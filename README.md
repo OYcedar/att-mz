@@ -40,22 +40,29 @@
 
 ## 🤖 第一步：选一个 Agent
 
-需要能执行命令、读写文件、处理多步骤任务的 Agent。下面是一些选择：
+需要能执行命令、读写文件、处理多步骤任务的 Agent。下面这些入口适合新手优先尝试，实际可用能力以各产品当前版本为准：
 
 | Agent | 形式 | 说明 |
 |-------|------|------|
-| [Codex 桌面版](https://chatgpt.com/zh-Hans-CN/codex/) | 🖥️ 桌面应用 | 开箱即用 |
-| [VS Code](https://code.visualstudio.com/) + [Cline](https://github.com/cline/cline) / [Kilo](https://github.com/kilocode/kilo-code) 等 | 🧩 编辑器插件 | 适合已在用 VS Code 的人 |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | ⌨️ 命令行 | Anthropic 官方 CLI Agent |
-| [Pi](https://github.com/earendil-works/pi) | ⌨️ 命令行 | 轻量终端 Agent |
-| [OpenClaw](https://github.com/openclaw/openclaw) | ⌨️ 命令行 | 开源跨平台个人 AI 助理 |
-| [Hermes](https://github.com/NousResearch/hermes-agent) | ⌨️ 命令行 | Nous Research 出品，支持子代理调度 |
+| [Codex 桌面版](https://chatgpt.com/zh-Hans-CN/codex/) | 🖥️ 桌面应用 | 适合直接打开游戏目录，让 Agent 按 Skill 连续执行 |
+| [腾讯 WorkBuddy](https://copilot.tencent.com/work/) | 🖥️ 桌面应用 | 面向多步骤任务和多 Agent 协作的工作台 |
+| [阿里 Qoder](https://qoder.com/download) | 🖥️ 桌面 / 编程平台 | 面向真实工程任务的智能编程平台 |
+| [智谱 ZCode](https://zcode-ai.com/) | 🖥️ 桌面应用 | 面向长任务的智能体开发环境 |
+| [OpenCode Windows 桌面端](https://opencode.ai/download) | 🖥️ 桌面应用 | 开源 AI 编程 Agent，下载页提供 Windows x64 桌面版 |
 
-以上只是举例，选择你顺手的即可。如果 Agent 支持调用子代理，翻译流程会更强地并行分析和交叉审查；不支持子代理时，也能按任务包或串行方式完成。
+选择你顺手的即可。如果 Agent 支持子代理，术语、规则和质量审查可以并行推进；不支持子代理时，也能按 Skill 串行完成。
+
+建议给 **Agent 本身** 选择较强的模型，例如 GPT-5.5 或同等级模型。A.T.T MZ 的工作流很吃模型编排能力、长上下文能力、工具调用能力和指令遵循能力；Agent 模型太弱时，常见问题不是翻译质量差一点，而是跳过 Skill、误改文件、漏跑检查或把未完成结果当成完成。
+
+`setting.toml` 里的底层翻译模型主要负责批量翻译正文，够用即可，不必为了流程稳定性盲目堆最强模型。真正决定工作流是否稳的是你正在对话、开目录、执行命令的 Agent 模型。
+
+如果发现 Agent 的动作不对，第一时间让它自检：
+
+> 请先停止当前动作，说明你是否正在严格遵循 A.T.T MZ 的 Skill。请引用 Skill 中当前阶段的通过标准、硬停止规则和下一步命令，再继续执行。
 
 怎么算装好了？在对话框里输入"你好"，AI 回复你了就说明 OK。
 
-> 💡 下面教程以 **Codex 桌面版** 为例。用其他 Agent 的话步骤完全一样——Agent 里都有开文件夹和对话框。
+> 💡 下面教程以 **Codex 桌面版** 为例。用其他 Agent 时也一样：先打开游戏目录，再把 A.T.T MZ 工具包路径和提示词发给 Agent。
 
 ## ⚙️ 第二步：下载 A.T.T MZ 并配置模型
 
@@ -92,13 +99,33 @@ timeout = 600
 
 ## 🚀 第四步：告诉 Agent 你要汉化
 
-在对话框里输入：
+根据你使用的是发行包还是源码运行，复制下面其中一段给 Agent。把尖括号里的内容换成你自己的路径或游戏名，不要把 API Key 发进对话。
 
-> A.T.T MZ 在 `<A.T.T MZ 目录>`，用它的 Skill（`<A.T.T MZ 目录>\skills\att-mz\SKILL.md`）把这个游戏汉化成中文。原文语言如果不确定，请先检查游戏文件再继续。
+### 使用发行包
 
-如果你已经在 Agent 中安装了 att-mz Skill，Skill 路径可以省略：
+适合下载 `att-mz-windows-x86_64.zip` 后直接使用的人。
 
-> A.T.T MZ 在 `<A.T.T MZ 目录>`，用它的 Skill 把这个游戏汉化成中文。原文语言如果不确定，请先检查游戏文件再继续。
+```text
+请使用 A.T.T MZ 工具包（发行包目录：<A.T.T MZ 发行包目录>）按照发行包内 `skills/att-mz/SKILL.md` 的流程，对当前打开的 RPG Maker MV/MZ 游戏进行完整汉化。
+
+允许使用子代理协助分析术语、规则和质量问题；允许在我确认后使用字体替换技术将中文写入游戏文件。工作过程中请持续记录使用体验、异常、命令结果和流程问题，完成后输出体验文档，供后续优化参考。
+
+重要约束：只能通过 A.T.T MZ CLI 和 Skill 规定的合法流程处理游戏；禁止手改游戏 `data/*.json`、插件源码、译文数据库或工具包文件。遇到技术阻碍且判断属于工具源码问题时，立即停止并向我汇报，不要自行修改源码。
+```
+
+### 使用源码
+
+适合你从仓库源码运行，或正在参与工具包开发的人。
+
+```text
+请使用 A.T.T MZ 源码工具包（源码目录：<A.T.T MZ 源码目录>）按照 `skills/att-mz/SKILL.md` 的流程，对当前打开的 RPG Maker MV/MZ 游戏进行完整汉化。默认命令使用 `uv run python main.py <命令>`。
+
+允许使用子代理协助工作；允许在我确认后使用字体替换技术将中文写入游戏文件。如有必要，可以编写只读脚本读取工具包数据库内容用于排查，但严格禁止修改数据库结构或数据。
+
+工作执行过程中，请持续收集使用体验、异常、命令结果和流程问题，最终输出详细体验文档，为后续优化工作提供参考依据。
+
+重要约束：如果遇到技术阻碍且确定属于工具源码问题，必须立即停止当前汉化流程并向我汇报；严禁任何形式的源码修改操作。确保整个汉化过程不触及游戏核心代码，仅通过工具包提供的合法途径完成汉化任务。
+```
 
 Agent 收到任务后，会自己完成整个流程：
 
@@ -112,59 +139,7 @@ Agent 收到任务后，会自己完成整个流程：
 
 过程中 Agent 会一步步向你报告进度。遇到需要确认的事情（比如要不要换游戏字体），它会主动问你。你只需要回答"可以"或"不行"。
 
-### 当前文本索引与恢复动作
-
-A.T.T MZ 用当前文本索引统一翻译、质量检查、手动补译、覆盖审计和写进游戏文件的文本范围。大型游戏或源文件、规则变化后，Agent 会先建立当前文本索引。
-
-源码运行：
-
-```powershell
-uv run python main.py rebuild-text-index --game <游戏标题>
-```
-
-发行包运行：
-
-```powershell
-.\att-mz.exe rebuild-text-index --game <游戏标题>
-```
-
-索引缺失、过期或范围不一致时，后续翻译、质量检查和写进游戏文件会失败并要求重建当前文本索引。
-
-### 规则正则契约
-
-插件规则、事件指令规则、Note 标签规则、普通占位符规则、结构化占位符规则、MV 虚拟名字框规则、源文残留结构规则和 `setting.toml` 中的用户可写正则都按当前命令导入或校验。
-
-外部可写正则统一使用 PCRE2 当前契约。需要命名 capture 时使用 `(?<name>...)`，例如 `(?<speaker>...)`、`(?<body>...)`。规则保存到当前统一规则模型；旧规则结构不会自动迁移，遇到规则校验失败时让 Agent 按当前命令重新导出并导入规则。
-
-当前工作区校验失败、manifest 不匹配或范围信息不可用时，让 Agent 重新准备工作区。
-
-源码运行：
-
-```powershell
-uv run python main.py prepare-agent-workspace --game <游戏标题> --output-dir <工作区>
-```
-
-发行包运行：
-
-```powershell
-.\att-mz.exe prepare-agent-workspace --game <游戏标题> --output-dir <工作区>
-```
-
-当前运行文件审计或反馈定位缺少可用写回映射时，先重建当前文本索引，再按需要重建当前运行文件。
-
-源码运行：
-
-```powershell
-uv run python main.py rebuild-text-index --game <游戏标题>
-uv run python main.py rebuild-active-runtime --game <游戏标题>
-```
-
-发行包运行：
-
-```powershell
-.\att-mz.exe rebuild-text-index --game <游戏标题>
-.\att-mz.exe rebuild-active-runtime --game <游戏标题>
-```
+如果 Agent 说需要重建文本索引、重新准备工作区或重建当前运行文件，让它按 Skill 和 CLI 输出继续处理即可。新手不需要记命令，关键是不要绕过工具去手改游戏文件。
 
 ## 🎯 第五步：试玩 + 反馈
 
