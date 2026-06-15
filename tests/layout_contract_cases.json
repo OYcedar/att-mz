@@ -8,6 +8,83 @@
   ],
   "split_cases": [
     {
+      "name": "line_start_opening_pair_adds_indent",
+      "lines": [
+        "「第一行，",
+        "第二行。」"
+      ],
+      "expected": [
+        "「第一行，",
+        "　第二行。」"
+      ]
+    },
+    {
+      "name": "line_mid_opening_pair_does_not_add_indent",
+      "lines": [
+        "他说「第一行，",
+        "第二行。」"
+      ],
+      "expected": [
+        "他说「第一行，",
+        "第二行。」"
+      ]
+    },
+    {
+      "name": "line_mid_opening_pair_with_leading_controls_does_not_add_indent",
+      "lines": [
+        "\\SE[0]他说「第一行，",
+        "\\SE[1]第二行。」"
+      ],
+      "expected": [
+        "\\SE[0]他说「第一行，",
+        "\\SE[1]第二行。」"
+      ]
+    },
+    {
+      "name": "new_split_line_start_wrapping_pair_adds_indent",
+      "line_width_limit": 5,
+      "lines": [
+        "「第一行，第二行。」"
+      ],
+      "expected": [
+        "「第一行，",
+        "　第二行。」"
+      ]
+    },
+    {
+      "name": "new_split_line_mid_wrapping_pair_does_not_add_indent",
+      "line_width_limit": 7,
+      "lines": [
+        "他说「第一行，第二行。」"
+      ],
+      "expected": [
+        "他说「第一行，",
+        "第二行。」"
+      ]
+    },
+    {
+      "name": "line_mid_opening_pair_existing_indent_is_preserved",
+      "lines": [
+        "他说「第一行，",
+        "　第二行。」"
+      ],
+      "expected": [
+        "他说「第一行，",
+        "　第二行。」"
+      ]
+    },
+    {
+      "name": "single_line_complete_wrapping_pair_does_not_indent_next_line",
+      "lines": [
+        "他说「完整句」。",
+        "下一句。"
+      ],
+      "expected": [
+        "他说「完整句」。",
+        "下一句。"
+      ]
+    },
+    {
       "name": "already_split_wrapping_pair_adds_indent",
       "lines": [
         "\\SE[2]「而、而且，对于收留了无依无靠的我，",

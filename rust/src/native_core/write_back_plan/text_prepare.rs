@@ -4,9 +4,8 @@ use crate::native_core::controls::{
     iter_symbol_standard_spans, iter_terms_percent_spans,
 };
 use crate::native_core::text_layout::{
-    WRAPPING_CONTINUATION_INDENT, count_unprotected_width_chars, is_byte_in_spans,
-    normalize_byte_spans, prepend_after_leading_protected_spans, raw_control_candidate_byte_spans,
-    strip_byte_spans,
+    count_unprotected_width_chars, is_byte_in_spans, normalize_byte_spans,
+    normalize_wrapping_continuation_indents, raw_control_candidate_byte_spans,
 };
 
 pub(super) fn prepared_lines(
@@ -60,54 +59,23 @@ pub(super) fn prepared_long_lines(
 
 pub(super) fn split_overwide_lines(lines: Vec<String>, rules: &TextPlanRules) -> Vec<String> {
     let mut split_lines = Vec::new();
-    let mut active_wrapping_pair: Option<(String, String)> = None;
     for line in lines {
         if line.is_empty() {
             split_lines.push(line);
             continue;
         }
-        let mut current_wrapping_pair = active_wrapping_pair.clone();
-        let opening_pair = find_opening_wrapping_pair(&line, rules);
-        if current_wrapping_pair.is_none() {
-            current_wrapping_pair = opening_pair;
-        }
-        let first_line_prefix = if active_wrapping_pair.is_some() {
-            WRAPPING_CONTINUATION_INDENT
-        } else {
-            ""
-        };
-        let wrapped_tail_prefix = if current_wrapping_pair.is_some() {
-            WRAPPING_CONTINUATION_INDENT
-        } else {
-            ""
-        };
-        split_lines.extend(split_single_overwide_line(
-            &line,
-            rules,
-            first_line_prefix,
-            wrapped_tail_prefix,
-        ));
-        if let Some(pair) = current_wrapping_pair {
-            if closes_wrapping_pair(&line, &pair, rules) {
-                active_wrapping_pair = None;
-            } else {
-                active_wrapping_pair = Some(pair);
-            }
-        } else {
-            active_wrapping_pair = None;
-        }
+        split_lines.extend(split_single_overwide_line(&line, rules));
     }
-    split_lines
+    normalize_wrapping_continuation_indents(
+        split_lines,
+        &rules.preserve_wrapping_punctuation_pairs,
+        |line| protected_control_byte_spans(line, rules),
+    )
 }
 
-pub(super) fn split_single_overwide_line(
-    line: &str,
-    rules: &TextPlanRules,
-    first_line_prefix: &str,
-    wrapped_tail_prefix: &str,
-) -> Vec<String> {
+pub(super) fn split_single_overwide_line(line: &str, rules: &TextPlanRules) -> Vec<String> {
     let mut result = Vec::new();
-    let mut pending_line = prepend_continuation_prefix(line, first_line_prefix, rules);
+    let mut pending_line = line.to_string();
     while count_line_width_chars(&pending_line, rules) > rules.long_text_line_width_limit {
         let Some(split_position) = find_hard_split_position(&pending_line, rules) else {
             break;
@@ -121,7 +89,7 @@ pub(super) fn split_single_overwide_line(
             break;
         }
         result.push(head);
-        pending_line = prepend_continuation_prefix(&tail, wrapped_tail_prefix, rules);
+        pending_line = tail;
     }
     result.push(pending_line);
     result
@@ -205,40 +173,6 @@ pub(super) fn protected_control_byte_spans(
             .map(|matched| (matched.start(), matched.end())),
     );
     normalize_byte_spans(spans)
-}
-
-pub(super) fn find_opening_wrapping_pair(
-    line: &str,
-    rules: &TextPlanRules,
-) -> Option<(String, String)> {
-    let stripped_line = build_wrapping_check_line(line, rules);
-    rules
-        .preserve_wrapping_punctuation_pairs
-        .iter()
-        .find(|(left, _right)| stripped_line.starts_with(left))
-        .cloned()
-}
-
-pub(super) fn closes_wrapping_pair(
-    line: &str,
-    wrapping_pair: &(String, String),
-    rules: &TextPlanRules,
-) -> bool {
-    build_wrapping_check_line(line, rules).ends_with(&wrapping_pair.1)
-}
-
-pub(super) fn build_wrapping_check_line(line: &str, rules: &TextPlanRules) -> String {
-    strip_byte_spans(line, &protected_control_byte_spans(line, rules))
-        .trim()
-        .to_string()
-}
-
-pub(super) fn prepend_continuation_prefix(
-    line: &str,
-    prefix: &str,
-    rules: &TextPlanRules,
-) -> String {
-    prepend_after_leading_protected_spans(line, prefix, &protected_control_byte_spans(line, rules))
 }
 
 #[derive(Clone)]
@@ -445,6 +379,8 @@ mod tests {
 
     #[derive(Deserialize)]
     struct SplitCase {
+        #[serde(default)]
+        line_width_limit: Option<usize>,
         lines: Vec<String>,
         expected: Vec<String>,
     }
@@ -454,13 +390,13 @@ mod tests {
             .expect("共享布局契约用例必须是有效 JSON")
     }
 
-    fn contract_rules() -> TextPlanRules {
+    fn contract_rules(long_text_line_width_limit: usize) -> TextPlanRules {
         TextPlanRules::from_payload(&SettingPayload {
             quality_text_rules: None,
             replacement_font_path: None,
             source_font_names: None,
             allowed_translation_paths: None,
-            long_text_line_width_limit: Some(999),
+            long_text_line_width_limit: Some(long_text_line_width_limit),
             line_width_count_pattern: Some(r"\S".to_string()),
             line_split_punctuations: Some(vec![
                 "，".to_string(),
@@ -487,7 +423,7 @@ mod tests {
 
     #[test]
     fn shared_layout_contract_counts_only_visible_width() {
-        let rules = contract_rules();
+        let rules = contract_rules(999);
         for case in load_layout_contract().line_width_cases {
             assert_eq!(
                 count_line_width_chars(&case.text, &rules),
@@ -498,8 +434,8 @@ mod tests {
 
     #[test]
     fn shared_layout_contract_applies_wrapping_continuation_indent() {
-        let rules = contract_rules();
         for case in load_layout_contract().split_cases {
+            let rules = contract_rules(case.line_width_limit.unwrap_or(999));
             assert_eq!(split_overwide_lines(case.lines, &rules), case.expected);
         }
     }

@@ -107,3 +107,95 @@ pub(crate) fn prepend_after_leading_protected_spans(
 
     format!("{}{}{}", &line[..insert_at], prefix, &line[insert_at..])
 }
+
+pub(crate) fn normalize_wrapping_continuation_indents<F>(
+    lines: Vec<String>,
+    wrapping_pairs: &[(String, String)],
+    mut protected_spans_for_line: F,
+) -> Vec<String>
+where
+    F: FnMut(&str) -> Vec<(usize, usize)>,
+{
+    if wrapping_pairs.is_empty() {
+        return lines;
+    }
+
+    let mut normalized_lines = Vec::with_capacity(lines.len());
+    let mut active_wrapping_stack: Vec<(String, String)> = Vec::new();
+    for line in lines {
+        let protected_spans = protected_spans_for_line(&line);
+        let normalized_line = if active_wrapping_stack.is_empty() {
+            line.clone()
+        } else {
+            prepend_after_leading_protected_spans(
+                &line,
+                WRAPPING_CONTINUATION_INDENT,
+                &protected_spans,
+            )
+        };
+        update_wrapping_stack_from_line(
+            &mut active_wrapping_stack,
+            &strip_byte_spans(&line, &protected_spans),
+            wrapping_pairs,
+        );
+        normalized_lines.push(normalized_line);
+    }
+    normalized_lines
+}
+
+fn update_wrapping_stack_from_line(
+    active_wrapping_stack: &mut Vec<(String, String)>,
+    visible_line: &str,
+    wrapping_pairs: &[(String, String)],
+) {
+    let mut visible_characters = visible_line
+        .chars()
+        .filter(|character| !character.is_whitespace());
+    let Some(first_character) = visible_characters.next() else {
+        return;
+    };
+    if active_wrapping_stack.is_empty() {
+        let first = first_character.to_string();
+        let Some(pair) = wrapping_pairs.iter().find(|(left, _right)| left == &first) else {
+            return;
+        };
+        active_wrapping_stack.push(pair.clone());
+        update_wrapping_stack_from_characters(
+            active_wrapping_stack,
+            visible_characters,
+            wrapping_pairs,
+        );
+        return;
+    }
+
+    update_wrapping_stack_from_characters(
+        active_wrapping_stack,
+        std::iter::once(first_character).chain(visible_characters),
+        wrapping_pairs,
+    );
+}
+
+fn update_wrapping_stack_from_characters<I>(
+    active_wrapping_stack: &mut Vec<(String, String)>,
+    visible_characters: I,
+    wrapping_pairs: &[(String, String)],
+) where
+    I: IntoIterator<Item = char>,
+{
+    for character in visible_characters {
+        let current = character.to_string();
+        if active_wrapping_stack
+            .last()
+            .is_some_and(|(_left, right)| right == &current)
+        {
+            let _ = active_wrapping_stack.pop();
+            continue;
+        }
+        if let Some(pair) = wrapping_pairs
+            .iter()
+            .find(|(left, _right)| left == &current)
+        {
+            active_wrapping_stack.push(pair.clone());
+        }
+    }
+}

@@ -9,9 +9,7 @@ from app.rmmz.text_rules import TextRules
 from .models import ProtectedSpan
 from .protected import collect_protected_spans, is_inside_protected_span, move_split_position_outside_protected_span
 from .width import count_line_width_chars, line_width_counted_flags
-from .wrapping import closes_wrapping_pair, find_opening_wrapping_pair, prepend_continuation_prefix
-
-WRAPPING_CONTINUATION_INDENT = "　"
+from .wrapping import normalize_wrapping_continuation_indents
 
 
 def split_overwide_lines(
@@ -22,41 +20,19 @@ def split_overwide_lines(
 ) -> list[str]:
     """按配置宽度切开过长非空行，并整理跨行包裹标点的续行缩进。"""
     split_lines: list[str] = []
-    active_wrapping_pair: tuple[str, str] | None = None
     for line in lines:
         if not line:
             split_lines.append(line)
             continue
 
-        current_wrapping_pair = active_wrapping_pair
-        opening_pair = find_opening_wrapping_pair(line=line, text_rules=text_rules)
-        if current_wrapping_pair is None:
-            current_wrapping_pair = opening_pair
-
-        first_line_prefix = WRAPPING_CONTINUATION_INDENT if active_wrapping_pair is not None else ""
-        wrapped_tail_prefix = WRAPPING_CONTINUATION_INDENT if current_wrapping_pair is not None else ""
         split_lines.extend(
             _split_single_overwide_line(
                 line=line,
                 location_path=location_path,
                 text_rules=text_rules,
-                first_line_prefix=first_line_prefix,
-                wrapped_tail_prefix=wrapped_tail_prefix,
             )
         )
-
-        if current_wrapping_pair is None:
-            active_wrapping_pair = None
-            continue
-        if closes_wrapping_pair(
-            line=line,
-            wrapping_pair=current_wrapping_pair,
-            text_rules=text_rules,
-        ):
-            active_wrapping_pair = None
-        else:
-            active_wrapping_pair = current_wrapping_pair
-    return split_lines
+    return normalize_wrapping_continuation_indents(lines=split_lines, text_rules=text_rules)
 
 
 def split_overwide_single_text_value_if_needed(
@@ -111,17 +87,11 @@ def _split_single_overwide_line(
     line: str,
     location_path: str | None,
     text_rules: TextRules,
-    first_line_prefix: str = "",
-    wrapped_tail_prefix: str = "",
 ) -> list[str]:
     """切开单个超宽文本行。"""
     line_width_limit = text_rules.setting.long_text_line_width_limit
     result: list[str] = []
-    pending_line = prepend_continuation_prefix(
-        line=line,
-        prefix=first_line_prefix,
-        text_rules=text_rules,
-    )
+    pending_line = line
     while count_line_width_chars(pending_line, text_rules) > line_width_limit:
         split_position = _find_preferred_split_position(pending_line, text_rules)
         if split_position is None:
@@ -148,11 +118,7 @@ def _split_single_overwide_line(
             break
 
         result.append(head)
-        pending_line = prepend_continuation_prefix(
-            line=tail,
-            prefix=wrapped_tail_prefix,
-            text_rules=text_rules,
-        )
+        pending_line = tail
 
     result.append(pending_line)
     return result

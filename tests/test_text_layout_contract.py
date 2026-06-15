@@ -21,12 +21,12 @@ def _load_contract() -> JsonObject:
     return value
 
 
-def _contract_text_rules() -> TextRules:
+def _contract_text_rules(long_text_line_width_limit: int = 999) -> TextRules:
     """构造共享契约测试用文本规则。"""
     return TextRules.from_setting(
         TextRulesSetting(
             line_width_count_pattern=r"\S",
-            long_text_line_width_limit=999,
+            long_text_line_width_limit=long_text_line_width_limit,
             preserve_wrapping_punctuation_pairs=[("「", "」"), ("『", "』"), ("（", "）")],
         )
     )
@@ -77,8 +77,11 @@ def test_shared_layout_contract_counts_only_visible_width() -> None:
 
 def test_shared_layout_contract_applies_wrapping_continuation_indent() -> None:
     """跨行包裹标点内部续行补全角空格，并保留控制符顺序。"""
-    rules = _contract_text_rules()
     for case in _case_list(_load_contract(), "split_cases"):
+        line_width_limit = case.get("line_width_limit")
+        if not isinstance(line_width_limit, int):
+            line_width_limit = 999
+        rules = _contract_text_rules(long_text_line_width_limit=line_width_limit)
         actual = split_overwide_lines(
             lines=_string_list_field(case, "lines"),
             location_path=_string_field(case, "name"),
