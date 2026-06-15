@@ -1,5 +1,49 @@
 # 更新日志
 
+## v0.1.12 - 2026-06-16
+
+### 更新重点
+
+- 修复写进游戏文件时的长文本布局判断：`\SE[...]`、`\.`, `\|`、`\SM[...]`、`\SA[...]` 等 RPG Maker 控制符不再计入玩家可见行宽，避免普通对话被误判过宽并被错误拆行。
+- 修复跨行包裹标点续行缩进：处在 `「」`、`『』`、`（）` 内部的既有分行译文会自动给续行补全角空格；行首有控制符时，空格会插在控制符之后、可见文本之前，不破坏语音、停顿或表情触发顺序。
+- 收窄跨行包裹缩进触发条件：只有最终行的第一个可见字符（忽略控制符和占位符）就是受保护开符号时，才把后续行视为包裹标点续行；句中引用不会让下一行错误缩进。
+- Rust 写回计划和 Rust 质量检查共用同一套布局辅助，Python 保存前布局入口增加共享契约测试，降低行宽、控制符和续行缩进规则漂移风险。
+- 新增 `doctor` 统一流程裁决输出，整合最近翻译运行、质量检查、写回级检查和下一步命令提示，让 Agent 更容易判断继续翻译、手动修复还是准备写回。
+- 手动译文导入支持 `--check-only` 保存前校验；导入命令报告会说明规则或译文变化对文本索引、doctor 和写回级检查的连锁影响。
+- 支持多模型客户端配置，可在 `setting.toml` 中配置多个 OpenAI 兼容客户端，并通过命令选择本轮使用的客户端。
+- 发布与测试门禁调整：发布工作流保留完整类型检查、全量 Python 业务测试、Rust 格式检查、clippy 和 Rust 测试；普通 push / PR 不再重复跑常规 CI。
+
+### 修复细节
+
+- 规则错误会归入规则阻断，避免流程过早进入手动修复。
+- 长文本写回先完成最终行布局，再统一归一化跨行包裹状态，避免拆分前后两套缩进判断产生差异。
+- 翻译流程会读取最近运行状态，减少同类失败尚未诊断时的误判。
+- 可信源快照记录保留文件元数据，降低写回和重建当前运行文件时的状态误判风险。
+- 测试体系继续收束到公开 CLI、数据库可观察结果、Rust/native 边界和真实写回副作用，删除不再服务当前契约的大型实现路径测试。
+
+### 升级提醒
+
+- 如果此前为了抵消控制符计宽问题调高过 `long_text_line_width_limit`，升级后建议恢复到适合窗口显示的正常值，再重新运行质量检查。
+- 已保存译文不需要手改；重新运行 `quality-report --game <游戏标题> --include-write-probe` 或 `write-back --game <游戏标题>` 时会按新布局规则处理。
+- 涉及规则变更、工作区过期或索引过期时，继续按命令提示重新运行 `rebuild-text-index --game <游戏标题>` 或 `prepare-agent-workspace --game <游戏标题> --output-dir <工作区>`。
+- 多模型客户端配置仍以 `setting.toml` 为事实源；命令行只选择客户端名称，不直接传模型地址、密钥或模型名。
+
+### 验证命令
+
+- `uv run basedpyright`
+- `uv run pytest -q -n 12 --dist=load --durations=30 --durations-min=0.5`
+- `cargo fmt --manifest-path rust/Cargo.toml -- --check`
+- `cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings`
+- `cargo test --manifest-path rust/Cargo.toml`
+- `uv run maturin develop --release`
+- `quality-report --game <游戏标题> --include-write-probe`
+- `write-back --game <游戏标题>`
+
+### 发行包
+
+- GitHub Release 下载 `att-mz-windows-x86_64.zip`。
+- 正式 Windows ZIP 由 GitHub Actions `release` 工作流生成。
+
 ## v0.1.11 - 2026-06-12
 
 ### 更新重点

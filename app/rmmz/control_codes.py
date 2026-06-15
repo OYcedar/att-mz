@@ -271,8 +271,8 @@ ALL_PLACEHOLDER_PATTERN: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 RAW_BRACKETED_CONTROL_CANDIDATE_PATTERN: re.Pattern[str] = re.compile(
-    r"\\[A-Za-z]+\d*\[[A-Za-z0-9_./:-]{1,32}[^\]\w\s\[\]\\]"
-    + r"|\\[A-Za-z]+\d*\[[^\]\r\n]{0,64}\]"
+    r"\\[A-Za-z]+\d*\[[^\]\r\n]{0,64}\]"
+    + r"|\\[A-Za-z]+\d*\[[A-Za-z0-9_./:-]{1,32}[^\]\w\s\[\]\\]"
 )
 RAW_BARE_CONTROL_CANDIDATE_PATTERN: re.Pattern[str] = re.compile(
     r"\\(?P<code>[A-Za-z]+)\d*"

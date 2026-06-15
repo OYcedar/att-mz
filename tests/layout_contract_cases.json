@@ -1,0 +1,165 @@
+{
+  "line_width_cases": [
+    {
+      "name": "rpg_maker_controls_are_not_visible_width",
+      "text": "\\SE[2]甲\\.乙\\|丙\\SM[happy]丁\\SA[angry]戊",
+      "expected_width": 5
+    }
+  ],
+  "split_cases": [
+    {
+      "name": "line_start_opening_pair_adds_indent",
+      "lines": [
+        "「第一行，",
+        "第二行。」"
+      ],
+      "expected": [
+        "「第一行，",
+        "　第二行。」"
+      ]
+    },
+    {
+      "name": "line_mid_opening_pair_does_not_add_indent",
+      "lines": [
+        "他说「第一行，",
+        "第二行。」"
+      ],
+      "expected": [
+        "他说「第一行，",
+        "第二行。」"
+      ]
+    },
+    {
+      "name": "line_mid_opening_pair_with_leading_controls_does_not_add_indent",
+      "lines": [
+        "\\SE[0]他说「第一行，",
+        "\\SE[1]第二行。」"
+      ],
+      "expected": [
+        "\\SE[0]他说「第一行，",
+        "\\SE[1]第二行。」"
+      ]
+    },
+    {
+      "name": "new_split_line_start_wrapping_pair_adds_indent",
+      "line_width_limit": 5,
+      "lines": [
+        "「第一行，第二行。」"
+      ],
+      "expected": [
+        "「第一行，",
+        "　第二行。」"
+      ]
+    },
+    {
+      "name": "new_split_line_mid_wrapping_pair_does_not_add_indent",
+      "line_width_limit": 7,
+      "lines": [
+        "他说「第一行，第二行。」"
+      ],
+      "expected": [
+        "他说「第一行，",
+        "第二行。」"
+      ]
+    },
+    {
+      "name": "line_mid_opening_pair_existing_indent_is_preserved",
+      "lines": [
+        "他说「第一行，",
+        "　第二行。」"
+      ],
+      "expected": [
+        "他说「第一行，",
+        "　第二行。」"
+      ]
+    },
+    {
+      "name": "single_line_complete_wrapping_pair_does_not_indent_next_line",
+      "lines": [
+        "他说「完整句」。",
+        "下一句。"
+      ],
+      "expected": [
+        "他说「完整句」。",
+        "下一句。"
+      ]
+    },
+    {
+      "name": "already_split_wrapping_pair_adds_indent",
+      "lines": [
+        "\\SE[2]「而、而且，对于收留了无依无靠的我，",
+        "如此温柔的店长先生，\\.\\.\\SE[11-nb]我……」"
+      ],
+      "expected": [
+        "\\SE[2]「而、而且，对于收留了无依无靠的我，",
+        "　如此温柔的店长先生，\\.\\.\\SE[11-nb]我……」"
+      ]
+    },
+    {
+      "name": "leading_control_continuation_inserts_after_control",
+      "lines": [
+        "「第一行还没结束",
+        "\\SE[11-nb]第二行」"
+      ],
+      "expected": [
+        "「第一行还没结束",
+        "\\SE[11-nb]　第二行」"
+      ]
+    },
+    {
+      "name": "leading_symbol_controls_continuation_inserts_after_controls",
+      "lines": [
+        "「第一行还没结束",
+        "\\.\\|第二行」"
+      ],
+      "expected": [
+        "「第一行还没结束",
+        "\\.\\|　第二行」"
+      ]
+    },
+    {
+      "name": "existing_full_width_space_is_not_duplicated",
+      "lines": [
+        "「第一行还没结束",
+        "\\SE[11-nb]　第二行」"
+      ],
+      "expected": [
+        "「第一行还没结束",
+        "\\SE[11-nb]　第二行」"
+      ]
+    },
+    {
+      "name": "existing_half_width_space_is_not_duplicated",
+      "lines": [
+        "「第一行还没结束",
+        "\\SE[11-nb] 第二行」"
+      ],
+      "expected": [
+        "「第一行还没结束",
+        "\\SE[11-nb] 第二行」"
+      ]
+    },
+    {
+      "name": "outside_wrapping_pair_does_not_add_indent",
+      "lines": [
+        "普通第一行",
+        "\\SE[11-nb]第二行"
+      ],
+      "expected": [
+        "普通第一行",
+        "\\SE[11-nb]第二行"
+      ]
+    },
+    {
+      "name": "parentheses_pair_uses_same_continuation_rule",
+      "lines": [
+        "（第一行还没结束",
+        "第二行）"
+      ],
+      "expected": [
+        "（第一行还没结束",
+        "　第二行）"
+      ]
+    }
+  ]
+}

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from itertools import chain
+
 from app.rmmz.text_rules import TextRules
 
-from .models import BoundaryChar, WrappingSpan
-from .protected import collect_protected_spans, find_containing_span
+from .models import BoundaryChar, ProtectedSpan, WrappingSpan
+from .protected import collect_protected_spans, find_containing_span, strip_protected_spans
+
+WRAPPING_CONTINUATION_INDENT = "　"
 
 TRANSLATED_WRAPPING_PUNCTUATION_PAIRS: tuple[tuple[str, str], ...] = (
     ("“", "”"),
@@ -67,42 +72,132 @@ def normalize_translated_wrapping_punctuation(
     return normalized_lines
 
 
-def find_opening_wrapping_pair(*, line: str, text_rules: TextRules) -> tuple[str, str] | None:
-    """返回当前行开头命中的包裹标点配置。"""
-    stripped_line = build_wrapping_check_line(line=line, text_rules=text_rules)
-    for left, right in text_rules.setting.preserve_wrapping_punctuation_pairs:
-        if stripped_line.startswith(left):
-            return left, right
-    return None
+def normalize_wrapping_continuation_indents(
+    *,
+    lines: list[str],
+    text_rules: TextRules,
+) -> list[str]:
+    """在最终显示行上补齐跨行包裹标点内部的续行缩进。"""
+    wrapping_pairs = tuple(text_rules.setting.preserve_wrapping_punctuation_pairs)
+    if not wrapping_pairs:
+        return list(lines)
+
+    normalized_lines: list[str] = []
+    active_wrapping_stack: list[tuple[str, str]] = []
+    for line in lines:
+        protected_spans = collect_protected_spans(text=line, text_rules=text_rules)
+        if active_wrapping_stack:
+            normalized_lines.append(
+                _prepend_after_leading_protected_spans(
+                    line=line,
+                    prefix=WRAPPING_CONTINUATION_INDENT,
+                    protected_spans=protected_spans,
+                )
+            )
+        else:
+            normalized_lines.append(line)
+        _update_wrapping_stack_from_line(
+            active_wrapping_stack=active_wrapping_stack,
+            visible_line=strip_protected_spans(text=line, protected_spans=protected_spans),
+            wrapping_pairs=wrapping_pairs,
+        )
+    return normalized_lines
 
 
-def closes_wrapping_pair(
+def _prepend_after_leading_protected_spans(
     *,
     line: str,
-    wrapping_pair: tuple[str, str],
-    text_rules: TextRules,
-) -> bool:
-    """判断当前逻辑行是否结束了跨行包裹标点块。"""
-    _, right = wrapping_pair
-    stripped_line = build_wrapping_check_line(line=line, text_rules=text_rules)
-    return stripped_line.endswith(right)
-
-
-def build_wrapping_check_line(*, line: str, text_rules: TextRules) -> str:
-    """去掉控制符后生成包裹标点状态判定用文本。"""
-    return text_rules.strip_rm_control_sequences(line).strip()
-
-
-def prepend_continuation_prefix(*, line: str, prefix: str) -> str:
-    """给包裹标点续行补视觉缩进，避免重复添加已有空白。"""
+    prefix: str,
+    protected_spans: list[ProtectedSpan],
+) -> str:
+    """在行首连续受保护控制符之后插入前缀，避免重复添加已有空白。"""
     if not prefix or not line:
         return line
     if line.startswith(prefix):
         return line
-    first_char = line[0]
+    insert_index = 0
+    while True:
+        containing_span = next(
+            (
+                span
+                for span in protected_spans
+                if span.start_index == insert_index and span.end_index > insert_index
+            ),
+            None,
+        )
+        if containing_span is None:
+            break
+        insert_index = containing_span.end_index
+    if insert_index >= len(line) or line[insert_index:].startswith(prefix):
+        return line
+    first_char = line[insert_index]
     if first_char.isspace():
         return line
-    return f"{prefix}{line}"
+    return f"{line[:insert_index]}{prefix}{line[insert_index:]}"
+
+
+def _update_wrapping_stack_from_line(
+    *,
+    active_wrapping_stack: list[tuple[str, str]],
+    visible_line: str,
+    wrapping_pairs: tuple[tuple[str, str], ...],
+) -> None:
+    """根据一行可见文本更新跨行包裹标点状态。"""
+    visible_characters = (character for character in visible_line if not character.isspace())
+    first_character = next(visible_characters, None)
+    if first_character is None:
+        return
+    if not active_wrapping_stack:
+        opening_pair = _find_opening_pair_for_first_visible_char(
+            char=first_character,
+            wrapping_pairs=wrapping_pairs,
+        )
+        if opening_pair is None:
+            return
+        active_wrapping_stack.append(opening_pair)
+        _update_wrapping_stack_from_characters(
+            active_wrapping_stack=active_wrapping_stack,
+            visible_characters=visible_characters,
+            wrapping_pairs=wrapping_pairs,
+        )
+        return
+
+    _update_wrapping_stack_from_characters(
+        active_wrapping_stack=active_wrapping_stack,
+        visible_characters=chain((first_character,), visible_characters),
+        wrapping_pairs=wrapping_pairs,
+    )
+
+
+def _find_opening_pair_for_first_visible_char(
+    *,
+    char: str,
+    wrapping_pairs: tuple[tuple[str, str], ...],
+) -> tuple[str, str] | None:
+    """仅允许行首第一个可见字符开启跨行包裹状态。"""
+    for pair in wrapping_pairs:
+        left, _right = pair
+        if left == char:
+            return pair
+    return None
+
+
+def _update_wrapping_stack_from_characters(
+    *,
+    active_wrapping_stack: list[tuple[str, str]],
+    visible_characters: Iterable[str],
+    wrapping_pairs: tuple[tuple[str, str], ...],
+) -> None:
+    """根据可见字符流更新已经开启的跨行包裹状态。"""
+    for char in visible_characters:
+        if active_wrapping_stack and active_wrapping_stack[-1][1] == char:
+            _ = active_wrapping_stack.pop()
+            continue
+        for pair in wrapping_pairs:
+            left, _right = pair
+            if left == char:
+                active_wrapping_stack.append(pair)
+                break
 
 
 def _has_preserved_wrapping_chars(*, lines: list[str], text_rules: TextRules) -> bool:

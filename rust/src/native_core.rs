@@ -16,6 +16,7 @@ mod rule_runtime;
 mod rules;
 mod scope_index;
 pub(crate) mod text_facts;
+mod text_layout;
 mod write_back_plan;
 mod write_protocol;
 
@@ -346,6 +347,29 @@ mod tests {
         let value: Value = serde_json::from_str(&output).expect("输出应是 JSON");
         assert_eq!(value["text_structure_items"], json!([]));
         assert_eq!(value["placeholder_risk_items"], json!([]));
+    }
+
+    #[test]
+    fn quality_scan_counts_only_visible_width_for_control_heavy_lines() {
+        let mut text_rules = minimal_text_rules();
+        text_rules["long_text_line_width_limit"] = json!(5);
+        let payload = json!({
+            "items": [
+                {
+                    "location_path": "Map001.json/1/0/0",
+                    "item_type": "long_text",
+                    "role": null,
+                    "original_lines": ["こんにちは"],
+                    "translation_lines": [r"\SE[2]甲\.乙\|丙\SM[happy]丁\SA[angry]戊"]
+                }
+            ],
+            "text_rules": text_rules,
+            "source_residual_rules": []
+        });
+        let output = scan_quality_impl(&payload.to_string()).expect("质检应成功");
+        let value: Value = serde_json::from_str(&output).expect("输出应是 JSON");
+
+        assert_eq!(value["overwide_line_items"], json!([]));
     }
 
     #[test]
