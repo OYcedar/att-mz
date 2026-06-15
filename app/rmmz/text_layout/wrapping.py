@@ -5,7 +5,7 @@ from __future__ import annotations
 from app.rmmz.text_rules import TextRules
 
 from .models import BoundaryChar, WrappingSpan
-from .protected import collect_protected_spans, find_containing_span
+from .protected import collect_protected_spans, find_containing_span, strip_protected_spans
 
 TRANSLATED_WRAPPING_PUNCTUATION_PAIRS: tuple[tuple[str, str], ...] = (
     ("“", "”"),
@@ -90,19 +90,38 @@ def closes_wrapping_pair(
 
 def build_wrapping_check_line(*, line: str, text_rules: TextRules) -> str:
     """去掉控制符后生成包裹标点状态判定用文本。"""
-    return text_rules.strip_rm_control_sequences(line).strip()
+    return strip_protected_spans(
+        text=line,
+        protected_spans=collect_protected_spans(text=line, text_rules=text_rules),
+    ).strip()
 
 
-def prepend_continuation_prefix(*, line: str, prefix: str) -> str:
+def prepend_continuation_prefix(*, line: str, prefix: str, text_rules: TextRules) -> str:
     """给包裹标点续行补视觉缩进，避免重复添加已有空白。"""
     if not prefix or not line:
         return line
     if line.startswith(prefix):
         return line
-    first_char = line[0]
+    protected_spans = collect_protected_spans(text=line, text_rules=text_rules)
+    insert_index = 0
+    while True:
+        containing_span = next(
+            (
+                span
+                for span in protected_spans
+                if span.start_index == insert_index and span.end_index > insert_index
+            ),
+            None,
+        )
+        if containing_span is None:
+            break
+        insert_index = containing_span.end_index
+    if insert_index >= len(line) or line[insert_index:].startswith(prefix):
+        return line
+    first_char = line[insert_index]
     if first_char.isspace():
         return line
-    return f"{prefix}{line}"
+    return f"{line[:insert_index]}{prefix}{line[insert_index:]}"
 
 
 def _has_preserved_wrapping_chars(*, lines: list[str], text_rules: TextRules) -> bool:

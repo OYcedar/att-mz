@@ -3,8 +3,10 @@ use crate::native_core::controls::{
     iter_indexed_standard_spans, iter_literal_escape_spans, iter_no_param_standard_spans,
     iter_symbol_standard_spans, iter_terms_percent_spans,
 };
-use crate::native_core::rules::{
-    RAW_BARE_CONTROL_RE, RAW_BRACKETED_CONTROL_RE, RAW_SYMBOL_CONTROL_RE,
+use crate::native_core::text_layout::{
+    WRAPPING_CONTINUATION_INDENT, count_unprotected_width_chars, is_byte_in_spans,
+    normalize_byte_spans, prepend_after_leading_protected_spans, raw_control_candidate_byte_spans,
+    strip_byte_spans,
 };
 
 pub(super) fn prepared_lines(
@@ -70,12 +72,12 @@ pub(super) fn split_overwide_lines(lines: Vec<String>, rules: &TextPlanRules) ->
             current_wrapping_pair = opening_pair;
         }
         let first_line_prefix = if active_wrapping_pair.is_some() {
-            "　"
+            WRAPPING_CONTINUATION_INDENT
         } else {
             ""
         };
         let wrapped_tail_prefix = if current_wrapping_pair.is_some() {
-            "　"
+            WRAPPING_CONTINUATION_INDENT
         } else {
             ""
         };
@@ -105,7 +107,7 @@ pub(super) fn split_single_overwide_line(
     wrapped_tail_prefix: &str,
 ) -> Vec<String> {
     let mut result = Vec::new();
-    let mut pending_line = prepend_continuation_prefix(line, first_line_prefix);
+    let mut pending_line = prepend_continuation_prefix(line, first_line_prefix, rules);
     while count_line_width_chars(&pending_line, rules) > rules.long_text_line_width_limit {
         let Some(split_position) = find_hard_split_position(&pending_line, rules) else {
             break;
@@ -119,7 +121,7 @@ pub(super) fn split_single_overwide_line(
             break;
         }
         result.push(head);
-        pending_line = prepend_continuation_prefix(&tail, wrapped_tail_prefix);
+        pending_line = prepend_continuation_prefix(&tail, wrapped_tail_prefix, rules);
     }
     result.push(pending_line);
     result
@@ -160,12 +162,9 @@ pub(super) fn find_hard_split_position(text: &str, rules: &TextPlanRules) -> Opt
 
 pub(super) fn count_line_width_chars(text: &str, rules: &TextPlanRules) -> usize {
     let protected_spans = protected_control_byte_spans(text, rules);
-    text.char_indices()
-        .filter(|(byte_index, character)| {
-            !is_byte_in_spans(*byte_index, &protected_spans)
-                && rules.is_line_width_counted_char(*character)
-        })
-        .count()
+    count_unprotected_width_chars(text, &protected_spans, |character| {
+        rules.is_line_width_counted_char(character)
+    })
 }
 
 pub(super) fn protected_control_byte_spans(
@@ -198,42 +197,21 @@ pub(super) fn protected_control_byte_spans(
             .into_iter()
             .map(|span| (span.start, span.end)),
     );
-    spans.extend(
-        RAW_BRACKETED_CONTROL_RE
-            .find_iter(text)
-            .map(|matched| (matched.start(), matched.end())),
-    );
-    spans.extend(
-        RAW_BARE_CONTROL_RE
-            .find_iter(text)
-            .map(|matched| (matched.start(), matched.end())),
-    );
-    spans.extend(
-        RAW_SYMBOL_CONTROL_RE
-            .find_iter(text)
-            .map(|matched| (matched.start(), matched.end())),
-    );
+    spans.extend(raw_control_candidate_byte_spans(text));
     spans.extend(
         rules
             .protected_macro_pattern
             .find_iter(text)
             .map(|matched| (matched.start(), matched.end())),
     );
-    spans.sort_unstable();
-    spans
-}
-
-pub(super) fn is_byte_in_spans(byte_index: usize, spans: &[(usize, usize)]) -> bool {
-    spans
-        .iter()
-        .any(|(start, end)| *start <= byte_index && byte_index < *end)
+    normalize_byte_spans(spans)
 }
 
 pub(super) fn find_opening_wrapping_pair(
     line: &str,
     rules: &TextPlanRules,
 ) -> Option<(String, String)> {
-    let stripped_line = line.trim();
+    let stripped_line = build_wrapping_check_line(line, rules);
     rules
         .preserve_wrapping_punctuation_pairs
         .iter()
@@ -244,22 +222,23 @@ pub(super) fn find_opening_wrapping_pair(
 pub(super) fn closes_wrapping_pair(
     line: &str,
     wrapping_pair: &(String, String),
-    _rules: &TextPlanRules,
+    rules: &TextPlanRules,
 ) -> bool {
-    line.trim().ends_with(&wrapping_pair.1)
+    build_wrapping_check_line(line, rules).ends_with(&wrapping_pair.1)
 }
 
-pub(super) fn prepend_continuation_prefix(line: &str, prefix: &str) -> String {
-    if prefix.is_empty() || line.is_empty() || line.starts_with(prefix) {
-        return line.to_string();
-    }
-    let Some(first_char) = line.chars().next() else {
-        return line.to_string();
-    };
-    if first_char.is_whitespace() {
-        return line.to_string();
-    }
-    format!("{prefix}{line}")
+pub(super) fn build_wrapping_check_line(line: &str, rules: &TextPlanRules) -> String {
+    strip_byte_spans(line, &protected_control_byte_spans(line, rules))
+        .trim()
+        .to_string()
+}
+
+pub(super) fn prepend_continuation_prefix(
+    line: &str,
+    prefix: &str,
+    rules: &TextPlanRules,
+) -> String {
+    prepend_after_leading_protected_spans(line, prefix, &protected_control_byte_spans(line, rules))
 }
 
 #[derive(Clone)]
@@ -333,7 +312,12 @@ pub(super) fn normalize_translated_wrapping_punctuation(
 }
 
 fn collect_source_wrapping_spans(lines: &[String], rules: &TextPlanRules) -> Vec<WrappingSpan> {
-    collect_wrapping_spans(lines, &rules.preserve_wrapping_punctuation_pairs, true)
+    collect_wrapping_spans(
+        lines,
+        &rules.preserve_wrapping_punctuation_pairs,
+        rules,
+        true,
+    )
 }
 
 fn collect_translated_wrapping_spans(lines: &[String], rules: &TextPlanRules) -> Vec<WrappingSpan> {
@@ -356,15 +340,16 @@ fn collect_translated_wrapping_spans(lines: &[String], rules: &TextPlanRules) ->
             pairs.push(pair_value);
         }
     }
-    collect_wrapping_spans(lines, &pairs, false)
+    collect_wrapping_spans(lines, &pairs, rules, false)
 }
 
 fn collect_wrapping_spans(
     lines: &[String],
     pair_definitions: &[(String, String)],
+    rules: &TextPlanRules,
     allow_mismatched_right: bool,
 ) -> Vec<WrappingSpan> {
-    let visible_chars = collect_visible_chars(lines);
+    let visible_chars = collect_visible_chars(lines, rules);
     let mut spans = Vec::new();
     let mut stack: Vec<(WrappingBoundary, (String, String))> = Vec::new();
     for boundary in visible_chars {
@@ -402,10 +387,14 @@ fn collect_wrapping_spans(
     spans
 }
 
-fn collect_visible_chars(lines: &[String]) -> Vec<WrappingBoundary> {
+fn collect_visible_chars(lines: &[String], rules: &TextPlanRules) -> Vec<WrappingBoundary> {
     let mut boundaries = Vec::new();
     for (line_index, line) in lines.iter().enumerate() {
-        for (char_index, character) in line.chars().enumerate() {
+        let protected_spans = protected_control_byte_spans(line, rules);
+        for (char_index, (byte_index, character)) in line.char_indices().enumerate() {
+            if is_byte_in_spans(byte_index, &protected_spans) {
+                continue;
+            }
             if character.is_whitespace() {
                 continue;
             }
@@ -434,4 +423,84 @@ pub(super) fn replace_char_at(text: &str, char_index: usize, replacement: &str) 
         replacement,
         &text[next_index..],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::models::{SettingPayload, TextPlanRules};
+    use super::{count_line_width_chars, split_overwide_lines};
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct LayoutContract {
+        line_width_cases: Vec<LineWidthCase>,
+        split_cases: Vec<SplitCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct LineWidthCase {
+        text: String,
+        expected_width: usize,
+    }
+
+    #[derive(Deserialize)]
+    struct SplitCase {
+        lines: Vec<String>,
+        expected: Vec<String>,
+    }
+
+    fn load_layout_contract() -> LayoutContract {
+        serde_json::from_str(include_str!("../../../../tests/layout_contract_cases.json"))
+            .expect("共享布局契约用例必须是有效 JSON")
+    }
+
+    fn contract_rules() -> TextPlanRules {
+        TextPlanRules::from_payload(&SettingPayload {
+            quality_text_rules: None,
+            replacement_font_path: None,
+            source_font_names: None,
+            allowed_translation_paths: None,
+            long_text_line_width_limit: Some(999),
+            line_width_count_pattern: Some(r"\S".to_string()),
+            line_split_punctuations: Some(vec![
+                "，".to_string(),
+                "。".to_string(),
+                "、".to_string(),
+                "；".to_string(),
+                "：".to_string(),
+                "！".to_string(),
+                "？".to_string(),
+                "…".to_string(),
+                "）".to_string(),
+                "」".to_string(),
+                "』".to_string(),
+            ]),
+            preserve_wrapping_punctuation_pairs: Some(vec![
+                ("「".to_string(), "」".to_string()),
+                ("『".to_string(), "』".to_string()),
+                ("（".to_string(), "）".to_string()),
+            ]),
+            plan_content_output_dir: None,
+        })
+        .expect("共享布局契约文本规则应可编译")
+    }
+
+    #[test]
+    fn shared_layout_contract_counts_only_visible_width() {
+        let rules = contract_rules();
+        for case in load_layout_contract().line_width_cases {
+            assert_eq!(
+                count_line_width_chars(&case.text, &rules),
+                case.expected_width
+            );
+        }
+    }
+
+    #[test]
+    fn shared_layout_contract_applies_wrapping_continuation_indent() {
+        let rules = contract_rules();
+        for case in load_layout_contract().split_cases {
+            assert_eq!(split_overwide_lines(case.lines, &rules), case.expected);
+        }
+    }
 }

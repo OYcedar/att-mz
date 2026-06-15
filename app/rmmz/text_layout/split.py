@@ -117,7 +117,11 @@ def _split_single_overwide_line(
     """切开单个超宽文本行。"""
     line_width_limit = text_rules.setting.long_text_line_width_limit
     result: list[str] = []
-    pending_line = prepend_continuation_prefix(line=line, prefix=first_line_prefix)
+    pending_line = prepend_continuation_prefix(
+        line=line,
+        prefix=first_line_prefix,
+        text_rules=text_rules,
+    )
     while count_line_width_chars(pending_line, text_rules) > line_width_limit:
         split_position = _find_preferred_split_position(pending_line, text_rules)
         if split_position is None:
@@ -144,7 +148,11 @@ def _split_single_overwide_line(
             break
 
         result.append(head)
-        pending_line = prepend_continuation_prefix(line=tail, prefix=wrapped_tail_prefix)
+        pending_line = prepend_continuation_prefix(
+            line=tail,
+            prefix=wrapped_tail_prefix,
+            text_rules=text_rules,
+        )
 
     result.append(pending_line)
     return result

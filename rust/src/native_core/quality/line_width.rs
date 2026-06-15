@@ -9,6 +9,9 @@ use super::super::details::base_detail;
 use super::super::models::{CompiledRules, NativeTranslationItem};
 use super::super::placeholders::LITERAL_LINE_BREAK_MARKER;
 use super::super::rules::PLACEHOLDER_RE;
+use super::super::text_layout::{
+    count_unprotected_width_chars, normalize_byte_spans, raw_control_candidate_byte_spans,
+};
 
 /// 收集单条译文中所有行宽超限问题。
 pub(super) fn collect_overwide_details(
@@ -131,15 +134,12 @@ fn count_line_width_chars(text: &str, rules: &CompiledRules) -> usize {
             .into_iter()
             .map(|span| (span.start, span.end)),
     );
-    text.char_indices()
-        .filter(|(byte_index, char_value)| {
-            !protected_spans
-                .iter()
-                .any(|(start, end)| *start <= *byte_index && *byte_index < *end)
-                && matches!(
-                    rules.line_width_count_re.is_match(&char_value.to_string()),
-                    Ok(true)
-                )
-        })
-        .count()
+    protected_spans.extend(raw_control_candidate_byte_spans(text));
+    let normalized_spans = normalize_byte_spans(protected_spans);
+    count_unprotected_width_chars(text, &normalized_spans, |character| {
+        matches!(
+            rules.line_width_count_re.is_match(&character.to_string()),
+            Ok(true)
+        )
+    })
 }
