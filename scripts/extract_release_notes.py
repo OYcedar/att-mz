@@ -6,6 +6,7 @@ import argparse
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,10 @@ GENERIC_RELEASE_NOTE_PATTERNS = (
 )
 VERIFICATION_COMMAND_PATTERN = re.compile(
     r"\b(?:uv\s+run\s+(?:basedpyright|pytest)|cargo\s+(?:fmt|clippy|test))\b"
+)
+RELEASE_PACKAGE_NAMES = (
+    "att-mz-windows-x86_64.zip",
+    "att-mz-linux-x86_64.zip",
 )
 
 
@@ -41,10 +46,13 @@ def parse_args() -> ReleaseNotesOptions:
     )
     _ = parser.add_argument("--output", required=True, help="写出的 Release 正文 markdown 文件")
     namespace = parser.parse_args()
+    tag = cast(str, namespace.tag)
+    changelog = cast(str, namespace.changelog)
+    output = cast(str, namespace.output)
     return ReleaseNotesOptions(
-        tag=str(namespace.tag),
-        changelog_path=Path(str(namespace.changelog)).resolve(),
-        output_path=Path(str(namespace.output)).resolve(),
+        tag=tag,
+        changelog_path=Path(changelog).resolve(),
+        output_path=Path(output).resolve(),
     )
 
 
@@ -88,8 +96,11 @@ def validate_release_notes_section(*, notes: str, tag: str) -> None:
         raise ValueError(f"CHANGELOG.md 中发布正文过于空泛: {tag}")
     if VERIFICATION_COMMAND_PATTERN.search(body) is None:
         raise ValueError(f"CHANGELOG.md 中发布标签缺少验证命令: {tag}")
-    if "att-mz-windows-x86_64.zip" not in body:
-        raise ValueError(f"CHANGELOG.md 中发布标签缺少发行包下载信息: {tag}")
+    missing_packages = [package_name for package_name in RELEASE_PACKAGE_NAMES if package_name not in body]
+    if missing_packages:
+        raise ValueError(
+            f"CHANGELOG.md 中发布标签缺少发行包下载信息: {tag}: {', '.join(missing_packages)}"
+        )
 
 
 def _release_notes_body(*, notes: str, tag: str) -> str:
@@ -110,7 +121,7 @@ def _release_notes_body_is_generic(lines: list[str]) -> bool:
         cleaned_line = line.lstrip("-* ").strip()
         if VERIFICATION_COMMAND_PATTERN.search(cleaned_line):
             continue
-        if "att-mz-windows-x86_64.zip" in cleaned_line:
+        if any(package_name in cleaned_line for package_name in RELEASE_PACKAGE_NAMES):
             continue
         content_lines.append(cleaned_line)
     if not content_lines:
@@ -129,7 +140,7 @@ def write_release_notes(options: ReleaseNotesOptions) -> None:
         tag=options.tag,
     )
     options.output_path.parent.mkdir(parents=True, exist_ok=True)
-    options.output_path.write_text(notes, encoding="utf-8")
+    _ = options.output_path.write_text(notes, encoding="utf-8")
 
 
 def main() -> int:

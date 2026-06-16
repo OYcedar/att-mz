@@ -34,20 +34,20 @@
 全量多轮后如果质量报告仍有少量可修复明细，运行：
 
 ```powershell
-.\att-mz.exe export-quality-fix-template --game <游戏标题> --output <工作区>/quality-fix-template.json
+<A.T.T MZ 可执行文件> export-quality-fix-template --game <游戏标题> --output <工作区>/quality-fix-template.json
 ```
 
 修复表里只改 `translation_lines`。改完后运行：
 
 ```powershell
-.\att-mz.exe import-manual-translations --game <游戏标题> --input <工作区>/quality-fix-template.json --check-only
-.\att-mz.exe import-manual-translations --game <游戏标题> --input <工作区>/quality-fix-template.json
+<A.T.T MZ 可执行文件> import-manual-translations --game <游戏标题> --input <工作区>/quality-fix-template.json --check-only
+<A.T.T MZ 可执行文件> import-manual-translations --game <游戏标题> --input <工作区>/quality-fix-template.json
 ```
 
 如果只剩还没成功保存译文的文本，且已经全量多轮重试并降到适合手动处理的数量，使用：
 
 ```powershell
-.\att-mz.exe export-pending-translations --game <游戏标题> --output <工作区>/pending-translations.json
+<A.T.T MZ 可执行文件> export-pending-translations --game <游戏标题> --output <工作区>/pending-translations.json
 ```
 
 需要抽样或分批时追加 `--limit N`。不传 `--limit` 时导出全部剩余文本，但全量导出必须满足“已经降到适合手动处理或多轮不下降”的前置条件。
@@ -59,8 +59,8 @@
 发现源文残留时先判断是不是漏翻。日文残留通常按假名、片假名等字符级风险处理；英文残留报告偏高精度，优先表示译文连续复制了当前原文的大段英文。漏翻就修中文译文行后导入。只有致谢名单、Staff 名、作品名、品牌名、游戏内专有名词等确实无需翻译，且质量报告实际提示需要放行的片段，才写入 `source-residual-rules.json` 并运行：
 
 ```powershell
-.\att-mz.exe validate-source-residual-rules --game <游戏标题> --input <工作区>/source-residual-rules.json
-.\att-mz.exe import-source-residual-rules --game <游戏标题> --input <工作区>/source-residual-rules.json
+<A.T.T MZ 可执行文件> validate-source-residual-rules --game <游戏标题> --input <工作区>/source-residual-rules.json
+<A.T.T MZ 可执行文件> import-source-residual-rules --game <游戏标题> --input <工作区>/source-residual-rules.json
 ```
 
 源文保留例外必须限制到具体文本内部位置或明确结构性片段，并填写原因。禁止用它掩盖整句漏翻，禁止关闭全局源文残留检测。
@@ -78,13 +78,13 @@
 运行：
 
 ```powershell
-.\att-mz.exe reset-translations --game <游戏标题> --input <工作区>/reset-translations.json
+<A.T.T MZ 可执行文件> reset-translations --game <游戏标题> --input <工作区>/reset-translations.json
 ```
 
 用户明确要求完整重译已完成游戏时，使用：
 
 ```powershell
-.\att-mz.exe reset-translations --game <游戏标题> --all
+<A.T.T MZ 可执行文件> reset-translations --game <游戏标题> --all
 ```
 
 不要手工拼当前提取范围全集路径，不要把 `translation_lines` 写成空数组来绕过导入校验。

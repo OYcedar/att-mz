@@ -130,7 +130,7 @@
 ## Skill 同步原则
 
 - Skill 只写 Agent 运行翻译流程所需的黑盒命令契约，不写 handler、源码模块、数据库表或维护者排障路线。
-- 开发版 Skill 使用 `uv run python main.py <命令> ...`；发行版 Skill 使用 `.\att-mz.exe <命令> ...`。
+- 开发版 Skill 使用 `uv run python main.py <命令> ...`；发行版 Skill 源模板使用 `<A.T.T MZ 可执行文件> <命令> ...`，发布时由 `scripts/build_release.py` 按目标平台渲染为 Windows `.\att-mz.exe <命令> ...` 或 Linux `./att-mz <命令> ...`。
 - 两份 Skill 的业务语义、JSON 判断、停止条件和用户文案必须一致；差异只允许来自命令入口、可访问资源、停止条件和打包环境。
 - CLI wiki 可以帮助维护者审查 Skill 是否过时，但不能被 Skill 引用成执行依据。
 

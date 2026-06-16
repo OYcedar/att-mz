@@ -2,7 +2,7 @@
 
 ## 职责
 
-发布与测试文档覆盖发行包构建、Skill 分发、提示词、GitHub Actions 和自动化测试。正式发行包只由 GitHub Actions `release` 工作流生成。`scripts/build_release.py` 负责发布目录、可执行文件、发行版 README、发行版 Skill、字体、提示词和空数据目录的包装。
+发布与测试文档覆盖发行包构建、Skill 分发、提示词、GitHub Actions 和自动化测试。正式发行包只由 GitHub Actions `release` 工作流生成。`scripts/build_release.py` 负责发布目录、可执行文件、发行版 README、发行版 Skill、字体、提示词和空数据目录的包装，并按目标平台渲染发行版 Skill 的命令入口。
 
 ## 输入
 
@@ -12,8 +12,9 @@
 
 ## 输出
 
-- `att-mz-windows-x86_64.zip`。
-- 发行包内的 `att-mz.exe`、`README.md`、`setting.toml`、`skills/att-mz/SKILL.md`、Skill references、字体、提示词和空数据目录。
+- `att-mz-windows-x86_64.zip` 和 `att-mz-linux-x86_64.zip`。
+- Windows 发行包内的 `att-mz.exe`，Linux 发行包内的 `att-mz`。
+- 两个平台发行包内共同包含 `README.md`、`setting.toml`、`skills/att-mz/SKILL.md`、Skill references、字体、提示词和空数据目录。
 - GitHub Release 正文来自 `CHANGELOG.md` 中对应 tag 的版本段落。
 - CI 中的类型检查、测试、构建和冒烟测试结果。
 - 本地大样本性能基准 JSON 结果。
@@ -21,9 +22,10 @@
 ## 失败策略
 
 - 本机执行发行版构建脚本会失败；正式发行版只能由 GitHub Actions 构建。
-- 发布工作流先执行 `uv run basedpyright`、设置 `ATT_MZ_RUST_THREADS=1` 后执行 `uv run pytest -q -n 12 --dist=load --durations=30 --durations-min=0.5`、`cargo fmt --manifest-path rust/Cargo.toml -- --check`、`cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings` 和 `cargo test --manifest-path rust/Cargo.toml`，通过后才构建发行包。
+- 发布工作流先在 Windows runner 执行 `uv run basedpyright`、设置 `ATT_MZ_RUST_THREADS=1` 后执行 `uv run pytest -q -n 12 --dist=load --durations=30 --durations-min=0.5`、`cargo fmt --manifest-path rust/Cargo.toml -- --check`、`cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings` 和 `cargo test --manifest-path rust/Cargo.toml`，通过后才进入 Windows / Linux 双平台构建。
 - 发布工作流必须先从 `CHANGELOG.md` 提取当前 tag 的具体更新说明；找不到对应版本段落时停止发布，不能只使用 GitHub 自动生成的 Release notes。
-- 发行包冒烟测试必须验证 `att-mz.exe --help` 和空注册表读取。
+- 当前 Release 正文必须同时包含 `att-mz-windows-x86_64.zip` 和 `att-mz-linux-x86_64.zip` 下载信息。
+- 发行包冒烟测试必须验证当前平台可执行文件的 `--help` 和空注册表读取；Windows 验证 `att-mz.exe`，Linux 验证 `att-mz`。
 - 大样本性能门禁不能在 GitHub 托管 runner 上伪造执行；私有样本只能放在本机或持有样本的专用环境。发布前在持有样本的环境运行下面的命令。失败时暂停发布：
 
 ```powershell
@@ -68,7 +70,7 @@ uv run python scripts/benchmark_small_tasks.py `
 ## 协作模块
 
 - 开发版 Skill 位于 `skills/att-mz/SKILL.md`，用于源码环境中的翻译流程。
-- 发行版 Skill 位于 `skills/att-mz-release/SKILL.md`，发布时改写为发行包内的 `skills/att-mz/SKILL.md`。
+- 发行版 Skill 位于 `skills/att-mz-release/SKILL.md`，源模板使用 `<A.T.T MZ 可执行文件>` 占位入口；发布时改写为发行包内的 `skills/att-mz/SKILL.md`，Windows 包渲染为 `.\att-mz.exe`，Linux 包渲染为 `./att-mz`。
 - 提示词位于 `prompts/`，正文翻译 prompt 不应暴露数据库字段、内部路径或程序定位细节。
 - 测试目录按业务域覆盖 CLI、配置、Agent 工具箱、文本规则、翻译、术语和持久化；发布协议由 release workflow、生成检查、脚本检查和人工审查确认。
 
@@ -86,7 +88,7 @@ uv run python scripts/benchmark_small_tasks.py `
 
 - `uv run basedpyright` 是 Python 静态类型交付红线。
 - 设置 `ATT_MZ_RUST_THREADS=1` 后执行 `uv run pytest -q -n 12 --dist=load --durations=30 --durations-min=0.5` 是当前 Python 业务测试交付红线；测试子集不能替代全量 pytest。
-- 普通 push 和 pull request 不再自动执行常规 CI；发布工作流在构建发行包前执行 Python 静态类型检查和全量 pytest 门禁。
+- 普通 push 和 pull request 不再自动执行常规 CI；发布工作流在构建发行包前执行 Python 静态类型检查和全量 pytest 门禁，并在门禁通过后分别构建 Windows / Linux 发行包。
 - 改到 Rust 或 PyO3 相关代码时执行 `cargo fmt --manifest-path rust/Cargo.toml -- --check`、`cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings` 和 `cargo test --manifest-path rust/Cargo.toml`。
 - 改到 Skill、README、提示词或工作区协议时，运行对应生成检查、静态检查或人工审查差异；不再用 pytest 固定这些文档和协议。
 - 改到写文件、插件源码扫描、当前运行审计、小任务链路或性能脚本时，使用真实 CLI 性能证据和阶段耗时验证；不再用 benchmark pytest 代替真实性能门禁。

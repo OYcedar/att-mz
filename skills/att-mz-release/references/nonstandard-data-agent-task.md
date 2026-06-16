@@ -49,10 +49,10 @@
 - 只选择玩家可见的 UI、菜单、说明、任务、状态、提示和对话文本。
 - 排除资源路径、图片/音频文件名、脚本、公式、ID、布尔值、数字、枚举、内部键、颜色、坐标和纯协议值。
 - 判断不清时，用同一对象的字段名、相邻字段、重复结构、同文件样本和源 JSON 副本交叉验证；证据不足时向主代理报告，不编造规则。
-- 完成后运行 `.\att-mz.exe validate-nonstandard-data-rules --game <游戏标题> --input <工作区>/nonstandard-data-rules.json`。
+- 完成后运行 `<A.T.T MZ 可执行文件> validate-nonstandard-data-rules --game <游戏标题> --input <工作区>/nonstandard-data-rules.json`。
 - validate 前必须完成 `nonstandard_data_review`，审查报告写入 `<工作区>/review-reports/branch_rules/nonstandard_data_review.json`。
 - 主代理读取工作报告、审查报告和候选文件，写入 `<工作区>/review-decisions/branch_rules.json`；存在未关闭 `blocker` 时停止。
-- validate 通过且主代理裁决为 `approved` 后运行 `.\att-mz.exe import-nonstandard-data-rules --game <游戏标题> --input <工作区>/nonstandard-data-rules.json`。
+- validate 通过且主代理裁决为 `approved` 后运行 `<A.T.T MZ 可执行文件> import-nonstandard-data-rules --game <游戏标题> --input <工作区>/nonstandard-data-rules.json`。
 
 ## 停止条件
 
