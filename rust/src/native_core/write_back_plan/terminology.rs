@@ -9,25 +9,26 @@ use super::models::{
 };
 use super::utils::is_map_file;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+struct MvVirtualSpeakerNameWriteContext<'a> {
+    data_files: &'a BTreeMap<String, Value>,
+    translations: &'a HashMap<String, String>,
+    rules: &'a [MvVirtualNameboxRule],
+    fact_templates: &'a [MvVirtualNameboxFactTemplate],
+    skipped_location_paths: &'a BTreeSet<String>,
+}
 
 pub(super) fn apply_terminology(
     data_files: &mut BTreeMap<String, Value>,
     terminology: &HashMap<String, HashMap<String, String>>,
     layout: &Layout,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
-    mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
 ) -> Result<usize, String> {
     let mut written_count = 0usize;
     if let Some(speaker_names) = terminology.get("speaker_names") {
         written_count += match layout.engine_kind {
             EngineKind::Mz => write_mz_speaker_names(data_files, speaker_names)?,
-            EngineKind::Mv => write_mv_virtual_speaker_names(
-                data_files,
-                speaker_names,
-                mv_virtual_namebox_rules,
-                mv_virtual_namebox_fact_templates,
-            )?,
+            EngineKind::Mv => 0,
         };
     }
     if let Some(map_names) = terminology.get("map_display_names") {
@@ -123,6 +124,25 @@ pub(super) fn apply_terminology(
         }
     }
     Ok(written_count)
+}
+
+pub(super) fn apply_mv_virtual_speaker_names(
+    data_files: &mut BTreeMap<String, Value>,
+    terminology: &HashMap<String, HashMap<String, String>>,
+    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
+    mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
+    skipped_location_paths: &BTreeSet<String>,
+) -> Result<usize, String> {
+    let Some(speaker_names) = terminology.get("speaker_names") else {
+        return Ok(0);
+    };
+    write_mv_virtual_speaker_names(
+        data_files,
+        speaker_names,
+        mv_virtual_namebox_rules,
+        mv_virtual_namebox_fact_templates,
+        skipped_location_paths,
+    )
 }
 
 pub(super) fn write_mz_speaker_names(
@@ -284,11 +304,12 @@ pub(super) fn write_mz_speaker_names_to_commands(
     Ok(written_count)
 }
 
-pub(super) fn write_mv_virtual_speaker_names(
+fn write_mv_virtual_speaker_names(
     data_files: &mut BTreeMap<String, Value>,
     translations: &HashMap<String, String>,
     mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
     mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
+    skipped_location_paths: &BTreeSet<String>,
 ) -> Result<usize, String> {
     if mv_virtual_namebox_rules.is_empty() {
         return Err("MV 术语写回缺少 MV 虚拟名字框规则，不能写入 speaker_names".to_string());
@@ -298,6 +319,7 @@ pub(super) fn write_mv_virtual_speaker_names(
         translations,
         mv_virtual_namebox_rules,
         mv_virtual_namebox_fact_templates,
+        skipped_location_paths,
     )?;
     let written_count = targets.len();
     for (target_path, translated_text) in targets {
@@ -306,56 +328,39 @@ pub(super) fn write_mv_virtual_speaker_names(
     Ok(written_count)
 }
 
-pub(super) fn collect_mv_virtual_speaker_name_writes(
+fn collect_mv_virtual_speaker_name_writes(
     data_files: &BTreeMap<String, Value>,
     translations: &HashMap<String, String>,
     mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
     mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
+    skipped_location_paths: &BTreeSet<String>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut targets = Vec::new();
+    let context = MvVirtualSpeakerNameWriteContext {
+        data_files,
+        translations,
+        rules: mv_virtual_namebox_rules,
+        fact_templates: mv_virtual_namebox_fact_templates,
+        skipped_location_paths,
+    };
     for (file_name, value) in data_files {
         if is_map_file(file_name) {
-            collect_mv_map_virtual_speaker_name_writes(
-                data_files,
-                file_name,
-                value,
-                translations,
-                mv_virtual_namebox_rules,
-                mv_virtual_namebox_fact_templates,
-                &mut targets,
-            )?;
+            collect_mv_map_virtual_speaker_name_writes(file_name, value, &context, &mut targets)?;
         }
     }
     if let Some(value) = data_files.get(COMMON_EVENTS_FILE_NAME) {
-        collect_mv_common_event_virtual_speaker_name_writes(
-            data_files,
-            value,
-            translations,
-            mv_virtual_namebox_rules,
-            mv_virtual_namebox_fact_templates,
-            &mut targets,
-        )?;
+        collect_mv_common_event_virtual_speaker_name_writes(value, &context, &mut targets)?;
     }
     if let Some(value) = data_files.get(TROOPS_FILE_NAME) {
-        collect_mv_troop_virtual_speaker_name_writes(
-            data_files,
-            value,
-            translations,
-            mv_virtual_namebox_rules,
-            mv_virtual_namebox_fact_templates,
-            &mut targets,
-        )?;
+        collect_mv_troop_virtual_speaker_name_writes(value, &context, &mut targets)?;
     }
     Ok(targets)
 }
 
-pub(super) fn collect_mv_map_virtual_speaker_name_writes(
-    data_files: &BTreeMap<String, Value>,
+fn collect_mv_map_virtual_speaker_name_writes(
     file_name: &str,
     value: &Value,
-    translations: &HashMap<String, String>,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
-    mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
+    context: &MvVirtualSpeakerNameWriteContext<'_>,
     targets: &mut Vec<(String, String)>,
 ) -> Result<(), String> {
     let object = value
@@ -389,12 +394,9 @@ pub(super) fn collect_mv_map_virtual_speaker_name_writes(
                     format!("{page_context}.list 不是数组，不能写入 MV 虚拟名字框术语")
                 })?;
             collect_mv_virtual_speaker_name_writes_from_commands(
-                data_files,
                 commands,
                 &page_context,
-                translations,
-                mv_virtual_namebox_rules,
-                mv_virtual_namebox_fact_templates,
+                context,
                 targets,
             )?;
         }
@@ -402,12 +404,9 @@ pub(super) fn collect_mv_map_virtual_speaker_name_writes(
     Ok(())
 }
 
-pub(super) fn collect_mv_common_event_virtual_speaker_name_writes(
-    data_files: &BTreeMap<String, Value>,
+fn collect_mv_common_event_virtual_speaker_name_writes(
     value: &Value,
-    translations: &HashMap<String, String>,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
-    mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
+    context: &MvVirtualSpeakerNameWriteContext<'_>,
     targets: &mut Vec<(String, String)>,
 ) -> Result<(), String> {
     let events = value
@@ -426,24 +425,18 @@ pub(super) fn collect_mv_common_event_virtual_speaker_name_writes(
             .and_then(Value::as_array)
             .ok_or_else(|| format!("{event_context}.list 不是数组，不能写入 MV 虚拟名字框术语"))?;
         collect_mv_virtual_speaker_name_writes_from_commands(
-            data_files,
             commands,
             &event_context,
-            translations,
-            mv_virtual_namebox_rules,
-            mv_virtual_namebox_fact_templates,
+            context,
             targets,
         )?;
     }
     Ok(())
 }
 
-pub(super) fn collect_mv_troop_virtual_speaker_name_writes(
-    data_files: &BTreeMap<String, Value>,
+fn collect_mv_troop_virtual_speaker_name_writes(
     value: &Value,
-    translations: &HashMap<String, String>,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
-    mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
+    context: &MvVirtualSpeakerNameWriteContext<'_>,
     targets: &mut Vec<(String, String)>,
 ) -> Result<(), String> {
     let troops = value
@@ -473,12 +466,9 @@ pub(super) fn collect_mv_troop_virtual_speaker_name_writes(
                     format!("{page_context}.list 不是数组，不能写入 MV 虚拟名字框术语")
                 })?;
             collect_mv_virtual_speaker_name_writes_from_commands(
-                data_files,
                 commands,
                 &page_context,
-                translations,
-                mv_virtual_namebox_rules,
-                mv_virtual_namebox_fact_templates,
+                context,
                 targets,
             )?;
         }
@@ -486,13 +476,10 @@ pub(super) fn collect_mv_troop_virtual_speaker_name_writes(
     Ok(())
 }
 
-pub(super) fn collect_mv_virtual_speaker_name_writes_from_commands(
-    data_files: &BTreeMap<String, Value>,
+fn collect_mv_virtual_speaker_name_writes_from_commands(
     commands: &[Value],
     command_path_prefix: &str,
-    translations: &HashMap<String, String>,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
-    mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
+    context: &MvVirtualSpeakerNameWriteContext<'_>,
     targets: &mut Vec<(String, String)>,
 ) -> Result<(), String> {
     for (command_index, command_value) in commands.iter().enumerate() {
@@ -507,12 +494,15 @@ pub(super) fn collect_mv_virtual_speaker_name_writes_from_commands(
         if code != 101 {
             continue;
         }
+        if context.skipped_location_paths.contains(&command_path) {
+            continue;
+        }
         let Some((speaker_line_path, virtual_speaker)) = find_mv_virtual_speaker_command_ref(
-            data_files,
+            context.data_files,
             commands,
             command_index,
             command_path_prefix,
-            mv_virtual_namebox_rules,
+            context.rules,
         )?
         else {
             continue;
@@ -523,11 +513,11 @@ pub(super) fn collect_mv_virtual_speaker_name_writes_from_commands(
         ) {
             continue;
         }
-        let Some(translated_speaker) = translations.get(&virtual_speaker.speaker) else {
+        let Some(translated_speaker) = context.translations.get(&virtual_speaker.speaker) else {
             continue;
         };
         let fact_template = find_mv_virtual_namebox_fact_template(
-            mv_virtual_namebox_fact_templates,
+            context.fact_templates,
             &speaker_line_path,
             &virtual_speaker,
         )
