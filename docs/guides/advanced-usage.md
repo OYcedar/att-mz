@@ -10,6 +10,7 @@
 | uv | 安装依赖、运行命令和测试 |
 | Rust stable | 构建 PyO3 原生扩展 |
 | VS Build Tools | Windows 上提供 MSVC 链接器，安装“使用 C++ 的桌面开发”组件 |
+| C/C++ 构建工具 | Linux 上提供系统链接器和基础编译工具，例如 Debian / Ubuntu 的 `build-essential` |
 
 初始化源码环境：
 
@@ -408,7 +409,7 @@ cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path rust/Cargo.toml
 ```
 
-发行版只能由 GitHub Actions 的 `release` 工作流构建。本机负责源码修改、测试和提交，不负责生成正式发行包。
+Windows / Linux 正式发行包只能由 GitHub Actions 的 `release` 工作流构建。本机负责源码修改、测试和提交，不负责生成正式发行包。
 
 ## 性能基准
 

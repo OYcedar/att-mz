@@ -55,7 +55,7 @@
 写完后建议主代理运行：
 
 ```powershell
-.\att-mz.exe validate-plugin-rules --game <游戏标题> --input <工作区>/plugin-rules.json
+<A.T.T MZ 可执行文件> validate-plugin-rules --game <游戏标题> --input <工作区>/plugin-rules.json
 ```
 
 如果校验失败，只修 `<工作区>/plugin-rules.json` 后重跑同一校验命令；不要绕过 CLI 导入。

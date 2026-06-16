@@ -25,8 +25,8 @@ permissions:
   contents: write
 
 jobs:
-  build-release:
-    name: Build Windows release
+  validate-release:
+    name: Validate release
     runs-on: windows-latest
     timeout-minutes: 45
 
@@ -46,25 +46,6 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Resolve release metadata
-        id: meta
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $tag = "${{ inputs.tag }}"
-          }
-          if ([string]::IsNullOrWhiteSpace($tag)) {
-            throw "缺少发布标签"
-          }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "zip_name=att-mz-windows-x86_64.zip" >> $env:GITHUB_OUTPUT
-          "release_notes=dist/release-notes.md" >> $env:GITHUB_OUTPUT
-
-      - name: Prepare release notes
-        shell: pwsh
-        run: python scripts/extract_release_notes.py --tag "${{ steps.meta.outputs.tag }}" --output "${{ steps.meta.outputs.release_notes }}"
 
       - name: Install project dependencies
         shell: pwsh
@@ -92,16 +73,95 @@ jobs:
         shell: pwsh
         run: cargo test --manifest-path rust/Cargo.toml
 
+  build-release:
+    name: Build ${{ matrix.label }} release
+    needs: validate-release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows
+            os: windows-latest
+            target_platform: windows-x86_64
+            zip_name: att-mz-windows-x86_64.zip
+          - label: Linux
+            os: ubuntu-latest
+            target_platform: linux-x86_64
+            zip_name: att-mz-linux-x86_64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install project dependencies
+        shell: pwsh
+        run: uv sync --locked --dev
+
       - name: Build release zip
         shell: pwsh
-        run: uv run python scripts/build_release.py --zip-name "${{ steps.meta.outputs.zip_name }}"
+        run: uv run python scripts/build_release.py --target-platform "${{ matrix.target_platform }}" --zip-name "${{ matrix.zip_name }}"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.meta.outputs.zip_name }}
-          path: dist/${{ steps.meta.outputs.zip_name }}
+          name: ${{ matrix.zip_name }}
+          path: dist/${{ matrix.zip_name }}
           if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub release
+    needs: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.tag }}"
+          }
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw "缺少发布标签"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "release_notes=dist/release-notes.md" >> $env:GITHUB_OUTPUT
+
+      - name: Prepare release notes
+        shell: pwsh
+        run: python scripts/extract_release_notes.py --tag "${{ steps.meta.outputs.tag }}" --output "${{ steps.meta.outputs.release_notes }}"
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: att-mz-*.zip
+          merge-multiple: true
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
@@ -109,7 +169,7 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: A.T.T MZ ${{ steps.meta.outputs.tag }}
-          files: dist/${{ steps.meta.outputs.zip_name }}
+          files: dist/att-mz-*.zip
           body_path: ${{ steps.meta.outputs.release_notes }}
           draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
           prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}

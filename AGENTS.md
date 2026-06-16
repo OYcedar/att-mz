@@ -17,7 +17,7 @@
 - 运行数据使用 SQLite，按游戏分库存储在 `data/db/`；持久 schema DDL 以 `app/persistence/schema/current.sql` 为事实源，业务代码不得复制 schema 结构判断。
 - 性能敏感和结构化写回能力由 Rust 2024 原生扩展提供，通过 `PyO3` + `maturin` 构建为 `app._native`；Rust 侧重型并行使用 `rayon` 等可控线程池。
 - 长期方向是减少 Python 核心逻辑、强化 Rust 主路径。除 CLI 编排、配置校验、模型 SDK 接入、报告组装等必要边界外，严禁在 Python 侧新增核心逻辑和基础能力；确因当前任务无法立即迁移到 Rust 时，必须在交付说明写明原因、临时边界、删除条件和对应测试。
-- 正式 Windows 发行包只允许由 GitHub Actions `release` 工作流生成；本机只提供源码改动、提交和工作流触发。
+- 正式 Windows / Linux 发行包只允许由 GitHub Actions `release` 工作流生成；本机只提供源码改动、提交和工作流触发。
 
 ## 2. 长期审查尺子
 

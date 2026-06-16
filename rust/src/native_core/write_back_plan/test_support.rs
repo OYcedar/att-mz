@@ -708,6 +708,123 @@ fn build_plan_write_back_loads_actor_names_for_mv_actor_name_rule() {
 }
 
 #[test]
+fn build_plan_keeps_mv_speaker_terms_stable_after_dialogue_line_deletions() {
+    let fixture = create_fixture_dir("att_mz_write_plan_mv_namebox_shift");
+    let game_dir = fixture.join("game");
+    let db_path = fixture.join("game.db");
+    create_minimal_mv_game_files(&game_dir);
+    create_minimal_database(&db_path);
+    write_mv_data_origin_and_active(
+        &game_dir,
+        "CommonEvents.json",
+        r#"[null,{"id":1,"list":[{"code":101,"parameters":[0,0,0,2]},{"code":401,"parameters":["盗賊頭"]},{"code":401,"parameters":["甲一"]},{"code":401,"parameters":["甲二"]},{"code":101,"parameters":[0,0,0,2]},{"code":401,"parameters":["盗賊頭"]},{"code":401,"parameters":["乙一"]},{"code":401,"parameters":["乙二"]},{"code":101,"parameters":[0,0,0,2]},{"code":401,"parameters":["追いはぎ"]},{"code":401,"parameters":["丙一"]},{"code":101,"parameters":[0,0,0,2]},{"code":401,"parameters":["盗賊頭"]},{"code":401,"parameters":["丁一"]},{"code":0,"parameters":[]}]}]"#,
+    );
+    insert_mv_exact_namebox_rule(&db_path);
+    insert_field_term(&db_path, "speaker_names", "盗賊頭", "头目");
+    insert_field_term(&db_path, "speaker_names", "追いはぎ", "小弟");
+    insert_mv_standalone_namebox_text_fact(
+        &db_path,
+        "CommonEvents.json/1/0",
+        &["CommonEvents.json/1/2", "CommonEvents.json/1/3"],
+        "盗賊頭",
+        "盗賊頭\n甲一\n甲二",
+        "甲一\n甲二",
+    );
+    insert_mv_standalone_namebox_text_fact(
+        &db_path,
+        "CommonEvents.json/1/4",
+        &["CommonEvents.json/1/6", "CommonEvents.json/1/7"],
+        "盗賊頭",
+        "盗賊頭\n乙一\n乙二",
+        "乙一\n乙二",
+    );
+    insert_mv_standalone_namebox_text_fact(
+        &db_path,
+        "CommonEvents.json/1/8",
+        &["CommonEvents.json/1/10"],
+        "追いはぎ",
+        "追いはぎ\n丙一",
+        "丙一",
+    );
+    insert_mv_standalone_namebox_text_fact(
+        &db_path,
+        "CommonEvents.json/1/11",
+        &["CommonEvents.json/1/13"],
+        "盗賊頭",
+        "盗賊頭\n丁一",
+        "丁一",
+    );
+    let connection = Connection::open(&db_path).expect("测试数据库应可打开");
+    for (location_path, role, original_lines, source_line_paths, translation_lines) in [
+        (
+            "CommonEvents.json/1/0",
+            "盗賊頭",
+            r#"["甲一","甲二"]"#,
+            r#"["CommonEvents.json/1/2","CommonEvents.json/1/3"]"#,
+            r#"["甲译"]"#,
+        ),
+        (
+            "CommonEvents.json/1/4",
+            "盗賊頭",
+            r#"["乙一","乙二"]"#,
+            r#"["CommonEvents.json/1/6","CommonEvents.json/1/7"]"#,
+            r#"["乙译"]"#,
+        ),
+        (
+            "CommonEvents.json/1/8",
+            "追いはぎ",
+            r#"["丙一"]"#,
+            r#"["CommonEvents.json/1/10"]"#,
+            r#"["丙译"]"#,
+        ),
+    ] {
+        insert_translation_item_for_current_fact(
+            &connection,
+            location_path,
+            "long_text",
+            Some(role),
+            original_lines,
+            source_line_paths,
+            translation_lines,
+        );
+    }
+    drop(connection);
+
+    let mut payload = minimal_setting_payload();
+    payload
+        .as_object_mut()
+        .expect("测试配置载荷应为对象")
+        .remove("allowed_translation_paths");
+
+    let output = build_write_back_plan_impl(
+        &game_dir.to_string_lossy(),
+        &db_path.to_string_lossy(),
+        &payload.to_string(),
+        "rebuild_active_runtime",
+        false,
+    )
+    .expect("MV 说话人术语不应在正文删行后串到相邻名字框");
+    let value: Value = serde_json::from_str(&output).expect("写回计划输出应是 JSON");
+    let common_events: Value =
+        serde_json::from_str(planned_file_content(&value, "data/CommonEvents.json"))
+            .expect("CommonEvents.json 计划内容应是 JSON");
+    let commands = common_events[1]["list"]
+        .as_array()
+        .expect("测试公共事件指令应是数组");
+
+    assert_eq!(commands[1]["parameters"][0], "头目");
+    assert_eq!(commands[2]["parameters"][0], "甲译");
+    assert_eq!(commands[4]["parameters"][0], "头目");
+    assert_eq!(commands[5]["parameters"][0], "乙译");
+    assert_eq!(commands[7]["parameters"][0], "小弟");
+    assert_eq!(commands[8]["parameters"][0], "丙译");
+    assert_eq!(commands[10]["parameters"][0], "头目");
+    assert_eq!(commands[11]["parameters"][0], "丁一");
+
+    fs::remove_dir_all(fixture).expect("测试目录应可清理");
+}
+
+#[test]
 fn build_plan_writes_mz_terminology_fields() {
     let fixture = create_fixture_dir("att_mz_write_plan_mz_terminology");
     let game_dir = fixture.join("game");
@@ -3226,6 +3343,25 @@ fn insert_mv_angle_namebox_rule_without_space(db_path: &Path) {
     );
 }
 
+fn insert_mv_exact_namebox_rule(db_path: &Path) {
+    let pattern = r"^(?P<speaker>盗賊頭|追いはぎ)$";
+    insert_runtime_rule(
+        db_path,
+        "mv_virtual_namebox",
+        0,
+        "pcre2_pattern",
+        pattern,
+        json!({
+            "name": "exact-speaker",
+            "pattern": pattern,
+            "speaker_group": "speaker",
+            "body_group": "",
+            "speaker_policy": "translate",
+            "render_template": "{speaker}",
+        }),
+    );
+}
+
 fn insert_mv_virtual_namebox_text_fact(
     db_path: &Path,
     location_path: &str,
@@ -3254,6 +3390,35 @@ fn insert_mv_virtual_namebox_text_fact(
         raw_text,
         translatable_text,
         include_render_parts.then_some(render_parts.as_slice()),
+    );
+}
+
+fn insert_mv_standalone_namebox_text_fact(
+    db_path: &Path,
+    location_path: &str,
+    source_line_paths: &[&str],
+    role: &str,
+    raw_text: &str,
+    translatable_text: &str,
+) {
+    let render_parts = [
+        ("speaker", role, role, "speaker"),
+        ("literal", "\n", "\n", "literal"),
+        (
+            "translated_body",
+            translatable_text,
+            translatable_text,
+            "body",
+        ),
+    ];
+    insert_mv_virtual_namebox_text_fact_with_parts(
+        db_path,
+        location_path,
+        source_line_paths,
+        role,
+        raw_text,
+        translatable_text,
+        Some(render_parts.as_slice()),
     );
 }
 

@@ -49,7 +49,7 @@
 用户提供原文清单后，运行：
 
 ```powershell
-.\att-mz.exe verify-feedback-text --game <游戏标题> --input <反馈原文清单>
+<A.T.T MZ 可执行文件> verify-feedback-text --game <游戏标题> --input <反馈原文清单>
 ```
 
 反查仍存在的文本按分类处理：

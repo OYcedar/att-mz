@@ -66,9 +66,11 @@
 
 ## ⚙️ 第二步：下载 A.T.T MZ 并配置模型
 
-1. 打开 [GitHub Releases](https://github.com/yexi-by/att-mz/releases/latest)，下载 `att-mz-windows-x86_64.zip`（目前仅提供 Windows 版）
-2. 右键 zip → 全部解压缩 → 放到你方便找的位置
-3. 用记事本打开解压出来的 `setting.toml`，填模型配置：
+1. 打开 [GitHub Releases](https://github.com/yexi-by/att-mz/releases/latest)，按运行环境下载发行包：
+   - Windows x86_64：`att-mz-windows-x86_64.zip`
+   - Linux / WSL x86_64：`att-mz-linux-x86_64.zip`
+2. 解压到你方便找的位置。Windows 可右键 zip → 全部解压缩；Linux / WSL 可执行 `unzip att-mz-linux-x86_64.zip`，如果权限丢失再执行 `chmod +x att-mz/att-mz`
+3. 用文本编辑器打开解压出来的 `setting.toml`，填模型配置：
 
 ```toml
 [llm]
@@ -89,6 +91,8 @@ timeout = 600
 
 如果想准备多个模型客户端，继续追加 `[[llm.clients]]` 并使用不同 `name`。执行翻译时可让 Agent 给 `doctor`、`translate` 或 `run-all` 加 `--llm-client <客户端名称>` 选择；模型名、超时、地址和 Key 都写在对应客户端配置里。
 
+Linux / WSL 发行包可以原生运行 A.T.T MZ CLI，并能处理 `/mnt/c/...` 这类 WSL 挂载路径下的游戏目录。RPG Maker MV/MZ 的 Windows 游戏本体通常仍通过 `Game.exe` 启动，试玩和效果确认建议回到 Windows 环境进行。
+
 > 💡 如果你习惯用源码运行，看仓库里的 [进阶教学与源码编译](https://github.com/yexi-by/att-mz/blob/main/docs/guides/advanced-usage.md)。普通使用不需要。
 
 ## 📂 第三步：用 Agent 打开你的游戏目录
@@ -103,7 +107,7 @@ timeout = 600
 
 ### 使用发行包
 
-适合下载 `att-mz-windows-x86_64.zip` 后直接使用的人。
+适合下载 Windows 或 Linux / WSL 发行包后直接使用的人。
 
 ```text
 请使用 A.T.T MZ 工具包（发行包目录：<A.T.T MZ 发行包目录>）按照发行包内 `skills/att-mz/SKILL.md` 的流程，对当前打开的 RPG Maker MV/MZ 游戏进行完整汉化。

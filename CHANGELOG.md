@@ -1,5 +1,34 @@
 # 更新日志
 
+## v0.1.13 - 2026-06-16
+
+### 更新重点
+
+- 修复 MV 虚拟名字框写进游戏文件时的说话人信息串位问题，避免同一位置反复报告“说话人不一致”并阻止写回。
+- Release 同时提供 Windows x86_64 和 Linux / WSL x86_64 发行包，支持在 Linux / WSL 中原生运行命令并处理 `/mnt/c/...` 下的游戏目录，响应 Issue #8 的 Linux 可执行文件需求。
+- 发行版 Skill、README 和发布文档同步改为平台化命令入口：Windows 包使用 `.\att-mz.exe`，Linux 包使用 `./att-mz`。
+- 发布工作流改为先完成完整验证，再分别在 Windows 和 Linux runner 构建发行 ZIP，最后把两个包一起附到 GitHub Release。
+
+### 升级提醒
+
+- Windows 用户继续下载 `att-mz-windows-x86_64.zip`。
+- Linux / WSL 用户下载 `att-mz-linux-x86_64.zip`；解压工具丢失执行权限时，执行 `chmod +x att-mz/att-mz`。
+- Linux / WSL 包可以运行 CLI 和处理挂载路径下的项目；RPG Maker MV / MZ 的 Windows 游戏本体试玩仍建议在 Windows 环境确认。
+
+### 验证命令
+
+- `uv run basedpyright`
+- `uv run pytest -q -n 12 --dist=load --durations=30 --durations-min=0.5`
+- `cargo fmt --manifest-path rust/Cargo.toml -- --check`
+- `cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings`
+- `cargo test --manifest-path rust/Cargo.toml`
+
+### 发行包
+
+- GitHub Release 下载 `att-mz-windows-x86_64.zip`。
+- GitHub Release 下载 `att-mz-linux-x86_64.zip`。
+- 正式 Windows / Linux ZIP 由 GitHub Actions `release` 工作流生成。
+
 ## v0.1.12 - 2026-06-16
 
 ### 更新重点

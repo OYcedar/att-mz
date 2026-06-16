@@ -55,7 +55,7 @@ use self::repository::{
     read_terminology_terms, read_translation_items_for_allowed_paths,
     read_translation_items_for_writable_text_index,
 };
-use self::terminology::apply_terminology;
+use self::terminology::{apply_mv_virtual_speaker_names, apply_terminology};
 use self::utils::{build_changed_file, externalize_planned_file_contents, is_map_file};
 use crate::native_core::pool::run_with_optional_pool;
 use rayon::prelude::*;
@@ -132,6 +132,21 @@ fn build_write_back_plan_inner(
         read_origin_data_files(&layout)?
     } else {
         read_selected_origin_data_files(&layout, &data_file_names_to_load)?
+    };
+    let translated_item_location_paths: BTreeSet<String> = translated_items
+        .iter()
+        .map(|item| item.location_path.clone())
+        .collect();
+    let mv_speaker_terminology_written_count = if matches!(layout.engine_kind, EngineKind::Mv) {
+        apply_mv_virtual_speaker_names(
+            &mut data_files,
+            &terminology,
+            &mv_virtual_namebox_rules,
+            &mv_virtual_namebox_fact_templates,
+            &translated_item_location_paths,
+        )?
+    } else {
+        0
     };
     timings_ms.insert(
         "load_inputs".to_string(),
@@ -214,13 +229,8 @@ fn build_write_back_plan_inner(
         &text_rules,
     )?;
 
-    let terminology_written_count = apply_terminology(
-        &mut data_files,
-        &terminology,
-        &layout,
-        &mv_virtual_namebox_rules,
-        &mv_virtual_namebox_fact_templates,
-    )?;
+    let terminology_written_count = mv_speaker_terminology_written_count
+        + apply_terminology(&mut data_files, &terminology, &layout)?;
     let font_summary = if confirm_font_overwrite {
         apply_font_replacement(
             &layout,
