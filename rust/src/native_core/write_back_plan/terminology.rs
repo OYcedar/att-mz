@@ -1,23 +1,13 @@
 use super::command_writer::{
-    find_mv_virtual_speaker_command_ref, render_mv_virtual_speaker_line_from_render_parts,
-    write_command_first_parameter,
+    render_mv_virtual_speaker_line_from_render_parts, write_command_first_parameter,
 };
 use super::models::{
     COMMON_EVENTS_FILE_NAME, EngineKind, Layout, MvVirtualNameboxFactTemplate,
-    MvVirtualNameboxRule, MvVirtualSpeaker, MvVirtualSpeakerPolicy, SYSTEM_FILE_NAME,
-    TROOPS_FILE_NAME,
+    MvVirtualSpeakerPolicy, SYSTEM_FILE_NAME, TROOPS_FILE_NAME, TextFactRenderPart,
 };
 use super::utils::is_map_file;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-struct MvVirtualSpeakerNameWriteContext<'a> {
-    data_files: &'a BTreeMap<String, Value>,
-    translations: &'a HashMap<String, String>,
-    rules: &'a [MvVirtualNameboxRule],
-    fact_templates: &'a [MvVirtualNameboxFactTemplate],
-    skipped_location_paths: &'a BTreeSet<String>,
-}
 
 pub(super) fn apply_terminology(
     data_files: &mut BTreeMap<String, Value>,
@@ -129,7 +119,6 @@ pub(super) fn apply_terminology(
 pub(super) fn apply_mv_virtual_speaker_names(
     data_files: &mut BTreeMap<String, Value>,
     terminology: &HashMap<String, HashMap<String, String>>,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
     mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
     skipped_location_paths: &BTreeSet<String>,
 ) -> Result<usize, String> {
@@ -139,7 +128,6 @@ pub(super) fn apply_mv_virtual_speaker_names(
     write_mv_virtual_speaker_names(
         data_files,
         speaker_names,
-        mv_virtual_namebox_rules,
         mv_virtual_namebox_fact_templates,
         skipped_location_paths,
     )
@@ -307,17 +295,11 @@ pub(super) fn write_mz_speaker_names_to_commands(
 fn write_mv_virtual_speaker_names(
     data_files: &mut BTreeMap<String, Value>,
     translations: &HashMap<String, String>,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
     mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
     skipped_location_paths: &BTreeSet<String>,
 ) -> Result<usize, String> {
-    if mv_virtual_namebox_rules.is_empty() {
-        return Err("MV 术语写回缺少 MV 虚拟名字框规则，不能写入 speaker_names".to_string());
-    }
     let targets = collect_mv_virtual_speaker_name_writes(
-        data_files,
         translations,
-        mv_virtual_namebox_rules,
         mv_virtual_namebox_fact_templates,
         skipped_location_paths,
     )?;
@@ -329,248 +311,71 @@ fn write_mv_virtual_speaker_names(
 }
 
 fn collect_mv_virtual_speaker_name_writes(
-    data_files: &BTreeMap<String, Value>,
     translations: &HashMap<String, String>,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
     mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
     skipped_location_paths: &BTreeSet<String>,
 ) -> Result<Vec<(String, String)>, String> {
+    // 直接遍历当前文本事实模板：每个模板的 location_path 即 101 命令路径，
+    // source_line_paths 首元素即名字框说话人行路径，role 即术语查表键，
+    // speaker_policy/source_speaker/render_parts 已由索引阶段一次性计算。
+    // 不再重新扫描 data_files 的 401 指令解析说话人。
     let mut targets = Vec::new();
-    let context = MvVirtualSpeakerNameWriteContext {
-        data_files,
-        translations,
-        rules: mv_virtual_namebox_rules,
-        fact_templates: mv_virtual_namebox_fact_templates,
-        skipped_location_paths,
-    };
-    for (file_name, value) in data_files {
-        if is_map_file(file_name) {
-            collect_mv_map_virtual_speaker_name_writes(file_name, value, &context, &mut targets)?;
-        }
-    }
-    if let Some(value) = data_files.get(COMMON_EVENTS_FILE_NAME) {
-        collect_mv_common_event_virtual_speaker_name_writes(value, &context, &mut targets)?;
-    }
-    if let Some(value) = data_files.get(TROOPS_FILE_NAME) {
-        collect_mv_troop_virtual_speaker_name_writes(value, &context, &mut targets)?;
-    }
-    Ok(targets)
-}
-
-fn collect_mv_map_virtual_speaker_name_writes(
-    file_name: &str,
-    value: &Value,
-    context: &MvVirtualSpeakerNameWriteContext<'_>,
-    targets: &mut Vec<(String, String)>,
-) -> Result<(), String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| format!("{file_name} 顶层不是地图对象，不能写入 MV 虚拟名字框术语"))?;
-    let events = object
-        .get("events")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("{file_name}.events 不是数组，不能写入 MV 虚拟名字框术语"))?;
-    for (event_index, event) in events.iter().enumerate() {
-        if event.is_null() {
+    for fact_template in mv_virtual_namebox_fact_templates {
+        // location_path 是 101 命令路径；已被翻译项覆盖的对话块由命令项写回处理，
+        // 术语写回只负责没有翻译项的名字框块（避免串位）。
+        if skipped_location_paths.contains(&fact_template.location_path) {
             continue;
         }
-        let event_context = format!("{file_name}/{event_index}");
-        let event_object = event
-            .as_object()
-            .ok_or_else(|| format!("{event_context} 不是事件对象，不能写入 MV 虚拟名字框术语"))?;
-        let pages = event_object
-            .get("pages")
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("{event_context}.pages 不是数组，不能写入 MV 虚拟名字框术语"))?;
-        for (page_index, page) in pages.iter().enumerate() {
-            let page_context = format!("{event_context}/{page_index}");
-            let page_object = page.as_object().ok_or_else(|| {
-                format!("{page_context} 不是事件页对象，不能写入 MV 虚拟名字框术语")
-            })?;
-            let commands = page_object
-                .get("list")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    format!("{page_context}.list 不是数组，不能写入 MV 虚拟名字框术语")
-                })?;
-            collect_mv_virtual_speaker_name_writes_from_commands(
-                commands,
-                &page_context,
-                context,
-                targets,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_mv_common_event_virtual_speaker_name_writes(
-    value: &Value,
-    context: &MvVirtualSpeakerNameWriteContext<'_>,
-    targets: &mut Vec<(String, String)>,
-) -> Result<(), String> {
-    let events = value
-        .as_array()
-        .ok_or_else(|| "CommonEvents.json 顶层不是数组，不能写入 MV 虚拟名字框术语".to_string())?;
-    for (event_index, event) in events.iter().enumerate() {
-        if event.is_null() {
-            continue;
-        }
-        let event_context = format!("{COMMON_EVENTS_FILE_NAME}/{event_index}");
-        let event_object = event.as_object().ok_or_else(|| {
-            format!("{event_context} 不是公共事件对象，不能写入 MV 虚拟名字框术语")
-        })?;
-        let commands = event_object
-            .get("list")
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("{event_context}.list 不是数组，不能写入 MV 虚拟名字框术语"))?;
-        collect_mv_virtual_speaker_name_writes_from_commands(
-            commands,
-            &event_context,
-            context,
-            targets,
-        )?;
-    }
-    Ok(())
-}
-
-fn collect_mv_troop_virtual_speaker_name_writes(
-    value: &Value,
-    context: &MvVirtualSpeakerNameWriteContext<'_>,
-    targets: &mut Vec<(String, String)>,
-) -> Result<(), String> {
-    let troops = value
-        .as_array()
-        .ok_or_else(|| "Troops.json 顶层不是数组，不能写入 MV 虚拟名字框术语".to_string())?;
-    for (troop_index, troop) in troops.iter().enumerate() {
-        if troop.is_null() {
-            continue;
-        }
-        let troop_context = format!("{TROOPS_FILE_NAME}/{troop_index}");
-        let troop_object = troop
-            .as_object()
-            .ok_or_else(|| format!("{troop_context} 不是敌群对象，不能写入 MV 虚拟名字框术语"))?;
-        let pages = troop_object
-            .get("pages")
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("{troop_context}.pages 不是数组，不能写入 MV 虚拟名字框术语"))?;
-        for (page_index, page) in pages.iter().enumerate() {
-            let page_context = format!("{troop_context}/{page_index}");
-            let page_object = page.as_object().ok_or_else(|| {
-                format!("{page_context} 不是敌群事件页对象，不能写入 MV 虚拟名字框术语")
-            })?;
-            let commands = page_object
-                .get("list")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    format!("{page_context}.list 不是数组，不能写入 MV 虚拟名字框术语")
-                })?;
-            collect_mv_virtual_speaker_name_writes_from_commands(
-                commands,
-                &page_context,
-                context,
-                targets,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_mv_virtual_speaker_name_writes_from_commands(
-    commands: &[Value],
-    command_path_prefix: &str,
-    context: &MvVirtualSpeakerNameWriteContext<'_>,
-    targets: &mut Vec<(String, String)>,
-) -> Result<(), String> {
-    for (command_index, command_value) in commands.iter().enumerate() {
-        let command_path = format!("{command_path_prefix}/{command_index}");
-        let command = command_value.as_object().ok_or_else(|| {
-            format!("{command_path} 不是事件指令对象，不能写入 MV 虚拟名字框术语")
-        })?;
-        let code = command
-            .get("code")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| format!("{command_path}.code 不是整数，不能写入 MV 虚拟名字框术语"))?;
-        if code != 101 {
-            continue;
-        }
-        if context.skipped_location_paths.contains(&command_path) {
-            continue;
-        }
-        let Some((speaker_line_path, virtual_speaker)) = find_mv_virtual_speaker_command_ref(
-            context.data_files,
-            commands,
-            command_index,
-            command_path_prefix,
-            context.rules,
-        )?
-        else {
-            continue;
-        };
         if matches!(
-            virtual_speaker.speaker_policy,
+            fact_template.speaker_policy,
             MvVirtualSpeakerPolicy::Preserve
         ) {
             continue;
         }
-        let Some(translated_speaker) = context.translations.get(&virtual_speaker.speaker) else {
+        let Some(translated_speaker) = translations.get(&fact_template.role) else {
             continue;
         };
-        let fact_template = find_mv_virtual_namebox_fact_template(
-            context.fact_templates,
-            &speaker_line_path,
-            &virtual_speaker,
-        )
-        .ok_or_else(|| {
-                format!(
-                    "MV 虚拟名字框术语写回缺少当前文本事实，不能写入 speaker_names；请重新运行 rebuild-text-index: {}",
-                    speaker_line_path
-                )
-            })?;
-        if fact_template.role != virtual_speaker.speaker {
+        let Some(speaker_line_path) = fact_template.source_line_paths.first() else {
             return Err(format!(
-                "MV 虚拟名字框术语写回 当前文本事实 speaker 不一致，不能写入 speaker_names；请重新运行 rebuild-text-index: 文本路径={}; 触发路径={}; fact_speaker={}; 当前_speaker={}",
-                fact_template.location_path,
-                speaker_line_path,
-                fact_template.role,
-                virtual_speaker.speaker,
+                "MV 虚拟名字框当前文本事实缺少说话人行路径，请重新运行 rebuild-text-index: {}",
+                fact_template.location_path
             ));
-        }
-        let translated_body =
-            (!virtual_speaker.body_text.is_empty()).then_some(virtual_speaker.body_text.as_str());
+        };
+        // 术语写回只替换说话人，保留原文 body。内联名字框（speaker 行含 body）需要把
+        // 该行原文 body 一起渲染回 speaker 行；独立名字框（body 在后续 401 行）没有内联
+        // body，传 None 只写说话人。内联 body 是 speaker 片段之后、第一个含换行 literal
+        // 之前的 body 片段；若 speaker 后先遇到换行 literal 则是独立名字框。
+        let speaker_line_body = mv_inline_speaker_body(&fact_template.render_parts);
         let translated_text = render_mv_virtual_speaker_line_from_fact_template(
             fact_template,
             translated_speaker,
-            translated_body,
+            speaker_line_body,
         )?;
-        targets.push((speaker_line_path, translated_text));
+        targets.push((speaker_line_path.clone(), translated_text));
     }
-    Ok(())
+    Ok(targets)
 }
 
-fn find_mv_virtual_namebox_fact_template<'a>(
-    templates: &'a [MvVirtualNameboxFactTemplate],
-    speaker_line_path: &str,
-    virtual_speaker: &MvVirtualSpeaker,
-) -> Option<&'a MvVirtualNameboxFactTemplate> {
-    if let Some(template) = templates.iter().find(|template| {
-        template
-            .source_line_paths
-            .iter()
-            .any(|path| path == speaker_line_path)
-    }) {
-        return Some(template);
+/// 返回名字框 speaker 行内联的原文 body：speaker 片段之后、第一个含换行 literal
+/// 之前的 body 片段 raw_text。独立名字框（speaker 后先遇换行 literal）返回 None。
+fn mv_inline_speaker_body(render_parts: &[TextFactRenderPart]) -> Option<&str> {
+    let mut after_speaker = false;
+    for part in render_parts {
+        if part.part_kind == "speaker" {
+            after_speaker = true;
+            continue;
+        }
+        if !after_speaker {
+            continue;
+        }
+        if part.part_kind == "translated_body" || part.template_key == "body" {
+            return Some(&part.raw_text);
+        }
+        if part.raw_text.contains('\n') || part.raw_text.contains('\r') {
+            return None;
+        }
     }
-    templates.iter().find(|template| {
-        template.role == virtual_speaker.speaker
-            && (virtual_speaker.body_text.is_empty()
-                || template.body_text == virtual_speaker.body_text)
-            && template
-                .raw_text
-                .lines()
-                .next()
-                .is_some_and(|line| line.trim() == virtual_speaker.matched_text)
-    })
+    None
 }
 
 fn render_mv_virtual_speaker_line_from_fact_template(

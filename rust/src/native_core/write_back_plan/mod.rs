@@ -32,10 +32,10 @@ use self::layout::{
     read_plugins_origin_file, read_selected_origin_data_files, resolve_layout,
 };
 use self::models::{
-    COMMON_EVENTS_FILE_NAME, EngineKind, FontPlanSummary, MvVirtualNameboxRule,
-    MvVirtualSpeakerPolicy, PLUGINS_FILE_NAME, PlanSummary, PlannedFile, PluginSourceTextRule,
-    SYSTEM_FILE_NAME, SettingPayload, TROOPS_FILE_NAME, TextPlanRules, TranslationItem,
-    WriteBackPlan, WritePlanMode,
+    COMMON_EVENTS_FILE_NAME, EngineKind, FontPlanSummary, MvVirtualNameboxFactTemplate,
+    MvVirtualNameboxRule, MvVirtualSpeakerPolicy, PLUGINS_FILE_NAME, PlanSummary, PlannedFile,
+    PluginSourceTextRule, SYSTEM_FILE_NAME, SettingPayload, TROOPS_FILE_NAME, TextPlanRules,
+    TranslationItem, WriteBackPlan, WritePlanMode,
 };
 use self::nonstandard_data_writer::{
     is_nonstandard_data_item, nonstandard_data_file_name, write_nonstandard_data_item,
@@ -138,10 +138,12 @@ fn build_write_back_plan_inner(
         .map(|item| item.location_path.clone())
         .collect();
     let mv_speaker_terminology_written_count = if matches!(layout.engine_kind, EngineKind::Mv) {
+        if terminology.contains_key("speaker_names") && mv_virtual_namebox_rules.is_empty() {
+            return Err("MV 术语写回缺少 MV 虚拟名字框规则，不能写入 speaker_names".to_string());
+        }
         apply_mv_virtual_speaker_names(
             &mut data_files,
             &terminology,
-            &mv_virtual_namebox_rules,
             &mv_virtual_namebox_fact_templates,
             &translated_item_location_paths,
         )?
@@ -224,7 +226,7 @@ fn build_write_back_plan_inner(
     write_command_items_by_file(
         &mut data_files,
         command_items,
-        &mv_virtual_namebox_rules,
+        &mv_virtual_namebox_fact_templates,
         &terminology,
         &text_rules,
     )?;
@@ -439,7 +441,7 @@ fn active_plugin_source_file_names_for_audit(
 fn write_command_items_by_file(
     data_files: &mut BTreeMap<String, serde_json::Value>,
     command_items: Vec<TranslationItem>,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
+    mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
     terminology: &HashMap<String, HashMap<String, String>>,
     text_rules: &TextPlanRules,
 ) -> Result<(), String> {
@@ -473,7 +475,7 @@ fn write_command_items_by_file(
                 write_command_item(
                     &mut local_data_files,
                     item,
-                    mv_virtual_namebox_rules,
+                    mv_virtual_namebox_fact_templates,
                     terminology,
                     text_rules,
                 )?;

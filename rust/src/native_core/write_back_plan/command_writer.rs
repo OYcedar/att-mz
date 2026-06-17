@@ -1,11 +1,8 @@
 use super::models::{
-    COMMON_EVENTS_FILE_NAME, MvVirtualNameboxRule, MvVirtualSpeaker, TROOPS_FILE_NAME,
-    TextFactRenderPart, TextPlanRules, TranslationItem,
+    COMMON_EVENTS_FILE_NAME, MvVirtualNameboxFactTemplate, MvVirtualSpeakerPolicy,
+    TROOPS_FILE_NAME, TextFactRenderPart, TextPlanRules, TranslationItem,
 };
-use super::mv_virtual_namebox::{
-    ensure_mv_translation_body_is_clean, parse_mv_virtual_speaker_line, read_mv_render_speaker,
-    render_mv_virtual_speaker_line,
-};
+use super::mv_virtual_namebox::ensure_mv_translation_body_is_clean;
 use super::plugin_config_writer::set_nested_text_value;
 use super::text_prepare::{prepared_lines, prepared_long_lines, prepared_single_text};
 use super::utils::{is_map_file, parse_i64, parse_usize};
@@ -74,7 +71,7 @@ pub(super) fn is_event_command_item(location_path: &str) -> bool {
 pub(super) fn write_command_item(
     data_files: &mut BTreeMap<String, Value>,
     item: &TranslationItem,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
+    mv_virtual_namebox_fact_templates: &[MvVirtualNameboxFactTemplate],
     terminology: &HashMap<String, HashMap<String, String>>,
     rules: &TextPlanRules,
 ) -> Result<(), String> {
@@ -121,18 +118,19 @@ pub(super) fn write_command_item(
         return Ok(());
     }
     if item.item_type == "long_text" {
+        // MV 虚拟名字框对话块由 item.render_parts 是否含 speaker 片段判定，
+        // 不再重新扫描 401 指令解析说话人。speaker 行路径是 source_line_paths 首元素。
         if command_code == 101
-            && !mv_virtual_namebox_rules.is_empty()
-            && let Some(virtual_speaker) = find_mv_virtual_speaker_for_name_command(
-                data_files,
-                item,
-                mv_virtual_namebox_rules,
-            )?
+            && is_mv_virtual_namebox_item(item)
+            && let Some(fact_template) = find_mv_virtual_namebox_fact_template_by_path(
+                mv_virtual_namebox_fact_templates,
+                &item.location_path,
+            )
         {
             return write_mv_virtual_name_text_item(
                 data_files,
                 item,
-                &virtual_speaker,
+                fact_template,
                 terminology,
                 rules,
             );
@@ -141,6 +139,21 @@ pub(super) fn write_command_item(
         return write_line_commands_by_paths(data_files, item, expected_code, rules);
     }
     Err(format!("事件指令 item_type 无法处理: {}", item.item_type))
+}
+
+fn is_mv_virtual_namebox_item(item: &TranslationItem) -> bool {
+    item.render_parts
+        .iter()
+        .any(|part| part.part_kind == "speaker")
+}
+
+fn find_mv_virtual_namebox_fact_template_by_path<'a>(
+    templates: &'a [MvVirtualNameboxFactTemplate],
+    location_path: &str,
+) -> Option<&'a MvVirtualNameboxFactTemplate> {
+    templates
+        .iter()
+        .find(|template| template.location_path == location_path)
 }
 
 pub(super) fn write_line_commands_by_paths(
@@ -207,98 +220,21 @@ pub(super) fn write_prepared_line_commands_by_paths(
     )
 }
 
-pub(super) fn find_mv_virtual_speaker_for_name_command(
-    data_files: &BTreeMap<String, Value>,
-    item: &TranslationItem,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
-) -> Result<Option<MvVirtualSpeaker>, String> {
-    let (commands, command_index) = locate_commands_ref(data_files, &item.location_path)?;
-    let command_path_prefix = command_list_parent_path(&item.location_path)?;
-    let Some((_speaker_line_path, virtual_speaker)) = find_mv_virtual_speaker_command_ref(
-        data_files,
-        commands,
-        command_index,
-        &command_path_prefix,
-        mv_virtual_namebox_rules,
-    )?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(virtual_speaker))
-}
-
-pub(super) fn find_mv_virtual_speaker_command_ref(
-    data_files: &BTreeMap<String, Value>,
-    commands: &[Value],
-    command_index: usize,
-    command_path_prefix: &str,
-    mv_virtual_namebox_rules: &[MvVirtualNameboxRule],
-) -> Result<Option<(String, MvVirtualSpeaker)>, String> {
-    let mut next_index = command_index + 1;
-    while next_index < commands.len() {
-        let command_path = format!("{command_path_prefix}/{next_index}");
-        let command = commands
-            .get(next_index)
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                format!("{command_path} 不是事件指令对象，不能写入 MV 虚拟名字框术语")
-            })?;
-        let code = command
-            .get("code")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| format!("{command_path}.code 不是整数，不能写入 MV 虚拟名字框术语"))?;
-        if code != 401 {
-            break;
-        }
-        let text = read_first_parameter_text(command, &command_path)?;
-        if text.trim().is_empty() {
-            next_index += 1;
-            continue;
-        }
-        let Some(mut virtual_speaker) = parse_mv_virtual_speaker_line(
-            data_files,
-            text,
-            mv_virtual_namebox_rules,
-            &command_path,
-        )?
-        else {
-            return Ok(None);
-        };
-        virtual_speaker.speaker_line_path = command_path.clone();
-        return Ok(Some((command_path, virtual_speaker)));
-    }
-    Ok(None)
-}
-
 pub(super) fn write_mv_virtual_name_text_item(
     data_files: &mut BTreeMap<String, Value>,
     item: &TranslationItem,
-    virtual_speaker: &MvVirtualSpeaker,
+    fact_template: &MvVirtualNameboxFactTemplate,
     terminology: &HashMap<String, HashMap<String, String>>,
     rules: &TextPlanRules,
 ) -> Result<(), String> {
-    if virtual_speaker.body_text.is_empty()
-        && item
-            .source_line_paths
-            .iter()
-            .any(|path| path == &virtual_speaker.speaker_line_path)
-    {
-        return Err(format!(
-            "当前 MV 译文仍包含说话人行，检查没通过，不能继续写进游戏文件；请先精确重置该文本后重新提取和翻译: 文本路径={}; 触发路径={}",
-            item.location_path, virtual_speaker.speaker_line_path
-        ));
-    }
-    let render_speaker =
-        match read_mv_render_speaker_from_item_fact(terminology, item, virtual_speaker)? {
-            Some(value) => value,
-            None => read_mv_render_speaker(terminology, virtual_speaker, &item.location_path)?,
-        };
     let translation_lines = prepared_long_lines(item, rules)?;
+    let render_speaker = read_mv_render_speaker_for_item(terminology, item, fact_template)?;
     let source_speaker_for_clean = item
         .role
         .as_deref()
-        .filter(|role| !role.trim().is_empty() && has_text_fact_render_parts(item))
-        .unwrap_or(&virtual_speaker.speaker);
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&fact_template.source_speaker);
     ensure_mv_translation_body_is_clean(
         source_speaker_for_clean,
         &render_speaker,
@@ -306,75 +242,85 @@ pub(super) fn write_mv_virtual_name_text_item(
         &item.location_path,
     )?;
 
-    if !virtual_speaker.body_text.is_empty() {
+    // speaker 行路径是 source_line_paths 首元素（索引阶段已前置说话人行）。
+    // 内联名字框（speaker 行含 body）需要把译文首行 body 一起渲染进 speaker 行；
+    // 独立名字框（body 在后续 401 行）speaker 行只渲染说话人，body 全部走续行写入。
+    let speaker_line_path = item
+        .source_line_paths
+        .first()
+        .ok_or_else(|| format!("MV 虚拟名字框缺少说话人行路径: {}", item.location_path))?;
+    let inline_body_in_speaker_line = mv_inline_body_in_speaker_line(&item.render_parts);
+    let (speaker_body, body_line_paths, body_translation_lines) = if inline_body_in_speaker_line {
         let first_line = translation_lines
             .first()
             .ok_or_else(|| format!("MV 内联说话人正文缺少译文: {}", item.location_path))?;
-        let speaker_line = render_mv_virtual_speaker_line_from_text_fact_parts(
-            item,
-            &render_speaker,
-            Some(first_line),
-        )
-        .unwrap_or_else(|| {
-            render_mv_virtual_speaker_line(virtual_speaker, &render_speaker, Some(first_line))
-        })?;
-        write_command_first_parameter(
-            data_files,
-            &virtual_speaker.speaker_line_path,
-            401,
-            &speaker_line,
-        )?;
-        write_prepared_line_commands_by_paths(
-            data_files,
-            401,
+        (
+            Some(first_line.as_str()),
             &item.source_line_paths[1..],
-            &virtual_speaker.speaker_line_path,
             &translation_lines[1..],
-        )?;
-        return Ok(());
-    }
+        )
+    } else {
+        (None, &item.source_line_paths[1..], &translation_lines[..])
+    };
 
-    let speaker_line = render_mv_virtual_speaker_line(virtual_speaker, &render_speaker, None)?;
-    write_command_first_parameter(
-        data_files,
-        &virtual_speaker.speaker_line_path,
-        401,
-        &speaker_line,
-    )?;
+    let speaker_line =
+        render_mv_virtual_speaker_line_from_text_fact_parts(item, &render_speaker, speaker_body)
+            .ok_or_else(|| {
+            format!(
+                "MV 虚拟名字框当前文本事实缺少写回所需源文结构，不能写进游戏文件: {}",
+                item.location_path
+            )
+        })??;
+    write_command_first_parameter(data_files, speaker_line_path, 401, &speaker_line)?;
     write_prepared_line_commands_by_paths(
         data_files,
         401,
-        &item.source_line_paths,
-        &virtual_speaker.speaker_line_path,
-        &translation_lines,
+        body_line_paths,
+        speaker_line_path,
+        body_translation_lines,
     )
 }
 
-fn has_text_fact_render_parts(item: &TranslationItem) -> bool {
-    !item.render_parts.is_empty()
+/// 判断名字框块的 speaker 行是否内联了 body：render_parts 中 speaker 片段之后
+/// 紧跟 translated_body 片段（中间没有含换行的 literal），属于内联格式；
+/// 否则是独立名字框（body 在后续 401 行）。
+fn mv_inline_body_in_speaker_line(render_parts: &[TextFactRenderPart]) -> bool {
+    let mut after_speaker = false;
+    for part in render_parts {
+        if part.part_kind == "speaker" {
+            after_speaker = true;
+            continue;
+        }
+        if !after_speaker {
+            continue;
+        }
+        if part.part_kind == "translated_body" || part.template_key == "body" {
+            return true;
+        }
+        // speaker 后遇到含换行的 literal，说明 body 在后续行，属于独立名字框。
+        if part.raw_text.contains('\n') || part.raw_text.contains('\r') {
+            return false;
+        }
+    }
+    false
 }
 
-fn read_mv_render_speaker_from_item_fact(
+fn read_mv_render_speaker_for_item(
     terminology: &HashMap<String, HashMap<String, String>>,
     item: &TranslationItem,
-    virtual_speaker: &MvVirtualSpeaker,
-) -> Result<Option<String>, String> {
-    if !has_text_fact_render_parts(item) {
-        return Ok(None);
-    }
-    let Some(source_speaker) = item
+    fact_template: &MvVirtualNameboxFactTemplate,
+) -> Result<String, String> {
+    let source_speaker = item
         .role
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
+        .unwrap_or(&fact_template.source_speaker);
     if matches!(
-        virtual_speaker.speaker_policy,
-        super::models::MvVirtualSpeakerPolicy::Preserve
+        fact_template.speaker_policy,
+        MvVirtualSpeakerPolicy::Preserve
     ) {
-        return Ok(Some(source_speaker.to_string()));
+        return Ok(source_speaker.to_string());
     }
     let translated_speaker = terminology
         .get("speaker_names")
@@ -382,14 +328,12 @@ fn read_mv_render_speaker_from_item_fact(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty());
     match translated_speaker {
-        Some(value) => Ok(Some(value.to_string())),
+        Some(value) => Ok(value.to_string()),
         None => Err(format!(
-            "MV 说话人缺少术语译名，请先导入 speaker_names: 文本路径={}; 触发路径={}; 规则={}; 原始匹配={}; 原始说话人={}; 术语键={}",
+            "MV 说话人缺少术语译名，请先导入 speaker_names: 文本路径={}; 规则={}; 原始说话人={}; 术语键={}",
             item.location_path,
-            virtual_speaker.speaker_line_path,
-            virtual_speaker.rule_name,
-            virtual_speaker.matched_text,
-            source_speaker,
+            fact_template.rule_name,
+            fact_template.source_speaker,
             source_speaker,
         )),
     }
@@ -499,18 +443,6 @@ fn render_text_fact_body_part(raw_body_part: &str, translated_body: &str) -> Str
     };
     format!("{prefix}{translated_body}{suffix}")
 }
-pub(super) fn read_first_parameter_text<'a>(
-    command: &'a Map<String, Value>,
-    location_path: &str,
-) -> Result<&'a str, String> {
-    command
-        .get("parameters")
-        .and_then(Value::as_array)
-        .and_then(|parameters| parameters.first())
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("事件指令缺少第一个文本参数: {location_path}"))
-}
-
 pub(super) fn write_command_first_parameter(
     data_files: &mut BTreeMap<String, Value>,
     source_line_path: &str,
@@ -722,66 +654,6 @@ pub(super) fn locate_commands_mut<'a>(
             .and_then(Value::as_object_mut)
             .and_then(|page| page.get_mut("list"))
             .and_then(Value::as_array_mut)
-            .ok_or_else(|| format!("敌群事件指令列表无法定位: {location_path}"))?;
-        return Ok((commands, command_index));
-    }
-    Err(format!("无法识别的事件定位路径: {location_path}"))
-}
-
-pub(super) fn locate_commands_ref<'a>(
-    data_files: &'a BTreeMap<String, Value>,
-    location_path: &str,
-) -> Result<(&'a Vec<Value>, usize), String> {
-    let parts: Vec<&str> = location_path.split('/').collect();
-    let file_name = parts.first().copied().unwrap_or_default();
-    let data = data_files
-        .get(file_name)
-        .ok_or_else(|| format!("事件文件不存在: {file_name}"))?;
-    if is_map_file(file_name) {
-        let event_id = parse_usize(parts.get(1).copied().unwrap_or_default(), location_path)?;
-        let page_index = parse_usize(parts.get(2).copied().unwrap_or_default(), location_path)?;
-        let command_index = parse_usize(parts.get(3).copied().unwrap_or_default(), location_path)?;
-        let commands = data
-            .as_object()
-            .and_then(|map| map.get("events"))
-            .and_then(Value::as_array)
-            .and_then(|events| events.get(event_id))
-            .and_then(Value::as_object)
-            .and_then(|event| event.get("pages"))
-            .and_then(Value::as_array)
-            .and_then(|pages| pages.get(page_index))
-            .and_then(Value::as_object)
-            .and_then(|page| page.get("list"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("地图事件指令列表无法定位: {location_path}"))?;
-        return Ok((commands, command_index));
-    }
-    if file_name == COMMON_EVENTS_FILE_NAME {
-        let event_id = parse_usize(parts.get(1).copied().unwrap_or_default(), location_path)?;
-        let command_index = parse_usize(parts.get(2).copied().unwrap_or_default(), location_path)?;
-        let commands = data
-            .as_array()
-            .and_then(|events| events.get(event_id))
-            .and_then(Value::as_object)
-            .and_then(|event| event.get("list"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("公共事件指令列表无法定位: {location_path}"))?;
-        return Ok((commands, command_index));
-    }
-    if file_name == TROOPS_FILE_NAME {
-        let troop_id = parse_usize(parts.get(1).copied().unwrap_or_default(), location_path)?;
-        let page_index = parse_usize(parts.get(2).copied().unwrap_or_default(), location_path)?;
-        let command_index = parse_usize(parts.get(3).copied().unwrap_or_default(), location_path)?;
-        let commands = data
-            .as_array()
-            .and_then(|troops| troops.get(troop_id))
-            .and_then(Value::as_object)
-            .and_then(|troop| troop.get("pages"))
-            .and_then(Value::as_array)
-            .and_then(|pages| pages.get(page_index))
-            .and_then(Value::as_object)
-            .and_then(|page| page.get("list"))
-            .and_then(Value::as_array)
             .ok_or_else(|| format!("敌群事件指令列表无法定位: {location_path}"))?;
         return Ok((commands, command_index));
     }

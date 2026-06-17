@@ -644,7 +644,7 @@ fn build_plan_supports_mv_virtual_namebox_rules() {
     let fixture = create_fixture_dir("att_mz_write_plan_mv_namebox");
     let game_dir = fixture.join("game");
     let db_path = fixture.join("game.db");
-    create_minimal_game_files(&game_dir);
+    create_minimal_mv_game_files(&game_dir);
     create_mv_virtual_namebox_game_files(&game_dir);
     create_minimal_database(&db_path);
     insert_mv_virtual_namebox_rules_and_items(&db_path);
@@ -686,7 +686,7 @@ fn build_plan_write_back_loads_actor_names_for_mv_actor_name_rule() {
     let fixture = create_fixture_dir("att_mz_write_plan_mv_namebox_write_back");
     let game_dir = fixture.join("game");
     let db_path = fixture.join("game.db");
-    create_minimal_game_files(&game_dir);
+    create_minimal_mv_game_files(&game_dir);
     create_mv_virtual_namebox_game_files(&game_dir);
     create_minimal_database(&db_path);
     insert_mv_virtual_namebox_rules_and_items(&db_path);
@@ -2730,6 +2730,10 @@ fn create_minimal_database(db_path: &Path) {
                 template_key TEXT NOT NULL,
                 PRIMARY KEY (fact_id, part_order)
             );
+            CREATE TABLE text_fact_domain_payloads (
+                fact_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL
+            );
             CREATE TABLE text_fact_scope (
                 scope_key TEXT PRIMARY KEY,
                 schema_version INTEGER NOT NULL,
@@ -3397,8 +3401,10 @@ fn create_mv_virtual_namebox_game_files(game_dir: &Path) {
 ]
 "#;
     let actors = r#"[null, {"id": 1, "name": "MV勇者"}]"#;
+    let content_root = game_dir.join("www");
     for dir_name in ["data", "data_origin"] {
-        let data_dir = game_dir.join(dir_name);
+        let data_dir = content_root.join(dir_name);
+        fs::create_dir_all(&data_dir).expect("MV data 目录应可创建");
         fs::write(data_dir.join("CommonEvents.json"), common_events)
             .expect("MV CommonEvents.json 应可写入");
         fs::write(data_dir.join("Actors.json"), actors).expect("MV Actors.json 应可写入");
@@ -3550,6 +3556,12 @@ fn insert_mv_standalone_namebox_text_fact(
     raw_text: &str,
     translatable_text: &str,
 ) {
+    // 独立名字框块的 source_line_paths 首元素是说话人行（紧跟 101 的 401），
+    // 后续是正文行。调用方传入的 source_line_paths 只含正文行，这里按 location_path
+    // 推导说话人行路径并前置，与 rebuild-text-index 的真实索引行为对齐。
+    let speaker_line_path = standalone_namebox_speaker_line_path(location_path);
+    let mut full_source_line_paths = vec![speaker_line_path.as_str()];
+    full_source_line_paths.extend(source_line_paths.iter().copied());
     let render_parts = [
         ("speaker", role, role, "speaker"),
         ("literal", "\n", "\n", "literal"),
@@ -3563,12 +3575,24 @@ fn insert_mv_standalone_namebox_text_fact(
     insert_mv_virtual_namebox_text_fact_with_parts(
         db_path,
         location_path,
-        source_line_paths,
+        &full_source_line_paths,
         role,
         raw_text,
         translatable_text,
         Some(render_parts.as_slice()),
     );
+}
+
+fn standalone_namebox_speaker_line_path(location_path: &str) -> String {
+    // location_path 形如 "CommonEvents.json/1/0"（101 命令），
+    // 说话人行是同一命令列表的下一个索引 "CommonEvents.json/1/1"。
+    let (prefix, last_segment) = location_path
+        .rsplit_once('/')
+        .expect("独立名字框 location_path 应含命令索引");
+    let command_index: i64 = last_segment
+        .parse()
+        .expect("独立名字框 location_path 末段应是命令索引");
+    format!("{prefix}/{}", command_index + 1)
 }
 
 fn insert_mv_quote_namebox_text_fact(
@@ -3681,6 +3705,7 @@ fn insert_mv_virtual_namebox_text_fact_with_parts(
             ],
         )
         .expect("测试 MV virtual namebox current text fact 应可写入");
+    insert_test_mv_virtual_namebox_domain_payload(&connection, &fact_id, role);
     let Some(render_parts) = render_parts else {
         return;
     };
@@ -3703,6 +3728,26 @@ fn insert_mv_virtual_namebox_text_fact_with_parts(
     }
 }
 
+fn insert_test_mv_virtual_namebox_domain_payload(
+    connection: &Connection,
+    fact_id: &str,
+    source_speaker: &str,
+) {
+    let payload = serde_json::json!({
+        "rule_name": "test-namebox",
+        "speaker_policy": "translate",
+        "source_speaker": source_speaker,
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO text_fact_domain_payloads (fact_id, payload_json) \
+             VALUES (?1, ?2)",
+            params![fact_id, payload],
+        )
+        .expect("测试 MV virtual namebox domain payload 应可写入");
+}
+
 fn insert_mv_virtual_namebox_rules_and_items(db_path: &Path) {
     insert_mv_virtual_namebox_rules(db_path);
     let connection = Connection::open(db_path).expect("测试数据库应可打开");
@@ -3715,16 +3760,82 @@ fn insert_mv_virtual_namebox_rules_and_items(db_path: &Path) {
             )
             .expect("MV 说话人术语应可写入");
     }
+    // 块2：独立冒号名字框 案内人： + 正文 次の本文です
+    insert_mv_virtual_namebox_text_fact_with_parts(
+        db_path,
+        "CommonEvents.json/2/0",
+        &["CommonEvents.json/2/1", "CommonEvents.json/2/2"],
+        "案内人",
+        "案内人：\n次の本文です",
+        "次の本文です",
+        Some(
+            [
+                ("speaker", "案内人", "案内人", "speaker"),
+                ("literal", "：", "：", "literal"),
+                ("literal", "\n", "\n", "literal"),
+                ("translated_body", "次の本文です", "次の本文です", "body"),
+            ]
+            .as_slice(),
+        ),
+    );
+    // 块3：内联引号名字框 案内人「こんにちは」
+    insert_mv_virtual_namebox_text_fact_with_parts(
+        db_path,
+        "CommonEvents.json/3/0",
+        &["CommonEvents.json/3/1"],
+        "案内人",
+        "案内人「こんにちは」",
+        "こんにちは」",
+        Some(
+            [
+                ("speaker", "案内人", "案内人", "speaker"),
+                ("literal", "「", "「", "literal"),
+                ("translated_body", "こんにちは」", "こんにちは」", "body"),
+            ]
+            .as_slice(),
+        ),
+    );
+    // 块4：actor_name 内联名字框 \N[1]:役者の本文です
+    insert_mv_virtual_namebox_text_fact_with_parts(
+        db_path,
+        "CommonEvents.json/4/0",
+        &["CommonEvents.json/4/1"],
+        "MV勇者",
+        "\\N[1]:役者の本文です",
+        "役者の本文です",
+        Some(
+            [
+                ("speaker", "\\N[1]", "\\N[1]", "speaker"),
+                ("literal", ":", ":", "literal"),
+                (
+                    "translated_body",
+                    "役者の本文です",
+                    "役者の本文です",
+                    "body",
+                ),
+            ]
+            .as_slice(),
+        ),
+    );
+    // actor_name 规则的 domain payload speaker_policy 需要 actor_name，
+    // 覆盖 insert_test_mv_virtual_namebox_domain_payload 的默认 translate。
+    update_test_mv_virtual_namebox_domain_payload(
+        &connection,
+        &test_fact_id("CommonEvents.json/4/0"),
+        "actor-inline",
+        "actor_name",
+        "\\N[1]",
+    );
     let items = [
         (
             "CommonEvents.json/2/0",
             "[\"次の本文です\"]",
-            "[\"CommonEvents.json/2/2\"]",
+            "[\"CommonEvents.json/2/1\",\"CommonEvents.json/2/2\"]",
             "[\"你好\"]",
         ),
         (
             "CommonEvents.json/3/0",
-            "[\"こんにちは\"]",
+            "[\"こんにちは」\"]",
             "[\"CommonEvents.json/3/1\"]",
             "[\"你好」\"]",
         ),
@@ -3736,14 +3847,6 @@ fn insert_mv_virtual_namebox_rules_and_items(db_path: &Path) {
         ),
     ];
     for (location_path, original_lines, source_line_paths, translation_lines) in items {
-        insert_text_fact_contract_for_item(
-            &connection,
-            location_path,
-            "long_text",
-            None,
-            original_lines,
-            source_line_paths,
-        );
         insert_translation_item_for_current_fact(
             &connection,
             location_path,
@@ -3754,4 +3857,26 @@ fn insert_mv_virtual_namebox_rules_and_items(db_path: &Path) {
             translation_lines,
         );
     }
+}
+
+fn update_test_mv_virtual_namebox_domain_payload(
+    connection: &Connection,
+    fact_id: &str,
+    rule_name: &str,
+    speaker_policy: &str,
+    source_speaker: &str,
+) {
+    let payload = serde_json::json!({
+        "rule_name": rule_name,
+        "speaker_policy": speaker_policy,
+        "source_speaker": source_speaker,
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO text_fact_domain_payloads (fact_id, payload_json) \
+             VALUES (?1, ?2)",
+            params![fact_id, payload],
+        )
+        .expect("测试 MV virtual namebox domain payload 应可更新");
 }
