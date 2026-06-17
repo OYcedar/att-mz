@@ -146,6 +146,20 @@ def reset_release_directory(release_dir: Path) -> None:
     release_dir.mkdir(parents=True)
 
 
+def release_subprocess_env() -> dict[str, str]:
+    """返回发布构建子进程的稳定环境。"""
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
+
+def build_release_entrypoint(release_dir: Path, platform_spec: PlatformSpec) -> None:
+    """按平台构建发行包入口。"""
+    executable_path = release_dir / platform_spec.executable_name
+    build_pex_scie(executable_path)
+
+
 def build_pex_scie(executable_path: Path) -> None:
     """使用 PEX scie eager 构建当前 runner 平台的可执行文件。"""
     pex_output_path = executable_path.with_suffix(".pex")
@@ -162,13 +176,17 @@ def build_pex_scie(executable_path: Path) -> None:
         ".",
         "--script",
         "att-mz",
+        "--venv",
+        "--venv-copies",
+        "--venv-site-packages-copies",
         "--scie",
         "eager",
+        "--scie-pbs-stripped",
         "--scie-load-dotenv",
         "--output-file",
         str(pex_output_path),
     ]
-    _ = subprocess.run(command, cwd=ROOT, check=True)
+    _ = subprocess.run(command, cwd=ROOT, check=True, env=release_subprocess_env())
     ensure_source_exists(executable_path)
     executable_path.chmod(executable_path.stat().st_mode | 0o755)
     if pex_output_path.exists():
@@ -298,7 +316,7 @@ def main() -> int:
 
     exe_path = release_dir / options.platform_spec.executable_name
     reset_release_directory(release_dir)
-    build_pex_scie(exe_path)
+    build_release_entrypoint(release_dir, options.platform_spec)
 
     copy_release_resources(release_dir, options.platform_spec)
     run_smoke_tests(release_dir, options.platform_spec)

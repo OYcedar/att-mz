@@ -2646,11 +2646,13 @@ fn scan_command_list(
                             parse_mv_virtual_speaker_line(context, &text, &location_path)?
                     {
                         last.role = Some(virtual_speaker.speaker);
+                        last.source_line_paths.push(location_path);
                         if virtual_speaker.body_text.is_empty() {
+                            // 仅有说话人的 MV 名字框服务术语写回，不进入正文翻译范围。
+                            last.writable = false;
                             continue;
                         }
                         last.original_lines.push(virtual_speaker.body_text);
-                        last.source_line_paths.push(location_path);
                         continue;
                     }
                     last.original_lines.push(text);
@@ -2706,7 +2708,11 @@ fn scan_command_list(
         }
     }
     flush_scroll(file_name, &mut pending_scroll, context, rows)?;
-    rows.retain(|row| !(row.item_type == "long_text" && row.original_lines.is_empty()));
+    rows.retain(|row| {
+        !(row.item_type == "long_text"
+            && row.original_lines.is_empty()
+            && row.source_line_paths.is_empty())
+    });
     Ok(())
 }
 

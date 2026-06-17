@@ -741,6 +741,7 @@ fn validate_text_fact_render_parts_for_domain(
     if !render_parts
         .iter()
         .any(|part| part.part_kind == "translated_body" || part.template_key == "body")
+        && !is_mv_virtual_namebox_speaker_only_template(domain, render_parts)
     {
         return Err(format!(
             "当前文本事实缺少译文写入位置，不能写进游戏文件；请重新运行 rebuild-text-index: {}",
@@ -748,6 +749,13 @@ fn validate_text_fact_render_parts_for_domain(
         ));
     }
     Ok(())
+}
+
+fn is_mv_virtual_namebox_speaker_only_template(
+    domain: &str,
+    render_parts: &[TextFactRenderPart],
+) -> bool {
+    domain == "mv_virtual_namebox" && render_parts.iter().any(|part| part.part_kind == "speaker")
 }
 
 fn text_fact_lines(text: &str, item_type: &str) -> Result<Vec<String>, String> {

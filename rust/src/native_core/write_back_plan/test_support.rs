@@ -5,6 +5,7 @@ use super::plugin_source::{
 use super::repository::read_translation_items_for_allowed_paths;
 use super::utils::sha256_text;
 use crate::native_core::javascript_ast::parse_javascript_string_spans;
+use crate::native_core::scope_index::rebuild_scope_index_storage_impl;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::fs;
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEST_TEXT_FACT_SCOPE_KEY: &str = "test-support-current";
+const CURRENT_SCHEMA_SQL: &str = include_str!("../../../../app/persistence/schema/current.sql");
 
 #[test]
 fn build_plan_generates_changed_data_file_from_sqlite() {
@@ -820,6 +822,67 @@ fn build_plan_keeps_mv_speaker_terms_stable_after_dialogue_line_deletions() {
     assert_eq!(commands[8]["parameters"][0], "丙译");
     assert_eq!(commands[10]["parameters"][0], "头目");
     assert_eq!(commands[11]["parameters"][0], "丁一");
+
+    fs::remove_dir_all(fixture).expect("测试目录应可清理");
+}
+
+#[test]
+fn build_plan_writes_mv_speaker_only_virtual_namebox_after_rebuild_index() {
+    let fixture = create_fixture_dir("att_mz_write_plan_mv_speaker_only_namebox");
+    let game_dir = fixture.join("game");
+    let db_path = fixture.join("game.db");
+    create_minimal_mv_game_files(&game_dir);
+    create_current_schema_database(&db_path);
+    write_mv_data_origin_and_active(
+        &game_dir,
+        "CommonEvents.json",
+        r#"[null,{"id":1,"list":[{"code":101,"parameters":[0,0,0,2]},{"code":401,"parameters":["盗賊頭"]},{"code":0,"parameters":[]}]}]"#,
+    );
+    insert_mv_exact_namebox_rule(&db_path);
+    insert_field_term(&db_path, "speaker_names", "盗賊頭", "头目");
+
+    let rebuild_payload = minimal_rebuild_storage_payload(&game_dir, &db_path, "mv");
+    let rebuild_output = rebuild_scope_index_storage_impl(&rebuild_payload.to_string())
+        .expect("重建索引应为 MV 空正文虚拟名字框保存当前事实");
+    let rebuild_value: Value =
+        serde_json::from_str(&rebuild_output).expect("重建索引输出应是 JSON");
+    assert_eq!(rebuild_value["status"], "ok");
+
+    let connection = Connection::open(&db_path).expect("测试数据库应可打开");
+    let (translatable_text, writable, source_line_paths): (String, i64, String) = connection
+        .query_row(
+            "SELECT facts.translatable_text, indexed.writable, indexed.source_line_paths \
+             FROM text_facts AS facts \
+             INNER JOIN text_index_items AS indexed \
+                ON indexed.location_path = facts.location_path \
+             WHERE facts.domain = 'mv_virtual_namebox'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("MV 空正文虚拟名字框应进入当前文本事实");
+    assert_eq!(translatable_text, "");
+    assert_eq!(writable, 0);
+    assert_eq!(source_line_paths, r#"["CommonEvents.json/1/1"]"#);
+    drop(connection);
+
+    let output = build_write_back_plan_impl(
+        &game_dir.to_string_lossy(),
+        &db_path.to_string_lossy(),
+        &minimal_setting_payload().to_string(),
+        "rebuild_active_runtime",
+        false,
+    )
+    .expect("MV 空正文虚拟名字框应能写入说话人术语");
+    let value: Value = serde_json::from_str(&output).expect("写回计划输出应是 JSON");
+    let common_events: Value =
+        serde_json::from_str(planned_file_content(&value, "data/CommonEvents.json"))
+            .expect("CommonEvents.json 计划内容应是 JSON");
+    let commands = common_events[1]["list"]
+        .as_array()
+        .expect("测试公共事件指令应是数组");
+
+    assert_eq!(value["summary"]["terminology_written_count"], 1);
+    assert_eq!(commands[1]["parameters"][0], "头目");
 
     fs::remove_dir_all(fixture).expect("测试目录应可清理");
 }
@@ -2409,6 +2472,32 @@ fn minimal_setting_payload() -> Value {
     })
 }
 
+fn minimal_rebuild_storage_payload(game_dir: &Path, db_path: &Path, engine_kind: &str) -> Value {
+    json!({
+        "db_path": db_path.to_string_lossy(),
+        "game_path": game_dir.to_string_lossy(),
+        "source_snapshot_fingerprint": "snapshot-v1",
+        "rules_fingerprint": "rules-v1",
+        "source_language": "ja",
+        "target_language": "zh-Hans",
+        "engine_kind": engine_kind,
+        "text_rules_setting": {
+            "source_text_required_pattern": ".+",
+            "source_text_exclusion_profile": "none"
+        },
+        "rule_candidate_text_rules": {
+            "custom_placeholder_rules": [],
+            "structured_placeholder_rules": [],
+            "strip_wrapping_punctuation_pairs": [],
+            "source_text_required_pattern": ".+",
+            "source_text_exclusion_profile": "none"
+        },
+        "event_command_scope_codes": [101, 102, 401, 405],
+        "source_text_required_pattern": ".+",
+        "created_at": "2026-06-17T00:00:00"
+    })
+}
+
 fn quality_payload_allowing_backslash_control_literal() -> Value {
     let mut payload = minimal_setting_payload();
     payload["quality_text_rules"]["custom_placeholder_rules"] = json!([
@@ -2985,6 +3074,13 @@ fn test_translatable_text(original_lines: &str, item_type: &str) -> String {
         return lines.first().cloned().unwrap_or_default();
     }
     lines.join("\n")
+}
+
+fn create_current_schema_database(db_path: &Path) {
+    let connection = Connection::open(db_path).expect("测试数据库应可创建");
+    connection
+        .execute_batch(CURRENT_SCHEMA_SQL)
+        .expect("当前数据库 schema 应可创建");
 }
 
 fn create_minimal_text_index_items(db_path: &Path, rows: &[(&str, bool)]) {
