@@ -13,7 +13,7 @@
 ## 输出
 
 - `att-mz-windows-x86_64.zip` 和 `att-mz-linux-x86_64.zip`。
-- Windows 发行包内的 `att-mz.exe`，Linux 发行包内的 `att-mz`；发行包根目录不得包含独立 `python/` 目录。
+- Windows 发行包内的 `att-mz.exe`，Linux 发行包内的 `att-mz`。
 - 两个平台发行包内共同包含 `README.md`、`setting.toml`、`skills/att-mz/SKILL.md`、Skill references、字体、提示词和空数据目录。
 - GitHub Release 正文来自 `CHANGELOG.md` 中对应 tag 的版本段落。
 - CI 中的类型检查、测试、构建和冒烟测试结果。
@@ -25,7 +25,7 @@
 - 发布工作流先在 Windows runner 执行 `uv run basedpyright`、设置 `ATT_MZ_RUST_THREADS=1` 后执行 `uv run pytest -q -n 12 --dist=load --durations=30 --durations-min=0.5`、`cargo fmt --manifest-path rust/Cargo.toml -- --check`、`cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings` 和 `cargo test --manifest-path rust/Cargo.toml`，通过后才进入 Windows / Linux 双平台构建。
 - 发布工作流必须先从 `CHANGELOG.md` 提取当前 tag 的具体更新说明；找不到对应版本段落时停止发布，不能只使用 GitHub 自动生成的 Release notes。
 - 当前 Release 正文必须同时包含 `att-mz-windows-x86_64.zip` 和 `att-mz-linux-x86_64.zip` 下载信息。
-- 发行包冒烟测试必须验证当前平台入口的 `--help` 和空注册表读取；Windows 验证 `att-mz.exe`，Linux 验证 `att-mz`。
+- 发行包冒烟测试必须验证当前平台可执行文件的 `--help` 和空注册表读取；Windows 验证 `att-mz.exe`，Linux 验证 `att-mz`。
 - 大样本性能门禁不能在 GitHub 托管 runner 上伪造执行；私有样本只能放在本机或持有样本的专用环境。发布前在持有样本的环境运行下面的命令。失败时暂停发布：
 
 ```powershell
