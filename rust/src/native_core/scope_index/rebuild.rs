@@ -2647,12 +2647,11 @@ fn scan_command_list(
                     {
                         last.role = Some(virtual_speaker.speaker);
                         last.source_line_paths.push(location_path);
-                        if virtual_speaker.body_text.is_empty() {
-                            // 仅有说话人的 MV 名字框服务术语写回，不进入正文翻译范围。
-                            last.writable = false;
-                            continue;
+                        if !virtual_speaker.body_text.is_empty() {
+                            last.original_lines.push(virtual_speaker.body_text);
                         }
-                        last.original_lines.push(virtual_speaker.body_text);
+                        // 名字框首行的 writable 不在此处判定：正文可能在后续 401 行。
+                        // 纯名字框块（无后续正文）的 writable 由块结束后的收尾逻辑处理。
                         continue;
                     }
                     last.original_lines.push(text);
@@ -2713,6 +2712,17 @@ fn scan_command_list(
             && row.original_lines.is_empty()
             && row.source_line_paths.is_empty())
     });
+    // 纯名字框块只命中说话人行、没有后续 401 正文，仅用于 speaker_names 术语写回，
+    // 不进入正文翻译范围；带后续正文的正常对话块 writable 保持默认 true。
+    for row in rows.iter_mut() {
+        if row.item_type == "long_text"
+            && row.original_lines.is_empty()
+            && !row.source_line_paths.is_empty()
+            && row.source_type == "event_command"
+        {
+            row.writable = false;
+        }
+    }
     Ok(())
 }
 

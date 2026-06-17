@@ -888,6 +888,59 @@ fn build_plan_writes_mv_speaker_only_virtual_namebox_after_rebuild_index() {
 }
 
 #[test]
+fn rebuild_index_keeps_namebox_first_line_with_body_writable() {
+    // 名字框首行（独立 401 行匹配 speaker，body_group 空）+ 后续 401 正文行，
+    // 是 MV 游戏常见的对话格式。索引后该块必须 writable=true 且进入 mv_virtual_namebox 域，
+    // 不能因为首行 body_text 为空被误判为不可写回。
+    let fixture = create_fixture_dir("att_mz_rebuild_namebox_first_with_body");
+    let game_dir = fixture.join("game");
+    let db_path = fixture.join("game.db");
+    create_minimal_mv_game_files(&game_dir);
+    create_current_schema_database(&db_path);
+    write_mv_data_origin_and_active(
+        &game_dir,
+        "CommonEvents.json",
+        r#"[null,{"id":1,"list":[{"code":101,"parameters":[0,0,0,2]},{"code":401,"parameters":["盗賊頭"]},{"code":401,"parameters":["ここを通るには金だ"]},{"code":0,"parameters":[]}]}]"#,
+    );
+    insert_mv_exact_namebox_rule(&db_path);
+
+    let rebuild_payload = minimal_rebuild_storage_payload(&game_dir, &db_path, "mv");
+    let rebuild_output = rebuild_scope_index_storage_impl(&rebuild_payload.to_string())
+        .expect("重建索引应为名字框首行+正文对话块保存当前事实");
+    let rebuild_value: Value =
+        serde_json::from_str(&rebuild_output).expect("重建索引输出应是 JSON");
+    assert_eq!(rebuild_value["status"], "ok");
+
+    let connection = Connection::open(&db_path).expect("测试数据库应可打开");
+    let (domain, translatable_text, writable, source_line_paths): (
+        String,
+        String,
+        i64,
+        String,
+    ) = connection
+        .query_row(
+            "SELECT facts.domain, facts.translatable_text, indexed.writable, indexed.source_line_paths \
+             FROM text_facts AS facts \
+             INNER JOIN text_index_items AS indexed \
+                ON indexed.location_path = facts.location_path \
+             WHERE facts.location_path = 'CommonEvents.json/1/0'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("名字框首行+正文对话块应进入当前文本事实");
+    assert_eq!(domain, "mv_virtual_namebox");
+    assert_eq!(translatable_text, "ここを通るには金だ");
+    assert_eq!(writable, 1, "名字框首行+正文对话块必须可写回");
+    assert_eq!(
+        source_line_paths,
+        r#"["CommonEvents.json/1/1","CommonEvents.json/1/2"]"#
+    );
+    drop(connection);
+
+    fs::remove_dir_all(fixture).expect("测试目录应可清理");
+}
+
+#[test]
 fn build_plan_writes_mz_terminology_fields() {
     let fixture = create_fixture_dir("att_mz_write_plan_mz_terminology");
     let game_dir = fixture.join("game");
