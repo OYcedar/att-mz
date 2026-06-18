@@ -3109,48 +3109,14 @@ fn actor_name_from_control(
     text: &str,
     location_path: &str,
 ) -> Result<String, String> {
-    let pattern = Regex::new(r"^\\[Nn]\[(?P<actor_id>\d+)\]$").map_err(|error| {
-        structured_error(
-            "scope_index_rebuild_mv_virtual_namebox_failed",
-            format!("MV actor_name 控制符正则初始化失败: {error}"),
-        )
-    })?;
-    let captures = pattern.captures(text).ok_or_else(|| {
-        structured_error(
-            "scope_index_rebuild_mv_virtual_namebox_failed",
-            format!(
-                "actor_name 规则命中的说话人不是角色名控制符: {text}; 文本路径={location_path}"
-            ),
-        )
-    })?;
-    let actor_id = captures
-        .name("actor_id")
-        .ok_or_else(|| {
+    super::mv_virtual_namebox::actor_name_from_control(&context.actor_names_by_id, text).map_err(
+        |message| {
             structured_error(
                 "scope_index_rebuild_mv_virtual_namebox_failed",
-                format!("actor_name 规则无法解析角色 ID: {text}; 文本路径={location_path}"),
+                format!("{message}; 文本路径={location_path}"),
             )
-        })?
-        .as_str()
-        .parse::<i64>()
-        .map_err(|error| {
-            structured_error(
-                "scope_index_rebuild_mv_virtual_namebox_failed",
-                format!(
-                    "actor_name 规则角色 ID 不是数字: {text}: {error}; 文本路径={location_path}"
-                ),
-            )
-        })?;
-    context
-        .actor_names_by_id
-        .get(&actor_id)
-        .cloned()
-        .ok_or_else(|| {
-            structured_error(
-                "scope_index_rebuild_mv_virtual_namebox_failed",
-                format!("actor_name 规则无法解析角色 ID: {actor_id}; 文本路径={location_path}"),
-            )
-        })
+        },
+    )
 }
 
 struct RowInput<'a> {
