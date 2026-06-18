@@ -2646,11 +2646,12 @@ fn scan_command_list(
                             parse_mv_virtual_speaker_line(context, &text, &location_path)?
                     {
                         last.role = Some(virtual_speaker.speaker);
-                        if virtual_speaker.body_text.is_empty() {
-                            continue;
-                        }
-                        last.original_lines.push(virtual_speaker.body_text);
                         last.source_line_paths.push(location_path);
+                        if !virtual_speaker.body_text.is_empty() {
+                            last.original_lines.push(virtual_speaker.body_text);
+                        }
+                        // 名字框首行的 writable 不在此处判定：正文可能在后续 401 行。
+                        // 纯名字框块（无后续正文）的 writable 由块结束后的收尾逻辑处理。
                         continue;
                     }
                     last.original_lines.push(text);
@@ -2706,7 +2707,22 @@ fn scan_command_list(
         }
     }
     flush_scroll(file_name, &mut pending_scroll, context, rows)?;
-    rows.retain(|row| !(row.item_type == "long_text" && row.original_lines.is_empty()));
+    rows.retain(|row| {
+        !(row.item_type == "long_text"
+            && row.original_lines.is_empty()
+            && row.source_line_paths.is_empty())
+    });
+    // 纯名字框块只命中说话人行、没有后续 401 正文，仅用于 speaker_names 术语写回，
+    // 不进入正文翻译范围；带后续正文的正常对话块 writable 保持默认 true。
+    for row in rows.iter_mut() {
+        if row.item_type == "long_text"
+            && row.original_lines.is_empty()
+            && !row.source_line_paths.is_empty()
+            && row.source_type == "event_command"
+        {
+            row.writable = false;
+        }
+    }
     Ok(())
 }
 
@@ -3093,48 +3109,14 @@ fn actor_name_from_control(
     text: &str,
     location_path: &str,
 ) -> Result<String, String> {
-    let pattern = Regex::new(r"^\\[Nn]\[(?P<actor_id>\d+)\]$").map_err(|error| {
-        structured_error(
-            "scope_index_rebuild_mv_virtual_namebox_failed",
-            format!("MV actor_name 控制符正则初始化失败: {error}"),
-        )
-    })?;
-    let captures = pattern.captures(text).ok_or_else(|| {
-        structured_error(
-            "scope_index_rebuild_mv_virtual_namebox_failed",
-            format!(
-                "actor_name 规则命中的说话人不是角色名控制符: {text}; 文本路径={location_path}"
-            ),
-        )
-    })?;
-    let actor_id = captures
-        .name("actor_id")
-        .ok_or_else(|| {
+    super::mv_virtual_namebox::actor_name_from_control(&context.actor_names_by_id, text).map_err(
+        |message| {
             structured_error(
                 "scope_index_rebuild_mv_virtual_namebox_failed",
-                format!("actor_name 规则无法解析角色 ID: {text}; 文本路径={location_path}"),
+                format!("{message}; 文本路径={location_path}"),
             )
-        })?
-        .as_str()
-        .parse::<i64>()
-        .map_err(|error| {
-            structured_error(
-                "scope_index_rebuild_mv_virtual_namebox_failed",
-                format!(
-                    "actor_name 规则角色 ID 不是数字: {text}: {error}; 文本路径={location_path}"
-                ),
-            )
-        })?;
-    context
-        .actor_names_by_id
-        .get(&actor_id)
-        .cloned()
-        .ok_or_else(|| {
-            structured_error(
-                "scope_index_rebuild_mv_virtual_namebox_failed",
-                format!("actor_name 规则无法解析角色 ID: {actor_id}; 文本路径={location_path}"),
-            )
-        })
+        },
+    )
 }
 
 struct RowInput<'a> {

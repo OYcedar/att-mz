@@ -1073,7 +1073,7 @@ fn template_field_value(
         .to_string()
 }
 
-fn actor_name_from_control(
+pub(super) fn actor_name_from_control(
     actor_names_by_id: &BTreeMap<i64, String>,
     text: &str,
 ) -> Result<String, String> {

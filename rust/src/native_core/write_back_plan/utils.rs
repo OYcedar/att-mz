@@ -1,6 +1,5 @@
 use super::models::PlannedFile;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -90,50 +89,6 @@ pub(super) fn current_timestamp_text() -> Result<String, String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
         .map_err(|error| format!("系统时间早于 UNIX_EPOCH，不能生成运行映射时间戳: {error}"))
-}
-
-pub(super) fn render_format_template(
-    template: &str,
-    values: &HashMap<String, String>,
-) -> Result<String, String> {
-    let chars: Vec<char> = template.chars().collect();
-    let mut rendered = String::new();
-    let mut index = 0usize;
-    while index < chars.len() {
-        let current = chars[index];
-        if current == '{' {
-            if index + 1 < chars.len() && chars[index + 1] == '{' {
-                rendered.push('{');
-                index += 2;
-                continue;
-            }
-            let mut end_index = index + 1;
-            while end_index < chars.len() && chars[end_index] != '}' {
-                end_index += 1;
-            }
-            if end_index >= chars.len() {
-                return Err(format!("MV 虚拟名字框模板缺少右花括号: {template}"));
-            }
-            let field_name: String = chars[index + 1..end_index].iter().collect();
-            let value = values
-                .get(&field_name)
-                .ok_or_else(|| format!("MV 虚拟名字框模板引用未知字段: {field_name}"))?;
-            rendered.push_str(value);
-            index = end_index + 1;
-            continue;
-        }
-        if current == '}' {
-            if index + 1 < chars.len() && chars[index + 1] == '}' {
-                rendered.push('}');
-                index += 2;
-                continue;
-            }
-            return Err(format!("MV 虚拟名字框模板存在孤立右花括号: {template}"));
-        }
-        rendered.push(current);
-        index += 1;
-    }
-    Ok(rendered)
 }
 
 pub(super) fn parse_usize(text: &str, context: &str) -> Result<usize, String> {

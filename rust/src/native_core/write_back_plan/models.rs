@@ -2,7 +2,7 @@ use crate::native_core::javascript_ast::JavaScriptStringSpan;
 use crate::native_core::models::NativeTextRules;
 use crate::native_core::rule_runtime::engine::{Pcre2Engine, Pcre2EngineConfig, Pcre2Pattern};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub(super) const PLUGINS_FILE_NAME: &str = "plugins.js";
@@ -42,10 +42,14 @@ pub(super) struct TextFactRenderPart {
 pub(super) struct MvVirtualNameboxFactTemplate {
     pub(super) location_path: String,
     pub(super) role: String,
-    pub(super) raw_text: String,
-    pub(super) body_text: String,
     pub(super) source_line_paths: Vec<String>,
     pub(super) render_parts: Vec<TextFactRenderPart>,
+    /// 命中规则名，来自 text_fact_domain_payloads.rule_name。
+    pub(super) rule_name: String,
+    /// 说话人策略，来自 text_fact_domain_payloads.speaker_policy。
+    pub(super) speaker_policy: MvVirtualSpeakerPolicy,
+    /// 原始匹配说话人，来自 text_fact_domain_payloads.source_speaker。
+    pub(super) source_speaker: String,
 }
 
 #[derive(Clone, Debug)]
@@ -154,34 +158,14 @@ pub(super) enum EngineKind {
 }
 
 pub(super) struct MvVirtualNameboxRule {
-    pub(super) rule_name: String,
-    pub(super) pattern: Pcre2Pattern,
-    pub(super) speaker_group: String,
-    pub(super) body_group: String,
     pub(super) speaker_policy: MvVirtualSpeakerPolicy,
-    pub(super) render_template: String,
-    pub(super) group_names: Vec<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum MvVirtualSpeakerPolicy {
     Translate,
     Preserve,
     ActorName,
-}
-
-pub(super) struct MvVirtualSpeaker {
-    pub(super) speaker_line_path: String,
-    pub(super) speaker: String,
-    pub(super) body_text: String,
-    pub(super) matched_text: String,
-    pub(super) rule_name: String,
-    pub(super) speaker_policy: MvVirtualSpeakerPolicy,
-    pub(super) source_speaker_text: String,
-    pub(super) render_template: String,
-    pub(super) group_values: HashMap<String, String>,
-    pub(super) speaker_group: String,
-    pub(super) body_group: String,
 }
 
 #[derive(Deserialize)]

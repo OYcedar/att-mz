@@ -1,5 +1,34 @@
 # 更新日志
 
+## v0.1.14 - 2026-06-18
+
+### 更新重点
+
+- 修复 MV 虚拟名字框"首行+后续正文"对话块被误判不可写回，导致约 12905 条对话文本被 `coverage_unwritable` 阻断无法进入翻译流程。名字框首行只更新角色和行路径，纯名字框块的不可写回判定延迟到块结束后统一处理，带后续正文的对话块恢复可写回。
+- 修复 MV `actor_name` 虚拟名字框写回时把 `\N[n]` 角色名控制符错误替换成角色名译名，破坏 RPG Maker 运行时动态角色名引用。控制符现在原样保留，角色名译文由 `actor_names` 术语分类写回 `Actors.json` 的 `name` 字段，游戏运行时由引擎替换控制符。
+- 收束 MV 虚拟名字框写回为单一事实源：索引阶段唯一计算说话人/正文解析结果，写回阶段只消费当前文本事实，删除写回阶段重复扫描 401 指令解析说话人的三份独立实现（净删约 400 行）；索引阶段 actor_name 控制符解析也收束为单一实现。
+- 修复 Windows 普通账户运行 `att-mz.exe` 时因缺少创建符号链接特权报 `WinError 1314` 无法启动。恢复 pex `--venv-copies` 用文件复制代替符号链接安装依赖，保持单体 exe 打包方式不变。
+
+### 升级提醒
+
+- 之前因名字框首行+正文格式被阻断的游戏，重新运行 `rebuild-text-index` 后受影响文本会恢复可写回，可继续翻译。
+- 使用 `actor_name` 规则的游戏，写回后名字框行的 `\N[n]` 控制符会保留原样（不再变成角色名译名），这是正确行为；角色名译文仍会正确写回 `Actors.json`。
+- Windows 用户若遇到 `att-mz.exe` 启动报 `WinError 1314`，请下载本版本及之后的发行包。
+
+### 验证命令
+
+- `uv run basedpyright`
+- 设置 `$env:ATT_MZ_RUST_THREADS = "1"` 后执行 `uv run pytest -q -n 12 --dist=load --durations=30 --durations-min=0.5`
+- `cargo fmt --manifest-path rust/Cargo.toml -- --check`
+- `cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings`
+- `cargo test --manifest-path rust/Cargo.toml`
+
+### 发行包
+
+- GitHub Release 下载 `att-mz-windows-x86_64.zip`。
+- GitHub Release 下载 `att-mz-linux-x86_64.zip`。
+- 正式 Windows / Linux ZIP 由 GitHub Actions `release` 工作流生成。
+
 ## v0.1.13 - 2026-06-16
 
 ### 更新重点

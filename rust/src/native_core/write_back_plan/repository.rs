@@ -3,9 +3,9 @@ use super::models::{
     PluginSourceTextRule, TextFactRenderPart, TranslationItem,
 };
 use crate::native_core::models::NativeSourceResidualRule;
-use crate::native_core::rule_runtime::adapters::mv_virtual_namebox::compile_mv_virtual_namebox_pattern;
 use crate::native_core::text_facts::CURRENT_TEXT_FACT_CONTRACT_VERSION;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -42,7 +42,6 @@ struct FactTemplateRow {
     domain: String,
     role: String,
     raw_text: String,
-    translatable_text: String,
     source_line_paths_text: String,
 }
 
@@ -308,7 +307,7 @@ pub(super) fn read_mv_virtual_namebox_fact_templates(
     let mut statement = connection
         .prepare(
             "SELECT facts.location_path, facts.fact_id, facts.domain, facts.role, \
-                    facts.raw_text, facts.translatable_text, indexed.source_line_paths \
+                    facts.raw_text, indexed.source_line_paths \
              FROM text_facts AS facts \
              INNER JOIN text_index_items AS indexed \
                 ON indexed.location_path = facts.location_path \
@@ -325,8 +324,7 @@ pub(super) fn read_mv_virtual_namebox_fact_templates(
                 domain: row.get(2)?,
                 role: row.get(3)?,
                 raw_text: row.get(4)?,
-                translatable_text: row.get(5)?,
-                source_line_paths_text: row.get(6)?,
+                source_line_paths_text: row.get(5)?,
             })
         })
         .map_err(|error| format!("读取 MV 虚拟名字框 current text facts 失败: {error}"))?;
@@ -337,6 +335,13 @@ pub(super) fn read_mv_virtual_namebox_fact_templates(
         );
     }
     let render_parts_by_fact = read_render_parts_by_fact_id(
+        connection,
+        &fact_rows
+            .iter()
+            .map(|row| row.fact_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let domain_payloads_by_fact = read_mv_virtual_namebox_domain_payloads_by_fact_id(
         connection,
         &fact_rows
             .iter()
@@ -357,13 +362,21 @@ pub(super) fn read_mv_virtual_namebox_fact_templates(
         )?;
         let source_line_paths =
             parse_string_array(&row.source_line_paths_text, "source_line_paths")?;
+        let payload = domain_payloads_by_fact.get(&row.fact_id).ok_or_else(|| {
+            format!(
+                "MV 虚拟名字框当前文本事实缺少 domain payload，请重新运行 rebuild-text-index: {}",
+                row.location_path
+            )
+        })?;
+        let speaker_policy = parse_mv_virtual_speaker_policy(&payload.speaker_policy)?;
         templates.push(MvVirtualNameboxFactTemplate {
             location_path: row.location_path,
             role: row.role,
-            raw_text: row.raw_text,
-            body_text: row.translatable_text,
             source_line_paths,
             render_parts,
+            rule_name: payload.rule_name.clone(),
+            speaker_policy,
+            source_speaker: payload.source_speaker.clone(),
         });
     }
     Ok(templates)
@@ -666,6 +679,61 @@ fn read_render_parts_by_fact_id(
     Ok(parts_by_fact)
 }
 
+/// MV 虚拟名字框 domain_payload_json 反序列化结构。
+/// 写回阶段消费 rule_name/speaker_policy/source_speaker，不再重新解析 401 指令。
+#[derive(Deserialize)]
+struct MvVirtualNameboxFactPayload {
+    rule_name: String,
+    speaker_policy: String,
+    source_speaker: String,
+}
+
+fn read_mv_virtual_namebox_domain_payloads_by_fact_id(
+    connection: &Connection,
+    fact_ids: &[String],
+) -> Result<HashMap<String, MvVirtualNameboxFactPayload>, String> {
+    let mut payloads_by_fact: HashMap<String, MvVirtualNameboxFactPayload> = HashMap::new();
+    if fact_ids.is_empty() {
+        return Ok(payloads_by_fact);
+    }
+    let unique_fact_ids: Vec<String> = fact_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    for chunk in unique_fact_ids.chunks(SQLITE_IN_CLAUSE_CHUNK_SIZE) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT fact_id, payload_json \
+             FROM text_fact_domain_payloads \
+             WHERE fact_id IN ({placeholders})"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| format!("读取 MV 虚拟名字框 domain payload SQL 准备失败: {error}"))?;
+        let rows = statement
+            .query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("读取 MV 虚拟名字框 domain payload 失败: {error}"))?;
+        for row in rows {
+            let (fact_id, payload_json) =
+                row.map_err(|error| format!("读取 MV 虚拟名字框 domain payload 行失败: {error}"))?;
+            let payload: MvVirtualNameboxFactPayload =
+                serde_json::from_str(&payload_json).map_err(|error| {
+                    format!(
+                        "MV 虚拟名字框 domain payload 解析失败，请重新运行 rebuild-text-index: {fact_id}: {error}"
+                    )
+                })?;
+            payloads_by_fact.insert(fact_id, payload);
+        }
+    }
+    Ok(payloads_by_fact)
+}
+
 fn translation_item_from_text_fact_row(
     row: TranslationFactRow,
     render_parts: Vec<TextFactRenderPart>,
@@ -741,6 +809,7 @@ fn validate_text_fact_render_parts_for_domain(
     if !render_parts
         .iter()
         .any(|part| part.part_kind == "translated_body" || part.template_key == "body")
+        && !is_mv_virtual_namebox_speaker_only_template(domain, render_parts)
     {
         return Err(format!(
             "当前文本事实缺少译文写入位置，不能写进游戏文件；请重新运行 rebuild-text-index: {}",
@@ -748,6 +817,13 @@ fn validate_text_fact_render_parts_for_domain(
         ));
     }
     Ok(())
+}
+
+fn is_mv_virtual_namebox_speaker_only_template(
+    domain: &str,
+    render_parts: &[TextFactRenderPart],
+) -> bool {
+    domain == "mv_virtual_namebox" && render_parts.iter().any(|part| part.part_kind == "speaker")
 }
 
 fn text_fact_lines(text: &str, item_type: &str) -> Result<Vec<String>, String> {
@@ -865,39 +941,13 @@ pub(super) fn read_mv_virtual_namebox_rules(
         read_runtime_rule_payloads(connection, "mv_virtual_namebox", "读取 MV 虚拟名字框规则")?;
     let mut rules = Vec::new();
     for row in rows {
-        let rule_name = payload_string(&row.payload_json, "name", "读取 MV 虚拟名字框规则")?;
-        let pattern_text =
-            payload_optional_string(&row.payload_json, "pattern").unwrap_or(row.matcher_value);
-        let speaker_group =
-            payload_string(&row.payload_json, "speaker_group", "读取 MV 虚拟名字框规则")?;
-        let body_group =
-            payload_optional_string(&row.payload_json, "body_group").unwrap_or_default();
         let speaker_policy = payload_string(
             &row.payload_json,
             "speaker_policy",
             "读取 MV 虚拟名字框规则",
         )?;
-        let render_template = payload_string(
-            &row.payload_json,
-            "render_template",
-            "读取 MV 虚拟名字框规则",
-        )?;
-        let pattern = compile_mv_virtual_namebox_pattern(
-            &rule_name,
-            &pattern_text,
-            &speaker_group,
-            &body_group,
-        )
-        .map_err(|error| format!("MV 虚拟名字框规则正则损坏 {rule_name}: {error}"))?;
-        let group_names = pattern.capture_names();
         rules.push(MvVirtualNameboxRule {
-            rule_name,
-            group_names,
-            pattern,
-            speaker_group,
-            body_group,
             speaker_policy: parse_mv_virtual_speaker_policy(&speaker_policy)?,
-            render_template,
         });
     }
     Ok(rules)
