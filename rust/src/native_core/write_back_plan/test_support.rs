@@ -674,8 +674,8 @@ fn build_plan_supports_mv_virtual_namebox_rules() {
         "内联虚拟名字框应把说话人和译文正文合并回同一行",
     );
     assert!(
-        common_events_content.contains("勇者:勇者正文"),
-        "actor_name 虚拟名字框应按角色名术语重建",
+        common_events_content.contains("\\N[1]:勇者正文"),
+        "actor_name 虚拟名字框的 \\N[n] 控制符必须原样保留，只写回正文译文",
     );
 
     fs::remove_dir_all(fixture).expect("测试目录应可清理");
@@ -702,8 +702,9 @@ fn build_plan_write_back_loads_actor_names_for_mv_actor_name_rule() {
     let value: Value = serde_json::from_str(&output).expect("写回计划输出应是 JSON");
 
     assert!(
-        planned_file_content(&value, "data/CommonEvents.json").contains("勇者:勇者正文"),
-        "actor_name 虚拟名字框在普通写回模式也应按角色名术语重建",
+        planned_file_content(&value, "data/CommonEvents.json").contains("\\N[1]:勇者正文"),
+        "actor_name 虚拟名字框的 \\N[n] 控制符必须原样保留，只写回正文译文；\
+         控制符由 RPG Maker 运行时替换为 Actors.json 角色名，不能替换成译名",
     );
 
     fs::remove_dir_all(fixture).expect("测试目录应可清理");

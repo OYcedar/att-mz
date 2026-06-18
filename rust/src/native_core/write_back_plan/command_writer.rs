@@ -310,6 +310,16 @@ fn read_mv_render_speaker_for_item(
     item: &TranslationItem,
     fact_template: &MvVirtualNameboxFactTemplate,
 ) -> Result<String, String> {
+    if matches!(
+        fact_template.speaker_policy,
+        MvVirtualSpeakerPolicy::ActorName
+    ) {
+        // actor_name 的 \N[n] 是 RPG Maker 运行时角色名控制符，游戏运行时由引擎
+        // 替换为 Actors.json 的角色名；写回时原样保留控制符，不能替换成译名，否则
+        // 破坏动态引用。术语 key 用数据库角色名（fact_template.role）只用于收集术语
+        // 和上下文，写回渲染取 source_speaker（控制符原文）。
+        return Ok(fact_template.source_speaker.to_string());
+    }
     let source_speaker = item
         .role
         .as_deref()

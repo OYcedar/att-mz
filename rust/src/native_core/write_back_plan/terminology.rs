@@ -328,8 +328,13 @@ fn collect_mv_virtual_speaker_name_writes(
         }
         if matches!(
             fact_template.speaker_policy,
-            MvVirtualSpeakerPolicy::Preserve
+            MvVirtualSpeakerPolicy::Preserve | MvVirtualSpeakerPolicy::ActorName
         ) {
+            // preserve 和 actor_name 的说话人行都不参与 speaker_names 术语写回：
+            // - preserve 是必须原样保留的动态控制符或协议标记，不进术语。
+            // - actor_name 的 \N[n] 是 RPG Maker 运行时角色名控制符，游戏运行时由引擎
+            //   替换为 Actors.json 的角色名；写回时必须原样保留控制符，不能替换成译名，
+            //   否则破坏动态引用。术语 key 用数据库角色名只用于收集术语和上下文。
             continue;
         }
         let Some(translated_speaker) = translations.get(&fact_template.role) else {

@@ -626,7 +626,7 @@ async def test_mv_terminology_collects_401_speakers_as_virtual_name_boxes(
         mv_virtual_namebox_rule_records=mv_namebox_rules,
     )
 
-    assert written_count == 3
+    assert written_count == 2
     current_events = ensure_json_array(game_data.writable_data["CommonEvents.json"], "CommonEvents")
     current_event = ensure_json_object(current_events[2], "CommonEvents[2]")
     current_commands = ensure_json_array(current_event["list"], "CommonEvents[2].list")
@@ -640,7 +640,16 @@ async def test_mv_terminology_collects_401_speakers_as_virtual_name_boxes(
     actor_commands = ensure_json_array(actor_event["list"], "CommonEvents[3].list")
     actor_text_command = ensure_json_object(actor_commands[1], "CommonEvents[3].list[1]")
     actor_text_parameters = ensure_json_array(actor_text_command["parameters"], "CommonEvents[3].list[1].parameters")
-    assert actor_text_parameters[0] == "勇者:"
+    # actor_name 的 \N[n] 是 RPG Maker 运行时角色名控制符，游戏运行时由引擎替换为
+    # Actors.json 的角色名；术语写回必须原样保留控制符，不能替换成译名，否则破坏动态引用。
+    # 角色名译文通过 actor_names 术语分类写回 Actors.json 的 name 字段，不通过名字框行。
+    assert actor_text_parameters[0] == "\\N[1]:"
+    # actor_name 块的后续正文行不参与术语写回，必须保持源文不变。
+    actor_body_command = ensure_json_object(actor_commands[2], "CommonEvents[3].list[2]")
+    actor_body_parameters = ensure_json_array(
+        actor_body_command["parameters"], "CommonEvents[3].list[2].parameters"
+    )
+    assert actor_body_parameters[0] == "役者の本文です"
     angle_event = ensure_json_object(current_events[5], "CommonEvents[5]")
     angle_commands = ensure_json_array(angle_event["list"], "CommonEvents[5].list")
     angle_text_command = ensure_json_object(angle_commands[1], "CommonEvents[5].list[1]")
