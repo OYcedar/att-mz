@@ -1,0 +1,380 @@
+//! 用七个根能力测试替身组装完整 ExtractUseCase 非根依赖树。
+
+use std::error::Error;
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use super::builtin::{BuiltInExtractionConfig, BuiltInExtractionService};
+use super::document::{MzDocumentReadingConfig, MzProjectDocumentReadingService};
+use super::lua::{LuaExtractionService, LuaInvocation, TrustedLuaExecutionHost};
+use super::rules::{RulesExtractionConfig, RulesExtractionService};
+use super::service::ExtractService;
+use super::store::asset_store::{MzExtractionAssetStore, MzExtractionAssetStoreConfig};
+use super::{ExtractInput, ExtractUseCase, ExtractionSelection};
+use crate::att_mz::ProjectName;
+use crate::att_mz::project::ExistingProjectOpeningService;
+use crate::project_database::ProjectDatabaseRecordReadingService;
+use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::storage::file_system::{
+    DirectoryLister, ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile,
+    ReadFileError, ResolveDirectoryError,
+};
+use crate::storage::sqlite::{
+    ExecuteTransactionError, QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor,
+    SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan, SqliteTransactionStep,
+    SqliteValue,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FakeRootError;
+
+impl fmt::Display for FakeRootError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("根能力测试替身失败")
+    }
+}
+
+impl Error for FakeRootError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Event {
+    BuiltinTransaction,
+    RulesTransaction,
+    Lua,
+}
+
+#[derive(Clone)]
+struct FakeDirectoryResolver;
+
+impl ExistingDirectoryResolver for FakeDirectoryResolver {
+    type Error = FakeRootError;
+
+    async fn resolve_existing_directory(
+        &self,
+        _: PathBuf,
+    ) -> Result<PathBuf, ResolveDirectoryError<Self::Error>> {
+        Ok(PathBuf::from("C:/Games/Demo"))
+    }
+}
+
+#[derive(Clone)]
+struct FakeFileReader {
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl FileReader for FakeFileReader {
+    type Error = FakeRootError;
+
+    async fn read_file(&self, path: PathBuf) -> Result<ReadFile, ReadFileError<Self::Error>> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        let bytes = match path.file_name().and_then(|name| name.to_str()) {
+            Some("rules.json") => {
+                br#"{"standard_fields":{"Items.json":["[].customRule"]}}"#.to_vec()
+            }
+            Some("Items.json") => r#"[null,{"name":"","description":"","customRule":"规则文本"}]"#
+                .as_bytes()
+                .to_vec(),
+            Some("System.json") => br#"{
+                "gameTitle":"",
+                "currencyUnit":"",
+                "terms":{"basic":[],"commands":[],"params":[],"messages":{}},
+                "elements":[],
+                "skillTypes":[],
+                "weaponTypes":[],
+                "armorTypes":[],
+                "equipTypes":[]
+            }"#
+            .to_vec(),
+            Some(
+                "Actors.json" | "Armors.json" | "Classes.json" | "CommonEvents.json"
+                | "Enemies.json" | "Skills.json" | "States.json" | "Troops.json" | "Weapons.json",
+            ) => b"[null]".to_vec(),
+            _ => {
+                return Err(ReadFileError::NotFound { path });
+            }
+        };
+
+        Ok(ReadFile::new(path, bytes))
+    }
+}
+
+#[derive(Clone)]
+struct FakeDirectoryLister;
+
+impl DirectoryLister for FakeDirectoryLister {
+    type Error = FakeRootError;
+
+    async fn list_directory(
+        &self,
+        _: PathBuf,
+    ) -> Result<Vec<PathBuf>, ListDirectoryError<Self::Error>> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Clone)]
+struct FakeCpuTaskExecutor {
+    executions: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl CpuTaskExecutor for FakeCpuTaskExecutor {
+    type Error = FakeRootError;
+
+    async fn execute<T, F>(&self, task: F) -> Result<T, CpuTaskExecutionError<Self::Error>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(task())
+    }
+}
+
+#[derive(Clone)]
+struct FakeSqliteQueryExecutor {
+    queries: Arc<AtomicUsize>,
+}
+
+impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
+    type Error = FakeRootError;
+
+    async fn query_existing_database(
+        &self,
+        path: PathBuf,
+        query: SqliteQuery,
+    ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>> {
+        assert_eq!(path, PathBuf::from("C:/Projects/demo.db"));
+        assert!(query.statement().contains("FROM metadata"));
+        assert!(query.parameters().is_empty());
+        self.queries.fetch_add(1, Ordering::Relaxed);
+        Ok(vec![SqliteRow::new(vec![
+            SqliteValue::Text("demo".to_owned()),
+            SqliteValue::Text("./Demo".to_owned()),
+            SqliteValue::Text("ja".to_owned()),
+            SqliteValue::Text("zh-Hans".to_owned()),
+        ])])
+    }
+}
+
+#[derive(Clone)]
+struct FakeSqliteTransactionExecutor {
+    events: Arc<Mutex<Vec<Event>>>,
+    fail_owner: Arc<Mutex<Option<String>>>,
+}
+
+impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
+    type Error = FakeRootError;
+
+    async fn execute_transaction(
+        &self,
+        path: PathBuf,
+        plan: SqliteTransactionPlan,
+    ) -> Result<(), ExecuteTransactionError<Self::Error>> {
+        assert_eq!(path, PathBuf::from("C:/Projects/demo.db"));
+        let owner = transaction_owner(&plan);
+        let event = match owner {
+            "builtin" => Event::BuiltinTransaction,
+            "rules" => Event::RulesTransaction,
+            owner => panic!("未预期的快照所有者：{owner}"),
+        };
+        self.events.lock().expect("事件锁不应中毒").push(event);
+        if self
+            .fail_owner
+            .lock()
+            .expect("SQLite 失败配置锁不应中毒")
+            .as_deref()
+            == Some(owner)
+        {
+            Err(ExecuteTransactionError::NotCommitted(FakeRootError))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn transaction_owner(plan: &SqliteTransactionPlan) -> &str {
+    plan.steps()
+        .iter()
+        .find_map(|step| {
+            let SqliteTransactionStep::Execute(command) = step else {
+                return None;
+            };
+            if command.statement() != "DELETE FROM entry WHERE owner = ?" {
+                return None;
+            }
+            match command.parameters().first() {
+                Some(SqliteValue::Text(owner)) => Some(owner.as_str()),
+                _ => None,
+            }
+        })
+        .expect("资产事务必须明确快照所有者")
+}
+
+#[derive(Clone)]
+struct FakeTrustedLuaExecutionHost {
+    events: Arc<Mutex<Vec<Event>>>,
+    invocations: Arc<Mutex<Vec<LuaInvocation>>>,
+}
+
+impl TrustedLuaExecutionHost for FakeTrustedLuaExecutionHost {
+    type Error = FakeRootError;
+
+    async fn execute(&self, invocation: LuaInvocation) -> Result<(), Self::Error> {
+        self.events.lock().expect("事件锁不应中毒").push(Event::Lua);
+        self.invocations
+            .lock()
+            .expect("Lua 调用锁不应中毒")
+            .push(invocation);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn seven_root_fakes_drive_the_complete_non_root_extract_tree() {
+    let query_count = Arc::new(AtomicUsize::new(0));
+    let cpu_executions = Arc::new(AtomicUsize::new(0));
+    let file_max_active = Arc::new(AtomicUsize::new(0));
+    let cpu_max_active = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let lua_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fail_owner = Arc::new(Mutex::new(None));
+
+    let file_reader = FakeFileReader {
+        active: Arc::new(AtomicUsize::new(0)),
+        max_active: Arc::clone(&file_max_active),
+    };
+    let directory_lister = FakeDirectoryLister;
+    let cpu = FakeCpuTaskExecutor {
+        executions: Arc::clone(&cpu_executions),
+        active: Arc::new(AtomicUsize::new(0)),
+        max_active: Arc::clone(&cpu_max_active),
+    };
+    let sqlite_transactions = FakeSqliteTransactionExecutor {
+        events: Arc::clone(&events),
+        fail_owner: Arc::clone(&fail_owner),
+    };
+
+    let document_config = MzDocumentReadingConfig::new(non_zero(2), non_zero(2));
+    let store_config = MzExtractionAssetStoreConfig::new(non_zero(2), non_zero(2));
+
+    let opener = ExistingProjectOpeningService::new(
+        ProjectDatabaseRecordReadingService::new(
+            PathBuf::from("C:/Projects"),
+            FakeSqliteQueryExecutor {
+                queries: Arc::clone(&query_count),
+            },
+        ),
+        FakeDirectoryResolver,
+    );
+    let builtin = BuiltInExtractionService::new(
+        MzProjectDocumentReadingService::new(
+            file_reader.clone(),
+            directory_lister.clone(),
+            cpu.clone(),
+            document_config,
+        ),
+        MzExtractionAssetStore::new(sqlite_transactions.clone(), cpu.clone(), store_config),
+        cpu.clone(),
+        BuiltInExtractionConfig::new(non_zero(2)),
+    );
+    let rules = RulesExtractionService::new(
+        file_reader.clone(),
+        MzProjectDocumentReadingService::new(
+            file_reader,
+            directory_lister,
+            cpu.clone(),
+            document_config,
+        ),
+        MzExtractionAssetStore::new(sqlite_transactions, cpu.clone(), store_config),
+        cpu.clone(),
+        RulesExtractionConfig::new(non_zero(2)),
+    );
+    let lua = LuaExtractionService::new(FakeTrustedLuaExecutionHost {
+        events: Arc::clone(&events),
+        invocations: Arc::clone(&lua_invocations),
+    });
+    let extract = ExtractService::new(opener, builtin, rules, lua);
+
+    let name: ProjectName = "demo".parse().expect("测试项目名应该合法");
+    let output = extract
+        .execute(ExtractInput {
+            name: name.clone(),
+            selection: ExtractionSelection::new(
+                true,
+                Some(PathBuf::from("rules.json")),
+                Some(PathBuf::from("extract.lua")),
+            )
+            .expect("测试选择应该合法"),
+        })
+        .await
+        .expect("完整非根树应该成功完成组合提取");
+
+    assert_eq!(output.name, name);
+    assert_eq!(query_count.load(Ordering::Relaxed), 1, "项目只应开启一次");
+    assert!(
+        cpu_executions.load(Ordering::Relaxed) > 0,
+        "文档、提取和 Store 的 CPU 工作应通过根执行器"
+    );
+    assert_eq!(file_max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(cpu_max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        events.lock().expect("事件锁不应中毒").as_slice(),
+        &[
+            Event::BuiltinTransaction,
+            Event::RulesTransaction,
+            Event::Lua,
+        ]
+    );
+
+    {
+        let invocations = lua_invocations.lock().expect("Lua 调用锁不应中毒");
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].script_path(), Path::new("extract.lua"));
+        assert_eq!(invocations[0].project().name(), &output.name);
+    }
+
+    events.lock().expect("事件锁不应中毒").clear();
+    lua_invocations.lock().expect("Lua 调用锁不应中毒").clear();
+    *fail_owner.lock().expect("SQLite 失败配置锁不应中毒") = Some("builtin".to_owned());
+
+    extract
+        .execute(ExtractInput {
+            name,
+            selection: ExtractionSelection::new(
+                true,
+                Some(PathBuf::from("rules.json")),
+                Some(PathBuf::from("extract.lua")),
+            )
+            .expect("测试选择应该合法"),
+        })
+        .await
+        .expect_err("Builtin 根事务失败必须停止 Rules 与 Lua");
+
+    assert_eq!(
+        events.lock().expect("事件锁不应中毒").as_slice(),
+        &[Event::BuiltinTransaction]
+    );
+    assert!(
+        lua_invocations
+            .lock()
+            .expect("Lua 调用锁不应中毒")
+            .is_empty()
+    );
+}
+
+fn non_zero(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).expect("测试配置必须显式提供非零值")
+}

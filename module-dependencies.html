@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="paper">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ATT MZ 当前模块依赖关系</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="preload" as="style" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/lxgwwenkai-regular.css" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/lxgwwenkai-regular.css"></noscript>
+<style>
+:root {
+  --paper: #faf7f0;
+  --paper-alt: #fffdf8;
+  --ink: #35322b;
+  --ink-soft: #6f6a5e;
+  --ink-faint: #a8a191;
+  --line: #cfc8b8;
+  --blue: #3b6ec9;
+  --teal: #0e9d84;
+  --amber: #d9930d;
+  --red: #d64550;
+  --purple: #8958d8;
+  --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --font-hand: 'LXGW WenKai', 'Xiaolai SC', 'KaiTi', 'STKaiti', 'AR PL UKai CN', cursive;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Consolas, monospace;
+  --wobble-a: 255px 15px 225px 15px / 15px 225px 15px 255px;
+  --wobble-b: 15px 225px 15px 255px / 255px 15px 225px 15px;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-hand);
+  font-size: 15px;
+  line-height: 1.7;
+  background-image: radial-gradient(var(--line) 0.8px, transparent 0.8px);
+  background-size: 26px 26px;
+}
+.container { max-width: 2140px; margin: 0 auto; padding: 40px 24px 64px; }
+h1 { margin: 0; font-size: 27px; font-weight: 700; }
+h2 { margin: 0 0 10px; font-size: 20px; font-weight: 700; }
+h3 { margin: 0 0 8px; font-size: 16px; font-weight: 700; }
+.subtitle { margin: 8px 0 0; max-width: 820px; color: var(--ink-soft); }
+section { margin-top: 34px; }
+code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+.layout-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 310px;
+  gap: 22px;
+  align-items: start;
+}
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 16px;
+}
+@media (max-width: 1500px) {
+  .layout-split { grid-template-columns: 1fr; }
+}
+.diagram, .card, .panel, .legend {
+  background: var(--paper-alt);
+  border: 1.6px solid var(--ink);
+  border-radius: var(--wobble-a);
+}
+.diagram {
+  padding: 12px;
+  contain: layout paint style;
+}
+.diagram svg { display: block; width: 100%; height: auto; }
+.panel, .card { padding: 16px; }
+.card:nth-child(even) { border-radius: var(--wobble-b); }
+.card p, .panel p { margin: 0; color: var(--ink-soft); font-size: 13.5px; }
+.card.important { border-color: var(--red); }
+.card.implemented { border-color: var(--blue); }
+.card.contract { border-color: var(--teal); }
+.stepper { display: flex; flex-wrap: wrap; gap: 8px; }
+.step-btn {
+  padding: 5px 13px;
+  border: 1.6px solid var(--ink);
+  border-radius: var(--wobble-b);
+  background: var(--paper-alt);
+  color: var(--ink-soft);
+  font-family: var(--font-hand);
+  font-size: 14px;
+  cursor: pointer;
+  transition: color 0.2s var(--ease), background-color 0.2s var(--ease), transform 0.2s var(--ease);
+}
+.step-btn:hover { color: var(--ink); transform: translateY(-1px); }
+.step-btn.is-current { background: var(--ink); border-color: var(--ink); color: var(--paper-alt); }
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  margin-top: 12px;
+  padding: 10px 14px;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 8px; }
+.legend-line { width: 34px; height: 0; border-top: 2px solid var(--blue); }
+.legend-line.dashed { border-top-style: dashed; border-top-color: var(--teal); }
+.legend-node { width: 28px; height: 15px; border: 2px dashed var(--blue); border-radius: 6px; }
+.status-note {
+  margin-top: 12px;
+  padding-top: 11px;
+  border-top: 1.4px dashed var(--line);
+}
+.kv { display: flex; justify-content: space-between; gap: 12px; margin-top: 7px; font-size: 13px; }
+.kv .k { color: var(--ink-faint); }
+.kv .v { color: var(--ink-soft); text-align: right; }
+.node { cursor: default; }
+.node .shape path, .node .shape rect {
+  stroke: var(--c, var(--ink));
+  transition: stroke 0.2s var(--ease), stroke-width 0.2s var(--ease);
+}
+.node .shape rect { fill: none; stroke-width: 1.6; }
+.node .node-label {
+  fill: var(--ink);
+  font-family: var(--font-hand);
+  font-size: 14px;
+  font-weight: 700;
+  text-anchor: middle;
+  dominant-baseline: central;
+}
+.node .node-sub {
+  fill: var(--ink-soft);
+  font-family: var(--font-hand);
+  font-size: 11px;
+  text-anchor: middle;
+  dominant-baseline: central;
+}
+.node.is-active .shape path, .node.is-active .shape rect { stroke-width: 2.6; }
+.edge path, .edge line {
+  stroke: var(--ink-soft);
+  fill: none;
+  transition: stroke 0.2s var(--ease);
+}
+.edge .shaft { stroke-width: 1.6; }
+.edge.is-active path, .edge.is-active line { stroke: var(--c, var(--blue)); }
+.edge-label {
+  fill: var(--ink-soft);
+  font-family: var(--font-hand);
+  font-size: 11px;
+  text-anchor: middle;
+  transition: fill 0.2s var(--ease);
+}
+.edge-label.is-active { fill: var(--c, var(--blue)); font-weight: 700; }
+.group path, .group rect { stroke: var(--c, var(--ink-faint)); fill: none; }
+.group text {
+  fill: var(--c, var(--ink-faint));
+  font-family: var(--font-hand);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.is-dimmed { opacity: 0.18; }
+.node, .edge, .edge-label, .group { transition: opacity 0.3s var(--ease); }
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+.anim-in {
+  opacity: 0;
+  animation: fade-in-up 0.4s var(--ease) forwards;
+  animation-delay: calc(var(--i, 0) * 60ms);
+}
+.panel-swap { animation: fade-in-up 0.3s var(--ease) both; }
+.completion-section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 280px;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .anim-in { opacity: 1 !important; animation: none !important; }
+  .panel-swap { animation: none !important; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <header class="anim-in">
+    <h1>ATT MZ 当前模块依赖关系</h1>
+    <p class="subtitle">箭头从消费方指向它的直接依赖。点击步骤可观察提取链如何从顶层编排收束到七个根接口；实线节点表示已有实现，虚线节点表示契约或根边界，图中不把测试替身画成生产实现。</p>
+  </header>
+
+  <section class="layout-split">
+    <div>
+      <div class="stepper anim-in" id="stepper" style="--i:1"></div>
+      <div class="diagram anim-in" id="diagram" style="--i:2; margin-top:12px"></div>
+      <div class="legend anim-in" style="--i:3">
+        <span class="legend-item"><span class="legend-line"></span>实线箭头：直接依赖</span>
+        <span class="legend-item"><span class="legend-line dashed"></span>虚线箭头：实现契约</span>
+        <span class="legend-item"><span class="legend-node"></span>虚线节点：接口边界</span>
+      </div>
+    </div>
+    <aside class="panel anim-in" id="step-panel" style="--i:3" aria-live="polite" aria-label="当前步骤说明"></aside>
+  </section>
+
+  <section class="anim-in completion-section" style="--i:4">
+    <h2>当前完成边界</h2>
+    <div class="card-grid">
+      <article class="card implemented">
+        <h3>已实现并有行为测试</h3>
+        <p>除顶层与四个提取模块外，项目记录读取、MZ 文档读取和标准资产 Store 也已有真实 Service。Builtin、Rules 的有界 CPU 工作和文档的有界异步读取均已进入实现。</p>
+      </article>
+      <article class="card contract">
+        <h3>只剩七个 Extract 根接口</h3>
+        <p>目录解析、文件读取、目录列举、CPU 执行、SQLite 查询、SQLite 事务与可信 Lua Host 尚无生产适配器。上层契约已有实现，不再被误标成“底层未实现”。</p>
+      </article>
+      <article class="card important">
+        <h3>尚未生产接线</h3>
+        <p>当前没有组合根把真实 CPU worker、文件系统、SQLite 或 Lua 适配器装入 <code>MzCli</code>。因此不能宣称已经真实建库、读取游戏或执行脚本。</p>
+      </article>
+      <article class="card">
+        <h3>资源选择全部来自外部</h3>
+        <p>文档读取/解析、Builtin/Rules 扫描、Store 编码与批大小都要求显式非零配置且没有默认值；根预算和 SQLite 连接策略留给未来配置边界注入。</p>
+      </article>
+    </div>
+  </section>
+</div>
+
+<script type="module">
+const SKETCH = { seed: 7, roughness: 1.2, bowing: 1.1 };
+
+function loadScript(srcs, timeout = 6000) {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(false), timeout);
+    let index = 0;
+    const next = () => {
+      if (index >= srcs.length) {
+        clearTimeout(timer);
+        resolve(false);
+        return;
+      }
+      const script = document.createElement('script');
+      script.src = srcs[index++];
+      script.onload = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      script.onerror = () => {
+        script.remove();
+        next();
+      };
+      document.head.appendChild(script);
+    };
+    next();
+  });
+}
+
+let hasRough = false;
+const roughReady = loadScript([
+  'https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js',
+  'https://unpkg.com/roughjs@4.6.6/bundled/rough.js',
+]);
+
+const nodes = [
+  { id: 'mz_cli', x: 910, y: 36, w: 210, h: 64, label: 'MzCli', sub: '参数解析 · 分派 · 输出', color: 'var(--amber)' },
+  { id: 'init_contract', x: 55, y: 160, w: 210, h: 64, label: 'InitUseCase', sub: '异步公开契约', color: 'var(--blue)', status: 'interface' },
+  { id: 'extract_contract', x: 910, y: 160, w: 210, h: 64, label: 'ExtractUseCase', sub: '异步公开契约', color: 'var(--blue)', status: 'interface' },
+  { id: 'translate_contract', x: 1360, y: 160, w: 230, h: 64, label: 'TranslateUseCase', sub: '--lua 意图已传递 · 阶段未实现', color: 'var(--blue)', status: 'interface' },
+  { id: 'write_contract', x: 1730, y: 160, w: 230, h: 64, label: 'WriteBackUseCase', sub: '--lua 意图已传递 · 阶段未实现', color: 'var(--blue)', status: 'interface' },
+  { id: 'init_service', x: 55, y: 300, w: 210, h: 64, label: 'InitService', sub: '已实现 · 未生产装配', color: 'var(--blue)' },
+  { id: 'extract_service', x: 910, y: 300, w: 210, h: 64, label: 'ExtractService', sub: '已实现固定顺序编排', color: 'var(--blue)' },
+
+  { id: 'pdc_contract', x: 45, y: 570, w: 240, h: 64, label: 'ProjectDatabaseCreator', sub: '异步职责契约', color: 'var(--teal)', status: 'interface' },
+  { id: 'pdc_service', x: 45, y: 720, w: 240, h: 64, label: 'ProjectDatabaseCreationService', sub: '已实现 · 外部数据库根目录', color: 'var(--teal)' },
+  { id: 'sqlite_creator', x: 45, y: 870, w: 240, h: 64, label: 'SqliteDatabaseCreator', sub: '根接口 · 无生产适配器', color: 'var(--teal)', status: 'interface' },
+
+  { id: 'project_opener', x: 350, y: 440, w: 260, h: 64, label: 'ExistingProjectOpener', sub: 'ExtractService 直接契约', color: 'var(--purple)', status: 'interface' },
+  { id: 'builtin_extraction', x: 750, y: 440, w: 250, h: 64, label: 'BuiltInExtraction', sub: 'ExtractService 直接契约', color: 'var(--purple)', status: 'interface' },
+  { id: 'rules_extraction', x: 1150, y: 440, w: 250, h: 64, label: 'RulesExtraction', sub: 'ExtractService 直接契约', color: 'var(--purple)', status: 'interface' },
+  { id: 'lua_extraction', x: 1550, y: 440, w: 250, h: 64, label: 'LuaExtraction', sub: 'ExtractService 直接契约', color: 'var(--purple)', status: 'interface' },
+
+  { id: 'opening_service', x: 350, y: 580, w: 260, h: 64, label: 'ExistingProjectOpeningService', sub: '已实现项目上下文建立', color: 'var(--purple)' },
+  { id: 'builtin_service', x: 750, y: 580, w: 250, h: 64, label: 'BuiltInExtractionService', sub: '已实现 · 有界 CPU 扫描', color: 'var(--purple)' },
+  { id: 'rules_service', x: 1150, y: 580, w: 250, h: 64, label: 'RulesExtractionService', sub: '已实现 · 有界 CPU 匹配', color: 'var(--purple)' },
+  { id: 'lua_service', x: 1550, y: 580, w: 250, h: 64, label: 'LuaExtractionService', sub: '已实现可信 Host 调用', color: 'var(--purple)' },
+
+  { id: 'record_reader', x: 340, y: 720, w: 300, h: 64, label: 'ProjectDatabaseRecordReader', sub: 'Opening 的领域读取契约', color: 'var(--teal)', status: 'interface' },
+  { id: 'document_reader', x: 690, y: 720, w: 285, h: 64, label: 'MzProjectDocumentReader', sub: 'Builtin / Rules 共享契约', color: 'var(--teal)', status: 'interface' },
+  { id: 'builtin_store', x: 1030, y: 720, w: 230, h: 64, label: 'BuiltinSnapshotStore', sub: 'Builtin 的持久化契约', color: 'var(--teal)', status: 'interface' },
+  { id: 'rules_store', x: 1320, y: 720, w: 230, h: 64, label: 'RulesSnapshotStore', sub: 'Rules 的持久化契约', color: 'var(--teal)', status: 'interface' },
+
+  { id: 'record_reading_service', x: 340, y: 860, w: 310, h: 64, label: 'ProjectDatabaseRecordReadingService', sub: '已实现 metadata 读取', color: 'var(--teal)' },
+  { id: 'document_reading_service', x: 690, y: 860, w: 300, h: 64, label: 'MzProjectDocumentReadingService', sub: '已实现有界读取与解析', color: 'var(--teal)' },
+  { id: 'asset_store', x: 1135, y: 860, w: 280, h: 64, label: 'MzExtractionAssetStore', sub: '已实现五表单事务替换', color: 'var(--teal)' },
+  { id: 'location_codec', x: 1480, y: 860, w: 250, h: 64, label: 'MzLocationCodec', sub: '已实现确定性位置编解码', color: 'var(--teal)' },
+
+  { id: 'directory_resolver', x: 330, y: 1035, w: 225, h: 64, label: 'ExistingDirectoryResolver', sub: '根接口 · Init 也依赖', color: 'var(--teal)', status: 'interface' },
+  { id: 'file_reader', x: 570, y: 1035, w: 225, h: 64, label: 'FileReader', sub: '根接口 · 异步读取', color: 'var(--teal)', status: 'interface' },
+  { id: 'directory_lister', x: 810, y: 1035, w: 225, h: 64, label: 'DirectoryLister', sub: '根接口 · 异步列举', color: 'var(--teal)', status: 'interface' },
+  { id: 'cpu_executor', x: 1050, y: 1035, w: 225, h: 64, label: 'CpuTaskExecutor', sub: '根接口 · 有界多线程', color: 'var(--teal)', status: 'interface' },
+  { id: 'sqlite_query', x: 1290, y: 1035, w: 225, h: 64, label: 'SqliteQueryExecutor', sub: '根接口 · 只读查询', color: 'var(--teal)', status: 'interface' },
+  { id: 'sqlite_transaction', x: 1530, y: 1035, w: 225, h: 64, label: 'SqliteTransactionExecutor', sub: '根接口 · 单事务执行', color: 'var(--teal)', status: 'interface' },
+  { id: 'lua_host', x: 1770, y: 1035, w: 225, h: 64, label: 'TrustedLuaExecutionHost', sub: '根接口 · 完全信任脚本', color: 'var(--teal)', status: 'interface' },
+];
+
+const nodeById = new Map(nodes.map(node => [node.id, node]));
+
+const edges = [
+  { id: 'cli_init', from: 'mz_cli', to: 'init_contract', fromPort: 'bottom', toPort: 'top', fromDx: -80, label: '直接依赖', color: 'var(--blue)', curve: 22 },
+  { id: 'cli_extract', from: 'mz_cli', to: 'extract_contract', fromPort: 'bottom', toPort: 'top', fromDx: -24, label: '直接依赖', color: 'var(--blue)', curve: 8 },
+  { id: 'cli_translate', from: 'mz_cli', to: 'translate_contract', fromPort: 'bottom', toPort: 'top', fromDx: 28, label: '直接依赖', color: 'var(--blue)', curve: -10 },
+  { id: 'cli_write', from: 'mz_cli', to: 'write_contract', fromPort: 'bottom', toPort: 'top', fromDx: 78, label: '直接依赖', color: 'var(--blue)', curve: -22 },
+  { id: 'implements_init', from: 'init_service', to: 'init_contract', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--blue)', dash: true },
+  { id: 'implements_extract', from: 'extract_service', to: 'extract_contract', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--blue)', dash: true },
+  { id: 'extract_open', from: 'extract_service', to: 'project_opener', fromPort: 'bottom', toPort: 'top', fromDx: -72, label: '直接依赖', color: 'var(--purple)', curve: 10 },
+  { id: 'extract_builtin', from: 'extract_service', to: 'builtin_extraction', fromPort: 'bottom', toPort: 'top', fromDx: -24, label: '直接依赖', color: 'var(--purple)', curve: 6 },
+  { id: 'extract_rules', from: 'extract_service', to: 'rules_extraction', fromPort: 'bottom', toPort: 'top', fromDx: 24, label: '直接依赖', color: 'var(--purple)', curve: -6 },
+  { id: 'extract_lua', from: 'extract_service', to: 'lua_extraction', fromPort: 'bottom', toPort: 'top', fromDx: 72, label: '直接依赖', color: 'var(--purple)', curve: -10 },
+
+  { id: 'implements_open', from: 'opening_service', to: 'project_opener', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--purple)', dash: true },
+  { id: 'implements_builtin', from: 'builtin_service', to: 'builtin_extraction', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--purple)', dash: true },
+  { id: 'implements_rules', from: 'rules_service', to: 'rules_extraction', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--purple)', dash: true },
+  { id: 'implements_lua', from: 'lua_service', to: 'lua_extraction', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--purple)', dash: true },
+
+  { id: 'open_record', from: 'opening_service', to: 'record_reader', fromPort: 'bottom', toPort: 'top', fromDx: -38, label: '直接依赖', color: 'var(--teal)', curve: 6 },
+  { id: 'open_directory', from: 'opening_service', to: 'directory_resolver', fromPort: 'bottom', toPort: 'top', fromDx: 38, label: '直接依赖', color: 'var(--teal)', curve: 28 },
+  { id: 'builtin_documents', from: 'builtin_service', to: 'document_reader', fromPort: 'bottom', toPort: 'top', fromDx: -48, label: '直接依赖', color: 'var(--teal)', curve: 7 },
+  { id: 'builtin_persist', from: 'builtin_service', to: 'builtin_store', fromPort: 'bottom', toPort: 'top', fromDx: 8, label: '直接依赖', color: 'var(--teal)', curve: -7 },
+  { id: 'builtin_cpu', from: 'builtin_service', to: 'cpu_executor', fromPort: 'bottom', toPort: 'top', fromDx: 58, label: 'CPU', color: 'var(--teal)', curve: -20 },
+  { id: 'rules_documents', from: 'rules_service', to: 'document_reader', fromPort: 'bottom', toPort: 'top', fromDx: -60, label: '直接依赖', color: 'var(--teal)', curve: 18 },
+  { id: 'rules_persist', from: 'rules_service', to: 'rules_store', fromPort: 'bottom', toPort: 'top', fromDx: 8, label: '直接依赖', color: 'var(--teal)', curve: -8 },
+  { id: 'rules_file', from: 'rules_service', to: 'file_reader', fromPort: 'bottom', toPort: 'top', fromDx: -18, label: 'Rules 文件', color: 'var(--teal)', curve: 38 },
+  { id: 'rules_cpu', from: 'rules_service', to: 'cpu_executor', fromPort: 'bottom', toPort: 'top', fromDx: 60, label: 'CPU', color: 'var(--teal)', curve: -18 },
+  { id: 'lua_execute', from: 'lua_service', to: 'lua_host', fromPort: 'bottom', toPort: 'top', label: '直接依赖', color: 'var(--teal)', curve: -8 },
+
+  { id: 'implements_record_reader', from: 'record_reading_service', to: 'record_reader', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--teal)', dash: true },
+  { id: 'record_query', from: 'record_reading_service', to: 'sqlite_query', fromPort: 'bottom', toPort: 'top', label: '直接依赖', color: 'var(--teal)', curve: -22 },
+  { id: 'implements_document_reader', from: 'document_reading_service', to: 'document_reader', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--teal)', dash: true },
+  { id: 'document_file', from: 'document_reading_service', to: 'file_reader', fromPort: 'bottom', toPort: 'top', fromDx: -70, label: '异步读取', color: 'var(--teal)', curve: 10 },
+  { id: 'document_list', from: 'document_reading_service', to: 'directory_lister', fromPort: 'bottom', toPort: 'top', label: '列举 Map', color: 'var(--teal)', curve: 2 },
+  { id: 'document_cpu', from: 'document_reading_service', to: 'cpu_executor', fromPort: 'bottom', toPort: 'top', fromDx: 70, label: 'CPU 解析', color: 'var(--teal)', curve: -10 },
+  { id: 'implements_builtin_store', from: 'asset_store', to: 'builtin_store', fromPort: 'top', toPort: 'bottom', fromDx: -65, label: '实现契约', color: 'var(--teal)', dash: true, curve: 7 },
+  { id: 'implements_rules_store', from: 'asset_store', to: 'rules_store', fromPort: 'top', toPort: 'bottom', fromDx: 65, label: '实现契约', color: 'var(--teal)', dash: true, curve: -7 },
+  { id: 'store_cpu', from: 'asset_store', to: 'cpu_executor', fromPort: 'bottom', toPort: 'top', fromDx: -58, label: 'CPU 编码', color: 'var(--teal)', curve: 7 },
+  { id: 'store_transaction', from: 'asset_store', to: 'sqlite_transaction', fromPort: 'bottom', toPort: 'top', fromDx: 58, label: '单事务', color: 'var(--teal)', curve: -7 },
+  { id: 'store_codec', from: 'asset_store', to: 'location_codec', fromPort: 'right', toPort: 'left', label: '内部纯函数', color: 'var(--teal)' },
+
+  { id: 'init_directory', from: 'init_service', to: 'directory_resolver', fromPort: 'bottom', toPort: 'left', fromDx: 48, label: '直接依赖', color: 'var(--teal)', curve: 26 },
+  { id: 'init_pdc', from: 'init_service', to: 'pdc_contract', fromPort: 'bottom', toPort: 'top', fromDx: -48, label: '直接依赖', color: 'var(--teal)', curve: 8 },
+  { id: 'implements_pdc', from: 'pdc_service', to: 'pdc_contract', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--teal)', dash: true },
+  { id: 'pdc_sqlite', from: 'pdc_service', to: 'sqlite_creator', fromPort: 'bottom', toPort: 'top', label: '直接依赖', color: 'var(--teal)' },
+];
+
+const groups = [
+  { x: 10, y: 12, w: 2010, h: 365, label: 'ATT MZ 命令域', color: 'var(--blue)' },
+  { x: 10, y: 400, w: 300, h: 580, label: '初始化与项目数据库创建', color: 'var(--teal)' },
+  { x: 325, y: 400, w: 1695, h: 570, label: 'Extract：全部非根模块均已实现', color: 'var(--purple)' },
+  { x: 325, y: 1005, w: 1695, h: 125, label: 'Extract 七个根接口：无生产实现 / 无组合根', color: 'var(--teal)' },
+];
+
+const steps = [
+  {
+    label: '① CLI 入口',
+    title: 'CLI 只依赖四个用例契约',
+    desc: '不同命令保持各自输入和行为，MzCli 只解析参数、等待异步结果并输出。Extract 的内部并发与资源配置不会泄漏成临时 CLI 参数。',
+    nodes: ['mz_cli', 'init_contract', 'extract_contract', 'translate_contract', 'write_contract'],
+    edges: ['cli_init', 'cli_extract', 'cli_translate', 'cli_write'],
+    kv: [['项目名称', '统一为受信 ProjectName'], ['Extract 顺序', 'Builtin → Rules → Lua'], ['退出码', '参数错误 2 / 用例失败 1']],
+  },
+  {
+    label: '② 初始化编排',
+    title: 'InitService 只看两个直接依赖',
+    desc: '它整理语言、请求解析稳定游戏目录，再把受信 NewProject 交给数据库创建职责。SQLite 创建接口已经从查询与事务执行接口中分离。',
+    nodes: ['init_contract', 'init_service', 'directory_resolver', 'pdc_contract'],
+    edges: ['implements_init', 'init_directory', 'init_pdc'],
+    kv: [['ExistingDirectoryResolver', '重新观测现存目录'], ['ProjectDatabaseCreator', '创建项目数据库'], ['停止线', '不绕过直接职责']],
+  },
+  {
+    label: '③ 提取编排',
+    title: 'ExtractService 仍只依赖四个高级契约',
+    desc: '服务打开项目一次，再按 Builtin → Rules → Lua 的固定顺序执行被选阶段。阶段间串行提交；并行只发生在阶段内部的只读 I/O 与纯 CPU 工作中。',
+    nodes: ['extract_contract', 'extract_service', 'project_opener', 'builtin_extraction', 'rules_extraction', 'lua_extraction'],
+    edges: ['implements_extract', 'extract_open', 'extract_builtin', 'extract_rules', 'extract_lua'],
+    kv: [['项目开启', 'ExistingProjectOpener'], ['提取能力', 'BuiltIn / Rules / Lua'], ['失败语义', '首错停止，前序提交不回滚']],
+  },
+  {
+    label: '④ 非根实现',
+    title: '领域契约已经继续实现到根接口之前',
+    desc: '项目记录读取、MZ 文档读取与标准资产 Store 都已有实现。一个文档读取服务同时服务 Builtin 与 Rules，一个资产 Store 同时实现两个来源的窄持久化契约。',
+    nodes: ['opening_service', 'builtin_service', 'rules_service', 'record_reader', 'document_reader', 'builtin_store', 'rules_store', 'record_reading_service', 'document_reading_service', 'asset_store', 'location_codec'],
+    edges: ['open_record', 'builtin_documents', 'builtin_persist', 'rules_documents', 'rules_persist', 'implements_record_reader', 'implements_document_reader', 'implements_builtin_store', 'implements_rules_store', 'store_codec'],
+    kv: [['项目记录', 'metadata → 受信项目事实'], ['文档读取', '有界异步读取 + CPU 解析'], ['资产 Store', '五张表 + 一个 SQLite 事务']],
+  },
+  {
+    label: '⑤ 并发与配置',
+    title: '阶段份额与进程根预算分开控制',
+    desc: '文档读取、Builtin 扫描、Rules 匹配和 Store 编码都使用外部显式的非零阶段上限；CPU 密集工作统一交给根执行器。服务没有 Default，也不探测硬件自行调整。',
+    nodes: ['builtin_service', 'rules_service', 'document_reading_service', 'asset_store', 'file_reader', 'directory_lister', 'cpu_executor'],
+    edges: ['builtin_cpu', 'rules_file', 'rules_cpu', 'document_file', 'document_list', 'document_cpu', 'store_cpu'],
+    kv: [['磁盘', '有界异步 I/O + 背压'], ['CPU', '独立 worker + 有界队列'], ['确定性', '并发完成顺序不改变结果']],
+  },
+  {
+    label: '⑥ SQLite 边界',
+    title: '创建、查询和事务执行是三个根能力',
+    desc: '初始化只请求 create-only 建库；项目记录服务只读 metadata；资产 Store 只提交拥有型单事务计划。连接、并发预算、背压和连接策略由未来根适配器承担。',
+    nodes: ['pdc_contract', 'pdc_service', 'sqlite_creator', 'record_reading_service', 'sqlite_query', 'asset_store', 'sqlite_transaction'],
+    edges: ['implements_pdc', 'pdc_sqlite', 'record_query', 'store_transaction'],
+    kv: [['创建', 'SqliteDatabaseCreator'], ['读取', 'SqliteQueryExecutor'], ['快照替换', 'SqliteTransactionExecutor']],
+  },
+  {
+    label: '⑦ 完成边界',
+    title: 'Extract 全部非根模块已实现，只剩七个根接口',
+    desc: '七个根接口目前只有测试替身，没有生产实现或组合根。现阶段可以证明调度、算法和事务计划，不代表真实线程池、磁盘、SQLite 与 Lua 已经端到端可用。',
+    nodes: ['extract_service', 'opening_service', 'builtin_service', 'rules_service', 'lua_service', 'record_reading_service', 'document_reading_service', 'asset_store', 'location_codec', 'directory_resolver', 'file_reader', 'directory_lister', 'cpu_executor', 'sqlite_query', 'sqlite_transaction', 'lua_host'],
+    edges: ['extract_open', 'extract_builtin', 'extract_rules', 'extract_lua', 'open_directory', 'record_query', 'document_file', 'document_list', 'document_cpu', 'store_codec', 'store_transaction', 'lua_execute'],
+    kv: [['可以声称', '非根业务实现收束到根接口'], ['不能声称', '生产纵向链路已经成立'], ['根接口数量', '7 个，全部未生产接线']],
+  },
+];
+
+const VIEWBOX = '0 0 2030 1150';
+const NS = 'http://www.w3.org/2000/svg';
+const svgEl = (tag, attrs = {}) => {
+  const element = document.createElementNS(NS, tag);
+  for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, value);
+  return element;
+};
+let rcHolder = null;
+
+function hashId(value) {
+  let hash = 9;
+  for (const character of String(value)) hash = (hash * 31 + character.charCodeAt(0)) % 1000;
+  return hash;
+}
+
+function sketchRect(x, y, width, height, { seed, dash } = {}) {
+  if (!hasRough) {
+    const rectangle = svgEl('rect', { x, y, width, height, rx: 8 });
+    if (dash) rectangle.setAttribute('stroke-dasharray', '8 6');
+    return rectangle;
+  }
+  return rcHolder.rectangle(x, y, width, height, {
+    roughness: SKETCH.roughness,
+    bowing: SKETCH.bowing,
+    seed: seed ?? SKETCH.seed,
+    strokeWidth: 1.6,
+    ...(dash ? { strokeLineDash: [8, 6] } : {}),
+  });
+}
+
+function sketchPath(path, { seed, dash } = {}) {
+  if (!hasRough) {
+    const fallback = svgEl('path', { d: path, class: 'shaft' });
+    if (dash) fallback.setAttribute('stroke-dasharray', '7 5');
+    return fallback;
+  }
+  const group = rcHolder.path(path, {
+    roughness: Math.min(SKETCH.roughness, 1),
+    bowing: 0.8,
+    seed: seed ?? SKETCH.seed,
+    strokeWidth: 1.6,
+    ...(dash ? { strokeLineDash: [7, 5] } : {}),
+  });
+  group.classList.add('shaft');
+  return group;
+}
+
+function svgText(x, y, content, className) {
+  const label = svgEl('text', { x, y, class: className });
+  label.textContent = content;
+  return label;
+}
+
+function nodeBox(node) {
+  const { id, x, y, w, h, label, sub, color, status } = node;
+  const group = svgEl('g', { class: 'node', 'data-id': id, 'data-status': status ?? 'implementation' });
+  group.style.setProperty('--c', color);
+  const shape = svgEl('g', { class: 'shape' });
+  shape.appendChild(sketchRect(x, y, w, h, { seed: hashId(id), dash: status === 'interface' }));
+  group.appendChild(shape);
+  group.appendChild(svgText(x + w / 2, y + h / 2 - 9, label, 'node-label'));
+  group.appendChild(svgText(x + w / 2, y + h / 2 + 14, sub, 'node-sub'));
+  return group;
+}
+
+function anchor(node, port, dx = 0, dy = 0) {
+  const points = {
+    top: { x: node.x + node.w / 2, y: node.y },
+    right: { x: node.x + node.w, y: node.y + node.h / 2 },
+    bottom: { x: node.x + node.w / 2, y: node.y + node.h },
+    left: { x: node.x, y: node.y + node.h / 2 },
+  };
+  const point = points[port];
+  return { x: point.x + dx, y: point.y + dy };
+}
+
+function edgeLine(edge) {
+  const fromNode = nodeById.get(edge.from);
+  const toNode = nodeById.get(edge.to);
+  const start = anchor(fromNode, edge.fromPort, edge.fromDx ?? 0, edge.fromDy ?? 0);
+  const end = anchor(toNode, edge.toPort, edge.toDx ?? 0, edge.toDy ?? 0);
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const length = Math.hypot(dx, dy) || 1;
+  let path;
+  let labelX;
+  let labelY;
+  let angle;
+  if (edge.curve) {
+    const controlX = (start.x + end.x) / 2 - (dy / length) * edge.curve;
+    const controlY = (start.y + end.y) / 2 + (dx / length) * edge.curve;
+    path = `M ${start.x} ${start.y} Q ${controlX} ${controlY} ${end.x} ${end.y}`;
+    labelX = 0.25 * start.x + 0.5 * controlX + 0.25 * end.x;
+    labelY = 0.25 * start.y + 0.5 * controlY + 0.25 * end.y - 7;
+    angle = Math.atan2(end.y - controlY, end.x - controlX);
+  } else {
+    path = `M ${start.x} ${start.y} L ${end.x} ${end.y}`;
+    labelX = (start.x + end.x) / 2;
+    labelY = (start.y + end.y) / 2 - 7;
+    angle = Math.atan2(end.y - start.y, end.x - start.x);
+  }
+  const group = svgEl('g', { class: 'edge', 'data-id': edge.id });
+  group.style.setProperty('--c', edge.color);
+  const strokes = svgEl('g');
+  strokes.appendChild(sketchPath(path, { seed: hashId(edge.id), dash: edge.dash }));
+  for (const side of [0.5, -0.5]) {
+    const headX = end.x - 11 * Math.cos(angle + side);
+    const headY = end.y - 11 * Math.sin(angle + side);
+    strokes.appendChild(sketchPath(`M ${headX} ${headY} L ${end.x} ${end.y}`, { seed: hashId(edge.id) + 7 }));
+  }
+  group.appendChild(strokes);
+  const label = svgText(labelX, labelY, edge.label, 'edge-label');
+  label.dataset.id = edge.id;
+  group.appendChild(label);
+  return group;
+}
+
+function groupArea(area) {
+  const group = svgEl('g', { class: 'group', 'data-id': area.label });
+  group.style.setProperty('--c', area.color);
+  group.appendChild(sketchRect(area.x, area.y, area.w, area.h, { seed: hashId(area.label), dash: true }));
+  const label = svgText(area.x + 14, area.y + 18, area.label, '');
+  label.setAttribute('text-anchor', 'start');
+  group.appendChild(label);
+  return group;
+}
+
+function renderDiagram() {
+  const svg = svgEl('svg', { viewBox: VIEWBOX, role: 'img', 'aria-label': 'ATT MZ 当前模块直接依赖图' });
+  if (hasRough) rcHolder = rough.svg(svg);
+  groups.forEach(group => svg.appendChild(groupArea(group)));
+  edges.forEach(edge => svg.appendChild(edgeLine(edge)));
+  nodes.forEach(node => svg.appendChild(nodeBox(node)));
+  const container = document.getElementById('diagram');
+  container.textContent = '';
+  container.appendChild(svg);
+  return svg;
+}
+
+const state = { step: 0 };
+
+function applyClasses(step) {
+  document.querySelectorAll('.step-btn').forEach((button, index) => {
+    const current = index === state.step;
+    button.classList.toggle('is-current', current);
+    button.setAttribute('aria-pressed', String(current));
+  });
+  document.querySelectorAll('.node').forEach(element => {
+    const active = step.nodes.includes(element.dataset.id);
+    element.classList.toggle('is-active', active);
+    element.classList.toggle('is-dimmed', !active);
+  });
+  document.querySelectorAll('.edge').forEach(element => {
+    const active = step.edges.includes(element.dataset.id);
+    element.classList.toggle('is-active', active);
+    element.classList.toggle('is-dimmed', !active);
+    element.querySelector('.edge-label')?.classList.toggle('is-active', active);
+  });
+}
+
+function renderPanel(step) {
+  const rows = step.kv.map(([key, value]) =>
+    `<div class="kv"><span class="k">${key}</span><span class="v">${value}</span></div>`
+  ).join('');
+  document.getElementById('step-panel').innerHTML =
+    `<div class="panel-swap"><h3>${step.title}</h3><p>${step.desc}</p><div class="status-note">${rows}</div></div>`;
+}
+
+function goStep(index) {
+  if (index === state.step) return;
+  state.step = index;
+  const step = steps[index];
+  applyClasses(step);
+  renderPanel(step);
+}
+
+function renderStepper() {
+  document.getElementById('stepper').innerHTML = steps.map((step, index) =>
+    `<button type="button" class="step-btn" data-index="${index}" aria-pressed="${index === 0}">${step.label}</button>`
+  ).join('');
+}
+
+document.getElementById('stepper').addEventListener('click', event => {
+  const button = event.target.closest('button[data-index]');
+  if (button) goStep(Number(button.dataset.index));
+});
+document.addEventListener('animationend', event => {
+  if (event.animationName === 'fade-in-up') {
+    event.target.classList.remove('anim-in', 'panel-swap');
+  }
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'ArrowRight') {
+    event.preventDefault();
+    goStep(Math.min(state.step + 1, steps.length - 1));
+  }
+  if (event.key === 'ArrowLeft') {
+    event.preventDefault();
+    goStep(Math.max(state.step - 1, 0));
+  }
+});
+
+renderDiagram();
+renderStepper();
+renderPanel(steps[0]);
+applyClasses(steps[0]);
+
+roughReady.then(loaded => {
+  if (!loaded) return;
+  const upgradeSketch = () => {
+    hasRough = true;
+    renderDiagram();
+    applyClasses(steps[state.step]);
+  };
+  if ('requestIdleCallback' in window) {
+    window.requestIdleCallback(upgradeSketch, { timeout: 800 });
+  } else {
+    setTimeout(upgradeSketch, 0);
+  }
+});
+</script>
+</body>
+</html>
