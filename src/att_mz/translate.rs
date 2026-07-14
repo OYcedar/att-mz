@@ -4,12 +4,32 @@ use std::path::PathBuf;
 
 use super::ProjectName;
 
+mod asset_reader;
+mod deduplication;
+pub(crate) mod executor;
+mod language;
+mod lua;
+mod placeholder;
+mod planner;
+mod planning_resource;
+pub(crate) mod profile;
+mod result_store;
+mod service;
+pub(crate) mod standard;
+
+#[cfg(test)]
+mod full_tree_tests;
+
 /// 翻译指定 MZ 游戏所需的输入。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranslateInput {
     pub name: ProjectName,
     pub llm_id: String,
-    /// 可选的可信 Lua 翻译程序；具体执行能力由后续任务实现。
+    /// 本次标准翻译使用的外部术语表；`None` 不表示权威空术语表。
+    pub terminology_path: Option<PathBuf>,
+    /// 本次补充的占位符规则；`None` 不关闭标准翻译内置的 MZ 保护规格。
+    pub placeholder_rules_path: Option<PathBuf>,
+    /// 可选的可信 Lua 翻译程序；真实 Host 仍由后续根适配器提供。
     pub lua_script: Option<PathBuf>,
 }
 

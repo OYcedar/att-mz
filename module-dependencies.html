@@ -30,20 +30,20 @@
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  background: var(--paper);
   color: var(--ink);
+  background: var(--paper);
+  background-image: radial-gradient(var(--line) 0.8px, transparent 0.8px);
+  background-size: 26px 26px;
   font-family: var(--font-hand);
   font-size: 15px;
   line-height: 1.7;
-  background-image: radial-gradient(var(--line) 0.8px, transparent 0.8px);
-  background-size: 26px 26px;
 }
-.container { max-width: 2140px; margin: 0 auto; padding: 40px 24px 64px; }
-h1 { margin: 0; font-size: 27px; font-weight: 700; }
-h2 { margin: 0 0 10px; font-size: 20px; font-weight: 700; }
-h3 { margin: 0 0 8px; font-size: 16px; font-weight: 700; }
-.subtitle { margin: 8px 0 0; max-width: 820px; color: var(--ink-soft); }
-section { margin-top: 34px; }
+.container { max-width: 1680px; margin: 0 auto; padding: 36px 24px 64px; }
+h1 { margin: 0; font-size: 28px; line-height: 1.25; }
+h2 { margin: 0 0 10px; font-size: 20px; }
+h3 { margin: 0 0 8px; font-size: 16px; }
+.subtitle { max-width: 980px; margin: 8px 0 0; color: var(--ink-soft); }
+section { margin-top: 30px; }
 code {
   padding: 1px 5px;
   border-radius: 4px;
@@ -51,77 +51,75 @@ code {
   font-family: var(--font-mono);
   font-size: 0.85em;
 }
-.layout-split {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 310px;
-  gap: 22px;
-  align-items: start;
-}
-.card-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 16px;
-}
-@media (max-width: 1500px) {
-  .layout-split { grid-template-columns: 1fr; }
-}
-.diagram, .card, .panel, .legend {
-  background: var(--paper-alt);
-  border: 1.6px solid var(--ink);
-  border-radius: var(--wobble-a);
-}
-.diagram {
-  padding: 12px;
-  contain: layout paint style;
-}
-.diagram svg { display: block; width: 100%; height: auto; }
-.panel, .card { padding: 16px; }
-.card:nth-child(even) { border-radius: var(--wobble-b); }
-.card p, .panel p { margin: 0; color: var(--ink-soft); font-size: 13.5px; }
-.card.important { border-color: var(--red); }
-.card.implemented { border-color: var(--blue); }
-.card.contract { border-color: var(--teal); }
-.stepper { display: flex; flex-wrap: wrap; gap: 8px; }
-.step-btn {
-  padding: 5px 13px;
+.toolbar, .stepper { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.toolbar { margin-top: 20px; }
+.toolbar-label { margin-right: 3px; color: var(--ink-faint); font-size: 13px; }
+.filter-btn, .step-btn {
   border: 1.6px solid var(--ink);
   border-radius: var(--wobble-b);
   background: var(--paper-alt);
   color: var(--ink-soft);
   font-family: var(--font-hand);
-  font-size: 14px;
   cursor: pointer;
   transition: color 0.2s var(--ease), background-color 0.2s var(--ease), transform 0.2s var(--ease);
 }
-.step-btn:hover { color: var(--ink); transform: translateY(-1px); }
-.step-btn.is-current { background: var(--ink); border-color: var(--ink); color: var(--paper-alt); }
+.filter-btn { padding: 5px 12px; font-size: 13px; }
+.step-btn { padding: 6px 13px; font-size: 14px; }
+.filter-btn:hover, .step-btn:hover { color: var(--ink); transform: translateY(-1px); }
+.filter-btn.is-current { border-color: var(--purple); color: var(--purple); }
+.step-btn.is-current { border-color: var(--ink); background: var(--ink); color: var(--paper-alt); }
+.layout-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 20px;
+  align-items: start;
+}
+.diagram, .panel, .legend, .card {
+  border: 1.6px solid var(--ink);
+  border-radius: var(--wobble-a);
+  background: var(--paper-alt);
+}
+.diagram {
+  min-height: 320px;
+  padding: 12px;
+  contain: layout paint style;
+  overflow: hidden;
+}
+.diagram svg { display: block; width: 100%; height: auto; }
+.panel, .card { padding: 16px; }
+.panel { position: sticky; top: 14px; }
+.panel p, .card p { margin: 0; color: var(--ink-soft); font-size: 13.5px; }
 .legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px 20px;
+  gap: 9px 20px;
   margin-top: 12px;
   padding: 10px 14px;
   color: var(--ink-soft);
   font-size: 13px;
 }
 .legend-item { display: inline-flex; align-items: center; gap: 8px; }
-.legend-line { width: 34px; height: 0; border-top: 2px solid var(--blue); }
+.legend-line { width: 34px; border-top: 2px solid var(--blue); }
 .legend-line.dashed { border-top-style: dashed; border-top-color: var(--teal); }
-.legend-node { width: 28px; height: 15px; border: 2px dashed var(--blue); border-radius: 6px; }
-.status-note {
-  margin-top: 12px;
-  padding-top: 11px;
-  border-top: 1.4px dashed var(--line);
-}
+.legend-node { width: 28px; height: 15px; border: 2px dashed var(--teal); border-radius: 6px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--purple); }
+.status-note { margin-top: 12px; padding-top: 11px; border-top: 1.4px dashed var(--line); }
 .kv { display: flex; justify-content: space-between; gap: 12px; margin-top: 7px; font-size: 13px; }
 .kv .k { color: var(--ink-faint); }
 .kv .v { color: var(--ink-soft); text-align: right; }
+.card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); gap: 15px; }
+.card:nth-child(even) { border-radius: var(--wobble-b); }
+.card.implemented { border-color: var(--blue); }
+.card.contract { border-color: var(--teal); }
+.card.important { border-color: var(--red); }
+.completion-section { content-visibility: auto; contain-intrinsic-size: auto 300px; }
 .node { cursor: default; }
 .node .shape path, .node .shape rect {
+  fill: none;
   stroke: var(--c, var(--ink));
-  transition: stroke 0.2s var(--ease), stroke-width 0.2s var(--ease);
+  stroke-width: 1.6;
+  transition: stroke-width 0.2s var(--ease), opacity 0.25s var(--ease);
 }
-.node .shape rect { fill: none; stroke-width: 1.6; }
 .node .node-label {
   fill: var(--ink);
   font-family: var(--font-hand);
@@ -138,51 +136,38 @@ code {
   dominant-baseline: central;
 }
 .node.is-active .shape path, .node.is-active .shape rect { stroke-width: 2.6; }
-.edge path, .edge line {
-  stroke: var(--ink-soft);
-  fill: none;
-  transition: stroke 0.2s var(--ease);
-}
+.edge path, .edge line { fill: none; stroke: var(--ink-soft); }
 .edge .shaft { stroke-width: 1.6; }
 .edge.is-active path, .edge.is-active line { stroke: var(--c, var(--blue)); }
 .edge-label {
   fill: var(--ink-soft);
   font-family: var(--font-hand);
-  font-size: 11px;
+  font-size: 10.5px;
   text-anchor: middle;
-  transition: fill 0.2s var(--ease);
 }
 .edge-label.is-active { fill: var(--c, var(--blue)); font-weight: 700; }
-.group path, .group rect { stroke: var(--c, var(--ink-faint)); fill: none; }
+.group path, .group rect { fill: none; stroke: var(--c, var(--ink-faint)); }
 .group text {
   fill: var(--c, var(--ink-faint));
   font-family: var(--font-hand);
   font-size: 12px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
 }
-.is-dimmed { opacity: 0.18; }
-.node, .edge, .edge-label, .group { transition: opacity 0.3s var(--ease); }
+.node, .edge, .edge-label, .group { transition: opacity 0.25s var(--ease); }
+.is-dimmed { opacity: 0.17; }
 @keyframes fade-in-up {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: none; }
 }
-.anim-in {
-  opacity: 0;
-  animation: fade-in-up 0.4s var(--ease) forwards;
-  animation-delay: calc(var(--i, 0) * 60ms);
-}
-.panel-swap { animation: fade-in-up 0.3s var(--ease) both; }
-.completion-section {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 280px;
+.anim-in { opacity: 0; animation: fade-in-up 0.4s var(--ease) forwards; animation-delay: calc(var(--i, 0) * 55ms); }
+.panel-swap { animation: fade-in-up 0.25s var(--ease) both; }
+@media (max-width: 1180px) {
+  .layout-split { grid-template-columns: 1fr; }
+  .panel { position: static; }
 }
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-  }
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
   .anim-in { opacity: 1 !important; animation: none !important; }
   .panel-swap { animation: none !important; }
 }
@@ -192,327 +177,467 @@ code {
 <div class="container">
   <header class="anim-in">
     <h1>ATT MZ 当前模块依赖关系</h1>
-    <p class="subtitle">箭头从消费方指向它的直接依赖。点击步骤可观察提取链如何从顶层编排收束到七个根接口；实线节点表示已有实现，虚线节点表示契约或根边界，图中不把测试替身画成生产实现。</p>
+    <p class="subtitle">箭头从消费方指向直接依赖。依赖树按视图拆分，Translate 可以继续聚焦到 Planner、Executor、Store、Lua Host 和根停止线；首屏先显示轻量 SVG，rough.js 只在空闲时增强当前焦点，不再重绘整棵大图。</p>
+    <div class="toolbar" id="filters" aria-label="步骤筛选">
+      <span class="toolbar-label">筛选：</span>
+      <button type="button" class="filter-btn is-current" data-filter="all" aria-pressed="true">全部</button>
+      <button type="button" class="filter-btn" data-filter="translate" aria-pressed="false">Translate 聚焦</button>
+      <button type="button" class="filter-btn" data-filter="other" aria-pressed="false">Init / Extract</button>
+    </div>
   </header>
 
   <section class="layout-split">
     <div>
-      <div class="stepper anim-in" id="stepper" style="--i:1"></div>
+      <div class="stepper anim-in" id="stepper" style="--i:1" aria-label="依赖图步骤"></div>
       <div class="diagram anim-in" id="diagram" style="--i:2; margin-top:12px"></div>
       <div class="legend anim-in" style="--i:3">
         <span class="legend-item"><span class="legend-line"></span>实线箭头：直接依赖</span>
         <span class="legend-item"><span class="legend-line dashed"></span>虚线箭头：实现契约</span>
-        <span class="legend-item"><span class="legend-node"></span>虚线节点：接口边界</span>
+        <span class="legend-item"><span class="legend-node"></span>虚线节点：根接口 / 公开契约</span>
+        <span class="legend-item"><span class="legend-dot"></span>紫色：Translate 业务能力</span>
       </div>
     </div>
     <aside class="panel anim-in" id="step-panel" style="--i:3" aria-live="polite" aria-label="当前步骤说明"></aside>
   </section>
 
-  <section class="anim-in completion-section" style="--i:4">
+  <section class="completion-section anim-in" style="--i:4">
     <h2>当前完成边界</h2>
     <div class="card-grid">
       <article class="card implemented">
-        <h3>已实现并有行为测试</h3>
-        <p>除顶层与四个提取模块外，项目记录读取、MZ 文档读取和标准资产 Store 也已有真实 Service。Builtin、Rules 的有界 CPU 工作和文档的有界异步读取均已进入实现。</p>
+        <h3>Translate 非根业务树</h3>
+        <p>资产读取、译前规划、语言与占位符、模型执行、响应验收、结果 Store 和可信 Lua Host 都已推进到实现层；顶层仍保持 Standard → 可选 Lua 的固定顺序。</p>
       </article>
       <article class="card contract">
-        <h3>只剩七个 Extract 根接口</h3>
-        <p>目录解析、文件读取、目录列举、CPU 执行、SQLite 查询、SQLite 事务与可信 Lua Host 尚无生产适配器。上层契约已有实现，不再被误标成“底层未实现”。</p>
-      </article>
-      <article class="card important">
-        <h3>尚未生产接线</h3>
-        <p>当前没有组合根把真实 CPU worker、文件系统、SQLite 或 Lua 适配器装入 <code>MzCli</code>。因此不能宣称已经真实建库、读取游戏或执行脚本。</p>
+        <h3>只剩真实运行根</h3>
+        <p>停止线是文件、CPU、SQLite 查询/事务、LLM 请求、异步延时、Lua VM 与 SQLite 交互会话等根接口。虚线表示契约存在，但没有生产适配器。</p>
       </article>
       <article class="card">
-        <h3>资源选择全部来自外部</h3>
-        <p>文档读取/解析、Builtin/Rules 扫描、Store 编码与批大小都要求显式非零配置且没有默认值；根预算和 SQLite 连接策略留给未来配置边界注入。</p>
+        <h3>配置全部由外部建立</h3>
+        <p>并发、批量、消息容量、完整 system Markdown、重试延时、语言阈值和 LLM 请求选项都从外部显式注入；模块没有 <code>Default</code>，也不探测硬件自行决定。</p>
+      </article>
+      <article class="card important">
+        <h3>仍不是端到端完成</h3>
+        <p>当前没有根适配器和生产组合根，因此不能声称真实游戏已经读取、模型已经请求、译文已经写入或 Lua 已在真实 VM 中执行。</p>
       </article>
     </div>
   </section>
 </div>
 
 <script type="module">
-const SKETCH = { seed: 7, roughness: 1.2, bowing: 1.1 };
+const SKETCH = { seed: 7, roughness: 1.15, bowing: 1.0 };
+const NS = 'http://www.w3.org/2000/svg';
+const ROOT = 'interface';
 
-function loadScript(srcs, timeout = 6000) {
+function node(id, x, y, label, sub, color = 'var(--purple)', status = 'implementation', w = 260, h = 64) {
+  return { id, x, y, w, h, label, sub, color, status };
+}
+function edge(id, from, to, label, color = 'var(--purple)', options = {}) {
+  return { id, from, to, label, color, fromPort: 'bottom', toPort: 'top', ...options };
+}
+
+const diagrams = {
+  overview: {
+    viewBox: '0 0 1250 530',
+    groups: [{ x: 12, y: 12, w: 1226, h: 500, label: '统一入口与独立纵向切片', color: 'var(--blue)' }],
+    nodes: [
+      node('mz_cli', 495, 35, 'MzCli', '统一入口 · 参数解析与路由', 'var(--amber)'),
+      node('init_contract', 30, 155, 'InitUseCase', '引擎命令契约', 'var(--blue)', ROOT),
+      node('extract_contract', 330, 155, 'ExtractUseCase', '引擎命令契约', 'var(--blue)', ROOT),
+      node('translate_contract', 630, 155, 'TranslateUseCase', '引擎命令契约', 'var(--blue)', ROOT),
+      node('write_contract', 930, 155, 'WriteBackUseCase', '引擎命令契约', 'var(--blue)', ROOT),
+      node('init_service', 30, 310, 'InitService', '已实现顶层编排', 'var(--blue)'),
+      node('extract_service', 330, 310, 'ExtractService', '已实现固定阶段顺序', 'var(--blue)'),
+      node('translate_service', 630, 310, 'TranslateService', '已实现 Standard → Lua', 'var(--blue)'),
+    ],
+    edges: [
+      edge('cli_init', 'mz_cli', 'init_contract', '直接依赖', 'var(--blue)', { fromDx: -90, curve: 24 }),
+      edge('cli_extract', 'mz_cli', 'extract_contract', '直接依赖', 'var(--blue)', { fromDx: -30, curve: 10 }),
+      edge('cli_translate', 'mz_cli', 'translate_contract', '直接依赖', 'var(--blue)', { fromDx: 30, curve: -10 }),
+      edge('cli_write', 'mz_cli', 'write_contract', '直接依赖', 'var(--blue)', { fromDx: 90, curve: -24 }),
+      edge('impl_init', 'init_service', 'init_contract', '实现契约', 'var(--blue)', { fromPort: 'top', toPort: 'bottom', dash: true }),
+      edge('impl_extract', 'extract_service', 'extract_contract', '实现契约', 'var(--blue)', { fromPort: 'top', toPort: 'bottom', dash: true }),
+      edge('impl_translate', 'translate_service', 'translate_contract', '实现契约', 'var(--blue)', { fromPort: 'top', toPort: 'bottom', dash: true }),
+    ],
+  },
+  initExtract: {
+    viewBox: '0 0 1520 850',
+    groups: [
+      { x: 12, y: 12, w: 430, h: 815, label: 'Init 链路', color: 'var(--blue)' },
+      { x: 465, y: 12, w: 1040, h: 815, label: 'Extract 非根实现与根停止线', color: 'var(--purple)' },
+    ],
+    nodes: [
+      node('init_service', 90, 65, 'InitService', '已实现', 'var(--blue)'),
+      node('directory_resolver', 40, 210, 'ExistingDirectoryResolver', '根接口', 'var(--teal)', ROOT, 300),
+      node('project_creator', 90, 350, 'ProjectDatabaseCreator', '职责契约', 'var(--teal)', ROOT),
+      node('project_creation', 90, 490, 'ProjectDatabaseCreationService', '已实现', 'var(--teal)', 'implementation', 290),
+      node('sqlite_creator', 90, 640, 'SqliteDatabaseCreator', '根接口', 'var(--teal)', ROOT),
+      node('extract_service', 850, 55, 'ExtractService', 'Builtin → Rules → Lua', 'var(--blue)'),
+      node('opener', 500, 190, 'ExistingProjectOpeningService', '已实现', 'var(--purple)', 'implementation', 290),
+      node('builtin', 820, 190, 'BuiltInExtractionService', '已实现', 'var(--purple)'),
+      node('rules', 1100, 190, 'RulesExtractionService', '已实现', 'var(--purple)'),
+      node('lua_extract', 1240, 330, 'LuaExtractionService', '已实现', 'var(--purple)'),
+      node('record_reading', 500, 350, 'ProjectDatabaseRecordReadingService', '已实现', 'var(--teal)', 'implementation', 310),
+      node('document_reading', 820, 350, 'MzProjectDocumentReadingService', '已实现', 'var(--teal)', 'implementation', 300),
+      node('asset_store', 1100, 490, 'MzExtractionAssetStore', '已实现快照事务', 'var(--teal)'),
+      node('file_reader', 500, 680, 'FileReader', '根接口', 'var(--teal)', ROOT),
+      node('directory_lister', 780, 680, 'DirectoryLister', '根接口', 'var(--teal)', ROOT),
+      node('cpu', 1060, 680, 'CpuTaskExecutor', '根接口', 'var(--teal)', ROOT),
+      node('sqlite_query', 500, 510, 'SqliteQueryExecutor', '根接口', 'var(--teal)', ROOT),
+      node('sqlite_tx', 1340, 610, 'SqliteTransactionExecutor', '根接口', 'var(--teal)', ROOT),
+    ],
+    edges: [
+      edge('init_directory', 'init_service', 'directory_resolver', '直接依赖', 'var(--teal)', { fromDx: -45, curve: 8 }),
+      edge('init_creator', 'init_service', 'project_creator', '直接依赖', 'var(--teal)', { fromDx: 45, curve: -8 }),
+      edge('creator_impl', 'project_creation', 'project_creator', '实现契约', 'var(--teal)', { fromPort: 'top', toPort: 'bottom', dash: true }),
+      edge('creator_sqlite', 'project_creation', 'sqlite_creator', '直接依赖', 'var(--teal)'),
+      edge('extract_open', 'extract_service', 'opener', '打开项目', 'var(--purple)', { fromDx: -90, curve: 16 }),
+      edge('extract_builtin', 'extract_service', 'builtin', 'Builtin', 'var(--purple)', { fromDx: -28, curve: 5 }),
+      edge('extract_rules', 'extract_service', 'rules', 'Rules', 'var(--purple)', { fromDx: 28, curve: -5 }),
+      edge('extract_lua', 'extract_service', 'lua_extract', 'Lua', 'var(--purple)', { fromDx: 90, curve: -24 }),
+      edge('open_record', 'opener', 'record_reading', '项目记录', 'var(--teal)'),
+      edge('record_query', 'record_reading', 'sqlite_query', '查询', 'var(--teal)'),
+      edge('builtin_docs', 'builtin', 'document_reading', '读取 MZ 文档', 'var(--teal)'),
+      edge('rules_docs', 'rules', 'document_reading', '读取 MZ 文档', 'var(--teal)', { fromDx: -38, curve: 14 }),
+      edge('builtin_store', 'builtin', 'asset_store', '快照提交', 'var(--teal)', { fromDx: 42, curve: -24 }),
+      edge('rules_store', 'rules', 'asset_store', '快照提交', 'var(--teal)'),
+      edge('document_file', 'document_reading', 'file_reader', '异步读取', 'var(--teal)', { fromDx: -70, curve: 18 }),
+      edge('document_list', 'document_reading', 'directory_lister', '列举 Map', 'var(--teal)'),
+      edge('document_cpu', 'document_reading', 'cpu', 'CPU 解析', 'var(--teal)', { fromDx: 70, curve: -18 }),
+      edge('store_cpu', 'asset_store', 'cpu', 'CPU 编码', 'var(--teal)', { fromDx: -45, curve: 10 }),
+      edge('store_tx', 'asset_store', 'sqlite_tx', '单事务', 'var(--teal)', { fromDx: 55, curve: -8 }),
+    ],
+  },
+  translate: {
+    viewBox: '0 0 1570 680',
+    groups: [
+      { x: 12, y: 12, w: 1545, h: 650, label: 'Translate 顶层与 Standard 四职责', color: 'var(--purple)' },
+    ],
+    nodes: [
+      node('translate_service', 655, 45, 'TranslateService', '已实现固定顶层顺序', 'var(--blue)', 'implementation', 280),
+      node('resolver', 55, 180, 'InMemoryTranslationProfileResolver', '已实现精确 ID 选择', 'var(--purple)', 'implementation', 330),
+      node('record', 420, 180, 'ProjectDatabaseRecordReadingService', '已实现 metadata 读取', 'var(--teal)', 'implementation', 330),
+      node('standard', 790, 180, 'StandardTranslationService', '已实现有界保序编排', 'var(--purple)', 'implementation', 300),
+      node('lua_translation', 1160, 180, 'LuaTranslationService', '已实现附加调用', 'var(--purple)', 'implementation', 280),
+      node('catalog', 70, 360, 'TranslationProfileCatalog', '受信内存值', 'var(--purple)'),
+      node('sqlite_query', 440, 360, 'SqliteQueryExecutor', '根接口', 'var(--teal)', ROOT),
+      node('asset_reader', 650, 500, 'MzStandardTranslationAssetReadingService', '已实现', 'var(--purple)', 'implementation', 330),
+      node('planner', 990, 360, 'MzStandardTranslationTaskPlanningService', '已实现', 'var(--purple)', 'implementation', 330),
+      node('executor', 990, 500, 'MzStandardTranslationTaskExecutionService', '已实现', 'var(--purple)', 'implementation', 330),
+      node('result_store', 1250, 360, 'MzStandardTranslationResultStorageService', '已实现', 'var(--purple)', 'implementation', 300),
+      node('lua_host', 1240, 500, 'TrustedLuaExecutionHostingService', '已实现到根接口', 'var(--purple)', 'implementation', 300),
+    ],
+    edges: [
+      edge('tr_profile', 'translate_service', 'resolver', 'ResolveProfile', 'var(--purple)', { fromDx: -90, curve: 26 }),
+      edge('tr_record', 'translate_service', 'record', 'ReadProject', 'var(--teal)', { fromDx: -30, curve: 12 }),
+      edge('tr_standard', 'translate_service', 'standard', 'Standard', 'var(--purple)', { fromDx: 30, curve: -8 }),
+      edge('tr_lua', 'translate_service', 'lua_translation', '可选 Lua', 'var(--purple)', { fromDx: 90, curve: -24 }),
+      edge('resolver_catalog', 'resolver', 'catalog', '受信值', 'var(--purple)'),
+      edge('record_query', 'record', 'sqlite_query', '根查询', 'var(--teal)'),
+      edge('standard_asset', 'standard', 'asset_reader', '资产快照', 'var(--purple)', { fromDx: -80, curve: 22 }),
+      edge('standard_plan', 'standard', 'planner', '完整计划', 'var(--purple)', { fromDx: -25, curve: 8 }),
+      edge('standard_execute', 'standard', 'executor', '任务执行', 'var(--purple)', { fromDx: 25, curve: -6 }),
+      edge('standard_store', 'standard', 'result_store', '准备与提交', 'var(--purple)', { fromDx: 80, curve: -26 }),
+      edge('lua_host_edge', 'lua_translation', 'lua_host', '可信 Host', 'var(--purple)'),
+    ],
+  },
+  planning: {
+    viewBox: '0 0 1680 610',
+    groups: [{ x: 12, y: 12, w: 1655, h: 580, label: '译前规划：外部资源、语言、占位符与全局去重', color: 'var(--purple)' }],
+    nodes: [
+      node('planner', 535, 45, 'MzStandardTranslationTaskPlanningService', '已实现语义范围规划', 'var(--purple)', 'implementation', 330),
+      node('resource_reader', 60, 190, 'JsonTranslationPlanningResourceReadingService', '已实现术语/规则读取', 'var(--purple)', 'implementation', 350),
+      node('language_catalog', 450, 190, 'TranslationLanguageCatalog', '精确语言 ID 绑定', 'var(--purple)', 'implementation', 300),
+      node('placeholder', 790, 190, 'Pcre2PlaceholderService', 'Builtin 优先 + Custom 顺序', 'var(--purple)', 'implementation', 300),
+      node('cpu', 1120, 190, 'CpuTaskExecutor', '根接口 · 有界 CPU', 'var(--teal)', ROOT),
+      node('file_reader', 105, 385, 'FileReader', '根接口 · 异步文件', 'var(--teal)', ROOT),
+      node('japanese', 400, 385, 'JapaneseSourceLanguage', '判定 + 残留检查', 'var(--purple)'),
+      node('english', 690, 385, 'EnglishSourceLanguage', '外部阈值 + 允许项', 'var(--purple)'),
+      node('chinese', 980, 385, 'SimplifiedChineseTargetLanguage', '确定性规范化与验收', 'var(--purple)', 'implementation', 300),
+      node('deduplication', 1330, 385, 'TranslationDeduplication', '纯 CPU · 全局保序代表/传播', 'var(--purple)', 'implementation', 320),
+    ],
+    edges: [
+      edge('plan_resources', 'planner', 'resource_reader', '外部资源', 'var(--purple)', { fromDx: -90, curve: 20 }),
+      edge('plan_language', 'planner', 'language_catalog', '语言能力', 'var(--purple)', { fromDx: -30, curve: 8 }),
+      edge('plan_placeholder', 'planner', 'placeholder', 'PCRE2 保护', 'var(--purple)', { fromDx: 30, curve: -8 }),
+      edge('plan_cpu', 'planner', 'cpu', '范围并行', 'var(--teal)', { fromDx: 90, curve: -20 }),
+      edge('plan_deduplication', 'planner', 'deduplication', '全局确定性去重', 'var(--purple)', { fromDx: 120, curve: -35 }),
+      edge('resource_file', 'resource_reader', 'file_reader', '异步读取', 'var(--teal)'),
+      edge('resource_cpu', 'resource_reader', 'cpu', '解析与编译', 'var(--teal)', { fromDx: 100, curve: -55 }),
+      edge('lang_ja', 'language_catalog', 'japanese', '精确绑定', 'var(--purple)', { fromDx: -70, curve: 10 }),
+      edge('lang_en', 'language_catalog', 'english', '精确绑定', 'var(--purple)'),
+      edge('lang_zh', 'language_catalog', 'chinese', '精确绑定', 'var(--purple)', { fromDx: 70, curve: -10 }),
+    ],
+  },
+  execution: {
+    viewBox: '0 0 1220 550',
+    groups: [{ x: 12, y: 12, w: 1195, h: 520, label: '模型请求、有限清洗与译后验收', color: 'var(--purple)' }],
+    nodes: [
+      node('executor', 430, 45, 'MzStandardTranslationTaskExecutionService', '已实现配置化重试', 'var(--purple)', 'implementation', 360),
+      node('llm', 70, 205, 'LlmRequestExecutor', '根接口 · 单次请求', 'var(--teal)', ROOT),
+      node('delay', 390, 205, 'AsyncDelay', '根接口 · 可取消等待', 'var(--teal)', ROOT),
+      node('response', 710, 205, 'TranslationTaskResponseProcessingService', '已实现清洗与原子验收', 'var(--purple)', 'implementation', 370),
+      node('language_catalog', 620, 385, 'TranslationLanguageCatalog', '目标处理 + 源文残留', 'var(--purple)', 'implementation', 300),
+      node('cpu', 950, 385, 'CpuTaskExecutor', '根接口 · 响应计算', 'var(--teal)', ROOT),
+    ],
+    edges: [
+      edge('exec_llm', 'executor', 'llm', '原样 messages', 'var(--teal)', { fromDx: -70, curve: 18 }),
+      edge('exec_delay', 'executor', 'delay', '重试等待', 'var(--teal)'),
+      edge('exec_response', 'executor', 'response', '清洗与验收', 'var(--purple)', { fromDx: 70, curve: -18 }),
+      edge('response_language', 'response', 'language_catalog', '语言验收', 'var(--purple)', { fromDx: -50, curve: 8 }),
+      edge('response_cpu', 'response', 'cpu', 'CPU 处理', 'var(--teal)', { fromDx: 50, curve: -8 }),
+    ],
+  },
+  storage: {
+    viewBox: '0 0 1290 560',
+    groups: [{ x: 12, y: 12, w: 1265, h: 530, label: '资产一致快照与短事务结果提交', color: 'var(--teal)' }],
+    nodes: [
+      node('asset_reader', 170, 55, 'MzStandardTranslationAssetReadingService', '五表 + 术语依赖一致快照', 'var(--purple)', 'implementation', 360),
+      node('result_store', 760, 55, 'MzStandardTranslationResultStorageService', 'Preparation + 单任务事务', 'var(--purple)', 'implementation', 370),
+      node('sqlite_query', 70, 230, 'SqliteQueryExecutor', '根接口', 'var(--teal)', ROOT),
+      node('cpu_read', 370, 230, 'CpuTaskExecutor', '根接口 · 解码', 'var(--teal)', ROOT),
+      node('cpu_write', 700, 230, 'CpuTaskExecutor', '同一根 · 编码', 'var(--teal)', ROOT),
+      node('sqlite_tx', 1000, 230, 'SqliteTransactionExecutor', '根接口', 'var(--teal)', ROOT),
+      node('codec', 500, 400, 'MzLocationCodec', '共享位置编解码纯函数', 'var(--teal)', 'implementation', 300),
+    ],
+    edges: [
+      edge('reader_query', 'asset_reader', 'sqlite_query', '一致查询', 'var(--teal)', { fromDx: -55, curve: 8 }),
+      edge('reader_cpu', 'asset_reader', 'cpu_read', '有界解码', 'var(--teal)', { fromDx: 55, curve: -8 }),
+      edge('store_cpu', 'result_store', 'cpu_write', '有界编码', 'var(--teal)', { fromDx: -55, curve: 8 }),
+      edge('store_tx', 'result_store', 'sqlite_tx', '短事务', 'var(--teal)', { fromDx: 55, curve: -8 }),
+      edge('reader_codec', 'asset_reader', 'codec', '位置解码', 'var(--teal)', { fromDx: 70, curve: -5 }),
+      edge('store_codec', 'result_store', 'codec', '位置编码', 'var(--teal)', { fromDx: -75, curve: 18 }),
+    ],
+  },
+  lua: {
+    viewBox: '0 0 1330 555',
+    groups: [{ x: 12, y: 12, w: 1305, h: 525, label: '可信 Lua：Host 拥有生命周期，脚本拥有业务协议', color: 'var(--purple)' }],
+    nodes: [
+      node('lua_translation', 500, 45, 'LuaTranslationService', 'Standard 成功后的附加执行', 'var(--purple)', 'implementation', 310),
+      node('lua_host', 455, 180, 'TrustedLuaExecutionHostingService', '已实现上下文与清理编排', 'var(--purple)', 'implementation', 400),
+      node('file_reader', 35, 370, 'FileReader', '根接口 · 主脚本', 'var(--teal)', ROOT),
+      node('llm', 335, 370, 'LlmRequestExecutor', '根接口 · ctx.llm', 'var(--teal)', ROOT),
+      node('lua_runtime', 635, 370, 'TrustedLuaRuntimeExecutor', '根接口 · 可信 VM worker', 'var(--teal)', ROOT, 290),
+      node('sqlite_session', 960, 370, 'SqliteInteractiveSessionFactory', '根接口 · 同连接会话', 'var(--teal)', ROOT, 330),
+    ],
+    edges: [
+      edge('lua_service_host', 'lua_translation', 'lua_host', '拥有 Profile 调用', 'var(--purple)'),
+      edge('host_file', 'lua_host', 'file_reader', '读取主脚本', 'var(--teal)', { fromDx: -100, curve: 22 }),
+      edge('host_llm', 'lua_host', 'llm', 'Translate 阶段', 'var(--teal)', { fromDx: -35, curve: 8 }),
+      edge('host_runtime', 'lua_host', 'lua_runtime', '执行可信脚本', 'var(--teal)', { fromDx: 35, curve: -8 }),
+      edge('host_session', 'lua_host', 'sqlite_session', '事务生命周期', 'var(--teal)', { fromDx: 100, curve: -22 }),
+    ],
+  },
+  roots: {
+    viewBox: '0 0 1550 650',
+    groups: [
+      { x: 12, y: 12, w: 1515, h: 265, label: '已实现的非根叶子模块', color: 'var(--purple)' },
+      { x: 12, y: 305, w: 1515, h: 320, label: 'Translate 真实运行根接口：尚无生产适配器', color: 'var(--teal)' },
+    ],
+    nodes: [
+      node('asset_reader', 35, 70, 'AssetReadingService', '读标准资产', 'var(--purple)'),
+      node('resource_reader', 325, 70, 'PlanningResourceReader', '读外部 JSON', 'var(--purple)'),
+      node('task_executor', 615, 70, 'TaskExecutionService', '请求与重试', 'var(--purple)'),
+      node('response', 905, 70, 'ResponseProcessingService', 'CPU 验收', 'var(--purple)'),
+      node('result_store', 1195, 70, 'ResultStorageService', '写短事务', 'var(--purple)'),
+      node('project_reader', 160, 185, 'ProjectRecordReadingService', '读 metadata', 'var(--teal)', 'implementation', 300),
+      node('lua_host', 790, 185, 'TrustedLuaExecutionHostingService', '可信脚本生命周期', 'var(--purple)', 'implementation', 350),
+      node('file', 25, 360, 'FileReader', '异步 I/O', 'var(--teal)', ROOT, 170),
+      node('cpu', 210, 360, 'CpuTaskExecutor', '有界多线程', 'var(--teal)', ROOT, 190),
+      node('query', 415, 360, 'SqliteQueryExecutor', '一致查询', 'var(--teal)', ROOT, 205),
+      node('tx', 635, 360, 'SqliteTransactionExecutor', '短事务', 'var(--teal)', ROOT, 220),
+      node('llm', 870, 360, 'LlmRequestExecutor', '单次网络请求', 'var(--teal)', ROOT, 210),
+      node('delay', 1095, 360, 'AsyncDelay', '可取消等待', 'var(--teal)', ROOT, 170),
+      node('runtime', 300, 500, 'TrustedLuaRuntimeExecutor', '可信 VM worker', 'var(--teal)', ROOT, 270),
+      node('session', 905, 500, 'SqliteInteractiveSessionFactory', '同连接交互会话', 'var(--teal)', ROOT, 330),
+    ],
+    edges: [
+      edge('asset_query', 'asset_reader', 'query', '查询', 'var(--teal)', { fromDx: -45, curve: 15 }),
+      edge('asset_cpu', 'asset_reader', 'cpu', '解码', 'var(--teal)', { fromDx: 45, curve: -10 }),
+      edge('resource_file', 'resource_reader', 'file', '读取', 'var(--teal)', { fromDx: -45, curve: 16 }),
+      edge('resource_cpu', 'resource_reader', 'cpu', '解析', 'var(--teal)', { fromDx: 45, curve: -8 }),
+      edge('executor_llm', 'task_executor', 'llm', '请求', 'var(--teal)', { fromDx: -40, curve: 12 }),
+      edge('executor_delay', 'task_executor', 'delay', '等待', 'var(--teal)', { fromDx: 40, curve: -16 }),
+      edge('response_cpu', 'response', 'cpu', '验收', 'var(--teal)', { curve: 30 }),
+      edge('store_cpu', 'result_store', 'cpu', '编码', 'var(--teal)', { fromDx: -40, curve: 52 }),
+      edge('store_tx', 'result_store', 'tx', '提交', 'var(--teal)', { fromDx: 40, curve: 25 }),
+      edge('project_query', 'project_reader', 'query', '查询', 'var(--teal)', { curve: -9 }),
+      edge('host_file', 'lua_host', 'file', '脚本', 'var(--teal)', { fromDx: -80, curve: 52 }),
+      edge('host_llm', 'lua_host', 'llm', 'ctx.llm', 'var(--teal)', { fromDx: -25, curve: 8 }),
+      edge('host_runtime', 'lua_host', 'runtime', 'VM', 'var(--teal)', { fromDx: 25, curve: 32 }),
+      edge('host_session', 'lua_host', 'session', 'DB 会话', 'var(--teal)', { fromDx: 80, curve: -8 }),
+    ],
+  },
+};
+
+const steps = [
+  {
+    category: 'other', view: 'overview', label: '产品总览', title: '统一入口不抹平引擎切片',
+    desc: 'MzCli 只依赖各命令用例。Translate 仍是自己的纵向切片；表面相同的命令不会自动共享参数或业务契约。',
+    nodes: '*', edges: '*', kv: [['箭头', '消费方 → 直接依赖'], ['实线节点', '已有实现'], ['虚线节点', '契约或根接口']],
+  },
+  {
+    category: 'other', view: 'initExtract', label: 'Init / Extract', title: '既有切片已经推进到运行根之前',
+    desc: 'Init 通过目录解析与数据库创建职责协作；Extract 保持 Builtin → Rules → Lua 的顶层串行顺序，并把文件 I/O 与 CPU 并行留在阶段内部。',
+    nodes: '*', edges: '*', kv: [['磁盘', '异步接口 + 有界背压'], ['CPU', '独立根 worker'], ['数据库', '查询与事务职责分离']],
+  },
+  {
+    category: 'translate', view: 'translate', label: 'Translate 总览', title: 'Translate 全部非根职责已经有实现',
+    desc: '顶层精确选择一次 Profile、读取一次项目记录，然后执行 Standard 与可选 Lua。Standard 的资产、计划、执行、Store 四个职责也已从接口继续实现。',
+    nodes: ['translate_service', 'resolver', 'record', 'standard', 'lua_translation'],
+    edges: ['tr_profile', 'tr_record', 'tr_standard', 'tr_lua'],
+    kv: [['固定顺序', 'Profile → Project → Standard → Lua'], ['共享事实', '同一 Arc Profile'], ['失败', '首错停止，不补偿前序提交']],
+  },
+  {
+    category: 'translate', view: 'translate', label: 'Standard 编排', title: '模型可并发，数据库按任务顺序提交',
+    desc: 'Standard 先建立包含失效、历史译文复用和全局传播关系的完整计划，再按外部上限有界执行任务；结果严格按 task_index 串行提交，形成稳定成功前缀。',
+    nodes: ['standard', 'asset_reader', 'planner', 'executor', 'result_store'],
+    edges: ['standard_asset', 'standard_plan', 'standard_execute', 'standard_store'],
+    kv: [['并发', 'Profile.max_in_flight_tasks'], ['提交', '严格顺序短事务'], ['OutcomeUnknown', '停止声称准确成功前缀']],
+  },
+  {
+    category: 'translate', view: 'planning', label: 'Planner / 去重', title: '范围并行预处理后，按自然顺序做一次全局去重',
+    desc: '资源 Reader 解释人类可写 JSON，语言目录与 PCRE2 完成语言和保护处理；Planner 保序汇合所有范围，由纯 CPU 去重模块确定代表、重复虚原文、传播目标与已有译文复用，再切块构造完整 Markdown。',
+    nodes: '*', edges: '*', kv: [['去重键', '原文 + 保护后文本 + 完整绑定'], ['代表', '只由 MZ 自然顺序决定'], ['上下文', '重复位置仍以虚原文保留']],
+  },
+  {
+    category: 'translate', view: 'execution', label: 'Executor / 验收', title: '请求重试与内容验收分开，但共享外部预算',
+    desc: 'LLM 根只做一次请求，AsyncDelay 只做等待；Executor 用外部延时重试相同 messages。响应服务进行有限 JSON 清洗、精确 ID 集校验、语言检查和占位符原样还原。',
+    nodes: '*', edges: '*', kv: [['清洗', '只做可证明安全的有限修复'], ['响应', 'ID 精确全集，整任务原子'], ['重试', 'Retryable + 内容验收失败']],
+  },
+  {
+    category: 'translate', view: 'storage', label: 'Reader / Store', title: '译文留在领域表，术语依赖单独保存',
+    desc: 'Reader 用一条五表查询取得资产与术语依赖的一致快照；Store 通过乐观预期完成术语失效、已有译文复用，以及代表与全部重复目标的原子提交。没有通用 translations 表。',
+    nodes: '*', edges: '*', kv: [['Preparation', '先校验全部旧状态，再失效与复用'], ['Commit', '代表 + 传播目标单事务'], ['终态', 'StalePlan / NotCommitted / OutcomeUnknown 分离']],
+  },
+  {
+    category: 'translate', view: 'lua', label: '可信 Lua Host', title: 'Lua 完全可信，Host 仍完整拥有资源生命周期',
+    desc: 'Host 读取主脚本、打开同一项目数据库会话，并在 Translate 阶段注入共享 LLM。脚本拥有业务协议；Host 负责未关闭事务回滚、会话关闭和主错误/清理错误组合。',
+    nodes: '*', edges: '*', kv: [['沙箱', '无；完全信任用户'], ['事务', '显式 begin / commit / rollback'], ['取消', '回滚当前事务并受控关闭']],
+  },
+  {
+    category: 'translate', view: 'roots', label: '根停止线', title: '非根树只剩八类真实运行机制',
+    desc: '根接口隔离文件、CPU、SQLite、网络、时钟与 Lua VM。它们只有契约和测试替身，没有生产适配器；因此并发结构已成立，但真实吞吐和端到端结果尚未成立。',
+    nodes: '*', edges: '*', kv: [['I/O', 'FileReader + SQLite 根 + LLM 根'], ['计算', 'CpuTaskExecutor + Lua Runtime'], ['完成条件', '根适配器 + 组合根 + 代表性游戏验证']],
+  },
+];
+
+let roughAvailable = false;
+let roughLoadingStarted = false;
+let rcHolder = null;
+const state = { filter: 'all', stepIndex: 0, view: null };
+
+function loadScript(sources, timeout = 6000) {
   return new Promise(resolve => {
-    const timer = setTimeout(() => resolve(false), timeout);
     let index = 0;
+    const started = performance.now();
     const next = () => {
-      if (index >= srcs.length) {
-        clearTimeout(timer);
-        resolve(false);
-        return;
-      }
+      if (index >= sources.length || performance.now() - started >= timeout) return resolve(false);
       const script = document.createElement('script');
-      script.src = srcs[index++];
-      script.onload = () => {
-        clearTimeout(timer);
-        resolve(true);
-      };
-      script.onerror = () => {
-        script.remove();
-        next();
-      };
+      script.src = sources[index++];
+      script.onload = () => resolve(true);
+      script.onerror = () => { script.remove(); next(); };
       document.head.appendChild(script);
     };
     next();
   });
 }
 
-let hasRough = false;
-const roughReady = loadScript([
-  'https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js',
-  'https://unpkg.com/roughjs@4.6.6/bundled/rough.js',
-]);
+function startRoughEnhancement() {
+  if (roughLoadingStarted) return;
+  roughLoadingStarted = true;
+  loadScript([
+    'https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js',
+    'https://unpkg.com/roughjs@4.6.6/bundled/rough.js',
+  ]).then(loaded => {
+    if (!loaded) return;
+    roughAvailable = true;
+    renderCurrent(true);
+  });
+}
 
-const nodes = [
-  { id: 'mz_cli', x: 910, y: 36, w: 210, h: 64, label: 'MzCli', sub: '参数解析 · 分派 · 输出', color: 'var(--amber)' },
-  { id: 'init_contract', x: 55, y: 160, w: 210, h: 64, label: 'InitUseCase', sub: '异步公开契约', color: 'var(--blue)', status: 'interface' },
-  { id: 'extract_contract', x: 910, y: 160, w: 210, h: 64, label: 'ExtractUseCase', sub: '异步公开契约', color: 'var(--blue)', status: 'interface' },
-  { id: 'translate_contract', x: 1360, y: 160, w: 230, h: 64, label: 'TranslateUseCase', sub: '--lua 意图已传递 · 阶段未实现', color: 'var(--blue)', status: 'interface' },
-  { id: 'write_contract', x: 1730, y: 160, w: 230, h: 64, label: 'WriteBackUseCase', sub: '--lua 意图已传递 · 阶段未实现', color: 'var(--blue)', status: 'interface' },
-  { id: 'init_service', x: 55, y: 300, w: 210, h: 64, label: 'InitService', sub: '已实现 · 未生产装配', color: 'var(--blue)' },
-  { id: 'extract_service', x: 910, y: 300, w: 210, h: 64, label: 'ExtractService', sub: '已实现固定顺序编排', color: 'var(--blue)' },
+function visibleStepIndexes() {
+  return steps.map((step, index) => ({ step, index }))
+    .filter(({ step }) => state.filter === 'all' || step.category === state.filter)
+    .map(({ index }) => index);
+}
 
-  { id: 'pdc_contract', x: 45, y: 570, w: 240, h: 64, label: 'ProjectDatabaseCreator', sub: '异步职责契约', color: 'var(--teal)', status: 'interface' },
-  { id: 'pdc_service', x: 45, y: 720, w: 240, h: 64, label: 'ProjectDatabaseCreationService', sub: '已实现 · 外部数据库根目录', color: 'var(--teal)' },
-  { id: 'sqlite_creator', x: 45, y: 870, w: 240, h: 64, label: 'SqliteDatabaseCreator', sub: '根接口 · 无生产适配器', color: 'var(--teal)', status: 'interface' },
-
-  { id: 'project_opener', x: 350, y: 440, w: 260, h: 64, label: 'ExistingProjectOpener', sub: 'ExtractService 直接契约', color: 'var(--purple)', status: 'interface' },
-  { id: 'builtin_extraction', x: 750, y: 440, w: 250, h: 64, label: 'BuiltInExtraction', sub: 'ExtractService 直接契约', color: 'var(--purple)', status: 'interface' },
-  { id: 'rules_extraction', x: 1150, y: 440, w: 250, h: 64, label: 'RulesExtraction', sub: 'ExtractService 直接契约', color: 'var(--purple)', status: 'interface' },
-  { id: 'lua_extraction', x: 1550, y: 440, w: 250, h: 64, label: 'LuaExtraction', sub: 'ExtractService 直接契约', color: 'var(--purple)', status: 'interface' },
-
-  { id: 'opening_service', x: 350, y: 580, w: 260, h: 64, label: 'ExistingProjectOpeningService', sub: '已实现项目上下文建立', color: 'var(--purple)' },
-  { id: 'builtin_service', x: 750, y: 580, w: 250, h: 64, label: 'BuiltInExtractionService', sub: '已实现 · 有界 CPU 扫描', color: 'var(--purple)' },
-  { id: 'rules_service', x: 1150, y: 580, w: 250, h: 64, label: 'RulesExtractionService', sub: '已实现 · 有界 CPU 匹配', color: 'var(--purple)' },
-  { id: 'lua_service', x: 1550, y: 580, w: 250, h: 64, label: 'LuaExtractionService', sub: '已实现可信 Host 调用', color: 'var(--purple)' },
-
-  { id: 'record_reader', x: 340, y: 720, w: 300, h: 64, label: 'ProjectDatabaseRecordReader', sub: 'Opening 的领域读取契约', color: 'var(--teal)', status: 'interface' },
-  { id: 'document_reader', x: 690, y: 720, w: 285, h: 64, label: 'MzProjectDocumentReader', sub: 'Builtin / Rules 共享契约', color: 'var(--teal)', status: 'interface' },
-  { id: 'builtin_store', x: 1030, y: 720, w: 230, h: 64, label: 'BuiltinSnapshotStore', sub: 'Builtin 的持久化契约', color: 'var(--teal)', status: 'interface' },
-  { id: 'rules_store', x: 1320, y: 720, w: 230, h: 64, label: 'RulesSnapshotStore', sub: 'Rules 的持久化契约', color: 'var(--teal)', status: 'interface' },
-
-  { id: 'record_reading_service', x: 340, y: 860, w: 310, h: 64, label: 'ProjectDatabaseRecordReadingService', sub: '已实现 metadata 读取', color: 'var(--teal)' },
-  { id: 'document_reading_service', x: 690, y: 860, w: 300, h: 64, label: 'MzProjectDocumentReadingService', sub: '已实现有界读取与解析', color: 'var(--teal)' },
-  { id: 'asset_store', x: 1135, y: 860, w: 280, h: 64, label: 'MzExtractionAssetStore', sub: '已实现五表单事务替换', color: 'var(--teal)' },
-  { id: 'location_codec', x: 1480, y: 860, w: 250, h: 64, label: 'MzLocationCodec', sub: '已实现确定性位置编解码', color: 'var(--teal)' },
-
-  { id: 'directory_resolver', x: 330, y: 1035, w: 225, h: 64, label: 'ExistingDirectoryResolver', sub: '根接口 · Init 也依赖', color: 'var(--teal)', status: 'interface' },
-  { id: 'file_reader', x: 570, y: 1035, w: 225, h: 64, label: 'FileReader', sub: '根接口 · 异步读取', color: 'var(--teal)', status: 'interface' },
-  { id: 'directory_lister', x: 810, y: 1035, w: 225, h: 64, label: 'DirectoryLister', sub: '根接口 · 异步列举', color: 'var(--teal)', status: 'interface' },
-  { id: 'cpu_executor', x: 1050, y: 1035, w: 225, h: 64, label: 'CpuTaskExecutor', sub: '根接口 · 有界多线程', color: 'var(--teal)', status: 'interface' },
-  { id: 'sqlite_query', x: 1290, y: 1035, w: 225, h: 64, label: 'SqliteQueryExecutor', sub: '根接口 · 只读查询', color: 'var(--teal)', status: 'interface' },
-  { id: 'sqlite_transaction', x: 1530, y: 1035, w: 225, h: 64, label: 'SqliteTransactionExecutor', sub: '根接口 · 单事务执行', color: 'var(--teal)', status: 'interface' },
-  { id: 'lua_host', x: 1770, y: 1035, w: 225, h: 64, label: 'TrustedLuaExecutionHost', sub: '根接口 · 完全信任脚本', color: 'var(--teal)', status: 'interface' },
-];
-
-const nodeById = new Map(nodes.map(node => [node.id, node]));
-
-const edges = [
-  { id: 'cli_init', from: 'mz_cli', to: 'init_contract', fromPort: 'bottom', toPort: 'top', fromDx: -80, label: '直接依赖', color: 'var(--blue)', curve: 22 },
-  { id: 'cli_extract', from: 'mz_cli', to: 'extract_contract', fromPort: 'bottom', toPort: 'top', fromDx: -24, label: '直接依赖', color: 'var(--blue)', curve: 8 },
-  { id: 'cli_translate', from: 'mz_cli', to: 'translate_contract', fromPort: 'bottom', toPort: 'top', fromDx: 28, label: '直接依赖', color: 'var(--blue)', curve: -10 },
-  { id: 'cli_write', from: 'mz_cli', to: 'write_contract', fromPort: 'bottom', toPort: 'top', fromDx: 78, label: '直接依赖', color: 'var(--blue)', curve: -22 },
-  { id: 'implements_init', from: 'init_service', to: 'init_contract', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--blue)', dash: true },
-  { id: 'implements_extract', from: 'extract_service', to: 'extract_contract', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--blue)', dash: true },
-  { id: 'extract_open', from: 'extract_service', to: 'project_opener', fromPort: 'bottom', toPort: 'top', fromDx: -72, label: '直接依赖', color: 'var(--purple)', curve: 10 },
-  { id: 'extract_builtin', from: 'extract_service', to: 'builtin_extraction', fromPort: 'bottom', toPort: 'top', fromDx: -24, label: '直接依赖', color: 'var(--purple)', curve: 6 },
-  { id: 'extract_rules', from: 'extract_service', to: 'rules_extraction', fromPort: 'bottom', toPort: 'top', fromDx: 24, label: '直接依赖', color: 'var(--purple)', curve: -6 },
-  { id: 'extract_lua', from: 'extract_service', to: 'lua_extraction', fromPort: 'bottom', toPort: 'top', fromDx: 72, label: '直接依赖', color: 'var(--purple)', curve: -10 },
-
-  { id: 'implements_open', from: 'opening_service', to: 'project_opener', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--purple)', dash: true },
-  { id: 'implements_builtin', from: 'builtin_service', to: 'builtin_extraction', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--purple)', dash: true },
-  { id: 'implements_rules', from: 'rules_service', to: 'rules_extraction', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--purple)', dash: true },
-  { id: 'implements_lua', from: 'lua_service', to: 'lua_extraction', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--purple)', dash: true },
-
-  { id: 'open_record', from: 'opening_service', to: 'record_reader', fromPort: 'bottom', toPort: 'top', fromDx: -38, label: '直接依赖', color: 'var(--teal)', curve: 6 },
-  { id: 'open_directory', from: 'opening_service', to: 'directory_resolver', fromPort: 'bottom', toPort: 'top', fromDx: 38, label: '直接依赖', color: 'var(--teal)', curve: 28 },
-  { id: 'builtin_documents', from: 'builtin_service', to: 'document_reader', fromPort: 'bottom', toPort: 'top', fromDx: -48, label: '直接依赖', color: 'var(--teal)', curve: 7 },
-  { id: 'builtin_persist', from: 'builtin_service', to: 'builtin_store', fromPort: 'bottom', toPort: 'top', fromDx: 8, label: '直接依赖', color: 'var(--teal)', curve: -7 },
-  { id: 'builtin_cpu', from: 'builtin_service', to: 'cpu_executor', fromPort: 'bottom', toPort: 'top', fromDx: 58, label: 'CPU', color: 'var(--teal)', curve: -20 },
-  { id: 'rules_documents', from: 'rules_service', to: 'document_reader', fromPort: 'bottom', toPort: 'top', fromDx: -60, label: '直接依赖', color: 'var(--teal)', curve: 18 },
-  { id: 'rules_persist', from: 'rules_service', to: 'rules_store', fromPort: 'bottom', toPort: 'top', fromDx: 8, label: '直接依赖', color: 'var(--teal)', curve: -8 },
-  { id: 'rules_file', from: 'rules_service', to: 'file_reader', fromPort: 'bottom', toPort: 'top', fromDx: -18, label: 'Rules 文件', color: 'var(--teal)', curve: 38 },
-  { id: 'rules_cpu', from: 'rules_service', to: 'cpu_executor', fromPort: 'bottom', toPort: 'top', fromDx: 60, label: 'CPU', color: 'var(--teal)', curve: -18 },
-  { id: 'lua_execute', from: 'lua_service', to: 'lua_host', fromPort: 'bottom', toPort: 'top', label: '直接依赖', color: 'var(--teal)', curve: -8 },
-
-  { id: 'implements_record_reader', from: 'record_reading_service', to: 'record_reader', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--teal)', dash: true },
-  { id: 'record_query', from: 'record_reading_service', to: 'sqlite_query', fromPort: 'bottom', toPort: 'top', label: '直接依赖', color: 'var(--teal)', curve: -22 },
-  { id: 'implements_document_reader', from: 'document_reading_service', to: 'document_reader', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--teal)', dash: true },
-  { id: 'document_file', from: 'document_reading_service', to: 'file_reader', fromPort: 'bottom', toPort: 'top', fromDx: -70, label: '异步读取', color: 'var(--teal)', curve: 10 },
-  { id: 'document_list', from: 'document_reading_service', to: 'directory_lister', fromPort: 'bottom', toPort: 'top', label: '列举 Map', color: 'var(--teal)', curve: 2 },
-  { id: 'document_cpu', from: 'document_reading_service', to: 'cpu_executor', fromPort: 'bottom', toPort: 'top', fromDx: 70, label: 'CPU 解析', color: 'var(--teal)', curve: -10 },
-  { id: 'implements_builtin_store', from: 'asset_store', to: 'builtin_store', fromPort: 'top', toPort: 'bottom', fromDx: -65, label: '实现契约', color: 'var(--teal)', dash: true, curve: 7 },
-  { id: 'implements_rules_store', from: 'asset_store', to: 'rules_store', fromPort: 'top', toPort: 'bottom', fromDx: 65, label: '实现契约', color: 'var(--teal)', dash: true, curve: -7 },
-  { id: 'store_cpu', from: 'asset_store', to: 'cpu_executor', fromPort: 'bottom', toPort: 'top', fromDx: -58, label: 'CPU 编码', color: 'var(--teal)', curve: 7 },
-  { id: 'store_transaction', from: 'asset_store', to: 'sqlite_transaction', fromPort: 'bottom', toPort: 'top', fromDx: 58, label: '单事务', color: 'var(--teal)', curve: -7 },
-  { id: 'store_codec', from: 'asset_store', to: 'location_codec', fromPort: 'right', toPort: 'left', label: '内部纯函数', color: 'var(--teal)' },
-
-  { id: 'init_directory', from: 'init_service', to: 'directory_resolver', fromPort: 'bottom', toPort: 'left', fromDx: 48, label: '直接依赖', color: 'var(--teal)', curve: 26 },
-  { id: 'init_pdc', from: 'init_service', to: 'pdc_contract', fromPort: 'bottom', toPort: 'top', fromDx: -48, label: '直接依赖', color: 'var(--teal)', curve: 8 },
-  { id: 'implements_pdc', from: 'pdc_service', to: 'pdc_contract', fromPort: 'top', toPort: 'bottom', label: '实现契约', color: 'var(--teal)', dash: true },
-  { id: 'pdc_sqlite', from: 'pdc_service', to: 'sqlite_creator', fromPort: 'bottom', toPort: 'top', label: '直接依赖', color: 'var(--teal)' },
-];
-
-const groups = [
-  { x: 10, y: 12, w: 2010, h: 365, label: 'ATT MZ 命令域', color: 'var(--blue)' },
-  { x: 10, y: 400, w: 300, h: 580, label: '初始化与项目数据库创建', color: 'var(--teal)' },
-  { x: 325, y: 400, w: 1695, h: 570, label: 'Extract：全部非根模块均已实现', color: 'var(--purple)' },
-  { x: 325, y: 1005, w: 1695, h: 125, label: 'Extract 七个根接口：无生产实现 / 无组合根', color: 'var(--teal)' },
-];
-
-const steps = [
-  {
-    label: '① CLI 入口',
-    title: 'CLI 只依赖四个用例契约',
-    desc: '不同命令保持各自输入和行为，MzCli 只解析参数、等待异步结果并输出。Extract 的内部并发与资源配置不会泄漏成临时 CLI 参数。',
-    nodes: ['mz_cli', 'init_contract', 'extract_contract', 'translate_contract', 'write_contract'],
-    edges: ['cli_init', 'cli_extract', 'cli_translate', 'cli_write'],
-    kv: [['项目名称', '统一为受信 ProjectName'], ['Extract 顺序', 'Builtin → Rules → Lua'], ['退出码', '参数错误 2 / 用例失败 1']],
-  },
-  {
-    label: '② 初始化编排',
-    title: 'InitService 只看两个直接依赖',
-    desc: '它整理语言、请求解析稳定游戏目录，再把受信 NewProject 交给数据库创建职责。SQLite 创建接口已经从查询与事务执行接口中分离。',
-    nodes: ['init_contract', 'init_service', 'directory_resolver', 'pdc_contract'],
-    edges: ['implements_init', 'init_directory', 'init_pdc'],
-    kv: [['ExistingDirectoryResolver', '重新观测现存目录'], ['ProjectDatabaseCreator', '创建项目数据库'], ['停止线', '不绕过直接职责']],
-  },
-  {
-    label: '③ 提取编排',
-    title: 'ExtractService 仍只依赖四个高级契约',
-    desc: '服务打开项目一次，再按 Builtin → Rules → Lua 的固定顺序执行被选阶段。阶段间串行提交；并行只发生在阶段内部的只读 I/O 与纯 CPU 工作中。',
-    nodes: ['extract_contract', 'extract_service', 'project_opener', 'builtin_extraction', 'rules_extraction', 'lua_extraction'],
-    edges: ['implements_extract', 'extract_open', 'extract_builtin', 'extract_rules', 'extract_lua'],
-    kv: [['项目开启', 'ExistingProjectOpener'], ['提取能力', 'BuiltIn / Rules / Lua'], ['失败语义', '首错停止，前序提交不回滚']],
-  },
-  {
-    label: '④ 非根实现',
-    title: '领域契约已经继续实现到根接口之前',
-    desc: '项目记录读取、MZ 文档读取与标准资产 Store 都已有实现。一个文档读取服务同时服务 Builtin 与 Rules，一个资产 Store 同时实现两个来源的窄持久化契约。',
-    nodes: ['opening_service', 'builtin_service', 'rules_service', 'record_reader', 'document_reader', 'builtin_store', 'rules_store', 'record_reading_service', 'document_reading_service', 'asset_store', 'location_codec'],
-    edges: ['open_record', 'builtin_documents', 'builtin_persist', 'rules_documents', 'rules_persist', 'implements_record_reader', 'implements_document_reader', 'implements_builtin_store', 'implements_rules_store', 'store_codec'],
-    kv: [['项目记录', 'metadata → 受信项目事实'], ['文档读取', '有界异步读取 + CPU 解析'], ['资产 Store', '五张表 + 一个 SQLite 事务']],
-  },
-  {
-    label: '⑤ 并发与配置',
-    title: '阶段份额与进程根预算分开控制',
-    desc: '文档读取、Builtin 扫描、Rules 匹配和 Store 编码都使用外部显式的非零阶段上限；CPU 密集工作统一交给根执行器。服务没有 Default，也不探测硬件自行调整。',
-    nodes: ['builtin_service', 'rules_service', 'document_reading_service', 'asset_store', 'file_reader', 'directory_lister', 'cpu_executor'],
-    edges: ['builtin_cpu', 'rules_file', 'rules_cpu', 'document_file', 'document_list', 'document_cpu', 'store_cpu'],
-    kv: [['磁盘', '有界异步 I/O + 背压'], ['CPU', '独立 worker + 有界队列'], ['确定性', '并发完成顺序不改变结果']],
-  },
-  {
-    label: '⑥ SQLite 边界',
-    title: '创建、查询和事务执行是三个根能力',
-    desc: '初始化只请求 create-only 建库；项目记录服务只读 metadata；资产 Store 只提交拥有型单事务计划。连接、并发预算、背压和连接策略由未来根适配器承担。',
-    nodes: ['pdc_contract', 'pdc_service', 'sqlite_creator', 'record_reading_service', 'sqlite_query', 'asset_store', 'sqlite_transaction'],
-    edges: ['implements_pdc', 'pdc_sqlite', 'record_query', 'store_transaction'],
-    kv: [['创建', 'SqliteDatabaseCreator'], ['读取', 'SqliteQueryExecutor'], ['快照替换', 'SqliteTransactionExecutor']],
-  },
-  {
-    label: '⑦ 完成边界',
-    title: 'Extract 全部非根模块已实现，只剩七个根接口',
-    desc: '七个根接口目前只有测试替身，没有生产实现或组合根。现阶段可以证明调度、算法和事务计划，不代表真实线程池、磁盘、SQLite 与 Lua 已经端到端可用。',
-    nodes: ['extract_service', 'opening_service', 'builtin_service', 'rules_service', 'lua_service', 'record_reading_service', 'document_reading_service', 'asset_store', 'location_codec', 'directory_resolver', 'file_reader', 'directory_lister', 'cpu_executor', 'sqlite_query', 'sqlite_transaction', 'lua_host'],
-    edges: ['extract_open', 'extract_builtin', 'extract_rules', 'extract_lua', 'open_directory', 'record_query', 'document_file', 'document_list', 'document_cpu', 'store_codec', 'store_transaction', 'lua_execute'],
-    kv: [['可以声称', '非根业务实现收束到根接口'], ['不能声称', '生产纵向链路已经成立'], ['根接口数量', '7 个，全部未生产接线']],
-  },
-];
-
-const VIEWBOX = '0 0 2030 1150';
-const NS = 'http://www.w3.org/2000/svg';
-const svgEl = (tag, attrs = {}) => {
+function svgEl(tag, attrs = {}) {
   const element = document.createElementNS(NS, tag);
   for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, value);
   return element;
-};
-let rcHolder = null;
-
+}
 function hashId(value) {
   let hash = 9;
   for (const character of String(value)) hash = (hash * 31 + character.charCodeAt(0)) % 1000;
   return hash;
 }
+function isSelected(selection, id) { return selection === '*' || selection.includes(id); }
 
-function sketchRect(x, y, width, height, { seed, dash } = {}) {
-  if (!hasRough) {
-    const rectangle = svgEl('rect', { x, y, width, height, rx: 8 });
-    if (dash) rectangle.setAttribute('stroke-dasharray', '8 6');
-    return rectangle;
-  }
+function cleanRect(x, y, width, height, dash) {
+  const rectangle = svgEl('rect', { x, y, width, height, rx: 8 });
+  if (dash) rectangle.setAttribute('stroke-dasharray', '8 6');
+  return rectangle;
+}
+function sketchRect(x, y, width, height, options) {
+  if (!options.enhance || !roughAvailable) return cleanRect(x, y, width, height, options.dash);
   return rcHolder.rectangle(x, y, width, height, {
-    roughness: SKETCH.roughness,
-    bowing: SKETCH.bowing,
-    seed: seed ?? SKETCH.seed,
-    strokeWidth: 1.6,
-    ...(dash ? { strokeLineDash: [8, 6] } : {}),
+    roughness: SKETCH.roughness, bowing: SKETCH.bowing, seed: options.seed,
+    strokeWidth: 1.6, ...(options.dash ? { strokeLineDash: [8, 6] } : {}),
   });
 }
-
-function sketchPath(path, { seed, dash } = {}) {
-  if (!hasRough) {
+function sketchPath(path, options) {
+  if (!options.enhance || !roughAvailable) {
     const fallback = svgEl('path', { d: path, class: 'shaft' });
-    if (dash) fallback.setAttribute('stroke-dasharray', '7 5');
+    if (options.dash) fallback.setAttribute('stroke-dasharray', '7 5');
     return fallback;
   }
   const group = rcHolder.path(path, {
-    roughness: Math.min(SKETCH.roughness, 1),
-    bowing: 0.8,
-    seed: seed ?? SKETCH.seed,
-    strokeWidth: 1.6,
-    ...(dash ? { strokeLineDash: [7, 5] } : {}),
+    roughness: 0.95, bowing: 0.75, seed: options.seed, strokeWidth: 1.6,
+    ...(options.dash ? { strokeLineDash: [7, 5] } : {}),
   });
   group.classList.add('shaft');
   return group;
 }
-
 function svgText(x, y, content, className) {
   const label = svgEl('text', { x, y, class: className });
   label.textContent = content;
   return label;
 }
+function anchor(item, port, dx = 0, dy = 0) {
+  const points = {
+    top: { x: item.x + item.w / 2, y: item.y },
+    right: { x: item.x + item.w, y: item.y + item.h / 2 },
+    bottom: { x: item.x + item.w / 2, y: item.y + item.h },
+    left: { x: item.x, y: item.y + item.h / 2 },
+  };
+  return { x: points[port].x + dx, y: points[port].y + dy };
+}
 
-function nodeBox(node) {
-  const { id, x, y, w, h, label, sub, color, status } = node;
-  const group = svgEl('g', { class: 'node', 'data-id': id, 'data-status': status ?? 'implementation' });
-  group.style.setProperty('--c', color);
+function renderNode(item, enhance) {
+  const group = svgEl('g', { class: 'node', 'data-id': item.id, 'data-status': item.status });
+  group.style.setProperty('--c', item.color);
   const shape = svgEl('g', { class: 'shape' });
-  shape.appendChild(sketchRect(x, y, w, h, { seed: hashId(id), dash: status === 'interface' }));
+  shape.appendChild(sketchRect(item.x, item.y, item.w, item.h, {
+    seed: hashId(item.id), dash: item.status === ROOT, enhance,
+  }));
   group.appendChild(shape);
-  group.appendChild(svgText(x + w / 2, y + h / 2 - 9, label, 'node-label'));
-  group.appendChild(svgText(x + w / 2, y + h / 2 + 14, sub, 'node-sub'));
+  group.appendChild(svgText(item.x + item.w / 2, item.y + item.h / 2 - 9, item.label, 'node-label'));
+  group.appendChild(svgText(item.x + item.w / 2, item.y + item.h / 2 + 14, item.sub, 'node-sub'));
   return group;
 }
 
-function anchor(node, port, dx = 0, dy = 0) {
-  const points = {
-    top: { x: node.x + node.w / 2, y: node.y },
-    right: { x: node.x + node.w, y: node.y + node.h / 2 },
-    bottom: { x: node.x + node.w / 2, y: node.y + node.h },
-    left: { x: node.x, y: node.y + node.h / 2 },
-  };
-  const point = points[port];
-  return { x: point.x + dx, y: point.y + dy };
-}
-
-function edgeLine(edge) {
-  const fromNode = nodeById.get(edge.from);
-  const toNode = nodeById.get(edge.to);
-  const start = anchor(fromNode, edge.fromPort, edge.fromDx ?? 0, edge.fromDy ?? 0);
-  const end = anchor(toNode, edge.toPort, edge.toDx ?? 0, edge.toDy ?? 0);
+function renderEdge(item, byId, enhance) {
+  const from = byId.get(item.from);
+  const to = byId.get(item.to);
+  const start = anchor(from, item.fromPort, item.fromDx ?? 0, item.fromDy ?? 0);
+  const end = anchor(to, item.toPort, item.toDx ?? 0, item.toDy ?? 0);
   const dx = end.x - start.x;
   const dy = end.y - start.y;
   const length = Math.hypot(dx, dy) || 1;
-  let path;
-  let labelX;
-  let labelY;
-  let angle;
-  if (edge.curve) {
-    const controlX = (start.x + end.x) / 2 - (dy / length) * edge.curve;
-    const controlY = (start.y + end.y) / 2 + (dx / length) * edge.curve;
+  let path, labelX, labelY, angle;
+  if (item.curve) {
+    const controlX = (start.x + end.x) / 2 - (dy / length) * item.curve;
+    const controlY = (start.y + end.y) / 2 + (dx / length) * item.curve;
     path = `M ${start.x} ${start.y} Q ${controlX} ${controlY} ${end.x} ${end.y}`;
     labelX = 0.25 * start.x + 0.5 * controlX + 0.25 * end.x;
     labelY = 0.25 * start.y + 0.5 * controlY + 0.25 * end.y - 7;
@@ -523,63 +648,60 @@ function edgeLine(edge) {
     labelY = (start.y + end.y) / 2 - 7;
     angle = Math.atan2(end.y - start.y, end.x - start.x);
   }
-  const group = svgEl('g', { class: 'edge', 'data-id': edge.id });
-  group.style.setProperty('--c', edge.color);
-  const strokes = svgEl('g');
-  strokes.appendChild(sketchPath(path, { seed: hashId(edge.id), dash: edge.dash }));
+  const group = svgEl('g', { class: 'edge', 'data-id': item.id });
+  group.style.setProperty('--c', item.color);
+  group.appendChild(sketchPath(path, { seed: hashId(item.id), dash: item.dash, enhance }));
   for (const side of [0.5, -0.5]) {
     const headX = end.x - 11 * Math.cos(angle + side);
     const headY = end.y - 11 * Math.sin(angle + side);
-    strokes.appendChild(sketchPath(`M ${headX} ${headY} L ${end.x} ${end.y}`, { seed: hashId(edge.id) + 7 }));
+    group.appendChild(sketchPath(`M ${headX} ${headY} L ${end.x} ${end.y}`, {
+      seed: hashId(item.id) + 7, dash: false, enhance,
+    }));
   }
-  group.appendChild(strokes);
-  const label = svgText(labelX, labelY, edge.label, 'edge-label');
-  label.dataset.id = edge.id;
+  const label = svgText(labelX, labelY, item.label, 'edge-label');
+  label.dataset.id = item.id;
   group.appendChild(label);
   return group;
 }
 
-function groupArea(area) {
-  const group = svgEl('g', { class: 'group', 'data-id': area.label });
-  group.style.setProperty('--c', area.color);
-  group.appendChild(sketchRect(area.x, area.y, area.w, area.h, { seed: hashId(area.label), dash: true }));
-  const label = svgText(area.x + 14, area.y + 18, area.label, '');
+function renderGroup(item) {
+  const group = svgEl('g', { class: 'group', 'data-id': item.label });
+  group.style.setProperty('--c', item.color);
+  group.appendChild(cleanRect(item.x, item.y, item.w, item.h, true));
+  const label = svgText(item.x + 14, item.y + 20, item.label, '');
   label.setAttribute('text-anchor', 'start');
   group.appendChild(label);
   return group;
 }
 
-function renderDiagram() {
-  const svg = svgEl('svg', { viewBox: VIEWBOX, role: 'img', 'aria-label': 'ATT MZ 当前模块直接依赖图' });
-  if (hasRough) rcHolder = rough.svg(svg);
-  groups.forEach(group => svg.appendChild(groupArea(group)));
-  edges.forEach(edge => svg.appendChild(edgeLine(edge)));
-  nodes.forEach(node => svg.appendChild(nodeBox(node)));
-  const container = document.getElementById('diagram');
-  container.textContent = '';
-  container.appendChild(svg);
-  return svg;
-}
-
-const state = { step: 0 };
-
 function applyClasses(step) {
-  document.querySelectorAll('.step-btn').forEach((button, index) => {
-    const current = index === state.step;
-    button.classList.toggle('is-current', current);
-    button.setAttribute('aria-pressed', String(current));
-  });
   document.querySelectorAll('.node').forEach(element => {
-    const active = step.nodes.includes(element.dataset.id);
+    const active = isSelected(step.nodes, element.dataset.id);
     element.classList.toggle('is-active', active);
     element.classList.toggle('is-dimmed', !active);
   });
   document.querySelectorAll('.edge').forEach(element => {
-    const active = step.edges.includes(element.dataset.id);
+    const active = isSelected(step.edges, element.dataset.id);
     element.classList.toggle('is-active', active);
     element.classList.toggle('is-dimmed', !active);
     element.querySelector('.edge-label')?.classList.toggle('is-active', active);
   });
+}
+
+function renderDiagram(step, enhanceFocused = false) {
+  const diagram = diagrams[step.view];
+  const byId = new Map(diagram.nodes.map(item => [item.id, item]));
+  const svg = svgEl('svg', { viewBox: diagram.viewBox, role: 'img', 'aria-label': `${step.title}依赖图` });
+  if (roughAvailable) rcHolder = rough.svg(svg);
+  diagram.groups.forEach(item => svg.appendChild(renderGroup(item)));
+  diagram.edges.forEach(item => svg.appendChild(renderEdge(item, byId,
+    enhanceFocused && isSelected(step.edges, item.id))));
+  diagram.nodes.forEach(item => svg.appendChild(renderNode(item,
+    enhanceFocused && isSelected(step.nodes, item.id))));
+  const container = document.getElementById('diagram');
+  container.replaceChildren(svg);
+  state.view = step.view;
+  applyClasses(step);
 }
 
 function renderPanel(step) {
@@ -590,58 +712,66 @@ function renderPanel(step) {
     `<div class="panel-swap"><h3>${step.title}</h3><p>${step.desc}</p><div class="status-note">${rows}</div></div>`;
 }
 
-function goStep(index) {
-  if (index === state.step) return;
-  state.step = index;
-  const step = steps[index];
-  applyClasses(step);
-  renderPanel(step);
-}
-
 function renderStepper() {
-  document.getElementById('stepper').innerHTML = steps.map((step, index) =>
-    `<button type="button" class="step-btn" data-index="${index}" aria-pressed="${index === 0}">${step.label}</button>`
+  const indexes = visibleStepIndexes();
+  document.getElementById('stepper').innerHTML = indexes.map(index =>
+    `<button type="button" class="step-btn${index === state.stepIndex ? ' is-current' : ''}" data-index="${index}" aria-pressed="${index === state.stepIndex}">${steps[index].label}</button>`
   ).join('');
 }
 
+function renderCurrent(enhanceFocused = roughAvailable) {
+  const step = steps[state.stepIndex];
+  renderDiagram(step, enhanceFocused);
+  renderPanel(step);
+  renderStepper();
+}
+
+function goStep(index) {
+  if (!steps[index]) return;
+  state.stepIndex = index;
+  renderCurrent(roughAvailable);
+}
+
+function setFilter(filter) {
+  state.filter = filter;
+  document.querySelectorAll('.filter-btn').forEach(button => {
+    const current = button.dataset.filter === filter;
+    button.classList.toggle('is-current', current);
+    button.setAttribute('aria-pressed', String(current));
+  });
+  const indexes = visibleStepIndexes();
+  if (!indexes.includes(state.stepIndex)) state.stepIndex = indexes[0];
+  renderCurrent(roughAvailable);
+}
+
+document.getElementById('filters').addEventListener('click', event => {
+  const button = event.target.closest('button[data-filter]');
+  if (button) setFilter(button.dataset.filter);
+});
 document.getElementById('stepper').addEventListener('click', event => {
   const button = event.target.closest('button[data-index]');
   if (button) goStep(Number(button.dataset.index));
 });
-document.addEventListener('animationend', event => {
-  if (event.animationName === 'fade-in-up') {
-    event.target.classList.remove('anim-in', 'panel-swap');
-  }
-});
 document.addEventListener('keydown', event => {
-  if (event.key === 'ArrowRight') {
-    event.preventDefault();
-    goStep(Math.min(state.step + 1, steps.length - 1));
-  }
-  if (event.key === 'ArrowLeft') {
-    event.preventDefault();
-    goStep(Math.max(state.step - 1, 0));
-  }
+  if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
+  const indexes = visibleStepIndexes();
+  const position = Math.max(0, indexes.indexOf(state.stepIndex));
+  const delta = event.key === 'ArrowRight' ? 1 : -1;
+  const next = indexes[Math.max(0, Math.min(indexes.length - 1, position + delta))];
+  event.preventDefault();
+  goStep(next);
+});
+document.addEventListener('animationend', event => {
+  if (event.animationName === 'fade-in-up') event.target.classList.remove('anim-in', 'panel-swap');
 });
 
-renderDiagram();
-renderStepper();
-renderPanel(steps[0]);
-applyClasses(steps[0]);
-
-roughReady.then(loaded => {
-  if (!loaded) return;
-  const upgradeSketch = () => {
-    hasRough = true;
-    renderDiagram();
-    applyClasses(steps[state.step]);
-  };
-  if ('requestIdleCallback' in window) {
-    window.requestIdleCallback(upgradeSketch, { timeout: 800 });
-  } else {
-    setTimeout(upgradeSketch, 0);
-  }
-});
+// 首屏只创建当前轻量 SVG。rough.js 在空闲时加载，并且只增强当前步骤的活跃子图。
+renderCurrent(false);
+if ('requestIdleCallback' in window) {
+  window.requestIdleCallback(startRoughEnhancement, { timeout: 1400 });
+} else {
+  setTimeout(startRoughEnhancement, 250);
+}
 </script>
 </body>
 </html>

@@ -1,3 +1,5 @@
+#![allow(dead_code, reason = "位置解码将在标准翻译资产读取器实现后进入生产路径")]
+
 //! MZ 结构化位置的持久化编码。
 //!
 //! 数据库键使用规范 JSON，而不使用面向人类的 `Display` 文本。该格式
@@ -8,8 +10,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::super::document::StandardDataFile;
-use super::super::model::{MzLocation, MzLocationStep, MzSource};
+use super::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
 
 /// 在数据库中无损保存 `MzLocation` 的规范编解码器。
 pub(crate) struct MzLocationCodec;

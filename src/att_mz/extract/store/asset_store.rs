@@ -15,8 +15,8 @@ use crate::storage::sqlite::{
 };
 
 use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, RulesSnapshot, TextGroupKind};
-use super::location_codec::{MzLocationCodec, MzLocationCodecError};
 use super::{BuiltinSnapshotStore, RulesSnapshotStore};
+use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
 
 const OWNER_CONFLICT_CHECK: &str = "mz_extraction_owner_conflict";
 const STAGING_TABLE: &str = "att_mz_extraction_staging";
@@ -70,6 +70,14 @@ const CREATE_PLUGIN_PARAM_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS plugin_par
     translation    TEXT
 )"#;
 
+const CREATE_TERMINOLOGY_DEPENDENCY_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS translation_terminology_dependency (
+    asset_table      TEXT NOT NULL,
+    exact_location   TEXT NOT NULL,
+    term             TEXT NOT NULL,
+    term_translation TEXT NOT NULL,
+    PRIMARY KEY (asset_table, exact_location, term)
+)"#;
+
 const DROP_STAGING_TABLE: &str = "DROP TABLE IF EXISTS temp.att_mz_extraction_staging";
 const DROP_PREVIOUS_TABLE: &str = "DROP TABLE IF EXISTS temp.att_mz_extraction_previous";
 
@@ -85,15 +93,15 @@ const CREATE_STAGING_TABLE: &str = r#"CREATE TEMP TABLE att_mz_extraction_stagin
 )"#;
 
 const CREATE_PREVIOUS_TABLE: &str = r#"CREATE TEMP TABLE att_mz_extraction_previous AS
-SELECT exact_location, owner, original_text, translation FROM entry
+SELECT 'entry' AS target_table, exact_location, owner, original_text, translation FROM entry
 UNION ALL
-SELECT exact_location, owner, original_text, translation FROM system_text
+SELECT 'system_text', exact_location, owner, original_text, translation FROM system_text
 UNION ALL
-SELECT exact_location, owner, original_text, translation FROM map_text
+SELECT 'map_text', exact_location, owner, original_text, translation FROM map_text
 UNION ALL
-SELECT exact_location, owner, original_text, translation FROM text_body
+SELECT 'text_body', exact_location, owner, original_text, translation FROM text_body
 UNION ALL
-SELECT exact_location, owner, original_text, translation FROM plugin_param"#;
+SELECT 'plugin_param', exact_location, owner, original_text, translation FROM plugin_param"#;
 
 const INSERT_STAGING: &str = r#"INSERT INTO att_mz_extraction_staging (
     target_table,
@@ -120,6 +128,49 @@ SET translation = (
       AND previous.owner = att_mz_extraction_staging.owner
       AND previous.original_text = att_mz_extraction_staging.original_text
     LIMIT 1
+)"#;
+
+const MIGRATE_INHERITED_TERMINOLOGY_DEPENDENCIES: &str = r#"UPDATE translation_terminology_dependency
+SET asset_table = (
+    SELECT staged.target_table
+    FROM att_mz_extraction_previous AS previous
+    JOIN att_mz_extraction_staging AS staged
+      ON staged.exact_location = previous.exact_location
+     AND staged.owner = previous.owner
+     AND staged.original_text = previous.original_text
+    WHERE previous.target_table = translation_terminology_dependency.asset_table
+      AND previous.exact_location = translation_terminology_dependency.exact_location
+      AND staged.translation IS NOT NULL
+    LIMIT 1
+)
+WHERE EXISTS (
+    SELECT 1
+    FROM att_mz_extraction_previous AS previous
+    JOIN att_mz_extraction_staging AS staged
+      ON staged.exact_location = previous.exact_location
+     AND staged.owner = previous.owner
+     AND staged.original_text = previous.original_text
+    WHERE previous.target_table = translation_terminology_dependency.asset_table
+      AND previous.exact_location = translation_terminology_dependency.exact_location
+      AND staged.translation IS NOT NULL
+)"#;
+
+const DELETE_INVALIDATED_TERMINOLOGY_DEPENDENCIES: &str = r#"DELETE FROM translation_terminology_dependency
+WHERE EXISTS (
+    SELECT 1
+    FROM att_mz_extraction_previous AS previous
+    WHERE previous.target_table = translation_terminology_dependency.asset_table
+      AND previous.exact_location = translation_terminology_dependency.exact_location
+      AND previous.owner = ?
+      AND NOT EXISTS (
+          SELECT 1
+          FROM att_mz_extraction_staging AS staged
+          WHERE staged.target_table = previous.target_table
+            AND staged.exact_location = previous.exact_location
+            AND staged.owner = previous.owner
+            AND staged.original_text = previous.original_text
+            AND staged.translation IS NOT NULL
+      )
 )"#;
 
 const DELETE_OWNER_FROM_TABLES: [&str; 5] = [
@@ -476,6 +527,7 @@ fn build_transaction_plan(
         CREATE_MAP_TEXT_TABLE,
         CREATE_TEXT_BODY_TABLE,
         CREATE_PLUGIN_PARAM_TABLE,
+        CREATE_TERMINOLOGY_DEPENDENCY_TABLE,
         DROP_STAGING_TABLE,
         DROP_PREVIOUS_TABLE,
         CREATE_STAGING_TABLE,
@@ -496,6 +548,14 @@ fn build_transaction_plan(
         query: SqliteQuery::new(FIND_OWNER_CONFLICT, Vec::new()),
     });
     steps.push(execute(INHERIT_TRANSLATIONS, Vec::new()));
+    steps.push(execute(
+        MIGRATE_INHERITED_TERMINOLOGY_DEPENDENCIES,
+        Vec::new(),
+    ));
+    steps.push(execute(
+        DELETE_INVALIDATED_TERMINOLOGY_DEPENDENCIES,
+        vec![text(owner.as_str())],
+    ));
 
     for statement in DELETE_OWNER_FROM_TABLES {
         steps.push(execute(statement, vec![text(owner.as_str())]));
@@ -790,11 +850,21 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(table_definitions.len(), 5);
-        assert!(table_definitions.iter().all(|statement| {
+        assert_eq!(table_definitions.len(), 6);
+        let domain_tables = table_definitions
+            .iter()
+            .copied()
+            .filter(|statement| !statement.contains("translation_terminology_dependency"))
+            .collect::<Vec<_>>();
+        assert_eq!(domain_tables.len(), 5);
+        assert!(domain_tables.iter().all(|statement| {
             statement.contains("original_text")
                 && statement.contains("translation")
                 && !statement.contains(" status")
+        }));
+        assert!(table_definitions.iter().any(|statement| {
+            statement.contains("translation_terminology_dependency")
+                && statement.contains("PRIMARY KEY (asset_table, exact_location, term)")
         }));
         assert!(steps.iter().any(|step| {
             matches!(
@@ -803,6 +873,25 @@ mod tests {
                     if command.statement() == INHERIT_TRANSLATIONS
                         && command.statement().contains("previous.exact_location")
                         && command.statement().contains("previous.original_text")
+            )
+        }));
+        assert!(steps.iter().any(|step| {
+            matches!(
+                step,
+                SqliteTransactionStep::Execute(command)
+                    if command.statement() == MIGRATE_INHERITED_TERMINOLOGY_DEPENDENCIES
+                        && command.statement().contains("SET asset_table")
+                        && command.statement().contains("staged.translation IS NOT NULL")
+            )
+        }));
+        assert!(steps.iter().any(|step| {
+            matches!(
+                step,
+                SqliteTransactionStep::Execute(command)
+                    if command.statement() == DELETE_INVALIDATED_TERMINOLOGY_DEPENDENCIES
+                        && command.parameters() == [text("builtin")]
+                        && command.statement().contains("staged.original_text = previous.original_text")
+                        && command.statement().contains("staged.translation IS NOT NULL")
             )
         }));
     }

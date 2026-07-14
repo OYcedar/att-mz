@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -226,18 +226,38 @@ fn transaction_owner(plan: &SqliteTransactionPlan) -> &str {
 #[derive(Clone)]
 struct FakeTrustedLuaExecutionHost {
     events: Arc<Mutex<Vec<Event>>>,
-    invocations: Arc<Mutex<Vec<LuaInvocation>>>,
+    invocations: Arc<Mutex<Vec<RecordedLuaInvocation>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedLuaInvocation {
+    script_path: PathBuf,
+    project: crate::att_mz::lua::LuaProjectContext,
 }
 
 impl TrustedLuaExecutionHost for FakeTrustedLuaExecutionHost {
+    type TranslationProfile = ();
     type Error = FakeRootError;
 
-    async fn execute(&self, invocation: LuaInvocation) -> Result<(), Self::Error> {
+    async fn execute(
+        &self,
+        invocation: LuaInvocation<Self::TranslationProfile>,
+    ) -> Result<(), Self::Error> {
         self.events.lock().expect("事件锁不应中毒").push(Event::Lua);
+        let LuaInvocation::Extract {
+            script_path,
+            project,
+        } = invocation
+        else {
+            panic!("Extract 完整树不应提交 Translate Lua 调用")
+        };
         self.invocations
             .lock()
             .expect("Lua 调用锁不应中毒")
-            .push(invocation);
+            .push(RecordedLuaInvocation {
+                script_path,
+                project,
+            });
         Ok(())
     }
 }
@@ -342,8 +362,8 @@ async fn seven_root_fakes_drive_the_complete_non_root_extract_tree() {
     {
         let invocations = lua_invocations.lock().expect("Lua 调用锁不应中毒");
         assert_eq!(invocations.len(), 1);
-        assert_eq!(invocations[0].script_path(), Path::new("extract.lua"));
-        assert_eq!(invocations[0].project().name(), &output.name);
+        assert_eq!(invocations[0].script_path, PathBuf::from("extract.lua"));
+        assert_eq!(invocations[0].project.name(), &output.name);
     }
 
     events.lock().expect("事件锁不应中毒").clear();

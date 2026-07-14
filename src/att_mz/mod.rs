@@ -11,8 +11,11 @@ use clap::{Args, Parser, Subcommand};
 
 pub mod extract;
 pub mod init;
+pub(crate) mod location_codec;
+pub(crate) mod lua;
 pub(crate) mod project;
 mod project_name;
+pub(crate) mod text;
 pub mod translate;
 pub mod write_back;
 
@@ -121,6 +124,8 @@ where
                     .execute(TranslateInput {
                         name: arguments.project.name,
                         llm_id: arguments.llm_id,
+                        terminology_path: arguments.terms,
+                        placeholder_rules_path: arguments.placeholders,
                         lua_script: arguments.lua,
                     })
                     .await;
@@ -224,6 +229,16 @@ struct TranslateArguments {
     /// 配置文件中要使用的 LLM 配置 ID。
     #[arg(value_name = "LLM_ID", value_parser = parse_non_blank)]
     llm_id: String,
+    /// 本次标准翻译使用的术语表 JSON 文件。
+    #[arg(long, value_name = "TERMS_JSON", value_parser = parse_non_blank_path)]
+    terms: Option<PathBuf>,
+    /// 本次标准翻译使用的自定义占位符规则 JSON 文件。
+    #[arg(
+        long,
+        value_name = "PLACEHOLDERS_JSON",
+        value_parser = parse_non_blank_path
+    )]
+    placeholders: Option<PathBuf>,
     /// 使用可信 Lua 程序处理自由翻译数据。
     #[arg(long, value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
     lua: Option<PathBuf>,

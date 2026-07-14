@@ -13,7 +13,6 @@ use crate::att_mz::project::OpenedProject;
 use super::model::{BuiltinSnapshot, RulesSnapshot};
 
 pub(crate) mod asset_store;
-pub(crate) mod location_codec;
 
 /// 原子替换 Builtin 拥有的标准文本快照。
 ///

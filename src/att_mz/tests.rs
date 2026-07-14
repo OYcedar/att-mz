@@ -253,6 +253,21 @@ async fn extract_help_lists_all_combinable_task_options_without_calling_use_case
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn translate_help_lists_optional_input_files_without_calling_use_case() {
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let cli = cli(Arc::clone(&calls));
+
+    let (exit_code, stdout, stderr) = run(&cli, &["translate", "--help"]).await;
+
+    assert_eq!(exit_code, ExitCode::SUCCESS);
+    assert!(stdout.contains("--terms <TERMS_JSON>"));
+    assert!(stdout.contains("--placeholders <PLACEHOLDERS_JSON>"));
+    assert!(stdout.contains("--lua <SCRIPT_LUA>"));
+    assert!(stderr.is_empty());
+    assert_eq!(*calls.lock().expect("调用记录锁不应中毒"), Calls::default());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn init_dispatches_all_confirmed_inputs_to_init_only() {
     let calls = Arc::new(Mutex::new(Calls::default()));
     let cli = cli(Arc::clone(&calls));
@@ -419,6 +434,8 @@ async fn translate_dispatches_name_and_llm_id_to_async_use_case_only() {
             translate: vec![TranslateInput {
                 name: project_name("alice"),
                 llm_id: "deepseek".to_owned(),
+                terminology_path: None,
+                placeholder_rules_path: None,
                 lua_script: None,
             }],
             ..Calls::default()
@@ -427,33 +444,61 @@ async fn translate_dispatches_name_and_llm_id_to_async_use_case_only() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn translate_passes_optional_lua_script_without_changing_output() {
+async fn translate_passes_all_optional_paths_exactly_and_ignores_argument_order() {
     let calls = Arc::new(Mutex::new(Calls::default()));
     let cli = cli(Arc::clone(&calls));
 
-    let (exit_code, stdout, stderr) = run(
+    let (first_exit_code, first_stdout, first_stderr) = run(
         &cli,
         &[
             "translate",
             "--name",
             "alice",
             "deepseek",
+            "--placeholders",
+            ".\\rules\\placeholders custom.json",
             "--lua",
             "scripts\\translate custom.lua",
+            "--terms",
+            ".\\glossaries\\terms custom.json",
         ],
     )
     .await;
 
-    assert_eq!(exit_code, ExitCode::SUCCESS);
-    assert_eq!(stdout, "翻译完成：alice（LLM：deepseek）\n");
-    assert!(stderr.is_empty());
+    let (second_exit_code, second_stdout, second_stderr) = run(
+        &cli,
+        &[
+            "translate",
+            "--terms",
+            ".\\glossaries\\terms custom.json",
+            "--name",
+            "alice",
+            "--lua",
+            "scripts\\translate custom.lua",
+            "--placeholders",
+            ".\\rules\\placeholders custom.json",
+            "deepseek",
+        ],
+    )
+    .await;
+
+    assert_eq!(first_exit_code, ExitCode::SUCCESS);
+    assert_eq!(first_stdout, "翻译完成：alice（LLM：deepseek）\n");
+    assert!(first_stderr.is_empty());
+    assert_eq!(second_exit_code, ExitCode::SUCCESS);
+    assert_eq!(second_stdout, "翻译完成：alice（LLM：deepseek）\n");
+    assert!(second_stderr.is_empty());
+
+    let expected = TranslateInput {
+        name: project_name("alice"),
+        llm_id: "deepseek".to_owned(),
+        terminology_path: Some(PathBuf::from(".\\glossaries\\terms custom.json")),
+        placeholder_rules_path: Some(PathBuf::from(".\\rules\\placeholders custom.json")),
+        lua_script: Some(PathBuf::from("scripts\\translate custom.lua")),
+    };
     assert_eq!(
         calls.lock().expect("调用记录锁不应中毒").translate,
-        vec![TranslateInput {
-            name: project_name("alice"),
-            llm_id: "deepseek".to_owned(),
-            lua_script: Some(PathBuf::from("scripts\\translate custom.lua")),
-        }]
+        vec![expected.clone(), expected]
     );
 }
 
@@ -666,8 +711,20 @@ async fn translate_requires_a_non_blank_llm_id() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn translate_and_write_back_reject_blank_lua_paths() {
+async fn translate_and_write_back_reject_missing_or_blank_optional_paths() {
     for args in [
+        &["translate", "--name", "alice", "deepseek", "--terms"][..],
+        &["translate", "--name", "alice", "deepseek", "--placeholders"][..],
+        &["translate", "--name", "alice", "deepseek", "--lua"][..],
+        &["translate", "--name", "alice", "deepseek", "--terms", "   "][..],
+        &[
+            "translate",
+            "--name",
+            "alice",
+            "deepseek",
+            "--placeholders",
+            "   ",
+        ][..],
         &["translate", "--name", "alice", "deepseek", "--lua", "   "][..],
         &["write-back", "--name", "alice", "--lua", "   "][..],
     ] {

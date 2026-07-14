@@ -17,71 +17,9 @@ use futures_util::stream::{self, StreamExt};
 use serde_json::{Map, Value};
 
 use crate::att_mz::project::OpenedProject;
+pub(crate) use crate::att_mz::text::StandardDataFile;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
-
-/// RPG Maker MZ 在 `data/` 中定义的标准数据文件。
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum StandardDataFile {
-    Actors,
-    Animations,
-    Armors,
-    Classes,
-    CommonEvents,
-    Enemies,
-    Items,
-    MapInfos,
-    Skills,
-    States,
-    System,
-    Tilesets,
-    Troops,
-    Weapons,
-}
-
-impl StandardDataFile {
-    pub(crate) const ALL: [Self; 14] = [
-        Self::Actors,
-        Self::Animations,
-        Self::Armors,
-        Self::Classes,
-        Self::CommonEvents,
-        Self::Enemies,
-        Self::Items,
-        Self::MapInfos,
-        Self::Skills,
-        Self::States,
-        Self::System,
-        Self::Tilesets,
-        Self::Troops,
-        Self::Weapons,
-    ];
-
-    pub(crate) const fn file_name(self) -> &'static str {
-        match self {
-            Self::Actors => "Actors.json",
-            Self::Animations => "Animations.json",
-            Self::Armors => "Armors.json",
-            Self::Classes => "Classes.json",
-            Self::CommonEvents => "CommonEvents.json",
-            Self::Enemies => "Enemies.json",
-            Self::Items => "Items.json",
-            Self::MapInfos => "MapInfos.json",
-            Self::Skills => "Skills.json",
-            Self::States => "States.json",
-            Self::System => "System.json",
-            Self::Tilesets => "Tilesets.json",
-            Self::Troops => "Troops.json",
-            Self::Weapons => "Weapons.json",
-        }
-    }
-
-    pub(crate) fn from_file_name(value: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|candidate| candidate.file_name() == value)
-    }
-}
 
 /// 一个已加载文档的稳定身份。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
