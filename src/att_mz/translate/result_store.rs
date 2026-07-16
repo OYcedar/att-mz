@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
-use crate::att_mz::text::TextGroupKind;
+use crate::att_mz::standard_asset::{MzStandardAssetStorageKind, MzStandardAssetTable};
 use crate::project_database::StoredProjectRecord;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
@@ -324,42 +324,8 @@ impl Error for ResultStoragePlanError {
     }
 }
 
-#[derive(Clone, Copy)]
-enum AssetTable {
-    Entry,
-    SystemText,
-    MapText,
-    TextBody,
-    PluginParam,
-}
-
-impl AssetTable {
-    const fn for_kind(kind: TextGroupKind) -> Self {
-        match kind {
-            TextGroupKind::DatabaseEntry => Self::Entry,
-            TextGroupKind::System => Self::SystemText,
-            TextGroupKind::Map => Self::MapText,
-            TextGroupKind::EventDialogue
-            | TextGroupKind::EventChoices
-            | TextGroupKind::EventScrollingText
-            | TextGroupKind::EventCommand => Self::TextBody,
-            TextGroupKind::PluginParameter => Self::PluginParam,
-        }
-    }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Entry => "entry",
-            Self::SystemText => "system_text",
-            Self::MapText => "map_text",
-            Self::TextBody => "text_body",
-            Self::PluginParam => "plugin_param",
-        }
-    }
-}
-
 struct EncodedIdentity {
-    table: AssetTable,
+    table: MzStandardAssetTable,
     unit_type: Option<&'static str>,
     exact_location: String,
     group_location: String,
@@ -628,28 +594,16 @@ fn encode_patch_leaf_batch(
 fn encode_identity(
     identity: &TranslationLeafIdentity,
 ) -> Result<EncodedIdentity, ResultStoragePlanError> {
+    let storage = MzStandardAssetStorageKind::for_group_kind(identity.kind());
     Ok(EncodedIdentity {
-        table: AssetTable::for_kind(identity.kind()),
-        unit_type: unit_type_for_kind(identity.kind()),
+        table: storage.table(),
+        unit_type: storage.unit_type().map(|unit| unit.storage_name()),
         exact_location: MzLocationCodec::encode(identity.exact_location())
             .map_err(ResultStoragePlanError::Location)?,
         group_location: MzLocationCodec::encode(identity.group_location())
             .map_err(ResultStoragePlanError::Location)?,
         original_text: identity.original_text().to_owned(),
     })
-}
-
-const fn unit_type_for_kind(kind: TextGroupKind) -> Option<&'static str> {
-    match kind {
-        TextGroupKind::EventDialogue => Some("dialogue"),
-        TextGroupKind::EventChoices => Some("choices"),
-        TextGroupKind::EventScrollingText => Some("scrolling_text"),
-        TextGroupKind::EventCommand => Some("event_command"),
-        TextGroupKind::DatabaseEntry
-        | TextGroupKind::System
-        | TextGroupKind::Map
-        | TextGroupKind::PluginParameter => None,
-    }
 }
 
 fn normalize_dependencies(
@@ -724,18 +678,18 @@ fn ensure_unique_patches(
 }
 
 fn ensure_unique_leaf_keys<'a>(
-    keys: impl Iterator<Item = (&'a AssetTable, &'a str)>,
+    keys: impl Iterator<Item = (&'a MzStandardAssetTable, &'a str)>,
 ) -> Result<(), ResultStoragePlanError> {
     let mut seen = std::collections::BTreeSet::new();
     for (table, exact_location) in keys {
-        if !seen.insert((table.name(), exact_location)) {
+        if !seen.insert((table.storage_name(), exact_location)) {
             return Err(ResultStoragePlanError::DuplicateLeaf);
         }
     }
     Ok(())
 }
 
-fn identity_key(identity: &EncodedIdentity) -> (&AssetTable, &str) {
+fn identity_key(identity: &EncodedIdentity) -> (&MzStandardAssetTable, &str) {
     (&identity.table, identity.exact_location.as_str())
 }
 
@@ -789,14 +743,14 @@ fn build_preparation_plan(preparation: EncodedPreparation) -> SqliteTransactionP
         steps.push(execute(
             DELETE_TERMINOLOGY_DEPENDENCIES,
             vec![
-                text(invalidation.identity.table.name()),
+                text(invalidation.identity.table.storage_name()),
                 text(invalidation.identity.exact_location.clone()),
             ],
         ));
         steps.push(execute(
             &format!(
                 "UPDATE {} SET translation = NULL WHERE exact_location = ?",
-                invalidation.identity.table.name()
+                invalidation.identity.table.storage_name()
             ),
             vec![text(invalidation.identity.exact_location)],
         ));
@@ -808,14 +762,14 @@ fn build_preparation_plan(preparation: EncodedPreparation) -> SqliteTransactionP
             steps.push(execute(
                 DELETE_TERMINOLOGY_DEPENDENCIES,
                 vec![
-                    text(target.identity.table.name()),
+                    text(target.identity.table.storage_name()),
                     text(target.identity.exact_location.clone()),
                 ],
             ));
             steps.push(execute(
                 &format!(
                     "UPDATE {} SET translation = ? WHERE exact_location = ?",
-                    target.identity.table.name()
+                    target.identity.table.storage_name()
                 ),
                 vec![
                     text(reuse_plan.seed.expected_translation.clone()),
@@ -824,7 +778,7 @@ fn build_preparation_plan(preparation: EncodedPreparation) -> SqliteTransactionP
             ));
             for dependency in &reuse_plan.seed.expected_dependencies {
                 dependency_parameter_sets.push(vec![
-                    text(target.identity.table.name()),
+                    text(target.identity.table.storage_name()),
                     text(target.identity.exact_location.clone()),
                     text(dependency.term()),
                     text(dependency.translation()),
@@ -855,7 +809,7 @@ fn build_commit_plan(patches: Vec<EncodedPatch>) -> SqliteTransactionPlan {
         steps.push(execute(
             &format!(
                 "UPDATE {} SET translation = ? WHERE exact_location = ?",
-                patch.identity.table.name()
+                patch.identity.table.storage_name()
             ),
             vec![
                 text(patch.translation),
@@ -864,7 +818,7 @@ fn build_commit_plan(patches: Vec<EncodedPatch>) -> SqliteTransactionPlan {
         ));
         for dependency in patch.dependencies {
             dependency_parameter_sets.push(vec![
-                text(patch.identity.table.name()),
+                text(patch.identity.table.storage_name()),
                 text(patch.identity.exact_location.clone()),
                 text(dependency.term()),
                 text(dependency.translation()),
@@ -904,11 +858,11 @@ fn snapshot_stale_query(
         "\n      AND translation IS NULL"
     };
     parameters.extend([
-        text(identity.table.name()),
+        text(identity.table.storage_name()),
         text(identity.exact_location.clone()),
     ]);
     parameters.extend([
-        text(identity.table.name()),
+        text(identity.table.storage_name()),
         text(identity.exact_location.clone()),
     ]);
     SqliteQuery::new(
@@ -938,7 +892,7 @@ OR EXISTS (
     FROM {dependency_table}
     WHERE asset_table = ? AND exact_location = ?
 )"#,
-            asset_table = identity.table.name(),
+            asset_table = identity.table.storage_name(),
             dependency_table = TERMINOLOGY_DEPENDENCY_TABLE,
         ),
         parameters,
@@ -959,7 +913,7 @@ fn commit_stale_query(patch: &EncodedPatch) -> SqliteQuery {
         ""
     };
     parameters.extend([
-        text(identity.table.name()),
+        text(identity.table.storage_name()),
         text(identity.exact_location.clone()),
     ]);
     SqliteQuery::new(
@@ -979,7 +933,7 @@ OR EXISTS (
     FROM {dependency_table}
     WHERE asset_table = ? AND exact_location = ?
 )"#,
-            asset_table = identity.table.name(),
+            asset_table = identity.table.storage_name(),
             dependency_table = TERMINOLOGY_DEPENDENCY_TABLE,
         ),
         parameters,
@@ -1049,7 +1003,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::att_mz::ProjectName;
-    use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
+    use crate::att_mz::text::{
+        MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
+    };
 
     use super::super::standard::{
         StandardTranslationTaskIndex, TranslationReuseSeed, TranslationReuseTarget,

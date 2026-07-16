@@ -32,6 +32,7 @@ pub(crate) enum MzDocumentId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MzDocumentSelection {
     standard_files: BTreeSet<StandardDataFile>,
+    map_ids: BTreeSet<u32>,
     all_maps: bool,
     plugins: bool,
 }
@@ -44,6 +45,7 @@ impl MzDocumentSelection {
     ) -> Self {
         Self {
             standard_files: standard_files.into_iter().collect(),
+            map_ids: BTreeSet::new(),
             all_maps,
             plugins,
         }
@@ -61,6 +63,11 @@ impl MzDocumentSelection {
         self.all_maps = true;
     }
 
+    /// 请求一个已由结构化位置确定的精确 Map 文档，不触发目录枚举。
+    pub(crate) fn insert_map(&mut self, map_id: u32) {
+        self.map_ids.insert(map_id);
+    }
+
     pub(crate) fn request_plugins(&mut self) {
         self.plugins = true;
     }
@@ -73,12 +80,16 @@ impl MzDocumentSelection {
         self.all_maps
     }
 
+    pub(crate) fn map_ids(&self) -> &BTreeSet<u32> {
+        &self.map_ids
+    }
+
     pub(crate) fn includes_plugins(&self) -> bool {
         self.plugins
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.standard_files.is_empty() && !self.all_maps && !self.plugins
+        self.standard_files.is_empty() && self.map_ids.is_empty() && !self.all_maps && !self.plugins
     }
 }
 
@@ -103,6 +114,10 @@ impl PluginConfiguration {
 
     pub(crate) fn fields(&self) -> &Map<String, Value> {
         &self.fields
+    }
+
+    pub(crate) fn into_parts(self) -> (usize, Map<String, Value>) {
+        (self.index, self.fields)
     }
 }
 
@@ -300,6 +315,12 @@ where
         let mut documents = BTreeMap::new();
         for file in selection.standard_files() {
             documents.insert(MzDocumentId::Data(*file), data_root.join(file.file_name()));
+        }
+        for map_id in selection.map_ids() {
+            documents.insert(
+                MzDocumentId::Map(*map_id),
+                data_root.join(format!("Map{map_id:03}.json")),
+            );
         }
 
         if selection.includes_all_maps() {
@@ -698,6 +719,35 @@ var $plugins =
         assert_eq!(documents.plugins()[0].index(), 0);
         assert_eq!(documents.plugins()[0].fields()["status"], false);
         assert_eq!(documents.plugins()[0].fields()["future"]["kept"], true);
+    }
+
+    #[tokio::test]
+    async fn exact_map_selection_reads_only_that_map_without_listing_data() {
+        let root = project().source_root().to_path_buf();
+        let map = root.join("data").join("Map042.json");
+        let harness = Harness::new(
+            HashMap::from([(map, r#"{"displayName":"精确地图"}"#.as_bytes().to_vec())]),
+            Vec::new(),
+            1,
+            1,
+        );
+        let mut selection = MzDocumentSelection::empty();
+        selection.insert_map(42);
+
+        let documents = harness
+            .service()
+            .read(&project(), selection)
+            .await
+            .expect("精确 Map 选择应该成功");
+
+        assert_eq!(harness.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.file_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            documents
+                .document(MzDocumentId::Map(42))
+                .expect("Map042 应被读取")["displayName"],
+            "精确地图"
+        );
     }
 
     #[tokio::test]

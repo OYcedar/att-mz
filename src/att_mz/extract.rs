@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use super::ProjectName;
 
 mod builtin;
-mod document;
+pub(crate) mod document;
 mod lua;
 mod model;
 mod rules;

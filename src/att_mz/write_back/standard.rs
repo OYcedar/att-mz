@@ -1,5 +1,13 @@
 //! 从数据库译文规划并发布 Standard MZ 写回的业务编排。
 
+mod layout;
+
+#[allow(
+    unused_imports,
+    reason = "布局实现属于本批生产组合根尚未接线的 WriteBack 非根能力"
+)]
+pub(crate) use layout::ConservativeMzWriteBackTextLayouter;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -856,6 +864,19 @@ pub(crate) struct SetTextMutation {
 }
 
 impl SetTextMutation {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        exact_location: MzLocation,
+        expected_original: impl Into<String>,
+        replacement: impl Into<String>,
+    ) -> Self {
+        Self {
+            exact_location,
+            expected_original: expected_original.into(),
+            replacement: replacement.into(),
+        }
+    }
+
     fn from_leaf(leaf: StandardWriteBackLeaf, replacement: String) -> Self {
         Self {
             exact_location: leaf.exact_location,
@@ -902,6 +923,31 @@ pub(crate) struct EventBodyMutationSegment {
 }
 
 impl EventBodyMutationSegment {
+    #[cfg(test)]
+    pub(crate) fn keep_for_test(
+        exact_location: MzLocation,
+        expected_original: impl Into<String>,
+    ) -> Self {
+        Self {
+            exact_location,
+            expected_original: expected_original.into(),
+            action: EventBodyMutationAction::KeepOriginal,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_for_test(
+        exact_location: MzLocation,
+        expected_original: impl Into<String>,
+        lines: Vec<String>,
+    ) -> Self {
+        Self {
+            exact_location,
+            expected_original: expected_original.into(),
+            action: EventBodyMutationAction::ReplaceWithLines(lines),
+        }
+    }
+
     fn keep_original(leaf: StandardWriteBackLeaf) -> Self {
         Self {
             exact_location: leaf.exact_location,
@@ -941,7 +987,7 @@ pub(crate) struct ReplaceEventBodyMutation {
 }
 
 impl ReplaceEventBodyMutation {
-    fn new(
+    pub(crate) fn new(
         kind: EventBodyKind,
         group_location: MzLocation,
         segments: Vec<EventBodyMutationSegment>,

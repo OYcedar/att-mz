@@ -18,6 +18,7 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
 use crate::att_mz::project::OpenedProject;
+use crate::att_mz::tag::simple_tag_spans;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{FileReader, ReadFileError};
 
@@ -1936,18 +1937,18 @@ fn scan_notes(
                     .iter()
                     .map(|rule| (rule.tag_name.as_str(), rule))
                     .collect::<BTreeMap<_, _>>();
-                for tag in parse_simple_tags(text) {
-                    let Some(rule) = selected.get(tag.name.as_str()) else {
+                for tag in simple_tag_spans(text) {
+                    let Some(rule) = selected.get(tag.name()) else {
                         continue;
                     };
-                    if tag.value.trim().is_empty() {
+                    if tag.value().trim().is_empty() {
                         continue;
                     }
                     let exact_location = MzLocation::note_tag(
                         source.clone(),
                         steps.clone(),
-                        &tag.name,
-                        tag.occurrence,
+                        tag.name(),
+                        tag.occurrence(),
                     );
                     let group_location = MzLocation::value(source.clone(), steps.clone());
                     let descriptor = &definition.descriptors[rule.id];
@@ -1956,7 +1957,7 @@ fn scan_notes(
                         group_location,
                         &descriptor.field_name,
                         exact_location,
-                        &tag.value,
+                        tag.value(),
                         &descriptor.label,
                     )?;
                     matches.increment(rule.id);
@@ -1986,40 +1987,6 @@ fn scan_notes(
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
     Ok(())
-}
-
-struct SimpleTag {
-    name: String,
-    value: String,
-    occurrence: usize,
-}
-
-fn parse_simple_tags(text: &str) -> Vec<SimpleTag> {
-    let mut result = Vec::new();
-    let mut occurrences = BTreeMap::<String, usize>::new();
-    let mut remaining = text;
-    while let Some(open) = remaining.find('<') {
-        remaining = &remaining[open + 1..];
-        let Some(close) = remaining.find('>') else {
-            break;
-        };
-        let body = &remaining[..close];
-        remaining = &remaining[close + 1..];
-        let Some((name, value)) = body.split_once(':') else {
-            continue;
-        };
-        if name.is_empty() {
-            continue;
-        }
-        let occurrence = occurrences.entry(name.to_owned()).or_default();
-        result.push(SimpleTag {
-            name: name.to_owned(),
-            value: value.to_owned(),
-            occurrence: *occurrence,
-        });
-        *occurrence += 1;
-    }
-    result
 }
 
 fn extract_event_rules(
@@ -2363,11 +2330,11 @@ fn extract_comment_block(
         .collect::<BTreeMap<_, _>>();
     let mut command_steps = list_steps.to_vec();
     command_steps.push(MzLocationStep::index(start_index));
-    for tag in parse_simple_tags(&text) {
-        let Some(rule) = selected.get(tag.name.as_str()) else {
+    for tag in simple_tag_spans(&text) {
+        let Some(rule) = selected.get(tag.name()) else {
             continue;
         };
-        if tag.value.trim().is_empty() {
+        if tag.value().trim().is_empty() {
             continue;
         }
         let descriptor = &definition.descriptors[rule.id];
@@ -2378,10 +2345,10 @@ fn extract_comment_block(
             MzLocation::comment_tag(
                 source.clone(),
                 command_steps.clone(),
-                &tag.name,
-                tag.occurrence,
+                tag.name(),
+                tag.occurrence(),
             ),
-            &tag.value,
+            tag.value(),
             &descriptor.label,
         )?;
         matches.increment(rule.id);

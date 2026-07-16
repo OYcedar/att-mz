@@ -10,7 +10,14 @@ use std::path::{Path, PathBuf};
 use super::ProjectName;
 use super::project::{ExistingProjectOpener, MzWriteBackLayoutProfile, OpenedProject};
 
+pub(crate) mod asset_reader;
+pub(crate) mod lua;
+pub(crate) mod publisher;
+pub(crate) mod rewriter;
 pub(crate) mod standard;
+
+#[cfg(test)]
+mod full_tree_tests;
 
 /// 写回指定 MZ 项目所需的输入。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +73,8 @@ pub trait WriteBackUseCase: Send + Sync {
 /// 失败而回滚它。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublishedWriteBack {
+    project_name: ProjectName,
+    workspace_root: PathBuf,
     output_root: PathBuf,
 }
 
@@ -75,8 +84,24 @@ impl PublishedWriteBack {
     /// 输出位置只能来自受信项目上下文，调用方不能用任意路径伪造已发布结果。
     pub(crate) fn new(project: &OpenedProject) -> Self {
         Self {
+            project_name: project.name().clone(),
+            workspace_root: project.workspace_root().to_path_buf(),
             output_root: project.write_back_root().to_path_buf(),
         }
+    }
+
+    pub(crate) fn belongs_to(&self, project: &OpenedProject) -> bool {
+        self.project_name == *project.name()
+            && self.workspace_root == project.workspace_root()
+            && self.output_root == project.write_back_root()
+    }
+
+    pub(crate) fn project_name(&self) -> &ProjectName {
+        &self.project_name
+    }
+
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 
     pub(crate) fn output_root(&self) -> &Path {

@@ -5,7 +5,7 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// 解析现存目录时可能发生的失败。
 #[derive(Debug)]
@@ -203,4 +203,342 @@ pub(crate) trait FileReader: Send + Sync {
         &self,
         path: PathBuf,
     ) -> impl Future<Output = Result<ReadFile, ReadFileError<Self::Error>>> + Send;
+}
+
+/// 完整目录快照中的一棵冻结来源子树。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectorySnapshotSourceMapping {
+    source_directory: PathBuf,
+    relative_target: PathBuf,
+}
+
+impl DirectorySnapshotSourceMapping {
+    /// 建立一项“来源目录 → 快照内相对目录”映射。
+    pub(crate) fn new(
+        source_directory: PathBuf,
+        relative_target: PathBuf,
+    ) -> Result<Self, DirectorySnapshotPublishRequestError> {
+        if source_directory.as_os_str().is_empty() {
+            return Err(DirectorySnapshotPublishRequestError::EmptySourceDirectory);
+        }
+        validate_snapshot_relative_path(&relative_target)?;
+        Ok(Self {
+            source_directory,
+            relative_target,
+        })
+    }
+
+    pub(crate) fn source_directory(&self) -> &Path {
+        &self.source_directory
+    }
+
+    pub(crate) fn relative_target(&self) -> &Path {
+        &self.relative_target
+    }
+}
+
+/// 覆盖完整目录快照中一个相对文件的确定字节。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectorySnapshotFileOverlay {
+    relative_file: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl DirectorySnapshotFileOverlay {
+    pub(crate) fn new(
+        relative_file: PathBuf,
+        bytes: Vec<u8>,
+    ) -> Result<Self, DirectorySnapshotPublishRequestError> {
+        validate_snapshot_relative_path(&relative_file)?;
+        Ok(Self {
+            relative_file,
+            bytes,
+        })
+    }
+
+    pub(crate) fn relative_file(&self) -> &Path {
+        &self.relative_file
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// 一次完整目录快照原子发布请求。
+///
+/// 请求只描述业务要发布的目标、冻结来源子树和文件覆盖；暂存目录、复制策略、
+/// 交换恢复、取消清理及资源背压全部属于根实现。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectorySnapshotPublishRequest {
+    target_root: PathBuf,
+    source_mappings: Vec<DirectorySnapshotSourceMapping>,
+    overlays: Vec<DirectorySnapshotFileOverlay>,
+}
+
+impl DirectorySnapshotPublishRequest {
+    pub(crate) fn new(
+        target_root: PathBuf,
+        source_mappings: Vec<DirectorySnapshotSourceMapping>,
+        overlays: Vec<DirectorySnapshotFileOverlay>,
+    ) -> Result<Self, DirectorySnapshotPublishRequestError> {
+        if target_root.as_os_str().is_empty() {
+            return Err(DirectorySnapshotPublishRequestError::EmptyTargetRoot);
+        }
+        if source_mappings.is_empty() {
+            return Err(DirectorySnapshotPublishRequestError::EmptySourceMappings);
+        }
+
+        for (index, mapping) in source_mappings.iter().enumerate() {
+            for other in source_mappings.iter().skip(index + 1) {
+                if paths_overlap(mapping.relative_target(), other.relative_target()) {
+                    return Err(DirectorySnapshotPublishRequestError::OverlappingTargets {
+                        first: mapping.relative_target().to_path_buf(),
+                        second: other.relative_target().to_path_buf(),
+                    });
+                }
+            }
+        }
+
+        for (index, overlay) in overlays.iter().enumerate() {
+            for other in overlays.iter().skip(index + 1) {
+                if paths_overlap(overlay.relative_file(), other.relative_file()) {
+                    return Err(DirectorySnapshotPublishRequestError::OverlappingOverlays {
+                        first: overlay.relative_file().to_path_buf(),
+                        second: other.relative_file().to_path_buf(),
+                    });
+                }
+            }
+            if !source_mappings.iter().any(|mapping| {
+                overlay
+                    .relative_file()
+                    .starts_with(mapping.relative_target())
+                    && overlay.relative_file() != mapping.relative_target()
+            }) {
+                return Err(
+                    DirectorySnapshotPublishRequestError::OverlayOutsideSourceMappings {
+                        relative_file: overlay.relative_file().to_path_buf(),
+                    },
+                );
+            }
+        }
+
+        Ok(Self {
+            target_root,
+            source_mappings,
+            overlays,
+        })
+    }
+
+    pub(crate) fn target_root(&self) -> &Path {
+        &self.target_root
+    }
+
+    pub(crate) fn source_mappings(&self) -> &[DirectorySnapshotSourceMapping] {
+        &self.source_mappings
+    }
+
+    pub(crate) fn overlays(&self) -> &[DirectorySnapshotFileOverlay] {
+        &self.overlays
+    }
+}
+
+fn validate_snapshot_relative_path(
+    path: &Path,
+) -> Result<(), DirectorySnapshotPublishRequestError> {
+    if path.as_os_str().is_empty()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::Prefix(_)
+                    | Component::RootDir
+                    | Component::ParentDir
+                    | Component::CurDir
+            )
+        })
+    {
+        return Err(DirectorySnapshotPublishRequestError::InvalidRelativePath {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn paths_overlap(first: &Path, second: &Path) -> bool {
+    first == second || first.starts_with(second) || second.starts_with(first)
+}
+
+/// 目录快照请求尚未到达根实现前发现的契约错误。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DirectorySnapshotPublishRequestError {
+    EmptyTargetRoot,
+    EmptySourceDirectory,
+    EmptySourceMappings,
+    InvalidRelativePath { path: PathBuf },
+    OverlappingTargets { first: PathBuf, second: PathBuf },
+    OverlappingOverlays { first: PathBuf, second: PathBuf },
+    OverlayOutsideSourceMappings { relative_file: PathBuf },
+}
+
+impl fmt::Display for DirectorySnapshotPublishRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyTargetRoot => write!(formatter, "目录快照目标根目录不能为空"),
+            Self::EmptySourceDirectory => write!(formatter, "目录快照来源目录不能为空"),
+            Self::EmptySourceMappings => write!(formatter, "目录快照至少需要一棵来源子树"),
+            Self::InvalidRelativePath { path } => {
+                write!(
+                    formatter,
+                    "目录快照路径不是安全相对路径：{}",
+                    path.display()
+                )
+            }
+            Self::OverlappingTargets { first, second } => write!(
+                formatter,
+                "目录快照目标子树相互重叠：{} 与 {}",
+                first.display(),
+                second.display()
+            ),
+            Self::OverlappingOverlays { first, second } => write!(
+                formatter,
+                "目录快照文件覆盖相互重叠：{} 与 {}",
+                first.display(),
+                second.display()
+            ),
+            Self::OverlayOutsideSourceMappings { relative_file } => write!(
+                formatter,
+                "目录快照文件覆盖不属于任何来源子树：{}",
+                relative_file.display()
+            ),
+        }
+    }
+}
+
+impl Error for DirectorySnapshotPublishRequestError {}
+
+/// 根实现无法完成一次原子目录快照发布时的终态。
+#[derive(Debug)]
+pub(crate) enum AtomicDirectorySnapshotPublishError<E> {
+    /// 新快照没有成为目标，调用方可继续信任旧完整输出。
+    NotPublished { source: E },
+    /// 目录交换或恢复发生二次故障，根实现无法确认目标目前是哪一份完整输出。
+    OutcomeUnknown { target_root: PathBuf, source: E },
+}
+
+impl<E> fmt::Display for AtomicDirectorySnapshotPublishError<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPublished { source } => write!(formatter, "目录快照未发布：{source}"),
+            Self::OutcomeUnknown {
+                target_root,
+                source,
+            } => write!(
+                formatter,
+                "目录快照发布结果未知（目标：{}）：{source}",
+                target_root.display()
+            ),
+        }
+    }
+}
+
+impl<E> Error for AtomicDirectorySnapshotPublishError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::NotPublished { source } | Self::OutcomeUnknown { source, .. } => Some(source),
+        }
+    }
+}
+
+/// 原子发布一份完整目录快照的环境根能力。
+///
+/// 成功意味着请求中的所有来源子树与文件覆盖已经共同成为 `target_root` 的唯一
+/// 可见完整版本。根实现必须在目标同级暂存、限制递归复制资源、不跟随越界符号链接
+/// 或 reparse point，并在取消或失败时清理暂存物。
+pub(crate) trait AtomicDirectorySnapshotPublisher: Send + Sync {
+    type Error: Error + Send + Sync + 'static;
+
+    fn publish_snapshot(
+        &self,
+        request: DirectorySnapshotPublishRequest,
+    ) -> impl Future<Output = Result<(), AtomicDirectorySnapshotPublishError<Self::Error>>> + Send;
+}
+
+#[cfg(test)]
+mod directory_snapshot_tests {
+    use super::*;
+
+    fn mapping(source: &str, target: &str) -> DirectorySnapshotSourceMapping {
+        DirectorySnapshotSourceMapping::new(PathBuf::from(source), PathBuf::from(target))
+            .expect("测试来源映射应该合法")
+    }
+
+    fn overlay(path: &str) -> DirectorySnapshotFileOverlay {
+        DirectorySnapshotFileOverlay::new(PathBuf::from(path), vec![1, 2, 3])
+            .expect("测试文件覆盖应该合法")
+    }
+
+    #[test]
+    fn snapshot_request_keeps_validated_sources_and_overlays() {
+        let request = DirectorySnapshotPublishRequest::new(
+            PathBuf::from("C:/projects/demo/write_back"),
+            vec![
+                mapping("C:/projects/demo/source/data", "data"),
+                mapping("C:/projects/demo/source/js", "js"),
+            ],
+            vec![overlay("data/Items.json"), overlay("js/plugins.js")],
+        )
+        .expect("标准写回快照请求应该合法");
+
+        assert_eq!(
+            request.target_root(),
+            Path::new("C:/projects/demo/write_back")
+        );
+        assert_eq!(request.source_mappings().len(), 2);
+        assert_eq!(request.overlays().len(), 2);
+        assert_eq!(request.overlays()[0].bytes(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn snapshot_paths_reject_escape_absolute_duplicate_and_overlap() {
+        for path in ["", "../data", "data/../js", "C:/outside"] {
+            assert!(matches!(
+                DirectorySnapshotFileOverlay::new(PathBuf::from(path), Vec::new()),
+                Err(DirectorySnapshotPublishRequestError::InvalidRelativePath { .. })
+            ));
+        }
+
+        assert!(matches!(
+            DirectorySnapshotPublishRequest::new(
+                PathBuf::from("out"),
+                vec![
+                    mapping("source/data", "data"),
+                    mapping("source/maps", "data/maps")
+                ],
+                Vec::new(),
+            ),
+            Err(DirectorySnapshotPublishRequestError::OverlappingTargets { .. })
+        ));
+        assert!(matches!(
+            DirectorySnapshotPublishRequest::new(
+                PathBuf::from("out"),
+                vec![mapping("source/data", "data")],
+                vec![overlay("data/Items.json"), overlay("data/Items.json")],
+            ),
+            Err(DirectorySnapshotPublishRequestError::OverlappingOverlays { .. })
+        ));
+        assert!(matches!(
+            DirectorySnapshotPublishRequest::new(
+                PathBuf::from("out"),
+                vec![mapping("source/data", "data")],
+                vec![overlay("js/plugins.js")],
+            ),
+            Err(DirectorySnapshotPublishRequestError::OverlayOutsideSourceMappings { .. })
+        ));
+    }
 }

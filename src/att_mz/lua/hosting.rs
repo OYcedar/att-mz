@@ -64,16 +64,20 @@ where
         &self,
         invocation: LuaInvocation<Self::TranslationProfile>,
     ) -> Result<(), Self::Error> {
-        let (script_path, project, profile) = match invocation {
+        let (phase, script_path, project, profile) = match invocation {
             LuaInvocation::Extract {
                 script_path,
                 project,
-            } => (script_path, project, None),
+            } => (LuaPhase::Extract, script_path, project, None),
             LuaInvocation::Translate {
                 script_path,
                 project,
                 profile,
-            } => (script_path, project, Some(profile)),
+            } => (LuaPhase::Translate, script_path, project, Some(profile)),
+            LuaInvocation::WriteBack {
+                script_path,
+                project,
+            } => (LuaPhase::WriteBack, script_path, project, None),
         };
 
         let requested_script_path = script_path.clone();
@@ -101,11 +105,7 @@ where
             })?;
 
         let bindings = Arc::new(LuaHostBindings {
-            phase: if profile.is_some() {
-                LuaPhase::Translate
-            } else {
-                LuaPhase::Extract
-            },
+            phase,
             project,
             profile,
             session,
@@ -247,7 +247,7 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Database(source) => write!(formatter, "Lua 数据库调用失败：{source}"),
-            Self::LlmUnavailable => formatter.write_str("Extract 阶段没有 ctx.llm"),
+            Self::LlmUnavailable => formatter.write_str("当前 Lua 阶段没有 ctx.llm"),
             Self::LlmRequest(source) => write!(formatter, "Lua LLM 调用失败：{source}"),
             Self::Cleanup(source) => source.fmt(formatter),
         }
@@ -423,6 +423,7 @@ mod tests {
             script_path: PathBuf,
             phase: LuaPhase,
             project_name: String,
+            output_root: Option<PathBuf>,
         },
         Llm(Vec<ChatMessage>),
         Begin,
@@ -628,6 +629,7 @@ mod tests {
                     script_path: program.main_script_path().to_path_buf(),
                     phase: bindings.phase(),
                     project_name: bindings.project().name().as_str().to_owned(),
+                    output_root: bindings.project().output_root().map(Path::to_path_buf),
                 });
             assert_eq!(program.source(), b"return true");
 
@@ -724,6 +726,21 @@ mod tests {
         ))
     }
 
+    fn write_back_project() -> LuaProjectContext {
+        let project = crate::att_mz::project::OpenedProject::new(
+            "alice".parse::<ProjectName>().expect("项目名应合法"),
+            PathBuf::from("C:/projects/alice"),
+            PathBuf::from("C:/projects/alice/project.db"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
+        );
+        LuaProjectContext::for_published_write_back(
+            &project,
+            PathBuf::from("C:/projects/alice/write_back"),
+        )
+    }
+
     fn profile() -> Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<String>>> {
         let pair = TranslationProfileLanguagePair::new("ja", "zh-Hans").expect("语言对应合法");
         Arc::new(TranslationExecutionProfile::new(
@@ -771,6 +788,7 @@ mod tests {
                 script_path,
                 phase: LuaPhase::Translate,
                 project_name,
+                output_root: None,
             } if script_path == Path::new("C:/resolved/scripts/translate.lua") && project_name == "alice"
         ));
         assert!(matches!(&events[3], Event::Llm(messages) if messages.len() == 1));
@@ -883,6 +901,39 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Llm(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn write_back_phase_exposes_output_but_not_llm_and_still_closes_database() {
+        let harness = harness(RuntimeBehavior::RequestLlmWithoutProfile, false);
+
+        let error = harness
+            .service
+            .execute(LuaInvocation::write_back(
+                PathBuf::from("write.lua"),
+                write_back_project(),
+            ))
+            .await
+            .expect_err("WriteBack 的 ctx.llm 调用必须失败");
+
+        assert!(matches!(
+            error,
+            TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Binding(
+                LuaHostBindingError::LlmUnavailable
+            ))
+        ));
+        let events = harness.events.lock().expect("事件锁不应中毒").clone();
+        assert!(matches!(
+            &events[2],
+            Event::Runtime {
+                phase: LuaPhase::WriteBack,
+                output_root: Some(output_root),
+                ..
+            } if output_root == Path::new("C:/projects/alice/write_back")
+        ));
+        assert!(!events.iter().any(|event| matches!(event, Event::Llm(_))));
+        assert!(events.ends_with(&[Event::Inspect, Event::Close]));
+        assert!(harness.state.lock().expect("会话锁不应中毒").closed);
     }
 
     #[test]

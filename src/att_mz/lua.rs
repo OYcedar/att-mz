@@ -15,14 +15,43 @@ pub(crate) mod hosting;
 pub(crate) mod runtime;
 pub(crate) mod session;
 
+/// 可信 Lua 在当前阶段能够访问的项目文件边界。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LuaProjectFileAccess {
+    /// Extract 与 Translate 只接收 Init 冻结的 `source/data`、`source/js`。
+    FrozenSource { source_root: PathBuf },
+    /// WriteBack 同时接收冻结来源和已经发布的固定最新输出。
+    PublishedWriteBack {
+        source_root: PathBuf,
+        output_root: PathBuf,
+    },
+}
+
+impl LuaProjectFileAccess {
+    pub(crate) fn source_root(&self) -> &Path {
+        match self {
+            Self::FrozenSource { source_root } | Self::PublishedWriteBack { source_root, .. } => {
+                source_root
+            }
+        }
+    }
+
+    pub(crate) fn output_root(&self) -> Option<&Path> {
+        match self {
+            Self::FrozenSource { .. } => None,
+            Self::PublishedWriteBack { output_root, .. } => Some(output_root),
+        }
+    }
+}
+
 /// 交给可信 Lua 程序的项目事实快照。
 ///
-/// `source_root` 始终指向 Init 导入到项目工作区的冻结 MZ 根，其中包含完整的
-/// `data/` 与 `js/`。原游戏目录不是后续阶段的权威事实，Host 也不会重新访问它。
+/// 冻结来源始终来自 Init 项目工作区；原游戏目录不是后续阶段的权威事实。只有
+/// WriteBack 变体能够看到已经发布的 `output_root`，Extract/Translate 不携带它。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LuaProjectContext {
     name: ProjectName,
-    source_root: PathBuf,
+    file_access: LuaProjectFileAccess,
     database_path: PathBuf,
     source_language: String,
     target_language: String,
@@ -32,7 +61,9 @@ impl LuaProjectContext {
     pub(crate) fn from_opened_project(project: &OpenedProject) -> Self {
         Self {
             name: project.name().clone(),
-            source_root: project.source_root().to_path_buf(),
+            file_access: LuaProjectFileAccess::FrozenSource {
+                source_root: project.source_root().to_path_buf(),
+            },
             database_path: project.database_path().to_path_buf(),
             source_language: project.source_language().to_owned(),
             target_language: project.target_language().to_owned(),
@@ -42,7 +73,22 @@ impl LuaProjectContext {
     pub(crate) fn from_stored_record(project: &StoredProjectRecord) -> Self {
         Self {
             name: project.name().clone(),
-            source_root: project.source_root().to_path_buf(),
+            file_access: LuaProjectFileAccess::FrozenSource {
+                source_root: project.source_root().to_path_buf(),
+            },
+            database_path: project.database_path().to_path_buf(),
+            source_language: project.source_language().to_owned(),
+            target_language: project.target_language().to_owned(),
+        }
+    }
+
+    pub(crate) fn for_published_write_back(project: &OpenedProject, output_root: PathBuf) -> Self {
+        Self {
+            name: project.name().clone(),
+            file_access: LuaProjectFileAccess::PublishedWriteBack {
+                source_root: project.source_root().to_path_buf(),
+                output_root,
+            },
             database_path: project.database_path().to_path_buf(),
             source_language: project.source_language().to_owned(),
             target_language: project.target_language().to_owned(),
@@ -54,7 +100,15 @@ impl LuaProjectContext {
     }
 
     pub(crate) fn source_root(&self) -> &Path {
-        &self.source_root
+        self.file_access.source_root()
+    }
+
+    pub(crate) fn output_root(&self) -> Option<&Path> {
+        self.file_access.output_root()
+    }
+
+    pub(crate) fn file_access(&self) -> &LuaProjectFileAccess {
+        &self.file_access
     }
 
     pub(crate) fn database_path(&self) -> &Path {
@@ -75,6 +129,7 @@ impl LuaProjectContext {
 pub(crate) enum LuaPhase {
     Extract,
     Translate,
+    WriteBack,
 }
 
 /// 交给可信 Lua Host 的一次完整调用。
@@ -91,6 +146,10 @@ pub(crate) enum LuaInvocation<P> {
         script_path: PathBuf,
         project: LuaProjectContext,
         profile: Arc<P>,
+    },
+    WriteBack {
+        script_path: PathBuf,
+        project: LuaProjectContext,
     },
 }
 
@@ -114,28 +173,40 @@ impl<P> LuaInvocation<P> {
         }
     }
 
+    pub(crate) fn write_back(script_path: PathBuf, project: LuaProjectContext) -> Self {
+        Self::WriteBack {
+            script_path,
+            project,
+        }
+    }
+
     pub(crate) fn phase(&self) -> LuaPhase {
         match self {
             Self::Extract { .. } => LuaPhase::Extract,
             Self::Translate { .. } => LuaPhase::Translate,
+            Self::WriteBack { .. } => LuaPhase::WriteBack,
         }
     }
 
     pub(crate) fn script_path(&self) -> &Path {
         match self {
-            Self::Extract { script_path, .. } | Self::Translate { script_path, .. } => script_path,
+            Self::Extract { script_path, .. }
+            | Self::Translate { script_path, .. }
+            | Self::WriteBack { script_path, .. } => script_path,
         }
     }
 
     pub(crate) fn project(&self) -> &LuaProjectContext {
         match self {
-            Self::Extract { project, .. } | Self::Translate { project, .. } => project,
+            Self::Extract { project, .. }
+            | Self::Translate { project, .. }
+            | Self::WriteBack { project, .. } => project,
         }
     }
 
     pub(crate) fn translation_profile(&self) -> Option<&P> {
         match self {
-            Self::Extract { .. } => None,
+            Self::Extract { .. } | Self::WriteBack { .. } => None,
             Self::Translate { profile, .. } => Some(profile.as_ref()),
         }
     }

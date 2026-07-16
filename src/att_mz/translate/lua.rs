@@ -154,6 +154,9 @@ mod tests {
                     profile_name: profile.name,
                 },
                 LuaInvocation::Extract { .. } => panic!("翻译服务不应提交 Extract 调用"),
+                LuaInvocation::WriteBack { .. } => {
+                    panic!("翻译服务不应提交 WriteBack 调用")
+                }
             };
             *self.invocation.lock().expect("调用记录锁不应中毒") = Some(recorded);
 

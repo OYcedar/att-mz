@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::asset_reader::{
-    MzStandardTranslationAssetReadingConfig, MzStandardTranslationAssetReadingService,
-};
+use super::asset_reader::MzStandardTranslationAssetReadingService;
 use super::executor::{
     AsyncDelay, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
     MzStandardTranslationTaskExecutionService, TranslationTaskResponseProcessingService,
@@ -41,6 +39,7 @@ use crate::att_mz::lua::session::{
     OpenSqliteInteractiveSessionError, SqliteInteractiveSession, SqliteInteractiveSessionError,
     SqliteInteractiveSessionFactory, SqliteInteractiveTransactionState,
 };
+use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
 use crate::language::{
     JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageModuleCatalog,
@@ -619,7 +618,7 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     let asset_reader = MzStandardTranslationAssetReadingService::new(
         sqlite_query,
         cpu.clone(),
-        MzStandardTranslationAssetReadingConfig::new(non_zero(1), non_zero(1)),
+        MzStandardAssetReadingConfig::new(non_zero(1), non_zero(1)),
     );
     let languages = language_catalog();
     let resources =

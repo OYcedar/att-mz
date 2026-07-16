@@ -129,6 +129,9 @@ mod tests {
                 LuaInvocation::Translate { .. } => {
                     panic!("提取服务不应提交 Translate 调用")
                 }
+                LuaInvocation::WriteBack { .. } => {
+                    panic!("提取服务不应提交 WriteBack 调用")
+                }
             };
             *self.invocation.lock().expect("调用记录锁不应中毒") = Some(recorded);
 

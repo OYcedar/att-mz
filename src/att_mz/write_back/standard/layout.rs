@@ -1,0 +1,813 @@
+//! MZ 写回文本的保守显示布局。
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+use super::{
+    MzWriteBackAppliedLayout, MzWriteBackLaidOutSegment, MzWriteBackLayoutCandidate,
+    MzWriteBackLayoutOutcome, MzWriteBackLayoutRequest, MzWriteBackTextLayouter,
+};
+use crate::att_mz::text::MzLocation;
+
+const FULLWIDTH_INDENT: &str = "　";
+const ATT_TOKEN_PREFIX: &str = "⟦ATT_";
+const MAX_TAIL_CELLS: u64 = 8;
+
+/// 只在能够完整证明显示结果安全时修改文本的 MZ 布局器。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ConservativeMzWriteBackTextLayouter;
+
+impl MzWriteBackTextLayouter for ConservativeMzWriteBackTextLayouter {
+    fn layout(&self, request: &MzWriteBackLayoutRequest) -> MzWriteBackLayoutOutcome {
+        layout_request(request).map_or(MzWriteBackLayoutOutcome::Manual, |applied| {
+            MzWriteBackLayoutOutcome::Applied(applied)
+        })
+    }
+}
+
+fn layout_request(request: &MzWriteBackLayoutRequest) -> Option<MzWriteBackAppliedLayout> {
+    let max_cells = u64::from(request.max_fullwidth_chars().get()) * 2;
+    let mut working_segments = Vec::with_capacity(request.segments().len());
+    let mut inserted_line_breaks = 0usize;
+
+    for segment in request.segments() {
+        let translated = matches!(
+            segment.candidate(),
+            MzWriteBackLayoutCandidate::DatabaseTranslation(_)
+        );
+        let mut lines = Vec::new();
+        for hard_line in segment.effective_text().split('\n') {
+            let tokens = scan_line(hard_line)?;
+            if !translated {
+                lines.push(hard_line.to_owned());
+                continue;
+            }
+
+            if line_width(&tokens) <= max_cells {
+                lines.push(hard_line.to_owned());
+                continue;
+            }
+            if !request.auto_wrap_enabled() {
+                return None;
+            }
+
+            let wrapped = wrap_line(&tokens, max_cells)?;
+            inserted_line_breaks =
+                inserted_line_breaks.checked_add(wrapped.len().saturating_sub(1))?;
+            lines.extend(wrapped);
+        }
+        working_segments.push(WorkingSegment {
+            exact_location: segment.exact_location().clone(),
+            translated,
+            lines,
+        });
+    }
+
+    let inserted_fullwidth_indents = apply_continuation_indents(&mut working_segments, max_cells)?;
+    let laid_out_segments = working_segments
+        .into_iter()
+        .filter(|segment| segment.translated)
+        .map(|segment| {
+            MzWriteBackLaidOutSegment::new(segment.exact_location, segment.lines)
+                .expect("受信布局过程必须为每个数据库译文保留至少一个无换行显示行")
+        })
+        .collect();
+
+    Some(
+        MzWriteBackAppliedLayout::new(
+            request,
+            laid_out_segments,
+            inserted_line_breaks,
+            inserted_fullwidth_indents,
+        )
+        .expect("受信布局过程必须逐一返回请求中的数据库译文叶"),
+    )
+}
+
+struct WorkingSegment {
+    exact_location: MzLocation,
+    translated: bool,
+    lines: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisplayTokenKind {
+    Control,
+    Whitespace,
+    NonBreakingWhitespace,
+    Visible,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DisplayToken<'a> {
+    text: &'a str,
+    kind: DisplayTokenKind,
+    width_cells: u64,
+}
+
+fn scan_line(line: &str) -> Option<Vec<DisplayToken<'_>>> {
+    if line.contains(ATT_TOKEN_PREFIX) {
+        return None;
+    }
+
+    let mut tokens = Vec::new();
+    let mut offset = 0usize;
+    while offset < line.len() {
+        let remaining = &line[offset..];
+        if remaining.starts_with('\\') {
+            let control_length = control_sequence_length(remaining)?;
+            tokens.push(DisplayToken {
+                text: &remaining[..control_length],
+                kind: DisplayTokenKind::Control,
+                width_cells: 0,
+            });
+            offset += control_length;
+            continue;
+        }
+
+        let grapheme = remaining
+            .graphemes(true)
+            .next()
+            .expect("非空 UTF-8 后缀必须包含一个 grapheme");
+        if grapheme
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+        {
+            return None;
+        }
+        let kind = if grapheme.chars().all(char::is_whitespace) {
+            if grapheme
+                .chars()
+                .any(|character| matches!(character, '\u{00a0}' | '\u{202f}'))
+            {
+                DisplayTokenKind::NonBreakingWhitespace
+            } else {
+                DisplayTokenKind::Whitespace
+            }
+        } else {
+            DisplayTokenKind::Visible
+        };
+        tokens.push(DisplayToken {
+            text: grapheme,
+            kind,
+            width_cells: UnicodeWidthStr::width_cjk(grapheme) as u64,
+        });
+        offset += grapheme.len();
+    }
+    Some(tokens)
+}
+
+fn control_sequence_length(input: &str) -> Option<usize> {
+    debug_assert!(input.starts_with('\\'));
+    let after_slash = input.get(1..)?;
+    let first = after_slash.chars().next()?;
+    if matches!(
+        first,
+        '{' | '}' | '\\' | '$' | '.' | '|' | '!' | '>' | '<' | '^'
+    ) {
+        return Some(1 + first.len_utf8());
+    }
+
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let mut command_length = 0usize;
+    for character in after_slash.chars() {
+        if character.is_ascii_alphabetic() {
+            command_length += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    for character in after_slash[command_length..].chars() {
+        if character.is_ascii_digit() {
+            command_length += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    let after_command = &after_slash[command_length..];
+    if let Some(parameter) = after_command.strip_prefix('[') {
+        let closing_offset = parameter.find(']')?;
+        let contents = &parameter[..closing_offset];
+        if contents.chars().any(char::is_control) {
+            return None;
+        }
+        return Some(1 + command_length + 1 + closing_offset + 1);
+    }
+
+    if command_length == 1 && first.eq_ignore_ascii_case(&'g') {
+        let boundary = after_command.chars().next();
+        if boundary.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '[') {
+            return Some(2);
+        }
+    }
+    None
+}
+
+fn line_width(tokens: &[DisplayToken<'_>]) -> u64 {
+    tokens
+        .iter()
+        .fold(0u64, |width, token| width.saturating_add(token.width_cells))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BreakCandidate {
+    head_end: usize,
+    tail_start: usize,
+}
+
+fn wrap_line(tokens: &[DisplayToken<'_>], max_cells: u64) -> Option<Vec<String>> {
+    let candidates = collect_break_candidates(tokens);
+    let min_tail_cells = MAX_TAIL_CELLS.min(max_cells.div_ceil(4));
+    let mut memo = BTreeMap::new();
+    let ranges = find_wrapped_ranges(tokens, &candidates, 0, max_cells, min_tail_cells, &mut memo)?;
+    Some(
+        ranges
+            .into_iter()
+            .map(|(start, end)| join_tokens(&tokens[start..end]))
+            .collect(),
+    )
+}
+
+fn find_wrapped_ranges(
+    tokens: &[DisplayToken<'_>],
+    candidates: &[BreakCandidate],
+    start: usize,
+    max_cells: u64,
+    min_tail_cells: u64,
+    memo: &mut BTreeMap<usize, Option<Vec<(usize, usize)>>>,
+) -> Option<Vec<(usize, usize)>> {
+    if let Some(cached) = memo.get(&start) {
+        return cached.clone();
+    }
+
+    let remaining_width = range_width(tokens, start, tokens.len());
+    if remaining_width <= max_cells {
+        let result = (remaining_width >= min_tail_cells
+            && valid_output_range(tokens, start, tokens.len()))
+        .then_some(vec![(start, tokens.len())]);
+        memo.insert(start, result.clone());
+        return result;
+    }
+
+    let mut viable = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.head_end > start && candidate.tail_start > start)
+        .filter_map(|candidate| {
+            let width = range_width(tokens, start, candidate.head_end);
+            (width <= max_cells
+                && width.saturating_mul(100) >= max_cells.saturating_mul(45)
+                && valid_output_range(tokens, start, candidate.head_end))
+            .then_some((candidate, width))
+        })
+        .collect::<Vec<_>>();
+    viable.sort_by(|(left, left_width), (right, right_width)| {
+        right_width
+            .cmp(left_width)
+            .then_with(|| right.head_end.cmp(&left.head_end))
+    });
+
+    for (candidate, _) in viable {
+        let Some(mut tail) = find_wrapped_ranges(
+            tokens,
+            candidates,
+            candidate.tail_start,
+            max_cells,
+            min_tail_cells,
+            memo,
+        ) else {
+            continue;
+        };
+        let mut ranges = Vec::with_capacity(tail.len() + 1);
+        ranges.push((start, candidate.head_end));
+        ranges.append(&mut tail);
+        memo.insert(start, Some(ranges.clone()));
+        return Some(ranges);
+    }
+
+    memo.insert(start, None);
+    None
+}
+
+fn collect_break_candidates(tokens: &[DisplayToken<'_>]) -> Vec<BreakCandidate> {
+    let mut candidates = BTreeSet::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if tokens[index].kind == DisplayTokenKind::Whitespace {
+            let end = whitespace_run_end(tokens, index);
+            if index > 0 && end < tokens.len() {
+                candidates.insert(BreakCandidate {
+                    head_end: index,
+                    tail_start: end,
+                });
+            }
+            index = end;
+            continue;
+        }
+
+        if is_break_punctuation(tokens, index) {
+            let mut head_end = index + 1;
+            while head_end < tokens.len() && is_pair_closer(tokens[head_end].text) {
+                head_end += 1;
+            }
+            let tail_start = whitespace_run_end(tokens, head_end);
+            if tail_start < tokens.len() {
+                candidates.insert(BreakCandidate {
+                    head_end,
+                    tail_start,
+                });
+            }
+        }
+        index += 1;
+    }
+    candidates.into_iter().collect()
+}
+
+fn whitespace_run_end(tokens: &[DisplayToken<'_>], start: usize) -> usize {
+    let mut end = start;
+    while end < tokens.len() && tokens[end].kind == DisplayTokenKind::Whitespace {
+        end += 1;
+    }
+    end
+}
+
+fn is_break_punctuation(tokens: &[DisplayToken<'_>], index: usize) -> bool {
+    let text = tokens[index].text;
+    if matches!(text, "，" | "。" | "！" | "？" | "；" | "：" | "、" | "…") {
+        return true;
+    }
+    if !matches!(text, "," | "." | "!" | "?" | ";" | ":") {
+        return false;
+    }
+    tokens
+        .get(index + 1)
+        .is_none_or(|next| next.kind == DisplayTokenKind::Whitespace || is_pair_closer(next.text))
+}
+
+fn valid_output_range(tokens: &[DisplayToken<'_>], start: usize, end: usize) -> bool {
+    let mut significant = tokens[start..end]
+        .iter()
+        .filter(|token| token.kind == DisplayTokenKind::Visible);
+    let Some(first) = significant.next() else {
+        return false;
+    };
+    let last = significant.next_back().unwrap_or(first);
+    !is_line_start_prohibited(first.text) && !is_pair_opener(last.text)
+}
+
+fn is_line_start_prohibited(text: &str) -> bool {
+    is_pair_closer(text)
+        || matches!(
+            text,
+            "，" | "。"
+                | "！"
+                | "？"
+                | "；"
+                | "："
+                | "、"
+                | "…"
+                | ","
+                | "."
+                | "!"
+                | "?"
+                | ";"
+                | ":"
+        )
+}
+
+fn is_pair_opener(text: &str) -> bool {
+    pair_closer(text).is_some()
+}
+
+fn is_pair_closer(text: &str) -> bool {
+    matches!(
+        text,
+        "」" | "』" | "”" | "）" | "】" | "》" | "〉" | "〕" | "］" | "｝"
+    )
+}
+
+fn range_width(tokens: &[DisplayToken<'_>], start: usize, end: usize) -> u64 {
+    line_width(&tokens[start..end])
+}
+
+fn join_tokens(tokens: &[DisplayToken<'_>]) -> String {
+    let capacity = tokens.iter().map(|token| token.text.len()).sum();
+    let mut output = String::with_capacity(capacity);
+    for token in tokens {
+        output.push_str(token.text);
+    }
+    output
+}
+
+fn apply_continuation_indents(segments: &mut [WorkingSegment], max_cells: u64) -> Option<usize> {
+    let mut wrapping_stack = Vec::new();
+    let mut inserted = 0usize;
+
+    for segment in segments {
+        for line in &mut segment.lines {
+            let insert_at = if segment.translated && !wrapping_stack.is_empty() {
+                let tokens = scan_line(line)?;
+                continuation_indent_position(&tokens)
+            } else {
+                None
+            };
+            if let Some(insert_at) = insert_at {
+                line.insert_str(insert_at, FULLWIDTH_INDENT);
+                inserted = inserted.checked_add(1)?;
+            }
+
+            let tokens = scan_line(line)?;
+            if segment.translated && line_width(&tokens) > max_cells {
+                return None;
+            }
+            update_wrapping_stack(&tokens, &mut wrapping_stack);
+        }
+    }
+    Some(inserted)
+}
+
+fn continuation_indent_position(tokens: &[DisplayToken<'_>]) -> Option<usize> {
+    let mut insert_at = 0usize;
+    let mut first_non_control = 0usize;
+    while first_non_control < tokens.len()
+        && tokens[first_non_control].kind == DisplayTokenKind::Control
+    {
+        insert_at += tokens[first_non_control].text.len();
+        first_non_control += 1;
+    }
+    let first = tokens.get(first_non_control)?;
+    matches!(first.kind, DisplayTokenKind::Visible).then_some(insert_at)
+}
+
+fn update_wrapping_stack(tokens: &[DisplayToken<'_>], wrapping_stack: &mut Vec<&'static str>) {
+    let mut visible = tokens
+        .iter()
+        .filter(|token| token.kind == DisplayTokenKind::Visible);
+    if wrapping_stack.is_empty() {
+        let Some(first) = visible.next() else {
+            return;
+        };
+        let Some(closer) = pair_closer(first.text) else {
+            return;
+        };
+        wrapping_stack.push(closer);
+    }
+
+    for token in visible {
+        if wrapping_stack
+            .last()
+            .is_some_and(|closer| *closer == token.text)
+        {
+            let _ = wrapping_stack.pop();
+            if wrapping_stack.is_empty() {
+                return;
+            }
+            continue;
+        }
+        if let Some(closer) = pair_closer(token.text) {
+            wrapping_stack.push(closer);
+        }
+    }
+}
+
+fn pair_closer(opener: &str) -> Option<&'static str> {
+    match opener {
+        "「" => Some("」"),
+        "『" => Some("』"),
+        "“" => Some("”"),
+        "（" => Some("）"),
+        "【" => Some("】"),
+        "《" => Some("》"),
+        "〈" => Some("〉"),
+        "〔" => Some("〕"),
+        "［" => Some("］"),
+        "｛" => Some("｝"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::att_mz::project::MaxFullwidthChars;
+    use crate::att_mz::text::{MzLocationStep, MzSource, StandardDataFile};
+    use crate::att_mz::write_back::standard::{
+        MzWriteBackLayoutRegion, MzWriteBackLayoutSegment, StandardWriteBackFieldRole,
+        StandardWriteBackLeaf,
+    };
+
+    fn width(value: u32) -> MaxFullwidthChars {
+        MaxFullwidthChars::new(value).expect("测试行宽应为正整数")
+    }
+
+    fn location(index: usize) -> MzLocation {
+        MzLocation::value(
+            MzSource::data(StandardDataFile::Items),
+            vec![
+                MzLocationStep::index(index),
+                MzLocationStep::key("description"),
+            ],
+        )
+    }
+
+    fn segment(
+        index: usize,
+        original: &str,
+        translation: Option<&str>,
+    ) -> MzWriteBackLayoutSegment {
+        let leaf = StandardWriteBackLeaf::new(
+            StandardWriteBackFieldRole::scalar("description"),
+            location(index),
+            original,
+            translation.map(str::to_owned),
+        )
+        .expect("测试叶应合法");
+        MzWriteBackLayoutSegment::from_leaf(&leaf)
+    }
+
+    fn request(
+        max_fullwidth_chars: u32,
+        auto_wrap_enabled: bool,
+        segments: Vec<MzWriteBackLayoutSegment>,
+    ) -> MzWriteBackLayoutRequest {
+        MzWriteBackLayoutRequest::new(
+            location(999),
+            MzWriteBackLayoutRegion::HelpDescription,
+            width(max_fullwidth_chars),
+            auto_wrap_enabled,
+            segments,
+        )
+    }
+
+    fn applied(request: &MzWriteBackLayoutRequest) -> MzWriteBackAppliedLayout {
+        let MzWriteBackLayoutOutcome::Applied(applied) =
+            ConservativeMzWriteBackTextLayouter.layout(request)
+        else {
+            panic!("测试请求应安全布局")
+        };
+        applied
+    }
+
+    fn line_texts(segment: &MzWriteBackLaidOutSegment) -> Vec<&str> {
+        segment.lines().iter().map(String::as_str).collect()
+    }
+
+    fn assert_manual(request: &MzWriteBackLayoutRequest) {
+        assert_eq!(
+            ConservativeMzWriteBackTextLayouter.layout(request),
+            MzWriteBackLayoutOutcome::Manual
+        );
+    }
+
+    #[test]
+    fn counts_cjk_ascii_combining_emoji_and_ambiguous_width_in_half_cells() {
+        let tokens = scan_line("甲A e\u{301}👨‍👩‍👧‍👦·").expect("文本应可扫描");
+
+        assert_eq!(line_width(&tokens), 9);
+    }
+
+    #[test]
+    fn canonical_and_plugin_controls_are_zero_width() {
+        let tokens = scan_line(r"\C[1]甲\.\G\SE[11-nb]乙").expect("控制符应可扫描");
+
+        assert_eq!(line_width(&tokens), 4);
+    }
+
+    #[test]
+    fn uncertain_controls_and_residual_att_tokens_make_the_whole_unit_manual() {
+        for text in [r"甲\broken乙", r"甲\C[1乙", "甲\\", "甲⟦ATT_X_0001⟧乙"] {
+            assert_manual(&request(20, true, vec![segment(1, "原文", Some(text))]));
+        }
+    }
+
+    #[test]
+    fn cr_tab_and_other_control_characters_make_the_whole_unit_manual() {
+        for text in ["甲\r乙", "甲\t乙", "甲\u{7}乙", "甲\u{2028}乙"] {
+            assert_manual(&request(20, true, vec![segment(1, "原文", Some(text))]));
+        }
+    }
+
+    #[test]
+    fn non_breaking_spaces_are_not_used_as_word_boundaries() {
+        assert_manual(&request(
+            2,
+            true,
+            vec![segment(1, "原文", Some("ab\u{a0}cd"))],
+        ));
+    }
+
+    #[test]
+    fn wraps_at_chinese_punctuation_without_moving_text_between_segments() {
+        let request = request(
+            3,
+            true,
+            vec![
+                segment(1, "原一", Some("甲乙，丙丁。")),
+                segment(2, "原二", Some("戊己，庚辛。")),
+            ],
+        );
+
+        let applied = applied(&request);
+
+        assert_eq!(line_texts(&applied.segments()[0]), ["甲乙，", "丙丁。"][..]);
+        assert_eq!(line_texts(&applied.segments()[1]), ["戊己，", "庚辛。"][..]);
+        assert_eq!(applied.inserted_line_breaks(), 2);
+    }
+
+    #[test]
+    fn replaces_a_horizontal_whitespace_boundary_with_a_line_break() {
+        let request = request(2, true, vec![segment(1, "原文", Some("abcd  efgh"))]);
+
+        let applied = applied(&request);
+
+        assert_eq!(line_texts(&applied.segments()[0]), ["abcd", "efgh"][..]);
+        assert_eq!(applied.inserted_line_breaks(), 1);
+    }
+
+    #[test]
+    fn refuses_a_whitespace_break_that_places_ascii_punctuation_at_line_start() {
+        assert_manual(&request(
+            2,
+            true,
+            vec![segment(1, "原文", Some("abcd ,efg"))],
+        ));
+    }
+
+    #[test]
+    fn refuses_to_hard_split_an_unsplittable_run() {
+        assert_manual(&request(
+            3,
+            true,
+            vec![segment(1, "原文", Some("甲乙丙丁"))],
+        ));
+    }
+
+    #[test]
+    fn rejects_a_break_before_the_forty_five_percent_readability_threshold() {
+        assert_manual(&request(
+            10,
+            true,
+            vec![segment(1, "原文", Some("甲甲甲，乙乙乙乙乙乙乙乙"))],
+        ));
+    }
+
+    #[test]
+    fn rejects_a_tiny_final_tail() {
+        assert_manual(&request(
+            6,
+            true,
+            vec![segment(1, "原文", Some("甲乙丙丁戊，乙"))],
+        ));
+    }
+
+    #[test]
+    fn keeps_closing_pair_with_preceding_punctuation_line() {
+        let request = request(4, true, vec![segment(1, "原文", Some("甲乙，」丙丁"))]);
+
+        let applied = applied(&request);
+
+        assert_eq!(line_texts(&applied.segments()[0]), ["甲乙，」", "丙丁"][..]);
+    }
+
+    #[test]
+    fn refuses_a_break_that_would_leave_an_opening_pair_at_line_end() {
+        assert_manual(&request(
+            3,
+            true,
+            vec![segment(1, "原文", Some("甲乙（ 丙丁丁"))],
+        ));
+    }
+
+    #[test]
+    fn preserves_database_hard_lines_without_counting_them_as_inserted() {
+        let request = request(2, false, vec![segment(1, "原文", Some("甲乙\n\n丙丁"))]);
+
+        let applied = applied(&request);
+
+        assert_eq!(line_texts(&applied.segments()[0]), ["甲乙", "", "丙丁"][..]);
+        assert_eq!(applied.inserted_line_breaks(), 0);
+    }
+
+    #[test]
+    fn disabled_auto_wrap_reports_overwidth_hard_line_as_manual() {
+        assert_manual(&request(2, false, vec![segment(1, "原文", Some("甲乙丙"))]));
+    }
+
+    #[test]
+    fn wraps_before_adding_fullwidth_continuation_indent() {
+        let request = request(4, true, vec![segment(1, "原文", Some("「甲乙，丙丁」"))]);
+
+        let applied = applied(&request);
+
+        assert_eq!(
+            line_texts(&applied.segments()[0]),
+            ["「甲乙，", "　丙丁」"][..]
+        );
+        assert_eq!(applied.inserted_line_breaks(), 1);
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
+    }
+
+    #[test]
+    fn inserts_indent_after_leading_controls() {
+        let request = request(
+            3,
+            false,
+            vec![segment(1, "原文", Some("「甲\n\\SE[2]乙」"))],
+        );
+
+        let applied = applied(&request);
+
+        assert_eq!(
+            line_texts(&applied.segments()[0]),
+            ["「甲", r"\SE[2]　乙」"][..]
+        );
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
+    }
+
+    #[test]
+    fn does_not_duplicate_existing_half_or_fullwidth_whitespace() {
+        for continuation in [" 乙」", "　乙」", "\u{a0}乙」"] {
+            let text = format!("「甲\n{continuation}");
+            let request = request(3, false, vec![segment(1, "原文", Some(&text))]);
+
+            let applied = applied(&request);
+
+            assert_eq!(applied.segments()[0].lines()[1], continuation);
+            assert_eq!(applied.inserted_fullwidth_indents(), 0);
+        }
+    }
+
+    #[test]
+    fn line_mid_opening_pair_does_not_start_continuation_indent() {
+        let request = request(5, false, vec![segment(1, "原文", Some("他说「甲\n乙」"))]);
+
+        let applied = applied(&request);
+
+        assert_eq!(line_texts(&applied.segments()[0]), ["他说「甲", "乙」"][..]);
+        assert_eq!(applied.inserted_fullwidth_indents(), 0);
+    }
+
+    #[test]
+    fn wrapping_state_crosses_segment_boundaries_and_observes_frozen_original() {
+        let request = request(
+            5,
+            false,
+            vec![
+                segment(1, "原一", Some("「甲")),
+                segment(2, "缺译", None),
+                segment(3, "原三", Some("【乙\n丙】」")),
+            ],
+        );
+
+        let applied = applied(&request);
+
+        assert_eq!(applied.segments().len(), 2);
+        assert_eq!(line_texts(&applied.segments()[0]), ["「甲"][..]);
+        assert_eq!(
+            line_texts(&applied.segments()[1]),
+            ["　【乙", "　丙】」"][..]
+        );
+        assert_eq!(applied.inserted_fullwidth_indents(), 2);
+    }
+
+    #[test]
+    fn frozen_original_can_close_wrapping_state_without_being_modified() {
+        let request = request(
+            4,
+            false,
+            vec![
+                segment(1, "原一", Some("「甲")),
+                segment(2, "缺译」", None),
+                segment(3, "原三", Some("乙")),
+            ],
+        );
+
+        let applied = applied(&request);
+
+        assert_eq!(line_texts(&applied.segments()[1]), ["乙"][..]);
+        assert_eq!(applied.inserted_fullwidth_indents(), 0);
+    }
+
+    #[test]
+    fn malformed_control_in_frozen_original_makes_state_observation_manual() {
+        assert_manual(&request(
+            20,
+            true,
+            vec![segment(1, "原一", Some("译文")), segment(2, "缺译\\", None)],
+        ));
+    }
+
+    #[test]
+    fn indent_that_would_exceed_the_explicit_width_makes_the_unit_manual() {
+        assert_manual(&request(
+            3,
+            false,
+            vec![segment(1, "原文", Some("「甲\n乙丙」"))],
+        ));
+    }
+}

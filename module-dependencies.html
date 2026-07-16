@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ATT MZ 四棵功能职责树</title>
-<meta name="description" content="用四棵可交互职责树解释 ATT MZ 当前已实现模块的归属、作用、调用关系和直白例子。">
+<meta name="description" content="用四棵可交互职责树解释 ATT MZ 当前已实现的非根业务模块、共享依赖与尚无生产适配器的根接口。">
 <link rel="icon" href="data:,">
 <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/lxgwwenkai-regular.css">
@@ -956,7 +956,7 @@ h1 {
       <h1>四个顶层功能，点开后顺着树往下看</h1>
       <p class="hero-copy">
         <strong>Init、Extract、Translate、WriteBack</strong> 是仅有的四个顶层功能。
-        每棵树先显示总控，再把它真正拥有的内部职责逐级展开；说明和例子默认收起，点击模块才出现。
+        每棵树先显示总控，再把它真正拥有的内部职责逐级展开；最底层标“根”的节点只定义了环境契约，不代表生产适配器已存在。
       </p>
     </div>
     <aside class="hero-note" aria-label="阅读说明">
@@ -969,6 +969,7 @@ h1 {
     <span><i class="legend-mark">↓</i> 上级直接拥有或调用下级</span>
     <span><i class="legend-mark">①</i> 编号表示固定执行顺序</span>
     <span><i class="legend-mark">复</i> 同一个已实现模块在这里再次使用</span>
+    <span><i class="legend-mark">根</i> 根接口已定义，生产适配器未实现</span>
   </div>
 
   <section class="forest" aria-labelledby="forest-title">
@@ -1014,7 +1015,7 @@ h1 {
       <button class="root-card" type="button" data-root="writeback" aria-expanded="false" style="--c:var(--red)">
         <span class="root-topline">
           <span class="root-index">04 / ROOT</span>
-          <span class="root-status">顶层编排已实现</span>
+          <span class="root-status">非根业务树已实现</span>
         </span>
         <span class="root-name">WriteBack</span>
         <span class="root-zh">写回游戏</span>
@@ -1067,7 +1068,7 @@ h1 {
 
   <footer class="page-foot">
     <span>页面口径：源码中已经落地的职责与真实调用关系。</span>
-    <span>WriteBack 顶层与 Standard 业务编排已实现；真实 SQL、布局、文档改写、发布和 Lua Host 仍停在契约边界。</span>
+    <span>WriteBack 非根业务树已全部实现；真实 SQLite、文件、日志和 Lua 运行时仍停在根适配器边界。</span>
   </footer>
 </main>
 
@@ -1104,7 +1105,7 @@ h1 {
       label: "WriteBack",
       zh: "写回游戏",
       color: "var(--red)",
-      summary: "WriteBackService 与 Standard 业务编排已实现；真实文件写回和 Lua Host 适配仍停在直接依赖契约。",
+      summary: "Reader、Layouter、Rewriter、Publisher、Lua WriteBack 与共享 Host 均已实现；环境根只定义接口。",
       sequence: "① 打开冻结项目 → ② Standard 写回 → ③ Lua 写回（可选）",
       tree: null
     }
@@ -1185,7 +1186,8 @@ h1 {
       plain: "它不再追着原游戏目录跑。项目一旦导入，后续命令只关心自己的冻结副本；即使原游戏移动或删除，标准流程的权威来源也不改变。",
       example: "demo 原来来自 C:\\Games\\Demo，但该目录后来被删除。只要项目工作区的 source/data 与 source/js 仍在，打开项目仍使用冻结副本。",
       input: "ProjectName",
-      output: "OpenedProject：工作区、冻结源、固定输出、数据库、语言与布局宽度"
+      output: "OpenedProject：工作区、冻结源、固定输出、数据库、语言与布局宽度",
+      boundary: "ExistingDirectoryResolver 只有根接口，尚无生产文件系统适配器。"
     },
     "project-record-reader": {
       title: "读取项目档案",
@@ -1197,7 +1199,8 @@ h1 {
       plain: "它像查档员。不是随便拿到一行数据就算成功，而是确认档案只有一份、字段完整、名字没有对不上。",
       example: "用户请求项目“demo”，数据库 metadata 却写着“other”。读取会报身份不一致，而不是把 other 当成 demo 继续运行。",
       input: "请求的 ProjectName",
-      output: "StoredProjectRecord"
+      output: "StoredProjectRecord",
+      boundary: "SqliteQueryExecutor 只有根接口，尚无生产 SQLite 驱动适配器。"
     },
     "builtin-extraction": {
       title: "内建字段提取",
@@ -1233,7 +1236,8 @@ h1 {
       plain: "它只负责把文件可靠地拿进来，不越权决定哪些字段要翻译。Builtin 和 Rules 都用同一个读取能力，但各自解释数据。",
       example: "读取 Items.json 时，即使里面有当前版本不认识的 extraMeta，也会原样保留；真正选择 name 还是自定义字段由上层负责。",
       input: "OpenedProject 的冻结 source 根与文档选择",
-      output: "MzProjectDocuments"
+      output: "MzProjectDocuments",
+      boundary: "FileReader、DirectoryLister 与 CpuTaskExecutor 根接口已定义，生产适配器未实现。"
     },
     "snapshot-model": {
       title: "提取快照模型",
@@ -1271,6 +1275,147 @@ h1 {
       input: "MzLocation",
       output: "稳定存储文本，或从文本还原 MzLocation"
     },
+    "standard-asset-storage": {
+      title: "标准资产存储语义",
+      symbol: "MzStandardAssetStorageKind",
+      shortSymbol: "Standard Asset Schema",
+      path: "src/att_mz/standard_asset.rs",
+      status: "共享纯能力已实现",
+      role: "唯一定义五张标准表、owner、text_body unit 与八种文本组语义的双向映射。",
+      plain: "Extract、Translate 和 WriteBack 不再各写一套 entry/text_body 字符串判断，而是共享同一份受信存储字典。",
+      example: "text_body + scrolling_text 始终映射为 EventScrollingText；非 text_body 表带 unit_type 会被拒绝。",
+      input: "表名、owner、unit_type 或 TextGroupKind",
+      output: "受信 MzStandardAssetStorageKind 与读取资源配置"
+    },
+    "tag-span-parser": {
+      title: "Tag Span 解析",
+      symbol: "simple_tag_spans",
+      shortSymbol: "Tag Span Parser",
+      path: "src/att_mz/tag.rs",
+      status: "共享纯能力已实现",
+      role: "以同一 occurrence 规则定位 Note 和 Comment 中的简单 tag 值边界。",
+      plain: "Rules 提取和 Rewriter 写回必须对“第几个 tag”有同一理解，否则译文可能写到另一个同名 tag。",
+      example: "note 内有两个 <desc:...>，occurrence=1 在提取和写回时始终指向第二个。",
+      input: "一段 note/comment 文本",
+      output: "按自然顺序排列的 tag 名、值与字节 span"
+    },
+    "sqlite-query-root": {
+      title: "SQLite 只读查询根",
+      symbol: "SqliteQueryExecutor",
+      shortSymbol: "SQLite Query Root",
+      path: "src/storage/sqlite.rs",
+      status: "根接口已定义",
+      role: "以只读意图查询一个必须已存在的 SQLite 数据库，不泄漏连接或行游标。",
+      plain: "它只是环境门口：业务层决定查什么，根适配器将来负责真正打开数据库、背压和关闭资源。",
+      example: "WriteBack Reader 交付一次五表 UNION 查询；根返回拥有型行或明确失败。",
+      input: "数据库路径与 SqliteQuery",
+      output: "Vec<SqliteRow> 或查询终态",
+      boundary: "生产 SQLite 驱动、连接池、并发预算与取消处理尚未实现。"
+    },
+    "cpu-root": {
+      title: "CPU 任务根",
+      symbol: "CpuTaskExecutor",
+      shortSymbol: "CPU Task Root",
+      path: "src/storage/cpu.rs",
+      status: "根接口已定义",
+      role: "在外部配置的有界工作资源中执行拥有型纯 CPU 计算。",
+      plain: "它让解码、JSON 改写和序列化不堵住异步 I/O 线程，但不在业务模块里偷猜线程数。",
+      example: "Reader 把数据库行分批解码；Rewriter 把内存文档改写交给同一根执行。",
+      input: "Send + 'static 的纯计算闭包",
+      output: "计算结果或不可用/panic 终态",
+      boundary: "有界线程池、队列背压和生命周期适配器尚未实现。"
+    },
+    "file-reader-root": {
+      title: "文件读取根",
+      symbol: "FileReader",
+      shortSymbol: "File Reader Root",
+      path: "src/storage/file_system.rs",
+      status: "根接口已定义",
+      role: "异步读取一个现存文件并交回解析后的真实路径与字节。",
+      plain: "MZ 文档读取器和 Lua Host 共用这个环境门口，不各自在异步主流程中做阻塞文件 I/O。",
+      example: "Rewriter 读 source/data/Items.json；Lua Host 读用户指定脚本，两者依赖同一根契约。",
+      input: "PathBuf",
+      output: "ResolvedFile 或明确文件错误",
+      boundary: "生产异步文件系统适配器尚未实现。"
+    },
+    "directory-lister-root": {
+      title: "目录列举根",
+      symbol: "DirectoryLister",
+      shortSymbol: "Directory Lister Root",
+      path: "src/storage/file_system.rs",
+      status: "根接口已定义",
+      role: "异步列举现存目录的直接子项，不在业务层隐式递归。",
+      plain: "文档读取器只说需要哪些 Map，真正如何遍历目录和限制句柄由根适配器负责。",
+      example: "需要全部 Map 时列举 source/data；只需 Map042 时文档读取器可直接精确请求而不列目录。",
+      input: "目录路径",
+      output: "稳定子项列表或列举错误",
+      boundary: "生产目录 I/O、句柄预算和符号链接策略适配器尚未实现。"
+    },
+    "existing-directory-root": {
+      title: "现存目录解析根",
+      symbol: "ExistingDirectoryResolver",
+      shortSymbol: "Directory Resolver Root",
+      path: "src/storage/file_system.rs",
+      status: "根接口已定义",
+      role: "在操作发生前重新观测指定路径是否仍是可用目录。",
+      plain: "OpenedProject 不只相信数据库里的历史记录，还要当场确认冻结 data/js 仍然存在。",
+      example: "source/js 被外部删除后，打开项目在这个根边界明确失败。",
+      input: "期望的目录路径",
+      output: "解析后目录路径或 NotFound/NotDirectory/IO",
+      boundary: "生产文件系统适配器尚未实现。"
+    },
+    "atomic-directory-root": {
+      title: "原子目录快照发布根",
+      symbol: "AtomicDirectorySnapshotPublisher",
+      shortSymbol: "Atomic Snapshot Root",
+      path: "src/storage/file_system.rs",
+      status: "根接口已定义",
+      role: "把多个来源子树与文件覆盖作为一份完整目录快照一次发布。",
+      plain: "它是真正多文件副作用的最底层：要么新版完整可见，要么明确没发布，交换二次失败则报 OutcomeUnknown。",
+      example: "复制 source/data 和 source/js，覆盖改写的 Items.json/plugins.js，然后共同替换 write_back。",
+      input: "DirectorySnapshotPublishRequest",
+      output: "发布成功、NotPublished 或 OutcomeUnknown",
+      boundary: "同级暂存、递归复制、目录交换、恢复与清理的生产适配器尚未实现。"
+    },
+    "lua-runtime-root": {
+      title: "可信 Lua Runtime 根",
+      symbol: "TrustedLuaRuntimeExecutor",
+      shortSymbol: "Lua Runtime Root",
+      path: "src/att_mz/lua/runtime.rs",
+      status: "根接口已定义",
+      role: "接管 Lua 程序与 Host bindings，完成 VM 运行、终止和 finalization 交接。",
+      plain: "Host 定义运行期语义，该根将来才真正创建 Lua VM 并在取消后继续受控清理。",
+      example: "WriteBack 脚本已开始后 Future 被取消，Runtime 仍需要让 bindings finalize 完成。",
+      input: "OwnedLuaProgram 与 TrustedLuaHostBindings",
+      output: "运行结果与清理终态",
+      boundary: "生产 Lua VM、worker、背压与取消适配器尚未实现。"
+    },
+    "sqlite-session-root": {
+      title: "SQLite 交互会话根",
+      symbol: "SqliteInteractiveSessionFactory",
+      shortSymbol: "SQLite Session Root",
+      path: "src/att_mz/lua/session.rs",
+      status: "根接口已定义",
+      role: "为可信 Lua 打开拥有显式事务状态和关闭终态的现存项目数据库会话。",
+      plain: "Lua 自己决定 begin/commit/rollback，Host 负责不把未提交事务带出调用边界。",
+      example: "脚本退出时仍处于 Active，Host 通过会话根回滚并关闭。",
+      input: "project.db 路径",
+      output: "SqliteInteractiveSession 或打开错误",
+      boundary: "生产 SQLite 连接、事务终态和关闭适配器尚未实现。"
+    },
+    "llm-root": {
+      title: "LLM 请求根",
+      symbol: "LlmRequestExecutor",
+      shortSymbol: "LLM Request Root",
+      path: "src/att_mz/translate/executor.rs",
+      status: "根接口已定义",
+      role: "按受信 Profile 向外部模型发出拥有型聊天请求并保留可恢复错误语义。",
+      plain: "共享 Lua Host 需要该根才能服务 Translate；Extract 与 WriteBack 没有 Profile，因此不向脚本开放 ctx.llm。",
+      example: "WriteBack 脚本调用 LLM 会得到阶段不可用，不会偷用某个默认 Profile。",
+      input: "Profile 与消息",
+      output: "LLM 响应或结构化请求错误",
+      boundary: "生产模型客户端、鉴权、限流和网络适配器尚未实现。"
+    },
     "lua-extraction": {
       title: "Lua 提取",
       symbol: "LuaExtractionService",
@@ -1290,11 +1435,11 @@ h1 {
       path: "src/att_mz/lua/hosting.rs",
       status: "业务逻辑已实现，可复用",
       role: "统一管理可信 Lua 调用的上下文、会话生命周期、提交和清理。",
-      plain: "它像剧场经理：Extract 和 Translate 都能借用同一个舞台，但每次演出属于哪个阶段、拿到什么上下文、结束后怎么清场，都由 Host 管住。",
-      example: "Translate 脚本运行中报错，Host 仍会走受控清理；不会因为 Future 被取消就把半开的会话丢在那里。",
+      plain: "它像剧场经理：Extract、Translate 和 WriteBack 共用同一舞台，但每次演出的阶段、项目文件边界、数据库会话与结束清理都由 Host 管住。",
+      example: "WriteBack 脚本报错时，Host 回滚未提交的数据库事务并关闭会话；脚本已显式提交的结果不会被伪装成从未发生。",
       input: "LuaInvocation：阶段、脚本、项目事实与可选 Profile",
       output: "脚本完成，或带清理结果的明确错误",
-      boundary: "Lua runtime 与 session 的生产根适配仍未接入，因此不作为树节点。"
+      boundary: "FileReader、Lua Runtime、SQLite Session 与 LLM 都只有根接口；WriteBack 不开放 ctx.llm，但共享 Host 的具体组装仍依赖该根。"
     },
     "translate-service": {
       title: "Translate 总控",
@@ -1490,7 +1635,7 @@ h1 {
       example: "Standard 已把输出发布到 demo/write_back，随后 Lua 失败。命令明确失败并报告脚本和输出路径，但不会谎称 Standard 从未成功。",
       input: "项目名与可选 Lua 脚本路径",
       output: "固定输出根、Standard 汇总与 Lua 执行状态",
-      boundary: "人工换行项是正常成功；Standard 已负责业务编排，真实数据库读取、布局、文档修改、发布和 Lua Host 适配仍由下级契约承担。"
+      boundary: "人工换行项是正常成功。全部非根业务依赖已实现；生产 SQLite、文件、日志和 Lua 运行时适配器仍是明确停止线。"
     },
     "standard-writeback": {
       title: "Standard 写回",
@@ -1503,85 +1648,85 @@ h1 {
       example: "某段译文超过对话宽度但没有安全断点。Standard 仍发布它的原译文，manual_layout_units 加一，不把正常人工处理升级成技术错误。",
       input: "OpenedProject 与显式 MzWriteBackLayoutProfile",
       output: "PublishedWriteBack 与 StandardWriteBackSummary；完整人工诊断进入单次运行日志",
-      boundary: "业务编排已经实现；真实五表 SQL、布局算法、MZ 文档重建、固定输出发布和日志适配器仍未实现。"
+      boundary: "Reader、Layouter、Rewriter 和 Publisher 的非根实现已接受该编排契约；持久日志及它们最终到达的环境能力仍只有根接口。"
     },
     "writeback-asset-reader": {
       title: "读取写回资产",
-      symbol: "StandardWriteBackAssetReader",
+      symbol: "MzStandardWriteBackAssetReadingService",
       shortSymbol: "WriteBack Asset Reader",
-      path: "src/att_mz/write_back/standard.rs",
-      status: "直接依赖契约",
+      path: "src/att_mz/write_back/asset_reader.rs",
+      status: "非根业务实现完成",
       role: "从五张标准资产表读取不含术语数据的一致写回快照。",
-      plain: "它只交付每个文本位置的原文、可选数据库译文和结构化角色；缺译是正常事实，SQL 或 schema 失败才是技术错误。",
+      plain: "它只交付每个文本位置的原文、可选数据库译文和结构化角色。一次八列 UNION 查询不包含任何术语表或术语字段。",
       example: "某个物品名称有译文而说明没有译文。Reader 同时返回两个叶子，Standard 对名称计入应用译文，对说明计入保留原文。",
       input: "OpenedProject",
       output: "StandardWriteBackSnapshot",
-      boundary: "真实五表 SQL 查询、一致读视图和数据库解码尚未实现；术语数据不属于该契约。"
+      boundary: "五表 SQL、存储语义、位置/角色解码与并行组装已实现；SqliteQueryExecutor 与 CpuTaskExecutor 生产适配器未实现。"
     },
     "writeback-layouter": {
       title: "保守文本布局",
-      symbol: "MzWriteBackTextLayouter",
+      symbol: "ConservativeMzWriteBackTextLayouter",
       shortSymbol: "WriteBack Layouter",
-      path: "src/att_mz/write_back/standard.rs",
-      status: "直接依赖契约",
+      path: "src/att_mz/write_back/standard/layout.rs",
+      status: "非根业务实现完成",
       role: "按显式区域行宽处理对话正文块、滚动文本块和规范帮助说明，并返回 Applied 或正常 Manual。",
-      plain: "它只负责文本阅读布局。找不到安全断点时整块放行，不伪造成功，也不把需要人工处理升级成技术错误。",
-      example: "对话正文块的一个译文叶子变长但没有安全断点，Layouter 返回 Manual；Standard 撤销这个块的自动换行和缩进，保留原始数据库译文。",
+      plain: "它按 grapheme 与全角等价宽度扫描可见文本，只在词界/标点安全断点换行，再追踪行首包裹符状态补全角缩进。",
+      example: "对话正文超宽但没有安全断点，或存在破损控制序列，Layouter 返回 Manual；Standard 保留原始数据库译文。",
       input: "MzWriteBackLayoutRequest 与对应 MaxFullwidthChars",
       output: "MzWriteBackLayoutOutcome",
-      boundary: "控制符、占位符、Unicode 显示宽度、断点选择和全角缩进算法尚未实现。"
+      boundary: "布局是已实现的同步纯业务能力，不依赖环境根；不可判定的自定义占位符仍按可见文本或 Manual 保守处理。"
     },
     "writeback-rewriter": {
       title: "重建 MZ 文档",
-      symbol: "MzWriteBackDocumentRewriter",
+      symbol: "MzWriteBackDocumentRewritingService",
       shortSymbol: "MZ Document Rewriter",
-      path: "src/att_mz/write_back/standard.rs",
-      status: "直接依赖契约",
+      path: "src/att_mz/write_back/rewriter.rs",
+      status: "非根业务实现完成",
       role: "把强类型 Mutation Plan 应用到冻结文档，生成候选文档而不直接发布。",
       plain: "它理解普通 JSON 位置、插件参数以及会改变数量的 401/405 指令块；Standard 因此无需操作裸命令码。",
-      example: "一个对话译文含三个硬行时，Rewriter 以后会把对应正文段重建为三条 401 指令，同时让缺译的相邻命令逐字保持不变。",
+      example: "一个对话译文含三个硬行时，Rewriter 把对应正文段重建为三条 401 指令，同时让缺译的相邻原命令整个保持不变。",
       input: "OpenedProject 与 StandardWriteBackMutationPlan",
-      output: "关联类型 RewrittenDocuments",
-      boundary: "真实文档读取、JSON/Note/Comment/插件参数改写、401/405 重建和序列化尚未实现。"
+      output: "带项目身份与完整文件覆盖的 MzRewrittenDocuments",
+      boundary: "JSON/Note/Comment/插件参数改写、401/405 重建和序列化已实现；文档读取与 CPU 的生产根适配器未实现。"
     },
     "writeback-publisher": {
       title: "发布固定输出",
-      symbol: "StandardWriteBackPublisher",
+      symbol: "StandardWriteBackPublishingService",
       shortSymbol: "WriteBack Publisher",
-      path: "src/att_mz/write_back/standard.rs",
-      status: "直接依赖契约",
+      path: "src/att_mz/write_back/publisher.rs",
+      status: "非根业务实现完成",
       role: "把候选文档与完整冻结 data/js 组成固定最新输出，成功后才确认 PublishedWriteBack。",
-      plain: "它拥有多文件副作用边界：发布失败不能把半成品当作成功，也不能让 Standard 自己逐个写文件。",
-      example: "即使没有任何译文，Publisher 以后仍会从 source 生成完整 write_back/data 和 write_back/js；中途失败则不返回发布成功。",
+      plain: "它校验候选确实属于当前项目，固定建立 source/data 和 source/js 两个快照映射，再把改写文件作为覆盖交给原子发布根。",
+      example: "即使没有任何译文，Publisher 仍构造包含完整 data/js 来源的发布请求；候选来自另一工作区时在根调用前拒绝。",
       input: "OpenedProject 与 RewrittenDocuments",
       output: "固定输出发布成功或明确失败",
-      boundary: "真实递归复制、候选覆盖、目录替换、失败清理和生产文件适配尚未实现。"
+      boundary: "发布业务适配已实现；真实递归复制、目录交换、恢复和清理属于尚未实现的 AtomicDirectorySnapshotPublisher 根适配器。"
     },
     "writeback-event-log": {
       title: "持久记录发布结果",
       symbol: "PersistentEventLog<StandardWriteBackRunLog>",
       shortSymbol: "WriteBack Event Log",
       path: "src/observability.rs",
-      status: "根接口",
+      status: "根接口已定义",
       role: "在固定输出发布成功后，一次持久接管项目、输出路径、汇总和全部人工布局诊断。",
       plain: "日志失败会让 Standard 明确失败并阻止 Lua，但不会回滚已经确认发布的 data/js；这样既不伪造完整命令成功，也不谎称已发布副作用不存在。",
       example: "Publisher 已成功，日志介质随后失败。错误带回 write_back 路径，顶层停止 Lua，而目录仍保留给人工诊断和后续恢复。",
       input: "一条 StandardWriteBackRunLog",
       output: "事件达到配置声明的持久化终态，或保留源错误",
-      boundary: "本轮只复用根接口；日志文件、格式、队列、轮转、刷盘和保留策略均无生产实现。"
+      boundary: "日志文件、格式、队列、轮转、刷盘和保留策略的生产适配器均未实现。"
     },
     "lua-writeback": {
       title: "Lua 写回",
-      symbol: "LuaWriteBack",
+      symbol: "LuaWriteBackService",
       shortSymbol: "Lua WriteBack",
-      path: "src/att_mz/write_back.rs",
-      status: "直接依赖契约",
+      path: "src/att_mz/write_back/lua.rs",
+      status: "非根业务实现完成",
       role: "在 Standard 已发布的同一固定输出上运行用户明确选择的可信 Lua 程序。",
-      plain: "Lua 拿到冻结源、项目数据库和最新输出后，自己拥有协议与事务；Rust 顶层不替它猜测、合并或回滚。",
+      plain: "它先确认 Published token 与当前项目身份一致，再把冻结源、项目数据库和最新输出组成 WriteBack invocation 交给共享 Host。",
       example: "脚本为自定义插件补写 js 数据。若它失败，错误包含脚本路径和 Standard 已发布输出路径，下一次 Standard 会再次从冻结 source 重建。",
       input: "OpenedProject、PublishedWriteBack 与脚本路径",
       output: "Lua 阶段成功或带上下文的明确失败",
-      boundary: "真实 LuaInvocation、Host 和 VM 接线属于后续以 LuaWriteBack 为目标的任务。"
+      boundary: "LuaInvocation::WriteBack 与 Host 阶段接线已实现；真实脚本读取、Lua VM 和 SQLite 交互会话仍等待根适配器。"
     }
   };
 
@@ -1606,33 +1751,57 @@ h1 {
 
   ROOTS.extract.tree = n("extract-service", "extract-service", [
     n("extract-project-open", "project-opener", [
-      n("extract-project-record", "project-record-reader")
+      n("extract-project-record", "project-record-reader", [
+        n("extract-project-record-sql", "sqlite-query-root", [], { reused: true })
+      ]),
+      n("extract-existing-directory", "existing-directory-root", [], { reused: true })
     ], { order: "①" }),
     n("extract-builtin", "builtin-extraction", [
-      n("builtin-doc-reader", "document-reader", [], { reused: true }),
+      n("builtin-doc-reader", "document-reader", [
+        n("builtin-file-reader", "file-reader-root", [], { reused: true }),
+        n("builtin-directory-lister", "directory-lister-root", [], { reused: true }),
+        n("builtin-doc-cpu", "cpu-root", [], { reused: true })
+      ], { reused: true }),
       n("builtin-snapshot-model", "snapshot-model", [], { reused: true }),
       n("builtin-asset-store", "asset-store", [
+        n("builtin-standard-storage", "standard-asset-storage", [], { reused: true }),
         n("builtin-location-codec", "location-codec", [], { reused: true })
       ], { reused: true })
     ], { order: "②" }),
     n("extract-rules", "rules-extraction", [
-      n("rules-doc-reader", "document-reader", [], { reused: true }),
+      n("rules-doc-reader", "document-reader", [
+        n("rules-file-reader", "file-reader-root", [], { reused: true }),
+        n("rules-directory-lister", "directory-lister-root", [], { reused: true }),
+        n("rules-doc-cpu", "cpu-root", [], { reused: true })
+      ], { reused: true }),
       n("rules-snapshot-model", "snapshot-model", [], { reused: true }),
       n("rules-asset-store", "asset-store", [
+        n("rules-standard-storage", "standard-asset-storage", [], { reused: true }),
         n("rules-location-codec", "location-codec", [], { reused: true })
-      ], { reused: true })
+      ], { reused: true }),
+      n("rules-tag-spans", "tag-span-parser", [], { reused: true })
     ], { order: "③" }),
     n("extract-lua", "lua-extraction", [
-      n("extract-lua-host", "lua-host", [], { reused: true })
+      n("extract-lua-host", "lua-host", [
+        n("extract-lua-file", "file-reader-root", [], { reused: true }),
+        n("extract-lua-runtime", "lua-runtime-root", [], { reused: true }),
+        n("extract-lua-session", "sqlite-session-root", [], { reused: true }),
+        n("extract-lua-llm", "llm-root", [], { reused: true, optional: true })
+      ], { reused: true })
     ], { order: "④", optional: true })
   ]);
 
   ROOTS.translate.tree = n("translate-service", "translate-service", [
     n("translate-profile", "profile-resolver", [], { order: "①" }),
-    n("translate-project-record", "project-record-reader", [], { order: "②", reused: true }),
+    n("translate-project-record", "project-record-reader", [
+      n("translate-project-record-sql", "sqlite-query-root", [], { reused: true })
+    ], { order: "②", reused: true }),
     n("translate-standard", "standard-translation", [
       n("standard-asset-reader", "asset-reader", [
-        n("reader-location-codec", "location-codec", [], { reused: true })
+        n("reader-standard-storage", "standard-asset-storage", [], { reused: true }),
+        n("reader-location-codec", "location-codec", [], { reused: true }),
+        n("reader-sql", "sqlite-query-root", [], { reused: true }),
+        n("reader-cpu", "cpu-root", [], { reused: true })
       ], { order: "①" }),
       n("standard-planner", "planner", [
         n("planner-resources", "planning-resource"),
@@ -1652,24 +1821,57 @@ h1 {
         ])
       ], { order: "③" }),
       n("standard-store", "result-store", [
+        n("store-standard-storage", "standard-asset-storage", [], { reused: true }),
         n("store-location-codec", "location-codec", [], { reused: true })
       ], { order: "④" })
     ], { order: "③" }),
     n("translate-lua", "lua-translation", [
-      n("translate-lua-host", "lua-host", [], { reused: true })
+      n("translate-lua-host", "lua-host", [
+        n("translate-lua-file", "file-reader-root", [], { reused: true }),
+        n("translate-lua-runtime", "lua-runtime-root", [], { reused: true }),
+        n("translate-lua-session", "sqlite-session-root", [], { reused: true }),
+        n("translate-lua-llm", "llm-root", [], { reused: true })
+      ], { reused: true })
     ], { order: "④", optional: true })
   ]);
 
   ROOTS.writeback.tree = n("writeback-service", "writeback-service", [
-    n("writeback-project-open", "project-opener", [], { order: "①", reused: true }),
+    n("writeback-project-open", "project-opener", [
+      n("writeback-project-record", "project-record-reader", [
+        n("writeback-project-record-sql", "sqlite-query-root", [], { reused: true })
+      ], { reused: true }),
+      n("writeback-existing-directory", "existing-directory-root", [], { reused: true })
+    ], { order: "①", reused: true }),
     n("writeback-standard", "standard-writeback", [
-      n("writeback-asset-read", "writeback-asset-reader", [], { order: "①" }),
+      n("writeback-asset-read", "writeback-asset-reader", [
+        n("writeback-reader-storage", "standard-asset-storage", [], { reused: true }),
+        n("writeback-reader-codec", "location-codec", [], { reused: true }),
+        n("writeback-reader-sql", "sqlite-query-root", [], { reused: true }),
+        n("writeback-reader-cpu", "cpu-root", [], { reused: true })
+      ], { order: "①" }),
       n("writeback-layout", "writeback-layouter", [], { order: "②" }),
-      n("writeback-rewrite", "writeback-rewriter", [], { order: "③" }),
-      n("writeback-publish", "writeback-publisher", [], { order: "④" }),
+      n("writeback-rewrite", "writeback-rewriter", [
+        n("writeback-document-reader", "document-reader", [
+          n("writeback-doc-file", "file-reader-root", [], { reused: true }),
+          n("writeback-doc-list", "directory-lister-root", [], { reused: true }),
+          n("writeback-doc-cpu", "cpu-root", [], { reused: true })
+        ], { reused: true }),
+        n("writeback-tag-spans", "tag-span-parser", [], { reused: true }),
+        n("writeback-rewriter-cpu", "cpu-root", [], { reused: true })
+      ], { order: "③" }),
+      n("writeback-publish", "writeback-publisher", [
+        n("writeback-atomic-publish", "atomic-directory-root")
+      ], { order: "④" }),
       n("writeback-log", "writeback-event-log", [], { order: "⑤" })
     ], { order: "②" }),
-    n("writeback-lua", "lua-writeback", [], { order: "③", optional: true })
+    n("writeback-lua", "lua-writeback", [
+      n("writeback-lua-host", "lua-host", [
+        n("writeback-lua-file", "file-reader-root", [], { reused: true }),
+        n("writeback-lua-runtime", "lua-runtime-root", [], { reused: true }),
+        n("writeback-lua-session", "sqlite-session-root", [], { reused: true }),
+        n("writeback-lua-llm", "llm-root", [], { reused: true, optional: true })
+      ], { reused: true })
+    ], { order: "③", optional: true })
   ]);
 
   var NS = "http://www.w3.org/2000/svg";
@@ -1866,7 +2068,7 @@ h1 {
     branchSummary.textContent = root.summary;
     sequenceText.textContent = root.sequence;
     treeFoot.textContent = rootId === "writeback"
-      ? "WriteBack 已展开到 Standard 业务编排及其直接契约；真实 SQL、布局、文档改写、发布、日志适配和 Lua Host 仍在边界之外。"
+      ? "WriteBack 已展开到全部非根业务实现和最终根接口；标“根”的节点均未实现生产适配器，因此尚不能声明真实磁盘写回成立。"
       : "点击模块逐层展开。重复出现的“复用”节点仍是同一个实现，不会被另分成第五类。";
 
     branchShell.classList.add("is-open");
@@ -2055,14 +2257,14 @@ h1 {
       });
       state.textContent = (expanded.has(data.uid) ? "−" : "+") + data.children.length;
       group.appendChild(state);
-    } else if (module.status === "暂时只有接口" || module.status === "直接依赖契约" || module.status === "根接口") {
+    } else if (module.status === "暂时只有接口" || module.status === "直接依赖契约" || module.status.indexOf("根接口") === 0) {
       var onlyInterface = svgEl("text", {
         class: "node-corner",
         x: x + NODE_W - 12,
         y: y + 14,
         "text-anchor": "end"
       });
-      onlyInterface.textContent = module.status === "根接口" ? "根" : "契约";
+      onlyInterface.textContent = module.status.indexOf("根接口") === 0 ? "根" : "契约";
       group.appendChild(onlyInterface);
     }
 

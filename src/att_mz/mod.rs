@@ -15,6 +15,8 @@ pub(crate) mod location_codec;
 pub(crate) mod lua;
 pub(crate) mod project;
 mod project_name;
+pub(crate) mod standard_asset;
+pub(crate) mod tag;
 pub(crate) mod text;
 pub mod translate;
 pub mod write_back;

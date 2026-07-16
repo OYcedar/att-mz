@@ -5,12 +5,15 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
+use crate::att_mz::standard_asset::{
+    MzStandardAssetOwner, MzStandardAssetReadingConfig, MzStandardAssetStorageKind,
+    MzStandardAssetTable, MzTextBodyUnit,
+};
 use crate::att_mz::text::{MzLocation, TextGroupKind};
 use crate::project_database::StoredProjectRecord;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -125,42 +128,15 @@ FROM (
 )
 ORDER BY asset_table, exact_location, term"#;
 
-/// 标准翻译资产解码阶段的全部必填资源上限。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MzStandardTranslationAssetReadingConfig {
-    decode_concurrency: NonZeroUsize,
-    leaves_per_decode_job: NonZeroUsize,
-}
-
-impl MzStandardTranslationAssetReadingConfig {
-    pub(crate) const fn new(
-        decode_concurrency: NonZeroUsize,
-        leaves_per_decode_job: NonZeroUsize,
-    ) -> Self {
-        Self {
-            decode_concurrency,
-            leaves_per_decode_job,
-        }
-    }
-
-    pub(crate) const fn decode_concurrency(self) -> NonZeroUsize {
-        self.decode_concurrency
-    }
-
-    pub(crate) const fn leaves_per_decode_job(self) -> NonZeroUsize {
-        self.leaves_per_decode_job
-    }
-}
-
 /// 使用单次 SQLite 一致查询与受控 CPU 解码建立标准翻译语料。
 pub(crate) struct MzStandardTranslationAssetReadingService<Q, C> {
     sqlite: Q,
     cpu: C,
-    config: MzStandardTranslationAssetReadingConfig,
+    config: MzStandardAssetReadingConfig,
 }
 
 impl<Q, C> MzStandardTranslationAssetReadingService<Q, C> {
-    pub(crate) fn new(sqlite: Q, cpu: C, config: MzStandardTranslationAssetReadingConfig) -> Self {
+    pub(crate) fn new(sqlite: Q, cpu: C, config: MzStandardAssetReadingConfig) -> Self {
         Self {
             sqlite,
             cpu,
@@ -194,7 +170,7 @@ where
             return Ok(StandardTranslationCorpus::new(Vec::new()));
         }
 
-        let leaves_per_job = self.config.leaves_per_decode_job.get();
+        let leaves_per_job = self.config.leaves_per_decode_job().get();
         let batches = self
             .cpu
             .execute(move || partition_rows(rows, leaves_per_job))
@@ -208,7 +184,7 @@ where
                 .map_err(MzStandardTranslationAssetReadingError::ScheduleDecode)?
                 .map_err(MzStandardTranslationAssetReadingError::InvalidSnapshot)
         }))
-        .buffered(self.config.decode_concurrency.get())
+        .buffered(self.config.decode_concurrency().get())
         .try_collect::<Vec<_>>()
         .await?;
 
@@ -279,67 +255,9 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum AssetTable {
-    Entry,
-    SystemText,
-    MapText,
-    TextBody,
-    PluginParam,
-}
-
-impl AssetTable {
-    const fn from_name(value: &str) -> Option<Self> {
-        match value.as_bytes() {
-            b"entry" => Some(Self::Entry),
-            b"system_text" => Some(Self::SystemText),
-            b"map_text" => Some(Self::MapText),
-            b"text_body" => Some(Self::TextBody),
-            b"plugin_param" => Some(Self::PluginParam),
-            _ => None,
-        }
-    }
-
-    const fn kind(self, unit_type: Option<TextBodyUnit>) -> Option<TextGroupKind> {
-        match (self, unit_type) {
-            (Self::Entry, None) => Some(TextGroupKind::DatabaseEntry),
-            (Self::SystemText, None) => Some(TextGroupKind::System),
-            (Self::MapText, None) => Some(TextGroupKind::Map),
-            (Self::PluginParam, None) => Some(TextGroupKind::PluginParameter),
-            (Self::TextBody, Some(TextBodyUnit::Dialogue)) => Some(TextGroupKind::EventDialogue),
-            (Self::TextBody, Some(TextBodyUnit::Choices)) => Some(TextGroupKind::EventChoices),
-            (Self::TextBody, Some(TextBodyUnit::ScrollingText)) => {
-                Some(TextGroupKind::EventScrollingText)
-            }
-            (Self::TextBody, Some(TextBodyUnit::EventCommand)) => Some(TextGroupKind::EventCommand),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TextBodyUnit {
-    Dialogue,
-    Choices,
-    ScrollingText,
-    EventCommand,
-}
-
-impl TextBodyUnit {
-    const fn from_name(value: &str) -> Option<Self> {
-        match value.as_bytes() {
-            b"dialogue" => Some(Self::Dialogue),
-            b"choices" => Some(Self::Choices),
-            b"scrolling_text" => Some(Self::ScrollingText),
-            b"event_command" => Some(Self::EventCommand),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug)]
 struct DecodedRow {
-    table: AssetTable,
+    storage: MzStandardAssetStorageKind,
     kind: TextGroupKind,
     exact_location: MzLocation,
     group_location: MzLocation,
@@ -351,7 +269,7 @@ struct DecodedRow {
 
 #[derive(Debug)]
 struct LeafAccumulator {
-    table: AssetTable,
+    storage: MzStandardAssetStorageKind,
     kind: TextGroupKind,
     group_location: MzLocation,
     field_name: String,
@@ -364,7 +282,7 @@ impl LeafAccumulator {
     fn from_row(row: DecodedRow) -> (Self, Option<TerminologyDependency>) {
         let terminology_dependency = row.terminology_dependency;
         let leaf = Self {
-            table: row.table,
+            storage: row.storage,
             kind: row.kind,
             group_location: row.group_location,
             field_name: row.field_name,
@@ -376,7 +294,7 @@ impl LeafAccumulator {
     }
 
     fn accepts(&self, row: &DecodedRow) -> bool {
-        self.table == row.table
+        self.storage == row.storage
             && self.kind == row.kind
             && self.group_location == row.group_location
             && self.field_name == row.field_name
@@ -551,25 +469,26 @@ fn decode_row(row: SqliteRow) -> Result<DecodedRow, InvalidStandardTranslationAs
     let term = optional_text(next(&mut values), "term")?;
     let term_translation = optional_text(next(&mut values), "term_translation")?;
 
-    let table = AssetTable::from_name(&table_name).ok_or_else(|| {
+    let table = MzStandardAssetTable::from_storage_name(&table_name).ok_or_else(|| {
         InvalidStandardTranslationAssetSnapshot::UnknownAssetTable(table_name.clone())
     })?;
-    if owner != "builtin" && owner != "rules" {
+    if MzStandardAssetOwner::from_storage_name(&owner).is_none() {
         return Err(InvalidStandardTranslationAssetSnapshot::UnknownOwner(owner));
     }
     let unit = unit_type
         .as_deref()
         .map(|value| {
-            TextBodyUnit::from_name(value).ok_or_else(|| {
+            MzTextBodyUnit::from_storage_name(value).ok_or_else(|| {
                 InvalidStandardTranslationAssetSnapshot::UnknownUnitType(value.to_owned())
             })
         })
         .transpose()?;
-    let kind = table.kind(unit).ok_or_else(|| {
+    let storage = MzStandardAssetStorageKind::from_parts(table, unit).ok_or_else(|| {
         InvalidStandardTranslationAssetSnapshot::UnexpectedUnitType {
             table: table_name.clone(),
         }
     })?;
+    let kind = storage.group_kind();
 
     if field_name.is_empty() {
         return Err(InvalidStandardTranslationAssetSnapshot::BlankFieldName);
@@ -605,7 +524,7 @@ fn decode_row(row: SqliteRow) -> Result<DecodedRow, InvalidStandardTranslationAs
     };
 
     Ok(DecodedRow {
-        table,
+        storage,
         kind,
         exact_location: MzLocationCodec::decode(&exact_location).map_err(|source| {
             InvalidStandardTranslationAssetSnapshot::InvalidLocation {
@@ -758,6 +677,7 @@ fn insert_dependency(
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -840,7 +760,7 @@ mod tests {
 
     #[test]
     fn config_preserves_explicit_non_zero_limits() {
-        let config = MzStandardTranslationAssetReadingConfig::new(non_zero(3), non_zero(12));
+        let config = MzStandardAssetReadingConfig::new(non_zero(3), non_zero(12));
 
         assert_eq!(config.decode_concurrency().get(), 3);
         assert_eq!(config.leaves_per_decode_job().get(), 12);
@@ -1043,7 +963,7 @@ mod tests {
                     max_active: Arc::clone(&self.max_cpu_active),
                     fail: false,
                 },
-                MzStandardTranslationAssetReadingConfig::new(
+                MzStandardAssetReadingConfig::new(
                     non_zero(decode_concurrency),
                     non_zero(leaves_per_job),
                 ),

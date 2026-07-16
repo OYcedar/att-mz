@@ -8,13 +8,16 @@ use std::path::PathBuf;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::att_mz::project::OpenedProject;
+use crate::att_mz::standard_asset::{
+    MzStandardAssetOwner, MzStandardAssetStorageKind, MzStandardAssetTable,
+};
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
     ExecuteTransactionError, SqliteBatch, SqliteCheckId, SqliteCommand, SqliteQuery,
     SqliteTransactionExecutor, SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
 };
 
-use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, RulesSnapshot, TextGroupKind};
+use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, RulesSnapshot};
 use super::{BuiltinSnapshotStore, RulesSnapshotStore};
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
 
@@ -273,7 +276,7 @@ where
     async fn replace(
         &self,
         project: &OpenedProject,
-        owner: SnapshotOwner,
+        owner: MzStandardAssetOwner,
         groups: Vec<ExtractedTextGroup>,
     ) -> Result<(), MzExtractionAssetStoreError<C::Error, S::Error>> {
         let batches = split_groups(groups, self.config.groups_per_encode_job.get());
@@ -311,8 +314,12 @@ where
         project: &OpenedProject,
         snapshot: BuiltinSnapshot,
     ) -> Result<(), Self::Error> {
-        self.replace(project, SnapshotOwner::Builtin, snapshot.into_groups())
-            .await
+        self.replace(
+            project,
+            MzStandardAssetOwner::Builtin,
+            snapshot.into_groups(),
+        )
+        .await
     }
 }
 
@@ -328,7 +335,7 @@ where
         project: &OpenedProject,
         snapshot: RulesSnapshot,
     ) -> Result<(), Self::Error> {
-        self.replace(project, SnapshotOwner::Rules, snapshot.into_groups())
+        self.replace(project, MzStandardAssetOwner::Rules, snapshot.into_groups())
             .await
     }
 }
@@ -396,68 +403,6 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
-enum SnapshotOwner {
-    Builtin,
-    Rules,
-}
-
-impl SnapshotOwner {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Builtin => "builtin",
-            Self::Rules => "rules",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum AssetTable {
-    Entry,
-    SystemText,
-    MapText,
-    TextBody(TextBodyUnit),
-    PluginParam,
-}
-
-impl AssetTable {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Entry => "entry",
-            Self::SystemText => "system_text",
-            Self::MapText => "map_text",
-            Self::TextBody(_) => "text_body",
-            Self::PluginParam => "plugin_param",
-        }
-    }
-
-    const fn unit_type(self) -> Option<&'static str> {
-        match self {
-            Self::TextBody(unit) => Some(unit.as_str()),
-            Self::Entry | Self::SystemText | Self::MapText | Self::PluginParam => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum TextBodyUnit {
-    Dialogue,
-    Choices,
-    ScrollingText,
-    EventCommand,
-}
-
-impl TextBodyUnit {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Dialogue => "dialogue",
-            Self::Choices => "choices",
-            Self::ScrollingText => "scrolling_text",
-            Self::EventCommand => "event_command",
-        }
-    }
-}
-
 fn split_groups(
     groups: Vec<ExtractedTextGroup>,
     groups_per_job: usize,
@@ -475,23 +420,25 @@ fn split_groups(
 
 fn encode_batch(
     groups: Vec<ExtractedTextGroup>,
-    owner: SnapshotOwner,
+    owner: MzStandardAssetOwner,
 ) -> Result<Vec<Vec<SqliteValue>>, MzLocationCodecError> {
     let capacity = groups.iter().map(|group| group.fields().len()).sum();
     let mut parameter_sets = Vec::with_capacity(capacity);
 
     for group in groups {
-        let table = table_for(group.kind());
+        let storage = MzStandardAssetStorageKind::for_group_kind(group.kind());
         let group_location = MzLocationCodec::encode(group.group_location())?;
         for field in group.fields() {
             parameter_sets.push(vec![
-                text(table.name()),
+                text(storage.table().storage_name()),
                 text(MzLocationCodec::encode(field.exact_location())?),
-                text(owner.as_str()),
+                text(owner.storage_name()),
                 text(group_location.clone()),
                 text(field.field_name()),
                 text(field.original_text()),
-                table.unit_type().map_or(SqliteValue::Null, text),
+                storage
+                    .unit_type()
+                    .map_or(SqliteValue::Null, |unit| text(unit.storage_name())),
             ]);
         }
     }
@@ -499,25 +446,12 @@ fn encode_batch(
     Ok(parameter_sets)
 }
 
-const fn table_for(kind: TextGroupKind) -> AssetTable {
-    match kind {
-        TextGroupKind::DatabaseEntry => AssetTable::Entry,
-        TextGroupKind::System => AssetTable::SystemText,
-        TextGroupKind::Map => AssetTable::MapText,
-        TextGroupKind::EventDialogue => AssetTable::TextBody(TextBodyUnit::Dialogue),
-        TextGroupKind::EventChoices => AssetTable::TextBody(TextBodyUnit::Choices),
-        TextGroupKind::EventScrollingText => AssetTable::TextBody(TextBodyUnit::ScrollingText),
-        TextGroupKind::EventCommand => AssetTable::TextBody(TextBodyUnit::EventCommand),
-        TextGroupKind::PluginParameter => AssetTable::PluginParam,
-    }
-}
-
 fn text(value: impl Into<String>) -> SqliteValue {
     SqliteValue::Text(value.into())
 }
 
 fn build_transaction_plan(
-    owner: SnapshotOwner,
+    owner: MzStandardAssetOwner,
     parameter_sets: Vec<Vec<SqliteValue>>,
 ) -> SqliteTransactionPlan {
     let mut steps = Vec::with_capacity(24);
@@ -554,21 +488,21 @@ fn build_transaction_plan(
     ));
     steps.push(execute(
         DELETE_INVALIDATED_TERMINOLOGY_DEPENDENCIES,
-        vec![text(owner.as_str())],
+        vec![text(owner.storage_name())],
     ));
 
     for statement in DELETE_OWNER_FROM_TABLES {
-        steps.push(execute(statement, vec![text(owner.as_str())]));
+        steps.push(execute(statement, vec![text(owner.storage_name())]));
     }
 
     for (statement, table) in [
-        (INSERT_ENTRY, "entry"),
-        (INSERT_SYSTEM_TEXT, "system_text"),
-        (INSERT_MAP_TEXT, "map_text"),
-        (INSERT_TEXT_BODY, "text_body"),
-        (INSERT_PLUGIN_PARAM, "plugin_param"),
+        (INSERT_ENTRY, MzStandardAssetTable::Entry),
+        (INSERT_SYSTEM_TEXT, MzStandardAssetTable::SystemText),
+        (INSERT_MAP_TEXT, MzStandardAssetTable::MapText),
+        (INSERT_TEXT_BODY, MzStandardAssetTable::TextBody),
+        (INSERT_PLUGIN_PARAM, MzStandardAssetTable::PluginParam),
     ] {
-        steps.push(execute(statement, vec![text(table)]));
+        steps.push(execute(statement, vec![text(table.storage_name())]));
     }
 
     steps.push(execute(DROP_STAGING_TABLE, Vec::new()));
@@ -614,6 +548,7 @@ mod tests {
     use crate::att_mz::ProjectName;
     use crate::att_mz::extract::document::StandardDataFile;
     use crate::att_mz::extract::model::{ExtractedTextField, MzLocation, MzLocationStep, MzSource};
+    use crate::att_mz::text::TextGroupKind;
 
     use super::*;
 
