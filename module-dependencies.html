@@ -3,11 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ATT MZ 当前模块依赖关系</title>
+<title>ATT MZ 四棵功能职责树</title>
+<meta name="description" content="用四棵可交互职责树解释 ATT MZ 当前已实现模块的归属、作用、调用关系和直白例子。">
 <link rel="icon" href="data:,">
 <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-<link rel="preload" as="style" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/lxgwwenkai-regular.css" onload="this.onload=null;this.rel='stylesheet'">
-<noscript><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/lxgwwenkai-regular.css"></noscript>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/lxgwwenkai-regular.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/lxgwwenkai-bold.css">
 <style>
 :root {
   --paper: #faf7f0;
@@ -22,756 +23,2299 @@
   --red: #d64550;
   --purple: #8958d8;
   --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
-  --font-hand: 'LXGW WenKai', 'Xiaolai SC', 'KaiTi', 'STKaiti', 'AR PL UKai CN', cursive;
-  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Consolas, monospace;
+  --font-hand: "LXGW WenKai", "Xiaolai SC", "KaiTi", "STKaiti", "AR PL UKai CN", cursive;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
   --wobble-a: 255px 15px 225px 15px / 15px 225px 15px 255px;
   --wobble-b: 15px 225px 15px 255px / 255px 15px 225px 15px;
 }
-* { box-sizing: border-box; }
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
+  scroll-behavior: smooth;
+}
+
 body {
   margin: 0;
+  min-width: 320px;
   color: var(--ink);
-  background: var(--paper);
+  background-color: var(--paper);
   background-image: radial-gradient(var(--line) 0.8px, transparent 0.8px);
   background-size: 26px 26px;
   font-family: var(--font-hand);
   font-size: 15px;
   line-height: 1.7;
 }
-.container { max-width: 1680px; margin: 0 auto; padding: 36px 24px 64px; }
-h1 { margin: 0; font-size: 28px; line-height: 1.25; }
-h2 { margin: 0 0 10px; font-size: 20px; }
-h3 { margin: 0 0 8px; font-size: 16px; }
-.subtitle { max-width: 980px; margin: 8px 0 0; color: var(--ink-soft); }
-section { margin-top: 30px; }
-code {
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--ink) 8%, transparent);
-  font-family: var(--font-mono);
-  font-size: 0.85em;
+
+button,
+a {
+  font: inherit;
 }
-.toolbar, .stepper { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.toolbar { margin-top: 20px; }
-.toolbar-label { margin-right: 3px; color: var(--ink-faint); font-size: 13px; }
-.filter-btn, .step-btn {
-  border: 1.6px solid var(--ink);
+
+button {
+  color: inherit;
+}
+
+button:focus-visible,
+a:focus-visible,
+[tabindex="0"]:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--blue) 38%, transparent);
+  outline-offset: 3px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--amber) 28%, transparent);
+}
+
+.page {
+  width: min(1480px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 34px 0 64px;
+}
+
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 24px;
+  align-items: end;
+  padding: 10px 8px 24px;
+}
+
+.kicker,
+.section-kicker,
+.branch-kicker,
+.inspector-kicker {
+  margin: 0;
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+h1 {
+  max-width: 820px;
+  margin: 6px 0 0;
+  font-size: clamp(29px, 4vw, 48px);
+  line-height: 1.18;
+  letter-spacing: -0.025em;
+}
+
+.hero-copy {
+  max-width: 850px;
+  margin: 14px 0 0;
+  color: var(--ink-soft);
+  font-size: 16px;
+}
+
+.hero-copy strong {
+  color: var(--ink);
+}
+
+.hero-note {
+  width: min(330px, 100%);
+  padding: 13px 16px;
+  border-left: 3px solid var(--blue);
+  background: color-mix(in srgb, var(--blue) 5%, var(--paper-alt));
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.hero-note strong {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin: 0 8px 25px;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.legend-mark {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1.5px solid var(--ink-soft);
+  border-radius: 50%;
+  background: var(--paper-alt);
+  color: var(--ink);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.forest {
+  padding: 22px;
+  border: 1.7px solid var(--ink);
+  border-radius: var(--wobble-a);
+  background: color-mix(in srgb, var(--paper-alt) 96%, transparent);
+  box-shadow: 7px 8px 0 color-mix(in srgb, var(--ink) 6%, transparent);
+}
+
+.forest-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+.forest-heading h2 {
+  margin: 2px 0 0;
+  font-size: 21px;
+}
+
+.forest-heading p {
+  max-width: 620px;
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+  text-align: right;
+}
+
+.root-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 13px;
+}
+
+.root-card {
+  --c: var(--ink);
+  position: relative;
+  min-height: 154px;
+  padding: 17px 17px 15px;
+  overflow: hidden;
+  border: 1.8px solid var(--ink);
   border-radius: var(--wobble-b);
   background: var(--paper-alt);
-  color: var(--ink-soft);
-  font-family: var(--font-hand);
+  text-align: left;
   cursor: pointer;
-  transition: color 0.2s var(--ease), background-color 0.2s var(--ease), transform 0.2s var(--ease);
+  transition:
+    transform 0.22s var(--ease),
+    border-color 0.22s var(--ease),
+    background-color 0.22s var(--ease),
+    box-shadow 0.22s var(--ease);
 }
-.filter-btn { padding: 5px 12px; font-size: 13px; }
-.step-btn { padding: 6px 13px; font-size: 14px; }
-.filter-btn:hover, .step-btn:hover { color: var(--ink); transform: translateY(-1px); }
-.filter-btn.is-current { border-color: var(--purple); color: var(--purple); }
-.step-btn.is-current { border-color: var(--ink); background: var(--ink); color: var(--paper-alt); }
-.layout-split {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 20px;
+
+.root-card:nth-child(even) {
+  border-radius: var(--wobble-a);
+}
+
+.root-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 5px;
+  background: var(--c);
+  opacity: 0.82;
+}
+
+.root-card::after {
+  content: "↓";
+  position: absolute;
+  right: 15px;
+  bottom: 11px;
+  color: var(--c);
+  font-size: 21px;
+  font-weight: 700;
+  transition: transform 0.24s var(--ease);
+}
+
+.root-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--c);
+  box-shadow: 5px 6px 0 color-mix(in srgb, var(--c) 12%, transparent);
+}
+
+.root-card.is-open {
+  transform: translateY(-2px);
+  border-color: var(--c);
+  background: color-mix(in srgb, var(--c) 8%, var(--paper-alt));
+  box-shadow: 5px 6px 0 color-mix(in srgb, var(--c) 14%, transparent);
+}
+
+.root-card.is-open::after {
+  transform: rotate(180deg);
+}
+
+.root-topline {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
   align-items: start;
 }
-.diagram, .panel, .legend, .card {
+
+.root-index {
+  color: var(--c);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.root-status {
+  padding: 2px 8px;
+  border: 1px solid color-mix(in srgb, var(--c) 58%, var(--line));
+  border-radius: 999px;
+  color: var(--c);
+  background: color-mix(in srgb, var(--c) 7%, var(--paper-alt));
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.root-name {
+  display: block;
+  margin-top: 10px;
+  font-family: var(--font-mono);
+  font-size: clamp(18px, 2vw, 25px);
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.root-zh {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.root-desc {
+  display: block;
+  max-width: 92%;
+  margin-top: 10px;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.branch-shell {
+  display: grid;
+  grid-template-rows: 0fr;
+  margin-top: 0;
+  opacity: 0;
+  transition:
+    grid-template-rows 0.44s var(--ease),
+    opacity 0.3s var(--ease),
+    margin-top 0.44s var(--ease);
+}
+
+.branch-shell.is-open {
+  grid-template-rows: 1fr;
+  margin-top: 20px;
+  opacity: 1;
+}
+
+.branch-clip {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.branch-card {
+  --c: var(--blue);
+  position: relative;
+  padding: 18px;
   border: 1.6px solid var(--ink);
   border-radius: var(--wobble-a);
   background: var(--paper-alt);
 }
-.diagram {
-  min-height: 320px;
-  padding: 12px;
-  contain: layout paint style;
-  overflow: hidden;
+
+.branch-card::before {
+  content: "";
+  position: absolute;
+  top: -14px;
+  left: 50%;
+  width: 1.6px;
+  height: 14px;
+  background: var(--c);
 }
-.diagram svg { display: block; width: 100%; height: auto; }
-.panel, .card { padding: 16px; }
-.panel { position: sticky; top: 14px; }
-.panel p, .card p { margin: 0; color: var(--ink-soft); font-size: 13.5px; }
-.legend {
+
+.branch-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: start;
+  padding: 2px 2px 13px;
+  border-bottom: 1px dashed var(--line);
+}
+
+.branch-title {
   display: flex;
   flex-wrap: wrap;
-  gap: 9px 20px;
-  margin-top: 12px;
-  padding: 10px 14px;
+  gap: 9px;
+  align-items: baseline;
+}
+
+.branch-title h3 {
+  margin: 0;
+  font-size: 21px;
+}
+
+.branch-summary {
+  margin: 3px 0 0;
   color: var(--ink-soft);
   font-size: 13px;
 }
-.legend-item { display: inline-flex; align-items: center; gap: 8px; }
-.legend-line { width: 34px; border-top: 2px solid var(--blue); }
-.legend-line.dashed { border-top-style: dashed; border-top-color: var(--teal); }
-.legend-node { width: 28px; height: 15px; border: 2px dashed var(--teal); border-radius: 6px; }
-.legend-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--purple); }
-.status-note { margin-top: 12px; padding-top: 11px; border-top: 1.4px dashed var(--line); }
-.kv { display: flex; justify-content: space-between; gap: 12px; margin-top: 7px; font-size: 13px; }
-.kv .k { color: var(--ink-faint); }
-.kv .v { color: var(--ink-soft); text-align: right; }
-.card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); gap: 15px; }
-.card:nth-child(even) { border-radius: var(--wobble-b); }
-.card.implemented { border-color: var(--blue); }
-.card.contract { border-color: var(--teal); }
-.card.important { border-color: var(--red); }
-.completion-section { content-visibility: auto; contain-intrinsic-size: auto 300px; }
-.node { cursor: default; }
-.node .shape path, .node .shape rect {
-  fill: none;
-  stroke: var(--c, var(--ink));
-  stroke-width: 1.6;
-  transition: stroke-width 0.2s var(--ease), opacity 0.25s var(--ease);
+
+.tree-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: end;
+  gap: 7px;
 }
-.node .node-label {
+
+.small-btn {
+  padding: 5px 11px;
+  border: 1.4px solid var(--ink-soft);
+  border-radius: var(--wobble-b);
+  background: var(--paper-alt);
+  color: var(--ink-soft);
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    color 0.18s var(--ease),
+    border-color 0.18s var(--ease),
+    background-color 0.18s var(--ease),
+    transform 0.18s var(--ease);
+}
+
+.small-btn:hover {
+  transform: translateY(-1px);
+  border-color: var(--c);
+  color: var(--c);
+  background: color-mix(in srgb, var(--c) 6%, var(--paper-alt));
+}
+
+.small-btn.is-strong {
+  border-color: var(--c);
+  color: var(--c);
+}
+
+.sequence-strip {
+  display: flex;
+  gap: 9px;
+  align-items: start;
+  margin: 12px 2px 0;
+  padding: 9px 11px;
+  border-left: 3px solid var(--c);
+  background: color-mix(in srgb, var(--c) 5%, var(--paper-alt));
+  color: var(--ink-soft);
+  font-size: 12.5px;
+}
+
+.sequence-strip strong {
+  flex: none;
+  color: var(--ink);
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 0fr;
+  gap: 0;
+  align-items: start;
+  margin-top: 14px;
+  transition:
+    grid-template-columns 0.36s var(--ease),
+    gap 0.36s var(--ease);
+}
+
+.workspace.has-inspector {
+  grid-template-columns: minmax(0, 1fr) minmax(310px, 360px);
+  gap: 14px;
+}
+
+.tree-pane {
+  min-width: 0;
+  border: 1.4px solid var(--line);
+  border-radius: var(--wobble-b);
+  background:
+    linear-gradient(color-mix(in srgb, var(--line) 32%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--line) 32%, transparent) 1px, transparent 1px),
+    var(--paper-alt);
+  background-size: 34px 34px;
+}
+
+.tree-guide {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px dashed var(--line);
+  color: var(--ink-soft);
+  background: color-mix(in srgb, var(--paper) 65%, transparent);
+  font-size: 11.5px;
+}
+
+.tree-guide span:last-child {
+  text-align: right;
+}
+
+.tree-scroller {
+  min-height: 300px;
+  overflow: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-color: var(--line) transparent;
+  scrollbar-width: thin;
+}
+
+.tree-scroller svg {
+  display: block;
+  max-width: none;
+}
+
+.tree-empty {
+  display: grid;
+  min-height: 290px;
+  place-items: center;
+  color: var(--ink-soft);
+}
+
+.tree-foot {
+  padding: 7px 12px;
+  border-top: 1px dashed var(--line);
+  color: var(--ink-faint);
+  font-size: 11.5px;
+}
+
+.inspector-rail {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.inspector {
+  --c: var(--blue);
+  min-width: 310px;
+  max-height: min(720px, calc(100vh - 100px));
+  overflow: auto;
+  border: 1.6px solid var(--ink);
+  border-radius: var(--wobble-a);
+  background: var(--paper-alt);
+  box-shadow: 5px 6px 0 color-mix(in srgb, var(--c) 10%, transparent);
+}
+
+.inspector-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+  padding: 16px 16px 13px;
+  border-bottom: 1px dashed var(--line);
+  background: color-mix(in srgb, var(--paper-alt) 94%, transparent);
+  backdrop-filter: blur(8px);
+}
+
+.inspector-title {
+  margin: 3px 0 0;
+  font-size: 19px;
+  line-height: 1.25;
+}
+
+.inspector-symbol {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.close-inspector {
+  display: grid;
+  flex: none;
+  width: 31px;
+  height: 31px;
+  place-items: center;
+  border: 1.3px solid var(--ink-soft);
+  border-radius: 50%;
+  background: var(--paper-alt);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.close-inspector:hover {
+  border-color: var(--c);
+  color: var(--c);
+}
+
+.inspector-body {
+  padding: 15px 16px 18px;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 13px;
+}
+
+.chip {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-soft);
+  background: var(--paper);
+  font-size: 11px;
+}
+
+.chip.is-tone {
+  border-color: color-mix(in srgb, var(--c) 52%, var(--line));
+  color: var(--c);
+  background: color-mix(in srgb, var(--c) 6%, var(--paper-alt));
+}
+
+.detail-block + .detail-block {
+  margin-top: 15px;
+}
+
+.detail-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.detail-block p {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.75;
+}
+
+.detail-block p strong {
+  color: var(--ink);
+}
+
+.example-box {
+  position: relative;
+  padding: 11px 12px 11px 14px;
+  border-left: 3px solid var(--c);
+  background: color-mix(in srgb, var(--c) 6%, var(--paper-alt));
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.75;
+}
+
+.io-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.io-item {
+  padding: 9px 10px;
+  border: 1px dashed var(--line);
+  background: var(--paper);
+}
+
+.io-item b {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--c);
+  font-size: 11px;
+}
+
+.io-item span {
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.location-box {
+  padding: 9px 10px;
+  border: 1px dashed var(--line);
+  color: var(--ink-soft);
+  background: var(--paper);
+  font-size: 12px;
+}
+
+.location-box strong {
+  color: var(--ink);
+}
+
+.source-link {
+  display: block;
+  margin-top: 6px;
+  color: var(--c);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.boundary-note {
+  margin-top: 14px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--red) 32%, var(--line));
+  background: color-mix(in srgb, var(--red) 4%, var(--paper-alt));
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.page-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 18px 8px 0;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+}
+
+.tree-edge path,
+.tree-edge polyline {
+  fill: none;
+  stroke: var(--ink-soft);
+  stroke-width: 1.55;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tree-edge .edge-rough path {
+  stroke: var(--ink-soft);
+}
+
+.tree-node {
+  --c: var(--blue);
+  cursor: pointer;
+  transition: opacity 0.22s var(--ease);
+}
+
+.tree-node .node-bg {
+  fill: var(--paper-alt);
+  stroke: none;
+  transition: fill 0.2s var(--ease);
+}
+
+.tree-node .node-shape path,
+.tree-node .node-shape rect,
+.tree-node path.node-shape,
+.tree-node rect.node-shape {
+  fill: none;
+  stroke: var(--c);
+  stroke-width: 1.55;
+  transition: stroke-width 0.2s var(--ease);
+}
+
+.tree-node:hover .node-bg,
+.tree-node.is-active .node-bg {
+  fill: color-mix(in srgb, var(--c) 10%, var(--paper-alt));
+}
+
+.tree-node:hover .node-shape path,
+.tree-node:hover .node-shape rect,
+.tree-node:hover path.node-shape,
+.tree-node:hover rect.node-shape,
+.tree-node.is-active .node-shape path,
+.tree-node.is-active .node-shape rect,
+.tree-node.is-active path.node-shape,
+.tree-node.is-active rect.node-shape {
+  stroke-width: 2.5;
+}
+
+.tree-node.is-same-module .node-shape path,
+.tree-node.is-same-module .node-shape rect,
+.tree-node.is-same-module path.node-shape,
+.tree-node.is-same-module rect.node-shape {
+  stroke-dasharray: 7 4;
+  stroke-width: 2.15;
+}
+
+.node-title {
   fill: var(--ink);
   font-family: var(--font-hand);
   font-size: 14px;
   font-weight: 700;
   text-anchor: middle;
-  dominant-baseline: central;
+  dominant-baseline: middle;
+  pointer-events: none;
 }
-.node .node-sub {
+
+.node-symbol {
   fill: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 9.6px;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
+.node-corner {
+  fill: var(--c);
   font-family: var(--font-hand);
   font-size: 11px;
-  text-anchor: middle;
-  dominant-baseline: central;
-}
-.node.is-active .shape path, .node.is-active .shape rect { stroke-width: 2.6; }
-.edge path, .edge line { fill: none; stroke: var(--ink-soft); }
-.edge .shaft { stroke-width: 1.6; }
-.edge.is-active path, .edge.is-active line { stroke: var(--c, var(--blue)); }
-.edge-label {
-  fill: var(--ink-soft);
-  font-family: var(--font-hand);
-  font-size: 10.5px;
-  text-anchor: middle;
-}
-.edge-label.is-active { fill: var(--c, var(--blue)); font-weight: 700; }
-.group path, .group rect { fill: none; stroke: var(--c, var(--ink-faint)); }
-.group text {
-  fill: var(--c, var(--ink-faint));
-  font-family: var(--font-hand);
-  font-size: 12px;
   font-weight: 700;
-  letter-spacing: 0.06em;
+  dominant-baseline: middle;
+  pointer-events: none;
 }
-.node, .edge, .edge-label, .group { transition: opacity 0.25s var(--ease); }
-.is-dimmed { opacity: 0.17; }
-@keyframes fade-in-up {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: none; }
+
+.node-reused {
+  fill: var(--c);
+  font-family: var(--font-hand);
+  font-size: 9.5px;
+  font-weight: 700;
+  text-anchor: end;
+  pointer-events: none;
 }
-.anim-in { opacity: 0; animation: fade-in-up 0.4s var(--ease) forwards; animation-delay: calc(var(--i, 0) * 55ms); }
-.panel-swap { animation: fade-in-up 0.25s var(--ease) both; }
-@media (max-width: 1180px) {
-  .layout-split { grid-template-columns: 1fr; }
-  .panel { position: static; }
+
+.draw-in {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: draw-on 0.52s var(--ease) both;
+  animation-delay: calc(var(--di, 0) * 14ms);
 }
+
+.fade-in {
+  opacity: 0;
+  animation: fade-up 0.34s var(--ease) both;
+  animation-delay: calc(var(--di, 0) * 18ms);
+}
+
+.panel-in {
+  animation: panel-in 0.3s var(--ease) both;
+}
+
+@keyframes draw-on {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateX(7px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (max-width: 1080px) {
+  .root-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workspace.has-inspector {
+    grid-template-columns: minmax(0, 1fr) minmax(290px, 330px);
+  }
+}
+
+@media (max-width: 900px) {
+  .page {
+    width: min(100% - 20px, 1480px);
+    padding-top: 20px;
+  }
+
+  .hero {
+    grid-template-columns: 1fr;
+  }
+
+  .hero-note {
+    width: 100%;
+  }
+
+  .forest {
+    padding: 15px;
+  }
+
+  .forest-heading,
+  .branch-head {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .forest-heading p {
+    text-align: left;
+  }
+
+  .tree-controls {
+    justify-content: start;
+  }
+
+  .workspace,
+  .workspace.has-inspector {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .inspector-rail {
+    display: grid;
+    grid-template-rows: 0fr;
+    margin-top: 0;
+    transition:
+      grid-template-rows 0.36s var(--ease),
+      margin-top 0.36s var(--ease);
+  }
+
+  .workspace.has-inspector .inspector-rail {
+    grid-template-rows: 1fr;
+    margin-top: 14px;
+  }
+
+  .inspector {
+    min-width: 0;
+    max-height: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .root-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .root-card {
+    min-height: 138px;
+  }
+
+  .hero {
+    padding-inline: 3px;
+  }
+
+  .legend {
+    margin-inline: 3px;
+  }
+
+  .forest {
+    padding: 12px;
+  }
+
+  .branch-card {
+    padding: 12px;
+  }
+
+  .tree-guide,
+  .page-foot {
+    flex-direction: column;
+  }
+
+  .tree-guide span:last-child {
+    text-align: left;
+  }
+
+  .io-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
-  .anim-in { opacity: 1 !important; animation: none !important; }
-  .panel-swap { animation: none !important; }
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 </style>
 </head>
 <body>
-<div class="container">
-  <header class="anim-in">
-    <h1>ATT MZ 当前模块依赖关系</h1>
-    <p class="subtitle">箭头从消费方指向直接依赖。依赖树按视图拆分，Translate 可以继续聚焦到 Planner、Executor、Store、Lua Host 和根停止线；首屏先显示轻量 SVG，rough.js 只在空闲时增强当前焦点，不再重绘整棵大图。</p>
-    <div class="toolbar" id="filters" aria-label="步骤筛选">
-      <span class="toolbar-label">筛选：</span>
-      <button type="button" class="filter-btn is-current" data-filter="all" aria-pressed="true">全部</button>
-      <button type="button" class="filter-btn" data-filter="translate" aria-pressed="false">Translate 聚焦</button>
-      <button type="button" class="filter-btn" data-filter="other" aria-pressed="false">Init / Extract</button>
+<main class="page">
+  <header class="hero">
+    <div>
+      <p class="kicker">ATT MZ · 当前已落地职责</p>
+      <h1>四个顶层功能，点开后顺着树往下看</h1>
+      <p class="hero-copy">
+        <strong>Init、Extract、Translate、WriteBack</strong> 是仅有的四个顶层功能。
+        每棵树先显示总控，再把它真正拥有的内部职责逐级展开；说明和例子默认收起，点击模块才出现。
+      </p>
     </div>
+    <aside class="hero-note" aria-label="阅读说明">
+      <strong>先认归属，再看细节</strong>
+      从上往下是“谁负责谁”。同一行只是同一个父模块的直接下级，不代表它们和父模块平级。
+    </aside>
   </header>
 
-  <section class="layout-split">
-    <div>
-      <div class="stepper anim-in" id="stepper" style="--i:1" aria-label="依赖图步骤"></div>
-      <div class="diagram anim-in" id="diagram" style="--i:2; margin-top:12px"></div>
-      <div class="legend anim-in" style="--i:3">
-        <span class="legend-item"><span class="legend-line"></span>实线箭头：直接依赖</span>
-        <span class="legend-item"><span class="legend-line dashed"></span>虚线箭头：实现契约</span>
-        <span class="legend-item"><span class="legend-node"></span>虚线节点：根接口 / 公开契约</span>
-        <span class="legend-item"><span class="legend-dot"></span>紫色：Translate 业务能力</span>
+  <div class="legend" aria-label="图例">
+    <span><i class="legend-mark">↓</i> 上级直接拥有或调用下级</span>
+    <span><i class="legend-mark">①</i> 编号表示固定执行顺序</span>
+    <span><i class="legend-mark">复</i> 同一个已实现模块在这里再次使用</span>
+  </div>
+
+  <section class="forest" aria-labelledby="forest-title">
+    <div class="forest-heading">
+      <div>
+        <p class="section-kicker">四个顶层功能</p>
+        <h2 id="forest-title">选择一棵树</h2>
+      </div>
+      <p>初始只显示四个根。点击一个根展开，重复点击同一个根即可整棵收起；一次只打开一棵。</p>
+    </div>
+
+    <div class="root-grid" id="root-grid">
+      <button class="root-card" type="button" data-root="init" aria-expanded="false" style="--c:var(--amber)">
+        <span class="root-topline">
+          <span class="root-index">01 / ROOT</span>
+          <span class="root-status">业务树已实现</span>
+        </span>
+        <span class="root-name">Init</span>
+        <span class="root-zh">建立项目</span>
+        <span class="root-desc">确认项目名、目录和语言，建立可复用的项目档案。</span>
+      </button>
+
+      <button class="root-card" type="button" data-root="extract" aria-expanded="false" style="--c:var(--teal)">
+        <span class="root-topline">
+          <span class="root-index">02 / ROOT</span>
+          <span class="root-status">业务树已实现</span>
+        </span>
+        <span class="root-name">Extract</span>
+        <span class="root-zh">提取文本</span>
+        <span class="root-desc">打开项目一次，依次收集内建、规则和 Lua 文本。</span>
+      </button>
+
+      <button class="root-card" type="button" data-root="translate" aria-expanded="false" style="--c:var(--blue)">
+        <span class="root-topline">
+          <span class="root-index">03 / ROOT</span>
+          <span class="root-status">业务树已实现</span>
+        </span>
+        <span class="root-name">Translate</span>
+        <span class="root-zh">翻译总控</span>
+        <span class="root-desc">选择配置后，把 Standard 和可选 Lua 翻译完整管起来。</span>
+      </button>
+
+      <button class="root-card" type="button" data-root="writeback" aria-expanded="false" style="--c:var(--red)">
+        <span class="root-topline">
+          <span class="root-index">04 / ROOT</span>
+          <span class="root-status">顶层编排已实现</span>
+        </span>
+        <span class="root-name">WriteBack</span>
+        <span class="root-zh">写回游戏</span>
+        <span class="root-desc">打开冻结项目，先 Standard，再把同一输出交给可选 Lua。</span>
+      </button>
+    </div>
+
+    <div class="branch-shell" id="branch-shell" aria-hidden="true" inert>
+      <div class="branch-clip">
+        <div class="branch-card" id="branch-card">
+          <div class="branch-head">
+            <div>
+              <p class="branch-kicker" id="branch-kicker">当前职责树</p>
+              <div class="branch-title">
+                <h3 id="branch-title"></h3>
+              </div>
+              <p class="branch-summary" id="branch-summary"></p>
+            </div>
+            <div class="tree-controls" aria-label="树控制">
+              <button class="small-btn" id="first-level-btn" type="button">只看第一层</button>
+              <button class="small-btn is-strong" id="expand-all-btn" type="button">展开整棵树</button>
+              <button class="small-btn" id="close-tree-btn" type="button">收起整棵</button>
+            </div>
+          </div>
+
+          <div class="sequence-strip" id="sequence-strip">
+            <strong>总控顺序</strong>
+            <span id="sequence-text"></span>
+          </div>
+
+          <div class="workspace" id="workspace">
+            <div class="tree-pane">
+              <div class="tree-guide">
+                <span>点击有 “+” 的模块：展开下级，同时查看通俗解释</span>
+                <span>点击叶子：只打开说明；按 Esc 收起说明</span>
+              </div>
+              <div class="tree-scroller" id="tree-scroller">
+                <div class="tree-empty">选择上方四个根之一</div>
+              </div>
+              <div class="tree-foot" id="tree-foot">树中展示已实现业务模块及其当前直接契约；根接口不代表生产适配器已经存在。</div>
+            </div>
+            <div class="inspector-rail">
+              <aside class="inspector" id="inspector" aria-live="polite"></aside>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
-    <aside class="panel anim-in" id="step-panel" style="--i:3" aria-live="polite" aria-label="当前步骤说明"></aside>
   </section>
 
-  <section class="completion-section anim-in" style="--i:4">
-    <h2>当前完成边界</h2>
-    <div class="card-grid">
-      <article class="card implemented">
-        <h3>Translate 非根业务树</h3>
-        <p>资产读取、译前规划、语言与占位符、模型执行、响应验收、结果 Store 和可信 Lua Host 都已推进到实现层；顶层仍保持 Standard → 可选 Lua 的固定顺序。</p>
-      </article>
-      <article class="card contract">
-        <h3>只剩真实运行根</h3>
-        <p>停止线是文件、CPU、SQLite 查询/事务、LLM 请求、异步延时、Lua VM 与 SQLite 交互会话等根接口。虚线表示契约存在，但没有生产适配器。</p>
-      </article>
-      <article class="card">
-        <h3>配置全部由外部建立</h3>
-        <p>并发、批量、消息容量、完整 system Markdown、重试延时、语言阈值和 LLM 请求选项都从外部显式注入；模块没有 <code>Default</code>，也不探测硬件自行决定。</p>
-      </article>
-      <article class="card important">
-        <h3>仍不是端到端完成</h3>
-        <p>当前没有根适配器和生产组合根，因此不能声称真实游戏已经读取、模型已经请求、译文已经写入或 Lua 已在真实 VM 中执行。</p>
-      </article>
-    </div>
-  </section>
-</div>
+  <footer class="page-foot">
+    <span>页面口径：源码中已经落地的职责与真实调用关系。</span>
+    <span>WriteBack 顶层与 Standard 业务编排已实现；真实 SQL、布局、文档改写、发布和 Lua Host 仍停在契约边界。</span>
+  </footer>
+</main>
 
-<script type="module">
-const SKETCH = { seed: 7, roughness: 1.15, bowing: 1.0 };
-const NS = 'http://www.w3.org/2000/svg';
-const ROOT = 'interface';
+<script>
+(function () {
+  "use strict";
 
-function node(id, x, y, label, sub, color = 'var(--purple)', status = 'implementation', w = 260, h = 64) {
-  return { id, x, y, w, h, label, sub, color, status };
-}
-function edge(id, from, to, label, color = 'var(--purple)', options = {}) {
-  return { id, from, to, label, color, fromPort: 'bottom', toPort: 'top', ...options };
-}
-
-const diagrams = {
-  overview: {
-    viewBox: '0 0 1250 530',
-    groups: [{ x: 12, y: 12, w: 1226, h: 500, label: '统一入口与独立纵向切片', color: 'var(--blue)' }],
-    nodes: [
-      node('mz_cli', 495, 35, 'MzCli', '统一入口 · 参数解析与路由', 'var(--amber)'),
-      node('init_contract', 30, 155, 'InitUseCase', '引擎命令契约', 'var(--blue)', ROOT),
-      node('extract_contract', 330, 155, 'ExtractUseCase', '引擎命令契约', 'var(--blue)', ROOT),
-      node('translate_contract', 630, 155, 'TranslateUseCase', '引擎命令契约', 'var(--blue)', ROOT),
-      node('write_contract', 930, 155, 'WriteBackUseCase', '引擎命令契约', 'var(--blue)', ROOT),
-      node('init_service', 30, 310, 'InitService', '已实现顶层编排', 'var(--blue)'),
-      node('extract_service', 330, 310, 'ExtractService', '已实现固定阶段顺序', 'var(--blue)'),
-      node('translate_service', 630, 310, 'TranslateService', '已实现 Standard → Lua', 'var(--blue)'),
-    ],
-    edges: [
-      edge('cli_init', 'mz_cli', 'init_contract', '直接依赖', 'var(--blue)', { fromDx: -90, curve: 24 }),
-      edge('cli_extract', 'mz_cli', 'extract_contract', '直接依赖', 'var(--blue)', { fromDx: -30, curve: 10 }),
-      edge('cli_translate', 'mz_cli', 'translate_contract', '直接依赖', 'var(--blue)', { fromDx: 30, curve: -10 }),
-      edge('cli_write', 'mz_cli', 'write_contract', '直接依赖', 'var(--blue)', { fromDx: 90, curve: -24 }),
-      edge('impl_init', 'init_service', 'init_contract', '实现契约', 'var(--blue)', { fromPort: 'top', toPort: 'bottom', dash: true }),
-      edge('impl_extract', 'extract_service', 'extract_contract', '实现契约', 'var(--blue)', { fromPort: 'top', toPort: 'bottom', dash: true }),
-      edge('impl_translate', 'translate_service', 'translate_contract', '实现契约', 'var(--blue)', { fromPort: 'top', toPort: 'bottom', dash: true }),
-    ],
-  },
-  initExtract: {
-    viewBox: '0 0 1520 850',
-    groups: [
-      { x: 12, y: 12, w: 430, h: 815, label: 'Init 链路', color: 'var(--blue)' },
-      { x: 465, y: 12, w: 1040, h: 815, label: 'Extract 非根实现与根停止线', color: 'var(--purple)' },
-    ],
-    nodes: [
-      node('init_service', 90, 65, 'InitService', '已实现', 'var(--blue)'),
-      node('directory_resolver', 40, 210, 'ExistingDirectoryResolver', '根接口', 'var(--teal)', ROOT, 300),
-      node('project_creator', 90, 350, 'ProjectDatabaseCreator', '职责契约', 'var(--teal)', ROOT),
-      node('project_creation', 90, 490, 'ProjectDatabaseCreationService', '已实现', 'var(--teal)', 'implementation', 290),
-      node('sqlite_creator', 90, 640, 'SqliteDatabaseCreator', '根接口', 'var(--teal)', ROOT),
-      node('extract_service', 850, 55, 'ExtractService', 'Builtin → Rules → Lua', 'var(--blue)'),
-      node('opener', 500, 190, 'ExistingProjectOpeningService', '已实现', 'var(--purple)', 'implementation', 290),
-      node('builtin', 820, 190, 'BuiltInExtractionService', '已实现', 'var(--purple)'),
-      node('rules', 1100, 190, 'RulesExtractionService', '已实现', 'var(--purple)'),
-      node('lua_extract', 1240, 330, 'LuaExtractionService', '已实现', 'var(--purple)'),
-      node('record_reading', 500, 350, 'ProjectDatabaseRecordReadingService', '已实现', 'var(--teal)', 'implementation', 310),
-      node('document_reading', 820, 350, 'MzProjectDocumentReadingService', '已实现', 'var(--teal)', 'implementation', 300),
-      node('asset_store', 1100, 490, 'MzExtractionAssetStore', '已实现快照事务', 'var(--teal)'),
-      node('file_reader', 500, 680, 'FileReader', '根接口', 'var(--teal)', ROOT),
-      node('directory_lister', 780, 680, 'DirectoryLister', '根接口', 'var(--teal)', ROOT),
-      node('cpu', 1060, 680, 'CpuTaskExecutor', '根接口', 'var(--teal)', ROOT),
-      node('sqlite_query', 500, 510, 'SqliteQueryExecutor', '根接口', 'var(--teal)', ROOT),
-      node('sqlite_tx', 1340, 610, 'SqliteTransactionExecutor', '根接口', 'var(--teal)', ROOT),
-    ],
-    edges: [
-      edge('init_directory', 'init_service', 'directory_resolver', '直接依赖', 'var(--teal)', { fromDx: -45, curve: 8 }),
-      edge('init_creator', 'init_service', 'project_creator', '直接依赖', 'var(--teal)', { fromDx: 45, curve: -8 }),
-      edge('creator_impl', 'project_creation', 'project_creator', '实现契约', 'var(--teal)', { fromPort: 'top', toPort: 'bottom', dash: true }),
-      edge('creator_sqlite', 'project_creation', 'sqlite_creator', '直接依赖', 'var(--teal)'),
-      edge('extract_open', 'extract_service', 'opener', '打开项目', 'var(--purple)', { fromDx: -90, curve: 16 }),
-      edge('extract_builtin', 'extract_service', 'builtin', 'Builtin', 'var(--purple)', { fromDx: -28, curve: 5 }),
-      edge('extract_rules', 'extract_service', 'rules', 'Rules', 'var(--purple)', { fromDx: 28, curve: -5 }),
-      edge('extract_lua', 'extract_service', 'lua_extract', 'Lua', 'var(--purple)', { fromDx: 90, curve: -24 }),
-      edge('open_record', 'opener', 'record_reading', '项目记录', 'var(--teal)'),
-      edge('record_query', 'record_reading', 'sqlite_query', '查询', 'var(--teal)'),
-      edge('builtin_docs', 'builtin', 'document_reading', '读取 MZ 文档', 'var(--teal)'),
-      edge('rules_docs', 'rules', 'document_reading', '读取 MZ 文档', 'var(--teal)', { fromDx: -38, curve: 14 }),
-      edge('builtin_store', 'builtin', 'asset_store', '快照提交', 'var(--teal)', { fromDx: 42, curve: -24 }),
-      edge('rules_store', 'rules', 'asset_store', '快照提交', 'var(--teal)'),
-      edge('document_file', 'document_reading', 'file_reader', '异步读取', 'var(--teal)', { fromDx: -70, curve: 18 }),
-      edge('document_list', 'document_reading', 'directory_lister', '列举 Map', 'var(--teal)'),
-      edge('document_cpu', 'document_reading', 'cpu', 'CPU 解析', 'var(--teal)', { fromDx: 70, curve: -18 }),
-      edge('store_cpu', 'asset_store', 'cpu', 'CPU 编码', 'var(--teal)', { fromDx: -45, curve: 10 }),
-      edge('store_tx', 'asset_store', 'sqlite_tx', '单事务', 'var(--teal)', { fromDx: 55, curve: -8 }),
-    ],
-  },
-  translate: {
-    viewBox: '0 0 1570 680',
-    groups: [
-      { x: 12, y: 12, w: 1545, h: 650, label: 'Translate 顶层与 Standard 四职责', color: 'var(--purple)' },
-    ],
-    nodes: [
-      node('translate_service', 655, 45, 'TranslateService', '已实现固定顶层顺序', 'var(--blue)', 'implementation', 280),
-      node('resolver', 55, 180, 'InMemoryTranslationProfileResolver', '已实现精确 ID 选择', 'var(--purple)', 'implementation', 330),
-      node('record', 420, 180, 'ProjectDatabaseRecordReadingService', '已实现 metadata 读取', 'var(--teal)', 'implementation', 330),
-      node('standard', 790, 180, 'StandardTranslationService', '已实现有界保序编排', 'var(--purple)', 'implementation', 300),
-      node('lua_translation', 1160, 180, 'LuaTranslationService', '已实现附加调用', 'var(--purple)', 'implementation', 280),
-      node('catalog', 70, 360, 'TranslationProfileCatalog', '受信内存值', 'var(--purple)'),
-      node('sqlite_query', 440, 360, 'SqliteQueryExecutor', '根接口', 'var(--teal)', ROOT),
-      node('asset_reader', 650, 500, 'MzStandardTranslationAssetReadingService', '已实现', 'var(--purple)', 'implementation', 330),
-      node('planner', 990, 360, 'MzStandardTranslationTaskPlanningService', '已实现', 'var(--purple)', 'implementation', 330),
-      node('executor', 990, 500, 'MzStandardTranslationTaskExecutionService', '已实现', 'var(--purple)', 'implementation', 330),
-      node('result_store', 1250, 360, 'MzStandardTranslationResultStorageService', '已实现', 'var(--purple)', 'implementation', 300),
-      node('lua_host', 1240, 500, 'TrustedLuaExecutionHostingService', '已实现到根接口', 'var(--purple)', 'implementation', 300),
-    ],
-    edges: [
-      edge('tr_profile', 'translate_service', 'resolver', 'ResolveProfile', 'var(--purple)', { fromDx: -90, curve: 26 }),
-      edge('tr_record', 'translate_service', 'record', 'ReadProject', 'var(--teal)', { fromDx: -30, curve: 12 }),
-      edge('tr_standard', 'translate_service', 'standard', 'Standard', 'var(--purple)', { fromDx: 30, curve: -8 }),
-      edge('tr_lua', 'translate_service', 'lua_translation', '可选 Lua', 'var(--purple)', { fromDx: 90, curve: -24 }),
-      edge('resolver_catalog', 'resolver', 'catalog', '受信值', 'var(--purple)'),
-      edge('record_query', 'record', 'sqlite_query', '根查询', 'var(--teal)'),
-      edge('standard_asset', 'standard', 'asset_reader', '资产快照', 'var(--purple)', { fromDx: -80, curve: 22 }),
-      edge('standard_plan', 'standard', 'planner', '完整计划', 'var(--purple)', { fromDx: -25, curve: 8 }),
-      edge('standard_execute', 'standard', 'executor', '任务执行', 'var(--purple)', { fromDx: 25, curve: -6 }),
-      edge('standard_store', 'standard', 'result_store', '准备与提交', 'var(--purple)', { fromDx: 80, curve: -26 }),
-      edge('lua_host_edge', 'lua_translation', 'lua_host', '可信 Host', 'var(--purple)'),
-    ],
-  },
-  planning: {
-    viewBox: '0 0 1680 610',
-    groups: [{ x: 12, y: 12, w: 1655, h: 580, label: '译前规划：外部资源、语言、占位符与全局去重', color: 'var(--purple)' }],
-    nodes: [
-      node('planner', 535, 45, 'MzStandardTranslationTaskPlanningService', '已实现语义范围规划', 'var(--purple)', 'implementation', 330),
-      node('resource_reader', 60, 190, 'JsonTranslationPlanningResourceReadingService', '已实现术语/规则读取', 'var(--purple)', 'implementation', 350),
-      node('language_catalog', 450, 190, 'TranslationLanguageCatalog', '精确语言 ID 绑定', 'var(--purple)', 'implementation', 300),
-      node('placeholder', 790, 190, 'Pcre2PlaceholderService', 'Builtin 优先 + Custom 顺序', 'var(--purple)', 'implementation', 300),
-      node('cpu', 1120, 190, 'CpuTaskExecutor', '根接口 · 有界 CPU', 'var(--teal)', ROOT),
-      node('file_reader', 105, 385, 'FileReader', '根接口 · 异步文件', 'var(--teal)', ROOT),
-      node('japanese', 400, 385, 'JapaneseSourceLanguage', '判定 + 残留检查', 'var(--purple)'),
-      node('english', 690, 385, 'EnglishSourceLanguage', '外部阈值 + 允许项', 'var(--purple)'),
-      node('chinese', 980, 385, 'SimplifiedChineseTargetLanguage', '确定性规范化与验收', 'var(--purple)', 'implementation', 300),
-      node('deduplication', 1330, 385, 'TranslationDeduplication', '纯 CPU · 全局保序代表/传播', 'var(--purple)', 'implementation', 320),
-    ],
-    edges: [
-      edge('plan_resources', 'planner', 'resource_reader', '外部资源', 'var(--purple)', { fromDx: -90, curve: 20 }),
-      edge('plan_language', 'planner', 'language_catalog', '语言能力', 'var(--purple)', { fromDx: -30, curve: 8 }),
-      edge('plan_placeholder', 'planner', 'placeholder', 'PCRE2 保护', 'var(--purple)', { fromDx: 30, curve: -8 }),
-      edge('plan_cpu', 'planner', 'cpu', '范围并行', 'var(--teal)', { fromDx: 90, curve: -20 }),
-      edge('plan_deduplication', 'planner', 'deduplication', '全局确定性去重', 'var(--purple)', { fromDx: 120, curve: -35 }),
-      edge('resource_file', 'resource_reader', 'file_reader', '异步读取', 'var(--teal)'),
-      edge('resource_cpu', 'resource_reader', 'cpu', '解析与编译', 'var(--teal)', { fromDx: 100, curve: -55 }),
-      edge('lang_ja', 'language_catalog', 'japanese', '精确绑定', 'var(--purple)', { fromDx: -70, curve: 10 }),
-      edge('lang_en', 'language_catalog', 'english', '精确绑定', 'var(--purple)'),
-      edge('lang_zh', 'language_catalog', 'chinese', '精确绑定', 'var(--purple)', { fromDx: 70, curve: -10 }),
-    ],
-  },
-  execution: {
-    viewBox: '0 0 1220 550',
-    groups: [{ x: 12, y: 12, w: 1195, h: 520, label: '模型请求、有限清洗与译后验收', color: 'var(--purple)' }],
-    nodes: [
-      node('executor', 430, 45, 'MzStandardTranslationTaskExecutionService', '已实现配置化重试', 'var(--purple)', 'implementation', 360),
-      node('llm', 70, 205, 'LlmRequestExecutor', '根接口 · 单次请求', 'var(--teal)', ROOT),
-      node('delay', 390, 205, 'AsyncDelay', '根接口 · 可取消等待', 'var(--teal)', ROOT),
-      node('response', 710, 205, 'TranslationTaskResponseProcessingService', '已实现清洗与原子验收', 'var(--purple)', 'implementation', 370),
-      node('language_catalog', 620, 385, 'TranslationLanguageCatalog', '目标处理 + 源文残留', 'var(--purple)', 'implementation', 300),
-      node('cpu', 950, 385, 'CpuTaskExecutor', '根接口 · 响应计算', 'var(--teal)', ROOT),
-    ],
-    edges: [
-      edge('exec_llm', 'executor', 'llm', '原样 messages', 'var(--teal)', { fromDx: -70, curve: 18 }),
-      edge('exec_delay', 'executor', 'delay', '重试等待', 'var(--teal)'),
-      edge('exec_response', 'executor', 'response', '清洗与验收', 'var(--purple)', { fromDx: 70, curve: -18 }),
-      edge('response_language', 'response', 'language_catalog', '语言验收', 'var(--purple)', { fromDx: -50, curve: 8 }),
-      edge('response_cpu', 'response', 'cpu', 'CPU 处理', 'var(--teal)', { fromDx: 50, curve: -8 }),
-    ],
-  },
-  storage: {
-    viewBox: '0 0 1290 560',
-    groups: [{ x: 12, y: 12, w: 1265, h: 530, label: '资产一致快照与短事务结果提交', color: 'var(--teal)' }],
-    nodes: [
-      node('asset_reader', 170, 55, 'MzStandardTranslationAssetReadingService', '五表 + 术语依赖一致快照', 'var(--purple)', 'implementation', 360),
-      node('result_store', 760, 55, 'MzStandardTranslationResultStorageService', 'Preparation + 单任务事务', 'var(--purple)', 'implementation', 370),
-      node('sqlite_query', 70, 230, 'SqliteQueryExecutor', '根接口', 'var(--teal)', ROOT),
-      node('cpu_read', 370, 230, 'CpuTaskExecutor', '根接口 · 解码', 'var(--teal)', ROOT),
-      node('cpu_write', 700, 230, 'CpuTaskExecutor', '同一根 · 编码', 'var(--teal)', ROOT),
-      node('sqlite_tx', 1000, 230, 'SqliteTransactionExecutor', '根接口', 'var(--teal)', ROOT),
-      node('codec', 500, 400, 'MzLocationCodec', '共享位置编解码纯函数', 'var(--teal)', 'implementation', 300),
-    ],
-    edges: [
-      edge('reader_query', 'asset_reader', 'sqlite_query', '一致查询', 'var(--teal)', { fromDx: -55, curve: 8 }),
-      edge('reader_cpu', 'asset_reader', 'cpu_read', '有界解码', 'var(--teal)', { fromDx: 55, curve: -8 }),
-      edge('store_cpu', 'result_store', 'cpu_write', '有界编码', 'var(--teal)', { fromDx: -55, curve: 8 }),
-      edge('store_tx', 'result_store', 'sqlite_tx', '短事务', 'var(--teal)', { fromDx: 55, curve: -8 }),
-      edge('reader_codec', 'asset_reader', 'codec', '位置解码', 'var(--teal)', { fromDx: 70, curve: -5 }),
-      edge('store_codec', 'result_store', 'codec', '位置编码', 'var(--teal)', { fromDx: -75, curve: 18 }),
-    ],
-  },
-  lua: {
-    viewBox: '0 0 1330 555',
-    groups: [{ x: 12, y: 12, w: 1305, h: 525, label: '可信 Lua：Host 拥有生命周期，脚本拥有业务协议', color: 'var(--purple)' }],
-    nodes: [
-      node('lua_translation', 500, 45, 'LuaTranslationService', 'Standard 成功后的附加执行', 'var(--purple)', 'implementation', 310),
-      node('lua_host', 455, 180, 'TrustedLuaExecutionHostingService', '已实现上下文与清理编排', 'var(--purple)', 'implementation', 400),
-      node('file_reader', 35, 370, 'FileReader', '根接口 · 主脚本', 'var(--teal)', ROOT),
-      node('llm', 335, 370, 'LlmRequestExecutor', '根接口 · ctx.llm', 'var(--teal)', ROOT),
-      node('lua_runtime', 635, 370, 'TrustedLuaRuntimeExecutor', '根接口 · 可信 VM worker', 'var(--teal)', ROOT, 290),
-      node('sqlite_session', 960, 370, 'SqliteInteractiveSessionFactory', '根接口 · 同连接会话', 'var(--teal)', ROOT, 330),
-    ],
-    edges: [
-      edge('lua_service_host', 'lua_translation', 'lua_host', '拥有 Profile 调用', 'var(--purple)'),
-      edge('host_file', 'lua_host', 'file_reader', '读取主脚本', 'var(--teal)', { fromDx: -100, curve: 22 }),
-      edge('host_llm', 'lua_host', 'llm', 'Translate 阶段', 'var(--teal)', { fromDx: -35, curve: 8 }),
-      edge('host_runtime', 'lua_host', 'lua_runtime', '执行可信脚本', 'var(--teal)', { fromDx: 35, curve: -8 }),
-      edge('host_session', 'lua_host', 'sqlite_session', '事务生命周期', 'var(--teal)', { fromDx: 100, curve: -22 }),
-    ],
-  },
-  roots: {
-    viewBox: '0 0 1550 650',
-    groups: [
-      { x: 12, y: 12, w: 1515, h: 265, label: '已实现的非根叶子模块', color: 'var(--purple)' },
-      { x: 12, y: 305, w: 1515, h: 320, label: 'Translate 真实运行根接口：尚无生产适配器', color: 'var(--teal)' },
-    ],
-    nodes: [
-      node('asset_reader', 35, 70, 'AssetReadingService', '读标准资产', 'var(--purple)'),
-      node('resource_reader', 325, 70, 'PlanningResourceReader', '读外部 JSON', 'var(--purple)'),
-      node('task_executor', 615, 70, 'TaskExecutionService', '请求与重试', 'var(--purple)'),
-      node('response', 905, 70, 'ResponseProcessingService', 'CPU 验收', 'var(--purple)'),
-      node('result_store', 1195, 70, 'ResultStorageService', '写短事务', 'var(--purple)'),
-      node('project_reader', 160, 185, 'ProjectRecordReadingService', '读 metadata', 'var(--teal)', 'implementation', 300),
-      node('lua_host', 790, 185, 'TrustedLuaExecutionHostingService', '可信脚本生命周期', 'var(--purple)', 'implementation', 350),
-      node('file', 25, 360, 'FileReader', '异步 I/O', 'var(--teal)', ROOT, 170),
-      node('cpu', 210, 360, 'CpuTaskExecutor', '有界多线程', 'var(--teal)', ROOT, 190),
-      node('query', 415, 360, 'SqliteQueryExecutor', '一致查询', 'var(--teal)', ROOT, 205),
-      node('tx', 635, 360, 'SqliteTransactionExecutor', '短事务', 'var(--teal)', ROOT, 220),
-      node('llm', 870, 360, 'LlmRequestExecutor', '单次网络请求', 'var(--teal)', ROOT, 210),
-      node('delay', 1095, 360, 'AsyncDelay', '可取消等待', 'var(--teal)', ROOT, 170),
-      node('runtime', 300, 500, 'TrustedLuaRuntimeExecutor', '可信 VM worker', 'var(--teal)', ROOT, 270),
-      node('session', 905, 500, 'SqliteInteractiveSessionFactory', '同连接交互会话', 'var(--teal)', ROOT, 330),
-    ],
-    edges: [
-      edge('asset_query', 'asset_reader', 'query', '查询', 'var(--teal)', { fromDx: -45, curve: 15 }),
-      edge('asset_cpu', 'asset_reader', 'cpu', '解码', 'var(--teal)', { fromDx: 45, curve: -10 }),
-      edge('resource_file', 'resource_reader', 'file', '读取', 'var(--teal)', { fromDx: -45, curve: 16 }),
-      edge('resource_cpu', 'resource_reader', 'cpu', '解析', 'var(--teal)', { fromDx: 45, curve: -8 }),
-      edge('executor_llm', 'task_executor', 'llm', '请求', 'var(--teal)', { fromDx: -40, curve: 12 }),
-      edge('executor_delay', 'task_executor', 'delay', '等待', 'var(--teal)', { fromDx: 40, curve: -16 }),
-      edge('response_cpu', 'response', 'cpu', '验收', 'var(--teal)', { curve: 30 }),
-      edge('store_cpu', 'result_store', 'cpu', '编码', 'var(--teal)', { fromDx: -40, curve: 52 }),
-      edge('store_tx', 'result_store', 'tx', '提交', 'var(--teal)', { fromDx: 40, curve: 25 }),
-      edge('project_query', 'project_reader', 'query', '查询', 'var(--teal)', { curve: -9 }),
-      edge('host_file', 'lua_host', 'file', '脚本', 'var(--teal)', { fromDx: -80, curve: 52 }),
-      edge('host_llm', 'lua_host', 'llm', 'ctx.llm', 'var(--teal)', { fromDx: -25, curve: 8 }),
-      edge('host_runtime', 'lua_host', 'runtime', 'VM', 'var(--teal)', { fromDx: 25, curve: 32 }),
-      edge('host_session', 'lua_host', 'session', 'DB 会话', 'var(--teal)', { fromDx: 80, curve: -8 }),
-    ],
-  },
-};
-
-const steps = [
-  {
-    category: 'other', view: 'overview', label: '产品总览', title: '统一入口不抹平引擎切片',
-    desc: 'MzCli 只依赖各命令用例。Translate 仍是自己的纵向切片；表面相同的命令不会自动共享参数或业务契约。',
-    nodes: '*', edges: '*', kv: [['箭头', '消费方 → 直接依赖'], ['实线节点', '已有实现'], ['虚线节点', '契约或根接口']],
-  },
-  {
-    category: 'other', view: 'initExtract', label: 'Init / Extract', title: '既有切片已经推进到运行根之前',
-    desc: 'Init 通过目录解析与数据库创建职责协作；Extract 保持 Builtin → Rules → Lua 的顶层串行顺序，并把文件 I/O 与 CPU 并行留在阶段内部。',
-    nodes: '*', edges: '*', kv: [['磁盘', '异步接口 + 有界背压'], ['CPU', '独立根 worker'], ['数据库', '查询与事务职责分离']],
-  },
-  {
-    category: 'translate', view: 'translate', label: 'Translate 总览', title: 'Translate 全部非根职责已经有实现',
-    desc: '顶层精确选择一次 Profile、读取一次项目记录，然后执行 Standard 与可选 Lua。Standard 的资产、计划、执行、Store 四个职责也已从接口继续实现。',
-    nodes: ['translate_service', 'resolver', 'record', 'standard', 'lua_translation'],
-    edges: ['tr_profile', 'tr_record', 'tr_standard', 'tr_lua'],
-    kv: [['固定顺序', 'Profile → Project → Standard → Lua'], ['共享事实', '同一 Arc Profile'], ['失败', '首错停止，不补偿前序提交']],
-  },
-  {
-    category: 'translate', view: 'translate', label: 'Standard 编排', title: '模型可并发，数据库按任务顺序提交',
-    desc: 'Standard 先建立包含失效、历史译文复用和全局传播关系的完整计划，再按外部上限有界执行任务；结果严格按 task_index 串行提交，形成稳定成功前缀。',
-    nodes: ['standard', 'asset_reader', 'planner', 'executor', 'result_store'],
-    edges: ['standard_asset', 'standard_plan', 'standard_execute', 'standard_store'],
-    kv: [['并发', 'Profile.max_in_flight_tasks'], ['提交', '严格顺序短事务'], ['OutcomeUnknown', '停止声称准确成功前缀']],
-  },
-  {
-    category: 'translate', view: 'planning', label: 'Planner / 去重', title: '范围并行预处理后，按自然顺序做一次全局去重',
-    desc: '资源 Reader 解释人类可写 JSON，语言目录与 PCRE2 完成语言和保护处理；Planner 保序汇合所有范围，由纯 CPU 去重模块确定代表、重复虚原文、传播目标与已有译文复用，再切块构造完整 Markdown。',
-    nodes: '*', edges: '*', kv: [['去重键', '原文 + 保护后文本 + 完整绑定'], ['代表', '只由 MZ 自然顺序决定'], ['上下文', '重复位置仍以虚原文保留']],
-  },
-  {
-    category: 'translate', view: 'execution', label: 'Executor / 验收', title: '请求重试与内容验收分开，但共享外部预算',
-    desc: 'LLM 根只做一次请求，AsyncDelay 只做等待；Executor 用外部延时重试相同 messages。响应服务进行有限 JSON 清洗、精确 ID 集校验、语言检查和占位符原样还原。',
-    nodes: '*', edges: '*', kv: [['清洗', '只做可证明安全的有限修复'], ['响应', 'ID 精确全集，整任务原子'], ['重试', 'Retryable + 内容验收失败']],
-  },
-  {
-    category: 'translate', view: 'storage', label: 'Reader / Store', title: '译文留在领域表，术语依赖单独保存',
-    desc: 'Reader 用一条五表查询取得资产与术语依赖的一致快照；Store 通过乐观预期完成术语失效、已有译文复用，以及代表与全部重复目标的原子提交。没有通用 translations 表。',
-    nodes: '*', edges: '*', kv: [['Preparation', '先校验全部旧状态，再失效与复用'], ['Commit', '代表 + 传播目标单事务'], ['终态', 'StalePlan / NotCommitted / OutcomeUnknown 分离']],
-  },
-  {
-    category: 'translate', view: 'lua', label: '可信 Lua Host', title: 'Lua 完全可信，Host 仍完整拥有资源生命周期',
-    desc: 'Host 读取主脚本、打开同一项目数据库会话，并在 Translate 阶段注入共享 LLM。脚本拥有业务协议；Host 负责未关闭事务回滚、会话关闭和主错误/清理错误组合。',
-    nodes: '*', edges: '*', kv: [['沙箱', '无；完全信任用户'], ['事务', '显式 begin / commit / rollback'], ['取消', '回滚当前事务并受控关闭']],
-  },
-  {
-    category: 'translate', view: 'roots', label: '根停止线', title: '非根树只剩八类真实运行机制',
-    desc: '根接口隔离文件、CPU、SQLite、网络、时钟与 Lua VM。它们只有契约和测试替身，没有生产适配器；因此并发结构已成立，但真实吞吐和端到端结果尚未成立。',
-    nodes: '*', edges: '*', kv: [['I/O', 'FileReader + SQLite 根 + LLM 根'], ['计算', 'CpuTaskExecutor + Lua Runtime'], ['完成条件', '根适配器 + 组合根 + 代表性游戏验证']],
-  },
-];
-
-let roughAvailable = false;
-let roughLoadingStarted = false;
-let rcHolder = null;
-const state = { filter: 'all', stepIndex: 0, view: null };
-
-function loadScript(sources, timeout = 6000) {
-  return new Promise(resolve => {
-    let index = 0;
-    const started = performance.now();
-    const next = () => {
-      if (index >= sources.length || performance.now() - started >= timeout) return resolve(false);
-      const script = document.createElement('script');
-      script.src = sources[index++];
-      script.onload = () => resolve(true);
-      script.onerror = () => { script.remove(); next(); };
-      document.head.appendChild(script);
-    };
-    next();
-  });
-}
-
-function startRoughEnhancement() {
-  if (roughLoadingStarted) return;
-  roughLoadingStarted = true;
-  loadScript([
-    'https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js',
-    'https://unpkg.com/roughjs@4.6.6/bundled/rough.js',
-  ]).then(loaded => {
-    if (!loaded) return;
-    roughAvailable = true;
-    renderCurrent(true);
-  });
-}
-
-function visibleStepIndexes() {
-  return steps.map((step, index) => ({ step, index }))
-    .filter(({ step }) => state.filter === 'all' || step.category === state.filter)
-    .map(({ index }) => index);
-}
-
-function svgEl(tag, attrs = {}) {
-  const element = document.createElementNS(NS, tag);
-  for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, value);
-  return element;
-}
-function hashId(value) {
-  let hash = 9;
-  for (const character of String(value)) hash = (hash * 31 + character.charCodeAt(0)) % 1000;
-  return hash;
-}
-function isSelected(selection, id) { return selection === '*' || selection.includes(id); }
-
-function cleanRect(x, y, width, height, dash) {
-  const rectangle = svgEl('rect', { x, y, width, height, rx: 8 });
-  if (dash) rectangle.setAttribute('stroke-dasharray', '8 6');
-  return rectangle;
-}
-function sketchRect(x, y, width, height, options) {
-  if (!options.enhance || !roughAvailable) return cleanRect(x, y, width, height, options.dash);
-  return rcHolder.rectangle(x, y, width, height, {
-    roughness: SKETCH.roughness, bowing: SKETCH.bowing, seed: options.seed,
-    strokeWidth: 1.6, ...(options.dash ? { strokeLineDash: [8, 6] } : {}),
-  });
-}
-function sketchPath(path, options) {
-  if (!options.enhance || !roughAvailable) {
-    const fallback = svgEl('path', { d: path, class: 'shaft' });
-    if (options.dash) fallback.setAttribute('stroke-dasharray', '7 5');
-    return fallback;
-  }
-  const group = rcHolder.path(path, {
-    roughness: 0.95, bowing: 0.75, seed: options.seed, strokeWidth: 1.6,
-    ...(options.dash ? { strokeLineDash: [7, 5] } : {}),
-  });
-  group.classList.add('shaft');
-  return group;
-}
-function svgText(x, y, content, className) {
-  const label = svgEl('text', { x, y, class: className });
-  label.textContent = content;
-  return label;
-}
-function anchor(item, port, dx = 0, dy = 0) {
-  const points = {
-    top: { x: item.x + item.w / 2, y: item.y },
-    right: { x: item.x + item.w, y: item.y + item.h / 2 },
-    bottom: { x: item.x + item.w / 2, y: item.y + item.h },
-    left: { x: item.x, y: item.y + item.h / 2 },
+  var ROOTS = {
+    init: {
+      label: "Init",
+      zh: "建立项目",
+      color: "var(--amber)",
+      summary: "InitService 整理受信项目事实，再把完整冻结工作区交给一个直接依赖创建。",
+      sequence: "整理名称、语言与布局宽度 → 确认原游戏目录 → 创建并发布冻结工作区",
+      tree: null
+    },
+    extract: {
+      label: "Extract",
+      zh: "提取文本",
+      color: "var(--teal)",
+      summary: "ExtractService 打开项目一次，再按固定顺序安排三种提取方式。",
+      sequence: "① 打开项目一次 → ② Builtin → ③ Rules → ④ Lua（可选）",
+      tree: null
+    },
+    translate: {
+      label: "Translate",
+      zh: "翻译总控",
+      color: "var(--blue)",
+      summary: "规划、执行和入库全部收在 Translate 的 Standard 分支里，不再和总控平行。",
+      sequence: "① 选择 Profile → ② 读取项目档案 → ③ Standard → ④ Lua（可选）",
+      tree: null
+    },
+    writeback: {
+      label: "WriteBack",
+      zh: "写回游戏",
+      color: "var(--red)",
+      summary: "WriteBackService 与 Standard 业务编排已实现；真实文件写回和 Lua Host 适配仍停在直接依赖契约。",
+      sequence: "① 打开冻结项目 → ② Standard 写回 → ③ Lua 写回（可选）",
+      tree: null
+    }
   };
-  return { x: points[port].x + dx, y: points[port].y + dy };
-}
 
-function renderNode(item, enhance) {
-  const group = svgEl('g', { class: 'node', 'data-id': item.id, 'data-status': item.status });
-  group.style.setProperty('--c', item.color);
-  const shape = svgEl('g', { class: 'shape' });
-  shape.appendChild(sketchRect(item.x, item.y, item.w, item.h, {
-    seed: hashId(item.id), dash: item.status === ROOT, enhance,
-  }));
-  group.appendChild(shape);
-  group.appendChild(svgText(item.x + item.w / 2, item.y + item.h / 2 - 9, item.label, 'node-label'));
-  group.appendChild(svgText(item.x + item.w / 2, item.y + item.h / 2 + 14, item.sub, 'node-sub'));
-  return group;
-}
+  var MODULES = {
+    "init-service": {
+      title: "Init 总控",
+      symbol: "InitService",
+      shortSymbol: "InitService",
+      path: "src/att_mz/init.rs",
+      status: "业务逻辑已实现",
+      role: "把一次导入请求整理成可信项目事实，并把完整冻结工作区的创建交给唯一直接依赖。",
+      plain: "它像项目登记处：先确认原游戏目录，整理名称、语言和三个布局宽度，再提交一次完整工作区创建；不再只建一份孤立数据库。",
+      example: "用户导入 C:\\Games\\Demo。Init 把 ja → zh-Hans 与三个显示宽度交给工作区创建器；成功必须同时得到 project.db、source/data、source/js 和 write_back。",
+      input: "项目名、原游戏目录、源/目标语言、三个受信布局宽度",
+      output: "命名冻结项目已经整体建立",
+      boundary: "真实递归复制和原子目录发布仍只有直接依赖契约；Init 不伪造已经复制成功。"
+    },
+    "project-name": {
+      title: "项目名规则",
+      symbol: "ProjectName",
+      shortSymbol: "ProjectName",
+      path: "src/att_mz/project_name.rs",
+      status: "已实现值类型",
+      role: "把普通字符串变成可安全用于项目身份和数据库文件名的可信名称。",
+      plain: "它相当于门卫：名称一旦通过，后面的模块就不用反复担心空白名、路径穿越或 Windows 保留名。",
+      example: "“游戏 一”可以通过；“../game”会被拒绝，因为它像在偷偷换目录；“CON”也会被拒绝，因为它是 Windows 保留名。",
+      input: "用户输入的一段文字",
+      output: "经过校验的 ProjectName"
+    },
+    "project-db-create": {
+      title: "项目建库",
+      symbol: "ProjectDatabaseCreationService",
+      shortSymbol: "Project DB Creation",
+      path: "src/project_database.rs",
+      status: "业务逻辑已实现",
+      role: "按已确认的项目事实建立数据库，并保证唯一 metadata 与文件创建保持一致。",
+      plain: "它像档案管理员：只接受已经整理好的 NewProject 和调用方指定的暂存路径，把项目身份、语言和三个布局宽度完整落到新档案里。",
+      example: "工作区创建器以后可以要求它在暂存目录建立 project.db；目标已存在时不会悄悄覆盖，而是明确失败。",
+      input: "明确目标数据库路径与 NewProject metadata",
+      output: "CreatedProject 或清楚的建库错误",
+      boundary: "该服务已经实现，但本批没有越过 ProjectWorkspaceCreator 把它直接接回 Init；真实 SQLite 驱动也尚未生产接线。"
+    },
+    "project-workspace-creator": {
+      title: "创建冻结项目工作区",
+      symbol: "ProjectWorkspaceCreator",
+      shortSymbol: "Project Workspace Creator",
+      path: "src/att_mz/init.rs",
+      status: "直接依赖契约",
+      role: "完整复制原游戏的 data 与 js，建立 metadata 数据库和固定写回目录，再把整个命名工作区一次发布。",
+      plain: "它是一张不可拆开的交付单：不能只把数据库建好就说 Init 成功，也不能把复制到一半的 source 暴露给后续命令。",
+      example: "创建 demo 时，成功代表 <projects_root>/demo/project.db、source/data、source/js 与 write_back 同时可用；任何一步失败都不能留下一个看似可打开的半项目。",
+      input: "NewProjectWorkspace：导入来源与受信 metadata",
+      output: "完整工作区发布成功，或明确失败",
+      boundary: "本批只定义并由 Init 消费该契约；递归复制、暂存、清理和原子发布实现属于后续任务。"
+    },
+    "extract-service": {
+      title: "Extract 总控",
+      symbol: "ExtractService",
+      shortSymbol: "ExtractService",
+      path: "src/att_mz/extract/service.rs",
+      status: "业务逻辑已实现",
+      role: "只打开一次项目，并固定安排 Builtin、Rules、Lua 三段提取。",
+      plain: "它像提取班组长：先拿到一份可信的已打开项目，然后依次叫不同工种干活。某一段失败，后面的段不会继续；前面已经成功提交的成果不会假装没发生。",
+      example: "Builtin 已经把标准物品名存好，但 Rules 随后发现规则文件有错。Extract 会停止，不再运行 Lua；Builtin 已确认的那部分仍然保留。",
+      input: "项目名与三段提取的开关/配置",
+      output: "三段提取各自的完成报告",
+      boundary: "文件、CPU、SQLite 与 Lua 运行时的生产适配不在业务树中展开。"
+    },
+    "project-opener": {
+      title: "打开既有项目",
+      symbol: "ExistingProjectOpeningService",
+      shortSymbol: "Existing Project Opening",
+      path: "src/att_mz/project.rs",
+      status: "业务逻辑已实现",
+      role: "读取项目档案，并重新确认工作区内冻结的 source/data 与 source/js 仍然可用。",
+      plain: "它不再追着原游戏目录跑。项目一旦导入，后续命令只关心自己的冻结副本；即使原游戏移动或删除，标准流程的权威来源也不改变。",
+      example: "demo 原来来自 C:\\Games\\Demo，但该目录后来被删除。只要项目工作区的 source/data 与 source/js 仍在，打开项目仍使用冻结副本。",
+      input: "ProjectName",
+      output: "OpenedProject：工作区、冻结源、固定输出、数据库、语言与布局宽度"
+    },
+    "project-record-reader": {
+      title: "读取项目档案",
+      symbol: "ProjectDatabaseRecordReadingService",
+      shortSymbol: "Project Record Reader",
+      path: "src/project_database.rs",
+      status: "业务逻辑已实现",
+      role: "从 <projects_root>/<name>/project.db 读取唯一 metadata，并核对名称、语言和三个布局宽度。",
+      plain: "它像查档员。不是随便拿到一行数据就算成功，而是确认档案只有一份、字段完整、名字没有对不上。",
+      example: "用户请求项目“demo”，数据库 metadata 却写着“other”。读取会报身份不一致，而不是把 other 当成 demo 继续运行。",
+      input: "请求的 ProjectName",
+      output: "StoredProjectRecord"
+    },
+    "builtin-extraction": {
+      title: "内建字段提取",
+      symbol: "BuiltInExtractionService",
+      shortSymbol: "BuiltIn Extraction",
+      path: "src/att_mz/extract/builtin.rs",
+      status: "业务逻辑已实现",
+      role: "按程序内置的 MZ 知识提取标准文本字段，并原子替换 Builtin 自己拥有的快照。",
+      plain: "它认识 RPG Maker MZ 的常规结构，知道物品名称、技能说明、事件对白等标准位置，不需要用户再写规则。",
+      example: "在 Items.json 第 3 个物品里，它知道 name 和 description 是翻译对象；数值 price 不是文本，所以不会硬塞进翻译库。",
+      input: "OpenedProject 与 Builtin 配置",
+      output: "BuiltinSnapshot 已安全存入"
+    },
+    "rules-extraction": {
+      title: "规则字段提取",
+      symbol: "RulesExtractionService",
+      shortSymbol: "Rules Extraction",
+      path: "src/att_mz/extract/rules.rs",
+      status: "业务逻辑已实现",
+      role: "读取用户规则，为内建知识没有覆盖的 JSON 或插件结构补充文本叶子。",
+      plain: "它像自定义采集员。Builtin 只管大家都一样的标准字段，Rules 根据项目自己的规则去找额外内容。",
+      example: "某插件把分类名放在 Categories[].Name。Builtin 不认识它；Rules 读取规则后，可以把每个 Name 当成可翻译叶子提取出来。",
+      input: "OpenedProject、规则文件与读取配置",
+      output: "RulesSnapshot 已安全存入"
+    },
+    "document-reader": {
+      title: "读取 MZ 文档",
+      symbol: "MzProjectDocumentReadingService",
+      shortSymbol: "MZ Document Reader",
+      path: "src/att_mz/extract/document.rs",
+      status: "已实现，可复用",
+      role: "按选择读取冻结 source 中的 data JSON、地图和插件参数，并保留原始结构供上层判断。",
+      plain: "它只负责把文件可靠地拿进来，不越权决定哪些字段要翻译。Builtin 和 Rules 都用同一个读取能力，但各自解释数据。",
+      example: "读取 Items.json 时，即使里面有当前版本不认识的 extraMeta，也会原样保留；真正选择 name 还是自定义字段由上层负责。",
+      input: "OpenedProject 的冻结 source 根与文档选择",
+      output: "MzProjectDocuments"
+    },
+    "snapshot-model": {
+      title: "提取快照模型",
+      symbol: "extract::model",
+      shortSymbol: "Extraction Snapshot Model",
+      path: "src/att_mz/extract/model.rs",
+      status: "已实现领域模型",
+      role: "用“相关组 + 精确叶子”表达提取结果，让上下文和最小失效粒度同时成立。",
+      plain: "它像一张既有文件夹又有页码的清单：一组文本可以一起给翻译看，但每个具体叶子仍有自己的身份。",
+      example: "一个物品的名称和说明属于同一上下文组；如果只改了说明，名称的旧译文仍可保留，不会整组作废。",
+      input: "提取器识别出的组、叶子、原文和位置",
+      output: "BuiltinSnapshot 或 RulesSnapshot"
+    },
+    "asset-store": {
+      title: "提取资产入库",
+      symbol: "MzExtractionAssetStore",
+      shortSymbol: "Extraction Asset Store",
+      path: "src/att_mz/extract/store/asset_store.rs",
+      status: "业务逻辑已实现",
+      role: "按所有者原子替换提取快照，并精确决定哪些旧译文继承、失效或删除。",
+      plain: "它不是粗暴清空重来。它会逐个比对“是谁提取的、位置是否相同、原文是否相同”，只让真正变化的叶子失效。",
+      example: "物品名称没变、说明从“恢复 10 HP”改成“恢复 20 HP”。名称译文继续用，只有说明译文回到待翻译。",
+      input: "OpenedProject 与一份完整快照",
+      output: "一个事务内完成的资产替换"
+    },
+    "location-codec": {
+      title: "位置编码",
+      symbol: "MzLocationCodec",
+      shortSymbol: "MZ Location Codec",
+      path: "src/att_mz/location_codec.rs",
+      status: "已实现，可复用",
+      role: "把结构化 MZ 位置稳定编码进数据库，并能无损还原。",
+      plain: "它像地址翻译器：程序内部使用强类型地址，数据库里保存稳定文本；展示用的好看字符串不能反过来冒充权威地址。",
+      example: "“Items.json 第 3 项的 description”会编码成明确结构。以后读回来仍知道文件、数组下标和字段，不靠猜字符串。",
+      input: "MzLocation",
+      output: "稳定存储文本，或从文本还原 MzLocation"
+    },
+    "lua-extraction": {
+      title: "Lua 提取",
+      symbol: "LuaExtractionService",
+      shortSymbol: "Lua Extraction",
+      path: "src/att_mz/extract/lua.rs",
+      status: "业务逻辑已实现",
+      role: "把可信项目上下文交给 Lua Host，运行项目自己的提取脚本。",
+      plain: "它是定制出口。Rust 标准流程不猜脚本想做什么，只把本次 Extract 所需的可信事实交过去，并等 Host 给出明确结果。",
+      example: "项目把文本放在自建表 custom_dialogue。Lua 脚本可以按自己的协议读取并写入自己的表，不强迫它伪装成 Builtin 资产。",
+      input: "OpenedProject 与 Lua 脚本路径",
+      output: "Lua 阶段完成或明确失败"
+    },
+    "lua-host": {
+      title: "可信 Lua Host",
+      symbol: "TrustedLuaExecutionHostingService",
+      shortSymbol: "Trusted Lua Host",
+      path: "src/att_mz/lua/hosting.rs",
+      status: "业务逻辑已实现，可复用",
+      role: "统一管理可信 Lua 调用的上下文、会话生命周期、提交和清理。",
+      plain: "它像剧场经理：Extract 和 Translate 都能借用同一个舞台，但每次演出属于哪个阶段、拿到什么上下文、结束后怎么清场，都由 Host 管住。",
+      example: "Translate 脚本运行中报错，Host 仍会走受控清理；不会因为 Future 被取消就把半开的会话丢在那里。",
+      input: "LuaInvocation：阶段、脚本、项目事实与可选 Profile",
+      output: "脚本完成，或带清理结果的明确错误",
+      boundary: "Lua runtime 与 session 的生产根适配仍未接入，因此不作为树节点。"
+    },
+    "translate-service": {
+      title: "Translate 总控",
+      symbol: "TranslateService",
+      shortSymbol: "TranslateService",
+      path: "src/att_mz/translate/service.rs",
+      status: "业务逻辑已实现",
+      role: "精确选择 Profile、读取一次项目档案，再依次运行 Standard 和可选 Lua。",
+      plain: "它是翻译总负责人。规划、执行、验收和入库都不是与它平行的“大功能”，而是它交给 Standard 子总控继续管理的内部职责。",
+      example: "用户选择 profile=quality。Translate 找到唯一配置，读取 demo 项目，先让 Standard 完整结束；只有成功后，才运行可选 Lua 翻译脚本。",
+      input: "项目名、Profile 名、术语/占位符路径与可选 Lua",
+      output: "Standard 报告与可选 Lua 完成结果",
+      boundary: "外部模型、等待器等运行根能力不进入职责树。"
+    },
+    "profile-resolver": {
+      title: "精确选择 Profile",
+      symbol: "InMemoryTranslationExecutionProfileResolver",
+      shortSymbol: "Profile Resolver",
+      path: "src/att_mz/translate/profile.rs",
+      status: "业务逻辑已实现",
+      role: "按名称选出唯一、完整、已经校验的翻译执行配置。",
+      plain: "它像配方柜：指定哪个配方就拿哪个，不做模糊匹配，也不在运行中偷偷补默认策略。",
+      example: "请求 profile=fast 时只会选择名为 fast 的配置。找不到就明确失败，不会因为 quality 看起来也能用就自动替换。",
+      input: "Profile 名称",
+      output: "共享的 TranslationExecutionProfile"
+    },
+    "standard-translation": {
+      title: "Standard 子总控",
+      symbol: "StandardTranslationService",
+      shortSymbol: "Standard Translation",
+      path: "src/att_mz/translate/standard.rs",
+      status: "业务逻辑已实现",
+      role: "完整拥有标准翻译的读取、规划、执行和结果提交顺序。",
+      plain: "它像 Translate 下面的生产线主管。先把资产读成一致语料，再做规划，然后按任务执行，最后只把确认合格的结果按顺序提交。",
+      example: "十处“保存”先被读入；Planner 只安排一个代表去翻译；Executor 验收返回；Result Store 再把合格译文传播到十处有效位置。",
+      input: "StoredProjectRecord、Profile 与规划资源路径",
+      output: "StandardTranslationRunReport",
+      boundary: "持久事件日志目前只有根接口；它在详情中说明，但不会被画成 Standard 的假子节点。"
+    },
+    "asset-reader": {
+      title: "标准资产读取",
+      symbol: "MzStandardTranslationAssetReadingService",
+      shortSymbol: "Standard Asset Reader",
+      path: "src/att_mz/translate/asset_reader.rs",
+      status: "业务逻辑已实现",
+      role: "把项目数据库中的标准资产、译文、分组和依赖关系读成一份一致语料。",
+      plain: "它不是分表读一点就交一点，而是在同一读取视图里拼出 Planner 真正需要的完整现场，避免前后表版本对不上。",
+      example: "一条物品说明、它所属物品组、旧译文和复用关系必须来自同一个一致快照；否则规划可能拿旧说明配新身份。",
+      input: "StoredProjectRecord",
+      output: "StandardTranslationCorpus"
+    },
+    "planner": {
+      title: "任务规划",
+      symbol: "MzStandardTranslationTaskPlanningService",
+      shortSymbol: "Task Planner",
+      path: "src/att_mz/translate/planner.rs",
+      status: "业务逻辑已实现",
+      role: "按自然顺序保护占位符，通过共享语言模块建立译前分析，完成全局去重并切成任务块。",
+      plain: "它像备料组：先把控制内容遮住，把自然文本交给对应语言模块判断，再把相同工作合并并按容量装箱；它不调用模型。",
+      example: "十处完全相同的“保存”会选自然顺序最早的一处作代表，其他九处成为复用目标，只产生一个翻译决定。",
+      input: "一致语料、项目语言、Profile 与规划资源",
+      output: "StandardTranslationPlan"
+    },
+    "planning-resource": {
+      title: "读取规划资源",
+      symbol: "JsonTranslationPlanningResourceReadingService",
+      shortSymbol: "Planning Resource Reader",
+      path: "src/att_mz/translate/planning_resource.rs",
+      status: "业务逻辑已实现",
+      role: "并行读取可选术语表和自定义占位符 JSON，并转换成可信规划资源。",
+      plain: "它只负责把人写的外部文件读懂并校验。文件缺失、JSON 错误和内容不合法会保持不同错误，不会混成一句“读取失败”。",
+      example: "terminology.json 规定“Skill”译为“技能”；placeholders.json 规定 <SE:...> 整段保护。两份文件会一起成为 Planner 的备料。",
+      input: "两个可选文件路径",
+      output: "TranslationPlanningResources"
+    },
+    "language-catalog": {
+      title: "共享语言目录",
+      symbol: "LanguageModuleCatalog",
+      shortSymbol: "Language Catalog",
+      path: "src/language.rs",
+      status: "共享领域能力已实现",
+      role: "按外部精确源语言 ID 选择同一个 LanguageModule，供译前分析与译后处理共同使用。",
+      plain: "它不是源语言表加目标语言表。它只回答“这个源语言 ID 对应哪套真实语言能力”，Planner 和质检都拿同一个实例，不猜别名也不补默认值。",
+      example: "项目源语言精确写 ja 时，目录选中日语模块。目标语言 zh-Hans 仍用于提示词和项目事实，但不会因此创建一个“简中模块”。",
+      input: "精确源语言 ID",
+      output: "共享 LanguageModule，或明确的未知 ID",
+      boundary: "crate 级共享领域能力，不依赖 MZ、数据库、CLI、控制符或模型协议；Catalog 没有目标语言分支。"
+    },
+    "japanese-language": {
+      title: "日语语言能力",
+      symbol: "JapaneseLanguageModule",
+      shortSymbol: "Japanese Language",
+      path: "src/language.rs",
+      status: "共享领域能力已实现",
+      role: "判断日文原文是否需要翻译、检查真实连续假名残留，并在结构唯一时修复日文引号风格。",
+      plain: "它只看自然文本，保护区对它是不透明边界。译前记住完整的「」和『』嵌套结构；译后若模型只是换成了能唯一对应的其他引号，就安全换回来。",
+      example: "原文“彼は「これは『勇者』の剣だ」と言った。”若译成“他说：“这是‘勇者’之剑。””，唯一拓扑可修成“他说：「这是『勇者』之剑。」”；数量或嵌套对不上时原样保留，不判失败。",
+      input: "LanguageText、译前 LanguageAnalysis 与外部日语策略",
+      output: "是否需要翻译、可选残留事实或安全 RepairPlan"
+    },
+    "english-language": {
+      title: "英语语言能力",
+      symbol: "EnglishLanguageModule",
+      shortSymbol: "English Language",
+      path: "src/language.rs",
+      status: "共享领域能力已实现",
+      role: "用彼此独立的外部策略判断英文原文是否需要翻译，并检查译文中真实连续的英文复制残留。",
+      plain: "它不会把译文里散落的英文词硬拼成一句残留，也不会跨保护区连接单词。译前门槛和译后门槛分别配置，不能互相冒充。",
+      example: "原文里的连续短语“New Game”原样出现在译文时可以按残留策略报告；“New”与“Game”分散在不同位置时不会拼成虚构命中。",
+      input: "LanguageText、译前 LanguageAnalysis 与外部英语策略",
+      output: "是否需要翻译、可选连续残留；不修改译文"
+    },
+    "placeholder-service": {
+      title: "占位符保护",
+      symbol: "Pcre2PlaceholderService",
+      shortSymbol: "Placeholder Service",
+      path: "src/att_mz/translate/placeholder.rs",
+      status: "业务逻辑已实现",
+      role: "识别内建和自定义控制片段，替换成稳定 token，并保留可恢复契约。",
+      plain: "它先给不能翻译的片段套保护壳。模型只看到 token；回来后再检查数量和身份，防止控制码丢失或被改坏。",
+      example: "“\\C[2]勇者”里的“\\C[2]”会被保护，只把“勇者”交给翻译。结果缺少 token 时不会被接受。",
+      input: "原文与自定义占位符规则",
+      output: "保护后的文本与 AppliedPlaceholder 列表"
+    },
+    "deduplication": {
+      title: "全局确定性去重",
+      symbol: "deduplicate_translation_candidates",
+      shortSymbol: "Deterministic Deduplication",
+      path: "src/att_mz/translate/deduplication.rs",
+      status: "算法已实现",
+      role: "在全项目候选中稳定选代表，并区分可直接复用、需要翻译和存在冲突的情况。",
+      plain: "它不只是删重复字符串。原文、占位符契约、既有译文等事实都要兼容，才能安全共用一个决定；代表选择不受并发完成顺序影响。",
+      example: "十个“保存”且契约相同，只翻一次；如果其中两处已有互相冲突的可信译文，去重会明确报冲突，不会随便挑一个。",
+      input: "按自然顺序排列的 TranslationDeduplicationCandidate",
+      output: "代表、复用关系、失效关系或冲突"
+    },
+    "executor": {
+      title: "任务执行",
+      symbol: "MzStandardTranslationTaskExecutionService",
+      shortSymbol: "Task Executor",
+      path: "src/att_mz/translate/executor.rs",
+      status: "业务逻辑已实现",
+      role: "在有界并发下调用翻译能力，只重试可恢复网络失败，并逐任务产出结果。",
+      plain: "它像受控派单员：不会无限并发，也不会见错就重试。模型返回后还必须交给响应处理模块逐 ID 验货。",
+      example: "网络暂时断开可以按配置重试；若模型回了非法协议，重试也不会变正确，因此直接作为该任务的失败结果。",
+      input: "TranslationTaskBlock 与执行 Profile",
+      output: "TranslationTaskOutcome"
+    },
+    "response-processor": {
+      title: "逐 ID 验收响应",
+      symbol: "TranslationTaskResponseProcessingService",
+      shortSymbol: "Response Processor",
+      path: "src/att_mz/translate/executor.rs",
+      status: "业务逻辑已实现",
+      role: "逐 ID 完成通用协议与文本检查，再用译前 LanguageAnalysis 检查残留、执行可选安全修复并恢复控制码。",
+      plain: "它像质检员：JSON、ID、空白、BOM、换行和占位符由通用逻辑负责；具体源语残留与可选阅读修复才交给共享语言模块。一个 ID 坏了不会拖掉其他合格结果。",
+      example: "任务期待 ID0 和 ID1。ID0 的日文残留超出允许策略会被记录为未解决；ID1 只把可唯一对应的中文引号修回「」后仍可提交，整个任务得到 Partial。",
+      input: "任务契约与模型原始响应",
+      output: "逐 ID 的合格 Patch、未解决原因与协议诊断"
+    },
+    "result-store": {
+      title: "结果入库",
+      symbol: "MzStandardTranslationResultStorageService",
+      shortSymbol: "Translation Result Store",
+      path: "src/att_mz/translate/result_store.rs",
+      status: "业务逻辑已实现",
+      role: "先应用规划准备，再按自然任务顺序用短事务提交已验收决定，并防止过期计划覆盖新事实。",
+      plain: "它像最后盖章的人。Executor 说合格还不够；入库前会再次确认资产没在等待期间变化，确保译文写到正确原文和正确位置上。",
+      example: "规划后某条原文已被重新提取并修改，Store 会判定计划过时，拒绝把旧译文写到新原文上。",
+      input: "StandardTranslationPlan 与已验收任务结果",
+      output: "已提交数量、未解决项与持久状态"
+    },
+    "lua-translation": {
+      title: "Lua 翻译",
+      symbol: "LuaTranslationService",
+      shortSymbol: "Lua Translation",
+      path: "src/att_mz/translate/lua.rs",
+      status: "业务逻辑已实现",
+      role: "在 Standard 正常完成后，把同一个项目事实和 Profile 交给可信 Lua 脚本。",
+      plain: "它负责项目自定义数据的翻译扩展，但不抢 Standard 的职责，也不会在 Standard 失败后继续写自己的结果。",
+      example: "标准物品与事件先由 Standard 翻译完成；随后 Lua 脚本可以处理自建 quest_text 表，并使用同一个 quality Profile。",
+      input: "StoredProjectRecord、共享 Profile 与脚本路径",
+      output: "Lua 翻译阶段完成或明确失败"
+    },
+    "writeback-service": {
+      title: "WriteBack 总控",
+      symbol: "WriteBackService",
+      shortSymbol: "WriteBackService",
+      path: "src/att_mz/write_back.rs",
+      status: "顶层业务逻辑已实现",
+      role: "打开项目一次，先运行 Standard，再按用户选择把同一份已发布输出交给 Lua。",
+      plain: "它像写回班组长：自己不读五张表，也不修改 JSON；它只保证三段职责的顺序、结果交接和失败含义准确。",
+      example: "Standard 已把输出发布到 demo/write_back，随后 Lua 失败。命令明确失败并报告脚本和输出路径，但不会谎称 Standard 从未成功。",
+      input: "项目名与可选 Lua 脚本路径",
+      output: "固定输出根、Standard 汇总与 Lua 执行状态",
+      boundary: "人工换行项是正常成功；Standard 已负责业务编排，真实数据库读取、布局、文档修改、发布和 Lua Host 适配仍由下级契约承担。"
+    },
+    "standard-writeback": {
+      title: "Standard 写回",
+      symbol: "StandardWriteBackService",
+      shortSymbol: "Standard WriteBack",
+      path: "src/att_mz/write_back/standard.rs",
+      status: "业务编排已实现",
+      role: "读取一致资产快照，按稳定顺序完成布局和 Mutation 规划，再依次交给文档改写、固定输出发布与持久日志。",
+      plain: "它对顶层承诺一份完整输出，而不是零散文件补丁。它自己决定哪些译文需要布局、如何整块保守回退以及如何统计，但不接触真实 SQL、JSON 或目录交换。",
+      example: "某段译文超过对话宽度但没有安全断点。Standard 仍发布它的原译文，manual_layout_units 加一，不把正常人工处理升级成技术错误。",
+      input: "OpenedProject 与显式 MzWriteBackLayoutProfile",
+      output: "PublishedWriteBack 与 StandardWriteBackSummary；完整人工诊断进入单次运行日志",
+      boundary: "业务编排已经实现；真实五表 SQL、布局算法、MZ 文档重建、固定输出发布和日志适配器仍未实现。"
+    },
+    "writeback-asset-reader": {
+      title: "读取写回资产",
+      symbol: "StandardWriteBackAssetReader",
+      shortSymbol: "WriteBack Asset Reader",
+      path: "src/att_mz/write_back/standard.rs",
+      status: "直接依赖契约",
+      role: "从五张标准资产表读取不含术语数据的一致写回快照。",
+      plain: "它只交付每个文本位置的原文、可选数据库译文和结构化角色；缺译是正常事实，SQL 或 schema 失败才是技术错误。",
+      example: "某个物品名称有译文而说明没有译文。Reader 同时返回两个叶子，Standard 对名称计入应用译文，对说明计入保留原文。",
+      input: "OpenedProject",
+      output: "StandardWriteBackSnapshot",
+      boundary: "真实五表 SQL 查询、一致读视图和数据库解码尚未实现；术语数据不属于该契约。"
+    },
+    "writeback-layouter": {
+      title: "保守文本布局",
+      symbol: "MzWriteBackTextLayouter",
+      shortSymbol: "WriteBack Layouter",
+      path: "src/att_mz/write_back/standard.rs",
+      status: "直接依赖契约",
+      role: "按显式区域行宽处理对话正文块、滚动文本块和规范帮助说明，并返回 Applied 或正常 Manual。",
+      plain: "它只负责文本阅读布局。找不到安全断点时整块放行，不伪造成功，也不把需要人工处理升级成技术错误。",
+      example: "对话正文块的一个译文叶子变长但没有安全断点，Layouter 返回 Manual；Standard 撤销这个块的自动换行和缩进，保留原始数据库译文。",
+      input: "MzWriteBackLayoutRequest 与对应 MaxFullwidthChars",
+      output: "MzWriteBackLayoutOutcome",
+      boundary: "控制符、占位符、Unicode 显示宽度、断点选择和全角缩进算法尚未实现。"
+    },
+    "writeback-rewriter": {
+      title: "重建 MZ 文档",
+      symbol: "MzWriteBackDocumentRewriter",
+      shortSymbol: "MZ Document Rewriter",
+      path: "src/att_mz/write_back/standard.rs",
+      status: "直接依赖契约",
+      role: "把强类型 Mutation Plan 应用到冻结文档，生成候选文档而不直接发布。",
+      plain: "它理解普通 JSON 位置、插件参数以及会改变数量的 401/405 指令块；Standard 因此无需操作裸命令码。",
+      example: "一个对话译文含三个硬行时，Rewriter 以后会把对应正文段重建为三条 401 指令，同时让缺译的相邻命令逐字保持不变。",
+      input: "OpenedProject 与 StandardWriteBackMutationPlan",
+      output: "关联类型 RewrittenDocuments",
+      boundary: "真实文档读取、JSON/Note/Comment/插件参数改写、401/405 重建和序列化尚未实现。"
+    },
+    "writeback-publisher": {
+      title: "发布固定输出",
+      symbol: "StandardWriteBackPublisher",
+      shortSymbol: "WriteBack Publisher",
+      path: "src/att_mz/write_back/standard.rs",
+      status: "直接依赖契约",
+      role: "把候选文档与完整冻结 data/js 组成固定最新输出，成功后才确认 PublishedWriteBack。",
+      plain: "它拥有多文件副作用边界：发布失败不能把半成品当作成功，也不能让 Standard 自己逐个写文件。",
+      example: "即使没有任何译文，Publisher 以后仍会从 source 生成完整 write_back/data 和 write_back/js；中途失败则不返回发布成功。",
+      input: "OpenedProject 与 RewrittenDocuments",
+      output: "固定输出发布成功或明确失败",
+      boundary: "真实递归复制、候选覆盖、目录替换、失败清理和生产文件适配尚未实现。"
+    },
+    "writeback-event-log": {
+      title: "持久记录发布结果",
+      symbol: "PersistentEventLog<StandardWriteBackRunLog>",
+      shortSymbol: "WriteBack Event Log",
+      path: "src/observability.rs",
+      status: "根接口",
+      role: "在固定输出发布成功后，一次持久接管项目、输出路径、汇总和全部人工布局诊断。",
+      plain: "日志失败会让 Standard 明确失败并阻止 Lua，但不会回滚已经确认发布的 data/js；这样既不伪造完整命令成功，也不谎称已发布副作用不存在。",
+      example: "Publisher 已成功，日志介质随后失败。错误带回 write_back 路径，顶层停止 Lua，而目录仍保留给人工诊断和后续恢复。",
+      input: "一条 StandardWriteBackRunLog",
+      output: "事件达到配置声明的持久化终态，或保留源错误",
+      boundary: "本轮只复用根接口；日志文件、格式、队列、轮转、刷盘和保留策略均无生产实现。"
+    },
+    "lua-writeback": {
+      title: "Lua 写回",
+      symbol: "LuaWriteBack",
+      shortSymbol: "Lua WriteBack",
+      path: "src/att_mz/write_back.rs",
+      status: "直接依赖契约",
+      role: "在 Standard 已发布的同一固定输出上运行用户明确选择的可信 Lua 程序。",
+      plain: "Lua 拿到冻结源、项目数据库和最新输出后，自己拥有协议与事务；Rust 顶层不替它猜测、合并或回滚。",
+      example: "脚本为自定义插件补写 js 数据。若它失败，错误包含脚本路径和 Standard 已发布输出路径，下一次 Standard 会再次从冻结 source 重建。",
+      input: "OpenedProject、PublishedWriteBack 与脚本路径",
+      output: "Lua 阶段成功或带上下文的明确失败",
+      boundary: "真实 LuaInvocation、Host 和 VM 接线属于后续以 LuaWriteBack 为目标的任务。"
+    }
+  };
 
-function renderEdge(item, byId, enhance) {
-  const from = byId.get(item.from);
-  const to = byId.get(item.to);
-  const start = anchor(from, item.fromPort, item.fromDx ?? 0, item.fromDy ?? 0);
-  const end = anchor(to, item.toPort, item.toDx ?? 0, item.toDy ?? 0);
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
-  const length = Math.hypot(dx, dy) || 1;
-  let path, labelX, labelY, angle;
-  if (item.curve) {
-    const controlX = (start.x + end.x) / 2 - (dy / length) * item.curve;
-    const controlY = (start.y + end.y) / 2 + (dx / length) * item.curve;
-    path = `M ${start.x} ${start.y} Q ${controlX} ${controlY} ${end.x} ${end.y}`;
-    labelX = 0.25 * start.x + 0.5 * controlX + 0.25 * end.x;
-    labelY = 0.25 * start.y + 0.5 * controlY + 0.25 * end.y - 7;
-    angle = Math.atan2(end.y - controlY, end.x - controlX);
-  } else {
-    path = `M ${start.x} ${start.y} L ${end.x} ${end.y}`;
-    labelX = (start.x + end.x) / 2;
-    labelY = (start.y + end.y) / 2 - 7;
-    angle = Math.atan2(end.y - start.y, end.x - start.x);
+  function n(uid, moduleId, children, options) {
+    var node = {
+      uid: uid,
+      module: moduleId,
+      children: children || []
+    };
+    if (options) {
+      Object.keys(options).forEach(function (key) {
+        node[key] = options[key];
+      });
+    }
+    return node;
   }
-  const group = svgEl('g', { class: 'edge', 'data-id': item.id });
-  group.style.setProperty('--c', item.color);
-  group.appendChild(sketchPath(path, { seed: hashId(item.id), dash: item.dash, enhance }));
-  for (const side of [0.5, -0.5]) {
-    const headX = end.x - 11 * Math.cos(angle + side);
-    const headY = end.y - 11 * Math.sin(angle + side);
-    group.appendChild(sketchPath(`M ${headX} ${headY} L ${end.x} ${end.y}`, {
-      seed: hashId(item.id) + 7, dash: false, enhance,
+
+  ROOTS.init.tree = n("init-service", "init-service", [
+    n("init-project-name", "project-name", [], { order: "①" }),
+    n("init-workspace-create", "project-workspace-creator", [], { order: "②" })
+  ]);
+
+  ROOTS.extract.tree = n("extract-service", "extract-service", [
+    n("extract-project-open", "project-opener", [
+      n("extract-project-record", "project-record-reader")
+    ], { order: "①" }),
+    n("extract-builtin", "builtin-extraction", [
+      n("builtin-doc-reader", "document-reader", [], { reused: true }),
+      n("builtin-snapshot-model", "snapshot-model", [], { reused: true }),
+      n("builtin-asset-store", "asset-store", [
+        n("builtin-location-codec", "location-codec", [], { reused: true })
+      ], { reused: true })
+    ], { order: "②" }),
+    n("extract-rules", "rules-extraction", [
+      n("rules-doc-reader", "document-reader", [], { reused: true }),
+      n("rules-snapshot-model", "snapshot-model", [], { reused: true }),
+      n("rules-asset-store", "asset-store", [
+        n("rules-location-codec", "location-codec", [], { reused: true })
+      ], { reused: true })
+    ], { order: "③" }),
+    n("extract-lua", "lua-extraction", [
+      n("extract-lua-host", "lua-host", [], { reused: true })
+    ], { order: "④", optional: true })
+  ]);
+
+  ROOTS.translate.tree = n("translate-service", "translate-service", [
+    n("translate-profile", "profile-resolver", [], { order: "①" }),
+    n("translate-project-record", "project-record-reader", [], { order: "②", reused: true }),
+    n("translate-standard", "standard-translation", [
+      n("standard-asset-reader", "asset-reader", [
+        n("reader-location-codec", "location-codec", [], { reused: true })
+      ], { order: "①" }),
+      n("standard-planner", "planner", [
+        n("planner-resources", "planning-resource"),
+        n("planner-language", "language-catalog", [
+          n("planner-language-ja", "japanese-language", [], { reused: true }),
+          n("planner-language-en", "english-language", [], { reused: true })
+        ], { reused: true }),
+        n("planner-placeholder", "placeholder-service"),
+        n("planner-dedup", "deduplication")
+      ], { order: "②" }),
+      n("standard-executor", "executor", [
+        n("executor-response", "response-processor", [
+          n("response-language", "language-catalog", [
+            n("response-language-ja", "japanese-language", [], { reused: true }),
+            n("response-language-en", "english-language", [], { reused: true })
+          ], { reused: true })
+        ])
+      ], { order: "③" }),
+      n("standard-store", "result-store", [
+        n("store-location-codec", "location-codec", [], { reused: true })
+      ], { order: "④" })
+    ], { order: "③" }),
+    n("translate-lua", "lua-translation", [
+      n("translate-lua-host", "lua-host", [], { reused: true })
+    ], { order: "④", optional: true })
+  ]);
+
+  ROOTS.writeback.tree = n("writeback-service", "writeback-service", [
+    n("writeback-project-open", "project-opener", [], { order: "①", reused: true }),
+    n("writeback-standard", "standard-writeback", [
+      n("writeback-asset-read", "writeback-asset-reader", [], { order: "①" }),
+      n("writeback-layout", "writeback-layouter", [], { order: "②" }),
+      n("writeback-rewrite", "writeback-rewriter", [], { order: "③" }),
+      n("writeback-publish", "writeback-publisher", [], { order: "④" }),
+      n("writeback-log", "writeback-event-log", [], { order: "⑤" })
+    ], { order: "②" }),
+    n("writeback-lua", "lua-writeback", [], { order: "③", optional: true })
+  ]);
+
+  var NS = "http://www.w3.org/2000/svg";
+  var NODE_W = 188;
+  var NODE_H = 68;
+  var LEAF_SPAN = 210;
+  var LEVEL_GAP = 124;
+  var PAD_X = 28;
+  var PAD_Y = 30;
+  var MIN_TREE_WIDTH = 720;
+  var reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var hasRough = false;
+  var roughController = null;
+  var activeRootId = null;
+  var selectedUid = null;
+  var expanded = new Set();
+  var lastPositions = new Map();
+
+  var rootGrid = document.getElementById("root-grid");
+  var rootButtons = Array.prototype.slice.call(rootGrid.querySelectorAll(".root-card"));
+  var branchShell = document.getElementById("branch-shell");
+  var branchCard = document.getElementById("branch-card");
+  var branchKicker = document.getElementById("branch-kicker");
+  var branchTitle = document.getElementById("branch-title");
+  var branchSummary = document.getElementById("branch-summary");
+  var sequenceText = document.getElementById("sequence-text");
+  var workspace = document.getElementById("workspace");
+  var treeScroller = document.getElementById("tree-scroller");
+  var treeFoot = document.getElementById("tree-foot");
+  var inspector = document.getElementById("inspector");
+  var firstLevelButton = document.getElementById("first-level-btn");
+  var expandAllButton = document.getElementById("expand-all-btn");
+  var closeTreeButton = document.getElementById("close-tree-btn");
+
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  function svgEl(tag, attrs) {
+    var el = document.createElementNS(NS, tag);
+    Object.keys(attrs || {}).forEach(function (key) {
+      el.setAttribute(key, attrs[key]);
+    });
+    return el;
+  }
+
+  function loadScriptWithFallback(urls, timeout) {
+    return new Promise(function (resolve) {
+      var index = 0;
+      var settled = false;
+
+      function next() {
+        if (settled) {
+          return;
+        }
+        if (index >= urls.length) {
+          settled = true;
+          resolve(false);
+          return;
+        }
+
+        var script = document.createElement("script");
+        var timer = window.setTimeout(function () {
+          script.onload = null;
+          script.onerror = null;
+          script.remove();
+          next();
+        }, timeout);
+
+        script.src = urls[index++];
+        script.async = true;
+        script.onload = function () {
+          window.clearTimeout(timer);
+          if (!settled) {
+            settled = true;
+            resolve(Boolean(window.rough));
+          }
+        };
+        script.onerror = function () {
+          window.clearTimeout(timer);
+          script.remove();
+          next();
+        };
+        document.head.appendChild(script);
+      }
+
+      next();
+    });
+  }
+
+  function flattenTree(root) {
+    var result = [];
+    function visit(node, parent) {
+      result.push({ node: node, parent: parent || null });
+      node.children.forEach(function (child) {
+        visit(child, node);
+      });
+    }
+    visit(root, null);
+    return result;
+  }
+
+  function findNode(root, uid) {
+    var stack = [root];
+    while (stack.length) {
+      var current = stack.pop();
+      if (current.uid === uid) {
+        return current;
+      }
+      for (var i = current.children.length - 1; i >= 0; i -= 1) {
+        stack.push(current.children[i]);
+      }
+    }
+    return null;
+  }
+
+  function findParent(root, uid) {
+    var flat = flattenTree(root);
+    for (var i = 0; i < flat.length; i += 1) {
+      if (flat[i].node.uid === uid) {
+        return flat[i].parent;
+      }
+    }
+    return null;
+  }
+
+  function moduleOccurrenceCount(moduleId) {
+    var count = 0;
+    Object.keys(ROOTS).forEach(function (rootId) {
+      flattenTree(ROOTS[rootId].tree).forEach(function (entry) {
+        if (entry.node.module === moduleId) {
+          count += 1;
+        }
+      });
+    });
+    return count;
+  }
+
+  function syncRootButtons() {
+    rootButtons.forEach(function (button) {
+      var open = button.getAttribute("data-root") === activeRootId;
+      button.classList.toggle("is-open", open);
+      button.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+  }
+
+  function closeInspector() {
+    workspace.classList.remove("has-inspector");
+    selectedUid = null;
+    inspector.innerHTML = "";
+    if (activeRootId) {
+      renderTree(false);
+    }
+  }
+
+  function closeRoot() {
+    activeRootId = null;
+    selectedUid = null;
+    expanded = new Set();
+    syncRootButtons();
+    workspace.classList.remove("has-inspector");
+    branchShell.classList.remove("is-open");
+    branchShell.setAttribute("aria-hidden", "true");
+    branchShell.inert = true;
+    window.setTimeout(function () {
+      if (!activeRootId) {
+        treeScroller.innerHTML = '<div class="tree-empty">选择上方四个根之一</div>';
+        inspector.innerHTML = "";
+      }
+    }, reducedMotion ? 0 : 420);
+  }
+
+  function openRoot(rootId) {
+    if (activeRootId === rootId) {
+      closeRoot();
+      return;
+    }
+
+    activeRootId = rootId;
+    var root = ROOTS[rootId];
+    expanded = new Set([root.tree.uid]);
+    selectedUid = root.tree.uid;
+
+    syncRootButtons();
+    branchCard.style.setProperty("--c", root.color);
+    branchKicker.textContent = root.label + " · 职责树";
+    branchKicker.style.color = root.color;
+    branchTitle.textContent = root.label + " — " + root.zh;
+    branchSummary.textContent = root.summary;
+    sequenceText.textContent = root.sequence;
+    treeFoot.textContent = rootId === "writeback"
+      ? "WriteBack 已展开到 Standard 业务编排及其直接契约；真实 SQL、布局、文档改写、发布、日志适配和 Lua Host 仍在边界之外。"
+      : "点击模块逐层展开。重复出现的“复用”节点仍是同一个实现，不会被另分成第五类。";
+
+    branchShell.classList.add("is-open");
+    branchShell.setAttribute("aria-hidden", "false");
+    branchShell.inert = false;
+    firstLevelButton.hidden = false;
+    expandAllButton.hidden = false;
+    workspace.classList.add("has-inspector");
+    renderTree(false);
+    renderInspector(root.tree);
+
+    window.requestAnimationFrame(function () {
+      branchShell.scrollIntoView({
+        behavior: reducedMotion ? "auto" : "smooth",
+        block: "nearest"
+      });
+    });
+  }
+
+  function buildVisible(node, depth) {
+    var item = {
+      data: node,
+      depth: depth,
+      children: [],
+      span: LEAF_SPAN,
+      x: 0,
+      y: 0
+    };
+    if (expanded.has(node.uid)) {
+      item.children = node.children.map(function (child) {
+        return buildVisible(child, depth + 1);
+      });
+    }
+    if (item.children.length) {
+      item.span = item.children.reduce(function (sum, child) {
+        return sum + child.span;
+      }, 0);
+      item.span = Math.max(item.span, LEAF_SPAN);
+    }
+    return item;
+  }
+
+  function placeVisible(item, startX, positions) {
+    var center = startX + item.span / 2;
+    item.x = center;
+    item.y = PAD_Y + item.depth * LEVEL_GAP;
+    positions.set(item.data.uid, item);
+
+    var childStart = startX;
+    item.children.forEach(function (child) {
+      placeVisible(child, childStart, positions);
+      childStart += child.span;
+    });
+  }
+
+  function visibleMaxDepth(item) {
+    if (!item.children.length) {
+      return item.depth;
+    }
+    return Math.max.apply(null, item.children.map(visibleMaxDepth));
+  }
+
+  function regularRect(x, y, width, height) {
+    return svgEl("rect", {
+      x: x,
+      y: y,
+      width: width,
+      height: height,
+      rx: 10
+    });
+  }
+
+  function sketchRect(x, y, width, height, seed) {
+    if (!hasRough || !roughController) {
+      return regularRect(x, y, width, height);
+    }
+    return roughController.rectangle(x, y, width, height, {
+      roughness: 1.05,
+      bowing: 0.9,
+      seed: seed,
+      strokeWidth: 1.55
+    });
+  }
+
+  function sketchPath(path, seed) {
+    if (!hasRough || !roughController) {
+      return svgEl("path", { d: path });
+    }
+    return roughController.path(path, {
+      roughness: 0.82,
+      bowing: 0.65,
+      seed: seed,
+      strokeWidth: 1.5
+    });
+  }
+
+  function drawEdge(svg, parent, child, index) {
+    var startY = parent.y + NODE_H;
+    var endY = child.y;
+    var middleY = startY + (endY - startY) * 0.52;
+    var path = "M " + parent.x + " " + startY +
+      " C " + parent.x + " " + middleY +
+      ", " + child.x + " " + middleY +
+      ", " + child.x + " " + endY;
+
+    var group = svgEl("g", { class: "tree-edge" });
+    var roughPath = sketchPath(path, 100 + index);
+    roughPath.classList.add("edge-rough");
+    Array.prototype.slice.call(roughPath.querySelectorAll ? roughPath.querySelectorAll("path") : [roughPath]).forEach(function (piece, pieceIndex) {
+      piece.setAttribute("pathLength", "1");
+      piece.classList.add("draw-in");
+      piece.style.setProperty("--di", String(index + pieceIndex));
+    });
+    if (roughPath.tagName && roughPath.tagName.toLowerCase() === "path") {
+      roughPath.setAttribute("pathLength", "1");
+      roughPath.classList.add("draw-in");
+      roughPath.style.setProperty("--di", String(index));
+    }
+    group.appendChild(roughPath);
+
+    var arrow = svgEl("polyline", {
+      points: (child.x - 5) + "," + (endY - 7) + " " + child.x + "," + endY + " " + (child.x + 5) + "," + (endY - 7),
+      pathLength: "1"
+    });
+    arrow.classList.add("draw-in");
+    arrow.style.setProperty("--di", String(index + 1));
+    group.appendChild(arrow);
+    svg.appendChild(group);
+  }
+
+  function drawNode(svg, item, index, rootColor) {
+    var data = item.data;
+    var module = MODULES[data.module];
+    var x = item.x - NODE_W / 2;
+    var y = item.y;
+    var classes = ["tree-node", "fade-in"];
+    if (selectedUid === data.uid) {
+      classes.push("is-active");
+    } else if (selectedUid) {
+      var selectedNode = findNode(ROOTS[activeRootId].tree, selectedUid);
+      if (selectedNode && selectedNode.module === data.module) {
+        classes.push("is-same-module");
+      }
+    }
+
+    var group = svgEl("g", {
+      class: classes.join(" "),
+      "data-uid": data.uid,
+      "data-module": data.module,
+      role: "button",
+      tabindex: "0",
+      "aria-label": module.title + (data.children.length ? "，点击展开或收起下级并查看说明" : "，点击查看说明")
+    });
+    group.style.setProperty("--c", rootColor);
+    group.style.setProperty("--di", String(index));
+
+    group.appendChild(svgEl("rect", {
+      class: "node-bg",
+      x: x + 1,
+      y: y + 1,
+      width: NODE_W - 2,
+      height: NODE_H - 2,
+      rx: 10
     }));
+
+    var shape = sketchRect(x, y, NODE_W, NODE_H, 300 + index);
+    shape.classList.add("node-shape");
+    group.appendChild(shape);
+
+    if (data.order) {
+      var order = svgEl("text", {
+        class: "node-corner",
+        x: x + 11,
+        y: y + 14
+      });
+      order.textContent = data.order;
+      group.appendChild(order);
+    }
+
+    if (data.children.length) {
+      var state = svgEl("text", {
+        class: "node-corner",
+        x: x + NODE_W - 12,
+        y: y + 14,
+        "text-anchor": "end"
+      });
+      state.textContent = (expanded.has(data.uid) ? "−" : "+") + data.children.length;
+      group.appendChild(state);
+    } else if (module.status === "暂时只有接口" || module.status === "直接依赖契约" || module.status === "根接口") {
+      var onlyInterface = svgEl("text", {
+        class: "node-corner",
+        x: x + NODE_W - 12,
+        y: y + 14,
+        "text-anchor": "end"
+      });
+      onlyInterface.textContent = module.status === "根接口" ? "根" : "契约";
+      group.appendChild(onlyInterface);
+    }
+
+    var title = svgEl("text", {
+      class: "node-title",
+      x: item.x,
+      y: y + 29
+    });
+    title.textContent = module.title;
+    group.appendChild(title);
+
+    var symbol = svgEl("text", {
+      class: "node-symbol",
+      x: item.x,
+      y: y + 49
+    });
+    symbol.textContent = module.shortSymbol;
+    group.appendChild(symbol);
+
+    if (data.reused || moduleOccurrenceCount(data.module) > 1) {
+      var reused = svgEl("text", {
+        class: "node-reused",
+        x: x + NODE_W - 10,
+        y: y + NODE_H - 8
+      });
+      reused.textContent = "复用";
+      group.appendChild(reused);
+    }
+
+    function activate(event) {
+      event.preventDefault();
+      selectNode(data);
+    }
+
+    group.addEventListener("click", activate);
+    group.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" || event.key === " ") {
+        activate(event);
+      }
+    });
+    svg.appendChild(group);
   }
-  const label = svgText(labelX, labelY, item.label, 'edge-label');
-  label.dataset.id = item.id;
-  group.appendChild(label);
-  return group;
-}
 
-function renderGroup(item) {
-  const group = svgEl('g', { class: 'group', 'data-id': item.label });
-  group.style.setProperty('--c', item.color);
-  group.appendChild(cleanRect(item.x, item.y, item.w, item.h, true));
-  const label = svgText(item.x + 14, item.y + 20, item.label, '');
-  label.setAttribute('text-anchor', 'start');
-  group.appendChild(label);
-  return group;
-}
+  function renderTree(keepScroll) {
+    if (!activeRootId) {
+      return;
+    }
 
-function applyClasses(step) {
-  document.querySelectorAll('.node').forEach(element => {
-    const active = isSelected(step.nodes, element.dataset.id);
-    element.classList.toggle('is-active', active);
-    element.classList.toggle('is-dimmed', !active);
+    var previousScrollLeft = treeScroller.scrollLeft;
+    var root = ROOTS[activeRootId];
+    var visible = buildVisible(root.tree, 0);
+    var contentWidth = visible.span;
+    var width = Math.max(MIN_TREE_WIDTH, contentWidth + PAD_X * 2);
+    var offset = (width - contentWidth) / 2;
+    var positions = new Map();
+    placeVisible(visible, offset, positions);
+    lastPositions = positions;
+    var height = PAD_Y * 2 + visibleMaxDepth(visible) * LEVEL_GAP + NODE_H;
+
+    var svg = svgEl("svg", {
+      viewBox: "0 0 " + width + " " + height,
+      width: width,
+      height: height,
+      role: "tree",
+      "aria-label": root.label + " 模块职责树"
+    });
+    roughController = hasRough && window.rough ? window.rough.svg(svg) : null;
+
+    var visibleList = [];
+    function collect(item) {
+      visibleList.push(item);
+      item.children.forEach(collect);
+    }
+    collect(visible);
+
+    var edgeIndex = 0;
+    visibleList.forEach(function (item) {
+      item.children.forEach(function (child) {
+        drawEdge(svg, item, child, edgeIndex++);
+      });
+    });
+
+    visibleList.forEach(function (item, index) {
+      drawNode(svg, item, index, root.color);
+    });
+
+    treeScroller.innerHTML = "";
+    treeScroller.appendChild(svg);
+
+    if (keepScroll) {
+      treeScroller.scrollLeft = previousScrollLeft;
+    }
+
+    if (selectedUid && positions.has(selectedUid)) {
+      var selected = positions.get(selectedUid);
+      window.requestAnimationFrame(function () {
+        var target = Math.max(0, selected.x - treeScroller.clientWidth / 2);
+        treeScroller.scrollTo({
+          left: target,
+          behavior: reducedMotion ? "auto" : "smooth"
+        });
+      });
+    }
+  }
+
+  function selectNode(node) {
+    selectedUid = node.uid;
+    if (node.children.length) {
+      if (expanded.has(node.uid)) {
+        expanded.delete(node.uid);
+      } else {
+        expanded.add(node.uid);
+      }
+    }
+    workspace.classList.add("has-inspector");
+    renderTree(true);
+    renderInspector(node);
+  }
+
+  function renderInspector(node) {
+    var module = MODULES[node.module];
+    var root = ROOTS[activeRootId];
+    var parent = findParent(root.tree, node.uid);
+    var parentText = parent ? MODULES[parent.module].title : root.label + " 顶层功能";
+    var childText = node.children.length
+      ? node.children.map(function (child) {
+          return MODULES[child.module].title;
+        }).join("、")
+      : "没有下级职责";
+    var occurrenceCount = moduleOccurrenceCount(node.module);
+    var chips = [
+      '<span class="chip is-tone">' + escapeHtml(module.status) + '</span>'
+    ];
+
+    if (node.optional) {
+      chips.push('<span class="chip">可选阶段</span>');
+    }
+    if (node.reused || occurrenceCount > 1) {
+      chips.push('<span class="chip">同一实现被复用</span>');
+    }
+    if (node.order) {
+      chips.push('<span class="chip">顺序 ' + escapeHtml(node.order) + '</span>');
+    }
+
+    var boundary = module.boundary
+      ? '<div class="boundary-note"><strong>接线现状：</strong>' + escapeHtml(module.boundary) + '</div>'
+      : "";
+
+    inspector.style.setProperty("--c", root.color);
+    inspector.innerHTML =
+      '<div class="inspector-head panel-in">' +
+        '<div>' +
+          '<p class="inspector-kicker" style="color:' + root.color + '">点击模块后的说明</p>' +
+          '<h4 class="inspector-title">' + escapeHtml(module.title) + '</h4>' +
+          '<span class="inspector-symbol">' + escapeHtml(module.symbol) + '</span>' +
+        '</div>' +
+        '<button class="close-inspector" type="button" aria-label="收起当前说明">×</button>' +
+      '</div>' +
+      '<div class="inspector-body panel-in">' +
+        '<div class="chips">' + chips.join("") + '</div>' +
+        '<div class="detail-block">' +
+          '<span class="detail-label">一句话作用</span>' +
+          '<p><strong>' + escapeHtml(module.role) + '</strong></p>' +
+        '</div>' +
+        '<div class="detail-block">' +
+          '<span class="detail-label">大白话</span>' +
+          '<p>' + escapeHtml(module.plain) + '</p>' +
+        '</div>' +
+        '<div class="detail-block">' +
+          '<span class="detail-label">简单直白例子</span>' +
+          '<div class="example-box">' + escapeHtml(module.example) + '</div>' +
+        '</div>' +
+        '<div class="detail-block">' +
+          '<span class="detail-label">输入 → 产出</span>' +
+          '<div class="io-grid">' +
+            '<div class="io-item"><b>输入</b><span>' + escapeHtml(module.input) + '</span></div>' +
+            '<div class="io-item"><b>产出</b><span>' + escapeHtml(module.output) + '</span></div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="detail-block">' +
+          '<span class="detail-label">它在树里的归属</span>' +
+          '<div class="location-box">' +
+            '<div><strong>直接上级：</strong>' + escapeHtml(parentText) + '</div>' +
+            '<div><strong>直接下级：</strong>' + escapeHtml(childText) + '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="detail-block">' +
+          '<span class="detail-label">代码位置</span>' +
+          '<a class="source-link" href="' + escapeHtml(module.path) + '">' + escapeHtml(module.path) + '</a>' +
+        '</div>' +
+        boundary +
+      '</div>';
+
+    var closeButton = inspector.querySelector(".close-inspector");
+    closeButton.addEventListener("click", closeInspector);
+  }
+
+  function addAllExpandable(node) {
+    if (node.children.length) {
+      expanded.add(node.uid);
+      node.children.forEach(addAllExpandable);
+    }
+  }
+
+  rootButtons.forEach(function (button) {
+    button.addEventListener("click", function () {
+      openRoot(button.getAttribute("data-root"));
+    });
   });
-  document.querySelectorAll('.edge').forEach(element => {
-    const active = isSelected(step.edges, element.dataset.id);
-    element.classList.toggle('is-active', active);
-    element.classList.toggle('is-dimmed', !active);
-    element.querySelector('.edge-label')?.classList.toggle('is-active', active);
+
+  firstLevelButton.addEventListener("click", function () {
+    if (!activeRootId) {
+      return;
+    }
+    expanded = new Set([ROOTS[activeRootId].tree.uid]);
+    selectedUid = ROOTS[activeRootId].tree.uid;
+    workspace.classList.add("has-inspector");
+    renderTree(false);
+    renderInspector(ROOTS[activeRootId].tree);
   });
-}
 
-function renderDiagram(step, enhanceFocused = false) {
-  const diagram = diagrams[step.view];
-  const byId = new Map(diagram.nodes.map(item => [item.id, item]));
-  const svg = svgEl('svg', { viewBox: diagram.viewBox, role: 'img', 'aria-label': `${step.title}依赖图` });
-  if (roughAvailable) rcHolder = rough.svg(svg);
-  diagram.groups.forEach(item => svg.appendChild(renderGroup(item)));
-  diagram.edges.forEach(item => svg.appendChild(renderEdge(item, byId,
-    enhanceFocused && isSelected(step.edges, item.id))));
-  diagram.nodes.forEach(item => svg.appendChild(renderNode(item,
-    enhanceFocused && isSelected(step.nodes, item.id))));
-  const container = document.getElementById('diagram');
-  container.replaceChildren(svg);
-  state.view = step.view;
-  applyClasses(step);
-}
-
-function renderPanel(step) {
-  const rows = step.kv.map(([key, value]) =>
-    `<div class="kv"><span class="k">${key}</span><span class="v">${value}</span></div>`
-  ).join('');
-  document.getElementById('step-panel').innerHTML =
-    `<div class="panel-swap"><h3>${step.title}</h3><p>${step.desc}</p><div class="status-note">${rows}</div></div>`;
-}
-
-function renderStepper() {
-  const indexes = visibleStepIndexes();
-  document.getElementById('stepper').innerHTML = indexes.map(index =>
-    `<button type="button" class="step-btn${index === state.stepIndex ? ' is-current' : ''}" data-index="${index}" aria-pressed="${index === state.stepIndex}">${steps[index].label}</button>`
-  ).join('');
-}
-
-function renderCurrent(enhanceFocused = roughAvailable) {
-  const step = steps[state.stepIndex];
-  renderDiagram(step, enhanceFocused);
-  renderPanel(step);
-  renderStepper();
-}
-
-function goStep(index) {
-  if (!steps[index]) return;
-  state.stepIndex = index;
-  renderCurrent(roughAvailable);
-}
-
-function setFilter(filter) {
-  state.filter = filter;
-  document.querySelectorAll('.filter-btn').forEach(button => {
-    const current = button.dataset.filter === filter;
-    button.classList.toggle('is-current', current);
-    button.setAttribute('aria-pressed', String(current));
+  expandAllButton.addEventListener("click", function () {
+    if (!activeRootId) {
+      return;
+    }
+    expanded = new Set();
+    addAllExpandable(ROOTS[activeRootId].tree);
+    renderTree(false);
   });
-  const indexes = visibleStepIndexes();
-  if (!indexes.includes(state.stepIndex)) state.stepIndex = indexes[0];
-  renderCurrent(roughAvailable);
-}
 
-document.getElementById('filters').addEventListener('click', event => {
-  const button = event.target.closest('button[data-filter]');
-  if (button) setFilter(button.dataset.filter);
-});
-document.getElementById('stepper').addEventListener('click', event => {
-  const button = event.target.closest('button[data-index]');
-  if (button) goStep(Number(button.dataset.index));
-});
-document.addEventListener('keydown', event => {
-  if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
-  const indexes = visibleStepIndexes();
-  const position = Math.max(0, indexes.indexOf(state.stepIndex));
-  const delta = event.key === 'ArrowRight' ? 1 : -1;
-  const next = indexes[Math.max(0, Math.min(indexes.length - 1, position + delta))];
-  event.preventDefault();
-  goStep(next);
-});
-document.addEventListener('animationend', event => {
-  if (event.animationName === 'fade-in-up') event.target.classList.remove('anim-in', 'panel-swap');
-});
+  closeTreeButton.addEventListener("click", closeRoot);
 
-// 首屏只创建当前轻量 SVG。rough.js 在空闲时加载，并且只增强当前步骤的活跃子图。
-renderCurrent(false);
-if ('requestIdleCallback' in window) {
-  window.requestIdleCallback(startRoughEnhancement, { timeout: 1400 });
-} else {
-  setTimeout(startRoughEnhancement, 250);
-}
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Escape" || !activeRootId) {
+      return;
+    }
+    if (workspace.classList.contains("has-inspector")) {
+      closeInspector();
+    } else {
+      closeRoot();
+    }
+  });
+
+  loadScriptWithFallback([
+    "https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js",
+    "https://unpkg.com/roughjs@4.6.6/bundled/rough.js"
+  ], 2200).then(function (loaded) {
+    hasRough = loaded;
+    if (activeRootId) {
+      renderTree(true);
+    }
+  });
+}());
 </script>
 </body>
 </html>

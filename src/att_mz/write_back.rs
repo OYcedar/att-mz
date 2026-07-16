@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use super::ProjectName;
 use super::project::{ExistingProjectOpener, MzWriteBackLayoutProfile, OpenedProject};
 
+pub(crate) mod standard;
 
 /// 写回指定 MZ 项目所需的输入。
 #[derive(Clone, Debug, Eq, PartialEq)]
