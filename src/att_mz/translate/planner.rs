@@ -11,6 +11,9 @@ use std::sync::Arc;
 use futures_util::stream::{self, StreamExt};
 
 use crate::att_mz::text::{MzLocationStep, MzSource, StandardDataFile, TextGroupKind};
+use crate::language::{
+    LanguageAnalysis, LanguageModule, LanguageModuleCatalog, LanguageModuleCatalogError,
+};
 use crate::project_database::StoredProjectRecord;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
@@ -18,9 +21,7 @@ use super::deduplication::{
     TranslationDeduplicationCandidate, TranslationDeduplicationError,
     TranslationDeduplicationOutcome, deduplicate_translation_candidates,
 };
-use super::language::{
-    SourceLanguage, TranslationLanguageCatalog, TranslationLanguageCatalogError,
-};
+use super::language_projection::{LanguageTextProjectionError, project_protected_text};
 use super::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderProtectionError,
     PlaceholderRuleCompilationError,
@@ -42,7 +43,7 @@ use super::standard::{
 /// 使用三个职责模块与 CPU 根建立确定性 MZ 翻译计划。
 pub(crate) struct MzStandardTranslationTaskPlanningService<R, C, L> {
     resources: R,
-    languages: TranslationLanguageCatalog,
+    languages: LanguageModuleCatalog,
     placeholders: Pcre2PlaceholderService,
     cpu: C,
     llm_profile: PhantomData<fn() -> L>,
@@ -51,7 +52,7 @@ pub(crate) struct MzStandardTranslationTaskPlanningService<R, C, L> {
 impl<R, C, L> MzStandardTranslationTaskPlanningService<R, C, L> {
     pub(crate) fn new(
         resources: R,
-        languages: TranslationLanguageCatalog,
+        languages: LanguageModuleCatalog,
         placeholders: Pcre2PlaceholderService,
         cpu: C,
     ) -> Self {
@@ -98,10 +99,7 @@ where
             .to_owned();
         let source_language = self
             .languages
-            .source_arc(project.source_language())
-            .map_err(MzStandardTranslationTaskPlanningError::Language)?;
-        self.languages
-            .target(project.target_language())
+            .resolve(project.source_language())
             .map_err(MzStandardTranslationTaskPlanningError::Language)?;
 
         let (terminology_path, placeholder_rules_path) = input.into_parts();
@@ -400,6 +398,7 @@ struct PreprocessedUnit {
     identity: TranslationLeafIdentity,
     protected_text: String,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
+    language_analysis: LanguageAnalysis,
     translation: Option<String>,
     terminology_dependencies: Vec<TerminologyDependency>,
     invalidated: bool,
@@ -419,7 +418,7 @@ enum PreparedUnitResponsibility {
 
 fn preprocess_scope(
     scope: PreparedScope,
-    source_language: Arc<dyn SourceLanguage>,
+    source_language: Arc<dyn LanguageModule>,
     placeholder_service: &Pcre2PlaceholderService,
     custom_placeholders: &CompiledPlaceholderRules,
 ) -> Result<PreprocessedScope, ScopePreprocessingError> {
@@ -435,12 +434,15 @@ fn preprocess_scope(
                 )
                 .map_err(ScopePreprocessingError::ProtectPlaceholder)?
                 .into_parts();
-            let translatable_text = remove_placeholder_tokens(&protected_text, &placeholders);
-            let responsibility = if translatable_text.trim().is_empty() {
+            let language_text = project_protected_text(&protected_text, &placeholders)
+                .map_err(ScopePreprocessingError::ProjectLanguageText)?;
+            let has_natural_text = language_text.has_non_whitespace_natural_text();
+            let language_analysis = source_language.analyze_source(&language_text);
+            let responsibility = if !has_natural_text {
                 PreparedUnitResponsibility::Virtual {
                     reason: TranslationVirtualReason::FullyProtected,
                 }
-            } else if source_language.needs_translation(&translatable_text) {
+            } else if language_analysis.needs_translation() {
                 PreparedUnitResponsibility::AwaitingDeduplication
             } else {
                 PreparedUnitResponsibility::Virtual {
@@ -452,6 +454,7 @@ fn preprocess_scope(
                 identity: asset.identity,
                 protected_text,
                 placeholders,
+                language_analysis,
                 translation: asset.translation,
                 terminology_dependencies: asset.terminology_dependencies,
                 invalidated: asset.invalidated,
@@ -552,6 +555,7 @@ struct PreparedUnit {
     identity: TranslationLeafIdentity,
     protected_text: String,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
+    language_analysis: LanguageAnalysis,
     responsibility: PreparedUnitResponsibility,
 }
 
@@ -571,6 +575,7 @@ fn build_scope_tasks(
                 identity: unit.identity,
                 protected_text: unit.protected_text,
                 placeholders: unit.placeholders,
+                language_analysis: unit.language_analysis,
                 responsibility: unit.responsibility,
             })
             .collect::<Vec<_>>();
@@ -597,17 +602,6 @@ fn build_scope_tasks(
     )
 }
 
-fn remove_placeholder_tokens(
-    protected_text: &str,
-    placeholders: &[super::standard::AppliedPlaceholder],
-) -> String {
-    placeholders
-        .iter()
-        .fold(protected_text.to_owned(), |text, placeholder| {
-            text.replace(placeholder.token(), "")
-        })
-}
-
 struct RenderedGroup {
     group: TranslationTaskGroup,
     markdown: String,
@@ -621,6 +615,7 @@ struct ExpectedBase {
     identity: TranslationLeafIdentity,
     propagation_targets: Vec<TranslationLeafIdentity>,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
+    language_analysis: LanguageAnalysis,
 }
 
 fn render_group(seed: PreparedTaskGroup, first_active_id: usize, ordinal: usize) -> RenderedGroup {
@@ -645,6 +640,7 @@ fn render_group(seed: PreparedTaskGroup, first_active_id: usize, ordinal: usize)
                     identity: unit.identity.clone(),
                     propagation_targets,
                     placeholders: unit.placeholders.clone(),
+                    language_analysis: unit.language_analysis,
                 });
                 units.push(TranslationTaskUnit::active(
                     unit.field_name,
@@ -852,6 +848,7 @@ fn finalize_task(
                 expected.identity,
                 expected.propagation_targets,
                 expected.placeholders,
+                expected.language_analysis,
                 injected.clone(),
             )
         }));
@@ -933,7 +930,7 @@ pub(crate) enum MzStandardTranslationTaskPlanningError<R, C> {
         source_language: String,
         target_language: String,
     },
-    Language(TranslationLanguageCatalogError),
+    Language(LanguageModuleCatalogError),
     ReadResources(R),
     CompilePlaceholdersCompute(CpuTaskExecutionError<C>),
     InvalidPlaceholderRules(PlaceholderRuleCompilationError),
@@ -1047,12 +1044,16 @@ impl Error for CorpusPlanningError {}
 #[derive(Debug)]
 pub(crate) enum ScopePreprocessingError {
     ProtectPlaceholder(PlaceholderProtectionError),
+    ProjectLanguageText(LanguageTextProjectionError),
 }
 
 impl fmt::Display for ScopePreprocessingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ProtectPlaceholder(source) => write!(formatter, "无法保护原文占位符：{source}"),
+            Self::ProjectLanguageText(source) => {
+                write!(formatter, "无法建立受保护原文的语言视图：{source}")
+            }
         }
     }
 }
@@ -1061,6 +1062,7 @@ impl Error for ScopePreprocessingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ProtectPlaceholder(source) => Some(source),
+            Self::ProjectLanguageText(source) => Some(source),
         }
     }
 }
@@ -1110,9 +1112,6 @@ mod tests {
     use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
 
     use super::*;
-    use crate::att_mz::translate::language::{
-        JapaneseSourceLanguage, SimplifiedChineseTargetLanguage, TargetLanguage,
-    };
     use crate::att_mz::translate::planning_resource::{
         JsonTranslationPlanningResourceReadingService, TranslationPlanningResources,
     };
@@ -1121,6 +1120,7 @@ mod tests {
     };
     use crate::att_mz::translate::standard::StandardTranslationAsset;
     use crate::att_mz::translate::standard::TranslationTaskUnitMode;
+    use crate::language::{JapaneseLanguageModule, JapaneseResidualPolicy};
 
     #[derive(Clone, Copy)]
     struct ImmediateCpu;
@@ -1203,14 +1203,16 @@ mod tests {
         }
     }
 
-    fn language_catalog() -> TranslationLanguageCatalog {
-        let source: Arc<dyn SourceLanguage> = Arc::new(JapaneseSourceLanguage);
-        let target: Arc<dyn TargetLanguage> = Arc::new(SimplifiedChineseTargetLanguage);
-        TranslationLanguageCatalog::new(
-            [("ja".to_owned(), source)],
-            [("zh-Hans".to_owned(), target)],
-        )
-        .expect("测试语言绑定应该有效")
+    fn language_catalog() -> LanguageModuleCatalog {
+        let module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
+            JapaneseResidualPolicy::new(
+                NonZeroUsize::new(1).expect("测试残留阈值必须非零"),
+                Vec::new(),
+            )
+            .expect("测试日文残留策略应该有效"),
+            None,
+        ));
+        LanguageModuleCatalog::new([("ja".to_owned(), module)]).expect("测试语言绑定应该有效")
     }
 
     fn profile(
@@ -1223,8 +1225,17 @@ mod tests {
         max_message_characters: usize,
         scope_concurrency: usize,
     ) -> Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<()>>> {
-        let pair =
-            TranslationProfileLanguagePair::new("ja", "zh-Hans").expect("测试语言对应该有效");
+        profile_for_language_pair(max_message_characters, scope_concurrency, "ja", "zh-Hans")
+    }
+
+    fn profile_for_language_pair(
+        max_message_characters: usize,
+        scope_concurrency: usize,
+        source_language: &str,
+        target_language: &str,
+    ) -> Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<()>>> {
+        let pair = TranslationProfileLanguagePair::new(source_language, target_language)
+            .expect("测试语言对应该有效");
         let planning = MzTranslationPlanningConfiguration::new(
             NonZeroUsize::new(scope_concurrency).expect("测试范围并发数必须非零"),
             NonZeroUsize::new(max_message_characters).expect("测试容量必须非零"),

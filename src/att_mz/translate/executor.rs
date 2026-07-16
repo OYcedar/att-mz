@@ -2,11 +2,11 @@
 
 //! 标准翻译任务的模型调用、有限响应清洗与译后验收。
 //!
-//! 本模块实现业务层的重试和整任务原子验收，并把网络请求、可取消等待与
-//! CPU 调度停在根接口。所有重试都复用 Planner 已经建立的完整消息，绝不
-//! 追加隐式修复提示词。
+//! 本模块只对可恢复网络失败按外部预算重试，并把网络请求、可取消等待与
+//! CPU 调度停在根接口。模型内容按 ID 独立验收，完整、部分或完全不可用均
+//! 是正常业务结果；网络重试始终复用 Planner 建立的完整消息。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -14,16 +14,24 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde_json::{Map, Value};
 
+use crate::language::{
+    LanguageModule, LanguageModuleCatalog, LanguageModuleCatalogError, LanguageModuleError,
+    LanguageRepairApplicationError, LanguageText, LanguageTextSegment,
+};
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
-use super::language::TranslationLanguageCatalog;
+use super::language_projection::{
+    LanguageTextProjectionError, project_protected_text, restore_protected_text,
+};
 use super::profile::{MzTranslationExecutionPayload, TranslationExecutionProfile};
 use super::standard::{
-    AppliedPlaceholder, ChatMessage, ExpectedTranslationOutput, StandardTranslationProfile,
-    StandardTranslationTaskExecutor, StandardTranslationTaskIndex, TranslationLanguagePair,
-    TranslationPatch, TranslationTaskBlock, ValidatedTranslationTaskResult,
+    AcceptedTranslationDecision, AppliedPlaceholder, ChatMessage, ExpectedTranslationOutput,
+    StandardTranslationProfile, StandardTranslationTaskExecutor, StandardTranslationTaskIndex,
+    TranslationLanguagePair, TranslationPatch, TranslationProtocolDiagnostic, TranslationTaskBlock,
+    TranslationTaskOutcome, TranslationTaskOutcomeInvariantError, TranslationTaskUnavailableReason,
+    TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
 
 /// 单次非流式 LLM 请求的结束原因。
@@ -190,8 +198,8 @@ pub(crate) trait TranslationTaskExecutionProfile: StandardTranslationProfile {
     type LlmProfile: Send + Sync + 'static;
 
     fn llm_profile(&self) -> &Self::LlmProfile;
-    fn retry_delays(&self) -> &[Duration];
-    fn max_retry_after(&self) -> Duration;
+    fn network_retry_delays(&self) -> &[Duration];
+    fn max_network_retry_after(&self) -> Duration;
 }
 
 impl<L> TranslationTaskExecutionProfile
@@ -205,12 +213,12 @@ where
         self.payload().llm()
     }
 
-    fn retry_delays(&self) -> &[Duration] {
-        self.payload().execution().retry_delays()
+    fn network_retry_delays(&self) -> &[Duration] {
+        self.payload().execution().network_retry_delays()
     }
 
-    fn max_retry_after(&self) -> Duration {
-        self.payload().execution().max_retry_after()
+    fn max_network_retry_after(&self) -> Duration {
+        self.payload().execution().max_network_retry_after()
     }
 }
 
@@ -225,115 +233,22 @@ where
         self.as_ref().payload().llm()
     }
 
-    fn retry_delays(&self) -> &[Duration] {
-        self.as_ref().payload().execution().retry_delays()
+    fn network_retry_delays(&self) -> &[Duration] {
+        self.as_ref().payload().execution().network_retry_delays()
     }
 
-    fn max_retry_after(&self) -> Duration {
-        self.as_ref().payload().execution().max_retry_after()
-    }
-}
-
-/// 语言模块对译后文本的确定性处理结果。
-#[derive(Debug)]
-pub(crate) enum TranslationResponseLanguageValidationError<E> {
-    /// 配置没有对应语言模块，或模块自身不可用；重试模型响应不能修复。
-    Unavailable(E),
-    /// 文本不满足目标语言或仍残留源语言；新的模型响应可能修复。
-    Rejected { message: String },
-}
-
-impl<E> fmt::Display for TranslationResponseLanguageValidationError<E>
-where
-    E: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unavailable(source) => write!(formatter, "译后语言模块不可用：{source}"),
-            Self::Rejected { message } => write!(formatter, "译文未通过语言验收：{message}"),
-        }
+    fn max_network_retry_after(&self) -> Duration {
+        self.as_ref()
+            .payload()
+            .execution()
+            .max_network_retry_after()
     }
 }
 
-impl<E> Error for TranslationResponseLanguageValidationError<E>
-where
-    E: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Unavailable(source) => Some(source),
-            Self::Rejected { .. } => None,
-        }
-    }
-}
-
-/// ResponseProcessor 从语言目录消费的窄能力。
+/// 将一次原始模型响应验收为正常业务结果。
 ///
-/// 目标语言处理只接收不含占位符 token 的普通文本片段；源语言残留检查接收
-/// 所有片段拼接后的文本。实现不得把 token 当作自然语言内容。
-pub(crate) trait TranslationResponseLanguageValidator:
-    Clone + Send + Sync + 'static
-{
-    type Error: Error + Send + Sync + 'static;
-
-    fn normalize_target(
-        &self,
-        target_language: &str,
-        text_without_tokens: &str,
-    ) -> Result<String, TranslationResponseLanguageValidationError<Self::Error>>;
-
-    fn validate_source_residual(
-        &self,
-        source_language: &str,
-        text_without_tokens: &str,
-    ) -> Result<(), TranslationResponseLanguageValidationError<Self::Error>>;
-}
-
-impl TranslationResponseLanguageValidator for TranslationLanguageCatalog {
-    type Error = super::language::TranslationLanguageCatalogError;
-
-    fn normalize_target(
-        &self,
-        target_language: &str,
-        text_without_tokens: &str,
-    ) -> Result<String, TranslationResponseLanguageValidationError<Self::Error>> {
-        let target = self
-            .target(target_language)
-            .map_err(TranslationResponseLanguageValidationError::Unavailable)?;
-        target
-            .normalize_and_validate(text_without_tokens)
-            .map_err(
-                |source| TranslationResponseLanguageValidationError::Rejected {
-                    message: source.to_string(),
-                },
-            )
-    }
-
-    fn validate_source_residual(
-        &self,
-        source_language: &str,
-        text_without_tokens: &str,
-    ) -> Result<(), TranslationResponseLanguageValidationError<Self::Error>> {
-        let source = self
-            .source(source_language)
-            .map_err(TranslationResponseLanguageValidationError::Unavailable)?;
-        if let Some(residual) = source.find_residual(text_without_tokens) {
-            return Err(TranslationResponseLanguageValidationError::Rejected {
-                message: format!("仍包含源语言片段 {:?}", residual.fragment()),
-            });
-        }
-        Ok(())
-    }
-}
-
-/// ResponseProcessor 错误是否允许重新请求完全相同的 messages。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResponseFailureDisposition {
-    RetryableContent,
-    Fatal,
-}
-
-/// 将一次原始模型响应验收为可原子提交结果。
+/// 模型内容完整、部分可用或完全不可用都返回 `TranslationTaskOutcome`；只有
+/// CPU、语言模块或内部不变量已经无法继续履行契约时才返回错误。
 pub(crate) trait TranslationTaskResponseProcessor: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
@@ -341,148 +256,91 @@ pub(crate) trait TranslationTaskResponseProcessor: Send + Sync {
         &self,
         task: &TranslationTaskBlock,
         response: LlmResponse,
-    ) -> impl Future<Output = Result<ValidatedTranslationTaskResult, Self::Error>> + Send;
-
-    fn failure_disposition(error: &Self::Error) -> ResponseFailureDisposition;
+        attempt: usize,
+    ) -> impl Future<Output = Result<TranslationTaskOutcome, Self::Error>> + Send;
 }
 
 /// 使用 CPU 根完成有限 JSON 清洗、严格协议校验与译后处理。
-pub(crate) struct TranslationTaskResponseProcessingService<C, V> {
+pub(crate) struct TranslationTaskResponseProcessingService<C> {
     cpu: C,
-    language_validator: V,
+    language_modules: LanguageModuleCatalog,
 }
 
-impl<C, V> TranslationTaskResponseProcessingService<C, V> {
-    pub(crate) fn new(cpu: C, language_validator: V) -> Self {
+impl<C> TranslationTaskResponseProcessingService<C> {
+    pub(crate) fn new(cpu: C, language_modules: LanguageModuleCatalog) -> Self {
         Self {
             cpu,
-            language_validator,
+            language_modules,
         }
     }
 }
 
-impl<C, V> TranslationTaskResponseProcessor for TranslationTaskResponseProcessingService<C, V>
+impl<C> TranslationTaskResponseProcessor for TranslationTaskResponseProcessingService<C>
 where
     C: CpuTaskExecutor,
-    V: TranslationResponseLanguageValidator,
 {
-    type Error = TranslationTaskResponseProcessingError<C::Error, V::Error>;
+    type Error = TranslationTaskResponseProcessingError<C::Error>;
 
     async fn process(
         &self,
         task: &TranslationTaskBlock,
         response: LlmResponse,
-    ) -> Result<ValidatedTranslationTaskResult, Self::Error> {
+        attempt: usize,
+    ) -> Result<TranslationTaskOutcome, Self::Error> {
         let input = ResponseProcessingInput {
             task_index: task.index(),
             language_pair: task.language_pair().clone(),
             expected_outputs: task.expected_outputs().to_vec(),
+            attempt,
         };
-        let language_validator = self.language_validator.clone();
-        self.cpu
-            .execute(move || process_response(input, response, &language_validator))
+        let language_modules = self.language_modules.clone();
+        let outcome = self
+            .cpu
+            .execute(move || process_response(input, response, &language_modules))
             .await
-            .map_err(TranslationTaskResponseProcessingError::ScheduleCompute)?
-            .map_err(TranslationTaskResponseProcessingError::Validation)
-    }
-
-    fn failure_disposition(error: &Self::Error) -> ResponseFailureDisposition {
-        match error {
-            TranslationTaskResponseProcessingError::ScheduleCompute(_) => {
-                ResponseFailureDisposition::Fatal
+            .map_err(TranslationTaskResponseProcessingError::ScheduleCompute)?;
+        outcome.map_err(|error| match error {
+            TranslationResponseTechnicalError::LanguageUnavailable(source) => {
+                TranslationTaskResponseProcessingError::LanguageUnavailable(source)
             }
-            TranslationTaskResponseProcessingError::Validation(error) => error.disposition(),
-        }
+            TranslationResponseTechnicalError::LanguageModule(source) => {
+                TranslationTaskResponseProcessingError::LanguageModule(source)
+            }
+            TranslationResponseTechnicalError::LanguageProjection(source) => {
+                TranslationTaskResponseProcessingError::LanguageProjection(source)
+            }
+            TranslationResponseTechnicalError::LanguageRepair(source) => {
+                TranslationTaskResponseProcessingError::LanguageRepair(source)
+            }
+            TranslationResponseTechnicalError::InternalInvariant { message } => {
+                TranslationTaskResponseProcessingError::InternalInvariant { message }
+            }
+        })
     }
 }
 
-/// 一个响应的 CPU 调度或内容验收失败。
+/// 一个响应无法继续处理的技术错误。
 #[derive(Debug)]
-pub(crate) enum TranslationTaskResponseProcessingError<C, L> {
+pub(crate) enum TranslationTaskResponseProcessingError<C> {
     ScheduleCompute(CpuTaskExecutionError<C>),
-    Validation(TranslationResponseValidationError<L>),
+    LanguageUnavailable(LanguageModuleCatalogError),
+    LanguageModule(LanguageModuleError),
+    LanguageProjection(LanguageTextProjectionError),
+    LanguageRepair(LanguageRepairApplicationError),
+    InternalInvariant { message: String },
 }
 
-impl<C, L> fmt::Display for TranslationTaskResponseProcessingError<C, L>
+impl<C> fmt::Display for TranslationTaskResponseProcessingError<C>
 where
     C: fmt::Display,
-    L: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ScheduleCompute(source) => write!(formatter, "调度译后 CPU 验收失败：{source}"),
-            Self::Validation(source) => source.fmt(formatter),
-        }
-    }
-}
-
-impl<C, L> Error for TranslationTaskResponseProcessingError<C, L>
-where
-    C: Error + 'static,
-    L: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::ScheduleCompute(source) => Some(source),
-            Self::Validation(source) => source.source(),
-        }
-    }
-}
-
-/// 模型内容未形成一个可整体提交的结果。
-#[derive(Debug)]
-pub(crate) enum TranslationResponseValidationError<L> {
-    IncompleteResponse { finish_reason: LlmFinishReason },
-    InvalidJson { message: String },
-    InvalidId { value: String },
-    DuplicateId { id: usize },
-    MissingId { id: usize },
-    UnknownId { id: usize },
-    BlankTranslation { id: usize },
-    PlaceholderMismatch { id: usize, token: String },
-    PlaceholderNormalizationAmbiguous { id: usize, original: String },
-    LanguageRejected { message: String },
-    LanguageUnavailable(L),
-    InternalInvariant { message: String },
-}
-
-impl<L> TranslationResponseValidationError<L> {
-    const fn disposition(&self) -> ResponseFailureDisposition {
-        match self {
-            Self::LanguageUnavailable(_) | Self::InternalInvariant { .. } => {
-                ResponseFailureDisposition::Fatal
-            }
-            _ => ResponseFailureDisposition::RetryableContent,
-        }
-    }
-}
-
-impl<L> fmt::Display for TranslationResponseValidationError<L>
-where
-    L: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::IncompleteResponse { finish_reason } => {
-                write!(formatter, "模型响应未完整结束：{finish_reason}")
-            }
-            Self::InvalidJson { message } => write!(formatter, "模型响应 JSON 无效：{message}"),
-            Self::InvalidId { value } => write!(formatter, "模型响应包含无效 ID：{value}"),
-            Self::DuplicateId { id } => write!(formatter, "模型响应重复返回 ID {id}"),
-            Self::MissingId { id } => write!(formatter, "模型响应缺少 ID {id}"),
-            Self::UnknownId { id } => write!(formatter, "模型响应包含未知 ID {id}"),
-            Self::BlankTranslation { id } => write!(formatter, "ID {id} 的译文为空"),
-            Self::PlaceholderMismatch { id, token } => {
-                write!(formatter, "ID {id} 的占位符数量不匹配：{token}")
-            }
-            Self::PlaceholderNormalizationAmbiguous { id, original } => write!(
-                formatter,
-                "ID {id} 返回的原控制符无法唯一映射回占位符：{original:?}"
-            ),
-            Self::LanguageRejected { message } => {
-                write!(formatter, "模型响应未通过语言验收：{message}")
-            }
             Self::LanguageUnavailable(source) => write!(formatter, "译后语言模块不可用：{source}"),
+            Self::LanguageModule(source) => write!(formatter, "译后语言事实不一致：{source}"),
+            Self::LanguageProjection(source) => write!(formatter, "译后语言投影失败：{source}"),
+            Self::LanguageRepair(source) => write!(formatter, "译后语言修复无法安全应用：{source}"),
             Self::InternalInvariant { message } => {
                 write!(formatter, "翻译任务内部不变量已破坏：{message}")
             }
@@ -490,16 +348,29 @@ where
     }
 }
 
-impl<L> Error for TranslationResponseValidationError<L>
+impl<C> Error for TranslationTaskResponseProcessingError<C>
 where
-    L: Error + 'static,
+    C: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::ScheduleCompute(source) => Some(source),
             Self::LanguageUnavailable(source) => Some(source),
-            _ => None,
+            Self::LanguageModule(source) => Some(source),
+            Self::LanguageProjection(source) => Some(source),
+            Self::LanguageRepair(source) => Some(source),
+            Self::InternalInvariant { .. } => None,
         }
     }
+}
+
+#[derive(Debug)]
+enum TranslationResponseTechnicalError {
+    LanguageUnavailable(LanguageModuleCatalogError),
+    LanguageModule(LanguageModuleError),
+    LanguageProjection(LanguageTextProjectionError),
+    LanguageRepair(LanguageRepairApplicationError),
+    InternalInvariant { message: String },
 }
 
 /// 使用根 LLM、根 Delay 和真实 ResponseProcessor 执行一个 TaskBlock。
@@ -536,9 +407,14 @@ where
         &self,
         profile: &Self::Profile,
         task: TranslationTaskBlock,
-    ) -> Result<ValidatedTranslationTaskResult, Self::Error> {
+    ) -> Result<TranslationTaskOutcome, Self::Error> {
+        if task.expected_outputs().is_empty() {
+            return Err(MzStandardTranslationTaskExecutionError::InternalInvariant {
+                message: "Planner 生成了没有预期输出的翻译任务".to_owned(),
+            });
+        }
         let mut attempt = 1_usize;
-        let mut retry_delays = profile.retry_delays().iter().copied();
+        let mut retry_delays = profile.network_retry_delays().iter().copied();
 
         loop {
             let response = match self
@@ -557,27 +433,33 @@ where
                     source,
                     retry_after,
                 }) => {
-                    let Some(configured_delay) = retry_delays.next() else {
-                        return Err(
-                            MzStandardTranslationTaskExecutionError::RequestRetriesExhausted {
-                                attempts: attempt,
-                                source,
-                            },
-                        );
-                    };
-                    let delay = choose_retry_delay(
-                        configured_delay,
-                        retry_after,
-                        profile.max_retry_after(),
-                    )
-                    .map_err(|retry_after| {
-                        MzStandardTranslationTaskExecutionError::RetryAfterExceedsLimit {
+                    if let Some(retry_after) = retry_after
+                        && retry_after > profile.max_network_retry_after()
+                    {
+                        return unavailable_after_request_failure(
+                            &task,
                             attempt,
-                            retry_after,
-                            maximum: profile.max_retry_after(),
-                            source,
-                        }
-                    })?;
+                            TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
+                                attempt,
+                                retry_after,
+                                maximum: profile.max_network_retry_after(),
+                                message: source.to_string(),
+                            },
+                        )
+                        .map_err(outcome_invariant_execution_error);
+                    }
+                    let Some(configured_delay) = retry_delays.next() else {
+                        return unavailable_after_request_failure(
+                            &task,
+                            attempt,
+                            TranslationTaskUnavailableReason::RecoverableRequestExhausted {
+                                attempts: attempt,
+                                message: source.to_string(),
+                            },
+                        )
+                        .map_err(outcome_invariant_execution_error);
+                    };
+                    let delay = configured_delay.max(retry_after.unwrap_or_default());
                     self.delay.wait(delay).await.map_err(|delay_source| {
                         MzStandardTranslationTaskExecutionError::WaitBeforeRetry {
                             attempt,
@@ -590,52 +472,44 @@ where
                 }
             };
 
-            match self.response_processor.process(&task, response).await {
-                Ok(result) => return Ok(result),
-                Err(source)
-                    if R::failure_disposition(&source)
-                        == ResponseFailureDisposition::RetryableContent =>
-                {
-                    let Some(delay) = retry_delays.next() else {
-                        return Err(
-                            MzStandardTranslationTaskExecutionError::ResponseRetriesExhausted {
-                                attempts: attempt,
-                                source,
-                            },
-                        );
-                    };
-                    self.delay.wait(delay).await.map_err(|delay_source| {
-                        MzStandardTranslationTaskExecutionError::WaitBeforeRetry {
-                            attempt,
-                            delay,
-                            source: delay_source,
-                        }
-                    })?;
-                    attempt += 1;
-                }
-                Err(source) => {
-                    return Err(MzStandardTranslationTaskExecutionError::ProcessResponse {
+            return self
+                .response_processor
+                .process(&task, response, attempt)
+                .await
+                .map_err(
+                    |source| MzStandardTranslationTaskExecutionError::ProcessResponse {
                         attempt,
                         source,
-                    });
-                }
-            }
+                    },
+                );
         }
     }
 }
 
-fn choose_retry_delay(
-    configured_delay: Duration,
-    retry_after: Option<Duration>,
-    maximum_retry_after: Duration,
-) -> Result<Duration, Duration> {
-    if let Some(retry_after) = retry_after {
-        if retry_after > maximum_retry_after {
-            return Err(retry_after);
-        }
-        Ok(configured_delay.max(retry_after))
-    } else {
-        Ok(configured_delay)
+fn unavailable_after_request_failure(
+    task: &TranslationTaskBlock,
+    attempts: usize,
+    reason: TranslationTaskUnavailableReason,
+) -> Result<TranslationTaskOutcome, TranslationTaskOutcomeInvariantError> {
+    TranslationTaskOutcome::unavailable(
+        task.index(),
+        attempts,
+        None,
+        None,
+        reason,
+        unresolved_all(
+            task.expected_outputs(),
+            TranslationUnitRejectionReason::Missing,
+        ),
+        Vec::new(),
+    )
+}
+
+fn outcome_invariant_execution_error<L, D, R>(
+    source: TranslationTaskOutcomeInvariantError,
+) -> MzStandardTranslationTaskExecutionError<L, D, R> {
+    MzStandardTranslationTaskExecutionError::InternalInvariant {
+        message: source.to_string(),
     }
 }
 
@@ -646,20 +520,6 @@ pub(crate) enum MzStandardTranslationTaskExecutionError<L, D, R> {
         attempt: usize,
         source: L,
     },
-    RequestRetriesExhausted {
-        attempts: usize,
-        source: L,
-    },
-    RetryAfterExceedsLimit {
-        attempt: usize,
-        retry_after: Duration,
-        maximum: Duration,
-        source: L,
-    },
-    ResponseRetriesExhausted {
-        attempts: usize,
-        source: R,
-    },
     ProcessResponse {
         attempt: usize,
         source: R,
@@ -668,6 +528,9 @@ pub(crate) enum MzStandardTranslationTaskExecutionError<L, D, R> {
         attempt: usize,
         delay: Duration,
         source: D,
+    },
+    InternalInvariant {
+        message: String,
     },
 }
 
@@ -682,22 +545,6 @@ where
             Self::FatalRequest { attempt, source } => {
                 write!(formatter, "第 {attempt} 次 LLM 请求不可重试：{source}")
             }
-            Self::RequestRetriesExhausted { attempts, source } => {
-                write!(formatter, "LLM 请求在 {attempts} 次尝试后仍失败：{source}")
-            }
-            Self::RetryAfterExceedsLimit {
-                attempt,
-                retry_after,
-                maximum,
-                source,
-            } => write!(
-                formatter,
-                "第 {attempt} 次 LLM 请求要求等待 {retry_after:?}，超过外部上限 {maximum:?}：{source}"
-            ),
-            Self::ResponseRetriesExhausted { attempts, source } => write!(
-                formatter,
-                "模型内容在 {attempts} 次尝试后仍未通过验收：{source}"
-            ),
             Self::ProcessResponse { attempt, source } => {
                 write!(formatter, "第 {attempt} 次模型响应无法处理：{source}")
             }
@@ -709,6 +556,9 @@ where
                 formatter,
                 "第 {attempt} 次失败后无法等待 {delay:?} 再重试：{source}"
             ),
+            Self::InternalInvariant { message } => {
+                write!(formatter, "翻译任务内部不变量已破坏：{message}")
+            }
         }
     }
 }
@@ -721,12 +571,10 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::FatalRequest { source, .. }
-            | Self::RequestRetriesExhausted { source, .. }
-            | Self::RetryAfterExceedsLimit { source, .. } => Some(source),
-            Self::ResponseRetriesExhausted { source, .. }
-            | Self::ProcessResponse { source, .. } => Some(source),
+            Self::FatalRequest { source, .. } => Some(source),
+            Self::ProcessResponse { source, .. } => Some(source),
             Self::WaitBeforeRetry { source, .. } => Some(source),
+            Self::InternalInvariant { .. } => None,
         }
     }
 }
@@ -735,123 +583,283 @@ struct ResponseProcessingInput {
     task_index: StandardTranslationTaskIndex,
     language_pair: TranslationLanguagePair,
     expected_outputs: Vec<ExpectedTranslationOutput>,
+    attempt: usize,
 }
 
-fn process_response<V>(
+fn process_response(
     input: ResponseProcessingInput,
     response: LlmResponse,
-    language_validator: &V,
-) -> Result<ValidatedTranslationTaskResult, TranslationResponseValidationError<V::Error>>
-where
-    V: TranslationResponseLanguageValidator,
-{
+    language_modules: &LanguageModuleCatalog,
+) -> Result<TranslationTaskOutcome, TranslationResponseTechnicalError> {
+    if input.expected_outputs.is_empty() {
+        return Err(TranslationResponseTechnicalError::InternalInvariant {
+            message: "Planner 生成了没有预期输出的翻译任务".to_owned(),
+        });
+    }
+    let language_module = language_modules
+        .resolve(input.language_pair.source_language())
+        .map_err(TranslationResponseTechnicalError::LanguageUnavailable)?;
+
+    let request_id = response.request_id.clone();
+    let finish_reason = response.finish_reason.to_string();
+    let mut diagnostics = Vec::new();
     if response.finish_reason != LlmFinishReason::Stop {
-        return Err(TranslationResponseValidationError::IncompleteResponse {
-            finish_reason: response.finish_reason,
+        diagnostics.push(TranslationProtocolDiagnostic::NonStopFinish {
+            reason: finish_reason.clone(),
         });
     }
 
-    let cleaned = clean_model_json(&response.content)
-        .map_err(|message| TranslationResponseValidationError::InvalidJson { message })?;
-    let outputs = parse_model_outputs(&cleaned)?;
+    let values = match clean_model_json(&response.content)
+        .and_then(|cleaned| parse_model_output_values(&cleaned))
+    {
+        Ok(values) => values,
+        Err(message) => {
+            diagnostics.push(TranslationProtocolDiagnostic::InvalidJson {
+                message: message.clone(),
+            });
+            return TranslationTaskOutcome::unavailable(
+                input.task_index,
+                input.attempt,
+                request_id,
+                Some(finish_reason),
+                TranslationTaskUnavailableReason::ModelResponseUnusable,
+                unresolved_all(
+                    &input.expected_outputs,
+                    TranslationUnitRejectionReason::InvalidShape { message },
+                ),
+                diagnostics,
+            )
+            .map_err(outcome_invariant_response_error);
+        }
+    };
+
     let expected_by_id = input
         .expected_outputs
         .iter()
         .map(|output| (output.id(), output))
         .collect::<BTreeMap<_, _>>();
+    let actual_by_id = collect_model_outputs(values, &expected_by_id, &mut diagnostics);
 
-    let mut actual_by_id = BTreeMap::new();
-    for output in outputs {
-        let id = output.id.into_usize()?;
-        if output.translation.trim().is_empty() {
-            return Err(TranslationResponseValidationError::BlankTranslation { id });
-        }
-        if actual_by_id.insert(id, output.translation).is_some() {
-            return Err(TranslationResponseValidationError::DuplicateId { id });
-        }
-    }
-
-    for id in actual_by_id.keys() {
-        if !expected_by_id.contains_key(id) {
-            return Err(TranslationResponseValidationError::UnknownId { id: *id });
-        }
-    }
-    for id in expected_by_id.keys() {
-        if !actual_by_id.contains_key(id) {
-            return Err(TranslationResponseValidationError::MissingId { id: *id });
-        }
-    }
-
-    let mut updates = Vec::with_capacity(expected_by_id.len());
+    let mut accepted = Vec::with_capacity(expected_by_id.len());
+    let mut unresolved = Vec::new();
     for expected in &input.expected_outputs {
-        let translation = actual_by_id.remove(&expected.id()).ok_or_else(|| {
-            TranslationResponseValidationError::InternalInvariant {
-                message: format!("已验证存在的 ID {} 无法再次取得", expected.id()),
+        let Some(candidates) = actual_by_id.get(&expected.id()) else {
+            unresolved.push(unresolved_unit(
+                expected,
+                TranslationUnitRejectionReason::Missing,
+            ));
+            continue;
+        };
+        if candidates.len() != 1 {
+            unresolved.push(unresolved_unit(
+                expected,
+                TranslationUnitRejectionReason::Duplicate,
+            ));
+            continue;
+        }
+        let translation = match &candidates[0] {
+            ParsedModelOutput::Translation(translation) => translation.clone(),
+            ParsedModelOutput::InvalidShape(message) => {
+                unresolved.push(unresolved_unit(
+                    expected,
+                    TranslationUnitRejectionReason::InvalidShape {
+                        message: message.clone(),
+                    },
+                ));
+                continue;
             }
-        })?;
-        let translation = validate_and_restore_translation(
-            expected.id(),
+        };
+        if translation.trim().is_empty() {
+            unresolved.push(unresolved_unit(
+                expected,
+                TranslationUnitRejectionReason::BlankTranslation,
+            ));
+            continue;
+        }
+        let translation = match validate_and_restore_translation(
             translation,
             expected.applied_placeholders(),
-            &input.language_pair,
-            language_validator,
-        )?;
-        updates.push(TranslationPatch::new(
-            expected.identity().clone(),
-            expected.propagation_targets().to_vec(),
-            translation,
-            expected.terminology_dependencies().to_vec(),
+            expected.language_analysis(),
+            language_module.as_ref(),
+        ) {
+            Ok(translation) => translation,
+            Err(TranslationCandidateValidationError::Rejected(reason)) => {
+                unresolved.push(unresolved_unit(expected, reason));
+                continue;
+            }
+            Err(TranslationCandidateValidationError::LanguageModule(source)) => {
+                return Err(TranslationResponseTechnicalError::LanguageModule(source));
+            }
+            Err(TranslationCandidateValidationError::LanguageProjection(source)) => {
+                return Err(TranslationResponseTechnicalError::LanguageProjection(
+                    source,
+                ));
+            }
+            Err(TranslationCandidateValidationError::LanguageRepair(source)) => {
+                return Err(TranslationResponseTechnicalError::LanguageRepair(source));
+            }
+            Err(TranslationCandidateValidationError::InternalInvariant { message }) => {
+                return Err(TranslationResponseTechnicalError::InternalInvariant { message });
+            }
+        };
+        accepted.push(AcceptedTranslationDecision::new(
+            expected.id(),
+            TranslationPatch::new(
+                expected.identity().clone(),
+                expected.propagation_targets().to_vec(),
+                translation,
+                expected.terminology_dependencies().to_vec(),
+            ),
         ));
     }
 
-    Ok(ValidatedTranslationTaskResult::new(
-        input.task_index,
-        updates,
-    ))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawModelOutput {
-    id: RawTranslationId,
-    translation: String,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawTranslationId {
-    Integer(u64),
-    DecimalString(String),
-}
-
-impl RawTranslationId {
-    fn into_usize<L>(self) -> Result<usize, TranslationResponseValidationError<L>> {
-        match self {
-            Self::Integer(value) => {
-                usize::try_from(value).map_err(|_| TranslationResponseValidationError::InvalidId {
-                    value: value.to_string(),
-                })
-            }
-            Self::DecimalString(value) => {
-                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(TranslationResponseValidationError::InvalidId { value });
-                }
-                value
-                    .parse::<usize>()
-                    .map_err(|_| TranslationResponseValidationError::InvalidId {
-                        value: value.clone(),
-                    })
-            }
-        }
+    if unresolved.is_empty() {
+        TranslationTaskOutcome::complete(
+            input.task_index,
+            input.attempt,
+            request_id,
+            Some(finish_reason),
+            accepted,
+            diagnostics,
+        )
+        .map_err(outcome_invariant_response_error)
+    } else if accepted.is_empty() {
+        TranslationTaskOutcome::unavailable(
+            input.task_index,
+            input.attempt,
+            request_id,
+            Some(finish_reason),
+            TranslationTaskUnavailableReason::AllOutputsRejected,
+            unresolved,
+            diagnostics,
+        )
+        .map_err(outcome_invariant_response_error)
+    } else {
+        TranslationTaskOutcome::partial(
+            input.task_index,
+            input.attempt,
+            request_id,
+            Some(finish_reason),
+            accepted,
+            unresolved,
+            diagnostics,
+        )
+        .map_err(outcome_invariant_response_error)
     }
 }
 
-fn parse_model_outputs<L>(
-    value: &str,
-) -> Result<Vec<RawModelOutput>, TranslationResponseValidationError<L>> {
-    serde_json::from_str(value).map_err(|source| TranslationResponseValidationError::InvalidJson {
+fn outcome_invariant_response_error(
+    source: TranslationTaskOutcomeInvariantError,
+) -> TranslationResponseTechnicalError {
+    TranslationResponseTechnicalError::InternalInvariant {
         message: source.to_string(),
-    })
+    }
+}
+
+#[derive(Debug)]
+enum ParsedModelOutput {
+    Translation(String),
+    InvalidShape(String),
+}
+
+fn collect_model_outputs(
+    values: Vec<Value>,
+    expected_by_id: &BTreeMap<usize, &ExpectedTranslationOutput>,
+    diagnostics: &mut Vec<TranslationProtocolDiagnostic>,
+) -> BTreeMap<usize, Vec<ParsedModelOutput>> {
+    let mut outputs = BTreeMap::<usize, Vec<ParsedModelOutput>>::new();
+    for (item_index, value) in values.into_iter().enumerate() {
+        let Value::Object(object) = value else {
+            diagnostics.push(TranslationProtocolDiagnostic::UnattributedItem {
+                item_index,
+                message: "响应元素不是对象".to_owned(),
+            });
+            continue;
+        };
+        let Some(raw_id) = object.get("id") else {
+            diagnostics.push(TranslationProtocolDiagnostic::MissingId { item_index });
+            continue;
+        };
+        let id = match parse_translation_id(raw_id) {
+            Ok(id) => id,
+            Err(value) => {
+                diagnostics.push(TranslationProtocolDiagnostic::InvalidId { item_index, value });
+                continue;
+            }
+        };
+        if !expected_by_id.contains_key(&id) {
+            diagnostics.push(TranslationProtocolDiagnostic::UnknownId { item_index, id });
+            continue;
+        }
+        outputs
+            .entry(id)
+            .or_default()
+            .push(parse_known_output(object));
+    }
+    outputs
+}
+
+fn parse_translation_id(value: &Value) -> Result<usize, String> {
+    match value {
+        Value::Number(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| value.to_string()),
+        Value::String(value)
+            if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            value.parse::<usize>().map_err(|_| value.clone())
+        }
+        _ => Err(value.to_string()),
+    }
+}
+
+fn parse_known_output(mut object: Map<String, Value>) -> ParsedModelOutput {
+    if object.len() != 2 || !object.contains_key("translation") {
+        let mut unexpected = object
+            .keys()
+            .filter(|key| key.as_str() != "id" && key.as_str() != "translation")
+            .cloned()
+            .collect::<Vec<_>>();
+        unexpected.sort();
+        let message = if !object.contains_key("translation") {
+            "缺少 translation 字段".to_owned()
+        } else {
+            format!("包含未知字段：{}", unexpected.join(", "))
+        };
+        return ParsedModelOutput::InvalidShape(message);
+    }
+    match object.remove("translation") {
+        Some(Value::String(translation)) => ParsedModelOutput::Translation(translation),
+        Some(_) => ParsedModelOutput::InvalidShape("translation 必须是字符串".to_owned()),
+        None => ParsedModelOutput::InvalidShape("缺少 translation 字段".to_owned()),
+    }
+}
+
+fn parse_model_output_values(value: &str) -> Result<Vec<Value>, String> {
+    serde_json::from_str(value).map_err(|source| source.to_string())
+}
+
+fn unresolved_unit(
+    expected: &ExpectedTranslationOutput,
+    reason: TranslationUnitRejectionReason,
+) -> UnresolvedTranslationUnit {
+    UnresolvedTranslationUnit::new(
+        expected.id(),
+        expected.identity().clone(),
+        expected.propagation_targets().to_vec(),
+        reason,
+    )
+}
+
+fn unresolved_all(
+    expected_outputs: &[ExpectedTranslationOutput],
+    reason: TranslationUnitRejectionReason,
+) -> Vec<UnresolvedTranslationUnit> {
+    expected_outputs
+        .iter()
+        .map(|expected| unresolved_unit(expected, reason.clone()))
+        .collect()
 }
 
 /// 只执行已确认安全的修复：BOM、单层 Markdown 围栏、唯一完整顶层数组和尾逗号。
@@ -1008,82 +1016,81 @@ fn remove_trailing_commas(value: &str) -> String {
     String::from_utf8(output).expect("删除 ASCII 逗号不会破坏原 UTF-8")
 }
 
-fn validate_and_restore_translation<V>(
-    id: usize,
+fn validate_and_restore_translation(
     mut translation: String,
     placeholders: &[AppliedPlaceholder],
-    language_pair: &TranslationLanguagePair,
-    language_validator: &V,
-) -> Result<String, TranslationResponseValidationError<V::Error>>
-where
-    V: TranslationResponseLanguageValidator,
-{
-    normalize_original_controls(id, &mut translation, placeholders)?;
-    validate_token_multiset(id, &translation, placeholders)?;
+    language_analysis: &crate::language::LanguageAnalysis,
+    language_module: &dyn LanguageModule,
+) -> Result<String, TranslationCandidateValidationError> {
+    normalize_original_controls(&mut translation, placeholders)
+        .map_err(TranslationCandidateValidationError::Rejected)?;
+    validate_token_multiset(&translation, placeholders)
+        .map_err(TranslationCandidateValidationError::Rejected)?;
 
-    let token_set = placeholders
-        .iter()
-        .map(|placeholder| placeholder.token().to_owned())
-        .collect::<BTreeSet<_>>();
-    let segments = split_around_tokens(&translation, &token_set);
-    let mut normalized = String::with_capacity(translation.len());
-    let mut language_text = String::new();
-    for segment in segments {
+    let projected = project_protected_text(&translation, placeholders)
+        .map_err(TranslationCandidateValidationError::LanguageProjection)?;
+    let normalized = normalize_language_text(&projected)
+        .map_err(TranslationCandidateValidationError::Rejected)?;
+    if let Some(residual) = language_module
+        .find_source_residual(language_analysis, &normalized)
+        .map_err(TranslationCandidateValidationError::LanguageModule)?
+    {
+        return Err(TranslationCandidateValidationError::Rejected(
+            TranslationUnitRejectionReason::SourceResidual {
+                fragment: residual.fragment().to_owned(),
+            },
+        ));
+    }
+    let repair = language_module
+        .plan_translation_repair(language_analysis, &normalized)
+        .map_err(TranslationCandidateValidationError::LanguageModule)?;
+    let repaired = normalized
+        .apply_repair(&repair)
+        .map_err(TranslationCandidateValidationError::LanguageRepair)?;
+    let restored = restore_protected_text(&translation, placeholders, &repaired)
+        .map_err(TranslationCandidateValidationError::LanguageProjection)?;
+    Ok(restored)
+}
+
+fn normalize_language_text(
+    language_text: &LanguageText,
+) -> Result<LanguageText, TranslationUnitRejectionReason> {
+    let mut segments = Vec::with_capacity(language_text.segments().len());
+    for segment in language_text.segments() {
         match segment {
-            ProtectedSegment::Text(text) => {
-                let text = if text.trim().is_empty() {
-                    text.to_owned()
-                } else {
-                    language_validator
-                        .normalize_target(language_pair.target_language(), text)
-                        .map_err(map_language_error)?
-                };
-                language_text.push_str(&text);
-                normalized.push_str(&text);
+            LanguageTextSegment::NaturalText(text) => {
+                if text.contains('\u{feff}') {
+                    return Err(TranslationUnitRejectionReason::ContainsByteOrderMark);
+                }
+                segments.push(LanguageTextSegment::NaturalText(
+                    text.replace("\r\n", "\n").replace('\r', "\n"),
+                ));
             }
-            ProtectedSegment::Token(token) => normalized.push_str(token),
+            LanguageTextSegment::OpaqueBoundary => {
+                segments.push(LanguageTextSegment::OpaqueBoundary);
+            }
         }
     }
-    if language_text.trim().is_empty() {
-        return Err(TranslationResponseValidationError::LanguageRejected {
-            message: "译文去除占位符后没有任何有效文本".to_owned(),
-        });
-    }
-    language_validator
-        .validate_source_residual(language_pair.source_language(), &language_text)
-        .map_err(map_language_error)?;
-
-    for placeholder in placeholders {
-        normalized = normalized.replace(placeholder.token(), placeholder.original());
-    }
-    for token in token_set {
-        if normalized.contains(&token) {
-            return Err(TranslationResponseValidationError::InternalInvariant {
-                message: format!("恢复后仍残留任务占位符 {token}"),
-            });
-        }
+    let normalized = LanguageText::new(segments);
+    if !normalized.has_non_whitespace_natural_text() {
+        return Err(TranslationUnitRejectionReason::NoNaturalLanguageText);
     }
     Ok(normalized)
 }
 
-fn map_language_error<E>(
-    error: TranslationResponseLanguageValidationError<E>,
-) -> TranslationResponseValidationError<E> {
-    match error {
-        TranslationResponseLanguageValidationError::Unavailable(source) => {
-            TranslationResponseValidationError::LanguageUnavailable(source)
-        }
-        TranslationResponseLanguageValidationError::Rejected { message } => {
-            TranslationResponseValidationError::LanguageRejected { message }
-        }
-    }
+#[derive(Debug)]
+enum TranslationCandidateValidationError {
+    Rejected(TranslationUnitRejectionReason),
+    LanguageModule(LanguageModuleError),
+    LanguageProjection(LanguageTextProjectionError),
+    LanguageRepair(LanguageRepairApplicationError),
+    InternalInvariant { message: String },
 }
 
-fn normalize_original_controls<L>(
-    id: usize,
+fn normalize_original_controls(
     translation: &mut String,
     placeholders: &[AppliedPlaceholder],
-) -> Result<(), TranslationResponseValidationError<L>> {
+) -> Result<(), TranslationUnitRejectionReason> {
     let mut originals = BTreeMap::<&str, Vec<&AppliedPlaceholder>>::new();
     for placeholder in placeholders {
         originals
@@ -1099,8 +1106,7 @@ fn normalize_original_controls<L>(
                     .any(|binding| !translation.contains(binding.token()))
             {
                 return Err(
-                    TranslationResponseValidationError::PlaceholderNormalizationAmbiguous {
-                        id,
+                    TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
                         original: original.to_owned(),
                     },
                 );
@@ -1114,8 +1120,7 @@ fn normalize_original_controls<L>(
             *translation = translation.replacen(original, binding.token(), 1);
         } else if original_count > 0 && token_count != 0 {
             return Err(
-                TranslationResponseValidationError::PlaceholderNormalizationAmbiguous {
-                    id,
+                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
                     original: original.to_owned(),
                 },
             );
@@ -1124,66 +1129,22 @@ fn normalize_original_controls<L>(
     Ok(())
 }
 
-fn validate_token_multiset<L>(
-    id: usize,
+fn validate_token_multiset(
     translation: &str,
     placeholders: &[AppliedPlaceholder],
-) -> Result<(), TranslationResponseValidationError<L>> {
+) -> Result<(), TranslationUnitRejectionReason> {
     let mut expected = BTreeMap::<&str, usize>::new();
     for placeholder in placeholders {
         *expected.entry(placeholder.token()).or_default() += 1;
     }
     for (token, count) in expected {
         if translation.matches(token).count() != count {
-            return Err(TranslationResponseValidationError::PlaceholderMismatch {
-                id,
+            return Err(TranslationUnitRejectionReason::PlaceholderMismatch {
                 token: token.to_owned(),
             });
         }
     }
     Ok(())
-}
-
-enum ProtectedSegment<'a> {
-    Text(&'a str),
-    Token(&'a str),
-}
-
-fn split_around_tokens<'a>(
-    value: &'a str,
-    tokens: &'a BTreeSet<String>,
-) -> Vec<ProtectedSegment<'a>> {
-    let mut segments = Vec::new();
-    let mut cursor = 0;
-    while cursor < value.len() {
-        let next = tokens
-            .iter()
-            .filter_map(|token| {
-                value[cursor..]
-                    .find(token)
-                    .map(|offset| (cursor + offset, token.as_str()))
-            })
-            .min_by(|(left_offset, left_token), (right_offset, right_token)| {
-                left_offset
-                    .cmp(right_offset)
-                    .then_with(|| right_token.len().cmp(&left_token.len()))
-            });
-        let Some((offset, token)) = next else {
-            segments.push(ProtectedSegment::Text(&value[cursor..]));
-            break;
-        };
-        if offset > cursor {
-            segments.push(ProtectedSegment::Text(&value[cursor..offset]));
-        }
-        segments.push(ProtectedSegment::Token(
-            &value[offset..offset + token.len()],
-        ));
-        cursor = offset + token.len();
-    }
-    if value.is_empty() {
-        segments.push(ProtectedSegment::Text(value));
-    }
-    segments
 }
 
 #[cfg(test)]
@@ -1203,7 +1164,12 @@ mod tests {
     use crate::att_mz::translate::standard::{
         AppliedPlaceholder, ChatMessageRole, ExpectedTranslationOutput, PlaceholderRuleOrigin,
         PlaceholderSegment, StandardTranslationTaskIndex, TerminologyDependency,
-        TranslationLanguagePair, TranslationLeafIdentity,
+        TranslationLanguagePair, TranslationLeafIdentity, TranslationTaskStatus,
+    };
+    use crate::language::{
+        EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
+        JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageModule,
+        LanguageModuleCatalog, LanguageText, QuotePair,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1247,43 +1213,44 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct FakeLanguage;
+    fn japanese_module() -> Arc<dyn LanguageModule> {
+        Arc::new(JapaneseLanguageModule::new(
+            JapaneseResidualPolicy::new(NonZeroUsize::new(2).expect("测试阈值非零"), Vec::new())
+                .expect("日文残留策略有效"),
+            Some(
+                JapaneseQuoteRepairPolicy::new(vec![
+                    QuotePair::new('“', '”'),
+                    QuotePair::new('‘', '’'),
+                ])
+                .expect("日文引号修复策略有效"),
+            ),
+        ))
+    }
 
-    impl TranslationResponseLanguageValidator for FakeLanguage {
-        type Error = FakeError;
+    fn english_module() -> Arc<dyn LanguageModule> {
+        Arc::new(EnglishLanguageModule::new(
+            EnglishTranslationDetectionPolicy::new(
+                NonZeroUsize::new(2).expect("测试阈值非零"),
+                NonZeroUsize::new(4).expect("测试阈值非零"),
+                Vec::new(),
+            )
+            .expect("英文译前策略有效"),
+            EnglishResidualPolicy::new(
+                NonZeroUsize::new(2).expect("测试阈值非零"),
+                NonZeroUsize::new(4).expect("测试阈值非零"),
+                Vec::new(),
+            )
+            .expect("英文残留策略有效"),
+        ))
+    }
 
-        fn normalize_target(
-            &self,
-            target_language: &str,
-            text: &str,
-        ) -> Result<String, TranslationResponseLanguageValidationError<Self::Error>> {
-            if target_language != "zh-Hans" {
-                return Err(TranslationResponseLanguageValidationError::Unavailable(
-                    FakeError("target"),
-                ));
-            }
-            Ok(text.replace('！', "!"))
-        }
+    fn language_catalog() -> LanguageModuleCatalog {
+        LanguageModuleCatalog::new([("ja".to_owned(), japanese_module())])
+            .expect("测试语言目录有效")
+    }
 
-        fn validate_source_residual(
-            &self,
-            source_language: &str,
-            text: &str,
-        ) -> Result<(), TranslationResponseLanguageValidationError<Self::Error>> {
-            if source_language != "ja" {
-                return Err(TranslationResponseLanguageValidationError::Unavailable(
-                    FakeError("source"),
-                ));
-            }
-            if text.contains("残留") {
-                Err(TranslationResponseLanguageValidationError::Rejected {
-                    message: "发现源文残留".to_owned(),
-                })
-            } else {
-                Ok(())
-            }
-        }
+    fn japanese_analysis() -> crate::language::LanguageAnalysis {
+        japanese_module().analyze_source(&LanguageText::natural("炎の剣"))
     }
 
     fn identity() -> TranslationLeafIdentity {
@@ -1330,22 +1297,39 @@ mod tests {
     }
 
     fn task() -> TranslationTaskBlock {
+        task_with_output_count(1)
+    }
+
+    fn task_with_output_count(output_count: usize) -> TranslationTaskBlock {
+        task_with_language_pair("ja", "zh-Hans", output_count)
+    }
+
+    fn task_with_language_pair(
+        source_language: &str,
+        target_language: &str,
+        output_count: usize,
+    ) -> TranslationTaskBlock {
         TranslationTaskBlock::new(
             StandardTranslationTaskIndex::new(2),
-            TranslationLanguagePair::new("ja", "zh-Hans"),
+            TranslationLanguagePair::new(source_language, target_language),
             Vec::new(),
             vec![TerminologyDependency::new("炎の剣", "炎之剑")],
             vec![
                 ChatMessage::new(ChatMessageRole::System, "# Contract"),
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
-            vec![ExpectedTranslationOutput::new(
-                0,
-                identity(),
-                vec![propagation_target()],
-                vec![placeholder()],
-                vec![TerminologyDependency::new("炎の剣", "炎之剑")],
-            )],
+            (0..output_count)
+                .map(|id| {
+                    ExpectedTranslationOutput::new(
+                        id,
+                        identity(),
+                        vec![propagation_target()],
+                        vec![placeholder()],
+                        japanese_analysis(),
+                        vec![TerminologyDependency::new("炎の剣", "炎之剑")],
+                    )
+                })
+                .collect(),
         )
     }
 
@@ -1362,75 +1346,339 @@ mod tests {
 
     #[tokio::test]
     async fn response_processor_accepts_string_id_and_restores_original_control() {
-        let processor = TranslationTaskResponseProcessingService::new(InlineCpu, FakeLanguage);
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
         let result = processor
             .process(
-                &task(),
+                &task_with_language_pair("ja", "unconfigured-target", 1),
                 LlmResponse::new(
                     r#"[{"id":"0","translation":"炎之剑\\N[1]！"}]"#,
                     LlmFinishReason::Stop,
                     Some("request-1".to_owned()),
                     Some(LlmUsage::new(10, 5, 15)),
                 ),
+                1,
             )
             .await
             .expect("原控制符能够唯一对应时应规范化并恢复");
 
         assert_eq!(result.task_index(), StandardTranslationTaskIndex::new(2));
-        assert_eq!(result.updates()[0].translation(), "炎之剑\\N[1]!");
+        assert!(matches!(result.status(), TranslationTaskStatus::Complete));
+        assert_eq!(result.attempts(), 1);
+        assert_eq!(result.request_id(), Some("request-1"));
+        assert_eq!(result.accepted()[0].translation(), "炎之剑\\N[1]！");
         assert_eq!(
-            result.updates()[0].propagation_targets(),
+            result.accepted()[0].propagation_targets(),
             &[propagation_target()]
         );
-        assert_eq!(result.updates()[0].terminology_dependencies().len(), 1);
+        assert_eq!(result.accepted()[0].terminology_dependencies().len(), 1);
     }
 
     #[tokio::test]
-    async fn response_processor_rejects_missing_ids_unknown_fields_and_residual_source() {
-        let processor = TranslationTaskResponseProcessingService::new(InlineCpu, FakeLanguage);
-        for content in [
-            "[]",
-            r#"[{"id":0,"translation":"炎之剑","extra":true}]"#,
-            r#"[{"id":1,"translation":"未知"}]"#,
-            r#"[{"id":0,"translation":"甲"},{"id":"0","translation":"乙"}]"#,
-            r#"[{"id":0,"translation":"缺少控制符"}]"#,
-            r#"[{"id":0,"translation":"⟦ATT:ACTOR_NAME:0⟧"}]"#,
-            r#"[{"id":0,"translation":"残留⟦ATT:ACTOR_NAME:0⟧"}]"#,
-        ] {
-            let error = processor
-                .process(
-                    &task(),
-                    LlmResponse::new(content, LlmFinishReason::Stop, None, None),
-                )
-                .await
-                .expect_err("不完整或不合规响应必须整任务失败");
-            assert_eq!(
-                TranslationTaskResponseProcessingService::<InlineCpu, FakeLanguage>::failure_disposition(&error),
-                ResponseFailureDisposition::RetryableContent
-            );
-        }
+    async fn response_processor_keeps_generic_text_checks_as_per_id_normal_results() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+
+        let bom = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    r#"[{"id":0,"translation":"炎\uFEFF之剑⟦ATT:ACTOR_NAME:0⟧"}]"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("BOM 属于当前 ID 的正常拒绝");
+        assert!(matches!(
+            bom.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::ContainsByteOrderMark
+        ));
+
+        let no_natural = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    r#"[{"id":0,"translation":" \r\n⟦ATT:ACTOR_NAME:0⟧\r"}]"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("只有占位符和空白属于当前 ID 的正常拒绝");
+        assert!(matches!(
+            no_natural.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::NoNaturalLanguageText
+        ));
+
+        let normalized = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    r#"[{"id":0,"translation":"第一行\r\n第二行\r⟦ATT:ACTOR_NAME:0⟧"}]"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("通用换行正规化应成功");
+        assert_eq!(
+            normalized.accepted()[0].translation(),
+            "第一行\n第二行\n\\N[1]"
+        );
+    }
+
+    #[test]
+    fn language_repair_rebuilds_tokens_in_their_translated_order() {
+        let first = AppliedPlaceholder::new(
+            "<first>",
+            "<FIRST_ORIGINAL>",
+            PlaceholderRuleOrigin::Custom,
+            "FIRST",
+            "all",
+            PlaceholderSegment::Whole,
+        );
+        let second = AppliedPlaceholder::new(
+            "<second>",
+            "<SECOND_ORIGINAL>",
+            PlaceholderRuleOrigin::Custom,
+            "SECOND",
+            "all",
+            PlaceholderSegment::Whole,
+        );
+        let module = japanese_module();
+        let analysis =
+            module.analyze_source(&LanguageText::natural("彼は「甲『乙』丙」と言った。"));
+
+        let restored = validate_and_restore_translation(
+            "他说：“甲<second>乙‘<first>’丙。”".to_owned(),
+            &[first, second],
+            &analysis,
+            module.as_ref(),
+        )
+        .expect("唯一引号结构应修复，并保留译文 token 实际顺序");
+
+        assert_eq!(
+            restored,
+            "他说：「甲<SECOND_ORIGINAL>乙『<FIRST_ORIGINAL>』丙。」"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_processor_keeps_valid_ids_and_records_every_unavailable_part() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+        let result = processor
+            .process(
+                &task_with_output_count(6),
+                LlmResponse::new(
+                    r#"[
+                        {"id":0,"translation":"炎之剑⟦ATT:ACTOR_NAME:0⟧"},
+                        {"id":1,"translation":"甲⟦ATT:ACTOR_NAME:0⟧"},
+                        {"id":"1","translation":"乙⟦ATT:ACTOR_NAME:0⟧"},
+                        {"id":3,"translation":"丙⟦ATT:ACTOR_NAME:0⟧","extra":true},
+                        {"id":4,"translation":"缺少控制符"},
+                        {"id":5,"translation":"译文です⟦ATT:ACTOR_NAME:0⟧"},
+                        {"id":99,"translation":"未知"},
+                        {"id":"bad","translation":"非法"},
+                        {"translation":"无 ID"},
+                        "不是对象"
+                    ]"#,
+                    LlmFinishReason::Length,
+                    Some("request-partial".to_owned()),
+                    None,
+                ),
+                2,
+            )
+            .await
+            .expect("模型内容的部分不可用必须是正常结果");
+
+        assert!(matches!(result.status(), TranslationTaskStatus::Partial));
+        assert_eq!(result.attempts(), 2);
+        assert_eq!(result.accepted().len(), 1);
+        assert_eq!(result.unresolved().len(), 5);
+        assert_eq!(result.unresolved()[0].id(), 1);
+        assert!(matches!(
+            result.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::Duplicate
+        ));
+        assert_eq!(result.unresolved()[1].id(), 2);
+        assert!(matches!(
+            result.unresolved()[1].reason(),
+            TranslationUnitRejectionReason::Missing
+        ));
+        assert_eq!(result.unresolved()[2].id(), 3);
+        assert!(matches!(
+            result.unresolved()[2].reason(),
+            TranslationUnitRejectionReason::InvalidShape { .. }
+        ));
+        assert_eq!(result.unresolved()[3].id(), 4);
+        assert!(matches!(
+            result.unresolved()[3].reason(),
+            TranslationUnitRejectionReason::PlaceholderMismatch { .. }
+        ));
+        assert_eq!(result.unresolved()[4].id(), 5);
+        assert!(matches!(
+            result.unresolved()[4].reason(),
+            TranslationUnitRejectionReason::SourceResidual { .. }
+        ));
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::NonStopFinish { .. }
+        )));
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::UnknownId { id: 99, .. }
+        )));
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::InvalidId { .. }
+        )));
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::MissingId { .. }
+        )));
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::UnattributedItem { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn response_processor_returns_persistable_unavailable_outcomes() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+        let invalid_json = processor
+            .process(
+                &task(),
+                LlmResponse::new("not-json", LlmFinishReason::Stop, None, None),
+                1,
+            )
+            .await
+            .expect("JSON 无法解析属于正常不可用结果");
+        assert!(matches!(
+            invalid_json.status(),
+            TranslationTaskStatus::Unavailable(
+                TranslationTaskUnavailableReason::ModelResponseUnusable
+            )
+        ));
+        assert!(matches!(
+            invalid_json.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::InvalidShape { .. }
+        ));
+        assert!(matches!(
+            invalid_json.diagnostics(),
+            [TranslationProtocolDiagnostic::InvalidJson { .. }]
+        ));
+
+        let all_rejected = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    r#"[{"id":0,"translation":""}]"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("所有 ID 不合格也属于正常不可用结果");
+        assert!(matches!(
+            all_rejected.status(),
+            TranslationTaskStatus::Unavailable(
+                TranslationTaskUnavailableReason::AllOutputsRejected
+            )
+        ));
+        assert!(matches!(
+            all_rejected.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::BlankTranslation
+        ));
     }
 
     #[tokio::test]
     async fn response_cpu_unavailable_is_fatal_instead_of_model_retryable() {
-        let processor = TranslationTaskResponseProcessingService::new(UnavailableCpu, FakeLanguage);
+        let processor =
+            TranslationTaskResponseProcessingService::new(UnavailableCpu, language_catalog());
         let error = processor
             .process(
                 &task(),
                 LlmResponse::new("[]", LlmFinishReason::Stop, None, None),
+                1,
             )
             .await
             .expect_err("CPU 根不可用必须传播");
 
-        assert_eq!(
-            TranslationTaskResponseProcessingService::<UnavailableCpu, FakeLanguage>::failure_disposition(&error),
-            ResponseFailureDisposition::Fatal
-        );
         assert!(matches!(
             error,
             TranslationTaskResponseProcessingError::ScheduleCompute(
                 CpuTaskExecutionError::Unavailable(FakeError("cpu"))
             )
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_language_unavailable_and_internal_invariant_are_technical_errors() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+        let language_error = processor
+            .process(
+                &task_with_language_pair("unknown", "any-target", 1),
+                LlmResponse::new(
+                    r#"[{"id":0,"translation":"炎之剑⟦ATT:ACTOR_NAME:0⟧"}]"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect_err("语言模块不可用必须是技术错误");
+        assert!(matches!(
+            language_error,
+            TranslationTaskResponseProcessingError::LanguageUnavailable(
+                LanguageModuleCatalogError::UnknownLanguageId { .. }
+            )
+        ));
+
+        let mismatched_catalog = LanguageModuleCatalog::new([("ja".to_owned(), english_module())])
+            .expect("测试语言目录有效");
+        let mismatch_error =
+            TranslationTaskResponseProcessingService::new(InlineCpu, mismatched_catalog)
+                .process(
+                    &task_with_language_pair("ja", "arbitrary-target", 1),
+                    LlmResponse::new(
+                        r#"[{"id":0,"translation":"炎之剑⟦ATT:ACTOR_NAME:0⟧"}]"#,
+                        LlmFinishReason::Stop,
+                        None,
+                        None,
+                    ),
+                    1,
+                )
+                .await
+                .expect_err("译前分析与当前源语言模块不匹配必须是技术错误");
+        assert!(matches!(
+            mismatch_error,
+            TranslationTaskResponseProcessingError::LanguageModule(_)
+        ));
+
+        let invariant_error = processor
+            .process(
+                &task_with_output_count(0),
+                LlmResponse::new("[]", LlmFinishReason::Stop, None, None),
+                1,
+            )
+            .await
+            .expect_err("空预期输出破坏 Planner 不变量");
+        assert!(matches!(
+            invariant_error,
+            TranslationTaskResponseProcessingError::InternalInvariant { .. }
         ));
     }
 
@@ -1475,6 +1723,17 @@ mod tests {
         async fn wait(&self, duration: Duration) -> Result<(), Self::Error> {
             self.waits.lock().expect("等待锁不应中毒").push(duration);
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FailingDelay;
+
+    impl AsyncDelay for FailingDelay {
+        type Error = FakeError;
+
+        async fn wait(&self, _duration: Duration) -> Result<(), Self::Error> {
+            Err(FakeError("delay"))
         }
     }
 
@@ -1524,7 +1783,7 @@ mod tests {
             FakeDelay {
                 waits: Arc::clone(&waits),
             },
-            TranslationTaskResponseProcessingService::new(InlineCpu, FakeLanguage),
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
         );
 
         service
@@ -1542,8 +1801,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_retries_invalid_model_content_with_same_budget() {
+    async fn executor_never_retries_invalid_model_content() {
         let waits = Arc::new(Mutex::new(Vec::new()));
+        let messages = Arc::new(Mutex::new(Vec::new()));
         let service = MzStandardTranslationTaskExecutionService::<
             _,
             _,
@@ -1560,37 +1820,57 @@ mod tests {
                         None,
                     )),
                 ]))),
-                messages: Arc::new(Mutex::new(Vec::new())),
+                messages: Arc::clone(&messages),
             },
             FakeDelay {
                 waits: Arc::clone(&waits),
             },
-            TranslationTaskResponseProcessingService::new(InlineCpu, FakeLanguage),
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
         );
-        service
+        let outcome = service
             .execute(&profile(), task())
             .await
-            .expect("模型内容失败应按外部延迟重试");
-        assert_eq!(
-            waits.lock().expect("等待锁不应中毒").as_slice(),
-            &[Duration::from_millis(10)]
-        );
+            .expect("模型内容不可用是正常结果");
+        assert!(matches!(
+            outcome.status(),
+            TranslationTaskStatus::Unavailable(
+                TranslationTaskUnavailableReason::AllOutputsRejected
+            )
+        ));
+        assert_eq!(messages.lock().expect("消息锁不应中毒").len(), 1);
+        assert!(waits.lock().expect("等待锁不应中毒").is_empty());
     }
 
     #[tokio::test]
-    async fn executor_does_not_retry_fatal_request_or_excessive_retry_after() {
-        for (response, expected_retry_after_error) in [
-            (Err(LlmRequestError::Fatal(FakeError("auth"))), false),
+    async fn executor_returns_unavailable_after_network_budget_or_retry_after_limit() {
+        for (responses, expected_status, expected_attempts) in [
             (
-                Err(LlmRequestError::Retryable {
+                VecDeque::from([
+                    Err(LlmRequestError::Retryable {
+                        source: FakeError("busy-1"),
+                        retry_after: None,
+                    }),
+                    Err(LlmRequestError::Retryable {
+                        source: FakeError("busy-2"),
+                        retry_after: None,
+                    }),
+                    Err(LlmRequestError::Retryable {
+                        source: FakeError("busy-3"),
+                        retry_after: None,
+                    }),
+                ]),
+                "exhausted",
+                3,
+            ),
+            (
+                VecDeque::from([Err(LlmRequestError::Retryable {
                     source: FakeError("busy"),
                     retry_after: Some(Duration::from_secs(3)),
-                }),
-                true,
+                })]),
+                "retry-after",
+                1,
             ),
         ] {
-            let messages = Arc::new(Mutex::new(Vec::new()));
-            let waits = Arc::new(Mutex::new(Vec::new()));
             let service = MzStandardTranslationTaskExecutionService::<
                 _,
                 _,
@@ -1598,29 +1878,99 @@ mod tests {
                 TranslationExecutionProfile<MzTranslationExecutionPayload<&'static str>>,
             >::new(
                 FakeLlm {
-                    responses: Arc::new(Mutex::new(VecDeque::from([response]))),
-                    messages: Arc::clone(&messages),
+                    responses: Arc::new(Mutex::new(responses)),
+                    messages: Arc::new(Mutex::new(Vec::new())),
                 },
                 FakeDelay {
-                    waits: Arc::clone(&waits),
+                    waits: Arc::new(Mutex::new(Vec::new())),
                 },
-                TranslationTaskResponseProcessingService::new(InlineCpu, FakeLanguage),
+                TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
             );
 
-            let error = service
+            let outcome = service
                 .execute(&profile(), task())
                 .await
-                .expect_err("不可恢复请求或超长 Retry-After 必须立即停止");
-            assert_eq!(messages.lock().expect("消息锁不应中毒").len(), 1);
-            assert!(waits.lock().expect("等待锁不应中毒").is_empty());
-            assert_eq!(
-                matches!(
-                    error,
-                    MzStandardTranslationTaskExecutionError::RetryAfterExceedsLimit { .. }
-                ),
-                expected_retry_after_error
-            );
+                .expect("可恢复网络预算不足属于正常不可用结果");
+            assert_eq!(outcome.attempts(), expected_attempts);
+            match (expected_status, outcome.status()) {
+                (
+                    "exhausted",
+                    TranslationTaskStatus::Unavailable(
+                        TranslationTaskUnavailableReason::RecoverableRequestExhausted { .. },
+                    ),
+                )
+                | (
+                    "retry-after",
+                    TranslationTaskStatus::Unavailable(
+                        TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
+                            ..
+                        },
+                    ),
+                ) => {}
+                (_, status) => panic!("意外任务状态：{status:?}"),
+            }
+            assert_eq!(outcome.unresolved().len(), 1);
+            assert!(matches!(
+                outcome.unresolved()[0].reason(),
+                TranslationUnitRejectionReason::Missing
+            ));
         }
+    }
+
+    #[tokio::test]
+    async fn executor_stops_on_fatal_request() {
+        let service = MzStandardTranslationTaskExecutionService::<
+            _,
+            _,
+            _,
+            TranslationExecutionProfile<MzTranslationExecutionPayload<&'static str>>,
+        >::new(
+            FakeLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([Err(LlmRequestError::Fatal(
+                    FakeError("auth"),
+                ))]))),
+                messages: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeDelay {
+                waits: Arc::new(Mutex::new(Vec::new())),
+            },
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
+        );
+
+        assert!(matches!(
+            service.execute(&profile(), task()).await,
+            Err(MzStandardTranslationTaskExecutionError::FatalRequest { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn executor_stops_when_network_backoff_cannot_wait() {
+        let service = MzStandardTranslationTaskExecutionService::<
+            _,
+            _,
+            _,
+            TranslationExecutionProfile<MzTranslationExecutionPayload<&'static str>>,
+        >::new(
+            FakeLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([Err(
+                    LlmRequestError::Retryable {
+                        source: FakeError("busy"),
+                        retry_after: None,
+                    },
+                )]))),
+                messages: Arc::new(Mutex::new(Vec::new())),
+            },
+            FailingDelay,
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
+        );
+
+        assert!(matches!(
+            service.execute(&profile(), task()).await,
+            Err(MzStandardTranslationTaskExecutionError::WaitBeforeRetry {
+                source: FakeError("delay"),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1645,7 +1995,7 @@ mod tests {
             FakeDelay {
                 waits: Arc::new(Mutex::new(Vec::new())),
             },
-            TranslationTaskResponseProcessingService::new(InlineCpu, FakeLanguage),
+            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
         );
         let profile = profile();
         assert_send(service.execute(&profile, task()));

@@ -17,7 +17,7 @@ att mz translate --name NAME LLM_ID
 | `LLM_ID` | 精确选择一份由外部完整建立的翻译执行 Profile |
 | `--terms TERMS_JSON` | 本次 Standard 翻译使用的可选权威术语表 |
 | `--placeholders PLACEHOLDERS_JSON` | 在固定 MZ 保护规格之外补充的可选 PCRE2 规则 |
-| `--lua SCRIPT_LUA` | Standard 全部成功后附加执行的可信 Lua 翻译程序 |
+| `--lua SCRIPT_LUA` | Standard 正常结束后附加执行的可信 Lua 翻译程序；仍有未翻译原文不会阻止它 |
 
 CLI 只建立命令参数事实，不读取这些文件，也不在命令行重复指定项目 metadata 已有的源语言和目标语言。
 
@@ -34,13 +34,15 @@ CLI 只建立命令参数事实，不读取这些文件，也不在命令行重�
 读取一次项目记录
         ↓
 StandardTranslationService
-        ↓ 全部成功且传入 --lua
+        ↓ 正常结束且传入 --lua
 LuaTranslationService
         ↓
-返回 TranslateOutput { name, llm_id }
+返回带 Standard 运行摘要的 TranslateOutput
 ```
 
-任一阶段失败立即停止。Standard 与 Lua 使用同一个不可变 Profile 快照；顶层不重读配置、不自动重试、不猜测提交范围，也不回滚下层已经确认提交的结果。
+Standard 的 Complete、Partial 与 Unavailable 都是正常业务结果；尚有未翻译原文时仍继续显式传入的 Lua。只有不可恢复请求错误、CPU/语言/内部不变量故障、SQLite 终态错误或持久日志失败等技术错误才立即停止并阻止 Lua。Standard 与 Lua 使用同一个不可变 Profile 快照；顶层不重读配置、不猜测提交范围，也不回滚下层已经确认提交的结果。
+
+正常完成时 CLI 返回退出码 0、stderr 为空，并输出 Standard 的任务、写入和剩余摘要；传入 Lua 时额外显示 Lua 已执行。Partial 或 Unavailable 不伪装成“全部翻译完成”，也不升级为失败退出码。技术错误继续返回退出码 1。
 
 ## 2. 完整非根依赖树
 
@@ -54,21 +56,21 @@ flowchart TD
     ST --> PL["MzStandardTranslationTaskPlanningService"]
     ST --> EX["MzStandardTranslationTaskExecutionService"]
     ST --> RS["MzStandardTranslationResultStorageService"]
+    ST --> LOG["PersistentEventLog&lt;TranslationLogEvent&gt;<br/>根接口"]
 
     AR --> SQ["SqliteQueryExecutor<br/>根接口"]
     AR --> CPU["CpuTaskExecutor<br/>根接口"]
 
     PL --> RR["JsonTranslationPlanningResourceReadingService"]
-    PL --> LANG["TranslationLanguageCatalog"]
+    PL --> LANG["LanguageModuleCatalog<br/>crate 级共享领域模块"]
     PL --> PH["Pcre2PlaceholderService"]
     PL --> DEDUP["TranslationDeduplication<br/>纯 CPU 领域模块"]
     PL --> CPU
     RR --> FR["FileReader<br/>根接口"]
     RR --> CPU
 
-    LANG --> JA["JapaneseSourceLanguage"]
-    LANG --> EN["EnglishSourceLanguage"]
-    LANG --> ZH["SimplifiedChineseTargetLanguage"]
+    LANG --> JA["JapaneseLanguageModule"]
+    LANG --> EN["EnglishLanguageModule"]
 
     EX --> LLM["LlmRequestExecutor<br/>根接口"]
     EX --> DELAY["AsyncDelay<br/>根接口"]
@@ -103,13 +105,13 @@ MzTranslationExecutionPayload<L>
 │  ├─ max_message_characters
 │  └─ 精确语言对 → 完整 system Markdown
 ├─ execution
-│  ├─ retry_delays
-│  └─ max_retry_after
+│  ├─ network_retry_delays
+│  └─ max_network_retry_after
 └─ llm
    └─ 根 LLM 适配器消费的不透明配置 L
 ```
 
-外层 Profile 继续持有非零 `max_in_flight_tasks`。资产解码、结果编码和英文残留判断也分别要求外部显式传入自己的非零并发、批量或阈值配置。
+外层 Profile 继续持有非零 `max_in_flight_tasks`。资产解码、结果编码、日英译前判定与残留策略，以及可选的日文引号修复候选也分别要求外部显式传入自己的并发、批量、阈值或规则配置。
 
 所有有意义的资源和策略选择遵循同一规则：
 
@@ -138,7 +140,7 @@ JSON 只存在于人类需要编辑的术语/占位符文件和模型响应边�
 
 活跃 ID 在每个任务内从 0 连续编号。虚原文包括已有有效译文、非源语言、完全受保护、全局重复和直接复用五类；它们都保留在各自的本地语义上下文中，携带保护后文本与占位符绑定，但没有 ID、没有旧译文，也不要求模型返回结果。`Duplicate` 和 `Reused` 的代表关系只存在于内部 Rust 模型中，提示词仍统一显示“仅上下文”。
 
-每个 `ExpectedTranslationOutput` 表达“一份待验收译文、一个代表位置和零到多个传播目标”。Executor 验收一次后生成同样结构的 `TranslationPatch`，不会把传播目标复制成彼此无关的翻译决定。
+每个 `ExpectedTranslationOutput` 表达“一份待验收译文、一个代表位置和零到多个传播目标”，并携带该代表在译前得到的 `LanguageAnalysis`。分析事实只保留这一份；用于渲染上下文的 `TranslationTaskUnit` 不重复保存。Executor 使用同一源语言模块和这份分析完成残留检查与可选安全修复，验收一次后生成同样传播结构的 `TranslationPatch`，不会把传播目标复制成彼此无关的翻译决定。
 
 只有 `messages` 发送给模型。表名、owner、数据库地址、结构化位置、正则正文和写回身份不进入用户提示词。`ChatMessageRole` 支持 System、User 与 Assistant，以便 Standard 与可信 Lua 共用同一个 LLM 根契约。
 
@@ -235,15 +237,51 @@ Store 直接依赖 `SqliteTransactionExecutor`、`CpuTaskExecutor` 和位置编�
 
 若一个候选 Active 单元在移除全部保护 token 后已不再包含源语言内容，Planner 将它降为虚原文；这使“整段保护”真正表示无需翻译，而不会制造一个只能返回 token 的空任务。
 
-### 6.3 语言目录
+### 6.3 共享 LanguageModule
 
-`TranslationLanguageCatalog` 通过外部精确语言 ID 绑定实现，不猜测、不回退。首版包含：
+语言能力位于 crate 级共享领域层，不属于 MZ 私有实现，也不是文件、网络一类的运行根。它只处理语言文本和外部建立的语言策略，不依赖 MZ 位置、数据库表、CLI、占位符 token、控制符或模型协议，因此未来其他引擎可以复用同一语义。
 
-- `JapaneseSourceLanguage`：源语言判定与译后日文残留检查；
-- `EnglishSourceLanguage`：源语言判定与译后英文残留检查，最小词数、最小字母数和允许项由外部传入；
-- `SimplifiedChineseTargetLanguage`：只做确定、安全的规范化与验收，不主观润色，不自动换行。
+`LanguageModule` 只承担三项职责：
 
-同一个源语言模块同时负责译前判定和译后残留检查，避免建立两套语言事实。
+1. 译前判断原文是否需要翻译，并产生后续所需的结构化 `LanguageAnalysis`；
+2. 译后根据同一份分析判断是否存在源语言残留；
+3. 在能够证明安全时给出可选的阅读风格修复计划。修复前的译文不因此被判错，无法唯一确认时保持原文不动。
+
+语言模块看到的不是占位符字符串，而是引擎无关的 `LanguageText`：
+
+```text
+LanguageText
+├─ NaturalText("彼は「")
+├─ OpaqueBoundary
+└─ NaturalText("」と言った")
+```
+
+`NaturalText` 是可以分析和修复的自然文本；`OpaqueBoundary` 表示调用方已经保护的内容。模块既看不到 token，也看不到被保护的原值。英文单词不能跨 opaque 边界拼接；同一翻译单元中的日文引号结构可以跨该边界继续配对。模块返回的 `LanguageRepairPlan` 只能描述 `NaturalText` 内经过验证且互不重叠的字符替换，不能删除、移动或改写 opaque 内容。
+
+`LanguageModuleCatalog` 只保存“外部精确源语言 ID → 同一个不可变 `LanguageModule` 实例”：
+
+- ID 不 trim、不折叠大小写，不猜测别名，也没有默认模块；
+- 外部可以显式把多个精确 ID 绑定到同一实例；
+- Catalog 不存在目标语言分支；
+- Planner 与 ResponseProcessor 直接复用同一个 Catalog 和同一个模块；
+- 分析类型与所选模块不匹配属于内部不变量破坏，而不是普通译文拒绝。
+
+首版实现两个模块：
+
+- `JapaneseLanguageModule`：出现假名或 CJK 表意文字时认为需要翻译；残留检查只报告达到外部阈值且未被允许项覆盖的真实连续假名片段，不把汉字当作确定残留。它还可以按外部候选引号对执行可选修复。
+- `EnglishLanguageModule`：译前判定与译后残留使用两份独立、显式注入的策略；译后只报告与原文真实连续对应的英文复制片段，不把分散单词拼成虚构残留。英文模块不修改译文。
+
+日文引号修复采用“唯一结构才修复”。译前记录当前单元内完整配对的 `「」`、`『』` 顺序和嵌套拓扑；译后只有候选引号的数量、顺序、配对与嵌套拓扑都唯一对应时，才把分隔符改回源文风格：
+
+```text
+原文：彼は「これは『勇者』の剣だ」と言った。
+模型：他说：“这是‘勇者’之剑。”
+修复：他说：「这是『勇者』之剑。」
+```
+
+源文或译文不配对、数量变化、嵌套变化、出现多种合法映射，或者需要跨不同翻译 ID 才能成对时，一律原样保留译文。这是“没有执行可选修复”，不会形成拒绝、Unavailable 或技术错误。
+
+目标语言 ID 仍然用于项目 metadata、精确语言对 system Markdown、TaskBlock 语言事实和告诉模型翻译目标；它不再对应目标语言模块。空白、BOM、换行、JSON、ID 和占位符完整性都是通用协议或文本职责，不伪装成任何具体语言能力。
 
 ### 6.4 规划算法
 
@@ -254,7 +292,7 @@ Planner 使用两阶段保序流水线：
 ```text
 建立 MZ 自然顺序并判定术语失效
         ↓
-按语义范围有界并行：占位符保护与源语言判定
+按语义范围有界并行：占位符保护、LanguageText 投影与译前分析
         ↓ 保序汇合
 一次全局 CPU 去重：确定代表、传播目标与历史译文复用
         ↓
@@ -278,6 +316,8 @@ Map 内保持 displayName、event、page、list、command 的真实结构顺序�
 
 User Markdown 只包含人类可理解的组、字段、活跃 ID/“仅上下文”、保护后的原文与实际术语；不泄露内部存储协议、去重原因或代表关系。仅含虚原文的范围不会生成模型请求。
 
+Planner 固定先保护占位符，再把普通文本与保护区投影为 `LanguageText`，随后调用按精确源语言 ID 选择的 `LanguageModule`。分析结果先暂存在预处理单元中；完成全局去重后，只把自然顺序代表的分析交给对应 `ExpectedTranslationOutput`。虚原文没有待验收输出，不向 Executor 复制分析。历史有效译文与 Preparation 直接复用的译文也不会因新语言模块而被隐式重写。
+
 ## 7. 模型执行与响应验收
 
 `LlmRequestExecutor` 是单次、非流式、单 choice、无自动重试的根契约。它返回原始 content、finish reason 与可选 request ID/usage，并将错误区分为 Retryable 与 Fatal；可恢复错误可以携带 `Retry-After`。
@@ -285,10 +325,11 @@ User Markdown 只包含人类可理解的组、字段、活跃 ID/“仅上下�
 `MzStandardTranslationTaskExecutionService`：
 
 1. 每次只发送 TaskBlock 已有的完整 messages；
-2. 可恢复根错误与模型内容验收失败共用外部 `retry_delays`；
-3. 每次重试使用完全相同的 messages，不追加隐藏“修复提示词”；
-4. `Retry-After` 与本地延迟取较大值，超过外部 `max_retry_after` 时停止；
-5. Fatal 根错误、CPU 不可用和内部不变量错误不重试。
+2. 只有 Retryable 网络错误使用外部 `network_retry_delays` 退避；
+3. 每次网络重试使用完全相同的 messages，不追加隐藏“修复提示词”；
+4. `Retry-After` 与本地延迟取较大值；超过 `max_network_retry_after` 或耗尽重试预算时，当前任务正常成为 Unavailable；
+5. 模型内容只验收一次，不消耗重试预算；
+6. Fatal 根错误、异步等待失败、CPU/语言能力不可用和内部不变量错误是技术错误，立即终止 Standard。
 
 `AsyncDelay` 只提供可取消的异步等待，不拥有重试策略。
 
@@ -302,11 +343,22 @@ User Markdown 只包含人类可理解的组、字段、活跃 ID/“仅上下�
 ]
 ```
 
-ID 可以是非负整数或十进制字符串。缺失、重复、未知、额外 ID，未知对象字段或空白译文都会使整个任务失败。输出 ID 集必须与 Active 单元完全一致。重复虚原文不进入 expected ID 集；模型试图为其额外返回译文仍按未知 ID 拒绝。
+ID 可以是非负整数或十进制字符串。响应先解析为顶层数组，再逐元素按可识别 ID 分桶和验收：
 
-译后处理顺序固定为：已知原控制符规范回 token → 校验 token 多重集 → 忽略 token 执行目标语言处理和源文残留检查 → 原样恢复保护片段 → 确认没有本任务 token 残留 → 按预期输出顺序建立原子结果。Active 译文在去除 token 后必须仍有有效文本；模型只返回控制符 token 会整任务失败，不能静默删除正文。代表译文只验收和还原一次，之后把同一结果连同代表任务实际注入的术语依赖交给 Store 原子扩散。
+- 唯一且属于预期集合的 ID 独立执行字段、通用文本、占位符和源文残留检查；
+- 同一预期 ID 重复出现时，该 ID 的所有候选都拒绝，不任意选择一个；
+- 缺失 ID 只使对应翻译决定未完成；未知、非法或缺失 ID 的响应元素记录协议诊断，不污染其他 ID；
+- `finish_reason` 非 Stop 时记录诊断；仍能安全解析的完整 ID 继续验收；
+- 顶层 JSON 无法安全解析或所有 ID 均不合格时，当前任务成为 Unavailable，而不是错误；
+- 部分 ID 合格时成为 Partial；所有预期 ID 合格时成为 Complete。
 
-## 8. Standard 并发与稳定前缀
+Complete、Partial 与 Unavailable 都是正常业务结果。缺失、重复、未知 ID、非法对象、空白译文、无自然语言文本、译文字段中的 BOM、占位符不匹配和源文残留都必须进入结构化任务诊断，不能因“不抛错”而丢失。重复虚原文不进入 expected ID 集；模型为其返回结果只形成未知 ID 诊断。
+
+译后处理顺序固定为：逐字段形状与原始空白检查 → 已知原控制符规范回 token → 校验 token 多重集 → 投影 `LanguageText` → 通用检查译文字段 BOM、规范化 `CRLF/CR` 为 `LF` 并确认存在自然语言文本 → 使用译前 `LanguageAnalysis` 检查源语残留 → 规划并应用可选安全修复 → 把修复映射回未保护文本 → 原样恢复保护片段 → 确认没有本任务 token 残留 → 按预期 ID 顺序建立 Patch。响应外壳开头可安全移除的 BOM 仍属于有限 JSON 清洗；译文字段内部出现 BOM 则是该 ID 的正常拒绝原因。
+
+源文残留检查发生在可选风格修复之前，避免修复掩盖真实残留；日文引号修复发生在占位符恢复之前，且只能改变已验证的自然文本字符。歧义修复直接跳过，不影响该 ID 合格。每个合格代表译文只验收和还原一次，再连同代表任务实际注入的术语依赖交给 Store 扩散；单个 ID 不合格不会丢弃其他已验收 Patch。
+
+## 8. Standard 并发、部分提交与自然续翻
 
 `StandardTranslationService` 固定执行：
 
@@ -319,12 +371,39 @@ ID 可以是非负整数或十进制字符串。缺失、重复、未知、额�
         ↓
 按 Profile.max_in_flight_tasks 有界执行 TaskExecutor
         ↓
-严格按 task_index 串行提交任务结果
+严格按 task_index 消费结果并记录持久事件
 ```
 
-模型请求可以乱序完成，数据库提交不能越过前序任务。任务 `i` 执行或提交失败时，只保留已经确认提交的 `0..i-1`；后序已完成结果被丢弃，尚未开始的请求取消，已经发出的请求也不得自行写数据库。一个已提交的前序代表可以同时填充物理位置位于后续上下文中的重复叶子，这仍属于同一个翻译决定的原子提交。空任务计划仍完成必要的失效与复用准备后成功。
+模型请求可以乱序完成，Standard 仍按 `task_index` 保序消费：
 
-## 9. 可信 Lua Host
+- Complete：用一个任务事务提交全部合格 Patch；
+- Partial：用一个任务事务只提交合格 Patch，未完成 ID 保持未翻译；
+- Unavailable：没有 Patch，不调用 Store，继续消费后续任务；
+- 技术错误：立即停止；已经提交的事务保持，后序结果不得写数据库。
+
+验收粒度、原子粒度和事务粒度彼此独立：译文按 ID 独立验收；每个代表及其全部去重传播目标必须原子成功；同一任务的所有合格传播族在一个短事务中批量提交。任一代表或传播目标已经变化时，整个任务事务以 `StalePlan` 失败，不允许部分传播。
+
+下一次运行不复用持久化 TaskBlock。Reader 重新读取数据库后，本次已提交译文自然成为 `ExistingTranslation` 虚原文，未完成原文重新成为 Active 并从 0 分配 ID；MZ 语义范围、自然顺序和本地上下文保持，但 Active/Virtual 变化后允许重新装箱。空任务计划仍完成必要的失效与复用准备后正常结束。
+
+Standard 返回结构化运行报告，至少统计计划任务、Complete/Partial/Unavailable 数量、接受的翻译决定、写入位置、未完成决定和位置、协议诊断以及网络重试耗尽任务。剩余数量大于零仍是成功的正常业务结果，并且不阻止显式 Lua。
+
+## 9. 集中持久事件日志
+
+`PersistentEventLog<TranslationLogEvent>` 是 Standard 唯一直接依赖的持久日志根接口。Executor 返回结构化业务结果，Store 只负责数据库事务，TranslateService、CLI 与其他下层模块不分别拼接或持久化任务日志。
+
+日志顺序与数据库可确认事实保持一致：
+
+- 有合格 Patch 的任务先确认事务提交，再追加一次任务事件；
+- 如果任务事务技术失败，先尽力追加独立的 `TaskCommitFailed` 事件，保存已经形成的逐 ID 验收与拒绝诊断，但不宣称任何位置已经写入；随后仍以原 Store 错误终止命令；
+- 没有 Patch 的 Unavailable 任务直接追加一次任务事件；
+- 全部任务正常消费后追加一次运行汇总；
+- 日志写入失败表示无法履行已确认的持久可观测性承诺，属于技术错误，停止后续任务并阻止 Lua；已经提交的译文保持。
+
+每个任务事件必须完整体现正常业务结果，而不只记录异常：任务索引、Complete/Partial/Unavailable、网络尝试次数、可选 request ID 与 finish reason、每个合格 ID 的代表位置和完整传播族、未完成 ID/位置、每项拒绝原因、缺失/重复/未知/非法 ID 等协议诊断，以及实际写入的翻译决定和物理位置数量。所有 ID 都不合格与顶层 JSON 无法解析统一表示“当前任务块无可用译文”，但保留各自诊断原因；部分不可用也完整记录，不能只记录成功 Patch。
+
+事件默认不包含完整 messages、完整模型响应、密钥或全文原文/译文。日志根返回成功必须表示事件已经达到外部配置声明的持久化终态；仅进入进程内易失队列不算成功。本轮只有根接口和受信事件模型，不实现日志文件、格式、队列、轮转、刷盘或保留策略，也不提供静默丢弃事件的生产实现；这些运行选择必须由未来组合根从外部配置建立。
+
+## 10. 可信 Lua Host
 
 Lua 是用户明确选择并完全信任的本机程序，不建立沙箱。`TrustedLuaExecutionHostingService` 已经把粗粒度 Host 继续实现到四个真实运行根：
 
@@ -349,7 +428,7 @@ Host 在提交 Runtime 前已经打开项目数据库，因此取消契约也覆
 
 `require` 和脚本主动文件访问属于 Lua 专用 worker，不得阻塞异步 I/O 执行器线程。
 
-## 10. 根接口与完成边界
+## 11. 根接口与完成边界
 
 TranslateUseCase 的非根业务树已经收束到以下运行根接口：
 
@@ -361,12 +440,14 @@ TranslateUseCase 的非根业务树已经收束到以下运行根接口：
 | `SqliteTransactionExecutor` | 拥有型短事务计划与确定提交终态 |
 | `LlmRequestExecutor` | 网络排队、限流、单次请求与响应读取 |
 | `AsyncDelay` | 可取消异步等待 |
+| `PersistentEventLog<TranslationLogEvent>` | 按顺序接管结构化任务结果与运行汇总并持久化 |
 | `TrustedLuaRuntimeExecutor` | 可信 Lua VM、专用 worker 与受控终态 |
 | `SqliteInteractiveSessionFactory` | 同连接 query/execute/事务状态/关闭生命周期 |
 
 当前可以声称：
 
 - Standard 的资产读取、两阶段计划、全局确定性去重、历史译文复用、模型执行、一次验收多位置扩散与结果存储业务边界已经成立；
+- Standard 的 Complete/Partial/Unavailable 正常结果、按 ID 验收、按传播族原子提交和集中日志依赖边界已经成立；
 - Lua Host 的脚本、项目上下文、共享 LLM、数据库会话和事务生命周期编排已经成立；
 - TranslateUseCase 全部非根依赖已经实现到真实运行根之前；
 - CPU 密集工作和异步等待路径均通过明确根契约隔离，阶段并发和批量选择全部由外部注入。
@@ -374,6 +455,7 @@ TranslateUseCase 的非根业务树已经收束到以下运行根接口：
 当前不能声称：
 
 - 真实文件、CPU 线程池、SQLite、网络 LLM 或 Lua VM 已有生产适配器；
+- 结构化持久事件日志已有生产适配器；
 - 生产组合根已经把这些能力装入 `MzCli`；
 - 真实游戏已经完成端到端翻译或达到目标吞吐量。
 

@@ -13,10 +13,6 @@ use super::executor::{
     AsyncDelay, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
     MzStandardTranslationTaskExecutionService, TranslationTaskResponseProcessingService,
 };
-use super::language::{
-    JapaneseSourceLanguage, SimplifiedChineseTargetLanguage, SourceLanguage, TargetLanguage,
-    TranslationLanguageCatalog,
-};
 use super::lua::LuaTranslationService;
 use super::placeholder::Pcre2PlaceholderService;
 use super::planner::MzStandardTranslationTaskPlanningService;
@@ -30,7 +26,9 @@ use super::result_store::{
     MzStandardTranslationResultStorageConfig, MzStandardTranslationResultStorageService,
 };
 use super::service::TranslateService;
-use super::standard::{ChatMessage, ChatMessageRole, StandardTranslationService};
+use super::standard::{
+    ChatMessage, ChatMessageRole, StandardTranslationService, TranslationLogEvent,
+};
 use super::{TranslateInput, TranslateUseCase};
 use crate::att_mz::location_codec::MzLocationCodec;
 use crate::att_mz::lua::LuaPhase;
@@ -44,6 +42,10 @@ use crate::att_mz::lua::session::{
     SqliteInteractiveSessionFactory, SqliteInteractiveTransactionState,
 };
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
+use crate::language::{
+    JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageModuleCatalog,
+};
+use crate::observability::PersistentEventLog;
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
@@ -75,6 +77,9 @@ enum Event {
     },
     Delay(Duration),
     StandardTransaction,
+    LogTask,
+    LogCommitFailure,
+    LogRun,
     ReadLua(PathBuf),
     OpenLuaDatabase(PathBuf),
     LuaRuntime,
@@ -86,6 +91,29 @@ enum Event {
     LuaCommit,
     LuaInspect,
     LuaClose,
+}
+
+#[derive(Clone)]
+struct FakePersistentEventLog {
+    events: EventLog,
+    calls: Arc<AtomicUsize>,
+}
+
+impl PersistentEventLog<TranslationLogEvent> for FakePersistentEventLog {
+    type Error = FakeRootError;
+
+    async fn append(&self, event: TranslationLogEvent) -> Result<(), Self::Error> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        record(
+            &self.events,
+            match event {
+                TranslationLogEvent::TaskProcessed(_) => Event::LogTask,
+                TranslationLogEvent::TaskCommitFailed(_) => Event::LogCommitFailure,
+                TranslationLogEvent::RunCompleted(_) => Event::LogRun,
+            },
+        );
+        Ok(())
+    }
 }
 
 type EventLog = Arc<Mutex<Vec<Event>>>;
@@ -482,14 +510,12 @@ fn non_zero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("测试配置必须非零")
 }
 
-fn language_catalog() -> TranslationLanguageCatalog {
-    let source: Arc<dyn SourceLanguage> = Arc::new(JapaneseSourceLanguage);
-    let target: Arc<dyn TargetLanguage> = Arc::new(SimplifiedChineseTargetLanguage);
-    TranslationLanguageCatalog::new(
-        [("ja".to_owned(), source)],
-        [("zh-Hans".to_owned(), target)],
-    )
-    .expect("测试语言目录应合法")
+fn language_catalog() -> LanguageModuleCatalog {
+    let japanese: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
+        JapaneseResidualPolicy::new(non_zero(1), Vec::new()).expect("测试日文残留策略应合法"),
+        None,
+    ));
+    LanguageModuleCatalog::new([("ja".to_owned(), japanese)]).expect("测试语言目录应合法")
 }
 
 fn event_position(events: &[Event], predicate: impl Fn(&Event) -> bool) -> usize {
@@ -497,7 +523,7 @@ fn event_position(events: &[Event], predicate: impl Fn(&Event) -> bool) -> usize
 }
 
 #[tokio::test]
-async fn all_non_root_translation_services_reach_the_eight_root_fakes() {
+async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let cpu_calls = Arc::new(AtomicUsize::new(0));
     let transaction_calls = Arc::new(AtomicUsize::new(0));
@@ -506,6 +532,7 @@ async fn all_non_root_translation_services_reach_the_eight_root_fakes() {
     let file_calls = Arc::new(AtomicUsize::new(0));
     let lua_runtime_calls = Arc::new(AtomicUsize::new(0));
     let session_factory_calls = Arc::new(AtomicUsize::new(0));
+    let persistent_log_calls = Arc::new(AtomicUsize::new(0));
 
     let cpu = FakeCpuTaskExecutor {
         events: Arc::clone(&events),
@@ -605,7 +632,16 @@ async fn all_non_root_translation_services_reach_the_eight_root_fakes() {
         cpu,
         MzStandardTranslationResultStorageConfig::new(non_zero(1), non_zero(1)),
     );
-    let standard = StandardTranslationService::new(asset_reader, planner, executor, result_store);
+    let standard = StandardTranslationService::new(
+        asset_reader,
+        planner,
+        executor,
+        result_store,
+        FakePersistentEventLog {
+            events: Arc::clone(&events),
+            calls: Arc::clone(&persistent_log_calls),
+        },
+    );
 
     let lua_host =
         TrustedLuaExecutionHostingService::new(file_reader, llm, lua_runtime, session_factory);
@@ -636,6 +672,7 @@ async fn all_non_root_translation_services_reach_the_eight_root_fakes() {
     assert_eq!(file_calls.load(Ordering::SeqCst), 1);
     assert_eq!(lua_runtime_calls.load(Ordering::SeqCst), 1);
     assert_eq!(session_factory_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(persistent_log_calls.load(Ordering::SeqCst), 2);
     assert!(session_state.lock().expect("会话状态锁不应中毒").closed);
 
     let events = events.lock().expect("事件锁不应中毒").clone();
@@ -650,6 +687,8 @@ async fn all_non_root_translation_services_reach_the_eight_root_fakes() {
     });
     let standard_transaction =
         event_position(&events, |event| matches!(event, Event::StandardTransaction));
+    let log_task = event_position(&events, |event| matches!(event, Event::LogTask));
+    let log_run = event_position(&events, |event| matches!(event, Event::LogRun));
     let read_lua = event_position(&events, |event| matches!(event, Event::ReadLua(_)));
     let open_lua = event_position(&events, |event| matches!(event, Event::OpenLuaDatabase(_)));
     let lua_runtime = event_position(&events, |event| matches!(event, Event::LuaRuntime));
@@ -664,7 +703,8 @@ async fn all_non_root_translation_services_reach_the_eight_root_fakes() {
     assert!(assets < first_llm);
     assert!(first_llm < delay && delay < second_llm);
     assert!(second_llm < standard_transaction);
-    assert!(standard_transaction < read_lua);
+    assert!(standard_transaction < log_task && log_task < log_run);
+    assert!(log_run < read_lua);
     assert!(read_lua < open_lua && open_lua < lua_runtime);
     assert!(lua_runtime < lua_begin && lua_begin < lua_execute);
     assert!(lua_execute < lua_llm && lua_llm < lua_commit);

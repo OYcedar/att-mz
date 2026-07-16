@@ -12,10 +12,13 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::stream::{self, StreamExt};
 
 use crate::att_mz::text::{MzLocation, TextGroupKind};
+use crate::language::LanguageAnalysis;
+use crate::observability::PersistentEventLog;
 use crate::project_database::StoredProjectRecord;
 
 use super::profile::TranslationExecutionProfile;
@@ -719,6 +722,7 @@ pub(crate) struct ExpectedTranslationOutput {
     identity: TranslationLeafIdentity,
     propagation_targets: Vec<TranslationLeafIdentity>,
     applied_placeholders: Vec<AppliedPlaceholder>,
+    language_analysis: LanguageAnalysis,
     terminology_dependencies: Vec<TerminologyDependency>,
 }
 
@@ -728,6 +732,7 @@ impl ExpectedTranslationOutput {
         identity: TranslationLeafIdentity,
         propagation_targets: Vec<TranslationLeafIdentity>,
         applied_placeholders: Vec<AppliedPlaceholder>,
+        language_analysis: LanguageAnalysis,
         terminology_dependencies: Vec<TerminologyDependency>,
     ) -> Self {
         Self {
@@ -735,6 +740,7 @@ impl ExpectedTranslationOutput {
             identity,
             propagation_targets,
             applied_placeholders,
+            language_analysis,
             terminology_dependencies,
         }
     }
@@ -753,6 +759,11 @@ impl ExpectedTranslationOutput {
 
     pub(crate) fn applied_placeholders(&self) -> &[AppliedPlaceholder] {
         &self.applied_placeholders
+    }
+
+    /// 返回 Planner 针对代表原文建立、供译后处理使用的唯一语言事实。
+    pub(crate) fn language_analysis(&self) -> &LanguageAnalysis {
+        &self.language_analysis
     }
 
     pub(crate) fn terminology_dependencies(&self) -> &[TerminologyDependency] {
@@ -876,7 +887,51 @@ impl TranslationPatch {
     }
 }
 
-/// Executor 对一个任务块的完整验收结果。
+/// 一个已经通过独立验收的任务 ID 及其可写 Patch。
+///
+/// ID 只属于本次 TaskBlock 协议，不进入资产表；保留在业务结果中是为了让持久日志
+/// 能准确表达“哪个 ID 成功，以及它会传播到哪些位置”。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcceptedTranslationDecision {
+    id: usize,
+    patch: TranslationPatch,
+}
+
+impl AcceptedTranslationDecision {
+    pub(crate) fn new(id: usize, patch: TranslationPatch) -> Self {
+        Self { id, patch }
+    }
+
+    pub(crate) const fn id(&self) -> usize {
+        self.id
+    }
+
+    pub(crate) fn patch(&self) -> &TranslationPatch {
+        &self.patch
+    }
+
+    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+        self.patch.identity()
+    }
+
+    pub(crate) fn propagation_targets(&self) -> &[TranslationLeafIdentity] {
+        self.patch.propagation_targets()
+    }
+
+    pub(crate) fn translation(&self) -> &str {
+        self.patch.translation()
+    }
+
+    pub(crate) fn terminology_dependencies(&self) -> &[TerminologyDependency] {
+        self.patch.terminology_dependencies()
+    }
+
+    fn into_patch(self) -> TranslationPatch {
+        self.patch
+    }
+}
+
+/// 只承载已经独立验收、可交给 Store 原子写入的译文 Patch。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ValidatedTranslationTaskResult {
     task_index: StandardTranslationTaskIndex,
@@ -904,6 +959,572 @@ impl ValidatedTranslationTaskResult {
 
     pub(crate) fn into_updates(self) -> Vec<TranslationPatch> {
         self.updates
+    }
+}
+
+/// 一个预期 ID 没有形成可写译文的正常业务原因。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationUnitRejectionReason {
+    Missing,
+    Duplicate,
+    InvalidShape { message: String },
+    BlankTranslation,
+    NoNaturalLanguageText,
+    ContainsByteOrderMark,
+    PlaceholderMismatch { token: String },
+    PlaceholderNormalizationAmbiguous { original: String },
+    SourceResidual { fragment: String },
+}
+
+/// 一个仍需在后续 CLI 运行中重新翻译的预期单元。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UnresolvedTranslationUnit {
+    id: usize,
+    identity: TranslationLeafIdentity,
+    propagation_targets: Vec<TranslationLeafIdentity>,
+    reason: TranslationUnitRejectionReason,
+}
+
+impl UnresolvedTranslationUnit {
+    pub(crate) fn new(
+        id: usize,
+        identity: TranslationLeafIdentity,
+        propagation_targets: Vec<TranslationLeafIdentity>,
+        reason: TranslationUnitRejectionReason,
+    ) -> Self {
+        Self {
+            id,
+            identity,
+            propagation_targets,
+            reason,
+        }
+    }
+
+    pub(crate) const fn id(&self) -> usize {
+        self.id
+    }
+
+    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn propagation_targets(&self) -> &[TranslationLeafIdentity] {
+        &self.propagation_targets
+    }
+
+    pub(crate) fn reason(&self) -> &TranslationUnitRejectionReason {
+        &self.reason
+    }
+
+    pub(crate) const fn location_count(&self) -> usize {
+        1 + self.propagation_targets.len()
+    }
+}
+
+/// 无法绑定为某个可写译文、但必须进入持久日志的模型协议事实。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationProtocolDiagnostic {
+    NonStopFinish { reason: String },
+    InvalidJson { message: String },
+    InvalidId { item_index: usize, value: String },
+    MissingId { item_index: usize },
+    UnknownId { item_index: usize, id: usize },
+    UnattributedItem { item_index: usize, message: String },
+}
+
+/// 一个任务没有任何可用译文的正常原因。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationTaskUnavailableReason {
+    ModelResponseUnusable,
+    AllOutputsRejected,
+    RecoverableRequestExhausted {
+        attempts: usize,
+        message: String,
+    },
+    RetryAfterExceedsConfiguredMaximum {
+        attempt: usize,
+        retry_after: Duration,
+        maximum: Duration,
+        message: String,
+    },
+}
+
+/// 一个任务块在本轮执行中的正常业务状态。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationTaskStatus {
+    Complete,
+    Partial,
+    Unavailable(TranslationTaskUnavailableReason),
+}
+
+/// 一个任务块的正常业务结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationTaskOutcome {
+    task_index: StandardTranslationTaskIndex,
+    status: TranslationTaskStatus,
+    attempts: usize,
+    request_id: Option<String>,
+    finish_reason: Option<String>,
+    accepted: Vec<AcceptedTranslationDecision>,
+    unresolved: Vec<UnresolvedTranslationUnit>,
+    diagnostics: Vec<TranslationProtocolDiagnostic>,
+}
+
+impl TranslationTaskOutcome {
+    pub(crate) fn complete(
+        task_index: StandardTranslationTaskIndex,
+        attempts: usize,
+        request_id: Option<String>,
+        finish_reason: Option<String>,
+        accepted: Vec<AcceptedTranslationDecision>,
+        diagnostics: Vec<TranslationProtocolDiagnostic>,
+    ) -> Result<Self, TranslationTaskOutcomeInvariantError> {
+        ensure_positive_attempts(attempts)?;
+        if accepted.is_empty() {
+            return Err(TranslationTaskOutcomeInvariantError::new(
+                "Complete 必须包含至少一个合格翻译决定",
+            ));
+        }
+        Ok(Self {
+            task_index,
+            status: TranslationTaskStatus::Complete,
+            attempts,
+            request_id,
+            finish_reason,
+            accepted,
+            unresolved: Vec::new(),
+            diagnostics,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn partial(
+        task_index: StandardTranslationTaskIndex,
+        attempts: usize,
+        request_id: Option<String>,
+        finish_reason: Option<String>,
+        accepted: Vec<AcceptedTranslationDecision>,
+        unresolved: Vec<UnresolvedTranslationUnit>,
+        diagnostics: Vec<TranslationProtocolDiagnostic>,
+    ) -> Result<Self, TranslationTaskOutcomeInvariantError> {
+        ensure_positive_attempts(attempts)?;
+        if accepted.is_empty() || unresolved.is_empty() {
+            return Err(TranslationTaskOutcomeInvariantError::new(
+                "Partial 必须同时包含合格与未完成翻译决定",
+            ));
+        }
+        Ok(Self {
+            task_index,
+            status: TranslationTaskStatus::Partial,
+            attempts,
+            request_id,
+            finish_reason,
+            accepted,
+            unresolved,
+            diagnostics,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn unavailable(
+        task_index: StandardTranslationTaskIndex,
+        attempts: usize,
+        request_id: Option<String>,
+        finish_reason: Option<String>,
+        reason: TranslationTaskUnavailableReason,
+        unresolved: Vec<UnresolvedTranslationUnit>,
+        diagnostics: Vec<TranslationProtocolDiagnostic>,
+    ) -> Result<Self, TranslationTaskOutcomeInvariantError> {
+        ensure_positive_attempts(attempts)?;
+        if unresolved.is_empty() {
+            return Err(TranslationTaskOutcomeInvariantError::new(
+                "Unavailable 必须包含至少一个未完成翻译决定",
+            ));
+        }
+        Ok(Self {
+            task_index,
+            status: TranslationTaskStatus::Unavailable(reason),
+            attempts,
+            request_id,
+            finish_reason,
+            accepted: Vec::new(),
+            unresolved,
+            diagnostics,
+        })
+    }
+
+    pub(crate) const fn task_index(&self) -> StandardTranslationTaskIndex {
+        self.task_index
+    }
+
+    pub(crate) fn status(&self) -> &TranslationTaskStatus {
+        &self.status
+    }
+
+    pub(crate) const fn attempts(&self) -> usize {
+        self.attempts
+    }
+
+    pub(crate) fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    pub(crate) fn finish_reason(&self) -> Option<&str> {
+        self.finish_reason.as_deref()
+    }
+
+    pub(crate) fn accepted(&self) -> &[AcceptedTranslationDecision] {
+        &self.accepted
+    }
+
+    pub(crate) fn unresolved(&self) -> &[UnresolvedTranslationUnit] {
+        &self.unresolved
+    }
+
+    pub(crate) fn diagnostics(&self) -> &[TranslationProtocolDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub(crate) fn accepted_location_count(&self) -> usize {
+        self.accepted
+            .iter()
+            .map(|decision| 1 + decision.propagation_targets().len())
+            .sum()
+    }
+
+    pub(crate) fn unresolved_location_count(&self) -> usize {
+        self.unresolved
+            .iter()
+            .map(UnresolvedTranslationUnit::location_count)
+            .sum()
+    }
+
+    pub(crate) fn validated_result(&self) -> Option<ValidatedTranslationTaskResult> {
+        (!self.accepted.is_empty()).then(|| {
+            ValidatedTranslationTaskResult::new(
+                self.task_index,
+                self.accepted
+                    .clone()
+                    .into_iter()
+                    .map(AcceptedTranslationDecision::into_patch)
+                    .collect(),
+            )
+        })
+    }
+}
+
+/// `TranslationTaskOutcome` 无法表达的内部非法状态。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationTaskOutcomeInvariantError {
+    message: &'static str,
+}
+
+impl TranslationTaskOutcomeInvariantError {
+    const fn new(message: &'static str) -> Self {
+        Self { message }
+    }
+}
+
+impl fmt::Display for TranslationTaskOutcomeInvariantError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl Error for TranslationTaskOutcomeInvariantError {}
+
+fn ensure_positive_attempts(attempts: usize) -> Result<(), TranslationTaskOutcomeInvariantError> {
+    if attempts == 0 {
+        Err(TranslationTaskOutcomeInvariantError::new(
+            "翻译任务尝试次数必须大于零",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// 一次 Standard 运行已经确认的正常业务汇总。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StandardTranslationRunReport {
+    total_tasks: usize,
+    complete_tasks: usize,
+    partial_tasks: usize,
+    unavailable_tasks: usize,
+    accepted_decisions: usize,
+    written_locations: usize,
+    unresolved_decisions: usize,
+    unresolved_locations: usize,
+    protocol_diagnostics: usize,
+    recoverable_request_exhaustions: usize,
+}
+
+impl StandardTranslationRunReport {
+    pub(crate) const fn empty(total_tasks: usize) -> Self {
+        Self {
+            total_tasks,
+            complete_tasks: 0,
+            partial_tasks: 0,
+            unavailable_tasks: 0,
+            accepted_decisions: 0,
+            written_locations: 0,
+            unresolved_decisions: 0,
+            unresolved_locations: 0,
+            protocol_diagnostics: 0,
+            recoverable_request_exhaustions: 0,
+        }
+    }
+
+    pub(crate) fn record(&mut self, outcome: &TranslationTaskOutcome) {
+        match outcome.status() {
+            TranslationTaskStatus::Complete => self.complete_tasks += 1,
+            TranslationTaskStatus::Partial => self.partial_tasks += 1,
+            TranslationTaskStatus::Unavailable(reason) => {
+                self.unavailable_tasks += 1;
+                if matches!(
+                    reason,
+                    TranslationTaskUnavailableReason::RecoverableRequestExhausted { .. }
+                        | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum { .. }
+                ) {
+                    self.recoverable_request_exhaustions += 1;
+                }
+            }
+        }
+        self.accepted_decisions += outcome.accepted().len();
+        self.written_locations += outcome.accepted_location_count();
+        self.unresolved_decisions += outcome.unresolved().len();
+        self.unresolved_locations += outcome.unresolved_location_count();
+        self.protocol_diagnostics += outcome.diagnostics().len();
+    }
+
+    pub(crate) const fn total_tasks(&self) -> usize {
+        self.total_tasks
+    }
+
+    pub(crate) const fn complete_tasks(&self) -> usize {
+        self.complete_tasks
+    }
+
+    pub(crate) const fn partial_tasks(&self) -> usize {
+        self.partial_tasks
+    }
+
+    pub(crate) const fn unavailable_tasks(&self) -> usize {
+        self.unavailable_tasks
+    }
+
+    pub(crate) const fn accepted_decisions(&self) -> usize {
+        self.accepted_decisions
+    }
+
+    pub(crate) const fn written_locations(&self) -> usize {
+        self.written_locations
+    }
+
+    pub(crate) const fn unresolved_decisions(&self) -> usize {
+        self.unresolved_decisions
+    }
+
+    pub(crate) const fn unresolved_locations(&self) -> usize {
+        self.unresolved_locations
+    }
+
+    pub(crate) const fn protocol_diagnostics(&self) -> usize {
+        self.protocol_diagnostics
+    }
+
+    pub(crate) const fn recoverable_request_exhaustions(&self) -> usize {
+        self.recoverable_request_exhaustions
+    }
+}
+
+/// Standard 交给唯一日志依赖的结构化事件。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationLogEvent {
+    TaskProcessed(TranslationTaskLogRecord),
+    TaskCommitFailed(TranslationTaskCommitFailureLogRecord),
+    RunCompleted(StandardTranslationRunReport),
+}
+
+/// 一个任务已经完成数据库提交后的日志事实。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationTaskLogRecord {
+    task_index: StandardTranslationTaskIndex,
+    status: TranslationTaskStatus,
+    attempts: usize,
+    request_id: Option<String>,
+    finish_reason: Option<String>,
+    accepted_decisions: usize,
+    confirmed_written_locations: Option<usize>,
+    accepted: Vec<LoggedAcceptedTranslationDecision>,
+    unresolved: Vec<LoggedUnresolvedTranslationUnit>,
+    diagnostics: Vec<TranslationProtocolDiagnostic>,
+}
+
+impl TranslationTaskLogRecord {
+    pub(crate) fn from_outcome(outcome: &TranslationTaskOutcome) -> Self {
+        let accepted = outcome
+            .accepted()
+            .iter()
+            .map(LoggedAcceptedTranslationDecision::from_accepted)
+            .collect();
+        let unresolved = outcome
+            .unresolved()
+            .iter()
+            .map(LoggedUnresolvedTranslationUnit::from_unresolved)
+            .collect();
+        Self {
+            task_index: outcome.task_index(),
+            status: outcome.status().clone(),
+            attempts: outcome.attempts(),
+            request_id: outcome.request_id().map(str::to_owned),
+            finish_reason: outcome.finish_reason().map(str::to_owned),
+            accepted_decisions: outcome.accepted().len(),
+            confirmed_written_locations: Some(outcome.accepted_location_count()),
+            accepted,
+            unresolved,
+            diagnostics: outcome.diagnostics().to_vec(),
+        }
+    }
+
+    pub(crate) const fn task_index(&self) -> StandardTranslationTaskIndex {
+        self.task_index
+    }
+
+    pub(crate) fn status(&self) -> &TranslationTaskStatus {
+        &self.status
+    }
+
+    pub(crate) const fn attempts(&self) -> usize {
+        self.attempts
+    }
+
+    pub(crate) fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    pub(crate) fn finish_reason(&self) -> Option<&str> {
+        self.finish_reason.as_deref()
+    }
+
+    pub(crate) const fn accepted_decisions(&self) -> usize {
+        self.accepted_decisions
+    }
+
+    pub(crate) const fn confirmed_written_locations(&self) -> Option<usize> {
+        self.confirmed_written_locations
+    }
+
+    pub(crate) fn accepted(&self) -> &[LoggedAcceptedTranslationDecision] {
+        &self.accepted
+    }
+
+    pub(crate) fn unresolved(&self) -> &[LoggedUnresolvedTranslationUnit] {
+        &self.unresolved
+    }
+
+    pub(crate) fn diagnostics(&self) -> &[TranslationProtocolDiagnostic] {
+        &self.diagnostics
+    }
+}
+
+/// Store 未能确认任务事务时持久化的内容验收事实。
+///
+/// 该事件不宣称任何位置已经写入；`commit_failure` 只保存适合调试的阶段错误文本，
+/// 具体 `NotCommitted / StalePlan / OutcomeUnknown` 语义仍由原 Store 错误链负责。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationTaskCommitFailureLogRecord {
+    outcome: TranslationTaskLogRecord,
+    commit_failure: String,
+}
+
+impl TranslationTaskCommitFailureLogRecord {
+    pub(crate) fn new(outcome: &TranslationTaskOutcome, commit_failure: String) -> Self {
+        let mut outcome = TranslationTaskLogRecord::from_outcome(outcome);
+        outcome.confirmed_written_locations = None;
+        Self {
+            outcome,
+            commit_failure,
+        }
+    }
+
+    pub(crate) fn outcome(&self) -> &TranslationTaskLogRecord {
+        &self.outcome
+    }
+
+    pub(crate) fn commit_failure(&self) -> &str {
+        &self.commit_failure
+    }
+}
+
+/// 日志中的一个合格 ID 及其去重传播族。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LoggedAcceptedTranslationDecision {
+    id: usize,
+    leader: MzLocation,
+    propagation_targets: Vec<MzLocation>,
+}
+
+impl LoggedAcceptedTranslationDecision {
+    fn from_accepted(accepted: &AcceptedTranslationDecision) -> Self {
+        Self {
+            id: accepted.id(),
+            leader: accepted.identity().exact_location().clone(),
+            propagation_targets: accepted
+                .propagation_targets()
+                .iter()
+                .map(|target| target.exact_location().clone())
+                .collect(),
+        }
+    }
+
+    pub(crate) const fn id(&self) -> usize {
+        self.id
+    }
+
+    pub(crate) fn leader(&self) -> &MzLocation {
+        &self.leader
+    }
+
+    pub(crate) fn propagation_targets(&self) -> &[MzLocation] {
+        &self.propagation_targets
+    }
+}
+
+/// 日志只保留结构化位置和拒绝原因，不复制原文或模型响应。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LoggedUnresolvedTranslationUnit {
+    id: usize,
+    locations: Vec<MzLocation>,
+    reason: TranslationUnitRejectionReason,
+}
+
+impl LoggedUnresolvedTranslationUnit {
+    fn from_unresolved(unresolved: &UnresolvedTranslationUnit) -> Self {
+        let locations = std::iter::once(unresolved.identity().exact_location().clone())
+            .chain(
+                unresolved
+                    .propagation_targets()
+                    .iter()
+                    .map(|target| target.exact_location().clone()),
+            )
+            .collect();
+        Self {
+            id: unresolved.id(),
+            locations,
+            reason: unresolved.reason().clone(),
+        }
+    }
+
+    pub(crate) const fn id(&self) -> usize {
+        self.id
+    }
+
+    pub(crate) fn locations(&self) -> &[MzLocation] {
+        &self.locations
+    }
+
+    pub(crate) fn reason(&self) -> &TranslationUnitRejectionReason {
+        &self.reason
     }
 }
 
@@ -941,10 +1562,11 @@ pub(crate) trait StandardTranslationTaskPlanner: Send + Sync {
     ) -> impl Future<Output = Result<StandardTranslationPlan, Self::Error>> + Send;
 }
 
-/// 执行一个已计划任务并返回可原子提交的验收结果。
+/// 执行一个已计划任务并返回正常业务结果。
 ///
-/// 一次逻辑调用内的 LLM 重试、JSON 整理与 ID 校验、目标语言验收、源文残留检查、
-/// 占位符验证与还原都属于该契约。Executor 不写项目数据库。
+/// 只有可恢复网络请求可以按外部预算重试。模型内容全部、部分或完全没有形成译文
+/// 都由 `TranslationTaskOutcome` 表达，不得转换成错误或阻断其他任务。
+/// Executor 不写项目数据库。
 /// Executor 只能把 TaskBlock 已经建立的完整 `messages` 发送给 LLM；结构化位置、
 /// 表归属、占位符反查和提交身份只用于程序内部验收，不能再拼入提示词。
 pub(crate) trait StandardTranslationTaskExecutor: Send + Sync {
@@ -955,7 +1577,7 @@ pub(crate) trait StandardTranslationTaskExecutor: Send + Sync {
         &self,
         profile: &Self::Profile,
         task: TranslationTaskBlock,
-    ) -> impl Future<Output = Result<ValidatedTranslationTaskResult, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<TranslationTaskOutcome, Self::Error>> + Send;
 }
 
 /// 拥有标准译文准备与单任务提交事务的存储边界。
@@ -980,11 +1602,11 @@ pub(crate) trait StandardTranslationResultStore: Send + Sync {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// 完成项目数据库中标准 MZ 资产翻译的职责契约。
+/// 完成一轮项目数据库标准 MZ 资产翻译的职责契约。
 ///
-/// 成功表示全部标准资产已经完成，或当前没有待翻译资产。一次执行包含多个任务时，
-/// 失败必须保留按确定顺序已经验收并提交的成功前缀；失败任务及其后续任务不得提交。
-/// 本职责拥有它的重试和提交语义；顶层不重试、不推断提交范围，也不回滚已确认的成功前缀。
+/// 成功表示所有计划任务都已经得到正常业务结果并按序完成必要提交，不表示所有原文
+/// 都获得了译文。模型内容不可用和可恢复网络预算耗尽都不会阻断后续任务。
+/// 只有依赖无法继续履行契约时才返回错误。
 pub(crate) trait StandardTranslation: Send + Sync {
     /// 与配置解析器产物一致的执行配置。
     type Profile: Send + Sync + 'static;
@@ -997,44 +1619,53 @@ pub(crate) trait StandardTranslation: Send + Sync {
         project: &StoredProjectRecord,
         profile: &Self::Profile,
         input: StandardTranslationInput,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<StandardTranslationRunReport, Self::Error>> + Send;
 }
 
-/// 使用四个直接能力编排一次标准资产翻译。
-pub(crate) struct StandardTranslationService<R, P, E, S> {
+/// 使用四个业务能力和唯一持久事件日志根编排一次标准资产翻译。
+pub(crate) struct StandardTranslationService<R, P, E, S, J> {
     asset_reader: R,
     task_planner: P,
     task_executor: E,
     result_store: S,
+    event_log: J,
 }
 
-impl<R, P, E, S> StandardTranslationService<R, P, E, S> {
-    pub(crate) fn new(asset_reader: R, task_planner: P, task_executor: E, result_store: S) -> Self {
+impl<R, P, E, S, J> StandardTranslationService<R, P, E, S, J> {
+    pub(crate) fn new(
+        asset_reader: R,
+        task_planner: P,
+        task_executor: E,
+        result_store: S,
+        event_log: J,
+    ) -> Self {
         Self {
             asset_reader,
             task_planner,
             task_executor,
             result_store,
+            event_log,
         }
     }
 }
 
-impl<R, P, E, S> StandardTranslation for StandardTranslationService<R, P, E, S>
+impl<R, P, E, S, J> StandardTranslation for StandardTranslationService<R, P, E, S, J>
 where
     R: StandardTranslationAssetReader,
     P: StandardTranslationTaskPlanner,
     E: StandardTranslationTaskExecutor<Profile = P::Profile>,
     S: StandardTranslationResultStore,
+    J: PersistentEventLog<TranslationLogEvent>,
 {
     type Profile = P::Profile;
-    type Error = StandardTranslationServiceError<R::Error, P::Error, E::Error, S::Error>;
+    type Error = StandardTranslationServiceError<R::Error, P::Error, E::Error, S::Error, J::Error>;
 
     async fn run(
         &self,
         project: &StoredProjectRecord,
         profile: &Self::Profile,
         input: StandardTranslationInput,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<StandardTranslationRunReport, Self::Error> {
         let corpus = self
             .asset_reader
             .read(project)
@@ -1046,6 +1677,7 @@ where
             .await
             .map_err(StandardTranslationServiceError::PlanTasks)?;
         let (preparation, tasks) = plan.into_parts();
+        let mut report = StandardTranslationRunReport::empty(tasks.len());
 
         self.result_store
             .apply_preparation(project, preparation)
@@ -1065,26 +1697,55 @@ where
         .buffered(max_in_flight);
 
         while let Some(result) = results.next().await {
-            let result = result.map_err(|(task_index, source)| {
+            let outcome = result.map_err(|(task_index, source)| {
                 StandardTranslationServiceError::ExecuteTask { task_index, source }
             })?;
-            let task_index = result.task_index();
-            self.result_store
-                .commit(project, result)
+            let task_index = outcome.task_index();
+            if let Some(result) = outcome.validated_result()
+                && let Err(commit_source) = self.result_store.commit(project, result).await
+            {
+                let event = TranslationLogEvent::TaskCommitFailed(
+                    TranslationTaskCommitFailureLogRecord::new(&outcome, commit_source.to_string()),
+                );
+                if let Err(log_source) = self.event_log.append(event).await {
+                    return Err(
+                        StandardTranslationServiceError::CommitTaskAndRecordFailure {
+                            task_index,
+                            commit_source,
+                            log_source,
+                        },
+                    );
+                }
+                return Err(StandardTranslationServiceError::CommitTask {
+                    task_index,
+                    source: commit_source,
+                });
+            }
+
+            report.record(&outcome);
+            self.event_log
+                .append(TranslationLogEvent::TaskProcessed(
+                    TranslationTaskLogRecord::from_outcome(&outcome),
+                ))
                 .await
-                .map_err(|source| StandardTranslationServiceError::CommitTask {
+                .map_err(|source| StandardTranslationServiceError::RecordTaskEvent {
                     task_index,
                     source,
                 })?;
         }
 
-        Ok(())
+        self.event_log
+            .append(TranslationLogEvent::RunCompleted(report.clone()))
+            .await
+            .map_err(StandardTranslationServiceError::RecordRunEvent)?;
+
+        Ok(report)
     }
 }
 
-/// Standard 在四个直接依赖边界上遇到的阶段失败。
+/// Standard 在直接依赖边界上遇到的技术失败。
 #[derive(Debug)]
-pub(crate) enum StandardTranslationServiceError<R, P, E, S> {
+pub(crate) enum StandardTranslationServiceError<R, P, E, S, J> {
     ReadAssets(R),
     PlanTasks(P),
     ApplyPreparation(S),
@@ -1096,14 +1757,25 @@ pub(crate) enum StandardTranslationServiceError<R, P, E, S> {
         task_index: StandardTranslationTaskIndex,
         source: S,
     },
+    CommitTaskAndRecordFailure {
+        task_index: StandardTranslationTaskIndex,
+        commit_source: S,
+        log_source: J,
+    },
+    RecordTaskEvent {
+        task_index: StandardTranslationTaskIndex,
+        source: J,
+    },
+    RecordRunEvent(J),
 }
 
-impl<R, P, E, S> fmt::Display for StandardTranslationServiceError<R, P, E, S>
+impl<R, P, E, S, J> fmt::Display for StandardTranslationServiceError<R, P, E, S, J>
 where
     R: fmt::Display,
     P: fmt::Display,
     E: fmt::Display,
     S: fmt::Display,
+    J: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1118,16 +1790,34 @@ where
             Self::CommitTask { task_index, source } => {
                 write!(formatter, "标准翻译任务 {task_index} 提交失败：{source}")
             }
+            Self::CommitTaskAndRecordFailure {
+                task_index,
+                commit_source,
+                log_source,
+            } => write!(
+                formatter,
+                "标准翻译任务 {task_index} 提交失败且无法记录诊断：提交：{commit_source}；日志：{log_source}"
+            ),
+            Self::RecordTaskEvent { task_index, source } => {
+                write!(
+                    formatter,
+                    "标准翻译任务 {task_index} 无法写入持久日志：{source}"
+                )
+            }
+            Self::RecordRunEvent(source) => {
+                write!(formatter, "标准翻译运行汇总无法写入持久日志：{source}")
+            }
         }
     }
 }
 
-impl<R, P, E, S> Error for StandardTranslationServiceError<R, P, E, S>
+impl<R, P, E, S, J> Error for StandardTranslationServiceError<R, P, E, S, J>
 where
     R: Error + 'static,
     P: Error + 'static,
     E: Error + 'static,
     S: Error + 'static,
+    J: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -1136,6 +1826,8 @@ where
             Self::ApplyPreparation(source) => Some(source),
             Self::ExecuteTask { source, .. } => Some(source),
             Self::CommitTask { source, .. } => Some(source),
+            Self::CommitTaskAndRecordFailure { commit_source, .. } => Some(commit_source),
+            Self::RecordTaskEvent { source, .. } | Self::RecordRunEvent(source) => Some(source),
         }
     }
 }
@@ -1148,6 +1840,9 @@ mod tests {
     use super::*;
     use crate::att_mz::ProjectName;
     use crate::att_mz::text::{MzLocationStep, MzSource, StandardDataFile};
+    use crate::language::{
+        JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageText,
+    };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -1229,6 +1924,7 @@ mod tests {
                 description_identity,
                 Vec::new(),
                 vec![placeholder],
+                test_language_analysis(),
                 vec![terminology],
             )],
         );
@@ -1273,6 +1969,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task_outcome_constructors_reject_every_illegal_state_in_release_builds() {
+        let task_index = StandardTranslationTaskIndex::new(0);
+        assert!(
+            TranslationTaskOutcome::complete(task_index, 1, None, None, Vec::new(), Vec::new())
+                .is_err()
+        );
+        assert!(
+            TranslationTaskOutcome::partial(
+                task_index,
+                1,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            TranslationTaskOutcome::unavailable(
+                task_index,
+                1,
+                None,
+                None,
+                TranslationTaskUnavailableReason::AllOutputsRejected,
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            TranslationTaskOutcome::unavailable(
+                task_index,
+                0,
+                None,
+                None,
+                TranslationTaskUnavailableReason::AllOutputsRejected,
+                vec![UnresolvedTranslationUnit::new(
+                    0,
+                    translation_identity(),
+                    Vec::new(),
+                    TranslationUnitRejectionReason::Missing,
+                )],
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
     #[derive(Clone, Copy)]
     struct FakeProfile {
         max_in_flight_tasks: NonZeroUsize,
@@ -1293,6 +2039,16 @@ mod tests {
         Complete(usize),
         CommitAttempt(usize),
         Commit(usize),
+        LogTask(usize),
+        LogCommitFailure(usize),
+        LogRun,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FakeOutcomeKind {
+        Complete,
+        Partial,
+        Unavailable,
     }
 
     #[derive(Clone)]
@@ -1348,6 +2104,10 @@ mod tests {
 
             let tasks = (0..self.task_count)
                 .map(|index| {
+                    let expected_outputs = vec![
+                        expected_output(index, 0, true),
+                        expected_output(index, 1, false),
+                    ];
                     TranslationTaskBlock::new(
                         StandardTranslationTaskIndex::new(index),
                         TranslationLanguagePair::new("ja", "zh-Hans"),
@@ -1357,7 +2117,7 @@ mod tests {
                             ChatMessageRole::User,
                             format!("# Task {index}"),
                         )],
-                        Vec::new(),
+                        expected_outputs,
                     )
                 })
                 .collect();
@@ -1375,6 +2135,7 @@ mod tests {
         max_active: Arc<AtomicUsize>,
         yields_by_task: Arc<Vec<usize>>,
         fail_at: Option<usize>,
+        outcome_kinds: Arc<Vec<FakeOutcomeKind>>,
     }
 
     impl StandardTranslationTaskExecutor for FakeExecutor {
@@ -1385,7 +2146,7 @@ mod tests {
             &self,
             _profile: &Self::Profile,
             task: TranslationTaskBlock,
-        ) -> Result<ValidatedTranslationTaskResult, Self::Error> {
+        ) -> Result<TranslationTaskOutcome, Self::Error> {
             let task_index = task.index();
             let index = task_index.get();
             record(&self.events, Event::Execute(index));
@@ -1401,7 +2162,14 @@ mod tests {
             if self.fail_at == Some(index) {
                 Err(FakeError("execute"))
             } else {
-                Ok(ValidatedTranslationTaskResult::new(task_index, Vec::new()))
+                Ok(fake_outcome(
+                    task_index,
+                    task.expected_outputs(),
+                    self.outcome_kinds
+                        .get(index)
+                        .copied()
+                        .unwrap_or(FakeOutcomeKind::Complete),
+                ))
             }
         }
     }
@@ -1450,13 +2218,54 @@ mod tests {
         }
     }
 
-    type Service = StandardTranslationService<FakeReader, FakePlanner, FakeExecutor, FakeStore>;
+    #[derive(Clone)]
+    struct FakeEventLog {
+        events: Arc<Mutex<Vec<Event>>>,
+        records: Arc<Mutex<Vec<TranslationLogEvent>>>,
+        fail_task_at: Option<usize>,
+        fail_run: bool,
+    }
+
+    impl PersistentEventLog<TranslationLogEvent> for FakeEventLog {
+        type Error = FakeError;
+
+        async fn append(&self, event: TranslationLogEvent) -> Result<(), Self::Error> {
+            let failure = match &event {
+                TranslationLogEvent::TaskProcessed(task_record) => {
+                    record(&self.events, Event::LogTask(task_record.task_index().get()));
+                    self.fail_task_at == Some(task_record.task_index().get())
+                }
+                TranslationLogEvent::TaskCommitFailed(failure) => {
+                    let task_index = failure.outcome().task_index().get();
+                    record(&self.events, Event::LogCommitFailure(task_index));
+                    self.fail_task_at == Some(task_index)
+                }
+                TranslationLogEvent::RunCompleted(_) => {
+                    record(&self.events, Event::LogRun);
+                    self.fail_run
+                }
+            };
+            self.records
+                .lock()
+                .expect("日志事件记录锁不应中毒")
+                .push(event);
+            if failure {
+                Err(FakeError("log"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    type Service =
+        StandardTranslationService<FakeReader, FakePlanner, FakeExecutor, FakeStore, FakeEventLog>;
 
     struct Harness {
         service: Service,
         events: Arc<Mutex<Vec<Event>>>,
         planner_inputs: Arc<Mutex<Vec<StandardTranslationInput>>>,
         preparations: Arc<Mutex<Vec<TranslationPlanPreparation>>>,
+        log_records: Arc<Mutex<Vec<TranslationLogEvent>>>,
         max_active: Arc<AtomicUsize>,
     }
 
@@ -1495,9 +2304,42 @@ mod tests {
         commit_failure_at: Option<usize>,
         preparation: TranslationPlanPreparation,
     ) -> Harness {
+        harness_with_behavior(
+            task_count,
+            yields_by_task,
+            read_failure,
+            plan_failure,
+            preparation_failure,
+            execute_failure_at,
+            commit_failure_at,
+            preparation,
+            vec![FakeOutcomeKind::Complete; task_count],
+            None,
+            false,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "测试需要独立控制业务结果与各技术失败阶段"
+    )]
+    fn harness_with_behavior(
+        task_count: usize,
+        yields_by_task: Vec<usize>,
+        read_failure: bool,
+        plan_failure: bool,
+        preparation_failure: bool,
+        execute_failure_at: Option<usize>,
+        commit_failure_at: Option<usize>,
+        preparation: TranslationPlanPreparation,
+        outcome_kinds: Vec<FakeOutcomeKind>,
+        log_failure_at: Option<usize>,
+        run_log_failure: bool,
+    ) -> Harness {
         let events = Arc::new(Mutex::new(Vec::new()));
         let planner_inputs = Arc::new(Mutex::new(Vec::new()));
         let preparations = Arc::new(Mutex::new(Vec::new()));
+        let log_records = Arc::new(Mutex::new(Vec::new()));
         let max_active = Arc::new(AtomicUsize::new(0));
         Harness {
             service: StandardTranslationService::new(
@@ -1518,6 +2360,7 @@ mod tests {
                     max_active: Arc::clone(&max_active),
                     yields_by_task: Arc::new(yields_by_task),
                     fail_at: execute_failure_at,
+                    outcome_kinds: Arc::new(outcome_kinds),
                 },
                 FakeStore {
                     events: Arc::clone(&events),
@@ -1525,10 +2368,17 @@ mod tests {
                     fail_preparation: preparation_failure,
                     fail_commit_at: commit_failure_at,
                 },
+                FakeEventLog {
+                    events: Arc::clone(&events),
+                    records: Arc::clone(&log_records),
+                    fail_task_at: log_failure_at,
+                    fail_run: run_log_failure,
+                },
             ),
             events,
             planner_inputs,
             preparations,
+            log_records,
             max_active,
         }
     }
@@ -1537,7 +2387,7 @@ mod tests {
     async fn dispatches_all_stages_and_commits_each_task_in_plan_order() {
         let harness = harness(3, vec![1, 1, 1], false, false, false, None, None);
 
-        harness
+        let report = harness
             .service
             .run(&project(), &profile(2), input())
             .await
@@ -1546,6 +2396,11 @@ mod tests {
         let events = events(&harness.events);
         assert_eq!(&events[..3], &[Event::Read, Event::Plan, Event::Prepare]);
         assert_eq!(committed(&events), vec![0, 1, 2]);
+        assert_eq!(logged_tasks(&events), vec![0, 1, 2]);
+        assert_eq!(events.last(), Some(&Event::LogRun));
+        assert_eq!(report.complete_tasks(), 3);
+        assert_eq!(report.accepted_decisions(), 6);
+        assert_eq!(report.written_locations(), 9);
     }
 
     #[tokio::test]
@@ -1605,7 +2460,24 @@ mod tests {
 
     #[tokio::test]
     async fn commit_failure_preserves_only_the_earlier_committed_prefix() {
-        let harness = harness(4, vec![1; 4], false, false, false, None, Some(1));
+        let harness = harness_with_behavior(
+            4,
+            vec![1; 4],
+            false,
+            false,
+            false,
+            None,
+            Some(1),
+            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            vec![
+                FakeOutcomeKind::Complete,
+                FakeOutcomeKind::Partial,
+                FakeOutcomeKind::Complete,
+                FakeOutcomeKind::Complete,
+            ],
+            None,
+            false,
+        );
 
         let error = harness
             .service
@@ -1623,14 +2495,31 @@ mod tests {
         let events = events(&harness.events);
         assert_eq!(commit_attempts(&events), vec![0, 1]);
         assert_eq!(committed(&events), vec![0]);
+        assert!(events.contains(&Event::LogCommitFailure(1)));
         assert!(!events.contains(&Event::CommitAttempt(2)));
+
+        let records = harness.log_records.lock().expect("日志事件记录锁不应中毒");
+        let failure = records
+            .iter()
+            .find_map(|event| match event {
+                TranslationLogEvent::TaskCommitFailed(failure) => Some(failure),
+                _ => None,
+            })
+            .expect("提交失败时应持久记录已经形成的内容诊断");
+        assert_eq!(failure.outcome().accepted_decisions(), 1);
+        assert_eq!(failure.outcome().confirmed_written_locations(), None);
+        assert!(matches!(
+            failure.outcome().unresolved()[0].reason(),
+            TranslationUnitRejectionReason::Duplicate
+        ));
+        assert_eq!(failure.commit_failure(), "commit");
     }
 
     #[tokio::test]
     async fn empty_plan_still_applies_preparation_without_calling_executor_or_commit() {
         let harness = harness(0, Vec::new(), false, false, false, None, None);
 
-        harness
+        let report = harness
             .service
             .run(&project(), &profile(2), input())
             .await
@@ -1638,8 +2527,9 @@ mod tests {
 
         assert_eq!(
             events(&harness.events),
-            vec![Event::Read, Event::Plan, Event::Prepare]
+            vec![Event::Read, Event::Plan, Event::Prepare, Event::LogRun]
         );
+        assert_eq!(report.total_tasks(), 0);
     }
 
     #[tokio::test]
@@ -1695,8 +2585,180 @@ mod tests {
         );
         assert_eq!(
             events(&harness.events),
-            vec![Event::Read, Event::Plan, Event::Prepare]
+            vec![Event::Read, Event::Plan, Event::Prepare, Event::LogRun]
         );
+    }
+
+    #[tokio::test]
+    async fn partial_and_unavailable_results_are_logged_and_do_not_stop_later_tasks() {
+        let harness = harness_with_behavior(
+            3,
+            vec![1; 3],
+            false,
+            false,
+            false,
+            None,
+            None,
+            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            vec![
+                FakeOutcomeKind::Partial,
+                FakeOutcomeKind::Unavailable,
+                FakeOutcomeKind::Complete,
+            ],
+            None,
+            false,
+        );
+
+        let report = harness
+            .service
+            .run(&project(), &profile(3), input())
+            .await
+            .expect("正常的部分与无可用译文不应中断运行");
+
+        let events = events(&harness.events);
+        assert_eq!(commit_attempts(&events), vec![0, 2]);
+        assert_eq!(logged_tasks(&events), vec![0, 1, 2]);
+        assert_eq!(report.complete_tasks(), 1);
+        assert_eq!(report.partial_tasks(), 1);
+        assert_eq!(report.unavailable_tasks(), 1);
+        assert_eq!(report.accepted_decisions(), 3);
+        assert_eq!(report.unresolved_decisions(), 3);
+        assert_eq!(report.protocol_diagnostics(), 2);
+
+        let records = harness.log_records.lock().expect("日志事件记录锁不应中毒");
+        let TranslationLogEvent::TaskProcessed(partial) = &records[0] else {
+            panic!("首个日志事件应为部分结果");
+        };
+        assert!(matches!(partial.status(), TranslationTaskStatus::Partial));
+        assert_eq!(partial.accepted_decisions(), 1);
+        assert_eq!(partial.confirmed_written_locations(), Some(2));
+        assert_eq!(partial.accepted()[0].id(), 0);
+        assert_eq!(
+            partial.accepted()[0].leader(),
+            expected_output(0, 0, true).identity().exact_location()
+        );
+        assert_eq!(partial.accepted()[0].propagation_targets().len(), 1);
+        assert!(matches!(
+            partial.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::Duplicate
+        ));
+        assert!(matches!(
+            partial.diagnostics()[0],
+            TranslationProtocolDiagnostic::UnknownId { id: 99, .. }
+        ));
+
+        let TranslationLogEvent::TaskProcessed(unavailable) = &records[1] else {
+            panic!("第二个日志事件应为无可用译文结果");
+        };
+        assert!(matches!(
+            unavailable.status(),
+            TranslationTaskStatus::Unavailable(
+                TranslationTaskUnavailableReason::ModelResponseUnusable
+            )
+        ));
+        assert_eq!(unavailable.unresolved().len(), 2);
+        assert!(matches!(
+            unavailable.diagnostics()[0],
+            TranslationProtocolDiagnostic::InvalidJson { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_log_failure_is_a_technical_error_after_the_task_commit() {
+        let harness = harness_with_behavior(
+            3,
+            vec![1; 3],
+            false,
+            false,
+            false,
+            None,
+            None,
+            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            vec![FakeOutcomeKind::Complete; 3],
+            Some(1),
+            false,
+        );
+
+        let error = harness
+            .service
+            .run(&project(), &profile(3), input())
+            .await
+            .expect_err("持久日志失败必须阻断后续任务");
+
+        assert!(matches!(
+            error,
+            StandardTranslationServiceError::RecordTaskEvent {
+                task_index,
+                source: FakeError("log")
+            } if task_index == StandardTranslationTaskIndex::new(1)
+        ));
+        let events = events(&harness.events);
+        assert_eq!(committed(&events), vec![0, 1]);
+        assert!(!events.contains(&Event::CommitAttempt(2)));
+        assert!(!events.contains(&Event::LogRun));
+    }
+
+    #[tokio::test]
+    async fn commit_and_diagnostic_log_failures_are_preserved_together() {
+        let harness = harness_with_behavior(
+            2,
+            vec![1; 2],
+            false,
+            false,
+            false,
+            None,
+            Some(1),
+            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            vec![FakeOutcomeKind::Complete, FakeOutcomeKind::Partial],
+            Some(1),
+            false,
+        );
+
+        let error = harness
+            .service
+            .run(&project(), &profile(2), input())
+            .await
+            .expect_err("提交和诊断日志同时失败必须保留两个原因");
+
+        assert!(matches!(
+            error,
+            StandardTranslationServiceError::CommitTaskAndRecordFailure {
+                task_index,
+                commit_source: FakeError("commit"),
+                log_source: FakeError("log")
+            } if task_index == StandardTranslationTaskIndex::new(1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_summary_log_failure_is_technical_after_all_task_logs() {
+        let harness = harness_with_behavior(
+            1,
+            vec![1],
+            false,
+            false,
+            false,
+            None,
+            None,
+            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            vec![FakeOutcomeKind::Complete],
+            None,
+            true,
+        );
+
+        let error = harness
+            .service
+            .run(&project(), &profile(1), input())
+            .await
+            .expect_err("运行汇总日志失败必须是技术错误");
+
+        assert!(matches!(
+            error,
+            StandardTranslationServiceError::RecordRunEvent(FakeError("log"))
+        ));
+        assert_eq!(committed(&events(&harness.events)), vec![0]);
+        assert_eq!(logged_tasks(&events(&harness.events)), vec![0]);
+        assert!(events(&harness.events).contains(&Event::LogRun));
     }
 
     #[tokio::test]
@@ -1756,17 +2818,132 @@ mod tests {
         )
     }
 
+    fn expected_output(
+        task_index: usize,
+        id: usize,
+        with_propagation_target: bool,
+    ) -> ExpectedTranslationOutput {
+        let identity = translation_identity_at(task_index * 10 + id, "name");
+        let propagation_targets = with_propagation_target
+            .then(|| translation_identity_at(1_000 + task_index * 10 + id, "name"))
+            .into_iter()
+            .collect();
+        ExpectedTranslationOutput::new(
+            id,
+            identity,
+            propagation_targets,
+            Vec::new(),
+            test_language_analysis(),
+            Vec::new(),
+        )
+    }
+
+    fn test_language_analysis() -> LanguageAnalysis {
+        JapaneseLanguageModule::new(
+            JapaneseResidualPolicy::new(
+                NonZeroUsize::new(1).expect("测试残留阈值必须非零"),
+                Vec::new(),
+            )
+            .expect("测试日文残留策略应该有效"),
+            None,
+        )
+        .analyze_source(&LanguageText::natural("宝剑"))
+    }
+
+    fn fake_outcome(
+        task_index: StandardTranslationTaskIndex,
+        expected: &[ExpectedTranslationOutput],
+        kind: FakeOutcomeKind,
+    ) -> TranslationTaskOutcome {
+        let patch = |output: &ExpectedTranslationOutput| {
+            AcceptedTranslationDecision::new(
+                output.id(),
+                TranslationPatch::new(
+                    output.identity().clone(),
+                    output.propagation_targets().to_vec(),
+                    format!("译文 {}", output.id()),
+                    output.terminology_dependencies().to_vec(),
+                ),
+            )
+        };
+        let unresolved = |output: &ExpectedTranslationOutput, reason| {
+            UnresolvedTranslationUnit::new(
+                output.id(),
+                output.identity().clone(),
+                output.propagation_targets().to_vec(),
+                reason,
+            )
+        };
+
+        match kind {
+            FakeOutcomeKind::Complete => TranslationTaskOutcome::complete(
+                task_index,
+                1,
+                Some(format!("request-{}", task_index.get())),
+                Some("stop".to_owned()),
+                expected.iter().map(patch).collect(),
+                Vec::new(),
+            )
+            .expect("完整测试结果必须满足状态不变量"),
+            FakeOutcomeKind::Partial => TranslationTaskOutcome::partial(
+                task_index,
+                1,
+                Some(format!("request-{}", task_index.get())),
+                Some("stop".to_owned()),
+                vec![patch(&expected[0])],
+                vec![unresolved(
+                    &expected[1],
+                    TranslationUnitRejectionReason::Duplicate,
+                )],
+                vec![TranslationProtocolDiagnostic::UnknownId {
+                    item_index: 3,
+                    id: 99,
+                }],
+            )
+            .expect("部分测试结果必须满足状态不变量"),
+            FakeOutcomeKind::Unavailable => TranslationTaskOutcome::unavailable(
+                task_index,
+                1,
+                Some(format!("request-{}", task_index.get())),
+                Some("length".to_owned()),
+                TranslationTaskUnavailableReason::ModelResponseUnusable,
+                expected
+                    .iter()
+                    .map(|output| {
+                        unresolved(
+                            output,
+                            TranslationUnitRejectionReason::InvalidShape {
+                                message: "无法解析模型 JSON".to_owned(),
+                            },
+                        )
+                    })
+                    .collect(),
+                vec![TranslationProtocolDiagnostic::InvalidJson {
+                    message: "无法解析模型 JSON".to_owned(),
+                }],
+            )
+            .expect("不可用测试结果必须满足状态不变量"),
+        }
+    }
+
     fn translation_identity() -> TranslationLeafIdentity {
+        translation_identity_at(10, "name")
+    }
+
+    fn translation_identity_at(index: usize, field_name: &str) -> TranslationLeafIdentity {
         let group_location = MzLocation::value(
             MzSource::data(StandardDataFile::Items),
-            vec![MzLocationStep::index(10)],
+            vec![MzLocationStep::index(index)],
         );
         TranslationLeafIdentity::new(
             TextGroupKind::DatabaseEntry,
             group_location,
             MzLocation::value(
                 MzSource::data(StandardDataFile::Items),
-                vec![MzLocationStep::index(10), MzLocationStep::key("name")],
+                vec![
+                    MzLocationStep::index(index),
+                    MzLocationStep::key(field_name),
+                ],
             ),
             "宝剑",
         )
@@ -1819,6 +2996,16 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Complete(index) => Some(*index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn logged_tasks(events: &[Event]) -> Vec<usize> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::LogTask(index) => Some(*index),
                 _ => None,
             })
             .collect()

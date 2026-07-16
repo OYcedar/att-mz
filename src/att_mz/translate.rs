@@ -7,7 +7,7 @@ use super::ProjectName;
 mod asset_reader;
 mod deduplication;
 pub(crate) mod executor;
-mod language;
+mod language_projection;
 mod lua;
 mod placeholder;
 mod planner;
@@ -33,11 +33,30 @@ pub struct TranslateInput {
     pub lua_script: Option<PathBuf>,
 }
 
-/// 翻译成功后交还给 CLI 的最小结果。
+/// 一轮标准翻译的正常业务汇总。
+///
+/// 剩余译文大于零仍然表示命令正常完成；调用方不得把部分产出或未产出升级为错误。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandardTranslationSummary {
+    pub total_tasks: usize,
+    pub complete_tasks: usize,
+    pub partial_tasks: usize,
+    pub unavailable_tasks: usize,
+    pub accepted_decisions: usize,
+    pub written_locations: usize,
+    pub remaining_decisions: usize,
+    pub remaining_locations: usize,
+    pub protocol_diagnostics: usize,
+    pub recoverable_request_exhaustions: usize,
+}
+
+/// 翻译命令正常完成后交还给 CLI 的结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranslateOutput {
     pub name: ProjectName,
     pub llm_id: String,
+    pub standard: StandardTranslationSummary,
+    pub lua_executed: bool,
 }
 
 /// 完成一个 MZ 游戏翻译用例。

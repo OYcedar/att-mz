@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use super::lua::LuaTranslation;
 use super::profile::TranslationExecutionProfileResolver;
 use super::standard::{StandardTranslation, StandardTranslationInput};
-use super::{TranslateInput, TranslateOutput, TranslateUseCase};
+use super::{StandardTranslationSummary, TranslateInput, TranslateOutput, TranslateUseCase};
 use crate::att_mz::ProjectName;
 use crate::project_database::ProjectDatabaseRecordReader;
 
@@ -70,7 +70,8 @@ where
             }
         })?;
 
-        self.standard_translation
+        let standard_report = self
+            .standard_translation
             .run(
                 &project,
                 &profile,
@@ -79,7 +80,7 @@ where
             .await
             .map_err(|source| TranslateServiceError::Standard { source })?;
 
-        if let Some(script_path) = lua_script {
+        let lua_executed = if let Some(script_path) = lua_script {
             let error_path = script_path.clone();
             self.lua_translation
                 .run(&project, &profile, script_path)
@@ -88,9 +89,28 @@ where
                     script_path: error_path,
                     source,
                 })?;
-        }
+            true
+        } else {
+            false
+        };
 
-        Ok(TranslateOutput { name, llm_id })
+        Ok(TranslateOutput {
+            name,
+            llm_id,
+            standard: StandardTranslationSummary {
+                total_tasks: standard_report.total_tasks(),
+                complete_tasks: standard_report.complete_tasks(),
+                partial_tasks: standard_report.partial_tasks(),
+                unavailable_tasks: standard_report.unavailable_tasks(),
+                accepted_decisions: standard_report.accepted_decisions(),
+                written_locations: standard_report.written_locations(),
+                remaining_decisions: standard_report.unresolved_decisions(),
+                remaining_locations: standard_report.unresolved_locations(),
+                protocol_diagnostics: standard_report.protocol_diagnostics(),
+                recoverable_request_exhaustions: standard_report.recoverable_request_exhaustions(),
+            },
+            lua_executed,
+        })
     }
 }
 
@@ -153,6 +173,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::att_mz::text::{
+        MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
+    };
+    use crate::att_mz::translate::standard::{
+        StandardTranslationRunReport, StandardTranslationTaskIndex, TranslationLeafIdentity,
+        TranslationTaskOutcome, TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
+        UnresolvedTranslationUnit,
+    };
     use crate::project_database::StoredProjectRecord;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,7 +287,7 @@ mod tests {
             project: &StoredProjectRecord,
             profile: &Self::Profile,
             input: StandardTranslationInput,
-        ) -> Result<(), Self::Error> {
+        ) -> Result<StandardTranslationRunReport, Self::Error> {
             self.events
                 .lock()
                 .expect("事件记录锁不应中毒")
@@ -272,7 +300,7 @@ mod tests {
             if self.failure == Some(Failure::Standard) {
                 Err(FakeError("standard"))
             } else {
-                Ok(())
+                Ok(unavailable_report())
             }
         }
     }
@@ -372,6 +400,53 @@ mod tests {
         )
     }
 
+    fn unavailable_report() -> StandardTranslationRunReport {
+        let source = MzSource::data(StandardDataFile::Items);
+        let group_location = MzLocation::value(source.clone(), vec![MzLocationStep::index(1)]);
+        let identity = TranslationLeafIdentity::new(
+            TextGroupKind::DatabaseEntry,
+            group_location,
+            MzLocation::value(
+                source,
+                vec![MzLocationStep::index(1), MzLocationStep::key("name")],
+            ),
+            "宝剑",
+        );
+        let outcome = TranslationTaskOutcome::unavailable(
+            StandardTranslationTaskIndex::new(0),
+            1,
+            Some("request-1".to_owned()),
+            Some("stop".to_owned()),
+            TranslationTaskUnavailableReason::AllOutputsRejected,
+            vec![UnresolvedTranslationUnit::new(
+                0,
+                identity,
+                Vec::new(),
+                TranslationUnitRejectionReason::Missing,
+            )],
+            Vec::new(),
+        )
+        .expect("测试不可用结果必须满足状态不变量");
+        let mut report = StandardTranslationRunReport::empty(1);
+        report.record(&outcome);
+        report
+    }
+
+    fn expected_summary() -> StandardTranslationSummary {
+        StandardTranslationSummary {
+            total_tasks: 1,
+            complete_tasks: 0,
+            partial_tasks: 0,
+            unavailable_tasks: 1,
+            accepted_decisions: 0,
+            written_locations: 0,
+            remaining_decisions: 1,
+            remaining_locations: 1,
+            protocol_diagnostics: 0,
+            recoverable_request_exhaustions: 0,
+        }
+    }
+
     fn events(events: &Arc<Mutex<Vec<Event>>>) -> Vec<Event> {
         events.lock().expect("事件记录锁不应中毒").clone()
     }
@@ -388,6 +463,8 @@ mod tests {
 
         assert_eq!(output.name, project_name());
         assert_eq!(output.llm_id, "quality-profile");
+        assert_eq!(output.standard, expected_summary());
+        assert!(output.lua_executed);
         assert_eq!(
             events(&recorded),
             vec![
@@ -411,10 +488,13 @@ mod tests {
     async fn omits_only_the_unselected_lua_stage() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
 
-        service(Arc::clone(&recorded), None)
+        let output = service(Arc::clone(&recorded), None)
             .execute(input(None))
             .await
             .expect("没有 Lua 的标准翻译应该成功");
+
+        assert_eq!(output.standard, expected_summary());
+        assert!(!output.lua_executed);
 
         assert_eq!(
             events(&recorded),

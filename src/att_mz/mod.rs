@@ -134,9 +134,22 @@ where
                     Ok(output) => {
                         writeln!(
                             stdout,
-                            "翻译完成：{}（LLM：{}）",
+                            "翻译执行完成：{}（LLM：{}）",
                             output.name, output.llm_id
                         )?;
+                        writeln!(
+                            stdout,
+                            "标准翻译：任务 {}，完整 {}，部分 {}，不可用 {}；写入 {} 处，剩余 {} 处",
+                            output.standard.total_tasks,
+                            output.standard.complete_tasks,
+                            output.standard.partial_tasks,
+                            output.standard.unavailable_tasks,
+                            output.standard.written_locations,
+                            output.standard.remaining_locations,
+                        )?;
+                        if output.lua_executed {
+                            writeln!(stdout, "Lua 翻译：已执行")?;
+                        }
                         Ok(ExitCode::SUCCESS)
                     }
                     Err(error) => render_use_case_error(error, stderr),

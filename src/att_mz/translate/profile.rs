@@ -106,24 +106,27 @@ impl MzTranslationPlanningConfiguration {
 /// 单任务模型执行阶段全部由外部明确提供的配置。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MzTranslationExecutionConfiguration {
-    retry_delays: Vec<Duration>,
-    max_retry_after: Duration,
+    network_retry_delays: Vec<Duration>,
+    max_network_retry_after: Duration,
 }
 
 impl MzTranslationExecutionConfiguration {
-    pub(crate) fn new(retry_delays: Vec<Duration>, max_retry_after: Duration) -> Self {
+    pub(crate) fn new(
+        network_retry_delays: Vec<Duration>,
+        max_network_retry_after: Duration,
+    ) -> Self {
         Self {
-            retry_delays,
-            max_retry_after,
+            network_retry_delays,
+            max_network_retry_after,
         }
     }
 
-    pub(crate) fn retry_delays(&self) -> &[Duration] {
-        &self.retry_delays
+    pub(crate) fn network_retry_delays(&self) -> &[Duration] {
+        &self.network_retry_delays
     }
 
-    pub(crate) const fn max_retry_after(&self) -> Duration {
-        self.max_retry_after
+    pub(crate) const fn max_network_retry_after(&self) -> Duration {
+        self.max_network_retry_after
     }
 }
 
@@ -642,11 +645,11 @@ mod tests {
             Some("# 完整系统提示词")
         );
         assert_eq!(
-            payload.execution().retry_delays(),
+            payload.execution().network_retry_delays(),
             [Duration::from_millis(250), Duration::from_secs(2)]
         );
         assert_eq!(
-            payload.execution().max_retry_after(),
+            payload.execution().max_network_retry_after(),
             Duration::from_secs(30)
         );
         assert!(payload.llm() == &SensitivePayload("secret"));

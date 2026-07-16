@@ -2,5 +2,7 @@
 
 pub mod att_mz;
 
+mod language;
+mod observability;
 mod project_database;
 mod storage;
