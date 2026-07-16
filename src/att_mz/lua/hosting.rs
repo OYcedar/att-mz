@@ -716,10 +716,11 @@ mod tests {
     fn project() -> LuaProjectContext {
         LuaProjectContext::from_stored_record(&StoredProjectRecord::new(
             "alice".parse::<ProjectName>().expect("项目名应合法"),
-            PathBuf::from("C:/games/alice"),
-            PathBuf::from("C:/projects/alice.db"),
+            PathBuf::from("C:/projects/alice"),
+            PathBuf::from("C:/projects/alice/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         ))
     }
 
@@ -762,7 +763,7 @@ mod tests {
         assert_eq!(events[0], Event::Read(PathBuf::from("translate.lua")));
         assert_eq!(
             events[1],
-            Event::Open(PathBuf::from("C:/projects/alice.db"))
+            Event::Open(PathBuf::from("C:/projects/alice/project.db"))
         );
         assert!(matches!(
             &events[2],

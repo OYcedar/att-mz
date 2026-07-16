@@ -1440,10 +1440,11 @@ mod tests {
     fn project() -> OpenedProject {
         OpenedProject::new(
             "示例项目".parse().expect("测试项目名称应该合法"),
-            "C:/Games/Demo".into(),
-            "C:/att/示例项目.db".into(),
+            "C:/att/示例项目".into(),
+            "C:/att/示例项目/project.db".into(),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         )
     }
 

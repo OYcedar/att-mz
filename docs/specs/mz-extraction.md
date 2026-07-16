@@ -24,6 +24,10 @@ Lua（若选择）
 跨阶段的全局回滚。阶段内部的只读 I/O 和纯 CPU 工作可以有界并发，不改变这个提交
 顺序。
 
+项目按 `<projects_root>/<name>/project.db` 定位。开启边界读取 metadata，并重新确认
+同一工作区内的 `source/data` 与 `source/js` 仍是目录；它不保存、解析或重新访问 Init
+时的原游戏路径。Builtin、Rules 和 Lua Extract 因而共同看到 Init 导入的冻结副本。
+
 ## 2. 标准快照如何表达文本
 
 Builtin 与 Rules 使用相同的复合文本模型，但分别提交自己的快照：
@@ -190,7 +194,7 @@ Builtin 和 Rules 各自只替换自己拥有的叶子，不删除另一来源�
 按请求顺序组装完整文档集
 ```
 
-`all_maps` 只列举一次 `game_root/data`。标准文件、标准 Map 与 `plugins.js` 可以并发
+`all_maps` 只列举一次 `source/data`。标准文件、标准 Map 与 `source/js/plugins.js` 可以并发
 读取；读取失败不返回部分文档。JSON 与 `plugins.js` 外壳解析都经 `CpuTaskExecutor`
 执行，不占用异步 I/O 执行器线程。`buffered` 同时提供阶段背压、首错与稳定顺序。
 
@@ -214,7 +218,7 @@ SQLite 事务计划必须完全一致。
 
 | 外部配置项 | 注入位置 |
 |---|---|
-| `projects.database_root` | 项目数据库创建与记录读取服务 |
+| `projects.root` | 项目工作区创建与项目数据库记录读取服务 |
 | `extract.document.read_concurrency` | `MzDocumentReadingConfig` |
 | `extract.document.parse_concurrency` | `MzDocumentReadingConfig` |
 | `extract.builtin.scan_concurrency` | `BuiltInExtractionConfig` |
@@ -253,7 +257,8 @@ SQLite 适配器与 Lua Host 打开项目数据库时必须接收同一连接策
 ## 8. Lua 信任边界
 
 Lua 是用户明确选择并完全信任的本机程序，不建立沙箱。Rust 只向可信宿主提交脚本
-路径、业务阶段和完整项目事实；宿主使用同一个项目数据库并注入 `ctx.db`。
+路径、业务阶段和完整项目事实；其中项目源目录同样是工作区内的冻结 `source/`。宿主
+使用同一个项目数据库并注入 `ctx.db`，不会重新访问原游戏目录。
 
 Lua 自己拥有 schema、数据身份、译文继承、事务划分和跨阶段协议。Rust 不扫描、
 解释、迁移或默认消费 Lua 产物；没有相应阶段的 Lua 脚本时，标准翻译和写回不会
@@ -269,7 +274,7 @@ flowchart TD
     ES --> LS["LuaExtractionService"]
 
     OS --> PR["ProjectDatabaseRecordReadingService"]
-    OS --> EDR["ExistingDirectoryResolver · 根接口"]
+    OS --> EDR["ExistingDirectoryResolver · 根接口<br/>确认 source/data 与 source/js"]
     PR --> SQ["SqliteQueryExecutor · 根接口"]
 
     BS --> DR["MzProjectDocumentReadingService"]

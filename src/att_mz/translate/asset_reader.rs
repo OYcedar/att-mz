@@ -887,7 +887,7 @@ mod tests {
 
         let calls = harness.query_calls.lock().expect("查询调用锁不应中毒");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, PathBuf::from("C:/projects/demo.db"));
+        assert_eq!(calls[0].0, PathBuf::from("C:/projects/demo/project.db"));
         assert_eq!(calls[0].1.statement(), READ_STANDARD_ASSETS);
         assert!(calls[0].1.statement().matches("UNION ALL").count() == 4);
         assert_eq!(corpus.groups().len(), 1);
@@ -996,13 +996,13 @@ mod tests {
                 .expect_err("查询错误应该传播");
             match error {
                 MzStandardTranslationAssetReadingError::DatabaseNotFound { database_path } => {
-                    assert_eq!(database_path, PathBuf::from("C:/projects/demo.db"));
+                    assert_eq!(database_path, PathBuf::from("C:/projects/demo/project.db"));
                 }
                 MzStandardTranslationAssetReadingError::Query {
                     database_path,
                     source,
                 } => {
-                    assert_eq!(database_path, PathBuf::from("C:/projects/demo.db"));
+                    assert_eq!(database_path, PathBuf::from("C:/projects/demo/project.db"));
                     assert_eq!(source, FakeError("read"));
                 }
                 other => panic!("未预期的读取错误：{other}"),
@@ -1080,10 +1080,11 @@ mod tests {
     fn project() -> StoredProjectRecord {
         StoredProjectRecord::new(
             "demo".parse::<ProjectName>().expect("项目名称应该有效"),
-            PathBuf::from("C:/games/demo"),
-            PathBuf::from("C:/projects/demo.db"),
+            PathBuf::from("C:/projects/demo"),
+            PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         )
     }
 

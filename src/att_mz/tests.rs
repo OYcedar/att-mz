@@ -13,8 +13,22 @@ use super::MzCli;
 use super::ProjectName;
 use super::extract::{ExtractInput, ExtractOutput, ExtractUseCase, ExtractionSelection};
 use super::init::{InitInput, InitOutput, InitUseCase};
-use super::translate::{TranslateInput, TranslateOutput, TranslateUseCase};
-use super::write_back::{WriteBackInput, WriteBackOutput, WriteBackUseCase};
+use super::project::{MaxFullwidthChars, MzWriteBackLayoutProfile};
+use super::translate::{
+    StandardTranslationSummary, TranslateInput, TranslateOutput, TranslateUseCase,
+};
+use super::write_back::{
+    StandardWriteBackSummary, WriteBackInput, WriteBackOutput, WriteBackUseCase,
+};
+
+const LAYOUT_WIDTH_ARGS: [&str; 6] = [
+    "--dialogue-max-fullwidth-chars",
+    "24",
+    "--scrolling-text-max-fullwidth-chars",
+    "30",
+    "--help-description-max-fullwidth-chars",
+    "18",
+];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Calls {
@@ -99,6 +113,7 @@ impl TranslateUseCase for FakeTranslate {
 
         async move {
             yield_once().await;
+            let lua_executed = input.lua_script.is_some();
             calls
                 .lock()
                 .expect("调用记录锁不应中毒")
@@ -108,6 +123,8 @@ impl TranslateUseCase for FakeTranslate {
             Ok(TranslateOutput {
                 name: input.name,
                 llm_id: input.llm_id,
+                standard: translation_summary(),
+                lua_executed,
             })
         }
     }
@@ -116,6 +133,7 @@ impl TranslateUseCase for FakeTranslate {
 #[derive(Clone)]
 struct FakeWriteBack {
     calls: Arc<Mutex<Calls>>,
+    failure: Option<&'static str>,
 }
 
 impl WriteBackUseCase for FakeWriteBack {
@@ -126,15 +144,28 @@ impl WriteBackUseCase for FakeWriteBack {
         input: WriteBackInput,
     ) -> impl Future<Output = Result<WriteBackOutput, Self::Error>> + Send {
         let calls = Arc::clone(&self.calls);
+        let failure = self.failure;
 
         async move {
             yield_once().await;
+            let output_root = PathBuf::from(".\\projects")
+                .join(input.name.to_string())
+                .join("write_back");
+            let lua_executed = input.lua_script.is_some();
             calls
                 .lock()
                 .expect("调用记录锁不应中毒")
                 .write_back
                 .push(input.clone());
-            Ok(WriteBackOutput { name: input.name })
+            if let Some(message) = failure {
+                return Err(FakeError(message));
+            }
+            Ok(WriteBackOutput {
+                name: input.name,
+                output_root,
+                standard: write_back_summary(),
+                lua_executed,
+            })
         }
     }
 }
@@ -168,6 +199,40 @@ fn project_name(value: &str) -> ProjectName {
     value.parse().expect("测试项目名称应该合法")
 }
 
+fn translation_summary() -> StandardTranslationSummary {
+    StandardTranslationSummary {
+        total_tasks: 4,
+        complete_tasks: 2,
+        partial_tasks: 1,
+        unavailable_tasks: 1,
+        accepted_decisions: 5,
+        written_locations: 7,
+        remaining_decisions: 2,
+        remaining_locations: 3,
+        protocol_diagnostics: 4,
+        recoverable_request_exhaustions: 1,
+    }
+}
+
+fn layout_profile() -> MzWriteBackLayoutProfile {
+    MzWriteBackLayoutProfile::new(
+        MaxFullwidthChars::new(24).expect("测试对话宽度应该合法"),
+        MaxFullwidthChars::new(30).expect("测试滚动文本宽度应该合法"),
+        MaxFullwidthChars::new(18).expect("测试说明框宽度应该合法"),
+    )
+}
+
+fn write_back_summary() -> StandardWriteBackSummary {
+    StandardWriteBackSummary {
+        translated_locations: 7,
+        original_locations: 3,
+        auto_wrapped_units: 2,
+        inserted_line_breaks: 4,
+        inserted_fullwidth_indents: 5,
+        manual_layout_units: 1,
+    }
+}
+
 fn selection(
     builtin: bool,
     rules_path: Option<&str>,
@@ -193,7 +258,10 @@ fn cli(calls: Arc<Mutex<Calls>>) -> MzCli<FakeInit, FakeExtract, FakeTranslate, 
         FakeTranslate {
             calls: Arc::clone(&calls),
         },
-        FakeWriteBack { calls },
+        FakeWriteBack {
+            calls,
+            failure: None,
+        },
     )
 }
 
@@ -253,6 +321,21 @@ async fn extract_help_lists_all_combinable_task_options_without_calling_use_case
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn init_help_lists_all_required_layout_widths_without_calling_use_case() {
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let cli = cli(Arc::clone(&calls));
+
+    let (exit_code, stdout, stderr) = run(&cli, &["init", "--help"]).await;
+
+    assert_eq!(exit_code, ExitCode::SUCCESS);
+    assert!(stdout.contains("--dialogue-max-fullwidth-chars <COUNT>"));
+    assert!(stdout.contains("--scrolling-text-max-fullwidth-chars <COUNT>"));
+    assert!(stdout.contains("--help-description-max-fullwidth-chars <COUNT>"));
+    assert!(stderr.is_empty());
+    assert_eq!(*calls.lock().expect("调用记录锁不应中毒"), Calls::default());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn translate_help_lists_optional_input_files_without_calling_use_case() {
     let calls = Arc::new(Mutex::new(Calls::default()));
     let cli = cli(Arc::clone(&calls));
@@ -284,6 +367,12 @@ async fn init_dispatches_all_confirmed_inputs_to_init_only() {
             "ja",
             "--target-language",
             "zh-Hans",
+            "--dialogue-max-fullwidth-chars",
+            "24",
+            "--scrolling-text-max-fullwidth-chars",
+            "30",
+            "--help-description-max-fullwidth-chars",
+            "18",
         ],
     )
     .await;
@@ -299,10 +388,55 @@ async fn init_dispatches_all_confirmed_inputs_to_init_only() {
                 game_root: PathBuf::from(".\\Game One"),
                 source_language: "ja".to_owned(),
                 target_language: "zh-Hans".to_owned(),
+                layout_profile: layout_profile(),
             }],
             ..Calls::default()
         }
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn init_requires_positive_layout_widths_before_calling_use_case() {
+    let base_args = [
+        "init",
+        "--name",
+        "alice",
+        "--path",
+        ".\\Game",
+        "--source-language",
+        "ja",
+        "--target-language",
+        "zh-Hans",
+    ];
+
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let command = cli(Arc::clone(&calls));
+    let (exit_code, stdout, stderr) = run(&command, &base_args).await;
+    assert_eq!(exit_code, ExitCode::from(2));
+    assert!(stdout.is_empty());
+    assert!(!stderr.is_empty());
+    assert_eq!(*calls.lock().expect("调用记录锁不应中毒"), Calls::default());
+
+    for (invalid_value_index, invalid_value) in [(1, "0"), (3, "0"), (5, "0"), (1, "not-a-number")]
+    {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let cli = cli(Arc::clone(&calls));
+        let mut args = base_args.to_vec();
+        let mut layout_args = LAYOUT_WIDTH_ARGS;
+        layout_args[invalid_value_index] = invalid_value;
+        args.extend(layout_args);
+
+        let (exit_code, stdout, stderr) = run(&cli, &args).await;
+
+        assert_eq!(exit_code, ExitCode::from(2), "参数：{args:?}");
+        assert!(stdout.is_empty(), "参数：{args:?}");
+        assert!(!stderr.is_empty(), "参数：{args:?}");
+        assert_eq!(
+            *calls.lock().expect("调用记录锁不应中毒"),
+            Calls::default(),
+            "参数：{args:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -426,7 +560,13 @@ async fn translate_dispatches_name_and_llm_id_to_async_use_case_only() {
         run(&cli, &["translate", "--name", "alice", "deepseek"]).await;
 
     assert_eq!(exit_code, ExitCode::SUCCESS);
-    assert_eq!(stdout, "翻译完成：alice（LLM：deepseek）\n");
+    assert_eq!(
+        stdout,
+        concat!(
+            "翻译执行完成：alice（LLM：deepseek）\n",
+            "标准翻译：任务 4，完整 2，部分 1，不可用 1；写入 7 处，剩余 3 处\n",
+        )
+    );
     assert!(stderr.is_empty());
     assert_eq!(
         *calls.lock().expect("调用记录锁不应中毒"),
@@ -483,10 +623,24 @@ async fn translate_passes_all_optional_paths_exactly_and_ignores_argument_order(
     .await;
 
     assert_eq!(first_exit_code, ExitCode::SUCCESS);
-    assert_eq!(first_stdout, "翻译完成：alice（LLM：deepseek）\n");
+    assert_eq!(
+        first_stdout,
+        concat!(
+            "翻译执行完成：alice（LLM：deepseek）\n",
+            "标准翻译：任务 4，完整 2，部分 1，不可用 1；写入 7 处，剩余 3 处\n",
+            "Lua 翻译：已执行\n",
+        )
+    );
     assert!(first_stderr.is_empty());
     assert_eq!(second_exit_code, ExitCode::SUCCESS);
-    assert_eq!(second_stdout, "翻译完成：alice（LLM：deepseek）\n");
+    assert_eq!(
+        second_stdout,
+        concat!(
+            "翻译执行完成：alice（LLM：deepseek）\n",
+            "标准翻译：任务 4，完整 2，部分 1，不可用 1；写入 7 处，剩余 3 处\n",
+            "Lua 翻译：已执行\n",
+        )
+    );
     assert!(second_stderr.is_empty());
 
     let expected = TranslateInput {
@@ -510,7 +664,16 @@ async fn write_back_dispatches_name_to_write_back_only() {
     let (exit_code, stdout, stderr) = run(&cli, &["write-back", "--name", "alice"]).await;
 
     assert_eq!(exit_code, ExitCode::SUCCESS);
-    assert_eq!(stdout, "写回完成：alice\n");
+    assert_eq!(
+        stdout,
+        concat!(
+            "写回完成：alice\n",
+            "输出目录：.\\projects\\alice\\write_back\n",
+            "标准写回：应用译文 7 处，保留原文 3 处；自动换行 2 段，新增换行 4 处；续行全角缩进 5 处；需人工换行 1 段\n",
+            "人工处理：1 段文本需要手动换行\n",
+            "Lua 写回：未执行\n",
+        )
+    );
     assert!(stderr.is_empty());
     assert_eq!(
         *calls.lock().expect("调用记录锁不应中毒"),
@@ -525,7 +688,7 @@ async fn write_back_dispatches_name_to_write_back_only() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn write_back_passes_optional_lua_script_without_changing_output() {
+async fn write_back_passes_optional_lua_script_and_reports_execution() {
     let calls = Arc::new(Mutex::new(Calls::default()));
     let cli = cli(Arc::clone(&calls));
 
@@ -542,7 +705,16 @@ async fn write_back_passes_optional_lua_script_without_changing_output() {
     .await;
 
     assert_eq!(exit_code, ExitCode::SUCCESS);
-    assert_eq!(stdout, "写回完成：alice\n");
+    assert_eq!(
+        stdout,
+        concat!(
+            "写回完成：alice\n",
+            "输出目录：.\\projects\\alice\\write_back\n",
+            "标准写回：应用译文 7 处，保留原文 3 处；自动换行 2 段，新增换行 4 处；续行全角缩进 5 处；需人工换行 1 段\n",
+            "人工处理：1 段文本需要手动换行\n",
+            "Lua 写回：已执行\n",
+        )
+    );
     assert!(stderr.is_empty());
     assert_eq!(
         calls.lock().expect("调用记录锁不应中毒").write_back,
@@ -564,6 +736,12 @@ async fn every_command_requires_a_non_blank_name() {
             "ja",
             "--target-language",
             "zh-Hans",
+            "--dialogue-max-fullwidth-chars",
+            "24",
+            "--scrolling-text-max-fullwidth-chars",
+            "30",
+            "--help-description-max-fullwidth-chars",
+            "18",
         ],
         &["extract", "--builtin"],
         &["translate", "deepseek"],
@@ -636,8 +814,8 @@ async fn extract_requires_at_least_one_complete_non_blank_task_selection() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn init_requires_a_non_blank_path_and_languages() {
-    let invalid_commands: &[&[&str]] = &[
-        &[
+    let invalid_commands = [
+        vec![
             "init",
             "--name",
             "alice",
@@ -646,7 +824,7 @@ async fn init_requires_a_non_blank_path_and_languages() {
             "--target-language",
             "zh-Hans",
         ],
-        &[
+        vec![
             "init",
             "--name",
             "alice",
@@ -655,7 +833,7 @@ async fn init_requires_a_non_blank_path_and_languages() {
             "--target-language",
             "zh-Hans",
         ],
-        &[
+        vec![
             "init",
             "--name",
             "alice",
@@ -664,7 +842,7 @@ async fn init_requires_a_non_blank_path_and_languages() {
             "--source-language",
             "ja",
         ],
-        &[
+        vec![
             "init",
             "--name",
             "alice",
@@ -677,10 +855,11 @@ async fn init_requires_a_non_blank_path_and_languages() {
         ],
     ];
 
-    for args in invalid_commands {
+    for mut args in invalid_commands {
+        args.extend(LAYOUT_WIDTH_ARGS);
         let calls = Arc::new(Mutex::new(Calls::default()));
         let cli = cli(Arc::clone(&calls));
-        let (exit_code, stdout, stderr) = run(&cli, args).await;
+        let (exit_code, stdout, stderr) = run(&cli, &args).await;
 
         assert_eq!(exit_code, ExitCode::from(2), "参数：{args:?}");
         assert!(stdout.is_empty(), "参数：{args:?}");
@@ -755,6 +934,7 @@ async fn use_case_failure_is_written_to_stderr_with_exit_code_one() {
         },
         FakeWriteBack {
             calls: Arc::clone(&calls),
+            failure: None,
         },
     );
 
@@ -769,6 +949,47 @@ async fn use_case_failure_is_written_to_stderr_with_exit_code_one() {
         vec![ExtractInput {
             name: project_name("missing"),
             selection: selection(true, None, None),
+        }]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_back_failure_is_written_to_stderr_with_exit_code_one() {
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let cli = MzCli::new(
+        FakeInit {
+            calls: Arc::clone(&calls),
+        },
+        FakeExtract {
+            calls: Arc::clone(&calls),
+            failure: None,
+        },
+        FakeTranslate {
+            calls: Arc::clone(&calls),
+        },
+        FakeWriteBack {
+            calls: Arc::clone(&calls),
+            failure: Some("Lua 写回失败（脚本：write.lua，已发布输出：demo/write_back）"),
+        },
+    );
+
+    let (exit_code, stdout, stderr) = run(
+        &cli,
+        &["write-back", "--name", "demo", "--lua", "write.lua"],
+    )
+    .await;
+
+    assert_eq!(exit_code, ExitCode::FAILURE);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        stderr,
+        "错误：Lua 写回失败（脚本：write.lua，已发布输出：demo/write_back）\n"
+    );
+    assert_eq!(
+        calls.lock().expect("调用记录锁不应中毒").write_back,
+        vec![WriteBackInput {
+            name: project_name("demo"),
+            lua_script: Some(PathBuf::from("write.lua")),
         }]
     );
 }

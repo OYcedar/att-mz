@@ -1693,10 +1693,11 @@ mod tests {
     fn project() -> StoredProjectRecord {
         StoredProjectRecord::new(
             "demo".parse::<ProjectName>().expect("项目名称应该有效"),
-            PathBuf::from("C:/games/demo"),
-            PathBuf::from("C:/projects/demo.db"),
+            PathBuf::from("C:/projects/demo"),
+            PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         )
     }
 

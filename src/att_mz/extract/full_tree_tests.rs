@@ -156,15 +156,20 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
         path: PathBuf,
         query: SqliteQuery,
     ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>> {
-        assert_eq!(path, PathBuf::from("C:/Projects/demo.db"));
+        assert_eq!(
+            path,
+            PathBuf::from("C:/Projects").join("demo").join("project.db")
+        );
         assert!(query.statement().contains("FROM metadata"));
         assert!(query.parameters().is_empty());
         self.queries.fetch_add(1, Ordering::Relaxed);
         Ok(vec![SqliteRow::new(vec![
             SqliteValue::Text("demo".to_owned()),
-            SqliteValue::Text("./Demo".to_owned()),
             SqliteValue::Text("ja".to_owned()),
             SqliteValue::Text("zh-Hans".to_owned()),
+            SqliteValue::Integer(24),
+            SqliteValue::Integer(30),
+            SqliteValue::Integer(18),
         ])])
     }
 }
@@ -183,7 +188,10 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
         path: PathBuf,
         plan: SqliteTransactionPlan,
     ) -> Result<(), ExecuteTransactionError<Self::Error>> {
-        assert_eq!(path, PathBuf::from("C:/Projects/demo.db"));
+        assert_eq!(
+            path,
+            PathBuf::from("C:/Projects").join("demo").join("project.db")
+        );
         let owner = transaction_owner(&plan);
         let event = match owner {
             "builtin" => Event::BuiltinTransaction,

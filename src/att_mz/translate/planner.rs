@@ -1254,12 +1254,17 @@ mod tests {
     }
 
     fn project() -> StoredProjectRecord {
+        project_with_languages("ja", "zh-Hans")
+    }
+
+    fn project_with_languages(source_language: &str, target_language: &str) -> StoredProjectRecord {
         StoredProjectRecord::new(
             "测试游戏".parse().expect("测试项目名应该有效"),
-            PathBuf::from("C:/Game"),
-            PathBuf::from("C:/Projects/测试游戏.db"),
-            "ja".to_owned(),
-            "zh-Hans".to_owned(),
+            PathBuf::from("C:/Projects/测试游戏"),
+            PathBuf::from("C:/Projects/测试游戏/project.db"),
+            source_language.to_owned(),
+            target_language.to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         )
     }
 
@@ -1421,6 +1426,41 @@ mod tests {
         assert!(user.contains("### [0] name"));
         assert!(!user.contains("data/Items.json"));
         assert!(!user.contains("exact_location"));
+    }
+
+    #[tokio::test]
+    async fn target_language_only_requires_exact_system_markdown() {
+        let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            EmptyResources,
+            language_catalog(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+
+        let (_, tasks) = planner
+            .plan(
+                &project_with_languages("ja", "future-target"),
+                &profile_for_language_pair(10_000, 2, "ja", "future-target"),
+                StandardTranslationCorpus::new(vec![group(
+                    MzSource::data(StandardDataFile::Items),
+                    1,
+                    "翻訳対象",
+                    None,
+                    Vec::new(),
+                )]),
+                StandardTranslationInput::new(None, None),
+            )
+            .await
+            .expect("目标语言没有对应模块时仍应按精确 system Markdown 规划")
+            .into_parts();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].language_pair().target_language(), "future-target");
+        assert!(
+            tasks[0].expected_outputs()[0]
+                .language_analysis()
+                .needs_translation()
+        );
     }
 
     #[tokio::test]

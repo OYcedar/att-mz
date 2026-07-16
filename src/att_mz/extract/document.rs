@@ -233,7 +233,7 @@ where
         }
 
         let requests = self
-            .build_requests(project.game_root(), selection)
+            .build_requests(project.source_root(), selection)
             .await
             .map_err(MzProjectDocumentReadingError::ListMaps)?;
         let read_concurrency = self.config.read_concurrency().get();
@@ -293,10 +293,10 @@ where
 {
     async fn build_requests(
         &self,
-        game_root: &Path,
+        source_root: &Path,
         selection: MzDocumentSelection,
     ) -> Result<Vec<DocumentRequest>, ListDirectoryError<L::Error>> {
-        let data_root = game_root.join("data");
+        let data_root = source_root.join("data");
         let mut documents = BTreeMap::new();
         for file in selection.standard_files() {
             documents.insert(MzDocumentId::Data(*file), data_root.join(file.file_name()));
@@ -324,7 +324,7 @@ where
         if selection.includes_plugins() {
             requests.push(DocumentRequest {
                 kind: DocumentRequestKind::Plugins,
-                path: game_root.join("js").join("plugins.js"),
+                path: source_root.join("js").join("plugins.js"),
             });
         }
         Ok(requests)
@@ -617,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn selected_documents_are_read_and_parsed_with_bounded_overlap() {
-        let root = project().game_root().to_path_buf();
+        let root = project().source_root().to_path_buf();
         let actors = root.join("data").join("Actors.json");
         let map_one = root.join("data").join("Map001.json");
         let map_thousand = root.join("data").join("Map1000.json");
@@ -702,7 +702,7 @@ var $plugins =
 
     #[tokio::test]
     async fn invalid_utf8_and_invalid_plugin_record_keep_precise_stage() {
-        let root = project().game_root().to_path_buf();
+        let root = project().source_root().to_path_buf();
         let actors = root.join("data").join("Actors.json");
         let invalid_utf8 = Harness::new(
             HashMap::from([(actors.clone(), vec![0xff])]),
@@ -745,7 +745,7 @@ var $plugins =
 
     #[tokio::test]
     async fn malformed_plugins_envelope_is_not_treated_as_generic_json() {
-        let plugins = project().game_root().join("js").join("plugins.js");
+        let plugins = project().source_root().join("js").join("plugins.js");
         let harness = Harness::new(
             HashMap::from([(plugins.clone(), b"const plugins = [];".to_vec())]),
             Vec::new(),
@@ -767,7 +767,7 @@ var $plugins =
 
     #[tokio::test]
     async fn cpu_panic_is_not_confused_with_a_document_parse_error() {
-        let actors = project().game_root().join("data").join("Actors.json");
+        let actors = project().source_root().join("data").join("Actors.json");
         let service = MzProjectDocumentReadingService::new(
             FakeFileReader {
                 files: Arc::new(HashMap::from([(
@@ -1003,10 +1003,11 @@ var $plugins =
     fn project() -> OpenedProject {
         OpenedProject::new(
             "demo".parse::<ProjectName>().expect("项目名称应该有效"),
-            PathBuf::from("C:/games/demo"),
-            PathBuf::from("C:/projects/demo.db"),
+            PathBuf::from("C:/projects/demo"),
+            PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         )
     }
 }

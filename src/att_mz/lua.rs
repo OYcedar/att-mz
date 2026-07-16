@@ -17,13 +17,12 @@ pub(crate) mod session;
 
 /// 交给可信 Lua 程序的项目事实快照。
 ///
-/// Extract 从已经重新观测目录的 `OpenedProject` 建立该值；Translate 从 metadata
-/// 记录建立该值，不因此重新确认游戏目录。Host 信任调用阶段已经建立的事实，不再
-/// 解释或校验它们。
+/// `source_root` 始终指向 Init 导入到项目工作区的冻结 MZ 根，其中包含完整的
+/// `data/` 与 `js/`。原游戏目录不是后续阶段的权威事实，Host 也不会重新访问它。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LuaProjectContext {
     name: ProjectName,
-    game_root: PathBuf,
+    source_root: PathBuf,
     database_path: PathBuf,
     source_language: String,
     target_language: String,
@@ -33,7 +32,7 @@ impl LuaProjectContext {
     pub(crate) fn from_opened_project(project: &OpenedProject) -> Self {
         Self {
             name: project.name().clone(),
-            game_root: project.game_root().to_path_buf(),
+            source_root: project.source_root().to_path_buf(),
             database_path: project.database_path().to_path_buf(),
             source_language: project.source_language().to_owned(),
             target_language: project.target_language().to_owned(),
@@ -43,7 +42,7 @@ impl LuaProjectContext {
     pub(crate) fn from_stored_record(project: &StoredProjectRecord) -> Self {
         Self {
             name: project.name().clone(),
-            game_root: project.game_root().to_path_buf(),
+            source_root: project.source_root().to_path_buf(),
             database_path: project.database_path().to_path_buf(),
             source_language: project.source_language().to_owned(),
             target_language: project.target_language().to_owned(),
@@ -54,8 +53,8 @@ impl LuaProjectContext {
         &self.name
     }
 
-    pub(crate) fn game_root(&self) -> &Path {
-        &self.game_root
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source_root
     }
 
     pub(crate) fn database_path(&self) -> &Path {

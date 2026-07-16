@@ -19,6 +19,7 @@ pub(crate) mod text;
 pub mod translate;
 pub mod write_back;
 
+pub use project::{MaxFullwidthChars, MaxFullwidthCharsError, MzWriteBackLayoutProfile};
 pub use project_name::ProjectName;
 
 use extract::{ExtractInput, ExtractUseCase, ExtractionSelection};
@@ -86,6 +87,11 @@ where
                         game_root: arguments.path,
                         source_language: arguments.source_language,
                         target_language: arguments.target_language,
+                        layout_profile: MzWriteBackLayoutProfile::new(
+                            arguments.dialogue_max_fullwidth_chars,
+                            arguments.scrolling_text_max_fullwidth_chars,
+                            arguments.help_description_max_fullwidth_chars,
+                        ),
                     })
                     .await;
 
@@ -167,6 +173,33 @@ where
                 match result {
                     Ok(output) => {
                         writeln!(stdout, "写回完成：{}", output.name)?;
+                        writeln!(stdout, "输出目录：{}", output.output_root.display())?;
+                        writeln!(
+                            stdout,
+                            "标准写回：应用译文 {} 处，保留原文 {} 处；自动换行 {} 段，新增换行 {} 处；续行全角缩进 {} 处；需人工换行 {} 段",
+                            output.standard.translated_locations,
+                            output.standard.original_locations,
+                            output.standard.auto_wrapped_units,
+                            output.standard.inserted_line_breaks,
+                            output.standard.inserted_fullwidth_indents,
+                            output.standard.manual_layout_units,
+                        )?;
+                        if output.standard.manual_layout_units > 0 {
+                            writeln!(
+                                stdout,
+                                "人工处理：{} 段文本需要手动换行",
+                                output.standard.manual_layout_units
+                            )?;
+                        }
+                        writeln!(
+                            stdout,
+                            "Lua 写回：{}",
+                            if output.lua_executed {
+                                "已执行"
+                            } else {
+                                "未执行"
+                            }
+                        )?;
                         Ok(ExitCode::SUCCESS)
                     }
                     Err(error) => render_use_case_error(error, stderr),
@@ -212,6 +245,15 @@ struct InitArguments {
     /// 译文目标语言。
     #[arg(long, value_name = "LANG", value_parser = parse_non_blank)]
     target_language: String,
+    /// 对话正文每行允许的最大全角字符数。
+    #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
+    dialogue_max_fullwidth_chars: MaxFullwidthChars,
+    /// 滚动文本每行允许的最大全角字符数。
+    #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
+    scrolling_text_max_fullwidth_chars: MaxFullwidthChars,
+    /// 帮助或说明框每行允许的最大全角字符数。
+    #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
+    help_description_max_fullwidth_chars: MaxFullwidthChars,
 }
 
 #[derive(Debug, Args)]
@@ -283,6 +325,13 @@ fn parse_non_blank(value: &str) -> Result<String, String> {
 
 fn parse_non_blank_path(value: &str) -> Result<PathBuf, String> {
     parse_non_blank(value).map(PathBuf::from)
+}
+
+fn parse_max_fullwidth_chars(value: &str) -> Result<MaxFullwidthChars, String> {
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| "每行最大全角字符数必须是正整数".to_owned())?;
+    MaxFullwidthChars::new(value).map_err(|error| error.to_string())
 }
 
 fn render_parse_error(

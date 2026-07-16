@@ -175,10 +175,11 @@ mod tests {
     fn project() -> StoredProjectRecord {
         StoredProjectRecord::new(
             "alice".parse::<ProjectName>().expect("项目名应合法"),
-            PathBuf::from("C:/games/alice"),
-            PathBuf::from("C:/projects/alice.db"),
+            PathBuf::from("C:/projects/alice"),
+            PathBuf::from("C:/projects/alice/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         )
     }
 
@@ -210,10 +211,13 @@ mod tests {
         assert_eq!(invocation.profile_address, profile_address);
         assert_eq!(invocation.profile_name, "quality");
         assert_eq!(invocation.project.name().as_str(), "alice");
-        assert_eq!(invocation.project.game_root(), Path::new("C:/games/alice"));
+        assert_eq!(
+            invocation.project.source_root(),
+            Path::new("C:/projects/alice/source")
+        );
         assert_eq!(
             invocation.project.database_path(),
-            Path::new("C:/projects/alice.db")
+            Path::new("C:/projects/alice/project.db")
         );
         assert_eq!(invocation.project.source_language(), "ja");
         assert_eq!(invocation.project.target_language(), "zh-Hans");

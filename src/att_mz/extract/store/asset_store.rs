@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(harness.max_cpu_active.load(Ordering::SeqCst), 2);
         let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, PathBuf::from("C:/projects/demo.db"));
+        assert_eq!(calls[0].0, PathBuf::from("C:/projects/demo/project.db"));
 
         let parameter_sets = staging_parameter_sets(&calls[0].1);
         assert_eq!(parameter_sets.len(), 8);
@@ -964,10 +964,10 @@ mod tests {
 
             match (expected, error) {
                 ("not_found", MzExtractionAssetStoreError::DatabaseNotFound { database_path }) => {
-                    assert_eq!(database_path, PathBuf::from("C:/projects/demo.db"))
+                    assert_eq!(database_path, PathBuf::from("C:/projects/demo/project.db"))
                 }
                 ("conflict", MzExtractionAssetStoreError::OwnershipConflict { database_path }) => {
-                    assert_eq!(database_path, PathBuf::from("C:/projects/demo.db"))
+                    assert_eq!(database_path, PathBuf::from("C:/projects/demo/project.db"))
                 }
                 (
                     "not_committed",
@@ -976,7 +976,7 @@ mod tests {
                         source,
                     },
                 ) => {
-                    assert_eq!(database_path, PathBuf::from("C:/projects/demo.db"));
+                    assert_eq!(database_path, PathBuf::from("C:/projects/demo/project.db"));
                     assert_eq!(source, FakeError("write"));
                 }
                 (
@@ -986,7 +986,7 @@ mod tests {
                         source,
                     },
                 ) => {
-                    assert_eq!(database_path, PathBuf::from("C:/projects/demo.db"));
+                    assert_eq!(database_path, PathBuf::from("C:/projects/demo/project.db"));
                     assert_eq!(source, FakeError("commit"));
                 }
                 (expected, actual) => panic!("期望 {expected}，实际为 {actual}"),
@@ -1082,10 +1082,11 @@ mod tests {
     fn project() -> OpenedProject {
         OpenedProject::new(
             "demo".parse::<ProjectName>().expect("项目名应该合法"),
-            PathBuf::from("C:/games/demo"),
-            PathBuf::from("C:/projects/demo.db"),
+            PathBuf::from("C:/projects/demo"),
+            PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         )
     }
 

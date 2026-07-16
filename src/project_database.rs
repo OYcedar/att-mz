@@ -13,11 +13,87 @@ use crate::storage::sqlite::{
     SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
 };
 
-const CREATE_METADATA_TABLE: &str = "CREATE TABLE metadata (\n    name            TEXT NOT NULL PRIMARY KEY,\n    game_root       TEXT NOT NULL,\n    source_language TEXT NOT NULL,\n    target_language TEXT NOT NULL\n)";
-const INSERT_METADATA: &str =
-    "INSERT INTO metadata (name, game_root, source_language, target_language) VALUES (?, ?, ?, ?)";
-const SELECT_METADATA: &str =
-    "SELECT name, game_root, source_language, target_language FROM metadata";
+const PROJECT_DATABASE_FILE_NAME: &str = "project.db";
+const CREATE_METADATA_TABLE: &str = "CREATE TABLE metadata (\n    name                                TEXT NOT NULL PRIMARY KEY,\n    source_language                     TEXT NOT NULL,\n    target_language                     TEXT NOT NULL,\n    dialogue_max_fullwidth_chars        INTEGER NOT NULL CHECK (dialogue_max_fullwidth_chars > 0),\n    scrolling_text_max_fullwidth_chars  INTEGER NOT NULL CHECK (scrolling_text_max_fullwidth_chars > 0),\n    help_description_max_fullwidth_chars INTEGER NOT NULL CHECK (help_description_max_fullwidth_chars > 0)\n)";
+const INSERT_METADATA: &str = "INSERT INTO metadata (name, source_language, target_language, dialogue_max_fullwidth_chars, scrolling_text_max_fullwidth_chars, help_description_max_fullwidth_chars) VALUES (?, ?, ?, ?, ?, ?)";
+const SELECT_METADATA: &str = "SELECT name, source_language, target_language, dialogue_max_fullwidth_chars, scrolling_text_max_fullwidth_chars, help_description_max_fullwidth_chars FROM metadata";
+
+/// 一个游戏显示区域允许的每行最大全角字符数。
+///
+/// 零不能表达可用的显示宽度，因此只能通过受检构造建立该值。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxFullwidthChars(u32);
+
+impl MaxFullwidthChars {
+    /// 建立一个严格大于零的显示宽度。
+    pub fn new(value: u32) -> Result<Self, MaxFullwidthCharsError> {
+        if value == 0 {
+            Err(MaxFullwidthCharsError)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// 返回每行最大全角字符数。
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for MaxFullwidthChars {
+    type Error = MaxFullwidthCharsError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// 每行最大全角字符数不是正整数。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxFullwidthCharsError;
+
+impl fmt::Display for MaxFullwidthCharsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("每行最大全角字符数必须大于零")
+    }
+}
+
+impl Error for MaxFullwidthCharsError {}
+
+/// MZ 标准写回所使用的三个显示区域宽度。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MzWriteBackLayoutProfile {
+    dialogue_body: MaxFullwidthChars,
+    scrolling_text: MaxFullwidthChars,
+    help_description: MaxFullwidthChars,
+}
+
+impl MzWriteBackLayoutProfile {
+    /// 汇集已经分别校验的显示区域宽度。
+    pub fn new(
+        dialogue_body: MaxFullwidthChars,
+        scrolling_text: MaxFullwidthChars,
+        help_description: MaxFullwidthChars,
+    ) -> Self {
+        Self {
+            dialogue_body,
+            scrolling_text,
+            help_description,
+        }
+    }
+
+    pub fn dialogue_body(&self) -> MaxFullwidthChars {
+        self.dialogue_body
+    }
+
+    pub fn scrolling_text(&self) -> MaxFullwidthChars {
+        self.scrolling_text
+    }
+
+    pub fn help_description(&self) -> MaxFullwidthChars {
+        self.help_description
+    }
+}
 
 /// 从项目数据库中读取的受信项目记录。
 ///
@@ -26,27 +102,33 @@ const SELECT_METADATA: &str =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredProjectRecord {
     name: ProjectName,
-    game_root: PathBuf,
+    workspace_root: PathBuf,
+    source_root: PathBuf,
     database_path: PathBuf,
     source_language: String,
     target_language: String,
+    layout_profile: MzWriteBackLayoutProfile,
 }
 
 impl StoredProjectRecord {
     /// 建立一条已经由项目数据库读取器确认可信的记录。
     pub(crate) fn new(
         name: ProjectName,
-        game_root: PathBuf,
+        workspace_root: PathBuf,
         database_path: PathBuf,
         source_language: String,
         target_language: String,
+        layout_profile: MzWriteBackLayoutProfile,
     ) -> Self {
+        let source_root = workspace_root.join("source");
         Self {
             name,
-            game_root,
+            workspace_root,
+            source_root,
             database_path,
             source_language,
             target_language,
+            layout_profile,
         }
     }
 
@@ -54,8 +136,12 @@ impl StoredProjectRecord {
         &self.name
     }
 
-    pub(crate) fn game_root(&self) -> &Path {
-        &self.game_root
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source_root
     }
 
     pub(crate) fn database_path(&self) -> &Path {
@@ -69,6 +155,10 @@ impl StoredProjectRecord {
     pub(crate) fn target_language(&self) -> &str {
         &self.target_language
     }
+
+    pub(crate) fn layout_profile(&self) -> &MzWriteBackLayoutProfile {
+        &self.layout_profile
+    }
 }
 
 /// 按项目名称读取现存项目记录的职责契约。
@@ -78,7 +168,7 @@ pub(crate) trait ProjectDatabaseRecordReader: Send + Sync {
 
     /// 读取一个现存项目的完整受信记录。
     ///
-    /// 实现负责定位 `<name>.db`、以只读意图打开数据库，并确认 metadata 记录
+    /// 实现负责定位 `<name>/project.db`、以只读意图打开数据库，并确认 metadata 记录
     /// 完整且属于请求的项目。不存在、损坏与底层数据库失败均通过本职责错误返回。
     fn read(
         &self,
@@ -88,15 +178,15 @@ pub(crate) trait ProjectDatabaseRecordReader: Send + Sync {
 
 /// 使用只读 SQLite 查询建立受信项目记录。
 pub(crate) struct ProjectDatabaseRecordReadingService<S> {
-    database_root: PathBuf,
+    projects_root: PathBuf,
     sqlite: S,
 }
 
 impl<S> ProjectDatabaseRecordReadingService<S> {
-    /// 创建服务；数据库根目录由外部配置边界明确注入。
-    pub(crate) fn new(database_root: PathBuf, sqlite: S) -> Self {
+    /// 创建服务；项目工作区根目录由外部配置边界明确注入。
+    pub(crate) fn new(projects_root: PathBuf, sqlite: S) -> Self {
         Self {
-            database_root,
+            projects_root,
             sqlite,
         }
     }
@@ -109,7 +199,8 @@ where
     type Error = ProjectDatabaseReadError<S::Error>;
 
     async fn read(&self, requested_name: &ProjectName) -> Result<StoredProjectRecord, Self::Error> {
-        let database_path = project_database_path(&self.database_root, requested_name);
+        let workspace_root = project_workspace_root(&self.projects_root, requested_name);
+        let database_path = workspace_root.join(PROJECT_DATABASE_FILE_NAME);
         let rows = self
             .sqlite
             .query_existing_database(
@@ -121,12 +212,13 @@ where
                 ProjectDatabaseReadError::from_executor(database_path.clone(), error)
             })?;
 
-        record_from_rows(requested_name, database_path, rows)
+        record_from_rows(requested_name, workspace_root, database_path, rows)
     }
 }
 
 fn record_from_rows<E>(
     requested_name: &ProjectName,
+    workspace_root: PathBuf,
     database_path: PathBuf,
     rows: Vec<SqliteRow>,
 ) -> Result<StoredProjectRecord, ProjectDatabaseReadError<E>> {
@@ -146,7 +238,7 @@ fn record_from_rows<E>(
     }
 
     let values = row.into_values();
-    if values.len() != 4 {
+    if values.len() != 6 {
         return Err(ProjectDatabaseReadError::InvalidMetadata {
             path: database_path,
             reason: InvalidProjectMetadata::WrongColumnCount {
@@ -156,21 +248,13 @@ fn record_from_rows<E>(
     }
 
     let mut values = values.into_iter();
-    let stored_name = text_column(values.next().expect("已确认 metadata 恰好有四列"), "name")
+    let stored_name = text_column(values.next().expect("已确认 metadata 恰好有六列"), "name")
         .map_err(|reason| ProjectDatabaseReadError::InvalidMetadata {
             path: database_path.clone(),
             reason,
         })?;
-    let game_root = text_column(
-        values.next().expect("已确认 metadata 恰好有四列"),
-        "game_root",
-    )
-    .map_err(|reason| ProjectDatabaseReadError::InvalidMetadata {
-        path: database_path.clone(),
-        reason,
-    })?;
     let source_language = text_column(
-        values.next().expect("已确认 metadata 恰好有四列"),
+        values.next().expect("已确认 metadata 恰好有六列"),
         "source_language",
     )
     .map_err(|reason| ProjectDatabaseReadError::InvalidMetadata {
@@ -178,8 +262,32 @@ fn record_from_rows<E>(
         reason,
     })?;
     let target_language = text_column(
-        values.next().expect("已确认 metadata 恰好有四列"),
+        values.next().expect("已确认 metadata 恰好有六列"),
         "target_language",
+    )
+    .map_err(|reason| ProjectDatabaseReadError::InvalidMetadata {
+        path: database_path.clone(),
+        reason,
+    })?;
+    let dialogue_max_fullwidth_chars = max_fullwidth_chars_column(
+        values.next().expect("已确认 metadata 恰好有六列"),
+        "dialogue_max_fullwidth_chars",
+    )
+    .map_err(|reason| ProjectDatabaseReadError::InvalidMetadata {
+        path: database_path.clone(),
+        reason,
+    })?;
+    let scrolling_text_max_fullwidth_chars = max_fullwidth_chars_column(
+        values.next().expect("已确认 metadata 恰好有六列"),
+        "scrolling_text_max_fullwidth_chars",
+    )
+    .map_err(|reason| ProjectDatabaseReadError::InvalidMetadata {
+        path: database_path.clone(),
+        reason,
+    })?;
+    let help_description_max_fullwidth_chars = max_fullwidth_chars_column(
+        values.next().expect("已确认 metadata 恰好有六列"),
+        "help_description_max_fullwidth_chars",
     )
     .map_err(|reason| ProjectDatabaseReadError::InvalidMetadata {
         path: database_path.clone(),
@@ -202,12 +310,6 @@ fn record_from_rows<E>(
         });
     }
 
-    if game_root.trim().is_empty() {
-        return Err(ProjectDatabaseReadError::InvalidMetadata {
-            path: database_path,
-            reason: InvalidProjectMetadata::BlankGameRoot,
-        });
-    }
     if source_language.trim().is_empty() {
         return Err(ProjectDatabaseReadError::InvalidMetadata {
             path: database_path,
@@ -227,10 +329,15 @@ fn record_from_rows<E>(
 
     Ok(StoredProjectRecord::new(
         stored_name,
-        PathBuf::from(game_root),
+        workspace_root,
         database_path,
         source_language,
         target_language,
+        MzWriteBackLayoutProfile::new(
+            dialogue_max_fullwidth_chars,
+            scrolling_text_max_fullwidth_chars,
+            help_description_max_fullwidth_chars,
+        ),
     ))
 }
 
@@ -239,9 +346,32 @@ fn text_column(value: SqliteValue, column: &'static str) -> Result<String, Inval
         SqliteValue::Text(value) => Ok(value),
         value => Err(InvalidProjectMetadata::WrongColumnType {
             column,
+            expected: "TEXT",
             actual: value.kind_name(),
         }),
     }
+}
+
+fn max_fullwidth_chars_column(
+    value: SqliteValue,
+    column: &'static str,
+) -> Result<MaxFullwidthChars, InvalidProjectMetadata> {
+    let SqliteValue::Integer(value) = value else {
+        return Err(InvalidProjectMetadata::WrongColumnType {
+            column,
+            expected: "INTEGER",
+            actual: value.kind_name(),
+        });
+    };
+
+    let value = u32::try_from(value).map_err(|_| InvalidProjectMetadata::InvalidLineWidth {
+        column,
+        actual: value,
+    })?;
+    MaxFullwidthChars::new(value).map_err(|_| InvalidProjectMetadata::InvalidLineWidth {
+        column,
+        actual: i64::from(value),
+    })
 }
 
 /// 项目数据库读取失败，并保留目标路径和底层原因。
@@ -316,6 +446,7 @@ pub(crate) enum InvalidProjectMetadata {
     },
     WrongColumnType {
         column: &'static str,
+        expected: &'static str,
         actual: &'static str,
     },
     InvalidProjectName {
@@ -325,9 +456,12 @@ pub(crate) enum InvalidProjectMetadata {
         requested: String,
         stored: String,
     },
-    BlankGameRoot,
     BlankLanguage {
         column: &'static str,
+    },
+    InvalidLineWidth {
+        column: &'static str,
+        actual: i64,
     },
 }
 
@@ -337,10 +471,14 @@ impl fmt::Display for InvalidProjectMetadata {
             Self::MissingRow => formatter.write_str("缺少项目记录"),
             Self::MultipleRows => formatter.write_str("包含多条项目记录"),
             Self::WrongColumnCount { actual } => {
-                write!(formatter, "查询结果应有 4 列，实际为 {actual} 列")
+                write!(formatter, "查询结果应有 6 列，实际为 {actual} 列")
             }
-            Self::WrongColumnType { column, actual } => {
-                write!(formatter, "字段 {column} 应为 TEXT，实际为 {actual}")
+            Self::WrongColumnType {
+                column,
+                expected,
+                actual,
+            } => {
+                write!(formatter, "字段 {column} 应为 {expected}，实际为 {actual}")
             }
             Self::InvalidProjectName { message } => {
                 write!(formatter, "项目名称无效：{message}")
@@ -349,8 +487,13 @@ impl fmt::Display for InvalidProjectMetadata {
                 formatter,
                 "项目名称不匹配，请求 {requested:?}，数据库记录 {stored:?}"
             ),
-            Self::BlankGameRoot => formatter.write_str("game_root 不能为空白"),
             Self::BlankLanguage { column } => write!(formatter, "{column} 不能为空白"),
+            Self::InvalidLineWidth { column, actual } => {
+                write!(
+                    formatter,
+                    "{column} 必须是 u32 范围内的正整数，实际为 {actual}"
+                )
+            }
         }
     }
 }
@@ -359,33 +502,29 @@ impl fmt::Display for InvalidProjectMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NewProject {
     name: ProjectName,
-    game_root: String,
     source_language: String,
     target_language: String,
+    layout_profile: MzWriteBackLayoutProfile,
 }
 
 impl NewProject {
     /// 汇集创建项目数据库所需的全部受信事实。
     pub(crate) fn new(
         name: ProjectName,
-        game_root: String,
         source_language: String,
         target_language: String,
+        layout_profile: MzWriteBackLayoutProfile,
     ) -> Self {
         Self {
             name,
-            game_root,
             source_language,
             target_language,
+            layout_profile,
         }
     }
 
     pub(crate) fn name(&self) -> &ProjectName {
         &self.name
-    }
-
-    pub(crate) fn game_root(&self) -> &str {
-        &self.game_root
     }
 
     pub(crate) fn source_language(&self) -> &str {
@@ -394,6 +533,10 @@ impl NewProject {
 
     pub(crate) fn target_language(&self) -> &str {
         &self.target_language
+    }
+
+    pub(crate) fn layout_profile(&self) -> &MzWriteBackLayoutProfile {
+        &self.layout_profile
     }
 }
 
@@ -422,30 +565,29 @@ pub(crate) trait ProjectDatabaseCreator: Send + Sync {
 
     /// 创建并初始化一个全新的项目数据库。
     ///
+    /// `destination_path` 是工作区创建器已经选择的精确暂存路径；本职责不得再按
+    /// 项目名推导或改写它。
+    ///
     /// 一旦返回的 Future 开始产生副作用，调用方必须持续等待到明确终态；直接
     /// 丢弃或中止 Future、以及进程终止后的清理不属于首版保证。
     fn create(
         &self,
+        destination_path: PathBuf,
         project: NewProject,
     ) -> impl Future<Output = Result<CreatedProject, Self::Error>> + Send;
 }
 
 /// 使用 SQLite 驱动创建项目数据库。
 pub(crate) struct ProjectDatabaseCreationService<S> {
-    database_root: PathBuf,
     sqlite: S,
 }
 
 impl<S> ProjectDatabaseCreationService<S> {
     /// 创建服务。
     ///
-    /// `database_root` 必须已经存在且是目录；最终由 SQLite 驱动在实际创建时确认
-    /// 该前置条件。本服务不创建目录，也不依赖通用文件系统。
-    pub(crate) fn new(database_root: PathBuf, sqlite: S) -> Self {
-        Self {
-            database_root,
-            sqlite,
-        }
+    /// 目标数据库路径由调用方逐次提供，本服务不创建其父目录。
+    pub(crate) fn new(sqlite: S) -> Self {
+        Self { sqlite }
     }
 }
 
@@ -455,8 +597,11 @@ where
 {
     type Error = ProjectDatabaseCreateError<S::Error>;
 
-    async fn create(&self, project: NewProject) -> Result<CreatedProject, Self::Error> {
-        let database_path = project_database_path(&self.database_root, project.name());
+    async fn create(
+        &self,
+        database_path: PathBuf,
+        project: NewProject,
+    ) -> Result<CreatedProject, Self::Error> {
         let commands = metadata_commands(&project);
 
         self.sqlite
@@ -470,8 +615,8 @@ where
     }
 }
 
-fn project_database_path(database_root: &Path, name: &ProjectName) -> PathBuf {
-    database_root.join(format!("{}.db", name.as_str()))
+fn project_workspace_root(projects_root: &Path, name: &ProjectName) -> PathBuf {
+    projects_root.join(name.as_str())
 }
 
 fn metadata_commands(project: &NewProject) -> Vec<SqliteCommand> {
@@ -481,9 +626,11 @@ fn metadata_commands(project: &NewProject) -> Vec<SqliteCommand> {
             INSERT_METADATA,
             vec![
                 SqliteValue::Text(project.name().as_str().to_owned()),
-                SqliteValue::Text(project.game_root().to_owned()),
                 SqliteValue::Text(project.source_language().to_owned()),
                 SqliteValue::Text(project.target_language().to_owned()),
+                SqliteValue::Integer(i64::from(project.layout_profile().dialogue_body().get())),
+                SqliteValue::Integer(i64::from(project.layout_profile().scrolling_text().get())),
+                SqliteValue::Integer(i64::from(project.layout_profile().help_description().get())),
             ],
         ),
     ]
@@ -640,27 +787,35 @@ mod tests {
     fn project(name: &str) -> NewProject {
         NewProject::new(
             name.parse().expect("test project name should be valid"),
-            "C:/games/example".to_owned(),
             "ja".to_owned(),
             "zh-CN".to_owned(),
+            layout_profile(),
         )
+    }
+
+    fn width(value: u32) -> MaxFullwidthChars {
+        MaxFullwidthChars::new(value).expect("test width should be positive")
+    }
+
+    fn layout_profile() -> MzWriteBackLayoutProfile {
+        MzWriteBackLayoutProfile::new(width(24), width(30), width(18))
     }
 
     #[tokio::test]
     async fn creates_expected_database_and_parameterized_metadata_transaction() {
-        let service = ProjectDatabaseCreationService::new(
-            PathBuf::from("C:/projects"),
-            RecordingDriver::succeeding(),
-        );
+        let service = ProjectDatabaseCreationService::new(RecordingDriver::succeeding());
 
         let created = service
-            .create(project("测试 游戏"))
+            .create(
+                PathBuf::from("C:/projects/测试 游戏/project.db"),
+                project("测试 游戏"),
+            )
             .await
             .expect("database creation should succeed");
 
         assert_eq!(
             created.database_path(),
-            Path::new("C:/projects/测试 游戏.db")
+            Path::new("C:/projects/测试 游戏/project.db")
         );
 
         let invocations = service
@@ -670,7 +825,10 @@ mod tests {
             .expect("invocations mutex should not be poisoned");
         assert_eq!(invocations.len(), 1);
         let invocation = &invocations[0];
-        assert_eq!(invocation.path, PathBuf::from("C:/projects/测试 游戏.db"));
+        assert_eq!(
+            invocation.path,
+            PathBuf::from("C:/projects/测试 游戏/project.db")
+        );
         assert_eq!(invocation.commands.len(), 2);
         assert_eq!(invocation.commands[0].statement(), CREATE_METADATA_TABLE);
         assert!(invocation.commands[0].parameters().is_empty());
@@ -679,9 +837,11 @@ mod tests {
             invocation.commands[1].parameters(),
             &[
                 SqliteValue::Text("测试 游戏".to_owned()),
-                SqliteValue::Text("C:/games/example".to_owned()),
                 SqliteValue::Text("ja".to_owned()),
                 SqliteValue::Text("zh-CN".to_owned()),
+                SqliteValue::Integer(24),
+                SqliteValue::Integer(30),
+                SqliteValue::Integer(18),
             ]
         );
     }
@@ -712,17 +872,19 @@ mod tests {
         ];
 
         for (driver_error, expected_kind, expected_source) in cases {
-            let service = ProjectDatabaseCreationService::new(
-                PathBuf::from("C:/projects"),
-                RecordingDriver::responding_with(Err(driver_error)),
-            );
+            let service = ProjectDatabaseCreationService::new(RecordingDriver::responding_with(
+                Err(driver_error),
+            ));
 
             let error = service
-                .create(project("demo"))
+                .create(
+                    PathBuf::from("C:/projects/demo/project.db"),
+                    project("demo"),
+                )
                 .await
                 .expect_err("driver failure should be preserved");
 
-            assert_eq!(error.path(), Path::new("C:/projects/demo.db"));
+            assert_eq!(error.path(), Path::new("C:/projects/demo/project.db"));
             assert_eq!(ExpectedKind::from(&error), expected_kind);
             assert_eq!(
                 error.source().map(ToString::to_string).as_deref(),
@@ -804,14 +966,17 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_serialize_creation_of_different_projects() {
-        let service = ProjectDatabaseCreationService::new(
-            PathBuf::from("C:/projects"),
-            ConcurrentDriver::new(),
-        );
+        let service = ProjectDatabaseCreationService::new(ConcurrentDriver::new());
 
         let (first, second) = tokio::join!(
-            service.create(project("first")),
-            service.create(project("second"))
+            service.create(
+                PathBuf::from("C:/projects/first/project.db"),
+                project("first")
+            ),
+            service.create(
+                PathBuf::from("C:/projects/second/project.db"),
+                project("second")
+            )
         );
 
         first.expect("first database should be created");
@@ -821,12 +986,12 @@ mod tests {
 
     #[test]
     fn creation_future_is_send() {
-        let service = ProjectDatabaseCreationService::new(
-            PathBuf::from("C:/projects"),
-            RecordingDriver::succeeding(),
-        );
+        let service = ProjectDatabaseCreationService::new(RecordingDriver::succeeding());
 
-        assert_send(service.create(project("demo")));
+        assert_send(service.create(
+            PathBuf::from("C:/projects/demo/project.db"),
+            project("demo"),
+        ));
     }
 
     #[derive(Debug)]
@@ -878,19 +1043,30 @@ mod tests {
 
     fn metadata_row(
         name: SqliteValue,
-        game_root: SqliteValue,
         source_language: SqliteValue,
         target_language: SqliteValue,
+        dialogue_width: SqliteValue,
+        scrolling_width: SqliteValue,
+        help_width: SqliteValue,
     ) -> SqliteRow {
-        SqliteRow::new(vec![name, game_root, source_language, target_language])
+        SqliteRow::new(vec![
+            name,
+            source_language,
+            target_language,
+            dialogue_width,
+            scrolling_width,
+            help_width,
+        ])
     }
 
     fn valid_metadata_row() -> SqliteRow {
         metadata_row(
             SqliteValue::Text("测试 游戏".to_owned()),
-            SqliteValue::Text("./Games/Game One".to_owned()),
             SqliteValue::Text("ja".to_owned()),
             SqliteValue::Text("zh-Hans".to_owned()),
+            SqliteValue::Integer(24),
+            SqliteValue::Integer(30),
+            SqliteValue::Integer(18),
         )
     }
 
@@ -914,13 +1090,17 @@ mod tests {
             .expect("valid metadata should be read");
 
         assert_eq!(record.name(), &requested);
-        assert_eq!(record.game_root(), Path::new("./Games/Game One"));
+        assert_eq!(
+            record.workspace_root(),
+            Path::new("C:/att/projects/测试 游戏")
+        );
         assert_eq!(
             record.database_path(),
-            Path::new("C:/att/projects/测试 游戏.db")
+            Path::new("C:/att/projects/测试 游戏/project.db")
         );
         assert_eq!(record.source_language(), "ja");
         assert_eq!(record.target_language(), "zh-Hans");
+        assert_eq!(record.layout_profile(), &layout_profile());
 
         let invocations = service
             .sqlite
@@ -930,7 +1110,7 @@ mod tests {
         assert_eq!(invocations.len(), 1);
         assert_eq!(
             invocations[0].path,
-            PathBuf::from("C:/att/projects/测试 游戏.db")
+            PathBuf::from("C:/att/projects/测试 游戏/project.db")
         );
         assert_eq!(invocations[0].query.statement(), SELECT_METADATA);
         assert!(invocations[0].query.parameters().is_empty());
@@ -946,7 +1126,10 @@ mod tests {
             not_found,
             ProjectDatabaseReadError::DatabaseNotFound { .. }
         ));
-        assert_eq!(not_found.path(), Path::new("C:/att/projects/demo.db"));
+        assert_eq!(
+            not_found.path(),
+            Path::new("C:/att/projects/demo/project.db")
+        );
         assert!(not_found.source().is_none());
 
         let read_failure = record_reading_service(Err(QueryExistingDatabaseError::QueryFailed(
@@ -955,7 +1138,10 @@ mod tests {
         .read(&"demo".parse().expect("test name should be valid"))
         .await
         .expect_err("query failure should be preserved");
-        assert_eq!(read_failure.path(), Path::new("C:/att/projects/demo.db"));
+        assert_eq!(
+            read_failure.path(),
+            Path::new("C:/att/projects/demo/project.db")
+        );
         assert!(matches!(
             read_failure,
             ProjectDatabaseReadError::ReadDatabase { .. }
@@ -964,6 +1150,30 @@ mod tests {
             read_failure.source().map(ToString::to_string).as_deref(),
             Some("query failed")
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_metadata_schema_without_fallback() {
+        let service = record_reading_service(Err(QueryExistingDatabaseError::QueryFailed(
+            FakeDriverError("no such column: dialogue_max_fullwidth_chars"),
+        )));
+
+        let error = service
+            .read(&"demo".parse().expect("test name should be valid"))
+            .await
+            .expect_err("legacy metadata must require reinitialization");
+
+        assert!(matches!(
+            error,
+            ProjectDatabaseReadError::ReadDatabase { .. }
+        ));
+        let invocations = service
+            .sqlite
+            .invocations
+            .lock()
+            .expect("query invocations mutex should not be poisoned");
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].query.statement(), SELECT_METADATA);
     }
 
     #[tokio::test]
@@ -984,8 +1194,21 @@ mod tests {
                 vec![metadata_row(
                     SqliteValue::Text("测试 游戏".to_owned()),
                     SqliteValue::Blob(Vec::new()),
+                    SqliteValue::Text("zh-Hans".to_owned()),
+                    SqliteValue::Integer(24),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(18),
+                )],
+                ExpectedInvalidMetadata::WrongColumnType,
+            ),
+            (
+                vec![metadata_row(
+                    SqliteValue::Text("测试 游戏".to_owned()),
                     SqliteValue::Text("ja".to_owned()),
                     SqliteValue::Text("zh-Hans".to_owned()),
+                    SqliteValue::Text("24".to_owned()),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(18),
                 )],
                 ExpectedInvalidMetadata::WrongColumnType,
             ),
@@ -1010,18 +1233,22 @@ mod tests {
             (
                 metadata_row(
                     SqliteValue::Text("../unsafe".to_owned()),
-                    SqliteValue::Text("C:/Games/Demo".to_owned()),
                     SqliteValue::Text("ja".to_owned()),
                     SqliteValue::Text("zh".to_owned()),
+                    SqliteValue::Integer(24),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(18),
                 ),
                 ExpectedInvalidMetadata::InvalidProjectName,
             ),
             (
                 metadata_row(
                     SqliteValue::Text("another".to_owned()),
-                    SqliteValue::Text("C:/Games/Demo".to_owned()),
                     SqliteValue::Text("ja".to_owned()),
                     SqliteValue::Text("zh".to_owned()),
+                    SqliteValue::Integer(24),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(18),
                 ),
                 ExpectedInvalidMetadata::NameMismatch,
             ),
@@ -1029,28 +1256,56 @@ mod tests {
                 metadata_row(
                     SqliteValue::Text("demo".to_owned()),
                     SqliteValue::Text(" \t".to_owned()),
-                    SqliteValue::Text("ja".to_owned()),
                     SqliteValue::Text("zh".to_owned()),
-                ),
-                ExpectedInvalidMetadata::BlankGameRoot,
-            ),
-            (
-                metadata_row(
-                    SqliteValue::Text("demo".to_owned()),
-                    SqliteValue::Text("C:/Games/Demo".to_owned()),
-                    SqliteValue::Text("  ".to_owned()),
-                    SqliteValue::Text("zh".to_owned()),
+                    SqliteValue::Integer(24),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(18),
                 ),
                 ExpectedInvalidMetadata::BlankLanguage,
             ),
             (
                 metadata_row(
                     SqliteValue::Text("demo".to_owned()),
-                    SqliteValue::Text("C:/Games/Demo".to_owned()),
                     SqliteValue::Text("ja".to_owned()),
                     SqliteValue::Text("\n".to_owned()),
+                    SqliteValue::Integer(24),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(18),
                 ),
                 ExpectedInvalidMetadata::BlankLanguage,
+            ),
+            (
+                metadata_row(
+                    SqliteValue::Text("demo".to_owned()),
+                    SqliteValue::Text("ja".to_owned()),
+                    SqliteValue::Text("zh".to_owned()),
+                    SqliteValue::Integer(0),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(18),
+                ),
+                ExpectedInvalidMetadata::InvalidLineWidth,
+            ),
+            (
+                metadata_row(
+                    SqliteValue::Text("demo".to_owned()),
+                    SqliteValue::Text("ja".to_owned()),
+                    SqliteValue::Text("zh".to_owned()),
+                    SqliteValue::Integer(24),
+                    SqliteValue::Integer(-1),
+                    SqliteValue::Integer(18),
+                ),
+                ExpectedInvalidMetadata::InvalidLineWidth,
+            ),
+            (
+                metadata_row(
+                    SqliteValue::Text("demo".to_owned()),
+                    SqliteValue::Text("ja".to_owned()),
+                    SqliteValue::Text("zh".to_owned()),
+                    SqliteValue::Integer(24),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(i64::from(u32::MAX) + 1),
+                ),
+                ExpectedInvalidMetadata::InvalidLineWidth,
             ),
         ];
 
@@ -1074,8 +1329,8 @@ mod tests {
         WrongColumnType,
         InvalidProjectName,
         NameMismatch,
-        BlankGameRoot,
         BlankLanguage,
+        InvalidLineWidth,
     }
 
     impl From<&InvalidProjectMetadata> for ExpectedInvalidMetadata {
@@ -1087,10 +1342,18 @@ mod tests {
                 InvalidProjectMetadata::WrongColumnType { .. } => Self::WrongColumnType,
                 InvalidProjectMetadata::InvalidProjectName { .. } => Self::InvalidProjectName,
                 InvalidProjectMetadata::NameMismatch { .. } => Self::NameMismatch,
-                InvalidProjectMetadata::BlankGameRoot => Self::BlankGameRoot,
                 InvalidProjectMetadata::BlankLanguage { .. } => Self::BlankLanguage,
+                InvalidProjectMetadata::InvalidLineWidth { .. } => Self::InvalidLineWidth,
             }
         }
+    }
+
+    #[test]
+    fn maximum_fullwidth_chars_rejects_zero() {
+        let error = MaxFullwidthChars::new(0).expect_err("zero width should be rejected");
+
+        assert_eq!(error.to_string(), "每行最大全角字符数必须大于零");
+        assert_eq!(width(1).get(), 1);
     }
 
     #[test]

@@ -380,10 +380,11 @@ mod tests {
     fn project_record() -> StoredProjectRecord {
         StoredProjectRecord::new(
             project_name(),
-            PathBuf::from("C:/Games/Alice"),
-            PathBuf::from("C:/Projects/alice.db"),
+            PathBuf::from("C:/Projects/alice"),
+            PathBuf::from("C:/Projects/alice/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         )
     }
 

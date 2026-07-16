@@ -4,7 +4,8 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use super::ProjectName;
-use crate::project_database::{NewProject, ProjectDatabaseCreator};
+use super::project::MzWriteBackLayoutProfile;
+use crate::project_database::NewProject;
 use crate::storage::file_system::{ExistingDirectoryResolver, ResolveDirectoryError};
 
 /// 初始化 MZ 游戏所需的输入。
@@ -14,6 +15,7 @@ pub struct InitInput {
     pub game_root: PathBuf,
     pub source_language: String,
     pub target_language: String,
+    pub layout_profile: MzWriteBackLayoutProfile,
 }
 
 /// 初始化成功后交还给 CLI 的最小结果。
@@ -32,29 +34,77 @@ pub trait InitUseCase: Send + Sync {
     ) -> impl Future<Output = Result<InitOutput, Self::Error>> + Send;
 }
 
+/// 创建完整冻结工作区所需的受信输入。
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code, reason = "真实工作区创建器将在后续任务进行生产装配")]
+pub(crate) struct NewProjectWorkspace {
+    source_game_root: PathBuf,
+    project: NewProject,
+}
+
+#[allow(dead_code, reason = "真实工作区创建器将在后续任务进行生产装配")]
+impl NewProjectWorkspace {
+    pub(crate) fn new(source_game_root: PathBuf, project: NewProject) -> Self {
+        Self {
+            source_game_root,
+            project,
+        }
+    }
+
+    /// 返回仅用于本次导入的原游戏根目录。
+    pub(crate) fn source_game_root(&self) -> &std::path::Path {
+        &self.source_game_root
+    }
+
+    pub(crate) fn project(&self) -> &NewProject {
+        &self.project
+    }
+
+    /// 把导入来源与数据库 metadata 交给真实工作区实现。
+    pub(crate) fn into_parts(self) -> (PathBuf, NewProject) {
+        (self.source_game_root, self.project)
+    }
+}
+
+/// 原子创建并发布一个冻结项目工作区的职责契约。
+#[allow(dead_code, reason = "真实工作区创建器将在后续任务进行生产装配")]
+pub(crate) trait ProjectWorkspaceCreator: Send + Sync {
+    type Error: Error + Send + Sync + 'static;
+
+    /// 完整复制 `data`、`js`，建立数据库和写回目录，再共同发布工作区。
+    ///
+    /// 成功意味着 `<name>/project.db`、`source/{data,js}` 与
+    /// `write_back/{data,js}` 已经作为同一个可用工作区对外可见；失败不得暴露
+    /// 半成品。真实复制和暂存发布实现不属于本批范围。
+    fn create(
+        &self,
+        project: NewProjectWorkspace,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
 /// 只负责初始化用例编排，不了解目录解析与数据库创建的内部机制。
 #[allow(dead_code, reason = "初始化服务按计划先实现但暂不进行生产装配")]
-pub(crate) struct InitService<F, D> {
+pub(crate) struct InitService<F, W> {
     file_system: F,
-    database_creator: D,
+    workspace_creator: W,
 }
 
 #[allow(dead_code, reason = "初始化服务按计划先实现但暂不进行生产装配")]
-impl<F, D> InitService<F, D> {
-    pub(crate) fn new(file_system: F, database_creator: D) -> Self {
+impl<F, W> InitService<F, W> {
+    pub(crate) fn new(file_system: F, workspace_creator: W) -> Self {
         Self {
             file_system,
-            database_creator,
+            workspace_creator,
         }
     }
 }
 
-impl<F, D> InitUseCase for InitService<F, D>
+impl<F, W> InitUseCase for InitService<F, W>
 where
     F: ExistingDirectoryResolver,
-    D: ProjectDatabaseCreator,
+    W: ProjectWorkspaceCreator,
 {
-    type Error = InitServiceError<F::Error, D::Error>;
+    type Error = InitServiceError<F::Error, W::Error>;
 
     async fn execute(&self, input: InitInput) -> Result<InitOutput, Self::Error> {
         let source_language =
@@ -62,32 +112,33 @@ where
         let target_language =
             normalized_language(input.target_language, InitServiceError::EmptyTargetLanguage)?;
 
-        let game_root = self
+        let source_game_root = self
             .file_system
             .resolve_existing_directory(input.game_root)
             .await
             .map_err(InitServiceError::GameRoot)?;
-        let game_root_text = game_root
-            .to_str()
-            .ok_or_else(|| InitServiceError::NonUtf8GameRoot(game_root.clone()))?
-            .to_owned();
 
         let output_name = input.name.clone();
-        let project = NewProject::new(input.name, game_root_text, source_language, target_language);
-        self.database_creator
-            .create(project)
+        let project = NewProject::new(
+            input.name,
+            source_language,
+            target_language,
+            input.layout_profile,
+        );
+        self.workspace_creator
+            .create(NewProjectWorkspace::new(source_game_root, project))
             .await
-            .map_err(InitServiceError::Database)?;
+            .map_err(InitServiceError::Workspace)?;
 
         Ok(InitOutput { name: output_name })
     }
 }
 
 #[allow(dead_code, reason = "初始化服务按计划先实现但暂不进行生产装配")]
-fn normalized_language<F, D>(
+fn normalized_language<F, W>(
     value: String,
-    empty_error: InitServiceError<F, D>,
-) -> Result<String, InitServiceError<F, D>> {
+    empty_error: InitServiceError<F, W>,
+) -> Result<String, InitServiceError<F, W>> {
     let normalized = value.trim();
     if normalized.is_empty() {
         Err(empty_error)
@@ -99,48 +150,38 @@ fn normalized_language<F, D>(
 /// 初始化编排在本职责边界内能够产生的错误。
 #[derive(Debug)]
 #[allow(dead_code, reason = "初始化服务按计划先实现但暂不进行生产装配")]
-pub(crate) enum InitServiceError<F, D> {
+pub(crate) enum InitServiceError<F, W> {
     EmptySourceLanguage,
     EmptyTargetLanguage,
     GameRoot(ResolveDirectoryError<F>),
-    NonUtf8GameRoot(PathBuf),
-    Database(D),
+    Workspace(W),
 }
 
-impl<F, D> fmt::Display for InitServiceError<F, D>
+impl<F, W> fmt::Display for InitServiceError<F, W>
 where
     F: Error,
-    D: Error,
+    W: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptySourceLanguage => formatter.write_str("源语言去除首尾空白后不能为空"),
             Self::EmptyTargetLanguage => formatter.write_str("目标语言去除首尾空白后不能为空"),
             Self::GameRoot(error) => write!(formatter, "无法使用游戏根目录：{error}"),
-            Self::NonUtf8GameRoot(path) => {
-                write!(
-                    formatter,
-                    "游戏根目录无法无损表示为 UTF-8：{}",
-                    path.display()
-                )
-            }
-            Self::Database(error) => write!(formatter, "无法创建项目数据库：{error}"),
+            Self::Workspace(error) => write!(formatter, "无法创建冻结项目工作区：{error}"),
         }
     }
 }
 
-impl<F, D> Error for InitServiceError<F, D>
+impl<F, W> Error for InitServiceError<F, W>
 where
     F: Error + 'static,
-    D: Error + 'static,
+    W: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::GameRoot(error) => Some(error),
-            Self::Database(error) => Some(error),
-            Self::EmptySourceLanguage | Self::EmptyTargetLanguage | Self::NonUtf8GameRoot(_) => {
-                None
-            }
+            Self::Workspace(error) => Some(error),
+            Self::EmptySourceLanguage | Self::EmptyTargetLanguage => None,
         }
     }
 }
@@ -150,8 +191,6 @@ mod tests {
     #[cfg(any(unix, windows))]
     use std::ffi::OsString;
     use std::sync::{Arc, Mutex};
-
-    use crate::project_database::CreatedProject;
 
     use super::*;
 
@@ -217,7 +256,7 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeCreator {
-        projects: Arc<Mutex<Vec<NewProject>>>,
+        projects: Arc<Mutex<Vec<NewProjectWorkspace>>>,
         failure: bool,
     }
 
@@ -237,19 +276,19 @@ mod tests {
         }
     }
 
-    impl ProjectDatabaseCreator for FakeCreator {
+    impl ProjectWorkspaceCreator for FakeCreator {
         type Error = FakeCreatorError;
 
-        async fn create(&self, project: NewProject) -> Result<CreatedProject, Self::Error> {
+        async fn create(&self, project: NewProjectWorkspace) -> Result<(), Self::Error> {
             self.projects
                 .lock()
-                .expect("数据库创建调用记录锁不应中毒")
+                .expect("工作区创建调用记录锁不应中毒")
                 .push(project);
 
             if self.failure {
                 Err(FakeCreatorError)
             } else {
-                Ok(CreatedProject::new(PathBuf::from("C:/databases/demo.db")))
+                Ok(())
             }
         }
     }
@@ -271,7 +310,16 @@ mod tests {
             game_root: PathBuf::from("./Game One"),
             source_language: " ja ".to_owned(),
             target_language: " ja ".to_owned(),
+            layout_profile: profile(),
         }
+    }
+
+    fn profile() -> MzWriteBackLayoutProfile {
+        MzWriteBackLayoutProfile::new(width(24), width(30), width(18))
+    }
+
+    fn width(value: u32) -> super::super::project::MaxFullwidthChars {
+        super::super::project::MaxFullwidthChars::new(value).expect("测试宽度应该是正整数")
     }
 
     #[tokio::test]
@@ -296,18 +344,16 @@ mod tests {
         );
 
         let projects = service
-            .database_creator
+            .workspace_creator
             .projects
             .lock()
-            .expect("数据库创建调用记录锁不应中毒");
+            .expect("工作区创建调用记录锁不应中毒");
         assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].name().as_str(), "游戏 一");
-        assert_eq!(
-            projects[0].game_root(),
-            resolved_root.to_str().expect("测试规范目录应该是 UTF-8")
-        );
-        assert_eq!(projects[0].source_language(), "ja");
-        assert_eq!(projects[0].target_language(), "ja");
+        assert_eq!(projects[0].source_game_root(), resolved_root);
+        assert_eq!(projects[0].project().name().as_str(), "游戏 一");
+        assert_eq!(projects[0].project().source_language(), "ja");
+        assert_eq!(projects[0].project().target_language(), "ja");
+        assert_eq!(projects[0].project().layout_profile(), &profile());
     }
 
     #[tokio::test]
@@ -346,10 +392,10 @@ mod tests {
             );
             assert!(
                 service
-                    .database_creator
+                    .workspace_creator
                     .projects
                     .lock()
-                    .expect("数据库创建调用记录锁不应中毒")
+                    .expect("工作区创建调用记录锁不应中毒")
                     .is_empty()
             );
         }
@@ -383,17 +429,17 @@ mod tests {
             assert_eq!(actual_kind, expected_kind);
             assert!(
                 service
-                    .database_creator
+                    .workspace_creator
                     .projects
                     .lock()
-                    .expect("数据库创建调用记录锁不应中毒")
+                    .expect("工作区创建调用记录锁不应中毒")
                     .is_empty()
             );
         }
     }
 
     #[tokio::test]
-    async fn preserves_creator_failure_after_one_call() {
+    async fn preserves_workspace_failure_after_one_call() {
         let service = InitService::new(
             FakeFileSystem::new(FileSystemOutcome::Resolved(PathBuf::from("C:/Games/Demo"))),
             FakeCreator::failing(),
@@ -402,18 +448,18 @@ mod tests {
         let error = service
             .execute(input())
             .await
-            .expect_err("数据库创建失败应该向上返回");
+            .expect_err("工作区创建失败应该向上返回");
 
         assert!(matches!(
             error,
-            InitServiceError::Database(FakeCreatorError)
+            InitServiceError::Workspace(FakeCreatorError)
         ));
         assert_eq!(
             service
-                .database_creator
+                .workspace_creator
                 .projects
                 .lock()
-                .expect("数据库创建调用记录锁不应中毒")
+                .expect("工作区创建调用记录锁不应中毒")
                 .len(),
             1
         );
@@ -421,25 +467,26 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[tokio::test]
-    async fn rejects_non_utf8_resolved_path_without_calling_creator() {
+    async fn passes_non_utf8_resolved_path_to_workspace_creator_losslessly() {
+        let resolved_path = non_utf8_path();
         let service = InitService::new(
-            FakeFileSystem::new(FileSystemOutcome::Resolved(non_utf8_path())),
+            FakeFileSystem::new(FileSystemOutcome::Resolved(resolved_path.clone())),
             FakeCreator::succeeding(),
         );
 
-        let error = service
+        service
             .execute(input())
             .await
-            .expect_err("非 UTF-8 规范路径应该被拒绝");
+            .expect("非 UTF-8 路径不应经过文本转换");
 
-        assert!(matches!(error, InitServiceError::NonUtf8GameRoot(_)));
-        assert!(
+        assert_eq!(
             service
-                .database_creator
+                .workspace_creator
                 .projects
                 .lock()
-                .expect("数据库创建调用记录锁不应中毒")
-                .is_empty()
+                .expect("工作区创建调用记录锁不应中毒")[0]
+                .source_game_root(),
+            resolved_path
         );
     }
 

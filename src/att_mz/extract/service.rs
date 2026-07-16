@@ -281,10 +281,11 @@ mod tests {
     fn opened_project() -> OpenedProject {
         OpenedProject::new(
             project_name(),
-            PathBuf::from("C:/games/alice"),
-            PathBuf::from("C:/projects/alice.db"),
+            PathBuf::from("C:/projects/alice"),
+            PathBuf::from("C:/projects/alice/project.db"),
             "ja".to_owned(),
             "zh-CN".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         )
     }
 

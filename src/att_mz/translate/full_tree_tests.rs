@@ -155,15 +155,20 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
         path: PathBuf,
         query: SqliteQuery,
     ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>> {
-        assert_eq!(path, PathBuf::from("C:/projects/demo.db"));
+        assert_eq!(
+            path,
+            PathBuf::from("C:/projects").join("demo").join("project.db")
+        );
         if query.statement().contains("FROM metadata") {
             record(&self.events, Event::QueryMetadata);
             assert!(query.parameters().is_empty());
             return Ok(vec![SqliteRow::new(vec![
                 SqliteValue::Text("demo".to_owned()),
-                SqliteValue::Text("C:/games/demo".to_owned()),
                 SqliteValue::Text("ja".to_owned()),
                 SqliteValue::Text("zh-Hans".to_owned()),
+                SqliteValue::Integer(24),
+                SqliteValue::Integer(30),
+                SqliteValue::Integer(18),
             ])]);
         }
 
@@ -214,7 +219,10 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
         path: PathBuf,
         plan: SqliteTransactionPlan,
     ) -> Result<(), ExecuteTransactionError<Self::Error>> {
-        assert_eq!(path, PathBuf::from("C:/projects/demo.db"));
+        assert_eq!(
+            path,
+            PathBuf::from("C:/projects").join("demo").join("project.db")
+        );
         let translated_leaf_count = plan
             .steps()
             .iter()
@@ -435,7 +443,10 @@ impl SqliteInteractiveSessionFactory for FakeSqliteInteractiveSessionFactory {
         &self,
         path: PathBuf,
     ) -> Result<Self::Session, OpenSqliteInteractiveSessionError<Self::Error>> {
-        assert_eq!(path, PathBuf::from("C:/projects/demo.db"));
+        assert_eq!(
+            path,
+            PathBuf::from("C:/projects").join("demo").join("project.db")
+        );
         self.calls.fetch_add(1, Ordering::SeqCst);
         record(&self.events, Event::OpenLuaDatabase(path));
         Ok(self.session.clone())

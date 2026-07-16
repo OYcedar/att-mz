@@ -11,31 +11,44 @@ use super::ProjectName;
 use crate::project_database::ProjectDatabaseRecordReader;
 use crate::storage::file_system::{ExistingDirectoryResolver, ResolveDirectoryError};
 
+pub use crate::project_database::{
+    MaxFullwidthChars, MaxFullwidthCharsError, MzWriteBackLayoutProfile,
+};
+
 /// 已由项目开启边界建立、可供 MZ 各用例直接信任的项目上下文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OpenedProject {
     name: ProjectName,
-    game_root: PathBuf,
+    workspace_root: PathBuf,
+    source_root: PathBuf,
+    write_back_root: PathBuf,
     database_path: PathBuf,
     source_language: String,
     target_language: String,
+    layout_profile: MzWriteBackLayoutProfile,
 }
 
 impl OpenedProject {
     /// 建立一个受信项目上下文。
     pub(crate) fn new(
         name: ProjectName,
-        game_root: PathBuf,
+        workspace_root: PathBuf,
         database_path: PathBuf,
         source_language: String,
         target_language: String,
+        layout_profile: MzWriteBackLayoutProfile,
     ) -> Self {
+        let source_root = workspace_root.join("source");
+        let write_back_root = workspace_root.join("write_back");
         Self {
             name,
-            game_root,
+            workspace_root,
+            source_root,
+            write_back_root,
             database_path,
             source_language,
             target_language,
+            layout_profile,
         }
     }
 
@@ -43,8 +56,16 @@ impl OpenedProject {
         &self.name
     }
 
-    pub(crate) fn game_root(&self) -> &Path {
-        &self.game_root
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+
+    pub(crate) fn write_back_root(&self) -> &Path {
+        &self.write_back_root
     }
 
     pub(crate) fn database_path(&self) -> &Path {
@@ -58,6 +79,10 @@ impl OpenedProject {
     pub(crate) fn target_language(&self) -> &str {
         &self.target_language
     }
+
+    pub(crate) fn layout_profile(&self) -> &MzWriteBackLayoutProfile {
+        &self.layout_profile
+    }
 }
 
 /// 把项目名称解析为当前仍可使用的受信项目上下文。
@@ -65,7 +90,7 @@ pub(crate) trait ExistingProjectOpener: Send + Sync {
     /// 项目开启失败。
     type Error: Error + Send + Sync + 'static;
 
-    /// 打开项目并重新观测游戏根目录。
+    /// 打开项目并重新观测冻结原文所需的 `source/data` 与 `source/js`。
     fn open(
         &self,
         name: &ProjectName,
@@ -100,18 +125,23 @@ where
             .read(name)
             .await
             .map_err(ExistingProjectOpeningError::ReadProjectRecord)?;
-        let game_root = self
-            .directory_resolver
-            .resolve_existing_directory(record.game_root().to_path_buf())
+        let source_root = record.workspace_root().join("source");
+        self.directory_resolver
+            .resolve_existing_directory(source_root.join("data"))
             .await
-            .map_err(ExistingProjectOpeningError::ResolveGameRoot)?;
+            .map_err(ExistingProjectOpeningError::ResolveSourceData)?;
+        self.directory_resolver
+            .resolve_existing_directory(source_root.join("js"))
+            .await
+            .map_err(ExistingProjectOpeningError::ResolveSourceJs)?;
 
         Ok(OpenedProject::new(
             record.name().clone(),
-            game_root,
+            record.workspace_root().to_path_buf(),
             record.database_path().to_path_buf(),
             record.source_language().to_owned(),
             record.target_language().to_owned(),
+            *record.layout_profile(),
         ))
     }
 }
@@ -121,8 +151,10 @@ where
 pub(crate) enum ExistingProjectOpeningError<R, D> {
     /// 无法读取项目数据库记录。
     ReadProjectRecord(R),
-    /// metadata 中记录的游戏根目录当前不可用。
-    ResolveGameRoot(ResolveDirectoryError<D>),
+    /// 冻结的 `source/data` 当前不可用。
+    ResolveSourceData(ResolveDirectoryError<D>),
+    /// 冻结的 `source/js` 当前不可用。
+    ResolveSourceJs(ResolveDirectoryError<D>),
 }
 
 impl<R, D> fmt::Display for ExistingProjectOpeningError<R, D>
@@ -133,7 +165,12 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReadProjectRecord(error) => write!(formatter, "无法读取项目记录：{error}"),
-            Self::ResolveGameRoot(error) => write!(formatter, "游戏根目录当前不可用：{error}"),
+            Self::ResolveSourceData(error) => {
+                write!(formatter, "冻结的 data 目录当前不可用：{error}")
+            }
+            Self::ResolveSourceJs(error) => {
+                write!(formatter, "冻结的 js 目录当前不可用：{error}")
+            }
         }
     }
 }
@@ -146,13 +183,23 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ReadProjectRecord(error) => Some(error),
-            Self::ResolveGameRoot(error) => Some(error),
+            Self::ResolveSourceData(error) | Self::ResolveSourceJs(error) => Some(error),
         }
     }
 }
 
 #[cfg(test)]
+pub(crate) fn test_layout_profile() -> MzWriteBackLayoutProfile {
+    MzWriteBackLayoutProfile::new(
+        MaxFullwidthChars::new(24).expect("测试对话宽度应该合法"),
+        MaxFullwidthChars::new(30).expect("测试滚动文本宽度应该合法"),
+        MaxFullwidthChars::new(18).expect("测试帮助说明宽度应该合法"),
+    )
+}
+
+#[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use crate::project_database::StoredProjectRecord;
@@ -179,8 +226,19 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeDirectoryResolver {
-        response: Result<PathBuf, DirectoryResponseError>,
+        responses: Arc<Mutex<VecDeque<Result<PathBuf, DirectoryResponseError>>>>,
         calls: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl FakeDirectoryResolver {
+        fn new(
+            responses: impl IntoIterator<Item = Result<PathBuf, DirectoryResponseError>>,
+        ) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     impl ExistingDirectoryResolver for FakeDirectoryResolver {
@@ -194,16 +252,21 @@ mod tests {
                 .lock()
                 .expect("目录解析调用锁不应中毒")
                 .push(path.clone());
-            self.response.clone().map_err(|error| match error {
-                DirectoryResponseError::NotFound => ResolveDirectoryError::NotFound { path },
-                DirectoryResponseError::NotDirectory => {
-                    ResolveDirectoryError::NotDirectory { path }
-                }
-                DirectoryResponseError::Io => ResolveDirectoryError::Io {
-                    path,
-                    source: FakeDirectoryError,
-                },
-            })
+            self.responses
+                .lock()
+                .expect("目录响应锁不应中毒")
+                .pop_front()
+                .expect("测试应为每次目录调用提供响应")
+                .map_err(|error| match error {
+                    DirectoryResponseError::NotFound => ResolveDirectoryError::NotFound { path },
+                    DirectoryResponseError::NotDirectory => {
+                        ResolveDirectoryError::NotDirectory { path }
+                    }
+                    DirectoryResponseError::Io => ResolveDirectoryError::Io {
+                        path,
+                        source: FakeDirectoryError,
+                    },
+                })
         }
     }
 
@@ -239,11 +302,20 @@ mod tests {
     fn record() -> StoredProjectRecord {
         StoredProjectRecord::new(
             "游戏 一".parse().expect("测试项目名称应该有效"),
-            PathBuf::from("./Game One"),
-            PathBuf::from("C:/att/projects/游戏 一.db"),
+            PathBuf::from("C:/att/projects/游戏 一"),
+            PathBuf::from("C:/att/projects/游戏 一/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
+            profile(),
         )
+    }
+
+    fn profile() -> MzWriteBackLayoutProfile {
+        MzWriteBackLayoutProfile::new(width(24), width(30), width(18))
+    }
+
+    fn width(value: u32) -> MaxFullwidthChars {
+        MaxFullwidthChars::new(value).expect("测试宽度应该是正整数")
     }
 
     fn succeeding_service() -> ExistingProjectOpeningService<FakeRecordReader, FakeDirectoryResolver>
@@ -253,15 +325,15 @@ mod tests {
                 response: Ok(record()),
                 calls: Arc::new(Mutex::new(Vec::new())),
             },
-            FakeDirectoryResolver {
-                response: Ok(PathBuf::from("C:/Games/Game One")),
-                calls: Arc::new(Mutex::new(Vec::new())),
-            },
+            FakeDirectoryResolver::new([
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/data")),
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/js")),
+            ]),
         )
     }
 
     #[tokio::test]
-    async fn reads_record_and_reobserves_directory_exactly_once() {
+    async fn reads_record_and_reobserves_both_frozen_source_directories() {
         let service = succeeding_service();
 
         let opened = service
@@ -270,13 +342,25 @@ mod tests {
             .expect("项目应该成功开启");
 
         assert_eq!(opened.name().as_str(), "游戏 一");
-        assert_eq!(opened.game_root(), Path::new("C:/Games/Game One"));
+        assert_eq!(
+            opened.workspace_root(),
+            Path::new("C:/att/projects/游戏 一")
+        );
+        assert_eq!(
+            opened.source_root(),
+            Path::new("C:/att/projects/游戏 一/source")
+        );
+        assert_eq!(
+            opened.write_back_root(),
+            Path::new("C:/att/projects/游戏 一/write_back")
+        );
         assert_eq!(
             opened.database_path(),
-            Path::new("C:/att/projects/游戏 一.db")
+            Path::new("C:/att/projects/游戏 一/project.db")
         );
         assert_eq!(opened.source_language(), "ja");
         assert_eq!(opened.target_language(), "zh-Hans");
+        assert_eq!(opened.layout_profile(), &profile());
         assert_eq!(
             service
                 .record_reader
@@ -293,7 +377,10 @@ mod tests {
                 .lock()
                 .expect("目录解析调用锁不应中毒")
                 .as_slice(),
-            &[PathBuf::from("./Game One")]
+            &[
+                PathBuf::from("C:/att/projects/游戏 一/source/data"),
+                PathBuf::from("C:/att/projects/游戏 一/source/js"),
+            ]
         );
     }
 
@@ -304,10 +391,10 @@ mod tests {
                 response: Err(FakeRecordError),
                 calls: Arc::new(Mutex::new(Vec::new())),
             },
-            FakeDirectoryResolver {
-                response: Ok(PathBuf::from("C:/Games/Game One")),
-                calls: Arc::new(Mutex::new(Vec::new())),
-            },
+            FakeDirectoryResolver::new([
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/data")),
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/js")),
+            ]),
         );
 
         let error = service
@@ -330,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_failure_keeps_stage_and_source() {
+    async fn data_directory_failure_stops_before_js_validation() {
         for response in [
             DirectoryResponseError::NotFound,
             DirectoryResponseError::NotDirectory,
@@ -341,10 +428,7 @@ mod tests {
                     response: Ok(record()),
                     calls: Arc::new(Mutex::new(Vec::new())),
                 },
-                FakeDirectoryResolver {
-                    response: Err(response),
-                    calls: Arc::new(Mutex::new(Vec::new())),
-                },
+                FakeDirectoryResolver::new([Err(response)]),
             );
 
             let error = service
@@ -353,19 +437,66 @@ mod tests {
                 .expect_err("失效目录应该阻止项目开启");
 
             match error {
-                ExistingProjectOpeningError::ResolveGameRoot(ResolveDirectoryError::NotFound {
-                    path,
-                }) => assert_eq!(path, PathBuf::from("./Game One")),
-                ExistingProjectOpeningError::ResolveGameRoot(
+                ExistingProjectOpeningError::ResolveSourceData(
+                    ResolveDirectoryError::NotFound { path },
+                ) => assert_eq!(path, PathBuf::from("C:/att/projects/游戏 一/source/data")),
+                ExistingProjectOpeningError::ResolveSourceData(
                     ResolveDirectoryError::NotDirectory { path },
-                ) => assert_eq!(path, PathBuf::from("./Game One")),
-                ExistingProjectOpeningError::ResolveGameRoot(ResolveDirectoryError::Io {
+                ) => assert_eq!(path, PathBuf::from("C:/att/projects/游戏 一/source/data")),
+                ExistingProjectOpeningError::ResolveSourceData(ResolveDirectoryError::Io {
                     source,
                     ..
                 }) => assert_eq!(source, FakeDirectoryError),
                 other => panic!("未预期的项目开启错误：{other}"),
             }
+            assert_eq!(
+                service
+                    .directory_resolver
+                    .calls
+                    .lock()
+                    .expect("目录解析调用锁不应中毒")
+                    .as_slice(),
+                &[PathBuf::from("C:/att/projects/游戏 一/source/data")]
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn js_directory_failure_is_reported_after_data_validation() {
+        let service = ExistingProjectOpeningService::new(
+            FakeRecordReader {
+                response: Ok(record()),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeDirectoryResolver::new([
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/data")),
+                Err(DirectoryResponseError::NotFound),
+            ]),
+        );
+
+        let error = service
+            .open(&"游戏 一".parse().expect("测试项目名称应该有效"))
+            .await
+            .expect_err("缺少冻结 js 应该阻止项目开启");
+
+        let ExistingProjectOpeningError::ResolveSourceJs(ResolveDirectoryError::NotFound { path }) =
+            error
+        else {
+            panic!("未预期的项目开启错误：{error}")
+        };
+        assert_eq!(path, PathBuf::from("C:/att/projects/游戏 一/source/js"));
+        assert_eq!(
+            service
+                .directory_resolver
+                .calls
+                .lock()
+                .expect("目录解析调用锁不应中毒")
+                .as_slice(),
+            &[
+                PathBuf::from("C:/att/projects/游戏 一/source/data"),
+                PathBuf::from("C:/att/projects/游戏 一/source/js"),
+            ]
+        );
     }
 
     #[test]
