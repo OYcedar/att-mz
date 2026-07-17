@@ -98,7 +98,8 @@ ctx = {
 | Translate | `translate` | 有 | 有 | nil |
 | WriteBack | `write_back` | 有 | nil | 已发布输出路径 |
 
-Translate 的 `ctx.llm` 使用本次选中的同一翻译 Profile、共享 HTTP 连接池和速率额度。
+Translate 的 `ctx.llm` 与 Standard 使用本次 Profile 引用的同一公共 LLM Client，
+共享 Executor、HTTP 连接池、全局准入和客户端速率额度。
 其他阶段不构造 LLM 能力，也不注入占位函数。
 
 ## 4. SQLite 值与事务
@@ -129,6 +130,11 @@ Translate 的 `ctx.llm` 只接受一个无洞 messages 数组。每一项必须�
 `role` 与 `content` 两个字符串字段；role 只接受 `system`、`user`、`assistant`。
 Lua 完整拥有响应 content 的解释、验收和是否再次调用模型的决定，Host 不修复或
 解析其业务内容。
+
+Lua 不能提交 model、认证、stream 或额外请求字段，也不能读取配置中的 Bearer。
+公共 Client 固定提供 `model` 与 `stream=false`，并透传自身受信
+`request_body_extra`；因此 Lua 与 Standard 使用完全相同的 endpoint、凭据、请求
+参数和速率事实，只由各自提供的 messages 区分调用。
 
 成功返回：
 

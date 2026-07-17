@@ -12,6 +12,7 @@ use crate::att_mz::text::{MzLocationStep, MzSource, StandardDataFile, TextGroupK
 use crate::language::{
     LanguageAnalysis, LanguageModule, LanguageModuleCatalog, LanguageModuleCatalogError,
 };
+use crate::llm::{ChatMessage, ChatMessageRole};
 use crate::project_database::StoredProjectRecord;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
@@ -30,12 +31,11 @@ use super::profile::{
     TranslationProfileConfigurationError, TranslationProfileLanguagePair,
 };
 use super::standard::{
-    ChatMessage, ChatMessageRole, ExpectedTranslationOutput, StandardTranslationCorpus,
-    StandardTranslationGroup, StandardTranslationInput, StandardTranslationPlan,
-    StandardTranslationTaskIndex, StandardTranslationTaskPlanner, TerminologyDependency,
-    TranslationInvalidation, TranslationLanguagePair, TranslationLeafIdentity,
-    TranslationPlanPreparation, TranslationTaskBlock, TranslationTaskGroup, TranslationTaskUnit,
-    TranslationVirtualReason,
+    ExpectedTranslationOutput, StandardTranslationCorpus, StandardTranslationGroup,
+    StandardTranslationInput, StandardTranslationPlan, StandardTranslationTaskIndex,
+    StandardTranslationTaskPlanner, TerminologyDependency, TranslationInvalidation,
+    TranslationLanguagePair, TranslationLeafIdentity, TranslationPlanPreparation,
+    TranslationTaskBlock, TranslationTaskGroup, TranslationTaskUnit, TranslationVirtualReason,
 };
 
 /// 使用三个职责模块与 CPU 根建立确定性 MZ 翻译计划。
@@ -44,7 +44,7 @@ pub(crate) struct MzStandardTranslationTaskPlanningService<R, C, L> {
     languages: LanguageModuleCatalog,
     placeholders: Pcre2PlaceholderService,
     cpu: C,
-    llm_profile: PhantomData<fn() -> L>,
+    llm_client: PhantomData<fn() -> L>,
 }
 
 impl<R, C, L> MzStandardTranslationTaskPlanningService<R, C, L> {
@@ -59,7 +59,7 @@ impl<R, C, L> MzStandardTranslationTaskPlanningService<R, C, L> {
             languages,
             placeholders,
             cpu,
-            llm_profile: PhantomData,
+            llm_client: PhantomData,
         }
     }
 }
@@ -1246,7 +1246,7 @@ mod tests {
             MzTranslationExecutionPayload::new(
                 planning,
                 MzTranslationExecutionConfiguration::new(Vec::new(), Duration::ZERO),
-                (),
+                Arc::new(()),
             ),
         ))
     }

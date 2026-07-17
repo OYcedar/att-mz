@@ -1097,7 +1097,7 @@ h1 {
       label: "Translate",
       zh: "翻译总控",
       color: "var(--blue)",
-      summary: "ProductionMzCommandRunner 只解析所选 Profile 的密钥并装配 Translate；规划、执行、日志和入库都在 Standard 分支里。",
+      summary: "ProductionMzCommandRunner 取得所选 Profile 引用的公共 LLM Client 并装配 Translate；规划、执行、日志和入库都在 Standard 分支里。",
       sequence: "① 选择 Profile → ② 读取项目档案 → ③ Standard → ④ Lua（可选）",
       tree: null
     },
@@ -1119,7 +1119,7 @@ h1 {
       path: "src/application/command.rs",
       status: "生产组合边界已实现",
       role: "只为当前 MZ 命令构造所需纵向切片，统一持有根生命周期并在业务结束后完成 shutdown。",
-      plain: "Init 不会因为未使用的 LLM 密钥或 Lua 运行时失败；Translate 才构造所选 Profile 的模型客户端，显式 Lua 时才构造 Lua 根。",
+      plain: "Init 不会构造未使用的 LLM 或 Lua 运行时；Translate 才构造所选 Profile 引用的公共模型客户端，显式 Lua 时才构造 Lua 根。",
       example: "att mz init 只装配文件系统与 SQLite 建库；att mz translate 才装配 CPU、SQLite、LLM、Delay、翻译日志与运行标识。",
       input: "严格解析的 AttArguments、MzCommand 与受信配置",
       output: "命令结果和完整 shutdown 结果",
@@ -1467,18 +1467,31 @@ h1 {
       output: "OpenedSqliteInteractiveSession { operations, finalizer } 或打开错误",
       boundary: "BEGIN 固定为 DEFERRED；每条语句后以 SQLite is_autocommit() 校正权威状态，OutcomeUnknown 会毒化 actor。"
     },
+    "llm-contract": {
+      title: "公共 LLM 请求契约",
+      symbol: "LlmRequestExecutor · ChatMessage · LlmResponse",
+      shortSymbol: "Shared LLM Contract",
+      path: "src/llm.rs",
+      status: "crate 私有共享核心已实现",
+      role: "让不同引擎业务与可信 Lua 用同一组消息、响应和单次失败语义调用模型根。",
+      plain: "公共层只表达一次非流式调用需要什么、返回什么；它不知道 MZ 资产、提示词规划或网络重试策略。",
+      example: "MZ Standard 和 Translate Lua 都提交 ChatMessage，并收到同一种 LlmResponse；以后其他引擎可以直接消费同一契约。",
+      input: "受信 Client 与 ChatMessage 列表",
+      output: "LlmResponse 或 Retryable/Fatal 单次请求错误",
+      boundary: "协议、认证和资源治理属于具体根；重试、响应业务解析和结果提交仍属于调用方。"
+    },
     "llm-root": {
-      title: "LLM 请求根",
+      title: "LLM 请求生产根",
       symbol: "OpenAiChatCompletionExecutor as LlmRequestExecutor",
       shortSymbol: "OpenAiChatCompletionExecutor",
       path: "src/runtime/llm.rs",
       status: "生产根已实现",
-      role: "按受信 Profile 发出符合 OpenAI Chat Completions 协议的非流式、单 choice 请求。",
-      plain: "Standard Translate 与 Translate Lua 共享同一 Client、Profile、连接池和速率额度；其他阶段的 ctx.llm 为 nil。",
-      example: "WriteBack 脚本调用 LLM 会得到阶段不可用，不会偷用某个默认 Profile。",
-      input: "Profile 与消息",
+      role: "按受信公共 Client 发出 OpenAI-compatible Chat Completions 非流式请求。",
+      plain: "Standard Translate 与 Translate Lua 共享同一 Executor、Client、连接池和速率额度；其他阶段的 ctx.llm 为 nil。",
+      example: "没有额外 JSON 参数时，请求正文严格只有 model、messages、stream=false；WriteBack 不会偷用某个默认 Client。",
+      input: "公共 Client 与消息",
       output: "区分 provider request/response ID、finish reason 与 usage 的 LlmResponse，或结构化请求错误",
-      boundary: "请求准入、RPM/burst、active 上限、HTTP wire、大小限制和错误分类由根负责；根不重试。"
+      boundary: "根固定 model、messages、stream=false，只合并 Client 的额外 JSON 字段；请求准入、RPM/burst、大小限制和错误分类由根负责，根不重试。"
     },
     "delay-root": {
       title: "异步等待根",
@@ -1553,7 +1566,7 @@ h1 {
       role: "统一管理可信 Lua 调用的上下文、会话生命周期、提交和清理。",
       plain: "它像剧场经理：Extract、Translate 和 WriteBack 共用同一舞台，但每次演出的阶段、项目文件边界、数据库会话与结束清理都由 Host 管住。",
       example: "WriteBack 脚本报错时，Host 回滚未提交的数据库事务并关闭会话；脚本已显式提交的结果不会被伪装成从未发生。",
-      input: "LuaInvocation：阶段、脚本、项目事实与可选 Profile",
+      input: "LuaInvocation：阶段、脚本、项目事实与可选公共 LLM Client",
       output: "脚本完成，或带清理结果的明确错误",
       boundary: "Host 依赖 SystemFileSystem、TrustedLua54Runtime、RusqliteStorage 与可选 OpenAiChatCompletionExecutor；WriteBack 不开放 ctx.llm。"
     },
@@ -1568,7 +1581,7 @@ h1 {
       example: "用户选择 profile=quality。Translate 找到唯一配置，读取 demo 项目，先让 Standard 完整结束；只有成功后，才运行可选 Lua 翻译脚本。",
       input: "项目名、Profile 名、术语/占位符路径与可选 Lua",
       output: "Standard 报告与可选 Lua 完成结果",
-      boundary: "Standard 执行分支直接展示模型与等待生产根；Lua 分支复用同一模型 Profile。"
+      boundary: "Standard 执行分支直接展示模型与等待生产根；Lua 分支复用同一公共 LLM Client。"
     },
     "profile-resolver": {
       title: "精确选择 Profile",
@@ -1746,10 +1759,10 @@ h1 {
       shortSymbol: "Lua Translation",
       path: "src/att_mz/translate/lua.rs",
       status: "业务逻辑已实现",
-      role: "在 Standard 正常完成后，把同一个项目事实和 Profile 交给可信 Lua 脚本。",
+      role: "在 Standard 正常完成后，把同一个项目事实和公共 LLM Client 交给可信 Lua 脚本。",
       plain: "它负责项目自定义数据的翻译扩展，但不抢 Standard 的职责，也不会在 Standard 失败后继续写自己的结果。",
-      example: "标准物品与事件先由 Standard 翻译完成；随后 Lua 脚本可以处理自建 quest_text 表，并使用同一个 quality Profile。",
-      input: "StoredProjectRecord、共享 Profile 与脚本路径",
+      example: "标准物品与事件先由 Standard 翻译完成；随后 Lua 脚本可以处理自建 quest_text 表，并使用 quality Profile 引用的同一个 Client。",
+      input: "StoredProjectRecord、共享执行 Profile 与脚本路径",
       output: "Lua 翻译阶段完成或明确失败"
     },
     "writeback-service": {
@@ -1955,7 +1968,9 @@ h1 {
         n("planner-dedup", "deduplication")
       ], { order: "②" }),
       n("standard-executor", "executor", [
-        n("executor-llm", "llm-root", [], { reused: true }),
+        n("executor-llm-contract", "llm-contract", [
+          n("executor-llm", "llm-root", [], { reused: true })
+        ], { reused: true }),
         n("executor-delay", "delay-root"),
         n("executor-response", "response-processor", [
           n("response-token", "placeholder-token-envelope", [], { reused: true }),
@@ -1976,7 +1991,9 @@ h1 {
         n("translate-lua-file", "file-reader-root", [], { reused: true }),
         n("translate-lua-runtime", "lua-runtime-root", [], { reused: true }),
         n("translate-lua-session", "sqlite-session-root", [], { reused: true }),
-        n("translate-lua-llm", "llm-root", [], { reused: true })
+        n("translate-lua-llm-contract", "llm-contract", [
+          n("translate-lua-llm", "llm-root", [], { reused: true })
+        ], { reused: true })
       ], { reused: true })
     ], { order: "④", optional: true })
     ])

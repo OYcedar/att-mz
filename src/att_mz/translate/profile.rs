@@ -132,19 +132,19 @@ impl MzTranslationExecutionConfiguration {
 pub(crate) struct MzTranslationExecutionPayload<L> {
     planning: MzTranslationPlanningConfiguration,
     execution: MzTranslationExecutionConfiguration,
-    llm: L,
+    llm_client: Arc<L>,
 }
 
 impl<L> MzTranslationExecutionPayload<L> {
     pub(crate) fn new(
         planning: MzTranslationPlanningConfiguration,
         execution: MzTranslationExecutionConfiguration,
-        llm: L,
+        llm_client: Arc<L>,
     ) -> Self {
         Self {
             planning,
             execution,
-            llm,
+            llm_client,
         }
     }
 
@@ -156,8 +156,8 @@ impl<L> MzTranslationExecutionPayload<L> {
         &self.execution
     }
 
-    pub(crate) fn llm(&self) -> &L {
-        &self.llm
+    pub(crate) fn llm_client(&self) -> &L {
+        self.llm_client.as_ref()
     }
 }
 
@@ -360,11 +360,11 @@ pub(crate) enum TranslationProfileCatalogError {
 impl fmt::Display for TranslationProfileCatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => formatter.write_str("没有配置任何 LLM Profile"),
+            Self::Empty => formatter.write_str("没有配置任何翻译 Profile"),
             Self::BlankId { index } => {
-                write!(formatter, "第 {} 个 LLM Profile 的 ID 为空", index + 1)
+                write!(formatter, "第 {} 个翻译 Profile 的 ID 为空", index + 1)
             }
-            Self::DuplicateId { id } => write!(formatter, "LLM Profile ID 重复：{id}"),
+            Self::DuplicateId { id } => write!(formatter, "翻译 Profile ID 重复：{id}"),
         }
     }
 }
@@ -425,7 +425,7 @@ impl fmt::Display for TranslationExecutionProfileResolveError {
                 available_ids,
             } => write!(
                 formatter,
-                "找不到 LLM Profile {requested_id}；可用 Profile：{}",
+                "找不到翻译 Profile {requested_id}；可用 Profile：{}",
                 available_ids.join("、")
             ),
         }
@@ -630,8 +630,8 @@ mod tests {
             vec![Duration::from_millis(250), Duration::from_secs(2)],
             Duration::from_secs(30),
         );
-        let payload =
-            MzTranslationExecutionPayload::new(planning, execution, SensitivePayload("secret"));
+        let client = Arc::new(SensitivePayload("secret"));
+        let payload = MzTranslationExecutionPayload::new(planning, execution, Arc::clone(&client));
 
         assert_eq!(payload.planning().scope_concurrency(), non_zero(4));
         assert_eq!(
@@ -650,7 +650,7 @@ mod tests {
             payload.execution().max_network_retry_after(),
             Duration::from_secs(30)
         );
-        assert!(payload.llm() == &SensitivePayload("secret"));
+        assert!(std::ptr::eq(payload.llm_client(), client.as_ref()));
     }
 
     #[test]

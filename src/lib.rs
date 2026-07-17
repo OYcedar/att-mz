@@ -8,6 +8,7 @@ pub mod att_mz;
 mod application;
 mod execution;
 mod language;
+mod llm;
 mod observability;
 mod project_database;
 mod runtime;

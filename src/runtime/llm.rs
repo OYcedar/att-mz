@@ -17,21 +17,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::{Semaphore, watch};
 use tokio::time::{Instant, timeout_at};
-use url::{Host, Url};
+use url::Url;
 
-use crate::att_mz::translate::executor::{
-    LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse, LlmUsage,
+use crate::llm::{
+    ChatMessage, ChatMessageRole, LlmFinishReason, LlmRequestError, LlmRequestExecutor,
+    LlmResponse, LlmUsage,
 };
-use crate::att_mz::translate::standard::{ChatMessage, ChatMessageRole};
-
-const RESERVED_REQUEST_OPTIONS: [&str; 6] = [
-    "model",
-    "messages",
-    "stream",
-    "n",
-    "max_tokens",
-    "max_completion_tokens",
-];
 
 /// Chat Completions 的认证方式。
 #[derive(Clone, Default)]
@@ -56,28 +47,8 @@ impl fmt::Debug for OpenAiAuthentication {
     }
 }
 
-/// 模型输出上限应使用的精确 Chat Completions 字段。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CompletionLimitParameter {
-    MaxTokens,
-    MaxCompletionTokens,
-}
-
-/// 一个非零的模型输出上限。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CompletionLimit {
-    parameter: CompletionLimitParameter,
-    value: NonZeroU32,
-}
-
-impl CompletionLimit {
-    pub(crate) const fn new(parameter: CompletionLimitParameter, value: NonZeroU32) -> Self {
-        Self { parameter, value }
-    }
-}
-
-/// 一个可被 Standard 与 Translate Lua 共享的受信 LLM Profile。
-pub(crate) struct OpenAiChatCompletionProfile {
+/// 一个可被不同引擎及 Lua 共享的受信 LLM Client。
+pub(crate) struct OpenAiChatCompletionClient {
     endpoint: Url,
     authentication: OpenAiAuthentication,
     model: String,
@@ -85,72 +56,44 @@ pub(crate) struct OpenAiChatCompletionProfile {
     max_request_bytes: NonZeroUsize,
     max_response_bytes: NonZeroUsize,
     max_error_response_bytes: NonZeroUsize,
-    completion_limit: CompletionLimit,
-    request_options: Map<String, Value>,
+    request_body_extra: Map<String, Value>,
     rate_limiter: Arc<DefaultDirectRateLimiter>,
 }
 
-impl OpenAiChatCompletionProfile {
+impl OpenAiChatCompletionClient {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         endpoint: Url,
         authentication: OpenAiAuthentication,
         model: impl Into<String>,
-        allow_plain_http_loopback: bool,
         request_timeout: Duration,
         max_request_bytes: NonZeroUsize,
         max_response_bytes: NonZeroUsize,
         max_error_response_bytes: NonZeroUsize,
         requests_per_minute: NonZeroU32,
         burst_requests: NonZeroU32,
-        completion_limit: CompletionLimit,
-        request_options: Map<String, Value>,
-    ) -> Result<Self, OpenAiProfileError> {
-        validate_endpoint(&endpoint, allow_plain_http_loopback)?;
-        let model = model.into();
-        if model.trim().is_empty() {
-            return Err(OpenAiProfileError::BlankModel);
-        }
-        if model.trim() != model {
-            return Err(OpenAiProfileError::SurroundingWhitespaceInModel);
-        }
-        if let OpenAiAuthentication::Bearer(secret) = &authentication
-            && secret.expose_secret().trim().is_empty()
-        {
-            return Err(OpenAiProfileError::BlankBearerCredential);
-        }
-        if request_timeout.is_zero() {
-            return Err(OpenAiProfileError::ZeroRequestTimeout);
-        }
-        for field in RESERVED_REQUEST_OPTIONS {
-            if request_options.contains_key(field) {
-                return Err(OpenAiProfileError::ReservedRequestOption {
-                    field: field.to_owned(),
-                });
-            }
-        }
-
+        request_body_extra: Map<String, Value>,
+    ) -> Self {
         let quota = Quota::per_minute(requests_per_minute).allow_burst(burst_requests);
-        Ok(Self {
+        Self {
             endpoint,
             authentication,
-            model,
+            model: model.into(),
             request_timeout,
             max_request_bytes,
             max_response_bytes,
             max_error_response_bytes,
-            completion_limit,
-            request_options,
+            request_body_extra,
             rate_limiter: Arc::new(RateLimiter::direct(quota)),
-        })
+        }
     }
 }
 
-impl fmt::Debug for OpenAiChatCompletionProfile {
+impl fmt::Debug for OpenAiChatCompletionClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let request_option_fields = self.request_options.keys().collect::<Vec<_>>();
+        let request_body_extra_fields = self.request_body_extra.keys().collect::<Vec<_>>();
         formatter
-            .debug_struct("OpenAiChatCompletionProfile")
+            .debug_struct("OpenAiChatCompletionClient")
             .field("endpoint_scheme", &self.endpoint.scheme())
             .field("endpoint_host", &self.endpoint.host_str())
             .field("authentication", &self.authentication)
@@ -159,84 +102,8 @@ impl fmt::Debug for OpenAiChatCompletionProfile {
             .field("max_request_bytes", &self.max_request_bytes)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_error_response_bytes", &self.max_error_response_bytes)
-            .field("completion_limit", &self.completion_limit)
-            .field("request_option_fields", &request_option_fields)
+            .field("request_body_extra_fields", &request_body_extra_fields)
             .finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum OpenAiProfileError {
-    EndpointMissingHost,
-    EndpointContainsCredentials,
-    EndpointContainsFragment,
-    UnsupportedEndpointScheme { scheme: String },
-    PlainHttpDisabled,
-    PlainHttpHostNotLoopback,
-    BlankModel,
-    SurroundingWhitespaceInModel,
-    BlankBearerCredential,
-    ZeroRequestTimeout,
-    ReservedRequestOption { field: String },
-}
-
-impl fmt::Display for OpenAiProfileError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EndpointMissingHost => formatter.write_str("LLM endpoint 没有主机"),
-            Self::EndpointContainsCredentials => {
-                formatter.write_str("LLM endpoint 不得内嵌用户名或密码")
-            }
-            Self::EndpointContainsFragment => formatter.write_str("LLM endpoint 不得包含 fragment"),
-            Self::UnsupportedEndpointScheme { scheme } => {
-                write!(formatter, "LLM endpoint 不支持协议 {scheme:?}")
-            }
-            Self::PlainHttpDisabled => formatter.write_str("LLM endpoint 必须使用 HTTPS"),
-            Self::PlainHttpHostNotLoopback => {
-                formatter.write_str("明文 HTTP LLM endpoint 必须是 loopback 主机")
-            }
-            Self::BlankModel => formatter.write_str("LLM 模型名为空"),
-            Self::SurroundingWhitespaceInModel => formatter.write_str("LLM 模型名含首尾空白"),
-            Self::BlankBearerCredential => formatter.write_str("LLM Bearer 密钥为空"),
-            Self::ZeroRequestTimeout => formatter.write_str("LLM 请求超时必须大于零"),
-            Self::ReservedRequestOption { field } => {
-                write!(formatter, "LLM request_options 不得覆盖保留字段 {field:?}")
-            }
-        }
-    }
-}
-
-impl Error for OpenAiProfileError {}
-
-fn validate_endpoint(
-    endpoint: &Url,
-    allow_plain_http_loopback: bool,
-) -> Result<(), OpenAiProfileError> {
-    let host = endpoint
-        .host()
-        .ok_or(OpenAiProfileError::EndpointMissingHost)?;
-    if !endpoint.username().is_empty() || endpoint.password().is_some() {
-        return Err(OpenAiProfileError::EndpointContainsCredentials);
-    }
-    if endpoint.fragment().is_some() {
-        return Err(OpenAiProfileError::EndpointContainsFragment);
-    }
-    match endpoint.scheme() {
-        "https" => Ok(()),
-        "http" if !allow_plain_http_loopback => Err(OpenAiProfileError::PlainHttpDisabled),
-        "http" if is_loopback_host(host) => Ok(()),
-        "http" => Err(OpenAiProfileError::PlainHttpHostNotLoopback),
-        scheme => Err(OpenAiProfileError::UnsupportedEndpointScheme {
-            scheme: scheme.to_owned(),
-        }),
-    }
-}
-
-fn is_loopback_host(host: Host<&str>) -> bool {
-    match host {
-        Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-        Host::Ipv4(address) => address.is_loopback(),
-        Host::Ipv6(address) => address.is_loopback(),
     }
 }
 
@@ -410,10 +277,10 @@ impl OpenAiChatCompletionExecutor {
 
     async fn execute_request(
         &self,
-        profile: &OpenAiChatCompletionProfile,
+        client: &OpenAiChatCompletionClient,
         messages: &[ChatMessage],
     ) -> Result<LlmResponse, LlmRequestError<OpenAiChatCompletionError>> {
-        let request_body = serialize_request(profile, messages).map_err(LlmRequestError::Fatal)?;
+        let request_body = serialize_request(client, messages).map_err(LlmRequestError::Fatal)?;
 
         let total_permit = Arc::clone(&self.total_capacity)
             .try_acquire_owned()
@@ -424,17 +291,17 @@ impl OpenAiChatCompletionExecutor {
             .ok_or_else(|| LlmRequestError::Fatal(OpenAiChatCompletionError::ShuttingDown))?;
         let deadline = Instant::now() + self.admission_timeout;
 
-        wait_for_rate(profile, &self.lifecycle, deadline).await?;
+        wait_for_rate(client, &self.lifecycle, deadline).await?;
         let active_permit =
             wait_for_active(Arc::clone(&self.active_capacity), &self.lifecycle, deadline).await?;
 
         let mut request = self
             .client
-            .post(profile.endpoint.clone())
+            .post(client.endpoint.clone())
             .header(CONTENT_TYPE, "application/json")
-            .timeout(profile.request_timeout)
+            .timeout(client.request_timeout)
             .body(request_body);
-        if let OpenAiAuthentication::Bearer(secret) = &profile.authentication {
+        if let OpenAiAuthentication::Bearer(secret) = &client.authentication {
             request = request.bearer_auth(secret.expose_secret());
         }
 
@@ -443,7 +310,7 @@ impl OpenAiChatCompletionExecutor {
         let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
         if status != StatusCode::OK {
             let facts =
-                read_error_body_facts(response, profile.max_error_response_bytes.get()).await;
+                read_error_body_facts(response, client.max_error_response_bytes.get()).await;
             let error = OpenAiChatCompletionError::HttpStatus {
                 status: status.as_u16(),
                 body_bytes: facts.body_bytes,
@@ -474,7 +341,7 @@ impl OpenAiChatCompletionExecutor {
                 })
             })
             .transpose()?;
-        let response_body = read_success_body(response, profile.max_response_bytes.get()).await?;
+        let response_body = read_success_body(response, client.max_response_bytes.get()).await?;
         let parsed = parse_success_response(&response_body, provider_request_id)?;
 
         drop(active_permit);
@@ -494,15 +361,15 @@ impl fmt::Debug for OpenAiChatCompletionExecutor {
 }
 
 impl LlmRequestExecutor for OpenAiChatCompletionExecutor {
-    type Profile = OpenAiChatCompletionProfile;
+    type Client = OpenAiChatCompletionClient;
     type Error = OpenAiChatCompletionError;
 
     async fn request<'a>(
         &'a self,
-        profile: &'a Self::Profile,
+        client: &'a Self::Client,
         messages: &'a [ChatMessage],
     ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
-        self.execute_request(profile, messages).await
+        self.execute_request(client, messages).await
     }
 }
 
@@ -622,13 +489,8 @@ struct ChatCompletionRequestWire<'a> {
     model: &'a str,
     messages: Vec<RequestMessageWire<'a>>,
     stream: bool,
-    n: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_completion_tokens: Option<u32>,
     #[serde(flatten)]
-    request_options: &'a Map<String, Value>,
+    request_body_extra: &'a Map<String, Value>,
 }
 
 struct BoundedRequestWriter {
@@ -664,7 +526,7 @@ impl Write for BoundedRequestWriter {
 }
 
 fn serialize_request(
-    profile: &OpenAiChatCompletionProfile,
+    client: &OpenAiChatCompletionClient,
     messages: &[ChatMessage],
 ) -> Result<Vec<u8>, OpenAiChatCompletionError> {
     let messages = messages
@@ -678,21 +540,13 @@ fn serialize_request(
             content: message.content(),
         })
         .collect::<Vec<_>>();
-    let completion_value = profile.completion_limit.value.get();
-    let (max_tokens, max_completion_tokens) = match profile.completion_limit.parameter {
-        CompletionLimitParameter::MaxTokens => (Some(completion_value), None),
-        CompletionLimitParameter::MaxCompletionTokens => (None, Some(completion_value)),
-    };
     let wire = ChatCompletionRequestWire {
-        model: &profile.model,
+        model: &client.model,
         messages,
         stream: false,
-        n: 1,
-        max_tokens,
-        max_completion_tokens,
-        request_options: &profile.request_options,
+        request_body_extra: &client.request_body_extra,
     };
-    let maximum = profile.max_request_bytes.get();
+    let maximum = client.max_request_bytes.get();
     let mut writer = BoundedRequestWriter::new(maximum);
     if let Err(source) = serde_json::to_writer(&mut writer, &wire) {
         return if let Some(actual) = writer.first_overflow {
@@ -705,7 +559,7 @@ fn serialize_request(
 }
 
 async fn wait_for_rate(
-    profile: &OpenAiChatCompletionProfile,
+    client: &OpenAiChatCompletionClient,
     lifecycle: &LlmLifecycle,
     deadline: Instant,
 ) -> Result<(), LlmRequestError<OpenAiChatCompletionError>> {
@@ -716,7 +570,7 @@ async fn wait_for_rate(
     }
     let stopped = lifecycle.wait_for_stop();
     tokio::pin!(stopped);
-    let ready = profile.rate_limiter.until_ready();
+    let ready = client.rate_limiter.until_ready();
     tokio::pin!(ready);
     let admitted = timeout_at(deadline, async {
         tokio::select! {
@@ -1072,37 +926,33 @@ mod tests {
         NonZeroU32::new(value).expect("测试值必须非零")
     }
 
-    fn profile(
+    fn client(
         endpoint: &str,
-        parameter: CompletionLimitParameter,
-        request_options: Map<String, Value>,
-    ) -> Result<OpenAiChatCompletionProfile, OpenAiProfileError> {
-        profile_with_limits(endpoint, parameter, request_options, 4096, 256, 60, 2)
+        request_body_extra: Map<String, Value>,
+    ) -> OpenAiChatCompletionClient {
+        client_with_limits(endpoint, request_body_extra, 4096, 256, 60, 2)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn profile_with_limits(
+    fn client_with_limits(
         endpoint: &str,
-        parameter: CompletionLimitParameter,
-        request_options: Map<String, Value>,
+        request_body_extra: Map<String, Value>,
         max_response_bytes: usize,
         max_error_response_bytes: usize,
         requests_per_minute: u32,
         burst_requests: u32,
-    ) -> Result<OpenAiChatCompletionProfile, OpenAiProfileError> {
-        OpenAiChatCompletionProfile::new(
+    ) -> OpenAiChatCompletionClient {
+        OpenAiChatCompletionClient::new(
             Url::parse(endpoint).expect("测试 URL 有效"),
             OpenAiAuthentication::None,
             "test-model",
-            true,
             Duration::from_secs(2),
             non_zero_usize(4096),
             non_zero_usize(max_response_bytes),
             non_zero_usize(max_error_response_bytes),
             non_zero_u32(requests_per_minute),
             non_zero_u32(burst_requests),
-            CompletionLimit::new(parameter, non_zero_u32(32)),
-            request_options,
+            request_body_extra,
         )
     }
 
@@ -1246,150 +1096,85 @@ mod tests {
         &request[header_end + 4..]
     }
 
-    #[test]
-    fn endpoint_and_reserved_options_are_strict() {
-        assert!(matches!(
-            profile(
-                "http://example.com/v1/chat/completions",
-                CompletionLimitParameter::MaxTokens,
-                Map::new()
-            ),
-            Err(OpenAiProfileError::PlainHttpHostNotLoopback)
-        ));
-        assert!(
-            profile(
-                "http://127.0.0.1:1234/v1/chat/completions",
-                CompletionLimitParameter::MaxTokens,
-                Map::new()
-            )
-            .is_ok()
-        );
-
-        let mut options = Map::new();
-        options.insert("messages".to_owned(), Value::Array(Vec::new()));
-        assert!(matches!(
-            profile(
-                "https://example.com/v1/chat/completions",
-                CompletionLimitParameter::MaxTokens,
-                options
-            ),
-            Err(OpenAiProfileError::ReservedRequestOption { field }) if field == "messages"
-        ));
-
-        assert!(matches!(
-            OpenAiChatCompletionProfile::new(
-                Url::parse("https://example.com/v1/chat/completions#fragment")
-                    .expect("测试 URL 有效"),
-                OpenAiAuthentication::None,
-                " test-model ",
-                false,
-                Duration::from_secs(2),
-                non_zero_usize(4096),
-                non_zero_usize(4096),
-                non_zero_usize(256),
-                non_zero_u32(60),
-                non_zero_u32(2),
-                CompletionLimit::new(CompletionLimitParameter::MaxTokens, non_zero_u32(32)),
-                Map::new(),
-            ),
-            Err(OpenAiProfileError::EndpointContainsFragment)
-        ));
-
-        assert!(matches!(
-            OpenAiChatCompletionProfile::new(
-                Url::parse("https://example.com/v1/chat/completions").expect("测试 URL 有效"),
-                OpenAiAuthentication::bearer(""),
-                "test-model",
-                false,
-                Duration::from_secs(2),
-                non_zero_usize(4096),
-                non_zero_usize(4096),
-                non_zero_usize(256),
-                non_zero_u32(60),
-                non_zero_u32(2),
-                CompletionLimit::new(CompletionLimitParameter::MaxTokens, non_zero_u32(32)),
-                Map::new(),
-            ),
-            Err(OpenAiProfileError::BlankBearerCredential)
-        ));
+    fn request_headers(request: &[u8]) -> String {
+        let header_end = find_subslice(request, b"\r\n\r\n").expect("请求应包含头部终止符");
+        String::from_utf8(request[..header_end].to_vec()).expect("测试请求头应为 UTF-8")
     }
 
     #[test]
-    fn debug_redacts_bearer_and_request_option_values() {
-        let mut options = Map::new();
-        options.insert(
+    fn debug_redacts_bearer_and_request_body_extra_values() {
+        let mut request_body_extra = Map::new();
+        request_body_extra.insert(
             "vendor_secret".to_owned(),
             Value::String("must-not-appear".to_owned()),
         );
-        let profile = OpenAiChatCompletionProfile::new(
+        let client = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").expect("测试 URL 有效"),
             OpenAiAuthentication::bearer("api-secret"),
             "test-model",
-            false,
             Duration::from_secs(2),
             non_zero_usize(4096),
             non_zero_usize(4096),
             non_zero_usize(256),
             non_zero_u32(60),
             non_zero_u32(2),
-            CompletionLimit::new(CompletionLimitParameter::MaxTokens, non_zero_u32(32)),
-            options,
-        )
-        .expect("测试 Profile 应有效");
-        let debug = format!("{profile:?}");
+            request_body_extra,
+        );
+        let debug = format!("{client:?}");
         assert!(debug.contains("vendor_secret"));
         assert!(!debug.contains("must-not-appear"));
         assert!(!debug.contains("api-secret"));
     }
 
     #[test]
-    fn request_wire_uses_exact_completion_parameter_and_preserves_options() {
-        for (parameter, expected, absent) in [
-            (
-                CompletionLimitParameter::MaxTokens,
-                "max_tokens",
-                "max_completion_tokens",
-            ),
-            (
-                CompletionLimitParameter::MaxCompletionTokens,
-                "max_completion_tokens",
-                "max_tokens",
-            ),
-        ] {
-            let mut options = Map::new();
-            options.insert("temperature".to_owned(), Value::from(0));
-            let profile = profile(
-                "https://example.com/v1/chat/completions",
-                parameter,
-                options,
-            )
-            .expect("测试 Profile 有效");
-            let bytes = serialize_request(
-                &profile,
-                &[ChatMessage::new(ChatMessageRole::User, "不得进入错误")],
-            )
-            .expect("请求应可序列化");
-            let wire: Value = serde_json::from_slice(&bytes).expect("请求应为 JSON");
-            assert_eq!(wire["stream"], false);
-            assert_eq!(wire["n"], 1);
-            assert_eq!(wire[expected], 32);
-            assert!(wire.get(absent).is_none());
-            assert_eq!(wire["temperature"], 0);
-        }
+    fn request_wire_without_extra_has_exactly_three_top_level_fields() {
+        let client = client("https://example.com/v1/chat/completions", Map::new());
+        let bytes = serialize_request(
+            &client,
+            &[ChatMessage::new(ChatMessageRole::User, "待翻译内容")],
+        )
+        .expect("请求应可序列化");
+        let wire: Value = serde_json::from_slice(&bytes).expect("请求应为 JSON");
+        let object = wire.as_object().expect("请求顶层应为对象");
+
+        assert_eq!(object.len(), 3);
+        assert_eq!(object["model"], "test-model");
+        assert_eq!(object["stream"], false);
+        assert_eq!(object["messages"][0]["role"], "user");
+        assert_eq!(object["messages"][0]["content"], "待翻译内容");
+    }
+
+    #[test]
+    fn request_wire_preserves_every_user_supplied_extra_field() {
+        let request_body_extra = serde_json::from_value::<Map<String, Value>>(serde_json::json!({
+            "n": 2,
+            "max_tokens": 32,
+            "max_completion_tokens": 64,
+            "temperature": 0.2,
+            "provider": { "thinking": true }
+        }))
+        .expect("测试扩展正文应为对象");
+        let client = client(
+            "https://example.com/v1/chat/completions",
+            request_body_extra,
+        );
+        let bytes = serialize_request(&client, &[]).expect("请求应可序列化");
+        let wire: Value = serde_json::from_slice(&bytes).expect("请求应为 JSON");
+
+        assert_eq!(wire["n"], 2);
+        assert_eq!(wire["max_tokens"], 32);
+        assert_eq!(wire["max_completion_tokens"], 64);
+        assert_eq!(wire["temperature"], 0.2);
+        assert_eq!(wire["provider"]["thinking"], true);
     }
 
     #[test]
     fn request_serialization_stops_at_configured_byte_limit() {
-        let mut profile = profile(
-            "https://example.com/v1/chat/completions",
-            CompletionLimitParameter::MaxTokens,
-            Map::new(),
-        )
-        .expect("测试 Profile 有效");
-        profile.max_request_bytes = non_zero_usize(64);
+        let mut client = client("https://example.com/v1/chat/completions", Map::new());
+        client.max_request_bytes = non_zero_usize(64);
 
         let error = serialize_request(
-            &profile,
+            &client,
             &[ChatMessage::new(ChatMessageRole::User, "x".repeat(4096))],
         )
         .expect_err("序列化必须在超过请求上限时立即停止");
@@ -1521,17 +1306,12 @@ mod tests {
             vec![success_response("response-body", "request-header", "[]")],
             false,
         );
-        let profile = profile(
-            &server.endpoint,
-            CompletionLimitParameter::MaxCompletionTokens,
-            Map::new(),
-        )
-        .expect("本地 Profile 应有效");
+        let client = client(&server.endpoint, Map::new());
         let executor = executor(1, 1);
 
         let response = executor
             .request(
-                &profile,
+                &client,
                 &[
                     ChatMessage::new(ChatMessageRole::System, "contract"),
                     ChatMessage::new(ChatMessageRole::User, "content"),
@@ -1547,14 +1327,56 @@ mod tests {
             .requests
             .recv_timeout(Duration::from_secs(1))
             .expect("测试请求应被记录");
+        assert!(
+            !request_headers(&request)
+                .to_ascii_lowercase()
+                .contains("authorization:")
+        );
         let wire: Value = serde_json::from_slice(request_body(&request)).expect("请求应为 JSON");
+        assert_eq!(wire.as_object().expect("请求顶层应为对象").len(), 3);
         assert_eq!(wire["model"], "test-model");
         assert_eq!(wire["stream"], false);
-        assert_eq!(wire["n"], 1);
-        assert_eq!(wire["max_completion_tokens"], 32);
+        assert!(wire.get("n").is_none());
         assert!(wire.get("max_tokens").is_none());
+        assert!(wire.get("max_completion_tokens").is_none());
         assert_eq!(wire["messages"][0]["role"], "system");
         assert_eq!(wire["messages"][1]["content"], "content");
+
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn bearer_authentication_is_sent_exactly_once() {
+        let server = spawn_test_server(
+            vec![success_response("response-body", "request-header", "[]")],
+            false,
+        );
+        let mut client = client(&server.endpoint, Map::new());
+        client.authentication = OpenAiAuthentication::bearer("exact-secret");
+        let executor = executor(1, 0);
+
+        executor
+            .request(
+                &client,
+                &[ChatMessage::new(ChatMessageRole::User, "content")],
+            )
+            .await
+            .expect("本地响应应成功");
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("测试请求应被记录");
+        let headers = request_headers(&request);
+        let authorization_values = headers
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(authorization_values, ["Bearer exact-secret"]);
 
         executor.shutdown().await;
         server.worker.join().expect("测试服务器应正常退出");
@@ -1569,25 +1391,21 @@ mod tests {
             ],
             true,
         );
-        let profile = Arc::new(
-            profile_with_limits(
-                &server.endpoint,
-                CompletionLimitParameter::MaxTokens,
-                Map::new(),
-                4096,
-                256,
-                60_000,
-                3,
-            )
-            .expect("本地 Profile 应有效"),
-        );
+        let client = Arc::new(client_with_limits(
+            &server.endpoint,
+            Map::new(),
+            4096,
+            256,
+            60_000,
+            3,
+        ));
         let executor = executor(1, 1);
         let first_executor = executor.clone();
-        let first_profile = Arc::clone(&profile);
+        let first_client = Arc::clone(&client);
         let first = tokio::spawn(async move {
             first_executor
                 .request(
-                    first_profile.as_ref(),
+                    first_client.as_ref(),
                     &[ChatMessage::new(ChatMessageRole::User, "first")],
                 )
                 .await
@@ -1607,11 +1425,11 @@ mod tests {
         .expect("首个活动请求应到达服务器");
 
         let second_executor = executor.clone();
-        let second_profile = Arc::clone(&profile);
+        let second_client = Arc::clone(&client);
         let second = tokio::spawn(async move {
             second_executor
                 .request(
-                    second_profile.as_ref(),
+                    second_client.as_ref(),
                     &[ChatMessage::new(ChatMessageRole::User, "second")],
                 )
                 .await
@@ -1626,7 +1444,7 @@ mod tests {
 
         let third = executor
             .request(
-                profile.as_ref(),
+                client.as_ref(),
                 &[ChatMessage::new(ChatMessageRole::User, "third")],
             )
             .await;
@@ -1658,27 +1476,25 @@ mod tests {
 
     #[tokio::test]
     async fn rate_burst_and_admission_deadlines_are_enforced() {
-        let profile = profile_with_limits(
+        let client = client_with_limits(
             "http://127.0.0.1:1/v1/chat/completions",
-            CompletionLimitParameter::MaxTokens,
             Map::new(),
             4096,
             256,
             60,
             2,
-        )
-        .expect("测试 Profile 应有效");
+        );
         let lifecycle = LlmLifecycle::new();
 
         wait_for_rate(
-            &profile,
+            &client,
             &lifecycle,
             Instant::now() + Duration::from_millis(50),
         )
         .await
         .expect("burst 内第一个请求应立即准入");
         wait_for_rate(
-            &profile,
+            &client,
             &lifecycle,
             Instant::now() + Duration::from_millis(50),
         )
@@ -1686,7 +1502,7 @@ mod tests {
         .expect("burst 内第二个请求应立即准入");
         assert!(matches!(
             wait_for_rate(
-                &profile,
+                &client,
                 &lifecycle,
                 Instant::now() + Duration::from_millis(10)
             )
@@ -1734,25 +1550,14 @@ mod tests {
             .expect("测试服务器线程应创建成功");
 
         let endpoint = format!("http://{address}/v1/chat/completions");
-        let profile = Arc::new(
-            profile_with_limits(
-                &endpoint,
-                CompletionLimitParameter::MaxTokens,
-                Map::new(),
-                4096,
-                256,
-                60,
-                1,
-            )
-            .expect("测试 Profile 应有效"),
-        );
+        let client = Arc::new(client_with_limits(&endpoint, Map::new(), 4096, 256, 60, 1));
         let executor = executor_with_admission_timeout(1, 0, Duration::from_secs(1));
         let request_executor = executor.clone();
-        let request_profile = Arc::clone(&profile);
+        let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move {
             request_executor
                 .request(
-                    request_profile.as_ref(),
+                    request_client.as_ref(),
                     &[ChatMessage::new(ChatMessageRole::User, "cancel")],
                 )
                 .await
@@ -1801,22 +1606,13 @@ mod tests {
             )],
             false,
         );
-        let profile = profile_with_limits(
-            &server.endpoint,
-            CompletionLimitParameter::MaxTokens,
-            Map::new(),
-            16,
-            8,
-            60,
-            1,
-        )
-        .expect("本地 Profile 应有效");
+        let client = client_with_limits(&server.endpoint, Map::new(), 16, 8, 60, 1);
         let executor = executor(1, 0);
 
         assert!(matches!(
             executor
                 .request(
-                    &profile,
+                    &client,
                     &[ChatMessage::new(ChatMessageRole::User, "content")]
                 )
                 .await,
@@ -1838,22 +1634,13 @@ mod tests {
             )],
             false,
         );
-        let profile = profile_with_limits(
-            &server.endpoint,
-            CompletionLimitParameter::MaxTokens,
-            Map::new(),
-            4096,
-            4,
-            60,
-            1,
-        )
-        .expect("本地 Profile 应有效");
+        let client = client_with_limits(&server.endpoint, Map::new(), 4096, 4, 60, 1);
         let executor = executor(1, 0);
 
         assert!(matches!(
             executor
                 .request(
-                    &profile,
+                    &client,
                     &[ChatMessage::new(ChatMessageRole::User, "content")]
                 )
                 .await,
@@ -1868,12 +1655,12 @@ mod tests {
             }) if duration == Duration::from_secs(3)
         ));
         assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        server.worker.join().expect("测试服务器应正常退出");
         assert!(matches!(
             server.requests.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
         executor.shutdown().await;
-        server.worker.join().expect("测试服务器应正常退出");
     }
 
     #[tokio::test]
@@ -1884,14 +1671,13 @@ mod tests {
             listener.local_addr().expect("测试地址应可读")
         );
         drop(listener);
-        let profile = profile(&endpoint, CompletionLimitParameter::MaxTokens, Map::new())
-            .expect("本地 Profile 应有效");
+        let client = client(&endpoint, Map::new());
         let executor = executor(1, 0);
 
         assert!(matches!(
             executor
                 .request(
-                    &profile,
+                    &client,
                     &[ChatMessage::new(ChatMessageRole::User, "content")]
                 )
                 .await,

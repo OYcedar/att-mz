@@ -13,10 +13,9 @@ use crate::application::arguments::{
     ExtractArguments, InitArguments, MzCommand, TranslateArguments, WriteBackArguments,
 };
 use crate::application::config::{
-    ApplicationConfiguration, CompletionLimitParameter as ConfigCompletionLimitParameter,
-    EventLogConfiguration, LlmRuntimeConfiguration, ProxyConfiguration,
-    SqliteJournalMode as ConfigSqliteJournalMode, SqliteSynchronous as ConfigSqliteSynchronous,
-    TranslationProfileConfiguration,
+    ApplicationConfiguration, EventLogConfiguration, LlmAuthConfiguration, LlmClientConfiguration,
+    LlmRuntimeConfiguration, ProxyConfiguration, SqliteJournalMode as ConfigSqliteJournalMode,
+    SqliteSynchronous as ConfigSqliteSynchronous, TranslationProfileConfiguration,
 };
 use crate::att_mz::MzWriteBackLayoutProfile;
 use crate::att_mz::extract::builtin::{BuiltInExtractionConfig, BuiltInExtractionService};
@@ -81,9 +80,8 @@ use crate::runtime::json_lines::{
     TranslationRunLogContext, WriteBackJsonLinesEventLog, WriteBackRunLogContext,
 };
 use crate::runtime::llm::{
-    CompletionLimit, CompletionLimitParameter, LlmProxyConfiguration,
-    LlmTlsConfiguration as RuntimeLlmTlsConfiguration, OpenAiAuthentication,
-    OpenAiChatCompletionError, OpenAiChatCompletionExecutor, OpenAiChatCompletionProfile,
+    LlmProxyConfiguration, LlmTlsConfiguration as RuntimeLlmTlsConfiguration, OpenAiAuthentication,
+    OpenAiChatCompletionClient, OpenAiChatCompletionError, OpenAiChatCompletionExecutor,
     OpenAiExecutorConfiguration,
 };
 use crate::runtime::lua::{
@@ -383,15 +381,11 @@ impl ProductionMzCommandRunner {
                 ),
             );
         };
-        let authentication = match profile_configuration.llm().auth().resolve() {
-            Ok(Some(secret)) => OpenAiAuthentication::bearer(secret),
-            Ok(None) => OpenAiAuthentication::None,
-            Err(error) => {
-                return ProductionCommandRunReport::construction_failed(
-                    ProductionCommandError::construct("LLM Credential", error),
-                );
-            }
-        };
+        let llm_configuration = self
+            .configuration
+            .llm_clients()
+            .get(profile_configuration.llm_client_id())
+            .expect("严格配置必须保证 MZ Translation Profile 引用已存在的公共 LLM Client");
         let event_log_configuration =
             match build_json_lines_config(self.configuration.observability().translation()) {
                 Ok(configuration) => configuration,
@@ -457,18 +451,7 @@ impl ProductionMzCommandRunner {
                 );
             }
         };
-        let llm_profile = match build_llm_profile(&profile_configuration, authentication) {
-            Ok(profile) => profile,
-            Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
-                return ProductionCommandRunReport::construction_failed_with_shutdown(
-                    error, shutdown,
-                );
-            }
-        };
+        let llm_client = build_llm_client(llm_configuration);
         let llm = match build_llm(
             self.configuration.runtime().llm(),
             loaded.additional_pem_roots,
@@ -546,7 +529,7 @@ impl ProductionMzCommandRunner {
                     .to_vec(),
                 profile_configuration.execution().max_network_retry_after(),
             ),
-            llm_profile,
+            Arc::new(llm_client),
         );
         let selected_profile = TranslationExecutionProfile::new(
             profile_configuration.id(),
@@ -572,7 +555,7 @@ impl ProductionMzCommandRunner {
         let resources =
             JsonTranslationPlanningResourceReadingService::new(file_system.clone(), cpu.clone());
         let planner =
-            MzStandardTranslationTaskPlanningService::<_, _, OpenAiChatCompletionProfile>::new(
+            MzStandardTranslationTaskPlanningService::<_, _, OpenAiChatCompletionClient>::new(
                 resources,
                 languages.clone(),
                 placeholders,
@@ -831,7 +814,7 @@ impl ProductionMzCommandRunner {
 }
 
 type ProductionTranslationProfile =
-    Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<OpenAiChatCompletionProfile>>>;
+    Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<OpenAiChatCompletionClient>>>;
 type EventLogFinalizerSlot = Arc<Mutex<Option<JsonLinesEventLogFinalizer>>>;
 
 struct ProductionRunLogResources {
@@ -908,32 +891,23 @@ async fn load_translation_materials(
     })
 }
 
-fn build_llm_profile(
-    configuration: &TranslationProfileConfiguration,
-    authentication: OpenAiAuthentication,
-) -> Result<OpenAiChatCompletionProfile, ProductionCommandError> {
-    let llm = configuration.llm();
-    let parameter = match llm.completion_limit().parameter() {
-        ConfigCompletionLimitParameter::MaxTokens => CompletionLimitParameter::MaxTokens,
-        ConfigCompletionLimitParameter::MaxCompletionTokens => {
-            CompletionLimitParameter::MaxCompletionTokens
-        }
+fn build_llm_client(configuration: &LlmClientConfiguration) -> OpenAiChatCompletionClient {
+    let authentication = match configuration.auth() {
+        LlmAuthConfiguration::None => OpenAiAuthentication::None,
+        LlmAuthConfiguration::Bearer(secret) => OpenAiAuthentication::bearer(secret.clone()),
     };
-    OpenAiChatCompletionProfile::new(
-        llm.endpoint().clone(),
+    OpenAiChatCompletionClient::new(
+        configuration.endpoint().clone(),
         authentication,
-        llm.model(),
-        llm.allow_plain_http_loopback(),
-        llm.request_timeout(),
-        llm.max_request_bytes(),
-        llm.max_response_bytes(),
-        llm.max_error_response_bytes(),
-        llm.requests_per_minute(),
-        llm.burst_requests(),
-        CompletionLimit::new(parameter, llm.completion_limit().value()),
-        llm.request_options().clone(),
+        configuration.model(),
+        configuration.request_timeout(),
+        configuration.max_request_bytes(),
+        configuration.max_response_bytes(),
+        configuration.max_error_response_bytes(),
+        configuration.requests_per_minute(),
+        configuration.burst_requests(),
+        configuration.request_body_extra().clone(),
     )
-    .map_err(|source| ProductionCommandError::construct("LLM Profile", source))
 }
 
 fn build_llm(
@@ -1154,7 +1128,7 @@ impl fmt::Display for UnknownTranslationProfile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "找不到 LLM Profile {}；可用 Profile：{}",
+            "找不到翻译 Profile {}；可用 Profile：{}",
             self.requested_id,
             self.available_ids.join("、")
         )

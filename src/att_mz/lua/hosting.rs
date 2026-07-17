@@ -7,13 +7,11 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::att_mz::translate::executor::{
-    LlmRequestError, LlmRequestExecutor, LlmResponse, TranslationTaskExecutionProfile,
-};
+use crate::att_mz::translate::executor::TranslationTaskExecutionProfile;
 use crate::att_mz::translate::profile::{
     MzTranslationExecutionPayload, TranslationExecutionProfile,
 };
-use crate::att_mz::translate::standard::ChatMessage;
+use crate::llm::{ChatMessage, LlmRequestError, LlmRequestExecutor, LlmResponse};
 use crate::storage::file_system::{FileReader, ReadFileError};
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
 
@@ -81,8 +79,7 @@ where
     R: TrustedLuaRuntimeExecutor,
     S: SqliteInteractiveSessionFactory,
 {
-    type TranslationProfile =
-        TranslationExecutionProfile<MzTranslationExecutionPayload<L::Profile>>;
+    type TranslationProfile = TranslationExecutionProfile<MzTranslationExecutionPayload<L::Client>>;
     type Error = TrustedLuaExecutionHostingError<F::Error, S::Error, R::Error>;
 
     async fn execute(
@@ -170,7 +167,7 @@ where
 {
     phase: LuaPhase,
     project: LuaProjectContext,
-    profile: Option<Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<L::Profile>>>>,
+    profile: Option<Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<L::Client>>>>,
     operations: Arc<S>,
     llm: LuaLlmCapability<L>,
 }
@@ -261,7 +258,7 @@ where
         };
         let llm = Arc::clone(llm);
         Box::pin(async move {
-            llm.request(profile.llm_profile(), &messages)
+            llm.request(profile.llm_client(), &messages)
                 .await
                 .map_err(llm_call_error)
         })
@@ -497,7 +494,7 @@ mod tests {
     };
     use crate::att_mz::lua::session::OpenedSqliteInteractiveSession;
     use crate::att_mz::project::OpenedProject;
-    use crate::att_mz::translate::executor::{LlmFinishReason, LlmUsage};
+    use crate::llm::{LlmFinishReason, LlmUsage};
     use crate::storage::file_system::ReadFile;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -538,12 +535,12 @@ mod tests {
     struct FakeLlm;
 
     impl LlmRequestExecutor for FakeLlm {
-        type Profile = ();
+        type Client = ();
         type Error = FakeError;
 
         async fn request<'a>(
             &'a self,
-            _profile: &'a Self::Profile,
+            _client: &'a Self::Client,
             _messages: &'a [ChatMessage],
         ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
             Ok(LlmResponse::new(

@@ -20,6 +20,7 @@ use crate::language::{
     LanguageModule, LanguageModuleCatalog, LanguageModuleCatalogError, LanguageModuleError,
     LanguageRepairApplicationError, LanguageText, LanguageTextSegment,
 };
+use crate::llm::{LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse, LlmUsage};
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
 use super::language_projection::{
@@ -27,110 +28,12 @@ use super::language_projection::{
 };
 use super::profile::{MzTranslationExecutionPayload, TranslationExecutionProfile};
 use super::standard::{
-    AcceptedTranslationDecision, AppliedPlaceholder, ChatMessage, ExpectedTranslationOutput,
+    AcceptedTranslationDecision, AppliedPlaceholder, ExpectedTranslationOutput,
     StandardTranslationProfile, StandardTranslationTaskExecutor, StandardTranslationTaskIndex,
     TranslationLanguagePair, TranslationPatch, TranslationProtocolDiagnostic, TranslationTaskBlock,
     TranslationTaskOutcome, TranslationTaskOutcomeInvariantError, TranslationTaskUnavailableReason,
     TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
-
-/// 单次非流式 LLM 请求的结束原因。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LlmFinishReason {
-    Stop,
-    Length,
-    ContentFilter,
-    Other(String),
-}
-
-impl fmt::Display for LlmFinishReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stop => formatter.write_str("stop"),
-            Self::Length => formatter.write_str("length"),
-            Self::ContentFilter => formatter.write_str("content_filter"),
-            Self::Other(value) => formatter.write_str(value),
-        }
-    }
-}
-
-/// 根适配器能够提供时返回的统一 token 用量。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LlmUsage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-}
-
-impl LlmUsage {
-    pub(crate) const fn new(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64) -> Self {
-        Self {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-        }
-    }
-
-    pub(crate) const fn prompt_tokens(self) -> u64 {
-        self.prompt_tokens
-    }
-
-    pub(crate) const fn completion_tokens(self) -> u64 {
-        self.completion_tokens
-    }
-
-    pub(crate) const fn total_tokens(self) -> u64 {
-        self.total_tokens
-    }
-}
-
-/// 一次模型请求的未清洗统一响应。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LlmResponse {
-    content: String,
-    finish_reason: LlmFinishReason,
-    provider_request_id: Option<String>,
-    provider_response_id: String,
-    usage: Option<LlmUsage>,
-}
-
-impl LlmResponse {
-    pub(crate) fn new(
-        content: impl Into<String>,
-        finish_reason: LlmFinishReason,
-        provider_request_id: Option<String>,
-        provider_response_id: impl Into<String>,
-        usage: Option<LlmUsage>,
-    ) -> Self {
-        Self {
-            content: content.into(),
-            finish_reason,
-            provider_request_id,
-            provider_response_id: provider_response_id.into(),
-            usage,
-        }
-    }
-
-    pub(crate) fn content(&self) -> &str {
-        &self.content
-    }
-
-    pub(crate) fn finish_reason(&self) -> &LlmFinishReason {
-        &self.finish_reason
-    }
-
-    pub(crate) fn provider_request_id(&self) -> Option<&str> {
-        self.provider_request_id.as_deref()
-    }
-
-    pub(crate) fn provider_response_id(&self) -> &str {
-        &self.provider_response_id
-    }
-
-    pub(crate) const fn usage(&self) -> Option<LlmUsage> {
-        self.usage
-    }
-}
 
 /// 一次最终成功 HTTP 响应中可安全进入任务结果与持久日志的元数据。
 ///
@@ -161,10 +64,10 @@ impl FinalLlmResponseMetadata {
 
     fn from_response(response: &LlmResponse) -> Self {
         Self::new(
-            response.provider_request_id.clone(),
-            response.provider_response_id.clone(),
-            response.finish_reason.to_string(),
-            response.usage,
+            response.provider_request_id().map(str::to_owned),
+            response.provider_response_id(),
+            response.finish_reason().to_string(),
+            response.usage(),
         )
     }
 
@@ -185,67 +88,6 @@ impl FinalLlmResponseMetadata {
     }
 }
 
-/// LLM 根请求在单次尝试中的失败类别。
-#[derive(Debug)]
-pub(crate) enum LlmRequestError<E> {
-    /// 调用方可以按自身策略重试，并可尊重服务端等待时间。
-    Retryable {
-        source: E,
-        retry_after: Option<Duration>,
-    },
-    /// 认证、无效请求等继续重试无意义的失败。
-    Fatal(E),
-}
-
-impl<E> fmt::Display for LlmRequestError<E>
-where
-    E: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Retryable {
-                source,
-                retry_after,
-            } => {
-                write!(formatter, "LLM 请求暂时失败：{source}")?;
-                if let Some(retry_after) = retry_after {
-                    write!(formatter, "（建议等待 {retry_after:?}）")?;
-                }
-                Ok(())
-            }
-            Self::Fatal(source) => write!(formatter, "LLM 请求不可恢复地失败：{source}"),
-        }
-    }
-}
-
-impl<E> Error for LlmRequestError<E>
-where
-    E: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Retryable { source, .. } | Self::Fatal(source) => Some(source),
-        }
-    }
-}
-
-/// 执行一次非流式、单 choice LLM 请求的根能力。
-///
-/// 根适配器不自动重试。全局活动请求数、排队容量、超时、响应字节上限和
-/// 速率治理均由外部配置并由适配器执行；排队、网络和响应读取不得阻塞异步线程。
-/// `Profile` 必须由外部完整提供 endpoint、凭据、模型、超时、响应上限、速率和
-/// 请求选项；根能力不得用 SDK 或库默认值补齐有意义的选择。
-pub(crate) trait LlmRequestExecutor: Send + Sync {
-    type Profile: Send + Sync + 'static;
-    type Error: Error + Send + Sync + 'static;
-
-    fn request<'a>(
-        &'a self,
-        profile: &'a Self::Profile,
-        messages: &'a [ChatMessage],
-    ) -> impl Future<Output = Result<LlmResponse, LlmRequestError<Self::Error>>> + Send + 'a;
-}
-
 /// 可取消异步等待的根能力。
 pub(crate) trait AsyncDelay: Send + Sync {
     type Error: Error + Send + Sync + 'static;
@@ -253,11 +95,11 @@ pub(crate) trait AsyncDelay: Send + Sync {
     fn wait(&self, duration: Duration) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Executor 从受信 Profile 消费的最小配置面。
+/// Executor 从受信 MZ Profile 消费的最小配置面。
 pub(crate) trait TranslationTaskExecutionProfile: StandardTranslationProfile {
-    type LlmProfile: Send + Sync + 'static;
+    type LlmClient: Send + Sync + 'static;
 
-    fn llm_profile(&self) -> &Self::LlmProfile;
+    fn llm_client(&self) -> &Self::LlmClient;
     fn network_retry_delays(&self) -> &[Duration];
     fn max_network_retry_after(&self) -> Duration;
 }
@@ -267,10 +109,10 @@ impl<L> TranslationTaskExecutionProfile
 where
     L: Send + Sync + 'static,
 {
-    type LlmProfile = L;
+    type LlmClient = L;
 
-    fn llm_profile(&self) -> &Self::LlmProfile {
-        self.payload().llm()
+    fn llm_client(&self) -> &Self::LlmClient {
+        self.payload().llm_client()
     }
 
     fn network_retry_delays(&self) -> &[Duration] {
@@ -287,10 +129,10 @@ impl<L> TranslationTaskExecutionProfile
 where
     L: Send + Sync + 'static,
 {
-    type LlmProfile = L;
+    type LlmClient = L;
 
-    fn llm_profile(&self) -> &Self::LlmProfile {
-        self.as_ref().payload().llm()
+    fn llm_client(&self) -> &Self::LlmClient {
+        self.as_ref().payload().llm_client()
     }
 
     fn network_retry_delays(&self) -> &[Duration] {
@@ -458,7 +300,7 @@ where
     L: LlmRequestExecutor,
     D: AsyncDelay,
     R: TranslationTaskResponseProcessor,
-    P: TranslationTaskExecutionProfile<LlmProfile = L::Profile>,
+    P: TranslationTaskExecutionProfile<LlmClient = L::Client>,
 {
     type Profile = P;
     type Error = MzStandardTranslationTaskExecutionError<L::Error, D::Error, R::Error>;
@@ -479,7 +321,7 @@ where
         loop {
             let response = match self
                 .llm
-                .request(profile.llm_profile(), task.messages())
+                .request(profile.llm_client(), task.messages())
                 .await
             {
                 Ok(response) => response,
@@ -662,13 +504,13 @@ fn process_response(
     let final_response = FinalLlmResponseMetadata::from_response(&response);
     let finish_reason = final_response.finish_reason().to_owned();
     let mut diagnostics = Vec::new();
-    if response.finish_reason != LlmFinishReason::Stop {
+    if response.finish_reason() != &LlmFinishReason::Stop {
         diagnostics.push(TranslationProtocolDiagnostic::NonStopFinish {
             reason: finish_reason.clone(),
         });
     }
 
-    let outputs = match parse_model_output_batch(&response.content) {
+    let outputs = match parse_model_output_batch(response.content()) {
         Ok(outputs) => outputs,
         Err(message) => {
             diagnostics.push(TranslationProtocolDiagnostic::InvalidResponse {
@@ -1095,15 +937,16 @@ mod tests {
         TranslationProfileLanguagePair,
     };
     use crate::att_mz::translate::standard::{
-        AppliedPlaceholder, ChatMessageRole, ExpectedTranslationOutput, PlaceholderRuleOrigin,
-        PlaceholderSegment, StandardTranslationTaskIndex, TerminologyDependency,
-        TranslationLanguagePair, TranslationLeafIdentity, TranslationTaskStatus,
+        AppliedPlaceholder, ExpectedTranslationOutput, PlaceholderRuleOrigin, PlaceholderSegment,
+        StandardTranslationTaskIndex, TerminologyDependency, TranslationLanguagePair,
+        TranslationLeafIdentity, TranslationTaskStatus,
     };
     use crate::language::{
         EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
         JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageModule,
         LanguageModuleCatalog, LanguageText, QuotePair,
     };
+    use crate::llm::{ChatMessage, ChatMessageRole};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -1861,12 +1704,12 @@ mod tests {
     type RecordedLlmResponses = Arc<Mutex<VecDeque<FakeLlmResponse>>>;
 
     impl LlmRequestExecutor for FakeLlm {
-        type Profile = &'static str;
+        type Client = &'static str;
         type Error = FakeError;
 
         async fn request<'a>(
             &'a self,
-            _profile: &'a Self::Profile,
+            _client: &'a Self::Client,
             messages: &'a [ChatMessage],
         ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
             self.messages
@@ -1924,7 +1767,7 @@ mod tests {
                     vec![Duration::from_millis(10), Duration::from_millis(20)],
                     Duration::from_secs(2),
                 ),
-                "llm-profile",
+                Arc::new("llm-client"),
             ),
         )
     }

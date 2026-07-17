@@ -72,7 +72,7 @@ flowchart TD
     LANG --> JA["JapaneseLanguageModule"]
     LANG --> EN["EnglishLanguageModule"]
 
-    EX --> LLM["OpenAiChatCompletionExecutor<br/>LlmRequestExecutor"]
+    EX --> LLM["公共 LlmRequestExecutor 契约<br/>OpenAiChatCompletionExecutor"]
     EX --> DELAY["TokioAsyncDelay<br/>AsyncDelay"]
     EX --> RP["TranslationTaskResponseProcessingService"]
     RP --> LANG
@@ -94,9 +94,13 @@ flowchart TD
 
 图中上层节点拥有翻译语义，带生产实现名称的叶子拥有操作系统线程、真实文件、SQLite 连接、网络请求、异步时钟和 Lua VM 等环境机制。
 
-## 3. Profile 与外部配置
+## 3. Profile、公共 Client 与外部配置
 
-Profile 由组合根一次性建立，再由 `InMemoryTranslationExecutionProfileResolver` 按精确 ID 选择。同一 ID 始终返回同一份 `Arc` 快照；ID 不 trim、不折叠大小写、不提供别名或默认项，错误也不泄露载荷或凭据。
+外部 MZ Profile 只保存公共 `llm.clients` 目录中的精确 `llm_client` ID。组合根
+验证引用并构造对应的 `OpenAiChatCompletionClient`，再把这个 Client 放入唯一的
+MZ 执行载荷。`InMemoryTranslationExecutionProfileResolver` 按精确 Profile ID
+选择同一份 `Arc` 快照；ID 不 trim、不折叠大小写、不提供别名或默认项，错误也
+不泄露载荷或凭据。
 
 MZ 受信载荷按职责分组：
 
@@ -109,8 +113,8 @@ MzTranslationExecutionPayload<L>
 ├─ execution
 │  ├─ network_retry_delays
 │  └─ max_network_retry_after
-└─ llm
-   └─ 根 LLM 适配器消费的不透明配置 L
+└─ llm_client
+   └─ 公共 LLM 根直接消费的受信 Client L
 ```
 
 外层 Profile 继续持有非零 `max_in_flight_tasks`。资产解码、结果编码、日英译前判定与残留策略，以及可选的日文引号修复候选也分别要求外部显式传入自己的并发、批量、阈值或规则配置。
@@ -122,7 +126,7 @@ MzTranslationExecutionPayload<L>
 - 模块不读取配置文件、环境变量或全局单例；
 - 模块不探测 CPU 核数，也不根据数据量自行改写并发或容量；
 - system Markdown 完整来自精确语言对配置，业务代码不补写隐藏提示词；
-- endpoint、凭据、model、timeout、响应上限、速率与请求选项属于 LLM 根配置。
+- endpoint、直接凭据、model、timeout、响应上限、速率与额外 JSON 请求字段属于公共 LLM Client 配置。
 
 固定的业务顺序、Builtin 控制符集合、语义范围、严格响应协议和事务承诺不是调优项，不转化为可选配置。
 
@@ -326,6 +330,10 @@ Planner 固定先保护占位符，再把普通文本与保护区投影为 `Lang
 
 `LlmRequestExecutor` 是单次、非流式、单 choice、无自动重试的根契约。它返回原始 content、finish reason、可选的 HTTP `x-request-id`、正文 completion ID 和可选 usage，并将错误区分为 Retryable 与 Fatal；可恢复错误可以携带 `Retry-After`。HTTP 请求身份与模型响应身份不互相冒充。
 
+MZ 只向这个公共契约提交完整 messages。根固定加入公共 Client 的 `model` 与
+`stream=false`；除此之外只透传该 Client 的 `request_body_extra`，MZ 不另行注入
+`n`、token 上限或供应商参数。
+
 `MzStandardTranslationTaskExecutionService`：
 
 1. 每次只发送 TaskBlock 已有的完整 messages；
@@ -412,7 +420,7 @@ Standard 返回结构化运行报告，至少统计计划任务、Complete/Parti
 Lua 是用户明确选择并完全信任的本机程序，不建立沙箱。`TrustedLuaExecutionHostingService` 已经把粗粒度 Host 继续实现到四个真实运行根：
 
 - `FileReader`：读取主脚本并返回规范绝对路径；
-- `LlmRequestExecutor`：Translate 阶段的 `ctx.llm` 共享 Standard 的模型根与同一 Profile；
+- `LlmRequestExecutor`：Translate 阶段的 `ctx.llm` 与 Standard 共享同一公共模型根和 Client；
 - `TrustedLuaRuntimeExecutor`：在专用有界 worker 上运行完整标准库 VM；
 - `SqliteInteractiveSessionFactory`：建立同一项目数据库上的交互会话。
 
@@ -445,6 +453,9 @@ Cancelled 还是 worker panic，都必须恰好一次进入 Finalizing。执行 
 | `TrustedLua54Runtime` | `TrustedLuaRuntimeExecutor` |
 | `WindowsRunIdGenerator` | `RunIdGenerator` |
 
-`ProductionMzCommandRunner` 在选中 Profile 后才解析 API key、读取提示词与 PEM，并构造上表中本命令实际需要的根。Standard 与 Translate Lua 共享同一个 HTTP Client、同一个 Profile 限流器和同一 SQLite 预算。
+`ProductionMzCommandRunner` 在选中 Profile 后取得其已经验证的 `llm_client`，只读取
+该 Profile 的提示词与全局 PEM，并构造上表中本命令实际需要的根。Standard 与
+Translate Lua 借用同一个 `OpenAiChatCompletionClient`，共享同一个 Executor、HTTP
+连接池、客户端限流器和同一 SQLite 预算。
 
 命令结束后按 Lua、LLM、SQLite、FileSystem、CPU、Translation Log 的顺序停止准入并排空已接管工作。只有业务结果与全部 shutdown 都成功后，进程才把 Complete/Partial/Unavailable 摘要写入 stdout。

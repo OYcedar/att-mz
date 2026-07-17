@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use super::asset_reader::MzStandardTranslationAssetReadingService;
 use super::executor::{
-    AsyncDelay, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
-    MzStandardTranslationTaskExecutionService, TranslationTaskResponseProcessingService,
+    AsyncDelay, MzStandardTranslationTaskExecutionService, TranslationTaskResponseProcessingService,
 };
 use super::lua::LuaTranslationService;
 use super::placeholder::Pcre2PlaceholderService;
@@ -24,9 +23,7 @@ use super::result_store::{
     MzStandardTranslationResultStorageConfig, MzStandardTranslationResultStorageService,
 };
 use super::service::TranslateService;
-use super::standard::{
-    ChatMessage, ChatMessageRole, StandardTranslationService, TranslationLogEvent,
-};
+use super::standard::{StandardTranslationService, TranslationLogEvent};
 use super::{TranslateInput, TranslateUseCase};
 use crate::att_mz::location_codec::MzLocationCodec;
 use crate::att_mz::lua::LuaPhase;
@@ -47,6 +44,9 @@ use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
 use crate::language::{
     JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageModuleCatalog,
+};
+use crate::llm::{
+    ChatMessage, ChatMessageRole, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
 };
 use crate::observability::PersistentEventLog;
 use crate::project_database::ProjectDatabaseRecordReadingService;
@@ -76,7 +76,7 @@ enum Event {
     Cpu,
     LlmStandard {
         attempt: usize,
-        profile_address: usize,
+        client_address: usize,
     },
     Delay(Duration),
     StandardTransaction,
@@ -89,7 +89,7 @@ enum Event {
     LuaBegin,
     LuaExecute,
     LlmLua {
-        profile_address: usize,
+        client_address: usize,
     },
     LuaCommit,
     LuaInspect,
@@ -248,7 +248,7 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
 }
 
 #[derive(Clone, Debug)]
-struct FakeLlmProfile {
+struct FakeLlmClient {
     name: &'static str,
 }
 
@@ -259,22 +259,22 @@ struct FakeLlmRequestExecutor {
 }
 
 impl LlmRequestExecutor for FakeLlmRequestExecutor {
-    type Profile = FakeLlmProfile;
+    type Client = FakeLlmClient;
     type Error = FakeRootError;
 
     async fn request<'a>(
         &'a self,
-        profile: &'a Self::Profile,
+        client: &'a Self::Client,
         messages: &'a [ChatMessage],
     ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
-        assert_eq!(profile.name, "shared-llm-config");
-        let profile_address = std::ptr::from_ref(profile).addr();
+        assert_eq!(client.name, "shared-llm-config");
+        let client_address = std::ptr::from_ref(client).addr();
         let is_lua = messages
             .iter()
             .any(|message| message.content() == "# Lua full messages");
 
         if is_lua {
-            record(&self.events, Event::LlmLua { profile_address });
+            record(&self.events, Event::LlmLua { client_address });
             return Ok(LlmResponse::new(
                 "lua raw response",
                 LlmFinishReason::Stop,
@@ -293,7 +293,7 @@ impl LlmRequestExecutor for FakeLlmRequestExecutor {
             &self.events,
             Event::LlmStandard {
                 attempt,
-                profile_address,
+                client_address,
             },
         );
         if attempt == 1 {
@@ -651,9 +651,9 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
             vec![Duration::from_millis(7)],
             Duration::from_secs(1),
         ),
-        FakeLlmProfile {
+        Arc::new(FakeLlmClient {
             name: "shared-llm-config",
-        },
+        }),
     );
     let resolver = InMemoryTranslationExecutionProfileResolver::new(
         TranslationProfileCatalog::new([TranslationExecutionProfile::new(
@@ -676,7 +676,7 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     let languages = language_catalog();
     let resources =
         JsonTranslationPlanningResourceReadingService::new(file_reader.clone(), cpu.clone());
-    let planner = MzStandardTranslationTaskPlanningService::<_, _, FakeLlmProfile>::new(
+    let planner = MzStandardTranslationTaskPlanningService::<_, _, FakeLlmClient>::new(
         resources,
         languages.clone(),
         Pcre2PlaceholderService::new().expect("内置占位符规格应可编译"),
@@ -684,7 +684,7 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     );
     let response_processor = TranslationTaskResponseProcessingService::new(cpu.clone(), languages);
     type SelectedProfile =
-        Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<FakeLlmProfile>>>;
+        Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<FakeLlmClient>>>;
     let executor = MzStandardTranslationTaskExecutionService::<_, _, _, SelectedProfile>::new(
         llm.clone(),
         delay,
@@ -775,21 +775,20 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     assert!(lua_execute < lua_llm && lua_llm < lua_commit);
     assert!(lua_commit < lua_inspect && lua_inspect < lua_close);
 
-    let profile_addresses = events
+    let client_addresses = events
         .iter()
         .filter_map(|event| match event {
-            Event::LlmStandard {
-                profile_address, ..
+            Event::LlmStandard { client_address, .. } | Event::LlmLua { client_address } => {
+                Some(*client_address)
             }
-            | Event::LlmLua { profile_address } => Some(*profile_address),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(profile_addresses.len(), 3);
+    assert_eq!(client_addresses.len(), 3);
     assert!(
-        profile_addresses
+        client_addresses
             .iter()
-            .all(|address| *address == profile_addresses[0]),
-        "Standard 和 Lua 必须使用同一份 LLM Profile 快照"
+            .all(|address| *address == client_addresses[0]),
+        "Standard 和 Lua 必须使用同一份 LLM Client 快照"
     );
 }

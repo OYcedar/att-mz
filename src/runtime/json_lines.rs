@@ -32,7 +32,6 @@ use super::windows::{
 };
 use crate::att_mz::project::MzWriteBackLayoutProfile;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource};
-use crate::att_mz::translate::executor::LlmUsage;
 use crate::att_mz::translate::standard::{
     LoggedAcceptedTranslationDecision, LoggedUnresolvedTranslationUnit,
     StandardTranslationRunReport, TranslationLogEvent, TranslationProtocolDiagnostic,
@@ -43,6 +42,7 @@ use crate::att_mz::write_back::StandardWriteBackSummary;
 use crate::att_mz::write_back::standard::{
     ManualLayoutDiagnostic, MzWriteBackLayoutRegion, StandardWriteBackRunLog,
 };
+use crate::llm::LlmUsage;
 use crate::observability::{PersistentEventLog, RunId};
 
 const TRANSLATION_STEM: &str = "translation";

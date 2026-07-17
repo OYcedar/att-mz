@@ -17,10 +17,11 @@ use futures_util::stream::{FuturesOrdered, StreamExt};
 use crate::att_mz::text::{MzLocation, TextGroupKind};
 use crate::execution::{CooperativeCancellation, OperationCancelled};
 use crate::language::LanguageAnalysis;
+use crate::llm::{ChatMessage, LlmUsage};
 use crate::observability::PersistentEventLog;
 use crate::project_database::StoredProjectRecord;
 
-use super::executor::{FinalLlmResponseMetadata, LlmUsage};
+use super::executor::FinalLlmResponseMetadata;
 use super::profile::TranslationExecutionProfile;
 
 /// 一次标准资产翻译需要的可选外部资料。
@@ -437,38 +438,6 @@ impl StandardTranslationTaskIndex {
 impl fmt::Display for StandardTranslationTaskIndex {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
-    }
-}
-
-/// 发送给 LLM 的消息角色。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ChatMessageRole {
-    System,
-    User,
-    Assistant,
-}
-
-/// Planner 已经建立的一条确定性消息。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ChatMessage {
-    role: ChatMessageRole,
-    content: String,
-}
-
-impl ChatMessage {
-    pub(crate) fn new(role: ChatMessageRole, content: impl Into<String>) -> Self {
-        Self {
-            role,
-            content: content.into(),
-        }
-    }
-
-    pub(crate) const fn role(&self) -> ChatMessageRole {
-        self.role
-    }
-
-    pub(crate) fn content(&self) -> &str {
-        &self.content
     }
 }
 
@@ -1901,6 +1870,7 @@ mod tests {
     use crate::language::{
         JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageText,
     };
+    use crate::llm::ChatMessageRole;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);

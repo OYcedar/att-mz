@@ -1,3 +1,4 @@
 /archive/
 /target/
+/config.toml
 **/*.rs.bk

@@ -39,10 +39,7 @@ use crate::att_mz::lua::{LuaPhase, LuaProjectContext};
 use crate::att_mz::project::ExistingProjectOpeningService;
 use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
-use crate::att_mz::translate::executor::{
-    LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
-};
-use crate::att_mz::translate::standard::ChatMessage;
+use crate::llm::{ChatMessage, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse};
 use crate::observability::PersistentEventLog;
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -259,12 +256,12 @@ struct RecordingLlm {
 }
 
 impl LlmRequestExecutor for RecordingLlm {
-    type Profile = ();
+    type Client = ();
     type Error = TestError;
 
     fn request<'a>(
         &'a self,
-        _profile: &'a Self::Profile,
+        _client: &'a Self::Client,
         _messages: &'a [ChatMessage],
     ) -> impl Future<Output = Result<LlmResponse, LlmRequestError<Self::Error>>> + Send + 'a {
         self.calls.fetch_add(1, Ordering::SeqCst);

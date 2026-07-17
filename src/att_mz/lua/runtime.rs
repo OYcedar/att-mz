@@ -11,8 +11,7 @@ use std::task::{Context, Poll};
 
 use tokio::sync::oneshot;
 
-use crate::att_mz::translate::executor::LlmResponse;
-use crate::att_mz::translate::standard::ChatMessage;
+use crate::llm::{ChatMessage, LlmResponse};
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
 
 use super::{LuaPhase, LuaProjectContext};

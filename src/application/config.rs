@@ -14,9 +14,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use secrecy::{ExposeSecret, SecretString};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use url::{Host, Url};
+use zeroize::Zeroizing;
 
 use crate::language::{
     EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
@@ -25,14 +28,7 @@ use crate::language::{
 };
 
 const MAX_CONFIGURATION_BYTES: u64 = 4 * 1024 * 1024;
-const RESERVED_REQUEST_OPTIONS: [&str; 6] = [
-    "model",
-    "messages",
-    "stream",
-    "n",
-    "max_tokens",
-    "max_completion_tokens",
-];
+const RESERVED_REQUEST_BODY_FIELDS: [&str; 3] = ["model", "messages", "stream"];
 
 /// 根据命令行选择配置文件位置。
 ///
@@ -101,7 +97,7 @@ pub(crate) fn load_configuration(
         });
     }
 
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
     file.by_ref()
         .take(MAX_CONFIGURATION_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -117,16 +113,20 @@ pub(crate) fn load_configuration(
         });
     }
 
-    let source =
-        String::from_utf8(bytes).map_err(|source| ConfigurationLoadError::InvalidUtf8 {
+    let source = std::str::from_utf8(bytes.as_slice()).map_err(|source| {
+        ConfigurationLoadError::InvalidUtf8 {
             path: configuration_path.clone(),
-            source,
-        })?;
-    let raw: RawConfiguration =
-        toml::from_str(&source).map_err(|source| ConfigurationLoadError::InvalidToml {
+            valid_up_to: source.valid_up_to(),
+            error_len: source.error_len(),
+        }
+    })?;
+    let raw: RawConfiguration = toml::from_str(source).map_err(|error| {
+        let location = error.span().map(|span| source_location(source, span.start));
+        ConfigurationLoadError::InvalidToml {
             path: configuration_path.clone(),
-            source,
-        })?;
+            location,
+        }
+    })?;
     let configuration_directory = configuration_path
         .parent()
         .expect("规范绝对文件路径必须拥有父目录")
@@ -140,6 +140,7 @@ pub(crate) struct ApplicationConfiguration {
     projects_root: PathBuf,
     runtime: RuntimeConfiguration,
     observability: ObservabilityConfiguration,
+    llm_clients: LlmClientCatalogConfiguration,
     mz: MzConfiguration,
 }
 
@@ -153,11 +154,13 @@ impl ApplicationConfiguration {
         let runtime = RuntimeConfiguration::build(configuration_directory, raw.runtime)?;
         let observability =
             ObservabilityConfiguration::build(configuration_directory, raw.observability)?;
-        let mz = MzConfiguration::build(configuration_directory, raw.mz)?;
+        let llm_clients = LlmClientCatalogConfiguration::build(raw.llm.clients)?;
+        let mz = MzConfiguration::build(configuration_directory, raw.mz, &llm_clients.client_ids)?;
         Ok(Self {
             projects_root,
             runtime,
             observability,
+            llm_clients,
             mz,
         })
     }
@@ -172,6 +175,10 @@ impl ApplicationConfiguration {
 
     pub(crate) const fn observability(&self) -> &ObservabilityConfiguration {
         &self.observability
+    }
+
+    pub(crate) const fn llm_clients(&self) -> &LlmClientCatalogConfiguration {
+        &self.llm_clients
     }
 
     pub(crate) const fn mz(&self) -> &MzConfiguration {
@@ -889,12 +896,14 @@ impl MzConfiguration {
     fn build(
         configuration_directory: &Path,
         raw: RawMzConfiguration,
+        llm_client_ids: &BTreeSet<LlmClientId>,
     ) -> Result<Self, ConfigurationValueError> {
         let (language_modules, language_ids) = build_language_modules(raw.languages)?;
         let translation_profiles = build_translation_profiles(
             configuration_directory,
             raw.translation_profiles,
             &language_ids,
+            llm_client_ids,
         )?;
         Ok(Self {
             document: MzDocumentConfiguration {
@@ -1127,80 +1136,48 @@ impl TranslationExecutionConfiguration {
 #[derive(Clone)]
 pub(crate) enum LlmAuthConfiguration {
     None,
-    BearerEnvironment(String),
+    Bearer(SecretString),
 }
 
-impl LlmAuthConfiguration {
-    /// 只应在当前 Translate 命令已经选中所属 Profile 后调用。
-    pub(crate) fn resolve(&self) -> Result<Option<String>, LlmCredentialError> {
-        self.resolve_with(|name| std::env::var(name))
-    }
-
-    fn resolve_with(
-        &self,
-        read_environment: impl FnOnce(&str) -> Result<String, std::env::VarError>,
-    ) -> Result<Option<String>, LlmCredentialError> {
+impl fmt::Debug for LlmAuthConfiguration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::None => Ok(None),
-            Self::BearerEnvironment(name) => match read_environment(name) {
-                Ok(value) if value.trim().is_empty() => Err(LlmCredentialError {
-                    environment_variable: name.clone(),
-                    failure: LlmCredentialFailure::Empty,
-                }),
-                Ok(value) => Ok(Some(value)),
-                Err(std::env::VarError::NotPresent) => Err(LlmCredentialError {
-                    environment_variable: name.clone(),
-                    failure: LlmCredentialFailure::Missing,
-                }),
-                Err(std::env::VarError::NotUnicode(_)) => Err(LlmCredentialError {
-                    environment_variable: name.clone(),
-                    failure: LlmCredentialFailure::NotUnicode,
-                }),
-            },
+            Self::None => formatter.write_str("None"),
+            Self::Bearer(_) => formatter.write_str("Bearer([REDACTED])"),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CompletionLimitParameter {
-    MaxTokens,
-    MaxCompletionTokens,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct CompletionLimitConfiguration {
-    parameter: CompletionLimitParameter,
-    value: NonZeroU32,
-}
-
-impl CompletionLimitConfiguration {
-    pub(crate) const fn parameter(self) -> CompletionLimitParameter {
-        self.parameter
-    }
-
-    pub(crate) const fn value(self) -> NonZeroU32 {
-        self.value
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct TranslationLlmConfiguration {
+pub(crate) struct LlmClientConfiguration {
+    id: LlmClientId,
     endpoint: Url,
     auth: LlmAuthConfiguration,
     model: String,
-    allow_plain_http_loopback: bool,
     request_timeout: Duration,
     max_request_bytes: NonZeroUsize,
     max_response_bytes: NonZeroUsize,
     max_error_response_bytes: NonZeroUsize,
     requests_per_minute: NonZeroU32,
     burst_requests: NonZeroU32,
-    completion_limit: CompletionLimitConfiguration,
-    request_options: JsonMap<String, JsonValue>,
+    request_body_extra: JsonMap<String, JsonValue>,
 }
 
-impl TranslationLlmConfiguration {
+/// 配置边界已经校验并确认存在的公共 LLM Client 身份。
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct LlmClientId(String);
+
+impl LlmClientId {
+    fn from_validated(value: String) -> Self {
+        Self(value)
+    }
+
+    #[cfg(test)]
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl LlmClientConfiguration {
     pub(crate) const fn endpoint(&self) -> &Url {
         &self.endpoint
     }
@@ -1211,10 +1188,6 @@ impl TranslationLlmConfiguration {
 
     pub(crate) fn model(&self) -> &str {
         &self.model
-    }
-
-    pub(crate) const fn allow_plain_http_loopback(&self) -> bool {
-        self.allow_plain_http_loopback
     }
 
     pub(crate) const fn request_timeout(&self) -> Duration {
@@ -1241,12 +1214,67 @@ impl TranslationLlmConfiguration {
         self.burst_requests
     }
 
-    pub(crate) const fn completion_limit(&self) -> CompletionLimitConfiguration {
-        self.completion_limit
+    pub(crate) fn request_body_extra(&self) -> &JsonMap<String, JsonValue> {
+        &self.request_body_extra
+    }
+}
+
+impl fmt::Debug for LlmClientConfiguration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LlmClientConfiguration")
+            .field("id", &self.id)
+            .field("auth", &self.auth)
+            .field("model", &self.model)
+            .field("request_timeout", &self.request_timeout)
+            .field("max_request_bytes", &self.max_request_bytes)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("max_error_response_bytes", &self.max_error_response_bytes)
+            .field("requests_per_minute", &self.requests_per_minute)
+            .field("burst_requests", &self.burst_requests)
+            .field(
+                "request_body_extra_keys",
+                &self.request_body_extra.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+pub(crate) struct LlmClientCatalogConfiguration {
+    clients: BTreeMap<LlmClientId, LlmClientConfiguration>,
+    client_ids: BTreeSet<LlmClientId>,
+}
+
+impl LlmClientCatalogConfiguration {
+    fn build(raw_clients: Vec<RawLlmClientConfiguration>) -> Result<Self, ConfigurationValueError> {
+        if raw_clients.is_empty() {
+            return Err(invalid("llm.clients", "至少需要一个 LLM 客户端"));
+        }
+
+        let mut clients = BTreeMap::new();
+        let mut client_ids = BTreeSet::new();
+        for (index, raw) in raw_clients.into_iter().enumerate() {
+            let field = format!("llm.clients[{index}]");
+            validate_exact_identifier(format!("{field}.id").as_str(), &raw.id)?;
+            let id = LlmClientId::from_validated(raw.id.clone());
+            if !client_ids.insert(id.clone()) {
+                return Err(invalid(
+                    format!("{field}.id").as_str(),
+                    "LLM 客户端 ID 重复",
+                ));
+            }
+            let client = build_llm_client(field.as_str(), raw)?;
+            clients.insert(id, client);
+        }
+
+        Ok(Self {
+            clients,
+            client_ids,
+        })
     }
 
-    pub(crate) fn request_options(&self) -> &JsonMap<String, JsonValue> {
-        &self.request_options
+    pub(crate) fn get(&self, id: &LlmClientId) -> Option<&LlmClientConfiguration> {
+        self.clients.get(id)
     }
 }
 
@@ -1256,7 +1284,7 @@ pub(crate) struct TranslationProfileConfiguration {
     max_in_flight_tasks: NonZeroUsize,
     planning: TranslationPlanningConfiguration,
     execution: TranslationExecutionConfiguration,
-    llm: TranslationLlmConfiguration,
+    llm_client_id: LlmClientId,
 }
 
 impl TranslationProfileConfiguration {
@@ -1276,8 +1304,8 @@ impl TranslationProfileConfiguration {
         &self.execution
     }
 
-    pub(crate) const fn llm(&self) -> &TranslationLlmConfiguration {
-        &self.llm
+    pub(crate) const fn llm_client_id(&self) -> &LlmClientId {
+        &self.llm_client_id
     }
 }
 
@@ -1373,6 +1401,7 @@ fn build_translation_profiles(
     configuration_directory: &Path,
     raw_profiles: Vec<RawTranslationProfileConfiguration>,
     language_ids: &BTreeSet<String>,
+    llm_client_ids: &BTreeSet<LlmClientId>,
 ) -> Result<BTreeMap<String, TranslationProfileConfiguration>, ConfigurationValueError> {
     if raw_profiles.is_empty() {
         return Err(invalid(
@@ -1411,7 +1440,14 @@ fn build_translation_profiles(
                 raw.execution.max_network_retry_after_ms,
             ),
         };
-        let llm = build_translation_llm(format!("{field}.llm").as_str(), raw.llm)?;
+        validate_exact_identifier(format!("{field}.llm_client").as_str(), &raw.llm_client)?;
+        let llm_client_id = LlmClientId::from_validated(raw.llm_client);
+        if !llm_client_ids.contains(&llm_client_id) {
+            return Err(invalid(
+                format!("{field}.llm_client").as_str(),
+                "没有同 ID 的公共 LLM 客户端",
+            ));
+        }
         let profile = TranslationProfileConfiguration {
             id: raw.id.clone(),
             max_in_flight_tasks: non_zero_usize(
@@ -1420,7 +1456,7 @@ fn build_translation_profiles(
             )?,
             planning,
             execution,
-            llm,
+            llm_client_id,
         };
         profiles.insert(raw.id, profile);
     }
@@ -1488,10 +1524,10 @@ fn build_translation_planning(
     })
 }
 
-fn build_translation_llm(
+fn build_llm_client(
     field: &str,
-    raw: RawTranslationLlmConfiguration,
-) -> Result<TranslationLlmConfiguration, ConfigurationValueError> {
+    raw: RawLlmClientConfiguration,
+) -> Result<LlmClientConfiguration, ConfigurationValueError> {
     let endpoint = Url::parse(&raw.endpoint)
         .map_err(|_| invalid(format!("{field}.endpoint").as_str(), "endpoint URL 无效"))?;
     validate_endpoint(
@@ -1509,44 +1545,62 @@ fn build_translation_llm(
                 "字符串形式只接受 none",
             ));
         }
-        RawLlmAuthConfiguration::BearerEnvironment(RawBearerEnvironmentConfiguration {
-            bearer_environment,
-        }) => {
-            validate_environment_variable(
-                format!("{field}.auth.bearer_environment").as_str(),
-                &bearer_environment,
-            )?;
-            LlmAuthConfiguration::BearerEnvironment(bearer_environment)
+        RawLlmAuthConfiguration::Bearer(RawBearerConfiguration { bearer }) => {
+            let exposed = bearer.expose_secret();
+            if exposed.trim().is_empty() {
+                return Err(invalid(
+                    format!("{field}.auth.bearer").as_str(),
+                    "Bearer 密钥不能为空白",
+                ));
+            }
+            if exposed.trim() != exposed {
+                return Err(invalid(
+                    format!("{field}.auth.bearer").as_str(),
+                    "Bearer 密钥不能包含首尾空白",
+                ));
+            }
+            if reqwest::header::HeaderValue::from_bytes(exposed.as_bytes()).is_err() {
+                return Err(invalid(
+                    format!("{field}.auth.bearer").as_str(),
+                    "Bearer 密钥不能安全写入 HTTP Header",
+                ));
+            }
+            LlmAuthConfiguration::Bearer(bearer)
         }
     };
 
-    for reserved in RESERVED_REQUEST_OPTIONS {
-        if raw.request_options.contains_key(reserved) {
+    let request_body_value = serde_json::from_str::<StrictJsonValue>(&raw.request_body_extra)
+        .map_err(|error| {
+            invalid(
+                format!("{field}.request_body_extra").as_str(),
+                format!(
+                    "不是有效的严格 JSON（第 {} 行，第 {} 列）",
+                    error.line(),
+                    error.column()
+                ),
+            )
+        })?
+        .0;
+    let JsonValue::Object(request_body_extra) = request_body_value else {
+        return Err(invalid(
+            format!("{field}.request_body_extra").as_str(),
+            "必须是 JSON 对象",
+        ));
+    };
+    for reserved in RESERVED_REQUEST_BODY_FIELDS {
+        if request_body_extra.contains_key(reserved) {
             return Err(invalid(
-                format!("{field}.request_options.{reserved}").as_str(),
-                "该字段由请求协议固定拥有，不能通过 request_options 覆盖",
+                format!("{field}.request_body_extra.{reserved}").as_str(),
+                "该顶层字段由请求协议固定拥有，不能通过 request_body_extra 覆盖",
             ));
         }
     }
-    let request_options = raw
-        .request_options
-        .into_iter()
-        .map(|(key, value)| {
-            let value = serde_json::to_value(value).map_err(|source| {
-                invalid(
-                    format!("{field}.request_options.{key}").as_str(),
-                    source.to_string(),
-                )
-            })?;
-            Ok((key, value))
-        })
-        .collect::<Result<JsonMap<_, _>, _>>()?;
 
-    Ok(TranslationLlmConfiguration {
+    Ok(LlmClientConfiguration {
+        id: LlmClientId::from_validated(raw.id),
         endpoint,
         auth,
         model: raw.model,
-        allow_plain_http_loopback: raw.allow_plain_http_loopback,
         request_timeout: positive_duration(
             format!("{field}.request_timeout_ms").as_str(),
             raw.request_timeout_ms,
@@ -1571,14 +1625,7 @@ fn build_translation_llm(
             format!("{field}.burst_requests").as_str(),
             raw.burst_requests,
         )?,
-        completion_limit: CompletionLimitConfiguration {
-            parameter: raw.completion_limit.parameter,
-            value: non_zero_u32(
-                format!("{field}.completion_limit.value").as_str(),
-                raw.completion_limit.value,
-            )?,
-        },
-        request_options,
+        request_body_extra,
     })
 }
 
@@ -1611,14 +1658,6 @@ fn is_loopback(host: Option<Host<&str>>) -> bool {
         Some(Host::Ipv6(address)) => address.is_loopback(),
         None => false,
     }
-}
-
-fn validate_environment_variable(field: &str, value: &str) -> Result<(), ConfigurationValueError> {
-    validate_exact_identifier(field, value)?;
-    if value.contains('=') || value.contains('\0') {
-        return Err(invalid(field, "环境变量名包含非法字符"));
-    }
-    Ok(())
 }
 
 fn validate_exact_identifier(field: &str, value: &str) -> Result<(), ConfigurationValueError> {
@@ -1654,6 +1693,137 @@ fn resolve_path(base: &Path, value: &Path) -> PathBuf {
     } else {
         base.join(value)
     }
+}
+
+fn source_location(source: &str, byte_offset: usize) -> SourceLocation {
+    let prefix = source.get(..byte_offset).unwrap_or(source);
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current_line)| current_line)
+        .chars()
+        .count()
+        + 1;
+    SourceLocation { line, column }
+}
+
+struct StrictJsonValue(JsonValue);
+
+impl<'de> Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonVisitor).map(Self)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("任意合法 JSON 值")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(JsonValue::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_i128<E>(self, value: i128) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        JsonNumber::deserialize(serde::de::value::I128Deserializer::new(value))
+            .map(JsonValue::Number)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        JsonNumber::deserialize(serde::de::value::U128Deserializer::new(value))
+            .map(JsonValue::Number)
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(JsonNumber::from_f64(value).map_or(JsonValue::Null, JsonValue::Number))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(JsonValue::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(JsonValue::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(JsonValue::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        StrictJsonValue::deserialize(deserializer).map(|value| value.0)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(JsonValue::Null)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<StrictJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(JsonValue::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = JsonMap::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom("JSON 对象包含重复字段"));
+            }
+            let value = object.next_value::<StrictJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(JsonValue::Object(values))
+    }
+}
+
+fn deserialize_secret_string<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(SecretString::from)
+}
+
+fn deserialize_zeroizing_string<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Zeroizing::new)
 }
 
 fn non_zero_usize(field: &str, value: u64) -> Result<NonZeroUsize, ConfigurationValueError> {
@@ -1731,11 +1901,12 @@ pub(crate) enum ConfigurationLoadError {
     },
     InvalidUtf8 {
         path: PathBuf,
-        source: std::string::FromUtf8Error,
+        valid_up_to: usize,
+        error_len: Option<usize>,
     },
     InvalidToml {
         path: PathBuf,
-        source: toml::de::Error,
+        location: Option<SourceLocation>,
     },
     InvalidValue(ConfigurationValueError),
 }
@@ -1761,19 +1932,28 @@ impl fmt::Display for ConfigurationLoadError {
             Self::Read { path, source } => {
                 write!(formatter, "无法读取配置文件 {}：{source}", path.display())
             }
-            Self::InvalidUtf8 { path, source } => {
+            Self::InvalidUtf8 {
+                path,
+                valid_up_to,
+                error_len,
+            } => {
                 write!(
                     formatter,
-                    "配置文件 {} 不是有效 UTF-8：{source}",
-                    path.display()
+                    "配置文件 {} 不是有效 UTF-8（有效前缀为 {valid_up_to} 字节，非法序列长度{}）",
+                    path.display(),
+                    error_len.map_or_else(|| "未知".to_owned(), |length| length.to_string())
                 )
             }
-            Self::InvalidToml { path, source } => {
-                write!(
-                    formatter,
-                    "配置文件 {} 不是有效 TOML：{source}",
-                    path.display()
-                )
+            Self::InvalidToml { path, location } => {
+                write!(formatter, "配置文件 {} 不是有效 TOML", path.display())?;
+                if let Some(location) = location {
+                    write!(
+                        formatter,
+                        "（第 {} 行，第 {} 列）",
+                        location.line, location.column
+                    )?;
+                }
+                formatter.write_str("：语法、结构或字段类型不符合当前配置契约")
             }
             Self::InvalidValue(source) => write!(formatter, "配置值无效：{source}"),
         }
@@ -1784,12 +1964,19 @@ impl Error for ConfigurationLoadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Open { source, .. } | Self::Read { source, .. } => Some(source),
-            Self::InvalidUtf8 { source, .. } => Some(source),
-            Self::InvalidToml { source, .. } => Some(source),
             Self::InvalidValue(source) => Some(source),
-            Self::NotAFile { .. } | Self::TooLarge { .. } => None,
+            Self::NotAFile { .. }
+            | Self::TooLarge { .. }
+            | Self::InvalidUtf8 { .. }
+            | Self::InvalidToml { .. } => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SourceLocation {
+    line: usize,
+    column: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1813,43 +2000,20 @@ impl fmt::Display for ConfigurationValueError {
 
 impl Error for ConfigurationValueError {}
 
-#[derive(Debug)]
-pub(crate) struct LlmCredentialError {
-    environment_variable: String,
-    failure: LlmCredentialFailure,
-}
-
-#[derive(Debug)]
-enum LlmCredentialFailure {
-    Missing,
-    NotUnicode,
-    Empty,
-}
-
-impl fmt::Display for LlmCredentialError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let reason = match self.failure {
-            LlmCredentialFailure::Missing => "未定义",
-            LlmCredentialFailure::NotUnicode => "不是有效 Unicode 文本",
-            LlmCredentialFailure::Empty => "值为空白",
-        };
-        write!(
-            formatter,
-            "无法从环境变量 {} 读取 Bearer 密钥：{reason}",
-            self.environment_variable
-        )
-    }
-}
-
-impl Error for LlmCredentialError {}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfiguration {
     projects: RawProjectsConfiguration,
     runtime: RawRuntimeConfiguration,
     observability: RawObservabilityConfiguration,
+    llm: RawLlmConfiguration,
     mz: RawMzConfiguration,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlmConfiguration {
+    clients: Vec<RawLlmClientConfiguration>,
 }
 
 #[derive(Deserialize)]
@@ -2065,10 +2229,10 @@ enum RawLanguageConfiguration {
 #[serde(deny_unknown_fields)]
 struct RawTranslationProfileConfiguration {
     id: String,
+    llm_client: String,
     max_in_flight_tasks: u64,
     planning: RawTranslationPlanningConfiguration,
     execution: RawTranslationExecutionConfiguration,
-    llm: RawTranslationLlmConfiguration,
 }
 
 #[derive(Deserialize)]
@@ -2096,7 +2260,8 @@ struct RawTranslationExecutionConfiguration {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTranslationLlmConfiguration {
+struct RawLlmClientConfiguration {
+    id: String,
     endpoint: String,
     auth: RawLlmAuthConfiguration,
     model: String,
@@ -2107,28 +2272,22 @@ struct RawTranslationLlmConfiguration {
     max_error_response_bytes: u64,
     requests_per_minute: u64,
     burst_requests: u64,
-    completion_limit: RawCompletionLimitConfiguration,
-    request_options: toml::Table,
+    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    request_body_extra: Zeroizing<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RawLlmAuthConfiguration {
     Name(String),
-    BearerEnvironment(RawBearerEnvironmentConfiguration),
+    Bearer(RawBearerConfiguration),
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawBearerEnvironmentConfiguration {
-    bearer_environment: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCompletionLimitConfiguration {
-    parameter: CompletionLimitParameter,
-    value: u64,
+struct RawBearerConfiguration {
+    #[serde(deserialize_with = "deserialize_secret_string")]
+    bearer: SecretString,
 }
 
 #[cfg(test)]
@@ -2136,6 +2295,8 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use secrecy::ExposeSecret;
 
     use super::*;
 
@@ -2195,14 +2356,16 @@ mod tests {
             profile.planning().systems()[0].markdown_path(),
             configuration_directory.join("prompts/ja-zh.md")
         );
-        assert!(matches!(
-            profile.llm().completion_limit().parameter(),
-            CompletionLimitParameter::MaxTokens
-        ));
+        assert_eq!(profile.llm_client_id().as_str(), "local-client");
+        let client = configuration
+            .llm_clients()
+            .get(profile.llm_client_id())
+            .expect("Profile 引用的公共客户端应存在");
         assert_eq!(
-            profile.llm().request_options().get("temperature"),
+            client.request_body_extra().get("temperature"),
             Some(&JsonValue::from(0.2))
         );
+        assert!(matches!(client.auth(), LlmAuthConfiguration::None));
         assert_eq!(
             configuration
                 .mz()
@@ -2263,7 +2426,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_resource_and_reserved_request_option_are_rejected() {
+    fn zero_resource_and_reserved_request_body_field_are_rejected() {
         let directory = TestDirectory::new();
         let zero = directory.write(
             "zero.toml",
@@ -2279,8 +2442,8 @@ mod tests {
         let reserved = directory.write(
             "reserved.toml",
             &valid_configuration().replacen(
-                "request_options = { temperature = 0.2 }",
-                "request_options = { temperature = 0.2, model = \"other\" }",
+                "\"temperature\": 0.2",
+                "\"temperature\": 0.2, \"model\": \"other\"",
                 1,
             ),
         );
@@ -2290,7 +2453,7 @@ mod tests {
         else {
             panic!("应返回配置值错误");
         };
-        assert!(error.field().ends_with("request_options.model"));
+        assert!(error.field().ends_with("request_body_extra.model"));
     }
 
     #[test]
@@ -2309,7 +2472,7 @@ mod tests {
         else {
             panic!("应返回配置值错误");
         };
-        assert!(error.field().ends_with("llm.endpoint"));
+        assert!(error.field().ends_with(".endpoint"));
 
         let profile = profile_configuration();
         let duplicate = directory.write(
@@ -2335,18 +2498,18 @@ mod tests {
                     "http://127.0.0.1:8080/v1/chat/completions",
                     "http://127.0.0.1:8080/v1/chat/completions#fragment",
                 ),
-                ".llm.endpoint",
+                ".endpoint",
             ),
             (
                 "model-whitespace.toml",
                 valid_configuration().replace("model = \"test-model\"", "model = \" test-model\""),
-                ".llm.model",
+                ".model",
             ),
             (
                 "auth-unknown.toml",
                 valid_configuration().replace(
                     "auth = \"none\"",
-                    "auth = { bearer_environment = \"ATT_KEY\", unknown = true }",
+                    "auth = { bearer = \"secret\", unknown = true }",
                 ),
                 "",
             ),
@@ -2365,46 +2528,253 @@ mod tests {
     }
 
     #[test]
-    fn blank_bearer_environment_value_is_rejected_without_echoing_the_value() {
-        let variable = format!(
-            "ATT_TEST_BLANK_{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("系统时间应有效")
-                .as_nanos()
+    fn bearer_is_loaded_directly_and_debug_is_redacted() {
+        let directory = TestDirectory::new();
+        let secret = "must-not-leak-bearer-7f91";
+        let sensitive_extra = "must-not-leak-extra-4c28";
+        let path = directory.write(
+            "bearer.toml",
+            &valid_configuration()
+                .replace(
+                    "auth = \"none\"",
+                    &format!("auth = {{ bearer = \"{secret}\" }}"),
+                )
+                .replace(
+                    "\"temperature\": 0.2",
+                    &format!("\"sensitive\": \"{sensitive_extra}\""),
+                ),
         );
-        let error = LlmAuthConfiguration::BearerEnvironment(variable.clone())
-            .resolve_with(|_| Ok("  ".to_owned()))
-            .expect_err("空白 Bearer 密钥必须拒绝");
-        let message = error.to_string();
-        assert!(message.contains(&variable));
-        assert!(message.contains("值为空白"));
-        assert!(!message.contains("\"  \""));
+        let configuration = load_configuration(&path).expect("配置内 Bearer 应合法");
+        let client = configuration
+            .llm_clients()
+            .get(&LlmClientId::from_validated("local-client".to_owned()))
+            .expect("客户端应存在");
+        let LlmAuthConfiguration::Bearer(bearer) = client.auth() else {
+            panic!("应建立 Bearer 认证");
+        };
+        assert_eq!(bearer.expose_secret(), secret);
+        let debug = format!("{client:?}");
+        assert!(!debug.contains(secret));
+        assert!(!debug.contains(sensitive_extra));
+        assert!(debug.contains("sensitive"));
     }
 
     #[test]
-    fn bearer_environment_is_not_read_while_loading_unselected_configuration() {
+    fn public_client_catalog_supports_shared_references_and_rejects_invalid_catalogs() {
         let directory = TestDirectory::new();
-        let variable = format!(
-            "ATT_TEST_MISSING_{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("系统时间应有效")
-                .as_nanos()
+        let primary_client = client_configuration();
+        let secondary_client = primary_client
+            .replace("id = \"local-client\"", "id = \"secondary-client\"")
+            .replace("127.0.0.1:8080", "127.0.0.1:8081");
+        let primary_profile = profile_configuration();
+        let secondary_profile = primary_profile.replace("id = \"local\"", "id = \"secondary\"");
+        let shared = valid_configuration()
+            .replace(
+                &primary_client,
+                &format!("{primary_client}\n{secondary_client}"),
+            )
+            .replace(
+                &primary_profile,
+                &format!("{primary_profile}\n{secondary_profile}"),
+            );
+        let configuration = load_configuration(&directory.write("shared.toml", &shared))
+            .expect("多个 Profile 应能引用同一公共客户端");
+        assert!(
+            configuration
+                .llm_clients()
+                .get(&LlmClientId::from_validated("secondary-client".to_owned()))
+                .is_some()
         );
-        let path = directory.write(
-            "environment.toml",
-            &valid_configuration().replace(
-                "auth = \"none\"",
-                &format!("auth = {{ bearer_environment = \"{variable}\" }}"),
+        assert_eq!(
+            configuration
+                .mz()
+                .translation_profile("secondary")
+                .expect("第二个 Profile 应存在")
+                .llm_client_id()
+                .as_str(),
+            "local-client"
+        );
+
+        for (name, source, expected_field) in [
+            (
+                "empty-clients.toml",
+                valid_configuration().replace(&primary_client, "[llm]\nclients = []"),
+                "llm.clients",
             ),
+            (
+                "duplicate-client.toml",
+                valid_configuration().replace(
+                    &primary_client,
+                    &format!("{primary_client}\n{primary_client}"),
+                ),
+                "llm.clients[1].id",
+            ),
+            (
+                "unknown-reference.toml",
+                valid_configuration().replace(
+                    "llm_client = \"local-client\"",
+                    "llm_client = \"missing-client\"",
+                ),
+                "mz.translation_profiles[0].llm_client",
+            ),
+            (
+                "blank-reference.toml",
+                valid_configuration()
+                    .replace("llm_client = \"local-client\"", "llm_client = \"  \""),
+                "mz.translation_profiles[0].llm_client",
+            ),
+        ] {
+            let ConfigurationLoadError::InvalidValue(error) =
+                load_configuration(&directory.write(name, &source))
+                    .err()
+                    .expect("非法公共客户端目录或引用必须拒绝")
+            else {
+                panic!("应返回配置值错误");
+            };
+            assert_eq!(error.field(), expected_field);
+        }
+    }
+
+    #[test]
+    fn request_body_extra_is_one_strict_json_object_contract() {
+        let directory = TestDirectory::new();
+        let accepted = replace_request_body_extra(
+            &valid_configuration(),
+            r#"{
+  "n": 2,
+  "max_tokens": 4096,
+  "max_completion_tokens": 8192,
+  "thinking": {"model": "nested", "values": [null, true, 1.5]}
+}"#,
         );
-        let configuration = load_configuration(&path).expect("加载配置不应读取密钥环境变量");
-        let profile = configuration
-            .mz()
-            .translation_profile("local")
-            .expect("Profile 应存在");
-        assert!(profile.llm().auth().resolve().is_err());
+        let configuration = load_configuration(&directory.write("accepted.toml", &accepted))
+            .expect("用户拥有的任意非保留 JSON 字段应保留");
+        let extra = configuration
+            .llm_clients()
+            .get(&LlmClientId::from_validated("local-client".to_owned()))
+            .expect("客户端应存在")
+            .request_body_extra();
+        assert_eq!(extra.get("n"), Some(&JsonValue::from(2)));
+        assert_eq!(extra.get("max_tokens"), Some(&JsonValue::from(4096)));
+        assert_eq!(
+            extra.get("thinking").and_then(|value| value.get("model")),
+            Some(&JsonValue::from("nested"))
+        );
+
+        for (name, json, expected_suffix) in [
+            ("non-object.toml", "[]", "request_body_extra"),
+            (
+                "trailing-comma.toml",
+                r#"{"value": 1,}"#,
+                "request_body_extra",
+            ),
+            (
+                "comment.toml",
+                "{\"value\": 1 // comment\n}",
+                "request_body_extra",
+            ),
+            (
+                "parallel-values.toml",
+                r#"{"value": 1} {"other": 2}"#,
+                "request_body_extra",
+            ),
+            (
+                "truncated.toml",
+                r#"{"value": "unfinished"#,
+                "request_body_extra",
+            ),
+            (
+                "top-duplicate.toml",
+                r#"{"value": 1, "value": 2}"#,
+                "request_body_extra",
+            ),
+            (
+                "nested-duplicate.toml",
+                r#"{"nested": {"value": 1, "value": 2}}"#,
+                "request_body_extra",
+            ),
+            (
+                "reserved-model.toml",
+                r#"{"model": "other"}"#,
+                "request_body_extra.model",
+            ),
+            (
+                "reserved-messages.toml",
+                r#"{"messages": []}"#,
+                "request_body_extra.messages",
+            ),
+            (
+                "reserved-stream.toml",
+                r#"{"stream": true}"#,
+                "request_body_extra.stream",
+            ),
+        ] {
+            let source = replace_request_body_extra(&valid_configuration(), json);
+            let ConfigurationLoadError::InvalidValue(error) =
+                load_configuration(&directory.write(name, &source))
+                    .err()
+                    .expect("非法扩展正文必须拒绝")
+            else {
+                panic!("应返回配置值错误");
+            };
+            assert!(error.field().ends_with(expected_suffix));
+        }
+
+        let wrong_type = valid_configuration().replace(
+            REQUEST_BODY_EXTRA_FIXTURE,
+            "request_body_extra = { temperature = 0.2 }",
+        );
+        assert!(matches!(
+            load_configuration(&directory.write("wrong-type.toml", &wrong_type)),
+            Err(ConfigurationLoadError::InvalidToml { .. })
+        ));
+    }
+
+    #[test]
+    fn configuration_errors_never_retain_or_render_secret_source_text() {
+        let directory = TestDirectory::new();
+        let secret = "must-not-leak-config-source-a3d9";
+        let invalid_toml = valid_configuration()
+            .replace(
+                "auth = \"none\"",
+                &format!("auth = {{ bearer = \"{secret}\" }}"),
+            )
+            .replace(
+                "root = \"projects\"",
+                "root = \"projects\"\nroot = \"other\"",
+            );
+        assert_error_chain_does_not_contain(
+            load_configuration(&directory.write("invalid-toml.toml", &invalid_toml))
+                .err()
+                .expect("重复 TOML key 必须拒绝"),
+            secret,
+        );
+
+        let invalid_json = valid_configuration().replace(
+            "auth = \"none\"",
+            &format!("auth = {{ bearer = \"{secret}\" }}"),
+        );
+        let invalid_json = replace_request_body_extra(
+            &invalid_json,
+            format!(r#"{{"sensitive": "{secret}",}}"#).as_str(),
+        );
+        assert_error_chain_does_not_contain(
+            load_configuration(&directory.write("invalid-json.toml", &invalid_json))
+                .err()
+                .expect("非法 JSON 必须拒绝"),
+            secret,
+        );
+
+        let invalid_bearer = valid_configuration().replace(
+            "auth = \"none\"",
+            &format!("auth = {{ bearer = \" {secret} \" }}"),
+        );
+        assert_error_chain_does_not_contain(
+            load_configuration(&directory.write("invalid-bearer.toml", &invalid_bearer))
+                .err()
+                .expect("带首尾空白的密钥必须拒绝"),
+            secret,
+        );
     }
 
     #[test]
@@ -2418,6 +2788,33 @@ mod tests {
             load_configuration(&path),
             Err(ConfigurationLoadError::TooLarge { .. })
         ));
+    }
+
+    const REQUEST_BODY_EXTRA_FIXTURE: &str = r#"request_body_extra = '''
+{
+  "temperature": 0.2
+}
+'''"#;
+
+    fn replace_request_body_extra(configuration: &str, json: &str) -> String {
+        let replacement = format!("request_body_extra = '''\n{json}\n'''");
+        let replaced = configuration.replace(REQUEST_BODY_EXTRA_FIXTURE, &replacement);
+        assert_ne!(replaced, configuration, "测试夹具必须命中扩展正文");
+        replaced
+    }
+
+    fn assert_error_chain_does_not_contain(error: ConfigurationLoadError, sentinel: &str) {
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(!display.contains(sentinel));
+        assert!(!debug.contains(sentinel));
+
+        let mut source = error.source();
+        while let Some(current) = source {
+            assert!(!current.to_string().contains(sentinel));
+            assert!(!format!("{current:?}").contains(sentinel));
+            source = current.source();
+        }
     }
 
     fn valid_configuration() -> String {
@@ -2503,6 +2900,8 @@ max_record_bytes = 1048576
 max_file_bytes = 67108864
 retained_rotated_files = 5
 
+{}
+
 [mz.document]
 read_concurrency = 4
 parse_concurrency = 2
@@ -2543,13 +2942,37 @@ minimum_copied_letter_count = 4
 allowed_terms = []
 
 {}"#,
+            client_configuration(),
             profile_configuration()
         )
+    }
+
+    fn client_configuration() -> String {
+        r#"[[llm.clients]]
+id = "local-client"
+endpoint = "http://127.0.0.1:8080/v1/chat/completions"
+auth = "none"
+model = "test-model"
+allow_plain_http_loopback = true
+request_timeout_ms = 60000
+max_request_bytes = 1048576
+max_response_bytes = 4194304
+max_error_response_bytes = 65536
+requests_per_minute = 60
+burst_requests = 4
+request_body_extra = '''
+{
+  "temperature": 0.2
+}
+'''
+"#
+        .to_owned()
     }
 
     fn profile_configuration() -> String {
         r#"[[mz.translation_profiles]]
 id = "local"
+llm_client = "local-client"
 max_in_flight_tasks = 2
 
 [mz.translation_profiles.planning]
@@ -2564,23 +2987,6 @@ path = "prompts/ja-zh.md"
 [mz.translation_profiles.execution]
 network_retry_delays_ms = [250, 1000]
 max_network_retry_after_ms = 5000
-
-[mz.translation_profiles.llm]
-endpoint = "http://127.0.0.1:8080/v1/chat/completions"
-auth = "none"
-model = "test-model"
-allow_plain_http_loopback = true
-request_timeout_ms = 60000
-max_request_bytes = 1048576
-max_response_bytes = 4194304
-max_error_response_bytes = 65536
-requests_per_minute = 60
-burst_requests = 4
-request_options = { temperature = 0.2 }
-
-[mz.translation_profiles.llm.completion_limit]
-parameter = "max_tokens"
-value = 4096
 "#
         .to_owned()
     }

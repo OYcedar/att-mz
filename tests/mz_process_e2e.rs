@@ -34,8 +34,11 @@ const EXPECTED_USER_MESSAGE: &str =
 const EXTRACT_LUA: &str = "scripts/extract.lua";
 const TRANSLATE_LUA: &str = "scripts/translate.lua";
 const WRITE_BACK_LUA: &str = "scripts/write_back.lua";
-const API_KEY_ENVIRONMENT: &str = "ATT_MZ_E2E_API_KEY";
 const API_KEY: &str = "e2e-secret";
+const E2E_EXTRA_SECRET: &str = "e2e-extra-secret";
+const LEAK_SENTINEL: &str = "e2e-secret-must-not-leak";
+const EMPTY_REQUEST_BODY_EXTRA: &str = "{}";
+const E2E_REQUEST_BODY_EXTRA: &str = r#"{"temperature":0.0,"provider_extension":{"mode":"e2e","private_marker":"e2e-extra-secret"}}"#;
 
 #[test]
 fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
@@ -52,7 +55,11 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     write_lua_scripts(root);
 
     let cancellation_server = BoundCancellationChatServer::bind();
-    write_configuration(root, cancellation_server.endpoint());
+    write_configuration(
+        root,
+        cancellation_server.endpoint(),
+        EMPTY_REQUEST_BODY_EXTRA,
+    );
 
     let mut init_arguments = arguments(&["mz", "init", "--name", PROJECT, "--path"]);
     init_arguments.push(game_root.as_os_str().to_owned());
@@ -102,7 +109,6 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     let cancelled_child = spawn_att_in_new_process_group(
         root,
         arguments(&["mz", "translate", "--name", PROJECT, PROFILE]),
-        &[(API_KEY_ENVIRONMENT, API_KEY)],
     );
     running_cancellation_server.wait_until_request();
     // SAFETY: 子进程使用 CREATE_NEW_PROCESS_GROUP 且继承当前控制台；只向其进程组
@@ -110,10 +116,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     let generated = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, cancelled_child.id()) };
     assert_ne!(generated, 0, "应能向 att.exe 独立进程组发送 Ctrl-Break");
     let cancelled_request = running_cancellation_server.respond_and_finish();
-    assert_eq!(
-        cancelled_request.header("authorization"),
-        Some("Bearer e2e-secret")
-    );
+    assert_exact_minimal_chat_request(&cancelled_request);
     let cancelled = wait_for_att(cancelled_child);
     assert_eq!(cancelled.status.code(), Some(130));
     assert!(cancelled.stdout.is_empty(), "Ctrl-C 不得打印业务完成文案");
@@ -121,9 +124,9 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_translation_absent(&database);
 
     let server = BoundChatServer::bind();
-    write_configuration(root, server.endpoint());
+    write_configuration(root, server.endpoint(), E2E_REQUEST_BODY_EXTRA);
     let running_server = server.start();
-    let translate = run_att_with_environment(
+    let translate = run_att(
         root,
         arguments(&[
             "mz",
@@ -134,7 +137,6 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
             "--lua",
             TRANSLATE_LUA,
         ]),
-        &[(API_KEY_ENVIRONMENT, API_KEY)],
     );
     let requests = running_server.finish();
     let translate_stdout = assert_success("translate", &translate);
@@ -182,6 +184,46 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         String::from_utf8_lossy(&failed.stderr).contains("missing-profile"),
         "失败应呈现未找到的 Profile"
     );
+    for (phase, output) in [
+        ("init", &init),
+        ("extract", &extract),
+        ("cancelled translate", &cancelled),
+        ("translate", &translate),
+        ("write-back", &write_back),
+        ("failed translate", &failed),
+    ] {
+        assert_process_output_does_not_contain_client_secrets(phase, output);
+    }
+}
+
+#[test]
+fn malformed_configuration_does_not_echo_bearer_secret() {
+    let temporary = tempfile::tempdir().expect("应可建立密钥泄漏测试目录");
+    let root = temporary.path();
+    fs::write(
+        root.join("config.toml"),
+        format!(
+            r#"[[llm.clients]]
+id = "leak-probe"
+endpoint = "https://example.invalid/v1/chat/completions"
+auth = {{ bearer = "{LEAK_SENTINEL}" "invalid" }}
+"#
+        ),
+    )
+    .expect("无效配置夹具应可写入");
+
+    let output = run_att(
+        root,
+        arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "配置失败不得打印成功文案");
+    let stderr = String::from_utf8(output.stderr).expect("stderr 必须是 UTF-8");
+    assert!(!stderr.is_empty(), "配置失败必须呈现诊断");
+    assert!(
+        !stderr.contains(LEAK_SENTINEL),
+        "配置语法错误不得回显 Bearer 密钥：{stderr}"
+    );
 }
 
 fn arguments(values: &[&str]) -> Vec<OsString> {
@@ -189,43 +231,41 @@ fn arguments(values: &[&str]) -> Vec<OsString> {
 }
 
 fn run_att(root: &Path, arguments: Vec<OsString>) -> Output {
-    run_att_with_environment(root, arguments, &[])
-}
-
-fn run_att_with_environment(
-    root: &Path,
-    arguments: Vec<OsString>,
-    environment: &[(&str, &str)],
-) -> Output {
-    let mut command = att_command(root, arguments, environment);
+    let mut command = att_command(root, arguments);
     let child = command.spawn().expect("att.exe 应可启动");
     wait_for_att(child)
 }
 
-fn spawn_att_in_new_process_group(
-    root: &Path,
-    arguments: Vec<OsString>,
-    environment: &[(&str, &str)],
-) -> Child {
-    let mut command = att_command(root, arguments, environment);
+fn assert_process_output_does_not_contain_client_secrets(phase: &str, output: &Output) {
+    for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(
+            !text.contains(API_KEY),
+            "{phase} 的 {stream} 不得包含配置内 Bearer 密钥：{text}"
+        );
+        assert!(
+            !text.contains(E2E_EXTRA_SECRET),
+            "{phase} 的 {stream} 不得包含扩展正文敏感值：{text}"
+        );
+    }
+}
+
+fn spawn_att_in_new_process_group(root: &Path, arguments: Vec<OsString>) -> Child {
+    let mut command = att_command(root, arguments);
     command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     command.spawn().expect("独立进程组中的 att.exe 应可启动")
 }
 
-fn att_command(root: &Path, arguments: Vec<OsString>, environment: &[(&str, &str)]) -> Command {
+fn att_command(root: &Path, arguments: Vec<OsString>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_att"));
     command
         .current_dir(root)
         .arg("--config")
         .arg(root.join("config.toml"))
         .args(arguments)
-        .env_remove(API_KEY_ENVIRONMENT)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (name, value) in environment {
-        command.env(name, value);
-    }
     command
 }
 
@@ -415,7 +455,7 @@ ctx.db.commit()
     .expect("WriteBack Lua 应可写入");
 }
 
-fn write_configuration(root: &Path, endpoint: &str) {
+fn write_configuration(root: &Path, endpoint: &str, request_body_extra: &str) {
     let configuration = format!(
         r#"[projects]
 root = "projects"
@@ -473,6 +513,20 @@ proxy = false
 [runtime.llm.tls]
 additional_pem_files = []
 
+[[llm.clients]]
+id = "primary"
+endpoint = "{endpoint}"
+auth = {{ bearer = "{API_KEY}" }}
+model = "e2e-model"
+allow_plain_http_loopback = true
+request_timeout_ms = 10000
+max_request_bytes = 1048576
+max_response_bytes = 1048576
+max_error_response_bytes = 65536
+requests_per_minute = 60
+burst_requests = 4
+request_body_extra = '''{request_body_extra}'''
+
 [runtime.lua]
 worker_threads = 1
 queue_capacity = 4
@@ -529,6 +583,7 @@ quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 
 [[mz.translation_profiles]]
 id = "local"
+llm_client = "primary"
 max_in_flight_tasks = 1
 
 [mz.translation_profiles.planning]
@@ -544,25 +599,9 @@ path = "prompts/ja-zh.md"
 network_retry_delays_ms = [10]
 max_network_retry_after_ms = 1000
 
-[mz.translation_profiles.llm]
-endpoint = "{endpoint}"
-auth = {{ bearer_environment = "{API_KEY_ENVIRONMENT}" }}
-model = "e2e-model"
-allow_plain_http_loopback = true
-request_timeout_ms = 10000
-max_request_bytes = 1048576
-max_response_bytes = 1048576
-max_error_response_bytes = 65536
-requests_per_minute = 60
-burst_requests = 4
-request_options = {{ temperature = 0.0 }}
-
-[mz.translation_profiles.llm.completion_limit]
-parameter = "max_tokens"
-value = 128
-
 [[mz.translation_profiles]]
 id = "unselected"
+llm_client = "primary"
 max_in_flight_tasks = 1
 
 [mz.translation_profiles.planning]
@@ -577,23 +616,6 @@ path = "prompts/does-not-exist.md"
 [mz.translation_profiles.execution]
 network_retry_delays_ms = []
 max_network_retry_after_ms = 1000
-
-[mz.translation_profiles.llm]
-endpoint = "{endpoint}"
-auth = {{ bearer_environment = "ATT_MZ_E2E_UNSELECTED_KEY" }}
-model = "unused-model"
-allow_plain_http_loopback = true
-request_timeout_ms = 10000
-max_request_bytes = 1048576
-max_response_bytes = 1048576
-max_error_response_bytes = 65536
-requests_per_minute = 60
-burst_requests = 4
-request_options = {{}}
-
-[mz.translation_profiles.llm.completion_limit]
-parameter = "max_tokens"
-value = 64
 "#
     );
     fs::write(root.join("config.toml"), configuration).expect("完整配置应可写入");
@@ -812,6 +834,8 @@ fn assert_json_lines(log_root: &Path, output_root: &Path) {
     assert!(!translation_raw.contains(SOURCE_TEXT));
     assert!(!translation_raw.contains(TRANSLATION));
     assert!(!translation_raw.contains("messages"));
+    assert!(!translation_raw.contains(API_KEY));
+    assert!(!translation_raw.contains(E2E_EXTRA_SECRET));
 
     let (write_back_raw, write_back_lines) = read_json_lines(&log_root.join("write_back.jsonl"));
     assert_eq!(write_back_lines.len(), 1);
@@ -848,6 +872,8 @@ fn assert_json_lines(log_root: &Path, output_root: &Path) {
     );
     assert!(!write_back_raw.contains(SOURCE_TEXT));
     assert!(!write_back_raw.contains(TRANSLATION));
+    assert!(!write_back_raw.contains(API_KEY));
+    assert!(!write_back_raw.contains(E2E_EXTRA_SECRET));
 }
 
 fn read_json_lines(path: &Path) -> (String, Vec<Value>) {
@@ -1262,7 +1288,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn assert_exact_standard_chat_request(request: &CapturedRequest) {
+fn assert_common_chat_request_headers(request: &CapturedRequest) {
     assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
     assert_eq!(request.header("content-type"), Some("application/json"));
     assert_eq!(request.header("authorization"), Some("Bearer e2e-secret"));
@@ -1274,6 +1300,27 @@ fn assert_exact_standard_chat_request(request: &CapturedRequest) {
             .expect("Content-Length 应是整数"),
         request.body.len()
     );
+}
+
+fn assert_exact_minimal_chat_request(request: &CapturedRequest) {
+    assert_common_chat_request_headers(request);
+    let actual: Value = serde_json::from_slice(&request.body).expect("LLM 请求必须是 JSON");
+    let expected = json!({
+        "model": "e2e-model",
+        "messages": [
+            { "role": "system", "content": SYSTEM_PROMPT },
+            { "role": "user", "content": EXPECTED_USER_MESSAGE }
+        ],
+        "stream": false
+    });
+    assert_eq!(
+        actual, expected,
+        "空扩展正文时只能发送 model、messages 与 stream"
+    );
+}
+
+fn assert_exact_standard_chat_request(request: &CapturedRequest) {
+    assert_common_chat_request_headers(request);
     let actual: Value = serde_json::from_slice(&request.body).expect("LLM 请求必须是 JSON");
     let expected = json!({
         "model": "e2e-model",
@@ -1282,17 +1329,17 @@ fn assert_exact_standard_chat_request(request: &CapturedRequest) {
             { "role": "user", "content": EXPECTED_USER_MESSAGE }
         ],
         "stream": false,
-        "n": 1,
-        "max_tokens": 128,
-        "temperature": 0.0
+        "temperature": 0.0,
+        "provider_extension": {
+            "mode": "e2e",
+            "private_marker": E2E_EXTRA_SECRET
+        }
     });
     assert_eq!(actual, expected, "Chat Completions 请求 wire 必须精确匹配");
 }
 
 fn assert_exact_lua_chat_request(request: &CapturedRequest) {
-    assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
-    assert_eq!(request.header("content-type"), Some("application/json"));
-    assert_eq!(request.header("authorization"), Some("Bearer e2e-secret"));
+    assert_common_chat_request_headers(request);
     let actual: Value = serde_json::from_slice(&request.body).expect("Lua LLM 请求必须是 JSON");
     let expected = json!({
         "model": "e2e-model",
@@ -1301,9 +1348,14 @@ fn assert_exact_lua_chat_request(request: &CapturedRequest) {
             { "role": "user", "content": "LUA USER" }
         ],
         "stream": false,
-        "n": 1,
-        "max_tokens": 128,
-        "temperature": 0.0
+        "temperature": 0.0,
+        "provider_extension": {
+            "mode": "e2e",
+            "private_marker": E2E_EXTRA_SECRET
+        }
     });
-    assert_eq!(actual, expected, "Translate Lua 必须复用同一 LLM Profile");
+    assert_eq!(
+        actual, expected,
+        "Translate Lua 必须复用同一公共 LLM 客户端"
+    );
 }

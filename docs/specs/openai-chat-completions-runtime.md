@@ -2,7 +2,10 @@
 
 ## 1. 职责与范围
 
-`OpenAiChatCompletionExecutor` 是 `LlmRequestExecutor` 的生产实现。它只执行一次非流式、单 choice 的 OpenAI-compatible Chat Completions HTTP 请求，负责请求大小、全局容量、Profile 速率、连接池、单次超时、响应大小和 HTTP 协议的精确边界。
+`OpenAiChatCompletionExecutor` 是公共 `LlmRequestExecutor` 的生产实现。它按受信
+`OpenAiChatCompletionClient` 只执行一次非流式 OpenAI-compatible Chat Completions
+HTTP 请求，负责请求大小、全局容量、客户端速率、连接池、单次超时、响应大小和
+HTTP 协议的精确边界。
 
 该根不自动重试、不自动探测供应商、不修复响应，也不支持流式、多 choice、tool call、图像或音频。Standard 翻译对 Retryable 失败的有限重试属于上层业务策略；Translate Lua 完整拥有自身的调用与重试逻辑。
 
@@ -15,7 +18,11 @@
 - 关闭系统代理后的显式代理选择；
 - Windows native TLS 根之上显式增加的 PEM 根证书。
 
-每个受信 Profile 精确建立 endpoint、认证、model、单请求超时、请求/成功响应/错误响应三类字节上限、RPM、burst、输出上限字段和供应商请求选项。只有当前命令选中的 Profile 解析 Bearer 环境变量和 PEM 文件。Standard 与 Translate Lua 共享同一个 Executor 和同一个 Profile 对象，因此共享 HTTP 连接池、总容量和 Profile 速率额度。
+每个受信 Client 精确建立 endpoint、直接 Bearer 或无认证、model、单请求超时、
+请求/成功响应/错误响应三类字节上限、RPM、burst 和用户提供的额外 JSON 请求字段。
+这些静态不变量已由统一配置边界建立，Executor 不重复解释或校验。Standard 与
+Translate Lua 共享同一个 Executor 和同一个 Client 对象，因此共享 HTTP 连接池、
+总容量和客户端速率额度。
 
 endpoint 只允许：
 
@@ -30,20 +37,22 @@ endpoint 不得嵌入用户名、密码或 fragment。根不跟随重定向，�
 
 ```json
 {
-  "model": "profile-model",
+  "model": "client-model",
   "messages": [
     { "role": "system", "content": "..." },
     { "role": "user", "content": "..." }
   ],
-  "stream": false,
-  "n": 1,
-  "max_tokens": 4096
+  "stream": false
 }
 ```
 
-Profile 可精确选择 `max_tokens` 或 `max_completion_tokens`，两者只发送其一。`request_options` 在保留表达力的同时不得覆盖 `model`、`messages`、`stream`、`n`、`max_tokens` 或 `max_completion_tokens`。
+`model`、`messages` 与 `stream=false` 是根拥有的完整固定字段集。Client 的
+`request_body_extra` 为 `{}` 时，请求中不得出现 `n`、`max_tokens`、
+`max_completion_tokens` 或其他隐式字段。非空时，根只把已验证 JSON 对象的顶层
+字段合并进正文；`n`、两种 token 上限以及供应商私有字段都不被解释或改写。
+用户配置 `n=2` 时会按原值发送，但成功响应仍必须满足本规格的单 choice wire。
 
-根通过受限 writer 序列化正文；一旦下一段输出会超过 `max_request_bytes` 就立即停止，不先建立超限的完整缓冲区。序列化成功后才占用任何请求许可。认证只使用受信 Profile 内的可选 Bearer 密钥。
+根通过受限 writer 序列化正文；一旦下一段输出会超过 `max_request_bytes` 就立即停止，不先建立超限的完整缓冲区。序列化成功后才占用任何请求许可。认证只使用受信 Client 内已经转换为秘密值的可选直接 Bearer。
 
 ## 4. 准入、取消与资源顺序
 
@@ -54,7 +63,7 @@ Profile 可精确选择 `max_tokens` 或 `max_completion_tokens`，两者只发�
         ↓
 总容量许可（active + queue）
         ↓
-Profile RPM / burst
+Client RPM / burst
         ↓
 active 许可
         ↓
@@ -107,7 +116,9 @@ Fatal 包含：
 
 ## 7. 隐私与可观测性
 
-根的 `Display`、`Debug` 和错误链不包含 Bearer 密钥、messages、完整请求正文、完整成功响应或错误响应。Profile Debug 只显示 `request_options` 的字段名，不显示字段值；Bearer 和显式代理一律脱敏。
+根的 `Display`、`Debug` 和错误链不包含 Bearer 密钥、messages、完整请求正文、
+完整成功响应或错误响应。Client Debug 只显示额外 JSON 的顶层字段名，不显示
+字段值；Bearer 和显式代理一律脱敏。
 
 持久翻译任务日志可记录 `provider_request_id`、`provider_response_id` 和 `final_response_usage`，不记录密钥、messages、模型正文、原文或译文全文。
 

@@ -33,8 +33,7 @@ use crate::att_mz::lua::runtime::{
     TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
 };
 use crate::att_mz::lua::{LuaPhase, LuaProjectContext};
-use crate::att_mz::translate::executor::{LlmResponse, LlmUsage};
-use crate::att_mz::translate::standard::{ChatMessage, ChatMessageRole};
+use crate::llm::{ChatMessage, ChatMessageRole, LlmResponse, LlmUsage};
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow, SqliteValue};
 
 /// 已由配置边界建立的 Lua worker 资源上限。
@@ -1498,7 +1497,7 @@ mod tests {
             Box::pin(async {
                 Ok(LlmResponse::new(
                     "raw response",
-                    crate::att_mz::translate::executor::LlmFinishReason::Stop,
+                    crate::llm::LlmFinishReason::Stop,
                     Some("request-1".to_owned()),
                     "response-1",
                     Some(LlmUsage::new(3, 5, 8)),

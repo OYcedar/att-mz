@@ -53,11 +53,12 @@ ProductionMzCommandRunner 只构造当前命令所需的纵向切片
 | Translate | 文件、SQLite、CPU、Delay、LLM、Translation JSONL 以及完整 Standard 翻译；显式 `--lua` 时再构造 Lua |
 | WriteBack | 文件、SQLite、CPU、可恢复目录发布、WriteBack JSONL 与完整 Standard 写回；显式 `--lua` 时再构造 Lua |
 
-Translate 先按 CLI 提供的精确 ID 选中一个 Profile。只有该 Profile 的
-Bearer 环境变量、系统提示词和全局 LLM TLS PEM 才会在本命令中读取。
-系统提示词必须是非空白 UTF-8 Markdown。Standard 与 Translate Lua 共享同一个
-`OpenAiChatCompletionExecutor` 和同一份不可变 Profile，因此共享连接池、总准入、
-限速和身份事实。
+Translate 先按 CLI 提供的精确 ID 选中一个 MZ Profile，再取得它引用的公共 LLM
+Client。只有该 Profile 的系统提示词和全局 LLM TLS PEM 才会在本命令中读取；
+系统提示词必须是非空白 UTF-8 Markdown。组合根只构造一个
+`OpenAiChatCompletionClient` 和一个 `OpenAiChatCompletionExecutor`，并把同一份
+不可变执行 Profile 交给 Standard 与 Translate Lua，因此两者共享 endpoint、直接
+Bearer、model、额外 JSON 请求字段、连接池、总准入和客户端限速。
 
 Translation 的 `run_id + project + profile` 在 Profile 选择和项目读取都成功后、
 任何翻译副作之前建立。WriteBack 的 `run_id + project` 同样在项目实际打开后
