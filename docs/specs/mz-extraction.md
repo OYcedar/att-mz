@@ -97,7 +97,20 @@ Rules 只负责快速、明确地定位标准 MZ 数据中的额外文本，不�
 ```json
 {
   "notes": {
-    "Items.json": ["Category", "HelpText"]
+    "Items.json": {
+      "[].note": ["Category", "HelpText"]
+    }
+  },
+  "event_lists": {
+    "Map*.json": {
+      "events[].pages[].list": ["QuestDescription"]
+    },
+    "CommonEvents.json": {
+      "[].list": []
+    },
+    "Troops.json": {
+      "[].pages[].list": []
+    }
   },
   "plugin_parameters": {
     "QuestMenu": ["WindowTitle", "Categories[].Name"]
@@ -107,16 +120,13 @@ Rules 只负责快速、明确地定位标准 MZ 数据中的额外文本，不�
       "ShowQuest": ["Entries[].Title", "Entries[].Body"]
     }
   },
-  "comments": {
-    "Map*.json": ["QuestDescription"]
-  },
   "standard_fields": {
     "Items.json": ["[].customShortName", "[].customDescription"]
   }
 }
 ```
 
-五个分区都可以省略，`{}` 表示提交一个空 Rules 快照并删除旧 Rules 资产。顶层未知
+五个分区都可以省略，`{}` 表示提交一个空 Rules 快照并清空 Rules 资产。顶层未知
 字段、重复对象键、同一数组内重复定位项和空字符串都属于规则错误。
 
 路径语言只支持：
@@ -130,21 +140,35 @@ A[3].B
 ```
 
 不支持 `$`、正则、递归、过滤表达式或通用 JSONPath。`Map*.json` 只匹配标准
-`Map` 加数字文件；非标准 `data/*.json` 一律交给 Lua。
+`Map` 加数字文件，不接受 `Map001.json` 这类单图来源；其他来源必须是程序认识的
+标准 MZ 数据文件名，非标准 `data/*.json` 一律交给 Lua。
 
-- `notes` 和 `comments` 的数组元素是精确标签名；
+- `notes` 是“来源 → Note 字段路径 → 标签数组”；路径直接指向字符串 `note` 字段，
+  末段必须是精确键名 `note`，标签数组非空；
+- `event_lists` 是“来源 → 事件命令列表路径 → Comment 标签数组”；路径直接指向
+  事件命令数组，非空标签数组只处理连续 `108 + 408` 注释块，空数组表示该列表只
+  供 `plugin_commands` 使用；
 - `plugin_parameters` 与 `standard_fields` 的数组元素是路径；
-- `plugin_commands` 是“插件名 → 命令名 → 路径数组”；
+- `plugin_commands` 是“插件名 → 命令名 → 路径数组”，只扫描 `event_lists` 明确
+  定位的命令数组；
+- 出现的分区、来源、插件、命令和路径数组都必须包含实际提取意图；不用的分区直接
+  省略，只有完整的 `{}` 表示空 Rules；
 - Note 只识别简单 `<Tag:value>`；
-- Comment 只处理连续 `108 + 408` 注释块；
+- 同一来源的同名 Note/Comment 标签只建立一项匹配事实，并在该来源声明它的全部路径
+  中联合验收；因此可以用多条路径表达同一标签的可选位置；
+- `plugin_parameters` 路径相对于目标插件的 `parameters` 对象，且只处理启用的插件；
+  `plugin_commands` 路径相对于事件指令 357 的 `parameters[3]` 参数对象；
 - 插件参数与 `357` 命令参数仅在路径需要继续深入时自动解码嵌套 JSON 字符串，
   每一层解码都会写进结构化地址；
-- 每条定位必须至少命中一个非纯空白字符串，零命中、命中非字符串或重复命中同一
-  叶子都会使整次 Rules 提取失败。
+- Note 与事件列表的结构路径只负责精确路由，某条路径在实际文档中没有终点时跳过；
+  一旦命中，其终点类型必须分别是字符串与事件命令数组；
+- 每个 Note/Comment 标签以及插件参数、插件命令和标准字段的文本定位都必须至少命中
+  一个非纯空白字符串；命中非字符串或重复命中同一叶子会使整次 Rules 提取失败；
+- `plugin_commands` 非空时必须至少声明一个 `event_lists` 来源；没有插件命令时，
+  每个事件列表路径都必须声明至少一个 Comment 标签。
 
-大量规则按来源分桶并编译为前缀树。每个实际文档只创建一个 CPU 来源工作单元；
-同一分区内的全部路径共享不可变前缀树，标准字段、Note 与事件协议各自至多执行一
-趟所需扫描，不按“规则数 × 文档大小”反复扫描。
+Rules 只访问配置中写出的精确路径，不递归寻找名为 `note` 或 `list` 的字段；未声明
+位置中的同名字段及其内容完全不参与提取。
 
 ## 5. 五张标准资产表与快照替换
 
@@ -199,7 +223,8 @@ Builtin 和 Rules 各自只替换自己拥有的叶子，不删除另一来源�
 执行，不占用异步 I/O 执行器线程。`buffered` 同时提供阶段背压、首错与稳定顺序。
 
 Builtin 把独立标准文件、Map、CommonEvents 和 Troops 形成 CPU 工作单元；Rules 按
-实际标准文件、Map、插件参数来源与插件命令来源分桶。各工作单元只产生局部结果，
+`notes`、`event_lists`、`standard_fields` 和插件参数的显式来源分桶。各工作单元只
+产生局部结果，
 不共享可变 Collector，也不产生数据库副作用。全部结果按稳定来源顺序合并，最终
 排序和重复地址检查同样经 CPU 根执行器完成。并发数为 1 或大于 1 时，最终快照与
 SQLite 事务计划必须完全一致。
@@ -251,7 +276,7 @@ SQLite 适配器与 Lua Host 打开项目数据库时必须接收同一连接策
 位置仍未决定；本轮只固定必填内容、受信类型和注入位置。
 
 下列内容属于产品与领域规格，不是可调配置：`Builtin → Rules → Lua` 顺序、Builtin
-字段集合、Rules 零命中失败、标准 Map 文件命名、非标准 `data/*.json` 交给 Lua、
+字段集合、Rules 文本定位零命中失败、标准 Map 文件命名、非标准 `data/*.json` 交给 Lua、
 五张资产表以及译文继承和单事务一致性。
 
 ## 8. Lua 信任边界

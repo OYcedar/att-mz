@@ -972,6 +972,7 @@ pub(crate) enum TranslationUnitRejectionReason {
     NoNaturalLanguageText,
     ContainsByteOrderMark,
     PlaceholderMismatch { token: String },
+    UnexpectedPlaceholderToken { token: String },
     PlaceholderNormalizationAmbiguous { original: String },
     SourceResidual { fragment: String },
 }
@@ -1025,11 +1026,8 @@ impl UnresolvedTranslationUnit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationProtocolDiagnostic {
     NonStopFinish { reason: String },
-    InvalidJson { message: String },
-    InvalidId { item_index: usize, value: String },
-    MissingId { item_index: usize },
+    InvalidResponse { message: String },
     UnknownId { item_index: usize, id: usize },
-    UnattributedItem { item_index: usize, message: String },
 }
 
 /// 一个任务没有任何可用译文的正常原因。
@@ -2659,7 +2657,7 @@ mod tests {
         assert_eq!(unavailable.unresolved().len(), 2);
         assert!(matches!(
             unavailable.diagnostics()[0],
-            TranslationProtocolDiagnostic::InvalidJson { .. }
+            TranslationProtocolDiagnostic::InvalidResponse { .. }
         ));
     }
 
@@ -2918,7 +2916,7 @@ mod tests {
                         )
                     })
                     .collect(),
-                vec![TranslationProtocolDiagnostic::InvalidJson {
+                vec![TranslationProtocolDiagnostic::InvalidResponse {
                     message: "无法解析模型 JSON".to_owned(),
                 }],
             )

@@ -12,8 +12,8 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
 use crate::att_mz::project::OpenedProject;
 use crate::att_mz::standard_asset::{
-    MzStandardAssetOwner, MzStandardAssetReadingConfig, MzStandardAssetStorageKind,
-    MzStandardAssetTable, MzTextBodyUnit,
+    MzStandardAssetLocationError, MzStandardAssetOwner, MzStandardAssetReadingConfig,
+    MzStandardAssetStorageKind, MzStandardAssetTable, MzTextBodyUnit,
 };
 use crate::att_mz::text::{MzLocation, TextGroupKind};
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -265,6 +265,7 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
         column: &'static str,
         source: MzLocationCodecError,
     },
+    InvalidStorageLocation(MzStandardAssetLocationError),
     InvalidModel(StandardWriteBackSnapshotError),
 }
 
@@ -293,6 +294,9 @@ impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
             Self::InvalidLocation { column, source } => {
                 write!(formatter, "列 {column} 中的结构化位置无效：{source}")
             }
+            Self::InvalidStorageLocation(source) => {
+                write!(formatter, "结构化位置与标准资产存储语义不一致：{source}")
+            }
             Self::InvalidModel(source) => source.fmt(formatter),
         }
     }
@@ -302,6 +306,7 @@ impl Error for InvalidStandardWriteBackAssetSnapshot {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidLocation { source, .. } => Some(source),
+            Self::InvalidStorageLocation(source) => Some(source),
             Self::InvalidModel(source) => Some(source),
             _ => None,
         }
@@ -380,22 +385,27 @@ fn decode_row(row: SqliteRow) -> Result<DecodedRow, InvalidStandardWriteBackAsse
         }
     })?;
     let kind = storage.group_kind();
+    let exact_location = MzLocationCodec::decode(&exact_location).map_err(|source| {
+        InvalidStandardWriteBackAssetSnapshot::InvalidLocation {
+            column: "exact_location",
+            source,
+        }
+    })?;
+    let group_location = MzLocationCodec::decode(&group_location).map_err(|source| {
+        InvalidStandardWriteBackAssetSnapshot::InvalidLocation {
+            column: "group_location",
+            source,
+        }
+    })?;
+    storage
+        .validate_locations(&exact_location, &group_location)
+        .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidStorageLocation)?;
     let role = role_for(kind, field_name)?;
 
     Ok(DecodedRow {
         kind,
-        exact_location: MzLocationCodec::decode(&exact_location).map_err(|source| {
-            InvalidStandardWriteBackAssetSnapshot::InvalidLocation {
-                column: "exact_location",
-                source,
-            }
-        })?,
-        group_location: MzLocationCodec::decode(&group_location).map_err(|source| {
-            InvalidStandardWriteBackAssetSnapshot::InvalidLocation {
-                column: "group_location",
-                source,
-            }
-        })?,
+        exact_location,
+        group_location,
         role,
         original_text,
         translation,
@@ -832,6 +842,71 @@ mod tests {
             )),
             Err(InvalidStandardWriteBackAssetSnapshot::UnknownUnitType(unit)) if unit == "dialog"
         ));
+    }
+
+    #[test]
+    fn decoded_locations_incompatible_with_the_asset_table_are_rejected() {
+        let group = data_group_location(StandardDataFile::Items, 1);
+        let exact = data_location(StandardDataFile::Items, 1, "Name");
+
+        let error = decode_row(row(
+            "plugin_param",
+            &exact,
+            &group,
+            "Name",
+            None,
+            "插件参数",
+            Some("Plugin parameter"),
+        ))
+        .expect_err("PluginParam 不应接受 Data 来源");
+
+        assert!(matches!(
+            error,
+            InvalidStandardWriteBackAssetSnapshot::InvalidStorageLocation(
+                MzStandardAssetLocationError::SourceDoesNotMatchStorage {
+                    storage: MzStandardAssetStorageKind::PluginParam,
+                    source: MzSource::Data(StandardDataFile::Items),
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn rules_entry_on_map_with_custom_field_and_path_is_accepted() {
+        let source = MzSource::map(18);
+        let group = MzLocation::value(
+            source.clone(),
+            vec![MzLocationStep::key("rules_group"), MzLocationStep::index(6)],
+        );
+        let exact = MzLocation::value(
+            source,
+            vec![
+                MzLocationStep::key("custom_rules_path"),
+                MzLocationStep::DecodeJsonString,
+                MzLocationStep::key("actual_name"),
+            ],
+        );
+        let mut values = row(
+            "entry",
+            &exact,
+            &group,
+            "custom_field_name",
+            None,
+            "原文",
+            Some("Translation"),
+        )
+        .into_values();
+        values[2] = SqliteValue::Text("rules".to_owned());
+
+        let decoded = decode_row(SqliteRow::new(values)).expect("合法 Rules Entry→Map 应被接受");
+
+        assert_eq!(decoded.kind, TextGroupKind::DatabaseEntry);
+        assert_eq!(decoded.exact_location, exact);
+        assert_eq!(decoded.group_location, group);
+        assert_eq!(
+            decoded.role,
+            StandardWriteBackFieldRole::scalar("custom_field_name")
+        );
     }
 
     #[tokio::test]

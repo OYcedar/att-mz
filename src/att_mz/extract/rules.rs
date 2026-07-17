@@ -354,9 +354,11 @@ pub(crate) enum RulesDefinitionError {
     ExpectedArray(String),
     ExpectedString(String),
     EmptyValue(String),
-    DuplicateLocator { context: String, locator: String },
+    DuplicateValue { context: String, value: String },
     UnsupportedSource { source: String, guidance: String },
     InvalidPath { path: String, reason: String },
+    MissingEventLists,
+    EventListWithoutConsumer(String),
 }
 
 impl fmt::Display for RulesDefinitionError {
@@ -369,14 +371,23 @@ impl fmt::Display for RulesDefinitionError {
             Self::ExpectedArray(context) => write!(formatter, "{context} 必须是数组"),
             Self::ExpectedString(context) => write!(formatter, "{context} 必须是字符串"),
             Self::EmptyValue(context) => write!(formatter, "{context} 不能为空"),
-            Self::DuplicateLocator { context, locator } => {
-                write!(formatter, "{context} 包含重复定位项：{locator}")
+            Self::DuplicateValue { context, value } => {
+                write!(formatter, "{context} 包含重复值：{value}")
             }
             Self::UnsupportedSource { source, guidance } => {
                 write!(formatter, "不支持的数据来源 {source}；{guidance}")
             }
             Self::InvalidPath { path, reason } => {
                 write!(formatter, "路径 {path} 无效：{reason}")
+            }
+            Self::MissingEventLists => {
+                formatter.write_str("plugin_commands 必须通过 event_lists 声明事件列表路径")
+            }
+            Self::EventListWithoutConsumer(locator) => {
+                write!(
+                    formatter,
+                    "事件列表路径没有 Comment 标签或插件命令消费者：{locator}"
+                )
             }
         }
     }
@@ -413,6 +424,13 @@ struct PathRule {
     path: CompiledPath,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaggedPathRule {
+    label: String,
+    path: CompiledPath,
+    tags: Vec<TagRule>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum DocumentRuleSource {
     Data(StandardDataFile),
@@ -422,10 +440,10 @@ enum DocumentRuleSource {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct RulesDefinition {
     descriptors: Vec<RuleDescriptor>,
-    notes: BTreeMap<DocumentRuleSource, Vec<TagRule>>,
+    notes: BTreeMap<DocumentRuleSource, Vec<TaggedPathRule>>,
+    event_lists: BTreeMap<DocumentRuleSource, Vec<TaggedPathRule>>,
     plugin_parameters: BTreeMap<String, Vec<PathRule>>,
     plugin_commands: BTreeMap<String, BTreeMap<String, Vec<PathRule>>>,
-    comments: BTreeMap<DocumentRuleSource, Vec<TagRule>>,
     standard_fields: BTreeMap<DocumentRuleSource, Vec<PathRule>>,
 }
 
@@ -438,9 +456,9 @@ impl RulesDefinition {
         for section in root.keys() {
             if ![
                 "notes",
+                "event_lists",
                 "plugin_parameters",
                 "plugin_commands",
-                "comments",
                 "standard_fields",
             ]
             .contains(&section.as_str())
@@ -450,11 +468,12 @@ impl RulesDefinition {
         }
 
         let mut definition = Self::default();
-        definition.notes = definition.parse_tag_section(root, "notes")?;
+        definition.notes = definition.parse_tagged_path_section(root, "notes", false)?;
+        definition.event_lists = definition.parse_tagged_path_section(root, "event_lists", true)?;
         definition.plugin_parameters = definition.parse_plugin_parameter_section(root)?;
         definition.plugin_commands = definition.parse_plugin_command_section(root)?;
-        definition.comments = definition.parse_tag_section(root, "comments")?;
         definition.standard_fields = definition.parse_path_section(root, "standard_fields")?;
+        definition.validate_event_list_consumers()?;
         Ok(definition)
     }
 
@@ -467,7 +486,7 @@ impl RulesDefinition {
         for source in self
             .notes
             .keys()
-            .chain(self.comments.keys())
+            .chain(self.event_lists.keys())
             .chain(self.standard_fields.keys())
         {
             match source {
@@ -478,11 +497,6 @@ impl RulesDefinition {
         if !self.plugin_parameters.is_empty() {
             selection.request_plugins();
         }
-        if !self.plugin_commands.is_empty() {
-            selection.insert_standard_file(StandardDataFile::CommonEvents);
-            selection.insert_standard_file(StandardDataFile::Troops);
-            selection.request_all_maps();
-        }
         selection
     }
 
@@ -492,37 +506,94 @@ impl RulesDefinition {
         id
     }
 
-    fn parse_tag_section(
+    fn parse_tagged_path_section(
         &mut self,
         root: &Map<String, Value>,
         section: &str,
-    ) -> Result<BTreeMap<DocumentRuleSource, Vec<TagRule>>, RulesDefinitionError> {
+        allow_empty_tags: bool,
+    ) -> Result<BTreeMap<DocumentRuleSource, Vec<TaggedPathRule>>, RulesDefinitionError> {
         let Some(value) = root.get(section) else {
             return Ok(BTreeMap::new());
         };
-        let object = expect_rule_object(value, section)?;
+        let object = expect_nonempty_rule_object(value, section)?;
         let mut result = BTreeMap::new();
-        for (source_name, values) in object {
+        for (source_name, paths_value) in object {
             let source = parse_document_rule_source(source_name)?;
-            let tags = parse_unique_strings(values, &format!("{section}.{source_name}"))?;
-            let mut rules = Vec::with_capacity(tags.len());
-            for tag_name in tags {
-                let id = self.add_descriptor(
-                    format!("{section}.{source_name}.{tag_name}"),
-                    format!(
-                        "{}#{tag_name}",
-                        if section == "notes" {
-                            "note"
-                        } else {
-                            "comment"
-                        }
-                    ),
-                );
-                rules.push(TagRule { id, tag_name });
+            let context = object_member_context(section, source_name);
+            let paths = expect_nonempty_rule_object(paths_value, &context)?;
+            let mut rules = Vec::with_capacity(paths.len());
+            let mut source_tags = BTreeMap::<String, TagRule>::new();
+            for (raw_path, tags_value) in paths {
+                ensure_non_blank(raw_path, &format!("{context} 的路径"))?;
+                let path_context = object_member_context(&context, raw_path);
+                let path = CompiledPath::parse(raw_path)
+                    .map_err(|error| qualify_path_error(error, &path_context))?;
+                if section == "notes"
+                    && !matches!(path.segments.last(), Some(PathSegment::Key(key)) if key == "note")
+                {
+                    return Err(RulesDefinitionError::InvalidPath {
+                        path: path_context,
+                        reason: "Note 路径必须以 note 字段结束".to_owned(),
+                    });
+                }
+                let tags = parse_unique_strings(tags_value, &path_context)?;
+                if tags.is_empty() && !allow_empty_tags {
+                    return Err(RulesDefinitionError::EmptyValue(path_context));
+                }
+                let mut tag_rules = Vec::with_capacity(tags.len());
+                for tag_name in tags {
+                    let tag_rule = if let Some(rule) = source_tags.get(&tag_name) {
+                        rule.clone()
+                    } else {
+                        let id = self.add_descriptor(
+                            format!(
+                                "{context} 中的标签 {}",
+                                serde_json::to_string(&tag_name)
+                                    .expect("Rust 字符串必须能编码为 JSON 字符串")
+                            ),
+                            format!(
+                                "{}#{tag_name}",
+                                if section == "notes" {
+                                    "note"
+                                } else {
+                                    "comment"
+                                }
+                            ),
+                        );
+                        let rule = TagRule {
+                            id,
+                            tag_name: tag_name.clone(),
+                        };
+                        source_tags.insert(tag_name, rule.clone());
+                        rule
+                    };
+                    tag_rules.push(tag_rule);
+                }
+                rules.push(TaggedPathRule {
+                    label: path_context,
+                    path,
+                    tags: tag_rules,
+                });
             }
             result.insert(source, rules);
         }
         Ok(result)
+    }
+
+    fn validate_event_list_consumers(&self) -> Result<(), RulesDefinitionError> {
+        if !self.plugin_commands.is_empty() && self.event_lists.is_empty() {
+            return Err(RulesDefinitionError::MissingEventLists);
+        }
+        if self.plugin_commands.is_empty() {
+            for rules in self.event_lists.values() {
+                if let Some(rule) = rules.iter().find(|rule| rule.tags.is_empty()) {
+                    return Err(RulesDefinitionError::EventListWithoutConsumer(
+                        rule.label.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn parse_path_section(
@@ -533,11 +604,16 @@ impl RulesDefinition {
         let Some(value) = root.get(section) else {
             return Ok(BTreeMap::new());
         };
-        let object = expect_rule_object(value, section)?;
+        let object = expect_nonempty_rule_object(value, section)?;
         let mut result = BTreeMap::new();
         for (source_name, values) in object {
             let source = parse_document_rule_source(source_name)?;
             let paths = parse_unique_strings(values, &format!("{section}.{source_name}"))?;
+            if paths.is_empty() {
+                return Err(RulesDefinitionError::EmptyValue(format!(
+                    "{section}.{source_name}"
+                )));
+            }
             let mut rules = Vec::with_capacity(paths.len());
             for raw_path in paths {
                 let path = CompiledPath::parse(&raw_path)?;
@@ -559,11 +635,16 @@ impl RulesDefinition {
         let Some(value) = root.get("plugin_parameters") else {
             return Ok(BTreeMap::new());
         };
-        let object = expect_rule_object(value, "plugin_parameters")?;
+        let object = expect_nonempty_rule_object(value, "plugin_parameters")?;
         let mut result = BTreeMap::new();
         for (plugin_name, values) in object {
             ensure_non_blank(plugin_name, "plugin_parameters 的插件名")?;
             let paths = parse_unique_strings(values, &format!("plugin_parameters.{plugin_name}"))?;
+            if paths.is_empty() {
+                return Err(RulesDefinitionError::EmptyValue(format!(
+                    "plugin_parameters.{plugin_name}"
+                )));
+            }
             let mut rules = Vec::with_capacity(paths.len());
             for raw_path in paths {
                 let path = CompiledPath::parse(&raw_path)?;
@@ -591,12 +672,14 @@ impl RulesDefinition {
         let Some(value) = root.get("plugin_commands") else {
             return Ok(BTreeMap::new());
         };
-        let plugins = expect_rule_object(value, "plugin_commands")?;
+        let plugins = expect_nonempty_rule_object(value, "plugin_commands")?;
         let mut result = BTreeMap::new();
         for (plugin_name, commands_value) in plugins {
             ensure_non_blank(plugin_name, "plugin_commands 的插件名")?;
-            let commands =
-                expect_rule_object(commands_value, &format!("plugin_commands.{plugin_name}"))?;
+            let commands = expect_nonempty_rule_object(
+                commands_value,
+                &format!("plugin_commands.{plugin_name}"),
+            )?;
             let mut parsed_commands = BTreeMap::new();
             for (command_name, values) in commands {
                 ensure_non_blank(command_name, "plugin_commands 的命令名")?;
@@ -604,6 +687,11 @@ impl RulesDefinition {
                     values,
                     &format!("plugin_commands.{plugin_name}.{command_name}"),
                 )?;
+                if paths.is_empty() {
+                    return Err(RulesDefinitionError::EmptyValue(format!(
+                        "plugin_commands.{plugin_name}.{command_name}"
+                    )));
+                }
                 let mut rules = Vec::with_capacity(paths.len());
                 for raw_path in paths {
                     let path = CompiledPath::parse(&raw_path)?;
@@ -636,6 +724,32 @@ fn expect_rule_object<'a>(
         .ok_or_else(|| RulesDefinitionError::ExpectedObject(context.to_owned()))
 }
 
+fn expect_nonempty_rule_object<'a>(
+    value: &'a Value,
+    context: &str,
+) -> Result<&'a Map<String, Value>, RulesDefinitionError> {
+    let object = expect_rule_object(value, context)?;
+    if object.is_empty() {
+        return Err(RulesDefinitionError::EmptyValue(context.to_owned()));
+    }
+    Ok(object)
+}
+
+fn object_member_context(parent: &str, key: &str) -> String {
+    let key = serde_json::to_string(key).expect("Rust 字符串必须能编码为 JSON 字符串");
+    format!("{parent}[{key}]")
+}
+
+fn qualify_path_error(error: RulesDefinitionError, context: &str) -> RulesDefinitionError {
+    match error {
+        RulesDefinitionError::InvalidPath { reason, .. } => RulesDefinitionError::InvalidPath {
+            path: context.to_owned(),
+            reason,
+        },
+        error => error,
+    }
+}
+
 fn parse_unique_strings(value: &Value, context: &str) -> Result<Vec<String>, RulesDefinitionError> {
     let array = value
         .as_array()
@@ -648,9 +762,9 @@ fn parse_unique_strings(value: &Value, context: &str) -> Result<Vec<String>, Rul
             .ok_or_else(|| RulesDefinitionError::ExpectedString(format!("{context}[{index}]")))?;
         ensure_non_blank(string, &format!("{context}[{index}]"))?;
         if !seen.insert(string.to_owned()) {
-            return Err(RulesDefinitionError::DuplicateLocator {
+            return Err(RulesDefinitionError::DuplicateValue {
                 context: context.to_owned(),
-                locator: string.to_owned(),
+                value: string.to_owned(),
             });
         }
         result.push(string.to_owned());
@@ -949,6 +1063,14 @@ impl PathTrie {
         trie
     }
 
+    fn from_tagged_paths(rules: &[TaggedPathRule]) -> Self {
+        let mut trie = Self::default();
+        for (index, rule) in rules.iter().enumerate() {
+            trie.insert(&rule.path.segments, index);
+        }
+        trie
+    }
+
     fn insert(&mut self, segments: &[PathSegment], id: usize) {
         let Some((head, tail)) = segments.split_first() else {
             self.terminals.push(id);
@@ -1105,6 +1227,8 @@ enum ParallelRulesBuildError<CE> {
 
 struct PreparedRules {
     standard_tries: BTreeMap<DocumentRuleSource, Arc<PathTrie>>,
+    note_tries: BTreeMap<DocumentRuleSource, Arc<PathTrie>>,
+    event_list_tries: BTreeMap<DocumentRuleSource, Arc<PathTrie>>,
     plugin_parameter_tries: BTreeMap<String, BTreeMap<String, Arc<PathTrie>>>,
     plugin_command_tries: Arc<PluginCommandTries>,
 }
@@ -1115,6 +1239,16 @@ impl PreparedRules {
             .standard_fields
             .iter()
             .map(|(source, rules)| (*source, Arc::new(PathTrie::from_rules(rules))))
+            .collect();
+        let note_tries = definition
+            .notes
+            .iter()
+            .map(|(source, rules)| (*source, Arc::new(PathTrie::from_tagged_paths(rules))))
+            .collect();
+        let event_list_tries = definition
+            .event_lists
+            .iter()
+            .map(|(source, rules)| (*source, Arc::new(PathTrie::from_tagged_paths(rules))))
             .collect();
 
         let mut plugin_parameter_tries = BTreeMap::new();
@@ -1142,6 +1276,8 @@ impl PreparedRules {
 
         Ok(Self {
             standard_tries,
+            note_tries,
+            event_list_tries,
             plugin_parameter_tries,
             plugin_command_tries: Arc::new(compile_plugin_command_tries(definition)),
         })
@@ -1193,23 +1329,31 @@ impl RulesWorkUnit {
                         &mut collector,
                     )?;
                 }
-                if let Some(rules) = definition.notes.get(&rule_source) {
-                    scan_notes(
+                if let (Some(rules), Some(trie)) = (
+                    definition.notes.get(&rule_source),
+                    prepared.note_tries.get(&rule_source),
+                ) {
+                    match_note_paths(
                         &document,
+                        trie,
                         &source,
-                        &mut Vec::new(),
                         rules,
                         definition,
                         &mut matches,
                         &mut collector,
                     )?;
                 }
-                if event_document_is_relevant(definition, document_id) {
-                    extract_event_rules_for_document(
-                        definition,
-                        &prepared.plugin_command_tries,
-                        document_id,
+                if let (Some(rules), Some(trie)) = (
+                    definition.event_lists.get(&rule_source),
+                    prepared.event_list_tries.get(&rule_source),
+                ) {
+                    match_event_list_paths(
                         &document,
+                        trie,
+                        &source,
+                        rules,
+                        &prepared.plugin_command_tries,
+                        definition,
                         &mut matches,
                         &mut collector,
                     )?;
@@ -1293,7 +1437,7 @@ fn rules_work_units(
         let rule_source = document_rule_source(*document_id);
         if definition.standard_fields.contains_key(&rule_source)
             || definition.notes.contains_key(&rule_source)
-            || event_document_is_relevant(definition, *document_id)
+            || definition.event_lists.contains_key(&rule_source)
         {
             work_units.push(RulesWorkUnit::Document {
                 document_id: *document_id,
@@ -1320,42 +1464,25 @@ fn validate_required_rules_documents(
     definition: &RulesDefinition,
     documents: &BTreeMap<MzDocumentId, Arc<Value>>,
 ) -> Result<(), BuildRulesSnapshotError> {
-    for (source, rule_id) in definition
-        .standard_fields
-        .iter()
-        .map(|(source, rules)| (*source, first_path_rule_id(rules)))
-        .chain(
-            definition
-                .notes
-                .iter()
-                .map(|(source, rules)| (*source, rules.first().map_or(0, |rule| rule.id))),
-        )
-        .chain(
-            definition
-                .comments
-                .iter()
-                .map(|(source, rules)| (*source, rules.first().map_or(0, |rule| rule.id))),
-        )
-    {
+    for (source, rules) in &definition.standard_fields {
         if let DocumentRuleSource::Data(file) = source
-            && !documents.contains_key(&MzDocumentId::Data(file))
+            && !documents.contains_key(&MzDocumentId::Data(*file))
         {
             return invalid_target(
                 definition,
-                rule_id,
+                first_path_rule_id(rules),
                 &format!("读取器没有返回已请求的 {}", file.file_name()),
             );
         }
     }
-    if !definition.plugin_commands.is_empty() {
-        for file in [StandardDataFile::CommonEvents, StandardDataFile::Troops] {
-            if !documents.contains_key(&MzDocumentId::Data(file)) {
-                return invalid_target(
-                    definition,
-                    first_plugin_command_rule_id(definition),
-                    &format!("读取器没有返回已请求的 {}", file.file_name()),
-                );
-            }
+    for (source, rules) in definition.notes.iter().chain(&definition.event_lists) {
+        if let DocumentRuleSource::Data(file) = source
+            && !documents.contains_key(&MzDocumentId::Data(*file))
+        {
+            return Err(invalid_target_at(
+                &rules[0].label,
+                &format!("读取器没有返回已请求的 {}", file.file_name()),
+            ));
         }
     }
     Ok(())
@@ -1373,24 +1500,6 @@ fn document_source(id: MzDocumentId) -> MzSource {
         MzDocumentId::Data(file) => MzSource::data(file),
         MzDocumentId::Map(map_id) => MzSource::map(map_id),
     }
-}
-
-fn event_document_is_relevant(definition: &RulesDefinition, id: MzDocumentId) -> bool {
-    let has_comments = match id {
-        MzDocumentId::Data(file) => definition
-            .comments
-            .contains_key(&DocumentRuleSource::Data(file)),
-        MzDocumentId::Map(_) => definition
-            .comments
-            .contains_key(&DocumentRuleSource::AllMaps),
-    };
-    let command_source = matches!(
-        id,
-        MzDocumentId::Map(_)
-            | MzDocumentId::Data(StandardDataFile::CommonEvents)
-            | MzDocumentId::Data(StandardDataFile::Troops)
-    );
-    has_comments || (!definition.plugin_commands.is_empty() && command_source)
 }
 
 fn finalize_parallel_rules(
@@ -1452,13 +1561,12 @@ fn extract_notes(
     collector: &mut GroupCollector,
 ) -> Result<(), BuildRulesSnapshotError> {
     for (rule_source, rules) in &definition.notes {
-        let first_id = rules.first().map_or(0, |rule| rule.id);
+        let trie = PathTrie::from_tagged_paths(rules);
         for (source, document) in
-            documents_for_rule_source(*rule_source, documents, first_id, definition)?
+            documents_for_rule_source_at(*rule_source, documents, &rules[0].label)?
         {
-            let mut steps = Vec::new();
-            scan_notes(
-                document, &source, &mut steps, rules, definition, matches, collector,
+            match_note_paths(
+                document, &trie, &source, rules, definition, matches, collector,
             )?;
         }
     }
@@ -1625,28 +1733,70 @@ fn match_path_trie(
     matches: &mut MatchCounts,
     collector: &mut GroupCollector,
 ) -> Result<(), BuildRulesSnapshotError> {
-    if !trie.terminals.is_empty() {
-        let Some(text) = value.as_str() else {
-            return invalid_target(definition, trie.terminals[0], "最终目标必须是字符串");
-        };
-        if !text.trim().is_empty() {
-            for id in &trie.terminals {
-                let descriptor = &definition.descriptors[*id];
-                let exact_location = MzLocation::value(source.clone(), steps.clone());
-                let group_steps = active_group_steps
-                    .clone()
-                    .unwrap_or_else(|| default_group_steps.clone());
-                collector.add(
-                    default_kind,
-                    MzLocation::value(source.clone(), group_steps),
-                    &descriptor.field_name,
-                    exact_location,
-                    text,
-                    &descriptor.label,
-                )?;
-                matches.increment(*id);
+    let context = |id: usize| {
+        definition
+            .descriptors
+            .get(id)
+            .map_or_else(|| "Rules 路径".to_owned(), |rule| rule.label.clone())
+    };
+    let mut visit_terminal =
+        |value: &Value,
+         terminals: &[usize],
+         terminal_steps: &[MzLocationStep],
+         terminal_group_steps: Option<&[MzLocationStep]>| {
+            let Some(text) = value.as_str() else {
+                return Err(BuildRulesSnapshotError::InvalidTarget {
+                    locator: context(terminals[0]),
+                    message: "最终目标必须是字符串".to_owned(),
+                });
+            };
+            if !text.trim().is_empty() {
+                for id in terminals {
+                    let descriptor = &definition.descriptors[*id];
+                    let exact_location = MzLocation::value(source.clone(), terminal_steps.to_vec());
+                    let group_steps = terminal_group_steps
+                        .map_or_else(|| default_group_steps.clone(), <[_]>::to_vec);
+                    collector.add(
+                        default_kind,
+                        MzLocation::value(source.clone(), group_steps),
+                        &descriptor.field_name,
+                        exact_location,
+                        text,
+                        &descriptor.label,
+                    )?;
+                    matches.increment(*id);
+                }
             }
-        }
+            Ok(())
+        };
+
+    walk_path_trie(
+        value,
+        trie,
+        steps,
+        active_group_steps,
+        decode_strings,
+        &context,
+        &mut visit_terminal,
+    )
+}
+
+fn walk_path_trie(
+    value: &Value,
+    trie: &PathTrie,
+    steps: &mut Vec<MzLocationStep>,
+    active_group_steps: Option<Vec<MzLocationStep>>,
+    decode_strings: bool,
+    context: &impl Fn(usize) -> String,
+    visit_terminal: &mut impl FnMut(
+        &Value,
+        &[usize],
+        &[MzLocationStep],
+        Option<&[MzLocationStep]>,
+    ) -> Result<(), BuildRulesSnapshotError>,
+) -> Result<(), BuildRulesSnapshotError> {
+    if !trie.terminals.is_empty() {
+        visit_terminal(value, &trie.terminals, steps, active_group_steps.as_deref())?;
     }
 
     if trie.children.is_empty() {
@@ -1655,66 +1805,56 @@ fn match_path_trie(
 
     if let Value::String(raw_json) = value {
         if !decode_strings {
-            return invalid_target(
-                definition,
-                trie.first_rule_id().unwrap_or(0),
+            return Err(path_walk_error(
+                trie,
+                context,
                 "路径仍需深入，但当前值是字符串",
-            );
+            ));
         }
         let decoded: Value = serde_json::from_str(raw_json).map_err(|source| {
             BuildRulesSnapshotError::InvalidTarget {
-                locator: definition.descriptors[trie.first_rule_id().unwrap_or(0)]
-                    .label
-                    .clone(),
+                locator: path_walk_context(trie, context),
                 message: format!("嵌套 JSON 字符串无法解码：{source}"),
             }
         })?;
         steps.push(MzLocationStep::DecodeJsonString);
-        let result = match_path_children(
+        let result = walk_path_children(
             &decoded,
             trie,
-            source,
             steps,
-            default_group_steps,
             active_group_steps,
-            default_kind,
             decode_strings,
-            definition,
-            matches,
-            collector,
+            context,
+            visit_terminal,
         );
         steps.pop();
         return result;
     }
 
-    match_path_children(
+    walk_path_children(
         value,
         trie,
-        source,
         steps,
-        default_group_steps,
         active_group_steps,
-        default_kind,
         decode_strings,
-        definition,
-        matches,
-        collector,
+        context,
+        visit_terminal,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn match_path_children(
+fn walk_path_children(
     value: &Value,
     trie: &PathTrie,
-    source: &MzSource,
     steps: &mut Vec<MzLocationStep>,
-    default_group_steps: Vec<MzLocationStep>,
     active_group_steps: Option<Vec<MzLocationStep>>,
-    default_kind: TextGroupKind,
     decode_strings: bool,
-    definition: &RulesDefinition,
-    matches: &mut MatchCounts,
-    collector: &mut GroupCollector,
+    context: &impl Fn(usize) -> String,
+    visit_terminal: &mut impl FnMut(
+        &Value,
+        &[usize],
+        &[MzLocationStep],
+        Option<&[MzLocationStep]>,
+    ) -> Result<(), BuildRulesSnapshotError>,
 ) -> Result<(), BuildRulesSnapshotError> {
     // 对象节点通常承载成千上万个同级字段规则。由实际字段反查前缀树，避免在 `[]`
     // 展开的每个稀疏对象上重新枚举全部规则。
@@ -1723,31 +1863,23 @@ fn match_path_children(
         .keys()
         .all(|segment| matches!(segment, PathSegment::Key(_)))
     {
-        let object = value.as_object().ok_or_else(|| {
-            invalid_target_value(
-                definition,
-                trie.first_rule_id().unwrap_or(0),
-                "路径需要对象字段，但当前值不是对象",
-            )
-        })?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| path_walk_error(trie, context, "路径需要对象字段，但当前值不是对象"))?;
 
         for (key, child_value) in object {
             let Some(child) = trie.children.get(&PathSegment::Key(key.clone())) else {
                 continue;
             };
             steps.push(MzLocationStep::key(key));
-            let result = match_path_trie(
+            let result = walk_path_trie(
                 child_value,
                 child,
-                source,
                 steps,
-                default_group_steps.clone(),
                 active_group_steps.clone(),
-                default_kind,
                 decode_strings,
-                definition,
-                matches,
-                collector,
+                context,
+                visit_terminal,
             );
             steps.pop();
             result?;
@@ -1759,68 +1891,48 @@ fn match_path_children(
         match segment {
             PathSegment::Key(key) => {
                 let object = value.as_object().ok_or_else(|| {
-                    invalid_target_value(
-                        definition,
-                        child.first_rule_id().unwrap_or(0),
-                        "路径需要对象字段，但当前值不是对象",
-                    )
+                    path_walk_error(child, context, "路径需要对象字段，但当前值不是对象")
                 })?;
                 let Some(child_value) = object.get(key) else {
                     continue;
                 };
                 steps.push(MzLocationStep::key(key));
-                let result = match_path_trie(
+                let result = walk_path_trie(
                     child_value,
                     child,
-                    source,
                     steps,
-                    default_group_steps.clone(),
                     active_group_steps.clone(),
-                    default_kind,
                     decode_strings,
-                    definition,
-                    matches,
-                    collector,
+                    context,
+                    visit_terminal,
                 );
                 steps.pop();
                 result?;
             }
             PathSegment::Index(index) => {
                 let array = value.as_array().ok_or_else(|| {
-                    invalid_target_value(
-                        definition,
-                        child.first_rule_id().unwrap_or(0),
-                        "路径需要数组下标，但当前值不是数组",
-                    )
+                    path_walk_error(child, context, "路径需要数组下标，但当前值不是数组")
                 })?;
                 let Some(child_value) = array.get(*index) else {
                     continue;
                 };
                 steps.push(MzLocationStep::index(*index));
                 let group_steps = Some(steps.clone());
-                let result = match_path_trie(
+                let result = walk_path_trie(
                     child_value,
                     child,
-                    source,
                     steps,
-                    default_group_steps.clone(),
                     group_steps,
-                    default_kind,
                     decode_strings,
-                    definition,
-                    matches,
-                    collector,
+                    context,
+                    visit_terminal,
                 );
                 steps.pop();
                 result?;
             }
             PathSegment::AnyIndex => {
                 let array = value.as_array().ok_or_else(|| {
-                    invalid_target_value(
-                        definition,
-                        child.first_rule_id().unwrap_or(0),
-                        "路径使用 []，但当前值不是数组",
-                    )
+                    path_walk_error(child, context, "路径使用 []，但当前值不是数组")
                 })?;
                 for (index, child_value) in array.iter().enumerate() {
                     if child_value.is_null() {
@@ -1828,18 +1940,14 @@ fn match_path_children(
                     }
                     steps.push(MzLocationStep::index(index));
                     let group_steps = Some(steps.clone());
-                    let result = match_path_trie(
+                    let result = walk_path_trie(
                         child_value,
                         child,
-                        source,
                         steps,
-                        default_group_steps.clone(),
                         group_steps,
-                        default_kind,
                         decode_strings,
-                        definition,
-                        matches,
-                        collector,
+                        context,
+                        visit_terminal,
                     );
                     steps.pop();
                     result?;
@@ -1848,6 +1956,22 @@ fn match_path_children(
         }
     }
     Ok(())
+}
+
+fn path_walk_context(trie: &PathTrie, context: &impl Fn(usize) -> String) -> String {
+    trie.first_rule_id()
+        .map_or_else(|| "Rules 路径".to_owned(), context)
+}
+
+fn path_walk_error(
+    trie: &PathTrie,
+    context: &impl Fn(usize) -> String,
+    message: &str,
+) -> BuildRulesSnapshotError {
+    BuildRulesSnapshotError::InvalidTarget {
+        locator: path_walk_context(trie, context),
+        message: message.to_owned(),
+    }
 }
 
 fn standard_group_kind(source: &MzSource, group_steps: &[MzLocationStep]) -> TextGroupKind {
@@ -1869,14 +1993,25 @@ fn documents_for_rule_source<'a>(
     rule_id: usize,
     definition: &RulesDefinition,
 ) -> Result<Vec<(MzSource, &'a Value)>, BuildRulesSnapshotError> {
+    let locator = definition
+        .descriptors
+        .get(rule_id)
+        .map_or("Rules 定位", |rule| rule.label.as_str());
+    documents_for_rule_source_at(source, documents, locator)
+}
+
+fn documents_for_rule_source_at<'a>(
+    source: DocumentRuleSource,
+    documents: &'a MzProjectDocuments,
+    locator: &str,
+) -> Result<Vec<(MzSource, &'a Value)>, BuildRulesSnapshotError> {
     match source {
         DocumentRuleSource::Data(file) => documents
             .document(MzDocumentId::Data(file))
             .map(|document| vec![(MzSource::data(file), document)])
             .ok_or_else(|| {
-                invalid_target_value(
-                    definition,
-                    rule_id,
+                invalid_target_at(
+                    locator,
                     &format!("读取器没有返回已请求的 {}", file.file_name()),
                 )
             }),
@@ -1913,32 +2048,52 @@ fn invalid_target_value(
     }
 }
 
+fn invalid_target_at(locator: &str, message: &str) -> BuildRulesSnapshotError {
+    BuildRulesSnapshotError::InvalidTarget {
+        locator: locator.to_owned(),
+        message: message.to_owned(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn scan_notes(
+fn match_note_paths(
     value: &Value,
+    trie: &PathTrie,
     source: &MzSource,
-    steps: &mut Vec<MzLocationStep>,
-    rules: &[TagRule],
+    rules: &[TaggedPathRule],
     definition: &RulesDefinition,
     matches: &mut MatchCounts,
     collector: &mut GroupCollector,
 ) -> Result<(), BuildRulesSnapshotError> {
-    match value {
-        Value::Object(object) => {
-            if let Some(note) = object.get("note") {
-                let text = note.as_str().ok_or_else(|| {
-                    invalid_target_value(
-                        definition,
-                        rules.first().map_or(0, |rule| rule.id),
-                        "note 字段必须是字符串",
-                    )
-                })?;
-                let selected = rules
+    let context = |index: usize| {
+        rules
+            .get(index)
+            .map_or_else(|| "Rules Note 路径".to_owned(), |rule| rule.label.clone())
+    };
+    let mut visit_terminal =
+        |note: &Value,
+         terminals: &[usize],
+         terminal_steps: &[MzLocationStep],
+         _group_steps: Option<&[MzLocationStep]>| {
+            let Some(text) = note.as_str() else {
+                return Err(BuildRulesSnapshotError::InvalidTarget {
+                    locator: context(terminals[0]),
+                    message: "Note 路径终点必须是字符串".to_owned(),
+                });
+            };
+            let container_steps = terminal_steps
+                .split_last()
+                .map_or_else(Vec::new, |(_, steps)| steps.to_vec());
+
+            for rule_index in terminals {
+                let rule = &rules[*rule_index];
+                let selected = rule
+                    .tags
                     .iter()
                     .map(|rule| (rule.tag_name.as_str(), rule))
                     .collect::<BTreeMap<_, _>>();
                 for tag in simple_tag_spans(text) {
-                    let Some(rule) = selected.get(tag.name()) else {
+                    let Some(tag_rule) = selected.get(tag.name()) else {
                         continue;
                     };
                     if tag.value().trim().is_empty() {
@@ -1946,47 +2101,35 @@ fn scan_notes(
                     }
                     let exact_location = MzLocation::note_tag(
                         source.clone(),
-                        steps.clone(),
+                        container_steps.clone(),
                         tag.name(),
                         tag.occurrence(),
                     );
-                    let group_location = MzLocation::value(source.clone(), steps.clone());
-                    let descriptor = &definition.descriptors[rule.id];
+                    let group_location = MzLocation::value(source.clone(), container_steps.clone());
+                    let descriptor = &definition.descriptors[tag_rule.id];
                     collector.add(
-                        standard_group_kind(source, steps),
+                        standard_group_kind(source, &container_steps),
                         group_location,
                         &descriptor.field_name,
                         exact_location,
                         tag.value(),
                         &descriptor.label,
                     )?;
-                    matches.increment(rule.id);
+                    matches.increment(tag_rule.id);
                 }
             }
+            Ok(())
+        };
 
-            for (key, child) in object {
-                if key == "note" {
-                    continue;
-                }
-                steps.push(MzLocationStep::key(key));
-                let result =
-                    scan_notes(child, source, steps, rules, definition, matches, collector);
-                steps.pop();
-                result?;
-            }
-        }
-        Value::Array(array) => {
-            for (index, child) in array.iter().enumerate() {
-                steps.push(MzLocationStep::index(index));
-                let result =
-                    scan_notes(child, source, steps, rules, definition, matches, collector);
-                steps.pop();
-                result?;
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
-    Ok(())
+    walk_path_trie(
+        value,
+        trie,
+        &mut Vec::new(),
+        None,
+        false,
+        &context,
+        &mut visit_terminal,
+    )
 }
 
 fn extract_event_rules(
@@ -1995,128 +2138,29 @@ fn extract_event_rules(
     matches: &mut MatchCounts,
     collector: &mut GroupCollector,
 ) -> Result<(), BuildRulesSnapshotError> {
-    if definition.comments.is_empty() && definition.plugin_commands.is_empty() {
+    if definition.event_lists.is_empty() {
         return Ok(());
-    }
-
-    for (source, rules) in &definition.comments {
-        if let DocumentRuleSource::Data(file) = source
-            && documents.document(MzDocumentId::Data(*file)).is_none()
-        {
-            return invalid_target(
-                definition,
-                rules.first().map_or(0, |rule| rule.id),
-                &format!("读取器没有返回已请求的 {}", file.file_name()),
-            );
-        }
-    }
-    if !definition.plugin_commands.is_empty() {
-        for file in [StandardDataFile::CommonEvents, StandardDataFile::Troops] {
-            if documents.document(MzDocumentId::Data(file)).is_none() {
-                return invalid_target(
-                    definition,
-                    first_plugin_command_rule_id(definition),
-                    &format!("读取器没有返回已请求的 {}", file.file_name()),
-                );
-            }
-        }
     }
 
     let command_tries = compile_plugin_command_tries(definition);
-    let empty_command_tries = BTreeMap::new();
-    for (document_id, document) in documents.documents() {
-        let comment_rules = match document_id {
-            MzDocumentId::Data(file) => definition
-                .comments
-                .get(&DocumentRuleSource::Data(*file))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-            MzDocumentId::Map(_) => definition
-                .comments
-                .get(&DocumentRuleSource::AllMaps)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        };
-        let command_source = matches!(
-            document_id,
-            MzDocumentId::Map(_)
-                | MzDocumentId::Data(StandardDataFile::CommonEvents)
-                | MzDocumentId::Data(StandardDataFile::Troops)
-        );
-        if comment_rules.is_empty() && (definition.plugin_commands.is_empty() || !command_source) {
-            continue;
+    for (rule_source, rules) in &definition.event_lists {
+        let trie = PathTrie::from_tagged_paths(rules);
+        for (source, document) in
+            documents_for_rule_source_at(*rule_source, documents, &rules[0].label)?
+        {
+            match_event_list_paths(
+                document,
+                &trie,
+                &source,
+                rules,
+                &command_tries,
+                definition,
+                matches,
+                collector,
+            )?;
         }
-        let source = match document_id {
-            MzDocumentId::Data(file) => MzSource::data(*file),
-            MzDocumentId::Map(map_id) => MzSource::map(*map_id),
-        };
-        let mut steps = Vec::new();
-        scan_event_document(
-            document,
-            &source,
-            &mut steps,
-            comment_rules,
-            if command_source {
-                &command_tries
-            } else {
-                &empty_command_tries
-            },
-            definition,
-            matches,
-            collector,
-        )?;
     }
     Ok(())
-}
-
-fn extract_event_rules_for_document(
-    definition: &RulesDefinition,
-    command_tries: &PluginCommandTries,
-    document_id: MzDocumentId,
-    document: &Value,
-    matches: &mut MatchCounts,
-    collector: &mut GroupCollector,
-) -> Result<(), BuildRulesSnapshotError> {
-    let comment_rules = match document_id {
-        MzDocumentId::Data(file) => definition
-            .comments
-            .get(&DocumentRuleSource::Data(file))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]),
-        MzDocumentId::Map(_) => definition
-            .comments
-            .get(&DocumentRuleSource::AllMaps)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]),
-    };
-    let command_source = matches!(
-        document_id,
-        MzDocumentId::Map(_)
-            | MzDocumentId::Data(StandardDataFile::CommonEvents)
-            | MzDocumentId::Data(StandardDataFile::Troops)
-    );
-    if comment_rules.is_empty() && (definition.plugin_commands.is_empty() || !command_source) {
-        return Ok(());
-    }
-    let source = match document_id {
-        MzDocumentId::Data(file) => MzSource::data(file),
-        MzDocumentId::Map(map_id) => MzSource::map(map_id),
-    };
-    let empty_command_tries = BTreeMap::new();
-    scan_event_document(
-        document,
-        &source,
-        &mut Vec::new(),
-        comment_rules,
-        if command_source {
-            command_tries
-        } else {
-            &empty_command_tries
-        },
-        definition,
-        matches,
-        collector,
-    )
 }
 
 type PluginCommandTries = BTreeMap<String, BTreeMap<String, PathTrie>>;
@@ -2137,91 +2181,59 @@ fn compile_plugin_command_tries(definition: &RulesDefinition) -> PluginCommandTr
         .collect()
 }
 
-fn first_plugin_command_rule_id(definition: &RulesDefinition) -> usize {
-    definition
-        .plugin_commands
-        .values()
-        .flat_map(BTreeMap::values)
-        .flatten()
-        .next()
-        .map_or(0, |rule| rule.id)
-}
-
 #[allow(clippy::too_many_arguments)]
-fn scan_event_document(
+fn match_event_list_paths(
     value: &Value,
+    trie: &PathTrie,
     source: &MzSource,
-    steps: &mut Vec<MzLocationStep>,
-    comment_rules: &[TagRule],
+    rules: &[TaggedPathRule],
     command_tries: &PluginCommandTries,
     definition: &RulesDefinition,
     matches: &mut MatchCounts,
     collector: &mut GroupCollector,
 ) -> Result<(), BuildRulesSnapshotError> {
-    match value {
-        Value::Object(object) => {
-            for (key, child) in object {
-                steps.push(MzLocationStep::key(key));
-                let result = if key == "list" {
-                    let list = child.as_array().ok_or_else(|| {
-                        invalid_target_value(
-                            definition,
-                            event_rule_id(comment_rules, definition),
-                            "事件 list 必须是数组",
-                        )
-                    })?;
-                    process_event_list(
-                        list,
-                        source,
-                        steps,
-                        comment_rules,
-                        command_tries,
-                        definition,
-                        matches,
-                        collector,
-                    )
-                } else {
-                    scan_event_document(
-                        child,
-                        source,
-                        steps,
-                        comment_rules,
-                        command_tries,
-                        definition,
-                        matches,
-                        collector,
-                    )
-                };
-                steps.pop();
-                result?;
-            }
-        }
-        Value::Array(array) => {
-            for (index, child) in array.iter().enumerate() {
-                steps.push(MzLocationStep::index(index));
-                let result = scan_event_document(
-                    child,
+    let context = |index: usize| {
+        rules.get(index).map_or_else(
+            || "Rules 事件列表路径".to_owned(),
+            |rule| rule.label.clone(),
+        )
+    };
+    let mut visit_terminal =
+        |list: &Value,
+         terminals: &[usize],
+         terminal_steps: &[MzLocationStep],
+         _group_steps: Option<&[MzLocationStep]>| {
+            let Some(list) = list.as_array() else {
+                return Err(BuildRulesSnapshotError::InvalidTarget {
+                    locator: context(terminals[0]),
+                    message: "事件列表路径终点必须是数组".to_owned(),
+                });
+            };
+            for rule_index in terminals {
+                process_event_list(
+                    list,
                     source,
-                    steps,
-                    comment_rules,
+                    terminal_steps,
+                    &rules[*rule_index].label,
+                    &rules[*rule_index].tags,
                     command_tries,
                     definition,
                     matches,
                     collector,
-                );
-                steps.pop();
-                result?;
+                )?;
             }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
-    Ok(())
-}
+            Ok(())
+        };
 
-fn event_rule_id(comment_rules: &[TagRule], definition: &RulesDefinition) -> usize {
-    comment_rules
-        .first()
-        .map_or_else(|| first_plugin_command_rule_id(definition), |rule| rule.id)
+    walk_path_trie(
+        value,
+        trie,
+        &mut Vec::new(),
+        None,
+        false,
+        &context,
+        &mut visit_terminal,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2229,6 +2241,7 @@ fn process_event_list(
     list: &[Value],
     source: &MzSource,
     list_steps: &[MzLocationStep],
+    list_locator: &str,
     comment_rules: &[TagRule],
     command_tries: &PluginCommandTries,
     definition: &RulesDefinition,
@@ -2236,30 +2249,17 @@ fn process_event_list(
     collector: &mut GroupCollector,
 ) -> Result<(), BuildRulesSnapshotError> {
     for (command_index, command) in list.iter().enumerate() {
-        let command = command.as_object().ok_or_else(|| {
-            invalid_target_value(
-                definition,
-                event_rule_id(comment_rules, definition),
-                "事件指令必须是对象",
-            )
-        })?;
-        let code = command.get("code").and_then(Value::as_i64).ok_or_else(|| {
-            invalid_target_value(
-                definition,
-                event_rule_id(comment_rules, definition),
-                "事件指令 code 必须是整数",
-            )
-        })?;
+        let command = command
+            .as_object()
+            .ok_or_else(|| invalid_target_at(list_locator, "事件指令必须是对象"))?;
+        let code = command
+            .get("code")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| invalid_target_at(list_locator, "事件指令 code 必须是整数"))?;
         let parameters = command
             .get("parameters")
             .and_then(Value::as_array)
-            .ok_or_else(|| {
-                invalid_target_value(
-                    definition,
-                    event_rule_id(comment_rules, definition),
-                    "事件指令 parameters 必须是数组",
-                )
-            })?;
+            .ok_or_else(|| invalid_target_at(list_locator, "事件指令 parameters 必须是数组"))?;
 
         if code == 108 && !comment_rules.is_empty() {
             extract_comment_block(
@@ -2279,6 +2279,7 @@ fn process_event_list(
                 command_index,
                 source,
                 list_steps,
+                list_locator,
                 command_tries,
                 definition,
                 matches,
@@ -2362,24 +2363,17 @@ fn extract_plugin_command(
     command_index: usize,
     source: &MzSource,
     list_steps: &[MzLocationStep],
+    list_locator: &str,
     command_tries: &PluginCommandTries,
     definition: &RulesDefinition,
     matches: &mut MatchCounts,
     collector: &mut GroupCollector,
 ) -> Result<(), BuildRulesSnapshotError> {
     let Some(plugin_name) = parameters.first().and_then(Value::as_str) else {
-        return invalid_target(
-            definition,
-            first_plugin_command_rule_id(definition),
-            "357 插件名必须是字符串",
-        );
+        return Err(invalid_target_at(list_locator, "357 插件名必须是字符串"));
     };
     let Some(command_name) = parameters.get(1).and_then(Value::as_str) else {
-        return invalid_target(
-            definition,
-            first_plugin_command_rule_id(definition),
-            "357 命令名必须是字符串",
-        );
+        return Err(invalid_target_at(list_locator, "357 命令名必须是字符串"));
     };
     let Some(trie) = command_tries
         .get(plugin_name)
@@ -2433,33 +2427,49 @@ mod tests {
 
     #[test]
     fn accepts_only_the_five_small_sections_and_rejects_duplicate_json_keys() {
-        let definition = RulesDefinition::parse(
-            r#"{
-                "notes": {},
-                "plugin_parameters": {},
-                "plugin_commands": {},
-                "comments": {},
-                "standard_fields": {}
-            }"#,
-        )
-        .expect("五个空分区应该合法");
+        let definition = RulesDefinition::parse("{}").expect("空对象应该表示空 Rules");
         assert!(definition.is_empty());
 
+        for section in [
+            "notes",
+            "event_lists",
+            "plugin_parameters",
+            "plugin_commands",
+            "standard_fields",
+        ] {
+            let text = format!(r#"{{"{section}":{{}}}}"#);
+            assert!(matches!(
+                RulesDefinition::parse(&text),
+                Err(RulesDefinitionError::EmptyValue(context)) if context == section
+            ));
+        }
+
         assert!(matches!(
-            RulesDefinition::parse(r#"{"version": 1}"#),
-            Err(RulesDefinitionError::UnknownSection(section)) if section == "version"
+            RulesDefinition::parse(r#"{"metadata": {}}"#),
+            Err(RulesDefinitionError::UnknownSection(section)) if section == "metadata"
         ));
-        let duplicate =
-            RulesDefinition::parse(r#"{"notes": {}, "notes": {"Items.json": ["Category"]}}"#)
-                .expect_err("重复对象键必须失败");
+        let duplicate = RulesDefinition::parse(
+            r#"{"notes": {}, "notes": {"Items.json": {"[].note": ["Category"]}}}"#,
+        )
+        .expect_err("重复对象键必须失败");
         assert!(duplicate.to_string().contains("对象键重复"));
         assert!(matches!(
-            RulesDefinition::parse(r#"{"notes":{"Items.json":["Category","Category"]}}"#),
-            Err(RulesDefinitionError::DuplicateLocator { .. })
+            RulesDefinition::parse(
+                r#"{"notes":{"Items.json":{"[].note":["Category","Category"]}}}"#
+            ),
+            Err(RulesDefinitionError::DuplicateValue { .. })
         ));
         assert!(matches!(
-            RulesDefinition::parse(r#"{"comments":{"Map*.json":["   "]}}"#),
+            RulesDefinition::parse(r#"{"notes":{"Items.json":{"[].note":[]}}}"#),
             Err(RulesDefinitionError::EmptyValue(_))
+        ));
+        assert!(matches!(
+            RulesDefinition::parse(r#"{"notes":{"Items.json":{"[].name":["Tag"]}}}"#),
+            Err(RulesDefinitionError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            RulesDefinition::parse(r#"{"plugin_commands":{"Quest":{"Show":["Text"]}}}"#),
+            Err(RulesDefinitionError::MissingEventLists)
         ));
     }
 
@@ -2484,6 +2494,192 @@ mod tests {
             RulesDefinition::parse(r#"{"standard_fields":{"Map001.json":["displayName"]}}"#)
                 .expect_err("地图来源只接受 Map*.json");
         assert!(exact_map.to_string().contains("Map*.json"));
+    }
+
+    #[test]
+    fn compact_contract_rejects_entries_without_extraction_intent() {
+        for text in [
+            r#"{"notes":{"Items.json":{}}}"#,
+            r#"{"standard_fields":{"Items.json":[]}}"#,
+            r#"{"plugin_parameters":{"QuestMenu":[]}}"#,
+            r#"{"plugin_commands":{"QuestBook":{}}}"#,
+            r#"{"plugin_commands":{"QuestBook":{"ShowQuest":[]}}}"#,
+            r#"{"event_lists":{"Items.json":{"[].list":[]}}}"#,
+        ] {
+            assert!(
+                RulesDefinition::parse(text).is_err(),
+                "无提取意图的声明必须失败：{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_paths_ignore_unrelated_note_and_list_keys() {
+        let definition = RulesDefinition::parse(
+            r#"{
+                "notes": {
+                    "Items.json": {
+                        "[].missing.note": ["Category"],
+                        "[].note": ["Category"]
+                    }
+                },
+                "event_lists": {
+                    "Items.json": {
+                        "[].events[].list": ["QuestDescription"]
+                    }
+                }
+            }"#,
+        )
+        .expect("紧凑的 Note 与事件路径应该合法");
+        assert_eq!(
+            definition.descriptors.len(),
+            2,
+            "同一来源的同名标签必须跨路径共享一次匹配事实"
+        );
+        let documents = items_documents(json!([null, {
+            "note": "<Category:武器>",
+            "custom": {"note": 42},
+            "list": 42,
+            "events": [{"list": [
+                {"code": 108, "parameters": ["<QuestDescription:任务说明>"]},
+                {"code": 0, "parameters": []}
+            ]}]
+        }]));
+
+        let snapshot =
+            build_rules_snapshot(&definition, &documents).expect("只应解释显式声明的路径");
+        let originals = snapshot
+            .groups()
+            .iter()
+            .flat_map(|group| group.fields())
+            .map(|field| field.original_text())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(originals, BTreeSet::from(["任务说明", "武器"]));
+    }
+
+    #[test]
+    fn map_root_note_path_derives_the_root_container() {
+        let definition = RulesDefinition::parse(r#"{"notes":{"Map*.json":{"note":["MapTag"]}}}"#)
+            .expect("地图根 Note 路径应该合法");
+        let documents = MzProjectDocuments::new(
+            [(MzDocumentId::Map(1), json!({"note": "<MapTag:地图备注>"}))]
+                .into_iter()
+                .collect(),
+            Vec::new(),
+        );
+
+        let snapshot =
+            build_rules_snapshot(&definition, &documents).expect("地图根 Note 应该生成空容器路径");
+        let group = &snapshot.groups()[0];
+        assert_eq!(group.kind(), TextGroupKind::Map);
+        assert_eq!(group.group_location().to_string(), "data/Map001.json");
+        assert!(matches!(
+            group.fields()[0].exact_location(),
+            MzLocation::NoteTag {
+                container_steps,
+                ..
+            } if container_steps.is_empty()
+        ));
+        assert_eq!(
+            group.fields()[0].exact_location().to_string(),
+            "data/Map001.json.note#MapTag[0]"
+        );
+    }
+
+    #[test]
+    fn declared_structural_type_mismatches_fail_at_the_exact_path() {
+        for (text, document, expected_path) in [
+            (
+                r#"{"notes":{"Items.json":{"[].note":["Tag"]}}}"#,
+                json!([null, {"note": 42}]),
+                "[].note",
+            ),
+            (
+                r#"{"event_lists":{"Items.json":{"[].list":["Tag"]}}}"#,
+                json!([null, {"list": 42}]),
+                "[].list",
+            ),
+            (
+                r#"{"event_lists":{"Items.json":{"[].events[].list":["Tag"]}}}"#,
+                json!([null, {"events": {}}]),
+                "[].events[].list",
+            ),
+        ] {
+            let definition = RulesDefinition::parse(text).expect("结构错误应发生在数据匹配阶段");
+            let error = build_rules_snapshot(&definition, &items_documents(document))
+                .expect_err("显式路径的结构类型冲突必须失败");
+            assert!(matches!(
+                error,
+                BuildRulesSnapshotError::InvalidTarget { locator, .. }
+                    if locator.contains(expected_path)
+            ));
+        }
+    }
+
+    #[test]
+    fn plugin_commands_use_only_declared_event_sources_and_allow_optional_routes() {
+        let definition = RulesDefinition::parse(
+            r#"{
+                "event_lists": {
+                    "Items.json": {
+                        "[].missing[].list": [],
+                        "[].list": ["QuestDescription"]
+                    }
+                },
+                "plugin_commands": {
+                    "QuestBook": {"ShowQuest": ["Text"]}
+                }
+            }"#,
+        )
+        .expect("插件命令可以使用任意显式标准数据来源");
+        let selection = definition.document_selection();
+        assert_eq!(
+            selection.standard_files(),
+            &BTreeSet::from([StandardDataFile::Items])
+        );
+        assert!(!selection.includes_all_maps());
+
+        let documents = MzProjectDocuments::new(
+            [
+                (
+                    MzDocumentId::Data(StandardDataFile::Items),
+                    json!([null, {"list": [
+                        {"code": 108, "parameters": ["<QuestDescription:任务说明>"]},
+                        {"code": 357, "parameters": [
+                            "QuestBook", "ShowQuest", "显示任务", {"Text": "正文"}
+                        ]},
+                        {"code": 0, "parameters": []}
+                    ]}]),
+                ),
+                (MzDocumentId::Map(1), json!({"list": 42})),
+            ]
+            .into_iter()
+            .collect(),
+            Vec::new(),
+        );
+
+        let snapshot = build_rules_snapshot(&definition, &documents)
+            .expect("未声明的地图和未命中的可选路径都不应影响插件命令");
+        let fields = snapshot
+            .groups()
+            .iter()
+            .flat_map(|group| group.fields())
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.original_text())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["任务说明", "正文"])
+        );
+        assert!(fields.iter().any(|field| {
+            field.original_text() == "正文"
+                && field
+                    .exact_location()
+                    .to_string()
+                    .starts_with("data/Items.json[1].list[1]")
+        }));
     }
 
     #[test]
@@ -2796,7 +2992,14 @@ mod tests {
 
     fn full_definition_text() -> &'static str {
         r#"{
-            "notes": {"Items.json": ["Category"]},
+            "notes": {"Items.json": {"[].note": ["Category"]}},
+            "event_lists": {
+                "Map*.json": {
+                    "events[].pages[].list": ["QuestDescription"]
+                },
+                "CommonEvents.json": {"[].list": []},
+                "Troops.json": {"[].pages[].list": []}
+            },
             "plugin_parameters": {
                 "QuestMenu": ["WindowTitle", "Outer[].Name"]
             },
@@ -2805,7 +3008,6 @@ mod tests {
                     "ShowQuest": ["Entries[].Title", "Entries[].Body"]
                 }
             },
-            "comments": {"Map*.json": ["QuestDescription"]},
             "standard_fields": {
                 "Items.json": ["[].customShortName", "[].customDescription"]
             }
@@ -3002,6 +3204,9 @@ mod tests {
             r#"{
                 "standard_fields": {
                     "Map*.json": ["events[1].pages[0].list[0].parameters[3].Text"]
+                },
+                "event_lists": {
+                    "Map*.json": {"events[].pages[].list": []}
                 },
                 "plugin_commands": {
                     "QuestBook": {"ShowQuest": ["Text"]}

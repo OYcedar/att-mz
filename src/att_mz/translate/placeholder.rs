@@ -9,11 +9,12 @@ use std::sync::Arc;
 use pcre2::bytes::{Regex, RegexBuilder};
 use serde::Deserialize;
 
+use crate::att_mz::placeholder_token;
 use crate::att_mz::text::TextGroupKind;
 
 use super::standard::{AppliedPlaceholder, PlaceholderRuleOrigin, PlaceholderSegment};
 
-const BUILTIN_CONTROL_PATTERN: &str = r"\\(?:(?i:V|N|P|C|I|PX|PY|FS)\[\d+\]|(?i:G)|[{}$.|!><^])";
+const BUILTIN_CONTROL_PATTERN: &str = r"\\(?:(?i:V|N|P|C|I|PX|PY|FS)\[\d+\]|(?i:G)|[\\{}$.|!><^])";
 
 /// 外部 JSON 中一条自定义占位符规则的最小表达。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -150,6 +151,10 @@ impl Pcre2PlaceholderService {
         original: &str,
         custom: &CompiledPlaceholderRules,
     ) -> Result<ProtectedText, PlaceholderProtectionError> {
+        if placeholder_token::contains_reserved_prefix(original) {
+            return Err(PlaceholderProtectionError::ReservedTokenNamespace);
+        }
+
         let scope = PlaceholderScope::from_kind(kind);
         let mut candidates = self.builtin_candidates(original, scope)?;
         for (rule_index, rule) in custom.rules.iter().enumerate() {
@@ -182,7 +187,6 @@ impl Pcre2PlaceholderService {
                 });
             }
         }
-        ensure_suspicious_controls_are_protected(original, &occupied)?;
         selected.sort_by_key(|span| (span.start, span.end));
 
         let mut protected = String::with_capacity(original.len());
@@ -235,31 +239,6 @@ impl Pcre2PlaceholderService {
         }
         Ok(result)
     }
-}
-
-fn ensure_suspicious_controls_are_protected(
-    original: &str,
-    occupied: &[(usize, usize)],
-) -> Result<(), PlaceholderProtectionError> {
-    let mut characters = original.char_indices().peekable();
-    while let Some((offset, character)) = characters.next() {
-        if character != '\\' {
-            continue;
-        }
-        let Some((_, next)) = characters.peek().copied() else {
-            continue;
-        };
-        let suspicious = next.is_ascii_alphabetic() || "{}$.|!><^".contains(next);
-        let protected = occupied
-            .iter()
-            .any(|&(start, end)| start <= offset && offset < end);
-        if suspicious && !protected {
-            return Err(PlaceholderProtectionError::UnprotectedControl {
-                fragment: format!("\\{next}"),
-            });
-        }
-    }
-    Ok(())
 }
 
 fn compile_regex(pattern: &str) -> Result<Regex, pcre2::Error> {
@@ -504,7 +483,7 @@ fn semantic_token(label: &str, segment: PlaceholderSegment, index: usize) -> Str
         PlaceholderSegment::Begin => "BEGIN",
         PlaceholderSegment::End => "END",
     };
-    format!("⟦ATT_{label}_{segment}_{index:04}⟧")
+    placeholder_token::envelope(&format!("{label}_{segment}_{index:04}"))
 }
 
 /// 一次保护的完整可逆结果。
@@ -625,7 +604,7 @@ pub(crate) enum PlaceholderProtectionError {
     Match(pcre2::Error),
     EmptyMatch { label: String },
     MissingTranslateCapture { label: String, capture: String },
-    UnprotectedControl { fragment: String },
+    ReservedTokenNamespace,
 }
 
 impl fmt::Display for PlaceholderProtectionError {
@@ -637,9 +616,10 @@ impl fmt::Display for PlaceholderProtectionError {
                 formatter,
                 "占位符规则 {label} 的命名组 {capture:?} 未参与匹配"
             ),
-            Self::UnprotectedControl { fragment } => write!(
+            Self::ReservedTokenNamespace => write!(
                 formatter,
-                "发现未被规则保护的疑似 RMMZ 控制符：{fragment:?}"
+                "原文包含保留的 ATT token 前缀 {:?}",
+                placeholder_token::PREFIX
             ),
         }
     }
@@ -681,6 +661,73 @@ mod tests {
         assert_eq!(bindings[1].origin(), PlaceholderRuleOrigin::Custom);
         assert_eq!(bindings[1].original(), "勇者");
         assert!(!text.contains(r"\C[2]"));
+    }
+
+    #[test]
+    fn builtin_controls_cover_literal_backslashes_and_adjacent_boundaries() {
+        let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
+        let cases: &[(&str, &[&str])] = &[
+            (r"\\", &[r"\\"]),
+            (r"\\\\", &[r"\\", r"\\"]),
+            (r"\\C[2]", &[r"\\"]),
+            (r"\\\C[2]", &[r"\\", r"\C[2]"]),
+        ];
+
+        for &(original, expected) in cases {
+            let (_, bindings) = service
+                .protect(
+                    TextGroupKind::EventDialogue,
+                    original,
+                    &CompiledPlaceholderRules::empty(),
+                )
+                .expect("内置控制符应该受到保护")
+                .into_parts();
+            let actual = bindings
+                .iter()
+                .map(AppliedPlaceholder::original)
+                .collect::<Vec<_>>();
+
+            assert_eq!(actual, expected, "边界样本 {original:?}");
+            assert!(bindings.iter().all(|binding| {
+                binding.origin() == PlaceholderRuleOrigin::BuiltIn
+                    && binding.segment() == PlaceholderSegment::Whole
+            }));
+        }
+    }
+
+    #[test]
+    fn builtin_parameter_and_single_character_controls_remain_protected() {
+        let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
+        for control in [
+            r"\V[1]", r"\N[2]", r"\P[3]", r"\C[4]", r"\I[5]", r"\PX[6]", r"\PY[7]", r"\FS[8]",
+            r"\G", r"\{", r"\}", r"\$", r"\.", r"\|", r"\!", r"\>", r"\<", r"\^",
+        ] {
+            let (_, bindings) = service
+                .protect(
+                    TextGroupKind::EventDialogue,
+                    control,
+                    &CompiledPlaceholderRules::empty(),
+                )
+                .expect("既有内置控制符应该受到保护")
+                .into_parts();
+
+            assert_eq!(bindings.len(), 1, "控制符 {control:?}");
+            assert_eq!(bindings[0].original(), control);
+        }
+    }
+
+    #[test]
+    fn original_text_cannot_enter_the_reserved_token_namespace() {
+        let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
+
+        assert!(matches!(
+            service.protect(
+                TextGroupKind::DatabaseEntry,
+                "自然文本⟦ATT_FAKE",
+                &CompiledPlaceholderRules::empty(),
+            ),
+            Err(PlaceholderProtectionError::ReservedTokenNamespace)
+        ));
     }
 
     #[test]
@@ -737,18 +784,54 @@ mod tests {
     }
 
     #[test]
-    fn unknown_control_requires_an_explicit_custom_rule() {
+    fn unmatched_backslash_sequences_remain_natural_text() {
         let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
 
-        assert!(matches!(
-            service.protect(
+        for original in [
+            r"播放 \SE[Bell] 后继续",
+            r"C:\Users\Player\save.json",
+            r"正则表达式 ^\w+\s+$",
+        ] {
+            let (protected, placeholders) = service
+                .protect(
+                    TextGroupKind::EventDialogue,
+                    original,
+                    &CompiledPlaceholderRules::empty(),
+                )
+                .expect("未命中精确规则的反斜杠文本应该保持为自然文本")
+                .into_parts();
+
+            assert_eq!(protected, original);
+            assert!(placeholders.is_empty());
+        }
+    }
+
+    #[test]
+    fn mixed_text_only_protects_exact_builtin_controls() {
+        let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
+        let original = r"路径 C:\Users\Player；播放 \SE[Bell]；颜色 \C[2]红；正则 ^\w+$";
+
+        let (protected, placeholders) = service
+            .protect(
                 TextGroupKind::EventDialogue,
-                r"播放 \SE[Bell] 后继续",
+                original,
                 &CompiledPlaceholderRules::empty(),
-            ),
-            Err(PlaceholderProtectionError::UnprotectedControl { fragment })
-                if fragment == r"\S"
-        ));
+            )
+            .expect("混合文本应该只保护精确命中的内置控制符")
+            .into_parts();
+
+        assert_eq!(placeholders.len(), 1);
+        assert_eq!(placeholders[0].origin(), PlaceholderRuleOrigin::BuiltIn);
+        assert_eq!(placeholders[0].original(), r"\C[2]");
+        assert!(protected.contains(r"C:\Users\Player"));
+        assert!(protected.contains(r"\SE[Bell]"));
+        assert!(protected.contains(r"^\w+$"));
+        assert!(!protected.contains(r"\C[2]"));
+    }
+
+    #[test]
+    fn custom_rule_can_protect_an_external_control_sequence() {
+        let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
 
         let custom = service
             .compile_custom(vec![PlaceholderRuleDefinition::new(

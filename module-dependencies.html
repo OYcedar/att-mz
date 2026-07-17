@@ -1220,9 +1220,9 @@ h1 {
       shortSymbol: "Rules Extraction",
       path: "src/att_mz/extract/rules.rs",
       status: "业务逻辑已实现",
-      role: "读取用户规则，为内建知识没有覆盖的 JSON 或插件结构补充文本叶子。",
-      plain: "它像自定义采集员。Builtin 只管大家都一样的标准字段，Rules 根据项目自己的规则去找额外内容。",
-      example: "某插件把分类名放在 Categories[].Name。Builtin 不认识它；Rules 读取规则后，可以把每个 Name 当成可翻译叶子提取出来。",
+      role: "读取用户写出的来源与精确路径，为内建知识没有覆盖的 Note、事件命令、JSON 或插件结构补充文本叶子。",
+      plain: "它只访问规则明确写出的路径，不会递归猜测名为 note 或 list 的字段；来源、结构位置和标签用紧凑映射直接表达。",
+      example: "Items.json → [].note → [Category] 精确提取 Note 标签；Map*.json → events[].pages[].list → [QuestDescription] 精确提取事件 Comment。",
       input: "OpenedProject、规则文件与读取配置",
       output: "RulesSnapshot 已安全存入"
     },
@@ -1281,11 +1281,11 @@ h1 {
       shortSymbol: "Standard Asset Schema",
       path: "src/att_mz/standard_asset.rs",
       status: "共享纯能力已实现",
-      role: "唯一定义五张标准表、owner、text_body unit 与八种文本组语义的双向映射。",
-      plain: "Extract、Translate 和 WriteBack 不再各写一套 entry/text_body 字符串判断，而是共享同一份受信存储字典。",
-      example: "text_body + scrolling_text 始终映射为 EventScrollingText；非 text_body 表带 unit_type 会被拒绝。",
-      input: "表名、owner、unit_type 或 TextGroupKind",
-      output: "受信 MzStandardAssetStorageKind 与读取资源配置"
+      role: "唯一定义五张标准表、owner、text_body unit、八种文本组语义及其结构化位置合法矩阵。",
+      plain: "Extract、Translate 和 WriteBack 不再各写一套 entry/text_body 字符串判断；Reader 也在这里确认表语义与 exact/group 地址确实一致。",
+      example: "text_body + scrolling_text 始终映射为 EventScrollingText；可解码但来自 Items.json 的 SystemText 地址会被判为数据库损坏。",
+      input: "表名、owner、unit_type、TextGroupKind 或 exact/group MzLocation",
+      output: "受信 MzStandardAssetStorageKind、读取资源配置或位置语义错误"
     },
     "tag-span-parser": {
       title: "Tag Span 解析",
@@ -1558,11 +1558,23 @@ h1 {
       shortSymbol: "Placeholder Service",
       path: "src/att_mz/translate/placeholder.rs",
       status: "业务逻辑已实现",
-      role: "识别内建和自定义控制片段，替换成稳定 token，并保留可恢复契约。",
-      plain: "它先给不能翻译的片段套保护壳。模型只看到 token；回来后再检查数量和身份，防止控制码丢失或被改坏。",
+      role: "精确识别内建和自定义控制片段，替换成稳定 token，并保留可恢复契约。",
+      plain: "它只给 Builtin 或外部规则精确命中的片段套保护壳；其他反斜杠序列作为自然文本进入翻译，不触发启发式阻断。模型返回后再检查 token 数量和身份。",
       example: "“\\C[2]勇者”里的“\\C[2]”会被保护，只把“勇者”交给翻译。结果缺少 token 时不会被接受。",
       input: "原文与自定义占位符规则",
       output: "保护后的文本与 AppliedPlaceholder 列表"
+    },
+    "placeholder-token-envelope": {
+      title: "ATT token 信封",
+      symbol: "placeholder_token",
+      shortSymbol: "ATT Token Envelope",
+      path: "src/att_mz/placeholder_token.rs",
+      status: "crate 私有共享协议已实现",
+      role: "唯一拥有 ATT token 的保留前缀、闭合信封扫描和命名空间残留检测。",
+      plain: "它让生成器、响应质检和写回布局对什么算完整 token、什么算破损保留前缀持有同一答案。",
+      example: "⟦ATT_NAME_WHOLE_0000⟧ 是完整信封；只有 ⟦ATT_ 而没有闭合符时会被明确拒绝。",
+      input: "待生成或扫描的文本",
+      output: "稳定信封文本、完整 token 序列或未闭合前缀错误"
     },
     "deduplication": {
       title: "全局确定性去重",
@@ -1589,14 +1601,14 @@ h1 {
       output: "TranslationTaskOutcome"
     },
     "response-processor": {
-      title: "逐 ID 验收响应",
+      title: "响应结构与逐 ID 验收",
       symbol: "TranslationTaskResponseProcessingService",
       shortSymbol: "Response Processor",
       path: "src/att_mz/translate/executor.rs",
       status: "业务逻辑已实现",
-      role: "逐 ID 完成通用协议与文本检查，再用译前 LanguageAnalysis 检查残留、执行可选安全修复并恢复控制码。",
-      plain: "它像质检员：JSON、ID、空白、BOM、换行和占位符由通用逻辑负责；具体源语残留与可选阅读修复才交给共享语言模块。一个 ID 坏了不会拖掉其他合格结果。",
-      example: "任务期待 ID0 和 ID1。ID0 的日文残留超出允许策略会被记录为未解决；ID1 只把可唯一对应的中文引号修回「」后仍可提交，整个任务得到 Partial。",
+      role: "先按严格信封、完整顶层数组和整批 wire schema 原子验收响应；结构通过后逐 ID 完成通用文本检查，再用译前 LanguageAnalysis 检查残留、执行可选安全修复并恢复控制码。",
+      plain: "它像两道质检门：前一道不从说明文字中猜数组，也不修尾逗号或坏字段，整批结构不合格就成为不重试的 ModelResponseUnusable；结构合格后才逐 ID 检查空白、BOM、换行、占位符和源语残留，此时一个 ID 坏了不会拖掉其他合格结果。",
+      example: "任务期待 ID0 和 ID1。若任一元素缺字段，整批响应不可用；若结构完整但 ID0 有源语残留，ID1 仍可通过并形成 Partial。",
       input: "任务契约与模型原始响应",
       output: "逐 ID 的合格 Patch、未解决原因与协议诊断"
     },
@@ -1809,11 +1821,14 @@ h1 {
           n("planner-language-ja", "japanese-language", [], { reused: true }),
           n("planner-language-en", "english-language", [], { reused: true })
         ], { reused: true }),
-        n("planner-placeholder", "placeholder-service"),
+        n("planner-placeholder", "placeholder-service", [
+          n("planner-placeholder-token", "placeholder-token-envelope", [], { reused: true })
+        ]),
         n("planner-dedup", "deduplication")
       ], { order: "②" }),
       n("standard-executor", "executor", [
         n("executor-response", "response-processor", [
+          n("response-token", "placeholder-token-envelope", [], { reused: true }),
           n("response-language", "language-catalog", [
             n("response-language-ja", "japanese-language", [], { reused: true }),
             n("response-language-en", "english-language", [], { reused: true })
@@ -1849,7 +1864,9 @@ h1 {
         n("writeback-reader-sql", "sqlite-query-root", [], { reused: true }),
         n("writeback-reader-cpu", "cpu-root", [], { reused: true })
       ], { order: "①" }),
-      n("writeback-layout", "writeback-layouter", [], { order: "②" }),
+      n("writeback-layout", "writeback-layouter", [
+        n("writeback-layout-token", "placeholder-token-envelope", [], { reused: true })
+      ], { order: "②" }),
       n("writeback-rewrite", "writeback-rewriter", [
         n("writeback-document-reader", "document-reader", [
           n("writeback-doc-file", "file-reader-root", [], { reused: true }),

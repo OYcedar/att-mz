@@ -1429,6 +1429,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_backslash_sequence_reaches_the_model_request_as_natural_text() {
+        let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            EmptyResources,
+            language_catalog(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let original = r"再生 \SE[Bell] 後で続けます";
+
+        let (_, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                StandardTranslationCorpus::new(vec![group(
+                    MzSource::data(StandardDataFile::Items),
+                    1,
+                    original,
+                    None,
+                    Vec::new(),
+                )]),
+                StandardTranslationInput::new(None, None),
+            )
+            .await
+            .expect("未知反斜杠序列不应阻断翻译规划")
+            .into_parts();
+
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].messages()[1].content().contains(original));
+        assert!(
+            tasks[0].expected_outputs()[0]
+                .applied_placeholders()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn target_language_only_requires_exact_system_markdown() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,

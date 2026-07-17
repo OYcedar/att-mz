@@ -9,10 +9,10 @@ use super::{
     MzWriteBackAppliedLayout, MzWriteBackLaidOutSegment, MzWriteBackLayoutCandidate,
     MzWriteBackLayoutOutcome, MzWriteBackLayoutRequest, MzWriteBackTextLayouter,
 };
+use crate::att_mz::placeholder_token;
 use crate::att_mz::text::MzLocation;
 
 const FULLWIDTH_INDENT: &str = "　";
-const ATT_TOKEN_PREFIX: &str = "⟦ATT_";
 const MAX_TAIL_CELLS: u64 = 8;
 
 /// 只在能够完整证明显示结果安全时修改文本的 MZ 布局器。
@@ -108,7 +108,7 @@ struct DisplayToken<'a> {
 }
 
 fn scan_line(line: &str) -> Option<Vec<DisplayToken<'_>>> {
-    if line.contains(ATT_TOKEN_PREFIX) {
+    if placeholder_token::contains_reserved_prefix(line) {
         return None;
     }
 

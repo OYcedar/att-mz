@@ -13,6 +13,7 @@ pub mod extract;
 pub mod init;
 pub(crate) mod location_codec;
 pub(crate) mod lua;
+pub(crate) mod placeholder_token;
 pub(crate) mod project;
 mod project_name;
 pub(crate) mod standard_asset;

@@ -11,8 +11,8 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
 use crate::att_mz::standard_asset::{
-    MzStandardAssetOwner, MzStandardAssetReadingConfig, MzStandardAssetStorageKind,
-    MzStandardAssetTable, MzTextBodyUnit,
+    MzStandardAssetLocationError, MzStandardAssetOwner, MzStandardAssetReadingConfig,
+    MzStandardAssetStorageKind, MzStandardAssetTable, MzTextBodyUnit,
 };
 use crate::att_mz::text::{MzLocation, TextGroupKind};
 use crate::project_database::StoredProjectRecord;
@@ -330,6 +330,7 @@ pub(crate) enum InvalidStandardTranslationAssetSnapshot {
         column: &'static str,
         source: MzLocationCodecError,
     },
+    InvalidStorageLocation(MzStandardAssetLocationError),
     ContradictoryAssetRows {
         exact_location: Box<MzLocation>,
     },
@@ -371,6 +372,9 @@ impl fmt::Display for InvalidStandardTranslationAssetSnapshot {
             Self::InvalidLocation { column, source } => {
                 write!(formatter, "列 {column} 中的结构化位置无效：{source}")
             }
+            Self::InvalidStorageLocation(source) => {
+                write!(formatter, "结构化位置与标准资产存储语义不一致：{source}")
+            }
             Self::ContradictoryAssetRows { exact_location } => {
                 write!(formatter, "同一资产位置存在矛盾行：{exact_location}")
             }
@@ -393,6 +397,7 @@ impl Error for InvalidStandardTranslationAssetSnapshot {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidLocation { source, .. } => Some(source),
+            Self::InvalidStorageLocation(source) => Some(source),
             _ => None,
         }
     }
@@ -489,6 +494,21 @@ fn decode_row(row: SqliteRow) -> Result<DecodedRow, InvalidStandardTranslationAs
         }
     })?;
     let kind = storage.group_kind();
+    let exact_location = MzLocationCodec::decode(&exact_location).map_err(|source| {
+        InvalidStandardTranslationAssetSnapshot::InvalidLocation {
+            column: "exact_location",
+            source,
+        }
+    })?;
+    let group_location = MzLocationCodec::decode(&group_location).map_err(|source| {
+        InvalidStandardTranslationAssetSnapshot::InvalidLocation {
+            column: "group_location",
+            source,
+        }
+    })?;
+    storage
+        .validate_locations(&exact_location, &group_location)
+        .map_err(InvalidStandardTranslationAssetSnapshot::InvalidStorageLocation)?;
 
     if field_name.is_empty() {
         return Err(InvalidStandardTranslationAssetSnapshot::BlankFieldName);
@@ -526,18 +546,8 @@ fn decode_row(row: SqliteRow) -> Result<DecodedRow, InvalidStandardTranslationAs
     Ok(DecodedRow {
         storage,
         kind,
-        exact_location: MzLocationCodec::decode(&exact_location).map_err(|source| {
-            InvalidStandardTranslationAssetSnapshot::InvalidLocation {
-                column: "exact_location",
-                source,
-            }
-        })?,
-        group_location: MzLocationCodec::decode(&group_location).map_err(|source| {
-            InvalidStandardTranslationAssetSnapshot::InvalidLocation {
-                column: "group_location",
-                source,
-            }
-        })?,
+        exact_location,
+        group_location,
         field_name,
         original_text,
         translation,
@@ -764,6 +774,77 @@ mod tests {
 
         assert_eq!(config.decode_concurrency().get(), 3);
         assert_eq!(config.leaves_per_decode_job().get(), 12);
+    }
+
+    #[test]
+    fn decoded_locations_incompatible_with_the_asset_table_are_rejected() {
+        let group = location(vec![MzLocationStep::index(1)]);
+        let exact = location(vec![
+            MzLocationStep::index(1),
+            MzLocationStep::key("gameTitle"),
+        ]);
+
+        let error = decode_row(row(
+            "system_text",
+            &exact,
+            &group,
+            "gameTitle",
+            [
+                SqliteValue::Text("标题".to_owned()),
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+            ],
+        ))
+        .expect_err("SystemText 不应接受 Items 来源");
+
+        assert!(matches!(
+            error,
+            InvalidStandardTranslationAssetSnapshot::InvalidStorageLocation(
+                MzStandardAssetLocationError::SourceDoesNotMatchStorage {
+                    storage: MzStandardAssetStorageKind::SystemText,
+                    source: MzSource::Data(StandardDataFile::Items),
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn rules_entry_on_map_with_custom_field_and_path_is_accepted() {
+        let source = MzSource::map(15);
+        let group = MzLocation::value(
+            source.clone(),
+            vec![MzLocationStep::key("rules_group"), MzLocationStep::index(2)],
+        );
+        let exact = MzLocation::value(
+            source,
+            vec![
+                MzLocationStep::key("unrelated_rules_path"),
+                MzLocationStep::DecodeJsonString,
+                MzLocationStep::key("actual_name"),
+            ],
+        );
+        let mut values = row(
+            "entry",
+            &exact,
+            &group,
+            "custom_field_name",
+            [
+                SqliteValue::Text("原文".to_owned()),
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+            ],
+        )
+        .into_values();
+        values[2] = SqliteValue::Text("rules".to_owned());
+
+        let decoded = decode_row(SqliteRow::new(values)).expect("合法 Rules Entry→Map 应被接受");
+
+        assert_eq!(decoded.storage, MzStandardAssetStorageKind::Entry);
+        assert_eq!(decoded.field_name, "custom_field_name");
+        assert_eq!(decoded.exact_location, exact);
+        assert_eq!(decoded.group_location, group);
     }
 
     #[tokio::test]
