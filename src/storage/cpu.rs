@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "CPU 根接口按计划先于生产适配器定义")]
-
 //! 受控执行 CPU 密集型纯计算的根能力契约。
 
 use std::error::Error;

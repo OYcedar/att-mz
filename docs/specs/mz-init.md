@@ -2,7 +2,7 @@
 
 本文记录已经确认并落地的 MZ Init 行为。Init 把一个现存游戏导入为命名工作区，
 只有数据库、冻结源目录和固定写回目录作为一个整体发布后，初始化才成功。
-文件系统和 SQLite 的生产根适配器不属于当前实现。
+生产进程通过 `SystemFileSystem` 和 `RusqliteStorage` 执行这些真实副作用。
 
 ## 1. 一次调用与成功结果
 
@@ -71,7 +71,7 @@ prepare
 ProjectDatabaseCreationService
   在 <staging>/project.db 建库并写入唯一 metadata
         ↓
-publish(CreateNew)
+publish  // request 中的意图为 CreateNew
         ↓
 <projects_root>/<name>
 ```
@@ -81,30 +81,37 @@ publish(CreateNew)
 目标绝不覆盖。建库位于目录复制成功之后；服务不重读数据库来验证建库结果，
 也不在任何阶段自动重试。
 
-## 4. 原子目录根契约
+## 4. 可恢复目录发布契约
 
-`AtomicDirectoryPublisher` 是 Init 和 Standard WriteBack 共用的环境根。它把
+`RecoverableDirectoryPublisher` 是 Init 和 Standard WriteBack 共用的环境根。它把
 多目录复制、文件覆盖和空目录作为一个候选目录处理：
 
-1. `prepare(request)` 在最终目标同级建立私有暂存根，成功时最终目标未改变；
-2. 返回的 `StagedDirectory` 暴露暂存根以便非根服务在其中建立
+1. 发布意图 `CreateNew` 或 `ReplaceExisting` 在 `DirectoryStageRequest` 构造时就被固定；
+2. `prepare(request)` 在最终目标同级建立私有暂存根，成功时最终目标未改变；
+3. 返回的 `StagedDirectory` 暴露暂存根以便非根服务在其中建立
    `project.db`，但不可复制；
-3. `publish(token, CreateNew | Replace)` 或 `discard(token)` 按值消费 token，
+4. `publish(token)` 或 `discard(token)` 按值消费 token，
    一个候选只能被终结一次。
 
-`CreateNew` 拒绝任何已存在目标并返回 `TargetAlreadyExists`；`Replace` 只替换一个
+`CreateNew` 拒绝任何已存在目标并返回 `TargetAlreadyExists`；`ReplaceExisting` 只替换一个
 已存在的目录，目标缺失或不是目录分别返回 `TargetMissing` 或 `TargetNotDirectory`。
 根还拥有递归复制的资源限制、符号链接/
 reparse point 拒绝策略、同目标发布线性化、交换恢复和暂存清理。
 
 发布终态保留以下业务含义：
 
+- `NotAttempted`：尚未执行任何可见交换；
 - `NotPublished`：候选没有成为最终目标，原目标仍可信；
-- `PublishedButCleanupFailed`：新目标已生效，但旧备份残留；
+- `PublishedWithResiduals`：新目标已生效，但 backup、journal 或清理产物残留；
+- `RecoveryRequired`：目标暂时缺失，但 old/new 的身份与位置均已知，下一次同目标操作继续恢复；
 - `OutcomeUnknown`：无法确定对外可见的是原目录、新目录还是不可用状态。
 
 这些结果不得被降级为成功，也不得自动重试。`OutcomeUnknown` 后不再执行
 额外清理或探测。显式 `discard` 失败必须保留准确暂存路径。
+
+生产 `SystemFileSystem` 使用同父目录 stage、Win32 file ID、同目标跨进程锁和
+`length + JSON + CRC32` journal 执行整目录切换。恢复在下一次同目标的
+`prepare`、`publish` 或 `discard` 时发生，不全盘扫描工作区。
 
 ## 5. 失败与完成边界
 
@@ -115,20 +122,22 @@ reparse point 拒绝策略、同目标发布线性化、交换恢复和暂存清
 - 任何建库失败都只调用一次 `discard`，然后返回建库原因；
 - 建库与 discard 同时失败时，同时保留首因、清理原因和残留路径；
 - publish 已消费 token，无论返回哪种失败，服务都不再调用 discard；
-- 只有 `publish(CreateNew)` 返回完全成功时，Init 才报告项目已初始化。
+- 只有意图已固定为 `CreateNew` 的 `publish` 返回完全成功时，Init 才报告项目已初始化。
 
-当前 Init 的全部非根业务树已实现，并可通过根测试替身贯通：
+当前 Init 从用例到生产根的完整依赖为：
 
 ```text
 InitService
-├─ ExistingDirectoryResolver                    根接口
+├─ SystemFileSystem
+│  └─ ExistingDirectoryResolver
 └─ ProjectWorkspaceCreationService
    ├─ ProjectWorkspaceLayout
    ├─ ProjectDatabaseCreationService
-   │  └─ SqliteDatabaseCreator              根接口
-   └─ AtomicDirectoryPublisher                  根接口
+   │  └─ RusqliteStorage
+   │     └─ SqliteDatabaseCreator
+   └─ SystemFileSystem
+      └─ RecoverableDirectoryPublisher
 ```
 
-`ExistingDirectoryResolver`、`SqliteDatabaseCreator` 和 `AtomicDirectoryPublisher`
-只定义了环境契约，没有生产适配器和组合根接线。因此当前可以声明非根
-初始化业务成立，不能声明真实磁盘上的生产 Init 已经贯通。
+`ProductionMzCommandRunner` 只在 Init 分支构造这棵树。命令与 SQLite、
+FileSystem 的显式 shutdown 都成功后，进程才输出“初始化完成”。

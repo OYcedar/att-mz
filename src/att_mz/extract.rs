@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 
 use super::ProjectName;
 
-mod builtin;
+pub(crate) mod builtin;
 pub(crate) mod document;
-mod lua;
+pub(crate) mod lua;
 mod model;
-mod rules;
-mod service;
-mod store;
+pub(crate) mod rules;
+pub(crate) mod service;
+pub(crate) mod store;
 
 /// 提取指定 MZ 游戏文本所需的输入。
 #[derive(Clone, Debug, Eq, PartialEq)]

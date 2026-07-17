@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "Planner 等待完整 Translate 组合根接线")]
-
 //! MZ 标准翻译任务规划：自然排序、语义范围、虚原文、术语和占位符。
 
 use std::collections::BTreeMap;

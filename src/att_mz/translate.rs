@@ -4,17 +4,17 @@ use std::path::PathBuf;
 
 use super::ProjectName;
 
-mod asset_reader;
+pub(crate) mod asset_reader;
 mod deduplication;
 pub(crate) mod executor;
 mod language_projection;
-mod lua;
-mod placeholder;
-mod planner;
-mod planning_resource;
+pub(crate) mod lua;
+pub(crate) mod placeholder;
+pub(crate) mod planner;
+pub(crate) mod planning_resource;
 pub(crate) mod profile;
-mod result_store;
-mod service;
+pub(crate) mod result_store;
+pub(crate) mod service;
 pub(crate) mod standard;
 
 #[cfg(test)]
@@ -24,7 +24,7 @@ mod full_tree_tests;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranslateInput {
     pub name: ProjectName,
-    pub llm_id: String,
+    pub profile_id: String,
     /// 本次标准翻译使用的外部术语表；`None` 不表示权威空术语表。
     pub terminology_path: Option<PathBuf>,
     /// 本次补充的占位符规则；`None` 不关闭标准翻译内置的 MZ 保护规格。
@@ -54,7 +54,7 @@ pub struct StandardTranslationSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranslateOutput {
     pub name: ProjectName,
-    pub llm_id: String,
+    pub profile_id: String,
     pub standard: StandardTranslationSummary,
     pub lua_executed: bool,
 }

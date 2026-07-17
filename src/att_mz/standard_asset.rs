@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "标准资产生产组合根尚未完整接线")]
-
 //! MZ 五张标准资产表共享的存储语义。
 //!
 //! 这里只表达 Extract、Translate 与 WriteBack 共同依赖的表名、owner、

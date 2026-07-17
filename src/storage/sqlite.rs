@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "底层接口按计划先于生产适配器定义")]
-
 //! SQLite 数据库创建、查询与事务执行的根能力契约。
 
 use std::error::Error;

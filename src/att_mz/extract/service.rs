@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "提取用例尚未接入生产组合根")]
-
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -9,6 +7,7 @@ use super::lua::LuaExtraction;
 use super::rules::RulesExtraction;
 use super::{ExtractInput, ExtractOutput, ExtractUseCase};
 use crate::att_mz::project::ExistingProjectOpener;
+use crate::execution::{CooperativeCancellation, OperationCancelled};
 
 /// 按固定业务顺序编排一次 MZ 文本提取。
 ///
@@ -18,7 +17,8 @@ pub(crate) struct ExtractService<O, B, R, L> {
     project_opener: O,
     built_in_extraction: B,
     rules_extraction: R,
-    lua_extraction: L,
+    lua_extraction: Option<L>,
+    cancellation: CooperativeCancellation,
 }
 
 impl<O, B, R, L> ExtractService<O, B, R, L> {
@@ -26,13 +26,15 @@ impl<O, B, R, L> ExtractService<O, B, R, L> {
         project_opener: O,
         built_in_extraction: B,
         rules_extraction: R,
-        lua_extraction: L,
+        lua_extraction: Option<L>,
+        cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             project_opener,
             built_in_extraction,
             rules_extraction,
             lua_extraction,
+            cancellation,
         }
     }
 }
@@ -47,6 +49,9 @@ where
     type Error = ExtractServiceError<O::Error, B::Error, R::Error, L::Error>;
 
     async fn execute(&self, input: ExtractInput) -> Result<ExtractOutput, Self::Error> {
+        self.cancellation
+            .check()
+            .map_err(ExtractServiceError::Cancelled)?;
         let ExtractInput { name, selection } = input;
         let (builtin, rules_path, lua_script) = selection.into_parts();
         let project = self
@@ -54,12 +59,18 @@ where
             .open(&name)
             .await
             .map_err(ExtractServiceError::OpenProject)?;
+        self.cancellation
+            .check()
+            .map_err(ExtractServiceError::Cancelled)?;
 
         if builtin {
             self.built_in_extraction
                 .refresh(&project)
                 .await
                 .map_err(ExtractServiceError::BuiltIn)?;
+            self.cancellation
+                .check()
+                .map_err(ExtractServiceError::Cancelled)?;
         }
 
         if let Some(rules_path) = rules_path {
@@ -71,11 +82,19 @@ where
                     rules_path: error_path,
                     source,
                 })?;
+            self.cancellation
+                .check()
+                .map_err(ExtractServiceError::Cancelled)?;
         }
 
         if let Some(script_path) = lua_script {
+            self.cancellation
+                .check()
+                .map_err(ExtractServiceError::Cancelled)?;
             let error_path = script_path.clone();
             self.lua_extraction
+                .as_ref()
+                .ok_or(ExtractServiceError::MissingLuaDependency)?
                 .run(&project, script_path)
                 .await
                 .map_err(|source| ExtractServiceError::Lua {
@@ -84,6 +103,10 @@ where
                 })?;
         }
 
+        self.cancellation
+            .check()
+            .map_err(ExtractServiceError::Cancelled)?;
+
         Ok(ExtractOutput { name })
     }
 }
@@ -91,9 +114,11 @@ where
 /// 提取用例在四个直接依赖边界上遇到的阶段失败。
 #[derive(Debug)]
 pub(crate) enum ExtractServiceError<OE, BE, RE, LE> {
+    Cancelled(OperationCancelled),
     OpenProject(OE),
     BuiltIn(BE),
     Rules { rules_path: PathBuf, source: RE },
+    MissingLuaDependency,
     Lua { script_path: PathBuf, source: LE },
 }
 
@@ -106,10 +131,14 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
             Self::OpenProject(source) => write!(formatter, "打开项目失败：{source}"),
             Self::BuiltIn(source) => write!(formatter, "内置提取失败：{source}"),
             Self::Rules { rules_path, source } => {
                 write!(formatter, "规则提取失败 {}：{source}", rules_path.display())
+            }
+            Self::MissingLuaDependency => {
+                formatter.write_str("本次选择了 Lua 提取，但未构造 Lua Runtime")
             }
             Self::Lua {
                 script_path,
@@ -132,9 +161,11 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
             Self::OpenProject(source) => Some(source),
             Self::BuiltIn(source) => Some(source),
             Self::Rules { source, .. } => Some(source),
+            Self::MissingLuaDependency => None,
             Self::Lua { source, .. } => Some(source),
         }
     }
@@ -172,6 +203,7 @@ mod tests {
     struct FakeOpener {
         events: Arc<Mutex<Vec<Event>>>,
         fail: bool,
+        cancel: Option<CooperativeCancellation>,
     }
 
     impl ExistingProjectOpener for FakeOpener {
@@ -182,6 +214,9 @@ mod tests {
                 .lock()
                 .expect("事件锁不应中毒")
                 .push(Event::Open);
+            if let Some(cancellation) = &self.cancel {
+                cancellation.request();
+            }
             if self.fail {
                 return Err(FakeError("open"));
             }
@@ -262,6 +297,7 @@ mod tests {
             FakeOpener {
                 events: Arc::clone(&events),
                 fail: failing_stage == Some("open"),
+                cancel: None,
             },
             FakeBuiltIn {
                 events: Arc::clone(&events),
@@ -271,10 +307,11 @@ mod tests {
                 events: Arc::clone(&events),
                 fail: failing_stage == Some("rules"),
             },
-            FakeLua {
+            Some(FakeLua {
                 events,
                 fail: failing_stage == Some("lua"),
-            },
+            }),
+            CooperativeCancellation::default(),
         )
     }
 
@@ -291,6 +328,40 @@ mod tests {
 
     fn project_name() -> ProjectName {
         "alice".parse().expect("项目名应合法")
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_open_prevents_every_extraction_stage() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let cancellation = CooperativeCancellation::default();
+        let service = ExtractService::new(
+            FakeOpener {
+                events: Arc::clone(&events),
+                fail: false,
+                cancel: Some(cancellation.clone()),
+            },
+            FakeBuiltIn {
+                events: Arc::clone(&events),
+                fail: false,
+            },
+            FakeRules {
+                events: Arc::clone(&events),
+                fail: false,
+            },
+            Some(FakeLua {
+                events: Arc::clone(&events),
+                fail: false,
+            }),
+            cancellation,
+        );
+
+        let error = service
+            .execute(input(true, Some("rules.json"), Some("translate.lua")))
+            .await
+            .expect_err("取消后不得启动提取阶段");
+
+        assert!(matches!(error, ExtractServiceError::Cancelled(_)));
+        assert_eq!(*events.lock().expect("事件锁不应中毒"), [Event::Open]);
     }
 
     fn input(builtin: bool, rules: Option<&str>, lua: Option<&str>) -> ExtractInput {

@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "Lua WriteBack 尚未接入生产组合根")]
-
 //! 把已经发布的 Standard 输出交给共享可信 Lua Host。
 
 use std::error::Error;
@@ -119,7 +117,7 @@ mod tests {
 
     use super::*;
     use crate::att_mz::ProjectName;
-    use crate::att_mz::lua::{LuaPhase, LuaProjectFileAccess};
+    use crate::att_mz::lua::LuaPhase;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct RecordedInvocation {
@@ -210,10 +208,6 @@ mod tests {
             invocation.project.output_root(),
             Some(Path::new("C:/projects/alice/write_back"))
         );
-        assert!(matches!(
-            invocation.project.file_access(),
-            LuaProjectFileAccess::PublishedWriteBack { .. }
-        ));
         assert_eq!(
             invocation.project.database_path(),
             Path::new("C:/projects/alice/project.db")

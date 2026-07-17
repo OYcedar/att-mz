@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "提取快照模型尚未接入生产存储适配器")]
-
 //! MZ 固定提取与规则提取共用的复合文本快照模型。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,6 +102,7 @@ impl BuiltinSnapshot {
         normalize_groups(groups).map(Self)
     }
 
+    #[cfg(test)]
     pub(crate) fn groups(&self) -> &[ExtractedTextGroup] {
         &self.0
     }
@@ -126,6 +125,7 @@ impl RulesSnapshot {
         Self(Vec::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn groups(&self) -> &[ExtractedTextGroup] {
         &self.0
     }

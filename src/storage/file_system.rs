@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "环境根尚未接入生产组合根")]
-
 //! 文件系统能力契约。
 
 use std::error::Error;
@@ -140,11 +138,6 @@ impl ReadFile {
         &self.resolved_path
     }
 
-    /// 返回文件的原始字节。
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
     /// 取出文件的原始字节。
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.bytes
@@ -265,7 +258,16 @@ impl DirectoryFileOverlay {
     }
 }
 
-/// 一次原子目录发布的候选准备请求。
+/// 目录候选准备完成后允许执行的唯一发布意图。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryPublishIntent {
+    /// 目标必须尚不存在，并在同名并发中保证至多一个发布者成功。
+    CreateNew,
+    /// 目标必须是现存目录，并被候选整体替换。
+    ReplaceExisting,
+}
+
+/// 一次可恢复目录发布的候选准备请求。
 ///
 /// 来源映射构成冻结子树，文件覆盖必须位于某棵来源子树中，
 /// `empty_directories` 则要求候选中至少存在这些目录。暂存位置、复制策略、
@@ -273,6 +275,7 @@ impl DirectoryFileOverlay {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryStageRequest {
     target_root: PathBuf,
+    publish_intent: DirectoryPublishIntent,
     source_mappings: Vec<DirectorySourceMapping>,
     overlays: Vec<DirectoryFileOverlay>,
     empty_directories: Vec<PathBuf>,
@@ -281,6 +284,7 @@ pub(crate) struct DirectoryStageRequest {
 impl DirectoryStageRequest {
     pub(crate) fn new(
         target_root: PathBuf,
+        publish_intent: DirectoryPublishIntent,
         source_mappings: Vec<DirectorySourceMapping>,
         overlays: Vec<DirectoryFileOverlay>,
         empty_directories: Vec<PathBuf>,
@@ -358,6 +362,7 @@ impl DirectoryStageRequest {
 
         Ok(Self {
             target_root,
+            publish_intent,
             source_mappings,
             overlays,
             empty_directories,
@@ -366,6 +371,10 @@ impl DirectoryStageRequest {
 
     pub(crate) fn target_root(&self) -> &Path {
         &self.target_root
+    }
+
+    pub(crate) fn publish_intent(&self) -> DirectoryPublishIntent {
+        self.publish_intent
     }
 
     pub(crate) fn source_mappings(&self) -> &[DirectorySourceMapping] {
@@ -512,15 +521,22 @@ impl Error for DirectoryStageRequestError {}
 pub(crate) struct StagedDirectory<T> {
     target_root: PathBuf,
     staging_root: PathBuf,
+    publish_intent: DirectoryPublishIntent,
     state: T,
 }
 
 impl<T> StagedDirectory<T> {
     /// 根实现在准备成功后建立所有权 token。
-    pub(crate) fn new(target_root: PathBuf, staging_root: PathBuf, state: T) -> Self {
+    pub(crate) fn new(
+        target_root: PathBuf,
+        staging_root: PathBuf,
+        publish_intent: DirectoryPublishIntent,
+        state: T,
+    ) -> Self {
         Self {
             target_root,
             staging_root,
+            publish_intent,
             state,
         }
     }
@@ -533,8 +549,23 @@ impl<T> StagedDirectory<T> {
         &self.staging_root
     }
 
-    pub(crate) fn into_parts(self) -> (PathBuf, PathBuf, T) {
-        (self.target_root, self.staging_root, self.state)
+    #[cfg(test)]
+    pub(crate) fn publish_intent(&self) -> DirectoryPublishIntent {
+        self.publish_intent
+    }
+
+    /// 仅供创建 token 的根在交付失败时标记清理责任。
+    pub(crate) fn state_mut(&mut self) -> &mut T {
+        &mut self.state
+    }
+
+    pub(crate) fn into_parts(self) -> (PathBuf, PathBuf, DirectoryPublishIntent, T) {
+        (
+            self.target_root,
+            self.staging_root,
+            self.publish_intent,
+            self.state,
+        )
     }
 }
 
@@ -553,16 +584,14 @@ impl<E> StagingCleanupFailure<E> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn residual_path(&self) -> &Path {
         &self.residual_path
     }
 
+    #[cfg(test)]
     pub(crate) fn source(&self) -> &E {
         &self.source
-    }
-
-    pub(crate) fn into_source(self) -> E {
-        self.source
     }
 }
 
@@ -591,7 +620,9 @@ where
 
 /// 准备目录候选时的已知未发布终态。
 #[derive(Debug)]
-pub(crate) enum AtomicDirectoryPrepareError<E> {
+pub(crate) enum DirectoryPrepareError<E> {
+    /// 本次操作尚未接管任何副作用。
+    NotAttempted { target_root: PathBuf, source: E },
     NotPrepared {
         target_root: PathBuf,
         source: E,
@@ -599,12 +630,20 @@ pub(crate) enum AtomicDirectoryPrepareError<E> {
     },
 }
 
-impl<E> fmt::Display for AtomicDirectoryPrepareError<E>
+impl<E> fmt::Display for DirectoryPrepareError<E>
 where
     E: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotAttempted {
+                target_root,
+                source,
+            } => write!(
+                formatter,
+                "目录候选尚未开始准备（目标：{}）：{source}",
+                target_root.display()
+            ),
             Self::NotPrepared {
                 target_root,
                 source,
@@ -621,29 +660,20 @@ where
     }
 }
 
-impl<E> Error for AtomicDirectoryPrepareError<E>
+impl<E> Error for DirectoryPrepareError<E>
 where
     E: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::NotPrepared { source, .. } => Some(source),
+            Self::NotAttempted { source, .. } | Self::NotPrepared { source, .. } => Some(source),
         }
     }
 }
 
-/// 已准备目录候选的发布方式。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DirectoryPublishMode {
-    /// 目标必须尚不存在，并在同名并发中保证至多一个发布者成功。
-    CreateNew,
-    /// 目标必须是现存目录，并被候选整体替换。
-    Replace,
-}
-
 /// 根实现终结一次目录发布时的可观测终态。
 #[derive(Debug)]
-pub(crate) enum AtomicDirectoryPublishError<E> {
+pub(crate) enum DirectoryPublishError<E> {
     TargetAlreadyExists {
         target_root: PathBuf,
         cleanup_failure: Option<StagingCleanupFailure<E>>,
@@ -656,6 +686,12 @@ pub(crate) enum AtomicDirectoryPublishError<E> {
         target_root: PathBuf,
         cleanup_failure: Option<StagingCleanupFailure<E>>,
     },
+    /// 根在接管交换副作用前拒绝本次发布。
+    NotAttempted {
+        target_root: PathBuf,
+        source: E,
+        cleanup_failure: Option<StagingCleanupFailure<E>>,
+    },
     /// 候选没有成为目标，调用方可继续信任原目标。
     NotPublished {
         target_root: PathBuf,
@@ -663,9 +699,15 @@ pub(crate) enum AtomicDirectoryPublishError<E> {
         cleanup_failure: Option<StagingCleanupFailure<E>>,
     },
     /// 候选已经成为目标，但旧备份或其他恢复产物未能清理。
-    PublishedButCleanupFailed {
+    PublishedWithResiduals {
         target_root: PathBuf,
         residual_path: PathBuf,
+        source: E,
+    },
+    /// 目标暂时缺失，但旧目录与候选身份仍然确定，后续同目标操作可以恢复。
+    RecoveryRequired {
+        target_root: PathBuf,
+        recovery_artifacts: Vec<PathBuf>,
         source: E,
     },
     /// 交换与恢复均发生故障，目标当前内容无法确定。
@@ -676,7 +718,7 @@ pub(crate) enum AtomicDirectoryPublishError<E> {
     },
 }
 
-impl<E> fmt::Display for AtomicDirectoryPublishError<E>
+impl<E> fmt::Display for DirectoryPublishError<E>
 where
     E: fmt::Display,
 {
@@ -703,6 +745,18 @@ where
                 write!(formatter, "目录发布目标不是目录：{}", target_root.display())?;
                 write_cleanup_failure(formatter, cleanup_failure.as_ref())
             }
+            Self::NotAttempted {
+                target_root,
+                source,
+                cleanup_failure,
+            } => {
+                write!(
+                    formatter,
+                    "目录候选尚未开始发布（目标：{}）：{source}",
+                    target_root.display()
+                )?;
+                write_cleanup_failure(formatter, cleanup_failure.as_ref())
+            }
             Self::NotPublished {
                 target_root,
                 source,
@@ -715,7 +769,7 @@ where
                 )?;
                 write_cleanup_failure(formatter, cleanup_failure.as_ref())
             }
-            Self::PublishedButCleanupFailed {
+            Self::PublishedWithResiduals {
                 target_root,
                 residual_path,
                 source,
@@ -724,6 +778,16 @@ where
                 "目录候选已发布到 {}，但无法清理恢复产物 {}：{source}",
                 target_root.display(),
                 residual_path.display()
+            ),
+            Self::RecoveryRequired {
+                target_root,
+                recovery_artifacts,
+                source,
+            } => write!(
+                formatter,
+                "目录发布需要继续恢复（目标：{}，恢复产物：{}）：{source}",
+                target_root.display(),
+                display_paths(recovery_artifacts)
             ),
             Self::OutcomeUnknown {
                 target_root,
@@ -739,7 +803,7 @@ where
     }
 }
 
-impl<E> Error for AtomicDirectoryPublishError<E>
+impl<E> Error for DirectoryPublishError<E>
 where
     E: Error + 'static,
 {
@@ -753,11 +817,15 @@ where
             }
             | Self::TargetNotDirectory {
                 cleanup_failure, ..
+            }
+            | Self::NotAttempted {
+                cleanup_failure, ..
             } => cleanup_failure
                 .as_ref()
                 .map(|failure| failure as &(dyn Error + 'static)),
             Self::NotPublished { source, .. }
-            | Self::PublishedButCleanupFailed { source, .. }
+            | Self::PublishedWithResiduals { source, .. }
+            | Self::RecoveryRequired { source, .. }
             | Self::OutcomeUnknown { source, .. } => Some(source),
         }
     }
@@ -789,12 +857,12 @@ fn display_paths(paths: &[PathBuf]) -> String {
 
 /// 主动丢弃目录候选时的清理失败。
 #[derive(Debug)]
-pub(crate) struct AtomicDirectoryDiscardError<E> {
+pub(crate) struct DirectoryDiscardError<E> {
     staging_root: PathBuf,
     source: E,
 }
 
-impl<E> AtomicDirectoryDiscardError<E> {
+impl<E> DirectoryDiscardError<E> {
     pub(crate) fn new(staging_root: PathBuf, source: E) -> Self {
         Self {
             staging_root,
@@ -802,20 +870,18 @@ impl<E> AtomicDirectoryDiscardError<E> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn staging_root(&self) -> &Path {
         &self.staging_root
     }
 
+    #[cfg(test)]
     pub(crate) fn source(&self) -> &E {
         &self.source
     }
-
-    pub(crate) fn into_source(self) -> E {
-        self.source
-    }
 }
 
-impl<E> fmt::Display for AtomicDirectoryDiscardError<E>
+impl<E> fmt::Display for DirectoryDiscardError<E>
 where
     E: fmt::Display,
 {
@@ -829,7 +895,7 @@ where
     }
 }
 
-impl<E> Error for AtomicDirectoryDiscardError<E>
+impl<E> Error for DirectoryDiscardError<E>
 where
     E: Error + 'static,
 {
@@ -838,12 +904,12 @@ where
     }
 }
 
-/// 在目标同级准备并原子发布完整目录的环境根能力。
+/// 在目标同级准备并可恢复地发布完整目录的环境根能力。
 ///
 /// `prepare` 必须限制递归复制资源，拒绝符号链接与 reparse point，并且不改变
 /// 最终目标。`publish` 必须对同一目标线性化，并将交换、恢复与清理收敛为一个
 /// 明确终态。所有操作一旦开始产生副作用，调用方必须等待 future 完成。
-pub(crate) trait AtomicDirectoryPublisher: Send + Sync {
+pub(crate) trait RecoverableDirectoryPublisher: Send + Sync {
     type Error: Error + Send + Sync + 'static;
     type StagingState: Send + 'static;
 
@@ -851,22 +917,18 @@ pub(crate) trait AtomicDirectoryPublisher: Send + Sync {
         &self,
         request: DirectoryStageRequest,
     ) -> impl Future<
-        Output = Result<
-            StagedDirectory<Self::StagingState>,
-            AtomicDirectoryPrepareError<Self::Error>,
-        >,
+        Output = Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>>,
     > + Send;
 
     fn publish(
         &self,
         staged: StagedDirectory<Self::StagingState>,
-        mode: DirectoryPublishMode,
-    ) -> impl Future<Output = Result<(), AtomicDirectoryPublishError<Self::Error>>> + Send;
+    ) -> impl Future<Output = Result<(), DirectoryPublishError<Self::Error>>> + Send;
 
     fn discard(
         &self,
         staged: StagedDirectory<Self::StagingState>,
-    ) -> impl Future<Output = Result<(), AtomicDirectoryDiscardError<Self::Error>>> + Send;
+    ) -> impl Future<Output = Result<(), DirectoryDiscardError<Self::Error>>> + Send;
 }
 
 #[cfg(test)]
@@ -887,6 +949,7 @@ mod directory_stage_tests {
     fn stage_request_keeps_all_validated_candidate_parts() {
         let request = DirectoryStageRequest::new(
             PathBuf::from("C:/projects/demo/write_back"),
+            DirectoryPublishIntent::ReplaceExisting,
             vec![
                 mapping("C:/projects/demo/source/data", "data"),
                 mapping("C:/projects/demo/source/js", "js"),
@@ -931,6 +994,7 @@ mod directory_stage_tests {
             assert!(matches!(
                 DirectoryStageRequest::new(
                     PathBuf::from("out"),
+                    DirectoryPublishIntent::CreateNew,
                     vec![mapping("source", "source")],
                     Vec::new(),
                     vec![PathBuf::from(path)],
@@ -949,6 +1013,7 @@ mod directory_stage_tests {
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::new(),
+                DirectoryPublishIntent::CreateNew,
                 vec![mapping("source", "data")],
                 Vec::new(),
                 Vec::new(),
@@ -956,7 +1021,13 @@ mod directory_stage_tests {
             Err(DirectoryStageRequestError::EmptyTargetRoot)
         ));
         assert!(matches!(
-            DirectoryStageRequest::new(PathBuf::from("out"), Vec::new(), Vec::new(), Vec::new(),),
+            DirectoryStageRequest::new(
+                PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
             Err(DirectoryStageRequestError::EmptySourceMappings)
         ));
     }
@@ -966,6 +1037,7 @@ mod directory_stage_tests {
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
                 vec![
                     mapping("source/data", "data"),
                     mapping("source/maps", "data/maps")
@@ -978,6 +1050,7 @@ mod directory_stage_tests {
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
                 vec![mapping("source/data", "data")],
                 vec![overlay("data/Items.json"), overlay("data/Items.json")],
                 Vec::new(),
@@ -987,6 +1060,7 @@ mod directory_stage_tests {
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
                 vec![mapping("source/data", "data")],
                 Vec::new(),
                 vec![PathBuf::from("empty"), PathBuf::from("empty/child")],
@@ -996,6 +1070,7 @@ mod directory_stage_tests {
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
                 vec![mapping("source/data", "data")],
                 Vec::new(),
                 vec![PathBuf::from("data/empty")],
@@ -1005,6 +1080,7 @@ mod directory_stage_tests {
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
                 vec![mapping("source/data", "data")],
                 vec![overlay("data/Items.json")],
                 vec![PathBuf::from("data/Items.json/child")],
@@ -1018,6 +1094,7 @@ mod directory_stage_tests {
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
                 vec![mapping("source/data", "data")],
                 vec![overlay("js/plugins.js")],
                 Vec::new(),
@@ -1027,6 +1104,7 @@ mod directory_stage_tests {
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
                 vec![mapping("source/data", "data")],
                 vec![overlay("data")],
                 Vec::new(),
@@ -1040,6 +1118,7 @@ mod directory_stage_tests {
         let staged = StagedDirectory::new(
             PathBuf::from("target"),
             PathBuf::from("target.stage"),
+            DirectoryPublishIntent::ReplaceExisting,
             42_u8,
         );
 
@@ -1047,24 +1126,30 @@ mod directory_stage_tests {
         assert_eq!(staged.staging_root(), Path::new("target.stage"));
         assert_eq!(
             staged.into_parts(),
-            (PathBuf::from("target"), PathBuf::from("target.stage"), 42)
+            (
+                PathBuf::from("target"),
+                PathBuf::from("target.stage"),
+                DirectoryPublishIntent::ReplaceExisting,
+                42
+            )
         );
     }
 
     struct SendContractPublisher;
 
-    impl AtomicDirectoryPublisher for SendContractPublisher {
+    impl RecoverableDirectoryPublisher for SendContractPublisher {
         type Error = Infallible;
         type StagingState = ();
 
         async fn prepare(
             &self,
             request: DirectoryStageRequest,
-        ) -> Result<StagedDirectory<Self::StagingState>, AtomicDirectoryPrepareError<Self::Error>>
+        ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>>
         {
             Ok(StagedDirectory::new(
                 request.target_root().to_path_buf(),
                 PathBuf::from("stage"),
+                request.publish_intent(),
                 (),
             ))
         }
@@ -1072,15 +1157,14 @@ mod directory_stage_tests {
         async fn publish(
             &self,
             _staged: StagedDirectory<Self::StagingState>,
-            _mode: DirectoryPublishMode,
-        ) -> Result<(), AtomicDirectoryPublishError<Self::Error>> {
+        ) -> Result<(), DirectoryPublishError<Self::Error>> {
             Ok(())
         }
 
         async fn discard(
             &self,
             _staged: StagedDirectory<Self::StagingState>,
-        ) -> Result<(), AtomicDirectoryDiscardError<Self::Error>> {
+        ) -> Result<(), DirectoryDiscardError<Self::Error>> {
             Ok(())
         }
     }
@@ -1092,6 +1176,7 @@ mod directory_stage_tests {
         let publisher = SendContractPublisher;
         let request = DirectoryStageRequest::new(
             PathBuf::from("target"),
+            DirectoryPublishIntent::CreateNew,
             vec![mapping("source", "data")],
             Vec::new(),
             Vec::new(),
@@ -1099,13 +1184,16 @@ mod directory_stage_tests {
         .expect("测试准备请求应该合法");
 
         assert_send(publisher.prepare(request));
-        assert_send(publisher.publish(
-            StagedDirectory::new(PathBuf::from("target"), PathBuf::from("stage"), ()),
-            DirectoryPublishMode::CreateNew,
-        ));
+        assert_send(publisher.publish(StagedDirectory::new(
+            PathBuf::from("target"),
+            PathBuf::from("stage"),
+            DirectoryPublishIntent::CreateNew,
+            (),
+        )));
         assert_send(publisher.discard(StagedDirectory::new(
             PathBuf::from("target"),
             PathBuf::from("stage"),
+            DirectoryPublishIntent::CreateNew,
             (),
         )));
     }
@@ -1130,15 +1218,15 @@ mod directory_stage_tests {
             ))
         };
         let errors = [
-            AtomicDirectoryPublishError::TargetAlreadyExists {
+            DirectoryPublishError::TargetAlreadyExists {
                 target_root: PathBuf::from("target"),
                 cleanup_failure: cleanup(),
             },
-            AtomicDirectoryPublishError::TargetMissing {
+            DirectoryPublishError::TargetMissing {
                 target_root: PathBuf::from("target"),
                 cleanup_failure: cleanup(),
             },
-            AtomicDirectoryPublishError::TargetNotDirectory {
+            DirectoryPublishError::TargetNotDirectory {
                 target_root: PathBuf::from("target"),
                 cleanup_failure: cleanup(),
             },
@@ -1155,7 +1243,7 @@ mod directory_stage_tests {
             );
         }
 
-        let error = AtomicDirectoryPublishError::NotPublished {
+        let error = DirectoryPublishError::NotPublished {
             target_root: PathBuf::from("target"),
             source: TestError("swap failed"),
             cleanup_failure: cleanup(),
@@ -1169,7 +1257,7 @@ mod directory_stage_tests {
 
     #[test]
     fn terminal_errors_report_published_and_unknown_outcomes_without_collapsing_them() {
-        let published = AtomicDirectoryPublishError::PublishedButCleanupFailed {
+        let published = DirectoryPublishError::PublishedWithResiduals {
             target_root: PathBuf::from("target"),
             residual_path: PathBuf::from("target.backup"),
             source: TestError("backup cleanup failed"),
@@ -1177,7 +1265,7 @@ mod directory_stage_tests {
         assert!(published.to_string().contains("已发布"));
         assert!(published.to_string().contains("target.backup"));
 
-        let unknown = AtomicDirectoryPublishError::OutcomeUnknown {
+        let unknown = DirectoryPublishError::OutcomeUnknown {
             target_root: PathBuf::from("target"),
             recovery_artifacts: vec![
                 PathBuf::from("target.stage"),
@@ -1197,7 +1285,7 @@ mod directory_stage_tests {
 
     #[test]
     fn prepare_and_discard_errors_keep_the_exact_residual_paths() {
-        let prepare = AtomicDirectoryPrepareError::NotPrepared {
+        let prepare = DirectoryPrepareError::NotPrepared {
             target_root: PathBuf::from("target"),
             source: TestError("copy failed"),
             cleanup_failure: Some(StagingCleanupFailure::new(
@@ -1211,10 +1299,8 @@ mod directory_stage_tests {
             Some("copy failed".to_owned())
         );
 
-        let discard = AtomicDirectoryDiscardError::new(
-            PathBuf::from("target.stage"),
-            TestError("delete failed"),
-        );
+        let discard =
+            DirectoryDiscardError::new(PathBuf::from("target.stage"), TestError("delete failed"));
         assert_eq!(discard.staging_root(), Path::new("target.stage"));
         assert_eq!(discard.source().0, "delete failed");
         assert!(discard.to_string().contains("target.stage"));

@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "占位符服务等待 Planner 生产装配")]
-
 //! MZ 内置控制符与用户 PCRE2 规则的语义化保护。
 
 use std::error::Error;
@@ -27,6 +25,7 @@ pub(crate) struct PlaceholderRuleDefinition {
 }
 
 impl PlaceholderRuleDefinition {
+    #[cfg(test)]
     pub(crate) fn new(
         scopes: Vec<String>,
         pattern: impl Into<String>,
@@ -58,6 +57,7 @@ impl fmt::Debug for CompiledPlaceholderRules {
 }
 
 impl CompiledPlaceholderRules {
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             rules: Arc::new(Vec::new()),

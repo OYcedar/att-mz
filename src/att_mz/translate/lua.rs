@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "Lua 翻译 Host 尚未接入生产组合根")]
-
 use std::error::Error;
 use std::fmt;
 use std::future::Future;

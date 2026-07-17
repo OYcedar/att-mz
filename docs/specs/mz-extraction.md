@@ -1,8 +1,7 @@
 # MZ 文本提取现行规格
 
-本文记录已经确认并落地的 MZ 提取行为。它描述当前外部意图、标准资产模型、并发与
-资源配置，以及已经实现到哪一层。文件系统、CPU、SQLite 与 Lua 的生产根适配器仍
-不属于当前实现。
+本文记录已经确认并落地的 MZ 提取行为，包括外部意图、标准资产模型、并发与资源
+配置，以及文件系统、CPU、SQLite 与 Lua 生产根组成的完整执行边界。
 
 ## 1. 一次调用与执行顺序
 
@@ -286,10 +285,10 @@ Lua 是用户明确选择并完全信任的本机程序，不建立沙箱。Rust
 使用同一个项目数据库并注入 `ctx.db`，不会重新访问原游戏目录。
 
 Lua 自己拥有 schema、数据身份、译文继承、事务划分和跨阶段协议。Rust 不扫描、
-解释、迁移或默认消费 Lua 产物；没有相应阶段的 Lua 脚本时，标准翻译和写回不会
+解释、转换或默认消费 Lua 产物；没有相应阶段的 Lua 脚本时，标准翻译和写回不会
 自动消费这些产物。宿主也不隐式把整个脚本包进一个长事务。
 
-## 9. 当前实现依赖树
+## 9. 生产依赖树
 
 ```mermaid
 flowchart TD
@@ -299,49 +298,46 @@ flowchart TD
     ES --> LS["LuaExtractionService"]
 
     OS --> PR["ProjectDatabaseRecordReadingService"]
-    OS --> EDR["ExistingDirectoryResolver · 根接口<br/>确认 source/data 与 source/js"]
-    PR --> SQ["SqliteQueryExecutor · 根接口"]
+    OS --> EDR["SystemFileSystem<br/>ExistingDirectoryResolver"]
+    PR --> SQ["RusqliteStorage<br/>SqliteQueryExecutor"]
 
     BS --> DR["MzProjectDocumentReadingService"]
     RS --> DR
-    RS --> FR["FileReader · 根接口"]
+    RS --> FR["SystemFileSystem<br/>FileReader"]
     DR --> FR
-    DR --> DL["DirectoryLister · 根接口"]
-    DR --> CPU["CpuTaskExecutor · 根接口"]
+    DR --> DL["SystemFileSystem<br/>DirectoryLister"]
+    DR --> CPU["BoundedCpuExecutor<br/>CpuTaskExecutor"]
 
     BS --> STORE["MzExtractionAssetStore"]
     RS --> STORE
     BS --> CPU
     RS --> CPU
     STORE --> CPU
-    STORE --> ST["SqliteTransactionExecutor · 根接口"]
+    STORE --> ST["RusqliteStorage<br/>SqliteTransactionExecutor"]
     STORE --> LC["MzLocationCodec · 内部纯函数"]
 
-    LS --> LUA["TrustedLuaExecutionHost · 根接口"]
+    LS --> HOST["TrustedLuaExecutionHostingService"]
+    HOST --> LUA["TrustedLua54Runtime<br/>TrustedLuaRuntimeExecutor"]
+    HOST --> SESSION["RusqliteStorage<br/>SqliteInteractiveSessionFactory"]
+    HOST --> FR
 ```
 
-图中 Service 均已有实现和测试。`BuiltInSnapshotStore`、`RulesSnapshotStore` 与
+图中每个业务 Service 都已有实现和测试。`BuiltInSnapshotStore`、`RulesSnapshotStore` 与
 `MzProjectDocumentReader` 仍是上层消费契约，但已经分别由
-`MzExtractionAssetStore` 和 `MzProjectDocumentReadingService` 实现，不再是树的
-未实现叶子。
+`MzExtractionAssetStore` 和 `MzProjectDocumentReadingService` 实现。
 
 ## 10. 当前完成边界
 
 `ExtractService`、项目开启、Builtin、Rules、Lua、项目数据库记录读取、MZ 文档读取
-和标准资产 Store 的业务实现已经收束到七个根能力：
+和标准资产 Store 通过以下生产根运行：
 
 ```text
-ExistingDirectoryResolver
-FileReader
-DirectoryLister
-CpuTaskExecutor
-SqliteQueryExecutor
-SqliteTransactionExecutor
-TrustedLuaExecutionHost
+SystemFileSystem
+BoundedCpuExecutor
+RusqliteStorage
+TrustedLua54Runtime  // 只在显式 --lua 时构造
 ```
 
-这七个根能力目前只有接口和测试替身，没有生产实现或组合根。因此当前可以确认：
-有界调度、稳定合并、快照算法、事务计划和完整 Extract 编排在测试中成立；仍不能
-宣称真实线程池、真实磁盘、真实 SQLite、真实 Lua 或 `att mz extract` 端到端可用。
-根适配器完成后，还必须使用代表性 MZ 游戏验证真实吞吐、背压、线程占用、资源释放
-和 SQLite 连接策略。
+`ProductionMzCommandRunner` 仅为当前 Extract 命令构造这些根。程序以固定顺序
+终结 Lua job 与交互会话、SQLite actor、文件工作队列和 CPU 工作线程；
+只有命令与全部 shutdown 都成功后才输出“提取完成”。

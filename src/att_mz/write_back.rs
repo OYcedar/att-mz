@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "WriteBack 用例尚未接入生产组合根")]
-
 //! MZ 数据库译文写回冻结项目副本的顶层编排。
 
 use std::error::Error;
@@ -9,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::ProjectName;
 use super::project::{ExistingProjectOpener, MzWriteBackLayoutProfile, OpenedProject};
+use crate::execution::{CooperativeCancellation, OperationCancelled};
 
 pub(crate) mod asset_reader;
 pub(crate) mod lua;
@@ -96,10 +95,6 @@ impl PublishedWriteBack {
             && self.output_root == project.write_back_root()
     }
 
-    pub(crate) fn project_name(&self) -> &ProjectName {
-        &self.project_name
-    }
-
     pub(crate) fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
@@ -165,15 +160,22 @@ pub(crate) trait LuaWriteBack: Send + Sync {
 pub(crate) struct WriteBackService<O, S, L> {
     project_opener: O,
     standard_write_back: S,
-    lua_write_back: L,
+    lua_write_back: Option<L>,
+    cancellation: CooperativeCancellation,
 }
 
 impl<O, S, L> WriteBackService<O, S, L> {
-    pub(crate) fn new(project_opener: O, standard_write_back: S, lua_write_back: L) -> Self {
+    pub(crate) fn new(
+        project_opener: O,
+        standard_write_back: S,
+        lua_write_back: Option<L>,
+        cancellation: CooperativeCancellation,
+    ) -> Self {
         Self {
             project_opener,
             standard_write_back,
             lua_write_back,
+            cancellation,
         }
     }
 }
@@ -187,12 +189,18 @@ where
     type Error = WriteBackServiceError<O::Error, S::Error, L::Error>;
 
     async fn execute(&self, input: WriteBackInput) -> Result<WriteBackOutput, Self::Error> {
+        self.cancellation
+            .check()
+            .map_err(WriteBackServiceError::Cancelled)?;
         let WriteBackInput { name, lua_script } = input;
         let project = self
             .project_opener
             .open(&name)
             .await
             .map_err(WriteBackServiceError::OpenProject)?;
+        self.cancellation
+            .check()
+            .map_err(WriteBackServiceError::Cancelled)?;
 
         let report = self
             .standard_write_back
@@ -202,9 +210,15 @@ where
         let (published, standard) = report.into_parts();
         let output_root = published.output_root().to_path_buf();
 
+        self.cancellation
+            .check()
+            .map_err(WriteBackServiceError::Cancelled)?;
+
         let lua_executed = if let Some(script_path) = lua_script {
             let error_script_path = script_path.clone();
             self.lua_write_back
+                .as_ref()
+                .ok_or(WriteBackServiceError::MissingLuaDependency)?
                 .run(&project, &published, script_path)
                 .await
                 .map_err(|source| WriteBackServiceError::Lua {
@@ -229,8 +243,10 @@ where
 /// WriteBack 顶层用例在三个直接依赖边界上遇到的阶段失败。
 #[derive(Debug)]
 pub(crate) enum WriteBackServiceError<OE, SE, LE> {
+    Cancelled(OperationCancelled),
     OpenProject(OE),
     Standard(SE),
+    MissingLuaDependency,
     Lua {
         script_path: PathBuf,
         output_root: PathBuf,
@@ -246,8 +262,12 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
             Self::OpenProject(source) => write!(formatter, "打开项目失败：{source}"),
             Self::Standard(source) => write!(formatter, "Standard 写回失败：{source}"),
+            Self::MissingLuaDependency => {
+                formatter.write_str("本次选择了 Lua 写回，但未构造 Lua Runtime")
+            }
             Self::Lua {
                 script_path,
                 output_root,
@@ -270,8 +290,10 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
             Self::OpenProject(source) => Some(source),
             Self::Standard(source) => Some(source),
+            Self::MissingLuaDependency => None,
             Self::Lua { source, .. } => Some(source),
         }
     }
@@ -395,10 +417,11 @@ mod tests {
                 events: Arc::clone(&events),
                 fail: failing_stage == Some("standard"),
             },
-            FakeLuaWriteBack {
+            Some(FakeLuaWriteBack {
                 events,
                 fail: failing_stage == Some("lua"),
-            },
+            }),
+            CooperativeCancellation::default(),
         )
     }
 

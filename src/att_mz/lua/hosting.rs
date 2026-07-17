@@ -2,7 +2,9 @@
 
 use std::error::Error;
 use std::fmt;
+use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::att_mz::translate::executor::{
@@ -16,30 +18,58 @@ use crate::storage::file_system::{FileReader, ReadFileError};
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
 
 use super::runtime::{
-    OwnedLuaProgram, TrustedLuaBindingFinalization, TrustedLuaHostBindings,
-    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor, TrustedLuaRuntimeTermination,
+    OwnedLuaProgram, TrustedLuaBindingFinalization, TrustedLuaBindingFinalizationError,
+    TrustedLuaBindingFinalizer, TrustedLuaHostCallError, TrustedLuaHostCalls,
+    TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor,
+    TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
 };
 use super::session::{
-    OpenSqliteInteractiveSessionError, SqliteInteractiveSession, SqliteInteractiveSessionError,
-    SqliteInteractiveSessionFactory, SqliteInteractiveTransactionState,
+    OpenSqliteInteractiveSessionError, SqliteInteractiveConnectionCloseOutcome,
+    SqliteInteractiveRollbackOutcome, SqliteInteractiveSessionError,
+    SqliteInteractiveSessionFactory, SqliteInteractiveSessionFinalizationReport,
+    SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
+    SqliteInteractiveTransactionObservation,
 };
 use super::{LuaInvocation, LuaPhase, LuaProjectContext, TrustedLuaExecutionHost};
 
 /// 使用四个根能力完成可信 Lua 程序生命周期。
 pub(crate) struct TrustedLuaExecutionHostingService<F, L, R, S> {
     file_reader: F,
-    llm: Arc<L>,
+    llm: LuaLlmCapability<L>,
     runtime: R,
     session_factory: S,
 }
 
 impl<F, L, R, S> TrustedLuaExecutionHostingService<F, L, R, S> {
-    pub(crate) fn new(file_reader: F, llm: L, runtime: R, session_factory: S) -> Self {
+    pub(crate) fn with_llm(file_reader: F, llm: L, runtime: R, session_factory: S) -> Self {
         Self {
             file_reader,
-            llm: Arc::new(llm),
+            llm: LuaLlmCapability::Enabled(Arc::new(llm)),
             runtime,
             session_factory,
+        }
+    }
+
+    pub(crate) fn without_llm(file_reader: F, runtime: R, session_factory: S) -> Self {
+        Self {
+            file_reader,
+            llm: LuaLlmCapability::Disabled(PhantomData),
+            runtime,
+            session_factory,
+        }
+    }
+}
+
+enum LuaLlmCapability<L> {
+    Disabled(PhantomData<fn() -> L>),
+    Enabled(Arc<L>),
+}
+
+impl<L> Clone for LuaLlmCapability<L> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Disabled(_) => Self::Disabled(PhantomData),
+            Self::Enabled(llm) => Self::Enabled(Arc::clone(llm)),
         }
     }
 }
@@ -53,12 +83,7 @@ where
 {
     type TranslationProfile =
         TranslationExecutionProfile<MzTranslationExecutionPayload<L::Profile>>;
-    type Error = TrustedLuaExecutionHostingError<
-        F::Error,
-        S::Error,
-        R::Error,
-        LuaHostBindingError<<S::Session as SqliteInteractiveSession>::Error, L::Error>,
-    >;
+    type Error = TrustedLuaExecutionHostingError<F::Error, S::Error, R::Error>;
 
     async fn execute(
         &self,
@@ -94,8 +119,15 @@ where
             read_file.into_bytes(),
         );
 
+        // 先预留 Runtime 容量，避免在长时间排队期间占用 SQLite 连接。
+        let reservation = self
+            .runtime
+            .reserve()
+            .await
+            .map_err(TrustedLuaExecutionHostingError::ReserveRuntime)?;
+
         let database_path = project.database_path().to_path_buf();
-        let session = self
+        let opened = self
             .session_factory
             .open_existing(database_path.clone())
             .await
@@ -103,15 +135,19 @@ where
                 database_path,
                 source,
             })?;
+        let (operations, finalizer) = opened.into_parts();
 
-        let bindings = Arc::new(LuaHostBindings {
+        let calls: Arc<dyn TrustedLuaHostCalls> = Arc::new(LuaHostCalls {
             phase,
             project,
             profile,
-            session,
-            llm: Arc::clone(&self.llm),
+            operations,
+            llm: self.llm.clone(),
         });
-        let (runtime, finalization) = self.runtime.execute(program, bindings).await.into_parts();
+        let finalizer: Box<dyn TrustedLuaBindingFinalizer> =
+            Box::new(LuaSessionFinalizer { finalizer });
+        let handle = reservation.start(program, TrustedLuaRuntimeBindings::new(calls, finalizer));
+        let (runtime, finalization) = handle.await.into_parts();
 
         match (runtime, finalization) {
             (Ok(()), Ok(finalization)) if finalization.had_active_transaction() => {
@@ -127,24 +163,23 @@ where
     }
 }
 
-struct LuaHostBindings<S, L>
+struct LuaHostCalls<S, L>
 where
+    S: SqliteInteractiveSessionOperations,
     L: LlmRequestExecutor + 'static,
 {
     phase: LuaPhase,
     project: LuaProjectContext,
     profile: Option<Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<L::Profile>>>>,
-    session: S,
-    llm: Arc<L>,
+    operations: Arc<S>,
+    llm: LuaLlmCapability<L>,
 }
 
-impl<S, L> TrustedLuaHostBindings for LuaHostBindings<S, L>
+impl<S, L> TrustedLuaHostCalls for LuaHostCalls<S, L>
 where
-    S: SqliteInteractiveSession,
+    S: SqliteInteractiveSessionOperations,
     L: LlmRequestExecutor + 'static,
 {
-    type Error = LuaHostBindingError<S::Error, L::Error>;
-
     fn phase(&self) -> LuaPhase {
         self.phase
     }
@@ -153,187 +188,251 @@ where
         &self.project
     }
 
-    async fn query(&self, query: SqliteQuery) -> Result<Vec<SqliteRow>, Self::Error> {
-        self.session
-            .query(query)
-            .await
-            .map_err(LuaHostBindingError::Database)
-    }
-
-    async fn execute(&self, command: SqliteCommand) -> Result<u64, Self::Error> {
-        self.session
-            .execute(command)
-            .await
-            .map_err(LuaHostBindingError::Database)
-    }
-
-    async fn begin(&self) -> Result<(), Self::Error> {
-        self.session
-            .begin()
-            .await
-            .map_err(LuaHostBindingError::Database)
-    }
-
-    async fn commit(&self) -> Result<(), Self::Error> {
-        self.session
-            .commit()
-            .await
-            .map_err(LuaHostBindingError::Database)
-    }
-
-    async fn rollback(&self) -> Result<(), Self::Error> {
-        self.session
-            .rollback()
-            .await
-            .map_err(LuaHostBindingError::Database)
-    }
-
-    async fn request_llm(&self, messages: Vec<ChatMessage>) -> Result<LlmResponse, Self::Error> {
-        let profile = self
-            .profile
-            .as_ref()
-            .ok_or(LuaHostBindingError::LlmUnavailable)?;
-        self.llm
-            .request(profile.llm_profile(), &messages)
-            .await
-            .map_err(LuaHostBindingError::LlmRequest)
-    }
-
-    async fn finalize(
+    fn query(
         &self,
-        _termination: TrustedLuaRuntimeTermination,
-    ) -> Result<TrustedLuaBindingFinalization, Self::Error> {
-        let mut failures = Vec::new();
-        let state = match self.session.transaction_state().await {
-            Ok(state) => Some(state),
-            Err(error) => {
-                failures.push(error);
-                None
-            }
+        query: SqliteQuery,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<SqliteRow>, TrustedLuaHostCallError>> + Send + 'static>,
+    > {
+        let operations = Arc::clone(&self.operations);
+        Box::pin(async move { operations.query(query).await.map_err(database_call_error) })
+    }
+
+    fn execute(
+        &self,
+        command: SqliteCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, TrustedLuaHostCallError>> + Send + 'static>> {
+        let operations = Arc::clone(&self.operations);
+        Box::pin(async move {
+            operations
+                .execute(command)
+                .await
+                .map_err(database_call_error)
+        })
+    }
+
+    fn begin(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
+        let operations = Arc::clone(&self.operations);
+        Box::pin(async move { operations.begin().await.map_err(database_call_error) })
+    }
+
+    fn commit(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
+        let operations = Arc::clone(&self.operations);
+        Box::pin(async move { operations.commit().await.map_err(database_call_error) })
+    }
+
+    fn rollback(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
+        let operations = Arc::clone(&self.operations);
+        Box::pin(async move { operations.rollback().await.map_err(database_call_error) })
+    }
+
+    fn request_llm(
+        &self,
+        messages: Vec<ChatMessage>,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, TrustedLuaHostCallError>> + Send + 'static>>
+    {
+        let Some(profile) = self.profile.as_ref().map(Arc::clone) else {
+            return Box::pin(async {
+                Err(TrustedLuaHostCallError::new(
+                    "llm",
+                    "unavailable",
+                    "当前 Lua 阶段没有 ctx.llm",
+                    None,
+                    None,
+                ))
+            });
         };
-        let had_active_transaction = state == Some(SqliteInteractiveTransactionState::Active);
-
-        if had_active_transaction && let Err(error) = self.session.rollback().await {
-            failures.push(error);
-        }
-        if let Err(error) = self.session.close().await {
-            failures.push(error);
-        }
-
-        if failures.is_empty() {
-            Ok(TrustedLuaBindingFinalization::new(had_active_transaction))
-        } else {
-            Err(LuaHostBindingError::Cleanup(LuaSessionCleanupError::new(
-                failures,
-            )))
-        }
+        let LuaLlmCapability::Enabled(llm) = &self.llm else {
+            return Box::pin(async {
+                Err(TrustedLuaHostCallError::new(
+                    "llm",
+                    "unavailable",
+                    "当前 Lua Host 未构造 LLM 能力",
+                    None,
+                    None,
+                ))
+            });
+        };
+        let llm = Arc::clone(llm);
+        Box::pin(async move {
+            llm.request(profile.llm_profile(), &messages)
+                .await
+                .map_err(llm_call_error)
+        })
     }
 }
 
-/// Lua VM 访问 Host 注入能力时的失败。
-#[derive(Debug)]
-pub(crate) enum LuaHostBindingError<S, L> {
-    Database(SqliteInteractiveSessionError<S>),
-    LlmUnavailable,
-    LlmRequest(LlmRequestError<L>),
-    Cleanup(LuaSessionCleanupError<S>),
-}
-
-impl<S, L> fmt::Display for LuaHostBindingError<S, L>
+fn database_call_error<E>(error: SqliteInteractiveSessionError<E>) -> TrustedLuaHostCallError
 where
-    S: fmt::Display,
-    L: fmt::Display,
+    E: Error + Send + Sync + 'static,
 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Database(source) => write!(formatter, "Lua 数据库调用失败：{source}"),
-            Self::LlmUnavailable => formatter.write_str("当前 Lua 阶段没有 ctx.llm"),
-            Self::LlmRequest(source) => write!(formatter, "Lua LLM 调用失败：{source}"),
-            Self::Cleanup(source) => source.fmt(formatter),
-        }
-    }
+    let kind = match &error {
+        SqliteInteractiveSessionError::Closed => "closed",
+        SqliteInteractiveSessionError::Indeterminate => "indeterminate",
+        SqliteInteractiveSessionError::TransactionAlreadyActive => "transaction_already_active",
+        SqliteInteractiveSessionError::NoActiveTransaction => "no_active_transaction",
+        SqliteInteractiveSessionError::OperationFailed(_) => "operation_failed",
+        SqliteInteractiveSessionError::OutcomeUnknown(_) => "outcome_unknown",
+    };
+    let message = error.to_string();
+    TrustedLuaHostCallError::new("sqlite", kind, message, None, Some(Arc::new(error)))
 }
 
-impl<S, L> Error for LuaHostBindingError<S, L>
+fn llm_call_error<E>(error: LlmRequestError<E>) -> TrustedLuaHostCallError
 where
-    S: Error + 'static,
-    L: Error + 'static,
+    E: Error + Send + Sync + 'static,
 {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Database(source) => Some(source),
-            Self::LlmUnavailable => None,
-            Self::LlmRequest(source) => Some(source),
-            Self::Cleanup(source) => Some(source),
-        }
+    let (kind, retry_after_ms) = match &error {
+        LlmRequestError::Retryable { retry_after, .. } => (
+            "retryable",
+            retry_after.map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        ),
+        LlmRequestError::Fatal(_) => ("fatal", None),
+    };
+    let message = error.to_string();
+    TrustedLuaHostCallError::new("llm", kind, message, retry_after_ms, Some(Arc::new(error)))
+}
+
+struct LuaSessionFinalizer<F> {
+    finalizer: F,
+}
+
+impl<F> TrustedLuaBindingFinalizer for LuaSessionFinalizer<F>
+where
+    F: SqliteInteractiveSessionFinalizer,
+{
+    fn finalize(
+        self: Box<Self>,
+        _termination: TrustedLuaRuntimeTermination,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        TrustedLuaBindingFinalization,
+                        TrustedLuaBindingFinalizationError,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async move {
+            let report = self.finalizer.finalize().await;
+            let had_active_transaction = matches!(
+                report.transaction(),
+                SqliteInteractiveTransactionObservation::Active
+            );
+            if sqlite_finalization_succeeded(&report) {
+                Ok(TrustedLuaBindingFinalization::new(had_active_transaction))
+            } else {
+                let failure = SqliteFinalizationFailure { report };
+                Err(TrustedLuaBindingFinalizationError::new(
+                    failure.to_string(),
+                    Some(Arc::new(failure)),
+                ))
+            }
+        })
     }
 }
 
-/// 关闭会话期间可能同时发生的多个错误。
+fn sqlite_finalization_succeeded<E>(
+    report: &SqliteInteractiveSessionFinalizationReport<E>,
+) -> bool {
+    matches!(
+        report.transaction(),
+        SqliteInteractiveTransactionObservation::Idle
+            | SqliteInteractiveTransactionObservation::Active
+    ) && matches!(
+        report.rollback(),
+        SqliteInteractiveRollbackOutcome::NotRequired
+            | SqliteInteractiveRollbackOutcome::RolledBack
+    ) && matches!(
+        report.connection(),
+        SqliteInteractiveConnectionCloseOutcome::Closed
+    )
+}
+
 #[derive(Debug)]
-pub(crate) struct LuaSessionCleanupError<E> {
-    failures: Vec<SqliteInteractiveSessionError<E>>,
+struct SqliteFinalizationFailure<E> {
+    report: SqliteInteractiveSessionFinalizationReport<E>,
 }
 
-impl<E> LuaSessionCleanupError<E> {
-    fn new(failures: Vec<SqliteInteractiveSessionError<E>>) -> Self {
-        debug_assert!(!failures.is_empty());
-        Self { failures }
-    }
-
-    pub(crate) fn failures(&self) -> &[SqliteInteractiveSessionError<E>] {
-        &self.failures
-    }
-}
-
-impl<E> fmt::Display for LuaSessionCleanupError<E>
+impl<E> fmt::Display for SqliteFinalizationFailure<E>
 where
     E: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Lua 数据库会话清理失败")?;
-        for failure in &self.failures {
-            write!(formatter, "；{failure}")?;
+        formatter.write_str("Lua SQLite 会话终结失败：")?;
+        match self.report.transaction() {
+            SqliteInteractiveTransactionObservation::Idle => formatter.write_str("事务空闲")?,
+            SqliteInteractiveTransactionObservation::Active => {
+                formatter.write_str("发现活动事务")?
+            }
+            SqliteInteractiveTransactionObservation::Indeterminate => {
+                formatter.write_str("事务状态不可确定")?
+            }
+            SqliteInteractiveTransactionObservation::Unavailable(error) => {
+                write!(formatter, "无法观测事务（{error}）")?
+            }
         }
-        Ok(())
+        match self.report.rollback() {
+            SqliteInteractiveRollbackOutcome::NotRequired => {}
+            SqliteInteractiveRollbackOutcome::RolledBack => formatter.write_str("；已回滚")?,
+            SqliteInteractiveRollbackOutcome::Failed(error) => {
+                write!(formatter, "；回滚失败（{error}）")?
+            }
+            SqliteInteractiveRollbackOutcome::OutcomeUnknown(error) => {
+                write!(formatter, "；回滚结果未知（{error}）")?
+            }
+            SqliteInteractiveRollbackOutcome::NotAttempted => {
+                formatter.write_str("；未尝试回滚")?
+            }
+        }
+        match self.report.connection() {
+            SqliteInteractiveConnectionCloseOutcome::Closed => formatter.write_str("；连接已关闭"),
+            SqliteInteractiveConnectionCloseOutcome::Failed(error) => {
+                write!(formatter, "；关闭失败（{error}）")
+            }
+            SqliteInteractiveConnectionCloseOutcome::OutcomeUnknown(error) => {
+                write!(formatter, "；关闭结果未知（{error}）")
+            }
+        }
     }
 }
 
-impl<E> Error for LuaSessionCleanupError<E>
-where
-    E: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.failures.first().map(|error| error as _)
-    }
-}
+impl<E> Error for SqliteFinalizationFailure<E> where E: Error + Send + Sync + 'static {}
 
-/// Host 在脚本加载、数据库建立、VM 或收尾阶段遇到的失败。
+/// Host 在脚本加载、Runtime 预留、数据库建立、VM 或收尾阶段遇到的失败。
 #[derive(Debug)]
-pub(crate) enum TrustedLuaExecutionHostingError<F, O, R, B> {
+pub(crate) enum TrustedLuaExecutionHostingError<F, O, R> {
     ReadScript {
         script_path: PathBuf,
         source: ReadFileError<F>,
     },
+    ReserveRuntime(R),
     OpenDatabase {
         database_path: PathBuf,
         source: OpenSqliteInteractiveSessionError<O>,
     },
-    Runtime(TrustedLuaRuntimeExecutionError<R, B>),
-    Cleanup(B),
+    Runtime(TrustedLuaRuntimeExecutionError<R>),
+    Cleanup(TrustedLuaBindingFinalizationError),
     UnclosedTransaction,
     RuntimeAndCleanup {
-        runtime: TrustedLuaRuntimeExecutionError<R, B>,
-        cleanup: B,
+        runtime: TrustedLuaRuntimeExecutionError<R>,
+        cleanup: TrustedLuaBindingFinalizationError,
     },
 }
 
-impl<F, O, R, B> fmt::Display for TrustedLuaExecutionHostingError<F, O, R, B>
+impl<F, O, R> fmt::Display for TrustedLuaExecutionHostingError<F, O, R>
 where
     F: fmt::Display,
     O: fmt::Display,
     R: fmt::Display,
-    B: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -345,6 +444,7 @@ where
                 "无法读取可信 Lua 主程序 {}：{source}",
                 script_path.display()
             ),
+            Self::ReserveRuntime(source) => write!(formatter, "无法预留 Lua 执行容量：{source}"),
             Self::OpenDatabase {
                 database_path,
                 source,
@@ -365,16 +465,16 @@ where
     }
 }
 
-impl<F, O, R, B> Error for TrustedLuaExecutionHostingError<F, O, R, B>
+impl<F, O, R> Error for TrustedLuaExecutionHostingError<F, O, R>
 where
     F: Error + 'static,
     O: Error + 'static,
     R: Error + 'static,
-    B: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ReadScript { source, .. } => Some(source),
+            Self::ReserveRuntime(source) => Some(source),
             Self::OpenDatabase { source, .. } => Some(source),
             Self::Runtime(source) => Some(source),
             Self::Cleanup(source) => Some(source),
@@ -386,23 +486,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-    use std::path::Path;
-    use std::sync::Mutex;
-    use std::time::Duration;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::att_mz::ProjectName;
-    use crate::att_mz::lua::runtime::TrustedLuaRuntimeExecutionReport;
-    use crate::att_mz::translate::executor::{LlmFinishReason, LlmRequestError};
-    use crate::att_mz::translate::profile::{
-        MzTranslationExecutionConfiguration, MzTranslationPlanningConfiguration,
-        TranslationProfileLanguagePair,
+    use crate::att_mz::lua::runtime::{
+        TrustedLuaExecutionHandle, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeReservation,
     };
-    use crate::att_mz::translate::standard::ChatMessageRole;
-    use crate::project_database::StoredProjectRecord;
-    use crate::storage::file_system::{ReadFile, ReadFileError};
-    use crate::storage::sqlite::SqliteValue;
+    use crate::att_mz::lua::session::OpenedSqliteInteractiveSession;
+    use crate::att_mz::project::OpenedProject;
+    use crate::att_mz::translate::executor::{LlmFinishReason, LlmUsage};
+    use crate::storage::file_system::ReadFile;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -415,56 +511,55 @@ mod tests {
 
     impl Error for FakeError {}
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    enum Event {
-        Read(PathBuf),
-        Open(PathBuf),
-        Runtime {
-            script_path: PathBuf,
-            phase: LuaPhase,
-            project_name: String,
-            output_root: Option<PathBuf>,
-        },
-        Llm(Vec<ChatMessage>),
-        Begin,
-        Rollback,
-        Inspect,
-        Close,
+    type Events = Arc<Mutex<Vec<&'static str>>>;
+
+    fn record(events: &Events, event: &'static str) {
+        events.lock().expect("事件锁不应中毒").push(event);
     }
 
     #[derive(Clone)]
     struct FakeFileReader {
-        events: Arc<Mutex<Vec<Event>>>,
+        events: Events,
     }
 
     impl FileReader for FakeFileReader {
         type Error = FakeError;
 
-        async fn read_file(&self, path: PathBuf) -> Result<ReadFile, ReadFileError<Self::Error>> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Read(path));
+        async fn read_file(&self, _path: PathBuf) -> Result<ReadFile, ReadFileError<Self::Error>> {
+            record(&self.events, "read");
             Ok(ReadFile::new(
-                PathBuf::from("C:/resolved/scripts/translate.lua"),
+                PathBuf::from("C:/resolved/main.lua"),
                 b"return true".to_vec(),
             ))
         }
     }
 
-    struct SessionState {
-        transaction: SqliteInteractiveTransactionState,
-        closed: bool,
-        fail_close: bool,
+    #[derive(Clone)]
+    struct FakeLlm;
+
+    impl LlmRequestExecutor for FakeLlm {
+        type Profile = ();
+        type Error = FakeError;
+
+        async fn request<'a>(
+            &'a self,
+            _profile: &'a Self::Profile,
+            _messages: &'a [ChatMessage],
+        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+            Ok(LlmResponse::new(
+                "response",
+                LlmFinishReason::Stop,
+                None,
+                "response-id",
+                Some(LlmUsage::new(1, 1, 2)),
+            ))
+        }
     }
 
     #[derive(Clone)]
-    struct FakeSession {
-        state: Arc<Mutex<SessionState>>,
-        events: Arc<Mutex<Vec<Event>>>,
-    }
+    struct FakeOperations;
 
-    impl SqliteInteractiveSession for FakeSession {
+    impl SqliteInteractiveSessionOperations for FakeOperations {
         type Error = FakeError;
 
         async fn query(
@@ -478,482 +573,342 @@ mod tests {
             &self,
             _command: SqliteCommand,
         ) -> Result<u64, SqliteInteractiveSessionError<Self::Error>> {
-            Ok(1)
+            Ok(0)
         }
 
         async fn begin(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Begin);
-            let mut state = self.state.lock().expect("会话锁不应中毒");
-            if state.transaction == SqliteInteractiveTransactionState::Active {
-                return Err(SqliteInteractiveSessionError::TransactionAlreadyActive);
-            }
-            state.transaction = SqliteInteractiveTransactionState::Active;
             Ok(())
         }
 
         async fn commit(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
-            let mut state = self.state.lock().expect("会话锁不应中毒");
-            if state.transaction == SqliteInteractiveTransactionState::Idle {
-                return Err(SqliteInteractiveSessionError::NoActiveTransaction);
-            }
-            state.transaction = SqliteInteractiveTransactionState::Idle;
             Ok(())
         }
 
         async fn rollback(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Rollback);
-            let mut state = self.state.lock().expect("会话锁不应中毒");
-            if state.transaction == SqliteInteractiveTransactionState::Idle {
-                return Err(SqliteInteractiveSessionError::NoActiveTransaction);
-            }
-            state.transaction = SqliteInteractiveTransactionState::Idle;
             Ok(())
         }
+    }
 
-        async fn transaction_state(
-            &self,
-        ) -> Result<SqliteInteractiveTransactionState, SqliteInteractiveSessionError<Self::Error>>
-        {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Inspect);
-            Ok(self.state.lock().expect("会话锁不应中毒").transaction)
-        }
+    #[derive(Clone, Copy)]
+    enum FinalizationBehavior {
+        Idle,
+        Active,
+        CloseFailed,
+    }
 
-        async fn close(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Close);
-            let mut state = self.state.lock().expect("会话锁不应中毒");
-            state.transaction = SqliteInteractiveTransactionState::Idle;
-            state.closed = true;
-            if state.fail_close {
-                Err(SqliteInteractiveSessionError::OperationFailed(FakeError(
-                    "close",
-                )))
-            } else {
-                Ok(())
+    struct FakeSessionFinalizer {
+        events: Events,
+        behavior: FinalizationBehavior,
+    }
+
+    impl SqliteInteractiveSessionFinalizer for FakeSessionFinalizer {
+        type Error = FakeError;
+
+        async fn finalize(self) -> SqliteInteractiveSessionFinalizationReport<Self::Error> {
+            record(&self.events, "finalize");
+            match self.behavior {
+                FinalizationBehavior::Idle => SqliteInteractiveSessionFinalizationReport::new(
+                    SqliteInteractiveTransactionObservation::Idle,
+                    SqliteInteractiveRollbackOutcome::NotRequired,
+                    SqliteInteractiveConnectionCloseOutcome::Closed,
+                ),
+                FinalizationBehavior::Active => SqliteInteractiveSessionFinalizationReport::new(
+                    SqliteInteractiveTransactionObservation::Active,
+                    SqliteInteractiveRollbackOutcome::RolledBack,
+                    SqliteInteractiveConnectionCloseOutcome::Closed,
+                ),
+                FinalizationBehavior::CloseFailed => {
+                    SqliteInteractiveSessionFinalizationReport::new(
+                        SqliteInteractiveTransactionObservation::Idle,
+                        SqliteInteractiveRollbackOutcome::NotRequired,
+                        SqliteInteractiveConnectionCloseOutcome::Failed(FakeError("close")),
+                    )
+                }
             }
         }
     }
 
     #[derive(Clone)]
     struct FakeSessionFactory {
-        session: FakeSession,
-        events: Arc<Mutex<Vec<Event>>>,
+        events: Events,
+        fail: bool,
+        finalization: FinalizationBehavior,
     }
 
     impl SqliteInteractiveSessionFactory for FakeSessionFactory {
-        type Session = FakeSession;
+        type Operations = FakeOperations;
+        type Finalizer = FakeSessionFinalizer;
         type Error = FakeError;
 
         async fn open_existing(
             &self,
-            path: PathBuf,
-        ) -> Result<Self::Session, OpenSqliteInteractiveSessionError<Self::Error>> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Open(path));
-            Ok(self.session.clone())
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeLlm {
-        events: Arc<Mutex<Vec<Event>>>,
-    }
-
-    impl LlmRequestExecutor for FakeLlm {
-        type Profile = String;
-        type Error = FakeError;
-
-        async fn request<'a>(
-            &'a self,
-            profile: &'a Self::Profile,
-            messages: &'a [ChatMessage],
-        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
-            assert_eq!(profile, "llm-config");
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Llm(messages.to_vec()));
-            Ok(LlmResponse::new(
-                "raw response",
-                LlmFinishReason::Stop,
-                Some("request-1".to_owned()),
-                None,
-            ))
+            _path: PathBuf,
+        ) -> Result<
+            OpenedSqliteInteractiveSession<Self::Operations, Self::Finalizer>,
+            OpenSqliteInteractiveSessionError<Self::Error>,
+        > {
+            record(&self.events, "open");
+            if self.fail {
+                Err(OpenSqliteInteractiveSessionError::OpenFailed(FakeError(
+                    "open",
+                )))
+            } else {
+                Ok(OpenedSqliteInteractiveSession::new(
+                    Arc::new(FakeOperations),
+                    FakeSessionFinalizer {
+                        events: Arc::clone(&self.events),
+                        behavior: self.finalization,
+                    },
+                ))
+            }
         }
     }
 
     #[derive(Clone, Copy)]
     enum RuntimeBehavior {
         Complete,
-        RequestLlm,
-        LeaveTransactionOpen,
-        FailAfterBegin,
-        Cancelled,
-        RequestLlmWithoutProfile,
+        Fail,
     }
 
     #[derive(Clone)]
     struct FakeRuntime {
+        events: Events,
+        fail_reserve: bool,
         behavior: RuntimeBehavior,
-        events: Arc<Mutex<Vec<Event>>>,
     }
 
     impl TrustedLuaRuntimeExecutor for FakeRuntime {
         type Error = FakeError;
+        type Reservation = FakeReservation;
 
-        async fn execute<B>(
-            &self,
-            program: OwnedLuaProgram,
-            bindings: Arc<B>,
-        ) -> TrustedLuaRuntimeExecutionReport<Self::Error, B::Error>
-        where
-            B: TrustedLuaHostBindings,
-        {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Runtime {
-                    script_path: program.main_script_path().to_path_buf(),
-                    phase: bindings.phase(),
-                    project_name: bindings.project().name().as_str().to_owned(),
-                    output_root: bindings.project().output_root().map(Path::to_path_buf),
-                });
-            assert_eq!(program.source(), b"return true");
+        async fn reserve(&self) -> Result<Self::Reservation, Self::Error> {
+            record(&self.events, "reserve");
+            if self.fail_reserve {
+                Err(FakeError("reserve"))
+            } else {
+                Ok(FakeReservation {
+                    events: Arc::clone(&self.events),
+                    behavior: self.behavior,
+                    started: false,
+                })
+            }
+        }
+    }
 
-            let runtime = match self.behavior {
-                RuntimeBehavior::Complete => Ok(()),
-                RuntimeBehavior::RequestLlm => bindings
-                    .request_llm(vec![ChatMessage::new(
-                        ChatMessageRole::User,
-                        "# Lua messages",
-                    )])
-                    .await
-                    .map(|_| ())
-                    .map_err(TrustedLuaRuntimeExecutionError::Binding),
-                RuntimeBehavior::LeaveTransactionOpen => bindings
-                    .begin()
-                    .await
-                    .map_err(TrustedLuaRuntimeExecutionError::Binding),
-                RuntimeBehavior::FailAfterBegin => match bindings.begin().await {
-                    Ok(()) => Err(TrustedLuaRuntimeExecutionError::Execute(FakeError(
-                        "runtime",
-                    ))),
-                    Err(error) => Err(TrustedLuaRuntimeExecutionError::Binding(error)),
-                },
-                RuntimeBehavior::Cancelled => Err(TrustedLuaRuntimeExecutionError::Cancelled),
-                RuntimeBehavior::RequestLlmWithoutProfile => bindings
-                    .request_llm(Vec::new())
-                    .await
-                    .map(|_| ())
-                    .map_err(TrustedLuaRuntimeExecutionError::Binding),
-            };
-            let termination = match &runtime {
-                Ok(()) => TrustedLuaRuntimeTermination::Completed,
-                Err(TrustedLuaRuntimeExecutionError::Cancelled) => {
-                    TrustedLuaRuntimeTermination::Cancelled
-                }
-                Err(_) => TrustedLuaRuntimeTermination::Failed,
-            };
-            let finalization = bindings.finalize(termination).await;
-            TrustedLuaRuntimeExecutionReport::new(runtime, finalization)
+    struct FakeReservation {
+        events: Events,
+        behavior: RuntimeBehavior,
+        started: bool,
+    }
+
+    impl Drop for FakeReservation {
+        fn drop(&mut self) {
+            if !self.started {
+                record(&self.events, "reservation_drop");
+            }
+        }
+    }
+
+    impl TrustedLuaRuntimeReservation for FakeReservation {
+        type Error = FakeError;
+
+        fn start(
+            mut self,
+            _program: OwnedLuaProgram,
+            bindings: TrustedLuaRuntimeBindings,
+        ) -> TrustedLuaExecutionHandle<Self::Error> {
+            self.started = true;
+            record(&self.events, "start");
+            let behavior = self.behavior;
+            let (calls, finalizer) = bindings.into_parts();
+            assert_eq!(calls.phase(), LuaPhase::Extract);
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            tokio::spawn(async move {
+                let runtime = match behavior {
+                    RuntimeBehavior::Complete => Ok(()),
+                    RuntimeBehavior::Fail => {
+                        Err(TrustedLuaRuntimeExecutionError::Execute(FakeError("vm")))
+                    }
+                };
+                let termination = if runtime.is_ok() {
+                    TrustedLuaRuntimeTermination::Completed
+                } else {
+                    TrustedLuaRuntimeTermination::Failed
+                };
+                let finalization = finalizer.finalize(termination).await;
+                let _ = sender.send(TrustedLuaRuntimeExecutionReport::new(runtime, finalization));
+            });
+            TrustedLuaExecutionHandle::new(receiver, cancelled)
         }
     }
 
     type Service =
         TrustedLuaExecutionHostingService<FakeFileReader, FakeLlm, FakeRuntime, FakeSessionFactory>;
 
-    struct Harness {
-        service: Service,
-        events: Arc<Mutex<Vec<Event>>>,
-        state: Arc<Mutex<SessionState>>,
-    }
-
-    fn harness(behavior: RuntimeBehavior, fail_close: bool) -> Harness {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let state = Arc::new(Mutex::new(SessionState {
-            transaction: SqliteInteractiveTransactionState::Idle,
-            closed: false,
-            fail_close,
-        }));
-        let session = FakeSession {
-            state: Arc::clone(&state),
-            events: Arc::clone(&events),
-        };
-        let service = TrustedLuaExecutionHostingService::new(
+    fn service(
+        events: Events,
+        fail_reserve: bool,
+        fail_open: bool,
+        runtime: RuntimeBehavior,
+        finalization: FinalizationBehavior,
+    ) -> Service {
+        TrustedLuaExecutionHostingService::<_, FakeLlm, _, _>::without_llm(
             FakeFileReader {
                 events: Arc::clone(&events),
             },
-            FakeLlm {
-                events: Arc::clone(&events),
-            },
             FakeRuntime {
-                behavior,
                 events: Arc::clone(&events),
+                fail_reserve,
+                behavior: runtime,
             },
             FakeSessionFactory {
-                session,
-                events: Arc::clone(&events),
+                events,
+                fail: fail_open,
+                finalization,
             },
-        );
-        Harness {
-            service,
-            events,
-            state,
-        }
-    }
-
-    fn project() -> LuaProjectContext {
-        LuaProjectContext::from_stored_record(&StoredProjectRecord::new(
-            "alice".parse::<ProjectName>().expect("项目名应合法"),
-            PathBuf::from("C:/projects/alice"),
-            PathBuf::from("C:/projects/alice/project.db"),
-            "ja".to_owned(),
-            "zh-Hans".to_owned(),
-            crate::att_mz::project::test_layout_profile(),
-        ))
-    }
-
-    fn write_back_project() -> LuaProjectContext {
-        let project = crate::att_mz::project::OpenedProject::new(
-            "alice".parse::<ProjectName>().expect("项目名应合法"),
-            PathBuf::from("C:/projects/alice"),
-            PathBuf::from("C:/projects/alice/project.db"),
-            "ja".to_owned(),
-            "zh-Hans".to_owned(),
-            crate::att_mz::project::test_layout_profile(),
-        );
-        LuaProjectContext::for_published_write_back(
-            &project,
-            PathBuf::from("C:/projects/alice/write_back"),
         )
     }
 
-    fn profile() -> Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<String>>> {
-        let pair = TranslationProfileLanguagePair::new("ja", "zh-Hans").expect("语言对应合法");
-        Arc::new(TranslationExecutionProfile::new(
-            "quality",
-            NonZeroUsize::new(2).expect("非零"),
-            MzTranslationExecutionPayload::new(
-                MzTranslationPlanningConfiguration::new(
-                    NonZeroUsize::new(2).expect("非零"),
-                    NonZeroUsize::new(10_000).expect("非零"),
-                    [(pair, "# system".to_owned())],
-                )
-                .expect("规划配置应合法"),
-                MzTranslationExecutionConfiguration::new(
-                    vec![Duration::from_millis(10)],
-                    Duration::from_secs(1),
-                ),
-                "llm-config".to_owned(),
-            ),
-        ))
-    }
-
-    #[tokio::test]
-    async fn translate_injects_raw_llm_and_closes_the_same_idle_session() {
-        let harness = harness(RuntimeBehavior::RequestLlm, false);
-
-        harness
-            .service
-            .execute(LuaInvocation::translate(
-                PathBuf::from("translate.lua"),
-                project(),
-                profile(),
-            ))
-            .await
-            .expect("Lua 翻译应成功");
-
-        let events = harness.events.lock().expect("事件锁不应中毒").clone();
-        assert_eq!(events[0], Event::Read(PathBuf::from("translate.lua")));
-        assert_eq!(
-            events[1],
-            Event::Open(PathBuf::from("C:/projects/alice/project.db"))
+    fn invocation() -> LuaInvocation<TranslationExecutionProfile<MzTranslationExecutionPayload<()>>>
+    {
+        let project = OpenedProject::new(
+            "demo".parse::<ProjectName>().unwrap(),
+            PathBuf::from("C:/projects/demo"),
+            PathBuf::from("C:/projects/demo/project.db"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
         );
-        assert!(matches!(
-            &events[2],
-            Event::Runtime {
-                script_path,
-                phase: LuaPhase::Translate,
-                project_name,
-                output_root: None,
-            } if script_path == Path::new("C:/resolved/scripts/translate.lua") && project_name == "alice"
-        ));
-        assert!(matches!(&events[3], Event::Llm(messages) if messages.len() == 1));
-        assert_eq!(&events[4..], &[Event::Inspect, Event::Close]);
-        assert!(harness.state.lock().expect("会话锁不应中毒").closed);
+        LuaInvocation::extract(
+            PathBuf::from("main.lua"),
+            LuaProjectContext::from_opened_project(&project),
+        )
     }
 
     #[tokio::test]
-    async fn normal_return_with_open_transaction_rolls_back_and_fails_explicitly() {
-        let harness = harness(RuntimeBehavior::LeaveTransactionOpen, false);
+    async fn reserves_before_opening_and_synchronously_hands_off_the_session() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        service(
+            Arc::clone(&events),
+            false,
+            false,
+            RuntimeBehavior::Complete,
+            FinalizationBehavior::Idle,
+        )
+        .execute(invocation())
+        .await
+        .unwrap();
 
-        let error = harness
-            .service
-            .execute(LuaInvocation::translate(
-                PathBuf::from("translate.lua"),
-                project(),
-                profile(),
-            ))
-            .await
-            .expect_err("未关闭事务必须使调用失败");
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["read", "reserve", "open", "start", "finalize"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_failure_never_opens_a_database() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let error = service(
+            Arc::clone(&events),
+            true,
+            false,
+            RuntimeBehavior::Complete,
+            FinalizationBehavior::Idle,
+        )
+        .execute(invocation())
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TrustedLuaExecutionHostingError::ReserveRuntime(FakeError("reserve"))
+        ));
+        assert_eq!(*events.lock().unwrap(), ["read", "reserve"]);
+    }
+
+    #[tokio::test]
+    async fn open_failure_releases_the_reservation_without_starting_runtime() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let error = service(
+            Arc::clone(&events),
+            false,
+            true,
+            RuntimeBehavior::Complete,
+            FinalizationBehavior::Idle,
+        )
+        .execute(invocation())
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TrustedLuaExecutionHostingError::OpenDatabase { .. }
+        ));
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["read", "reserve", "open", "reservation_drop"]
+        );
+    }
+
+    #[tokio::test]
+    async fn active_transaction_is_rolled_back_and_reported_after_normal_return() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let error = service(
+            events,
+            false,
+            false,
+            RuntimeBehavior::Complete,
+            FinalizationBehavior::Active,
+        )
+        .execute(invocation())
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             error,
             TrustedLuaExecutionHostingError::UnclosedTransaction
         ));
-        let events = harness.events.lock().expect("事件锁不应中毒").clone();
-        assert!(events.ends_with(&[Event::Inspect, Event::Rollback, Event::Close]));
-        let state = harness.state.lock().expect("会话锁不应中毒");
-        assert_eq!(state.transaction, SqliteInteractiveTransactionState::Idle);
-        assert!(state.closed);
     }
 
     #[tokio::test]
-    async fn runtime_and_cleanup_failures_are_both_preserved() {
-        let harness = harness(RuntimeBehavior::FailAfterBegin, true);
-
-        let error = harness
-            .service
-            .execute(LuaInvocation::translate(
-                PathBuf::from("translate.lua"),
-                project(),
-                profile(),
-            ))
-            .await
-            .expect_err("运行与关闭失败必须向上返回");
+    async fn runtime_and_session_cleanup_failures_are_both_preserved() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let error = service(
+            events,
+            false,
+            false,
+            RuntimeBehavior::Fail,
+            FinalizationBehavior::CloseFailed,
+        )
+        .execute(invocation())
+        .await
+        .unwrap_err();
 
         assert!(matches!(
-            &error,
+            error,
             TrustedLuaExecutionHostingError::RuntimeAndCleanup {
-                runtime: TrustedLuaRuntimeExecutionError::Execute(FakeError("runtime")),
-                cleanup: LuaHostBindingError::Cleanup(cleanup),
-            } if cleanup.failures().len() == 1
-        ));
-        assert!(error.to_string().contains("runtime"));
-        assert!(error.to_string().contains("close"));
-    }
-
-    #[tokio::test]
-    async fn cancelled_runtime_still_finalizes_and_closes_the_opened_session() {
-        let harness = harness(RuntimeBehavior::Cancelled, false);
-
-        let error = harness
-            .service
-            .execute(LuaInvocation::translate(
-                PathBuf::from("translate.lua"),
-                project(),
-                profile(),
-            ))
-            .await
-            .expect_err("取消必须作为明确终态返回");
-
-        assert!(matches!(
-            error,
-            TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Cancelled)
-        ));
-        assert!(
-            harness
-                .events
-                .lock()
-                .expect("事件锁不应中毒")
-                .ends_with(&[Event::Inspect, Event::Close])
-        );
-        assert!(harness.state.lock().expect("会话锁不应中毒").closed);
-    }
-
-    #[tokio::test]
-    async fn extract_does_not_receive_an_llm_profile() {
-        let harness = harness(RuntimeBehavior::RequestLlmWithoutProfile, false);
-
-        let error = harness
-            .service
-            .execute(LuaInvocation::extract(
-                PathBuf::from("extract.lua"),
-                project(),
-            ))
-            .await
-            .expect_err("Extract 的 ctx.llm 调用必须失败");
-
-        assert!(matches!(
-            error,
-            TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Binding(
-                LuaHostBindingError::LlmUnavailable
-            ))
-        ));
-        assert!(
-            !harness
-                .events
-                .lock()
-                .expect("事件锁不应中毒")
-                .iter()
-                .any(|event| matches!(event, Event::Llm(_)))
-        );
-    }
-
-    #[tokio::test]
-    async fn write_back_phase_exposes_output_but_not_llm_and_still_closes_database() {
-        let harness = harness(RuntimeBehavior::RequestLlmWithoutProfile, false);
-
-        let error = harness
-            .service
-            .execute(LuaInvocation::write_back(
-                PathBuf::from("write.lua"),
-                write_back_project(),
-            ))
-            .await
-            .expect_err("WriteBack 的 ctx.llm 调用必须失败");
-
-        assert!(matches!(
-            error,
-            TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Binding(
-                LuaHostBindingError::LlmUnavailable
-            ))
-        ));
-        let events = harness.events.lock().expect("事件锁不应中毒").clone();
-        assert!(matches!(
-            &events[2],
-            Event::Runtime {
-                phase: LuaPhase::WriteBack,
-                output_root: Some(output_root),
+                runtime: TrustedLuaRuntimeExecutionError::Execute(FakeError("vm")),
                 ..
-            } if output_root == Path::new("C:/projects/alice/write_back")
+            }
         ));
-        assert!(!events.iter().any(|event| matches!(event, Event::Llm(_))));
-        assert!(events.ends_with(&[Event::Inspect, Event::Close]));
-        assert!(harness.state.lock().expect("会话锁不应中毒").closed);
+        assert!(error.to_string().contains("vm"));
+        assert!(error.to_string().contains("close"));
     }
 
     #[test]
     fn execution_future_is_send() {
         fn assert_send(_: impl Send) {}
 
-        let harness = harness(RuntimeBehavior::Complete, false);
-        assert_send(harness.service.execute(LuaInvocation::translate(
-            PathBuf::from("translate.lua"),
-            project(),
-            profile(),
-        )));
-    }
-
-    #[test]
-    fn interactive_query_types_remain_owned_rust_values() {
-        let query = SqliteQuery::new(
-            "SELECT value FROM lua_data WHERE id = ?1",
-            vec![SqliteValue::Integer(1)],
+        assert_send(
+            service(
+                Arc::new(Mutex::new(Vec::new())),
+                false,
+                false,
+                RuntimeBehavior::Complete,
+                FinalizationBehavior::Idle,
+            )
+            .execute(invocation()),
         );
-        assert_eq!(query.parameters(), &[SqliteValue::Integer(1)]);
     }
 }

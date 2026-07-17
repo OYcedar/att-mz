@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "标准翻译结果存储器尚未接入生产组合根")]
-
 //! 标准翻译准备与单任务结果的 SQLite 持久化实现。
 
 use std::collections::BTreeMap;
@@ -53,10 +51,12 @@ impl MzStandardTranslationResultStorageConfig {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn encode_concurrency(self) -> NonZeroUsize {
         self.encode_concurrency
     }
 
+    #[cfg(test)]
     pub(crate) const fn leaves_per_encode_job(self) -> NonZeroUsize {
         self.leaves_per_encode_job
     }

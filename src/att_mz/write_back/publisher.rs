@@ -1,6 +1,4 @@
-#![allow(dead_code, reason = "Standard WriteBack 尚未接入生产组合根")]
-
-//! 把 Rewriter 候选提交给原子目录候选发布根。
+//! 把 Rewriter 候选提交给可恢复目录发布根。
 
 use std::error::Error;
 use std::fmt;
@@ -8,10 +6,11 @@ use std::path::PathBuf;
 
 use crate::att_mz::ProjectName;
 use crate::att_mz::project::OpenedProject;
+use crate::execution::{CooperativeCancellation, OperationCancelled};
 use crate::storage::file_system::{
-    AtomicDirectoryPrepareError, AtomicDirectoryPublishError, AtomicDirectoryPublisher,
-    DirectoryFileOverlay, DirectoryPublishMode, DirectorySourceMapping, DirectoryStageRequest,
-    DirectoryStageRequestError,
+    DirectoryDiscardError, DirectoryFileOverlay, DirectoryPrepareError, DirectoryPublishError,
+    DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+    DirectoryStageRequestError, RecoverableDirectoryPublisher,
 };
 
 use super::rewriter::MzRewrittenDocuments;
@@ -19,18 +18,22 @@ use super::standard::StandardWriteBackPublisher;
 
 /// 用固定 `source/data`、`source/js` 基底发布 Standard 写回候选。
 pub(crate) struct StandardWriteBackPublishingService<A> {
-    atomic_publisher: A,
+    directory_publisher: A,
+    cancellation: CooperativeCancellation,
 }
 
 impl<A> StandardWriteBackPublishingService<A> {
-    pub(crate) const fn new(atomic_publisher: A) -> Self {
-        Self { atomic_publisher }
+    pub(crate) fn new(directory_publisher: A, cancellation: CooperativeCancellation) -> Self {
+        Self {
+            directory_publisher,
+            cancellation,
+        }
     }
 }
 
 impl<A> StandardWriteBackPublisher<MzRewrittenDocuments> for StandardWriteBackPublishingService<A>
 where
-    A: AtomicDirectoryPublisher,
+    A: RecoverableDirectoryPublisher,
 {
     type Error = StandardWriteBackPublishingError<A::Error>;
 
@@ -39,6 +42,9 @@ where
         project: &OpenedProject,
         documents: MzRewrittenDocuments,
     ) -> Result<(), Self::Error> {
+        self.cancellation
+            .check()
+            .map_err(StandardWriteBackPublishingError::Cancelled)?;
         if documents.project_name() != project.name()
             || documents.workspace_root() != project.workspace_root()
         {
@@ -73,6 +79,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let request = DirectoryStageRequest::new(
             project.layout().write_back_root().to_path_buf(),
+            DirectoryPublishIntent::ReplaceExisting,
             source_mappings,
             overlays,
             Vec::new(),
@@ -80,12 +87,23 @@ where
         .map_err(StandardWriteBackPublishingError::InvalidRequest)?;
 
         let staged = self
-            .atomic_publisher
+            .directory_publisher
             .prepare(request)
             .await
             .map_err(StandardWriteBackPublishingError::Prepare)?;
-        self.atomic_publisher
-            .publish(staged, DirectoryPublishMode::Replace)
+        if let Err(cancellation) = self.cancellation.check() {
+            let staging_root = staged.staging_root().to_path_buf();
+            return match self.directory_publisher.discard(staged).await {
+                Ok(()) => Err(StandardWriteBackPublishingError::Cancelled(cancellation)),
+                Err(discard) => Err(StandardWriteBackPublishingError::CancelledAndDiscard {
+                    cancellation,
+                    staging_root,
+                    discard,
+                }),
+            };
+        }
+        self.directory_publisher
+            .publish(staged)
             .await
             .map_err(StandardWriteBackPublishingError::Publish)
     }
@@ -94,6 +112,12 @@ where
 /// Standard Publisher 在候选交接、请求建立或根发布阶段遇到的失败。
 #[derive(Debug)]
 pub(crate) enum StandardWriteBackPublishingError<E> {
+    Cancelled(OperationCancelled),
+    CancelledAndDiscard {
+        cancellation: OperationCancelled,
+        staging_root: PathBuf,
+        discard: DirectoryDiscardError<E>,
+    },
     CandidateProjectMismatch {
         expected_name: ProjectName,
         expected_workspace_root: PathBuf,
@@ -101,8 +125,8 @@ pub(crate) enum StandardWriteBackPublishingError<E> {
         candidate_workspace_root: PathBuf,
     },
     InvalidRequest(DirectoryStageRequestError),
-    Prepare(AtomicDirectoryPrepareError<E>),
-    Publish(AtomicDirectoryPublishError<E>),
+    Prepare(DirectoryPrepareError<E>),
+    Publish(DirectoryPublishError<E>),
 }
 
 impl<E> fmt::Display for StandardWriteBackPublishingError<E>
@@ -111,6 +135,16 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
+            Self::CancelledAndDiscard {
+                cancellation,
+                staging_root,
+                discard,
+            } => write!(
+                formatter,
+                "{cancellation}，且无法丢弃候选目录 {}：{discard}",
+                staging_root.display()
+            ),
             Self::CandidateProjectMismatch {
                 expected_name,
                 expected_workspace_root,
@@ -137,6 +171,8 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
+            Self::CancelledAndDiscard { discard, .. } => Some(discard),
             Self::CandidateProjectMismatch { .. } => None,
             Self::InvalidRequest(source) => Some(source),
             Self::Prepare(source) => Some(source),
@@ -153,12 +189,10 @@ mod tests {
     use super::*;
     use crate::att_mz::write_back::rewriter::MzRewrittenFile;
 
-    use crate::storage::file_system::{
-        AtomicDirectoryDiscardError, StagedDirectory, StagingCleanupFailure,
-    };
+    use crate::storage::file_system::{StagedDirectory, StagingCleanupFailure};
 
-    type PrepareError = AtomicDirectoryPrepareError<FakeError>;
-    type PublishResult = Result<(), AtomicDirectoryPublishError<FakeError>>;
+    type PrepareError = DirectoryPrepareError<FakeError>;
+    type PublishResult = Result<(), DirectoryPublishError<FakeError>>;
     type PrepareCalls = Arc<Mutex<Vec<DirectoryStageRequest>>>;
     type PublishCalls = Arc<Mutex<Vec<PublishCall>>>;
 
@@ -166,18 +200,21 @@ mod tests {
     struct PublishCall {
         target_root: PathBuf,
         staging_root: PathBuf,
-        mode: DirectoryPublishMode,
+        mode: DirectoryPublishIntent,
     }
 
     #[derive(Clone)]
-    struct FakeAtomicPublisher {
+    struct FakeRecoverablePublisher {
         prepare_calls: Arc<Mutex<Vec<DirectoryStageRequest>>>,
         publish_calls: Arc<Mutex<Vec<PublishCall>>>,
         prepare_error: Arc<Mutex<Option<PrepareError>>>,
         publish_result: Arc<Mutex<Option<PublishResult>>>,
+        cancel_after_prepare: Option<CooperativeCancellation>,
+        discard_calls: Arc<Mutex<Vec<PathBuf>>>,
+        discard_error: Arc<Mutex<Option<FakeError>>>,
     }
 
-    impl AtomicDirectoryPublisher for FakeAtomicPublisher {
+    impl RecoverableDirectoryPublisher for FakeRecoverablePublisher {
         type Error = FakeError;
         type StagingState = usize;
 
@@ -186,6 +223,7 @@ mod tests {
             request: DirectoryStageRequest,
         ) -> Result<StagedDirectory<Self::StagingState>, PrepareError> {
             let target_root = request.target_root().to_path_buf();
+            let publish_intent = request.publish_intent();
             self.prepare_calls
                 .lock()
                 .expect("暂存调用锁不应中毒")
@@ -198,15 +236,20 @@ mod tests {
             {
                 return Err(error);
             }
+            if let Some(cancellation) = &self.cancel_after_prepare {
+                cancellation.request();
+            }
             let staging_root = target_root.with_extension("att-stage");
-            Ok(StagedDirectory::new(target_root, staging_root, 7))
+            Ok(StagedDirectory::new(
+                target_root,
+                staging_root,
+                publish_intent,
+                7,
+            ))
         }
 
-        async fn publish(
-            &self,
-            staged: StagedDirectory<Self::StagingState>,
-            mode: DirectoryPublishMode,
-        ) -> PublishResult {
+        async fn publish(&self, staged: StagedDirectory<Self::StagingState>) -> PublishResult {
+            let mode = staged.publish_intent();
             self.publish_calls
                 .lock()
                 .expect("发布调用锁不应中毒")
@@ -224,9 +267,22 @@ mod tests {
 
         async fn discard(
             &self,
-            _staged: StagedDirectory<Self::StagingState>,
-        ) -> Result<(), AtomicDirectoryDiscardError<Self::Error>> {
-            panic!("Standard WriteBack 不应显式丢弃已暂存候选")
+            staged: StagedDirectory<Self::StagingState>,
+        ) -> Result<(), DirectoryDiscardError<Self::Error>> {
+            let staging_root = staged.staging_root().to_path_buf();
+            self.discard_calls
+                .lock()
+                .expect("丢弃调用锁不应中毒")
+                .push(staging_root.clone());
+            match self
+                .discard_error
+                .lock()
+                .expect("丢弃结果锁不应中毒")
+                .take()
+            {
+                Some(error) => Err(DirectoryDiscardError::new(staging_root, error)),
+                None => Ok(()),
+            }
         }
     }
 
@@ -272,19 +328,25 @@ mod tests {
         prepare_error: Option<PrepareError>,
         result: PublishResult,
     ) -> (
-        StandardWriteBackPublishingService<FakeAtomicPublisher>,
+        StandardWriteBackPublishingService<FakeRecoverablePublisher>,
         PrepareCalls,
         PublishCalls,
     ) {
         let prepare_calls = Arc::new(Mutex::new(Vec::new()));
         let publish_calls = Arc::new(Mutex::new(Vec::new()));
         (
-            StandardWriteBackPublishingService::new(FakeAtomicPublisher {
-                prepare_calls: Arc::clone(&prepare_calls),
-                publish_calls: Arc::clone(&publish_calls),
-                prepare_error: Arc::new(Mutex::new(prepare_error)),
-                publish_result: Arc::new(Mutex::new(Some(result))),
-            }),
+            StandardWriteBackPublishingService::new(
+                FakeRecoverablePublisher {
+                    prepare_calls: Arc::clone(&prepare_calls),
+                    publish_calls: Arc::clone(&publish_calls),
+                    prepare_error: Arc::new(Mutex::new(prepare_error)),
+                    publish_result: Arc::new(Mutex::new(Some(result))),
+                    cancel_after_prepare: None,
+                    discard_calls: Arc::new(Mutex::new(Vec::new())),
+                    discard_error: Arc::new(Mutex::new(None)),
+                },
+                CooperativeCancellation::default(),
+            ),
             prepare_calls,
             publish_calls,
         )
@@ -339,8 +401,44 @@ mod tests {
         assert!(request.empty_directories().is_empty());
         let publish_calls = publish_calls.lock().expect("发布调用锁不应中毒");
         assert_eq!(publish_calls.len(), 1);
-        assert_eq!(publish_calls[0].mode, DirectoryPublishMode::Replace);
+        assert_eq!(
+            publish_calls[0].mode,
+            DirectoryPublishIntent::ReplaceExisting
+        );
         assert_eq!(publish_calls[0].target_root, project.write_back_root());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_prepare_discards_candidate_without_publishing() {
+        let project = project("alice", "C:/projects");
+        let cancellation = CooperativeCancellation::default();
+        let prepare_calls = Arc::new(Mutex::new(Vec::new()));
+        let publish_calls = Arc::new(Mutex::new(Vec::new()));
+        let discard_calls = Arc::new(Mutex::new(Vec::new()));
+        let publisher = StandardWriteBackPublishingService::new(
+            FakeRecoverablePublisher {
+                prepare_calls,
+                publish_calls: Arc::clone(&publish_calls),
+                prepare_error: Arc::new(Mutex::new(None)),
+                publish_result: Arc::new(Mutex::new(Some(Ok(())))),
+                cancel_after_prepare: Some(cancellation.clone()),
+                discard_calls: Arc::clone(&discard_calls),
+                discard_error: Arc::new(Mutex::new(None)),
+            },
+            cancellation,
+        );
+
+        let error = publisher
+            .publish(&project, documents(&project, Vec::new()))
+            .await
+            .expect_err("取消后不得发布候选");
+
+        assert!(matches!(
+            error,
+            StandardWriteBackPublishingError::Cancelled(_)
+        ));
+        assert!(publish_calls.lock().expect("发布调用锁不应中毒").is_empty());
+        assert_eq!(discard_calls.lock().expect("丢弃调用锁不应中毒").len(), 1);
     }
 
     #[tokio::test]
@@ -359,7 +457,7 @@ mod tests {
         assert!(calls[0].overlays().is_empty());
         assert_eq!(
             publish_calls.lock().expect("发布调用锁不应中毒")[0].mode,
-            DirectoryPublishMode::Replace
+            DirectoryPublishIntent::ReplaceExisting
         );
     }
 
@@ -387,7 +485,7 @@ mod tests {
         let project = project("alice", "C:/projects");
         let target_root = project.write_back_root().to_path_buf();
         let (publisher, prepare_calls, publish_calls) = harness(
-            Some(AtomicDirectoryPrepareError::NotPrepared {
+            Some(DirectoryPrepareError::NotPrepared {
                 target_root: target_root.clone(),
                 source: FakeError("copy"),
                 cleanup_failure: None,
@@ -400,7 +498,7 @@ mod tests {
             .expect_err("暂存失败必须传播");
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::Prepare(AtomicDirectoryPrepareError::NotPrepared {
+            StandardWriteBackPublishingError::Prepare(DirectoryPrepareError::NotPrepared {
                 target_root: failed_target,
                 source: FakeError("copy"),
                 cleanup_failure: None,
@@ -411,7 +509,7 @@ mod tests {
     }
 
     async fn assert_publish_error(
-        root_error: AtomicDirectoryPublishError<FakeError>,
+        root_error: DirectoryPublishError<FakeError>,
     ) -> StandardWriteBackPublishingError<FakeError> {
         let project = project("alice", "C:/projects");
         let (publisher, _, publish_calls) = harness(None, Err(root_error));
@@ -421,7 +519,7 @@ mod tests {
             .expect_err("根发布失败必须传播");
         assert_eq!(
             publish_calls.lock().expect("发布调用锁不应中毒")[0].mode,
-            DirectoryPublishMode::Replace
+            DirectoryPublishIntent::ReplaceExisting
         );
         error
     }
@@ -429,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn preserves_replace_target_missing_and_not_directory_states() {
         let target_root = PathBuf::from("C:/projects/alice/write_back");
-        let error = assert_publish_error(AtomicDirectoryPublishError::TargetMissing {
+        let error = assert_publish_error(DirectoryPublishError::TargetMissing {
             target_root: target_root.clone(),
             cleanup_failure: None,
         })
@@ -437,14 +535,14 @@ mod tests {
         assert!(matches!(
             error,
             StandardWriteBackPublishingError::Publish(
-                AtomicDirectoryPublishError::TargetMissing {
+                DirectoryPublishError::TargetMissing {
                     target_root: failed_target,
                     cleanup_failure: None,
                 }
             ) if failed_target == target_root
         ));
 
-        let error = assert_publish_error(AtomicDirectoryPublishError::TargetNotDirectory {
+        let error = assert_publish_error(DirectoryPublishError::TargetNotDirectory {
             target_root: target_root.clone(),
             cleanup_failure: None,
         })
@@ -452,7 +550,7 @@ mod tests {
         assert!(matches!(
             error,
             StandardWriteBackPublishingError::Publish(
-                AtomicDirectoryPublishError::TargetNotDirectory {
+                DirectoryPublishError::TargetNotDirectory {
                     target_root: failed_target,
                     cleanup_failure: None,
                 }
@@ -464,7 +562,7 @@ mod tests {
     async fn preserves_known_not_published_state_and_candidate_cleanup_failure() {
         let target_root = PathBuf::from("C:/projects/alice/write_back");
         let residual_path = PathBuf::from("C:/projects/alice/.write_back-stage");
-        let error = assert_publish_error(AtomicDirectoryPublishError::NotPublished {
+        let error = assert_publish_error(DirectoryPublishError::NotPublished {
             target_root: target_root.clone(),
             source: FakeError("replace"),
             cleanup_failure: Some(StagingCleanupFailure::new(
@@ -477,7 +575,7 @@ mod tests {
         assert!(matches!(
             error,
             StandardWriteBackPublishingError::Publish(
-                AtomicDirectoryPublishError::NotPublished {
+                DirectoryPublishError::NotPublished {
                     target_root: failed_target,
                     source: FakeError("replace"),
                     cleanup_failure: Some(cleanup_failure),
@@ -492,7 +590,7 @@ mod tests {
     async fn preserves_published_cleanup_failure_and_outcome_unknown_states() {
         let target_root = PathBuf::from("C:/projects/alice/write_back");
         let residual_path = PathBuf::from("C:/projects/alice/.write_back-old");
-        let error = assert_publish_error(AtomicDirectoryPublishError::PublishedButCleanupFailed {
+        let error = assert_publish_error(DirectoryPublishError::PublishedWithResiduals {
             target_root: target_root.clone(),
             residual_path: residual_path.clone(),
             source: FakeError("cleanup"),
@@ -501,7 +599,7 @@ mod tests {
         assert!(matches!(
             error,
             StandardWriteBackPublishingError::Publish(
-                AtomicDirectoryPublishError::PublishedButCleanupFailed {
+                DirectoryPublishError::PublishedWithResiduals {
                     target_root: failed_target,
                     residual_path: residual,
                     source: FakeError("cleanup"),
@@ -510,7 +608,7 @@ mod tests {
         ));
 
         let recovery_artifacts = vec![PathBuf::from("C:/projects/alice/.write_back-recovery")];
-        let error = assert_publish_error(AtomicDirectoryPublishError::OutcomeUnknown {
+        let error = assert_publish_error(DirectoryPublishError::OutcomeUnknown {
             target_root: target_root.clone(),
             recovery_artifacts: recovery_artifacts.clone(),
             source: FakeError("restore"),
@@ -519,7 +617,7 @@ mod tests {
         assert!(matches!(
             error,
             StandardWriteBackPublishingError::Publish(
-                AtomicDirectoryPublishError::OutcomeUnknown {
+                DirectoryPublishError::OutcomeUnknown {
                     target_root: failed_target,
                     recovery_artifacts: artifacts,
                     source: FakeError("restore"),

@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "共享语言能力等待生产组合根接线")]
-
 //! 跨游戏引擎共享的语言分析、源文残留检查与可选安全修复。
 //!
 //! 本模块只理解自然语言文本和不透明边界，不依赖游戏引擎位置、数据库、CLI、
@@ -48,6 +46,7 @@ impl LanguageText {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn natural(text: impl Into<String>) -> Self {
         Self::new(vec![LanguageTextSegment::NaturalText(text.into())])
     }
@@ -180,6 +179,7 @@ impl LanguageRepairPlan {
         &self.replacements
     }
 
+    #[cfg(test)]
     pub(crate) fn is_unchanged(&self) -> bool {
         self.replacements.is_empty()
     }

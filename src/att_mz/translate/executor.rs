@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "翻译执行链尚未接入生产组合根")]
-
 //! 标准翻译任务的模型调用、有限响应清洗与译后验收。
 //!
 //! 本模块只对可恢复网络失败按外部预算重试，并把网络请求、可取消等待与
@@ -91,7 +89,8 @@ impl LlmUsage {
 pub(crate) struct LlmResponse {
     content: String,
     finish_reason: LlmFinishReason,
-    request_id: Option<String>,
+    provider_request_id: Option<String>,
+    provider_response_id: String,
     usage: Option<LlmUsage>,
 }
 
@@ -99,13 +98,15 @@ impl LlmResponse {
     pub(crate) fn new(
         content: impl Into<String>,
         finish_reason: LlmFinishReason,
-        request_id: Option<String>,
+        provider_request_id: Option<String>,
+        provider_response_id: impl Into<String>,
         usage: Option<LlmUsage>,
     ) -> Self {
         Self {
             content: content.into(),
             finish_reason,
-            request_id,
+            provider_request_id,
+            provider_response_id: provider_response_id.into(),
             usage,
         }
     }
@@ -118,8 +119,65 @@ impl LlmResponse {
         &self.finish_reason
     }
 
-    pub(crate) fn request_id(&self) -> Option<&str> {
-        self.request_id.as_deref()
+    pub(crate) fn provider_request_id(&self) -> Option<&str> {
+        self.provider_request_id.as_deref()
+    }
+
+    pub(crate) fn provider_response_id(&self) -> &str {
+        &self.provider_response_id
+    }
+
+    pub(crate) const fn usage(&self) -> Option<LlmUsage> {
+        self.usage
+    }
+}
+
+/// 一次最终成功 HTTP 响应中可安全进入任务结果与持久日志的元数据。
+///
+/// `provider_request_id` 来自响应头 `x-request-id`，`provider_response_id`
+/// 来自 Chat Completions 正文 `id`。两者语义不同，不能相互补位。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FinalLlmResponseMetadata {
+    provider_request_id: Option<String>,
+    provider_response_id: String,
+    finish_reason: String,
+    usage: Option<LlmUsage>,
+}
+
+impl FinalLlmResponseMetadata {
+    pub(crate) fn new(
+        provider_request_id: Option<String>,
+        provider_response_id: impl Into<String>,
+        finish_reason: impl Into<String>,
+        usage: Option<LlmUsage>,
+    ) -> Self {
+        Self {
+            provider_request_id,
+            provider_response_id: provider_response_id.into(),
+            finish_reason: finish_reason.into(),
+            usage,
+        }
+    }
+
+    fn from_response(response: &LlmResponse) -> Self {
+        Self::new(
+            response.provider_request_id.clone(),
+            response.provider_response_id.clone(),
+            response.finish_reason.to_string(),
+            response.usage,
+        )
+    }
+
+    pub(crate) fn provider_request_id(&self) -> Option<&str> {
+        self.provider_request_id.as_deref()
+    }
+
+    pub(crate) fn provider_response_id(&self) -> &str {
+        &self.provider_response_id
+    }
+
+    pub(crate) fn finish_reason(&self) -> &str {
+        &self.finish_reason
     }
 
     pub(crate) const fn usage(&self) -> Option<LlmUsage> {
@@ -497,7 +555,6 @@ fn unavailable_after_request_failure(
         task.index(),
         attempts,
         None,
-        None,
         reason,
         unresolved_all(
             task.expected_outputs(),
@@ -602,8 +659,8 @@ fn process_response(
         .resolve(input.language_pair.source_language())
         .map_err(TranslationResponseTechnicalError::LanguageUnavailable)?;
 
-    let request_id = response.request_id.clone();
-    let finish_reason = response.finish_reason.to_string();
+    let final_response = FinalLlmResponseMetadata::from_response(&response);
+    let finish_reason = final_response.finish_reason().to_owned();
     let mut diagnostics = Vec::new();
     if response.finish_reason != LlmFinishReason::Stop {
         diagnostics.push(TranslationProtocolDiagnostic::NonStopFinish {
@@ -620,8 +677,7 @@ fn process_response(
             return TranslationTaskOutcome::unavailable(
                 input.task_index,
                 input.attempt,
-                request_id,
-                Some(finish_reason),
+                Some(final_response),
                 TranslationTaskUnavailableReason::ModelResponseUnusable,
                 unresolved_all(
                     &input.expected_outputs,
@@ -706,8 +762,7 @@ fn process_response(
         TranslationTaskOutcome::complete(
             input.task_index,
             input.attempt,
-            request_id,
-            Some(finish_reason),
+            Some(final_response),
             accepted,
             diagnostics,
         )
@@ -716,8 +771,7 @@ fn process_response(
         TranslationTaskOutcome::unavailable(
             input.task_index,
             input.attempt,
-            request_id,
-            Some(finish_reason),
+            Some(final_response),
             TranslationTaskUnavailableReason::AllOutputsRejected,
             unresolved,
             diagnostics,
@@ -727,8 +781,7 @@ fn process_response(
         TranslationTaskOutcome::partial(
             input.task_index,
             input.attempt,
-            request_id,
-            Some(finish_reason),
+            Some(final_response),
             accepted,
             unresolved,
             diagnostics,
@@ -1275,6 +1328,7 @@ mod tests {
                     r#"[{"id":"0","translation":"炎之剑\\N[1]！"}]"#,
                     LlmFinishReason::Stop,
                     Some("request-1".to_owned()),
+                    "response-1",
                     Some(LlmUsage::new(10, 5, 15)),
                 ),
                 1,
@@ -1285,7 +1339,12 @@ mod tests {
         assert_eq!(result.task_index(), StandardTranslationTaskIndex::new(2));
         assert!(matches!(result.status(), TranslationTaskStatus::Complete));
         assert_eq!(result.attempts(), 1);
-        assert_eq!(result.request_id(), Some("request-1"));
+        assert_eq!(result.provider_request_id(), Some("request-1"));
+        assert_eq!(result.provider_response_id(), Some("response-1"));
+        assert_eq!(
+            result.final_response_usage(),
+            Some(LlmUsage::new(10, 5, 15))
+        );
         assert_eq!(result.accepted()[0].translation(), "炎之剑\\N[1]！");
         assert_eq!(
             result.accepted()[0].propagation_targets(),
@@ -1306,6 +1365,7 @@ mod tests {
                     r#"[{"id":0,"translation":"炎\uFEFF之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
                     LlmFinishReason::Stop,
                     None,
+                    "response-bom",
                     None,
                 ),
                 1,
@@ -1324,6 +1384,7 @@ mod tests {
                     r#"[{"id":0,"translation":" \r\n⟦ATT_ACTOR_NAME_WHOLE_0000⟧\r"}]"#,
                     LlmFinishReason::Stop,
                     None,
+                    "response-natural",
                     None,
                 ),
                 1,
@@ -1342,6 +1403,7 @@ mod tests {
                     r#"[{"id":0,"translation":"第一行\r\n第二行\r⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
                     LlmFinishReason::Stop,
                     None,
+                    "response-normalized",
                     None,
                 ),
                 1,
@@ -1439,6 +1501,7 @@ mod tests {
                     ]"#,
                     LlmFinishReason::Stop,
                     None,
+                    "response-unknown-token",
                     None,
                 ),
                 1,
@@ -1537,6 +1600,7 @@ mod tests {
                     ]"#,
                     LlmFinishReason::Length,
                     Some("request-partial".to_owned()),
+                    "response-partial",
                     None,
                 ),
                 2,
@@ -1609,7 +1673,13 @@ mod tests {
             let result = processor
                 .process(
                     &task_with_output_count(2),
-                    LlmResponse::new(content, LlmFinishReason::Stop, None, None),
+                    LlmResponse::new(
+                        content,
+                        LlmFinishReason::Stop,
+                        None,
+                        "response-schema",
+                        None,
+                    ),
                     1,
                 )
                 .await
@@ -1641,7 +1711,13 @@ mod tests {
         let invalid_json = processor
             .process(
                 &task(),
-                LlmResponse::new("not-json", LlmFinishReason::Stop, None, None),
+                LlmResponse::new(
+                    "not-json",
+                    LlmFinishReason::Stop,
+                    None,
+                    "response-invalid-json",
+                    None,
+                ),
                 1,
             )
             .await
@@ -1668,6 +1744,7 @@ mod tests {
                     r#"[{"id":0,"translation":""}]"#,
                     LlmFinishReason::Stop,
                     None,
+                    "response-rejected",
                     None,
                 ),
                 1,
@@ -1693,7 +1770,7 @@ mod tests {
         let error = processor
             .process(
                 &task(),
-                LlmResponse::new("[]", LlmFinishReason::Stop, None, None),
+                LlmResponse::new("[]", LlmFinishReason::Stop, None, "response-cpu", None),
                 1,
             )
             .await
@@ -1718,6 +1795,7 @@ mod tests {
                     r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
                     LlmFinishReason::Stop,
                     None,
+                    "response-language",
                     None,
                 ),
                 1,
@@ -1741,6 +1819,7 @@ mod tests {
                         r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
                         LlmFinishReason::Stop,
                         None,
+                        "response-mismatch",
                         None,
                     ),
                     1,
@@ -1755,7 +1834,13 @@ mod tests {
         let invariant_error = processor
             .process(
                 &task_with_output_count(0),
-                LlmResponse::new("[]", LlmFinishReason::Stop, None, None),
+                LlmResponse::new(
+                    "[]",
+                    LlmFinishReason::Stop,
+                    None,
+                    "response-invariant",
+                    None,
+                ),
                 1,
             )
             .await
@@ -1859,6 +1944,7 @@ mod tests {
                         r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
                         LlmFinishReason::Stop,
                         None,
+                        "response-retry",
                         None,
                     )),
                 ]))),
@@ -1900,12 +1986,14 @@ mod tests {
                         r#"[{"id":0,"translation":123}]"#,
                         LlmFinishReason::Stop,
                         None,
+                        "response-invalid-shape",
                         None,
                     )),
                     Ok(LlmResponse::new(
                         r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
                         LlmFinishReason::Stop,
                         None,
+                        "response-unused",
                         None,
                     )),
                 ]))),
@@ -2077,6 +2165,7 @@ mod tests {
                     r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
                     LlmFinishReason::Stop,
                     None,
+                    "response-send",
                     None,
                 ))]))),
                 messages: Arc::new(Mutex::new(Vec::new())),

@@ -2,10 +2,6 @@
 
 mod layout;
 
-#[allow(
-    unused_imports,
-    reason = "布局实现属于本批生产组合根尚未接线的 WriteBack 非根能力"
-)]
 pub(crate) use layout::ConservativeMzWriteBackTextLayouter;
 
 use std::cmp::Ordering;
@@ -21,6 +17,7 @@ use super::{
 use crate::att_mz::ProjectName;
 use crate::att_mz::project::{MaxFullwidthChars, MzWriteBackLayoutProfile, OpenedProject};
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind};
+use crate::execution::{CooperativeCancellation, OperationCancelled};
 use crate::observability::PersistentEventLog;
 
 /// 数据库资产叶子在 Standard 写回中的结构化角色。
@@ -110,36 +107,24 @@ impl StandardWriteBackLeaf {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn role(&self) -> &StandardWriteBackFieldRole {
         &self.role
     }
 
+    #[cfg(test)]
     pub(crate) fn exact_location(&self) -> &MzLocation {
         &self.exact_location
     }
 
+    #[cfg(test)]
     pub(crate) fn original_text(&self) -> &str {
         &self.original_text
     }
 
+    #[cfg(test)]
     pub(crate) fn translation(&self) -> Option<&str> {
         self.translation.as_deref()
-    }
-
-    fn into_parts(
-        self,
-    ) -> (
-        StandardWriteBackFieldRole,
-        MzLocation,
-        String,
-        Option<String>,
-    ) {
-        (
-            self.role,
-            self.exact_location,
-            self.original_text,
-            self.translation,
-        )
     }
 }
 
@@ -204,14 +189,17 @@ impl StandardWriteBackGroup {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn kind(&self) -> TextGroupKind {
         self.kind
     }
 
+    #[cfg(test)]
     pub(crate) fn group_location(&self) -> &MzLocation {
         &self.group_location
     }
 
+    #[cfg(test)]
     pub(crate) fn leaves(&self) -> &[StandardWriteBackLeaf] {
         &self.leaves
     }
@@ -261,6 +249,7 @@ impl StandardWriteBackSnapshot {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn groups(&self) -> &[StandardWriteBackGroup] {
         &self.groups
     }
@@ -584,10 +573,6 @@ impl MzWriteBackLayoutSegment {
         &self.exact_location
     }
 
-    pub(crate) fn original_text(&self) -> &str {
-        &self.original_text
-    }
-
     pub(crate) fn candidate(&self) -> &MzWriteBackLayoutCandidate {
         &self.candidate
     }
@@ -635,10 +620,12 @@ impl MzWriteBackLayoutRequest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn unit_location(&self) -> &MzLocation {
         &self.unit_location
     }
 
+    #[cfg(test)]
     pub(crate) const fn region(&self) -> MzWriteBackLayoutRegion {
         self.region
     }
@@ -685,10 +672,12 @@ impl MzWriteBackLaidOutSegment {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn exact_location(&self) -> &MzLocation {
         &self.exact_location
     }
 
+    #[cfg(test)]
     pub(crate) fn lines(&self) -> &[String] {
         &self.lines
     }
@@ -752,14 +741,17 @@ impl MzWriteBackAppliedLayout {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn segments(&self) -> &[MzWriteBackLaidOutSegment] {
         &self.segments
     }
 
+    #[cfg(test)]
     pub(crate) const fn inserted_line_breaks(&self) -> usize {
         self.inserted_line_breaks
     }
 
+    #[cfg(test)]
     pub(crate) const fn inserted_fullwidth_indents(&self) -> usize {
         self.inserted_fullwidth_indents
     }
@@ -1090,6 +1082,7 @@ impl StandardWriteBackMutationPlan {
         Ok(Self { mutations })
     }
 
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self::default()
     }
@@ -1207,14 +1200,16 @@ impl ManualLayoutDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StandardWriteBackRunLog {
     name: ProjectName,
+    layout_profile: MzWriteBackLayoutProfile,
     output_root: PathBuf,
     summary: StandardWriteBackSummary,
     manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
 }
 
 impl StandardWriteBackRunLog {
-    fn new(
+    pub(crate) fn new(
         project: &OpenedProject,
+        layout_profile: MzWriteBackLayoutProfile,
         summary: StandardWriteBackSummary,
         manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
     ) -> Self {
@@ -1225,6 +1220,7 @@ impl StandardWriteBackRunLog {
         );
         Self {
             name: project.name().clone(),
+            layout_profile,
             output_root: project.write_back_root().to_path_buf(),
             summary,
             manual_layout_diagnostics,
@@ -1233,6 +1229,10 @@ impl StandardWriteBackRunLog {
 
     pub(crate) fn name(&self) -> &ProjectName {
         &self.name
+    }
+
+    pub(crate) const fn layout_profile(&self) -> MzWriteBackLayoutProfile {
+        self.layout_profile
     }
 
     pub(crate) fn output_root(&self) -> &Path {
@@ -1255,6 +1255,7 @@ pub(crate) struct StandardWriteBackService<R, L, D, P, J> {
     document_rewriter: D,
     publisher: P,
     event_log: J,
+    cancellation: CooperativeCancellation,
 }
 
 impl<R, L, D, P, J> StandardWriteBackService<R, L, D, P, J> {
@@ -1264,6 +1265,7 @@ impl<R, L, D, P, J> StandardWriteBackService<R, L, D, P, J> {
         document_rewriter: D,
         publisher: P,
         event_log: J,
+        cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             asset_reader,
@@ -1271,6 +1273,7 @@ impl<R, L, D, P, J> StandardWriteBackService<R, L, D, P, J> {
             document_rewriter,
             publisher,
             event_log,
+            cancellation,
         }
     }
 }
@@ -1290,17 +1293,29 @@ where
         project: &OpenedProject,
         layout_profile: &MzWriteBackLayoutProfile,
     ) -> Result<StandardWriteBackReport, Self::Error> {
+        self.cancellation
+            .check()
+            .map_err(StandardWriteBackServiceError::Cancelled)?;
         let snapshot = self
             .asset_reader
             .read(project)
             .await
             .map_err(StandardWriteBackServiceError::ReadAssets)?;
+        self.cancellation
+            .check()
+            .map_err(StandardWriteBackServiceError::Cancelled)?;
         let planned = plan_standard_write_back(snapshot, layout_profile, &self.text_layouter);
+        self.cancellation
+            .check()
+            .map_err(StandardWriteBackServiceError::Cancelled)?;
         let rewritten = self
             .document_rewriter
             .rewrite(project, planned.mutation_plan)
             .await
             .map_err(StandardWriteBackServiceError::RewriteDocuments)?;
+        self.cancellation
+            .check()
+            .map_err(StandardWriteBackServiceError::Cancelled)?;
         self.publisher
             .publish(project, rewritten)
             .await
@@ -1311,6 +1326,7 @@ where
         self.event_log
             .append(StandardWriteBackRunLog::new(
                 project,
+                *layout_profile,
                 planned.summary,
                 planned.manual_layout_diagnostics,
             ))
@@ -1319,6 +1335,10 @@ where
                 output_root,
                 source,
             })?;
+
+        self.cancellation
+            .check()
+            .map_err(StandardWriteBackServiceError::Cancelled)?;
 
         Ok(StandardWriteBackReport::new(published, planned.summary))
     }
@@ -1620,6 +1640,7 @@ fn is_canonical_help_description(leaf: &StandardWriteBackLeaf) -> bool {
 /// Standard 在四个业务依赖和发布后日志边界上遇到的技术失败。
 #[derive(Debug)]
 pub(crate) enum StandardWriteBackServiceError<R, D, P, J> {
+    Cancelled(OperationCancelled),
     ReadAssets(R),
     RewriteDocuments(D),
     Publish(P),
@@ -1635,6 +1656,7 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
             Self::ReadAssets(source) => write!(formatter, "读取 Standard 写回资产失败：{source}"),
             Self::RewriteDocuments(source) => write!(formatter, "改写 MZ 文档失败：{source}"),
             Self::Publish(source) => write!(formatter, "发布 Standard 写回输出失败：{source}"),
@@ -1659,6 +1681,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
             Self::ReadAssets(source) => Some(source),
             Self::RewriteDocuments(source) => Some(source),
             Self::Publish(source) => Some(source),
@@ -1903,6 +1926,7 @@ mod tests {
                     fail: failing_stage == Some("log"),
                     recording: Arc::clone(&recording),
                 },
+                CooperativeCancellation::default(),
             );
             Self { service, recording }
         }

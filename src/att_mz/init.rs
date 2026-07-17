@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "初始化非根能力尚未接入生产组合根")]
-
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -7,11 +5,12 @@ use std::path::PathBuf;
 
 use super::ProjectName;
 use super::project::MzWriteBackLayoutProfile;
+use crate::execution::{CooperativeCancellation, OperationCancelled};
 use crate::project_database::{NewProject, ProjectDatabaseCreator, ProjectWorkspaceLayout};
 use crate::storage::file_system::{
-    AtomicDirectoryDiscardError, AtomicDirectoryPrepareError, AtomicDirectoryPublishError,
-    AtomicDirectoryPublisher, DirectoryPublishMode, DirectorySourceMapping, DirectoryStageRequest,
-    DirectoryStageRequestError, ExistingDirectoryResolver, ResolveDirectoryError,
+    DirectoryDiscardError, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
+    DirectorySourceMapping, DirectoryStageRequest, DirectoryStageRequestError,
+    ExistingDirectoryResolver, RecoverableDirectoryPublisher, ResolveDirectoryError,
 };
 
 /// 初始化 MZ 游戏所需的输入。
@@ -56,10 +55,12 @@ impl NewProjectWorkspace {
     }
 
     /// 返回仅用于本次导入的原游戏根目录。
+    #[cfg(test)]
     pub(crate) fn source_game_root(&self) -> &std::path::Path {
         &self.source_game_root
     }
 
+    #[cfg(test)]
     pub(crate) fn project(&self) -> &NewProject {
         &self.project
     }
@@ -70,7 +71,7 @@ impl NewProjectWorkspace {
     }
 }
 
-/// 原子创建并发布一个冻结项目工作区的职责契约。
+/// 整体创建并发布一个冻结项目工作区的职责契约。
 pub(crate) trait ProjectWorkspaceCreator: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
@@ -90,15 +91,22 @@ pub(crate) struct ProjectWorkspaceCreationService<D, A> {
     projects_root: PathBuf,
     database: D,
     directories: A,
+    cancellation: CooperativeCancellation,
 }
 
 impl<D, A> ProjectWorkspaceCreationService<D, A> {
     /// 使用外部配置建立的项目根目录与两个直接依赖创建服务。
-    pub(crate) fn new(projects_root: PathBuf, database: D, directories: A) -> Self {
+    pub(crate) fn new(
+        projects_root: PathBuf,
+        database: D,
+        directories: A,
+        cancellation: CooperativeCancellation,
+    ) -> Self {
         Self {
             projects_root,
             database,
             directories,
+            cancellation,
         }
     }
 }
@@ -106,15 +114,19 @@ impl<D, A> ProjectWorkspaceCreationService<D, A> {
 impl<D, A> ProjectWorkspaceCreator for ProjectWorkspaceCreationService<D, A>
 where
     D: ProjectDatabaseCreator,
-    A: AtomicDirectoryPublisher,
+    A: RecoverableDirectoryPublisher,
 {
     type Error = ProjectWorkspaceCreationError<D::Error, A::Error>;
 
     async fn create(&self, workspace: NewProjectWorkspace) -> Result<(), Self::Error> {
+        self.cancellation
+            .check()
+            .map_err(ProjectWorkspaceCreationError::Cancelled)?;
         let (source_game_root, project) = workspace.into_parts();
         let final_layout = ProjectWorkspaceLayout::for_project(&self.projects_root, project.name());
         let request = DirectoryStageRequest::new(
             final_layout.workspace_root().to_path_buf(),
+            DirectoryPublishIntent::CreateNew,
             vec![
                 DirectorySourceMapping::new(
                     source_game_root.join("data"),
@@ -137,6 +149,15 @@ where
             .prepare(request)
             .await
             .map_err(ProjectWorkspaceCreationError::Prepare)?;
+        if let Err(cancellation) = self.cancellation.check() {
+            return match self.directories.discard(staged).await {
+                Ok(()) => Err(ProjectWorkspaceCreationError::Cancelled(cancellation)),
+                Err(discard) => Err(ProjectWorkspaceCreationError::CancelledAndDiscard {
+                    cancellation,
+                    discard,
+                }),
+            };
+        }
         let staged_layout =
             ProjectWorkspaceLayout::from_workspace_root(staged.staging_root().to_path_buf());
 
@@ -153,8 +174,18 @@ where
             };
         }
 
+        if let Err(cancellation) = self.cancellation.check() {
+            return match self.directories.discard(staged).await {
+                Ok(()) => Err(ProjectWorkspaceCreationError::Cancelled(cancellation)),
+                Err(discard) => Err(ProjectWorkspaceCreationError::CancelledAndDiscard {
+                    cancellation,
+                    discard,
+                }),
+            };
+        }
+
         self.directories
-            .publish(staged, DirectoryPublishMode::CreateNew)
+            .publish(staged)
             .await
             .map_err(ProjectWorkspaceCreationError::Publish)
     }
@@ -163,14 +194,19 @@ where
 /// 创建完整工作区时可以精确定位的失败阶段。
 #[derive(Debug)]
 pub(crate) enum ProjectWorkspaceCreationError<D, A> {
+    Cancelled(OperationCancelled),
+    CancelledAndDiscard {
+        cancellation: OperationCancelled,
+        discard: DirectoryDiscardError<A>,
+    },
     InvalidStageRequest(DirectoryStageRequestError),
-    Prepare(AtomicDirectoryPrepareError<A>),
+    Prepare(DirectoryPrepareError<A>),
     Database(D),
     DatabaseAndDiscard {
         database: D,
-        discard: AtomicDirectoryDiscardError<A>,
+        discard: DirectoryDiscardError<A>,
     },
-    Publish(AtomicDirectoryPublishError<A>),
+    Publish(DirectoryPublishError<A>),
 }
 
 impl<D, A> From<DirectoryStageRequestError> for ProjectWorkspaceCreationError<D, A> {
@@ -186,6 +222,14 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
+            Self::CancelledAndDiscard {
+                cancellation,
+                discard,
+            } => write!(
+                formatter,
+                "{cancellation}，且无法清理工作区候选目录：{discard}"
+            ),
             Self::InvalidStageRequest(error) => {
                 write!(formatter, "工作区暂存请求无效：{error}")
             }
@@ -207,6 +251,8 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
+            Self::CancelledAndDiscard { discard, .. } => Some(discard),
             Self::InvalidStageRequest(error) => Some(error),
             Self::Prepare(error) => Some(error),
             Self::Database(error) => Some(error),
@@ -220,13 +266,19 @@ where
 pub(crate) struct InitService<F, W> {
     file_system: F,
     workspace_creator: W,
+    cancellation: CooperativeCancellation,
 }
 
 impl<F, W> InitService<F, W> {
-    pub(crate) fn new(file_system: F, workspace_creator: W) -> Self {
+    pub(crate) fn new(
+        file_system: F,
+        workspace_creator: W,
+        cancellation: CooperativeCancellation,
+    ) -> Self {
         Self {
             file_system,
             workspace_creator,
+            cancellation,
         }
     }
 }
@@ -239,6 +291,9 @@ where
     type Error = InitServiceError<F::Error, W::Error>;
 
     async fn execute(&self, input: InitInput) -> Result<InitOutput, Self::Error> {
+        self.cancellation
+            .check()
+            .map_err(InitServiceError::Cancelled)?;
         let source_language =
             normalized_language(input.source_language, InitServiceError::EmptySourceLanguage)?;
         let target_language =
@@ -249,6 +304,9 @@ where
             .resolve_existing_directory(input.game_root)
             .await
             .map_err(InitServiceError::GameRoot)?;
+        self.cancellation
+            .check()
+            .map_err(InitServiceError::Cancelled)?;
 
         let output_name = input.name.clone();
         let project = NewProject::new(
@@ -281,6 +339,7 @@ fn normalized_language<F, W>(
 /// 初始化编排在本职责边界内能够产生的错误。
 #[derive(Debug)]
 pub(crate) enum InitServiceError<F, W> {
+    Cancelled(OperationCancelled),
     EmptySourceLanguage,
     EmptyTargetLanguage,
     GameRoot(ResolveDirectoryError<F>),
@@ -294,6 +353,7 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
             Self::EmptySourceLanguage => formatter.write_str("源语言去除首尾空白后不能为空"),
             Self::EmptyTargetLanguage => formatter.write_str("目标语言去除首尾空白后不能为空"),
             Self::GameRoot(error) => write!(formatter, "无法使用游戏根目录：{error}"),
@@ -309,6 +369,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
             Self::GameRoot(error) => Some(error),
             Self::Workspace(error) => Some(error),
             Self::EmptySourceLanguage | Self::EmptyTargetLanguage => None,
@@ -458,6 +519,7 @@ mod tests {
         let service = InitService::new(
             FakeFileSystem::new(FileSystemOutcome::Resolved(resolved_root.clone())),
             FakeCreator::succeeding(),
+            CooperativeCancellation::default(),
         );
 
         let output = service.execute(input()).await.expect("初始化编排应该成功");
@@ -494,6 +556,7 @@ mod tests {
             let service = InitService::new(
                 FakeFileSystem::new(FileSystemOutcome::Resolved(PathBuf::from("C:/Games/Demo"))),
                 FakeCreator::succeeding(),
+                CooperativeCancellation::default(),
             );
             let mut request = input();
             request.source_language = source_language.to_owned();
@@ -538,7 +601,11 @@ mod tests {
             (FileSystemOutcome::NotDirectory, "not-directory"),
             (FileSystemOutcome::Io, "io"),
         ] {
-            let service = InitService::new(FakeFileSystem::new(outcome), FakeCreator::succeeding());
+            let service = InitService::new(
+                FakeFileSystem::new(outcome),
+                FakeCreator::succeeding(),
+                CooperativeCancellation::default(),
+            );
 
             let error = service
                 .execute(input())
@@ -573,6 +640,7 @@ mod tests {
         let service = InitService::new(
             FakeFileSystem::new(FileSystemOutcome::Resolved(PathBuf::from("C:/Games/Demo"))),
             FakeCreator::failing(),
+            CooperativeCancellation::default(),
         );
 
         let error = service
@@ -602,6 +670,7 @@ mod tests {
         let service = InitService::new(
             FakeFileSystem::new(FileSystemOutcome::Resolved(resolved_path.clone())),
             FakeCreator::succeeding(),
+            CooperativeCancellation::default(),
         );
 
         service
@@ -625,6 +694,7 @@ mod tests {
         let service = InitService::new(
             FakeFileSystem::new(FileSystemOutcome::Resolved(PathBuf::from("C:/Games/Demo"))),
             FakeCreator::succeeding(),
+            CooperativeCancellation::default(),
         );
 
         assert_send(service.execute(input()));
@@ -674,7 +744,7 @@ mod workspace_creation_service_tests {
         Prepare,
         Database,
         Discard,
-        Publish(DirectoryPublishMode),
+        Publish(DirectoryPublishIntent),
     }
 
     #[derive(Debug, Default)]
@@ -703,7 +773,7 @@ mod workspace_creation_service_tests {
     struct CapturedPublication {
         target_root: PathBuf,
         staging_root: PathBuf,
-        mode: DirectoryPublishMode,
+        mode: DirectoryPublishIntent,
     }
 
     #[derive(Clone)]
@@ -748,25 +818,27 @@ mod workspace_creation_service_tests {
         }
     }
 
-    struct RecordingAtomicPublisher {
+    struct RecordingRecoverablePublisher {
         staging_root: PathBuf,
         trace: Arc<Mutex<Trace>>,
         prepare_fails: bool,
         prepare_cleanup_fails: bool,
         discard_fails: bool,
         publish_failure: Option<PublishFailure>,
+        cancel_after_prepare: Option<CooperativeCancellation>,
     }
 
-    impl AtomicDirectoryPublisher for RecordingAtomicPublisher {
+    impl RecoverableDirectoryPublisher for RecordingRecoverablePublisher {
         type Error = RootError;
         type StagingState = ();
 
         async fn prepare(
             &self,
             request: DirectoryStageRequest,
-        ) -> Result<StagedDirectory<Self::StagingState>, AtomicDirectoryPrepareError<Self::Error>>
+        ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>>
         {
             let target_root = request.target_root().to_path_buf();
+            let publish_intent = request.publish_intent();
             let captured = CapturedStageRequest {
                 target_root: target_root.clone(),
                 source_mappings: request
@@ -788,7 +860,7 @@ mod workspace_creation_service_tests {
             drop(trace);
 
             if self.prepare_fails {
-                return Err(AtomicDirectoryPrepareError::NotPrepared {
+                return Err(DirectoryPrepareError::NotPrepared {
                     target_root,
                     source: RootError,
                     cleanup_failure: self
@@ -797,9 +869,14 @@ mod workspace_creation_service_tests {
                 });
             }
 
+            if let Some(cancellation) = &self.cancel_after_prepare {
+                cancellation.request();
+            }
+
             Ok(StagedDirectory::new(
                 target_root,
                 self.staging_root.clone(),
+                publish_intent,
                 (),
             ))
         }
@@ -807,8 +884,8 @@ mod workspace_creation_service_tests {
         async fn publish(
             &self,
             staged: StagedDirectory<Self::StagingState>,
-            mode: DirectoryPublishMode,
-        ) -> Result<(), AtomicDirectoryPublishError<Self::Error>> {
+        ) -> Result<(), DirectoryPublishError<Self::Error>> {
+            let mode = staged.publish_intent();
             let mut trace = self.trace.lock().expect("记录锁不应中毒");
             trace.events.push(Event::Publish(mode));
             trace.publication = Some(CapturedPublication {
@@ -820,27 +897,37 @@ mod workspace_creation_service_tests {
             match self.publish_failure {
                 None => Ok(()),
                 Some(PublishFailure::TargetAlreadyExists) => {
-                    Err(AtomicDirectoryPublishError::TargetAlreadyExists {
+                    Err(DirectoryPublishError::TargetAlreadyExists {
                         target_root,
                         cleanup_failure: None,
                     })
                 }
-                Some(PublishFailure::NotPublished) => {
-                    Err(AtomicDirectoryPublishError::NotPublished {
-                        target_root,
-                        source: RootError,
-                        cleanup_failure: None,
-                    })
-                }
-                Some(PublishFailure::PublishedButCleanupFailed) => {
-                    Err(AtomicDirectoryPublishError::PublishedButCleanupFailed {
+                Some(PublishFailure::NotAttempted) => Err(DirectoryPublishError::NotAttempted {
+                    target_root,
+                    source: RootError,
+                    cleanup_failure: None,
+                }),
+                Some(PublishFailure::NotPublished) => Err(DirectoryPublishError::NotPublished {
+                    target_root,
+                    source: RootError,
+                    cleanup_failure: None,
+                }),
+                Some(PublishFailure::PublishedWithResiduals) => {
+                    Err(DirectoryPublishError::PublishedWithResiduals {
                         target_root,
                         residual_path: PathBuf::from("C:/ATT/projects/.old-demo"),
                         source: RootError,
                     })
                 }
+                Some(PublishFailure::RecoveryRequired) => {
+                    Err(DirectoryPublishError::RecoveryRequired {
+                        target_root,
+                        recovery_artifacts: vec![PathBuf::from("C:/ATT/projects/.recovery-demo")],
+                        source: RootError,
+                    })
+                }
                 Some(PublishFailure::OutcomeUnknown) => {
-                    Err(AtomicDirectoryPublishError::OutcomeUnknown {
+                    Err(DirectoryPublishError::OutcomeUnknown {
                         target_root,
                         recovery_artifacts: vec![PathBuf::from("C:/ATT/projects/.recovery-demo")],
                         source: RootError,
@@ -852,14 +939,14 @@ mod workspace_creation_service_tests {
         async fn discard(
             &self,
             _staged: StagedDirectory<Self::StagingState>,
-        ) -> Result<(), AtomicDirectoryDiscardError<Self::Error>> {
+        ) -> Result<(), DirectoryDiscardError<Self::Error>> {
             self.trace
                 .lock()
                 .expect("记录锁不应中毒")
                 .events
                 .push(Event::Discard);
             if self.discard_fails {
-                Err(AtomicDirectoryDiscardError::new(
+                Err(DirectoryDiscardError::new(
                     self.staging_root.clone(),
                     RootError,
                 ))
@@ -872,8 +959,10 @@ mod workspace_creation_service_tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum PublishFailure {
         TargetAlreadyExists,
+        NotAttempted,
         NotPublished,
-        PublishedButCleanupFailed,
+        PublishedWithResiduals,
+        RecoveryRequired,
         OutcomeUnknown,
     }
 
@@ -984,12 +1073,12 @@ mod workspace_creation_service_tests {
     }
 
     #[derive(Clone)]
-    struct LinearizingAtomicPublisher {
+    struct LinearizingRecoverablePublisher {
         owner_id: u64,
         state: Arc<Mutex<LinearizingState>>,
     }
 
-    impl LinearizingAtomicPublisher {
+    impl LinearizingRecoverablePublisher {
         fn new(owner_id: u64) -> Self {
             Self {
                 owner_id,
@@ -998,16 +1087,17 @@ mod workspace_creation_service_tests {
         }
     }
 
-    impl AtomicDirectoryPublisher for LinearizingAtomicPublisher {
+    impl RecoverableDirectoryPublisher for LinearizingRecoverablePublisher {
         type Error = RootError;
         type StagingState = LinearizingStageState;
 
         async fn prepare(
             &self,
             request: DirectoryStageRequest,
-        ) -> Result<StagedDirectory<Self::StagingState>, AtomicDirectoryPrepareError<Self::Error>>
+        ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>>
         {
             let target_root = request.target_root().to_path_buf();
+            let publish_intent = request.publish_intent();
             let sequence = {
                 let mut state = self.state.lock().expect("线性化状态锁不应中毒");
                 let sequence = state.next_sequence;
@@ -1019,6 +1109,7 @@ mod workspace_creation_service_tests {
             Ok(StagedDirectory::new(
                 target_root.clone(),
                 staging_root,
+                publish_intent,
                 LinearizingStageState {
                     owner_id: self.owner_id,
                     target_root,
@@ -1030,21 +1121,20 @@ mod workspace_creation_service_tests {
         async fn publish(
             &self,
             staged: StagedDirectory<Self::StagingState>,
-            mode: DirectoryPublishMode,
-        ) -> Result<(), AtomicDirectoryPublishError<Self::Error>> {
-            let (target_root, _staging_root, token) = staged.into_parts();
+        ) -> Result<(), DirectoryPublishError<Self::Error>> {
+            let (target_root, _staging_root, mode, token) = staged.into_parts();
             if token.owner_id != self.owner_id || token.target_root != target_root {
-                return Err(AtomicDirectoryPublishError::NotPublished {
+                return Err(DirectoryPublishError::NotPublished {
                     target_root,
                     source: RootError,
                     cleanup_failure: None,
                 });
             }
-            assert_eq!(mode, DirectoryPublishMode::CreateNew);
+            assert_eq!(mode, DirectoryPublishIntent::CreateNew);
 
             let mut state = self.state.lock().expect("线性化状态锁不应中毒");
             if !state.published_targets.insert(target_root.clone()) {
-                return Err(AtomicDirectoryPublishError::TargetAlreadyExists {
+                return Err(DirectoryPublishError::TargetAlreadyExists {
                     target_root,
                     cleanup_failure: None,
                 });
@@ -1056,12 +1146,12 @@ mod workspace_creation_service_tests {
         async fn discard(
             &self,
             staged: StagedDirectory<Self::StagingState>,
-        ) -> Result<(), AtomicDirectoryDiscardError<Self::Error>> {
-            let (target_root, staging_root, token) = staged.into_parts();
+        ) -> Result<(), DirectoryDiscardError<Self::Error>> {
+            let (target_root, staging_root, _intent, token) = staged.into_parts();
             if token.owner_id == self.owner_id && token.target_root == target_root {
                 Ok(())
             } else {
-                Err(AtomicDirectoryDiscardError::new(staging_root, RootError))
+                Err(DirectoryDiscardError::new(staging_root, RootError))
             }
         }
     }
@@ -1079,8 +1169,10 @@ mod workspace_creation_service_tests {
                 ProjectDatabaseCreationService::new(RecordingSqliteCreator {
                     trace: Arc::clone(&trace),
                 }),
-                atomic_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-game-one"),
+                directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-game-one"),
+                CooperativeCancellation::default(),
             ),
+            CooperativeCancellation::default(),
         );
 
         let output = service
@@ -1096,7 +1188,7 @@ mod workspace_creation_service_tests {
                 Event::Resolve,
                 Event::Prepare,
                 Event::Database,
-                Event::Publish(DirectoryPublishMode::CreateNew),
+                Event::Publish(DirectoryPublishIntent::CreateNew),
             ]
         );
         assert_eq!(
@@ -1143,14 +1235,14 @@ mod workspace_creation_service_tests {
             Some(&CapturedPublication {
                 target_root: PathBuf::from("C:/ATT/projects/游戏 一"),
                 staging_root: PathBuf::from("C:/ATT/projects/.stage-game-one"),
-                mode: DirectoryPublishMode::CreateNew,
+                mode: DirectoryPublishIntent::CreateNew,
             })
         );
     }
 
     #[tokio::test]
     async fn concurrent_same_name_init_is_linearized_only_by_create_new_publish() {
-        let root = LinearizingAtomicPublisher::new(7);
+        let root = LinearizingRecoverablePublisher::new(7);
         let database = SuccessfulDatabaseCreator::default();
         let trace = Arc::new(Mutex::new(Trace::default()));
         let first = concurrent_init_service(root.clone(), database.clone(), Arc::clone(&trace));
@@ -1169,7 +1261,7 @@ mod workspace_creation_service_tests {
                         result,
                         Err(InitServiceError::Workspace(
                             ProjectWorkspaceCreationError::Publish(
-                                AtomicDirectoryPublishError::TargetAlreadyExists { .. }
+                                DirectoryPublishError::TargetAlreadyExists { .. }
                             )
                         ))
                     )
@@ -1193,7 +1285,7 @@ mod workspace_creation_service_tests {
 
     #[tokio::test]
     async fn concurrent_different_projects_publish_only_their_own_tokens() {
-        let root = LinearizingAtomicPublisher::new(11);
+        let root = LinearizingRecoverablePublisher::new(11);
         let database = SuccessfulDatabaseCreator::default();
         let trace = Arc::new(Mutex::new(Trace::default()));
         let first = concurrent_init_service(root.clone(), database.clone(), Arc::clone(&trace));
@@ -1224,10 +1316,11 @@ mod workspace_creation_service_tests {
 
     #[tokio::test]
     async fn staged_token_is_rejected_by_a_different_publisher_instance() {
-        let first_root = LinearizingAtomicPublisher::new(21);
-        let second_root = LinearizingAtomicPublisher::new(22);
+        let first_root = LinearizingRecoverablePublisher::new(21);
+        let second_root = LinearizingRecoverablePublisher::new(22);
         let request = DirectoryStageRequest::new(
             PathBuf::from("C:/ATT/projects/demo"),
+            DirectoryPublishIntent::CreateNew,
             vec![
                 DirectorySourceMapping::new(
                     PathBuf::from("C:/Games/Demo/data"),
@@ -1245,13 +1338,13 @@ mod workspace_creation_service_tests {
             .expect("第一个根应该准备候选");
 
         let error = second_root
-            .publish(staged, DirectoryPublishMode::CreateNew)
+            .publish(staged)
             .await
             .expect_err("候选 token 不得交给另一个根实例");
 
         assert!(matches!(
             error,
-            AtomicDirectoryPublishError::NotPublished {
+            DirectoryPublishError::NotPublished {
                 target_root,
                 cleanup_failure: None,
                 ..
@@ -1294,7 +1387,8 @@ mod workspace_creation_service_tests {
             FailingDatabaseCreator {
                 trace: Arc::clone(&trace),
             },
-            atomic_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo"),
+            directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo"),
+            CooperativeCancellation::default(),
         );
 
         let error = service
@@ -1313,9 +1407,36 @@ mod workspace_creation_service_tests {
     }
 
     #[tokio::test]
+    async fn cancellation_after_prepare_discards_candidate_before_database_and_publish() {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let cancellation = CooperativeCancellation::default();
+        let mut directories =
+            directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
+        directories.cancel_after_prepare = Some(cancellation.clone());
+        let service = ProjectWorkspaceCreationService::new(
+            PathBuf::from("C:/ATT/projects"),
+            SuccessfulDatabaseCreator::default(),
+            directories,
+            cancellation,
+        );
+
+        let error = service
+            .create(workspace())
+            .await
+            .expect_err("取消后必须显式丢弃候选");
+
+        assert!(matches!(error, ProjectWorkspaceCreationError::Cancelled(_)));
+        assert_eq!(
+            trace.lock().expect("记录锁不应中毒").events,
+            [Event::Prepare, Event::Discard]
+        );
+    }
+
+    #[tokio::test]
     async fn prepare_failure_stops_before_database_publish_and_discard() {
         let trace = Arc::new(Mutex::new(Trace::default()));
-        let mut directories = atomic_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
+        let mut directories =
+            directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
         directories.prepare_fails = true;
         let service = ProjectWorkspaceCreationService::new(
             PathBuf::from("C:/ATT/projects"),
@@ -1323,6 +1444,7 @@ mod workspace_creation_service_tests {
                 trace: Arc::clone(&trace),
             },
             directories,
+            CooperativeCancellation::default(),
         );
 
         let error = service
@@ -1332,7 +1454,7 @@ mod workspace_creation_service_tests {
 
         assert!(matches!(
             error,
-            ProjectWorkspaceCreationError::Prepare(AtomicDirectoryPrepareError::NotPrepared { .. })
+            ProjectWorkspaceCreationError::Prepare(DirectoryPrepareError::NotPrepared { .. })
         ));
         assert_eq!(
             trace.lock().expect("记录锁不应中毒").events,
@@ -1344,7 +1466,7 @@ mod workspace_creation_service_tests {
     async fn prepare_failure_preserves_candidate_cleanup_failure_without_extra_discard() {
         let trace = Arc::new(Mutex::new(Trace::default()));
         let staging_root = PathBuf::from("C:/ATT/projects/.stage-demo");
-        let mut directories = atomic_publisher(
+        let mut directories = directory_publisher(
             Arc::clone(&trace),
             staging_root.to_str().expect("测试路径应为 UTF-8"),
         );
@@ -1356,6 +1478,7 @@ mod workspace_creation_service_tests {
                 trace: Arc::clone(&trace),
             },
             directories,
+            CooperativeCancellation::default(),
         );
 
         let error = service
@@ -1363,7 +1486,7 @@ mod workspace_creation_service_tests {
             .await
             .expect_err("候选准备与内部清理双重失败应该一起返回");
 
-        let ProjectWorkspaceCreationError::Prepare(AtomicDirectoryPrepareError::NotPrepared {
+        let ProjectWorkspaceCreationError::Prepare(DirectoryPrepareError::NotPrepared {
             cleanup_failure: Some(cleanup_failure),
             ..
         }) = error
@@ -1419,7 +1542,8 @@ mod workspace_creation_service_tests {
                     trace: Arc::clone(&trace),
                     error: Mutex::new(Some(database_error)),
                 },
-                atomic_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo"),
+                directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo"),
+                CooperativeCancellation::default(),
             );
 
             let error = service
@@ -1441,7 +1565,8 @@ mod workspace_creation_service_tests {
     #[tokio::test]
     async fn database_and_discard_failures_are_both_preserved() {
         let trace = Arc::new(Mutex::new(Trace::default()));
-        let mut directories = atomic_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
+        let mut directories =
+            directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
         directories.discard_fails = true;
         let service = ProjectWorkspaceCreationService::new(
             PathBuf::from("C:/ATT/projects"),
@@ -1449,6 +1574,7 @@ mod workspace_creation_service_tests {
                 trace: Arc::clone(&trace),
             },
             directories,
+            CooperativeCancellation::default(),
         );
 
         let error = service
@@ -1476,12 +1602,12 @@ mod workspace_creation_service_tests {
         for publish_failure in [
             PublishFailure::TargetAlreadyExists,
             PublishFailure::NotPublished,
-            PublishFailure::PublishedButCleanupFailed,
+            PublishFailure::PublishedWithResiduals,
             PublishFailure::OutcomeUnknown,
         ] {
             let trace = Arc::new(Mutex::new(Trace::default()));
             let mut directories =
-                atomic_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
+                directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
             directories.publish_failure = Some(publish_failure);
             let service = ProjectWorkspaceCreationService::new(
                 PathBuf::from("C:/ATT/projects"),
@@ -1489,6 +1615,7 @@ mod workspace_creation_service_tests {
                     trace: Arc::clone(&trace),
                 }),
                 directories,
+                CooperativeCancellation::default(),
             );
 
             let error = service
@@ -1505,7 +1632,7 @@ mod workspace_creation_service_tests {
                 [
                     Event::Prepare,
                     Event::Database,
-                    Event::Publish(DirectoryPublishMode::CreateNew),
+                    Event::Publish(DirectoryPublishIntent::CreateNew),
                 ]
             );
         }
@@ -1519,7 +1646,8 @@ mod workspace_creation_service_tests {
             FailingDatabaseCreator {
                 trace: Arc::clone(&trace),
             },
-            atomic_publisher(trace, "C:/ATT/projects/.stage-demo"),
+            directory_publisher(trace, "C:/ATT/projects/.stage-demo"),
+            CooperativeCancellation::default(),
         );
 
         assert_send(service.create(workspace()));
@@ -1536,12 +1664,12 @@ mod workspace_creation_service_tests {
     }
 
     fn concurrent_init_service(
-        directories: LinearizingAtomicPublisher,
+        directories: LinearizingRecoverablePublisher,
         database: SuccessfulDatabaseCreator,
         trace: Arc<Mutex<Trace>>,
     ) -> InitService<
         RecordingDirectoryResolver,
-        ProjectWorkspaceCreationService<SuccessfulDatabaseCreator, LinearizingAtomicPublisher>,
+        ProjectWorkspaceCreationService<SuccessfulDatabaseCreator, LinearizingRecoverablePublisher>,
     > {
         InitService::new(
             RecordingDirectoryResolver {
@@ -1552,7 +1680,9 @@ mod workspace_creation_service_tests {
                 PathBuf::from("C:/ATT/projects"),
                 database,
                 directories,
+                CooperativeCancellation::default(),
             ),
+            CooperativeCancellation::default(),
         )
     }
 
@@ -1597,33 +1727,37 @@ mod workspace_creation_service_tests {
         }
     }
 
-    impl From<&AtomicDirectoryPublishError<RootError>> for PublishFailure {
-        fn from(error: &AtomicDirectoryPublishError<RootError>) -> Self {
+    impl From<&DirectoryPublishError<RootError>> for PublishFailure {
+        fn from(error: &DirectoryPublishError<RootError>) -> Self {
             match error {
-                AtomicDirectoryPublishError::TargetAlreadyExists { .. } => {
-                    Self::TargetAlreadyExists
+                DirectoryPublishError::TargetAlreadyExists { .. } => Self::TargetAlreadyExists,
+                DirectoryPublishError::NotAttempted { .. } => Self::NotAttempted,
+                DirectoryPublishError::NotPublished { .. } => Self::NotPublished,
+                DirectoryPublishError::PublishedWithResiduals { .. } => {
+                    Self::PublishedWithResiduals
                 }
-                AtomicDirectoryPublishError::NotPublished { .. } => Self::NotPublished,
-                AtomicDirectoryPublishError::PublishedButCleanupFailed { .. } => {
-                    Self::PublishedButCleanupFailed
-                }
-                AtomicDirectoryPublishError::OutcomeUnknown { .. } => Self::OutcomeUnknown,
-                AtomicDirectoryPublishError::TargetMissing { .. }
-                | AtomicDirectoryPublishError::TargetNotDirectory { .. } => {
+                DirectoryPublishError::RecoveryRequired { .. } => Self::RecoveryRequired,
+                DirectoryPublishError::OutcomeUnknown { .. } => Self::OutcomeUnknown,
+                DirectoryPublishError::TargetMissing { .. }
+                | DirectoryPublishError::TargetNotDirectory { .. } => {
                     panic!("CreateNew 根不应返回 Replace 专属终态")
                 }
             }
         }
     }
 
-    fn atomic_publisher(trace: Arc<Mutex<Trace>>, staging_root: &str) -> RecordingAtomicPublisher {
-        RecordingAtomicPublisher {
+    fn directory_publisher(
+        trace: Arc<Mutex<Trace>>,
+        staging_root: &str,
+    ) -> RecordingRecoverablePublisher {
+        RecordingRecoverablePublisher {
             staging_root: PathBuf::from(staging_root),
             trace,
             prepare_fails: false,
             prepare_cleanup_fails: false,
             discard_fails: false,
             publish_failure: None,
+            cancel_after_prepare: None,
         }
     }
 }

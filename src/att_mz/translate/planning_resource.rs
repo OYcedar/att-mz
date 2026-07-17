@@ -1,12 +1,10 @@
-#![allow(dead_code, reason = "规划资料读取服务等待 Planner 生产装配")]
-
 //! 外部术语与占位符 JSON 的异步读取和 CPU 解析边界。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -36,6 +34,7 @@ impl TranslationPlanningResources {
     }
 
     /// `None` 表示本次没有提供权威术语表；`Some(empty)` 表示权威空集合。
+    #[cfg(test)]
     pub(crate) fn terminology(&self) -> Option<&Arc<CompiledTerminology>> {
         self.terminology.as_ref()
     }
@@ -85,10 +84,6 @@ impl CompiledTerminology {
         &self.entries
     }
 
-    pub(crate) fn entry_at(&self, index: usize) -> &TerminologyEntry {
-        &self.entries[index]
-    }
-
     pub(crate) fn entry(&self, term: &str) -> Option<&TerminologyEntry> {
         self.entry_by_term
             .get(term)
@@ -96,6 +91,7 @@ impl CompiledTerminology {
     }
 
     /// 返回由任意给定原文触发的术语，顺序稳定为术语文件顺序。
+    #[cfg(test)]
     pub(crate) fn triggered_by<'a>(
         &'a self,
         texts: impl IntoIterator<Item = &'a str>,
@@ -436,19 +432,6 @@ where
             Self::InvalidTerminology { source, .. } => Some(source),
             Self::ParsePlaceholderRulesCompute { source, .. } => Some(source),
             Self::InvalidPlaceholderRules { source, .. } => Some(source),
-        }
-    }
-}
-
-impl<F, C> TranslationPlanningResourceReadingError<F, C> {
-    pub(crate) fn path(&self) -> &Path {
-        match self {
-            Self::ReadTerminology { path, .. }
-            | Self::ReadPlaceholderRules { path, .. }
-            | Self::ParseTerminologyCompute { path, .. }
-            | Self::InvalidTerminology { path, .. }
-            | Self::ParsePlaceholderRulesCompute { path, .. }
-            | Self::InvalidPlaceholderRules { path, .. } => path,
         }
     }
 }

@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "MZ 文档读取服务尚未接入根能力生产适配器")]
-
 //! MZ 项目文档的无损读取契约。
 //!
 //! 读取器只负责按选择加载标准文档并保留完整 JSON；哪些字段属于可翻译文本由
@@ -145,6 +143,7 @@ impl MzProjectDocuments {
         self.documents.get(&id)
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_document(&mut self, id: MzDocumentId, value: Value) -> Option<Value> {
         self.documents.insert(id, value)
     }
@@ -153,6 +152,7 @@ impl MzProjectDocuments {
         &self.documents
     }
 
+    #[cfg(test)]
     pub(crate) fn plugins(&self) -> &[PluginConfiguration] {
         &self.plugins
     }

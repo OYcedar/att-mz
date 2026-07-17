@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "语言投影等待 Translate 组合根接线")]
-
 //! 把 MZ 翻译阶段的占位符文本投影为引擎无关的语言视图。
 
 use std::error::Error;
@@ -25,6 +23,7 @@ pub(crate) fn project_protected_text(
 ///
 /// token 使用模型译文中的实际顺序，而不是规则声明顺序。语言模块只能
 /// 修改自然文本字符；分段数量或自然/不透明类型发生变化都属于内部不变量破坏。
+#[cfg(test)]
 pub(crate) fn rebuild_protected_text(
     protected_text: &str,
     placeholders: &[AppliedPlaceholder],
@@ -57,6 +56,7 @@ pub(crate) fn restore_protected_text(
 
 #[derive(Clone, Copy)]
 enum OpaqueRebuild {
+    #[cfg(test)]
     Token,
     Original,
 }
@@ -92,6 +92,7 @@ fn rebuild_text(
                     return Err(LanguageTextProjectionError::MissingOrderedToken { segment_index });
                 };
                 match opaque_rebuild {
+                    #[cfg(test)]
                     OpaqueRebuild::Token => rebuilt.push_str(token),
                     OpaqueRebuild::Original => {
                         let Some(placeholder) =

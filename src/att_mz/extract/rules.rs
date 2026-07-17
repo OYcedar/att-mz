@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "Rules 服务已实现但尚未接入生产组合根")]
-
 //! 人类可直接书写的极简 Rules JSON，以及从规则到标准文本快照的完整编排。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1172,6 +1170,7 @@ impl GroupCollector {
         Ok(groups)
     }
 
+    #[cfg(test)]
     fn finish(self) -> Result<RulesSnapshot, BuildRulesSnapshotError> {
         let groups = self.into_groups()?;
         rules_snapshot_from_groups(groups)
@@ -1194,6 +1193,7 @@ fn rules_snapshot_from_groups(
     })
 }
 
+#[cfg(test)]
 fn build_rules_snapshot(
     definition: &RulesDefinition,
     documents: &MzProjectDocuments,
@@ -1520,6 +1520,7 @@ fn finalize_parallel_rules(
     rules_snapshot_from_groups(groups)
 }
 
+#[cfg(test)]
 fn extract_standard_fields(
     definition: &RulesDefinition,
     documents: &MzProjectDocuments,
@@ -1554,6 +1555,7 @@ fn extract_standard_fields(
     Ok(())
 }
 
+#[cfg(test)]
 fn extract_notes(
     definition: &RulesDefinition,
     documents: &MzProjectDocuments,
@@ -1573,6 +1575,7 @@ fn extract_notes(
     Ok(())
 }
 
+#[cfg(test)]
 fn extract_plugin_parameters(
     definition: &RulesDefinition,
     plugins: &[PluginConfiguration],
@@ -1987,6 +1990,7 @@ fn first_path_rule_id(rules: &[PathRule]) -> usize {
     rules.first().map_or(0, |rule| rule.id)
 }
 
+#[cfg(test)]
 fn documents_for_rule_source<'a>(
     source: DocumentRuleSource,
     documents: &'a MzProjectDocuments,
@@ -2000,6 +2004,7 @@ fn documents_for_rule_source<'a>(
     documents_for_rule_source_at(source, documents, locator)
 }
 
+#[cfg(test)]
 fn documents_for_rule_source_at<'a>(
     source: DocumentRuleSource,
     documents: &'a MzProjectDocuments,
@@ -2132,6 +2137,7 @@ fn match_note_paths(
     )
 }
 
+#[cfg(test)]
 fn extract_event_rules(
     definition: &RulesDefinition,
     documents: &MzProjectDocuments,

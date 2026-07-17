@@ -334,7 +334,13 @@ async fn seven_root_fakes_drive_the_complete_non_root_extract_tree() {
         events: Arc::clone(&events),
         invocations: Arc::clone(&lua_invocations),
     });
-    let extract = ExtractService::new(opener, builtin, rules, lua);
+    let extract = ExtractService::new(
+        opener,
+        builtin,
+        rules,
+        Some(lua),
+        crate::execution::CooperativeCancellation::default(),
+    );
 
     let name: ProjectName = "demo".parse().expect("测试项目名应该合法");
     let output = extract

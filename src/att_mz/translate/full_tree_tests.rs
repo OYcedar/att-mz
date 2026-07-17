@@ -32,12 +32,16 @@ use crate::att_mz::location_codec::MzLocationCodec;
 use crate::att_mz::lua::LuaPhase;
 use crate::att_mz::lua::hosting::TrustedLuaExecutionHostingService;
 use crate::att_mz::lua::runtime::{
-    OwnedLuaProgram, TrustedLuaHostBindings, TrustedLuaRuntimeExecutionError,
-    TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor, TrustedLuaRuntimeTermination,
+    OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaRuntimeBindings,
+    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
+    TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
 };
 use crate::att_mz::lua::session::{
-    OpenSqliteInteractiveSessionError, SqliteInteractiveSession, SqliteInteractiveSessionError,
-    SqliteInteractiveSessionFactory, SqliteInteractiveTransactionState,
+    OpenSqliteInteractiveSessionError, OpenedSqliteInteractiveSession,
+    SqliteInteractiveConnectionCloseOutcome, SqliteInteractiveRollbackOutcome,
+    SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
+    SqliteInteractiveSessionFinalizationReport, SqliteInteractiveSessionFinalizer,
+    SqliteInteractiveSessionOperations, SqliteInteractiveTransactionObservation,
 };
 use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
@@ -275,6 +279,7 @@ impl LlmRequestExecutor for FakeLlmRequestExecutor {
                 "lua raw response",
                 LlmFinishReason::Stop,
                 Some("lua-request".to_owned()),
+                "lua-response",
                 None,
             ));
         }
@@ -302,6 +307,7 @@ impl LlmRequestExecutor for FakeLlmRequestExecutor {
             r#"[{"id":"0","translation":"魔法剑"}]"#,
             LlmFinishReason::Stop,
             Some("standard-request".to_owned()),
+            "standard-response",
             None,
         ))
     }
@@ -345,7 +351,7 @@ impl FileReader for FakeFileReader {
 
 #[derive(Debug)]
 struct FakeSessionState {
-    transaction: SqliteInteractiveTransactionState,
+    transaction_active: bool,
     closed: bool,
 }
 
@@ -355,7 +361,7 @@ struct FakeSqliteInteractiveSession {
     state: Arc<Mutex<FakeSessionState>>,
 }
 
-impl SqliteInteractiveSession for FakeSqliteInteractiveSession {
+impl SqliteInteractiveSessionOperations for FakeSqliteInteractiveSession {
     type Error = FakeRootError;
 
     async fn query(
@@ -373,7 +379,7 @@ impl SqliteInteractiveSession for FakeSqliteInteractiveSession {
         if state.closed {
             return Err(SqliteInteractiveSessionError::Closed);
         }
-        assert_eq!(state.transaction, SqliteInteractiveTransactionState::Active);
+        assert!(state.transaction_active);
         drop(state);
         record(&self.events, Event::LuaExecute);
         Ok(1)
@@ -381,10 +387,10 @@ impl SqliteInteractiveSession for FakeSqliteInteractiveSession {
 
     async fn begin(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
         let mut state = self.state.lock().expect("会话状态锁不应中毒");
-        if state.transaction == SqliteInteractiveTransactionState::Active {
+        if state.transaction_active {
             return Err(SqliteInteractiveSessionError::TransactionAlreadyActive);
         }
-        state.transaction = SqliteInteractiveTransactionState::Active;
+        state.transaction_active = true;
         drop(state);
         record(&self.events, Event::LuaBegin);
         Ok(())
@@ -392,10 +398,10 @@ impl SqliteInteractiveSession for FakeSqliteInteractiveSession {
 
     async fn commit(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
         let mut state = self.state.lock().expect("会话状态锁不应中毒");
-        if state.transaction == SqliteInteractiveTransactionState::Idle {
+        if !state.transaction_active {
             return Err(SqliteInteractiveSessionError::NoActiveTransaction);
         }
-        state.transaction = SqliteInteractiveTransactionState::Idle;
+        state.transaction_active = false;
         drop(state);
         record(&self.events, Event::LuaCommit);
         Ok(())
@@ -403,27 +409,44 @@ impl SqliteInteractiveSession for FakeSqliteInteractiveSession {
 
     async fn rollback(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
         let mut state = self.state.lock().expect("会话状态锁不应中毒");
-        if state.transaction == SqliteInteractiveTransactionState::Idle {
+        if !state.transaction_active {
             return Err(SqliteInteractiveSessionError::NoActiveTransaction);
         }
-        state.transaction = SqliteInteractiveTransactionState::Idle;
+        state.transaction_active = false;
         Ok(())
     }
+}
 
-    async fn transaction_state(
-        &self,
-    ) -> Result<SqliteInteractiveTransactionState, SqliteInteractiveSessionError<Self::Error>> {
+struct FakeSqliteInteractiveSessionFinalizer {
+    events: EventLog,
+    state: Arc<Mutex<FakeSessionState>>,
+}
+
+impl SqliteInteractiveSessionFinalizer for FakeSqliteInteractiveSessionFinalizer {
+    type Error = FakeRootError;
+
+    async fn finalize(self) -> SqliteInteractiveSessionFinalizationReport<Self::Error> {
         record(&self.events, Event::LuaInspect);
-        Ok(self.state.lock().expect("会话状态锁不应中毒").transaction)
-    }
-
-    async fn close(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
         let mut state = self.state.lock().expect("会话状态锁不应中毒");
-        assert_eq!(state.transaction, SqliteInteractiveTransactionState::Idle);
+        let transaction = if state.transaction_active {
+            state.transaction_active = false;
+            SqliteInteractiveTransactionObservation::Active
+        } else {
+            SqliteInteractiveTransactionObservation::Idle
+        };
         state.closed = true;
         drop(state);
         record(&self.events, Event::LuaClose);
-        Ok(())
+        let rollback = if matches!(transaction, SqliteInteractiveTransactionObservation::Active) {
+            SqliteInteractiveRollbackOutcome::RolledBack
+        } else {
+            SqliteInteractiveRollbackOutcome::NotRequired
+        };
+        SqliteInteractiveSessionFinalizationReport::new(
+            transaction,
+            rollback,
+            SqliteInteractiveConnectionCloseOutcome::Closed,
+        )
     }
 }
 
@@ -435,20 +458,30 @@ struct FakeSqliteInteractiveSessionFactory {
 }
 
 impl SqliteInteractiveSessionFactory for FakeSqliteInteractiveSessionFactory {
-    type Session = FakeSqliteInteractiveSession;
+    type Operations = FakeSqliteInteractiveSession;
+    type Finalizer = FakeSqliteInteractiveSessionFinalizer;
     type Error = FakeRootError;
 
     async fn open_existing(
         &self,
         path: PathBuf,
-    ) -> Result<Self::Session, OpenSqliteInteractiveSessionError<Self::Error>> {
+    ) -> Result<
+        OpenedSqliteInteractiveSession<Self::Operations, Self::Finalizer>,
+        OpenSqliteInteractiveSessionError<Self::Error>,
+    > {
         assert_eq!(
             path,
             PathBuf::from("C:/projects").join("demo").join("project.db")
         );
         self.calls.fetch_add(1, Ordering::SeqCst);
         record(&self.events, Event::OpenLuaDatabase(path));
-        Ok(self.session.clone())
+        Ok(OpenedSqliteInteractiveSession::new(
+            Arc::new(self.session.clone()),
+            FakeSqliteInteractiveSessionFinalizer {
+                events: Arc::clone(&self.events),
+                state: Arc::clone(&self.session.state),
+            },
+        ))
     }
 }
 
@@ -460,15 +493,29 @@ struct FakeTrustedLuaRuntimeExecutor {
 
 impl TrustedLuaRuntimeExecutor for FakeTrustedLuaRuntimeExecutor {
     type Error = FakeRootError;
+    type Reservation = FakeTrustedLuaRuntimeReservation;
 
-    async fn execute<B>(
-        &self,
+    async fn reserve(&self) -> Result<Self::Reservation, Self::Error> {
+        Ok(FakeTrustedLuaRuntimeReservation {
+            events: Arc::clone(&self.events),
+            calls: Arc::clone(&self.calls),
+        })
+    }
+}
+
+struct FakeTrustedLuaRuntimeReservation {
+    events: EventLog,
+    calls: Arc<AtomicUsize>,
+}
+
+impl TrustedLuaRuntimeReservation for FakeTrustedLuaRuntimeReservation {
+    type Error = FakeRootError;
+
+    fn start(
+        self,
         program: OwnedLuaProgram,
-        bindings: Arc<B>,
-    ) -> TrustedLuaRuntimeExecutionReport<Self::Error, B::Error>
-    where
-        B: TrustedLuaHostBindings,
-    {
+        bindings: TrustedLuaRuntimeBindings,
+    ) -> TrustedLuaExecutionHandle<Self::Error> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         record(&self.events, Event::LuaRuntime);
         assert_eq!(
@@ -476,43 +523,49 @@ impl TrustedLuaRuntimeExecutor for FakeTrustedLuaRuntimeExecutor {
             std::path::Path::new("C:/resolved/scripts/translate.lua")
         );
         assert_eq!(program.source(), b"return true");
-        assert_eq!(bindings.phase(), LuaPhase::Translate);
-        assert_eq!(bindings.project().name().as_str(), "demo");
+        let (calls, finalizer) = bindings.into_parts();
+        assert_eq!(calls.phase(), LuaPhase::Translate);
+        assert_eq!(calls.project().name().as_str(), "demo");
 
-        let runtime = async {
-            bindings
-                .begin()
-                .await
-                .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
-            bindings
-                .execute(SqliteCommand::new(
-                    "INSERT INTO lua_owned(value) VALUES (?)",
-                    vec![SqliteValue::Text("自由译文".to_owned())],
-                ))
-                .await
-                .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
-            let response = bindings
-                .request_llm(vec![ChatMessage::new(
-                    ChatMessageRole::User,
-                    "# Lua full messages",
-                )])
-                .await
-                .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
-            assert_eq!(response.content(), "lua raw response");
-            bindings
-                .commit()
-                .await
-                .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
-            Ok(())
-        }
-        .await;
-        let termination = if runtime.is_ok() {
-            TrustedLuaRuntimeTermination::Completed
-        } else {
-            TrustedLuaRuntimeTermination::Failed
-        };
-        let finalization = bindings.finalize(termination).await;
-        TrustedLuaRuntimeExecutionReport::new(runtime, finalization)
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn(async move {
+            let runtime = async {
+                calls
+                    .begin()
+                    .await
+                    .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
+                calls
+                    .execute(SqliteCommand::new(
+                        "INSERT INTO lua_owned(value) VALUES (?)",
+                        vec![SqliteValue::Text("自由译文".to_owned())],
+                    ))
+                    .await
+                    .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
+                let response = calls
+                    .request_llm(vec![ChatMessage::new(
+                        ChatMessageRole::User,
+                        "# Lua full messages",
+                    )])
+                    .await
+                    .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
+                assert_eq!(response.content(), "lua raw response");
+                calls
+                    .commit()
+                    .await
+                    .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
+                Ok(())
+            }
+            .await;
+            let termination = if runtime.is_ok() {
+                TrustedLuaRuntimeTermination::Completed
+            } else {
+                TrustedLuaRuntimeTermination::Failed
+            };
+            let finalization = finalizer.finalize(termination).await;
+            let _ = sender.send(TrustedLuaRuntimeExecutionReport::new(runtime, finalization));
+        });
+        TrustedLuaExecutionHandle::new(receiver, cancelled)
     }
 }
 
@@ -568,7 +621,7 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
         calls: Arc::clone(&file_calls),
     };
     let session_state = Arc::new(Mutex::new(FakeSessionState {
-        transaction: SqliteInteractiveTransactionState::Idle,
+        transaction_active: false,
         closed: false,
     }));
     let session = FakeSqliteInteractiveSession {
@@ -651,21 +704,23 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
             events: Arc::clone(&events),
             calls: Arc::clone(&persistent_log_calls),
         },
+        crate::execution::CooperativeCancellation::default(),
     );
 
     let lua_host =
-        TrustedLuaExecutionHostingService::new(file_reader, llm, lua_runtime, session_factory);
+        TrustedLuaExecutionHostingService::with_llm(file_reader, llm, lua_runtime, session_factory);
     let use_case = TranslateService::new(
         resolver,
         project_reader,
         standard,
-        LuaTranslationService::new(lua_host),
+        Some(LuaTranslationService::new(lua_host)),
+        crate::execution::CooperativeCancellation::default(),
     );
 
     let output = use_case
         .execute(TranslateInput {
             name: "demo".parse().expect("测试项目名称应合法"),
-            llm_id: "quality".to_owned(),
+            profile_id: "quality".to_owned(),
             terminology_path: None,
             placeholder_rules_path: None,
             lua_script: Some(PathBuf::from("scripts/translate.lua")),
@@ -674,7 +729,7 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
         .expect("完整非根 Translate 树应该成功");
 
     assert_eq!(output.name.as_str(), "demo");
-    assert_eq!(output.llm_id, "quality");
+    assert_eq!(output.profile_id, "quality");
     assert!(cpu_calls.load(Ordering::SeqCst) > 0);
     assert_eq!(transaction_calls.load(Ordering::SeqCst), 1);
     assert_eq!(standard_attempts.load(Ordering::SeqCst), 2);

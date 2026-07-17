@@ -40,10 +40,12 @@ impl MzRewrittenFile {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn relative_path(&self) -> &Path {
         &self.relative_path
     }
 
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -98,6 +100,7 @@ impl MzRewrittenDocuments {
         &self.workspace_root
     }
 
+    #[cfg(test)]
     pub(crate) fn files(&self) -> &[MzRewrittenFile] {
         &self.files
     }

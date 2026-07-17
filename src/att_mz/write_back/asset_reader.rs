@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "WriteBack 生产组合根尚未接线")]
-
 //! 从五张 MZ 标准资产表建立不含术语数据的写回快照。
 
 use std::collections::BTreeMap;

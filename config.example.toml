@@ -1,0 +1,153 @@
+[projects]
+root = "projects"
+
+[runtime.async]
+worker_threads = 4
+max_blocking_threads = 8
+blocking_thread_keep_alive_ms = 1000
+
+[runtime.cpu]
+worker_threads = 4
+queue_capacity = 64
+
+[runtime.filesystem]
+worker_threads = 4
+queue_capacity = 64
+max_read_bytes = 67108864
+max_directory_entries = 100000
+
+[runtime.filesystem.publisher]
+max_prepared_candidates = 2
+max_candidate_entries = 500000
+max_candidate_depth = 128
+max_candidate_bytes = 8589934592
+max_single_file_bytes = 1073741824
+max_recovery_artifacts_per_target = 16
+target_lock_timeout_ms = 30000
+
+[runtime.sqlite]
+short_worker_threads = 4
+short_queue_capacity = 128
+max_open_connections = 16
+max_interactive_sessions = 4
+interactive_open_queue_capacity = 16
+interactive_command_queue_capacity = 128
+worker_stack_bytes = 4194304
+max_statement_bytes = 1048576
+max_parameter_bytes = 16777216
+max_rows_per_query = 200000
+max_result_bytes_per_query = 134217728
+busy_timeout_ms = 10000
+journal_mode = "wal"
+synchronous = "full"
+
+[runtime.llm]
+max_active_requests = 8
+queue_capacity = 64
+admission_timeout_ms = 30000
+connect_timeout_ms = 15000
+read_timeout_ms = 120000
+pool_idle_timeout_ms = 30000
+pool_max_idle_per_host = 8
+proxy = false
+
+[runtime.llm.tls]
+additional_pem_files = []
+
+[runtime.lua]
+worker_threads = 2
+queue_capacity = 16
+worker_stack_bytes = 8388608
+memory_limit_bytes_per_vm = 134217728
+cancel_check_instruction_interval = 10000
+max_error_bytes = 65536
+
+[observability]
+root = "logs"
+
+[observability.translation]
+queue_capacity = 256
+lock_timeout_ms = 30000
+max_record_bytes = 4194304
+max_file_bytes = 268435456
+retained_rotated_files = 8
+
+[observability.write_back]
+queue_capacity = 64
+lock_timeout_ms = 30000
+max_record_bytes = 4194304
+max_file_bytes = 67108864
+retained_rotated_files = 8
+
+[mz.document]
+read_concurrency = 8
+parse_concurrency = 4
+
+[mz.standard_asset]
+decode_concurrency = 4
+leaves_per_decode_job = 512
+
+[mz.extract.builtin]
+scan_concurrency = 4
+
+[mz.extract.rules]
+scan_concurrency = 4
+
+[mz.extract.store]
+encode_concurrency = 4
+groups_per_encode_job = 256
+
+[mz.translate.store]
+encode_concurrency = 4
+leaves_per_encode_job = 512
+
+[[mz.languages]]
+type = "japanese"
+id = "ja"
+minimum_kana_characters = 1
+allowed_terms = []
+quote_repair_pairs = [["“", "”"], ["‘", "’"]]
+
+[[mz.languages]]
+type = "english"
+id = "en"
+minimum_word_count = 1
+minimum_letter_count = 2
+ignored_terms = []
+minimum_copied_word_count = 2
+minimum_copied_letter_count = 4
+allowed_terms = []
+
+[[mz.translation_profiles]]
+id = "primary"
+max_in_flight_tasks = 4
+
+[mz.translation_profiles.planning]
+scope_concurrency = 4
+max_message_characters = 24000
+
+[[mz.translation_profiles.planning.systems]]
+source_language = "ja"
+target_language = "zh-Hans"
+path = "prompts/ja-zh.md"
+
+[mz.translation_profiles.execution]
+network_retry_delays_ms = [500, 1500, 5000]
+max_network_retry_after_ms = 30000
+
+[mz.translation_profiles.llm]
+endpoint = "https://api.example.com/v1/chat/completions"
+auth = { bearer_environment = "ATT_LLM_API_KEY" }
+model = "replace-with-model-id"
+allow_plain_http_loopback = false
+request_timeout_ms = 120000
+max_request_bytes = 2097152
+max_response_bytes = 8388608
+max_error_response_bytes = 65536
+requests_per_minute = 60
+burst_requests = 8
+request_options = { temperature = 0.2 }
+
+[mz.translation_profiles.llm.completion_limit]
+parameter = "max_tokens"
+value = 4096

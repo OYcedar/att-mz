@@ -24,12 +24,16 @@ use crate::att_mz::extract::document::{MzDocumentReadingConfig, MzProjectDocumen
 use crate::att_mz::location_codec::MzLocationCodec;
 use crate::att_mz::lua::hosting::TrustedLuaExecutionHostingService;
 use crate::att_mz::lua::runtime::{
-    OwnedLuaProgram, TrustedLuaHostBindings, TrustedLuaRuntimeExecutionError,
-    TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor, TrustedLuaRuntimeTermination,
+    OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaRuntimeBindings,
+    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
+    TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
 };
 use crate::att_mz::lua::session::{
-    OpenSqliteInteractiveSessionError, SqliteInteractiveSession, SqliteInteractiveSessionError,
-    SqliteInteractiveSessionFactory, SqliteInteractiveTransactionState,
+    OpenSqliteInteractiveSessionError, OpenedSqliteInteractiveSession,
+    SqliteInteractiveConnectionCloseOutcome, SqliteInteractiveRollbackOutcome,
+    SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
+    SqliteInteractiveSessionFinalizationReport, SqliteInteractiveSessionFinalizer,
+    SqliteInteractiveSessionOperations, SqliteInteractiveTransactionObservation,
 };
 use crate::att_mz::lua::{LuaPhase, LuaProjectContext};
 use crate::att_mz::project::ExistingProjectOpeningService;
@@ -43,9 +47,9 @@ use crate::observability::PersistentEventLog;
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
-    AtomicDirectoryDiscardError, AtomicDirectoryPrepareError, AtomicDirectoryPublishError,
-    AtomicDirectoryPublisher, DirectoryLister, DirectoryPublishMode, DirectoryStageRequest,
-    ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile, ReadFileError,
+    DirectoryDiscardError, DirectoryLister, DirectoryPrepareError, DirectoryPublishError,
+    DirectoryPublishIntent, DirectoryStageRequest, ExistingDirectoryResolver, FileReader,
+    ListDirectoryError, ReadFile, ReadFileError, RecoverableDirectoryPublisher,
     ResolveDirectoryError, StagedDirectory,
 };
 use crate::storage::sqlite::{
@@ -174,34 +178,40 @@ impl CpuTaskExecutor for InlineCpuExecutor {
 }
 
 #[derive(Clone, Default)]
-struct RecordingAtomicPublisher {
+struct RecordingRecoverablePublisher {
     requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
-    publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishMode)>>>,
-    publish_error: Arc<Mutex<Option<AtomicDirectoryPublishError<TestError>>>>,
+    publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishIntent)>>>,
+    publish_error: Arc<Mutex<Option<DirectoryPublishError<TestError>>>>,
 }
 
-impl AtomicDirectoryPublisher for RecordingAtomicPublisher {
+impl RecoverableDirectoryPublisher for RecordingRecoverablePublisher {
     type Error = TestError;
     type StagingState = ();
 
     async fn prepare(
         &self,
         request: DirectoryStageRequest,
-    ) -> Result<StagedDirectory<Self::StagingState>, AtomicDirectoryPrepareError<Self::Error>> {
+    ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>> {
         let target_root = request.target_root().to_path_buf();
+        let publish_intent = request.publish_intent();
         self.requests
             .lock()
             .expect("发布记录锁不应中毒")
             .push(request);
         let staging_root = target_root.with_extension("att-stage");
-        Ok(StagedDirectory::new(target_root, staging_root, ()))
+        Ok(StagedDirectory::new(
+            target_root,
+            staging_root,
+            publish_intent,
+            (),
+        ))
     }
 
     async fn publish(
         &self,
         staged: StagedDirectory<Self::StagingState>,
-        mode: DirectoryPublishMode,
-    ) -> Result<(), AtomicDirectoryPublishError<Self::Error>> {
+    ) -> Result<(), DirectoryPublishError<Self::Error>> {
+        let mode = staged.publish_intent();
         self.publish_calls
             .lock()
             .expect("发布记录锁不应中毒")
@@ -224,7 +234,7 @@ impl AtomicDirectoryPublisher for RecordingAtomicPublisher {
     async fn discard(
         &self,
         _staged: StagedDirectory<Self::StagingState>,
-    ) -> Result<(), AtomicDirectoryDiscardError<Self::Error>> {
+    ) -> Result<(), DirectoryDiscardError<Self::Error>> {
         panic!("Standard WriteBack 全树不应丢弃已暂存候选")
     }
 }
@@ -263,6 +273,7 @@ impl LlmRequestExecutor for RecordingLlm {
                 "不应到达 LLM 根",
                 LlmFinishReason::Stop,
                 None,
+                "unused-response",
                 None,
             ))
         }
@@ -292,41 +303,66 @@ struct ExercisingLuaRuntime {
 
 impl TrustedLuaRuntimeExecutor for ExercisingLuaRuntime {
     type Error = TestError;
+    type Reservation = ExercisingLuaReservation;
 
-    async fn execute<B>(
-        &self,
+    async fn reserve(&self) -> Result<Self::Reservation, Self::Error> {
+        Ok(ExercisingLuaReservation {
+            mode: self.mode,
+            facts: Arc::clone(&self.facts),
+        })
+    }
+}
+
+struct ExercisingLuaReservation {
+    mode: RuntimeTransactionMode,
+    facts: Arc<Mutex<RuntimeFacts>>,
+}
+
+impl TrustedLuaRuntimeReservation for ExercisingLuaReservation {
+    type Error = TestError;
+
+    fn start(
+        self,
         program: OwnedLuaProgram,
-        bindings: Arc<B>,
-    ) -> TrustedLuaRuntimeExecutionReport<Self::Error, B::Error>
-    where
-        B: TrustedLuaHostBindings,
-    {
+        bindings: TrustedLuaRuntimeBindings,
+    ) -> TrustedLuaExecutionHandle<Self::Error> {
+        let (calls, finalizer) = bindings.into_parts();
         {
             let mut facts = self.facts.lock().expect("Runtime 记录锁不应中毒");
             facts.program_path = Some(program.main_script_path().to_path_buf());
             facts.program_source = program.source().to_vec();
-            facts.phase = Some(bindings.phase());
-            facts.project = Some(bindings.project().clone());
+            facts.phase = Some(calls.phase());
+            facts.project = Some(calls.project().clone());
         }
 
-        let llm_unavailable = bindings.request_llm(Vec::new()).await.is_err();
-        self.facts
-            .lock()
-            .expect("Runtime 记录锁不应中毒")
-            .llm_unavailable = llm_unavailable;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let facts = Arc::clone(&self.facts);
+        let mode = self.mode;
+        tokio::spawn(async move {
+            let llm_unavailable = calls.request_llm(Vec::new()).await.is_err();
+            facts
+                .lock()
+                .expect("Runtime 记录锁不应中毒")
+                .llm_unavailable = llm_unavailable;
 
-        let runtime = match bindings.begin().await {
-            Err(source) => Err(TrustedLuaRuntimeExecutionError::Binding(source)),
-            Ok(()) if self.mode == RuntimeTransactionMode::Commit => bindings
-                .commit()
-                .await
-                .map_err(TrustedLuaRuntimeExecutionError::Binding),
-            Ok(()) => Ok(()),
-        };
-        let finalization = bindings
-            .finalize(TrustedLuaRuntimeTermination::Completed)
-            .await;
-        TrustedLuaRuntimeExecutionReport::new(runtime, finalization)
+            let runtime = match calls.begin().await {
+                Err(source) => Err(TrustedLuaRuntimeExecutionError::Binding(source)),
+                Ok(()) if mode == RuntimeTransactionMode::Commit => calls
+                    .commit()
+                    .await
+                    .map_err(TrustedLuaRuntimeExecutionError::Binding),
+                Ok(()) => Ok(()),
+            };
+            let termination = if runtime.is_ok() {
+                TrustedLuaRuntimeTermination::Completed
+            } else {
+                TrustedLuaRuntimeTermination::Failed
+            };
+            let finalization = finalizer.finalize(termination).await;
+            let _ = sender.send(TrustedLuaRuntimeExecutionReport::new(runtime, finalization));
+        });
+        TrustedLuaExecutionHandle::new(receiver, cancelled)
     }
 }
 
@@ -364,7 +400,7 @@ struct RecordingSession {
     facts: Arc<Mutex<SessionFacts>>,
 }
 
-impl SqliteInteractiveSession for RecordingSession {
+impl SqliteInteractiveSessionOperations for RecordingSession {
     type Error = TestError;
 
     async fn query(
@@ -413,32 +449,36 @@ impl SqliteInteractiveSession for RecordingSession {
         facts.state = SessionTransactionState::Idle;
         Ok(())
     }
+}
 
-    async fn transaction_state(
-        &self,
-    ) -> Result<SqliteInteractiveTransactionState, SqliteInteractiveSessionError<Self::Error>> {
-        let facts = self.facts.lock().expect("Session 记录锁不应中毒");
-        if facts.closed {
-            return Err(SqliteInteractiveSessionError::Closed);
-        }
-        Ok(match facts.state {
-            SessionTransactionState::Idle => SqliteInteractiveTransactionState::Idle,
-            SessionTransactionState::Active => SqliteInteractiveTransactionState::Active,
-        })
-    }
+struct RecordingSessionFinalizer {
+    facts: Arc<Mutex<SessionFacts>>,
+}
 
-    async fn close(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
+impl SqliteInteractiveSessionFinalizer for RecordingSessionFinalizer {
+    type Error = TestError;
+
+    async fn finalize(self) -> SqliteInteractiveSessionFinalizationReport<Self::Error> {
         let mut facts = self.facts.lock().expect("Session 记录锁不应中毒");
-        if facts.closed {
-            return Err(SqliteInteractiveSessionError::Closed);
-        }
-        if facts.state == SessionTransactionState::Active {
+        let transaction = if facts.state == SessionTransactionState::Active {
             facts.rollback_calls += 1;
             facts.state = SessionTransactionState::Idle;
-        }
+            SqliteInteractiveTransactionObservation::Active
+        } else {
+            SqliteInteractiveTransactionObservation::Idle
+        };
+        let rollback = if matches!(transaction, SqliteInteractiveTransactionObservation::Active) {
+            SqliteInteractiveRollbackOutcome::RolledBack
+        } else {
+            SqliteInteractiveRollbackOutcome::NotRequired
+        };
         facts.close_calls += 1;
         facts.closed = true;
-        Ok(())
+        SqliteInteractiveSessionFinalizationReport::new(
+            transaction,
+            rollback,
+            SqliteInteractiveConnectionCloseOutcome::Closed,
+        )
     }
 }
 
@@ -449,18 +489,27 @@ struct RecordingSessionFactory {
 }
 
 impl SqliteInteractiveSessionFactory for RecordingSessionFactory {
-    type Session = RecordingSession;
+    type Operations = RecordingSession;
+    type Finalizer = RecordingSessionFinalizer;
     type Error = TestError;
 
     async fn open_existing(
         &self,
         path: PathBuf,
-    ) -> Result<Self::Session, OpenSqliteInteractiveSessionError<Self::Error>> {
+    ) -> Result<
+        OpenedSqliteInteractiveSession<Self::Operations, Self::Finalizer>,
+        OpenSqliteInteractiveSessionError<Self::Error>,
+    > {
         self.opened_paths
             .lock()
             .expect("Session factory 记录锁不应中毒")
             .push(path);
-        Ok(self.session.clone())
+        Ok(OpenedSqliteInteractiveSession::new(
+            Arc::new(self.session.clone()),
+            RecordingSessionFinalizer {
+                facts: Arc::clone(&self.session.facts),
+            },
+        ))
     }
 }
 
@@ -471,7 +520,7 @@ struct FullTreeObservations {
     file_calls: Arc<Mutex<Vec<PathBuf>>>,
     cpu_calls: Arc<AtomicUsize>,
     publish_requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
-    publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishMode)>>>,
+    publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishIntent)>>>,
     run_logs: Arc<Mutex<Vec<StandardWriteBackRunLog>>>,
     llm_calls: Arc<AtomicUsize>,
     runtime_facts: Arc<Mutex<RuntimeFacts>>,
@@ -485,7 +534,7 @@ fn build_full_tree(mode: RuntimeTransactionMode) -> (impl WriteBackUseCase, Full
 
 fn build_full_tree_with_publish_error(
     mode: RuntimeTransactionMode,
-    publish_error: Option<AtomicDirectoryPublishError<TestError>>,
+    publish_error: Option<DirectoryPublishError<TestError>>,
 ) -> (impl WriteBackUseCase, FullTreeObservations) {
     let sqlite = RecordingSqliteQuery::default();
     let resolver = RecordingDirectoryResolver::default();
@@ -494,9 +543,9 @@ fn build_full_tree_with_publish_error(
         calls: Arc::new(Mutex::new(Vec::new())),
     };
     let cpu = InlineCpuExecutor::default();
-    let atomic_publisher = RecordingAtomicPublisher {
+    let directory_publisher = RecordingRecoverablePublisher {
         publish_error: Arc::new(Mutex::new(publish_error)),
-        ..RecordingAtomicPublisher::default()
+        ..RecordingRecoverablePublisher::default()
     };
     let run_log = RecordingRunLog::default();
     let llm = RecordingLlm::default();
@@ -525,29 +574,31 @@ fn build_full_tree_with_publish_error(
         MzDocumentReadingConfig::new(non_zero(2), non_zero(2)),
     );
     let rewriter = MzWriteBackDocumentRewritingService::new(document_reader, cpu.clone());
-    let publisher = StandardWriteBackPublishingService::new(atomic_publisher.clone());
+    let cancellation = crate::execution::CooperativeCancellation::default();
+    let publisher =
+        StandardWriteBackPublishingService::new(directory_publisher.clone(), cancellation.clone());
     let standard = StandardWriteBackService::new(
         asset_reader,
         ConservativeMzWriteBackTextLayouter,
         rewriter,
         publisher,
         run_log.clone(),
+        cancellation.clone(),
     );
-    let host = TrustedLuaExecutionHostingService::new(
+    let host = TrustedLuaExecutionHostingService::<_, RecordingLlm, _, _>::without_llm(
         file_reader.clone(),
-        llm.clone(),
         runtime.clone(),
         session_factory.clone(),
     );
     let lua = LuaWriteBackService::new(host);
-    let service = WriteBackService::new(opener, standard, lua);
+    let service = WriteBackService::new(opener, standard, Some(lua), cancellation);
     let observations = FullTreeObservations {
         sqlite_calls: sqlite.calls,
         resolved_directories: resolver.calls,
         file_calls: file_reader.calls,
         cpu_calls: cpu.calls,
-        publish_requests: atomic_publisher.requests,
-        publish_calls: atomic_publisher.publish_calls,
+        publish_requests: directory_publisher.requests,
+        publish_calls: directory_publisher.publish_calls,
         run_logs: run_log.events,
         llm_calls: llm.calls,
         runtime_facts: runtime.facts,
@@ -639,7 +690,7 @@ async fn published_cleanup_failure_is_not_logged_as_complete_standard_success() 
     let residual_path = workspace_root().join(".write_back-old");
     let (service, observations) = build_full_tree_with_publish_error(
         RuntimeTransactionMode::Commit,
-        Some(AtomicDirectoryPublishError::PublishedButCleanupFailed {
+        Some(DirectoryPublishError::PublishedWithResiduals {
             target_root: target_root.clone(),
             residual_path: residual_path.clone(),
             source: TestError("cleanup"),
@@ -747,7 +798,7 @@ fn assert_published_documents(
         .expect("发布记录锁不应中毒");
     assert_eq!(publish_calls.len(), 1);
     assert_eq!(publish_calls[0].0, workspace_root().join("write_back"));
-    assert_eq!(publish_calls[0].2, DirectoryPublishMode::Replace);
+    assert_eq!(publish_calls[0].2, DirectoryPublishIntent::ReplaceExisting);
     drop(publish_calls);
 
     let items: Value = serde_json::from_slice(overlay(request, "data/Items.json"))

@@ -22,8 +22,6 @@ use super::{BuiltinSnapshotStore, RulesSnapshotStore};
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
 
 const OWNER_CONFLICT_CHECK: &str = "mz_extraction_owner_conflict";
-const STAGING_TABLE: &str = "att_mz_extraction_staging";
-const PREVIOUS_TABLE: &str = "att_mz_extraction_previous";
 
 const CREATE_ENTRY_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS entry (
     exact_location TEXT NOT NULL PRIMARY KEY,
@@ -242,10 +240,12 @@ impl MzExtractionAssetStoreConfig {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn encode_concurrency(self) -> NonZeroUsize {
         self.encode_concurrency
     }
 
+    #[cfg(test)]
     pub(crate) const fn groups_per_encode_job(self) -> NonZeroUsize {
         self.groups_per_encode_job
     }
@@ -601,7 +601,7 @@ mod tests {
                 .expect("SQLite 调用锁不应中毒")
                 .push((path, plan));
             match self.response.lock().expect("SQLite 响应锁不应中毒").take() {
-                None | Some(SqliteResponse::Success) => Ok(()),
+                None => Ok(()),
                 Some(SqliteResponse::NotFound) => Err(ExecuteTransactionError::NotFound),
                 Some(SqliteResponse::Conflict) => Err(ExecuteTransactionError::RequirementFailed {
                     check_id: SqliteCheckId::new(OWNER_CONFLICT_CHECK),
@@ -618,7 +618,6 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum SqliteResponse {
-        Success,
         NotFound,
         Conflict,
         NotCommitted,

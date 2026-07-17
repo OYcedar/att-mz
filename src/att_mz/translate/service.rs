@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "翻译服务按计划先实现但尚未生产装配")]
-
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -9,6 +7,7 @@ use super::profile::TranslationExecutionProfileResolver;
 use super::standard::{StandardTranslation, StandardTranslationInput};
 use super::{StandardTranslationSummary, TranslateInput, TranslateOutput, TranslateUseCase};
 use crate::att_mz::ProjectName;
+use crate::execution::{CooperativeCancellation, OperationCancelled};
 use crate::project_database::ProjectDatabaseRecordReader;
 
 /// 按固定业务顺序编排一次 MZ 翻译。
@@ -20,7 +19,8 @@ pub(crate) struct TranslateService<C, R, S, L> {
     profile_resolver: C,
     project_reader: R,
     standard_translation: S,
-    lua_translation: L,
+    lua_translation: Option<L>,
+    cancellation: CooperativeCancellation,
 }
 
 impl<C, R, S, L> TranslateService<C, R, S, L> {
@@ -28,13 +28,15 @@ impl<C, R, S, L> TranslateService<C, R, S, L> {
         profile_resolver: C,
         project_reader: R,
         standard_translation: S,
-        lua_translation: L,
+        lua_translation: Option<L>,
+        cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             profile_resolver,
             project_reader,
             standard_translation,
             lua_translation,
+            cancellation,
         }
     }
 }
@@ -49,26 +51,36 @@ where
     type Error = TranslateServiceError<C::Error, R::Error, S::Error, L::Error>;
 
     async fn execute(&self, input: TranslateInput) -> Result<TranslateOutput, Self::Error> {
+        self.cancellation
+            .check()
+            .map_err(TranslateServiceError::Cancelled)?;
         let TranslateInput {
             name,
-            llm_id,
+            profile_id,
             terminology_path,
             placeholder_rules_path,
             lua_script,
         } = input;
 
-        let profile = self.profile_resolver.resolve(&llm_id).map_err(|source| {
-            TranslateServiceError::ResolveProfile {
-                llm_id: llm_id.clone(),
+        let profile = self
+            .profile_resolver
+            .resolve(&profile_id)
+            .map_err(|source| TranslateServiceError::ResolveProfile {
+                profile_id: profile_id.clone(),
                 source,
-            }
-        })?;
+            })?;
+        self.cancellation
+            .check()
+            .map_err(TranslateServiceError::Cancelled)?;
         let project = self.project_reader.read(&name).await.map_err(|source| {
             TranslateServiceError::ReadProject {
                 name: name.clone(),
                 source,
             }
         })?;
+        self.cancellation
+            .check()
+            .map_err(TranslateServiceError::Cancelled)?;
 
         let standard_report = self
             .standard_translation
@@ -79,10 +91,15 @@ where
             )
             .await
             .map_err(|source| TranslateServiceError::Standard { source })?;
+        self.cancellation
+            .check()
+            .map_err(TranslateServiceError::Cancelled)?;
 
         let lua_executed = if let Some(script_path) = lua_script {
             let error_path = script_path.clone();
             self.lua_translation
+                .as_ref()
+                .ok_or(TranslateServiceError::MissingLuaDependency)?
                 .run(&project, &profile, script_path)
                 .await
                 .map_err(|source| TranslateServiceError::Lua {
@@ -96,7 +113,7 @@ where
 
         Ok(TranslateOutput {
             name,
-            llm_id,
+            profile_id,
             standard: StandardTranslationSummary {
                 total_tasks: standard_report.total_tasks(),
                 complete_tasks: standard_report.complete_tasks(),
@@ -117,9 +134,11 @@ where
 /// 翻译用例在四个直接依赖边界上遇到的阶段失败。
 #[derive(Debug)]
 pub(crate) enum TranslateServiceError<CE, RE, SE, LE> {
-    ResolveProfile { llm_id: String, source: CE },
+    Cancelled(OperationCancelled),
+    ResolveProfile { profile_id: String, source: CE },
     ReadProject { name: ProjectName, source: RE },
     Standard { source: SE },
+    MissingLuaDependency,
     Lua { script_path: PathBuf, source: LE },
 }
 
@@ -132,13 +151,17 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ResolveProfile { llm_id, source } => {
-                write!(formatter, "无法选择 LLM 配置 {llm_id}：{source}")
+            Self::Cancelled(error) => error.fmt(formatter),
+            Self::ResolveProfile { profile_id, source } => {
+                write!(formatter, "无法选择翻译 Profile {profile_id}：{source}")
             }
             Self::ReadProject { name, source } => {
                 write!(formatter, "无法读取项目 {name}：{source}")
             }
             Self::Standard { source } => write!(formatter, "标准翻译失败：{source}"),
+            Self::MissingLuaDependency => {
+                formatter.write_str("本次选择了 Lua 翻译，但未构造 Lua Runtime")
+            }
             Self::Lua {
                 script_path,
                 source,
@@ -160,9 +183,11 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
             Self::ResolveProfile { source, .. } => Some(source),
             Self::ReadProject { source, .. } => Some(source),
             Self::Standard { source } => Some(source),
+            Self::MissingLuaDependency => None,
             Self::Lua { source, .. } => Some(source),
         }
     }
@@ -176,6 +201,7 @@ mod tests {
     use crate::att_mz::text::{
         MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
     };
+    use crate::att_mz::translate::executor::FinalLlmResponseMetadata;
     use crate::att_mz::translate::standard::{
         StandardTranslationRunReport, StandardTranslationTaskIndex, TranslationLeafIdentity,
         TranslationTaskOutcome, TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
@@ -193,7 +219,7 @@ mod tests {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct FakeProfile {
-        llm_id: String,
+        profile_id: String,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,17 +259,17 @@ mod tests {
         type Profile = FakeProfile;
         type Error = FakeError;
 
-        fn resolve(&self, llm_id: &str) -> Result<Self::Profile, Self::Error> {
+        fn resolve(&self, profile_id: &str) -> Result<Self::Profile, Self::Error> {
             self.events
                 .lock()
                 .expect("事件记录锁不应中毒")
-                .push(Event::Resolve(llm_id.to_owned()));
+                .push(Event::Resolve(profile_id.to_owned()));
 
             if self.failure == Some(Failure::Resolve) {
                 Err(FakeError("resolve"))
             } else {
                 Ok(FakeProfile {
-                    llm_id: llm_id.to_owned(),
+                    profile_id: profile_id.to_owned(),
                 })
             }
         }
@@ -359,14 +385,15 @@ mod tests {
                 events: Arc::clone(&events),
                 failure,
             },
-            FakeLuaTranslation { events, failure },
+            Some(FakeLuaTranslation { events, failure }),
+            CooperativeCancellation::default(),
         )
     }
 
     fn input(lua_script: Option<&str>) -> TranslateInput {
         TranslateInput {
             name: project_name(),
-            llm_id: "quality-profile".to_owned(),
+            profile_id: "quality-profile".to_owned(),
             terminology_path: Some(PathBuf::from("config/terms.json")),
             placeholder_rules_path: Some(PathBuf::from("config/placeholders.json")),
             lua_script: lua_script.map(PathBuf::from),
@@ -390,7 +417,7 @@ mod tests {
 
     fn profile() -> FakeProfile {
         FakeProfile {
-            llm_id: "quality-profile".to_owned(),
+            profile_id: "quality-profile".to_owned(),
         }
     }
 
@@ -416,8 +443,12 @@ mod tests {
         let outcome = TranslationTaskOutcome::unavailable(
             StandardTranslationTaskIndex::new(0),
             1,
-            Some("request-1".to_owned()),
-            Some("stop".to_owned()),
+            Some(FinalLlmResponseMetadata::new(
+                Some("request-1".to_owned()),
+                "response-1",
+                "stop",
+                None,
+            )),
             TranslationTaskUnavailableReason::AllOutputsRejected,
             vec![UnresolvedTranslationUnit::new(
                 0,
@@ -463,7 +494,7 @@ mod tests {
             .expect("完整翻译编排应该成功");
 
         assert_eq!(output.name, project_name());
-        assert_eq!(output.llm_id, "quality-profile");
+        assert_eq!(output.profile_id, "quality-profile");
         assert_eq!(output.standard, expected_summary());
         assert!(output.lua_executed);
         assert_eq!(
@@ -602,8 +633,11 @@ mod tests {
             );
 
             match (failure, &error) {
-                (Failure::Resolve, TranslateServiceError::ResolveProfile { llm_id, source }) => {
-                    assert_eq!(llm_id, "quality-profile");
+                (
+                    Failure::Resolve,
+                    TranslateServiceError::ResolveProfile { profile_id, source },
+                ) => {
+                    assert_eq!(profile_id, "quality-profile");
                     assert_eq!(*source, FakeError("resolve"));
                 }
                 (Failure::Read, TranslateServiceError::ReadProject { name, source }) => {
@@ -628,7 +662,7 @@ mod tests {
 
             match failure {
                 Failure::Resolve => {
-                    assert!(rendered.contains("LLM 配置 quality-profile"));
+                    assert!(rendered.contains("翻译 Profile quality-profile"));
                 }
                 Failure::Read => assert!(rendered.contains("项目 alice")),
                 Failure::Standard => assert!(rendered.starts_with("标准翻译失败")),

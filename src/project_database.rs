@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "项目持久化能力尚未接入生产组合根")]
-
 //! 项目数据库的创建职责。
 
 use std::error::Error;
@@ -86,10 +84,12 @@ impl ProjectWorkspaceLayout {
         &self.write_back_root
     }
 
+    #[cfg(test)]
     pub(crate) fn write_back_data(&self) -> &Path {
         &self.write_back_data
     }
 
+    #[cfg(test)]
     pub(crate) fn write_back_js(&self) -> &Path {
         &self.write_back_js
     }
@@ -187,6 +187,7 @@ pub(crate) struct StoredProjectRecord {
 
 impl StoredProjectRecord {
     /// 建立一条已经由项目数据库读取器确认可信的记录。
+    #[cfg(test)]
     pub(crate) fn new(
         name: ProjectName,
         workspace_root: PathBuf,
@@ -496,6 +497,7 @@ impl<E> ProjectDatabaseReadError<E> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         match self {
             Self::DatabaseNotFound { path }
@@ -651,6 +653,7 @@ impl CreatedProject {
     }
 
     /// 返回成功创建的数据库路径。
+    #[cfg(test)]
     pub(crate) fn database_path(&self) -> &Path {
         &self.database_path
     }
@@ -756,6 +759,7 @@ impl<E> ProjectDatabaseCreateError<E> {
     }
 
     /// 返回此次创建所针对的数据库路径。
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         match self {
             Self::AlreadyExists { path }

@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "可信 Lua Host 尚未接入生产组合根")]
-
 //! MZ 各业务阶段共享的可信 Lua 调用边界。
 
 use std::error::Error;
@@ -107,10 +105,6 @@ impl LuaProjectContext {
         self.file_access.output_root()
     }
 
-    pub(crate) fn file_access(&self) -> &LuaProjectFileAccess {
-        &self.file_access
-    }
-
     pub(crate) fn database_path(&self) -> &Path {
         &self.database_path
     }
@@ -179,37 +173,6 @@ impl<P> LuaInvocation<P> {
             project,
         }
     }
-
-    pub(crate) fn phase(&self) -> LuaPhase {
-        match self {
-            Self::Extract { .. } => LuaPhase::Extract,
-            Self::Translate { .. } => LuaPhase::Translate,
-            Self::WriteBack { .. } => LuaPhase::WriteBack,
-        }
-    }
-
-    pub(crate) fn script_path(&self) -> &Path {
-        match self {
-            Self::Extract { script_path, .. }
-            | Self::Translate { script_path, .. }
-            | Self::WriteBack { script_path, .. } => script_path,
-        }
-    }
-
-    pub(crate) fn project(&self) -> &LuaProjectContext {
-        match self {
-            Self::Extract { project, .. }
-            | Self::Translate { project, .. }
-            | Self::WriteBack { project, .. } => project,
-        }
-    }
-
-    pub(crate) fn translation_profile(&self) -> Option<&P> {
-        match self {
-            Self::Extract { .. } | Self::WriteBack { .. } => None,
-            Self::Translate { profile, .. } => Some(profile.as_ref()),
-        }
-    }
 }
 
 /// 完整拥有可信 Lua 程序生命周期与项目能力桥接的 Host。
@@ -220,11 +183,11 @@ impl<P> LuaInvocation<P> {
 /// 或 Profile 暴露给脚本。
 ///
 /// Lua 自己拥有 schema、数据身份、译文继承、业务事务划分、模型消息、响应处理、
-/// 重试和跨阶段协议；Rust 不扫描、解释、迁移或默认消费 Lua 产物，也不会把整个
+/// 重试和跨阶段协议；Rust 不扫描、解释、转换或默认消费 Lua 产物，也不会把整个
 /// 脚本隐式包进长事务。Host 负责 worker、背压和阻塞隔离；公开 Future 不得阻塞
-/// 异步执行器线程。Runtime 一旦接管 Host bindings，排队期或运行期取消都必须通过
-/// `finalize` 回滚仍未提交的活动事务并关闭数据库连接和 VM；已经显式提交的结果不由
-/// Host 回滚。
+/// 异步执行器线程。Host 先预留 Runtime 容量，再打开 SQLite 会话，最后通过
+/// `reservation.start` 同步移交调用面与唯一终结器。排队期或运行期取消都必须回滚
+/// 仍未提交的活动事务并关闭数据库连接和 VM；已经显式提交的结果不由 Host 回滚。
 pub(crate) trait TrustedLuaExecutionHost: Send + Sync {
     /// 与翻译配置 Resolver 产物一致的执行配置。
     type TranslationProfile: Send + Sync + 'static;

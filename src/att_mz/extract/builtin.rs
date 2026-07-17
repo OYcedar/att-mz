@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "Builtin 服务已实现但尚未接入生产组合根")]
-
 //! RPG Maker MZ 固定位置文本的完整快照提取。
 
 use std::error::Error;
@@ -195,6 +193,7 @@ impl BuiltinDocumentError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn location(&self) -> &str {
         &self.location
     }
@@ -226,6 +225,7 @@ impl From<SnapshotModelError> for BuildBuiltinSnapshotError {
     }
 }
 
+#[cfg(test)]
 fn build_builtin_snapshot(
     documents: &MzProjectDocuments,
 ) -> Result<BuiltinSnapshot, BuildBuiltinSnapshotError> {

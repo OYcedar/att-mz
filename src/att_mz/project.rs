@@ -1,11 +1,11 @@
-#![allow(dead_code, reason = "项目开启服务尚未进行生产装配")]
-
 //! MZ 命令域共享的现存项目上下文与开启职责。
 
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use super::ProjectName;
 use crate::project_database::{
@@ -25,6 +25,7 @@ pub(crate) struct OpenedProject {
 
 impl OpenedProject {
     /// 建立一个受信项目上下文。
+    #[cfg(test)]
     pub(crate) fn new(
         name: ProjectName,
         workspace_root: PathBuf,

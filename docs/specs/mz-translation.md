@@ -1,11 +1,11 @@
 # MZ 翻译现行规格
 
-本文记录当前代码与测试已经建立的 MZ 翻译职责、依赖关系和完成边界。模块接口描述可长期依赖的语义；根接口只代表真实运行机制的停止线，不代表生产适配器已经存在。
+本文记录 MZ 翻译的现行职责、依赖关系和运行边界。业务模块通过精确根契约协作，生产进程把它们连接到文件、CPU、SQLite、LLM、时钟、Lua 和 JSONL 的真实实现。
 
 ## 1. 用户入口与固定执行顺序
 
 ```text
-att mz translate --name NAME LLM_ID
+att mz translate --name NAME PROFILE_ID
     [--terms TERMS_JSON]
     [--placeholders PLACEHOLDERS_JSON]
     [--lua SCRIPT_LUA]
@@ -14,7 +14,7 @@ att mz translate --name NAME LLM_ID
 | 参数 | 语义 |
 |---|---|
 | `--name NAME` | 选择已经初始化的项目；CLI 将其建立为受信 `ProjectName` |
-| `LLM_ID` | 精确选择一份由外部完整建立的翻译执行 Profile |
+| `PROFILE_ID` | 精确选择一份由外部完整建立的翻译执行 Profile |
 | `--terms TERMS_JSON` | 本次 Standard 翻译使用的可选权威术语表 |
 | `--placeholders PLACEHOLDERS_JSON` | 在固定 MZ 保护规格之外补充的可选 PCRE2 规则 |
 | `--lua SCRIPT_LUA` | Standard 正常结束后附加执行的可信 Lua 翻译程序；仍有未翻译原文不会阻止它 |
@@ -44,7 +44,7 @@ Standard 的 Complete、Partial 与 Unavailable 都是正常业务结果；尚�
 
 正常完成时 CLI 返回退出码 0、stderr 为空，并输出 Standard 的任务、写入和剩余摘要；传入 Lua 时额外显示 Lua 已执行。Partial 或 Unavailable 不伪装成“全部翻译完成”，也不升级为失败退出码。技术错误继续返回退出码 1。
 
-## 2. 完整非根依赖树
+## 2. 完整生产依赖树
 
 ```mermaid
 flowchart TD
@@ -56,43 +56,43 @@ flowchart TD
     ST --> PL["MzStandardTranslationTaskPlanningService"]
     ST --> EX["MzStandardTranslationTaskExecutionService"]
     ST --> RS["MzStandardTranslationResultStorageService"]
-    ST --> LOG["PersistentEventLog&lt;TranslationLogEvent&gt;<br/>根接口"]
+    ST --> LOG["TranslationJsonLinesEventLog<br/>PersistentEventLog"]
 
-    AR --> SQ["SqliteQueryExecutor<br/>根接口"]
-    AR --> CPU["CpuTaskExecutor<br/>根接口"]
+    AR --> SQ["RusqliteStorage<br/>SqliteQueryExecutor"]
+    AR --> CPU["BoundedCpuExecutor<br/>CpuTaskExecutor"]
 
     PL --> RR["JsonTranslationPlanningResourceReadingService"]
     PL --> LANG["LanguageModuleCatalog<br/>crate 级共享领域模块"]
     PL --> PH["Pcre2PlaceholderService"]
     PL --> DEDUP["TranslationDeduplication<br/>纯 CPU 领域模块"]
     PL --> CPU
-    RR --> FR["FileReader<br/>根接口"]
+    RR --> FR["SystemFileSystem<br/>FileReader"]
     RR --> CPU
 
     LANG --> JA["JapaneseLanguageModule"]
     LANG --> EN["EnglishLanguageModule"]
 
-    EX --> LLM["LlmRequestExecutor<br/>根接口"]
-    EX --> DELAY["AsyncDelay<br/>根接口"]
+    EX --> LLM["OpenAiChatCompletionExecutor<br/>LlmRequestExecutor"]
+    EX --> DELAY["TokioAsyncDelay<br/>AsyncDelay"]
     EX --> RP["TranslationTaskResponseProcessingService"]
     RP --> LANG
     RP --> CPU
     PH --> TOKEN["ATT Placeholder Token Envelope<br/>crate 私有共享协议"]
     RP --> TOKEN
 
-    RS --> STX["SqliteTransactionExecutor<br/>根接口"]
+    RS --> STX["RusqliteStorage<br/>SqliteTransactionExecutor"]
     RS --> CPU
 
     LT --> LH["TrustedLuaExecutionHostingService"]
     LH --> FR
     LH --> LLM
-    LH --> LR["TrustedLuaRuntimeExecutor<br/>根接口"]
-    LH --> IS["SqliteInteractiveSessionFactory<br/>根接口"]
+    LH --> LR["TrustedLua54Runtime<br/>TrustedLuaRuntimeExecutor"]
+    LH --> IS["RusqliteStorage<br/>SqliteInteractiveSessionFactory"]
 
     PR --> SQ
 ```
 
-图中除明确标注“根接口”的节点外，都是已经进入业务实现层的非根模块。根接口隔离的是操作系统线程、真实文件、SQLite 连接、网络模型请求、异步时钟和 Lua VM 等运行机制。
+图中上层节点拥有翻译语义，带生产实现名称的叶子拥有操作系统线程、真实文件、SQLite 连接、网络请求、异步时钟和 Lua VM 等环境机制。
 
 ## 3. Profile 与外部配置
 
@@ -324,7 +324,7 @@ Planner 固定先保护占位符，再把普通文本与保护区投影为 `Lang
 
 ## 7. 模型执行与响应验收
 
-`LlmRequestExecutor` 是单次、非流式、单 choice、无自动重试的根契约。它返回原始 content、finish reason 与可选 request ID/usage，并将错误区分为 Retryable 与 Fatal；可恢复错误可以携带 `Retry-After`。
+`LlmRequestExecutor` 是单次、非流式、单 choice、无自动重试的根契约。它返回原始 content、finish reason、可选的 HTTP `x-request-id`、正文 completion ID 和可选 usage，并将错误区分为 Retryable 与 Fatal；可恢复错误可以携带 `Retry-After`。HTTP 请求身份与模型响应身份不互相冒充。
 
 `MzStandardTranslationTaskExecutionService`：
 
@@ -403,9 +403,9 @@ Standard 返回结构化运行报告，至少统计计划任务、Complete/Parti
 - 全部任务正常消费后追加一次运行汇总；
 - 日志写入失败表示无法履行已确认的持久可观测性承诺，属于技术错误，停止后续任务并阻止 Lua；已经提交的译文保持。
 
-每个任务事件必须完整体现正常业务结果，而不只记录异常：任务索引、Complete/Partial/Unavailable、网络尝试次数、可选 request ID 与 finish reason、每个合格 ID 的代表位置和完整传播族、未完成 ID/位置、每项拒绝原因、信封/JSON/wire schema 失败以及缺失、重复、未知 ID 等协议事实，以及实际写入的翻译决定和物理位置数量。整批结构不可用与结构通过但所有预期 ID 都不合格都表示“当前任务块无可用译文”，但必须分别保留 `ModelResponseUnusable` 与 `AllOutputsRejected` 及各自诊断；部分不可用也完整记录，不能只记录成功 Patch。
+每个任务事件必须完整体现正常业务结果，而不只记录异常：任务索引、Complete/Partial/Unavailable、网络尝试次数、`provider_request_id`、`provider_response_id`、`final_response_usage`、finish reason、每个合格 ID 的代表位置和完整传播族、未完成 ID/位置、每项拒绝原因、信封/JSON/wire schema 失败以及缺失、重复、未知 ID 等协议事实，以及实际写入的翻译决定和物理位置数量。`final_response_usage` 只表示最终成功 HTTP 响应的 usage。整批结构不可用与结构通过但所有预期 ID 都不合格都表示“当前任务块无可用译文”，但必须分别保留 `ModelResponseUnusable` 与 `AllOutputsRejected` 及各自诊断；部分不可用也完整记录，不能只记录成功 Patch。
 
-事件默认不包含完整 messages、完整模型响应、密钥或全文原文/译文。日志根返回成功必须表示事件已经达到外部配置声明的持久化终态；仅进入进程内易失队列不算成功。本轮只有根接口和受信事件模型，不实现日志文件、格式、队列、轮转、刷盘或保留策略，也不提供静默丢弃事件的生产实现；这些运行选择必须由未来组合根从外部配置建立。
+事件不包含完整 messages、完整模型响应、密钥或全文原文/译文。`TranslationJsonLinesEventLog` 把紧凑 UTF-8 JSON 追加到全局 `translation.jsonl`；每条事件都携带同一运行的 `run_id + project + profile`。只有 `write + LF + sync_data` 全部成功才确认 append。日志根在跨进程锁内验证尾部、轮转活动文件并执行 retention；完整但不符合强类型 wire 的行被视为损坏，不猜测修复。
 
 ## 10. 可信 Lua Host
 
@@ -425,42 +425,26 @@ Host 注入项目事实、`ctx.phase` 与 `ctx.db`；Translate 阶段额外注�
 - 主错误和清理错误同时发生：组合保留两者；
 - 不支持嵌套事务、隐式长事务或自动提交。
 
-Host 在提交 Runtime 前已经打开项目数据库，因此取消契约也覆盖排队期：Runtime 的
-`execute` Future 一旦首次轮询并接管 bindings，无论任务是否已经进入 worker，成功、
-失败、排队期取消和运行期取消都必须恰好调用一次 `finalize`。调用 Future 被丢弃也不能
-放弃清理；根实现须在自己的受控任务中回滚活动事务并关闭会话。
+Host 先读取脚本，再 `runtime.reserve().await`，随后打开项目 SQLite 会话并构造
+Host calls 与不可复制的 finalizer，最后用 `reservation.start(...)` 同步移交所有权。
+`start` 之后，Runtime supervisor 无论经历排队、Context、Compile、Execute、Binding、
+Cancelled 还是 worker panic，都必须恰好一次进入 Finalizing。执行 handle 被丢弃只发出取消信号，supervisor 仍持有唯一 finalizer，负责回滚活动事务并关闭会话。
 
 `require` 和脚本主动文件访问属于 Lua 专用 worker，不得阻塞异步 I/O 执行器线程。
 
-## 11. 根接口与完成边界
+## 11. 生产根与进程边界
 
-TranslateUseCase 的非根业务树已经收束到以下运行根接口：
-
-| 根接口 | 负责的真实机制 |
+| 生产实现 | 承载的翻译根契约 |
 |---|---|
-| `FileReader` | 有界、真正异步或隔离阻塞调用的文件读取 |
-| `CpuTaskExecutor` | 有界多线程 CPU worker、队列背压与 panic 隔离 |
-| `SqliteQueryExecutor` | 一致只读查询与行返回 |
-| `SqliteTransactionExecutor` | 拥有型短事务计划与确定提交终态 |
-| `LlmRequestExecutor` | 网络排队、限流、单次请求与响应读取 |
-| `AsyncDelay` | 可取消异步等待 |
-| `PersistentEventLog<TranslationLogEvent>` | 按顺序接管结构化任务结果与运行汇总并持久化 |
-| `TrustedLuaRuntimeExecutor` | 可信 Lua VM、专用 worker 与受控终态 |
-| `SqliteInteractiveSessionFactory` | 同连接 query/execute/事务状态/关闭生命周期 |
+| `SystemFileSystem` | `FileReader` |
+| `BoundedCpuExecutor` | `CpuTaskExecutor` |
+| `RusqliteStorage` | `SqliteQueryExecutor`、`SqliteTransactionExecutor`、`SqliteInteractiveSessionFactory` |
+| `OpenAiChatCompletionExecutor` | `LlmRequestExecutor` |
+| `TokioAsyncDelay` | `AsyncDelay` |
+| `TranslationJsonLinesEventLog` | `PersistentEventLog<TranslationLogEvent>` |
+| `TrustedLua54Runtime` | `TrustedLuaRuntimeExecutor` |
+| `WindowsRunIdGenerator` | `RunIdGenerator` |
 
-当前可以声称：
+`ProductionMzCommandRunner` 在选中 Profile 后才解析 API key、读取提示词与 PEM，并构造上表中本命令实际需要的根。Standard 与 Translate Lua 共享同一个 HTTP Client、同一个 Profile 限流器和同一 SQLite 预算。
 
-- Standard 的资产读取、两阶段计划、全局确定性去重、历史译文复用、模型执行、一次验收多位置扩散与结果存储业务边界已经成立；
-- Standard 的 Complete/Partial/Unavailable 正常结果、按 ID 验收、按传播族原子提交和集中日志依赖边界已经成立；
-- Lua Host 的脚本、项目上下文、共享 LLM、数据库会话和事务生命周期编排已经成立；
-- TranslateUseCase 全部非根依赖已经实现到真实运行根之前；
-- CPU 密集工作和异步等待路径均通过明确根契约隔离，阶段并发和批量选择全部由外部注入。
-
-当前不能声称：
-
-- 真实文件、CPU 线程池、SQLite、网络 LLM 或 Lua VM 已有生产适配器；
-- 结构化持久事件日志已有生产适配器；
-- 生产组合根已经把这些能力装入 `MzCli`；
-- 真实游戏已经完成端到端翻译或达到目标吞吐量。
-
-测试替身可以证明业务顺序、错误边界、确定性和资源上限契约，但真实吞吐、取消后的系统资源释放、数据库终态和网络行为必须等待根适配器与组合根完成后，用代表性 MZ 游戏验证。
+命令结束后按 Lua、LLM、SQLite、FileSystem、CPU、Translation Log 的顺序停止准入并排空已接管工作。只有业务结果与全部 shutdown 都成功后，进程才把 Complete/Partial/Unavailable 摘要写入 stdout。

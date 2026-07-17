@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "翻译服务按计划先实现但尚未生产装配")]
-
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -240,8 +238,8 @@ pub(crate) trait TranslationExecutionProfileResolver: Send + Sync {
     /// 配置不存在、无效或无法建立时的失败。
     type Error: Error + Send + Sync + 'static;
 
-    /// 按调用方明确指定的 LLM 标识选择执行配置。
-    fn resolve(&self, llm_id: &str) -> Result<Self::Profile, Self::Error>;
+    /// 按调用方明确指定的 Profile 标识选择执行配置。
+    fn resolve(&self, profile_id: &str) -> Result<Self::Profile, Self::Error>;
 }
 
 /// 一次翻译运行共享的不可变执行配置。
@@ -400,10 +398,10 @@ where
     type Profile = Arc<TranslationExecutionProfile<P>>;
     type Error = TranslationExecutionProfileResolveError;
 
-    fn resolve(&self, llm_id: &str) -> Result<Self::Profile, Self::Error> {
-        self.catalog.get(llm_id).ok_or_else(|| {
+    fn resolve(&self, profile_id: &str) -> Result<Self::Profile, Self::Error> {
+        self.catalog.get(profile_id).ok_or_else(|| {
             TranslationExecutionProfileResolveError::UnknownProfile {
-                requested_id: llm_id.to_owned(),
+                requested_id: profile_id.to_owned(),
                 available_ids: self.catalog.available_ids(),
             }
         })

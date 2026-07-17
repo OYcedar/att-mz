@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "标准翻译资产读取器尚未接入生产组合根")]
-
 //! 从五张 MZ 标准资产表建立一致翻译语料。
 
 use std::collections::BTreeMap;

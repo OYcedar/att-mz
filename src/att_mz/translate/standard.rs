@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "Standard 直接依赖尚未接入生产实现")]
-
 //! MZ 标准资产翻译的顶层编排。
 //!
 //! Standard 只负责读取当前资产、建立任务计划、在外部上限内执行任务，
@@ -14,13 +12,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{FuturesOrdered, StreamExt};
 
 use crate::att_mz::text::{MzLocation, TextGroupKind};
+use crate::execution::{CooperativeCancellation, OperationCancelled};
 use crate::language::LanguageAnalysis;
 use crate::observability::PersistentEventLog;
 use crate::project_database::StoredProjectRecord;
 
+use super::executor::{FinalLlmResponseMetadata, LlmUsage};
 use super::profile::TranslationExecutionProfile;
 
 /// 一次标准资产翻译需要的可选外部资料。
@@ -168,18 +168,12 @@ impl StandardTranslationAsset {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
         &self.identity
     }
 
-    pub(crate) fn field_name(&self) -> &str {
-        &self.field_name
-    }
-
-    pub(crate) fn translation(&self) -> Option<&str> {
-        self.translation.as_deref()
-    }
-
+    #[cfg(test)]
     pub(crate) fn terminology_dependencies(&self) -> &[TerminologyDependency] {
         &self.terminology_dependencies
     }
@@ -230,6 +224,7 @@ impl StandardTranslationGroup {
         &self.group_location
     }
 
+    #[cfg(test)]
     pub(crate) fn assets(&self) -> &[StandardTranslationAsset] {
         &self.assets
     }
@@ -250,6 +245,7 @@ impl StandardTranslationCorpus {
         Self { groups }
     }
 
+    #[cfg(test)]
     pub(crate) fn groups(&self) -> &[StandardTranslationGroup] {
         &self.groups
     }
@@ -409,10 +405,12 @@ impl TranslationPlanPreparation {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn invalidations(&self) -> &[TranslationInvalidation] {
         &self.invalidations
     }
 
+    #[cfg(test)]
     pub(crate) fn reuses(&self) -> &[TranslationReuse] {
         &self.reuses
     }
@@ -496,6 +494,7 @@ impl TranslationLanguagePair {
         &self.source_language
     }
 
+    #[cfg(test)]
     pub(crate) fn target_language(&self) -> &str {
         &self.target_language
     }
@@ -554,19 +553,23 @@ impl AppliedPlaceholder {
         &self.original
     }
 
+    #[cfg(test)]
     pub(crate) const fn origin(&self) -> PlaceholderRuleOrigin {
         self.origin
     }
 
+    #[cfg(test)]
     pub(crate) fn label(&self) -> &str {
         &self.label
     }
 
     /// 返回建立本绑定的稳定领域作用域。
+    #[cfg(test)]
     pub(crate) fn scope(&self) -> &str {
         &self.scope
     }
 
+    #[cfg(test)]
     pub(crate) const fn segment(&self) -> PlaceholderSegment {
         self.segment
     }
@@ -654,26 +657,17 @@ impl TranslationTaskUnit {
         )
     }
 
-    pub(crate) fn field_name(&self) -> &str {
-        &self.field_name
-    }
-
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
         &self.identity
     }
 
-    pub(crate) fn original_text(&self) -> &str {
-        self.identity.original_text()
-    }
-
+    #[cfg(test)]
     pub(crate) fn protected_text(&self) -> &str {
         &self.protected_text
     }
 
-    pub(crate) fn applied_placeholders(&self) -> &[AppliedPlaceholder] {
-        &self.applied_placeholders
-    }
-
+    #[cfg(test)]
     pub(crate) const fn mode(&self) -> &TranslationTaskUnitMode {
         &self.mode
     }
@@ -704,10 +698,12 @@ impl TranslationTaskGroup {
         self.kind
     }
 
+    #[cfg(test)]
     pub(crate) fn group_location(&self) -> &MzLocation {
         &self.group_location
     }
 
+    #[cfg(test)]
     pub(crate) fn units(&self) -> &[TranslationTaskUnit] {
         &self.units
     }
@@ -809,10 +805,12 @@ impl TranslationTaskBlock {
         &self.language_pair
     }
 
+    #[cfg(test)]
     pub(crate) fn groups(&self) -> &[TranslationTaskGroup] {
         &self.groups
     }
 
+    #[cfg(test)]
     pub(crate) fn injected_terminology(&self) -> &[TerminologyDependency] {
         &self.injected_terminology
     }
@@ -906,10 +904,6 @@ impl AcceptedTranslationDecision {
         self.id
     }
 
-    pub(crate) fn patch(&self) -> &TranslationPatch {
-        &self.patch
-    }
-
     pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
         self.patch.identity()
     }
@@ -918,10 +912,12 @@ impl AcceptedTranslationDecision {
         self.patch.propagation_targets()
     }
 
+    #[cfg(test)]
     pub(crate) fn translation(&self) -> &str {
         self.patch.translation()
     }
 
+    #[cfg(test)]
     pub(crate) fn terminology_dependencies(&self) -> &[TerminologyDependency] {
         self.patch.terminology_dependencies()
     }
@@ -949,12 +945,9 @@ impl ValidatedTranslationTaskResult {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn task_index(&self) -> StandardTranslationTaskIndex {
         self.task_index
-    }
-
-    pub(crate) fn updates(&self) -> &[TranslationPatch] {
-        &self.updates
     }
 
     pub(crate) fn into_updates(self) -> Vec<TranslationPatch> {
@@ -1061,8 +1054,7 @@ pub(crate) struct TranslationTaskOutcome {
     task_index: StandardTranslationTaskIndex,
     status: TranslationTaskStatus,
     attempts: usize,
-    request_id: Option<String>,
-    finish_reason: Option<String>,
+    final_response: Option<FinalLlmResponseMetadata>,
     accepted: Vec<AcceptedTranslationDecision>,
     unresolved: Vec<UnresolvedTranslationUnit>,
     diagnostics: Vec<TranslationProtocolDiagnostic>,
@@ -1072,8 +1064,7 @@ impl TranslationTaskOutcome {
     pub(crate) fn complete(
         task_index: StandardTranslationTaskIndex,
         attempts: usize,
-        request_id: Option<String>,
-        finish_reason: Option<String>,
+        final_response: Option<FinalLlmResponseMetadata>,
         accepted: Vec<AcceptedTranslationDecision>,
         diagnostics: Vec<TranslationProtocolDiagnostic>,
     ) -> Result<Self, TranslationTaskOutcomeInvariantError> {
@@ -1087,8 +1078,7 @@ impl TranslationTaskOutcome {
             task_index,
             status: TranslationTaskStatus::Complete,
             attempts,
-            request_id,
-            finish_reason,
+            final_response,
             accepted,
             unresolved: Vec::new(),
             diagnostics,
@@ -1099,8 +1089,7 @@ impl TranslationTaskOutcome {
     pub(crate) fn partial(
         task_index: StandardTranslationTaskIndex,
         attempts: usize,
-        request_id: Option<String>,
-        finish_reason: Option<String>,
+        final_response: Option<FinalLlmResponseMetadata>,
         accepted: Vec<AcceptedTranslationDecision>,
         unresolved: Vec<UnresolvedTranslationUnit>,
         diagnostics: Vec<TranslationProtocolDiagnostic>,
@@ -1115,8 +1104,7 @@ impl TranslationTaskOutcome {
             task_index,
             status: TranslationTaskStatus::Partial,
             attempts,
-            request_id,
-            finish_reason,
+            final_response,
             accepted,
             unresolved,
             diagnostics,
@@ -1127,8 +1115,7 @@ impl TranslationTaskOutcome {
     pub(crate) fn unavailable(
         task_index: StandardTranslationTaskIndex,
         attempts: usize,
-        request_id: Option<String>,
-        finish_reason: Option<String>,
+        final_response: Option<FinalLlmResponseMetadata>,
         reason: TranslationTaskUnavailableReason,
         unresolved: Vec<UnresolvedTranslationUnit>,
         diagnostics: Vec<TranslationProtocolDiagnostic>,
@@ -1143,8 +1130,7 @@ impl TranslationTaskOutcome {
             task_index,
             status: TranslationTaskStatus::Unavailable(reason),
             attempts,
-            request_id,
-            finish_reason,
+            final_response,
             accepted: Vec::new(),
             unresolved,
             diagnostics,
@@ -1163,12 +1149,28 @@ impl TranslationTaskOutcome {
         self.attempts
     }
 
-    pub(crate) fn request_id(&self) -> Option<&str> {
-        self.request_id.as_deref()
+    pub(crate) fn provider_request_id(&self) -> Option<&str> {
+        self.final_response
+            .as_ref()
+            .and_then(FinalLlmResponseMetadata::provider_request_id)
+    }
+
+    pub(crate) fn provider_response_id(&self) -> Option<&str> {
+        self.final_response
+            .as_ref()
+            .map(FinalLlmResponseMetadata::provider_response_id)
     }
 
     pub(crate) fn finish_reason(&self) -> Option<&str> {
-        self.finish_reason.as_deref()
+        self.final_response
+            .as_ref()
+            .map(FinalLlmResponseMetadata::finish_reason)
+    }
+
+    pub(crate) fn final_response_usage(&self) -> Option<LlmUsage> {
+        self.final_response
+            .as_ref()
+            .and_then(FinalLlmResponseMetadata::usage)
     }
 
     pub(crate) fn accepted(&self) -> &[AcceptedTranslationDecision] {
@@ -1349,8 +1351,10 @@ pub(crate) struct TranslationTaskLogRecord {
     task_index: StandardTranslationTaskIndex,
     status: TranslationTaskStatus,
     attempts: usize,
-    request_id: Option<String>,
+    provider_request_id: Option<String>,
+    provider_response_id: Option<String>,
     finish_reason: Option<String>,
+    final_response_usage: Option<LlmUsage>,
     accepted_decisions: usize,
     confirmed_written_locations: Option<usize>,
     accepted: Vec<LoggedAcceptedTranslationDecision>,
@@ -1374,8 +1378,10 @@ impl TranslationTaskLogRecord {
             task_index: outcome.task_index(),
             status: outcome.status().clone(),
             attempts: outcome.attempts(),
-            request_id: outcome.request_id().map(str::to_owned),
+            provider_request_id: outcome.provider_request_id().map(str::to_owned),
+            provider_response_id: outcome.provider_response_id().map(str::to_owned),
             finish_reason: outcome.finish_reason().map(str::to_owned),
+            final_response_usage: outcome.final_response_usage(),
             accepted_decisions: outcome.accepted().len(),
             confirmed_written_locations: Some(outcome.accepted_location_count()),
             accepted,
@@ -1396,12 +1402,20 @@ impl TranslationTaskLogRecord {
         self.attempts
     }
 
-    pub(crate) fn request_id(&self) -> Option<&str> {
-        self.request_id.as_deref()
+    pub(crate) fn provider_request_id(&self) -> Option<&str> {
+        self.provider_request_id.as_deref()
+    }
+
+    pub(crate) fn provider_response_id(&self) -> Option<&str> {
+        self.provider_response_id.as_deref()
     }
 
     pub(crate) fn finish_reason(&self) -> Option<&str> {
         self.finish_reason.as_deref()
+    }
+
+    pub(crate) const fn final_response_usage(&self) -> Option<LlmUsage> {
+        self.final_response_usage
     }
 
     pub(crate) const fn accepted_decisions(&self) -> usize {
@@ -1627,6 +1641,7 @@ pub(crate) struct StandardTranslationService<R, P, E, S, J> {
     task_executor: E,
     result_store: S,
     event_log: J,
+    cancellation: CooperativeCancellation,
 }
 
 impl<R, P, E, S, J> StandardTranslationService<R, P, E, S, J> {
@@ -1636,6 +1651,7 @@ impl<R, P, E, S, J> StandardTranslationService<R, P, E, S, J> {
         task_executor: E,
         result_store: S,
         event_log: J,
+        cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             asset_reader,
@@ -1643,6 +1659,7 @@ impl<R, P, E, S, J> StandardTranslationService<R, P, E, S, J> {
             task_executor,
             result_store,
             event_log,
+            cancellation,
         }
     }
 }
@@ -1664,16 +1681,25 @@ where
         profile: &Self::Profile,
         input: StandardTranslationInput,
     ) -> Result<StandardTranslationRunReport, Self::Error> {
+        self.cancellation
+            .check()
+            .map_err(StandardTranslationServiceError::Cancelled)?;
         let corpus = self
             .asset_reader
             .read(project)
             .await
             .map_err(StandardTranslationServiceError::ReadAssets)?;
+        self.cancellation
+            .check()
+            .map_err(StandardTranslationServiceError::Cancelled)?;
         let plan = self
             .task_planner
             .plan(project, profile, corpus, input)
             .await
             .map_err(StandardTranslationServiceError::PlanTasks)?;
+        self.cancellation
+            .check()
+            .map_err(StandardTranslationServiceError::Cancelled)?;
         let (preparation, tasks) = plan.into_parts();
         let mut report = StandardTranslationRunReport::empty(tasks.len());
 
@@ -1682,22 +1708,43 @@ where
             .await
             .map_err(StandardTranslationServiceError::ApplyPreparation)?;
 
+        self.cancellation
+            .check()
+            .map_err(StandardTranslationServiceError::Cancelled)?;
+
         let max_in_flight = profile.max_in_flight_tasks().get();
-        let mut results = stream::iter(tasks.into_iter().map(|task| {
+        let mut tasks = tasks.into_iter();
+        let execute_task = |task: TranslationTaskBlock| {
             let task_index = task.index();
             async move {
+                if self.cancellation.is_requested() {
+                    return Ok(None);
+                }
                 self.task_executor
                     .execute(profile, task)
                     .await
+                    .map(Some)
                     .map_err(|source| (task_index, source))
             }
-        }))
-        .buffered(max_in_flight);
+        };
+        let mut results = FuturesOrdered::new();
+        for _ in 0..max_in_flight {
+            if self.cancellation.is_requested() {
+                break;
+            }
+            let Some(task) = tasks.next() else {
+                break;
+            };
+            results.push_back(execute_task(task));
+        }
 
         while let Some(result) = results.next().await {
-            let outcome = result.map_err(|(task_index, source)| {
+            let Some(outcome) = result.map_err(|(task_index, source)| {
                 StandardTranslationServiceError::ExecuteTask { task_index, source }
-            })?;
+            })?
+            else {
+                continue;
+            };
             let task_index = outcome.task_index();
             if let Some(result) = outcome.validated_result()
                 && let Err(commit_source) = self.result_store.commit(project, result).await
@@ -1730,7 +1777,17 @@ where
                     task_index,
                     source,
                 })?;
+
+            if !self.cancellation.is_requested()
+                && let Some(task) = tasks.next()
+            {
+                results.push_back(execute_task(task));
+            }
         }
+
+        self.cancellation
+            .check()
+            .map_err(StandardTranslationServiceError::Cancelled)?;
 
         self.event_log
             .append(TranslationLogEvent::RunCompleted(report.clone()))
@@ -1744,6 +1801,7 @@ where
 /// Standard 在直接依赖边界上遇到的技术失败。
 #[derive(Debug)]
 pub(crate) enum StandardTranslationServiceError<R, P, E, S, J> {
+    Cancelled(OperationCancelled),
     ReadAssets(R),
     PlanTasks(P),
     ApplyPreparation(S),
@@ -1777,6 +1835,7 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
             Self::ReadAssets(source) => write!(formatter, "无法读取标准翻译资产：{source}"),
             Self::PlanTasks(source) => write!(formatter, "无法建立标准翻译计划：{source}"),
             Self::ApplyPreparation(source) => {
@@ -1819,6 +1878,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
             Self::ReadAssets(source) => Some(source),
             Self::PlanTasks(source) => Some(source),
             Self::ApplyPreparation(source) => Some(source),
@@ -1971,14 +2031,12 @@ mod tests {
     fn task_outcome_constructors_reject_every_illegal_state_in_release_builds() {
         let task_index = StandardTranslationTaskIndex::new(0);
         assert!(
-            TranslationTaskOutcome::complete(task_index, 1, None, None, Vec::new(), Vec::new())
-                .is_err()
+            TranslationTaskOutcome::complete(task_index, 1, None, Vec::new(), Vec::new()).is_err()
         );
         assert!(
             TranslationTaskOutcome::partial(
                 task_index,
                 1,
-                None,
                 None,
                 Vec::new(),
                 Vec::new(),
@@ -1990,7 +2048,6 @@ mod tests {
             TranslationTaskOutcome::unavailable(
                 task_index,
                 1,
-                None,
                 None,
                 TranslationTaskUnavailableReason::AllOutputsRejected,
                 Vec::new(),
@@ -2002,7 +2059,6 @@ mod tests {
             TranslationTaskOutcome::unavailable(
                 task_index,
                 0,
-                None,
                 None,
                 TranslationTaskUnavailableReason::AllOutputsRejected,
                 vec![UnresolvedTranslationUnit::new(
@@ -2134,6 +2190,7 @@ mod tests {
         yields_by_task: Arc<Vec<usize>>,
         fail_at: Option<usize>,
         outcome_kinds: Arc<Vec<FakeOutcomeKind>>,
+        cancel_on_start: Option<(usize, CooperativeCancellation)>,
     }
 
     impl StandardTranslationTaskExecutor for FakeExecutor {
@@ -2148,6 +2205,11 @@ mod tests {
             let task_index = task.index();
             let index = task_index.get();
             record(&self.events, Event::Execute(index));
+            if let Some((cancel_index, cancellation)) = &self.cancel_on_start
+                && *cancel_index == index
+            {
+                cancellation.request();
+            }
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
 
@@ -2265,6 +2327,7 @@ mod tests {
         preparations: Arc<Mutex<Vec<TranslationPlanPreparation>>>,
         log_records: Arc<Mutex<Vec<TranslationLogEvent>>>,
         max_active: Arc<AtomicUsize>,
+        cancellation: CooperativeCancellation,
     }
 
     fn harness(
@@ -2339,6 +2402,7 @@ mod tests {
         let preparations = Arc::new(Mutex::new(Vec::new()));
         let log_records = Arc::new(Mutex::new(Vec::new()));
         let max_active = Arc::new(AtomicUsize::new(0));
+        let cancellation = CooperativeCancellation::default();
         Harness {
             service: StandardTranslationService::new(
                 FakeReader {
@@ -2359,6 +2423,7 @@ mod tests {
                     yields_by_task: Arc::new(yields_by_task),
                     fail_at: execute_failure_at,
                     outcome_kinds: Arc::new(outcome_kinds),
+                    cancel_on_start: None,
                 },
                 FakeStore {
                     events: Arc::clone(&events),
@@ -2372,12 +2437,14 @@ mod tests {
                     fail_task_at: log_failure_at,
                     fail_run: run_log_failure,
                 },
+                cancellation.clone(),
             ),
             events,
             planner_inputs,
             preparations,
             log_records,
             max_active,
+            cancellation,
         }
     }
 
@@ -2412,6 +2479,37 @@ mod tests {
             .expect("并发执行应该成功");
 
         assert_eq!(harness.max_active.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_task_refill_and_drains_the_started_task() {
+        let mut harness = harness(4, vec![1; 4], false, false, false, None, None);
+        harness.service.task_executor.cancel_on_start = Some((0, harness.cancellation.clone()));
+
+        let error = harness
+            .service
+            .run(&project(), &profile(2), input())
+            .await
+            .expect_err("取消后标准翻译应在已开始任务收尾后停止");
+
+        assert!(matches!(
+            error,
+            StandardTranslationServiceError::Cancelled(_)
+        ));
+        let events = events(&harness.events);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Execute(index) => Some(*index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(committed(&events), [0]);
+        assert_eq!(logged_tasks(&events), [0]);
+        assert!(!events.contains(&Event::LogRun));
     }
 
     #[tokio::test]
@@ -2877,8 +2975,12 @@ mod tests {
             FakeOutcomeKind::Complete => TranslationTaskOutcome::complete(
                 task_index,
                 1,
-                Some(format!("request-{}", task_index.get())),
-                Some("stop".to_owned()),
+                Some(FinalLlmResponseMetadata::new(
+                    Some(format!("request-{}", task_index.get())),
+                    format!("response-{}", task_index.get()),
+                    "stop",
+                    None,
+                )),
                 expected.iter().map(patch).collect(),
                 Vec::new(),
             )
@@ -2886,8 +2988,12 @@ mod tests {
             FakeOutcomeKind::Partial => TranslationTaskOutcome::partial(
                 task_index,
                 1,
-                Some(format!("request-{}", task_index.get())),
-                Some("stop".to_owned()),
+                Some(FinalLlmResponseMetadata::new(
+                    Some(format!("request-{}", task_index.get())),
+                    format!("response-{}", task_index.get()),
+                    "stop",
+                    None,
+                )),
                 vec![patch(&expected[0])],
                 vec![unresolved(
                     &expected[1],
@@ -2902,8 +3008,12 @@ mod tests {
             FakeOutcomeKind::Unavailable => TranslationTaskOutcome::unavailable(
                 task_index,
                 1,
-                Some(format!("request-{}", task_index.get())),
-                Some("length".to_owned()),
+                Some(FinalLlmResponseMetadata::new(
+                    Some(format!("request-{}", task_index.get())),
+                    format!("response-{}", task_index.get()),
+                    "length",
+                    None,
+                )),
                 TranslationTaskUnavailableReason::ModelResponseUnusable,
                 expected
                     .iter()
