@@ -1,4 +1,4 @@
-#![allow(dead_code, reason = "服务按计划先实现但暂不进行生产装配")]
+#![allow(dead_code, reason = "项目持久化能力尚未接入生产组合根")]
 
 //! 项目数据库的创建职责。
 
@@ -17,6 +17,83 @@ const PROJECT_DATABASE_FILE_NAME: &str = "project.db";
 const CREATE_METADATA_TABLE: &str = "CREATE TABLE metadata (\n    name                                TEXT NOT NULL PRIMARY KEY,\n    source_language                     TEXT NOT NULL,\n    target_language                     TEXT NOT NULL,\n    dialogue_max_fullwidth_chars        INTEGER NOT NULL CHECK (dialogue_max_fullwidth_chars > 0),\n    scrolling_text_max_fullwidth_chars  INTEGER NOT NULL CHECK (scrolling_text_max_fullwidth_chars > 0),\n    help_description_max_fullwidth_chars INTEGER NOT NULL CHECK (help_description_max_fullwidth_chars > 0)\n)";
 const INSERT_METADATA: &str = "INSERT INTO metadata (name, source_language, target_language, dialogue_max_fullwidth_chars, scrolling_text_max_fullwidth_chars, help_description_max_fullwidth_chars) VALUES (?, ?, ?, ?, ?, ?)";
 const SELECT_METADATA: &str = "SELECT name, source_language, target_language, dialogue_max_fullwidth_chars, scrolling_text_max_fullwidth_chars, help_description_max_fullwidth_chars FROM metadata";
+
+/// 一个 MZ 项目工作区中所有固定位置的唯一派生结果。
+///
+/// 工作区创建、数据库读取、项目开启与写回都从该值取得路径，避免各自重新解释
+/// 工作区结构。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectWorkspaceLayout {
+    workspace_root: PathBuf,
+    database_path: PathBuf,
+    source_root: PathBuf,
+    source_data: PathBuf,
+    source_js: PathBuf,
+    write_back_root: PathBuf,
+    write_back_data: PathBuf,
+    write_back_js: PathBuf,
+}
+
+impl ProjectWorkspaceLayout {
+    /// 从项目集合根和受信项目名定位工作区。
+    pub(crate) fn for_project(projects_root: &Path, name: &ProjectName) -> Self {
+        Self::from_workspace_root(projects_root.join(name.as_str()))
+    }
+
+    /// 从已经确定的工作区根建立全部固定位置。
+    pub(crate) fn from_workspace_root(workspace_root: PathBuf) -> Self {
+        let database_path = workspace_root.join(PROJECT_DATABASE_FILE_NAME);
+        let source_root = workspace_root.join("source");
+        let source_data = source_root.join("data");
+        let source_js = source_root.join("js");
+        let write_back_root = workspace_root.join("write_back");
+        let write_back_data = write_back_root.join("data");
+        let write_back_js = write_back_root.join("js");
+
+        Self {
+            workspace_root,
+            database_path,
+            source_root,
+            source_data,
+            source_js,
+            write_back_root,
+            write_back_data,
+            write_back_js,
+        }
+    }
+
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+
+    pub(crate) fn source_data(&self) -> &Path {
+        &self.source_data
+    }
+
+    pub(crate) fn source_js(&self) -> &Path {
+        &self.source_js
+    }
+
+    pub(crate) fn write_back_root(&self) -> &Path {
+        &self.write_back_root
+    }
+
+    pub(crate) fn write_back_data(&self) -> &Path {
+        &self.write_back_data
+    }
+
+    pub(crate) fn write_back_js(&self) -> &Path {
+        &self.write_back_js
+    }
+}
 
 /// 一个游戏显示区域允许的每行最大全角字符数。
 ///
@@ -102,9 +179,7 @@ impl MzWriteBackLayoutProfile {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredProjectRecord {
     name: ProjectName,
-    workspace_root: PathBuf,
-    source_root: PathBuf,
-    database_path: PathBuf,
+    layout: ProjectWorkspaceLayout,
     source_language: String,
     target_language: String,
     layout_profile: MzWriteBackLayoutProfile,
@@ -120,12 +195,32 @@ impl StoredProjectRecord {
         target_language: String,
         layout_profile: MzWriteBackLayoutProfile,
     ) -> Self {
-        let source_root = workspace_root.join("source");
+        let layout = ProjectWorkspaceLayout::from_workspace_root(workspace_root);
+        assert_eq!(
+            layout.database_path(),
+            database_path,
+            "受信项目记录的数据库路径必须属于同一工作区布局"
+        );
+        Self::from_layout(
+            name,
+            layout,
+            source_language,
+            target_language,
+            layout_profile,
+        )
+    }
+
+    /// 直接复用已经建立的工作区布局。
+    pub(crate) fn from_layout(
+        name: ProjectName,
+        layout: ProjectWorkspaceLayout,
+        source_language: String,
+        target_language: String,
+        layout_profile: MzWriteBackLayoutProfile,
+    ) -> Self {
         Self {
             name,
-            workspace_root,
-            source_root,
-            database_path,
+            layout,
             source_language,
             target_language,
             layout_profile,
@@ -136,16 +231,20 @@ impl StoredProjectRecord {
         &self.name
     }
 
+    pub(crate) fn layout(&self) -> &ProjectWorkspaceLayout {
+        &self.layout
+    }
+
     pub(crate) fn workspace_root(&self) -> &Path {
-        &self.workspace_root
+        self.layout.workspace_root()
     }
 
     pub(crate) fn source_root(&self) -> &Path {
-        &self.source_root
+        self.layout.source_root()
     }
 
     pub(crate) fn database_path(&self) -> &Path {
-        &self.database_path
+        self.layout.database_path()
     }
 
     pub(crate) fn source_language(&self) -> &str {
@@ -199,8 +298,8 @@ where
     type Error = ProjectDatabaseReadError<S::Error>;
 
     async fn read(&self, requested_name: &ProjectName) -> Result<StoredProjectRecord, Self::Error> {
-        let workspace_root = project_workspace_root(&self.projects_root, requested_name);
-        let database_path = workspace_root.join(PROJECT_DATABASE_FILE_NAME);
+        let layout = ProjectWorkspaceLayout::for_project(&self.projects_root, requested_name);
+        let database_path = layout.database_path().to_path_buf();
         let rows = self
             .sqlite
             .query_existing_database(
@@ -212,16 +311,16 @@ where
                 ProjectDatabaseReadError::from_executor(database_path.clone(), error)
             })?;
 
-        record_from_rows(requested_name, workspace_root, database_path, rows)
+        record_from_rows(requested_name, layout, rows)
     }
 }
 
 fn record_from_rows<E>(
     requested_name: &ProjectName,
-    workspace_root: PathBuf,
-    database_path: PathBuf,
+    layout: ProjectWorkspaceLayout,
     rows: Vec<SqliteRow>,
 ) -> Result<StoredProjectRecord, ProjectDatabaseReadError<E>> {
+    let database_path = layout.database_path().to_path_buf();
     let mut rows = rows.into_iter();
     let row = rows
         .next()
@@ -327,10 +426,9 @@ fn record_from_rows<E>(
         });
     }
 
-    Ok(StoredProjectRecord::new(
+    Ok(StoredProjectRecord::from_layout(
         stored_name,
-        workspace_root,
-        database_path,
+        layout,
         source_language,
         target_language,
         MzWriteBackLayoutProfile::new(
@@ -568,8 +666,8 @@ pub(crate) trait ProjectDatabaseCreator: Send + Sync {
     /// `destination_path` 是工作区创建器已经选择的精确暂存路径；本职责不得再按
     /// 项目名推导或改写它。
     ///
-    /// 一旦返回的 Future 开始产生副作用，调用方必须持续等待到明确终态；直接
-    /// 丢弃或中止 Future、以及进程终止后的清理不属于首版保证。
+    /// 一旦返回的 Future 开始产生副作用，调用方必须持续等待到明确终态；本契约
+    /// 不承诺 Future 被丢弃、中止或进程终止后的清理结果。
     fn create(
         &self,
         destination_path: PathBuf,
@@ -613,10 +711,6 @@ where
 
         Ok(CreatedProject::new(database_path))
     }
-}
-
-fn project_workspace_root(projects_root: &Path, name: &ProjectName) -> PathBuf {
-    projects_root.join(name.as_str())
 }
 
 fn metadata_commands(project: &NewProject) -> Vec<SqliteCommand> {
@@ -725,6 +819,45 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
+
+    #[test]
+    fn workspace_layout_derives_every_fixed_location_from_one_root() {
+        let name: ProjectName = "测试 游戏".parse().expect("test name should be valid");
+        let layout = ProjectWorkspaceLayout::for_project(Path::new("C:/att/projects"), &name);
+
+        assert_eq!(
+            layout.workspace_root(),
+            Path::new("C:/att/projects/测试 游戏")
+        );
+        assert_eq!(
+            layout.database_path(),
+            Path::new("C:/att/projects/测试 游戏/project.db")
+        );
+        assert_eq!(
+            layout.source_root(),
+            Path::new("C:/att/projects/测试 游戏/source")
+        );
+        assert_eq!(
+            layout.source_data(),
+            Path::new("C:/att/projects/测试 游戏/source/data")
+        );
+        assert_eq!(
+            layout.source_js(),
+            Path::new("C:/att/projects/测试 游戏/source/js")
+        );
+        assert_eq!(
+            layout.write_back_root(),
+            Path::new("C:/att/projects/测试 游戏/write_back")
+        );
+        assert_eq!(
+            layout.write_back_data(),
+            Path::new("C:/att/projects/测试 游戏/write_back/data")
+        );
+        assert_eq!(
+            layout.write_back_js(),
+            Path::new("C:/att/projects/测试 游戏/write_back/js")
+        );
+    }
 
     #[derive(Debug)]
     struct FakeDriverError(&'static str);
@@ -1098,6 +1231,14 @@ mod tests {
             record.database_path(),
             Path::new("C:/att/projects/测试 游戏/project.db")
         );
+        assert_eq!(
+            record.layout().source_data(),
+            Path::new("C:/att/projects/测试 游戏/source/data")
+        );
+        assert_eq!(
+            record.layout().source_js(),
+            Path::new("C:/att/projects/测试 游戏/source/js")
+        );
         assert_eq!(record.source_language(), "ja");
         assert_eq!(record.target_language(), "zh-Hans");
         assert_eq!(record.layout_profile(), &layout_profile());
@@ -1153,7 +1294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_legacy_metadata_schema_without_fallback() {
+    async fn rejects_metadata_rows_that_do_not_match_the_current_contract() {
         let service = record_reading_service(Err(QueryExistingDatabaseError::QueryFailed(
             FakeDriverError("no such column: dialogue_max_fullwidth_chars"),
         )));
@@ -1161,7 +1302,7 @@ mod tests {
         let error = service
             .read(&"demo".parse().expect("test name should be valid"))
             .await
-            .expect_err("legacy metadata must require reinitialization");
+            .expect_err("不符合当前 metadata 契约的记录必须被拒绝");
 
         assert!(matches!(
             error,

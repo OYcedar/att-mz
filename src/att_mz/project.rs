@@ -8,7 +8,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use super::ProjectName;
-use crate::project_database::ProjectDatabaseRecordReader;
+use crate::project_database::{
+    ProjectDatabaseRecordReader, ProjectWorkspaceLayout, StoredProjectRecord,
+};
 use crate::storage::file_system::{ExistingDirectoryResolver, ResolveDirectoryError};
 
 pub use crate::project_database::{
@@ -18,14 +20,7 @@ pub use crate::project_database::{
 /// 已由项目开启边界建立、可供 MZ 各用例直接信任的项目上下文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OpenedProject {
-    name: ProjectName,
-    workspace_root: PathBuf,
-    source_root: PathBuf,
-    write_back_root: PathBuf,
-    database_path: PathBuf,
-    source_language: String,
-    target_language: String,
-    layout_profile: MzWriteBackLayoutProfile,
+    record: StoredProjectRecord,
 }
 
 impl OpenedProject {
@@ -38,50 +33,54 @@ impl OpenedProject {
         target_language: String,
         layout_profile: MzWriteBackLayoutProfile,
     ) -> Self {
-        let source_root = workspace_root.join("source");
-        let write_back_root = workspace_root.join("write_back");
-        Self {
+        Self::from_record(StoredProjectRecord::new(
             name,
             workspace_root,
-            source_root,
-            write_back_root,
             database_path,
             source_language,
             target_language,
             layout_profile,
-        }
+        ))
+    }
+
+    fn from_record(record: StoredProjectRecord) -> Self {
+        Self { record }
     }
 
     pub(crate) fn name(&self) -> &ProjectName {
-        &self.name
+        self.record.name()
+    }
+
+    pub(crate) fn layout(&self) -> &ProjectWorkspaceLayout {
+        self.record.layout()
     }
 
     pub(crate) fn workspace_root(&self) -> &Path {
-        &self.workspace_root
+        self.record.workspace_root()
     }
 
     pub(crate) fn source_root(&self) -> &Path {
-        &self.source_root
+        self.record.source_root()
     }
 
     pub(crate) fn write_back_root(&self) -> &Path {
-        &self.write_back_root
+        self.record.layout().write_back_root()
     }
 
     pub(crate) fn database_path(&self) -> &Path {
-        &self.database_path
+        self.record.database_path()
     }
 
     pub(crate) fn source_language(&self) -> &str {
-        &self.source_language
+        self.record.source_language()
     }
 
     pub(crate) fn target_language(&self) -> &str {
-        &self.target_language
+        self.record.target_language()
     }
 
     pub(crate) fn layout_profile(&self) -> &MzWriteBackLayoutProfile {
-        &self.layout_profile
+        self.record.layout_profile()
     }
 }
 
@@ -125,24 +124,16 @@ where
             .read(name)
             .await
             .map_err(ExistingProjectOpeningError::ReadProjectRecord)?;
-        let source_root = record.workspace_root().join("source");
         self.directory_resolver
-            .resolve_existing_directory(source_root.join("data"))
+            .resolve_existing_directory(record.layout().source_data().to_path_buf())
             .await
             .map_err(ExistingProjectOpeningError::ResolveSourceData)?;
         self.directory_resolver
-            .resolve_existing_directory(source_root.join("js"))
+            .resolve_existing_directory(record.layout().source_js().to_path_buf())
             .await
             .map_err(ExistingProjectOpeningError::ResolveSourceJs)?;
 
-        Ok(OpenedProject::new(
-            record.name().clone(),
-            record.workspace_root().to_path_buf(),
-            record.database_path().to_path_buf(),
-            record.source_language().to_owned(),
-            record.target_language().to_owned(),
-            *record.layout_profile(),
-        ))
+        Ok(OpenedProject::from_record(record))
     }
 }
 
@@ -201,8 +192,6 @@ pub(crate) fn test_layout_profile() -> MzWriteBackLayoutProfile {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-
-    use crate::project_database::StoredProjectRecord;
 
     use super::*;
 
@@ -357,6 +346,22 @@ mod tests {
         assert_eq!(
             opened.database_path(),
             Path::new("C:/att/projects/游戏 一/project.db")
+        );
+        assert_eq!(
+            opened.layout().source_data(),
+            Path::new("C:/att/projects/游戏 一/source/data")
+        );
+        assert_eq!(
+            opened.layout().source_js(),
+            Path::new("C:/att/projects/游戏 一/source/js")
+        );
+        assert_eq!(
+            opened.layout().write_back_data(),
+            Path::new("C:/att/projects/游戏 一/write_back/data")
+        );
+        assert_eq!(
+            opened.layout().write_back_js(),
+            Path::new("C:/att/projects/游戏 一/write_back/js")
         );
         assert_eq!(opened.source_language(), "ja");
         assert_eq!(opened.target_language(), "zh-Hans");

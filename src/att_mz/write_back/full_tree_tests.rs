@@ -43,9 +43,10 @@ use crate::observability::PersistentEventLog;
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
-    AtomicDirectorySnapshotPublishError, AtomicDirectorySnapshotPublisher, DirectoryLister,
-    DirectorySnapshotPublishRequest, ExistingDirectoryResolver, FileReader, ListDirectoryError,
-    ReadFile, ReadFileError, ResolveDirectoryError,
+    AtomicDirectoryDiscardError, AtomicDirectoryPrepareError, AtomicDirectoryPublishError,
+    AtomicDirectoryPublisher, DirectoryLister, DirectoryPublishMode, DirectoryStageRequest,
+    ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile, ReadFileError,
+    ResolveDirectoryError, StagedDirectory,
 };
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteCommand, SqliteQuery, SqliteQueryExecutor, SqliteRow,
@@ -174,21 +175,57 @@ impl CpuTaskExecutor for InlineCpuExecutor {
 
 #[derive(Clone, Default)]
 struct RecordingAtomicPublisher {
-    requests: Arc<Mutex<Vec<DirectorySnapshotPublishRequest>>>,
+    requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
+    publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishMode)>>>,
+    publish_error: Arc<Mutex<Option<AtomicDirectoryPublishError<TestError>>>>,
 }
 
-impl AtomicDirectorySnapshotPublisher for RecordingAtomicPublisher {
+impl AtomicDirectoryPublisher for RecordingAtomicPublisher {
     type Error = TestError;
+    type StagingState = ();
 
-    async fn publish_snapshot(
+    async fn prepare(
         &self,
-        request: DirectorySnapshotPublishRequest,
-    ) -> Result<(), AtomicDirectorySnapshotPublishError<Self::Error>> {
+        request: DirectoryStageRequest,
+    ) -> Result<StagedDirectory<Self::StagingState>, AtomicDirectoryPrepareError<Self::Error>> {
+        let target_root = request.target_root().to_path_buf();
         self.requests
             .lock()
             .expect("发布记录锁不应中毒")
             .push(request);
+        let staging_root = target_root.with_extension("att-stage");
+        Ok(StagedDirectory::new(target_root, staging_root, ()))
+    }
+
+    async fn publish(
+        &self,
+        staged: StagedDirectory<Self::StagingState>,
+        mode: DirectoryPublishMode,
+    ) -> Result<(), AtomicDirectoryPublishError<Self::Error>> {
+        self.publish_calls
+            .lock()
+            .expect("发布记录锁不应中毒")
+            .push((
+                staged.target_root().to_path_buf(),
+                staged.staging_root().to_path_buf(),
+                mode,
+            ));
+        if let Some(error) = self
+            .publish_error
+            .lock()
+            .expect("发布结果锁不应中毒")
+            .take()
+        {
+            return Err(error);
+        }
         Ok(())
+    }
+
+    async fn discard(
+        &self,
+        _staged: StagedDirectory<Self::StagingState>,
+    ) -> Result<(), AtomicDirectoryDiscardError<Self::Error>> {
+        panic!("Standard WriteBack 全树不应丢弃已暂存候选")
     }
 }
 
@@ -433,7 +470,8 @@ struct FullTreeObservations {
     resolved_directories: Arc<Mutex<Vec<PathBuf>>>,
     file_calls: Arc<Mutex<Vec<PathBuf>>>,
     cpu_calls: Arc<AtomicUsize>,
-    publish_requests: Arc<Mutex<Vec<DirectorySnapshotPublishRequest>>>,
+    publish_requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
+    publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishMode)>>>,
     run_logs: Arc<Mutex<Vec<StandardWriteBackRunLog>>>,
     llm_calls: Arc<AtomicUsize>,
     runtime_facts: Arc<Mutex<RuntimeFacts>>,
@@ -442,6 +480,13 @@ struct FullTreeObservations {
 }
 
 fn build_full_tree(mode: RuntimeTransactionMode) -> (impl WriteBackUseCase, FullTreeObservations) {
+    build_full_tree_with_publish_error(mode, None)
+}
+
+fn build_full_tree_with_publish_error(
+    mode: RuntimeTransactionMode,
+    publish_error: Option<AtomicDirectoryPublishError<TestError>>,
+) -> (impl WriteBackUseCase, FullTreeObservations) {
     let sqlite = RecordingSqliteQuery::default();
     let resolver = RecordingDirectoryResolver::default();
     let file_reader = RecordingFileReader {
@@ -449,7 +494,10 @@ fn build_full_tree(mode: RuntimeTransactionMode) -> (impl WriteBackUseCase, Full
         calls: Arc::new(Mutex::new(Vec::new())),
     };
     let cpu = InlineCpuExecutor::default();
-    let atomic_publisher = RecordingAtomicPublisher::default();
+    let atomic_publisher = RecordingAtomicPublisher {
+        publish_error: Arc::new(Mutex::new(publish_error)),
+        ..RecordingAtomicPublisher::default()
+    };
     let run_log = RecordingRunLog::default();
     let llm = RecordingLlm::default();
     let runtime = ExercisingLuaRuntime {
@@ -499,6 +547,7 @@ fn build_full_tree(mode: RuntimeTransactionMode) -> (impl WriteBackUseCase, Full
         file_calls: file_reader.calls,
         cpu_calls: cpu.calls,
         publish_requests: atomic_publisher.requests,
+        publish_calls: atomic_publisher.publish_calls,
         run_logs: run_log.events,
         llm_calls: llm.calls,
         runtime_facts: runtime.facts,
@@ -584,6 +633,46 @@ async fn unclosed_lua_transaction_is_rolled_back_after_standard_remains_publishe
     );
 }
 
+#[tokio::test]
+async fn published_cleanup_failure_is_not_logged_as_complete_standard_success() {
+    let target_root = workspace_root().join("write_back");
+    let residual_path = workspace_root().join(".write_back-old");
+    let (service, observations) = build_full_tree_with_publish_error(
+        RuntimeTransactionMode::Commit,
+        Some(AtomicDirectoryPublishError::PublishedButCleanupFailed {
+            target_root: target_root.clone(),
+            residual_path: residual_path.clone(),
+            source: TestError("cleanup"),
+        }),
+    );
+
+    let error = service
+        .execute(write_back_input())
+        .await
+        .expect_err("已发布但清理失败不是完全成功");
+
+    let message = error.to_string();
+    assert!(message.contains("已发布"));
+    assert!(message.contains(&target_root.display().to_string()));
+    assert!(message.contains(&residual_path.display().to_string()));
+    assert_eq!(
+        observations
+            .publish_calls
+            .lock()
+            .expect("发布记录锁不应中毒")
+            .len(),
+        1
+    );
+    assert!(
+        observations
+            .run_logs
+            .lock()
+            .expect("日志记录锁不应中毒")
+            .is_empty()
+    );
+    assert_eq!(observations.llm_calls.load(Ordering::SeqCst), 0);
+}
+
 fn assert_project_open_and_asset_queries(observations: &FullTreeObservations) {
     let calls = observations
         .sqlite_calls
@@ -650,6 +739,16 @@ fn assert_published_documents(
         Path::new("js")
     );
     assert_eq!(request.overlays().len(), 2);
+    assert!(request.empty_directories().is_empty());
+
+    let publish_calls = observations
+        .publish_calls
+        .lock()
+        .expect("发布记录锁不应中毒");
+    assert_eq!(publish_calls.len(), 1);
+    assert_eq!(publish_calls[0].0, workspace_root().join("write_back"));
+    assert_eq!(publish_calls[0].2, DirectoryPublishMode::Replace);
+    drop(publish_calls);
 
     let items: Value = serde_json::from_slice(overlay(request, "data/Items.json"))
         .expect("Items overlay 应为 JSON");
@@ -724,7 +823,7 @@ fn assert_successful_lua_execution(observations: &FullTreeObservations) {
     assert_eq!(session.state, SessionTransactionState::Idle);
 }
 
-fn overlay<'a>(request: &'a DirectorySnapshotPublishRequest, path: &str) -> &'a [u8] {
+fn overlay<'a>(request: &'a DirectoryStageRequest, path: &str) -> &'a [u8] {
     request
         .overlays()
         .iter()

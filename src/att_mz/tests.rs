@@ -41,6 +41,7 @@ struct Calls {
 #[derive(Clone)]
 struct FakeInit {
     calls: Arc<Mutex<Calls>>,
+    failure: Option<&'static str>,
 }
 
 impl InitUseCase for FakeInit {
@@ -51,6 +52,7 @@ impl InitUseCase for FakeInit {
         input: InitInput,
     ) -> impl Future<Output = Result<InitOutput, Self::Error>> + Send {
         let calls = Arc::clone(&self.calls);
+        let failure = self.failure;
 
         async move {
             yield_once().await;
@@ -59,7 +61,11 @@ impl InitUseCase for FakeInit {
                 .expect("调用记录锁不应中毒")
                 .init
                 .push(input.clone());
-            Ok(InitOutput { name: input.name })
+            if let Some(message) = failure {
+                Err(FakeError(message))
+            } else {
+                Ok(InitOutput { name: input.name })
+            }
         }
     }
 }
@@ -250,6 +256,7 @@ fn cli(calls: Arc<Mutex<Calls>>) -> MzCli<FakeInit, FakeExtract, FakeTranslate, 
     MzCli::new(
         FakeInit {
             calls: Arc::clone(&calls),
+            failure: None,
         },
         FakeExtract {
             calls: Arc::clone(&calls),
@@ -919,11 +926,61 @@ async fn translate_and_write_back_reject_missing_or_blank_optional_paths() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn init_failure_never_prints_success_and_exits_with_one() {
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let cli = MzCli::new(
+        FakeInit {
+            calls: Arc::clone(&calls),
+            failure: Some("无法创建冻结项目工作区"),
+        },
+        FakeExtract {
+            calls: Arc::clone(&calls),
+            failure: None,
+        },
+        FakeTranslate {
+            calls: Arc::clone(&calls),
+        },
+        FakeWriteBack {
+            calls: Arc::clone(&calls),
+            failure: None,
+        },
+    );
+
+    let (exit_code, stdout, stderr) = run(
+        &cli,
+        &[
+            "init",
+            "--name",
+            "demo",
+            "--path",
+            ".\\Game",
+            "--source-language",
+            "ja",
+            "--target-language",
+            "zh-Hans",
+            "--dialogue-max-fullwidth-chars",
+            "24",
+            "--scrolling-text-max-fullwidth-chars",
+            "30",
+            "--help-description-max-fullwidth-chars",
+            "18",
+        ],
+    )
+    .await;
+
+    assert_eq!(exit_code, ExitCode::FAILURE);
+    assert!(stdout.is_empty());
+    assert_eq!(stderr, "错误：无法创建冻结项目工作区\n");
+    assert_eq!(calls.lock().expect("调用记录锁不应中毒").init.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn use_case_failure_is_written_to_stderr_with_exit_code_one() {
     let calls = Arc::new(Mutex::new(Calls::default()));
     let cli = MzCli::new(
         FakeInit {
             calls: Arc::clone(&calls),
+            failure: None,
         },
         FakeExtract {
             calls: Arc::clone(&calls),
@@ -959,6 +1016,7 @@ async fn write_back_failure_is_written_to_stderr_with_exit_code_one() {
     let cli = MzCli::new(
         FakeInit {
             calls: Arc::clone(&calls),
+            failure: None,
         },
         FakeExtract {
             calls: Arc::clone(&calls),

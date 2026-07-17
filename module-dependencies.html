@@ -1068,7 +1068,7 @@ h1 {
 
   <footer class="page-foot">
     <span>页面口径：源码中已经落地的职责与真实调用关系。</span>
-    <span>WriteBack 非根业务树已全部实现；真实 SQLite、文件、日志和 Lua 运行时仍停在根适配器边界。</span>
+    <span>Init 与 WriteBack 的非根业务树已全部实现；真实 SQLite、文件、日志和 Lua 运行时仍停在根适配器边界。</span>
   </footer>
 </main>
 
@@ -1123,7 +1123,7 @@ h1 {
       example: "用户导入 C:\\Games\\Demo。Init 把 ja → zh-Hans 与三个显示宽度交给工作区创建器；成功必须同时得到 project.db、source/data、source/js 和 write_back。",
       input: "项目名、原游戏目录、源/目标语言、三个受信布局宽度",
       output: "命名冻结项目已经整体建立",
-      boundary: "真实递归复制和原子目录发布仍只有直接依赖契约；Init 不伪造已经复制成功。"
+      boundary: "工作区创建的非根编排已实现；目录解析、SQLite 建库和原子目录发布只有根接口。"
     },
     "project-name": {
       title: "项目名规则",
@@ -1145,23 +1145,35 @@ h1 {
       status: "业务逻辑已实现",
       role: "按已确认的项目事实建立数据库，并保证唯一 metadata 与文件创建保持一致。",
       plain: "它像档案管理员：只接受已经整理好的 NewProject 和调用方指定的暂存路径，把项目身份、语言和三个布局宽度完整落到新档案里。",
-      example: "工作区创建器以后可以要求它在暂存目录建立 project.db；目标已存在时不会悄悄覆盖，而是明确失败。",
+      example: "工作区创建器要求它在候选工作区的 project.db 写入唯一 metadata；目标已存在时不会悄悄覆盖。",
       input: "明确目标数据库路径与 NewProject metadata",
       output: "CreatedProject 或清楚的建库错误",
-      boundary: "该服务已经实现，但本批没有越过 ProjectWorkspaceCreator 把它直接接回 Init；真实 SQLite 驱动也尚未生产接线。"
+      boundary: "该服务已由 ProjectWorkspaceCreationService 消费；真实 SQLite 建库驱动尚未实现。"
     },
     "project-workspace-creator": {
       title: "创建冻结项目工作区",
-      symbol: "ProjectWorkspaceCreator",
-      shortSymbol: "Project Workspace Creator",
+      symbol: "ProjectWorkspaceCreationService",
+      shortSymbol: "Project Workspace Creation",
       path: "src/att_mz/init.rs",
-      status: "直接依赖契约",
+      status: "非根业务实现完成",
       role: "完整复制原游戏的 data 与 js，建立 metadata 数据库和固定写回目录，再把整个命名工作区一次发布。",
       plain: "它是一张不可拆开的交付单：不能只把数据库建好就说 Init 成功，也不能把复制到一半的 source 暴露给后续命令。",
-      example: "创建 demo 时，成功代表 <projects_root>/demo/project.db、source/data、source/js 与 write_back 同时可用；任何一步失败都不能留下一个看似可打开的半项目。",
+      example: "它先准备 source/data、source/js 和两个空写回目录，再在候选根建立 project.db，最后以 CreateNew 整体发布。",
       input: "NewProjectWorkspace：导入来源与受信 metadata",
       output: "完整工作区发布成功，或明确失败",
-      boundary: "本批只定义并由 Init 消费该契约；递归复制、暂存、清理和原子发布实现属于后续任务。"
+      boundary: "候选准备、建库、失败清理和 CreateNew 发布的阶段语义已实现；真实文件系统和 SQLite 副作用留在根边界。"
+    },
+    "project-workspace-layout": {
+      title: "唯一工作区布局",
+      symbol: "ProjectWorkspaceLayout",
+      shortSymbol: "Project Workspace Layout",
+      path: "src/project_database.rs",
+      status: "共享受信值已实现",
+      role: "从 projects.root 和项目名或已选工作区根，唯一派生数据库、冻结源和写回路径。",
+      plain: "创建器、档案读取器和项目开启服务共用同一份目录知识，不再各自 join 字符串。",
+      example: "对 demo 只建立一次布局，即可取得 demo/project.db、source/data、source/js 和 write_back/data/js。",
+      input: "projects.root + ProjectName，或已选工作区根",
+      output: "全部标准工作区路径"
     },
     "extract-service": {
       title: "Extract 总控",
@@ -1312,6 +1324,19 @@ h1 {
       output: "Vec<SqliteRow> 或查询终态",
       boundary: "生产 SQLite 驱动、连接池、并发预算与取消处理尚未实现。"
     },
+    "sqlite-database-creator-root": {
+      title: "SQLite 建库根",
+      symbol: "SqliteDatabaseCreator",
+      shortSymbol: "SQLite Database Creator Root",
+      path: "src/storage/sqlite.rs",
+      status: "根接口已定义",
+      role: "在精确目标路径新建一个 SQLite 数据库，并在单一初始化事务中执行全部建表和 metadata 命令。",
+      plain: "项目建库服务决定写什么；这个根只负责真正创建文件、执行事务并报告可信终态。",
+      example: "候选工作区已准备好后，它在 staging/project.db 创建唯一 metadata，不推导或改写路径。",
+      input: "精确数据库路径与 SqliteCommand 列表",
+      output: "新数据库已创建，或 AlreadyExists/NotCreated/ResidualArtifact/OutcomeUnknown",
+      boundary: "生产 SQLite 驱动、事务、刷盘、取消和残留清理适配器尚未实现。"
+    },
     "cpu-root": {
       title: "CPU 任务根",
       symbol: "CpuTaskExecutor",
@@ -1365,17 +1390,17 @@ h1 {
       boundary: "生产文件系统适配器尚未实现。"
     },
     "atomic-directory-root": {
-      title: "原子目录快照发布根",
-      symbol: "AtomicDirectorySnapshotPublisher",
-      shortSymbol: "Atomic Snapshot Root",
+      title: "原子目录发布根",
+      symbol: "AtomicDirectoryPublisher",
+      shortSymbol: "Atomic Directory Root",
       path: "src/storage/file_system.rs",
       status: "根接口已定义",
-      role: "把多个来源子树与文件覆盖作为一份完整目录快照一次发布。",
-      plain: "它是真正多文件副作用的最底层：要么新版完整可见，要么明确没发布，交换二次失败则报 OutcomeUnknown。",
-      example: "复制 source/data 和 source/js，覆盖改写的 Items.json/plugins.js，然后共同替换 write_back。",
-      input: "DirectorySnapshotPublishRequest",
-      output: "发布成功、NotPublished 或 OutcomeUnknown",
-      boundary: "同级暂存、递归复制、目录交换、恢复与清理的生产适配器尚未实现。"
+      role: "准备包含多目录来源、文件覆盖和空目录的完整候选，再以 CreateNew 或 Replace 原子发布。",
+      plain: "prepare 只改变私有暂存根；不可复制的 staged token 最终只能被 publish 或 discard 消费一次。",
+      example: "Init 在 staged 根建完 project.db 后以 CreateNew 发布；WriteBack 则把冻结 data/js 和改写覆盖以 Replace 替换固定输出。",
+      input: "DirectoryStageRequest，以及之后按值消费的 StagedDirectory",
+      output: "候选、发布或清理的明确终态",
+      boundary: "同级暂存、有界递归复制、符号链接/reparse point 拒绝、目录交换、恢复与清理的生产适配器尚未实现。"
     },
     "lua-runtime-root": {
       title: "可信 Lua Runtime 根",
@@ -1708,11 +1733,11 @@ h1 {
       path: "src/att_mz/write_back/publisher.rs",
       status: "非根业务实现完成",
       role: "把候选文档与完整冻结 data/js 组成固定最新输出，成功后才确认 PublishedWriteBack。",
-      plain: "它校验候选确实属于当前项目，固定建立 source/data 和 source/js 两个快照映射，再把改写文件作为覆盖交给原子发布根。",
-      example: "即使没有任何译文，Publisher 仍构造包含完整 data/js 来源的发布请求；候选来自另一工作区时在根调用前拒绝。",
+      plain: "它校验候选确实属于当前项目，建立 source/data 和 source/js 两个来源映射，再把改写文件作为覆盖交给原子根 prepare 并以 Replace 发布。",
+      example: "即使没有任何译文，Publisher 仍准备包含完整 data/js 来源的候选；固定输出缺失或不是目录时 Replace 明确失败。",
       input: "OpenedProject 与 RewrittenDocuments",
       output: "固定输出发布成功或明确失败",
-      boundary: "发布业务适配已实现；真实递归复制、目录交换、恢复和清理属于尚未实现的 AtomicDirectorySnapshotPublisher 根适配器。"
+      boundary: "候选准备与 Replace 发布编排已实现；真实递归复制、目录交换、恢复和清理属于尚未实现的 AtomicDirectoryPublisher 根适配器。"
     },
     "writeback-event-log": {
       title: "持久记录发布结果",
@@ -1758,12 +1783,20 @@ h1 {
 
   ROOTS.init.tree = n("init-service", "init-service", [
     n("init-project-name", "project-name", [], { order: "①" }),
-    n("init-workspace-create", "project-workspace-creator", [], { order: "②" })
+    n("init-existing-directory", "existing-directory-root", [], { order: "②" }),
+    n("init-workspace-create", "project-workspace-creator", [
+      n("init-workspace-layout", "project-workspace-layout"),
+      n("init-project-db-create", "project-db-create", [
+        n("init-project-db-sqlite", "sqlite-database-creator-root")
+      ]),
+      n("init-atomic-publish", "atomic-directory-root")
+    ], { order: "③" })
   ]);
 
   ROOTS.extract.tree = n("extract-service", "extract-service", [
     n("extract-project-open", "project-opener", [
       n("extract-project-record", "project-record-reader", [
+        n("extract-project-layout", "project-workspace-layout", [], { reused: true }),
         n("extract-project-record-sql", "sqlite-query-root", [], { reused: true })
       ]),
       n("extract-existing-directory", "existing-directory-root", [], { reused: true })
@@ -1806,6 +1839,7 @@ h1 {
   ROOTS.translate.tree = n("translate-service", "translate-service", [
     n("translate-profile", "profile-resolver", [], { order: "①" }),
     n("translate-project-record", "project-record-reader", [
+      n("translate-project-layout", "project-workspace-layout", [], { reused: true }),
       n("translate-project-record-sql", "sqlite-query-root", [], { reused: true })
     ], { order: "②", reused: true }),
     n("translate-standard", "standard-translation", [
@@ -1853,6 +1887,7 @@ h1 {
   ROOTS.writeback.tree = n("writeback-service", "writeback-service", [
     n("writeback-project-open", "project-opener", [
       n("writeback-project-record", "project-record-reader", [
+        n("writeback-project-layout", "project-workspace-layout", [], { reused: true }),
         n("writeback-project-record-sql", "sqlite-query-root", [], { reused: true })
       ], { reused: true }),
       n("writeback-existing-directory", "existing-directory-root", [], { reused: true })
@@ -1877,7 +1912,7 @@ h1 {
         n("writeback-rewriter-cpu", "cpu-root", [], { reused: true })
       ], { order: "③" }),
       n("writeback-publish", "writeback-publisher", [
-        n("writeback-atomic-publish", "atomic-directory-root")
+        n("writeback-atomic-publish", "atomic-directory-root", [], { reused: true })
       ], { order: "④" }),
       n("writeback-log", "writeback-event-log", [], { order: "⑤" })
     ], { order: "②" }),
@@ -2086,7 +2121,9 @@ h1 {
     sequenceText.textContent = root.sequence;
     treeFoot.textContent = rootId === "writeback"
       ? "WriteBack 已展开到全部非根业务实现和最终根接口；标“根”的节点均未实现生产适配器，因此尚不能声明真实磁盘写回成立。"
-      : "点击模块逐层展开。重复出现的“复用”节点仍是同一个实现，不会被另分成第五类。";
+      : rootId === "init"
+        ? "Init 已展开到全部非根业务实现和三个最终根接口；真实目录解析、SQLite 建库与原子发布仍需要生产适配器。"
+        : "点击模块逐层展开。重复出现的“复用”节点仍是同一个实现，不会被另分成第五类。";
 
     branchShell.classList.add("is-open");
     branchShell.setAttribute("aria-hidden", "false");
