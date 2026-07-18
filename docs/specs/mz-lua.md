@@ -207,7 +207,7 @@ NotApplicable 或 Pending。脚本只为 Pending 组织自己的批次和 messag
 源语残留、可选修复、控制符恢复及最终 state 计算，不能绕过验收伪造 Current。
 
 `ctx.llm(messages)` 只接受无洞 `{ role, content }` 数组。它与 Standard 使用同一个
-公共 Client 和 Executor；Lua 不能覆盖 model、认证、stream 或额外 JSON 参数。
+公共 Client 和 Executor；Lua 不能覆盖 URL、API key、model、stream 或 parameters。
 成功返回 content、finish_reason、HTTP request ID、正文 response ID 和可选 usage。
 Lua 决定分组、调用次数、Retryable 重试和事务提交。
 

@@ -41,8 +41,8 @@ const TERMS_JSON: &str = "terms.json";
 const API_KEY: &str = "e2e-secret";
 const E2E_EXTRA_SECRET: &str = "e2e-extra-secret";
 const LEAK_SENTINEL: &str = "e2e-secret-must-not-leak";
-const EMPTY_REQUEST_BODY_EXTRA: &str = "{}";
-const E2E_REQUEST_BODY_EXTRA: &str = r#"{"temperature":0.0,"provider_extension":{"mode":"e2e","private_marker":"e2e-extra-secret"}}"#;
+const EMPTY_PARAMETERS: &str = "{}";
+const E2E_PARAMETERS: &str = r#"{"temperature":0.0,"provider_extension":{"mode":"e2e","private_marker":"e2e-extra-secret"}}"#;
 
 #[test]
 fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
@@ -59,11 +59,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     write_lua_scripts(root);
 
     let cancellation_server = BoundCancellationChatServer::bind();
-    write_configuration(
-        root,
-        cancellation_server.endpoint(),
-        EMPTY_REQUEST_BODY_EXTRA,
-    );
+    write_configuration(root, cancellation_server.endpoint(), EMPTY_PARAMETERS);
 
     let init_arguments = mz_init_arguments(&game_root);
     let init = run_att(root, init_arguments.clone());
@@ -115,7 +111,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_translation_absent(&database);
 
     let server = BoundChatServer::bind();
-    write_configuration(root, server.endpoint(), E2E_REQUEST_BODY_EXTRA);
+    write_configuration(root, server.endpoint(), E2E_PARAMETERS);
     let running_server = server.start();
     let translate = run_att(
         root,
@@ -235,7 +231,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_builtin_owner_is_stale(&database);
 
     let stale_server = BoundChatServer::bind();
-    write_configuration(root, stale_server.endpoint(), E2E_REQUEST_BODY_EXTRA);
+    write_configuration(root, stale_server.endpoint(), E2E_PARAMETERS);
     let stale_requests = stale_server.start_for_requests(0);
     let stale_translate = run_att(
         root,
@@ -259,7 +255,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_translation_for_original(&database, UPDATED_SOURCE_TEXT, None);
 
     let updated_server = BoundChatServer::bind();
-    write_configuration(root, updated_server.endpoint(), E2E_REQUEST_BODY_EXTRA);
+    write_configuration(root, updated_server.endpoint(), E2E_PARAMETERS);
     let convergence_server = updated_server.start_for_requests(3);
     let updated_translate = run_att(
         root,
@@ -441,16 +437,15 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
 }
 
 #[test]
-fn malformed_configuration_does_not_echo_bearer_secret() {
+fn malformed_configuration_does_not_echo_api_key() {
     let temporary = tempfile::tempdir().expect("应可建立密钥泄漏测试目录");
     let root = temporary.path();
     fs::write(
         root.join("config.toml"),
         format!(
-            r#"[[llm.clients]]
-id = "leak-probe"
-endpoint = "https://example.invalid/v1/chat/completions"
-auth = {{ bearer = "{LEAK_SENTINEL}" "invalid" }}
+            r#"[llm.clients.leak-probe]
+url = "https://example.invalid/v1/chat/completions"
+api_key = "{LEAK_SENTINEL}" "invalid"
 "#
         ),
     )
@@ -466,7 +461,7 @@ auth = {{ bearer = "{LEAK_SENTINEL}" "invalid" }}
     assert!(!stderr.is_empty(), "配置失败必须呈现诊断");
     assert!(
         !stderr.contains(LEAK_SENTINEL),
-        "配置语法错误不得回显 Bearer 密钥：{stderr}"
+        "配置语法错误不得回显 API key：{stderr}"
     );
 }
 
@@ -512,11 +507,11 @@ fn assert_process_output_does_not_contain_client_secrets(phase: &str, output: &O
         let text = String::from_utf8_lossy(bytes);
         assert!(
             !text.contains(API_KEY),
-            "{phase} 的 {stream} 不得包含配置内 Bearer 密钥：{text}"
+            "{phase} 的 {stream} 不得包含配置内 API key：{text}"
         );
         assert!(
             !text.contains(E2E_EXTRA_SECRET),
-            "{phase} 的 {stream} 不得包含扩展正文敏感值：{text}"
+            "{phase} 的 {stream} 不得包含 parameters 敏感值：{text}"
         );
     }
 }
@@ -784,7 +779,7 @@ fn write_terminology(root: &Path) {
     .expect("术语夹具应可写入");
 }
 
-fn write_configuration(root: &Path, endpoint: &str, request_body_extra: &str) {
+fn write_configuration(root: &Path, url: &str, parameters: &str) {
     let configuration = format!(
         r#"[projects]
 root = "projects"
@@ -847,19 +842,14 @@ proxy = false
 [runtime.llm.tls]
 additional_pem_files = []
 
-[[llm.clients]]
-id = "primary"
-endpoint = "{endpoint}"
-auth = {{ bearer = "{API_KEY}" }}
+[llm.clients.primary]
+url = "{url}"
+api_key = "{API_KEY}"
 model = "e2e-model"
-allow_plain_http_loopback = true
-request_timeout_ms = 10000
-max_request_bytes = 1048576
-max_response_bytes = 1048576
-max_error_response_bytes = 65536
-requests_per_minute = 60
-burst_requests = 4
-request_body_extra = '''{request_body_extra}'''
+timeout_ms = 10000
+rpm = 60
+burst = 4
+parameters = '''{parameters}'''
 
 [runtime.lua]
 worker_threads = 1
@@ -1906,7 +1896,7 @@ fn assert_exact_minimal_chat_request(request: &CapturedRequest) {
     });
     assert_eq!(
         actual, expected,
-        "空扩展正文时只能发送 model、messages 与 stream"
+        "空 parameters 时只能发送 model、messages 与 stream"
     );
 }
 

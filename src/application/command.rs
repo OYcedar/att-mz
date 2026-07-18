@@ -13,7 +13,7 @@ use crate::application::arguments::{
     ExtractArguments, InitArguments, MzCommand, TranslateArguments, WriteBackArguments,
 };
 use crate::application::config::{
-    ApplicationConfiguration, EventLogConfiguration, LlmAuthConfiguration, LlmClientConfiguration,
+    ApplicationConfiguration, EventLogConfiguration, LlmClientConfiguration,
     LlmRuntimeConfiguration, ProxyConfiguration, SqliteJournalMode as ConfigSqliteJournalMode,
     SqliteSynchronous as ConfigSqliteSynchronous, TranslationProfileConfiguration,
 };
@@ -85,7 +85,7 @@ use crate::runtime::json_lines::{
     TranslationRunLogContext, WriteBackJsonLinesEventLog, WriteBackRunLogContext,
 };
 use crate::runtime::llm::{
-    LlmProxyConfiguration, LlmTlsConfiguration as RuntimeLlmTlsConfiguration, OpenAiAuthentication,
+    LlmProxyConfiguration, LlmTlsConfiguration as RuntimeLlmTlsConfiguration,
     OpenAiChatCompletionClient, OpenAiChatCompletionError, OpenAiChatCompletionExecutor,
     OpenAiExecutorConfiguration,
 };
@@ -989,21 +989,14 @@ async fn load_translation_materials(
 }
 
 fn build_llm_client(configuration: &LlmClientConfiguration) -> OpenAiChatCompletionClient {
-    let authentication = match configuration.auth() {
-        LlmAuthConfiguration::None => OpenAiAuthentication::None,
-        LlmAuthConfiguration::Bearer(secret) => OpenAiAuthentication::bearer(secret.clone()),
-    };
     OpenAiChatCompletionClient::new(
-        configuration.endpoint().clone(),
-        authentication,
+        configuration.url().clone(),
+        configuration.api_key().clone(),
         configuration.model(),
-        configuration.request_timeout(),
-        configuration.max_request_bytes(),
-        configuration.max_response_bytes(),
-        configuration.max_error_response_bytes(),
-        configuration.requests_per_minute(),
-        configuration.burst_requests(),
-        configuration.request_body_extra().clone(),
+        configuration.timeout(),
+        configuration.rpm(),
+        configuration.burst(),
+        configuration.parameters().clone(),
     )
 }
 

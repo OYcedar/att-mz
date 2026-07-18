@@ -18,7 +18,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
-use url::{Host, Url};
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::language::{
@@ -1208,33 +1208,14 @@ impl TranslationExecutionConfiguration {
     }
 }
 
-#[derive(Clone)]
-pub(crate) enum LlmAuthConfiguration {
-    None,
-    Bearer(SecretString),
-}
-
-impl fmt::Debug for LlmAuthConfiguration {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::None => formatter.write_str("None"),
-            Self::Bearer(_) => formatter.write_str("Bearer([REDACTED])"),
-        }
-    }
-}
-
 pub(crate) struct LlmClientConfiguration {
-    id: LlmClientId,
-    endpoint: Url,
-    auth: LlmAuthConfiguration,
+    url: Url,
+    api_key: SecretString,
     model: String,
-    request_timeout: Duration,
-    max_request_bytes: NonZeroUsize,
-    max_response_bytes: NonZeroUsize,
-    max_error_response_bytes: NonZeroUsize,
-    requests_per_minute: NonZeroU32,
-    burst_requests: NonZeroU32,
-    request_body_extra: JsonMap<String, JsonValue>,
+    timeout: Duration,
+    rpm: NonZeroU32,
+    burst: NonZeroU32,
+    parameters: JsonMap<String, JsonValue>,
 }
 
 /// 配置边界已经校验并确认存在的公共 LLM Client 身份。
@@ -1253,44 +1234,32 @@ impl LlmClientId {
 }
 
 impl LlmClientConfiguration {
-    pub(crate) const fn endpoint(&self) -> &Url {
-        &self.endpoint
+    pub(crate) const fn url(&self) -> &Url {
+        &self.url
     }
 
-    pub(crate) const fn auth(&self) -> &LlmAuthConfiguration {
-        &self.auth
+    pub(crate) const fn api_key(&self) -> &SecretString {
+        &self.api_key
     }
 
     pub(crate) fn model(&self) -> &str {
         &self.model
     }
 
-    pub(crate) const fn request_timeout(&self) -> Duration {
-        self.request_timeout
+    pub(crate) const fn timeout(&self) -> Duration {
+        self.timeout
     }
 
-    pub(crate) const fn max_request_bytes(&self) -> NonZeroUsize {
-        self.max_request_bytes
+    pub(crate) const fn rpm(&self) -> NonZeroU32 {
+        self.rpm
     }
 
-    pub(crate) const fn max_response_bytes(&self) -> NonZeroUsize {
-        self.max_response_bytes
+    pub(crate) const fn burst(&self) -> NonZeroU32 {
+        self.burst
     }
 
-    pub(crate) const fn max_error_response_bytes(&self) -> NonZeroUsize {
-        self.max_error_response_bytes
-    }
-
-    pub(crate) const fn requests_per_minute(&self) -> NonZeroU32 {
-        self.requests_per_minute
-    }
-
-    pub(crate) const fn burst_requests(&self) -> NonZeroU32 {
-        self.burst_requests
-    }
-
-    pub(crate) fn request_body_extra(&self) -> &JsonMap<String, JsonValue> {
-        &self.request_body_extra
+    pub(crate) fn parameters(&self) -> &JsonMap<String, JsonValue> {
+        &self.parameters
     }
 }
 
@@ -1298,18 +1267,16 @@ impl fmt::Debug for LlmClientConfiguration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LlmClientConfiguration")
-            .field("id", &self.id)
-            .field("auth", &self.auth)
+            .field("url_scheme", &self.url.scheme())
+            .field("url_host", &self.url.host_str())
+            .field("api_key", &"[REDACTED]")
             .field("model", &self.model)
-            .field("request_timeout", &self.request_timeout)
-            .field("max_request_bytes", &self.max_request_bytes)
-            .field("max_response_bytes", &self.max_response_bytes)
-            .field("max_error_response_bytes", &self.max_error_response_bytes)
-            .field("requests_per_minute", &self.requests_per_minute)
-            .field("burst_requests", &self.burst_requests)
+            .field("timeout", &self.timeout)
+            .field("rpm", &self.rpm)
+            .field("burst", &self.burst)
             .field(
-                "request_body_extra_keys",
-                &self.request_body_extra.keys().collect::<Vec<_>>(),
+                "parameter_keys",
+                &self.parameters.keys().collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -1321,23 +1288,22 @@ pub(crate) struct LlmClientCatalogConfiguration {
 }
 
 impl LlmClientCatalogConfiguration {
-    fn build(raw_clients: Vec<RawLlmClientConfiguration>) -> Result<Self, ConfigurationValueError> {
+    fn build(
+        raw_clients: BTreeMap<String, RawLlmClientConfiguration>,
+    ) -> Result<Self, ConfigurationValueError> {
         if raw_clients.is_empty() {
             return Err(invalid("llm.clients", "至少需要一个 LLM 客户端"));
         }
 
         let mut clients = BTreeMap::new();
         let mut client_ids = BTreeSet::new();
-        for (index, raw) in raw_clients.into_iter().enumerate() {
-            let field = format!("llm.clients[{index}]");
-            validate_exact_identifier(format!("{field}.id").as_str(), &raw.id)?;
-            let id = LlmClientId::from_validated(raw.id.clone());
-            if !client_ids.insert(id.clone()) {
-                return Err(invalid(
-                    format!("{field}.id").as_str(),
-                    "LLM 客户端 ID 重复",
-                ));
-            }
+        for (raw_id, raw) in raw_clients {
+            let id_field = format!("llm.clients.{raw_id}");
+            validate_exact_identifier(id_field.as_str(), &raw_id)?;
+            let id = LlmClientId::from_validated(raw_id);
+            let inserted = client_ids.insert(id.clone());
+            debug_assert!(inserted, "TOML 表键和 BTreeMap 已保证客户端 ID 唯一");
+            let field = format!("llm.clients.{}", id.0);
             let client = build_llm_client(field.as_str(), raw)?;
             clients.insert(id, client);
         }
@@ -1603,53 +1569,37 @@ fn build_llm_client(
     field: &str,
     raw: RawLlmClientConfiguration,
 ) -> Result<LlmClientConfiguration, ConfigurationValueError> {
-    let endpoint = Url::parse(&raw.endpoint)
-        .map_err(|_| invalid(format!("{field}.endpoint").as_str(), "endpoint URL 无效"))?;
-    validate_endpoint(
-        format!("{field}.endpoint").as_str(),
-        &endpoint,
-        raw.allow_plain_http_loopback,
-    )?;
+    let url =
+        Url::parse(&raw.url).map_err(|_| invalid(format!("{field}.url").as_str(), "URL 无效"))?;
+    validate_llm_url(format!("{field}.url").as_str(), &url)?;
     validate_exact_identifier(format!("{field}.model").as_str(), &raw.model)?;
 
-    let auth = match raw.auth {
-        RawLlmAuthConfiguration::Name(value) if value == "none" => LlmAuthConfiguration::None,
-        RawLlmAuthConfiguration::Name(_) => {
-            return Err(invalid(
-                format!("{field}.auth").as_str(),
-                "字符串形式只接受 none",
-            ));
-        }
-        RawLlmAuthConfiguration::Bearer(RawBearerConfiguration { bearer }) => {
-            let exposed = bearer.expose_secret();
-            if exposed.trim().is_empty() {
-                return Err(invalid(
-                    format!("{field}.auth.bearer").as_str(),
-                    "Bearer 密钥不能为空白",
-                ));
-            }
-            if exposed.trim() != exposed {
-                return Err(invalid(
-                    format!("{field}.auth.bearer").as_str(),
-                    "Bearer 密钥不能包含首尾空白",
-                ));
-            }
-            if reqwest::header::HeaderValue::from_bytes(exposed.as_bytes()).is_err() {
-                return Err(invalid(
-                    format!("{field}.auth.bearer").as_str(),
-                    "Bearer 密钥不能安全写入 HTTP Header",
-                ));
-            }
-            LlmAuthConfiguration::Bearer(bearer)
-        }
-    };
+    let exposed_api_key = raw.api_key.expose_secret();
+    if exposed_api_key.trim().is_empty() {
+        return Err(invalid(
+            format!("{field}.api_key").as_str(),
+            "API key 不能为空白",
+        ));
+    }
+    if exposed_api_key.trim() != exposed_api_key {
+        return Err(invalid(
+            format!("{field}.api_key").as_str(),
+            "API key 不能包含首尾空白",
+        ));
+    }
+    if reqwest::header::HeaderValue::from_bytes(exposed_api_key.as_bytes()).is_err() {
+        return Err(invalid(
+            format!("{field}.api_key").as_str(),
+            "API key 不能安全写入 HTTP Header",
+        ));
+    }
 
     // 任意精度数字会在 Serde 访问器内使用一个私有 map 信封传递原始十进制
     // 文本。第一遍自定义访问器只负责递归拒绝重复键；第二遍由
     // `serde_json::Value` 自身还原真正的 Number，避免把内部信封泄漏到请求正文。
-    serde_json::from_str::<StrictJsonValue>(&raw.request_body_extra).map_err(|error| {
+    serde_json::from_str::<StrictJsonValue>(&raw.parameters).map_err(|error| {
         invalid(
-            format!("{field}.request_body_extra").as_str(),
+            format!("{field}.parameters").as_str(),
             format!(
                 "不是有效的严格 JSON（第 {} 行，第 {} 列）",
                 error.line(),
@@ -1657,84 +1607,44 @@ fn build_llm_client(
             ),
         )
     })?;
-    let request_body_value = serde_json::from_str::<JsonValue>(&raw.request_body_extra)
+    let parameter_value = serde_json::from_str::<JsonValue>(&raw.parameters)
         .expect("已通过同一 serde_json 语法边界的源文必须可重建为 Value");
-    let JsonValue::Object(request_body_extra) = request_body_value else {
+    let JsonValue::Object(parameters) = parameter_value else {
         return Err(invalid(
-            format!("{field}.request_body_extra").as_str(),
+            format!("{field}.parameters").as_str(),
             "必须是 JSON 对象",
         ));
     };
     for reserved in RESERVED_REQUEST_BODY_FIELDS {
-        if request_body_extra.contains_key(reserved) {
+        if parameters.contains_key(reserved) {
             return Err(invalid(
-                format!("{field}.request_body_extra.{reserved}").as_str(),
-                "该顶层字段由请求协议固定拥有，不能通过 request_body_extra 覆盖",
+                format!("{field}.parameters.{reserved}").as_str(),
+                "该顶层字段由请求协议固定拥有，不能通过 parameters 覆盖",
             ));
         }
     }
 
     Ok(LlmClientConfiguration {
-        id: LlmClientId::from_validated(raw.id),
-        endpoint,
-        auth,
+        url,
+        api_key: raw.api_key,
         model: raw.model,
-        request_timeout: positive_duration(
-            format!("{field}.request_timeout_ms").as_str(),
-            raw.request_timeout_ms,
-        )?,
-        max_request_bytes: non_zero_usize(
-            format!("{field}.max_request_bytes").as_str(),
-            raw.max_request_bytes,
-        )?,
-        max_response_bytes: non_zero_usize(
-            format!("{field}.max_response_bytes").as_str(),
-            raw.max_response_bytes,
-        )?,
-        max_error_response_bytes: non_zero_usize(
-            format!("{field}.max_error_response_bytes").as_str(),
-            raw.max_error_response_bytes,
-        )?,
-        requests_per_minute: non_zero_u32(
-            format!("{field}.requests_per_minute").as_str(),
-            raw.requests_per_minute,
-        )?,
-        burst_requests: non_zero_u32(
-            format!("{field}.burst_requests").as_str(),
-            raw.burst_requests,
-        )?,
-        request_body_extra,
+        timeout: positive_duration(format!("{field}.timeout_ms").as_str(), raw.timeout_ms)?,
+        rpm: non_zero_u32(format!("{field}.rpm").as_str(), raw.rpm)?,
+        burst: non_zero_u32(format!("{field}.burst").as_str(), raw.burst)?,
+        parameters,
     })
 }
 
-fn validate_endpoint(
-    field: &str,
-    endpoint: &Url,
-    allow_plain_http_loopback: bool,
-) -> Result<(), ConfigurationValueError> {
-    if endpoint.username() != "" || endpoint.password().is_some() {
-        return Err(invalid(field, "endpoint 不得内嵌凭据"));
+fn validate_llm_url(field: &str, url: &Url) -> Result<(), ConfigurationValueError> {
+    if url.username() != "" || url.password().is_some() {
+        return Err(invalid(field, "URL 不得内嵌凭据"));
     }
-    if endpoint.fragment().is_some() {
-        return Err(invalid(field, "endpoint 不得包含 URL fragment"));
+    if url.fragment().is_some() {
+        return Err(invalid(field, "URL 不得包含 fragment"));
     }
-    match endpoint.scheme() {
-        "https" => Ok(()),
-        "http" if allow_plain_http_loopback && is_loopback(endpoint.host()) => Ok(()),
-        "http" => Err(invalid(
-            field,
-            "HTTP endpoint 只允许在显式开启后指向 loopback",
-        )),
-        _ => Err(invalid(field, "endpoint 只接受 https 或 loopback http")),
-    }
-}
-
-fn is_loopback(host: Option<Host<&str>>) -> bool {
-    match host {
-        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        None => false,
+    match url.scheme() {
+        "http" | "https" => Ok(()),
+        _ => Err(invalid(field, "URL 只接受 http 或 https")),
     }
 }
 
@@ -2091,7 +2001,7 @@ struct RawConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLlmConfiguration {
-    clients: Vec<RawLlmClientConfiguration>,
+    clients: BTreeMap<String, RawLlmClientConfiguration>,
 }
 
 #[derive(Deserialize)]
@@ -2361,33 +2271,15 @@ struct RawTranslationExecutionConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLlmClientConfiguration {
-    id: String,
-    endpoint: String,
-    auth: RawLlmAuthConfiguration,
-    model: String,
-    allow_plain_http_loopback: bool,
-    request_timeout_ms: u64,
-    max_request_bytes: u64,
-    max_response_bytes: u64,
-    max_error_response_bytes: u64,
-    requests_per_minute: u64,
-    burst_requests: u64,
-    #[serde(deserialize_with = "deserialize_zeroizing_string")]
-    request_body_extra: Zeroizing<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawLlmAuthConfiguration {
-    Name(String),
-    Bearer(RawBearerConfiguration),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawBearerConfiguration {
+    url: String,
     #[serde(deserialize_with = "deserialize_secret_string")]
-    bearer: SecretString,
+    api_key: SecretString,
+    model: String,
+    timeout_ms: u64,
+    rpm: u64,
+    burst: u64,
+    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    parameters: Zeroizing<String>,
 }
 
 #[cfg(test)]
@@ -2462,10 +2354,18 @@ mod tests {
             .get(profile.llm_client_id())
             .expect("Profile 引用的公共客户端应存在");
         assert_eq!(
-            client.request_body_extra().get("temperature"),
+            client.parameters().get("temperature"),
             Some(&JsonValue::from(0.2))
         );
-        assert!(matches!(client.auth(), LlmAuthConfiguration::None));
+        assert_eq!(
+            client.url().as_str(),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
+        assert_eq!(client.api_key().expose_secret(), "test-api-key");
+        assert_eq!(client.model(), "test-model");
+        assert_eq!(client.timeout(), Duration::from_secs(60));
+        assert_eq!(client.rpm().get(), 60);
+        assert_eq!(client.burst().get(), 4);
         assert_eq!(
             configuration
                 .mz()
@@ -2553,11 +2453,55 @@ mod tests {
         else {
             panic!("应返回配置值错误");
         };
-        assert!(error.field().ends_with("request_body_extra.model"));
+        assert!(error.field().ends_with("parameters.model"));
     }
 
     #[test]
-    fn remote_plain_http_and_duplicate_profile_ids_are_rejected() {
+    fn every_client_field_is_required_and_numeric_client_fields_are_nonzero() {
+        let directory = TestDirectory::new();
+        for (name, field) in [
+            (
+                "missing-url.toml",
+                "url = \"http://127.0.0.1:8080/v1/chat/completions\"\n",
+            ),
+            ("missing-api-key.toml", "api_key = \"test-api-key\"\n"),
+            ("missing-model.toml", "model = \"test-model\"\n"),
+            ("missing-timeout.toml", "timeout_ms = 60000\n"),
+            ("missing-rpm.toml", "rpm = 60\n"),
+            ("missing-burst.toml", "burst = 4\n"),
+            ("missing-parameters.toml", PARAMETERS_FIXTURE),
+        ] {
+            let source = valid_configuration().replace(field, "");
+            assert!(matches!(
+                load_configuration(&directory.write(name, &source)),
+                Err(ConfigurationLoadError::InvalidToml { .. })
+            ));
+        }
+
+        for (name, original, replacement, expected_field) in [
+            (
+                "zero-timeout.toml",
+                "model = \"test-model\"\ntimeout_ms = 60000",
+                "model = \"test-model\"\ntimeout_ms = 0",
+                ".timeout_ms",
+            ),
+            ("zero-rpm.toml", "rpm = 60", "rpm = 0", ".rpm"),
+            ("zero-burst.toml", "burst = 4", "burst = 0", ".burst"),
+        ] {
+            let source = valid_configuration().replace(original, replacement);
+            let ConfigurationLoadError::InvalidValue(error) =
+                load_configuration(&directory.write(name, &source))
+                    .err()
+                    .expect("零值必须拒绝")
+            else {
+                panic!("应返回配置值错误");
+            };
+            assert!(error.field().ends_with(expected_field));
+        }
+    }
+
+    #[test]
+    fn remote_plain_http_is_accepted_and_duplicate_profile_ids_are_rejected() {
         let directory = TestDirectory::new();
         let remote_http = directory.write(
             "http.toml",
@@ -2566,13 +2510,15 @@ mod tests {
                 "http://example.com/v1/chat/completions",
             ),
         );
-        let ConfigurationLoadError::InvalidValue(error) = load_configuration(&remote_http)
-            .err()
-            .expect("远程 HTTP 必须拒绝")
-        else {
-            panic!("应返回配置值错误");
-        };
-        assert!(error.field().ends_with(".endpoint"));
+        load_configuration(&remote_http).expect("合法远程 HTTP URL 应被接受");
+        let https = directory.write(
+            "https.toml",
+            &valid_configuration().replace(
+                "http://127.0.0.1:8080/v1/chat/completions",
+                "https://api.example.com/v1/chat/completions",
+            ),
+        );
+        load_configuration(&https).expect("合法 HTTPS URL 应被接受");
 
         let profile = profile_configuration();
         let duplicate = directory.write(
@@ -2589,7 +2535,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_fragment_model_whitespace_and_auth_unknown_field_are_rejected() {
+    fn url_credentials_fragment_scheme_model_whitespace_and_unknown_field_are_rejected() {
         let directory = TestDirectory::new();
         for (name, source, expected_field) in [
             (
@@ -2598,7 +2544,23 @@ mod tests {
                     "http://127.0.0.1:8080/v1/chat/completions",
                     "http://127.0.0.1:8080/v1/chat/completions#fragment",
                 ),
-                ".endpoint",
+                ".url",
+            ),
+            (
+                "credentials.toml",
+                valid_configuration().replace(
+                    "http://127.0.0.1:8080/v1/chat/completions",
+                    "http://user:password@127.0.0.1:8080/v1/chat/completions",
+                ),
+                ".url",
+            ),
+            (
+                "scheme.toml",
+                valid_configuration().replace(
+                    "http://127.0.0.1:8080/v1/chat/completions",
+                    "ftp://127.0.0.1/v1/chat/completions",
+                ),
+                ".url",
             ),
             (
                 "model-whitespace.toml",
@@ -2606,11 +2568,8 @@ mod tests {
                 ".model",
             ),
             (
-                "auth-unknown.toml",
-                valid_configuration().replace(
-                    "auth = \"none\"",
-                    "auth = { bearer = \"secret\", unknown = true }",
-                ),
+                "client-unknown.toml",
+                valid_configuration().replace("burst = 4", "burst = 4\nunknown = true"),
                 "",
             ),
         ] {
@@ -2628,35 +2587,63 @@ mod tests {
     }
 
     #[test]
-    fn bearer_is_loaded_directly_and_debug_is_redacted() {
+    fn api_key_is_loaded_directly_and_debug_is_redacted() {
         let directory = TestDirectory::new();
-        let secret = "must-not-leak-bearer-7f91";
-        let sensitive_extra = "must-not-leak-extra-4c28";
+        let secret = "must-not-leak-api-key-7f91";
+        let sensitive_parameter = "must-not-leak-parameter-4c28";
+        let sensitive_url_query = "must-not-leak-url-query-9b31";
         let path = directory.write(
-            "bearer.toml",
+            "api-key.toml",
             &valid_configuration()
                 .replace(
-                    "auth = \"none\"",
-                    &format!("auth = {{ bearer = \"{secret}\" }}"),
+                    "api_key = \"test-api-key\"",
+                    &format!("api_key = \"{secret}\""),
                 )
                 .replace(
                     "\"temperature\": 0.2",
-                    &format!("\"sensitive\": \"{sensitive_extra}\""),
+                    &format!("\"sensitive\": \"{sensitive_parameter}\""),
+                )
+                .replace(
+                    "http://127.0.0.1:8080/v1/chat/completions",
+                    &format!(
+                        "http://127.0.0.1:8080/v1/chat/completions?token={sensitive_url_query}"
+                    ),
                 ),
         );
-        let configuration = load_configuration(&path).expect("配置内 Bearer 应合法");
+        let configuration = load_configuration(&path).expect("配置内 API key 应合法");
         let client = configuration
             .llm_clients()
             .get(&LlmClientId::from_validated("local-client".to_owned()))
             .expect("客户端应存在");
-        let LlmAuthConfiguration::Bearer(bearer) = client.auth() else {
-            panic!("应建立 Bearer 认证");
-        };
-        assert_eq!(bearer.expose_secret(), secret);
+        assert_eq!(client.api_key().expose_secret(), secret);
         let debug = format!("{client:?}");
         assert!(!debug.contains(secret));
-        assert!(!debug.contains(sensitive_extra));
+        assert!(!debug.contains(sensitive_parameter));
+        assert!(!debug.contains(sensitive_url_query));
         assert!(debug.contains("sensitive"));
+    }
+
+    #[test]
+    fn api_key_rejects_blank_whitespace_and_header_unsafe_values() {
+        let directory = TestDirectory::new();
+        for (name, api_key) in [
+            ("blank-api-key.toml", "   "),
+            ("padded-api-key.toml", " padded "),
+            ("unsafe-api-key.toml", r"bad\u007fkey"),
+        ] {
+            let source = valid_configuration().replace(
+                "api_key = \"test-api-key\"",
+                &format!("api_key = \"{api_key}\""),
+            );
+            let ConfigurationLoadError::InvalidValue(error) =
+                load_configuration(&directory.write(name, &source))
+                    .err()
+                    .expect("非法 API key 必须拒绝")
+            else {
+                panic!("应返回配置值错误");
+            };
+            assert!(error.field().ends_with(".api_key"));
+        }
     }
 
     #[test]
@@ -2664,7 +2651,10 @@ mod tests {
         let directory = TestDirectory::new();
         let primary_client = client_configuration();
         let secondary_client = primary_client
-            .replace("id = \"local-client\"", "id = \"secondary-client\"")
+            .replace(
+                "[llm.clients.local-client]",
+                "[llm.clients.secondary-client]",
+            )
             .replace("127.0.0.1:8080", "127.0.0.1:8081");
         let primary_profile = profile_configuration();
         let secondary_profile = primary_profile.replace("id = \"local\"", "id = \"secondary\"");
@@ -2698,16 +2688,13 @@ mod tests {
         for (name, source, expected_field) in [
             (
                 "empty-clients.toml",
-                valid_configuration().replace(&primary_client, "[llm]\nclients = []"),
+                valid_configuration().replace(&primary_client, "[llm.clients]\n"),
                 "llm.clients",
             ),
             (
-                "duplicate-client.toml",
-                valid_configuration().replace(
-                    &primary_client,
-                    &format!("{primary_client}\n{primary_client}"),
-                ),
-                "llm.clients[1].id",
+                "blank-client-id.toml",
+                valid_configuration().replace("[llm.clients.local-client]", "[llm.clients.\"  \"]"),
+                "llm.clients.  ",
             ),
             (
                 "unknown-reference.toml",
@@ -2733,12 +2720,24 @@ mod tests {
             };
             assert_eq!(error.field(), expected_field);
         }
+
+        let duplicate = valid_configuration().replace(
+            &primary_client,
+            &format!("{primary_client}\n{primary_client}"),
+        );
+        assert!(matches!(
+            load_configuration(&directory.write("duplicate-client.toml", &duplicate)),
+            Err(ConfigurationLoadError::InvalidToml { .. })
+        ));
     }
 
     #[test]
-    fn request_body_extra_is_one_strict_json_object_contract() {
+    fn parameters_is_one_strict_json_object_contract() {
         let directory = TestDirectory::new();
-        let accepted = replace_request_body_extra(
+        let empty = replace_parameters(&valid_configuration(), "{}");
+        load_configuration(&directory.write("empty-parameters.toml", &empty))
+            .expect("显式空 parameters 对象应合法");
+        let accepted = replace_parameters(
             &valid_configuration(),
             r#"{
   "n": 2,
@@ -2750,71 +2749,64 @@ mod tests {
         );
         let configuration = load_configuration(&directory.write("accepted.toml", &accepted))
             .expect("用户拥有的任意非保留 JSON 字段应保留");
-        let extra = configuration
+        let parameters = configuration
             .llm_clients()
             .get(&LlmClientId::from_validated("local-client".to_owned()))
             .expect("客户端应存在")
-            .request_body_extra();
-        assert_eq!(extra.get("n"), Some(&JsonValue::from(2)));
-        assert_eq!(extra.get("max_tokens"), Some(&JsonValue::from(4096)));
+            .parameters();
+        assert_eq!(parameters.get("n"), Some(&JsonValue::from(2)));
+        assert_eq!(parameters.get("max_tokens"), Some(&JsonValue::from(4096)));
         assert_eq!(
-            extra.get("thinking").and_then(|value| value.get("model")),
+            parameters
+                .get("thinking")
+                .and_then(|value| value.get("model")),
             Some(&JsonValue::from("nested"))
         );
         assert_eq!(
-            extra.get("precise").map(JsonValue::to_string).as_deref(),
+            parameters
+                .get("precise")
+                .map(JsonValue::to_string)
+                .as_deref(),
             Some("123456789012345678901234567890.00000000000000000001")
         );
 
         for (name, json, expected_suffix) in [
-            ("non-object.toml", "[]", "request_body_extra"),
-            (
-                "trailing-comma.toml",
-                r#"{"value": 1,}"#,
-                "request_body_extra",
-            ),
-            (
-                "comment.toml",
-                "{\"value\": 1 // comment\n}",
-                "request_body_extra",
-            ),
+            ("non-object.toml", "[]", "parameters"),
+            ("trailing-comma.toml", r#"{"value": 1,}"#, "parameters"),
+            ("comment.toml", "{\"value\": 1 // comment\n}", "parameters"),
             (
                 "parallel-values.toml",
                 r#"{"value": 1} {"other": 2}"#,
-                "request_body_extra",
+                "parameters",
             ),
-            (
-                "truncated.toml",
-                r#"{"value": "unfinished"#,
-                "request_body_extra",
-            ),
+            ("truncated.toml", r#"{"value": "unfinished"#, "parameters"),
             (
                 "top-duplicate.toml",
                 r#"{"value": 1, "value": 2}"#,
-                "request_body_extra",
+                "parameters",
             ),
             (
                 "nested-duplicate.toml",
                 r#"{"nested": {"value": 1, "value": 2}}"#,
-                "request_body_extra",
+                "parameters",
             ),
             (
                 "reserved-model.toml",
                 r#"{"model": "other"}"#,
-                "request_body_extra.model",
+                "parameters.model",
             ),
             (
                 "reserved-messages.toml",
                 r#"{"messages": []}"#,
-                "request_body_extra.messages",
+                "parameters.messages",
             ),
             (
                 "reserved-stream.toml",
                 r#"{"stream": true}"#,
-                "request_body_extra.stream",
+                "parameters.stream",
             ),
         ] {
-            let source = replace_request_body_extra(&valid_configuration(), json);
+            let source = replace_parameters(&valid_configuration(), json);
             let ConfigurationLoadError::InvalidValue(error) =
                 load_configuration(&directory.write(name, &source))
                     .err()
@@ -2825,10 +2817,8 @@ mod tests {
             assert!(error.field().ends_with(expected_suffix));
         }
 
-        let wrong_type = valid_configuration().replace(
-            REQUEST_BODY_EXTRA_FIXTURE,
-            "request_body_extra = { temperature = 0.2 }",
-        );
+        let wrong_type =
+            valid_configuration().replace(PARAMETERS_FIXTURE, "parameters = { temperature = 0.2 }");
         assert!(matches!(
             load_configuration(&directory.write("wrong-type.toml", &wrong_type)),
             Err(ConfigurationLoadError::InvalidToml { .. })
@@ -2857,8 +2847,8 @@ mod tests {
         let secret = "must-not-leak-config-source-a3d9";
         let invalid_toml = valid_configuration()
             .replace(
-                "auth = \"none\"",
-                &format!("auth = {{ bearer = \"{secret}\" }}"),
+                "api_key = \"test-api-key\"",
+                &format!("api_key = \"{secret}\""),
             )
             .replace(
                 "root = \"projects\"",
@@ -2872,10 +2862,10 @@ mod tests {
         );
 
         let invalid_json = valid_configuration().replace(
-            "auth = \"none\"",
-            &format!("auth = {{ bearer = \"{secret}\" }}"),
+            "api_key = \"test-api-key\"",
+            &format!("api_key = \"{secret}\""),
         );
-        let invalid_json = replace_request_body_extra(
+        let invalid_json = replace_parameters(
             &invalid_json,
             format!(r#"{{"sensitive": "{secret}",}}"#).as_str(),
         );
@@ -2886,12 +2876,12 @@ mod tests {
             secret,
         );
 
-        let invalid_bearer = valid_configuration().replace(
-            "auth = \"none\"",
-            &format!("auth = {{ bearer = \" {secret} \" }}"),
+        let invalid_api_key = valid_configuration().replace(
+            "api_key = \"test-api-key\"",
+            &format!("api_key = \" {secret} \""),
         );
         assert_error_chain_does_not_contain(
-            load_configuration(&directory.write("invalid-bearer.toml", &invalid_bearer))
+            load_configuration(&directory.write("invalid-api-key.toml", &invalid_api_key))
                 .err()
                 .expect("带首尾空白的密钥必须拒绝"),
             secret,
@@ -2911,16 +2901,16 @@ mod tests {
         ));
     }
 
-    const REQUEST_BODY_EXTRA_FIXTURE: &str = r#"request_body_extra = '''
+    const PARAMETERS_FIXTURE: &str = r#"parameters = '''
 {
   "temperature": 0.2
 }
 '''"#;
 
-    fn replace_request_body_extra(configuration: &str, json: &str) -> String {
-        let replacement = format!("request_body_extra = '''\n{json}\n'''");
-        let replaced = configuration.replace(REQUEST_BODY_EXTRA_FIXTURE, &replacement);
-        assert_ne!(replaced, configuration, "测试夹具必须命中扩展正文");
+    fn replace_parameters(configuration: &str, json: &str) -> String {
+        let replacement = format!("parameters = '''\n{json}\n'''");
+        let replaced = configuration.replace(PARAMETERS_FIXTURE, &replacement);
+        assert_ne!(replaced, configuration, "测试夹具必须命中 parameters");
         replaced
     }
 
@@ -3079,19 +3069,14 @@ allowed_terms = []
     }
 
     fn client_configuration() -> String {
-        r#"[[llm.clients]]
-id = "local-client"
-endpoint = "http://127.0.0.1:8080/v1/chat/completions"
-auth = "none"
+        r#"[llm.clients.local-client]
+url = "http://127.0.0.1:8080/v1/chat/completions"
+api_key = "test-api-key"
 model = "test-model"
-allow_plain_http_loopback = true
-request_timeout_ms = 60000
-max_request_bytes = 1048576
-max_response_bytes = 4194304
-max_error_response_bytes = 65536
-requests_per_minute = 60
-burst_requests = 4
-request_body_extra = '''
+timeout_ms = 60000
+rpm = 60
+burst = 4
+parameters = '''
 {
   "temperature": 0.2
 }

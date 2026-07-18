@@ -82,8 +82,8 @@ Translate 先按 CLI 提供的精确 ID 选中一个 MZ Profile，再取得它�
 Client。只有该 Profile 的系统提示词和全局 LLM TLS PEM 才会在本命令中读取；
 系统提示词必须是非空白 UTF-8 Markdown。组合根只构造一个
 `OpenAiChatCompletionClient` 和一个 `OpenAiChatCompletionExecutor`，并把同一份
-不可变执行 Profile 交给 Standard 与 Translate Lua，因此两者共享 endpoint、直接
-Bearer、model、额外 JSON 请求字段、连接池、总准入和客户端限速。
+不可变执行 Profile 交给 Standard 与 Translate Lua，因此两者共享 URL、固定 Bearer
+API key、model、parameters、连接池、总准入和客户端 RPM/burst。
 
 Translation 的 `run_id + project + profile` 在 Profile 选择和项目读取都成功后、
 任何翻译副作用之前建立。WriteBack 的 `run_id + project` 同样在项目实际打开后

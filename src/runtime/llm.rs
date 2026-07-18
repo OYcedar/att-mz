@@ -2,13 +2,11 @@
 
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use futures_util::StreamExt;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Client, Proxy, StatusCode, redirect};
@@ -25,66 +23,33 @@ use crate::llm::{
     LlmRequestExecutor, LlmResponse, LlmUsage,
 };
 
-/// Chat Completions 的认证方式。
-#[derive(Clone, Default)]
-pub(crate) enum OpenAiAuthentication {
-    #[default]
-    None,
-    Bearer(SecretString),
-}
-
-impl OpenAiAuthentication {
-    pub(crate) fn bearer(secret: impl Into<SecretString>) -> Self {
-        Self::Bearer(secret.into())
-    }
-}
-
-impl fmt::Debug for OpenAiAuthentication {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::None => formatter.write_str("None"),
-            Self::Bearer(_) => formatter.write_str("Bearer([REDACTED])"),
-        }
-    }
-}
-
 /// 一个可被不同引擎及 Lua 共享的受信 LLM Client。
 pub(crate) struct OpenAiChatCompletionClient {
-    endpoint: Url,
-    authentication: OpenAiAuthentication,
+    url: Url,
+    api_key: SecretString,
     model: String,
-    request_timeout: Duration,
-    max_request_bytes: NonZeroUsize,
-    max_response_bytes: NonZeroUsize,
-    max_error_response_bytes: NonZeroUsize,
-    request_body_extra: Map<String, Value>,
+    timeout: Duration,
+    parameters: Map<String, Value>,
     rate_limiter: Arc<DefaultDirectRateLimiter>,
 }
 
 impl OpenAiChatCompletionClient {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        endpoint: Url,
-        authentication: OpenAiAuthentication,
+        url: Url,
+        api_key: SecretString,
         model: impl Into<String>,
-        request_timeout: Duration,
-        max_request_bytes: NonZeroUsize,
-        max_response_bytes: NonZeroUsize,
-        max_error_response_bytes: NonZeroUsize,
-        requests_per_minute: NonZeroU32,
-        burst_requests: NonZeroU32,
-        request_body_extra: Map<String, Value>,
+        timeout: Duration,
+        rpm: NonZeroU32,
+        burst: NonZeroU32,
+        parameters: Map<String, Value>,
     ) -> Self {
-        let quota = Quota::per_minute(requests_per_minute).allow_burst(burst_requests);
+        let quota = Quota::per_minute(rpm).allow_burst(burst);
         Self {
-            endpoint,
-            authentication,
+            url,
+            api_key,
             model: model.into(),
-            request_timeout,
-            max_request_bytes,
-            max_response_bytes,
-            max_error_response_bytes,
-            request_body_extra,
+            timeout,
+            parameters,
             rate_limiter: Arc::new(RateLimiter::direct(quota)),
         }
     }
@@ -92,13 +57,13 @@ impl OpenAiChatCompletionClient {
 
 impl LlmClientSemanticIdentity for OpenAiChatCompletionClient {
     fn semantic_fingerprint(&self) -> Sha256Fingerprint {
-        let canonical_extra =
-            canonical_json_semantic_bytes(&Value::Object(self.request_body_extra.clone()));
+        let canonical_parameters =
+            canonical_json_semantic_bytes(&Value::Object(self.parameters.clone()));
         let mut hasher = Sha256FramedHasher::new(b"att.llm.chat-completions.semantics");
         hasher
-            .frame(1, self.endpoint.as_str().as_bytes())
+            .frame(1, self.url.as_str().as_bytes())
             .frame(2, self.model.as_bytes())
-            .frame(3, &canonical_extra);
+            .frame(3, &canonical_parameters);
         hasher.finish()
     }
 }
@@ -341,18 +306,15 @@ fn canonical_json_number(value: &str) -> (bool, String, bool, String) {
 
 impl fmt::Debug for OpenAiChatCompletionClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let request_body_extra_fields = self.request_body_extra.keys().collect::<Vec<_>>();
+        let parameter_fields = self.parameters.keys().collect::<Vec<_>>();
         formatter
             .debug_struct("OpenAiChatCompletionClient")
-            .field("endpoint_scheme", &self.endpoint.scheme())
-            .field("endpoint_host", &self.endpoint.host_str())
-            .field("authentication", &self.authentication)
+            .field("url_scheme", &self.url.scheme())
+            .field("url_host", &self.url.host_str())
+            .field("api_key", &"[REDACTED]")
             .field("model", &self.model)
-            .field("request_timeout", &self.request_timeout)
-            .field("max_request_bytes", &self.max_request_bytes)
-            .field("max_response_bytes", &self.max_response_bytes)
-            .field("max_error_response_bytes", &self.max_error_response_bytes)
-            .field("request_body_extra_fields", &request_body_extra_fields)
+            .field("timeout", &self.timeout)
+            .field("parameter_fields", &parameter_fields)
             .finish_non_exhaustive()
     }
 }
@@ -545,27 +507,20 @@ impl OpenAiChatCompletionExecutor {
         let active_permit =
             wait_for_active(Arc::clone(&self.active_capacity), &self.lifecycle, deadline).await?;
 
-        let mut request = self
+        let request = self
             .client
-            .post(client.endpoint.clone())
+            .post(client.url.clone())
             .header(CONTENT_TYPE, "application/json")
-            .timeout(client.request_timeout)
+            .timeout(client.timeout)
+            .bearer_auth(client.api_key.expose_secret())
             .body(request_body);
-        if let OpenAiAuthentication::Bearer(secret) = &client.authentication {
-            request = request.bearer_auth(secret.expose_secret());
-        }
 
         let response = request.send().await.map_err(classify_transport_error)?;
         let status = response.status();
         let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
         if status != StatusCode::OK {
-            let facts =
-                read_error_body_facts(response, client.max_error_response_bytes.get()).await;
             let error = OpenAiChatCompletionError::HttpStatus {
                 status: status.as_u16(),
-                body_bytes: facts.body_bytes,
-                body_truncated: facts.truncated,
-                body_read_failed: facts.read_failed,
             };
             drop(active_permit);
             drop(total_permit);
@@ -591,7 +546,7 @@ impl OpenAiChatCompletionExecutor {
                 })
             })
             .transpose()?;
-        let response_body = read_success_body(response, client.max_response_bytes.get()).await?;
+        let response_body = response.bytes().await.map_err(classify_transport_error)?;
         let parsed = parse_success_response(&response_body, provider_request_id)?;
 
         drop(active_permit);
@@ -627,32 +582,16 @@ impl LlmRequestExecutor for OpenAiChatCompletionExecutor {
 pub(crate) enum OpenAiChatCompletionError {
     ShuttingDown,
     QueueFull,
-    AdmissionTimeout {
-        stage: AdmissionStage,
-    },
+    AdmissionTimeout { stage: AdmissionStage },
     AdmissionClosed,
     SerializeRequest(serde_json::Error),
-    RequestTooLarge {
-        actual: usize,
-        maximum: usize,
-    },
     Transport(reqwest::Error),
-    HttpStatus {
-        status: u16,
-        body_bytes: usize,
-        body_truncated: bool,
-        body_read_failed: bool,
-    },
+    HttpStatus { status: u16 },
     MissingJsonContentType,
     InvalidJsonContentType,
     InvalidProviderRequestId,
-    ResponseTooLarge {
-        maximum: usize,
-    },
     ParseResponse(serde_json::Error),
-    InvalidResponseWire {
-        reason: &'static str,
-    },
+    InvalidResponseWire { reason: &'static str },
 }
 
 impl fmt::Display for OpenAiChatCompletionError {
@@ -663,22 +602,8 @@ impl fmt::Display for OpenAiChatCompletionError {
             Self::AdmissionTimeout { stage } => write!(formatter, "LLM {stage} 准入超时"),
             Self::AdmissionClosed => formatter.write_str("LLM 活动请求通道已关闭"),
             Self::SerializeRequest(_) => formatter.write_str("无法序列化 LLM 请求"),
-            Self::RequestTooLarge { actual, maximum } => {
-                write!(
-                    formatter,
-                    "LLM 请求至少为 {actual} 字节，超过上限 {maximum}"
-                )
-            }
             Self::Transport(_) => formatter.write_str("LLM HTTP 传输失败"),
-            Self::HttpStatus {
-                status,
-                body_bytes,
-                body_truncated,
-                body_read_failed,
-            } => write!(
-                formatter,
-                "LLM HTTP 状态 {status}（错误正文已读 {body_bytes} 字节，truncated={body_truncated}，read_failed={body_read_failed}）"
-            ),
+            Self::HttpStatus { status } => write!(formatter, "LLM HTTP 状态 {status}"),
             Self::MissingJsonContentType => {
                 formatter.write_str("LLM 成功响应缺少 JSON Content-Type")
             }
@@ -687,9 +612,6 @@ impl fmt::Display for OpenAiChatCompletionError {
             }
             Self::InvalidProviderRequestId => {
                 formatter.write_str("LLM x-request-id 响应头不是有效文本")
-            }
-            Self::ResponseTooLarge { maximum } => {
-                write!(formatter, "LLM 成功响应超过 {maximum} 字节")
             }
             Self::ParseResponse(_) => formatter.write_str("LLM 成功响应不是有效 JSON"),
             Self::InvalidResponseWire { reason } => {
@@ -740,39 +662,7 @@ struct ChatCompletionRequestWire<'a> {
     messages: Vec<RequestMessageWire<'a>>,
     stream: bool,
     #[serde(flatten)]
-    request_body_extra: &'a Map<String, Value>,
-}
-
-struct BoundedRequestWriter {
-    bytes: Vec<u8>,
-    maximum: usize,
-    first_overflow: Option<usize>,
-}
-
-impl BoundedRequestWriter {
-    fn new(maximum: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(maximum.min(8 * 1024)),
-            maximum,
-            first_overflow: None,
-        }
-    }
-}
-
-impl Write for BoundedRequestWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let attempted = self.bytes.len().saturating_add(buffer.len());
-        if attempted > self.maximum {
-            self.first_overflow.get_or_insert(attempted);
-            return Err(io::Error::other("LLM 请求超过序列化字节上限"));
-        }
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    parameters: &'a Map<String, Value>,
 }
 
 fn serialize_request(
@@ -794,18 +684,9 @@ fn serialize_request(
         model: &client.model,
         messages,
         stream: false,
-        request_body_extra: &client.request_body_extra,
+        parameters: &client.parameters,
     };
-    let maximum = client.max_request_bytes.get();
-    let mut writer = BoundedRequestWriter::new(maximum);
-    if let Err(source) = serde_json::to_writer(&mut writer, &wire) {
-        return if let Some(actual) = writer.first_overflow {
-            Err(OpenAiChatCompletionError::RequestTooLarge { actual, maximum })
-        } else {
-            Err(OpenAiChatCompletionError::SerializeRequest(source))
-        };
-    }
-    Ok(writer.bytes)
+    serde_json::to_vec(&wire).map_err(OpenAiChatCompletionError::SerializeRequest)
 }
 
 async fn wait_for_rate(
@@ -940,64 +821,6 @@ fn validate_json_content_type(
     } else {
         Err(OpenAiChatCompletionError::InvalidJsonContentType)
     }
-}
-
-struct ErrorBodyFacts {
-    body_bytes: usize,
-    truncated: bool,
-    read_failed: bool,
-}
-
-async fn read_error_body_facts(response: reqwest::Response, maximum: usize) -> ErrorBodyFacts {
-    let mut body_bytes = 0_usize;
-    let mut truncated = false;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else {
-            return ErrorBodyFacts {
-                body_bytes,
-                truncated,
-                read_failed: true,
-            };
-        };
-        let remaining = maximum.saturating_sub(body_bytes);
-        body_bytes += chunk.len().min(remaining);
-        if chunk.len() > remaining {
-            truncated = true;
-            break;
-        }
-    }
-    ErrorBodyFacts {
-        body_bytes,
-        truncated,
-        read_failed: false,
-    }
-}
-
-async fn read_success_body(
-    response: reqwest::Response,
-    maximum: usize,
-) -> Result<Vec<u8>, LlmRequestError<OpenAiChatCompletionError>> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > maximum as u64)
-    {
-        return Err(LlmRequestError::Fatal(
-            OpenAiChatCompletionError::ResponseTooLarge { maximum },
-        ));
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(classify_transport_error)?;
-        if body.len().saturating_add(chunk.len()) > maximum {
-            return Err(LlmRequestError::Fatal(
-                OpenAiChatCompletionError::ResponseTooLarge { maximum },
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 #[derive(Deserialize)]
@@ -1176,33 +999,24 @@ mod tests {
         NonZeroU32::new(value).expect("测试值必须非零")
     }
 
-    fn client(
-        endpoint: &str,
-        request_body_extra: Map<String, Value>,
-    ) -> OpenAiChatCompletionClient {
-        client_with_limits(endpoint, request_body_extra, 4096, 256, 60, 2)
+    fn client(url: &str, parameters: Map<String, Value>) -> OpenAiChatCompletionClient {
+        client_with_rate(url, parameters, 60, 2)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn client_with_limits(
-        endpoint: &str,
-        request_body_extra: Map<String, Value>,
-        max_response_bytes: usize,
-        max_error_response_bytes: usize,
-        requests_per_minute: u32,
-        burst_requests: u32,
+    fn client_with_rate(
+        url: &str,
+        parameters: Map<String, Value>,
+        rpm: u32,
+        burst: u32,
     ) -> OpenAiChatCompletionClient {
         OpenAiChatCompletionClient::new(
-            Url::parse(endpoint).expect("测试 URL 有效"),
-            OpenAiAuthentication::None,
+            Url::parse(url).expect("测试 URL 有效"),
+            SecretString::from("test-secret"),
             "test-model",
             Duration::from_secs(2),
-            non_zero_usize(4096),
-            non_zero_usize(max_response_bytes),
-            non_zero_usize(max_error_response_bytes),
-            non_zero_u32(requests_per_minute),
-            non_zero_u32(burst_requests),
-            request_body_extra,
+            non_zero_u32(rpm),
+            non_zero_u32(burst),
+            parameters,
         )
     }
 
@@ -1352,23 +1166,20 @@ mod tests {
     }
 
     #[test]
-    fn debug_redacts_bearer_and_request_body_extra_values() {
-        let mut request_body_extra = Map::new();
-        request_body_extra.insert(
+    fn debug_redacts_api_key_and_parameter_values() {
+        let mut parameters = Map::new();
+        parameters.insert(
             "vendor_secret".to_owned(),
             Value::String("must-not-appear".to_owned()),
         );
         let client = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").expect("测试 URL 有效"),
-            OpenAiAuthentication::bearer("api-secret"),
+            SecretString::from("api-secret"),
             "test-model",
             Duration::from_secs(2),
-            non_zero_usize(4096),
-            non_zero_usize(4096),
-            non_zero_usize(256),
             non_zero_u32(60),
             non_zero_u32(2),
-            request_body_extra,
+            parameters,
         );
         let debug = format!("{client:?}");
         assert!(debug.contains("vendor_secret"));
@@ -1377,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_identity_includes_only_endpoint_model_and_extra_body() {
+    fn semantic_identity_includes_only_url_model_and_parameters() {
         let mut extra = Map::new();
         extra.insert("temperature".to_owned(), serde_json::json!(0.2));
         extra.insert(
@@ -1386,24 +1197,18 @@ mod tests {
         );
         let first = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            OpenAiAuthentication::None,
+            SecretString::from("first-secret"),
             "model-a",
             Duration::from_secs(2),
-            non_zero_usize(4096),
-            non_zero_usize(8192),
-            non_zero_usize(256),
             non_zero_u32(60),
             non_zero_u32(2),
             extra.clone(),
         );
         let operationally_different = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            OpenAiAuthentication::bearer("different-secret"),
+            SecretString::from("different-secret"),
             "model-a",
             Duration::from_secs(90),
-            non_zero_usize(8192),
-            non_zero_usize(16384),
-            non_zero_usize(1024),
             non_zero_u32(1),
             non_zero_u32(1),
             extra.clone(),
@@ -1419,12 +1224,9 @@ mod tests {
         extra_reordered.insert("temperature".to_owned(), serde_json::json!(0.2));
         let textually_reordered = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            OpenAiAuthentication::None,
+            SecretString::from("first-secret"),
             "model-a",
             Duration::from_secs(2),
-            non_zero_usize(4096),
-            non_zero_usize(8192),
-            non_zero_usize(256),
             non_zero_u32(60),
             non_zero_u32(2),
             extra_reordered.clone(),
@@ -1436,24 +1238,18 @@ mod tests {
         );
         let numerically_equivalent = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            OpenAiAuthentication::None,
+            SecretString::from("first-secret"),
             "model-a",
             Duration::from_secs(2),
-            non_zero_usize(4096),
-            non_zero_usize(8192),
-            non_zero_usize(256),
             non_zero_u32(60),
             non_zero_u32(2),
             numerically_equivalent_extra,
         );
         let different_model = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            OpenAiAuthentication::None,
+            SecretString::from("first-secret"),
             "model-b",
             Duration::from_secs(2),
-            non_zero_usize(4096),
-            non_zero_usize(8192),
-            non_zero_usize(256),
             non_zero_u32(60),
             non_zero_u32(2),
             extra,
@@ -1504,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn request_wire_without_extra_has_exactly_three_top_level_fields() {
+    fn request_wire_without_parameters_has_exactly_three_top_level_fields() {
         let client = client("https://example.com/v1/chat/completions", Map::new());
         let bytes = serialize_request(
             &client,
@@ -1522,8 +1318,8 @@ mod tests {
     }
 
     #[test]
-    fn request_wire_preserves_every_user_supplied_extra_field() {
-        let request_body_extra = serde_json::from_value::<Map<String, Value>>(serde_json::json!({
+    fn request_wire_preserves_every_user_supplied_parameter() {
+        let parameters = serde_json::from_value::<Map<String, Value>>(serde_json::json!({
             "n": 2,
             "max_tokens": 32,
             "max_completion_tokens": 64,
@@ -1531,10 +1327,7 @@ mod tests {
             "provider": { "thinking": true }
         }))
         .expect("测试扩展正文应为对象");
-        let client = client(
-            "https://example.com/v1/chat/completions",
-            request_body_extra,
-        );
+        let client = client("https://example.com/v1/chat/completions", parameters);
         let bytes = serialize_request(&client, &[]).expect("请求应可序列化");
         let wire: Value = serde_json::from_slice(&bytes).expect("请求应为 JSON");
 
@@ -1543,26 +1336,6 @@ mod tests {
         assert_eq!(wire["max_completion_tokens"], 64);
         assert_eq!(wire["temperature"], 0.2);
         assert_eq!(wire["provider"]["thinking"], true);
-    }
-
-    #[test]
-    fn request_serialization_stops_at_configured_byte_limit() {
-        let mut client = client("https://example.com/v1/chat/completions", Map::new());
-        client.max_request_bytes = non_zero_usize(64);
-
-        let error = serialize_request(
-            &client,
-            &[ChatMessage::new(ChatMessageRole::User, "x".repeat(4096))],
-        )
-        .expect_err("序列化必须在超过请求上限时立即停止");
-
-        assert!(matches!(
-            error,
-            OpenAiChatCompletionError::RequestTooLarge {
-                actual,
-                maximum: 64
-            } if actual > 64
-        ));
     }
 
     #[test]
@@ -1705,9 +1478,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("测试请求应被记录");
         assert!(
-            !request_headers(&request)
+            request_headers(&request)
                 .to_ascii_lowercase()
-                .contains("authorization:")
+                .contains("authorization: bearer test-secret")
         );
         let wire: Value = serde_json::from_slice(request_body(&request)).expect("请求应为 JSON");
         assert_eq!(wire.as_object().expect("请求顶层应为对象").len(), 3);
@@ -1724,13 +1497,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bearer_authentication_is_sent_exactly_once() {
+    async fn api_key_is_sent_exactly_once() {
         let server = spawn_test_server(
             vec![success_response("response-body", "request-header", "[]")],
             false,
         );
         let mut client = client(&server.endpoint, Map::new());
-        client.authentication = OpenAiAuthentication::bearer("exact-secret");
+        client.api_key = SecretString::from("exact-secret");
         let executor = executor(1, 0);
 
         executor
@@ -1768,14 +1541,7 @@ mod tests {
             ],
             true,
         );
-        let client = Arc::new(client_with_limits(
-            &server.endpoint,
-            Map::new(),
-            4096,
-            256,
-            60_000,
-            3,
-        ));
+        let client = Arc::new(client_with_rate(&server.endpoint, Map::new(), 60_000, 3));
         let executor = executor(1, 1);
         let first_executor = executor.clone();
         let first_client = Arc::clone(&client);
@@ -1853,14 +1619,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_burst_and_admission_deadlines_are_enforced() {
-        let client = client_with_limits(
-            "http://127.0.0.1:1/v1/chat/completions",
-            Map::new(),
-            4096,
-            256,
-            60,
-            2,
-        );
+        let client = client_with_rate("http://127.0.0.1:1/v1/chat/completions", Map::new(), 60, 2);
         let lifecycle = LlmLifecycle::new();
 
         wait_for_rate(
@@ -1927,7 +1686,7 @@ mod tests {
             .expect("测试服务器线程应创建成功");
 
         let endpoint = format!("http://{address}/v1/chat/completions");
-        let client = Arc::new(client_with_limits(&endpoint, Map::new(), 4096, 256, 60, 1));
+        let client = Arc::new(client_with_rate(&endpoint, Map::new(), 60, 1));
         let executor = executor_with_admission_timeout(1, 0, Duration::from_secs(1));
         let request_executor = executor.clone();
         let request_client = Arc::clone(&client);
@@ -1974,34 +1733,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn success_response_limit_is_enforced_during_streaming() {
-        let server = spawn_test_server(
-            vec![success_response(
-                "response-too-large",
-                "request-too-large",
-                "this response is deliberately too long",
-            )],
-            false,
-        );
-        let client = client_with_limits(&server.endpoint, Map::new(), 16, 8, 60, 1);
-        let executor = executor(1, 0);
-
-        assert!(matches!(
-            executor
-                .request(
-                    &client,
-                    &[ChatMessage::new(ChatMessageRole::User, "content")]
-                )
-                .await,
-            Err(LlmRequestError::Fatal(
-                OpenAiChatCompletionError::ResponseTooLarge { maximum: 16 }
-            ))
-        ));
-        executor.shutdown().await;
-        server.worker.join().expect("测试服务器应正常退出");
-    }
-
-    #[tokio::test]
     async fn retryable_http_status_preserves_retry_after_without_root_retry() {
         let server = spawn_test_server(
             vec![status_response(
@@ -2011,7 +1742,7 @@ mod tests {
             )],
             false,
         );
-        let client = client_with_limits(&server.endpoint, Map::new(), 4096, 4, 60, 1);
+        let client = client_with_rate(&server.endpoint, Map::new(), 60, 1);
         let executor = executor(1, 0);
 
         assert!(matches!(
@@ -2022,12 +1753,7 @@ mod tests {
                 )
                 .await,
             Err(LlmRequestError::Retryable {
-                source: OpenAiChatCompletionError::HttpStatus {
-                    status: 429,
-                    body_bytes: 4,
-                    body_truncated: true,
-                    body_read_failed: false,
-                },
+                source: OpenAiChatCompletionError::HttpStatus { status: 429 },
                 retry_after: Some(duration),
             }) if duration == Duration::from_secs(3)
         ));

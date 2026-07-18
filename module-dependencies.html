@@ -1530,7 +1530,7 @@ h1 {
       example: "MZ Standard 和 Translate Lua 都提交 ChatMessage，并收到同一种 LlmResponse；以后其他引擎可以直接消费同一契约。",
       input: "受信 Client 与 ChatMessage 列表",
       output: "LlmResponse 或 Retryable/Fatal 单次请求错误",
-      boundary: "协议、认证和资源治理属于具体根；重试、响应业务解析和结果提交仍属于调用方。"
+      boundary: "请求 wire、固定 Bearer、并发队列、RPM/burst 和网络错误分类属于具体根；重试、响应业务解析和结果提交仍属于调用方。"
     },
     "llm-root": {
       title: "LLM 请求生产根",
@@ -1540,10 +1540,10 @@ h1 {
       status: "生产根已实现",
       role: "按受信公共 Client 发出 OpenAI-compatible Chat Completions 非流式请求。",
       plain: "Standard Translate 与 Translate Lua 共享同一 Executor、Client、连接池和速率额度；其他阶段的 ctx.llm 为 nil。",
-      example: "没有额外 JSON 参数时，请求正文严格只有 model、messages、stream=false；WriteBack 不会偷用某个默认 Client。",
+      example: "parameters 为空对象时，请求正文严格只有 model、messages、stream=false；WriteBack 不会偷用某个默认 Client。",
       input: "公共 Client 与消息",
       output: "区分 provider request/response ID、finish reason 与 usage 的 LlmResponse，或结构化请求错误",
-      boundary: "根固定 model、messages、stream=false，只合并 Client 的额外 JSON 字段；请求准入、RPM/burst、大小限制和错误分类由根负责，根不重试。"
+      boundary: "根固定 model、messages、stream=false，只合并 Client 的严格 JSON parameters；请求准入、RPM/burst、超时和错误分类由根负责，根不重试。"
     },
     "delay-root": {
       title: "异步等待根",
@@ -1704,7 +1704,7 @@ h1 {
       status: "标准翻译领域能力已实现",
       role: "用 32 字节 SHA-256 唯一证明一条译文仍对应当前可翻译语义，并据此建立 Current、Stale、NotApplicable、Pending。",
       plain: "state 只包含会改变该叶翻译含义的事实；并发、装箱容量、组上下文和配置名字不会让正确译文无故失效。",
-      example: "改 endpoint/model、系统提示、语言策略、该叶术语或保护绑定会让 state 变化；只改 max_message_characters 或 Profile ID 不会。",
+      example: "改 URL/model/parameters、系统提示、语言策略、该叶术语或保护绑定会让 state 变化；只改 max_message_characters 或 Profile ID 不会。",
       input: "语言策略、提示、模型请求语义、叶身份、原文、保护绑定、逐叶术语与最终译文",
       output: "固定 32 字节 state 与逐叶分类",
       boundary: "包含 owner/table/unit/field/exact，不包含 group/scope/sibling、secret 或网络容量策略。"

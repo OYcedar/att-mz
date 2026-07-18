@@ -46,35 +46,41 @@ SQLite `journal_mode` 只允许 `delete`、`truncate`、`persist`、`wal`；`syn
 ## 3. 公共 LLM 客户端配置
 
 `llm.clients` 是全产品共享的 OpenAI-compatible Chat Completions 客户端目录，
-必须至少包含一项。每个客户端的 `id` 非空白、无首尾空白、区分大小写且在
-目录中唯一；具体游戏引擎的翻译配置只按这个精确 ID 引用客户端，不重复拥有
-endpoint、凭据或模型参数。
+必须至少包含一项。客户端 ID 直接由 `[llm.clients.<id>]` 的表名建立，必须非空白、
+无首尾空白、区分大小写且在目录中唯一；具体游戏引擎的翻译配置只按这个精确 ID
+引用客户端，不重复拥有 URL、密钥或模型参数。
 
-每个客户端显式建立 endpoint、认证、model、单请求超时、请求/成功响应/错误响应
-三类字节上限以及 RPM/burst。endpoint 必须为不含 fragment 或内嵌凭据的 HTTPS
-URL；只有同时设置 `allow_plain_http_loopback = true` 且主机是 loopback 时才允许
-HTTP。`model` 必须是不含首尾空白的非空精确标识。
-
-`auth` 必填且只有两种当前写法：
+每个客户端表严格且仅允许以下七个必填字段：
 
 ```toml
-auth = "none"
-auth = { bearer = "replace-with-api-key" }
+[llm.clients.primary]
+url = "https://api.example.com/v1/chat/completions"
+api_key = "replace-with-api-key"
+model = "model-id"
+timeout_ms = 120000
+rpm = 60
+burst = 8
+parameters = '''{}'''
 ```
 
-Bearer 必须非空、无首尾空白并能原样构造 HTTP Authorization Header。配置边界
-立即把它转换为秘密值；配置、客户端、错误、日志及进程输出的 `Display` 和
-`Debug` 都不得暴露密钥。
+`url` 接受合法的 `http://` 或 `https://` URL，但不得包含用户名、密码或 fragment。
+`model` 必须是不含首尾空白的非空精确标识。`timeout_ms`、`rpm` 与 `burst` 都必须
+非零；RPM 与 burst 共同建立该客户端的主动请求速率，Standard 与 Translate Lua
+共享同一份额度。
 
-`request_body_extra` 同样必填，是一个以 TOML 字符串承载的完整 JSON 对象；没有
-扩展参数时显式写 `'''{}'''`。JSON 递归拒绝重复键，并拒绝注释、尾逗号、并列值、
-截断内容和非对象顶层。顶层不得包含 `model`、`messages` 或 `stream`，嵌套同名键
-合法。`n`、`max_tokens`、`max_completion_tokens` 和供应商私有字段均作为用户
-拥有的 JSON 值原样进入请求语义，程序不另行解释、补全或改写。
+`api_key` 必须非空、无首尾空白并能原样构造 HTTP Authorization Header。每次请求
+固定发送 `Authorization: Bearer <api_key>`。配置边界立即把它转换为秘密值；配置、
+客户端、错误、日志及进程输出的 `Display` 和 `Debug` 都不得暴露密钥。
+
+`parameters` 是一个以 TOML 字符串承载的完整严格 JSON 对象；没有额外参数时显式写
+`'''{}'''`。JSON 递归拒绝重复键，并拒绝注释、尾逗号、并列值、截断内容和非对象
+顶层。顶层不得包含 `model`、`messages` 或 `stream`，嵌套同名键合法。`n`、
+`max_tokens`、`max_completion_tokens` 和供应商私有字段均作为用户拥有的 JSON 值
+原样进入请求语义，程序不另行解释、补全或改写。
 
 配置解析错误只报告配置路径、安全原因及可用的一基行列；TOML 和 JSON 原文、
-Bearer、扩展字段值以及完整配置源码都不进入错误对象或错误链。读取配置使用的
-字节、UTF-8 文本和 JSON 临时文本在边界完成后被清零。
+API key、parameters 字段值以及完整配置源码都不进入错误对象或错误链。读取配置
+使用的字节、UTF-8 文本和 JSON 临时文本在边界完成后被清零。
 
 ## 4. MZ 业务配置
 

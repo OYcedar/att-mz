@@ -138,7 +138,7 @@ MzTranslationExecutionPayload<L>
 - 模块不读取配置文件、环境变量或全局单例；
 - 模块不探测 CPU 核数，也不根据数据量自行改写并发或容量；
 - system Markdown 完整来自精确语言对配置，业务代码不补写隐藏提示词；
-- endpoint、直接凭据、model、timeout、响应上限、速率与额外 JSON 请求字段属于公共 LLM Client 配置。
+- URL、固定 Bearer API key、model、timeout、RPM/burst 与严格 JSON parameters 属于公共 LLM Client 配置。
 
 固定的业务顺序、Builtin 控制符集合、语义范围、严格响应协议和事务承诺不是调优项，不转化为可选配置。
 
@@ -335,12 +335,12 @@ LanguageText
 计算。它证明一份最终译文对应以下完整语义：
 
 - 源/目标语言对、当前源语言判定/残留/修复策略及精确 system prompt；
-- 公共 Client 的 endpoint、model 和规范 `request_body_extra`；
+- 公共 Client 的 URL、model 和规范 `parameters`；
 - owner、资产表、`unit_type`、字段名、exact 位置和原文；
 - 保护后文本、顺序一致的完整占位符绑定和本叶实际触发的术语；
 - 最终验收并恢复控制符后的译文全文。
 
-Profile ID、Client ID、Bearer、网络超时/限流/队列参数、
+Profile ID、Client ID、API key、网络超时/限流/队列参数、
 `max_message_characters`、group 位置、语义 scope 以及兄弟叶上下文不进入 state。
 规范 JSON 对象键序和数字表示先统一后哈希，配置中的空白或对象书写顺序不制造状态
 变化。已有 translation 参与重算；只有重算值与持久 state 相等才是 Current。
@@ -390,7 +390,7 @@ Planner 固定先保护占位符，再把普通文本与保护区投影为 `Lang
 `LlmRequestExecutor` 是单次、非流式、单 choice、无自动重试的根契约。它返回原始 content、finish reason、可选的 HTTP `x-request-id`、正文 completion ID 和可选 usage，并将错误区分为 Retryable 与 Fatal；可恢复错误可以携带 `Retry-After`。HTTP 请求身份与模型响应身份不互相冒充。
 
 MZ 只向这个公共契约提交完整 messages。根固定加入公共 Client 的 `model` 与
-`stream=false`；除此之外只透传该 Client 的 `request_body_extra`，MZ 不另行注入
+`stream=false`；除此之外只透传该 Client 的 `parameters`，MZ 不另行注入
 `n`、token 上限或供应商参数。
 
 `MzStandardTranslationTaskExecutionService`：
