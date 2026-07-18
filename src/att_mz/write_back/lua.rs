@@ -16,6 +16,7 @@ use crate::att_mz::lua::{
 };
 use crate::att_mz::project::MzWriteBackLayoutProfile;
 use crate::att_mz::project::OpenedProject;
+use crate::execution::OperationCompletion;
 use crate::storage::file_system::{
     BoundScopedDirectory, ScopedDirectoryBindError, ScopedDirectoryEditError,
     ScopedDirectoryEditor, ScopedDirectoryEntryKind, ScopedDirectoryPath, StagedDirectory,
@@ -60,7 +61,8 @@ where
         project: &OpenedProject,
         candidate: &C,
         script_path: PathBuf,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl std::future::Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send
+    {
         let prepared = if !candidate.belongs_to(project) {
             Err(LuaWriteBackServiceError::CandidateProjectMismatch {
                 project_root: project.workspace_root().to_path_buf(),
@@ -71,7 +73,7 @@ where
             let candidate_root = candidate.candidate_root().to_path_buf();
             let bind = self
                 .editor
-                .bind_scoped_directory(candidate.staged_directory());
+                .bind_scoped_directory(candidate.staged_directory(), super::mz_output_scope());
             let editor = Arc::clone(&self.editor);
             let layout_profile = *project.layout_profile();
             Ok((
@@ -103,13 +105,16 @@ where
                 });
             let invocation = LuaInvocation::write_back(script_path, project, calls);
             match self.host.execute(invocation).await {
-                Ok(TrustedLuaExecutionOutcome::Empty) => Ok(()),
-                Ok(TrustedLuaExecutionOutcome::ExtractIntent(_)) => {
-                    Err(LuaWriteBackServiceError::UnexpectedOutcome {
-                        script_path: error_path,
-                        candidate_root,
-                    })
+                Ok(OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty)) => {
+                    Ok(OperationCompletion::Completed(()))
                 }
+                Ok(OperationCompletion::Cancelled) => Ok(OperationCompletion::Cancelled),
+                Ok(OperationCompletion::Completed(TrustedLuaExecutionOutcome::ExtractIntent(
+                    _,
+                ))) => Err(LuaWriteBackServiceError::UnexpectedOutcome {
+                    script_path: error_path,
+                    candidate_root,
+                }),
                 Err(source) => Err(LuaWriteBackServiceError::ExecuteHost {
                     script_path: error_path,
                     candidate_root,
@@ -289,6 +294,7 @@ where
 {
     let kind = match &error {
         ScopedDirectoryEditError::WrongEditorInstance => "wrong_editor_instance",
+        ScopedDirectoryEditError::OutsideScope { .. } => "outside_scope",
         ScopedDirectoryEditError::ScopeRootMutation { .. } => "scope_root_mutation",
         ScopedDirectoryEditError::NotFound { .. } => "not_found",
         ScopedDirectoryEditError::NotFile { .. } => "not_file",
@@ -405,6 +411,7 @@ mod tests {
     struct FakeHost {
         invocation: Arc<Mutex<Option<RecordedInvocation>>>,
         fail: bool,
+        cancelled: bool,
         unexpected_outcome: bool,
     }
 
@@ -415,7 +422,7 @@ mod tests {
         async fn execute(
             &self,
             invocation: LuaInvocation<Self::TranslationProfile>,
-        ) -> Result<TrustedLuaExecutionOutcome, Self::Error> {
+        ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
             let LuaInvocation::WriteBack {
                 script_path,
                 project,
@@ -431,12 +438,18 @@ mod tests {
             });
             if self.fail {
                 Err(FakeError)
+            } else if self.cancelled {
+                Ok(OperationCompletion::Cancelled)
             } else if self.unexpected_outcome {
-                Ok(TrustedLuaExecutionOutcome::ExtractIntent(
-                    crate::att_mz::lua::runtime::TrustedLuaExtractIntent::Deactivate,
+                Ok(OperationCompletion::Completed(
+                    TrustedLuaExecutionOutcome::ExtractIntent(
+                        crate::att_mz::lua::runtime::TrustedLuaExtractIntent::Deactivate,
+                    ),
                 ))
             } else {
-                Ok(TrustedLuaExecutionOutcome::Empty)
+                Ok(OperationCompletion::Completed(
+                    TrustedLuaExecutionOutcome::Empty,
+                ))
             }
         }
     }
@@ -476,6 +489,7 @@ mod tests {
         fn bind_scoped_directory(
             &self,
             candidate: &StagedDirectory<Self::CandidateState>,
+            scope: crate::storage::file_system::ScopedDirectoryScope,
         ) -> impl std::future::Future<
             Output = Result<
                 BoundScopedDirectory<Self::ScopeState>,
@@ -487,7 +501,7 @@ mod tests {
             std::future::ready(if self.bind_fail {
                 Err(ScopedDirectoryBindError::CandidateIdentityChanged { root })
             } else {
-                Ok(BoundScopedDirectory::new(root, ()))
+                Ok(BoundScopedDirectory::new(root, scope, ()))
             })
         }
 
@@ -514,6 +528,18 @@ mod tests {
             &self,
             _scope: &BoundScopedDirectory<Self::ScopeState>,
             _path: ScopedDirectoryPath,
+        ) -> impl std::future::Future<
+            Output = Result<
+                Vec<crate::storage::file_system::ScopedDirectoryEntry>,
+                ScopedDirectoryEditError<Self::Error>,
+            >,
+        > + Send {
+            std::future::ready(Ok(Vec::new()))
+        }
+
+        fn list_scoped_root(
+            &self,
+            _scope: &BoundScopedDirectory<Self::ScopeState>,
         ) -> impl std::future::Future<
             Output = Result<
                 Vec<crate::storage::file_system::ScopedDirectoryEntry>,
@@ -609,6 +635,7 @@ mod tests {
             FakeHost {
                 invocation: Arc::clone(&recorded),
                 fail: false,
+                cancelled: false,
                 unexpected_outcome: false,
             },
             FakeEditor::default(),
@@ -643,12 +670,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_is_propagated_as_a_normal_write_back_result() {
+        let service = LuaWriteBackService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                cancelled: true,
+                unexpected_outcome: false,
+            },
+            FakeEditor::default(),
+        );
+        let project = project("alice");
+
+        let completion = service
+            .run(&project, &candidate(&project), PathBuf::from("write.lua"))
+            .await
+            .expect("Lua 取消应是正常结果");
+
+        assert_eq!(completion, OperationCompletion::Cancelled);
+    }
+
+    #[tokio::test]
     async fn rejects_a_candidate_from_another_project_before_host() {
         let recorded = Arc::new(Mutex::new(None));
         let service = LuaWriteBackService::new(
             FakeHost {
                 invocation: Arc::clone(&recorded),
                 fail: false,
+                cancelled: false,
                 unexpected_outcome: false,
             },
             FakeEditor::default(),
@@ -678,6 +727,7 @@ mod tests {
             FakeHost {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: true,
+                cancelled: false,
                 unexpected_outcome: false,
             },
             FakeEditor::default(),
@@ -715,6 +765,7 @@ mod tests {
             FakeHost {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: false,
+                cancelled: false,
                 unexpected_outcome: false,
             },
             FakeEditor::default(),
@@ -730,6 +781,7 @@ mod tests {
             FakeHost {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: false,
+                cancelled: false,
                 unexpected_outcome: true,
             },
             FakeEditor::default(),
@@ -754,6 +806,7 @@ mod tests {
             FakeHost {
                 invocation: Arc::clone(&recorded),
                 fail: false,
+                cancelled: false,
                 unexpected_outcome: false,
             },
             FakeEditor { bind_fail: true },
@@ -778,6 +831,7 @@ mod tests {
             editor: Arc::new(FakeEditor::default()),
             scope: Arc::new(BoundScopedDirectory::new(
                 PathBuf::from("C:/projects/alice/.write_back-stage"),
+                super::super::mz_output_scope(),
                 (),
             )),
             layout_profile: MzWriteBackLayoutProfile::new(width(3), width(2), width(2)),

@@ -1,6 +1,5 @@
 //! `rusqlite` 生产存储根。
 
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -9,7 +8,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -21,10 +20,10 @@ use tokio::sync::oneshot;
 
 use crate::att_mz::lua::session::{
     OpenSqliteInteractiveSessionError, OpenedSqliteInteractiveSession,
-    SqliteInteractiveConnectionCloseOutcome, SqliteInteractiveRollbackOutcome,
     SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
-    SqliteInteractiveSessionFinalizationReport, SqliteInteractiveSessionFinalizer,
-    SqliteInteractiveSessionOperations, SqliteInteractiveTransactionObservation,
+    SqliteInteractiveSessionFinalization, SqliteInteractiveSessionFinalizationError,
+    SqliteInteractiveSessionFinalizationFailure, SqliteInteractiveSessionFinalizer,
+    SqliteInteractiveSessionOperations,
 };
 use crate::runtime::windows::{
     FileIdentity, WindowsFsError, delete_regular_file_if_identity, pin_directory_without_reparse,
@@ -89,9 +88,6 @@ pub(crate) struct RusqliteStorageConfiguration {
     short_worker_threads: NonZeroUsize,
     short_queue_capacity: NonZeroUsize,
     max_open_connections: NonZeroUsize,
-    max_interactive_sessions: NonZeroUsize,
-    interactive_open_queue_capacity: NonZeroUsize,
-    interactive_command_queue_capacity: NonZeroUsize,
     worker_stack_bytes: NonZeroUsize,
     max_statement_bytes: NonZeroUsize,
     max_parameter_bytes: NonZeroUsize,
@@ -108,9 +104,6 @@ impl RusqliteStorageConfiguration {
         short_worker_threads: NonZeroUsize,
         short_queue_capacity: NonZeroUsize,
         max_open_connections: NonZeroUsize,
-        max_interactive_sessions: NonZeroUsize,
-        interactive_open_queue_capacity: NonZeroUsize,
-        interactive_command_queue_capacity: NonZeroUsize,
         worker_stack_bytes: NonZeroUsize,
         max_statement_bytes: NonZeroUsize,
         max_parameter_bytes: NonZeroUsize,
@@ -120,16 +113,6 @@ impl RusqliteStorageConfiguration {
         journal_mode: SqliteJournalMode,
         synchronous: SqliteSynchronous,
     ) -> Result<Self, SqliteRuntimeError> {
-        if max_open_connections.get() < 2 {
-            return Err(SqliteRuntimeError::InvalidConfiguration(
-                "max_open_connections 必须至少为 2，以原子容纳 SQLite online backup 的源与目标连接",
-            ));
-        }
-        if max_interactive_sessions > max_open_connections {
-            return Err(SqliteRuntimeError::InvalidConfiguration(
-                "max_interactive_sessions 不得大于 max_open_connections",
-            ));
-        }
         if busy_timeout.is_zero() {
             return Err(SqliteRuntimeError::InvalidConfiguration(
                 "busy_timeout_ms 必须大于零",
@@ -140,9 +123,6 @@ impl RusqliteStorageConfiguration {
             short_worker_threads,
             short_queue_capacity,
             max_open_connections,
-            max_interactive_sessions,
-            interactive_open_queue_capacity,
-            interactive_command_queue_capacity,
             worker_stack_bytes,
             max_statement_bytes,
             max_parameter_bytes,
@@ -159,7 +139,13 @@ impl RusqliteStorageConfiguration {
 #[derive(Debug)]
 pub(crate) enum SqliteRuntimeError {
     InvalidConfiguration(&'static str),
+    InsufficientConnectionCapacity {
+        operation: &'static str,
+        required: usize,
+        configured: usize,
+    },
     Closed,
+    InteractiveSessionAlreadyOpen,
     WorkerSpawn {
         worker: String,
         source: io::Error,
@@ -224,7 +210,18 @@ impl fmt::Display for SqliteRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfiguration(reason) => write!(formatter, "SQLite 配置无效：{reason}"),
+            Self::InsufficientConnectionCapacity {
+                operation,
+                required,
+                configured,
+            } => write!(
+                formatter,
+                "SQLite {operation} 需要同时占用 {required} 个连接，但当前连接上限为 {configured}"
+            ),
             Self::Closed => formatter.write_str("SQLite 存储根已经关闭"),
+            Self::InteractiveSessionAlreadyOpen => {
+                formatter.write_str("当前 SQLite 存储根已有活动交互会话")
+            }
             Self::WorkerSpawn { worker, source } => {
                 write!(formatter, "无法启动 SQLite 工作线程 {worker}：{source}")
             }
@@ -287,7 +284,9 @@ impl Error for SqliteRuntimeError {
             Self::Driver { source, .. } => Some(source),
             Self::Cleanup { primary, .. } => Some(primary),
             Self::InvalidConfiguration(_)
+            | Self::InsufficientConnectionCapacity { .. }
             | Self::Closed
+            | Self::InteractiveSessionAlreadyOpen
             | Self::WorkerPanicked(_)
             | Self::InvalidTarget { .. }
             | Self::UnexpectedArtifact { .. }
@@ -666,7 +665,7 @@ fn validate_transaction_plan(
                     validate_parameters(parameters, config)?;
                 }
             }
-            SqliteTransactionStep::RequireNoRows { query, .. } => {
+            SqliteTransactionStep::RequireNoRows(query) => {
                 validate_query(query, config)?;
             }
         }
@@ -746,7 +745,7 @@ fn run_transaction(
                 }
                 result
             })(),
-            SqliteTransactionStep::RequireNoRows { check_id, query } => {
+            SqliteTransactionStep::RequireNoRows(query) => {
                 let exists = (|| {
                     let parameters = owned_driver_values(query.parameters());
                     let mut statement = connection
@@ -761,9 +760,7 @@ fn run_transaction(
                     Ok(true) => {
                         return match connection.execute_batch("ROLLBACK") {
                             Ok(()) if connection.is_autocommit() => {
-                                Err(ExecuteTransactionError::RequirementFailed {
-                                    check_id: check_id.clone(),
-                                })
+                                Err(ExecuteTransactionError::RequirementFailed)
                             }
                             Ok(()) => Err(ExecuteTransactionError::OutcomeUnknown(
                                 SqliteRuntimeError::Internal("事务条件失败回滚后仍非 autocommit"),
@@ -1590,60 +1587,61 @@ fn process_interactive_command(
     }
 }
 
-type InteractiveFinalizationReport = SqliteInteractiveSessionFinalizationReport<SqliteRuntimeError>;
+type InteractiveFinalizationResult = Result<
+    SqliteInteractiveSessionFinalization,
+    SqliteInteractiveSessionFinalizationError<SqliteRuntimeError>,
+>;
 
 fn finalize_interactive_connection(
     connection: Connection,
-    transaction: InteractiveTransactionState,
     lifecycle: &AtomicU8,
-) -> InteractiveFinalizationReport {
-    let observation = match transaction {
-        InteractiveTransactionState::Idle => SqliteInteractiveTransactionObservation::Idle,
-        InteractiveTransactionState::Active => SqliteInteractiveTransactionObservation::Active,
-        InteractiveTransactionState::Indeterminate => {
-            SqliteInteractiveTransactionObservation::Indeterminate
-        }
-    };
-    let rollback = if connection.is_autocommit() {
-        SqliteInteractiveRollbackOutcome::NotRequired
-    } else {
+) -> InteractiveFinalizationResult {
+    let had_unclosed_transaction = !connection.is_autocommit();
+    let primary = if had_unclosed_transaction {
         match connection.execute_batch("ROLLBACK") {
-            Ok(()) if connection.is_autocommit() => SqliteInteractiveRollbackOutcome::RolledBack,
-            Ok(()) => SqliteInteractiveRollbackOutcome::OutcomeUnknown(
+            Ok(()) if connection.is_autocommit() => None,
+            Ok(()) => Some(SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(
                 SqliteRuntimeError::Internal("回滚成功后交互式连接仍非 autocommit"),
-            ),
+            )),
             Err(source) if connection.is_autocommit() => {
-                SqliteInteractiveRollbackOutcome::OutcomeUnknown(SqliteRuntimeError::driver(
-                    "终结交互式事务",
-                    source,
+                Some(SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(
+                    SqliteRuntimeError::driver("终结交互式事务", source),
                 ))
             }
-            Err(source) => SqliteInteractiveRollbackOutcome::Failed(SqliteRuntimeError::driver(
-                "终结交互式事务",
-                source,
+            Err(source) => Some(SqliteInteractiveSessionFinalizationFailure::CleanupFailed(
+                SqliteRuntimeError::driver("终结交互式事务", source),
             )),
         }
+    } else {
+        None
     };
-    let connection = match connection.close() {
-        Ok(()) => SqliteInteractiveConnectionCloseOutcome::Closed,
-        Err((_connection, source)) => SqliteInteractiveConnectionCloseOutcome::Failed(
-            SqliteRuntimeError::driver("关闭交互式连接", source),
-        ),
+    let close_failure = match connection.close() {
+        Ok(()) => None,
+        Err((_connection, source)) => Some(SqliteRuntimeError::driver("关闭交互式连接", source)),
     };
     lifecycle.store(SESSION_CLOSED, Ordering::Release);
-    SqliteInteractiveSessionFinalizationReport::new(observation, rollback, connection)
+    match (primary, close_failure) {
+        (None, None) => Ok(SqliteInteractiveSessionFinalization::new(
+            had_unclosed_transaction,
+        )),
+        (None, Some(source)) => Err(SqliteInteractiveSessionFinalizationError::new(
+            SqliteInteractiveSessionFinalizationFailure::CleanupFailed(source),
+            None,
+        )),
+        (Some(primary), connection_close) => Err(SqliteInteractiveSessionFinalizationError::new(
+            primary,
+            connection_close,
+        )),
+    }
 }
 
-fn panicked_finalization_report() -> InteractiveFinalizationReport {
-    SqliteInteractiveSessionFinalizationReport::new(
-        SqliteInteractiveTransactionObservation::Unavailable(SqliteRuntimeError::WorkerPanicked(
-            "交互式 actor",
-        )),
-        SqliteInteractiveRollbackOutcome::NotAttempted,
-        SqliteInteractiveConnectionCloseOutcome::OutcomeUnknown(
+fn panicked_finalization_result() -> InteractiveFinalizationResult {
+    Err(SqliteInteractiveSessionFinalizationError::new(
+        SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(
             SqliteRuntimeError::WorkerPanicked("交互式 actor"),
         ),
-    )
+        None,
+    ))
 }
 
 fn run_interactive_actor(
@@ -1653,7 +1651,7 @@ fn run_interactive_actor(
     control: mpsc::Receiver<()>,
     lifecycle: Arc<AtomicU8>,
     _connection_permit: PoolPermit,
-) -> InteractiveFinalizationReport {
+) -> InteractiveFinalizationResult {
     let mut transaction = if connection.is_autocommit() {
         InteractiveTransactionState::Idle
     } else {
@@ -1663,68 +1661,94 @@ fn run_interactive_actor(
         process_interactive_command(&connection, &config, &mut transaction, &lifecycle, command);
     }
     let _ = control.recv();
-    finalize_interactive_connection(connection, transaction, &lifecycle)
+    finalize_interactive_connection(connection, &lifecycle)
 }
 
-struct InteractiveSessionRegistryState {
+struct InteractiveSessionSlotState {
     accepting: bool,
-    active: BTreeMap<u64, Arc<InteractiveSessionControl>>,
+    opening: bool,
+    active: Option<Arc<InteractiveSessionControl>>,
 }
 
-struct InteractiveSessionRegistry {
-    state: Mutex<InteractiveSessionRegistryState>,
+struct InteractiveSessionSlot {
+    state: Mutex<InteractiveSessionSlotState>,
     changed: Condvar,
 }
 
-impl InteractiveSessionRegistry {
+impl InteractiveSessionSlot {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(InteractiveSessionRegistryState {
+            state: Mutex::new(InteractiveSessionSlotState {
                 accepting: true,
-                active: BTreeMap::new(),
+                opening: false,
+                active: None,
             }),
             changed: Condvar::new(),
         })
     }
 
-    fn is_accepting(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .accepting
-    }
-
-    fn register(&self, session_id: u64, control: Arc<InteractiveSessionControl>) -> bool {
+    fn begin_open(&self) -> Result<(), SqliteRuntimeError> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.accepting {
-            return false;
+            return Err(SqliteRuntimeError::Closed);
         }
-        let previous = state.active.insert(session_id, control);
-        debug_assert!(previous.is_none(), "SQLite session ID 必须唯一");
-        true
+        if state.opening || state.active.is_some() {
+            return Err(SqliteRuntimeError::InteractiveSessionAlreadyOpen);
+        }
+        state.opening = true;
+        Ok(())
     }
 
-    fn begin_shutdown(&self) -> Vec<Arc<InteractiveSessionControl>> {
+    fn complete_open(&self, control: Arc<InteractiveSessionControl>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.opening && state.active.is_none());
+        state.opening = false;
+        state.active = Some(control);
+        self.changed.notify_all();
+        state.accepting
+    }
+
+    fn abort_open(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.opening = false;
+        self.changed.notify_all();
+    }
+
+    fn recover_open_panic(&self) -> Option<Arc<InteractiveSessionControl>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.opening = false;
+        self.changed.notify_all();
+        state.active.clone()
+    }
+
+    fn complete(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = None;
+        self.changed.notify_all();
+    }
+
+    fn begin_shutdown(&self) -> Option<Arc<InteractiveSessionControl>> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.accepting = false;
-        state.active.values().cloned().collect()
-    }
-
-    fn complete(&self, session_id: u64) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.active.remove(&session_id);
-        if state.active.is_empty() {
-            self.changed.notify_all();
-        }
+        state.active.clone()
     }
 
     fn wait_until_empty(&self) {
@@ -1732,7 +1756,7 @@ impl InteractiveSessionRegistry {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !state.active.is_empty() {
+        while state.opening || state.active.is_some() {
             state = self
                 .changed
                 .wait(state)
@@ -1744,17 +1768,11 @@ impl InteractiveSessionRegistry {
 struct InteractiveFinalizationResources {
     command_receiver: async_channel::Receiver<InteractiveCommand>,
     control: mpsc::Sender<()>,
-    actor: JoinHandle<InteractiveFinalizationReport>,
-    report: oneshot::Sender<InteractiveFinalizationReport>,
-    session_permit: PoolPermit,
 }
 
 struct InteractiveSessionControl {
-    session_id: u64,
     lifecycle: Arc<AtomicU8>,
     resources: Mutex<Option<InteractiveFinalizationResources>>,
-    reaper: mpsc::Sender<ReaperJob>,
-    registry: Arc<InteractiveSessionRegistry>,
 }
 
 impl InteractiveSessionControl {
@@ -1770,52 +1788,6 @@ impl InteractiveSessionControl {
         self.lifecycle.store(SESSION_FINALIZING, Ordering::Release);
         resources.command_receiver.close();
         let _ = resources.control.send(());
-        let job = ReaperJob::Finalize {
-            control: Arc::clone(self),
-            actor: resources.actor,
-            report: resources.report,
-            session_permit: resources.session_permit,
-        };
-        if let Err(error) = self.reaper.send(job) {
-            complete_reaper_job(error.0);
-        }
-    }
-}
-
-enum ReaperJob {
-    Finalize {
-        control: Arc<InteractiveSessionControl>,
-        actor: JoinHandle<InteractiveFinalizationReport>,
-        report: oneshot::Sender<InteractiveFinalizationReport>,
-        session_permit: PoolPermit,
-    },
-    Shutdown,
-}
-
-fn complete_reaper_job(job: ReaperJob) {
-    let ReaperJob::Finalize {
-        control,
-        actor,
-        report,
-        session_permit,
-    } = job
-    else {
-        return;
-    };
-    let finalization = actor
-        .join()
-        .unwrap_or_else(|_| panicked_finalization_report());
-    let _ = report.send(finalization);
-    drop(session_permit);
-    control.registry.complete(control.session_id);
-}
-
-fn run_reaper(receiver: mpsc::Receiver<ReaperJob>) {
-    while let Ok(job) = receiver.recv() {
-        match job {
-            ReaperJob::Finalize { .. } => complete_reaper_job(job),
-            ReaperJob::Shutdown => break,
-        }
     }
 }
 
@@ -1914,11 +1886,11 @@ impl SqliteInteractiveSessionOperations for RusqliteInteractiveSessionOperations
 /// `rusqlite` 交互式会话的唯一终结令牌。
 pub(crate) struct RusqliteInteractiveSessionFinalizer {
     control: Arc<InteractiveSessionControl>,
-    report: Option<oneshot::Receiver<InteractiveFinalizationReport>>,
+    report: Option<oneshot::Receiver<InteractiveFinalizationResult>>,
 }
 
 impl RusqliteInteractiveSessionFinalizer {
-    fn initiate(&mut self) -> oneshot::Receiver<InteractiveFinalizationReport> {
+    fn initiate(&mut self) -> oneshot::Receiver<InteractiveFinalizationResult> {
         self.control.initiate();
         self.report.take().expect("终结令牌必须拥有唯一报告接收端")
     }
@@ -1927,12 +1899,12 @@ impl RusqliteInteractiveSessionFinalizer {
 impl SqliteInteractiveSessionFinalizer for RusqliteInteractiveSessionFinalizer {
     type Error = SqliteRuntimeError;
 
-    fn finalize(mut self) -> impl Future<Output = InteractiveFinalizationReport> + Send {
+    fn finalize(mut self) -> impl Future<Output = InteractiveFinalizationResult> + Send {
         let receiver = self.initiate();
         async move {
             receiver
                 .await
-                .unwrap_or_else(|_| panicked_finalization_report())
+                .unwrap_or_else(|_| panicked_finalization_result())
         }
     }
 }
@@ -1979,13 +1951,6 @@ enum ShortJob {
         #[cfg(test)]
         panic_after_operation: bool,
     },
-}
-
-struct OpenJob {
-    path: PathBuf,
-    response: oneshot::Sender<
-        Result<OpenedRusqliteSession, OpenSqliteInteractiveSessionError<SqliteRuntimeError>>,
-    >,
 }
 
 fn run_short_worker(
@@ -2085,27 +2050,12 @@ fn run_short_worker(
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "actor 必须一次取得全部唯一资源")]
 fn open_interactive_session(
     path: &Path,
     config: Arc<RusqliteStorageConfiguration>,
     connections: &Arc<PermitPool>,
-    sessions: &Arc<PermitPool>,
-    reaper: &mpsc::Sender<ReaperJob>,
-    registry: &Arc<InteractiveSessionRegistry>,
-    session_id: u64,
+    slot: Arc<InteractiveSessionSlot>,
 ) -> Result<OpenedRusqliteSession, OpenSqliteInteractiveSessionError<SqliteRuntimeError>> {
-    if !registry.is_accepting() {
-        return Err(OpenSqliteInteractiveSessionError::OpenFailed(
-            SqliteRuntimeError::Closed,
-        ));
-    }
-    let session_permit = sessions.acquire();
-    if !registry.is_accepting() {
-        return Err(OpenSqliteInteractiveSessionError::OpenFailed(
-            SqliteRuntimeError::Closed,
-        ));
-    }
     let connection_permit = connections.acquire();
     let connection = open_existing_read_write(path, &config).map_err(|error| match error {
         ExistingFileErrorOrRuntime::Existing(ExistingFileError::NotFound) => {
@@ -2127,56 +2077,64 @@ fn open_interactive_session(
             OpenSqliteInteractiveSessionError::OpenFailed(source)
         }
     })?;
-    let (command_sender, command_receiver) =
-        async_channel::bounded(config.interactive_command_queue_capacity.get());
+    let (command_sender, command_receiver) = async_channel::bounded(1);
     let actor_receiver = command_receiver.clone();
     let (control_sender, control_receiver) = mpsc::channel();
+    let (start_sender, start_receiver) = mpsc::sync_channel(0);
     let lifecycle = Arc::new(AtomicU8::new(SESSION_OPEN));
     let actor_lifecycle = Arc::clone(&lifecycle);
     let actor_config = Arc::clone(&config);
     let (report_sender, report_receiver) = oneshot::channel();
-    let actor = thread::Builder::new()
-        .name(format!("att-sqlite-session-{session_id}"))
-        .stack_size(config.worker_stack_bytes.get())
-        .spawn(move || {
-            run_interactive_actor(
-                connection,
-                actor_config,
-                actor_receiver,
-                control_receiver,
-                actor_lifecycle,
-                connection_permit,
-            )
-        })
-        .map_err(|source| {
-            OpenSqliteInteractiveSessionError::OpenFailed(SqliteRuntimeError::WorkerSpawn {
-                worker: format!("interactive-{session_id}"),
-                source,
-            })
-        })?;
-    let operations = Arc::new(RusqliteInteractiveSessionOperations {
-        commands: command_sender,
-        lifecycle: Arc::clone(&lifecycle),
-    });
     let control = Arc::new(InteractiveSessionControl {
-        session_id,
-        lifecycle,
+        lifecycle: Arc::clone(&lifecycle),
         resources: Mutex::new(Some(InteractiveFinalizationResources {
             command_receiver,
             control: control_sender,
-            actor,
-            report: report_sender,
-            session_permit,
         })),
-        reaper: reaper.clone(),
-        registry: Arc::clone(registry),
     });
-    if !registry.register(session_id, Arc::clone(&control)) {
+    let actor_slot = Arc::clone(&slot);
+    let actor = thread::Builder::new()
+        .name("att-sqlite-session".to_owned())
+        .stack_size(config.worker_stack_bytes.get())
+        .spawn(move || {
+            let result = if start_receiver.recv().is_err() {
+                panicked_finalization_result()
+            } else {
+                catch_unwind(AssertUnwindSafe(|| {
+                    run_interactive_actor(
+                        connection,
+                        actor_config,
+                        actor_receiver,
+                        control_receiver,
+                        actor_lifecycle,
+                        connection_permit,
+                    )
+                }))
+                .unwrap_or_else(|_| panicked_finalization_result())
+            };
+            actor_slot.complete();
+            let _ = report_sender.send(result);
+        })
+        .map_err(|source| {
+            OpenSqliteInteractiveSessionError::OpenFailed(SqliteRuntimeError::WorkerSpawn {
+                worker: "interactive".to_owned(),
+                source,
+            })
+        })?;
+    // actor 自行上报终态并释放唯一会话槽，不需要第二个回收线程持有 join handle。
+    drop(actor);
+    let accepted = slot.complete_open(Arc::clone(&control));
+    let _ = start_sender.send(());
+    if !accepted {
         control.initiate();
         return Err(OpenSqliteInteractiveSessionError::OpenFailed(
             SqliteRuntimeError::Closed,
         ));
     }
+    let operations = Arc::new(RusqliteInteractiveSessionOperations {
+        commands: command_sender,
+        lifecycle: Arc::clone(&lifecycle),
+    });
     let finalizer = RusqliteInteractiveSessionFinalizer {
         control,
         report: Some(report_receiver),
@@ -2184,57 +2142,20 @@ fn open_interactive_session(
     Ok(OpenedSqliteInteractiveSession::new(operations, finalizer))
 }
 
-fn run_open_worker(
-    receiver: async_channel::Receiver<OpenJob>,
-    config: Arc<RusqliteStorageConfiguration>,
-    connections: Arc<PermitPool>,
-    sessions: Arc<PermitPool>,
-    reaper: mpsc::Sender<ReaperJob>,
-    registry: Arc<InteractiveSessionRegistry>,
-    next_session_id: Arc<AtomicU64>,
-) {
-    while let Ok(job) = receiver.recv_blocking() {
-        let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            open_interactive_session(
-                &job.path,
-                Arc::clone(&config),
-                &connections,
-                &sessions,
-                &reaper,
-                &registry,
-                session_id,
-            )
-        }))
-        .unwrap_or_else(|_| {
-            Err(OpenSqliteInteractiveSessionError::OpenFailed(
-                SqliteRuntimeError::WorkerPanicked("交互式打开"),
-            ))
-        });
-        let _ = job.response.send(result);
-    }
-}
-
 struct RusqliteStorageInner {
     config: Arc<RusqliteStorageConfiguration>,
     accepting: AtomicBool,
     lifecycle: AtomicU8,
     short_sender: async_channel::Sender<ShortJob>,
-    open_sender: async_channel::Sender<OpenJob>,
     short_workers: Mutex<Option<Vec<JoinHandle<()>>>>,
-    open_worker: Mutex<Option<JoinHandle<()>>>,
-    reaper_sender: mpsc::Sender<ReaperJob>,
-    reaper_worker: Mutex<Option<JoinHandle<()>>>,
     connections: Arc<PermitPool>,
-    sessions: Arc<PermitPool>,
-    interactive_sessions: Arc<InteractiveSessionRegistry>,
+    interactive_session: Arc<InteractiveSessionSlot>,
 }
 
 impl Drop for RusqliteStorageInner {
     fn drop(&mut self) {
         self.accepting.store(false, Ordering::Release);
         self.short_sender.close();
-        self.open_sender.close();
         if self.lifecycle.load(Ordering::Acquire) == STORAGE_CLOSED {
             return;
         }
@@ -2245,27 +2166,14 @@ impl Drop for RusqliteStorageInner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap_or_default();
-        let open_worker = self
-            .open_worker
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let reaper_worker = self
-            .reaper_worker
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if short_workers.is_empty() && open_worker.is_none() && reaper_worker.is_none() {
+        if short_workers.is_empty() {
             return;
         }
         let connections = Arc::clone(&self.connections);
-        let sessions = Arc::clone(&self.sessions);
-        let interactive_sessions = Arc::clone(&self.interactive_sessions);
-        let controls = interactive_sessions.begin_shutdown();
-        for control in controls {
+        let interactive_session = Arc::clone(&self.interactive_session);
+        if let Some(control) = interactive_session.begin_shutdown() {
             control.initiate();
         }
-        let reaper = self.reaper_sender.clone();
         let stack_size = self.config.worker_stack_bytes.get();
         let _ = thread::Builder::new()
             .name("att-sqlite-drop-shutdown".to_owned())
@@ -2274,16 +2182,8 @@ impl Drop for RusqliteStorageInner {
                 for worker in short_workers {
                     let _ = worker.join();
                 }
-                if let Some(worker) = open_worker {
-                    let _ = worker.join();
-                }
-                interactive_sessions.wait_until_empty();
+                interactive_session.wait_until_empty();
                 connections.wait_until_empty();
-                sessions.wait_until_empty();
-                let _ = reaper.send(ReaperJob::Shutdown);
-                if let Some(worker) = reaper_worker {
-                    let _ = worker.join();
-                }
             });
     }
 }
@@ -2298,21 +2198,9 @@ impl RusqliteStorage {
     pub(crate) fn start(config: RusqliteStorageConfiguration) -> Result<Self, SqliteRuntimeError> {
         let config = Arc::new(config);
         let connections = PermitPool::new(config.max_open_connections);
-        let sessions = PermitPool::new(config.max_interactive_sessions);
-        let interactive_sessions = InteractiveSessionRegistry::new();
+        let interactive_session = InteractiveSessionSlot::new();
         let (short_sender, short_receiver) =
             async_channel::bounded(config.short_queue_capacity.get());
-        let (open_sender, open_receiver) =
-            async_channel::bounded(config.interactive_open_queue_capacity.get());
-        let (reaper_sender, reaper_receiver) = mpsc::channel();
-        let reaper_worker = thread::Builder::new()
-            .name("att-sqlite-reaper".to_owned())
-            .stack_size(config.worker_stack_bytes.get())
-            .spawn(move || run_reaper(reaper_receiver))
-            .map_err(|source| SqliteRuntimeError::WorkerSpawn {
-                worker: "reaper".to_owned(),
-                source,
-            })?;
 
         let mut short_workers: Vec<JoinHandle<()>> =
             Vec::with_capacity(config.short_worker_threads.get());
@@ -2328,12 +2216,9 @@ impl RusqliteStorage {
                 Ok(worker) => worker,
                 Err(source) => {
                     short_sender.close();
-                    open_sender.close();
                     for worker in short_workers {
                         let _ = worker.join();
                     }
-                    let _ = reaper_sender.send(ReaperJob::Shutdown);
-                    let _ = reaper_worker.join();
                     return Err(SqliteRuntimeError::WorkerSpawn {
                         worker: format!("short-{index}"),
                         source,
@@ -2343,56 +2228,15 @@ impl RusqliteStorage {
             short_workers.push(worker);
         }
 
-        let open_config = Arc::clone(&config);
-        let open_connections = Arc::clone(&connections);
-        let open_sessions = Arc::clone(&sessions);
-        let open_interactive_sessions = Arc::clone(&interactive_sessions);
-        let open_reaper = reaper_sender.clone();
-        let next_session_id = Arc::new(AtomicU64::new(1));
-        let open_worker = match thread::Builder::new()
-            .name("att-sqlite-open".to_owned())
-            .stack_size(config.worker_stack_bytes.get())
-            .spawn(move || {
-                run_open_worker(
-                    open_receiver,
-                    open_config,
-                    open_connections,
-                    open_sessions,
-                    open_reaper,
-                    open_interactive_sessions,
-                    next_session_id,
-                )
-            }) {
-            Ok(worker) => worker,
-            Err(source) => {
-                short_sender.close();
-                open_sender.close();
-                for worker in short_workers {
-                    let _ = worker.join();
-                }
-                let _ = reaper_sender.send(ReaperJob::Shutdown);
-                let _ = reaper_worker.join();
-                return Err(SqliteRuntimeError::WorkerSpawn {
-                    worker: "interactive-open".to_owned(),
-                    source,
-                });
-            }
-        };
-
         Ok(Self {
             inner: Arc::new(RusqliteStorageInner {
                 config,
                 accepting: AtomicBool::new(true),
                 lifecycle: AtomicU8::new(STORAGE_RUNNING),
                 short_sender,
-                open_sender,
                 short_workers: Mutex::new(Some(short_workers)),
-                open_worker: Mutex::new(Some(open_worker)),
-                reaper_sender,
-                reaper_worker: Mutex::new(Some(reaper_worker)),
                 connections,
-                sessions,
-                interactive_sessions,
+                interactive_session,
             }),
         })
     }
@@ -2422,9 +2266,7 @@ impl RusqliteStorage {
         }
         self.inner.accepting.store(false, Ordering::Release);
         self.inner.short_sender.close();
-        self.inner.open_sender.close();
-        let controls = self.inner.interactive_sessions.begin_shutdown();
-        for control in controls {
+        if let Some(control) = self.inner.interactive_session.begin_shutdown() {
             control.initiate();
         }
         let short_workers = self
@@ -2434,18 +2276,6 @@ impl RusqliteStorage {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap_or_default();
-        let open_worker = self
-            .inner
-            .open_worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let reaper_worker = self
-            .inner
-            .reaper_worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
         let inner = Arc::clone(&self.inner);
         let (response, receiver) = oneshot::channel();
         thread::Builder::new()
@@ -2456,16 +2286,8 @@ impl RusqliteStorage {
                 for worker in short_workers {
                     panic |= worker.join().is_err();
                 }
-                if let Some(worker) = open_worker {
-                    panic |= worker.join().is_err();
-                }
-                inner.interactive_sessions.wait_until_empty();
+                inner.interactive_session.wait_until_empty();
                 inner.connections.wait_until_empty();
-                inner.sessions.wait_until_empty();
-                let _ = inner.reaper_sender.send(ReaperJob::Shutdown);
-                if let Some(worker) = reaper_worker {
-                    panic |= worker.join().is_err();
-                }
                 inner.lifecycle.store(STORAGE_CLOSED, Ordering::Release);
                 let result = if panic {
                     Err(SqliteRuntimeError::WorkerPanicked("shutdown"))
@@ -2526,8 +2348,18 @@ impl SqliteDatabaseSnapshotter for RusqliteStorage {
     ) -> impl Future<Output = Result<(), SnapshotDatabaseError<Self::Error>>> + Send {
         let sender = self.inner.short_sender.clone();
         let accepting = self.ensure_accepting();
+        let configured_connection_capacity = self.inner.config.max_open_connections.get();
         async move {
             accepting.map_err(SnapshotDatabaseError::NotCreated)?;
+            if configured_connection_capacity < 2 {
+                return Err(SnapshotDatabaseError::NotCreated(
+                    SqliteRuntimeError::InsufficientConnectionCapacity {
+                        operation: "online backup",
+                        required: 2,
+                        configured: configured_connection_capacity,
+                    },
+                ));
+            }
             let (response, receiver) = oneshot::channel();
             sender
                 .send(ShortJob::Snapshot {
@@ -2625,14 +2457,54 @@ impl SqliteInteractiveSessionFactory for RusqliteStorage {
             OpenSqliteInteractiveSessionError<Self::Error>,
         >,
     > + Send {
-        let sender = self.inner.open_sender.clone();
         let accepting = self.ensure_accepting();
+        let config = Arc::clone(&self.inner.config);
+        let connections = Arc::clone(&self.inner.connections);
+        let slot = Arc::clone(&self.inner.interactive_session);
         async move {
             accepting.map_err(OpenSqliteInteractiveSessionError::OpenFailed)?;
+            slot.begin_open()
+                .map_err(OpenSqliteInteractiveSessionError::OpenFailed)?;
             let (response, receiver) = oneshot::channel();
-            sender.send(OpenJob { path, response }).await.map_err(|_| {
-                OpenSqliteInteractiveSessionError::OpenFailed(SqliteRuntimeError::Closed)
-            })?;
+            let worker_slot = Arc::clone(&slot);
+            if let Err(source) = thread::Builder::new()
+                .name("att-sqlite-open".to_owned())
+                .stack_size(config.worker_stack_bytes.get())
+                .spawn(move || {
+                    let result = match catch_unwind(AssertUnwindSafe(|| {
+                        open_interactive_session(
+                            &path,
+                            config,
+                            &connections,
+                            Arc::clone(&worker_slot),
+                        )
+                    })) {
+                        Ok(result) => {
+                            if result.is_err() {
+                                worker_slot.abort_open();
+                            }
+                            result
+                        }
+                        Err(_) => {
+                            if let Some(control) = worker_slot.recover_open_panic() {
+                                control.initiate();
+                            }
+                            Err(OpenSqliteInteractiveSessionError::OpenFailed(
+                                SqliteRuntimeError::WorkerPanicked("交互式打开"),
+                            ))
+                        }
+                    };
+                    let _ = response.send(result);
+                })
+            {
+                slot.abort_open();
+                return Err(OpenSqliteInteractiveSessionError::OpenFailed(
+                    SqliteRuntimeError::WorkerSpawn {
+                        worker: "interactive-open".to_owned(),
+                        source,
+                    },
+                ));
+            }
             receiver
                 .await
                 .unwrap_or(Err(OpenSqliteInteractiveSessionError::OpenFailed(
@@ -2647,7 +2519,7 @@ mod tests {
     use super::*;
     use std::task::{Context, Poll};
 
-    use crate::storage::sqlite::{SqliteBatch, SqliteCheckId};
+    use crate::storage::sqlite::SqliteBatch;
     use futures_util::task::noop_waker_ref;
 
     struct TestDirectory(PathBuf);
@@ -2711,14 +2583,13 @@ mod tests {
         (response_receiver, entered_receiver, release_sender)
     }
 
-    fn configuration() -> RusqliteStorageConfiguration {
+    fn configuration_with_max_open_connections(
+        max_open_connections: usize,
+    ) -> RusqliteStorageConfiguration {
         RusqliteStorageConfiguration::new(
             nonzero(2),
             nonzero(8),
-            nonzero(4),
-            nonzero(2),
-            nonzero(4),
-            nonzero(4),
+            nonzero(max_open_connections),
             nonzero(1024 * 1024),
             nonzero(64 * 1024),
             nonzero(64 * 1024),
@@ -2729,6 +2600,10 @@ mod tests {
             SqliteSynchronous::Full,
         )
         .expect("测试配置应合法")
+    }
+
+    fn configuration() -> RusqliteStorageConfiguration {
+        configuration_with_max_open_connections(4)
     }
 
     fn schema_commands() -> Vec<SqliteCommand> {
@@ -2780,27 +2655,38 @@ mod tests {
     }
 
     #[test]
-    fn configuration_reserves_two_connections_for_online_backup() {
-        let error = RusqliteStorageConfiguration::new(
-            nonzero(1),
-            nonzero(1),
-            nonzero(1),
-            nonzero(1),
-            nonzero(1),
-            nonzero(1),
-            nonzero(1024 * 1024),
-            nonzero(64 * 1024),
-            nonzero(64 * 1024),
-            nonzero(100),
-            nonzero(1024 * 1024),
-            Duration::from_secs(1),
-            SqliteJournalMode::Delete,
-            SqliteSynchronous::Full,
-        )
-        .expect_err("online backup 需要同时占用两个连接许可");
+    fn configuration_accepts_one_connection_for_non_snapshot_operations() {
+        let configuration = configuration_with_max_open_connections(1);
 
-        assert!(matches!(error, SqliteRuntimeError::InvalidConfiguration(_)));
-        assert!(error.to_string().contains("至少为 2"));
+        assert_eq!(configuration.max_open_connections, nonzero(1));
+    }
+
+    #[tokio::test]
+    async fn online_backup_rejects_insufficient_connection_capacity_without_waiting() {
+        let directory = TestDirectory::new();
+        let source = directory.database("single-connection-source.db");
+        let destination = directory.database("single-connection-snapshot.db");
+        let storage = RusqliteStorage::start(configuration_with_max_open_connections(1))
+            .expect("单连接存储根应可启动");
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            storage.snapshot_database(source, destination.clone()),
+        )
+        .await
+        .expect("连接容量不足必须在入队前立即返回")
+        .expect_err("单连接无法执行 online backup");
+
+        assert!(matches!(
+            error,
+            SnapshotDatabaseError::NotCreated(SqliteRuntimeError::InsufficientConnectionCapacity {
+                operation: "online backup",
+                required: 2,
+                configured: 1,
+            })
+        ));
+        assert!(!destination.exists());
+        storage.shutdown().await.expect("根应可关闭");
     }
 
     #[tokio::test]
@@ -3163,7 +3049,6 @@ mod tests {
             .await
             .expect("数据库应可创建");
 
-        let check_id = SqliteCheckId::new("duplicate");
         let result = storage
             .execute_transaction(
                 database.clone(),
@@ -3172,13 +3057,10 @@ mod tests {
                         "INSERT INTO values_table (id) VALUES (1)",
                         Vec::new(),
                     )),
-                    SqliteTransactionStep::RequireNoRows {
-                        check_id: check_id.clone(),
-                        query: SqliteQuery::new(
-                            "SELECT 1 FROM values_table WHERE id = 1",
-                            Vec::new(),
-                        ),
-                    },
+                    SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
+                        "SELECT 1 FROM values_table WHERE id = 1",
+                        Vec::new(),
+                    )),
                     SqliteTransactionStep::Execute(SqliteCommand::new(
                         "INSERT INTO values_table (id) VALUES (2)",
                         Vec::new(),
@@ -3188,8 +3070,7 @@ mod tests {
             .await;
         assert!(matches!(
             result,
-            Err(ExecuteTransactionError::RequirementFailed { check_id: actual })
-                if actual == check_id
+            Err(ExecuteTransactionError::RequirementFailed)
         ));
         let rows = storage
             .query_existing_database(
@@ -3228,19 +3109,8 @@ mod tests {
             ))
             .await
             .expect("应在同一事务中执行");
-        let report = finalizer.finalize().await;
-        assert!(matches!(
-            report.transaction(),
-            SqliteInteractiveTransactionObservation::Active
-        ));
-        assert!(matches!(
-            report.rollback(),
-            SqliteInteractiveRollbackOutcome::RolledBack
-        ));
-        assert!(matches!(
-            report.connection(),
-            SqliteInteractiveConnectionCloseOutcome::Closed
-        ));
+        let report = finalizer.finalize().await.expect("会话应可终结");
+        assert!(report.had_unclosed_transaction());
         assert!(matches!(
             operations
                 .query(SqliteQuery::new("SELECT 1", Vec::new()))
@@ -3292,6 +3162,26 @@ mod tests {
         connection
             .execute_batch("ROLLBACK")
             .expect("测试事务应可清理");
+    }
+
+    #[test]
+    fn finalization_error_preserves_the_primary_and_connection_close_failures() {
+        let error = SqliteInteractiveSessionFinalizationError::new(
+            SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(
+                SqliteRuntimeError::Internal("回滚结果未知"),
+            ),
+            Some(SqliteRuntimeError::Internal("关闭失败")),
+        );
+
+        assert!(
+            Error::source(&error)
+                .expect("主失败应保留在错误链")
+                .to_string()
+                .contains("回滚结果未知")
+        );
+        let message = error.to_string();
+        assert!(message.contains("回滚结果未知"));
+        assert!(message.contains("关闭失败"));
     }
 
     #[tokio::test]
@@ -3420,9 +3310,7 @@ mod tests {
     async fn finalizer_bypasses_full_command_queue_and_drains_accepted_commands() {
         let directory = TestDirectory::new();
         let database = directory.database("full-command-queue.db");
-        let mut config = configuration();
-        config.interactive_command_queue_capacity = nonzero(1);
-        let storage = RusqliteStorage::start(config).expect("根应可启动");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
         storage
             .create_new_database(database.clone(), schema_commands())
             .await
@@ -3463,7 +3351,8 @@ mod tests {
         first_release.send(()).expect("必须释放首条门控命令");
         let report = tokio::time::timeout(Duration::from_secs(20), finalization)
             .await
-            .expect("队列填满不得阻断独立终结通道");
+            .expect("队列填满不得阻断独立终结通道")
+            .expect("会话应可终结");
         first_response
             .await
             .expect("交互式 actor 必须返回首条命令结果")
@@ -3472,18 +3361,7 @@ mod tests {
             .await
             .expect("第二个调用任务不应 panic")
             .expect("第二条已接管命令应完成");
-        assert!(matches!(
-            report.transaction(),
-            SqliteInteractiveTransactionObservation::Idle
-        ));
-        assert!(matches!(
-            report.rollback(),
-            SqliteInteractiveRollbackOutcome::NotRequired
-        ));
-        assert!(matches!(
-            report.connection(),
-            SqliteInteractiveConnectionCloseOutcome::Closed
-        ));
+        assert!(!report.had_unclosed_transaction());
         let rows = storage
             .query_existing_database(
                 database,
@@ -3528,19 +3406,9 @@ mod tests {
         ));
         let report = tokio::time::timeout(Duration::from_secs(5), finalizer.finalize())
             .await
-            .expect("shutdown 后仍应可领取唯一终结报告");
-        assert!(matches!(
-            report.transaction(),
-            SqliteInteractiveTransactionObservation::Idle
-        ));
-        assert!(matches!(
-            report.rollback(),
-            SqliteInteractiveRollbackOutcome::NotRequired
-        ));
-        assert!(matches!(
-            report.connection(),
-            SqliteInteractiveConnectionCloseOutcome::Closed
-        ));
+            .expect("shutdown 后仍应可领取唯一终结报告")
+            .expect("会话应可终结");
+        assert!(!report.had_unclosed_transaction());
     }
 
     #[tokio::test]
@@ -3570,19 +3438,8 @@ mod tests {
             .await
             .expect("活动事务不得使 shutdown 永久等待")
             .expect("根应可关闭");
-        let report = finalizer.finalize().await;
-        assert!(matches!(
-            report.transaction(),
-            SqliteInteractiveTransactionObservation::Active
-        ));
-        assert!(matches!(
-            report.rollback(),
-            SqliteInteractiveRollbackOutcome::RolledBack
-        ));
-        assert!(matches!(
-            report.connection(),
-            SqliteInteractiveConnectionCloseOutcome::Closed
-        ));
+        let report = finalizer.finalize().await.expect("会话应可终结");
+        assert!(report.had_unclosed_transaction());
         let connection = Connection::open(database).expect("终结后数据库应可重新打开");
         let count: i64 = connection
             .query_row("SELECT COUNT(*) FROM values_table", [], |row| row.get(0))
@@ -3595,9 +3452,7 @@ mod tests {
     async fn shutdown_bypasses_a_full_session_queue_and_rejects_unaccepted_commands() {
         let directory = TestDirectory::new();
         let database = directory.database("shutdown-full-command-queue.db");
-        let mut config = configuration();
-        config.interactive_command_queue_capacity = nonzero(1);
-        let storage = RusqliteStorage::start(config).expect("根应可启动");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
         storage
             .create_new_database(database.clone(), schema_commands())
             .await
@@ -3673,11 +3528,8 @@ mod tests {
             third.await.expect("第三个调用任务不应 panic"),
             Err(SqliteInteractiveSessionError::Closed)
         ));
-        let report = finalizer.finalize().await;
-        assert!(matches!(
-            report.connection(),
-            SqliteInteractiveConnectionCloseOutcome::Closed
-        ));
+        let report = finalizer.finalize().await.expect("会话应可终结");
+        assert!(!report.had_unclosed_transaction());
         let connection = Connection::open(database).expect("终结后数据库应可打开");
         let ids = connection
             .prepare("SELECT id FROM values_table ORDER BY id")
@@ -3690,12 +3542,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_releases_capacity_for_an_open_already_waiting_on_session_permit() {
+    async fn single_active_session_rejects_a_second_open_and_allows_reopen_after_finalization() {
         let directory = TestDirectory::new();
-        let database = directory.database("shutdown-waiting-open.db");
-        let mut config = configuration();
-        config.max_interactive_sessions = nonzero(1);
-        let storage = RusqliteStorage::start(config).expect("根应可启动");
+        let database = directory.database("single-interactive-session.db");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
         storage
             .create_new_database(database.clone(), schema_commands())
             .await
@@ -3703,42 +3553,70 @@ mod tests {
         let first = storage
             .open_existing(database.clone())
             .await
-            .expect("第一个会话应占满容量");
+            .expect("第一个会话应可打开");
         let (operations, finalizer) = first.into_parts();
-        let waiting_storage = storage.clone();
-        let waiting_database = database.clone();
-        let waiting =
-            tokio::spawn(async move { waiting_storage.open_existing(waiting_database).await });
-        wait_until("第二个 open 进入 session permit 等待", || {
-            storage.inner.open_sender.is_empty() && !waiting.is_finished()
-        })
-        .await;
-        assert!(
-            !waiting.is_finished(),
-            "第二个 open 应正在等待 session permit"
-        );
-
-        tokio::time::timeout(Duration::from_secs(5), storage.shutdown())
-            .await
-            .expect("等待 session permit 的 open 不得与 shutdown 死锁")
-            .expect("根应可关闭");
         assert!(matches!(
-            waiting.await.expect("第二个 open 任务不应 panic"),
+            storage.open_existing(database.clone()).await,
             Err(OpenSqliteInteractiveSessionError::OpenFailed(
-                SqliteRuntimeError::Closed
+                SqliteRuntimeError::InteractiveSessionAlreadyOpen
             ))
         ));
-        let report = finalizer.finalize().await;
-        assert!(matches!(
-            report.connection(),
-            SqliteInteractiveConnectionCloseOutcome::Closed
-        ));
+        let report = finalizer.finalize().await.expect("第一个会话应可终结");
+        assert!(!report.had_unclosed_transaction());
         assert!(matches!(
             operations
                 .query(SqliteQuery::new("SELECT 1", Vec::new()))
                 .await,
             Err(SqliteInteractiveSessionError::Closed)
         ));
+        let reopened = storage
+            .open_existing(database)
+            .await
+            .expect("终结后应可打开新会话");
+        let (_operations, finalizer) = reopened.into_parts();
+        finalizer.finalize().await.expect("新会话应可终结");
+        storage.shutdown().await.expect("根应可关闭");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_unique_finalizer_still_closes_the_session_once() {
+        let directory = TestDirectory::new();
+        let database = directory.database("dropped-finalizer.db");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
+        storage
+            .create_new_database(database.clone(), schema_commands())
+            .await
+            .expect("数据库应可创建");
+        let opened = storage
+            .open_existing(database.clone())
+            .await
+            .expect("会话应可打开");
+        let (operations, finalizer) = opened.into_parts();
+
+        drop(finalizer);
+        wait_until("丢弃的终结令牌完成清理", || {
+            let state = storage
+                .inner
+                .interactive_session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !state.opening && state.active.is_none()
+        })
+        .await;
+        assert!(matches!(
+            operations
+                .query(SqliteQuery::new("SELECT 1", Vec::new()))
+                .await,
+            Err(SqliteInteractiveSessionError::Closed)
+        ));
+        let reopened = storage
+            .open_existing(database)
+            .await
+            .expect("丢弃的令牌清理后应可重新打开");
+        let (_operations, finalizer) = reopened.into_parts();
+        finalizer.finalize().await.expect("新会话应可终结");
+        storage.shutdown().await.expect("根应可关闭");
     }
 
     #[tokio::test]
@@ -3759,15 +3637,10 @@ mod tests {
         let shutdown = storage.shutdown();
         let (shutdown_result, report) = tokio::join!(shutdown, finalization);
         shutdown_result.expect("并发终结时根应可关闭");
-        let report = report.expect("唯一 finalizer 任务不应 panic");
-        assert!(matches!(
-            report.transaction(),
-            SqliteInteractiveTransactionObservation::Idle
-        ));
-        assert!(matches!(
-            report.connection(),
-            SqliteInteractiveConnectionCloseOutcome::Closed
-        ));
+        let report = report
+            .expect("唯一 finalizer 任务不应 panic")
+            .expect("会话应可终结");
+        assert!(!report.had_unclosed_transaction());
     }
 
     #[tokio::test]
@@ -3788,19 +3661,9 @@ mod tests {
 
         let report = tokio::time::timeout(Duration::from_secs(5), finalizer.finalize())
             .await
-            .expect("最后一个 storage 句柄丢弃后仍应产生终结报告");
-        assert!(matches!(
-            report.transaction(),
-            SqliteInteractiveTransactionObservation::Idle
-        ));
-        assert!(matches!(
-            report.rollback(),
-            SqliteInteractiveRollbackOutcome::NotRequired
-        ));
-        assert!(matches!(
-            report.connection(),
-            SqliteInteractiveConnectionCloseOutcome::Closed
-        ));
+            .expect("最后一个 storage 句柄丢弃后仍应产生终结报告")
+            .expect("会话应可终结");
+        assert!(!report.had_unclosed_transaction());
         assert!(matches!(
             operations
                 .query(SqliteQuery::new("SELECT 1", Vec::new()))

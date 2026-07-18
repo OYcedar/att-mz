@@ -6,6 +6,7 @@ use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -18,30 +19,33 @@ use super::rewriter::MzWriteBackDocumentRewritingService;
 use super::standard::{
     ConservativeMzWriteBackTextLayouter, StandardWriteBackService, WriteBackRunLog,
 };
-use super::{WriteBackInput, WriteBackService, WriteBackUseCase};
-use crate::att_mz::ProjectName;
+use super::{WriteBackInput, WriteBackOutput, WriteBackService};
+use crate::att_mz::audit::{AuditEvent, AuditLedger, WriteBackPublishAuditResult};
 use crate::att_mz::extract::document::{MzDocumentReadingConfig, MzProjectDocumentReadingService};
 use crate::att_mz::location_codec::MzLocationCodec;
 use crate::att_mz::lua::hosting::TrustedLuaExecutionHostingService;
 use crate::att_mz::lua::runtime::{
     OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeBindings,
     TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
-    TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
 };
 use crate::att_mz::lua::session::{
     OpenSqliteInteractiveSessionError, OpenedSqliteInteractiveSession,
-    SqliteInteractiveConnectionCloseOutcome, SqliteInteractiveRollbackOutcome,
     SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
-    SqliteInteractiveSessionFinalizationReport, SqliteInteractiveSessionFinalizer,
-    SqliteInteractiveSessionOperations, SqliteInteractiveTransactionObservation,
+    SqliteInteractiveSessionFinalization, SqliteInteractiveSessionFinalizationError,
+    SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
 };
 use crate::att_mz::lua::{LuaPhase, LuaProjectContext};
 use crate::att_mz::project::ExistingProjectOpeningService;
+use crate::att_mz::project_lease::{
+    ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
+};
 use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
+use crate::att_mz::{ProjectName, SelectedLua};
+use crate::execution::OperationCompletion;
 use crate::fingerprint::Sha256Fingerprint;
 use crate::llm::{ChatMessage, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse};
-use crate::observability::PersistentEventLog;
+use crate::observability::{EventId, OperationId};
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
@@ -51,7 +55,8 @@ use crate::storage::file_system::{
     DirectoryTreeFingerprinter, ExistingDirectoryResolver, FileReader, ListDirectoryError,
     ReadFile, ReadFileError, RecoverableDirectoryPublisher, ResolveDirectoryError,
     ScopedDirectoryBindError, ScopedDirectoryEditError, ScopedDirectoryEditor,
-    ScopedDirectoryEntry, ScopedDirectoryPath, StagedDirectory,
+    ScopedDirectoryEntry, ScopedDirectoryEntryKind, ScopedDirectoryPath, ScopedDirectoryScope,
+    StagedDirectory,
 };
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteCommand, SqliteQuery, SqliteQueryExecutor, SqliteRow,
@@ -72,6 +77,21 @@ impl fmt::Display for TestError {
 }
 
 impl Error for TestError {}
+
+#[derive(Clone, Copy)]
+struct FakeProjectLease;
+
+impl ProjectCommandLeaseProvider for FakeProjectLease {
+    type Error = TestError;
+    type LeaseState = ();
+
+    async fn acquire(
+        &self,
+        _: &ProjectName,
+    ) -> Result<ProjectCommandLease<Self::LeaseState>, ProjectCommandLeaseError<Self::Error>> {
+        Ok(ProjectCommandLease::for_test(()))
+    }
+}
 
 #[derive(Clone, Default)]
 struct RecordingSqliteQuery {
@@ -287,6 +307,7 @@ impl ScopedDirectoryEditor for RecordingRecoverablePublisher {
     fn bind_scoped_directory(
         &self,
         candidate: &StagedDirectory<Self::CandidateState>,
+        scope: ScopedDirectoryScope,
     ) -> impl Future<
         Output = Result<
             BoundScopedDirectory<Self::ScopeState>,
@@ -295,7 +316,7 @@ impl ScopedDirectoryEditor for RecordingRecoverablePublisher {
     > + Send
     + use<> {
         let root = candidate.staging_root().to_path_buf();
-        std::future::ready(Ok(BoundScopedDirectory::new(root, ())))
+        std::future::ready(Ok(BoundScopedDirectory::new(root, scope, ())))
     }
 
     fn validate_scoped_directory(
@@ -325,6 +346,18 @@ impl ScopedDirectoryEditor for RecordingRecoverablePublisher {
         Output = Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Self::Error>>,
     > + Send {
         std::future::ready(Ok(Vec::new()))
+    }
+
+    fn list_scoped_root(
+        &self,
+        _scope: &BoundScopedDirectory<Self::ScopeState>,
+    ) -> impl Future<
+        Output = Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Self::Error>>,
+    > + Send {
+        std::future::ready(Ok(vec![
+            ScopedDirectoryEntry::new("data".into(), ScopedDirectoryEntryKind::Directory),
+            ScopedDirectoryEntry::new("js".into(), ScopedDirectoryEntryKind::Directory),
+        ]))
     }
 
     fn create_scoped_directory(
@@ -358,12 +391,40 @@ struct RecordingRunLog {
     events: Arc<Mutex<Vec<WriteBackRunLog>>>,
 }
 
-impl PersistentEventLog<WriteBackRunLog> for RecordingRunLog {
+impl AuditLedger for RecordingRunLog {
     type Error = TestError;
 
-    async fn append(&self, event: WriteBackRunLog) -> Result<(), Self::Error> {
-        self.events.lock().expect("日志记录锁不应中毒").push(event);
-        Ok(())
+    fn new_operation_id(&self) -> Result<OperationId, Self::Error> {
+        Ok(OperationId::from_uuid(uuid::Uuid::from_u128(
+            0x550e_8400_e29b_41d4_a716_4466_5544_0000,
+        )))
+    }
+
+    async fn append(&self, event: AuditEvent) -> Result<EventId, Self::Error> {
+        match event {
+            AuditEvent::WriteBackPublishStarted { .. } => {}
+            AuditEvent::WriteBackPublishFinished {
+                result: WriteBackPublishAuditResult::Published(event),
+                ..
+            } => self.events.lock().expect("日志记录锁不应中毒").push(event),
+            AuditEvent::WriteBackPublishFinished {
+                result:
+                    WriteBackPublishAuditResult::NotPublished { .. }
+                    | WriteBackPublishAuditResult::PublishedWithResiduals { .. }
+                    | WriteBackPublishAuditResult::RecoveryRequired { .. }
+                    | WriteBackPublishAuditResult::OutcomeUnknown { .. },
+                ..
+            } => {}
+            AuditEvent::RunStarted
+            | AuditEvent::RunFinished { .. }
+            | AuditEvent::TranslationTaskStarted { .. }
+            | AuditEvent::TranslationTaskFinished { .. } => {
+                return Err(TestError("意外审计事件"));
+            }
+        }
+        Ok(EventId::from_uuid(uuid::Uuid::from_u128(
+            0x7c9e_6679_7425_40de_944b_e07f_c1f9_0ae7,
+        )))
     }
 }
 
@@ -387,7 +448,7 @@ impl LlmRequestExecutor for RecordingLlm {
                 "不应到达 LLM 根",
                 LlmFinishReason::Stop,
                 None,
-                "unused-response",
+                Some("unused-response".to_owned()),
                 None,
             ))
         }
@@ -417,26 +478,9 @@ struct ExercisingLuaRuntime {
 
 impl TrustedLuaRuntimeExecutor for ExercisingLuaRuntime {
     type Error = TestError;
-    type Reservation = ExercisingLuaReservation;
-
-    async fn reserve(&self) -> Result<Self::Reservation, Self::Error> {
-        Ok(ExercisingLuaReservation {
-            mode: self.mode,
-            facts: Arc::clone(&self.facts),
-        })
-    }
-}
-
-struct ExercisingLuaReservation {
-    mode: RuntimeTransactionMode,
-    facts: Arc<Mutex<RuntimeFacts>>,
-}
-
-impl TrustedLuaRuntimeReservation for ExercisingLuaReservation {
-    type Error = TestError;
 
     fn start(
-        self,
+        &self,
         program: OwnedLuaProgram,
         bindings: TrustedLuaRuntimeBindings,
     ) -> TrustedLuaExecutionHandle<Self::Error> {
@@ -465,12 +509,7 @@ impl TrustedLuaRuntimeReservation for ExercisingLuaReservation {
                     .map_err(TrustedLuaRuntimeExecutionError::Binding),
                 Ok(()) => Ok(()),
             };
-            let termination = if runtime.is_ok() {
-                TrustedLuaRuntimeTermination::Completed
-            } else {
-                TrustedLuaRuntimeTermination::Failed
-            };
-            let finalization = finalizer.finalize(termination).await;
+            let finalization = finalizer.finalize().await;
             let _ = sender.send(TrustedLuaRuntimeExecutionReport::new(runtime, finalization));
         });
         TrustedLuaExecutionHandle::new(receiver, cancelled)
@@ -569,27 +608,25 @@ struct RecordingSessionFinalizer {
 impl SqliteInteractiveSessionFinalizer for RecordingSessionFinalizer {
     type Error = TestError;
 
-    async fn finalize(self) -> SqliteInteractiveSessionFinalizationReport<Self::Error> {
+    async fn finalize(
+        self,
+    ) -> Result<
+        SqliteInteractiveSessionFinalization,
+        SqliteInteractiveSessionFinalizationError<Self::Error>,
+    > {
         let mut facts = self.facts.lock().expect("Session 记录锁不应中毒");
-        let transaction = if facts.state == SessionTransactionState::Active {
+        let had_unclosed_transaction = if facts.state == SessionTransactionState::Active {
             facts.rollback_calls += 1;
             facts.state = SessionTransactionState::Idle;
-            SqliteInteractiveTransactionObservation::Active
+            true
         } else {
-            SqliteInteractiveTransactionObservation::Idle
-        };
-        let rollback = if matches!(transaction, SqliteInteractiveTransactionObservation::Active) {
-            SqliteInteractiveRollbackOutcome::RolledBack
-        } else {
-            SqliteInteractiveRollbackOutcome::NotRequired
+            false
         };
         facts.close_calls += 1;
         facts.closed = true;
-        SqliteInteractiveSessionFinalizationReport::new(
-            transaction,
-            rollback,
-            SqliteInteractiveConnectionCloseOutcome::Closed,
-        )
+        Ok(SqliteInteractiveSessionFinalization::new(
+            had_unclosed_transaction,
+        ))
     }
 }
 
@@ -641,14 +678,35 @@ struct FullTreeObservations {
     opened_database_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
 
-fn build_full_tree(mode: RuntimeTransactionMode) -> (impl WriteBackUseCase, FullTreeObservations) {
+type FullTreeRunFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<OperationCompletion<WriteBackOutput>, Box<dyn Error + Send + Sync>>,
+            > + Send,
+    >,
+>;
+
+struct FullTreeService {
+    execute: Box<dyn Fn(WriteBackInput) -> FullTreeRunFuture + Send + Sync>,
+}
+
+impl FullTreeService {
+    async fn execute(
+        &self,
+        input: WriteBackInput,
+    ) -> Result<OperationCompletion<WriteBackOutput>, Box<dyn Error + Send + Sync>> {
+        (self.execute)(input).await
+    }
+}
+
+fn build_full_tree(mode: RuntimeTransactionMode) -> (FullTreeService, FullTreeObservations) {
     build_full_tree_with_publish_error(mode, None)
 }
 
 fn build_full_tree_with_publish_error(
     mode: RuntimeTransactionMode,
     publish_error: Option<DirectoryPublishError<TestError>>,
-) -> (impl WriteBackUseCase, FullTreeObservations) {
+) -> (FullTreeService, FullTreeObservations) {
     let sqlite = RecordingSqliteQuery::default();
     let resolver = RecordingDirectoryResolver::default();
     let file_reader = RecordingFileReader {
@@ -709,10 +767,24 @@ fn build_full_tree_with_publish_error(
         opener,
         standard,
         publisher,
-        Some(lua),
+        Some(SelectedLua::new(PathBuf::from(LUA_SCRIPT), lua)),
         run_log.clone(),
+        FakeProjectLease,
         cancellation,
     );
+    let service = Arc::new(service);
+    let run_service = Arc::clone(&service);
+    let service = FullTreeService {
+        execute: Box::new(move |input| {
+            let service = Arc::clone(&run_service);
+            Box::pin(async move {
+                service
+                    .execute(input)
+                    .await
+                    .map_err(|source| Box::new(source) as Box<dyn Error + Send + Sync>)
+            })
+        }),
+    };
     let observations = FullTreeObservations {
         sqlite_calls: sqlite.calls,
         resolved_directories: resolver.calls,
@@ -739,6 +811,9 @@ async fn real_write_back_non_root_tree_rewrites_publishes_logs_and_runs_lua() {
         .execute(write_back_input())
         .await
         .expect("完整非根 WriteBack 树应该成功");
+    let OperationCompletion::Completed(output) = output else {
+        panic!("完整非根 WriteBack 树应正常完成")
+    };
 
     assert_eq!(output.name.as_str(), PROJECT_NAME);
     assert_eq!(output.output_root, workspace_root().join("write_back"));
@@ -989,7 +1064,6 @@ fn assert_published_documents(
 
     let logs = observations.run_logs.lock().expect("日志记录锁不应中毒");
     assert_eq!(logs.len(), 1);
-    assert_eq!(logs[0].name().as_str(), PROJECT_NAME);
     assert_eq!(logs[0].output_root(), workspace_root().join("write_back"));
     assert_eq!(logs[0].summary(), summary);
     assert!(logs[0].manual_layout_diagnostics().is_empty());
@@ -1050,7 +1124,6 @@ fn overlay<'a>(request: &'a DirectoryStageRequest, path: &str) -> &'a [u8] {
 fn write_back_input() -> WriteBackInput {
     WriteBackInput {
         name: project_name(),
-        lua_script: Some(PathBuf::from(LUA_SCRIPT)),
     }
 }
 

@@ -8,7 +8,7 @@ use clap::Parser;
 use clap::error::ErrorKind;
 
 use super::arguments::AttArguments;
-use super::command::{CommandResultRenderer, ProductionMzCommandRunner};
+use super::command::{CommandResultRenderer, CommandRunResult, ProductionMzCommandRunner};
 use super::config::{load_configuration, resolve_configuration_path};
 
 /// 运行真实进程入口。
@@ -29,7 +29,7 @@ where
     };
     let current_directory = match std::env::current_dir() {
         Ok(path) => path,
-        Err(error) => return render_fatal("无法读取当前工作目录", &error, stderr),
+        Err(error) => return render_fatal("内部技术故障", &error, stderr),
     };
     let app_data = std::env::var_os("APPDATA");
     let configuration_path = match resolve_configuration_path(
@@ -38,13 +38,14 @@ where
         app_data.as_deref(),
     ) {
         Ok(path) => path,
-        Err(error) => return render_fatal("无法定位配置文件", &error, stderr),
+        Err(error) => return render_fatal("配置或输入错误", &error, stderr),
     };
-    let configuration = match load_configuration(&configuration_path) {
+    let command = arguments.product.into_mz();
+    let configuration = match load_configuration(&configuration_path, command) {
         Ok(configuration) => configuration,
-        Err(error) => return render_fatal("无法加载配置", &error, stderr),
+        Err(error) => return render_fatal("配置或输入错误", &error, stderr),
     };
-    let async_runtime = configuration.runtime().async_runtime();
+    let async_runtime = configuration.common().async_runtime();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(async_runtime.worker_threads().get())
         .max_blocking_threads(async_runtime.max_blocking_threads().get())
@@ -53,46 +54,24 @@ where
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => return render_fatal("无法构造异步运行时", &error, stderr),
+        Err(error) => return render_fatal("内部技术故障", &error, stderr),
     };
 
-    let command = arguments.product.into_mz();
-    let report = runtime.block_on(ProductionMzCommandRunner::new(configuration).run(command));
+    let report = runtime.block_on(ProductionMzCommandRunner::new().run(configuration));
     // 所有根已经显式 shutdown；丢弃 Runtime 是最终进程资源终结步骤。
     drop(runtime);
 
-    if report.interrupted {
-        let command_error = report.command_result.and_then(Result::err);
-        if command_error.is_some() || report.shutdown_error.is_some() {
-            let _ = CommandResultRenderer::render_failure(
-                command_error
-                    .as_ref()
-                    .map(|error| error as &dyn std::fmt::Display),
-                report
-                    .shutdown_error
-                    .as_ref()
-                    .map(|error| error as &dyn std::fmt::Display),
-                stderr,
-            );
-            return ExitCode::FAILURE;
-        }
-        return ExitCode::from(130);
-    }
-
-    match (report.command_result, report.shutdown_error) {
-        (Some(Ok(output)), None) => {
+    match (report.result, report.shutdown_error) {
+        (CommandRunResult::Succeeded(output), None) => {
             if let Err(error) = CommandResultRenderer::render_success(output, stdout) {
-                render_fatal("无法写入标准输出", &error, stderr)
+                render_fatal("内部技术故障", &error, stderr)
             } else {
                 ExitCode::SUCCESS
             }
         }
-        (Some(result), shutdown) => {
-            let command_error = result.err();
+        (CommandRunResult::Failed(command_error), shutdown) => {
             if CommandResultRenderer::render_failure(
-                command_error
-                    .as_ref()
-                    .map(|error| error as &dyn std::fmt::Display),
+                Some(&command_error),
                 shutdown
                     .as_ref()
                     .map(|error| error as &dyn std::fmt::Display),
@@ -104,10 +83,17 @@ where
             }
             ExitCode::FAILURE
         }
-        (None, shutdown) => {
-            if let Some(shutdown) = shutdown.as_ref() {
-                let _ = CommandResultRenderer::render_failure(None, Some(shutdown), stderr);
-            }
+        (CommandRunResult::Interrupted, None) => ExitCode::from(130),
+        (CommandRunResult::Interrupted, Some(shutdown)) => {
+            let _ = CommandResultRenderer::render_failure(
+                Some(&"内部技术故障"),
+                Some(&shutdown),
+                stderr,
+            );
+            ExitCode::FAILURE
+        }
+        (CommandRunResult::Succeeded(_), Some(shutdown)) => {
+            let _ = CommandResultRenderer::render_applied_finalization_failure(&shutdown, stderr);
             ExitCode::FAILURE
         }
     }
@@ -134,7 +120,8 @@ fn render_parse_error(
 }
 
 fn render_fatal(stage: &str, error: &dyn std::fmt::Display, stderr: &mut dyn Write) -> ExitCode {
-    let _ = writeln!(stderr, "{stage}：{error}");
+    let _ = error;
+    let _ = writeln!(stderr, "{stage}");
     ExitCode::FAILURE
 }
 

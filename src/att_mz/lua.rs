@@ -11,6 +11,7 @@ use self::runtime::TrustedLuaTranslationSemantics;
 use self::runtime::TrustedLuaWriteBackHostCalls;
 use super::ProjectName;
 use super::project::OpenedProject;
+use crate::execution::OperationCompletion;
 
 pub(crate) mod hosting;
 pub(crate) mod json;
@@ -299,15 +300,14 @@ impl<P> LuaInvocation<P> {
 ///
 /// Lua 通过 `ctx.extract` 明确采用标准资产契约时，Host 只收集已校验的完整意图，
 /// 并在 VM 与数据库会话都干净结束后交给 Extract 服务提交；Lua 通过开放 SQL 建立的
-/// 自有数据仍由脚本拥有。Host 不会把整个脚本隐式包进长事务。Host 负责 worker、
-/// 背压和阻塞隔离；公开 Future 不得阻塞异步执行器线程。Host 先预留 Runtime 容量，
-/// 再打开 SQLite 会话，最后通过
-/// `reservation.start` 同步移交调用面与唯一终结器。排队期或运行期取消都必须回滚
+/// 自有数据仍由脚本拥有。Host 不会把整个脚本隐式包进长事务。Runtime 为每次脚本
+/// 建立专用 OS 线程以隔离阻塞；公开 Future 不得阻塞异步执行器线程。Host 先打开
+/// SQLite 会话，再通过 `start` 同步移交调用面与唯一终结器。启动期或运行期取消都必须回滚
 /// 仍未提交的活动事务并关闭数据库连接和 VM；已经显式提交的结果不由 Host 回滚。
 /// 成功返回的 Extract 意图进一步承诺 VM 正常结束、唯一终结器成功、没有未闭合事务，
 /// 因而调用方可以在会话关闭后另起短事务提交托管标准快照。
 pub(crate) trait TrustedLuaExecutionHost: Send + Sync {
-    /// 与翻译配置 Resolver 产物一致的执行配置。
+    /// 与应用配置边界所选结果一致的执行配置。
     type TranslationProfile: Send + Sync + 'static;
     /// Host 接管或执行失败。
     type Error: Error + Send + Sync + 'static;
@@ -315,7 +315,7 @@ pub(crate) trait TrustedLuaExecutionHost: Send + Sync {
     fn execute(
         &self,
         invocation: LuaInvocation<Self::TranslationProfile>,
-    ) -> impl Future<Output = Result<TrustedLuaExecutionOutcome, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error>> + Send;
 }
 
 #[cfg(test)]

@@ -45,29 +45,21 @@ impl OwnedLuaProgram {
     }
 }
 
-/// Lua 主程序离开 VM 时的终止方式。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TrustedLuaRuntimeTermination {
-    Completed,
-    Failed,
-    Cancelled,
-}
-
 /// Host 在释放绑定资源后交还给编排层的事实。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TrustedLuaBindingFinalization {
-    had_active_transaction: bool,
+    had_unclosed_transaction: bool,
 }
 
 impl TrustedLuaBindingFinalization {
-    pub(crate) const fn new(had_active_transaction: bool) -> Self {
+    pub(crate) const fn new(had_unclosed_transaction: bool) -> Self {
         Self {
-            had_active_transaction,
+            had_unclosed_transaction,
         }
     }
 
-    pub(crate) const fn had_active_transaction(self) -> bool {
-        self.had_active_transaction
+    pub(crate) const fn had_unclosed_transaction(self) -> bool {
+        self.had_unclosed_transaction
     }
 }
 
@@ -528,12 +520,11 @@ impl TrustedLuaPhaseBindings {
 pub(crate) trait TrustedLuaBindingFinalizer: Send + 'static {
     fn finalize(
         self: Box<Self>,
-        termination: TrustedLuaRuntimeTermination,
     ) -> HostFuture<Result<TrustedLuaBindingFinalization, TrustedLuaBindingFinalizationError>>;
 }
 
 /// 一次 Runtime 启动所需的公共能力、唯一阶段能力与唯一终结器。
-#[must_use = "Lua bindings 必须同步移交给 Runtime reservation"]
+#[must_use = "Lua bindings 必须同步移交给 Runtime"]
 pub(crate) struct TrustedLuaRuntimeBindings {
     common: TrustedLuaCommonBindings,
     phase: TrustedLuaPhaseBindings,
@@ -713,24 +704,16 @@ impl<R> Drop for TrustedLuaExecutionHandle<R> {
     }
 }
 
-/// 已预留的 Lua 队列与 worker 容量。
+/// 在一次专用 OS 线程中运行完全可信的 Lua 程序。
 ///
-/// reservation 不可克隆；丢弃只释放容量。`start` 不返回移交失败，一旦接收
-/// bindings，Runtime 必须最终产生执行与清理报告。
-pub(crate) trait TrustedLuaRuntimeReservation: Send + 'static {
+/// `start` 同步接管 bindings 且不返回移交失败。接管后即使 Runtime 正在关闭、
+/// worker 无法创建或执行 panic，也必须最终产生执行与清理报告。
+pub(crate) trait TrustedLuaRuntimeExecutor: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
     fn start(
-        self,
+        &self,
         program: OwnedLuaProgram,
         bindings: TrustedLuaRuntimeBindings,
     ) -> TrustedLuaExecutionHandle<Self::Error>;
-}
-
-/// 在外部配置的专用有界 worker 与队列中运行完全可信的 Lua 程序。
-pub(crate) trait TrustedLuaRuntimeExecutor: Send + Sync {
-    type Error: Error + Send + Sync + 'static;
-    type Reservation: TrustedLuaRuntimeReservation<Error = Self::Error>;
-
-    fn reserve(&self) -> impl Future<Output = Result<Self::Reservation, Self::Error>> + Send;
 }

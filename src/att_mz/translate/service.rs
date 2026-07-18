@@ -4,123 +4,181 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::lua::LuaTranslation;
-use super::profile::TranslationExecutionProfileResolver;
+use super::profile::TranslationExecutionProfile;
 use super::standard::{StandardTranslation, StandardTranslationInput};
-use super::{StandardTranslationSummary, TranslateInput, TranslateOutput, TranslateUseCase};
-use crate::att_mz::ProjectName;
+use super::{StandardTranslationSummary, TranslateInput, TranslateOutput};
 use crate::att_mz::lua::runtime::TrustedLuaTranslationSemantics;
-use crate::att_mz::project::ExistingProjectOpener;
-use crate::execution::{CooperativeCancellation, OperationCancelled};
+use crate::att_mz::project::{ExistingProjectOpener, OpenedProject};
+use crate::att_mz::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
+use crate::att_mz::{ProjectName, SelectedLua};
+use crate::execution::{CooperativeCancellation, OperationCompletion};
+
+/// 为当前项目语言对建立完整翻译执行切片的结果。
+pub(crate) type SelectedTranslationExecutionBuildResult<P, S, L, E> =
+    Result<SelectedTranslationExecution<P, S, L>, E>;
+
+/// 打开项目后一次性建立当前语言对实际需要的翻译执行切片。
+pub(crate) trait SelectedTranslationExecutionBuilder: Send + Sync {
+    type Payload: Send + Sync + 'static;
+    type Standard: StandardTranslation<Profile = Arc<TranslationExecutionProfile<Self::Payload>>>;
+    type Lua: LuaTranslation<Profile = Arc<TranslationExecutionProfile<Self::Payload>>>;
+    type Error: Error + Send + Sync + 'static;
+
+    fn build(
+        &self,
+        project: &OpenedProject,
+    ) -> impl std::future::Future<
+        Output = SelectedTranslationExecutionBuildResult<
+            Self::Payload,
+            Self::Standard,
+            Self::Lua,
+            Self::Error,
+        >,
+    > + Send;
+}
+
+/// 当前项目语言对唯一的一组 Standard、Profile 与可选 Lua 执行能力。
+pub(crate) struct SelectedTranslationExecution<P, S, L> {
+    profile: Arc<TranslationExecutionProfile<P>>,
+    standard: S,
+    lua: Option<SelectedLua<L>>,
+}
+
+impl<P, S, L> SelectedTranslationExecution<P, S, L> {
+    pub(crate) fn new(
+        profile: Arc<TranslationExecutionProfile<P>>,
+        standard: S,
+        lua: Option<SelectedLua<L>>,
+    ) -> Self {
+        Self {
+            profile,
+            standard,
+            lua,
+        }
+    }
+}
 
 /// 按固定业务顺序编排一次 MZ 翻译。
 ///
-/// 用例先选择调用方明确指定的执行配置，再读取一次项目记录，随后执行标准翻译，
-/// 最后按需执行可信 Lua 翻译。首个失败会阻止后续阶段；本层不回滚依赖已经提交
-/// 的副作用。
-pub(crate) struct TranslateService<C, R, S, L> {
-    profile_resolver: C,
+/// 配置边界在构造本服务前已经完成 Profile 选择。本服务把同一个不可变
+/// Profile 快照交给标准翻译和 Lua 翻译，不再保存或解析选择标识。
+pub(crate) struct TranslateService<R, B, P> {
     project_opener: R,
-    standard_translation: S,
-    lua_translation: Option<L>,
+    execution_builder: B,
+    project_lease: P,
     cancellation: CooperativeCancellation,
 }
 
-impl<C, R, S, L> TranslateService<C, R, S, L> {
+impl<R, B, P> TranslateService<R, B, P> {
     pub(crate) fn new(
-        profile_resolver: C,
         project_opener: R,
-        standard_translation: S,
-        lua_translation: Option<L>,
+        execution_builder: B,
+        project_lease: P,
         cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
-            profile_resolver,
             project_opener,
-            standard_translation,
-            lua_translation,
+            execution_builder,
+            project_lease,
             cancellation,
         }
     }
 }
 
-impl<C, R, S, L> TranslateUseCase for TranslateService<C, R, S, L>
+impl<R, B, P> TranslateService<R, B, P>
 where
-    C: TranslationExecutionProfileResolver,
     R: ExistingProjectOpener,
-    S: StandardTranslation<Profile = C::Profile>,
-    L: LuaTranslation<Profile = C::Profile>,
+    B: SelectedTranslationExecutionBuilder,
+    P: ProjectCommandLeaseProvider,
 {
-    type Error = TranslateServiceError<C::Error, R::Error, S::Error, L::Error>;
-
-    async fn execute(&self, input: TranslateInput) -> Result<TranslateOutput, Self::Error> {
-        self.cancellation
-            .check()
-            .map_err(TranslateServiceError::Cancelled)?;
+    pub(crate) async fn execute(
+        &self,
+        input: TranslateInput,
+    ) -> Result<
+        OperationCompletion<TranslateOutput>,
+        TranslateServiceError<
+            R::Error,
+            B::Error,
+            <B::Standard as StandardTranslation>::Error,
+            <B::Lua as LuaTranslation>::Error,
+            P::Error,
+        >,
+    > {
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let TranslateInput {
             name,
-            profile_id,
             terminology_path,
             placeholder_rules_path,
-            lua_script,
         } = input;
 
-        let profile = self
-            .profile_resolver
-            .resolve(&profile_id)
-            .map_err(|source| TranslateServiceError::ResolveProfile {
-                profile_id: profile_id.clone(),
-                source,
-            })?;
-        self.cancellation
-            .check()
-            .map_err(TranslateServiceError::Cancelled)?;
+        let _lease = self
+            .project_lease
+            .acquire(&name)
+            .await
+            .map_err(TranslateServiceError::ProjectLease)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let project = self.project_opener.open(&name).await.map_err(|source| {
             TranslateServiceError::ReadProject {
                 name: name.clone(),
                 source,
             }
         })?;
-        self.cancellation
-            .check()
-            .map_err(TranslateServiceError::Cancelled)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
+
+        let execution = self
+            .execution_builder
+            .build(&project)
+            .await
+            .map_err(TranslateServiceError::BuildExecution)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
 
         let standard_report = self
-            .standard_translation
-            .run(
+            .run_standard(
+                &execution,
                 &project,
-                &profile,
                 StandardTranslationInput::new(terminology_path, placeholder_rules_path),
             )
-            .await
-            .map_err(|source| TranslateServiceError::Standard { source })?;
-        self.cancellation
-            .check()
-            .map_err(TranslateServiceError::Cancelled)?;
+            .await?;
+        let OperationCompletion::Completed(standard_report) = standard_report else {
+            return Ok(OperationCompletion::Cancelled);
+        };
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
 
-        let lua_executed = if let Some(script_path) = lua_script {
-            let error_path = script_path.clone();
-            let lua = self
-                .lua_translation
-                .as_ref()
-                .ok_or(TranslateServiceError::MissingLuaDependency)?;
+        let lua_executed = if let Some(selected_lua) = &execution.lua {
+            let error_path = selected_lua.script_path().to_path_buf();
             let semantics: Arc<dyn TrustedLuaTranslationSemantics> = standard_report
                 .resolved_semantics()
                 .cloned()
                 .ok_or(TranslateServiceError::MissingResolvedTranslationSemantics)?;
-            lua.run(&project, &profile, semantics, script_path)
+            let completion = selected_lua
+                .executor()
+                .run(&project, &execution.profile, semantics, error_path.clone())
                 .await
                 .map_err(|source| TranslateServiceError::Lua {
                     script_path: error_path,
                     source,
                 })?;
+            let OperationCompletion::Completed(()) = completion else {
+                return Ok(OperationCompletion::Cancelled);
+            };
             true
         } else {
             false
         };
 
-        Ok(TranslateOutput {
+        Ok(OperationCompletion::Completed(TranslateOutput {
             name,
-            profile_id,
+            profile_id: execution.profile.id().to_owned(),
             standard: StandardTranslationSummary {
                 total_tasks: standard_report.total_tasks(),
                 complete_tasks: standard_report.complete_tasks(),
@@ -138,44 +196,63 @@ where
                 reused: standard_report.reused(),
             },
             lua_executed,
-        })
+        }))
+    }
+
+    async fn run_standard(
+        &self,
+        execution: &SelectedTranslationExecution<B::Payload, B::Standard, B::Lua>,
+        project: &OpenedProject,
+        input: StandardTranslationInput,
+    ) -> Result<
+        OperationCompletion<super::standard::StandardTranslationRunReport>,
+        TranslateServiceError<
+            R::Error,
+            B::Error,
+            <B::Standard as StandardTranslation>::Error,
+            <B::Lua as LuaTranslation>::Error,
+            P::Error,
+        >,
+    > {
+        execution
+            .standard
+            .run(project, &execution.profile, input)
+            .await
+            .map_err(|source| TranslateServiceError::Standard { source })
     }
 }
 
-/// 翻译用例在四个直接依赖边界上遇到的阶段失败。
+/// 翻译用例在直接依赖边界上遇到的阶段失败。
 #[derive(Debug)]
-pub(crate) enum TranslateServiceError<CE, RE, SE, LE> {
-    Cancelled(OperationCancelled),
-    ResolveProfile { profile_id: String, source: CE },
+pub(crate) enum TranslateServiceError<RE, BE, SE, LE, PE> {
+    ProjectLease(ProjectCommandLeaseError<PE>),
     ReadProject { name: ProjectName, source: RE },
+    BuildExecution(BE),
     Standard { source: SE },
     MissingResolvedTranslationSemantics,
-    MissingLuaDependency,
     Lua { script_path: PathBuf, source: LE },
 }
 
-impl<CE, RE, SE, LE> fmt::Display for TranslateServiceError<CE, RE, SE, LE>
+impl<RE, BE, SE, LE, PE> fmt::Display for TranslateServiceError<RE, BE, SE, LE, PE>
 where
-    CE: Error,
     RE: Error,
+    BE: Error,
     SE: Error,
     LE: Error,
+    PE: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled(error) => error.fmt(formatter),
-            Self::ResolveProfile { profile_id, source } => {
-                write!(formatter, "无法选择翻译 Profile {profile_id}：{source}")
-            }
+            Self::ProjectLease(error) => error.fmt(formatter),
             Self::ReadProject { name, source } => {
                 write!(formatter, "无法打开项目 {name}：{source}")
+            }
+            Self::BuildExecution(source) => {
+                write!(formatter, "无法建立当前翻译执行上下文：{source}")
             }
             Self::Standard { source } => write!(formatter, "标准翻译失败：{source}"),
             Self::MissingResolvedTranslationSemantics => {
                 formatter.write_str("标准翻译未交付 Lua 所需的当前翻译语义")
-            }
-            Self::MissingLuaDependency => {
-                formatter.write_str("本次选择了 Lua 翻译，但未构造 Lua Runtime")
             }
             Self::Lua {
                 script_path,
@@ -189,20 +266,21 @@ where
     }
 }
 
-impl<CE, RE, SE, LE> Error for TranslateServiceError<CE, RE, SE, LE>
+impl<RE, BE, SE, LE, PE> Error for TranslateServiceError<RE, BE, SE, LE, PE>
 where
-    CE: Error + 'static,
     RE: Error + 'static,
+    BE: Error + 'static,
     SE: Error + 'static,
     LE: Error + 'static,
+    PE: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Cancelled(error) => Some(error),
-            Self::ResolveProfile { source, .. } => Some(source),
+            Self::ProjectLease(error) => Some(error),
             Self::ReadProject { source, .. } => Some(source),
+            Self::BuildExecution(source) => Some(source),
             Self::Standard { source } => Some(source),
-            Self::MissingResolvedTranslationSemantics | Self::MissingLuaDependency => None,
+            Self::MissingResolvedTranslationSemantics => None,
             Self::Lua { source, .. } => Some(source),
         }
     }
@@ -210,6 +288,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -221,36 +300,36 @@ mod tests {
     use crate::att_mz::translate::executor::FinalLlmResponseMetadata;
     use crate::att_mz::translate::semantics::ResolvedTranslationSemantics;
     use crate::att_mz::translate::standard::{
-        StandardTranslationRunReport, StandardTranslationTaskIndex, TranslationLeafIdentity,
-        TranslationTaskOutcome, TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
+        NonEmptyTaskItems, StandardTranslationRunReport, StandardTranslationTaskIndex,
+        TranslationLeafIdentity, TranslationTaskOutcome, TranslationTaskOutcomeContext,
+        TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
         UnresolvedTranslationUnit,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Failure {
-        Resolve,
         Read,
         Standard,
         Lua,
+        LuaCancelled,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct FakeProfile {
-        profile_id: String,
-    }
+    #[derive(Debug)]
+    struct FakePayload;
+
+    type SelectedProfile = Arc<TranslationExecutionProfile<FakePayload>>;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
-        Resolve(String),
         Read(ProjectName),
         Standard {
             project: OpenedProject,
-            profile: FakeProfile,
+            profile_id: String,
             input: StandardTranslationInput,
         },
         Lua {
             project: OpenedProject,
-            profile: FakeProfile,
+            profile_id: String,
             script_path: PathBuf,
         },
     }
@@ -265,32 +344,6 @@ mod tests {
     }
 
     impl Error for FakeError {}
-
-    #[derive(Clone)]
-    struct FakeProfileResolver {
-        events: Arc<Mutex<Vec<Event>>>,
-        failure: Option<Failure>,
-    }
-
-    impl TranslationExecutionProfileResolver for FakeProfileResolver {
-        type Profile = FakeProfile;
-        type Error = FakeError;
-
-        fn resolve(&self, profile_id: &str) -> Result<Self::Profile, Self::Error> {
-            self.events
-                .lock()
-                .expect("事件记录锁不应中毒")
-                .push(Event::Resolve(profile_id.to_owned()));
-
-            if self.failure == Some(Failure::Resolve) {
-                Err(FakeError("resolve"))
-            } else {
-                Ok(FakeProfile {
-                    profile_id: profile_id.to_owned(),
-                })
-            }
-        }
-    }
 
     #[derive(Clone)]
     struct FakeProjectReader {
@@ -320,10 +373,11 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         failure: Option<Failure>,
         semantics: Arc<ResolvedTranslationSemantics>,
+        expected_profile: SelectedProfile,
     }
 
     impl StandardTranslation for FakeStandardTranslation {
-        type Profile = FakeProfile;
+        type Profile = SelectedProfile;
         type Error = FakeError;
 
         async fn run(
@@ -331,20 +385,23 @@ mod tests {
             project: &OpenedProject,
             profile: &Self::Profile,
             input: StandardTranslationInput,
-        ) -> Result<StandardTranslationRunReport, Self::Error> {
+        ) -> Result<OperationCompletion<StandardTranslationRunReport>, Self::Error> {
+            assert!(Arc::ptr_eq(profile, &self.expected_profile));
             self.events
                 .lock()
                 .expect("事件记录锁不应中毒")
                 .push(Event::Standard {
                     project: project.clone(),
-                    profile: profile.clone(),
+                    profile_id: profile.id().to_owned(),
                     input,
                 });
 
             if self.failure == Some(Failure::Standard) {
                 Err(FakeError("standard"))
             } else {
-                Ok(unavailable_report(Arc::clone(&self.semantics)))
+                Ok(OperationCompletion::Completed(unavailable_report(
+                    Arc::clone(&self.semantics),
+                )))
             }
         }
     }
@@ -354,10 +411,11 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         failure: Option<Failure>,
         expected_semantics: Arc<ResolvedTranslationSemantics>,
+        expected_profile: SelectedProfile,
     }
 
     impl LuaTranslation for FakeLuaTranslation {
-        type Profile = FakeProfile;
+        type Profile = SelectedProfile;
         type Error = FakeError;
 
         async fn run(
@@ -366,7 +424,8 @@ mod tests {
             profile: &Self::Profile,
             semantics: Arc<dyn TrustedLuaTranslationSemantics>,
             script_path: PathBuf,
-        ) -> Result<(), Self::Error> {
+        ) -> Result<OperationCompletion<()>, Self::Error> {
+            assert!(Arc::ptr_eq(profile, &self.expected_profile));
             assert_eq!(
                 Arc::as_ptr(&semantics) as *const (),
                 Arc::as_ptr(&self.expected_semantics) as *const (),
@@ -377,57 +436,120 @@ mod tests {
                 .expect("事件记录锁不应中毒")
                 .push(Event::Lua {
                     project: project.clone(),
-                    profile: profile.clone(),
+                    profile_id: profile.id().to_owned(),
                     script_path,
                 });
 
             if self.failure == Some(Failure::Lua) {
                 Err(FakeError("lua"))
+            } else if self.failure == Some(Failure::LuaCancelled) {
+                Ok(OperationCompletion::Cancelled)
             } else {
-                Ok(())
+                Ok(OperationCompletion::Completed(()))
             }
         }
     }
 
-    type Service = TranslateService<
-        FakeProfileResolver,
-        FakeProjectReader,
-        FakeStandardTranslation,
-        FakeLuaTranslation,
-    >;
+    struct FakeBuilder {
+        profile: SelectedProfile,
+        standard: FakeStandardTranslation,
+        lua: Option<SelectedLua<FakeLuaTranslation>>,
+    }
 
-    fn service(events: Arc<Mutex<Vec<Event>>>, failure: Option<Failure>) -> Service {
+    impl SelectedTranslationExecutionBuilder for FakeBuilder {
+        type Payload = FakePayload;
+        type Standard = FakeStandardTranslation;
+        type Lua = FakeLuaTranslation;
+        type Error = FakeError;
+
+        async fn build(
+            &self,
+            _: &OpenedProject,
+        ) -> Result<
+            SelectedTranslationExecution<Self::Payload, Self::Standard, Self::Lua>,
+            Self::Error,
+        > {
+            Ok(SelectedTranslationExecution::new(
+                Arc::clone(&self.profile),
+                self.standard.clone(),
+                self.lua.as_ref().map(|selected| {
+                    SelectedLua::new(
+                        selected.script_path().to_path_buf(),
+                        selected.executor().clone(),
+                    )
+                }),
+            ))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeProjectLease;
+
+    impl ProjectCommandLeaseProvider for FakeProjectLease {
+        type Error = FakeError;
+        type LeaseState = ();
+
+        async fn acquire(
+            &self,
+            _: &ProjectName,
+        ) -> Result<
+            crate::att_mz::project_lease::ProjectCommandLease<Self::LeaseState>,
+            ProjectCommandLeaseError<Self::Error>,
+        > {
+            Ok(crate::att_mz::project_lease::ProjectCommandLease::for_test(
+                (),
+            ))
+        }
+    }
+
+    type Service = TranslateService<FakeProjectReader, FakeBuilder, FakeProjectLease>;
+
+    fn service(
+        events: Arc<Mutex<Vec<Event>>>,
+        failure: Option<Failure>,
+        lua_script: Option<&str>,
+    ) -> Service {
         let semantics = Arc::new(ResolvedTranslationSemantics::for_test());
+        let profile = Arc::new(TranslationExecutionProfile::new(
+            "quality-profile",
+            std::num::NonZeroUsize::new(2).expect("测试并发数必须非零"),
+            FakePayload,
+        ));
         TranslateService::new(
-            FakeProfileResolver {
-                events: Arc::clone(&events),
-                failure,
-            },
             FakeProjectReader {
                 events: Arc::clone(&events),
                 failure,
             },
-            FakeStandardTranslation {
-                events: Arc::clone(&events),
-                failure,
-                semantics: Arc::clone(&semantics),
+            FakeBuilder {
+                profile: Arc::clone(&profile),
+                standard: FakeStandardTranslation {
+                    events: Arc::clone(&events),
+                    failure,
+                    semantics: Arc::clone(&semantics),
+                    expected_profile: Arc::clone(&profile),
+                },
+                lua: lua_script.map(|path| {
+                    SelectedLua::new(
+                        PathBuf::from(path),
+                        FakeLuaTranslation {
+                            events,
+                            failure,
+                            expected_semantics: semantics,
+                            expected_profile: profile,
+                        },
+                    )
+                }),
             },
-            Some(FakeLuaTranslation {
-                events,
-                failure,
-                expected_semantics: semantics,
-            }),
+            FakeProjectLease,
             CooperativeCancellation::default(),
         )
     }
 
-    fn input(lua_script: Option<&str>) -> TranslateInput {
+    fn input(_: Option<&str>) -> TranslateInput {
         TranslateInput {
             name: project_name(),
-            profile_id: "quality-profile".to_owned(),
             terminology_path: Some(PathBuf::from("config/terms.json")),
             placeholder_rules_path: Some(PathBuf::from("config/placeholders.json")),
-            lua_script: lua_script.map(PathBuf::from),
         }
     }
 
@@ -444,12 +566,6 @@ mod tests {
             "zh-Hans".to_owned(),
             crate::att_mz::project::test_layout_profile(),
         )
-    }
-
-    fn profile() -> FakeProfile {
-        FakeProfile {
-            profile_id: "quality-profile".to_owned(),
-        }
     }
 
     fn standard_input() -> StandardTranslationInput {
@@ -475,25 +591,29 @@ mod tests {
             ),
             "宝剑",
         );
-        let outcome = TranslationTaskOutcome::unavailable(
-            StandardTranslationTaskIndex::new(0),
-            1,
-            Some(FinalLlmResponseMetadata::new(
+        let outcome = TranslationTaskOutcome::Unavailable {
+            context: TranslationTaskOutcomeContext::new(
+                StandardTranslationTaskIndex::new(0),
+                NonZeroUsize::new(1).expect("测试尝试数应非零"),
+                Vec::new(),
+            ),
+            final_response: Some(FinalLlmResponseMetadata::new(
                 Some("request-1".to_owned()),
-                "response-1",
+                Some("response-1".to_owned()),
                 "stop",
                 None,
             )),
-            TranslationTaskUnavailableReason::AllOutputsRejected,
-            vec![UnresolvedTranslationUnit::new(
-                0,
-                identity,
+            reason: TranslationTaskUnavailableReason::AllOutputsRejected,
+            unresolved: NonEmptyTaskItems::new(
+                UnresolvedTranslationUnit::new(
+                    0,
+                    identity,
+                    Vec::new(),
+                    TranslationUnitRejectionReason::Missing,
+                ),
                 Vec::new(),
-                TranslationUnitRejectionReason::Missing,
-            )],
-            Vec::new(),
-        )
-        .expect("测试不可用结果必须满足状态不变量");
+            ),
+        };
         let mut report = StandardTranslationRunReport::empty(1);
         report.record(&outcome);
         report.with_semantics(semantics)
@@ -523,15 +643,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_reads_and_runs_both_stages_in_fixed_order() {
+    async fn reads_and_runs_both_stages_with_the_same_selected_profile() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let service = service(Arc::clone(&recorded), None);
+        let service = service(Arc::clone(&recorded), None, Some("scripts/translate.lua"));
 
         let output = service
             .execute(input(Some("scripts/translate.lua")))
             .await
             .expect("完整翻译编排应该成功");
 
+        let OperationCompletion::Completed(output) = output else {
+            panic!("翻译应正常完成")
+        };
         assert_eq!(output.name, project_name());
         assert_eq!(output.profile_id, "quality-profile");
         assert_eq!(output.standard, expected_summary());
@@ -539,16 +662,15 @@ mod tests {
         assert_eq!(
             events(&recorded),
             vec![
-                Event::Resolve("quality-profile".to_owned()),
                 Event::Read(project_name()),
                 Event::Standard {
                     project: project_record(),
-                    profile: profile(),
+                    profile_id: "quality-profile".to_owned(),
                     input: standard_input(),
                 },
                 Event::Lua {
                     project: project_record(),
-                    profile: profile(),
+                    profile_id: "quality-profile".to_owned(),
                     script_path: PathBuf::from("scripts/translate.lua"),
                 },
             ]
@@ -556,25 +678,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lua_cancellation_is_the_normal_top_level_completion() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+
+        let completion = service(
+            Arc::clone(&recorded),
+            Some(Failure::LuaCancelled),
+            Some("scripts/translate.lua"),
+        )
+        .execute(input(Some("scripts/translate.lua")))
+        .await
+        .expect("Lua 取消应作为正常结果传播");
+
+        assert_eq!(completion, OperationCompletion::Cancelled);
+        assert!(matches!(events(&recorded).last(), Some(Event::Lua { .. })));
+    }
+
+    #[tokio::test]
     async fn omits_only_the_unselected_lua_stage() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
 
-        let output = service(Arc::clone(&recorded), None)
+        let output = service(Arc::clone(&recorded), None, None)
             .execute(input(None))
             .await
             .expect("没有 Lua 的标准翻译应该成功");
 
+        let OperationCompletion::Completed(output) = output else {
+            panic!("翻译应正常完成")
+        };
         assert_eq!(output.standard, expected_summary());
         assert!(!output.lua_executed);
 
         assert_eq!(
             events(&recorded),
             vec![
-                Event::Resolve("quality-profile".to_owned()),
                 Event::Read(project_name()),
                 Event::Standard {
                     project: project_record(),
-                    profile: profile(),
+                    profile_id: "quality-profile".to_owned(),
                     input: standard_input(),
                 },
             ]
@@ -588,7 +729,7 @@ mod tests {
         request.terminology_path = None;
         request.placeholder_rules_path = None;
 
-        service(Arc::clone(&recorded), None)
+        service(Arc::clone(&recorded), None, None)
             .execute(request)
             .await
             .expect("没有可选文件的标准翻译应该成功");
@@ -596,11 +737,10 @@ mod tests {
         assert_eq!(
             events(&recorded),
             vec![
-                Event::Resolve("quality-profile".to_owned()),
                 Event::Read(project_name()),
                 Event::Standard {
                     project: project_record(),
-                    profile: profile(),
+                    profile_id: "quality-profile".to_owned(),
                     input: StandardTranslationInput::new(None, None),
                 },
             ]
@@ -610,25 +750,14 @@ mod tests {
     #[tokio::test]
     async fn each_failure_stops_every_later_stage() {
         let cases = [
-            (
-                Failure::Resolve,
-                vec![Event::Resolve("quality-profile".to_owned())],
-            ),
-            (
-                Failure::Read,
-                vec![
-                    Event::Resolve("quality-profile".to_owned()),
-                    Event::Read(project_name()),
-                ],
-            ),
+            (Failure::Read, vec![Event::Read(project_name())]),
             (
                 Failure::Standard,
                 vec![
-                    Event::Resolve("quality-profile".to_owned()),
                     Event::Read(project_name()),
                     Event::Standard {
                         project: project_record(),
-                        profile: profile(),
+                        profile_id: "quality-profile".to_owned(),
                         input: standard_input(),
                     },
                 ],
@@ -636,16 +765,15 @@ mod tests {
             (
                 Failure::Lua,
                 vec![
-                    Event::Resolve("quality-profile".to_owned()),
                     Event::Read(project_name()),
                     Event::Standard {
                         project: project_record(),
-                        profile: profile(),
+                        profile_id: "quality-profile".to_owned(),
                         input: standard_input(),
                     },
                     Event::Lua {
                         project: project_record(),
-                        profile: profile(),
+                        profile_id: "quality-profile".to_owned(),
                         script_path: PathBuf::from("scripts/translate.lua"),
                     },
                 ],
@@ -654,31 +782,28 @@ mod tests {
 
         for (failure, expected) in cases {
             let recorded = Arc::new(Mutex::new(Vec::new()));
-            let error = service(Arc::clone(&recorded), Some(failure))
-                .execute(input(Some("scripts/translate.lua")))
-                .await
-                .expect_err("被选择的失败阶段应该向上返回");
+            let error = service(
+                Arc::clone(&recorded),
+                Some(failure),
+                Some("scripts/translate.lua"),
+            )
+            .execute(input(Some("scripts/translate.lua")))
+            .await
+            .expect_err("被选择的失败阶段应该向上返回");
 
             assert_eq!(events(&recorded), expected, "失败阶段：{failure:?}");
             let rendered = error.to_string();
             assert_eq!(
                 error.source().expect("阶段错误应该保留 source").to_string(),
                 match failure {
-                    Failure::Resolve => "resolve",
                     Failure::Read => "read",
                     Failure::Standard => "standard",
                     Failure::Lua => "lua",
+                    Failure::LuaCancelled => unreachable!("取消不属于技术失败矩阵"),
                 }
             );
 
             match (failure, &error) {
-                (
-                    Failure::Resolve,
-                    TranslateServiceError::ResolveProfile { profile_id, source },
-                ) => {
-                    assert_eq!(profile_id, "quality-profile");
-                    assert_eq!(*source, FakeError("resolve"));
-                }
                 (Failure::Read, TranslateServiceError::ReadProject { name, source }) => {
                     assert_eq!(name, &project_name());
                     assert_eq!(*source, FakeError("read"));
@@ -700,12 +825,10 @@ mod tests {
             }
 
             match failure {
-                Failure::Resolve => {
-                    assert!(rendered.contains("翻译 Profile quality-profile"));
-                }
                 Failure::Read => assert!(rendered.contains("项目 alice")),
                 Failure::Standard => assert!(rendered.starts_with("标准翻译失败")),
                 Failure::Lua => assert!(rendered.contains("scripts/translate.lua")),
+                Failure::LuaCancelled => unreachable!("取消不属于技术失败矩阵"),
             }
         }
     }
@@ -713,7 +836,7 @@ mod tests {
     #[test]
     fn execution_future_is_send() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let service = service(recorded, None);
+        let service = service(recorded, None, None);
 
         assert_send(service.execute(input(None)));
     }

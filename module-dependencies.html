@@ -1068,7 +1068,7 @@ h1 {
 
   <footer class="page-foot">
     <span>页面口径：源码中已经落地的职责与真实调用关系。</span>
-    <span>四条纵向切片已经连接真实文件、CPU、SQLite、网络、等待、Lua、日志和运行标识根。</span>
+    <span>四条纵向切片已经连接真实文件、CPU、SQLite、网络、等待、Lua 与统一强审计账本。</span>
   </footer>
 </main>
 
@@ -1081,8 +1081,8 @@ h1 {
       label: "Init",
       zh: "建立项目",
       color: "var(--amber)",
-      summary: "InitService 在项目租约内创建、更新或修复完整冻结工作区；完全一致时丢弃观察候选并返回 Unchanged。",
-      sequence: "取得租约 → 准备候选 → 候选指纹与数据库对账 → discard 并 Unchanged，或整体发布一次",
+      summary: "InitService 在项目租约内创建、更新或修复完整冻结工作区；完全一致时快速返回 Unchanged，不建立候选。",
+      sequence: "审计运行意图 → 取得租约 → 复核现有状态与来源指纹 → 快速 Unchanged，或准备并整体发布一次",
       tree: null
     },
     extract: {
@@ -1090,7 +1090,7 @@ h1 {
       zh: "提取文本",
       color: "var(--teal)",
       summary: "ExtractService 验证冻结来源后，只替换本次选中的 owner 快照并更新各自 freshness。",
-      sequence: "① 取得租约 → ② 打开并复核来源 → ③ Builtin → ④ Rules → ⑤ Lua（可选）",
+      sequence: "审计运行意图 → 取得租约 → 打开并复核来源 → Builtin → Rules → Lua（可选）",
       tree: null
     },
     translate: {
@@ -1098,7 +1098,7 @@ h1 {
       zh: "翻译总控",
       color: "var(--blue)",
       summary: "Translate 复用持久术语/占位符与逐叶 state，只为 Pending 叶装配模型任务；Standard 与 Lua 共享核心门面。",
-      sequence: "Profile → 项目租约与 freshness → 资源/逐叶状态收敛 → Pending 翻译 → Lua（可选）",
+      sequence: "按命令配置选择 Profile → 审计运行意图 → 项目租约与 freshness → 资源/逐叶状态收敛 → 审计每个 Pending 任务 → Lua（可选）",
       tree: null
     },
     writeback: {
@@ -1106,24 +1106,37 @@ h1 {
       zh: "写回游戏",
       color: "var(--red)",
       summary: "WriteBack 把 Standard overlays 和可选 Lua 修改汇入同一个未发布候选，验证后只 publish 一次。",
-      sequence: "① 项目租约 → ② freshness → ③ Standard 计划 → ④ prepare → ⑤ Lua（可选）→ ⑥ 无条件验证 → ⑦ 发布一次 → ⑧ 日志",
+      sequence: "审计运行意图 → 项目租约 → freshness → Standard → prepare → Lua（可选）→ MZ/文件双边界验证 → 审计发布意图 → 发布一次 → 审计发布终态",
       tree: null
     }
   };
 
   var MODULES = {
+    "command-configuration": {
+      title: "按命令配置选择",
+      symbol: "load_configuration → ConfiguredMzCommand",
+      shortSymbol: "Command Configuration",
+      path: "src/application/config.rs",
+      status: "生产配置边界已实现",
+      role: "读取一次受限 TOML，在检查完整语法和未知顶层分区后，只解析当前命令实际使用的配置。",
+      plain: "Init 不会因为语法有效但未被选择的 LLM Client 字段类型或未知字段而失败；完整 TOML 的语法、重复 key 与未知顶层仍始终检查。Translate 只验证指定 Profile、它引用的 Client 与实际语言对。",
+      example: "ConfiguredMzCommand::Translate 直接持有选定 Profile 与 Client，业务模块不再按 ID 二次选择。",
+      input: "配置路径与 MzCommand",
+      output: "Init/Extract/Translate/WriteBack 四个互斥受信变体",
+      boundary: "完整 TOML 语法、重复 key 和未知顶层始终检查；未选分区不反序列化、不校验、不物化秘密。"
+    },
     "production-command-runner": {
       title: "生产命令装配",
       symbol: "ProductionMzCommandRunner",
       shortSymbol: "Production Command Runner",
       path: "src/application/command.rs",
       status: "生产组合边界已实现",
-      role: "只为当前 MZ 命令构造所需纵向切片，统一持有根生命周期并在业务结束后完成 shutdown。",
+      role: "接收按命令选择完成的 ConfiguredMzCommand，只构造当前纵向切片，并编排强审计与根 shutdown。",
       plain: "Init 不会构造未使用的 LLM 或 Lua 运行时；Translate 才构造所选 Profile 引用的公共模型客户端，显式 Lua 时才构造 Lua 根。",
-      example: "att mz init 只装配文件系统与 SQLite 建库；att mz translate 才装配 CPU、SQLite、LLM、Delay、翻译日志与运行标识。",
-      input: "严格解析的 AttArguments、MzCommand 与受信配置",
-      output: "命令结果和完整 shutdown 结果",
-      boundary: "CommandResultRenderer 只在业务与 shutdown 都成功后输出成功文案；进程边界通过 CooperativeCancellation 统一处理 Ctrl-C，并保留收尾期间产生的技术终态。"
+      example: "att mz init 不解析未使用的 LLM Client；att mz translate 只解析指定 Profile、其 Client 和实际语言对。",
+      input: "ConfiguredMzCommand 的互斥命令变体",
+      output: "ProductionCommandRunReport 与独立 shutdown 结果",
+      boundary: "run_started 刷盘后才取得项目租约；非审计根终结后写 run_finished，最后关闭账本并呈现结果。"
     },
     "cooperative-cancellation": {
       title: "合作式取消事实",
@@ -1132,24 +1145,24 @@ h1 {
       path: "src/execution.rs",
       status: "共享核心值类型已实现",
       role: "把进程收到的一次 Ctrl-C 变成单向、可共享的受信事实，让业务只在安全阶段边界停止派生新工作。",
-      plain: "它不是强行杀线程的开关。已经交给文件、SQLite、CPU、日志或目录发布根的工作仍要收尾；尚未开始的下一阶段和 TaskBlock 则不再启动。",
+      plain: "它不是强行杀线程的开关。已经交给文件、SQLite、CPU、强审计或目录发布根的工作仍要收尾；尚未开始的下一阶段和 TaskBlock 则不再启动。",
       example: "WriteBack 在 prepare 返回后发现取消，会显式 discard 候选；如果 publish 已开始，则等待发布终态并记录已经生效的输出。",
       input: "进程边界发出的取消请求",
-      output: "所有本次纵向切片消费者看到的同一取消状态",
-      boundary: "不拥有线程、超时或副作用；唯一职责是建立单向取消事实，具体安全停止点由各语义所有者决定。"
+      output: "OperationCompletion::Completed(T) 或 Cancelled",
+      boundary: "取消是正常数据分支；进程直接形成 CommandRunResult::Interrupted，不解析底层错误文本或 source 链。"
     },
-    "project-operation-lease": {
-      title: "项目操作租约",
-      symbol: "SystemFileSystem as ProjectOperationLeaseProvider",
-      shortSymbol: "Project Operation Lease",
-      path: "src/runtime/filesystem.rs",
-      status: "生产根已实现",
-      role: "让同一项目的 Init、Extract、Translate 和 WriteBack 跨进程互斥，同时允许不同项目并行。",
-      plain: "它像项目门锁：只大小写不同的同名项目也共用一把锁，拿不到就在外部超时后返回 ProjectBusy。",
+    "project-command-lease": {
+      title: "项目命令租约",
+      symbol: "ProjectCommandLeaseService → ExclusiveFileLeaseProvider",
+      shortSymbol: "Project Command Lease",
+      path: "src/att_mz/project_lease.rs · src/storage/file_system.rs · src/runtime/filesystem.rs",
+      status: "领域映射与生产根已实现",
+      role: "MZ 选择固定锁目录并提交 ProjectName 语义 identity，通用文件根确定性编码锁文件名并取得独占锁，让同项目四命令跨进程互斥。",
+      plain: "项目服务不拥有摘要算法；文件根按 Windows 非大小写敏感语义规范化不透明 identity、生成稳定 SHA-256 文件名并取得锁，但不知道项目或 MZ。",
       example: "demo 正在 WriteBack 时再次启动 demo Translate 会等待并超时；other Translate 不受影响。",
-      input: "projects.root、单个项目目录名与外部等待上限",
-      output: "不可复制的 ProjectOperationLease，或 Busy/Unavailable",
-      boundary: "锁文件固定在 .att-project-locks；锁序是项目租约 → 发布锁 → SQLite，lease Drop 释放。"
+      input: "projects.root、ProjectName 与外部等待上限",
+      output: "不可复制的 ProjectCommandLease，或 ProjectBusy/Unavailable",
+      boundary: "项目锁固定在 .att-locks/projects；目录发布锁在 .att-locks/directory-publish；锁序是项目租约 → 发布锁 → SQLite。"
     },
     "source-fingerprint": {
       title: "冻结来源指纹",
@@ -1184,9 +1197,9 @@ h1 {
       path: "src/att_mz/init.rs",
       status: "业务逻辑已实现",
       role: "把一次 Init 请求收敛为 Created、Updated 或 Unchanged 的完整项目状态；工作区修复属于 Updated。",
-      plain: "它像项目校准器：同样输入只丢弃观察候选，不改变可见工作区；来源、语言、布局或结构变化时，把全部变化放进一个候选整体生效。",
+      plain: "它像项目校准器：同样输入在现有工作区完成快速精确比较并直接返回；来源、语言、布局或结构变化时，才把全部变化放进一个候选整体生效。",
       example: "只改布局宽度会保留资产和 state，但清空旧 write_back；来源变化会更新 metadata 指纹并让 active owner 自然 stale。",
-      input: "项目名、原游戏目录、源/目标语言、三个受信布局宽度",
+      input: "项目名、原游戏目录，以及首次必填/已有项目可逐项继承的源目标语言与三个布局宽度",
       output: "Created、Updated 或 Unchanged",
       boundary: "有效 project.db 才允许更新；无法读取、身份不符或 schema 不受管时技术失败且绝不覆盖。"
     },
@@ -1212,7 +1225,7 @@ h1 {
       plain: "新库从第一刻就有全部 schema 和 terminology/placeholder_rules 两行 []，不存在后续命令按需补表。",
       example: "metadata 保存来源 SHA-256；owner 初始 inactive；五表要求 translation 与 32 字节 state 成对。",
       input: "明确目标数据库路径与 NewProject metadata",
-      output: "CreatedProject 或清楚的建库错误",
+      output: "成功确认或清楚的建库错误",
       boundary: "该服务只由工作区收敛的新建分支消费，并把精确建库命令交给 RusqliteStorage。"
     },
     "project-workspace-creator": {
@@ -1222,7 +1235,7 @@ h1 {
       path: "src/att_mz/init.rs",
       status: "非根业务实现完成",
       role: "在唯一候选中创建或转换有效数据库、冻结来源和空输出，再一次 CreateNew/ReplaceExisting 发布。",
-      plain: "它不直接改活工作区。根对象和 source/write_back 直接子项精确匹配时，SQLite 自有 sidecar 不被误判为业务偏差；完全一致就丢弃观察候选并返回 Unchanged。",
+      plain: "它不直接改活工作区。Init 已在调用它之前完成快速 Unchanged 判断；进入这里表示需要在候选中创建、更新或修复完整工作区。",
       example: "语言变化在候选 DB 清 translation/state 和 terminology，保留 placeholder_rules；发布前旧工作区一直可用。",
       input: "期望来源指纹、语言、布局与已观测工作区",
       output: "收敛结果或带候选终结事实的明确失败",
@@ -1460,12 +1473,12 @@ h1 {
       shortSymbol: "SystemFileSystem · Candidate Scope",
       path: "src/runtime/filesystem.rs",
       status: "生产根已实现",
-      role: "把借用式 scope 绑定到尚未发布候选的物理身份，并受控编辑或完整复核 data/js 普通树。",
-      plain: "Lua 只拿 scope 做候选内文件操作；WriteBack Publisher 无论是否运行 Lua，都在发布前用同一根重新枚举完整候选。",
-      example: "Standard 候选意外缺少 js，或可信 Lua 绕过门面建立硬链接时，validate 在 token 尚可丢弃的阶段拒绝。",
-      input: "借用的 StagedDirectory 或 BoundScopedDirectory",
+      role: "把 scope 绑定到候选物理身份和调用方声明的可编辑顶层集合，提供通用受控编辑与文件事实复核。",
+      plain: "文件根只理解安全相对路径、声明范围、身份、reparse、hardlink 和预算；data/js 顶层规则由 MZ WriteBack 拥有。",
+      example: "调用方声明 data/js 后，Lua 不能越界写入根下第三个顶层；硬链接或 reparse 也会在发布前被拒绝。",
+      input: "候选身份、安全相对路径与调用方声明的顶层集合",
       output: "物理身份绑定、受控文件操作或完整树校验结果",
-      boundary: "不持有或终结发布 token；身份、精确 data/js 顶层结构、reparse、硬链接和统一树预算由 SystemFileSystem 校验。"
+      boundary: "不持有发布 token，不理解 MZ；MZ 自己验证顶层精确为 data/js，SystemFileSystem 负责环境机制。"
     },
     "existing-directory-root": {
       title: "现存目录解析根",
@@ -1499,12 +1512,12 @@ h1 {
       shortSymbol: "TrustedLua54Runtime",
       path: "src/runtime/lua.rs",
       status: "生产根已实现",
-      role: "先异步预留有界 VM 容量，再用同步 start 把程序、Host calls 与唯一 finalizer 无窗口移交给 supervisor。",
-      plain: "reserve 只占容量；数据库会话打开后才 start。start 接管后无论排队、编译、执行、取消或 worker panic，都汇入恰好一次 Finalizing。",
+      role: "每次脚本创建一个专用 OS 线程，并用同步 start 接管程序、Host calls 与唯一 finalizer。",
+      plain: "start 接管后，无论线程创建、编译、执行、取消或 panic，都产生执行与清理报告并恰好终结一次会话。",
       example: "WriteBack 脚本开始后 execution handle 被丢弃只发送取消；job supervisor 仍持有 finalizer 并完成数据库清理报告。",
-      input: "reservation.start(OwnedLuaProgram, calls, finalizer)",
+      input: "start(OwnedLuaProgram, calls, finalizer)",
       output: "分别保留 VM、Host 调用与清理终态的执行报告",
-      boundary: "vendored Lua 5.4 VM 位于专用 OS worker；SQLite 与 LLM Future 继续由主 Tokio Runtime 驱动。"
+      boundary: "一次命令最多一个脚本；vendored Lua 5.4 VM 位于该脚本的专用线程，SQLite 与 LLM Future 由主 Tokio Runtime 驱动。"
     },
     "sqlite-session-root": {
       title: "SQLite 交互会话根",
@@ -1514,10 +1527,10 @@ h1 {
       status: "生产根已实现",
       role: "为可信 Lua 启动单连接 actor，并返回可共享 operations 与不可复制的唯一 SessionFinalizer。",
       plain: "operations 只负责 query、execute 与事务操作；finalizer 按值消费，禁止新命令、排空已接管命令、回滚活动事务并关闭和 join actor。",
-      example: "脚本正常返回但仍有活动事务时，唯一 finalizer 回滚后报告 UnclosedTransaction，同时保留连接关闭终态。",
+      example: "脚本正常返回但仍有活动事务时，finalizer 回滚并以 had_unclosed_transaction 告知 Host；清理首因与可选关闭次因可以同时保留。",
       input: "project.db 路径",
       output: "OpenedSqliteInteractiveSession { operations, finalizer } 或打开错误",
-      boundary: "BEGIN 固定为 DEFERRED；每条语句后以 SQLite is_autocommit() 校正权威状态，OutcomeUnknown 会毒化 actor。"
+      boundary: "BEGIN 固定为 DEFERRED；命令通道容量固定为 1，finalizer 走独立控制通道；复杂事务观察留在 SQLite 内部。"
     },
     "llm-contract": {
       title: "公共 LLM 请求契约",
@@ -1527,7 +1540,7 @@ h1 {
       status: "crate 私有共享核心已实现",
       role: "让不同引擎业务与可信 Lua 用同一组消息、响应和单次失败语义调用模型根。",
       plain: "公共层只表达一次非流式调用需要什么、返回什么；它不知道 MZ 资产、提示词规划或网络重试策略。",
-      example: "MZ Standard 和 Translate Lua 都提交 ChatMessage，并收到同一种 LlmResponse；以后其他引擎可以直接消费同一契约。",
+      example: "MZ Standard 和 Translate Lua 都提交 ChatMessage，并收到同一种 LlmResponse，共享同一客户端、连接池和 RPM/burst 配额。",
       input: "受信 Client 与 ChatMessage 列表",
       output: "LlmResponse 或 Retryable/Fatal 单次请求错误",
       boundary: "请求 wire、固定 Bearer、并发队列、RPM/burst 和网络错误分类属于具体根；重试、响应业务解析和结果提交仍属于调用方。"
@@ -1542,8 +1555,8 @@ h1 {
       plain: "Standard Translate 与 Translate Lua 共享同一 Executor、Client、连接池和速率额度；其他阶段的 ctx.llm 为 nil。",
       example: "parameters 为空对象时，请求正文严格只有 model、messages、stream=false；WriteBack 不会偷用某个默认 Client。",
       input: "公共 Client 与消息",
-      output: "区分 provider request/response ID、finish reason 与 usage 的 LlmResponse，或结构化请求错误",
-      boundary: "根固定 model、messages、stream=false，只合并 Client 的严格 JSON parameters；请求准入、RPM/burst、超时和错误分类由根负责，根不重试。"
+      output: "content、finish reason、可选 provider request/response ID、可选 usage，或结构化请求错误",
+      boundary: "HTTP 200 只要求完整 JSON、唯一数值 index 0 及其 content/finish_reason；Content-Type、role 和可选元数据不成为供应商兼容障碍。"
     },
     "delay-root": {
       title: "异步等待根",
@@ -1555,47 +1568,21 @@ h1 {
       plain: "根只睡眠指定时长，不拥有重试次数、间隔或 Retry-After 策略；Future 被丢弃即取消等待。",
       example: "Executor 判断一次 429 可重试并选定等待时长后，TokioAsyncDelay 只执行这次等待。",
       input: "Duration",
-      output: "等待完成；错误类型为 Infallible",
+      output: "等待完成；Future 被丢弃时取消本次等待",
       boundary: "重试判断仍由 Standard Task Executor 拥有。"
     },
-    "run-id-root": {
-      title: "运行标识根",
-      symbol: "WindowsRunIdGenerator as RunIdGenerator",
-      shortSymbol: "WindowsRunIdGenerator",
-      path: "src/runtime/run_id.rs",
-      status: "生产根已实现",
-      role: "用 Windows 安全随机源生成 UUID v4，给一次 Translate 或 WriteBack 运行建立稳定身份。",
-      plain: "Translate 在项目与 Profile 解析后生成；WriteBack 在项目和实际布局确定后生成。同一次 Standard 运行的全部日志共用它。",
-      example: "同一个翻译任务的 task 事件和 summary 事件拥有同一 run_id，但下一次命令得到新的 run_id。",
-      input: "无",
-      output: "RunId 或 Windows 随机源错误",
-      boundary: "日志根只记录调用方给出的运行上下文，不自行猜测归属。"
-    },
-    "translation-event-log": {
-      title: "翻译 JSONL 日志根",
-      symbol: "TranslationJsonLinesEventLog as PersistentEventLog<TranslationLogEvent>",
-      shortSymbol: "Translation JSONL Log",
-      path: "src/runtime/json_lines.rs",
-      status: "生产根已实现",
-      role: "把 Translation task 与 summary 事件追加到全局 translation.jsonl，并在 sync_data 成功后确认。",
-      plain: "独立有界 writer、跨进程 Windows 文件锁、尾部恢复与轮转共同维护文件物理顺序；领域类型先映射为稳定 wire DTO。",
-      example: "任务日志记录 run_id、项目、Profile、两个供应商 ID 和 final_response_usage，不记录密钥、messages 或全文。",
-      input: "TranslationLogEvent 与运行上下文",
-      output: "持久化确认或 NotPersisted/OutcomeUnknown/PersistedButMaintenanceFailed",
-      boundary: "唯一日志 finalizer 在进程 shutdown 时停止准入、排空队列并同步结束。"
-    },
-    "writeback-event-log": {
-      title: "写回 JSONL 日志根",
-      symbol: "WriteBackJsonLinesEventLog as PersistentEventLog<WriteBackRunLog>",
-      shortSymbol: "WriteBack JSONL Log",
-      path: "src/runtime/json_lines.rs",
-      status: "生产根已实现",
-      role: "把一次完整 WriteBack 的输出、Standard 汇总、人工布局诊断和 Lua 执行事实追加到全局 write_back.jsonl，并在 sync_data 后确认。",
-      plain: "它与翻译流拥有独立 worker、队列、锁和轮转序列，两个事件流不会串写。",
-      example: "记录同一 run_id、项目、实际三个布局宽度、output_root、summary、结构化位置诊断与 lua_executed。",
-      input: "WriteBackRunLog 与运行上下文",
-      output: "持久化确认或精确失败终态",
-      boundary: "物理行顺序是全局权威顺序；完整但无法按当前 wire 解析的行被视为损坏。"
+    "audit-ledger": {
+      title: "统一强审计账本",
+      symbol: "JsonLinesAuditLedger · AuditLedger",
+      shortSymbol: "audit.jsonl",
+      path: "src/att_mz/audit.rs · src/runtime/json_lines.rs",
+      status: "领域 wire 与通用持久根已实现",
+      role: "为四个命令持久化 run 生命周期、翻译任务意图/终态和写回发布意图/终态，并在 sync_data 后确认。",
+      plain: "MZ 拥有 command/event/payload 与结构化位置；通用 JSONL 根只负责有界队列、跨进程锁、追加、尾部恢复、轮转、retention 和刷盘。",
+      example: "translation_task_started 未确认时不发送模型请求；write_back_publish_started 未确认时不交换目录。",
+      input: "AuditEvent 与本次 run/project/command/profile 上下文",
+      output: "EventId，或 NotPersisted/OutcomeUnknown/PersistedButMaintenanceFailed",
+      boundary: "固定 audit.jsonl；每条事件独立 UUID，意图与终态共享 operation_id；副作用已生效但终态审计失败时明确报告审计未确认。"
     },
     "lua-extraction": {
       title: "Lua 提取",
@@ -1628,24 +1615,12 @@ h1 {
       shortSymbol: "TranslateService",
       path: "src/att_mz/translate/service.rs",
       status: "业务逻辑已实现",
-      role: "在项目租约内精确选择 Profile、验证来源与 owner freshness，再依次运行 Standard 和可选 Lua。",
+      role: "在项目租约内使用配置边界已经选定的 Profile，验证来源与 owner freshness，再依次运行 Standard 和可选 Lua。",
       plain: "它是翻译总负责人。规划、执行、验收和入库都不是与它平行的“大功能”，而是它交给 Standard 子总控继续管理的内部职责。",
       example: "用户选择 profile=quality。Translate 找到唯一配置，读取 demo 项目，先让 Standard 完整结束；只有成功后，才运行可选 Lua 翻译脚本。",
-      input: "项目名、Profile 名、可选完整术语/占位符快照路径与可选 Lua",
+      input: "项目名、共享受信 Profile、可选完整术语/占位符快照路径与 SelectedLua",
       output: "Standard 报告与可选 Lua 完成结果",
       boundary: "Standard 执行分支直接展示模型与等待生产根；Lua 分支复用同一公共 LLM Client。"
-    },
-    "profile-resolver": {
-      title: "精确选择 Profile",
-      symbol: "InMemoryTranslationExecutionProfileResolver",
-      shortSymbol: "Profile Resolver",
-      path: "src/att_mz/translate/profile.rs",
-      status: "业务逻辑已实现",
-      role: "按名称选出唯一、完整、已经校验的翻译执行配置。",
-      plain: "它像配方柜：指定哪个配方就拿哪个，不做模糊匹配，也不在运行中偷偷补默认策略。",
-      example: "请求 profile=fast 时只会选择名为 fast 的配置。找不到就明确失败，不会因为 quality 看起来也能用就自动替换。",
-      input: "Profile 名称",
-      output: "共享的 TranslationExecutionProfile"
     },
     "standard-translation": {
       title: "Standard 子总控",
@@ -1658,7 +1633,7 @@ h1 {
       example: "完全相同的再次运行会发现所有叶子都是 Current，既不调用模型，也不写数据库；只改术语时只让受影响叶子重新进入 Pending。",
       input: "StoredProjectRecord、Profile 与可选完整资源替换",
       output: "StandardTranslationRunReport",
-      boundary: "任务与汇总事件由 TranslationJsonLinesEventLog 持久化；运行身份由 WindowsRunIdGenerator 建立。"
+      boundary: "每个模型任务先审计意图，再发送请求；验收和提交确定后审计终态。任务结果由 Complete/Partial/Unavailable 数据枚举直接表达。"
     },
     "asset-reader": {
       title: "标准资产读取",
@@ -1792,7 +1767,7 @@ h1 {
       plain: "它像受控派单员：不会无限并发，也不会见错就重试。模型返回后还必须交给响应处理模块逐 ID 验货。",
       example: "网络暂时断开可以按配置重试；若模型回了非法协议，重试也不会变正确，因此直接作为该任务的失败结果。",
       input: "TranslationTaskBlock 与执行 Profile",
-      output: "TranslationTaskOutcome"
+      output: "Complete / Partial / Unavailable 数据枚举，含唯一 NonZeroUsize 尝试次数"
     },
     "response-processor": {
       title: "响应结构与逐 ID 验收",
@@ -1841,7 +1816,7 @@ h1 {
       example: "Lua 修改候选后报错，WriteBack 只调用一次 discard，demo/write_back 仍是上一轮完整输出；publish 接管 token 后上层不再清理。",
       input: "项目名与可选 Lua 脚本路径",
       output: "固定输出根、Standard 汇总与 Lua 执行状态",
-      boundary: "发布前复核候选普通 data/js 与资源预算；日志只在发布成功后追加，日志失败时明确说明输出已经生效。"
+      boundary: "MZ 复核 data/js 领域结构，文件根复核通用身份与预算；发布意图先刷盘，发布终态随后写入统一 audit.jsonl。"
     },
     "standard-writeback": {
       title: "Standard 写回准备",
@@ -1850,11 +1825,11 @@ h1 {
       path: "src/att_mz/write_back/standard.rs",
       status: "业务编排已实现",
       role: "读取新鲜资产快照，按稳定顺序完成布局、Mutation 规划和完整文档重写，但不发布。",
-      plain: "它交付完整文件覆盖、汇总和人工诊断。候选、Lua、发布与日志由 WriteBack 总控继续编排，因此整个命令只有一个可见发布点。",
+      plain: "它交付完整文件覆盖、汇总和人工诊断。候选、Lua、发布与强审计由 WriteBack 总控继续编排，因此整个命令只有一个可见发布点。",
       example: "某段译文超过对话宽度但没有安全断点。Standard 仍把原译文写入候选覆盖，manual_layout_units 加一，不把正常人工处理升级成技术错误。",
       input: "OpenedProject 与显式 MzWriteBackLayoutProfile",
       output: "StandardWriteBackPreparation：重写文档、汇总与完整人工诊断",
-      boundary: "Reader 与 Rewriter 分别连接 RusqliteStorage、BoundedCpuExecutor 和 SystemFileSystem；不拥有目录发布或日志。"
+      boundary: "Reader 与 Rewriter 分别连接 RusqliteStorage、BoundedCpuExecutor 和 SystemFileSystem；不拥有目录发布或审计。"
     },
     "writeback-asset-reader": {
       title: "读取写回资产",
@@ -1938,10 +1913,12 @@ h1 {
   }
 
   ROOTS.init.tree = n("init-command-runner", "production-command-runner", [
+    n("init-command-config", "command-configuration", [], { reused: true }),
+    n("init-audit", "audit-ledger", [], { order: "①", reused: true }),
     n("init-service", "init-service", [
     n("init-cancellation", "cooperative-cancellation", [], { reused: true }),
     n("init-project-name", "project-name", [], { order: "①" }),
-    n("init-project-lease", "project-operation-lease", [], { order: "②", reused: true }),
+    n("init-project-lease", "project-command-lease", [], { order: "②", reused: true }),
     n("init-existing-directory", "existing-directory-root", [], { order: "③" }),
     n("init-source-fingerprint", "source-fingerprint", [
       n("init-directory-fingerprint", "directory-fingerprint-root", [], { reused: true })
@@ -1961,9 +1938,11 @@ h1 {
   ]);
 
   ROOTS.extract.tree = n("extract-command-runner", "production-command-runner", [
+    n("extract-command-config", "command-configuration", [], { reused: true }),
+    n("extract-audit", "audit-ledger", [], { order: "①", reused: true }),
     n("extract-service", "extract-service", [
     n("extract-cancellation", "cooperative-cancellation", [], { reused: true }),
-    n("extract-project-lease", "project-operation-lease", [], { order: "①", reused: true }),
+    n("extract-project-lease", "project-command-lease", [], { order: "①", reused: true }),
     n("extract-project-open", "project-opener", [
       n("extract-project-record", "project-record-reader", [
         n("extract-project-layout", "project-workspace-layout", [], { reused: true }),
@@ -2012,10 +1991,11 @@ h1 {
   ]);
 
   ROOTS.translate.tree = n("translate-command-runner", "production-command-runner", [
+    n("translate-command-config", "command-configuration", [], { reused: true }),
+    n("translate-audit", "audit-ledger", [], { order: "①", reused: true }),
     n("translate-service", "translate-service", [
     n("translate-cancellation", "cooperative-cancellation", [], { reused: true }),
-    n("translate-profile", "profile-resolver", [], { order: "①" }),
-    n("translate-project-lease", "project-operation-lease", [], { order: "②", reused: true }),
+    n("translate-project-lease", "project-command-lease", [], { order: "①", reused: true }),
     n("translate-project-open", "project-opener", [
       n("translate-project-record", "project-record-reader", [
         n("translate-project-layout", "project-workspace-layout", [], { reused: true }),
@@ -2028,8 +2008,7 @@ h1 {
     ], { order: "③", reused: true }),
     n("translate-standard", "standard-translation", [
       n("standard-cancellation", "cooperative-cancellation", [], { reused: true }),
-      n("standard-run-id", "run-id-root", [], { reused: true }),
-      n("standard-translation-log", "translation-event-log"),
+      n("standard-audit", "audit-ledger", [], { reused: true }),
       n("standard-asset-reader", "asset-reader", [
         n("reader-standard-storage", "standard-asset-storage", [], { reused: true }),
         n("reader-location-codec", "location-codec", [], { reused: true }),
@@ -2089,9 +2068,11 @@ h1 {
   ]);
 
   ROOTS.writeback.tree = n("writeback-command-runner", "production-command-runner", [
+    n("writeback-command-config", "command-configuration", [], { reused: true }),
+    n("writeback-audit", "audit-ledger", [], { order: "①", reused: true }),
     n("writeback-service", "writeback-service", [
     n("writeback-cancellation", "cooperative-cancellation", [], { reused: true }),
-    n("writeback-project-lease", "project-operation-lease", [], { order: "①", reused: true }),
+    n("writeback-project-lease", "project-command-lease", [], { order: "①", reused: true }),
     n("writeback-project-open", "project-opener", [
       n("writeback-project-record", "project-record-reader", [
         n("writeback-project-layout", "project-workspace-layout", [], { reused: true }),
@@ -2102,7 +2083,6 @@ h1 {
         n("writeback-directory-fingerprint", "directory-fingerprint-root", [], { reused: true })
       ], { reused: true })
     ], { order: "②", reused: true }),
-    n("writeback-run-id", "run-id-root", [], { reused: true }),
     n("writeback-standard", "standard-writeback", [
       n("writeback-standard-cancellation", "cooperative-cancellation", [], { reused: true }),
       n("writeback-asset-read", "writeback-asset-reader", [
@@ -2142,7 +2122,7 @@ h1 {
       n("writeback-publisher-cancellation", "cooperative-cancellation", [], { reused: true }),
       n("writeback-recoverable-publish", "recoverable-directory-root", [], { reused: true })
     ], { order: "⑦", reused: true }),
-    n("writeback-log", "writeback-event-log", [], { order: "⑧" })
+    n("writeback-operation-audit", "audit-ledger", [], { order: "⑧", reused: true })
     ])
   ]);
 
@@ -2185,6 +2165,16 @@ h1 {
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#039;");
+  }
+
+  function renderSourceLinks(path) {
+    return String(path)
+      .split(" · ")
+      .map(function (sourcePath) {
+        var escaped = escapeHtml(sourcePath);
+        return '<a class="source-link" href="' + escaped + '">' + escaped + '</a>';
+      })
+      .join("");
   }
 
   function svgEl(tag, attrs) {
@@ -2340,7 +2330,7 @@ h1 {
     branchSummary.textContent = root.summary;
     sequenceText.textContent = root.sequence;
     treeFoot.textContent = rootId === "writeback"
-      ? "WriteBack 从业务编排展开到全部生产环境根；固定磁盘输出与 JSONL 日志均在真实装配中完成。"
+      ? "WriteBack 从业务编排展开到全部生产环境根；固定磁盘输出与统一 audit.jsonl 强审计均在真实装配中完成。"
       : rootId === "init"
         ? "Init 从业务编排展开到 SystemFileSystem 与 RusqliteStorage；冻结工作区由真实根创建或收敛。"
         : "点击模块逐层展开。重复出现的“复用”节点仍是同一个实现，不会被另分成第五类。";
@@ -2727,7 +2717,7 @@ h1 {
         '</div>' +
         '<div class="detail-block">' +
           '<span class="detail-label">代码位置</span>' +
-          '<a class="source-link" href="' + escapeHtml(module.path) + '">' + escapeHtml(module.path) + '</a>' +
+          renderSourceLinks(module.path) +
         '</div>' +
         boundary +
       '</div>';

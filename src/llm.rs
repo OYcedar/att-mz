@@ -98,7 +98,7 @@ pub(crate) struct LlmResponse {
     content: String,
     finish_reason: LlmFinishReason,
     provider_request_id: Option<String>,
-    provider_response_id: String,
+    provider_response_id: Option<String>,
     usage: Option<LlmUsage>,
 }
 
@@ -107,14 +107,14 @@ impl LlmResponse {
         content: impl Into<String>,
         finish_reason: LlmFinishReason,
         provider_request_id: Option<String>,
-        provider_response_id: impl Into<String>,
+        provider_response_id: Option<String>,
         usage: Option<LlmUsage>,
     ) -> Self {
         Self {
             content: content.into(),
             finish_reason,
             provider_request_id,
-            provider_response_id: provider_response_id.into(),
+            provider_response_id,
             usage,
         }
     }
@@ -131,8 +131,8 @@ impl LlmResponse {
         self.provider_request_id.as_deref()
     }
 
-    pub(crate) fn provider_response_id(&self) -> &str {
-        &self.provider_response_id
+    pub(crate) fn provider_response_id(&self) -> Option<&str> {
+        self.provider_response_id.as_deref()
     }
 
     pub(crate) const fn usage(&self) -> Option<LlmUsage> {

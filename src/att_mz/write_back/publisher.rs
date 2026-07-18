@@ -10,12 +10,16 @@ use crate::storage::file_system::{
     DirectoryDiscardError, DirectoryFileOverlay, DirectoryPrepareError, DirectoryPublishError,
     DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
     DirectoryStageRequestError, RecoverableDirectoryPublisher, ScopedDirectoryBindError,
-    ScopedDirectoryEditError, ScopedDirectoryEditor,
+    ScopedDirectoryEditError, ScopedDirectoryEditor, ScopedDirectoryEntry,
+    ScopedDirectoryEntryKind,
 };
 
 use super::lua::ScopedPreparedWriteBackCandidate;
 use super::rewriter::MzRewrittenDocuments;
-use super::{PreparedWriteBackCandidate, PublishedWriteBack, StandardWriteBackPublisher};
+use super::{
+    PreparedWriteBackCandidate, PublishedWriteBack, StandardWriteBackPublisher,
+    WriteBackPublishFailure, WriteBackPublishFailureState,
+};
 
 /// 根已准备、只能发布或丢弃一次的完整写回候选。
 pub(crate) struct PreparedWriteBack<S> {
@@ -152,7 +156,8 @@ where
         // 通过 `&Candidate` 带入异步状态机并错误要求 Sync。
         let bind = self
             .directory_publisher
-            .bind_scoped_directory(&candidate.staged);
+            .bind_scoped_directory(&candidate.staged, super::mz_output_scope());
+        let candidate_root = candidate.candidate_root().to_path_buf();
         let directory_publisher = &self.directory_publisher;
         async move {
             let scope = bind
@@ -161,20 +166,35 @@ where
             directory_publisher
                 .validate_scoped_directory(&scope)
                 .await
-                .map_err(StandardWriteBackPublishingError::ValidateCandidate)
+                .map_err(StandardWriteBackPublishingError::ValidateCandidate)?;
+            let entries = directory_publisher
+                .list_scoped_root(&scope)
+                .await
+                .map_err(StandardWriteBackPublishingError::InspectCandidateRoot)?;
+            validate_mz_candidate_root(&entries).map_err(|()| {
+                StandardWriteBackPublishingError::InvalidCandidateRoot {
+                    root: candidate_root,
+                }
+            })
         }
     }
 
-    async fn publish(&self, candidate: Self::Candidate) -> Result<PublishedWriteBack, Self::Error> {
+    async fn publish(
+        &self,
+        candidate: Self::Candidate,
+    ) -> Result<PublishedWriteBack, WriteBackPublishFailure<Self::Error>> {
         let PreparedWriteBack {
             output_root,
             staged,
             ..
         } = candidate;
-        self.directory_publisher
-            .publish(staged)
-            .await
-            .map_err(StandardWriteBackPublishingError::Publish)?;
+        if let Err(source) = self.directory_publisher.publish(staged).await {
+            let state = publish_failure_state(&source);
+            return Err(WriteBackPublishFailure::new(
+                state,
+                StandardWriteBackPublishingError::Publish(source),
+            ));
+        }
         Ok(PublishedWriteBack::new(output_root))
     }
 
@@ -183,6 +203,63 @@ where
             .discard(candidate.staged)
             .await
             .map_err(StandardWriteBackPublishingError::Discard)
+    }
+}
+
+fn publish_failure_state<E>(source: &DirectoryPublishError<E>) -> WriteBackPublishFailureState {
+    match source {
+        DirectoryPublishError::TargetAlreadyExists {
+            target_root,
+            cleanup_failure,
+        }
+        | DirectoryPublishError::TargetMissing {
+            target_root,
+            cleanup_failure,
+        }
+        | DirectoryPublishError::TargetNotDirectory {
+            target_root,
+            cleanup_failure,
+        }
+        | DirectoryPublishError::NotAttempted {
+            target_root,
+            cleanup_failure,
+            ..
+        }
+        | DirectoryPublishError::NotPublished {
+            target_root,
+            cleanup_failure,
+            ..
+        } => WriteBackPublishFailureState::NotPublished {
+            output_root: target_root.clone(),
+            residual_paths: cleanup_failure
+                .iter()
+                .map(|failure| failure.residual_path().to_path_buf())
+                .collect(),
+        },
+        DirectoryPublishError::PublishedWithResiduals {
+            target_root,
+            residual_path,
+            ..
+        } => WriteBackPublishFailureState::PublishedWithResiduals {
+            output_root: target_root.clone(),
+            residual_paths: vec![residual_path.clone()],
+        },
+        DirectoryPublishError::RecoveryRequired {
+            target_root,
+            recovery_artifacts,
+            ..
+        } => WriteBackPublishFailureState::RecoveryRequired {
+            output_root: target_root.clone(),
+            recovery_artifacts: recovery_artifacts.clone(),
+        },
+        DirectoryPublishError::OutcomeUnknown {
+            target_root,
+            recovery_artifacts,
+            ..
+        } => WriteBackPublishFailureState::OutcomeUnknown {
+            output_root: target_root.clone(),
+            recovery_artifacts: recovery_artifacts.clone(),
+        },
     }
 }
 
@@ -199,6 +276,10 @@ pub(crate) enum StandardWriteBackPublishingError<E> {
     Prepare(DirectoryPrepareError<E>),
     BindCandidate(ScopedDirectoryBindError<E>),
     ValidateCandidate(ScopedDirectoryEditError<E>),
+    InspectCandidateRoot(ScopedDirectoryEditError<E>),
+    InvalidCandidateRoot {
+        root: PathBuf,
+    },
     Publish(DirectoryPublishError<E>),
     Discard(DirectoryDiscardError<E>),
 }
@@ -230,6 +311,14 @@ where
             Self::ValidateCandidate(source) => {
                 write!(formatter, "写回候选未通过完整树校验：{source}")
             }
+            Self::InspectCandidateRoot(source) => {
+                write!(formatter, "无法检查写回候选顶层结构：{source}")
+            }
+            Self::InvalidCandidateRoot { root } => write!(
+                formatter,
+                "写回候选根必须恰好包含普通 data 与 js 目录：{}",
+                root.display()
+            ),
             Self::Publish(source) => source.fmt(formatter),
             Self::Discard(source) => source.fmt(formatter),
         }
@@ -247,10 +336,27 @@ where
             Self::Prepare(source) => Some(source),
             Self::BindCandidate(source) => Some(source),
             Self::ValidateCandidate(source) => Some(source),
+            Self::InspectCandidateRoot(source) => Some(source),
+            Self::InvalidCandidateRoot { .. } => None,
             Self::Publish(source) => Some(source),
             Self::Discard(source) => Some(source),
         }
     }
+}
+
+fn validate_mz_candidate_root(entries: &[ScopedDirectoryEntry]) -> Result<(), ()> {
+    if entries.len() != 2 {
+        return Err(());
+    }
+    let has_data = entries.iter().any(|entry| {
+        entry.name() == std::ffi::OsStr::new("data")
+            && entry.kind() == ScopedDirectoryEntryKind::Directory
+    });
+    let has_js = entries.iter().any(|entry| {
+        entry.name() == std::ffi::OsStr::new("js")
+            && entry.kind() == ScopedDirectoryEntryKind::Directory
+    });
+    if has_data && has_js { Ok(()) } else { Err(()) }
 }
 
 #[cfg(test)]
@@ -262,8 +368,8 @@ mod tests {
     use crate::att_mz::write_back::rewriter::MzRewrittenFile;
 
     use crate::storage::file_system::{
-        BoundScopedDirectory, ScopedDirectoryEntry, ScopedDirectoryPath, StagedDirectory,
-        StagingCleanupFailure,
+        BoundScopedDirectory, ScopedDirectoryEntry, ScopedDirectoryPath, ScopedDirectoryScope,
+        StagedDirectory, StagingCleanupFailure,
     };
 
     type PrepareError = DirectoryPrepareError<FakeError>;
@@ -365,6 +471,7 @@ mod tests {
         fn bind_scoped_directory(
             &self,
             candidate: &StagedDirectory<Self::CandidateState>,
+            scope: ScopedDirectoryScope,
         ) -> impl std::future::Future<
             Output = Result<
                 BoundScopedDirectory<Self::ScopeState>,
@@ -373,7 +480,7 @@ mod tests {
         > + Send
         + use<> {
             let root = candidate.staging_root().to_path_buf();
-            std::future::ready(Ok(BoundScopedDirectory::new(root, ())))
+            std::future::ready(Ok(BoundScopedDirectory::new(root, scope, ())))
         }
 
         fn validate_scoped_directory(
@@ -403,6 +510,18 @@ mod tests {
             Output = Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Self::Error>>,
         > + Send {
             std::future::ready(Ok(Vec::new()))
+        }
+
+        fn list_scoped_root(
+            &self,
+            _scope: &BoundScopedDirectory<Self::ScopeState>,
+        ) -> impl std::future::Future<
+            Output = Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Self::Error>>,
+        > + Send {
+            std::future::ready(Ok(vec![
+                ScopedDirectoryEntry::new("data".into(), ScopedDirectoryEntryKind::Directory),
+                ScopedDirectoryEntry::new("js".into(), ScopedDirectoryEntryKind::Directory),
+            ]))
         }
 
         fn create_scoped_directory(
@@ -444,6 +563,28 @@ mod tests {
     }
 
     impl Error for FakeError {}
+
+    #[test]
+    fn mz_candidate_root_owns_exact_data_and_js_structure() {
+        let directory = |name: &str| {
+            ScopedDirectoryEntry::new(name.into(), ScopedDirectoryEntryKind::Directory)
+        };
+        assert_eq!(
+            validate_mz_candidate_root(&[directory("data"), directory("js")]),
+            Ok(())
+        );
+        for entries in [
+            vec![directory("data")],
+            vec![directory("data"), directory("js"), directory("other")],
+            vec![directory("Data"), directory("js")],
+            vec![
+                ScopedDirectoryEntry::new("data".into(), ScopedDirectoryEntryKind::File),
+                directory("js"),
+            ],
+        ] {
+            assert_eq!(validate_mz_candidate_root(&entries), Err(()));
+        }
+    }
 
     fn project(name: &str, projects_root: &str) -> OpenedProject {
         let workspace_root = PathBuf::from(projects_root).join(name);
@@ -689,7 +830,10 @@ mod tests {
 
     async fn assert_publish_error(
         root_error: DirectoryPublishError<FakeError>,
-    ) -> StandardWriteBackPublishingError<FakeError> {
+    ) -> (
+        WriteBackPublishFailureState,
+        StandardWriteBackPublishingError<FakeError>,
+    ) {
         let project = project("alice", "C:/projects");
         let (publisher, _, publish_calls) = harness(None, Err(root_error));
         let candidate = publisher
@@ -704,17 +848,24 @@ mod tests {
             publish_calls.lock().expect("发布调用锁不应中毒")[0].mode,
             DirectoryPublishIntent::ReplaceExisting
         );
-        error
+        error.into_parts()
     }
 
     #[tokio::test]
     async fn preserves_replace_target_missing_and_not_directory_states() {
         let target_root = PathBuf::from("C:/projects/alice/write_back");
-        let error = assert_publish_error(DirectoryPublishError::TargetMissing {
+        let (state, error) = assert_publish_error(DirectoryPublishError::TargetMissing {
             target_root: target_root.clone(),
             cleanup_failure: None,
         })
         .await;
+        assert_eq!(
+            state,
+            WriteBackPublishFailureState::NotPublished {
+                output_root: target_root.clone(),
+                residual_paths: Vec::new(),
+            }
+        );
         assert!(matches!(
             error,
             StandardWriteBackPublishingError::Publish(
@@ -725,11 +876,18 @@ mod tests {
             ) if failed_target == target_root
         ));
 
-        let error = assert_publish_error(DirectoryPublishError::TargetNotDirectory {
+        let (state, error) = assert_publish_error(DirectoryPublishError::TargetNotDirectory {
             target_root: target_root.clone(),
             cleanup_failure: None,
         })
         .await;
+        assert_eq!(
+            state,
+            WriteBackPublishFailureState::NotPublished {
+                output_root: target_root.clone(),
+                residual_paths: Vec::new(),
+            }
+        );
         assert!(matches!(
             error,
             StandardWriteBackPublishingError::Publish(
@@ -745,7 +903,7 @@ mod tests {
     async fn preserves_known_not_published_state_and_candidate_cleanup_failure() {
         let target_root = PathBuf::from("C:/projects/alice/write_back");
         let residual_path = PathBuf::from("C:/projects/alice/.write_back-stage");
-        let error = assert_publish_error(DirectoryPublishError::NotPublished {
+        let (state, error) = assert_publish_error(DirectoryPublishError::NotPublished {
             target_root: target_root.clone(),
             source: FakeError("replace"),
             cleanup_failure: Some(StagingCleanupFailure::new(
@@ -754,6 +912,13 @@ mod tests {
             )),
         })
         .await;
+        assert_eq!(
+            state,
+            WriteBackPublishFailureState::NotPublished {
+                output_root: target_root.clone(),
+                residual_paths: vec![residual_path.clone()],
+            }
+        );
 
         assert!(matches!(
             error,
@@ -773,12 +938,19 @@ mod tests {
     async fn preserves_published_cleanup_failure_and_outcome_unknown_states() {
         let target_root = PathBuf::from("C:/projects/alice/write_back");
         let residual_path = PathBuf::from("C:/projects/alice/.write_back-old");
-        let error = assert_publish_error(DirectoryPublishError::PublishedWithResiduals {
+        let (state, error) = assert_publish_error(DirectoryPublishError::PublishedWithResiduals {
             target_root: target_root.clone(),
             residual_path: residual_path.clone(),
             source: FakeError("cleanup"),
         })
         .await;
+        assert_eq!(
+            state,
+            WriteBackPublishFailureState::PublishedWithResiduals {
+                output_root: target_root.clone(),
+                residual_paths: vec![residual_path.clone()],
+            }
+        );
         assert!(matches!(
             error,
             StandardWriteBackPublishingError::Publish(
@@ -791,12 +963,19 @@ mod tests {
         ));
 
         let recovery_artifacts = vec![PathBuf::from("C:/projects/alice/.write_back-recovery")];
-        let error = assert_publish_error(DirectoryPublishError::OutcomeUnknown {
+        let (state, error) = assert_publish_error(DirectoryPublishError::OutcomeUnknown {
             target_root: target_root.clone(),
             recovery_artifacts: recovery_artifacts.clone(),
             source: FakeError("restore"),
         })
         .await;
+        assert_eq!(
+            state,
+            WriteBackPublishFailureState::OutcomeUnknown {
+                output_root: target_root.clone(),
+                recovery_artifacts: recovery_artifacts.clone(),
+            }
+        );
         assert!(matches!(
             error,
             StandardWriteBackPublishingError::Publish(

@@ -9,12 +9,6 @@ use std::time::Duration;
 
 use crate::fingerprint::Sha256Fingerprint;
 
-/// 可恢复目录发布器在目标父目录中持有的锁命名空间。
-///
-/// 该名称同时是工作区结构观察需要精确识别的受管基础设施事实，因此由目录能力
-/// 契约统一拥有，避免发布实现与业务收敛边界各自复制字符串常量。
-pub(crate) const DIRECTORY_PUBLISH_LOCK_NAMESPACE: &str = ".att-dirpub-locks";
-
 /// 解析现存目录时可能发生的失败。
 #[derive(Debug)]
 pub(crate) enum ResolveDirectoryError<E> {
@@ -242,114 +236,98 @@ pub(crate) trait FileReader: Send + Sync {
     ) -> impl Future<Output = Result<ReadFile, ReadFileError<Self::Error>>> + Send;
 }
 
-/// 一个项目级排他操作租约的受检请求。
+/// 在指定文件身份上取得跨进程排他租约的受检请求。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProjectOperationLeaseRequest {
-    projects_root: PathBuf,
-    project_directory_name: OsString,
+pub(crate) struct ExclusiveFileLeaseRequest {
+    lock_directory: PathBuf,
+    identity: OsString,
 }
 
-impl ProjectOperationLeaseRequest {
+impl ExclusiveFileLeaseRequest {
     pub(crate) fn new(
-        projects_root: PathBuf,
-        project_directory_name: OsString,
-    ) -> Result<Self, ProjectOperationLeaseRequestError> {
-        if projects_root.as_os_str().is_empty() {
-            return Err(ProjectOperationLeaseRequestError::EmptyProjectsRoot);
+        lock_directory: PathBuf,
+        identity: OsString,
+    ) -> Result<Self, ExclusiveFileLeaseRequestError> {
+        if lock_directory.as_os_str().is_empty() {
+            return Err(ExclusiveFileLeaseRequestError::EmptyLockDirectory);
         }
-        let project_path = Path::new(&project_directory_name);
-        let mut components = project_path.components();
-        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-            return Err(
-                ProjectOperationLeaseRequestError::InvalidProjectDirectoryName {
-                    name: project_directory_name,
-                },
-            );
+        if identity.is_empty() {
+            return Err(ExclusiveFileLeaseRequestError::EmptyIdentity);
         }
         Ok(Self {
-            projects_root,
-            project_directory_name,
+            lock_directory,
+            identity,
         })
     }
 
-    pub(crate) fn projects_root(&self) -> &Path {
-        &self.projects_root
+    pub(crate) fn lock_directory(&self) -> &Path {
+        &self.lock_directory
     }
 
-    pub(crate) fn project_directory_name(&self) -> &std::ffi::OsStr {
-        &self.project_directory_name
+    pub(crate) fn identity(&self) -> &OsStr {
+        &self.identity
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ProjectOperationLeaseRequestError {
-    EmptyProjectsRoot,
-    InvalidProjectDirectoryName { name: OsString },
+pub(crate) enum ExclusiveFileLeaseRequestError {
+    EmptyLockDirectory,
+    EmptyIdentity,
 }
 
-impl fmt::Display for ProjectOperationLeaseRequestError {
+impl fmt::Display for ExclusiveFileLeaseRequestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyProjectsRoot => formatter.write_str("项目集合根不能为空"),
-            Self::InvalidProjectDirectoryName { name } => write!(
-                formatter,
-                "项目目录名必须是一个普通路径段：{}",
-                name.to_string_lossy()
-            ),
+            Self::EmptyLockDirectory => formatter.write_str("排他文件租约目录不能为空"),
+            Self::EmptyIdentity => formatter.write_str("排他文件租约身份不能为空"),
         }
     }
 }
 
-impl Error for ProjectOperationLeaseRequestError {}
+impl Error for ExclusiveFileLeaseRequestError {}
 
-/// 持有一个项目级排他操作直到本值被丢弃。
-#[must_use = "项目操作租约必须存活到整个项目命令结束"]
-pub(crate) struct ProjectOperationLease<T> {
+/// 持有一个跨进程排他文件租约直到本值被丢弃。
+#[must_use = "排他文件租约必须存活到需要串行化的操作结束"]
+pub(crate) struct ExclusiveFileLease<T> {
     _state: T,
 }
 
-impl<T> ProjectOperationLease<T> {
+impl<T> ExclusiveFileLease<T> {
     pub(crate) const fn new(state: T) -> Self {
         Self { _state: state }
     }
 }
 
 #[derive(Debug)]
-pub(crate) enum ProjectOperationLeaseError<E> {
+pub(crate) enum ExclusiveFileLeaseError<E> {
     Busy {
-        project_directory_name: OsString,
+        identity: OsString,
         timeout: Duration,
     },
     Unavailable {
-        project_directory_name: OsString,
+        identity: OsString,
         source: E,
     },
 }
 
-impl<E: fmt::Display> fmt::Display for ProjectOperationLeaseError<E> {
+impl<E: fmt::Display> fmt::Display for ExclusiveFileLeaseError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Busy {
-                project_directory_name,
-                timeout,
-            } => write!(
+            Self::Busy { identity, timeout } => write!(
                 formatter,
-                "项目 {} 正由另一条命令处理，等待 {timeout:?} 后仍未取得租约",
-                project_directory_name.to_string_lossy()
+                "等待 {timeout:?} 后仍未取得排他文件租约：{}",
+                identity.to_string_lossy()
             ),
-            Self::Unavailable {
-                project_directory_name,
-                source,
-            } => write!(
+            Self::Unavailable { identity, source } => write!(
                 formatter,
-                "无法取得项目 {} 的操作租约：{source}",
-                project_directory_name.to_string_lossy()
+                "无法取得排他文件租约 {}：{source}",
+                identity.to_string_lossy()
             ),
         }
     }
 }
 
-impl<E: Error + 'static> Error for ProjectOperationLeaseError<E> {
+impl<E: Error + 'static> Error for ExclusiveFileLeaseError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Unavailable { source, .. } => Some(source),
@@ -358,19 +336,16 @@ impl<E: Error + 'static> Error for ProjectOperationLeaseError<E> {
     }
 }
 
-/// 为同一项目跨进程串行化完整命令的环境根能力。
-pub(crate) trait ProjectOperationLeaseProvider: Send + Sync {
+/// 为一个调用方声明的文件身份提供跨进程排他租约。
+pub(crate) trait ExclusiveFileLeaseProvider: Send + Sync {
     type Error: Error + Send + Sync + 'static;
     type LeaseState: Send + 'static;
 
-    fn acquire_project_operation_lease(
+    fn acquire_exclusive_file_lease(
         &self,
-        request: ProjectOperationLeaseRequest,
+        request: ExclusiveFileLeaseRequest,
     ) -> impl Future<
-        Output = Result<
-            ProjectOperationLease<Self::LeaseState>,
-            ProjectOperationLeaseError<Self::Error>,
-        >,
+        Output = Result<ExclusiveFileLease<Self::LeaseState>, ExclusiveFileLeaseError<Self::Error>>,
     > + Send;
 }
 
@@ -907,10 +882,10 @@ impl<T> StagedDirectory<T> {
     }
 }
 
-/// Lua 可在未发布候选内访问的受检相对路径。
+/// 未发布目录候选内的受检相对路径。
 ///
-/// 路径只允许精确位于 `data` 或 `js` 子树，不接受绝对路径、当前/父级段、前缀、
-/// ADS 分隔符或其他候选根外表达。
+/// 本类型只建立通用路径安全不变量；路径是否位于调用方声明的编辑范围，由绑定后的
+/// `ScopedDirectoryScope` 统一判断。
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ScopedDirectoryPath(PathBuf);
 
@@ -920,9 +895,6 @@ impl ScopedDirectoryPath {
         let Some(Component::Normal(root)) = components.next() else {
             return Err(ScopedDirectoryPathError { path });
         };
-        if root != OsStr::new("data") && root != OsStr::new("js") {
-            return Err(ScopedDirectoryPathError { path });
-        }
         if root.to_string_lossy().contains(':')
             || components.any(|component| {
                 !matches!(component, Component::Normal(name) if !name.to_string_lossy().contains(':'))
@@ -937,8 +909,11 @@ impl ScopedDirectoryPath {
         &self.0
     }
 
-    pub(crate) fn is_scope_root(&self) -> bool {
-        self.0.components().count() == 1
+    fn first_component(&self) -> &OsStr {
+        match self.0.components().next() {
+            Some(Component::Normal(root)) => root,
+            _ => unreachable!("ScopedDirectoryPath 已建立普通相对路径不变量"),
+        }
     }
 }
 
@@ -951,13 +926,89 @@ impl fmt::Display for ScopedDirectoryPathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "候选编辑路径必须是 data 或 js 下的安全相对路径：{}",
+            "候选编辑路径必须是无 ADS、当前段或父级逃逸的安全相对路径：{}",
             self.path.display()
         )
     }
 }
 
 impl Error for ScopedDirectoryPathError {}
+
+/// 调用方为一个目录候选声明的可编辑顶层目录集合。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScopedDirectoryScope {
+    roots: Vec<OsString>,
+}
+
+impl ScopedDirectoryScope {
+    pub(crate) fn new(
+        roots: impl IntoIterator<Item = OsString>,
+    ) -> Result<Self, ScopedDirectoryScopeError> {
+        let mut roots = roots.into_iter().collect::<Vec<_>>();
+        if roots.is_empty() {
+            return Err(ScopedDirectoryScopeError::Empty);
+        }
+        for root in &roots {
+            let path = Path::new(root);
+            let mut components = path.components();
+            if !matches!(components.next(), Some(Component::Normal(name)) if !name.to_string_lossy().contains(':'))
+                || components.next().is_some()
+            {
+                return Err(ScopedDirectoryScopeError::InvalidRoot { root: root.clone() });
+            }
+        }
+        roots.sort();
+        for pair in roots.windows(2) {
+            if pair[0] == pair[1] {
+                return Err(ScopedDirectoryScopeError::DuplicateRoot {
+                    root: pair[0].clone(),
+                });
+            }
+        }
+        Ok(Self { roots })
+    }
+
+    pub(crate) fn roots(&self) -> &[OsString] {
+        &self.roots
+    }
+
+    pub(crate) fn contains(&self, path: &ScopedDirectoryPath) -> bool {
+        self.roots
+            .iter()
+            .any(|root| root.as_os_str() == path.first_component())
+    }
+
+    pub(crate) fn is_scope_root(&self, path: &ScopedDirectoryPath) -> bool {
+        path.0.components().count() == 1 && self.contains(path)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ScopedDirectoryScopeError {
+    Empty,
+    InvalidRoot { root: OsString },
+    DuplicateRoot { root: OsString },
+}
+
+impl fmt::Display for ScopedDirectoryScopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("候选编辑范围必须至少声明一个顶层目录"),
+            Self::InvalidRoot { root } => write!(
+                formatter,
+                "候选编辑范围必须使用单个安全相对路径段：{}",
+                root.to_string_lossy()
+            ),
+            Self::DuplicateRoot { root } => write!(
+                formatter,
+                "候选编辑范围重复声明顶层目录：{}",
+                root.to_string_lossy()
+            ),
+        }
+    }
+}
+
+impl Error for ScopedDirectoryScopeError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScopedDirectoryEntryKind {
@@ -989,12 +1040,13 @@ impl ScopedDirectoryEntry {
 #[derive(Debug)]
 pub(crate) struct BoundScopedDirectory<T> {
     root: PathBuf,
+    scope: ScopedDirectoryScope,
     state: T,
 }
 
 impl<T> BoundScopedDirectory<T> {
-    pub(crate) fn new(root: PathBuf, state: T) -> Self {
-        Self { root, state }
+    pub(crate) fn new(root: PathBuf, scope: ScopedDirectoryScope, state: T) -> Self {
+        Self { root, scope, state }
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -1003,6 +1055,10 @@ impl<T> BoundScopedDirectory<T> {
 
     pub(crate) fn state(&self) -> &T {
         &self.state
+    }
+
+    pub(crate) fn scope(&self) -> &ScopedDirectoryScope {
+        &self.scope
     }
 }
 
@@ -1047,6 +1103,7 @@ impl<E: Error + 'static> Error for ScopedDirectoryBindError<E> {
 #[derive(Debug)]
 pub(crate) enum ScopedDirectoryEditError<E> {
     WrongEditorInstance,
+    OutsideScope { path: PathBuf },
     ScopeRootMutation { path: PathBuf },
     NotFound { path: PathBuf },
     NotFile { path: PathBuf },
@@ -1061,6 +1118,13 @@ impl<E: fmt::Display> fmt::Display for ScopedDirectoryEditError<E> {
         match self {
             Self::WrongEditorInstance => {
                 formatter.write_str("候选编辑令牌不能交给另一个文件系统根实例")
+            }
+            Self::OutsideScope { path } => {
+                write!(
+                    formatter,
+                    "候选路径不在调用方声明的编辑范围内：{}",
+                    path.display()
+                )
             }
             Self::ScopeRootMutation { path } => {
                 write!(formatter, "不能修改候选编辑子树根：{}", path.display())
@@ -1088,6 +1152,7 @@ impl<E: Error + 'static> Error for ScopedDirectoryEditError<E> {
         match self {
             Self::Failed { source, .. } => Some(source),
             Self::WrongEditorInstance
+            | Self::OutsideScope { .. }
             | Self::ScopeRootMutation { .. }
             | Self::NotFound { .. }
             | Self::NotFile { .. }
@@ -1098,7 +1163,7 @@ impl<E: Error + 'static> Error for ScopedDirectoryEditError<E> {
     }
 }
 
-/// 在一个未发布目录候选的 `data`/`js` 子树中执行受限文件操作。
+/// 在一个未发布目录候选的调用方声明子树中执行受限文件操作。
 ///
 /// `bind_scoped_directory` 必须先把令牌绑定到候选根的物理身份。所有操作必须拒绝
 /// reparse point 与硬链接，并经有界根资源接管；调用返回前该次操作已经终结。发布根
@@ -1111,6 +1176,7 @@ pub(crate) trait ScopedDirectoryEditor: Send + Sync {
     fn bind_scoped_directory(
         &self,
         candidate: &StagedDirectory<Self::CandidateState>,
+        scope: ScopedDirectoryScope,
     ) -> impl Future<
         Output = Result<
             BoundScopedDirectory<Self::ScopeState>,
@@ -1119,7 +1185,7 @@ pub(crate) trait ScopedDirectoryEditor: Send + Sync {
     > + Send
     + use<Self>;
 
-    /// 在候选交回发布根前重验物理身份、整树预算与顶层 `data`/`js` 结构。
+    /// 在候选交回发布根前重验物理身份、整树预算与声明范围根。
     fn validate_scoped_directory(
         &self,
         scope: &BoundScopedDirectory<Self::ScopeState>,
@@ -1139,6 +1205,14 @@ pub(crate) trait ScopedDirectoryEditor: Send + Sync {
         Output = Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Self::Error>>,
     > + Send;
 
+    /// 列举候选根的全部直接子项；调用方据此拥有自身的顶层结构语义。
+    fn list_scoped_root(
+        &self,
+        scope: &BoundScopedDirectory<Self::ScopeState>,
+    ) -> impl Future<
+        Output = Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Self::Error>>,
+    > + Send;
+
     fn create_scoped_directory(
         &self,
         scope: &BoundScopedDirectory<Self::ScopeState>,
@@ -1152,7 +1226,7 @@ pub(crate) trait ScopedDirectoryEditor: Send + Sync {
         bytes: Vec<u8>,
     ) -> impl Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send;
 
-    /// 删除一个普通文件或空目录；`data`、`js` 根本身不可删除。
+    /// 删除一个普通文件或空目录；调用方声明的范围根本身不可删除。
     fn remove_scoped_path(
         &self,
         scope: &BoundScopedDirectory<Self::ScopeState>,
@@ -1175,7 +1249,6 @@ impl<E> StagingCleanupFailure<E> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn residual_path(&self) -> &Path {
         &self.residual_path
     }
@@ -1212,8 +1285,6 @@ where
 /// 准备目录候选时的已知未发布终态。
 #[derive(Debug)]
 pub(crate) enum DirectoryPrepareError<E> {
-    /// 本次操作尚未接管任何副作用。
-    NotAttempted { target_root: PathBuf, source: E },
     NotPrepared {
         target_root: PathBuf,
         source: E,
@@ -1227,14 +1298,6 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotAttempted {
-                target_root,
-                source,
-            } => write!(
-                formatter,
-                "目录候选尚未开始准备（目标：{}）：{source}",
-                target_root.display()
-            ),
             Self::NotPrepared {
                 target_root,
                 source,
@@ -1257,7 +1320,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::NotAttempted { source, .. } | Self::NotPrepared { source, .. } => Some(source),
+            Self::NotPrepared { source, .. } => Some(source),
         }
     }
 }
@@ -1537,8 +1600,13 @@ mod directory_stage_tests {
     }
 
     #[test]
-    fn scoped_paths_only_accept_exact_data_and_js_subtrees() {
-        for path in ["data", "data/Map001.json", "js", "js/plugins/Quest.js"] {
+    fn scoped_paths_only_establish_generic_safe_relative_path_invariants() {
+        for path in [
+            "assets",
+            "assets/catalog.json",
+            "scripts",
+            "scripts/modules/task.lua",
+        ] {
             assert_eq!(
                 ScopedDirectoryPath::new(PathBuf::from(path))
                     .expect("受限候选路径应合法")
@@ -1549,13 +1617,10 @@ mod directory_stage_tests {
 
         for path in [
             "",
-            "Data/Map001.json",
-            "data2/file.json",
-            "other/file",
-            "../data/file",
-            "data/../js/file",
-            "data/file:stream",
-            "C:/data/file",
+            "../assets/file",
+            "assets/../scripts/file",
+            "assets/file:stream",
+            "C:/assets/file",
         ] {
             assert!(
                 ScopedDirectoryPath::new(PathBuf::from(path)).is_err(),
@@ -1565,22 +1630,46 @@ mod directory_stage_tests {
     }
 
     #[test]
+    fn scoped_directory_scope_owns_allowed_top_level_directories() {
+        let scope =
+            ScopedDirectoryScope::new([OsString::from("assets"), OsString::from("scripts")])
+                .expect("两个普通顶层目录应该可建立编辑范围");
+        let assets = ScopedDirectoryPath::new(PathBuf::from("assets/image.png"))
+            .expect("范围内路径应该合法");
+        let outside = ScopedDirectoryPath::new(PathBuf::from("private/catalog.json"))
+            .expect("通用安全路径不负责业务范围");
+        assert!(scope.contains(&assets));
+        assert!(!scope.contains(&outside));
+        assert!(scope.is_scope_root(
+            &ScopedDirectoryPath::new(PathBuf::from("scripts")).expect("范围根路径应该合法")
+        ));
+        assert!(matches!(
+            ScopedDirectoryScope::new(Vec::<OsString>::new()),
+            Err(ScopedDirectoryScopeError::Empty)
+        ));
+        assert!(matches!(
+            ScopedDirectoryScope::new([OsString::from("assets"), OsString::from("assets")]),
+            Err(ScopedDirectoryScopeError::DuplicateRoot { .. })
+        ));
+    }
+
+    #[test]
     fn stage_request_keeps_all_validated_candidate_parts() {
         let request = DirectoryStageRequest::new(
-            PathBuf::from("C:/projects/demo/write_back"),
+            PathBuf::from("C:/workspaces/sample/output"),
             DirectoryPublishIntent::ReplaceExisting,
             vec![
-                mapping("C:/projects/demo/source/data", "data"),
-                mapping("C:/projects/demo/source/js", "js"),
+                mapping("C:/workspaces/sample/input/assets", "assets"),
+                mapping("C:/workspaces/sample/input/scripts", "scripts"),
             ],
-            vec![overlay("data/Items.json"), overlay("js/plugins.js")],
+            vec![overlay("assets/catalog.json"), overlay("scripts/main.lua")],
             vec![PathBuf::from("logs"), PathBuf::from("empty/cache")],
         )
         .expect("标准目录候选请求应该合法");
 
         assert_eq!(
             request.target_root(),
-            Path::new("C:/projects/demo/write_back")
+            Path::new("C:/workspaces/sample/output")
         );
         assert_eq!(request.source_mappings().len(), 2);
         assert_eq!(request.overlays().len(), 2);
@@ -1596,9 +1685,9 @@ mod directory_stage_tests {
         for path in [
             "",
             ".",
-            "../data",
-            "data/../js",
-            "data/./Items.json",
+            "../assets",
+            "assets/../scripts",
+            "assets/./catalog.json",
             "/outside",
             "C:/outside",
         ] {
@@ -1626,14 +1715,14 @@ mod directory_stage_tests {
     #[test]
     fn stage_request_rejects_missing_roots_and_sources() {
         assert!(matches!(
-            DirectorySourceMapping::new(PathBuf::new(), PathBuf::from("data")),
+            DirectorySourceMapping::new(PathBuf::new(), PathBuf::from("assets")),
             Err(DirectoryStageRequestError::EmptySourceDirectory)
         ));
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::new(),
                 DirectoryPublishIntent::CreateNew,
-                vec![mapping("source", "data")],
+                vec![mapping("source", "assets")],
                 Vec::new(),
                 Vec::new(),
             ),
@@ -1658,8 +1747,8 @@ mod directory_stage_tests {
                 PathBuf::from("out"),
                 DirectoryPublishIntent::CreateNew,
                 vec![
-                    mapping("source/data", "data"),
-                    mapping("source/maps", "data/maps")
+                    mapping("source/assets", "assets"),
+                    mapping("source/catalog", "assets/catalog")
                 ],
                 Vec::new(),
                 Vec::new(),
@@ -1670,8 +1759,11 @@ mod directory_stage_tests {
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
                 DirectoryPublishIntent::CreateNew,
-                vec![mapping("source/data", "data")],
-                vec![overlay("data/Items.json"), overlay("data/Items.json")],
+                vec![mapping("source/assets", "assets")],
+                vec![
+                    overlay("assets/catalog.json"),
+                    overlay("assets/catalog.json")
+                ],
                 Vec::new(),
             ),
             Err(DirectoryStageRequestError::OverlappingOverlays { .. })
@@ -1680,7 +1772,7 @@ mod directory_stage_tests {
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
                 DirectoryPublishIntent::CreateNew,
-                vec![mapping("source/data", "data")],
+                vec![mapping("source/assets", "assets")],
                 Vec::new(),
                 vec![PathBuf::from("empty"), PathBuf::from("empty/child")],
             ),
@@ -1690,9 +1782,9 @@ mod directory_stage_tests {
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
                 DirectoryPublishIntent::CreateNew,
-                vec![mapping("source/data", "data")],
+                vec![mapping("source/assets", "assets")],
                 Vec::new(),
-                vec![PathBuf::from("data/empty")],
+                vec![PathBuf::from("assets/empty")],
             ),
             Err(DirectoryStageRequestError::EmptyDirectoryOverlapsSourceTarget { .. })
         ));
@@ -1700,9 +1792,9 @@ mod directory_stage_tests {
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
                 DirectoryPublishIntent::CreateNew,
-                vec![mapping("source/data", "data")],
-                vec![overlay("data/Items.json")],
-                vec![PathBuf::from("data/Items.json/child")],
+                vec![mapping("source/assets", "assets")],
+                vec![overlay("assets/catalog.json")],
+                vec![PathBuf::from("assets/catalog.json/child")],
             ),
             Err(DirectoryStageRequestError::EmptyDirectoryOverlapsOverlay { .. })
         ));
@@ -1714,8 +1806,8 @@ mod directory_stage_tests {
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
                 DirectoryPublishIntent::CreateNew,
-                vec![mapping("source/data", "data")],
-                vec![overlay("js/plugins.js")],
+                vec![mapping("source/assets", "assets")],
+                vec![overlay("scripts/main.lua")],
                 Vec::new(),
             ),
             Err(DirectoryStageRequestError::OverlayOutsideSourceMappings { .. })
@@ -1724,8 +1816,8 @@ mod directory_stage_tests {
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
                 DirectoryPublishIntent::CreateNew,
-                vec![mapping("source/data", "data")],
-                vec![overlay("data")],
+                vec![mapping("source/assets", "assets")],
+                vec![overlay("assets")],
                 Vec::new(),
             ),
             Err(DirectoryStageRequestError::OverlayOutsideSourceMappings { .. })
@@ -1755,28 +1847,29 @@ mod directory_stage_tests {
     }
 
     #[test]
-    fn project_lease_request_requires_a_root_and_one_project_name_component() {
+    fn exclusive_file_lease_request_requires_a_directory_and_identity() {
         assert!(matches!(
-            ProjectOperationLeaseRequest::new(PathBuf::new(), OsString::from("game")),
-            Err(ProjectOperationLeaseRequestError::EmptyProjectsRoot)
+            ExclusiveFileLeaseRequest::new(PathBuf::new(), OsString::from("game")),
+            Err(ExclusiveFileLeaseRequestError::EmptyLockDirectory)
         ));
-        for name in ["", ".", "..", "nested/game", "nested\\game", "C:/game"] {
-            assert!(matches!(
-                ProjectOperationLeaseRequest::new(
-                    PathBuf::from("C:/projects"),
-                    OsString::from(name),
-                ),
-                Err(ProjectOperationLeaseRequestError::InvalidProjectDirectoryName { .. })
-            ));
-        }
+        assert!(matches!(
+            ExclusiveFileLeaseRequest::new(
+                PathBuf::from("C:/workspaces/locks/leases"),
+                OsString::new(),
+            ),
+            Err(ExclusiveFileLeaseRequestError::EmptyIdentity)
+        ));
 
-        let request = ProjectOperationLeaseRequest::new(
-            PathBuf::from("C:/projects"),
+        let request = ExclusiveFileLeaseRequest::new(
+            PathBuf::from("C:/workspaces/locks/leases"),
             OsString::from("游戏 一"),
         )
-        .expect("单个 Unicode 项目目录名应该合法");
-        assert_eq!(request.projects_root(), Path::new("C:/projects"));
-        assert_eq!(request.project_directory_name(), OsStr::new("游戏 一"));
+        .expect("Unicode 文件租约身份应该合法");
+        assert_eq!(
+            request.lock_directory(),
+            Path::new("C:/workspaces/locks/leases")
+        );
+        assert_eq!(request.identity(), OsStr::new("游戏 一"));
     }
 
     #[test]
@@ -1785,7 +1878,14 @@ mod directory_stage_tests {
             DirectoryTreeFingerprintRequest::new(Vec::new()),
             Err(DirectoryTreeFingerprintRequestError::EmptyRoots)
         ));
-        for logical in ["", ".", "../data", "data/../js", "/data", "C:/data"] {
+        for logical in [
+            "",
+            ".",
+            "../assets",
+            "assets/../scripts",
+            "/assets",
+            "C:/assets",
+        ] {
             assert!(matches!(
                 DirectoryTreeRoot::new(PathBuf::from("physical"), PathBuf::from(logical)),
                 Err(DirectoryTreeFingerprintRequestError::InvalidLogicalRoot { .. })
@@ -1793,21 +1893,24 @@ mod directory_stage_tests {
         }
         assert!(matches!(
             DirectoryTreeFingerprintRequest::new(vec![
-                DirectoryTreeRoot::new(PathBuf::from("physical/data"), PathBuf::from("data"))
-                    .expect("data 逻辑根应该合法"),
-                DirectoryTreeRoot::new(PathBuf::from("physical/maps"), PathBuf::from("data/maps"),)
-                    .expect("data/maps 逻辑根应该合法"),
+                DirectoryTreeRoot::new(PathBuf::from("physical/assets"), PathBuf::from("assets"))
+                    .expect("资源逻辑根应该合法"),
+                DirectoryTreeRoot::new(
+                    PathBuf::from("physical/catalog"),
+                    PathBuf::from("assets/catalog"),
+                )
+                .expect("资源子逻辑根应该合法"),
             ]),
             Err(DirectoryTreeFingerprintRequestError::OverlappingLogicalRoots { .. })
         ));
 
         let request = DirectoryTreeFingerprintRequest::new(vec![
-            DirectoryTreeRoot::new(PathBuf::from("physical/data"), PathBuf::from("data"))
-                .expect("data 逻辑根应该合法"),
-            DirectoryTreeRoot::new(PathBuf::from("physical/js"), PathBuf::from("js"))
-                .expect("js 逻辑根应该合法"),
+            DirectoryTreeRoot::new(PathBuf::from("physical/assets"), PathBuf::from("assets"))
+                .expect("资源逻辑根应该合法"),
+            DirectoryTreeRoot::new(PathBuf::from("physical/scripts"), PathBuf::from("scripts"))
+                .expect("脚本逻辑根应该合法"),
         ])
-        .expect("data 与 js 逻辑根互不重叠");
+        .expect("资源与脚本逻辑根互不重叠");
         assert_eq!(request.roots().len(), 2);
     }
 
@@ -1815,16 +1918,16 @@ mod directory_stage_tests {
 
     struct SendContractLeaseProvider;
 
-    impl ProjectOperationLeaseProvider for SendContractLeaseProvider {
+    impl ExclusiveFileLeaseProvider for SendContractLeaseProvider {
         type Error = Infallible;
         type LeaseState = ();
 
-        async fn acquire_project_operation_lease(
+        async fn acquire_exclusive_file_lease(
             &self,
-            _request: ProjectOperationLeaseRequest,
-        ) -> Result<ProjectOperationLease<Self::LeaseState>, ProjectOperationLeaseError<Self::Error>>
+            _request: ExclusiveFileLeaseRequest,
+        ) -> Result<ExclusiveFileLease<Self::LeaseState>, ExclusiveFileLeaseError<Self::Error>>
         {
-            Ok(ProjectOperationLease::new(()))
+            Ok(ExclusiveFileLease::new(()))
         }
     }
 
@@ -1883,7 +1986,7 @@ mod directory_stage_tests {
         let request = DirectoryStageRequest::new(
             PathBuf::from("target"),
             DirectoryPublishIntent::CreateNew,
-            vec![mapping("source", "data")],
+            vec![mapping("source", "assets")],
             Vec::new(),
             Vec::new(),
         )
@@ -1903,18 +2006,18 @@ mod directory_stage_tests {
             (),
         )));
         assert_send(
-            lease_provider.acquire_project_operation_lease(
-                ProjectOperationLeaseRequest::new(
-                    PathBuf::from("C:/projects"),
+            lease_provider.acquire_exclusive_file_lease(
+                ExclusiveFileLeaseRequest::new(
+                    PathBuf::from("C:/workspaces/locks/leases"),
                     OsString::from("game"),
                 )
-                .expect("项目租约请求应该合法"),
+                .expect("文件租约请求应该合法"),
             ),
         );
         assert_send(
             fingerprinter.fingerprint_directory_tree(
                 DirectoryTreeFingerprintRequest::new(vec![
-                    DirectoryTreeRoot::new(PathBuf::from("source/data"), PathBuf::from("data"))
+                    DirectoryTreeRoot::new(PathBuf::from("source/assets"), PathBuf::from("assets"))
                         .expect("目录树根应该合法"),
                 ])
                 .expect("目录树指纹请求应该合法"),

@@ -1112,15 +1112,14 @@ mod tests {
             &self,
             _project: &OpenedProject,
             snapshot: BuiltinSnapshot,
-        ) -> Result<crate::att_mz::extract::store::SnapshotReplacementOutcome, Self::Error>
-        {
+        ) -> Result<(), Self::Error> {
             self.snapshots
                 .lock()
                 .expect("快照记录锁不应中毒")
                 .push(snapshot);
             match &self.failure {
                 Some(error) => Err(error.clone()),
-                None => Ok(crate::att_mz::extract::store::SnapshotReplacementOutcome::Changed),
+                None => Ok(()),
             }
         }
     }

@@ -11,27 +11,23 @@
 ```text
 读取完整主程序
       ↓
-runtime.reserve().await
-      ↓
 打开项目 SQLite 交互会话
       ↓
 构造 Host calls + 唯一 session finalizer
       ↓
-reservation.start(program, bindings)
+runtime.start(program, bindings) 同步接管
       ↓
 等待 VM 终态与清理终态
 ```
 
-Runtime 容量先于数据库会话取得，排队不占 SQLite 连接。打开会话到同步 `start`
-之间没有 await 窗口；一旦接管，job supervisor 在 VM 完成、失败、取消或 worker
-panic 后恰好调用一次 `finalize(self)`。
-
-reservation 不可克隆，未启动时丢弃只释放容量。execution handle 被丢弃只发送合作
-取消；supervisor 继续终结会话。执行错误和清理错误分别保存，清理错误不覆盖主错。
+当前一次命令最多选择一个脚本。每次 `start` 创建一个专用 OS 线程；一旦同步接管 bindings，
+无论线程创建失败、关闭竞态、VM 失败、取消或 worker panic，都必须产生执行报告并
+恰好调用一次 `finalize(self)`。execution handle 被丢弃只发送合作取消；Runtime
+仍拥有 finalizer。执行错误和清理错误分别保存，清理错误不覆盖主错。
 
 ## 2. VM、租约与可信边界
 
-生产 Runtime 使用进程内 vendored Lua 5.4，每个 VM 只在专用有界 OS worker 上
+生产 Runtime 使用进程内 vendored Lua 5.4，每次脚本的 VM 只在其专用 OS 线程上
 创建、运行和销毁。SQLite、LLM 和 Host 文件 Future 由主 Tokio Runtime 驱动；Lua
 worker 通过同步桥等待结果，不建立私有 Tokio Runtime。
 
@@ -39,7 +35,7 @@ VM 开放完整标准库，包括 `require`、`io`、`os` 和 `debug`。主程�
 `package.path/cpath`，不修改进程 cwd；路径必须无损转换为 UTF-8。Unicode Lua/C
 模块搜索和 Lua 5.4 `luaopen_*` 规则由 Runtime 实现，模块句柄持有到 VM 销毁。
 
-每个 VM 使用配置给定的内存、栈、队列和取消检查预算。完整标准库意味着脚本可调用
+每个 VM 使用配置给定的内存、线程栈、Host 值和取消检查预算。完整标准库意味着脚本可调用
 `os.execute`、加载 native 模块、替换 debug hook，甚至通过 `os.exit` 或 native crash
 终止进程。因此只承诺进程仍存活且 VM/Host 调用交还控制时的合作取消和唯一清理。
 
@@ -208,7 +204,8 @@ NotApplicable 或 Pending。脚本只为 Pending 组织自己的批次和 messag
 
 `ctx.llm(messages)` 只接受无洞 `{ role, content }` 数组。它与 Standard 使用同一个
 公共 Client 和 Executor；Lua 不能覆盖 URL、API key、model、stream 或 parameters。
-成功返回 content、finish_reason、HTTP request ID、正文 response ID 和可选 usage。
+成功返回 content、finish_reason、可选 HTTP request ID、可选正文 response ID 和可选
+usage；缺失元数据在 Lua 中为 `nil`。
 Lua 决定分组、调用次数、Retryable 重试和事务提交。
 
 ### 6.3 WriteBack：`ctx.output` 与 `ctx.write_back`
@@ -229,11 +226,12 @@ remove
 `dialogue_body`、`scrolling_text`、`help_description`；segments 保留显式文本/控制
 边界，返回自动布局结果或结构化人工诊断，不让 Lua 重写宽度算法。
 
-Lua Host 只负责候选编辑，不拥有完整候选的最终校验。可选脚本结束后，外层
-WriteBack 无条件调用 Publisher 的借用式候选校验；即使未选择 Lua 也执行同一校验。
-候选必须仍恰好包含普通 `data/` 与 `js/` 树且全部预算成立，随后才按值消费 token
-发布。校验失败时只丢弃一次，并同时保留校验首因与清理次错。Lua 看不到最终输出
-路径的可写句柄，也不能自行 validate、discard 或 publish。
+Lua Host 只负责在调用方声明的可编辑顶层集合内修改候选，不拥有完整候选的最终
+校验。通用文件根只校验安全相对路径、声明范围、身份、reparse/hardlink 与预算；
+MZ WriteBack 自己声明 `{data, js}` 并验证候选顶层恰好是普通 `data/` 与 `js/`。
+随后 Publisher 才复核完整候选并按值消费 token 发布。校验失败时只丢弃一次，并
+同时保留校验首因与清理次错。Lua 看不到最终输出路径的可写句柄，也不能自行
+validate、discard 或 publish。
 
 ## 7. Host 错误、取消与关闭
 
@@ -257,6 +255,6 @@ panic 保持独立终态。
 的所有 JSON 调用都经过同一类型化错误信封。错误被 `pcall` 捕获时四个公开字段可读，
 未捕获时仍按其 JSON Host error 身份进入 Binding 终态，不降格为普通 Lua Execute。
 
-Runtime shutdown 停止新 reservation，取消已预留、排队和运行脚本，等待全部
-supervisor 完成唯一 finalizer，再 join worker。进程不设置超时后强拆，也不伪造
-清理成功。
+Runtime shutdown 停止新的 `start`，对当前唯一脚本发出合作取消，等待唯一 finalizer
+并 join 专用线程。取消是正常 `OperationCompletion::Cancelled`，不通过底层错误文本
+识别。进程不设置超时后强拆，也不伪造清理成功。

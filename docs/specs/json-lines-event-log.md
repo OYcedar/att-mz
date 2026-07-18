@@ -1,220 +1,126 @@
-# JSON Lines 持久事件日志现行规格
+# 强审计 JSON Lines 账本现行规格
 
-本文定义 MZ Standard Translate 与完整 WriteBack 共用的生产日志根。日志根把已经建立的结构化业务事件转换为稳定 wire，串行追加到两条彼此独立的全局 JSON Lines 流，并在单条记录完成数据刷盘后才向调用方确认。
+本文定义四个 MZ 命令共同使用的强审计账本。它不是可丢失的排障日志：业务意图必须先持久化，才允许开始对应副作用；副作用取得终态后必须记录终态，才可报告完整成功。
 
-## 1. 双流与固定路径
+## 1. 唯一账本
 
-日志根由配置中的 `observability.root` 建立。该目录必须位于本机、大小写不敏感的 NTFS 文件系统；从卷根到该目录的任一路径组件都不得是符号链接、junction、mount point 或其他 reparse point。两条流使用固定文件名：
+固定路径为：
 
 ```text
 <observability.root>/
-├─ translation.jsonl
-├─ write_back.jsonl
-├─ .translation.lock
-└─ .write_back.lock
+├─ audit.jsonl
+├─ .audit.lock
+└─ audit.00000000000000000001.jsonl
 ```
 
-- `translation.jsonl` 只接收 Standard Translate 事件；
-- `write_back.jsonl` 只接收完整 WriteBack 事件；
-- 两条流分别拥有有界队列、专用 OS worker、跨进程文件锁、活动文件和轮转文件；
-- 一个流的排队、锁等待、轮转或失败不会改变另一条流的物理文件；
-- 文件物理行顺序是该流的全局权威顺序。
+账本拥有一个有界队列、一个专用 worker、一把跨进程文件锁、一份活动文件和一个轮转序列。物理行顺序是所有进程的全局权威顺序。
 
-锁文件和活动文件也以不跟随 reparse point 的 Win32 方式打开；已有同名 reparse point 会在读取、写入或加锁前被拒绝。
+每条记录是无 BOM 的紧凑 UTF-8 JSON，后接一个 LF。根在实际打开目录、锁、文件和执行 `sync_data` 时验证这些机制可用，不以文件系统品牌名称代替能力检查。
 
-每条记录都是紧凑 UTF-8 JSON，后接且只接一个 LF。文件没有 BOM。配置分别为两条流建立队列容量、锁等待上限、单条记录字节上限、活动文件字节上限和轮转文件保留数量；单条记录上限必须能够装入活动文件上限。
+## 2. 稳定 wire
 
-## 2. 运行身份与运行上下文
-
-`RunIdGenerator` 在一次命令开始业务副作用前生成运行身份。生产实现直接调用 Windows 系统安全随机源，并建立规范小写 UUID v4；随机源失败时显式终止当前命令，不使用时间、进程号或伪随机回退值。
-
-Translate 在项目和 Profile 成功解析后建立一次以下上下文：
-
-```text
-run_id + project + profile
-```
-
-WriteBack 在项目成功解析后建立一次以下日志上下文：
-
-```text
-run_id + project
-```
-
-实际布局宽度由已经打开项目的 WriteBackService 作为完成事件事实提交，组合边界不为构造日志根重复读取项目数据库。同一次 WriteBack 运行的事件复用同一个日志上下文。日志根不从事件文本、文件路径或先前记录猜测运行归属。WriteBack 事件携带的项目必须与注入上下文一致，否则该条记录在写文件前拒绝。
-
-`recorded_at_utc` 由日志 worker 在处理该事件时生成，格式固定为 UTC 毫秒：
-
-```text
-YYYY-MM-DDTHH:MM:SS.mmmZ
-```
-
-## 3. Translation 稳定 wire
-
-Translation 流允许三种顶层事件：
-
-| `event` | 顶层载荷 |
-|---|---|
-| `task_processed` | `recorded_at_utc`、`run_id`、`project`、`profile`、`task` |
-| `task_commit_failed` | 上述字段、`task`、`commit_failure` |
-| `run_completed` | `recorded_at_utc`、`run_id`、`project`、`profile`、`summary` |
-
-`task` 固定包含：
-
-```text
-task_index
-status
-attempts
-provider_request_id
-provider_response_id
-finish_reason
-final_response_usage
-accepted_decisions
-confirmed_written_locations
-accepted[]
-unresolved[]
-diagnostics[]
-```
-
-`status` 精确表达 `complete`、`partial` 或带结构化原因的 `unavailable`。`final_response_usage` 缺席时为 `null`；存在时只包含最终成功 HTTP 响应的 `prompt_tokens`、`completion_tokens` 和 `total_tokens`。HTTP `x-request-id` 与响应正文 completion ID 分别进入 `provider_request_id` 和 `provider_response_id`，二者不互相代替。
-
-`accepted[]` 记录模型 ID、代表位置与全部传播目标；`unresolved[]` 记录模型 ID、完整位置集合和结构化拒绝原因；`diagnostics[]` 记录响应协议诊断。`task_commit_failed` 保留已经形成的内容验收结果和独立的 Store 失败事实，同时把 `confirmed_written_locations` 记为 `null`，不宣称数据库写入成功。
-
-`summary` 固定包含：
-
-```text
-total_tasks
-complete_tasks
-partial_tasks
-unavailable_tasks
-accepted_decisions
-written_locations
-unresolved_decisions
-unresolved_locations
-protocol_diagnostics
-recoverable_request_exhaustions
-```
-
-Translation 记录不包含 API 密钥、完整 messages、完整模型响应、完整原文或完整译文。结构化拒绝原因可以保存定位拒绝所必需的 token、原控制片段或源语残留片段，但不把业务正文作为日志载荷复制。
-
-## 4. WriteBack 稳定 wire
-
-WriteBack 流只允许 `run_completed` 事件，顶层字段固定为：
+每行顶层字段固定为：
 
 ```text
 recorded_at_utc
+event_id
 run_id
 project
-layout_profile
+command
+profile | null
 event
-output_root
-summary
-manual_layout_diagnostics[]
-lua_executed
+payload
 ```
 
-`layout_profile` 保存本次实际使用的三个正整数宽度：
+- `recorded_at_utc` 由 worker 在持久化时生成，格式为 UTC 毫秒；
+- `event_id` 是每条记录独立的 UUID；
+- `run_id` 标识一次命令运行；
+- `command` 是 `init | extract | translate | write_back`；
+- `profile` 仅 Translate 使用，其他命令写 `null`；
+- `payload` 是 MZ 可观测性模块拥有的稳定领域 DTO，通用 JSONL Runtime 不认识 MZ 类型。
+
+允许的事件只有：
 
 ```text
-dialogue_body_max_fullwidth_chars
-scrolling_text_max_fullwidth_chars
-help_description_max_fullwidth_chars
+run_started
+translation_task_started
+translation_task_finished
+write_back_publish_started
+write_back_publish_finished
+run_finished
 ```
 
-`summary` 固定包含译文位置数、原文位置数、自动换行单元数、插入换行数、插入全角缩进数和人工布局单元数。`manual_layout_diagnostics[]` 逐项保存结构化位置、`dialogue_body | scrolling_text | help_description` 区域和实际宽度；其数量必须与 `summary.manual_layout_units` 相等。`lua_executed` 精确记录本次唯一候选是否经过显式 Lua 阶段。
+翻译任务意图与终态、写回发布意图与终态分别共享一个稳定 `operation_id`。新一次命令总是生成新的 `run_id`，不得把重新运行猜成先前操作的恢复。
 
-## 5. 结构化 MZ 位置
+`translation_task_finished` 从任务结果枚举派生 `complete | partial | unavailable`、唯一非零尝试次数、可选供应商请求/响应 ID、可选最终 usage、验收决定、未解决结果、协议诊断和已确认数据库写入。`provider_response_id` 缺失时写 `null`。
 
-持久 wire 不使用 `MzLocation` 的展示文本。每个位置完整保存来源、路径步骤和 Tag 语义：
+`write_back_publish_finished` 保存目录发布的明确终态、实际布局、输出根、写回摘要、人工布局诊断和 `lua_executed`。所有 MZ 位置都使用来源、路径步骤和 Tag 语义的结构化 DTO，不使用展示文本。
 
-```text
-location.kind = value
-  source
-  steps[]
+账本不记录 API key、完整 messages、完整模型响应、完整原文或译文。外部松散字段只在当前事件确实需要无损承载时停留于 wire 边界，不扩散为 Runtime 业务模型。
 
-location.kind = note_tag
-  source
-  container_steps[]
-  tag_name
-  occurrence
+## 3. 业务顺序
 
-location.kind = comment_tag
-  source
-  command_steps[]
-  tag_name
-  occurrence
-```
+一次已经成功解析 CLI 和本次所需配置的命令按以下顺序审计：
 
-来源精确区分：
+1. 构造账本并持久化 `run_started`；
+2. 只有该事件确认持久化后，才取得项目租约并执行业务；
+3. Translate 在每个 TaskBlock 发起模型请求前持久化 `translation_task_started`；
+4. 该任务完成内容验收和数据库提交/拒绝判断后，持久化 `translation_task_finished`；
+5. WriteBack 在发布候选前持久化 `write_back_publish_started`；
+6. 目录发布取得明确终态后，持久化 `write_back_publish_finished`；
+7. 其他根完成 shutdown 后持久化 `run_finished`；
+8. 最后关闭并排空审计 writer。
 
-- `data`：标准数据文件名；
-- `map`：`map_id`；
-- `plugin_parameter`：插件索引、插件名和参数名。
+CLI 或配置尚未成功解析时没有业务运行，不建立账本。只有命令、非审计根 shutdown、所需终态事件和账本 shutdown 全部成功，CLI 才输出成功文案。
 
-路径步骤精确区分 `object_key`、`array_index` 和 `decode_json_string`。这些稳定 DTO 独立于领域类型定义 Serde；领域类型本身不直接派生持久格式。所有 wire 对象拒绝未知字段、重复字段、缺失字段和字段类型漂移。
+意图事件只有得到 `Persisted` 才可继续对应副作用。其他终态立即停止；可能已经存在的完整意图行作为未完成操作保留。副作用已经生效但终态记录失败时，结果必须明确表达“状态已生效但审计未确认”，不能误报普通失败或自动重做。
 
-## 6. 追加、确认与取消
+## 4. 通用追加机制
 
-一次 `append` 按以下顺序执行：
+通用 JSONL Runtime 只负责：
 
 ```text
-结构化事件进入有界队列
-        ↓
-专用 worker 生成 recorded_at_utc 并序列化
-        ↓
-取得当前流的跨进程 Windows 文件锁
-        ↓
-恢复并严格校验活动文件尾部
-        ↓
+事件进入有界队列
+  ↓
+生成时间并序列化稳定 wire
+  ↓
+取得跨进程文件锁
+  ↓
+恢复并校验活动文件尾部
+  ↓
 按需轮转
-        ↓
+  ↓
 write_all(JSON + LF)
-        ↓
+  ↓
 sync_data
-        ↓
-清理超出保留数量的已知轮转文件
-        ↓
-向调用方返回终态
+  ↓
+执行配置授权的 retention
+  ↓
+返回持久化终态
 ```
 
-只有 `write_all` 和 `sync_data` 都成功，当前记录才算持久化。仅进入队列、仅完成序列化或仅写入操作系统缓存都不能返回成功。
+只有 `write_all` 和 `sync_data` 都成功才算持久化。事件进入队列后由 worker 完成，即使调用 Future 被丢弃也不能撤销已经接管的写入。append 不自动重试。
 
-事件一旦成功进入队列，worker 就拥有其完成责任。调用方随后丢弃 `append` Future 只会丢失该调用方对终态的等待，不会撤销已经接管的写入。显式 finalizer 关闭新准入，排空已经接管的事件，等待 worker 退出并 join；进程组合边界必须持有并调用该唯一终结令牌。
+终态固定为：
 
-## 7. 跨进程锁、尾部恢复与损坏判定
+- `Persisted`：当前完整记录已经写入并完成 `sync_data`；
+- `NotPersisted`：可确认当前记录未进入活动文件；
+- `OutcomeUnknown`：写入、刷盘或 worker 交接后无法确认是否完整持久化；
+- `PersistedButMaintenanceFailed`：记录已刷盘，但轮转或保留维护失败，并携带残留事实。
 
-同一流的恢复、校验、轮转、追加、刷盘和保留清理都在对应 Windows 跨进程文件锁内完成，因此多个 `att.exe` 进程不会把两条记录交叉写入同一物理行。worker 从启动到明确终结始终持有日志根整条路径链的无删除共享句柄，日志根不能在取锁后被重命名、替换或换成 reparse point。
+## 5. 尾部、轮转与损坏
 
-每次追加前，worker 从已经确认的同一文件身份与长度继续校验；文件身份改变或长度回退时，从头重新校验。校验规则为：
+每次追加都在同一跨进程锁内执行尾部恢复、校验、轮转、写入、刷盘和 retention。
 
-- 最终记录缺少 LF：把它视为进程中断留下的未完成尾部，截断到最后一个完整 LF 之后并执行 `sync_data`；即使该未完成尾部已经超过单条上限，也只按 LF 边界整体截断；
-- 已有完整行：必须满足当前流的严格 wire，且总长度不得超过单条记录上限；
-- 已带 LF 的完整坏行、未知事件、未知字段、重复字段或类型错误：拒绝后续追加，保留原文件供诊断，不猜测修复。
+- 最终片段没有 LF：视为崩溃留下的半行，截断到最后一个完整 LF 后 `sync_data`；
+- 已带 LF 的完整行必须符合当前唯一 audit wire；
+- 完整坏行、未知事件、未知字段、重复字段或类型漂移表示账本损坏，保留现场并拒绝追加；
+- 不扫描或改写未知文件。
 
-该恢复只处理活动文件尾部，不扫描或改写未知文件。
+轮转名称固定为 `audit.` 加 20 位十进制序号和 `.jsonl`。活动文件非空且追加将超过上限时先轮转；新记录刷盘后再删除超出保留数量的最小序号。配置授权的旧轮转文件删除属于账本保留策略，不构成审计缺失。删除前必须复核枚举时与删除时的对象身份一致。
 
-## 8. 轮转与保留
+## 6. 完成边界
 
-当活动文件非空，并且追加当前记录将超过活动文件字节上限时，先轮转活动文件：
+账本保证正常 Win32 故障和进程崩溃后可依据完整 LF 和严格 wire 恢复活动文件，不承诺任意硬件断电下绝对耐久，也不宣称 JSONL 与业务数据库或目录发布具有分布式原子提交。
 
-```text
-translation.00000000000000000001.jsonl
-write_back.00000000000000000001.jsonl
-```
-
-序号固定为 20 位十进制。轮转只识别对应流名、精确 20 位序号和 `.jsonl` 后缀；其他文件不属于日志根，不删除也不改名。已识别名称的目录项必须能够以不跟随 reparse 的方式打开为普通文件，并在枚举时记录其卷与 file ID。新序号取当前已知轮转文件中的最大序号加一，rename 禁止覆盖现有目标。
-
-当前记录通过 `sync_data` 后，日志根按序号从小到大删除超出配置保留数量的已知轮转文件。删除前以 DELETE 句柄重新打开对象，复核它仍为普通文件且 file ID 与枚举时相同，再通过同一句柄设置删除 disposition；枚举后换入的外来文件不得被删除。保留清理失败不能撤销已经持久化的当前记录，必须返回“已持久化但维护失败”终态并报告残留路径。
-
-轮转开始前失败，或者原活动文件已移入轮转位置但建立新活动文件失败后能够完整恢复原文件时，当前记录确定未持久化。新活动文件建立和原文件恢复同时失败时，日志根不猜测物理文件归属，返回结果未知。
-
-## 9. 持久化终态与完成边界
-
-`append` 的失败终态固定为：
-
-- `NotPersisted`：在当前记录开始写入前失败，当前记录确定没有进入活动文件，既有完整记录仍可信；
-- `OutcomeUnknown`：已经开始写入或刷盘，或者 worker 接管后没有交还终态，无法确认当前记录是否完整持久化；
-- `PersistedButMaintenanceFailed`：当前记录已经通过 `sync_data`，但轮转保留清理没有完全结束，并返回准确残留路径。
-
-启动失败发生在接纳事件之前，精确区分日志根创建、NTFS 条件校验和 worker 创建失败。shutdown 精确区分 worker 完成报告丢失与 worker panic。
-
-本契约保证正常 Win32 故障和进程崩溃后，可以按完整 LF 与严格 wire 恢复活动文件，并且不会把未刷盘的队列接纳误报为成功。它不宣称任意硬件断电下的绝对耐久；调用方必须根据上述终态决定是否可以继续业务流程，不得把结果未知或维护残留降级为完全成功。
+进程崩溃可以留下已持久化而没有对应终态的意图；这是可审计事实，不由下一次命令猜测或自动恢复。业务状态仍由四个状态收敛命令及其各自权威存储决定。

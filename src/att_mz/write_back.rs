@@ -1,20 +1,29 @@
 //! MZ 数据库译文写回冻结项目副本的顶层编排。
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use super::ProjectName;
+use super::SelectedLua;
+use super::audit::{AuditEvent, AuditLedger, WriteBackPublishAuditResult};
 use super::project::{ExistingProjectOpener, MzWriteBackLayoutProfile, OpenedProject};
-use crate::execution::{CooperativeCancellation, OperationCancelled};
-use crate::observability::PersistentEventLog;
+use super::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
+use crate::execution::{CooperativeCancellation, OperationCompletion};
+use crate::storage::file_system::ScopedDirectoryScope;
 
 pub(crate) mod asset_reader;
 pub(crate) mod lua;
 pub(crate) mod publisher;
 pub(crate) mod rewriter;
 pub(crate) mod standard;
+
+fn mz_output_scope() -> ScopedDirectoryScope {
+    ScopedDirectoryScope::new([OsString::from("data"), OsString::from("js")])
+        .expect("固定 MZ 写回顶层目录必须能建立候选编辑范围")
+}
 
 #[cfg(test)]
 mod full_tree_tests;
@@ -23,8 +32,6 @@ mod full_tree_tests;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteBackInput {
     pub name: ProjectName,
-    /// 可选的可信 Lua 写回程序；Lua 自己负责自己的文件和数据库事务。
-    pub lua_script: Option<PathBuf>,
 }
 
 /// 一轮标准写回的正常业务汇总。
@@ -57,16 +64,6 @@ pub struct WriteBackOutput {
     pub lua_executed: bool,
 }
 
-/// 完成一个 MZ 项目文本写回用例。
-pub trait WriteBackUseCase: Send + Sync {
-    type Error: Error + Send + Sync + 'static;
-
-    fn execute(
-        &self,
-        input: WriteBackInput,
-    ) -> impl Future<Output = Result<WriteBackOutput, Self::Error>> + Send;
-}
-
 /// 完整候选已经成功发布后的固定输出身份。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublishedWriteBack {
@@ -80,6 +77,44 @@ impl PublishedWriteBack {
 
     pub(crate) fn output_root(&self) -> &Path {
         &self.output_root
+    }
+}
+
+/// 发布根已经确认的写回失败终态；调用方据此记录事实，不能从错误文本猜测。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WriteBackPublishFailureState {
+    NotPublished {
+        output_root: PathBuf,
+        residual_paths: Vec<PathBuf>,
+    },
+    PublishedWithResiduals {
+        output_root: PathBuf,
+        residual_paths: Vec<PathBuf>,
+    },
+    RecoveryRequired {
+        output_root: PathBuf,
+        recovery_artifacts: Vec<PathBuf>,
+    },
+    OutcomeUnknown {
+        output_root: PathBuf,
+        recovery_artifacts: Vec<PathBuf>,
+    },
+}
+
+/// 发布错误与其精确终态必须作为一个不可分割的结果返回。
+#[derive(Debug)]
+pub(crate) struct WriteBackPublishFailure<E> {
+    state: WriteBackPublishFailureState,
+    source: E,
+}
+
+impl<E> WriteBackPublishFailure<E> {
+    pub(crate) fn new(state: WriteBackPublishFailureState, source: E) -> Self {
+        Self { state, source }
+    }
+
+    fn into_parts(self) -> (WriteBackPublishFailureState, E) {
+        (self.state, self.source)
     }
 }
 
@@ -99,7 +134,10 @@ pub(crate) trait StandardWriteBack: Send + Sync {
         project: &OpenedProject,
         layout_profile: &MzWriteBackLayoutProfile,
     ) -> impl Future<
-        Output = Result<standard::StandardWriteBackPreparation<Self::Documents>, Self::Error>,
+        Output = Result<
+            OperationCompletion<standard::StandardWriteBackPreparation<Self::Documents>>,
+            Self::Error,
+        >,
     > + Send;
 }
 
@@ -135,7 +173,7 @@ where
     fn publish(
         &self,
         candidate: Self::Candidate,
-    ) -> impl Future<Output = Result<PublishedWriteBack, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<PublishedWriteBack, WriteBackPublishFailure<Self::Error>>> + Send;
 
     fn discard(
         &self,
@@ -155,120 +193,147 @@ where
         project: &OpenedProject,
         candidate: &C,
         script_path: PathBuf,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send;
 }
 
 /// 按固定业务顺序编排一次 MZ 文本写回。
 ///
 /// 用例只打开一次项目，先准备完整候选，再让可选 Lua 修改同一候选，最后只发布一次。
 /// 候选产生后的取消或 Lua 失败只丢弃该候选；发布根接管 token 后，上层不再清理。
-pub(crate) struct WriteBackService<O, S, P, L, J> {
+pub(crate) struct WriteBackService<O, S, P, L, J, K> {
     project_opener: O,
     standard_write_back: S,
     publisher: P,
-    lua_write_back: Option<L>,
+    selected_lua: Option<SelectedLua<L>>,
     event_log: J,
+    project_lease: K,
     cancellation: CooperativeCancellation,
 }
 
-impl<O, S, P, L, J> WriteBackService<O, S, P, L, J> {
+impl<O, S, P, L, J, K> WriteBackService<O, S, P, L, J, K> {
     pub(crate) fn new(
         project_opener: O,
         standard_write_back: S,
         publisher: P,
-        lua_write_back: Option<L>,
+        selected_lua: Option<SelectedLua<L>>,
         event_log: J,
+        project_lease: K,
         cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             project_opener,
             standard_write_back,
             publisher,
-            lua_write_back,
+            selected_lua,
             event_log,
+            project_lease,
             cancellation,
         }
     }
 }
 
-impl<O, S, P, L, J> WriteBackUseCase for WriteBackService<O, S, P, L, J>
+impl<O, S, P, L, J, K> WriteBackService<O, S, P, L, J, K>
 where
     O: ExistingProjectOpener,
     S: StandardWriteBack,
     P: StandardWriteBackPublisher<S::Documents>,
     L: LuaWriteBack<P::Candidate>,
-    J: PersistentEventLog<standard::WriteBackRunLog>,
+    J: AuditLedger,
+    K: ProjectCommandLeaseProvider,
 {
-    type Error = WriteBackServiceError<O::Error, S::Error, P::Error, L::Error, J::Error>;
-
-    async fn execute(&self, input: WriteBackInput) -> Result<WriteBackOutput, Self::Error> {
-        self.cancellation
-            .check()
-            .map_err(WriteBackServiceError::Cancelled)?;
-        let WriteBackInput { name, lua_script } = input;
-        if lua_script.is_some() && self.lua_write_back.is_none() {
-            return Err(WriteBackServiceError::MissingLuaDependency);
+    pub(crate) async fn execute(
+        &self,
+        input: WriteBackInput,
+    ) -> Result<
+        OperationCompletion<WriteBackOutput>,
+        WriteBackServiceError<O::Error, S::Error, P::Error, L::Error, J::Error, K::Error>,
+    > {
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
+        let WriteBackInput { name } = input;
+        let _lease = self
+            .project_lease
+            .acquire(&name)
+            .await
+            .map_err(WriteBackServiceError::ProjectLease)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
         }
         let project = self
             .project_opener
             .open(&name)
             .await
             .map_err(WriteBackServiceError::OpenProject)?;
-        self.cancellation
-            .check()
-            .map_err(WriteBackServiceError::Cancelled)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
 
         let preparation = self
             .standard_write_back
             .prepare(&project, project.layout_profile())
             .await
             .map_err(WriteBackServiceError::Standard)?;
+        let OperationCompletion::Completed(preparation) = preparation else {
+            return Ok(OperationCompletion::Cancelled);
+        };
         let (documents, standard, manual_layout_diagnostics) = preparation.into_parts();
 
-        self.cancellation
-            .check()
-            .map_err(WriteBackServiceError::Cancelled)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let candidate = self
             .publisher
             .prepare(&project, documents)
             .await
             .map_err(WriteBackServiceError::PrepareCandidate)?;
 
-        if let Err(cancellation) = self.cancellation.check() {
+        if self.cancellation.is_requested() {
             let candidate_root = candidate.candidate_root().to_path_buf();
             return match self.publisher.discard(candidate).await {
-                Ok(()) => Err(WriteBackServiceError::Cancelled(cancellation)),
-                Err(discard) => Err(WriteBackServiceError::CancelledAndDiscard {
-                    cancellation,
+                Ok(()) => Ok(OperationCompletion::Cancelled),
+                Err(discard) => Err(WriteBackServiceError::CancellationDiscard {
                     candidate_root,
                     discard,
                 }),
             };
         }
 
-        let lua_executed = if let Some(script_path) = lua_script {
-            let error_script_path = script_path.clone();
-            let lua = self
-                .lua_write_back
-                .as_ref()
-                .expect("Lua 依赖已在产生候选前验证");
-            if let Err(source) = lua.run(&project, &candidate, script_path).await {
-                let candidate_root = candidate.candidate_root().to_path_buf();
-                return match self.publisher.discard(candidate).await {
-                    Ok(()) => Err(WriteBackServiceError::Lua {
-                        script_path: error_script_path,
-                        candidate_root,
-                        source,
-                    }),
-                    Err(discard) => Err(WriteBackServiceError::LuaAndDiscard {
-                        script_path: error_script_path,
-                        candidate_root,
-                        source,
-                        discard,
-                    }),
-                };
+        let lua_executed = if let Some(selected_lua) = &self.selected_lua {
+            let error_script_path = selected_lua.script_path().to_path_buf();
+            let lua_completion = selected_lua
+                .executor()
+                .run(&project, &candidate, error_script_path.clone())
+                .await;
+            match lua_completion {
+                Ok(OperationCompletion::Completed(())) => true,
+                Ok(OperationCompletion::Cancelled) => {
+                    let candidate_root = candidate.candidate_root().to_path_buf();
+                    return match self.publisher.discard(candidate).await {
+                        Ok(()) => Ok(OperationCompletion::Cancelled),
+                        Err(discard) => Err(WriteBackServiceError::CancellationDiscard {
+                            candidate_root,
+                            discard,
+                        }),
+                    };
+                }
+                Err(source) => {
+                    let candidate_root = candidate.candidate_root().to_path_buf();
+                    return match self.publisher.discard(candidate).await {
+                        Ok(()) => Err(WriteBackServiceError::Lua {
+                            script_path: error_script_path,
+                            candidate_root,
+                            source,
+                        }),
+                        Err(discard) => Err(WriteBackServiceError::LuaAndDiscard {
+                            script_path: error_script_path,
+                            candidate_root,
+                            source,
+                            discard,
+                        }),
+                    };
+                }
             }
-            true
         } else {
             false
         };
@@ -288,12 +353,11 @@ where
             };
         }
 
-        if let Err(cancellation) = self.cancellation.check() {
+        if self.cancellation.is_requested() {
             let candidate_root = candidate.candidate_root().to_path_buf();
             return match self.publisher.discard(candidate).await {
-                Ok(()) => Err(WriteBackServiceError::Cancelled(cancellation)),
-                Err(discard) => Err(WriteBackServiceError::CancelledAndDiscard {
-                    cancellation,
+                Ok(()) => Ok(OperationCompletion::Cancelled),
+                Err(discard) => Err(WriteBackServiceError::CancellationDiscard {
                     candidate_root,
                     discard,
                 }),
@@ -303,21 +367,116 @@ where
         // 借用式业务校验已经通过；`publish` 现在按值接管 token，并在实际目标交换前
         // 再次复核完整候选以覆盖检查与使用之间的变化。从此边界开始，无论根返回何种
         // 终态，上层都不得再次尝试 discard。
-        let published = self
-            .publisher
-            .publish(candidate)
+        let publish_operation_id = match self.event_log.new_operation_id() {
+            Ok(operation_id) => operation_id,
+            Err(source) => {
+                let candidate_root = candidate.candidate_root().to_path_buf();
+                return match self.publisher.discard(candidate).await {
+                    Ok(()) => Err(WriteBackServiceError::CreatePublishOperationId {
+                        candidate_root,
+                        source,
+                    }),
+                    Err(discard) => {
+                        Err(WriteBackServiceError::CreatePublishOperationIdAndDiscard {
+                            candidate_root,
+                            source,
+                            discard,
+                        })
+                    }
+                };
+            }
+        };
+        let intended_output_root = project.write_back_root().to_path_buf();
+        if let Err(source) = self
+            .event_log
+            .append(AuditEvent::WriteBackPublishStarted {
+                operation_id: publish_operation_id,
+                output_root: intended_output_root.clone(),
+            })
             .await
-            .map_err(WriteBackServiceError::Publish)?;
+        {
+            let candidate_root = candidate.candidate_root().to_path_buf();
+            return match self.publisher.discard(candidate).await {
+                Ok(()) => Err(WriteBackServiceError::RecordPublishStarted {
+                    candidate_root,
+                    source,
+                }),
+                Err(discard) => Err(WriteBackServiceError::RecordPublishStartedAndDiscard {
+                    candidate_root,
+                    source,
+                    discard,
+                }),
+            };
+        }
+        let published = match self.publisher.publish(candidate).await {
+            Ok(published) => published,
+            Err(failure) => {
+                let (state, source) = failure.into_parts();
+                let error_state = state.clone();
+                let audit_result = match state {
+                    WriteBackPublishFailureState::NotPublished {
+                        output_root,
+                        residual_paths,
+                    } => WriteBackPublishAuditResult::NotPublished {
+                        output_root,
+                        residual_paths,
+                    },
+                    WriteBackPublishFailureState::PublishedWithResiduals {
+                        output_root,
+                        residual_paths,
+                    } => WriteBackPublishAuditResult::PublishedWithResiduals {
+                        output_root,
+                        residual_paths,
+                    },
+                    WriteBackPublishFailureState::RecoveryRequired {
+                        output_root,
+                        recovery_artifacts,
+                    } => WriteBackPublishAuditResult::RecoveryRequired {
+                        output_root,
+                        recovery_artifacts,
+                    },
+                    WriteBackPublishFailureState::OutcomeUnknown {
+                        output_root,
+                        recovery_artifacts,
+                    } => WriteBackPublishAuditResult::OutcomeUnknown {
+                        output_root,
+                        recovery_artifacts,
+                    },
+                };
+                let finish = self
+                    .event_log
+                    .append(AuditEvent::WriteBackPublishFinished {
+                        operation_id: publish_operation_id,
+                        result: audit_result,
+                    })
+                    .await;
+                return match finish {
+                    Ok(_) => Err(WriteBackServiceError::Publish {
+                        state: error_state,
+                        source,
+                    }),
+                    Err(log_source) => Err(WriteBackServiceError::PublishAndRecordFailure {
+                        state: error_state,
+                        source,
+                        log_source,
+                    }),
+                };
+            }
+        };
         let output_root = published.output_root().to_path_buf();
 
+        let run_log = standard::WriteBackRunLog::new(
+            &project,
+            *project.layout_profile(),
+            standard,
+            manual_layout_diagnostics,
+            lua_executed,
+        );
         self.event_log
-            .append(standard::WriteBackRunLog::new(
-                &project,
-                *project.layout_profile(),
-                standard,
-                manual_layout_diagnostics,
-                lua_executed,
-            ))
+            .append(AuditEvent::WriteBackPublishFinished {
+                operation_id: publish_operation_id,
+                result: WriteBackPublishAuditResult::Published(run_log),
+            })
             .await
             .map_err(|source| WriteBackServiceError::RecordPublishedRun {
                 output_root: output_root.clone(),
@@ -325,28 +484,26 @@ where
                 source,
             })?;
 
-        Ok(WriteBackOutput {
+        Ok(OperationCompletion::Completed(WriteBackOutput {
             name: project.name().clone(),
             output_root,
             standard,
             lua_executed,
-        })
+        }))
     }
 }
 
 /// WriteBack 顶层用例在打开、准备、候选终结、Lua 与日志边界遇到的阶段失败。
 #[derive(Debug)]
-pub(crate) enum WriteBackServiceError<OE, SE, PE, LE, JE> {
-    Cancelled(OperationCancelled),
-    CancelledAndDiscard {
-        cancellation: OperationCancelled,
+pub(crate) enum WriteBackServiceError<OE, SE, PE, LE, JE, KE> {
+    ProjectLease(ProjectCommandLeaseError<KE>),
+    CancellationDiscard {
         candidate_root: PathBuf,
         discard: PE,
     },
     OpenProject(OE),
     Standard(SE),
     PrepareCandidate(PE),
-    MissingLuaDependency,
     Lua {
         script_path: PathBuf,
         candidate_root: PathBuf,
@@ -367,7 +524,33 @@ pub(crate) enum WriteBackServiceError<OE, SE, PE, LE, JE> {
         source: PE,
         discard: PE,
     },
-    Publish(PE),
+    CreatePublishOperationId {
+        candidate_root: PathBuf,
+        source: JE,
+    },
+    CreatePublishOperationIdAndDiscard {
+        candidate_root: PathBuf,
+        source: JE,
+        discard: PE,
+    },
+    RecordPublishStarted {
+        candidate_root: PathBuf,
+        source: JE,
+    },
+    RecordPublishStartedAndDiscard {
+        candidate_root: PathBuf,
+        source: JE,
+        discard: PE,
+    },
+    Publish {
+        state: WriteBackPublishFailureState,
+        source: PE,
+    },
+    PublishAndRecordFailure {
+        state: WriteBackPublishFailureState,
+        source: PE,
+        log_source: JE,
+    },
     RecordPublishedRun {
         output_root: PathBuf,
         lua_executed: bool,
@@ -375,32 +558,80 @@ pub(crate) enum WriteBackServiceError<OE, SE, PE, LE, JE> {
     },
 }
 
-impl<OE, SE, PE, LE, JE> fmt::Display for WriteBackServiceError<OE, SE, PE, LE, JE>
+/// 写回失败已经造成的最高层用户影响。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteBackFailureImpact {
+    ProjectUnavailable,
+    ProjectState,
+    AuditLedger,
+    StateAppliedButFinalizationFailed,
+    OutcomeUnknown,
+    Internal,
+}
+
+impl<OE, SE, PE, LE, JE, KE> WriteBackServiceError<OE, SE, PE, LE, JE, KE> {
+    /// 将候选、审计与目录发布终态归并为命令边界可以准确呈现的用户影响。
+    pub(crate) fn failure_impact(&self) -> WriteBackFailureImpact {
+        use WriteBackFailureImpact as Impact;
+
+        match self {
+            Self::ProjectLease(_) => Impact::ProjectUnavailable,
+            Self::CancellationDiscard { .. } => Impact::Internal,
+            Self::OpenProject(_)
+            | Self::Standard(_)
+            | Self::PrepareCandidate(_)
+            | Self::Lua { .. }
+            | Self::LuaAndDiscard { .. }
+            | Self::ValidateCandidate { .. }
+            | Self::ValidateCandidateAndDiscard { .. } => Impact::ProjectState,
+            Self::CreatePublishOperationId { .. }
+            | Self::CreatePublishOperationIdAndDiscard { .. }
+            | Self::RecordPublishStarted { .. }
+            | Self::RecordPublishStartedAndDiscard { .. } => Impact::AuditLedger,
+            Self::Publish { state, .. } => match state {
+                WriteBackPublishFailureState::NotPublished { .. } => Impact::ProjectState,
+                WriteBackPublishFailureState::PublishedWithResiduals { .. } => {
+                    Impact::StateAppliedButFinalizationFailed
+                }
+                WriteBackPublishFailureState::RecoveryRequired { .. }
+                | WriteBackPublishFailureState::OutcomeUnknown { .. } => Impact::OutcomeUnknown,
+            },
+            Self::PublishAndRecordFailure { state, .. } => match state {
+                WriteBackPublishFailureState::NotPublished { .. } => Impact::AuditLedger,
+                WriteBackPublishFailureState::PublishedWithResiduals { .. } => {
+                    Impact::StateAppliedButFinalizationFailed
+                }
+                WriteBackPublishFailureState::RecoveryRequired { .. }
+                | WriteBackPublishFailureState::OutcomeUnknown { .. } => Impact::OutcomeUnknown,
+            },
+            Self::RecordPublishedRun { .. } => Impact::StateAppliedButFinalizationFailed,
+        }
+    }
+}
+
+impl<OE, SE, PE, LE, JE, KE> fmt::Display for WriteBackServiceError<OE, SE, PE, LE, JE, KE>
 where
     OE: Error,
     SE: Error,
     PE: Error,
     LE: Error,
     JE: Error,
+    KE: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled(error) => error.fmt(formatter),
-            Self::CancelledAndDiscard {
-                cancellation,
+            Self::ProjectLease(error) => error.fmt(formatter),
+            Self::CancellationDiscard {
                 candidate_root,
                 discard,
             } => write!(
                 formatter,
-                "{cancellation}，且无法丢弃写回候选 {}：{discard}",
+                "取消后无法丢弃写回候选 {}：{discard}",
                 candidate_root.display()
             ),
             Self::OpenProject(source) => write!(formatter, "打开项目失败：{source}"),
             Self::Standard(source) => write!(formatter, "准备 Standard 写回失败：{source}"),
             Self::PrepareCandidate(source) => write!(formatter, "准备完整写回候选失败：{source}"),
-            Self::MissingLuaDependency => {
-                formatter.write_str("本次选择了 Lua 写回，但未构造 Lua Runtime")
-            }
             Self::Lua {
                 script_path,
                 candidate_root,
@@ -439,7 +670,54 @@ where
                 "写回候选未通过发布前完整校验（候选：{}）：{source}；随后丢弃候选失败：{discard}",
                 candidate_root.display()
             ),
-            Self::Publish(source) => write!(formatter, "发布完整写回候选失败：{source}"),
+            Self::CreatePublishOperationId {
+                candidate_root,
+                source,
+            } => write!(
+                formatter,
+                "无法为写回候选 {} 建立审计操作身份：{source}",
+                candidate_root.display()
+            ),
+            Self::CreatePublishOperationIdAndDiscard {
+                candidate_root,
+                source,
+                discard,
+            } => write!(
+                formatter,
+                "无法为写回候选 {} 建立审计操作身份：{source}；随后丢弃候选失败：{discard}",
+                candidate_root.display()
+            ),
+            Self::RecordPublishStarted {
+                candidate_root,
+                source,
+            } => write!(
+                formatter,
+                "写回候选 {} 的发布意图未能写入审计账本：{source}",
+                candidate_root.display()
+            ),
+            Self::RecordPublishStartedAndDiscard {
+                candidate_root,
+                source,
+                discard,
+            } => write!(
+                formatter,
+                "写回候选 {} 的发布意图未能写入审计账本：{source}；随后丢弃候选失败：{discard}",
+                candidate_root.display()
+            ),
+            Self::Publish { state, source } => {
+                write!(
+                    formatter,
+                    "发布完整写回候选失败（终态：{state:?}）：{source}"
+                )
+            }
+            Self::PublishAndRecordFailure {
+                state,
+                source,
+                log_source,
+            } => write!(
+                formatter,
+                "发布完整写回候选失败（终态：{state:?}）且无法记录发布终态：发布：{source}；审计：{log_source}"
+            ),
             Self::RecordPublishedRun {
                 output_root,
                 lua_executed,
@@ -453,27 +731,32 @@ where
     }
 }
 
-impl<OE, SE, PE, LE, JE> Error for WriteBackServiceError<OE, SE, PE, LE, JE>
+impl<OE, SE, PE, LE, JE, KE> Error for WriteBackServiceError<OE, SE, PE, LE, JE, KE>
 where
     OE: Error + 'static,
     SE: Error + 'static,
     PE: Error + 'static,
     LE: Error + 'static,
     JE: Error + 'static,
+    KE: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Cancelled(error) => Some(error),
-            Self::CancelledAndDiscard { cancellation, .. } => Some(cancellation),
+            Self::ProjectLease(error) => Some(error),
+            Self::CancellationDiscard { discard, .. } => Some(discard),
             Self::OpenProject(source) => Some(source),
             Self::Standard(source) => Some(source),
             Self::PrepareCandidate(source)
             | Self::ValidateCandidate { source, .. }
             | Self::ValidateCandidateAndDiscard { source, .. }
-            | Self::Publish(source) => Some(source),
-            Self::MissingLuaDependency => None,
+            | Self::Publish { source, .. } => Some(source),
             Self::Lua { source, .. } | Self::LuaAndDiscard { source, .. } => Some(source),
-            Self::RecordPublishedRun { source, .. } => Some(source),
+            Self::CreatePublishOperationId { source, .. }
+            | Self::CreatePublishOperationIdAndDiscard { source, .. }
+            | Self::RecordPublishStarted { source, .. }
+            | Self::RecordPublishStartedAndDiscard { source, .. }
+            | Self::RecordPublishedRun { source, .. } => Some(source),
+            Self::PublishAndRecordFailure { source, .. } => Some(source),
         }
     }
 }
@@ -484,6 +767,8 @@ mod tests {
 
     use super::*;
     use crate::att_mz::project::{MaxFullwidthChars, MzWriteBackLayoutProfile};
+    use crate::observability::{EventId, OperationId};
+    use uuid::Uuid;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
@@ -495,11 +780,13 @@ mod tests {
             candidate_root: PathBuf,
         },
         ValidateCandidate,
+        AuditPublishStarted,
         Publish,
         Discard,
         Log {
             lua_executed: bool,
         },
+        LogPublishFailure,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,7 +836,10 @@ mod tests {
             &self,
             _: &OpenedProject,
             layout_profile: &MzWriteBackLayoutProfile,
-        ) -> Result<standard::StandardWriteBackPreparation<Self::Documents>, Self::Error> {
+        ) -> Result<
+            OperationCompletion<standard::StandardWriteBackPreparation<Self::Documents>>,
+            Self::Error,
+        > {
             self.events
                 .lock()
                 .expect("事件锁不应中毒")
@@ -557,12 +847,30 @@ mod tests {
             if self.fail {
                 Err(FakeError("standard"))
             } else {
-                Ok(standard::StandardWriteBackPreparation::new(
-                    (),
-                    standard_summary(),
-                    Vec::new(),
+                Ok(OperationCompletion::Completed(
+                    standard::StandardWriteBackPreparation::new((), standard_summary(), Vec::new()),
                 ))
             }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeProjectLease;
+
+    impl ProjectCommandLeaseProvider for FakeProjectLease {
+        type Error = FakeError;
+        type LeaseState = ();
+
+        async fn acquire(
+            &self,
+            _: &ProjectName,
+        ) -> Result<
+            crate::att_mz::project_lease::ProjectCommandLease<Self::LeaseState>,
+            ProjectCommandLeaseError<Self::Error>,
+        > {
+            Ok(crate::att_mz::project_lease::ProjectCommandLease::for_test(
+                (),
+            ))
         }
     }
 
@@ -623,13 +931,19 @@ mod tests {
         async fn publish(
             &self,
             candidate: Self::Candidate,
-        ) -> Result<PublishedWriteBack, Self::Error> {
+        ) -> Result<PublishedWriteBack, WriteBackPublishFailure<Self::Error>> {
             self.events
                 .lock()
                 .expect("事件锁不应中毒")
                 .push(Event::Publish);
             if self.failing_stage == Some("publish") {
-                return Err(FakeError("publish"));
+                return Err(WriteBackPublishFailure::new(
+                    WriteBackPublishFailureState::NotPublished {
+                        output_root: candidate.output_root.clone(),
+                        residual_paths: Vec::new(),
+                    },
+                    FakeError("publish"),
+                ));
             }
             Ok(PublishedWriteBack::new(candidate.output_root))
         }
@@ -660,7 +974,13 @@ mod tests {
                 .push(Event::Discard);
             if matches!(
                 self.failing_stage,
-                Some("discard" | "lua-discard" | "validate-discard" | "cancel-discard")
+                Some(
+                    "discard"
+                        | "lua-discard"
+                        | "validate-discard"
+                        | "cancel-discard"
+                        | "cancel-lua-discard"
+                )
             ) {
                 Err(FakeError("discard"))
             } else {
@@ -673,6 +993,7 @@ mod tests {
     struct FakeLuaWriteBack {
         events: Arc<Mutex<Vec<Event>>>,
         fail: bool,
+        cancelled: bool,
     }
 
     impl LuaWriteBack<FakeCandidate> for FakeLuaWriteBack {
@@ -683,7 +1004,7 @@ mod tests {
             _: &OpenedProject,
             candidate: &FakeCandidate,
             script_path: PathBuf,
-        ) -> Result<(), Self::Error> {
+        ) -> Result<OperationCompletion<()>, Self::Error> {
             self.events
                 .lock()
                 .expect("事件锁不应中毒")
@@ -693,8 +1014,10 @@ mod tests {
                 });
             if self.fail {
                 Err(FakeError("lua"))
+            } else if self.cancelled {
+                Ok(OperationCompletion::Cancelled)
             } else {
-                Ok(())
+                Ok(OperationCompletion::Completed(()))
             }
         }
     }
@@ -702,23 +1025,65 @@ mod tests {
     #[derive(Clone)]
     struct FakeEventLog {
         events: Arc<Mutex<Vec<Event>>>,
-        fail: bool,
+        fail_start: bool,
+        fail_finish: bool,
     }
 
-    impl PersistentEventLog<standard::WriteBackRunLog> for FakeEventLog {
+    impl AuditLedger for FakeEventLog {
         type Error = FakeError;
 
-        async fn append(&self, event: standard::WriteBackRunLog) -> Result<(), Self::Error> {
-            self.events
-                .lock()
-                .expect("事件锁不应中毒")
-                .push(Event::Log {
-                    lua_executed: event.lua_executed(),
-                });
-            if self.fail {
+        fn new_operation_id(&self) -> Result<OperationId, Self::Error> {
+            Ok(OperationId::from_uuid(Uuid::from_u128(
+                0x550e_8400_e29b_41d4_a716_4466_5544_0000,
+            )))
+        }
+
+        async fn append(&self, event: AuditEvent) -> Result<EventId, Self::Error> {
+            let fail = match event {
+                AuditEvent::WriteBackPublishStarted { .. } => {
+                    self.events
+                        .lock()
+                        .expect("事件锁不应中毒")
+                        .push(Event::AuditPublishStarted);
+                    self.fail_start
+                }
+                AuditEvent::WriteBackPublishFinished {
+                    result: WriteBackPublishAuditResult::Published(event),
+                    ..
+                } => {
+                    self.events
+                        .lock()
+                        .expect("事件锁不应中毒")
+                        .push(Event::Log {
+                            lua_executed: event.lua_executed(),
+                        });
+                    self.fail_finish
+                }
+                AuditEvent::WriteBackPublishFinished {
+                    result:
+                        WriteBackPublishAuditResult::NotPublished { .. }
+                        | WriteBackPublishAuditResult::PublishedWithResiduals { .. }
+                        | WriteBackPublishAuditResult::RecoveryRequired { .. }
+                        | WriteBackPublishAuditResult::OutcomeUnknown { .. },
+                    ..
+                } => {
+                    self.events
+                        .lock()
+                        .expect("事件锁不应中毒")
+                        .push(Event::LogPublishFailure);
+                    self.fail_finish
+                }
+                AuditEvent::RunStarted
+                | AuditEvent::RunFinished { .. }
+                | AuditEvent::TranslationTaskStarted { .. }
+                | AuditEvent::TranslationTaskFinished { .. } => false,
+            };
+            if fail {
                 Err(FakeError("log"))
             } else {
-                Ok(())
+                Ok(EventId::from_uuid(Uuid::from_u128(
+                    0x7c9e_6679_7425_40de_944b_e07f_c1f9_0ae7,
+                )))
             }
         }
     }
@@ -729,9 +1094,14 @@ mod tests {
         FakePublisher,
         FakeLuaWriteBack,
         FakeEventLog,
+        FakeProjectLease,
     >;
 
-    fn service(events: Arc<Mutex<Vec<Event>>>, failing_stage: Option<&'static str>) -> Service {
+    fn service(
+        events: Arc<Mutex<Vec<Event>>>,
+        failing_stage: Option<&'static str>,
+        lua_script: Option<&str>,
+    ) -> Service {
         let cancellation = CooperativeCancellation::default();
         WriteBackService::new(
             FakeOpener {
@@ -753,14 +1123,25 @@ mod tests {
                 cancel_after_validate: (failing_stage == Some("cancel-after-validate"))
                     .then(|| cancellation.clone()),
             },
-            Some(FakeLuaWriteBack {
-                events: Arc::clone(&events),
-                fail: matches!(failing_stage, Some("lua" | "lua-discard")),
+            lua_script.map(|path| {
+                SelectedLua::new(
+                    PathBuf::from(path),
+                    FakeLuaWriteBack {
+                        events: Arc::clone(&events),
+                        fail: matches!(failing_stage, Some("lua" | "lua-discard")),
+                        cancelled: matches!(
+                            failing_stage,
+                            Some("cancel-lua" | "cancel-lua-discard")
+                        ),
+                    },
+                )
             }),
             FakeEventLog {
                 events,
-                fail: failing_stage == Some("log"),
+                fail_start: failing_stage == Some("log-start"),
+                fail_finish: failing_stage == Some("log"),
             },
+            FakeProjectLease,
             cancellation,
         )
     }
@@ -811,10 +1192,9 @@ mod tests {
         }
     }
 
-    fn input(lua_script: Option<&str>) -> WriteBackInput {
+    fn input(_: Option<&str>) -> WriteBackInput {
         WriteBackInput {
             name: project_name(),
-            lua_script: lua_script.map(PathBuf::from),
         }
     }
 
@@ -826,19 +1206,19 @@ mod tests {
     async fn without_lua_still_validates_before_the_single_publish() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
 
-        let output = service(Arc::clone(&recorded), None)
+        let output = service(Arc::clone(&recorded), None, None)
             .execute(input(None))
             .await
             .expect("Standard 写回应成功");
 
         assert_eq!(
             output,
-            WriteBackOutput {
+            OperationCompletion::Completed(WriteBackOutput {
                 name: project_name(),
                 output_root: output_root(),
                 standard: standard_summary(),
                 lua_executed: false,
-            }
+            })
         );
         assert_eq!(
             events(&recorded),
@@ -847,6 +1227,7 @@ mod tests {
                 Event::Standard(layout_profile()),
                 Event::PrepareCandidate,
                 Event::ValidateCandidate,
+                Event::AuditPublishStarted,
                 Event::Publish,
                 Event::Log {
                     lua_executed: false,
@@ -860,11 +1241,14 @@ mod tests {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let script_path = PathBuf::from("scripts/write_back.lua");
 
-        let output = service(Arc::clone(&recorded), None)
+        let output = service(Arc::clone(&recorded), None, Some("scripts/write_back.lua"))
             .execute(input(Some("scripts/write_back.lua")))
             .await
             .expect("Lua 应在候选发布前完成");
 
+        let OperationCompletion::Completed(output) = output else {
+            panic!("写回应正常完成")
+        };
         assert_eq!(output.standard.manual_layout_units, 0);
         assert!(output.lua_executed);
         assert_eq!(output.output_root, output_root());
@@ -879,9 +1263,68 @@ mod tests {
                     candidate_root: candidate_root(),
                 },
                 Event::ValidateCandidate,
+                Event::AuditPublishStarted,
                 Event::Publish,
                 Event::Log { lua_executed: true },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_cancellation_discards_the_candidate_and_returns_normal_cancellation() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+
+        let completion = service(
+            Arc::clone(&recorded),
+            Some("cancel-lua"),
+            Some("scripts/write_back.lua"),
+        )
+        .execute(input(Some("scripts/write_back.lua")))
+        .await
+        .expect("Lua 取消且候选清理成功应是正常结果");
+
+        assert_eq!(completion, OperationCompletion::Cancelled);
+        assert_eq!(
+            events(&recorded),
+            vec![
+                Event::Open(project_name()),
+                Event::Standard(layout_profile()),
+                Event::PrepareCandidate,
+                Event::Lua {
+                    script_path: PathBuf::from("scripts/write_back.lua"),
+                    candidate_root: candidate_root(),
+                },
+                Event::Discard,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_cancellation_and_discard_failure_preserve_both_facts() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+
+        let error = service(
+            Arc::clone(&recorded),
+            Some("cancel-lua-discard"),
+            Some("scripts/write_back.lua"),
+        )
+        .execute(input(Some("scripts/write_back.lua")))
+        .await
+        .expect_err("取消后的候选清理失败必须显式返回");
+
+        assert!(matches!(
+            error,
+            WriteBackServiceError::CancellationDiscard {
+                candidate_root: failed_candidate,
+                discard: FakeError("discard"),
+            } if failed_candidate == candidate_root()
+        ));
+        assert_eq!(
+            events(&recorded)
+                .into_iter()
+                .filter(|event| matches!(event, Event::Discard))
+                .count(),
+            1
         );
     }
 
@@ -965,17 +1408,32 @@ mod tests {
                         candidate_root: candidate_root(),
                     },
                     Event::ValidateCandidate,
+                    Event::AuditPublishStarted,
                     Event::Publish,
+                    Event::LogPublishFailure,
                 ],
             ),
         ];
 
         for (stage, expected_events) in cases {
             let recorded = Arc::new(Mutex::new(Vec::new()));
-            let error = service(Arc::clone(&recorded), Some(stage))
-                .execute(input(Some("scripts/write_back.lua")))
-                .await
-                .expect_err("指定技术阶段应失败");
+            let result = service(
+                Arc::clone(&recorded),
+                Some(stage),
+                Some("scripts/write_back.lua"),
+            )
+            .execute(input(Some("scripts/write_back.lua")))
+            .await;
+
+            if matches!(stage, "cancel-after-prepare" | "cancel-after-validate") {
+                assert_eq!(
+                    result.expect("取消应是正常结果"),
+                    OperationCompletion::Cancelled
+                );
+                assert_eq!(events(&recorded), expected_events);
+                continue;
+            }
+            let error = result.expect_err("指定技术阶段应失败");
 
             match stage {
                 "open" => assert!(matches!(
@@ -997,9 +1455,6 @@ mod tests {
                         ..
                     }
                 )),
-                "cancel-after-prepare" | "cancel-after-validate" => {
-                    assert!(matches!(error, WriteBackServiceError::Cancelled(_)))
-                }
                 "validate" => assert!(matches!(
                     error,
                     WriteBackServiceError::ValidateCandidate {
@@ -1009,7 +1464,10 @@ mod tests {
                 )),
                 "publish" => assert!(matches!(
                     error,
-                    WriteBackServiceError::Publish(FakeError("publish"))
+                    WriteBackServiceError::Publish {
+                        state: WriteBackPublishFailureState::NotPublished { .. },
+                        source: FakeError("publish"),
+                    }
                 )),
                 _ => unreachable!("测试只包含已知阶段"),
             }
@@ -1021,10 +1479,14 @@ mod tests {
     async fn lua_failure_discards_candidate_and_preserves_primary_source() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
 
-        let error = service(Arc::clone(&recorded), Some("lua"))
-            .execute(input(Some("custom/write_back.lua")))
-            .await
-            .expect_err("Lua 技术失败应返回错误");
+        let error = service(
+            Arc::clone(&recorded),
+            Some("lua"),
+            Some("custom/write_back.lua"),
+        )
+        .execute(input(Some("custom/write_back.lua")))
+        .await
+        .expect_err("Lua 技术失败应返回错误");
 
         assert!(matches!(
             &error,
@@ -1064,7 +1526,7 @@ mod tests {
     async fn validation_failure_without_lua_discards_once_and_never_publishes() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
 
-        let error = service(Arc::clone(&recorded), Some("validate"))
+        let error = service(Arc::clone(&recorded), Some("validate"), None)
             .execute(input(None))
             .await
             .expect_err("无 Lua 的完整候选也必须通过发布前校验");
@@ -1096,7 +1558,7 @@ mod tests {
     async fn log_failure_reports_that_publish_already_took_effect() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
 
-        let error = service(Arc::clone(&recorded), Some("log"))
+        let error = service(Arc::clone(&recorded), Some("log"), Some("write.lua"))
             .execute(input(Some("write.lua")))
             .await
             .expect_err("日志失败必须显式传播");
@@ -1121,13 +1583,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publish_intent_failure_discards_candidate_and_never_publishes() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+
+        let error = service(Arc::clone(&recorded), Some("log-start"), None)
+            .execute(input(None))
+            .await
+            .expect_err("未确认审计意图时不得发布");
+
+        assert!(matches!(
+            error,
+            WriteBackServiceError::RecordPublishStarted {
+                source: FakeError("log"),
+                ..
+            }
+        ));
+        let recorded = events(&recorded);
+        assert!(recorded.contains(&Event::AuditPublishStarted));
+        assert!(recorded.contains(&Event::Discard));
+        assert!(!recorded.contains(&Event::Publish));
+    }
+
+    #[tokio::test]
     async fn lua_and_discard_failure_preserves_both_errors() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
 
-        let error = service(Arc::clone(&recorded), Some("lua-discard"))
-            .execute(input(Some("broken.lua")))
-            .await
-            .expect_err("Lua 与清理双重失败必须同时保留");
+        let error = service(
+            Arc::clone(&recorded),
+            Some("lua-discard"),
+            Some("broken.lua"),
+        )
+        .execute(input(Some("broken.lua")))
+        .await
+        .expect_err("Lua 与清理双重失败必须同时保留");
 
         assert!(matches!(
             error,
@@ -1152,10 +1640,14 @@ mod tests {
     async fn validation_and_discard_failure_preserves_both_errors() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
 
-        let error = service(Arc::clone(&recorded), Some("validate-discard"))
-            .execute(input(Some("write.lua")))
-            .await
-            .expect_err("完整候选校验与清理双重失败必须同时保留");
+        let error = service(
+            Arc::clone(&recorded),
+            Some("validate-discard"),
+            Some("write.lua"),
+        )
+        .execute(input(Some("write.lua")))
+        .await
+        .expect_err("完整候选校验与清理双重失败必须同时保留");
 
         assert!(matches!(
             error,
@@ -1182,52 +1674,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_lua_dependency_is_rejected_before_opening_the_project() {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let service: Service = WriteBackService::new(
-            FakeOpener {
-                events: Arc::clone(&recorded),
-                fail: false,
-            },
-            FakeStandardWriteBack {
-                events: Arc::clone(&recorded),
-                fail: false,
-            },
-            FakePublisher {
-                events: Arc::clone(&recorded),
-                failing_stage: None,
-                cancel_after_prepare: None,
-                cancel_after_validate: None,
-            },
-            None,
-            FakeEventLog {
-                events: Arc::clone(&recorded),
-                fail: false,
-            },
-            CooperativeCancellation::default(),
-        );
-
-        let error = service
-            .execute(input(Some("write.lua")))
-            .await
-            .expect_err("缺少 Lua 根必须在任何业务副作用前失败");
-
-        assert!(matches!(error, WriteBackServiceError::MissingLuaDependency));
-        assert!(events(&recorded).is_empty());
-    }
-
-    #[tokio::test]
     async fn cancellation_and_discard_failure_preserves_both_outcomes() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
 
-        let error = service(Arc::clone(&recorded), Some("cancel-discard"))
+        let error = service(Arc::clone(&recorded), Some("cancel-discard"), None)
             .execute(input(None))
             .await
             .expect_err("取消后的清理失败必须同时保留");
 
         assert!(matches!(
             error,
-            WriteBackServiceError::CancelledAndDiscard {
+            WriteBackServiceError::CancellationDiscard {
                 discard: FakeError("discard"),
                 ..
             }
@@ -1245,7 +1702,7 @@ mod tests {
     fn execution_future_is_send() {
         fn assert_send(_: impl Send) {}
 
-        let service = service(Arc::new(Mutex::new(Vec::new())), None);
+        let service = service(Arc::new(Mutex::new(Vec::new())), None, None);
         assert_send(service.execute(input(None)));
     }
 }

@@ -123,20 +123,6 @@ impl SqliteBatch {
     }
 }
 
-/// 事务条件的调用方标识，用于把失败恢复为领域错误。
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct SqliteCheckId(String);
-
-impl SqliteCheckId {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// 一个 SQLite 事务中的拥有型执行步骤。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SqliteTransactionStep {
@@ -145,10 +131,7 @@ pub(crate) enum SqliteTransactionStep {
     /// 只准备一次语句，按顺序执行全部参数组。
     ExecuteMany(SqliteBatch),
     /// 查询必须不返回任何行，否则事务在后续步骤之前失败并回滚。
-    RequireNoRows {
-        check_id: SqliteCheckId,
-        query: SqliteQuery,
-    },
+    RequireNoRows(SqliteQuery),
 }
 
 /// 必须在同一个连接和写事务中顺序执行的完整计划。
@@ -268,7 +251,7 @@ pub(crate) enum ExecuteTransactionError<E> {
     /// 目标主数据库文件不存在；实现没有创建文件。
     NotFound,
     /// 指定事务条件命中了至少一行；整个事务已回滚。
-    RequirementFailed { check_id: SqliteCheckId },
+    RequirementFailed,
     /// 事务未提交，驱动确认其修改均未生效。
     NotCommitted(E),
     /// 驱动无法确认提交是否已经生效。
@@ -279,9 +262,7 @@ impl<E: fmt::Display> fmt::Display for ExecuteTransactionError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound => formatter.write_str("目标数据库不存在"),
-            Self::RequirementFailed { check_id } => {
-                write!(formatter, "事务条件未满足：{}", check_id.as_str())
-            }
+            Self::RequirementFailed => formatter.write_str("事务条件未满足"),
             Self::NotCommitted(source) => write!(formatter, "数据库事务未提交：{source}"),
             Self::OutcomeUnknown(source) => write!(formatter, "数据库事务结果未知：{source}"),
         }
@@ -291,7 +272,7 @@ impl<E: fmt::Display> fmt::Display for ExecuteTransactionError<E> {
 impl<E: Error + 'static> Error for ExecuteTransactionError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::NotFound | Self::RequirementFailed { .. } => None,
+            Self::NotFound | Self::RequirementFailed => None,
             Self::NotCommitted(source) | Self::OutcomeUnknown(source) => Some(source),
         }
     }

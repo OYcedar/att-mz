@@ -10,9 +10,9 @@ use crate::att_mz::ProjectName;
 use crate::att_mz::standard_asset::MzStandardAssetOwner;
 use crate::fingerprint::{InvalidSha256FingerprintLength, Sha256Fingerprint};
 use crate::storage::sqlite::{
-    CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError, SqliteCheckId,
-    SqliteCommand, SqliteDatabaseCreator, SqliteQuery, SqliteQueryExecutor, SqliteRow,
-    SqliteTransactionExecutor, SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
+    CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand,
+    SqliteDatabaseCreator, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor,
+    SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
 };
 
 const PROJECT_DATABASE_FILE_NAME: &str = "project.db";
@@ -265,8 +265,6 @@ pub(crate) struct ProjectWorkspaceLayout {
     source_data: PathBuf,
     source_js: PathBuf,
     write_back_root: PathBuf,
-    write_back_data: PathBuf,
-    write_back_js: PathBuf,
 }
 
 impl ProjectWorkspaceLayout {
@@ -282,8 +280,6 @@ impl ProjectWorkspaceLayout {
         let source_data = source_root.join("data");
         let source_js = source_root.join("js");
         let write_back_root = workspace_root.join("write_back");
-        let write_back_data = write_back_root.join("data");
-        let write_back_js = write_back_root.join("js");
 
         Self {
             workspace_root,
@@ -292,8 +288,6 @@ impl ProjectWorkspaceLayout {
             source_data,
             source_js,
             write_back_root,
-            write_back_data,
-            write_back_js,
         }
     }
 
@@ -319,14 +313,6 @@ impl ProjectWorkspaceLayout {
 
     pub(crate) fn write_back_root(&self) -> &Path {
         &self.write_back_root
-    }
-
-    pub(crate) fn write_back_data(&self) -> &Path {
-        &self.write_back_data
-    }
-
-    pub(crate) fn write_back_js(&self) -> &Path {
-        &self.write_back_js
     }
 }
 
@@ -907,14 +893,16 @@ impl ProjectDatabaseState {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn source_language(&self) -> &str {
         &self.metadata.source_language
     }
 
-    #[cfg(test)]
     pub(crate) fn target_language(&self) -> &str {
         &self.metadata.target_language
+    }
+
+    pub(crate) fn layout_profile(&self) -> &MzWriteBackLayoutProfile {
+        &self.metadata.layout_profile
     }
 
     pub(crate) const fn source_snapshot_fingerprint(&self) -> SourceSnapshotFingerprint {
@@ -1329,18 +1317,13 @@ impl NewProject {
 /// 对现存项目数据库完成一次严格检查或状态收敛后的结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectDatabaseReconciliation {
-    changed: bool,
     state: ProjectDatabaseState,
 }
 
 impl ProjectDatabaseReconciliation {
     #[cfg(test)]
-    pub(crate) fn for_test(changed: bool, state: ProjectDatabaseState) -> Self {
-        Self { changed, state }
-    }
-
-    pub(crate) const fn changed(&self) -> bool {
-        self.changed
+    pub(crate) fn for_test(state: ProjectDatabaseState) -> Self {
+        Self { state }
     }
 
     #[cfg(test)]
@@ -1406,33 +1389,23 @@ impl<E: Error + 'static> Error for ProjectDatabaseInspectionError<E> {
 #[derive(Debug)]
 pub(crate) enum ProjectDatabaseReconciliationError<R, W> {
     Inspection(ProjectDatabaseInspectionError<R>),
-    ConcurrentModification {
-        path: PathBuf,
-        check_id: SqliteCheckId,
-    },
-    DatabaseNotFound {
-        path: PathBuf,
-    },
-    NotCommitted {
-        path: PathBuf,
-        source: W,
-    },
-    OutcomeUnknown {
-        path: PathBuf,
-        source: W,
-    },
+    ConcurrentModification { path: PathBuf },
+    DatabaseNotFound { path: PathBuf },
+    NotCommitted { path: PathBuf, source: W },
+    OutcomeUnknown { path: PathBuf, source: W },
 }
 
 impl<R: fmt::Display, W: fmt::Display> fmt::Display for ProjectDatabaseReconciliationError<R, W> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Inspection(source) => source.fmt(formatter),
-            Self::ConcurrentModification { path, check_id } => write!(
-                formatter,
-                "项目数据库 {} 在对账期间被外部改变（{}）",
-                path.display(),
-                check_id.as_str()
-            ),
+            Self::ConcurrentModification { path } => {
+                write!(
+                    formatter,
+                    "项目数据库 {} 在对账期间被外部改变",
+                    path.display()
+                )
+            }
             Self::DatabaseNotFound { path } => {
                 write!(formatter, "项目数据库在对账前消失：{}", path.display())
             }
@@ -1694,20 +1667,15 @@ where
 }
 
 fn schema_version_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
-    SqliteTransactionStep::RequireNoRows {
-        check_id: SqliteCheckId::new("project_schema_unchanged"),
-        query: SqliteQuery::new(
-            "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pragma_schema_version WHERE schema_version = ?1)",
-            vec![SqliteValue::Integer(state.schema_version)],
-        ),
-    }
+    SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
+        "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pragma_schema_version WHERE schema_version = ?1)",
+        vec![SqliteValue::Integer(state.schema_version)],
+    ))
 }
 
 fn metadata_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
-    SqliteTransactionStep::RequireNoRows {
-        check_id: SqliteCheckId::new("project_metadata_unchanged"),
-        query: SqliteQuery::new(
-            r#"SELECT 1
+    SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
+        r#"SELECT 1
 WHERE (SELECT COUNT(*) FROM metadata) <> 1
    OR NOT EXISTS (
      SELECT 1 FROM metadata
@@ -1719,29 +1687,28 @@ WHERE (SELECT COUNT(*) FROM metadata) <> 1
        AND scrolling_text_max_fullwidth_chars = ?6
        AND help_description_max_fullwidth_chars = ?7
    )"#,
-            vec![
-                SqliteValue::Text(state.metadata.name.as_str().to_owned()),
-                SqliteValue::Text(state.metadata.source_language.clone()),
-                SqliteValue::Text(state.metadata.target_language.clone()),
-                SqliteValue::Blob(
-                    state
-                        .metadata
-                        .source_snapshot_fingerprint
-                        .as_bytes()
-                        .to_vec(),
-                ),
-                SqliteValue::Integer(i64::from(
-                    state.metadata.layout_profile.dialogue_body().get(),
-                )),
-                SqliteValue::Integer(i64::from(
-                    state.metadata.layout_profile.scrolling_text().get(),
-                )),
-                SqliteValue::Integer(i64::from(
-                    state.metadata.layout_profile.help_description().get(),
-                )),
-            ],
-        ),
-    }
+        vec![
+            SqliteValue::Text(state.metadata.name.as_str().to_owned()),
+            SqliteValue::Text(state.metadata.source_language.clone()),
+            SqliteValue::Text(state.metadata.target_language.clone()),
+            SqliteValue::Blob(
+                state
+                    .metadata
+                    .source_snapshot_fingerprint
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            SqliteValue::Integer(i64::from(
+                state.metadata.layout_profile.dialogue_body().get(),
+            )),
+            SqliteValue::Integer(i64::from(
+                state.metadata.layout_profile.scrolling_text().get(),
+            )),
+            SqliteValue::Integer(i64::from(
+                state.metadata.layout_profile.help_description().get(),
+            )),
+        ],
+    ))
 }
 
 fn owner_state_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
@@ -1768,17 +1735,12 @@ fn owner_state_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
         }
         statement.push_str("))");
     }
-    SqliteTransactionStep::RequireNoRows {
-        check_id: SqliteCheckId::new("project_owner_state_unchanged"),
-        query: SqliteQuery::new(statement, parameters),
-    }
+    SqliteTransactionStep::RequireNoRows(SqliteQuery::new(statement, parameters))
 }
 
 fn translation_resources_cas(state: &ProjectDatabaseState) -> SqliteTransactionStep {
-    SqliteTransactionStep::RequireNoRows {
-        check_id: SqliteCheckId::new("project_translation_resources_unchanged"),
-        query: SqliteQuery::new(
-            r#"SELECT 1
+    SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
+        r#"SELECT 1
 WHERE (SELECT COUNT(*) FROM standard_translation_resource) <> 2
    OR NOT EXISTS (
      SELECT 1 FROM standard_translation_resource
@@ -1788,12 +1750,11 @@ WHERE (SELECT COUNT(*) FROM standard_translation_resource) <> 2
      SELECT 1 FROM standard_translation_resource
      WHERE resource_kind = 'placeholder_rules' AND canonical_json = ?2
    )"#,
-            vec![
-                SqliteValue::Text(state.terminology_json.clone()),
-                SqliteValue::Text(state.placeholder_rules_json.clone()),
-            ],
-        ),
-    }
+        vec![
+            SqliteValue::Text(state.terminology_json.clone()),
+            SqliteValue::Text(state.placeholder_rules_json.clone()),
+        ],
+    ))
 }
 
 async fn reconcile_project_database<R, T>(
@@ -1812,10 +1773,7 @@ where
         || current.metadata.source_snapshot_fingerprint != requested.source_snapshot_fingerprint
         || current.metadata.layout_profile != requested.layout_profile;
     if !changed {
-        return Ok(ProjectDatabaseReconciliation {
-            changed: false,
-            state: current,
-        });
+        return Ok(ProjectDatabaseReconciliation { state: current });
     }
 
     let mut steps = vec![
@@ -1861,10 +1819,9 @@ where
                     path: database_path.clone(),
                 }
             }
-            ExecuteTransactionError::RequirementFailed { check_id } => {
+            ExecuteTransactionError::RequirementFailed => {
                 ProjectDatabaseReconciliationError::ConcurrentModification {
                     path: database_path.clone(),
-                    check_id,
                 }
             }
             ExecuteTransactionError::NotCommitted(source) => {
@@ -1898,29 +1855,7 @@ where
         placeholder_rules_json: current.placeholder_rules_json,
         schema_version: current.schema_version,
     };
-    Ok(ProjectDatabaseReconciliation {
-        changed: true,
-        state,
-    })
-}
-
-/// 已创建项目数据库的定位信息。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CreatedProject {
-    database_path: PathBuf,
-}
-
-impl CreatedProject {
-    /// 记录一个已经成功创建的数据库路径。
-    pub(crate) fn new(database_path: PathBuf) -> Self {
-        Self { database_path }
-    }
-
-    /// 返回成功创建的数据库路径。
-    #[cfg(test)]
-    pub(crate) fn database_path(&self) -> &Path {
-        &self.database_path
-    }
+    Ok(ProjectDatabaseReconciliation { state })
 }
 
 /// 创建项目数据库的职责契约。
@@ -1939,7 +1874,7 @@ pub(crate) trait ProjectDatabaseCreator: Send + Sync {
         &self,
         destination_path: PathBuf,
         project: NewProject,
-    ) -> impl Future<Output = Result<CreatedProject, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// 使用 SQLite 驱动创建项目数据库。
@@ -1962,11 +1897,7 @@ where
 {
     type Error = ProjectDatabaseCreateError<S::Error>;
 
-    async fn create(
-        &self,
-        database_path: PathBuf,
-        project: NewProject,
-    ) -> Result<CreatedProject, Self::Error> {
+    async fn create(&self, database_path: PathBuf, project: NewProject) -> Result<(), Self::Error> {
         let commands = project_database_commands(&project);
 
         self.sqlite
@@ -1976,7 +1907,7 @@ where
                 ProjectDatabaseCreateError::from_driver(database_path.clone(), error)
             })?;
 
-        Ok(CreatedProject::new(database_path))
+        Ok(())
     }
 }
 
@@ -2143,14 +2074,6 @@ mod tests {
             layout.write_back_root(),
             Path::new("C:/att/projects/测试 游戏/write_back")
         );
-        assert_eq!(
-            layout.write_back_data(),
-            Path::new("C:/att/projects/测试 游戏/write_back/data")
-        );
-        assert_eq!(
-            layout.write_back_js(),
-            Path::new("C:/att/projects/测试 游戏/write_back/js")
-        );
     }
 
     #[derive(Debug)]
@@ -2237,18 +2160,13 @@ mod tests {
     async fn creates_expected_database_and_parameterized_metadata_transaction() {
         let service = ProjectDatabaseCreationService::new(RecordingDriver::succeeding());
 
-        let created = service
+        service
             .create(
                 PathBuf::from("C:/projects/测试 游戏/project.db"),
                 project("测试 游戏"),
             )
             .await
             .expect("database creation should succeed");
-
-        assert_eq!(
-            created.database_path(),
-            Path::new("C:/projects/测试 游戏/project.db")
-        );
 
         let invocations = service
             .sqlite
@@ -2848,7 +2766,6 @@ mod tests {
             .await
             .expect("对账事务应提交");
 
-        assert!(result.changed());
         assert_eq!(
             result.stale_owners(),
             vec![MzStandardAssetOwner::Builtin, MzStandardAssetOwner::Lua]
@@ -2865,22 +2782,11 @@ mod tests {
             .expect("transaction plans mutex should not be poisoned");
         assert_eq!(plans.len(), 1);
         let steps = plans[0].1.steps();
-        let check_ids = steps
+        let check_count = steps
             .iter()
-            .filter_map(|step| match step {
-                SqliteTransactionStep::RequireNoRows { check_id, .. } => Some(check_id.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            check_ids,
-            vec![
-                "project_schema_unchanged",
-                "project_metadata_unchanged",
-                "project_owner_state_unchanged",
-                "project_translation_resources_unchanged",
-            ]
-        );
+            .filter(|step| matches!(step, SqliteTransactionStep::RequireNoRows(_)))
+            .count();
+        assert_eq!(check_count, 4);
         let executed = steps
             .iter()
             .filter_map(|step| match step {
@@ -2898,9 +2804,7 @@ mod tests {
     async fn reconciliation_maps_failed_cas_without_executing_a_second_plan() {
         let queries = RecordingQueryExecutor::responding_with_many(valid_inspection_responses());
         let transactions = RecordingTransactionExecutor::responding_with(Err(
-            ExecuteTransactionError::RequirementFailed {
-                check_id: SqliteCheckId::new("project_metadata_unchanged"),
-            },
+            ExecuteTransactionError::RequirementFailed,
         ));
         let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
         let requested = NewProject::new(
@@ -2918,8 +2822,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProjectDatabaseReconciliationError::ConcurrentModification { ref check_id, .. }
-                if check_id.as_str() == "project_metadata_unchanged"
+            ProjectDatabaseReconciliationError::ConcurrentModification { .. }
         ));
         assert_eq!(
             service

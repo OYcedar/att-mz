@@ -6,9 +6,10 @@ Init 是命名工作区的状态收敛命令。它既能建立项目，也能用
 
 ## 1. 输入、租约与结果
 
-一次调用提交项目名、现存 MZ 游戏根、源语言、目标语言，以及对话正文、滚动文本
-和帮助说明三个区域的正整数宽度。进程先取得项目租约，再观测目标工作区；同名项目
-的 Init、Extract、Translate 与 WriteBack 互斥，不同项目可以并行。
+项目名和现存 MZ 游戏根始终必填；源语言、目标语言及三个布局宽度可以逐项省略。
+首次创建时五项全部必需，缺失时一次报告完整列表，并且不解析游戏目录、不准备候选、
+不建库、不发布。已有项目省略单项表示复用数据库当前事实，显式项表示本次更新值；
+没有任何默认语言或默认宽度。`run_started` 持久化后进程取得项目租约，再观测工作区。
 
 目标不存在时，Init 建立：
 
@@ -24,9 +25,9 @@ Init 是命名工作区的状态收敛命令。它既能建立项目，也能用
 ```
 
 目标存在时，`project.db` 必须可读、属于同名项目并严格符合当前受管 schema；否则
-技术失败，绝不覆盖或重建为空数据库。Init 在候选中复制并对账数据库；来源内容、
-语言、布局和必需工作区结构都与输入一致时丢弃候选并返回 `Unchanged`，不修改可见
-数据库，也不清空既有输出。
+技术失败，绝不覆盖或重建为空数据库。Init 先在可见工作区严格检查结构、数据库、
+冻结来源与本次游戏来源指纹和有效设置；全部一致时直接返回 `Unchanged`，不调用
+prepare、数据库 snapshot/reconcile、discard 或 publish，也不清空既有输出。
 
 原游戏路径只服务本次收敛，不进入 metadata。后续命令只使用工作区内的冻结来源。
 
@@ -86,13 +87,10 @@ Init 对本次游戏来源计算期望指纹。其他三个命令每次开启项
 - 工作区根的直接业务对象必须恰为 `project.db`、`source`、`write_back`，
   `source` 与 `write_back` 的直接子项都必须恰为 `data`、`js`。根目录允许
   数据库检查后留下的 `project.db-journal`、`project.db-wal`、`project.db-shm`；
-  还允许 WriteBack 可恢复目录发布器留下的 `.att-dirpub-locks` 基础设施目录。
-  该目录存在时，内部必须精确只有名为 `write_back` 的锁文件；命名空间可缺省，
-  但不得包含其他锁名或额外对象；
   `project.db` 与这些 SQLite sidecar 必须是单链接普通文件，`source`、`write_back`
-  及两者的 `data`、`js`、`.att-dirpub-locks` 必须是普通目录，锁文件也必须是
-  单链接普通文件。目录列举根拒绝 reparse point、hardlink 和其他非普通对象。
-  Init 只允许这些精确的 SQLite sidecar 与发布锁事实，不解释其内容。其他额外项、
+  及两者的 `data`、`js` 必须是普通目录。目录列举根拒绝 reparse point、hardlink
+  和其他非普通对象。项目锁和目录发布锁固定在 `<projects.root>/.att-locks/`，不属于
+  工作区结构。其他额外项、
   缺失项或角色类型偏差都使用本次来源和已检查的有效数据库在候选中恢复；
 - 多项同时变化时在同一个候选中组合执行，不能暴露中间状态。
 
@@ -108,19 +106,20 @@ Init 不直接修改可见工作区。目标不存在时准备 `CreateNew` 候�
 ```text
 项目租约
    ↓
-prepare 完整工作区候选
+检查现有 DB/结构并解析逐项有效设置
    ↓
-建立候选来源指纹
+比较当前冻结来源与本次游戏来源指纹
+   ├─ 全部一致 → Unchanged（零候选操作）
+   └─ 有变化/损坏 → prepare 完整工作区候选
    ↓
 在 candidate/project.db 创建或复制数据库并对账
-   ├─ 目标原本存在、结构完整且数据库无变化 → discard → Unchanged
-   └─ 需要创建、更新或修复                  → publish 一次 → Created / Updated
+   ↓
+publish 一次 → Created / Updated
 ```
 
 数据库准备失败只对尚未发布的候选调用一次 `discard`；清理失败与首因同时保留。
 publish 按值消费候选，无论返回何种发布终态，Init 都不得再次 discard。成功只在
-`Unchanged` 的候选已成功 discard，或 Created/Updated 的完整候选已经成为目标后
-成立。
+快速检查确认 `Unchanged`，或 Created/Updated 的完整候选已经成为目标后成立。
 
 目录根继续区分 `TargetAlreadyExists`、`TargetMissing`、`TargetNotDirectory`、
 `NotAttempted`、`NotPublished`、`PublishedWithResiduals`、`RecoveryRequired` 和
@@ -130,7 +129,10 @@ publish 按值消费候选，无论返回何种发布终态，Init 都不得再�
 
 ```text
 InitService
-├─ ProjectOperationLeaseProvider
+├─ ProjectCommandLeaseService
+│  └─ SystemFileSystem as ExclusiveFileLeaseProvider
+├─ MzAuditLedger
+│  └─ JsonLinesEventLog（通用追加、轮转与 sync_data）
 ├─ ExistingDirectoryResolver
 ├─ SourceSnapshotFingerprint + SystemFileSystem as DirectoryTreeFingerprinter
 ├─ ProjectDatabaseStateReconciliationService
@@ -141,5 +143,5 @@ InitService
 ```
 
 锁顺序固定为项目租约 → 目录发布锁 → SQLite；同项目租约超时返回 `ProjectBusy`。
-命令、候选终结及全部根 shutdown 成功后才呈现 Created、Updated 或 Unchanged 的
-实际结果；工作区修复属于 Updated。
+`run_started` 与 `run_finished` 进入统一 `audit.jsonl`。命令、候选终结、审计及全部
+根 shutdown 成功后才呈现 Created、Updated 或 Unchanged；工作区修复属于 Updated。

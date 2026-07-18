@@ -48,10 +48,7 @@ fn validate(value: &str) -> Result<(), String> {
         return Err("项目名称不能以点结尾".to_owned());
     }
 
-    if value
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".att-"))
-    {
+    if value.eq_ignore_ascii_case(".att-locks") {
         return Err("项目名称不能使用 ATT 根保留命名空间".to_owned());
     }
 
@@ -105,6 +102,7 @@ mod tests {
             "Project Alpha",
             "release.v1",
             ".hidden",
+            ".att-game",
             "COM10",
             "a中",
             "aaé",
@@ -126,9 +124,8 @@ mod tests {
             ".",
             "..",
             "alice.",
-            ".att-project-locks",
-            ".ATT-dirpub-locks",
-            ".att-private",
+            ".att-locks",
+            ".ATT-LOCKS",
             "a/b",
             "a\\b",
             "a<b",

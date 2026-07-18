@@ -9,6 +9,7 @@ pub(crate) use crate::att_mz::lua::{
     LuaInvocation, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
 };
 use crate::att_mz::project::OpenedProject;
+use crate::execution::OperationCompletion;
 
 use super::store::LuaSnapshotStore;
 
@@ -20,7 +21,7 @@ pub(crate) trait LuaExtraction: Send + Sync {
         &self,
         project: &OpenedProject,
         script_path: PathBuf,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send;
 }
 
 /// 把 Extract 阶段已经建立的项目事实交给可信 Lua Host。
@@ -42,33 +43,40 @@ where
 {
     type Error = LuaExtractionError<H::Error, S::Error>;
 
-    async fn run(&self, project: &OpenedProject, script_path: PathBuf) -> Result<(), Self::Error> {
+    async fn run(
+        &self,
+        project: &OpenedProject,
+        script_path: PathBuf,
+    ) -> Result<OperationCompletion<()>, Self::Error> {
         let error_path = script_path.clone();
         let invocation =
             LuaInvocation::extract(script_path, LuaProjectContext::from_opened_project(project));
 
-        let outcome = self.host.execute(invocation).await.map_err(|source| {
+        let completion = self.host.execute(invocation).await.map_err(|source| {
             LuaExtractionError::ExecuteHost {
                 script_path: error_path,
                 source,
             }
         })?;
+        let OperationCompletion::Completed(outcome) = completion else {
+            return Ok(OperationCompletion::Cancelled);
+        };
 
         match outcome {
-            TrustedLuaExecutionOutcome::Empty => Ok(()),
+            TrustedLuaExecutionOutcome::Empty => Ok(OperationCompletion::Completed(())),
             TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Replace(
                 snapshot,
             )) => self
                 .store
                 .replace_lua(project, snapshot)
                 .await
-                .map(|_| ())
+                .map(|_| OperationCompletion::Completed(()))
                 .map_err(LuaExtractionError::StoreSnapshot),
             TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Deactivate) => self
                 .store
                 .deactivate_lua(project)
                 .await
-                .map(|_| ())
+                .map(|_| OperationCompletion::Completed(()))
                 .map_err(LuaExtractionError::StoreSnapshot),
         }
     }
@@ -121,7 +129,7 @@ mod tests {
 
     use super::*;
     use crate::att_mz::ProjectName;
-    use crate::att_mz::extract::store::{LuaSnapshot, SnapshotReplacementOutcome};
+    use crate::att_mz::extract::store::LuaSnapshot;
     use crate::att_mz::lua::runtime::TrustedLuaExtractIntent;
     use crate::att_mz::lua::{LuaPhase, LuaProjectContext};
 
@@ -136,6 +144,7 @@ mod tests {
     struct FakeHost {
         invocation: Arc<Mutex<Option<RecordedInvocation>>>,
         fail: bool,
+        cancelled: bool,
         outcome: TrustedLuaExecutionOutcome,
     }
 
@@ -146,7 +155,7 @@ mod tests {
         async fn execute(
             &self,
             invocation: LuaInvocation<Self::TranslationProfile>,
-        ) -> Result<TrustedLuaExecutionOutcome, Self::Error> {
+        ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
             let recorded = match invocation {
                 LuaInvocation::Extract {
                     script_path,
@@ -167,8 +176,10 @@ mod tests {
 
             if self.fail {
                 Err(FakeError)
+            } else if self.cancelled {
+                Ok(OperationCompletion::Cancelled)
             } else {
-                Ok(self.outcome.clone())
+                Ok(OperationCompletion::Completed(self.outcome.clone()))
             }
         }
     }
@@ -192,7 +203,7 @@ mod tests {
             &self,
             _project: &OpenedProject,
             snapshot: LuaSnapshot,
-        ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+        ) -> Result<(), Self::Error> {
             if self.fail {
                 return Err(FakeError);
             }
@@ -200,13 +211,10 @@ mod tests {
                 .lock()
                 .expect("Store 调用锁不应中毒")
                 .push(StoreCall::Replace(snapshot.groups().len()));
-            Ok(SnapshotReplacementOutcome::Changed)
+            Ok(())
         }
 
-        async fn deactivate_lua(
-            &self,
-            _project: &OpenedProject,
-        ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+        async fn deactivate_lua(&self, _project: &OpenedProject) -> Result<(), Self::Error> {
             if self.fail {
                 return Err(FakeError);
             }
@@ -214,7 +222,7 @@ mod tests {
                 .lock()
                 .expect("Store 调用锁不应中毒")
                 .push(StoreCall::Deactivate);
-            Ok(SnapshotReplacementOutcome::Changed)
+            Ok(())
         }
     }
 
@@ -249,6 +257,7 @@ mod tests {
             FakeHost {
                 invocation: Arc::clone(&recorded),
                 fail: false,
+                cancelled: false,
                 outcome: TrustedLuaExecutionOutcome::Empty,
             },
             store,
@@ -286,6 +295,7 @@ mod tests {
             FakeHost {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: true,
+                cancelled: false,
                 outcome: TrustedLuaExecutionOutcome::ExtractIntent(
                     TrustedLuaExtractIntent::Deactivate,
                 ),
@@ -320,6 +330,7 @@ mod tests {
             FakeHost {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: false,
+                cancelled: false,
                 outcome: TrustedLuaExecutionOutcome::ExtractIntent(
                     TrustedLuaExtractIntent::Replace(LuaSnapshot::empty()),
                 ),
@@ -339,11 +350,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_is_a_normal_result_and_never_commits_the_extract_intent() {
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                cancelled: true,
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(
+                    TrustedLuaExtractIntent::Deactivate,
+                ),
+            },
+            store,
+        );
+
+        let completion = service
+            .run(&opened_project(), PathBuf::from("extract.lua"))
+            .await
+            .expect("Lua 取消应是正常结果");
+
+        assert_eq!(completion, OperationCompletion::Cancelled);
+        assert!(calls.lock().expect("Store 调用锁不应中毒").is_empty());
+    }
+
+    #[tokio::test]
     async fn reports_store_failure_after_host_success() {
         let service = LuaExtractionService::new(
             FakeHost {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: false,
+                cancelled: false,
                 outcome: TrustedLuaExecutionOutcome::ExtractIntent(
                     TrustedLuaExtractIntent::Deactivate,
                 ),
@@ -372,6 +409,7 @@ mod tests {
             FakeHost {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: false,
+                cancelled: false,
                 outcome: TrustedLuaExecutionOutcome::Empty,
             },
             FakeStore::default(),

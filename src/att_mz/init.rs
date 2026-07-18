@@ -1,24 +1,23 @@
 use std::error::Error;
 use std::fmt;
-use std::future::Future;
 use std::path::PathBuf;
 
 use super::ProjectName;
-use super::project::MzWriteBackLayoutProfile;
+use super::project::{MaxFullwidthChars, MzWriteBackLayoutProfile};
 use super::standard_asset::MzStandardAssetOwner;
-use crate::execution::{CooperativeCancellation, OperationCancelled};
+use crate::att_mz::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
+use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::project_database::{
     NewProject, ProjectDatabaseCreator, ProjectDatabaseStateReconciler, ProjectWorkspaceLayout,
     SourceSnapshotFingerprint,
 };
 use crate::storage::file_system::{
-    DIRECTORY_PUBLISH_LOCK_NAMESPACE, DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind,
-    DirectoryLister, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
-    DirectorySourceMapping, DirectoryStageRequest, DirectoryStageRequestError,
-    DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
-    DirectoryTreeRoot, ExistingDirectoryResolver, ListDirectoryError, ProjectOperationLeaseError,
-    ProjectOperationLeaseProvider, ProjectOperationLeaseRequest, ProjectOperationLeaseRequestError,
-    RecoverableDirectoryPublisher, ResolveDirectoryError, StagedDirectory,
+    DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind, DirectoryLister,
+    DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent, DirectorySourceMapping,
+    DirectoryStageRequest, DirectoryStageRequestError, DirectoryTreeFingerprintError,
+    DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, DirectoryTreeRoot,
+    ExistingDirectoryResolver, ListDirectoryError, RecoverableDirectoryPublisher,
+    ResolveDirectoryError, StagedDirectory,
 };
 use crate::storage::sqlite::{SnapshotDatabaseError, SqliteDatabaseSnapshotter};
 
@@ -27,9 +26,11 @@ use crate::storage::sqlite::{SnapshotDatabaseError, SqliteDatabaseSnapshotter};
 pub struct InitInput {
     pub name: ProjectName,
     pub game_root: PathBuf,
-    pub source_language: String,
-    pub target_language: String,
-    pub layout_profile: MzWriteBackLayoutProfile,
+    pub source_language: Option<String>,
+    pub target_language: Option<String>,
+    pub dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
+    pub scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
+    pub help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
 }
 
 /// Init 更新后可能需要重新提取的标准资产 owner。
@@ -55,40 +56,65 @@ pub struct InitOutput {
     pub outcome: InitOutcome,
 }
 
-/// 完成一个 MZ 游戏初始化用例。
-pub trait InitUseCase: Send + Sync {
-    type Error: Error + Send + Sync + 'static;
-
-    fn execute(
-        &self,
-        input: InitInput,
-    ) -> impl Future<Output = Result<InitOutput, Self::Error>> + Send;
-}
-
 /// 完成一次工作区状态收敛所需的全部受信事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectWorkspaceConvergenceRequest {
     source_game_root: PathBuf,
     name: ProjectName,
-    source_language: String,
-    target_language: String,
-    layout_profile: MzWriteBackLayoutProfile,
+    source_language: Option<String>,
+    target_language: Option<String>,
+    dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
+    scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
+    help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
 }
 
 impl ProjectWorkspaceConvergenceRequest {
     pub(crate) fn new(
         source_game_root: PathBuf,
         name: ProjectName,
-        source_language: String,
-        target_language: String,
-        layout_profile: MzWriteBackLayoutProfile,
+        source_language: Option<String>,
+        target_language: Option<String>,
+        dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
+        scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
+        help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
     ) -> Self {
         Self {
             source_game_root,
             name,
             source_language,
             target_language,
-            layout_profile,
+            dialogue_max_fullwidth_chars,
+            scrolling_text_max_fullwidth_chars,
+            help_description_max_fullwidth_chars,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedProjectSettings {
+    source_language: String,
+    target_language: String,
+    layout_profile: MzWriteBackLayoutProfile,
+}
+
+/// 首次建立项目时必须由用户明确给出的设置。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MissingInitialProjectSetting {
+    SourceLanguage,
+    TargetLanguage,
+    DialogueMaxFullwidthChars,
+    ScrollingTextMaxFullwidthChars,
+    HelpDescriptionMaxFullwidthChars,
+}
+
+impl MissingInitialProjectSetting {
+    const fn cli_flag(self) -> &'static str {
+        match self {
+            Self::SourceLanguage => "--source-language",
+            Self::TargetLanguage => "--target-language",
+            Self::DialogueMaxFullwidthChars => "--dialogue-max-fullwidth-chars",
+            Self::ScrollingTextMaxFullwidthChars => "--scrolling-text-max-fullwidth-chars",
+            Self::HelpDescriptionMaxFullwidthChars => "--help-description-max-fullwidth-chars",
         }
     }
 }
@@ -109,7 +135,9 @@ pub(crate) trait ProjectWorkspaceConverger: Send + Sync {
     fn converge(
         &self,
         request: ProjectWorkspaceConvergenceRequest,
-    ) -> impl Future<Output = Result<ProjectWorkspaceConvergence, Self::Error>> + Send;
+    ) -> impl std::future::Future<
+        Output = Result<OperationCompletion<ProjectWorkspaceConvergence>, Self::Error>,
+    > + Send;
 }
 
 /// 项目工作区收敛服务；持有项目租约直到候选被发布或明确丢弃。
@@ -156,8 +184,7 @@ where
     R: ProjectDatabaseStateReconciler,
     F: ExistingDirectoryResolver
         + DirectoryLister<Error = <F as ExistingDirectoryResolver>::Error>
-        + DirectoryTreeFingerprinter
-        + ProjectOperationLeaseProvider,
+        + DirectoryTreeFingerprinter,
     A: RecoverableDirectoryPublisher,
 {
     type Error = ProjectWorkspaceConvergenceError<
@@ -167,33 +194,16 @@ where
         R::ReconciliationError,
         <F as ExistingDirectoryResolver>::Error,
         <F as DirectoryTreeFingerprinter>::Error,
-        <F as ProjectOperationLeaseProvider>::Error,
         A::Error,
     >;
 
     async fn converge(
         &self,
         request: ProjectWorkspaceConvergenceRequest,
-    ) -> Result<ProjectWorkspaceConvergence, Self::Error> {
-        self.cancellation
-            .check()
-            .map_err(ProjectWorkspaceConvergenceError::CancelledBeforeCandidate)?;
-        let lease_request = ProjectOperationLeaseRequest::new(
-            self.projects_root.clone(),
-            request.name.as_str().into(),
-        )
-        .map_err(ProjectWorkspaceConvergenceError::InvalidLeaseRequest)?;
-        let _lease = self
-            .file_system
-            .acquire_project_operation_lease(lease_request)
-            .await
-            .map_err(ProjectWorkspaceConvergenceError::Lease)?;
-        let source_game_root = self
-            .file_system
-            .resolve_existing_directory(request.source_game_root)
-            .await
-            .map_err(ProjectWorkspaceConvergenceError::SourceGameRoot)?;
-
+    ) -> Result<OperationCompletion<ProjectWorkspaceConvergence>, Self::Error> {
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let final_layout = ProjectWorkspaceLayout::for_project(&self.projects_root, &request.name);
         let target_exists = match self
             .file_system
@@ -205,15 +215,28 @@ where
             Err(error) => return Err(ProjectWorkspaceConvergenceError::WorkspaceRoot(error)),
         };
 
-        let (current_state, workspace_complete) = if target_exists {
-            let state = self
-                .database_reconciler
-                .inspect(
-                    final_layout.database_path().to_path_buf(),
-                    request.name.clone(),
-                )
-                .await
-                .map_err(ProjectWorkspaceConvergenceError::InspectExistingDatabase)?;
+        let current_state = if target_exists {
+            Some(
+                self.database_reconciler
+                    .inspect(
+                        final_layout.database_path().to_path_buf(),
+                        request.name.clone(),
+                    )
+                    .await
+                    .map_err(ProjectWorkspaceConvergenceError::InspectExistingDatabase)?,
+            )
+        } else {
+            None
+        };
+        let settings = resolve_project_settings(&request, current_state.as_ref())
+            .map_err(ProjectWorkspaceConvergenceError::MissingInitialSettings)?;
+        let source_game_root = self
+            .file_system
+            .resolve_existing_directory(request.source_game_root)
+            .await
+            .map_err(ProjectWorkspaceConvergenceError::SourceGameRoot)?;
+
+        if let Some(state) = current_state.as_ref() {
             let structure_matches =
                 observe_required_workspace_structure(&self.file_system, &final_layout)
                     .await
@@ -229,37 +252,29 @@ where
             } else {
                 false
             };
-            let output_data = if structure_matches {
-                optional_directory_exists(
-                    &self.file_system,
-                    final_layout.write_back_data().to_path_buf(),
-                )
-                .await
-                .map_err(ProjectWorkspaceConvergenceError::ObserveWorkspaceDirectory)?
-            } else {
-                false
-            };
-            let output_js = if structure_matches {
-                optional_directory_exists(
-                    &self.file_system,
-                    final_layout.write_back_js().to_path_buf(),
-                )
-                .await
-                .map_err(ProjectWorkspaceConvergenceError::ObserveWorkspaceDirectory)?
-            } else {
-                false
-            };
-            (
-                Some(state),
-                structure_matches && source_matches && output_data && output_js,
-            )
-        } else {
-            (None, false)
-        };
+            let workspace_complete = structure_matches && source_matches;
+            let settings_match = state.source_language() == settings.source_language
+                && state.target_language() == settings.target_language
+                && state.layout_profile() == &settings.layout_profile;
+            if workspace_complete && settings_match {
+                let input_fingerprint =
+                    fingerprint_game_source(&self.file_system, &source_game_root)
+                        .await
+                        .map_err(ProjectWorkspaceConvergenceError::ObserveInputSource)?;
+                if self.cancellation.is_requested() {
+                    return Ok(OperationCompletion::Cancelled);
+                }
+                if input_fingerprint == state.source_snapshot_fingerprint() {
+                    return Ok(OperationCompletion::Completed(
+                        ProjectWorkspaceConvergence::Unchanged,
+                    ));
+                }
+            }
+        }
 
-        self.cancellation
-            .check()
-            .map_err(ProjectWorkspaceConvergenceError::CancelledBeforeCandidate)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let publish_intent = if target_exists {
             DirectoryPublishIntent::ReplaceExisting
         } else {
@@ -292,13 +307,8 @@ where
         let staged_layout =
             ProjectWorkspaceLayout::from_workspace_root(staged.staging_root().to_path_buf());
 
-        if let Err(cancellation) = self.cancellation.check() {
-            return Err(discard_candidate_failure(
-                &self.directories,
-                staged,
-                ProjectWorkspaceCandidateFailure::Cancelled(cancellation),
-            )
-            .await);
+        if self.cancellation.is_requested() {
+            return discard_cancelled_candidate(&self.directories, staged).await;
         }
         let candidate_fingerprint =
             match fingerprint_source(&self.file_system, &staged_layout, false).await {
@@ -315,10 +325,10 @@ where
             };
         let requested_project = NewProject::new(
             request.name,
-            request.source_language,
-            request.target_language,
+            settings.source_language,
+            settings.target_language,
             candidate_fingerprint,
-            request.layout_profile,
+            settings.layout_profile,
         );
 
         if target_exists {
@@ -372,34 +382,79 @@ where
             }
         };
 
-        if let Err(cancellation) = self.cancellation.check() {
-            return Err(discard_candidate_failure(
-                &self.directories,
-                staged,
-                ProjectWorkspaceCandidateFailure::Cancelled(cancellation),
-            )
-            .await);
+        if self.cancellation.is_requested() {
+            return discard_cancelled_candidate(&self.directories, staged).await;
         }
-        if target_exists && workspace_complete && !reconciliation.changed() {
-            self.directories
-                .discard(staged)
-                .await
-                .map_err(ProjectWorkspaceConvergenceError::DiscardUnchanged)?;
-            return Ok(ProjectWorkspaceConvergence::Unchanged);
-        }
-
         self.directories
             .publish(staged)
             .await
             .map_err(ProjectWorkspaceConvergenceError::Publish)?;
         if current_state.is_some() {
-            Ok(ProjectWorkspaceConvergence::Updated {
-                stale_owners: reconciliation.stale_owners(),
-            })
+            Ok(OperationCompletion::Completed(
+                ProjectWorkspaceConvergence::Updated {
+                    stale_owners: reconciliation.stale_owners(),
+                },
+            ))
         } else {
-            Ok(ProjectWorkspaceConvergence::Created)
+            Ok(OperationCompletion::Completed(
+                ProjectWorkspaceConvergence::Created,
+            ))
         }
     }
+}
+
+fn resolve_project_settings(
+    request: &ProjectWorkspaceConvergenceRequest,
+    current: Option<&crate::project_database::ProjectDatabaseState>,
+) -> Result<ResolvedProjectSettings, Vec<MissingInitialProjectSetting>> {
+    let mut missing = Vec::new();
+
+    let source_language = request
+        .source_language
+        .clone()
+        .or_else(|| current.map(|state| state.source_language().to_owned()));
+    if source_language.is_none() {
+        missing.push(MissingInitialProjectSetting::SourceLanguage);
+    }
+    let target_language = request
+        .target_language
+        .clone()
+        .or_else(|| current.map(|state| state.target_language().to_owned()));
+    if target_language.is_none() {
+        missing.push(MissingInitialProjectSetting::TargetLanguage);
+    }
+    let dialogue_body = request
+        .dialogue_max_fullwidth_chars
+        .or_else(|| current.map(|state| state.layout_profile().dialogue_body()));
+    if dialogue_body.is_none() {
+        missing.push(MissingInitialProjectSetting::DialogueMaxFullwidthChars);
+    }
+    let scrolling_text = request
+        .scrolling_text_max_fullwidth_chars
+        .or_else(|| current.map(|state| state.layout_profile().scrolling_text()));
+    if scrolling_text.is_none() {
+        missing.push(MissingInitialProjectSetting::ScrollingTextMaxFullwidthChars);
+    }
+    let help_description = request
+        .help_description_max_fullwidth_chars
+        .or_else(|| current.map(|state| state.layout_profile().help_description()));
+    if help_description.is_none() {
+        missing.push(MissingInitialProjectSetting::HelpDescriptionMaxFullwidthChars);
+    }
+
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+
+    Ok(ResolvedProjectSettings {
+        source_language: source_language.expect("已确认源语言存在"),
+        target_language: target_language.expect("已确认目标语言存在"),
+        layout_profile: MzWriteBackLayoutProfile::new(
+            dialogue_body.expect("已确认对话宽度存在"),
+            scrolling_text.expect("已确认滚动文本宽度存在"),
+            help_description.expect("已确认帮助描述宽度存在"),
+        ),
+    })
 }
 
 async fn observe_required_workspace_structure<F>(
@@ -409,7 +464,6 @@ async fn observe_required_workspace_structure<F>(
 where
     F: DirectoryLister,
 {
-    let mut has_publish_lock_namespace = false;
     for (root, expected_children) in [
         (
             layout.workspace_root(),
@@ -449,10 +503,6 @@ where
                     ("project.db-journal", DirectoryEntryKind::RegularFile),
                     ("project.db-wal", DirectoryEntryKind::RegularFile),
                     ("project.db-shm", DirectoryEntryKind::RegularFile),
-                    (
-                        DIRECTORY_PUBLISH_LOCK_NAMESPACE,
-                        DirectoryEntryKind::Directory,
-                    ),
                 ],
             )
         } else {
@@ -461,35 +511,18 @@ where
         if !matches {
             return Ok(false);
         }
-        if root == layout.workspace_root() {
-            has_publish_lock_namespace = count_child(
-                &children,
-                (
-                    DIRECTORY_PUBLISH_LOCK_NAMESPACE,
-                    DirectoryEntryKind::Directory,
-                ),
-            ) == 1;
-        }
-    }
-    if has_publish_lock_namespace {
-        let lock_namespace = layout
-            .workspace_root()
-            .join(DIRECTORY_PUBLISH_LOCK_NAMESPACE);
-        let children = match file_system.list_directory(lock_namespace).await {
-            Ok(children) => children,
-            Err(ListDirectoryError::NotFound { .. } | ListDirectoryError::NotDirectory { .. }) => {
-                return Ok(false);
-            }
-            Err(error @ ListDirectoryError::Io { .. }) => return Err(error),
-        };
-        if !has_exact_child_names(
-            &children,
-            &[("write_back", DirectoryEntryKind::RegularFile)],
-        ) {
-            return Ok(false);
-        }
     }
     Ok(true)
+}
+
+async fn fingerprint_game_source<F>(
+    file_system: &F,
+    game_root: &std::path::Path,
+) -> Result<SourceSnapshotFingerprint, DirectoryTreeFingerprintError<F::Error>>
+where
+    F: DirectoryTreeFingerprinter,
+{
+    fingerprint_roots(file_system, game_root.join("data"), game_root.join("js")).await
 }
 
 fn has_exact_child_names(
@@ -534,22 +567,6 @@ fn count_child(children: &[DirectoryEntry], expected: (&str, DirectoryEntryKind)
         .count()
 }
 
-async fn optional_directory_exists<F>(
-    file_system: &F,
-    path: PathBuf,
-) -> Result<bool, ResolveDirectoryError<F::Error>>
-where
-    F: ExistingDirectoryResolver,
-{
-    match file_system.resolve_existing_directory(path).await {
-        Ok(_) => Ok(true),
-        Err(
-            ResolveDirectoryError::NotFound { .. } | ResolveDirectoryError::NotDirectory { .. },
-        ) => Ok(false),
-        Err(error @ ResolveDirectoryError::Io { .. }) => Err(error),
-    }
-}
-
 async fn fingerprint_source<F>(
     file_system: &F,
     layout: &ProjectWorkspaceLayout,
@@ -558,17 +575,14 @@ async fn fingerprint_source<F>(
 where
     F: DirectoryTreeFingerprinter,
 {
-    let request = DirectoryTreeFingerprintRequest::new(vec![
-        DirectoryTreeRoot::new(layout.source_data().to_path_buf(), PathBuf::from("data"))
-            .expect("固定 data 逻辑根必须合法"),
-        DirectoryTreeRoot::new(layout.source_js().to_path_buf(), PathBuf::from("js"))
-            .expect("固定 js 逻辑根必须合法"),
-    ])
-    .expect("固定 data 与 js 逻辑根必须互不重叠");
-    match file_system.fingerprint_directory_tree(request).await {
-        Ok(value) => Ok(Some(SourceSnapshotFingerprint::from_bytes(
-            value.into_bytes(),
-        ))),
+    match fingerprint_roots(
+        file_system,
+        layout.source_data().to_path_buf(),
+        layout.source_js().to_path_buf(),
+    )
+    .await
+    {
+        Ok(value) => Ok(Some(value)),
         Err(
             DirectoryTreeFingerprintError::NotFound { .. }
             | DirectoryTreeFingerprintError::NotDirectory { .. },
@@ -577,11 +591,30 @@ where
     }
 }
 
-async fn discard_candidate_failure<A, D, S, I, R, E, P, L>(
+async fn fingerprint_roots<F>(
+    file_system: &F,
+    data_root: PathBuf,
+    js_root: PathBuf,
+) -> Result<SourceSnapshotFingerprint, DirectoryTreeFingerprintError<F::Error>>
+where
+    F: DirectoryTreeFingerprinter,
+{
+    let request = DirectoryTreeFingerprintRequest::new(vec![
+        DirectoryTreeRoot::new(data_root, PathBuf::from("data")).expect("固定 data 逻辑根必须合法"),
+        DirectoryTreeRoot::new(js_root, PathBuf::from("js")).expect("固定 js 逻辑根必须合法"),
+    ])
+    .expect("固定 data 与 js 逻辑根必须互不重叠");
+    file_system
+        .fingerprint_directory_tree(request)
+        .await
+        .map(|value| SourceSnapshotFingerprint::from_bytes(value.into_bytes()))
+}
+
+async fn discard_candidate_failure<A, D, S, I, R, E, P>(
     directories: &A,
     staged: StagedDirectory<A::StagingState>,
     failure: ProjectWorkspaceCandidateFailure<D, S, R, P>,
-) -> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A::Error>
+) -> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A::Error>
 where
     A: RecoverableDirectoryPublisher,
 {
@@ -589,9 +622,26 @@ where
     ProjectWorkspaceConvergenceError::CandidateFailure { failure, discard }
 }
 
+async fn discard_cancelled_candidate<A, D, S, I, R, E, P>(
+    directories: &A,
+    staged: StagedDirectory<A::StagingState>,
+) -> Result<
+    OperationCompletion<ProjectWorkspaceConvergence>,
+    ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A::Error>,
+>
+where
+    A: RecoverableDirectoryPublisher,
+{
+    match directories.discard(staged).await {
+        Ok(()) => Ok(OperationCompletion::Cancelled),
+        Err(source) => Err(ProjectWorkspaceConvergenceError::CancellationCleanup(
+            source,
+        )),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ProjectWorkspaceCandidateFailure<D, S, R, P> {
-    Cancelled(OperationCancelled),
     FingerprintCandidate(DirectoryTreeFingerprintError<P>),
     CreateDatabase(D),
     SnapshotDatabase(SnapshotDatabaseError<S>),
@@ -599,36 +649,76 @@ pub(crate) enum ProjectWorkspaceCandidateFailure<D, S, R, P> {
 }
 
 #[derive(Debug)]
-pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A> {
-    CancelledBeforeCandidate(OperationCancelled),
-    InvalidLeaseRequest(ProjectOperationLeaseRequestError),
-    Lease(ProjectOperationLeaseError<L>),
+pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     SourceGameRoot(ResolveDirectoryError<E>),
     WorkspaceRoot(ResolveDirectoryError<E>),
     InspectExistingDatabase(I),
+    MissingInitialSettings(Vec<MissingInitialProjectSetting>),
     ObserveWorkspaceStructure(ListDirectoryError<E>),
     ObserveExistingSource(DirectoryTreeFingerprintError<P>),
-    ObserveWorkspaceDirectory(ResolveDirectoryError<E>),
+    ObserveInputSource(DirectoryTreeFingerprintError<P>),
     InvalidStageRequest(DirectoryStageRequestError),
     Prepare(DirectoryPrepareError<A>),
     CandidateFailure {
         failure: ProjectWorkspaceCandidateFailure<D, S, R, P>,
         discard: Option<DirectoryDiscardError<A>>,
     },
-    DiscardUnchanged(DirectoryDiscardError<A>),
+    CancellationCleanup(DirectoryDiscardError<A>),
     Publish(DirectoryPublishError<A>),
 }
 
-impl<D, S, I, R, E, P, L, A> From<DirectoryStageRequestError>
-    for ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A>
+/// 工作区收敛失败已经造成的最高层用户影响。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectWorkspaceConvergenceFailureImpact {
+    ConfigurationOrInput,
+    ProjectState,
+    StateAppliedButFinalizationFailed,
+    OutcomeUnknown,
+    Internal,
+}
+
+impl<D, S, I, R, E, P, A> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
+    /// 将工作区内部阶段和目录发布终态归并为命令边界可以准确呈现的用户影响。
+    pub(crate) fn failure_impact(&self) -> ProjectWorkspaceConvergenceFailureImpact {
+        use ProjectWorkspaceConvergenceFailureImpact as Impact;
+
+        match self {
+            Self::SourceGameRoot(_)
+            | Self::MissingInitialSettings(_)
+            | Self::ObserveInputSource(_) => Impact::ConfigurationOrInput,
+            Self::InvalidStageRequest(_) => Impact::Internal,
+            Self::WorkspaceRoot(_)
+            | Self::InspectExistingDatabase(_)
+            | Self::ObserveWorkspaceStructure(_)
+            | Self::ObserveExistingSource(_)
+            | Self::Prepare(_)
+            | Self::CandidateFailure { .. }
+            | Self::CancellationCleanup(_) => Impact::ProjectState,
+            Self::Publish(error) => match error {
+                DirectoryPublishError::TargetAlreadyExists { .. }
+                | DirectoryPublishError::TargetMissing { .. }
+                | DirectoryPublishError::TargetNotDirectory { .. }
+                | DirectoryPublishError::NotAttempted { .. }
+                | DirectoryPublishError::NotPublished { .. } => Impact::ProjectState,
+                DirectoryPublishError::PublishedWithResiduals { .. } => {
+                    Impact::StateAppliedButFinalizationFailed
+                }
+                DirectoryPublishError::RecoveryRequired { .. }
+                | DirectoryPublishError::OutcomeUnknown { .. } => Impact::OutcomeUnknown,
+            },
+        }
+    }
+}
+
+impl<D, S, I, R, E, P, A> From<DirectoryStageRequestError>
+    for ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A>
 {
     fn from(error: DirectoryStageRequestError) -> Self {
         Self::InvalidStageRequest(error)
     }
 }
 
-impl<D, S, I, R, E, P, L, A> fmt::Display
-    for ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A>
+impl<D, S, I, R, E, P, A> fmt::Display for ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A>
 where
     D: fmt::Display,
     S: fmt::Display,
@@ -636,18 +726,24 @@ where
     R: fmt::Display,
     E: fmt::Display,
     P: fmt::Display,
-    L: fmt::Display,
     A: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CancelledBeforeCandidate(error) => error.fmt(formatter),
-            Self::InvalidLeaseRequest(error) => write!(formatter, "项目租约请求无效：{error}"),
-            Self::Lease(error) => error.fmt(formatter),
             Self::SourceGameRoot(error) => write!(formatter, "无法使用游戏根目录：{error}"),
             Self::WorkspaceRoot(error) => write!(formatter, "项目工作区根无效：{error}"),
             Self::InspectExistingDatabase(error) => {
                 write!(formatter, "现存项目数据库无效：{error}")
+            }
+            Self::MissingInitialSettings(settings) => {
+                formatter.write_str("首次初始化还需要明确提供：")?;
+                for (index, setting) in settings.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str("、")?;
+                    }
+                    formatter.write_str(setting.cli_flag())?;
+                }
+                Ok(())
             }
             Self::ObserveWorkspaceStructure(error) => {
                 write!(formatter, "无法检查现存工作区结构：{error}")
@@ -655,8 +751,8 @@ where
             Self::ObserveExistingSource(error) => {
                 write!(formatter, "无法检查现存冻结来源：{error}")
             }
-            Self::ObserveWorkspaceDirectory(error) => {
-                write!(formatter, "无法检查现存工作区结构：{error}")
+            Self::ObserveInputSource(error) => {
+                write!(formatter, "无法检查本次游戏来源：{error}")
             }
             Self::InvalidStageRequest(error) => write!(formatter, "工作区候选请求无效：{error}"),
             Self::Prepare(error) => write!(formatter, "无法准备工作区候选：{error}"),
@@ -667,8 +763,8 @@ where
                 }
                 Ok(())
             }
-            Self::DiscardUnchanged(error) => {
-                write!(formatter, "工作区事实未变化，但无法丢弃候选：{error}")
+            Self::CancellationCleanup(error) => {
+                write!(formatter, "取消后无法清理工作区候选：{error}")
             }
             Self::Publish(error) => write!(formatter, "无法发布完整工作区：{error}"),
         }
@@ -684,7 +780,6 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled(error) => error.fmt(formatter),
             Self::FingerprintCandidate(error) => {
                 write!(formatter, "无法建立候选来源指纹：{error}")
             }
@@ -695,7 +790,7 @@ where
     }
 }
 
-impl<D, S, I, R, E, P, L, A> Error for ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A>
+impl<D, S, I, R, E, P, A> Error for ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A>
 where
     D: Error + 'static,
     S: Error + 'static,
@@ -703,42 +798,61 @@ where
     R: Error + 'static,
     E: Error + 'static,
     P: Error + 'static,
-    L: Error + 'static,
     A: Error + 'static,
 {
 }
 
 /// 只负责验证初始化意图并交给工作区收敛边界。
-pub(crate) struct InitService<W> {
+pub(crate) struct InitService<W, P> {
     workspace_converger: W,
+    project_lease: P,
     cancellation: CooperativeCancellation,
 }
 
-impl<W> InitService<W> {
-    pub(crate) fn new(workspace_converger: W, cancellation: CooperativeCancellation) -> Self {
+impl<W, P> InitService<W, P> {
+    pub(crate) fn new(
+        workspace_converger: W,
+        project_lease: P,
+        cancellation: CooperativeCancellation,
+    ) -> Self {
         Self {
             workspace_converger,
+            project_lease,
             cancellation,
         }
     }
 }
 
-impl<W> InitUseCase for InitService<W>
+impl<W, P> InitService<W, P>
 where
     W: ProjectWorkspaceConverger,
+    P: ProjectCommandLeaseProvider,
 {
-    type Error = InitServiceError<W::Error>;
-
-    async fn execute(&self, input: InitInput) -> Result<InitOutput, Self::Error> {
-        self.cancellation
-            .check()
-            .map_err(InitServiceError::Cancelled)?;
-        let source_language =
-            normalized_language(input.source_language, InitServiceError::EmptySourceLanguage)?;
-        let target_language =
-            normalized_language(input.target_language, InitServiceError::EmptyTargetLanguage)?;
+    pub(crate) async fn execute(
+        &self,
+        input: InitInput,
+    ) -> Result<OperationCompletion<InitOutput>, InitServiceError<W::Error, P::Error>> {
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
+        let source_language = input
+            .source_language
+            .map(|value| normalized_language(value, InitServiceError::EmptySourceLanguage))
+            .transpose()?;
+        let target_language = input
+            .target_language
+            .map(|value| normalized_language(value, InitServiceError::EmptyTargetLanguage))
+            .transpose()?;
 
         let output_name = input.name.clone();
+        let _lease = self
+            .project_lease
+            .acquire(&input.name)
+            .await
+            .map_err(InitServiceError::ProjectLease)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let outcome = self
             .workspace_converger
             .converge(ProjectWorkspaceConvergenceRequest::new(
@@ -746,10 +860,15 @@ where
                 input.name,
                 source_language,
                 target_language,
-                input.layout_profile,
+                input.dialogue_max_fullwidth_chars,
+                input.scrolling_text_max_fullwidth_chars,
+                input.help_description_max_fullwidth_chars,
             ))
             .await
             .map_err(InitServiceError::Workspace)?;
+        let OperationCompletion::Completed(outcome) = outcome else {
+            return Ok(OperationCompletion::Cancelled);
+        };
         let outcome = match outcome {
             ProjectWorkspaceConvergence::Created => InitOutcome::Created,
             ProjectWorkspaceConvergence::Unchanged => InitOutcome::Unchanged,
@@ -758,10 +877,10 @@ where
             },
         };
 
-        Ok(InitOutput {
+        Ok(OperationCompletion::Completed(InitOutput {
             name: output_name,
             outcome,
-        })
+        }))
     }
 }
 
@@ -775,10 +894,10 @@ impl From<MzStandardAssetOwner> for InitStaleOwner {
     }
 }
 
-fn normalized_language<W>(
+fn normalized_language<W, P>(
     value: String,
-    empty_error: InitServiceError<W>,
-) -> Result<String, InitServiceError<W>> {
+    empty_error: InitServiceError<W, P>,
+) -> Result<String, InitServiceError<W, P>> {
     let normalized = value.trim();
     if normalized.is_empty() {
         Err(empty_error)
@@ -789,20 +908,21 @@ fn normalized_language<W>(
 
 /// 初始化编排在本职责边界内能够产生的错误。
 #[derive(Debug)]
-pub(crate) enum InitServiceError<W> {
-    Cancelled(OperationCancelled),
+pub(crate) enum InitServiceError<W, P> {
+    ProjectLease(ProjectCommandLeaseError<P>),
     EmptySourceLanguage,
     EmptyTargetLanguage,
     Workspace(W),
 }
 
-impl<W> fmt::Display for InitServiceError<W>
+impl<W, P> fmt::Display for InitServiceError<W, P>
 where
     W: Error,
+    P: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled(error) => error.fmt(formatter),
+            Self::ProjectLease(error) => error.fmt(formatter),
             Self::EmptySourceLanguage => formatter.write_str("源语言去除首尾空白后不能为空"),
             Self::EmptyTargetLanguage => formatter.write_str("目标语言去除首尾空白后不能为空"),
             Self::Workspace(error) => write!(formatter, "无法收敛项目工作区：{error}"),
@@ -810,13 +930,14 @@ where
     }
 }
 
-impl<W> Error for InitServiceError<W>
+impl<W, P> Error for InitServiceError<W, P>
 where
     W: Error + 'static,
+    P: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Cancelled(error) => Some(error),
+            Self::ProjectLease(error) => Some(error),
             Self::Workspace(error) => Some(error),
             Self::EmptySourceLanguage | Self::EmptyTargetLanguage => None,
         }
@@ -833,10 +954,7 @@ mod tests {
 
     type SnapshotDatabaseResponses = VecDeque<Result<(), SnapshotDatabaseError<FakeError>>>;
     use crate::fingerprint::Sha256Fingerprint;
-    use crate::project_database::{
-        CreatedProject, ProjectDatabaseReconciliation, ProjectDatabaseState,
-    };
-    use crate::storage::file_system::ProjectOperationLease;
+    use crate::project_database::{ProjectDatabaseReconciliation, ProjectDatabaseState};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -874,14 +992,6 @@ mod tests {
         }
     }
 
-    struct LeaseState(Observations);
-
-    impl Drop for LeaseState {
-        fn drop(&mut self) {
-            self.0.event("lease_drop");
-        }
-    }
-
     #[derive(Clone, Copy)]
     enum ExistingSourceObservation {
         Fingerprint([u8; 32]),
@@ -893,11 +1003,6 @@ mod tests {
         Complete,
         SqliteSidecars,
         SqliteSidecarNotFile,
-        DirectoryPublishLock,
-        DirectoryPublishLockNamespaceNotDirectory,
-        DirectoryPublishLockFileNotRegular,
-        DirectoryPublishLockMissingFile,
-        DirectoryPublishLockExtraEntry,
         DatabaseNotFile,
         SourceNotDirectory,
         SourceDataNotDirectory,
@@ -936,14 +1041,6 @@ mod tests {
                     return Ok(path);
                 }
                 return Err(ResolveDirectoryError::NotFound { path });
-            }
-            if path.ends_with("write_back/data") {
-                self.observations.event("output_data");
-                return Ok(path);
-            }
-            if path.ends_with("write_back/js") {
-                self.observations.event("output_js");
-                return Ok(path);
             }
             Ok(path)
         }
@@ -1025,26 +1122,6 @@ mod tests {
                         ),
                     ]);
                 }
-                if matches!(
-                    self.workspace_structure,
-                    WorkspaceStructureObservation::DirectoryPublishLock
-                        | WorkspaceStructureObservation::DirectoryPublishLockNamespaceNotDirectory
-                        | WorkspaceStructureObservation::DirectoryPublishLockFileNotRegular
-                        | WorkspaceStructureObservation::DirectoryPublishLockMissingFile
-                        | WorkspaceStructureObservation::DirectoryPublishLockExtraEntry
-                ) {
-                    children.push(DirectoryEntry::new(
-                        path.join(DIRECTORY_PUBLISH_LOCK_NAMESPACE),
-                        if matches!(
-                            self.workspace_structure,
-                            WorkspaceStructureObservation::DirectoryPublishLockNamespaceNotDirectory
-                        ) {
-                            DirectoryEntryKind::RegularFile
-                        } else {
-                            DirectoryEntryKind::Directory
-                        },
-                    ));
-                }
                 return Ok(children);
             }
             if path == Path::new("C:/projects/game/source") {
@@ -1113,56 +1190,7 @@ mod tests {
                 }
                 return Ok(children);
             }
-            if path == Path::new("C:/projects/game").join(DIRECTORY_PUBLISH_LOCK_NAMESPACE) {
-                self.observations.event("list_directory_publish_locks");
-                let mut children = if matches!(
-                    self.workspace_structure,
-                    WorkspaceStructureObservation::DirectoryPublishLockMissingFile
-                ) {
-                    Vec::new()
-                } else {
-                    vec![DirectoryEntry::new(
-                        path.join("write_back"),
-                        if matches!(
-                            self.workspace_structure,
-                            WorkspaceStructureObservation::DirectoryPublishLockFileNotRegular
-                        ) {
-                            DirectoryEntryKind::Directory
-                        } else {
-                            DirectoryEntryKind::RegularFile
-                        },
-                    )]
-                };
-                if matches!(
-                    self.workspace_structure,
-                    WorkspaceStructureObservation::DirectoryPublishLockExtraEntry
-                ) {
-                    children.push(DirectoryEntry::new(
-                        path.join("unexpected"),
-                        DirectoryEntryKind::RegularFile,
-                    ));
-                }
-                return Ok(children);
-            }
             panic!("测试未声明目录列举：{}", path.display());
-        }
-    }
-
-    impl ProjectOperationLeaseProvider for FakeWorkspaceFileSystem {
-        type Error = FakeError;
-        type LeaseState = LeaseState;
-
-        async fn acquire_project_operation_lease(
-            &self,
-            request: ProjectOperationLeaseRequest,
-        ) -> Result<ProjectOperationLease<Self::LeaseState>, ProjectOperationLeaseError<Self::Error>>
-        {
-            assert_eq!(request.projects_root(), Path::new("C:/projects"));
-            assert_eq!(request.project_directory_name(), "game");
-            self.observations.event("lease_acquire");
-            Ok(ProjectOperationLease::new(LeaseState(
-                self.observations.clone(),
-            )))
         }
     }
 
@@ -1187,6 +1215,14 @@ mod tests {
                 .all(|root| root.physical_root().starts_with("C:/projects/.game-stage"));
             if candidate {
                 self.observations.event("fingerprint_candidate");
+                return Ok(Sha256Fingerprint::from_bytes(self.candidate_fingerprint));
+            }
+            let input = request
+                .roots()
+                .iter()
+                .all(|root| root.physical_root().starts_with("C:/games/source"));
+            if input {
+                self.observations.event("fingerprint_input");
                 return Ok(Sha256Fingerprint::from_bytes(self.candidate_fingerprint));
             }
             self.observations.event("fingerprint_existing");
@@ -1215,14 +1251,14 @@ mod tests {
             &self,
             destination_path: PathBuf,
             project: NewProject,
-        ) -> Result<CreatedProject, Self::Error> {
+        ) -> Result<(), Self::Error> {
             self.observations.event("create_database");
             self.observations
                 .created_projects
                 .lock()
                 .expect("created projects mutex should not be poisoned")
                 .push((destination_path.clone(), project));
-            Ok(CreatedProject::new(destination_path))
+            Ok(())
         }
     }
 
@@ -1376,9 +1412,23 @@ mod tests {
         ProjectWorkspaceConvergenceRequest::new(
             PathBuf::from("C:/games/source"),
             "game".parse().expect("项目名应合法"),
-            "ja".to_owned(),
-            "zh-Hans".to_owned(),
-            profile(),
+            Some("ja".to_owned()),
+            Some("zh-Hans".to_owned()),
+            Some(profile().dialogue_body()),
+            Some(profile().scrolling_text()),
+            Some(profile().help_description()),
+        )
+    }
+
+    fn omitted_settings_request() -> ProjectWorkspaceConvergenceRequest {
+        ProjectWorkspaceConvergenceRequest::new(
+            PathBuf::from("C:/games/source"),
+            "game".parse().expect("项目名应合法"),
+            None,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -1434,6 +1484,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_init_reports_all_missing_settings_before_candidate_side_effects() {
+        let state = database_state(0x22, Vec::new());
+        let (service, observations) = service(
+            false,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Missing,
+            0x22,
+            Ok(state.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(state)),
+            Ok(()),
+        );
+
+        let error = service
+            .converge(omitted_settings_request())
+            .await
+            .expect_err("首次 Init 必须一次报告全部缺失设置");
+
+        assert!(matches!(
+            error,
+            ProjectWorkspaceConvergenceError::MissingInitialSettings(ref missing)
+                if missing == &vec![
+                    MissingInitialProjectSetting::SourceLanguage,
+                    MissingInitialProjectSetting::TargetLanguage,
+                    MissingInitialProjectSetting::DialogueMaxFullwidthChars,
+                    MissingInitialProjectSetting::ScrollingTextMaxFullwidthChars,
+                    MissingInitialProjectSetting::HelpDescriptionMaxFullwidthChars,
+                ]
+        ));
+        assert_eq!(observations.events(), vec!["workspace_root"]);
+        assert!(
+            observations
+                .stage_requests
+                .lock()
+                .expect("stage requests mutex should not be poisoned")
+                .is_empty()
+        );
+        assert!(
+            observations
+                .created_projects
+                .lock()
+                .expect("created projects mutex should not be poisoned")
+                .is_empty()
+        );
+        assert!(
+            observations
+                .reconciled_projects
+                .lock()
+                .expect("reconciled projects mutex should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn first_init_builds_candidate_database_then_publishes_create_new() {
         let candidate_state = database_state(0x22, Vec::new());
         let (service, observations) = service(
@@ -1442,10 +1545,7 @@ mod tests {
             ExistingSourceObservation::Missing,
             0x22,
             Ok(candidate_state.clone()),
-            Ok(ProjectDatabaseReconciliation::for_test(
-                false,
-                candidate_state,
-            )),
+            Ok(ProjectDatabaseReconciliation::for_test(candidate_state)),
             Ok(()),
         );
 
@@ -1454,19 +1554,20 @@ mod tests {
             .await
             .expect("首次 Init 应创建工作区");
 
-        assert_eq!(outcome, ProjectWorkspaceConvergence::Created);
+        assert_eq!(
+            outcome,
+            OperationCompletion::Completed(ProjectWorkspaceConvergence::Created)
+        );
         assert_eq!(
             observations.events(),
             vec![
-                "lease_acquire",
-                "game_root",
                 "workspace_root",
+                "game_root",
                 "prepare",
                 "fingerprint_candidate",
                 "create_database",
                 "reconcile_database",
                 "publish",
-                "lease_drop",
             ]
         );
         let stage_requests = observations
@@ -1541,7 +1642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identical_existing_project_discards_candidate_and_preserves_output() {
+    async fn existing_project_inherits_each_omitted_setting() {
         let current = database_state(0x33, Vec::new());
         let (service, observations) = service(
             true,
@@ -1549,7 +1650,79 @@ mod tests {
             ExistingSourceObservation::Fingerprint([0x33; 32]),
             0x33,
             Ok(current.clone()),
-            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(ProjectDatabaseReconciliation::for_test(current)),
+            Ok(()),
+        );
+
+        let outcome = service
+            .converge(omitted_settings_request())
+            .await
+            .expect("已有项目应逐项复用数据库设置");
+
+        assert_eq!(
+            outcome,
+            OperationCompletion::Completed(ProjectWorkspaceConvergence::Unchanged)
+        );
+        assert!(!observations.events().contains(&"prepare"));
+        assert!(!observations.events().contains(&"snapshot_database"));
+        assert!(!observations.events().contains(&"reconcile_database"));
+    }
+
+    #[tokio::test]
+    async fn existing_project_combines_explicit_overrides_with_inherited_settings() {
+        let current = database_state(0x33, Vec::new());
+        let updated = ProjectDatabaseState::for_test(
+            "game".parse().expect("项目名应合法"),
+            "ja".to_owned(),
+            "zh-Hant".to_owned(),
+            fingerprint(0x33),
+            MzWriteBackLayoutProfile::new(width(40), width(30), width(18)),
+            Vec::new(),
+        );
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x33,
+            Ok(current),
+            Ok(ProjectDatabaseReconciliation::for_test(updated)),
+            Ok(()),
+        );
+        let mut requested = omitted_settings_request();
+        requested.target_language = Some("zh-Hant".to_owned());
+        requested.dialogue_max_fullwidth_chars = Some(width(40));
+
+        let outcome = service
+            .converge(requested)
+            .await
+            .expect("显式项应覆盖，省略项应继承");
+
+        assert!(matches!(
+            outcome,
+            OperationCompletion::Completed(ProjectWorkspaceConvergence::Updated { .. })
+        ));
+        let reconciled = observations
+            .reconciled_projects
+            .lock()
+            .expect("reconciled projects mutex should not be poisoned");
+        let requested = &reconciled[0].1;
+        assert_eq!(requested.source_language(), "ja");
+        assert_eq!(requested.target_language(), "zh-Hant");
+        assert_eq!(requested.layout_profile().dialogue_body(), width(40));
+        assert_eq!(requested.layout_profile().scrolling_text(), width(30));
+        assert_eq!(requested.layout_profile().help_description(), width(18));
+    }
+
+    #[tokio::test]
+    async fn identical_existing_project_returns_before_candidate_and_preserves_output() {
+        let current = database_state(0x33, Vec::new());
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x33,
+            Ok(current.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(current)),
             Ok(()),
         );
 
@@ -1558,46 +1731,36 @@ mod tests {
             .await
             .expect("完全相同的项目应成功 no-op");
 
-        assert_eq!(outcome, ProjectWorkspaceConvergence::Unchanged);
+        assert_eq!(
+            outcome,
+            OperationCompletion::Completed(ProjectWorkspaceConvergence::Unchanged)
+        );
         assert_eq!(
             observations.events(),
             vec![
-                "lease_acquire",
-                "game_root",
                 "workspace_root",
                 "inspect_database",
+                "game_root",
                 "list_workspace",
                 "list_source",
                 "list_write_back",
                 "fingerprint_existing",
-                "output_data",
-                "output_js",
-                "prepare",
-                "fingerprint_candidate",
-                "snapshot_database",
-                "reconcile_database",
-                "discard",
-                "lease_drop",
+                "fingerprint_input",
             ]
         );
-        assert_eq!(
+        assert!(
             observations
                 .stage_requests
                 .lock()
-                .expect("stage requests mutex should not be poisoned")[0]
-                .publish_intent(),
-            DirectoryPublishIntent::ReplaceExisting
+                .expect("stage requests mutex should not be poisoned")
+                .is_empty()
         );
-        assert_eq!(
+        assert!(
             observations
                 .snapshots
                 .lock()
                 .expect("snapshots mutex should not be poisoned")
-                .as_slice(),
-            &[(
-                PathBuf::from("C:/projects/game/project.db"),
-                PathBuf::from("C:/projects/.game-stage/project.db"),
-            )]
+                .is_empty()
         );
     }
 
@@ -1610,7 +1773,7 @@ mod tests {
             ExistingSourceObservation::Fingerprint([0x33; 32]),
             0x33,
             Ok(current.clone()),
-            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(ProjectDatabaseReconciliation::for_test(current)),
             Ok(()),
         );
 
@@ -1619,36 +1782,11 @@ mod tests {
             .await
             .expect("SQLite sidecar 属于已检查数据库的存储语义");
 
-        assert_eq!(outcome, ProjectWorkspaceConvergence::Unchanged);
-        assert!(observations.events().contains(&"discard"));
-        assert!(!observations.events().contains(&"publish"));
-    }
-
-    #[tokio::test]
-    async fn exact_directory_publish_lock_does_not_make_an_identical_workspace_look_changed() {
-        let current = database_state(0x33, Vec::new());
-        let (service, observations) = service(
-            true,
-            WorkspaceStructureObservation::DirectoryPublishLock,
-            ExistingSourceObservation::Fingerprint([0x33; 32]),
-            0x33,
-            Ok(current.clone()),
-            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
-            Ok(()),
+        assert_eq!(
+            outcome,
+            OperationCompletion::Completed(ProjectWorkspaceConvergence::Unchanged)
         );
-
-        let outcome = service
-            .converge(request())
-            .await
-            .expect("WriteBack 发布器留下的精确锁目录属于受管基础设施");
-
-        assert_eq!(outcome, ProjectWorkspaceConvergence::Unchanged);
-        assert!(
-            observations
-                .events()
-                .contains(&"list_directory_publish_locks")
-        );
-        assert!(observations.events().contains(&"discard"));
+        assert!(!observations.events().contains(&"prepare"));
         assert!(!observations.events().contains(&"publish"));
     }
 
@@ -1668,7 +1806,7 @@ mod tests {
             ExistingSourceObservation::Fingerprint([0x33; 32]),
             0x44,
             Ok(current),
-            Ok(ProjectDatabaseReconciliation::for_test(true, updated)),
+            Ok(ProjectDatabaseReconciliation::for_test(updated)),
             Ok(()),
         );
 
@@ -1679,9 +1817,9 @@ mod tests {
 
         assert_eq!(
             outcome,
-            ProjectWorkspaceConvergence::Updated {
+            OperationCompletion::Completed(ProjectWorkspaceConvergence::Updated {
                 stale_owners: vec![MzStandardAssetOwner::Builtin],
-            }
+            })
         );
         assert!(observations.events().contains(&"snapshot_database"));
         assert!(observations.events().contains(&"publish"));
@@ -1692,10 +1830,6 @@ mod tests {
     async fn non_exact_workspace_structure_is_repaired_even_when_requested_facts_match() {
         for structure in [
             WorkspaceStructureObservation::SqliteSidecarNotFile,
-            WorkspaceStructureObservation::DirectoryPublishLockNamespaceNotDirectory,
-            WorkspaceStructureObservation::DirectoryPublishLockFileNotRegular,
-            WorkspaceStructureObservation::DirectoryPublishLockMissingFile,
-            WorkspaceStructureObservation::DirectoryPublishLockExtraEntry,
             WorkspaceStructureObservation::DatabaseNotFile,
             WorkspaceStructureObservation::SourceNotDirectory,
             WorkspaceStructureObservation::SourceDataNotDirectory,
@@ -1713,7 +1847,7 @@ mod tests {
                 ExistingSourceObservation::Fingerprint([0x55; 32]),
                 0x55,
                 Ok(current.clone()),
-                Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+                Ok(ProjectDatabaseReconciliation::for_test(current)),
                 Ok(()),
             );
 
@@ -1724,9 +1858,9 @@ mod tests {
 
             assert_eq!(
                 outcome,
-                ProjectWorkspaceConvergence::Updated {
+                OperationCompletion::Completed(ProjectWorkspaceConvergence::Updated {
                     stale_owners: Vec::new(),
-                },
+                }),
                 "{structure:?}"
             );
             assert!(observations.events().contains(&"publish"), "{structure:?}");
@@ -1747,7 +1881,7 @@ mod tests {
             ExistingSourceObservation::Fingerprint([0x55; 32]),
             0x55,
             Ok(current.clone()),
-            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(ProjectDatabaseReconciliation::for_test(current)),
             Ok(()),
         );
 
@@ -1775,7 +1909,7 @@ mod tests {
             ExistingSourceObservation::Fingerprint([0x33; 32]),
             0x33,
             Err(FakeError("invalid database")),
-            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(ProjectDatabaseReconciliation::for_test(current)),
             Ok(()),
         );
 
@@ -1792,13 +1926,7 @@ mod tests {
         ));
         assert_eq!(
             observations.events(),
-            vec![
-                "lease_acquire",
-                "game_root",
-                "workspace_root",
-                "inspect_database",
-                "lease_drop",
-            ]
+            vec!["workspace_root", "inspect_database"]
         );
     }
 
@@ -1811,7 +1939,7 @@ mod tests {
             ExistingSourceObservation::Fingerprint([0x33; 32]),
             0x44,
             Ok(current.clone()),
-            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(ProjectDatabaseReconciliation::for_test(current)),
             Err(SnapshotDatabaseError::NotCreated(FakeError("backup"))),
         );
 
@@ -1849,7 +1977,7 @@ mod tests {
             ExistingSourceObservation::Fingerprint([0x33; 32]),
             0x44,
             Ok(current.clone()),
-            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(ProjectDatabaseReconciliation::for_test(current)),
             Err(SnapshotDatabaseError::NotCreated(FakeError("backup"))),
         );
         *service
@@ -1875,10 +2003,13 @@ mod tests {
         ));
     }
 
+    type FakeWorkspaceResponse =
+        Result<OperationCompletion<ProjectWorkspaceConvergence>, FakeError>;
+
     #[derive(Clone)]
     struct FakeWorkspaceConverger {
         requests: Arc<Mutex<Vec<ProjectWorkspaceConvergenceRequest>>>,
-        responses: Arc<Mutex<VecDeque<Result<ProjectWorkspaceConvergence, FakeError>>>>,
+        responses: Arc<Mutex<VecDeque<FakeWorkspaceResponse>>>,
     }
 
     impl ProjectWorkspaceConverger for FakeWorkspaceConverger {
@@ -1887,7 +2018,7 @@ mod tests {
         async fn converge(
             &self,
             request: ProjectWorkspaceConvergenceRequest,
-        ) -> Result<ProjectWorkspaceConvergence, Self::Error> {
+        ) -> Result<OperationCompletion<ProjectWorkspaceConvergence>, Self::Error> {
             self.requests
                 .lock()
                 .expect("workspace requests mutex should not be poisoned")
@@ -1900,13 +2031,35 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct FakeProjectLease;
+
+    impl ProjectCommandLeaseProvider for FakeProjectLease {
+        type Error = FakeError;
+        type LeaseState = ();
+
+        async fn acquire(
+            &self,
+            _: &ProjectName,
+        ) -> Result<
+            crate::att_mz::project_lease::ProjectCommandLease<Self::LeaseState>,
+            ProjectCommandLeaseError<Self::Error>,
+        > {
+            Ok(crate::att_mz::project_lease::ProjectCommandLease::for_test(
+                (),
+            ))
+        }
+    }
+
     fn init_input() -> InitInput {
         InitInput {
             name: "game".parse().expect("项目名应合法"),
             game_root: PathBuf::from("./Game"),
-            source_language: " ja ".to_owned(),
-            target_language: " zh-Hans ".to_owned(),
-            layout_profile: profile(),
+            source_language: Some(" ja ".to_owned()),
+            target_language: Some(" zh-Hans ".to_owned()),
+            dialogue_max_fullwidth_chars: Some(profile().dialogue_body()),
+            scrolling_text_max_fullwidth_chars: Some(profile().scrolling_text()),
+            help_description_max_fullwidth_chars: Some(profile().help_description()),
         }
     }
 
@@ -1915,18 +2068,25 @@ mod tests {
         let converger = FakeWorkspaceConverger {
             requests: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(VecDeque::from([Ok(
-                ProjectWorkspaceConvergence::Updated {
+                OperationCompletion::Completed(ProjectWorkspaceConvergence::Updated {
                     stale_owners: vec![MzStandardAssetOwner::Builtin, MzStandardAssetOwner::Lua],
-                },
+                }),
             )]))),
         };
-        let service = InitService::new(converger, CooperativeCancellation::default());
+        let service = InitService::new(
+            converger,
+            FakeProjectLease,
+            CooperativeCancellation::default(),
+        );
 
         let output = service
             .execute(init_input())
             .await
             .expect("Init 编排应成功");
 
+        let OperationCompletion::Completed(output) = output else {
+            panic!("Init 应正常完成")
+        };
         assert_eq!(output.name.as_str(), "game");
         assert_eq!(
             output.outcome,
@@ -1941,8 +2101,8 @@ mod tests {
             .expect("workspace requests mutex should not be poisoned");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].source_game_root, Path::new("./Game"));
-        assert_eq!(requests[0].source_language, "ja");
-        assert_eq!(requests[0].target_language, "zh-Hans");
+        assert_eq!(requests[0].source_language.as_deref(), Some("ja"));
+        assert_eq!(requests[0].target_language.as_deref(), Some("zh-Hans"));
     }
 
     #[tokio::test]
@@ -1951,9 +2111,13 @@ mod tests {
             requests: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(VecDeque::new())),
         };
-        let service = InitService::new(converger, CooperativeCancellation::default());
+        let service = InitService::new(
+            converger,
+            FakeProjectLease,
+            CooperativeCancellation::default(),
+        );
         let mut input = init_input();
-        input.source_language = " \t ".to_owned();
+        input.source_language = Some(" \t ".to_owned());
 
         assert!(matches!(
             service.execute(input).await,
@@ -1980,7 +2144,7 @@ mod tests {
             ExistingSourceObservation::Missing,
             0x11,
             Ok(state.clone()),
-            Ok(ProjectDatabaseReconciliation::for_test(false, state)),
+            Ok(ProjectDatabaseReconciliation::for_test(state)),
             Ok(()),
         );
         assert_send(workspace.converge(request()));
@@ -1989,9 +2153,10 @@ mod tests {
             FakeWorkspaceConverger {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(
-                    ProjectWorkspaceConvergence::Created,
+                    OperationCompletion::Completed(ProjectWorkspaceConvergence::Created),
                 )]))),
             },
+            FakeProjectLease,
             CooperativeCancellation::default(),
         );
         assert_send(init.execute(init_input()));

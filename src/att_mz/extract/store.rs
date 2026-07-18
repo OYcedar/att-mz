@@ -15,13 +15,6 @@ pub(crate) use super::model::{
 
 pub(crate) mod asset_store;
 
-/// 一次 owner 快照收敛是否实际改变了持久状态。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SnapshotReplacementOutcome {
-    Unchanged,
-    Changed,
-}
-
 /// 原子替换 Builtin 拥有的标准文本快照。
 ///
 /// 实现保证：
@@ -32,7 +25,7 @@ pub(crate) enum SnapshotReplacementOutcome {
 ///   `translation + translation_state`；group 与 sibling 变化不扩大失效范围；
 /// - 新叶子进入未翻译状态，消失叶子被删除；
 /// - 只与当前来源下新鲜的 Rules/Lua owner 检查精确地址冲突；
-/// - 快照与 owner 指纹完全相同时返回 `Unchanged` 且不发起写事务；
+/// - 快照与 owner 指纹完全相同时直接成功且不发起写事务；
 /// - 一个快照在单个事务中替换，不会出现部分快照；驱动确认未提交时旧快照保持，
 ///   提交结果未知时显式返回不确定终态。
 pub(crate) trait BuiltinSnapshotStore: Send + Sync {
@@ -42,7 +35,7 @@ pub(crate) trait BuiltinSnapshotStore: Send + Sync {
         &self,
         project: &OpenedProject,
         snapshot: BuiltinSnapshot,
-    ) -> impl Future<Output = Result<SnapshotReplacementOutcome, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// 原子替换 Rules 拥有的标准文本快照。
@@ -57,7 +50,7 @@ pub(crate) trait BuiltinSnapshotStore: Send + Sync {
 /// - 只与当前来源下新鲜的 Builtin/Lua owner 检查精确地址冲突；
 /// - 非空 Rules 定义可提交 active 空快照；完整 `{}` 通过 `deactivate_rules`
 ///   移除 owner state 并级联清理资产；
-/// - 快照与 owner 指纹完全相同时返回 `Unchanged` 且不发起写事务；
+/// - 快照与 owner 指纹完全相同时直接成功且不发起写事务；
 /// - 一个快照在单个事务中替换，不会出现部分快照；驱动确认未提交时旧快照保持，
 ///   提交结果未知时显式返回不确定终态。
 ///
@@ -69,13 +62,13 @@ pub(crate) trait RulesSnapshotStore: Send + Sync {
         &self,
         project: &OpenedProject,
         snapshot: RulesSnapshot,
-    ) -> impl Future<Output = Result<SnapshotReplacementOutcome, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// 清空 Rules 资产并移除其 active owner state。
     fn deactivate_rules(
         &self,
         project: &OpenedProject,
-    ) -> impl Future<Output = Result<SnapshotReplacementOutcome, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// 原子收敛 Lua 拥有的标准文本快照。
@@ -89,10 +82,10 @@ pub(crate) trait LuaSnapshotStore: Send + Sync {
         &self,
         project: &OpenedProject,
         snapshot: LuaSnapshot,
-    ) -> impl Future<Output = Result<SnapshotReplacementOutcome, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     fn deactivate_lua(
         &self,
         project: &OpenedProject,
-    ) -> impl Future<Output = Result<SnapshotReplacementOutcome, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

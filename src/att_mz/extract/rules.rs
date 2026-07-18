@@ -3426,8 +3426,7 @@ mod tests {
             &self,
             _project: &OpenedProject,
             snapshot: RulesSnapshot,
-        ) -> Result<crate::att_mz::extract::store::SnapshotReplacementOutcome, Self::Error>
-        {
+        ) -> Result<(), Self::Error> {
             self.snapshots
                 .lock()
                 .expect("快照锁不应中毒")
@@ -3435,20 +3434,16 @@ mod tests {
             if self.fail {
                 Err(FakeError("persist"))
             } else {
-                Ok(crate::att_mz::extract::store::SnapshotReplacementOutcome::Changed)
+                Ok(())
             }
         }
 
-        async fn deactivate_rules(
-            &self,
-            _project: &OpenedProject,
-        ) -> Result<crate::att_mz::extract::store::SnapshotReplacementOutcome, Self::Error>
-        {
+        async fn deactivate_rules(&self, _project: &OpenedProject) -> Result<(), Self::Error> {
             self.deactivations.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 Err(FakeError("persist"))
             } else {
-                Ok(crate::att_mz::extract::store::SnapshotReplacementOutcome::Changed)
+                Ok(())
             }
         }
     }

@@ -22,7 +22,7 @@ use mlua::{
     UserData, UserDataFields, UserDataMethods, Value, VmState,
 };
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Notify, oneshot};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
@@ -38,12 +38,12 @@ use crate::att_mz::lua::mz::{
     plugin_parameter_source, source_path,
 };
 use crate::att_mz::lua::runtime::{
-    OwnedLuaProgram, TrustedLuaBindingFinalizationError, TrustedLuaCommonBindings,
-    TrustedLuaCommonHostCalls, TrustedLuaExecutionHandle, TrustedLuaExtractHostCalls,
-    TrustedLuaHostCallError, TrustedLuaOutputEntry, TrustedLuaPhaseBindings,
-    TrustedLuaPreparedTranslation, TrustedLuaPreparedTranslationAcceptance,
-    TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport,
-    TrustedLuaRuntimeExecutor, TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
+    OwnedLuaProgram, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
+    TrustedLuaCommonBindings, TrustedLuaCommonHostCalls, TrustedLuaExecutionHandle,
+    TrustedLuaExtractHostCalls, TrustedLuaHostCallError, TrustedLuaOutputEntry,
+    TrustedLuaPhaseBindings, TrustedLuaPreparedTranslation,
+    TrustedLuaPreparedTranslationAcceptance, TrustedLuaRuntimeBindings,
+    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
     TrustedLuaTranslateHostCalls, TrustedLuaWriteBackHostCalls, TrustedLuaWriteBackLayoutPair,
     TrustedLuaWriteBackLayoutRegion, TrustedLuaWriteBackLayoutResult,
 };
@@ -54,11 +54,9 @@ use crate::llm::{ChatMessage, ChatMessageRole, LlmResponse, LlmUsage};
 use crate::storage::file_system::ScopedDirectoryPath;
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow, SqliteValue};
 
-/// 已由配置边界建立的 Lua worker 资源上限。
+/// 已由配置边界建立的单次 Lua 执行资源上限。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TrustedLua54RuntimeConfiguration {
-    worker_threads: NonZeroUsize,
-    queue_capacity: NonZeroUsize,
     worker_stack_bytes: NonZeroUsize,
     memory_limit_bytes_per_vm: NonZeroUsize,
     cancel_check_instruction_interval: NonZeroU32,
@@ -68,8 +66,6 @@ pub(crate) struct TrustedLua54RuntimeConfiguration {
 
 impl TrustedLua54RuntimeConfiguration {
     pub(crate) const fn new(
-        worker_threads: NonZeroUsize,
-        queue_capacity: NonZeroUsize,
         worker_stack_bytes: NonZeroUsize,
         memory_limit_bytes_per_vm: NonZeroUsize,
         cancel_check_instruction_interval: NonZeroU32,
@@ -77,8 +73,6 @@ impl TrustedLua54RuntimeConfiguration {
         host_value_budget: HostValueBudget,
     ) -> Self {
         Self {
-            worker_threads,
-            queue_capacity,
             worker_stack_bytes,
             memory_limit_bytes_per_vm,
             cancel_check_instruction_interval,
@@ -88,10 +82,9 @@ impl TrustedLua54RuntimeConfiguration {
     }
 }
 
-/// Lua 生产根的构造、调度或 VM 失败。
+/// Lua 生产根的线程启动、生命周期或 VM 失败。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TrustedLua54RuntimeError {
-    CapacityOverflow,
     WorkerSpawn(String),
     ShuttingDown,
     WorkerChannelClosed,
@@ -102,7 +95,6 @@ pub(crate) enum TrustedLua54RuntimeError {
 impl fmt::Display for TrustedLua54RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CapacityOverflow => formatter.write_str("Lua worker 与队列容量溢出"),
             Self::WorkerSpawn(message) => write!(formatter, "无法创建 Lua worker：{message}"),
             Self::ShuttingDown => formatter.write_str("Lua Runtime 正在关闭"),
             Self::WorkerChannelClosed => formatter.write_str("Lua worker 通道已关闭"),
@@ -114,21 +106,22 @@ impl fmt::Display for TrustedLua54RuntimeError {
 
 impl Error for TrustedLua54RuntimeError {}
 
-type WorkerTask = Box<dyn FnOnce() + Send + 'static>;
-
 struct RuntimeInner {
-    sender: Mutex<Option<mpsc::Sender<WorkerTask>>>,
-    capacity: Arc<Semaphore>,
-    accepting: AtomicBool,
+    lifecycle: Mutex<RuntimeLifecycle>,
     shutdown_requested: Arc<AtomicBool>,
     runtime_handles: AtomicUsize,
-    active_jobs: AtomicUsize,
     jobs_finished: Notify,
     tokio: Handle,
+    worker_stack_bytes: usize,
     memory_limit_bytes_per_vm: usize,
     cancel_check_instruction_interval: u32,
     max_error_bytes: usize,
     host_value_budget: HostValueBudget,
+}
+
+struct RuntimeLifecycle {
+    accepting: bool,
+    active_jobs: usize,
 }
 
 /// 进程内完整 Lua 5.4 Runtime。
@@ -137,54 +130,23 @@ struct RuntimeInner {
 /// 同步响应桥交回构造本根的 Tokio Runtime 驱动。
 pub(crate) struct TrustedLua54Runtime {
     inner: Arc<RuntimeInner>,
-    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl TrustedLua54Runtime {
-    pub(crate) fn new(
-        configuration: TrustedLua54RuntimeConfiguration,
-        tokio: Handle,
-    ) -> Result<Self, TrustedLua54RuntimeError> {
-        let total_capacity = configuration
-            .worker_threads
-            .get()
-            .checked_add(configuration.queue_capacity.get())
-            .ok_or(TrustedLua54RuntimeError::CapacityOverflow)?;
-        let (sender, receiver) = mpsc::channel::<WorkerTask>();
-        let receiver = Arc::new(Mutex::new(receiver));
+    pub(crate) fn new(configuration: TrustedLua54RuntimeConfiguration, tokio: Handle) -> Self {
         let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let mut workers = Vec::with_capacity(configuration.worker_threads.get());
 
-        for index in 0..configuration.worker_threads.get() {
-            let receiver = Arc::clone(&receiver);
-            let name = format!("att-lua-{index}");
-            let worker = thread::Builder::new()
-                .name(name)
-                .stack_size(configuration.worker_stack_bytes.get())
-                .spawn(move || worker_loop(&receiver));
-            match worker {
-                Ok(worker) => workers.push(worker),
-                Err(error) => {
-                    // 新 worker 失败后立即关闭唯一 sender，使已启动 worker 退出并完整 join。
-                    drop(sender);
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
-                    return Err(TrustedLua54RuntimeError::WorkerSpawn(error.to_string()));
-                }
-            }
-        }
-
-        Ok(Self {
+        Self {
             inner: Arc::new(RuntimeInner {
-                sender: Mutex::new(Some(sender)),
-                capacity: Arc::new(Semaphore::new(total_capacity)),
-                accepting: AtomicBool::new(true),
+                lifecycle: Mutex::new(RuntimeLifecycle {
+                    accepting: true,
+                    active_jobs: 0,
+                }),
                 shutdown_requested,
                 runtime_handles: AtomicUsize::new(1),
-                active_jobs: AtomicUsize::new(0),
                 jobs_finished: Notify::new(),
                 tokio,
+                worker_stack_bytes: configuration.worker_stack_bytes.get(),
                 memory_limit_bytes_per_vm: configuration.memory_limit_bytes_per_vm.get(),
                 cancel_check_instruction_interval: configuration
                     .cancel_check_instruction_interval
@@ -192,63 +154,60 @@ impl TrustedLua54Runtime {
                 max_error_bytes: configuration.max_error_bytes.get(),
                 host_value_budget: configuration.host_value_budget,
             }),
-            workers: Arc::new(Mutex::new(workers)),
-        })
+        }
     }
 
-    /// 停止新预留，取消已排队或正在执行的脚本，并等待 worker 退出。
+    /// 停止新启动，取消正在执行的脚本，并等待 worker 与唯一终结器退出。
     ///
     /// 可信脚本进入 native C 模块、`os.execute` 或替换调试 hook 后可以长时间不
     /// 交还控制；本方法不伪造超时成功。
     pub(crate) async fn shutdown(&self) -> Result<(), TrustedLua54RuntimeError> {
         self.inner.request_shutdown();
-
-        let workers = {
-            let mut guard = self.workers.lock().expect("Lua worker 锁不应中毒");
-            std::mem::take(&mut *guard)
-        };
-        let joined = self
-            .inner
-            .tokio
-            .spawn_blocking(move || {
-                let mut panicked = false;
-                for worker in workers {
-                    panicked |= worker.join().is_err();
-                }
-                panicked
-            })
-            .await
-            .map_err(|error| TrustedLua54RuntimeError::Vm(error.to_string()))?;
         loop {
             let finished = self.inner.jobs_finished.notified();
-            if self.inner.active_jobs.load(Ordering::Acquire) == 0 {
+            if self.inner.active_jobs() == 0 {
                 break;
             }
             finished.await;
         }
-        if joined {
-            Err(TrustedLua54RuntimeError::Vm(
-                "Lua worker 在关闭期间 panic".to_owned(),
-            ))
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 }
 
 impl RuntimeInner {
     fn request_shutdown(&self) {
-        self.accepting.store(false, Ordering::Release);
+        let mut lifecycle = self.lifecycle.lock().expect("Lua 生命周期锁不应中毒");
+        lifecycle.accepting = false;
         self.shutdown_requested.store(true, Ordering::Release);
-        self.capacity.close();
-        match self.sender.lock() {
-            Ok(mut sender) => {
-                sender.take();
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().take();
-            }
+    }
+
+    fn accept_job(&self) -> bool {
+        let mut lifecycle = self.lifecycle.lock().expect("Lua 生命周期锁不应中毒");
+        if !lifecycle.accepting {
+            return false;
         }
+        lifecycle.active_jobs = lifecycle
+            .active_jobs
+            .checked_add(1)
+            .expect("Lua 活动 job 数不可能溢出");
+        true
+    }
+
+    fn finish_job(&self) {
+        let mut lifecycle = self.lifecycle.lock().expect("Lua 生命周期锁不应中毒");
+        lifecycle.active_jobs = lifecycle
+            .active_jobs
+            .checked_sub(1)
+            .expect("每个已接管 Lua job 只能完成一次");
+        drop(lifecycle);
+        self.jobs_finished.notify_waiters();
+    }
+
+    fn active_jobs(&self) -> usize {
+        self.lifecycle
+            .lock()
+            .expect("Lua 生命周期锁不应中毒")
+            .active_jobs
     }
 }
 
@@ -257,7 +216,6 @@ impl Clone for TrustedLua54Runtime {
         self.inner.runtime_handles.fetch_add(1, Ordering::AcqRel);
         Self {
             inner: Arc::clone(&self.inner),
-            workers: Arc::clone(&self.workers),
         }
     }
 }
@@ -265,8 +223,8 @@ impl Clone for TrustedLua54Runtime {
 impl Drop for TrustedLua54Runtime {
     fn drop(&mut self) {
         if self.inner.runtime_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
-            // 显式 shutdown 才能取得 join 结果；最后一个句柄的兜底只负责停止准入、
-            // 请求取消并关闭队列，避免遗留永不退出的 worker。
+            // 最后一个 Runtime 句柄只负责停止准入并请求合作取消；已经接管工作的
+            // supervisor 仍拥有线程和唯一终结器，会自行完成收尾。
             self.inner.request_shutdown();
         }
     }
@@ -274,51 +232,9 @@ impl Drop for TrustedLua54Runtime {
 
 impl TrustedLuaRuntimeExecutor for TrustedLua54Runtime {
     type Error = TrustedLua54RuntimeError;
-    type Reservation = TrustedLua54Reservation;
-
-    async fn reserve(&self) -> Result<Self::Reservation, Self::Error> {
-        if !self.inner.accepting.load(Ordering::Acquire) {
-            return Err(TrustedLua54RuntimeError::ShuttingDown);
-        }
-        let permit = Arc::clone(&self.inner.capacity)
-            .acquire_owned()
-            .await
-            .map_err(|_| TrustedLua54RuntimeError::ShuttingDown)?;
-        // 先登记已经授予的 reservation，再复核准入开关。这样 shutdown 不会在
-        // reserve 与 start 之间误判为已经没有受理中的工作。
-        self.inner.active_jobs.fetch_add(1, Ordering::AcqRel);
-        if !self.inner.accepting.load(Ordering::Acquire) {
-            self.inner.active_jobs.fetch_sub(1, Ordering::AcqRel);
-            self.inner.jobs_finished.notify_waiters();
-            return Err(TrustedLua54RuntimeError::ShuttingDown);
-        }
-        Ok(TrustedLua54Reservation {
-            inner: Arc::clone(&self.inner),
-            permit: Some(permit),
-        })
-    }
-}
-
-/// 一次不可克隆的 Lua 容量预留。
-pub(crate) struct TrustedLua54Reservation {
-    inner: Arc<RuntimeInner>,
-    permit: Option<OwnedSemaphorePermit>,
-}
-
-impl Drop for TrustedLua54Reservation {
-    fn drop(&mut self) {
-        if self.permit.is_some() {
-            self.inner.active_jobs.fetch_sub(1, Ordering::AcqRel);
-            self.inner.jobs_finished.notify_waiters();
-        }
-    }
-}
-
-impl TrustedLuaRuntimeReservation for TrustedLua54Reservation {
-    type Error = TrustedLua54RuntimeError;
 
     fn start(
-        mut self,
+        &self,
         program: OwnedLuaProgram,
         bindings: TrustedLuaRuntimeBindings,
     ) -> TrustedLuaExecutionHandle<Self::Error> {
@@ -330,50 +246,7 @@ impl TrustedLuaRuntimeReservation for TrustedLua54Reservation {
         };
         let (worker_sender, worker_receiver) = oneshot::channel::<WorkerOutcome>();
         let (report_sender, report_receiver) = oneshot::channel();
-        let supervisor_cancel = cancellation.clone();
-        let permit = self
-            .permit
-            .take()
-            .expect("Lua reservation permit 只能移交一次");
-        let supervisor_inner = Arc::clone(&self.inner);
-
-        self.inner.tokio.spawn(async move {
-            let runtime = match worker_receiver.await {
-                Ok(result) => result.into_runtime_result(),
-                Err(_) => Err(TrustedLuaRuntimeExecutionError::Unavailable(
-                    TrustedLua54RuntimeError::WorkerChannelClosed,
-                )),
-            };
-            let termination = if supervisor_cancel.is_cancelled()
-                || matches!(runtime, Err(TrustedLuaRuntimeExecutionError::Cancelled))
-            {
-                TrustedLuaRuntimeTermination::Cancelled
-            } else if runtime.is_ok() {
-                TrustedLuaRuntimeTermination::Completed
-            } else {
-                TrustedLuaRuntimeTermination::Failed
-            };
-            let finalization =
-                match catch_unwind(AssertUnwindSafe(|| finalizer.finalize(termination))) {
-                    Ok(finalization) => match AssertUnwindSafe(finalization).catch_unwind().await {
-                        Ok(finalization) => finalization,
-                        Err(_) => Err(TrustedLuaBindingFinalizationError::new(
-                            "Lua Host 唯一终结器 panic",
-                            None,
-                        )),
-                    },
-                    Err(_) => Err(TrustedLuaBindingFinalizationError::new(
-                        "Lua Host 唯一终结器 panic",
-                        None,
-                    )),
-                };
-            let _ =
-                report_sender.send(TrustedLuaRuntimeExecutionReport::new(runtime, finalization));
-            drop(permit);
-            supervisor_inner.active_jobs.fetch_sub(1, Ordering::AcqRel);
-            supervisor_inner.jobs_finished.notify_waiters();
-        });
-
+        let accepted = self.inner.accept_job();
         let tokio = self.inner.tokio.clone();
         let limits = LuaExecutionLimits {
             memory_limit_bytes_per_vm: self.inner.memory_limit_bytes_per_vm,
@@ -381,40 +254,101 @@ impl TrustedLuaRuntimeReservation for TrustedLua54Reservation {
             max_error_bytes: self.inner.max_error_bytes,
             host_value_budget: self.inner.host_value_budget,
         };
-        let task: WorkerTask = Box::new(move || {
-            let outcome = catch_unwind(AssertUnwindSafe(|| {
-                execute_program(&program, common, phase, &tokio, &cancellation, limits)
-            }))
-            .unwrap_or(WorkerOutcome::Panicked);
-            let _ = worker_sender.send(outcome);
-        });
 
-        let sent = self
-            .inner
-            .sender
-            .lock()
-            .expect("Lua sender 锁不应中毒")
-            .as_ref()
-            .is_some_and(|sender| sender.send(task).is_ok());
-        if !sent {
-            // task 被丢弃后 worker_sender 同步关闭，supervisor 仍会执行唯一终结器。
-        }
+        let worker = if accepted {
+            let sender = Arc::new(Mutex::new(Some(worker_sender)));
+            let worker_sender = Arc::clone(&sender);
+            let worker = thread::Builder::new()
+                .name("att-lua".to_owned())
+                .stack_size(self.inner.worker_stack_bytes)
+                .spawn(move || {
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        execute_program(&program, common, phase, &tokio, &cancellation, limits)
+                    }))
+                    .unwrap_or(WorkerOutcome::Panicked);
+                    if let Some(sender) = worker_sender
+                        .lock()
+                        .expect("Lua worker 结果锁不应中毒")
+                        .take()
+                    {
+                        let _ = sender.send(outcome);
+                    }
+                });
+            match worker {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    if let Some(sender) = sender.lock().expect("Lua worker 结果锁不应中毒").take()
+                    {
+                        let _ = sender.send(WorkerOutcome::Unavailable(
+                            TrustedLua54RuntimeError::WorkerSpawn(error.to_string()),
+                        ));
+                    }
+                    None
+                }
+            }
+        } else {
+            let _ = worker_sender.send(WorkerOutcome::Unavailable(
+                TrustedLua54RuntimeError::ShuttingDown,
+            ));
+            None
+        };
+
+        spawn_supervisor(
+            Arc::clone(&self.inner),
+            accepted,
+            worker,
+            worker_receiver,
+            finalizer,
+            report_sender,
+        );
 
         TrustedLuaExecutionHandle::new(report_receiver, cancelled)
     }
 }
 
-fn worker_loop(receiver: &Mutex<mpsc::Receiver<WorkerTask>>) {
-    loop {
-        let task = {
-            let guard = receiver.lock().expect("Lua receiver 锁不应中毒");
-            guard.recv()
+fn spawn_supervisor(
+    inner: Arc<RuntimeInner>,
+    accepted: bool,
+    worker: Option<JoinHandle<()>>,
+    worker_receiver: oneshot::Receiver<WorkerOutcome>,
+    finalizer: Box<dyn TrustedLuaBindingFinalizer>,
+    report_sender: oneshot::Sender<TrustedLuaRuntimeExecutionReport<TrustedLua54RuntimeError>>,
+) {
+    let supervisor_runtime = Arc::clone(&inner);
+    inner.tokio.spawn(async move {
+        let mut runtime = match worker_receiver.await {
+            Ok(result) => result.into_runtime_result(),
+            Err(_) => Err(TrustedLuaRuntimeExecutionError::Unavailable(
+                TrustedLua54RuntimeError::WorkerChannelClosed,
+            )),
         };
-        let Ok(task) = task else {
-            return;
+        if let Some(worker) = worker {
+            let joined = supervisor_runtime
+                .tokio
+                .spawn_blocking(move || worker.join())
+                .await;
+            if !matches!(joined, Ok(Ok(()))) {
+                runtime = Err(TrustedLuaRuntimeExecutionError::WorkerPanicked);
+            }
+        }
+        let finalization = match catch_unwind(AssertUnwindSafe(|| finalizer.finalize())) {
+            Ok(finalization) => match AssertUnwindSafe(finalization).catch_unwind().await {
+                Ok(finalization) => finalization,
+                Err(_) => Err(TrustedLuaBindingFinalizationError::new(
+                    "Lua Host 唯一终结器 panic",
+                    None,
+                )),
+            },
+            Err(_) => Err(TrustedLuaBindingFinalizationError::new(
+                "Lua Host 唯一终结器 panic",
+                None,
+            )),
         };
-        task();
-    }
+        let _ = report_sender.send(TrustedLuaRuntimeExecutionReport::new(runtime, finalization));
+        if accepted {
+            supervisor_runtime.finish_job();
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -439,6 +373,7 @@ impl RuntimeCancellation {
 
 enum WorkerOutcome {
     Completed,
+    Unavailable(TrustedLua54RuntimeError),
     Context(TrustedLua54RuntimeError),
     Compile(TrustedLua54RuntimeError),
     Execute(TrustedLua54RuntimeError),
@@ -453,6 +388,7 @@ impl WorkerOutcome {
     ) -> Result<(), TrustedLuaRuntimeExecutionError<TrustedLua54RuntimeError>> {
         match self {
             Self::Completed => Ok(()),
+            Self::Unavailable(error) => Err(TrustedLuaRuntimeExecutionError::Unavailable(error)),
             Self::Context(error) => Err(TrustedLuaRuntimeExecutionError::Context(error)),
             Self::Compile(error) => Err(TrustedLuaRuntimeExecutionError::Compile(error)),
             Self::Execute(error) => Err(TrustedLuaRuntimeExecutionError::Execute(error)),
@@ -520,6 +456,9 @@ fn execute_program(
     ) {
         return WorkerOutcome::Context(vm_error("无法安装 Lua 取消 hook", error, max_error_bytes));
     }
+    if cancellation.is_cancelled() {
+        return WorkerOutcome::Cancelled;
+    }
 
     let context = match build_context(
         &lua,
@@ -531,10 +470,16 @@ fn execute_program(
     ) {
         Ok(context) => context,
         Err(error) => {
+            if cancellation.is_cancelled() {
+                return WorkerOutcome::Cancelled;
+            }
             return WorkerOutcome::Context(vm_error("无法构造 Lua ctx", error, max_error_bytes));
         }
     };
     if let Err(error) = lua.globals().set("ctx", context) {
+        if cancellation.is_cancelled() {
+            return WorkerOutcome::Cancelled;
+        }
         return WorkerOutcome::Context(vm_error("无法注入 Lua ctx", error, max_error_bytes));
     }
 
@@ -545,6 +490,9 @@ fn execute_program(
     {
         Ok(function) => function,
         Err(error) => {
+            if cancellation.is_cancelled() {
+                return WorkerOutcome::Cancelled;
+            }
             return WorkerOutcome::Compile(vm_error("Lua 主程序编译失败", error, max_error_bytes));
         }
     };
@@ -557,6 +505,9 @@ fn execute_program(
     {
         Ok(runner) => runner,
         Err(error) => {
+            if cancellation.is_cancelled() {
+                return WorkerOutcome::Cancelled;
+            }
             return WorkerOutcome::Context(vm_error(
                 "无法构造 Lua 执行边界",
                 error,
@@ -3244,7 +3195,10 @@ fn llm_response_to_lua(lua: &Lua, response: LlmResponse) -> mlua::Result<Value> 
         Some(request_id) => table.set("request_id", request_id)?,
         None => table.set("request_id", Value::Nil)?,
     }
-    table.set("response_id", response.provider_response_id())?;
+    match response.provider_response_id() {
+        Some(response_id) => table.set("response_id", response_id)?,
+        None => table.set("response_id", Value::Nil)?,
+    }
     match response.usage() {
         Some(usage) => table.set("usage", usage_to_lua(lua, usage)?)?,
         None => table.set("usage", Value::Nil)?,
@@ -3265,7 +3219,10 @@ fn validate_llm_response_budget(
             Some(request_id) => tracker.string(2, request_id),
             None => tracker.scalar(2),
         })
-        .and_then(|()| tracker.string(2, response.provider_response_id()))
+        .and_then(|()| match response.provider_response_id() {
+            Some(response_id) => tracker.string(2, response_id),
+            None => tracker.scalar(2),
+        })
         .and_then(|()| match response.usage() {
             Some(_) => {
                 tracker.container(2)?;
@@ -3632,7 +3589,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::task::Poll;
     use std::time::Duration;
 
     use crate::att_mz::ProjectName;
@@ -3887,7 +3843,7 @@ mod tests {
                     "raw response",
                     crate::llm::LlmFinishReason::Stop,
                     Some("request-1".to_owned()),
-                    "response-1",
+                    Some("response-1".to_owned()),
                     Some(LlmUsage::new(3, 5, 8)),
                 ))
             })
@@ -4101,14 +4057,13 @@ mod tests {
     }
 
     struct TestFinalizer {
-        terminations: Arc<Mutex<Vec<TrustedLuaRuntimeTermination>>>,
-        completion: Option<oneshot::Sender<TrustedLuaRuntimeTermination>>,
+        finalizations: Arc<Mutex<Vec<()>>>,
+        completion: Option<oneshot::Sender<()>>,
     }
 
     impl TrustedLuaBindingFinalizer for TestFinalizer {
         fn finalize(
             self: Box<Self>,
-            termination: TrustedLuaRuntimeTermination,
         ) -> std::pin::Pin<
             Box<
                 dyn Future<
@@ -4121,16 +4076,13 @@ mod tests {
             >,
         > {
             let Self {
-                terminations,
+                finalizations,
                 completion,
             } = *self;
             Box::pin(async move {
-                terminations
-                    .lock()
-                    .expect("终结记录锁不应中毒")
-                    .push(termination);
+                finalizations.lock().expect("终结记录锁不应中毒").push(());
                 if let Some(completion) = completion {
-                    let _ = completion.send(termination);
+                    let _ = completion.send(());
                 }
                 Ok(TrustedLuaBindingFinalization::new(false))
             })
@@ -4142,7 +4094,6 @@ mod tests {
     impl TrustedLuaBindingFinalizer for PanickingFinalizer {
         fn finalize(
             self: Box<Self>,
-            _termination: TrustedLuaRuntimeTermination,
         ) -> std::pin::Pin<
             Box<
                 dyn Future<
@@ -4170,8 +4121,6 @@ mod tests {
         host_value_budget: HostValueBudget,
     ) -> TrustedLua54RuntimeConfiguration {
         TrustedLua54RuntimeConfiguration::new(
-            NonZeroUsize::new(1).unwrap(),
-            NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
             NonZeroUsize::new(16 * 1024 * 1024).unwrap(),
             NonZeroU32::new(100).unwrap(),
@@ -4203,8 +4152,8 @@ mod tests {
     fn test_bindings(
         begin_error: Option<TrustedLuaHostCallError>,
         observations: Arc<Mutex<TestObservations>>,
-        terminations: Arc<Mutex<Vec<TrustedLuaRuntimeTermination>>>,
-        completion: Option<oneshot::Sender<TrustedLuaRuntimeTermination>>,
+        finalizations: Arc<Mutex<Vec<()>>>,
+        completion: Option<oneshot::Sender<()>>,
     ) -> TrustedLuaRuntimeBindings {
         let calls = Arc::new(TestCalls {
             panic_on_project: false,
@@ -4217,7 +4166,7 @@ mod tests {
         translate_bindings(
             calls,
             Box::new(TestFinalizer {
-                terminations,
+                finalizations,
                 completion,
             }),
         )
@@ -4251,7 +4200,7 @@ mod tests {
         extract_bindings(
             calls,
             Box::new(TestFinalizer {
-                terminations: Arc::new(Mutex::new(Vec::new())),
+                finalizations: Arc::new(Mutex::new(Vec::new())),
                 completion: None,
             }),
         )
@@ -4263,9 +4212,6 @@ mod tests {
         source: &str,
     ) -> Result<(), TrustedLuaRuntimeExecutionError<TrustedLua54RuntimeError>> {
         let report = runtime
-            .reserve()
-            .await
-            .expect("测试 Runtime 应可预留")
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/extract-managed.lua"),
@@ -4387,7 +4333,7 @@ mod tests {
             "123456789",
             crate::llm::LlmFinishReason::Stop,
             None,
-            "r",
+            Some("r".to_owned()),
             None,
         );
         assert_host_budget_error(validate_llm_response_budget(&response, budget));
@@ -4419,13 +4365,36 @@ mod tests {
     }
 
     #[test]
+    fn llm_response_without_provider_ids_maps_them_to_lua_nil() {
+        let lua = Lua::new();
+        let response = LlmResponse::new(
+            "translated",
+            crate::llm::LlmFinishReason::Stop,
+            None,
+            None,
+            None,
+        );
+        let Value::Table(table) = llm_response_to_lua(&lua, response).unwrap() else {
+            panic!("LLM 响应必须映射成 Lua table");
+        };
+        assert!(matches!(
+            table.get::<Value>("request_id").unwrap(),
+            Value::Nil
+        ));
+        assert!(matches!(
+            table.get::<Value>("response_id").unwrap(),
+            Value::Nil
+        ));
+    }
+
+    #[test]
     fn error_truncation_preserves_utf8() {
         assert_eq!(truncate_utf8("中文abc".to_owned(), 4), "中");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extract_replace_standard_builds_a_valid_unforgeable_snapshot() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let observations = Arc::new(Mutex::new(TestObservations::default()));
         run_extract_program(
             &runtime,
@@ -4464,7 +4433,7 @@ ctx.extract.replace_standard({
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extract_empty_replace_and_clear_have_distinct_intents() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let replace_observations = Arc::new(Mutex::new(TestObservations::default()));
         run_extract_program(
             &runtime,
@@ -4503,7 +4472,7 @@ ctx.extract.replace_standard({
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extract_rejects_duplicate_intents_and_forged_text_references() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let duplicate_observations = Arc::new(Mutex::new(TestObservations::default()));
         let duplicate = run_extract_program(
             &runtime,
@@ -4558,10 +4527,9 @@ ctx.extract.replace_standard({{
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_vm_exposes_exact_ctx_and_preserves_sqlite_and_llm_values() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let observations = Arc::new(Mutex::new(TestObservations::default()));
-        let terminations = Arc::new(Mutex::new(Vec::new()));
-        let reservation = runtime.reserve().await.unwrap();
+        let finalizations = Arc::new(Mutex::new(Vec::new()));
         let script = r#"
 assert(ctx.phase == "translate")
 assert(ctx.project.name == "demo")
@@ -4654,7 +4622,7 @@ assert(response.usage.completion_tokens == 5)
 assert(response.usage.total_tokens == 8)
 ctx.db.commit()
 "#;
-        let report = reservation
+        let report = runtime
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/main.lua"),
@@ -4663,7 +4631,7 @@ ctx.db.commit()
                 test_bindings(
                     None,
                     Arc::clone(&observations),
-                    Arc::clone(&terminations),
+                    Arc::clone(&finalizations),
                     None,
                 ),
             )
@@ -4713,16 +4681,13 @@ ctx.db.commit()
             assert_eq!(messages[0].role(), ChatMessageRole::User);
             assert_eq!(messages[0].content(), "hello");
         }
-        assert_eq!(
-            *terminations.lock().unwrap(),
-            vec![TrustedLuaRuntimeTermination::Completed]
-        );
+        assert_eq!(*finalizations.lock().unwrap(), vec![()]);
         runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn json_context_preserves_kinds_numbers_and_container_identity() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let script = r#"
 local json = ctx.json
 assert(json.NULL ~= ctx.db.NULL)
@@ -4764,9 +4729,6 @@ assert(json.number_text(1.5) == "1.5")
 assert(json.encode(json.object({b = 2, a = 1})) == [[{"a":1,"b":2}]])
 "#;
         let report = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/json-roundtrip.lua"),
@@ -4786,7 +4748,7 @@ assert(json.encode(json.object({b = 2, a = 1})) == [[{"a":1,"b":2}]])
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn json_context_rejects_ambiguous_or_non_json_lua_values() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let script = r#"
 local json = ctx.json
 local failures = {
@@ -4821,9 +4783,6 @@ local ok, error = pcall(ctx.db.query, "SELECT values", {ctx.json.NULL})
 assert(not ok and error.domain == "binding" and error.kind == "invalid_value")
 "#;
         let report = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/json-invalid.lua"),
@@ -4850,8 +4809,7 @@ assert(not ok and error.domain == "binding" and error.kind == "invalid_value")
                 NonZeroUsize::new(2).unwrap(),
             )),
             Handle::current(),
-        )
-        .unwrap();
+        );
         let script = r#"
 local json = ctx.json
 assert(json.encode(json.decode("[1,2]")) == "[1,2]")
@@ -4869,9 +4827,6 @@ for _, failure in ipairs(failures) do
 end
 "#;
         let report = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/json-budget.lua"),
@@ -4891,7 +4846,7 @@ end
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn source_and_mz_facades_reuse_lossless_json_and_structured_locations() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let script = r#"
 assert(ctx.source.read("js/raw.bin") == string.char(0, 255, 1))
 assert(ctx.source.read_text("js/text.txt") == "文本")
@@ -4953,9 +4908,6 @@ ok, error = pcall(items.text, items, {1, "missing"})
 assert(not ok and error.domain == "mz" and error.kind == "invalid_location")
 "#;
         let report = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/source-mz.lua"),
@@ -4975,13 +4927,10 @@ assert(not ok and error.domain == "mz" and error.kind == "invalid_location")
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pcall_receives_typed_host_error_and_unhandled_error_is_binding_failure() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let host_error =
             TrustedLuaHostCallError::new("sqlite", "busy", "database busy", Some(25), None);
         let caught = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/caught.lua"),
@@ -5006,9 +4955,6 @@ assert(error.retry_after_ms == 25)
         assert!(caught.into_parts().0.is_ok());
 
         let unhandled = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/unhandled.lua"),
@@ -5029,9 +4975,6 @@ assert(error.retry_after_ms == 25)
         ));
 
         let unhandled_json = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/unhandled-json.lua"),
@@ -5052,9 +4995,6 @@ assert(error.retry_after_ms == 25)
         ));
 
         let invalid_binding = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/invalid-binding.lua"),
@@ -5096,9 +5036,9 @@ assert(error.kind == "invalid_value")
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_unpolled_handle_cancels_but_supervisor_still_finalizes_once() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let (completion, finalized) = oneshot::channel();
-        let handle = runtime.reserve().await.unwrap().start(
+        let handle = runtime.start(
             OwnedLuaProgram::new(
                 PathBuf::from("C:/scripts/infinite.lua"),
                 b"while true do end".to_vec(),
@@ -5111,19 +5051,18 @@ assert(error.kind == "invalid_value")
             ),
         );
         drop(handle);
-        let termination = tokio::time::timeout(Duration::from_secs(5), finalized)
+        tokio::time::timeout(Duration::from_secs(5), finalized)
             .await
             .expect("取消后应完成唯一终结")
             .expect("终结器应发送终态");
-        assert_eq!(termination, TrustedLuaRuntimeTermination::Cancelled);
         runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_the_last_runtime_handle_requests_cancellation_and_finalization() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let (completion, finalized) = oneshot::channel();
-        let execution = runtime.reserve().await.unwrap().start(
+        let execution = runtime.start(
             OwnedLuaProgram::new(
                 PathBuf::from("C:/scripts/drop-runtime.lua"),
                 b"while true do end".to_vec(),
@@ -5142,7 +5081,7 @@ assert(error.kind == "invalid_value")
                 .await
                 .expect("最后一个 Runtime 句柄释放后应完成终结")
                 .expect("终结器应返回终态"),
-            TrustedLuaRuntimeTermination::Cancelled
+            ()
         );
         let (runtime, finalization) = execution.await.into_parts();
         assert!(
@@ -5154,7 +5093,7 @@ assert(error.kind == "invalid_value")
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_interrupts_a_host_await_and_then_finalizes() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let started = Arc::new(Notify::new());
         let gate = Arc::new(Notify::new());
         let (completion, finalized) = oneshot::channel();
@@ -5169,11 +5108,11 @@ assert(error.kind == "invalid_value")
         let bindings = translate_bindings(
             calls,
             Box::new(TestFinalizer {
-                terminations: Arc::new(Mutex::new(Vec::new())),
+                finalizations: Arc::new(Mutex::new(Vec::new())),
                 completion: Some(completion),
             }),
         );
-        let handle = runtime.reserve().await.unwrap().start(
+        let handle = runtime.start(
             OwnedLuaProgram::new(
                 PathBuf::from("C:/scripts/host-await.lua"),
                 b"ctx.db.begin()".to_vec(),
@@ -5189,14 +5128,14 @@ assert(error.kind == "invalid_value")
                 .await
                 .expect("Host await 取消后应终结")
                 .expect("终结器应返回终态"),
-            TrustedLuaRuntimeTermination::Cancelled
+            ()
         );
         runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_waits_for_an_accepted_output_edit_before_finalizing() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let started = Arc::new(Notify::new());
         let gate = Arc::new(Notify::new());
         let observations = Arc::new(Mutex::new(TestObservations::default()));
@@ -5220,7 +5159,7 @@ assert(error.kind == "invalid_value")
             begin_started: Some(Arc::clone(&started)),
             begin_gate: Some(Arc::clone(&gate)),
         });
-        let handle = runtime.reserve().await.unwrap().start(
+        let handle = runtime.start(
             OwnedLuaProgram::new(
                 PathBuf::from("C:/scripts/gated-write.lua"),
                 b"ctx.output.write('data/gated.bin', 'finished')".to_vec(),
@@ -5228,7 +5167,7 @@ assert(error.kind == "invalid_value")
             write_back_bindings(
                 calls,
                 Box::new(TestFinalizer {
-                    terminations: Arc::new(Mutex::new(Vec::new())),
+                    finalizations: Arc::new(Mutex::new(Vec::new())),
                     completion: Some(completion),
                 }),
             ),
@@ -5251,7 +5190,7 @@ assert(error.kind == "invalid_value")
                 .await
                 .expect("候选写入终结后应完成 finalization")
                 .expect("finalizer 应交还终态"),
-            TrustedLuaRuntimeTermination::Cancelled
+            ()
         );
         assert_eq!(
             observations
@@ -5265,8 +5204,8 @@ assert(error.kind == "invalid_value")
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_vm_only_exposes_llm_in_translate_and_output_in_write_back() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
-        let terminations = Arc::new(Mutex::new(Vec::new()));
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let finalizations = Arc::new(Mutex::new(Vec::new()));
         let extract_calls = Arc::new(TestCalls {
             panic_on_project: false,
             project: test_project(),
@@ -5275,11 +5214,7 @@ assert(error.kind == "invalid_value")
             begin_started: None,
             begin_gate: None,
         });
-        let extract = runtime
-            .reserve()
-            .await
-            .unwrap()
-            .start(
+        let extract = runtime.start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/extract.lua"),
                     b"assert(ctx.phase == 'extract'); assert(ctx.llm == nil); assert(ctx.translation == nil); assert(ctx.output == nil); assert(ctx.write_back == nil); assert(ctx.project.output_root == nil); assert(type(ctx.source) == 'table'); assert(type(ctx.mz) == 'table')".to_vec(),
@@ -5287,7 +5222,7 @@ assert(error.kind == "invalid_value")
                 extract_bindings(
                     extract_calls,
                     Box::new(TestFinalizer {
-                        terminations: Arc::clone(&terminations),
+                        finalizations: Arc::clone(&finalizations),
                         completion: None,
                     }),
                 ),
@@ -5316,9 +5251,6 @@ assert(error.kind == "invalid_value")
             begin_gate: None,
         });
         let write_back = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/write.lua"),
@@ -5365,7 +5297,7 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
                 write_back_bindings(
                     write_back_calls,
                     Box::new(TestFinalizer {
-                        terminations: Arc::clone(&terminations),
+                        finalizations: Arc::clone(&finalizations),
                         completion: None,
                     }),
                 ),
@@ -5409,20 +5341,14 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
                 ]
             );
         }
-        assert_eq!(
-            *terminations.lock().unwrap(),
-            vec![
-                TrustedLuaRuntimeTermination::Completed,
-                TrustedLuaRuntimeTermination::Completed,
-            ]
-        );
+        assert_eq!(*finalizations.lock().unwrap(), vec![(), ()]);
         runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_panic_is_isolated_and_still_runs_the_unique_finalizer() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
-        let terminations = Arc::new(Mutex::new(Vec::new()));
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let finalizations = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(TestCalls {
             panic_on_project: true,
             project: test_project(),
@@ -5432,9 +5358,6 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
             begin_gate: None,
         });
         let report = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/panic.lua"),
@@ -5443,7 +5366,7 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
                 extract_bindings(
                     calls,
                     Box::new(TestFinalizer {
-                        terminations: Arc::clone(&terminations),
+                        finalizations: Arc::clone(&finalizations),
                         completion: None,
                     }),
                 ),
@@ -5455,16 +5378,13 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
             Err(TrustedLuaRuntimeExecutionError::WorkerPanicked)
         ));
         finalization.unwrap();
-        assert_eq!(
-            *terminations.lock().unwrap(),
-            [TrustedLuaRuntimeTermination::Failed]
-        );
+        assert_eq!(*finalizations.lock().unwrap(), [()]);
         runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn synchronous_finalizer_panic_becomes_a_cleanup_report() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let calls = Arc::new(TestCalls {
             panic_on_project: false,
             project: test_project(),
@@ -5474,9 +5394,6 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
             begin_gate: None,
         });
         let report = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/finalizer-panic.lua"),
@@ -5499,11 +5416,8 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
             "return { value = 'loaded' }",
         )
         .unwrap();
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let report = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     directory.path().join("main.lua"),
@@ -5541,7 +5455,7 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
             std::fs::copy(&library, module_directory.join(name)).unwrap();
         }
 
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let script = r#"
 assert(#package.searchers == 4)
 assert(require("unicode_native") == true)
@@ -5552,9 +5466,6 @@ assert(not ok)
 assert(string.find(tostring(error), "luaopen_wrong_symbol", 1, true))
 "#;
         let report = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     module_directory.join("main.lua"),
@@ -5608,11 +5519,8 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configured_vm_memory_limit_rejects_excessive_allocation() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let report = runtime
-            .reserve()
-            .await
-            .unwrap()
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/memory.lua"),
@@ -5633,31 +5541,61 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
         runtime.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn reservations_apply_worker_plus_queue_backpressure() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
-        let first = runtime.reserve().await.unwrap();
-        let second = runtime.reserve().await.unwrap();
-        let mut third = Box::pin(runtime.reserve());
-        assert!(matches!(futures_util::poll!(&mut third), Poll::Pending));
-        drop(first);
-        let third = third.await.unwrap();
-        drop(second);
-        drop(third);
-        runtime.shutdown().await.unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cancels_an_accepted_script_and_waits_for_finalization() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let (completion, mut finalized) = oneshot::channel();
+        let execution = runtime.start(
+            OwnedLuaProgram::new(
+                PathBuf::from("C:/scripts/shutdown.lua"),
+                b"while true do end".to_vec(),
+            ),
+            test_bindings(
+                None,
+                Arc::new(Mutex::new(TestObservations::default())),
+                Arc::new(Mutex::new(Vec::new())),
+                Some(completion),
+            ),
+        );
+        let shutdown_runtime = runtime.clone();
+        let shutdown = tokio::spawn(async move { shutdown_runtime.shutdown().await });
+
+        shutdown.await.unwrap().unwrap();
+        assert_eq!(finalized.try_recv(), Ok(()));
+        let (execution, _) = execution.await.into_parts();
+        assert!(
+            matches!(execution, Err(TrustedLuaRuntimeExecutionError::Cancelled)),
+            "shutdown 后的脚本终态应为取消，实际为 {execution:?}"
+        );
     }
 
-    #[tokio::test]
-    async fn shutdown_waits_for_a_granted_reservation_to_be_released() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current()).unwrap();
-        let reservation = runtime.reserve().await.unwrap();
-        let shutdown_runtime = runtime.clone();
-        let mut shutdown = tokio::spawn(async move { shutdown_runtime.shutdown().await });
-
-        tokio::task::yield_now().await;
-        assert!(matches!(futures_util::poll!(&mut shutdown), Poll::Pending));
-
-        drop(reservation);
-        shutdown.await.unwrap().unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_after_shutdown_still_finalizes_the_owned_bindings() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        runtime.shutdown().await.unwrap();
+        let finalizations = Arc::new(Mutex::new(Vec::new()));
+        let report = runtime
+            .start(
+                OwnedLuaProgram::new(
+                    PathBuf::from("C:/scripts/rejected.lua"),
+                    b"return true".to_vec(),
+                ),
+                test_bindings(
+                    None,
+                    Arc::new(Mutex::new(TestObservations::default())),
+                    Arc::clone(&finalizations),
+                    None,
+                ),
+            )
+            .await;
+        let (execution, finalization) = report.into_parts();
+        assert!(matches!(
+            execution,
+            Err(TrustedLuaRuntimeExecutionError::Unavailable(
+                TrustedLua54RuntimeError::ShuttingDown
+            ))
+        ));
+        finalization.unwrap();
+        assert_eq!(*finalizations.lock().unwrap(), [()]);
     }
 }

@@ -1,7 +1,4 @@
-//! 进程内一次业务运行的合作式取消状态。
-
-use std::error::Error;
-use std::fmt;
+//! 进程内一次业务运行的合作式取消状态与正常终态。
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -22,27 +19,14 @@ impl CooperativeCancellation {
     pub(crate) fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
-
-    pub(crate) fn check(&self) -> Result<(), OperationCancelled> {
-        if self.is_requested() {
-            Err(OperationCancelled)
-        } else {
-            Ok(())
-        }
-    }
 }
 
-/// 当前运行已收到合作式取消请求。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct OperationCancelled;
-
-impl fmt::Display for OperationCancelled {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("运行已收到合作式取消请求")
-    }
+/// 一次业务操作已经完成，或在继续派生工作前正常响应了合作式取消。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OperationCompletion<T> {
+    Completed(T),
+    Cancelled,
 }
-
-impl Error for OperationCancelled {}
 
 #[cfg(test)]
 mod tests {
@@ -52,11 +36,17 @@ mod tests {
     fn cancellation_is_shared_and_monotonic() {
         let first = CooperativeCancellation::default();
         let second = first.clone();
-        assert!(first.check().is_ok());
+        assert!(!first.is_requested());
 
         second.request();
 
-        assert_eq!(first.check(), Err(OperationCancelled));
+        assert!(first.is_requested());
         assert!(second.is_requested());
+    }
+
+    #[test]
+    fn completion_expresses_cancellation_as_data() {
+        let completion: OperationCompletion<usize> = OperationCompletion::Cancelled;
+        assert_eq!(completion, OperationCompletion::Cancelled);
     }
 }

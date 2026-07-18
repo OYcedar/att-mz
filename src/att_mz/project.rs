@@ -17,9 +17,7 @@ use crate::storage::file_system::{
     DirectoryTreeRoot, ExistingDirectoryResolver, ResolveDirectoryError,
 };
 
-pub use crate::project_database::{
-    MaxFullwidthChars, MaxFullwidthCharsError, MzWriteBackLayoutProfile,
-};
+pub(crate) use crate::project_database::{MaxFullwidthChars, MzWriteBackLayoutProfile};
 
 /// 已由项目开启边界建立、可供 MZ 各用例直接信任的项目上下文。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -476,14 +474,6 @@ mod tests {
         assert_eq!(
             opened.layout().source_js(),
             Path::new("C:/att/projects/游戏 一/source/js")
-        );
-        assert_eq!(
-            opened.layout().write_back_data(),
-            Path::new("C:/att/projects/游戏 一/write_back/data")
-        );
-        assert_eq!(
-            opened.layout().write_back_js(),
-            Path::new("C:/att/projects/游戏 一/write_back/js")
         );
         assert_eq!(opened.source_language(), "ja");
         assert_eq!(opened.target_language(), "zh-Hans");

@@ -240,10 +240,10 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert!(stale_requests.finish().is_empty());
     assert_eq!(stale_translate.status.code(), Some(1));
     assert!(stale_translate.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&stale_translate.stderr).contains("标准资产提取已过期：builtin"),
-        "来源变化后必须先刷新 active owner：{}",
-        String::from_utf8_lossy(&stale_translate.stderr)
+    assert_eq!(
+        String::from_utf8_lossy(&stale_translate.stderr),
+        "命令失败：项目状态损坏或提取过期\n",
+        "来源变化后必须先刷新 active owner，用户界面只呈现稳定错误类别"
     );
 
     let refreshed_extract = run_att(
@@ -404,9 +404,10 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     );
     assert_eq!(failed.status.code(), Some(1));
     assert!(failed.stdout.is_empty(), "命令失败不得打印成功文案");
-    assert!(
-        String::from_utf8_lossy(&failed.stderr).contains("missing-profile"),
-        "失败应呈现未找到的 Profile"
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stderr),
+        "配置或输入错误\n",
+        "配置失败只呈现稳定用户类别，不泄漏内部选择器诊断"
     );
     for (phase, output) in [
         ("init", &init),
@@ -809,7 +810,6 @@ max_single_file_bytes = 8388608
 timeout_ms = 5000
 
 [runtime.filesystem.publisher]
-max_prepared_candidates = 2
 max_recovery_artifacts_per_target = 8
 target_lock_timeout_ms = 5000
 
@@ -817,9 +817,6 @@ target_lock_timeout_ms = 5000
 short_worker_threads = 2
 short_queue_capacity = 32
 max_open_connections = 8
-max_interactive_sessions = 2
-interactive_open_queue_capacity = 4
-interactive_command_queue_capacity = 16
 worker_stack_bytes = 2097152
 max_statement_bytes = 262144
 max_parameter_bytes = 1048576
@@ -852,8 +849,6 @@ burst = 4
 parameters = '''{parameters}'''
 
 [runtime.lua]
-worker_threads = 1
-queue_capacity = 4
 worker_stack_bytes = 4194304
 memory_limit_bytes_per_vm = 33554432
 cancel_check_instruction_interval = 1000
@@ -867,14 +862,7 @@ max_depth = 64
 [observability]
 root = "logs"
 
-[observability.translation]
-queue_capacity = 16
-lock_timeout_ms = 5000
-max_record_bytes = 1048576
-max_file_bytes = 8388608
-retained_rotated_files = 2
-
-[observability.write_back]
+[observability.audit]
 queue_capacity = 16
 lock_timeout_ms = 5000
 max_record_bytes = 1048576
@@ -1325,81 +1313,112 @@ fn assert_updated_written_game(workspace: &Path, output_root: &Path) {
 }
 
 fn assert_json_lines(log_root: &Path, output_root: &Path) {
-    let (translation_raw, translation_lines) = read_json_lines(&log_root.join("translation.jsonl"));
-    assert_eq!(translation_lines.len(), 3);
-    let summary = translation_lines
+    let (audit_raw, records) = read_json_lines(&log_root.join("audit.jsonl"));
+    assert!(records.len() >= 16, "初始五次运行必须形成完整生命周期审计");
+    for record in &records {
+        assert_eq!(record["project"], PROJECT);
+        assert_uuid_v4(record["event_id"].as_str().expect("event_id 应为字符串"));
+        assert_uuid_v4(record["run_id"].as_str().expect("run_id 应为字符串"));
+    }
+
+    let task = records
         .iter()
-        .find(|line| line["event"] == "run_completed")
-        .expect("Translation JSONL 应包含汇总事件");
-    let successful_run_id = summary["run_id"]
+        .find(|record| {
+            record["command"] == "translate"
+                && record["event"] == "translation_task_finished"
+                && record["payload"]["result"]["task"]["provider_request_id"] == "request-e2e"
+        })
+        .expect("审计账本应包含成功翻译任务终态");
+    let successful_run_id = task["run_id"].as_str().expect("成功翻译 run_id 应为字符串");
+    let successful_operation_id = task["payload"]["operation_id"]
         .as_str()
-        .expect("Translation 汇总 run_id 应为字符串");
-    let task = translation_lines
+        .expect("成功翻译 operation_id 应为字符串");
+    assert_uuid_v4(successful_operation_id);
+    assert!(records.iter().any(|record| {
+        record["run_id"] == successful_run_id
+            && record["event"] == "translation_task_started"
+            && record["payload"]["operation_id"] == successful_operation_id
+    }));
+    let task_wire = &task["payload"]["result"]["task"];
+    assert_eq!(task["profile"], PROFILE);
+    assert_eq!(task["payload"]["result"]["kind"], "completed");
+    assert_eq!(task_wire["status"]["kind"], "complete");
+    assert_eq!(task_wire["provider_request_id"], "request-e2e");
+    assert_eq!(task_wire["provider_response_id"], "response-e2e");
+    assert_eq!(task_wire["finish_reason"], "stop");
+    assert_eq!(task_wire["final_response_usage"]["prompt_tokens"], 11);
+    assert_eq!(task_wire["final_response_usage"]["completion_tokens"], 3);
+    assert_eq!(task_wire["final_response_usage"]["total_tokens"], 14);
+    assert_eq!(task_wire["confirmed_written_locations"], 1);
+    assert!(records.iter().any(|record| {
+        record["run_id"] == successful_run_id
+            && record["event"] == "run_finished"
+            && record["payload"]["outcome"]["kind"] == "succeeded"
+    }));
+
+    let cancelled_task = records
         .iter()
-        .find(|line| line["event"] == "task_processed" && line["run_id"] == successful_run_id)
-        .expect("Translation JSONL 应包含成功运行的任务事件");
-    let cancelled_task = translation_lines
-        .iter()
-        .find(|line| line["event"] == "task_processed" && line["run_id"] != successful_run_id)
+        .find(|record| {
+            record["command"] == "translate"
+                && record["event"] == "translation_task_finished"
+                && record["run_id"] != successful_run_id
+        })
         .expect("合作取消前已接管的任务也应记录明确终态");
-    assert_eq!(cancelled_task["task"]["status"]["kind"], "unavailable");
     assert_eq!(
-        cancelled_task["task"]["status"]["reason"]["kind"],
+        cancelled_task["payload"]["result"]["task"]["status"]["kind"],
+        "unavailable"
+    );
+    assert_eq!(
+        cancelled_task["payload"]["result"]["task"]["status"]["reason"]["kind"],
         "all_outputs_rejected"
     );
-    assert!(
-        translation_lines.iter().all(|line| {
-            line["event"] != "run_completed" || line["run_id"] == successful_run_id
-        }),
-        "取消运行不得伪造完成汇总"
-    );
-    assert_eq!(task["project"], PROJECT);
-    assert_eq!(task["profile"], PROFILE);
-    assert_eq!(task["task"]["status"]["kind"], "complete");
-    assert_eq!(task["task"]["provider_request_id"], "request-e2e");
-    assert_eq!(task["task"]["provider_response_id"], "response-e2e");
-    assert_eq!(task["task"]["finish_reason"], "stop");
-    assert_eq!(task["task"]["final_response_usage"]["prompt_tokens"], 11);
-    assert_eq!(task["task"]["final_response_usage"]["completion_tokens"], 3);
-    assert_eq!(task["task"]["final_response_usage"]["total_tokens"], 14);
-    assert_eq!(task["task"]["confirmed_written_locations"], 1);
-    assert_eq!(summary["summary"]["written_locations"], 1);
-    assert_eq!(summary["summary"]["unresolved_locations"], 0);
-    let translation_run_id = task["run_id"].as_str().expect("run_id 应为字符串");
-    assert_uuid_v4(translation_run_id);
-    assert_eq!(summary["run_id"], translation_run_id);
-    assert!(!translation_raw.contains(SOURCE_TEXT));
-    assert!(!translation_raw.contains(TRANSLATION));
-    assert!(!translation_raw.contains("messages"));
-    assert!(!translation_raw.contains(API_KEY));
-    assert!(!translation_raw.contains(E2E_EXTRA_SECRET));
+    let cancelled_run_id = cancelled_task["run_id"]
+        .as_str()
+        .expect("取消运行 run_id 应为字符串");
+    assert!(records.iter().any(|record| {
+        record["run_id"] == cancelled_run_id
+            && record["event"] == "run_finished"
+            && record["payload"]["outcome"]["kind"] == "interrupted"
+    }));
 
-    let (write_back_raw, write_back_lines) = read_json_lines(&log_root.join("write_back.jsonl"));
-    assert_eq!(write_back_lines.len(), 1);
-    let write_back = &write_back_lines[0];
-    assert_eq!(write_back["event"], "run_completed");
-    assert_eq!(write_back["project"], PROJECT);
-    assert!(write_back.get("profile").is_none());
+    let write_back = records
+        .iter()
+        .find(|record| {
+            record["command"] == "write_back"
+                && record["event"] == "write_back_publish_finished"
+                && record["payload"]["result"]["kind"] == "published"
+        })
+        .expect("审计账本应包含写回发布终态");
+    assert!(write_back["profile"].is_null());
+    let write_back_wire = &write_back["payload"]["result"]["write_back"];
     assert_eq!(
-        write_back["layout_profile"]["dialogue_body_max_fullwidth_chars"],
+        write_back_wire["layout_profile"]["dialogue_body_max_fullwidth_chars"],
         24
     );
     assert_eq!(
-        write_back["layout_profile"]["scrolling_text_max_fullwidth_chars"],
+        write_back_wire["layout_profile"]["scrolling_text_max_fullwidth_chars"],
         30
     );
     assert_eq!(
-        write_back["layout_profile"]["help_description_max_fullwidth_chars"],
+        write_back_wire["layout_profile"]["help_description_max_fullwidth_chars"],
         40
     );
-    assert_eq!(write_back["summary"]["translated_locations"], 1);
-    assert_eq!(write_back["summary"]["original_locations"], 0);
-    assert_eq!(write_back["manual_layout_diagnostics"], json!([]));
+    assert_eq!(write_back_wire["summary"]["translated_locations"], 1);
+    assert_eq!(write_back_wire["summary"]["original_locations"], 0);
+    assert_eq!(write_back_wire["manual_layout_diagnostics"], json!([]));
     let write_back_run_id = write_back["run_id"].as_str().expect("run_id 应为字符串");
-    assert_uuid_v4(write_back_run_id);
-    assert_ne!(write_back_run_id, translation_run_id);
+    assert_ne!(write_back_run_id, successful_run_id);
+    let write_back_operation_id = write_back["payload"]["operation_id"]
+        .as_str()
+        .expect("写回 operation_id 应为字符串");
+    assert_uuid_v4(write_back_operation_id);
+    assert!(records.iter().any(|record| {
+        record["run_id"] == write_back_run_id
+            && record["event"] == "write_back_publish_started"
+            && record["payload"]["operation_id"] == write_back_operation_id
+    }));
     let logged_output = PathBuf::from(
-        write_back["output_root"]
+        write_back_wire["output_root"]
             .as_str()
             .expect("output_root 应为字符串"),
     );
@@ -1407,10 +1426,11 @@ fn assert_json_lines(log_root: &Path, output_root: &Path) {
         fs::canonicalize(logged_output).expect("日志输出目录应存在"),
         fs::canonicalize(output_root).expect("预期输出目录应存在")
     );
-    assert!(!write_back_raw.contains(SOURCE_TEXT));
-    assert!(!write_back_raw.contains(TRANSLATION));
-    assert!(!write_back_raw.contains(API_KEY));
-    assert!(!write_back_raw.contains(E2E_EXTRA_SECRET));
+    assert!(!audit_raw.contains(SOURCE_TEXT));
+    assert!(!audit_raw.contains(TRANSLATION));
+    assert!(!audit_raw.contains("messages"));
+    assert!(!audit_raw.contains(API_KEY));
+    assert!(!audit_raw.contains(E2E_EXTRA_SECRET));
 }
 
 fn read_json_lines(path: &Path) -> (String, Vec<Value>) {
@@ -1426,16 +1446,24 @@ fn read_json_lines(path: &Path) -> (String, Vec<Value>) {
 }
 
 fn assert_last_write_back_log(log_root: &Path, help_width: u64, lua_executed: bool) {
-    let (_, records) = read_json_lines(&log_root.join("write_back.jsonl"));
-    let record = records.last().expect("至少应有一条 WriteBack 日志");
-    assert_eq!(record["event"], "run_completed");
+    let (_, records) = read_json_lines(&log_root.join("audit.jsonl"));
+    let record = records
+        .iter()
+        .rev()
+        .find(|record| {
+            record["command"] == "write_back"
+                && record["event"] == "write_back_publish_finished"
+                && record["payload"]["result"]["kind"] == "published"
+        })
+        .expect("至少应有一条已确认发布的 WriteBack 审计记录");
+    let write_back = &record["payload"]["result"]["write_back"];
     assert_eq!(
-        record["layout_profile"]["help_description_max_fullwidth_chars"],
+        write_back["layout_profile"]["help_description_max_fullwidth_chars"],
         help_width
     );
-    assert_eq!(record["lua_executed"], lua_executed);
+    assert_eq!(write_back["lua_executed"], lua_executed);
     assert_eq!(
-        record["manual_layout_diagnostics"]
+        write_back["manual_layout_diagnostics"]
             .as_array()
             .expect("人工布局诊断必须是数组")
             .len(),

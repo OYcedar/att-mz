@@ -23,21 +23,22 @@ use async_channel::{Receiver, Sender};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use windows_sys::Win32::Globalization::{LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
 use crate::fingerprint::Sha256Fingerprint;
 use crate::storage::file_system::{
-    BoundScopedDirectory, DIRECTORY_PUBLISH_LOCK_NAMESPACE, DirectoryDiscardError, DirectoryEntry,
-    DirectoryEntryKind, DirectoryFileOverlay, DirectoryLister, DirectoryPrepareError,
-    DirectoryPublishError, DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+    BoundScopedDirectory, DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind,
+    DirectoryFileOverlay, DirectoryLister, DirectoryPrepareError, DirectoryPublishError,
+    DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
     DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
-    ExistingDirectoryResolver, FileReader, ListDirectoryError, ProjectOperationLease,
-    ProjectOperationLeaseError, ProjectOperationLeaseProvider, ProjectOperationLeaseRequest,
-    ReadFile, ReadFileError, RecoverableDirectoryPublisher, ResolveDirectoryError,
-    ScopedDirectoryBindError, ScopedDirectoryEditError, ScopedDirectoryEditor,
-    ScopedDirectoryEntry, ScopedDirectoryEntryKind, ScopedDirectoryPath, StagedDirectory,
+    ExclusiveFileLease, ExclusiveFileLeaseError, ExclusiveFileLeaseProvider,
+    ExclusiveFileLeaseRequest, ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile,
+    ReadFileError, RecoverableDirectoryPublisher, ResolveDirectoryError, ScopedDirectoryBindError,
+    ScopedDirectoryEditError, ScopedDirectoryEditor, ScopedDirectoryEntry,
+    ScopedDirectoryEntryKind, ScopedDirectoryPath, ScopedDirectoryScope, StagedDirectory,
     StagingCleanupFailure,
 };
 use sha2::{Digest, Sha256};
@@ -51,9 +52,8 @@ use super::windows::{
     validate_local_case_insensitive_ntfs_directory, windows_names_equal,
 };
 
-const RESERVED_PREFIX: &str = ".att-dirpub-";
-const PROJECT_OPERATION_LOCK_NAMESPACE: &str = ".att-project-locks";
-const DIRECTORY_TREE_FINGERPRINT_DOMAIN: &[u8] = b"att.directory-tree";
+const RESERVED_PREFIX: &str = ".directory-publish-";
+const DIRECTORY_TREE_FINGERPRINT_DOMAIN: &[u8] = b"directory-tree-fingerprint";
 const JOURNAL_MAX_BYTES: usize = 1024 * 1024;
 
 #[cfg(test)]
@@ -129,7 +129,7 @@ fn injected_publish_error(operation: &'static str, path: &Path) -> SystemFileSys
     io_error(operation, path, io::Error::other("测试注入的目录发布故障"))
 }
 
-/// 文件与目录候选根使用的全部资源预算。
+/// 通用文件读取、目录观察和独占文件租约使用的资源预算。
 #[derive(Clone, Debug)]
 pub(crate) struct SystemFileSystemConfig {
     worker_threads: usize,
@@ -137,8 +137,7 @@ pub(crate) struct SystemFileSystemConfig {
     max_read_bytes: u64,
     max_directory_entries: usize,
     tree: TreeBudget,
-    project_lock: ProjectLockConfig,
-    publisher: DirectoryPublisherConfig,
+    exclusive_file_lease: ExclusiveFileLeaseConfig,
 }
 
 impl SystemFileSystemConfig {
@@ -149,8 +148,7 @@ impl SystemFileSystemConfig {
         max_read_bytes: u64,
         max_directory_entries: usize,
         tree: TreeBudget,
-        project_lock: ProjectLockConfig,
-        publisher: DirectoryPublisherConfig,
+        exclusive_file_lease: ExclusiveFileLeaseConfig,
     ) -> Result<Self, SystemFileSystemBuildError> {
         if worker_threads == 0 {
             return Err(SystemFileSystemBuildError::InvalidConfiguration(
@@ -178,8 +176,7 @@ impl SystemFileSystemConfig {
             max_read_bytes,
             max_directory_entries,
             tree,
-            project_lock,
-            publisher,
+            exclusive_file_lease,
         })
     }
 }
@@ -219,44 +216,49 @@ impl TreeBudget {
     }
 }
 
-/// 项目级跨进程租约的等待策略。
+/// 通用跨进程独占文件租约的等待策略。
 #[derive(Clone, Debug)]
-pub(crate) struct ProjectLockConfig {
+pub(crate) struct ExclusiveFileLeaseConfig {
     timeout: Duration,
 }
 
-impl ProjectLockConfig {
+impl ExclusiveFileLeaseConfig {
     pub(crate) fn new(timeout: Duration) -> Result<Self, SystemFileSystemBuildError> {
         if timeout.is_zero() {
             return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "项目操作锁超时必须大于零",
+                "独占文件租约超时必须大于零",
             ));
         }
         Ok(Self { timeout })
     }
 }
 
-/// 一次完整候选的并发与恢复预算。
+/// 目录发布的恢复产物预算与目标锁等待策略。
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryPublisherConfig {
-    max_prepared_candidates: usize,
+    lock_directory: PathBuf,
     max_recovery_artifacts_per_target: usize,
     target_lock_timeout: Duration,
 }
 
 impl DirectoryPublisherConfig {
     pub(crate) fn new(
-        max_prepared_candidates: usize,
+        lock_directory: PathBuf,
         max_recovery_artifacts_per_target: usize,
         target_lock_timeout: Duration,
     ) -> Result<Self, SystemFileSystemBuildError> {
-        if max_prepared_candidates == 0 || max_recovery_artifacts_per_target == 0 {
+        if lock_directory.as_os_str().is_empty() {
             return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "目录发布的候选数与恢复产物预算必须全部大于零",
+                "目录发布锁目录不能为空",
+            ));
+        }
+        if max_recovery_artifacts_per_target == 0 {
+            return Err(SystemFileSystemBuildError::InvalidConfiguration(
+                "目录发布恢复产物预算必须大于零",
             ));
         }
         Ok(Self {
-            max_prepared_candidates,
+            lock_directory,
             max_recovery_artifacts_per_target,
             target_lock_timeout,
         })
@@ -464,7 +466,7 @@ impl FileWorkPool {
         for index in 0..worker_threads {
             let receiver = receiver.clone();
             let worker = match thread::Builder::new()
-                .name(format!("att-filesystem-{index}"))
+                .name(format!("filesystem-worker-{index}"))
                 .spawn(move || file_worker(receiver))
             {
                 Ok(worker) => worker,
@@ -545,7 +547,7 @@ impl FileWorkPool {
         };
         let (sender, receiver) = async_channel::bounded(1);
         thread::Builder::new()
-            .name("att-filesystem-join".to_owned())
+            .name("filesystem-join".to_owned())
             .spawn(move || {
                 let clean = workers.into_iter().all(|worker| worker.join().is_ok());
                 let _ = sender.send_blocking(clean);
@@ -562,40 +564,6 @@ impl FileWorkPool {
 fn file_worker(receiver: Receiver<FileJob>) {
     while let Ok(job) = receiver.recv_blocking() {
         let _ = catch_unwind(AssertUnwindSafe(job));
-    }
-}
-
-#[derive(Default)]
-struct PermitState {
-    active: usize,
-}
-
-struct PreparedPermitPool {
-    limit: usize,
-    state: Mutex<PermitState>,
-}
-
-impl PreparedPermitPool {
-    fn try_acquire(self: &Arc<Self>) -> Option<PreparedPermit> {
-        let mut state = self.state.lock().expect("候选许可锁不应中毒");
-        if state.active >= self.limit {
-            return None;
-        }
-        state.active += 1;
-        Some(PreparedPermit {
-            pool: Arc::clone(self),
-        })
-    }
-}
-
-struct PreparedPermit {
-    pool: Arc<PreparedPermitPool>,
-}
-
-impl Drop for PreparedPermit {
-    fn drop(&mut self) {
-        let mut state = self.pool.state.lock().expect("候选许可锁不应中毒");
-        state.active -= 1;
     }
 }
 
@@ -708,7 +676,6 @@ pub(crate) struct SystemStagingState {
     journal_path: PathBuf,
     backup_path: PathBuf,
     cleanup: StageCleanupGuard,
-    _permit: PreparedPermit,
     abandoned_before_delivery: bool,
     finalized: bool,
 }
@@ -745,30 +712,41 @@ pub(crate) struct SystemFileSystem {
 struct SystemFileSystemInner {
     pool: FileWorkPool,
     config: SystemFileSystemConfig,
-    publisher_identity: Arc<()>,
-    prepared_permits: Arc<PreparedPermitPool>,
 }
 
 impl SystemFileSystem {
     pub(crate) fn new(config: SystemFileSystemConfig) -> Result<Self, SystemFileSystemBuildError> {
         let pool = FileWorkPool::new(config.worker_threads, config.queue_capacity)?;
-        let prepared_permits = Arc::new(PreparedPermitPool {
-            limit: config.publisher.max_prepared_candidates,
-            state: Mutex::new(PermitState::default()),
-        });
         Ok(Self {
-            inner: Arc::new(SystemFileSystemInner {
-                pool,
-                config,
-                publisher_identity: Arc::new(()),
-                prepared_permits,
-            }),
+            inner: Arc::new(SystemFileSystemInner { pool, config }),
         })
+    }
+
+    /// 按调用方实际需要的发布配置建立目录发布能力。
+    pub(crate) fn directory_publisher(
+        &self,
+        config: DirectoryPublisherConfig,
+    ) -> SystemDirectoryPublisher {
+        SystemDirectoryPublisher {
+            inner: Arc::clone(&self.inner),
+            config,
+            publisher_identity: Arc::new(()),
+        }
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), SystemFileSystemError> {
         self.inner.pool.shutdown().await
     }
+}
+
+/// 目录候选、受限编辑和可恢复发布组成的单一能力实例。
+///
+/// 实例身份同时约束候选 token 和编辑句柄，防止它们被其他发布器终结或修改。
+#[derive(Clone)]
+pub(crate) struct SystemDirectoryPublisher {
+    inner: Arc<SystemFileSystemInner>,
+    config: DirectoryPublisherConfig,
+    publisher_identity: Arc<()>,
 }
 
 impl ExistingDirectoryResolver for SystemFileSystem {
@@ -858,7 +836,7 @@ impl FileReader for SystemFileSystem {
     }
 }
 
-impl ScopedDirectoryEditor for SystemFileSystem {
+impl ScopedDirectoryEditor for SystemDirectoryPublisher {
     type CandidateState = SystemStagingState;
     type ScopeState = SystemScopedDirectoryState;
     type Error = Box<SystemFileSystemError>;
@@ -866,6 +844,7 @@ impl ScopedDirectoryEditor for SystemFileSystem {
     fn bind_scoped_directory(
         &self,
         candidate: &StagedDirectory<Self::CandidateState>,
+        scope: ScopedDirectoryScope,
     ) -> impl std::future::Future<
         Output = Result<
             BoundScopedDirectory<Self::ScopeState>,
@@ -877,13 +856,14 @@ impl ScopedDirectoryEditor for SystemFileSystem {
         let candidate_state = candidate.state();
         let same_instance = Arc::ptr_eq(
             &candidate_state.publisher_identity,
-            &self.inner.publisher_identity,
+            &self.publisher_identity,
         );
         let finalized = candidate_state.finalized;
         let expected_identity = candidate_state.stage_identity;
-        let editor_identity = Arc::clone(&self.inner.publisher_identity);
+        let editor_identity = Arc::clone(&self.publisher_identity);
         let config = self.inner.config.clone();
         let inner = Arc::clone(&self.inner);
+        let verified_scope = scope.clone();
         async move {
             if !same_instance {
                 return Err(ScopedDirectoryBindError::WrongEditorInstance);
@@ -896,7 +876,12 @@ impl ScopedDirectoryEditor for SystemFileSystem {
             inner
                 .pool
                 .execute(move || {
-                    bind_scoped_directory_sync(&verified_root, expected_identity, &config)
+                    bind_scoped_directory_sync(
+                        &verified_root,
+                        expected_identity,
+                        &verified_scope,
+                        &config,
+                    )
                 })
                 .await
                 .map_err(|source| ScopedDirectoryBindError::Failed {
@@ -916,6 +901,7 @@ impl ScopedDirectoryEditor for SystemFileSystem {
                 })?;
             Ok(BoundScopedDirectory::new(
                 root,
+                scope,
                 SystemScopedDirectoryState {
                     editor_identity,
                     root_identity: expected_identity,
@@ -931,6 +917,7 @@ impl ScopedDirectoryEditor for SystemFileSystem {
     + Send
     + use<> {
         let context = scoped_root_context(self, scope);
+        let declared_scope = scope.scope().clone();
         async move {
             let (inner, root, root_identity) = context?;
             let config = inner.config.clone();
@@ -938,7 +925,9 @@ impl ScopedDirectoryEditor for SystemFileSystem {
             let error_root = root.clone();
             inner
                 .pool
-                .execute(move || validate_scoped_directory_sync(&root, root_identity, &config))
+                .execute(move || {
+                    validate_scoped_directory_sync(&root, root_identity, &declared_scope, &config)
+                })
                 .await
                 .map_err(|source| ScopedDirectoryEditError::Failed {
                     path: error_path.clone(),
@@ -1008,16 +997,38 @@ impl ScopedDirectoryEditor for SystemFileSystem {
         }
     }
 
+    fn list_scoped_root(
+        &self,
+        scope: &BoundScopedDirectory<Self::ScopeState>,
+    ) -> impl std::future::Future<
+        Output = Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Self::Error>>,
+    > + Send {
+        let context = scoped_root_context(self, scope);
+        async move {
+            let (inner, root, root_identity) = context?;
+            let limit = inner.config.max_directory_entries;
+            inner
+                .pool
+                .execute(move || list_scoped_root_sync(&root, root_identity, limit))
+                .await
+                .map_err(|source| ScopedDirectoryEditError::Failed {
+                    path: PathBuf::from("."),
+                    source: Box::new(source),
+                })?
+        }
+    }
+
     fn create_scoped_directory(
         &self,
         scope: &BoundScopedDirectory<Self::ScopeState>,
         path: ScopedDirectoryPath,
     ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
     {
+        let scope_root = scope.scope().is_scope_root(&path);
         let context = scoped_operation_context(self, scope, path);
         async move {
             let (inner, root, root_identity, relative, absolute) = context?;
-            if relative.is_scope_root() {
+            if scope_root {
                 return Err(ScopedDirectoryEditError::ScopeRootMutation {
                     path: relative.as_path().to_path_buf(),
                 });
@@ -1050,10 +1061,11 @@ impl ScopedDirectoryEditor for SystemFileSystem {
         bytes: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
     {
+        let scope_root = scope.scope().is_scope_root(&path);
         let context = scoped_operation_context(self, scope, path);
         async move {
             let (inner, root, root_identity, relative, absolute) = context?;
-            if relative.is_scope_root() {
+            if scope_root {
                 return Err(ScopedDirectoryEditError::ScopeRootMutation {
                     path: relative.as_path().to_path_buf(),
                 });
@@ -1086,10 +1098,11 @@ impl ScopedDirectoryEditor for SystemFileSystem {
         path: ScopedDirectoryPath,
     ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
     {
+        let scope_root = scope.scope().is_scope_root(&path);
         let context = scoped_operation_context(self, scope, path);
         async move {
             let (inner, root, root_identity, relative, absolute) = context?;
-            if relative.is_scope_root() {
+            if scope_root {
                 return Err(ScopedDirectoryEditError::ScopeRootMutation {
                     path: relative.as_path().to_path_buf(),
                 });
@@ -1120,56 +1133,58 @@ type ScopedOperationContext = (
 type ScopedRootContext = (Arc<SystemFileSystemInner>, PathBuf, FileIdentity);
 
 fn scoped_root_context(
-    file_system: &SystemFileSystem,
+    publisher: &SystemDirectoryPublisher,
     scope: &BoundScopedDirectory<SystemScopedDirectoryState>,
 ) -> Result<ScopedRootContext, ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     if !Arc::ptr_eq(
         &scope.state().editor_identity,
-        &file_system.inner.publisher_identity,
+        &publisher.publisher_identity,
     ) {
         return Err(ScopedDirectoryEditError::WrongEditorInstance);
     }
     Ok((
-        Arc::clone(&file_system.inner),
+        Arc::clone(&publisher.inner),
         scope.root().to_path_buf(),
         scope.state().root_identity,
     ))
 }
 
 fn scoped_operation_context(
-    file_system: &SystemFileSystem,
+    publisher: &SystemDirectoryPublisher,
     scope: &BoundScopedDirectory<SystemScopedDirectoryState>,
     relative: ScopedDirectoryPath,
 ) -> Result<ScopedOperationContext, ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
-    let (inner, root, root_identity) = scoped_root_context(file_system, scope)?;
+    if !scope.scope().contains(&relative) {
+        return Err(ScopedDirectoryEditError::OutsideScope {
+            path: relative.as_path().to_path_buf(),
+        });
+    }
+    let (inner, root, root_identity) = scoped_root_context(publisher, scope)?;
     let absolute = root.join(relative.as_path());
     Ok((inner, root, root_identity, relative, absolute))
 }
 
-impl ProjectOperationLeaseProvider for SystemFileSystem {
+impl ExclusiveFileLeaseProvider for SystemFileSystem {
     type Error = Box<SystemFileSystemError>;
     type LeaseState = ExclusiveFileLock;
 
-    fn acquire_project_operation_lease(
+    fn acquire_exclusive_file_lease(
         &self,
-        request: ProjectOperationLeaseRequest,
+        request: ExclusiveFileLeaseRequest,
     ) -> impl std::future::Future<
-        Output = Result<
-            ProjectOperationLease<Self::LeaseState>,
-            ProjectOperationLeaseError<Self::Error>,
-        >,
+        Output = Result<ExclusiveFileLease<Self::LeaseState>, ExclusiveFileLeaseError<Self::Error>>,
     > + Send {
         let inner = Arc::clone(&self.inner);
-        let timeout = self.inner.config.project_lock.timeout;
-        let project_directory_name = request.project_directory_name().to_os_string();
+        let timeout = self.inner.config.exclusive_file_lease.timeout;
+        let identity = request.identity().to_os_string();
         async move {
-            let failure_name = project_directory_name.clone();
+            let failure_identity = identity.clone();
             inner
                 .pool
-                .execute(move || acquire_project_operation_lease_sync(request, timeout))
+                .execute(move || acquire_exclusive_file_lease_sync(request, timeout))
                 .await
-                .map_err(|source| ProjectOperationLeaseError::Unavailable {
-                    project_directory_name: failure_name,
+                .map_err(|source| ExclusiveFileLeaseError::Unavailable {
+                    identity: failure_identity,
                     source: Box::new(source),
                 })?
         }
@@ -1206,7 +1221,7 @@ impl DirectoryTreeFingerprinter for SystemFileSystem {
     }
 }
 
-impl RecoverableDirectoryPublisher for SystemFileSystem {
+impl RecoverableDirectoryPublisher for SystemDirectoryPublisher {
     type Error = Box<SystemFileSystemError>;
     type StagingState = SystemStagingState;
 
@@ -1215,23 +1230,21 @@ impl RecoverableDirectoryPublisher for SystemFileSystem {
         request: DirectoryStageRequest,
     ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>> {
         let target_root = request.target_root().to_path_buf();
-        let Some(permit) = self.inner.prepared_permits.try_acquire() else {
-            return Err(DirectoryPrepareError::NotAttempted {
-                target_root,
-                source: Box::new(SystemFileSystemError::ResourceLimit {
-                    resource: "同时保留的目录候选数",
-                    limit: self.inner.config.publisher.max_prepared_candidates as u64,
-                    observed: self.inner.config.publisher.max_prepared_candidates as u64 + 1,
-                }),
-            });
-        };
-        let config = self.inner.config.clone();
-        let publisher_identity = Arc::clone(&self.inner.publisher_identity);
+        let system_config = self.inner.config.clone();
+        let publisher_config = self.config.clone();
+        let publisher_identity = Arc::clone(&self.publisher_identity);
         let error_target = target_root.clone();
         self.inner
             .pool
             .execute_with_abandon(
-                move || prepare_directory_sync(request, config, publisher_identity, permit),
+                move || {
+                    prepare_directory_sync(
+                        request,
+                        system_config,
+                        publisher_config,
+                        publisher_identity,
+                    )
+                },
                 |result| {
                     if let Ok(staged) = result {
                         staged.state_mut().mark_abandoned_before_delivery();
@@ -1250,12 +1263,12 @@ impl RecoverableDirectoryPublisher for SystemFileSystem {
         &self,
         staged: StagedDirectory<Self::StagingState>,
     ) -> Result<(), DirectoryPublishError<Self::Error>> {
-        let expected_identity = Arc::clone(&self.inner.publisher_identity);
-        let config = self.inner.config.clone();
+        let expected_identity = Arc::clone(&self.publisher_identity);
+        let system_config = self.inner.config.clone();
         let target_root = staged.target_root().to_path_buf();
         self.inner
             .pool
-            .execute(move || publish_directory_sync(staged, &expected_identity, &config))
+            .execute(move || publish_directory_sync(staged, &expected_identity, &system_config))
             .await
             .map_err(|source| DirectoryPublishError::OutcomeUnknown {
                 target_root,
@@ -1268,7 +1281,7 @@ impl RecoverableDirectoryPublisher for SystemFileSystem {
         &self,
         staged: StagedDirectory<Self::StagingState>,
     ) -> Result<(), DirectoryDiscardError<Self::Error>> {
-        let expected_identity = Arc::clone(&self.inner.publisher_identity);
+        let expected_identity = Arc::clone(&self.publisher_identity);
         let staging_root = staged.staging_root().to_path_buf();
         self.inner
             .pool
@@ -1521,14 +1534,16 @@ fn read_file_sync(
 fn bind_scoped_directory_sync(
     root: &Path,
     expected_identity: FileIdentity,
+    scope: &ScopedDirectoryScope,
     config: &SystemFileSystemConfig,
 ) -> Result<(), SystemFileSystemError> {
-    validate_scoped_directory_sync(root, expected_identity, config)
+    validate_scoped_directory_sync(root, expected_identity, scope, config)
 }
 
 fn validate_scoped_directory_sync(
     root: &Path,
     expected_identity: FileIdentity,
+    scope: &ScopedDirectoryScope,
     config: &SystemFileSystemConfig,
 ) -> Result<(), SystemFileSystemError> {
     validate_complete_candidate(root, expected_identity, config)?;
@@ -1538,41 +1553,26 @@ fn validate_scoped_directory_sync(
             path: root.to_path_buf(),
         });
     }
-    let resolved = pinned_root.resolved_path();
-    let mut found_data = false;
-    let mut found_js = false;
-    let mut count = 0usize;
-    for entry in
-        fs::read_dir(resolved).map_err(|source| io_error("列举候选编辑根", resolved, source))?
-    {
-        count += 1;
-        let entry = entry.map_err(|source| io_error("读取候选编辑根目录项", resolved, source))?;
-        let name = entry.file_name();
-        let path = entry.path();
-        let target = if name == OsStr::new("data") {
-            &mut found_data
-        } else if name == OsStr::new("js") {
-            &mut found_js
-        } else {
+    for (index, declared) in scope.roots().iter().enumerate() {
+        if scope.roots().iter().skip(index + 1).any(|other| {
+            windows_names_equal(
+                &declared.encode_wide().collect::<Vec<_>>(),
+                &other.encode_wide().collect::<Vec<_>>(),
+            )
+        }) {
             return Err(SystemFileSystemError::InvalidPath {
-                path,
-                reason: "写回候选根只允许 data 与 js 两个直接子目录",
-            });
-        };
-        let child = pin_directory_without_reparse(&path)?;
-        if !child.metadata()?.is_dir() || *target {
-            return Err(SystemFileSystemError::InvalidPath {
-                path,
-                reason: "写回候选顶层 data/js 结构无效",
+                path: root.to_path_buf(),
+                reason: "候选编辑范围包含 Windows 非大小写语义下重复的顶层目录",
             });
         }
-        *target = true;
-    }
-    if count != 2 || !found_data || !found_js {
-        return Err(SystemFileSystemError::InvalidPath {
-            path: root.to_path_buf(),
-            reason: "写回候选根必须恰好包含 data 与 js 两个直接子目录",
-        });
+        let path = pinned_root.resolved_path().join(declared);
+        let child = pin_directory_without_reparse(&path)?;
+        if !child.metadata()?.is_dir() {
+            return Err(SystemFileSystemError::InvalidPath {
+                path,
+                reason: "候选编辑范围根必须是普通目录",
+            });
+        }
     }
     Ok(())
 }
@@ -1787,6 +1787,86 @@ fn list_scoped_directory_sync(
                     reason: "候选编辑目录包含非普通文件系统对象",
                 },
             ));
+        };
+        entries.push(ScopedDirectoryEntry::new(name, kind));
+    }
+    entries.sort_by(|left, right| left.name().cmp(right.name()));
+    Ok(entries)
+}
+
+fn list_scoped_root_sync(
+    root: &Path,
+    root_identity: FileIdentity,
+    limit: usize,
+) -> Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
+    let pinned = pin_scoped_root(root, root_identity)?;
+    let resolved = pinned.resolved_path();
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(resolved).map_err(|source| ScopedDirectoryEditError::Failed {
+        path: PathBuf::from("."),
+        source: Box::new(io_error("列举候选根", resolved, source)),
+    })? {
+        if entries.len() == limit {
+            return Err(ScopedDirectoryEditError::Failed {
+                path: PathBuf::from("."),
+                source: Box::new(SystemFileSystemError::ResourceLimit {
+                    resource: "候选根直接条目数",
+                    limit: limit as u64,
+                    observed: limit as u64 + 1,
+                }),
+            });
+        }
+        let entry = entry.map_err(|source| ScopedDirectoryEditError::Failed {
+            path: PathBuf::from("."),
+            source: Box::new(io_error("读取候选根目录项", resolved, source)),
+        })?;
+        let name = entry.file_name();
+        let child_path = entry.path();
+        validate_windows_name(&name, &child_path).map_err(|source| {
+            ScopedDirectoryEditError::Failed {
+                path: PathBuf::from("."),
+                source: Box::new(source),
+            }
+        })?;
+        let child = pin_path_without_reparse(&child_path).map_err(|source| {
+            ScopedDirectoryEditError::Failed {
+                path: PathBuf::from("."),
+                source: Box::new(source.into()),
+            }
+        })?;
+        let metadata = child
+            .metadata()
+            .map_err(|source| ScopedDirectoryEditError::Failed {
+                path: PathBuf::from("."),
+                source: Box::new(source.into()),
+            })?;
+        let kind = if metadata.is_dir() {
+            ScopedDirectoryEntryKind::Directory
+        } else if metadata.is_file() {
+            if number_of_links(child.file(), &child_path).map_err(|source| {
+                ScopedDirectoryEditError::Failed {
+                    path: PathBuf::from("."),
+                    source: Box::new(source.into()),
+                }
+            })? != 1
+            {
+                return Err(ScopedDirectoryEditError::Failed {
+                    path: PathBuf::from("."),
+                    source: Box::new(SystemFileSystemError::InvalidPath {
+                        path: child_path,
+                        reason: "候选编辑拒绝硬链接文件",
+                    }),
+                });
+            }
+            ScopedDirectoryEntryKind::File
+        } else {
+            return Err(ScopedDirectoryEditError::Failed {
+                path: PathBuf::from("."),
+                source: Box::new(SystemFileSystemError::InvalidPath {
+                    path: child_path,
+                    reason: "候选根包含非普通文件系统对象",
+                }),
+            });
         };
         entries.push(ScopedDirectoryEntry::new(name, kind));
     }
@@ -2106,38 +2186,28 @@ fn remove_scoped_path_sync(
     }
 }
 
-fn acquire_project_operation_lease_sync(
-    request: ProjectOperationLeaseRequest,
+fn acquire_exclusive_file_lease_sync(
+    request: ExclusiveFileLeaseRequest,
     timeout: Duration,
 ) -> Result<
-    ProjectOperationLease<ExclusiveFileLock>,
-    ProjectOperationLeaseError<Box<SystemFileSystemError>>,
+    ExclusiveFileLease<ExclusiveFileLock>,
+    ExclusiveFileLeaseError<Box<SystemFileSystemError>>,
 > {
-    let project_directory_name = request.project_directory_name().to_os_string();
+    let identity = request.identity().to_os_string();
     let result: Result<_, SystemFileSystemError> = (|| {
-        let projects_root = absolutize(request.projects_root().to_path_buf())?;
-        let projects_root = validate_local_case_insensitive_ntfs_directory(&projects_root)?;
-        validate_windows_name(
-            request.project_directory_name(),
-            &projects_root.join(request.project_directory_name()),
-        )?;
-        let lock_directory =
-            trusted_lock_namespace(&projects_root, PROJECT_OPERATION_LOCK_NAMESPACE)?;
-        let lock_path = lock_directory.join(request.project_directory_name());
+        let lock_directory = trusted_lock_directory(request.lock_directory())?;
+        let lock_path = stable_lock_path(&lock_directory, request.identity())?;
         ExclusiveFileLock::acquire(&lock_path, timeout)
-            .map(ProjectOperationLease::new)
+            .map(ExclusiveFileLease::new)
             .map_err(Into::into)
     })();
     match result {
         Ok(lease) => Ok(lease),
         Err(SystemFileSystemError::Windows(WindowsFsError::LockTimeout { .. })) => {
-            Err(ProjectOperationLeaseError::Busy {
-                project_directory_name,
-                timeout,
-            })
+            Err(ExclusiveFileLeaseError::Busy { identity, timeout })
         }
-        Err(source) => Err(ProjectOperationLeaseError::Unavailable {
-            project_directory_name,
+        Err(source) => Err(ExclusiveFileLeaseError::Unavailable {
+            identity,
             source: Box::new(source),
         }),
     }
@@ -2663,8 +2733,8 @@ impl TreeBudgetUsage {
 fn prepare_directory_sync(
     request: DirectoryStageRequest,
     system_config: SystemFileSystemConfig,
+    publisher_config: DirectoryPublisherConfig,
     publisher_identity: Arc<()>,
-    permit: PreparedPermit,
 ) -> Result<StagedDirectory<SystemStagingState>, DirectoryPrepareError<Box<SystemFileSystemError>>>
 {
     let target_root = request.target_root().to_path_buf();
@@ -2694,11 +2764,11 @@ fn prepare_directory_sync(
                 })?;
         validate_windows_name(target_name, &target_root)?;
         let target_root = parent_root.join(target_name);
-        let lock_path = target_lock_path(&parent_root, target_name)?;
+        let lock_path = target_lock_path(&publisher_config.lock_directory, &target_root)?;
         let target_lock =
-            ExclusiveFileLock::acquire(&lock_path, system_config.publisher.target_lock_timeout)?;
+            ExclusiveFileLock::acquire(&lock_path, publisher_config.target_lock_timeout)?;
         let target_artifact_key = target_lock.identity(&lock_path)?.stable_hex();
-        recover_target(&target_root, &target_artifact_key, &system_config.publisher)?;
+        recover_target(&target_root, &target_artifact_key, &publisher_config)?;
 
         let operation_id = secure_uuid_v4("生成目录发布操作 ID")?;
         let stem = format!("{RESERVED_PREFIX}{target_artifact_key}-{operation_id}");
@@ -2764,7 +2834,6 @@ fn prepare_directory_sync(
                 journal_path,
                 backup_path,
                 cleanup,
-                _permit: permit,
                 abandoned_before_delivery: false,
                 finalized: false,
             },
@@ -2968,7 +3037,7 @@ fn validate_declared_windows_paths(
 }
 
 /// 发布前重新观测完整候选，把 `prepare` 返回后由受信非根服务新增的文件
-/// （例如 Init 的 `project.db`）也纳入同一组资源、名称和 reparse 不变量。
+/// 调用方在候选内新增的普通文件也纳入同一组资源、名称和 reparse 不变量。
 fn validate_complete_candidate(
     stage_root: &Path,
     expected_identity: FileIdentity,
@@ -3422,34 +3491,113 @@ fn validate_windows_name(name: &OsStr, full_path: &Path) -> Result<(), SystemFil
     Ok(())
 }
 
-fn target_lock_path(parent: &Path, target_name: &OsStr) -> Result<PathBuf, SystemFileSystemError> {
-    let lock_directory = trusted_lock_namespace(parent, DIRECTORY_PUBLISH_LOCK_NAMESPACE)?;
-    Ok(lock_directory.join(target_name))
+fn target_lock_path(
+    configured_lock_directory: &Path,
+    target_root: &Path,
+) -> Result<PathBuf, SystemFileSystemError> {
+    let lock_directory = trusted_lock_directory(configured_lock_directory)?;
+    stable_lock_path(&lock_directory, target_root.as_os_str())
 }
 
-fn trusted_lock_namespace(
-    parent: &Path,
-    namespace: &str,
-) -> Result<PathBuf, SystemFileSystemError> {
-    let lock_directory = parent.join(namespace);
-    match fs::create_dir(&lock_directory) {
-        Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(&lock_directory)
-                .map_err(|source| io_error("读取目录发布锁目录", &lock_directory, source))?;
-            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            {
-                return Err(SystemFileSystemError::InvalidPath {
-                    path: lock_directory,
-                    reason: "锁命名空间被非目录对象占用",
-                });
-            }
+fn trusted_lock_directory(path: &Path) -> Result<PathBuf, SystemFileSystemError> {
+    let lock_directory = absolutize(path.to_path_buf())?;
+    let mut current = PathBuf::new();
+    for component in lock_directory.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
         }
-        Err(source) => {
-            return Err(io_error("建立锁命名空间", &lock_directory, source));
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(io_error("建立锁目录", &current, source)),
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|source| io_error("读取锁目录元数据", &current, source))?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(SystemFileSystemError::InvalidPath {
+                path: current,
+                reason: "锁目录路径包含非普通目录或 reparse point",
+            });
         }
     }
-    validate_local_case_insensitive_ntfs_directory(&lock_directory).map_err(Into::into)
+    let pinned = pin_directory_without_reparse(&lock_directory)?;
+    Ok(pinned.resolved_path().to_path_buf())
+}
+
+fn stable_lock_path(
+    lock_directory: &Path,
+    identity: &OsStr,
+) -> Result<PathBuf, SystemFileSystemError> {
+    let key = invariant_uppercase_utf16(identity)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"exclusive-file-lease");
+    hasher.update((key.len() as u64).to_le_bytes());
+    for unit in key {
+        hasher.update(unit.to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut file_name = String::with_capacity(digest.len() * 2 + 5);
+    use std::fmt::Write as _;
+    for byte in digest {
+        write!(&mut file_name, "{byte:02x}").expect("写入 String 不会失败");
+    }
+    file_name.push_str(".lock");
+    Ok(lock_directory.join(file_name))
+}
+
+fn invariant_uppercase_utf16(value: &OsStr) -> Result<Vec<u16>, SystemFileSystemError> {
+    let input = value.encode_wide().collect::<Vec<_>>();
+    let input_len =
+        i32::try_from(input.len()).map_err(|_| SystemFileSystemError::ResourceLimit {
+            resource: "文件租约身份 UTF-16 单元数",
+            limit: i32::MAX as u64,
+            observed: input.len() as u64,
+        })?;
+    // SAFETY: 输入切片在调用期间有效；第一次调用只查询所需长度，不写入目标缓冲区。
+    let required = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            input.as_ptr(),
+            input_len,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if required == 0 {
+        return Err(io_error(
+            "建立 Windows 非大小写敏感租约键",
+            Path::new("<lock-identity>"),
+            io::Error::last_os_error(),
+        ));
+    }
+    let mut output = vec![0_u16; required as usize];
+    // SAFETY: 目标缓冲区使用上一次系统调用给出的精确长度；输入与输出在调用期间有效。
+    let written = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            input.as_ptr(),
+            input_len,
+            output.as_mut_ptr(),
+            required,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if written != required {
+        return Err(io_error(
+            "建立 Windows 非大小写敏感租约键",
+            Path::new("<lock-identity>"),
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(output)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4494,6 +4642,48 @@ fn remove_matching_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Deref;
+
+    #[derive(Clone)]
+    struct TestDirectoryPublisher {
+        file_system: SystemFileSystem,
+        publisher: SystemDirectoryPublisher,
+    }
+
+    impl TestDirectoryPublisher {
+        fn new(config: SystemFileSystemConfig) -> Self {
+            let file_system = SystemFileSystem::new(config).expect("应该可建立文件系统根");
+            let publisher = file_system.directory_publisher(publisher_config());
+            Self {
+                file_system,
+                publisher,
+            }
+        }
+
+        fn with_publisher_config(
+            config: SystemFileSystemConfig,
+            publisher_config: DirectoryPublisherConfig,
+        ) -> Self {
+            let file_system = SystemFileSystem::new(config).expect("应该可建立文件系统根");
+            let publisher = file_system.directory_publisher(publisher_config);
+            Self {
+                file_system,
+                publisher,
+            }
+        }
+
+        async fn shutdown(&self) -> Result<(), SystemFileSystemError> {
+            self.file_system.shutdown().await
+        }
+    }
+
+    impl Deref for TestDirectoryPublisher {
+        type Target = SystemDirectoryPublisher;
+
+        fn deref(&self) -> &Self::Target {
+            &self.publisher
+        }
+    }
 
     fn symlink_unavailable(error: &io::Error) -> bool {
         matches!(
@@ -4503,48 +4693,54 @@ mod tests {
     }
 
     fn publisher_config() -> DirectoryPublisherConfig {
-        DirectoryPublisherConfig::new(2, 8, Duration::from_secs(1)).expect("测试发布配置应该合法")
+        publisher_config_for_lock_directory(
+            std::env::temp_dir().join("filesystem-test-publisher-locks"),
+        )
+    }
+
+    fn publisher_config_for_lock_directory(lock_directory: PathBuf) -> DirectoryPublisherConfig {
+        DirectoryPublisherConfig::new(lock_directory, 8, Duration::from_secs(1))
+            .expect("测试发布配置应该合法")
     }
 
     fn tree_budget() -> TreeBudget {
         TreeBudget::new(128, 16, 1024 * 1024, 512 * 1024).expect("测试目录树预算应该合法")
     }
 
-    fn project_lock_config() -> ProjectLockConfig {
-        ProjectLockConfig::new(Duration::from_secs(1)).expect("测试项目锁配置应该合法")
+    fn exclusive_file_lease_config() -> ExclusiveFileLeaseConfig {
+        ExclusiveFileLeaseConfig::new(Duration::from_secs(1)).expect("测试租约配置应该合法")
     }
 
     fn file_system_config() -> SystemFileSystemConfig {
-        file_system_config_with_project_lock_timeout(Duration::from_secs(1))
+        file_system_config_with_lease_timeout(Duration::from_secs(1))
     }
 
-    fn file_system_config_with_project_lock_timeout(timeout: Duration) -> SystemFileSystemConfig {
+    fn file_system_config_with_lease_timeout(timeout: Duration) -> SystemFileSystemConfig {
         SystemFileSystemConfig::new(
             2,
             8,
             1024,
             16,
             tree_budget(),
-            ProjectLockConfig::new(timeout).expect("测试项目锁配置应该合法"),
-            publisher_config(),
+            ExclusiveFileLeaseConfig::new(timeout).expect("测试租约配置应该合法"),
         )
         .expect("测试文件系统配置应该合法")
     }
 
-    fn tree_fingerprint_request(data: &Path, js: &Path) -> DirectoryTreeFingerprintRequest {
+    fn tree_fingerprint_request(assets: &Path, scripts: &Path) -> DirectoryTreeFingerprintRequest {
         DirectoryTreeFingerprintRequest::new(vec![
             crate::storage::file_system::DirectoryTreeRoot::new(
-                data.to_path_buf(),
-                PathBuf::from("data"),
+                assets.to_path_buf(),
+                PathBuf::from("assets"),
             )
-            .expect("data 指纹根应该合法"),
+            .expect("资源指纹根应该合法"),
             crate::storage::file_system::DirectoryTreeRoot::new(
-                js.to_path_buf(),
-                PathBuf::from("js"),
+                scripts.to_path_buf(),
+                PathBuf::from("scripts"),
             )
-            .expect("js 指纹根应该合法"),
+            .expect("脚本指纹根应该合法"),
         ])
-        .expect("data 与 js 指纹根应该互不重叠")
+        .expect("资源与脚本指纹根应该互不重叠")
     }
 
     fn stage_request(
@@ -4556,7 +4752,7 @@ mod tests {
             target,
             intent,
             vec![
-                DirectorySourceMapping::new(source, PathBuf::from("source/data"))
+                DirectorySourceMapping::new(source, PathBuf::from("snapshot/content"))
                     .expect("测试来源映射应该合法"),
             ],
             Vec::new(),
@@ -4574,10 +4770,10 @@ mod tests {
             target,
             intent,
             vec![
-                DirectorySourceMapping::new(source_root.join("data"), PathBuf::from("data"))
-                    .expect("data 候选映射应该合法"),
-                DirectorySourceMapping::new(source_root.join("js"), PathBuf::from("js"))
-                    .expect("js 候选映射应该合法"),
+                DirectorySourceMapping::new(source_root.join("assets"), PathBuf::from("assets"))
+                    .expect("资源候选映射应该合法"),
+                DirectorySourceMapping::new(source_root.join("scripts"), PathBuf::from("scripts"))
+                    .expect("脚本候选映射应该合法"),
             ],
             Vec::new(),
             Vec::new(),
@@ -4589,11 +4785,16 @@ mod tests {
         ScopedDirectoryPath::new(PathBuf::from(path)).expect("测试候选路径应该合法")
     }
 
+    fn scoped_scope() -> ScopedDirectoryScope {
+        ScopedDirectoryScope::new([OsString::from("assets"), OsString::from("scripts")])
+            .expect("测试候选范围应该合法")
+    }
+
     fn scoped_source(root: &Path) {
-        fs::create_dir_all(root.join("data")).expect("应该可建立 data 来源");
-        fs::create_dir_all(root.join("js")).expect("应该可建立 js 来源");
-        fs::write(root.join("data/Items.json"), b"items").expect("应该可建立 data 文件");
-        fs::write(root.join("js/plugins.js"), b"plugins").expect("应该可建立 js 文件");
+        fs::create_dir_all(root.join("assets")).expect("应该可建立资源来源");
+        fs::create_dir_all(root.join("scripts")).expect("应该可建立脚本来源");
+        fs::write(root.join("assets/catalog.json"), b"items").expect("应该可建立资源文件");
+        fs::write(root.join("scripts/main.lua"), b"scripts").expect("应该可建立脚本文件");
     }
 
     fn canonical_target(path: &Path) -> PathBuf {
@@ -4611,9 +4812,9 @@ mod tests {
             .arg("--exact")
             .arg("runtime::filesystem::tests::publisher_subprocess_entrypoint")
             .arg("--nocapture")
-            .env("ATT_FS_PUBLISHER_CHILD_MODE", mode)
-            .env("ATT_FS_PUBLISHER_CHILD_TARGET", target)
-            .env("ATT_FS_PUBLISHER_CHILD_SOURCE", source)
+            .env("FILESYSTEM_PUBLISHER_CHILD_MODE", mode)
+            .env("FILESYSTEM_PUBLISHER_CHILD_TARGET", target)
+            .env("FILESYSTEM_PUBLISHER_CHILD_SOURCE", source)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         command
@@ -4621,7 +4822,13 @@ mod tests {
 
     #[test]
     fn windows_name_validation_rejects_devices_ads_and_reserved_namespace() {
-        for name in ["CON", "nul.txt", "file:ads", "trailing.", ".att-dirpub-x"] {
+        for name in [
+            "CON",
+            "nul.txt",
+            "file:ads",
+            "trailing.",
+            ".directory-publish-x",
+        ] {
             assert!(validate_windows_name(OsStr::new(name), Path::new(name)).is_err());
         }
         validate_windows_name(OsStr::new("剧情 数据.json"), Path::new("剧情 数据.json"))
@@ -4631,9 +4838,9 @@ mod tests {
     #[test]
     fn declared_paths_reject_conflicting_windows_case_spelling() {
         let mappings = vec![
-            DirectorySourceMapping::new(PathBuf::from("first"), PathBuf::from("source/data"))
+            DirectorySourceMapping::new(PathBuf::from("first"), PathBuf::from("content/first"))
                 .expect("第一条声明应合法"),
-            DirectorySourceMapping::new(PathBuf::from("second"), PathBuf::from("Source/js"))
+            DirectorySourceMapping::new(PathBuf::from("second"), PathBuf::from("Content/second"))
                 .expect("大小写不同的原始声明尚未进入 Windows 边界"),
         ];
         assert!(matches!(
@@ -4645,7 +4852,7 @@ mod tests {
 
     #[test]
     fn journal_ignores_only_the_final_incomplete_frame() {
-        let root = std::env::temp_dir().join(format!("att-journal-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("journal-test-{}", Uuid::new_v4()));
         fs::create_dir(&root).expect("测试目录应该可创建");
         let path = root.join("state.journal");
         let record = JournalRecord {
@@ -4671,58 +4878,96 @@ mod tests {
 
     #[test]
     fn publisher_configuration_rejects_zero_resource_budget() {
-        assert!(DirectoryPublisherConfig::new(0, 1, Duration::ZERO).is_err());
+        assert!(DirectoryPublisherConfig::new(PathBuf::from("locks"), 0, Duration::ZERO).is_err());
+        assert!(DirectoryPublisherConfig::new(PathBuf::new(), 1, Duration::ZERO).is_err());
         assert!(TreeBudget::new(0, 1, 1, 1).is_err());
-        assert!(ProjectLockConfig::new(Duration::ZERO).is_err());
+        assert!(ExclusiveFileLeaseConfig::new(Duration::ZERO).is_err());
         let _ = publisher_config();
     }
 
     #[tokio::test]
-    async fn project_operation_lease_serializes_same_windows_name_and_allows_other_projects() {
+    async fn exclusive_file_lease_serializes_same_windows_identity_and_allows_other_identities() {
         let temporary = tempfile::tempdir().expect("应该可创建临时项目集合根");
         let owner = SystemFileSystem::new(file_system_config()).expect("应该可建立锁所有者根");
-        let contender = SystemFileSystem::new(file_system_config_with_project_lock_timeout(
+        let contender = SystemFileSystem::new(file_system_config_with_lease_timeout(
             Duration::from_millis(25),
         ))
         .expect("应该可建立锁竞争者根");
+        let lock_directory = temporary.path().join("locks/leases");
         let request = |name: &str| {
-            ProjectOperationLeaseRequest::new(temporary.path().to_path_buf(), OsString::from(name))
-                .expect("测试项目租约请求应该合法")
+            ExclusiveFileLeaseRequest::new(lock_directory.clone(), OsString::from(name))
+                .expect("测试文件租约请求应该合法")
         };
 
         let lease = owner
-            .acquire_project_operation_lease(request("游戏One"))
+            .acquire_exclusive_file_lease(request("游戏One"))
             .await
             .expect("首个同项目命令应该取得租约");
-        let other_project = contender
-            .acquire_project_operation_lease(request("游戏Two"))
+        let other_lease = contender
+            .acquire_exclusive_file_lease(request("游戏Two"))
             .await
-            .expect("不同项目应该可以并行");
+            .expect("不同身份应该可以并行");
         assert!(matches!(
             contender
-                .acquire_project_operation_lease(request("游戏one"))
+                .acquire_exclusive_file_lease(request("游戏one"))
                 .await,
-            Err(ProjectOperationLeaseError::Busy {
-                project_directory_name,
-                ..
-            }) if project_directory_name == OsStr::new("游戏one")
+            Err(ExclusiveFileLeaseError::Busy { identity, .. })
+                if identity == OsStr::new("游戏one")
         ));
-        assert!(
-            temporary
-                .path()
-                .join(PROJECT_OPERATION_LOCK_NAMESPACE)
-                .is_dir()
+        assert!(lock_directory.is_dir());
+        assert_eq!(
+            fs::read_dir(&lock_directory)
+                .expect("应该可列举锁目录")
+                .count(),
+            2,
+            "两个 Windows 身份应该各自只建立一个摘要锁文件"
         );
 
-        drop(other_project);
+        drop(other_lease);
         drop(lease);
         let reacquired = contender
-            .acquire_project_operation_lease(request("游戏one"))
+            .acquire_exclusive_file_lease(request("游戏one"))
             .await
-            .expect("所有者释放后应该可重新取得同项目租约");
+            .expect("所有者释放后应该可重新取得同身份租约");
         drop(reacquired);
         contender.shutdown().await.expect("竞争者根应该可终结");
         owner.shutdown().await.expect("所有者根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn publisher_lock_lives_in_the_configured_lock_directory() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let lock_directory = temporary.path().join("locks/publish");
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).expect("应该可创建候选来源");
+        let target = temporary.path().join("outputs/target");
+        fs::create_dir(target.parent().expect("测试目标应该有父目录"))
+            .expect("应该可创建目标父目录");
+        let root = TestDirectoryPublisher::with_publisher_config(
+            file_system_config(),
+            publisher_config_for_lock_directory(lock_directory.clone()),
+        );
+
+        let staged = root
+            .prepare(stage_request(
+                target.clone(),
+                source,
+                DirectoryPublishIntent::CreateNew,
+            ))
+            .await
+            .expect("候选应该可准备");
+
+        assert!(lock_directory.is_dir());
+        let lock_files = fs::read_dir(&lock_directory)
+            .expect("应该可列举目录发布锁")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应该可读取目录发布锁项");
+        assert_eq!(lock_files.len(), 1);
+        assert_eq!(lock_files[0].path().extension(), Some(OsStr::new("lock")));
+        assert!(!target.parent().unwrap().join("locks").exists());
+
+        root.discard(staged).await.expect("应该可丢弃候选");
+        root.shutdown().await.expect("文件系统根应该可终结");
     }
 
     #[tokio::test]
@@ -4731,50 +4976,53 @@ mod tests {
         let first = temporary.path().join("first");
         let second = temporary.path().join("second");
         for root in [&first, &second] {
-            fs::create_dir_all(root.join("data/Actors")).expect("应该可建立 data 子目录");
-            fs::create_dir_all(root.join("data/Empty")).expect("应该可建立空目录");
-            fs::create_dir_all(root.join("js/plugins")).expect("应该可建立 js 子目录");
+            fs::create_dir_all(root.join("assets/catalog")).expect("应该可建立资源子目录");
+            fs::create_dir_all(root.join("assets/empty")).expect("应该可建立空目录");
+            fs::create_dir_all(root.join("scripts/modules")).expect("应该可建立脚本子目录");
         }
-        fs::write(first.join("js/plugins/main.js"), b"plugin").expect("应该可写入第一份 js");
-        fs::write(first.join("data/Actors/Actors.json"), b"actors").expect("应该可写入第一份 data");
+        fs::write(first.join("scripts/modules/main.lua"), b"module").expect("应该可写入第一份脚本");
+        fs::write(first.join("assets/catalog/index.json"), b"catalog")
+            .expect("应该可写入第一份资源");
         // 反转创建顺序，证明枚举顺序不参与指纹。
-        fs::write(second.join("data/Actors/Actors.json"), b"actors")
-            .expect("应该可写入第二份 data");
-        fs::write(second.join("js/plugins/main.js"), b"plugin").expect("应该可写入第二份 js");
+        fs::write(second.join("assets/catalog/index.json"), b"catalog")
+            .expect("应该可写入第二份资源");
+        fs::write(second.join("scripts/modules/main.lua"), b"module")
+            .expect("应该可写入第二份脚本");
         let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
 
         let first_fingerprint = root
             .fingerprint_directory_tree(tree_fingerprint_request(
-                &first.join("data"),
-                &first.join("js"),
+                &first.join("assets"),
+                &first.join("scripts"),
             ))
             .await
             .expect("第一份目录树应该可建立指纹");
         let second_fingerprint = root
             .fingerprint_directory_tree(tree_fingerprint_request(
-                &second.join("data"),
-                &second.join("js"),
+                &second.join("assets"),
+                &second.join("scripts"),
             ))
             .await
             .expect("第二份目录树应该可建立指纹");
         assert_eq!(first_fingerprint, second_fingerprint);
 
-        fs::write(second.join("data/Actors/Actors.json"), b"changed").expect("应该可修改指纹来源");
+        fs::write(second.join("assets/catalog/index.json"), b"changed")
+            .expect("应该可修改指纹来源");
         let changed_bytes = root
             .fingerprint_directory_tree(tree_fingerprint_request(
-                &second.join("data"),
-                &second.join("js"),
+                &second.join("assets"),
+                &second.join("scripts"),
             ))
             .await
             .expect("修改后应该仍可建立指纹");
         assert_ne!(changed_bytes, first_fingerprint);
 
-        fs::write(second.join("data/Actors/Actors.json"), b"actors").expect("应该可恢复原文件");
-        fs::create_dir(second.join("data/AnotherEmpty")).expect("应该可增加空目录");
+        fs::write(second.join("assets/catalog/index.json"), b"catalog").expect("应该可恢复原文件");
+        fs::create_dir(second.join("assets/another-empty")).expect("应该可增加空目录");
         let changed_empty_directory = root
             .fingerprint_directory_tree(tree_fingerprint_request(
-                &second.join("data"),
-                &second.join("js"),
+                &second.join("assets"),
+                &second.join("scripts"),
             ))
             .await
             .expect("增加空目录后应该可建立指纹");
@@ -4786,17 +5034,17 @@ mod tests {
     #[tokio::test]
     async fn directory_tree_fingerprint_rejects_hardlinks() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
-        let data = temporary.path().join("data");
-        let js = temporary.path().join("js");
-        fs::create_dir(&data).expect("应该可建立 data 目录");
-        fs::create_dir(&js).expect("应该可建立 js 目录");
-        fs::write(data.join("first.json"), b"same physical file").expect("应该可建立原始文件");
-        fs::hard_link(data.join("first.json"), data.join("second.json"))
+        let assets = temporary.path().join("assets");
+        let scripts = temporary.path().join("scripts");
+        fs::create_dir(&assets).expect("应该可建立资源目录");
+        fs::create_dir(&scripts).expect("应该可建立脚本目录");
+        fs::write(assets.join("first.json"), b"same physical file").expect("应该可建立原始文件");
+        fs::hard_link(assets.join("first.json"), assets.join("second.json"))
             .expect("本地 NTFS 测试目录应该支持硬链接");
         let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
 
         let error = root
-            .fingerprint_directory_tree(tree_fingerprint_request(&data, &js))
+            .fingerprint_directory_tree(tree_fingerprint_request(&assets, &scripts))
             .await
             .expect_err("硬链接必须阻止精确目录树指纹");
         assert!(matches!(
@@ -4817,17 +5065,17 @@ mod tests {
     #[test]
     fn directory_tree_fingerprint_rejects_same_bytes_with_new_identity_between_rounds() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
-        let data = temporary.path().join("data");
-        let js = temporary.path().join("js");
-        fs::create_dir(&data).expect("应该可建立 data 目录");
-        fs::create_dir(&js).expect("应该可建立 js 目录");
-        let observed = data.join("Actors.json");
+        let assets = temporary.path().join("assets");
+        let scripts = temporary.path().join("scripts");
+        fs::create_dir(&assets).expect("应该可建立资源目录");
+        fs::create_dir(&scripts).expect("应该可建立脚本目录");
+        let observed = assets.join("catalog.json");
         let replacement = temporary.path().join("replacement.json");
         fs::write(&observed, b"same bytes").expect("应该可建立首个对象");
         fs::write(&replacement, b"same bytes").expect("应该可建立不同身份的替换对象");
 
         let error = fingerprint_directory_tree_sync_with_between(
-            tree_fingerprint_request(&data, &js),
+            tree_fingerprint_request(&assets, &scripts),
             &file_system_config(),
             || {
                 fs::remove_file(&observed).expect("第一轮结束后应该可移除原对象");
@@ -4839,14 +5087,14 @@ mod tests {
         assert!(matches!(
             error,
             DirectoryTreeFingerprintError::ChangedDuringObservation { path }
-                if path.ends_with("Actors.json")
+                if path.ends_with("catalog.json")
         ));
     }
 
     #[test]
     fn fingerprint_file_rechecks_the_identity_captured_during_enumeration() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
-        let observed = temporary.path().join("Actors.json");
+        let observed = temporary.path().join("catalog.json");
         let replacement = temporary.path().join("replacement.json");
         fs::write(&observed, b"same bytes").expect("应该可建立首个对象");
         fs::write(&replacement, b"same bytes").expect("应该可建立替换对象");
@@ -4868,7 +5116,7 @@ mod tests {
         };
         let error = fingerprint_file(
             &observed,
-            Path::new("data/Actors.json"),
+            Path::new("assets/catalog.json"),
             ExpectedFingerprintFile {
                 identity: expected_identity,
                 size: expected_size,
@@ -4893,7 +5141,7 @@ mod tests {
         fs::write(source.join("first.json"), b"shared").expect("应该可建立来源文件");
         fs::hard_link(source.join("first.json"), source.join("second.json"))
             .expect("本地 NTFS 测试目录应该支持硬链接");
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        let root = TestDirectoryPublisher::new(file_system_config());
 
         let error = match root
             .prepare(stage_request(
@@ -4999,10 +5247,10 @@ mod tests {
     async fn directory_listing_reports_entry_kinds_and_rejects_hardlinked_files() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let directory = temporary.path().join("source");
-        let nested = directory.join("data");
+        let nested = directory.join("nested");
         fs::create_dir_all(&nested).expect("应该可创建测试目录");
-        let ordinary = directory.join("project.db");
-        fs::write(&ordinary, b"database").expect("应该可创建普通文件");
+        let ordinary = directory.join("state.db");
+        fs::write(&ordinary, b"state").expect("应该可创建普通文件");
         let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
 
         let mut entries = root
@@ -5023,7 +5271,7 @@ mod tests {
         expected.sort_by(|left, right| left.resolved_path().cmp(right.resolved_path()));
         assert_eq!(entries, expected);
 
-        let hardlink = directory.join("project-copy.db");
+        let hardlink = directory.join("state-copy.db");
         fs::hard_link(&ordinary, &hardlink).expect("应该可创建硬链接测试入口");
         assert!(matches!(
             root.list_directory(directory).await,
@@ -5040,12 +5288,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_editor_mutates_only_data_and_js_and_the_publisher_revalidates_the_result() {
+    async fn scoped_editor_mutates_only_declared_roots_and_the_publisher_revalidates_the_result() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         scoped_source(&source);
         let target = temporary.path().join("output");
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        let root = TestDirectoryPublisher::new(file_system_config());
         let staged = root
             .prepare(scoped_stage_request(
                 target.clone(),
@@ -5055,48 +5303,53 @@ mod tests {
             .await
             .expect("候选应该可准备");
         let scope = root
-            .bind_scoped_directory(&staged)
+            .bind_scoped_directory(&staged, scoped_scope())
             .await
             .expect("应该可绑定未发布候选");
 
         assert_eq!(
-            root.read_scoped_file(&scope, scoped_path("data/Items.json"))
+            root.read_scoped_file(&scope, scoped_path("assets/catalog.json"))
                 .await
                 .expect("应该可读取候选文件"),
             b"items"
         );
+        assert!(matches!(
+            root.read_scoped_file(&scope, scoped_path("other/file.txt"))
+                .await,
+            Err(ScopedDirectoryEditError::OutsideScope { .. })
+        ));
         assert_eq!(
-            root.list_scoped_directory(&scope, scoped_path("data"))
+            root.list_scoped_directory(&scope, scoped_path("assets"))
                 .await
-                .expect("应该可列举 data"),
+                .expect("应该可列举资源目录"),
             vec![ScopedDirectoryEntry::new(
-                OsString::from("Items.json"),
+                OsString::from("catalog.json"),
                 ScopedDirectoryEntryKind::File,
             )]
         );
-        root.create_scoped_directory(&scope, scoped_path("data/generated/nested"))
+        root.create_scoped_directory(&scope, scoped_path("assets/generated/nested"))
             .await
             .expect("应该可逐段建立候选目录");
         root.write_scoped_file(
             &scope,
-            scoped_path("data/generated/nested/result.json"),
+            scoped_path("assets/generated/nested/result.json"),
             b"generated".to_vec(),
         )
         .await
         .expect("应该可建立候选文件");
-        root.write_scoped_file(&scope, scoped_path("js/plugins.js"), b"changed".to_vec())
+        root.write_scoped_file(&scope, scoped_path("scripts/main.lua"), b"changed".to_vec())
             .await
             .expect("应该可替换候选文件");
-        root.remove_scoped_path(&scope, scoped_path("data/Items.json"))
+        root.remove_scoped_path(&scope, scoped_path("assets/catalog.json"))
             .await
             .expect("应该可删除候选文件");
 
         for operation in [
-            root.create_scoped_directory(&scope, scoped_path("data"))
+            root.create_scoped_directory(&scope, scoped_path("assets"))
                 .await,
-            root.write_scoped_file(&scope, scoped_path("data"), Vec::new())
+            root.write_scoped_file(&scope, scoped_path("assets"), Vec::new())
                 .await,
-            root.remove_scoped_path(&scope, scoped_path("data")).await,
+            root.remove_scoped_path(&scope, scoped_path("assets")).await,
         ] {
             assert!(matches!(
                 operation,
@@ -5105,8 +5358,8 @@ mod tests {
         }
 
         fn assert_send<T: Send>(_: T) {}
-        assert_send(root.read_scoped_file(&scope, scoped_path("js/plugins.js")));
-        assert_send(root.list_scoped_directory(&scope, scoped_path("js")));
+        assert_send(root.read_scoped_file(&scope, scoped_path("scripts/main.lua")));
+        assert_send(root.list_scoped_directory(&scope, scoped_path("scripts")));
         root.validate_scoped_directory(&scope)
             .await
             .expect("编辑后候选应仍满足完整写回结构");
@@ -5115,25 +5368,25 @@ mod tests {
         root.publish(staged)
             .await
             .expect("发布根应该重新验证并整体发布编辑后候选");
-        assert!(!target.join("data/Items.json").exists());
+        assert!(!target.join("assets/catalog.json").exists());
         assert_eq!(
-            fs::read(target.join("data/generated/nested/result.json"))
+            fs::read(target.join("assets/generated/nested/result.json"))
                 .expect("应该可读取已发布新文件"),
             b"generated"
         );
         assert_eq!(
-            fs::read(target.join("js/plugins.js")).expect("应该可读取已发布替换文件"),
+            fs::read(target.join("scripts/main.lua")).expect("应该可读取已发布替换文件"),
             b"changed"
         );
         root.shutdown().await.expect("文件系统根应该可终结");
     }
 
     #[tokio::test]
-    async fn scoped_final_validation_rejects_an_unmanaged_top_level_entry() {
+    async fn scoped_root_validation_is_generic_and_reports_all_top_level_entries() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         scoped_source(&source);
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        let root = TestDirectoryPublisher::new(file_system_config());
         let staged = root
             .prepare(scoped_stage_request(
                 temporary.path().join("output"),
@@ -5144,17 +5397,27 @@ mod tests {
             .expect("候选应该可准备");
         let candidate_root = staged.staging_root().to_path_buf();
         let scope = root
-            .bind_scoped_directory(&staged)
+            .bind_scoped_directory(&staged, scoped_scope())
             .await
             .expect("应该可绑定候选");
 
         fs::create_dir(candidate_root.join("evil")).expect("测试应可模拟可信 Lua 绕过门面写入");
-        assert!(matches!(
-            root.validate_scoped_directory(&scope).await,
-            Err(ScopedDirectoryEditError::Failed { source, .. })
-                if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
-                    if reason.contains("只允许 data 与 js"))
-        ));
+        root.validate_scoped_directory(&scope)
+            .await
+            .expect("通用文件根不应猜测调用方的顶层目录语义");
+        assert_eq!(
+            root.list_scoped_root(&scope)
+                .await
+                .expect("应该可列举候选根")
+                .into_iter()
+                .map(|entry| entry.name().to_os_string())
+                .collect::<Vec<_>>(),
+            vec![
+                OsString::from("assets"),
+                OsString::from("evil"),
+                OsString::from("scripts"),
+            ]
+        );
         fs::remove_dir(candidate_root.join("evil")).expect("应该可清理测试目录");
         root.validate_scoped_directory(&scope)
             .await
@@ -5166,12 +5429,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_editor_accepts_arbitrary_declared_top_level_directories() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        fs::create_dir_all(source.join("assets")).expect("应该可建立 assets 来源");
+        fs::create_dir_all(source.join("scripts")).expect("应该可建立 scripts 来源");
+        fs::write(source.join("assets/title.png"), b"image").expect("应该可建立资源文件");
+        let request = DirectoryStageRequest::new(
+            temporary.path().join("output"),
+            DirectoryPublishIntent::CreateNew,
+            vec![
+                DirectorySourceMapping::new(source.join("assets"), PathBuf::from("assets"))
+                    .expect("assets 映射应该合法"),
+                DirectorySourceMapping::new(source.join("scripts"), PathBuf::from("scripts"))
+                    .expect("scripts 映射应该合法"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("通用候选请求应该合法");
+        let root = TestDirectoryPublisher::new(file_system_config());
+        let staged = root.prepare(request).await.expect("候选应该可准备");
+        let scope = root
+            .bind_scoped_directory(
+                &staged,
+                ScopedDirectoryScope::new([OsString::from("assets"), OsString::from("scripts")])
+                    .expect("通用范围应该合法"),
+            )
+            .await
+            .expect("通用顶层目录应该可绑定");
+
+        assert_eq!(
+            root.read_scoped_file(&scope, scoped_path("assets/title.png"))
+                .await
+                .expect("应该可读取声明范围内文件"),
+            b"image"
+        );
+        assert!(matches!(
+            root.read_scoped_file(&scope, scoped_path("private/catalog.json"))
+                .await,
+            Err(ScopedDirectoryEditError::OutsideScope { .. })
+        ));
+
+        drop(scope);
+        root.discard(staged).await.expect("应该可丢弃候选");
+        root.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[tokio::test]
     async fn scoped_tokens_are_bound_to_the_creating_file_system_instance() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         scoped_source(&source);
-        let owner = SystemFileSystem::new(file_system_config()).expect("应该可建立所有者根");
-        let foreign = SystemFileSystem::new(file_system_config()).expect("应该可建立外来根");
+        let owner = TestDirectoryPublisher::new(file_system_config());
+        let foreign = TestDirectoryPublisher::new(file_system_config());
         let staged = owner
             .prepare(scoped_stage_request(
                 temporary.path().join("output"),
@@ -5182,16 +5493,16 @@ mod tests {
             .expect("候选应该可准备");
 
         assert!(matches!(
-            foreign.bind_scoped_directory(&staged).await,
+            foreign.bind_scoped_directory(&staged, scoped_scope()).await,
             Err(ScopedDirectoryBindError::WrongEditorInstance)
         ));
         let scope = owner
-            .bind_scoped_directory(&staged)
+            .bind_scoped_directory(&staged, scoped_scope())
             .await
             .expect("所有者应该可绑定候选");
         assert!(matches!(
             foreign
-                .read_scoped_file(&scope, scoped_path("data/Items.json"))
+                .read_scoped_file(&scope, scoped_path("assets/catalog.json"))
                 .await,
             Err(ScopedDirectoryEditError::WrongEditorInstance)
         ));
@@ -5206,7 +5517,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         scoped_source(&source);
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        let root = TestDirectoryPublisher::new(file_system_config());
         let staged = root
             .prepare(scoped_stage_request(
                 temporary.path().join("output"),
@@ -5217,15 +5528,15 @@ mod tests {
             .expect("候选应该可准备");
         let staging_root = staged.staging_root().to_path_buf();
         let scope = root
-            .bind_scoped_directory(&staged)
+            .bind_scoped_directory(&staged, scoped_scope())
             .await
             .expect("应该可绑定候选");
 
-        let hardlink = staging_root.join("data/hardlink.json");
-        fs::hard_link(staging_root.join("data/Items.json"), &hardlink)
+        let hardlink = staging_root.join("assets/hardlink.json");
+        fs::hard_link(staging_root.join("assets/catalog.json"), &hardlink)
             .expect("本地 NTFS 测试目录应支持硬链接");
         assert!(matches!(
-            root.read_scoped_file(&scope, scoped_path("data/hardlink.json"))
+            root.read_scoped_file(&scope, scoped_path("assets/hardlink.json"))
                 .await,
             Err(ScopedDirectoryEditError::Failed { source, .. })
                 if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
@@ -5234,12 +5545,12 @@ mod tests {
         fs::remove_file(&hardlink).expect("应该可移除硬链接测试入口");
 
         let external = temporary.path().join("external.txt");
-        let link = staging_root.join("data/linked.txt");
+        let link = staging_root.join("assets/linked.txt");
         fs::write(&external, b"external").expect("应该可建立外部文件");
         match std::os::windows::fs::symlink_file(&external, &link) {
             Ok(()) => {
                 assert!(matches!(
-                    root.read_scoped_file(&scope, scoped_path("data/linked.txt"))
+                    root.read_scoped_file(&scope, scoped_path("assets/linked.txt"))
                         .await,
                     Err(ScopedDirectoryEditError::Failed { source, .. })
                         if matches!(*source, SystemFileSystemError::Windows(
@@ -5261,21 +5572,20 @@ mod tests {
     async fn scoped_write_rolls_back_when_the_complete_tree_exceeds_its_budget() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
-        fs::create_dir_all(source.join("data")).expect("应该可建立 data 来源");
-        fs::create_dir_all(source.join("js")).expect("应该可建立 js 来源");
-        fs::write(source.join("data/a.json"), b"1234").expect("应该可写入 data 来源");
-        fs::write(source.join("js/a.js"), b"12").expect("应该可写入 js 来源");
+        fs::create_dir_all(source.join("assets")).expect("应该可建立资源来源");
+        fs::create_dir_all(source.join("scripts")).expect("应该可建立脚本来源");
+        fs::write(source.join("assets/a.json"), b"1234").expect("应该可写入资源来源");
+        fs::write(source.join("scripts/a.lua"), b"12").expect("应该可写入脚本来源");
         let constrained = SystemFileSystemConfig::new(
             2,
             8,
             1024,
             16,
             TreeBudget::new(16, 8, 6, 6).expect("受限目录树预算应该合法"),
-            project_lock_config(),
-            publisher_config(),
+            exclusive_file_lease_config(),
         )
         .expect("受限文件系统配置应该合法");
-        let root = SystemFileSystem::new(constrained).expect("应该可建立文件系统根");
+        let root = TestDirectoryPublisher::new(constrained);
         let staged = root
             .prepare(scoped_stage_request(
                 temporary.path().join("output"),
@@ -5286,12 +5596,12 @@ mod tests {
             .expect("恰好用尽字节预算的候选应可准备");
         let candidate_root = staged.staging_root().to_path_buf();
         let scope = root
-            .bind_scoped_directory(&staged)
+            .bind_scoped_directory(&staged, scoped_scope())
             .await
             .expect("应该可绑定候选");
 
         assert!(matches!(
-            root.write_scoped_file(&scope, scoped_path("data/overflow.json"), vec![1])
+            root.write_scoped_file(&scope, scoped_path("assets/overflow.json"), vec![1])
                 .await,
             Err(ScopedDirectoryEditError::Failed { source, .. })
                 if matches!(*source, SystemFileSystemError::ResourceLimit {
@@ -5300,7 +5610,7 @@ mod tests {
                 })
         ));
         assert!(
-            !candidate_root.join("data/overflow.json").exists(),
+            !candidate_root.join("assets/overflow.json").exists(),
             "超出预算的新文件必须回滚"
         );
 
@@ -5316,7 +5626,7 @@ mod tests {
         fs::create_dir(&source).expect("应该可创建来源目录");
         fs::write(source.join("value.txt"), b"first").expect("应该可写入来源文件");
         let target = temporary.path().join("output");
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        let root = TestDirectoryPublisher::new(file_system_config());
 
         let staged = root
             .prepare(stage_request(
@@ -5328,7 +5638,7 @@ mod tests {
             .expect("首次候选应该可准备");
         fs::write(staged.staging_root().join("prepared.txt"), b"prepared")
             .expect("非根服务应该可在候选内建立文件");
-        let database = rusqlite::Connection::open(staged.staging_root().join("project.db"))
+        let database = rusqlite::Connection::open(staged.staging_root().join("state.db"))
             .expect("应该可在候选内建立真实 SQLite 数据库");
         database
             .execute_batch(
@@ -5338,7 +5648,7 @@ mod tests {
         drop(database);
         root.publish(staged).await.expect("首次候选应该可发布");
         assert_eq!(
-            fs::read(target.join("source/data/value.txt")).unwrap(),
+            fs::read(target.join("snapshot/content/value.txt")).unwrap(),
             b"first"
         );
         assert_eq!(fs::read(target.join("prepared.txt")).unwrap(), b"prepared");
@@ -5357,7 +5667,7 @@ mod tests {
             .expect("替换候选应该可准备");
         root.publish(staged).await.expect("替换候选应该可发布");
         assert_eq!(
-            fs::read(target.join("source/data/value.txt")).unwrap(),
+            fs::read(target.join("snapshot/content/value.txt")).unwrap(),
             b"second"
         );
         assert!(!target.join("prepared.txt").exists());
@@ -5372,7 +5682,7 @@ mod tests {
         fs::create_dir(&source).expect("应该可创建来源目录");
         fs::write(source.join("value.txt"), b"small").expect("应该可写入来源文件");
         let target = temporary.path().join("target");
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        let root = TestDirectoryPublisher::new(file_system_config());
         let staged = root
             .prepare(stage_request(
                 target.clone(),
@@ -5408,7 +5718,7 @@ mod tests {
         fs::create_dir(&source).expect("应该可创建来源目录");
         fs::write(source.join("value.txt"), b"value").expect("应该可写入来源文件");
         let target = temporary.path().join("target");
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        let root = TestDirectoryPublisher::new(file_system_config());
         let staged = root
             .prepare(stage_request(
                 target.clone(),
@@ -5419,7 +5729,7 @@ mod tests {
             .expect("候选应可准备");
         let staging_root = staged.staging_root().to_path_buf();
         fs::hard_link(
-            staging_root.join("source/data/value.txt"),
+            staging_root.join("snapshot/content/value.txt"),
             staging_root.join("same-file.txt"),
         )
         .expect("测试卷应支持硬链接");
@@ -5444,8 +5754,8 @@ mod tests {
         fs::create_dir(&second_source).expect("应该可创建第二来源");
         fs::write(first_source.join("winner.txt"), b"first").unwrap();
         fs::write(second_source.join("winner.txt"), b"second").unwrap();
-        let target = temporary.path().join("project");
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        let target = temporary.path().join("destination");
+        let root = TestDirectoryPublisher::new(file_system_config());
 
         let publish_one = |source: PathBuf| {
             let root = root.clone();
@@ -5489,8 +5799,8 @@ mod tests {
         let source = temporary.path().join("source");
         fs::create_dir(&source).expect("应该可创建来源目录");
         let target = temporary.path().join("target");
-        let owner = SystemFileSystem::new(file_system_config()).expect("应该可建立所有者根");
-        let foreign = SystemFileSystem::new(file_system_config()).expect("应该可建立外来根");
+        let owner = TestDirectoryPublisher::new(file_system_config());
+        let foreign = TestDirectoryPublisher::new(file_system_config());
         let staged = owner
             .prepare(stage_request(
                 target,
@@ -5592,7 +5902,7 @@ mod tests {
         fs::create_dir(&source).expect("应该可创建来源目录");
         fs::write(source.join("value.txt"), b"value").expect("应该可创建来源文件");
         let target = temporary.path().join("target");
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        let root = TestDirectoryPublisher::new(file_system_config());
         let staged = root
             .prepare(stage_request(
                 target,
@@ -5634,7 +5944,11 @@ mod tests {
         let source = temporary.path().join("source");
         fs::create_dir(&source).expect("应该可创建来源目录");
         let target = temporary.path().join("target");
-        let owner = SystemFileSystem::new(file_system_config()).expect("应该可建立所有者根");
+        let lock_directory = temporary.path().join("locks");
+        let owner = TestDirectoryPublisher::with_publisher_config(
+            file_system_config(),
+            publisher_config_for_lock_directory(lock_directory.clone()),
+        );
         let staged = owner
             .prepare(stage_request(
                 target.clone(),
@@ -5643,21 +5957,20 @@ mod tests {
             ))
             .await
             .expect("所有者应可持有目标锁");
-        let zero_timeout =
-            DirectoryPublisherConfig::new(2, 8, Duration::ZERO).expect("零等待只表示立即尝试");
-        let contender = SystemFileSystem::new(
+        let zero_timeout = DirectoryPublisherConfig::new(lock_directory, 8, Duration::ZERO)
+            .expect("零等待只表示立即尝试");
+        let contender = TestDirectoryPublisher::with_publisher_config(
             SystemFileSystemConfig::new(
                 1,
                 2,
                 1024,
                 16,
                 tree_budget(),
-                project_lock_config(),
-                zero_timeout,
+                exclusive_file_lease_config(),
             )
             .expect("竞争根配置应合法"),
-        )
-        .expect("应该可建立竞争根");
+            zero_timeout,
+        );
 
         assert!(matches!(
             contender
@@ -5684,9 +5997,9 @@ mod tests {
         fs::create_dir(&source).expect("应该可创建来源目录");
         fs::write(source.join("value.txt"), b"new").expect("应该可写入新内容");
         let target = temporary.path().join("target");
-        fs::create_dir_all(target.join("source/data")).expect("应该可创建旧目标");
-        fs::write(target.join("source/data/value.txt"), b"old").expect("应该可写入旧内容");
-        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+        fs::create_dir_all(target.join("snapshot/content")).expect("应该可创建旧目标");
+        fs::write(target.join("snapshot/content/value.txt"), b"old").expect("应该可写入旧内容");
+        let root = TestDirectoryPublisher::new(file_system_config());
         let trusted_target = canonical_target(&target);
 
         let staged = root
@@ -5709,7 +6022,7 @@ mod tests {
             Err(DirectoryPublishError::NotPublished { .. })
         ));
         assert_eq!(
-            fs::read(target.join("source/data/value.txt")).expect("旧目标应已恢复"),
+            fs::read(target.join("snapshot/content/value.txt")).expect("旧目标应已恢复"),
             b"old"
         );
 
@@ -5733,7 +6046,7 @@ mod tests {
             Err(DirectoryPublishError::PublishedWithResiduals { .. })
         ));
         assert_eq!(
-            fs::read(target.join("source/data/value.txt")).expect("新目标应已可见"),
+            fs::read(target.join("snapshot/content/value.txt")).expect("新目标应已可见"),
             b"new"
         );
 
@@ -5747,7 +6060,7 @@ mod tests {
             .expect("下次操作应先完成恢复");
         root.discard(staged).await.expect("恢复后候选应可丢弃");
         assert_eq!(
-            fs::read(target.join("source/data/value.txt")).expect("恢复不应回退已发布目标"),
+            fs::read(target.join("snapshot/content/value.txt")).expect("恢复不应回退已发布目标"),
             b"new"
         );
         root.shutdown().await.expect("文件系统根应可终结");
@@ -5755,14 +6068,14 @@ mod tests {
 
     #[test]
     fn publisher_subprocess_entrypoint() {
-        let Some(mode) = std::env::var_os("ATT_FS_PUBLISHER_CHILD_MODE") else {
+        let Some(mode) = std::env::var_os("FILESYSTEM_PUBLISHER_CHILD_MODE") else {
             return;
         };
         let target = PathBuf::from(
-            std::env::var_os("ATT_FS_PUBLISHER_CHILD_TARGET").expect("子进程应提供目标路径"),
+            std::env::var_os("FILESYSTEM_PUBLISHER_CHILD_TARGET").expect("子进程应提供目标路径"),
         );
         let source = PathBuf::from(
-            std::env::var_os("ATT_FS_PUBLISHER_CHILD_SOURCE").expect("子进程应提供来源路径"),
+            std::env::var_os("FILESYSTEM_PUBLISHER_CHILD_SOURCE").expect("子进程应提供来源路径"),
         );
         let mode = mode.to_string_lossy();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5770,7 +6083,7 @@ mod tests {
             .build()
             .expect("应该可建立子进程运行时");
         runtime.block_on(async move {
-            let root = SystemFileSystem::new(file_system_config()).expect("应该可建立子进程根");
+            let root = TestDirectoryPublisher::new(file_system_config());
             let intent = if mode == "create" {
                 DirectoryPublishIntent::CreateNew
             } else {
@@ -5797,7 +6110,7 @@ mod tests {
             let result = root.publish(staged).await;
             if mode == "create" {
                 let result_path = PathBuf::from(
-                    std::env::var_os("ATT_FS_PUBLISHER_CHILD_RESULT")
+                    std::env::var_os("FILESYSTEM_PUBLISHER_CHILD_RESULT")
                         .expect("新建子进程应提供结果路径"),
                 );
                 let outcome = match result {
@@ -5825,7 +6138,7 @@ mod tests {
             fs::write(source.join("value.txt"), index.to_string()).expect("应该可写入来源");
             let result = temporary.path().join(format!("result-{index}"));
             let mut command = subprocess_command("create", &target, &source);
-            command.env("ATT_FS_PUBLISHER_CHILD_RESULT", &result);
+            command.env("FILESYSTEM_PUBLISHER_CHILD_RESULT", &result);
             children.push(command.spawn().expect("应该可启动发布子进程"));
             results.push(result);
         }
@@ -5863,14 +6176,14 @@ mod tests {
             fs::create_dir(&source).expect("应该可创建来源");
             fs::write(source.join("value.txt"), b"new").expect("应该可写入新内容");
             let target = temporary.path().join("target");
-            fs::create_dir_all(target.join("source/data")).expect("应该可创建旧目标");
-            fs::write(target.join("source/data/value.txt"), b"old").expect("应该可写入旧内容");
+            fs::create_dir_all(target.join("snapshot/content")).expect("应该可创建旧目标");
+            fs::write(target.join("snapshot/content/value.txt"), b"old").expect("应该可写入旧内容");
             let status = subprocess_command(&format!("abort:{phase}"), &target, &source)
                 .status()
                 .expect("应该可等待故障子进程");
             assert!(!status.success(), "故障点 {phase} 必须终止子进程");
 
-            let root = SystemFileSystem::new(file_system_config()).expect("应该可建立恢复根");
+            let root = TestDirectoryPublisher::new(file_system_config());
             for _ in 0..2 {
                 let staged = root
                     .prepare(stage_request(
@@ -5883,7 +6196,7 @@ mod tests {
                 root.discard(staged).await.expect("恢复后候选应可丢弃");
             }
             assert_eq!(
-                fs::read(target.join("source/data/value.txt")).expect("应该可读取恢复目标"),
+                fs::read(target.join("snapshot/content/value.txt")).expect("应该可读取恢复目标"),
                 expected,
                 "故障点 {phase} 恢复了错误一侧"
             );

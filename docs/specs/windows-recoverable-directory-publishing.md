@@ -1,180 +1,95 @@
-# Windows 可恢复目录发布现行规格
+# Windows 文件能力与可恢复目录发布现行规格
 
-本文定义 `SystemFileSystem` 在 Windows x64 MSVC 进程中提供的文件访问与
-`RecoverableDirectoryPublisher` 行为。该根把一个完整目录候选作为单一发布对象，
-为 Init 的项目创建/收敛和 WriteBack 的唯一候选整体替换提供跨进程线性化、进程
-崩溃后恢复及有界资源占用。
+## 1. 边界
 
-## 1. 平台与路径边界
+`SystemFileSystem` 提供普通读取、目录树指纹、通用独占文件租约、受控候选编辑和可恢复目录发布。根只理解文件、目录、路径范围、物理身份、锁和资源预算，不理解项目、MZ、`data/js` 或审计 wire。
 
-发布目标、同级 stage、backup、journal 和锁文件必须位于本机固定、非大小写敏感的
-NTFS 卷。根从卷根开始逐组件以不跟随 reparse point 的方式打开路径，并在同步操作
-期间持有无删除共享句柄。路径链中任一符号链接、junction、mount point 或其他
-reparse point 都会使操作失败；最终对象通过 Win32 volume serial 与 128 位 file ID
-复核身份。
+不对 `projects.root` 做全局 NTFS 品牌检查。普通读取和指纹只验证当前操作需要的普通文件、稳定身份、reparse/hardlink 拒绝与预算。独占租约在实际取得锁时验证锁能力；发布器在真实 prepare/publish 时验证同卷、handle rename、稳定 file ID 与恢复能力。
 
-Windows 名称按系统的序数、忽略大小写语义比较。以下名称不进入候选或发布协议：
+## 2. 普通文件与树指纹
 
-- 大小写等价的同目录重名；
-- 尾点、尾空格、设备名、控制字符和保留符号；
-- ADS 语法；
-- 根保留的 stage、backup、journal 命名空间。
+Resolver、Lister、Reader 和 Fingerprinter 共享固定工作线程与有界队列：
 
-递归复制只接受单链接普通文件和普通目录的主数据流；来源中的 hardlink 直接失败，
-不会先复制成一个看似普通的新文件。每个来源项在枚举时固定 file ID 与长度，复制时
-以拒绝其他写入者的句柄重新打开并复核，读取完成后再次确认 file ID、长度、链接数和
-实际字节数。候选新建文件继承发布目标父目录的 ACL；根不复制 ACL、ADS 和时间戳。
+- Resolver 返回不跟随 reparse point 的规范绝对目录；
+- Lister 只列直接子项，拒绝 reparse、非普通对象、hardlink 和身份替换，并限制条目数；
+- Reader 在分配前检查固定句柄长度，完整读取受单文件预算保护；
+- Fingerprinter 按 Windows UTF-16 相对名的稳定顺序，把类型、空目录、文件长度和完整字节写入有 framing 的 SHA-256；绝对路径、时间戳、ACL 和 ADS 不参与。
 
-## 2. 普通文件能力
+工作一旦进入文件队列便执行到明确终态，等待 Future 被丢弃不撤销已接管操作。
 
-`ExistingDirectoryResolver`、`DirectoryLister`、`FileReader` 和
-`DirectoryTreeFingerprinter` 共享固定线程数、有界队列的文件工作池。相对路径在
-方法调用时以进程当前工作目录转换为绝对路径；worker 不重新解释调用方的当前目录。
+## 3. 通用独占文件租约与 MZ 映射
 
-- Resolver 返回逐组件校验后的规范绝对目录；
-- Lister 只列举直接子项，返回规范绝对路径及普通文件/目录种类；逐项固定并拒绝
-  reparse point、非普通对象、硬链接文件和枚举后的身份替换，且受单目录条目数限制；
-- Reader 在分配前读取已固定文件句柄的长度，受完整文件字节上限约束，并返回原始
-  字节与规范绝对路径。
-- Fingerprinter 对一个或多个逻辑根稳定遍历普通目录树，把 Windows UTF-16 相对名、
-  类型、空目录、文件长度和全部字节写入无歧义 SHA-256；绝对路径和文件属性不参与。
-  每轮同时保留按逻辑路径自然顺序排列的根、目录、文件 file ID；连续两轮必须同时
-  得到相同摘要和相同身份映射。枚举后的对象重新打开时、目录枚举结束时及文件读取
-  完成时都会复核原身份，因此用相同字节替换成新对象也属于观察期间变化。
+根契约接收一个锁目录和一个不透明 identity，生成稳定锁文件名并取得跨进程独占锁。它不解释项目名称。
 
-工作进入有界队列前可以被取消；工作池一旦接管任务，即使等待结果的 Future 被丢弃，
-任务仍执行到明确终态。worker panic 被隔离为根错误，其他 worker 继续服务。
-
-## 3. 项目操作租约
-
-`ProjectOperationLeaseProvider` 在 `<projects.root>/.att-project-locks/` 为精确项目目录名
-取得跨进程排他锁。项目身份使用 Windows ordinal case-insensitive 语义，因此仅大小写
-不同的同名项目共享一把锁；不同项目没有全局互斥。
+MZ 的 `ProjectCommandLeaseService` 只负责选择固定锁目录，并把受信 `ProjectName` 作为不透明语义 identity 交给通用文件根：
 
 ```text
-acquire_project_operation_lease(ProjectOperationLeaseRequest)
-→ ProjectOperationLease<LeaseState> | Busy | Unavailable
+ProjectName → <projects.root>/.att-locks/projects + 不透明 identity
+            → 通用文件根按 Windows 非大小写敏感语义规范化
+            → 稳定 SHA-256 摘要文件名 → 独占文件锁
 ```
 
-等待上限只来自 `runtime.filesystem.project_lock.timeout_ms`。超时返回 `Busy` 并由命令
-映射为 `ProjectBusy`；文件系统故障返回 `Unavailable`。lease 不可复制，命令持有它
-直到全部业务和候选终结，Drop 释放锁。同一进程和可信 Lua 子进程都不能绕过这条
-跨进程互斥；锁顺序固定为项目租约 → 目标发布锁 → SQLite。
+因此 MZ 不拥有锁文件名算法，通用根也不理解项目或 MZ；两者只在“锁目录 + identity”的契约处交接。
 
-## 4. 候选请求与唯一终结令牌
+目录发布器的目标锁位于 `<projects.root>/.att-locks/directory-publish/`。同项目四命令互斥，不同项目并行；固定锁序是项目租约、目录发布锁、SQLite/session。锁文件不进入会被 Init 替换的项目工作区。
 
-`DirectoryStageRequest` 在构造边界固定以下事实：
+## 4. 通用候选编辑
+
+候选编辑根接收：
 
 ```text
-target_root
-publish_intent = CreateNew | ReplaceExisting
-source_mappings[]
-overlays[]
-empty_directories[]
+候选物理身份
+安全相对路径
+调用方声明的可编辑顶层集合
 ```
 
-来源映射、覆盖和空目录使用严格相对 Windows 路径，并在请求构造时拒绝重复、重叠、
-绝对路径和父级逃逸。overlay 必须落在一个来源映射内。
+根负责拒绝绝对路径、父级逃逸、ADS、越出声明范围、删除声明根、reparse、hardlink、对象身份变化和预算超限。根不内置任何顶层名称。
 
-`prepare(request)` 先取得同目标跨进程锁并恢复该目标的已知残留，再在目标同级建立
-私有候选。来源目录、overlay 和空目录共同计入以下外部配置预算：
+MZ WriteBack 唯一声明 `{data, js}`，并在领域边界验证候选顶层精确等于 `data/js`。其他消费者可以声明完全不同的顶层集合，无需修改文件根。
 
-- 同时保留的候选数；
-- 候选总条目数、最大深度和总字节数；
-- 单文件字节数；
-- 复制来源单目录条目数；
-- 单目标恢复产物数和目标锁等待时间。
+## 5. 候选与终结令牌
 
-成功返回的 `StagedDirectory` 不可复制，记录 publisher 实例身份、操作 UUID、父目录
-和候选 file ID、发布意图、候选容量许可及同目标锁。`publish(token)` 与
-`discard(token)` 按值消费；token 只能交还创建它的同一 publisher 实例。调用方在
-收到 token 后直接丢弃属于内部契约错误，根仍会尽力清理未发布的候选。
+`DirectoryStageRequest` 包含目标、`CreateNew | ReplaceExisting`、来源映射、overlay 和空目录。所有候选路径必须是安全相对路径；来源、覆盖、空目录的重叠与预算在 prepare 前拒绝。
 
-`StagedDirectory` 允许受信非根服务在候选中建立后续产物，例如 Init 转换
-`project.db`，或 WriteBack Lua 通过 `ctx.output` 修改同一个候选。因此 `publish` 在
-任何可见交换前必须重新枚举完整候选，把后续产物一并纳入条目、深度、单文件和总
-字节预算，并重新拒绝 reparse point、非普通对象、共享同一物理文件身份的硬链接和
-Windows 等价重名。复核失败时返回 `NotAttempted` 并精确清理候选，最终目标不变。
+prepare 取得同目标跨进程锁、恢复已知残留，并在 target 同父目录建立 stage。任一准备失败都统一返回 `NotPrepared`，同时保留目标、首因及可选候选清理失败。成功 token 不可复制，只能由同一 publisher 按值 `publish` 或 `discard`。stage、backup 和 journal 位于 target 同父目录以保证同卷切换；锁文件单独位于 `.att-locks/directory-publish/`。
 
-## 5. CreateNew
+当前产品一次命令只拥有一个候选。树条目、深度、总字节、单文件和单目标恢复产物预算继续存在。
 
-`CreateNew` 不预检后宣称成功。根使用 Win32 无覆盖 handle rename 把已完成候选移动到
-最终名称，该 rename 是同名并发创建的线性化点：
+发布前重新枚举完整候选，纳入后续数据库产物和 Lua 编辑，并再次验证 file ID、普通对象、Windows 等价名称、reparse、hardlink 和预算。MZ 的顶层结构校验在这一通用复核之前由 WriteBack 自己完成。
 
-- 目标不存在时，候选成为目标；
-- 任意同名对象已经存在时返回 `TargetAlreadyExists`；
-- 其他失败保持 `NotAttempted`、`NotPublished` 或 `OutcomeUnknown` 的真实语义。
+## 6. CreateNew 与 ReplaceExisting
 
-该意图绝不覆盖已有文件或目录。
+CreateNew 使用无覆盖 handle rename 作为同名创建线性化点，目标已经存在返回 `TargetAlreadyExists`，绝不覆盖。
 
-## 6. ReplaceExisting 与 journal
-
-`ReplaceExisting` 要求目标是现存目录。目标缺失返回 `TargetMissing`，目标不是目录或
-是 reparse point 返回 `TargetNotDirectory` 或对应根错误。切换始终在同目标跨进程锁内
-执行：
+ReplaceExisting 在同目标锁内执行：
 
 ```text
-写入并 sync OriginalMoveIntent
-target -> backup
-追加并 sync CandidateMoveIntent
-stage -> target
-追加并 sync CandidateVisible
-复核新 target file ID
-清理 backup
-删除 journal
+写入并刷盘 OriginalMoveIntent journal
+target → backup
+写入并刷盘 CandidateMoveIntent
+stage → target
+写入并刷盘 CandidateVisible
+复核新 target 身份
+清理 backup 与 journal
 ```
 
-journal 每帧为 `u32 length + JSON payload + CRC32`。每次追加后执行 `sync_data`。
-完整但 CRC、JSON、操作 ID、文件身份或阶段序列无效的帧属于损坏；只有文件末尾的
-不完整帧可以回退到最后一个完整帧。journal 只保存完成恢复所需的目标名称、old/new
-file ID、操作 UUID 和阶段，不用路径展示文本充当身份。
+journal 使用长度、严格 JSON payload 和 CRC32 framing。只有最终不完整帧可以回退；完整损坏帧、外来身份或第三方占位导致 `OutcomeUnknown`，不得猜测清理。
 
-两次目录 rename 之间允许目标名称短暂缺失；根不会把逐文件半成品暴露为最终目录。
+下一次同目标操作按 journal 与 file ID 恢复：old 未移动则保留 old；old 在 backup 且 new 在 stage 时恢复 old；new 已成为 target 时保留 new 并继续清理；身份已知但目标暂缺返回 `RecoveryRequired`；无法归类返回 `OutcomeUnknown`。
 
-## 7. 按目标恢复
+## 7. 终态与生命周期
 
-恢复不在进程启动时扫描全部项目。下一次针对同一目标执行 `prepare` 时，在取得相同
-目标锁后，根据 journal、目标、stage 和 backup 的 file ID 分类：
+发布终态固定为：
 
-- old 尚未移动：保留 old，清理未发布候选和 journal；
-- old 位于 backup 且 new 仍在 stage：把 old 恢复为 target；
-- new 已位于 target：保留 new，继续清理 backup 和 journal；
-- 目标暂时缺失但 old/new 身份与位置仍可证明：返回 `RecoveryRequired` 并保留证据；
-- 出现外来 file ID、损坏 journal、第三方占位对象或无法证明的组合：返回
-  `OutcomeUnknown`，不猜测、不删除证据、不自动重试。
+- `TargetAlreadyExists`；
+- `TargetMissing`；
+- `TargetNotDirectory`；
+- `NotAttempted`；
+- `NotPublished`；
+- `PublishedWithResiduals`；
+- `RecoveryRequired`；
+- `OutcomeUnknown`。
 
-无 journal 的私有 stage 可以在持锁状态下清理；无 journal 的 backup 不能猜测其
-归属。stage、backup、journal 作为一个集合计入单目标恢复产物上限。
+只有完全成功表示目标已经生效且无残留。`PublishedWithResiduals` 明确表示新目标已生效；`RecoveryRequired`/`OutcomeUnknown` 保留现场，不由调用方猜测、重试或删除。
 
-候选、备份和 journal 的清理不使用“先校验路径、再按路径删除”。根先用拒绝
-reparse 的句柄固定整条父路径和待删除对象，读取 file ID，然后用含
-`DELETE` 权限的句柄再次复核同一身份并执行 disposition。目录的每个子项依次按
-同一规则清空，最后才删除空目录本身。任一路径被外来 file ID 替换、变成 reparse
-point、被不共享删除的句柄占用，或在枚举期间新增子项时，清理显式失败并保留证据，
-绝不退回对同名路径的递归删除。
-
-## 8. 发布终态
-
-根向消费方保留以下互斥含义：
-
-- `TargetAlreadyExists`：CreateNew 的目标名称已经被占用；
-- `TargetMissing`：ReplaceExisting 没有现存目标；
-- `TargetNotDirectory`：ReplaceExisting 的目标不是可替换目录；
-- `NotAttempted`：尚未开始可见目录交换；
-- `NotPublished`：候选未成为目标，原目标已按 file ID 恢复并复核；
-- `PublishedWithResiduals`：新目标已经生效，但 backup、journal 或清理产物残留；
-- `RecoveryRequired`：old/new 身份已知，目标当前需要下一次同目标操作继续恢复；
-- `OutcomeUnknown`：无法可靠确认目标身份或可用状态。
-
-`PublishedWithResiduals` 不是完全成功，`RecoveryRequired` 和 `OutcomeUnknown` 不触发
-调用方重试或额外清理。已知未发布终态携带实际残留路径；显式 `discard` 失败携带准确
-stage 路径。
-
-## 9. 生命周期与耐久边界
-
-FileSystem shutdown 先停止准入，再排空已接管的普通文件、候选准备、发布、恢复和清理
-工作，最后 join 固定 worker。shutdown 不在中途遗弃已经接管的目录副作用。
-
-候选文件内容和每个 journal 帧在确认前执行 `sync_data`，发布过程使用同卷 Win32
-handle rename。契约保证正常 Win32 故障和进程崩溃后能够依据持久 journal 恢复；不承诺
-任意硬件、控制器或文件系统在突然断电下具有绝对耐久性。
+shutdown 停止新准入，排空已接管的文件、候选、恢复和清理工作。契约保证正常 Win32 故障和进程崩溃后能够依据 journal 恢复，不承诺任意硬件断电下绝对耐久。

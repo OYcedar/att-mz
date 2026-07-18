@@ -228,20 +228,6 @@ fn validate_language_id(
     Ok(())
 }
 
-/// 根据 CLI 选择建立一次翻译执行所需的受信配置。
-///
-/// 选择只在已经由外部加载的配置集合中同步完成；实现不得读取文件、执行 I/O、
-/// 补充默认值或根据运行环境自行选择配置。
-pub(crate) trait TranslationExecutionProfileResolver: Send + Sync {
-    /// 下层翻译能力共同消费的完整执行配置。
-    type Profile: Send + Sync + 'static;
-    /// 配置不存在、无效或无法建立时的失败。
-    type Error: Error + Send + Sync + 'static;
-
-    /// 按调用方明确指定的 Profile 标识选择执行配置。
-    fn resolve(&self, profile_id: &str) -> Result<Self::Profile, Self::Error>;
-}
-
 /// 一次翻译运行共享的不可变执行配置。
 ///
 /// `payload` 由外部配置边界建立并保持不透明；本类型只固定所有翻译阶段共同需要的
@@ -292,152 +278,9 @@ impl<P> fmt::Debug for TranslationExecutionProfile<P> {
     }
 }
 
-/// 已由外部配置边界建立的完整 Profile 集合。
-///
-/// 构造成功后，集合非空、每个 ID 至少包含一个非空白字符，并且 ID 按原值精确唯一。
-/// 集合不修剪、不正规化，也不折叠大小写。
-pub(crate) struct TranslationProfileCatalog<P> {
-    profiles_by_id: BTreeMap<String, Arc<TranslationExecutionProfile<P>>>,
-}
-
-impl<P> TranslationProfileCatalog<P> {
-    pub(crate) fn new(
-        profiles: impl IntoIterator<Item = TranslationExecutionProfile<P>>,
-    ) -> Result<Self, TranslationProfileCatalogError> {
-        let mut profiles_by_id = BTreeMap::new();
-
-        for (index, profile) in profiles.into_iter().enumerate() {
-            if profile.id().trim().is_empty() {
-                return Err(TranslationProfileCatalogError::BlankId { index });
-            }
-
-            let id = profile.id().to_owned();
-            if profiles_by_id.contains_key(&id) {
-                return Err(TranslationProfileCatalogError::DuplicateId { id });
-            }
-            profiles_by_id.insert(id, Arc::new(profile));
-        }
-
-        if profiles_by_id.is_empty() {
-            return Err(TranslationProfileCatalogError::Empty);
-        }
-
-        Ok(Self { profiles_by_id })
-    }
-
-    fn get(&self, id: &str) -> Option<Arc<TranslationExecutionProfile<P>>> {
-        self.profiles_by_id.get(id).cloned()
-    }
-
-    fn available_ids(&self) -> Vec<String> {
-        self.profiles_by_id.keys().cloned().collect()
-    }
-}
-
-impl<P> fmt::Debug for TranslationProfileCatalog<P> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TranslationProfileCatalog")
-            .field(
-                "profile_ids",
-                &self.profiles_by_id.keys().collect::<Vec<_>>(),
-            )
-            .finish()
-    }
-}
-
-/// 外部 Profile 集合无法建立时的配置错误。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationProfileCatalogError {
-    /// 没有提供任何可选择的 Profile。
-    Empty,
-    /// 第 `index` 个 Profile 的 ID 不包含非空白字符。
-    BlankId { index: usize },
-    /// 两个 Profile 使用了完全相同的 ID。
-    DuplicateId { id: String },
-}
-
-impl fmt::Display for TranslationProfileCatalogError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("没有配置任何翻译 Profile"),
-            Self::BlankId { index } => {
-                write!(formatter, "第 {} 个翻译 Profile 的 ID 为空", index + 1)
-            }
-            Self::DuplicateId { id } => write!(formatter, "翻译 Profile ID 重复：{id}"),
-        }
-    }
-}
-
-impl Error for TranslationProfileCatalogError {}
-
-/// 在一个受信、不可变的 Profile 集合中执行精确 ID 选择。
-pub(crate) struct InMemoryTranslationExecutionProfileResolver<P> {
-    catalog: TranslationProfileCatalog<P>,
-}
-
-impl<P> InMemoryTranslationExecutionProfileResolver<P> {
-    pub(crate) const fn new(catalog: TranslationProfileCatalog<P>) -> Self {
-        Self { catalog }
-    }
-}
-
-impl<P> fmt::Debug for InMemoryTranslationExecutionProfileResolver<P> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("InMemoryTranslationExecutionProfileResolver")
-            .field("catalog", &self.catalog)
-            .finish()
-    }
-}
-
-impl<P> TranslationExecutionProfileResolver for InMemoryTranslationExecutionProfileResolver<P>
-where
-    P: Send + Sync + 'static,
-{
-    type Profile = Arc<TranslationExecutionProfile<P>>;
-    type Error = TranslationExecutionProfileResolveError;
-
-    fn resolve(&self, profile_id: &str) -> Result<Self::Profile, Self::Error> {
-        self.catalog.get(profile_id).ok_or_else(|| {
-            TranslationExecutionProfileResolveError::UnknownProfile {
-                requested_id: profile_id.to_owned(),
-                available_ids: self.catalog.available_ids(),
-            }
-        })
-    }
-}
-
-/// 调用方指定的 Profile 无法在受信集合中找到。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationExecutionProfileResolveError {
-    UnknownProfile {
-        requested_id: String,
-        available_ids: Vec<String>,
-    },
-}
-
-impl fmt::Display for TranslationExecutionProfileResolveError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownProfile {
-                requested_id,
-                available_ids,
-            } => write!(
-                formatter,
-                "找不到翻译 Profile {requested_id}；可用 Profile：{}",
-                available_ids.join("、")
-            ),
-        }
-    }
-}
-
-impl Error for TranslationExecutionProfileResolveError {}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::super::standard::StandardTranslationProfile;
@@ -454,14 +297,6 @@ mod tests {
         TranslationExecutionProfile::new(id, non_zero(3), SensitivePayload(secret))
     }
 
-    fn catalog() -> TranslationProfileCatalog<SensitivePayload> {
-        TranslationProfileCatalog::new([
-            profile("alpha", "alpha-secret"),
-            profile("beta", "beta-secret"),
-        ])
-        .expect("测试 Profile 集合应该合法")
-    }
-
     #[test]
     fn profile_exposes_only_trusted_read_only_values() {
         let profile = profile("alpha", "alpha-secret");
@@ -472,147 +307,18 @@ mod tests {
     }
 
     #[test]
-    fn catalog_rejects_empty_blank_and_duplicate_profiles() {
-        assert_eq!(
-            TranslationProfileCatalog::<SensitivePayload>::new([]).expect_err("空集合应该失败"),
-            TranslationProfileCatalogError::Empty
-        );
-
-        for blank_id in ["", "   ", "\t\r\n"] {
-            assert_eq!(
-                TranslationProfileCatalog::new([profile(blank_id, "secret")])
-                    .expect_err("空白 ID 应该失败"),
-                TranslationProfileCatalogError::BlankId { index: 0 }
-            );
-        }
-
-        assert_eq!(
-            TranslationProfileCatalog::new([
-                profile("same", "first-secret"),
-                profile("same", "second-secret"),
-            ])
-            .expect_err("重复 ID 应该失败"),
-            TranslationProfileCatalogError::DuplicateId {
-                id: "same".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn exact_ids_are_not_trimmed_normalized_or_case_folded() {
-        let resolver = InMemoryTranslationExecutionProfileResolver::new(
-            TranslationProfileCatalog::new([
-                profile("alpha", "lower-secret"),
-                profile("Alpha", "upper-secret"),
-                profile(" alpha ", "spaced-secret"),
-            ])
-            .expect("三个精确 ID 应该互不重复"),
-        );
-
-        assert_eq!(
-            resolver.resolve("alpha").expect("小写 ID 应该存在").id(),
-            "alpha"
-        );
-        assert_eq!(
-            resolver.resolve("Alpha").expect("大写 ID 应该存在").id(),
-            "Alpha"
-        );
-        assert_eq!(
-            resolver
-                .resolve(" alpha ")
-                .expect("带空格的原始 ID 应该存在")
-                .id(),
-            " alpha "
-        );
-        assert!(matches!(
-            resolver.resolve("ALPHA"),
-            Err(TranslationExecutionProfileResolveError::UnknownProfile { .. })
-        ));
-    }
-
-    #[test]
-    fn repeated_resolution_returns_the_same_arc_snapshot() {
-        let resolver = InMemoryTranslationExecutionProfileResolver::new(catalog());
-
-        let first = resolver.resolve("alpha").expect("Profile 应该存在");
-        let second = resolver.resolve("alpha").expect("Profile 应该存在");
-
-        assert!(Arc::ptr_eq(&first, &second));
-    }
-
-    #[test]
-    fn unknown_profile_reports_requested_and_sorted_available_ids() {
-        let resolver = InMemoryTranslationExecutionProfileResolver::new(catalog());
-
-        let error = resolver
-            .resolve("missing")
-            .expect_err("未知 Profile 不得回退到其它配置");
-
-        assert_eq!(
-            error,
-            TranslationExecutionProfileResolveError::UnknownProfile {
-                requested_id: "missing".to_owned(),
-                available_ids: vec!["alpha".to_owned(), "beta".to_owned()],
-            }
-        );
-        assert!(error.source().is_none());
-    }
-
-    #[test]
-    fn concurrent_resolution_has_no_shared_active_selection() {
-        let resolver = Arc::new(InMemoryTranslationExecutionProfileResolver::new(catalog()));
-        let expected_alpha = resolver.resolve("alpha").expect("alpha 应该存在");
-        let expected_beta = resolver.resolve("beta").expect("beta 应该存在");
-        let barrier = Arc::new(Barrier::new(3));
-
-        let alpha_resolver = Arc::clone(&resolver);
-        let alpha_barrier = Arc::clone(&barrier);
-        let alpha = thread::spawn(move || {
-            alpha_barrier.wait();
-            alpha_resolver.resolve("alpha").expect("alpha 应该存在")
-        });
-
-        let beta_resolver = Arc::clone(&resolver);
-        let beta_barrier = Arc::clone(&barrier);
-        let beta = thread::spawn(move || {
-            beta_barrier.wait();
-            beta_resolver.resolve("beta").expect("beta 应该存在")
-        });
-
-        barrier.wait();
-        let resolved_alpha = alpha.join().expect("alpha 选择线程不应 panic");
-        let resolved_beta = beta.join().expect("beta 选择线程不应 panic");
-
-        assert!(Arc::ptr_eq(&resolved_alpha, &expected_alpha));
-        assert!(Arc::ptr_eq(&resolved_beta, &expected_beta));
-        assert!(!Arc::ptr_eq(&resolved_alpha, &resolved_beta));
-        assert!(Arc::ptr_eq(
-            &resolver.resolve("alpha").expect("alpha 应该保持可选"),
-            &expected_alpha
-        ));
-    }
-
-    #[test]
     fn debug_output_never_reads_or_exposes_payload() {
         let profile = profile("private", "never-print-this-secret");
         let profile_debug = format!("{profile:?}");
         assert!(profile_debug.contains("private"));
         assert!(profile_debug.contains("[REDACTED]"));
         assert!(!profile_debug.contains("never-print-this-secret"));
-
-        let resolver = InMemoryTranslationExecutionProfileResolver::new(
-            TranslationProfileCatalog::new([profile]).expect("Profile 集合应该合法"),
-        );
-        let resolver_debug = format!("{resolver:?}");
-        assert!(resolver_debug.contains("private"));
-        assert!(!resolver_debug.contains("never-print-this-secret"));
     }
 
     #[test]
-    fn resolver_and_selected_profile_are_send_and_sync_without_clone_payload() {
+    fn selected_profile_is_send_and_sync_without_clone_payload() {
         fn assert_send_sync<T: Send + Sync>() {}
 
-        assert_send_sync::<InMemoryTranslationExecutionProfileResolver<SensitivePayload>>();
         assert_send_sync::<Arc<TranslationExecutionProfile<SensitivePayload>>>();
     }
 
@@ -693,9 +399,7 @@ mod tests {
             non_zero(3)
         );
 
-        let selected = InMemoryTranslationExecutionProfileResolver::new(catalog())
-            .resolve("alpha")
-            .expect("alpha 应该存在");
+        let selected = Arc::new(profile("alpha", "alpha-secret"));
         assert_eq!(
             StandardTranslationProfile::max_in_flight_tasks(&selected),
             non_zero(3)

@@ -96,7 +96,8 @@ impl MzDocumentSelection {
 /// `plugins.js` 中一个插件的无损记录。
 ///
 /// 这里保留完整对象，插件名称、启用状态和参数结构由真正消费它们的 Rules 模块
-/// 解释。这样读取边界不会因为当前只需要参数而丢弃说明或未来新增字段。
+/// 解释；写回会修改参数叶后重新序列化整条记录，因此读取边界必须无损保留当前
+/// 不参与 Rules 判断的其余字段。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginConfiguration {
     index: usize,

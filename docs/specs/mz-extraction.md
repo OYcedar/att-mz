@@ -243,9 +243,9 @@ Builtin 把独立标准文件、Map、CommonEvents 和 Troops 形成 CPU 工作�
 排序和重复地址检查同样经 CPU 根执行器完成。并发数为 1 或大于 1 时，最终快照与
 SQLite 事务计划必须完全一致。
 
-阶段上限只限制一次提取可占用的份额；根适配器还必须用进程级预算约束多个项目和
-未来其他纵向切片的总资源。不得使用无界任务、全局默认线程池、执行器隐式阻塞配额
-或硬件探测来替代显式配置。
+阶段上限只限制一次提取可占用的份额；根适配器还必须用进程级预算统一约束文档解析、
+Builtin/Rules 匹配和资产编码这些现实消费者。不得使用无界任务、全局默认线程池、
+执行器隐式阻塞配额或硬件探测来替代显式配置。
 
 ## 7. 外部必填配置
 
@@ -278,8 +278,10 @@ runtime.filesystem.worker_threads
 runtime.filesystem.queue_capacity
 runtime.sqlite.max_open_connections
 runtime.sqlite.short_queue_capacity
-runtime.lua.worker_threads
-runtime.lua.queue_capacity
+runtime.lua.worker_stack_bytes
+runtime.lua.memory_limit_bytes_per_vm
+runtime.lua.cancel_check_instruction_interval
+runtime.lua.host_values
 
 runtime.sqlite.busy_timeout_ms
 runtime.sqlite.journal_mode       # delete / truncate / persist / wal
@@ -307,7 +309,10 @@ Builtin/Rules 相同的位置和文档构造能力，Lua 无需自行复制 JSON
 
 ```mermaid
 flowchart TD
-    ES["ExtractService"] --> LEASE["SystemFileSystem<br/>ProjectOperationLeaseProvider"]
+    ES["ExtractService"] --> LEASE["ProjectCommandLeaseService"]
+    LEASE --> FLEASE["SystemFileSystem<br/>ExclusiveFileLeaseProvider"]
+    ES --> AUDIT["MzAuditLedger<br/>audit.jsonl"]
+    AUDIT --> JSONL["JsonLinesEventLog<br/>通用追加/轮转/sync_data"]
     ES["ExtractService"] --> OS["ExistingProjectOpeningService"]
     ES --> BS["BuiltInExtractionService"]
     ES --> RS["RulesExtractionService"]
@@ -356,6 +361,8 @@ RusqliteStorage
 TrustedLua54Runtime  // 只在显式 --lua 时构造
 ```
 
-`ProductionMzCommandRunner` 仅为当前 Extract 命令构造这些根。程序以固定顺序
-终结 Lua job 与交互会话、SQLite actor、文件工作队列和 CPU 工作线程；
-只有命令与全部 shutdown 都成功后才输出“提取完成”。
+`ProductionMzCommandRunner` 仅解析并构造当前 Extract 实际选择的配置与根。显式
+`--lua` 时每次脚本使用一个专用 OS 线程和一个 SQLite 交互会话。`run_started`
+确认后才取得项目租约；业务与非审计根终结后记录
+`run_finished`，最后关闭 Audit Ledger。只有命令、审计和全部 shutdown 都成功后才
+输出“提取完成”。

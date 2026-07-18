@@ -68,19 +68,19 @@ pub(crate) struct InitArguments {
     pub(crate) path: PathBuf,
     /// 游戏原文语言 ID。
     #[arg(long, value_name = "LANG", value_parser = parse_non_blank)]
-    pub(crate) source_language: String,
+    pub(crate) source_language: Option<String>,
     /// 译文目标语言 ID。
     #[arg(long, value_name = "LANG", value_parser = parse_non_blank)]
-    pub(crate) target_language: String,
+    pub(crate) target_language: Option<String>,
     /// 对话正文每行允许的最大全角字符数。
     #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
-    pub(crate) dialogue_max_fullwidth_chars: MaxFullwidthChars,
+    pub(crate) dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
     /// 滚动文本每行允许的最大全角字符数。
     #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
-    pub(crate) scrolling_text_max_fullwidth_chars: MaxFullwidthChars,
+    pub(crate) scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
     /// 帮助或说明框每行允许的最大全角字符数。
     #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
-    pub(crate) help_description_max_fullwidth_chars: MaxFullwidthChars,
+    pub(crate) help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
 }
 
 #[derive(Debug, Args)]
@@ -245,8 +245,24 @@ mod tests {
     }
 
     #[test]
-    fn init_requires_all_layout_widths() {
-        let error = AttArguments::try_parse_from([
+    fn init_accepts_only_project_and_game_path() {
+        let parsed =
+            AttArguments::try_parse_from(["att", "mz", "init", "--name", "demo", "--path", "game"])
+                .expect("后续 Init 应允许复用已经保存的语言和布局");
+        let MzCommand::Init(arguments) = parsed.product.into_mz() else {
+            panic!("应解析为 Init 命令");
+        };
+        assert_eq!(arguments.path, Path::new("game"));
+        assert!(arguments.source_language.is_none());
+        assert!(arguments.target_language.is_none());
+        assert!(arguments.dialogue_max_fullwidth_chars.is_none());
+        assert!(arguments.scrolling_text_max_fullwidth_chars.is_none());
+        assert!(arguments.help_description_max_fullwidth_chars.is_none());
+    }
+
+    #[test]
+    fn init_preserves_each_explicit_override_independently() {
+        let parsed = AttArguments::try_parse_from([
             "att",
             "mz",
             "init",
@@ -256,10 +272,22 @@ mod tests {
             "game",
             "--source-language",
             "ja",
-            "--target-language",
-            "zh-Hans",
+            "--dialogue-max-fullwidth-chars",
+            "24",
         ])
-        .expect_err("缺少布局宽度必须拒绝");
-        assert_eq!(error.exit_code(), 2);
+        .expect("Init 覆盖值应可以逐项提供");
+        let MzCommand::Init(arguments) = parsed.product.into_mz() else {
+            panic!("应解析为 Init 命令");
+        };
+        assert_eq!(arguments.source_language.as_deref(), Some("ja"));
+        assert_eq!(
+            arguments
+                .dialogue_max_fullwidth_chars
+                .map(MaxFullwidthChars::get),
+            Some(24)
+        );
+        assert!(arguments.target_language.is_none());
+        assert!(arguments.scrolling_text_max_fullwidth_chars.is_none());
+        assert!(arguments.help_description_max_fullwidth_chars.is_none());
     }
 }

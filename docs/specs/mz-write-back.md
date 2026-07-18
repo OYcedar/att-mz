@@ -10,7 +10,7 @@ WriteBack 从冻结来源和当前新鲜标准资产构造一个完整候选，�
 att [--config FILE] mz write-back --name NAME [--lua SCRIPT_LUA]
 ```
 
-命令先取得项目租约，然后开启项目并验证：
+命令先把 `run_started` 写入强审计账本，再取得项目租约并开启项目验证：
 
 - `source/data + source/js` 的实际 SHA-256 等于 metadata；
 - `project.db` 严格符合受管 schema；
@@ -24,7 +24,7 @@ att [--config FILE] mz write-back --name NAME [--lua SCRIPT_LUA]
 ## 2. 唯一执行顺序
 
 ```text
-项目租约
+run_started 已持久化 → 项目租约
    ↓
 读取新鲜标准资产和冻结文档
    ↓
@@ -34,11 +34,13 @@ prepare 一个包含 source/data、source/js 与 Standard overlays 的候选
    ↓ 显式 --lua
 Lua 通过 ctx.output / ctx.write_back 修改同一个未发布候选
    ↓
-重新验证 data/js 普通树、身份与全部候选预算
+MZ 验证顶层精确为 data/js；文件根复核声明范围、身份与全部预算
+   ↓
+持久化 write_back_publish_started
    ↓
 publish(token) 一次
    ↓
-发布成功后追加一次 WriteBack 持久日志
+持久化 write_back_publish_finished
 ```
 
 Standard、Lua 和候选验证中的任何技术失败都会停止流程。候选验证无论是否执行 Lua
@@ -71,18 +73,17 @@ WriteBack Lua 的 `ctx.output` 只绑定这个 candidate；它可以读写、建
 Lua 仍有 `ctx.db` 完整 SQL 逃生口。脚本显式提交的数据库事务不会因为之后 discard
 候选而自动回滚；数据库与目录发布不是同一个原子单元，幂等责任属于可信脚本。
 
-可选 Lua 结束后，WriteBack 无条件调用 Publisher 的借用式 `validate(&candidate)`；未选择
-Lua 时执行同一调用。生产 Publisher 使用与发布根同一个 `ScopedDirectoryEditor`，先把
-scope 绑定到候选物理身份，再从文件根验证：candidate 根下必须恰好存在普通 `data/`
-和 `js/` 目录，树中没有 reparse point、硬链接、非法 Windows 名称或物理逃逸，且条目、
-深度、单文件和总字节预算全部满足。验证不能信任 Standard、Lua 或先前观察。
+可选 Lua 结束后，MZ WriteBack 验证 candidate 根下必须恰好存在普通 `data/` 和
+`js/` 目录；这是领域规则。通用 `ScopedDirectoryEditor` 只绑定候选物理身份与调用方
+声明的可编辑顶层 `{data, js}`，验证安全相对路径、声明范围、reparse、硬链接、身份和
+条目/深度/字节预算，不内置 MZ 顶层名称。未选择 Lua 时也执行相同最终验证。
 
 `validate` 只借用 candidate，不取得终结权。验证失败时 WriteBack 恰好调用一次
 `discard(candidate)`，同时保留验证首因和可能的 discard 次错。验证成功后才检查最终
 取消并按值调用 `publish(candidate)`。发布根仍在实际目录交换前重新复核同一物理事实，
 防止验证与交换之间的状态变化；这次根复核已接管 token，失败后上层不得再 discard。
 
-## 5. 终结、发布与日志
+## 5. 终结、发布与强审计
 
 prepare 成功后、publish 开始前的任一失败、候选验证失败或取消，只调用一次
 `discard(token)`；
@@ -92,15 +93,18 @@ publish 按值消费 token。发布一旦开始，WriteBack 等待明确终态�
 `NotPublished`、`PublishedWithResiduals`、`RecoveryRequired` 和 `OutcomeUnknown` 保持
 各自含义，不自动重试或探测降级。
 
-只有新候选已经生效后才把 `WriteBackRunLog` 写入 `write_back.jsonl`。日志包含 run
-ID、项目、实际宽度、输出根、Standard 汇总、人工诊断和 `lua_executed`。日志失败是
-命令技术失败，但必须明确报告输出已经生效，不能回滚或误报未发布。
+发布前必须先把 `write_back_publish_started` 写入唯一 `audit.jsonl`；意图未确认时
+不得调用 publish。目录根返回明确终态后，用同一 `operation_id` 写
+`write_back_publish_finished`，其中包含实际宽度、输出根、Standard 汇总、人工诊断和
+`lua_executed`。终态审计失败时必须明确报告输出可能或已经生效但审计未确认，不能
+回滚、误报未发布或自动重做。
 
 ## 6. 依赖与锁顺序
 
 ```mermaid
 flowchart TD
-    WB["WriteBackService"] --> LEASE["ProjectOperationLeaseProvider"]
+    WB["WriteBackService"] --> LEASE["ProjectCommandLeaseService"]
+    LEASE --> FLEASE["SystemFileSystem<br/>ExclusiveFileLeaseProvider"]
     WB --> OPEN["ExistingProjectOpeningService"]
     OPEN --> FP["SourceSnapshotFingerprint"]
     FP --> FPFS["SystemFileSystem<br/>DirectoryTreeFingerprinter"]
@@ -111,7 +115,8 @@ flowchart TD
     PUB --> DIR["RecoverableDirectoryPublisher"]
     WB --> LUA["TrustedLuaExecutionHostingService（可选）"]
     LUA --> OUT["Candidate Output Host"]
-    WB --> LOG["WriteBackJsonLinesEventLog"]
+    WB --> AUDIT["MzAuditLedger<br/>audit.jsonl"]
+    AUDIT --> JSONL["JsonLinesEventLog<br/>通用追加/轮转/sync_data"]
 ```
 
 锁顺序固定为项目租约 → `write_back` 发布锁 → SQLite。项目租约超时返回

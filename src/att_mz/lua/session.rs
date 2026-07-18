@@ -81,67 +81,81 @@ where
     }
 }
 
-/// 终结时观察到的事务状态。
-#[derive(Debug)]
-pub(crate) enum SqliteInteractiveTransactionObservation<E> {
-    Idle,
-    Active,
-    Indeterminate,
-    Unavailable(E),
+/// 交互式会话已完整终结。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SqliteInteractiveSessionFinalization {
+    had_unclosed_transaction: bool,
 }
 
-/// 终结时对活动事务的回滚结果。
-#[derive(Debug)]
-pub(crate) enum SqliteInteractiveRollbackOutcome<E> {
-    NotRequired,
-    RolledBack,
-    Failed(E),
-    OutcomeUnknown(E),
-    NotAttempted,
-}
-
-/// 交互式连接的关闭结果。
-#[derive(Debug)]
-pub(crate) enum SqliteInteractiveConnectionCloseOutcome<E> {
-    Closed,
-    Failed(E),
-    OutcomeUnknown(E),
-}
-
-/// 交互式会话的完整终结报告。
-///
-/// 报告始终同时保留事务观察、回滚与连接关闭三个终态，因此关闭错误
-/// 不会覆盖先发生的回滚错误。
-#[derive(Debug)]
-pub(crate) struct SqliteInteractiveSessionFinalizationReport<E> {
-    transaction: SqliteInteractiveTransactionObservation<E>,
-    rollback: SqliteInteractiveRollbackOutcome<E>,
-    connection: SqliteInteractiveConnectionCloseOutcome<E>,
-}
-
-impl<E> SqliteInteractiveSessionFinalizationReport<E> {
-    pub(crate) fn new(
-        transaction: SqliteInteractiveTransactionObservation<E>,
-        rollback: SqliteInteractiveRollbackOutcome<E>,
-        connection: SqliteInteractiveConnectionCloseOutcome<E>,
-    ) -> Self {
+impl SqliteInteractiveSessionFinalization {
+    pub(crate) fn new(had_unclosed_transaction: bool) -> Self {
         Self {
-            transaction,
-            rollback,
-            connection,
+            had_unclosed_transaction,
         }
     }
 
-    pub(crate) fn transaction(&self) -> &SqliteInteractiveTransactionObservation<E> {
-        &self.transaction
+    pub(crate) fn had_unclosed_transaction(self) -> bool {
+        self.had_unclosed_transaction
     }
+}
 
-    pub(crate) fn rollback(&self) -> &SqliteInteractiveRollbackOutcome<E> {
-        &self.rollback
+/// 交互式会话终结的主失败语义。
+#[derive(Debug)]
+pub(crate) enum SqliteInteractiveSessionFinalizationFailure<E> {
+    CleanupFailed(E),
+    OutcomeUnknown(E),
+}
+
+impl<E> SqliteInteractiveSessionFinalizationFailure<E> {
+    pub(crate) fn source(&self) -> &E {
+        match self {
+            Self::CleanupFailed(source) | Self::OutcomeUnknown(source) => source,
+        }
     }
+}
 
-    pub(crate) fn connection(&self) -> &SqliteInteractiveConnectionCloseOutcome<E> {
-        &self.connection
+/// 交互式会话终结失败。
+///
+/// `primary` 保留回滚、actor panic 或唯一的关闭失败；若回滚失败后
+/// 连接关闭也失败，`connection_close` 同时保留第二个原因。
+#[derive(Debug)]
+pub(crate) struct SqliteInteractiveSessionFinalizationError<E> {
+    primary: Box<SqliteInteractiveSessionFinalizationFailure<E>>,
+    connection_close: Option<Box<E>>,
+}
+
+impl<E> SqliteInteractiveSessionFinalizationError<E> {
+    pub(crate) fn new(
+        primary: SqliteInteractiveSessionFinalizationFailure<E>,
+        connection_close: Option<E>,
+    ) -> Self {
+        Self {
+            primary: Box::new(primary),
+            connection_close: connection_close.map(Box::new),
+        }
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for SqliteInteractiveSessionFinalizationError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.primary.as_ref() {
+            SqliteInteractiveSessionFinalizationFailure::CleanupFailed(source) => {
+                write!(formatter, "无法完整终结交互式数据库会话：{source}")?;
+            }
+            SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(source) => {
+                write!(formatter, "交互式数据库会话的终结结果未知：{source}")?;
+            }
+        }
+        if let Some(source) = &self.connection_close {
+            write!(formatter, "；连接关闭也失败：{source}")?;
+        }
+        Ok(())
+    }
+}
+
+impl<E: Error + 'static> Error for SqliteInteractiveSessionFinalizationError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.primary.source())
     }
 }
 
@@ -184,7 +198,12 @@ pub(crate) trait SqliteInteractiveSessionFinalizer: Send + 'static {
 
     fn finalize(
         self,
-    ) -> impl Future<Output = SqliteInteractiveSessionFinalizationReport<Self::Error>> + Send;
+    ) -> impl Future<
+        Output = Result<
+            SqliteInteractiveSessionFinalization,
+            SqliteInteractiveSessionFinalizationError<Self::Error>,
+        >,
+    > + Send;
 }
 
 /// 工厂交付的交互式 SQLite 会话。

@@ -1,11 +1,9 @@
-//! 跨领域复用的持久事件日志与运行身份根契约。
+//! 跨领域复用的审计身份。
 //!
-//! 业务模块只提交已经建立的结构化事实。记录时间、物理顺序、轮转、刷盘和
-//! 跨进程协调都由日志根拥有；运行身份由独立根在业务副作用开始前建立。
+//! 运行身份、事件身份与操作身份分别表达一次命令、一条物理审计记录，以及一对
+//! 意图与终态之间的稳定关联。
 
-use std::error::Error;
 use std::fmt;
-use std::future::Future;
 
 use uuid::Uuid;
 
@@ -30,24 +28,36 @@ impl fmt::Display for RunId {
     }
 }
 
-/// 在一次业务运行开始副作用前产生不可猜测的运行身份。
-pub(crate) trait RunIdGenerator: Send + Sync {
-    type Error: Error + Send + Sync + 'static;
+/// 一条审计事件的全局唯一身份。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EventId(Uuid);
 
-    fn generate(&self) -> Result<RunId, Self::Error>;
+impl EventId {
+    pub(crate) const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
 }
 
-/// 按调用方定义的结构化事件类型追加持久日志。
-///
-/// 成功表示该条完整记录已经写入并通过 `sync_data` 确认。仅进入进程内队列、
-/// 仅写入用户态缓冲或只完成 `write` 都不能返回成功。
-pub(crate) trait PersistentEventLog<E>: Send + Sync
-where
-    E: Send + 'static,
-{
-    type Error: Error + Send + Sync + 'static;
+impl fmt::Display for EventId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
-    fn append(&self, event: E) -> impl Future<Output = Result<(), Self::Error>> + Send;
+/// 一对审计意图与终态共同使用的稳定操作身份。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct OperationId(Uuid);
+
+impl OperationId {
+    pub(crate) const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
 }
 
 #[cfg(test)]
@@ -61,5 +71,14 @@ mod tests {
         );
 
         assert_eq!(id.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn audit_ids_use_canonical_uuid_text() {
+        let uuid =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").expect("测试 UUID 应合法");
+
+        assert_eq!(EventId::from_uuid(uuid).to_string(), uuid.to_string());
+        assert_eq!(OperationId::from_uuid(uuid).to_string(), uuid.to_string());
     }
 }

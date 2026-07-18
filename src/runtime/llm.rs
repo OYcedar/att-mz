@@ -11,7 +11,7 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Client, Proxy, StatusCode, redirect};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::{Semaphore, watch};
 use tokio::time::{Instant, timeout_at};
@@ -52,6 +52,16 @@ impl OpenAiChatCompletionClient {
             parameters,
             rate_limiter: Arc::new(RateLimiter::direct(quota)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn api_key(&self) -> &SecretString {
+        &self.api_key
     }
 }
 
@@ -363,7 +373,7 @@ impl LlmTlsConfiguration {
 #[derive(Clone, Debug)]
 pub(crate) struct OpenAiExecutorConfiguration {
     max_active_requests: NonZeroUsize,
-    queue_capacity: usize,
+    total_capacity: NonZeroUsize,
     admission_timeout: Duration,
     connect_timeout: Duration,
     read_timeout: Duration,
@@ -377,33 +387,37 @@ impl OpenAiExecutorConfiguration {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         max_active_requests: NonZeroUsize,
-        queue_capacity: usize,
+        total_capacity: NonZeroUsize,
         admission_timeout: Duration,
         connect_timeout: Duration,
         read_timeout: Duration,
         pool_idle_timeout: Duration,
         pool_max_idle_per_host: usize,
         proxy: LlmProxyConfiguration,
-        tls: LlmTlsConfiguration,
     ) -> Self {
         Self {
             max_active_requests,
-            queue_capacity,
+            total_capacity,
             admission_timeout,
             connect_timeout,
             read_timeout,
             pool_idle_timeout,
             pool_max_idle_per_host,
             proxy,
-            tls,
+            tls: LlmTlsConfiguration::default(),
         }
+    }
+
+    /// 注入配置边界已经读取完成的附加根证书。
+    pub(crate) fn with_additional_pem_roots(mut self, roots: Vec<Vec<u8>>) -> Self {
+        self.tls = LlmTlsConfiguration::new(roots);
+        self
     }
 }
 
 /// 根构造无法建立安全的共享 HTTP Client。
 #[derive(Debug)]
 pub(crate) enum OpenAiExecutorBuildError {
-    CapacityOverflow,
     InvalidProxy(reqwest::Error),
     InvalidCertificate(reqwest::Error),
     BuildClient(reqwest::Error),
@@ -412,7 +426,6 @@ pub(crate) enum OpenAiExecutorBuildError {
 impl fmt::Display for OpenAiExecutorBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CapacityOverflow => formatter.write_str("LLM active + queue 容量溢出"),
             Self::InvalidProxy(_) => formatter.write_str("LLM 显式代理配置无效"),
             Self::InvalidCertificate(_) => formatter.write_str("LLM 额外 PEM 根证书无效"),
             Self::BuildClient(_) => formatter.write_str("无法构造 LLM HTTP Client"),
@@ -426,7 +439,6 @@ impl Error for OpenAiExecutorBuildError {
             Self::InvalidProxy(source)
             | Self::InvalidCertificate(source)
             | Self::BuildClient(source) => Some(source),
-            Self::CapacityOverflow => None,
         }
     }
 }
@@ -444,12 +456,6 @@ impl OpenAiChatCompletionExecutor {
     pub(crate) fn new(
         configuration: OpenAiExecutorConfiguration,
     ) -> Result<Self, OpenAiExecutorBuildError> {
-        let total_capacity = configuration
-            .max_active_requests
-            .get()
-            .checked_add(configuration.queue_capacity)
-            .ok_or(OpenAiExecutorBuildError::CapacityOverflow)?;
-
         let mut builder = Client::builder()
             .redirect(redirect::Policy::none())
             .no_proxy()
@@ -474,7 +480,7 @@ impl OpenAiChatCompletionExecutor {
 
         Ok(Self {
             client,
-            total_capacity: Arc::new(Semaphore::new(total_capacity)),
+            total_capacity: Arc::new(Semaphore::new(configuration.total_capacity.get())),
             active_capacity: Arc::new(Semaphore::new(configuration.max_active_requests.get())),
             admission_timeout: configuration.admission_timeout,
             lifecycle: Arc::new(LlmLifecycle::new()),
@@ -535,17 +541,11 @@ impl OpenAiChatCompletionExecutor {
             };
         }
 
-        validate_json_content_type(response.headers().get(CONTENT_TYPE))
-            .map_err(LlmRequestError::Fatal)?;
         let provider_request_id = response
             .headers()
             .get("x-request-id")
-            .map(|value| {
-                value.to_str().map(str::to_owned).map_err(|_| {
-                    LlmRequestError::Fatal(OpenAiChatCompletionError::InvalidProviderRequestId)
-                })
-            })
-            .transpose()?;
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let response_body = response.bytes().await.map_err(classify_transport_error)?;
         let parsed = parse_success_response(&response_body, provider_request_id)?;
 
@@ -583,13 +583,9 @@ pub(crate) enum OpenAiChatCompletionError {
     ShuttingDown,
     QueueFull,
     AdmissionTimeout { stage: AdmissionStage },
-    AdmissionClosed,
     SerializeRequest(serde_json::Error),
     Transport(reqwest::Error),
     HttpStatus { status: u16 },
-    MissingJsonContentType,
-    InvalidJsonContentType,
-    InvalidProviderRequestId,
     ParseResponse(serde_json::Error),
     InvalidResponseWire { reason: &'static str },
 }
@@ -600,19 +596,9 @@ impl fmt::Display for OpenAiChatCompletionError {
             Self::ShuttingDown => formatter.write_str("LLM 根正在关闭"),
             Self::QueueFull => formatter.write_str("LLM 请求队列已满"),
             Self::AdmissionTimeout { stage } => write!(formatter, "LLM {stage} 准入超时"),
-            Self::AdmissionClosed => formatter.write_str("LLM 活动请求通道已关闭"),
             Self::SerializeRequest(_) => formatter.write_str("无法序列化 LLM 请求"),
             Self::Transport(_) => formatter.write_str("LLM HTTP 传输失败"),
             Self::HttpStatus { status } => write!(formatter, "LLM HTTP 状态 {status}"),
-            Self::MissingJsonContentType => {
-                formatter.write_str("LLM 成功响应缺少 JSON Content-Type")
-            }
-            Self::InvalidJsonContentType => {
-                formatter.write_str("LLM 成功响应的 Content-Type 不是 JSON")
-            }
-            Self::InvalidProviderRequestId => {
-                formatter.write_str("LLM x-request-id 响应头不是有效文本")
-            }
             Self::ParseResponse(_) => formatter.write_str("LLM 成功响应不是有效 JSON"),
             Self::InvalidResponseWire { reason } => {
                 write!(
@@ -741,7 +727,7 @@ async fn wait_for_active(
     timeout_at(deadline, async {
         tokio::select! {
             result = &mut permit => result
-                .map_err(|_| LlmRequestError::Fatal(OpenAiChatCompletionError::AdmissionClosed)),
+                .map_err(|_| LlmRequestError::Fatal(OpenAiChatCompletionError::ShuttingDown)),
             () = &mut stopped => Err(LlmRequestError::Fatal(OpenAiChatCompletionError::ShuttingDown)),
         }
     })
@@ -801,102 +787,83 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Dur
     )
 }
 
-fn validate_json_content_type(
-    value: Option<&reqwest::header::HeaderValue>,
-) -> Result<(), OpenAiChatCompletionError> {
-    let value = value.ok_or(OpenAiChatCompletionError::MissingJsonContentType)?;
-    let value = value
-        .to_str()
-        .map_err(|_| OpenAiChatCompletionError::InvalidJsonContentType)?;
-    let media_type = value
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if media_type == "application/json"
-        || (media_type.starts_with("application/") && media_type.ends_with("+json"))
-    {
-        Ok(())
-    } else {
-        Err(OpenAiChatCompletionError::InvalidJsonContentType)
-    }
-}
-
-#[derive(Deserialize)]
-struct ChatCompletionResponseWire {
-    id: String,
-    choices: Vec<ChatCompletionChoiceWire>,
-    usage: Option<ChatCompletionUsageWire>,
-}
-
-#[derive(Deserialize)]
-struct ChatCompletionChoiceWire {
-    index: u64,
-    message: ChatCompletionMessageWire,
-    finish_reason: String,
-}
-
-#[derive(Deserialize)]
-struct ChatCompletionMessageWire {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ChatCompletionUsageWire {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-}
-
 fn parse_success_response(
     body: &[u8],
     provider_request_id: Option<String>,
 ) -> Result<LlmResponse, LlmRequestError<OpenAiChatCompletionError>> {
-    let wire: ChatCompletionResponseWire = serde_json::from_slice(body).map_err(|source| {
+    let wire: Value = serde_json::from_slice(body).map_err(|source| {
         LlmRequestError::Fatal(OpenAiChatCompletionError::ParseResponse(source))
     })?;
-    let [choice] = wire.choices.as_slice() else {
+    let object = wire
+        .as_object()
+        .ok_or_else(|| invalid_response("顶层必须为对象"))?;
+    let choices = object
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_response("choices 必须为数组"))?;
+    let mut matching_choices = choices.iter().filter(|choice| {
+        choice
+            .as_object()
+            .and_then(|choice| choice.get("index"))
+            .and_then(Value::as_u64)
+            == Some(0)
+    });
+    let Some(choice) = matching_choices.next() else {
         return Err(LlmRequestError::Fatal(
             OpenAiChatCompletionError::InvalidResponseWire {
-                reason: "choices 必须恰好包含一项",
+                reason: "choices 必须包含唯一的数值 index 0",
             },
         ));
     };
-    if choice.index != 0 {
+    if matching_choices.next().is_some() {
         return Err(LlmRequestError::Fatal(
             OpenAiChatCompletionError::InvalidResponseWire {
-                reason: "choice index 必须为 0",
+                reason: "choices 必须包含唯一的数值 index 0",
             },
         ));
     }
-    if choice.message.role != "assistant" {
-        return Err(LlmRequestError::Fatal(
-            OpenAiChatCompletionError::InvalidResponseWire {
-                reason: "message role 必须为 assistant",
-            },
-        ));
-    }
-    let finish_reason = match choice.finish_reason.as_str() {
+    let choice = choice
+        .as_object()
+        .expect("index 0 choice 已经确认是 JSON 对象");
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_response("index 0 choice 的 message 必须为对象"))?;
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_response("index 0 choice 的 message.content 必须为字符串"))?;
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_response("index 0 choice 的 finish_reason 必须为字符串"))?;
+    let finish_reason = match finish_reason {
         "stop" => LlmFinishReason::Stop,
         "length" => LlmFinishReason::Length,
         "content_filter" => LlmFinishReason::ContentFilter,
         other => LlmFinishReason::Other(other.to_owned()),
     };
-    let usage = wire.usage.map(|usage| {
-        LlmUsage::new(
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.total_tokens,
-        )
-    });
+    let provider_response_id = object.get("id").and_then(Value::as_str).map(str::to_owned);
+    let usage = object.get("usage").and_then(parse_usage);
     Ok(LlmResponse::new(
-        choice.message.content.clone(),
+        content,
         finish_reason,
         provider_request_id,
-        wire.id,
+        provider_response_id,
         usage,
+    ))
+}
+
+fn invalid_response(reason: &'static str) -> LlmRequestError<OpenAiChatCompletionError> {
+    LlmRequestError::Fatal(OpenAiChatCompletionError::InvalidResponseWire { reason })
+}
+
+fn parse_usage(value: &Value) -> Option<LlmUsage> {
+    let usage = value.as_object()?;
+    Some(LlmUsage::new(
+        usage.get("prompt_tokens")?.as_u64()?,
+        usage.get("completion_tokens")?.as_u64()?,
+        usage.get("total_tokens")?.as_u64()?,
     ))
 }
 
@@ -1031,14 +998,13 @@ mod tests {
     ) -> OpenAiChatCompletionExecutor {
         OpenAiChatCompletionExecutor::new(OpenAiExecutorConfiguration::new(
             non_zero_usize(max_active_requests),
-            queue_capacity,
+            non_zero_usize(max_active_requests + queue_capacity),
             admission_timeout,
             Duration::from_secs(2),
             Duration::from_secs(2),
             Duration::from_secs(30),
             2,
             LlmProxyConfiguration::Disabled,
-            LlmTlsConfiguration::default(),
         ))
         .expect("测试 LLM 根应构造成功")
     }
@@ -1153,6 +1119,24 @@ mod tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    fn core_success_body() -> &'static str {
+        r#"{"choices":[{"index":0,"message":{"content":"[]"},"finish_reason":"stop"}]}"#
+    }
+
+    fn response_with_invalid_request_id() -> Vec<u8> {
+        let body = core_success_body();
+        let mut response = b"HTTP/1.1 200 OK\r\nx-request-id: ".to_vec();
+        response.push(0xff);
+        response.extend_from_slice(
+            format!(
+                "\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        response
     }
 
     fn request_body(request: &[u8]) -> &[u8] {
@@ -1357,35 +1341,70 @@ mod tests {
         .expect("合法响应应通过");
 
         assert_eq!(response.provider_request_id(), Some("http-request"));
-        assert_eq!(response.provider_response_id(), "chatcmpl-response");
+        assert_eq!(response.provider_response_id(), Some("chatcmpl-response"));
         assert_eq!(response.usage(), Some(LlmUsage::new(3, 2, 5)));
     }
 
     #[test]
-    fn response_id_accepts_every_json_string() {
-        let response = parse_success_response(
-            br#"{
-                "id":"",
-                "choices":[{
-                    "index":0,
-                    "message":{"role":"assistant","content":"[]"},
-                    "finish_reason":"stop"
-                }]
-            }"#,
-            Some("http-request".to_owned()),
-        )
-        .expect("正文 id 的契约只要求 JSON 字符串");
-
-        assert_eq!(response.provider_response_id(), "");
+    fn optional_response_metadata_never_invalidates_core_response() {
+        for (metadata, expected_id, expected_usage) in [
+            ("", None, None),
+            (r#", "id": null, "usage": null"#, None, None),
+            (r#", "id": 7, "usage": true"#, None, None),
+            (
+                r#", "id": "", "usage": {"prompt_tokens":1,"completion_tokens":2}"#,
+                Some(""),
+                None,
+            ),
+            (
+                r#", "id": "response", "usage": {"prompt_tokens":1,"completion_tokens":2,"total_tokens":3.5}"#,
+                Some("response"),
+                None,
+            ),
+        ] {
+            let body = format!(
+                r#"{{"choices":[{{"index":0,"message":{{"content":"[]"}},"finish_reason":"stop"}}]{metadata}}}"#
+            );
+            let response = parse_success_response(body.as_bytes(), None)
+                .expect("可选元数据异常不应否定核心响应");
+            assert_eq!(response.provider_response_id(), expected_id);
+            assert_eq!(response.usage(), expected_usage);
+        }
     }
 
     #[test]
-    fn successful_wire_requires_one_assistant_choice() {
+    fn successful_wire_selects_unique_index_zero_and_ignores_other_choices_and_role() {
+        let response = parse_success_response(
+            br#"{
+                "choices":[
+                    null,
+                    {"index":1,"message":false},
+                    {"index":"0","message":{"content":[]}},
+                    {"index":0,"message":{"role":"user","content":"selected"},"finish_reason":"length"},
+                    {"index":2,"finish_reason":null}
+                ]
+            }"#,
+            None,
+        )
+        .expect("只应验收唯一 index 0 choice 的必要字段");
+
+        assert_eq!(response.content(), "selected");
+        assert_eq!(response.finish_reason(), &LlmFinishReason::Length);
+    }
+
+    #[test]
+    fn successful_wire_rejects_missing_or_duplicate_index_zero_and_invalid_core_fields() {
         for body in [
-            br#"{"id":"r","choices":[]}"#.as_slice(),
-            br#"{"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"},{"index":1,"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}]}"#.as_slice(),
-            br#"{"id":"r","choices":[{"index":1,"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}]}"#.as_slice(),
-            br#"{"id":"r","choices":[{"index":0,"message":{"role":"user","content":"[]"},"finish_reason":"stop"}]}"#.as_slice(),
+            br#"[]"#.as_slice(),
+            br#"{}"#.as_slice(),
+            br#"{"choices":null}"#.as_slice(),
+            br#"{"choices":[]}"#.as_slice(),
+            br#"{"choices":[{"index":1}]}"#.as_slice(),
+            br#"{"choices":[{"index":"0"}]}"#.as_slice(),
+            br#"{"choices":[{"index":0,"message":{"content":"[]"},"finish_reason":"stop"},{"index":0,"message":{"content":"[]"},"finish_reason":"stop"}]}"#.as_slice(),
+            br#"{"choices":[{"index":0,"message":null,"finish_reason":"stop"}]}"#.as_slice(),
+            br#"{"choices":[{"index":0,"message":{"content":[]},"finish_reason":"stop"}]}"#.as_slice(),
+            br#"{"choices":[{"index":0,"message":{"content":"[]"},"finish_reason":null}]}"#.as_slice(),
         ] {
             assert!(matches!(
                 parse_success_response(body, None),
@@ -1393,30 +1412,6 @@ mod tests {
                     OpenAiChatCompletionError::InvalidResponseWire { .. }
                 ))
             ));
-        }
-    }
-
-    #[test]
-    fn successful_wire_rejects_required_field_type_drift_and_partial_usage() {
-        for body in [
-            br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}]}"#.as_slice(),
-            br#"{"id":1,"choices":[{"index":0,"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}]}"#.as_slice(),
-            br#"{"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":[]},"finish_reason":"stop"}]}"#.as_slice(),
-            br#"{"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"[]"},"finish_reason":null}]}"#.as_slice(),
-            br#"{"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#.as_slice(),
-            br#"{"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3.5}}"#.as_slice(),
-        ] {
-            assert!(matches!(
-                parse_success_response(body, None),
-                Err(LlmRequestError::Fatal(_))
-            ));
-        }
-
-        for body in [
-            br#"{"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}]}"#.as_slice(),
-            br#"{"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}],"usage":null}"#.as_slice(),
-        ] {
-            assert!(parse_success_response(body, None).is_ok());
         }
     }
 
@@ -1470,7 +1465,7 @@ mod tests {
             .await
             .expect("本地响应应成功");
         assert_eq!(response.provider_request_id(), Some("request-header"));
-        assert_eq!(response.provider_response_id(), "response-body");
+        assert_eq!(response.provider_response_id(), Some("response-body"));
         assert_eq!(response.usage(), Some(LlmUsage::new(4, 2, 6)));
 
         let request = server
@@ -1491,6 +1486,37 @@ mod tests {
         assert!(wire.get("max_completion_tokens").is_none());
         assert_eq!(wire["messages"][0]["role"], "system");
         assert_eq!(wire["messages"][1]["content"], "content");
+
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn success_ignores_content_type_and_invalid_request_id_metadata() {
+        let server = spawn_test_server(
+            vec![
+                status_response("200 OK", "", core_success_body()),
+                status_response(
+                    "200 OK",
+                    "Content-Type: text/plain\r\n",
+                    core_success_body(),
+                ),
+                response_with_invalid_request_id(),
+            ],
+            false,
+        );
+        let client = client(&server.endpoint, Map::new());
+        let executor = executor(1, 2);
+
+        for _ in 0..3 {
+            let response = executor
+                .request(&client, &[])
+                .await
+                .expect("Content-Type 与请求 ID 不是核心响应字段");
+            assert_eq!(response.provider_request_id(), None);
+            assert_eq!(response.provider_response_id(), None);
+            assert_eq!(response.content(), "[]");
+        }
 
         executor.shutdown().await;
         server.worker.join().expect("测试服务器应正常退出");

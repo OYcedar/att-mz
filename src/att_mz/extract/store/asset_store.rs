@@ -13,18 +13,14 @@ use crate::att_mz::standard_asset::{
 };
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
-    ExecuteTransactionError, QueryExistingDatabaseError, SqliteBatch, SqliteCheckId, SqliteCommand,
-    SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
+    ExecuteTransactionError, QueryExistingDatabaseError, SqliteBatch, SqliteCommand, SqliteQuery,
+    SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
     SqliteTransactionStep, SqliteValue,
 };
 
 use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, LuaSnapshot, RulesSnapshot};
-use super::{
-    BuiltinSnapshotStore, LuaSnapshotStore, RulesSnapshotStore, SnapshotReplacementOutcome,
-};
+use super::{BuiltinSnapshotStore, LuaSnapshotStore, RulesSnapshotStore};
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
-
-const OWNER_CONFLICT_CHECK: &str = "mz_extraction_owner_conflict";
 
 const DROP_STAGING_TABLE: &str = "DROP TABLE IF EXISTS temp.att_mz_extraction_staging";
 const DROP_PREVIOUS_TABLE: &str = "DROP TABLE IF EXISTS temp.att_mz_extraction_previous";
@@ -228,10 +224,7 @@ where
         project: &OpenedProject,
         owner: MzStandardAssetOwner,
         groups: Vec<ExtractedTextGroup>,
-    ) -> Result<
-        SnapshotReplacementOutcome,
-        MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
-    > {
+    ) -> Result<(), MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>> {
         let batches = split_groups(groups, self.config.groups_per_encode_job.get());
         let parameter_batches = stream::iter(batches.into_iter().map(|batch| async move {
             self.cpu
@@ -255,7 +248,7 @@ where
             &parameter_sets,
         );
         if current == desired {
-            return Ok(SnapshotReplacementOutcome::Unchanged);
+            return Ok(());
         }
 
         let plan = build_transaction_plan(
@@ -268,24 +261,21 @@ where
             .execute_transaction(database_path.clone(), plan)
             .await
             .map_err(|error| map_persist_error(database_path, error))?;
-        Ok(SnapshotReplacementOutcome::Changed)
+        Ok(())
     }
 
     async fn deactivate(
         &self,
         project: &OpenedProject,
         owner: MzStandardAssetOwner,
-    ) -> Result<
-        SnapshotReplacementOutcome,
-        MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
-    > {
+    ) -> Result<(), MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>> {
         let database_path = project.database_path().to_path_buf();
         if self
             .read_owner_snapshot(database_path.clone(), owner)
             .await?
             .is_empty()
         {
-            return Ok(SnapshotReplacementOutcome::Unchanged);
+            return Ok(());
         }
         let plan = SqliteTransactionPlan::new(vec![execute(
             DEACTIVATE_OWNER,
@@ -295,7 +285,7 @@ where
             .execute_transaction(database_path.clone(), plan)
             .await
             .map_err(|error| map_persist_error(database_path, error))?;
-        Ok(SnapshotReplacementOutcome::Changed)
+        Ok(())
     }
 
     async fn read_owner_snapshot(
@@ -328,7 +318,7 @@ where
         &self,
         project: &OpenedProject,
         snapshot: BuiltinSnapshot,
-    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.replace(
             project,
             MzStandardAssetOwner::Builtin,
@@ -349,15 +339,12 @@ where
         &self,
         project: &OpenedProject,
         snapshot: RulesSnapshot,
-    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.replace(project, MzStandardAssetOwner::Rules, snapshot.into_groups())
             .await
     }
 
-    async fn deactivate_rules(
-        &self,
-        project: &OpenedProject,
-    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+    async fn deactivate_rules(&self, project: &OpenedProject) -> Result<(), Self::Error> {
         self.deactivate(project, MzStandardAssetOwner::Rules).await
     }
 }
@@ -373,15 +360,12 @@ where
         &self,
         project: &OpenedProject,
         snapshot: LuaSnapshot,
-    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.replace(project, MzStandardAssetOwner::Lua, snapshot.into_groups())
             .await
     }
 
-    async fn deactivate_lua(
-        &self,
-        project: &OpenedProject,
-    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+    async fn deactivate_lua(&self, project: &OpenedProject) -> Result<(), Self::Error> {
         self.deactivate(project, MzStandardAssetOwner::Lua).await
     }
 }
@@ -580,10 +564,10 @@ fn build_transaction_plan(
         )));
     }
 
-    steps.push(SqliteTransactionStep::RequireNoRows {
-        check_id: SqliteCheckId::new(OWNER_CONFLICT_CHECK),
-        query: SqliteQuery::new(FIND_OWNER_CONFLICT, Vec::new()),
-    });
+    steps.push(SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
+        FIND_OWNER_CONFLICT,
+        Vec::new(),
+    )));
     steps.push(execute(INHERIT_TRANSLATIONS, Vec::new()));
 
     for statement in DELETE_OWNER_FROM_TABLES {
@@ -624,7 +608,7 @@ fn map_persist_error<C, S>(
         ExecuteTransactionError::NotFound => {
             MzExtractionAssetStoreError::DatabaseNotFound { database_path }
         }
-        ExecuteTransactionError::RequirementFailed { .. } => {
+        ExecuteTransactionError::RequirementFailed => {
             MzExtractionAssetStoreError::OwnershipConflict { database_path }
         }
         ExecuteTransactionError::NotCommitted(source) => {
@@ -726,9 +710,7 @@ mod tests {
             match self.response.lock().expect("SQLite 响应锁不应中毒").take() {
                 None => Ok(()),
                 Some(SqliteResponse::NotFound) => Err(ExecuteTransactionError::NotFound),
-                Some(SqliteResponse::Conflict) => Err(ExecuteTransactionError::RequirementFailed {
-                    check_id: SqliteCheckId::new(OWNER_CONFLICT_CHECK),
-                }),
+                Some(SqliteResponse::Conflict) => Err(ExecuteTransactionError::RequirementFailed),
                 Some(SqliteResponse::NotCommitted) => {
                     Err(ExecuteTransactionError::NotCommitted(FakeError("write")))
                 }
@@ -881,7 +863,7 @@ mod tests {
         );
         let check_index = steps
             .iter()
-            .position(|step| matches!(step, SqliteTransactionStep::RequireNoRows { .. }))
+            .position(|step| matches!(step, SqliteTransactionStep::RequireNoRows(_)))
             .expect("事务必须检查所有权冲突");
         let delete_index = steps
             .iter()
@@ -960,13 +942,12 @@ mod tests {
             &parameters,
         );
 
-        let outcome = harness
+        harness
             .service(3, 2)
             .replace_builtin(&project, BuiltinSnapshot::new(all_kind_groups()).unwrap())
             .await
             .expect("完全相同的 owner 快照应该正常收敛");
 
-        assert_eq!(outcome, SnapshotReplacementOutcome::Unchanged);
         assert_eq!(harness.sqlite_query_calls.load(Ordering::SeqCst), 1);
         assert!(
             harness
@@ -974,7 +955,7 @@ mod tests {
                 .lock()
                 .expect("SQLite 调用锁不应中毒")
                 .is_empty(),
-            "Unchanged 不得删除重插或更新 owner state"
+            "完全相同的快照不得删除重插或更新 owner state"
         );
     }
 
@@ -983,12 +964,11 @@ mod tests {
         let harness = Harness::new(None);
         let project = project();
 
-        let activated = harness
+        harness
             .service(1, 1)
             .replace_rules(&project, RulesSnapshot::empty())
             .await
             .expect("非空定义生成的空快照应可激活 Rules owner");
-        assert_eq!(activated, SnapshotReplacementOutcome::Changed);
         {
             let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
             assert_eq!(calls.len(), 1);
@@ -1009,12 +989,11 @@ mod tests {
             .clear();
         *harness.current_snapshot.lock().expect("当前快照锁不应中毒") =
             desired_snapshot_rows(project.source_snapshot_fingerprint().as_bytes(), &[]);
-        let unchanged = harness
+        harness
             .service(1, 1)
             .replace_rules(&project, RulesSnapshot::empty())
             .await
             .expect("active 空快照重复提交应可收敛");
-        assert_eq!(unchanged, SnapshotReplacementOutcome::Unchanged);
         assert!(
             harness
                 .sqlite_calls
@@ -1023,12 +1002,11 @@ mod tests {
                 .is_empty()
         );
 
-        let deactivated = harness
+        harness
             .service(1, 1)
             .deactivate_rules(&project)
             .await
             .expect("停用 active 空快照应该删除 owner state");
-        assert_eq!(deactivated, SnapshotReplacementOutcome::Changed);
         {
             let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
             assert_eq!(calls.len(), 1);
@@ -1049,12 +1027,11 @@ mod tests {
             .lock()
             .expect("当前快照锁不应中毒")
             .clear();
-        let already_inactive = harness
+        harness
             .service(1, 1)
             .deactivate_rules(&project)
             .await
             .expect("已停用 Rules 重复收敛应成功");
-        assert_eq!(already_inactive, SnapshotReplacementOutcome::Unchanged);
         assert!(
             harness
                 .sqlite_calls
@@ -1069,12 +1046,11 @@ mod tests {
         let harness = Harness::new(None);
         let project = project();
 
-        let activated = harness
+        harness
             .service(1, 1)
             .replace_lua(&project, LuaSnapshot::empty())
             .await
             .expect("replace_standard({}) 应建立 active Lua owner");
-        assert_eq!(activated, SnapshotReplacementOutcome::Changed);
         {
             let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
             assert!(calls[0].1.steps().iter().any(|step| {
@@ -1094,12 +1070,11 @@ mod tests {
             .clear();
         *harness.current_snapshot.lock().expect("当前快照锁不应中毒") =
             desired_snapshot_rows(project.source_snapshot_fingerprint().as_bytes(), &[]);
-        let deactivated = harness
+        harness
             .service(1, 1)
             .deactivate_lua(&project)
             .await
             .expect("clear_standard 应停用 Lua owner");
-        assert_eq!(deactivated, SnapshotReplacementOutcome::Changed);
         let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
         let SqliteTransactionStep::Execute(command) = &calls[0].1.steps()[0] else {
             panic!("停用 Lua owner 应只删除 owner state")
@@ -1534,7 +1509,7 @@ mod tests {
                             .map_err(|error| error.to_string())?;
                     }
                 }
-                SqliteTransactionStep::RequireNoRows { query, .. } => {
+                SqliteTransactionStep::RequireNoRows(query) => {
                     let mut statement = transaction
                         .prepare(query.statement())
                         .map_err(|error| error.to_string())?;

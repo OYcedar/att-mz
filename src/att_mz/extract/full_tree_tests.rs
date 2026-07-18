@@ -1,4 +1,4 @@
-//! 用八个根能力测试替身组装完整 ExtractUseCase 非根依赖树。
+//! 用根能力测试替身组装完整 Extract 非根依赖树。
 
 use std::error::Error;
 use std::fmt;
@@ -15,9 +15,13 @@ use super::lua::{
 use super::rules::{RulesExtractionConfig, RulesExtractionService};
 use super::service::ExtractService;
 use super::store::asset_store::{MzExtractionAssetStore, MzExtractionAssetStoreConfig};
-use super::{ExtractInput, ExtractUseCase, ExtractionSelection};
-use crate::att_mz::ProjectName;
+use super::{ExtractInput, SelectedRules};
 use crate::att_mz::project::ExistingProjectOpeningService;
+use crate::att_mz::project_lease::{
+    ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
+};
+use crate::att_mz::{ProjectName, SelectedLua};
+use crate::execution::OperationCompletion;
 use crate::fingerprint::Sha256Fingerprint;
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -42,6 +46,21 @@ impl fmt::Display for FakeRootError {
 }
 
 impl Error for FakeRootError {}
+
+#[derive(Clone, Copy)]
+struct FakeProjectLease;
+
+impl ProjectCommandLeaseProvider for FakeProjectLease {
+    type Error = FakeRootError;
+    type LeaseState = ();
+
+    async fn acquire(
+        &self,
+        _: &ProjectName,
+    ) -> Result<ProjectCommandLease<Self::LeaseState>, ProjectCommandLeaseError<Self::Error>> {
+        Ok(ProjectCommandLease::for_test(()))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Event {
@@ -286,7 +305,7 @@ impl TrustedLuaExecutionHost for FakeTrustedLuaExecutionHost {
     async fn execute(
         &self,
         invocation: LuaInvocation<Self::TranslationProfile>,
-    ) -> Result<TrustedLuaExecutionOutcome, Self::Error> {
+    ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
         self.events.lock().expect("事件锁不应中毒").push(Event::Lua);
         let LuaInvocation::Extract {
             script_path,
@@ -302,7 +321,9 @@ impl TrustedLuaExecutionHost for FakeTrustedLuaExecutionHost {
                 script_path,
                 project,
             });
-        Ok(TrustedLuaExecutionOutcome::Empty)
+        Ok(OperationCompletion::Completed(
+            TrustedLuaExecutionOutcome::Empty,
+        ))
     }
 }
 
@@ -376,26 +397,22 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
     );
     let extract = ExtractService::new(
         opener,
-        builtin,
-        rules,
-        Some(lua),
+        Some(builtin),
+        Some(SelectedRules::new(PathBuf::from("rules.json"), rules)),
+        Some(SelectedLua::new(PathBuf::from("extract.lua"), lua)),
+        FakeProjectLease,
         crate::execution::CooperativeCancellation::default(),
     );
 
     let name: ProjectName = "demo".parse().expect("测试项目名应该合法");
     let output = extract
-        .execute(ExtractInput {
-            name: name.clone(),
-            selection: ExtractionSelection::new(
-                true,
-                Some(PathBuf::from("rules.json")),
-                Some(PathBuf::from("extract.lua")),
-            )
-            .expect("测试选择应该合法"),
-        })
+        .execute(ExtractInput { name: name.clone() })
         .await
         .expect("完整非根树应该成功完成组合提取");
 
+    let OperationCompletion::Completed(output) = output else {
+        panic!("完整非根树应正常完成")
+    };
     assert_eq!(output.name, name);
     assert_eq!(query_count.load(Ordering::Relaxed), 1, "项目只应开启一次");
     assert!(
@@ -425,15 +442,7 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
     *fail_owner.lock().expect("SQLite 失败配置锁不应中毒") = Some("builtin".to_owned());
 
     extract
-        .execute(ExtractInput {
-            name,
-            selection: ExtractionSelection::new(
-                true,
-                Some(PathBuf::from("rules.json")),
-                Some(PathBuf::from("extract.lua")),
-            )
-            .expect("测试选择应该合法"),
-        })
+        .execute(ExtractInput { name })
         .await
         .expect_err("Builtin 根事务失败必须停止 Rules 与 Lua");
 

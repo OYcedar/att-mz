@@ -3,7 +3,7 @@
 //! 原始 TOML 只在本模块存在。结构和字段类型全部通过后，本模块继续建立非零资源
 //! 上限、路径基准、语言模块与 Profile 唯一性；业务和根适配器只接收受信配置。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
@@ -15,16 +15,42 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use url::Url;
 use zeroize::Zeroizing;
 
+use super::arguments::{
+    ExtractArguments, InitArguments, MzCommand, TranslateArguments, WriteBackArguments,
+};
+
+use crate::att_mz::ProjectName;
+use crate::att_mz::extract::builtin::BuiltInExtractionConfig;
+use crate::att_mz::extract::document::MzDocumentReadingConfig;
+use crate::att_mz::extract::rules::RulesExtractionConfig;
+use crate::att_mz::extract::store::asset_store::MzExtractionAssetStoreConfig;
+use crate::att_mz::lua::json::HostValueBudget;
+use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
+use crate::att_mz::translate::profile::MzTranslationExecutionConfiguration;
+use crate::att_mz::translate::result_store::MzStandardTranslationResultStorageConfig;
 use crate::language::{
     EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
     JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageModule,
     LanguageModuleCatalog, QuotePair,
+};
+use crate::runtime::cpu::CpuExecutorConfig;
+use crate::runtime::filesystem::{
+    DirectoryPublisherConfig, ExclusiveFileLeaseConfig, SystemFileSystemConfig, TreeBudget,
+};
+use crate::runtime::json_lines::JsonLinesStreamConfig;
+use crate::runtime::llm::{
+    LlmProxyConfiguration, OpenAiChatCompletionClient, OpenAiExecutorConfiguration,
+};
+use crate::runtime::lua::TrustedLua54RuntimeConfiguration;
+use crate::runtime::sqlite::{
+    RusqliteStorageConfiguration, SqliteJournalMode as RuntimeSqliteJournalMode,
+    SqliteSynchronous as RuntimeSqliteSynchronous,
 };
 
 const MAX_CONFIGURATION_BYTES: u64 = 4 * 1024 * 1024;
@@ -64,10 +90,11 @@ pub(crate) fn resolve_configuration_path(
     Ok(app_data.join("ATT").join("config.toml"))
 }
 
-/// 读取并建立完整受信配置。
+/// 读取配置，并且只建立本次命令实际消费的受信配置。
 pub(crate) fn load_configuration(
     requested_path: &Path,
-) -> Result<ApplicationConfiguration, ConfigurationLoadError> {
+    command: MzCommand,
+) -> Result<ConfiguredMzCommand, ConfigurationLoadError> {
     let configuration_path =
         std::fs::canonicalize(requested_path).map_err(|source| ConfigurationLoadError::Open {
             path: requested_path.to_path_buf(),
@@ -120,48 +147,200 @@ pub(crate) fn load_configuration(
             error_len: source.error_len(),
         }
     })?;
-    let raw: RawConfiguration = toml::from_str(source).map_err(|error| {
-        let location = error.span().map(|span| source_location(source, span.start));
-        ConfigurationLoadError::InvalidToml {
-            path: configuration_path.clone(),
-            location,
-        }
-    })?;
+    validate_top_level(source, &configuration_path)?;
     let configuration_directory = configuration_path
         .parent()
         .expect("规范绝对文件路径必须拥有父目录")
         .to_path_buf();
-    ApplicationConfiguration::build(&configuration_directory, raw)
-        .map_err(ConfigurationLoadError::InvalidValue)
+    ConfiguredMzCommand::build(
+        &configuration_path,
+        &configuration_directory,
+        source,
+        command,
+    )
 }
 
-/// 进程共享的完整受信配置。
-pub(crate) struct ApplicationConfiguration {
+/// 四个互斥命令各自拥有且只拥有现实消费的配置。
+pub(crate) enum ConfiguredMzCommand {
+    Init(ConfiguredInitCommand),
+    Extract(ConfiguredExtractCommand),
+    Translate(Box<ConfiguredTranslateCommand>),
+    WriteBack(ConfiguredWriteBackCommand),
+}
+
+impl ConfiguredMzCommand {
+    fn build(
+        configuration_path: &Path,
+        configuration_directory: &Path,
+        source: &str,
+        command: MzCommand,
+    ) -> Result<Self, ConfigurationLoadError> {
+        let raw_common: RawCommonConfiguration = parse_selected(source, configuration_path)?;
+        let requires_two_sqlite_connections = match &command {
+            MzCommand::Init(_) => true,
+            MzCommand::Extract(arguments) => arguments.lua.is_some(),
+            MzCommand::Translate(arguments) => arguments.lua.is_some(),
+            MzCommand::WriteBack(arguments) => arguments.lua.is_some(),
+        };
+        if requires_two_sqlite_connections && raw_common.runtime.sqlite.max_open_connections < 2 {
+            return Err(ConfigurationLoadError::InvalidValue(invalid(
+                "runtime.sqlite.max_open_connections",
+                "Init 的数据库快照或本次所选 Lua 会话需要至少两个连接",
+            )));
+        }
+        let common = CommonCommandConfiguration::build(configuration_directory, raw_common)
+            .map_err(ConfigurationLoadError::InvalidValue)?;
+
+        match command {
+            MzCommand::Init(arguments) => {
+                let raw: RawInitSelection = parse_selected(source, configuration_path)?;
+                let publisher = build_directory_publisher_configuration(
+                    common.projects_root(),
+                    raw.runtime.filesystem.publisher,
+                )
+                .map_err(ConfigurationLoadError::InvalidValue)?;
+                Ok(Self::Init(ConfiguredInitCommand {
+                    arguments,
+                    common,
+                    publisher,
+                }))
+            }
+            MzCommand::Extract(arguments) => {
+                let raw: RawExtractSelection = parse_selected(source, configuration_path)?;
+                let cpu = build_cpu_configuration(raw.runtime.cpu)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                let ExtractArguments {
+                    project,
+                    builtin,
+                    rules,
+                    lua,
+                } = arguments;
+                let lua = lua
+                    .map(|script_path| {
+                        parse_lua_configuration(source, configuration_path)
+                            .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
+                    })
+                    .transpose()?;
+                let mz = ExtractConfiguration::build(raw.mz, builtin, rules)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                Ok(Self::Extract(ConfiguredExtractCommand {
+                    project_name: project.name,
+                    common,
+                    cpu,
+                    lua,
+                    mz,
+                }))
+            }
+            MzCommand::Translate(arguments) => {
+                let raw: RawTranslateSelection = parse_selected(source, configuration_path)?;
+                let cpu = build_cpu_configuration(raw.runtime.cpu)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                let llm = SelectedLlmExecutorConfiguration::build(
+                    configuration_directory,
+                    raw.runtime.llm,
+                )
+                .map_err(ConfigurationLoadError::InvalidValue)?;
+                let TranslateArguments {
+                    project,
+                    profile_id,
+                    terms,
+                    placeholders,
+                    lua,
+                } = arguments;
+                let lua = lua
+                    .map(|script_path| {
+                        parse_lua_configuration(source, configuration_path)
+                            .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
+                    })
+                    .transpose()?;
+                let (mz, llm_client_id) =
+                    TranslateConfiguration::build(configuration_directory, raw.mz, &profile_id)
+                        .map_err(ConfigurationLoadError::InvalidValue)?;
+                let raw_client =
+                    parse_selected_llm_client(source, configuration_path, &llm_client_id)?;
+                let client = Arc::new(
+                    build_llm_client(format!("llm.clients.{llm_client_id}").as_str(), raw_client)
+                        .map_err(ConfigurationLoadError::InvalidValue)?,
+                );
+                Ok(Self::Translate(Box::new(ConfiguredTranslateCommand {
+                    project_name: project.name,
+                    terminology_path: terms,
+                    placeholder_rules_path: placeholders,
+                    common,
+                    cpu,
+                    llm,
+                    lua,
+                    client,
+                    mz,
+                })))
+            }
+            MzCommand::WriteBack(arguments) => {
+                let raw: RawWriteBackSelection = parse_selected(source, configuration_path)?;
+                let cpu = build_cpu_configuration(raw.runtime.cpu)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                let publisher = build_directory_publisher_configuration(
+                    common.projects_root(),
+                    raw.runtime.filesystem.publisher,
+                )
+                .map_err(ConfigurationLoadError::InvalidValue)?;
+                let WriteBackArguments { project, lua } = arguments;
+                let lua = lua
+                    .map(|script_path| {
+                        parse_lua_configuration(source, configuration_path)
+                            .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
+                    })
+                    .transpose()?;
+                let mz = WriteBackConfiguration::build(raw.mz)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                Ok(Self::WriteBack(ConfiguredWriteBackCommand {
+                    project_name: project.name,
+                    common,
+                    cpu,
+                    publisher,
+                    lua,
+                    mz,
+                }))
+            }
+        }
+    }
+
+    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
+        match self {
+            Self::Init(command) => &command.common,
+            Self::Extract(command) => &command.common,
+            Self::Translate(command) => &command.common,
+            Self::WriteBack(command) => &command.common,
+        }
+    }
+}
+
+pub(crate) struct CommonCommandConfiguration {
     projects_root: PathBuf,
-    runtime: RuntimeConfiguration,
-    observability: ObservabilityConfiguration,
-    llm_clients: LlmClientCatalogConfiguration,
-    mz: MzConfiguration,
+    async_runtime: AsyncRuntimeConfiguration,
+    filesystem: SystemFileSystemConfig,
+    sqlite: RusqliteStorageConfiguration,
+    audit_root: PathBuf,
+    audit: JsonLinesStreamConfig,
 }
 
-impl ApplicationConfiguration {
+impl CommonCommandConfiguration {
     fn build(
         configuration_directory: &Path,
-        raw: RawConfiguration,
+        raw: RawCommonConfiguration,
     ) -> Result<Self, ConfigurationValueError> {
         let projects_root =
             checked_path("projects.root", configuration_directory, raw.projects.root)?;
-        let runtime = RuntimeConfiguration::build(configuration_directory, raw.runtime)?;
-        let observability =
-            ObservabilityConfiguration::build(configuration_directory, raw.observability)?;
-        let llm_clients = LlmClientCatalogConfiguration::build(raw.llm.clients)?;
-        let mz = MzConfiguration::build(configuration_directory, raw.mz, &llm_clients.client_ids)?;
         Ok(Self {
             projects_root,
-            runtime,
-            observability,
-            llm_clients,
-            mz,
+            async_runtime: AsyncRuntimeConfiguration::build(raw.runtime.async_runtime)?,
+            filesystem: build_file_system_configuration(raw.runtime.filesystem)?,
+            sqlite: build_sqlite_configuration(raw.runtime.sqlite)?,
+            audit_root: checked_path(
+                "observability.root",
+                configuration_directory,
+                raw.observability.root,
+            )?,
+            audit: build_audit_configuration(raw.observability.audit)?,
         })
     }
 
@@ -169,69 +348,155 @@ impl ApplicationConfiguration {
         &self.projects_root
     }
 
-    pub(crate) const fn runtime(&self) -> &RuntimeConfiguration {
-        &self.runtime
+    pub(crate) const fn async_runtime(&self) -> AsyncRuntimeConfiguration {
+        self.async_runtime
     }
 
-    pub(crate) const fn observability(&self) -> &ObservabilityConfiguration {
-        &self.observability
+    pub(crate) const fn filesystem(&self) -> &SystemFileSystemConfig {
+        &self.filesystem
     }
 
-    pub(crate) const fn llm_clients(&self) -> &LlmClientCatalogConfiguration {
-        &self.llm_clients
+    pub(crate) const fn sqlite(&self) -> &RusqliteStorageConfiguration {
+        &self.sqlite
     }
 
-    pub(crate) const fn mz(&self) -> &MzConfiguration {
+    pub(crate) fn audit_root(&self) -> &Path {
+        &self.audit_root
+    }
+
+    pub(crate) const fn audit(&self) -> JsonLinesStreamConfig {
+        self.audit
+    }
+}
+
+pub(crate) struct ConfiguredInitCommand {
+    pub(crate) arguments: InitArguments,
+    common: CommonCommandConfiguration,
+    publisher: DirectoryPublisherConfig,
+}
+
+impl ConfiguredInitCommand {
+    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
+        &self.common
+    }
+
+    pub(crate) const fn publisher(&self) -> &DirectoryPublisherConfig {
+        &self.publisher
+    }
+}
+
+pub(crate) struct ConfiguredExtractCommand {
+    project_name: ProjectName,
+    common: CommonCommandConfiguration,
+    cpu: CpuExecutorConfig,
+    lua: Option<SelectedLuaConfiguration>,
+    mz: ExtractConfiguration,
+}
+
+impl ConfiguredExtractCommand {
+    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
+        &self.common
+    }
+
+    pub(crate) const fn project_name(&self) -> &ProjectName {
+        &self.project_name
+    }
+
+    pub(crate) const fn cpu(&self) -> CpuExecutorConfig {
+        self.cpu
+    }
+
+    pub(crate) const fn lua(&self) -> Option<&SelectedLuaConfiguration> {
+        self.lua.as_ref()
+    }
+
+    pub(crate) const fn mz(&self) -> &ExtractConfiguration {
         &self.mz
     }
 }
 
-pub(crate) struct RuntimeConfiguration {
-    async_runtime: AsyncRuntimeConfiguration,
-    cpu: CpuRuntimeConfiguration,
-    filesystem: FilesystemRuntimeConfiguration,
-    sqlite: SqliteRuntimeConfiguration,
-    llm: LlmRuntimeConfiguration,
-    lua: LuaRuntimeConfiguration,
+pub(crate) struct ConfiguredTranslateCommand {
+    project_name: ProjectName,
+    terminology_path: Option<PathBuf>,
+    placeholder_rules_path: Option<PathBuf>,
+    common: CommonCommandConfiguration,
+    cpu: CpuExecutorConfig,
+    llm: SelectedLlmExecutorConfiguration,
+    lua: Option<SelectedLuaConfiguration>,
+    client: Arc<OpenAiChatCompletionClient>,
+    mz: TranslateConfiguration,
 }
 
-impl RuntimeConfiguration {
-    fn build(
-        configuration_directory: &Path,
-        raw: RawRuntimeConfiguration,
-    ) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
-            async_runtime: AsyncRuntimeConfiguration::build(raw.async_runtime)?,
-            cpu: CpuRuntimeConfiguration::build(raw.cpu)?,
-            filesystem: FilesystemRuntimeConfiguration::build(raw.filesystem)?,
-            sqlite: SqliteRuntimeConfiguration::build(raw.sqlite)?,
-            llm: LlmRuntimeConfiguration::build(configuration_directory, raw.llm)?,
-            lua: LuaRuntimeConfiguration::build(raw.lua)?,
-        })
+impl ConfiguredTranslateCommand {
+    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
+        &self.common
     }
 
-    pub(crate) const fn async_runtime(&self) -> &AsyncRuntimeConfiguration {
-        &self.async_runtime
+    pub(crate) const fn project_name(&self) -> &ProjectName {
+        &self.project_name
     }
 
-    pub(crate) const fn cpu(&self) -> &CpuRuntimeConfiguration {
-        &self.cpu
+    pub(crate) fn terminology_path(&self) -> Option<&Path> {
+        self.terminology_path.as_deref()
     }
 
-    pub(crate) const fn filesystem(&self) -> &FilesystemRuntimeConfiguration {
-        &self.filesystem
+    pub(crate) fn placeholder_rules_path(&self) -> Option<&Path> {
+        self.placeholder_rules_path.as_deref()
     }
 
-    pub(crate) const fn sqlite(&self) -> &SqliteRuntimeConfiguration {
-        &self.sqlite
+    pub(crate) const fn cpu(&self) -> CpuExecutorConfig {
+        self.cpu
     }
 
-    pub(crate) const fn llm(&self) -> &LlmRuntimeConfiguration {
+    pub(crate) const fn llm(&self) -> &SelectedLlmExecutorConfiguration {
         &self.llm
     }
 
-    pub(crate) const fn lua(&self) -> &LuaRuntimeConfiguration {
-        &self.lua
+    pub(crate) const fn lua(&self) -> Option<&SelectedLuaConfiguration> {
+        self.lua.as_ref()
+    }
+
+    pub(crate) const fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
+        &self.client
+    }
+
+    pub(crate) const fn mz(&self) -> &TranslateConfiguration {
+        &self.mz
+    }
+}
+
+pub(crate) struct ConfiguredWriteBackCommand {
+    project_name: ProjectName,
+    common: CommonCommandConfiguration,
+    cpu: CpuExecutorConfig,
+    publisher: DirectoryPublisherConfig,
+    lua: Option<SelectedLuaConfiguration>,
+    mz: WriteBackConfiguration,
+}
+
+impl ConfiguredWriteBackCommand {
+    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
+        &self.common
+    }
+
+    pub(crate) const fn project_name(&self) -> &ProjectName {
+        &self.project_name
+    }
+
+    pub(crate) const fn cpu(&self) -> CpuExecutorConfig {
+        self.cpu
+    }
+
+    pub(crate) const fn publisher(&self) -> &DirectoryPublisherConfig {
+        &self.publisher
+    }
+
+    pub(crate) const fn lua(&self) -> Option<&SelectedLuaConfiguration> {
+        self.lua.as_ref()
+    }
+
+    pub(crate) const fn mz(&self) -> &WriteBackConfiguration {
+        &self.mz
     }
 }
 
@@ -270,395 +535,165 @@ impl AsyncRuntimeConfiguration {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct CpuRuntimeConfiguration {
-    worker_threads: NonZeroUsize,
-    queue_capacity: NonZeroUsize,
+fn build_cpu_configuration(
+    raw: RawCpuRuntimeConfiguration,
+) -> Result<CpuExecutorConfig, ConfigurationValueError> {
+    CpuExecutorConfig::new(
+        usize_value("runtime.cpu.worker_threads", raw.worker_threads)?,
+        usize_value("runtime.cpu.queue_capacity", raw.queue_capacity)?,
+    )
+    .map_err(|source| invalid("runtime.cpu", source.to_string()))
 }
 
-impl CpuRuntimeConfiguration {
-    fn build(raw: RawCpuRuntimeConfiguration) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
-            worker_threads: non_zero_usize("runtime.cpu.worker_threads", raw.worker_threads)?,
-            queue_capacity: non_zero_usize("runtime.cpu.queue_capacity", raw.queue_capacity)?,
-        })
-    }
+fn build_file_system_configuration(
+    raw: RawCommonFilesystemRuntimeConfiguration,
+) -> Result<SystemFileSystemConfig, ConfigurationValueError> {
+    let tree = TreeBudget::new(
+        usize_value("runtime.filesystem.tree.max_entries", raw.tree.max_entries)?,
+        usize_value("runtime.filesystem.tree.max_depth", raw.tree.max_depth)?,
+        raw.tree.max_bytes,
+        raw.tree.max_single_file_bytes,
+    )
+    .map_err(|source| invalid("runtime.filesystem.tree", source.to_string()))?;
+    let project_lease = ExclusiveFileLeaseConfig::new(positive_duration(
+        "runtime.filesystem.project_lock.timeout_ms",
+        raw.project_lock.timeout_ms,
+    )?)
+    .map_err(|source| invalid("runtime.filesystem.project_lock", source.to_string()))?;
 
-    pub(crate) const fn worker_threads(self) -> NonZeroUsize {
-        self.worker_threads
-    }
-
-    pub(crate) const fn queue_capacity(self) -> NonZeroUsize {
-        self.queue_capacity
-    }
+    SystemFileSystemConfig::new(
+        usize_value("runtime.filesystem.worker_threads", raw.worker_threads)?,
+        usize_value("runtime.filesystem.queue_capacity", raw.queue_capacity)?,
+        raw.max_read_bytes,
+        usize_value(
+            "runtime.filesystem.max_directory_entries",
+            raw.max_directory_entries,
+        )?,
+        tree,
+        project_lease,
+    )
+    .map_err(|source| invalid("runtime.filesystem", source.to_string()))
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct DirectoryPublisherConfiguration {
-    max_prepared_candidates: NonZeroUsize,
-    max_recovery_artifacts_per_target: NonZeroUsize,
-    target_lock_timeout: Duration,
+fn build_directory_publisher_configuration(
+    projects_root: &Path,
+    raw: RawDirectoryPublisherConfiguration,
+) -> Result<DirectoryPublisherConfig, ConfigurationValueError> {
+    DirectoryPublisherConfig::new(
+        projects_root.join(".att-locks").join("directory-publish"),
+        usize_value(
+            "runtime.filesystem.publisher.max_recovery_artifacts_per_target",
+            raw.max_recovery_artifacts_per_target,
+        )?,
+        positive_duration(
+            "runtime.filesystem.publisher.target_lock_timeout_ms",
+            raw.target_lock_timeout_ms,
+        )?,
+    )
+    .map_err(|source| invalid("runtime.filesystem.publisher", source.to_string()))
 }
 
-impl DirectoryPublisherConfiguration {
-    fn build(raw: RawDirectoryPublisherConfiguration) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
-            max_prepared_candidates: non_zero_usize(
-                "runtime.filesystem.publisher.max_prepared_candidates",
-                raw.max_prepared_candidates,
-            )?,
-            max_recovery_artifacts_per_target: non_zero_usize(
-                "runtime.filesystem.publisher.max_recovery_artifacts_per_target",
-                raw.max_recovery_artifacts_per_target,
-            )?,
-            target_lock_timeout: positive_duration(
-                "runtime.filesystem.publisher.target_lock_timeout_ms",
-                raw.target_lock_timeout_ms,
-            )?,
-        })
-    }
+fn build_sqlite_configuration(
+    raw: RawSqliteRuntimeConfiguration,
+) -> Result<RusqliteStorageConfiguration, ConfigurationValueError> {
+    let journal_mode = match raw.journal_mode {
+        RawSqliteJournalMode::Delete => RuntimeSqliteJournalMode::Delete,
+        RawSqliteJournalMode::Truncate => RuntimeSqliteJournalMode::Truncate,
+        RawSqliteJournalMode::Persist => RuntimeSqliteJournalMode::Persist,
+        RawSqliteJournalMode::Wal => RuntimeSqliteJournalMode::Wal,
+    };
+    let synchronous = match raw.synchronous {
+        RawSqliteSynchronous::Normal => RuntimeSqliteSynchronous::Normal,
+        RawSqliteSynchronous::Full => RuntimeSqliteSynchronous::Full,
+        RawSqliteSynchronous::Extra => RuntimeSqliteSynchronous::Extra,
+    };
 
-    pub(crate) const fn max_prepared_candidates(self) -> NonZeroUsize {
-        self.max_prepared_candidates
-    }
-
-    pub(crate) const fn max_recovery_artifacts_per_target(self) -> NonZeroUsize {
-        self.max_recovery_artifacts_per_target
-    }
-
-    pub(crate) const fn target_lock_timeout(self) -> Duration {
-        self.target_lock_timeout
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct DirectoryTreeConfiguration {
-    max_entries: NonZeroUsize,
-    max_depth: NonZeroUsize,
-    max_bytes: NonZeroUsize,
-    max_single_file_bytes: NonZeroUsize,
-}
-
-impl DirectoryTreeConfiguration {
-    fn build(raw: RawDirectoryTreeConfiguration) -> Result<Self, ConfigurationValueError> {
-        let max_bytes = non_zero_usize("runtime.filesystem.tree.max_bytes", raw.max_bytes)?;
-        let max_single_file_bytes = non_zero_usize(
-            "runtime.filesystem.tree.max_single_file_bytes",
-            raw.max_single_file_bytes,
-        )?;
-        if max_single_file_bytes > max_bytes {
-            return Err(invalid(
-                "runtime.filesystem.tree.max_single_file_bytes",
-                "单文件上限不得大于目录树总字节上限",
-            ));
-        }
-        Ok(Self {
-            max_entries: non_zero_usize("runtime.filesystem.tree.max_entries", raw.max_entries)?,
-            max_depth: non_zero_usize("runtime.filesystem.tree.max_depth", raw.max_depth)?,
-            max_bytes,
-            max_single_file_bytes,
-        })
-    }
-
-    pub(crate) const fn max_entries(self) -> NonZeroUsize {
-        self.max_entries
-    }
-
-    pub(crate) const fn max_depth(self) -> NonZeroUsize {
-        self.max_depth
-    }
-
-    pub(crate) const fn max_bytes(self) -> NonZeroUsize {
-        self.max_bytes
-    }
-
-    pub(crate) const fn max_single_file_bytes(self) -> NonZeroUsize {
-        self.max_single_file_bytes
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ProjectLockConfiguration {
-    timeout: Duration,
-}
-
-impl ProjectLockConfiguration {
-    fn build(raw: RawProjectLockConfiguration) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
-            timeout: positive_duration(
-                "runtime.filesystem.project_lock.timeout_ms",
-                raw.timeout_ms,
-            )?,
-        })
-    }
-
-    pub(crate) const fn timeout(self) -> Duration {
-        self.timeout
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct FilesystemRuntimeConfiguration {
-    worker_threads: NonZeroUsize,
-    queue_capacity: NonZeroUsize,
-    max_read_bytes: NonZeroUsize,
-    max_directory_entries: NonZeroUsize,
-    tree: DirectoryTreeConfiguration,
-    project_lock: ProjectLockConfiguration,
-    publisher: DirectoryPublisherConfiguration,
-}
-
-impl FilesystemRuntimeConfiguration {
-    fn build(raw: RawFilesystemRuntimeConfiguration) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
-            worker_threads: non_zero_usize(
-                "runtime.filesystem.worker_threads",
-                raw.worker_threads,
-            )?,
-            queue_capacity: non_zero_usize(
-                "runtime.filesystem.queue_capacity",
-                raw.queue_capacity,
-            )?,
-            max_read_bytes: non_zero_usize(
-                "runtime.filesystem.max_read_bytes",
-                raw.max_read_bytes,
-            )?,
-            max_directory_entries: non_zero_usize(
-                "runtime.filesystem.max_directory_entries",
-                raw.max_directory_entries,
-            )?,
-            tree: DirectoryTreeConfiguration::build(raw.tree)?,
-            project_lock: ProjectLockConfiguration::build(raw.project_lock)?,
-            publisher: DirectoryPublisherConfiguration::build(raw.publisher)?,
-        })
-    }
-
-    pub(crate) const fn worker_threads(self) -> NonZeroUsize {
-        self.worker_threads
-    }
-
-    pub(crate) const fn queue_capacity(self) -> NonZeroUsize {
-        self.queue_capacity
-    }
-
-    pub(crate) const fn max_read_bytes(self) -> NonZeroUsize {
-        self.max_read_bytes
-    }
-
-    pub(crate) const fn max_directory_entries(self) -> NonZeroUsize {
-        self.max_directory_entries
-    }
-
-    pub(crate) const fn publisher(self) -> DirectoryPublisherConfiguration {
-        self.publisher
-    }
-
-    pub(crate) const fn tree(self) -> DirectoryTreeConfiguration {
-        self.tree
-    }
-
-    pub(crate) const fn project_lock(self) -> ProjectLockConfiguration {
-        self.project_lock
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SqliteJournalMode {
-    Delete,
-    Truncate,
-    Persist,
-    Wal,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SqliteSynchronous {
-    Normal,
-    Full,
-    Extra,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct SqliteRuntimeConfiguration {
-    short_worker_threads: NonZeroUsize,
-    short_queue_capacity: NonZeroUsize,
-    max_open_connections: NonZeroUsize,
-    max_interactive_sessions: NonZeroUsize,
-    interactive_open_queue_capacity: NonZeroUsize,
-    interactive_command_queue_capacity: NonZeroUsize,
-    worker_stack_bytes: NonZeroUsize,
-    max_statement_bytes: NonZeroUsize,
-    max_parameter_bytes: NonZeroUsize,
-    max_rows_per_query: NonZeroUsize,
-    max_result_bytes_per_query: NonZeroUsize,
-    busy_timeout: Duration,
-    journal_mode: SqliteJournalMode,
-    synchronous: SqliteSynchronous,
-}
-
-impl SqliteRuntimeConfiguration {
-    fn build(raw: RawSqliteRuntimeConfiguration) -> Result<Self, ConfigurationValueError> {
-        let max_open_connections = non_zero_usize(
+    RusqliteStorageConfiguration::new(
+        non_zero_usize(
+            "runtime.sqlite.short_worker_threads",
+            raw.short_worker_threads,
+        )?,
+        non_zero_usize(
+            "runtime.sqlite.short_queue_capacity",
+            raw.short_queue_capacity,
+        )?,
+        non_zero_usize(
             "runtime.sqlite.max_open_connections",
             raw.max_open_connections,
-        )?;
-        if max_open_connections.get() < 2 {
-            return Err(invalid(
-                "runtime.sqlite.max_open_connections",
-                "SQLite online backup 需要同时使用源与目标连接，连接总上限必须至少为 2",
-            ));
+        )?,
+        non_zero_usize("runtime.sqlite.worker_stack_bytes", raw.worker_stack_bytes)?,
+        non_zero_usize(
+            "runtime.sqlite.max_statement_bytes",
+            raw.max_statement_bytes,
+        )?,
+        non_zero_usize(
+            "runtime.sqlite.max_parameter_bytes",
+            raw.max_parameter_bytes,
+        )?,
+        non_zero_usize("runtime.sqlite.max_rows_per_query", raw.max_rows_per_query)?,
+        non_zero_usize(
+            "runtime.sqlite.max_result_bytes_per_query",
+            raw.max_result_bytes_per_query,
+        )?,
+        positive_duration("runtime.sqlite.busy_timeout_ms", raw.busy_timeout_ms)?,
+        journal_mode,
+        synchronous,
+    )
+    .map_err(|source| invalid("runtime.sqlite", source.to_string()))
+}
+
+fn build_audit_configuration(
+    raw: RawEventLogConfiguration,
+) -> Result<JsonLinesStreamConfig, ConfigurationValueError> {
+    JsonLinesStreamConfig::new(
+        usize_value("observability.audit.queue_capacity", raw.queue_capacity)?,
+        positive_duration("observability.audit.lock_timeout_ms", raw.lock_timeout_ms)?,
+        usize_value("observability.audit.max_record_bytes", raw.max_record_bytes)?,
+        raw.max_file_bytes,
+        usize_value(
+            "observability.audit.retained_rotated_files",
+            raw.retained_rotated_files,
+        )?,
+    )
+    .map_err(|source| invalid("observability.audit", source.to_string()))
+}
+
+pub(crate) struct SelectedLuaConfiguration {
+    script_path: PathBuf,
+    runtime: TrustedLua54RuntimeConfiguration,
+}
+
+impl SelectedLuaConfiguration {
+    fn new(script_path: PathBuf, runtime: TrustedLua54RuntimeConfiguration) -> Self {
+        Self {
+            script_path,
+            runtime,
         }
-        let max_interactive_sessions = non_zero_usize(
-            "runtime.sqlite.max_interactive_sessions",
-            raw.max_interactive_sessions,
-        )?;
-        if max_interactive_sessions > max_open_connections {
-            return Err(invalid(
-                "runtime.sqlite.max_interactive_sessions",
-                "交互会话上限不得大于连接总上限",
-            ));
-        }
-        Ok(Self {
-            short_worker_threads: non_zero_usize(
-                "runtime.sqlite.short_worker_threads",
-                raw.short_worker_threads,
-            )?,
-            short_queue_capacity: non_zero_usize(
-                "runtime.sqlite.short_queue_capacity",
-                raw.short_queue_capacity,
-            )?,
-            max_open_connections,
-            max_interactive_sessions,
-            interactive_open_queue_capacity: non_zero_usize(
-                "runtime.sqlite.interactive_open_queue_capacity",
-                raw.interactive_open_queue_capacity,
-            )?,
-            interactive_command_queue_capacity: non_zero_usize(
-                "runtime.sqlite.interactive_command_queue_capacity",
-                raw.interactive_command_queue_capacity,
-            )?,
-            worker_stack_bytes: non_zero_usize(
-                "runtime.sqlite.worker_stack_bytes",
-                raw.worker_stack_bytes,
-            )?,
-            max_statement_bytes: non_zero_usize(
-                "runtime.sqlite.max_statement_bytes",
-                raw.max_statement_bytes,
-            )?,
-            max_parameter_bytes: non_zero_usize(
-                "runtime.sqlite.max_parameter_bytes",
-                raw.max_parameter_bytes,
-            )?,
-            max_rows_per_query: non_zero_usize(
-                "runtime.sqlite.max_rows_per_query",
-                raw.max_rows_per_query,
-            )?,
-            max_result_bytes_per_query: non_zero_usize(
-                "runtime.sqlite.max_result_bytes_per_query",
-                raw.max_result_bytes_per_query,
-            )?,
-            busy_timeout: positive_duration("runtime.sqlite.busy_timeout_ms", raw.busy_timeout_ms)?,
-            journal_mode: raw.journal_mode,
-            synchronous: raw.synchronous,
-        })
     }
 
-    pub(crate) const fn short_worker_threads(self) -> NonZeroUsize {
-        self.short_worker_threads
+    pub(crate) fn script_path(&self) -> &Path {
+        &self.script_path
     }
 
-    pub(crate) const fn short_queue_capacity(self) -> NonZeroUsize {
-        self.short_queue_capacity
-    }
-
-    pub(crate) const fn max_open_connections(self) -> NonZeroUsize {
-        self.max_open_connections
-    }
-
-    pub(crate) const fn max_interactive_sessions(self) -> NonZeroUsize {
-        self.max_interactive_sessions
-    }
-
-    pub(crate) const fn interactive_open_queue_capacity(self) -> NonZeroUsize {
-        self.interactive_open_queue_capacity
-    }
-
-    pub(crate) const fn interactive_command_queue_capacity(self) -> NonZeroUsize {
-        self.interactive_command_queue_capacity
-    }
-
-    pub(crate) const fn worker_stack_bytes(self) -> NonZeroUsize {
-        self.worker_stack_bytes
-    }
-
-    pub(crate) const fn max_statement_bytes(self) -> NonZeroUsize {
-        self.max_statement_bytes
-    }
-
-    pub(crate) const fn max_parameter_bytes(self) -> NonZeroUsize {
-        self.max_parameter_bytes
-    }
-
-    pub(crate) const fn max_rows_per_query(self) -> NonZeroUsize {
-        self.max_rows_per_query
-    }
-
-    pub(crate) const fn max_result_bytes_per_query(self) -> NonZeroUsize {
-        self.max_result_bytes_per_query
-    }
-
-    pub(crate) const fn busy_timeout(self) -> Duration {
-        self.busy_timeout
-    }
-
-    pub(crate) const fn journal_mode(self) -> SqliteJournalMode {
-        self.journal_mode
-    }
-
-    pub(crate) const fn synchronous(self) -> SqliteSynchronous {
-        self.synchronous
+    pub(crate) const fn runtime(&self) -> TrustedLua54RuntimeConfiguration {
+        self.runtime
     }
 }
 
 #[derive(Clone)]
-pub(crate) enum ProxyConfiguration {
-    Disabled,
-    Url(Url),
-}
-
-#[derive(Clone)]
-pub(crate) struct LlmTlsConfiguration {
+pub(crate) struct SelectedLlmExecutorConfiguration {
+    runtime: OpenAiExecutorConfiguration,
     additional_pem_files: Vec<PathBuf>,
 }
 
-impl LlmTlsConfiguration {
-    pub(crate) fn additional_pem_files(&self) -> &[PathBuf] {
-        &self.additional_pem_files
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct LlmRuntimeConfiguration {
-    max_active_requests: NonZeroUsize,
-    queue_capacity: usize,
-    admission_timeout: Duration,
-    connect_timeout: Duration,
-    read_timeout: Duration,
-    pool_idle_timeout: Duration,
-    pool_max_idle_per_host: usize,
-    proxy: ProxyConfiguration,
-    tls: LlmTlsConfiguration,
-}
-
-impl LlmRuntimeConfiguration {
+impl SelectedLlmExecutorConfiguration {
     fn build(
         configuration_directory: &Path,
         raw: RawLlmRuntimeConfiguration,
     ) -> Result<Self, ConfigurationValueError> {
         let proxy = match raw.proxy {
-            RawProxyConfiguration::Disabled(value) if !value => ProxyConfiguration::Disabled,
-            RawProxyConfiguration::Disabled(_) => {
+            RawProxyConfiguration::Disabled(false) => LlmProxyConfiguration::Disabled,
+            RawProxyConfiguration::Disabled(true) => {
                 return Err(invalid(
                     "runtime.llm.proxy",
                     "代理只能用 false 关闭，或提供完整 URL",
@@ -676,478 +711,269 @@ impl LlmRuntimeConfiguration {
                 if !url.username().is_empty() || url.password().is_some() {
                     return Err(invalid("runtime.llm.proxy", "代理 URL 不得内嵌凭据"));
                 }
-                ProxyConfiguration::Url(url)
+                LlmProxyConfiguration::Explicit(url)
             }
         };
 
         let mut additional_pem_files = Vec::with_capacity(raw.tls.additional_pem_files.len());
         let mut seen_pem_files = BTreeSet::new();
         for (index, path) in raw.tls.additional_pem_files.into_iter().enumerate() {
-            let path = checked_path(
-                format!("runtime.llm.tls.additional_pem_files[{index}]").as_str(),
-                configuration_directory,
-                path,
-            )?;
+            let field = format!("runtime.llm.tls.additional_pem_files[{index}]");
+            let path = checked_path(&field, configuration_directory, path)?;
             if !seen_pem_files.insert(path.clone()) {
-                return Err(invalid(
-                    format!("runtime.llm.tls.additional_pem_files[{index}]").as_str(),
-                    "PEM 路径重复",
-                ));
+                return Err(invalid(&field, "PEM 路径重复"));
             }
             additional_pem_files.push(path);
         }
 
-        Ok(Self {
-            max_active_requests: non_zero_usize(
-                "runtime.llm.max_active_requests",
-                raw.max_active_requests,
-            )?,
-            queue_capacity: usize_value("runtime.llm.queue_capacity", raw.queue_capacity)?,
-            admission_timeout: positive_duration(
-                "runtime.llm.admission_timeout_ms",
-                raw.admission_timeout_ms,
-            )?,
-            connect_timeout: positive_duration(
-                "runtime.llm.connect_timeout_ms",
-                raw.connect_timeout_ms,
-            )?,
-            read_timeout: positive_duration("runtime.llm.read_timeout_ms", raw.read_timeout_ms)?,
-            pool_idle_timeout: positive_duration(
-                "runtime.llm.pool_idle_timeout_ms",
-                raw.pool_idle_timeout_ms,
-            )?,
-            pool_max_idle_per_host: usize_value(
+        let max_active_requests =
+            non_zero_usize("runtime.llm.max_active_requests", raw.max_active_requests)?;
+        let queue_capacity = usize_value("runtime.llm.queue_capacity", raw.queue_capacity)?;
+        let total_capacity = max_active_requests
+            .get()
+            .checked_add(queue_capacity)
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| invalid("runtime.llm.queue_capacity", "活动与排队总容量溢出"))?;
+        let runtime = OpenAiExecutorConfiguration::new(
+            max_active_requests,
+            total_capacity,
+            positive_duration("runtime.llm.admission_timeout_ms", raw.admission_timeout_ms)?,
+            positive_duration("runtime.llm.connect_timeout_ms", raw.connect_timeout_ms)?,
+            positive_duration("runtime.llm.read_timeout_ms", raw.read_timeout_ms)?,
+            positive_duration("runtime.llm.pool_idle_timeout_ms", raw.pool_idle_timeout_ms)?,
+            usize_value(
                 "runtime.llm.pool_max_idle_per_host",
                 raw.pool_max_idle_per_host,
             )?,
             proxy,
-            tls: LlmTlsConfiguration {
-                additional_pem_files,
-            },
-        })
-    }
-
-    pub(crate) const fn max_active_requests(&self) -> NonZeroUsize {
-        self.max_active_requests
-    }
-
-    pub(crate) const fn queue_capacity(&self) -> usize {
-        self.queue_capacity
-    }
-
-    pub(crate) const fn admission_timeout(&self) -> Duration {
-        self.admission_timeout
-    }
-
-    pub(crate) const fn connect_timeout(&self) -> Duration {
-        self.connect_timeout
-    }
-
-    pub(crate) const fn read_timeout(&self) -> Duration {
-        self.read_timeout
-    }
-
-    pub(crate) const fn pool_idle_timeout(&self) -> Duration {
-        self.pool_idle_timeout
-    }
-
-    pub(crate) const fn pool_max_idle_per_host(&self) -> usize {
-        self.pool_max_idle_per_host
-    }
-
-    pub(crate) const fn proxy(&self) -> &ProxyConfiguration {
-        &self.proxy
-    }
-
-    pub(crate) const fn tls(&self) -> &LlmTlsConfiguration {
-        &self.tls
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct LuaRuntimeConfiguration {
-    worker_threads: NonZeroUsize,
-    queue_capacity: NonZeroUsize,
-    worker_stack_bytes: NonZeroUsize,
-    memory_limit_bytes_per_vm: NonZeroUsize,
-    cancel_check_instruction_interval: NonZeroU32,
-    max_error_bytes: NonZeroUsize,
-    host_values: LuaHostValueConfiguration,
-}
-
-impl LuaRuntimeConfiguration {
-    fn build(raw: RawLuaRuntimeConfiguration) -> Result<Self, ConfigurationValueError> {
+        );
         Ok(Self {
-            worker_threads: non_zero_usize("runtime.lua.worker_threads", raw.worker_threads)?,
-            queue_capacity: non_zero_usize("runtime.lua.queue_capacity", raw.queue_capacity)?,
-            worker_stack_bytes: non_zero_usize(
-                "runtime.lua.worker_stack_bytes",
-                raw.worker_stack_bytes,
-            )?,
-            memory_limit_bytes_per_vm: non_zero_usize(
-                "runtime.lua.memory_limit_bytes_per_vm",
-                raw.memory_limit_bytes_per_vm,
-            )?,
-            cancel_check_instruction_interval: non_zero_u32(
-                "runtime.lua.cancel_check_instruction_interval",
-                raw.cancel_check_instruction_interval,
-            )?,
-            max_error_bytes: non_zero_usize("runtime.lua.max_error_bytes", raw.max_error_bytes)?,
-            host_values: LuaHostValueConfiguration::build(raw.host_values)?,
+            runtime,
+            additional_pem_files,
         })
     }
 
-    pub(crate) const fn worker_threads(self) -> NonZeroUsize {
-        self.worker_threads
+    pub(crate) fn additional_pem_files(&self) -> &[PathBuf] {
+        &self.additional_pem_files
     }
 
-    pub(crate) const fn queue_capacity(self) -> NonZeroUsize {
-        self.queue_capacity
-    }
-
-    pub(crate) const fn worker_stack_bytes(self) -> NonZeroUsize {
-        self.worker_stack_bytes
-    }
-
-    pub(crate) const fn memory_limit_bytes_per_vm(self) -> NonZeroUsize {
-        self.memory_limit_bytes_per_vm
-    }
-
-    pub(crate) const fn cancel_check_instruction_interval(self) -> NonZeroU32 {
-        self.cancel_check_instruction_interval
-    }
-
-    pub(crate) const fn max_error_bytes(self) -> NonZeroUsize {
-        self.max_error_bytes
-    }
-
-    pub(crate) const fn host_values(self) -> LuaHostValueConfiguration {
-        self.host_values
+    pub(crate) fn with_pem_roots(&self, roots: Vec<Vec<u8>>) -> OpenAiExecutorConfiguration {
+        self.runtime.clone().with_additional_pem_roots(roots)
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct LuaHostValueConfiguration {
-    max_bytes: NonZeroUsize,
-    max_nodes: NonZeroUsize,
-    max_depth: NonZeroUsize,
+pub(crate) struct SelectedRulesConfiguration {
+    rules_path: PathBuf,
+    runtime: RulesExtractionConfig,
 }
 
-impl LuaHostValueConfiguration {
-    fn build(raw: RawLuaHostValueConfiguration) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
-            max_bytes: non_zero_usize("runtime.lua.host_values.max_bytes", raw.max_bytes)?,
-            max_nodes: non_zero_usize("runtime.lua.host_values.max_nodes", raw.max_nodes)?,
-            max_depth: non_zero_usize("runtime.lua.host_values.max_depth", raw.max_depth)?,
-        })
+impl SelectedRulesConfiguration {
+    pub(crate) fn rules_path(&self) -> &Path {
+        &self.rules_path
     }
 
-    pub(crate) const fn max_bytes(self) -> NonZeroUsize {
-        self.max_bytes
-    }
-
-    pub(crate) const fn max_nodes(self) -> NonZeroUsize {
-        self.max_nodes
-    }
-
-    pub(crate) const fn max_depth(self) -> NonZeroUsize {
-        self.max_depth
+    pub(crate) const fn runtime(&self) -> RulesExtractionConfig {
+        self.runtime
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct EventLogConfiguration {
-    queue_capacity: NonZeroUsize,
-    lock_timeout: Duration,
-    max_record_bytes: NonZeroUsize,
-    max_file_bytes: NonZeroUsize,
-    retained_rotated_files: usize,
+pub(crate) struct ExtractConfiguration {
+    document: MzDocumentReadingConfig,
+    builtin: Option<BuiltInExtractionConfig>,
+    rules: Option<SelectedRulesConfiguration>,
+    extract_store: MzExtractionAssetStoreConfig,
 }
 
-impl EventLogConfiguration {
+impl ExtractConfiguration {
     fn build(
-        field_prefix: &str,
-        raw: RawEventLogConfiguration,
+        raw: RawExtractMzSelection,
+        select_builtin: bool,
+        rules_path: Option<PathBuf>,
     ) -> Result<Self, ConfigurationValueError> {
-        let max_record_bytes = non_zero_usize(
-            format!("{field_prefix}.max_record_bytes").as_str(),
-            raw.max_record_bytes,
-        )?;
-        let max_file_bytes = non_zero_usize(
-            format!("{field_prefix}.max_file_bytes").as_str(),
-            raw.max_file_bytes,
-        )?;
-        if max_record_bytes > max_file_bytes {
-            return Err(invalid(
-                format!("{field_prefix}.max_record_bytes").as_str(),
-                "单条记录上限不得大于活动文件上限",
-            ));
-        }
+        let builtin = select_optional_scan_concurrency(
+            "mz.extract.builtin",
+            select_builtin,
+            raw.extract.builtin,
+        )?
+        .map(BuiltInExtractionConfig::new);
+        let rules = select_optional_scan_concurrency(
+            "mz.extract.rules",
+            rules_path.is_some(),
+            raw.extract.rules,
+        )?
+        .zip(rules_path)
+        .map(
+            |(scan_concurrency, rules_path)| SelectedRulesConfiguration {
+                rules_path,
+                runtime: RulesExtractionConfig::new(scan_concurrency),
+            },
+        );
         Ok(Self {
-            queue_capacity: non_zero_usize(
-                format!("{field_prefix}.queue_capacity").as_str(),
-                raw.queue_capacity,
-            )?,
-            lock_timeout: positive_duration(
-                format!("{field_prefix}.lock_timeout_ms").as_str(),
-                raw.lock_timeout_ms,
-            )?,
-            max_record_bytes,
-            max_file_bytes,
-            retained_rotated_files: usize_value(
-                format!("{field_prefix}.retained_rotated_files").as_str(),
-                raw.retained_rotated_files,
-            )?,
+            document: build_document_configuration(raw.document)?,
+            builtin,
+            rules,
+            extract_store: build_extraction_store_configuration(raw.extract.store)?,
         })
     }
 
-    pub(crate) const fn queue_capacity(self) -> NonZeroUsize {
-        self.queue_capacity
-    }
-
-    pub(crate) const fn lock_timeout(self) -> Duration {
-        self.lock_timeout
-    }
-
-    pub(crate) const fn max_record_bytes(self) -> NonZeroUsize {
-        self.max_record_bytes
-    }
-
-    pub(crate) const fn max_file_bytes(self) -> NonZeroUsize {
-        self.max_file_bytes
-    }
-
-    pub(crate) const fn retained_rotated_files(self) -> usize {
-        self.retained_rotated_files
-    }
-}
-
-pub(crate) struct ObservabilityConfiguration {
-    root: PathBuf,
-    translation: EventLogConfiguration,
-    write_back: EventLogConfiguration,
-}
-
-impl ObservabilityConfiguration {
-    fn build(
-        configuration_directory: &Path,
-        raw: RawObservabilityConfiguration,
-    ) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
-            root: checked_path("observability.root", configuration_directory, raw.root)?,
-            translation: EventLogConfiguration::build(
-                "observability.translation",
-                raw.translation,
-            )?,
-            write_back: EventLogConfiguration::build("observability.write_back", raw.write_back)?,
-        })
-    }
-
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub(crate) const fn translation(&self) -> EventLogConfiguration {
-        self.translation
-    }
-
-    pub(crate) const fn write_back(&self) -> EventLogConfiguration {
-        self.write_back
-    }
-}
-
-pub(crate) struct MzConfiguration {
-    document: MzDocumentConfiguration,
-    standard_asset: MzStandardAssetConfiguration,
-    extract_builtin: MzScanConfiguration,
-    extract_rules: MzScanConfiguration,
-    extract_store: MzExtractionStoreConfiguration,
-    translate_store: MzTranslationStoreConfiguration,
-    language_modules: LanguageModuleCatalog,
-    translation_profiles: BTreeMap<String, TranslationProfileConfiguration>,
-}
-
-impl MzConfiguration {
-    fn build(
-        configuration_directory: &Path,
-        raw: RawMzConfiguration,
-        llm_client_ids: &BTreeSet<LlmClientId>,
-    ) -> Result<Self, ConfigurationValueError> {
-        let (language_modules, language_ids) = build_language_modules(raw.languages)?;
-        let translation_profiles = build_translation_profiles(
-            configuration_directory,
-            raw.translation_profiles,
-            &language_ids,
-            llm_client_ids,
-        )?;
-        Ok(Self {
-            document: MzDocumentConfiguration {
-                read_concurrency: non_zero_usize(
-                    "mz.document.read_concurrency",
-                    raw.document.read_concurrency,
-                )?,
-                parse_concurrency: non_zero_usize(
-                    "mz.document.parse_concurrency",
-                    raw.document.parse_concurrency,
-                )?,
-            },
-            standard_asset: MzStandardAssetConfiguration {
-                decode_concurrency: non_zero_usize(
-                    "mz.standard_asset.decode_concurrency",
-                    raw.standard_asset.decode_concurrency,
-                )?,
-                leaves_per_decode_job: non_zero_usize(
-                    "mz.standard_asset.leaves_per_decode_job",
-                    raw.standard_asset.leaves_per_decode_job,
-                )?,
-            },
-            extract_builtin: MzScanConfiguration {
-                scan_concurrency: non_zero_usize(
-                    "mz.extract.builtin.scan_concurrency",
-                    raw.extract.builtin.scan_concurrency,
-                )?,
-            },
-            extract_rules: MzScanConfiguration {
-                scan_concurrency: non_zero_usize(
-                    "mz.extract.rules.scan_concurrency",
-                    raw.extract.rules.scan_concurrency,
-                )?,
-            },
-            extract_store: MzExtractionStoreConfiguration {
-                encode_concurrency: non_zero_usize(
-                    "mz.extract.store.encode_concurrency",
-                    raw.extract.store.encode_concurrency,
-                )?,
-                groups_per_encode_job: non_zero_usize(
-                    "mz.extract.store.groups_per_encode_job",
-                    raw.extract.store.groups_per_encode_job,
-                )?,
-            },
-            translate_store: MzTranslationStoreConfiguration {
-                encode_concurrency: non_zero_usize(
-                    "mz.translate.store.encode_concurrency",
-                    raw.translate.store.encode_concurrency,
-                )?,
-                leaves_per_encode_job: non_zero_usize(
-                    "mz.translate.store.leaves_per_encode_job",
-                    raw.translate.store.leaves_per_encode_job,
-                )?,
-            },
-            language_modules,
-            translation_profiles,
-        })
-    }
-
-    pub(crate) const fn document(&self) -> MzDocumentConfiguration {
+    pub(crate) const fn document(&self) -> MzDocumentReadingConfig {
         self.document
     }
 
-    pub(crate) const fn standard_asset(&self) -> MzStandardAssetConfiguration {
+    pub(crate) const fn builtin(&self) -> Option<BuiltInExtractionConfig> {
+        self.builtin
+    }
+
+    pub(crate) const fn rules(&self) -> Option<&SelectedRulesConfiguration> {
+        self.rules.as_ref()
+    }
+
+    pub(crate) const fn extract_store(&self) -> MzExtractionAssetStoreConfig {
+        self.extract_store
+    }
+}
+
+pub(crate) struct TranslateConfiguration {
+    standard_asset: MzStandardAssetReadingConfig,
+    translate_store: MzStandardTranslationResultStorageConfig,
+    languages: Vec<toml::Value>,
+    profile: TranslationProfileConfiguration,
+}
+
+impl TranslateConfiguration {
+    fn build(
+        configuration_directory: &Path,
+        raw: RawTranslateMzSelection,
+        profile_id: &str,
+    ) -> Result<(Self, String), ConfigurationValueError> {
+        validate_exact_identifier("命令行 PROFILE_ID", profile_id)?;
+        let selected_profile = select_named_table(
+            "mz.translation_profiles",
+            &raw.translation_profiles,
+            profile_id,
+        )?;
+        let selected_profile: RawSelectedTranslationProfileConfiguration = selected_profile
+            .clone()
+            .try_into()
+            .map_err(|_| invalid("mz.translation_profiles", "所选 Profile 结构或字段类型无效"))?;
+        let (profile, llm_client_id) = build_selected_translation_profile(
+            configuration_directory,
+            "mz.translation_profiles",
+            selected_profile,
+        )?;
+        Ok((
+            Self {
+                standard_asset: build_standard_asset_configuration(raw.standard_asset)?,
+                translate_store: build_translation_store_configuration(raw.translate.store)?,
+                languages: raw.languages,
+                profile,
+            },
+            llm_client_id,
+        ))
+    }
+
+    pub(crate) const fn standard_asset(&self) -> MzStandardAssetReadingConfig {
         self.standard_asset
     }
 
-    pub(crate) const fn extract_builtin(&self) -> MzScanConfiguration {
-        self.extract_builtin
-    }
-
-    pub(crate) const fn extract_rules(&self) -> MzScanConfiguration {
-        self.extract_rules
-    }
-
-    pub(crate) const fn extract_store(&self) -> MzExtractionStoreConfiguration {
-        self.extract_store
-    }
-
-    pub(crate) const fn translate_store(&self) -> MzTranslationStoreConfiguration {
+    pub(crate) const fn translate_store(&self) -> MzStandardTranslationResultStorageConfig {
         self.translate_store
     }
 
-    pub(crate) fn language_modules(&self) -> LanguageModuleCatalog {
-        self.language_modules.clone()
+    pub(crate) const fn profile(&self) -> &TranslationProfileConfiguration {
+        &self.profile
     }
 
-    pub(crate) fn translation_profile(&self, id: &str) -> Option<&TranslationProfileConfiguration> {
-        self.translation_profiles.get(id)
-    }
-
-    pub(crate) fn translation_profile_ids(&self) -> impl Iterator<Item = &str> {
-        self.translation_profiles.keys().map(String::as_str)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct MzDocumentConfiguration {
-    read_concurrency: NonZeroUsize,
-    parse_concurrency: NonZeroUsize,
-}
-
-impl MzDocumentConfiguration {
-    pub(crate) const fn read_concurrency(self) -> NonZeroUsize {
-        self.read_concurrency
-    }
-
-    pub(crate) const fn parse_concurrency(self) -> NonZeroUsize {
-        self.parse_concurrency
+    /// 只建立项目当前源语言需要的模块；其他语言条目保持未解释。
+    pub(crate) fn language_modules_for(
+        &self,
+        source_language: &str,
+    ) -> Result<LanguageModuleCatalog, ConfigurationValueError> {
+        validate_exact_identifier("项目 source_language", source_language)?;
+        let selected = select_named_table("mz.languages", &self.languages, source_language)?;
+        let raw: RawLanguageConfiguration = selected
+            .clone()
+            .try_into()
+            .map_err(|_| invalid("mz.languages", "所选语言模块结构或字段类型无效"))?;
+        let (catalog, _) = build_language_modules(vec![raw])?;
+        Ok(catalog)
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct MzStandardAssetConfiguration {
-    decode_concurrency: NonZeroUsize,
-    leaves_per_decode_job: NonZeroUsize,
+pub(crate) struct WriteBackConfiguration {
+    document: MzDocumentReadingConfig,
+    standard_asset: MzStandardAssetReadingConfig,
 }
 
-impl MzStandardAssetConfiguration {
-    pub(crate) const fn decode_concurrency(self) -> NonZeroUsize {
-        self.decode_concurrency
+impl WriteBackConfiguration {
+    fn build(raw: RawWriteBackMzSelection) -> Result<Self, ConfigurationValueError> {
+        Ok(Self {
+            document: build_document_configuration(raw.document)?,
+            standard_asset: build_standard_asset_configuration(raw.standard_asset)?,
+        })
     }
 
-    pub(crate) const fn leaves_per_decode_job(self) -> NonZeroUsize {
-        self.leaves_per_decode_job
+    pub(crate) const fn document(&self) -> MzDocumentReadingConfig {
+        self.document
     }
-}
 
-#[derive(Clone, Copy)]
-pub(crate) struct MzScanConfiguration {
-    scan_concurrency: NonZeroUsize,
-}
-
-impl MzScanConfiguration {
-    pub(crate) const fn scan_concurrency(self) -> NonZeroUsize {
-        self.scan_concurrency
+    pub(crate) const fn standard_asset(&self) -> MzStandardAssetReadingConfig {
+        self.standard_asset
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct MzExtractionStoreConfiguration {
-    encode_concurrency: NonZeroUsize,
-    groups_per_encode_job: NonZeroUsize,
+fn build_document_configuration(
+    raw: RawMzDocumentConfiguration,
+) -> Result<MzDocumentReadingConfig, ConfigurationValueError> {
+    Ok(MzDocumentReadingConfig::new(
+        non_zero_usize("mz.document.read_concurrency", raw.read_concurrency)?,
+        non_zero_usize("mz.document.parse_concurrency", raw.parse_concurrency)?,
+    ))
 }
 
-impl MzExtractionStoreConfiguration {
-    pub(crate) const fn encode_concurrency(self) -> NonZeroUsize {
-        self.encode_concurrency
-    }
-
-    pub(crate) const fn groups_per_encode_job(self) -> NonZeroUsize {
-        self.groups_per_encode_job
-    }
+fn build_standard_asset_configuration(
+    raw: RawMzStandardAssetConfiguration,
+) -> Result<MzStandardAssetReadingConfig, ConfigurationValueError> {
+    Ok(MzStandardAssetReadingConfig::new(
+        non_zero_usize(
+            "mz.standard_asset.decode_concurrency",
+            raw.decode_concurrency,
+        )?,
+        non_zero_usize(
+            "mz.standard_asset.leaves_per_decode_job",
+            raw.leaves_per_decode_job,
+        )?,
+    ))
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct MzTranslationStoreConfiguration {
-    encode_concurrency: NonZeroUsize,
-    leaves_per_encode_job: NonZeroUsize,
+fn build_extraction_store_configuration(
+    raw: RawMzExtractStoreConfiguration,
+) -> Result<MzExtractionAssetStoreConfig, ConfigurationValueError> {
+    Ok(MzExtractionAssetStoreConfig::new(
+        non_zero_usize(
+            "mz.extract.store.encode_concurrency",
+            raw.encode_concurrency,
+        )?,
+        non_zero_usize(
+            "mz.extract.store.groups_per_encode_job",
+            raw.groups_per_encode_job,
+        )?,
+    ))
 }
 
-impl MzTranslationStoreConfiguration {
-    pub(crate) const fn encode_concurrency(self) -> NonZeroUsize {
-        self.encode_concurrency
-    }
-
-    pub(crate) const fn leaves_per_encode_job(self) -> NonZeroUsize {
-        self.leaves_per_encode_job
-    }
+fn build_translation_store_configuration(
+    raw: RawMzTranslateStoreConfiguration,
+) -> Result<MzStandardTranslationResultStorageConfig, ConfigurationValueError> {
+    Ok(MzStandardTranslationResultStorageConfig::new(
+        non_zero_usize(
+            "mz.translate.store.encode_concurrency",
+            raw.encode_concurrency,
+        )?,
+        non_zero_usize(
+            "mz.translate.store.leaves_per_encode_job",
+            raw.leaves_per_encode_job,
+        )?,
+    ))
 }
 
 #[derive(Clone)]
@@ -1175,7 +1001,8 @@ impl TranslationSystemConfiguration {
 pub(crate) struct TranslationPlanningConfiguration {
     scope_concurrency: NonZeroUsize,
     max_message_characters: NonZeroUsize,
-    systems: Vec<TranslationSystemConfiguration>,
+    configuration_directory: PathBuf,
+    systems: Vec<toml::Value>,
 }
 
 impl TranslationPlanningConfiguration {
@@ -1187,135 +1014,64 @@ impl TranslationPlanningConfiguration {
         self.max_message_characters
     }
 
-    pub(crate) fn systems(&self) -> &[TranslationSystemConfiguration] {
-        &self.systems
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct TranslationExecutionConfiguration {
-    network_retry_delays: Vec<Duration>,
-    max_network_retry_after: Duration,
-}
-
-impl TranslationExecutionConfiguration {
-    pub(crate) fn network_retry_delays(&self) -> &[Duration] {
-        &self.network_retry_delays
-    }
-
-    pub(crate) const fn max_network_retry_after(&self) -> Duration {
-        self.max_network_retry_after
-    }
-}
-
-pub(crate) struct LlmClientConfiguration {
-    url: Url,
-    api_key: SecretString,
-    model: String,
-    timeout: Duration,
-    rpm: NonZeroU32,
-    burst: NonZeroU32,
-    parameters: JsonMap<String, JsonValue>,
-}
-
-/// 配置边界已经校验并确认存在的公共 LLM Client 身份。
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct LlmClientId(String);
-
-impl LlmClientId {
-    fn from_validated(value: String) -> Self {
-        Self(value)
-    }
-
-    #[cfg(test)]
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl LlmClientConfiguration {
-    pub(crate) const fn url(&self) -> &Url {
-        &self.url
-    }
-
-    pub(crate) const fn api_key(&self) -> &SecretString {
-        &self.api_key
-    }
-
-    pub(crate) fn model(&self) -> &str {
-        &self.model
-    }
-
-    pub(crate) const fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
-    pub(crate) const fn rpm(&self) -> NonZeroU32 {
-        self.rpm
-    }
-
-    pub(crate) const fn burst(&self) -> NonZeroU32 {
-        self.burst
-    }
-
-    pub(crate) fn parameters(&self) -> &JsonMap<String, JsonValue> {
-        &self.parameters
-    }
-}
-
-impl fmt::Debug for LlmClientConfiguration {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LlmClientConfiguration")
-            .field("url_scheme", &self.url.scheme())
-            .field("url_host", &self.url.host_str())
-            .field("api_key", &"[REDACTED]")
-            .field("model", &self.model)
-            .field("timeout", &self.timeout)
-            .field("rpm", &self.rpm)
-            .field("burst", &self.burst)
-            .field(
-                "parameter_keys",
-                &self.parameters.keys().collect::<Vec<_>>(),
+    /// 只解释项目当前语言对对应的 system；其他条目不会阻止本次命令。
+    pub(crate) fn system_for(
+        &self,
+        source_language: &str,
+        target_language: &str,
+    ) -> Result<TranslationSystemConfiguration, ConfigurationValueError> {
+        let mut selected = None;
+        for candidate in &self.systems {
+            let Some(table) = candidate.as_table() else {
+                continue;
+            };
+            let Some(candidate_source) = table.get("source_language").and_then(toml::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(candidate_target) = table.get("target_language").and_then(toml::Value::as_str)
+            else {
+                continue;
+            };
+            if candidate_source != source_language || candidate_target != target_language {
+                continue;
+            }
+            if selected.replace(candidate).is_some() {
+                return Err(invalid(
+                    "mz.translation_profiles.planning.systems",
+                    "当前项目语言对的 system 重复",
+                ));
+            }
+        }
+        let selected = selected.ok_or_else(|| {
+            invalid(
+                "mz.translation_profiles.planning.systems",
+                format!("没有当前项目语言对 {source_language} -> {target_language} 的 system"),
             )
-            .finish()
-    }
-}
-
-pub(crate) struct LlmClientCatalogConfiguration {
-    clients: BTreeMap<LlmClientId, LlmClientConfiguration>,
-    client_ids: BTreeSet<LlmClientId>,
-}
-
-impl LlmClientCatalogConfiguration {
-    fn build(
-        raw_clients: BTreeMap<String, RawLlmClientConfiguration>,
-    ) -> Result<Self, ConfigurationValueError> {
-        if raw_clients.is_empty() {
-            return Err(invalid("llm.clients", "至少需要一个 LLM 客户端"));
-        }
-
-        let mut clients = BTreeMap::new();
-        let mut client_ids = BTreeSet::new();
-        for (raw_id, raw) in raw_clients {
-            let id_field = format!("llm.clients.{raw_id}");
-            validate_exact_identifier(id_field.as_str(), &raw_id)?;
-            let id = LlmClientId::from_validated(raw_id);
-            let inserted = client_ids.insert(id.clone());
-            debug_assert!(inserted, "TOML 表键和 BTreeMap 已保证客户端 ID 唯一");
-            let field = format!("llm.clients.{}", id.0);
-            let client = build_llm_client(field.as_str(), raw)?;
-            clients.insert(id, client);
-        }
-
-        Ok(Self {
-            clients,
-            client_ids,
+        })?;
+        let raw: RawTranslationSystemConfiguration = selected.clone().try_into().map_err(|_| {
+            invalid(
+                "mz.translation_profiles.planning.systems",
+                "当前项目语言对的 system 结构或字段类型无效",
+            )
+        })?;
+        validate_exact_identifier(
+            "mz.translation_profiles.planning.systems.source_language",
+            &raw.source_language,
+        )?;
+        validate_exact_identifier(
+            "mz.translation_profiles.planning.systems.target_language",
+            &raw.target_language,
+        )?;
+        Ok(TranslationSystemConfiguration {
+            source_language: raw.source_language,
+            target_language: raw.target_language,
+            markdown_path: checked_path(
+                "mz.translation_profiles.planning.systems.path",
+                &self.configuration_directory,
+                raw.path,
+            )?,
         })
-    }
-
-    pub(crate) fn get(&self, id: &LlmClientId) -> Option<&LlmClientConfiguration> {
-        self.clients.get(id)
     }
 }
 
@@ -1324,8 +1080,7 @@ pub(crate) struct TranslationProfileConfiguration {
     id: String,
     max_in_flight_tasks: NonZeroUsize,
     planning: TranslationPlanningConfiguration,
-    execution: TranslationExecutionConfiguration,
-    llm_client_id: LlmClientId,
+    execution: MzTranslationExecutionConfiguration,
 }
 
 impl TranslationProfileConfiguration {
@@ -1341,12 +1096,8 @@ impl TranslationProfileConfiguration {
         &self.planning
     }
 
-    pub(crate) const fn execution(&self) -> &TranslationExecutionConfiguration {
+    pub(crate) const fn execution(&self) -> &MzTranslationExecutionConfiguration {
         &self.execution
-    }
-
-    pub(crate) const fn llm_client_id(&self) -> &LlmClientId {
-        &self.llm_client_id
     }
 }
 
@@ -1438,137 +1189,56 @@ fn build_language_modules(
     Ok((catalog, language_ids))
 }
 
-fn build_translation_profiles(
+fn build_selected_translation_profile(
     configuration_directory: &Path,
-    raw_profiles: Vec<RawTranslationProfileConfiguration>,
-    language_ids: &BTreeSet<String>,
-    llm_client_ids: &BTreeSet<LlmClientId>,
-) -> Result<BTreeMap<String, TranslationProfileConfiguration>, ConfigurationValueError> {
-    if raw_profiles.is_empty() {
+    field: &str,
+    raw: RawSelectedTranslationProfileConfiguration,
+) -> Result<(TranslationProfileConfiguration, String), ConfigurationValueError> {
+    validate_exact_identifier(format!("{field}.id").as_str(), &raw.id)?;
+    validate_exact_identifier(format!("{field}.llm_client").as_str(), &raw.llm_client)?;
+    if raw.planning.systems.is_empty() {
         return Err(invalid(
-            "mz.translation_profiles",
-            "至少需要一个翻译 Profile",
+            format!("{field}.planning.systems").as_str(),
+            "系统提示词列表不能为空",
         ));
     }
-
-    let mut profiles = BTreeMap::new();
-    for (index, raw) in raw_profiles.into_iter().enumerate() {
-        let field = format!("mz.translation_profiles[{index}]");
-        if raw.id.trim().is_empty() {
-            return Err(invalid(format!("{field}.id").as_str(), "ID 不能为空白"));
-        }
-        if profiles.contains_key(&raw.id) {
-            return Err(invalid(
-                format!("{field}.id").as_str(),
-                format!("翻译 Profile ID 重复：{}", raw.id),
-            ));
-        }
-
-        let planning = build_translation_planning(
-            configuration_directory,
-            format!("{field}.planning").as_str(),
-            raw.planning,
-            language_ids,
-        )?;
-        let execution = TranslationExecutionConfiguration {
-            network_retry_delays: raw
-                .execution
-                .network_retry_delays_ms
-                .into_iter()
-                .map(Duration::from_millis)
-                .collect(),
-            max_network_retry_after: Duration::from_millis(
-                raw.execution.max_network_retry_after_ms,
-            ),
-        };
-        validate_exact_identifier(format!("{field}.llm_client").as_str(), &raw.llm_client)?;
-        let llm_client_id = LlmClientId::from_validated(raw.llm_client);
-        if !llm_client_ids.contains(&llm_client_id) {
-            return Err(invalid(
-                format!("{field}.llm_client").as_str(),
-                "没有同 ID 的公共 LLM 客户端",
-            ));
-        }
-        let profile = TranslationProfileConfiguration {
-            id: raw.id.clone(),
+    let llm_client_id = raw.llm_client;
+    Ok((
+        TranslationProfileConfiguration {
+            id: raw.id,
             max_in_flight_tasks: non_zero_usize(
                 format!("{field}.max_in_flight_tasks").as_str(),
                 raw.max_in_flight_tasks,
             )?,
-            planning,
-            execution,
-            llm_client_id,
-        };
-        profiles.insert(raw.id, profile);
-    }
-    Ok(profiles)
-}
-
-fn build_translation_planning(
-    configuration_directory: &Path,
-    field: &str,
-    raw: RawTranslationPlanningConfiguration,
-    language_ids: &BTreeSet<String>,
-) -> Result<TranslationPlanningConfiguration, ConfigurationValueError> {
-    if raw.systems.is_empty() {
-        return Err(invalid(
-            format!("{field}.systems").as_str(),
-            "系统提示词列表不能为空",
-        ));
-    }
-    let mut seen_pairs = BTreeSet::new();
-    let mut systems = Vec::with_capacity(raw.systems.len());
-    for (index, system) in raw.systems.into_iter().enumerate() {
-        let system_field = format!("{field}.systems[{index}]");
-        validate_exact_identifier(
-            format!("{system_field}.source_language").as_str(),
-            &system.source_language,
-        )?;
-        validate_exact_identifier(
-            format!("{system_field}.target_language").as_str(),
-            &system.target_language,
-        )?;
-        if !language_ids.contains(&system.source_language) {
-            return Err(invalid(
-                format!("{system_field}.source_language").as_str(),
-                format!("没有同 ID 的源语言模块：{}", system.source_language),
-            ));
-        }
-        let pair = (
-            system.source_language.clone(),
-            system.target_language.clone(),
-        );
-        if !seen_pairs.insert(pair) {
-            return Err(invalid(system_field.as_str(), "系统提示词语言对重复"));
-        }
-        systems.push(TranslationSystemConfiguration {
-            source_language: system.source_language,
-            target_language: system.target_language,
-            markdown_path: checked_path(
-                format!("{system_field}.path").as_str(),
-                configuration_directory,
-                system.path,
-            )?,
-        });
-    }
-
-    Ok(TranslationPlanningConfiguration {
-        scope_concurrency: non_zero_usize(
-            format!("{field}.scope_concurrency").as_str(),
-            raw.scope_concurrency,
-        )?,
-        max_message_characters: non_zero_usize(
-            format!("{field}.max_message_characters").as_str(),
-            raw.max_message_characters,
-        )?,
-        systems,
-    })
+            planning: TranslationPlanningConfiguration {
+                scope_concurrency: non_zero_usize(
+                    format!("{field}.planning.scope_concurrency").as_str(),
+                    raw.planning.scope_concurrency,
+                )?,
+                max_message_characters: non_zero_usize(
+                    format!("{field}.planning.max_message_characters").as_str(),
+                    raw.planning.max_message_characters,
+                )?,
+                configuration_directory: configuration_directory.to_path_buf(),
+                systems: raw.planning.systems,
+            },
+            execution: MzTranslationExecutionConfiguration::new(
+                raw.execution
+                    .network_retry_delays_ms
+                    .into_iter()
+                    .map(Duration::from_millis)
+                    .collect(),
+                Duration::from_millis(raw.execution.max_network_retry_after_ms),
+            ),
+        },
+        llm_client_id,
+    ))
 }
 
 fn build_llm_client(
     field: &str,
     raw: RawLlmClientConfiguration,
-) -> Result<LlmClientConfiguration, ConfigurationValueError> {
+) -> Result<OpenAiChatCompletionClient, ConfigurationValueError> {
     let url =
         Url::parse(&raw.url).map_err(|_| invalid(format!("{field}.url").as_str(), "URL 无效"))?;
     validate_llm_url(format!("{field}.url").as_str(), &url)?;
@@ -1624,15 +1294,15 @@ fn build_llm_client(
         }
     }
 
-    Ok(LlmClientConfiguration {
+    Ok(OpenAiChatCompletionClient::new(
         url,
-        api_key: raw.api_key,
-        model: raw.model,
-        timeout: positive_duration(format!("{field}.timeout_ms").as_str(), raw.timeout_ms)?,
-        rpm: non_zero_u32(format!("{field}.rpm").as_str(), raw.rpm)?,
-        burst: non_zero_u32(format!("{field}.burst").as_str(), raw.burst)?,
+        raw.api_key,
+        raw.model,
+        positive_duration(format!("{field}.timeout_ms").as_str(), raw.timeout_ms)?,
+        non_zero_u32(format!("{field}.rpm").as_str(), raw.rpm)?,
+        non_zero_u32(format!("{field}.burst").as_str(), raw.burst)?,
         parameters,
-    })
+    ))
 }
 
 fn validate_llm_url(field: &str, url: &Url) -> Result<(), ConfigurationValueError> {
@@ -1973,13 +1643,6 @@ pub(crate) struct ConfigurationValueError {
     message: String,
 }
 
-impl ConfigurationValueError {
-    #[cfg(test)]
-    pub(crate) fn field(&self) -> &str {
-        &self.field
-    }
-}
-
 impl fmt::Display for ConfigurationValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}：{}", self.field, self.message)
@@ -1988,20 +1651,513 @@ impl fmt::Display for ConfigurationValueError {
 
 impl Error for ConfigurationValueError {}
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawConfiguration {
-    projects: RawProjectsConfiguration,
-    runtime: RawRuntimeConfiguration,
-    observability: RawObservabilityConfiguration,
-    llm: RawLlmConfiguration,
-    mz: RawMzConfiguration,
+fn validate_top_level(source: &str, path: &Path) -> Result<(), ConfigurationLoadError> {
+    let raw: RawTopLevelSyntax = parse_selected(source, path)?;
+    let RawTopLevelSyntax {
+        _projects,
+        _runtime,
+        _observability,
+        _llm,
+        _mz,
+    } = raw;
+    let _ = (_projects, _runtime, _observability, _llm, _mz);
+    Ok(())
+}
+
+fn parse_selected<T>(source: &str, path: &Path) -> Result<T, ConfigurationLoadError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    toml::from_str(source).map_err(|error| invalid_toml(path, source, &error))
+}
+
+fn invalid_toml(path: &Path, source: &str, error: &toml::de::Error) -> ConfigurationLoadError {
+    let location = error.span().map(|span| source_location(source, span.start));
+    ConfigurationLoadError::InvalidToml {
+        path: path.to_path_buf(),
+        location,
+    }
+}
+
+fn parse_lua_configuration(
+    source: &str,
+    path: &Path,
+) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
+    let raw: RawLuaSelection = parse_selected(source, path)?;
+    build_lua_configuration(raw.runtime.lua).map_err(ConfigurationLoadError::InvalidValue)
+}
+
+fn build_lua_configuration(
+    raw: RawLuaRuntimeConfiguration,
+) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationValueError> {
+    Ok(TrustedLua54RuntimeConfiguration::new(
+        non_zero_usize("runtime.lua.worker_stack_bytes", raw.worker_stack_bytes)?,
+        non_zero_usize(
+            "runtime.lua.memory_limit_bytes_per_vm",
+            raw.memory_limit_bytes_per_vm,
+        )?,
+        non_zero_u32(
+            "runtime.lua.cancel_check_instruction_interval",
+            raw.cancel_check_instruction_interval,
+        )?,
+        non_zero_usize("runtime.lua.max_error_bytes", raw.max_error_bytes)?,
+        HostValueBudget::new(
+            non_zero_usize(
+                "runtime.lua.host_values.max_bytes",
+                raw.host_values.max_bytes,
+            )?,
+            non_zero_usize(
+                "runtime.lua.host_values.max_nodes",
+                raw.host_values.max_nodes,
+            )?,
+            non_zero_usize(
+                "runtime.lua.host_values.max_depth",
+                raw.host_values.max_depth,
+            )?,
+        ),
+    ))
+}
+
+fn select_optional_scan_concurrency(
+    field: &str,
+    selected: bool,
+    raw: Option<toml::Value>,
+) -> Result<Option<NonZeroUsize>, ConfigurationValueError> {
+    if !selected {
+        return Ok(None);
+    }
+    let raw = raw.ok_or_else(|| invalid(field, "本次选择需要该配置"))?;
+    let raw: RawMzScanConfiguration = raw
+        .try_into()
+        .map_err(|_| invalid(field, "结构或字段类型无效"))?;
+    Ok(Some(non_zero_usize(
+        format!("{field}.scan_concurrency").as_str(),
+        raw.scan_concurrency,
+    )?))
+}
+
+fn select_named_table<'a>(
+    field: &str,
+    candidates: &'a [toml::Value],
+    requested_id: &str,
+) -> Result<&'a toml::Value, ConfigurationValueError> {
+    let mut selected = None;
+    for candidate in candidates {
+        let Some(id) = candidate
+            .as_table()
+            .and_then(|table| table.get("id"))
+            .and_then(toml::Value::as_str)
+        else {
+            continue;
+        };
+        if id != requested_id {
+            continue;
+        }
+        if selected.replace(candidate).is_some() {
+            return Err(invalid(field, format!("ID 重复：{requested_id}")));
+        }
+    }
+    selected.ok_or_else(|| invalid(field, format!("没有 ID 为 {requested_id} 的条目")))
+}
+
+fn parse_selected_llm_client(
+    source: &str,
+    path: &Path,
+    requested_id: &str,
+) -> Result<RawLlmClientConfiguration, ConfigurationLoadError> {
+    validate_exact_identifier("llm client id", requested_id)
+        .map_err(ConfigurationLoadError::InvalidValue)?;
+    let seed = SelectedLlmClientTopSeed { requested_id };
+    let deserializer = toml::de::Deserializer::parse(source)
+        .map_err(|error| invalid_toml(path, source, &error))?;
+    let selected = seed
+        .deserialize(deserializer)
+        .map_err(|error| invalid_toml(path, source, &error))?;
+    selected.ok_or_else(|| {
+        ConfigurationLoadError::InvalidValue(invalid(
+            "llm.clients",
+            format!("没有 ID 为 {requested_id} 的客户端"),
+        ))
+    })
+}
+
+struct SelectedLlmClientTopSeed<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for SelectedLlmClientTopSeed<'_> {
+    type Value = Option<RawLlmClientConfiguration>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SelectedLlmClientTopVisitor {
+            requested_id: self.requested_id,
+        })
+    }
+}
+
+struct SelectedLlmClientTopVisitor<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for SelectedLlmClientTopVisitor<'_> {
+    type Value = Option<RawLlmClientConfiguration>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ATT 顶层 TOML 配置")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut selected = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "llm" {
+                if selected.is_some() {
+                    return Err(de::Error::duplicate_field("llm"));
+                }
+                selected = map.next_value_seed(SelectedLlmClientSectionSeed {
+                    requested_id: self.requested_id,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(selected)
+    }
+}
+
+struct SelectedLlmClientSectionSeed<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for SelectedLlmClientSectionSeed<'_> {
+    type Value = Option<RawLlmClientConfiguration>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SelectedLlmClientSectionVisitor {
+            requested_id: self.requested_id,
+        })
+    }
+}
+
+struct SelectedLlmClientSectionVisitor<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for SelectedLlmClientSectionVisitor<'_> {
+    type Value = Option<RawLlmClientConfiguration>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("只包含 clients 的 LLM 配置")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut selected = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "clients" => {
+                    if selected.is_some() {
+                        return Err(de::Error::duplicate_field("clients"));
+                    }
+                    selected = map.next_value_seed(SelectedLlmClientMapSeed {
+                        requested_id: self.requested_id,
+                    })?;
+                }
+                _ => return Err(de::Error::unknown_field(&key, &["clients"])),
+            }
+        }
+        Ok(selected)
+    }
+}
+
+struct SelectedLlmClientMapSeed<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for SelectedLlmClientMapSeed<'_> {
+    type Value = Option<RawLlmClientConfiguration>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SelectedLlmClientMapVisitor {
+            requested_id: self.requested_id,
+        })
+    }
+}
+
+struct SelectedLlmClientMapVisitor<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for SelectedLlmClientMapVisitor<'_> {
+    type Value = Option<RawLlmClientConfiguration>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("按 ID 命名的 LLM 客户端表")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut selected = None;
+        while let Some(id) = map.next_key::<String>()? {
+            if id == self.requested_id {
+                if selected.is_some() {
+                    return Err(de::Error::custom("所选 LLM 客户端 ID 重复"));
+                }
+                selected = Some(map.next_value::<RawLlmClientConfiguration>()?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(selected)
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawLlmConfiguration {
-    clients: BTreeMap<String, RawLlmClientConfiguration>,
+struct RawTopLevelSyntax {
+    #[serde(default, rename = "projects")]
+    _projects: Option<IgnoredAny>,
+    #[serde(default, rename = "runtime")]
+    _runtime: Option<IgnoredAny>,
+    #[serde(default, rename = "observability")]
+    _observability: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "mz")]
+    _mz: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCommonConfiguration {
+    projects: RawProjectsConfiguration,
+    runtime: RawCommonRuntimeConfiguration,
+    observability: RawObservabilityConfiguration,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "mz")]
+    _mz: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInitSelection {
+    runtime: RawPublisherRuntimeSelection,
+    #[serde(default, rename = "projects")]
+    _projects: Option<IgnoredAny>,
+    #[serde(default, rename = "observability")]
+    _observability: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "mz")]
+    _mz: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtractSelection {
+    runtime: RawCpuRuntimeSelection,
+    mz: RawExtractMzSelection,
+    #[serde(default, rename = "projects")]
+    _projects: Option<IgnoredAny>,
+    #[serde(default, rename = "observability")]
+    _observability: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTranslateSelection {
+    runtime: RawTranslateRuntimeSelection,
+    mz: RawTranslateMzSelection,
+    #[serde(default, rename = "projects")]
+    _projects: Option<IgnoredAny>,
+    #[serde(default, rename = "observability")]
+    _observability: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWriteBackSelection {
+    runtime: RawWriteBackRuntimeSelection,
+    mz: RawWriteBackMzSelection,
+    #[serde(default, rename = "projects")]
+    _projects: Option<IgnoredAny>,
+    #[serde(default, rename = "observability")]
+    _observability: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLuaSelection {
+    runtime: RawLuaRuntimeSelection,
+    #[serde(default, rename = "projects")]
+    _projects: Option<IgnoredAny>,
+    #[serde(default, rename = "observability")]
+    _observability: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "mz")]
+    _mz: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCpuRuntimeSelection {
+    cpu: RawCpuRuntimeConfiguration,
+    #[serde(rename = "async", default)]
+    _async_runtime: Option<IgnoredAny>,
+    #[serde(default, rename = "filesystem")]
+    _filesystem: Option<IgnoredAny>,
+    #[serde(default, rename = "sqlite")]
+    _sqlite: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "lua")]
+    _lua: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTranslateRuntimeSelection {
+    cpu: RawCpuRuntimeConfiguration,
+    llm: RawLlmRuntimeConfiguration,
+    #[serde(rename = "async", default)]
+    _async_runtime: Option<IgnoredAny>,
+    #[serde(default, rename = "filesystem")]
+    _filesystem: Option<IgnoredAny>,
+    #[serde(default, rename = "sqlite")]
+    _sqlite: Option<IgnoredAny>,
+    #[serde(default, rename = "lua")]
+    _lua: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPublisherRuntimeSelection {
+    filesystem: RawPublisherFilesystemSelection,
+    #[serde(rename = "async", default)]
+    _async_runtime: Option<IgnoredAny>,
+    #[serde(default, rename = "cpu")]
+    _cpu: Option<IgnoredAny>,
+    #[serde(default, rename = "sqlite")]
+    _sqlite: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "lua")]
+    _lua: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWriteBackRuntimeSelection {
+    cpu: RawCpuRuntimeConfiguration,
+    filesystem: RawPublisherFilesystemSelection,
+    #[serde(rename = "async", default)]
+    _async_runtime: Option<IgnoredAny>,
+    #[serde(default, rename = "sqlite")]
+    _sqlite: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "lua")]
+    _lua: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLuaRuntimeSelection {
+    lua: RawLuaRuntimeConfiguration,
+    #[serde(rename = "async", default)]
+    _async_runtime: Option<IgnoredAny>,
+    #[serde(default, rename = "cpu")]
+    _cpu: Option<IgnoredAny>,
+    #[serde(default, rename = "filesystem")]
+    _filesystem: Option<IgnoredAny>,
+    #[serde(default, rename = "sqlite")]
+    _sqlite: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPublisherFilesystemSelection {
+    publisher: RawDirectoryPublisherConfiguration,
+    #[serde(default, rename = "worker_threads")]
+    _worker_threads: Option<IgnoredAny>,
+    #[serde(default, rename = "queue_capacity")]
+    _queue_capacity: Option<IgnoredAny>,
+    #[serde(default, rename = "max_read_bytes")]
+    _max_read_bytes: Option<IgnoredAny>,
+    #[serde(default, rename = "max_directory_entries")]
+    _max_directory_entries: Option<IgnoredAny>,
+    #[serde(default, rename = "tree")]
+    _tree: Option<IgnoredAny>,
+    #[serde(default, rename = "project_lock")]
+    _project_lock: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExtractMzSelection {
+    document: RawMzDocumentConfiguration,
+    extract: RawSelectedMzExtractConfiguration,
+    #[serde(default, rename = "standard_asset")]
+    _standard_asset: Option<IgnoredAny>,
+    #[serde(default, rename = "translate")]
+    _translate: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
+    #[serde(default, rename = "translation_profiles")]
+    _translation_profiles: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTranslateMzSelection {
+    standard_asset: RawMzStandardAssetConfiguration,
+    translate: RawMzTranslateConfiguration,
+    languages: Vec<toml::Value>,
+    translation_profiles: Vec<toml::Value>,
+    #[serde(default, rename = "document")]
+    _document: Option<IgnoredAny>,
+    #[serde(default, rename = "extract")]
+    _extract: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWriteBackMzSelection {
+    document: RawMzDocumentConfiguration,
+    standard_asset: RawMzStandardAssetConfiguration,
+    #[serde(default, rename = "extract")]
+    _extract: Option<IgnoredAny>,
+    #[serde(default, rename = "translate")]
+    _translate: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
+    #[serde(default, rename = "translation_profiles")]
+    _translation_profiles: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2012,14 +2168,17 @@ struct RawProjectsConfiguration {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawRuntimeConfiguration {
+struct RawCommonRuntimeConfiguration {
     #[serde(rename = "async")]
     async_runtime: RawAsyncRuntimeConfiguration,
-    cpu: RawCpuRuntimeConfiguration,
-    filesystem: RawFilesystemRuntimeConfiguration,
+    filesystem: RawCommonFilesystemRuntimeConfiguration,
     sqlite: RawSqliteRuntimeConfiguration,
-    llm: RawLlmRuntimeConfiguration,
-    lua: RawLuaRuntimeConfiguration,
+    #[serde(default, rename = "cpu")]
+    _cpu: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "lua")]
+    _lua: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2039,20 +2198,20 @@ struct RawCpuRuntimeConfiguration {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawFilesystemRuntimeConfiguration {
+struct RawCommonFilesystemRuntimeConfiguration {
     worker_threads: u64,
     queue_capacity: u64,
     max_read_bytes: u64,
     max_directory_entries: u64,
     tree: RawDirectoryTreeConfiguration,
     project_lock: RawProjectLockConfiguration,
-    publisher: RawDirectoryPublisherConfiguration,
+    #[serde(default, rename = "publisher")]
+    _publisher: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDirectoryPublisherConfiguration {
-    max_prepared_candidates: u64,
     max_recovery_artifacts_per_target: u64,
     target_lock_timeout_ms: u64,
 }
@@ -2078,17 +2237,31 @@ struct RawSqliteRuntimeConfiguration {
     short_worker_threads: u64,
     short_queue_capacity: u64,
     max_open_connections: u64,
-    max_interactive_sessions: u64,
-    interactive_open_queue_capacity: u64,
-    interactive_command_queue_capacity: u64,
     worker_stack_bytes: u64,
     max_statement_bytes: u64,
     max_parameter_bytes: u64,
     max_rows_per_query: u64,
     max_result_bytes_per_query: u64,
     busy_timeout_ms: u64,
-    journal_mode: SqliteJournalMode,
-    synchronous: SqliteSynchronous,
+    journal_mode: RawSqliteJournalMode,
+    synchronous: RawSqliteSynchronous,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawSqliteJournalMode {
+    Delete,
+    Truncate,
+    Persist,
+    Wal,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawSqliteSynchronous {
+    Normal,
+    Full,
+    Extra,
 }
 
 #[derive(Deserialize)]
@@ -2121,8 +2294,6 @@ struct RawLlmTlsConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLuaRuntimeConfiguration {
-    worker_threads: u64,
-    queue_capacity: u64,
     worker_stack_bytes: u64,
     memory_limit_bytes_per_vm: u64,
     cancel_check_instruction_interval: u64,
@@ -2142,8 +2313,7 @@ struct RawLuaHostValueConfiguration {
 #[serde(deny_unknown_fields)]
 struct RawObservabilityConfiguration {
     root: PathBuf,
-    translation: RawEventLogConfiguration,
-    write_back: RawEventLogConfiguration,
+    audit: RawEventLogConfiguration,
 }
 
 #[derive(Deserialize)]
@@ -2154,17 +2324,6 @@ struct RawEventLogConfiguration {
     max_record_bytes: u64,
     max_file_bytes: u64,
     retained_rotated_files: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawMzConfiguration {
-    document: RawMzDocumentConfiguration,
-    standard_asset: RawMzStandardAssetConfiguration,
-    extract: RawMzExtractConfiguration,
-    translate: RawMzTranslateConfiguration,
-    languages: Vec<RawLanguageConfiguration>,
-    translation_profiles: Vec<RawTranslationProfileConfiguration>,
 }
 
 #[derive(Deserialize)]
@@ -2183,9 +2342,11 @@ struct RawMzStandardAssetConfiguration {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMzExtractConfiguration {
-    builtin: RawMzScanConfiguration,
-    rules: RawMzScanConfiguration,
+struct RawSelectedMzExtractConfiguration {
+    #[serde(default)]
+    builtin: Option<toml::Value>,
+    #[serde(default)]
+    rules: Option<toml::Value>,
     store: RawMzExtractStoreConfiguration,
 }
 
@@ -2237,20 +2398,20 @@ enum RawLanguageConfiguration {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTranslationProfileConfiguration {
+struct RawSelectedTranslationProfileConfiguration {
     id: String,
     llm_client: String,
     max_in_flight_tasks: u64,
-    planning: RawTranslationPlanningConfiguration,
+    planning: RawSelectedTranslationPlanningConfiguration,
     execution: RawTranslationExecutionConfiguration,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTranslationPlanningConfiguration {
+struct RawSelectedTranslationPlanningConfiguration {
     scope_concurrency: u64,
     max_message_characters: u64,
-    systems: Vec<RawTranslationSystemConfiguration>,
+    systems: Vec<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -2286,18 +2447,26 @@ struct RawLlmClientConfiguration {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
+    use clap::Parser;
     use secrecy::ExposeSecret;
 
     use super::*;
+    use crate::application::arguments::{AttArguments, ProductCommand};
 
     #[test]
-    fn repository_example_is_the_current_complete_contract() {
+    fn repository_example_is_valid_for_every_command() {
         let directory = TestDirectory::new();
-        let path = directory.path().join("config.toml");
-        fs::write(&path, include_str!("../../config.example.toml")).expect("应写入示例配置");
-        load_configuration(&path).expect("仓库示例必须符合当前完整契约");
+        let path = directory.write("config.toml", include_str!("../../config.example.toml"));
+
+        for command in [
+            init_command(),
+            extract_command(false),
+            translate_command(false, "primary"),
+            write_back_command(false),
+        ] {
+            load_configuration(&path, command).expect("仓库示例必须满足每个命令的当前契约");
+        }
     }
 
     #[test]
@@ -2321,828 +2490,460 @@ mod tests {
     }
 
     #[test]
-    fn strict_configuration_builds_all_current_sections_and_resolves_paths() {
+    fn init_does_not_parse_unselected_product_sections() {
         let directory = TestDirectory::new();
-        let path = directory.write("config.toml", &valid_configuration());
-        let configuration = load_configuration(&path).expect("完整配置应合法");
-        let configuration_directory =
-            fs::canonicalize(directory.path()).expect("测试配置目录应可规范化");
+        let source = include_str!("../../config.example.toml")
+            .replace("api_key = \"replace-with-api-key\"", "api_key = []")
+            .replace(
+                "worker_stack_bytes = 8388608",
+                "worker_stack_bytes = \"invalid\"",
+            )
+            .replace("read_concurrency = 8", "read_concurrency = \"invalid\"");
+        let path = directory.write("init.toml", &source);
 
-        assert_eq!(
-            configuration.projects_root(),
-            configuration_directory.join("projects")
+        let configured =
+            load_configuration(&path, init_command()).expect("Init 不应解析 LLM、Lua 或 MZ 配置");
+        assert!(matches!(configured, ConfiguredMzCommand::Init(_)));
+    }
+
+    #[test]
+    fn init_allows_known_unselected_sections_to_be_absent() {
+        let directory = TestDirectory::new();
+        let path = directory.write("minimal-init.toml", minimal_init_configuration());
+
+        let configured = load_configuration(&path, init_command())
+            .expect("Init 不应要求 CPU、LLM、Lua 或 MZ 配置存在");
+        assert!(matches!(configured, ConfiguredMzCommand::Init(_)));
+    }
+
+    #[test]
+    fn sqlite_connection_capacity_is_checked_only_for_the_selected_command() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml")
+            .replace("max_open_connections = 16", "max_open_connections = 1");
+        let path = directory.write("single-sqlite-connection.toml", &source);
+
+        assert!(
+            load_configuration(&path, init_command()).is_err(),
+            "Init 的数据库快照固定需要两个连接"
         );
-        assert_eq!(
-            configuration.observability().root(),
-            configuration_directory.join("logs")
-        );
-        assert_eq!(
-            configuration.runtime().llm().tls().additional_pem_files(),
-            &[configuration_directory.join("certificates/provider.pem")]
-        );
-        let profile = configuration
-            .mz()
-            .translation_profile("local")
-            .expect("Profile 应存在");
-        assert_eq!(
-            profile.planning().systems()[0].markdown_path(),
-            configuration_directory.join("prompts/ja-zh.md")
-        );
-        assert_eq!(profile.llm_client_id().as_str(), "local-client");
-        let client = configuration
-            .llm_clients()
-            .get(profile.llm_client_id())
-            .expect("Profile 引用的公共客户端应存在");
-        assert_eq!(
-            client.parameters().get("temperature"),
-            Some(&JsonValue::from(0.2))
-        );
-        assert_eq!(
-            client.url().as_str(),
-            "http://127.0.0.1:8080/v1/chat/completions"
-        );
-        assert_eq!(client.api_key().expose_secret(), "test-api-key");
-        assert_eq!(client.model(), "test-model");
-        assert_eq!(client.timeout(), Duration::from_secs(60));
-        assert_eq!(client.rpm().get(), 60);
-        assert_eq!(client.burst().get(), 4);
-        assert_eq!(
-            configuration
-                .mz()
-                .translation_profile_ids()
-                .collect::<Vec<_>>(),
-            vec!["local"]
+        for command in [
+            extract_command(false),
+            translate_command(false, "primary"),
+            write_back_command(false),
+        ] {
+            load_configuration(&path, command)
+                .expect("没有 Lua 的命令不应为未使用的第二个 SQLite 连接失败");
+        }
+        for command in [
+            parse_command([
+                "att",
+                "mz",
+                "extract",
+                "--name",
+                "demo",
+                "--rules",
+                "rules.json",
+                "--lua",
+                "script.lua",
+            ]),
+            translate_command(true, "primary"),
+            write_back_command(true),
+        ] {
+            assert!(
+                load_configuration(&path, command).is_err(),
+                "显式 Lua 会话与命令短操作共享连接预算，必须拥有第二个连接"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_only_parses_selected_rule_kinds_and_lua() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml")
+            .replacen("scan_concurrency = 4", "scan_concurrency = \"invalid\"", 1)
+            .replace(
+                "worker_stack_bytes = 8388608",
+                "worker_stack_bytes = \"invalid\"",
+            );
+        let path = directory.write("extract.toml", &source);
+
+        load_configuration(&path, extract_command(false))
+            .expect("仅 Rules 且没有 Lua 时不应解析 Builtin 或 Lua");
+        assert!(load_configuration(&path, extract_command(true)).is_err());
+        assert!(
+            load_configuration(
+                &path,
+                parse_command([
+                    "att",
+                    "mz",
+                    "extract",
+                    "--name",
+                    "demo",
+                    "--rules",
+                    "rules.json",
+                    "--lua",
+                    "script.lua",
+                ]),
+            )
+            .is_err(),
+            "显式选择 Lua 时必须严格校验 Lua 配置"
         );
     }
 
     #[test]
-    fn unknown_field_and_duplicate_key_are_rejected_by_toml_boundary() {
+    fn translate_ignores_unselected_client_profile_and_language() {
+        let directory = TestDirectory::new();
+        let source = format!(
+            "{}\n[llm.clients.unused]\nurl = []\napi_key = []\nmodel = []\ntimeout_ms = []\nrpm = []\nburst = []\nparameters = []\n\n[[mz.translation_profiles]]\nid = \"unused\"\nllm_client = []\nmax_in_flight_tasks = []\nplanning = []\nexecution = []\n\n[[mz.languages]]\ntype = \"english\"\nid = \"unused\"\nminimum_word_count = \"invalid\"\n",
+            include_str!("../../config.example.toml")
+        );
+        let path = directory.write("translate.toml", &source);
+        let ConfiguredMzCommand::Translate(configured) =
+            load_configuration(&path, translate_command(false, "primary"))
+                .expect("无关客户端、Profile 和语言条目不应阻止本次翻译")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        configured
+            .mz()
+            .language_modules_for("ja")
+            .expect("只应建立当前源语言模块");
+        configured
+            .mz()
+            .profile()
+            .planning()
+            .system_for("ja", "zh-Hans")
+            .expect("只应建立当前语言对的 system");
+        assert_eq!(configured.client().model(), "replace-with-model-id");
+        assert_eq!(
+            configured.client().api_key().expose_secret(),
+            "replace-with-api-key"
+        );
+    }
+
+    #[test]
+    fn translate_defers_language_and_system_validation_to_actual_project_facts() {
+        let directory = TestDirectory::new();
+        let invalid_unselected_system = include_str!("../../config.example.toml").replace(
+            "[mz.translation_profiles.execution]",
+            "[[mz.translation_profiles.planning.systems]]\nsource_language = \"en\"\ntarget_language = \"zh-Hans\"\npath = []\n\n[mz.translation_profiles.execution]",
+        );
+        let path = directory.write("unselected-system.toml", &invalid_unselected_system);
+        let ConfiguredMzCommand::Translate(configured) =
+            load_configuration(&path, translate_command(false, "primary"))
+                .expect("未命中当前语言对的 system 不应提前解释")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        configured
+            .mz()
+            .profile()
+            .planning()
+            .system_for("ja", "zh-Hans")
+            .expect("当前语言对应使用自己的合法 system");
+        assert!(
+            configured
+                .mz()
+                .profile()
+                .planning()
+                .system_for("en", "zh-Hans")
+                .is_err(),
+            "当项目实际命中该 system 时必须严格拒绝错误类型"
+        );
+
+        let invalid_selected_language = include_str!("../../config.example.toml").replace(
+            "minimum_kana_characters = 1",
+            "minimum_kana_characters = \"invalid\"",
+        );
+        let path = directory.write("selected-language.toml", &invalid_selected_language);
+        let ConfiguredMzCommand::Translate(configured) =
+            load_configuration(&path, translate_command(false, "primary"))
+                .expect("配置读取时还不知道项目实际源语言")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        assert!(
+            configured.mz().language_modules_for("ja").is_err(),
+            "打开项目后命中的语言模块必须严格校验"
+        );
+    }
+
+    #[test]
+    fn translate_rejects_duplicate_current_profile_and_language_ids() {
+        let directory = TestDirectory::new();
+        let duplicate_profile = format!(
+            "{}\n[[mz.translation_profiles]]\nid = \"primary\"\n",
+            include_str!("../../config.example.toml")
+        );
+        let path = directory.write("duplicate-profile.toml", &duplicate_profile);
+        assert!(load_configuration(&path, translate_command(false, "primary")).is_err());
+
+        let duplicate_language = format!(
+            "{}\n[[mz.languages]]\nid = \"ja\"\n",
+            include_str!("../../config.example.toml")
+        );
+        let path = directory.write("duplicate-language.toml", &duplicate_language);
+        let ConfiguredMzCommand::Translate(configured) =
+            load_configuration(&path, translate_command(false, "primary"))
+                .expect("语言 ID 只在项目语言已知后选择")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        assert!(configured.mz().language_modules_for("ja").is_err());
+    }
+
+    #[test]
+    fn selected_subtrees_remain_strict() {
+        let directory = TestDirectory::new();
+        let invalid_client = include_str!("../../config.example.toml")
+            .replace("model = \"replace-with-model-id\"", "model = []");
+        let path = directory.write("client.toml", &invalid_client);
+        assert!(load_configuration(&path, translate_command(false, "primary")).is_err());
+
+        let invalid_audit = include_str!("../../config.example.toml")
+            .replace("queue_capacity = 256", "queue_capacity = 0");
+        let path = directory.write("audit.toml", &invalid_audit);
+        assert!(load_configuration(&path, init_command()).is_err());
+    }
+
+    #[test]
+    fn unknown_top_level_and_runtime_fields_are_rejected() {
         let directory = TestDirectory::new();
         for (name, source) in [
             (
-                "unknown.toml",
-                valid_configuration().replacen(
-                    "root = \"projects\"",
-                    "root = \"projects\"\nunknown = true",
-                    1,
+                "top.toml",
+                format!(
+                    "{}\n[unknown]\nvalue = 1\n",
+                    include_str!("../../config.example.toml")
                 ),
             ),
             (
-                "duplicate.toml",
-                valid_configuration().replacen(
-                    "root = \"projects\"",
-                    "root = \"projects\"\nroot = \"other\"",
-                    1,
-                ),
+                "runtime.toml",
+                include_str!("../../config.example.toml")
+                    .replace("[runtime.cpu]", "unexpected = 1\n\n[runtime.cpu]"),
             ),
         ] {
             let path = directory.write(name, &source);
-            assert!(matches!(
-                load_configuration(&path),
-                Err(ConfigurationLoadError::InvalidToml { .. })
-            ));
+            assert!(load_configuration(&path, init_command()).is_err());
         }
     }
 
     #[test]
-    fn every_policy_field_is_explicit_even_when_disabled() {
+    fn duplicate_toml_keys_are_rejected_even_inside_unselected_sections() {
         let directory = TestDirectory::new();
-        let source = valid_configuration().replace(
-            "quote_repair_pairs = [[\"“\", \"”\"], [\"‘\", \"’\"]]\n",
-            "",
+        let source = format!(
+            "{}\n[llm.clients.unused]\napi_key = \"first\"\napi_key = \"second\"\n",
+            minimal_init_configuration()
         );
-        let path = directory.write("missing-policy.toml", &source);
-        assert!(matches!(
-            load_configuration(&path),
-            Err(ConfigurationLoadError::InvalidToml { .. })
-        ));
+        let path = directory.write("duplicate-unselected-key.toml", &source);
 
-        let disabled = valid_configuration().replace(
-            "quote_repair_pairs = [[\"“\", \"”\"], [\"‘\", \"’\"]]",
-            "quote_repair_pairs = []",
-        );
-        let path = directory.write("disabled-policy.toml", &disabled);
-        load_configuration(&path).expect("显式空数组应表示关闭引号修复");
-    }
-
-    #[test]
-    fn zero_resource_and_reserved_request_body_field_are_rejected() {
-        let directory = TestDirectory::new();
-        let zero = directory.write(
-            "zero.toml",
-            &valid_configuration().replacen("worker_threads = 2", "worker_threads = 0", 1),
-        );
-        let ConfigurationLoadError::InvalidValue(error) =
-            load_configuration(&zero).err().expect("零线程必须拒绝")
-        else {
-            panic!("应返回配置值错误");
-        };
-        assert_eq!(error.field(), "runtime.async.worker_threads");
-
-        let reserved = directory.write(
-            "reserved.toml",
-            &valid_configuration().replacen(
-                "\"temperature\": 0.2",
-                "\"temperature\": 0.2, \"model\": \"other\"",
-                1,
-            ),
-        );
-        let ConfigurationLoadError::InvalidValue(error) = load_configuration(&reserved)
-            .err()
-            .expect("保留请求字段必须拒绝")
-        else {
-            panic!("应返回配置值错误");
-        };
-        assert!(error.field().ends_with("parameters.model"));
-    }
-
-    #[test]
-    fn every_client_field_is_required_and_numeric_client_fields_are_nonzero() {
-        let directory = TestDirectory::new();
-        for (name, field) in [
-            (
-                "missing-url.toml",
-                "url = \"http://127.0.0.1:8080/v1/chat/completions\"\n",
-            ),
-            ("missing-api-key.toml", "api_key = \"test-api-key\"\n"),
-            ("missing-model.toml", "model = \"test-model\"\n"),
-            ("missing-timeout.toml", "timeout_ms = 60000\n"),
-            ("missing-rpm.toml", "rpm = 60\n"),
-            ("missing-burst.toml", "burst = 4\n"),
-            ("missing-parameters.toml", PARAMETERS_FIXTURE),
-        ] {
-            let source = valid_configuration().replace(field, "");
-            assert!(matches!(
-                load_configuration(&directory.write(name, &source)),
-                Err(ConfigurationLoadError::InvalidToml { .. })
-            ));
-        }
-
-        for (name, original, replacement, expected_field) in [
-            (
-                "zero-timeout.toml",
-                "model = \"test-model\"\ntimeout_ms = 60000",
-                "model = \"test-model\"\ntimeout_ms = 0",
-                ".timeout_ms",
-            ),
-            ("zero-rpm.toml", "rpm = 60", "rpm = 0", ".rpm"),
-            ("zero-burst.toml", "burst = 4", "burst = 0", ".burst"),
-        ] {
-            let source = valid_configuration().replace(original, replacement);
-            let ConfigurationLoadError::InvalidValue(error) =
-                load_configuration(&directory.write(name, &source))
-                    .err()
-                    .expect("零值必须拒绝")
-            else {
-                panic!("应返回配置值错误");
-            };
-            assert!(error.field().ends_with(expected_field));
-        }
-    }
-
-    #[test]
-    fn remote_plain_http_is_accepted_and_duplicate_profile_ids_are_rejected() {
-        let directory = TestDirectory::new();
-        let remote_http = directory.write(
-            "http.toml",
-            &valid_configuration().replace(
-                "http://127.0.0.1:8080/v1/chat/completions",
-                "http://example.com/v1/chat/completions",
-            ),
-        );
-        load_configuration(&remote_http).expect("合法远程 HTTP URL 应被接受");
-        let https = directory.write(
-            "https.toml",
-            &valid_configuration().replace(
-                "http://127.0.0.1:8080/v1/chat/completions",
-                "https://api.example.com/v1/chat/completions",
-            ),
-        );
-        load_configuration(&https).expect("合法 HTTPS URL 应被接受");
-
-        let profile = profile_configuration();
-        let duplicate = directory.write(
-            "duplicate-profile.toml",
-            &valid_configuration().replace(&profile, &format!("{profile}\n{profile}")),
-        );
-        let ConfigurationLoadError::InvalidValue(error) = load_configuration(&duplicate)
-            .err()
-            .expect("重复 Profile ID 必须拒绝")
-        else {
-            panic!("应返回配置值错误");
-        };
-        assert!(error.field().ends_with(".id"));
-    }
-
-    #[test]
-    fn url_credentials_fragment_scheme_model_whitespace_and_unknown_field_are_rejected() {
-        let directory = TestDirectory::new();
-        for (name, source, expected_field) in [
-            (
-                "fragment.toml",
-                valid_configuration().replace(
-                    "http://127.0.0.1:8080/v1/chat/completions",
-                    "http://127.0.0.1:8080/v1/chat/completions#fragment",
-                ),
-                ".url",
-            ),
-            (
-                "credentials.toml",
-                valid_configuration().replace(
-                    "http://127.0.0.1:8080/v1/chat/completions",
-                    "http://user:password@127.0.0.1:8080/v1/chat/completions",
-                ),
-                ".url",
-            ),
-            (
-                "scheme.toml",
-                valid_configuration().replace(
-                    "http://127.0.0.1:8080/v1/chat/completions",
-                    "ftp://127.0.0.1/v1/chat/completions",
-                ),
-                ".url",
-            ),
-            (
-                "model-whitespace.toml",
-                valid_configuration().replace("model = \"test-model\"", "model = \" test-model\""),
-                ".model",
-            ),
-            (
-                "client-unknown.toml",
-                valid_configuration().replace("burst = 4", "burst = 4\nunknown = true"),
-                "",
-            ),
-        ] {
-            let path = directory.write(name, &source);
-            let error = load_configuration(&path).err().expect("非法配置必须拒绝");
-            if expected_field.is_empty() {
-                assert!(matches!(error, ConfigurationLoadError::InvalidToml { .. }));
-            } else {
-                let ConfigurationLoadError::InvalidValue(error) = error else {
-                    panic!("应返回配置值错误");
-                };
-                assert!(error.field().ends_with(expected_field));
-            }
-        }
-    }
-
-    #[test]
-    fn api_key_is_loaded_directly_and_debug_is_redacted() {
-        let directory = TestDirectory::new();
-        let secret = "must-not-leak-api-key-7f91";
-        let sensitive_parameter = "must-not-leak-parameter-4c28";
-        let sensitive_url_query = "must-not-leak-url-query-9b31";
-        let path = directory.write(
-            "api-key.toml",
-            &valid_configuration()
-                .replace(
-                    "api_key = \"test-api-key\"",
-                    &format!("api_key = \"{secret}\""),
-                )
-                .replace(
-                    "\"temperature\": 0.2",
-                    &format!("\"sensitive\": \"{sensitive_parameter}\""),
-                )
-                .replace(
-                    "http://127.0.0.1:8080/v1/chat/completions",
-                    &format!(
-                        "http://127.0.0.1:8080/v1/chat/completions?token={sensitive_url_query}"
-                    ),
-                ),
-        );
-        let configuration = load_configuration(&path).expect("配置内 API key 应合法");
-        let client = configuration
-            .llm_clients()
-            .get(&LlmClientId::from_validated("local-client".to_owned()))
-            .expect("客户端应存在");
-        assert_eq!(client.api_key().expose_secret(), secret);
-        let debug = format!("{client:?}");
-        assert!(!debug.contains(secret));
-        assert!(!debug.contains(sensitive_parameter));
-        assert!(!debug.contains(sensitive_url_query));
-        assert!(debug.contains("sensitive"));
-    }
-
-    #[test]
-    fn api_key_rejects_blank_whitespace_and_header_unsafe_values() {
-        let directory = TestDirectory::new();
-        for (name, api_key) in [
-            ("blank-api-key.toml", "   "),
-            ("padded-api-key.toml", " padded "),
-            ("unsafe-api-key.toml", r"bad\u007fkey"),
-        ] {
-            let source = valid_configuration().replace(
-                "api_key = \"test-api-key\"",
-                &format!("api_key = \"{api_key}\""),
-            );
-            let ConfigurationLoadError::InvalidValue(error) =
-                load_configuration(&directory.write(name, &source))
-                    .err()
-                    .expect("非法 API key 必须拒绝")
-            else {
-                panic!("应返回配置值错误");
-            };
-            assert!(error.field().ends_with(".api_key"));
-        }
-    }
-
-    #[test]
-    fn public_client_catalog_supports_shared_references_and_rejects_invalid_catalogs() {
-        let directory = TestDirectory::new();
-        let primary_client = client_configuration();
-        let secondary_client = primary_client
-            .replace(
-                "[llm.clients.local-client]",
-                "[llm.clients.secondary-client]",
-            )
-            .replace("127.0.0.1:8080", "127.0.0.1:8081");
-        let primary_profile = profile_configuration();
-        let secondary_profile = primary_profile.replace("id = \"local\"", "id = \"secondary\"");
-        let shared = valid_configuration()
-            .replace(
-                &primary_client,
-                &format!("{primary_client}\n{secondary_client}"),
-            )
-            .replace(
-                &primary_profile,
-                &format!("{primary_profile}\n{secondary_profile}"),
-            );
-        let configuration = load_configuration(&directory.write("shared.toml", &shared))
-            .expect("多个 Profile 应能引用同一公共客户端");
         assert!(
-            configuration
-                .llm_clients()
-                .get(&LlmClientId::from_validated("secondary-client".to_owned()))
-                .is_some()
+            load_configuration(&path, init_command()).is_err(),
+            "完整 TOML 的重复键属于语法错误，不得因分区未选中而忽略"
         );
-        assert_eq!(
-            configuration
-                .mz()
-                .translation_profile("secondary")
-                .expect("第二个 Profile 应存在")
-                .llm_client_id()
-                .as_str(),
-            "local-client"
-        );
-
-        for (name, source, expected_field) in [
-            (
-                "empty-clients.toml",
-                valid_configuration().replace(&primary_client, "[llm.clients]\n"),
-                "llm.clients",
-            ),
-            (
-                "blank-client-id.toml",
-                valid_configuration().replace("[llm.clients.local-client]", "[llm.clients.\"  \"]"),
-                "llm.clients.  ",
-            ),
-            (
-                "unknown-reference.toml",
-                valid_configuration().replace(
-                    "llm_client = \"local-client\"",
-                    "llm_client = \"missing-client\"",
-                ),
-                "mz.translation_profiles[0].llm_client",
-            ),
-            (
-                "blank-reference.toml",
-                valid_configuration()
-                    .replace("llm_client = \"local-client\"", "llm_client = \"  \""),
-                "mz.translation_profiles[0].llm_client",
-            ),
-        ] {
-            let ConfigurationLoadError::InvalidValue(error) =
-                load_configuration(&directory.write(name, &source))
-                    .err()
-                    .expect("非法公共客户端目录或引用必须拒绝")
-            else {
-                panic!("应返回配置值错误");
-            };
-            assert_eq!(error.field(), expected_field);
-        }
-
-        let duplicate = valid_configuration().replace(
-            &primary_client,
-            &format!("{primary_client}\n{primary_client}"),
-        );
-        assert!(matches!(
-            load_configuration(&directory.write("duplicate-client.toml", &duplicate)),
-            Err(ConfigurationLoadError::InvalidToml { .. })
-        ));
     }
 
     #[test]
-    fn parameters_is_one_strict_json_object_contract() {
+    fn selected_llm_client_debug_redacts_secret_and_parameters() {
         let directory = TestDirectory::new();
-        let empty = replace_parameters(&valid_configuration(), "{}");
-        load_configuration(&directory.write("empty-parameters.toml", &empty))
-            .expect("显式空 parameters 对象应合法");
-        let accepted = replace_parameters(
-            &valid_configuration(),
-            r#"{
-  "n": 2,
-  "max_tokens": 4096,
-  "max_completion_tokens": 8192,
-  "thinking": {"model": "nested", "values": [null, true, 1.5]},
-  "precise": 123456789012345678901234567890.00000000000000000001
-}"#,
-        );
-        let configuration = load_configuration(&directory.write("accepted.toml", &accepted))
-            .expect("用户拥有的任意非保留 JSON 字段应保留");
-        let parameters = configuration
-            .llm_clients()
-            .get(&LlmClientId::from_validated("local-client".to_owned()))
-            .expect("客户端应存在")
-            .parameters();
-        assert_eq!(parameters.get("n"), Some(&JsonValue::from(2)));
-        assert_eq!(parameters.get("max_tokens"), Some(&JsonValue::from(4096)));
-        assert_eq!(
-            parameters
-                .get("thinking")
-                .and_then(|value| value.get("model")),
-            Some(&JsonValue::from("nested"))
-        );
-        assert_eq!(
-            parameters
-                .get("precise")
-                .map(JsonValue::to_string)
-                .as_deref(),
-            Some("123456789012345678901234567890.00000000000000000001")
-        );
-
-        for (name, json, expected_suffix) in [
-            ("non-object.toml", "[]", "parameters"),
-            ("trailing-comma.toml", r#"{"value": 1,}"#, "parameters"),
-            ("comment.toml", "{\"value\": 1 // comment\n}", "parameters"),
-            (
-                "parallel-values.toml",
-                r#"{"value": 1} {"other": 2}"#,
-                "parameters",
-            ),
-            ("truncated.toml", r#"{"value": "unfinished"#, "parameters"),
-            (
-                "top-duplicate.toml",
-                r#"{"value": 1, "value": 2}"#,
-                "parameters",
-            ),
-            (
-                "nested-duplicate.toml",
-                r#"{"nested": {"value": 1, "value": 2}}"#,
-                "parameters",
-            ),
-            (
-                "reserved-model.toml",
-                r#"{"model": "other"}"#,
-                "parameters.model",
-            ),
-            (
-                "reserved-messages.toml",
-                r#"{"messages": []}"#,
-                "parameters.messages",
-            ),
-            (
-                "reserved-stream.toml",
-                r#"{"stream": true}"#,
-                "parameters.stream",
-            ),
-        ] {
-            let source = replace_parameters(&valid_configuration(), json);
-            let ConfigurationLoadError::InvalidValue(error) =
-                load_configuration(&directory.write(name, &source))
-                    .err()
-                    .expect("非法扩展正文必须拒绝")
-            else {
-                panic!("应返回配置值错误");
-            };
-            assert!(error.field().ends_with(expected_suffix));
-        }
-
-        let wrong_type =
-            valid_configuration().replace(PARAMETERS_FIXTURE, "parameters = { temperature = 0.2 }");
-        assert!(matches!(
-            load_configuration(&directory.write("wrong-type.toml", &wrong_type)),
-            Err(ConfigurationLoadError::InvalidToml { .. })
-        ));
-    }
-
-    #[test]
-    fn sqlite_connection_budget_reserves_source_and_destination_for_online_backup() {
-        let directory = TestDirectory::new();
-        let source =
-            valid_configuration().replace("max_open_connections = 8", "max_open_connections = 1");
-
-        let ConfigurationLoadError::InvalidValue(error) =
-            load_configuration(&directory.write("sqlite-one-connection.toml", &source))
-                .err()
-                .expect("单连接预算必须在配置边界被拒绝")
-        else {
-            panic!("应返回配置值错误");
-        };
-        assert_eq!(error.field(), "runtime.sqlite.max_open_connections");
-    }
-
-    #[test]
-    fn configuration_errors_never_retain_or_render_secret_source_text() {
-        let directory = TestDirectory::new();
-        let secret = "must-not-leak-config-source-a3d9";
-        let invalid_toml = valid_configuration()
+        let source = include_str!("../../config.example.toml")
+            .replace("replace-with-api-key", "SECRET_SENTINEL")
             .replace(
-                "api_key = \"test-api-key\"",
-                &format!("api_key = \"{secret}\""),
-            )
-            .replace(
-                "root = \"projects\"",
-                "root = \"projects\"\nroot = \"other\"",
+                "\"temperature\": 0.2",
+                "\"private_vendor_value\": \"PRIVATE_SENTINEL\"",
             );
-        assert_error_chain_does_not_contain(
-            load_configuration(&directory.write("invalid-toml.toml", &invalid_toml))
-                .err()
-                .expect("重复 TOML key 必须拒绝"),
-            secret,
-        );
+        let path = directory.write("secret.toml", &source);
+        let ConfiguredMzCommand::Translate(configured) =
+            load_configuration(&path, translate_command(false, "primary"))
+                .expect("所选客户端应合法")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        let debug = format!("{:?}", configured.client());
+        assert!(!debug.contains("SECRET_SENTINEL"));
+        assert!(!debug.contains("PRIVATE_SENTINEL"));
+    }
 
-        let invalid_json = valid_configuration().replace(
-            "api_key = \"test-api-key\"",
-            &format!("api_key = \"{secret}\""),
-        );
-        let invalid_json = replace_parameters(
-            &invalid_json,
-            format!(r#"{{"sensitive": "{secret}",}}"#).as_str(),
-        );
-        assert_error_chain_does_not_contain(
-            load_configuration(&directory.write("invalid-json.toml", &invalid_json))
-                .err()
-                .expect("非法 JSON 必须拒绝"),
-            secret,
-        );
-
-        let invalid_api_key = valid_configuration().replace(
-            "api_key = \"test-api-key\"",
-            &format!("api_key = \" {secret} \""),
-        );
-        assert_error_chain_does_not_contain(
-            load_configuration(&directory.write("invalid-api-key.toml", &invalid_api_key))
-                .err()
-                .expect("带首尾空白的密钥必须拒绝"),
-            secret,
-        );
+    #[test]
+    fn unselected_client_secret_never_enters_configuration_diagnostics() {
+        let directory = TestDirectory::new();
+        let source = format!(
+            "{}\n[llm.clients.unused]\nurl = []\napi_key = \"UNSELECTED_SECRET_SENTINEL\"\nmodel = []\ntimeout_ms = []\nrpm = []\nburst = []\nparameters = []\n",
+            include_str!("../../config.example.toml")
+        )
+        .replace("queue_capacity = 256", "queue_capacity = 0");
+        let path = directory.write("unselected-secret.toml", &source);
+        let error = match load_configuration(&path, translate_command(false, "primary")) {
+            Ok(_) => panic!("无效审计配置必须拒绝"),
+            Err(error) => error,
+        };
+        let mut diagnostics = format!("{error:?}\n{error}");
+        let mut source = error.source();
+        while let Some(error) = source {
+            diagnostics.push_str(format!("\n{error:?}\n{error}").as_str());
+            source = error.source();
+        }
+        assert!(!diagnostics.contains("UNSELECTED_SECRET_SENTINEL"));
     }
 
     #[test]
     fn configuration_file_has_fixed_bootstrap_size_limit() {
         let directory = TestDirectory::new();
         let path = directory.path().join("large.toml");
-        let file = File::create(&path).expect("应创建测试文件");
-        file.set_len(MAX_CONFIGURATION_BYTES + 1)
-            .expect("应扩展测试文件");
+        fs::write(&path, vec![b'x'; MAX_CONFIGURATION_BYTES as usize + 1]).expect("应写入超限配置");
         assert!(matches!(
-            load_configuration(&path),
+            load_configuration(&path, init_command()),
             Err(ConfigurationLoadError::TooLarge { .. })
         ));
     }
 
-    const PARAMETERS_FIXTURE: &str = r#"parameters = '''
-{
-  "temperature": 0.2
-}
-'''"#;
-
-    fn replace_parameters(configuration: &str, json: &str) -> String {
-        let replacement = format!("parameters = '''\n{json}\n'''");
-        let replaced = configuration.replace(PARAMETERS_FIXTURE, &replacement);
-        assert_ne!(replaced, configuration, "测试夹具必须命中 parameters");
-        replaced
+    fn init_command() -> MzCommand {
+        parse_command(["att", "mz", "init", "--name", "demo", "--path", "game"])
     }
 
-    fn assert_error_chain_does_not_contain(error: ConfigurationLoadError, sentinel: &str) {
-        let display = error.to_string();
-        let debug = format!("{error:?}");
-        assert!(!display.contains(sentinel));
-        assert!(!debug.contains(sentinel));
-
-        let mut source = error.source();
-        while let Some(current) = source {
-            assert!(!current.to_string().contains(sentinel));
-            assert!(!format!("{current:?}").contains(sentinel));
-            source = current.source();
+    fn extract_command(builtin: bool) -> MzCommand {
+        if builtin {
+            parse_command(["att", "mz", "extract", "--name", "demo", "--builtin"])
+        } else {
+            parse_command([
+                "att",
+                "mz",
+                "extract",
+                "--name",
+                "demo",
+                "--rules",
+                "rules.json",
+            ])
         }
     }
 
-    fn valid_configuration() -> String {
-        format!(
-            r#"[projects]
+    fn translate_command(lua: bool, profile: &str) -> MzCommand {
+        if lua {
+            parse_command([
+                "att",
+                "mz",
+                "translate",
+                "--name",
+                "demo",
+                profile,
+                "--lua",
+                "script.lua",
+            ])
+        } else {
+            parse_command(["att", "mz", "translate", "--name", "demo", profile])
+        }
+    }
+
+    fn write_back_command(lua: bool) -> MzCommand {
+        if lua {
+            parse_command([
+                "att",
+                "mz",
+                "write-back",
+                "--name",
+                "demo",
+                "--lua",
+                "script.lua",
+            ])
+        } else {
+            parse_command(["att", "mz", "write-back", "--name", "demo"])
+        }
+    }
+
+    fn parse_command<const N: usize>(arguments: [&str; N]) -> MzCommand {
+        let parsed = AttArguments::try_parse_from(arguments).expect("测试命令应合法");
+        let ProductCommand::Mz { command } = parsed.product;
+        command
+    }
+
+    fn absolute_test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join("att-config-tests").join(label)
+    }
+
+    fn minimal_init_configuration() -> &'static str {
+        r#"
+[projects]
 root = "projects"
 
 [runtime.async]
-worker_threads = 2
-max_blocking_threads = 4
-blocking_thread_keep_alive_ms = 1000
-
-[runtime.cpu]
-worker_threads = 2
-queue_capacity = 16
+worker_threads = 1
+max_blocking_threads = 1
+blocking_thread_keep_alive_ms = 1
 
 [runtime.filesystem]
-worker_threads = 2
-queue_capacity = 16
-max_read_bytes = 8388608
-max_directory_entries = 10000
+worker_threads = 1
+queue_capacity = 1
+max_read_bytes = 1
+max_directory_entries = 1
 
 [runtime.filesystem.tree]
-max_entries = 100000
-max_depth = 64
-max_bytes = 1073741824
-max_single_file_bytes = 67108864
+max_entries = 1
+max_depth = 1
+max_bytes = 1
+max_single_file_bytes = 1
 
 [runtime.filesystem.project_lock]
-timeout_ms = 5000
+timeout_ms = 1
 
 [runtime.filesystem.publisher]
-max_prepared_candidates = 2
-max_recovery_artifacts_per_target = 8
-target_lock_timeout_ms = 5000
+max_recovery_artifacts_per_target = 1
+target_lock_timeout_ms = 1
 
 [runtime.sqlite]
-short_worker_threads = 2
-short_queue_capacity = 32
-max_open_connections = 8
-max_interactive_sessions = 2
-interactive_open_queue_capacity = 8
-interactive_command_queue_capacity = 32
-worker_stack_bytes = 2097152
-max_statement_bytes = 1048576
-max_parameter_bytes = 8388608
-max_rows_per_query = 100000
-max_result_bytes_per_query = 67108864
-busy_timeout_ms = 5000
-journal_mode = "wal"
+short_worker_threads = 1
+short_queue_capacity = 1
+max_open_connections = 2
+worker_stack_bytes = 1
+max_statement_bytes = 1
+max_parameter_bytes = 1
+max_rows_per_query = 1
+max_result_bytes_per_query = 1
+busy_timeout_ms = 1
+journal_mode = "delete"
 synchronous = "full"
-
-[runtime.llm]
-max_active_requests = 4
-queue_capacity = 16
-admission_timeout_ms = 5000
-connect_timeout_ms = 10000
-read_timeout_ms = 60000
-pool_idle_timeout_ms = 30000
-pool_max_idle_per_host = 4
-proxy = false
-
-[runtime.llm.tls]
-additional_pem_files = ["certificates/provider.pem"]
-
-[runtime.lua]
-worker_threads = 2
-queue_capacity = 8
-worker_stack_bytes = 4194304
-memory_limit_bytes_per_vm = 67108864
-cancel_check_instruction_interval = 10000
-max_error_bytes = 65536
-
-[runtime.lua.host_values]
-max_bytes = 33554432
-max_nodes = 500000
-max_depth = 64
 
 [observability]
 root = "logs"
 
-[observability.translation]
-queue_capacity = 128
-lock_timeout_ms = 5000
-max_record_bytes = 1048576
-max_file_bytes = 67108864
-retained_rotated_files = 5
-
-[observability.write_back]
-queue_capacity = 128
-lock_timeout_ms = 5000
-max_record_bytes = 1048576
-max_file_bytes = 67108864
-retained_rotated_files = 5
-
-{}
-
-[mz.document]
-read_concurrency = 4
-parse_concurrency = 2
-
-[mz.standard_asset]
-decode_concurrency = 2
-leaves_per_decode_job = 256
-
-[mz.extract.builtin]
-scan_concurrency = 2
-
-[mz.extract.rules]
-scan_concurrency = 2
-
-[mz.extract.store]
-encode_concurrency = 2
-groups_per_encode_job = 128
-
-[mz.translate.store]
-encode_concurrency = 2
-leaves_per_encode_job = 256
-
-[[mz.languages]]
-type = "japanese"
-id = "ja"
-minimum_kana_characters = 1
-allowed_terms = []
-quote_repair_pairs = [["“", "”"], ["‘", "’"]]
-
-[[mz.languages]]
-type = "english"
-id = "en"
-minimum_word_count = 1
-minimum_letter_count = 2
-ignored_terms = []
-minimum_copied_word_count = 2
-minimum_copied_letter_count = 4
-allowed_terms = []
-
-{}"#,
-            client_configuration(),
-            profile_configuration()
-        )
-    }
-
-    fn client_configuration() -> String {
-        r#"[llm.clients.local-client]
-url = "http://127.0.0.1:8080/v1/chat/completions"
-api_key = "test-api-key"
-model = "test-model"
-timeout_ms = 60000
-rpm = 60
-burst = 4
-parameters = '''
-{
-  "temperature": 0.2
-}
-'''
+[observability.audit]
+queue_capacity = 1
+lock_timeout_ms = 1
+max_record_bytes = 1
+max_file_bytes = 1
+retained_rotated_files = 0
 "#
-        .to_owned()
-    }
-
-    fn profile_configuration() -> String {
-        r#"[[mz.translation_profiles]]
-id = "local"
-llm_client = "local-client"
-max_in_flight_tasks = 2
-
-[mz.translation_profiles.planning]
-scope_concurrency = 2
-max_message_characters = 24000
-
-[[mz.translation_profiles.planning.systems]]
-source_language = "ja"
-target_language = "zh-Hans"
-path = "prompts/ja-zh.md"
-
-[mz.translation_profiles.execution]
-network_retry_delays_ms = [250, 1000]
-max_network_retry_after_ms = 5000
-"#
-        .to_owned()
-    }
-
-    fn absolute_test_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "att-config-{label}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("系统时间应有效")
-                .as_nanos()
-        ))
     }
 
     struct TestDirectory {
-        path: PathBuf,
+        root: PathBuf,
     }
 
     impl TestDirectory {
         fn new() -> Self {
-            let path = absolute_test_path("directory");
-            fs::create_dir_all(&path).expect("应创建测试目录");
-            Self { path }
+            let root = std::env::temp_dir().join(format!(
+                "att-config-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&root).expect("应创建测试目录");
+            Self { root }
         }
 
         fn path(&self) -> &Path {
-            &self.path
+            &self.root
         }
 
-        fn write(&self, name: &str, source: &str) -> PathBuf {
-            let path = self.path.join(name);
-            fs::write(&path, source).expect("应写入测试配置");
+        fn write(&self, name: &str, content: &str) -> PathBuf {
+            let path = self.root.join(name);
+            fs::write(&path, content).expect("应写入测试配置");
             path
         }
     }
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 }

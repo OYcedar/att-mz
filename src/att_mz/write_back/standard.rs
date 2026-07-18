@@ -12,10 +12,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use super::{StandardWriteBack, StandardWriteBackSummary};
-use crate::att_mz::ProjectName;
 use crate::att_mz::project::{MaxFullwidthChars, MzWriteBackLayoutProfile, OpenedProject};
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind};
-use crate::execution::{CooperativeCancellation, OperationCancelled};
+use crate::execution::{CooperativeCancellation, OperationCompletion};
 
 /// 数据库资产叶子在 Standard 写回中的结构化角色。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1258,7 +1257,6 @@ impl ManualLayoutDiagnostic {
 /// 一次完整 WriteBack 成功发布后写入持久日志的运行事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WriteBackRunLog {
-    name: ProjectName,
     layout_profile: MzWriteBackLayoutProfile,
     output_root: PathBuf,
     summary: StandardWriteBackSummary,
@@ -1280,17 +1278,12 @@ impl WriteBackRunLog {
             "人工布局计数必须由结构化诊断唯一建立"
         );
         Self {
-            name: project.name().clone(),
             layout_profile,
             output_root: project.write_back_root().to_path_buf(),
             summary,
             manual_layout_diagnostics,
             lua_executed,
         }
-    }
-
-    pub(crate) fn name(&self) -> &ProjectName {
-        &self.name
     }
 
     pub(crate) const fn layout_profile(&self) -> MzWriteBackLayoutProfile {
@@ -1392,34 +1385,37 @@ where
         &self,
         project: &OpenedProject,
         layout_profile: &MzWriteBackLayoutProfile,
-    ) -> Result<StandardWriteBackPreparation<Self::Documents>, Self::Error> {
-        self.cancellation
-            .check()
-            .map_err(StandardWriteBackServiceError::Cancelled)?;
+    ) -> Result<OperationCompletion<StandardWriteBackPreparation<Self::Documents>>, Self::Error>
+    {
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let snapshot = self
             .asset_reader
             .read(project)
             .await
             .map_err(StandardWriteBackServiceError::ReadAssets)?;
-        self.cancellation
-            .check()
-            .map_err(StandardWriteBackServiceError::Cancelled)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let planned = plan_standard_write_back(snapshot, layout_profile, &self.text_layouter);
-        self.cancellation
-            .check()
-            .map_err(StandardWriteBackServiceError::Cancelled)?;
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
         let rewritten = self
             .document_rewriter
             .rewrite(project, planned.mutation_plan)
             .await
             .map_err(StandardWriteBackServiceError::RewriteDocuments)?;
-        self.cancellation
-            .check()
-            .map_err(StandardWriteBackServiceError::Cancelled)?;
-        Ok(StandardWriteBackPreparation::new(
-            rewritten,
-            planned.summary,
-            planned.manual_layout_diagnostics,
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
+        Ok(OperationCompletion::Completed(
+            StandardWriteBackPreparation::new(
+                rewritten,
+                planned.summary,
+                planned.manual_layout_diagnostics,
+            ),
         ))
     }
 }
@@ -1720,7 +1716,6 @@ fn is_canonical_help_description(leaf: &StandardWriteBackLeaf) -> bool {
 /// Standard 在资产读取和文档改写边界上遇到的技术失败。
 #[derive(Debug)]
 pub(crate) enum StandardWriteBackServiceError<R, D> {
-    Cancelled(OperationCancelled),
     ReadAssets(R),
     RewriteDocuments(D),
 }
@@ -1732,7 +1727,6 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled(error) => error.fmt(formatter),
             Self::ReadAssets(source) => write!(formatter, "读取 Standard 写回资产失败：{source}"),
             Self::RewriteDocuments(source) => write!(formatter, "改写 MZ 文档失败：{source}"),
         }
@@ -1746,7 +1740,6 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Cancelled(error) => Some(error),
             Self::ReadAssets(source) => Some(source),
             Self::RewriteDocuments(source) => Some(source),
         }
@@ -2145,6 +2138,9 @@ mod tests {
             .prepare(&project, project.layout_profile())
             .await
             .expect("Standard 写回应成功");
+        let OperationCompletion::Completed(report) = report else {
+            panic!("Standard 写回应正常完成")
+        };
         let (documents, summary, diagnostics) = report.into_parts();
 
         assert_eq!(documents, RewrittenDocuments("candidate".to_owned()));
@@ -2283,6 +2279,9 @@ mod tests {
             .prepare(&project, project.layout_profile())
             .await
             .expect("非帮助 description 不应阻止写回");
+        let OperationCompletion::Completed(report) = report else {
+            panic!("Standard 写回应正常完成")
+        };
         let (_, summary, _) = report.into_parts();
         let recorded = harness.recorded();
 
@@ -2335,6 +2334,9 @@ mod tests {
             .prepare(&project, project.layout_profile())
             .await
             .expect("Manual 是正常写回结果");
+        let OperationCompletion::Completed(report) = report else {
+            panic!("Standard 写回应正常完成")
+        };
         let (_, summary, diagnostics) = report.into_parts();
         let recorded = harness.recorded();
 
@@ -2386,6 +2388,9 @@ mod tests {
             .prepare(&project, project.layout_profile())
             .await
             .expect("空快照仍应发布完整冻结副本");
+        let OperationCompletion::Completed(report) = report else {
+            panic!("Standard 写回应正常完成")
+        };
         let (_, summary, diagnostics) = report.into_parts();
         let recorded = harness.recorded();
 
@@ -2412,6 +2417,9 @@ mod tests {
             .prepare(&project, project.layout_profile())
             .await
             .expect("显式同文译文仍应应用");
+        let OperationCompletion::Completed(report) = report else {
+            panic!("Standard 写回应正常完成")
+        };
         let (_, summary, _) = report.into_parts();
         let recorded = harness.recorded();
 
@@ -2867,6 +2875,9 @@ mod tests {
             .prepare(&project, project.layout_profile())
             .await
             .expect("帮助框 Manual 仍应成功发布");
+        let OperationCompletion::Completed(report) = report else {
+            panic!("Standard 写回应正常完成")
+        };
         let (_, summary, diagnostics) = report.into_parts();
         let recorded = harness.recorded();
 

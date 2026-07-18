@@ -15,7 +15,7 @@ use crate::fingerprint::Sha256Fingerprint;
 use crate::project_database::{PLACEHOLDER_RULES_RESOURCE_KIND, TERMINOLOGY_RESOURCE_KIND};
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
-    ExecuteTransactionError, SqliteCheckId, SqliteCommand, SqliteQuery, SqliteTransactionExecutor,
+    ExecuteTransactionError, SqliteCommand, SqliteQuery, SqliteTransactionExecutor,
     SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
 };
 
@@ -165,21 +165,10 @@ where
 pub(crate) enum MzStandardTranslationResultStorageError<S, C> {
     ScheduleEncoding(CpuTaskExecutionError<C>),
     InvalidPlan(ResultStoragePlanError),
-    DatabaseNotFound {
-        database_path: PathBuf,
-    },
-    StalePlan {
-        database_path: PathBuf,
-        check_id: SqliteCheckId,
-    },
-    NotCommitted {
-        database_path: PathBuf,
-        source: S,
-    },
-    OutcomeUnknown {
-        database_path: PathBuf,
-        source: S,
-    },
+    DatabaseNotFound { database_path: PathBuf },
+    StalePlan { database_path: PathBuf },
+    NotCommitted { database_path: PathBuf, source: S },
+    OutcomeUnknown { database_path: PathBuf, source: S },
 }
 
 impl<S: fmt::Display, C: fmt::Display> fmt::Display
@@ -192,14 +181,10 @@ impl<S: fmt::Display, C: fmt::Display> fmt::Display
             Self::DatabaseNotFound { database_path } => {
                 write!(formatter, "项目数据库不存在：{}", database_path.display())
             }
-            Self::StalePlan {
-                database_path,
-                check_id,
-            } => write!(
+            Self::StalePlan { database_path } => write!(
                 formatter,
-                "翻译计划建立后资产已发生变化（{}，检查 {}）",
-                database_path.display(),
-                check_id.as_str()
+                "翻译计划建立后资产已发生变化（{}）",
+                database_path.display()
             ),
             Self::NotCommitted {
                 database_path,
@@ -287,20 +272,16 @@ struct EncodedIdentity {
 
 enum PreparationLeafWork {
     Invalidation {
-        index: usize,
         identity: TranslationLeafIdentity,
         expected_translation: String,
         expected_translation_state: Sha256Fingerprint,
     },
     ReuseSeed {
-        reuse_index: usize,
         identity: TranslationLeafIdentity,
         expected_translation: String,
         expected_translation_state: Sha256Fingerprint,
     },
     ReuseTarget {
-        reuse_index: usize,
-        target_index: usize,
         seed_original: String,
         translation: String,
         identity: TranslationLeafIdentity,
@@ -312,20 +293,16 @@ enum PreparationLeafWork {
 
 enum EncodedPreparationLeaf {
     Invalidation {
-        index: usize,
         identity: EncodedIdentity,
         expected_translation: String,
         expected_translation_state: Sha256Fingerprint,
     },
     ReuseSeed {
-        reuse_index: usize,
         identity: EncodedIdentity,
         expected_translation: String,
         expected_translation_state: Sha256Fingerprint,
     },
     ReuseTarget {
-        reuse_index: usize,
-        target_index: usize,
         translation: String,
         identity: EncodedIdentity,
         expected_translation: Option<String>,
@@ -335,8 +312,6 @@ enum EncodedPreparationLeaf {
 }
 
 struct CommitLeafWork {
-    patch_index: usize,
-    role: String,
     identity: TranslationLeafIdentity,
     required_original: Option<String>,
     translation: String,
@@ -344,8 +319,6 @@ struct CommitLeafWork {
 }
 
 struct EncodedCommitLeaf {
-    patch_index: usize,
-    role: String,
     identity: EncodedIdentity,
     translation: String,
     translation_state: Sha256Fingerprint,
@@ -366,32 +339,28 @@ fn preparation_work(
         preparation.into_parts();
     let mut work = Vec::new();
 
-    for (index, invalidation) in invalidations.into_iter().enumerate() {
+    for invalidation in invalidations {
         work.push(PreparationLeafWork::Invalidation {
-            index,
             identity: invalidation.identity().clone(),
             expected_translation: invalidation.expected_translation().to_owned(),
             expected_translation_state: invalidation.expected_translation_state(),
         });
     }
 
-    for (reuse_index, reuse) in reuses.into_iter().enumerate() {
+    for reuse in reuses {
         if reuse.targets().is_empty() {
             return Err(ResultStoragePlanError::EmptyReuseTargets);
         }
         let seed_original = reuse.seed().identity().original_text().to_owned();
         let translation = reuse.seed().expected_translation().to_owned();
         work.push(PreparationLeafWork::ReuseSeed {
-            reuse_index,
             identity: reuse.seed().identity().clone(),
             expected_translation: translation.clone(),
             expected_translation_state: reuse.seed().expected_translation_state(),
         });
 
-        for (target_index, target) in reuse.targets().iter().enumerate() {
+        for target in reuse.targets() {
             work.push(PreparationLeafWork::ReuseTarget {
-                reuse_index,
-                target_index,
                 seed_original: seed_original.clone(),
                 translation: translation.clone(),
                 identity: target.identity().clone(),
@@ -416,36 +385,30 @@ fn encode_preparation_job(
     job.into_iter()
         .map(|work| match work {
             PreparationLeafWork::Invalidation {
-                index,
                 identity,
                 expected_translation,
                 expected_translation_state,
             } => {
                 ensure_nonblank(&expected_translation)?;
                 Ok(EncodedPreparationLeaf::Invalidation {
-                    index,
                     identity: encode_identity(&identity)?,
                     expected_translation,
                     expected_translation_state,
                 })
             }
             PreparationLeafWork::ReuseSeed {
-                reuse_index,
                 identity,
                 expected_translation,
                 expected_translation_state,
             } => {
                 ensure_nonblank(&expected_translation)?;
                 Ok(EncodedPreparationLeaf::ReuseSeed {
-                    reuse_index,
                     identity: encode_identity(&identity)?,
                     expected_translation,
                     expected_translation_state,
                 })
             }
             PreparationLeafWork::ReuseTarget {
-                reuse_index,
-                target_index,
                 seed_original,
                 translation,
                 identity,
@@ -467,8 +430,6 @@ fn encode_preparation_job(
                     return Err(ResultStoragePlanError::BlankTranslation);
                 }
                 Ok(EncodedPreparationLeaf::ReuseTarget {
-                    reuse_index,
-                    target_index,
                     translation,
                     identity: encode_identity(&identity)?,
                     expected_translation,
@@ -491,35 +452,29 @@ fn finish_preparation_plan(
     for leaf in batches.into_iter().flatten() {
         match leaf {
             EncodedPreparationLeaf::Invalidation {
-                index,
                 identity,
                 expected_translation,
                 expected_translation_state,
             } => {
                 ensure_unique(&mut seen, &identity)?;
                 steps.push(require_snapshot(
-                    format!("preparation_invalidation_{index}"),
                     &identity,
                     Some((&expected_translation, expected_translation_state)),
                 ));
                 steps.push(clear_translation(&identity));
             }
             EncodedPreparationLeaf::ReuseSeed {
-                reuse_index,
                 identity,
                 expected_translation,
                 expected_translation_state,
             } => {
                 ensure_unique(&mut seen, &identity)?;
                 steps.push(require_snapshot(
-                    format!("preparation_reuse_seed_{reuse_index}"),
                     &identity,
                     Some((&expected_translation, expected_translation_state)),
                 ));
             }
             EncodedPreparationLeaf::ReuseTarget {
-                reuse_index,
-                target_index,
                 translation,
                 identity,
                 expected_translation,
@@ -530,11 +485,7 @@ fn finish_preparation_plan(
                 let expected = expected_translation
                     .as_deref()
                     .zip(expected_translation_state);
-                steps.push(require_snapshot(
-                    format!("preparation_reuse_target_{reuse_index}_{target_index}"),
-                    &identity,
-                    expected,
-                ));
+                steps.push(require_snapshot(&identity, expected));
                 steps.push(write_translation(
                     &identity,
                     &translation,
@@ -555,20 +506,16 @@ fn commit_work(
         return Err(ResultStoragePlanError::EmptyTaskResult);
     }
     let mut work = Vec::new();
-    for (patch_index, patch) in patches.into_iter().enumerate() {
+    for patch in patches {
         let translation = patch.translation().to_owned();
         work.push(CommitLeafWork {
-            patch_index,
-            role: "leader".to_owned(),
             identity: patch.identity().clone(),
             required_original: None,
             translation: translation.clone(),
             translation_state: patch.translation_state(),
         });
-        for (target_index, target) in patch.propagation_targets().iter().enumerate() {
+        for target in patch.propagation_targets() {
             work.push(CommitLeafWork {
-                patch_index,
-                role: format!("target_{target_index}"),
                 identity: target.identity().clone(),
                 required_original: Some(patch.identity().original_text().to_owned()),
                 translation: translation.clone(),
@@ -593,8 +540,6 @@ fn encode_commit_job(
                 return Err(ResultStoragePlanError::MismatchedPropagationOriginal);
             }
             Ok(EncodedCommitLeaf {
-                patch_index: work.patch_index,
-                role: work.role,
                 identity: encode_identity(&work.identity)?,
                 translation: work.translation,
                 translation_state: work.translation_state,
@@ -610,11 +555,7 @@ fn finish_commit_plan(
     let mut seen = BTreeSet::new();
     for leaf in batches.into_iter().flatten() {
         ensure_unique(&mut seen, &leaf.identity)?;
-        steps.push(require_snapshot(
-            format!("commit_{}_{}", leaf.patch_index, leaf.role),
-            &leaf.identity,
-            None,
-        ));
+        steps.push(require_snapshot(&leaf.identity, None));
         steps.push(write_translation(
             &leaf.identity,
             &leaf.translation,
@@ -703,19 +644,15 @@ fn require_snapshot_baseline(baseline: &TranslationSnapshotBaseline) -> SqliteTr
         text(baseline.placeholder_rules_json()),
     ]);
 
-    SqliteTransactionStep::RequireNoRows {
-        check_id: SqliteCheckId::new("mz_translation_snapshot_baseline"),
-        query: SqliteQuery::new(
-            format!(
-                "SELECT 1 WHERE (SELECT COUNT(*) FROM metadata) <> 1 OR NOT EXISTS (SELECT 1 FROM metadata WHERE source_snapshot_fingerprint = ?) OR {owner_condition} OR (SELECT COUNT(*) FROM standard_translation_resource) <> 2 OR NOT EXISTS (SELECT 1 FROM standard_translation_resource WHERE resource_kind = ? AND canonical_json = ?) OR NOT EXISTS (SELECT 1 FROM standard_translation_resource WHERE resource_kind = ? AND canonical_json = ?)"
-            ),
-            parameters,
+    SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
+        format!(
+            "SELECT 1 WHERE (SELECT COUNT(*) FROM metadata) <> 1 OR NOT EXISTS (SELECT 1 FROM metadata WHERE source_snapshot_fingerprint = ?) OR {owner_condition} OR (SELECT COUNT(*) FROM standard_translation_resource) <> 2 OR NOT EXISTS (SELECT 1 FROM standard_translation_resource WHERE resource_kind = ? AND canonical_json = ?) OR NOT EXISTS (SELECT 1 FROM standard_translation_resource WHERE resource_kind = ? AND canonical_json = ?)"
         ),
-    }
+        parameters,
+    ))
 }
 
 fn require_snapshot(
-    id: String,
     identity: &EncodedIdentity,
     expected_translation: Option<(&str, Sha256Fingerprint)>,
 ) -> SqliteTransactionStep {
@@ -739,16 +676,13 @@ fn require_snapshot(
     } else {
         " AND translation IS NULL AND translation_state IS NULL"
     };
-    SqliteTransactionStep::RequireNoRows {
-        check_id: SqliteCheckId::new(format!("mz_translation_{id}")),
-        query: SqliteQuery::new(
-            format!(
-                "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM {} WHERE owner = ? AND exact_location = ? AND group_location = ? AND field_name = ? AND original_text = ?{unit_predicate}{state_predicate})",
-                identity.table.storage_name()
-            ),
-            parameters,
+    SqliteTransactionStep::RequireNoRows(SqliteQuery::new(
+        format!(
+            "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM {} WHERE owner = ? AND exact_location = ? AND group_location = ? AND field_name = ? AND original_text = ?{unit_predicate}{state_predicate})",
+            identity.table.storage_name()
         ),
-    }
+        parameters,
+    ))
 }
 
 fn clear_translation(identity: &EncodedIdentity) -> SqliteTransactionStep {
@@ -821,11 +755,8 @@ fn map_transaction_error<S, C>(
         ExecuteTransactionError::NotFound => {
             MzStandardTranslationResultStorageError::DatabaseNotFound { database_path }
         }
-        ExecuteTransactionError::RequirementFailed { check_id } => {
-            MzStandardTranslationResultStorageError::StalePlan {
-                database_path,
-                check_id,
-            }
+        ExecuteTransactionError::RequirementFailed => {
+            MzStandardTranslationResultStorageError::StalePlan { database_path }
         }
         ExecuteTransactionError::NotCommitted(source) => {
             MzStandardTranslationResultStorageError::NotCommitted {
@@ -990,8 +921,7 @@ mod tests {
         assert_eq!(concurrent_plan, serial.only_plan());
         assert!(matches!(
             concurrent_plan.steps().first(),
-            Some(SqliteTransactionStep::RequireNoRows { check_id, .. })
-                if check_id.as_str() == "mz_translation_snapshot_baseline"
+            Some(SqliteTransactionStep::RequireNoRows(_))
         ));
     }
 
@@ -1097,8 +1027,7 @@ mod tests {
             assert!(
                 matches!(
                     error,
-                    MzStandardTranslationResultStorageError::StalePlan { ref check_id, .. }
-                        if check_id.as_str() == "mz_translation_snapshot_baseline"
+                    MzStandardTranslationResultStorageError::StalePlan { .. }
                 ),
                 "漂移种类 {mutation}"
             );
@@ -1160,7 +1089,7 @@ mod tests {
         let transaction = connection.transaction().expect("应可开始测试事务");
         for step in plan.steps() {
             match step {
-                SqliteTransactionStep::RequireNoRows { check_id, query } => {
+                SqliteTransactionStep::RequireNoRows(query) => {
                     let exists = {
                         let mut statement = transaction
                             .prepare(query.statement())
@@ -1177,9 +1106,7 @@ mod tests {
                     };
                     if exists {
                         transaction.rollback().expect("失败事务应可回滚");
-                        return Err(ExecuteTransactionError::RequirementFailed {
-                            check_id: check_id.clone(),
-                        });
+                        return Err(ExecuteTransactionError::RequirementFailed);
                     }
                 }
                 SqliteTransactionStep::Execute(command) => {

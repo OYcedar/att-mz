@@ -1,5 +1,3 @@
-use std::error::Error;
-use std::future::Future;
 use std::path::PathBuf;
 
 use super::ProjectName;
@@ -25,13 +23,10 @@ mod full_tree_tests;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranslateInput {
     pub name: ProjectName,
-    pub profile_id: String,
     /// 本次标准翻译使用的外部术语表；`None` 不表示权威空术语表。
     pub terminology_path: Option<PathBuf>,
     /// 本次补充的占位符规则；`None` 不关闭标准翻译内置的 MZ 保护规格。
     pub placeholder_rules_path: Option<PathBuf>,
-    /// 可选的可信 Lua 翻译程序；真实 Host 仍由后续根适配器提供。
-    pub lua_script: Option<PathBuf>,
 }
 
 /// 一轮标准翻译的正常业务汇总。
@@ -62,14 +57,4 @@ pub struct TranslateOutput {
     pub profile_id: String,
     pub standard: StandardTranslationSummary,
     pub lua_executed: bool,
-}
-
-/// 完成一个 MZ 游戏翻译用例。
-pub trait TranslateUseCase: Send + Sync {
-    type Error: Error + Send + Sync + 'static;
-
-    fn execute(
-        &self,
-        input: TranslateInput,
-    ) -> impl Future<Output = Result<TranslateOutput, Self::Error>> + Send;
 }

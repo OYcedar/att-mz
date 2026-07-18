@@ -6,43 +6,48 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::TranslateInput;
 use super::asset_reader::MzStandardTranslationAssetReadingService;
 use super::executor::{
     AsyncDelay, MzStandardTranslationTaskExecutionService, TranslationTaskResponseProcessingService,
 };
-use super::lua::LuaTranslationService;
+use super::lua::{LuaTranslation, LuaTranslationService};
 use super::placeholder::Pcre2PlaceholderService;
 use super::planner::MzStandardTranslationTaskPlanningService;
 use super::planning_resource::JsonTranslationPlanningResourceReadingService;
 use super::profile::{
-    InMemoryTranslationExecutionProfileResolver, MzTranslationExecutionConfiguration,
-    MzTranslationExecutionPayload, MzTranslationPlanningConfiguration, TranslationExecutionProfile,
-    TranslationProfileCatalog, TranslationProfileLanguagePair,
+    MzTranslationExecutionConfiguration, MzTranslationExecutionPayload,
+    MzTranslationPlanningConfiguration, TranslationExecutionProfile,
+    TranslationProfileLanguagePair,
 };
 use super::result_store::{
     MzStandardTranslationResultStorageConfig, MzStandardTranslationResultStorageService,
 };
-use super::service::TranslateService;
-use super::standard::{StandardTranslationService, TranslationLogEvent};
-use super::{TranslateInput, TranslateUseCase};
+use super::service::{
+    SelectedTranslationExecution, SelectedTranslationExecutionBuilder, TranslateService,
+};
+use super::standard::{StandardTranslation, StandardTranslationService};
+use crate::att_mz::audit::{AuditEvent, AuditLedger, TranslationTaskAuditResult};
 use crate::att_mz::location_codec::MzLocationCodec;
 use crate::att_mz::lua::LuaPhase;
 use crate::att_mz::lua::hosting::TrustedLuaExecutionHostingService;
 use crate::att_mz::lua::runtime::{
     OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeBindings,
     TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
-    TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
 };
 use crate::att_mz::lua::session::{
     OpenSqliteInteractiveSessionError, OpenedSqliteInteractiveSession,
-    SqliteInteractiveConnectionCloseOutcome, SqliteInteractiveRollbackOutcome,
     SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
-    SqliteInteractiveSessionFinalizationReport, SqliteInteractiveSessionFinalizer,
-    SqliteInteractiveSessionOperations, SqliteInteractiveTransactionObservation,
+    SqliteInteractiveSessionFinalization, SqliteInteractiveSessionFinalizationError,
+    SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
 };
 use crate::att_mz::project::ExistingProjectOpeningService;
+use crate::att_mz::project_lease::{
+    ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
+};
 use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
+use crate::execution::OperationCompletion;
 use crate::fingerprint::Sha256Fingerprint;
 use crate::language::{
     JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageModuleCatalog,
@@ -51,7 +56,7 @@ use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError,
     LlmRequestExecutor, LlmResponse,
 };
-use crate::observability::PersistentEventLog;
+use crate::observability::{EventId, OperationId};
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
@@ -88,9 +93,9 @@ enum Event {
     Delay(Duration),
     PreparationTransaction,
     CommitTransaction,
+    LogTaskStarted,
     LogTask,
     LogCommitFailure,
-    LogRun,
     ReadLua(PathBuf),
     OpenLuaDatabase(PathBuf),
     LuaRuntime,
@@ -105,25 +110,51 @@ enum Event {
 }
 
 #[derive(Clone)]
-struct FakePersistentEventLog {
+struct FakeAuditLedger {
     events: EventLog,
     calls: Arc<AtomicUsize>,
 }
 
-impl PersistentEventLog<TranslationLogEvent> for FakePersistentEventLog {
+impl AuditLedger for FakeAuditLedger {
     type Error = FakeRootError;
 
-    async fn append(&self, event: TranslationLogEvent) -> Result<(), Self::Error> {
+    fn new_operation_id(&self) -> Result<OperationId, Self::Error> {
+        Ok(OperationId::from_uuid(uuid::Uuid::from_u128(
+            0x550e_8400_e29b_41d4_a716_4466_5544_0000,
+        )))
+    }
+
+    async fn append(&self, event: AuditEvent) -> Result<EventId, Self::Error> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        record(
-            &self.events,
-            match event {
-                TranslationLogEvent::TaskProcessed(_) => Event::LogTask,
-                TranslationLogEvent::TaskCommitFailed(_) => Event::LogCommitFailure,
-                TranslationLogEvent::RunCompleted(_) => Event::LogRun,
-            },
-        );
-        Ok(())
+        let recorded = match event {
+            AuditEvent::TranslationTaskStarted { .. } => Event::LogTaskStarted,
+            AuditEvent::TranslationTaskFinished {
+                result: TranslationTaskAuditResult::Completed(_),
+                ..
+            } => Event::LogTask,
+            AuditEvent::TranslationTaskFinished {
+                result: TranslationTaskAuditResult::CommitFailed(_),
+                ..
+            }
+            | AuditEvent::TranslationTaskFinished {
+                result: TranslationTaskAuditResult::NotCommitted(_),
+                ..
+            }
+            | AuditEvent::TranslationTaskFinished {
+                result: TranslationTaskAuditResult::ExecutionFailed { .. },
+                ..
+            } => Event::LogCommitFailure,
+            AuditEvent::RunStarted
+            | AuditEvent::RunFinished { .. }
+            | AuditEvent::WriteBackPublishStarted { .. }
+            | AuditEvent::WriteBackPublishFinished { .. } => {
+                return Err(FakeRootError("意外审计事件"));
+            }
+        };
+        record(&self.events, recorded);
+        Ok(EventId::from_uuid(uuid::Uuid::from_u128(
+            0x7c9e_6679_7425_40de_944b_e07f_c1f9_0ae7,
+        )))
     }
 }
 
@@ -324,17 +355,17 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
             path,
             PathBuf::from("C:/projects").join("demo").join("project.db")
         );
-        let translated_leaf_count = plan
-            .steps()
-            .iter()
-            .filter(|step| match step {
-                SqliteTransactionStep::Execute(command) => command
-                    .parameters()
-                    .contains(&SqliteValue::Text("魔法剑".to_owned())),
-                SqliteTransactionStep::ExecuteMany(_)
-                | SqliteTransactionStep::RequireNoRows { .. } => false,
-            })
-            .count();
+        let translated_leaf_count =
+            plan.steps()
+                .iter()
+                .filter(|step| match step {
+                    SqliteTransactionStep::Execute(command) => command
+                        .parameters()
+                        .contains(&SqliteValue::Text("魔法剑".to_owned())),
+                    SqliteTransactionStep::ExecuteMany(_)
+                    | SqliteTransactionStep::RequireNoRows(_) => false,
+                })
+                .count();
         let event = if translated_leaf_count == 0 {
             assert!(plan.steps().iter().any(|step| matches!(
                 step,
@@ -393,7 +424,7 @@ impl LlmRequestExecutor for FakeLlmRequestExecutor {
                 "lua raw response",
                 LlmFinishReason::Stop,
                 Some("lua-request".to_owned()),
-                "lua-response",
+                Some("lua-response".to_owned()),
                 None,
             ));
         }
@@ -421,7 +452,7 @@ impl LlmRequestExecutor for FakeLlmRequestExecutor {
             r#"[{"id":"0","translation":"魔法剑"}]"#,
             LlmFinishReason::Stop,
             Some("standard-request".to_owned()),
-            "standard-response",
+            Some("standard-response".to_owned()),
             None,
         ))
     }
@@ -434,12 +465,9 @@ struct FakeAsyncDelay {
 }
 
 impl AsyncDelay for FakeAsyncDelay {
-    type Error = FakeRootError;
-
-    async fn wait(&self, duration: Duration) -> Result<(), Self::Error> {
+    async fn wait(&self, duration: Duration) {
         self.calls.fetch_add(1, Ordering::SeqCst);
         record(&self.events, Event::Delay(duration));
-        Ok(())
     }
 }
 
@@ -550,28 +578,26 @@ struct FakeSqliteInteractiveSessionFinalizer {
 impl SqliteInteractiveSessionFinalizer for FakeSqliteInteractiveSessionFinalizer {
     type Error = FakeRootError;
 
-    async fn finalize(self) -> SqliteInteractiveSessionFinalizationReport<Self::Error> {
+    async fn finalize(
+        self,
+    ) -> Result<
+        SqliteInteractiveSessionFinalization,
+        SqliteInteractiveSessionFinalizationError<Self::Error>,
+    > {
         record(&self.events, Event::LuaInspect);
         let mut state = self.state.lock().expect("会话状态锁不应中毒");
-        let transaction = if state.transaction_active {
+        let had_unclosed_transaction = if state.transaction_active {
             state.transaction_active = false;
-            SqliteInteractiveTransactionObservation::Active
+            true
         } else {
-            SqliteInteractiveTransactionObservation::Idle
+            false
         };
         state.closed = true;
         drop(state);
         record(&self.events, Event::LuaClose);
-        let rollback = if matches!(transaction, SqliteInteractiveTransactionObservation::Active) {
-            SqliteInteractiveRollbackOutcome::RolledBack
-        } else {
-            SqliteInteractiveRollbackOutcome::NotRequired
-        };
-        SqliteInteractiveSessionFinalizationReport::new(
-            transaction,
-            rollback,
-            SqliteInteractiveConnectionCloseOutcome::Closed,
-        )
+        Ok(SqliteInteractiveSessionFinalization::new(
+            had_unclosed_transaction,
+        ))
     }
 }
 
@@ -618,26 +644,9 @@ struct FakeTrustedLuaRuntimeExecutor {
 
 impl TrustedLuaRuntimeExecutor for FakeTrustedLuaRuntimeExecutor {
     type Error = FakeRootError;
-    type Reservation = FakeTrustedLuaRuntimeReservation;
-
-    async fn reserve(&self) -> Result<Self::Reservation, Self::Error> {
-        Ok(FakeTrustedLuaRuntimeReservation {
-            events: Arc::clone(&self.events),
-            calls: Arc::clone(&self.calls),
-        })
-    }
-}
-
-struct FakeTrustedLuaRuntimeReservation {
-    events: EventLog,
-    calls: Arc<AtomicUsize>,
-}
-
-impl TrustedLuaRuntimeReservation for FakeTrustedLuaRuntimeReservation {
-    type Error = FakeRootError;
 
     fn start(
-        self,
+        &self,
         program: OwnedLuaProgram,
         bindings: TrustedLuaRuntimeBindings,
     ) -> TrustedLuaExecutionHandle<Self::Error> {
@@ -686,12 +695,7 @@ impl TrustedLuaRuntimeReservation for FakeTrustedLuaRuntimeReservation {
                 Ok(())
             }
             .await;
-            let termination = if runtime.is_ok() {
-                TrustedLuaRuntimeTermination::Completed
-            } else {
-                TrustedLuaRuntimeTermination::Failed
-            };
-            let finalization = finalizer.finalize(termination).await;
+            let finalization = finalizer.finalize().await;
             let _ = sender.send(TrustedLuaRuntimeExecutionReport::new(runtime, finalization));
         });
         TrustedLuaExecutionHandle::new(receiver, cancelled)
@@ -714,8 +718,59 @@ fn event_position(events: &[Event], predicate: impl Fn(&Event) -> bool) -> usize
     events.iter().position(predicate).expect("预期事件应该发生")
 }
 
+struct FixedExecutionBuilder<P, S, L> {
+    profile: Arc<TranslationExecutionProfile<P>>,
+    standard: Mutex<Option<S>>,
+    lua: Mutex<Option<crate::att_mz::SelectedLua<L>>>,
+}
+
+impl<P, S, L> SelectedTranslationExecutionBuilder for FixedExecutionBuilder<P, S, L>
+where
+    P: Send + Sync + 'static,
+    S: StandardTranslation<Profile = Arc<TranslationExecutionProfile<P>>>,
+    L: LuaTranslation<Profile = Arc<TranslationExecutionProfile<P>>>,
+{
+    type Payload = P;
+    type Standard = S;
+    type Lua = L;
+    type Error = FakeRootError;
+
+    async fn build(
+        &self,
+        _project: &crate::att_mz::project::OpenedProject,
+    ) -> Result<SelectedTranslationExecution<P, S, L>, Self::Error> {
+        let standard = self
+            .standard
+            .lock()
+            .expect("标准翻译构造锁不应中毒")
+            .take()
+            .ok_or(FakeRootError("翻译执行切片已经构造"))?;
+        let lua = self.lua.lock().expect("Lua 构造锁不应中毒").take();
+        Ok(SelectedTranslationExecution::new(
+            Arc::clone(&self.profile),
+            standard,
+            lua,
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FakeProjectLeaseProvider;
+
+impl ProjectCommandLeaseProvider for FakeProjectLeaseProvider {
+    type Error = FakeRootError;
+    type LeaseState = ();
+
+    async fn acquire(
+        &self,
+        _project: &crate::att_mz::ProjectName,
+    ) -> Result<ProjectCommandLease<Self::LeaseState>, ProjectCommandLeaseError<Self::Error>> {
+        Ok(ProjectCommandLease::for_test(()))
+    }
+}
+
 #[tokio::test]
-async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
+async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let cpu_calls = Arc::new(AtomicUsize::new(0));
     let transaction_calls = Arc::new(AtomicUsize::new(0));
@@ -784,14 +839,11 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
             name: "shared-llm-config",
         }),
     );
-    let resolver = InMemoryTranslationExecutionProfileResolver::new(
-        TranslationProfileCatalog::new([TranslationExecutionProfile::new(
-            "quality",
-            non_zero(1),
-            payload,
-        )])
-        .expect("测试 Profile 目录应合法"),
-    );
+    let profile = Arc::new(TranslationExecutionProfile::new(
+        "quality",
+        non_zero(1),
+        payload,
+    ));
 
     let project_reader = ExistingProjectOpeningService::new(
         ProjectDatabaseRecordReadingService::new(
@@ -833,7 +885,7 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
         planner,
         executor,
         result_store,
-        FakePersistentEventLog {
+        FakeAuditLedger {
             events: Arc::clone(&events),
             calls: Arc::clone(&persistent_log_calls),
         },
@@ -842,24 +894,32 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
 
     let lua_host =
         TrustedLuaExecutionHostingService::with_llm(file_reader, llm, lua_runtime, session_factory);
+    let execution_builder = FixedExecutionBuilder {
+        profile,
+        standard: Mutex::new(Some(standard)),
+        lua: Mutex::new(Some(crate::att_mz::SelectedLua::new(
+            PathBuf::from("scripts/translate.lua"),
+            LuaTranslationService::new(lua_host),
+        ))),
+    };
     let use_case = TranslateService::new(
-        resolver,
         project_reader,
-        standard,
-        Some(LuaTranslationService::new(lua_host)),
+        execution_builder,
+        FakeProjectLeaseProvider,
         crate::execution::CooperativeCancellation::default(),
     );
 
-    let output = use_case
+    let completion = use_case
         .execute(TranslateInput {
             name: "demo".parse().expect("测试项目名称应合法"),
-            profile_id: "quality".to_owned(),
             terminology_path: None,
             placeholder_rules_path: None,
-            lua_script: Some(PathBuf::from("scripts/translate.lua")),
         })
         .await
         .expect("完整非根 Translate 树应该成功");
+    let OperationCompletion::Completed(output) = completion else {
+        panic!("测试未请求取消");
+    };
 
     assert_eq!(output.name.as_str(), "demo");
     assert_eq!(output.profile_id, "quality");
@@ -891,8 +951,8 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     });
     let commit_transaction =
         event_position(&events, |event| matches!(event, Event::CommitTransaction));
+    let log_start = event_position(&events, |event| matches!(event, Event::LogTaskStarted));
     let log_task = event_position(&events, |event| matches!(event, Event::LogTask));
-    let log_run = event_position(&events, |event| matches!(event, Event::LogRun));
     let read_lua = event_position(&events, |event| matches!(event, Event::ReadLua(_)));
     let open_lua = event_position(&events, |event| matches!(event, Event::OpenLuaDatabase(_)));
     let lua_runtime = event_position(&events, |event| matches!(event, Event::LuaRuntime));
@@ -904,11 +964,10 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     let lua_close = event_position(&events, |event| matches!(event, Event::LuaClose));
 
     assert!(metadata < assets);
-    assert!(assets < first_llm);
+    assert!(assets < log_start && log_start < first_llm);
     assert!(first_llm < delay && delay < second_llm);
     assert!(second_llm < commit_transaction);
-    assert!(commit_transaction < log_task && log_task < log_run);
-    assert!(log_run < read_lua);
+    assert!(commit_transaction < log_task && log_task < read_lua);
     assert!(read_lua < open_lua && open_lua < lua_runtime);
     assert!(lua_runtime < lua_begin && lua_begin < lua_execute);
     assert!(lua_execute < lua_llm && lua_llm < lua_commit);

@@ -11,6 +11,7 @@ use crate::att_mz::translate::executor::TranslationTaskExecutionProfile;
 use crate::att_mz::translate::profile::{
     MzTranslationExecutionPayload, TranslationExecutionProfile,
 };
+use crate::execution::OperationCompletion;
 use crate::llm::{ChatMessage, LlmRequestError, LlmRequestExecutor, LlmResponse};
 use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
@@ -20,15 +21,12 @@ use super::runtime::{
     TrustedLuaBindingFinalizer, TrustedLuaCommonBindings, TrustedLuaCommonHostCalls,
     TrustedLuaExtractHostCalls, TrustedLuaExtractIntent, TrustedLuaHostCallError,
     TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor,
-    TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination, TrustedLuaTranslateHostCalls,
-    TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
+    TrustedLuaTranslateHostCalls, TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
 };
 use super::session::{
-    OpenSqliteInteractiveSessionError, SqliteInteractiveConnectionCloseOutcome,
-    SqliteInteractiveRollbackOutcome, SqliteInteractiveSessionError,
-    SqliteInteractiveSessionFactory, SqliteInteractiveSessionFinalizationReport,
-    SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
-    SqliteInteractiveTransactionObservation,
+    OpenSqliteInteractiveSessionError, SqliteInteractiveSessionError,
+    SqliteInteractiveSessionFactory, SqliteInteractiveSessionFinalizer,
+    SqliteInteractiveSessionOperations,
 };
 use super::{
     LuaInvocation, LuaProjectContext, LuaSourcePath, TrustedLuaExecutionHost,
@@ -90,7 +88,7 @@ where
     async fn execute(
         &self,
         invocation: LuaInvocation<Self::TranslationProfile>,
-    ) -> Result<TrustedLuaExecutionOutcome, Self::Error> {
+    ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
         let (phase, script_path, project) = match invocation {
             LuaInvocation::Extract {
                 script_path,
@@ -126,13 +124,6 @@ where
             read_file.resolved_path().to_path_buf(),
             read_file.into_bytes(),
         );
-
-        // 先预留 Runtime 容量，避免在长时间排队期间占用 SQLite 连接。
-        let reservation = self
-            .runtime
-            .reserve()
-            .await
-            .map_err(TrustedLuaExecutionHostingError::ReserveRuntime)?;
 
         let database_path = project.database_path().to_path_buf();
         let opened = self
@@ -173,18 +164,23 @@ where
                 TrustedLuaRuntimeBindings::write_back(common, calls, finalizer)
             }
         };
-        let handle = reservation.start(program, bindings);
+        let handle = self.runtime.start(program, bindings);
         let (runtime, finalization) = handle.await.into_parts();
 
         match (runtime, finalization) {
-            (Ok(()), Ok(finalization)) if finalization.had_active_transaction() => {
+            (Err(TrustedLuaRuntimeExecutionError::Cancelled), Ok(_)) => {
+                Ok(OperationCompletion::Cancelled)
+            }
+            (Ok(()), Ok(finalization)) if finalization.had_unclosed_transaction() => {
                 Err(TrustedLuaExecutionHostingError::UnclosedTransaction)
             }
-            (Ok(()), Ok(_)) => Ok(extract_calls
-                .and_then(|calls| calls.take_intent())
-                .map_or(TrustedLuaExecutionOutcome::Empty, |intent| {
-                    TrustedLuaExecutionOutcome::ExtractIntent(intent)
-                })),
+            (Ok(()), Ok(_)) => Ok(OperationCompletion::Completed(
+                extract_calls
+                    .and_then(|calls| calls.take_intent())
+                    .map_or(TrustedLuaExecutionOutcome::Empty, |intent| {
+                        TrustedLuaExecutionOutcome::ExtractIntent(intent)
+                    }),
+            )),
             (Ok(()), Err(cleanup)) => Err(TrustedLuaExecutionHostingError::Cleanup(cleanup)),
             (Err(runtime), Ok(_)) => Err(TrustedLuaExecutionHostingError::Runtime(runtime)),
             (Err(runtime), Err(cleanup)) => {
@@ -498,7 +494,6 @@ where
 {
     fn finalize(
         self: Box<Self>,
-        _termination: TrustedLuaRuntimeTermination,
     ) -> Pin<
         Box<
             dyn Future<
@@ -511,99 +506,29 @@ where
         >,
     > {
         Box::pin(async move {
-            let report = self.finalizer.finalize().await;
-            let had_active_transaction = matches!(
-                report.transaction(),
-                SqliteInteractiveTransactionObservation::Active
-            );
-            if sqlite_finalization_succeeded(&report) {
-                Ok(TrustedLuaBindingFinalization::new(had_active_transaction))
-            } else {
-                let failure = SqliteFinalizationFailure { report };
-                Err(TrustedLuaBindingFinalizationError::new(
-                    failure.to_string(),
-                    Some(Arc::new(failure)),
-                ))
+            match self.finalizer.finalize().await {
+                Ok(finalization) => Ok(TrustedLuaBindingFinalization::new(
+                    finalization.had_unclosed_transaction(),
+                )),
+                Err(error) => {
+                    let message = error.to_string();
+                    Err(TrustedLuaBindingFinalizationError::new(
+                        message,
+                        Some(Arc::new(error)),
+                    ))
+                }
             }
         })
     }
 }
 
-fn sqlite_finalization_succeeded<E>(
-    report: &SqliteInteractiveSessionFinalizationReport<E>,
-) -> bool {
-    matches!(
-        report.transaction(),
-        SqliteInteractiveTransactionObservation::Idle
-            | SqliteInteractiveTransactionObservation::Active
-    ) && matches!(
-        report.rollback(),
-        SqliteInteractiveRollbackOutcome::NotRequired
-            | SqliteInteractiveRollbackOutcome::RolledBack
-    ) && matches!(
-        report.connection(),
-        SqliteInteractiveConnectionCloseOutcome::Closed
-    )
-}
-
-#[derive(Debug)]
-struct SqliteFinalizationFailure<E> {
-    report: SqliteInteractiveSessionFinalizationReport<E>,
-}
-
-impl<E> fmt::Display for SqliteFinalizationFailure<E>
-where
-    E: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Lua SQLite 会话终结失败：")?;
-        match self.report.transaction() {
-            SqliteInteractiveTransactionObservation::Idle => formatter.write_str("事务空闲")?,
-            SqliteInteractiveTransactionObservation::Active => {
-                formatter.write_str("发现活动事务")?
-            }
-            SqliteInteractiveTransactionObservation::Indeterminate => {
-                formatter.write_str("事务状态不可确定")?
-            }
-            SqliteInteractiveTransactionObservation::Unavailable(error) => {
-                write!(formatter, "无法观测事务（{error}）")?
-            }
-        }
-        match self.report.rollback() {
-            SqliteInteractiveRollbackOutcome::NotRequired => {}
-            SqliteInteractiveRollbackOutcome::RolledBack => formatter.write_str("；已回滚")?,
-            SqliteInteractiveRollbackOutcome::Failed(error) => {
-                write!(formatter, "；回滚失败（{error}）")?
-            }
-            SqliteInteractiveRollbackOutcome::OutcomeUnknown(error) => {
-                write!(formatter, "；回滚结果未知（{error}）")?
-            }
-            SqliteInteractiveRollbackOutcome::NotAttempted => {
-                formatter.write_str("；未尝试回滚")?
-            }
-        }
-        match self.report.connection() {
-            SqliteInteractiveConnectionCloseOutcome::Closed => formatter.write_str("；连接已关闭"),
-            SqliteInteractiveConnectionCloseOutcome::Failed(error) => {
-                write!(formatter, "；关闭失败（{error}）")
-            }
-            SqliteInteractiveConnectionCloseOutcome::OutcomeUnknown(error) => {
-                write!(formatter, "；关闭结果未知（{error}）")
-            }
-        }
-    }
-}
-
-impl<E> Error for SqliteFinalizationFailure<E> where E: Error + Send + Sync + 'static {}
-
-/// Host 在脚本加载、Runtime 预留、数据库建立、VM 或收尾阶段遇到的失败。
+/// Host 在脚本加载、数据库建立、VM 或收尾阶段遇到的失败。
 #[derive(Debug)]
 pub(crate) enum TrustedLuaExecutionHostingError<F, O, R> {
     ReadScript {
         script_path: PathBuf,
         source: ReadFileError<F>,
     },
-    ReserveRuntime(R),
     OpenDatabase {
         database_path: PathBuf,
         source: OpenSqliteInteractiveSessionError<O>,
@@ -633,7 +558,6 @@ where
                 "无法读取可信 Lua 主程序 {}：{source}",
                 script_path.display()
             ),
-            Self::ReserveRuntime(source) => write!(formatter, "无法预留 Lua 执行容量：{source}"),
             Self::OpenDatabase {
                 database_path,
                 source,
@@ -663,7 +587,6 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ReadScript { source, .. } => Some(source),
-            Self::ReserveRuntime(source) => Some(source),
             Self::OpenDatabase { source, .. } => Some(source),
             Self::Runtime(source) => Some(source),
             Self::Cleanup(source) => Some(source),
@@ -683,9 +606,11 @@ mod tests {
     use crate::att_mz::ProjectName;
     use crate::att_mz::lua::runtime::{
         TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeExecutionReport,
-        TrustedLuaRuntimeReservation,
     };
-    use crate::att_mz::lua::session::OpenedSqliteInteractiveSession;
+    use crate::att_mz::lua::session::{
+        OpenedSqliteInteractiveSession, SqliteInteractiveSessionFinalization,
+        SqliteInteractiveSessionFinalizationError, SqliteInteractiveSessionFinalizationFailure,
+    };
     use crate::att_mz::project::OpenedProject;
     use crate::llm::{LlmFinishReason, LlmUsage};
     use crate::storage::file_system::{
@@ -753,7 +678,7 @@ mod tests {
                 "response",
                 LlmFinishReason::Stop,
                 None,
-                "response-id",
+                Some("response-id".to_owned()),
                 Some(LlmUsage::new(1, 1, 2)),
             ))
         }
@@ -807,25 +732,23 @@ mod tests {
     impl SqliteInteractiveSessionFinalizer for FakeSessionFinalizer {
         type Error = FakeError;
 
-        async fn finalize(self) -> SqliteInteractiveSessionFinalizationReport<Self::Error> {
+        async fn finalize(
+            self,
+        ) -> Result<
+            SqliteInteractiveSessionFinalization,
+            SqliteInteractiveSessionFinalizationError<Self::Error>,
+        > {
             record(&self.events, "finalize");
             match self.behavior {
-                FinalizationBehavior::Idle => SqliteInteractiveSessionFinalizationReport::new(
-                    SqliteInteractiveTransactionObservation::Idle,
-                    SqliteInteractiveRollbackOutcome::NotRequired,
-                    SqliteInteractiveConnectionCloseOutcome::Closed,
-                ),
-                FinalizationBehavior::Active => SqliteInteractiveSessionFinalizationReport::new(
-                    SqliteInteractiveTransactionObservation::Active,
-                    SqliteInteractiveRollbackOutcome::RolledBack,
-                    SqliteInteractiveConnectionCloseOutcome::Closed,
-                ),
+                FinalizationBehavior::Idle => Ok(SqliteInteractiveSessionFinalization::new(false)),
+                FinalizationBehavior::Active => Ok(SqliteInteractiveSessionFinalization::new(true)),
                 FinalizationBehavior::CloseFailed => {
-                    SqliteInteractiveSessionFinalizationReport::new(
-                        SqliteInteractiveTransactionObservation::Idle,
-                        SqliteInteractiveRollbackOutcome::NotRequired,
-                        SqliteInteractiveConnectionCloseOutcome::Failed(FakeError("close")),
-                    )
+                    Err(SqliteInteractiveSessionFinalizationError::new(
+                        SqliteInteractiveSessionFinalizationFailure::CleanupFailed(FakeError(
+                            "close",
+                        )),
+                        None,
+                    ))
                 }
             }
         }
@@ -872,56 +795,24 @@ mod tests {
         Complete,
         DeclareDeactivate,
         Fail,
+        Unavailable,
+        Cancelled,
     }
 
     #[derive(Clone)]
     struct FakeRuntime {
         events: Events,
-        fail_reserve: bool,
         behavior: RuntimeBehavior,
     }
 
     impl TrustedLuaRuntimeExecutor for FakeRuntime {
         type Error = FakeError;
-        type Reservation = FakeReservation;
-
-        async fn reserve(&self) -> Result<Self::Reservation, Self::Error> {
-            record(&self.events, "reserve");
-            if self.fail_reserve {
-                Err(FakeError("reserve"))
-            } else {
-                Ok(FakeReservation {
-                    events: Arc::clone(&self.events),
-                    behavior: self.behavior,
-                    started: false,
-                })
-            }
-        }
-    }
-
-    struct FakeReservation {
-        events: Events,
-        behavior: RuntimeBehavior,
-        started: bool,
-    }
-
-    impl Drop for FakeReservation {
-        fn drop(&mut self) {
-            if !self.started {
-                record(&self.events, "reservation_drop");
-            }
-        }
-    }
-
-    impl TrustedLuaRuntimeReservation for FakeReservation {
-        type Error = FakeError;
 
         fn start(
-            mut self,
+            &self,
             _program: OwnedLuaProgram,
             bindings: TrustedLuaRuntimeBindings,
         ) -> TrustedLuaExecutionHandle<Self::Error> {
-            self.started = true;
             record(&self.events, "start");
             let behavior = self.behavior;
             let (_common, phase, finalizer) = bindings.into_parts();
@@ -939,13 +830,12 @@ mod tests {
                     RuntimeBehavior::Fail => {
                         Err(TrustedLuaRuntimeExecutionError::Execute(FakeError("vm")))
                     }
+                    RuntimeBehavior::Unavailable => Err(
+                        TrustedLuaRuntimeExecutionError::Unavailable(FakeError("unavailable")),
+                    ),
+                    RuntimeBehavior::Cancelled => Err(TrustedLuaRuntimeExecutionError::Cancelled),
                 };
-                let termination = if runtime.is_ok() {
-                    TrustedLuaRuntimeTermination::Completed
-                } else {
-                    TrustedLuaRuntimeTermination::Failed
-                };
-                let finalization = finalizer.finalize(termination).await;
+                let finalization = finalizer.finalize().await;
                 let _ = sender.send(TrustedLuaRuntimeExecutionReport::new(runtime, finalization));
             });
             TrustedLuaExecutionHandle::new(receiver, cancelled)
@@ -957,7 +847,6 @@ mod tests {
 
     fn service(
         events: Events,
-        fail_reserve: bool,
         fail_open: bool,
         runtime: RuntimeBehavior,
         finalization: FinalizationBehavior,
@@ -968,7 +857,6 @@ mod tests {
             },
             FakeRuntime {
                 events: Arc::clone(&events),
-                fail_reserve,
                 behavior: runtime,
             },
             FakeSessionFactory {
@@ -996,11 +884,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserves_before_opening_and_synchronously_hands_off_the_session() {
+    async fn opens_the_session_before_synchronously_handing_it_to_the_runtime() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let outcome = service(
             Arc::clone(&events),
-            false,
             false,
             RuntimeBehavior::Complete,
             FinalizationBehavior::Idle,
@@ -1009,11 +896,14 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome, TrustedLuaExecutionOutcome::Empty);
+        assert_eq!(
+            outcome,
+            OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty)
+        );
 
         assert_eq!(
             *events.lock().unwrap(),
-            ["read", "reserve", "open", "start", "finalize"]
+            ["read", "open", "start", "finalize"]
         );
     }
 
@@ -1021,7 +911,6 @@ mod tests {
     async fn returns_extract_intent_only_after_runtime_and_finalizer_both_succeed() {
         let outcome = service(
             Arc::new(Mutex::new(Vec::new())),
-            false,
             false,
             RuntimeBehavior::DeclareDeactivate,
             FinalizationBehavior::Idle,
@@ -1032,7 +921,9 @@ mod tests {
 
         assert_eq!(
             outcome,
-            TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Deactivate)
+            OperationCompletion::Completed(TrustedLuaExecutionOutcome::ExtractIntent(
+                TrustedLuaExtractIntent::Deactivate
+            ))
         );
     }
 
@@ -1040,7 +931,6 @@ mod tests {
     async fn discards_extract_intent_when_session_finishes_with_active_transaction() {
         let error = service(
             Arc::new(Mutex::new(Vec::new())),
-            false,
             false,
             RuntimeBehavior::DeclareDeactivate,
             FinalizationBehavior::Active,
@@ -1060,7 +950,6 @@ mod tests {
         let error = service(
             Arc::new(Mutex::new(Vec::new())),
             false,
-            false,
             RuntimeBehavior::DeclareDeactivate,
             FinalizationBehavior::CloseFailed,
         )
@@ -1072,13 +961,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserve_failure_never_opens_a_database() {
+    async fn runtime_unavailability_still_finalizes_the_open_session() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let error = service(
             Arc::clone(&events),
-            true,
             false,
-            RuntimeBehavior::Complete,
+            RuntimeBehavior::Unavailable,
             FinalizationBehavior::Idle,
         )
         .execute(invocation())
@@ -1087,17 +975,41 @@ mod tests {
 
         assert!(matches!(
             error,
-            TrustedLuaExecutionHostingError::ReserveRuntime(FakeError("reserve"))
+            TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Unavailable(
+                FakeError("unavailable")
+            ))
         ));
-        assert_eq!(*events.lock().unwrap(), ["read", "reserve"]);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["read", "open", "start", "finalize"]
+        );
     }
 
     #[tokio::test]
-    async fn open_failure_releases_the_reservation_without_starting_runtime() {
+    async fn runtime_cancellation_is_normal_only_after_session_finalization_succeeds() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let completion = service(
+            Arc::clone(&events),
+            false,
+            RuntimeBehavior::Cancelled,
+            FinalizationBehavior::Active,
+        )
+        .execute(invocation())
+        .await
+        .expect("取消时回滚活动事务并关闭会话应是正常结果");
+
+        assert_eq!(completion, OperationCompletion::Cancelled);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["read", "open", "start", "finalize"]
+        );
+    }
+
+    #[tokio::test]
+    async fn open_failure_does_not_start_the_runtime() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let error = service(
             Arc::clone(&events),
-            false,
             true,
             RuntimeBehavior::Complete,
             FinalizationBehavior::Idle,
@@ -1110,10 +1022,7 @@ mod tests {
             error,
             TrustedLuaExecutionHostingError::OpenDatabase { .. }
         ));
-        assert_eq!(
-            *events.lock().unwrap(),
-            ["read", "reserve", "open", "reservation_drop"]
-        );
+        assert_eq!(*events.lock().unwrap(), ["read", "open"]);
     }
 
     #[tokio::test]
@@ -1121,7 +1030,6 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let error = service(
             events,
-            false,
             false,
             RuntimeBehavior::Complete,
             FinalizationBehavior::Active,
@@ -1141,7 +1049,6 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let error = service(
             events,
-            false,
             false,
             RuntimeBehavior::Fail,
             FinalizationBehavior::CloseFailed,
@@ -1168,7 +1075,6 @@ mod tests {
         assert_send(
             service(
                 Arc::new(Mutex::new(Vec::new())),
-                false,
                 false,
                 RuntimeBehavior::Complete,
                 FinalizationBehavior::Idle,

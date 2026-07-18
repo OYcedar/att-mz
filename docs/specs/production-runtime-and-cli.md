@@ -1,159 +1,111 @@
 # ATT 生产运行时与 CLI 规格
 
-## 1. 进程入口
-
-ATT 只提供一个生产可执行入口：
+## 1. 唯一入口
 
 ```text
 att [--config FILE] mz <init|extract|translate|write-back>
 ```
 
-`AttArguments` 和 `MzCommand` 只负责 Clap 解析，不读配置、不构造根、不执行业务。
-Help 和 Version 在解析边界直接返回，因此不依赖配置文件或任何生产资源。
+四个命令是唯一用户入口，也是状态收敛入口；不增加维护、重试或恢复命令。Clap 的 Help/Version 不读取配置。当前生产目标只支持 `x86_64-pc-windows-msvc`。
 
-当前产物只支持 `x86_64-pc-windows-msvc`。其他目标不是可降级运行环境，
-构建时直接失败。
-
-## 2. 启动顺序
-
-生产进程固定按以下边界推进：
+## 2. 启动与配置选择
 
 ```text
-Clap 解析
-   ↓
-定位并严格解析 TOML
-   ↓
-构造带 time / net / signal driver 的 Tokio Runtime
-   ↓
-ProductionMzCommandRunner 只构造当前命令所需的纵向切片
-   ↓
-执行唯一命令
-   ↓
-按固定顺序 shutdown 所有已构造根
-   ↓
-销毁 Tokio Runtime
-   ↓
-呈现业务结果或完整错误
+解析 CLI
+  ↓
+读取一次受限 TOML，检查完整语法和未知顶层分区
+  ↓
+仅解析当前命令实际选择的分区
+  ↓
+构造 ConfiguredMzCommand 互斥变体
+  ↓
+构造 Tokio Runtime 和当前纵向切片
+  ↓
+构造 audit.jsonl，持久化 run_started
+  ↓
+取得项目租约并执行命令
+  ↓
+终结非审计根，持久化 run_finished，终结账本
+  ↓
+呈现结果
 ```
 
-配置中的相对路径以配置文件目录为基准。`projects.root` 在每个命令
-构造文件根后统一规范化，并校验为本机、非大小写敏感的 NTFS 目录；
-路径链中任一 reparse point 都会被拒绝。后续工作区布局只使用这一
-规范路径。两条日志流在自身启动边界对 `observability.root` 执行同等的
-本机 NTFS 校验。
+已知但未选的配置分区不解析、不验证；未选 Client 的密钥不物化。配置边界选择一次
+Profile，并把同一个 `Arc<TranslationExecutionProfile>` 与 Client 注入 Standard 和
+可选 Lua。业务输入只携带已经建立的受信执行事实。
 
 ## 3. 按命令构造
 
-`ProductionMzCommandRunner` 不持有四棵预先构造的用例树。它每次只构造一条切片：
-
-| 命令 | 实际构造的根与业务能力 |
+| 命令 | 当前纵向切片 |
 |---|---|
-| Init | `SystemFileSystem`、`RusqliteStorage`、工作区创建与 Init 编排 |
-| Extract | 文件、SQLite、CPU 以及 Builtin/Rules 提取；只有显式 `--lua` 才构造 Lua Runtime 和 Host |
-| Translate | 文件、SQLite、CPU、Delay、LLM、Translation JSONL 以及完整 Standard 翻译；显式 `--lua` 时再构造 Lua |
-| WriteBack | 文件、SQLite、CPU、可恢复目录发布、WriteBack JSONL 与完整 Standard 写回；显式 `--lua` 时再构造 Lua |
+| Init | 文件、SQLite 建库/快照、目录发布、审计 |
+| Extract | 文件、SQLite、CPU、所选提取能力、审计；显式 `--lua` 才构造 Lua |
+| Translate | 文件、SQLite、CPU、Delay、LLM、Standard、审计；显式 `--lua` 才构造 Lua |
+| WriteBack | 文件、SQLite、CPU、目录发布/候选编辑、Standard、审计；显式 `--lua` 才构造 Lua |
 
-四个命令都先为精确项目名取得跨进程项目租约。锁文件位于
-`<projects.root>/.att-project-locks/`，项目身份按 Windows ordinal
-case-insensitive 语义归一；因此仅大小写不同的名字不能绕过互斥。同一项目的
-Init、Extract、Translate、WriteBack 严格互斥，不同项目可以并行。租约等待达到外部
-超时后返回 `ProjectBusy`，不继续打开 SQLite 或建立目录候选。
+三个可选 Lua 命令把脚本路径和执行能力组合成一个 `SelectedLua`；不存在“路径已选但依赖缺失”的内部状态。
 
-根契约只有一个当前形态：
+## 4. 项目租约
+
+四个顶层 MZ 服务在读取项目、打开 SQLite、发送网络请求或建立候选前取得项目租约，并持有到业务终态及相关操作审计确认结束。MZ 的 `ProjectCommandLeaseService` 只选择固定锁目录并提交受信项目 identity，通用文件根负责按 Windows 非大小写敏感语义生成稳定锁文件名：
 
 ```text
-ProjectOperationLeaseProvider
-  .acquire_project_operation_lease(ProjectOperationLeaseRequest)
-  → ProjectOperationLease<LeaseState> | Busy | Unavailable
+ProjectName + <projects.root>/.att-locks/projects
+  ↓ 通用文件根规范化不透明 identity 并计算 SHA-256
+<projects.root>/.att-locks/projects/<digest>.lock
 ```
 
-lease 不可复制，并由命令持有到业务与候选终结完成；Drop 释放同项目跨进程锁。
+文件系统根只提供通用独占文件租约，不理解 identity 是项目名，也不理解 MZ。目录发布锁位于 `<projects.root>/.att-locks/directory-publish/`；stage、backup 和 journal 仍在目标同父目录。
 
-全局锁顺序固定为：
+锁序固定为：
 
 ```text
-项目租约 → 目标目录发布锁 → SQLite 连接/事务
+项目租约 → 目录发布锁 → SQLite/session
 ```
 
-任何业务或 Lua Host 都不得反向取得。可信 Lua 的 `os.execute` 仍受同一个跨进程锁
-约束，同项目子命令不可重入。
+同项目四命令互斥，不同项目并行。超时是稳定的“项目正忙”用户结果，不继续副作用。可信 Lua 通过子进程启动同项目命令也不能重入。
 
-Translate 先按 CLI 提供的精确 ID 选中一个 MZ Profile，再取得它引用的公共 LLM
-Client。只有该 Profile 的系统提示词和全局 LLM TLS PEM 才会在本命令中读取；
-系统提示词必须是非空白 UTF-8 Markdown。组合根只构造一个
-`OpenAiChatCompletionClient` 和一个 `OpenAiChatCompletionExecutor`，并把同一份
-不可变执行 Profile 交给 Standard 与 Translate Lua，因此两者共享 URL、固定 Bearer
-API key、model、parameters、连接池、总准入和客户端 RPM/burst。
+不对整个 `projects.root` 做 NTFS 品牌预检。普通读取、Extract 和 Translate 不承担目录发布才需要的限制；各根在实际操作时验证自己需要的独占锁、稳定身份、同卷 rename、追加和刷盘能力。
 
-Translation 的 `run_id + project + profile` 在 Profile 选择和项目读取都成功后、
-任何翻译副作用之前建立。WriteBack 的 `run_id + project` 同样在项目实际打开后
-建立；实际三个布局宽度由 Standard 已消费的权威项目事实随日志事件写入，
-组合边界不为日志重复读取数据库。
+## 5. 四命令收敛
 
-## 4. 四命令的重复运行语义
+- Init 首次创建项目；已有项目逐项继承未显式给出的语言/布局，并在来源与全部事实相同时快速返回 `Unchanged`，不建立候选；
+- Extract 只替换当前选择的 owner，同快照返回 `Unchanged`；
+- Translate 复用持久资源和逐叶 state，全部 Current 时不请求模型、不写译文；
+- WriteBack 每次从冻结来源重建一个候选，Standard 与可选 Lua 修改同一候选，只发布一次。
 
-- Init 收敛来源、语言、布局和工作区结构；完全相同返回 Unchanged；
-- Extract 只替换本次选择的 Builtin/Rules/Lua owner，同快照返回 Unchanged；
-- Translate 复用持久资源和逐叶 state，全部 Current 时 0 LLM、0 资产写入；
-- WriteBack 每次从冻结来源重建唯一候选，Standard 与 Lua 完成后只发布一次。
+## 6. 强审计顺序
 
-来源实际指纹在每次项目开启时重算。Translate 和 WriteBack 还要求全部 active owner
-与 metadata 同世代，否则返回 `ExtractionOutOfDate`。这些都是四条现有命令内部的
-状态收敛，不增加 reset、update、repair、resume 或 publish 命令。
+所有命令在取得项目租约前确认 `run_started` 已持久化。Translate 在每个 TaskBlock 请求模型前写任务意图，任务验收和提交确定后写任务终态；WriteBack 在发布前写发布意图，发布取得终态后写发布终态。
 
-## 5. Ctrl-C 与明确终态
+意图审计失败意味着对应网络/发布副作用没有开始。副作用已生效而终态审计失败时，命令报告“状态已生效但审计未确认”。其他根 shutdown 完成后才写 `run_finished`，账本最后关闭。只有上述事实全部确认后才输出成功文案。
 
-进程每次只准入一个顶层命令。第一次 Ctrl-C 后不再建立新的业务入口，
-并把同一个单向合作取消事实交给本次纵向切片。业务编排在每个阶段边界停止
-派生后续工作，但不 drop 正持有目录候选、SQLite 操作或 Lua 唯一 finalizer
-的高层 Future。
+## 7. 取消与进程结果
 
-已构造 Lua 时，进程立即停止新 reserve，取消 queued/running job，并在继续
-驱动业务 Future 的同时等待所有唯一 finalizer。Translate 还会立即停止
-LLM 新准入；已活动 HTTP 与业务 Future 并发驱动到终态，不会因暂停
-poll 活动请求而与 LLM shutdown 互等。
-
-Init 在候选准备或建库返回后观察到取消时显式 discard，不再发布；一旦 publish
-已被根接管便等待其明确终态。Extract 不再进入下一个 Builtin、Rules 或 Lua 阶段。
-Translate 不再补入新的 TaskBlock，已经开始的 TaskBlock 仍按自然顺序完成验收、
-提交和任务日志，取消运行不写完成汇总。WriteBack 在读取、布局和改写边界停止；
-唯一候选 prepare 后的取消会先终结可选 Lua，再显式 discard；publish 已接管后等待
-明确终态，已经生效的输出仍必须写入发布日志。
-可信 Lua 进入不交还控制的 native 调用时，进程不伪造超时或成功。
-
-Ctrl-C 后，合作取消或正常完成且完整 shutdown 成功时退出码为 `130`，不呈现
-业务完成文案。收尾期间产生的发布结果未知、持久化失败等技术终态必须保留并
-呈现；业务技术终态或任一 shutdown 失败时退出码为 `1`。
-
-## 6. shutdown 顺序
-
-命令自己记录已构造的根，并只终结这些实例。完整 Translate 的顺序是：
+合作取消是正常完成分支：
 
 ```text
-Lua 停止准入、取消并等待 finalizer
-LLM 停止准入并等待活动请求
-SQLite 停止 open、终结 session、排空短操作
-FileSystem 排空文件、候选和恢复工作
-CPU 停止准入、排空并 join
-JSONL 关闭准入、排空并确认 sync_data
+OperationCompletion<T>
+├─ Completed(T)
+└─ Cancelled
+
+ProductionCommandRunReport
+├─ Succeeded(output)
+├─ Interrupted
+└─ Failed(failure)
 ```
 
-WriteBack 不构造 LLM，Extract 不构造日志，Init 只终结 SQLite 和 FileSystem。
-未选择 Lua 时不存在 Lua shutdown 步骤。进程不设置“超时后强拆”；一旦根
-已接管副作用，进程必须等待它返回明确终态。
+进程不通过错误文本、`source.to_string()` 或 downcast 判断 Ctrl-C。第一次 Ctrl-C 后停止派生新阶段；根已经接管的 SQLite、目录发布、审计、CPU 和 HTTP 工作继续到明确终态。候选尚未发布时显式 discard；publish 已开始时等待终态。Lua handle 的取消是合作式的，脚本不交还控制时不伪造成功或超时。
 
-## 7. 呈现与退出码
+## 8. shutdown 与退出码
 
-`CommandResultRenderer` 只在业务命令成功、所有 shutdown 成功且 Tokio Runtime 已销毁
-后向 stdout 写入成功结果。Translate 的 `Partial` 和 `Unavailable` 是正常业务结果，
-仍使用退出码 `0`。WriteBack 的人工布局诊断也是成功结果的一部分。
+只终结当前命令实际构造的实例。完整 Translate 的顺序是：Lua 等待唯一 finalizer、LLM 停止准入并等待活动请求、SQLite 终结唯一会话并排空短操作、FileSystem/CPU 排空、记录 `run_finished`、最后排空并关闭 audit writer。
 
 | 退出码 | 含义 |
 |---|---|
-| `0` | Help、Version 或命令正常完成 |
+| `0` | Help、Version、命令成功，包括正常 Partial/Unavailable |
 | `2` | Clap 参数错误 |
-| `1` | 配置、根构造、业务技术失败或 shutdown 失败 |
-| `130` | Ctrl-C 后所有可终结资源已受控收尾 |
+| `1` | 配置、技术错误、任一 shutdown/审计失败，或状态已生效但收尾未确认 |
+| `130` | Ctrl-C 后完成受控收尾 |
 
-命令失败和 shutdown 失败同时发生时，stderr 分别呈现两者，后发的清理失败
-不覆盖业务首因。
+用户错误只呈现稳定中文类别，不暴露根类型名、内部状态枚举、检查 ID 或底层错误文本；技术原因链保留给内部诊断。

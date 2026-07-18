@@ -14,6 +14,7 @@ use crate::att_mz::lua::{
 };
 use crate::att_mz::project::OpenedProject;
 use crate::att_mz::text::TextGroupKind;
+use crate::execution::OperationCompletion;
 
 use super::semantics::{
     PreparedTranslationAcceptance, PreparedTranslationRejection, PreparedTranslationStatus,
@@ -38,7 +39,7 @@ pub(crate) trait LuaTranslation: Send + Sync {
         profile: &Self::Profile,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
         script_path: PathBuf,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send;
 }
 
 /// 把 Translate 阶段已经建立的项目事实和 Profile 交给可信 Lua Host。
@@ -65,7 +66,7 @@ where
         profile: &Self::Profile,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
         script_path: PathBuf,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<OperationCompletion<()>, Self::Error> {
         let error_path = script_path.clone();
         let invocation = LuaInvocation::translate(
             script_path,
@@ -74,14 +75,17 @@ where
             semantics,
         );
 
-        let outcome = self.host.execute(invocation).await.map_err(|source| {
+        let completion = self.host.execute(invocation).await.map_err(|source| {
             LuaTranslationError::ExecuteHost {
                 script_path: error_path,
                 source,
             }
         })?;
+        let OperationCompletion::Completed(outcome) = completion else {
+            return Ok(OperationCompletion::Cancelled);
+        };
         match outcome {
-            TrustedLuaExecutionOutcome::Empty => Ok(()),
+            TrustedLuaExecutionOutcome::Empty => Ok(OperationCompletion::Completed(())),
             TrustedLuaExecutionOutcome::ExtractIntent(_) => {
                 Err(LuaTranslationError::UnexpectedManagedOutcome)
             }
@@ -262,6 +266,7 @@ mod tests {
     struct FakeHost {
         invocation: Arc<Mutex<Option<RecordedInvocation>>>,
         fail: bool,
+        cancelled: bool,
         unexpected_outcome: bool,
     }
 
@@ -272,7 +277,7 @@ mod tests {
         async fn execute(
             &self,
             invocation: LuaInvocation<Self::TranslationProfile>,
-        ) -> Result<TrustedLuaExecutionOutcome, Self::Error> {
+        ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
             let recorded = match invocation {
                 LuaInvocation::Translate {
                     script_path,
@@ -296,12 +301,18 @@ mod tests {
 
             if self.fail {
                 Err(FakeError)
+            } else if self.cancelled {
+                Ok(OperationCompletion::Cancelled)
             } else if self.unexpected_outcome {
-                Ok(TrustedLuaExecutionOutcome::ExtractIntent(
-                    crate::att_mz::lua::runtime::TrustedLuaExtractIntent::Deactivate,
+                Ok(OperationCompletion::Completed(
+                    TrustedLuaExecutionOutcome::ExtractIntent(
+                        crate::att_mz::lua::runtime::TrustedLuaExtractIntent::Deactivate,
+                    ),
                 ))
             } else {
-                Ok(TrustedLuaExecutionOutcome::Empty)
+                Ok(OperationCompletion::Completed(
+                    TrustedLuaExecutionOutcome::Empty,
+                ))
             }
         }
     }
@@ -423,6 +434,7 @@ mod tests {
         let service = LuaTranslationService::new(FakeHost {
             invocation: Arc::clone(&recorded),
             fail: false,
+            cancelled: false,
             unexpected_outcome: false,
         });
         let profile = Arc::new(FakeProfile { name: "quality" });
@@ -471,6 +483,7 @@ mod tests {
         let service = LuaTranslationService::new(FakeHost {
             invocation: Arc::new(Mutex::new(None)),
             fail: true,
+            cancelled: false,
             unexpected_outcome: false,
         });
 
@@ -503,6 +516,7 @@ mod tests {
         let service = LuaTranslationService::new(FakeHost {
             invocation: Arc::new(Mutex::new(None)),
             fail: false,
+            cancelled: false,
             unexpected_outcome: true,
         });
 
@@ -522,6 +536,28 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn cancellation_is_propagated_as_a_normal_translation_result() {
+        let service = LuaTranslationService::new(FakeHost {
+            invocation: Arc::new(Mutex::new(None)),
+            fail: false,
+            cancelled: true,
+            unexpected_outcome: false,
+        });
+
+        let completion = service
+            .run(
+                &project(),
+                &Arc::new(FakeProfile { name: "quality" }),
+                semantics(),
+                PathBuf::from("translation.lua"),
+            )
+            .await
+            .expect("Lua 取消应是正常结果");
+
+        assert_eq!(completion, OperationCompletion::Cancelled);
+    }
+
     #[test]
     fn execution_future_is_send() {
         fn assert_send<T: Send>(_: T) {}
@@ -529,6 +565,7 @@ mod tests {
         let service = LuaTranslationService::new(FakeHost {
             invocation: Arc::new(Mutex::new(None)),
             fail: false,
+            cancelled: false,
             unexpected_outcome: false,
         });
         let project = project();

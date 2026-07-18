@@ -1,6 +1,5 @@
 //! Tokio 时间驱动上的可取消延迟根。
 
-use std::convert::Infallible;
 use std::time::Duration;
 
 use crate::att_mz::translate::executor::AsyncDelay;
@@ -9,11 +8,8 @@ use crate::att_mz::translate::executor::AsyncDelay;
 pub(crate) struct TokioAsyncDelay;
 
 impl AsyncDelay for TokioAsyncDelay {
-    type Error = Infallible;
-
-    async fn wait(&self, duration: Duration) -> Result<(), Self::Error> {
+    async fn wait(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
-        Ok(())
     }
 }
 
@@ -26,10 +22,7 @@ mod tests {
     #[tokio::test]
     async fn waits_for_requested_duration() {
         let started = Instant::now();
-        TokioAsyncDelay
-            .wait(Duration::from_millis(5))
-            .await
-            .expect("延迟根不会失败");
+        TokioAsyncDelay.wait(Duration::from_millis(5)).await;
         assert!(started.elapsed() >= Duration::from_millis(5));
     }
 }

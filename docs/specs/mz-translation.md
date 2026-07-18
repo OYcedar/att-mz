@@ -32,7 +32,7 @@ CLI 只建立命令参数事实，不读取这些文件，也不在命令行重�
 ```text
 精确选择一次 Profile
         ↓
-取得项目租约
+持久化 run_started 并取得项目租约
         ↓
 打开项目并复核来源指纹、schema 与 owner freshness
         ↓
@@ -47,7 +47,7 @@ LuaTranslationService
 `source_snapshot_fingerprint` 必须等于 metadata；任一 owner stale 时返回
 `ExtractionOutOfDate`，不读取部分新鲜资产继续翻译。
 
-Standard 的 Complete、Partial 与 Unavailable 都是正常业务结果；尚有未翻译原文时仍继续显式传入的 Lua。只有不可恢复请求错误、CPU/语言/内部不变量故障、SQLite 终态错误或持久日志失败等技术错误才立即停止并阻止 Lua。Standard 与 Lua 使用同一个不可变 Profile 快照；顶层不重读配置、不猜测提交范围，也不回滚下层已经确认提交的结果。
+Standard 的 Complete、Partial 与 Unavailable 都是正常业务结果；尚有未翻译原文时仍继续显式传入的 Lua。只有不可恢复请求错误、CPU/语言/内部不变量故障、SQLite 终态错误或强审计失败等技术错误才立即停止并阻止 Lua。Standard 与 Lua 使用配置边界一次选中的同一个不可变 Profile 快照；顶层不重读配置、不猜测提交范围，也不回滚下层已经确认提交的结果。
 
 正常完成时 CLI 返回退出码 0、stderr 为空，并输出 Standard 的任务、写入和剩余摘要；传入 Lua 时额外显示 Lua 已执行。Partial 或 Unavailable 不伪装成“全部翻译完成”，也不升级为失败退出码。技术错误继续返回退出码 1。
 
@@ -55,7 +55,10 @@ Standard 的 Complete、Partial 与 Unavailable 都是正常业务结果；尚�
 
 ```mermaid
 flowchart TD
-    TS --> LEASE["ProjectOperationLeaseProvider"]
+    TS --> LEASE["ProjectCommandLeaseService"]
+    LEASE --> FLEASE["SystemFileSystem<br/>ExclusiveFileLeaseProvider"]
+    TS --> AUDIT["MzAuditLedger<br/>audit.jsonl"]
+    AUDIT --> JSONL["JsonLinesEventLog<br/>通用追加/轮转/sync_data"]
     TS["TranslateService"] --> ST["StandardTranslationService"]
     TS --> LT["LuaTranslationService"]
     TS --> OPEN["ExistingProjectOpeningService"]
@@ -67,7 +70,7 @@ flowchart TD
     ST --> PL["MzStandardTranslationTaskPlanningService"]
     ST --> EX["MzStandardTranslationTaskExecutionService"]
     ST --> RS["MzStandardTranslationResultStorageService"]
-    ST --> LOG["TranslationJsonLinesEventLog<br/>PersistentEventLog"]
+    ST --> AUDIT
 
     AR --> SQ["RusqliteStorage<br/>SqliteQueryExecutor"]
     AR --> CPU["BoundedCpuExecutor<br/>CpuTaskExecutor"]
@@ -108,11 +111,10 @@ flowchart TD
 
 ## 3. Profile、公共 Client 与外部配置
 
-外部 MZ Profile 只保存公共 `llm.clients` 目录中的精确 `llm_client` ID。组合根
-验证引用并构造对应的 `OpenAiChatCompletionClient`，再把这个 Client 放入唯一的
-MZ 执行载荷。`InMemoryTranslationExecutionProfileResolver` 按精确 Profile ID
-选择同一份 `Arc` 快照；ID 不 trim、不折叠大小写、不提供别名或默认项，错误也
-不泄露载荷或凭据。
+外部 MZ Profile 只保存公共 `llm.clients` 目录中的精确 `llm_client` ID。按命令配置
+边界只解析 CLI 指定的 Profile、其 Client 和实际语言对，验证引用后直接构造同一个
+`Arc<TranslationExecutionProfile>` 与 `OpenAiChatCompletionClient`。Standard 与 Lua
+直接接收这些受信值。Profile ID 精确匹配，不 trim、不折叠大小写、不提供别名或默认项。
 
 MZ 受信载荷按职责分组：
 
@@ -285,7 +287,7 @@ translation/state；任一事实变化时整体 `StalePlan`，不提交部分准
 
 ### 6.3 共享 LanguageModule
 
-语言能力位于 crate 级共享领域层，不属于 MZ 私有实现，也不是文件、网络一类的运行根。它只处理语言文本和外部建立的语言策略，不依赖 MZ 位置、数据库表、CLI、占位符 token、控制符或模型协议，因此未来其他引擎可以复用同一语义。
+语言能力位于 crate 级共享领域层，不属于 MZ 私有实现，也不是文件、网络一类的运行根。Standard 翻译的译前/译后判断与 Lua `translation.prepare/accept` 当前共同消费这套语义；它只处理语言文本和外部建立的语言策略，不依赖 MZ 位置、数据库表、CLI、占位符 token、控制符或模型协议。
 
 `LanguageModule` 只承担三项职责：
 
@@ -387,7 +389,10 @@ Planner 固定先保护占位符，再把普通文本与保护区投影为 `Lang
 
 ## 7. 模型执行与响应验收
 
-`LlmRequestExecutor` 是单次、非流式、单 choice、无自动重试的根契约。它返回原始 content、finish reason、可选的 HTTP `x-request-id`、正文 completion ID 和可选 usage，并将错误区分为 Retryable 与 Fatal；可恢复错误可以携带 `Retry-After`。HTTP 请求身份与模型响应身份不互相冒充。
+`LlmRequestExecutor` 是单次、非流式、唯一数值 index 0、无自动重试的根契约。它返回
+原始 content、finish reason、可选的 HTTP `x-request-id`、可选正文 completion ID 和
+可选 usage，并将错误区分为 Retryable 与 Fatal；可恢复错误可以携带 `Retry-After`。
+HTTP 请求身份与模型响应身份不互相冒充。
 
 MZ 只向这个公共契约提交完整 messages。根固定加入公共 Client 的 `model` 与
 `stream=false`；除此之外只透传该 Client 的 `parameters`，MZ 不另行注入
@@ -447,9 +452,9 @@ Complete、Partial 与 Unavailable 都是正常业务结果。信封、JSON 或 
 
 模型请求可以乱序完成，Standard 仍按 `task_index` 保序消费：
 
-- Complete：用一个任务事务提交全部合格 Patch；
-- Partial：用一个任务事务只提交合格 Patch，未完成 ID 保持未翻译；
-- Unavailable：没有 Patch，不调用 Store，继续消费后续任务；
+- Complete：`accepted` 非空并携带最终响应，用一个任务事务提交全部合格 Patch；
+- Partial：`accepted` 与 `unresolved` 都非空并携带最终响应，只提交合格 Patch；
+- Unavailable：`unresolved` 非空，可选最终响应和原因，没有 Patch，不调用 Store；
 - 技术错误：立即停止；已经提交的事务保持，后序结果不得写数据库。
 
 验收粒度、原子粒度和事务粒度彼此独立：译文按 ID 独立验收；每个代表及其全部去重传播目标必须原子成功；同一任务的所有合格传播族在一个短事务中批量提交。任一代表或传播目标已经变化时，整个任务事务以 `StalePlan` 失败，不允许部分传播。
@@ -459,23 +464,26 @@ state 仍匹配的叶成为 Current，未完成叶重新成为 Pending 并从 0 
 自然顺序和本地上下文保持，但状态变化后允许重新装箱。资源与输入完全未变且所有叶
 Current 时，空计划直接完成，0 次 LLM、0 次资产写入。
 
-Standard 返回结构化运行报告，至少统计计划任务、Complete/Partial/Unavailable 数量、接受的翻译决定、写入位置、未完成决定和位置、协议诊断以及网络重试耗尽任务。剩余数量大于零仍是成功的正常业务结果，并且不阻止显式 Lua。
+任务结果是上述数据枚举，不另存可矛盾的 status、计数或空 Vec 组合；尝试次数只有一个
+`NonZeroUsize` 权威字段，汇总和 audit wire 都从枚举派生。Standard 返回结构化运行
+报告，统计任务枚举、接受/写入/未完成位置、协议诊断和网络重试耗尽任务。剩余数量
+大于零仍是成功的正常业务结果，并且不阻止显式 Lua。
 
-## 9. 集中持久事件日志
+## 9. 强审计任务事件
 
-`PersistentEventLog<TranslationLogEvent>` 是 Standard 唯一直接依赖的持久日志根接口。Executor 返回结构化业务结果，Store 只负责数据库事务，TranslateService、CLI 与其他下层模块不分别拼接或持久化任务日志。
+Translate 使用四命令共用的 `audit.jsonl`。每个 TaskBlock 在发送第一次模型请求前必须
+先持久化 `translation_task_started`；意图未确认时零网络请求。内容验收和数据库提交
+或拒绝终态确定后，使用相同 `operation_id` 持久化 `translation_task_finished`。
 
-日志顺序与数据库可确认事实保持一致：
+终态事件完整记录由任务枚举派生的 Complete/Partial/Unavailable、唯一尝试次数、
+可选 `provider_request_id`、可选 `provider_response_id`、可选 `final_response_usage`、
+finish reason、合格传播族、未完成位置、拒绝原因、协议诊断和已确认写入数。
+整批结构不可用与结构通过但全部内容拒绝继续保留不同原因。事件不包含完整 messages、
+响应、密钥或全文原文/译文。
 
-- 有合格 Patch 的任务先确认事务提交，再追加一次任务事件；
-- 如果任务事务技术失败，先尽力追加独立的 `TaskCommitFailed` 事件，保存已经形成的逐 ID 验收与拒绝诊断，但不宣称任何位置已经写入；随后仍以原 Store 错误终止命令；
-- 没有 Patch 的 Unavailable 任务直接追加一次任务事件；
-- 全部任务正常消费后追加一次运行汇总；
-- 日志写入失败表示无法履行已确认的持久可观测性承诺，属于技术错误，停止后续任务并阻止 Lua；已经提交的译文保持。
-
-每个任务事件必须完整体现正常业务结果，而不只记录异常：任务索引、Complete/Partial/Unavailable、网络尝试次数、`provider_request_id`、`provider_response_id`、`final_response_usage`、finish reason、每个合格 ID 的代表位置和完整传播族、未完成 ID/位置、每项拒绝原因、信封/JSON/wire schema 失败以及缺失、重复、未知 ID 等协议事实，以及实际写入的翻译决定和物理位置数量。`final_response_usage` 只表示最终成功 HTTP 响应的 usage。整批结构不可用与结构通过但所有预期 ID 都不合格都表示“当前任务块无可用译文”，但必须分别保留 `ModelResponseUnusable` 与 `AllOutputsRejected` 及各自诊断；部分不可用也完整记录，不能只记录成功 Patch。
-
-事件不包含完整 messages、完整模型响应、密钥或全文原文/译文。`TranslationJsonLinesEventLog` 把紧凑 UTF-8 JSON 追加到全局 `translation.jsonl`；每条事件都携带同一运行的 `run_id + project + profile`。只有 `write + LF + sync_data` 全部成功才确认 append。日志根在跨进程锁内验证尾部、轮转活动文件并执行 retention；完整但不符合强类型 wire 的行被视为损坏，不猜测修复。
+任务终态审计失败时，已经确认的数据库提交保持，但命令返回“状态已生效但审计未确认”，
+停止后续任务和 Lua。通用 JSONL Runtime 只负责锁、追加、轮转、刷盘与 shutdown；MZ
+审计 DTO 和位置 wire 留在 MZ observability 边界。
 
 ## 10. 可信 Lua Host
 
@@ -483,7 +491,7 @@ Lua 是用户明确选择并完全信任的本机程序，不建立沙箱。`Tru
 
 - `FileReader`：读取主脚本并返回规范绝对路径；
 - `LlmRequestExecutor`：Translate 阶段的 `ctx.llm` 与 Standard 共享同一公共模型根和 Client；
-- `TrustedLuaRuntimeExecutor`：在专用有界 worker 上运行完整标准库 VM；
+- `TrustedLuaRuntimeExecutor`：为本次唯一脚本启动一个专用 OS 线程和完整标准库 VM；
 - `SqliteInteractiveSessionFactory`：建立同一项目数据库上的交互会话。
 
 Host 在公共 `project/json/source/mz/db` 之外注入 Translate 专属的 `translation` 与
@@ -503,10 +511,10 @@ Pending，使用 `model_text` 与 `terms` 构造自己的 messages，并用 `acc
 - 主错误和清理错误同时发生：组合保留两者；
 - 不支持嵌套事务、隐式长事务或自动提交。
 
-Host 先读取脚本，再 `runtime.reserve().await`，随后打开项目 SQLite 会话并构造
-Host calls 与不可复制的 finalizer，最后用 `reservation.start(...)` 同步移交所有权。
-`start` 之后，Runtime supervisor 无论经历排队、Context、Compile、Execute、Binding、
-Cancelled 还是 worker panic，都必须恰好一次进入 Finalizing。执行 handle 被丢弃只发出取消信号，supervisor 仍持有唯一 finalizer，负责回滚活动事务并关闭会话。
+Host 先读取脚本，打开项目唯一 SQLite 交互会话并构造 Host calls 与不可复制的
+finalizer，最后用 `runtime.start(...)` 同步移交所有权。`start` 接管后无论线程创建、
+Context、Compile、Execute、Binding、
+Cancelled 还是 worker panic，都必须产生执行与清理报告并恰好一次终结 session。
 
 `require` 和脚本主动文件访问属于 Lua 专用 worker，不得阻塞异步 I/O 执行器线程。
 
@@ -514,14 +522,13 @@ Cancelled 还是 worker panic，都必须恰好一次进入 Finalizing。执行 
 
 | 生产实现 | 承载的翻译根契约 |
 |---|---|
-| `SystemFileSystem` | `ProjectOperationLeaseProvider`、`ExistingDirectoryResolver`、`DirectoryTreeFingerprinter`、`FileReader` |
+| `SystemFileSystem` | `ExclusiveFileLeaseProvider`、`ExistingDirectoryResolver`、`DirectoryTreeFingerprinter`、`FileReader` |
 | `BoundedCpuExecutor` | `CpuTaskExecutor` |
 | `RusqliteStorage` | `SqliteQueryExecutor`、`SqliteTransactionExecutor`、`SqliteInteractiveSessionFactory` |
 | `OpenAiChatCompletionExecutor` | `LlmRequestExecutor` |
 | `TokioAsyncDelay` | `AsyncDelay` |
-| `TranslationJsonLinesEventLog` | `PersistentEventLog<TranslationLogEvent>` |
+| `JsonLinesAuditLog` | MZ Audit Ledger 使用的通用追加、轮转与刷盘机制 |
 | `TrustedLua54Runtime` | `TrustedLuaRuntimeExecutor` |
-| `WindowsRunIdGenerator` | `RunIdGenerator` |
 
 `ProductionMzCommandRunner` 在选中 Profile 后取得其已经验证的 `llm_client`，只读取
 该 Profile 的提示词与全局 PEM，并构造上表中本命令实际需要的根。Standard 与
@@ -531,4 +538,6 @@ Translate Lua 借用同一个 `OpenAiChatCompletionClient`，共享同一个 Exe
 同项目租约覆盖项目开启、Standard、可选 Lua 和全部数据库提交；超时返回
 `ProjectBusy`。可信 Lua 通过 `os.execute` 再调用同项目 ATT 命令也不能重入该租约。
 
-命令结束后按 Lua、LLM、SQLite、FileSystem、CPU、Translation Log 的顺序停止准入并排空已接管工作。只有业务结果与全部 shutdown 都成功后，进程才把 Complete/Partial/Unavailable 摘要写入 stdout。
+命令结束后按 Lua、LLM、SQLite、FileSystem、CPU 的顺序停止并排空已接管工作，随后
+写 `run_finished`，最后关闭 Audit Ledger。只有业务结果、所需任务终态审计与全部
+shutdown 都成功后，进程才把 Complete/Partial/Unavailable 摘要写入 stdout。
