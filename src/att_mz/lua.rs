@@ -12,6 +12,7 @@ use self::runtime::TrustedLuaWriteBackHostCalls;
 use super::ProjectName;
 use super::project::OpenedProject;
 use crate::execution::OperationCompletion;
+use crate::language::{LanguageId, LanguagePair};
 
 pub(crate) mod hosting;
 pub(crate) mod json;
@@ -159,8 +160,7 @@ pub(crate) struct LuaProjectContext {
     name: ProjectName,
     file_access: LuaProjectFileAccess,
     database_path: PathBuf,
-    source_language: String,
-    target_language: String,
+    language_pair: LanguagePair,
 }
 
 impl LuaProjectContext {
@@ -171,8 +171,7 @@ impl LuaProjectContext {
                 source_root: project.source_root().to_path_buf(),
             },
             database_path: project.database_path().to_path_buf(),
-            source_language: project.source_language().to_owned(),
-            target_language: project.target_language().to_owned(),
+            language_pair: project.language_pair().clone(),
         }
     }
 
@@ -184,8 +183,7 @@ impl LuaProjectContext {
                 output_root,
             },
             database_path: project.database_path().to_path_buf(),
-            source_language: project.source_language().to_owned(),
-            target_language: project.target_language().to_owned(),
+            language_pair: project.language_pair().clone(),
         }
     }
 
@@ -205,12 +203,12 @@ impl LuaProjectContext {
         &self.database_path
     }
 
-    pub(crate) fn source_language(&self) -> &str {
-        &self.source_language
+    pub(crate) fn source_language(&self) -> &LanguageId {
+        self.language_pair.source()
     }
 
-    pub(crate) fn target_language(&self) -> &str {
-        &self.target_language
+    pub(crate) fn target_language(&self) -> &LanguageId {
+        self.language_pair.target()
     }
 }
 
@@ -234,10 +232,10 @@ pub(crate) enum TrustedLuaExecutionOutcome {
 
 /// 交给可信 Lua Host 的一次完整调用。
 ///
-/// 枚举变体从类型上保证 Extract 不携带无关 Profile，而 Translate 一定拥有顶层已经
-/// 选择的同一 `Arc` Profile。调用拥有全部事实，便于专用 worker 在调用 Future 被
-/// 取消后继续完成受控清理，且不要求 Profile 载荷实现 `Clone`。
-pub(crate) enum LuaInvocation<P> {
+/// 枚举变体从类型上保证 Extract 不携带无关 LLM Client，而 Translate 一定拥有配置
+/// 边界已经选择的 Client。调用拥有全部事实，便于专用 worker 在调用 Future 被取消
+/// 后继续完成受控清理。
+pub(crate) enum LuaInvocation<C> {
     Extract {
         script_path: PathBuf,
         project: LuaProjectContext,
@@ -245,7 +243,7 @@ pub(crate) enum LuaInvocation<P> {
     Translate {
         script_path: PathBuf,
         project: LuaProjectContext,
-        profile: Arc<P>,
+        llm_client: Arc<C>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     },
     WriteBack {
@@ -255,7 +253,7 @@ pub(crate) enum LuaInvocation<P> {
     },
 }
 
-impl<P> LuaInvocation<P> {
+impl<C> LuaInvocation<C> {
     pub(crate) fn extract(script_path: PathBuf, project: LuaProjectContext) -> Self {
         Self::Extract {
             script_path,
@@ -266,13 +264,13 @@ impl<P> LuaInvocation<P> {
     pub(crate) fn translate(
         script_path: PathBuf,
         project: LuaProjectContext,
-        profile: Arc<P>,
+        llm_client: Arc<C>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     ) -> Self {
         Self::Translate {
             script_path,
             project,
-            profile,
+            llm_client,
             semantics,
         }
     }
@@ -294,8 +292,8 @@ impl<P> LuaInvocation<P> {
 ///
 /// Lua 是用户明确选择并完全信任的本机程序，不建立安全沙箱。Host 负责加载脚本、
 /// 建立 VM、打开同一项目数据库，向全部阶段注入冻结来源 `ctx.source`、MZ 结构化
-/// 只读门面 `ctx.mz` 与 `ctx.db`，在 Translate 阶段根据拥有的同一 `Arc` Profile 注入
-/// `ctx.llm`，以及执行和关闭全部资源。Host 不把原始数据库连接、凭据或 Profile 暴露
+/// 只读门面 `ctx.mz` 与 `ctx.db`，在 Translate 阶段根据拥有的 Client 注入 `ctx.llm`，
+/// 以及执行和关闭全部资源。Host 不把原始数据库连接或凭据暴露
 /// 给脚本。
 ///
 /// Lua 通过 `ctx.extract` 明确采用标准资产契约时，Host 只收集已校验的完整意图，
@@ -307,14 +305,14 @@ impl<P> LuaInvocation<P> {
 /// 成功返回的 Extract 意图进一步承诺 VM 正常结束、唯一终结器成功、没有未闭合事务，
 /// 因而调用方可以在会话关闭后另起短事务提交托管标准快照。
 pub(crate) trait TrustedLuaExecutionHost: Send + Sync {
-    /// 与应用配置边界所选结果一致的执行配置。
-    type TranslationProfile: Send + Sync + 'static;
+    /// 与应用配置边界所选结果一致的 LLM Client。
+    type TranslationClient: Send + Sync + 'static;
     /// Host 接管或执行失败。
     type Error: Error + Send + Sync + 'static;
 
     fn execute(
         &self,
-        invocation: LuaInvocation<Self::TranslationProfile>,
+        invocation: LuaInvocation<Self::TranslationClient>,
     ) -> impl Future<Output = Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error>> + Send;
 }
 

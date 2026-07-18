@@ -17,22 +17,22 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use crate::att_mz::placeholder_token;
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::language::{
-    LanguageModule, LanguageModuleCatalog, LanguageModuleCatalogError, LanguageModuleError,
-    LanguageRepairApplicationError, LanguageText, LanguageTextSegment,
+    LanguageModule, LanguageModuleError, LanguagePair, LanguageRepairApplicationError,
+    LanguageText, LanguageTextSegment,
 };
 use crate::llm::{LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse, LlmUsage};
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
 use super::language_projection::{
     LanguageTextProjectionError, project_protected_text, restore_protected_text,
 };
-use super::profile::{MzTranslationExecutionPayload, TranslationExecutionProfile};
+use super::profile::{MzTranslationProfile, ResolvedMzTranslationResources};
 use super::standard::{
     AcceptedTranslationDecision, AppliedPlaceholder, ExpectedTranslationOutput, NonEmptyTaskItems,
     StandardTranslationProfile, StandardTranslationTaskExecutor, StandardTranslationTaskIndex,
-    TranslationLanguagePair, TranslationPatch, TranslationProtocolDiagnostic, TranslationTaskBlock,
-    TranslationTaskOutcome, TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
+    TranslationPatch, TranslationProtocolDiagnostic, TranslationTaskBlock, TranslationTaskOutcome,
+    TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
     TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
 
@@ -104,46 +104,41 @@ pub(crate) trait TranslationTaskExecutionProfile: StandardTranslationProfile {
     fn max_network_retry_after(&self) -> Duration;
 }
 
-impl<L> TranslationTaskExecutionProfile
-    for TranslationExecutionProfile<MzTranslationExecutionPayload<L>>
+impl<L> TranslationTaskExecutionProfile for MzTranslationProfile<L>
 where
     L: Send + Sync + 'static,
 {
     type LlmClient = L;
 
     fn llm_client(&self) -> &Self::LlmClient {
-        self.payload().llm_client()
+        self.llm_client()
     }
 
     fn network_retry_delays(&self) -> &[Duration] {
-        self.payload().execution().network_retry_delays()
+        self.request().network_retry_delays()
     }
 
     fn max_network_retry_after(&self) -> Duration {
-        self.payload().execution().max_network_retry_after()
+        self.request().max_network_retry_after()
     }
 }
 
-impl<L> TranslationTaskExecutionProfile
-    for Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<L>>>
+impl<L> TranslationTaskExecutionProfile for Arc<MzTranslationProfile<L>>
 where
     L: Send + Sync + 'static,
 {
     type LlmClient = L;
 
     fn llm_client(&self) -> &Self::LlmClient {
-        self.as_ref().payload().llm_client()
+        self.as_ref().llm_client()
     }
 
     fn network_retry_delays(&self) -> &[Duration] {
-        self.as_ref().payload().execution().network_retry_delays()
+        self.as_ref().request().network_retry_delays()
     }
 
     fn max_network_retry_after(&self) -> Duration {
-        self.as_ref()
-            .payload()
-            .execution()
-            .max_network_retry_after()
+        self.as_ref().request().max_network_retry_after()
     }
 }
 
@@ -165,15 +160,12 @@ pub(crate) trait TranslationTaskResponseProcessor: Send + Sync {
 /// 使用 CPU 根完成有限 JSON 清洗、严格协议校验与译后处理。
 pub(crate) struct TranslationTaskResponseProcessingService<C> {
     cpu: C,
-    language_modules: LanguageModuleCatalog,
+    resources: Arc<ResolvedMzTranslationResources>,
 }
 
 impl<C> TranslationTaskResponseProcessingService<C> {
-    pub(crate) fn new(cpu: C, language_modules: LanguageModuleCatalog) -> Self {
-        Self {
-            cpu,
-            language_modules,
-        }
+    pub(crate) fn new(cpu: C, resources: Arc<ResolvedMzTranslationResources>) -> Self {
+        Self { cpu, resources }
     }
 }
 
@@ -200,16 +192,13 @@ where
             expected_outputs: task.expected_outputs().to_vec(),
             attempt,
         };
-        let language_modules = self.language_modules.clone();
+        let resources = Arc::clone(&self.resources);
         let outcome = self
             .cpu
-            .execute(move || process_response(input, response, &language_modules))
+            .execute(move || process_response(input, response, resources.as_ref()))
             .await
             .map_err(TranslationTaskResponseProcessingError::ScheduleCompute)?;
         outcome.map_err(|error| match error {
-            TranslationResponseTechnicalError::LanguageUnavailable(source) => {
-                TranslationTaskResponseProcessingError::LanguageUnavailable(source)
-            }
             TranslationResponseTechnicalError::LanguageModule(source) => {
                 TranslationTaskResponseProcessingError::LanguageModule(source)
             }
@@ -230,7 +219,6 @@ where
 #[derive(Debug)]
 pub(crate) enum TranslationTaskResponseProcessingError<C> {
     ScheduleCompute(CpuTaskExecutionError<C>),
-    LanguageUnavailable(LanguageModuleCatalogError),
     LanguageModule(LanguageModuleError),
     LanguageProjection(LanguageTextProjectionError),
     LanguageRepair(LanguageRepairApplicationError),
@@ -244,7 +232,6 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ScheduleCompute(source) => write!(formatter, "调度译后 CPU 验收失败：{source}"),
-            Self::LanguageUnavailable(source) => write!(formatter, "译后语言模块不可用：{source}"),
             Self::LanguageModule(source) => write!(formatter, "译后语言事实不一致：{source}"),
             Self::LanguageProjection(source) => write!(formatter, "译后语言投影失败：{source}"),
             Self::LanguageRepair(source) => write!(formatter, "译后语言修复无法安全应用：{source}"),
@@ -262,7 +249,6 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ScheduleCompute(source) => Some(source),
-            Self::LanguageUnavailable(source) => Some(source),
             Self::LanguageModule(source) => Some(source),
             Self::LanguageProjection(source) => Some(source),
             Self::LanguageRepair(source) => Some(source),
@@ -273,7 +259,6 @@ where
 
 #[derive(Debug)]
 enum TranslationResponseTechnicalError {
-    LanguageUnavailable(LanguageModuleCatalogError),
     LanguageModule(LanguageModuleError),
     LanguageProjection(LanguageTextProjectionError),
     LanguageRepair(LanguageRepairApplicationError),
@@ -446,7 +431,7 @@ where
 
 struct ResponseProcessingInput {
     task_index: StandardTranslationTaskIndex,
-    language_pair: TranslationLanguagePair,
+    language_pair: LanguagePair,
     expected_outputs: Vec<ExpectedTranslationOutput>,
     attempt: NonZeroUsize,
 }
@@ -454,16 +439,26 @@ struct ResponseProcessingInput {
 fn process_response(
     input: ResponseProcessingInput,
     response: LlmResponse,
-    language_modules: &LanguageModuleCatalog,
+    resources: &ResolvedMzTranslationResources,
 ) -> Result<TranslationTaskOutcome, TranslationResponseTechnicalError> {
     if input.expected_outputs.is_empty() {
         return Err(TranslationResponseTechnicalError::InternalInvariant {
             message: "Planner 生成了没有预期输出的翻译任务".to_owned(),
         });
     }
-    let language_module = language_modules
-        .resolve(input.language_pair.source_language())
-        .map_err(TranslationResponseTechnicalError::LanguageUnavailable)?;
+    let resolved_pair = resources.language_pair();
+    if &input.language_pair != resolved_pair {
+        return Err(TranslationResponseTechnicalError::InternalInvariant {
+            message: format!(
+                "任务语言对 {} -> {} 与已解析资源 {} -> {} 不一致",
+                input.language_pair.source(),
+                input.language_pair.target(),
+                resolved_pair.source(),
+                resolved_pair.target()
+            ),
+        });
+    }
+    let language_module = resources.source_language();
 
     let final_response = FinalLlmResponseMetadata::from_response(&response);
     let finish_reason = final_response.finish_reason().to_owned();
@@ -980,19 +975,19 @@ mod tests {
         MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
     };
     use crate::att_mz::translate::profile::{
-        MzTranslationExecutionConfiguration, MzTranslationPlanningConfiguration,
-        TranslationProfileLanguagePair,
+        MzSystemPrompt, MzTranslationPlanningConfiguration, MzTranslationProfile,
+        MzTranslationRequestConfiguration, ResolvedMzTranslationResources,
     };
     use crate::att_mz::translate::standard::{
         AppliedPlaceholder, ExpectedTranslationOutput, PlaceholderRuleOrigin, PlaceholderSegment,
-        StandardTranslationTaskIndex, TerminologyDependency, TranslationLanguagePair,
-        TranslationLeafIdentity, TranslationStateContext,
+        StandardTranslationTaskIndex, TerminologyDependency, TranslationLeafIdentity,
+        TranslationStateContext,
     };
     use crate::fingerprint::Sha256Fingerprint;
     use crate::language::{
         EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
-        JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageModule,
-        LanguageModuleCatalog, LanguageText, QuotePair,
+        JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageId,
+        LanguageModule, LanguagePair, LanguageText, QuotePair,
     };
     use crate::llm::{ChatMessage, ChatMessageRole};
 
@@ -1068,9 +1063,21 @@ mod tests {
         ))
     }
 
-    fn language_catalog() -> LanguageModuleCatalog {
-        LanguageModuleCatalog::new([("ja".to_owned(), japanese_module())])
-            .expect("测试语言目录有效")
+    fn translation_resources_with(
+        source_language: &str,
+        target_language: &str,
+        module: Arc<dyn LanguageModule>,
+    ) -> Arc<ResolvedMzTranslationResources> {
+        let pair = LanguagePair::new(
+            LanguageId::parse(source_language).expect("测试源语言合法"),
+            LanguageId::parse(target_language).expect("测试目标语言合法"),
+        );
+        let prompt = MzSystemPrompt::new(pair, "# Contract".to_owned()).expect("测试 Prompt 合法");
+        Arc::new(ResolvedMzTranslationResources::new(prompt, module))
+    }
+
+    fn translation_resources() -> Arc<ResolvedMzTranslationResources> {
+        translation_resources_with("ja", "zh-Hans", japanese_module())
     }
 
     fn japanese_analysis() -> crate::language::LanguageAnalysis {
@@ -1139,7 +1146,10 @@ mod tests {
     ) -> TranslationTaskBlock {
         TranslationTaskBlock::new(
             StandardTranslationTaskIndex::new(2),
-            TranslationLanguagePair::new(source_language, target_language),
+            LanguagePair::new(
+                LanguageId::parse(source_language).expect("测试源语言合法"),
+                LanguageId::parse(target_language).expect("测试目标语言合法"),
+            ),
             Vec::new(),
             vec![TerminologyDependency::new("炎の剣", "炎之剑")],
             vec![
@@ -1216,10 +1226,10 @@ mod tests {
     #[tokio::test]
     async fn response_processor_accepts_string_id_and_restores_original_control() {
         let processor =
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         let result = processor
             .process(
-                &task_with_language_pair("ja", "unconfigured-target", 1),
+                &task_with_language_pair("ja", "zh-Hans", 1),
                 LlmResponse::new(
                     r#"[{"id":"0","translation":"炎之剑\\N[1]！"}]"#,
                     LlmFinishReason::Stop,
@@ -1254,10 +1264,10 @@ mod tests {
     #[tokio::test]
     async fn response_processor_preserves_missing_provider_metadata() {
         let processor =
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         let result = processor
             .process(
-                &task_with_language_pair("ja", "unconfigured-target", 1),
+                &task_with_language_pair("ja", "zh-Hans", 1),
                 LlmResponse::new(
                     r#"[{"id":0,"translation":"炎之剑\\N[1]！"}]"#,
                     LlmFinishReason::Stop,
@@ -1283,7 +1293,7 @@ mod tests {
     #[tokio::test]
     async fn response_processor_keeps_generic_text_checks_as_per_id_normal_results() {
         let processor =
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
 
         let bom = processor
             .process(
@@ -1417,7 +1427,7 @@ mod tests {
     #[tokio::test]
     async fn unexpected_token_only_rejects_its_own_id() {
         let processor =
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         let result = processor
             .process(
                 &task_with_output_count(2),
@@ -1511,7 +1521,7 @@ mod tests {
     #[tokio::test]
     async fn response_processor_keeps_valid_ids_and_records_every_unavailable_part() {
         let processor =
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         let result = processor
             .process(
                 &task_with_output_count(6),
@@ -1578,7 +1588,7 @@ mod tests {
     #[tokio::test]
     async fn response_schema_errors_reject_the_entire_batch() {
         let processor =
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         for invalid_item in [
             r#""不是对象""#,
             r#"{"translation":"无 ID"}"#,
@@ -1635,7 +1645,7 @@ mod tests {
     #[tokio::test]
     async fn response_processor_returns_persistable_unavailable_outcomes() {
         let processor =
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         let invalid_json = processor
             .process(
                 &task(),
@@ -1696,7 +1706,7 @@ mod tests {
     #[tokio::test]
     async fn response_cpu_unavailable_is_fatal_instead_of_model_retryable() {
         let processor =
-            TranslationTaskResponseProcessingService::new(UnavailableCpu, language_catalog());
+            TranslationTaskResponseProcessingService::new(UnavailableCpu, translation_resources());
         let error = processor
             .process(
                 &task(),
@@ -1721,12 +1731,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_language_unavailable_and_internal_invariant_are_technical_errors() {
+    async fn response_language_pair_mismatch_and_module_mismatch_are_technical_errors() {
         let processor =
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog());
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         let language_error = processor
             .process(
-                &task_with_language_pair("unknown", "any-target", 1),
+                &task_with_language_pair("en", "zh-Hant", 1),
                 LlmResponse::new(
                     r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
                     LlmFinishReason::Stop,
@@ -1737,20 +1747,17 @@ mod tests {
                 1,
             )
             .await
-            .expect_err("语言模块不可用必须是技术错误");
+            .expect_err("任务语言对不一致必须是技术错误");
         assert!(matches!(
             language_error,
-            TranslationTaskResponseProcessingError::LanguageUnavailable(
-                LanguageModuleCatalogError::UnknownLanguageId { .. }
-            )
+            TranslationTaskResponseProcessingError::InternalInvariant { .. }
         ));
 
-        let mismatched_catalog = LanguageModuleCatalog::new([("ja".to_owned(), english_module())])
-            .expect("测试语言目录有效");
+        let mismatched_catalog = translation_resources_with("ja", "zh-Hans", english_module());
         let mismatch_error =
             TranslationTaskResponseProcessingService::new(InlineCpu, mismatched_catalog)
                 .process(
-                    &task_with_language_pair("ja", "arbitrary-target", 1),
+                    &task_with_language_pair("ja", "zh-Hans", 1),
                     LlmResponse::new(
                         r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
                         LlmFinishReason::Stop,
@@ -1828,26 +1835,20 @@ mod tests {
         }
     }
 
-    fn profile() -> TranslationExecutionProfile<MzTranslationExecutionPayload<&'static str>> {
-        let language_pair =
-            TranslationProfileLanguagePair::new("ja", "zh-Hans").expect("测试语言对应合法");
+    fn profile() -> MzTranslationProfile<&'static str> {
         let planning = MzTranslationPlanningConfiguration::new(
             NonZeroUsize::new(2).expect("非零"),
             NonZeroUsize::new(4096).expect("非零"),
-            [(language_pair, "# Contract".to_owned())],
-        )
-        .expect("规划配置应合法");
-        TranslationExecutionProfile::new(
+        );
+        MzTranslationProfile::new(
             "quality",
             NonZeroUsize::new(3).expect("非零"),
-            MzTranslationExecutionPayload::new(
-                planning,
-                MzTranslationExecutionConfiguration::new(
-                    vec![Duration::from_millis(10), Duration::from_millis(20)],
-                    Duration::from_secs(2),
-                ),
-                Arc::new("llm-client"),
+            planning,
+            MzTranslationRequestConfiguration::new(
+                vec![Duration::from_millis(10), Duration::from_millis(20)],
+                Duration::from_secs(2),
             ),
+            Arc::new("llm-client"),
         )
     }
 
@@ -1875,7 +1876,7 @@ mod tests {
             FakeDelay {
                 waits: Arc::clone(&waits),
             },
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
         );
 
         service
@@ -1900,7 +1901,7 @@ mod tests {
             _,
             _,
             _,
-            TranslationExecutionProfile<MzTranslationExecutionPayload<&'static str>>,
+            MzTranslationProfile<&'static str>,
         >::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([
@@ -1924,7 +1925,7 @@ mod tests {
             FakeDelay {
                 waits: Arc::clone(&waits),
             },
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
         );
         let outcome = service
             .execute(&profile(), task())
@@ -1975,7 +1976,7 @@ mod tests {
                 _,
                 _,
                 _,
-                TranslationExecutionProfile<MzTranslationExecutionPayload<&'static str>>,
+                MzTranslationProfile<&'static str>,
             >::new(
                 FakeLlm {
                     responses: Arc::new(Mutex::new(responses)),
@@ -1984,7 +1985,7 @@ mod tests {
                 FakeDelay {
                     waits: Arc::new(Mutex::new(Vec::new())),
                 },
-                TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
+                TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
             );
 
             let outcome = service
@@ -2026,7 +2027,7 @@ mod tests {
             _,
             _,
             _,
-            TranslationExecutionProfile<MzTranslationExecutionPayload<&'static str>>,
+            MzTranslationProfile<&'static str>,
         >::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Err(LlmRequestError::Fatal(
@@ -2037,7 +2038,7 @@ mod tests {
             FakeDelay {
                 waits: Arc::new(Mutex::new(Vec::new())),
             },
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
         );
 
         assert!(matches!(
@@ -2054,7 +2055,7 @@ mod tests {
             _,
             _,
             _,
-            TranslationExecutionProfile<MzTranslationExecutionPayload<&'static str>>,
+            MzTranslationProfile<&'static str>,
         >::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
@@ -2069,7 +2070,7 @@ mod tests {
             FakeDelay {
                 waits: Arc::new(Mutex::new(Vec::new())),
             },
-            TranslationTaskResponseProcessingService::new(InlineCpu, language_catalog()),
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
         );
         let profile = profile();
         assert_send(service.execute(&profile, task()));

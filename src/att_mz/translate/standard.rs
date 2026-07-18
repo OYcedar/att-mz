@@ -16,16 +16,16 @@ use futures_util::stream::{FuturesOrdered, StreamExt};
 
 use crate::att_mz::audit::{AuditEvent, AuditLedger, TranslationTaskAuditResult};
 use crate::att_mz::project::OpenedProject;
+use crate::att_mz::project_database::SourceSnapshotFingerprint;
 use crate::att_mz::standard_asset::MzStandardAssetOwner;
 use crate::att_mz::text::{MzLocation, TextGroupKind};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
-use crate::language::LanguageAnalysis;
+use crate::language::{LanguageAnalysis, LanguagePair};
 use crate::llm::{ChatMessage, LlmUsage};
-use crate::project_database::SourceSnapshotFingerprint;
 
 use super::executor::FinalLlmResponseMetadata;
-use super::profile::TranslationExecutionProfile;
+use super::profile::MzTranslationProfile;
 
 /// 一次标准资产翻译需要的可选外部资料。
 ///
@@ -61,21 +61,21 @@ pub(crate) trait StandardTranslationProfile: Send + Sync + 'static {
     fn max_in_flight_tasks(&self) -> NonZeroUsize;
 }
 
-impl<P> StandardTranslationProfile for TranslationExecutionProfile<P>
+impl<L> StandardTranslationProfile for MzTranslationProfile<L>
 where
-    P: Send + Sync + 'static,
+    L: Send + Sync + 'static,
 {
     fn max_in_flight_tasks(&self) -> NonZeroUsize {
         self.max_in_flight_tasks()
     }
 }
 
-impl<P> StandardTranslationProfile for Arc<TranslationExecutionProfile<P>>
+impl<L> StandardTranslationProfile for Arc<MzTranslationProfile<L>>
 where
-    P: Send + Sync + 'static,
+    L: Send + Sync + 'static,
 {
     fn max_in_flight_tasks(&self) -> NonZeroUsize {
-        TranslationExecutionProfile::max_in_flight_tasks(self.as_ref())
+        MzTranslationProfile::max_in_flight_tasks(self.as_ref())
     }
 }
 
@@ -635,33 +635,6 @@ impl fmt::Display for StandardTranslationTaskIndex {
     }
 }
 
-/// 一个任务使用的受信源语言与目标语言事实。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationLanguagePair {
-    source_language: String,
-    target_language: String,
-}
-
-impl TranslationLanguagePair {
-    pub(crate) fn new(
-        source_language: impl Into<String>,
-        target_language: impl Into<String>,
-    ) -> Self {
-        Self {
-            source_language: source_language.into(),
-            target_language: target_language.into(),
-        }
-    }
-
-    pub(crate) fn source_language(&self) -> &str {
-        &self.source_language
-    }
-
-    pub(crate) fn target_language(&self) -> &str {
-        &self.target_language
-    }
-}
-
 /// 占位符来自 MZ 内置保护规格还是用户提供的自定义规则。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum PlaceholderRuleOrigin {
@@ -981,7 +954,7 @@ impl ExpectedTranslationOutput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationTaskBlock {
     index: StandardTranslationTaskIndex,
-    language_pair: TranslationLanguagePair,
+    language_pair: LanguagePair,
     groups: Vec<TranslationTaskGroup>,
     injected_terminology: Vec<TerminologyDependency>,
     messages: Vec<ChatMessage>,
@@ -991,7 +964,7 @@ pub(crate) struct TranslationTaskBlock {
 impl TranslationTaskBlock {
     pub(crate) fn new(
         index: StandardTranslationTaskIndex,
-        language_pair: TranslationLanguagePair,
+        language_pair: LanguagePair,
         groups: Vec<TranslationTaskGroup>,
         injected_terminology: Vec<TerminologyDependency>,
         messages: Vec<ChatMessage>,
@@ -1011,7 +984,7 @@ impl TranslationTaskBlock {
         self.index
     }
 
-    pub(crate) fn language_pair(&self) -> &TranslationLanguagePair {
+    pub(crate) fn language_pair(&self) -> &LanguagePair {
         &self.language_pair
     }
 
@@ -2342,7 +2315,7 @@ mod tests {
     use crate::att_mz::standard_asset::MzStandardAssetOwner;
     use crate::att_mz::text::{MzLocationStep, MzSource, StandardDataFile};
     use crate::language::{
-        JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageText,
+        JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageModule, LanguageText,
     };
     use crate::llm::ChatMessageRole;
     use crate::observability::{EventId, OperationId};
@@ -2358,6 +2331,13 @@ mod tests {
     }
 
     impl Error for FakeError {}
+
+    fn test_language_pair() -> LanguagePair {
+        LanguagePair::new(
+            LanguageId::parse("ja").expect("测试源语言应合法"),
+            LanguageId::parse("zh-Hans").expect("测试目标语言应合法"),
+        )
+    }
 
     #[test]
     fn task_block_keeps_prompt_context_and_internal_post_processing_facts_separate() {
@@ -2401,7 +2381,7 @@ mod tests {
         );
         let block = TranslationTaskBlock::new(
             StandardTranslationTaskIndex::new(4),
-            TranslationLanguagePair::new("ja", "zh-Hans"),
+            test_language_pair(),
             vec![TranslationTaskGroup::new(
                 TextGroupKind::DatabaseEntry,
                 group_location.clone(),
@@ -2439,8 +2419,8 @@ mod tests {
         );
 
         assert_eq!(block.index(), StandardTranslationTaskIndex::new(4));
-        assert_eq!(block.language_pair().source_language(), "ja");
-        assert_eq!(block.language_pair().target_language(), "zh-Hans");
+        assert_eq!(block.language_pair().source().as_str(), "ja");
+        assert_eq!(block.language_pair().target().as_str(), "zh-Hans");
         assert_eq!(block.groups()[0].group_location(), &group_location);
         assert!(matches!(
             block.groups()[0].units()[0].mode(),
@@ -2571,7 +2551,7 @@ mod tests {
                     ];
                     TranslationTaskBlock::new(
                         StandardTranslationTaskIndex::new(index),
-                        TranslationLanguagePair::new("ja", "zh-Hans"),
+                        test_language_pair(),
                         Vec::new(),
                         Vec::new(),
                         vec![ChatMessage::new(

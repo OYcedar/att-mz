@@ -1098,7 +1098,7 @@ h1 {
       zh: "翻译总控",
       color: "var(--blue)",
       summary: "Translate 复用持久术语/占位符与逐叶 state，只为 Pending 叶装配模型任务；Standard 与 Lua 共享核心门面。",
-      sequence: "按命令配置选择 Profile → 审计运行意图 → 项目租约与 freshness → 资源/逐叶状态收敛 → 审计每个 Pending 任务 → Lua（可选）",
+      sequence: "配置选择 Profile/Client/语言目录 → 审计运行意图 → 项目租约与 freshness → metadata 语言对精确解析 Prompt/模块 → 逐叶状态收敛 → 审计每个 Pending 任务 → Lua（可选）",
       tree: null
     },
     writeback: {
@@ -1119,11 +1119,11 @@ h1 {
       path: "src/application/config.rs",
       status: "生产配置边界已实现",
       role: "读取一次受限 TOML，在检查完整语法和未知顶层分区后，只解析当前命令实际使用的配置。",
-      plain: "Init 不会因为语法有效但未被选择的 LLM Client 字段类型或未知字段而失败；完整 TOML 的语法、重复 key 与未知顶层仍始终检查。Translate 只验证指定 Profile、它引用的 Client 与实际语言对。",
-      example: "ConfiguredMzCommand::Translate 直接持有选定 Profile 与 Client，业务模块不再按 ID 二次选择。",
-      input: "配置路径与 MzCommand",
+      plain: "普通命令必须显式传入 --config；Help/Version 不读取配置。Translate 完整验证顶层 languages，并持有 prompts.root、选定 MZ Profile 与 Client；打开项目后才按 metadata 解析精确语言资源。",
+      example: "ConfiguredMzCommand::Translate 持有强类型语言目录、Prompt 根、选定 Profile 与 Client，不保存待业务层解释的 toml::Value。",
+      input: "必填配置路径与 MzCommand",
       output: "Init/Extract/Translate/WriteBack 四个互斥受信变体",
-      boundary: "完整 TOML 语法、重复 key 和未知顶层始终检查；未选分区不反序列化、不校验、不物化秘密。"
+      boundary: "完整 TOML 语法、重复 key 和未知顶层始终检查；未选分区不反序列化、不校验、不物化秘密；没有默认配置路径。"
     },
     "production-command-runner": {
       title: "生产命令装配",
@@ -1132,8 +1132,8 @@ h1 {
       path: "src/application/command.rs",
       status: "生产组合边界已实现",
       role: "接收按命令选择完成的 ConfiguredMzCommand，只构造当前纵向切片，并编排强审计与根 shutdown。",
-      plain: "Init 不会构造未使用的 LLM 或 Lua 运行时；Translate 才构造所选 Profile 引用的公共模型客户端，显式 Lua 时才构造 Lua 根。",
-      example: "att mz init 不解析未使用的 LLM Client；att mz translate 只解析指定 Profile、其 Client 和实际语言对。",
+      plain: "Init 不会构造未使用的 LLM 或 Lua 运行时；Translate 打开项目后以规范 LanguagePair 精确读取 prompts.root/mz/source--target.md，并把同一解析资源注入 Standard 与可选 Lua。",
+      example: "att --config config.toml mz init 不解析未使用的 LLM Client；Translate 在 Prompt 缺失、非 UTF-8 或空白时不会开始模型请求。",
       input: "ConfiguredMzCommand 的互斥命令变体",
       output: "ProductionCommandRunReport 与独立 shutdown 结果",
       boundary: "run_started 刷盘后才取得项目租约；非审计根终结后写 run_finished，最后关闭账本并呈现结果。"
@@ -1162,7 +1162,7 @@ h1 {
       example: "demo 正在 WriteBack 时再次启动 demo Translate 会等待并超时；other Translate 不受影响。",
       input: "projects.root、ProjectName 与外部等待上限",
       output: "不可复制的 ProjectCommandLease，或 ProjectBusy/Unavailable",
-      boundary: "项目锁固定在 .att-locks/projects；目录发布锁在 .att-locks/directory-publish；锁序是项目租约 → 发布锁 → SQLite。"
+      boundary: "工作区固定在 projects.root/mz/name；项目锁固定在 .att-locks/projects/mz；目录发布锁在 .att-locks/directory-publish/mz；锁序是项目租约 → 发布锁 → SQLite。"
     },
     "source-fingerprint": {
       title: "冻结来源指纹",
@@ -1219,14 +1219,14 @@ h1 {
       title: "项目建库",
       symbol: "ProjectDatabaseCreationService",
       shortSymbol: "Project DB Creation",
-      path: "src/project_database.rs",
+      path: "src/att_mz/project_database.rs",
       status: "业务逻辑已实现",
       role: "一次建立 metadata、owner state、固定资源和五张标准表组成的完整受管数据库。",
       plain: "新库从第一刻就有全部 schema 和 terminology/placeholder_rules 两行 []，不存在后续命令按需补表。",
       example: "metadata 保存来源 SHA-256；owner 初始 inactive；五表要求 translation 与 32 字节 state 成对。",
       input: "明确目标数据库路径与 NewProject metadata",
       output: "成功确认或清楚的建库错误",
-      boundary: "该服务只由工作区收敛的新建分支消费，并把精确建库命令交给 RusqliteStorage。"
+      boundary: "schema 与对账属于 att_mz::project_database；服务只由工作区收敛的新建分支消费，并把精确建库命令交给共享 RusqliteStorage。"
     },
     "project-workspace-creator": {
       title: "收敛冻结项目工作区",
@@ -1245,11 +1245,11 @@ h1 {
       title: "唯一工作区布局",
       symbol: "ProjectWorkspaceLayout",
       shortSymbol: "Project Workspace Layout",
-      path: "src/project_database.rs",
-      status: "共享受信值已实现",
-      role: "从 projects.root 和项目名或已选工作区根，唯一派生数据库、冻结源和写回路径。",
+      path: "src/att_mz/project_database.rs",
+      status: "MZ 受信值已实现",
+      role: "从 projects.root/mz 和项目名或已选工作区根，唯一派生数据库、冻结源和写回路径。",
       plain: "创建器、档案读取器和项目开启服务共用同一份目录知识，不再各自 join 字符串。",
-      example: "对 demo 只建立一次布局，即可取得 demo/project.db、source/data、source/js 和 write_back/data/js。",
+      example: "对 demo 只建立一次布局，即可取得 mz/demo/project.db、source/data、source/js 和 write_back/data/js。",
       input: "projects.root + ProjectName，或已选工作区根",
       output: "全部标准工作区路径"
     },
@@ -1283,7 +1283,7 @@ h1 {
       title: "读取项目档案",
       symbol: "ProjectDatabaseRecordReadingService",
       shortSymbol: "Project Record Reader",
-      path: "src/project_database.rs",
+      path: "src/att_mz/project_database.rs",
       status: "业务逻辑已实现",
       role: "读取唯一 metadata、来源指纹、owner freshness 和固定翻译资源，并严格验证受管 schema。",
       plain: "它像查档员。不是随便拿到一行数据就算成功，而是确认档案只有一份、字段完整、名字没有对不上。",
@@ -1432,14 +1432,14 @@ h1 {
       title: "CPU 任务根",
       symbol: "BoundedCpuExecutor as CpuTaskExecutor",
       shortSymbol: "BoundedCpuExecutor",
-      path: "src/runtime/cpu.rs",
+      path: "src/execution/cpu.rs · src/runtime/cpu.rs",
       status: "生产根已实现",
       role: "在外部配置的有界工作资源中执行拥有型纯 CPU 计算。",
       plain: "固定 std::thread worker 与有界队列让解码、JSON 改写和序列化不堵住异步 I/O 线程；线程数完全来自配置。",
       example: "Reader 把数据库行分批解码；Rewriter 把内存文档改写交给同一根执行。",
       input: "Send + 'static 的纯计算闭包",
       output: "计算结果或不可用/panic 终态",
-      boundary: "每个任务隔离 panic；shutdown 停止准入、排空已接管任务并 join worker。"
+      boundary: "CpuTaskExecutor 契约位于共享 execution::cpu，生产 worker 位于 runtime::cpu；每个任务隔离 panic，shutdown 停止准入、排空已接管任务并 join worker。"
     },
     "file-reader-root": {
       title: "文件读取根",
@@ -1615,10 +1615,10 @@ h1 {
       shortSymbol: "TranslateService",
       path: "src/att_mz/translate/service.rs",
       status: "业务逻辑已实现",
-      role: "在项目租约内使用配置边界已经选定的 Profile，验证来源与 owner freshness，再依次运行 Standard 和可选 Lua。",
+      role: "在项目租约内使用配置边界已选定的 MZ Profile 与项目开启后解析的语言资源，验证来源与 owner freshness，再依次运行 Standard 和可选 Lua。",
       plain: "它是翻译总负责人。规划、执行、验收和入库都不是与它平行的“大功能”，而是它交给 Standard 子总控继续管理的内部职责。",
       example: "用户选择 profile=quality。Translate 找到唯一配置，读取 demo 项目，先让 Standard 完整结束；只有成功后，才运行可选 Lua 翻译脚本。",
-      input: "项目名、共享受信 Profile、可选完整术语/占位符快照路径与 SelectedLua",
+      input: "项目名、MzTranslationProfile、ResolvedMzTranslationResources、可选完整术语/占位符快照路径与 SelectedLua",
       output: "Standard 报告与可选 Lua 完成结果",
       boundary: "Standard 执行分支直接展示模型与等待生产根；Lua 分支复用同一公共 LLM Client。"
     },
@@ -1631,7 +1631,7 @@ h1 {
       role: "完整拥有标准翻译的资源收敛、逐叶状态准备、Pending 执行和结果提交顺序。",
       plain: "它先解析本次可选资源替换并读取一致语料，再在第一笔事务里保存资源、清理失效译文和传播可复用结果；只有仍为 Pending 的叶子会进入模型。",
       example: "完全相同的再次运行会发现所有叶子都是 Current，既不调用模型，也不写数据库；只改术语时只让受影响叶子重新进入 Pending。",
-      input: "StoredProjectRecord、Profile 与可选完整资源替换",
+      input: "StoredProjectRecord、MzTranslationProfile、ResolvedMzTranslationResources 与可选完整资源替换",
       output: "StandardTranslationRunReport",
       boundary: "每个模型任务先审计意图，再发送请求；验收和提交确定后审计终态。任务结果由 Complete/Partial/Unavailable 数据枚举直接表达。"
     },
@@ -1656,7 +1656,7 @@ h1 {
       role: "按自然顺序保护占位符、建立逐叶 state、完成全局去重，并只把 Pending 代表切成任务块。",
       plain: "它先为每个叶子判定 Current、Stale、NotApplicable 或 Pending，再把可复用结果传播计划和模型工作分开；它不调用模型。",
       example: "十处契约相同的“保存”会选自然顺序最早的一处作 Pending 代表；已有匹配 state 的译文则直接 Current，不再产生模型任务。",
-      input: "一致语料、项目语言、Profile 与已解析资源快照",
+      input: "一致语料、MzTranslationProfile 与同一份 LanguagePair/Prompt/语言模块解析资源",
       output: "包含 preparation 与 Pending TaskBlock 的 StandardTranslationPlan"
     },
     "planning-resource": {
@@ -1686,16 +1686,29 @@ h1 {
     },
     "language-catalog": {
       title: "共享语言目录",
-      symbol: "LanguageModuleCatalog",
+      symbol: "LanguageId · LanguagePair · LanguageModuleCatalog",
       shortSymbol: "Language Catalog",
       path: "src/language.rs",
       status: "共享领域能力已实现",
-      role: "按外部精确源语言 ID 选择同一个 LanguageModule，供译前分析与译后处理共同使用。",
-      plain: "它不是源语言表加目标语言表。它只回答“这个源语言 ID 对应哪套真实语言能力”，Planner 和质检都拿同一个实例，不猜别名也不补默认值。",
-      example: "项目源语言精确写 ja 时，目录选中日语模块。目标语言 zh-Hans 仍用于提示词和项目事实，但不会因此创建一个“简中模块”。",
-      input: "精确源语言 ID",
+      role: "按规范 LanguageId 精确选择一个 LanguageModule，并把同一个 Arc 注入译前分析与译后处理。",
+      plain: "LanguageId 在边界执行 RFC 5646 解析、注册表校验与 canonicalization。Translate 完整验证全局目录，规范化后重复、缺失或默认回退都不成立。",
+      example: "项目源语言 en-us 在 Init 时保存为 en-US，并以 en-US 精确查询模块；目标 zh-Hans 仍用于 Prompt 和项目事实，不创建一个“简中模块”。",
+      input: "规范源 LanguageId",
       output: "共享 LanguageModule，或明确的未知 ID",
-      boundary: "crate 级共享领域能力，不依赖 MZ、数据库、CLI、控制符或模型协议；Catalog 没有目标语言分支。"
+      boundary: "LanguageId、LanguagePair 与 Catalog 是 crate 级共享领域能力，不依赖 MZ、数据库、CLI、控制符或模型协议；Catalog 没有目标语言分支。"
+    },
+    "resolved-mz-translation-resources": {
+      title: "精确 MZ 翻译资源",
+      symbol: "ResolvedMzTranslationResources",
+      shortSymbol: "Resolved MZ Resources",
+      path: "src/att_mz/translate/profile.rs · src/application/command.rs",
+      status: "MZ 受信资源已实现",
+      role: "项目打开后按规范 LanguagePair 一次选择源语言模块，并读取唯一 MZ system prompt。",
+      plain: "Prompt 固定来自 prompts.root/mz/source--target.md；它不属于 Profile。普通文件、UTF-8、非空白和精确语言对全部成立后，Planner、Executor 与 Lua 复用同一语言模块和 Prompt。",
+      example: "ja → zh-Hans 只读取 mz/ja--zh-Hans.md；文件缺失时不尝试父语言、大小写变体或默认文件，也不会开始 LLM 请求。",
+      input: "项目 metadata 的 LanguagePair、全局 LanguageModuleCatalog 与 prompts.root",
+      output: "MzSystemPrompt + 同一 Arc<dyn LanguageModule>",
+      boundary: "Prompt 协议和路由由 MZ 拥有；共享层只拥有 LanguageId/Pair、语言模块和文件能力。"
     },
     "japanese-language": {
       title: "日语语言能力",
@@ -1766,7 +1779,7 @@ h1 {
       role: "在有界并发下调用翻译能力，只重试可恢复网络失败，并逐任务产出结果。",
       plain: "它像受控派单员：不会无限并发，也不会见错就重试。模型返回后还必须交给响应处理模块逐 ID 验货。",
       example: "网络暂时断开可以按配置重试；若模型回了非法协议，重试也不会变正确，因此直接作为该任务的失败结果。",
-      input: "TranslationTaskBlock 与执行 Profile",
+      input: "TranslationTaskBlock、MzTranslationProfile 的 request/并发策略与同一已解析语言模块",
       output: "Complete / Partial / Unavailable 数据枚举，含唯一 NonZeroUsize 尝试次数"
     },
     "response-processor": {
@@ -1802,7 +1815,7 @@ h1 {
       role: "在 Standard 正常完成后，把公共翻译准备门面、同一 LLM Client 和完整 db 逃生口交给可信 Lua。",
       plain: "脚本可用 ctx.translation.prepare 复用 Rust 的占位符、术语、语言分析和结果验收；只有真正自定义的数据协议才需要自行处理。",
       example: "脚本读取自建 quest_text 后调用 prepared=ctx.translation.prepare(text)，只在 Pending 时把 prepared.model_text 发送给 ctx.llm，再用 prepared:accept 验收。",
-      input: "StoredProjectRecord、共享执行 Profile 与脚本路径",
+      input: "StoredProjectRecord、ResolvedMzTranslationResources、同一 LLM Client 与脚本路径",
       output: "Lua 翻译阶段完成或明确失败"
     },
     "writeback-service": {
@@ -1991,7 +2004,12 @@ h1 {
   ]);
 
   ROOTS.translate.tree = n("translate-command-runner", "production-command-runner", [
-    n("translate-command-config", "command-configuration", [], { reused: true }),
+    n("translate-command-config", "command-configuration", [
+      n("translate-language-catalog", "language-catalog", [
+        n("translate-language-ja", "japanese-language", [], { reused: true }),
+        n("translate-language-en", "english-language", [], { reused: true })
+      ], { reused: true })
+    ], { reused: true }),
     n("translate-audit", "audit-ledger", [], { order: "①", reused: true }),
     n("translate-service", "translate-service", [
     n("translate-cancellation", "cooperative-cancellation", [], { reused: true }),
@@ -2006,6 +2024,10 @@ h1 {
         n("translate-directory-fingerprint", "directory-fingerprint-root", [], { reused: true })
       ], { reused: true })
     ], { order: "③", reused: true }),
+    n("translate-resolved-resources", "resolved-mz-translation-resources", [
+      n("translate-prompt-file", "file-reader-root", [], { reused: true }),
+      n("translate-resolved-language", "language-catalog", [], { reused: true })
+    ], { order: "④" }),
     n("translate-standard", "standard-translation", [
       n("standard-cancellation", "cooperative-cancellation", [], { reused: true }),
       n("standard-audit", "audit-ledger", [], { reused: true }),
@@ -2020,10 +2042,7 @@ h1 {
           n("planner-resources-file", "file-reader-root", [], { reused: true }),
           n("planner-resources-cpu", "cpu-root", [], { reused: true })
         ]),
-        n("planner-language", "language-catalog", [
-          n("planner-language-ja", "japanese-language", [], { reused: true }),
-          n("planner-language-en", "english-language", [], { reused: true })
-        ], { reused: true }),
+        n("planner-language", "resolved-mz-translation-resources", [], { reused: true }),
         n("planner-placeholder", "placeholder-service", [
           n("planner-placeholder-token", "placeholder-token-envelope", [], { reused: true })
         ]),
@@ -2042,10 +2061,7 @@ h1 {
         n("executor-delay", "delay-root"),
         n("executor-response", "response-processor", [
           n("response-token", "placeholder-token-envelope", [], { reused: true }),
-          n("response-language", "language-catalog", [
-            n("response-language-ja", "japanese-language", [], { reused: true }),
-            n("response-language-en", "english-language", [], { reused: true })
-          ], { reused: true })
+          n("response-language", "resolved-mz-translation-resources", [], { reused: true })
         ])
       ], { order: "④" }),
       n("standard-store", "result-store", [
@@ -2053,8 +2069,9 @@ h1 {
         n("store-location-codec", "location-codec", [], { reused: true }),
         n("store-sql", "sqlite-transaction-root", [], { reused: true })
       ], { order: "⑤", reused: true })
-    ], { order: "④" }),
+    ], { order: "⑤" }),
     n("translate-lua", "lua-translation", [
+      n("translate-lua-resources", "resolved-mz-translation-resources", [], { reused: true }),
       n("translate-lua-host", "lua-host", [
         n("translate-lua-file", "file-reader-root", [], { reused: true }),
         n("translate-lua-runtime", "lua-runtime-root", [], { reused: true }),
@@ -2063,7 +2080,7 @@ h1 {
           n("translate-lua-llm", "llm-root", [], { reused: true })
         ], { reused: true })
       ], { reused: true })
-    ], { order: "⑤", optional: true })
+    ], { order: "⑥", optional: true })
     ])
   ]);
 

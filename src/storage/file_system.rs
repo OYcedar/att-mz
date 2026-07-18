@@ -65,6 +65,22 @@ pub(crate) trait ExistingDirectoryResolver: Send + Sync {
     ) -> impl Future<Output = Result<PathBuf, ResolveDirectoryError<Self::Error>>> + Send;
 }
 
+/// 在一个已经受信的现存目录下幂等建立并验证一个直接子目录。
+///
+/// 调用方只声明单个子目录名；实现不得递归建立父目录，也不得跟随 reparse point。
+/// 生产实现负责把阻塞式目录操作隔离到受控执行资源。
+pub(crate) trait DirectChildDirectoryEnsurer: Send + Sync {
+    /// 底层文件系统错误。
+    type Error: Error + Send + Sync + 'static;
+
+    /// 返回已经固定、确认是普通目录的直接子目录路径。
+    fn ensure_direct_child_directory(
+        &self,
+        parent: PathBuf,
+        child: OsString,
+    ) -> impl Future<Output = Result<PathBuf, Self::Error>> + Send;
+}
+
 /// 列举一个目录的直接子项时可能发生的失败。
 #[derive(Debug)]
 pub(crate) enum ListDirectoryError<E> {
@@ -1916,6 +1932,20 @@ mod directory_stage_tests {
 
     struct SendContractPublisher;
 
+    struct SendContractDirectoryEnsurer;
+
+    impl DirectChildDirectoryEnsurer for SendContractDirectoryEnsurer {
+        type Error = Infallible;
+
+        async fn ensure_direct_child_directory(
+            &self,
+            parent: PathBuf,
+            child: OsString,
+        ) -> Result<PathBuf, Self::Error> {
+            Ok(parent.join(child))
+        }
+    }
+
     struct SendContractLeaseProvider;
 
     impl ExclusiveFileLeaseProvider for SendContractLeaseProvider {
@@ -1981,6 +2011,7 @@ mod directory_stage_tests {
     #[test]
     fn every_root_operation_returns_a_send_future() {
         let publisher = SendContractPublisher;
+        let directory_ensurer = SendContractDirectoryEnsurer;
         let lease_provider = SendContractLeaseProvider;
         let fingerprinter = SendContractFingerprinter;
         let request = DirectoryStageRequest::new(
@@ -2005,6 +2036,12 @@ mod directory_stage_tests {
             DirectoryPublishIntent::CreateNew,
             (),
         )));
+        assert_send(
+            directory_ensurer.ensure_direct_child_directory(
+                PathBuf::from("C:/workspaces"),
+                OsString::from("mz"),
+            ),
+        );
         assert_send(
             lease_provider.acquire_exclusive_file_lease(
                 ExclusiveFileLeaseRequest::new(

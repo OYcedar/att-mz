@@ -2647,8 +2647,8 @@ fn build_project_table(lua: &Lua, project: &LuaProjectContext) -> mlua::Result<T
     table.set("name", project.name().as_str())?;
     table.set("source_root", strict_path(project.source_root())?)?;
     table.set("database_path", strict_path(project.database_path())?)?;
-    table.set("source_language", project.source_language())?;
-    table.set("target_language", project.target_language())?;
+    table.set("source_language", project.source_language().as_str())?;
+    table.set("target_language", project.target_language().as_str())?;
     match project.output_root() {
         Some(path) => table.set("output_root", strict_path(path)?)?,
         None => table.set("output_root", Value::Nil)?,

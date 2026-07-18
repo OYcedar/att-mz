@@ -30,9 +30,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::fingerprint::Sha256Fingerprint;
 use crate::storage::file_system::{
-    BoundScopedDirectory, DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind,
-    DirectoryFileOverlay, DirectoryLister, DirectoryPrepareError, DirectoryPublishError,
-    DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+    BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
+    DirectoryEntryKind, DirectoryFileOverlay, DirectoryLister, DirectoryPrepareError,
+    DirectoryPublishError, DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
     DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
     ExclusiveFileLease, ExclusiveFileLeaseError, ExclusiveFileLeaseProvider,
     ExclusiveFileLeaseRequest, ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile,
@@ -263,6 +263,11 @@ impl DirectoryPublisherConfig {
             target_lock_timeout,
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn lock_directory(&self) -> &Path {
+        &self.lock_directory
+    }
 }
 
 #[derive(Debug)]
@@ -317,6 +322,11 @@ pub(crate) enum SystemFileSystemError {
     InvalidStagedIdentity {
         path: PathBuf,
     },
+    DirectChildRollbackFailed {
+        path: PathBuf,
+        operation: Box<SystemFileSystemError>,
+        rollback: Box<SystemFileSystemError>,
+    },
     ScopedEditRollbackFailed {
         path: PathBuf,
         operation: Box<SystemFileSystemError>,
@@ -369,6 +379,15 @@ impl fmt::Display for SystemFileSystemError {
                 "目录候选的物理文件身份已经变化：{}",
                 path.display()
             ),
+            Self::DirectChildRollbackFailed {
+                path,
+                operation,
+                rollback,
+            } => write!(
+                formatter,
+                "直接子目录 {} 建立后父目录身份发生变化（{operation}），且无法回滚：{rollback}",
+                path.display()
+            ),
             Self::ScopedEditRollbackFailed {
                 path,
                 operation,
@@ -412,7 +431,8 @@ impl Error for SystemFileSystemError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Windows(source) => Some(source),
-            Self::ScopedEditRollbackFailed { operation, .. } => Some(operation),
+            Self::DirectChildRollbackFailed { operation, .. }
+            | Self::ScopedEditRollbackFailed { operation, .. } => Some(operation),
             Self::Closed
             | Self::WorkerPanicked
             | Self::ResourceLimit { .. }
@@ -773,6 +793,26 @@ impl ExistingDirectoryResolver for SystemFileSystem {
                     path: error_path,
                     source,
                 })?
+        }
+    }
+}
+
+impl DirectChildDirectoryEnsurer for SystemFileSystem {
+    type Error = SystemFileSystemError;
+
+    fn ensure_direct_child_directory(
+        &self,
+        parent: PathBuf,
+        child: OsString,
+    ) -> impl std::future::Future<Output = Result<PathBuf, Self::Error>> + Send {
+        let parent = absolutize(parent);
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let parent = parent?;
+            inner
+                .pool
+                .execute(move || ensure_direct_child_directory_sync(parent, child))
+                .await?
         }
     }
 }
@@ -1341,6 +1381,50 @@ fn resolve_directory_sync(
         return Err(ResolveDirectoryError::NotDirectory { path });
     }
     Ok(pinned.resolved_path().to_path_buf())
+}
+
+fn ensure_direct_child_directory_sync(
+    parent: PathBuf,
+    child: OsString,
+) -> Result<PathBuf, SystemFileSystemError> {
+    let parent = validate_local_case_insensitive_ntfs_directory(&parent)?;
+    let parent_handle = open_directory(&parent, false)?;
+    let parent_identity = FileIdentity::of(&parent_handle, &parent)?;
+    let child_path = parent.join(&child);
+    validate_windows_name(&child, &child_path)?;
+    let created = match fs::create_dir(&child_path) {
+        Ok(()) => true,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(source) => return Err(io_error("建立直接子目录", &child_path, source)),
+    };
+    let pinned_child = pin_directory_without_reparse(&child_path)?;
+    let child_identity = FileIdentity::of(pinned_child.file(), &child_path)?;
+    let resolved_child = pinned_child.resolved_path().to_path_buf();
+    let parent_unchanged = (|| -> Result<bool, SystemFileSystemError> {
+        let current_parent = open_directory(&parent, false)?;
+        Ok(FileIdentity::of(&current_parent, &parent)? == parent_identity)
+    })();
+    let operation = match parent_unchanged {
+        Ok(true) => return Ok(resolved_child),
+        Ok(false) => SystemFileSystemError::InvalidPath {
+            path: parent,
+            reason: "建立直接子目录期间父目录身份发生变化",
+        },
+        Err(source) => source,
+    };
+    drop(pinned_child);
+    drop(parent_handle);
+    if !created {
+        return Err(operation);
+    }
+    match delete_empty_directory_if_identity(&child_path, child_identity) {
+        Ok(()) => Err(operation),
+        Err(rollback) => Err(SystemFileSystemError::DirectChildRollbackFailed {
+            path: child_path,
+            operation: Box::new(operation),
+            rollback: Box::new(rollback.into()),
+        }),
+    }
 }
 
 fn list_directory_sync(
@@ -4883,6 +4967,93 @@ mod tests {
         assert!(TreeBudget::new(0, 1, 1, 1).is_err());
         assert!(ExclusiveFileLeaseConfig::new(Duration::ZERO).is_err());
         let _ = publisher_config();
+    }
+
+    #[tokio::test]
+    async fn direct_child_directory_ensure_is_concurrently_idempotent() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时项目根");
+        let parent = temporary.path().join("projects");
+        fs::create_dir(&parent).expect("应该可创建现存父目录");
+        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+
+        let first = root.ensure_direct_child_directory(parent.clone(), OsString::from("mz"));
+        let second = root.ensure_direct_child_directory(parent.clone(), OsString::from("mz"));
+        let (first, second) = tokio::join!(first, second);
+        let expected = parent
+            .join("mz")
+            .canonicalize()
+            .expect("MZ 直接子目录应该可规范化");
+        assert_eq!(first.expect("首次建立应该成功"), expected);
+        assert_eq!(second.expect("并发重复建立应该成功"), expected);
+        assert_eq!(fs::read_dir(&parent).expect("应该可列举项目根").count(), 1);
+
+        root.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn direct_child_directory_ensure_rejects_non_segment_and_existing_file() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时项目根");
+        let parent = temporary.path().join("projects");
+        fs::create_dir(&parent).expect("应该可创建现存父目录");
+        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+
+        for child in ["", ".", "nested/mz"] {
+            assert!(
+                root.ensure_direct_child_directory(parent.clone(), OsString::from(child))
+                    .await
+                    .is_err(),
+                "非普通单段名称必须被拒绝：{child:?}"
+            );
+        }
+        assert!(!parent.join("nested").exists());
+
+        let missing_parent = temporary.path().join("missing/projects");
+        assert!(
+            root.ensure_direct_child_directory(missing_parent.clone(), OsString::from("mz"),)
+                .await
+                .is_err(),
+            "能力不得递归建立缺失父目录"
+        );
+        assert!(!temporary.path().join("missing").exists());
+
+        let occupied = parent.join("mz");
+        fs::write(&occupied, b"occupied").expect("应该可用普通文件占用名称");
+        assert!(
+            root.ensure_direct_child_directory(parent.clone(), OsString::from("mz"))
+                .await
+                .is_err(),
+            "已有普通文件不得被当作目录"
+        );
+        assert!(occupied.is_file());
+
+        root.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn direct_child_directory_ensure_rejects_reparse_point() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时项目根");
+        let parent = temporary.path().join("projects");
+        let target = temporary.path().join("foreign");
+        fs::create_dir(&parent).expect("应该可创建现存父目录");
+        fs::create_dir(&target).expect("应该可创建链接目标");
+        let link = parent.join("mz");
+        if let Err(error) = std::os::windows::fs::symlink_dir(&target, &link) {
+            if symlink_unavailable(&error) {
+                return;
+            }
+            panic!("应该可创建目录符号链接：{error}");
+        }
+        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+
+        assert!(
+            root.ensure_direct_child_directory(parent, OsString::from("mz"))
+                .await
+                .is_err(),
+            "reparse point 不得成为受信直接子目录"
+        );
+        assert!(target.is_dir(), "拒绝 reparse point 不得修改链接目标");
+
+        root.shutdown().await.expect("文件系统根应该可终结");
     }
 
     #[tokio::test]

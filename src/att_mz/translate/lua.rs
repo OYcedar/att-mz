@@ -27,8 +27,8 @@ use super::standard::TranslationUnitRejectionReason;
 /// Lua 翻译完整拥有自己的数据协议、事务划分、重试和幂等语义。标准翻译和顶层
 /// 翻译用例不解释 Lua 产物，也不回滚 Lua 或前序标准翻译已经提交的副作用。
 pub(crate) trait LuaTranslation: Send + Sync {
-    /// 与配置解析器产物一致的执行配置。
-    type Profile: Send + Sync + 'static;
+    /// 配置边界已经选择且只供 Lua LLM 调用使用的 Client。
+    type Client: Send + Sync + 'static;
     /// Lua 翻译失败。
     type Error: Error + Send + Sync + 'static;
 
@@ -36,13 +36,13 @@ pub(crate) trait LuaTranslation: Send + Sync {
     fn run(
         &self,
         project: &OpenedProject,
-        profile: &Self::Profile,
+        llm_client: Arc<Self::Client>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
         script_path: PathBuf,
     ) -> impl Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send;
 }
 
-/// 把 Translate 阶段已经建立的项目事实和 Profile 交给可信 Lua Host。
+/// 把 Translate 阶段已经建立的项目事实、公共 Client 和解析语义交给可信 Lua Host。
 pub(crate) struct LuaTranslationService<H> {
     host: H,
 }
@@ -57,13 +57,13 @@ impl<H> LuaTranslation for LuaTranslationService<H>
 where
     H: TrustedLuaExecutionHost,
 {
-    type Profile = Arc<H::TranslationProfile>;
+    type Client = H::TranslationClient;
     type Error = LuaTranslationError<H::Error>;
 
     async fn run(
         &self,
         project: &OpenedProject,
-        profile: &Self::Profile,
+        llm_client: Arc<Self::Client>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
         script_path: PathBuf,
     ) -> Result<OperationCompletion<()>, Self::Error> {
@@ -71,7 +71,7 @@ where
         let invocation = LuaInvocation::translate(
             script_path,
             LuaProjectContext::from_opened_project(project),
-            Arc::clone(profile),
+            llm_client,
             semantics,
         );
 
@@ -139,11 +139,11 @@ impl TrustedLuaTranslationSemantics for ResolvedTranslationSemantics {
     }
 
     fn source_language(&self) -> &str {
-        self.language_pair().source_language()
+        self.language_pair().source().as_str()
     }
 
     fn target_language(&self) -> &str {
-        self.language_pair().target_language()
+        self.language_pair().target().as_str()
     }
 
     fn prepare_translation(
@@ -248,7 +248,7 @@ mod tests {
     use crate::att_mz::lua::LuaPhase;
 
     #[derive(Debug)]
-    struct FakeProfile {
+    struct FakeClient {
         name: &'static str,
     }
 
@@ -257,8 +257,8 @@ mod tests {
         phase: LuaPhase,
         script_path: PathBuf,
         project: LuaProjectContext,
-        profile_address: usize,
-        profile_name: &'static str,
+        client_address: usize,
+        client_name: &'static str,
         semantics_address: usize,
     }
 
@@ -271,25 +271,25 @@ mod tests {
     }
 
     impl TrustedLuaExecutionHost for FakeHost {
-        type TranslationProfile = FakeProfile;
+        type TranslationClient = FakeClient;
         type Error = FakeError;
 
         async fn execute(
             &self,
-            invocation: LuaInvocation<Self::TranslationProfile>,
+            invocation: LuaInvocation<Self::TranslationClient>,
         ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
             let recorded = match invocation {
                 LuaInvocation::Translate {
                     script_path,
                     project,
-                    profile,
+                    llm_client,
                     semantics,
                 } => RecordedInvocation {
                     phase: LuaPhase::Translate,
                     script_path,
                     project,
-                    profile_address: Arc::as_ptr(&profile).addr(),
-                    profile_name: profile.name,
+                    client_address: Arc::as_ptr(&llm_client).addr(),
+                    client_name: llm_client.name,
                     semantics_address: Arc::as_ptr(&semantics) as *const () as usize,
                 },
                 LuaInvocation::Extract { .. } => panic!("翻译服务不应提交 Extract 调用"),
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passes_complete_translate_context_and_the_same_profile_to_host_once() {
+    async fn passes_complete_translate_context_and_the_same_client_to_host_once() {
         let recorded = Arc::new(Mutex::new(None));
         let service = LuaTranslationService::new(FakeHost {
             invocation: Arc::clone(&recorded),
@@ -437,15 +437,15 @@ mod tests {
             cancelled: false,
             unexpected_outcome: false,
         });
-        let profile = Arc::new(FakeProfile { name: "quality" });
-        let profile_address = Arc::as_ptr(&profile).addr();
+        let client = Arc::new(FakeClient { name: "quality" });
+        let client_address = Arc::as_ptr(&client).addr();
         let semantics = semantics();
         let semantics_address = Arc::as_ptr(&semantics) as *const () as usize;
 
         service
             .run(
                 &project(),
-                &profile,
+                Arc::clone(&client),
                 semantics,
                 PathBuf::from("scripts/translate.lua"),
             )
@@ -462,8 +462,8 @@ mod tests {
             invocation.script_path,
             PathBuf::from("scripts/translate.lua")
         );
-        assert_eq!(invocation.profile_address, profile_address);
-        assert_eq!(invocation.profile_name, "quality");
+        assert_eq!(invocation.client_address, client_address);
+        assert_eq!(invocation.client_name, "quality");
         assert_eq!(invocation.semantics_address, semantics_address);
         assert_eq!(invocation.project.name().as_str(), "alice");
         assert_eq!(
@@ -474,8 +474,8 @@ mod tests {
             invocation.project.database_path(),
             Path::new("C:/projects/alice/project.db")
         );
-        assert_eq!(invocation.project.source_language(), "ja");
-        assert_eq!(invocation.project.target_language(), "zh-Hans");
+        assert_eq!(invocation.project.source_language().as_str(), "ja");
+        assert_eq!(invocation.project.target_language().as_str(), "zh-Hans");
     }
 
     #[tokio::test]
@@ -490,7 +490,7 @@ mod tests {
         let error = service
             .run(
                 &project(),
-                &Arc::new(FakeProfile { name: "quality" }),
+                Arc::new(FakeClient { name: "quality" }),
                 semantics(),
                 PathBuf::from("broken translation.lua"),
             )
@@ -523,7 +523,7 @@ mod tests {
         let error = service
             .run(
                 &project(),
-                &Arc::new(FakeProfile { name: "quality" }),
+                Arc::new(FakeClient { name: "quality" }),
                 semantics(),
                 PathBuf::from("translation.lua"),
             )
@@ -548,7 +548,7 @@ mod tests {
         let completion = service
             .run(
                 &project(),
-                &Arc::new(FakeProfile { name: "quality" }),
+                Arc::new(FakeClient { name: "quality" }),
                 semantics(),
                 PathBuf::from("translation.lua"),
             )
@@ -569,10 +569,10 @@ mod tests {
             unexpected_outcome: false,
         });
         let project = project();
-        let profile = Arc::new(FakeProfile { name: "quality" });
+        let client = Arc::new(FakeClient { name: "quality" });
         assert_send(service.run(
             &project,
-            &profile,
+            client,
             semantics(),
             PathBuf::from("translate.lua"),
         ));

@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 
 use tokio::sync::oneshot;
 
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
 const STATE_RUNNING: u8 = 0;
 const STATE_SHUTTING_DOWN: u8 = 1;

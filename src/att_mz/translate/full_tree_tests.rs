@@ -16,9 +16,8 @@ use super::placeholder::Pcre2PlaceholderService;
 use super::planner::MzStandardTranslationTaskPlanningService;
 use super::planning_resource::JsonTranslationPlanningResourceReadingService;
 use super::profile::{
-    MzTranslationExecutionConfiguration, MzTranslationExecutionPayload,
-    MzTranslationPlanningConfiguration, TranslationExecutionProfile,
-    TranslationProfileLanguagePair,
+    MzSystemPrompt, MzTranslationPlanningConfiguration, MzTranslationProfile,
+    MzTranslationRequestConfiguration, ResolvedMzTranslationResources,
 };
 use super::result_store::{
     MzStandardTranslationResultStorageConfig, MzStandardTranslationResultStorageService,
@@ -42,23 +41,23 @@ use crate::att_mz::lua::session::{
     SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
 };
 use crate::att_mz::project::ExistingProjectOpeningService;
+use crate::att_mz::project_database::ProjectDatabaseRecordReadingService;
 use crate::att_mz::project_lease::{
     ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
 };
 use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
 use crate::execution::OperationCompletion;
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
 use crate::language::{
-    JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageModuleCatalog,
+    JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageModule, LanguagePair,
 };
 use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError,
     LlmRequestExecutor, LlmResponse,
 };
 use crate::observability::{EventId, OperationId};
-use crate::project_database::ProjectDatabaseRecordReadingService;
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
     DirectoryEntry, DirectoryLister, DirectoryTreeFingerprintError,
     DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, ExistingDirectoryResolver,
@@ -199,7 +198,10 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
     ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>> {
         assert_eq!(
             path,
-            PathBuf::from("C:/projects").join("demo").join("project.db")
+            PathBuf::from("C:/projects")
+                .join("mz")
+                .join("demo")
+                .join("project.db")
         );
         if query.statement().contains("FROM metadata") && !query.statement().contains("UNION ALL") {
             record(&self.events, Event::QueryMetadata);
@@ -353,7 +355,10 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
     ) -> Result<(), ExecuteTransactionError<Self::Error>> {
         assert_eq!(
             path,
-            PathBuf::from("C:/projects").join("demo").join("project.db")
+            PathBuf::from("C:/projects")
+                .join("mz")
+                .join("demo")
+                .join("project.db")
         );
         let translated_leaf_count =
             plan.steps()
@@ -622,7 +627,10 @@ impl SqliteInteractiveSessionFactory for FakeSqliteInteractiveSessionFactory {
     > {
         assert_eq!(
             path,
-            PathBuf::from("C:/projects").join("demo").join("project.db")
+            PathBuf::from("C:/projects")
+                .join("mz")
+                .join("demo")
+                .join("project.db")
         );
         self.calls.fetch_add(1, Ordering::SeqCst);
         record(&self.events, Event::OpenLuaDatabase(path));
@@ -706,12 +714,18 @@ fn non_zero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("测试配置必须非零")
 }
 
-fn language_catalog() -> LanguageModuleCatalog {
+fn translation_resources() -> Arc<ResolvedMzTranslationResources> {
     let japanese: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
         JapaneseResidualPolicy::new(non_zero(1), Vec::new()).expect("测试日文残留策略应合法"),
         None,
     ));
-    LanguageModuleCatalog::new([("ja".to_owned(), japanese)]).expect("测试语言目录应合法")
+    let pair = LanguagePair::new(
+        LanguageId::parse("ja").expect("测试源语言合法"),
+        LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
+    );
+    let prompt = MzSystemPrompt::new(pair, "# 完整系统提示词\n\n只返回约定 JSON。".to_owned())
+        .expect("测试 Prompt 应合法");
+    Arc::new(ResolvedMzTranslationResources::new(prompt, japanese))
 }
 
 fn event_position(events: &[Event], predicate: impl Fn(&Event) -> bool) -> usize {
@@ -719,7 +733,7 @@ fn event_position(events: &[Event], predicate: impl Fn(&Event) -> bool) -> usize
 }
 
 struct FixedExecutionBuilder<P, S, L> {
-    profile: Arc<TranslationExecutionProfile<P>>,
+    profile: Arc<MzTranslationProfile<P>>,
     standard: Mutex<Option<S>>,
     lua: Mutex<Option<crate::att_mz::SelectedLua<L>>>,
 }
@@ -727,10 +741,10 @@ struct FixedExecutionBuilder<P, S, L> {
 impl<P, S, L> SelectedTranslationExecutionBuilder for FixedExecutionBuilder<P, S, L>
 where
     P: Send + Sync + 'static,
-    S: StandardTranslation<Profile = Arc<TranslationExecutionProfile<P>>>,
-    L: LuaTranslation<Profile = Arc<TranslationExecutionProfile<P>>>,
+    S: StandardTranslation<Profile = Arc<MzTranslationProfile<P>>>,
+    L: LuaTranslation<Client = P>,
 {
-    type Payload = P;
+    type Client = P;
     type Standard = S;
     type Lua = L;
     type Error = FakeRootError;
@@ -822,27 +836,18 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
         calls: Arc::clone(&lua_runtime_calls),
     };
 
-    let pair = TranslationProfileLanguagePair::new("ja", "zh-Hans").expect("测试语言对应合法");
-    let planning = MzTranslationPlanningConfiguration::new(
+    let planning = MzTranslationPlanningConfiguration::new(non_zero(1), non_zero(10_000));
+    let profile = Arc::new(MzTranslationProfile::new(
+        "quality",
         non_zero(1),
-        non_zero(10_000),
-        [(pair, "# 完整系统提示词\n\n只返回约定 JSON。".to_owned())],
-    )
-    .expect("测试规划配置应合法");
-    let payload = MzTranslationExecutionPayload::new(
         planning,
-        MzTranslationExecutionConfiguration::new(
+        MzTranslationRequestConfiguration::new(
             vec![Duration::from_millis(7)],
             Duration::from_secs(1),
         ),
         Arc::new(FakeLlmClient {
             name: "shared-llm-config",
         }),
-    );
-    let profile = Arc::new(TranslationExecutionProfile::new(
-        "quality",
-        non_zero(1),
-        payload,
     ));
 
     let project_reader = ExistingProjectOpeningService::new(
@@ -858,7 +863,7 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
         cpu.clone(),
         MzStandardAssetReadingConfig::new(non_zero(1), non_zero(1)),
     );
-    let languages = language_catalog();
+    let languages = translation_resources();
     let resources =
         JsonTranslationPlanningResourceReadingService::new(file_reader.clone(), cpu.clone());
     let planner = MzStandardTranslationTaskPlanningService::<_, _, FakeLlmClient>::new(
@@ -868,8 +873,7 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
         cpu.clone(),
     );
     let response_processor = TranslationTaskResponseProcessingService::new(cpu.clone(), languages);
-    type SelectedProfile =
-        Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<FakeLlmClient>>>;
+    type SelectedProfile = Arc<MzTranslationProfile<FakeLlmClient>>;
     let executor = MzStandardTranslationTaskExecutionService::<_, _, _, SelectedProfile>::new(
         llm.clone(),
         delay,

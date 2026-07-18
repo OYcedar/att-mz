@@ -14,7 +14,7 @@ Init 是命名工作区的状态收敛命令。它既能建立项目，也能用
 目标不存在时，Init 建立：
 
 ```text
-<projects_root>/<name>/
+<projects.root>/mz/<name>/
 ├─ project.db
 ├─ source/
 │  ├─ data/
@@ -53,7 +53,8 @@ Init 对本次游戏来源计算期望指纹。其他三个命令每次开启项
 
 ## 3. 项目数据库当前结构
 
-新数据库在一个初始化事务中建立：
+MZ 项目数据库的 schema、布局、对账与开启能力属于 `att_mz::project_database`，底层
+SQLite 执行机制保持共享。新数据库在一个初始化事务中建立：
 
 - `metadata` 唯一保存 `name`、`source_language`、`target_language`、
   `dialogue_max_fullwidth_chars`、`scrolling_text_max_fullwidth_chars`、
@@ -70,6 +71,11 @@ Init 对本次游戏来源计算期望指纹。其他三个命令每次开启项
 - 五张表都以 `(owner, exact_location)` 为主键并外键引用
   `standard_asset_owner_state(owner) ON DELETE CASCADE`；`translation` 与固定 32 字节
   `translation_state` 必须同时为 NULL 或同时存在。
+
+`source_language` 与 `target_language` 只保存规范 `LanguageId`。CLI 输入在进入项目
+事实前执行 RFC 5646 解析、IANA 注册表校验和 canonicalization；合法大小写变体会被
+规范化，首尾空白、下划线、非法或未注册子标签以及主语言 `und` 被拒绝。读取到非法
+或非规范 metadata 表示当前项目数据库损坏，不静默修正。
 
 删除 owner 状态会级联删除该 owner 的标准叶。受管 schema 由 Init 一次完整建立，
 只包含上述 metadata、owner state、固定资源和五张标准表。
@@ -89,7 +95,8 @@ Init 对本次游戏来源计算期望指纹。其他三个命令每次开启项
   数据库检查后留下的 `project.db-journal`、`project.db-wal`、`project.db-shm`；
   `project.db` 与这些 SQLite sidecar 必须是单链接普通文件，`source`、`write_back`
   及两者的 `data`、`js` 必须是普通目录。目录列举根拒绝 reparse point、hardlink
-  和其他非普通对象。项目锁和目录发布锁固定在 `<projects.root>/.att-locks/`，不属于
+  和其他非普通对象。项目锁固定在 `<projects.root>/.att-locks/projects/mz/`，目录发布
+  锁固定在 `<projects.root>/.att-locks/directory-publish/mz/`，两者都不属于
   工作区结构。其他额外项、
   缺失项或角色类型偏差都使用本次来源和已检查的有效数据库在候选中恢复；
 - 多项同时变化时在同一个候选中组合执行，不能暴露中间状态。
@@ -135,7 +142,7 @@ InitService
 │  └─ JsonLinesEventLog（通用追加、轮转与 sync_data）
 ├─ ExistingDirectoryResolver
 ├─ SourceSnapshotFingerprint + SystemFileSystem as DirectoryTreeFingerprinter
-├─ ProjectDatabaseStateReconciliationService
+├─ att_mz::project_database::ProjectDatabaseStateReconciliationService
 └─ ProjectWorkspaceConvergenceService
    ├─ ProjectWorkspaceLayout
    ├─ SqliteDatabaseCreator / SQLite backup 与短事务根
@@ -145,3 +152,4 @@ InitService
 锁顺序固定为项目租约 → 目录发布锁 → SQLite；同项目租约超时返回 `ProjectBusy`。
 `run_started` 与 `run_finished` 进入统一 `audit.jsonl`。命令、候选终结、审计及全部
 根 shutdown 成功后才呈现 Created、Updated 或 Unchanged；工作区修复属于 Updated。
+MZ 只定位 `<projects.root>/mz/<name>`，不搜索其他工作区候选位置。

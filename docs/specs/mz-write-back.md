@@ -7,7 +7,7 @@ WriteBack 从冻结来源和当前新鲜标准资产构造一个完整候选，�
 ## 1. 输入与前置状态
 
 ```text
-att [--config FILE] mz write-back --name NAME [--lua SCRIPT_LUA]
+att --config FILE mz write-back --name NAME [--lua SCRIPT_LUA]
 ```
 
 命令先把 `run_started` 写入强审计账本，再取得项目租约并开启项目验证：

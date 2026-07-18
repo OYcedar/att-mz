@@ -7,9 +7,209 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use language_tags::{LanguageTag, ParseError as LanguageTagParseError, ValidationError};
+
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+
+/// 已按 RFC 5646 验证并规范化的语言标签。
+///
+/// 构造边界会拒绝首尾空白、下划线、未在 IANA 注册表中的子标签以及
+/// `und` 主语言；内部始终保存 RFC 5646 规范形式。
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct LanguageId(String);
+
+impl LanguageId {
+    pub(crate) fn parse(input: &str) -> Result<Self, LanguageIdError> {
+        if input.is_empty() || input.chars().all(char::is_whitespace) {
+            return Err(LanguageIdError::Blank);
+        }
+        if input.trim() != input {
+            return Err(LanguageIdError::SurroundingWhitespace {
+                language_id: input.to_owned(),
+            });
+        }
+        if input.contains('_') {
+            return Err(LanguageIdError::Underscore {
+                language_id: input.to_owned(),
+            });
+        }
+
+        let parsed =
+            LanguageTag::parse(input).map_err(|source| LanguageIdError::InvalidSyntax {
+                language_id: input.to_owned(),
+                source,
+            })?;
+        parsed
+            .validate()
+            .map_err(|source| LanguageIdError::InvalidRegistryTag {
+                language_id: input.to_owned(),
+                source,
+            })?;
+        let canonical =
+            parsed
+                .canonicalize()
+                .map_err(|source| LanguageIdError::CanonicalizationFailed {
+                    language_id: input.to_owned(),
+                    source,
+                })?;
+        if canonical.primary_language() == "und" {
+            return Err(LanguageIdError::UndefinedPrimaryLanguage {
+                language_id: input.to_owned(),
+            });
+        }
+
+        Ok(Self(canonical.into_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for LanguageId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for LanguageId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LanguageId {
+    type Err = LanguageIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Self::parse(input)
+    }
+}
+
+impl TryFrom<String> for LanguageId {
+    type Error = LanguageIdError;
+
+    fn try_from(input: String) -> Result<Self, Self::Error> {
+        Self::parse(&input)
+    }
+}
+
+/// 外部语言标签无法建立为受信语言 ID。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LanguageIdError {
+    Blank,
+    SurroundingWhitespace {
+        language_id: String,
+    },
+    Underscore {
+        language_id: String,
+    },
+    InvalidSyntax {
+        language_id: String,
+        source: LanguageTagParseError,
+    },
+    InvalidRegistryTag {
+        language_id: String,
+        source: ValidationError,
+    },
+    CanonicalizationFailed {
+        language_id: String,
+        source: ValidationError,
+    },
+    UndefinedPrimaryLanguage {
+        language_id: String,
+    },
+}
+
+impl fmt::Display for LanguageIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blank => formatter.write_str("语言 ID 不能为空白"),
+            Self::SurroundingWhitespace { language_id } => {
+                write!(formatter, "语言 ID 含首尾空白：{language_id:?}")
+            }
+            Self::Underscore { language_id } => {
+                write!(
+                    formatter,
+                    "语言 ID 必须使用连字号分隔子标签：{language_id:?}"
+                )
+            }
+            Self::InvalidSyntax {
+                language_id,
+                source,
+            } => write!(
+                formatter,
+                "语言 ID 不符合 RFC 5646：{language_id:?}（{source}）"
+            ),
+            Self::InvalidRegistryTag {
+                language_id,
+                source,
+            } => write!(
+                formatter,
+                "语言 ID 未通过 IANA 注册表校验：{language_id:?}（{source}）"
+            ),
+            Self::CanonicalizationFailed {
+                language_id,
+                source,
+            } => write!(
+                formatter,
+                "语言 ID 无法唯一规范化：{language_id:?}（{source}）"
+            ),
+            Self::UndefinedPrimaryLanguage { language_id } => {
+                write!(formatter, "语言 ID 不能使用 und 主语言：{language_id:?}")
+            }
+        }
+    }
+}
+
+impl Error for LanguageIdError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidSyntax { source, .. } => Some(source),
+            Self::InvalidRegistryTag { source, .. }
+            | Self::CanonicalizationFailed { source, .. } => Some(source),
+            Self::Blank
+            | Self::SurroundingWhitespace { .. }
+            | Self::Underscore { .. }
+            | Self::UndefinedPrimaryLanguage { .. } => None,
+        }
+    }
+}
+
+/// 一次翻译的规范源语言与目标语言。
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct LanguagePair {
+    source: LanguageId,
+    target: LanguageId,
+}
+
+impl LanguagePair {
+    pub(crate) const fn new(source: LanguageId, target: LanguageId) -> Self {
+        Self { source, target }
+    }
+
+    pub(crate) const fn source(&self) -> &LanguageId {
+        &self.source
+    }
+
+    pub(crate) const fn target(&self) -> &LanguageId {
+        &self.target
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_parts(self) -> (LanguageId, LanguageId) {
+        (self.source, self.target)
+    }
+}
+
+impl fmt::Display for LanguagePair {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} -> {}", self.source, self.target)
+    }
+}
 
 /// 语言模块能够观察的文本片段。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -363,25 +563,15 @@ impl Error for LanguageModuleError {}
 /// 精确源语言 ID 到语言模块的受信绑定集合。
 #[derive(Clone)]
 pub(crate) struct LanguageModuleCatalog {
-    modules: BTreeMap<String, Arc<dyn LanguageModule>>,
+    modules: BTreeMap<LanguageId, Arc<dyn LanguageModule>>,
 }
 
 impl LanguageModuleCatalog {
     pub(crate) fn new(
-        bindings: impl IntoIterator<Item = (String, Arc<dyn LanguageModule>)>,
+        bindings: impl IntoIterator<Item = (LanguageId, Arc<dyn LanguageModule>)>,
     ) -> Result<Self, LanguageModuleCatalogBuildError> {
         let mut modules = BTreeMap::new();
         for (language_id, module) in bindings {
-            if language_id.trim().is_empty() {
-                return Err(LanguageModuleCatalogBuildError::BlankLanguageId);
-            }
-            if language_id.trim() != language_id {
-                return Err(
-                    LanguageModuleCatalogBuildError::SurroundingWhitespaceInLanguageId {
-                        language_id,
-                    },
-                );
-            }
             if modules.insert(language_id.clone(), module).is_some() {
                 return Err(LanguageModuleCatalogBuildError::DuplicateLanguageId { language_id });
             }
@@ -394,11 +584,11 @@ impl LanguageModuleCatalog {
 
     pub(crate) fn resolve(
         &self,
-        language_id: &str,
+        language_id: &LanguageId,
     ) -> Result<Arc<dyn LanguageModule>, LanguageModuleCatalogError> {
         self.modules.get(language_id).cloned().ok_or_else(|| {
             LanguageModuleCatalogError::UnknownLanguageId {
-                language_id: language_id.to_owned(),
+                language_id: language_id.clone(),
                 available_ids: self.modules.keys().cloned().collect(),
             }
         })
@@ -417,19 +607,13 @@ impl fmt::Debug for LanguageModuleCatalog {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LanguageModuleCatalogBuildError {
     MissingLanguageModule,
-    BlankLanguageId,
-    SurroundingWhitespaceInLanguageId { language_id: String },
-    DuplicateLanguageId { language_id: String },
+    DuplicateLanguageId { language_id: LanguageId },
 }
 
 impl fmt::Display for LanguageModuleCatalogBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingLanguageModule => formatter.write_str("没有绑定任何源语言模块"),
-            Self::BlankLanguageId => formatter.write_str("源语言 ID 不能为空白"),
-            Self::SurroundingWhitespaceInLanguageId { language_id } => {
-                write!(formatter, "源语言 ID 含首尾空白：{language_id:?}")
-            }
             Self::DuplicateLanguageId { language_id } => {
                 write!(formatter, "源语言 ID 重复：{language_id}")
             }
@@ -442,8 +626,8 @@ impl Error for LanguageModuleCatalogBuildError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LanguageModuleCatalogError {
     UnknownLanguageId {
-        language_id: String,
-        available_ids: Vec<String>,
+        language_id: LanguageId,
+        available_ids: Vec<LanguageId>,
     },
 }
 
@@ -455,8 +639,12 @@ impl fmt::Display for LanguageModuleCatalogError {
                 available_ids,
             } => write!(
                 formatter,
-                "未知源语言 ID {language_id:?}；可用 ID：{}",
-                available_ids.join(", ")
+                "未知源语言 ID {language_id}；可用 ID：{}",
+                available_ids
+                    .iter()
+                    .map(LanguageId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }
@@ -1449,6 +1637,10 @@ fn first_copied_english_fragment(
 mod tests {
     use super::*;
 
+    fn language_id(value: &str) -> LanguageId {
+        LanguageId::parse(value).expect("测试语言 ID 应该有效")
+    }
+
     fn non_zero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("测试值必须非零")
     }
@@ -1478,46 +1670,98 @@ mod tests {
     }
 
     #[test]
-    fn catalog_only_resolves_exact_source_ids() {
+    fn language_id_validates_and_canonicalizes_rfc_5646_tags() {
+        for (input, expected) in [
+            ("ja", "ja"),
+            ("EN-us", "en-US"),
+            ("zh-hans", "zh-Hans"),
+            ("en-Latn", "en"),
+        ] {
+            let language_id = LanguageId::parse(input).expect("语言标签应该有效");
+            assert_eq!(language_id.as_str(), expected);
+            assert_eq!(
+                language_id
+                    .to_string()
+                    .parse::<LanguageId>()
+                    .expect("规范标签应可重新解析"),
+                language_id
+            );
+        }
+    }
+
+    #[test]
+    fn language_id_rejects_noncanonical_external_forms() {
+        for invalid in ["", "   "] {
+            assert!(matches!(
+                LanguageId::parse(invalid),
+                Err(LanguageIdError::Blank)
+            ));
+        }
+        assert!(matches!(
+            LanguageId::parse(" ja"),
+            Err(LanguageIdError::SurroundingWhitespace { .. })
+        ));
+        assert!(matches!(
+            LanguageId::parse("en_US"),
+            Err(LanguageIdError::Underscore { .. })
+        ));
+        assert!(matches!(
+            LanguageId::parse("en--US"),
+            Err(LanguageIdError::InvalidSyntax { .. })
+        ));
+        assert!(matches!(
+            LanguageId::parse("zz"),
+            Err(LanguageIdError::InvalidRegistryTag { .. })
+        ));
+        assert!(matches!(
+            LanguageId::parse("und-Latn"),
+            Err(LanguageIdError::UndefinedPrimaryLanguage { .. })
+        ));
+    }
+
+    #[test]
+    fn language_pair_preserves_typed_source_and_target() {
+        let pair = LanguagePair::new(language_id("ja"), language_id("zh-Hans"));
+
+        assert_eq!(pair.source().as_str(), "ja");
+        assert_eq!(pair.target().as_str(), "zh-Hans");
+        assert_eq!(pair.to_string(), "ja -> zh-Hans");
+        assert_eq!(
+            pair.into_parts(),
+            (language_id("ja"), language_id("zh-Hans"))
+        );
+    }
+
+    #[test]
+    fn catalog_resolves_canonical_source_ids() {
         let module: Arc<dyn LanguageModule> = Arc::new(japanese_module());
         let catalog = LanguageModuleCatalog::new([
-            ("ja".to_owned(), Arc::clone(&module)),
-            ("ja-JP".to_owned(), module),
+            (language_id("ja"), Arc::clone(&module)),
+            (language_id("ja-JP"), module),
         ])
         .expect("显式精确绑定有效");
 
-        assert!(catalog.resolve("ja").is_ok());
+        assert!(catalog.resolve(&language_id("JA")).is_ok());
         assert!(matches!(
-            catalog.resolve("JA"),
+            catalog.resolve(&language_id("en")),
             Err(LanguageModuleCatalogError::UnknownLanguageId { .. })
         ));
     }
 
     #[test]
-    fn catalog_rejects_missing_blank_surrounded_and_duplicate_ids() {
+    fn catalog_rejects_missing_and_canonical_duplicate_ids() {
         assert!(matches!(
-            LanguageModuleCatalog::new(std::iter::empty()),
+            LanguageModuleCatalog::new(std::iter::empty::<(LanguageId, Arc<dyn LanguageModule>,)>()),
             Err(LanguageModuleCatalogBuildError::MissingLanguageModule)
-        ));
-
-        for invalid in ["", "   "] {
-            let module: Arc<dyn LanguageModule> = Arc::new(japanese_module());
-            assert!(matches!(
-                LanguageModuleCatalog::new([(invalid.to_owned(), module)]),
-                Err(LanguageModuleCatalogBuildError::BlankLanguageId)
-            ));
-        }
-
-        let surrounded: Arc<dyn LanguageModule> = Arc::new(japanese_module());
-        assert!(matches!(
-            LanguageModuleCatalog::new([(" ja".to_owned(), surrounded)]),
-            Err(LanguageModuleCatalogBuildError::SurroundingWhitespaceInLanguageId { .. })
         ));
 
         let first: Arc<dyn LanguageModule> = Arc::new(japanese_module());
         let second: Arc<dyn LanguageModule> = Arc::new(japanese_module());
         assert!(matches!(
-            LanguageModuleCatalog::new([("ja".to_owned(), first), ("ja".to_owned(), second),]),
+            LanguageModuleCatalog::new([
+                (language_id("en-US"), first),
+                (language_id("EN-us"), second),
+            ]),
             Err(LanguageModuleCatalogBuildError::DuplicateLanguageId { .. })
         ));
     }

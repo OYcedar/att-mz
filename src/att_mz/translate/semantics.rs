@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::att_mz::text::TextGroupKind;
 use crate::fingerprint::Sha256Fingerprint;
-use crate::language::{LanguageAnalysis, LanguageModule};
+use crate::language::{LanguageAnalysis, LanguageModule, LanguagePair};
 
 use super::executor::accept_prepared_translation_candidate;
 use super::language_projection::{LanguageTextProjectionError, project_protected_text};
@@ -14,15 +14,12 @@ use super::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderProtectionError,
 };
 use super::planning_resource::CompiledTerminology;
-use super::standard::{
-    AppliedPlaceholder, TerminologyDependency, TranslationLanguagePair,
-    TranslationUnitRejectionReason,
-};
+use super::standard::{AppliedPlaceholder, TerminologyDependency, TranslationUnitRejectionReason};
 
 /// 一轮 Standard 与 Lua 共享且不可变的当前翻译语义。
 pub(crate) struct ResolvedTranslationSemantics {
     system_prompt: String,
-    language_pair: TranslationLanguagePair,
+    language_pair: LanguagePair,
     terminology: Arc<CompiledTerminology>,
     placeholder_service: Pcre2PlaceholderService,
     custom_placeholders: CompiledPlaceholderRules,
@@ -53,7 +50,7 @@ impl ResolvedTranslationSemantics {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         system_prompt: String,
-        language_pair: TranslationLanguagePair,
+        language_pair: LanguagePair,
         terminology: Arc<CompiledTerminology>,
         placeholder_service: Pcre2PlaceholderService,
         custom_placeholders: CompiledPlaceholderRules,
@@ -75,7 +72,9 @@ impl ResolvedTranslationSemantics {
     pub(crate) fn for_test() -> Self {
         use std::num::NonZeroUsize;
 
-        use crate::language::{JapaneseLanguageModule, JapaneseResidualPolicy};
+        use crate::language::{
+            JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguagePair,
+        };
 
         let placeholder_service = Pcre2PlaceholderService::new().expect("测试内建占位符应可编译");
         let custom_placeholders = placeholder_service
@@ -88,7 +87,10 @@ impl ResolvedTranslationSemantics {
         ));
         Self::new(
             "test system".to_owned(),
-            TranslationLanguagePair::new("ja", "zh-Hans"),
+            LanguagePair::new(
+                LanguageId::parse("ja").expect("测试源语言应合法"),
+                LanguageId::parse("zh-Hans").expect("测试目标语言应合法"),
+            ),
             Arc::new(CompiledTerminology::empty()),
             placeholder_service,
             custom_placeholders,
@@ -101,7 +103,7 @@ impl ResolvedTranslationSemantics {
         &self.system_prompt
     }
 
-    pub(crate) fn language_pair(&self) -> &TranslationLanguagePair {
+    pub(crate) fn language_pair(&self) -> &LanguagePair {
         &self.language_pair
     }
 

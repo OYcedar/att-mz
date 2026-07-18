@@ -5,7 +5,6 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
@@ -25,19 +24,19 @@ use super::arguments::{
     ExtractArguments, InitArguments, MzCommand, TranslateArguments, WriteBackArguments,
 };
 
-use crate::att_mz::ProjectName;
 use crate::att_mz::extract::builtin::BuiltInExtractionConfig;
 use crate::att_mz::extract::document::MzDocumentReadingConfig;
 use crate::att_mz::extract::rules::RulesExtractionConfig;
 use crate::att_mz::extract::store::asset_store::MzExtractionAssetStoreConfig;
 use crate::att_mz::lua::json::HostValueBudget;
 use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
-use crate::att_mz::translate::profile::MzTranslationExecutionConfiguration;
+use crate::att_mz::translate::profile::MzTranslationRequestConfiguration;
 use crate::att_mz::translate::result_store::MzStandardTranslationResultStorageConfig;
+use crate::att_mz::{ENGINE_DIRECTORY_NAME, ProjectName};
 use crate::language::{
     EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
-    JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageModule,
-    LanguageModuleCatalog, QuotePair,
+    JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageId,
+    LanguageModule, LanguageModuleCatalog, QuotePair,
 };
 use crate::runtime::cpu::CpuExecutorConfig;
 use crate::runtime::filesystem::{
@@ -56,13 +55,12 @@ use crate::runtime::sqlite::{
 const MAX_CONFIGURATION_BYTES: u64 = 4 * 1024 * 1024;
 const RESERVED_REQUEST_BODY_FIELDS: [&str; 3] = ["model", "messages", "stream"];
 
-/// 根据命令行选择配置文件位置。
+/// 根据命令行显式路径选择配置文件位置。
 ///
-/// 显式相对路径以当前工作目录解析；没有显式路径时使用 APPDATA 下的固定位置。
+/// 相对路径以当前工作目录解析。
 pub(crate) fn resolve_configuration_path(
-    explicit: Option<&Path>,
+    explicit: &Path,
     current_directory: &Path,
-    app_data: Option<&OsStr>,
 ) -> Result<PathBuf, ConfigurationPathError> {
     if !current_directory.is_absolute() {
         return Err(ConfigurationPathError::CurrentDirectoryNotAbsolute(
@@ -70,24 +68,10 @@ pub(crate) fn resolve_configuration_path(
         ));
     }
 
-    if let Some(explicit) = explicit {
-        if explicit.as_os_str().is_empty() {
-            return Err(ConfigurationPathError::EmptyExplicitPath);
-        }
-        return Ok(resolve_path(current_directory, explicit));
+    if explicit.as_os_str().is_empty() {
+        return Err(ConfigurationPathError::EmptyExplicitPath);
     }
-
-    let app_data = app_data.ok_or(ConfigurationPathError::MissingAppData)?;
-    if app_data.is_empty() {
-        return Err(ConfigurationPathError::EmptyAppData);
-    }
-    let app_data = Path::new(app_data);
-    if !app_data.is_absolute() {
-        return Err(ConfigurationPathError::AppDataNotAbsolute(
-            app_data.to_path_buf(),
-        ));
-    }
-    Ok(app_data.join("ATT").join("config.toml"))
+    Ok(resolve_path(current_directory, explicit))
 }
 
 /// 读取配置，并且只建立本次命令实际消费的受信配置。
@@ -158,6 +142,7 @@ pub(crate) fn load_configuration(
         source,
         command,
     )
+    .map_err(|error| error.with_configuration_path(&configuration_path))
 }
 
 /// 四个互斥命令各自拥有且只拥有现实消费的配置。
@@ -253,15 +238,26 @@ impl ConfiguredMzCommand {
                             .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
                     })
                     .transpose()?;
-                let (mz, llm_client_id) =
-                    TranslateConfiguration::build(configuration_directory, raw.mz, &profile_id)
-                        .map_err(ConfigurationLoadError::InvalidValue)?;
+                validate_exact_identifier("命令行 PROFILE_ID", &profile_id)
+                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                let selected_profile =
+                    parse_selected_translation_profile(source, configuration_path, &profile_id)?;
+                let llm_client_id = selected_profile.llm_client.clone();
                 let raw_client =
                     parse_selected_llm_client(source, configuration_path, &llm_client_id)?;
                 let client = Arc::new(
                     build_llm_client(format!("llm.clients.{llm_client_id}").as_str(), raw_client)
                         .map_err(ConfigurationLoadError::InvalidValue)?,
                 );
+                let mz = TranslateConfiguration::build(
+                    configuration_directory,
+                    raw.prompts,
+                    raw.languages,
+                    raw.mz,
+                    selected_profile,
+                    client,
+                )
+                .map_err(ConfigurationLoadError::InvalidValue)?;
                 Ok(Self::Translate(Box::new(ConfiguredTranslateCommand {
                     project_name: project.name,
                     terminology_path: terms,
@@ -270,7 +266,6 @@ impl ConfiguredMzCommand {
                     cpu,
                     llm,
                     lua,
-                    client,
                     mz,
                 })))
             }
@@ -423,7 +418,6 @@ pub(crate) struct ConfiguredTranslateCommand {
     cpu: CpuExecutorConfig,
     llm: SelectedLlmExecutorConfiguration,
     lua: Option<SelectedLuaConfiguration>,
-    client: Arc<OpenAiChatCompletionClient>,
     mz: TranslateConfiguration,
 }
 
@@ -456,8 +450,9 @@ impl ConfiguredTranslateCommand {
         self.lua.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) const fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
-        &self.client
+        self.mz.client()
     }
 
     pub(crate) const fn mz(&self) -> &TranslateConfiguration {
@@ -580,7 +575,10 @@ fn build_directory_publisher_configuration(
     raw: RawDirectoryPublisherConfiguration,
 ) -> Result<DirectoryPublisherConfig, ConfigurationValueError> {
     DirectoryPublisherConfig::new(
-        projects_root.join(".att-locks").join("directory-publish"),
+        projects_root
+            .join(".att-locks")
+            .join("directory-publish")
+            .join(ENGINE_DIRECTORY_NAME),
         usize_value(
             "runtime.filesystem.publisher.max_recovery_artifacts_per_target",
             raw.max_recovery_artifacts_per_target,
@@ -836,40 +834,32 @@ impl ExtractConfiguration {
 pub(crate) struct TranslateConfiguration {
     standard_asset: MzStandardAssetReadingConfig,
     translate_store: MzStandardTranslationResultStorageConfig,
-    languages: Vec<toml::Value>,
+    prompt_root: PathBuf,
+    language_modules: LanguageModuleCatalog,
     profile: TranslationProfileConfiguration,
+    client: Arc<OpenAiChatCompletionClient>,
 }
 
 impl TranslateConfiguration {
     fn build(
         configuration_directory: &Path,
+        raw_prompts: RawPromptsConfiguration,
+        raw_languages: Vec<RawLanguageConfiguration>,
         raw: RawTranslateMzSelection,
-        profile_id: &str,
-    ) -> Result<(Self, String), ConfigurationValueError> {
-        validate_exact_identifier("命令行 PROFILE_ID", profile_id)?;
-        let selected_profile = select_named_table(
-            "mz.translation_profiles",
-            &raw.translation_profiles,
-            profile_id,
-        )?;
-        let selected_profile: RawSelectedTranslationProfileConfiguration = selected_profile
-            .clone()
-            .try_into()
-            .map_err(|_| invalid("mz.translation_profiles", "所选 Profile 结构或字段类型无效"))?;
-        let (profile, llm_client_id) = build_selected_translation_profile(
-            configuration_directory,
-            "mz.translation_profiles",
-            selected_profile,
-        )?;
-        Ok((
-            Self {
-                standard_asset: build_standard_asset_configuration(raw.standard_asset)?,
-                translate_store: build_translation_store_configuration(raw.translate.store)?,
-                languages: raw.languages,
-                profile,
-            },
-            llm_client_id,
-        ))
+        selected_profile: RawSelectedTranslationProfileConfiguration,
+        client: Arc<OpenAiChatCompletionClient>,
+    ) -> Result<Self, ConfigurationValueError> {
+        Ok(Self {
+            standard_asset: build_standard_asset_configuration(raw.standard_asset)?,
+            translate_store: build_translation_store_configuration(raw.translate.store)?,
+            prompt_root: checked_path("prompts.root", configuration_directory, raw_prompts.root)?,
+            language_modules: build_language_modules(raw_languages)?,
+            profile: build_selected_translation_profile(
+                "mz.translation_profiles",
+                selected_profile,
+            )?,
+            client,
+        })
     }
 
     pub(crate) const fn standard_asset(&self) -> MzStandardAssetReadingConfig {
@@ -884,19 +874,16 @@ impl TranslateConfiguration {
         &self.profile
     }
 
-    /// 只建立项目当前源语言需要的模块；其他语言条目保持未解释。
-    pub(crate) fn language_modules_for(
-        &self,
-        source_language: &str,
-    ) -> Result<LanguageModuleCatalog, ConfigurationValueError> {
-        validate_exact_identifier("项目 source_language", source_language)?;
-        let selected = select_named_table("mz.languages", &self.languages, source_language)?;
-        let raw: RawLanguageConfiguration = selected
-            .clone()
-            .try_into()
-            .map_err(|_| invalid("mz.languages", "所选语言模块结构或字段类型无效"))?;
-        let (catalog, _) = build_language_modules(vec![raw])?;
-        Ok(catalog)
+    pub(crate) fn prompt_root(&self) -> &Path {
+        &self.prompt_root
+    }
+
+    pub(crate) const fn language_modules(&self) -> &LanguageModuleCatalog {
+        &self.language_modules
+    }
+
+    pub(crate) const fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
+        &self.client
     }
 }
 
@@ -976,33 +963,10 @@ fn build_translation_store_configuration(
     ))
 }
 
-#[derive(Clone)]
-pub(crate) struct TranslationSystemConfiguration {
-    source_language: String,
-    target_language: String,
-    markdown_path: PathBuf,
-}
-
-impl TranslationSystemConfiguration {
-    pub(crate) fn source_language(&self) -> &str {
-        &self.source_language
-    }
-
-    pub(crate) fn target_language(&self) -> &str {
-        &self.target_language
-    }
-
-    pub(crate) fn markdown_path(&self) -> &Path {
-        &self.markdown_path
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TranslationPlanningConfiguration {
     scope_concurrency: NonZeroUsize,
     max_message_characters: NonZeroUsize,
-    configuration_directory: PathBuf,
-    systems: Vec<toml::Value>,
 }
 
 impl TranslationPlanningConfiguration {
@@ -1013,74 +977,14 @@ impl TranslationPlanningConfiguration {
     pub(crate) const fn max_message_characters(&self) -> NonZeroUsize {
         self.max_message_characters
     }
-
-    /// 只解释项目当前语言对对应的 system；其他条目不会阻止本次命令。
-    pub(crate) fn system_for(
-        &self,
-        source_language: &str,
-        target_language: &str,
-    ) -> Result<TranslationSystemConfiguration, ConfigurationValueError> {
-        let mut selected = None;
-        for candidate in &self.systems {
-            let Some(table) = candidate.as_table() else {
-                continue;
-            };
-            let Some(candidate_source) = table.get("source_language").and_then(toml::Value::as_str)
-            else {
-                continue;
-            };
-            let Some(candidate_target) = table.get("target_language").and_then(toml::Value::as_str)
-            else {
-                continue;
-            };
-            if candidate_source != source_language || candidate_target != target_language {
-                continue;
-            }
-            if selected.replace(candidate).is_some() {
-                return Err(invalid(
-                    "mz.translation_profiles.planning.systems",
-                    "当前项目语言对的 system 重复",
-                ));
-            }
-        }
-        let selected = selected.ok_or_else(|| {
-            invalid(
-                "mz.translation_profiles.planning.systems",
-                format!("没有当前项目语言对 {source_language} -> {target_language} 的 system"),
-            )
-        })?;
-        let raw: RawTranslationSystemConfiguration = selected.clone().try_into().map_err(|_| {
-            invalid(
-                "mz.translation_profiles.planning.systems",
-                "当前项目语言对的 system 结构或字段类型无效",
-            )
-        })?;
-        validate_exact_identifier(
-            "mz.translation_profiles.planning.systems.source_language",
-            &raw.source_language,
-        )?;
-        validate_exact_identifier(
-            "mz.translation_profiles.planning.systems.target_language",
-            &raw.target_language,
-        )?;
-        Ok(TranslationSystemConfiguration {
-            source_language: raw.source_language,
-            target_language: raw.target_language,
-            markdown_path: checked_path(
-                "mz.translation_profiles.planning.systems.path",
-                &self.configuration_directory,
-                raw.path,
-            )?,
-        })
-    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TranslationProfileConfiguration {
     id: String,
     max_in_flight_tasks: NonZeroUsize,
     planning: TranslationPlanningConfiguration,
-    execution: MzTranslationExecutionConfiguration,
+    request: MzTranslationRequestConfiguration,
 }
 
 impl TranslationProfileConfiguration {
@@ -1096,18 +1000,18 @@ impl TranslationProfileConfiguration {
         &self.planning
     }
 
-    pub(crate) const fn execution(&self) -> &MzTranslationExecutionConfiguration {
-        &self.execution
+    pub(crate) const fn request(&self) -> &MzTranslationRequestConfiguration {
+        &self.request
     }
 }
 
 fn build_language_modules(
     raw_languages: Vec<RawLanguageConfiguration>,
-) -> Result<(LanguageModuleCatalog, BTreeSet<String>), ConfigurationValueError> {
-    let mut bindings = Vec::<(String, Arc<dyn LanguageModule>)>::new();
+) -> Result<LanguageModuleCatalog, ConfigurationValueError> {
+    let mut bindings = Vec::<(LanguageId, Arc<dyn LanguageModule>)>::new();
     let mut language_ids = BTreeSet::new();
     for (index, raw) in raw_languages.into_iter().enumerate() {
-        let field = format!("mz.languages[{index}]");
+        let field = format!("languages[{index}]");
         let (id, module): (String, Arc<dyn LanguageModule>) = match raw {
             RawLanguageConfiguration::Japanese {
                 id,
@@ -1178,61 +1082,50 @@ fn build_language_modules(
                 )
             }
         };
-        if !language_ids.insert(id.clone()) {
+        let id = LanguageId::parse(&id)
+            .map_err(|source| invalid(format!("{field}.id").as_str(), source.to_string()))?;
+        if !language_ids.insert(id.as_str().to_owned()) {
             return Err(invalid(field.as_str(), format!("源语言 ID 重复：{id}")));
         }
         bindings.push((id, module));
     }
 
     let catalog = LanguageModuleCatalog::new(bindings)
-        .map_err(|source| invalid("mz.languages", source.to_string()))?;
-    Ok((catalog, language_ids))
+        .map_err(|source| invalid("languages", source.to_string()))?;
+    Ok(catalog)
 }
 
 fn build_selected_translation_profile(
-    configuration_directory: &Path,
     field: &str,
     raw: RawSelectedTranslationProfileConfiguration,
-) -> Result<(TranslationProfileConfiguration, String), ConfigurationValueError> {
+) -> Result<TranslationProfileConfiguration, ConfigurationValueError> {
     validate_exact_identifier(format!("{field}.id").as_str(), &raw.id)?;
     validate_exact_identifier(format!("{field}.llm_client").as_str(), &raw.llm_client)?;
-    if raw.planning.systems.is_empty() {
-        return Err(invalid(
-            format!("{field}.planning.systems").as_str(),
-            "系统提示词列表不能为空",
-        ));
-    }
-    let llm_client_id = raw.llm_client;
-    Ok((
-        TranslationProfileConfiguration {
-            id: raw.id,
-            max_in_flight_tasks: non_zero_usize(
-                format!("{field}.max_in_flight_tasks").as_str(),
-                raw.max_in_flight_tasks,
+    Ok(TranslationProfileConfiguration {
+        id: raw.id,
+        max_in_flight_tasks: non_zero_usize(
+            format!("{field}.max_in_flight_tasks").as_str(),
+            raw.max_in_flight_tasks,
+        )?,
+        planning: TranslationPlanningConfiguration {
+            scope_concurrency: non_zero_usize(
+                format!("{field}.planning.scope_concurrency").as_str(),
+                raw.planning.scope_concurrency,
             )?,
-            planning: TranslationPlanningConfiguration {
-                scope_concurrency: non_zero_usize(
-                    format!("{field}.planning.scope_concurrency").as_str(),
-                    raw.planning.scope_concurrency,
-                )?,
-                max_message_characters: non_zero_usize(
-                    format!("{field}.planning.max_message_characters").as_str(),
-                    raw.planning.max_message_characters,
-                )?,
-                configuration_directory: configuration_directory.to_path_buf(),
-                systems: raw.planning.systems,
-            },
-            execution: MzTranslationExecutionConfiguration::new(
-                raw.execution
-                    .network_retry_delays_ms
-                    .into_iter()
-                    .map(Duration::from_millis)
-                    .collect(),
-                Duration::from_millis(raw.execution.max_network_retry_after_ms),
-            ),
+            max_message_characters: non_zero_usize(
+                format!("{field}.planning.max_message_characters").as_str(),
+                raw.planning.max_message_characters,
+            )?,
         },
-        llm_client_id,
-    ))
+        request: MzTranslationRequestConfiguration::new(
+            raw.execution
+                .network_retry_delays_ms
+                .into_iter()
+                .map(Duration::from_millis)
+                .collect(),
+            Duration::from_millis(raw.execution.max_network_retry_after_ms),
+        ),
+    })
 }
 
 fn build_llm_client(
@@ -1516,9 +1409,6 @@ fn invalid(field: &str, message: impl Into<String>) -> ConfigurationValueError {
 pub(crate) enum ConfigurationPathError {
     CurrentDirectoryNotAbsolute(PathBuf),
     EmptyExplicitPath,
-    MissingAppData,
-    EmptyAppData,
-    AppDataNotAbsolute(PathBuf),
 }
 
 impl fmt::Display for ConfigurationPathError {
@@ -1528,11 +1418,6 @@ impl fmt::Display for ConfigurationPathError {
                 write!(formatter, "当前工作目录不是绝对路径：{}", path.display())
             }
             Self::EmptyExplicitPath => formatter.write_str("--config 路径不能为空"),
-            Self::MissingAppData => formatter.write_str("未设置 APPDATA，无法定位默认配置文件"),
-            Self::EmptyAppData => formatter.write_str("APPDATA 为空，无法定位默认配置文件"),
-            Self::AppDataNotAbsolute(path) => {
-                write!(formatter, "APPDATA 不是绝对路径：{}", path.display())
-            }
         }
     }
 }
@@ -1565,8 +1450,26 @@ pub(crate) enum ConfigurationLoadError {
     InvalidToml {
         path: PathBuf,
         location: Option<SourceLocation>,
+        resource: String,
+        reason: &'static str,
     },
     InvalidValue(ConfigurationValueError),
+    InvalidValueAtPath {
+        path: PathBuf,
+        source: ConfigurationValueError,
+    },
+}
+
+impl ConfigurationLoadError {
+    fn with_configuration_path(self, path: &Path) -> Self {
+        match self {
+            Self::InvalidValue(source) => Self::InvalidValueAtPath {
+                path: path.to_path_buf(),
+                source,
+            },
+            other => other,
+        }
+    }
 }
 
 impl fmt::Display for ConfigurationLoadError {
@@ -1602,18 +1505,26 @@ impl fmt::Display for ConfigurationLoadError {
                     error_len.map_or_else(|| "未知".to_owned(), |length| length.to_string())
                 )
             }
-            Self::InvalidToml { path, location } => {
-                write!(formatter, "配置文件 {} 不是有效 TOML", path.display())?;
+            Self::InvalidToml {
+                path,
+                location,
+                resource,
+                reason,
+            } => {
+                write!(formatter, "{}", path.display())?;
                 if let Some(location) = location {
-                    write!(
-                        formatter,
-                        "（第 {} 行，第 {} 列）",
-                        location.line, location.column
-                    )?;
+                    write!(formatter, ":{}:{}", location.line, location.column)?;
                 }
-                formatter.write_str("：语法、结构或字段类型不符合当前配置契约")
+                write!(formatter, "：{resource}：{reason}")
             }
             Self::InvalidValue(source) => write!(formatter, "配置值无效：{source}"),
+            Self::InvalidValueAtPath { path, source } => {
+                write!(
+                    formatter,
+                    "配置文件 {}：配置值无效：{source}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -1622,7 +1533,7 @@ impl Error for ConfigurationLoadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Open { source, .. } | Self::Read { source, .. } => Some(source),
-            Self::InvalidValue(source) => Some(source),
+            Self::InvalidValue(source) | Self::InvalidValueAtPath { source, .. } => Some(source),
             Self::NotAFile { .. }
             | Self::TooLarge { .. }
             | Self::InvalidUtf8 { .. }
@@ -1658,9 +1569,19 @@ fn validate_top_level(source: &str, path: &Path) -> Result<(), ConfigurationLoad
         _runtime,
         _observability,
         _llm,
+        _prompts,
+        _languages,
         _mz,
     } = raw;
-    let _ = (_projects, _runtime, _observability, _llm, _mz);
+    let _ = (
+        _projects,
+        _runtime,
+        _observability,
+        _llm,
+        _prompts,
+        _languages,
+        _mz,
+    );
     Ok(())
 }
 
@@ -1672,11 +1593,115 @@ where
 }
 
 fn invalid_toml(path: &Path, source: &str, error: &toml::de::Error) -> ConfigurationLoadError {
-    let location = error.span().map(|span| source_location(source, span.start));
+    let span = error.span();
+    let location = span
+        .as_ref()
+        .map(|span| source_location(source, span.start));
+    let (resource, reason) = safe_toml_diagnostic(source, span.as_ref(), error.message());
     ConfigurationLoadError::InvalidToml {
         path: path.to_path_buf(),
         location,
+        resource,
+        reason,
     }
+}
+
+/// 从 TOML/Serde 错误中只提取字段身份和失败类别。
+///
+/// 不保留原始错误文本，因为 `invalid type` 等 Serde 诊断可能嵌入实际字符串值。
+/// 资源名只由 TOML 表头、赋值左侧或 Serde 报告的字段名组成。
+fn safe_toml_diagnostic(
+    source: &str,
+    span: Option<&std::ops::Range<usize>>,
+    message: &str,
+) -> (String, &'static str) {
+    let (reported_field, reason) = if message.starts_with("missing field ") {
+        (
+            backticked_field_after(message, "missing field "),
+            "缺少必填字段",
+        )
+    } else if message.starts_with("unknown field ") {
+        (
+            backticked_field_after(message, "unknown field "),
+            "当前配置契约不接受该字段",
+        )
+    } else if message.starts_with("duplicate field ") {
+        (
+            backticked_field_after(message, "duplicate field "),
+            "字段重复",
+        )
+    } else if message.starts_with("invalid type:") {
+        (None, "字段类型不符合当前配置契约")
+    } else if message.starts_with("invalid value:") || message.starts_with("unknown variant ") {
+        (None, "字段值不符合当前配置契约")
+    } else if message.contains("duplicate key") {
+        (None, "TOML 字段或表重复")
+    } else {
+        (None, "TOML 语法无效")
+    };
+
+    let offset = span.map_or(source.len(), |span| span.start.min(source.len()));
+    let assignment_field = assignment_field_at(source, offset);
+    let field = reported_field.or(assignment_field.as_deref());
+    let table = table_path_at(source, offset);
+    let resource = match (table.as_deref(), field) {
+        (Some(table), Some(field)) if table == field || table.ends_with(&format!(".{field}")) => {
+            table.to_owned()
+        }
+        (Some(table), Some(field)) => format!("{table}.{field}"),
+        (None, Some(field)) => field.to_owned(),
+        (Some(table), None) => table.to_owned(),
+        (None, None) => "TOML 文档".to_owned(),
+    };
+    (resource, reason)
+}
+
+fn backticked_field_after<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
+    let remainder = message.strip_prefix(prefix)?;
+    let field = remainder.strip_prefix('`')?.split_once('`')?.0;
+    safe_toml_key_path(field).then_some(field)
+}
+
+fn assignment_field_at(source: &str, offset: usize) -> Option<String> {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = source[offset..]
+        .find('\n')
+        .map_or(source.len(), |index| offset + index);
+    let line = source.get(line_start..line_end)?.trim();
+    let field = line.split_once('=')?.0.trim();
+    safe_toml_key_path(field).then(|| field.to_owned())
+}
+
+fn table_path_at(source: &str, offset: usize) -> Option<String> {
+    let offset = offset.min(source.len());
+    let line_end = source[offset..]
+        .find('\n')
+        .map_or(source.len(), |index| offset + index);
+    source[..line_end].lines().rev().find_map(|line| {
+        let line = line.trim();
+        let table = line
+            .strip_prefix("[[")
+            .and_then(|value| value.strip_suffix("]]"))
+            .or_else(|| {
+                line.strip_prefix('[')
+                    .and_then(|value| value.strip_suffix(']'))
+            })?
+            .trim();
+        safe_toml_key_path(table).then(|| table.to_owned())
+    })
+}
+
+fn safe_toml_key_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.split('.').all(|part| {
+            !part.is_empty()
+                && part.len() <= 128
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
 }
 
 fn parse_lua_configuration(
@@ -1736,28 +1761,478 @@ fn select_optional_scan_concurrency(
     )?))
 }
 
-fn select_named_table<'a>(
-    field: &str,
-    candidates: &'a [toml::Value],
+fn parse_selected_translation_profile(
+    source: &str,
+    path: &Path,
     requested_id: &str,
-) -> Result<&'a toml::Value, ConfigurationValueError> {
-    let mut selected = None;
-    for candidate in candidates {
-        let Some(id) = candidate
-            .as_table()
-            .and_then(|table| table.get("id"))
-            .and_then(toml::Value::as_str)
-        else {
-            continue;
-        };
-        if id != requested_id {
-            continue;
+) -> Result<RawSelectedTranslationProfileConfiguration, ConfigurationLoadError> {
+    let index_deserializer = toml::de::Deserializer::parse(source)
+        .map_err(|error| invalid_toml(path, source, &error))?;
+    let selection = TranslationProfileIndexTopSeed { requested_id }
+        .deserialize(index_deserializer)
+        .map_err(|error| invalid_toml(path, source, &error))?
+        .unwrap_or_default();
+    if selection.duplicate {
+        return Err(ConfigurationLoadError::InvalidValue(invalid(
+            "mz.translation_profiles",
+            format!("ID 重复：{requested_id}"),
+        )));
+    }
+    let selected_index = selection.selected_index.ok_or_else(|| {
+        ConfigurationLoadError::InvalidValue(invalid(
+            "mz.translation_profiles",
+            format!("没有 ID 为 {requested_id} 的条目"),
+        ))
+    })?;
+
+    let profile_deserializer = toml::de::Deserializer::parse(source)
+        .map_err(|error| invalid_toml(path, source, &error))?;
+    SelectedTranslationProfileTopSeed { selected_index }
+        .deserialize(profile_deserializer)
+        .map_err(|error| invalid_toml(path, source, &error))?
+        .ok_or_else(|| {
+            ConfigurationLoadError::InvalidValue(invalid(
+                "mz.translation_profiles",
+                "所选 Profile 结构或字段类型无效",
+            ))
+        })
+}
+
+#[derive(Default)]
+struct TranslationProfileIndexSelection {
+    selected_index: Option<usize>,
+    duplicate: bool,
+}
+
+struct TranslationProfileIndexTopSeed<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for TranslationProfileIndexTopSeed<'_> {
+    type Value = Option<TranslationProfileIndexSelection>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(TranslationProfileIndexTopVisitor {
+            requested_id: self.requested_id,
+        })
+    }
+}
+
+struct TranslationProfileIndexTopVisitor<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for TranslationProfileIndexTopVisitor<'_> {
+    type Value = Option<TranslationProfileIndexSelection>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ATT 顶层 TOML 配置")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen_mz = false;
+        let mut selection = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "mz" {
+                if seen_mz {
+                    return Err(de::Error::duplicate_field("mz"));
+                }
+                seen_mz = true;
+                selection = map.next_value_seed(TranslationProfileIndexMzSeed {
+                    requested_id: self.requested_id,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
         }
-        if selected.replace(candidate).is_some() {
-            return Err(invalid(field, format!("ID 重复：{requested_id}")));
+        Ok(selection)
+    }
+}
+
+struct TranslationProfileIndexMzSeed<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for TranslationProfileIndexMzSeed<'_> {
+    type Value = Option<TranslationProfileIndexSelection>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(TranslationProfileIndexMzVisitor {
+            requested_id: self.requested_id,
+        })
+    }
+}
+
+struct TranslationProfileIndexMzVisitor<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for TranslationProfileIndexMzVisitor<'_> {
+    type Value = Option<TranslationProfileIndexSelection>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MZ 配置")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen_profiles = false;
+        let mut selection = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "translation_profiles" {
+                if seen_profiles {
+                    return Err(de::Error::duplicate_field("translation_profiles"));
+                }
+                seen_profiles = true;
+                selection = Some(map.next_value_seed(TranslationProfileIndexSequenceSeed {
+                    requested_id: self.requested_id,
+                })?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(selection)
+    }
+}
+
+struct TranslationProfileIndexSequenceSeed<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for TranslationProfileIndexSequenceSeed<'_> {
+    type Value = TranslationProfileIndexSelection;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(TranslationProfileIndexSequenceVisitor {
+            requested_id: self.requested_id,
+        })
+    }
+}
+
+struct TranslationProfileIndexSequenceVisitor<'a> {
+    requested_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for TranslationProfileIndexSequenceVisitor<'_> {
+    type Value = TranslationProfileIndexSelection;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MZ translation profile 数组")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut selection = TranslationProfileIndexSelection::default();
+        let mut index = 0usize;
+        while let Some(id) = sequence.next_element_seed(TranslationProfileIdSeed)? {
+            if id.as_deref() == Some(self.requested_id)
+                && selection.selected_index.replace(index).is_some()
+            {
+                selection.duplicate = true;
+            }
+            index += 1;
+        }
+        Ok(selection)
+    }
+}
+
+struct TranslationProfileIdSeed;
+
+impl<'de> DeserializeSeed<'de> for TranslationProfileIdSeed {
+    type Value = Option<String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(TranslationProfileIdVisitor)
+    }
+}
+
+struct TranslationProfileIdVisitor;
+
+impl<'de> Visitor<'de> for TranslationProfileIdVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("只读取 id 的 MZ translation profile")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen_id = false;
+        let mut id = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "id" {
+                if seen_id {
+                    return Err(de::Error::duplicate_field("id"));
+                }
+                seen_id = true;
+                id = map.next_value_seed(OptionalStringSeed)?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(id)
+    }
+}
+
+struct OptionalStringSeed;
+
+impl<'de> DeserializeSeed<'de> for OptionalStringSeed {
+    type Value = Option<String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(OptionalStringVisitor)
+    }
+}
+
+struct OptionalStringVisitor;
+
+impl<'de> Visitor<'de> for OptionalStringVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("字符串或未选择的任意 TOML 值")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Some(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(Some(value))
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+}
+
+struct SelectedTranslationProfileTopSeed {
+    selected_index: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SelectedTranslationProfileTopSeed {
+    type Value = Option<RawSelectedTranslationProfileConfiguration>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SelectedTranslationProfileTopVisitor {
+            selected_index: self.selected_index,
+        })
+    }
+}
+
+struct SelectedTranslationProfileTopVisitor {
+    selected_index: usize,
+}
+
+impl<'de> Visitor<'de> for SelectedTranslationProfileTopVisitor {
+    type Value = Option<RawSelectedTranslationProfileConfiguration>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ATT 顶层 TOML 配置")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen_mz = false;
+        let mut selected = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "mz" {
+                if seen_mz {
+                    return Err(de::Error::duplicate_field("mz"));
+                }
+                seen_mz = true;
+                selected = map.next_value_seed(SelectedTranslationProfileMzSeed {
+                    selected_index: self.selected_index,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(selected)
+    }
+}
+
+struct SelectedTranslationProfileMzSeed {
+    selected_index: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SelectedTranslationProfileMzSeed {
+    type Value = Option<RawSelectedTranslationProfileConfiguration>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SelectedTranslationProfileMzVisitor {
+            selected_index: self.selected_index,
+        })
+    }
+}
+
+struct SelectedTranslationProfileMzVisitor {
+    selected_index: usize,
+}
+
+impl<'de> Visitor<'de> for SelectedTranslationProfileMzVisitor {
+    type Value = Option<RawSelectedTranslationProfileConfiguration>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MZ 配置")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen_profiles = false;
+        let mut selected = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "translation_profiles" {
+                if seen_profiles {
+                    return Err(de::Error::duplicate_field("translation_profiles"));
+                }
+                seen_profiles = true;
+                selected = map.next_value_seed(SelectedTranslationProfileSequenceSeed {
+                    selected_index: self.selected_index,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(selected)
+    }
+}
+
+struct SelectedTranslationProfileSequenceSeed {
+    selected_index: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for SelectedTranslationProfileSequenceSeed {
+    type Value = Option<RawSelectedTranslationProfileConfiguration>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(SelectedTranslationProfileSequenceVisitor {
+            selected_index: self.selected_index,
+        })
+    }
+}
+
+struct SelectedTranslationProfileSequenceVisitor {
+    selected_index: usize,
+}
+
+impl<'de> Visitor<'de> for SelectedTranslationProfileSequenceVisitor {
+    type Value = Option<RawSelectedTranslationProfileConfiguration>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MZ translation profile 数组")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut selected = None;
+        let mut index = 0usize;
+        while let Some(profile) =
+            sequence.next_element_seed(SelectedTranslationProfileCandidateSeed {
+                selected: index == self.selected_index,
+            })?
+        {
+            if profile.is_some() {
+                selected = profile;
+            }
+            index += 1;
+        }
+        Ok(selected)
+    }
+}
+
+struct SelectedTranslationProfileCandidateSeed {
+    selected: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for SelectedTranslationProfileCandidateSeed {
+    type Value = Option<RawSelectedTranslationProfileConfiguration>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if self.selected {
+            RawSelectedTranslationProfileConfiguration::deserialize(deserializer).map(Some)
+        } else {
+            IgnoredAny::deserialize(deserializer).map(|_| None)
         }
     }
-    selected.ok_or_else(|| invalid(field, format!("没有 ID 为 {requested_id} 的条目")))
 }
 
 fn parse_selected_llm_client(
@@ -1938,6 +2413,10 @@ struct RawTopLevelSyntax {
     _observability: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "prompts")]
+    _prompts: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
     #[serde(default, rename = "mz")]
     _mz: Option<IgnoredAny>,
 }
@@ -1950,6 +2429,10 @@ struct RawCommonConfiguration {
     observability: RawObservabilityConfiguration,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "prompts")]
+    _prompts: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
     #[serde(default, rename = "mz")]
     _mz: Option<IgnoredAny>,
 }
@@ -1964,6 +2447,10 @@ struct RawInitSelection {
     _observability: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "prompts")]
+    _prompts: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
     #[serde(default, rename = "mz")]
     _mz: Option<IgnoredAny>,
 }
@@ -1979,12 +2466,18 @@ struct RawExtractSelection {
     _observability: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "prompts")]
+    _prompts: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTranslateSelection {
     runtime: RawTranslateRuntimeSelection,
+    prompts: RawPromptsConfiguration,
+    languages: Vec<RawLanguageConfiguration>,
     mz: RawTranslateMzSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
@@ -2005,6 +2498,10 @@ struct RawWriteBackSelection {
     _observability: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "prompts")]
+    _prompts: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2017,6 +2514,10 @@ struct RawLuaSelection {
     _observability: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "prompts")]
+    _prompts: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
     #[serde(default, rename = "mz")]
     _mz: Option<IgnoredAny>,
 }
@@ -2126,8 +2627,6 @@ struct RawExtractMzSelection {
     _standard_asset: Option<IgnoredAny>,
     #[serde(default, rename = "translate")]
     _translate: Option<IgnoredAny>,
-    #[serde(default, rename = "languages")]
-    _languages: Option<IgnoredAny>,
     #[serde(default, rename = "translation_profiles")]
     _translation_profiles: Option<IgnoredAny>,
 }
@@ -2137,8 +2636,8 @@ struct RawExtractMzSelection {
 struct RawTranslateMzSelection {
     standard_asset: RawMzStandardAssetConfiguration,
     translate: RawMzTranslateConfiguration,
-    languages: Vec<toml::Value>,
-    translation_profiles: Vec<toml::Value>,
+    #[serde(rename = "translation_profiles")]
+    _translation_profiles: IgnoredAny,
     #[serde(default, rename = "document")]
     _document: Option<IgnoredAny>,
     #[serde(default, rename = "extract")]
@@ -2154,10 +2653,14 @@ struct RawWriteBackMzSelection {
     _extract: Option<IgnoredAny>,
     #[serde(default, rename = "translate")]
     _translate: Option<IgnoredAny>,
-    #[serde(default, rename = "languages")]
-    _languages: Option<IgnoredAny>,
     #[serde(default, rename = "translation_profiles")]
     _translation_profiles: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptsConfiguration {
+    root: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -2411,15 +2914,6 @@ struct RawSelectedTranslationProfileConfiguration {
 struct RawSelectedTranslationPlanningConfiguration {
     scope_concurrency: u64,
     max_message_characters: u64,
-    systems: Vec<toml::Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTranslationSystemConfiguration {
-    source_language: String,
-    target_language: String,
-    path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -2448,7 +2942,6 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use clap::Parser;
     use secrecy::ExposeSecret;
 
     use super::*;
@@ -2470,22 +2963,34 @@ mod tests {
     }
 
     #[test]
-    fn explicit_and_default_configuration_paths_use_their_declared_bases() {
+    fn explicit_configuration_path_uses_current_directory_as_its_base() {
         let current = absolute_test_path("cwd");
-        let app_data = absolute_test_path("appdata");
         assert_eq!(
-            resolve_configuration_path(
-                Some(Path::new("settings/att.toml")),
-                &current,
-                Some(app_data.as_os_str()),
-            )
-            .expect("显式配置路径应合法"),
+            resolve_configuration_path(Path::new("settings/att.toml"), &current)
+                .expect("显式配置路径应合法"),
             current.join("settings/att.toml")
         );
         assert_eq!(
-            resolve_configuration_path(None, &current, Some(app_data.as_os_str()))
-                .expect("默认配置路径应合法"),
-            app_data.join("ATT/config.toml")
+            resolve_configuration_path(&absolute_test_path("explicit.toml"), &current)
+                .expect("绝对配置路径应保持不变"),
+            absolute_test_path("explicit.toml")
+        );
+    }
+
+    #[test]
+    fn directory_publisher_lock_root_is_namespaced_by_engine() {
+        let projects_root = absolute_test_path("projects");
+        let configured = build_directory_publisher_configuration(
+            &projects_root,
+            RawDirectoryPublisherConfiguration {
+                max_recovery_artifacts_per_target: 1,
+                target_lock_timeout_ms: 1,
+            },
+        )
+        .expect("目录发布配置应合法");
+        assert_eq!(
+            configured.lock_directory(),
+            projects_root.join(".att-locks/directory-publish/mz")
         );
     }
 
@@ -2591,82 +3096,262 @@ mod tests {
         );
     }
 
-    #[test]
-    fn translate_ignores_unselected_client_profile_and_language() {
-        let directory = TestDirectory::new();
-        let source = format!(
-            "{}\n[llm.clients.unused]\nurl = []\napi_key = []\nmodel = []\ntimeout_ms = []\nrpm = []\nburst = []\nparameters = []\n\n[[mz.translation_profiles]]\nid = \"unused\"\nllm_client = []\nmax_in_flight_tasks = []\nplanning = []\nexecution = []\n\n[[mz.languages]]\ntype = \"english\"\nid = \"unused\"\nminimum_word_count = \"invalid\"\n",
+    fn configuration_with_unselected_profile_sentinel(sentinel: &str) -> String {
+        format!(
+            r#"{}
+[llm.clients.unused]
+url = []
+api_key = []
+model = []
+timeout_ms = []
+rpm = []
+burst = []
+parameters = []
+
+[[mz.translation_profiles]]
+llm_client = ["{sentinel}"]
+max_in_flight_tasks = {{ secret = "{sentinel}" }}
+planning = ["{sentinel}"]
+execution = ["{sentinel}"]
+private_secret = "{sentinel}"
+id = "unused"
+"#,
             include_str!("../../config.example.toml")
-        );
+        )
+    }
+
+    #[test]
+    fn translate_streams_past_unselected_client_and_profile_without_materializing_values() {
+        const SENTINEL: &str = "UNSELECTED_PROFILE_SECRET_SENTINEL";
+        let directory = TestDirectory::new();
+        let source = configuration_with_unselected_profile_sentinel(SENTINEL);
         let path = directory.write("translate.toml", &source);
         let ConfiguredMzCommand::Translate(configured) =
             load_configuration(&path, translate_command(false, "primary"))
-                .expect("无关客户端、Profile 和语言条目不应阻止本次翻译")
+                .expect("无关客户端和 Profile 不应阻止本次翻译")
         else {
             panic!("应建立 Translate 配置");
         };
         configured
             .mz()
-            .language_modules_for("ja")
-            .expect("只应建立当前源语言模块");
+            .language_modules()
+            .resolve(&LanguageId::parse("ja").expect("测试语言应合法"))
+            .expect("应建立日语模块");
         configured
             .mz()
-            .profile()
-            .planning()
-            .system_for("ja", "zh-Hans")
-            .expect("只应建立当前语言对的 system");
+            .language_modules()
+            .resolve(&LanguageId::parse("en").expect("测试语言应合法"))
+            .expect("应建立英语模块");
         assert_eq!(configured.client().model(), "replace-with-model-id");
         assert_eq!(
             configured.client().api_key().expose_secret(),
             "replace-with-api-key"
         );
+        let profile_debug = format!("{:?}", configured.mz().profile());
+        assert!(profile_debug.contains("primary"));
+        assert!(!profile_debug.contains(SENTINEL));
     }
 
     #[test]
-    fn translate_defers_language_and_system_validation_to_actual_project_facts() {
+    fn unselected_profile_secret_never_enters_configuration_diagnostics() {
+        const SENTINEL: &str = "UNSELECTED_PROFILE_DIAGNOSTIC_SENTINEL";
         let directory = TestDirectory::new();
-        let invalid_unselected_system = include_str!("../../config.example.toml").replace(
-            "[mz.translation_profiles.execution]",
-            "[[mz.translation_profiles.planning.systems]]\nsource_language = \"en\"\ntarget_language = \"zh-Hans\"\npath = []\n\n[mz.translation_profiles.execution]",
-        );
-        let path = directory.write("unselected-system.toml", &invalid_unselected_system);
-        let ConfiguredMzCommand::Translate(configured) =
-            load_configuration(&path, translate_command(false, "primary"))
-                .expect("未命中当前语言对的 system 不应提前解释")
-        else {
-            panic!("应建立 Translate 配置");
-        };
-        configured
-            .mz()
-            .profile()
-            .planning()
-            .system_for("ja", "zh-Hans")
-            .expect("当前语言对应使用自己的合法 system");
-        assert!(
-            configured
-                .mz()
-                .profile()
-                .planning()
-                .system_for("en", "zh-Hans")
-                .is_err(),
-            "当项目实际命中该 system 时必须严格拒绝错误类型"
-        );
-
-        let invalid_selected_language = include_str!("../../config.example.toml").replace(
+        let source = configuration_with_unselected_profile_sentinel(SENTINEL).replacen(
             "minimum_kana_characters = 1",
-            "minimum_kana_characters = \"invalid\"",
+            "minimum_kana_characters = 0",
+            1,
         );
-        let path = directory.write("selected-language.toml", &invalid_selected_language);
+        let path = directory.write("invalid-language-with-unselected-profile.toml", &source);
+        let error = match load_configuration(&path, translate_command(false, "primary")) {
+            Ok(_) => panic!("无效语言策略必须拒绝"),
+            Err(error) => error,
+        };
+
+        let mut diagnostics = format!("{error:?}\n{error}");
+        let mut source = error.source();
+        while let Some(error) = source {
+            diagnostics.push_str(format!("\n{error:?}\n{error}").as_str());
+            source = error.source();
+        }
+        assert!(!diagnostics.contains(SENTINEL));
+    }
+
+    #[test]
+    fn translate_validates_the_complete_global_language_catalog() {
+        let directory = TestDirectory::new();
+        let source = format!(
+            "{}\n[[languages]]\ntype = \"english\"\nid = \"fr\"\nminimum_word_count = \"invalid\"\n",
+            include_str!("../../config.example.toml")
+        );
+        let path = directory.write("invalid-language.toml", &source);
+        assert!(
+            load_configuration(&path, translate_command(false, "primary")).is_err(),
+            "Translate 必须在执行前验证全部语言条目"
+        );
+    }
+
+    #[test]
+    fn prompt_root_is_resolved_from_the_configuration_directory() {
+        let directory = TestDirectory::new();
+        let path = directory.write("config.toml", include_str!("../../config.example.toml"));
         let ConfiguredMzCommand::Translate(configured) =
             load_configuration(&path, translate_command(false, "primary"))
-                .expect("配置读取时还不知道项目实际源语言")
+                .expect("示例 Translate 配置应合法")
         else {
             panic!("应建立 Translate 配置");
         };
-        assert!(
-            configured.mz().language_modules_for("ja").is_err(),
-            "打开项目后命中的语言模块必须严格校验"
+        let expected = path
+            .canonicalize()
+            .expect("测试配置应可规范化")
+            .parent()
+            .expect("规范配置路径应有父目录")
+            .join("prompts");
+        assert_eq!(configured.mz().prompt_root(), expected);
+    }
+
+    #[test]
+    fn selected_profile_rejects_unknown_planning_fields() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml").replace(
+            "max_message_characters = 24000",
+            "max_message_characters = 24000\nunexpected_field = []",
         );
+        let path = directory.write("unknown-planning-field.toml", &source);
+        assert!(
+            load_configuration(&path, translate_command(false, "primary")).is_err(),
+            "所选 Profile 的 planning 表必须严格拒绝未知字段"
+        );
+    }
+
+    #[test]
+    fn translate_rejects_every_missing_consumed_configuration_field() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml").replace("\r\n", "\n");
+        let cases = [
+            (
+                "prompts-root",
+                source.replacen("root = \"prompts\"\n", "", 1),
+            ),
+            (
+                "languages",
+                remove_configuration_range(&source, "[[languages]]", "[[mz.translation_profiles]]"),
+            ),
+            ("profile-id", source.replacen("id = \"primary\"\n", "", 1)),
+            (
+                "profile-client",
+                source.replacen("llm_client = \"primary\"\n", "", 1),
+            ),
+            (
+                "profile-max-in-flight",
+                source.replacen("max_in_flight_tasks = 4\n", "", 1),
+            ),
+            (
+                "planning-scope-concurrency",
+                source.replacen("scope_concurrency = 4\n", "", 1),
+            ),
+            (
+                "planning-max-message-characters",
+                source.replacen("max_message_characters = 24000\n", "", 1),
+            ),
+            (
+                "execution-network-retry-delays",
+                source.replacen("network_retry_delays_ms = [500, 1500, 5000]\n", "", 1),
+            ),
+            (
+                "execution-max-network-retry-after",
+                source.replacen("max_network_retry_after_ms = 30000\n", "", 1),
+            ),
+        ];
+
+        for (name, source) in cases {
+            let path = directory.write(format!("missing-{name}.toml").as_str(), &source);
+            assert!(
+                load_configuration(&path, translate_command(false, "primary")).is_err(),
+                "Translate 消费的必填项 {name} 缺失时必须显式失败"
+            );
+        }
+    }
+
+    #[test]
+    fn toml_diagnostics_identify_missing_unknown_and_mistyped_fields_without_values() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml").replace("\r\n", "\n");
+        let cases = [
+            (
+                "selected-profile-missing",
+                source.replacen("llm_client = \"primary\"\n", "", 1),
+                "mz.translation_profiles.llm_client",
+                "缺少必填字段",
+                None,
+            ),
+            (
+                "missing",
+                source.replacen("root = \"prompts\"\n", "", 1),
+                "prompts.root",
+                "缺少必填字段",
+                None,
+            ),
+            (
+                "unknown",
+                source.replacen(
+                    "[prompts]\n",
+                    "[prompts]\nunexpected_prompt_field = \"UNKNOWN_VALUE_SENTINEL\"\n",
+                    1,
+                ),
+                "prompts.unexpected_prompt_field",
+                "当前配置契约不接受该字段",
+                Some("UNKNOWN_VALUE_SENTINEL"),
+            ),
+            (
+                "type",
+                source.replacen(
+                    "max_active_requests = 8",
+                    "max_active_requests = \"TYPE_VALUE_SENTINEL\"",
+                    1,
+                ),
+                "runtime.llm.max_active_requests",
+                "字段类型不符合当前配置契约",
+                Some("TYPE_VALUE_SENTINEL"),
+            ),
+            (
+                "secret-type",
+                source.replacen(
+                    "api_key = \"replace-with-api-key\"",
+                    "api_key = [\"API_KEY_TYPE_SENTINEL\"]",
+                    1,
+                ),
+                "llm.clients.primary.api_key",
+                "字段类型不符合当前配置契约",
+                Some("API_KEY_TYPE_SENTINEL"),
+            ),
+        ];
+
+        for (name, source, expected_resource, expected_reason, forbidden_value) in cases {
+            let path = directory.write(format!("diagnostic-{name}.toml").as_str(), &source);
+            let error = match load_configuration(&path, translate_command(false, "primary")) {
+                Ok(_) => panic!("无效配置必须失败"),
+                Err(error) => error,
+            };
+            let diagnostic = error.to_string();
+            let canonical_path = path.canonicalize().expect("测试配置应可规范化");
+
+            assert!(
+                diagnostic.starts_with(canonical_path.display().to_string().as_str()),
+                "诊断必须以配置路径开始：{diagnostic}"
+            );
+            assert!(diagnostic.contains(expected_resource), "{diagnostic}");
+            assert!(diagnostic.contains(expected_reason), "{diagnostic}");
+            if let Some(value) = forbidden_value {
+                assert!(
+                    !diagnostic.contains(value),
+                    "诊断不得回显原始值：{diagnostic}"
+                );
+                assert!(
+                    !format!("{error:?}").contains(value),
+                    "Debug 诊断不得回显原始值"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2680,17 +3365,11 @@ mod tests {
         assert!(load_configuration(&path, translate_command(false, "primary")).is_err());
 
         let duplicate_language = format!(
-            "{}\n[[mz.languages]]\nid = \"ja\"\n",
+            "{}\n[[languages]]\ntype = \"japanese\"\nid = \"JA\"\nminimum_kana_characters = 1\nallowed_terms = []\nquote_repair_pairs = []\n",
             include_str!("../../config.example.toml")
         );
         let path = directory.write("duplicate-language.toml", &duplicate_language);
-        let ConfiguredMzCommand::Translate(configured) =
-            load_configuration(&path, translate_command(false, "primary"))
-                .expect("语言 ID 只在项目语言已知后选择")
-        else {
-            panic!("应建立 Translate 配置");
-        };
-        assert!(configured.mz().language_modules_for("ja").is_err());
+        assert!(load_configuration(&path, translate_command(false, "primary")).is_err());
     }
 
     #[test]
@@ -2852,6 +3531,9 @@ mod tests {
     }
 
     fn parse_command<const N: usize>(arguments: [&str; N]) -> MzCommand {
+        let arguments = ["att", "--config", "config.toml"]
+            .into_iter()
+            .chain(arguments.into_iter().skip(1));
         let parsed = AttArguments::try_parse_from(arguments).expect("测试命令应合法");
         let ProductCommand::Mz { command } = parsed.product;
         command
@@ -2913,6 +3595,15 @@ max_record_bytes = 1
 max_file_bytes = 1
 retained_rotated_files = 0
 "#
+    }
+
+    fn remove_configuration_range(source: &str, start: &str, end: &str) -> String {
+        let start_offset = source.find(start).expect("测试配置应包含起始标记");
+        let relative_end = source[start_offset..]
+            .find(end)
+            .expect("测试配置应包含结束标记");
+        let end_offset = start_offset + relative_end;
+        format!("{}{}", &source[..start_offset], &source[end_offset..])
     }
 
     struct TestDirectory {

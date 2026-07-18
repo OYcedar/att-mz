@@ -5,7 +5,7 @@
 ## 1. 用户入口与固定执行顺序
 
 ```text
-att mz translate --name NAME PROFILE_ID
+att --config FILE mz translate --name NAME PROFILE_ID
     [--terms TERMS_JSON]
     [--placeholders PLACEHOLDERS_JSON]
     [--lua SCRIPT_LUA]
@@ -30,11 +30,13 @@ CLI 只建立命令参数事实，不读取这些文件，也不在命令行重�
 `TranslateService` 的顺序固定为：
 
 ```text
-精确选择一次 Profile
+解析全局语言目录、Prompt 根并精确选择一次 MZ Profile
         ↓
 持久化 run_started 并取得项目租约
         ↓
 打开项目并复核来源指纹、schema 与 owner freshness
+        ↓
+从 metadata 取得 LanguagePair，精确解析源语言模块与 MZ Prompt
         ↓
 StandardTranslationService
         ↓ 正常结束且传入 --lua
@@ -47,7 +49,7 @@ LuaTranslationService
 `source_snapshot_fingerprint` 必须等于 metadata；任一 owner stale 时返回
 `ExtractionOutOfDate`，不读取部分新鲜资产继续翻译。
 
-Standard 的 Complete、Partial 与 Unavailable 都是正常业务结果；尚有未翻译原文时仍继续显式传入的 Lua。只有不可恢复请求错误、CPU/语言/内部不变量故障、SQLite 终态错误或强审计失败等技术错误才立即停止并阻止 Lua。Standard 与 Lua 使用配置边界一次选中的同一个不可变 Profile 快照；顶层不重读配置、不猜测提交范围，也不回滚下层已经确认提交的结果。
+Standard 的 Complete、Partial 与 Unavailable 都是正常业务结果；尚有未翻译原文时仍继续显式传入的 Lua。只有不可恢复请求错误、CPU/语言/内部不变量故障、SQLite 终态错误或强审计失败等技术错误才立即停止并阻止 Lua。Standard 与 Lua 使用配置边界一次选中的同一个 Client 和解析后的翻译语义；只有 Standard 消费 MZ Profile 的 planning、request 与任务并发策略。顶层不重读配置、不猜测提交范围，也不回滚下层已经确认提交的结果。
 
 正常完成时 CLI 返回退出码 0、stderr 为空，并输出 Standard 的任务、写入和剩余摘要；传入 Lua 时额外显示 Lua 已执行。Partial 或 Unavailable 不伪装成“全部翻译完成”，也不升级为失败退出码。技术错误继续返回退出码 1。
 
@@ -55,6 +57,11 @@ Standard 的 Complete、Partial 与 Unavailable 都是正常业务结果；尚�
 
 ```mermaid
 flowchart TD
+    ROOT["ProductionMzCommandRunner"] --> TS
+    ROOT --> RESOLVE["MZ 翻译资源精确解析"]
+    RESOLVE --> CATALOG["LanguageModuleCatalog"]
+    RESOLVE --> FR["SystemFileSystem<br/>FileReader"]
+    RESOLVE --> RES["ResolvedMzTranslationResources<br/>LanguagePair + MzSystemPrompt + 源语言模块"]
     TS --> LEASE["ProjectCommandLeaseService"]
     LEASE --> FLEASE["SystemFileSystem<br/>ExclusiveFileLeaseProvider"]
     TS --> AUDIT["MzAuditLedger<br/>audit.jsonl"]
@@ -62,9 +69,10 @@ flowchart TD
     TS["TranslateService"] --> ST["StandardTranslationService"]
     TS --> LT["LuaTranslationService"]
     TS --> OPEN["ExistingProjectOpeningService"]
-    OPEN --> PR["ProjectDatabaseRecordReadingService"]
+    OPEN --> PR["att_mz::project_database<br/>ProjectDatabaseRecordReadingService"]
     OPEN --> FP["SourceSnapshotFingerprint"]
     FP --> FPFS["SystemFileSystem<br/>DirectoryTreeFingerprinter"]
+    TS --> RES
 
     ST --> AR["MzStandardTranslationAssetReadingService"]
     ST --> PL["MzStandardTranslationTaskPlanningService"]
@@ -75,17 +83,12 @@ flowchart TD
     AR --> SQ["RusqliteStorage<br/>SqliteQueryExecutor"]
     AR --> CPU["BoundedCpuExecutor<br/>CpuTaskExecutor"]
 
-    PL --> RR["TranslationResourceResolvingService"]
-    PL --> LANG["LanguageModuleCatalog<br/>crate 级共享领域模块"]
+    PL --> LANG["同一 Arc&lt;dyn LanguageModule&gt;<br/>crate 级共享领域模块"]
     PL --> PH["Pcre2PlaceholderService"]
     PL --> STATE["TranslationStateFingerprint"]
     PL --> DEDUP["TranslationDeduplication<br/>纯 CPU 领域模块"]
     PL --> CPU
-    RR --> FR["SystemFileSystem<br/>FileReader"]
-    RR --> CPU
-
-    LANG --> JA["JapaneseLanguageModule"]
-    LANG --> EN["EnglishLanguageModule"]
+    RES --> LANG
 
     EX --> LLM["公共 LlmRequestExecutor 契约<br/>OpenAiChatCompletionExecutor"]
     EX --> DELAY["TokioAsyncDelay<br/>AsyncDelay"]
@@ -112,26 +115,42 @@ flowchart TD
 ## 3. Profile、公共 Client 与外部配置
 
 外部 MZ Profile 只保存公共 `llm.clients` 目录中的精确 `llm_client` ID。按命令配置
-边界只解析 CLI 指定的 Profile、其 Client 和实际语言对，验证引用后直接构造同一个
-`Arc<TranslationExecutionProfile>` 与 `OpenAiChatCompletionClient`。Standard 与 Lua
-直接接收这些受信值。Profile ID 精确匹配，不 trim、不折叠大小写、不提供别名或默认项。
+边界解析完整全局语言目录、CLI 指定的 Profile 及其 Client，验证引用后构造
+`MzTranslationProfile<OpenAiChatCompletionClient>`。Profile ID 精确匹配，不 trim、
+不折叠大小写、不提供别名或默认项。打开项目后再从 metadata 取得权威
+`LanguagePair`，精确选择源语言模块并读取对应的 MZ Prompt。
 
-MZ 受信载荷按职责分组：
+Profile 与项目相关的解析资源保持不同所有权：
 
 ```text
-MzTranslationExecutionPayload<L>
+MzTranslationProfile<L>
+├─ id
+├─ max_in_flight_tasks
 ├─ planning
 │  ├─ scope_concurrency
-│  ├─ max_message_characters
-│  └─ 精确语言对 → 完整 system Markdown
-├─ execution
+│  └─ max_message_characters
+├─ request
 │  ├─ network_retry_delays
 │  └─ max_network_retry_after
 └─ llm_client
    └─ 公共 LLM 根直接消费的受信 Client L
+
+ResolvedMzTranslationResources
+├─ 精确 LanguagePair
+├─ MzSystemPrompt
+└─ Arc<dyn LanguageModule>
 ```
 
-外层 Profile 继续持有非零 `max_in_flight_tasks`。资产解码、结果编码、日英译前判定与残留策略，以及可选的日文引号修复候选也分别要求外部显式传入自己的并发、批量、阈值或规则配置。
+Prompt 不属于 Profile。路径固定为
+`<prompts.root>/mz/<source>--<target>.md`，其中两个标签均为项目 metadata 的规范
+`LanguageId`。只接受该精确路径上的普通 UTF-8 非空白文件，不做大小写、父语言或默认
+Prompt 回退。Standard 消费完整 Profile 与解析资源；Lua 只接收同一个 Client、
+`LanguagePair`、`MzSystemPrompt` 和语言语义，不获得 planning、request 或任务并发配置。
+
+资产解码、结果编码、日英译前判定与残留策略，以及可选的日文引号修复候选也分别要求
+外部显式传入自己的并发、批量、阈值或规则配置。全局 `LanguageModuleCatalog` 以规范
+`LanguageId` 为 key，Translate 必须完整验证目录，规范化后重复或实际源语言缺少模块均
+显式失败。
 
 所有有意义的资源和策略选择遵循同一规则：
 
@@ -139,7 +158,7 @@ MzTranslationExecutionPayload<L>
 - 不实现 `Default`，不提供隐式配置构造路径；
 - 模块不读取配置文件、环境变量或全局单例；
 - 模块不探测 CPU 核数，也不根据数据量自行改写并发或容量；
-- system Markdown 完整来自精确语言对配置，业务代码不补写隐藏提示词；
+- system Markdown 完整来自精确语言对 Prompt 文件，业务代码不补写隐藏提示词；
 - URL、固定 Bearer API key、model、timeout、RPM/burst 与严格 JSON parameters 属于公共 LLM Client 配置。
 
 固定的业务顺序、Builtin 控制符集合、语义范围、严格响应协议和事务承诺不是调优项，不转化为可选配置。
@@ -306,12 +325,16 @@ LanguageText
 
 `NaturalText` 是可以分析和修复的自然文本；`OpaqueBoundary` 表示调用方已经保护的内容。模块既看不到 token，也看不到被保护的原值。英文单词不能跨 opaque 边界拼接；同一翻译单元中的日文引号结构可以跨该边界继续配对。模块返回的 `LanguageRepairPlan` 只能描述 `NaturalText` 内经过验证且互不重叠的字符替换，不能删除、移动或改写 opaque 内容。
 
-`LanguageModuleCatalog` 只保存“外部精确源语言 ID → 同一个不可变 `LanguageModule` 实例”：
+共享 `LanguageId` 对每个外部标签执行 RFC 5646 解析、IANA 注册表校验和
+canonicalization；合法大小写变体进入内部时立即规范化，首尾空白、下划线、非法或
+未注册子标签以及主语言 `und` 被拒绝。`LanguagePair` 直接承载两个规范 ID。
 
-- ID 不 trim、不折叠大小写，不猜测别名，也没有默认模块；
-- 外部可以显式把多个精确 ID 绑定到同一实例；
+`LanguageModuleCatalog` 只保存“规范源语言 ID → 一个不可变 `LanguageModule` 实例”：
+
+- 规范化后重复 ID 直接失败，不猜测别名，也没有默认模块；
 - Catalog 不存在目标语言分支；
-- Planner 与 ResponseProcessor 直接复用同一个 Catalog 和同一个模块；
+- Catalog 只在配置解析阶段按源 `LanguageId` 精确选择一次模块；
+- Planner 与 ResponseProcessor 直接复用解析结果中的同一个 `Arc<dyn LanguageModule>`；
 - 分析类型与所选模块不匹配属于内部不变量破坏，而不是普通译文拒绝。
 
 当前语言目录包含两个模块：
@@ -329,7 +352,7 @@ LanguageText
 
 源文或译文不配对、数量变化、嵌套变化、出现多种合法映射，或者需要跨不同翻译 ID 才能成对时，一律原样保留译文。这是“没有执行可选修复”，不会形成拒绝、Unavailable 或技术错误。
 
-目标语言 ID 仍然用于项目 metadata、精确语言对 system Markdown、TaskBlock 语言事实和告诉模型翻译目标；它不再对应目标语言模块。空白、BOM、换行、JSON、ID 和占位符完整性都是通用协议或文本职责，不伪装成任何具体语言能力。
+目标 `LanguageId` 仍然用于项目 metadata、精确语言对 MZ Prompt、TaskBlock 语言事实和告诉模型翻译目标；它不对应目标语言模块。空白、BOM、换行、JSON、ID 和占位符完整性都是通用协议或文本职责，不伪装成任何具体语言能力。
 
 ### 6.4 逐叶 translation state
 
@@ -496,7 +519,7 @@ Lua 是用户明确选择并完全信任的本机程序，不建立沙箱。`Tru
 
 Host 在公共 `project/json/source/mz/db` 之外注入 Translate 专属的 `translation` 与
 `llm`；`extract`、`output`、`write_back` 为 nil。`ctx.translation.system_prompt` 和
-`language_pair` 暴露本次受信 Profile 事实，`prepare` 直接复用 Rust 的术语触发、
+`language_pair` 暴露本次已解析的 MZ 翻译语义，`prepare` 直接复用 Rust 的术语触发、
 占位符保护、语言分析和逐叶 state 计算。
 
 `prepare` 返回 `PreparedText`，脚本通过 `status` 判断 Current、NotApplicable 或
@@ -530,10 +553,13 @@ Cancelled 还是 worker panic，都必须产生执行与清理报告并恰好一
 | `JsonLinesAuditLog` | MZ Audit Ledger 使用的通用追加、轮转与刷盘机制 |
 | `TrustedLua54Runtime` | `TrustedLuaRuntimeExecutor` |
 
-`ProductionMzCommandRunner` 在选中 Profile 后取得其已经验证的 `llm_client`，只读取
-该 Profile 的提示词与全局 PEM，并构造上表中本命令实际需要的根。Standard 与
-Translate Lua 借用同一个 `OpenAiChatCompletionClient`，共享同一个 Executor、HTTP
-连接池、客户端限流器和同一 SQLite 预算。
+`ProductionMzCommandRunner` 在选中 Profile 后取得其已经验证的 `llm_client`，打开
+项目后按 metadata 的规范 `LanguagePair` 从全局目录精确选择源语言模块，并读取唯一
+`<prompts.root>/mz/<source>--<target>.md`。普通文件、UTF-8 与非空白校验全部通过后才
+构造上表中本命令实际需要的根；缺失或非法 Prompt 时不会开始 LLM 请求。Standard 与
+Translate Lua 借用同一个 `OpenAiChatCompletionClient` 和
+`ResolvedMzTranslationResources`，共享同一个 Executor、HTTP 连接池、客户端限流器
+和同一 SQLite 预算；Lua 不借用 MZ Profile 的 planning 或 request 策略。
 
 同项目租约覆盖项目开启、Standard、可选 Lua 和全部数据库提交；超时返回
 `ProjectBusy`。可信 Lua 通过 `os.execute` 再调用同项目 ATT 命令也不能重入该租约。

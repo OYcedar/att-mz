@@ -3,7 +3,7 @@
 //! Windows x64 生产进程边界的 MZ 纵向黑盒测试。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -55,6 +55,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     fs::create_dir(&projects_root).expect("项目根应可建立");
     fs::create_dir(&logs_root).expect("日志根应可建立");
     fs::create_dir(&prompt_root).expect("提示词目录应可建立");
+    fs::create_dir(prompt_root.join("mz")).expect("MZ 提示词目录应可建立");
     write_minimal_mz_game(&game_root);
     write_lua_scripts(root);
 
@@ -66,12 +67,18 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     let init_stdout = assert_success("init", &init);
     assert_eq!(init_stdout, "初始化完成：e2e\n项目状态：已创建\n");
 
-    let workspace = projects_root.join(PROJECT);
+    let workspace = projects_root.join("mz").join(PROJECT);
     let database = workspace.join("project.db");
+    assert!(
+        !projects_root.join(PROJECT).exists(),
+        "不得创建未带 MZ 命名空间的旧工作区"
+    );
     assert!(workspace.join("source/data/Items.json").is_file());
     assert!(workspace.join("source/js/plugins.js").is_file());
     assert!(workspace.join("write_back/data").is_dir());
     assert!(workspace.join("write_back/js").is_dir());
+    assert_engine_lock_namespace(&projects_root, "projects");
+    assert_engine_lock_namespace(&projects_root, "directory-publish");
     assert_metadata(&database);
 
     let extract = run_att(
@@ -91,7 +98,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_extracted_database(&database);
     assert_lua_probes(&database, &["extract"]);
 
-    fs::write(prompt_root.join("ja-zh.md"), SYSTEM_PROMPT).expect("系统提示词应可写入");
+    fs::write(prompt_root.join("mz/ja--zh-Hans.md"), SYSTEM_PROMPT).expect("系统提示词应可写入");
     let mut running_cancellation_server = cancellation_server.start();
     let cancelled_child = spawn_att_in_new_process_group(
         root,
@@ -316,7 +323,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     );
     assert_persisted_terminology(&database);
 
-    fs::write(prompt_root.join("ja-zh.md"), UPDATED_SYSTEM_PROMPT)
+    fs::write(prompt_root.join("mz/ja--zh-Hans.md"), UPDATED_SYSTEM_PROMPT)
         .expect("更新后的系统提示词应可写入");
     let before_profile_semantics = read_translation_leaf(&database);
     let profile_semantics_translate = run_att(
@@ -396,19 +403,20 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_write_back_lua_probe(&database, "|v2");
     assert_last_write_back_log(&logs_root, 2, true);
 
-    fs::remove_file(prompt_root.join("ja-zh.md")).expect("应删除已消费的提示词夹具");
+    fs::remove_file(prompt_root.join("mz/ja--zh-Hans.md")).expect("应删除已消费的提示词夹具");
 
     let failed = run_att(
         root,
-        arguments(&["mz", "translate", "--name", PROJECT, "missing-profile"]),
+        arguments(&["mz", "translate", "--name", PROJECT, PROFILE]),
     );
     assert_eq!(failed.status.code(), Some(1));
     assert!(failed.stdout.is_empty(), "命令失败不得打印成功文案");
-    assert_eq!(
-        String::from_utf8_lossy(&failed.stderr),
-        "配置或输入错误\n",
-        "配置失败只呈现稳定用户类别，不泄漏内部选择器诊断"
-    );
+    let failed_stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(failed_stderr.starts_with("配置或输入错误："));
+    assert!(failed_stderr.contains("ja"));
+    assert!(failed_stderr.contains("zh-Hans"));
+    assert!(failed_stderr.contains("ja--zh-Hans.md"));
+    assert_process_output_does_not_contain_client_secrets("missing prompt", &failed);
     for (phase, output) in [
         ("init", &init),
         ("extract", &extract),
@@ -437,6 +445,29 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     }
 }
 
+fn assert_engine_lock_namespace(projects_root: &Path, lock_kind: &str) {
+    let parent = projects_root.join(".att-locks").join(lock_kind);
+    let namespaces = fs::read_dir(&parent)
+        .unwrap_or_else(|error| panic!("应可列举锁命名空间 {}：{error}", parent.display()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("锁命名空间条目应可读取");
+    assert_eq!(namespaces.len(), 1, "锁根下只能存在当前 MZ 命名空间");
+    assert_eq!(namespaces[0].file_name(), OsStr::new("mz"));
+    assert!(namespaces[0].path().is_dir(), "MZ 锁命名空间应为目录");
+
+    let lock_files = fs::read_dir(namespaces[0].path())
+        .expect("应可列举 MZ 锁目录")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("MZ 锁条目应可读取");
+    assert!(!lock_files.is_empty(), "MZ 锁目录应包含生产锁文件");
+    assert!(
+        lock_files
+            .iter()
+            .all(|entry| entry.path().extension() == Some(OsStr::new("lock"))),
+        "锁文件不得创建在 MZ 命名空间之外"
+    );
+}
+
 #[test]
 fn malformed_configuration_does_not_echo_api_key() {
     let temporary = tempfile::tempdir().expect("应可建立密钥泄漏测试目录");
@@ -461,9 +492,227 @@ api_key = "{LEAK_SENTINEL}" "invalid"
     let stderr = String::from_utf8(output.stderr).expect("stderr 必须是 UTF-8");
     assert!(!stderr.is_empty(), "配置失败必须呈现诊断");
     assert!(
+        stderr.contains(&root.join("config.toml").display().to_string()),
+        "配置语法错误必须包含配置路径：{stderr}"
+    );
+    let location_prefix = format!("{}:3:", root.join("config.toml").display());
+    let location = stderr
+        .split_once(&location_prefix)
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| suffix.split('：').next())
+        .and_then(|column| column.parse::<usize>().ok())
+        .expect("配置语法错误必须包含 1-based 行列");
+    assert!(location >= 1, "配置错误列号必须从 1 开始：{stderr}");
+    assert!(
+        stderr.contains("llm.clients.leak-probe.api_key"),
+        "配置语法错误必须标明安全字段路径：{stderr}"
+    );
+    assert!(stderr.contains("TOML 语法无效"), "{stderr}");
+    assert!(
         !stderr.contains(LEAK_SENTINEL),
         "配置语法错误不得回显 API key：{stderr}"
     );
+}
+
+#[test]
+fn configuration_path_is_required_for_commands_but_not_information_actions() {
+    let temporary = tempfile::tempdir().expect("应可建立 CLI 配置边界测试目录");
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_att"))
+        .current_dir(temporary.path())
+        .args(["mz", "extract", "--name", PROJECT, "--builtin"])
+        .output()
+        .expect("att.exe 应可执行");
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--config"));
+
+    for argument in ["--help", "--version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_att"))
+            .current_dir(temporary.path())
+            .arg(argument)
+            .output()
+            .expect("ATT 信息命令应可执行");
+        assert_eq!(output.status.code(), Some(0), "{argument} 不应要求配置文件");
+    }
+}
+
+#[test]
+fn prompt_routing_uses_exact_metadata_language_pairs_and_fails_before_llm() {
+    const JA_PROJECT: &str = "prompt-ja";
+    const EN_PROJECT: &str = "prompt-en";
+    const CANONICAL_EN_US_PROJECT: &str = "canonical-en-us";
+    const JA_PROMPT: &str = "JA EXACT PROMPT";
+    const EN_PROMPT: &str = "EN EXACT PROMPT";
+    const EN_SOURCE: &str = "Healing potion";
+
+    let temporary = tempfile::tempdir().expect("应可建立 Prompt 路由测试目录");
+    let root = temporary.path();
+    let prompt_mz = root.join("prompts/mz");
+    fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
+    fs::create_dir_all(root.join("logs")).expect("日志根应可建立");
+    fs::create_dir_all(&prompt_mz).expect("MZ Prompt 根应可建立");
+
+    let ja_game = root.join("game-ja");
+    write_minimal_mz_game(&ja_game);
+    initialize_and_extract_prompt_project(root, JA_PROJECT, &ja_game, "JA", "zh-hans");
+    fs::write(prompt_mz.join("ja--zh-Hans.md"), JA_PROMPT).expect("日文 Prompt 应可写入");
+
+    let ja_server = BoundChatServer::bind();
+    write_configuration(root, ja_server.endpoint(), E2E_PARAMETERS);
+    let ja_requests = ja_server.start_for_requests(1);
+    let ja_translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", JA_PROJECT, PROFILE]),
+    );
+    assert_success("exact ja prompt", &ja_translate);
+    let ja_requests = ja_requests.finish();
+    assert_eq!(ja_requests.len(), 1);
+    assert_standard_request_semantics(&ja_requests[0], JA_PROMPT, &[SOURCE_TEXT]);
+
+    let en_game = root.join("game-en");
+    write_minimal_mz_game(&en_game);
+    write_items_source(&en_game, EN_SOURCE);
+    initialize_and_extract_prompt_project(root, EN_PROJECT, &en_game, "EN", "zh-Hans");
+    let exact_en_prompt = prompt_mz.join("en--zh-Hans.md");
+    fs::write(&exact_en_prompt, EN_PROMPT).expect("英文 Prompt 应可写入");
+
+    let en_server = BoundChatServer::bind();
+    write_configuration(root, en_server.endpoint(), E2E_PARAMETERS);
+    let en_requests = en_server.start_for_requests(1);
+    let en_translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", EN_PROJECT, PROFILE]),
+    );
+    assert_success("exact en prompt", &en_translate);
+    let en_requests = en_requests.finish();
+    assert_eq!(en_requests.len(), 1);
+    assert_standard_request_semantics(&en_requests[0], EN_PROMPT, &[EN_SOURCE]);
+
+    initialize_prompt_project(root, CANONICAL_EN_US_PROJECT, &en_game, "en-us", "zh-Hans");
+    assert_project_language_metadata(root, CANONICAL_EN_US_PROJECT, "en-US", "zh-Hans");
+    let canonical_extract = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "extract",
+            "--name",
+            CANONICAL_EN_US_PROJECT,
+            "--builtin",
+        ]),
+    );
+    assert_success("canonical en-US project extract", &canonical_extract);
+    let canonical_en_us_prompt = prompt_mz.join("en-US--zh-Hans.md");
+    for (name, content) in [
+        ("en--zh-Hans.md", EN_PROMPT),
+        ("default.md", "default fallback"),
+    ] {
+        fs::write(prompt_mz.join(name), content).expect("回退探针应可写入");
+    }
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "en-US--zh-Hans.md");
+
+    fs::create_dir(&canonical_en_us_prompt).expect("同名目录探针应可建立");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "无法读取普通文件");
+    fs::remove_dir(&canonical_en_us_prompt).expect("同名目录探针应可删除");
+
+    fs::write(&canonical_en_us_prompt, [0xff, 0xfe]).expect("非法 UTF-8 Prompt 应可写入");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "文件不是合法 UTF-8");
+
+    fs::write(&canonical_en_us_prompt, " \r\n\t").expect("空白 Prompt 应可写入");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "内容为空白");
+
+    fs::remove_file(&canonical_en_us_prompt).expect("空白 Prompt 探针应可删除");
+    let wrong_source_case = prompt_mz.join("en-us--zh-Hans.md");
+    fs::write(&wrong_source_case, "source case fallback").expect("源语言大小写探针应可写入");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "en-US--zh-Hans.md");
+    fs::remove_file(&wrong_source_case).expect("源语言大小写探针应可删除");
+
+    let wrong_target_case = prompt_mz.join("en-US--zh-hans.md");
+    fs::write(&wrong_target_case, "target case fallback").expect("目标语言大小写探针应可写入");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "en-US--zh-Hans.md");
+}
+
+fn initialize_and_extract_prompt_project(
+    root: &Path,
+    project: &str,
+    game_root: &Path,
+    source_language: &str,
+    target_language: &str,
+) {
+    initialize_prompt_project(root, project, game_root, source_language, target_language);
+    let extract = run_att(
+        root,
+        arguments(&["mz", "extract", "--name", project, "--builtin"]),
+    );
+    assert_success("prompt project extract", &extract);
+}
+
+fn initialize_prompt_project(
+    root: &Path,
+    project: &str,
+    game_root: &Path,
+    source_language: &str,
+    target_language: &str,
+) {
+    let bootstrap_server = BoundChatServer::bind();
+    write_configuration(root, bootstrap_server.endpoint(), EMPTY_PARAMETERS);
+    let init = run_att(
+        root,
+        mz_init_arguments_for(
+            game_root,
+            project,
+            source_language,
+            target_language,
+            24,
+            30,
+            40,
+        ),
+    );
+    assert_success("prompt project init", &init);
+}
+
+fn assert_project_language_metadata(
+    root: &Path,
+    project: &str,
+    source_language: &str,
+    target_language: &str,
+) {
+    let database = root
+        .join("projects")
+        .join("mz")
+        .join(project)
+        .join("project.db");
+    let connection = open_read_only(&database);
+    let actual = connection
+        .query_row(
+            "SELECT source_language, target_language FROM metadata",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("项目语言 metadata 应可读取");
+    assert_eq!(
+        actual,
+        (source_language.to_owned(), target_language.to_owned())
+    );
+}
+
+fn assert_prompt_failure_before_llm(root: &Path, project: &str, expected_diagnostic: &str) {
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), E2E_PARAMETERS);
+    let requests = server.start_observing_requests();
+    let output = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", project, PROFILE]),
+    );
+    let requests = requests.finish();
+
+    assert!(requests.is_empty(), "Prompt 失败前不得发出 LLM 请求");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("配置或输入错误："), "{stderr}");
+    assert!(stderr.contains(expected_diagnostic), "{stderr}");
+    assert_process_output_does_not_contain_client_secrets("prompt failure", &output);
 }
 
 fn arguments(values: &[&str]) -> Vec<OsString> {
@@ -480,15 +729,32 @@ fn mz_init_arguments_with_layout(
     scrolling_text: u32,
     help_description: u32,
 ) -> Vec<OsString> {
-    let mut values = arguments(&["mz", "init", "--name", PROJECT, "--path"]);
+    mz_init_arguments_for(
+        game_root,
+        PROJECT,
+        "JA",
+        "zh-hans",
+        dialogue,
+        scrolling_text,
+        help_description,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mz_init_arguments_for(
+    game_root: &Path,
+    project: &str,
+    source_language: &str,
+    target_language: &str,
+    dialogue: u32,
+    scrolling_text: u32,
+    help_description: u32,
+) -> Vec<OsString> {
+    let mut values = arguments(&["mz", "init", "--name", project, "--path"]);
     values.push(game_root.as_os_str().to_owned());
-    values.extend(arguments(&[
-        "--source-language",
-        "ja",
-        "--target-language",
-        "zh-Hans",
-        "--dialogue-max-fullwidth-chars",
-    ]));
+    values.extend(arguments(&["--source-language", source_language]));
+    values.extend(arguments(&["--target-language", target_language]));
+    values.push("--dialogue-max-fullwidth-chars".into());
     values.push(dialogue.to_string().into());
     values.push("--scrolling-text-max-fullwidth-chars".into());
     values.push(scrolling_text.to_string().into());
@@ -785,6 +1051,9 @@ fn write_configuration(root: &Path, url: &str, parameters: &str) {
         r#"[projects]
 root = "projects"
 
+[prompts]
+root = "prompts"
+
 [runtime.async]
 worker_threads = 2
 max_blocking_threads = 4
@@ -891,12 +1160,32 @@ groups_per_encode_job = 32
 encode_concurrency = 2
 leaves_per_encode_job = 32
 
-[[mz.languages]]
+[[languages]]
 type = "japanese"
 id = "ja"
 minimum_kana_characters = 1
 allowed_terms = []
 quote_repair_pairs = [["“", "”"], ["‘", "’"]]
+
+[[languages]]
+type = "english"
+id = "en"
+minimum_word_count = 1
+minimum_letter_count = 2
+ignored_terms = []
+minimum_copied_word_count = 2
+minimum_copied_letter_count = 4
+allowed_terms = []
+
+[[languages]]
+type = "english"
+id = "en-US"
+minimum_word_count = 1
+minimum_letter_count = 2
+ignored_terms = []
+minimum_copied_word_count = 2
+minimum_copied_letter_count = 4
+allowed_terms = []
 
 [[mz.translation_profiles]]
 id = "local"
@@ -906,11 +1195,6 @@ max_in_flight_tasks = 1
 [mz.translation_profiles.planning]
 scope_concurrency = 2
 max_message_characters = 10000
-
-[[mz.translation_profiles.planning.systems]]
-source_language = "ja"
-target_language = "zh-Hans"
-path = "prompts/ja-zh.md"
 
 [mz.translation_profiles.execution]
 network_retry_delays_ms = [10]
@@ -924,11 +1208,6 @@ max_in_flight_tasks = 1
 [mz.translation_profiles.planning]
 scope_concurrency = 1
 max_message_characters = 10000
-
-[[mz.translation_profiles.planning.systems]]
-source_language = "ja"
-target_language = "zh-Hans"
-path = "prompts/does-not-exist.md"
 
 [mz.translation_profiles.execution]
 network_retry_delays_ms = []
@@ -1660,6 +1939,42 @@ impl BoundChatServer {
 
     fn start_for_requests(self, expected_requests: usize) -> RunningChatServer {
         self.start_with_responses(vec![ChatResponseFixture::Standard; expected_requests])
+    }
+
+    fn start_observing_requests(self) -> RunningChatServer {
+        self.listener
+            .set_nonblocking(true)
+            .expect("本地监听器应可设为非阻塞");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (result_sender, result_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = (|| {
+                let mut requests = Vec::new();
+                while !worker_stop.load(Ordering::Acquire) {
+                    match self.listener.accept() {
+                        Ok((stream, _)) => requests.push(serve_chat_completion(
+                            stream,
+                            requests.len(),
+                            ChatResponseFixture::Standard,
+                        )?),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => {
+                            return Err(format!("Prompt 零请求探针 accept 失败：{error}"));
+                        }
+                    }
+                }
+                Ok(requests)
+            })();
+            let _ = result_sender.send(result);
+        });
+        RunningChatServer {
+            stop,
+            result_receiver,
+            worker: Some(worker),
+        }
     }
 
     fn start_with_responses(self, responses: Vec<ChatResponseFixture>) -> RunningChatServer {

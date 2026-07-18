@@ -149,12 +149,12 @@ mod tests {
     }
 
     impl TrustedLuaExecutionHost for FakeHost {
-        type TranslationProfile = ();
+        type TranslationClient = ();
         type Error = FakeError;
 
         async fn execute(
             &self,
-            invocation: LuaInvocation<Self::TranslationProfile>,
+            invocation: LuaInvocation<Self::TranslationClient>,
         ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
             let recorded = match invocation {
                 LuaInvocation::Extract {
@@ -284,8 +284,8 @@ mod tests {
             invocation.project.database_path(),
             Path::new("C:/projects/alice/project.db")
         );
-        assert_eq!(invocation.project.source_language(), "ja");
-        assert_eq!(invocation.project.target_language(), "zh-CN");
+        assert_eq!(invocation.project.source_language().as_str(), "ja");
+        assert_eq!(invocation.project.target_language().as_str(), "zh-CN");
         assert!(calls.lock().expect("Store 调用锁不应中毒").is_empty());
     }
 

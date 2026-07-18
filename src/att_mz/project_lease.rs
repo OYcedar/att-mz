@@ -5,7 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 
-use super::ProjectName;
+use super::{ENGINE_DIRECTORY_NAME, ProjectName};
 use crate::storage::file_system::{
     ExclusiveFileLease, ExclusiveFileLeaseError, ExclusiveFileLeaseProvider,
     ExclusiveFileLeaseRequest,
@@ -56,7 +56,8 @@ impl<L> ProjectCommandLeaseService<L> {
         Self {
             lock_directory: projects_root
                 .join(ATT_LOCK_DIRECTORY)
-                .join(PROJECT_LOCK_DIRECTORY),
+                .join(PROJECT_LOCK_DIRECTORY)
+                .join(ENGINE_DIRECTORY_NAME),
             lease_provider,
         }
     }
@@ -197,7 +198,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].lock_directory(),
-            std::path::Path::new("C:/att/projects/.att-locks/projects")
+            std::path::Path::new("C:/att/projects/.att-locks/projects/mz")
         );
         assert_eq!(requests[0].identity(), std::ffi::OsStr::new("游戏 One"));
         drop(lease);

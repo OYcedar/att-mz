@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 
 use crate::att_mz::project::OpenedProject;
 pub(crate) use crate::att_mz::text::StandardDataFile;
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
     DirectoryEntryKind, DirectoryLister, FileReader, ListDirectoryError, ReadFileError,
 };

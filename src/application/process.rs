@@ -4,7 +4,6 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use clap::Parser;
 use clap::error::ErrorKind;
 
 use super::arguments::AttArguments;
@@ -31,19 +30,15 @@ where
         Ok(path) => path,
         Err(error) => return render_fatal("内部技术故障", &error, stderr),
     };
-    let app_data = std::env::var_os("APPDATA");
-    let configuration_path = match resolve_configuration_path(
-        arguments.config.as_deref(),
-        &current_directory,
-        app_data.as_deref(),
-    ) {
+    let configuration_path = match resolve_configuration_path(&arguments.config, &current_directory)
+    {
         Ok(path) => path,
-        Err(error) => return render_fatal("配置或输入错误", &error, stderr),
+        Err(error) => return render_user_error("配置或输入错误", &error, stderr),
     };
     let command = arguments.product.into_mz();
     let configuration = match load_configuration(&configuration_path, command) {
         Ok(configuration) => configuration,
-        Err(error) => return render_fatal("配置或输入错误", &error, stderr),
+        Err(error) => return render_user_error("配置或输入错误", &error, stderr),
     };
     let async_runtime = configuration.common().async_runtime();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -85,11 +80,7 @@ where
         }
         (CommandRunResult::Interrupted, None) => ExitCode::from(130),
         (CommandRunResult::Interrupted, Some(shutdown)) => {
-            let _ = CommandResultRenderer::render_failure(
-                Some(&"内部技术故障"),
-                Some(&shutdown),
-                stderr,
-            );
+            let _ = CommandResultRenderer::render_failure(None, Some(&shutdown), stderr);
             ExitCode::FAILURE
         }
         (CommandRunResult::Succeeded(_), Some(shutdown)) => {
@@ -125,6 +116,15 @@ fn render_fatal(stage: &str, error: &dyn std::fmt::Display, stderr: &mut dyn Wri
     ExitCode::FAILURE
 }
 
+fn render_user_error(
+    stage: &str,
+    error: &dyn std::fmt::Display,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    let _ = writeln!(stderr, "{stage}：{error}");
+    ExitCode::FAILURE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +148,44 @@ mod tests {
         let exit = run_from(["att", "unknown"], &mut stdout, &mut stderr);
         assert_eq!(exit, ExitCode::from(2));
         assert!(!stderr.is_empty());
+
+        stdout.clear();
+        stderr.clear();
+        let exit = run_from(
+            ["att", "mz", "write-back", "--name", "demo"],
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(exit, ExitCode::from(2));
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8(stderr.clone())
+                .expect("诊断应为 UTF-8")
+                .contains("--config"),
+            "缺少配置路径应由 clap 呈现缺参错误"
+        );
+    }
+
+    #[test]
+    fn user_errors_include_safe_detail_but_internal_errors_do_not() {
+        let mut stderr = Vec::new();
+        let exit = render_user_error(
+            "配置或输入错误",
+            &"配置文件 settings.toml 第 3 行无效",
+            &mut stderr,
+        );
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(
+            String::from_utf8(stderr).expect("诊断应为 UTF-8"),
+            "配置或输入错误：配置文件 settings.toml 第 3 行无效\n"
+        );
+
+        let mut stderr = Vec::new();
+        let exit = render_fatal("内部技术故障", &"SECRET_SENTINEL", &mut stderr);
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(
+            String::from_utf8(stderr).expect("诊断应为 UTF-8"),
+            "内部技术故障\n"
+        );
     }
 }

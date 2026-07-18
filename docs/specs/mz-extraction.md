@@ -25,7 +25,7 @@ Lua（若选择）
 跨阶段的全局回滚。阶段内部的只读 I/O 和纯 CPU 工作可以有界并发，不改变这个提交
 顺序。
 
-项目按 `<projects_root>/<name>/project.db` 定位。命令先取得同项目租约，再由开启边界
+项目按 `<projects.root>/mz/<name>/project.db` 定位。命令先取得同项目租约，再由开启边界
 读取 metadata、验证受管 schema，并重新计算 `source/data + source/js` 的完整 SHA-256
 指纹。实际指纹必须等于 metadata 的 `source_snapshot_fingerprint`；否则来源已在
 Init 之外变化，Extract 在修改 owner 前失败。Builtin、Rules 和 Lua 因而共同看到
@@ -318,7 +318,7 @@ flowchart TD
     ES --> RS["RulesExtractionService"]
     ES --> LS["LuaExtractionService"]
 
-    OS --> PR["ProjectDatabaseRecordReadingService"]
+    OS --> PR["att_mz::project_database<br/>ProjectDatabaseRecordReadingService"]
     OS --> EDR["SystemFileSystem<br/>ExistingDirectoryResolver"]
     OS --> FP["SourceSnapshotFingerprint"]
     FP --> FPFS["SystemFileSystem<br/>DirectoryTreeFingerprinter"]

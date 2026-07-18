@@ -12,10 +12,10 @@ use crate::att_mz::location_codec::MzLocationCodec;
 use crate::att_mz::project::OpenedProject;
 use crate::att_mz::standard_asset::MzStandardAssetStorageKind;
 use crate::att_mz::text::{MzLocationStep, MzSource, StandardDataFile, TextGroupKind};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
-use crate::language::{LanguageAnalysis, LanguageModuleCatalog, LanguageModuleCatalogError};
+use crate::language::{LanguageAnalysis, LanguagePair};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmClientSemanticIdentity};
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
 use super::deduplication::{
     TranslationDeduplicationCandidate, TranslationDeduplicationError,
@@ -23,10 +23,7 @@ use super::deduplication::{
 };
 use super::placeholder::{Pcre2PlaceholderService, PlaceholderRuleCompilationError};
 use super::planning_resource::{CompiledTerminology, TranslationPlanningResourceReader};
-use super::profile::{
-    MzTranslationExecutionPayload, TranslationExecutionProfile,
-    TranslationProfileConfigurationError, TranslationProfileLanguagePair,
-};
+use super::profile::{MzTranslationProfile, ResolvedMzTranslationResources};
 use super::semantics::{
     PreparedTranslationAcceptance, PreparedTranslationStatus, ResolvedTranslationSemanticError,
     ResolvedTranslationSemantics,
@@ -35,15 +32,15 @@ use super::standard::{
     ExpectedTranslationOutput, StandardTranslationCorpus, StandardTranslationGroup,
     StandardTranslationInput, StandardTranslationPlan, StandardTranslationTaskIndex,
     StandardTranslationTaskPlanner, TerminologyDependency, TranslationInvalidation,
-    TranslationLanguagePair, TranslationLeafIdentity, TranslationPlanPreparation,
-    TranslationPlanPreparationCounts, TranslationPropagationTarget, TranslationStateContext,
-    TranslationTaskBlock, TranslationTaskGroup, TranslationTaskUnit, TranslationVirtualReason,
+    TranslationLeafIdentity, TranslationPlanPreparation, TranslationPlanPreparationCounts,
+    TranslationPropagationTarget, TranslationStateContext, TranslationTaskBlock,
+    TranslationTaskGroup, TranslationTaskUnit, TranslationVirtualReason,
 };
 
 /// 使用三个职责模块与 CPU 根建立确定性 MZ 翻译计划。
 pub(crate) struct MzStandardTranslationTaskPlanningService<R, C, L> {
     resources: R,
-    languages: LanguageModuleCatalog,
+    translation_resources: Arc<ResolvedMzTranslationResources>,
     placeholders: Pcre2PlaceholderService,
     cpu: C,
     llm_client: PhantomData<fn() -> L>,
@@ -52,13 +49,13 @@ pub(crate) struct MzStandardTranslationTaskPlanningService<R, C, L> {
 impl<R, C, L> MzStandardTranslationTaskPlanningService<R, C, L> {
     pub(crate) fn new(
         resources: R,
-        languages: LanguageModuleCatalog,
+        translation_resources: Arc<ResolvedMzTranslationResources>,
         placeholders: Pcre2PlaceholderService,
         cpu: C,
     ) -> Self {
         Self {
             resources,
-            languages,
+            translation_resources,
             placeholders,
             cpu,
             llm_client: PhantomData,
@@ -72,7 +69,7 @@ where
     C: CpuTaskExecutor,
     L: LlmClientSemanticIdentity + 'static,
 {
-    type Profile = Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<L>>>;
+    type Profile = Arc<MzTranslationProfile<L>>;
     type Error = MzStandardTranslationTaskPlanningError<R::Error, C::Error>;
 
     async fn plan(
@@ -82,25 +79,26 @@ where
         corpus: StandardTranslationCorpus,
         input: StandardTranslationInput,
     ) -> Result<StandardTranslationPlan, Self::Error> {
-        let language_pair = TranslationProfileLanguagePair::new(
-            project.source_language().to_owned(),
-            project.target_language().to_owned(),
-        )
-        .map_err(MzStandardTranslationTaskPlanningError::InvalidLanguagePair)?;
-        let planning = profile.payload().planning();
-        let system_markdown = planning
-            .system_markdown(&language_pair)
-            .ok_or_else(
-                || MzStandardTranslationTaskPlanningError::MissingSystemMarkdown {
-                    source_language: project.source_language().to_owned(),
-                    target_language: project.target_language().to_owned(),
+        let resolved_pair = self.translation_resources.language_pair();
+        if project.source_language() != resolved_pair.source()
+            || project.target_language() != resolved_pair.target()
+        {
+            return Err(
+                MzStandardTranslationTaskPlanningError::ResolvedLanguagePairMismatch {
+                    project_source: project.source_language().to_string(),
+                    project_target: project.target_language().to_string(),
+                    resolved_source: resolved_pair.source().to_string(),
+                    resolved_target: resolved_pair.target().to_string(),
                 },
-            )?
+            );
+        }
+        let planning = profile.planning();
+        let system_markdown = self
+            .translation_resources
+            .system_prompt()
+            .markdown()
             .to_owned();
-        let source_language = self
-            .languages
-            .resolve(project.source_language())
-            .map_err(MzStandardTranslationTaskPlanningError::Language)?;
+        let source_language = self.translation_resources.source_language();
 
         let (groups, snapshot_baseline) = corpus.into_parts();
         let current_terminology_json = snapshot_baseline.terminology_json().to_owned();
@@ -137,14 +135,13 @@ where
         let source_language_id = project.source_language().to_owned();
         let target_language_id = project.target_language().to_owned();
         let global_semantics = global_translation_semantics(
-            &source_language_id,
-            &target_language_id,
+            source_language_id.as_str(),
+            target_language_id.as_str(),
             source_language.semantic_fingerprint(),
             &system_markdown,
-            profile.payload().llm_client().semantic_fingerprint(),
+            profile.llm_client().semantic_fingerprint(),
         );
-        let task_language_pair =
-            TranslationLanguagePair::new(source_language_id.clone(), target_language_id.clone());
+        let task_language_pair = LanguagePair::new(source_language_id, target_language_id);
         let semantics = Arc::new(ResolvedTranslationSemantics::new(
             system_markdown.clone(),
             task_language_pair.clone(),
@@ -998,7 +995,7 @@ impl UnindexedTask {
     fn with_index(
         self,
         index: StandardTranslationTaskIndex,
-        language_pair: TranslationLanguagePair,
+        language_pair: LanguagePair,
     ) -> TranslationTaskBlock {
         TranslationTaskBlock::new(
             index,
@@ -1048,12 +1045,12 @@ enum ScopePreprocessingFailure<C> {
 
 #[derive(Debug)]
 pub(crate) enum MzStandardTranslationTaskPlanningError<R, C> {
-    InvalidLanguagePair(TranslationProfileConfigurationError),
-    MissingSystemMarkdown {
-        source_language: String,
-        target_language: String,
+    ResolvedLanguagePairMismatch {
+        project_source: String,
+        project_target: String,
+        resolved_source: String,
+        resolved_target: String,
     },
-    Language(LanguageModuleCatalogError),
     ReadResources(R),
     CompilePlaceholdersCompute(CpuTaskExecutionError<C>),
     InvalidPlaceholderRules(PlaceholderRuleCompilationError),
@@ -1084,15 +1081,15 @@ impl<R: fmt::Display, C: fmt::Display> fmt::Display
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidLanguagePair(source) => write!(formatter, "项目语言对无效：{source}"),
-            Self::MissingSystemMarkdown {
-                source_language,
-                target_language,
+            Self::ResolvedLanguagePairMismatch {
+                project_source,
+                project_target,
+                resolved_source,
+                resolved_target,
             } => write!(
                 formatter,
-                "Profile 未提供语言对 {source_language} -> {target_language} 的完整 system Markdown"
+                "项目语言对 {project_source} -> {project_target} 与已解析资源 {resolved_source} -> {resolved_target} 不一致"
             ),
-            Self::Language(source) => write!(formatter, "无法选择翻译语言模块：{source}"),
             Self::ReadResources(source) => write!(formatter, "无法读取翻译规划资料：{source}"),
             Self::CompilePlaceholdersCompute(source) => {
                 write!(formatter, "无法调度占位符规则编译：{source}")
@@ -1129,8 +1126,6 @@ impl<R: Error + 'static, C: Error + 'static> Error
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidLanguagePair(source) => Some(source),
-            Self::Language(source) => Some(source),
             Self::ReadResources(source) => Some(source),
             Self::CompilePlaceholdersCompute(source) => Some(source),
             Self::InvalidPlaceholderRules(source) => Some(source),
@@ -1142,7 +1137,7 @@ impl<R: Error + 'static, C: Error + 'static> Error
             Self::InvalidDeduplication(source) => Some(source),
             Self::PlanScopeCompute { source, .. } => Some(source),
             Self::InvalidScope { source, .. } => Some(source),
-            Self::MissingSystemMarkdown { .. } => None,
+            Self::ResolvedLanguagePairMismatch { .. } => None,
         }
     }
 }
@@ -1229,7 +1224,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     use crate::att_mz::text::{MzLocation, MzLocationStep};
     use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
@@ -1240,12 +1234,14 @@ mod tests {
         JsonTranslationPlanningResourceReadingService, TranslationPlanningResources,
     };
     use crate::att_mz::translate::profile::{
-        MzTranslationExecutionConfiguration, MzTranslationPlanningConfiguration,
+        MzSystemPrompt, MzTranslationPlanningConfiguration, MzTranslationProfile,
+        MzTranslationRequestConfiguration, ResolvedMzTranslationResources,
     };
     use crate::att_mz::translate::standard::StandardTranslationAsset;
     use crate::att_mz::translate::standard::TranslationTaskUnitMode;
-    use crate::language::LanguageModule;
-    use crate::language::{JapaneseLanguageModule, JapaneseResidualPolicy};
+    use crate::language::{
+        JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageModule, LanguagePair,
+    };
 
     #[derive(Clone, Copy)]
     struct ImmediateCpu;
@@ -1341,7 +1337,10 @@ mod tests {
         }
     }
 
-    fn language_catalog() -> LanguageModuleCatalog {
+    fn translation_resources_for(
+        source_language: &str,
+        target_language: &str,
+    ) -> Arc<ResolvedMzTranslationResources> {
         let module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(
                 NonZeroUsize::new(1).expect("测试残留阈值必须非零"),
@@ -1350,44 +1349,37 @@ mod tests {
             .expect("测试日文残留策略应该有效"),
             None,
         ));
-        LanguageModuleCatalog::new([("ja".to_owned(), module)]).expect("测试语言绑定应该有效")
+        let pair = LanguagePair::new(
+            LanguageId::parse(source_language).expect("测试源语言应合法"),
+            LanguageId::parse(target_language).expect("测试目标语言应合法"),
+        );
+        let prompt = MzSystemPrompt::new(pair, "# System\n完整且由外部提供。".to_owned())
+            .expect("测试 Prompt 应合法");
+        Arc::new(ResolvedMzTranslationResources::new(prompt, module))
     }
 
-    fn profile(
-        max_message_characters: usize,
-    ) -> Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<()>>> {
+    fn translation_resources() -> Arc<ResolvedMzTranslationResources> {
+        translation_resources_for("ja", "zh-Hans")
+    }
+
+    fn profile(max_message_characters: usize) -> Arc<MzTranslationProfile<()>> {
         profile_with_scope_concurrency(max_message_characters, 2)
     }
 
     fn profile_with_scope_concurrency(
         max_message_characters: usize,
         scope_concurrency: usize,
-    ) -> Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<()>>> {
-        profile_for_language_pair(max_message_characters, scope_concurrency, "ja", "zh-Hans")
-    }
-
-    fn profile_for_language_pair(
-        max_message_characters: usize,
-        scope_concurrency: usize,
-        source_language: &str,
-        target_language: &str,
-    ) -> Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<()>>> {
-        let pair = TranslationProfileLanguagePair::new(source_language, target_language)
-            .expect("测试语言对应该有效");
+    ) -> Arc<MzTranslationProfile<()>> {
         let planning = MzTranslationPlanningConfiguration::new(
             NonZeroUsize::new(scope_concurrency).expect("测试范围并发数必须非零"),
             NonZeroUsize::new(max_message_characters).expect("测试容量必须非零"),
-            [(pair, "# System\n完整且由外部提供。".to_owned())],
-        )
-        .expect("测试规划配置应该有效");
-        Arc::new(TranslationExecutionProfile::new(
+        );
+        Arc::new(MzTranslationProfile::new(
             "test",
             NonZeroUsize::new(2).expect("常量非零"),
-            MzTranslationExecutionPayload::new(
-                planning,
-                MzTranslationExecutionConfiguration::new(Vec::new(), Duration::ZERO),
-                Arc::new(()),
-            ),
+            planning,
+            MzTranslationRequestConfiguration::new(Vec::new(), std::time::Duration::ZERO),
+            Arc::new(()),
         ))
     }
 
@@ -1440,9 +1432,7 @@ mod tests {
                 .protect(TextGroupKind::DatabaseEntry, &original, &custom)
                 .expect("测试原文应可保护")
                 .into_parts();
-            let source_language = language_catalog()
-                .resolve("ja")
-                .expect("测试日文模块应存在");
+            let source_language = translation_resources().source_language();
             let global = global_translation_semantics(
                 "ja",
                 "zh-Hans",
@@ -1530,7 +1520,7 @@ mod tests {
         );
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             reader,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
@@ -1589,7 +1579,7 @@ mod tests {
     async fn unknown_backslash_sequence_reaches_the_model_request_as_natural_text() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
@@ -1622,18 +1612,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_language_only_requires_exact_system_markdown() {
+    async fn target_language_uses_the_exact_resolved_system_prompt() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources_for("ja", "zh-Hant"),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
 
         let (_, _, tasks) = planner
             .plan(
-                &project_with_languages("ja", "future-target"),
-                &profile_for_language_pair(10_000, 2, "ja", "future-target"),
+                &project_with_languages("ja", "zh-Hant"),
+                &profile_with_scope_concurrency(10_000, 2),
                 StandardTranslationCorpus::new(vec![group(
                     MzSource::data(StandardDataFile::Items),
                     1,
@@ -1648,7 +1638,7 @@ mod tests {
             .into_parts();
 
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].language_pair().target_language(), "future-target");
+        assert_eq!(tasks[0].language_pair().target().as_str(), "zh-Hant");
         assert!(
             tasks[0].expected_outputs()[0]
                 .language_analysis()
@@ -1660,7 +1650,7 @@ mod tests {
     async fn whole_maps_are_independent_semantic_scopes_even_with_large_capacity() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
@@ -1695,7 +1685,7 @@ mod tests {
         };
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             cpu,
         );
@@ -1733,7 +1723,7 @@ mod tests {
     async fn shuffled_map_groups_follow_display_event_page_list_and_command_order() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
@@ -1808,7 +1798,7 @@ mod tests {
         );
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             reader,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
@@ -1859,7 +1849,7 @@ mod tests {
     async fn global_deduplication_keeps_later_context_and_one_llm_owner() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
@@ -1915,7 +1905,7 @@ mod tests {
     async fn valid_existing_translation_reuses_without_creating_an_llm_task() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
@@ -1959,7 +1949,7 @@ mod tests {
     async fn conflicting_existing_translations_fail_before_a_plan_is_returned() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
@@ -2002,7 +1992,7 @@ mod tests {
     async fn capacity_splits_only_between_groups_inside_the_same_scope() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );
@@ -2056,7 +2046,7 @@ mod tests {
     async fn translated_or_non_source_assets_are_context_only_and_do_not_create_empty_tasks() {
         let planner = MzStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
-            language_catalog(),
+            translation_resources(),
             Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
             ImmediateCpu,
         );

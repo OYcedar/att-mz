@@ -36,6 +36,7 @@ use crate::att_mz::lua::session::{
 };
 use crate::att_mz::lua::{LuaPhase, LuaProjectContext};
 use crate::att_mz::project::ExistingProjectOpeningService;
+use crate::att_mz::project_database::ProjectDatabaseRecordReadingService;
 use crate::att_mz::project_lease::{
     ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
 };
@@ -43,11 +44,10 @@ use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
 use crate::att_mz::{ProjectName, SelectedLua};
 use crate::execution::OperationCompletion;
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
 use crate::llm::{ChatMessage, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse};
 use crate::observability::{EventId, OperationId};
-use crate::project_database::ProjectDatabaseRecordReadingService;
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
     BoundScopedDirectory, DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind,
     DirectoryLister, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
@@ -1089,8 +1089,8 @@ fn assert_successful_lua_execution(observations: &FullTreeObservations) {
         Some(workspace_root().join("write_back.att-stage").as_path())
     );
     assert_eq!(project.database_path(), database_path());
-    assert_eq!(project.source_language(), "ja");
-    assert_eq!(project.target_language(), "zh-Hans");
+    assert_eq!(project.source_language().as_str(), "ja");
+    assert_eq!(project.target_language().as_str(), "zh-Hans");
 
     assert_eq!(
         *observations
@@ -1348,7 +1348,7 @@ fn project_name() -> ProjectName {
 }
 
 fn workspace_root() -> PathBuf {
-    PathBuf::from(PROJECTS_ROOT).join(PROJECT_NAME)
+    PathBuf::from(PROJECTS_ROOT).join("mz").join(PROJECT_NAME)
 }
 
 fn database_path() -> PathBuf {

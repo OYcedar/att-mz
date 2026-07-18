@@ -1,23 +1,27 @@
 use std::error::Error;
+#[cfg(test)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
-use super::ProjectName;
 use super::project::{MaxFullwidthChars, MzWriteBackLayoutProfile};
 use super::standard_asset::MzStandardAssetOwner;
-use crate::att_mz::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
-use crate::execution::{CooperativeCancellation, OperationCompletion};
-use crate::project_database::{
+use super::{ENGINE_DIRECTORY_NAME, ProjectName};
+use crate::att_mz::project_database::{
     NewProject, ProjectDatabaseCreator, ProjectDatabaseStateReconciler, ProjectWorkspaceLayout,
     SourceSnapshotFingerprint,
 };
+use crate::att_mz::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
+use crate::execution::{CooperativeCancellation, OperationCompletion};
+use crate::language::{LanguageId, LanguagePair};
 use crate::storage::file_system::{
-    DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind, DirectoryLister,
-    DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent, DirectorySourceMapping,
-    DirectoryStageRequest, DirectoryStageRequestError, DirectoryTreeFingerprintError,
-    DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, DirectoryTreeRoot,
-    ExistingDirectoryResolver, ListDirectoryError, RecoverableDirectoryPublisher,
-    ResolveDirectoryError, StagedDirectory,
+    DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind,
+    DirectoryLister, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
+    DirectorySourceMapping, DirectoryStageRequest, DirectoryStageRequestError,
+    DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
+    DirectoryTreeRoot, ExistingDirectoryResolver, ListDirectoryError,
+    RecoverableDirectoryPublisher, ResolveDirectoryError, StagedDirectory,
 };
 use crate::storage::sqlite::{SnapshotDatabaseError, SqliteDatabaseSnapshotter};
 
@@ -26,8 +30,8 @@ use crate::storage::sqlite::{SnapshotDatabaseError, SqliteDatabaseSnapshotter};
 pub struct InitInput {
     pub name: ProjectName,
     pub game_root: PathBuf,
-    pub source_language: Option<String>,
-    pub target_language: Option<String>,
+    pub source_language: Option<LanguageId>,
+    pub target_language: Option<LanguageId>,
     pub dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
     pub scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
     pub help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
@@ -61,8 +65,8 @@ pub struct InitOutput {
 pub(crate) struct ProjectWorkspaceConvergenceRequest {
     source_game_root: PathBuf,
     name: ProjectName,
-    source_language: Option<String>,
-    target_language: Option<String>,
+    source_language: Option<LanguageId>,
+    target_language: Option<LanguageId>,
     dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
     scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
     help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
@@ -72,8 +76,8 @@ impl ProjectWorkspaceConvergenceRequest {
     pub(crate) fn new(
         source_game_root: PathBuf,
         name: ProjectName,
-        source_language: Option<String>,
-        target_language: Option<String>,
+        source_language: Option<LanguageId>,
+        target_language: Option<LanguageId>,
         dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
         scrolling_text_max_fullwidth_chars: Option<MaxFullwidthChars>,
         help_description_max_fullwidth_chars: Option<MaxFullwidthChars>,
@@ -92,8 +96,7 @@ impl ProjectWorkspaceConvergenceRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedProjectSettings {
-    source_language: String,
-    target_language: String,
+    language_pair: LanguagePair,
     layout_profile: MzWriteBackLayoutProfile,
 }
 
@@ -183,6 +186,7 @@ where
     S: SqliteDatabaseSnapshotter,
     R: ProjectDatabaseStateReconciler,
     F: ExistingDirectoryResolver
+        + DirectChildDirectoryEnsurer<Error = <F as ExistingDirectoryResolver>::Error>
         + DirectoryLister<Error = <F as ExistingDirectoryResolver>::Error>
         + DirectoryTreeFingerprinter,
     A: RecoverableDirectoryPublisher,
@@ -253,8 +257,7 @@ where
                 false
             };
             let workspace_complete = structure_matches && source_matches;
-            let settings_match = state.source_language() == settings.source_language
-                && state.target_language() == settings.target_language
+            let settings_match = state.language_pair() == &settings.language_pair
                 && state.layout_profile() == &settings.layout_profile;
             if workspace_complete && settings_match {
                 let input_fingerprint =
@@ -272,6 +275,16 @@ where
             }
         }
 
+        if self.cancellation.is_requested() {
+            return Ok(OperationCompletion::Cancelled);
+        }
+        self.file_system
+            .ensure_direct_child_directory(
+                self.projects_root.clone(),
+                OsString::from(ENGINE_DIRECTORY_NAME),
+            )
+            .await
+            .map_err(ProjectWorkspaceConvergenceError::EngineWorkspaceRoot)?;
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
@@ -325,8 +338,7 @@ where
             };
         let requested_project = NewProject::new(
             request.name,
-            settings.source_language,
-            settings.target_language,
+            settings.language_pair,
             candidate_fingerprint,
             settings.layout_profile,
         );
@@ -405,7 +417,7 @@ where
 
 fn resolve_project_settings(
     request: &ProjectWorkspaceConvergenceRequest,
-    current: Option<&crate::project_database::ProjectDatabaseState>,
+    current: Option<&crate::att_mz::project_database::ProjectDatabaseState>,
 ) -> Result<ResolvedProjectSettings, Vec<MissingInitialProjectSetting>> {
     let mut missing = Vec::new();
 
@@ -447,8 +459,10 @@ fn resolve_project_settings(
     }
 
     Ok(ResolvedProjectSettings {
-        source_language: source_language.expect("已确认源语言存在"),
-        target_language: target_language.expect("已确认目标语言存在"),
+        language_pair: LanguagePair::new(
+            source_language.expect("已确认源语言存在"),
+            target_language.expect("已确认目标语言存在"),
+        ),
         layout_profile: MzWriteBackLayoutProfile::new(
             dialogue_body.expect("已确认对话宽度存在"),
             scrolling_text.expect("已确认滚动文本宽度存在"),
@@ -651,6 +665,7 @@ pub(crate) enum ProjectWorkspaceCandidateFailure<D, S, R, P> {
 #[derive(Debug)]
 pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     SourceGameRoot(ResolveDirectoryError<E>),
+    EngineWorkspaceRoot(E),
     WorkspaceRoot(ResolveDirectoryError<E>),
     InspectExistingDatabase(I),
     MissingInitialSettings(Vec<MissingInitialProjectSetting>),
@@ -684,6 +699,7 @@ impl<D, S, I, R, E, P, A> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> 
 
         match self {
             Self::SourceGameRoot(_)
+            | Self::EngineWorkspaceRoot(_)
             | Self::MissingInitialSettings(_)
             | Self::ObserveInputSource(_) => Impact::ConfigurationOrInput,
             Self::InvalidStageRequest(_) => Impact::Internal,
@@ -731,6 +747,9 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SourceGameRoot(error) => write!(formatter, "无法使用游戏根目录：{error}"),
+            Self::EngineWorkspaceRoot(error) => {
+                write!(formatter, "无法建立 MZ 项目集合目录：{error}")
+            }
             Self::WorkspaceRoot(error) => write!(formatter, "项目工作区根无效：{error}"),
             Self::InspectExistingDatabase(error) => {
                 write!(formatter, "现存项目数据库无效：{error}")
@@ -835,15 +854,6 @@ where
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
-        let source_language = input
-            .source_language
-            .map(|value| normalized_language(value, InitServiceError::EmptySourceLanguage))
-            .transpose()?;
-        let target_language = input
-            .target_language
-            .map(|value| normalized_language(value, InitServiceError::EmptyTargetLanguage))
-            .transpose()?;
-
         let output_name = input.name.clone();
         let _lease = self
             .project_lease
@@ -858,8 +868,8 @@ where
             .converge(ProjectWorkspaceConvergenceRequest::new(
                 input.game_root,
                 input.name,
-                source_language,
-                target_language,
+                input.source_language,
+                input.target_language,
                 input.dialogue_max_fullwidth_chars,
                 input.scrolling_text_max_fullwidth_chars,
                 input.help_description_max_fullwidth_chars,
@@ -894,24 +904,10 @@ impl From<MzStandardAssetOwner> for InitStaleOwner {
     }
 }
 
-fn normalized_language<W, P>(
-    value: String,
-    empty_error: InitServiceError<W, P>,
-) -> Result<String, InitServiceError<W, P>> {
-    let normalized = value.trim();
-    if normalized.is_empty() {
-        Err(empty_error)
-    } else {
-        Ok(normalized.to_owned())
-    }
-}
-
 /// 初始化编排在本职责边界内能够产生的错误。
 #[derive(Debug)]
 pub(crate) enum InitServiceError<W, P> {
     ProjectLease(ProjectCommandLeaseError<P>),
-    EmptySourceLanguage,
-    EmptyTargetLanguage,
     Workspace(W),
 }
 
@@ -923,8 +919,6 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ProjectLease(error) => error.fmt(formatter),
-            Self::EmptySourceLanguage => formatter.write_str("源语言去除首尾空白后不能为空"),
-            Self::EmptyTargetLanguage => formatter.write_str("目标语言去除首尾空白后不能为空"),
             Self::Workspace(error) => write!(formatter, "无法收敛项目工作区：{error}"),
         }
     }
@@ -939,7 +933,6 @@ where
         match self {
             Self::ProjectLease(error) => Some(error),
             Self::Workspace(error) => Some(error),
-            Self::EmptySourceLanguage | Self::EmptyTargetLanguage => None,
         }
     }
 }
@@ -953,8 +946,8 @@ mod tests {
     use super::*;
 
     type SnapshotDatabaseResponses = VecDeque<Result<(), SnapshotDatabaseError<FakeError>>>;
+    use crate::att_mz::project_database::{ProjectDatabaseReconciliation, ProjectDatabaseState};
     use crate::fingerprint::Sha256Fingerprint;
-    use crate::project_database::{ProjectDatabaseReconciliation, ProjectDatabaseState};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -1018,10 +1011,29 @@ mod tests {
     #[derive(Clone)]
     struct FakeWorkspaceFileSystem {
         observations: Observations,
+        namespace_error: Option<FakeError>,
         target_exists: bool,
         workspace_structure: WorkspaceStructureObservation,
         existing_source: ExistingSourceObservation,
         candidate_fingerprint: [u8; 32],
+    }
+
+    impl DirectChildDirectoryEnsurer for FakeWorkspaceFileSystem {
+        type Error = FakeError;
+
+        async fn ensure_direct_child_directory(
+            &self,
+            parent: PathBuf,
+            child: OsString,
+        ) -> Result<PathBuf, Self::Error> {
+            self.observations.event("ensure_engine_root");
+            assert_eq!(parent, Path::new("C:/projects"));
+            assert_eq!(child, OsStr::new("mz"));
+            if let Some(error) = self.namespace_error {
+                return Err(error);
+            }
+            Ok(parent.join(child))
+        }
     }
 
     impl ExistingDirectoryResolver for FakeWorkspaceFileSystem {
@@ -1031,11 +1043,16 @@ mod tests {
             &self,
             path: PathBuf,
         ) -> Result<PathBuf, ResolveDirectoryError<Self::Error>> {
+            assert_ne!(
+                path,
+                Path::new("C:/projects/game"),
+                "MZ Init 不得探测未带引擎命名空间的旧工作区"
+            );
             if path == Path::new("C:/games/source") {
                 self.observations.event("game_root");
                 return Ok(path);
             }
-            if path == Path::new("C:/projects/game") {
+            if path == Path::new("C:/projects/mz/game") {
                 self.observations.event("workspace_root");
                 if self.target_exists {
                     return Ok(path);
@@ -1059,7 +1076,7 @@ mod tests {
                     source: FakeError("list workspace"),
                 });
             }
-            if path == Path::new("C:/projects/game") {
+            if path == Path::new("C:/projects/mz/game") {
                 self.observations.event("list_workspace");
                 let mut children = vec![
                     DirectoryEntry::new(
@@ -1124,7 +1141,7 @@ mod tests {
                 }
                 return Ok(children);
             }
-            if path == Path::new("C:/projects/game/source") {
+            if path == Path::new("C:/projects/mz/game/source") {
                 self.observations.event("list_source");
                 let mut children = vec![
                     DirectoryEntry::new(
@@ -1157,7 +1174,7 @@ mod tests {
                 }
                 return Ok(children);
             }
-            if path == Path::new("C:/projects/game/write_back") {
+            if path == Path::new("C:/projects/mz/game/write_back") {
                 self.observations.event("list_write_back");
                 if matches!(
                     self.workspace_structure,
@@ -1232,7 +1249,7 @@ mod tests {
                 }
                 ExistingSourceObservation::Missing => {
                     Err(DirectoryTreeFingerprintError::NotFound {
-                        path: PathBuf::from("C:/projects/game/source/data"),
+                        path: PathBuf::from("C:/projects/mz/game/source/data"),
                     })
                 }
             }
@@ -1386,6 +1403,10 @@ mod tests {
         super::super::project::MaxFullwidthChars::new(value).expect("宽度应合法")
     }
 
+    fn language_id(value: &str) -> LanguageId {
+        LanguageId::parse(value).expect("测试语言 ID 应合法")
+    }
+
     fn profile() -> MzWriteBackLayoutProfile {
         MzWriteBackLayoutProfile::new(width(24), width(30), width(18))
     }
@@ -1400,8 +1421,7 @@ mod tests {
     ) -> ProjectDatabaseState {
         ProjectDatabaseState::for_test(
             "game".parse().expect("项目名应合法"),
-            "ja".to_owned(),
-            "zh-Hans".to_owned(),
+            LanguagePair::new(language_id("ja"), language_id("zh-Hans")),
             fingerprint(source_fingerprint),
             profile(),
             owners,
@@ -1412,8 +1432,8 @@ mod tests {
         ProjectWorkspaceConvergenceRequest::new(
             PathBuf::from("C:/games/source"),
             "game".parse().expect("项目名应合法"),
-            Some("ja".to_owned()),
-            Some("zh-Hans".to_owned()),
+            Some(language_id("ja")),
+            Some(language_id("zh-Hans")),
             Some(profile().dialogue_body()),
             Some(profile().scrolling_text()),
             Some(profile().help_description()),
@@ -1468,6 +1488,7 @@ mod tests {
                 },
                 FakeWorkspaceFileSystem {
                     observations: observations.clone(),
+                    namespace_error: None,
                     target_exists,
                     workspace_structure,
                     existing_source,
@@ -1481,6 +1502,48 @@ mod tests {
             ),
             observations,
         )
+    }
+
+    #[tokio::test]
+    async fn engine_workspace_root_failure_stops_before_candidate_preparation() {
+        let state = database_state(0x22, Vec::new());
+        let (mut service, observations) = service(
+            false,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Missing,
+            0x22,
+            Ok(state.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(state)),
+            Ok(()),
+        );
+        service.file_system.namespace_error = Some(FakeError("cannot create mz root"));
+
+        let error = service
+            .converge(request())
+            .await
+            .expect_err("MZ 项目集合目录失败必须停止 Init");
+
+        assert!(matches!(
+            &error,
+            ProjectWorkspaceConvergenceError::EngineWorkspaceRoot(FakeError(
+                "cannot create mz root"
+            ))
+        ));
+        assert_eq!(
+            error.failure_impact(),
+            ProjectWorkspaceConvergenceFailureImpact::ConfigurationOrInput
+        );
+        assert_eq!(
+            observations.events(),
+            vec!["workspace_root", "game_root", "ensure_engine_root"]
+        );
+        assert!(
+            observations
+                .stage_requests
+                .lock()
+                .expect("stage requests mutex should not be poisoned")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1563,6 +1626,7 @@ mod tests {
             vec![
                 "workspace_root",
                 "game_root",
+                "ensure_engine_root",
                 "prepare",
                 "fingerprint_candidate",
                 "create_database",
@@ -1580,7 +1644,7 @@ mod tests {
         );
         assert_eq!(
             stage_requests[0].target_root(),
-            Path::new("C:/projects/game")
+            Path::new("C:/projects/mz/game")
         );
         assert_eq!(stage_requests[0].source_mappings().len(), 2);
         assert_eq!(
@@ -1673,8 +1737,7 @@ mod tests {
         let current = database_state(0x33, Vec::new());
         let updated = ProjectDatabaseState::for_test(
             "game".parse().expect("项目名应合法"),
-            "ja".to_owned(),
-            "zh-Hant".to_owned(),
+            LanguagePair::new(language_id("ja"), language_id("zh-Hant")),
             fingerprint(0x33),
             MzWriteBackLayoutProfile::new(width(40), width(30), width(18)),
             Vec::new(),
@@ -1689,7 +1752,7 @@ mod tests {
             Ok(()),
         );
         let mut requested = omitted_settings_request();
-        requested.target_language = Some("zh-Hant".to_owned());
+        requested.target_language = Some(language_id("zh-Hant"));
         requested.dialogue_max_fullwidth_chars = Some(width(40));
 
         let outcome = service
@@ -1706,8 +1769,8 @@ mod tests {
             .lock()
             .expect("reconciled projects mutex should not be poisoned");
         let requested = &reconciled[0].1;
-        assert_eq!(requested.source_language(), "ja");
-        assert_eq!(requested.target_language(), "zh-Hant");
+        assert_eq!(requested.source_language().as_str(), "ja");
+        assert_eq!(requested.target_language().as_str(), "zh-Hant");
         assert_eq!(requested.layout_profile().dialogue_body(), width(40));
         assert_eq!(requested.layout_profile().scrolling_text(), width(30));
         assert_eq!(requested.layout_profile().help_description(), width(18));
@@ -2055,8 +2118,8 @@ mod tests {
         InitInput {
             name: "game".parse().expect("项目名应合法"),
             game_root: PathBuf::from("./Game"),
-            source_language: Some(" ja ".to_owned()),
-            target_language: Some(" zh-Hans ".to_owned()),
+            source_language: Some(language_id("JA")),
+            target_language: Some(language_id("zh-hans")),
             dialogue_max_fullwidth_chars: Some(profile().dialogue_body()),
             scrolling_text_max_fullwidth_chars: Some(profile().scrolling_text()),
             help_description_max_fullwidth_chars: Some(profile().help_description()),
@@ -2064,7 +2127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_service_normalizes_input_and_maps_updated_owner_result() {
+    async fn init_service_forwards_trusted_languages_and_maps_updated_owner_result() {
         let converger = FakeWorkspaceConverger {
             requests: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(VecDeque::from([Ok(
@@ -2101,35 +2164,13 @@ mod tests {
             .expect("workspace requests mutex should not be poisoned");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].source_game_root, Path::new("./Game"));
-        assert_eq!(requests[0].source_language.as_deref(), Some("ja"));
-        assert_eq!(requests[0].target_language.as_deref(), Some("zh-Hans"));
-    }
-
-    #[tokio::test]
-    async fn blank_language_stops_before_workspace_convergence() {
-        let converger = FakeWorkspaceConverger {
-            requests: Arc::new(Mutex::new(Vec::new())),
-            responses: Arc::new(Mutex::new(VecDeque::new())),
-        };
-        let service = InitService::new(
-            converger,
-            FakeProjectLease,
-            CooperativeCancellation::default(),
+        assert_eq!(
+            requests[0].source_language.as_ref().map(LanguageId::as_str),
+            Some("ja")
         );
-        let mut input = init_input();
-        input.source_language = Some(" \t ".to_owned());
-
-        assert!(matches!(
-            service.execute(input).await,
-            Err(InitServiceError::EmptySourceLanguage)
-        ));
-        assert!(
-            service
-                .workspace_converger
-                .requests
-                .lock()
-                .expect("workspace requests mutex should not be poisoned")
-                .is_empty()
+        assert_eq!(
+            requests[0].target_language.as_ref().map(LanguageId::as_str),
+            Some("zh-Hans")
         );
     }
 

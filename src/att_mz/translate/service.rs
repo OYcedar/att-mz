@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::lua::LuaTranslation;
-use super::profile::TranslationExecutionProfile;
+use super::profile::MzTranslationProfile;
 use super::standard::{StandardTranslation, StandardTranslationInput};
 use super::{StandardTranslationSummary, TranslateInput, TranslateOutput};
 use crate::att_mz::lua::runtime::TrustedLuaTranslationSemantics;
@@ -14,14 +14,14 @@ use crate::att_mz::{ProjectName, SelectedLua};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 
 /// 为当前项目语言对建立完整翻译执行切片的结果。
-pub(crate) type SelectedTranslationExecutionBuildResult<P, S, L, E> =
-    Result<SelectedTranslationExecution<P, S, L>, E>;
+pub(crate) type SelectedTranslationExecutionBuildResult<C, S, L, E> =
+    Result<SelectedTranslationExecution<C, S, L>, E>;
 
 /// 打开项目后一次性建立当前语言对实际需要的翻译执行切片。
 pub(crate) trait SelectedTranslationExecutionBuilder: Send + Sync {
-    type Payload: Send + Sync + 'static;
-    type Standard: StandardTranslation<Profile = Arc<TranslationExecutionProfile<Self::Payload>>>;
-    type Lua: LuaTranslation<Profile = Arc<TranslationExecutionProfile<Self::Payload>>>;
+    type Client: Send + Sync + 'static;
+    type Standard: StandardTranslation<Profile = Arc<MzTranslationProfile<Self::Client>>>;
+    type Lua: LuaTranslation<Client = Self::Client>;
     type Error: Error + Send + Sync + 'static;
 
     fn build(
@@ -29,7 +29,7 @@ pub(crate) trait SelectedTranslationExecutionBuilder: Send + Sync {
         project: &OpenedProject,
     ) -> impl std::future::Future<
         Output = SelectedTranslationExecutionBuildResult<
-            Self::Payload,
+            Self::Client,
             Self::Standard,
             Self::Lua,
             Self::Error,
@@ -38,15 +38,15 @@ pub(crate) trait SelectedTranslationExecutionBuilder: Send + Sync {
 }
 
 /// 当前项目语言对唯一的一组 Standard、Profile 与可选 Lua 执行能力。
-pub(crate) struct SelectedTranslationExecution<P, S, L> {
-    profile: Arc<TranslationExecutionProfile<P>>,
+pub(crate) struct SelectedTranslationExecution<C, S, L> {
+    profile: Arc<MzTranslationProfile<C>>,
     standard: S,
     lua: Option<SelectedLua<L>>,
 }
 
-impl<P, S, L> SelectedTranslationExecution<P, S, L> {
+impl<C, S, L> SelectedTranslationExecution<C, S, L> {
     pub(crate) fn new(
-        profile: Arc<TranslationExecutionProfile<P>>,
+        profile: Arc<MzTranslationProfile<C>>,
         standard: S,
         lua: Option<SelectedLua<L>>,
     ) -> Self {
@@ -60,8 +60,8 @@ impl<P, S, L> SelectedTranslationExecution<P, S, L> {
 
 /// 按固定业务顺序编排一次 MZ 翻译。
 ///
-/// 配置边界在构造本服务前已经完成 Profile 选择。本服务把同一个不可变
-/// Profile 快照交给标准翻译和 Lua 翻译，不再保存或解析选择标识。
+/// 配置边界在构造本服务前已经完成 Profile 选择。本服务把完整 Profile 交给标准
+/// 翻译；可选 Lua 只接收其中的公共 Client 和 Standard 交付的解析语义。
 pub(crate) struct TranslateService<R, B, P> {
     project_opener: R,
     execution_builder: B,
@@ -162,7 +162,12 @@ where
                 .ok_or(TranslateServiceError::MissingResolvedTranslationSemantics)?;
             let completion = selected_lua
                 .executor()
-                .run(&project, &execution.profile, semantics, error_path.clone())
+                .run(
+                    &project,
+                    execution.profile.shared_llm_client(),
+                    semantics,
+                    error_path.clone(),
+                )
                 .await
                 .map_err(|source| TranslateServiceError::Lua {
                     script_path: error_path,
@@ -201,7 +206,7 @@ where
 
     async fn run_standard(
         &self,
-        execution: &SelectedTranslationExecution<B::Payload, B::Standard, B::Lua>,
+        execution: &SelectedTranslationExecution<B::Client, B::Standard, B::Lua>,
         project: &OpenedProject,
         input: StandardTranslationInput,
     ) -> Result<
@@ -290,6 +295,7 @@ where
 mod tests {
     use std::num::NonZeroUsize;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::*;
     use crate::att_mz::project::{ExistingProjectOpener, OpenedProject};
@@ -298,6 +304,9 @@ mod tests {
         MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
     };
     use crate::att_mz::translate::executor::FinalLlmResponseMetadata;
+    use crate::att_mz::translate::profile::{
+        MzTranslationPlanningConfiguration, MzTranslationRequestConfiguration,
+    };
     use crate::att_mz::translate::semantics::ResolvedTranslationSemantics;
     use crate::att_mz::translate::standard::{
         NonEmptyTaskItems, StandardTranslationRunReport, StandardTranslationTaskIndex,
@@ -315,9 +324,9 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct FakePayload;
+    struct FakeClient(&'static str);
 
-    type SelectedProfile = Arc<TranslationExecutionProfile<FakePayload>>;
+    type SelectedProfile = Arc<MzTranslationProfile<FakeClient>>;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
@@ -329,7 +338,7 @@ mod tests {
         },
         Lua {
             project: OpenedProject,
-            profile_id: String,
+            client_name: String,
             script_path: PathBuf,
         },
     }
@@ -411,21 +420,21 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         failure: Option<Failure>,
         expected_semantics: Arc<ResolvedTranslationSemantics>,
-        expected_profile: SelectedProfile,
+        expected_client: Arc<FakeClient>,
     }
 
     impl LuaTranslation for FakeLuaTranslation {
-        type Profile = SelectedProfile;
+        type Client = FakeClient;
         type Error = FakeError;
 
         async fn run(
             &self,
             project: &OpenedProject,
-            profile: &Self::Profile,
+            llm_client: Arc<Self::Client>,
             semantics: Arc<dyn TrustedLuaTranslationSemantics>,
             script_path: PathBuf,
         ) -> Result<OperationCompletion<()>, Self::Error> {
-            assert!(Arc::ptr_eq(profile, &self.expected_profile));
+            assert!(Arc::ptr_eq(&llm_client, &self.expected_client));
             assert_eq!(
                 Arc::as_ptr(&semantics) as *const (),
                 Arc::as_ptr(&self.expected_semantics) as *const (),
@@ -436,7 +445,7 @@ mod tests {
                 .expect("事件记录锁不应中毒")
                 .push(Event::Lua {
                     project: project.clone(),
-                    profile_id: profile.id().to_owned(),
+                    client_name: llm_client.0.to_owned(),
                     script_path,
                 });
 
@@ -457,7 +466,7 @@ mod tests {
     }
 
     impl SelectedTranslationExecutionBuilder for FakeBuilder {
-        type Payload = FakePayload;
+        type Client = FakeClient;
         type Standard = FakeStandardTranslation;
         type Lua = FakeLuaTranslation;
         type Error = FakeError;
@@ -466,7 +475,7 @@ mod tests {
             &self,
             _: &OpenedProject,
         ) -> Result<
-            SelectedTranslationExecution<Self::Payload, Self::Standard, Self::Lua>,
+            SelectedTranslationExecution<Self::Client, Self::Standard, Self::Lua>,
             Self::Error,
         > {
             Ok(SelectedTranslationExecution::new(
@@ -510,10 +519,13 @@ mod tests {
         lua_script: Option<&str>,
     ) -> Service {
         let semantics = Arc::new(ResolvedTranslationSemantics::for_test());
-        let profile = Arc::new(TranslationExecutionProfile::new(
+        let client = Arc::new(FakeClient("shared-client"));
+        let profile = Arc::new(MzTranslationProfile::new(
             "quality-profile",
             std::num::NonZeroUsize::new(2).expect("测试并发数必须非零"),
-            FakePayload,
+            MzTranslationPlanningConfiguration::new(NonZeroUsize::MIN, NonZeroUsize::MIN),
+            MzTranslationRequestConfiguration::new(Vec::new(), Duration::ZERO),
+            Arc::clone(&client),
         ));
         TranslateService::new(
             FakeProjectReader {
@@ -535,7 +547,7 @@ mod tests {
                             events,
                             failure,
                             expected_semantics: semantics,
-                            expected_profile: profile,
+                            expected_client: client,
                         },
                     )
                 }),
@@ -643,7 +655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_and_runs_both_stages_with_the_same_selected_profile() {
+    async fn standard_receives_the_profile_and_lua_receives_its_client_and_resolved_semantics() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let service = service(Arc::clone(&recorded), None, Some("scripts/translate.lua"));
 
@@ -670,7 +682,7 @@ mod tests {
                 },
                 Event::Lua {
                     project: project_record(),
-                    profile_id: "quality-profile".to_owned(),
+                    client_name: "shared-client".to_owned(),
                     script_path: PathBuf::from("scripts/translate.lua"),
                 },
             ]
@@ -773,7 +785,7 @@ mod tests {
                     },
                     Event::Lua {
                         project: project_record(),
-                        profile_id: "quality-profile".to_owned(),
+                        client_name: "shared-client".to_owned(),
                         script_path: PathBuf::from("scripts/translate.lua"),
                     },
                 ],

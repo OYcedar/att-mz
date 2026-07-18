@@ -416,12 +416,12 @@ mod tests {
     }
 
     impl TrustedLuaExecutionHost for FakeHost {
-        type TranslationProfile = ();
+        type TranslationClient = ();
         type Error = FakeError;
 
         async fn execute(
             &self,
-            invocation: LuaInvocation<Self::TranslationProfile>,
+            invocation: LuaInvocation<Self::TranslationClient>,
         ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
             let LuaInvocation::WriteBack {
                 script_path,

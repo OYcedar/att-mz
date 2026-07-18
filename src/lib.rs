@@ -11,7 +11,6 @@ mod fingerprint;
 mod language;
 mod llm;
 mod observability;
-mod project_database;
 mod runtime;
 mod storage;
 

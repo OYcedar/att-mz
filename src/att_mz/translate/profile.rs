@@ -1,86 +1,131 @@
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 用于精确选择系统提示词和语言实现的受信语言对。
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct TranslationProfileLanguagePair {
-    source_language: String,
-    target_language: String,
+use crate::language::{LanguageModule, LanguagePair};
+
+/// 一个 MZ system prompt 及其唯一适用的规范语言对。
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct MzSystemPrompt {
+    language_pair: LanguagePair,
+    markdown: String,
 }
 
-impl TranslationProfileLanguagePair {
+impl fmt::Debug for MzSystemPrompt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MzSystemPrompt")
+            .field("language_pair", &self.language_pair)
+            .field("markdown", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl MzSystemPrompt {
     pub(crate) fn new(
-        source_language: impl Into<String>,
-        target_language: impl Into<String>,
-    ) -> Result<Self, TranslationProfileConfigurationError> {
-        let source_language = source_language.into();
-        let target_language = target_language.into();
-        validate_language_id("源语言", &source_language)?;
-        validate_language_id("目标语言", &target_language)?;
+        language_pair: LanguagePair,
+        markdown: String,
+    ) -> Result<Self, MzSystemPromptError> {
+        if markdown.trim().is_empty() {
+            return Err(MzSystemPromptError::Blank { language_pair });
+        }
         Ok(Self {
-            source_language,
-            target_language,
+            language_pair,
+            markdown,
         })
     }
 
-    pub(crate) fn source_language(&self) -> &str {
-        &self.source_language
+    pub(crate) fn language_pair(&self) -> &LanguagePair {
+        &self.language_pair
     }
 
-    pub(crate) fn target_language(&self) -> &str {
-        &self.target_language
+    pub(crate) fn markdown(&self) -> &str {
+        &self.markdown
     }
 }
 
-/// 标准翻译规划阶段全部由外部明确提供的配置。
+/// Prompt 文件内容无法建立为受信 MZ system prompt。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MzSystemPromptError {
+    Blank { language_pair: LanguagePair },
+}
+
+impl fmt::Display for MzSystemPromptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blank { language_pair } => write!(
+                formatter,
+                "语言对 {} -> {} 的 MZ system prompt 为空",
+                language_pair.source(),
+                language_pair.target()
+            ),
+        }
+    }
+}
+
+impl Error for MzSystemPromptError {}
+
+/// 项目打开后为其精确语言对一次性解析出的 MZ 翻译资源。
+///
+/// Planner 与 Executor 必须共享同一个实例；两者不得重新查询语言目录或选择 Prompt。
+pub(crate) struct ResolvedMzTranslationResources {
+    system_prompt: MzSystemPrompt,
+    source_language: Arc<dyn LanguageModule>,
+}
+
+impl ResolvedMzTranslationResources {
+    pub(crate) fn new(
+        system_prompt: MzSystemPrompt,
+        source_language: Arc<dyn LanguageModule>,
+    ) -> Self {
+        Self {
+            system_prompt,
+            source_language,
+        }
+    }
+
+    pub(crate) fn language_pair(&self) -> &LanguagePair {
+        self.system_prompt.language_pair()
+    }
+
+    pub(crate) fn system_prompt(&self) -> &MzSystemPrompt {
+        &self.system_prompt
+    }
+
+    pub(crate) fn source_language(&self) -> Arc<dyn LanguageModule> {
+        Arc::clone(&self.source_language)
+    }
+}
+
+impl fmt::Debug for ResolvedMzTranslationResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedMzTranslationResources")
+            .field("language_pair", self.language_pair())
+            .field("system_prompt", &"[REDACTED]")
+            .field("source_language", &"dyn LanguageModule")
+            .finish()
+    }
+}
+
+/// MZ 规划阶段全部由外部明确提供的资源策略。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MzTranslationPlanningConfiguration {
     scope_concurrency: NonZeroUsize,
     max_message_characters: NonZeroUsize,
-    system_markdown_by_language_pair: BTreeMap<TranslationProfileLanguagePair, String>,
 }
 
 impl MzTranslationPlanningConfiguration {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         scope_concurrency: NonZeroUsize,
         max_message_characters: NonZeroUsize,
-        system_markdown_by_language_pair: impl IntoIterator<
-            Item = (TranslationProfileLanguagePair, String),
-        >,
-    ) -> Result<Self, TranslationProfileConfigurationError> {
-        let mut systems = BTreeMap::new();
-        for (language_pair, system_markdown) in system_markdown_by_language_pair {
-            if system_markdown.trim().is_empty() {
-                return Err(TranslationProfileConfigurationError::BlankSystemMarkdown {
-                    source_language: language_pair.source_language().to_owned(),
-                    target_language: language_pair.target_language().to_owned(),
-                });
-            }
-            if systems
-                .insert(language_pair.clone(), system_markdown)
-                .is_some()
-            {
-                return Err(
-                    TranslationProfileConfigurationError::DuplicateLanguagePair {
-                        source_language: language_pair.source_language().to_owned(),
-                        target_language: language_pair.target_language().to_owned(),
-                    },
-                );
-            }
-        }
-        if systems.is_empty() {
-            return Err(TranslationProfileConfigurationError::MissingSystemMarkdown);
-        }
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             scope_concurrency,
             max_message_characters,
-            system_markdown_by_language_pair: systems,
-        })
+        }
     }
 
     pub(crate) const fn scope_concurrency(&self) -> NonZeroUsize {
@@ -90,25 +135,16 @@ impl MzTranslationPlanningConfiguration {
     pub(crate) const fn max_message_characters(&self) -> NonZeroUsize {
         self.max_message_characters
     }
-
-    pub(crate) fn system_markdown(
-        &self,
-        language_pair: &TranslationProfileLanguagePair,
-    ) -> Option<&str> {
-        self.system_markdown_by_language_pair
-            .get(language_pair)
-            .map(String::as_str)
-    }
 }
 
-/// 单任务模型执行阶段全部由外部明确提供的配置。
+/// MZ 单任务模型请求阶段全部由外部明确提供的重试策略。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MzTranslationExecutionConfiguration {
+pub(crate) struct MzTranslationRequestConfiguration {
     network_retry_delays: Vec<Duration>,
     max_network_retry_after: Duration,
 }
 
-impl MzTranslationExecutionConfiguration {
+impl MzTranslationRequestConfiguration {
     pub(crate) fn new(
         network_retry_delays: Vec<Duration>,
         max_network_retry_after: Duration,
@@ -128,281 +164,163 @@ impl MzTranslationExecutionConfiguration {
     }
 }
 
-/// MZ 标准翻译与可信 Lua 翻译共享的完整受信载荷。
-pub(crate) struct MzTranslationExecutionPayload<L> {
+/// 一次 MZ 翻译运行共享的不可变执行 Profile。
+///
+/// Prompt 与语言模块属于项目语言对解析结果，不属于 Profile。Debug 输出不会访问或
+/// 展示 LLM Client，避免其中的凭据进入诊断。
+pub(crate) struct MzTranslationProfile<L> {
+    id: String,
+    max_in_flight_tasks: NonZeroUsize,
     planning: MzTranslationPlanningConfiguration,
-    execution: MzTranslationExecutionConfiguration,
+    request: MzTranslationRequestConfiguration,
     llm_client: Arc<L>,
 }
 
-impl<L> MzTranslationExecutionPayload<L> {
+impl<L> MzTranslationProfile<L> {
     pub(crate) fn new(
+        id: impl Into<String>,
+        max_in_flight_tasks: NonZeroUsize,
         planning: MzTranslationPlanningConfiguration,
-        execution: MzTranslationExecutionConfiguration,
+        request: MzTranslationRequestConfiguration,
         llm_client: Arc<L>,
     ) -> Self {
         Self {
+            id: id.into(),
+            max_in_flight_tasks,
             planning,
-            execution,
+            request,
             llm_client,
         }
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) const fn max_in_flight_tasks(&self) -> NonZeroUsize {
+        self.max_in_flight_tasks
     }
 
     pub(crate) fn planning(&self) -> &MzTranslationPlanningConfiguration {
         &self.planning
     }
 
-    pub(crate) fn execution(&self) -> &MzTranslationExecutionConfiguration {
-        &self.execution
+    pub(crate) fn request(&self) -> &MzTranslationRequestConfiguration {
+        &self.request
     }
 
     pub(crate) fn llm_client(&self) -> &L {
         self.llm_client.as_ref()
     }
-}
 
-/// 外部配置无法建立为受信翻译 Profile 时的错误。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationProfileConfigurationError {
-    BlankLanguageId {
-        role: &'static str,
-    },
-    SurroundingWhitespaceInLanguageId {
-        role: &'static str,
-        value: String,
-    },
-    MissingSystemMarkdown,
-    BlankSystemMarkdown {
-        source_language: String,
-        target_language: String,
-    },
-    DuplicateLanguagePair {
-        source_language: String,
-        target_language: String,
-    },
-}
-
-impl fmt::Display for TranslationProfileConfigurationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BlankLanguageId { role } => write!(formatter, "{role} ID 为空"),
-            Self::SurroundingWhitespaceInLanguageId { role, value } => {
-                write!(formatter, "{role} ID 含首尾空白：{value:?}")
-            }
-            Self::MissingSystemMarkdown => formatter.write_str("没有配置任何语言对的系统提示词"),
-            Self::BlankSystemMarkdown {
-                source_language,
-                target_language,
-            } => write!(
-                formatter,
-                "语言对 {source_language} -> {target_language} 的系统提示词为空"
-            ),
-            Self::DuplicateLanguagePair {
-                source_language,
-                target_language,
-            } => write!(
-                formatter,
-                "语言对 {source_language} -> {target_language} 的系统提示词重复"
-            ),
-        }
+    pub(crate) fn shared_llm_client(&self) -> Arc<L> {
+        Arc::clone(&self.llm_client)
     }
 }
 
-impl Error for TranslationProfileConfigurationError {}
-
-fn validate_language_id(
-    role: &'static str,
-    value: &str,
-) -> Result<(), TranslationProfileConfigurationError> {
-    if value.trim().is_empty() {
-        return Err(TranslationProfileConfigurationError::BlankLanguageId { role });
-    }
-    if value.trim() != value {
-        return Err(
-            TranslationProfileConfigurationError::SurroundingWhitespaceInLanguageId {
-                role,
-                value: value.to_owned(),
-            },
-        );
-    }
-    Ok(())
-}
-
-/// 一次翻译运行共享的不可变执行配置。
-///
-/// `payload` 由外部配置边界建立并保持不透明；本类型只固定所有翻译阶段共同需要的
-/// 配置身份和逻辑任务并发上限。Debug 输出绝不会访问或展示 `payload`。
-pub(crate) struct TranslationExecutionProfile<P> {
-    id: String,
-    max_in_flight_tasks: NonZeroUsize,
-    payload: P,
-}
-
-impl<P> TranslationExecutionProfile<P> {
-    pub(crate) fn new(
-        id: impl Into<String>,
-        max_in_flight_tasks: NonZeroUsize,
-        payload: P,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            max_in_flight_tasks,
-            payload,
-        }
-    }
-
-    /// 返回配置文件中用于精确选择本 Profile 的 ID。
-    pub(crate) fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// 返回本次运行最多同时执行的逻辑翻译任务数。
-    pub(crate) const fn max_in_flight_tasks(&self) -> NonZeroUsize {
-        self.max_in_flight_tasks
-    }
-
-    /// 借用外部配置边界建立的受信执行载荷。
-    pub(crate) fn payload(&self) -> &P {
-        &self.payload
-    }
-}
-
-impl<P> fmt::Debug for TranslationExecutionProfile<P> {
+impl<L> fmt::Debug for MzTranslationProfile<L> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TranslationExecutionProfile")
+            .debug_struct("MzTranslationProfile")
             .field("id", &self.id)
             .field("max_in_flight_tasks", &self.max_in_flight_tasks)
-            .field("payload", &"[REDACTED]")
+            .field("planning", &self.planning)
+            .field("request", &self.request)
+            .field("llm_client", &"[REDACTED]")
             .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::num::NonZeroUsize;
 
-    use super::super::standard::StandardTranslationProfile;
+    use crate::language::{JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId};
+
     use super::*;
 
-    #[derive(Eq, PartialEq)]
-    struct SensitivePayload(&'static str);
+    #[derive(Debug, Eq, PartialEq)]
+    struct SensitiveClient(&'static str);
 
     fn non_zero(value: usize) -> NonZeroUsize {
-        NonZeroUsize::new(value).expect("测试并发数必须非零")
+        NonZeroUsize::new(value).expect("测试配置必须非零")
     }
 
-    fn profile(id: &str, secret: &'static str) -> TranslationExecutionProfile<SensitivePayload> {
-        TranslationExecutionProfile::new(id, non_zero(3), SensitivePayload(secret))
-    }
-
-    #[test]
-    fn profile_exposes_only_trusted_read_only_values() {
-        let profile = profile("alpha", "alpha-secret");
-
-        assert_eq!(profile.id(), "alpha");
-        assert_eq!(profile.max_in_flight_tasks(), non_zero(3));
-        assert!(profile.payload() == &SensitivePayload("alpha-secret"));
-    }
-
-    #[test]
-    fn debug_output_never_reads_or_exposes_payload() {
-        let profile = profile("private", "never-print-this-secret");
-        let profile_debug = format!("{profile:?}");
-        assert!(profile_debug.contains("private"));
-        assert!(profile_debug.contains("[REDACTED]"));
-        assert!(!profile_debug.contains("never-print-this-secret"));
-    }
-
-    #[test]
-    fn selected_profile_is_send_and_sync_without_clone_payload() {
-        fn assert_send_sync<T: Send + Sync>() {}
-
-        assert_send_sync::<Arc<TranslationExecutionProfile<SensitivePayload>>>();
-    }
-
-    #[test]
-    fn mz_payload_keeps_every_external_planning_and_execution_choice_exact() {
-        let language_pair =
-            TranslationProfileLanguagePair::new("ja", "zh-Hans").expect("语言对应合法");
-        let planning = MzTranslationPlanningConfiguration::new(
-            non_zero(4),
-            non_zero(24_000),
-            [(language_pair.clone(), "# 完整系统提示词".to_owned())],
+    fn language_pair() -> LanguagePair {
+        LanguagePair::new(
+            LanguageId::parse("ja").expect("测试源语言合法"),
+            LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
         )
-        .expect("规划配置应合法");
-        let execution = MzTranslationExecutionConfiguration::new(
-            vec![Duration::from_millis(250), Duration::from_secs(2)],
-            Duration::from_secs(30),
-        );
-        let client = Arc::new(SensitivePayload("secret"));
-        let payload = MzTranslationExecutionPayload::new(planning, execution, Arc::clone(&client));
+    }
 
-        assert_eq!(payload.planning().scope_concurrency(), non_zero(4));
+    fn profile(secret: &'static str) -> MzTranslationProfile<SensitiveClient> {
+        MzTranslationProfile::new(
+            "primary",
+            non_zero(3),
+            MzTranslationPlanningConfiguration::new(non_zero(4), non_zero(24_000)),
+            MzTranslationRequestConfiguration::new(
+                vec![Duration::from_millis(250), Duration::from_secs(2)],
+                Duration::from_secs(30),
+            ),
+            Arc::new(SensitiveClient(secret)),
+        )
+    }
+
+    #[test]
+    fn prompt_binds_non_blank_markdown_to_one_exact_language_pair() {
+        let prompt = MzSystemPrompt::new(language_pair(), "# 完整提示词".to_owned())
+            .expect("非空提示词合法");
+        assert_eq!(prompt.language_pair(), &language_pair());
+        assert_eq!(prompt.markdown(), "# 完整提示词");
+
         assert_eq!(
-            payload.planning().max_message_characters(),
+            MzSystemPrompt::new(language_pair(), " \n".to_owned()).expect_err("空白提示词必须失败"),
+            MzSystemPromptError::Blank {
+                language_pair: language_pair(),
+            }
+        );
+    }
+
+    #[test]
+    fn profile_keeps_every_external_strategy_without_owning_prompt() {
+        let profile = profile("secret");
+        assert_eq!(profile.id(), "primary");
+        assert_eq!(profile.max_in_flight_tasks(), non_zero(3));
+        assert_eq!(profile.planning().scope_concurrency(), non_zero(4));
+        assert_eq!(
+            profile.planning().max_message_characters(),
             non_zero(24_000)
         );
         assert_eq!(
-            payload.planning().system_markdown(&language_pair),
-            Some("# 完整系统提示词")
-        );
-        assert_eq!(
-            payload.execution().network_retry_delays(),
+            profile.request().network_retry_delays(),
             [Duration::from_millis(250), Duration::from_secs(2)]
         );
         assert_eq!(
-            payload.execution().max_network_retry_after(),
+            profile.request().max_network_retry_after(),
             Duration::from_secs(30)
         );
-        assert!(std::ptr::eq(payload.llm_client(), client.as_ref()));
+        assert!(profile.llm_client() == &SensitiveClient("secret"));
     }
 
     #[test]
-    fn profile_configuration_rejects_ambiguous_language_pairs_and_prompts() {
-        assert_eq!(
-            TranslationProfileLanguagePair::new(" ja", "zh-Hans")
-                .expect_err("语言 ID 首尾空白应失败"),
-            TranslationProfileConfigurationError::SurroundingWhitespaceInLanguageId {
-                role: "源语言",
-                value: " ja".to_owned(),
-            }
-        );
-
-        assert_eq!(
-            MzTranslationPlanningConfiguration::new(non_zero(1), non_zero(1), [])
-                .expect_err("缺少系统提示词应失败"),
-            TranslationProfileConfigurationError::MissingSystemMarkdown
-        );
-
-        let pair = TranslationProfileLanguagePair::new("en", "zh-Hans").expect("语言对应合法");
-        assert_eq!(
-            MzTranslationPlanningConfiguration::new(
-                non_zero(1),
-                non_zero(1),
-                [(pair, " \n".to_owned())],
-            )
-            .expect_err("空白系统提示词应失败"),
-            TranslationProfileConfigurationError::BlankSystemMarkdown {
-                source_language: "en".to_owned(),
-                target_language: "zh-Hans".to_owned(),
-            }
-        );
+    fn debug_output_redacts_llm_client() {
+        let debug = format!("{:?}", profile("never-print-this-secret"));
+        assert!(debug.contains("primary"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("never-print-this-secret"));
     }
 
     #[test]
-    fn concrete_and_arc_profiles_satisfy_the_standard_profile_contract() {
-        let concrete = profile("alpha", "alpha-secret");
-        assert_eq!(
-            StandardTranslationProfile::max_in_flight_tasks(&concrete),
-            non_zero(3)
-        );
+    fn resolved_resources_share_the_exact_prompt_and_language_module() {
+        let module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
+            JapaneseResidualPolicy::new(non_zero(1), Vec::new()).expect("测试日文策略合法"),
+            None,
+        ));
+        let prompt = MzSystemPrompt::new(language_pair(), "system".to_owned()).unwrap();
+        let resources = ResolvedMzTranslationResources::new(prompt, Arc::clone(&module));
 
-        let selected = Arc::new(profile("alpha", "alpha-secret"));
-        assert_eq!(
-            StandardTranslationProfile::max_in_flight_tasks(&selected),
-            non_zero(3)
-        );
+        assert_eq!(resources.language_pair(), &language_pair());
+        assert_eq!(resources.system_prompt().markdown(), "system");
+        assert!(Arc::ptr_eq(&resources.source_language(), &module));
     }
 }

@@ -7,10 +7,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use crate::att_mz::translate::executor::TranslationTaskExecutionProfile;
-use crate::att_mz::translate::profile::{
-    MzTranslationExecutionPayload, TranslationExecutionProfile,
-};
 use crate::execution::OperationCompletion;
 use crate::llm::{ChatMessage, LlmRequestError, LlmRequestExecutor, LlmResponse};
 use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
@@ -82,12 +78,12 @@ where
     R: TrustedLuaRuntimeExecutor,
     S: SqliteInteractiveSessionFactory,
 {
-    type TranslationProfile = TranslationExecutionProfile<MzTranslationExecutionPayload<L::Client>>;
+    type TranslationClient = L::Client;
     type Error = TrustedLuaExecutionHostingError<<F as FileReader>::Error, S::Error, R::Error>;
 
     async fn execute(
         &self,
-        invocation: LuaInvocation<Self::TranslationProfile>,
+        invocation: LuaInvocation<Self::TranslationClient>,
     ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
         let (phase, script_path, project) = match invocation {
             LuaInvocation::Extract {
@@ -97,10 +93,13 @@ where
             LuaInvocation::Translate {
                 script_path,
                 project,
-                profile,
+                llm_client,
                 semantics,
             } => (
-                HostingPhase::Translate { profile, semantics },
+                HostingPhase::Translate {
+                    llm_client,
+                    semantics,
+                },
                 script_path,
                 project,
             ),
@@ -151,10 +150,13 @@ where
                 extract_calls = Some(Arc::clone(&calls));
                 TrustedLuaRuntimeBindings::extract(common, calls, finalizer)
             }
-            HostingPhase::Translate { profile, semantics } => TrustedLuaRuntimeBindings::translate(
+            HostingPhase::Translate {
+                llm_client,
+                semantics,
+            } => TrustedLuaRuntimeBindings::translate(
                 common,
                 Arc::new(LuaTranslationHostCalls {
-                    profile,
+                    llm_client,
                     semantics,
                     llm: self.llm.clone(),
                 }),
@@ -193,7 +195,7 @@ where
 enum HostingPhase<P> {
     Extract,
     Translate {
-        profile: Arc<P>,
+        llm_client: Arc<P>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     },
     WriteBack(Arc<dyn TrustedLuaWriteBackHostCalls>),
@@ -371,7 +373,7 @@ struct LuaTranslationHostCalls<L>
 where
     L: LlmRequestExecutor + 'static,
 {
-    profile: Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<L::Client>>>,
+    llm_client: Arc<L::Client>,
     semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     llm: LuaLlmCapability<L>,
 }
@@ -406,7 +408,7 @@ where
         messages: Vec<ChatMessage>,
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, TrustedLuaHostCallError>> + Send + 'static>>
     {
-        let profile = Arc::clone(&self.profile);
+        let llm_client = Arc::clone(&self.llm_client);
         let LuaLlmCapability::Enabled(llm) = &self.llm else {
             return Box::pin(async {
                 Err(TrustedLuaHostCallError::new(
@@ -420,7 +422,7 @@ where
         };
         let llm = Arc::clone(llm);
         Box::pin(async move {
-            llm.request(profile.llm_client(), &messages)
+            llm.request(llm_client.as_ref(), &messages)
                 .await
                 .map_err(llm_call_error)
         })
@@ -867,8 +869,7 @@ mod tests {
         )
     }
 
-    fn invocation() -> LuaInvocation<TranslationExecutionProfile<MzTranslationExecutionPayload<()>>>
-    {
+    fn invocation() -> LuaInvocation<()> {
         let project = OpenedProject::new(
             "demo".parse::<ProjectName>().unwrap(),
             PathBuf::from("C:/projects/demo"),

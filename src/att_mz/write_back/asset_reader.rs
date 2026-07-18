@@ -11,13 +11,13 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
 use crate::att_mz::project::OpenedProject;
+use crate::att_mz::project_database::SourceSnapshotFingerprint;
 use crate::att_mz::standard_asset::{
     MzStandardAssetLocationError, MzStandardAssetOwner, MzStandardAssetReadingConfig,
     MzStandardAssetStorageKind, MzStandardAssetTable, MzTextBodyUnit,
 };
 use crate::att_mz::text::{MzLocation, TextGroupKind};
-use crate::project_database::SourceSnapshotFingerprint;
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
 };

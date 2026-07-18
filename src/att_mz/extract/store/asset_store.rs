@@ -11,7 +11,7 @@ use crate::att_mz::project::OpenedProject;
 use crate::att_mz::standard_asset::{
     MzStandardAssetOwner, MzStandardAssetStorageKind, MzStandardAssetTable,
 };
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
     ExecuteTransactionError, QueryExistingDatabaseError, SqliteBatch, SqliteCommand, SqliteQuery,
     SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,

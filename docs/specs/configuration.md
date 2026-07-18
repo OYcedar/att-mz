@@ -1,28 +1,51 @@
 # ATT 生产配置规格
 
-## 1. 配置读取与选择
+## 1. 配置读取、选择与解析阶段
 
-ATT 每次进程只读取一个 TOML 文件。顶层 `--config FILE` 指定文件时，相对路径以进程当前工作目录为基准；未指定时使用 `%APPDATA%\ATT\config.toml`。配置内部的相对路径以配置文件所在目录为基准。
+除 Help 和 Version 外，每次 ATT 进程都必须通过顶层 `--config FILE` 指定一个 TOML
+配置文件。相对配置路径以进程当前工作目录为基准；配置内部的相对路径以配置文件所在
+目录为基准。不存在环境变量、用户目录或其他隐式配置文件回退。
 
-配置源码受 4 MiB 固定上限保护，并且只读取一次。配置边界始终检查 UTF-8、完整 TOML 语法、重复 key 和未知顶层分区；随后根据当前 CLI 命令及其实际选择，仅解析并验证本次会使用的分区：
+配置源码受 4 MiB 固定上限保护，并且只读取一次。配置边界始终检查 UTF-8、完整 TOML
+语法、重复 key 和未知顶层分区，随后仅反序列化当前 CLI 命令实际消费的已知分区：
 
 ```text
-CLI 命令
+CLI 命令 + 必填 --config FILE
   ↓
 受限读取一次 TOML
   ↓
 检查完整语法、重复 key、未知顶层分区
   ↓
-选择当前命令所需分区
+选择当前命令所需分区并建立受信类型
   ↓
-直接构造 ConfiguredMzCommand 的互斥变体
+构造 ConfiguredMzCommand 的互斥变体
 ```
 
-已选择分区严格拒绝缺失字段、未知字段、错误类型、非法值、空白 ID 和重复的当前 ID。
-已知但未选择的分区允许缺失，其内部内容不反序列化、不校验、不物化密钥。每个
-`ConfiguredMzCommand` 变体只持有当前命令的受信配置，根构造器直接消费这些值。
+Translate 在这个公共配置阶段完整建立 `prompts.root`、全局语言模块目录、CLI 选中的
+MZ Profile 及其引用的公共 LLM Client。打开项目后才取得权威 `LanguagePair`，再执行
+第二阶段资源解析：
 
-配置错误只保存配置路径、安全原因及可用的一基行列。TOML/JSON 原文、API key 和完整配置源码不进入错误对象或错误链；读取缓冲在配置边界完成后清零。
+```text
+打开 <projects.root>/mz/<project-name>
+  ↓
+从 metadata 取得受信 LanguagePair
+  ↓
+按 source LanguageId 精确选择一个共享语言模块
+  ↓
+读取 <prompts.root>/mz/<source>--<target>.md
+  ↓
+构造 ResolvedMzTranslationResources
+```
+
+原始 `toml::Value` 只停留在未受信的 TOML 文档选择边界；`ConfiguredMzCommand`、
+`TranslateConfiguration` 及业务模块不得保存延后解释的语言或 Prompt 原始值。已选择
+分区严格拒绝缺失字段、未知字段、错误类型、非法值、空白 ID 和重复 ID。已知但未选择
+的分区允许缺失，其内部内容不反序列化、不校验、不物化密钥。
+
+用户可修复的配置或资源错误呈现稳定类别以及安全详情：配置路径、可用的一基行列、
+字段或资源路径和原因。TOML/JSON 原文、API key、Client parameters、Prompt 内容和完整
+配置源码不进入错误对象、错误链或输出。进程输出格式为
+`配置或输入错误：<安全详情>`；读取缓冲在配置边界完成后清零。
 
 ## 2. 按命令选择
 
@@ -40,22 +63,26 @@ CLI 命令
 |---|---|
 | Init | 目录发布、SQLite 建库与数据库快照 |
 | Extract | CPU、所选 Builtin/Rules/Store；只有 `--lua` 才选择 Lua 和交互会话 |
-| Translate | CPU、LLM Runtime、指定 Profile、该 Profile 引用的 Client、实际语言对、标准资产与 Store；只有 `--lua` 才选择 Lua |
+| Translate | `prompts.root`、完整 `languages`、CPU、LLM Runtime、指定 MZ Profile、该 Profile 引用的 Client、标准资产与 Store；只有 `--lua` 才选择 Lua |
 | WriteBack | CPU、目录发布与候选编辑、文档和标准资产；只有 `--lua` 才选择 Lua |
 
-Translate 只验证 CLI 指定的 Profile、它引用的 Client，以及实际项目语言对需要的 system prompt 和语言模块。其他 Profile、Client 或语言条目不阻止本次运行；当前 ID 重复或当前引用缺失仍然失败。完整 TOML 会短暂存在于读取配置所需的零化缓冲中；未选择 Client 的 API key 不会被反序列化或额外物化为秘密值，也不会进入受信配置、Debug、错误链或输出，读取缓冲在配置选择结束后零化。
+Translate 必须解析并验证全部 `[[languages]]` 条目，因此任一非法语言配置或规范化后
+重复 ID 都会阻止运行。其他 MZ Profile 和公共 Client 不因存在而被选择；当前 Profile
+或 Client ID 重复、引用缺失仍然失败。Profile 通过第一遍只读 ID、第二遍只解析命中
+条目的方式选择；未选择 Profile 除 ID 外的内容和未选择 Client 的 API key 都不会被
+反序列化或额外物化为秘密值，也不会进入受信配置、Debug、错误链或输出。
 
-配置边界直接产生四个互斥的 `ConfiguredMzCommand` 变体，每个变体把命令输入与相应
-受信配置绑定，不能把 Translate 配置交给 Init。业务模块直接接收选定 Profile。
+四个 `ConfiguredMzCommand` 变体分别把命令输入与相应受信配置绑定，不能把 Translate
+配置交给 Init。业务模块不读取配置文件，也不重新解释配置字段。
 
-## 3. 根资源配置
+## 3. 根资源配置与路径
 
 以下配置保留，因为它们拥有当前现实消费者：
 
 | 分区 | 职责 |
 |---|---|
 | `runtime.async` | Tokio 工作线程、阻塞线程上限和保活时间 |
-| `runtime.cpu` | CPU 专用线程数和有界队列 |
+| `runtime.cpu` | 共享执行层的 CPU 专用线程数和有界队列 |
 | `runtime.filesystem` | 文件工作线程、队列、单文件读取和单目录枚举上限 |
 | `runtime.filesystem.tree` | 来源指纹、候选树和候选编辑共用的条目、深度、总字节与单文件预算 |
 | `runtime.filesystem.publisher` | 单目标恢复产物数和目录发布锁等待上限 |
@@ -67,11 +94,17 @@ Translate 只验证 CLI 指定的 Profile、它引用的 Client，以及实际�
 Lua 每次脚本使用一个专用线程；SQLite 交互命令通道容量固定为 1；每个命令至多持有
 一个目录候选。这些是当前产品固定的生命周期事实，不需要用户配置。
 
-SQLite `journal_mode` 只允许 `delete`、`truncate`、`persist`、`wal`；`synchronous` 只允许 `normal`、`full`、`extra`。短操作、建库和唯一交互会话共享这些策略。
+SQLite `journal_mode` 只允许 `delete`、`truncate`、`persist`、`wal`；`synchronous`
+只允许 `normal`、`full`、`extra`。短操作、建库和唯一交互会话共享这些策略。
 
-项目锁文件固定由 MZ 项目租约服务映射到 `<projects.root>/.att-locks/projects/`，目录发布锁位于 `<projects.root>/.att-locks/directory-publish/`。不增加可配置锁根。
+MZ 工作区固定为 `<projects.root>/mz/<project-name>`。MZ 项目租约服务选择
+`<projects.root>/.att-locks/projects/mz/`，MZ 目录发布选择
+`<projects.root>/.att-locks/directory-publish/mz/`；两者均不增加可配置锁根，也不搜索
+其他工作区或锁目录。
 
-不对 `projects.root` 做全局文件系统品牌预检。读取、提取和翻译只要求其实际文件操作成立；项目租约、目录发布和审计分别在真实操作发生时验证自己需要的锁、身份、同卷切换、追加和刷盘能力。
+不对 `projects.root` 做全局文件系统品牌预检。读取、提取和翻译只要求其实际文件操作
+成立；项目租约、目录发布和审计分别在真实操作发生时验证自己需要的锁、身份、同卷
+切换、追加和刷盘能力。
 
 ## 4. 审计配置
 
@@ -89,11 +122,13 @@ max_file_bytes = 268435456
 retained_rotated_files = 8
 ```
 
-这些值分别控制唯一审计 worker 的队列、跨进程锁等待、单条记录、活动文件和轮转保留。审计不是可丢失的调试日志；意图没有持久化时不得开始对应网络请求或目录发布。
+这些值分别控制唯一审计 worker 的队列、跨进程锁等待、单条记录、活动文件和轮转保留。
+审计不是可丢失的调试日志；意图没有持久化时不得开始对应网络请求或目录发布。
 
 ## 5. 公共 LLM Client
 
-公共 Client 仍使用 `url`、`api_key`、`model`、`timeout_ms`、`rpm`、`burst` 和严格 JSON `parameters`。MZ Profile 只按精确 `llm_client` ID 引用它，不重复拥有网络身份。
+公共 Client 使用 `url`、`api_key`、`model`、`timeout_ms`、`rpm`、`burst` 和严格 JSON
+`parameters`。MZ Profile 只按精确 `llm_client` ID 引用它，不重复拥有网络身份。
 
 ```toml
 [llm.clients.primary]
@@ -106,12 +141,83 @@ burst = 8
 parameters = '''{}'''
 ```
 
-`parameters` 必须是完整 JSON 对象，递归拒绝重复键，并拒绝注释、尾逗号、并列值和截断内容。顶层不得包含 `model`、`messages` 或 `stream`；其余字段由用户拥有，程序不解释或改写。Standard 与 Translate Lua 使用配置边界已经选择的同一个 Client 和执行 Profile，共享 HTTP 连接池、全局容量与客户端 RPM/burst。
+`parameters` 必须是完整 JSON 对象，递归拒绝重复键，并拒绝注释、尾逗号、并列值和
+截断内容。顶层不得包含 `model`、`messages` 或 `stream`；其余字段由用户拥有，程序
+不解释或改写。Standard 与 Translate Lua 使用配置边界已经选择的同一个 Client，
+共享 HTTP 连接池、全局容量与客户端 RPM/burst；Lua 不接收 MZ planning 或 request
+策略。
 
-## 6. MZ 业务配置
+## 6. 共享语言目录与 MZ Prompt
 
-`mz.document`、`mz.standard_asset`、Extract/Translate Store 和实际算法并发均由其现实
-消费配置建立。语言模块和 Translation Profile 只在 Translate 选择边界使用；业务模块
-直接接收受信的语言对和 `Arc<TranslationExecutionProfile>`。
+翻译语言能力属于跨引擎共享配置，使用顶层 `[[languages]]`：
 
-Init 的五项项目事实来自 CLI 或已有数据库，不从配置推断默认值。首次创建时五项全部必需；已有项目省略单项表示复用数据库中的当前事实。
+```toml
+[prompts]
+root = "prompts"
+
+[[languages]]
+type = "japanese"
+id = "ja"
+minimum_kana_characters = 1
+allowed_terms = []
+quote_repair_pairs = [["“", "”"], ["‘", "’"]]
+
+[[languages]]
+type = "english"
+id = "en"
+minimum_word_count = 1
+minimum_letter_count = 2
+ignored_terms = []
+minimum_copied_word_count = 2
+minimum_copied_letter_count = 4
+allowed_terms = []
+```
+
+`LanguageId` 在 CLI、TOML 和其他外部文本进入内部时执行 RFC 5646 解析、IANA 注册表
+校验和 canonicalization。合法大小写变体会立即规范化，例如 `en-us` 成为 `en-US`；
+首尾空白、下划线、非法或未注册子标签以及主语言 `und` 均被拒绝。`LanguagePair`
+承载规范源语言和目标语言；`LanguageModuleCatalog` 以规范 `LanguageId` 为唯一 key，
+精确查询，不做父语言或别名回退。
+
+`prompts.root` 对 Translate 必填。MZ Prompt 不属于共享语言模块，也不属于 Profile；
+它由 MZ 按权威项目语言对派生精确路径：
+
+```text
+<prompts.root>/mz/<source>--<target>.md
+```
+
+例如 `ja--zh-Hans.md` 和 `en--zh-Hans.md`。文件名直接使用规范语言标签；只读取该路径
+指向的普通文件，不尝试大小写变体、父语言、默认文件或目录首项。文件必须是合法
+UTF-8 且内容不能全为空白。`MzSystemPrompt` 绑定读取时的精确 `LanguagePair`，并与
+同一 `Arc<dyn LanguageModule>` 共同组成 `ResolvedMzTranslationResources`。Prompt
+内容和语言策略指纹继续参与逐叶翻译状态指纹。
+
+## 7. MZ Profile 与所有权
+
+```toml
+[[mz.translation_profiles]]
+id = "primary"
+llm_client = "primary"
+max_in_flight_tasks = 4
+
+[mz.translation_profiles.planning]
+scope_concurrency = 4
+max_message_characters = 24000
+
+[mz.translation_profiles.execution]
+network_retry_delays_ms = [500, 1500, 5000]
+max_network_retry_after_ms = 30000
+```
+
+配置中不存在语言对到 Prompt 的映射。受信 `MzTranslationProfile<L>` 只保存 ID、非零
+任务并发、`MzTranslationPlanningConfiguration`、`MzTranslationRequestConfiguration`
+和所选公共 Client。Profile ID 精确匹配，不 trim、不折叠大小写、不提供别名或默认项。
+
+`LanguageId`、`LanguagePair`、`LanguageModuleCatalog`、公共 LLM、文件、SQLite 和 CPU
+执行器属于共享能力。MZ Profile、Prompt 协议、项目 schema、工作区布局、数据库对账
+和写回布局仍由 `att_mz` 拥有；MZ 项目数据库能力位于 `att_mz::project_database`，
+不建立通用项目数据库或跨引擎 Prompt Resolver。
+
+`mz.document`、`mz.standard_asset`、Extract/Translate Store 和实际算法并发仍由其现实
+消费配置建立。Init 的五项项目事实来自 CLI 或已有数据库，不从配置推断默认值。首次
+创建时五项全部必需；已有项目省略单项表示复用数据库中的当前事实。

@@ -8,16 +8,17 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use super::ProjectName;
-use crate::project_database::{
+use crate::att_mz::project_database::{
     ProjectDatabaseRecordReader, ProjectWorkspaceLayout, SourceSnapshotFingerprint,
     StoredProjectRecord,
 };
+use crate::language::{LanguageId, LanguagePair};
 use crate::storage::file_system::{
     DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
     DirectoryTreeRoot, ExistingDirectoryResolver, ResolveDirectoryError,
 };
 
-pub(crate) use crate::project_database::{MaxFullwidthChars, MzWriteBackLayoutProfile};
+pub(crate) use crate::att_mz::project_database::{MaxFullwidthChars, MzWriteBackLayoutProfile};
 
 /// 已由项目开启边界建立、可供 MZ 各用例直接信任的项目上下文。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,12 +37,15 @@ impl OpenedProject {
         target_language: String,
         layout_profile: MzWriteBackLayoutProfile,
     ) -> Self {
+        let language_pair = LanguagePair::new(
+            LanguageId::parse(&source_language).expect("测试源语言应为有效规范标签"),
+            LanguageId::parse(&target_language).expect("测试目标语言应为有效规范标签"),
+        );
         Self::from_record(StoredProjectRecord::new(
             name,
             workspace_root,
             database_path,
-            source_language,
-            target_language,
+            language_pair,
             layout_profile,
         ))
     }
@@ -74,11 +78,15 @@ impl OpenedProject {
         self.record.database_path()
     }
 
-    pub(crate) fn source_language(&self) -> &str {
+    pub(crate) fn language_pair(&self) -> &LanguagePair {
+        self.record.language_pair()
+    }
+
+    pub(crate) fn source_language(&self) -> &LanguageId {
         self.record.source_language()
     }
 
-    pub(crate) fn target_language(&self) -> &str {
+    pub(crate) fn target_language(&self) -> &LanguageId {
         self.record.target_language()
     }
 
@@ -409,8 +417,10 @@ mod tests {
             "游戏 一".parse().expect("测试项目名称应该有效"),
             PathBuf::from("C:/att/projects/游戏 一"),
             PathBuf::from("C:/att/projects/游戏 一/project.db"),
-            "ja".to_owned(),
-            "zh-Hans".to_owned(),
+            LanguagePair::new(
+                LanguageId::parse("ja").expect("测试源语言应合法"),
+                LanguageId::parse("zh-Hans").expect("测试目标语言应合法"),
+            ),
             profile(),
         )
     }
@@ -475,8 +485,8 @@ mod tests {
             opened.layout().source_js(),
             Path::new("C:/att/projects/游戏 一/source/js")
         );
-        assert_eq!(opened.source_language(), "ja");
-        assert_eq!(opened.target_language(), "zh-Hans");
+        assert_eq!(opened.source_language().as_str(), "ja");
+        assert_eq!(opened.target_language().as_str(), "zh-Hans");
         assert_eq!(
             opened.source_snapshot_fingerprint(),
             SourceSnapshotFingerprint::from_bytes([0xa5; 32])

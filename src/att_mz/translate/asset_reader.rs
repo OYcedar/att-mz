@@ -9,16 +9,16 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
 use crate::att_mz::project::OpenedProject;
+use crate::att_mz::project_database::{
+    PLACEHOLDER_RULES_RESOURCE_KIND, SourceSnapshotFingerprint, TERMINOLOGY_RESOURCE_KIND,
+};
 use crate::att_mz::standard_asset::{
     MzStandardAssetLocationError, MzStandardAssetOwner, MzStandardAssetReadingConfig,
     MzStandardAssetStorageKind, MzStandardAssetTable, MzTextBodyUnit,
 };
 use crate::att_mz::text::{MzLocation, TextGroupKind};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
-use crate::project_database::{
-    PLACEHOLDER_RULES_RESOURCE_KIND, SourceSnapshotFingerprint, TERMINOLOGY_RESOURCE_KIND,
-};
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
 };

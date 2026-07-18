@@ -10,10 +10,10 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
 use crate::att_mz::project::OpenedProject;
+use crate::att_mz::project_database::{PLACEHOLDER_RULES_RESOURCE_KIND, TERMINOLOGY_RESOURCE_KIND};
 use crate::att_mz::standard_asset::{MzStandardAssetStorageKind, MzStandardAssetTable};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
-use crate::project_database::{PLACEHOLDER_RULES_RESOURCE_KIND, TERMINOLOGY_RESOURCE_KIND};
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
     ExecuteTransactionError, SqliteCommand, SqliteQuery, SqliteTransactionExecutor,
     SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
@@ -783,11 +783,11 @@ mod tests {
     use rusqlite::{Connection, params_from_iter};
 
     use crate::att_mz::ProjectName;
+    use crate::att_mz::project_database::SourceSnapshotFingerprint;
     use crate::att_mz::standard_asset::MzStandardAssetOwner;
     use crate::att_mz::text::{
         MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
     };
-    use crate::project_database::SourceSnapshotFingerprint;
     use crate::storage::sqlite::SqliteTransactionStep;
 
     use super::*;

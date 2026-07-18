@@ -1,4 +1,4 @@
-//! 项目数据库的创建职责。
+//! MZ 项目数据库的创建、读取与状态收敛职责。
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::att_mz::ProjectName;
 use crate::att_mz::standard_asset::MzStandardAssetOwner;
 use crate::fingerprint::{InvalidSha256FingerprintLength, Sha256Fingerprint};
+use crate::language::{LanguageId, LanguageIdError, LanguagePair};
 use crate::storage::sqlite::{
     CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand,
     SqliteDatabaseCreator, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor,
@@ -270,7 +271,11 @@ pub(crate) struct ProjectWorkspaceLayout {
 impl ProjectWorkspaceLayout {
     /// 从项目集合根和受信项目名定位工作区。
     pub(crate) fn for_project(projects_root: &Path, name: &ProjectName) -> Self {
-        Self::from_workspace_root(projects_root.join(name.as_str()))
+        Self::from_workspace_root(
+            projects_root
+                .join(super::ENGINE_DIRECTORY_NAME)
+                .join(name.as_str()),
+        )
     }
 
     /// 从已经确定的工作区根建立全部固定位置。
@@ -401,8 +406,7 @@ impl MzWriteBackLayoutProfile {
 pub(crate) struct StoredProjectRecord {
     name: ProjectName,
     layout: ProjectWorkspaceLayout,
-    source_language: String,
-    target_language: String,
+    language_pair: LanguagePair,
     source_snapshot_fingerprint: SourceSnapshotFingerprint,
     layout_profile: MzWriteBackLayoutProfile,
 }
@@ -414,8 +418,7 @@ impl StoredProjectRecord {
         name: ProjectName,
         workspace_root: PathBuf,
         database_path: PathBuf,
-        source_language: String,
-        target_language: String,
+        language_pair: LanguagePair,
         layout_profile: MzWriteBackLayoutProfile,
     ) -> Self {
         let layout = ProjectWorkspaceLayout::from_workspace_root(workspace_root);
@@ -427,8 +430,7 @@ impl StoredProjectRecord {
         Self::from_layout(
             name,
             layout,
-            source_language,
-            target_language,
+            language_pair,
             SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
             layout_profile,
         )
@@ -438,16 +440,14 @@ impl StoredProjectRecord {
     pub(crate) fn from_layout(
         name: ProjectName,
         layout: ProjectWorkspaceLayout,
-        source_language: String,
-        target_language: String,
+        language_pair: LanguagePair,
         source_snapshot_fingerprint: SourceSnapshotFingerprint,
         layout_profile: MzWriteBackLayoutProfile,
     ) -> Self {
         Self {
             name,
             layout,
-            source_language,
-            target_language,
+            language_pair,
             source_snapshot_fingerprint,
             layout_profile,
         }
@@ -473,12 +473,16 @@ impl StoredProjectRecord {
         self.layout.database_path()
     }
 
-    pub(crate) fn source_language(&self) -> &str {
-        &self.source_language
+    pub(crate) fn language_pair(&self) -> &LanguagePair {
+        &self.language_pair
     }
 
-    pub(crate) fn target_language(&self) -> &str {
-        &self.target_language
+    pub(crate) fn source_language(&self) -> &LanguageId {
+        self.language_pair.source()
+    }
+
+    pub(crate) fn target_language(&self) -> &LanguageId {
+        self.language_pair.target()
     }
 
     pub(crate) const fn source_snapshot_fingerprint(&self) -> SourceSnapshotFingerprint {
@@ -561,8 +565,7 @@ fn record_from_rows<E>(
     Ok(StoredProjectRecord::from_layout(
         metadata.name,
         layout,
-        metadata.source_language,
-        metadata.target_language,
+        metadata.language_pair,
         metadata.source_snapshot_fingerprint,
         metadata.layout_profile,
     ))
@@ -571,8 +574,7 @@ fn record_from_rows<E>(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProjectMetadataFacts {
     name: ProjectName,
-    source_language: String,
-    target_language: String,
+    language_pair: LanguagePair,
     source_snapshot_fingerprint: SourceSnapshotFingerprint,
     layout_profile: MzWriteBackLayoutProfile,
 }
@@ -597,11 +599,11 @@ fn metadata_facts_from_rows(
 
     let mut values = values.into_iter();
     let stored_name = text_column(values.next().expect("已确认 metadata 恰好有七列"), "name")?;
-    let source_language = text_column(
+    let source_language = language_id_column(
         values.next().expect("已确认 metadata 恰好有七列"),
         "source_language",
     )?;
-    let target_language = text_column(
+    let target_language = language_id_column(
         values.next().expect("已确认 metadata 恰好有七列"),
         "target_language",
     )?;
@@ -630,21 +632,9 @@ fn metadata_facts_from_rows(
         });
     }
 
-    if source_language.trim().is_empty() {
-        return Err(InvalidProjectMetadata::BlankLanguage {
-            column: "source_language",
-        });
-    }
-    if target_language.trim().is_empty() {
-        return Err(InvalidProjectMetadata::BlankLanguage {
-            column: "target_language",
-        });
-    }
-
     Ok(ProjectMetadataFacts {
         name: stored_name,
-        source_language,
-        target_language,
+        language_pair: LanguagePair::new(source_language, target_language),
         source_snapshot_fingerprint,
         layout_profile: MzWriteBackLayoutProfile::new(
             dialogue_max_fullwidth_chars,
@@ -663,6 +653,23 @@ fn text_column(value: SqliteValue, column: &'static str) -> Result<String, Inval
             actual: value.kind_name(),
         }),
     }
+}
+
+fn language_id_column(
+    value: SqliteValue,
+    column: &'static str,
+) -> Result<LanguageId, InvalidProjectMetadata> {
+    let stored = text_column(value, column)?;
+    let language_id = LanguageId::parse(&stored)
+        .map_err(|source| InvalidProjectMetadata::InvalidLanguage { column, source })?;
+    if language_id.as_str() != stored {
+        return Err(InvalidProjectMetadata::NonCanonicalLanguage {
+            column,
+            stored,
+            canonical: language_id.as_str().to_owned(),
+        });
+    }
+    Ok(language_id)
 }
 
 fn source_snapshot_fingerprint_column(
@@ -787,8 +794,14 @@ pub(crate) enum InvalidProjectMetadata {
         requested: String,
         stored: String,
     },
-    BlankLanguage {
+    InvalidLanguage {
         column: &'static str,
+        source: LanguageIdError,
+    },
+    NonCanonicalLanguage {
+        column: &'static str,
+        stored: String,
+        canonical: String,
     },
     InvalidLineWidth {
         column: &'static str,
@@ -821,7 +834,17 @@ impl fmt::Display for InvalidProjectMetadata {
                 formatter,
                 "项目名称不匹配，请求 {requested:?}，数据库记录 {stored:?}"
             ),
-            Self::BlankLanguage { column } => write!(formatter, "{column} 不能为空白"),
+            Self::InvalidLanguage { column, source } => {
+                write!(formatter, "字段 {column} 不是有效语言 ID：{source}")
+            }
+            Self::NonCanonicalLanguage {
+                column,
+                stored,
+                canonical,
+            } => write!(
+                formatter,
+                "字段 {column} 必须保存规范语言 ID，实际为 {stored:?}，规范形式为 {canonical:?}"
+            ),
             Self::InvalidLineWidth { column, actual } => {
                 write!(
                     formatter,
@@ -836,7 +859,14 @@ impl fmt::Display for InvalidProjectMetadata {
     }
 }
 
-impl Error for InvalidProjectMetadata {}
+impl Error for InvalidProjectMetadata {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidLanguage { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveOwnerState {
@@ -866,8 +896,7 @@ impl ProjectDatabaseState {
     #[cfg(test)]
     pub(crate) fn for_test(
         name: ProjectName,
-        source_language: String,
-        target_language: String,
+        language_pair: LanguagePair,
         source_snapshot_fingerprint: SourceSnapshotFingerprint,
         layout_profile: MzWriteBackLayoutProfile,
         owners: Vec<(MzStandardAssetOwner, SourceSnapshotFingerprint)>,
@@ -875,8 +904,7 @@ impl ProjectDatabaseState {
         Self {
             metadata: ProjectMetadataFacts {
                 name,
-                source_language,
-                target_language,
+                language_pair,
                 source_snapshot_fingerprint,
                 layout_profile,
             },
@@ -893,12 +921,16 @@ impl ProjectDatabaseState {
         }
     }
 
-    pub(crate) fn source_language(&self) -> &str {
-        &self.metadata.source_language
+    pub(crate) fn language_pair(&self) -> &LanguagePair {
+        &self.metadata.language_pair
     }
 
-    pub(crate) fn target_language(&self) -> &str {
-        &self.metadata.target_language
+    pub(crate) fn source_language(&self) -> &LanguageId {
+        self.metadata.language_pair.source()
+    }
+
+    pub(crate) fn target_language(&self) -> &LanguageId {
+        self.metadata.language_pair.target()
     }
 
     pub(crate) fn layout_profile(&self) -> &MzWriteBackLayoutProfile {
@@ -1269,8 +1301,7 @@ fn validate_integrity(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NewProject {
     name: ProjectName,
-    source_language: String,
-    target_language: String,
+    language_pair: LanguagePair,
     source_snapshot_fingerprint: SourceSnapshotFingerprint,
     layout_profile: MzWriteBackLayoutProfile,
 }
@@ -1279,15 +1310,13 @@ impl NewProject {
     /// 汇集创建项目数据库所需的全部受信事实。
     pub(crate) fn new(
         name: ProjectName,
-        source_language: String,
-        target_language: String,
+        language_pair: LanguagePair,
         source_snapshot_fingerprint: SourceSnapshotFingerprint,
         layout_profile: MzWriteBackLayoutProfile,
     ) -> Self {
         Self {
             name,
-            source_language,
-            target_language,
+            language_pair,
             source_snapshot_fingerprint,
             layout_profile,
         }
@@ -1297,12 +1326,12 @@ impl NewProject {
         &self.name
     }
 
-    pub(crate) fn source_language(&self) -> &str {
-        &self.source_language
+    pub(crate) fn source_language(&self) -> &LanguageId {
+        self.language_pair.source()
     }
 
-    pub(crate) fn target_language(&self) -> &str {
-        &self.target_language
+    pub(crate) fn target_language(&self) -> &LanguageId {
+        self.language_pair.target()
     }
 
     pub(crate) const fn source_snapshot_fingerprint(&self) -> SourceSnapshotFingerprint {
@@ -1689,8 +1718,8 @@ WHERE (SELECT COUNT(*) FROM metadata) <> 1
    )"#,
         vec![
             SqliteValue::Text(state.metadata.name.as_str().to_owned()),
-            SqliteValue::Text(state.metadata.source_language.clone()),
-            SqliteValue::Text(state.metadata.target_language.clone()),
+            SqliteValue::Text(state.metadata.language_pair.source().as_str().to_owned()),
+            SqliteValue::Text(state.metadata.language_pair.target().as_str().to_owned()),
             SqliteValue::Blob(
                 state
                     .metadata
@@ -1767,8 +1796,7 @@ where
     R: Error + Send + Sync + 'static,
     T: SqliteTransactionExecutor,
 {
-    let language_changed = current.metadata.source_language != requested.source_language
-        || current.metadata.target_language != requested.target_language;
+    let language_changed = current.metadata.language_pair != requested.language_pair;
     let changed = language_changed
         || current.metadata.source_snapshot_fingerprint != requested.source_snapshot_fingerprint
         || current.metadata.layout_profile != requested.layout_profile;
@@ -1800,8 +1828,8 @@ where
     steps.push(SqliteTransactionStep::Execute(SqliteCommand::new(
         UPDATE_METADATA,
         vec![
-            SqliteValue::Text(requested.source_language.clone()),
-            SqliteValue::Text(requested.target_language.clone()),
+            SqliteValue::Text(requested.language_pair.source().as_str().to_owned()),
+            SqliteValue::Text(requested.language_pair.target().as_str().to_owned()),
             SqliteValue::Blob(requested.source_snapshot_fingerprint.as_bytes().to_vec()),
             SqliteValue::Integer(i64::from(requested.layout_profile.dialogue_body().get())),
             SqliteValue::Integer(i64::from(requested.layout_profile.scrolling_text().get())),
@@ -1841,8 +1869,7 @@ where
     let state = ProjectDatabaseState {
         metadata: ProjectMetadataFacts {
             name: requested.name,
-            source_language: requested.source_language,
-            target_language: requested.target_language,
+            language_pair: requested.language_pair,
             source_snapshot_fingerprint: requested.source_snapshot_fingerprint,
             layout_profile: requested.layout_profile,
         },
@@ -1934,8 +1961,8 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
         INSERT_METADATA,
         vec![
             SqliteValue::Text(project.name().as_str().to_owned()),
-            SqliteValue::Text(project.source_language().to_owned()),
-            SqliteValue::Text(project.target_language().to_owned()),
+            SqliteValue::Text(project.source_language().as_str().to_owned()),
+            SqliteValue::Text(project.target_language().as_str().to_owned()),
             SqliteValue::Blob(project.source_snapshot_fingerprint().as_bytes().to_vec()),
             SqliteValue::Integer(i64::from(project.layout_profile().dialogue_body().get())),
             SqliteValue::Integer(i64::from(project.layout_profile().scrolling_text().get())),
@@ -2052,27 +2079,27 @@ mod tests {
 
         assert_eq!(
             layout.workspace_root(),
-            Path::new("C:/att/projects/测试 游戏")
+            Path::new("C:/att/projects/mz/测试 游戏")
         );
         assert_eq!(
             layout.database_path(),
-            Path::new("C:/att/projects/测试 游戏/project.db")
+            Path::new("C:/att/projects/mz/测试 游戏/project.db")
         );
         assert_eq!(
             layout.source_root(),
-            Path::new("C:/att/projects/测试 游戏/source")
+            Path::new("C:/att/projects/mz/测试 游戏/source")
         );
         assert_eq!(
             layout.source_data(),
-            Path::new("C:/att/projects/测试 游戏/source/data")
+            Path::new("C:/att/projects/mz/测试 游戏/source/data")
         );
         assert_eq!(
             layout.source_js(),
-            Path::new("C:/att/projects/测试 游戏/source/js")
+            Path::new("C:/att/projects/mz/测试 游戏/source/js")
         );
         assert_eq!(
             layout.write_back_root(),
-            Path::new("C:/att/projects/测试 游戏/write_back")
+            Path::new("C:/att/projects/mz/测试 游戏/write_back")
         );
     }
 
@@ -2137,11 +2164,18 @@ mod tests {
     fn project(name: &str) -> NewProject {
         NewProject::new(
             name.parse().expect("test project name should be valid"),
-            "ja".to_owned(),
-            "zh-CN".to_owned(),
+            language_pair("JA", "zh-cn"),
             test_source_snapshot_fingerprint(),
             layout_profile(),
         )
+    }
+
+    fn language_id(value: &str) -> LanguageId {
+        LanguageId::parse(value).expect("test language ID should be valid")
+    }
+
+    fn language_pair(source: &str, target: &str) -> LanguagePair {
+        LanguagePair::new(language_id(source), language_id(target))
     }
 
     fn test_source_snapshot_fingerprint() -> SourceSnapshotFingerprint {
@@ -2722,8 +2756,8 @@ mod tests {
             .await
             .expect("当前 schema 与项目事实应通过严格检查");
 
-        assert_eq!(state.source_language(), "ja");
-        assert_eq!(state.target_language(), "zh-Hans");
+        assert_eq!(state.source_language().as_str(), "ja");
+        assert_eq!(state.target_language().as_str(), "zh-Hans");
         assert_eq!(
             state.active_owner_freshness(),
             vec![
@@ -2749,14 +2783,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_rejects_noncanonical_language_metadata_without_writing() {
+        let mut responses = valid_inspection_responses();
+        responses[2] = Ok(vec![metadata_row(
+            SqliteValue::Text("测试 游戏".to_owned()),
+            SqliteValue::Text("en-us".to_owned()),
+            SqliteValue::Text("zh-Hans".to_owned()),
+            SqliteValue::Integer(24),
+            SqliteValue::Integer(30),
+            SqliteValue::Integer(18),
+        )]);
+        let queries = RecordingQueryExecutor::responding_with_many(responses);
+        let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
+        let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
+        let requested = NewProject::new(
+            "测试 游戏".parse().expect("项目名应合法"),
+            language_pair("en-US", "zh-Hans"),
+            test_source_snapshot_fingerprint(),
+            layout_profile(),
+        );
+
+        let error = service
+            .reconcile(PathBuf::from("C:/projects/demo/project.db"), requested)
+            .await
+            .expect_err("非规范语言 metadata 必须在对账写入前失败");
+
+        let ProjectDatabaseReconciliationError::Inspection(
+            ProjectDatabaseInspectionError::InvalidDatabase {
+                reason:
+                    InvalidCurrentProjectDatabase::Metadata(
+                        InvalidProjectMetadata::NonCanonicalLanguage {
+                            column,
+                            stored,
+                            canonical,
+                        },
+                    ),
+                ..
+            },
+        ) = error
+        else {
+            panic!("应报告项目 metadata 中的非规范语言")
+        };
+        assert_eq!(column, "source_language");
+        assert_eq!(stored, "en-us");
+        assert_eq!(canonical, "en-US");
+        assert_eq!(
+            service
+                .queries
+                .invocations
+                .lock()
+                .expect("查询记录锁不应中毒")
+                .len(),
+            3
+        );
+        assert!(
+            service
+                .transactions
+                .plans
+                .lock()
+                .expect("事务记录锁不应中毒")
+                .is_empty(),
+            "非规范 metadata 不得触发修复或其他写事务"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_rejects_invalid_language_metadata_without_writing() {
+        let mut responses = valid_inspection_responses();
+        responses[2] = Ok(vec![metadata_row(
+            SqliteValue::Text("测试 游戏".to_owned()),
+            SqliteValue::Text("en_US".to_owned()),
+            SqliteValue::Text("zh-Hans".to_owned()),
+            SqliteValue::Integer(24),
+            SqliteValue::Integer(30),
+            SqliteValue::Integer(18),
+        )]);
+        let queries = RecordingQueryExecutor::responding_with_many(responses);
+        let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
+        let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
+        let requested = NewProject::new(
+            "测试 游戏".parse().expect("项目名应合法"),
+            language_pair("en-US", "zh-Hans"),
+            test_source_snapshot_fingerprint(),
+            layout_profile(),
+        );
+
+        let error = service
+            .reconcile(PathBuf::from("C:/projects/demo/project.db"), requested)
+            .await
+            .expect_err("非法语言 metadata 必须在对账写入前失败");
+
+        assert!(matches!(
+            error,
+            ProjectDatabaseReconciliationError::Inspection(
+                ProjectDatabaseInspectionError::InvalidDatabase {
+                    reason: InvalidCurrentProjectDatabase::Metadata(
+                        InvalidProjectMetadata::InvalidLanguage {
+                            column: "source_language",
+                            ..
+                        }
+                    ),
+                    ..
+                }
+            )
+        ));
+        assert!(
+            service
+                .transactions
+                .plans
+                .lock()
+                .expect("事务记录锁不应中毒")
+                .is_empty(),
+            "非法 metadata 不得触发修复或其他写事务"
+        );
+    }
+
+    #[tokio::test]
     async fn reconciliation_clears_language_dependent_state_and_uses_cas_guards() {
         let queries = RecordingQueryExecutor::responding_with_many(valid_inspection_responses());
         let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
         let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
         let requested = NewProject::new(
             "测试 游戏".parse().expect("项目名应合法"),
-            "en".to_owned(),
-            "zh-Hans".to_owned(),
+            language_pair("en", "zh-Hans"),
             SourceSnapshotFingerprint::from_bytes([0x7c; 32]),
             MzWriteBackLayoutProfile::new(width(26), width(32), width(20)),
         );
@@ -2770,7 +2919,7 @@ mod tests {
             result.stale_owners(),
             vec![MzStandardAssetOwner::Builtin, MzStandardAssetOwner::Lua]
         );
-        assert_eq!(result.state().source_language(), "en");
+        assert_eq!(result.state().source_language().as_str(), "en");
         assert_eq!(
             result.state().source_snapshot_fingerprint(),
             SourceSnapshotFingerprint::from_bytes([0x7c; 32])
@@ -2809,8 +2958,7 @@ mod tests {
         let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
         let requested = NewProject::new(
             "测试 游戏".parse().expect("项目名应合法"),
-            "ja".to_owned(),
-            "zh-Hans".to_owned(),
+            language_pair("ja", "zh-Hans"),
             SourceSnapshotFingerprint::from_bytes([0x7c; 32]),
             layout_profile(),
         );
@@ -2848,22 +2996,22 @@ mod tests {
         assert_eq!(record.name(), &requested);
         assert_eq!(
             record.workspace_root(),
-            Path::new("C:/att/projects/测试 游戏")
+            Path::new("C:/att/projects/mz/测试 游戏")
         );
         assert_eq!(
             record.database_path(),
-            Path::new("C:/att/projects/测试 游戏/project.db")
+            Path::new("C:/att/projects/mz/测试 游戏/project.db")
         );
         assert_eq!(
             record.layout().source_data(),
-            Path::new("C:/att/projects/测试 游戏/source/data")
+            Path::new("C:/att/projects/mz/测试 游戏/source/data")
         );
         assert_eq!(
             record.layout().source_js(),
-            Path::new("C:/att/projects/测试 游戏/source/js")
+            Path::new("C:/att/projects/mz/测试 游戏/source/js")
         );
-        assert_eq!(record.source_language(), "ja");
-        assert_eq!(record.target_language(), "zh-Hans");
+        assert_eq!(record.source_language().as_str(), "ja");
+        assert_eq!(record.target_language().as_str(), "zh-Hans");
         assert_eq!(
             record.source_snapshot_fingerprint(),
             test_source_snapshot_fingerprint()
@@ -2878,7 +3026,7 @@ mod tests {
         assert_eq!(invocations.len(), 1);
         assert_eq!(
             invocations[0].path,
-            PathBuf::from("C:/att/projects/测试 游戏/project.db")
+            PathBuf::from("C:/att/projects/mz/测试 游戏/project.db")
         );
         assert_eq!(invocations[0].query.statement(), SELECT_METADATA);
         assert!(invocations[0].query.parameters().is_empty());
@@ -2896,7 +3044,7 @@ mod tests {
         ));
         assert_eq!(
             not_found.path(),
-            Path::new("C:/att/projects/demo/project.db")
+            Path::new("C:/att/projects/mz/demo/project.db")
         );
         assert!(not_found.source().is_none());
 
@@ -2908,7 +3056,7 @@ mod tests {
         .expect_err("query failure should be preserved");
         assert_eq!(
             read_failure.path(),
-            Path::new("C:/att/projects/demo/project.db")
+            Path::new("C:/att/projects/mz/demo/project.db")
         );
         assert!(matches!(
             read_failure,
@@ -3042,7 +3190,7 @@ mod tests {
                     SqliteValue::Integer(30),
                     SqliteValue::Integer(18),
                 ),
-                ExpectedInvalidMetadata::BlankLanguage,
+                ExpectedInvalidMetadata::InvalidLanguage,
             ),
             (
                 metadata_row(
@@ -3053,7 +3201,18 @@ mod tests {
                     SqliteValue::Integer(30),
                     SqliteValue::Integer(18),
                 ),
-                ExpectedInvalidMetadata::BlankLanguage,
+                ExpectedInvalidMetadata::InvalidLanguage,
+            ),
+            (
+                metadata_row(
+                    SqliteValue::Text("demo".to_owned()),
+                    SqliteValue::Text("en-us".to_owned()),
+                    SqliteValue::Text("zh".to_owned()),
+                    SqliteValue::Integer(24),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(18),
+                ),
+                ExpectedInvalidMetadata::NonCanonicalLanguage,
             ),
             (
                 metadata_row(
@@ -3110,7 +3269,8 @@ mod tests {
         WrongColumnType,
         InvalidProjectName,
         NameMismatch,
-        BlankLanguage,
+        InvalidLanguage,
+        NonCanonicalLanguage,
         InvalidLineWidth,
         InvalidSourceSnapshotFingerprintLength,
     }
@@ -3124,7 +3284,8 @@ mod tests {
                 InvalidProjectMetadata::WrongColumnType { .. } => Self::WrongColumnType,
                 InvalidProjectMetadata::InvalidProjectName { .. } => Self::InvalidProjectName,
                 InvalidProjectMetadata::NameMismatch { .. } => Self::NameMismatch,
-                InvalidProjectMetadata::BlankLanguage { .. } => Self::BlankLanguage,
+                InvalidProjectMetadata::InvalidLanguage { .. } => Self::InvalidLanguage,
+                InvalidProjectMetadata::NonCanonicalLanguage { .. } => Self::NonCanonicalLanguage,
                 InvalidProjectMetadata::InvalidLineWidth { .. } => Self::InvalidLineWidth,
                 InvalidProjectMetadata::InvalidSourceSnapshotFingerprintLength { .. } => {
                     Self::InvalidSourceSnapshotFingerprintLength

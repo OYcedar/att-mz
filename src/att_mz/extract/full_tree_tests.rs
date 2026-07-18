@@ -17,14 +17,14 @@ use super::service::ExtractService;
 use super::store::asset_store::{MzExtractionAssetStore, MzExtractionAssetStoreConfig};
 use super::{ExtractInput, SelectedRules};
 use crate::att_mz::project::ExistingProjectOpeningService;
+use crate::att_mz::project_database::ProjectDatabaseRecordReadingService;
 use crate::att_mz::project_lease::{
     ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
 };
 use crate::att_mz::{ProjectName, SelectedLua};
 use crate::execution::OperationCompletion;
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
-use crate::project_database::ProjectDatabaseRecordReadingService;
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
     DirectoryEntry, DirectoryLister, DirectoryTreeFingerprintError,
     DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, ExistingDirectoryResolver,
@@ -195,7 +195,10 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
     ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>> {
         assert_eq!(
             path,
-            PathBuf::from("C:/Projects").join("demo").join("project.db")
+            PathBuf::from("C:/Projects")
+                .join("mz")
+                .join("demo")
+                .join("project.db")
         );
         assert!(query.statement().contains("FROM metadata"));
         assert!(query.parameters().is_empty());
@@ -228,7 +231,10 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
     ) -> Result<(), ExecuteTransactionError<Self::Error>> {
         assert_eq!(
             path,
-            PathBuf::from("C:/Projects").join("demo").join("project.db")
+            PathBuf::from("C:/Projects")
+                .join("mz")
+                .join("demo")
+                .join("project.db")
         );
         let owner = transaction_owner(&plan);
         let event = match owner {
@@ -299,12 +305,12 @@ struct RecordedLuaInvocation {
 }
 
 impl TrustedLuaExecutionHost for FakeTrustedLuaExecutionHost {
-    type TranslationProfile = ();
+    type TranslationClient = ();
     type Error = FakeRootError;
 
     async fn execute(
         &self,
-        invocation: LuaInvocation<Self::TranslationProfile>,
+        invocation: LuaInvocation<Self::TranslationClient>,
     ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
         self.events.lock().expect("事件锁不应中毒").push(Event::Lua);
         let LuaInvocation::Extract {

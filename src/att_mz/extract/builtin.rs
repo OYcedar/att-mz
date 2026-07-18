@@ -11,7 +11,7 @@ use futures_util::stream;
 use serde_json::{Map, Value};
 
 use crate::att_mz::project::OpenedProject;
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
 use super::document::{
     MzDocumentId, MzDocumentSelection, MzProjectDocumentReader, MzProjectDocuments,

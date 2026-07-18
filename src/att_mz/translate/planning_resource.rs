@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
 
 use super::placeholder::PlaceholderRuleDefinition;

@@ -17,7 +17,7 @@ use serde_json::{Map, Number, Value};
 
 use crate::att_mz::project::OpenedProject;
 use crate::att_mz::tag::simple_tag_spans;
-use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{FileReader, ReadFileError};
 
 use super::document::{

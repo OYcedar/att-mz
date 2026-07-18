@@ -11,7 +11,6 @@ use crate::application::config::{
     ConfiguredExtractCommand, ConfiguredInitCommand, ConfiguredMzCommand,
     ConfiguredTranslateCommand, ConfiguredWriteBackCommand, TranslateConfiguration,
 };
-use crate::att_mz::SelectedLua;
 use crate::att_mz::audit::{
     AuditContext, AuditEvent, AuditFailureCategory, AuditLedger, AuditRunOutcome,
     JsonLinesAuditLedger, JsonLinesAuditRun,
@@ -30,6 +29,10 @@ use crate::att_mz::init::{
 };
 use crate::att_mz::lua::hosting::TrustedLuaExecutionHostingService;
 use crate::att_mz::project::ExistingProjectOpeningService;
+use crate::att_mz::project_database::{
+    ProjectDatabaseCreationService, ProjectDatabaseRecordReadingService,
+    ProjectDatabaseStateReconciliationService,
+};
 use crate::att_mz::project_lease::ProjectCommandLeaseService;
 use crate::att_mz::translate::TranslateInput;
 use crate::att_mz::translate::TranslateOutput;
@@ -42,8 +45,8 @@ use crate::att_mz::translate::placeholder::Pcre2PlaceholderService;
 use crate::att_mz::translate::planner::MzStandardTranslationTaskPlanningService;
 use crate::att_mz::translate::planning_resource::JsonTranslationPlanningResourceReadingService;
 use crate::att_mz::translate::profile::{
-    MzTranslationExecutionPayload, MzTranslationPlanningConfiguration, TranslationExecutionProfile,
-    TranslationProfileLanguagePair,
+    MzSystemPrompt, MzTranslationPlanningConfiguration, MzTranslationProfile,
+    ResolvedMzTranslationResources,
 };
 use crate::att_mz::translate::result_store::MzStandardTranslationResultStorageService;
 use crate::att_mz::translate::service::{
@@ -64,11 +67,8 @@ use crate::att_mz::write_back::{
     WriteBackFailureImpact, WriteBackInput, WriteBackOutput, WriteBackService,
     WriteBackServiceError,
 };
+use crate::att_mz::{ENGINE_DIRECTORY_NAME, SelectedLua};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
-use crate::project_database::{
-    ProjectDatabaseCreationService, ProjectDatabaseRecordReadingService,
-    ProjectDatabaseStateReconciliationService,
-};
 use crate::runtime::cpu::BoundedCpuExecutor;
 use crate::runtime::delay::TokioAsyncDelay;
 use crate::runtime::filesystem::SystemFileSystem;
@@ -454,7 +454,6 @@ impl ProductionMzCommandRunner {
                 tokio::runtime::Handle::current(),
             ),
         });
-        let client = Arc::clone(command.client());
         let project_reader =
             ProjectDatabaseRecordReadingService::new(projects_root.clone(), sqlite.clone());
         let opener = ExistingProjectOpeningService::new(
@@ -468,7 +467,6 @@ impl ProductionMzCommandRunner {
             cpu: cpu.clone(),
             sqlite: sqlite.clone(),
             llm: llm.clone(),
-            client,
             lua: lua.clone(),
             audit: audit.run.clone(),
             cancellation: cancellation.clone(),
@@ -484,7 +482,11 @@ impl ProductionMzCommandRunner {
             .await
             .map(|result| {
                 result.map_err(|error| {
-                    map_translate_error(error, |standard| standard.failure_impact())
+                    map_translate_error(
+                        error,
+                        ProductionTranslationExecutionBuildError::failure_impact,
+                        |standard| standard.failure_impact(),
+                    )
                 })
             });
         let mut shutdown = ShutdownFailures::default();
@@ -713,8 +715,7 @@ async fn audited_construction_failure(
     ProductionCommandRunReport::construction_failed_with_shutdown(error, shutdown)
 }
 
-type ProductionTranslationProfile =
-    Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<OpenAiChatCompletionClient>>>;
+type ProductionTranslationProfile = Arc<MzTranslationProfile<OpenAiChatCompletionClient>>;
 type ProductionTranslationAssetReader =
     MzStandardTranslationAssetReadingService<RusqliteStorage, BoundedCpuExecutor>;
 type ProductionTranslationPlanner = MzStandardTranslationTaskPlanningService<
@@ -751,14 +752,13 @@ struct ProductionSelectedTranslationExecutionBuilder<'a> {
     cpu: BoundedCpuExecutor,
     sqlite: RusqliteStorage,
     llm: OpenAiChatCompletionExecutor,
-    client: Arc<OpenAiChatCompletionClient>,
     lua: Option<ProductionLuaSelection>,
     audit: JsonLinesAuditRun,
     cancellation: CooperativeCancellation,
 }
 
 impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecutionBuilder<'_> {
-    type Payload = MzTranslationExecutionPayload<OpenAiChatCompletionClient>;
+    type Client = OpenAiChatCompletionClient;
     type Standard = ProductionStandardTranslation;
     type Lua = ProductionLuaTranslation;
     type Error = ProductionTranslationExecutionBuildError;
@@ -766,51 +766,88 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
     async fn build(
         &self,
         project: &crate::att_mz::project::OpenedProject,
-    ) -> Result<SelectedTranslationExecution<Self::Payload, Self::Standard, Self::Lua>, Self::Error>
+    ) -> Result<SelectedTranslationExecution<Self::Client, Self::Standard, Self::Lua>, Self::Error>
     {
         let profile_configuration = self.configuration.profile();
-        let system = profile_configuration
-            .planning()
-            .system_for(project.source_language(), project.target_language())
-            .map_err(ProductionTranslationExecutionBuildError::new)?;
-        let path = system.markdown_path().to_path_buf();
+        let language_pair = project.language_pair().clone();
+        let path = self
+            .configuration
+            .prompt_root()
+            .join(ENGINE_DIRECTORY_NAME)
+            .join(format!(
+                "{}--{}.md",
+                language_pair.source(),
+                language_pair.target()
+            ));
         let file = self
             .file_system
             .read_file(path.clone())
             .await
-            .map_err(ProductionTranslationExecutionBuildError::new)?;
+            .map_err(|source| {
+                ProductionTranslationExecutionBuildError::prompt(
+                    &language_pair,
+                    &path,
+                    "无法读取普通文件",
+                    source,
+                )
+            })?;
+        if file.resolved_path().file_name() != path.file_name() {
+            return Err(ProductionTranslationExecutionBuildError::prompt(
+                &language_pair,
+                &path,
+                "文件名与规范语言对不精确匹配",
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "固定后的 Prompt 文件名与规范语言对派生文件名不一致",
+                ),
+            ));
+        }
         let markdown = String::from_utf8(file.into_bytes()).map_err(|source| {
             let utf8 = source.utf8_error();
-            ProductionTranslationExecutionBuildError::new(Utf8ResourceError {
-                path,
-                valid_up_to: utf8.valid_up_to(),
-                error_len: utf8.error_len(),
-            })
+            ProductionTranslationExecutionBuildError::prompt(
+                &language_pair,
+                &path,
+                "文件不是合法 UTF-8",
+                Utf8ResourceError {
+                    path: path.clone(),
+                    valid_up_to: utf8.valid_up_to(),
+                    error_len: utf8.error_len(),
+                },
+            )
         })?;
-        let pair =
-            TranslationProfileLanguagePair::new(system.source_language(), system.target_language())
-                .map_err(ProductionTranslationExecutionBuildError::new)?;
+        let system_prompt =
+            MzSystemPrompt::new(language_pair.clone(), markdown).map_err(|source| {
+                ProductionTranslationExecutionBuildError::prompt(
+                    &language_pair,
+                    &path,
+                    "内容为空白",
+                    source,
+                )
+            })?;
+        let source_language = self
+            .configuration
+            .language_modules()
+            .resolve(language_pair.source())
+            .map_err(|source| {
+                ProductionTranslationExecutionBuildError::language_module(&language_pair, source)
+            })?;
+        let translation_resources = Arc::new(ResolvedMzTranslationResources::new(
+            system_prompt,
+            source_language,
+        ));
         let planning = MzTranslationPlanningConfiguration::new(
             profile_configuration.planning().scope_concurrency(),
             profile_configuration.planning().max_message_characters(),
-            [(pair, markdown)],
-        )
-        .map_err(ProductionTranslationExecutionBuildError::new)?;
-        let profile = Arc::new(TranslationExecutionProfile::new(
+        );
+        let profile = Arc::new(MzTranslationProfile::new(
             profile_configuration.id(),
             profile_configuration.max_in_flight_tasks(),
-            MzTranslationExecutionPayload::new(
-                planning,
-                profile_configuration.execution().clone(),
-                Arc::clone(&self.client),
-            ),
+            planning,
+            profile_configuration.request().clone(),
+            Arc::clone(self.configuration.client()),
         ));
-        let languages = self
-            .configuration
-            .language_modules_for(project.source_language())
-            .map_err(ProductionTranslationExecutionBuildError::new)?;
         let placeholders = Pcre2PlaceholderService::new()
-            .map_err(ProductionTranslationExecutionBuildError::new)?;
+            .map_err(ProductionTranslationExecutionBuildError::internal)?;
         let asset_reader = MzStandardTranslationAssetReadingService::new(
             self.sqlite.clone(),
             self.cpu.clone(),
@@ -823,11 +860,12 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
         let planner =
             MzStandardTranslationTaskPlanningService::<_, _, OpenAiChatCompletionClient>::new(
                 resources,
-                languages.clone(),
+                Arc::clone(&translation_resources),
                 placeholders,
                 self.cpu.clone(),
             );
-        let processor = TranslationTaskResponseProcessingService::new(self.cpu.clone(), languages);
+        let processor =
+            TranslationTaskResponseProcessingService::new(self.cpu.clone(), translation_resources);
         let executor = MzStandardTranslationTaskExecutionService::<
             _,
             _,
@@ -863,24 +901,85 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
     }
 }
 
-#[derive(Debug)]
-struct ProductionTranslationExecutionBuildError(BoxedError);
+struct ProductionTranslationExecutionBuildError {
+    impact: TranslationExecutionBuildFailureImpact,
+    safe_detail: String,
+    source: BoxedError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TranslationExecutionBuildFailureImpact {
+    ConfigurationOrInput,
+    Internal,
+}
 
 impl ProductionTranslationExecutionBuildError {
-    fn new(source: impl Error + Send + Sync + 'static) -> Self {
-        Self(Box::new(source))
+    fn prompt(
+        language_pair: &crate::language::LanguagePair,
+        path: &Path,
+        reason: &str,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            impact: TranslationExecutionBuildFailureImpact::ConfigurationOrInput,
+            safe_detail: format!(
+                "MZ Prompt {} -> {}（{}）：{reason}",
+                language_pair.source(),
+                language_pair.target(),
+                path.display()
+            ),
+            source: Box::new(source),
+        }
+    }
+
+    fn language_module(
+        language_pair: &crate::language::LanguagePair,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            impact: TranslationExecutionBuildFailureImpact::ConfigurationOrInput,
+            safe_detail: format!(
+                "MZ 翻译语言对 {} -> {}：缺少源语言模块",
+                language_pair.source(),
+                language_pair.target()
+            ),
+            source: Box::new(source),
+        }
+    }
+
+    fn internal(source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            impact: TranslationExecutionBuildFailureImpact::Internal,
+            safe_detail: "无法建立当前项目语言对的翻译执行上下文".to_owned(),
+            source: Box::new(source),
+        }
+    }
+
+    const fn failure_impact(&self) -> TranslationExecutionBuildFailureImpact {
+        self.impact
+    }
+}
+
+impl fmt::Debug for ProductionTranslationExecutionBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductionTranslationExecutionBuildError")
+            .field("impact", &self.impact)
+            .field("safe_detail", &self.safe_detail)
+            .field("source", &self.source)
+            .finish()
     }
 }
 
 impl fmt::Display for ProductionTranslationExecutionBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("无法建立当前项目语言对的翻译执行上下文")
+        formatter.write_str(&self.safe_detail)
     }
 }
 
 impl Error for ProductionTranslationExecutionBuildError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.0.as_ref())
+        Some(self.source.as_ref())
     }
 }
 
@@ -1071,9 +1170,6 @@ where
         error @ InitServiceError::ProjectLease(_) => {
             ProductionCommandError::ProjectUnavailable(Box::new(error))
         }
-        error @ (InitServiceError::EmptySourceLanguage | InitServiceError::EmptyTargetLanguage) => {
-            ProductionCommandError::ConfigurationOrInput(Box::new(error))
-        }
         error @ InitServiceError::Workspace(_) => match &error {
             InitServiceError::Workspace(source) => match workspace_impact(source) {
                 ProjectWorkspaceConvergenceFailureImpact::ConfigurationOrInput => {
@@ -1120,6 +1216,7 @@ where
 
 fn map_translate_error<RE, BE, SE, LE, PE>(
     error: TranslateServiceError<RE, BE, SE, LE, PE>,
+    build_impact: impl FnOnce(&BE) -> TranslationExecutionBuildFailureImpact,
     standard_impact: impl FnOnce(&SE) -> StandardTranslationFailureImpact,
 ) -> ProductionCommandError
 where
@@ -1136,9 +1233,17 @@ where
         error @ TranslateServiceError::ReadProject { .. } => {
             ProductionCommandError::ProjectState(Box::new(error))
         }
-        error @ TranslateServiceError::BuildExecution(_) => {
-            ProductionCommandError::ConfigurationOrInput(Box::new(error))
-        }
+        error @ TranslateServiceError::BuildExecution(_) => match &error {
+            TranslateServiceError::BuildExecution(source) => match build_impact(source) {
+                TranslationExecutionBuildFailureImpact::ConfigurationOrInput => {
+                    ProductionCommandError::ConfigurationOrInput(Box::new(error))
+                }
+                TranslationExecutionBuildFailureImpact::Internal => {
+                    ProductionCommandError::Internal(Box::new(error))
+                }
+            },
+            _ => unreachable!("当前分支已经确认是翻译执行上下文构造错误"),
+        },
         error @ TranslateServiceError::Standard { .. } => match &error {
             TranslateServiceError::Standard { source } => match standard_impact(source) {
                 StandardTranslationFailureImpact::ConfigurationOrInput => {
@@ -1273,6 +1378,18 @@ impl ProductionCommandError {
                 SignalOutcome::Cancelled => AuditFailureCategory::Internal,
                 SignalOutcome::CommandFailed(command) => command.audit_category(),
             },
+        }
+    }
+
+    /// 只返回已由责任边界转换为用户可修复语义的安全诊断。
+    fn configuration_or_input_detail(&self) -> Option<&dyn fmt::Display> {
+        match self {
+            Self::ConfigurationOrInput(source) => Some(source.as_ref()),
+            Self::Signal {
+                outcome: SignalOutcome::CommandFailed(command),
+                ..
+            } => command.configuration_or_input_detail(),
+            _ => None,
         }
     }
 }
@@ -1461,12 +1578,16 @@ impl CommandResultRenderer {
     }
 
     pub(crate) fn render_failure(
-        command_error: Option<&dyn fmt::Display>,
+        command_error: Option<&ProductionCommandError>,
         shutdown_error: Option<&dyn fmt::Display>,
         stderr: &mut dyn Write,
     ) -> io::Result<()> {
         if let Some(error) = command_error {
-            writeln!(stderr, "命令失败：{error}")?;
+            if let Some(detail) = error.configuration_or_input_detail() {
+                writeln!(stderr, "配置或输入错误：{detail}")?;
+            } else {
+                writeln!(stderr, "命令失败：{error}")?;
+            }
         }
         if let Some(error) = shutdown_error {
             writeln!(stderr, "收尾失败：{error}")?;
@@ -1479,5 +1600,104 @@ impl CommandResultRenderer {
         stderr: &mut dyn Write,
     ) -> io::Result<()> {
         writeln!(stderr, "状态已生效但收尾失败：{shutdown_error}")
+    }
+}
+
+#[cfg(test)]
+mod command_error_rendering_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestError(&'static str);
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl Error for TestError {}
+
+    #[test]
+    fn configuration_or_input_failure_renders_its_safe_detail() {
+        let error = ProductionCommandError::ConfigurationOrInput(Box::new(TestError(
+            "MZ system prompt 文件 prompts/mz/ja--zh-Hans.md 不存在",
+        )));
+        let mut stderr = Vec::new();
+
+        CommandResultRenderer::render_failure(Some(&error), None, &mut stderr)
+            .expect("诊断应可写入");
+
+        assert_eq!(
+            String::from_utf8(stderr).expect("诊断应为 UTF-8"),
+            "配置或输入错误：MZ system prompt 文件 prompts/mz/ja--zh-Hans.md 不存在\n"
+        );
+    }
+
+    #[test]
+    fn signal_failure_preserves_nested_user_repairable_detail() {
+        let error = ProductionCommandError::Signal {
+            source: io::Error::other("SIGNAL_SECRET_SENTINEL"),
+            outcome: SignalOutcome::CommandFailed(Box::new(
+                ProductionCommandError::ConfigurationOrInput(Box::new(TestError(
+                    "语言对 ja -> zh-Hans 缺少 Prompt 资源",
+                ))),
+            )),
+        };
+        let mut stderr = Vec::new();
+
+        CommandResultRenderer::render_failure(Some(&error), None, &mut stderr)
+            .expect("诊断应可写入");
+        let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
+
+        assert_eq!(
+            stderr,
+            "配置或输入错误：语言对 ja -> zh-Hans 缺少 Prompt 资源\n"
+        );
+        assert!(!stderr.contains("SIGNAL_SECRET_SENTINEL"));
+    }
+
+    #[test]
+    fn internal_failure_never_renders_its_source() {
+        let error = ProductionCommandError::Internal(Box::new(TestError(
+            "API_KEY_SENTINEL CLIENT_PARAMETERS_SENTINEL PROMPT_CONTENT_SENTINEL",
+        )));
+        let mut stderr = Vec::new();
+
+        CommandResultRenderer::render_failure(Some(&error), None, &mut stderr)
+            .expect("诊断应可写入");
+        let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
+
+        assert_eq!(stderr, "命令失败：内部技术故障\n");
+        assert!(!stderr.contains("API_KEY_SENTINEL"));
+        assert!(!stderr.contains("CLIENT_PARAMETERS_SENTINEL"));
+        assert!(!stderr.contains("PROMPT_CONTENT_SENTINEL"));
+    }
+
+    #[test]
+    fn internal_translation_build_failure_is_not_mapped_to_user_input() {
+        let build = ProductionTranslationExecutionBuildError::internal(TestError(
+            "CLIENT_PARAMETERS_SENTINEL",
+        ));
+        let error = TranslateServiceError::<
+            TestError,
+            ProductionTranslationExecutionBuildError,
+            TestError,
+            TestError,
+            TestError,
+        >::BuildExecution(build);
+
+        let mapped = map_translate_error(
+            error,
+            ProductionTranslationExecutionBuildError::failure_impact,
+            |_| StandardTranslationFailureImpact::ConfigurationOrInput,
+        );
+        let mut stderr = Vec::new();
+        CommandResultRenderer::render_failure(Some(&mapped), None, &mut stderr)
+            .expect("诊断应可写入");
+        let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
+
+        assert_eq!(stderr, "命令失败：内部技术故障\n");
+        assert!(!stderr.contains("CLIENT_PARAMETERS_SENTINEL"));
     }
 }

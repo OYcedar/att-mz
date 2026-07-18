@@ -3,10 +3,12 @@
 ## 1. 唯一入口
 
 ```text
-att [--config FILE] mz <init|extract|translate|write-back>
+att --config FILE mz <init|extract|translate|write-back>
 ```
 
-四个命令是唯一用户入口，也是状态收敛入口；不增加维护、重试或恢复命令。Clap 的 Help/Version 不读取配置。当前生产目标只支持 `x86_64-pc-windows-msvc`。
+四个命令是唯一用户入口，也是状态收敛入口；不增加维护、重试或恢复命令。普通命令
+缺少 `--config FILE` 是 Clap 参数错误；Help/Version 不需要也不读取配置。不存在默认
+配置路径。当前生产目标只支持 `x86_64-pc-windows-msvc`。
 
 ## 2. 启动与配置选择
 
@@ -15,7 +17,7 @@ att [--config FILE] mz <init|extract|translate|write-back>
   ↓
 读取一次受限 TOML，检查完整语法和未知顶层分区
   ↓
-仅解析当前命令实际选择的分区
+仅解析当前命令实际选择的分区并建立受信类型
   ↓
 构造 ConfiguredMzCommand 互斥变体
   ↓
@@ -24,15 +26,20 @@ att [--config FILE] mz <init|extract|translate|write-back>
 构造 audit.jsonl，持久化 run_started
   ↓
 取得项目租约并执行命令
+  ↓ Translate：打开项目，按 metadata 解析 LanguagePair、语言模块与 MZ Prompt
   ↓
 终结非审计根，持久化 run_finished，终结账本
   ↓
 呈现结果
 ```
 
-已知但未选的配置分区不解析、不验证；未选 Client 的密钥不物化。配置边界选择一次
-Profile，并把同一个 `Arc<TranslationExecutionProfile>` 与 Client 注入 Standard 和
-可选 Lua。业务输入只携带已经建立的受信执行事实。
+已知但未选的配置分区不解析、不验证；未选 Profile 除选择用 ID 外的内容与未选 Client
+的密钥都不物化。Translate 的第一阶段完整建立全局语言目录、Prompt 根、所选
+`MzTranslationProfile` 与 Client；项目
+开启后的第二阶段才使用 metadata 的规范 `LanguagePair` 精确读取
+`<prompts.root>/mz/<source>--<target>.md`，并构造 `ResolvedMzTranslationResources`。
+Standard 与可选 Lua 复用同一个 Client 和已解析翻译语义；Lua 不接收 planning 或
+request 策略。业务输入只携带已经建立的受信执行事实。
 
 ## 3. 按命令构造
 
@@ -50,12 +57,15 @@ Profile，并把同一个 `Arc<TranslationExecutionProfile>` 与 Client 注入 S
 四个顶层 MZ 服务在读取项目、打开 SQLite、发送网络请求或建立候选前取得项目租约，并持有到业务终态及相关操作审计确认结束。MZ 的 `ProjectCommandLeaseService` 只选择固定锁目录并提交受信项目 identity，通用文件根负责按 Windows 非大小写敏感语义生成稳定锁文件名：
 
 ```text
-ProjectName + <projects.root>/.att-locks/projects
+ProjectName + <projects.root>/.att-locks/projects/mz
   ↓ 通用文件根规范化不透明 identity 并计算 SHA-256
-<projects.root>/.att-locks/projects/<digest>.lock
+<projects.root>/.att-locks/projects/mz/<digest>.lock
 ```
 
-文件系统根只提供通用独占文件租约，不理解 identity 是项目名，也不理解 MZ。目录发布锁位于 `<projects.root>/.att-locks/directory-publish/`；stage、backup 和 journal 仍在目标同父目录。
+文件系统根只提供通用独占文件租约，不理解 identity 是项目名，也不理解 MZ。项目
+工作区固定为 `<projects.root>/mz/<project-name>`；目录发布锁位于
+`<projects.root>/.att-locks/directory-publish/mz/`，stage、backup 和 journal 仍在目标
+同父目录。MZ 只使用这些精确路径，不搜索其他项目或锁目录。
 
 锁序固定为：
 
@@ -108,4 +118,7 @@ ProductionCommandRunReport
 | `1` | 配置、技术错误、任一 shutdown/审计失败，或状态已生效但收尾未确认 |
 | `130` | Ctrl-C 后完成受控收尾 |
 
-用户错误只呈现稳定中文类别，不暴露根类型名、内部状态枚举、检查 ID 或底层错误文本；技术原因链保留给内部诊断。
+用户可修复的配置、输入和 Prompt 资源错误呈现稳定中文类别以及安全详情，包括配置
+路径、可用的一基行列、字段或资源路径和原因；不得包含配置原文、密钥、Client
+parameters 或 Prompt 内容。内部技术故障仍只呈现稳定类别，不暴露根类型名、内部状态
+枚举、检查 ID 或底层错误文本；完整技术原因链只供内部诊断。

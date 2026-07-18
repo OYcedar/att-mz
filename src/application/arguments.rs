@@ -2,25 +2,59 @@
 //!
 //! 本模块只把命令行转换为用户意图，不构造运行时、读取配置或执行业务。
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::att_mz::{MaxFullwidthChars, ProjectName};
+use crate::language::LanguageId;
 
-/// ATT 进程的完整命令行参数。
+/// 已确认显式配置路径的 ATT 进程参数。
+#[derive(Debug)]
+pub(crate) struct AttArguments {
+    pub(crate) config: PathBuf,
+    pub(crate) product: ProductCommand,
+}
+
+impl AttArguments {
+    pub(crate) fn try_parse_from<I, T>(arguments: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let raw = RawAttArguments::try_parse_from(arguments)?;
+        let Some(config) = raw.config else {
+            return Err(RawAttArguments::command().error(
+                ErrorKind::MissingRequiredArgument,
+                "缺少必需的配置路径 `--config <FILE>`",
+            ));
+        };
+        Ok(Self {
+            config,
+            product: raw.product,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn command() -> clap::Command {
+        RawAttArguments::command()
+    }
+}
+
+/// Clap 解析阶段允许全局参数在子命令前后出现，再由上方边界建立必填不变量。
 #[derive(Debug, Parser)]
 #[command(name = "att", bin_name = "att", about = "游戏翻译工具", version)]
-pub(crate) struct AttArguments {
+struct RawAttArguments {
     /// 本次进程使用的严格 TOML 配置文件。
     ///
-    /// 相对路径以进程当前工作目录为基准；省略时使用
-    /// `%APPDATA%\ATT\config.toml`。
+    /// 相对路径以进程当前工作目录为基准。
     #[arg(long, global = true, value_name = "FILE", value_parser = parse_non_blank_path)]
-    pub(crate) config: Option<PathBuf>,
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
-    pub(crate) product: ProductCommand,
+    product: ProductCommand,
 }
 
 /// 统一产品入口当前支持的命令域。
@@ -67,11 +101,11 @@ pub(crate) struct InitArguments {
     #[arg(long, value_name = "DIR", value_parser = parse_non_blank_path)]
     pub(crate) path: PathBuf,
     /// 游戏原文语言 ID。
-    #[arg(long, value_name = "LANG", value_parser = parse_non_blank)]
-    pub(crate) source_language: Option<String>,
+    #[arg(long, value_name = "LANG", value_parser = parse_language_id)]
+    pub(crate) source_language: Option<LanguageId>,
     /// 译文目标语言 ID。
-    #[arg(long, value_name = "LANG", value_parser = parse_non_blank)]
-    pub(crate) target_language: Option<String>,
+    #[arg(long, value_name = "LANG", value_parser = parse_language_id)]
+    pub(crate) target_language: Option<LanguageId>,
     /// 对话正文每行允许的最大全角字符数。
     #[arg(long, value_name = "COUNT", value_parser = parse_max_fullwidth_chars)]
     pub(crate) dialogue_max_fullwidth_chars: Option<MaxFullwidthChars>,
@@ -150,6 +184,10 @@ fn parse_non_blank_path(value: &str) -> Result<PathBuf, String> {
     parse_non_blank(value).map(PathBuf::from)
 }
 
+fn parse_language_id(value: &str) -> Result<LanguageId, String> {
+    LanguageId::parse(value).map_err(|error| error.to_string())
+}
+
 fn parse_max_fullwidth_chars(value: &str) -> Result<MaxFullwidthChars, String> {
     let value = value
         .parse::<u32>()
@@ -160,8 +198,6 @@ fn parse_max_fullwidth_chars(value: &str) -> Result<MaxFullwidthChars, String> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-
-    use clap::{CommandFactory, Parser};
 
     use super::*;
 
@@ -193,18 +229,30 @@ mod tests {
             ],
         ] {
             let parsed = AttArguments::try_parse_from(arguments).expect("参数应合法");
-            assert_eq!(
-                parsed.config.as_deref(),
-                Some(Path::new("settings/config.toml"))
-            );
+            assert_eq!(parsed.config.as_path(), Path::new("settings/config.toml"));
             assert!(matches!(parsed.product.into_mz(), MzCommand::WriteBack(_)));
         }
     }
 
     #[test]
     fn extract_requires_at_least_one_explicit_task() {
-        let error = AttArguments::try_parse_from(["att", "mz", "extract", "--name", "demo"])
-            .expect_err("空提取选择必须拒绝");
+        let error = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "mz",
+            "extract",
+            "--name",
+            "demo",
+        ])
+        .expect_err("空提取选择必须拒绝");
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn ordinary_commands_require_explicit_configuration() {
+        let error = AttArguments::try_parse_from(["att", "mz", "write-back", "--name", "demo"])
+            .expect_err("普通命令不得推断默认配置路径");
         assert_eq!(error.exit_code(), 2);
     }
 
@@ -212,6 +260,8 @@ mod tests {
     fn translate_preserves_exact_profile_id_and_paths() {
         let parsed = AttArguments::try_parse_from([
             "att",
+            "--config",
+            "config.toml",
             "mz",
             "translate",
             "--name",
@@ -246,9 +296,18 @@ mod tests {
 
     #[test]
     fn init_accepts_only_project_and_game_path() {
-        let parsed =
-            AttArguments::try_parse_from(["att", "mz", "init", "--name", "demo", "--path", "game"])
-                .expect("后续 Init 应允许复用已经保存的语言和布局");
+        let parsed = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "mz",
+            "init",
+            "--name",
+            "demo",
+            "--path",
+            "game",
+        ])
+        .expect("后续 Init 应允许复用已经保存的语言和布局");
         let MzCommand::Init(arguments) = parsed.product.into_mz() else {
             panic!("应解析为 Init 命令");
         };
@@ -261,9 +320,11 @@ mod tests {
     }
 
     #[test]
-    fn init_preserves_each_explicit_override_independently() {
+    fn init_parses_each_explicit_override_independently() {
         let parsed = AttArguments::try_parse_from([
             "att",
+            "--config",
+            "config.toml",
             "mz",
             "init",
             "--name",
@@ -271,7 +332,7 @@ mod tests {
             "--path",
             "game",
             "--source-language",
-            "ja",
+            "JA",
             "--dialogue-max-fullwidth-chars",
             "24",
         ])
@@ -279,7 +340,10 @@ mod tests {
         let MzCommand::Init(arguments) = parsed.product.into_mz() else {
             panic!("应解析为 Init 命令");
         };
-        assert_eq!(arguments.source_language.as_deref(), Some("ja"));
+        assert_eq!(
+            arguments.source_language.as_ref().map(LanguageId::as_str),
+            Some("ja")
+        );
         assert_eq!(
             arguments
                 .dialogue_max_fullwidth_chars
@@ -289,5 +353,25 @@ mod tests {
         assert!(arguments.target_language.is_none());
         assert!(arguments.scrolling_text_max_fullwidth_chars.is_none());
         assert!(arguments.help_description_max_fullwidth_chars.is_none());
+    }
+
+    #[test]
+    fn init_rejects_language_ids_with_surrounding_whitespace() {
+        let error = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "mz",
+            "init",
+            "--name",
+            "demo",
+            "--path",
+            "game",
+            "--source-language",
+            " ja ",
+        ])
+        .expect_err("语言 ID 的首尾空白不得被静默裁剪");
+
+        assert_eq!(error.exit_code(), 2);
     }
 }
