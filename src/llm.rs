@@ -8,6 +8,8 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
+use crate::fingerprint::Sha256Fingerprint;
+
 /// 发送给 LLM 的消息角色。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChatMessageRole {
@@ -195,4 +197,13 @@ pub(crate) trait LlmRequestExecutor: Send + Sync {
         client: &'a Self::Client,
         messages: &'a [ChatMessage],
     ) -> impl Future<Output = Result<LlmResponse, LlmRequestError<Self::Error>>> + Send + 'a;
+}
+
+/// 一个受信 LLM Client 对译文结果有影响的稳定语义身份。
+///
+/// 实现只纳入会改变模型输出语义的协议事实；密钥、TLS、代理、
+/// 超时、限速与并发等运行资源事实不得进入身份。这是公共 LLM
+/// Client 对会消费已接受译文的上层提供的能力，不携带 MZ 特有规则。
+pub(crate) trait LlmClientSemanticIdentity: Send + Sync {
+    fn semantic_fingerprint(&self) -> Sha256Fingerprint;
 }

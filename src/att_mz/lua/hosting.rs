@@ -1,25 +1,27 @@
-//! 可信 Lua 程序的项目上下文、数据库、LLM 与资源终态编排。
+//! 可信 Lua 程序的冻结来源、项目上下文、数据库、LLM 与资源终态编排。
 
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::att_mz::translate::executor::TranslationTaskExecutionProfile;
 use crate::att_mz::translate::profile::{
     MzTranslationExecutionPayload, TranslationExecutionProfile,
 };
 use crate::llm::{ChatMessage, LlmRequestError, LlmRequestExecutor, LlmResponse};
-use crate::storage::file_system::{FileReader, ReadFileError};
+use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
 
 use super::runtime::{
     OwnedLuaProgram, TrustedLuaBindingFinalization, TrustedLuaBindingFinalizationError,
-    TrustedLuaBindingFinalizer, TrustedLuaHostCallError, TrustedLuaHostCalls,
+    TrustedLuaBindingFinalizer, TrustedLuaCommonBindings, TrustedLuaCommonHostCalls,
+    TrustedLuaExtractHostCalls, TrustedLuaExtractIntent, TrustedLuaHostCallError,
     TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor,
-    TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
+    TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination, TrustedLuaTranslateHostCalls,
+    TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
 };
 use super::session::{
     OpenSqliteInteractiveSessionError, SqliteInteractiveConnectionCloseOutcome,
@@ -28,11 +30,14 @@ use super::session::{
     SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
     SqliteInteractiveTransactionObservation,
 };
-use super::{LuaInvocation, LuaPhase, LuaProjectContext, TrustedLuaExecutionHost};
+use super::{
+    LuaInvocation, LuaProjectContext, LuaSourcePath, TrustedLuaExecutionHost,
+    TrustedLuaExecutionOutcome,
+};
 
 /// 使用四个根能力完成可信 Lua 程序生命周期。
 pub(crate) struct TrustedLuaExecutionHostingService<F, L, R, S> {
-    file_reader: F,
+    file_system: Arc<F>,
     llm: LuaLlmCapability<L>,
     runtime: R,
     session_factory: S,
@@ -41,7 +46,7 @@ pub(crate) struct TrustedLuaExecutionHostingService<F, L, R, S> {
 impl<F, L, R, S> TrustedLuaExecutionHostingService<F, L, R, S> {
     pub(crate) fn with_llm(file_reader: F, llm: L, runtime: R, session_factory: S) -> Self {
         Self {
-            file_reader,
+            file_system: Arc::new(file_reader),
             llm: LuaLlmCapability::Enabled(Arc::new(llm)),
             runtime,
             session_factory,
@@ -50,7 +55,7 @@ impl<F, L, R, S> TrustedLuaExecutionHostingService<F, L, R, S> {
 
     pub(crate) fn without_llm(file_reader: F, runtime: R, session_factory: S) -> Self {
         Self {
-            file_reader,
+            file_system: Arc::new(file_reader),
             llm: LuaLlmCapability::Disabled(PhantomData),
             runtime,
             session_factory,
@@ -74,37 +79,43 @@ impl<L> Clone for LuaLlmCapability<L> {
 
 impl<F, L, R, S> TrustedLuaExecutionHost for TrustedLuaExecutionHostingService<F, L, R, S>
 where
-    F: FileReader,
+    F: FileReader + DirectoryLister<Error = <F as FileReader>::Error> + 'static,
     L: LlmRequestExecutor + 'static,
     R: TrustedLuaRuntimeExecutor,
     S: SqliteInteractiveSessionFactory,
 {
     type TranslationProfile = TranslationExecutionProfile<MzTranslationExecutionPayload<L::Client>>;
-    type Error = TrustedLuaExecutionHostingError<F::Error, S::Error, R::Error>;
+    type Error = TrustedLuaExecutionHostingError<<F as FileReader>::Error, S::Error, R::Error>;
 
     async fn execute(
         &self,
         invocation: LuaInvocation<Self::TranslationProfile>,
-    ) -> Result<(), Self::Error> {
-        let (phase, script_path, project, profile) = match invocation {
+    ) -> Result<TrustedLuaExecutionOutcome, Self::Error> {
+        let (phase, script_path, project) = match invocation {
             LuaInvocation::Extract {
                 script_path,
                 project,
-            } => (LuaPhase::Extract, script_path, project, None),
+            } => (HostingPhase::Extract, script_path, project),
             LuaInvocation::Translate {
                 script_path,
                 project,
                 profile,
-            } => (LuaPhase::Translate, script_path, project, Some(profile)),
+                semantics,
+            } => (
+                HostingPhase::Translate { profile, semantics },
+                script_path,
+                project,
+            ),
             LuaInvocation::WriteBack {
                 script_path,
                 project,
-            } => (LuaPhase::WriteBack, script_path, project, None),
+                calls,
+            } => (HostingPhase::WriteBack(calls), script_path, project),
         };
 
         let requested_script_path = script_path.clone();
         let read_file = self
-            .file_reader
+            .file_system
             .read_file(script_path)
             .await
             .map_err(|source| TrustedLuaExecutionHostingError::ReadScript {
@@ -134,23 +145,46 @@ where
             })?;
         let (operations, finalizer) = opened.into_parts();
 
-        let calls: Arc<dyn TrustedLuaHostCalls> = Arc::new(LuaHostCalls {
-            phase,
+        let common: Arc<dyn TrustedLuaCommonHostCalls> = Arc::new(LuaCommonHostCalls {
             project,
-            profile,
             operations,
-            llm: self.llm.clone(),
+            file_system: Arc::clone(&self.file_system),
         });
         let finalizer: Box<dyn TrustedLuaBindingFinalizer> =
             Box::new(LuaSessionFinalizer { finalizer });
-        let handle = reservation.start(program, TrustedLuaRuntimeBindings::new(calls, finalizer));
+        let common = TrustedLuaCommonBindings::new(common);
+        let mut extract_calls = None;
+        let bindings = match phase {
+            HostingPhase::Extract => {
+                let calls = Arc::new(LuaExtractHostCalls::default());
+                extract_calls = Some(Arc::clone(&calls));
+                TrustedLuaRuntimeBindings::extract(common, calls, finalizer)
+            }
+            HostingPhase::Translate { profile, semantics } => TrustedLuaRuntimeBindings::translate(
+                common,
+                Arc::new(LuaTranslationHostCalls {
+                    profile,
+                    semantics,
+                    llm: self.llm.clone(),
+                }),
+                finalizer,
+            ),
+            HostingPhase::WriteBack(calls) => {
+                TrustedLuaRuntimeBindings::write_back(common, calls, finalizer)
+            }
+        };
+        let handle = reservation.start(program, bindings);
         let (runtime, finalization) = handle.await.into_parts();
 
         match (runtime, finalization) {
             (Ok(()), Ok(finalization)) if finalization.had_active_transaction() => {
                 Err(TrustedLuaExecutionHostingError::UnclosedTransaction)
             }
-            (Ok(()), Ok(_)) => Ok(()),
+            (Ok(()), Ok(_)) => Ok(extract_calls
+                .and_then(|calls| calls.take_intent())
+                .map_or(TrustedLuaExecutionOutcome::Empty, |intent| {
+                    TrustedLuaExecutionOutcome::ExtractIntent(intent)
+                })),
             (Ok(()), Err(cleanup)) => Err(TrustedLuaExecutionHostingError::Cleanup(cleanup)),
             (Err(runtime), Ok(_)) => Err(TrustedLuaExecutionHostingError::Runtime(runtime)),
             (Err(runtime), Err(cleanup)) => {
@@ -160,29 +194,91 @@ where
     }
 }
 
-struct LuaHostCalls<S, L>
-where
-    S: SqliteInteractiveSessionOperations,
-    L: LlmRequestExecutor + 'static,
-{
-    phase: LuaPhase,
-    project: LuaProjectContext,
-    profile: Option<Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<L::Client>>>>,
-    operations: Arc<S>,
-    llm: LuaLlmCapability<L>,
+enum HostingPhase<P> {
+    Extract,
+    Translate {
+        profile: Arc<P>,
+        semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+    },
+    WriteBack(Arc<dyn TrustedLuaWriteBackHostCalls>),
 }
 
-impl<S, L> TrustedLuaHostCalls for LuaHostCalls<S, L>
+struct LuaCommonHostCalls<F, S>
 where
+    F: FileReader + DirectoryLister<Error = <F as FileReader>::Error>,
     S: SqliteInteractiveSessionOperations,
-    L: LlmRequestExecutor + 'static,
 {
-    fn phase(&self) -> LuaPhase {
-        self.phase
-    }
+    project: LuaProjectContext,
+    operations: Arc<S>,
+    file_system: Arc<F>,
+}
 
+impl<F, S> TrustedLuaCommonHostCalls for LuaCommonHostCalls<F, S>
+where
+    F: FileReader + DirectoryLister<Error = <F as FileReader>::Error> + 'static,
+    S: SqliteInteractiveSessionOperations,
+{
     fn project(&self) -> &LuaProjectContext {
         &self.project
+    }
+
+    fn read_source(
+        &self,
+        path: LuaSourcePath,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TrustedLuaHostCallError>> + Send + 'static>>
+    {
+        let file_system = Arc::clone(&self.file_system);
+        let requested = path.join_to(self.project.source_root());
+        Box::pin(async move {
+            file_system
+                .read_file(requested)
+                .await
+                .map(|file| file.into_bytes())
+                .map_err(source_read_error)
+        })
+    }
+
+    fn list_source(
+        &self,
+        path: LuaSourcePath,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, TrustedLuaHostCallError>> + Send + 'static>>
+    {
+        let file_system = Arc::clone(&self.file_system);
+        let requested = path.join_to(self.project.source_root());
+        Box::pin(async move {
+            let entries = file_system
+                .list_directory(requested)
+                .await
+                .map_err(source_list_error)?;
+            let mut result = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let name = entry
+                    .resolved_path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        TrustedLuaHostCallError::new(
+                            "filesystem",
+                            "invalid_utf8",
+                            "来源目录项名称无法无损转换为 UTF-8",
+                            None,
+                            None,
+                        )
+                    })?;
+                let child = path.child(name).map_err(|error| {
+                    TrustedLuaHostCallError::new(
+                        "filesystem",
+                        "invalid_path",
+                        error.to_string(),
+                        None,
+                        Some(Arc::new(error)),
+                    )
+                })?;
+                result.push(child.as_str().to_owned());
+            }
+            result.sort();
+            Ok(result)
+        })
     }
 
     fn query(
@@ -228,23 +324,93 @@ where
         let operations = Arc::clone(&self.operations);
         Box::pin(async move { operations.rollback().await.map_err(database_call_error) })
     }
+}
+
+#[derive(Default)]
+struct LuaExtractHostCalls {
+    intent: Mutex<Option<TrustedLuaExtractIntent>>,
+}
+
+impl LuaExtractHostCalls {
+    fn record_intent(
+        &self,
+        intent: TrustedLuaExtractIntent,
+    ) -> Result<(), TrustedLuaHostCallError> {
+        let mut current = self.intent.lock().expect("Lua Extract intent 锁不应中毒");
+        if current.is_some() {
+            return Err(TrustedLuaHostCallError::new(
+                "extract",
+                "intent_already_declared",
+                "一次 Lua Extract 主程序只能声明一个标准快照意图",
+                None,
+                None,
+            ));
+        }
+        *current = Some(intent);
+        Ok(())
+    }
+
+    fn take_intent(&self) -> Option<TrustedLuaExtractIntent> {
+        self.intent
+            .lock()
+            .expect("Lua Extract intent 锁不应中毒")
+            .take()
+    }
+}
+
+impl TrustedLuaExtractHostCalls for LuaExtractHostCalls {
+    fn replace_standard(
+        &self,
+        snapshot: crate::att_mz::extract::store::LuaSnapshot,
+    ) -> Result<(), TrustedLuaHostCallError> {
+        self.record_intent(TrustedLuaExtractIntent::Replace(snapshot))
+    }
+
+    fn clear_standard(&self) -> Result<(), TrustedLuaHostCallError> {
+        self.record_intent(TrustedLuaExtractIntent::Deactivate)
+    }
+}
+
+struct LuaTranslationHostCalls<L>
+where
+    L: LlmRequestExecutor + 'static,
+{
+    profile: Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<L::Client>>>,
+    semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+    llm: LuaLlmCapability<L>,
+}
+
+impl<L> TrustedLuaTranslateHostCalls for LuaTranslationHostCalls<L>
+where
+    L: LlmRequestExecutor + 'static,
+{
+    fn system_prompt(&self) -> &str {
+        self.semantics.system_prompt()
+    }
+
+    fn source_language(&self) -> &str {
+        self.semantics.source_language()
+    }
+
+    fn target_language(&self) -> &str {
+        self.semantics.target_language()
+    }
+
+    fn prepare_translation(
+        &self,
+        kind: crate::att_mz::text::TextGroupKind,
+        original: String,
+    ) -> Result<Arc<dyn super::runtime::TrustedLuaPreparedTranslation>, TrustedLuaHostCallError>
+    {
+        self.semantics.prepare_translation(kind, original)
+    }
 
     fn request_llm(
         &self,
         messages: Vec<ChatMessage>,
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, TrustedLuaHostCallError>> + Send + 'static>>
     {
-        let Some(profile) = self.profile.as_ref().map(Arc::clone) else {
-            return Box::pin(async {
-                Err(TrustedLuaHostCallError::new(
-                    "llm",
-                    "unavailable",
-                    "当前 Lua 阶段没有 ctx.llm",
-                    None,
-                    None,
-                ))
-            });
-        };
+        let profile = Arc::clone(&self.profile);
         let LuaLlmCapability::Enabled(llm) = &self.llm else {
             return Box::pin(async {
                 Err(TrustedLuaHostCallError::new(
@@ -279,6 +445,32 @@ where
     };
     let message = error.to_string();
     TrustedLuaHostCallError::new("sqlite", kind, message, None, Some(Arc::new(error)))
+}
+
+fn source_read_error<E>(error: ReadFileError<E>) -> TrustedLuaHostCallError
+where
+    E: Error + Send + Sync + 'static,
+{
+    let kind = match &error {
+        ReadFileError::NotFound { .. } => "not_found",
+        ReadFileError::NotFile { .. } => "not_file",
+        ReadFileError::Io { .. } => "io",
+    };
+    let message = error.to_string();
+    TrustedLuaHostCallError::new("filesystem", kind, message, None, Some(Arc::new(error)))
+}
+
+fn source_list_error<E>(error: ListDirectoryError<E>) -> TrustedLuaHostCallError
+where
+    E: Error + Send + Sync + 'static,
+{
+    let kind = match &error {
+        ListDirectoryError::NotFound { .. } => "not_found",
+        ListDirectoryError::NotDirectory { .. } => "not_directory",
+        ListDirectoryError::Io { .. } => "io",
+    };
+    let message = error.to_string();
+    TrustedLuaHostCallError::new("filesystem", kind, message, None, Some(Arc::new(error)))
 }
 
 fn llm_call_error<E>(error: LlmRequestError<E>) -> TrustedLuaHostCallError
@@ -490,12 +682,15 @@ mod tests {
     use super::*;
     use crate::att_mz::ProjectName;
     use crate::att_mz::lua::runtime::{
-        TrustedLuaExecutionHandle, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeReservation,
+        TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeExecutionReport,
+        TrustedLuaRuntimeReservation,
     };
     use crate::att_mz::lua::session::OpenedSqliteInteractiveSession;
     use crate::att_mz::project::OpenedProject;
     use crate::llm::{LlmFinishReason, LlmUsage};
-    use crate::storage::file_system::ReadFile;
+    use crate::storage::file_system::{
+        DirectoryEntry, DirectoryEntryKind, DirectoryLister, ListDirectoryError, ReadFile,
+    };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -528,6 +723,17 @@ mod tests {
                 PathBuf::from("C:/resolved/main.lua"),
                 b"return true".to_vec(),
             ))
+        }
+    }
+
+    impl DirectoryLister for FakeFileReader {
+        type Error = FakeError;
+
+        async fn list_directory(
+            &self,
+            _path: PathBuf,
+        ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<Self::Error>> {
+            Ok(Vec::new())
         }
     }
 
@@ -664,6 +870,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum RuntimeBehavior {
         Complete,
+        DeclareDeactivate,
         Fail,
     }
 
@@ -717,13 +924,18 @@ mod tests {
             self.started = true;
             record(&self.events, "start");
             let behavior = self.behavior;
-            let (calls, finalizer) = bindings.into_parts();
-            assert_eq!(calls.phase(), LuaPhase::Extract);
+            let (_common, phase, finalizer) = bindings.into_parts();
+            let TrustedLuaPhaseBindings::Extract(extract) = phase else {
+                panic!("Hosting Extract 测试只应接收 Extract bindings")
+            };
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
             tokio::spawn(async move {
                 let runtime = match behavior {
                     RuntimeBehavior::Complete => Ok(()),
+                    RuntimeBehavior::DeclareDeactivate => extract
+                        .clear_standard()
+                        .map_err(TrustedLuaRuntimeExecutionError::Binding),
                     RuntimeBehavior::Fail => {
                         Err(TrustedLuaRuntimeExecutionError::Execute(FakeError("vm")))
                     }
@@ -786,7 +998,7 @@ mod tests {
     #[tokio::test]
     async fn reserves_before_opening_and_synchronously_hands_off_the_session() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        service(
+        let outcome = service(
             Arc::clone(&events),
             false,
             false,
@@ -797,10 +1009,66 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(outcome, TrustedLuaExecutionOutcome::Empty);
+
         assert_eq!(
             *events.lock().unwrap(),
             ["read", "reserve", "open", "start", "finalize"]
         );
+    }
+
+    #[tokio::test]
+    async fn returns_extract_intent_only_after_runtime_and_finalizer_both_succeed() {
+        let outcome = service(
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+            false,
+            RuntimeBehavior::DeclareDeactivate,
+            FinalizationBehavior::Idle,
+        )
+        .execute(invocation())
+        .await
+        .expect("VM 与会话清理成功后应该交还 Extract 意图");
+
+        assert_eq!(
+            outcome,
+            TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Deactivate)
+        );
+    }
+
+    #[tokio::test]
+    async fn discards_extract_intent_when_session_finishes_with_active_transaction() {
+        let error = service(
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+            false,
+            RuntimeBehavior::DeclareDeactivate,
+            FinalizationBehavior::Active,
+        )
+        .execute(invocation())
+        .await
+        .expect_err("未闭合事务必须阻止托管快照意图离开 Host");
+
+        assert!(matches!(
+            error,
+            TrustedLuaExecutionHostingError::UnclosedTransaction
+        ));
+    }
+
+    #[tokio::test]
+    async fn discards_extract_intent_when_session_cleanup_fails() {
+        let error = service(
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+            false,
+            RuntimeBehavior::DeclareDeactivate,
+            FinalizationBehavior::CloseFailed,
+        )
+        .execute(invocation())
+        .await
+        .expect_err("清理失败必须阻止托管快照意图离开 Host");
+
+        assert!(matches!(error, TrustedLuaExecutionHostingError::Cleanup(_)));
     }
 
     #[tokio::test]
@@ -906,6 +1174,76 @@ mod tests {
                 FinalizationBehavior::Idle,
             )
             .execute(invocation()),
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct SourceFileSystem {
+        reads: Arc<Mutex<Vec<PathBuf>>>,
+        lists: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl FileReader for SourceFileSystem {
+        type Error = FakeError;
+
+        async fn read_file(&self, path: PathBuf) -> Result<ReadFile, ReadFileError<Self::Error>> {
+            self.reads.lock().unwrap().push(path.clone());
+            Ok(ReadFile::new(path, b"source".to_vec()))
+        }
+    }
+
+    impl DirectoryLister for SourceFileSystem {
+        type Error = FakeError;
+
+        async fn list_directory(
+            &self,
+            path: PathBuf,
+        ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<Self::Error>> {
+            self.lists.lock().unwrap().push(path.clone());
+            Ok(vec![
+                DirectoryEntry::new(path.join("z.json"), DirectoryEntryKind::RegularFile),
+                DirectoryEntry::new(path.join("a.json"), DirectoryEntryKind::RegularFile),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn source_calls_join_the_frozen_root_and_return_sorted_relative_paths() {
+        let file_system = Arc::new(SourceFileSystem::default());
+        let opened = OpenedProject::new(
+            "demo".parse::<ProjectName>().unwrap(),
+            PathBuf::from("C:/projects/demo"),
+            PathBuf::from("C:/projects/demo/project.db"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            crate::att_mz::project::test_layout_profile(),
+        );
+        let calls = LuaCommonHostCalls::<_, _> {
+            project: LuaProjectContext::from_opened_project(&opened),
+            operations: Arc::new(FakeOperations),
+            file_system: Arc::clone(&file_system),
+        };
+
+        let bytes = calls
+            .read_source(LuaSourcePath::parse("data/Items.json").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"source");
+        let entries = calls
+            .list_source(LuaSourcePath::parse("data").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec!["data/a.json".to_owned(), "data/z.json".to_owned()]
+        );
+        assert_eq!(
+            *file_system.reads.lock().unwrap(),
+            [PathBuf::from("C:/projects/demo/source/data/Items.json")]
+        );
+        assert_eq!(
+            *file_system.lists.lock().unwrap(),
+            [PathBuf::from("C:/projects/demo/source/data")]
         );
     }
 }

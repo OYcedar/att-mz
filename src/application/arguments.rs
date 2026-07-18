@@ -111,10 +111,10 @@ pub(crate) struct TranslateArguments {
     /// 配置文件中要使用的翻译 Profile ID。
     #[arg(value_name = "PROFILE_ID", value_parser = parse_non_blank)]
     pub(crate) profile_id: String,
-    /// 本次标准翻译使用的术语表 JSON 文件。
+    /// 用该 JSON 文件替换项目当前术语表；省略时复用已保存内容。
     #[arg(long, value_name = "TERMS_JSON", value_parser = parse_non_blank_path)]
     pub(crate) terms: Option<PathBuf>,
-    /// 本次标准翻译使用的自定义占位符规则 JSON 文件。
+    /// 用该 JSON 文件替换项目当前占位符规则；省略时复用已保存内容。
     #[arg(long, value_name = "PLACEHOLDERS_JSON", value_parser = parse_non_blank_path)]
     pub(crate) placeholders: Option<PathBuf>,
     /// 运行指定可信 Lua 程序。

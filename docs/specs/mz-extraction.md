@@ -9,6 +9,8 @@
 一项。选择至少包含一项；实际执行顺序固定为：
 
 ```text
+取得项目租约
+    ↓
 打开项目一次
     ↓
 Builtin（若选择）
@@ -23,9 +25,11 @@ Lua（若选择）
 跨阶段的全局回滚。阶段内部的只读 I/O 和纯 CPU 工作可以有界并发，不改变这个提交
 顺序。
 
-项目按 `<projects_root>/<name>/project.db` 定位。开启边界读取 metadata，并重新确认
-同一工作区内的 `source/data` 与 `source/js` 仍是目录；它不保存、解析或重新访问 Init
-时的原游戏路径。Builtin、Rules 和 Lua Extract 因而共同看到 Init 导入的冻结副本。
+项目按 `<projects_root>/<name>/project.db` 定位。命令先取得同项目租约，再由开启边界
+读取 metadata、验证受管 schema，并重新计算 `source/data + source/js` 的完整 SHA-256
+指纹。实际指纹必须等于 metadata 的 `source_snapshot_fingerprint`；否则来源已在
+Init 之外变化，Extract 在修改 owner 前失败。Builtin、Rules 和 Lua 因而共同看到
+同一份由 Init 确认的冻结来源。
 
 ## 2. 标准快照如何表达文本
 
@@ -125,8 +129,10 @@ Rules 只负责快速、明确地定位标准 MZ 数据中的额外文本，不�
 }
 ```
 
-五个分区都可以省略，`{}` 表示提交一个空 Rules 快照并清空 Rules 资产。顶层未知
-字段、重复对象键、同一数组内重复定位项和空字符串都属于规则错误。
+五个分区都可以省略。完整 `{}` 表示停用 Rules owner：删除其 owner 状态并级联删除
+其标准资产。任意非空合法 Rules 始终保持 owner active，即使当前来源中零命中也提交
+active 空快照。顶层未知字段、重复对象键、同一数组内重复定位项和空字符串都属于
+规则错误。
 
 路径语言只支持：
 
@@ -150,8 +156,8 @@ A[3].B
 - `plugin_parameters` 与 `standard_fields` 的数组元素是路径；
 - `plugin_commands` 是“插件名 → 命令名 → 路径数组”，只扫描 `event_lists` 明确
   定位的命令数组；
-- 出现的分区、来源、插件、命令和路径数组都必须包含实际提取意图；不用的分区直接
-  省略，只有完整的 `{}` 表示空 Rules；
+- 出现的分区、来源、插件、命令和路径数组都必须包含明确提取意图；不用的分区直接
+  省略；
 - Note 只识别简单 `<Tag:value>`；
 - 同一来源的同名 Note/Comment 标签只建立一项匹配事实，并在该来源声明它的全部路径
   中联合验收；因此可以用多条路径表达同一标签的可选位置；
@@ -161,18 +167,18 @@ A[3].B
   每一层解码都会写进结构化地址；
 - Note 与事件列表的结构路径只负责精确路由，某条路径在实际文档中没有终点时跳过；
   一旦命中，其终点类型必须分别是字符串与事件命令数组；
-- 每个 Note/Comment 标签以及插件参数、插件命令和标准字段的文本定位都必须至少命中
-  一个非纯空白字符串；命中非字符串或重复命中同一叶子会使整次 Rules 提取失败；
+- 可选路径和声明可以零命中；实际遍历到的中间结构或终点类型与声明冲突，以及重复
+  命中同一叶子，仍会使整次 Rules 提取失败；
 - `plugin_commands` 非空时必须至少声明一个 `event_lists` 来源；没有插件命令时，
   每个事件列表路径都必须声明至少一个 Comment 标签。
 
 Rules 只访问配置中写出的精确路径，不递归寻找名为 `note` 或 `list` 的字段；未声明
 位置中的同名字段及其内容完全不参与提取。
 
-## 5. 五张标准资产表与快照替换
+## 5. Owner 快照、五张标准表与状态继承
 
-`MzExtractionAssetStore` 已实现 Builtin 与 Rules 共用的持久化算法。标准资产落入五
-张领域表：
+标准提取只有三个精确 owner：`builtin`、`rules`、`lua`。每个 owner 独立 active 或
+inactive，并拥有自己在五张表中的完整标准快照：
 
 | 表 | 承载内容 |
 |---|---|
@@ -180,28 +186,37 @@ Rules 只访问配置中写出的精确路径，不递归寻找名为 `note` 或
 | `system_text` | `System.json` 中的系统文本 |
 | `map_text` | 地图显示名等地图级文本 |
 | `text_body` | 对话、选项、滚动文本和事件命令文本 |
-| `plugin_param` | Rules 命中的 `plugins.js` 插件参数；事件中的插件命令参数归入 `text_body` |
+| `plugin_param` | Rules 命中的插件参数；事件插件命令归入 text body |
 
-五张表都直接保存 `owner`、`group_location`、`exact_location`、`field_name`、
-`original_text` 和可空 `translation`；`text_body` 另存明确的 `unit_type`。不建立
-通用 `translations`、`text_units` 或规则持久化表。结构化地址由内部纯函数
-`MzLocationCodec` 确定性编码，调试显示字符串仍不作为存储协议。
+五表统一保存 `owner`、group/exact 位置、字段、原文、可空 `translation` 和可空
+32 字节 `translation_state`；text body 另存 `unit_type`。主键统一为
+`(owner, exact_location)`，owner 外键指向 `standard_asset_owner_state`。
+translation 与 state 必须成对存在或成对为 NULL。
 
-Store 按外部指定的 Group 批大小切分拥有型工作单元，把位置编码、五表映射和 SQLite
-参数构造交给 CPU 根执行器有界并行。编码结果按原 Group 顺序稳定合并，随后构造一
-个完整的 SQLite 事务计划。一次快照始终使用一个连接和一个写事务顺序执行 SQL，
-不会用多个线程同时修改同一个事务。
+一次 Builtin、Rules 或 Lua 标准替换只触碰选中的 owner。成功事务把该 owner 的
+`source_snapshot_fingerprint` 更新为当前 metadata 指纹；其他 active owner 保持原
+指纹，因而可能继续 stale。Translate 与 WriteBack 在任一 active owner stale 时返回
+`ExtractionOutOfDate`，不会混用不同来源世代的资产。
 
-Builtin 和 Rules 各自只替换自己拥有的叶子，不删除另一来源的叶子，也不扫描或
-修改 Lua 自建表。两种来源可以共享一个 Group，但不能拥有同一个精确叶子；冲突时
-整次替换失败。事务内的替换规则为：
+替换时，旧叶只有在以下完整身份相等时才一起继承 translation 与 state：
 
-- 地址相同且原文相同：继承该叶子的旧译文；
-- 地址相同但原文改变：只清除该叶子的译文；
-- 新叶子：进入未翻译状态；
-- 新快照中消失的旧叶子：连同旧译文删除；
-- 驱动确认未提交：保留旧快照；事务始终不会留下部分快照；
-- 提交结果未知：明确返回不确定终态，调用方不能擅自断言旧快照或新快照哪一个生效。
+```text
+owner + table + unit_type + exact_location + field_name + original_text
+```
+
+group 位置不参与继承身份；新快照仍保存并校验新的 group 语义。身份变化、叶子消失
+或新叶都不会继承旧状态。active owner 的新快照与当前快照、当前来源指纹完全相同
+时返回 `Unchanged`，不执行写事务；即使叶集合相同，只要 owner 原先 stale，刷新
+owner 指纹仍是一次实际状态变化。
+
+Builtin 被选择时提交 active 快照。Rules 的 `{}` 删除 Rules owner 状态并级联删除其
+快照；非空规则提交 active 快照，零命中也合法。Extract Lua 通过
+`ctx.extract.replace_standard(snapshot)` 提交 active 快照，空 snapshot 表示 active
+空集合；`ctx.extract.clear_standard()` 明确停用 Lua owner。Lua 自建 SQL 表不由
+标准 Store 扫描或解释。
+
+位置编码和 SQL 参数构造继续有界并行，最终按自然顺序合并为单一短事务。确定未提交
+时保留原快照；提交结果未知时返回不确定终态，调用方不得声称某一状态已经生效。
 
 ## 6. 有界异步 I/O 与有界 CPU 并行
 
@@ -243,12 +258,12 @@ SQLite 事务计划必须完全一致。
 | 外部配置项 | 注入位置 |
 |---|---|
 | `projects.root` | 项目工作区创建与项目数据库记录读取服务 |
-| `extract.document.read_concurrency` | `MzDocumentReadingConfig` |
-| `extract.document.parse_concurrency` | `MzDocumentReadingConfig` |
-| `extract.builtin.scan_concurrency` | `BuiltInExtractionConfig` |
-| `extract.rules.scan_concurrency` | `RulesExtractionConfig` |
-| `extract.store.encode_concurrency` | `MzExtractionAssetStoreConfig` |
-| `extract.store.groups_per_encode_job` | `MzExtractionAssetStoreConfig` |
+| `mz.document.read_concurrency` | `MzDocumentReadingConfig` |
+| `mz.document.parse_concurrency` | `MzDocumentReadingConfig` |
+| `mz.extract.builtin.scan_concurrency` | `BuiltInExtractionConfig` |
+| `mz.extract.rules.scan_concurrency` | `RulesExtractionConfig` |
+| `mz.extract.store.encode_concurrency` | `MzExtractionAssetStoreConfig` |
+| `mz.extract.store.groups_per_encode_job` | `MzExtractionAssetStoreConfig` |
 
 所有并发数与批大小均为非零受信值；配置类型字段私有、没有 `Default`，服务构造时
 必须完整提供。`ExtractService`、`ExistingProjectOpeningService` 和
@@ -259,39 +274,40 @@ SQLite 事务计划必须完全一致。
 ```text
 runtime.cpu.worker_threads
 runtime.cpu.queue_capacity
-runtime.filesystem.max_active_operations
+runtime.filesystem.worker_threads
 runtime.filesystem.queue_capacity
-runtime.sqlite.max_active_databases
-runtime.sqlite.queue_capacity
-runtime.lua.max_active_scripts
+runtime.sqlite.max_open_connections
+runtime.sqlite.short_queue_capacity
+runtime.lua.worker_threads
 runtime.lua.queue_capacity
 
-database.busy_timeout
-database.journal_mode       # delete / truncate / persist / wal
-database.synchronous        # normal / full / extra
+runtime.sqlite.busy_timeout_ms
+runtime.sqlite.journal_mode       # delete / truncate / persist / wal
+runtime.sqlite.synchronous        # normal / full / extra
 ```
 
-SQLite 适配器与 Lua Host 打开项目数据库时必须接收同一连接策略。配置文件格式和加载
-位置仍未决定；本轮只固定必填内容、受信类型和注入位置。
+SQLite 适配器与 Lua Host 打开项目数据库时接收同一连接策略。
 
 下列内容属于产品与领域规格，不是可调配置：`Builtin → Rules → Lua` 顺序、Builtin
-字段集合、Rules 文本定位零命中失败、标准 Map 文件命名、非标准 `data/*.json` 交给 Lua、
-五张资产表以及译文继承和单事务一致性。
+字段集合、Rules active 空快照语义、标准 Map 文件命名、非标准 `data/*.json` 交给
+Lua、三个 owner、五张资产表以及 state 成对继承和单事务一致性。
 
 ## 8. Lua 信任边界
 
-Lua 是用户明确选择并完全信任的本机程序，不建立沙箱。Rust 只向可信宿主提交脚本
-路径、业务阶段和完整项目事实；其中项目源目录同样是工作区内的冻结 `source/`。宿主
-使用同一个项目数据库并注入 `ctx.db`，不会重新访问原游戏目录。
+Lua 是用户明确选择并完全信任的本机程序，不建立沙箱。Extract 阶段获得公共
+`ctx.project/json/source/mz/db`，并额外获得 `ctx.extract`；`translation`、`llm`、
+`output` 和 `write_back` 均为 nil。`source` 只读 Init 冻结来源，`mz` 提供与 Rust
+Builtin/Rules 相同的位置和文档构造能力，Lua 无需自行复制 JSON/MZ 定位器。
 
-Lua 自己拥有 schema、数据身份、译文继承、事务划分和跨阶段协议。Rust 不扫描、
-解释、转换或默认消费 Lua 产物；没有相应阶段的 Lua 脚本时，标准翻译和写回不会
-自动消费这些产物。宿主也不隐式把整个脚本包进一个长事务。
+`ctx.extract.replace_standard` 与 `clear_standard` 是 Lua owner 标准快照的唯一语义
+入口。Lua 仍可通过 `ctx.db` 管理自建 schema、事务和跨阶段协议；Rust 不扫描或默认
+消费这些自建产物，Host 也不把整个脚本隐式包进长事务。
 
 ## 9. 生产依赖树
 
 ```mermaid
 flowchart TD
+    ES["ExtractService"] --> LEASE["SystemFileSystem<br/>ProjectOperationLeaseProvider"]
     ES["ExtractService"] --> OS["ExistingProjectOpeningService"]
     ES --> BS["BuiltInExtractionService"]
     ES --> RS["RulesExtractionService"]
@@ -299,6 +315,8 @@ flowchart TD
 
     OS --> PR["ProjectDatabaseRecordReadingService"]
     OS --> EDR["SystemFileSystem<br/>ExistingDirectoryResolver"]
+    OS --> FP["SourceSnapshotFingerprint"]
+    FP --> FPFS["SystemFileSystem<br/>DirectoryTreeFingerprinter"]
     PR --> SQ["RusqliteStorage<br/>SqliteQueryExecutor"]
 
     BS --> DR["MzProjectDocumentReadingService"]

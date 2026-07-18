@@ -1,6 +1,6 @@
-//! 从数据库译文规划并发布 Standard MZ 写回的业务编排。
+//! 从数据库译文规划并生成 Standard MZ 写回候选。
 
-mod layout;
+pub(crate) mod layout;
 
 pub(crate) use layout::ConservativeMzWriteBackTextLayouter;
 
@@ -11,14 +11,11 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
-use super::{
-    PublishedWriteBack, StandardWriteBack, StandardWriteBackReport, StandardWriteBackSummary,
-};
+use super::{StandardWriteBack, StandardWriteBackSummary};
 use crate::att_mz::ProjectName;
 use crate::att_mz::project::{MaxFullwidthChars, MzWriteBackLayoutProfile, OpenedProject};
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind};
 use crate::execution::{CooperativeCancellation, OperationCancelled};
-use crate::observability::PersistentEventLog;
 
 /// 数据库资产叶子在 Standard 写回中的结构化角色。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -517,7 +514,7 @@ impl fmt::Display for StandardWriteBackSnapshotError {
 
 impl Error for StandardWriteBackSnapshotError {}
 
-/// 在同一个一致读视图中取得五张标准资产表的当前写回事实。
+/// 在读取五张标准资产表前确认所有 active owner 仍属于当前冻结来源。
 ///
 /// 实现不得读取或校验术语依赖；术语数据不是 WriteBack 的输入。
 pub(crate) trait StandardWriteBackAssetReader: Send + Sync {
@@ -526,7 +523,7 @@ pub(crate) trait StandardWriteBackAssetReader: Send + Sync {
     fn read(
         &self,
         project: &OpenedProject,
-    ) -> impl Future<Output = Result<StandardWriteBackSnapshot, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<StandardWriteBackSnapshot, Self::Error>> + Send + use<Self>;
 }
 
 /// 当前允许自动布局的 MZ 显示区域。
@@ -535,6 +532,90 @@ pub(crate) enum MzWriteBackLayoutRegion {
     DialogueBody,
     ScrollingText,
     HelpDescription,
+}
+
+/// 共享布局内核中的一个原文/当前文本对。
+///
+/// `replacement == None` 表示该项仍使用冻结原文：它参与跨项括号与缩进状态观察，
+/// 但布局结果不得修改它。Lua 对自己提供的当前文本使用 `Some`。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MzLayoutTextPair {
+    original_text: String,
+    replacement: Option<String>,
+}
+
+impl MzLayoutTextPair {
+    pub(crate) fn new(original_text: String, replacement: Option<String>) -> Self {
+        Self {
+            original_text,
+            replacement,
+        }
+    }
+
+    pub(crate) fn original_text(&self) -> &str {
+        &self.original_text
+    }
+
+    pub(crate) fn replacement(&self) -> Option<&str> {
+        self.replacement.as_deref()
+    }
+
+    fn effective_text(&self) -> &str {
+        self.replacement.as_deref().unwrap_or(&self.original_text)
+    }
+}
+
+/// 共享布局内核成功后与输入逐项对齐的文本及新增内容计数。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MzAppliedTextLayout {
+    texts: Vec<String>,
+    inserted_line_breaks: usize,
+    inserted_fullwidth_indents: usize,
+}
+
+impl MzAppliedTextLayout {
+    pub(super) fn new(
+        texts: Vec<String>,
+        inserted_line_breaks: usize,
+        inserted_fullwidth_indents: usize,
+    ) -> Self {
+        Self {
+            texts,
+            inserted_line_breaks,
+            inserted_fullwidth_indents,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<String>, usize, usize) {
+        (
+            self.texts,
+            self.inserted_line_breaks,
+            self.inserted_fullwidth_indents,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texts(&self) -> &[String] {
+        &self.texts
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn inserted_line_breaks(&self) -> usize {
+        self.inserted_line_breaks
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn inserted_fullwidth_indents(&self) -> usize {
+        self.inserted_fullwidth_indents
+    }
+}
+
+/// 共享纯布局内核的正常业务结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MzTextLayoutOutcome {
+    Applied(MzAppliedTextLayout),
+    /// 无法保证阅读质量；文本仍与输入逐项对齐，且不含程序新增内容。
+    Manual(MzAppliedTextLayout),
 }
 
 /// 一个布局段当前写回内容的权威来源。
@@ -577,11 +658,8 @@ impl MzWriteBackLayoutSegment {
         &self.candidate
     }
 
-    pub(crate) fn effective_text(&self) -> &str {
-        match &self.candidate {
-            MzWriteBackLayoutCandidate::FrozenOriginal => &self.original_text,
-            MzWriteBackLayoutCandidate::DatabaseTranslation(translation) => translation,
-        }
+    pub(crate) fn original_text(&self) -> &str {
+        &self.original_text
     }
 }
 
@@ -1147,25 +1225,6 @@ pub(crate) trait MzWriteBackDocumentRewriter: Send + Sync {
     ) -> impl Future<Output = Result<Self::RewrittenDocuments, Self::Error>> + Send;
 }
 
-/// 把完整候选发布为项目固定的最新 `write_back/` 输出。
-///
-/// 实现必须以冻结 `source/data`、`source/js` 为基底，把候选改写与所有未修改文件组成
-/// 完整副本；即使 Mutation 为空也必须发布完整输出。唯一成功目标是
-/// `OpenedProject::write_back_root()`。成功表示新的 `data/`、`js/` 已共同成为固定最新
-/// 输出；失败不得暴露半成品，也不得破坏此前一次成功输出。
-pub(crate) trait StandardWriteBackPublisher<D>: Send + Sync
-where
-    D: Send + 'static,
-{
-    type Error: Error + Send + Sync + 'static;
-
-    fn publish(
-        &self,
-        project: &OpenedProject,
-        documents: D,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-}
-
 /// 一项需要人工调整布局、但没有阻止写回的结构化诊断。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManualLayoutDiagnostic {
@@ -1196,22 +1255,24 @@ impl ManualLayoutDiagnostic {
     }
 }
 
-/// Standard 已成功发布后一次性写入持久日志的完整运行事实。
+/// 一次完整 WriteBack 成功发布后写入持久日志的运行事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StandardWriteBackRunLog {
+pub(crate) struct WriteBackRunLog {
     name: ProjectName,
     layout_profile: MzWriteBackLayoutProfile,
     output_root: PathBuf,
     summary: StandardWriteBackSummary,
     manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
+    lua_executed: bool,
 }
 
-impl StandardWriteBackRunLog {
+impl WriteBackRunLog {
     pub(crate) fn new(
         project: &OpenedProject,
         layout_profile: MzWriteBackLayoutProfile,
         summary: StandardWriteBackSummary,
         manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
+        lua_executed: bool,
     ) -> Self {
         assert_eq!(
             summary.manual_layout_units,
@@ -1224,6 +1285,7 @@ impl StandardWriteBackRunLog {
             output_root: project.write_back_root().to_path_buf(),
             summary,
             manual_layout_diagnostics,
+            lua_executed,
         }
     }
 
@@ -1246,53 +1308,91 @@ impl StandardWriteBackRunLog {
     pub(crate) fn manual_layout_diagnostics(&self) -> &[ManualLayoutDiagnostic] {
         &self.manual_layout_diagnostics
     }
+
+    pub(crate) const fn lua_executed(&self) -> bool {
+        self.lua_executed
+    }
 }
 
-/// 使用四个业务能力和唯一持久日志根完成 Standard 写回。
-pub(crate) struct StandardWriteBackService<R, L, D, P, J> {
+/// Standard 阶段生成的文件候选和全部业务事实。
+pub(crate) struct StandardWriteBackPreparation<D> {
+    documents: D,
+    summary: StandardWriteBackSummary,
+    manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
+}
+
+impl<D> fmt::Debug for StandardWriteBackPreparation<D> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StandardWriteBackPreparation")
+            .field("summary", &self.summary)
+            .field("manual_layout_diagnostics", &self.manual_layout_diagnostics)
+            .field("documents", &"<owned documents>")
+            .finish()
+    }
+}
+
+impl<D> StandardWriteBackPreparation<D> {
+    pub(crate) fn new(
+        documents: D,
+        summary: StandardWriteBackSummary,
+        manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
+    ) -> Self {
+        assert_eq!(
+            summary.manual_layout_units,
+            manual_layout_diagnostics.len(),
+            "人工布局计数必须由结构化诊断唯一建立"
+        );
+        Self {
+            documents,
+            summary,
+            manual_layout_diagnostics,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (D, StandardWriteBackSummary, Vec<ManualLayoutDiagnostic>) {
+        (self.documents, self.summary, self.manual_layout_diagnostics)
+    }
+}
+
+/// 使用资产读取、布局和文档改写能力准备 Standard 写回候选。
+pub(crate) struct StandardWriteBackService<R, L, D> {
     asset_reader: R,
     text_layouter: L,
     document_rewriter: D,
-    publisher: P,
-    event_log: J,
     cancellation: CooperativeCancellation,
 }
 
-impl<R, L, D, P, J> StandardWriteBackService<R, L, D, P, J> {
+impl<R, L, D> StandardWriteBackService<R, L, D> {
     pub(crate) fn new(
         asset_reader: R,
         text_layouter: L,
         document_rewriter: D,
-        publisher: P,
-        event_log: J,
         cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             asset_reader,
             text_layouter,
             document_rewriter,
-            publisher,
-            event_log,
             cancellation,
         }
     }
 }
 
-impl<R, L, D, P, J> StandardWriteBack for StandardWriteBackService<R, L, D, P, J>
+impl<R, L, D> StandardWriteBack for StandardWriteBackService<R, L, D>
 where
     R: StandardWriteBackAssetReader,
     L: MzWriteBackTextLayouter,
     D: MzWriteBackDocumentRewriter,
-    P: StandardWriteBackPublisher<D::RewrittenDocuments>,
-    J: PersistentEventLog<StandardWriteBackRunLog>,
 {
-    type Error = StandardWriteBackServiceError<R::Error, D::Error, P::Error, J::Error>;
+    type Documents = D::RewrittenDocuments;
+    type Error = StandardWriteBackServiceError<R::Error, D::Error>;
 
-    async fn run(
+    async fn prepare(
         &self,
         project: &OpenedProject,
         layout_profile: &MzWriteBackLayoutProfile,
-    ) -> Result<StandardWriteBackReport, Self::Error> {
+    ) -> Result<StandardWriteBackPreparation<Self::Documents>, Self::Error> {
         self.cancellation
             .check()
             .map_err(StandardWriteBackServiceError::Cancelled)?;
@@ -1316,31 +1416,11 @@ where
         self.cancellation
             .check()
             .map_err(StandardWriteBackServiceError::Cancelled)?;
-        self.publisher
-            .publish(project, rewritten)
-            .await
-            .map_err(StandardWriteBackServiceError::Publish)?;
-
-        let published = PublishedWriteBack::new(project);
-        let output_root = published.output_root().to_path_buf();
-        self.event_log
-            .append(StandardWriteBackRunLog::new(
-                project,
-                *layout_profile,
-                planned.summary,
-                planned.manual_layout_diagnostics,
-            ))
-            .await
-            .map_err(|source| StandardWriteBackServiceError::RecordPublishedRun {
-                output_root,
-                source,
-            })?;
-
-        self.cancellation
-            .check()
-            .map_err(StandardWriteBackServiceError::Cancelled)?;
-
-        Ok(StandardWriteBackReport::new(published, planned.summary))
+        Ok(StandardWriteBackPreparation::new(
+            rewritten,
+            planned.summary,
+            planned.manual_layout_diagnostics,
+        ))
     }
 }
 
@@ -1637,55 +1717,38 @@ fn is_canonical_help_description(leaf: &StandardWriteBackLeaf) -> bool {
     )
 }
 
-/// Standard 在四个业务依赖和发布后日志边界上遇到的技术失败。
+/// Standard 在资产读取和文档改写边界上遇到的技术失败。
 #[derive(Debug)]
-pub(crate) enum StandardWriteBackServiceError<R, D, P, J> {
+pub(crate) enum StandardWriteBackServiceError<R, D> {
     Cancelled(OperationCancelled),
     ReadAssets(R),
     RewriteDocuments(D),
-    Publish(P),
-    RecordPublishedRun { output_root: PathBuf, source: J },
 }
 
-impl<R, D, P, J> fmt::Display for StandardWriteBackServiceError<R, D, P, J>
+impl<R, D> fmt::Display for StandardWriteBackServiceError<R, D>
 where
     R: fmt::Display,
     D: fmt::Display,
-    P: fmt::Display,
-    J: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled(error) => error.fmt(formatter),
             Self::ReadAssets(source) => write!(formatter, "读取 Standard 写回资产失败：{source}"),
             Self::RewriteDocuments(source) => write!(formatter, "改写 MZ 文档失败：{source}"),
-            Self::Publish(source) => write!(formatter, "发布 Standard 写回输出失败：{source}"),
-            Self::RecordPublishedRun {
-                output_root,
-                source,
-            } => write!(
-                formatter,
-                "Standard 输出已发布到 {}，但持久日志记录失败：{source}",
-                output_root.display()
-            ),
         }
     }
 }
 
-impl<R, D, P, J> Error for StandardWriteBackServiceError<R, D, P, J>
+impl<R, D> Error for StandardWriteBackServiceError<R, D>
 where
     R: Error + 'static,
     D: Error + 'static,
-    P: Error + 'static,
-    J: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Cancelled(error) => Some(error),
             Self::ReadAssets(source) => Some(source),
             Self::RewriteDocuments(source) => Some(source),
-            Self::Publish(source) => Some(source),
-            Self::RecordPublishedRun { source, .. } => Some(source),
         }
     }
 }
@@ -1701,8 +1764,6 @@ mod tests {
         Read,
         Layout(MzWriteBackLayoutRegion),
         Rewrite,
-        Publish(PathBuf),
-        Log,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -1710,8 +1771,6 @@ mod tests {
         stages: Vec<Stage>,
         requests: Vec<MzWriteBackLayoutRequest>,
         plans: Vec<StandardWriteBackMutationPlan>,
-        published_documents: Vec<RewrittenDocuments>,
-        logs: Vec<StandardWriteBackRunLog>,
     }
 
     type SharedRecording = Arc<Mutex<Recording>>;
@@ -1736,13 +1795,21 @@ mod tests {
     impl StandardWriteBackAssetReader for FakeAssetReader {
         type Error = FakeError;
 
-        async fn read(&self, _: &OpenedProject) -> Result<StandardWriteBackSnapshot, Self::Error> {
-            self.recording
-                .lock()
-                .expect("记录锁不应中毒")
-                .stages
-                .push(Stage::Read);
-            self.response.clone()
+        fn read(
+            &self,
+            _: &OpenedProject,
+        ) -> impl Future<Output = Result<StandardWriteBackSnapshot, Self::Error>> + Send + use<>
+        {
+            let recording = Arc::clone(&self.recording);
+            let response = self.response.clone();
+            async move {
+                recording
+                    .lock()
+                    .expect("记录锁不应中毒")
+                    .stages
+                    .push(Stage::Read);
+                response
+            }
         }
     }
 
@@ -1837,61 +1904,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct FakePublisher {
-        fail: bool,
-        recording: SharedRecording,
-    }
-
-    impl StandardWriteBackPublisher<RewrittenDocuments> for FakePublisher {
-        type Error = FakeError;
-
-        async fn publish(
-            &self,
-            project: &OpenedProject,
-            documents: RewrittenDocuments,
-        ) -> Result<(), Self::Error> {
-            let mut recording = self.recording.lock().expect("记录锁不应中毒");
-            recording
-                .stages
-                .push(Stage::Publish(project.write_back_root().to_path_buf()));
-            recording.published_documents.push(documents);
-            if self.fail {
-                Err(FakeError("publish"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeEventLog {
-        fail: bool,
-        recording: SharedRecording,
-    }
-
-    impl PersistentEventLog<StandardWriteBackRunLog> for FakeEventLog {
-        type Error = FakeError;
-
-        async fn append(&self, event: StandardWriteBackRunLog) -> Result<(), Self::Error> {
-            let mut recording = self.recording.lock().expect("记录锁不应中毒");
-            recording.stages.push(Stage::Log);
-            recording.logs.push(event);
-            if self.fail {
-                Err(FakeError("log"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    type Service = StandardWriteBackService<
-        FakeAssetReader,
-        FakeLayouter,
-        FakeDocumentRewriter,
-        FakePublisher,
-        FakeEventLog,
-    >;
+    type Service = StandardWriteBackService<FakeAssetReader, FakeLayouter, FakeDocumentRewriter>;
 
     struct Harness {
         service: Service,
@@ -1916,14 +1929,6 @@ mod tests {
                 },
                 FakeDocumentRewriter {
                     fail: failing_stage == Some("rewrite"),
-                    recording: Arc::clone(&recording),
-                },
-                FakePublisher {
-                    fail: failing_stage == Some("publish"),
-                    recording: Arc::clone(&recording),
-                },
-                FakeEventLog {
-                    fail: failing_stage == Some("log"),
                     recording: Arc::clone(&recording),
                 },
                 CooperativeCancellation::default(),
@@ -2137,12 +2142,12 @@ mod tests {
 
         let report = harness
             .service
-            .run(&project, project.layout_profile())
+            .prepare(&project, project.layout_profile())
             .await
             .expect("Standard 写回应成功");
-        let (published, summary) = report.into_parts();
+        let (documents, summary, diagnostics) = report.into_parts();
 
-        assert_eq!(published.output_root(), project.write_back_root());
+        assert_eq!(documents, RewrittenDocuments("candidate".to_owned()));
         assert_eq!(
             summary,
             StandardWriteBackSummary {
@@ -2164,8 +2169,6 @@ mod tests {
                 Stage::Layout(MzWriteBackLayoutRegion::DialogueBody),
                 Stage::Layout(MzWriteBackLayoutRegion::ScrollingText),
                 Stage::Rewrite,
-                Stage::Publish(project.write_back_root().to_path_buf()),
-                Stage::Log,
             ]
         );
         assert_eq!(recorded.requests.len(), 3);
@@ -2208,12 +2211,7 @@ mod tests {
             dialogue_mutation.segments()[1].action(),
             &EventBodyMutationAction::KeepOriginal
         );
-        assert_eq!(recorded.published_documents.len(), 1);
-        assert_eq!(recorded.logs.len(), 1);
-        assert_eq!(recorded.logs[0].name(), project.name());
-        assert_eq!(recorded.logs[0].output_root(), project.write_back_root());
-        assert_eq!(recorded.logs[0].summary(), summary);
-        assert!(recorded.logs[0].manual_layout_diagnostics().is_empty());
+        assert!(diagnostics.is_empty());
     }
 
     #[tokio::test]
@@ -2282,10 +2280,10 @@ mod tests {
 
         let report = harness
             .service
-            .run(&project, project.layout_profile())
+            .prepare(&project, project.layout_profile())
             .await
             .expect("非帮助 description 不应阻止写回");
-        let (_, summary) = report.into_parts();
+        let (_, summary, _) = report.into_parts();
         let recorded = harness.recorded();
 
         assert_eq!(recorded.requests.len(), 1);
@@ -2334,10 +2332,10 @@ mod tests {
 
         let report = harness
             .service
-            .run(&project, project.layout_profile())
+            .prepare(&project, project.layout_profile())
             .await
             .expect("Manual 是正常写回结果");
-        let (_, summary) = report.into_parts();
+        let (_, summary, diagnostics) = report.into_parts();
         let recorded = harness.recorded();
 
         assert_eq!(
@@ -2366,13 +2364,12 @@ mod tests {
             mutation.segments()[1].action(),
             &EventBodyMutationAction::KeepOriginal
         );
-        assert_eq!(recorded.logs.len(), 1);
-        assert_eq!(recorded.logs[0].manual_layout_diagnostics().len(), 1);
-        let diagnostic = &recorded.logs[0].manual_layout_diagnostics()[0];
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
         assert_eq!(diagnostic.unit_location(), &group_location);
         assert_eq!(diagnostic.region(), MzWriteBackLayoutRegion::DialogueBody);
         assert_eq!(diagnostic.max_fullwidth_chars(), width(24));
-        assert_eq!(recorded.stages.last(), Some(&Stage::Log));
+        assert_eq!(recorded.stages.last(), Some(&Stage::Rewrite));
     }
 
     #[tokio::test]
@@ -2386,25 +2383,17 @@ mod tests {
 
         let report = harness
             .service
-            .run(&project, project.layout_profile())
+            .prepare(&project, project.layout_profile())
             .await
             .expect("空快照仍应发布完整冻结副本");
-        let (_, summary) = report.into_parts();
+        let (_, summary, diagnostics) = report.into_parts();
         let recorded = harness.recorded();
 
         assert_eq!(summary, StandardWriteBackSummary::default());
-        assert_eq!(
-            recorded.stages,
-            vec![
-                Stage::Read,
-                Stage::Rewrite,
-                Stage::Publish(project.write_back_root().to_path_buf()),
-                Stage::Log,
-            ]
-        );
+        assert_eq!(recorded.stages, vec![Stage::Read, Stage::Rewrite,]);
         assert!(recorded.requests.is_empty());
         assert!(recorded.plans[0].mutations().is_empty());
-        assert_eq!(recorded.logs.len(), 1);
+        assert!(diagnostics.is_empty());
     }
 
     #[tokio::test]
@@ -2420,10 +2409,10 @@ mod tests {
 
         let report = harness
             .service
-            .run(&project, project.layout_profile())
+            .prepare(&project, project.layout_profile())
             .await
             .expect("显式同文译文仍应应用");
-        let (_, summary) = report.into_parts();
+        let (_, summary, _) = report.into_parts();
         let recorded = harness.recorded();
 
         assert_eq!(summary.translated_locations, 1);
@@ -2441,23 +2430,6 @@ mod tests {
         let cases = [
             ("read", vec![Stage::Read]),
             ("rewrite", vec![Stage::Read, Stage::Rewrite]),
-            (
-                "publish",
-                vec![
-                    Stage::Read,
-                    Stage::Rewrite,
-                    Stage::Publish(project().write_back_root().to_path_buf()),
-                ],
-            ),
-            (
-                "log",
-                vec![
-                    Stage::Read,
-                    Stage::Rewrite,
-                    Stage::Publish(project().write_back_root().to_path_buf()),
-                    Stage::Log,
-                ],
-            ),
         ];
 
         for (stage, expected_stages) in cases {
@@ -2471,7 +2443,7 @@ mod tests {
 
             let error = harness
                 .service
-                .run(&project, project.layout_profile())
+                .prepare(&project, project.layout_profile())
                 .await
                 .expect_err("指定阶段应技术失败");
 
@@ -2484,24 +2456,6 @@ mod tests {
                     error,
                     StandardWriteBackServiceError::RewriteDocuments(FakeError("rewrite"))
                 )),
-                "publish" => assert!(matches!(
-                    error,
-                    StandardWriteBackServiceError::Publish(FakeError("publish"))
-                )),
-                "log" => {
-                    assert!(matches!(
-                        &error,
-                        StandardWriteBackServiceError::RecordPublishedRun {
-                            output_root,
-                            source: FakeError("log"),
-                        } if output_root == project.write_back_root()
-                    ));
-                    assert!(
-                        error
-                            .to_string()
-                            .contains(&project.write_back_root().display().to_string())
-                    );
-                }
                 _ => unreachable!("测试只包含已知失败阶段"),
             }
             assert_eq!(
@@ -2910,18 +2864,15 @@ mod tests {
 
         let report = harness
             .service
-            .run(&project, project.layout_profile())
+            .prepare(&project, project.layout_profile())
             .await
             .expect("帮助框 Manual 仍应成功发布");
-        let (_, summary) = report.into_parts();
+        let (_, summary, diagnostics) = report.into_parts();
         let recorded = harness.recorded();
 
         assert_eq!(summary.manual_layout_units, 1);
-        assert_eq!(recorded.logs[0].manual_layout_diagnostics().len(), 1);
-        assert_eq!(
-            recorded.logs[0].manual_layout_diagnostics()[0].unit_location(),
-            &location
-        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].unit_location(), &location);
         let StandardWriteBackMutation::SetText(mutation) = &recorded.plans[0].mutations()[0] else {
             panic!("帮助说明应产生单值 Mutation")
         };
@@ -2938,6 +2889,6 @@ mod tests {
             None,
         );
         let project = project();
-        assert_send(harness.service.run(&project, project.layout_profile()));
+        assert_send(harness.service.prepare(&project, project.layout_profile()));
     }
 }

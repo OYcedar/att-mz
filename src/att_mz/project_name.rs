@@ -48,6 +48,13 @@ fn validate(value: &str) -> Result<(), String> {
         return Err("项目名称不能以点结尾".to_owned());
     }
 
+    if value
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".att-"))
+    {
+        return Err("项目名称不能使用 ATT 根保留命名空间".to_owned());
+    }
+
     if value.chars().any(char::is_control) {
         return Err("项目名称不能包含控制字符".to_owned());
     }
@@ -70,6 +77,10 @@ fn validate(value: &str) -> Result<(), String> {
 }
 
 fn is_windows_reserved_device_name(value: &str) -> bool {
+    if !value.is_ascii() {
+        return false;
+    }
+
     if ["CON", "PRN", "AUX", "NUL"]
         .iter()
         .any(|reserved| value.eq_ignore_ascii_case(reserved))
@@ -89,7 +100,15 @@ mod tests {
 
     #[test]
     fn accepts_unicode_internal_spaces_and_meaningful_dots() {
-        for value in ["游戏 一", "Project Alpha", "release.v1", ".hidden", "COM10"] {
+        for value in [
+            "游戏 一",
+            "Project Alpha",
+            "release.v1",
+            ".hidden",
+            "COM10",
+            "a中",
+            "aaé",
+        ] {
             let name = value.parse::<ProjectName>().expect("名称应该合法");
 
             assert_eq!(name.as_str(), value);
@@ -107,6 +126,9 @@ mod tests {
             ".",
             "..",
             "alice.",
+            ".att-project-locks",
+            ".ATT-dirpub-locks",
+            ".att-private",
             "a/b",
             "a\\b",
             "a<b",

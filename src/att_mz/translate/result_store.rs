@@ -1,6 +1,6 @@
-//! 标准翻译准备与单任务结果的 SQLite 持久化实现。
+//! 标准译文状态的原子对账与提交。
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -9,31 +9,21 @@ use std::path::PathBuf;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
+use crate::att_mz::project::OpenedProject;
 use crate::att_mz::standard_asset::{MzStandardAssetStorageKind, MzStandardAssetTable};
-use crate::project_database::StoredProjectRecord;
+use crate::fingerprint::Sha256Fingerprint;
+use crate::project_database::{PLACEHOLDER_RULES_RESOURCE_KIND, TERMINOLOGY_RESOURCE_KIND};
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
-    ExecuteTransactionError, SqliteBatch, SqliteCheckId, SqliteCommand, SqliteQuery,
-    SqliteTransactionExecutor, SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
+    ExecuteTransactionError, SqliteCheckId, SqliteCommand, SqliteQuery, SqliteTransactionExecutor,
+    SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
 };
 
 use super::standard::{
-    StandardTranslationResultStore, TerminologyDependency, TranslationInvalidation,
-    TranslationLeafIdentity, TranslationPatch, TranslationPlanPreparation, TranslationReuse,
-    TranslationReuseSeed, TranslationReuseTarget, ValidatedTranslationTaskResult,
+    StandardTranslationResultStore, TranslationLeafIdentity, TranslationPlanPreparation,
+    TranslationSnapshotBaseline, ValidatedTranslationTaskResult,
 };
 
-const TERMINOLOGY_DEPENDENCY_TABLE: &str = "translation_terminology_dependency";
-const DELETE_TERMINOLOGY_DEPENDENCIES: &str =
-    "DELETE FROM translation_terminology_dependency WHERE asset_table = ? AND exact_location = ?";
-const INSERT_TERMINOLOGY_DEPENDENCY: &str = r#"INSERT INTO translation_terminology_dependency (
-    asset_table,
-    exact_location,
-    term,
-    term_translation
-) VALUES (?, ?, ?, ?)"#;
-
-/// 标准译文写入编码阶段的全部必填资源上限。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MzStandardTranslationResultStorageConfig {
     encode_concurrency: NonZeroUsize,
@@ -50,19 +40,8 @@ impl MzStandardTranslationResultStorageConfig {
             leaves_per_encode_job,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) const fn encode_concurrency(self) -> NonZeroUsize {
-        self.encode_concurrency
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn leaves_per_encode_job(self) -> NonZeroUsize {
-        self.leaves_per_encode_job
-    }
 }
 
-/// 以乐观并发检查和短事务保存标准译文状态。
 pub(crate) struct MzStandardTranslationResultStorageService<S, C> {
     sqlite: S,
     cpu: C,
@@ -88,63 +67,23 @@ where
 
     async fn apply_preparation(
         &self,
-        project: &StoredProjectRecord,
+        project: &OpenedProject,
         preparation: TranslationPlanPreparation,
     ) -> Result<(), Self::Error> {
-        let (invalidations, reuses) = preparation.into_parts();
-        if invalidations.is_empty() && reuses.is_empty() {
+        if !preparation.requires_storage_changes() {
             return Ok(());
         }
-
-        let invalidation_batches =
-            split_owned(invalidations, self.config.leaves_per_encode_job.get());
-        let encoded_invalidations = self
-            .encode_batches(invalidation_batches, encode_invalidation_batch)
-            .await?;
-        let (reuse_count, reuse_inputs) = build_reuse_encoding_inputs(reuses)
-            .map_err(MzStandardTranslationResultStorageError::InvalidPlan)?;
-        let reuse_batches = split_owned(reuse_inputs, self.config.leaves_per_encode_job.get());
-        let encoded_reuse_parts = self
-            .encode_batches(reuse_batches, encode_reuse_part_batch)
-            .await?;
-        let encoded = self
-            .cpu
-            .execute(move || {
-                let encoded_reuses = assemble_encoded_reuses(reuse_count, encoded_reuse_parts)?;
-                ensure_valid_preparation(encoded_invalidations, encoded_reuses)
-            })
-            .await
-            .map_err(MzStandardTranslationResultStorageError::ScheduleEncoding)?
-            .map_err(MzStandardTranslationResultStorageError::InvalidPlan)?;
-        let plan = build_preparation_plan(encoded);
+        let plan = self.encode_preparation_plan(preparation).await?;
         self.execute(project.database_path().to_path_buf(), plan)
             .await
     }
 
     async fn commit(
         &self,
-        project: &StoredProjectRecord,
+        project: &OpenedProject,
         result: ValidatedTranslationTaskResult,
     ) -> Result<(), Self::Error> {
-        let patches = result.into_updates();
-        if patches.is_empty() {
-            return Err(MzStandardTranslationResultStorageError::InvalidPlan(
-                ResultStoragePlanError::EmptyTaskResult,
-            ));
-        }
-
-        let patch_inputs = build_patch_encoding_inputs(patches);
-        let batches = split_owned(patch_inputs, self.config.leaves_per_encode_job.get());
-        let encoded = self
-            .encode_batches(batches, encode_patch_leaf_batch)
-            .await?;
-        let encoded = self
-            .cpu
-            .execute(move || ensure_unique_patches(encoded))
-            .await
-            .map_err(MzStandardTranslationResultStorageError::ScheduleEncoding)?
-            .map_err(MzStandardTranslationResultStorageError::InvalidPlan)?;
-        let plan = build_commit_plan(encoded);
+        let plan = self.encode_commit_plan(result).await?;
         self.execute(project.database_path().to_path_buf(), plan)
             .await
     }
@@ -155,28 +94,59 @@ where
     S: SqliteTransactionExecutor,
     C: CpuTaskExecutor,
 {
-    async fn encode_batches<I, O, F>(
+    async fn encode_preparation_plan(
         &self,
-        batches: Vec<Vec<I>>,
-        encode: F,
-    ) -> Result<Vec<O>, MzStandardTranslationResultStorageError<S::Error, C::Error>>
-    where
-        I: Send + 'static,
-        O: Send + 'static,
-        F: Fn(Vec<I>) -> Result<Vec<O>, ResultStoragePlanError> + Copy + Send + 'static,
+        preparation: TranslationPlanPreparation,
+    ) -> Result<SqliteTransactionPlan, MzStandardTranslationResultStorageError<S::Error, C::Error>>
     {
-        let encoded_batches = stream::iter(batches.into_iter().map(|batch| async move {
-            self.cpu
-                .execute(move || encode(batch))
-                .await
-                .map_err(MzStandardTranslationResultStorageError::ScheduleEncoding)?
-                .map_err(MzStandardTranslationResultStorageError::InvalidPlan)
+        let (work, terminology_json, placeholder_rules_json, snapshot_baseline) =
+            preparation_work(preparation)
+                .map_err(MzStandardTranslationResultStorageError::InvalidPlan)?;
+        let jobs = split_jobs(work, self.config.leaves_per_encode_job.get());
+        let batches = stream::iter(jobs.into_iter().map(|job| {
+            let cpu = &self.cpu;
+            async move {
+                cpu.execute(move || encode_preparation_job(job))
+                    .await
+                    .map_err(MzStandardTranslationResultStorageError::ScheduleEncoding)?
+                    .map_err(MzStandardTranslationResultStorageError::InvalidPlan)
+            }
         }))
         .buffered(self.config.encode_concurrency.get())
         .try_collect::<Vec<_>>()
         .await?;
 
-        Ok(encoded_batches.into_iter().flatten().collect())
+        finish_preparation_plan(
+            batches,
+            terminology_json,
+            placeholder_rules_json,
+            snapshot_baseline,
+        )
+        .map_err(MzStandardTranslationResultStorageError::InvalidPlan)
+    }
+
+    async fn encode_commit_plan(
+        &self,
+        result: ValidatedTranslationTaskResult,
+    ) -> Result<SqliteTransactionPlan, MzStandardTranslationResultStorageError<S::Error, C::Error>>
+    {
+        let work =
+            commit_work(result).map_err(MzStandardTranslationResultStorageError::InvalidPlan)?;
+        let jobs = split_jobs(work, self.config.leaves_per_encode_job.get());
+        let batches = stream::iter(jobs.into_iter().map(|job| {
+            let cpu = &self.cpu;
+            async move {
+                cpu.execute(move || encode_commit_job(job))
+                    .await
+                    .map_err(MzStandardTranslationResultStorageError::ScheduleEncoding)?
+                    .map_err(MzStandardTranslationResultStorageError::InvalidPlan)
+            }
+        }))
+        .buffered(self.config.encode_concurrency.get())
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        finish_commit_plan(batches).map_err(MzStandardTranslationResultStorageError::InvalidPlan)
     }
 
     async fn execute(
@@ -191,7 +161,6 @@ where
     }
 }
 
-/// 标准译文持久化职责的明确失败语义。
 #[derive(Debug)]
 pub(crate) enum MzStandardTranslationResultStorageError<S, C> {
     ScheduleEncoding(CpuTaskExecutionError<C>),
@@ -213,10 +182,8 @@ pub(crate) enum MzStandardTranslationResultStorageError<S, C> {
     },
 }
 
-impl<S, C> fmt::Display for MzStandardTranslationResultStorageError<S, C>
-where
-    S: fmt::Display,
-    C: fmt::Display,
+impl<S: fmt::Display, C: fmt::Display> fmt::Display
+    for MzStandardTranslationResultStorageError<S, C>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -254,10 +221,8 @@ where
     }
 }
 
-impl<S, C> Error for MzStandardTranslationResultStorageError<S, C>
-where
-    S: Error + 'static,
-    C: Error + 'static,
+impl<S: Error + 'static, C: Error + 'static> Error
+    for MzStandardTranslationResultStorageError<S, C>
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -269,21 +234,16 @@ where
     }
 }
 
-/// 构造安全事务计划前发现的内部结果不变量破坏。
 #[derive(Debug)]
 pub(crate) enum ResultStoragePlanError {
     Location(MzLocationCodecError),
     EmptyTaskResult,
     EmptyReuseTargets,
-    IncompleteReuseEncoding,
     BlankTranslation,
-    BlankTerminologyDependency,
-    UntranslatedLeafHasTerminologyDependencies,
+    InconsistentTranslationState,
     MismatchedReuseOriginal,
     MismatchedPropagationOriginal,
     DuplicateLeaf,
-    DuplicateTerminologyDependency { term: String },
-    ContradictoryTerminologyDependency { term: String },
 }
 
 impl fmt::Display for ResultStoragePlanError {
@@ -292,25 +252,15 @@ impl fmt::Display for ResultStoragePlanError {
             Self::Location(source) => source.fmt(formatter),
             Self::EmptyTaskResult => formatter.write_str("任务结果不包含任何译文"),
             Self::EmptyReuseTargets => formatter.write_str("译文复用计划不包含任何目标"),
-            Self::IncompleteReuseEncoding => formatter.write_str("译文复用编码结果不完整"),
             Self::BlankTranslation => formatter.write_str("任务结果包含空白译文"),
-            Self::BlankTerminologyDependency => {
-                formatter.write_str("任务结果的术语依赖为空或带首尾空白")
-            }
-            Self::UntranslatedLeafHasTerminologyDependencies => {
-                formatter.write_str("未翻译的复用目标不应持有术语依赖")
+            Self::InconsistentTranslationState => {
+                formatter.write_str("读取时的译文与译文状态没有同时存在或同时缺失")
             }
             Self::MismatchedReuseOriginal => formatter.write_str("译文复用种子与目标的原文不一致"),
             Self::MismatchedPropagationOriginal => {
                 formatter.write_str("译文代表与传播目标的原文不一致")
             }
             Self::DuplicateLeaf => formatter.write_str("同一事务重复修改同一文本叶子"),
-            Self::DuplicateTerminologyDependency { term } => {
-                write!(formatter, "重复记录术语依赖：{term}")
-            }
-            Self::ContradictoryTerminologyDependency { term } => {
-                write!(formatter, "同一术语记录了矛盾译词：{term}")
-            }
         }
     }
 }
@@ -324,271 +274,364 @@ impl Error for ResultStoragePlanError {
     }
 }
 
+#[derive(Clone)]
 struct EncodedIdentity {
+    owner: &'static str,
     table: MzStandardAssetTable,
     unit_type: Option<&'static str>,
     exact_location: String,
     group_location: String,
+    field_name: String,
     original_text: String,
 }
 
-struct EncodedInvalidation {
-    identity: EncodedIdentity,
-    expected_translation: String,
-    expected_dependencies: Vec<TerminologyDependency>,
-}
-
-enum ReuseEncodingInput {
-    Seed {
-        reuse_index: usize,
-        seed: TranslationReuseSeed,
+enum PreparationLeafWork {
+    Invalidation {
+        index: usize,
+        identity: TranslationLeafIdentity,
+        expected_translation: String,
+        expected_translation_state: Sha256Fingerprint,
     },
-    Target {
+    ReuseSeed {
         reuse_index: usize,
-        target: TranslationReuseTarget,
+        identity: TranslationLeafIdentity,
+        expected_translation: String,
+        expected_translation_state: Sha256Fingerprint,
     },
-}
-
-enum EncodedReusePart {
-    Seed {
+    ReuseTarget {
         reuse_index: usize,
-        seed: EncodedReuseSeed,
-    },
-    Target {
-        reuse_index: usize,
-        target: EncodedReuseTarget,
+        target_index: usize,
+        seed_original: String,
+        translation: String,
+        identity: TranslationLeafIdentity,
+        expected_translation: Option<String>,
+        expected_translation_state: Option<Sha256Fingerprint>,
+        replacement_translation_state: Sha256Fingerprint,
     },
 }
 
-struct EncodedReuseSeed {
-    identity: EncodedIdentity,
-    expected_translation: String,
-    expected_dependencies: Vec<TerminologyDependency>,
+enum EncodedPreparationLeaf {
+    Invalidation {
+        index: usize,
+        identity: EncodedIdentity,
+        expected_translation: String,
+        expected_translation_state: Sha256Fingerprint,
+    },
+    ReuseSeed {
+        reuse_index: usize,
+        identity: EncodedIdentity,
+        expected_translation: String,
+        expected_translation_state: Sha256Fingerprint,
+    },
+    ReuseTarget {
+        reuse_index: usize,
+        target_index: usize,
+        translation: String,
+        identity: EncodedIdentity,
+        expected_translation: Option<String>,
+        expected_translation_state: Option<Sha256Fingerprint>,
+        replacement_translation_state: Sha256Fingerprint,
+    },
 }
 
-struct EncodedReuseTarget {
-    identity: EncodedIdentity,
-    expected_translation: Option<String>,
-    expected_dependencies: Vec<TerminologyDependency>,
-}
-
-struct EncodedReuse {
-    seed: EncodedReuseSeed,
-    targets: Vec<EncodedReuseTarget>,
-}
-
-struct EncodedPreparation {
-    invalidations: Vec<EncodedInvalidation>,
-    reuses: Vec<EncodedReuse>,
-}
-
-struct PatchEncodingInput {
+struct CommitLeafWork {
+    patch_index: usize,
+    role: String,
     identity: TranslationLeafIdentity,
-    leader_original: String,
+    required_original: Option<String>,
     translation: String,
-    dependencies: Vec<TerminologyDependency>,
+    translation_state: Sha256Fingerprint,
 }
 
-struct EncodedPatch {
+struct EncodedCommitLeaf {
+    patch_index: usize,
+    role: String,
     identity: EncodedIdentity,
     translation: String,
-    dependencies: Vec<TerminologyDependency>,
+    translation_state: Sha256Fingerprint,
 }
 
-fn split_owned<T>(values: Vec<T>, values_per_job: usize) -> Vec<Vec<T>> {
-    let mut values = values.into_iter();
-    let mut batches = Vec::new();
-    loop {
-        let batch = values.by_ref().take(values_per_job).collect::<Vec<_>>();
-        if batch.is_empty() {
-            return batches;
-        }
-        batches.push(batch);
+fn preparation_work(
+    preparation: TranslationPlanPreparation,
+) -> Result<
+    (
+        Vec<PreparationLeafWork>,
+        String,
+        String,
+        TranslationSnapshotBaseline,
+    ),
+    ResultStoragePlanError,
+> {
+    let (invalidations, reuses, terminology_json, placeholder_rules_json, _, _, snapshot_baseline) =
+        preparation.into_parts();
+    let mut work = Vec::new();
+
+    for (index, invalidation) in invalidations.into_iter().enumerate() {
+        work.push(PreparationLeafWork::Invalidation {
+            index,
+            identity: invalidation.identity().clone(),
+            expected_translation: invalidation.expected_translation().to_owned(),
+            expected_translation_state: invalidation.expected_translation_state(),
+        });
     }
-}
 
-fn encode_invalidation_batch(
-    invalidations: Vec<TranslationInvalidation>,
-) -> Result<Vec<EncodedInvalidation>, ResultStoragePlanError> {
-    invalidations
-        .into_iter()
-        .map(|invalidation| {
-            if invalidation.expected_translation().trim().is_empty() {
-                return Err(ResultStoragePlanError::BlankTranslation);
-            }
-            let dependencies =
-                normalize_dependencies(invalidation.expected_terminology_dependencies().to_vec())?;
-            Ok(EncodedInvalidation {
-                identity: encode_identity(invalidation.identity())?,
-                expected_translation: invalidation.expected_translation().to_owned(),
-                expected_dependencies: dependencies,
-            })
-        })
-        .collect()
-}
-
-fn build_reuse_encoding_inputs(
-    reuses: Vec<TranslationReuse>,
-) -> Result<(usize, Vec<ReuseEncodingInput>), ResultStoragePlanError> {
-    let reuse_count = reuses.len();
-    let mut inputs = Vec::new();
-    for (reuse_index, reuse_plan) in reuses.into_iter().enumerate() {
-        if reuse_plan.targets().is_empty() {
+    for (reuse_index, reuse) in reuses.into_iter().enumerate() {
+        if reuse.targets().is_empty() {
             return Err(ResultStoragePlanError::EmptyReuseTargets);
         }
-        inputs.push(ReuseEncodingInput::Seed {
+        let seed_original = reuse.seed().identity().original_text().to_owned();
+        let translation = reuse.seed().expected_translation().to_owned();
+        work.push(PreparationLeafWork::ReuseSeed {
             reuse_index,
-            seed: reuse_plan.seed().clone(),
+            identity: reuse.seed().identity().clone(),
+            expected_translation: translation.clone(),
+            expected_translation_state: reuse.seed().expected_translation_state(),
         });
-        inputs.extend(reuse_plan.targets().iter().cloned().map(|target| {
-            ReuseEncodingInput::Target {
-                reuse_index,
-                target,
-            }
-        }));
-    }
-    Ok((reuse_count, inputs))
-}
 
-fn encode_reuse_part_batch(
-    inputs: Vec<ReuseEncodingInput>,
-) -> Result<Vec<EncodedReusePart>, ResultStoragePlanError> {
-    inputs
-        .into_iter()
-        .map(|input| match input {
-            ReuseEncodingInput::Seed { reuse_index, seed } => {
-                if seed.expected_translation().trim().is_empty() {
-                    return Err(ResultStoragePlanError::BlankTranslation);
-                }
-                let expected_dependencies =
-                    normalize_dependencies(seed.expected_terminology_dependencies().to_vec())?;
-                Ok(EncodedReusePart::Seed {
-                    reuse_index,
-                    seed: EncodedReuseSeed {
-                        identity: encode_identity(seed.identity())?,
-                        expected_translation: seed.expected_translation().to_owned(),
-                        expected_dependencies,
-                    },
-                })
-            }
-            ReuseEncodingInput::Target {
+        for (target_index, target) in reuse.targets().iter().enumerate() {
+            work.push(PreparationLeafWork::ReuseTarget {
                 reuse_index,
-                target,
-            } => {
-                if target
-                    .expected_translation()
-                    .is_some_and(|translation| translation.trim().is_empty())
-                {
-                    return Err(ResultStoragePlanError::BlankTranslation);
-                }
-                if target.expected_translation().is_none()
-                    && !target.expected_terminology_dependencies().is_empty()
-                {
-                    return Err(ResultStoragePlanError::UntranslatedLeafHasTerminologyDependencies);
-                }
-                Ok(EncodedReusePart::Target {
-                    reuse_index,
-                    target: EncodedReuseTarget {
-                        identity: encode_identity(target.identity())?,
-                        expected_translation: target.expected_translation().map(str::to_owned),
-                        expected_dependencies: normalize_dependencies(
-                            target.expected_terminology_dependencies().to_vec(),
-                        )?,
-                    },
-                })
-            }
-        })
-        .collect()
-}
-
-fn assemble_encoded_reuses(
-    reuse_count: usize,
-    parts: Vec<EncodedReusePart>,
-) -> Result<Vec<EncodedReuse>, ResultStoragePlanError> {
-    let mut seeds = (0..reuse_count).map(|_| None).collect::<Vec<_>>();
-    let mut targets = (0..reuse_count).map(|_| Vec::new()).collect::<Vec<_>>();
-    for part in parts {
-        match part {
-            EncodedReusePart::Seed { reuse_index, seed } => {
-                let Some(slot) = seeds.get_mut(reuse_index) else {
-                    return Err(ResultStoragePlanError::IncompleteReuseEncoding);
-                };
-                if slot.replace(seed).is_some() {
-                    return Err(ResultStoragePlanError::IncompleteReuseEncoding);
-                }
-            }
-            EncodedReusePart::Target {
-                reuse_index,
-                target,
-            } => {
-                let Some(group) = targets.get_mut(reuse_index) else {
-                    return Err(ResultStoragePlanError::IncompleteReuseEncoding);
-                };
-                group.push(target);
-            }
+                target_index,
+                seed_original: seed_original.clone(),
+                translation: translation.clone(),
+                identity: target.identity().clone(),
+                expected_translation: target.expected_translation().map(str::to_owned),
+                expected_translation_state: target.expected_translation_state(),
+                replacement_translation_state: target.replacement_translation_state(),
+            });
         }
     }
 
-    seeds
-        .into_iter()
-        .zip(targets)
-        .map(|(seed, targets)| {
-            let seed = seed.ok_or(ResultStoragePlanError::IncompleteReuseEncoding)?;
-            if targets.is_empty() {
-                return Err(ResultStoragePlanError::EmptyReuseTargets);
+    Ok((
+        work,
+        terminology_json,
+        placeholder_rules_json,
+        snapshot_baseline,
+    ))
+}
+
+fn encode_preparation_job(
+    job: Vec<PreparationLeafWork>,
+) -> Result<Vec<EncodedPreparationLeaf>, ResultStoragePlanError> {
+    job.into_iter()
+        .map(|work| match work {
+            PreparationLeafWork::Invalidation {
+                index,
+                identity,
+                expected_translation,
+                expected_translation_state,
+            } => {
+                ensure_nonblank(&expected_translation)?;
+                Ok(EncodedPreparationLeaf::Invalidation {
+                    index,
+                    identity: encode_identity(&identity)?,
+                    expected_translation,
+                    expected_translation_state,
+                })
             }
-            if targets
-                .iter()
-                .any(|target| target.identity.original_text != seed.identity.original_text)
-            {
-                return Err(ResultStoragePlanError::MismatchedReuseOriginal);
+            PreparationLeafWork::ReuseSeed {
+                reuse_index,
+                identity,
+                expected_translation,
+                expected_translation_state,
+            } => {
+                ensure_nonblank(&expected_translation)?;
+                Ok(EncodedPreparationLeaf::ReuseSeed {
+                    reuse_index,
+                    identity: encode_identity(&identity)?,
+                    expected_translation,
+                    expected_translation_state,
+                })
             }
-            Ok(EncodedReuse { seed, targets })
+            PreparationLeafWork::ReuseTarget {
+                reuse_index,
+                target_index,
+                seed_original,
+                translation,
+                identity,
+                expected_translation,
+                expected_translation_state,
+                replacement_translation_state,
+            } => {
+                ensure_nonblank(&translation)?;
+                if identity.original_text() != seed_original {
+                    return Err(ResultStoragePlanError::MismatchedReuseOriginal);
+                }
+                if expected_translation.is_some() != expected_translation_state.is_some() {
+                    return Err(ResultStoragePlanError::InconsistentTranslationState);
+                }
+                if expected_translation
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(ResultStoragePlanError::BlankTranslation);
+                }
+                Ok(EncodedPreparationLeaf::ReuseTarget {
+                    reuse_index,
+                    target_index,
+                    translation,
+                    identity: encode_identity(&identity)?,
+                    expected_translation,
+                    expected_translation_state,
+                    replacement_translation_state,
+                })
+            }
         })
         .collect()
 }
 
-fn build_patch_encoding_inputs(patches: Vec<TranslationPatch>) -> Vec<PatchEncodingInput> {
-    let mut inputs = Vec::new();
-    for patch in patches {
-        let leader_original = patch.identity().original_text().to_owned();
-        inputs.push(PatchEncodingInput {
-            identity: patch.identity().clone(),
-            leader_original: leader_original.clone(),
-            translation: patch.translation().to_owned(),
-            dependencies: patch.terminology_dependencies().to_vec(),
-        });
-        inputs.extend(patch.propagation_targets().iter().cloned().map(|identity| {
-            PatchEncodingInput {
+fn finish_preparation_plan(
+    batches: Vec<Vec<EncodedPreparationLeaf>>,
+    terminology_json: String,
+    placeholder_rules_json: String,
+    snapshot_baseline: TranslationSnapshotBaseline,
+) -> Result<SqliteTransactionPlan, ResultStoragePlanError> {
+    let mut steps = vec![require_snapshot_baseline(&snapshot_baseline)];
+    let mut seen = BTreeSet::new();
+    for leaf in batches.into_iter().flatten() {
+        match leaf {
+            EncodedPreparationLeaf::Invalidation {
+                index,
                 identity,
-                leader_original: leader_original.clone(),
-                translation: patch.translation().to_owned(),
-                dependencies: patch.terminology_dependencies().to_vec(),
+                expected_translation,
+                expected_translation_state,
+            } => {
+                ensure_unique(&mut seen, &identity)?;
+                steps.push(require_snapshot(
+                    format!("preparation_invalidation_{index}"),
+                    &identity,
+                    Some((&expected_translation, expected_translation_state)),
+                ));
+                steps.push(clear_translation(&identity));
             }
-        }));
+            EncodedPreparationLeaf::ReuseSeed {
+                reuse_index,
+                identity,
+                expected_translation,
+                expected_translation_state,
+            } => {
+                ensure_unique(&mut seen, &identity)?;
+                steps.push(require_snapshot(
+                    format!("preparation_reuse_seed_{reuse_index}"),
+                    &identity,
+                    Some((&expected_translation, expected_translation_state)),
+                ));
+            }
+            EncodedPreparationLeaf::ReuseTarget {
+                reuse_index,
+                target_index,
+                translation,
+                identity,
+                expected_translation,
+                expected_translation_state,
+                replacement_translation_state,
+            } => {
+                ensure_unique(&mut seen, &identity)?;
+                let expected = expected_translation
+                    .as_deref()
+                    .zip(expected_translation_state);
+                steps.push(require_snapshot(
+                    format!("preparation_reuse_target_{reuse_index}_{target_index}"),
+                    &identity,
+                    expected,
+                ));
+                steps.push(write_translation(
+                    &identity,
+                    &translation,
+                    replacement_translation_state,
+                ));
+            }
+        }
     }
-    inputs
+    steps.extend(resource_updates(terminology_json, placeholder_rules_json));
+    Ok(SqliteTransactionPlan::new(steps))
 }
 
-fn encode_patch_leaf_batch(
-    inputs: Vec<PatchEncodingInput>,
-) -> Result<Vec<EncodedPatch>, ResultStoragePlanError> {
-    inputs
-        .into_iter()
-        .map(|input| {
-            if input.translation.trim().is_empty() {
-                return Err(ResultStoragePlanError::BlankTranslation);
-            }
-            if input.identity.original_text() != input.leader_original {
+fn commit_work(
+    result: ValidatedTranslationTaskResult,
+) -> Result<Vec<CommitLeafWork>, ResultStoragePlanError> {
+    let patches = result.into_updates();
+    if patches.is_empty() {
+        return Err(ResultStoragePlanError::EmptyTaskResult);
+    }
+    let mut work = Vec::new();
+    for (patch_index, patch) in patches.into_iter().enumerate() {
+        let translation = patch.translation().to_owned();
+        work.push(CommitLeafWork {
+            patch_index,
+            role: "leader".to_owned(),
+            identity: patch.identity().clone(),
+            required_original: None,
+            translation: translation.clone(),
+            translation_state: patch.translation_state(),
+        });
+        for (target_index, target) in patch.propagation_targets().iter().enumerate() {
+            work.push(CommitLeafWork {
+                patch_index,
+                role: format!("target_{target_index}"),
+                identity: target.identity().clone(),
+                required_original: Some(patch.identity().original_text().to_owned()),
+                translation: translation.clone(),
+                translation_state: target.state_context().finish(&translation),
+            });
+        }
+    }
+    Ok(work)
+}
+
+fn encode_commit_job(
+    job: Vec<CommitLeafWork>,
+) -> Result<Vec<EncodedCommitLeaf>, ResultStoragePlanError> {
+    job.into_iter()
+        .map(|work| {
+            ensure_nonblank(&work.translation)?;
+            if work
+                .required_original
+                .as_deref()
+                .is_some_and(|original| original != work.identity.original_text())
+            {
                 return Err(ResultStoragePlanError::MismatchedPropagationOriginal);
             }
-            Ok(EncodedPatch {
-                identity: encode_identity(&input.identity)?,
-                translation: input.translation,
-                dependencies: normalize_dependencies(input.dependencies)?,
+            Ok(EncodedCommitLeaf {
+                patch_index: work.patch_index,
+                role: work.role,
+                identity: encode_identity(&work.identity)?,
+                translation: work.translation,
+                translation_state: work.translation_state,
             })
         })
         .collect()
+}
+
+fn finish_commit_plan(
+    batches: Vec<Vec<EncodedCommitLeaf>>,
+) -> Result<SqliteTransactionPlan, ResultStoragePlanError> {
+    let mut steps = Vec::new();
+    let mut seen = BTreeSet::new();
+    for leaf in batches.into_iter().flatten() {
+        ensure_unique(&mut seen, &leaf.identity)?;
+        steps.push(require_snapshot(
+            format!("commit_{}_{}", leaf.patch_index, leaf.role),
+            &leaf.identity,
+            None,
+        ));
+        steps.push(write_translation(
+            &leaf.identity,
+            &leaf.translation,
+            leaf.translation_state,
+        ));
+    }
+    Ok(SqliteTransactionPlan::new(steps))
+}
+
+fn split_jobs<T>(items: Vec<T>, leaves_per_job: usize) -> Vec<Vec<T>> {
+    debug_assert!(leaves_per_job > 0);
+    let mut items = items.into_iter();
+    std::iter::from_fn(|| {
+        let job = items.by_ref().take(leaves_per_job).collect::<Vec<_>>();
+        (!job.is_empty()).then_some(job)
+    })
+    .collect()
 }
 
 fn encode_identity(
@@ -596,375 +639,178 @@ fn encode_identity(
 ) -> Result<EncodedIdentity, ResultStoragePlanError> {
     let storage = MzStandardAssetStorageKind::for_group_kind(identity.kind());
     Ok(EncodedIdentity {
+        owner: identity.owner().storage_name(),
         table: storage.table(),
         unit_type: storage.unit_type().map(|unit| unit.storage_name()),
         exact_location: MzLocationCodec::encode(identity.exact_location())
             .map_err(ResultStoragePlanError::Location)?,
         group_location: MzLocationCodec::encode(identity.group_location())
             .map_err(ResultStoragePlanError::Location)?,
+        field_name: identity.field_name().to_owned(),
         original_text: identity.original_text().to_owned(),
     })
 }
 
-fn normalize_dependencies(
-    dependencies: Vec<TerminologyDependency>,
-) -> Result<Vec<TerminologyDependency>, ResultStoragePlanError> {
-    let mut normalized = BTreeMap::<String, String>::new();
-    for dependency in dependencies {
-        if dependency.term().trim().is_empty()
-            || dependency.term().trim() != dependency.term()
-            || dependency.translation().trim().is_empty()
-            || dependency.translation().trim() != dependency.translation()
-        {
-            return Err(ResultStoragePlanError::BlankTerminologyDependency);
-        }
-        match normalized.entry(dependency.term().to_owned()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(dependency.translation().to_owned());
-            }
-            std::collections::btree_map::Entry::Occupied(entry)
-                if entry.get() == dependency.translation() =>
-            {
-                return Err(ResultStoragePlanError::DuplicateTerminologyDependency {
-                    term: dependency.term().to_owned(),
-                });
-            }
-            std::collections::btree_map::Entry::Occupied(_) => {
-                return Err(ResultStoragePlanError::ContradictoryTerminologyDependency {
-                    term: dependency.term().to_owned(),
-                });
-            }
-        }
-    }
-    Ok(normalized
-        .into_iter()
-        .map(|(term, translation)| TerminologyDependency::new(term, translation))
-        .collect())
-}
-
-fn ensure_valid_preparation(
-    invalidations: Vec<EncodedInvalidation>,
-    reuses: Vec<EncodedReuse>,
-) -> Result<EncodedPreparation, ResultStoragePlanError> {
-    ensure_unique_leaf_keys(
-        invalidations
-            .iter()
-            .map(|value| &value.identity)
-            .chain(reuses.iter().map(|reuse_plan| &reuse_plan.seed.identity))
-            .chain(
-                reuses
-                    .iter()
-                    .flat_map(|reuse_plan| reuse_plan.targets.iter())
-                    .map(|target| &target.identity),
-            )
-            .map(identity_key),
-    )?;
-    Ok(EncodedPreparation {
-        invalidations,
-        reuses,
-    })
-}
-
-fn ensure_unique_patches(
-    patches: Vec<EncodedPatch>,
-) -> Result<Vec<EncodedPatch>, ResultStoragePlanError> {
-    ensure_unique_leaf_keys(patches.iter().map(|value| {
-        (
-            &value.identity.table,
-            value.identity.exact_location.as_str(),
-        )
-    }))?;
-    Ok(patches)
-}
-
-fn ensure_unique_leaf_keys<'a>(
-    keys: impl Iterator<Item = (&'a MzStandardAssetTable, &'a str)>,
-) -> Result<(), ResultStoragePlanError> {
-    let mut seen = std::collections::BTreeSet::new();
-    for (table, exact_location) in keys {
-        if !seen.insert((table.storage_name(), exact_location)) {
-            return Err(ResultStoragePlanError::DuplicateLeaf);
-        }
-    }
-    Ok(())
-}
-
-fn identity_key(identity: &EncodedIdentity) -> (&MzStandardAssetTable, &str) {
-    (&identity.table, identity.exact_location.as_str())
-}
-
-fn build_preparation_plan(preparation: EncodedPreparation) -> SqliteTransactionPlan {
-    let target_count = preparation
-        .reuses
-        .iter()
-        .map(|reuse_plan| reuse_plan.targets.len())
-        .sum::<usize>();
-    let mut steps = Vec::with_capacity(
-        preparation.invalidations.len() * 3 + preparation.reuses.len() + target_count * 4 + 1,
-    );
-
-    for (index, invalidation) in preparation.invalidations.iter().enumerate() {
-        steps.push(SqliteTransactionStep::RequireNoRows {
-            check_id: stale_check_id("preparation_invalidation", index),
-            query: snapshot_stale_query(
-                &invalidation.identity,
-                Some(invalidation.expected_translation.as_str()),
-                &invalidation.expected_dependencies,
-            ),
-        });
-    }
-    for (index, reuse_plan) in preparation.reuses.iter().enumerate() {
-        steps.push(SqliteTransactionStep::RequireNoRows {
-            check_id: stale_check_id("preparation_reuse_seed", index),
-            query: snapshot_stale_query(
-                &reuse_plan.seed.identity,
-                Some(reuse_plan.seed.expected_translation.as_str()),
-                &reuse_plan.seed.expected_dependencies,
-            ),
-        });
-    }
-    for (index, target) in preparation
-        .reuses
-        .iter()
-        .flat_map(|reuse_plan| reuse_plan.targets.iter())
-        .enumerate()
-    {
-        steps.push(SqliteTransactionStep::RequireNoRows {
-            check_id: stale_check_id("preparation_reuse_target", index),
-            query: snapshot_stale_query(
-                &target.identity,
-                target.expected_translation.as_deref(),
-                &target.expected_dependencies,
-            ),
-        });
-    }
-
-    for invalidation in preparation.invalidations {
-        steps.push(execute(
-            DELETE_TERMINOLOGY_DEPENDENCIES,
-            vec![
-                text(invalidation.identity.table.storage_name()),
-                text(invalidation.identity.exact_location.clone()),
-            ],
-        ));
-        steps.push(execute(
-            &format!(
-                "UPDATE {} SET translation = NULL WHERE exact_location = ?",
-                invalidation.identity.table.storage_name()
-            ),
-            vec![text(invalidation.identity.exact_location)],
-        ));
-    }
-
-    let mut dependency_parameter_sets = Vec::new();
-    for reuse_plan in preparation.reuses {
-        for target in reuse_plan.targets {
-            steps.push(execute(
-                DELETE_TERMINOLOGY_DEPENDENCIES,
-                vec![
-                    text(target.identity.table.storage_name()),
-                    text(target.identity.exact_location.clone()),
-                ],
-            ));
-            steps.push(execute(
-                &format!(
-                    "UPDATE {} SET translation = ? WHERE exact_location = ?",
-                    target.identity.table.storage_name()
-                ),
-                vec![
-                    text(reuse_plan.seed.expected_translation.clone()),
-                    text(target.identity.exact_location.clone()),
-                ],
-            ));
-            for dependency in &reuse_plan.seed.expected_dependencies {
-                dependency_parameter_sets.push(vec![
-                    text(target.identity.table.storage_name()),
-                    text(target.identity.exact_location.clone()),
-                    text(dependency.term()),
-                    text(dependency.translation()),
-                ]);
-            }
-        }
-    }
-    if !dependency_parameter_sets.is_empty() {
-        steps.push(SqliteTransactionStep::ExecuteMany(SqliteBatch::new(
-            INSERT_TERMINOLOGY_DEPENDENCY,
-            dependency_parameter_sets,
-        )));
-    }
-    SqliteTransactionPlan::new(steps)
-}
-
-fn build_commit_plan(patches: Vec<EncodedPatch>) -> SqliteTransactionPlan {
-    let mut steps = Vec::with_capacity(patches.len() * 2 + 1);
-    for (index, patch) in patches.iter().enumerate() {
-        steps.push(SqliteTransactionStep::RequireNoRows {
-            check_id: stale_check_id("commit", index),
-            query: commit_stale_query(patch),
-        });
-    }
-
-    let mut dependency_parameter_sets = Vec::new();
-    for patch in patches {
-        steps.push(execute(
-            &format!(
-                "UPDATE {} SET translation = ? WHERE exact_location = ?",
-                patch.identity.table.storage_name()
-            ),
-            vec![
-                text(patch.translation),
-                text(patch.identity.exact_location.clone()),
-            ],
-        ));
-        for dependency in patch.dependencies {
-            dependency_parameter_sets.push(vec![
-                text(patch.identity.table.storage_name()),
-                text(patch.identity.exact_location.clone()),
-                text(dependency.term()),
-                text(dependency.translation()),
-            ]);
-        }
-    }
-    if !dependency_parameter_sets.is_empty() {
-        steps.push(SqliteTransactionStep::ExecuteMany(SqliteBatch::new(
-            INSERT_TERMINOLOGY_DEPENDENCY,
-            dependency_parameter_sets,
-        )));
-    }
-    SqliteTransactionPlan::new(steps)
-}
-
-fn snapshot_stale_query(
+fn ensure_unique(
+    seen: &mut BTreeSet<(&'static str, &'static str, String)>,
     identity: &EncodedIdentity,
-    expected_translation: Option<&str>,
-    expected_dependencies: &[TerminologyDependency],
-) -> SqliteQuery {
-    let (expected_cte, mut parameters) = expected_dependencies_cte(expected_dependencies);
-    parameters.extend([
-        text(identity.exact_location.clone()),
-        text(identity.group_location.clone()),
-        text(identity.original_text.clone()),
-    ]);
-    let unit_type_predicate = if let Some(unit_type) = identity.unit_type {
-        parameters.push(text(unit_type));
-        "\n      AND unit_type = ?"
+) -> Result<(), ResultStoragePlanError> {
+    if seen.insert((
+        identity.owner,
+        identity.table.storage_name(),
+        identity.exact_location.clone(),
+    )) {
+        Ok(())
     } else {
-        ""
-    };
-    let translation_predicate = if let Some(expected_translation) = expected_translation {
-        parameters.push(text(expected_translation));
-        "\n      AND translation = ?"
-    } else {
-        "\n      AND translation IS NULL"
-    };
-    parameters.extend([
-        text(identity.table.storage_name()),
-        text(identity.exact_location.clone()),
-    ]);
-    parameters.extend([
-        text(identity.table.storage_name()),
-        text(identity.exact_location.clone()),
-    ]);
-    SqliteQuery::new(
-        format!(
-            r#"WITH expected(term, term_translation) AS ({expected_cte})
-SELECT 1
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM {asset_table}
-    WHERE exact_location = ?
-      AND group_location = ?
-      AND original_text = ?
-      {unit_type_predicate}
-      {translation_predicate}
-)
-OR EXISTS (
-    SELECT term, term_translation
-    FROM {dependency_table}
-    WHERE asset_table = ? AND exact_location = ?
-    EXCEPT
-    SELECT term, term_translation FROM expected
-)
-OR EXISTS (
-    SELECT term, term_translation FROM expected
-    EXCEPT
-    SELECT term, term_translation
-    FROM {dependency_table}
-    WHERE asset_table = ? AND exact_location = ?
-)"#,
-            asset_table = identity.table.storage_name(),
-            dependency_table = TERMINOLOGY_DEPENDENCY_TABLE,
-        ),
-        parameters,
-    )
+        Err(ResultStoragePlanError::DuplicateLeaf)
+    }
 }
 
-fn commit_stale_query(patch: &EncodedPatch) -> SqliteQuery {
-    let identity = &patch.identity;
+fn ensure_nonblank(translation: &str) -> Result<(), ResultStoragePlanError> {
+    if translation.trim().is_empty() {
+        Err(ResultStoragePlanError::BlankTranslation)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_snapshot_baseline(baseline: &TranslationSnapshotBaseline) -> SqliteTransactionStep {
+    let mut parameters = vec![SqliteValue::Blob(
+        baseline.source_snapshot_fingerprint().as_bytes().to_vec(),
+    )];
+    let owner_condition = if baseline.owner_source_fingerprints().is_empty() {
+        "(SELECT COUNT(*) FROM standard_asset_owner_state) <> 0".to_owned()
+    } else {
+        let clauses = baseline
+            .owner_source_fingerprints()
+            .iter()
+            .map(|(owner, fingerprint)| {
+                parameters.push(text(owner.storage_name()));
+                parameters.push(SqliteValue::Blob(fingerprint.as_bytes().to_vec()));
+                "(owner = ? AND source_snapshot_fingerprint = ?)"
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!(
+            "(SELECT COUNT(*) FROM standard_asset_owner_state) <> {} OR EXISTS (SELECT 1 FROM standard_asset_owner_state WHERE NOT ({clauses}))",
+            baseline.owner_source_fingerprints().len()
+        )
+    };
+    parameters.extend([
+        text(TERMINOLOGY_RESOURCE_KIND),
+        text(baseline.terminology_json()),
+        text(PLACEHOLDER_RULES_RESOURCE_KIND),
+        text(baseline.placeholder_rules_json()),
+    ]);
+
+    SqliteTransactionStep::RequireNoRows {
+        check_id: SqliteCheckId::new("mz_translation_snapshot_baseline"),
+        query: SqliteQuery::new(
+            format!(
+                "SELECT 1 WHERE (SELECT COUNT(*) FROM metadata) <> 1 OR NOT EXISTS (SELECT 1 FROM metadata WHERE source_snapshot_fingerprint = ?) OR {owner_condition} OR (SELECT COUNT(*) FROM standard_translation_resource) <> 2 OR NOT EXISTS (SELECT 1 FROM standard_translation_resource WHERE resource_kind = ? AND canonical_json = ?) OR NOT EXISTS (SELECT 1 FROM standard_translation_resource WHERE resource_kind = ? AND canonical_json = ?)"
+            ),
+            parameters,
+        ),
+    }
+}
+
+fn require_snapshot(
+    id: String,
+    identity: &EncodedIdentity,
+    expected_translation: Option<(&str, Sha256Fingerprint)>,
+) -> SqliteTransactionStep {
     let mut parameters = vec![
+        text(identity.owner),
         text(identity.exact_location.clone()),
         text(identity.group_location.clone()),
+        text(identity.field_name.clone()),
         text(identity.original_text.clone()),
     ];
-    let unit_type_predicate = if let Some(unit_type) = identity.unit_type {
+    let unit_predicate = if let Some(unit_type) = identity.unit_type {
         parameters.push(text(unit_type));
-        "\n      AND unit_type = ?"
+        " AND unit_type = ?"
     } else {
         ""
     };
-    parameters.extend([
-        text(identity.table.storage_name()),
-        text(identity.exact_location.clone()),
-    ]);
-    SqliteQuery::new(
-        format!(
-            r#"SELECT 1
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM {asset_table}
-    WHERE exact_location = ?
-      AND group_location = ?
-      AND original_text = ?
-      {unit_type_predicate}
-      AND translation IS NULL
-)
-OR EXISTS (
-    SELECT 1
-    FROM {dependency_table}
-    WHERE asset_table = ? AND exact_location = ?
-)"#,
-            asset_table = identity.table.storage_name(),
-            dependency_table = TERMINOLOGY_DEPENDENCY_TABLE,
+    let state_predicate = if let Some((translation, state)) = expected_translation {
+        parameters.push(text(translation));
+        parameters.push(blob(state));
+        " AND translation = ? AND translation_state = ?"
+    } else {
+        " AND translation IS NULL AND translation_state IS NULL"
+    };
+    SqliteTransactionStep::RequireNoRows {
+        check_id: SqliteCheckId::new(format!("mz_translation_{id}")),
+        query: SqliteQuery::new(
+            format!(
+                "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM {} WHERE owner = ? AND exact_location = ? AND group_location = ? AND field_name = ? AND original_text = ?{unit_predicate}{state_predicate})",
+                identity.table.storage_name()
+            ),
+            parameters,
         ),
-        parameters,
+    }
+}
+
+fn clear_translation(identity: &EncodedIdentity) -> SqliteTransactionStep {
+    execute(
+        format!(
+            "UPDATE {} SET translation = NULL, translation_state = NULL WHERE owner = ? AND exact_location = ?",
+            identity.table.storage_name()
+        ),
+        vec![text(identity.owner), text(identity.exact_location.clone())],
     )
 }
 
-fn expected_dependencies_cte(dependencies: &[TerminologyDependency]) -> (String, Vec<SqliteValue>) {
-    if dependencies.is_empty() {
-        return ("SELECT NULL, NULL WHERE 0".to_owned(), Vec::new());
-    }
-
-    let placeholders = std::iter::repeat_n("(?, ?)", dependencies.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let parameters = dependencies
-        .iter()
-        .flat_map(|dependency| [text(dependency.term()), text(dependency.translation())])
-        .collect();
-    (format!("VALUES {placeholders}"), parameters)
+fn write_translation(
+    identity: &EncodedIdentity,
+    translation: &str,
+    state: Sha256Fingerprint,
+) -> SqliteTransactionStep {
+    execute(
+        format!(
+            "UPDATE {} SET translation = ?, translation_state = ? WHERE owner = ? AND exact_location = ?",
+            identity.table.storage_name()
+        ),
+        vec![
+            text(translation),
+            blob(state),
+            text(identity.owner),
+            text(identity.exact_location.clone()),
+        ],
+    )
 }
 
-fn stale_check_id(stage: &str, index: usize) -> SqliteCheckId {
-    SqliteCheckId::new(format!("mz_translation_{stage}_stale_{index}"))
+fn resource_updates(
+    terminology_json: String,
+    placeholder_rules_json: String,
+) -> [SqliteTransactionStep; 2] {
+    [
+        update_resource(TERMINOLOGY_RESOURCE_KIND, terminology_json),
+        update_resource(PLACEHOLDER_RULES_RESOURCE_KIND, placeholder_rules_json),
+    ]
 }
 
-fn execute(statement: &str, parameters: Vec<SqliteValue>) -> SqliteTransactionStep {
+fn update_resource(kind: &'static str, canonical_json: String) -> SqliteTransactionStep {
+    execute(
+        "UPDATE standard_translation_resource SET canonical_json = ? WHERE resource_kind = ? AND canonical_json <> ?",
+        vec![
+            text(canonical_json.clone()),
+            text(kind),
+            text(canonical_json),
+        ],
+    )
+}
+
+fn execute(statement: impl Into<String>, parameters: Vec<SqliteValue>) -> SqliteTransactionStep {
     SqliteTransactionStep::Execute(SqliteCommand::new(statement, parameters))
 }
 
 fn text(value: impl Into<String>) -> SqliteValue {
     SqliteValue::Text(value.into())
+}
+
+fn blob(value: Sha256Fingerprint) -> SqliteValue {
+    SqliteValue::Blob(value.as_bytes().to_vec())
 }
 
 fn map_transaction_error<S, C>(
@@ -998,50 +844,38 @@ fn map_transaction_error<S, C>(
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
+    use std::future::{Future, ready};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use rusqlite::types::Value as RusqliteValue;
+    use rusqlite::{Connection, params_from_iter};
+
     use crate::att_mz::ProjectName;
+    use crate::att_mz::standard_asset::MzStandardAssetOwner;
     use crate::att_mz::text::{
         MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
     };
+    use crate::project_database::SourceSnapshotFingerprint;
+    use crate::storage::sqlite::SqliteTransactionStep;
 
-    use super::super::standard::{
-        StandardTranslationTaskIndex, TranslationReuseSeed, TranslationReuseTarget,
-    };
     use super::*;
+    use crate::att_mz::translate::standard::{
+        StandardTranslationTaskIndex, TranslationInvalidation, TranslationPatch,
+        TranslationPlanPreparationCounts, TranslationPropagationTarget,
+        TranslationSnapshotBaseline, TranslationStateContext,
+    };
 
-    type TransactionResponse = Result<(), ExecuteTransactionError<FakeError>>;
-    type SharedTransactionResponse = Arc<Mutex<Option<TransactionResponse>>>;
+    #[derive(Clone, Copy, Debug)]
+    struct FakeError;
 
-    #[derive(Clone)]
-    struct RecordingSqlite {
-        calls: Arc<Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>>,
-        response: SharedTransactionResponse,
-    }
-
-    impl SqliteTransactionExecutor for RecordingSqlite {
-        type Error = FakeError;
-
-        fn execute_transaction(
-            &self,
-            path: PathBuf,
-            plan: SqliteTransactionPlan,
-        ) -> impl Future<Output = Result<(), ExecuteTransactionError<Self::Error>>> + Send {
-            self.calls
-                .lock()
-                .expect("事务调用锁不应中毒")
-                .push((path, plan));
-            let response = self
-                .response
-                .lock()
-                .expect("事务响应锁不应中毒")
-                .take()
-                .unwrap_or(Ok(()));
-            async move { response }
+    impl fmt::Display for FakeError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("fake failure")
         }
     }
+
+    impl Error for FakeError {}
 
     #[derive(Clone)]
     struct RecordingCpu {
@@ -1062,599 +896,493 @@ mod tests {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             tokio::task::yield_now().await;
-            let output = task();
+            let result = task();
             self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(output)
+            Ok(result)
         }
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FakeError(&'static str);
-
-    impl fmt::Display for FakeError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str(self.0)
-        }
+    #[derive(Clone, Default)]
+    struct RecordingSqlite {
+        plans: Arc<Mutex<Vec<SqliteTransactionPlan>>>,
     }
 
-    impl Error for FakeError {}
+    impl SqliteTransactionExecutor for RecordingSqlite {
+        type Error = FakeError;
 
-    #[test]
-    fn config_preserves_explicit_non_zero_limits() {
-        let config = MzStandardTranslationResultStorageConfig::new(non_zero(2), non_zero(16));
-
-        assert_eq!(config.encode_concurrency().get(), 2);
-        assert_eq!(config.leaves_per_encode_job().get(), 16);
-    }
-
-    #[tokio::test]
-    async fn preparation_checks_expected_translation_and_exact_dependency_set_before_clearing() {
-        let harness = Harness::new(None);
-        let service = harness.service(2, 1);
-        let preparation = TranslationPlanPreparation::new(
-            vec![TranslationInvalidation::new(
-                identity("name", "宝剑"),
-                "Sword",
-                vec![TerminologyDependency::new("宝剑", "Sword")],
-            )],
-            Vec::new(),
-        );
-
-        service
-            .apply_preparation(&project(), preparation)
-            .await
-            .expect("准备事务应该成功");
-
-        let calls = harness.calls.lock().expect("事务调用锁不应中毒");
-        assert_eq!(calls.len(), 1);
-        let steps = calls[0].1.steps();
-        assert!(matches!(
-            &steps[0],
-            SqliteTransactionStep::RequireNoRows { query, .. }
-                if query.statement().contains("EXCEPT")
-                    && query.statement().contains("translation = ?")
-                    && query.parameters().contains(&text("Sword"))
-                    && query.parameters().contains(&text("宝剑"))
-        ));
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            SqliteTransactionStep::Execute(command)
-                if command.statement() == DELETE_TERMINOLOGY_DEPENDENCIES
-        )));
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            SqliteTransactionStep::Execute(command)
-                if command.statement().contains("SET translation = NULL")
-        )));
-    }
-
-    #[tokio::test]
-    async fn preparation_checks_all_reuse_snapshots_before_copying_translation_and_dependencies() {
-        let harness = Harness::new(None);
-        let service = harness.service(2, 1);
-        let seed_dependencies = vec![TerminologyDependency::new("宝剑", "Sword")];
-        let preparation = TranslationPlanPreparation::new(
-            Vec::new(),
-            vec![TranslationReuse::new(
-                TranslationReuseSeed::new(
-                    identity_at(10, "name", "宝剑"),
-                    "Sword",
-                    seed_dependencies.clone(),
-                ),
-                vec![
-                    TranslationReuseTarget::new(identity_at(11, "name", "宝剑"), None, Vec::new()),
-                    TranslationReuseTarget::new(
-                        identity_at(12, "name", "宝剑"),
-                        Some("Old sword".to_owned()),
-                        vec![TerminologyDependency::new("宝剑", "Old sword")],
-                    ),
-                ],
-            )],
-        );
-
-        service
-            .apply_preparation(&project(), preparation)
-            .await
-            .expect("复用准备事务应该成功");
-
-        assert_eq!(
-            harness.cpu_calls.load(Ordering::SeqCst),
-            4,
-            "一个种子和两个目标应按三个物理叶子分批，随后执行一次组装校验"
-        );
-        assert_eq!(harness.max_cpu_active.load(Ordering::SeqCst), 2);
-        let calls = harness.calls.lock().expect("事务调用锁不应中毒");
-        let steps = calls[0].1.steps();
-        assert_eq!(
-            steps
-                .iter()
-                .take_while(|step| matches!(step, SqliteTransactionStep::RequireNoRows { .. }))
-                .count(),
-            3,
-            "种子和所有目标必须在首次写入前完成 CAS"
-        );
-        let queries = steps[..3]
-            .iter()
-            .map(|step| match step {
-                SqliteTransactionStep::RequireNoRows { query, .. } => query,
-                _ => unreachable!("前三步必须是快照检查"),
-            })
-            .collect::<Vec<_>>();
-        assert!(queries[0].statement().contains("translation = ?"));
-        assert!(queries[1].statement().contains("translation IS NULL"));
-        assert!(queries[2].statement().contains("translation = ?"));
-        assert!(
-            queries
-                .iter()
-                .all(|query| query.statement().contains("EXCEPT"))
-        );
-
-        let translation_updates = steps
-            .iter()
-            .filter_map(|step| match step {
-                SqliteTransactionStep::Execute(command)
-                    if command.statement().contains("SET translation = ?") =>
-                {
-                    Some(command)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(translation_updates.len(), 2);
-        assert!(
-            translation_updates
-                .iter()
-                .all(|command| command.parameters()[0] == text("Sword"))
-        );
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            SqliteTransactionStep::ExecuteMany(batch)
-                if batch.statement() == INSERT_TERMINOLOGY_DEPENDENCY
-                    && batch.parameter_sets().len() == 2
-                    && batch.parameter_sets().iter().all(|parameters| {
-                        parameters[2] == text("宝剑") && parameters[3] == text("Sword")
-                    })
-        )));
-    }
-
-    #[tokio::test]
-    async fn preparation_rejects_invalidation_and_reuse_target_overlap_before_sqlite() {
-        let harness = Harness::new(None);
-        let target = identity_at(11, "name", "宝剑");
-        let preparation = TranslationPlanPreparation::new(
-            vec![TranslationInvalidation::new(
-                target.clone(),
-                "Old sword",
-                Vec::new(),
-            )],
-            vec![TranslationReuse::new(
-                TranslationReuseSeed::new(identity_at(10, "name", "宝剑"), "Sword", Vec::new()),
-                vec![TranslationReuseTarget::new(
-                    target,
-                    Some("Old sword".to_owned()),
-                    Vec::new(),
-                )],
-            )],
-        );
-
-        let error = harness
-            .service(2, 1)
-            .apply_preparation(&project(), preparation)
-            .await
-            .expect_err("同一叶子不得同时失效和复用");
-
-        assert!(matches!(
-            error,
-            MzStandardTranslationResultStorageError::InvalidPlan(
-                ResultStoragePlanError::DuplicateLeaf
-            )
-        ));
-        assert!(harness.calls.lock().expect("事务调用锁不应中毒").is_empty());
-    }
-
-    #[tokio::test]
-    async fn commit_checks_untranslated_leaf_then_writes_translation_and_dependencies_atomically() {
-        let harness = Harness::new(None);
-        let service = harness.service(1, 10);
-        let result = ValidatedTranslationTaskResult::new(
-            StandardTranslationTaskIndex::new(0),
-            vec![TranslationPatch::new(
-                identity("name", "宝剑"),
-                Vec::new(),
-                "Sword",
-                vec![TerminologyDependency::new("宝剑", "Sword")],
-            )],
-        );
-
-        service
-            .commit(&project(), result)
-            .await
-            .expect("任务提交应该成功");
-
-        let calls = harness.calls.lock().expect("事务调用锁不应中毒");
-        let steps = calls[0].1.steps();
-        assert!(matches!(
-            &steps[0],
-            SqliteTransactionStep::RequireNoRows { query, .. }
-                if query.statement().contains("translation IS NULL")
-                    && query.statement().contains(TERMINOLOGY_DEPENDENCY_TABLE)
-        ));
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            SqliteTransactionStep::Execute(command)
-                if command.statement().contains("SET translation = ?")
-                    && command.parameters()[0] == text("Sword")
-        )));
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            SqliteTransactionStep::ExecuteMany(batch)
-                if batch.statement() == INSERT_TERMINOLOGY_DEPENDENCY
-                    && batch.parameter_sets()[0][2] == text("宝剑")
-        )));
-    }
-
-    #[tokio::test]
-    async fn commit_expands_one_validated_translation_to_all_propagation_targets_atomically() {
-        let harness = Harness::new(None);
-        let result = ValidatedTranslationTaskResult::new(
-            StandardTranslationTaskIndex::new(0),
-            vec![TranslationPatch::new(
-                identity_at(10, "name", "宝剑"),
-                vec![
-                    identity_at(11, "name", "宝剑"),
-                    identity_at(12, "name", "宝剑"),
-                ],
-                "Sword",
-                vec![TerminologyDependency::new("宝剑", "Sword")],
-            )],
-        );
-
-        harness
-            .service(2, 1)
-            .commit(&project(), result)
-            .await
-            .expect("代表译文应该原子传播");
-
-        assert_eq!(
-            harness.cpu_calls.load(Ordering::SeqCst),
-            4,
-            "一个代表和两个 alias 应按三个物理叶子分批，随后执行一次唯一性校验"
-        );
-        assert_eq!(harness.max_cpu_active.load(Ordering::SeqCst), 2);
-        let calls = harness.calls.lock().expect("事务调用锁不应中毒");
-        let steps = calls[0].1.steps();
-        assert_eq!(
-            steps
-                .iter()
-                .take_while(|step| matches!(step, SqliteTransactionStep::RequireNoRows { .. }))
-                .count(),
-            3
-        );
-        assert_eq!(
-            steps
-                .iter()
-                .filter(|step| matches!(
-                    step,
-                    SqliteTransactionStep::Execute(command)
-                        if command.statement().contains("SET translation = ?")
-                            && command.parameters()[0] == text("Sword")
-                ))
-                .count(),
-            3
-        );
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            SqliteTransactionStep::ExecuteMany(batch)
-                if batch.statement() == INSERT_TERMINOLOGY_DEPENDENCY
-                    && batch.parameter_sets().len() == 3
-        )));
-    }
-
-    #[tokio::test]
-    async fn every_text_body_kind_checks_its_semantic_unit_type() {
-        for (kind, unit_type) in [
-            (TextGroupKind::EventDialogue, "dialogue"),
-            (TextGroupKind::EventChoices, "choices"),
-            (TextGroupKind::EventScrollingText, "scrolling_text"),
-            (TextGroupKind::EventCommand, "event_command"),
-        ] {
-            let harness = Harness::new(None);
-            let result = ValidatedTranslationTaskResult::new(
-                StandardTranslationTaskIndex::new(0),
-                vec![TranslationPatch::new(
-                    text_body_identity(kind, "こんにちは"),
-                    Vec::new(),
-                    "你好",
-                    Vec::new(),
-                )],
-            );
-
-            harness
-                .service(1, 1)
-                .commit(&project(), result)
-                .await
-                .expect("text_body 应以具体单元语义提交");
-
-            let calls = harness.calls.lock().expect("事务调用锁不应中毒");
-            let SqliteTransactionStep::RequireNoRows { query, .. } = &calls[0].1.steps()[0] else {
-                panic!("第一步必须检查计划是否过期");
-            };
-            assert!(query.statement().contains("unit_type = ?"));
-            assert!(query.parameters().contains(&text(unit_type)));
-        }
-    }
-
-    #[tokio::test]
-    async fn configured_parallel_encoding_preserves_the_same_deterministic_plan() {
-        let serial = Harness::new(None);
-        let parallel = Harness::new(None);
-        let preparation = || {
-            TranslationPlanPreparation::new(
-                vec![
-                    TranslationInvalidation::new(identity("name", "宝剑"), "Sword", Vec::new()),
-                    TranslationInvalidation::new(
-                        identity("description", "锋利的宝剑"),
-                        "A sharp sword",
-                        Vec::new(),
-                    ),
-                ],
-                Vec::new(),
-            )
-        };
-
-        serial
-            .service(1, 1)
-            .apply_preparation(&project(), preparation())
-            .await
-            .expect("串行编码应该成功");
-        parallel
-            .service(2, 1)
-            .apply_preparation(&project(), preparation())
-            .await
-            .expect("并行编码应该成功");
-
-        assert_eq!(parallel.max_cpu_active.load(Ordering::SeqCst), 2);
-        let serial_calls = serial.calls.lock().expect("串行事务调用锁不应中毒");
-        let parallel_calls = parallel.calls.lock().expect("并行事务调用锁不应中毒");
-        assert_eq!(serial_calls[0].1, parallel_calls[0].1);
-    }
-
-    #[tokio::test]
-    async fn duplicate_leaf_is_rejected_before_sqlite_side_effects() {
-        let harness = Harness::new(None);
-        let duplicate_identity = identity("name", "宝剑");
-        let result = ValidatedTranslationTaskResult::new(
-            StandardTranslationTaskIndex::new(0),
-            vec![
-                TranslationPatch::new(duplicate_identity.clone(), Vec::new(), "Sword", Vec::new()),
-                TranslationPatch::new(duplicate_identity, Vec::new(), "Blade", Vec::new()),
-            ],
-        );
-
-        let error = harness
-            .service(2, 1)
-            .commit(&project(), result)
-            .await
-            .expect_err("同一任务不得重复修改同一叶子");
-
-        assert!(matches!(
-            error,
-            MzStandardTranslationResultStorageError::InvalidPlan(
-                ResultStoragePlanError::DuplicateLeaf
-            )
-        ));
-        assert!(harness.calls.lock().expect("事务调用锁不应中毒").is_empty());
-    }
-
-    #[tokio::test]
-    async fn propagation_target_cannot_repeat_or_belong_to_multiple_leaders() {
-        let repeated_target = identity_at(12, "name", "宝剑");
-        for result in [
-            ValidatedTranslationTaskResult::new(
-                StandardTranslationTaskIndex::new(0),
-                vec![TranslationPatch::new(
-                    identity_at(10, "name", "宝剑"),
-                    vec![repeated_target.clone(), repeated_target.clone()],
-                    "Sword",
-                    Vec::new(),
-                )],
-            ),
-            ValidatedTranslationTaskResult::new(
-                StandardTranslationTaskIndex::new(0),
-                vec![
-                    TranslationPatch::new(
-                        identity_at(10, "name", "宝剑"),
-                        vec![repeated_target.clone()],
-                        "Sword",
-                        Vec::new(),
-                    ),
-                    TranslationPatch::new(
-                        identity_at(11, "name", "宝剑"),
-                        vec![repeated_target.clone()],
-                        "Sword",
-                        Vec::new(),
-                    ),
-                ],
-            ),
-        ] {
-            let harness = Harness::new(None);
-            let error = harness
-                .service(2, 1)
-                .commit(&project(), result)
-                .await
-                .expect_err("传播目标必须全局唯一");
-            assert!(matches!(
-                error,
-                MzStandardTranslationResultStorageError::InvalidPlan(
-                    ResultStoragePlanError::DuplicateLeaf
-                )
-            ));
-            assert!(harness.calls.lock().expect("事务调用锁不应中毒").is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn empty_reuse_is_rejected_before_sqlite_side_effects() {
-        let harness = Harness::new(None);
-        let preparation = TranslationPlanPreparation::new(
-            Vec::new(),
-            vec![TranslationReuse::new(
-                TranslationReuseSeed::new(identity_at(10, "name", "宝剑"), "Sword", Vec::new()),
-                Vec::new(),
-            )],
-        );
-
-        let error = harness
-            .service(1, 1)
-            .apply_preparation(&project(), preparation)
-            .await
-            .expect_err("没有目标的复用计划应该失败");
-
-        assert!(matches!(
-            error,
-            MzStandardTranslationResultStorageError::InvalidPlan(
-                ResultStoragePlanError::EmptyReuseTargets
-            )
-        ));
-        assert!(harness.calls.lock().expect("事务调用锁不应中毒").is_empty());
-    }
-
-    #[tokio::test]
-    async fn stale_not_committed_and_unknown_outcomes_remain_distinct() {
-        let cases = [
-            (
-                Err(ExecuteTransactionError::RequirementFailed {
-                    check_id: SqliteCheckId::new("stale"),
-                }),
-                "stale",
-            ),
-            (
-                Err(ExecuteTransactionError::NotCommitted(FakeError("write"))),
-                "not_committed",
-            ),
-            (
-                Err(ExecuteTransactionError::OutcomeUnknown(FakeError("commit"))),
-                "unknown",
-            ),
-        ];
-        for (response, expected) in cases {
-            let harness = Harness::new(Some(response));
-            let error = harness
-                .service(1, 1)
-                .apply_preparation(
-                    &project(),
-                    TranslationPlanPreparation::new(
-                        vec![TranslationInvalidation::new(
-                            identity("name", "宝剑"),
-                            "Sword",
-                            Vec::new(),
-                        )],
-                        Vec::new(),
-                    ),
-                )
-                .await
-                .expect_err("事务终态应该传播");
-            match (expected, error) {
-                ("stale", MzStandardTranslationResultStorageError::StalePlan { .. })
-                | ("not_committed", MzStandardTranslationResultStorageError::NotCommitted { .. })
-                | ("unknown", MzStandardTranslationResultStorageError::OutcomeUnknown { .. }) => {}
-                (expected, actual) => panic!("期望 {expected}，实际为 {actual}"),
-            }
+        async fn execute_transaction(
+            &self,
+            _path: PathBuf,
+            plan: SqliteTransactionPlan,
+        ) -> Result<(), ExecuteTransactionError<Self::Error>> {
+            self.plans.lock().expect("计划锁不应中毒").push(plan);
+            Ok(())
         }
     }
 
     struct Harness {
-        calls: Arc<Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>>,
-        response: SharedTransactionResponse,
         cpu_calls: Arc<AtomicUsize>,
         max_cpu_active: Arc<AtomicUsize>,
+        sqlite: RecordingSqlite,
     }
 
     impl Harness {
-        fn new(response: Option<TransactionResponse>) -> Self {
+        fn new() -> Self {
             Self {
-                calls: Arc::new(Mutex::new(Vec::new())),
-                response: Arc::new(Mutex::new(response)),
                 cpu_calls: Arc::new(AtomicUsize::new(0)),
                 max_cpu_active: Arc::new(AtomicUsize::new(0)),
+                sqlite: RecordingSqlite::default(),
             }
         }
 
         fn service(
             &self,
-            encode_concurrency: usize,
+            concurrency: usize,
             leaves_per_job: usize,
         ) -> MzStandardTranslationResultStorageService<RecordingSqlite, RecordingCpu> {
             MzStandardTranslationResultStorageService::new(
-                RecordingSqlite {
-                    calls: Arc::clone(&self.calls),
-                    response: Arc::clone(&self.response),
-                },
+                self.sqlite.clone(),
                 RecordingCpu {
                     calls: Arc::clone(&self.cpu_calls),
                     active: Arc::new(AtomicUsize::new(0)),
                     max_active: Arc::clone(&self.max_cpu_active),
                 },
                 MzStandardTranslationResultStorageConfig::new(
-                    non_zero(encode_concurrency),
+                    non_zero(concurrency),
                     non_zero(leaves_per_job),
                 ),
             )
         }
+
+        fn only_plan(&self) -> SqliteTransactionPlan {
+            self.sqlite
+                .plans
+                .lock()
+                .expect("计划锁不应中毒")
+                .first()
+                .expect("应提交一个事务计划")
+                .clone()
+        }
     }
 
-    fn identity(field: &str, original: &str) -> TranslationLeafIdentity {
-        identity_at(10, field, original)
+    #[tokio::test]
+    async fn preparation_encoding_obeys_job_size_and_bounded_ordered_concurrency() {
+        let concurrent = Harness::new();
+        concurrent
+            .service(2, 2)
+            .apply_preparation(&project(), invalidation_preparation(5))
+            .await
+            .expect("并发分片应成功");
+
+        assert_eq!(concurrent.cpu_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(concurrent.max_cpu_active.load(Ordering::SeqCst), 2);
+        let concurrent_plan = concurrent.only_plan();
+
+        let serial = Harness::new();
+        serial
+            .service(1, 1)
+            .apply_preparation(&project(), invalidation_preparation(5))
+            .await
+            .expect("串行分片应成功");
+
+        assert_eq!(serial.cpu_calls.load(Ordering::SeqCst), 5);
+        assert_eq!(serial.max_cpu_active.load(Ordering::SeqCst), 1);
+        assert_eq!(concurrent_plan, serial.only_plan());
+        assert!(matches!(
+            concurrent_plan.steps().first(),
+            Some(SqliteTransactionStep::RequireNoRows { check_id, .. })
+                if check_id.as_str() == "mz_translation_snapshot_baseline"
+        ));
     }
 
-    fn identity_at(item_index: usize, field: &str, original: &str) -> TranslationLeafIdentity {
+    #[tokio::test]
+    async fn commit_encoding_uses_the_same_bounded_ordered_leaf_partitioning() {
+        let concurrent = Harness::new();
+        concurrent
+            .service(2, 2)
+            .commit(&project(), five_leaf_result())
+            .await
+            .expect("并发提交编码应成功");
+        assert_eq!(concurrent.cpu_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(concurrent.max_cpu_active.load(Ordering::SeqCst), 2);
+
+        let serial = Harness::new();
+        serial
+            .service(1, 1)
+            .commit(&project(), five_leaf_result())
+            .await
+            .expect("串行提交编码应成功");
+        assert_eq!(serial.cpu_calls.load(Ordering::SeqCst), 5);
+        assert_eq!(serial.max_cpu_active.load(Ordering::SeqCst), 1);
+        assert_eq!(concurrent.only_plan(), serial.only_plan());
+    }
+
+    #[tokio::test]
+    async fn unchanged_resources_and_current_leaves_skip_cpu_and_sqlite() {
+        let harness = Harness::new();
+        let preparation = TranslationPlanPreparation::with_baseline(
+            Vec::new(),
+            Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            TranslationPlanPreparationCounts::new(4, 0, 0),
+            baseline(),
+        );
+
+        harness
+            .service(3, 2)
+            .apply_preparation(&project(), preparation)
+            .await
+            .expect("完全收敛状态应直接成功");
+
+        assert_eq!(harness.cpu_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            harness
+                .sqlite
+                .plans
+                .lock()
+                .expect("计划锁不应中毒")
+                .is_empty()
+        );
+    }
+
+    #[derive(Clone)]
+    struct EvaluatingSqlite {
+        connection: Arc<Mutex<Connection>>,
+        attempted_writes: Arc<AtomicUsize>,
+    }
+
+    impl SqliteTransactionExecutor for EvaluatingSqlite {
+        type Error = FakeError;
+
+        fn execute_transaction(
+            &self,
+            _path: PathBuf,
+            plan: SqliteTransactionPlan,
+        ) -> impl Future<Output = Result<(), ExecuteTransactionError<Self::Error>>> + Send {
+            let result = {
+                let mut connection = self.connection.lock().expect("SQLite 锁不应中毒");
+                evaluate_plan(&mut connection, &plan, &self.attempted_writes)
+            };
+            ready(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_drift_is_stale_and_prevents_every_planned_write() {
+        for mutation in [
+            "metadata",
+            "owner_fingerprint",
+            "owner_set",
+            "terminology",
+            "placeholder_rules",
+        ] {
+            let sqlite = evaluating_sqlite();
+            mutate_baseline(&sqlite.connection, mutation);
+            let service = MzStandardTranslationResultStorageService::new(
+                sqlite.clone(),
+                RecordingCpu {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    active: Arc::new(AtomicUsize::new(0)),
+                    max_active: Arc::new(AtomicUsize::new(0)),
+                },
+                MzStandardTranslationResultStorageConfig::new(non_zero(2), non_zero(2)),
+            );
+
+            let error = service
+                .apply_preparation(&project(), changed_resource_preparation())
+                .await
+                .expect_err("基线漂移必须拒绝整个事务");
+
+            assert!(
+                matches!(
+                    error,
+                    MzStandardTranslationResultStorageError::StalePlan { ref check_id, .. }
+                        if check_id.as_str() == "mz_translation_snapshot_baseline"
+                ),
+                "漂移种类 {mutation}"
+            );
+            assert_eq!(sqlite.attempted_writes.load(Ordering::SeqCst), 0);
+            let connection = sqlite.connection.lock().expect("SQLite 锁不应中毒");
+            let translation: Option<String> = connection
+                .query_row("SELECT translation FROM entry", [], |row| row.get(0))
+                .expect("应可复核原译文");
+            assert_eq!(
+                translation.as_deref(),
+                Some("旧译文"),
+                "漂移种类 {mutation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_baseline_applies_resource_and_leaf_changes_in_one_transaction() {
+        let sqlite = evaluating_sqlite();
+        let service = MzStandardTranslationResultStorageService::new(
+            sqlite.clone(),
+            RecordingCpu {
+                calls: Arc::new(AtomicUsize::new(0)),
+                active: Arc::new(AtomicUsize::new(0)),
+                max_active: Arc::new(AtomicUsize::new(0)),
+            },
+            MzStandardTranslationResultStorageConfig::new(non_zero(2), non_zero(1)),
+        );
+
+        service
+            .apply_preparation(&project(), changed_resource_preparation())
+            .await
+            .expect("未漂移基线应原子提交");
+
+        let connection = sqlite.connection.lock().expect("SQLite 锁不应中毒");
+        let (translation, state): (Option<String>, Option<Vec<u8>>) = connection
+            .query_row(
+                "SELECT translation, translation_state FROM entry",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("应可读取资产状态");
+        assert_eq!((translation, state), (None, None));
+        let terminology: String = connection
+            .query_row(
+                "SELECT canonical_json FROM standard_translation_resource WHERE resource_kind = 'terminology'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应可读取术语资源");
+        assert_eq!(terminology, r#"[{"term":"新"}]"#);
+    }
+
+    fn evaluate_plan(
+        connection: &mut Connection,
+        plan: &SqliteTransactionPlan,
+        attempted_writes: &AtomicUsize,
+    ) -> Result<(), ExecuteTransactionError<FakeError>> {
+        let transaction = connection.transaction().expect("应可开始测试事务");
+        for step in plan.steps() {
+            match step {
+                SqliteTransactionStep::RequireNoRows { check_id, query } => {
+                    let exists = {
+                        let mut statement = transaction
+                            .prepare(query.statement())
+                            .expect("检查 SQL 应合法");
+                        let parameters = query
+                            .parameters()
+                            .iter()
+                            .map(to_rusqlite_value)
+                            .collect::<Vec<_>>();
+                        let mut rows = statement
+                            .query(params_from_iter(parameters))
+                            .expect("检查参数应可绑定");
+                        rows.next().expect("检查查询应可执行").is_some()
+                    };
+                    if exists {
+                        transaction.rollback().expect("失败事务应可回滚");
+                        return Err(ExecuteTransactionError::RequirementFailed {
+                            check_id: check_id.clone(),
+                        });
+                    }
+                }
+                SqliteTransactionStep::Execute(command) => {
+                    attempted_writes.fetch_add(1, Ordering::SeqCst);
+                    let parameters = command
+                        .parameters()
+                        .iter()
+                        .map(to_rusqlite_value)
+                        .collect::<Vec<_>>();
+                    transaction
+                        .execute(command.statement(), params_from_iter(parameters))
+                        .expect("写入 SQL 应可执行");
+                }
+                SqliteTransactionStep::ExecuteMany(batch) => {
+                    let mut statement = transaction
+                        .prepare(batch.statement())
+                        .expect("批量 SQL 应合法");
+                    for parameters in batch.parameter_sets() {
+                        attempted_writes.fetch_add(1, Ordering::SeqCst);
+                        statement
+                            .execute(params_from_iter(parameters.iter().map(to_rusqlite_value)))
+                            .expect("批量参数应可执行");
+                    }
+                }
+            }
+        }
+        transaction.commit().expect("测试事务应可提交");
+        Ok(())
+    }
+
+    fn evaluating_sqlite() -> EvaluatingSqlite {
+        let connection = Connection::open_in_memory().expect("应可创建内存数据库");
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (source_snapshot_fingerprint BLOB NOT NULL);
+                 CREATE TABLE standard_asset_owner_state (owner TEXT PRIMARY KEY, source_snapshot_fingerprint BLOB NOT NULL);
+                 CREATE TABLE standard_translation_resource (resource_kind TEXT PRIMARY KEY, canonical_json TEXT NOT NULL);
+                 CREATE TABLE entry (owner TEXT NOT NULL, exact_location TEXT NOT NULL, group_location TEXT NOT NULL, field_name TEXT NOT NULL, original_text TEXT NOT NULL, translation TEXT, translation_state BLOB, PRIMARY KEY (owner, exact_location));",
+            )
+            .expect("测试 schema 应可建立");
+        let identity = identity(0);
+        connection
+            .execute("INSERT INTO metadata VALUES (?1)", [vec![0xa5; 32]])
+            .expect("应可写 metadata");
+        connection
+            .execute(
+                "INSERT INTO standard_asset_owner_state VALUES ('builtin', ?1)",
+                [vec![0xa5; 32]],
+            )
+            .expect("应可写 owner");
+        connection
+            .execute_batch(
+                "INSERT INTO standard_translation_resource VALUES ('terminology', '[]');
+                 INSERT INTO standard_translation_resource VALUES ('placeholder_rules', '[]');",
+            )
+            .expect("应可写资源");
+        connection
+            .execute(
+                "INSERT INTO entry VALUES ('builtin', ?1, ?2, 'name', '原文-0', '旧译文', ?3)",
+                rusqlite::params![
+                    MzLocationCodec::encode(identity.exact_location()).expect("位置应可编码"),
+                    MzLocationCodec::encode(identity.group_location()).expect("位置应可编码"),
+                    vec![0x10_u8; 32],
+                ],
+            )
+            .expect("应可写资产");
+        EvaluatingSqlite {
+            connection: Arc::new(Mutex::new(connection)),
+            attempted_writes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn mutate_baseline(connection: &Mutex<Connection>, mutation: &str) {
+        let connection = connection.lock().expect("SQLite 锁不应中毒");
+        match mutation {
+            "metadata" => connection
+                .execute("UPDATE metadata SET source_snapshot_fingerprint = ?1", [vec![0xb4; 32]])
+                .expect("应可篡改 metadata"),
+            "owner_fingerprint" => connection
+                .execute("UPDATE standard_asset_owner_state SET source_snapshot_fingerprint = ?1", [vec![0xb4; 32]])
+                .expect("应可篡改 owner 指纹"),
+            "owner_set" => connection
+                .execute("INSERT INTO standard_asset_owner_state VALUES ('rules', ?1)", [vec![0xa5; 32]])
+                .expect("应可篡改 owner 集合"),
+            "terminology" => connection
+                .execute("UPDATE standard_translation_resource SET canonical_json = '[1]' WHERE resource_kind = 'terminology'", [])
+                .expect("应可篡改术语"),
+            "placeholder_rules" => connection
+                .execute("UPDATE standard_translation_resource SET canonical_json = '[1]' WHERE resource_kind = 'placeholder_rules'", [])
+                .expect("应可篡改占位符"),
+            _ => panic!("未知篡改种类"),
+        };
+    }
+
+    fn changed_resource_preparation() -> TranslationPlanPreparation {
+        TranslationPlanPreparation::with_baseline(
+            vec![TranslationInvalidation::new(
+                identity(0),
+                "旧译文",
+                Sha256Fingerprint::from_bytes([0x10; 32]),
+            )],
+            Vec::new(),
+            r#"[{"term":"新"}]"#.to_owned(),
+            "[]".to_owned(),
+            TranslationPlanPreparationCounts::new(0, 1, 0),
+            baseline(),
+        )
+    }
+
+    fn invalidation_preparation(count: usize) -> TranslationPlanPreparation {
+        TranslationPlanPreparation::with_baseline(
+            (0..count)
+                .map(|index| {
+                    TranslationInvalidation::new(
+                        identity(index),
+                        format!("旧译文-{index}"),
+                        Sha256Fingerprint::from_bytes([index as u8; 32]),
+                    )
+                })
+                .collect(),
+            Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            TranslationPlanPreparationCounts::new(0, count, 0),
+            baseline(),
+        )
+    }
+
+    fn five_leaf_result() -> ValidatedTranslationTaskResult {
+        let translation = "新译文";
+        let state_context =
+            |byte| TranslationStateContext::new(Sha256Fingerprint::from_bytes([byte; 32]));
+        let propagation_targets = (1..5)
+            .map(|index| {
+                TranslationPropagationTarget::new(
+                    identity_with_original(index, "原文-0"),
+                    state_context(index as u8),
+                )
+            })
+            .collect();
+        ValidatedTranslationTaskResult::new(
+            StandardTranslationTaskIndex::new(0),
+            vec![TranslationPatch::new(
+                identity(0),
+                propagation_targets,
+                translation,
+                state_context(0).finish(translation),
+            )],
+        )
+    }
+
+    fn baseline() -> TranslationSnapshotBaseline {
+        TranslationSnapshotBaseline::new(
+            SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
+            vec![(
+                MzStandardAssetOwner::Builtin,
+                SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
+            )],
+            "[]".to_owned(),
+            "[]".to_owned(),
+        )
+    }
+
+    fn identity(index: usize) -> TranslationLeafIdentity {
+        identity_with_original(index, &format!("原文-{index}"))
+    }
+
+    fn identity_with_original(index: usize, original: &str) -> TranslationLeafIdentity {
         let source = MzSource::data(StandardDataFile::Items);
-        let group_location =
-            MzLocation::value(source.clone(), vec![MzLocationStep::index(item_index)]);
-        let exact_location = MzLocation::value(
+        let group = MzLocation::value(source.clone(), vec![MzLocationStep::index(index)]);
+        let exact = MzLocation::value(
             source,
-            vec![
-                MzLocationStep::index(item_index),
-                MzLocationStep::key(field),
-            ],
+            vec![MzLocationStep::index(index), MzLocationStep::key("name")],
         );
         TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
-            group_location,
-            exact_location,
+            "name",
+            group,
+            exact,
             original,
         )
     }
 
-    fn text_body_identity(kind: TextGroupKind, original: &str) -> TranslationLeafIdentity {
-        let source = MzSource::map(1);
-        let group_steps = vec![
-            MzLocationStep::key("events"),
-            MzLocationStep::index(2),
-            MzLocationStep::key("pages"),
-            MzLocationStep::index(0),
-            MzLocationStep::key("list"),
-            MzLocationStep::index(5),
-        ];
-        let mut exact_steps = group_steps.clone();
-        exact_steps.extend([MzLocationStep::key("parameters"), MzLocationStep::index(0)]);
-        TranslationLeafIdentity::new(
-            kind,
-            MzLocation::value(source.clone(), group_steps),
-            MzLocation::value(source, exact_steps),
-            original,
-        )
-    }
-
-    fn project() -> StoredProjectRecord {
-        StoredProjectRecord::new(
-            "demo".parse::<ProjectName>().expect("项目名称应该有效"),
+    fn project() -> OpenedProject {
+        OpenedProject::new(
+            "demo".parse::<ProjectName>().expect("项目名应合法"),
             PathBuf::from("C:/projects/demo"),
             PathBuf::from("C:/projects/demo/project.db"),
             "ja".to_owned(),
             "zh-Hans".to_owned(),
             crate::att_mz::project::test_layout_profile(),
         )
+    }
+
+    fn to_rusqlite_value(value: &SqliteValue) -> RusqliteValue {
+        match value {
+            SqliteValue::Null => RusqliteValue::Null,
+            SqliteValue::Integer(value) => RusqliteValue::Integer(*value),
+            SqliteValue::Real(value) => RusqliteValue::Real(*value),
+            SqliteValue::Text(value) => RusqliteValue::Text(value.clone()),
+            SqliteValue::Blob(value) => RusqliteValue::Blob(value.clone()),
+        }
     }
 
     fn non_zero(value: usize) -> NonZeroUsize {

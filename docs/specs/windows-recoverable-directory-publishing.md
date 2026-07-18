@@ -2,8 +2,8 @@
 
 本文定义 `SystemFileSystem` 在 Windows x64 MSVC 进程中提供的文件访问与
 `RecoverableDirectoryPublisher` 行为。该根把一个完整目录候选作为单一发布对象，
-为 Init 的首次创建和 Standard WriteBack 的整体替换提供跨进程线性化、进程崩溃后
-恢复及有界资源占用。
+为 Init 的项目创建/收敛和 WriteBack 的唯一候选整体替换提供跨进程线性化、进程
+崩溃后恢复及有界资源占用。
 
 ## 1. 平台与路径边界
 
@@ -20,25 +20,48 @@ Windows 名称按系统的序数、忽略大小写语义比较。以下名称不
 - ADS 语法；
 - 根保留的 stage、backup、journal 命名空间。
 
-递归复制只接受普通目录和普通文件的主数据流。候选新建文件继承发布目标父目录的
-ACL；根不复制 ACL、ADS、hardlink 身份和时间戳。
+递归复制只接受单链接普通文件和普通目录的主数据流；来源中的 hardlink 直接失败，
+不会先复制成一个看似普通的新文件。每个来源项在枚举时固定 file ID 与长度，复制时
+以拒绝其他写入者的句柄重新打开并复核，读取完成后再次确认 file ID、长度、链接数和
+实际字节数。候选新建文件继承发布目标父目录的 ACL；根不复制 ACL、ADS 和时间戳。
 
 ## 2. 普通文件能力
 
-`ExistingDirectoryResolver`、`DirectoryLister` 和 `FileReader` 共享固定线程数、
-有界队列的文件工作池。相对路径在方法调用时以进程当前工作目录转换为绝对路径；
-worker 不重新解释调用方的当前目录。
+`ExistingDirectoryResolver`、`DirectoryLister`、`FileReader` 和
+`DirectoryTreeFingerprinter` 共享固定线程数、有界队列的文件工作池。相对路径在
+方法调用时以进程当前工作目录转换为绝对路径；worker 不重新解释调用方的当前目录。
 
 - Resolver 返回逐组件校验后的规范绝对目录；
-- Lister 只列举直接子项，逐项固定并拒绝在枚举后被替换成的 reparse point，且受
-  单目录条目数限制；
+- Lister 只列举直接子项，返回规范绝对路径及普通文件/目录种类；逐项固定并拒绝
+  reparse point、非普通对象、硬链接文件和枚举后的身份替换，且受单目录条目数限制；
 - Reader 在分配前读取已固定文件句柄的长度，受完整文件字节上限约束，并返回原始
   字节与规范绝对路径。
+- Fingerprinter 对一个或多个逻辑根稳定遍历普通目录树，把 Windows UTF-16 相对名、
+  类型、空目录、文件长度和全部字节写入无歧义 SHA-256；绝对路径和文件属性不参与。
+  每轮同时保留按逻辑路径自然顺序排列的根、目录、文件 file ID；连续两轮必须同时
+  得到相同摘要和相同身份映射。枚举后的对象重新打开时、目录枚举结束时及文件读取
+  完成时都会复核原身份，因此用相同字节替换成新对象也属于观察期间变化。
 
 工作进入有界队列前可以被取消；工作池一旦接管任务，即使等待结果的 Future 被丢弃，
 任务仍执行到明确终态。worker panic 被隔离为根错误，其他 worker 继续服务。
 
-## 3. 候选请求与唯一终结令牌
+## 3. 项目操作租约
+
+`ProjectOperationLeaseProvider` 在 `<projects.root>/.att-project-locks/` 为精确项目目录名
+取得跨进程排他锁。项目身份使用 Windows ordinal case-insensitive 语义，因此仅大小写
+不同的同名项目共享一把锁；不同项目没有全局互斥。
+
+```text
+acquire_project_operation_lease(ProjectOperationLeaseRequest)
+→ ProjectOperationLease<LeaseState> | Busy | Unavailable
+```
+
+等待上限只来自 `runtime.filesystem.project_lock.timeout_ms`。超时返回 `Busy` 并由命令
+映射为 `ProjectBusy`；文件系统故障返回 `Unavailable`。lease 不可复制，命令持有它
+直到全部业务和候选终结，Drop 释放锁。同一进程和可信 Lua 子进程都不能绕过这条
+跨进程互斥；锁顺序固定为项目租约 → 目标发布锁 → SQLite。
+
+## 4. 候选请求与唯一终结令牌
 
 `DirectoryStageRequest` 在构造边界固定以下事实：
 
@@ -67,13 +90,13 @@ empty_directories[]
 `discard(token)` 按值消费；token 只能交还创建它的同一 publisher 实例。调用方在
 收到 token 后直接丢弃属于内部契约错误，根仍会尽力清理未发布的候选。
 
-`StagedDirectory` 允许受信非根服务在候选中建立后续产物，例如 Init 在复制完成后
-建立 `project.db`。因此 `publish` 在任何可见交换前必须重新枚举完整候选，把后续产物
-一并纳入条目、深度、单文件和总字节预算，并重新拒绝 reparse point、非普通对象、
-共享同一物理文件身份的硬链接和 Windows 等价重名。复核失败时返回 `NotAttempted` 并
-精确清理候选，最终目标不变。
+`StagedDirectory` 允许受信非根服务在候选中建立后续产物，例如 Init 转换
+`project.db`，或 WriteBack Lua 通过 `ctx.output` 修改同一个候选。因此 `publish` 在
+任何可见交换前必须重新枚举完整候选，把后续产物一并纳入条目、深度、单文件和总
+字节预算，并重新拒绝 reparse point、非普通对象、共享同一物理文件身份的硬链接和
+Windows 等价重名。复核失败时返回 `NotAttempted` 并精确清理候选，最终目标不变。
 
-## 4. CreateNew
+## 5. CreateNew
 
 `CreateNew` 不预检后宣称成功。根使用 Win32 无覆盖 handle rename 把已完成候选移动到
 最终名称，该 rename 是同名并发创建的线性化点：
@@ -84,7 +107,7 @@ empty_directories[]
 
 该意图绝不覆盖已有文件或目录。
 
-## 5. ReplaceExisting 与 journal
+## 6. ReplaceExisting 与 journal
 
 `ReplaceExisting` 要求目标是现存目录。目标缺失返回 `TargetMissing`，目标不是目录或
 是 reparse point 返回 `TargetNotDirectory` 或对应根错误。切换始终在同目标跨进程锁内
@@ -108,7 +131,7 @@ file ID、操作 UUID 和阶段，不用路径展示文本充当身份。
 
 两次目录 rename 之间允许目标名称短暂缺失；根不会把逐文件半成品暴露为最终目录。
 
-## 6. 按目标恢复
+## 7. 按目标恢复
 
 恢复不在进程启动时扫描全部项目。下一次针对同一目标执行 `prepare` 时，在取得相同
 目标锁后，根据 journal、目标、stage 和 backup 的 file ID 分类：
@@ -130,7 +153,7 @@ reparse 的句柄固定整条父路径和待删除对象，读取 file ID，然�
 point、被不共享删除的句柄占用，或在枚举期间新增子项时，清理显式失败并保留证据，
 绝不退回对同名路径的递归删除。
 
-## 7. 发布终态
+## 8. 发布终态
 
 根向消费方保留以下互斥含义：
 
@@ -147,7 +170,7 @@ point、被不共享删除的句柄占用，或在枚举期间新增子项时，
 调用方重试或额外清理。已知未发布终态携带实际残留路径；显式 `discard` 失败携带准确
 stage 路径。
 
-## 8. 生命周期与耐久边界
+## 9. 生命周期与耐久边界
 
 FileSystem shutdown 先停止准入，再排空已接管的普通文件、候选准备、发布、恢复和清理
 工作，最后 join 固定 worker。shutdown 不在中途遗弃已经接管的目录副作用。

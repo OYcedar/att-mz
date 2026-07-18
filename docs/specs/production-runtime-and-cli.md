@@ -53,6 +53,31 @@ ProductionMzCommandRunner 只构造当前命令所需的纵向切片
 | Translate | 文件、SQLite、CPU、Delay、LLM、Translation JSONL 以及完整 Standard 翻译；显式 `--lua` 时再构造 Lua |
 | WriteBack | 文件、SQLite、CPU、可恢复目录发布、WriteBack JSONL 与完整 Standard 写回；显式 `--lua` 时再构造 Lua |
 
+四个命令都先为精确项目名取得跨进程项目租约。锁文件位于
+`<projects.root>/.att-project-locks/`，项目身份按 Windows ordinal
+case-insensitive 语义归一；因此仅大小写不同的名字不能绕过互斥。同一项目的
+Init、Extract、Translate、WriteBack 严格互斥，不同项目可以并行。租约等待达到外部
+超时后返回 `ProjectBusy`，不继续打开 SQLite 或建立目录候选。
+
+根契约只有一个当前形态：
+
+```text
+ProjectOperationLeaseProvider
+  .acquire_project_operation_lease(ProjectOperationLeaseRequest)
+  → ProjectOperationLease<LeaseState> | Busy | Unavailable
+```
+
+lease 不可复制，并由命令持有到业务与候选终结完成；Drop 释放同项目跨进程锁。
+
+全局锁顺序固定为：
+
+```text
+项目租约 → 目标目录发布锁 → SQLite 连接/事务
+```
+
+任何业务或 Lua Host 都不得反向取得。可信 Lua 的 `os.execute` 仍受同一个跨进程锁
+约束，同项目子命令不可重入。
+
 Translate 先按 CLI 提供的精确 ID 选中一个 MZ Profile，再取得它引用的公共 LLM
 Client。只有该 Profile 的系统提示词和全局 LLM TLS PEM 才会在本命令中读取；
 系统提示词必须是非空白 UTF-8 Markdown。组合根只构造一个
@@ -61,11 +86,22 @@ Client。只有该 Profile 的系统提示词和全局 LLM TLS PEM 才会在本�
 Bearer、model、额外 JSON 请求字段、连接池、总准入和客户端限速。
 
 Translation 的 `run_id + project + profile` 在 Profile 选择和项目读取都成功后、
-任何翻译副作之前建立。WriteBack 的 `run_id + project` 同样在项目实际打开后
+任何翻译副作用之前建立。WriteBack 的 `run_id + project` 同样在项目实际打开后
 建立；实际三个布局宽度由 Standard 已消费的权威项目事实随日志事件写入，
 组合边界不为日志重复读取数据库。
 
-## 4. Ctrl-C 与明确终态
+## 4. 四命令的重复运行语义
+
+- Init 收敛来源、语言、布局和工作区结构；完全相同返回 Unchanged；
+- Extract 只替换本次选择的 Builtin/Rules/Lua owner，同快照返回 Unchanged；
+- Translate 复用持久资源和逐叶 state，全部 Current 时 0 LLM、0 资产写入；
+- WriteBack 每次从冻结来源重建唯一候选，Standard 与 Lua 完成后只发布一次。
+
+来源实际指纹在每次项目开启时重算。Translate 和 WriteBack 还要求全部 active owner
+与 metadata 同世代，否则返回 `ExtractionOutOfDate`。这些都是四条现有命令内部的
+状态收敛，不增加 reset、update、repair、resume 或 publish 命令。
+
+## 5. Ctrl-C 与明确终态
 
 进程每次只准入一个顶层命令。第一次 Ctrl-C 后不再建立新的业务入口，
 并把同一个单向合作取消事实交给本次纵向切片。业务编排在每个阶段边界停止
@@ -80,15 +116,16 @@ poll 活动请求而与 LLM shutdown 互等。
 Init 在候选准备或建库返回后观察到取消时显式 discard，不再发布；一旦 publish
 已被根接管便等待其明确终态。Extract 不再进入下一个 Builtin、Rules 或 Lua 阶段。
 Translate 不再补入新的 TaskBlock，已经开始的 TaskBlock 仍按自然顺序完成验收、
-提交和任务日志，取消运行不写完成汇总。WriteBack 在读取、布局、改写和发布边界
-停止；候选 prepare 后取消会显式 discard，已经发布的输出仍必须写入发布日志。
+提交和任务日志，取消运行不写完成汇总。WriteBack 在读取、布局和改写边界停止；
+唯一候选 prepare 后的取消会先终结可选 Lua，再显式 discard；publish 已接管后等待
+明确终态，已经生效的输出仍必须写入发布日志。
 可信 Lua 进入不交还控制的 native 调用时，进程不伪造超时或成功。
 
 Ctrl-C 后，合作取消或正常完成且完整 shutdown 成功时退出码为 `130`，不呈现
 业务完成文案。收尾期间产生的发布结果未知、持久化失败等技术终态必须保留并
 呈现；业务技术终态或任一 shutdown 失败时退出码为 `1`。
 
-## 5. shutdown 顺序
+## 6. shutdown 顺序
 
 命令自己记录已构造的根，并只终结这些实例。完整 Translate 的顺序是：
 
@@ -105,7 +142,7 @@ WriteBack 不构造 LLM，Extract 不构造日志，Init 只终结 SQLite 和 Fi
 未选择 Lua 时不存在 Lua shutdown 步骤。进程不设置“超时后强拆”；一旦根
 已接管副作用，进程必须等待它返回明确终态。
 
-## 6. 呈现与退出码
+## 7. 呈现与退出码
 
 `CommandResultRenderer` 只在业务命令成功、所有 shutdown 成功且 Tokio Runtime 已销毁
 后向 stdout 写入成功结果。Translate 的 `Partial` 和 `Unavailable` 是正常业务结果，

@@ -19,9 +19,10 @@ use tokio::sync::{Semaphore, watch};
 use tokio::time::{Instant, timeout_at};
 use url::Url;
 
+use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::llm::{
-    ChatMessage, ChatMessageRole, LlmFinishReason, LlmRequestError, LlmRequestExecutor,
-    LlmResponse, LlmUsage,
+    ChatMessage, ChatMessageRole, LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError,
+    LlmRequestExecutor, LlmResponse, LlmUsage,
 };
 
 /// Chat Completions 的认证方式。
@@ -87,6 +88,255 @@ impl OpenAiChatCompletionClient {
             rate_limiter: Arc::new(RateLimiter::direct(quota)),
         }
     }
+}
+
+impl LlmClientSemanticIdentity for OpenAiChatCompletionClient {
+    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+        let canonical_extra =
+            canonical_json_semantic_bytes(&Value::Object(self.request_body_extra.clone()));
+        let mut hasher = Sha256FramedHasher::new(b"att.llm.chat-completions.semantics");
+        hasher
+            .frame(1, self.endpoint.as_str().as_bytes())
+            .frame(2, self.model.as_bytes())
+            .frame(3, &canonical_extra);
+        hasher.finish()
+    }
+}
+
+/// 为翻译语义指纹建立与配置书写形式无关的 JSON 值编码。
+///
+/// 对象键递归排序，数组顺序保持不变；数字按任意精度十进制值规范化，因此
+/// `0.2`、`2e-1` 与 `0.20` 具有同一个语义身份。请求发送仍使用用户提供的值，
+/// 这份编码只服务于失效判断。
+fn canonical_json_semantic_bytes(value: &Value) -> Vec<u8> {
+    fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+        output.extend_from_slice(
+            &u64::try_from(bytes.len())
+                .expect("x86_64 usize 必须可表示为 u64")
+                .to_be_bytes(),
+        );
+        output.extend_from_slice(bytes);
+    }
+
+    fn encode(value: &Value, output: &mut Vec<u8>) {
+        match value {
+            Value::Null => output.push(0),
+            Value::Bool(false) => output.push(1),
+            Value::Bool(true) => output.push(2),
+            Value::Number(number) => {
+                output.push(3);
+                let number = CanonicalJsonNumber::parse(&number.to_string());
+                output.push(u8::from(number.negative));
+                push_bytes(output, number.coefficient.as_bytes());
+                output.push(u8::from(number.exponent.negative));
+                push_bytes(output, &number.exponent.magnitude);
+            }
+            Value::String(value) => {
+                output.push(4);
+                push_bytes(output, value.as_bytes());
+            }
+            Value::Array(values) => {
+                output.push(5);
+                output.extend_from_slice(
+                    &u64::try_from(values.len())
+                        .expect("x86_64 usize 必须可表示为 u64")
+                        .to_be_bytes(),
+                );
+                for value in values {
+                    encode(value, output);
+                }
+            }
+            Value::Object(object) => {
+                output.push(6);
+                output.extend_from_slice(
+                    &u64::try_from(object.len())
+                        .expect("x86_64 usize 必须可表示为 u64")
+                        .to_be_bytes(),
+                );
+                let mut keys = object.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                for key in keys {
+                    push_bytes(output, key.as_bytes());
+                    encode(&object[key], output);
+                }
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    encode(value, &mut output);
+    output
+}
+
+struct CanonicalJsonNumber {
+    negative: bool,
+    coefficient: String,
+    exponent: SignedDecimal,
+}
+
+impl CanonicalJsonNumber {
+    fn parse(value: &str) -> Self {
+        let (negative, unsigned) = value
+            .strip_prefix('-')
+            .map_or((false, value), |value| (true, value));
+        let (mantissa, exponent) = unsigned
+            .split_once(['e', 'E'])
+            .map_or((unsigned, "0"), |(mantissa, exponent)| (mantissa, exponent));
+        let (integer, fraction) = mantissa
+            .split_once('.')
+            .map_or((mantissa, ""), |(integer, fraction)| (integer, fraction));
+        let mut digits = String::with_capacity(integer.len() + fraction.len());
+        digits.push_str(integer);
+        digits.push_str(fraction);
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            return Self {
+                negative: false,
+                coefficient: "0".to_owned(),
+                exponent: SignedDecimal::zero(),
+            };
+        }
+
+        let trailing_zeroes = digits
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'0')
+            .count();
+        let coefficient = digits[..digits.len() - trailing_zeroes].to_owned();
+        let mut exponent = SignedDecimal::parse(exponent);
+        exponent.add_unsigned(fraction.len(), true);
+        exponent.add_unsigned(trailing_zeroes, false);
+        Self {
+            negative,
+            coefficient,
+            exponent,
+        }
+    }
+}
+
+struct SignedDecimal {
+    negative: bool,
+    /// 无前导零的 ASCII 十进制绝对值；零固定为单个 `0`。
+    magnitude: Vec<u8>,
+}
+
+impl SignedDecimal {
+    fn zero() -> Self {
+        Self {
+            negative: false,
+            magnitude: vec![b'0'],
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        let (negative, digits) = value.strip_prefix('-').map_or_else(
+            || (false, value.strip_prefix('+').unwrap_or(value)),
+            |digits| (true, digits),
+        );
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            Self::zero()
+        } else {
+            Self {
+                negative,
+                magnitude: digits.as_bytes().to_vec(),
+            }
+        }
+    }
+
+    fn add_unsigned(&mut self, value: usize, negative: bool) {
+        if value == 0 {
+            return;
+        }
+        let right = value.to_string().into_bytes();
+        if self.is_zero() {
+            self.negative = negative;
+            self.magnitude = right;
+        } else if self.negative == negative {
+            self.magnitude = add_decimal_magnitudes(&self.magnitude, &right);
+        } else {
+            match compare_decimal_magnitudes(&self.magnitude, &right) {
+                std::cmp::Ordering::Greater => {
+                    self.magnitude = subtract_decimal_magnitudes(&self.magnitude, &right);
+                }
+                std::cmp::Ordering::Less => {
+                    self.magnitude = subtract_decimal_magnitudes(&right, &self.magnitude);
+                    self.negative = negative;
+                }
+                std::cmp::Ordering::Equal => *self = Self::zero(),
+            }
+        }
+        if self.is_zero() {
+            self.negative = false;
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.magnitude == b"0"
+    }
+}
+
+fn compare_decimal_magnitudes(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+fn add_decimal_magnitudes(left: &[u8], right: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(left.len().max(right.len()) + 1);
+    let mut left = left.iter().rev();
+    let mut right = right.iter().rev();
+    let mut carry = 0_u8;
+    loop {
+        let left = left.next().map(|digit| digit - b'0');
+        let right = right.next().map(|digit| digit - b'0');
+        if left.is_none() && right.is_none() {
+            break;
+        }
+        let sum = left.unwrap_or(0) + right.unwrap_or(0) + carry;
+        output.push(b'0' + sum % 10);
+        carry = sum / 10;
+    }
+    if carry != 0 {
+        output.push(b'0' + carry);
+    }
+    output.reverse();
+    output
+}
+
+/// `left` 必须大于 `right`。
+fn subtract_decimal_magnitudes(left: &[u8], right: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(left.len());
+    let mut right = right.iter().rev();
+    let mut borrow = 0_i8;
+    for left_digit in left.iter().rev() {
+        let mut value = i8::try_from(left_digit - b'0').expect("十进制位必须小于 10") - borrow;
+        let right_digit = right.next().map_or(0, |digit| {
+            i8::try_from(digit - b'0').expect("十进制位必须小于 10")
+        });
+        if value < right_digit {
+            value += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        output.push(b'0' + u8::try_from(value - right_digit).expect("十进制差必须非负"));
+    }
+    debug_assert_eq!(borrow, 0);
+    while output.len() > 1 && output.last() == Some(&b'0') {
+        output.pop();
+    }
+    output.reverse();
+    output
+}
+
+#[cfg(test)]
+fn canonical_json_number(value: &str) -> (bool, String, bool, String) {
+    let value = CanonicalJsonNumber::parse(value);
+    (
+        value.negative,
+        value.coefficient,
+        value.exponent.negative,
+        String::from_utf8(value.exponent.magnitude).expect("指数必须保持 ASCII"),
+    )
 }
 
 impl fmt::Debug for OpenAiChatCompletionClient {
@@ -1124,6 +1374,133 @@ mod tests {
         assert!(debug.contains("vendor_secret"));
         assert!(!debug.contains("must-not-appear"));
         assert!(!debug.contains("api-secret"));
+    }
+
+    #[test]
+    fn semantic_identity_includes_only_endpoint_model_and_extra_body() {
+        let mut extra = Map::new();
+        extra.insert("temperature".to_owned(), serde_json::json!(0.2));
+        extra.insert(
+            "vendor".to_owned(),
+            serde_json::json!({"mode": "quality", "nested": {"b": 2, "a": 1}}),
+        );
+        let first = OpenAiChatCompletionClient::new(
+            Url::parse("https://example.com/v1/chat/completions").unwrap(),
+            OpenAiAuthentication::None,
+            "model-a",
+            Duration::from_secs(2),
+            non_zero_usize(4096),
+            non_zero_usize(8192),
+            non_zero_usize(256),
+            non_zero_u32(60),
+            non_zero_u32(2),
+            extra.clone(),
+        );
+        let operationally_different = OpenAiChatCompletionClient::new(
+            Url::parse("https://example.com/v1/chat/completions").unwrap(),
+            OpenAiAuthentication::bearer("different-secret"),
+            "model-a",
+            Duration::from_secs(90),
+            non_zero_usize(8192),
+            non_zero_usize(16384),
+            non_zero_usize(1024),
+            non_zero_u32(1),
+            non_zero_u32(1),
+            extra.clone(),
+        );
+        let mut nested_reordered = Map::new();
+        nested_reordered.insert("a".to_owned(), serde_json::json!(1));
+        nested_reordered.insert("b".to_owned(), serde_json::json!(2));
+        let mut vendor_reordered = Map::new();
+        vendor_reordered.insert("nested".to_owned(), Value::Object(nested_reordered));
+        vendor_reordered.insert("mode".to_owned(), serde_json::json!("quality"));
+        let mut extra_reordered = Map::new();
+        extra_reordered.insert("vendor".to_owned(), Value::Object(vendor_reordered));
+        extra_reordered.insert("temperature".to_owned(), serde_json::json!(0.2));
+        let textually_reordered = OpenAiChatCompletionClient::new(
+            Url::parse("https://example.com/v1/chat/completions").unwrap(),
+            OpenAiAuthentication::None,
+            "model-a",
+            Duration::from_secs(2),
+            non_zero_usize(4096),
+            non_zero_usize(8192),
+            non_zero_usize(256),
+            non_zero_u32(60),
+            non_zero_u32(2),
+            extra_reordered.clone(),
+        );
+        let mut numerically_equivalent_extra = extra_reordered;
+        numerically_equivalent_extra.insert(
+            "temperature".to_owned(),
+            serde_json::from_str("2e-1").expect("测试任意精度数字应有效"),
+        );
+        let numerically_equivalent = OpenAiChatCompletionClient::new(
+            Url::parse("https://example.com/v1/chat/completions").unwrap(),
+            OpenAiAuthentication::None,
+            "model-a",
+            Duration::from_secs(2),
+            non_zero_usize(4096),
+            non_zero_usize(8192),
+            non_zero_usize(256),
+            non_zero_u32(60),
+            non_zero_u32(2),
+            numerically_equivalent_extra,
+        );
+        let different_model = OpenAiChatCompletionClient::new(
+            Url::parse("https://example.com/v1/chat/completions").unwrap(),
+            OpenAiAuthentication::None,
+            "model-b",
+            Duration::from_secs(2),
+            non_zero_usize(4096),
+            non_zero_usize(8192),
+            non_zero_usize(256),
+            non_zero_u32(60),
+            non_zero_u32(2),
+            extra,
+        );
+
+        assert_eq!(
+            first.semantic_fingerprint(),
+            operationally_different.semantic_fingerprint(),
+            "凭据和运行资源参数不应使已接受译文失效"
+        );
+        assert_eq!(
+            first.semantic_fingerprint(),
+            textually_reordered.semantic_fingerprint(),
+            "对象键书写顺序不属于扩展正文的值语义"
+        );
+        assert_eq!(
+            first.semantic_fingerprint(),
+            numerically_equivalent.semantic_fingerprint(),
+            "JSON 数字的等价十进制写法不应使已接受译文失效"
+        );
+        assert_ne!(
+            first.semantic_fingerprint(),
+            different_model.semantic_fingerprint(),
+            "模型是译文语义的一部分"
+        );
+    }
+
+    #[test]
+    fn arbitrary_precision_json_number_semantics_are_exact_and_not_textual() {
+        let expected = canonical_json_number("0.2");
+        for equivalent in ["2e-1", "0.20", "20e-2", "200e-3"] {
+            assert_eq!(canonical_json_number(equivalent), expected);
+        }
+        assert_eq!(
+            canonical_json_number("-0.000e999999999999"),
+            canonical_json_number("0")
+        );
+        assert_eq!(
+            canonical_json_number("1e1000000000000000000000000"),
+            canonical_json_number("10e999999999999999999999999"),
+            "任意长度指数的进位必须保持精确"
+        );
+        assert_ne!(
+            canonical_json_number("1234567890123456789012345678901234567890"),
+            canonical_json_number("1234567890123456789012345678901234567891"),
+            "相邻任意精度整数不能碰撞"
+        );
     }
 
     #[test]

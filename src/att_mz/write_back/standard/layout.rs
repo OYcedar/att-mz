@@ -6,11 +6,12 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    MzWriteBackAppliedLayout, MzWriteBackLaidOutSegment, MzWriteBackLayoutCandidate,
-    MzWriteBackLayoutOutcome, MzWriteBackLayoutRequest, MzWriteBackTextLayouter,
+    MzAppliedTextLayout, MzLayoutTextPair, MzTextLayoutOutcome, MzWriteBackAppliedLayout,
+    MzWriteBackLaidOutSegment, MzWriteBackLayoutCandidate, MzWriteBackLayoutOutcome,
+    MzWriteBackLayoutRegion, MzWriteBackLayoutRequest, MzWriteBackTextLayouter,
 };
 use crate::att_mz::placeholder_token;
-use crate::att_mz::text::MzLocation;
+use crate::att_mz::project::{MaxFullwidthChars, MzWriteBackLayoutProfile};
 
 const FULLWIDTH_INDENT: &str = "　";
 const MAX_TAIL_CELLS: u64 = 8;
@@ -21,24 +22,127 @@ pub(crate) struct ConservativeMzWriteBackTextLayouter;
 
 impl MzWriteBackTextLayouter for ConservativeMzWriteBackTextLayouter {
     fn layout(&self, request: &MzWriteBackLayoutRequest) -> MzWriteBackLayoutOutcome {
-        layout_request(request).map_or(MzWriteBackLayoutOutcome::Manual, |applied| {
-            MzWriteBackLayoutOutcome::Applied(applied)
-        })
+        layout_request(request).unwrap_or(MzWriteBackLayoutOutcome::Manual)
     }
 }
 
-fn layout_request(request: &MzWriteBackLayoutRequest) -> Option<MzWriteBackAppliedLayout> {
-    let max_cells = u64::from(request.max_fullwidth_chars().get()) * 2;
-    let mut working_segments = Vec::with_capacity(request.segments().len());
+/// 使用调用方项目的实际行宽，对逐项对应的文本执行共享纯布局。
+pub(crate) fn layout(
+    region: MzWriteBackLayoutRegion,
+    pairs: &[MzLayoutTextPair],
+    profile: &MzWriteBackLayoutProfile,
+) -> MzTextLayoutOutcome {
+    let max_fullwidth_chars = match region {
+        MzWriteBackLayoutRegion::DialogueBody => profile.dialogue_body(),
+        MzWriteBackLayoutRegion::ScrollingText => profile.scrolling_text(),
+        MzWriteBackLayoutRegion::HelpDescription => profile.help_description(),
+    };
+    let auto_wrap_enabled = match region {
+        MzWriteBackLayoutRegion::DialogueBody | MzWriteBackLayoutRegion::ScrollingText => true,
+        MzWriteBackLayoutRegion::HelpDescription => {
+            pairs.iter().any(|pair| pair.original_text().contains('\n'))
+        }
+    };
+    layout_pairs_result(pairs, max_fullwidth_chars, auto_wrap_enabled)
+}
+
+fn layout_request(request: &MzWriteBackLayoutRequest) -> Option<MzWriteBackLayoutOutcome> {
+    let pairs = request
+        .segments()
+        .iter()
+        .map(|segment| {
+            let replacement = match segment.candidate() {
+                MzWriteBackLayoutCandidate::FrozenOriginal => None,
+                MzWriteBackLayoutCandidate::DatabaseTranslation(translation) => {
+                    Some(translation.clone())
+                }
+            };
+            MzLayoutTextPair::new(segment.original_text().to_owned(), replacement)
+        })
+        .collect::<Vec<_>>();
+    let MzTextLayoutOutcome::Applied(applied) = layout_pairs_result(
+        &pairs,
+        request.max_fullwidth_chars(),
+        request.auto_wrap_enabled(),
+    ) else {
+        return Some(MzWriteBackLayoutOutcome::Manual);
+    };
+    let (texts, inserted_line_breaks, inserted_fullwidth_indents) = applied.into_parts();
+    let laid_out_segments = request
+        .segments()
+        .iter()
+        .zip(texts)
+        .filter_map(|(segment, text)| {
+            matches!(
+                segment.candidate(),
+                MzWriteBackLayoutCandidate::DatabaseTranslation(_)
+            )
+            .then(|| {
+                MzWriteBackLaidOutSegment::new(
+                    segment.exact_location().clone(),
+                    text.split('\n').map(str::to_owned).collect(),
+                )
+                .expect("受信布局过程必须为每个数据库译文保留至少一个无换行显示行")
+            })
+        })
+        .collect();
+
+    Some(MzWriteBackLayoutOutcome::Applied(
+        MzWriteBackAppliedLayout::new(
+            request,
+            laid_out_segments,
+            inserted_line_breaks,
+            inserted_fullwidth_indents,
+        )
+        .expect("受信布局过程必须逐一返回请求中的数据库译文叶"),
+    ))
+}
+
+fn layout_pairs_result(
+    pairs: &[MzLayoutTextPair],
+    max_fullwidth_chars: MaxFullwidthChars,
+    auto_wrap_enabled: bool,
+) -> MzTextLayoutOutcome {
+    layout_pairs(pairs, max_fullwidth_chars, auto_wrap_enabled).map_or_else(
+        || {
+            MzTextLayoutOutcome::Manual(MzAppliedTextLayout::new(
+                pairs
+                    .iter()
+                    .map(|pair| pair.effective_text().to_owned())
+                    .collect(),
+                0,
+                0,
+            ))
+        },
+        |applied| {
+            MzTextLayoutOutcome::Applied(MzAppliedTextLayout::new(
+                applied.texts,
+                applied.inserted_line_breaks,
+                applied.inserted_fullwidth_indents,
+            ))
+        },
+    )
+}
+
+struct CoreAppliedLayout {
+    texts: Vec<String>,
+    inserted_line_breaks: usize,
+    inserted_fullwidth_indents: usize,
+}
+
+fn layout_pairs(
+    pairs: &[MzLayoutTextPair],
+    max_fullwidth_chars: MaxFullwidthChars,
+    auto_wrap_enabled: bool,
+) -> Option<CoreAppliedLayout> {
+    let max_cells = u64::from(max_fullwidth_chars.get()) * 2;
+    let mut working_segments = Vec::with_capacity(pairs.len());
     let mut inserted_line_breaks = 0usize;
 
-    for segment in request.segments() {
-        let translated = matches!(
-            segment.candidate(),
-            MzWriteBackLayoutCandidate::DatabaseTranslation(_)
-        );
+    for pair in pairs {
+        let translated = pair.replacement().is_some();
         let mut lines = Vec::new();
-        for hard_line in segment.effective_text().split('\n') {
+        for hard_line in pair.effective_text().split('\n') {
             let tokens = scan_line(hard_line)?;
             if !translated {
                 lines.push(hard_line.to_owned());
@@ -49,7 +153,7 @@ fn layout_request(request: &MzWriteBackLayoutRequest) -> Option<MzWriteBackAppli
                 lines.push(hard_line.to_owned());
                 continue;
             }
-            if !request.auto_wrap_enabled() {
+            if !auto_wrap_enabled {
                 return None;
             }
 
@@ -58,36 +162,22 @@ fn layout_request(request: &MzWriteBackLayoutRequest) -> Option<MzWriteBackAppli
                 inserted_line_breaks.checked_add(wrapped.len().saturating_sub(1))?;
             lines.extend(wrapped);
         }
-        working_segments.push(WorkingSegment {
-            exact_location: segment.exact_location().clone(),
-            translated,
-            lines,
-        });
+        working_segments.push(WorkingSegment { translated, lines });
     }
 
     let inserted_fullwidth_indents = apply_continuation_indents(&mut working_segments, max_cells)?;
-    let laid_out_segments = working_segments
+    let texts = working_segments
         .into_iter()
-        .filter(|segment| segment.translated)
-        .map(|segment| {
-            MzWriteBackLaidOutSegment::new(segment.exact_location, segment.lines)
-                .expect("受信布局过程必须为每个数据库译文保留至少一个无换行显示行")
-        })
+        .map(|segment| segment.lines.join("\n"))
         .collect();
-
-    Some(
-        MzWriteBackAppliedLayout::new(
-            request,
-            laid_out_segments,
-            inserted_line_breaks,
-            inserted_fullwidth_indents,
-        )
-        .expect("受信布局过程必须逐一返回请求中的数据库译文叶"),
-    )
+    Some(CoreAppliedLayout {
+        texts,
+        inserted_line_breaks,
+        inserted_fullwidth_indents,
+    })
 }
 
 struct WorkingSegment {
-    exact_location: MzLocation,
     translated: bool,
     lines: Vec<String>,
 }
@@ -494,8 +584,8 @@ fn pair_closer(opener: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::att_mz::project::MaxFullwidthChars;
-    use crate::att_mz::text::{MzLocationStep, MzSource, StandardDataFile};
+    use crate::att_mz::project::{MaxFullwidthChars, MzWriteBackLayoutProfile};
+    use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
     use crate::att_mz::write_back::standard::{
         MzWriteBackLayoutRegion, MzWriteBackLayoutSegment, StandardWriteBackFieldRole,
         StandardWriteBackLeaf,
@@ -562,6 +652,80 @@ mod tests {
             ConservativeMzWriteBackTextLayouter.layout(request),
             MzWriteBackLayoutOutcome::Manual
         );
+    }
+
+    fn profile(dialogue: u32, scrolling: u32, help: u32) -> MzWriteBackLayoutProfile {
+        MzWriteBackLayoutProfile::new(width(dialogue), width(scrolling), width(help))
+    }
+
+    #[test]
+    fn shared_layout_uses_the_selected_region_from_the_actual_profile() {
+        let pairs = vec![MzLayoutTextPair::new(
+            "原文".to_owned(),
+            Some("甲乙丙".to_owned()),
+        )];
+        let profile = profile(3, 2, 2);
+
+        let MzTextLayoutOutcome::Applied(dialogue) =
+            layout(MzWriteBackLayoutRegion::DialogueBody, &pairs, &profile)
+        else {
+            panic!("对话实际宽度足以容纳文本")
+        };
+        assert_eq!(dialogue.texts(), ["甲乙丙"]);
+        for outcome in [
+            layout(MzWriteBackLayoutRegion::ScrollingText, &pairs, &profile),
+            layout(MzWriteBackLayoutRegion::HelpDescription, &pairs, &profile),
+        ] {
+            let MzTextLayoutOutcome::Manual(manual) = outcome else {
+                panic!("宽度不足且不能安全换行时应转人工")
+            };
+            assert_eq!(manual.texts(), ["甲乙丙"]);
+            assert_eq!(manual.inserted_line_breaks(), 0);
+            assert_eq!(manual.inserted_fullwidth_indents(), 0);
+        }
+    }
+
+    #[test]
+    fn shared_layout_returns_aligned_texts_and_inserted_counts() {
+        let pairs = vec![
+            MzLayoutTextPair::new("原一".to_owned(), Some("「甲乙，丙丁」".to_owned())),
+            MzLayoutTextPair::new("冻结原文".to_owned(), None),
+        ];
+
+        let MzTextLayoutOutcome::Applied(applied) = layout(
+            MzWriteBackLayoutRegion::DialogueBody,
+            &pairs,
+            &profile(4, 4, 4),
+        ) else {
+            panic!("共享布局请求应可安全处理")
+        };
+
+        assert_eq!(applied.texts(), ["「甲乙，\n　丙丁」", "冻结原文"]);
+        assert_eq!(applied.inserted_line_breaks(), 1);
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
+        let (texts, line_breaks, indents) = applied.into_parts();
+        assert_eq!(texts.len(), pairs.len());
+        assert_eq!((line_breaks, indents), (1, 1));
+    }
+
+    #[test]
+    fn shared_manual_layout_returns_current_texts_in_input_order() {
+        let pairs = vec![
+            MzLayoutTextPair::new("原文一".to_owned(), Some("甲乙丙".to_owned())),
+            MzLayoutTextPair::new("原文二".to_owned(), None),
+        ];
+
+        let MzTextLayoutOutcome::Manual(manual) = layout(
+            MzWriteBackLayoutRegion::HelpDescription,
+            &pairs,
+            &profile(2, 2, 2),
+        ) else {
+            panic!("无法安全布局的帮助文本应转人工")
+        };
+
+        assert_eq!(manual.texts(), ["甲乙丙", "原文二"]);
+        assert_eq!(manual.inserted_line_breaks(), 0);
+        assert_eq!(manual.inserted_fullwidth_indents(), 0);
     }
 
     #[test]

@@ -176,6 +176,41 @@ pub(crate) enum CreateDatabaseError<E> {
     ResidualArtifact(E),
 }
 
+/// 把一个现存 SQLite 数据库在线复制到 create-only 目标的明确终态。
+#[derive(Debug)]
+pub(crate) enum SnapshotDatabaseError<E> {
+    SourceNotFound,
+    DestinationAlreadyExists,
+    NotCreated(E),
+    ResidualArtifact(E),
+    OutcomeUnknown(E),
+}
+
+impl<E: fmt::Display> fmt::Display for SnapshotDatabaseError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceNotFound => formatter.write_str("源数据库不存在"),
+            Self::DestinationAlreadyExists => formatter.write_str("快照目标数据库已经存在"),
+            Self::NotCreated(source) => write!(formatter, "数据库快照未创建：{source}"),
+            Self::ResidualArtifact(source) => {
+                write!(formatter, "数据库快照创建失败且存在残留文件：{source}")
+            }
+            Self::OutcomeUnknown(source) => write!(formatter, "数据库快照结果未知：{source}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for SnapshotDatabaseError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SourceNotFound | Self::DestinationAlreadyExists => None,
+            Self::NotCreated(source)
+            | Self::ResidualArtifact(source)
+            | Self::OutcomeUnknown(source) => Some(source),
+        }
+    }
+}
+
 impl<E: fmt::Display> fmt::Display for CreateDatabaseError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -276,6 +311,21 @@ pub(crate) trait SqliteDatabaseCreator: Send + Sync {
         path: PathBuf,
         commands: Vec<SqliteCommand>,
     ) -> impl Future<Output = Result<(), CreateDatabaseError<Self::Error>>> + Send;
+}
+
+/// 使用 SQLite online backup 把现存数据库复制为一个全新的数据库文件。
+///
+/// 实现必须在开始前原子取得两个连接许可，并以一次 `step(-1)` 完成复制；源文件
+/// 缺失时不得创建它，目标文件存在时不得覆盖，也不得在 BUSY/LOCKED 后自动重试。
+/// 目标一旦被 create-only 占有，即使调用 Future 被丢弃，实现也必须继续到明确终态。
+pub(crate) trait SqliteDatabaseSnapshotter: Send + Sync {
+    type Error: Error + Send + Sync + 'static;
+
+    fn snapshot_database(
+        &self,
+        source: PathBuf,
+        destination: PathBuf,
+    ) -> impl Future<Output = Result<(), SnapshotDatabaseError<Self::Error>>> + Send;
 }
 
 /// 只读查询一个必须已经存在的 SQLite 数据库。

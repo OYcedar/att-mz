@@ -1,14 +1,16 @@
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::lua::LuaTranslation;
 use super::profile::TranslationExecutionProfileResolver;
 use super::standard::{StandardTranslation, StandardTranslationInput};
 use super::{StandardTranslationSummary, TranslateInput, TranslateOutput, TranslateUseCase};
 use crate::att_mz::ProjectName;
+use crate::att_mz::lua::runtime::TrustedLuaTranslationSemantics;
+use crate::att_mz::project::ExistingProjectOpener;
 use crate::execution::{CooperativeCancellation, OperationCancelled};
-use crate::project_database::ProjectDatabaseRecordReader;
 
 /// 按固定业务顺序编排一次 MZ 翻译。
 ///
@@ -17,7 +19,7 @@ use crate::project_database::ProjectDatabaseRecordReader;
 /// 的副作用。
 pub(crate) struct TranslateService<C, R, S, L> {
     profile_resolver: C,
-    project_reader: R,
+    project_opener: R,
     standard_translation: S,
     lua_translation: Option<L>,
     cancellation: CooperativeCancellation,
@@ -26,14 +28,14 @@ pub(crate) struct TranslateService<C, R, S, L> {
 impl<C, R, S, L> TranslateService<C, R, S, L> {
     pub(crate) fn new(
         profile_resolver: C,
-        project_reader: R,
+        project_opener: R,
         standard_translation: S,
         lua_translation: Option<L>,
         cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             profile_resolver,
-            project_reader,
+            project_opener,
             standard_translation,
             lua_translation,
             cancellation,
@@ -44,7 +46,7 @@ impl<C, R, S, L> TranslateService<C, R, S, L> {
 impl<C, R, S, L> TranslateUseCase for TranslateService<C, R, S, L>
 where
     C: TranslationExecutionProfileResolver,
-    R: ProjectDatabaseRecordReader,
+    R: ExistingProjectOpener,
     S: StandardTranslation<Profile = C::Profile>,
     L: LuaTranslation<Profile = C::Profile>,
 {
@@ -72,7 +74,7 @@ where
         self.cancellation
             .check()
             .map_err(TranslateServiceError::Cancelled)?;
-        let project = self.project_reader.read(&name).await.map_err(|source| {
+        let project = self.project_opener.open(&name).await.map_err(|source| {
             TranslateServiceError::ReadProject {
                 name: name.clone(),
                 source,
@@ -97,10 +99,15 @@ where
 
         let lua_executed = if let Some(script_path) = lua_script {
             let error_path = script_path.clone();
-            self.lua_translation
+            let lua = self
+                .lua_translation
                 .as_ref()
-                .ok_or(TranslateServiceError::MissingLuaDependency)?
-                .run(&project, &profile, script_path)
+                .ok_or(TranslateServiceError::MissingLuaDependency)?;
+            let semantics: Arc<dyn TrustedLuaTranslationSemantics> = standard_report
+                .resolved_semantics()
+                .cloned()
+                .ok_or(TranslateServiceError::MissingResolvedTranslationSemantics)?;
+            lua.run(&project, &profile, semantics, script_path)
                 .await
                 .map_err(|source| TranslateServiceError::Lua {
                     script_path: error_path,
@@ -125,6 +132,10 @@ where
                 remaining_locations: standard_report.unresolved_locations(),
                 protocol_diagnostics: standard_report.protocol_diagnostics(),
                 recoverable_request_exhaustions: standard_report.recoverable_request_exhaustions(),
+                retained: standard_report.retained(),
+                invalidated: standard_report.invalidated(),
+                not_applicable: standard_report.not_applicable(),
+                reused: standard_report.reused(),
             },
             lua_executed,
         })
@@ -138,6 +149,7 @@ pub(crate) enum TranslateServiceError<CE, RE, SE, LE> {
     ResolveProfile { profile_id: String, source: CE },
     ReadProject { name: ProjectName, source: RE },
     Standard { source: SE },
+    MissingResolvedTranslationSemantics,
     MissingLuaDependency,
     Lua { script_path: PathBuf, source: LE },
 }
@@ -156,9 +168,12 @@ where
                 write!(formatter, "无法选择翻译 Profile {profile_id}：{source}")
             }
             Self::ReadProject { name, source } => {
-                write!(formatter, "无法读取项目 {name}：{source}")
+                write!(formatter, "无法打开项目 {name}：{source}")
             }
             Self::Standard { source } => write!(formatter, "标准翻译失败：{source}"),
+            Self::MissingResolvedTranslationSemantics => {
+                formatter.write_str("标准翻译未交付 Lua 所需的当前翻译语义")
+            }
             Self::MissingLuaDependency => {
                 formatter.write_str("本次选择了 Lua 翻译，但未构造 Lua Runtime")
             }
@@ -187,7 +202,7 @@ where
             Self::ResolveProfile { source, .. } => Some(source),
             Self::ReadProject { source, .. } => Some(source),
             Self::Standard { source } => Some(source),
-            Self::MissingLuaDependency => None,
+            Self::MissingResolvedTranslationSemantics | Self::MissingLuaDependency => None,
             Self::Lua { source, .. } => Some(source),
         }
     }
@@ -198,16 +213,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::att_mz::project::{ExistingProjectOpener, OpenedProject};
+    use crate::att_mz::standard_asset::MzStandardAssetOwner;
     use crate::att_mz::text::{
         MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
     };
     use crate::att_mz::translate::executor::FinalLlmResponseMetadata;
+    use crate::att_mz::translate::semantics::ResolvedTranslationSemantics;
     use crate::att_mz::translate::standard::{
         StandardTranslationRunReport, StandardTranslationTaskIndex, TranslationLeafIdentity,
         TranslationTaskOutcome, TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
         UnresolvedTranslationUnit,
     };
-    use crate::project_database::StoredProjectRecord;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Failure {
@@ -227,12 +244,12 @@ mod tests {
         Resolve(String),
         Read(ProjectName),
         Standard {
-            project: StoredProjectRecord,
+            project: OpenedProject,
             profile: FakeProfile,
             input: StandardTranslationInput,
         },
         Lua {
-            project: StoredProjectRecord,
+            project: OpenedProject,
             profile: FakeProfile,
             script_path: PathBuf,
         },
@@ -281,10 +298,10 @@ mod tests {
         failure: Option<Failure>,
     }
 
-    impl ProjectDatabaseRecordReader for FakeProjectReader {
+    impl ExistingProjectOpener for FakeProjectReader {
         type Error = FakeError;
 
-        async fn read(&self, name: &ProjectName) -> Result<StoredProjectRecord, Self::Error> {
+        async fn open(&self, name: &ProjectName) -> Result<OpenedProject, Self::Error> {
             self.events
                 .lock()
                 .expect("事件记录锁不应中毒")
@@ -302,6 +319,7 @@ mod tests {
     struct FakeStandardTranslation {
         events: Arc<Mutex<Vec<Event>>>,
         failure: Option<Failure>,
+        semantics: Arc<ResolvedTranslationSemantics>,
     }
 
     impl StandardTranslation for FakeStandardTranslation {
@@ -310,7 +328,7 @@ mod tests {
 
         async fn run(
             &self,
-            project: &StoredProjectRecord,
+            project: &OpenedProject,
             profile: &Self::Profile,
             input: StandardTranslationInput,
         ) -> Result<StandardTranslationRunReport, Self::Error> {
@@ -326,7 +344,7 @@ mod tests {
             if self.failure == Some(Failure::Standard) {
                 Err(FakeError("standard"))
             } else {
-                Ok(unavailable_report())
+                Ok(unavailable_report(Arc::clone(&self.semantics)))
             }
         }
     }
@@ -335,6 +353,7 @@ mod tests {
     struct FakeLuaTranslation {
         events: Arc<Mutex<Vec<Event>>>,
         failure: Option<Failure>,
+        expected_semantics: Arc<ResolvedTranslationSemantics>,
     }
 
     impl LuaTranslation for FakeLuaTranslation {
@@ -343,10 +362,16 @@ mod tests {
 
         async fn run(
             &self,
-            project: &StoredProjectRecord,
+            project: &OpenedProject,
             profile: &Self::Profile,
+            semantics: Arc<dyn TrustedLuaTranslationSemantics>,
             script_path: PathBuf,
         ) -> Result<(), Self::Error> {
+            assert_eq!(
+                Arc::as_ptr(&semantics) as *const (),
+                Arc::as_ptr(&self.expected_semantics) as *const (),
+                "Lua 必须收到 Standard 交付的同一个语义快照",
+            );
             self.events
                 .lock()
                 .expect("事件记录锁不应中毒")
@@ -372,6 +397,7 @@ mod tests {
     >;
 
     fn service(events: Arc<Mutex<Vec<Event>>>, failure: Option<Failure>) -> Service {
+        let semantics = Arc::new(ResolvedTranslationSemantics::for_test());
         TranslateService::new(
             FakeProfileResolver {
                 events: Arc::clone(&events),
@@ -384,8 +410,13 @@ mod tests {
             FakeStandardTranslation {
                 events: Arc::clone(&events),
                 failure,
+                semantics: Arc::clone(&semantics),
             },
-            Some(FakeLuaTranslation { events, failure }),
+            Some(FakeLuaTranslation {
+                events,
+                failure,
+                expected_semantics: semantics,
+            }),
             CooperativeCancellation::default(),
         )
     }
@@ -404,8 +435,8 @@ mod tests {
         "alice".parse().expect("测试项目名称应该合法")
     }
 
-    fn project_record() -> StoredProjectRecord {
-        StoredProjectRecord::new(
+    fn project_record() -> OpenedProject {
+        OpenedProject::new(
             project_name(),
             PathBuf::from("C:/Projects/alice"),
             PathBuf::from("C:/Projects/alice/project.db"),
@@ -428,11 +459,15 @@ mod tests {
         )
     }
 
-    fn unavailable_report() -> StandardTranslationRunReport {
+    fn unavailable_report(
+        semantics: Arc<ResolvedTranslationSemantics>,
+    ) -> StandardTranslationRunReport {
         let source = MzSource::data(StandardDataFile::Items);
         let group_location = MzLocation::value(source.clone(), vec![MzLocationStep::index(1)]);
         let identity = TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
+            "name",
             group_location,
             MzLocation::value(
                 source,
@@ -461,7 +496,7 @@ mod tests {
         .expect("测试不可用结果必须满足状态不变量");
         let mut report = StandardTranslationRunReport::empty(1);
         report.record(&outcome);
-        report
+        report.with_semantics(semantics)
     }
 
     fn expected_summary() -> StandardTranslationSummary {
@@ -476,6 +511,10 @@ mod tests {
             remaining_locations: 1,
             protocol_diagnostics: 0,
             recoverable_request_exhaustions: 0,
+            retained: 0,
+            invalidated: 0,
+            not_applicable: 0,
+            reused: 0,
         }
     }
 

@@ -8,33 +8,35 @@ use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt};
 
+use crate::att_mz::location_codec::MzLocationCodec;
+use crate::att_mz::project::OpenedProject;
+use crate::att_mz::standard_asset::MzStandardAssetStorageKind;
 use crate::att_mz::text::{MzLocationStep, MzSource, StandardDataFile, TextGroupKind};
-use crate::language::{
-    LanguageAnalysis, LanguageModule, LanguageModuleCatalog, LanguageModuleCatalogError,
-};
-use crate::llm::{ChatMessage, ChatMessageRole};
-use crate::project_database::StoredProjectRecord;
+use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::language::{LanguageAnalysis, LanguageModuleCatalog, LanguageModuleCatalogError};
+use crate::llm::{ChatMessage, ChatMessageRole, LlmClientSemanticIdentity};
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
 use super::deduplication::{
     TranslationDeduplicationCandidate, TranslationDeduplicationError,
     TranslationDeduplicationOutcome, deduplicate_translation_candidates,
 };
-use super::language_projection::{LanguageTextProjectionError, project_protected_text};
-use super::placeholder::{
-    CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderProtectionError,
-    PlaceholderRuleCompilationError,
-};
+use super::placeholder::{Pcre2PlaceholderService, PlaceholderRuleCompilationError};
 use super::planning_resource::{CompiledTerminology, TranslationPlanningResourceReader};
 use super::profile::{
     MzTranslationExecutionPayload, TranslationExecutionProfile,
     TranslationProfileConfigurationError, TranslationProfileLanguagePair,
+};
+use super::semantics::{
+    PreparedTranslationAcceptance, PreparedTranslationStatus, ResolvedTranslationSemanticError,
+    ResolvedTranslationSemantics,
 };
 use super::standard::{
     ExpectedTranslationOutput, StandardTranslationCorpus, StandardTranslationGroup,
     StandardTranslationInput, StandardTranslationPlan, StandardTranslationTaskIndex,
     StandardTranslationTaskPlanner, TerminologyDependency, TranslationInvalidation,
     TranslationLanguagePair, TranslationLeafIdentity, TranslationPlanPreparation,
+    TranslationPlanPreparationCounts, TranslationPropagationTarget, TranslationStateContext,
     TranslationTaskBlock, TranslationTaskGroup, TranslationTaskUnit, TranslationVirtualReason,
 };
 
@@ -68,14 +70,14 @@ impl<R, C, L> StandardTranslationTaskPlanner for MzStandardTranslationTaskPlanni
 where
     R: TranslationPlanningResourceReader,
     C: CpuTaskExecutor,
-    L: Send + Sync + 'static,
+    L: LlmClientSemanticIdentity + 'static,
 {
     type Profile = Arc<TranslationExecutionProfile<MzTranslationExecutionPayload<L>>>;
     type Error = MzStandardTranslationTaskPlanningError<R::Error, C::Error>;
 
     async fn plan(
         &self,
-        project: &StoredProjectRecord,
+        project: &OpenedProject,
         profile: &Self::Profile,
         corpus: StandardTranslationCorpus,
         input: StandardTranslationInput,
@@ -100,13 +102,22 @@ where
             .resolve(project.source_language())
             .map_err(MzStandardTranslationTaskPlanningError::Language)?;
 
+        let (groups, snapshot_baseline) = corpus.into_parts();
+        let current_terminology_json = snapshot_baseline.terminology_json().to_owned();
+        let current_placeholder_rules_json = snapshot_baseline.placeholder_rules_json().to_owned();
         let (terminology_path, placeholder_rules_path) = input.into_parts();
         let resources = self
             .resources
-            .read(terminology_path, placeholder_rules_path)
+            .read(
+                terminology_path,
+                placeholder_rules_path,
+                current_terminology_json,
+                current_placeholder_rules_json,
+            )
             .await
             .map_err(MzStandardTranslationTaskPlanningError::ReadResources)?;
-        let (terminology, placeholder_definitions) = resources.into_parts();
+        let (terminology, placeholder_definitions, terminology_json, placeholder_rules_json) =
+            resources.into_parts();
 
         let placeholder_service = self.placeholders.clone();
         let custom_placeholders = self
@@ -116,33 +127,41 @@ where
             .map_err(MzStandardTranslationTaskPlanningError::CompilePlaceholdersCompute)?
             .map_err(MzStandardTranslationTaskPlanningError::InvalidPlaceholderRules)?;
 
-        let terminology_for_prepare = terminology.clone();
         let prepared = self
             .cpu
-            .execute(move || prepare_corpus(corpus, terminology_for_prepare.as_deref()))
+            .execute(move || prepare_corpus(groups))
             .await
             .map_err(MzStandardTranslationTaskPlanningError::PrepareCorpusCompute)?
             .map_err(MzStandardTranslationTaskPlanningError::InvalidCorpus)?;
 
         let source_language_id = project.source_language().to_owned();
         let target_language_id = project.target_language().to_owned();
+        let global_semantics = global_translation_semantics(
+            &source_language_id,
+            &target_language_id,
+            source_language.semantic_fingerprint(),
+            &system_markdown,
+            profile.payload().llm_client().semantic_fingerprint(),
+        );
+        let task_language_pair =
+            TranslationLanguagePair::new(source_language_id.clone(), target_language_id.clone());
+        let semantics = Arc::new(ResolvedTranslationSemantics::new(
+            system_markdown.clone(),
+            task_language_pair.clone(),
+            Arc::clone(&terminology),
+            self.placeholders.clone(),
+            custom_placeholders,
+            source_language,
+            global_semantics,
+        ));
         let max_characters = planning.max_message_characters().get();
         let scope_concurrency = planning.scope_concurrency().get();
         let mut preprocessed_scopes = stream::iter(prepared.into_iter().map(|scope| {
-            let source_language = Arc::clone(&source_language);
-            let custom_placeholders = custom_placeholders.clone();
-            let placeholder_service = self.placeholders.clone();
+            let semantics = Arc::clone(&semantics);
             async move {
                 let scope_name = scope.key.clone();
                 self.cpu
-                    .execute(move || {
-                        preprocess_scope(
-                            scope,
-                            source_language,
-                            &placeholder_service,
-                            &custom_placeholders,
-                        )
-                    })
+                    .execute(move || preprocess_scope(scope, semantics))
                     .await
                     .map_err(|source| ScopePreprocessingFailure::Compute {
                         scope: scope_name.clone(),
@@ -182,6 +201,25 @@ where
         invalidations.extend(deduplication_invalidations);
         apply_deduplication_outcomes(&mut scopes, positions, outcomes);
 
+        let retained = scopes
+            .iter()
+            .flat_map(|scope| &scope.groups)
+            .flat_map(|group| &group.units)
+            .filter(|unit| unit.current)
+            .count();
+        let not_applicable = scopes
+            .iter()
+            .flat_map(|scope| &scope.groups)
+            .flat_map(|group| &group.units)
+            .filter(|unit| unit.not_applicable)
+            .count();
+        let invalidated = scopes
+            .iter()
+            .flat_map(|scope| &scope.groups)
+            .flat_map(|group| &group.units)
+            .filter(|unit| unit.invalidated && !unit.not_applicable)
+            .count();
+
         let mut planned_scopes = stream::iter(scopes.into_iter().map(|scope| {
             let terminology = terminology.clone();
             let system_markdown = system_markdown.clone();
@@ -216,20 +254,27 @@ where
             })?);
         }
 
-        let language_pair = TranslationLanguagePair::new(source_language_id, target_language_id);
         let tasks = unindexed_tasks
             .into_iter()
             .enumerate()
             .map(|(index, task)| {
                 task.with_index(
                     StandardTranslationTaskIndex::new(index),
-                    language_pair.clone(),
+                    task_language_pair.clone(),
                 )
             })
             .collect();
 
         Ok(StandardTranslationPlan::new(
-            TranslationPlanPreparation::new(invalidations, reuses),
+            Arc::clone(&semantics),
+            TranslationPlanPreparation::with_baseline(
+                invalidations,
+                reuses,
+                terminology_json,
+                placeholder_rules_json,
+                TranslationPlanPreparationCounts::new(retained, invalidated, not_applicable),
+                snapshot_baseline,
+            ),
             tasks,
         ))
     }
@@ -261,38 +306,25 @@ struct PreparedGroup {
 
 struct PreparedAsset {
     identity: TranslationLeafIdentity,
-    field_name: String,
     translation: Option<String>,
-    terminology_dependencies: Vec<TerminologyDependency>,
-    invalidated: bool,
+    translation_state: Option<Sha256Fingerprint>,
 }
 
 fn prepare_corpus(
-    corpus: StandardTranslationCorpus,
-    terminology: Option<&CompiledTerminology>,
+    groups: Vec<StandardTranslationGroup>,
 ) -> Result<PreparedCorpus, CorpusPlanningError> {
     let mut by_scope = BTreeMap::<SemanticScopeKey, Vec<PreparedGroup>>::new();
-    for group in corpus.into_groups() {
+    for group in groups {
         let scope = SemanticScopeKey::from_group(&group)?;
         let kind = group.kind();
         let group_location = group.group_location().clone();
         let mut assets = Vec::new();
         for asset in group.into_assets() {
-            let (identity, field_name, translation, dependencies) = asset.into_parts();
-            let invalidated = translation.is_some()
-                && terminology.is_some_and(|current| {
-                    dependencies.iter().any(|dependency| {
-                        current
-                            .entry(dependency.term())
-                            .is_none_or(|entry| entry.translation() != dependency.translation())
-                    })
-                });
+            let (identity, translation, translation_state) = asset.into_parts();
             assets.push(PreparedAsset {
                 identity,
-                field_name,
                 translation,
-                terminology_dependencies: dependencies,
-                invalidated,
+                translation_state,
             });
         }
         assets.sort_by(|left, right| {
@@ -392,14 +424,16 @@ struct PreprocessedGroup {
 }
 
 struct PreprocessedUnit {
-    field_name: String,
     identity: TranslationLeafIdentity,
     protected_text: String,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
     translation: Option<String>,
-    terminology_dependencies: Vec<TerminologyDependency>,
+    translation_state: Option<Sha256Fingerprint>,
     invalidated: bool,
+    state_context: TranslationStateContext,
+    current: bool,
+    not_applicable: bool,
     responsibility: PreparedUnitResponsibility,
 }
 
@@ -407,7 +441,7 @@ struct PreprocessedUnit {
 enum PreparedUnitResponsibility {
     AwaitingDeduplication,
     Active {
-        propagation_targets: Vec<TranslationLeafIdentity>,
+        propagation_targets: Vec<TranslationPropagationTarget>,
     },
     Virtual {
         reason: TranslationVirtualReason,
@@ -416,46 +450,66 @@ enum PreparedUnitResponsibility {
 
 fn preprocess_scope(
     scope: PreparedScope,
-    source_language: Arc<dyn LanguageModule>,
-    placeholder_service: &Pcre2PlaceholderService,
-    custom_placeholders: &CompiledPlaceholderRules,
+    semantics: Arc<ResolvedTranslationSemantics>,
 ) -> Result<PreprocessedScope, ScopePreprocessingError> {
     let mut groups = Vec::with_capacity(scope.groups.len());
     for group in scope.groups {
         let mut units = Vec::with_capacity(group.assets.len());
         for asset in group.assets {
-            let (protected_text, placeholders) = placeholder_service
-                .protect(
-                    group.kind,
-                    asset.identity.original_text(),
-                    custom_placeholders,
-                )
-                .map_err(ScopePreprocessingError::ProtectPlaceholder)?
-                .into_parts();
-            let language_text = project_protected_text(&protected_text, &placeholders)
-                .map_err(ScopePreprocessingError::ProjectLanguageText)?;
-            let has_natural_text = language_text.has_non_whitespace_natural_text();
-            let language_analysis = source_language.analyze_source(&language_text);
-            let responsibility = if !has_natural_text {
-                PreparedUnitResponsibility::Virtual {
-                    reason: TranslationVirtualReason::FullyProtected,
-                }
-            } else if language_analysis.needs_translation() {
-                PreparedUnitResponsibility::AwaitingDeduplication
+            let prepared = semantics
+                .prepare(group.kind, asset.identity.original_text())
+                .map_err(ScopePreprocessingError::Semantics)?;
+            let protected_text = prepared.model_text().to_owned();
+            let placeholders = prepared.placeholders().to_vec();
+            let language_analysis = prepared.language_analysis().clone();
+            let terminology_dependencies = prepared.terms().to_vec();
+            let state_context = translation_state_context(
+                semantics.global_fingerprint(),
+                &asset.identity,
+                &protected_text,
+                &placeholders,
+                &terminology_dependencies,
+            )?;
+            let not_applicable = prepared.status() != PreparedTranslationStatus::Active;
+            let current = if not_applicable {
+                false
+            } else if let Some(translation) = asset.translation.as_deref() {
+                asset.translation_state == Some(state_context.finish(translation))
+                    && matches!(
+                        prepared
+                            .accept(translation)
+                            .map_err(ScopePreprocessingError::Semantics)?,
+                        PreparedTranslationAcceptance::Accepted(accepted)
+                            if accepted == translation
+                    )
             } else {
-                PreparedUnitResponsibility::Virtual {
-                    reason: TranslationVirtualReason::NonSourceLanguage,
+                false
+            };
+            let invalidated = asset.translation.is_some() && !current;
+            let responsibility = match prepared.status() {
+                PreparedTranslationStatus::Active => {
+                    PreparedUnitResponsibility::AwaitingDeduplication
                 }
+                PreparedTranslationStatus::NonSourceLanguage => {
+                    PreparedUnitResponsibility::Virtual {
+                        reason: TranslationVirtualReason::NonSourceLanguage,
+                    }
+                }
+                PreparedTranslationStatus::FullyProtected => PreparedUnitResponsibility::Virtual {
+                    reason: TranslationVirtualReason::FullyProtected,
+                },
             };
             units.push(PreprocessedUnit {
-                field_name: asset.field_name,
                 identity: asset.identity,
                 protected_text,
                 placeholders,
                 language_analysis,
                 translation: asset.translation,
-                terminology_dependencies: asset.terminology_dependencies,
-                invalidated: asset.invalidated,
+                translation_state: asset.translation_state,
+                invalidated,
+                state_context,
+                current,
+                not_applicable,
                 responsibility,
             });
         }
@@ -469,6 +523,74 @@ fn preprocess_scope(
         key: scope.key,
         groups,
     })
+}
+
+fn global_translation_semantics(
+    source_language: &str,
+    target_language: &str,
+    language_semantics: Sha256Fingerprint,
+    system_markdown: &str,
+    client_semantics: Sha256Fingerprint,
+) -> Sha256Fingerprint {
+    let mut hasher = Sha256FramedHasher::new(b"att.mz.translation-global");
+    hasher
+        .frame(1, source_language.as_bytes())
+        .frame(2, target_language.as_bytes())
+        .frame(3, language_semantics.as_bytes())
+        .frame(4, system_markdown.as_bytes())
+        .frame(5, client_semantics.as_bytes());
+    hasher.finish()
+}
+
+fn translation_state_context(
+    global_semantics: Sha256Fingerprint,
+    identity: &TranslationLeafIdentity,
+    protected_text: &str,
+    placeholders: &[super::standard::AppliedPlaceholder],
+    terminology: &[TerminologyDependency],
+) -> Result<TranslationStateContext, ScopePreprocessingError> {
+    let storage = MzStandardAssetStorageKind::for_group_kind(identity.kind());
+    let exact_location = MzLocationCodec::encode(identity.exact_location())
+        .map_err(ScopePreprocessingError::EncodeStateLocation)?;
+    let mut hasher = Sha256FramedHasher::new(b"att.mz.translation-leaf-context");
+    hasher
+        .frame(1, global_semantics.as_bytes())
+        .frame(2, identity.owner().storage_name().as_bytes())
+        .frame(3, storage.table().storage_name().as_bytes())
+        .frame(
+            4,
+            storage
+                .unit_type()
+                .map_or(b"".as_slice(), |unit| unit.storage_name().as_bytes()),
+        )
+        .frame(5, identity.field_name().as_bytes())
+        .frame(6, exact_location.as_bytes())
+        .frame(7, identity.original_text().as_bytes())
+        .frame(8, protected_text.as_bytes());
+    for placeholder in placeholders {
+        let origin = match placeholder.origin() {
+            super::standard::PlaceholderRuleOrigin::BuiltIn => b"builtin".as_slice(),
+            super::standard::PlaceholderRuleOrigin::Custom => b"custom".as_slice(),
+        };
+        let segment = match placeholder.segment() {
+            super::standard::PlaceholderSegment::Whole => b"whole".as_slice(),
+            super::standard::PlaceholderSegment::Begin => b"begin".as_slice(),
+            super::standard::PlaceholderSegment::End => b"end".as_slice(),
+        };
+        hasher
+            .frame(20, placeholder.token().as_bytes())
+            .frame(21, placeholder.original().as_bytes())
+            .frame(22, origin)
+            .frame(23, placeholder.label().as_bytes())
+            .frame(24, placeholder.scope().as_bytes())
+            .frame(25, segment);
+    }
+    for dependency in terminology {
+        hasher
+            .frame(30, dependency.term().as_bytes())
+            .frame(31, dependency.translation().as_bytes());
+    }
+    Ok(TranslationStateContext::new(hasher.finish()))
 }
 
 type UnitPosition = (usize, usize, usize);
@@ -495,7 +617,8 @@ fn collect_deduplication_inputs(
                         unit.protected_text.clone(),
                         unit.placeholders.clone(),
                         unit.translation.clone(),
-                        unit.terminology_dependencies.clone(),
+                        unit.translation_state,
+                        unit.state_context,
                         unit.invalidated,
                     ));
                     positions.push((scope_index, group_index, unit_index));
@@ -505,7 +628,8 @@ fn collect_deduplication_inputs(
                         unit.translation
                             .as_deref()
                             .expect("只有已有译文的叶子才可能术语失效"),
-                        unit.terminology_dependencies.clone(),
+                        unit.translation_state
+                            .expect("已有译文必须同时具有 translation_state"),
                     ));
                 }
             }
@@ -554,12 +678,13 @@ struct PreparedUnit {
     protected_text: String,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
+    state_context: TranslationStateContext,
     responsibility: PreparedUnitResponsibility,
 }
 
 fn build_scope_tasks(
     scope: PreprocessedScope,
-    terminology: Option<Arc<CompiledTerminology>>,
+    terminology: Arc<CompiledTerminology>,
     system_markdown: &str,
     max_characters: usize,
 ) -> Result<Vec<UnindexedTask>, ScopePlanningError> {
@@ -569,21 +694,17 @@ fn build_scope_tasks(
             .units
             .into_iter()
             .map(|unit| PreparedUnit {
-                field_name: unit.field_name,
+                field_name: unit.identity.field_name().to_owned(),
                 identity: unit.identity,
                 protected_text: unit.protected_text,
                 placeholders: unit.placeholders,
                 language_analysis: unit.language_analysis,
+                state_context: unit.state_context,
                 responsibility: unit.responsibility,
             })
             .collect::<Vec<_>>();
-        let triggered_terms = terminology
-            .as_deref()
-            .map(|terminology| {
-                terminology
-                    .triggered_indices(units.iter().map(|unit| unit.identity.original_text()))
-            })
-            .unwrap_or_default();
+        let triggered_terms =
+            terminology.triggered_indices(units.iter().map(|unit| unit.identity.original_text()));
         prepared_groups.push(PreparedTaskGroup {
             kind: group.kind,
             group_location: group.group_location,
@@ -594,7 +715,7 @@ fn build_scope_tasks(
 
     pack_scope(
         prepared_groups,
-        terminology.as_deref(),
+        terminology.as_ref(),
         system_markdown,
         max_characters,
     )
@@ -611,9 +732,10 @@ struct RenderedGroup {
 struct ExpectedBase {
     id: usize,
     identity: TranslationLeafIdentity,
-    propagation_targets: Vec<TranslationLeafIdentity>,
+    propagation_targets: Vec<TranslationPropagationTarget>,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
+    state_context: TranslationStateContext,
 }
 
 fn render_group(seed: PreparedTaskGroup, first_active_id: usize, ordinal: usize) -> RenderedGroup {
@@ -639,6 +761,7 @@ fn render_group(seed: PreparedTaskGroup, first_active_id: usize, ordinal: usize)
                     propagation_targets,
                     placeholders: unit.placeholders.clone(),
                     language_analysis: unit.language_analysis,
+                    state_context: unit.state_context,
                 });
                 units.push(TranslationTaskUnit::active(
                     unit.field_name,
@@ -685,7 +808,7 @@ fn push_blockquote(markdown: &mut String, text: &str) {
 
 fn pack_scope(
     groups: Vec<PreparedTaskGroup>,
-    terminology: Option<&CompiledTerminology>,
+    terminology: &CompiledTerminology,
     system_markdown: &str,
     max_characters: usize,
 ) -> Result<Vec<UnindexedTask>, ScopePlanningError> {
@@ -699,7 +822,7 @@ fn pack_scope(
         let candidate_terms = merged_term_flags(
             &current_terms,
             &rendered.triggered_terms,
-            terminology.map_or(0, |terms| terms.entries().len()),
+            terminology.entries().len(),
         );
         let candidate_size = message_character_count(
             system_markdown,
@@ -730,11 +853,7 @@ fn pack_scope(
         current_terms.clear();
 
         let rendered = render_group(seed, 0, 0);
-        let terms = merged_term_flags(
-            &[],
-            &rendered.triggered_terms,
-            terminology.map_or(0, |terms| terms.entries().len()),
-        );
+        let terms = merged_term_flags(&[], &rendered.triggered_terms, terminology.entries().len());
         let group_size =
             message_character_count(system_markdown, &[], Some(&rendered), terminology, &terms);
         if group_size > max_characters {
@@ -779,7 +898,7 @@ fn message_character_count(
     system_markdown: &str,
     current_groups: &[RenderedGroup],
     additional_group: Option<&RenderedGroup>,
-    terminology: Option<&CompiledTerminology>,
+    terminology: &CompiledTerminology,
     term_flags: &[bool],
 ) -> usize {
     system_markdown.chars().count()
@@ -791,13 +910,13 @@ fn message_character_count(
 fn render_user_markdown(
     groups: &[RenderedGroup],
     additional_group: Option<&RenderedGroup>,
-    terminology: Option<&CompiledTerminology>,
+    terminology: &CompiledTerminology,
     term_flags: &[bool],
 ) -> String {
     let mut markdown = String::from("# 翻译任务\n\n");
     let terms = terminology
-        .into_iter()
-        .flat_map(CompiledTerminology::entries)
+        .entries()
+        .iter()
         .enumerate()
         .filter(|(index, _)| term_flags.get(*index).copied().unwrap_or(false))
         .map(|(_, entry)| entry)
@@ -824,13 +943,13 @@ fn render_user_markdown(
 
 fn finalize_task(
     groups: Vec<RenderedGroup>,
-    terminology: Option<&CompiledTerminology>,
+    terminology: &CompiledTerminology,
     term_flags: &[bool],
     system_markdown: &str,
 ) -> UnindexedTask {
     let injected = terminology
-        .into_iter()
-        .flat_map(CompiledTerminology::entries)
+        .entries()
+        .iter()
         .enumerate()
         .filter(|(index, _)| term_flags.get(*index).copied().unwrap_or(false))
         .map(|(_, entry)| entry.dependency())
@@ -841,13 +960,19 @@ fn finalize_task(
     for group in groups {
         task_groups.push(group.group);
         expected_outputs.extend(group.expected.into_iter().map(|expected| {
+            let (propagation_targets, propagation_state_contexts) = expected
+                .propagation_targets
+                .into_iter()
+                .map(|target| (target.identity().clone(), target.state_context()))
+                .unzip();
             ExpectedTranslationOutput::new(
                 expected.id,
                 expected.identity,
-                expected.propagation_targets,
+                propagation_targets,
                 expected.placeholders,
                 expected.language_analysis,
-                injected.clone(),
+                expected.state_context,
+                propagation_state_contexts,
             )
         }));
     }
@@ -1041,16 +1166,16 @@ impl Error for CorpusPlanningError {}
 
 #[derive(Debug)]
 pub(crate) enum ScopePreprocessingError {
-    ProtectPlaceholder(PlaceholderProtectionError),
-    ProjectLanguageText(LanguageTextProjectionError),
+    Semantics(ResolvedTranslationSemanticError),
+    EncodeStateLocation(crate::att_mz::location_codec::MzLocationCodecError),
 }
 
 impl fmt::Display for ScopePreprocessingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ProtectPlaceholder(source) => write!(formatter, "无法保护原文占位符：{source}"),
-            Self::ProjectLanguageText(source) => {
-                write!(formatter, "无法建立受保护原文的语言视图：{source}")
+            Self::Semantics(source) => write!(formatter, "无法建立受信翻译语义：{source}"),
+            Self::EncodeStateLocation(source) => {
+                write!(formatter, "无法编码译文状态位置：{source}")
             }
         }
     }
@@ -1059,8 +1184,8 @@ impl fmt::Display for ScopePreprocessingError {
 impl Error for ScopePreprocessingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ProtectPlaceholder(source) => Some(source),
-            Self::ProjectLanguageText(source) => Some(source),
+            Self::Semantics(source) => Some(source),
+            Self::EncodeStateLocation(source) => Some(source),
         }
     }
 }
@@ -1110,6 +1235,7 @@ mod tests {
     use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
 
     use super::*;
+    use crate::att_mz::standard_asset::MzStandardAssetOwner;
     use crate::att_mz::translate::planning_resource::{
         JsonTranslationPlanningResourceReadingService, TranslationPlanningResources,
     };
@@ -1118,6 +1244,7 @@ mod tests {
     };
     use crate::att_mz::translate::standard::StandardTranslationAsset;
     use crate::att_mz::translate::standard::TranslationTaskUnitMode;
+    use crate::language::LanguageModule;
     use crate::language::{JapaneseLanguageModule, JapaneseResidualPolicy};
 
     #[derive(Clone, Copy)]
@@ -1169,6 +1296,12 @@ mod tests {
 
     impl Error for FakeError {}
 
+    impl LlmClientSemanticIdentity for () {
+        fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+            Sha256Fingerprint::from_bytes([0x33; 32])
+        }
+    }
+
     struct EmptyResources;
 
     impl TranslationPlanningResourceReader for EmptyResources {
@@ -1178,8 +1311,15 @@ mod tests {
             &self,
             _terminology_path: Option<PathBuf>,
             _placeholder_rules_path: Option<PathBuf>,
+            _current_terminology_json: String,
+            _current_placeholder_rules_json: String,
         ) -> Result<TranslationPlanningResources, Self::Error> {
-            Ok(TranslationPlanningResources::new(None, Vec::new()))
+            Ok(TranslationPlanningResources::new(
+                CompiledTerminology::empty(),
+                Vec::new(),
+                "[]".to_owned(),
+                "[]".to_owned(),
+            ))
         }
     }
 
@@ -1251,12 +1391,12 @@ mod tests {
         ))
     }
 
-    fn project() -> StoredProjectRecord {
+    fn project() -> OpenedProject {
         project_with_languages("ja", "zh-Hans")
     }
 
-    fn project_with_languages(source_language: &str, target_language: &str) -> StoredProjectRecord {
-        StoredProjectRecord::new(
+    fn project_with_languages(source_language: &str, target_language: &str) -> OpenedProject {
+        OpenedProject::new(
             "测试游戏".parse().expect("测试项目名应该有效"),
             PathBuf::from("C:/Projects/测试游戏"),
             PathBuf::from("C:/Projects/测试游戏/project.db"),
@@ -1271,8 +1411,9 @@ mod tests {
         object_index: usize,
         original: impl Into<String>,
         translation: Option<&str>,
-        dependencies: Vec<TerminologyDependency>,
+        terms: Vec<TerminologyDependency>,
     ) -> StandardTranslationGroup {
+        let original = original.into();
         let group_location =
             MzLocation::value(source.clone(), vec![MzLocationStep::index(object_index)]);
         let exact_location = MzLocation::value(
@@ -1283,19 +1424,43 @@ mod tests {
             ],
         );
         let identity = TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
+            "name",
             group_location.clone(),
             exact_location,
-            original,
+            original.clone(),
         );
+        let translation_state = translation.map(|translation| {
+            let placeholders = Pcre2PlaceholderService::new().expect("内建占位符应可编译");
+            let custom = placeholders
+                .compile_custom(Vec::new())
+                .expect("空自定义占位符应可编译");
+            let (protected_text, bindings) = placeholders
+                .protect(TextGroupKind::DatabaseEntry, &original, &custom)
+                .expect("测试原文应可保护")
+                .into_parts();
+            let source_language = language_catalog()
+                .resolve("ja")
+                .expect("测试日文模块应存在");
+            let global = global_translation_semantics(
+                "ja",
+                "zh-Hans",
+                source_language.semantic_fingerprint(),
+                "# System\n完整且由外部提供。",
+                ().semantic_fingerprint(),
+            );
+            translation_state_context(global, &identity, &protected_text, &bindings, &terms)
+                .expect("测试译文状态应可建立")
+                .finish(translation)
+        });
         StandardTranslationGroup::new(
             TextGroupKind::DatabaseEntry,
             group_location,
             vec![StandardTranslationAsset::new(
                 identity,
-                "name",
                 translation.map(str::to_owned),
-                dependencies,
+                translation_state,
             )],
         )
     }
@@ -1329,7 +1494,13 @@ mod tests {
         };
         let group_location = MzLocation::value(source.clone(), group_steps);
         let identity = TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             kind,
+            if kind == TextGroupKind::Map {
+                "displayName"
+            } else {
+                "body[0]"
+            },
             group_location.clone(),
             MzLocation::value(source, exact_steps),
             original,
@@ -1337,16 +1508,7 @@ mod tests {
         StandardTranslationGroup::new(
             kind,
             group_location,
-            vec![StandardTranslationAsset::new(
-                identity,
-                if kind == TextGroupKind::Map {
-                    "displayName"
-                } else {
-                    "body[0]"
-                },
-                None,
-                Vec::new(),
-            )],
+            vec![StandardTranslationAsset::new(identity, None, None)],
         )
     }
 
@@ -1390,17 +1552,14 @@ mod tests {
             )
             .await
             .expect("术语变更应该建立重译计划");
-        let (preparation, tasks) = plan.into_parts();
+        let (_, preparation, tasks) = plan.into_parts();
 
         assert_eq!(preparation.invalidations().len(), 1);
         assert_eq!(
             preparation.invalidations()[0].expected_translation(),
             "魔法剑"
         );
-        assert_eq!(
-            preparation.invalidations()[0].expected_terminology_dependencies(),
-            &[old_dependency]
-        );
+        assert_eq!(preparation.invalidated(), 1);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].expected_outputs()[0].id(), 0);
         assert_eq!(
@@ -1436,7 +1595,7 @@ mod tests {
         );
         let original = r"再生 \SE[Bell] 後で続けます";
 
-        let (_, tasks) = planner
+        let (_, _, tasks) = planner
             .plan(
                 &project(),
                 &profile(10_000),
@@ -1471,7 +1630,7 @@ mod tests {
             ImmediateCpu,
         );
 
-        let (_, tasks) = planner
+        let (_, _, tasks) = planner
             .plan(
                 &project_with_languages("ja", "future-target"),
                 &profile_for_language_pair(10_000, 2, "ja", "future-target"),
@@ -1510,7 +1669,7 @@ mod tests {
             group(MzSource::map(2), 0, "二番目", None, Vec::new()),
         ]);
 
-        let (_, tasks) = planner
+        let (_, _, tasks) = planner
             .plan(
                 &project(),
                 &profile(10_000),
@@ -1554,7 +1713,7 @@ mod tests {
                 .collect(),
         );
 
-        let (_, tasks) = planner
+        let (_, _, tasks) = planner
             .plan(
                 &project(),
                 &profile_with_scope_concurrency(10_000, 2),
@@ -1601,7 +1760,7 @@ mod tests {
             "次のイベント",
         );
 
-        let (_, tasks) = planner
+        let (_, _, tasks) = planner
             .plan(
                 &project(),
                 &profile(10_000),
@@ -1670,7 +1829,7 @@ mod tests {
             ),
         ]);
 
-        let (_, tasks) = planner
+        let (_, _, tasks) = planner
             .plan(
                 &project(),
                 &profile(10_000),
@@ -1722,7 +1881,7 @@ mod tests {
             "別の翻訳対象です。",
         );
 
-        let (preparation, tasks) = planner
+        let (_, preparation, tasks) = planner
             .plan(
                 &project(),
                 &profile(10_000),
@@ -1765,7 +1924,7 @@ mod tests {
             1,
             "保存",
             Some("Save"),
-            vec![TerminologyDependency::new("保存", "Save")],
+            Vec::new(),
         );
         let target = group(
             MzSource::data(StandardDataFile::Skills),
@@ -1775,7 +1934,7 @@ mod tests {
             Vec::new(),
         );
 
-        let (preparation, tasks) = planner
+        let (_, preparation, tasks) = planner
             .plan(
                 &project(),
                 &profile(10_000),
@@ -1861,7 +2020,7 @@ mod tests {
             None,
             Vec::new(),
         );
-        let (_, single) = planner
+        let (_, _, single) = planner
             .plan(
                 &project(),
                 &profile(10_000),
@@ -1877,7 +2036,7 @@ mod tests {
             .map(|message| message.content().chars().count())
             .sum::<usize>();
 
-        let (_, split) = planner
+        let (_, _, split) = planner
             .plan(
                 &project(),
                 &profile(exact_single_size),
@@ -1913,12 +2072,12 @@ mod tests {
                 MzSource::data(StandardDataFile::Items),
                 2,
                 "12345",
-                None,
+                Some("12345"),
                 Vec::new(),
             ),
         ]);
 
-        let (_, tasks) = planner
+        let (_, preparation, tasks) = planner
             .plan(
                 &project(),
                 &profile(10_000),
@@ -1929,5 +2088,8 @@ mod tests {
             .expect("纯上下文语料应该形成空计划")
             .into_parts();
         assert!(tasks.is_empty());
+        assert_eq!(preparation.not_applicable(), 1);
+        assert_eq!(preparation.invalidated(), 0);
+        assert_eq!(preparation.invalidations().len(), 1);
     }
 }

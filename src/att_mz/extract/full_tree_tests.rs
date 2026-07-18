@@ -1,4 +1,4 @@
-//! 用七个根能力测试替身组装完整 ExtractUseCase 非根依赖树。
+//! 用八个根能力测试替身组装完整 ExtractUseCase 非根依赖树。
 
 use std::error::Error;
 use std::fmt;
@@ -9,18 +9,22 @@ use std::sync::{Arc, Mutex};
 
 use super::builtin::{BuiltInExtractionConfig, BuiltInExtractionService};
 use super::document::{MzDocumentReadingConfig, MzProjectDocumentReadingService};
-use super::lua::{LuaExtractionService, LuaInvocation, TrustedLuaExecutionHost};
+use super::lua::{
+    LuaExtractionService, LuaInvocation, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
+};
 use super::rules::{RulesExtractionConfig, RulesExtractionService};
 use super::service::ExtractService;
 use super::store::asset_store::{MzExtractionAssetStore, MzExtractionAssetStoreConfig};
 use super::{ExtractInput, ExtractUseCase, ExtractionSelection};
 use crate::att_mz::ProjectName;
 use crate::att_mz::project::ExistingProjectOpeningService;
+use crate::fingerprint::Sha256Fingerprint;
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
-    DirectoryLister, ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile,
-    ReadFileError, ResolveDirectoryError,
+    DirectoryEntry, DirectoryLister, DirectoryTreeFingerprintError,
+    DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, ExistingDirectoryResolver,
+    FileReader, ListDirectoryError, ReadFile, ReadFileError, ResolveDirectoryError,
 };
 use crate::storage::sqlite::{
     ExecuteTransactionError, QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor,
@@ -57,6 +61,20 @@ impl ExistingDirectoryResolver for FakeDirectoryResolver {
         _: PathBuf,
     ) -> Result<PathBuf, ResolveDirectoryError<Self::Error>> {
         Ok(PathBuf::from("C:/Games/Demo"))
+    }
+}
+
+#[derive(Clone)]
+struct FakeDirectoryTreeFingerprinter;
+
+impl DirectoryTreeFingerprinter for FakeDirectoryTreeFingerprinter {
+    type Error = FakeRootError;
+
+    async fn fingerprint_directory_tree(
+        &self,
+        _: DirectoryTreeFingerprintRequest,
+    ) -> Result<Sha256Fingerprint, DirectoryTreeFingerprintError<Self::Error>> {
+        Ok(Sha256Fingerprint::from_bytes([0x5a; 32]))
     }
 }
 
@@ -114,7 +132,7 @@ impl DirectoryLister for FakeDirectoryLister {
     async fn list_directory(
         &self,
         _: PathBuf,
-    ) -> Result<Vec<PathBuf>, ListDirectoryError<Self::Error>> {
+    ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<Self::Error>> {
         Ok(Vec::new())
     }
 }
@@ -167,6 +185,7 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
             SqliteValue::Text("demo".to_owned()),
             SqliteValue::Text("ja".to_owned()),
             SqliteValue::Text("zh-Hans".to_owned()),
+            SqliteValue::Blob(vec![0x5a; 32]),
             SqliteValue::Integer(24),
             SqliteValue::Integer(30),
             SqliteValue::Integer(18),
@@ -213,6 +232,23 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
     }
 }
 
+impl SqliteQueryExecutor for FakeSqliteTransactionExecutor {
+    type Error = FakeRootError;
+
+    async fn query_existing_database(
+        &self,
+        _: PathBuf,
+        query: SqliteQuery,
+    ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>> {
+        assert!(
+            query.statement().contains("standard_asset_owner_state")
+                || query.statement().contains("UNION ALL"),
+            "Store 只应读取当前 owner 快照或新鲜 owner"
+        );
+        Ok(Vec::new())
+    }
+}
+
 fn transaction_owner(plan: &SqliteTransactionPlan) -> &str {
     plan.steps()
         .iter()
@@ -250,7 +286,7 @@ impl TrustedLuaExecutionHost for FakeTrustedLuaExecutionHost {
     async fn execute(
         &self,
         invocation: LuaInvocation<Self::TranslationProfile>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<TrustedLuaExecutionOutcome, Self::Error> {
         self.events.lock().expect("事件锁不应中毒").push(Event::Lua);
         let LuaInvocation::Extract {
             script_path,
@@ -266,12 +302,12 @@ impl TrustedLuaExecutionHost for FakeTrustedLuaExecutionHost {
                 script_path,
                 project,
             });
-        Ok(())
+        Ok(TrustedLuaExecutionOutcome::Empty)
     }
 }
 
 #[tokio::test]
-async fn seven_root_fakes_drive_the_complete_non_root_extract_tree() {
+async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
     let query_count = Arc::new(AtomicUsize::new(0));
     let cpu_executions = Arc::new(AtomicUsize::new(0));
     let file_max_active = Arc::new(AtomicUsize::new(0));
@@ -306,6 +342,7 @@ async fn seven_root_fakes_drive_the_complete_non_root_extract_tree() {
             },
         ),
         FakeDirectoryResolver,
+        FakeDirectoryTreeFingerprinter,
     );
     let builtin = BuiltInExtractionService::new(
         MzProjectDocumentReadingService::new(
@@ -326,14 +363,17 @@ async fn seven_root_fakes_drive_the_complete_non_root_extract_tree() {
             cpu.clone(),
             document_config,
         ),
-        MzExtractionAssetStore::new(sqlite_transactions, cpu.clone(), store_config),
+        MzExtractionAssetStore::new(sqlite_transactions.clone(), cpu.clone(), store_config),
         cpu.clone(),
         RulesExtractionConfig::new(non_zero(2)),
     );
-    let lua = LuaExtractionService::new(FakeTrustedLuaExecutionHost {
-        events: Arc::clone(&events),
-        invocations: Arc::clone(&lua_invocations),
-    });
+    let lua = LuaExtractionService::new(
+        FakeTrustedLuaExecutionHost {
+            events: Arc::clone(&events),
+            invocations: Arc::clone(&lua_invocations),
+        },
+        MzExtractionAssetStore::new(sqlite_transactions, cpu.clone(), store_config),
+    );
     let extract = ExtractService::new(
         opener,
         builtin,

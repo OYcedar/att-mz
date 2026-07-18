@@ -14,12 +14,15 @@ use std::time::Duration;
 
 use futures_util::stream::{FuturesOrdered, StreamExt};
 
+use crate::att_mz::project::OpenedProject;
+use crate::att_mz::standard_asset::MzStandardAssetOwner;
 use crate::att_mz::text::{MzLocation, TextGroupKind};
 use crate::execution::{CooperativeCancellation, OperationCancelled};
+use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::LanguageAnalysis;
 use crate::llm::{ChatMessage, LlmUsage};
 use crate::observability::PersistentEventLog;
-use crate::project_database::StoredProjectRecord;
+use crate::project_database::SourceSnapshotFingerprint;
 
 use super::executor::FinalLlmResponseMetadata;
 use super::profile::TranslationExecutionProfile;
@@ -81,7 +84,9 @@ where
 /// Store 在写入时可以用原文事实防止把旧计划提交到已变化的资产上。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TranslationLeafIdentity {
+    owner: MzStandardAssetOwner,
     kind: TextGroupKind,
+    field_name: String,
     group_location: MzLocation,
     exact_location: MzLocation,
     original_text: String,
@@ -89,22 +94,34 @@ pub(crate) struct TranslationLeafIdentity {
 
 impl TranslationLeafIdentity {
     pub(crate) fn new(
+        owner: MzStandardAssetOwner,
         kind: TextGroupKind,
+        field_name: impl Into<String>,
         group_location: MzLocation,
         exact_location: MzLocation,
         original_text: impl Into<String>,
     ) -> Self {
         Self {
+            owner,
             kind,
+            field_name: field_name.into(),
             group_location,
             exact_location,
             original_text: original_text.into(),
         }
     }
 
+    pub(crate) const fn owner(&self) -> MzStandardAssetOwner {
+        self.owner
+    }
+
     /// 返回决定五张标准资产表中目标表的领域种类。
     pub(crate) const fn kind(&self) -> TextGroupKind {
         self.kind
+    }
+
+    pub(crate) fn field_name(&self) -> &str {
+        &self.field_name
     }
 
     /// 返回译文所属复合语义组的结构化位置。
@@ -149,23 +166,20 @@ impl TerminologyDependency {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StandardTranslationAsset {
     identity: TranslationLeafIdentity,
-    field_name: String,
     translation: Option<String>,
-    terminology_dependencies: Vec<TerminologyDependency>,
+    translation_state: Option<Sha256Fingerprint>,
 }
 
 impl StandardTranslationAsset {
     pub(crate) fn new(
         identity: TranslationLeafIdentity,
-        field_name: impl Into<String>,
         translation: Option<String>,
-        terminology_dependencies: Vec<TerminologyDependency>,
+        translation_state: Option<Sha256Fingerprint>,
     ) -> Self {
         Self {
             identity,
-            field_name: field_name.into(),
             translation,
-            terminology_dependencies,
+            translation_state,
         }
     }
 
@@ -175,24 +189,18 @@ impl StandardTranslationAsset {
     }
 
     #[cfg(test)]
-    pub(crate) fn terminology_dependencies(&self) -> &[TerminologyDependency] {
-        &self.terminology_dependencies
+    pub(crate) const fn translation_state(&self) -> Option<Sha256Fingerprint> {
+        self.translation_state
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
         TranslationLeafIdentity,
-        String,
         Option<String>,
-        Vec<TerminologyDependency>,
+        Option<Sha256Fingerprint>,
     ) {
-        (
-            self.identity,
-            self.field_name,
-            self.translation,
-            self.terminology_dependencies,
-        )
+        (self.identity, self.translation, self.translation_state)
     }
 }
 
@@ -237,13 +245,82 @@ impl StandardTranslationGroup {
 
 /// Reader 在同一个一致读视图中建立的完整标准翻译语料。
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationSnapshotBaseline {
+    source_snapshot_fingerprint: SourceSnapshotFingerprint,
+    owner_source_fingerprints: Vec<(MzStandardAssetOwner, SourceSnapshotFingerprint)>,
+    terminology_json: String,
+    placeholder_rules_json: String,
+}
+
+impl TranslationSnapshotBaseline {
+    pub(crate) fn new(
+        source_snapshot_fingerprint: SourceSnapshotFingerprint,
+        owner_source_fingerprints: Vec<(MzStandardAssetOwner, SourceSnapshotFingerprint)>,
+        terminology_json: String,
+        placeholder_rules_json: String,
+    ) -> Self {
+        Self {
+            source_snapshot_fingerprint,
+            owner_source_fingerprints,
+            terminology_json,
+            placeholder_rules_json,
+        }
+    }
+
+    pub(crate) const fn source_snapshot_fingerprint(&self) -> SourceSnapshotFingerprint {
+        self.source_snapshot_fingerprint
+    }
+
+    pub(crate) fn owner_source_fingerprints(
+        &self,
+    ) -> &[(MzStandardAssetOwner, SourceSnapshotFingerprint)] {
+        &self.owner_source_fingerprints
+    }
+
+    pub(crate) fn terminology_json(&self) -> &str {
+        &self.terminology_json
+    }
+
+    pub(crate) fn placeholder_rules_json(&self) -> &str {
+        &self.placeholder_rules_json
+    }
+}
+
+/// Reader 在同一个一致读视图中建立的完整标准翻译语料。
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StandardTranslationCorpus {
     groups: Vec<StandardTranslationGroup>,
+    baseline: TranslationSnapshotBaseline,
 }
 
 impl StandardTranslationCorpus {
+    #[cfg(test)]
     pub(crate) fn new(groups: Vec<StandardTranslationGroup>) -> Self {
-        Self { groups }
+        Self::with_snapshot(
+            groups,
+            SourceSnapshotFingerprint::from_bytes([0; 32]),
+            Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        )
+    }
+
+    pub(crate) fn with_snapshot(
+        groups: Vec<StandardTranslationGroup>,
+        source_snapshot_fingerprint: SourceSnapshotFingerprint,
+        owner_source_fingerprints: Vec<(MzStandardAssetOwner, SourceSnapshotFingerprint)>,
+        terminology_json: String,
+        placeholder_rules_json: String,
+    ) -> Self {
+        Self {
+            groups,
+            baseline: TranslationSnapshotBaseline::new(
+                source_snapshot_fingerprint,
+                owner_source_fingerprints,
+                terminology_json,
+                placeholder_rules_json,
+            ),
+        }
     }
 
     #[cfg(test)]
@@ -251,8 +328,18 @@ impl StandardTranslationCorpus {
         &self.groups
     }
 
-    pub(crate) fn into_groups(self) -> Vec<StandardTranslationGroup> {
-        self.groups
+    #[cfg(test)]
+    pub(crate) fn terminology_json(&self) -> &str {
+        self.baseline.terminology_json()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn placeholder_rules_json(&self) -> &str {
+        self.baseline.placeholder_rules_json()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<StandardTranslationGroup>, TranslationSnapshotBaseline) {
+        (self.groups, self.baseline)
     }
 }
 
@@ -264,30 +351,30 @@ impl StandardTranslationCorpus {
 pub(crate) struct TranslationInvalidation {
     identity: TranslationLeafIdentity,
     expected_translation: String,
-    expected_terminology_dependencies: Vec<TerminologyDependency>,
+    expected_translation_state: Sha256Fingerprint,
 }
 
 /// 可以直接复用的一条现有译文快照。
 ///
-/// Store 必须在写入目标前确认种子仍保持读取时的译文和术语依赖，避免把
+/// Store 必须在写入目标前确认种子仍保持读取时的译文和语义状态，避免把
 /// 已被并发修改的旧事实扩散到其他位置。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationReuseSeed {
     identity: TranslationLeafIdentity,
     expected_translation: String,
-    expected_terminology_dependencies: Vec<TerminologyDependency>,
+    expected_translation_state: Sha256Fingerprint,
 }
 
 impl TranslationReuseSeed {
     pub(crate) fn new(
         identity: TranslationLeafIdentity,
         expected_translation: impl Into<String>,
-        expected_terminology_dependencies: Vec<TerminologyDependency>,
+        expected_translation_state: Sha256Fingerprint,
     ) -> Self {
         Self {
             identity,
             expected_translation: expected_translation.into(),
-            expected_terminology_dependencies,
+            expected_translation_state,
         }
     }
 
@@ -299,8 +386,8 @@ impl TranslationReuseSeed {
         &self.expected_translation
     }
 
-    pub(crate) fn expected_terminology_dependencies(&self) -> &[TerminologyDependency] {
-        &self.expected_terminology_dependencies
+    pub(crate) const fn expected_translation_state(&self) -> Sha256Fingerprint {
+        self.expected_translation_state
     }
 }
 
@@ -309,19 +396,22 @@ impl TranslationReuseSeed {
 pub(crate) struct TranslationReuseTarget {
     identity: TranslationLeafIdentity,
     expected_translation: Option<String>,
-    expected_terminology_dependencies: Vec<TerminologyDependency>,
+    expected_translation_state: Option<Sha256Fingerprint>,
+    replacement_translation_state: Sha256Fingerprint,
 }
 
 impl TranslationReuseTarget {
     pub(crate) fn new(
         identity: TranslationLeafIdentity,
         expected_translation: Option<String>,
-        expected_terminology_dependencies: Vec<TerminologyDependency>,
+        expected_translation_state: Option<Sha256Fingerprint>,
+        replacement_translation_state: Sha256Fingerprint,
     ) -> Self {
         Self {
             identity,
             expected_translation,
-            expected_terminology_dependencies,
+            expected_translation_state,
+            replacement_translation_state,
         }
     }
 
@@ -333,8 +423,12 @@ impl TranslationReuseTarget {
         self.expected_translation.as_deref()
     }
 
-    pub(crate) fn expected_terminology_dependencies(&self) -> &[TerminologyDependency] {
-        &self.expected_terminology_dependencies
+    pub(crate) const fn expected_translation_state(&self) -> Option<Sha256Fingerprint> {
+        self.expected_translation_state
+    }
+
+    pub(crate) const fn replacement_translation_state(&self) -> Sha256Fingerprint {
+        self.replacement_translation_state
     }
 }
 
@@ -363,12 +457,12 @@ impl TranslationInvalidation {
     pub(crate) fn new(
         identity: TranslationLeafIdentity,
         expected_translation: impl Into<String>,
-        expected_terminology_dependencies: Vec<TerminologyDependency>,
+        expected_translation_state: Sha256Fingerprint,
     ) -> Self {
         Self {
             identity,
             expected_translation: expected_translation.into(),
-            expected_terminology_dependencies,
+            expected_translation_state,
         }
     }
 
@@ -380,29 +474,88 @@ impl TranslationInvalidation {
         &self.expected_translation
     }
 
-    pub(crate) fn expected_terminology_dependencies(&self) -> &[TerminologyDependency] {
-        &self.expected_terminology_dependencies
+    pub(crate) const fn expected_translation_state(&self) -> Sha256Fingerprint {
+        self.expected_translation_state
+    }
+}
+
+/// 标准翻译计划准备阶段的逐叶对账计数。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationPlanPreparationCounts {
+    retained: usize,
+    invalidated: usize,
+    not_applicable: usize,
+}
+
+impl TranslationPlanPreparationCounts {
+    pub(crate) const fn new(retained: usize, invalidated: usize, not_applicable: usize) -> Self {
+        Self {
+            retained,
+            invalidated,
+            not_applicable,
+        }
     }
 }
 
 /// 在任何 LLM 请求前必须完成的标准资产准备。
 ///
-/// 每项失效同时携带读取时的旧译文和术语依赖，Store 必须在清理前原子确认这些
+/// 每项失效同时携带读取时的旧译文和语义状态，Store 必须在清理前原子确认这些
 /// 事实仍未变化，避免并发翻译把更新后的译文误删。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationPlanPreparation {
     invalidations: Vec<TranslationInvalidation>,
     reuses: Vec<TranslationReuse>,
+    terminology_json: String,
+    placeholder_rules_json: String,
+    retained: usize,
+    invalidated: usize,
+    not_applicable: usize,
+    snapshot_baseline: TranslationSnapshotBaseline,
 }
 
 impl TranslationPlanPreparation {
+    #[cfg(test)]
     pub(crate) fn new(
         invalidations: Vec<TranslationInvalidation>,
         reuses: Vec<TranslationReuse>,
+        terminology_json: String,
+        placeholder_rules_json: String,
+        retained: usize,
+        invalidated: usize,
+        not_applicable: usize,
+    ) -> Self {
+        Self::with_baseline(
+            invalidations,
+            reuses,
+            terminology_json,
+            placeholder_rules_json,
+            TranslationPlanPreparationCounts::new(retained, invalidated, not_applicable),
+            TranslationSnapshotBaseline::new(
+                SourceSnapshotFingerprint::from_bytes([0; 32]),
+                Vec::new(),
+                "[]".to_owned(),
+                "[]".to_owned(),
+            ),
+        )
+    }
+
+    pub(crate) fn with_baseline(
+        invalidations: Vec<TranslationInvalidation>,
+        reuses: Vec<TranslationReuse>,
+        terminology_json: String,
+        placeholder_rules_json: String,
+        counts: TranslationPlanPreparationCounts,
+        snapshot_baseline: TranslationSnapshotBaseline,
     ) -> Self {
         Self {
             invalidations,
             reuses,
+            terminology_json,
+            placeholder_rules_json,
+            retained: counts.retained,
+            invalidated: counts.invalidated,
+            not_applicable: counts.not_applicable,
+            snapshot_baseline,
         }
     }
 
@@ -416,8 +569,49 @@ impl TranslationPlanPreparation {
         &self.reuses
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<TranslationInvalidation>, Vec<TranslationReuse>) {
-        (self.invalidations, self.reuses)
+    pub(crate) const fn retained(&self) -> usize {
+        self.retained
+    }
+
+    pub(crate) const fn invalidated(&self) -> usize {
+        self.invalidated
+    }
+
+    pub(crate) const fn not_applicable(&self) -> usize {
+        self.not_applicable
+    }
+
+    pub(crate) fn reused(&self) -> usize {
+        self.reuses.iter().map(|reuse| reuse.targets().len()).sum()
+    }
+
+    pub(crate) fn requires_storage_changes(&self) -> bool {
+        !self.invalidations.is_empty()
+            || !self.reuses.is_empty()
+            || self.terminology_json != self.snapshot_baseline.terminology_json()
+            || self.placeholder_rules_json != self.snapshot_baseline.placeholder_rules_json()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<TranslationInvalidation>,
+        Vec<TranslationReuse>,
+        String,
+        String,
+        usize,
+        usize,
+        TranslationSnapshotBaseline,
+    ) {
+        (
+            self.invalidations,
+            self.reuses,
+            self.terminology_json,
+            self.placeholder_rules_json,
+            self.retained,
+            self.not_applicable,
+            self.snapshot_baseline,
+        )
     }
 }
 
@@ -463,7 +657,6 @@ impl TranslationLanguagePair {
         &self.source_language
     }
 
-    #[cfg(test)]
     pub(crate) fn target_language(&self) -> &str {
         &self.target_language
     }
@@ -522,25 +715,66 @@ impl AppliedPlaceholder {
         &self.original
     }
 
-    #[cfg(test)]
     pub(crate) const fn origin(&self) -> PlaceholderRuleOrigin {
         self.origin
     }
 
-    #[cfg(test)]
     pub(crate) fn label(&self) -> &str {
         &self.label
     }
 
     /// 返回建立本绑定的稳定领域作用域。
-    #[cfg(test)]
     pub(crate) fn scope(&self) -> &str {
         &self.scope
     }
 
-    #[cfg(test)]
     pub(crate) const fn segment(&self) -> PlaceholderSegment {
         self.segment
+    }
+}
+
+/// 一个叶子除最终译文以外的全部当前翻译语义。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationStateContext(Sha256Fingerprint);
+
+impl TranslationStateContext {
+    pub(crate) const fn new(fingerprint: Sha256Fingerprint) -> Self {
+        Self(fingerprint)
+    }
+
+    pub(crate) fn finish(self, translation: &str) -> Sha256Fingerprint {
+        let mut hasher = Sha256FramedHasher::new(b"att.mz.translation-state");
+        hasher
+            .frame(1, self.0.as_bytes())
+            .frame(2, translation.as_bytes());
+        hasher.finish()
+    }
+}
+
+/// 去重传播目标以及该物理叶子的独立语义上下文。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationPropagationTarget {
+    identity: TranslationLeafIdentity,
+    state_context: TranslationStateContext,
+}
+
+impl TranslationPropagationTarget {
+    pub(crate) const fn new(
+        identity: TranslationLeafIdentity,
+        state_context: TranslationStateContext,
+    ) -> Self {
+        Self {
+            identity,
+            state_context,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+        &self.identity
+    }
+
+    pub(crate) const fn state_context(&self) -> TranslationStateContext {
+        self.state_context
     }
 }
 
@@ -688,7 +922,8 @@ pub(crate) struct ExpectedTranslationOutput {
     propagation_targets: Vec<TranslationLeafIdentity>,
     applied_placeholders: Vec<AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
-    terminology_dependencies: Vec<TerminologyDependency>,
+    state_context: TranslationStateContext,
+    propagation_state_contexts: Vec<TranslationStateContext>,
 }
 
 impl ExpectedTranslationOutput {
@@ -698,7 +933,8 @@ impl ExpectedTranslationOutput {
         propagation_targets: Vec<TranslationLeafIdentity>,
         applied_placeholders: Vec<AppliedPlaceholder>,
         language_analysis: LanguageAnalysis,
-        terminology_dependencies: Vec<TerminologyDependency>,
+        state_context: TranslationStateContext,
+        propagation_state_contexts: Vec<TranslationStateContext>,
     ) -> Self {
         Self {
             id,
@@ -706,7 +942,8 @@ impl ExpectedTranslationOutput {
             propagation_targets,
             applied_placeholders,
             language_analysis,
-            terminology_dependencies,
+            state_context,
+            propagation_state_contexts,
         }
     }
 
@@ -731,8 +968,12 @@ impl ExpectedTranslationOutput {
         &self.language_analysis
     }
 
-    pub(crate) fn terminology_dependencies(&self) -> &[TerminologyDependency] {
-        &self.terminology_dependencies
+    pub(crate) const fn state_context(&self) -> TranslationStateContext {
+        self.state_context
+    }
+
+    pub(crate) fn propagation_state_contexts(&self) -> &[TranslationStateContext] {
+        &self.propagation_state_contexts
     }
 }
 
@@ -796,20 +1037,32 @@ impl TranslationTaskBlock {
 /// Planner 建立的确定顺序计划。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StandardTranslationPlan {
+    semantics: Arc<super::semantics::ResolvedTranslationSemantics>,
     preparation: TranslationPlanPreparation,
     tasks: Vec<TranslationTaskBlock>,
 }
 
 impl StandardTranslationPlan {
     pub(crate) fn new(
+        semantics: Arc<super::semantics::ResolvedTranslationSemantics>,
         preparation: TranslationPlanPreparation,
         tasks: Vec<TranslationTaskBlock>,
     ) -> Self {
-        Self { preparation, tasks }
+        Self {
+            semantics,
+            preparation,
+            tasks,
+        }
     }
 
-    pub(crate) fn into_parts(self) -> (TranslationPlanPreparation, Vec<TranslationTaskBlock>) {
-        (self.preparation, self.tasks)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Arc<super::semantics::ResolvedTranslationSemantics>,
+        TranslationPlanPreparation,
+        Vec<TranslationTaskBlock>,
+    ) {
+        (self.semantics, self.preparation, self.tasks)
     }
 }
 
@@ -817,23 +1070,23 @@ impl StandardTranslationPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationPatch {
     identity: TranslationLeafIdentity,
-    propagation_targets: Vec<TranslationLeafIdentity>,
+    propagation_targets: Vec<TranslationPropagationTarget>,
     translation: String,
-    terminology_dependencies: Vec<TerminologyDependency>,
+    translation_state: Sha256Fingerprint,
 }
 
 impl TranslationPatch {
     pub(crate) fn new(
         identity: TranslationLeafIdentity,
-        propagation_targets: Vec<TranslationLeafIdentity>,
+        propagation_targets: Vec<TranslationPropagationTarget>,
         translation: impl Into<String>,
-        terminology_dependencies: Vec<TerminologyDependency>,
+        translation_state: Sha256Fingerprint,
     ) -> Self {
         Self {
             identity,
             propagation_targets,
             translation: translation.into(),
-            terminology_dependencies,
+            translation_state,
         }
     }
 
@@ -841,7 +1094,7 @@ impl TranslationPatch {
         &self.identity
     }
 
-    pub(crate) fn propagation_targets(&self) -> &[TranslationLeafIdentity] {
+    pub(crate) fn propagation_targets(&self) -> &[TranslationPropagationTarget] {
         &self.propagation_targets
     }
 
@@ -849,8 +1102,8 @@ impl TranslationPatch {
         &self.translation
     }
 
-    pub(crate) fn terminology_dependencies(&self) -> &[TerminologyDependency] {
-        &self.terminology_dependencies
+    pub(crate) const fn translation_state(&self) -> Sha256Fingerprint {
+        self.translation_state
     }
 }
 
@@ -877,18 +1130,13 @@ impl AcceptedTranslationDecision {
         self.patch.identity()
     }
 
-    pub(crate) fn propagation_targets(&self) -> &[TranslationLeafIdentity] {
+    pub(crate) fn propagation_targets(&self) -> &[TranslationPropagationTarget] {
         self.patch.propagation_targets()
     }
 
     #[cfg(test)]
     pub(crate) fn translation(&self) -> &str {
         self.patch.translation()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn terminology_dependencies(&self) -> &[TerminologyDependency] {
-        self.patch.terminology_dependencies()
     }
 
     fn into_patch(self) -> TranslationPatch {
@@ -1215,6 +1463,7 @@ fn ensure_positive_attempts(attempts: usize) -> Result<(), TranslationTaskOutcom
 /// 一次 Standard 运行已经确认的正常业务汇总。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StandardTranslationRunReport {
+    semantics: Option<Arc<super::semantics::ResolvedTranslationSemantics>>,
     total_tasks: usize,
     complete_tasks: usize,
     partial_tasks: usize,
@@ -1225,11 +1474,27 @@ pub(crate) struct StandardTranslationRunReport {
     unresolved_locations: usize,
     protocol_diagnostics: usize,
     recoverable_request_exhaustions: usize,
+    retained: usize,
+    invalidated: usize,
+    not_applicable: usize,
+    reused: usize,
 }
 
 impl StandardTranslationRunReport {
+    #[cfg(test)]
     pub(crate) const fn empty(total_tasks: usize) -> Self {
+        Self::with_reconciliation(total_tasks, 0, 0, 0, 0)
+    }
+
+    pub(crate) const fn with_reconciliation(
+        total_tasks: usize,
+        retained: usize,
+        invalidated: usize,
+        not_applicable: usize,
+        reused: usize,
+    ) -> Self {
         Self {
+            semantics: None,
             total_tasks,
             complete_tasks: 0,
             partial_tasks: 0,
@@ -1240,7 +1505,31 @@ impl StandardTranslationRunReport {
             unresolved_locations: 0,
             protocol_diagnostics: 0,
             recoverable_request_exhaustions: 0,
+            retained,
+            invalidated,
+            not_applicable,
+            reused,
         }
+    }
+
+    pub(crate) fn with_semantics(
+        mut self,
+        semantics: Arc<super::semantics::ResolvedTranslationSemantics>,
+    ) -> Self {
+        self.semantics = Some(semantics);
+        self
+    }
+
+    pub(crate) fn resolved_semantics(
+        &self,
+    ) -> Option<&Arc<super::semantics::ResolvedTranslationSemantics>> {
+        self.semantics.as_ref()
+    }
+
+    fn log_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.semantics = None;
+        snapshot
     }
 
     pub(crate) fn record(&mut self, outcome: &TranslationTaskOutcome) {
@@ -1303,6 +1592,22 @@ impl StandardTranslationRunReport {
 
     pub(crate) const fn recoverable_request_exhaustions(&self) -> usize {
         self.recoverable_request_exhaustions
+    }
+
+    pub(crate) const fn retained(&self) -> usize {
+        self.retained
+    }
+
+    pub(crate) const fn invalidated(&self) -> usize {
+        self.invalidated
+    }
+
+    pub(crate) const fn not_applicable(&self) -> usize {
+        self.not_applicable
+    }
+
+    pub(crate) const fn reused(&self) -> usize {
+        self.reused
     }
 }
 
@@ -1453,7 +1758,7 @@ impl LoggedAcceptedTranslationDecision {
             propagation_targets: accepted
                 .propagation_targets()
                 .iter()
-                .map(|target| target.exact_location().clone())
+                .map(|target| target.identity().exact_location().clone())
                 .collect(),
         }
     }
@@ -1515,7 +1820,7 @@ pub(crate) trait StandardTranslationAssetReader: Send + Sync {
 
     fn read(
         &self,
-        project: &StoredProjectRecord,
+        project: &OpenedProject,
     ) -> impl Future<Output = Result<StandardTranslationCorpus, Self::Error>> + Send;
 }
 
@@ -1527,16 +1832,16 @@ pub(crate) trait StandardTranslationAssetReader: Send + Sync {
 ///
 /// Planner 必须先在最大仍有关联的 MZ 结构范围内组织复合 Group，再按外部 Profile
 /// 提供的容量切割；不得为了填满容量拼接无关范围。每个 TaskBlock 内待翻译单元的
-/// ID 从 0 连续递增，虚原文只保留原文且没有 ID。`--terms` 未提供时不得发起权威
-/// 对账；显式空术语表、译名变化和删除术语的差异语义由 Planner 写入 Preparation，
-/// 新增术语不让既有译文失效。
+/// ID 从 0 连续递增，虚原文只保留原文且没有 ID。省略外部资源时复用项目当前快照；
+/// 显式资源在全部解析成功后成为新快照。Planner 按每个叶子实际触发的术语和占位符
+/// 语义对账，并把资源更新、失效清理与可复用传播一并写入 Preparation。
 pub(crate) trait StandardTranslationTaskPlanner: Send + Sync {
     type Profile: StandardTranslationProfile;
     type Error: Error + Send + Sync + 'static;
 
     fn plan(
         &self,
-        project: &StoredProjectRecord,
+        project: &OpenedProject,
         profile: &Self::Profile,
         corpus: StandardTranslationCorpus,
         input: StandardTranslationInput,
@@ -1567,18 +1872,18 @@ pub(crate) trait StandardTranslationResultStore: Send + Sync {
 
     /// 在任何 LLM 请求前原子应用一次 Planner 建立的准备。
     ///
-    /// 对每个受影响叶子同时清除译文及旧术语依赖，并用预期原文阻止过时计划写入；
+    /// 对每个受影响叶子同时清除译文及旧语义状态，并用预期原文阻止过时计划写入；
     /// 未列出的译文保持不变。
     fn apply_preparation(
         &self,
-        project: &StoredProjectRecord,
+        project: &OpenedProject,
         preparation: TranslationPlanPreparation,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// 原子提交一个指定任务的全部验收译文。
     fn commit(
         &self,
-        project: &StoredProjectRecord,
+        project: &OpenedProject,
         result: ValidatedTranslationTaskResult,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
@@ -1597,7 +1902,7 @@ pub(crate) trait StandardTranslation: Send + Sync {
     /// 使用指定配置完成一次标准资产翻译。
     fn run(
         &self,
-        project: &StoredProjectRecord,
+        project: &OpenedProject,
         profile: &Self::Profile,
         input: StandardTranslationInput,
     ) -> impl Future<Output = Result<StandardTranslationRunReport, Self::Error>> + Send;
@@ -1646,7 +1951,7 @@ where
 
     async fn run(
         &self,
-        project: &StoredProjectRecord,
+        project: &OpenedProject,
         profile: &Self::Profile,
         input: StandardTranslationInput,
     ) -> Result<StandardTranslationRunReport, Self::Error> {
@@ -1669,8 +1974,15 @@ where
         self.cancellation
             .check()
             .map_err(StandardTranslationServiceError::Cancelled)?;
-        let (preparation, tasks) = plan.into_parts();
-        let mut report = StandardTranslationRunReport::empty(tasks.len());
+        let (semantics, preparation, tasks) = plan.into_parts();
+        let mut report = StandardTranslationRunReport::with_reconciliation(
+            tasks.len(),
+            preparation.retained(),
+            preparation.invalidated(),
+            preparation.not_applicable(),
+            preparation.reused(),
+        )
+        .with_semantics(semantics);
 
         self.result_store
             .apply_preparation(project, preparation)
@@ -1759,7 +2071,7 @@ where
             .map_err(StandardTranslationServiceError::Cancelled)?;
 
         self.event_log
-            .append(TranslationLogEvent::RunCompleted(report.clone()))
+            .append(TranslationLogEvent::RunCompleted(report.log_snapshot()))
             .await
             .map_err(StandardTranslationServiceError::RecordRunEvent)?;
 
@@ -1866,6 +2178,7 @@ mod tests {
 
     use super::*;
     use crate::att_mz::ProjectName;
+    use crate::att_mz::standard_asset::MzStandardAssetOwner;
     use crate::att_mz::text::{MzLocationStep, MzSource, StandardDataFile};
     use crate::language::{
         JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageText,
@@ -1890,7 +2203,9 @@ mod tests {
             vec![MzLocationStep::index(10)],
         );
         let name_identity = TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
+            "name",
             group_location.clone(),
             MzLocation::value(
                 MzSource::data(StandardDataFile::Items),
@@ -1899,7 +2214,9 @@ mod tests {
             "宝剑",
         );
         let description_identity = TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
+            "description",
             group_location.clone(),
             MzLocation::value(
                 MzSource::data(StandardDataFile::Items),
@@ -1953,7 +2270,8 @@ mod tests {
                 Vec::new(),
                 vec![placeholder],
                 test_language_analysis(),
-                vec![terminology],
+                test_state_context(1),
+                Vec::new(),
             )],
         );
 
@@ -2086,7 +2404,7 @@ mod tests {
 
         async fn read(
             &self,
-            _project: &StoredProjectRecord,
+            _project: &OpenedProject,
         ) -> Result<StandardTranslationCorpus, Self::Error> {
             record(&self.events, Event::Read);
             if self.failure {
@@ -2112,7 +2430,7 @@ mod tests {
 
         async fn plan(
             &self,
-            _project: &StoredProjectRecord,
+            _project: &OpenedProject,
             _profile: &Self::Profile,
             _corpus: StandardTranslationCorpus,
             input: StandardTranslationInput,
@@ -2126,7 +2444,7 @@ mod tests {
                 return Err(FakeError("plan"));
             }
 
-            let tasks = (0..self.task_count)
+            let tasks: Vec<TranslationTaskBlock> = (0..self.task_count)
                 .map(|index| {
                     let expected_outputs = vec![
                         expected_output(index, 0, true),
@@ -2146,6 +2464,7 @@ mod tests {
                 })
                 .collect();
             Ok(StandardTranslationPlan::new(
+                Arc::new(super::super::semantics::ResolvedTranslationSemantics::for_test()),
                 self.preparation.clone(),
                 tasks,
             ))
@@ -2217,7 +2536,7 @@ mod tests {
 
         async fn apply_preparation(
             &self,
-            _project: &StoredProjectRecord,
+            _project: &OpenedProject,
             preparation: TranslationPlanPreparation,
         ) -> Result<(), Self::Error> {
             record(&self.events, Event::Prepare);
@@ -2234,7 +2553,7 @@ mod tests {
 
         async fn commit(
             &self,
-            _project: &StoredProjectRecord,
+            _project: &OpenedProject,
             result: ValidatedTranslationTaskResult,
         ) -> Result<(), Self::Error> {
             let index = result.task_index().get();
@@ -2317,7 +2636,7 @@ mod tests {
             preparation_failure,
             execute_failure_at,
             commit_failure_at,
-            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            empty_preparation(),
         )
     }
 
@@ -2534,7 +2853,7 @@ mod tests {
             false,
             None,
             Some(1),
-            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            empty_preparation(),
             vec![
                 FakeOutcomeKind::Complete,
                 FakeOutcomeKind::Partial,
@@ -2624,9 +2943,14 @@ mod tests {
             vec![TranslationInvalidation::new(
                 translation_identity(),
                 "旧译文",
-                vec![TerminologyDependency::new("术语", "Term")],
+                Sha256Fingerprint::from_bytes([0x44; 32]),
             )],
             Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            0,
+            1,
+            0,
         );
         let harness = harness_with_preparation(
             0,
@@ -2665,7 +2989,7 @@ mod tests {
             false,
             None,
             None,
-            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            empty_preparation(),
             vec![
                 FakeOutcomeKind::Partial,
                 FakeOutcomeKind::Unavailable,
@@ -2739,7 +3063,7 @@ mod tests {
             false,
             None,
             None,
-            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            empty_preparation(),
             vec![FakeOutcomeKind::Complete; 3],
             Some(1),
             false,
@@ -2774,7 +3098,7 @@ mod tests {
             false,
             None,
             Some(1),
-            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            empty_preparation(),
             vec![FakeOutcomeKind::Complete, FakeOutcomeKind::Partial],
             Some(1),
             false,
@@ -2806,7 +3130,7 @@ mod tests {
             false,
             None,
             None,
-            TranslationPlanPreparation::new(Vec::new(), Vec::new()),
+            empty_preparation(),
             vec![FakeOutcomeKind::Complete],
             None,
             true,
@@ -2900,7 +3224,11 @@ mod tests {
             propagation_targets,
             Vec::new(),
             test_language_analysis(),
-            Vec::new(),
+            test_state_context((task_index * 10 + id) as u8),
+            with_propagation_target
+                .then(|| test_state_context((100 + task_index * 10 + id) as u8))
+                .into_iter()
+                .collect(),
         )
     }
 
@@ -2922,13 +3250,21 @@ mod tests {
         kind: FakeOutcomeKind,
     ) -> TranslationTaskOutcome {
         let patch = |output: &ExpectedTranslationOutput| {
+            let translation = format!("译文 {}", output.id());
+            let propagation_targets = output
+                .propagation_targets()
+                .iter()
+                .cloned()
+                .zip(output.propagation_state_contexts().iter().copied())
+                .map(|(identity, state)| TranslationPropagationTarget::new(identity, state))
+                .collect();
             AcceptedTranslationDecision::new(
                 output.id(),
                 TranslationPatch::new(
                     output.identity().clone(),
-                    output.propagation_targets().to_vec(),
-                    format!("译文 {}", output.id()),
-                    output.terminology_dependencies().to_vec(),
+                    propagation_targets,
+                    translation.clone(),
+                    output.state_context().finish(&translation),
                 ),
             )
         };
@@ -3014,7 +3350,9 @@ mod tests {
             vec![MzLocationStep::index(index)],
         );
         TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
+            field_name,
             group_location,
             MzLocation::value(
                 MzSource::data(StandardDataFile::Items),
@@ -3027,8 +3365,24 @@ mod tests {
         )
     }
 
-    fn project() -> StoredProjectRecord {
-        StoredProjectRecord::new(
+    fn test_state_context(byte: u8) -> TranslationStateContext {
+        TranslationStateContext::new(Sha256Fingerprint::from_bytes([byte; 32]))
+    }
+
+    fn empty_preparation() -> TranslationPlanPreparation {
+        TranslationPlanPreparation::new(
+            Vec::new(),
+            Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            0,
+            0,
+            0,
+        )
+    }
+
+    fn project() -> OpenedProject {
+        OpenedProject::new(
             project_name(),
             PathBuf::from("C:/Projects/alice"),
             PathBuf::from("C:/Projects/alice/project.db"),

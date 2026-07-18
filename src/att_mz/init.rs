@@ -5,13 +5,22 @@ use std::path::PathBuf;
 
 use super::ProjectName;
 use super::project::MzWriteBackLayoutProfile;
+use super::standard_asset::MzStandardAssetOwner;
 use crate::execution::{CooperativeCancellation, OperationCancelled};
-use crate::project_database::{NewProject, ProjectDatabaseCreator, ProjectWorkspaceLayout};
-use crate::storage::file_system::{
-    DirectoryDiscardError, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
-    DirectorySourceMapping, DirectoryStageRequest, DirectoryStageRequestError,
-    ExistingDirectoryResolver, RecoverableDirectoryPublisher, ResolveDirectoryError,
+use crate::project_database::{
+    NewProject, ProjectDatabaseCreator, ProjectDatabaseStateReconciler, ProjectWorkspaceLayout,
+    SourceSnapshotFingerprint,
 };
+use crate::storage::file_system::{
+    DIRECTORY_PUBLISH_LOCK_NAMESPACE, DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind,
+    DirectoryLister, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
+    DirectorySourceMapping, DirectoryStageRequest, DirectoryStageRequestError,
+    DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
+    DirectoryTreeRoot, ExistingDirectoryResolver, ListDirectoryError, ProjectOperationLeaseError,
+    ProjectOperationLeaseProvider, ProjectOperationLeaseRequest, ProjectOperationLeaseRequestError,
+    RecoverableDirectoryPublisher, ResolveDirectoryError, StagedDirectory,
+};
+use crate::storage::sqlite::{SnapshotDatabaseError, SqliteDatabaseSnapshotter};
 
 /// 初始化 MZ 游戏所需的输入。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,10 +32,27 @@ pub struct InitInput {
     pub layout_profile: MzWriteBackLayoutProfile,
 }
 
-/// 初始化成功后交还给 CLI 的最小结果。
+/// Init 更新后可能需要重新提取的标准资产 owner。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitStaleOwner {
+    Builtin,
+    Rules,
+    Lua,
+}
+
+/// 本次 Init 把项目工作区收敛到的终态。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InitOutcome {
+    Created,
+    Unchanged,
+    Updated { stale_owners: Vec<InitStaleOwner> },
+}
+
+/// 初始化成功后交还给 CLI 的项目与收敛结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitOutput {
     pub name: ProjectName,
+    pub outcome: InitOutcome,
 }
 
 /// 完成一个 MZ 游戏初始化用例。
@@ -39,94 +65,209 @@ pub trait InitUseCase: Send + Sync {
     ) -> impl Future<Output = Result<InitOutput, Self::Error>> + Send;
 }
 
-/// 创建完整冻结工作区所需的受信输入。
+/// 完成一次工作区状态收敛所需的全部受信事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NewProjectWorkspace {
+pub(crate) struct ProjectWorkspaceConvergenceRequest {
     source_game_root: PathBuf,
-    project: NewProject,
+    name: ProjectName,
+    source_language: String,
+    target_language: String,
+    layout_profile: MzWriteBackLayoutProfile,
 }
 
-impl NewProjectWorkspace {
-    pub(crate) fn new(source_game_root: PathBuf, project: NewProject) -> Self {
+impl ProjectWorkspaceConvergenceRequest {
+    pub(crate) fn new(
+        source_game_root: PathBuf,
+        name: ProjectName,
+        source_language: String,
+        target_language: String,
+        layout_profile: MzWriteBackLayoutProfile,
+    ) -> Self {
         Self {
             source_game_root,
-            project,
+            name,
+            source_language,
+            target_language,
+            layout_profile,
         }
     }
-
-    /// 返回仅用于本次导入的原游戏根目录。
-    #[cfg(test)]
-    pub(crate) fn source_game_root(&self) -> &std::path::Path {
-        &self.source_game_root
-    }
-
-    #[cfg(test)]
-    pub(crate) fn project(&self) -> &NewProject {
-        &self.project
-    }
-
-    /// 把导入来源与数据库 metadata 交给工作区创建服务。
-    pub(crate) fn into_parts(self) -> (PathBuf, NewProject) {
-        (self.source_game_root, self.project)
-    }
 }
 
-/// 整体创建并发布一个冻结项目工作区的职责契约。
-pub(crate) trait ProjectWorkspaceCreator: Send + Sync {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectWorkspaceConvergence {
+    Created,
+    Unchanged,
+    Updated {
+        stale_owners: Vec<MzStandardAssetOwner>,
+    },
+}
+
+/// 把项目工作区收敛到本次请求的唯一当前状态。
+pub(crate) trait ProjectWorkspaceConverger: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
-    /// 完整复制 `data`、`js`，建立数据库和写回目录，再共同发布工作区。
-    ///
-    /// 成功意味着 `<name>/project.db`、`source/{data,js}` 与
-    /// `write_back/{data,js}` 已经作为同一个可用工作区对外可见；失败不得暴露
-    /// 半成品。
-    fn create(
+    fn converge(
         &self,
-        project: NewProjectWorkspace,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        request: ProjectWorkspaceConvergenceRequest,
+    ) -> impl Future<Output = Result<ProjectWorkspaceConvergence, Self::Error>> + Send;
 }
 
-/// 把原游戏快照、项目数据库和空写回目录作为一个整体创建并发布。
-pub(crate) struct ProjectWorkspaceCreationService<D, A> {
+/// 项目工作区收敛服务；持有项目租约直到候选被发布或明确丢弃。
+pub(crate) struct ProjectWorkspaceConvergenceService<D, S, R, F, A> {
     projects_root: PathBuf,
-    database: D,
+    database_creator: D,
+    database_snapshotter: S,
+    database_reconciler: R,
+    file_system: F,
     directories: A,
     cancellation: CooperativeCancellation,
 }
 
-impl<D, A> ProjectWorkspaceCreationService<D, A> {
-    /// 使用外部配置建立的项目根目录与两个直接依赖创建服务。
+impl<D, S, R, F, A> ProjectWorkspaceConvergenceService<D, S, R, F, A> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "每项参数都是本职责的直接依赖或构造事实"
+    )]
     pub(crate) fn new(
         projects_root: PathBuf,
-        database: D,
+        database_creator: D,
+        database_snapshotter: S,
+        database_reconciler: R,
+        file_system: F,
         directories: A,
         cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             projects_root,
-            database,
+            database_creator,
+            database_snapshotter,
+            database_reconciler,
+            file_system,
             directories,
             cancellation,
         }
     }
 }
 
-impl<D, A> ProjectWorkspaceCreator for ProjectWorkspaceCreationService<D, A>
+impl<D, S, R, F, A> ProjectWorkspaceConverger for ProjectWorkspaceConvergenceService<D, S, R, F, A>
 where
     D: ProjectDatabaseCreator,
+    S: SqliteDatabaseSnapshotter,
+    R: ProjectDatabaseStateReconciler,
+    F: ExistingDirectoryResolver
+        + DirectoryLister<Error = <F as ExistingDirectoryResolver>::Error>
+        + DirectoryTreeFingerprinter
+        + ProjectOperationLeaseProvider,
     A: RecoverableDirectoryPublisher,
 {
-    type Error = ProjectWorkspaceCreationError<D::Error, A::Error>;
+    type Error = ProjectWorkspaceConvergenceError<
+        D::Error,
+        S::Error,
+        R::InspectionError,
+        R::ReconciliationError,
+        <F as ExistingDirectoryResolver>::Error,
+        <F as DirectoryTreeFingerprinter>::Error,
+        <F as ProjectOperationLeaseProvider>::Error,
+        A::Error,
+    >;
 
-    async fn create(&self, workspace: NewProjectWorkspace) -> Result<(), Self::Error> {
+    async fn converge(
+        &self,
+        request: ProjectWorkspaceConvergenceRequest,
+    ) -> Result<ProjectWorkspaceConvergence, Self::Error> {
         self.cancellation
             .check()
-            .map_err(ProjectWorkspaceCreationError::Cancelled)?;
-        let (source_game_root, project) = workspace.into_parts();
-        let final_layout = ProjectWorkspaceLayout::for_project(&self.projects_root, project.name());
-        let request = DirectoryStageRequest::new(
+            .map_err(ProjectWorkspaceConvergenceError::CancelledBeforeCandidate)?;
+        let lease_request = ProjectOperationLeaseRequest::new(
+            self.projects_root.clone(),
+            request.name.as_str().into(),
+        )
+        .map_err(ProjectWorkspaceConvergenceError::InvalidLeaseRequest)?;
+        let _lease = self
+            .file_system
+            .acquire_project_operation_lease(lease_request)
+            .await
+            .map_err(ProjectWorkspaceConvergenceError::Lease)?;
+        let source_game_root = self
+            .file_system
+            .resolve_existing_directory(request.source_game_root)
+            .await
+            .map_err(ProjectWorkspaceConvergenceError::SourceGameRoot)?;
+
+        let final_layout = ProjectWorkspaceLayout::for_project(&self.projects_root, &request.name);
+        let target_exists = match self
+            .file_system
+            .resolve_existing_directory(final_layout.workspace_root().to_path_buf())
+            .await
+        {
+            Ok(_) => true,
+            Err(ResolveDirectoryError::NotFound { .. }) => false,
+            Err(error) => return Err(ProjectWorkspaceConvergenceError::WorkspaceRoot(error)),
+        };
+
+        let (current_state, workspace_complete) = if target_exists {
+            let state = self
+                .database_reconciler
+                .inspect(
+                    final_layout.database_path().to_path_buf(),
+                    request.name.clone(),
+                )
+                .await
+                .map_err(ProjectWorkspaceConvergenceError::InspectExistingDatabase)?;
+            let structure_matches =
+                observe_required_workspace_structure(&self.file_system, &final_layout)
+                    .await
+                    .map_err(ProjectWorkspaceConvergenceError::ObserveWorkspaceStructure)?;
+            let source_matches = if structure_matches {
+                match fingerprint_source(&self.file_system, &final_layout, true)
+                    .await
+                    .map_err(ProjectWorkspaceConvergenceError::ObserveExistingSource)?
+                {
+                    Some(actual) => actual == state.source_snapshot_fingerprint(),
+                    None => false,
+                }
+            } else {
+                false
+            };
+            let output_data = if structure_matches {
+                optional_directory_exists(
+                    &self.file_system,
+                    final_layout.write_back_data().to_path_buf(),
+                )
+                .await
+                .map_err(ProjectWorkspaceConvergenceError::ObserveWorkspaceDirectory)?
+            } else {
+                false
+            };
+            let output_js = if structure_matches {
+                optional_directory_exists(
+                    &self.file_system,
+                    final_layout.write_back_js().to_path_buf(),
+                )
+                .await
+                .map_err(ProjectWorkspaceConvergenceError::ObserveWorkspaceDirectory)?
+            } else {
+                false
+            };
+            (
+                Some(state),
+                structure_matches && source_matches && output_data && output_js,
+            )
+        } else {
+            (None, false)
+        };
+
+        self.cancellation
+            .check()
+            .map_err(ProjectWorkspaceConvergenceError::CancelledBeforeCandidate)?;
+        let publish_intent = if target_exists {
+            DirectoryPublishIntent::ReplaceExisting
+        } else {
+            DirectoryPublishIntent::CreateNew
+        };
+        let stage_request = DirectoryStageRequest::new(
             final_layout.workspace_root().to_path_buf(),
-            DirectoryPublishIntent::CreateNew,
+            publish_intent,
             vec![
                 DirectorySourceMapping::new(
                     source_game_root.join("data"),
@@ -143,152 +284,450 @@ where
                 PathBuf::from("write_back/js"),
             ],
         )?;
-
         let staged = self
             .directories
-            .prepare(request)
+            .prepare(stage_request)
             .await
-            .map_err(ProjectWorkspaceCreationError::Prepare)?;
-        if let Err(cancellation) = self.cancellation.check() {
-            return match self.directories.discard(staged).await {
-                Ok(()) => Err(ProjectWorkspaceCreationError::Cancelled(cancellation)),
-                Err(discard) => Err(ProjectWorkspaceCreationError::CancelledAndDiscard {
-                    cancellation,
-                    discard,
-                }),
-            };
-        }
+            .map_err(ProjectWorkspaceConvergenceError::Prepare)?;
         let staged_layout =
             ProjectWorkspaceLayout::from_workspace_root(staged.staging_root().to_path_buf());
 
-        if let Err(database) = self
-            .database
-            .create(staged_layout.database_path().to_path_buf(), project)
-            .await
-        {
-            return match self.directories.discard(staged).await {
-                Ok(()) => Err(ProjectWorkspaceCreationError::Database(database)),
-                Err(discard) => {
-                    Err(ProjectWorkspaceCreationError::DatabaseAndDiscard { database, discard })
+        if let Err(cancellation) = self.cancellation.check() {
+            return Err(discard_candidate_failure(
+                &self.directories,
+                staged,
+                ProjectWorkspaceCandidateFailure::Cancelled(cancellation),
+            )
+            .await);
+        }
+        let candidate_fingerprint =
+            match fingerprint_source(&self.file_system, &staged_layout, false).await {
+                Ok(Some(fingerprint)) => fingerprint,
+                Ok(None) => unreachable!("候选来源缺失必须由指纹根返回错误"),
+                Err(source) => {
+                    return Err(discard_candidate_failure(
+                        &self.directories,
+                        staged,
+                        ProjectWorkspaceCandidateFailure::FingerprintCandidate(source),
+                    )
+                    .await);
                 }
             };
+        let requested_project = NewProject::new(
+            request.name,
+            request.source_language,
+            request.target_language,
+            candidate_fingerprint,
+            request.layout_profile,
+        );
+
+        if target_exists {
+            if let Err(source) = self
+                .database_snapshotter
+                .snapshot_database(
+                    final_layout.database_path().to_path_buf(),
+                    staged_layout.database_path().to_path_buf(),
+                )
+                .await
+            {
+                return Err(discard_candidate_failure(
+                    &self.directories,
+                    staged,
+                    ProjectWorkspaceCandidateFailure::SnapshotDatabase(source),
+                )
+                .await);
+            }
+        } else if let Err(source) = self
+            .database_creator
+            .create(
+                staged_layout.database_path().to_path_buf(),
+                requested_project.clone(),
+            )
+            .await
+        {
+            return Err(discard_candidate_failure(
+                &self.directories,
+                staged,
+                ProjectWorkspaceCandidateFailure::CreateDatabase(source),
+            )
+            .await);
         }
 
+        let reconciliation = match self
+            .database_reconciler
+            .reconcile(
+                staged_layout.database_path().to_path_buf(),
+                requested_project,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(source) => {
+                return Err(discard_candidate_failure(
+                    &self.directories,
+                    staged,
+                    ProjectWorkspaceCandidateFailure::ReconcileDatabase(source),
+                )
+                .await);
+            }
+        };
+
         if let Err(cancellation) = self.cancellation.check() {
-            return match self.directories.discard(staged).await {
-                Ok(()) => Err(ProjectWorkspaceCreationError::Cancelled(cancellation)),
-                Err(discard) => Err(ProjectWorkspaceCreationError::CancelledAndDiscard {
-                    cancellation,
-                    discard,
-                }),
-            };
+            return Err(discard_candidate_failure(
+                &self.directories,
+                staged,
+                ProjectWorkspaceCandidateFailure::Cancelled(cancellation),
+            )
+            .await);
+        }
+        if target_exists && workspace_complete && !reconciliation.changed() {
+            self.directories
+                .discard(staged)
+                .await
+                .map_err(ProjectWorkspaceConvergenceError::DiscardUnchanged)?;
+            return Ok(ProjectWorkspaceConvergence::Unchanged);
         }
 
         self.directories
             .publish(staged)
             .await
-            .map_err(ProjectWorkspaceCreationError::Publish)
+            .map_err(ProjectWorkspaceConvergenceError::Publish)?;
+        if current_state.is_some() {
+            Ok(ProjectWorkspaceConvergence::Updated {
+                stale_owners: reconciliation.stale_owners(),
+            })
+        } else {
+            Ok(ProjectWorkspaceConvergence::Created)
+        }
     }
 }
 
-/// 创建完整工作区时可以精确定位的失败阶段。
+async fn observe_required_workspace_structure<F>(
+    file_system: &F,
+    layout: &ProjectWorkspaceLayout,
+) -> Result<bool, ListDirectoryError<F::Error>>
+where
+    F: DirectoryLister,
+{
+    let mut has_publish_lock_namespace = false;
+    for (root, expected_children) in [
+        (
+            layout.workspace_root(),
+            &[
+                ("project.db", DirectoryEntryKind::RegularFile),
+                ("source", DirectoryEntryKind::Directory),
+                ("write_back", DirectoryEntryKind::Directory),
+            ][..],
+        ),
+        (
+            layout.source_root(),
+            &[
+                ("data", DirectoryEntryKind::Directory),
+                ("js", DirectoryEntryKind::Directory),
+            ][..],
+        ),
+        (
+            layout.write_back_root(),
+            &[
+                ("data", DirectoryEntryKind::Directory),
+                ("js", DirectoryEntryKind::Directory),
+            ][..],
+        ),
+    ] {
+        let children = match file_system.list_directory(root.to_path_buf()).await {
+            Ok(children) => children,
+            Err(ListDirectoryError::NotFound { .. } | ListDirectoryError::NotDirectory { .. }) => {
+                return Ok(false);
+            }
+            Err(error @ ListDirectoryError::Io { .. }) => return Err(error),
+        };
+        let matches = if root == layout.workspace_root() {
+            has_required_and_optional_child_names(
+                &children,
+                expected_children,
+                &[
+                    ("project.db-journal", DirectoryEntryKind::RegularFile),
+                    ("project.db-wal", DirectoryEntryKind::RegularFile),
+                    ("project.db-shm", DirectoryEntryKind::RegularFile),
+                    (
+                        DIRECTORY_PUBLISH_LOCK_NAMESPACE,
+                        DirectoryEntryKind::Directory,
+                    ),
+                ],
+            )
+        } else {
+            has_exact_child_names(&children, expected_children)
+        };
+        if !matches {
+            return Ok(false);
+        }
+        if root == layout.workspace_root() {
+            has_publish_lock_namespace = count_child(
+                &children,
+                (
+                    DIRECTORY_PUBLISH_LOCK_NAMESPACE,
+                    DirectoryEntryKind::Directory,
+                ),
+            ) == 1;
+        }
+    }
+    if has_publish_lock_namespace {
+        let lock_namespace = layout
+            .workspace_root()
+            .join(DIRECTORY_PUBLISH_LOCK_NAMESPACE);
+        let children = match file_system.list_directory(lock_namespace).await {
+            Ok(children) => children,
+            Err(ListDirectoryError::NotFound { .. } | ListDirectoryError::NotDirectory { .. }) => {
+                return Ok(false);
+            }
+            Err(error @ ListDirectoryError::Io { .. }) => return Err(error),
+        };
+        if !has_exact_child_names(
+            &children,
+            &[("write_back", DirectoryEntryKind::RegularFile)],
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn has_exact_child_names(
+    children: &[DirectoryEntry],
+    expected: &[(&str, DirectoryEntryKind)],
+) -> bool {
+    has_required_and_optional_child_names(children, expected, &[])
+}
+
+fn has_required_and_optional_child_names(
+    children: &[DirectoryEntry],
+    required: &[(&str, DirectoryEntryKind)],
+    optional: &[(&str, DirectoryEntryKind)],
+) -> bool {
+    children.iter().all(|child| {
+        child.resolved_path().file_name().is_some_and(|name| {
+            required
+                .iter()
+                .chain(optional)
+                .any(|(expected_name, expected_kind)| {
+                    name == *expected_name && child.kind() == *expected_kind
+                })
+        })
+    }) && required
+        .iter()
+        .all(|expected| count_child(children, *expected) == 1)
+        && optional
+            .iter()
+            .all(|expected| count_child(children, *expected) <= 1)
+}
+
+fn count_child(children: &[DirectoryEntry], expected: (&str, DirectoryEntryKind)) -> usize {
+    children
+        .iter()
+        .filter(|child| {
+            child
+                .resolved_path()
+                .file_name()
+                .is_some_and(|name| name == expected.0)
+                && child.kind() == expected.1
+        })
+        .count()
+}
+
+async fn optional_directory_exists<F>(
+    file_system: &F,
+    path: PathBuf,
+) -> Result<bool, ResolveDirectoryError<F::Error>>
+where
+    F: ExistingDirectoryResolver,
+{
+    match file_system.resolve_existing_directory(path).await {
+        Ok(_) => Ok(true),
+        Err(
+            ResolveDirectoryError::NotFound { .. } | ResolveDirectoryError::NotDirectory { .. },
+        ) => Ok(false),
+        Err(error @ ResolveDirectoryError::Io { .. }) => Err(error),
+    }
+}
+
+async fn fingerprint_source<F>(
+    file_system: &F,
+    layout: &ProjectWorkspaceLayout,
+    absence_is_repairable: bool,
+) -> Result<Option<SourceSnapshotFingerprint>, DirectoryTreeFingerprintError<F::Error>>
+where
+    F: DirectoryTreeFingerprinter,
+{
+    let request = DirectoryTreeFingerprintRequest::new(vec![
+        DirectoryTreeRoot::new(layout.source_data().to_path_buf(), PathBuf::from("data"))
+            .expect("固定 data 逻辑根必须合法"),
+        DirectoryTreeRoot::new(layout.source_js().to_path_buf(), PathBuf::from("js"))
+            .expect("固定 js 逻辑根必须合法"),
+    ])
+    .expect("固定 data 与 js 逻辑根必须互不重叠");
+    match file_system.fingerprint_directory_tree(request).await {
+        Ok(value) => Ok(Some(SourceSnapshotFingerprint::from_bytes(
+            value.into_bytes(),
+        ))),
+        Err(
+            DirectoryTreeFingerprintError::NotFound { .. }
+            | DirectoryTreeFingerprintError::NotDirectory { .. },
+        ) if absence_is_repairable => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn discard_candidate_failure<A, D, S, I, R, E, P, L>(
+    directories: &A,
+    staged: StagedDirectory<A::StagingState>,
+    failure: ProjectWorkspaceCandidateFailure<D, S, R, P>,
+) -> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A::Error>
+where
+    A: RecoverableDirectoryPublisher,
+{
+    let discard = directories.discard(staged).await.err();
+    ProjectWorkspaceConvergenceError::CandidateFailure { failure, discard }
+}
+
 #[derive(Debug)]
-pub(crate) enum ProjectWorkspaceCreationError<D, A> {
+pub(crate) enum ProjectWorkspaceCandidateFailure<D, S, R, P> {
     Cancelled(OperationCancelled),
-    CancelledAndDiscard {
-        cancellation: OperationCancelled,
-        discard: DirectoryDiscardError<A>,
-    },
+    FingerprintCandidate(DirectoryTreeFingerprintError<P>),
+    CreateDatabase(D),
+    SnapshotDatabase(SnapshotDatabaseError<S>),
+    ReconcileDatabase(R),
+}
+
+#[derive(Debug)]
+pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A> {
+    CancelledBeforeCandidate(OperationCancelled),
+    InvalidLeaseRequest(ProjectOperationLeaseRequestError),
+    Lease(ProjectOperationLeaseError<L>),
+    SourceGameRoot(ResolveDirectoryError<E>),
+    WorkspaceRoot(ResolveDirectoryError<E>),
+    InspectExistingDatabase(I),
+    ObserveWorkspaceStructure(ListDirectoryError<E>),
+    ObserveExistingSource(DirectoryTreeFingerprintError<P>),
+    ObserveWorkspaceDirectory(ResolveDirectoryError<E>),
     InvalidStageRequest(DirectoryStageRequestError),
     Prepare(DirectoryPrepareError<A>),
-    Database(D),
-    DatabaseAndDiscard {
-        database: D,
-        discard: DirectoryDiscardError<A>,
+    CandidateFailure {
+        failure: ProjectWorkspaceCandidateFailure<D, S, R, P>,
+        discard: Option<DirectoryDiscardError<A>>,
     },
+    DiscardUnchanged(DirectoryDiscardError<A>),
     Publish(DirectoryPublishError<A>),
 }
 
-impl<D, A> From<DirectoryStageRequestError> for ProjectWorkspaceCreationError<D, A> {
+impl<D, S, I, R, E, P, L, A> From<DirectoryStageRequestError>
+    for ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A>
+{
     fn from(error: DirectoryStageRequestError) -> Self {
         Self::InvalidStageRequest(error)
     }
 }
 
-impl<D, A> fmt::Display for ProjectWorkspaceCreationError<D, A>
+impl<D, S, I, R, E, P, L, A> fmt::Display
+    for ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A>
 where
     D: fmt::Display,
+    S: fmt::Display,
+    I: fmt::Display,
+    R: fmt::Display,
+    E: fmt::Display,
+    P: fmt::Display,
+    L: fmt::Display,
     A: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled(error) => error.fmt(formatter),
-            Self::CancelledAndDiscard {
-                cancellation,
-                discard,
-            } => write!(
-                formatter,
-                "{cancellation}，且无法清理工作区候选目录：{discard}"
-            ),
-            Self::InvalidStageRequest(error) => {
-                write!(formatter, "工作区暂存请求无效：{error}")
+            Self::CancelledBeforeCandidate(error) => error.fmt(formatter),
+            Self::InvalidLeaseRequest(error) => write!(formatter, "项目租约请求无效：{error}"),
+            Self::Lease(error) => error.fmt(formatter),
+            Self::SourceGameRoot(error) => write!(formatter, "无法使用游戏根目录：{error}"),
+            Self::WorkspaceRoot(error) => write!(formatter, "项目工作区根无效：{error}"),
+            Self::InspectExistingDatabase(error) => {
+                write!(formatter, "现存项目数据库无效：{error}")
             }
-            Self::Prepare(error) => write!(formatter, "无法准备工作区候选目录：{error}"),
-            Self::Database(error) => write!(formatter, "无法创建项目数据库：{error}"),
-            Self::DatabaseAndDiscard { database, discard } => write!(
-                formatter,
-                "无法创建项目数据库，且无法清理工作区候选目录：{database}；{discard}"
-            ),
+            Self::ObserveWorkspaceStructure(error) => {
+                write!(formatter, "无法检查现存工作区结构：{error}")
+            }
+            Self::ObserveExistingSource(error) => {
+                write!(formatter, "无法检查现存冻结来源：{error}")
+            }
+            Self::ObserveWorkspaceDirectory(error) => {
+                write!(formatter, "无法检查现存工作区结构：{error}")
+            }
+            Self::InvalidStageRequest(error) => write!(formatter, "工作区候选请求无效：{error}"),
+            Self::Prepare(error) => write!(formatter, "无法准备工作区候选：{error}"),
+            Self::CandidateFailure { failure, discard } => {
+                write!(formatter, "工作区候选处理失败：{failure}")?;
+                if let Some(discard) = discard {
+                    write!(formatter, "；且候选清理失败：{discard}")?;
+                }
+                Ok(())
+            }
+            Self::DiscardUnchanged(error) => {
+                write!(formatter, "工作区事实未变化，但无法丢弃候选：{error}")
+            }
             Self::Publish(error) => write!(formatter, "无法发布完整工作区：{error}"),
         }
     }
 }
 
-impl<D, A> Error for ProjectWorkspaceCreationError<D, A>
+impl<D, S, R, P> fmt::Display for ProjectWorkspaceCandidateFailure<D, S, R, P>
 where
-    D: Error + 'static,
-    A: Error + 'static,
+    D: fmt::Display,
+    S: fmt::Display,
+    R: fmt::Display,
+    P: fmt::Display,
 {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled(error) => Some(error),
-            Self::CancelledAndDiscard { discard, .. } => Some(discard),
-            Self::InvalidStageRequest(error) => Some(error),
-            Self::Prepare(error) => Some(error),
-            Self::Database(error) => Some(error),
-            Self::DatabaseAndDiscard { database, .. } => Some(database),
-            Self::Publish(error) => Some(error),
+            Self::Cancelled(error) => error.fmt(formatter),
+            Self::FingerprintCandidate(error) => {
+                write!(formatter, "无法建立候选来源指纹：{error}")
+            }
+            Self::CreateDatabase(error) => write!(formatter, "无法创建候选数据库：{error}"),
+            Self::SnapshotDatabase(error) => write!(formatter, "无法复制现存数据库：{error}"),
+            Self::ReconcileDatabase(error) => write!(formatter, "无法对账候选数据库：{error}"),
         }
     }
 }
 
-/// 只负责初始化用例编排，不了解目录解析与数据库创建的内部机制。
-pub(crate) struct InitService<F, W> {
-    file_system: F,
-    workspace_creator: W,
+impl<D, S, I, R, E, P, L, A> Error for ProjectWorkspaceConvergenceError<D, S, I, R, E, P, L, A>
+where
+    D: Error + 'static,
+    S: Error + 'static,
+    I: Error + 'static,
+    R: Error + 'static,
+    E: Error + 'static,
+    P: Error + 'static,
+    L: Error + 'static,
+    A: Error + 'static,
+{
+}
+
+/// 只负责验证初始化意图并交给工作区收敛边界。
+pub(crate) struct InitService<W> {
+    workspace_converger: W,
     cancellation: CooperativeCancellation,
 }
 
-impl<F, W> InitService<F, W> {
-    pub(crate) fn new(
-        file_system: F,
-        workspace_creator: W,
-        cancellation: CooperativeCancellation,
-    ) -> Self {
+impl<W> InitService<W> {
+    pub(crate) fn new(workspace_converger: W, cancellation: CooperativeCancellation) -> Self {
         Self {
-            file_system,
-            workspace_creator,
+            workspace_converger,
             cancellation,
         }
     }
 }
 
-impl<F, W> InitUseCase for InitService<F, W>
+impl<W> InitUseCase for InitService<W>
 where
-    F: ExistingDirectoryResolver,
-    W: ProjectWorkspaceCreator,
+    W: ProjectWorkspaceConverger,
 {
-    type Error = InitServiceError<F::Error, W::Error>;
+    type Error = InitServiceError<W::Error>;
 
     async fn execute(&self, input: InitInput) -> Result<InitOutput, Self::Error> {
         self.cancellation
@@ -299,35 +738,47 @@ where
         let target_language =
             normalized_language(input.target_language, InitServiceError::EmptyTargetLanguage)?;
 
-        let source_game_root = self
-            .file_system
-            .resolve_existing_directory(input.game_root)
-            .await
-            .map_err(InitServiceError::GameRoot)?;
-        self.cancellation
-            .check()
-            .map_err(InitServiceError::Cancelled)?;
-
         let output_name = input.name.clone();
-        let project = NewProject::new(
-            input.name,
-            source_language,
-            target_language,
-            input.layout_profile,
-        );
-        self.workspace_creator
-            .create(NewProjectWorkspace::new(source_game_root, project))
+        let outcome = self
+            .workspace_converger
+            .converge(ProjectWorkspaceConvergenceRequest::new(
+                input.game_root,
+                input.name,
+                source_language,
+                target_language,
+                input.layout_profile,
+            ))
             .await
             .map_err(InitServiceError::Workspace)?;
+        let outcome = match outcome {
+            ProjectWorkspaceConvergence::Created => InitOutcome::Created,
+            ProjectWorkspaceConvergence::Unchanged => InitOutcome::Unchanged,
+            ProjectWorkspaceConvergence::Updated { stale_owners } => InitOutcome::Updated {
+                stale_owners: stale_owners.into_iter().map(InitStaleOwner::from).collect(),
+            },
+        };
 
-        Ok(InitOutput { name: output_name })
+        Ok(InitOutput {
+            name: output_name,
+            outcome,
+        })
     }
 }
 
-fn normalized_language<F, W>(
+impl From<MzStandardAssetOwner> for InitStaleOwner {
+    fn from(owner: MzStandardAssetOwner) -> Self {
+        match owner {
+            MzStandardAssetOwner::Builtin => Self::Builtin,
+            MzStandardAssetOwner::Rules => Self::Rules,
+            MzStandardAssetOwner::Lua => Self::Lua,
+        }
+    }
+}
+
+fn normalized_language<W>(
     value: String,
-    empty_error: InitServiceError<F, W>,
-) -> Result<String, InitServiceError<F, W>> {
+    empty_error: InitServiceError<W>,
+) -> Result<String, InitServiceError<W>> {
     let normalized = value.trim();
     if normalized.is_empty() {
         Err(empty_error)
@@ -338,17 +789,15 @@ fn normalized_language<F, W>(
 
 /// 初始化编排在本职责边界内能够产生的错误。
 #[derive(Debug)]
-pub(crate) enum InitServiceError<F, W> {
+pub(crate) enum InitServiceError<W> {
     Cancelled(OperationCancelled),
     EmptySourceLanguage,
     EmptyTargetLanguage,
-    GameRoot(ResolveDirectoryError<F>),
     Workspace(W),
 }
 
-impl<F, W> fmt::Display for InitServiceError<F, W>
+impl<W> fmt::Display for InitServiceError<W>
 where
-    F: Error,
     W: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -356,21 +805,18 @@ where
             Self::Cancelled(error) => error.fmt(formatter),
             Self::EmptySourceLanguage => formatter.write_str("源语言去除首尾空白后不能为空"),
             Self::EmptyTargetLanguage => formatter.write_str("目标语言去除首尾空白后不能为空"),
-            Self::GameRoot(error) => write!(formatter, "无法使用游戏根目录：{error}"),
-            Self::Workspace(error) => write!(formatter, "无法创建冻结项目工作区：{error}"),
+            Self::Workspace(error) => write!(formatter, "无法收敛项目工作区：{error}"),
         }
     }
 }
 
-impl<F, W> Error for InitServiceError<F, W>
+impl<W> Error for InitServiceError<W>
 where
-    F: Error + 'static,
     W: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Cancelled(error) => Some(error),
-            Self::GameRoot(error) => Some(error),
             Self::Workspace(error) => Some(error),
             Self::EmptySourceLanguage | Self::EmptyTargetLanguage => None,
         }
@@ -379,1385 +825,1175 @@ where
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(unix, windows))]
-    use std::ffi::OsString;
+    use std::collections::VecDeque;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     use super::*;
 
-    #[derive(Clone, Debug)]
-    enum FileSystemOutcome {
-        Resolved(PathBuf),
-        NotFound,
-        NotDirectory,
+    type SnapshotDatabaseResponses = VecDeque<Result<(), SnapshotDatabaseError<FakeError>>>;
+    use crate::fingerprint::Sha256Fingerprint;
+    use crate::project_database::{
+        CreatedProject, ProjectDatabaseReconciliation, ProjectDatabaseState,
+    };
+    use crate::storage::file_system::ProjectOperationLease;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FakeError(&'static str);
+
+    impl fmt::Display for FakeError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl Error for FakeError {}
+
+    #[derive(Clone, Default)]
+    struct Observations {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        stage_requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
+        created_projects: Arc<Mutex<Vec<(PathBuf, NewProject)>>>,
+        snapshots: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
+        reconciled_projects: Arc<Mutex<Vec<(PathBuf, NewProject)>>>,
+    }
+
+    impl Observations {
+        fn event(&self, event: &'static str) {
+            self.events
+                .lock()
+                .expect("events mutex should not be poisoned")
+                .push(event);
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events
+                .lock()
+                .expect("events mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    struct LeaseState(Observations);
+
+    impl Drop for LeaseState {
+        fn drop(&mut self) {
+            self.0.event("lease_drop");
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExistingSourceObservation {
+        Fingerprint([u8; 32]),
+        Missing,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum WorkspaceStructureObservation {
+        Complete,
+        SqliteSidecars,
+        SqliteSidecarNotFile,
+        DirectoryPublishLock,
+        DirectoryPublishLockNamespaceNotDirectory,
+        DirectoryPublishLockFileNotRegular,
+        DirectoryPublishLockMissingFile,
+        DirectoryPublishLockExtraEntry,
+        DatabaseNotFile,
+        SourceNotDirectory,
+        SourceDataNotDirectory,
+        WriteBackDataNotDirectory,
+        ExtraWorkspaceEntry,
+        ExtraSourceEntry,
+        ExtraWriteBackEntry,
+        MissingSourceEntry,
+        WriteBackNotDirectory,
         Io,
     }
 
     #[derive(Clone)]
-    struct FakeFileSystem {
-        outcome: FileSystemOutcome,
-        calls: Arc<Mutex<Vec<PathBuf>>>,
+    struct FakeWorkspaceFileSystem {
+        observations: Observations,
+        target_exists: bool,
+        workspace_structure: WorkspaceStructureObservation,
+        existing_source: ExistingSourceObservation,
+        candidate_fingerprint: [u8; 32],
     }
 
-    impl FakeFileSystem {
-        fn new(outcome: FileSystemOutcome) -> Self {
-            Self {
-                outcome,
-                calls: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-    }
-
-    impl ExistingDirectoryResolver for FakeFileSystem {
-        type Error = FakeFileSystemError;
+    impl ExistingDirectoryResolver for FakeWorkspaceFileSystem {
+        type Error = FakeError;
 
         async fn resolve_existing_directory(
             &self,
             path: PathBuf,
         ) -> Result<PathBuf, ResolveDirectoryError<Self::Error>> {
-            self.calls
-                .lock()
-                .expect("文件系统调用记录锁不应中毒")
-                .push(path.clone());
-
-            match &self.outcome {
-                FileSystemOutcome::Resolved(resolved) => Ok(resolved.clone()),
-                FileSystemOutcome::NotFound => Err(ResolveDirectoryError::NotFound { path }),
-                FileSystemOutcome::NotDirectory => {
-                    Err(ResolveDirectoryError::NotDirectory { path })
+            if path == Path::new("C:/games/source") {
+                self.observations.event("game_root");
+                return Ok(path);
+            }
+            if path == Path::new("C:/projects/game") {
+                self.observations.event("workspace_root");
+                if self.target_exists {
+                    return Ok(path);
                 }
-                FileSystemOutcome::Io => Err(ResolveDirectoryError::Io {
+                return Err(ResolveDirectoryError::NotFound { path });
+            }
+            if path.ends_with("write_back/data") {
+                self.observations.event("output_data");
+                return Ok(path);
+            }
+            if path.ends_with("write_back/js") {
+                self.observations.event("output_js");
+                return Ok(path);
+            }
+            Ok(path)
+        }
+    }
+
+    impl DirectoryLister for FakeWorkspaceFileSystem {
+        type Error = FakeError;
+
+        async fn list_directory(
+            &self,
+            path: PathBuf,
+        ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<Self::Error>> {
+            if matches!(self.workspace_structure, WorkspaceStructureObservation::Io) {
+                return Err(ListDirectoryError::Io {
                     path,
-                    source: FakeFileSystemError,
-                }),
+                    source: FakeError("list workspace"),
+                });
+            }
+            if path == Path::new("C:/projects/game") {
+                self.observations.event("list_workspace");
+                let mut children = vec![
+                    DirectoryEntry::new(
+                        path.join("project.db"),
+                        if matches!(
+                            self.workspace_structure,
+                            WorkspaceStructureObservation::DatabaseNotFile
+                        ) {
+                            DirectoryEntryKind::Directory
+                        } else {
+                            DirectoryEntryKind::RegularFile
+                        },
+                    ),
+                    DirectoryEntry::new(
+                        path.join("source"),
+                        if matches!(
+                            self.workspace_structure,
+                            WorkspaceStructureObservation::SourceNotDirectory
+                        ) {
+                            DirectoryEntryKind::RegularFile
+                        } else {
+                            DirectoryEntryKind::Directory
+                        },
+                    ),
+                    DirectoryEntry::new(path.join("write_back"), DirectoryEntryKind::Directory),
+                ];
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::ExtraWorkspaceEntry
+                ) {
+                    children.push(DirectoryEntry::new(
+                        path.join("unexpected"),
+                        DirectoryEntryKind::RegularFile,
+                    ));
+                }
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::SqliteSidecars
+                        | WorkspaceStructureObservation::SqliteSidecarNotFile
+                ) {
+                    children.extend([
+                        DirectoryEntry::new(
+                            path.join("project.db-journal"),
+                            if matches!(
+                                self.workspace_structure,
+                                WorkspaceStructureObservation::SqliteSidecarNotFile
+                            ) {
+                                DirectoryEntryKind::Directory
+                            } else {
+                                DirectoryEntryKind::RegularFile
+                            },
+                        ),
+                        DirectoryEntry::new(
+                            path.join("project.db-wal"),
+                            DirectoryEntryKind::RegularFile,
+                        ),
+                        DirectoryEntry::new(
+                            path.join("project.db-shm"),
+                            DirectoryEntryKind::RegularFile,
+                        ),
+                    ]);
+                }
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::DirectoryPublishLock
+                        | WorkspaceStructureObservation::DirectoryPublishLockNamespaceNotDirectory
+                        | WorkspaceStructureObservation::DirectoryPublishLockFileNotRegular
+                        | WorkspaceStructureObservation::DirectoryPublishLockMissingFile
+                        | WorkspaceStructureObservation::DirectoryPublishLockExtraEntry
+                ) {
+                    children.push(DirectoryEntry::new(
+                        path.join(DIRECTORY_PUBLISH_LOCK_NAMESPACE),
+                        if matches!(
+                            self.workspace_structure,
+                            WorkspaceStructureObservation::DirectoryPublishLockNamespaceNotDirectory
+                        ) {
+                            DirectoryEntryKind::RegularFile
+                        } else {
+                            DirectoryEntryKind::Directory
+                        },
+                    ));
+                }
+                return Ok(children);
+            }
+            if path == Path::new("C:/projects/game/source") {
+                self.observations.event("list_source");
+                let mut children = vec![
+                    DirectoryEntry::new(
+                        path.join("data"),
+                        if matches!(
+                            self.workspace_structure,
+                            WorkspaceStructureObservation::SourceDataNotDirectory
+                        ) {
+                            DirectoryEntryKind::RegularFile
+                        } else {
+                            DirectoryEntryKind::Directory
+                        },
+                    ),
+                    DirectoryEntry::new(path.join("js"), DirectoryEntryKind::Directory),
+                ];
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::MissingSourceEntry
+                ) {
+                    children.pop();
+                }
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::ExtraSourceEntry
+                ) {
+                    children.push(DirectoryEntry::new(
+                        path.join("unexpected"),
+                        DirectoryEntryKind::RegularFile,
+                    ));
+                }
+                return Ok(children);
+            }
+            if path == Path::new("C:/projects/game/write_back") {
+                self.observations.event("list_write_back");
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::WriteBackNotDirectory
+                ) {
+                    return Err(ListDirectoryError::NotDirectory { path });
+                }
+                let mut children = vec![
+                    DirectoryEntry::new(
+                        path.join("data"),
+                        if matches!(
+                            self.workspace_structure,
+                            WorkspaceStructureObservation::WriteBackDataNotDirectory
+                        ) {
+                            DirectoryEntryKind::RegularFile
+                        } else {
+                            DirectoryEntryKind::Directory
+                        },
+                    ),
+                    DirectoryEntry::new(path.join("js"), DirectoryEntryKind::Directory),
+                ];
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::ExtraWriteBackEntry
+                ) {
+                    children.push(DirectoryEntry::new(
+                        path.join("unexpected"),
+                        DirectoryEntryKind::RegularFile,
+                    ));
+                }
+                return Ok(children);
+            }
+            if path == Path::new("C:/projects/game").join(DIRECTORY_PUBLISH_LOCK_NAMESPACE) {
+                self.observations.event("list_directory_publish_locks");
+                let mut children = if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::DirectoryPublishLockMissingFile
+                ) {
+                    Vec::new()
+                } else {
+                    vec![DirectoryEntry::new(
+                        path.join("write_back"),
+                        if matches!(
+                            self.workspace_structure,
+                            WorkspaceStructureObservation::DirectoryPublishLockFileNotRegular
+                        ) {
+                            DirectoryEntryKind::Directory
+                        } else {
+                            DirectoryEntryKind::RegularFile
+                        },
+                    )]
+                };
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::DirectoryPublishLockExtraEntry
+                ) {
+                    children.push(DirectoryEntry::new(
+                        path.join("unexpected"),
+                        DirectoryEntryKind::RegularFile,
+                    ));
+                }
+                return Ok(children);
+            }
+            panic!("测试未声明目录列举：{}", path.display());
+        }
+    }
+
+    impl ProjectOperationLeaseProvider for FakeWorkspaceFileSystem {
+        type Error = FakeError;
+        type LeaseState = LeaseState;
+
+        async fn acquire_project_operation_lease(
+            &self,
+            request: ProjectOperationLeaseRequest,
+        ) -> Result<ProjectOperationLease<Self::LeaseState>, ProjectOperationLeaseError<Self::Error>>
+        {
+            assert_eq!(request.projects_root(), Path::new("C:/projects"));
+            assert_eq!(request.project_directory_name(), "game");
+            self.observations.event("lease_acquire");
+            Ok(ProjectOperationLease::new(LeaseState(
+                self.observations.clone(),
+            )))
+        }
+    }
+
+    impl DirectoryTreeFingerprinter for FakeWorkspaceFileSystem {
+        type Error = FakeError;
+
+        async fn fingerprint_directory_tree(
+            &self,
+            request: DirectoryTreeFingerprintRequest,
+        ) -> Result<Sha256Fingerprint, DirectoryTreeFingerprintError<Self::Error>> {
+            assert_eq!(
+                request
+                    .roots()
+                    .iter()
+                    .map(|root| root.logical_root())
+                    .collect::<Vec<_>>(),
+                vec![Path::new("data"), Path::new("js")]
+            );
+            let candidate = request
+                .roots()
+                .iter()
+                .all(|root| root.physical_root().starts_with("C:/projects/.game-stage"));
+            if candidate {
+                self.observations.event("fingerprint_candidate");
+                return Ok(Sha256Fingerprint::from_bytes(self.candidate_fingerprint));
+            }
+            self.observations.event("fingerprint_existing");
+            match self.existing_source {
+                ExistingSourceObservation::Fingerprint(value) => {
+                    Ok(Sha256Fingerprint::from_bytes(value))
+                }
+                ExistingSourceObservation::Missing => {
+                    Err(DirectoryTreeFingerprintError::NotFound {
+                        path: PathBuf::from("C:/projects/game/source/data"),
+                    })
+                }
             }
         }
     }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FakeFileSystemError;
-
-    impl fmt::Display for FakeFileSystemError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("fake filesystem failure")
-        }
-    }
-
-    impl Error for FakeFileSystemError {}
 
     #[derive(Clone)]
-    struct FakeCreator {
-        projects: Arc<Mutex<Vec<NewProjectWorkspace>>>,
-        failure: bool,
+    struct FakeDatabaseCreator {
+        observations: Observations,
     }
 
-    impl FakeCreator {
-        fn succeeding() -> Self {
-            Self {
-                projects: Arc::new(Mutex::new(Vec::new())),
-                failure: false,
-            }
-        }
+    impl ProjectDatabaseCreator for FakeDatabaseCreator {
+        type Error = FakeError;
 
-        fn failing() -> Self {
-            Self {
-                projects: Arc::new(Mutex::new(Vec::new())),
-                failure: true,
-            }
-        }
-    }
-
-    impl ProjectWorkspaceCreator for FakeCreator {
-        type Error = FakeCreatorError;
-
-        async fn create(&self, project: NewProjectWorkspace) -> Result<(), Self::Error> {
-            self.projects
+        async fn create(
+            &self,
+            destination_path: PathBuf,
+            project: NewProject,
+        ) -> Result<CreatedProject, Self::Error> {
+            self.observations.event("create_database");
+            self.observations
+                .created_projects
                 .lock()
-                .expect("工作区创建调用记录锁不应中毒")
-                .push(project);
+                .expect("created projects mutex should not be poisoned")
+                .push((destination_path.clone(), project));
+            Ok(CreatedProject::new(destination_path))
+        }
+    }
 
-            if self.failure {
-                Err(FakeCreatorError)
-            } else {
-                Ok(())
+    #[derive(Clone)]
+    struct FakeSnapshotter {
+        observations: Observations,
+        responses: Arc<Mutex<SnapshotDatabaseResponses>>,
+    }
+
+    impl SqliteDatabaseSnapshotter for FakeSnapshotter {
+        type Error = FakeError;
+
+        async fn snapshot_database(
+            &self,
+            source: PathBuf,
+            destination: PathBuf,
+        ) -> Result<(), SnapshotDatabaseError<Self::Error>> {
+            self.observations.event("snapshot_database");
+            self.observations
+                .snapshots
+                .lock()
+                .expect("snapshots mutex should not be poisoned")
+                .push((source, destination));
+            self.responses
+                .lock()
+                .expect("snapshot responses mutex should not be poisoned")
+                .pop_front()
+                .expect("测试必须提供快照响应")
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeReconciler {
+        observations: Observations,
+        inspection: Result<ProjectDatabaseState, FakeError>,
+        reconciliation: Result<ProjectDatabaseReconciliation, FakeError>,
+    }
+
+    impl ProjectDatabaseStateReconciler for FakeReconciler {
+        type InspectionError = FakeError;
+        type ReconciliationError = FakeError;
+
+        async fn inspect(
+            &self,
+            _database_path: PathBuf,
+            _expected_name: ProjectName,
+        ) -> Result<ProjectDatabaseState, Self::InspectionError> {
+            self.observations.event("inspect_database");
+            self.inspection.clone()
+        }
+
+        async fn reconcile(
+            &self,
+            database_path: PathBuf,
+            requested: NewProject,
+        ) -> Result<ProjectDatabaseReconciliation, Self::ReconciliationError> {
+            self.observations.event("reconcile_database");
+            self.observations
+                .reconciled_projects
+                .lock()
+                .expect("reconciled projects mutex should not be poisoned")
+                .push((database_path, requested));
+            self.reconciliation.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakePublisher {
+        observations: Observations,
+        discard_error: Arc<Mutex<Option<FakeError>>>,
+    }
+
+    impl RecoverableDirectoryPublisher for FakePublisher {
+        type Error = FakeError;
+        type StagingState = usize;
+
+        async fn prepare(
+            &self,
+            request: DirectoryStageRequest,
+        ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>>
+        {
+            self.observations.event("prepare");
+            self.observations
+                .stage_requests
+                .lock()
+                .expect("stage requests mutex should not be poisoned")
+                .push(request.clone());
+            Ok(StagedDirectory::new(
+                request.target_root().to_path_buf(),
+                PathBuf::from("C:/projects/.game-stage"),
+                request.publish_intent(),
+                1,
+            ))
+        }
+
+        async fn publish(
+            &self,
+            _staged: StagedDirectory<Self::StagingState>,
+        ) -> Result<(), DirectoryPublishError<Self::Error>> {
+            self.observations.event("publish");
+            Ok(())
+        }
+
+        async fn discard(
+            &self,
+            staged: StagedDirectory<Self::StagingState>,
+        ) -> Result<(), DirectoryDiscardError<Self::Error>> {
+            self.observations.event("discard");
+            match self
+                .discard_error
+                .lock()
+                .expect("discard error mutex should not be poisoned")
+                .take()
+            {
+                Some(source) => Err(DirectoryDiscardError::new(
+                    staged.staging_root().to_path_buf(),
+                    source,
+                )),
+                None => Ok(()),
             }
         }
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FakeCreatorError;
-
-    impl fmt::Display for FakeCreatorError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("fake database creation failure")
-        }
-    }
-
-    impl Error for FakeCreatorError {}
-
-    fn input() -> InitInput {
-        InitInput {
-            name: "游戏 一".parse().expect("测试项目名称应该合法"),
-            game_root: PathBuf::from("./Game One"),
-            source_language: " ja ".to_owned(),
-            target_language: " ja ".to_owned(),
-            layout_profile: profile(),
-        }
+    fn width(value: u32) -> super::super::project::MaxFullwidthChars {
+        super::super::project::MaxFullwidthChars::new(value).expect("宽度应合法")
     }
 
     fn profile() -> MzWriteBackLayoutProfile {
         MzWriteBackLayoutProfile::new(width(24), width(30), width(18))
     }
 
-    fn width(value: u32) -> super::super::project::MaxFullwidthChars {
-        super::super::project::MaxFullwidthChars::new(value).expect("测试宽度应该是正整数")
+    fn fingerprint(value: u8) -> SourceSnapshotFingerprint {
+        SourceSnapshotFingerprint::from_bytes([value; 32])
+    }
+
+    fn database_state(
+        source_fingerprint: u8,
+        owners: Vec<(MzStandardAssetOwner, SourceSnapshotFingerprint)>,
+    ) -> ProjectDatabaseState {
+        ProjectDatabaseState::for_test(
+            "game".parse().expect("项目名应合法"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            fingerprint(source_fingerprint),
+            profile(),
+            owners,
+        )
+    }
+
+    fn request() -> ProjectWorkspaceConvergenceRequest {
+        ProjectWorkspaceConvergenceRequest::new(
+            PathBuf::from("C:/games/source"),
+            "game".parse().expect("项目名应合法"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            profile(),
+        )
+    }
+
+    fn service(
+        target_exists: bool,
+        workspace_structure: WorkspaceStructureObservation,
+        existing_source: ExistingSourceObservation,
+        candidate_fingerprint: u8,
+        inspection: Result<ProjectDatabaseState, FakeError>,
+        reconciliation: Result<ProjectDatabaseReconciliation, FakeError>,
+        snapshot_response: Result<(), SnapshotDatabaseError<FakeError>>,
+    ) -> (
+        ProjectWorkspaceConvergenceService<
+            FakeDatabaseCreator,
+            FakeSnapshotter,
+            FakeReconciler,
+            FakeWorkspaceFileSystem,
+            FakePublisher,
+        >,
+        Observations,
+    ) {
+        let observations = Observations::default();
+        (
+            ProjectWorkspaceConvergenceService::new(
+                PathBuf::from("C:/projects"),
+                FakeDatabaseCreator {
+                    observations: observations.clone(),
+                },
+                FakeSnapshotter {
+                    observations: observations.clone(),
+                    responses: Arc::new(Mutex::new(VecDeque::from([snapshot_response]))),
+                },
+                FakeReconciler {
+                    observations: observations.clone(),
+                    inspection,
+                    reconciliation,
+                },
+                FakeWorkspaceFileSystem {
+                    observations: observations.clone(),
+                    target_exists,
+                    workspace_structure,
+                    existing_source,
+                    candidate_fingerprint: [candidate_fingerprint; 32],
+                },
+                FakePublisher {
+                    observations: observations.clone(),
+                    discard_error: Arc::new(Mutex::new(None)),
+                },
+                CooperativeCancellation::default(),
+            ),
+            observations,
+        )
     }
 
     #[tokio::test]
-    async fn resolves_game_root_and_creates_one_normalized_project() {
-        let resolved_root = PathBuf::from("C:/Games/Game One");
-        let service = InitService::new(
-            FakeFileSystem::new(FileSystemOutcome::Resolved(resolved_root.clone())),
-            FakeCreator::succeeding(),
-            CooperativeCancellation::default(),
+    async fn first_init_builds_candidate_database_then_publishes_create_new() {
+        let candidate_state = database_state(0x22, Vec::new());
+        let (service, observations) = service(
+            false,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Missing,
+            0x22,
+            Ok(candidate_state.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(
+                false,
+                candidate_state,
+            )),
+            Ok(()),
         );
 
-        let output = service.execute(input()).await.expect("初始化编排应该成功");
+        let outcome = service
+            .converge(request())
+            .await
+            .expect("首次 Init 应创建工作区");
 
-        assert_eq!(output.name.as_str(), "游戏 一");
+        assert_eq!(outcome, ProjectWorkspaceConvergence::Created);
         assert_eq!(
-            service
-                .file_system
-                .calls
+            observations.events(),
+            vec![
+                "lease_acquire",
+                "game_root",
+                "workspace_root",
+                "prepare",
+                "fingerprint_candidate",
+                "create_database",
+                "reconcile_database",
+                "publish",
+                "lease_drop",
+            ]
+        );
+        let stage_requests = observations
+            .stage_requests
+            .lock()
+            .expect("stage requests mutex should not be poisoned");
+        assert_eq!(
+            stage_requests[0].publish_intent(),
+            DirectoryPublishIntent::CreateNew
+        );
+        assert_eq!(
+            stage_requests[0].target_root(),
+            Path::new("C:/projects/game")
+        );
+        assert_eq!(stage_requests[0].source_mappings().len(), 2);
+        assert_eq!(
+            stage_requests[0].source_mappings()[0].source_directory(),
+            Path::new("C:/games/source/data")
+        );
+        assert_eq!(
+            stage_requests[0].source_mappings()[0].relative_target(),
+            Path::new("source/data")
+        );
+        assert_eq!(
+            stage_requests[0].source_mappings()[1].source_directory(),
+            Path::new("C:/games/source/js")
+        );
+        assert_eq!(
+            stage_requests[0].source_mappings()[1].relative_target(),
+            Path::new("source/js")
+        );
+        assert_eq!(
+            stage_requests[0].empty_directories(),
+            &[
+                PathBuf::from("write_back/data"),
+                PathBuf::from("write_back/js")
+            ]
+        );
+        let created = observations
+            .created_projects
+            .lock()
+            .expect("created projects mutex should not be poisoned");
+        assert_eq!(created.len(), 1);
+        assert_eq!(
+            created[0].0,
+            Path::new("C:/projects/.game-stage/project.db")
+        );
+        assert_eq!(
+            created[0].1.source_snapshot_fingerprint(),
+            fingerprint(0x22)
+        );
+        let reconciled = observations
+            .reconciled_projects
+            .lock()
+            .expect("reconciled projects mutex should not be poisoned");
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(
+            reconciled[0].0,
+            Path::new("C:/projects/.game-stage/project.db")
+        );
+        assert_eq!(
+            reconciled[0].1.source_snapshot_fingerprint(),
+            fingerprint(0x22)
+        );
+        assert!(
+            observations
+                .snapshots
                 .lock()
-                .expect("文件系统调用记录锁不应中毒")
-                .as_slice(),
-            &[PathBuf::from("./Game One")]
+                .expect("snapshots mutex should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_existing_project_discards_candidate_and_preserves_output() {
+        let current = database_state(0x33, Vec::new());
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x33,
+            Ok(current.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(()),
         );
 
-        let projects = service
-            .workspace_creator
-            .projects
-            .lock()
-            .expect("工作区创建调用记录锁不应中毒");
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].source_game_root(), resolved_root);
-        assert_eq!(projects[0].project().name().as_str(), "游戏 一");
-        assert_eq!(projects[0].project().source_language(), "ja");
-        assert_eq!(projects[0].project().target_language(), "ja");
-        assert_eq!(projects[0].project().layout_profile(), &profile());
+        let outcome = service
+            .converge(request())
+            .await
+            .expect("完全相同的项目应成功 no-op");
+
+        assert_eq!(outcome, ProjectWorkspaceConvergence::Unchanged);
+        assert_eq!(
+            observations.events(),
+            vec![
+                "lease_acquire",
+                "game_root",
+                "workspace_root",
+                "inspect_database",
+                "list_workspace",
+                "list_source",
+                "list_write_back",
+                "fingerprint_existing",
+                "output_data",
+                "output_js",
+                "prepare",
+                "fingerprint_candidate",
+                "snapshot_database",
+                "reconcile_database",
+                "discard",
+                "lease_drop",
+            ]
+        );
+        assert_eq!(
+            observations
+                .stage_requests
+                .lock()
+                .expect("stage requests mutex should not be poisoned")[0]
+                .publish_intent(),
+            DirectoryPublishIntent::ReplaceExisting
+        );
+        assert_eq!(
+            observations
+                .snapshots
+                .lock()
+                .expect("snapshots mutex should not be poisoned")
+                .as_slice(),
+            &[(
+                PathBuf::from("C:/projects/game/project.db"),
+                PathBuf::from("C:/projects/.game-stage/project.db"),
+            )]
+        );
     }
 
     #[tokio::test]
-    async fn rejects_blank_languages_before_any_dependency_call() {
-        for (source_language, target_language, source_is_invalid) in
-            [("   ", "zh-Hans", true), ("ja", "\t", false)]
-        {
-            let service = InitService::new(
-                FakeFileSystem::new(FileSystemOutcome::Resolved(PathBuf::from("C:/Games/Demo"))),
-                FakeCreator::succeeding(),
-                CooperativeCancellation::default(),
-            );
-            let mut request = input();
-            request.source_language = source_language.to_owned();
-            request.target_language = target_language.to_owned();
+    async fn sqlite_sidecars_do_not_make_an_identical_workspace_look_changed() {
+        let current = database_state(0x33, Vec::new());
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::SqliteSidecars,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x33,
+            Ok(current.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(()),
+        );
 
-            let error = service
-                .execute(request)
-                .await
-                .expect_err("空白语言应该被拒绝");
+        let outcome = service
+            .converge(request())
+            .await
+            .expect("SQLite sidecar 属于已检查数据库的存储语义");
 
-            assert_eq!(
-                matches!(error, InitServiceError::EmptySourceLanguage),
-                source_is_invalid
-            );
-            assert_eq!(
-                matches!(error, InitServiceError::EmptyTargetLanguage),
-                !source_is_invalid
-            );
-            assert!(
-                service
-                    .file_system
-                    .calls
-                    .lock()
-                    .expect("文件系统调用记录锁不应中毒")
-                    .is_empty()
-            );
-            assert!(
-                service
-                    .workspace_creator
-                    .projects
-                    .lock()
-                    .expect("工作区创建调用记录锁不应中毒")
-                    .is_empty()
-            );
-        }
+        assert_eq!(outcome, ProjectWorkspaceConvergence::Unchanged);
+        assert!(observations.events().contains(&"discard"));
+        assert!(!observations.events().contains(&"publish"));
     }
 
     #[tokio::test]
-    async fn preserves_each_directory_failure_without_calling_creator() {
-        for (outcome, expected_kind) in [
-            (FileSystemOutcome::NotFound, "not-found"),
-            (FileSystemOutcome::NotDirectory, "not-directory"),
-            (FileSystemOutcome::Io, "io"),
+    async fn exact_directory_publish_lock_does_not_make_an_identical_workspace_look_changed() {
+        let current = database_state(0x33, Vec::new());
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::DirectoryPublishLock,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x33,
+            Ok(current.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(()),
+        );
+
+        let outcome = service
+            .converge(request())
+            .await
+            .expect("WriteBack 发布器留下的精确锁目录属于受管基础设施");
+
+        assert_eq!(outcome, ProjectWorkspaceConvergence::Unchanged);
+        assert!(
+            observations
+                .events()
+                .contains(&"list_directory_publish_locks")
+        );
+        assert!(observations.events().contains(&"discard"));
+        assert!(!observations.events().contains(&"publish"));
+    }
+
+    #[tokio::test]
+    async fn changed_source_updates_workspace_and_reports_stale_owners() {
+        let current = database_state(
+            0x33,
+            vec![(MzStandardAssetOwner::Builtin, fingerprint(0x33))],
+        );
+        let updated = database_state(
+            0x44,
+            vec![(MzStandardAssetOwner::Builtin, fingerprint(0x33))],
+        );
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x44,
+            Ok(current),
+            Ok(ProjectDatabaseReconciliation::for_test(true, updated)),
+            Ok(()),
+        );
+
+        let outcome = service
+            .converge(request())
+            .await
+            .expect("来源变化应发布更新");
+
+        assert_eq!(
+            outcome,
+            ProjectWorkspaceConvergence::Updated {
+                stale_owners: vec![MzStandardAssetOwner::Builtin],
+            }
+        );
+        assert!(observations.events().contains(&"snapshot_database"));
+        assert!(observations.events().contains(&"publish"));
+        assert!(!observations.events().contains(&"discard"));
+    }
+
+    #[tokio::test]
+    async fn non_exact_workspace_structure_is_repaired_even_when_requested_facts_match() {
+        for structure in [
+            WorkspaceStructureObservation::SqliteSidecarNotFile,
+            WorkspaceStructureObservation::DirectoryPublishLockNamespaceNotDirectory,
+            WorkspaceStructureObservation::DirectoryPublishLockFileNotRegular,
+            WorkspaceStructureObservation::DirectoryPublishLockMissingFile,
+            WorkspaceStructureObservation::DirectoryPublishLockExtraEntry,
+            WorkspaceStructureObservation::DatabaseNotFile,
+            WorkspaceStructureObservation::SourceNotDirectory,
+            WorkspaceStructureObservation::SourceDataNotDirectory,
+            WorkspaceStructureObservation::WriteBackDataNotDirectory,
+            WorkspaceStructureObservation::ExtraWorkspaceEntry,
+            WorkspaceStructureObservation::ExtraSourceEntry,
+            WorkspaceStructureObservation::ExtraWriteBackEntry,
+            WorkspaceStructureObservation::MissingSourceEntry,
+            WorkspaceStructureObservation::WriteBackNotDirectory,
         ] {
-            let service = InitService::new(
-                FakeFileSystem::new(outcome),
-                FakeCreator::succeeding(),
-                CooperativeCancellation::default(),
+            let current = database_state(0x55, Vec::new());
+            let (service, observations) = service(
+                true,
+                structure,
+                ExistingSourceObservation::Fingerprint([0x55; 32]),
+                0x55,
+                Ok(current.clone()),
+                Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+                Ok(()),
             );
 
-            let error = service
-                .execute(input())
+            let outcome = service
+                .converge(request())
                 .await
-                .expect_err("目录失败应该向上返回");
-            let actual_kind = match error {
-                InitServiceError::GameRoot(ResolveDirectoryError::NotFound { .. }) => "not-found",
-                InitServiceError::GameRoot(ResolveDirectoryError::NotDirectory { .. }) => {
-                    "not-directory"
-                }
-                InitServiceError::GameRoot(ResolveDirectoryError::Io { source, .. }) => {
-                    assert_eq!(source, FakeFileSystemError);
-                    "io"
-                }
-                other => panic!("未预期的初始化错误：{other}"),
-            };
+                .unwrap_or_else(|error| panic!("{structure:?} 应执行 repair：{error}"));
 
-            assert_eq!(actual_kind, expected_kind);
+            assert_eq!(
+                outcome,
+                ProjectWorkspaceConvergence::Updated {
+                    stale_owners: Vec::new(),
+                },
+                "{structure:?}"
+            );
+            assert!(observations.events().contains(&"publish"), "{structure:?}");
+            assert!(!observations.events().contains(&"discard"), "{structure:?}");
             assert!(
-                service
-                    .workspace_creator
-                    .projects
-                    .lock()
-                    .expect("工作区创建调用记录锁不应中毒")
-                    .is_empty()
+                !observations.events().contains(&"fingerprint_existing"),
+                "结构不完整时不应把其内容身份当作可复用事实：{structure:?}"
             );
         }
     }
 
     #[tokio::test]
-    async fn preserves_workspace_failure_after_one_call() {
-        let service = InitService::new(
-            FakeFileSystem::new(FileSystemOutcome::Resolved(PathBuf::from("C:/Games/Demo"))),
-            FakeCreator::failing(),
-            CooperativeCancellation::default(),
+    async fn workspace_structure_listing_io_failure_is_technical_error() {
+        let current = database_state(0x55, Vec::new());
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::Io,
+            ExistingSourceObservation::Fingerprint([0x55; 32]),
+            0x55,
+            Ok(current.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(()),
         );
 
         let error = service
-            .execute(input())
+            .converge(request())
             .await
-            .expect_err("工作区创建失败应该向上返回");
+            .expect_err("真实列举 I/O 失败不得被误判为可修复结构偏差");
 
         assert!(matches!(
             error,
-            InitServiceError::Workspace(FakeCreatorError)
+            ProjectWorkspaceConvergenceError::ObserveWorkspaceStructure(ListDirectoryError::Io {
+                source: FakeError("list workspace"),
+                ..
+            })
+        ));
+        assert!(!observations.events().contains(&"prepare"));
+    }
+
+    #[tokio::test]
+    async fn invalid_existing_database_stops_before_candidate_preparation() {
+        let current = database_state(0x33, Vec::new());
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x33,
+            Err(FakeError("invalid database")),
+            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Ok(()),
+        );
+
+        let error = service
+            .converge(request())
+            .await
+            .expect_err("无效数据库绝不能被覆盖");
+
+        assert!(matches!(
+            error,
+            ProjectWorkspaceConvergenceError::InspectExistingDatabase(FakeError(
+                "invalid database"
+            ))
         ));
         assert_eq!(
-            service
-                .workspace_creator
-                .projects
-                .lock()
-                .expect("工作区创建调用记录锁不应中毒")
-                .len(),
-            1
-        );
-    }
-
-    #[cfg(any(unix, windows))]
-    #[tokio::test]
-    async fn passes_non_utf8_resolved_path_to_workspace_creator_losslessly() {
-        let resolved_path = non_utf8_path();
-        let service = InitService::new(
-            FakeFileSystem::new(FileSystemOutcome::Resolved(resolved_path.clone())),
-            FakeCreator::succeeding(),
-            CooperativeCancellation::default(),
-        );
-
-        service
-            .execute(input())
-            .await
-            .expect("非 UTF-8 路径不应经过文本转换");
-
-        assert_eq!(
-            service
-                .workspace_creator
-                .projects
-                .lock()
-                .expect("工作区创建调用记录锁不应中毒")[0]
-                .source_game_root(),
-            resolved_path
-        );
-    }
-
-    #[test]
-    fn execution_future_is_send() {
-        let service = InitService::new(
-            FakeFileSystem::new(FileSystemOutcome::Resolved(PathBuf::from("C:/Games/Demo"))),
-            FakeCreator::succeeding(),
-            CooperativeCancellation::default(),
-        );
-
-        assert_send(service.execute(input()));
-    }
-
-    fn assert_send(_: impl Send) {}
-
-    #[cfg(windows)]
-    fn non_utf8_path() -> PathBuf {
-        use std::os::windows::ffi::OsStringExt;
-
-        PathBuf::from(OsString::from_wide(&[
-            b'C' as u16,
-            b':' as u16,
-            b'\\' as u16,
-            0xd800,
-        ]))
-    }
-
-    #[cfg(unix)]
-    fn non_utf8_path() -> PathBuf {
-        use std::os::unix::ffi::OsStringExt;
-
-        PathBuf::from(OsString::from_vec(vec![b'/', 0xff]))
-    }
-}
-
-#[cfg(test)]
-mod workspace_creation_service_tests {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
-
-    use crate::project_database::{
-        CreatedProject, ProjectDatabaseCreateError, ProjectDatabaseCreationService,
-        ProjectDatabaseCreator,
-    };
-    use crate::storage::file_system::{StagedDirectory, StagingCleanupFailure};
-    use crate::storage::sqlite::{
-        CreateDatabaseError, SqliteCommand, SqliteDatabaseCreator, SqliteValue,
-    };
-
-    use super::*;
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    enum Event {
-        Resolve,
-        Prepare,
-        Database,
-        Discard,
-        Publish(DirectoryPublishIntent),
-    }
-
-    #[derive(Debug, Default)]
-    struct Trace {
-        events: Vec<Event>,
-        stage: Option<CapturedStageRequest>,
-        database: Option<CapturedDatabaseCreation>,
-        publication: Option<CapturedPublication>,
-    }
-
-    #[derive(Debug, Eq, PartialEq)]
-    struct CapturedStageRequest {
-        target_root: PathBuf,
-        source_mappings: Vec<(PathBuf, PathBuf)>,
-        overlay_count: usize,
-        empty_directories: Vec<PathBuf>,
-    }
-
-    #[derive(Debug)]
-    struct CapturedDatabaseCreation {
-        path: PathBuf,
-        commands: Vec<SqliteCommand>,
-    }
-
-    #[derive(Debug, Eq, PartialEq)]
-    struct CapturedPublication {
-        target_root: PathBuf,
-        staging_root: PathBuf,
-        mode: DirectoryPublishIntent,
-    }
-
-    #[derive(Clone)]
-    struct RecordingDirectoryResolver {
-        resolved: PathBuf,
-        trace: Arc<Mutex<Trace>>,
-    }
-
-    impl ExistingDirectoryResolver for RecordingDirectoryResolver {
-        type Error = RootError;
-
-        async fn resolve_existing_directory(
-            &self,
-            _path: PathBuf,
-        ) -> Result<PathBuf, ResolveDirectoryError<Self::Error>> {
-            self.trace
-                .lock()
-                .expect("记录锁不应中毒")
-                .events
-                .push(Event::Resolve);
-            Ok(self.resolved.clone())
-        }
-    }
-
-    #[derive(Clone)]
-    struct RecordingSqliteCreator {
-        trace: Arc<Mutex<Trace>>,
-    }
-
-    impl SqliteDatabaseCreator for RecordingSqliteCreator {
-        type Error = RootError;
-
-        async fn create_new_database(
-            &self,
-            path: PathBuf,
-            commands: Vec<SqliteCommand>,
-        ) -> Result<(), CreateDatabaseError<Self::Error>> {
-            let mut trace = self.trace.lock().expect("记录锁不应中毒");
-            trace.events.push(Event::Database);
-            trace.database = Some(CapturedDatabaseCreation { path, commands });
-            Ok(())
-        }
-    }
-
-    struct RecordingRecoverablePublisher {
-        staging_root: PathBuf,
-        trace: Arc<Mutex<Trace>>,
-        prepare_fails: bool,
-        prepare_cleanup_fails: bool,
-        discard_fails: bool,
-        publish_failure: Option<PublishFailure>,
-        cancel_after_prepare: Option<CooperativeCancellation>,
-    }
-
-    impl RecoverableDirectoryPublisher for RecordingRecoverablePublisher {
-        type Error = RootError;
-        type StagingState = ();
-
-        async fn prepare(
-            &self,
-            request: DirectoryStageRequest,
-        ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>>
-        {
-            let target_root = request.target_root().to_path_buf();
-            let publish_intent = request.publish_intent();
-            let captured = CapturedStageRequest {
-                target_root: target_root.clone(),
-                source_mappings: request
-                    .source_mappings()
-                    .iter()
-                    .map(|mapping| {
-                        (
-                            mapping.source_directory().to_path_buf(),
-                            mapping.relative_target().to_path_buf(),
-                        )
-                    })
-                    .collect(),
-                overlay_count: request.overlays().len(),
-                empty_directories: request.empty_directories().to_vec(),
-            };
-            let mut trace = self.trace.lock().expect("记录锁不应中毒");
-            trace.events.push(Event::Prepare);
-            trace.stage = Some(captured);
-            drop(trace);
-
-            if self.prepare_fails {
-                return Err(DirectoryPrepareError::NotPrepared {
-                    target_root,
-                    source: RootError,
-                    cleanup_failure: self
-                        .prepare_cleanup_fails
-                        .then(|| StagingCleanupFailure::new(self.staging_root.clone(), RootError)),
-                });
-            }
-
-            if let Some(cancellation) = &self.cancel_after_prepare {
-                cancellation.request();
-            }
-
-            Ok(StagedDirectory::new(
-                target_root,
-                self.staging_root.clone(),
-                publish_intent,
-                (),
-            ))
-        }
-
-        async fn publish(
-            &self,
-            staged: StagedDirectory<Self::StagingState>,
-        ) -> Result<(), DirectoryPublishError<Self::Error>> {
-            let mode = staged.publish_intent();
-            let mut trace = self.trace.lock().expect("记录锁不应中毒");
-            trace.events.push(Event::Publish(mode));
-            trace.publication = Some(CapturedPublication {
-                target_root: staged.target_root().to_path_buf(),
-                staging_root: staged.staging_root().to_path_buf(),
-                mode,
-            });
-            let target_root = staged.target_root().to_path_buf();
-            match self.publish_failure {
-                None => Ok(()),
-                Some(PublishFailure::TargetAlreadyExists) => {
-                    Err(DirectoryPublishError::TargetAlreadyExists {
-                        target_root,
-                        cleanup_failure: None,
-                    })
-                }
-                Some(PublishFailure::NotAttempted) => Err(DirectoryPublishError::NotAttempted {
-                    target_root,
-                    source: RootError,
-                    cleanup_failure: None,
-                }),
-                Some(PublishFailure::NotPublished) => Err(DirectoryPublishError::NotPublished {
-                    target_root,
-                    source: RootError,
-                    cleanup_failure: None,
-                }),
-                Some(PublishFailure::PublishedWithResiduals) => {
-                    Err(DirectoryPublishError::PublishedWithResiduals {
-                        target_root,
-                        residual_path: PathBuf::from("C:/ATT/projects/.old-demo"),
-                        source: RootError,
-                    })
-                }
-                Some(PublishFailure::RecoveryRequired) => {
-                    Err(DirectoryPublishError::RecoveryRequired {
-                        target_root,
-                        recovery_artifacts: vec![PathBuf::from("C:/ATT/projects/.recovery-demo")],
-                        source: RootError,
-                    })
-                }
-                Some(PublishFailure::OutcomeUnknown) => {
-                    Err(DirectoryPublishError::OutcomeUnknown {
-                        target_root,
-                        recovery_artifacts: vec![PathBuf::from("C:/ATT/projects/.recovery-demo")],
-                        source: RootError,
-                    })
-                }
-            }
-        }
-
-        async fn discard(
-            &self,
-            _staged: StagedDirectory<Self::StagingState>,
-        ) -> Result<(), DirectoryDiscardError<Self::Error>> {
-            self.trace
-                .lock()
-                .expect("记录锁不应中毒")
-                .events
-                .push(Event::Discard);
-            if self.discard_fails {
-                Err(DirectoryDiscardError::new(
-                    self.staging_root.clone(),
-                    RootError,
-                ))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum PublishFailure {
-        TargetAlreadyExists,
-        NotAttempted,
-        NotPublished,
-        PublishedWithResiduals,
-        RecoveryRequired,
-        OutcomeUnknown,
-    }
-
-    struct FailingDatabaseCreator {
-        trace: Arc<Mutex<Trace>>,
-    }
-
-    impl ProjectDatabaseCreator for FailingDatabaseCreator {
-        type Error = DatabaseError;
-
-        async fn create(
-            &self,
-            _destination_path: PathBuf,
-            _project: NewProject,
-        ) -> Result<CreatedProject, Self::Error> {
-            self.trace
-                .lock()
-                .expect("记录锁不应中毒")
-                .events
-                .push(Event::Database);
-            Err(DatabaseError)
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct RootError;
-
-    impl fmt::Display for RootError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("测试根失败")
-        }
-    }
-
-    impl Error for RootError {}
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct DatabaseError;
-
-    impl fmt::Display for DatabaseError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("测试建库失败")
-        }
-    }
-
-    impl Error for DatabaseError {}
-
-    struct ScriptedDatabaseCreator {
-        trace: Arc<Mutex<Trace>>,
-        error: Mutex<Option<ProjectDatabaseCreateError<RootError>>>,
-    }
-
-    impl ProjectDatabaseCreator for ScriptedDatabaseCreator {
-        type Error = ProjectDatabaseCreateError<RootError>;
-
-        async fn create(
-            &self,
-            _destination_path: PathBuf,
-            _project: NewProject,
-        ) -> Result<CreatedProject, Self::Error> {
-            self.trace
-                .lock()
-                .expect("记录锁不应中毒")
-                .events
-                .push(Event::Database);
-            Err(self
-                .error
-                .lock()
-                .expect("建库响应锁不应中毒")
-                .take()
-                .expect("测试应为每次建库提供响应"))
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct SuccessfulDatabaseCreator {
-        paths: Arc<Mutex<Vec<PathBuf>>>,
-    }
-
-    impl ProjectDatabaseCreator for SuccessfulDatabaseCreator {
-        type Error = DatabaseError;
-
-        async fn create(
-            &self,
-            destination_path: PathBuf,
-            _project: NewProject,
-        ) -> Result<CreatedProject, Self::Error> {
-            self.paths
-                .lock()
-                .expect("建库路径记录锁不应中毒")
-                .push(destination_path.clone());
-            tokio::task::yield_now().await;
-            Ok(CreatedProject::new(destination_path))
-        }
-    }
-
-    #[derive(Debug)]
-    struct LinearizingStageState {
-        owner_id: u64,
-        target_root: PathBuf,
-        sequence: usize,
-    }
-
-    #[derive(Debug, Default)]
-    struct LinearizingState {
-        next_sequence: usize,
-        published_targets: HashSet<PathBuf>,
-        published_tokens: Vec<(PathBuf, usize)>,
-    }
-
-    #[derive(Clone)]
-    struct LinearizingRecoverablePublisher {
-        owner_id: u64,
-        state: Arc<Mutex<LinearizingState>>,
-    }
-
-    impl LinearizingRecoverablePublisher {
-        fn new(owner_id: u64) -> Self {
-            Self {
-                owner_id,
-                state: Arc::new(Mutex::new(LinearizingState::default())),
-            }
-        }
-    }
-
-    impl RecoverableDirectoryPublisher for LinearizingRecoverablePublisher {
-        type Error = RootError;
-        type StagingState = LinearizingStageState;
-
-        async fn prepare(
-            &self,
-            request: DirectoryStageRequest,
-        ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>>
-        {
-            let target_root = request.target_root().to_path_buf();
-            let publish_intent = request.publish_intent();
-            let sequence = {
-                let mut state = self.state.lock().expect("线性化状态锁不应中毒");
-                let sequence = state.next_sequence;
-                state.next_sequence += 1;
-                sequence
-            };
-            let staging_root = target_root.with_extension(format!("att-stage-{sequence}"));
-            tokio::task::yield_now().await;
-            Ok(StagedDirectory::new(
-                target_root.clone(),
-                staging_root,
-                publish_intent,
-                LinearizingStageState {
-                    owner_id: self.owner_id,
-                    target_root,
-                    sequence,
-                },
-            ))
-        }
-
-        async fn publish(
-            &self,
-            staged: StagedDirectory<Self::StagingState>,
-        ) -> Result<(), DirectoryPublishError<Self::Error>> {
-            let (target_root, _staging_root, mode, token) = staged.into_parts();
-            if token.owner_id != self.owner_id || token.target_root != target_root {
-                return Err(DirectoryPublishError::NotPublished {
-                    target_root,
-                    source: RootError,
-                    cleanup_failure: None,
-                });
-            }
-            assert_eq!(mode, DirectoryPublishIntent::CreateNew);
-
-            let mut state = self.state.lock().expect("线性化状态锁不应中毒");
-            if !state.published_targets.insert(target_root.clone()) {
-                return Err(DirectoryPublishError::TargetAlreadyExists {
-                    target_root,
-                    cleanup_failure: None,
-                });
-            }
-            state.published_tokens.push((target_root, token.sequence));
-            Ok(())
-        }
-
-        async fn discard(
-            &self,
-            staged: StagedDirectory<Self::StagingState>,
-        ) -> Result<(), DirectoryDiscardError<Self::Error>> {
-            let (target_root, staging_root, _intent, token) = staged.into_parts();
-            if token.owner_id == self.owner_id && token.target_root == target_root {
-                Ok(())
-            } else {
-                Err(DirectoryDiscardError::new(staging_root, RootError))
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn full_non_root_chain_stages_database_and_publishes_one_complete_workspace() {
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let service = InitService::new(
-            RecordingDirectoryResolver {
-                resolved: PathBuf::from("C:/Games/Game One"),
-                trace: Arc::clone(&trace),
-            },
-            ProjectWorkspaceCreationService::new(
-                PathBuf::from("C:/ATT/projects"),
-                ProjectDatabaseCreationService::new(RecordingSqliteCreator {
-                    trace: Arc::clone(&trace),
-                }),
-                directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-game-one"),
-                CooperativeCancellation::default(),
-            ),
-            CooperativeCancellation::default(),
-        );
-
-        let output = service
-            .execute(init_input())
-            .await
-            .expect("完整非根链应该创建工作区");
-
-        assert_eq!(output.name.as_str(), "游戏 一");
-        let trace = trace.lock().expect("记录锁不应中毒");
-        assert_eq!(
-            trace.events,
-            [
-                Event::Resolve,
-                Event::Prepare,
-                Event::Database,
-                Event::Publish(DirectoryPublishIntent::CreateNew),
+            observations.events(),
+            vec![
+                "lease_acquire",
+                "game_root",
+                "workspace_root",
+                "inspect_database",
+                "lease_drop",
             ]
         );
-        assert_eq!(
-            trace.stage.as_ref(),
-            Some(&CapturedStageRequest {
-                target_root: PathBuf::from("C:/ATT/projects/游戏 一"),
-                source_mappings: vec![
-                    (
-                        PathBuf::from("C:/Games/Game One/data"),
-                        PathBuf::from("source/data"),
-                    ),
-                    (
-                        PathBuf::from("C:/Games/Game One/js"),
-                        PathBuf::from("source/js"),
-                    ),
-                ],
-                overlay_count: 0,
-                empty_directories: vec![
-                    PathBuf::from("write_back/data"),
-                    PathBuf::from("write_back/js"),
-                ],
-            })
-        );
-
-        let database = trace.database.as_ref().expect("应该创建数据库");
-        assert_eq!(
-            database.path,
-            PathBuf::from("C:/ATT/projects/.stage-game-one/project.db")
-        );
-        assert_eq!(database.commands.len(), 2);
-        assert_eq!(
-            database.commands[1].parameters(),
-            &[
-                SqliteValue::Text("游戏 一".to_owned()),
-                SqliteValue::Text("ja".to_owned()),
-                SqliteValue::Text("zh-Hans".to_owned()),
-                SqliteValue::Integer(24),
-                SqliteValue::Integer(30),
-                SqliteValue::Integer(18),
-            ]
-        );
-        assert_eq!(
-            trace.publication.as_ref(),
-            Some(&CapturedPublication {
-                target_root: PathBuf::from("C:/ATT/projects/游戏 一"),
-                staging_root: PathBuf::from("C:/ATT/projects/.stage-game-one"),
-                mode: DirectoryPublishIntent::CreateNew,
-            })
-        );
     }
 
     #[tokio::test]
-    async fn concurrent_same_name_init_is_linearized_only_by_create_new_publish() {
-        let root = LinearizingRecoverablePublisher::new(7);
-        let database = SuccessfulDatabaseCreator::default();
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let first = concurrent_init_service(root.clone(), database.clone(), Arc::clone(&trace));
-        let second = concurrent_init_service(root.clone(), database.clone(), trace);
+    async fn snapshot_failure_discards_candidate_once_and_preserves_primary_error() {
+        let current = database_state(0x33, Vec::new());
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x44,
+            Ok(current.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Err(SnapshotDatabaseError::NotCreated(FakeError("backup"))),
+        );
 
-        let (first_result, second_result) =
-            tokio::join!(first.execute(init_input()), second.execute(init_input()));
-        let results = [first_result, second_result];
+        let error = service
+            .converge(request())
+            .await
+            .expect_err("快照失败必须拒绝候选");
 
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(matches!(
+            error,
+            ProjectWorkspaceConvergenceError::CandidateFailure {
+                failure: ProjectWorkspaceCandidateFailure::SnapshotDatabase(
+                    SnapshotDatabaseError::NotCreated(FakeError("backup"))
+                ),
+                discard: None,
+            }
+        ));
         assert_eq!(
-            results
-                .iter()
-                .filter(|result| {
-                    matches!(
-                        result,
-                        Err(InitServiceError::Workspace(
-                            ProjectWorkspaceCreationError::Publish(
-                                DirectoryPublishError::TargetAlreadyExists { .. }
-                            )
-                        ))
-                    )
-                })
+            observations
+                .events()
+                .into_iter()
+                .filter(|event| *event == "discard")
                 .count(),
             1
         );
-        assert_eq!(
-            database.paths.lock().expect("建库路径记录锁不应中毒").len(),
-            2,
-            "两个候选都应在唯一线性化点之前完成建库"
-        );
-        let state = root.state.lock().expect("线性化状态锁不应中毒");
-        assert_eq!(state.published_targets.len(), 1);
-        assert!(
-            state
-                .published_targets
-                .contains(&PathBuf::from("C:/ATT/projects/游戏 一"))
-        );
+        assert!(!observations.events().contains(&"reconcile_database"));
     }
 
     #[tokio::test]
-    async fn concurrent_different_projects_publish_only_their_own_tokens() {
-        let root = LinearizingRecoverablePublisher::new(11);
-        let database = SuccessfulDatabaseCreator::default();
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let first = concurrent_init_service(root.clone(), database.clone(), Arc::clone(&trace));
-        let second = concurrent_init_service(root.clone(), database, trace);
-        let first_input = init_input();
-        let mut second_input = init_input();
-        second_input.name = "游戏 二".parse().expect("测试项目名应该合法");
-
-        let (first_result, second_result) =
-            tokio::join!(first.execute(first_input), second.execute(second_input));
-
-        first_result.expect("第一个独立项目应该发布成功");
-        second_result.expect("第二个独立项目应该发布成功");
-        let state = root.state.lock().expect("线性化状态锁不应中毒");
-        assert_eq!(state.published_targets.len(), 2);
-        assert_eq!(state.published_tokens.len(), 2);
-        assert!(
-            state
-                .published_targets
-                .contains(&PathBuf::from("C:/ATT/projects/游戏 一"))
+    async fn candidate_failure_preserves_primary_and_discard_errors() {
+        let current = database_state(0x33, Vec::new());
+        let (service, _) = service(
+            true,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x44,
+            Ok(current.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(false, current)),
+            Err(SnapshotDatabaseError::NotCreated(FakeError("backup"))),
         );
-        assert!(
-            state
-                .published_targets
-                .contains(&PathBuf::from("C:/ATT/projects/游戏 二"))
-        );
-    }
+        *service
+            .directories
+            .discard_error
+            .lock()
+            .expect("discard error mutex should not be poisoned") = Some(FakeError("discard"));
 
-    #[tokio::test]
-    async fn staged_token_is_rejected_by_a_different_publisher_instance() {
-        let first_root = LinearizingRecoverablePublisher::new(21);
-        let second_root = LinearizingRecoverablePublisher::new(22);
-        let request = DirectoryStageRequest::new(
-            PathBuf::from("C:/ATT/projects/demo"),
-            DirectoryPublishIntent::CreateNew,
-            vec![
-                DirectorySourceMapping::new(
-                    PathBuf::from("C:/Games/Demo/data"),
-                    PathBuf::from("source/data"),
-                )
-                .expect("测试来源映射应该合法"),
-            ],
-            Vec::new(),
-            Vec::new(),
-        )
-        .expect("测试候选请求应该合法");
-        let staged = first_root
-            .prepare(request.clone())
+        let error = service
+            .converge(request())
             .await
-            .expect("第一个根应该准备候选");
-
-        let error = second_root
-            .publish(staged)
-            .await
-            .expect_err("候选 token 不得交给另一个根实例");
+            .expect_err("快照与候选清理双重失败必须同时保留");
 
         assert!(matches!(
             error,
-            DirectoryPublishError::NotPublished {
-                target_root,
-                cleanup_failure: None,
-                ..
-            } if target_root == std::path::Path::new("C:/ATT/projects/demo")
+            ProjectWorkspaceConvergenceError::CandidateFailure {
+                failure: ProjectWorkspaceCandidateFailure::SnapshotDatabase(
+                    SnapshotDatabaseError::NotCreated(FakeError("backup"))
+                ),
+                discard: Some(ref discard),
+            } if discard.source() == &FakeError("discard")
+                && discard.staging_root() == Path::new("C:/projects/.game-stage")
         ));
+    }
 
-        let staged = first_root
-            .prepare(request)
-            .await
-            .expect("第一个根应该准备另一个候选");
-        let staging_root = staged.staging_root().to_path_buf();
-        let error = second_root
-            .discard(staged)
-            .await
-            .expect_err("候选 token 也不得由另一个根实例丢弃");
-        assert_eq!(error.staging_root(), staging_root);
-        assert!(
-            first_root
-                .state
+    #[derive(Clone)]
+    struct FakeWorkspaceConverger {
+        requests: Arc<Mutex<Vec<ProjectWorkspaceConvergenceRequest>>>,
+        responses: Arc<Mutex<VecDeque<Result<ProjectWorkspaceConvergence, FakeError>>>>,
+    }
+
+    impl ProjectWorkspaceConverger for FakeWorkspaceConverger {
+        type Error = FakeError;
+
+        async fn converge(
+            &self,
+            request: ProjectWorkspaceConvergenceRequest,
+        ) -> Result<ProjectWorkspaceConvergence, Self::Error> {
+            self.requests
                 .lock()
-                .expect("线性化状态锁不应中毒")
-                .published_targets
-                .is_empty()
-        );
-        assert!(
-            second_root
-                .state
+                .expect("workspace requests mutex should not be poisoned")
+                .push(request);
+            self.responses
                 .lock()
-                .expect("线性化状态锁不应中毒")
-                .published_targets
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn database_failure_discards_once_and_never_publishes() {
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let service = ProjectWorkspaceCreationService::new(
-            PathBuf::from("C:/ATT/projects"),
-            FailingDatabaseCreator {
-                trace: Arc::clone(&trace),
-            },
-            directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo"),
-            CooperativeCancellation::default(),
-        );
-
-        let error = service
-            .create(workspace())
-            .await
-            .expect_err("建库失败应该使工作区创建失败");
-
-        assert!(matches!(
-            error,
-            ProjectWorkspaceCreationError::Database(DatabaseError)
-        ));
-        assert_eq!(
-            trace.lock().expect("记录锁不应中毒").events,
-            [Event::Prepare, Event::Database, Event::Discard]
-        );
-    }
-
-    #[tokio::test]
-    async fn cancellation_after_prepare_discards_candidate_before_database_and_publish() {
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let cancellation = CooperativeCancellation::default();
-        let mut directories =
-            directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
-        directories.cancel_after_prepare = Some(cancellation.clone());
-        let service = ProjectWorkspaceCreationService::new(
-            PathBuf::from("C:/ATT/projects"),
-            SuccessfulDatabaseCreator::default(),
-            directories,
-            cancellation,
-        );
-
-        let error = service
-            .create(workspace())
-            .await
-            .expect_err("取消后必须显式丢弃候选");
-
-        assert!(matches!(error, ProjectWorkspaceCreationError::Cancelled(_)));
-        assert_eq!(
-            trace.lock().expect("记录锁不应中毒").events,
-            [Event::Prepare, Event::Discard]
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_failure_stops_before_database_publish_and_discard() {
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let mut directories =
-            directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
-        directories.prepare_fails = true;
-        let service = ProjectWorkspaceCreationService::new(
-            PathBuf::from("C:/ATT/projects"),
-            FailingDatabaseCreator {
-                trace: Arc::clone(&trace),
-            },
-            directories,
-            CooperativeCancellation::default(),
-        );
-
-        let error = service
-            .create(workspace())
-            .await
-            .expect_err("候选目录未准备时应该立即失败");
-
-        assert!(matches!(
-            error,
-            ProjectWorkspaceCreationError::Prepare(DirectoryPrepareError::NotPrepared { .. })
-        ));
-        assert_eq!(
-            trace.lock().expect("记录锁不应中毒").events,
-            [Event::Prepare]
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_failure_preserves_candidate_cleanup_failure_without_extra_discard() {
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let staging_root = PathBuf::from("C:/ATT/projects/.stage-demo");
-        let mut directories = directory_publisher(
-            Arc::clone(&trace),
-            staging_root.to_str().expect("测试路径应为 UTF-8"),
-        );
-        directories.prepare_fails = true;
-        directories.prepare_cleanup_fails = true;
-        let service = ProjectWorkspaceCreationService::new(
-            PathBuf::from("C:/ATT/projects"),
-            FailingDatabaseCreator {
-                trace: Arc::clone(&trace),
-            },
-            directories,
-            CooperativeCancellation::default(),
-        );
-
-        let error = service
-            .create(workspace())
-            .await
-            .expect_err("候选准备与内部清理双重失败应该一起返回");
-
-        let ProjectWorkspaceCreationError::Prepare(DirectoryPrepareError::NotPrepared {
-            cleanup_failure: Some(cleanup_failure),
-            ..
-        }) = error
-        else {
-            panic!("准备错误应该保留根返回的候选清理失败")
-        };
-        assert_eq!(cleanup_failure.residual_path(), staging_root);
-        assert_eq!(*cleanup_failure.source(), RootError);
-        assert_eq!(
-            trace.lock().expect("记录锁不应中毒").events,
-            [Event::Prepare]
-        );
-    }
-
-    #[tokio::test]
-    async fn every_database_terminal_error_discards_once_and_preserves_its_kind() {
-        let database_path = PathBuf::from("C:/ATT/projects/.stage-demo/project.db");
-        let cases = [
-            (
-                ProjectDatabaseCreateError::AlreadyExists {
-                    path: database_path.clone(),
-                },
-                DatabaseFailureKind::AlreadyExists,
-            ),
-            (
-                ProjectDatabaseCreateError::NotCreated {
-                    path: database_path.clone(),
-                    source: RootError,
-                },
-                DatabaseFailureKind::NotCreated,
-            ),
-            (
-                ProjectDatabaseCreateError::OutcomeUnknown {
-                    path: database_path.clone(),
-                    source: RootError,
-                },
-                DatabaseFailureKind::OutcomeUnknown,
-            ),
-            (
-                ProjectDatabaseCreateError::ResidualArtifact {
-                    path: database_path,
-                    source: RootError,
-                },
-                DatabaseFailureKind::ResidualArtifact,
-            ),
-        ];
-
-        for (database_error, expected_kind) in cases {
-            let trace = Arc::new(Mutex::new(Trace::default()));
-            let service = ProjectWorkspaceCreationService::new(
-                PathBuf::from("C:/ATT/projects"),
-                ScriptedDatabaseCreator {
-                    trace: Arc::clone(&trace),
-                    error: Mutex::new(Some(database_error)),
-                },
-                directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo"),
-                CooperativeCancellation::default(),
-            );
-
-            let error = service
-                .create(workspace())
-                .await
-                .expect_err("建库终态错误应该使工作区创建失败");
-            let ProjectWorkspaceCreationError::Database(error) = error else {
-                panic!("建库错误且清理成功时应保留原建库错误")
-            };
-
-            assert_eq!(DatabaseFailureKind::from(&error), expected_kind);
-            assert_eq!(
-                trace.lock().expect("记录锁不应中毒").events,
-                [Event::Prepare, Event::Database, Event::Discard]
-            );
+                .expect("workspace responses mutex should not be poisoned")
+                .pop_front()
+                .expect("测试必须提供响应")
         }
-    }
-
-    #[tokio::test]
-    async fn database_and_discard_failures_are_both_preserved() {
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let mut directories =
-            directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
-        directories.discard_fails = true;
-        let service = ProjectWorkspaceCreationService::new(
-            PathBuf::from("C:/ATT/projects"),
-            FailingDatabaseCreator {
-                trace: Arc::clone(&trace),
-            },
-            directories,
-            CooperativeCancellation::default(),
-        );
-
-        let error = service
-            .create(workspace())
-            .await
-            .expect_err("建库与清理双重失败应该返回");
-
-        let ProjectWorkspaceCreationError::DatabaseAndDiscard { database, discard } = error else {
-            panic!("应该同时保留建库与清理失败")
-        };
-        assert_eq!(database, DatabaseError);
-        assert_eq!(
-            discard.staging_root(),
-            PathBuf::from("C:/ATT/projects/.stage-demo")
-        );
-        assert_eq!(*discard.source(), RootError);
-        assert_eq!(
-            trace.lock().expect("记录锁不应中毒").events,
-            [Event::Prepare, Event::Database, Event::Discard]
-        );
-    }
-
-    #[tokio::test]
-    async fn publish_terminal_errors_are_preserved_without_second_cleanup() {
-        for publish_failure in [
-            PublishFailure::TargetAlreadyExists,
-            PublishFailure::NotPublished,
-            PublishFailure::PublishedWithResiduals,
-            PublishFailure::OutcomeUnknown,
-        ] {
-            let trace = Arc::new(Mutex::new(Trace::default()));
-            let mut directories =
-                directory_publisher(Arc::clone(&trace), "C:/ATT/projects/.stage-demo");
-            directories.publish_failure = Some(publish_failure);
-            let service = ProjectWorkspaceCreationService::new(
-                PathBuf::from("C:/ATT/projects"),
-                ProjectDatabaseCreationService::new(RecordingSqliteCreator {
-                    trace: Arc::clone(&trace),
-                }),
-                directories,
-                CooperativeCancellation::default(),
-            );
-
-            let error = service
-                .create(workspace())
-                .await
-                .expect_err("发布终态错误应该使工作区创建失败");
-            let ProjectWorkspaceCreationError::Publish(error) = error else {
-                panic!("应该保留发布终态错误")
-            };
-
-            assert_eq!(PublishFailure::from(&error), publish_failure);
-            assert_eq!(
-                trace.lock().expect("记录锁不应中毒").events,
-                [
-                    Event::Prepare,
-                    Event::Database,
-                    Event::Publish(DirectoryPublishIntent::CreateNew),
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn workspace_creation_future_is_send() {
-        let trace = Arc::new(Mutex::new(Trace::default()));
-        let service = ProjectWorkspaceCreationService::new(
-            PathBuf::from("C:/ATT/projects"),
-            FailingDatabaseCreator {
-                trace: Arc::clone(&trace),
-            },
-            directory_publisher(trace, "C:/ATT/projects/.stage-demo"),
-            CooperativeCancellation::default(),
-        );
-
-        assert_send(service.create(workspace()));
     }
 
     fn init_input() -> InitInput {
         InitInput {
-            name: "游戏 一".parse().expect("测试项目名应该合法"),
-            game_root: PathBuf::from("./Game One"),
+            name: "game".parse().expect("项目名应合法"),
+            game_root: PathBuf::from("./Game"),
             source_language: " ja ".to_owned(),
             target_language: " zh-Hans ".to_owned(),
-            layout_profile: layout_profile(),
+            layout_profile: profile(),
         }
     }
 
-    fn concurrent_init_service(
-        directories: LinearizingRecoverablePublisher,
-        database: SuccessfulDatabaseCreator,
-        trace: Arc<Mutex<Trace>>,
-    ) -> InitService<
-        RecordingDirectoryResolver,
-        ProjectWorkspaceCreationService<SuccessfulDatabaseCreator, LinearizingRecoverablePublisher>,
-    > {
-        InitService::new(
-            RecordingDirectoryResolver {
-                resolved: PathBuf::from("C:/Games/Game One"),
-                trace,
+    #[tokio::test]
+    async fn init_service_normalizes_input_and_maps_updated_owner_result() {
+        let converger = FakeWorkspaceConverger {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(VecDeque::from([Ok(
+                ProjectWorkspaceConvergence::Updated {
+                    stale_owners: vec![MzStandardAssetOwner::Builtin, MzStandardAssetOwner::Lua],
+                },
+            )]))),
+        };
+        let service = InitService::new(converger, CooperativeCancellation::default());
+
+        let output = service
+            .execute(init_input())
+            .await
+            .expect("Init 编排应成功");
+
+        assert_eq!(output.name.as_str(), "game");
+        assert_eq!(
+            output.outcome,
+            InitOutcome::Updated {
+                stale_owners: vec![InitStaleOwner::Builtin, InitStaleOwner::Lua],
+            }
+        );
+        let requests = service
+            .workspace_converger
+            .requests
+            .lock()
+            .expect("workspace requests mutex should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].source_game_root, Path::new("./Game"));
+        assert_eq!(requests[0].source_language, "ja");
+        assert_eq!(requests[0].target_language, "zh-Hans");
+    }
+
+    #[tokio::test]
+    async fn blank_language_stops_before_workspace_convergence() {
+        let converger = FakeWorkspaceConverger {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let service = InitService::new(converger, CooperativeCancellation::default());
+        let mut input = init_input();
+        input.source_language = " \t ".to_owned();
+
+        assert!(matches!(
+            service.execute(input).await,
+            Err(InitServiceError::EmptySourceLanguage)
+        ));
+        assert!(
+            service
+                .workspace_converger
+                .requests
+                .lock()
+                .expect("workspace requests mutex should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn init_and_workspace_futures_are_send() {
+        fn assert_send(_: impl Send) {}
+
+        let state = database_state(0x11, Vec::new());
+        let (workspace, _) = service(
+            false,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Missing,
+            0x11,
+            Ok(state.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(false, state)),
+            Ok(()),
+        );
+        assert_send(workspace.converge(request()));
+
+        let init = InitService::new(
+            FakeWorkspaceConverger {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                responses: Arc::new(Mutex::new(VecDeque::from([Ok(
+                    ProjectWorkspaceConvergence::Created,
+                )]))),
             },
-            ProjectWorkspaceCreationService::new(
-                PathBuf::from("C:/ATT/projects"),
-                database,
-                directories,
-                CooperativeCancellation::default(),
-            ),
             CooperativeCancellation::default(),
-        )
-    }
-
-    fn workspace() -> NewProjectWorkspace {
-        NewProjectWorkspace::new(
-            PathBuf::from("C:/Games/Demo"),
-            NewProject::new(
-                "demo".parse().expect("测试项目名应该合法"),
-                "ja".to_owned(),
-                "zh-Hans".to_owned(),
-                layout_profile(),
-            ),
-        )
-    }
-
-    fn layout_profile() -> MzWriteBackLayoutProfile {
-        MzWriteBackLayoutProfile::new(width(24), width(30), width(18))
-    }
-
-    fn width(value: u32) -> super::super::project::MaxFullwidthChars {
-        super::super::project::MaxFullwidthChars::new(value).expect("测试宽度应该是正整数")
-    }
-
-    fn assert_send(_: impl Send) {}
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum DatabaseFailureKind {
-        AlreadyExists,
-        NotCreated,
-        OutcomeUnknown,
-        ResidualArtifact,
-    }
-
-    impl<E> From<&ProjectDatabaseCreateError<E>> for DatabaseFailureKind {
-        fn from(error: &ProjectDatabaseCreateError<E>) -> Self {
-            match error {
-                ProjectDatabaseCreateError::AlreadyExists { .. } => Self::AlreadyExists,
-                ProjectDatabaseCreateError::NotCreated { .. } => Self::NotCreated,
-                ProjectDatabaseCreateError::OutcomeUnknown { .. } => Self::OutcomeUnknown,
-                ProjectDatabaseCreateError::ResidualArtifact { .. } => Self::ResidualArtifact,
-            }
-        }
-    }
-
-    impl From<&DirectoryPublishError<RootError>> for PublishFailure {
-        fn from(error: &DirectoryPublishError<RootError>) -> Self {
-            match error {
-                DirectoryPublishError::TargetAlreadyExists { .. } => Self::TargetAlreadyExists,
-                DirectoryPublishError::NotAttempted { .. } => Self::NotAttempted,
-                DirectoryPublishError::NotPublished { .. } => Self::NotPublished,
-                DirectoryPublishError::PublishedWithResiduals { .. } => {
-                    Self::PublishedWithResiduals
-                }
-                DirectoryPublishError::RecoveryRequired { .. } => Self::RecoveryRequired,
-                DirectoryPublishError::OutcomeUnknown { .. } => Self::OutcomeUnknown,
-                DirectoryPublishError::TargetMissing { .. }
-                | DirectoryPublishError::TargetNotDirectory { .. } => {
-                    panic!("CreateNew 根不应返回 Replace 专属终态")
-                }
-            }
-        }
-    }
-
-    fn directory_publisher(
-        trace: Arc<Mutex<Trace>>,
-        staging_root: &str,
-    ) -> RecordingRecoverablePublisher {
-        RecordingRecoverablePublisher {
-            staging_root: PathBuf::from(staging_root),
-            trace,
-            prepare_fails: false,
-            prepare_cleanup_fails: false,
-            discard_fails: false,
-            publish_failure: None,
-            cancel_after_prepare: None,
-        }
+        );
+        assert_send(init.execute(init_input()));
     }
 }

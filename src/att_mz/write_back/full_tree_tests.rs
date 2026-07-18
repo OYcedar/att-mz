@@ -16,7 +16,7 @@ use super::lua::LuaWriteBackService;
 use super::publisher::StandardWriteBackPublishingService;
 use super::rewriter::MzWriteBackDocumentRewritingService;
 use super::standard::{
-    ConservativeMzWriteBackTextLayouter, StandardWriteBackRunLog, StandardWriteBackService,
+    ConservativeMzWriteBackTextLayouter, StandardWriteBackService, WriteBackRunLog,
 };
 use super::{WriteBackInput, WriteBackService, WriteBackUseCase};
 use crate::att_mz::ProjectName;
@@ -24,7 +24,7 @@ use crate::att_mz::extract::document::{MzDocumentReadingConfig, MzProjectDocumen
 use crate::att_mz::location_codec::MzLocationCodec;
 use crate::att_mz::lua::hosting::TrustedLuaExecutionHostingService;
 use crate::att_mz::lua::runtime::{
-    OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaRuntimeBindings,
+    OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeBindings,
     TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
     TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
 };
@@ -39,15 +39,19 @@ use crate::att_mz::lua::{LuaPhase, LuaProjectContext};
 use crate::att_mz::project::ExistingProjectOpeningService;
 use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
+use crate::fingerprint::Sha256Fingerprint;
 use crate::llm::{ChatMessage, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse};
 use crate::observability::PersistentEventLog;
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{
-    DirectoryDiscardError, DirectoryLister, DirectoryPrepareError, DirectoryPublishError,
-    DirectoryPublishIntent, DirectoryStageRequest, ExistingDirectoryResolver, FileReader,
-    ListDirectoryError, ReadFile, ReadFileError, RecoverableDirectoryPublisher,
-    ResolveDirectoryError, StagedDirectory,
+    BoundScopedDirectory, DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind,
+    DirectoryLister, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
+    DirectoryStageRequest, DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest,
+    DirectoryTreeFingerprinter, ExistingDirectoryResolver, FileReader, ListDirectoryError,
+    ReadFile, ReadFileError, RecoverableDirectoryPublisher, ResolveDirectoryError,
+    ScopedDirectoryBindError, ScopedDirectoryEditError, ScopedDirectoryEditor,
+    ScopedDirectoryEntry, ScopedDirectoryPath, StagedDirectory,
 };
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteCommand, SqliteQuery, SqliteQueryExecutor, SqliteRow,
@@ -88,8 +92,8 @@ impl SqliteQueryExecutor for RecordingSqliteQuery {
             .push((path, query.clone()));
         if query.statement().contains("FROM metadata") {
             Ok(vec![metadata_row()])
-        } else if query.statement().contains("'entry' AS asset_table") {
-            Ok(write_back_asset_rows())
+        } else if query.statement().contains("'owner_state' AS record_kind") {
+            Ok(write_back_snapshot_rows())
         } else {
             Err(QueryExistingDatabaseError::QueryFailed(TestError(
                 "意外的全树测试查询",
@@ -101,6 +105,20 @@ impl SqliteQueryExecutor for RecordingSqliteQuery {
 #[derive(Clone, Default)]
 struct RecordingDirectoryResolver {
     calls: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+#[derive(Clone, Copy)]
+struct MatchingDirectoryTreeFingerprinter;
+
+impl DirectoryTreeFingerprinter for MatchingDirectoryTreeFingerprinter {
+    type Error = TestError;
+
+    async fn fingerprint_directory_tree(
+        &self,
+        _: DirectoryTreeFingerprintRequest,
+    ) -> Result<Sha256Fingerprint, DirectoryTreeFingerprintError<Self::Error>> {
+        Ok(Sha256Fingerprint::from_slice(&[7; 32]).expect("固定测试指纹应合法"))
+    }
 }
 
 impl ExistingDirectoryResolver for RecordingDirectoryResolver {
@@ -139,6 +157,25 @@ impl FileReader for RecordingFileReader {
     }
 }
 
+impl DirectoryLister for RecordingFileReader {
+    type Error = TestError;
+
+    async fn list_directory(
+        &self,
+        path: PathBuf,
+    ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<Self::Error>> {
+        let mut entries = self
+            .files
+            .keys()
+            .filter(|entry| entry.parent() == Some(path.as_path()))
+            .cloned()
+            .map(|entry| DirectoryEntry::new(entry, DirectoryEntryKind::RegularFile))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.resolved_path().cmp(right.resolved_path()));
+        Ok(entries)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RejectingDirectoryLister;
 
@@ -148,7 +185,7 @@ impl DirectoryLister for RejectingDirectoryLister {
     async fn list_directory(
         &self,
         path: PathBuf,
-    ) -> Result<Vec<PathBuf>, ListDirectoryError<Self::Error>> {
+    ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<Self::Error>> {
         Err(ListDirectoryError::Io {
             path,
             source: TestError("精确 Map 选择不应列举 data"),
@@ -177,7 +214,9 @@ impl CpuTaskExecutor for InlineCpuExecutor {
 #[derive(Clone, Default)]
 struct RecordingRecoverablePublisher {
     requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
+    validation_calls: Arc<Mutex<Vec<PathBuf>>>,
     publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishIntent)>>>,
+    discard_calls: Arc<Mutex<Vec<PathBuf>>>,
     publish_error: Arc<Mutex<Option<DirectoryPublishError<TestError>>>>,
 }
 
@@ -230,21 +269,99 @@ impl RecoverableDirectoryPublisher for RecordingRecoverablePublisher {
 
     async fn discard(
         &self,
-        _staged: StagedDirectory<Self::StagingState>,
+        staged: StagedDirectory<Self::StagingState>,
     ) -> Result<(), DirectoryDiscardError<Self::Error>> {
-        panic!("Standard WriteBack 全树不应丢弃已暂存候选")
+        self.discard_calls
+            .lock()
+            .expect("丢弃记录锁不应中毒")
+            .push(staged.staging_root().to_path_buf());
+        Ok(())
+    }
+}
+
+impl ScopedDirectoryEditor for RecordingRecoverablePublisher {
+    type CandidateState = ();
+    type ScopeState = ();
+    type Error = TestError;
+
+    fn bind_scoped_directory(
+        &self,
+        candidate: &StagedDirectory<Self::CandidateState>,
+    ) -> impl Future<
+        Output = Result<
+            BoundScopedDirectory<Self::ScopeState>,
+            ScopedDirectoryBindError<Self::Error>,
+        >,
+    > + Send
+    + use<> {
+        let root = candidate.staging_root().to_path_buf();
+        std::future::ready(Ok(BoundScopedDirectory::new(root, ())))
+    }
+
+    fn validate_scoped_directory(
+        &self,
+        scope: &BoundScopedDirectory<Self::ScopeState>,
+    ) -> impl Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send + use<>
+    {
+        let calls = Arc::clone(&self.validation_calls);
+        let root = scope.root().to_path_buf();
+        calls.lock().expect("候选校验记录锁不应中毒").push(root);
+        std::future::ready(Ok(()))
+    }
+
+    fn read_scoped_file(
+        &self,
+        _scope: &BoundScopedDirectory<Self::ScopeState>,
+        _path: ScopedDirectoryPath,
+    ) -> impl Future<Output = Result<Vec<u8>, ScopedDirectoryEditError<Self::Error>>> + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+
+    fn list_scoped_directory(
+        &self,
+        _scope: &BoundScopedDirectory<Self::ScopeState>,
+        _path: ScopedDirectoryPath,
+    ) -> impl Future<
+        Output = Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Self::Error>>,
+    > + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+
+    fn create_scoped_directory(
+        &self,
+        _scope: &BoundScopedDirectory<Self::ScopeState>,
+        _path: ScopedDirectoryPath,
+    ) -> impl Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn write_scoped_file(
+        &self,
+        _scope: &BoundScopedDirectory<Self::ScopeState>,
+        _path: ScopedDirectoryPath,
+        _bytes: Vec<u8>,
+    ) -> impl Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn remove_scoped_path(
+        &self,
+        _scope: &BoundScopedDirectory<Self::ScopeState>,
+        _path: ScopedDirectoryPath,
+    ) -> impl Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send {
+        std::future::ready(Ok(()))
     }
 }
 
 #[derive(Clone, Default)]
 struct RecordingRunLog {
-    events: Arc<Mutex<Vec<StandardWriteBackRunLog>>>,
+    events: Arc<Mutex<Vec<WriteBackRunLog>>>,
 }
 
-impl PersistentEventLog<StandardWriteBackRunLog> for RecordingRunLog {
+impl PersistentEventLog<WriteBackRunLog> for RecordingRunLog {
     type Error = TestError;
 
-    async fn append(&self, event: StandardWriteBackRunLog) -> Result<(), Self::Error> {
+    async fn append(&self, event: WriteBackRunLog) -> Result<(), Self::Error> {
         self.events.lock().expect("日志记录锁不应中毒").push(event);
         Ok(())
     }
@@ -323,26 +440,23 @@ impl TrustedLuaRuntimeReservation for ExercisingLuaReservation {
         program: OwnedLuaProgram,
         bindings: TrustedLuaRuntimeBindings,
     ) -> TrustedLuaExecutionHandle<Self::Error> {
-        let (calls, finalizer) = bindings.into_parts();
+        let (common, phase, finalizer) = bindings.into_parts();
+        let is_write_back = matches!(phase, TrustedLuaPhaseBindings::WriteBack(_));
+        assert!(is_write_back, "WriteBack 测试树只应收到 WriteBack 阶段能力");
+        let calls = Arc::clone(common.calls());
         {
             let mut facts = self.facts.lock().expect("Runtime 记录锁不应中毒");
             facts.program_path = Some(program.main_script_path().to_path_buf());
             facts.program_source = program.source().to_vec();
-            facts.phase = Some(calls.phase());
+            facts.phase = Some(LuaPhase::WriteBack);
             facts.project = Some(calls.project().clone());
+            facts.llm_unavailable = true;
         }
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let facts = Arc::clone(&self.facts);
         let mode = self.mode;
         tokio::spawn(async move {
-            let llm_unavailable = calls.request_llm(Vec::new()).await.is_err();
-            facts
-                .lock()
-                .expect("Runtime 记录锁不应中毒")
-                .llm_unavailable = llm_unavailable;
-
             let runtime = match calls.begin().await {
                 Err(source) => Err(TrustedLuaRuntimeExecutionError::Binding(source)),
                 Ok(()) if mode == RuntimeTransactionMode::Commit => calls
@@ -517,8 +631,10 @@ struct FullTreeObservations {
     file_calls: Arc<Mutex<Vec<PathBuf>>>,
     cpu_calls: Arc<AtomicUsize>,
     publish_requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
+    validation_calls: Arc<Mutex<Vec<PathBuf>>>,
     publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishIntent)>>>,
-    run_logs: Arc<Mutex<Vec<StandardWriteBackRunLog>>>,
+    discard_calls: Arc<Mutex<Vec<PathBuf>>>,
+    run_logs: Arc<Mutex<Vec<WriteBackRunLog>>>,
     llm_calls: Arc<AtomicUsize>,
     runtime_facts: Arc<Mutex<RuntimeFacts>>,
     session_facts: Arc<Mutex<SessionFacts>>,
@@ -558,7 +674,11 @@ fn build_full_tree_with_publish_error(
 
     let record_reader =
         ProjectDatabaseRecordReadingService::new(PathBuf::from(PROJECTS_ROOT), sqlite.clone());
-    let opener = ExistingProjectOpeningService::new(record_reader, resolver.clone());
+    let opener = ExistingProjectOpeningService::new(
+        record_reader,
+        resolver.clone(),
+        MatchingDirectoryTreeFingerprinter,
+    );
     let asset_reader = MzStandardWriteBackAssetReadingService::new(
         sqlite.clone(),
         cpu.clone(),
@@ -572,14 +692,11 @@ fn build_full_tree_with_publish_error(
     );
     let rewriter = MzWriteBackDocumentRewritingService::new(document_reader, cpu.clone());
     let cancellation = crate::execution::CooperativeCancellation::default();
-    let publisher =
-        StandardWriteBackPublishingService::new(directory_publisher.clone(), cancellation.clone());
+    let publisher = StandardWriteBackPublishingService::new(directory_publisher.clone());
     let standard = StandardWriteBackService::new(
         asset_reader,
         ConservativeMzWriteBackTextLayouter,
         rewriter,
-        publisher,
-        run_log.clone(),
         cancellation.clone(),
     );
     let host = TrustedLuaExecutionHostingService::<_, RecordingLlm, _, _>::without_llm(
@@ -587,15 +704,24 @@ fn build_full_tree_with_publish_error(
         runtime.clone(),
         session_factory.clone(),
     );
-    let lua = LuaWriteBackService::new(host);
-    let service = WriteBackService::new(opener, standard, Some(lua), cancellation);
+    let lua = LuaWriteBackService::new(host, directory_publisher.clone());
+    let service = WriteBackService::new(
+        opener,
+        standard,
+        publisher,
+        Some(lua),
+        run_log.clone(),
+        cancellation,
+    );
     let observations = FullTreeObservations {
         sqlite_calls: sqlite.calls,
         resolved_directories: resolver.calls,
         file_calls: file_reader.calls,
         cpu_calls: cpu.calls,
         publish_requests: directory_publisher.requests,
+        validation_calls: directory_publisher.validation_calls,
         publish_calls: directory_publisher.publish_calls,
+        discard_calls: directory_publisher.discard_calls,
         run_logs: run_log.events,
         llm_calls: llm.calls,
         runtime_facts: runtime.facts,
@@ -617,7 +743,7 @@ async fn real_write_back_non_root_tree_rewrites_publishes_logs_and_runs_lua() {
     assert_eq!(output.name.as_str(), PROJECT_NAME);
     assert_eq!(output.output_root, workspace_root().join("write_back"));
     assert!(output.lua_executed);
-    assert_eq!(output.standard.translated_locations, 2);
+    assert_eq!(output.standard.translated_locations, 3);
     assert_eq!(output.standard.original_locations, 0);
     assert_eq!(output.standard.auto_wrapped_units, 2);
     assert_eq!(output.standard.inserted_line_breaks, 2);
@@ -631,7 +757,7 @@ async fn real_write_back_non_root_tree_rewrites_publishes_logs_and_runs_lua() {
 }
 
 #[tokio::test]
-async fn unclosed_lua_transaction_is_rolled_back_after_standard_remains_published() {
+async fn unclosed_lua_transaction_discards_the_unpublished_candidate() {
     let (service, observations) = build_full_tree(RuntimeTransactionMode::LeaveActive);
 
     let error = service
@@ -640,7 +766,7 @@ async fn unclosed_lua_transaction_is_rolled_back_after_standard_remains_publishe
         .expect_err("Lua 遗留活动事务必须令命令失败");
 
     let message = error.to_string();
-    assert!(message.contains("Lua 写回失败"));
+    assert!(message.contains("Lua 写回候选失败"));
     assert!(message.contains("write_back.lua"));
     assert!(message.contains("write_back"));
     assert_eq!(
@@ -650,15 +776,31 @@ async fn unclosed_lua_transaction_is_rolled_back_after_standard_remains_publishe
             .expect("发布记录锁不应中毒")
             .len(),
         1,
-        "Lua 失败不得撤销已经确认的 Standard 发布"
+        "Lua 执行前必须已准备完整候选"
+    );
+    assert!(
+        observations
+            .publish_calls
+            .lock()
+            .expect("发布记录锁不应中毒")
+            .is_empty(),
+        "Lua 失败不得让候选成为最终输出"
     );
     assert_eq!(
+        observations
+            .discard_calls
+            .lock()
+            .expect("丢弃记录锁不应中毒")
+            .as_slice(),
+        [workspace_root().join("write_back.att-stage")]
+    );
+    assert!(
         observations
             .run_logs
             .lock()
             .expect("日志记录锁不应中毒")
-            .len(),
-        1
+            .is_empty(),
+        "未发布候选不得记录完成日志"
     );
     let session = observations
         .session_facts
@@ -717,6 +859,14 @@ async fn published_cleanup_failure_is_not_logged_as_complete_standard_success() 
             .lock()
             .expect("日志记录锁不应中毒")
             .is_empty()
+    );
+    assert!(
+        observations
+            .discard_calls
+            .lock()
+            .expect("丢弃记录锁不应中毒")
+            .is_empty(),
+        "发布根接管 token 后不得由顶层再次丢弃"
     );
     assert_eq!(observations.llm_calls.load(Ordering::SeqCst), 0);
 }
@@ -797,9 +947,25 @@ fn assert_published_documents(
     assert_eq!(publish_calls[0].0, workspace_root().join("write_back"));
     assert_eq!(publish_calls[0].2, DirectoryPublishIntent::ReplaceExisting);
     drop(publish_calls);
+    assert_eq!(
+        observations
+            .validation_calls
+            .lock()
+            .expect("候选校验记录锁不应中毒")
+            .as_slice(),
+        [workspace_root().join("write_back.att-stage")]
+    );
+    assert!(
+        observations
+            .discard_calls
+            .lock()
+            .expect("丢弃记录锁不应中毒")
+            .is_empty()
+    );
 
     let items: Value = serde_json::from_slice(overlay(request, "data/Items.json"))
         .expect("Items overlay 应为 JSON");
+    assert_eq!(items[1]["name"], "Potion");
     assert_eq!(items[1]["description"], "甲乙，\n丙丁。");
     assert_eq!(items[1]["unknown"], true);
 
@@ -827,6 +993,7 @@ fn assert_published_documents(
     assert_eq!(logs[0].output_root(), workspace_root().join("write_back"));
     assert_eq!(logs[0].summary(), summary);
     assert!(logs[0].manual_layout_diagnostics().is_empty());
+    assert!(logs[0].lua_executed());
 }
 
 fn assert_successful_lua_execution(observations: &FullTreeObservations) {
@@ -845,7 +1012,7 @@ fn assert_successful_lua_execution(observations: &FullTreeObservations) {
     assert_eq!(project.source_root(), workspace_root().join("source"));
     assert_eq!(
         project.output_root(),
-        Some(workspace_root().join("write_back").as_path())
+        Some(workspace_root().join("write_back.att-stage").as_path())
     );
     assert_eq!(project.database_path(), database_path());
     assert_eq!(project.source_language(), "ja");
@@ -892,6 +1059,7 @@ fn metadata_row() -> SqliteRow {
         SqliteValue::Text(PROJECT_NAME.to_owned()),
         SqliteValue::Text("ja".to_owned()),
         SqliteValue::Text("zh-Hans".to_owned()),
+        SqliteValue::Blob(vec![7; 32]),
         SqliteValue::Integer(4),
         SqliteValue::Integer(8),
         SqliteValue::Integer(3),
@@ -902,8 +1070,12 @@ fn write_back_asset_rows() -> Vec<SqliteRow> {
     let item_source = MzSource::data(StandardDataFile::Items);
     let item_group = MzLocation::value(item_source.clone(), vec![MzLocationStep::index(1)]);
     let item_description = MzLocation::value(
-        item_source,
+        item_source.clone(),
         vec![MzLocationStep::index(1), MzLocationStep::key("description")],
+    );
+    let item_name = MzLocation::value(
+        item_source,
+        vec![MzLocationStep::index(1), MzLocationStep::key("name")],
     );
 
     let map_source = MzSource::map(1);
@@ -932,40 +1104,110 @@ fn write_back_asset_rows() -> Vec<SqliteRow> {
     );
 
     vec![
-        write_back_row(
-            "entry",
-            &item_description,
-            &item_group,
-            "description",
-            None,
-            "旧说明\n第二行",
-            "甲乙，丙丁。",
-        ),
-        write_back_row(
-            "text_body",
-            &dialogue_body,
-            &dialogue_group,
-            "body[0]",
-            Some("dialogue"),
-            "原始对话",
-            "「甲乙，丙丁」",
-        ),
+        write_back_row(WriteBackRowFixture {
+            table: "entry",
+            owner: "builtin",
+            exact_location: &item_description,
+            group_location: &item_group,
+            field_name: "description",
+            unit_type: None,
+            original_text: "旧说明\n第二行",
+            translation: "甲乙，丙丁。",
+        }),
+        write_back_row(WriteBackRowFixture {
+            table: "entry",
+            owner: "rules",
+            exact_location: &item_name,
+            group_location: &item_group,
+            field_name: "name",
+            unit_type: None,
+            original_text: "药水",
+            translation: "Potion",
+        }),
+        write_back_row(WriteBackRowFixture {
+            table: "text_body",
+            owner: "builtin",
+            exact_location: &dialogue_body,
+            group_location: &dialogue_group,
+            field_name: "body[0]",
+            unit_type: Some("dialogue"),
+            original_text: "原始对话",
+            translation: "「甲乙，丙丁」",
+        }),
     ]
 }
 
-fn write_back_row(
-    table: &str,
-    exact_location: &MzLocation,
-    group_location: &MzLocation,
-    field_name: &str,
-    unit_type: Option<&str>,
-    original_text: &str,
-    translation: &str,
-) -> SqliteRow {
+fn write_back_snapshot_rows() -> Vec<SqliteRow> {
+    let mut rows = ["builtin", "rules"]
+        .into_iter()
+        .map(|owner| {
+            SqliteRow::new(vec![
+                SqliteValue::Text("owner_state".to_owned()),
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Text(owner.to_owned()),
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Blob(vec![7; 32]),
+            ])
+        })
+        .collect::<Vec<_>>();
+    rows.extend(write_back_asset_rows().into_iter().map(|row| {
+        let [
+            asset_table,
+            exact_location,
+            owner,
+            group_location,
+            field_name,
+            unit_type,
+            original_text,
+            translation,
+        ] = <[SqliteValue; 8]>::try_from(row.into_values()).expect("全树测试资产行应恰好八列");
+        SqliteRow::new(vec![
+            SqliteValue::Text("asset".to_owned()),
+            asset_table,
+            exact_location,
+            owner,
+            group_location,
+            field_name,
+            unit_type,
+            original_text,
+            translation,
+            SqliteValue::Null,
+        ])
+    }));
+    rows
+}
+
+struct WriteBackRowFixture<'a> {
+    table: &'a str,
+    owner: &'a str,
+    exact_location: &'a MzLocation,
+    group_location: &'a MzLocation,
+    field_name: &'a str,
+    unit_type: Option<&'a str>,
+    original_text: &'a str,
+    translation: &'a str,
+}
+
+fn write_back_row(fixture: WriteBackRowFixture<'_>) -> SqliteRow {
+    let WriteBackRowFixture {
+        table,
+        owner,
+        exact_location,
+        group_location,
+        field_name,
+        unit_type,
+        original_text,
+        translation,
+    } = fixture;
     SqliteRow::new(vec![
         SqliteValue::Text(table.to_owned()),
         SqliteValue::Text(MzLocationCodec::encode(exact_location).expect("精确位置应该可编码")),
-        SqliteValue::Text("builtin".to_owned()),
+        SqliteValue::Text(owner.to_owned()),
         SqliteValue::Text(MzLocationCodec::encode(group_location).expect("组位置应该可编码")),
         SqliteValue::Text(field_name.to_owned()),
         unit_type.map_or(SqliteValue::Null, |value| {

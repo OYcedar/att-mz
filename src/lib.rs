@@ -7,6 +7,7 @@ pub mod att_mz;
 
 mod application;
 mod execution;
+mod fingerprint;
 mod language;
 mod llm;
 mod observability;

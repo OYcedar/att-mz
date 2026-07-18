@@ -9,9 +9,13 @@ use std::path::PathBuf;
 
 use super::ProjectName;
 use crate::project_database::{
-    ProjectDatabaseRecordReader, ProjectWorkspaceLayout, StoredProjectRecord,
+    ProjectDatabaseRecordReader, ProjectWorkspaceLayout, SourceSnapshotFingerprint,
+    StoredProjectRecord,
 };
-use crate::storage::file_system::{ExistingDirectoryResolver, ResolveDirectoryError};
+use crate::storage::file_system::{
+    DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
+    DirectoryTreeRoot, ExistingDirectoryResolver, ResolveDirectoryError,
+};
 
 pub use crate::project_database::{
     MaxFullwidthChars, MaxFullwidthCharsError, MzWriteBackLayoutProfile,
@@ -80,6 +84,10 @@ impl OpenedProject {
         self.record.target_language()
     }
 
+    pub(crate) const fn source_snapshot_fingerprint(&self) -> SourceSnapshotFingerprint {
+        self.record.source_snapshot_fingerprint()
+    }
+
     pub(crate) fn layout_profile(&self) -> &MzWriteBackLayoutProfile {
         self.record.layout_profile()
     }
@@ -98,26 +106,33 @@ pub(crate) trait ExistingProjectOpener: Send + Sync {
 }
 
 /// 通过项目数据库记录和当前目录状态建立项目上下文。
-pub(crate) struct ExistingProjectOpeningService<R, D> {
+pub(crate) struct ExistingProjectOpeningService<R, D, F> {
     record_reader: R,
     directory_resolver: D,
+    directory_tree_fingerprinter: F,
 }
 
-impl<R, D> ExistingProjectOpeningService<R, D> {
-    pub(crate) fn new(record_reader: R, directory_resolver: D) -> Self {
+impl<R, D, F> ExistingProjectOpeningService<R, D, F> {
+    pub(crate) fn new(
+        record_reader: R,
+        directory_resolver: D,
+        directory_tree_fingerprinter: F,
+    ) -> Self {
         Self {
             record_reader,
             directory_resolver,
+            directory_tree_fingerprinter,
         }
     }
 }
 
-impl<R, D> ExistingProjectOpener for ExistingProjectOpeningService<R, D>
+impl<R, D, F> ExistingProjectOpener for ExistingProjectOpeningService<R, D, F>
 where
     R: ProjectDatabaseRecordReader,
     D: ExistingDirectoryResolver,
+    F: DirectoryTreeFingerprinter,
 {
-    type Error = ExistingProjectOpeningError<R::Error, D::Error>;
+    type Error = ExistingProjectOpeningError<R::Error, D::Error, F::Error>;
 
     async fn open(&self, name: &ProjectName) -> Result<OpenedProject, Self::Error> {
         let record = self
@@ -125,14 +140,37 @@ where
             .read(name)
             .await
             .map_err(ExistingProjectOpeningError::ReadProjectRecord)?;
-        self.directory_resolver
+        let source_data = self
+            .directory_resolver
             .resolve_existing_directory(record.layout().source_data().to_path_buf())
             .await
             .map_err(ExistingProjectOpeningError::ResolveSourceData)?;
-        self.directory_resolver
+        let source_js = self
+            .directory_resolver
             .resolve_existing_directory(record.layout().source_js().to_path_buf())
             .await
             .map_err(ExistingProjectOpeningError::ResolveSourceJs)?;
+
+        let request = DirectoryTreeFingerprintRequest::new(vec![
+            DirectoryTreeRoot::new(source_data, "data".into())
+                .expect("固定 data 逻辑根必须符合目录树指纹契约"),
+            DirectoryTreeRoot::new(source_js, "js".into())
+                .expect("固定 js 逻辑根必须符合目录树指纹契约"),
+        ])
+        .expect("固定 data 与 js 逻辑根必须互不重叠");
+        let observed = self
+            .directory_tree_fingerprinter
+            .fingerprint_directory_tree(request)
+            .await
+            .map_err(ExistingProjectOpeningError::FingerprintSource)?;
+        let observed = SourceSnapshotFingerprint::from_bytes(observed.into_bytes());
+        let persisted = record.source_snapshot_fingerprint();
+        if observed != persisted {
+            return Err(ExistingProjectOpeningError::SourceSnapshotMismatch {
+                persisted,
+                observed,
+            });
+        }
 
         Ok(OpenedProject::from_record(record))
     }
@@ -140,19 +178,27 @@ where
 
 /// 项目开启服务在自身职责边界内产生的阶段错误。
 #[derive(Debug)]
-pub(crate) enum ExistingProjectOpeningError<R, D> {
+pub(crate) enum ExistingProjectOpeningError<R, D, F> {
     /// 无法读取项目数据库记录。
     ReadProjectRecord(R),
     /// 冻结的 `source/data` 当前不可用。
     ResolveSourceData(ResolveDirectoryError<D>),
     /// 冻结的 `source/js` 当前不可用。
     ResolveSourceJs(ResolveDirectoryError<D>),
+    /// 无法建立冻结来源的当前内容指纹。
+    FingerprintSource(DirectoryTreeFingerprintError<F>),
+    /// 工作区的实际冻结来源已与数据库记录分离。
+    SourceSnapshotMismatch {
+        persisted: SourceSnapshotFingerprint,
+        observed: SourceSnapshotFingerprint,
+    },
 }
 
-impl<R, D> fmt::Display for ExistingProjectOpeningError<R, D>
+impl<R, D, F> fmt::Display for ExistingProjectOpeningError<R, D, F>
 where
     R: fmt::Display,
     D: fmt::Display,
+    F: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -163,19 +209,32 @@ where
             Self::ResolveSourceJs(error) => {
                 write!(formatter, "冻结的 js 目录当前不可用：{error}")
             }
+            Self::FingerprintSource(error) => {
+                write!(formatter, "无法建立冻结来源指纹：{error}")
+            }
+            Self::SourceSnapshotMismatch {
+                persisted,
+                observed,
+            } => write!(
+                formatter,
+                "冻结来源内容与项目数据库记录不一致（记录 {persisted:?}，实际 {observed:?}）"
+            ),
         }
     }
 }
 
-impl<R, D> Error for ExistingProjectOpeningError<R, D>
+impl<R, D, F> Error for ExistingProjectOpeningError<R, D, F>
 where
     R: Error + 'static,
     D: Error + 'static,
+    F: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ReadProjectRecord(error) => Some(error),
             Self::ResolveSourceData(error) | Self::ResolveSourceJs(error) => Some(error),
+            Self::FingerprintSource(error) => Some(error),
+            Self::SourceSnapshotMismatch { .. } => None,
         }
     }
 }
@@ -195,6 +254,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::fingerprint::Sha256Fingerprint;
 
     #[derive(Clone)]
     struct FakeRecordReader {
@@ -260,6 +320,46 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FakeDirectoryTreeFingerprinter {
+        response: Result<Sha256Fingerprint, FingerprintResponseError>,
+        calls: Arc<Mutex<Vec<DirectoryTreeFingerprintRequest>>>,
+    }
+
+    impl FakeDirectoryTreeFingerprinter {
+        fn matching() -> Self {
+            Self {
+                response: Ok(Sha256Fingerprint::from_bytes([0xa5; 32])),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl DirectoryTreeFingerprinter for FakeDirectoryTreeFingerprinter {
+        type Error = FakeFingerprintError;
+
+        async fn fingerprint_directory_tree(
+            &self,
+            request: DirectoryTreeFingerprintRequest,
+        ) -> Result<Sha256Fingerprint, DirectoryTreeFingerprintError<Self::Error>> {
+            self.calls
+                .lock()
+                .expect("目录树指纹调用锁不应中毒")
+                .push(request);
+            self.response.map_err(|error| match error {
+                FingerprintResponseError::Changed => {
+                    DirectoryTreeFingerprintError::ChangedDuringObservation {
+                        path: PathBuf::from("C:/att/projects/游戏 一/source/data"),
+                    }
+                }
+                FingerprintResponseError::Failed => DirectoryTreeFingerprintError::Failed {
+                    path: PathBuf::from("C:/att/projects/游戏 一/source/data"),
+                    source: FakeFingerprintError,
+                },
+            })
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeRecordError;
 
@@ -282,11 +382,28 @@ mod tests {
 
     impl Error for FakeDirectoryError {}
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FakeFingerprintError;
+
+    impl fmt::Display for FakeFingerprintError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("fake fingerprint failure")
+        }
+    }
+
+    impl Error for FakeFingerprintError {}
+
     #[derive(Clone, Copy)]
     enum DirectoryResponseError {
         NotFound,
         NotDirectory,
         Io,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FingerprintResponseError {
+        Changed,
+        Failed,
     }
 
     fn record() -> StoredProjectRecord {
@@ -308,8 +425,11 @@ mod tests {
         MaxFullwidthChars::new(value).expect("测试宽度应该是正整数")
     }
 
-    fn succeeding_service() -> ExistingProjectOpeningService<FakeRecordReader, FakeDirectoryResolver>
-    {
+    fn succeeding_service() -> ExistingProjectOpeningService<
+        FakeRecordReader,
+        FakeDirectoryResolver,
+        FakeDirectoryTreeFingerprinter,
+    > {
         ExistingProjectOpeningService::new(
             FakeRecordReader {
                 response: Ok(record()),
@@ -319,6 +439,7 @@ mod tests {
                 Ok(PathBuf::from("C:/att/projects/游戏 一/source/data")),
                 Ok(PathBuf::from("C:/att/projects/游戏 一/source/js")),
             ]),
+            FakeDirectoryTreeFingerprinter::matching(),
         )
     }
 
@@ -366,6 +487,10 @@ mod tests {
         );
         assert_eq!(opened.source_language(), "ja");
         assert_eq!(opened.target_language(), "zh-Hans");
+        assert_eq!(
+            opened.source_snapshot_fingerprint(),
+            SourceSnapshotFingerprint::from_bytes([0xa5; 32])
+        );
         assert_eq!(opened.layout_profile(), &profile());
         assert_eq!(
             service
@@ -388,6 +513,29 @@ mod tests {
                 PathBuf::from("C:/att/projects/游戏 一/source/js"),
             ]
         );
+        let fingerprint_calls = service
+            .directory_tree_fingerprinter
+            .calls
+            .lock()
+            .expect("目录树指纹调用锁不应中毒");
+        assert_eq!(fingerprint_calls.len(), 1);
+        assert_eq!(
+            fingerprint_calls[0]
+                .roots()
+                .iter()
+                .map(|root| (root.physical_root(), root.logical_root()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Path::new("C:/att/projects/游戏 一/source/data"),
+                    Path::new("data"),
+                ),
+                (
+                    Path::new("C:/att/projects/游戏 一/source/js"),
+                    Path::new("js"),
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -401,6 +549,7 @@ mod tests {
                 Ok(PathBuf::from("C:/att/projects/游戏 一/source/data")),
                 Ok(PathBuf::from("C:/att/projects/游戏 一/source/js")),
             ]),
+            FakeDirectoryTreeFingerprinter::matching(),
         );
 
         let error = service
@@ -435,6 +584,7 @@ mod tests {
                     calls: Arc::new(Mutex::new(Vec::new())),
                 },
                 FakeDirectoryResolver::new([Err(response)]),
+                FakeDirectoryTreeFingerprinter::matching(),
             );
 
             let error = service
@@ -478,6 +628,7 @@ mod tests {
                 Ok(PathBuf::from("C:/att/projects/游戏 一/source/data")),
                 Err(DirectoryResponseError::NotFound),
             ]),
+            FakeDirectoryTreeFingerprinter::matching(),
         );
 
         let error = service
@@ -503,6 +654,99 @@ mod tests {
                 PathBuf::from("C:/att/projects/游戏 一/source/js"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn fingerprint_failure_stops_project_opening_after_both_directories_are_resolved() {
+        let service = ExistingProjectOpeningService::new(
+            FakeRecordReader {
+                response: Ok(record()),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeDirectoryResolver::new([
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/data")),
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/js")),
+            ]),
+            FakeDirectoryTreeFingerprinter {
+                response: Err(FingerprintResponseError::Failed),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+
+        let error = service
+            .open(&"游戏 一".parse().expect("测试项目名称应该有效"))
+            .await
+            .expect_err("指纹失败应该阻止项目开启");
+
+        assert!(matches!(
+            error,
+            ExistingProjectOpeningError::FingerprintSource(DirectoryTreeFingerprintError::Failed {
+                source: FakeFingerprintError,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn changed_source_snapshot_is_rejected_even_when_directories_still_exist() {
+        let service = ExistingProjectOpeningService::new(
+            FakeRecordReader {
+                response: Ok(record()),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeDirectoryResolver::new([
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/data")),
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/js")),
+            ]),
+            FakeDirectoryTreeFingerprinter {
+                response: Ok(Sha256Fingerprint::from_bytes([0xb4; 32])),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+
+        let error = service
+            .open(&"游戏 一".parse().expect("测试项目名称应该有效"))
+            .await
+            .expect_err("冻结来源与记录不一致应该阻止项目开启");
+
+        assert!(matches!(
+            error,
+            ExistingProjectOpeningError::SourceSnapshotMismatch {
+                persisted,
+                observed,
+            } if persisted == SourceSnapshotFingerprint::from_bytes([0xa5; 32])
+                && observed == SourceSnapshotFingerprint::from_bytes([0xb4; 32])
+        ));
+    }
+
+    #[tokio::test]
+    async fn changing_tree_during_observation_is_preserved_as_fingerprint_error() {
+        let service = ExistingProjectOpeningService::new(
+            FakeRecordReader {
+                response: Ok(record()),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeDirectoryResolver::new([
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/data")),
+                Ok(PathBuf::from("C:/att/projects/游戏 一/source/js")),
+            ]),
+            FakeDirectoryTreeFingerprinter {
+                response: Err(FingerprintResponseError::Changed),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+
+        let error = service
+            .open(&"游戏 一".parse().expect("测试项目名称应该有效"))
+            .await
+            .expect_err("指纹观察期间变化应该阻止项目开启");
+
+        assert!(matches!(
+            error,
+            ExistingProjectOpeningError::FingerprintSource(
+                DirectoryTreeFingerprintError::ChangedDuringObservation { .. }
+            )
+        ));
     }
 
     #[test]

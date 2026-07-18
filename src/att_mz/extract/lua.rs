@@ -4,10 +4,15 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use crate::att_mz::lua::LuaProjectContext;
-pub(crate) use crate::att_mz::lua::{LuaInvocation, TrustedLuaExecutionHost};
+use crate::att_mz::lua::runtime::TrustedLuaExtractIntent;
+pub(crate) use crate::att_mz::lua::{
+    LuaInvocation, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
+};
 use crate::att_mz::project::OpenedProject;
 
-/// 执行一次自由 Lua 提取。
+use super::store::LuaSnapshotStore;
+
+/// 执行一次可信 Lua 提取，并在 Host 干净结束后收敛其可选标准快照意图。
 pub(crate) trait LuaExtraction: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
@@ -19,46 +24,67 @@ pub(crate) trait LuaExtraction: Send + Sync {
 }
 
 /// 把 Extract 阶段已经建立的项目事实交给可信 Lua Host。
-pub(crate) struct LuaExtractionService<H> {
+pub(crate) struct LuaExtractionService<H, S> {
     host: H,
+    store: S,
 }
 
-impl<H> LuaExtractionService<H> {
-    pub(crate) fn new(host: H) -> Self {
-        Self { host }
+impl<H, S> LuaExtractionService<H, S> {
+    pub(crate) fn new(host: H, store: S) -> Self {
+        Self { host, store }
     }
 }
 
-impl<H> LuaExtraction for LuaExtractionService<H>
+impl<H, S> LuaExtraction for LuaExtractionService<H, S>
 where
     H: TrustedLuaExecutionHost,
+    S: LuaSnapshotStore,
 {
-    type Error = LuaExtractionError<H::Error>;
+    type Error = LuaExtractionError<H::Error, S::Error>;
 
     async fn run(&self, project: &OpenedProject, script_path: PathBuf) -> Result<(), Self::Error> {
         let error_path = script_path.clone();
         let invocation =
             LuaInvocation::extract(script_path, LuaProjectContext::from_opened_project(project));
 
-        self.host
-            .execute(invocation)
-            .await
-            .map_err(|source| LuaExtractionError::ExecuteHost {
+        let outcome = self.host.execute(invocation).await.map_err(|source| {
+            LuaExtractionError::ExecuteHost {
                 script_path: error_path,
                 source,
-            })
+            }
+        })?;
+
+        match outcome {
+            TrustedLuaExecutionOutcome::Empty => Ok(()),
+            TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Replace(
+                snapshot,
+            )) => self
+                .store
+                .replace_lua(project, snapshot)
+                .await
+                .map(|_| ())
+                .map_err(LuaExtractionError::StoreSnapshot),
+            TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Deactivate) => self
+                .store
+                .deactivate_lua(project)
+                .await
+                .map(|_| ())
+                .map_err(LuaExtractionError::StoreSnapshot),
+        }
     }
 }
 
 /// Lua Extract 阶段的 Host 执行失败。
 #[derive(Debug)]
-pub(crate) enum LuaExtractionError<E> {
+pub(crate) enum LuaExtractionError<E, S> {
     ExecuteHost { script_path: PathBuf, source: E },
+    StoreSnapshot(S),
 }
 
-impl<E> fmt::Display for LuaExtractionError<E>
+impl<E, S> fmt::Display for LuaExtractionError<E, S>
 where
     E: Error,
+    S: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -70,17 +96,20 @@ where
                 "执行可信 Lua 提取 Host 失败 {}：{source}",
                 script_path.display()
             ),
+            Self::StoreSnapshot(source) => write!(formatter, "保存 Lua 标准资产快照失败：{source}"),
         }
     }
 }
 
-impl<E> Error for LuaExtractionError<E>
+impl<E, S> Error for LuaExtractionError<E, S>
 where
     E: Error + 'static,
+    S: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ExecuteHost { source, .. } => Some(source),
+            Self::StoreSnapshot(source) => Some(source),
         }
     }
 }
@@ -92,6 +121,8 @@ mod tests {
 
     use super::*;
     use crate::att_mz::ProjectName;
+    use crate::att_mz::extract::store::{LuaSnapshot, SnapshotReplacementOutcome};
+    use crate::att_mz::lua::runtime::TrustedLuaExtractIntent;
     use crate::att_mz::lua::{LuaPhase, LuaProjectContext};
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,6 +136,7 @@ mod tests {
     struct FakeHost {
         invocation: Arc<Mutex<Option<RecordedInvocation>>>,
         fail: bool,
+        outcome: TrustedLuaExecutionOutcome,
     }
 
     impl TrustedLuaExecutionHost for FakeHost {
@@ -114,7 +146,7 @@ mod tests {
         async fn execute(
             &self,
             invocation: LuaInvocation<Self::TranslationProfile>,
-        ) -> Result<(), Self::Error> {
+        ) -> Result<TrustedLuaExecutionOutcome, Self::Error> {
             let recorded = match invocation {
                 LuaInvocation::Extract {
                     script_path,
@@ -133,7 +165,56 @@ mod tests {
             };
             *self.invocation.lock().expect("调用记录锁不应中毒") = Some(recorded);
 
-            if self.fail { Err(FakeError) } else { Ok(()) }
+            if self.fail {
+                Err(FakeError)
+            } else {
+                Ok(self.outcome.clone())
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum StoreCall {
+        Replace(usize),
+        Deactivate,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeStore {
+        calls: Arc<Mutex<Vec<StoreCall>>>,
+        fail: bool,
+    }
+
+    impl LuaSnapshotStore for FakeStore {
+        type Error = FakeError;
+
+        async fn replace_lua(
+            &self,
+            _project: &OpenedProject,
+            snapshot: LuaSnapshot,
+        ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+            if self.fail {
+                return Err(FakeError);
+            }
+            self.calls
+                .lock()
+                .expect("Store 调用锁不应中毒")
+                .push(StoreCall::Replace(snapshot.groups().len()));
+            Ok(SnapshotReplacementOutcome::Changed)
+        }
+
+        async fn deactivate_lua(
+            &self,
+            _project: &OpenedProject,
+        ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+            if self.fail {
+                return Err(FakeError);
+            }
+            self.calls
+                .lock()
+                .expect("Store 调用锁不应中毒")
+                .push(StoreCall::Deactivate);
+            Ok(SnapshotReplacementOutcome::Changed)
         }
     }
 
@@ -162,10 +243,16 @@ mod tests {
     #[tokio::test]
     async fn passes_complete_extract_context_to_host_once() {
         let recorded = Arc::new(Mutex::new(None));
-        let service = LuaExtractionService::new(FakeHost {
-            invocation: Arc::clone(&recorded),
-            fail: false,
-        });
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::clone(&recorded),
+                fail: false,
+                outcome: TrustedLuaExecutionOutcome::Empty,
+            },
+            store,
+        );
 
         service
             .run(&opened_project(), PathBuf::from("scripts/extract.lua"))
@@ -190,14 +277,21 @@ mod tests {
         );
         assert_eq!(invocation.project.source_language(), "ja");
         assert_eq!(invocation.project.target_language(), "zh-CN");
+        assert!(calls.lock().expect("Store 调用锁不应中毒").is_empty());
     }
 
     #[tokio::test]
     async fn preserves_script_path_and_host_source() {
-        let service = LuaExtractionService::new(FakeHost {
-            invocation: Arc::new(Mutex::new(None)),
-            fail: true,
-        });
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: true,
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(
+                    TrustedLuaExtractIntent::Deactivate,
+                ),
+            },
+            FakeStore::default(),
+        );
 
         let error = service
             .run(&opened_project(), PathBuf::from("broken extract.lua"))
@@ -218,14 +312,70 @@ mod tests {
         assert!(error.to_string().contains("broken extract.lua"));
     }
 
+    #[tokio::test]
+    async fn commits_exactly_the_extract_intent_returned_by_clean_host() {
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(
+                    TrustedLuaExtractIntent::Replace(LuaSnapshot::empty()),
+                ),
+            },
+            store,
+        );
+
+        service
+            .run(&opened_project(), PathBuf::from("extract.lua"))
+            .await
+            .expect("Host 已确认的 active 空快照应该提交");
+
+        assert_eq!(
+            calls.lock().expect("Store 调用锁不应中毒").as_slice(),
+            &[StoreCall::Replace(0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_store_failure_after_host_success() {
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(
+                    TrustedLuaExtractIntent::Deactivate,
+                ),
+            },
+            FakeStore {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                fail: true,
+            },
+        );
+
+        let error = service
+            .run(&opened_project(), PathBuf::from("extract.lua"))
+            .await
+            .expect_err("Store 失败必须传播");
+        assert!(matches!(
+            error,
+            LuaExtractionError::StoreSnapshot(FakeError)
+        ));
+    }
+
     #[test]
     fn execution_future_is_send() {
         fn assert_send<T: Send>(_: T) {}
 
-        let service = LuaExtractionService::new(FakeHost {
-            invocation: Arc::new(Mutex::new(None)),
-            fail: false,
-        });
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                outcome: TrustedLuaExecutionOutcome::Empty,
+            },
+            FakeStore::default(),
+        );
         let project = opened_project();
         assert_send(service.run(&project, PathBuf::from("extract.lua")));
     }

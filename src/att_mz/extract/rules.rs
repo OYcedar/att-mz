@@ -129,9 +129,15 @@ where
                 }
             })?;
 
-        let snapshot = if definition.is_empty() {
-            RulesSnapshot::empty()
-        } else {
+        if definition.is_empty() {
+            self.snapshot_store
+                .deactivate_rules(project)
+                .await
+                .map_err(|source| RulesExtractionError::Persist { rules_path, source })?;
+            return Ok(());
+        }
+
+        let snapshot = {
             let documents = self
                 .document_reader
                 .read(project, definition.document_selection())
@@ -164,7 +170,8 @@ where
         self.snapshot_store
             .replace_rules(project, snapshot)
             .await
-            .map_err(|source| RulesExtractionError::Persist { rules_path, source })
+            .map_err(|source| RulesExtractionError::Persist { rules_path, source })?;
+        Ok(())
     }
 }
 
@@ -280,7 +287,7 @@ where
                 locator,
             } => write!(
                 formatter,
-                "Rules 定位没有命中任何非空文本：{locator}（{}）",
+                "Rules 必需声明没有命中任何非空文本：{locator}（{}）",
                 rules_path.display()
             ),
             Self::InvalidTarget {
@@ -408,6 +415,7 @@ fn parse_rules_definition(bytes: Vec<u8>) -> Result<RulesDefinition, ParseRulesD
 struct RuleDescriptor {
     label: String,
     field_name: String,
+    requires_match: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -498,9 +506,13 @@ impl RulesDefinition {
         selection
     }
 
-    fn add_descriptor(&mut self, label: String, field_name: String) -> usize {
+    fn add_descriptor(&mut self, label: String, field_name: String, requires_match: bool) -> usize {
         let id = self.descriptors.len();
-        self.descriptors.push(RuleDescriptor { label, field_name });
+        self.descriptors.push(RuleDescriptor {
+            label,
+            field_name,
+            requires_match,
+        });
         id
     }
 
@@ -557,6 +569,7 @@ impl RulesDefinition {
                                     "comment"
                                 }
                             ),
+                            true,
                         );
                         let rule = TagRule {
                             id,
@@ -618,6 +631,7 @@ impl RulesDefinition {
                 let id = self.add_descriptor(
                     format!("{section}.{source_name}.{raw_path}"),
                     path.field_name(&raw_path),
+                    false,
                 );
                 rules.push(PathRule { id, path });
             }
@@ -655,6 +669,7 @@ impl RulesDefinition {
                 let id = self.add_descriptor(
                     format!("plugin_parameters.{plugin_name}.{raw_path}"),
                     path.field_name(&raw_path),
+                    false,
                 );
                 rules.push(PathRule { id, path });
             }
@@ -702,6 +717,7 @@ impl RulesDefinition {
                     let id = self.add_descriptor(
                         format!("plugin_commands.{plugin_name}.{command_name}.{raw_path}"),
                         path.field_name(&raw_path),
+                        true,
                     );
                     rules.push(PathRule { id, path });
                 }
@@ -1115,6 +1131,19 @@ impl MatchCounts {
     }
 }
 
+fn first_required_rule_without_match(
+    definition: &RulesDefinition,
+    matches: &MatchCounts,
+) -> Option<usize> {
+    definition
+        .descriptors
+        .iter()
+        .enumerate()
+        .find_map(|(id, descriptor)| {
+            (descriptor.requires_match && matches.count(id) == 0).then_some(id)
+        })
+}
+
 struct GroupCollector {
     groups: BTreeMap<(MzLocation, TextGroupKind), Vec<ExtractedTextField>>,
     locations: BTreeSet<MzLocation>,
@@ -1211,7 +1240,7 @@ fn build_rules_snapshot(
     )?;
     extract_event_rules(definition, documents, &mut matches, &mut collector)?;
 
-    if let Some(id) = (0..definition.descriptors.len()).find(|id| matches.count(*id) == 0) {
+    if let Some(id) = first_required_rule_without_match(definition, &matches) {
         return Err(BuildRulesSnapshotError::NoMatch {
             locator: definition.descriptors[id].label.clone(),
         });
@@ -1512,7 +1541,7 @@ fn finalize_parallel_rules(
         matches.merge(result.matches);
         groups.extend(result.groups);
     }
-    if let Some(id) = (0..definition.descriptors.len()).find(|id| matches.count(*id) == 0) {
+    if let Some(id) = first_required_rule_without_match(definition, &matches) {
         return Err(BuildRulesSnapshotError::NoMatch {
             locator: definition.descriptors[id].label.clone(),
         });
@@ -2750,14 +2779,24 @@ mod tests {
     }
 
     #[test]
-    fn zero_match_wrong_type_and_duplicate_leaf_abort_before_a_snapshot_exists() {
+    fn optional_zero_match_builds_empty_snapshot_but_invalid_or_duplicate_targets_still_fail() {
         let documents = items_documents(json!([null, {"customDescription": 42}]));
 
         let no_match =
             RulesDefinition::parse(r#"{"standard_fields":{"Items.json":["[].missing"]}}"#)
                 .expect("规则格式应该合法");
+        assert!(
+            build_rules_snapshot(&no_match, &documents)
+                .expect("可选标准字段零命中应建立 active 空快照")
+                .groups()
+                .is_empty()
+        );
+
+        let required_tag =
+            RulesDefinition::parse(r#"{"notes":{"Items.json":{"[].note":["RequiredTag"]}}}"#)
+                .expect("必需 Note 标签规则应该合法");
         assert!(matches!(
-            build_rules_snapshot(&no_match, &documents),
+            build_rules_snapshot(&required_tag, &documents),
             Err(BuildRulesSnapshotError::NoMatch { .. })
         ));
 
@@ -2829,19 +2868,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_definition_clears_rules_without_reading_mz_documents() {
+    async fn empty_definition_deactivates_rules_without_reading_mz_documents() {
         let harness = Harness::new(b"{}".to_vec(), MzProjectDocuments::empty());
 
         harness
             .service()
             .replace(&project(), PathBuf::from("empty.json"))
             .await
-            .expect("空规则应该提交空快照");
+            .expect("空规则应该停用 Rules owner");
 
         assert_eq!(harness.document_calls.load(Ordering::SeqCst), 0);
-        let snapshots = harness.snapshots.lock().expect("快照锁不应中毒");
-        assert_eq!(snapshots.len(), 1);
-        assert!(snapshots[0].groups().is_empty());
+        assert!(harness.snapshots.lock().expect("快照锁不应中毒").is_empty());
+        assert_eq!(harness.deactivations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2916,7 +2954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dependency_and_no_match_failures_never_submit_a_partial_snapshot() {
+    async fn dependency_failures_and_required_no_match_never_submit_a_partial_snapshot() {
         let mut read_failure = Harness::new(b"{}".to_vec(), MzProjectDocuments::empty());
         read_failure.file_failure = true;
         let error = read_failure
@@ -2963,18 +3001,34 @@ mod tests {
                 .is_empty()
         );
 
-        let no_match = Harness::new(
+        let optional_no_match = Harness::new(
             br#"{"standard_fields":{"Items.json":["[].missing"]}}"#.to_vec(),
             items_documents(json!([null, {"name": "宝剑"}])),
         );
-        let error = no_match
+        optional_no_match
             .service()
             .replace(&project(), PathBuf::from("rules.json"))
             .await
-            .expect_err("零命中必须保留旧快照");
+            .expect("可选标准字段零命中应提交 active 空快照");
+        {
+            let snapshots = optional_no_match.snapshots.lock().expect("快照锁不应中毒");
+            assert_eq!(snapshots.len(), 1);
+            assert!(snapshots[0].groups().is_empty());
+        }
+        assert_eq!(optional_no_match.deactivations.load(Ordering::SeqCst), 0);
+
+        let required_no_match = Harness::new(
+            br#"{"notes":{"Items.json":{"[].note":["RequiredTag"]}}}"#.to_vec(),
+            items_documents(json!([null, {"name": "宝剑"}])),
+        );
+        let error = required_no_match
+            .service()
+            .replace(&project(), PathBuf::from("rules.json"))
+            .await
+            .expect_err("必需标签零命中必须保留旧快照");
         assert!(matches!(error, RulesExtractionError::NoMatch { .. }));
         assert!(
-            no_match
+            required_no_match
                 .snapshots
                 .lock()
                 .expect("快照锁不应中毒")
@@ -3361,6 +3415,7 @@ mod tests {
     #[derive(Clone)]
     struct FakeStore {
         snapshots: Arc<Mutex<Vec<RulesSnapshot>>>,
+        deactivations: Arc<AtomicUsize>,
         fail: bool,
     }
 
@@ -3371,7 +3426,8 @@ mod tests {
             &self,
             _project: &OpenedProject,
             snapshot: RulesSnapshot,
-        ) -> Result<(), Self::Error> {
+        ) -> Result<crate::att_mz::extract::store::SnapshotReplacementOutcome, Self::Error>
+        {
             self.snapshots
                 .lock()
                 .expect("快照锁不应中毒")
@@ -3379,7 +3435,20 @@ mod tests {
             if self.fail {
                 Err(FakeError("persist"))
             } else {
-                Ok(())
+                Ok(crate::att_mz::extract::store::SnapshotReplacementOutcome::Changed)
+            }
+        }
+
+        async fn deactivate_rules(
+            &self,
+            _project: &OpenedProject,
+        ) -> Result<crate::att_mz::extract::store::SnapshotReplacementOutcome, Self::Error>
+        {
+            self.deactivations.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(FakeError("persist"))
+            } else {
+                Ok(crate::att_mz::extract::store::SnapshotReplacementOutcome::Changed)
             }
         }
     }
@@ -3391,6 +3460,7 @@ mod tests {
         document_calls: Arc<AtomicUsize>,
         selections: Arc<Mutex<Vec<MzDocumentSelection>>>,
         snapshots: Arc<Mutex<Vec<RulesSnapshot>>>,
+        deactivations: Arc<AtomicUsize>,
         store_failure: bool,
         file_failure: bool,
         document_failure: bool,
@@ -3405,6 +3475,7 @@ mod tests {
                 document_calls: Arc::new(AtomicUsize::new(0)),
                 selections: Arc::new(Mutex::new(Vec::new())),
                 snapshots: Arc::new(Mutex::new(Vec::new())),
+                deactivations: Arc::new(AtomicUsize::new(0)),
                 store_failure: false,
                 file_failure: false,
                 document_failure: false,
@@ -3436,6 +3507,7 @@ mod tests {
                 },
                 FakeStore {
                     snapshots: Arc::clone(&self.snapshots),
+                    deactivations: Arc::clone(&self.deactivations),
                     fail: self.store_failure,
                 },
                 cpu,

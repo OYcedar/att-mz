@@ -93,11 +93,14 @@ impl ExtractedTextGroup {
     }
 }
 
-/// 内置提取拥有的完整当前快照。
+/// 一个标准资产 owner 拥有的完整当前快照。
+///
+/// 三种提取入口共同依赖这里的排序、同组字段合并与精确地址唯一性，owner 包装只负责
+/// 在类型上表达本次提交属于谁，不各自实现快照规则。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BuiltinSnapshot(Vec<ExtractedTextGroup>);
+pub(crate) struct StandardAssetSnapshot(Vec<ExtractedTextGroup>);
 
-impl BuiltinSnapshot {
+impl StandardAssetSnapshot {
     pub(crate) fn new(groups: Vec<ExtractedTextGroup>) -> Result<Self, SnapshotModelError> {
         normalize_groups(groups).map(Self)
     }
@@ -112,26 +115,70 @@ impl BuiltinSnapshot {
     }
 }
 
-/// Rules 提取拥有的完整当前快照。
+/// 内置提取拥有的完整当前快照。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RulesSnapshot(Vec<ExtractedTextGroup>);
+pub(crate) struct BuiltinSnapshot(StandardAssetSnapshot);
 
-impl RulesSnapshot {
+impl BuiltinSnapshot {
     pub(crate) fn new(groups: Vec<ExtractedTextGroup>) -> Result<Self, SnapshotModelError> {
-        normalize_groups(groups).map(Self)
-    }
-
-    pub(crate) fn empty() -> Self {
-        Self(Vec::new())
+        StandardAssetSnapshot::new(groups).map(Self)
     }
 
     #[cfg(test)]
     pub(crate) fn groups(&self) -> &[ExtractedTextGroup] {
-        &self.0
+        self.0.groups()
     }
 
     pub(crate) fn into_groups(self) -> Vec<ExtractedTextGroup> {
-        self.0
+        self.0.into_groups()
+    }
+}
+
+/// Rules 提取拥有的完整当前快照。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RulesSnapshot(StandardAssetSnapshot);
+
+impl RulesSnapshot {
+    pub(crate) fn new(groups: Vec<ExtractedTextGroup>) -> Result<Self, SnapshotModelError> {
+        StandardAssetSnapshot::new(groups).map(Self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self(StandardAssetSnapshot(Vec::new()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn groups(&self) -> &[ExtractedTextGroup] {
+        self.0.groups()
+    }
+
+    pub(crate) fn into_groups(self) -> Vec<ExtractedTextGroup> {
+        self.0.into_groups()
+    }
+}
+
+/// Lua 提取拥有的完整当前快照。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LuaSnapshot(StandardAssetSnapshot);
+
+impl LuaSnapshot {
+    pub(crate) fn new(groups: Vec<ExtractedTextGroup>) -> Result<Self, SnapshotModelError> {
+        StandardAssetSnapshot::new(groups).map(Self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self(StandardAssetSnapshot(Vec::new()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn groups(&self) -> &[ExtractedTextGroup] {
+        self.0.groups()
+    }
+
+    pub(crate) fn into_groups(self) -> Vec<ExtractedTextGroup> {
+        self.0.into_groups()
     }
 }
 

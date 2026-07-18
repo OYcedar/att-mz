@@ -21,12 +21,13 @@ use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_DISPOSITION_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileCaseSensitiveInfo,
-    FileDispositionInfo, FileIdInfo, FileRenameInfo, GetDriveTypeW, GetFileInformationByHandleEx,
-    GetVolumeInformationByHandleW, GetVolumePathNameW, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, SetFileInformationByHandle, UnlockFileEx,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileCaseSensitiveInfo, FileDispositionInfo, FileIdInfo, FileRenameInfo, GetDriveTypeW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+    GetVolumePathNameW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    SetFileInformationByHandle, UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
@@ -231,7 +232,7 @@ impl PinnedPath {
 }
 
 /// 一个卷内稳定的文件身份。
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct FileIdentity {
     volume_serial_number: u64,
     file_id: [u8; 16],
@@ -274,6 +275,23 @@ impl FileIdentity {
             file_id: info.FileId.Identifier,
         })
     }
+}
+
+/// 读取已打开文件的硬链接数，不通过路径重新定位对象。
+pub(crate) fn number_of_links(file: &File, path: &Path) -> Result<u32, WindowsFsError> {
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` 是 Win32 的纯输出 POD 结构，零初始化对所有字段都有效。
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: 文件句柄在调用期间有效，输出指针指向完整可写结构。
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+    if succeeded == 0 {
+        return Err(io_error(
+            "读取文件硬链接数",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(information.nNumberOfLinks)
 }
 
 /// 以不跟随 reparse point 的方式打开目录。
@@ -334,6 +352,46 @@ fn open_any_path(path: &Path, share_delete: bool) -> Result<File, WindowsFsError
 /// 路径链的句柄，因此校验完成后到调用方完成本次同步操作前，不存在父目录被替换
 /// 后再通过原字符串路径悄然穿越 junction、mount point 或符号链接的窗口。
 pub(crate) fn pin_path_without_reparse(path: &Path) -> Result<PinnedPath, WindowsFsError> {
+    pin_path_with_final_opener(path, open_shared_final_path)
+}
+
+fn open_shared_final_path(path: &Path) -> Result<File, WindowsFsError> {
+    open_any_path(path, false)
+}
+
+/// 固定一条普通文件路径，并在句柄存活期间拒绝其他写入者和删除者。
+///
+/// 该能力用于建立内容指纹和复制目录候选；普通路径 pin 只固定身份，仍允许共享
+/// 写入，不能承载稳定字节观察语义。
+pub(crate) fn pin_regular_file_for_snapshot_read(
+    path: &Path,
+) -> Result<PinnedPath, WindowsFsError> {
+    let pinned = pin_path_with_final_opener(path, open_snapshot_read_file)?;
+    if !pinned.metadata()?.is_file() {
+        return Err(io_error(
+            "确认快照读取文件",
+            pinned.resolved_path(),
+            io::Error::new(io::ErrorKind::InvalidInput, "目标不是普通文件"),
+        ));
+    }
+    Ok(pinned)
+}
+
+fn open_snapshot_read_file(path: &Path) -> Result<File, WindowsFsError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| io_error("打开稳定快照文件", path, source))?;
+    reject_reparse(&file, path)?;
+    Ok(file)
+}
+
+fn pin_path_with_final_opener(
+    path: &Path,
+    open_final: fn(&Path) -> Result<File, WindowsFsError>,
+) -> Result<PinnedPath, WindowsFsError> {
     let absolute =
         std::path::absolute(path).map_err(|source| io_error("建立绝对路径", path, source))?;
     let components = absolute.ancestors().collect::<Vec<_>>();
@@ -358,7 +416,7 @@ pub(crate) fn pin_path_without_reparse(path: &Path) -> Result<PinnedPath, Window
     for (index, component) in components.iter().rev().enumerate() {
         let is_final = index + 1 == components.len();
         let opened = if is_final {
-            open_any_path(component, false)?
+            open_final(component)?
         } else {
             open_directory(component, false)?
         };
@@ -617,7 +675,7 @@ impl ExclusiveFileLock {
             .map_err(|source| io_error("打开锁文件", path, source))?;
         reject_reparse(&file, path)?;
         let mut overlapped = OVERLAPPED::default();
-        let deadline = Instant::now() + timeout;
+        let started_at = Instant::now();
         loop {
             // SAFETY: 文件句柄与 `overlapped` 在锁的整个生命周期内有效；同步调用不保留指针。
             let locked = unsafe {
@@ -644,14 +702,14 @@ impl ExclusiveFileLock {
             ) {
                 return Err(io_error("取得文件锁", path, source));
             }
-            let now = Instant::now();
-            if now >= deadline {
+            let elapsed = started_at.elapsed();
+            if elapsed >= timeout {
                 return Err(WindowsFsError::LockTimeout {
                     path: path.to_path_buf(),
                     timeout,
                 });
             }
-            thread::sleep((deadline - now).min(Duration::from_millis(5)));
+            thread::sleep((timeout - elapsed).min(Duration::from_millis(5)));
         }
     }
 

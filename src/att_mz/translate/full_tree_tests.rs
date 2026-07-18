@@ -29,7 +29,7 @@ use crate::att_mz::location_codec::MzLocationCodec;
 use crate::att_mz::lua::LuaPhase;
 use crate::att_mz::lua::hosting::TrustedLuaExecutionHostingService;
 use crate::att_mz::lua::runtime::{
-    OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaRuntimeBindings,
+    OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeBindings,
     TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
     TrustedLuaRuntimeReservation, TrustedLuaRuntimeTermination,
 };
@@ -40,18 +40,25 @@ use crate::att_mz::lua::session::{
     SqliteInteractiveSessionFinalizationReport, SqliteInteractiveSessionFinalizer,
     SqliteInteractiveSessionOperations, SqliteInteractiveTransactionObservation,
 };
+use crate::att_mz::project::ExistingProjectOpeningService;
 use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
 use crate::att_mz::text::{MzLocation, MzLocationStep, MzSource, StandardDataFile};
+use crate::fingerprint::Sha256Fingerprint;
 use crate::language::{
     JapaneseLanguageModule, JapaneseResidualPolicy, LanguageModule, LanguageModuleCatalog,
 };
 use crate::llm::{
-    ChatMessage, ChatMessageRole, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
+    ChatMessage, ChatMessageRole, LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError,
+    LlmRequestExecutor, LlmResponse,
 };
 use crate::observability::PersistentEventLog;
 use crate::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
-use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
+use crate::storage::file_system::{
+    DirectoryEntry, DirectoryLister, DirectoryTreeFingerprintError,
+    DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, ExistingDirectoryResolver,
+    FileReader, ListDirectoryError, ReadFile, ReadFileError, ResolveDirectoryError,
+};
 use crate::storage::sqlite::{
     ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand, SqliteQuery,
     SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
@@ -79,7 +86,8 @@ enum Event {
         client_address: usize,
     },
     Delay(Duration),
-    StandardTransaction,
+    PreparationTransaction,
+    CommitTransaction,
     LogTask,
     LogCommitFailure,
     LogRun,
@@ -162,13 +170,14 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
             path,
             PathBuf::from("C:/projects").join("demo").join("project.db")
         );
-        if query.statement().contains("FROM metadata") {
+        if query.statement().contains("FROM metadata") && !query.statement().contains("UNION ALL") {
             record(&self.events, Event::QueryMetadata);
             assert!(query.parameters().is_empty());
             return Ok(vec![SqliteRow::new(vec![
                 SqliteValue::Text("demo".to_owned()),
                 SqliteValue::Text("ja".to_owned()),
                 SqliteValue::Text("zh-Hans".to_owned()),
+                SqliteValue::Blob(vec![0xa5; 32]),
                 SqliteValue::Integer(24),
                 SqliteValue::Integer(30),
                 SqliteValue::Integer(18),
@@ -176,14 +185,100 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
         }
 
         assert!(query.statement().contains("UNION ALL"));
-        assert!(
-            query
-                .statement()
-                .contains("translation_terminology_dependency")
-        );
+        assert!(query.statement().contains("standard_translation_resource"));
         record(&self.events, Event::QueryAssets);
-        Ok(vec![standard_asset_row(1), standard_asset_row(2)])
+        Ok(vec![
+            metadata_snapshot_row(),
+            owner_snapshot_row(),
+            resource_snapshot_row("placeholder_rules"),
+            resource_snapshot_row("terminology"),
+            standard_asset_row(1),
+            standard_asset_row(2),
+        ])
     }
+}
+
+#[derive(Clone, Copy)]
+struct FakeDirectoryResolver;
+
+impl ExistingDirectoryResolver for FakeDirectoryResolver {
+    type Error = FakeRootError;
+
+    async fn resolve_existing_directory(
+        &self,
+        path: PathBuf,
+    ) -> Result<PathBuf, ResolveDirectoryError<Self::Error>> {
+        Ok(path)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FakeDirectoryTreeFingerprinter;
+
+impl DirectoryTreeFingerprinter for FakeDirectoryTreeFingerprinter {
+    type Error = FakeRootError;
+
+    async fn fingerprint_directory_tree(
+        &self,
+        request: DirectoryTreeFingerprintRequest,
+    ) -> Result<Sha256Fingerprint, DirectoryTreeFingerprintError<Self::Error>> {
+        assert_eq!(request.roots().len(), 2);
+        Ok(Sha256Fingerprint::from_bytes([0xa5; 32]))
+    }
+}
+
+fn metadata_snapshot_row() -> SqliteRow {
+    SqliteRow::new(vec![
+        SqliteValue::Text("0_metadata".to_owned()),
+        SqliteValue::Null,
+        SqliteValue::Blob(vec![0xa5; 32]),
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+    ])
+}
+
+fn owner_snapshot_row() -> SqliteRow {
+    SqliteRow::new(vec![
+        SqliteValue::Text("1_owner".to_owned()),
+        SqliteValue::Text("builtin".to_owned()),
+        SqliteValue::Blob(vec![0xa5; 32]),
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+    ])
+}
+
+fn resource_snapshot_row(kind: &str) -> SqliteRow {
+    SqliteRow::new(vec![
+        SqliteValue::Text("2_resource".to_owned()),
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Text(kind.to_owned()),
+        SqliteValue::Text("[]".to_owned()),
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+    ])
 }
 
 fn standard_asset_row(index: usize) -> SqliteRow {
@@ -195,14 +290,17 @@ fn standard_asset_row(index: usize) -> SqliteRow {
     );
 
     SqliteRow::new(vec![
+        SqliteValue::Text("3_asset".to_owned()),
+        SqliteValue::Text("builtin".to_owned()),
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
         SqliteValue::Text("entry".to_owned()),
         SqliteValue::Text(MzLocationCodec::encode(&exact_location).expect("测试位置应可编码")),
-        SqliteValue::Text("builtin".to_owned()),
         SqliteValue::Text(MzLocationCodec::encode(&group_location).expect("测试位置应可编码")),
         SqliteValue::Text("name".to_owned()),
         SqliteValue::Null,
         SqliteValue::Text("魔法剣".to_owned()),
-        SqliteValue::Null,
         SqliteValue::Null,
         SqliteValue::Null,
     ])
@@ -237,12 +335,22 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
                 | SqliteTransactionStep::RequireNoRows { .. } => false,
             })
             .count();
-        assert_eq!(
-            translated_leaf_count, 2,
-            "一次代表译文必须在同一事务中扩散到两个物理位置"
-        );
+        let event = if translated_leaf_count == 0 {
+            assert!(plan.steps().iter().any(|step| matches!(
+                step,
+                SqliteTransactionStep::Execute(command)
+                    if command.statement().contains("standard_translation_resource")
+            )));
+            Event::PreparationTransaction
+        } else {
+            assert_eq!(
+                translated_leaf_count, 2,
+                "一次代表译文必须在同一事务中扩散到两个物理位置"
+            );
+            Event::CommitTransaction
+        };
         self.calls.fetch_add(1, Ordering::SeqCst);
-        record(&self.events, Event::StandardTransaction);
+        record(&self.events, event);
         Ok(())
     }
 }
@@ -250,6 +358,12 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
 #[derive(Clone, Debug)]
 struct FakeLlmClient {
     name: &'static str,
+}
+
+impl LlmClientSemanticIdentity for FakeLlmClient {
+    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+        Sha256Fingerprint::from_bytes([0x4c; 32])
+    }
 }
 
 #[derive(Clone)]
@@ -346,6 +460,17 @@ impl FileReader for FakeFileReader {
             PathBuf::from("C:/resolved/scripts/translate.lua"),
             b"return true".to_vec(),
         ))
+    }
+}
+
+impl DirectoryLister for FakeFileReader {
+    type Error = FakeRootError;
+
+    async fn list_directory(
+        &self,
+        _path: PathBuf,
+    ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<Self::Error>> {
+        Ok(Vec::new())
     }
 }
 
@@ -523,9 +648,13 @@ impl TrustedLuaRuntimeReservation for FakeTrustedLuaRuntimeReservation {
             std::path::Path::new("C:/resolved/scripts/translate.lua")
         );
         assert_eq!(program.source(), b"return true");
-        let (calls, finalizer) = bindings.into_parts();
-        assert_eq!(calls.phase(), LuaPhase::Translate);
+        let (common, phase, finalizer) = bindings.into_parts();
+        assert_eq!(phase.phase(), LuaPhase::Translate);
+        let calls = Arc::clone(common.calls());
         assert_eq!(calls.project().name().as_str(), "demo");
+        let TrustedLuaPhaseBindings::Translate(translate) = phase else {
+            panic!("翻译 Runtime 必须获得 Translate 阶段能力");
+        };
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -542,7 +671,7 @@ impl TrustedLuaRuntimeReservation for FakeTrustedLuaRuntimeReservation {
                     ))
                     .await
                     .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
-                let response = calls
+                let response = translate
                     .request_llm(vec![ChatMessage::new(
                         ChatMessageRole::User,
                         "# Lua full messages",
@@ -664,9 +793,13 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
         .expect("测试 Profile 目录应合法"),
     );
 
-    let project_reader = ProjectDatabaseRecordReadingService::new(
-        PathBuf::from("C:/projects"),
-        sqlite_query.clone(),
+    let project_reader = ExistingProjectOpeningService::new(
+        ProjectDatabaseRecordReadingService::new(
+            PathBuf::from("C:/projects"),
+            sqlite_query.clone(),
+        ),
+        FakeDirectoryResolver,
+        FakeDirectoryTreeFingerprinter,
     );
     let asset_reader = MzStandardTranslationAssetReadingService::new(
         sqlite_query,
@@ -743,6 +876,12 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     let events = events.lock().expect("事件锁不应中毒").clone();
     let metadata = event_position(&events, |event| matches!(event, Event::QueryMetadata));
     let assets = event_position(&events, |event| matches!(event, Event::QueryAssets));
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, Event::PreparationTransaction)),
+        "资源和待清状态均未变化时不应提交 Preparation 事务"
+    );
     let first_llm = event_position(&events, |event| {
         matches!(event, Event::LlmStandard { attempt: 1, .. })
     });
@@ -750,8 +889,8 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     let second_llm = event_position(&events, |event| {
         matches!(event, Event::LlmStandard { attempt: 2, .. })
     });
-    let standard_transaction =
-        event_position(&events, |event| matches!(event, Event::StandardTransaction));
+    let commit_transaction =
+        event_position(&events, |event| matches!(event, Event::CommitTransaction));
     let log_task = event_position(&events, |event| matches!(event, Event::LogTask));
     let log_run = event_position(&events, |event| matches!(event, Event::LogRun));
     let read_lua = event_position(&events, |event| matches!(event, Event::ReadLua(_)));
@@ -767,8 +906,8 @@ async fn all_non_root_translation_services_reach_the_nine_root_fakes() {
     assert!(metadata < assets);
     assert!(assets < first_llm);
     assert!(first_llm < delay && delay < second_llm);
-    assert!(second_llm < standard_transaction);
-    assert!(standard_transaction < log_task && log_task < log_run);
+    assert!(second_llm < commit_transaction);
+    assert!(commit_transaction < log_task && log_task < log_run);
     assert!(log_run < read_lua);
     assert!(read_lua < open_lua && open_lua < lua_runtime);
     assert!(lua_runtime < lua_begin && lua_begin < lua_execute);

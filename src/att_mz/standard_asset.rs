@@ -11,10 +11,11 @@ use std::num::NonZeroUsize;
 use super::text::{MzLocation, MzSource, StandardDataFile, TextGroupKind};
 
 /// 一个标准资产位置的提取所有者。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum MzStandardAssetOwner {
     Builtin,
     Rules,
+    Lua,
 }
 
 impl MzStandardAssetOwner {
@@ -22,6 +23,7 @@ impl MzStandardAssetOwner {
         match value.as_bytes() {
             b"builtin" => Some(Self::Builtin),
             b"rules" => Some(Self::Rules),
+            b"lua" => Some(Self::Lua),
             _ => None,
         }
     }
@@ -30,6 +32,7 @@ impl MzStandardAssetOwner {
         match self {
             Self::Builtin => "builtin",
             Self::Rules => "rules",
+            Self::Lua => "lua",
         }
     }
 }
@@ -412,6 +415,14 @@ mod tests {
             Some(MzStandardAssetOwner::Builtin)
         );
         assert_eq!(
+            MzStandardAssetOwner::from_storage_name("rules"),
+            Some(MzStandardAssetOwner::Rules)
+        );
+        assert_eq!(
+            MzStandardAssetOwner::from_storage_name("lua"),
+            Some(MzStandardAssetOwner::Lua)
+        );
+        assert_eq!(
             MzStandardAssetTable::from_storage_name("text_body"),
             Some(MzStandardAssetTable::TextBody)
         );
@@ -420,6 +431,7 @@ mod tests {
             Some(MzTextBodyUnit::ScrollingText)
         );
         assert_eq!(MzStandardAssetOwner::from_storage_name("Builtin"), None);
+        assert_eq!(MzStandardAssetOwner::from_storage_name("Lua"), None);
         assert_eq!(MzStandardAssetTable::from_storage_name("terminology"), None);
         assert_eq!(MzTextBodyUnit::from_storage_name("dialog"), None);
     }

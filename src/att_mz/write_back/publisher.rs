@@ -2,49 +2,94 @@
 
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::att_mz::ProjectName;
 use crate::att_mz::project::OpenedProject;
-use crate::execution::{CooperativeCancellation, OperationCancelled};
 use crate::storage::file_system::{
     DirectoryDiscardError, DirectoryFileOverlay, DirectoryPrepareError, DirectoryPublishError,
     DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
-    DirectoryStageRequestError, RecoverableDirectoryPublisher,
+    DirectoryStageRequestError, RecoverableDirectoryPublisher, ScopedDirectoryBindError,
+    ScopedDirectoryEditError, ScopedDirectoryEditor,
 };
 
+use super::lua::ScopedPreparedWriteBackCandidate;
 use super::rewriter::MzRewrittenDocuments;
-use super::standard::StandardWriteBackPublisher;
+use super::{PreparedWriteBackCandidate, PublishedWriteBack, StandardWriteBackPublisher};
+
+/// 根已准备、只能发布或丢弃一次的完整写回候选。
+pub(crate) struct PreparedWriteBack<S> {
+    project_name: ProjectName,
+    workspace_root: PathBuf,
+    output_root: PathBuf,
+    staged: crate::storage::file_system::StagedDirectory<S>,
+}
+
+impl<S> fmt::Debug for PreparedWriteBack<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedWriteBack")
+            .field("project_name", &self.project_name)
+            .field("workspace_root", &self.workspace_root)
+            .field("output_root", &self.output_root)
+            .field("candidate_root", &self.staged.staging_root())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> PreparedWriteBackCandidate for PreparedWriteBack<S>
+where
+    S: Send + 'static,
+{
+    fn belongs_to(&self, project: &OpenedProject) -> bool {
+        self.project_name == *project.name()
+            && self.workspace_root == project.workspace_root()
+            && self.output_root == project.write_back_root()
+    }
+
+    fn candidate_root(&self) -> &Path {
+        self.staged.staging_root()
+    }
+}
+
+impl<S> ScopedPreparedWriteBackCandidate<S> for PreparedWriteBack<S>
+where
+    S: Send + 'static,
+{
+    fn staged_directory(&self) -> &crate::storage::file_system::StagedDirectory<S> {
+        &self.staged
+    }
+}
 
 /// 用固定 `source/data`、`source/js` 基底发布 Standard 写回候选。
 pub(crate) struct StandardWriteBackPublishingService<A> {
     directory_publisher: A,
-    cancellation: CooperativeCancellation,
 }
 
 impl<A> StandardWriteBackPublishingService<A> {
-    pub(crate) fn new(directory_publisher: A, cancellation: CooperativeCancellation) -> Self {
+    pub(crate) fn new(directory_publisher: A) -> Self {
         Self {
             directory_publisher,
-            cancellation,
         }
     }
 }
 
 impl<A> StandardWriteBackPublisher<MzRewrittenDocuments> for StandardWriteBackPublishingService<A>
 where
-    A: RecoverableDirectoryPublisher,
+    A: RecoverableDirectoryPublisher
+        + ScopedDirectoryEditor<
+            CandidateState = <A as RecoverableDirectoryPublisher>::StagingState,
+            Error = <A as RecoverableDirectoryPublisher>::Error,
+        >,
 {
-    type Error = StandardWriteBackPublishingError<A::Error>;
+    type Candidate = PreparedWriteBack<<A as RecoverableDirectoryPublisher>::StagingState>;
+    type Error = StandardWriteBackPublishingError<<A as RecoverableDirectoryPublisher>::Error>;
 
-    async fn publish(
+    async fn prepare(
         &self,
         project: &OpenedProject,
         documents: MzRewrittenDocuments,
-    ) -> Result<(), Self::Error> {
-        self.cancellation
-            .check()
-            .map_err(StandardWriteBackPublishingError::Cancelled)?;
+    ) -> Result<Self::Candidate, Self::Error> {
         if documents.project_name() != project.name()
             || documents.workspace_root() != project.workspace_root()
         {
@@ -91,33 +136,59 @@ where
             .prepare(request)
             .await
             .map_err(StandardWriteBackPublishingError::Prepare)?;
-        if let Err(cancellation) = self.cancellation.check() {
-            let staging_root = staged.staging_root().to_path_buf();
-            return match self.directory_publisher.discard(staged).await {
-                Ok(()) => Err(StandardWriteBackPublishingError::Cancelled(cancellation)),
-                Err(discard) => Err(StandardWriteBackPublishingError::CancelledAndDiscard {
-                    cancellation,
-                    staging_root,
-                    discard,
-                }),
-            };
+        Ok(PreparedWriteBack {
+            project_name: project.name().clone(),
+            workspace_root: project.workspace_root().to_path_buf(),
+            output_root: project.write_back_root().to_path_buf(),
+            staged,
+        })
+    }
+
+    fn validate<'a>(
+        &'a self,
+        candidate: &Self::Candidate,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + use<'a, A> {
+        // 先同步建立不再借用候选的 bind future，避免把只承诺 Send 的根 token state
+        // 通过 `&Candidate` 带入异步状态机并错误要求 Sync。
+        let bind = self
+            .directory_publisher
+            .bind_scoped_directory(&candidate.staged);
+        let directory_publisher = &self.directory_publisher;
+        async move {
+            let scope = bind
+                .await
+                .map_err(StandardWriteBackPublishingError::BindCandidate)?;
+            directory_publisher
+                .validate_scoped_directory(&scope)
+                .await
+                .map_err(StandardWriteBackPublishingError::ValidateCandidate)
         }
+    }
+
+    async fn publish(&self, candidate: Self::Candidate) -> Result<PublishedWriteBack, Self::Error> {
+        let PreparedWriteBack {
+            output_root,
+            staged,
+            ..
+        } = candidate;
         self.directory_publisher
             .publish(staged)
             .await
-            .map_err(StandardWriteBackPublishingError::Publish)
+            .map_err(StandardWriteBackPublishingError::Publish)?;
+        Ok(PublishedWriteBack::new(output_root))
+    }
+
+    async fn discard(&self, candidate: Self::Candidate) -> Result<(), Self::Error> {
+        self.directory_publisher
+            .discard(candidate.staged)
+            .await
+            .map_err(StandardWriteBackPublishingError::Discard)
     }
 }
 
-/// Standard Publisher 在候选交接、请求建立或根发布阶段遇到的失败。
+/// Standard Publisher 在候选交接、请求建立或根终结阶段遇到的失败。
 #[derive(Debug)]
 pub(crate) enum StandardWriteBackPublishingError<E> {
-    Cancelled(OperationCancelled),
-    CancelledAndDiscard {
-        cancellation: OperationCancelled,
-        staging_root: PathBuf,
-        discard: DirectoryDiscardError<E>,
-    },
     CandidateProjectMismatch {
         expected_name: ProjectName,
         expected_workspace_root: PathBuf,
@@ -126,7 +197,10 @@ pub(crate) enum StandardWriteBackPublishingError<E> {
     },
     InvalidRequest(DirectoryStageRequestError),
     Prepare(DirectoryPrepareError<E>),
+    BindCandidate(ScopedDirectoryBindError<E>),
+    ValidateCandidate(ScopedDirectoryEditError<E>),
     Publish(DirectoryPublishError<E>),
+    Discard(DirectoryDiscardError<E>),
 }
 
 impl<E> fmt::Display for StandardWriteBackPublishingError<E>
@@ -135,16 +209,6 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled(error) => error.fmt(formatter),
-            Self::CancelledAndDiscard {
-                cancellation,
-                staging_root,
-                discard,
-            } => write!(
-                formatter,
-                "{cancellation}，且无法丢弃候选目录 {}：{discard}",
-                staging_root.display()
-            ),
             Self::CandidateProjectMismatch {
                 expected_name,
                 expected_workspace_root,
@@ -160,7 +224,14 @@ where
             ),
             Self::InvalidRequest(source) => write!(formatter, "写回候选请求无效：{source}"),
             Self::Prepare(source) => source.fmt(formatter),
+            Self::BindCandidate(source) => {
+                write!(formatter, "无法绑定写回候选的物理身份：{source}")
+            }
+            Self::ValidateCandidate(source) => {
+                write!(formatter, "写回候选未通过完整树校验：{source}")
+            }
             Self::Publish(source) => source.fmt(formatter),
+            Self::Discard(source) => source.fmt(formatter),
         }
     }
 }
@@ -171,12 +242,13 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Cancelled(error) => Some(error),
-            Self::CancelledAndDiscard { discard, .. } => Some(discard),
             Self::CandidateProjectMismatch { .. } => None,
             Self::InvalidRequest(source) => Some(source),
             Self::Prepare(source) => Some(source),
+            Self::BindCandidate(source) => Some(source),
+            Self::ValidateCandidate(source) => Some(source),
             Self::Publish(source) => Some(source),
+            Self::Discard(source) => Some(source),
         }
     }
 }
@@ -189,7 +261,10 @@ mod tests {
     use super::*;
     use crate::att_mz::write_back::rewriter::MzRewrittenFile;
 
-    use crate::storage::file_system::{StagedDirectory, StagingCleanupFailure};
+    use crate::storage::file_system::{
+        BoundScopedDirectory, ScopedDirectoryEntry, ScopedDirectoryPath, StagedDirectory,
+        StagingCleanupFailure,
+    };
 
     type PrepareError = DirectoryPrepareError<FakeError>;
     type PublishResult = Result<(), DirectoryPublishError<FakeError>>;
@@ -209,7 +284,6 @@ mod tests {
         publish_calls: Arc<Mutex<Vec<PublishCall>>>,
         prepare_error: Arc<Mutex<Option<PrepareError>>>,
         publish_result: Arc<Mutex<Option<PublishResult>>>,
-        cancel_after_prepare: Option<CooperativeCancellation>,
         discard_calls: Arc<Mutex<Vec<PathBuf>>>,
         discard_error: Arc<Mutex<Option<FakeError>>>,
     }
@@ -235,9 +309,6 @@ mod tests {
                 .take()
             {
                 return Err(error);
-            }
-            if let Some(cancellation) = &self.cancel_after_prepare {
-                cancellation.request();
             }
             let staging_root = target_root.with_extension("att-stage");
             Ok(StagedDirectory::new(
@@ -283,6 +354,83 @@ mod tests {
                 Some(error) => Err(DirectoryDiscardError::new(staging_root, error)),
                 None => Ok(()),
             }
+        }
+    }
+
+    impl ScopedDirectoryEditor for FakeRecoverablePublisher {
+        type CandidateState = usize;
+        type ScopeState = ();
+        type Error = FakeError;
+
+        fn bind_scoped_directory(
+            &self,
+            candidate: &StagedDirectory<Self::CandidateState>,
+        ) -> impl std::future::Future<
+            Output = Result<
+                BoundScopedDirectory<Self::ScopeState>,
+                ScopedDirectoryBindError<Self::Error>,
+            >,
+        > + Send
+        + use<> {
+            let root = candidate.staging_root().to_path_buf();
+            std::future::ready(Ok(BoundScopedDirectory::new(root, ())))
+        }
+
+        fn validate_scoped_directory(
+            &self,
+            _scope: &BoundScopedDirectory<Self::ScopeState>,
+        ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>>
+        + Send
+        + use<> {
+            std::future::ready(Ok(()))
+        }
+
+        fn read_scoped_file(
+            &self,
+            _scope: &BoundScopedDirectory<Self::ScopeState>,
+            _path: ScopedDirectoryPath,
+        ) -> impl std::future::Future<
+            Output = Result<Vec<u8>, ScopedDirectoryEditError<Self::Error>>,
+        > + Send {
+            std::future::ready(Ok(Vec::new()))
+        }
+
+        fn list_scoped_directory(
+            &self,
+            _scope: &BoundScopedDirectory<Self::ScopeState>,
+            _path: ScopedDirectoryPath,
+        ) -> impl std::future::Future<
+            Output = Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Self::Error>>,
+        > + Send {
+            std::future::ready(Ok(Vec::new()))
+        }
+
+        fn create_scoped_directory(
+            &self,
+            _scope: &BoundScopedDirectory<Self::ScopeState>,
+            _path: ScopedDirectoryPath,
+        ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
+        {
+            std::future::ready(Ok(()))
+        }
+
+        fn write_scoped_file(
+            &self,
+            _scope: &BoundScopedDirectory<Self::ScopeState>,
+            _path: ScopedDirectoryPath,
+            _bytes: Vec<u8>,
+        ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
+        {
+            std::future::ready(Ok(()))
+        }
+
+        fn remove_scoped_path(
+            &self,
+            _scope: &BoundScopedDirectory<Self::ScopeState>,
+            _path: ScopedDirectoryPath,
+        ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
+        {
+            std::future::ready(Ok(()))
         }
     }
 
@@ -335,18 +483,14 @@ mod tests {
         let prepare_calls = Arc::new(Mutex::new(Vec::new()));
         let publish_calls = Arc::new(Mutex::new(Vec::new()));
         (
-            StandardWriteBackPublishingService::new(
-                FakeRecoverablePublisher {
-                    prepare_calls: Arc::clone(&prepare_calls),
-                    publish_calls: Arc::clone(&publish_calls),
-                    prepare_error: Arc::new(Mutex::new(prepare_error)),
-                    publish_result: Arc::new(Mutex::new(Some(result))),
-                    cancel_after_prepare: None,
-                    discard_calls: Arc::new(Mutex::new(Vec::new())),
-                    discard_error: Arc::new(Mutex::new(None)),
-                },
-                CooperativeCancellation::default(),
-            ),
+            StandardWriteBackPublishingService::new(FakeRecoverablePublisher {
+                prepare_calls: Arc::clone(&prepare_calls),
+                publish_calls: Arc::clone(&publish_calls),
+                prepare_error: Arc::new(Mutex::new(prepare_error)),
+                publish_result: Arc::new(Mutex::new(Some(result))),
+                discard_calls: Arc::new(Mutex::new(Vec::new())),
+                discard_error: Arc::new(Mutex::new(None)),
+            }),
             prepare_calls,
             publish_calls,
         )
@@ -357,8 +501,8 @@ mod tests {
         let project = project("alice", "C:/projects");
         let (publisher, prepare_calls, publish_calls) = harness(None, Ok(()));
 
-        publisher
-            .publish(
+        let candidate = publisher
+            .prepare(
                 &project,
                 documents(
                     &project,
@@ -366,7 +510,16 @@ mod tests {
                 ),
             )
             .await
+            .expect("目录候选应该准备成功");
+        assert_eq!(
+            candidate.candidate_root(),
+            Path::new("C:/projects/alice/write_back.att-stage")
+        );
+        let published = publisher
+            .publish(candidate)
+            .await
             .expect("目录候选应该发布成功");
+        assert_eq!(published.output_root(), project.write_back_root());
 
         let calls = prepare_calls.lock().expect("暂存调用锁不应中毒");
         assert_eq!(calls.len(), 1);
@@ -409,36 +562,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_after_prepare_discards_candidate_without_publishing() {
+    async fn prepared_candidate_can_be_explicitly_discarded_without_publishing() {
         let project = project("alice", "C:/projects");
-        let cancellation = CooperativeCancellation::default();
         let prepare_calls = Arc::new(Mutex::new(Vec::new()));
         let publish_calls = Arc::new(Mutex::new(Vec::new()));
         let discard_calls = Arc::new(Mutex::new(Vec::new()));
-        let publisher = StandardWriteBackPublishingService::new(
-            FakeRecoverablePublisher {
-                prepare_calls,
-                publish_calls: Arc::clone(&publish_calls),
-                prepare_error: Arc::new(Mutex::new(None)),
-                publish_result: Arc::new(Mutex::new(Some(Ok(())))),
-                cancel_after_prepare: Some(cancellation.clone()),
-                discard_calls: Arc::clone(&discard_calls),
-                discard_error: Arc::new(Mutex::new(None)),
-            },
-            cancellation,
-        );
+        let publisher = StandardWriteBackPublishingService::new(FakeRecoverablePublisher {
+            prepare_calls,
+            publish_calls: Arc::clone(&publish_calls),
+            prepare_error: Arc::new(Mutex::new(None)),
+            publish_result: Arc::new(Mutex::new(Some(Ok(())))),
+            discard_calls: Arc::clone(&discard_calls),
+            discard_error: Arc::new(Mutex::new(None)),
+        });
+
+        let candidate = publisher
+            .prepare(&project, documents(&project, Vec::new()))
+            .await
+            .expect("候选应准备成功");
+        publisher
+            .discard(candidate)
+            .await
+            .expect("候选应只丢弃一次");
+
+        assert!(publish_calls.lock().expect("发布调用锁不应中毒").is_empty());
+        assert_eq!(discard_calls.lock().expect("丢弃调用锁不应中毒").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discard_failure_preserves_the_exact_staging_root() {
+        let project = project("alice", "C:/projects");
+        let publisher = StandardWriteBackPublishingService::new(FakeRecoverablePublisher {
+            prepare_calls: Arc::new(Mutex::new(Vec::new())),
+            publish_calls: Arc::new(Mutex::new(Vec::new())),
+            prepare_error: Arc::new(Mutex::new(None)),
+            publish_result: Arc::new(Mutex::new(Some(Ok(())))),
+            discard_calls: Arc::new(Mutex::new(Vec::new())),
+            discard_error: Arc::new(Mutex::new(Some(FakeError("cleanup")))),
+        });
+        let candidate = publisher
+            .prepare(&project, documents(&project, Vec::new()))
+            .await
+            .expect("候选应准备成功");
 
         let error = publisher
-            .publish(&project, documents(&project, Vec::new()))
+            .discard(candidate)
             .await
-            .expect_err("取消后不得发布候选");
+            .expect_err("根清理失败必须传播");
 
         assert!(matches!(
             error,
-            StandardWriteBackPublishingError::Cancelled(_)
+            StandardWriteBackPublishingError::Discard(source)
+                if source.staging_root()
+                    == Path::new("C:/projects/alice/write_back.att-stage")
+                    && *source.source() == FakeError("cleanup")
         ));
-        assert!(publish_calls.lock().expect("发布调用锁不应中毒").is_empty());
-        assert_eq!(discard_calls.lock().expect("丢弃调用锁不应中毒").len(), 1);
     }
 
     #[tokio::test]
@@ -446,10 +624,11 @@ mod tests {
         let project = project("alice", "C:/projects");
         let (publisher, calls, publish_calls) = harness(None, Ok(()));
 
-        publisher
-            .publish(&project, documents(&project, Vec::new()))
+        let candidate = publisher
+            .prepare(&project, documents(&project, Vec::new()))
             .await
-            .expect("空候选仍应发布完整副本");
+            .expect("空候选仍应准备完整副本");
+        publisher.publish(candidate).await.expect("空候选仍应发布");
 
         let calls = calls.lock().expect("发布调用锁不应中毒");
         assert_eq!(calls.len(), 1);
@@ -468,7 +647,7 @@ mod tests {
         let (publisher, calls, publish_calls) = harness(None, Ok(()));
 
         let error = publisher
-            .publish(&current_project, documents(&other, Vec::new()))
+            .prepare(&current_project, documents(&other, Vec::new()))
             .await
             .expect_err("跨工作区候选必须拒绝");
 
@@ -493,7 +672,7 @@ mod tests {
             Ok(()),
         );
         let error = publisher
-            .publish(&project, documents(&project, Vec::new()))
+            .prepare(&project, documents(&project, Vec::new()))
             .await
             .expect_err("暂存失败必须传播");
         assert!(matches!(
@@ -513,8 +692,12 @@ mod tests {
     ) -> StandardWriteBackPublishingError<FakeError> {
         let project = project("alice", "C:/projects");
         let (publisher, _, publish_calls) = harness(None, Err(root_error));
+        let candidate = publisher
+            .prepare(&project, documents(&project, Vec::new()))
+            .await
+            .expect("发布错误测试应先准备候选");
         let error = publisher
-            .publish(&project, documents(&project, Vec::new()))
+            .publish(candidate)
             .await
             .expect_err("根发布失败必须传播");
         assert_eq!(
@@ -627,12 +810,12 @@ mod tests {
     }
 
     #[test]
-    fn publishing_future_is_send() {
+    fn preparing_future_is_send() {
         fn assert_send<T: Send>(_: T) {}
 
         let project = project("alice", "C:/projects");
         let candidate = documents(&project, Vec::new());
         let (publisher, _, _) = harness(None, Ok(()));
-        assert_send(publisher.publish(&project, candidate));
+        assert_send(publisher.prepare(&project, candidate));
     }
 }

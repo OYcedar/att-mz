@@ -14,6 +14,7 @@ pub(crate) mod planner;
 pub(crate) mod planning_resource;
 pub(crate) mod profile;
 pub(crate) mod result_store;
+pub(crate) mod semantics;
 pub(crate) mod service;
 pub(crate) mod standard;
 
@@ -48,6 +49,10 @@ pub struct StandardTranslationSummary {
     pub remaining_locations: usize,
     pub protocol_diagnostics: usize,
     pub recoverable_request_exhaustions: usize,
+    pub retained: usize,
+    pub invalidated: usize,
+    pub not_applicable: usize,
+    pub reused: usize,
 }
 
 /// 翻译命令正常完成后交还给 CLI 的结果。

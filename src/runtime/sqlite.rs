@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use rusqlite::backup::{Backup, StepResult};
 use rusqlite::types::{Value as RusqliteValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use tokio::sync::oneshot;
@@ -30,9 +31,10 @@ use crate::runtime::windows::{
     pin_path_without_reparse,
 };
 use crate::storage::sqlite::{
-    CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand,
-    SqliteDatabaseCreator, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor,
-    SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
+    CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError,
+    SnapshotDatabaseError, SqliteCommand, SqliteDatabaseCreator, SqliteDatabaseSnapshotter,
+    SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
+    SqliteTransactionStep, SqliteValue,
 };
 
 const STORAGE_RUNNING: u8 = 0;
@@ -118,6 +120,11 @@ impl RusqliteStorageConfiguration {
         journal_mode: SqliteJournalMode,
         synchronous: SqliteSynchronous,
     ) -> Result<Self, SqliteRuntimeError> {
+        if max_open_connections.get() < 2 {
+            return Err(SqliteRuntimeError::InvalidConfiguration(
+                "max_open_connections 必须至少为 2，以原子容纳 SQLite online backup 的源与目标连接",
+            ));
+        }
         if max_interactive_sessions > max_open_connections {
             return Err(SqliteRuntimeError::InvalidConfiguration(
                 "max_interactive_sessions 不得大于 max_open_connections",
@@ -184,6 +191,7 @@ pub(crate) enum SqliteRuntimeError {
     },
     InvalidValue(&'static str),
     Internal(&'static str),
+    BackupIncomplete(&'static str),
     Cleanup {
         primary: Box<SqliteRuntimeError>,
         failures: Vec<String>,
@@ -257,6 +265,9 @@ impl fmt::Display for SqliteRuntimeError {
             }
             Self::InvalidValue(reason) => write!(formatter, "SQLite 值无效：{reason}"),
             Self::Internal(reason) => write!(formatter, "SQLite 内部不变量破坏：{reason}"),
+            Self::BackupIncomplete(state) => {
+                write!(formatter, "SQLite online backup 未完成：{state}")
+            }
             Self::Cleanup { primary, failures } => {
                 write!(formatter, "{primary}；清理失败")?;
                 for failure in failures {
@@ -282,7 +293,8 @@ impl Error for SqliteRuntimeError {
             | Self::UnexpectedArtifact { .. }
             | Self::ResourceLimit { .. }
             | Self::InvalidValue(_)
-            | Self::Internal(_) => None,
+            | Self::Internal(_)
+            | Self::BackupIncomplete(_) => None,
         }
     }
 }
@@ -303,19 +315,25 @@ impl PermitPool {
     }
 
     fn acquire(self: &Arc<Self>) -> PoolPermit {
+        self.acquire_many(1)
+    }
+
+    fn acquire_many(self: &Arc<Self>, count: usize) -> PoolPermit {
+        assert!(count > 0 && count <= self.maximum);
         let mut active = self
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *active == self.maximum {
+        while self.maximum - *active < count {
             active = self
                 .changed
                 .wait(active)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        *active += 1;
+        *active += count;
         PoolPermit {
             pool: Arc::clone(self),
+            count,
         }
     }
 
@@ -335,6 +353,7 @@ impl PermitPool {
 
 struct PoolPermit {
     pool: Arc<PermitPool>,
+    count: usize,
 }
 
 impl Drop for PoolPermit {
@@ -344,7 +363,7 @@ impl Drop for PoolPermit {
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *active -= 1;
+        *active -= self.count;
         self.pool.changed.notify_all();
     }
 }
@@ -474,6 +493,14 @@ fn open_existing_read_only(
             ))
         })?;
     connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|source| {
+            ExistingFileErrorOrRuntime::Runtime(SqliteRuntimeError::driver(
+                "启用只读连接外键约束",
+                source,
+            ))
+        })?;
+    connection
         .pragma_update(None, "query_only", true)
         .map_err(|source| {
             ExistingFileErrorOrRuntime::Runtime(SqliteRuntimeError::driver("设置只读连接", source))
@@ -524,6 +551,9 @@ fn apply_read_write_policy(
     connection
         .busy_timeout(config.busy_timeout)
         .map_err(|source| SqliteRuntimeError::driver("设置 busy timeout", source))?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|source| SqliteRuntimeError::driver("启用 foreign key 约束", source))?;
     connection
         .pragma_update(None, "journal_mode", config.journal_mode.as_str())
         .map_err(|source| SqliteRuntimeError::driver("设置 journal_mode", source))?;
@@ -1132,6 +1162,222 @@ fn run_create_database(
     }
 }
 
+fn snapshot_failure(
+    primary: SqliteRuntimeError,
+    cleanup: CleanupAssessment,
+) -> SnapshotDatabaseError<SqliteRuntimeError> {
+    let source = if cleanup.failures.is_empty() {
+        primary
+    } else {
+        SqliteRuntimeError::Cleanup {
+            primary: Box::new(primary),
+            failures: cleanup.failures,
+        }
+    };
+    if cleanup.unknown {
+        SnapshotDatabaseError::OutcomeUnknown(source)
+    } else if cleanup.residual {
+        SnapshotDatabaseError::ResidualArtifact(source)
+    } else {
+        SnapshotDatabaseError::NotCreated(source)
+    }
+}
+
+fn snapshot_source_connection(
+    path: &Path,
+    config: &RusqliteStorageConfiguration,
+) -> Result<Connection, SnapshotDatabaseError<SqliteRuntimeError>> {
+    open_existing_read_only(path, config).map_err(|error| match error {
+        ExistingFileErrorOrRuntime::Existing(ExistingFileError::NotFound) => {
+            SnapshotDatabaseError::SourceNotFound
+        }
+        ExistingFileErrorOrRuntime::Existing(ExistingFileError::InvalidTarget) => {
+            SnapshotDatabaseError::NotCreated(SqliteRuntimeError::InvalidTarget {
+                path: path.to_path_buf(),
+            })
+        }
+        ExistingFileErrorOrRuntime::Existing(ExistingFileError::Io(source)) => {
+            SnapshotDatabaseError::NotCreated(SqliteRuntimeError::io(
+                "检查快照源数据库",
+                path,
+                source,
+            ))
+        }
+        ExistingFileErrorOrRuntime::Runtime(source) => SnapshotDatabaseError::NotCreated(source),
+    })
+}
+
+fn run_snapshot_database(
+    source_path: &Path,
+    destination_path: &Path,
+    config: &RusqliteStorageConfiguration,
+) -> Result<(), SnapshotDatabaseError<SqliteRuntimeError>> {
+    let source = snapshot_source_connection(source_path, config)?;
+    let absolute = std::path::absolute(destination_path).map_err(|source| {
+        SnapshotDatabaseError::NotCreated(SqliteRuntimeError::io(
+            "建立快照目标绝对路径",
+            destination_path,
+            source,
+        ))
+    })?;
+    let parent_path = absolute.parent().ok_or_else(|| {
+        SnapshotDatabaseError::NotCreated(SqliteRuntimeError::InvalidTarget {
+            path: absolute.clone(),
+        })
+    })?;
+    let file_name = absolute.file_name().ok_or_else(|| {
+        SnapshotDatabaseError::NotCreated(SqliteRuntimeError::InvalidTarget {
+            path: absolute.clone(),
+        })
+    })?;
+    let parent = pin_directory_without_reparse(parent_path).map_err(|source| {
+        SnapshotDatabaseError::NotCreated(SqliteRuntimeError::windows_file_system(
+            "固定快照目标父目录",
+            parent_path,
+            source,
+        ))
+    })?;
+    let stable_path = parent.resolved_path().join(file_name);
+    let placeholder = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stable_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(SnapshotDatabaseError::DestinationAlreadyExists);
+        }
+        Err(error) => {
+            return Err(SnapshotDatabaseError::NotCreated(SqliteRuntimeError::io(
+                "原子占有快照目标路径",
+                &stable_path,
+                error,
+            )));
+        }
+    };
+    let main_identity = match FileIdentity::of(&placeholder, &stable_path) {
+        Ok(identity) => identity,
+        Err(source) => {
+            drop(placeholder);
+            return Err(SnapshotDatabaseError::OutcomeUnknown(
+                SqliteRuntimeError::windows_file_system(
+                    "固定快照目标物理身份",
+                    &stable_path,
+                    source,
+                ),
+            ));
+        }
+    };
+    drop(placeholder);
+
+    let paths = database_artifact_paths(&stable_path);
+    let main = TrackedDatabaseArtifact {
+        path: stable_path.clone(),
+        identity: main_identity,
+        is_main: true,
+    };
+    for sidecar in &paths[1..] {
+        match fs::symlink_metadata(sidecar) {
+            Ok(_) => {
+                let cleanup = cleanup_database_artifacts(
+                    &paths,
+                    std::slice::from_ref(&main),
+                    CleanupAssessment {
+                        residual: true,
+                        unknown: false,
+                        failures: Vec::new(),
+                    },
+                );
+                return Err(snapshot_failure(
+                    SqliteRuntimeError::UnexpectedArtifact {
+                        path: sidecar.clone(),
+                    },
+                    cleanup,
+                ));
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                let cleanup = cleanup_database_artifacts(
+                    &paths,
+                    std::slice::from_ref(&main),
+                    CleanupAssessment {
+                        residual: false,
+                        unknown: true,
+                        failures: Vec::new(),
+                    },
+                );
+                return Err(snapshot_failure(
+                    SqliteRuntimeError::io("确认快照目标伴生路径初始不存在", sidecar, source),
+                    cleanup,
+                ));
+            }
+        }
+    }
+
+    let mut destination = match Connection::open_with_flags(
+        &stable_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(source) => {
+            let (sidecars, assessment) = observe_sidecar_artifacts(&paths[1..]);
+            let mut tracked = vec![main];
+            tracked.extend(sidecars);
+            let cleanup = cleanup_database_artifacts(&paths, &tracked, assessment);
+            return Err(snapshot_failure(
+                SqliteRuntimeError::driver("打开快照目标数据库", source),
+                cleanup,
+            ));
+        }
+    };
+    let result = (|| {
+        apply_read_write_policy(&destination, config)?;
+        let backup = Backup::new(&source, &mut destination)
+            .map_err(|source| SqliteRuntimeError::driver("建立 online backup", source))?;
+        match backup
+            .step(-1)
+            .map_err(|source| SqliteRuntimeError::driver("执行 online backup", source))?
+        {
+            StepResult::Done => Ok(()),
+            StepResult::More => Err(SqliteRuntimeError::BackupIncomplete("MORE")),
+            StepResult::Busy => Err(SqliteRuntimeError::BackupIncomplete("BUSY")),
+            StepResult::Locked => Err(SqliteRuntimeError::BackupIncomplete("LOCKED")),
+            _ => Err(SqliteRuntimeError::BackupIncomplete("未知状态")),
+        }
+    })();
+    drop(destination);
+    drop(source);
+
+    if let Err(primary) = result {
+        let (sidecars, assessment) = observe_sidecar_artifacts(&paths[1..]);
+        let mut tracked = vec![main];
+        tracked.extend(sidecars);
+        let cleanup = cleanup_database_artifacts(&paths, &tracked, assessment);
+        return Err(snapshot_failure(primary, cleanup));
+    }
+
+    let pinned = pin_path_without_reparse(&stable_path).map_err(|source| {
+        SnapshotDatabaseError::OutcomeUnknown(SqliteRuntimeError::windows_file_system(
+            "复核快照目标物理身份",
+            &stable_path,
+            source,
+        ))
+    })?;
+    let final_identity = FileIdentity::of(pinned.file(), &stable_path).map_err(|source| {
+        SnapshotDatabaseError::OutcomeUnknown(SqliteRuntimeError::windows_file_system(
+            "读取快照目标最终身份",
+            &stable_path,
+            source,
+        ))
+    })?;
+    if final_identity != main_identity {
+        return Err(SnapshotDatabaseError::OutcomeUnknown(
+            SqliteRuntimeError::Internal("快照目标物理身份在 online backup 期间发生变化"),
+        ));
+    }
+    Ok(())
+}
+
 type InteractiveQueryResult =
     Result<Vec<SqliteRow>, SqliteInteractiveSessionError<SqliteRuntimeError>>;
 type InteractiveExecuteResult = Result<u64, SqliteInteractiveSessionError<SqliteRuntimeError>>;
@@ -1713,6 +1959,13 @@ enum ShortJob {
         #[cfg(test)]
         panic_after_operation: bool,
     },
+    Snapshot {
+        source: PathBuf,
+        destination: PathBuf,
+        response: oneshot::Sender<Result<(), SnapshotDatabaseError<SqliteRuntimeError>>>,
+        #[cfg(test)]
+        panic_after_operation: bool,
+    },
     Query {
         path: PathBuf,
         query: SqliteQuery,
@@ -1741,7 +1994,11 @@ fn run_short_worker(
     connections: Arc<PermitPool>,
 ) {
     while let Ok(job) = receiver.recv_blocking() {
-        let _permit = connections.acquire();
+        let _permit = if matches!(&job, ShortJob::Snapshot { .. }) {
+            connections.acquire_many(2)
+        } else {
+            connections.acquire()
+        };
         match job {
             ShortJob::Create {
                 path,
@@ -1760,6 +2017,28 @@ fn run_short_worker(
                 }))
                 .unwrap_or_else(|_| {
                     Err(CreateDatabaseError::OutcomeUnknown(
+                        SqliteRuntimeError::WorkerPanicked("短操作"),
+                    ))
+                });
+                let _ = response.send(result);
+            }
+            ShortJob::Snapshot {
+                source,
+                destination,
+                response,
+                #[cfg(test)]
+                panic_after_operation,
+            } => {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let result = run_snapshot_database(&source, &destination, &config);
+                    #[cfg(test)]
+                    if panic_after_operation {
+                        panic!("测试注入：数据库快照副作用后 panic");
+                    }
+                    result
+                }))
+                .unwrap_or_else(|_| {
+                    Err(SnapshotDatabaseError::OutcomeUnknown(
                         SqliteRuntimeError::WorkerPanicked("短操作"),
                     ))
                 });
@@ -2237,6 +2516,38 @@ impl SqliteDatabaseCreator for RusqliteStorage {
     }
 }
 
+impl SqliteDatabaseSnapshotter for RusqliteStorage {
+    type Error = SqliteRuntimeError;
+
+    fn snapshot_database(
+        &self,
+        source: PathBuf,
+        destination: PathBuf,
+    ) -> impl Future<Output = Result<(), SnapshotDatabaseError<Self::Error>>> + Send {
+        let sender = self.inner.short_sender.clone();
+        let accepting = self.ensure_accepting();
+        async move {
+            accepting.map_err(SnapshotDatabaseError::NotCreated)?;
+            let (response, receiver) = oneshot::channel();
+            sender
+                .send(ShortJob::Snapshot {
+                    source,
+                    destination,
+                    response,
+                    #[cfg(test)]
+                    panic_after_operation: false,
+                })
+                .await
+                .map_err(|_| SnapshotDatabaseError::NotCreated(SqliteRuntimeError::Closed))?;
+            receiver
+                .await
+                .unwrap_or(Err(SnapshotDatabaseError::OutcomeUnknown(
+                    SqliteRuntimeError::WorkerPanicked("短操作"),
+                )))
+        }
+    }
+}
+
 impl SqliteQueryExecutor for RusqliteStorage {
     type Error = SqliteRuntimeError;
 
@@ -2425,6 +2736,154 @@ mod tests {
             "CREATE TABLE values_table (id INTEGER PRIMARY KEY, n INTEGER, r REAL, t TEXT, b BLOB, z BLOB)",
             Vec::new(),
         )]
+    }
+
+    #[test]
+    fn read_write_policy_enables_foreign_key_constraints() {
+        let connection = Connection::open_in_memory().expect("内存数据库应可打开");
+        apply_read_write_policy(&connection, &configuration()).expect("读写策略应可应用");
+
+        let foreign_keys: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("应可读取 foreign_keys 状态");
+        assert_eq!(foreign_keys, 1);
+
+        connection
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY);\
+                 CREATE TABLE child (parent_id INTEGER REFERENCES parent(id));",
+            )
+            .expect("外键测试表应可创建");
+        let error = connection
+            .execute("INSERT INTO child (parent_id) VALUES (1)", [])
+            .expect_err("不存在的父行必须触发外键约束");
+        assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
+    }
+
+    #[test]
+    fn read_only_policy_enables_foreign_key_constraints() {
+        let directory = TestDirectory::new();
+        let database = directory.database("read-only-foreign-keys.db");
+        Connection::open(&database)
+            .expect("测试数据库应可创建")
+            .close()
+            .expect("测试数据库应可关闭");
+
+        let connection = match open_existing_read_only(&database, &configuration()) {
+            Ok(connection) => connection,
+            Err(_) => panic!("现存数据库应可只读打开"),
+        };
+        let foreign_keys: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("应可读取 foreign_keys 状态");
+        assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn configuration_reserves_two_connections_for_online_backup() {
+        let error = RusqliteStorageConfiguration::new(
+            nonzero(1),
+            nonzero(1),
+            nonzero(1),
+            nonzero(1),
+            nonzero(1),
+            nonzero(1),
+            nonzero(1024 * 1024),
+            nonzero(64 * 1024),
+            nonzero(64 * 1024),
+            nonzero(100),
+            nonzero(1024 * 1024),
+            Duration::from_secs(1),
+            SqliteJournalMode::Delete,
+            SqliteSynchronous::Full,
+        )
+        .expect_err("online backup 需要同时占用两个连接许可");
+
+        assert!(matches!(error, SqliteRuntimeError::InvalidConfiguration(_)));
+        assert!(error.to_string().contains("至少为 2"));
+    }
+
+    #[tokio::test]
+    async fn online_backup_is_create_only_and_copies_one_consistent_database() {
+        let directory = TestDirectory::new();
+        let source = directory.database("source.db");
+        let destination = directory.database("snapshot.db");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
+        storage
+            .create_new_database(source.clone(), schema_commands())
+            .await
+            .expect("源数据库应可创建");
+        storage
+            .execute_transaction(
+                source.clone(),
+                SqliteTransactionPlan::new(vec![SqliteTransactionStep::Execute(
+                    SqliteCommand::new(
+                        "INSERT INTO values_table (id, t) VALUES (?1, ?2)",
+                        vec![
+                            SqliteValue::Integer(1),
+                            SqliteValue::Text("冻结值".to_owned()),
+                        ],
+                    ),
+                )]),
+            )
+            .await
+            .expect("源数据应可提交");
+
+        storage
+            .snapshot_database(source.clone(), destination.clone())
+            .await
+            .expect("online backup 应成功");
+        let rows = storage
+            .query_existing_database(
+                destination.clone(),
+                SqliteQuery::new("SELECT id, t FROM values_table", Vec::new()),
+            )
+            .await
+            .expect("快照应可独立读取");
+        assert_eq!(
+            rows,
+            vec![SqliteRow::new(vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("冻结值".to_owned()),
+            ])]
+        );
+
+        let error = storage
+            .snapshot_database(source, destination)
+            .await
+            .expect_err("现存目标绝不能被覆盖");
+        assert!(matches!(
+            error,
+            SnapshotDatabaseError::DestinationAlreadyExists
+        ));
+        storage.shutdown().await.expect("根应可关闭");
+    }
+
+    #[tokio::test]
+    async fn online_backup_reports_missing_source_and_cleans_invalid_copy() {
+        let directory = TestDirectory::new();
+        let missing = directory.database("missing.db");
+        let destination = directory.database("missing-snapshot.db");
+        let invalid = directory.database("invalid.db");
+        let invalid_destination = directory.database("invalid-snapshot.db");
+        fs::write(&invalid, b"not a sqlite database").expect("无效源文件应可创建");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
+
+        assert!(matches!(
+            storage
+                .snapshot_database(missing, destination.clone())
+                .await,
+            Err(SnapshotDatabaseError::SourceNotFound)
+        ));
+        assert!(!destination.exists());
+
+        let error = storage
+            .snapshot_database(invalid, invalid_destination.clone())
+            .await
+            .expect_err("无效 SQLite 源必须失败");
+        assert!(matches!(error, SnapshotDatabaseError::NotCreated(_)));
+        assert!(!invalid_destination.exists());
+        storage.shutdown().await.expect("根应可关闭");
     }
 
     #[tokio::test]
@@ -3357,6 +3816,10 @@ mod tests {
         let directory = TestDirectory::new();
         let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
         assert_send(storage.create_new_database(directory.database("send.db"), schema_commands()));
+        assert_send(storage.snapshot_database(
+            directory.database("send.db"),
+            directory.database("send-copy.db"),
+        ));
         assert_send(storage.query_existing_database(
             directory.database("send.db"),
             SqliteQuery::new("SELECT 1", Vec::new()),

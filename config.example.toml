@@ -16,12 +16,17 @@ queue_capacity = 64
 max_read_bytes = 67108864
 max_directory_entries = 100000
 
+[runtime.filesystem.tree]
+max_entries = 500000
+max_depth = 128
+max_bytes = 8589934592
+max_single_file_bytes = 1073741824
+
+[runtime.filesystem.project_lock]
+timeout_ms = 30000
+
 [runtime.filesystem.publisher]
 max_prepared_candidates = 2
-max_candidate_entries = 500000
-max_candidate_depth = 128
-max_candidate_bytes = 8589934592
-max_single_file_bytes = 1073741824
 max_recovery_artifacts_per_target = 16
 target_lock_timeout_ms = 30000
 
@@ -61,6 +66,11 @@ worker_stack_bytes = 8388608
 memory_limit_bytes_per_vm = 134217728
 cancel_check_instruction_interval = 10000
 max_error_bytes = 65536
+
+[runtime.lua.host_values]
+max_bytes = 67108864
+max_nodes = 1000000
+max_depth = 128
 
 [observability]
 root = "logs"

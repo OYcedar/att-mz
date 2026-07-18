@@ -9,6 +9,8 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+
 /// 语言模块能够观察的文本片段。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LanguageTextSegment {
@@ -311,6 +313,9 @@ impl LanguageAnalysis {
 
 /// 一个语言模块只拥有译前判断、源文残留和可选安全修复三项职责。
 pub(crate) trait LanguageModule: Send + Sync {
+    /// 返回仅由当前语言策略决定的稳定语义指纹。
+    fn semantic_fingerprint(&self) -> Sha256Fingerprint;
+
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis;
 
     fn find_source_residual(
@@ -637,6 +642,34 @@ struct JapaneseQuoteNode {
 }
 
 impl LanguageModule for JapaneseLanguageModule {
+    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+        let mut hasher = Sha256FramedHasher::new(b"att.language.japanese");
+        hasher.frame(
+            1,
+            &u64::try_from(self.residual_policy.minimum_kana_characters.get())
+                .expect("x86_64 usize 必须可表示为 u64")
+                .to_be_bytes(),
+        );
+        for term in &self.residual_policy.allowed_terms {
+            hasher.frame(2, term.as_bytes());
+        }
+        match &self.quote_repair_policy {
+            None => {
+                hasher.frame(3, &[0]);
+            }
+            Some(policy) => {
+                hasher.frame(3, &[1]);
+                for pair in &policy.candidate_pairs {
+                    let mut encoded = [0_u8; 8];
+                    encoded[..4].copy_from_slice(&u32::from(pair.opening()).to_be_bytes());
+                    encoded[4..].copy_from_slice(&u32::from(pair.closing()).to_be_bytes());
+                    hasher.frame(4, &encoded);
+                }
+            }
+        }
+        hasher.finish()
+    }
+
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
         let needs_translation = natural_texts(text)
             .flat_map(str::chars)
@@ -797,6 +830,30 @@ pub(crate) struct EnglishLanguageAnalysis {
 }
 
 impl LanguageModule for EnglishLanguageModule {
+    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+        let mut hasher = Sha256FramedHasher::new(b"att.language.english");
+        for (tag, value) in [
+            (1, self.detection_policy.minimum_word_count.get()),
+            (2, self.detection_policy.minimum_letter_count.get()),
+            (4, self.residual_policy.minimum_copied_word_count.get()),
+            (5, self.residual_policy.minimum_copied_letter_count.get()),
+        ] {
+            hasher.frame(
+                tag,
+                &u64::try_from(value)
+                    .expect("x86_64 usize 必须可表示为 u64")
+                    .to_be_bytes(),
+            );
+        }
+        for term in &self.detection_policy.ignored_terms {
+            hasher.frame(3, term.as_bytes());
+        }
+        for term in &self.residual_policy.allowed_terms {
+            hasher.frame(6, term.as_bytes());
+        }
+        hasher.finish()
+    }
+
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
         let detection_runs = english_runs(text, &self.detection_policy.ignored_terms);
         let needs_translation = detection_runs.iter().any(|run| {

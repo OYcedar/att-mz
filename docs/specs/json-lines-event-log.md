@@ -1,6 +1,6 @@
 # JSON Lines 持久事件日志现行规格
 
-本文定义 MZ Standard Translate 与 Standard WriteBack 共用的生产日志根。日志根把已经建立的结构化业务事件转换为稳定 wire，串行追加到两条彼此独立的全局 JSON Lines 流，并在单条记录完成数据刷盘后才向调用方确认。
+本文定义 MZ Standard Translate 与完整 WriteBack 共用的生产日志根。日志根把已经建立的结构化业务事件转换为稳定 wire，串行追加到两条彼此独立的全局 JSON Lines 流，并在单条记录完成数据刷盘后才向调用方确认。
 
 ## 1. 双流与固定路径
 
@@ -15,7 +15,7 @@
 ```
 
 - `translation.jsonl` 只接收 Standard Translate 事件；
-- `write_back.jsonl` 只接收 Standard WriteBack 事件；
+- `write_back.jsonl` 只接收完整 WriteBack 事件；
 - 两条流分别拥有有界队列、专用 OS worker、跨进程文件锁、活动文件和轮转文件；
 - 一个流的排队、锁等待、轮转或失败不会改变另一条流的物理文件；
 - 文件物理行顺序是该流的全局权威顺序。
@@ -40,7 +40,7 @@ WriteBack 在项目成功解析后建立一次以下日志上下文：
 run_id + project
 ```
 
-实际布局宽度由已经打开项目的 WriteBackService 作为完成事件事实提交，组合边界不为构造日志根重复读取项目数据库。同一次 Standard 运行的所有事件复用同一个日志上下文。日志根不从事件文本、文件路径或先前记录猜测运行归属。WriteBack 事件携带的项目必须与注入上下文一致，否则该条记录在写文件前拒绝。
+实际布局宽度由已经打开项目的 WriteBackService 作为完成事件事实提交，组合边界不为构造日志根重复读取项目数据库。同一次 WriteBack 运行的事件复用同一个日志上下文。日志根不从事件文本、文件路径或先前记录猜测运行归属。WriteBack 事件携带的项目必须与注入上下文一致，否则该条记录在写文件前拒绝。
 
 `recorded_at_utc` 由日志 worker 在处理该事件时生成，格式固定为 UTC 毫秒：
 
@@ -109,6 +109,7 @@ event
 output_root
 summary
 manual_layout_diagnostics[]
+lua_executed
 ```
 
 `layout_profile` 保存本次实际使用的三个正整数宽度：
@@ -119,7 +120,7 @@ scrolling_text_max_fullwidth_chars
 help_description_max_fullwidth_chars
 ```
 
-`summary` 固定包含译文位置数、原文位置数、自动换行单元数、插入换行数、插入全角缩进数和人工布局单元数。`manual_layout_diagnostics[]` 逐项保存结构化位置、`dialogue_body | scrolling_text | help_description` 区域和实际宽度；其数量必须与 `summary.manual_layout_units` 相等。
+`summary` 固定包含译文位置数、原文位置数、自动换行单元数、插入换行数、插入全角缩进数和人工布局单元数。`manual_layout_diagnostics[]` 逐项保存结构化位置、`dialogue_body | scrolling_text | help_description` 区域和实际宽度；其数量必须与 `summary.manual_layout_units` 相等。`lua_executed` 精确记录本次唯一候选是否经过显式 Lua 阶段。
 
 ## 5. 结构化 MZ 位置
 

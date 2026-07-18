@@ -17,7 +17,9 @@ use serde_json::{Map, Value};
 use crate::att_mz::project::OpenedProject;
 pub(crate) use crate::att_mz::text::StandardDataFile;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
-use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
+use crate::storage::file_system::{
+    DirectoryEntryKind, DirectoryLister, FileReader, ListDirectoryError, ReadFileError,
+};
 
 /// 一个已加载文档的稳定身份。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -329,8 +331,12 @@ where
                 .list_directory(data_root.clone())
                 .await?;
             for entry in entries {
-                if let Some(map_id) = canonical_map_id(&entry) {
-                    documents.insert(MzDocumentId::Map(map_id), entry);
+                if entry.kind() != DirectoryEntryKind::RegularFile {
+                    continue;
+                }
+                let path = entry.into_path();
+                if let Some(map_id) = canonical_map_id(&path) {
+                    documents.insert(MzDocumentId::Map(map_id), path);
                 }
             }
         }
@@ -913,9 +919,20 @@ var $plugins =
         async fn list_directory(
             &self,
             _path: PathBuf,
-        ) -> Result<Vec<PathBuf>, ListDirectoryError<Self::Error>> {
+        ) -> Result<Vec<crate::storage::file_system::DirectoryEntry>, ListDirectoryError<Self::Error>>
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.entries.as_ref().clone())
+            Ok(self
+                .entries
+                .iter()
+                .cloned()
+                .map(|path| {
+                    crate::storage::file_system::DirectoryEntry::new(
+                        path,
+                        DirectoryEntryKind::RegularFile,
+                    )
+                })
+                .collect())
         }
     }
 

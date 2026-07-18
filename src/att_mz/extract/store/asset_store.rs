@@ -13,96 +13,50 @@ use crate::att_mz::standard_asset::{
 };
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
-    ExecuteTransactionError, SqliteBatch, SqliteCheckId, SqliteCommand, SqliteQuery,
-    SqliteTransactionExecutor, SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
+    ExecuteTransactionError, QueryExistingDatabaseError, SqliteBatch, SqliteCheckId, SqliteCommand,
+    SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
+    SqliteTransactionStep, SqliteValue,
 };
 
-use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, RulesSnapshot};
-use super::{BuiltinSnapshotStore, RulesSnapshotStore};
+use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, LuaSnapshot, RulesSnapshot};
+use super::{
+    BuiltinSnapshotStore, LuaSnapshotStore, RulesSnapshotStore, SnapshotReplacementOutcome,
+};
 use crate::att_mz::location_codec::{MzLocationCodec, MzLocationCodecError};
 
 const OWNER_CONFLICT_CHECK: &str = "mz_extraction_owner_conflict";
-
-const CREATE_ENTRY_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS entry (
-    exact_location TEXT NOT NULL PRIMARY KEY,
-    owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
-    group_location TEXT NOT NULL,
-    field_name     TEXT NOT NULL,
-    original_text  TEXT NOT NULL,
-    translation    TEXT
-)"#;
-
-const CREATE_SYSTEM_TEXT_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS system_text (
-    exact_location TEXT NOT NULL PRIMARY KEY,
-    owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
-    group_location TEXT NOT NULL,
-    field_name     TEXT NOT NULL,
-    original_text  TEXT NOT NULL,
-    translation    TEXT
-)"#;
-
-const CREATE_MAP_TEXT_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS map_text (
-    exact_location TEXT NOT NULL PRIMARY KEY,
-    owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
-    group_location TEXT NOT NULL,
-    field_name     TEXT NOT NULL,
-    original_text  TEXT NOT NULL,
-    translation    TEXT
-)"#;
-
-const CREATE_TEXT_BODY_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS text_body (
-    exact_location TEXT NOT NULL PRIMARY KEY,
-    owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
-    group_location TEXT NOT NULL,
-    field_name     TEXT NOT NULL,
-    unit_type      TEXT NOT NULL CHECK (
-        unit_type IN ('dialogue', 'choices', 'scrolling_text', 'event_command')
-    ),
-    original_text  TEXT NOT NULL,
-    translation    TEXT
-)"#;
-
-const CREATE_PLUGIN_PARAM_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS plugin_param (
-    exact_location TEXT NOT NULL PRIMARY KEY,
-    owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules')),
-    group_location TEXT NOT NULL,
-    field_name     TEXT NOT NULL,
-    original_text  TEXT NOT NULL,
-    translation    TEXT
-)"#;
-
-const CREATE_TERMINOLOGY_DEPENDENCY_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS translation_terminology_dependency (
-    asset_table      TEXT NOT NULL,
-    exact_location   TEXT NOT NULL,
-    term             TEXT NOT NULL,
-    term_translation TEXT NOT NULL,
-    PRIMARY KEY (asset_table, exact_location, term)
-)"#;
 
 const DROP_STAGING_TABLE: &str = "DROP TABLE IF EXISTS temp.att_mz_extraction_staging";
 const DROP_PREVIOUS_TABLE: &str = "DROP TABLE IF EXISTS temp.att_mz_extraction_previous";
 
 const CREATE_STAGING_TABLE: &str = r#"CREATE TEMP TABLE att_mz_extraction_staging (
     target_table   TEXT NOT NULL,
-    exact_location TEXT NOT NULL PRIMARY KEY,
+    exact_location TEXT NOT NULL,
     owner          TEXT NOT NULL,
     group_location TEXT NOT NULL,
     field_name     TEXT NOT NULL,
     original_text  TEXT NOT NULL,
     unit_type      TEXT,
-    translation    TEXT
+    translation    TEXT,
+    translation_state BLOB,
+    PRIMARY KEY (target_table, exact_location)
 )"#;
 
 const CREATE_PREVIOUS_TABLE: &str = r#"CREATE TEMP TABLE att_mz_extraction_previous AS
-SELECT 'entry' AS target_table, exact_location, owner, original_text, translation FROM entry
+SELECT 'entry' AS target_table, exact_location, owner, field_name, original_text,
+       NULL AS unit_type, translation, translation_state FROM entry WHERE owner = ?
 UNION ALL
-SELECT 'system_text', exact_location, owner, original_text, translation FROM system_text
+SELECT 'system_text', exact_location, owner, field_name, original_text,
+       NULL, translation, translation_state FROM system_text WHERE owner = ?
 UNION ALL
-SELECT 'map_text', exact_location, owner, original_text, translation FROM map_text
+SELECT 'map_text', exact_location, owner, field_name, original_text,
+       NULL, translation, translation_state FROM map_text WHERE owner = ?
 UNION ALL
-SELECT 'text_body', exact_location, owner, original_text, translation FROM text_body
+SELECT 'text_body', exact_location, owner, field_name, original_text,
+       unit_type, translation, translation_state FROM text_body WHERE owner = ?
 UNION ALL
-SELECT 'plugin_param', exact_location, owner, original_text, translation FROM plugin_param"#;
+SELECT 'plugin_param', exact_location, owner, field_name, original_text,
+       NULL, translation, translation_state FROM plugin_param WHERE owner = ?"#;
 
 const INSERT_STAGING: &str = r#"INSERT INTO att_mz_extraction_staging (
     target_table,
@@ -116,62 +70,29 @@ const INSERT_STAGING: &str = r#"INSERT INTO att_mz_extraction_staging (
 
 const FIND_OWNER_CONFLICT: &str = r#"SELECT 1
 FROM att_mz_extraction_staging AS staged
-JOIN att_mz_extraction_previous AS previous
-  ON previous.exact_location = staged.exact_location
+JOIN (
+    SELECT owner, exact_location FROM entry
+    UNION ALL SELECT owner, exact_location FROM system_text
+    UNION ALL SELECT owner, exact_location FROM map_text
+    UNION ALL SELECT owner, exact_location FROM text_body
+    UNION ALL SELECT owner, exact_location FROM plugin_param
+) AS previous ON previous.exact_location = staged.exact_location
+JOIN standard_asset_owner_state AS state ON state.owner = previous.owner
+JOIN metadata ON metadata.source_snapshot_fingerprint = state.source_snapshot_fingerprint
 WHERE previous.owner <> staged.owner
 LIMIT 1"#;
 
 const INHERIT_TRANSLATIONS: &str = r#"UPDATE att_mz_extraction_staging
-SET translation = (
-    SELECT previous.translation
+SET (translation, translation_state) = (
+    SELECT previous.translation, previous.translation_state
     FROM att_mz_extraction_previous AS previous
-    WHERE previous.exact_location = att_mz_extraction_staging.exact_location
+    WHERE previous.target_table = att_mz_extraction_staging.target_table
+      AND previous.exact_location = att_mz_extraction_staging.exact_location
       AND previous.owner = att_mz_extraction_staging.owner
+      AND previous.field_name = att_mz_extraction_staging.field_name
       AND previous.original_text = att_mz_extraction_staging.original_text
+      AND previous.unit_type IS att_mz_extraction_staging.unit_type
     LIMIT 1
-)"#;
-
-const MIGRATE_INHERITED_TERMINOLOGY_DEPENDENCIES: &str = r#"UPDATE translation_terminology_dependency
-SET asset_table = (
-    SELECT staged.target_table
-    FROM att_mz_extraction_previous AS previous
-    JOIN att_mz_extraction_staging AS staged
-      ON staged.exact_location = previous.exact_location
-     AND staged.owner = previous.owner
-     AND staged.original_text = previous.original_text
-    WHERE previous.target_table = translation_terminology_dependency.asset_table
-      AND previous.exact_location = translation_terminology_dependency.exact_location
-      AND staged.translation IS NOT NULL
-    LIMIT 1
-)
-WHERE EXISTS (
-    SELECT 1
-    FROM att_mz_extraction_previous AS previous
-    JOIN att_mz_extraction_staging AS staged
-      ON staged.exact_location = previous.exact_location
-     AND staged.owner = previous.owner
-     AND staged.original_text = previous.original_text
-    WHERE previous.target_table = translation_terminology_dependency.asset_table
-      AND previous.exact_location = translation_terminology_dependency.exact_location
-      AND staged.translation IS NOT NULL
-)"#;
-
-const DELETE_INVALIDATED_TERMINOLOGY_DEPENDENCIES: &str = r#"DELETE FROM translation_terminology_dependency
-WHERE EXISTS (
-    SELECT 1
-    FROM att_mz_extraction_previous AS previous
-    WHERE previous.target_table = translation_terminology_dependency.asset_table
-      AND previous.exact_location = translation_terminology_dependency.exact_location
-      AND previous.owner = ?
-      AND NOT EXISTS (
-          SELECT 1
-          FROM att_mz_extraction_staging AS staged
-          WHERE staged.target_table = previous.target_table
-            AND staged.exact_location = previous.exact_location
-            AND staged.owner = previous.owner
-            AND staged.original_text = previous.original_text
-            AND staged.translation IS NOT NULL
-      )
 )"#;
 
 const DELETE_OWNER_FROM_TABLES: [&str; 5] = [
@@ -182,42 +103,71 @@ const DELETE_OWNER_FROM_TABLES: [&str; 5] = [
     "DELETE FROM plugin_param WHERE owner = ?",
 ];
 
+const UPSERT_OWNER_STATE: &str = r#"INSERT INTO standard_asset_owner_state (
+    owner, source_snapshot_fingerprint
+) VALUES (?, ?)
+ON CONFLICT(owner) DO UPDATE SET
+    source_snapshot_fingerprint = excluded.source_snapshot_fingerprint"#;
+
+const DEACTIVATE_OWNER: &str = "DELETE FROM standard_asset_owner_state WHERE owner = ?";
+
+const READ_OWNER_SNAPSHOT: &str = r#"SELECT
+    'owner', '', '', '', '', '', NULL, source_snapshot_fingerprint
+FROM standard_asset_owner_state
+WHERE owner = ?
+UNION ALL
+SELECT 'asset', 'entry', exact_location, group_location, field_name, original_text, NULL, NULL
+FROM entry WHERE owner = ?
+UNION ALL
+SELECT 'asset', 'system_text', exact_location, group_location, field_name, original_text, NULL, NULL
+FROM system_text WHERE owner = ?
+UNION ALL
+SELECT 'asset', 'map_text', exact_location, group_location, field_name, original_text, NULL, NULL
+FROM map_text WHERE owner = ?
+UNION ALL
+SELECT 'asset', 'text_body', exact_location, group_location, field_name, original_text, unit_type, NULL
+FROM text_body WHERE owner = ?
+UNION ALL
+SELECT 'asset', 'plugin_param', exact_location, group_location, field_name, original_text, NULL, NULL
+FROM plugin_param WHERE owner = ?
+ORDER BY 1 DESC, 2, 3"#;
+
 const INSERT_ENTRY: &str = r#"INSERT INTO entry (
-    exact_location, owner, group_location, field_name, original_text, translation
+    owner, exact_location, group_location, field_name, original_text, translation, translation_state
 )
-SELECT exact_location, owner, group_location, field_name, original_text, translation
+SELECT owner, exact_location, group_location, field_name, original_text, translation, translation_state
 FROM att_mz_extraction_staging
 WHERE target_table = ?
 ORDER BY exact_location"#;
 
 const INSERT_SYSTEM_TEXT: &str = r#"INSERT INTO system_text (
-    exact_location, owner, group_location, field_name, original_text, translation
+    owner, exact_location, group_location, field_name, original_text, translation, translation_state
 )
-SELECT exact_location, owner, group_location, field_name, original_text, translation
+SELECT owner, exact_location, group_location, field_name, original_text, translation, translation_state
 FROM att_mz_extraction_staging
 WHERE target_table = ?
 ORDER BY exact_location"#;
 
 const INSERT_MAP_TEXT: &str = r#"INSERT INTO map_text (
-    exact_location, owner, group_location, field_name, original_text, translation
+    owner, exact_location, group_location, field_name, original_text, translation, translation_state
 )
-SELECT exact_location, owner, group_location, field_name, original_text, translation
+SELECT owner, exact_location, group_location, field_name, original_text, translation, translation_state
 FROM att_mz_extraction_staging
 WHERE target_table = ?
 ORDER BY exact_location"#;
 
 const INSERT_TEXT_BODY: &str = r#"INSERT INTO text_body (
-    exact_location, owner, group_location, field_name, unit_type, original_text, translation
+    owner, exact_location, group_location, field_name, unit_type, original_text, translation, translation_state
 )
-SELECT exact_location, owner, group_location, field_name, unit_type, original_text, translation
+SELECT owner, exact_location, group_location, field_name, unit_type, original_text, translation, translation_state
 FROM att_mz_extraction_staging
 WHERE target_table = ?
 ORDER BY exact_location"#;
 
 const INSERT_PLUGIN_PARAM: &str = r#"INSERT INTO plugin_param (
-    exact_location, owner, group_location, field_name, original_text, translation
+    owner, exact_location, group_location, field_name, original_text, translation, translation_state
 )
-SELECT exact_location, owner, group_location, field_name, original_text, translation
+SELECT owner, exact_location, group_location, field_name, original_text, translation, translation_state
 FROM att_mz_extraction_staging
 WHERE target_table = ?
 ORDER BY exact_location"#;
@@ -270,7 +220,7 @@ impl<S, C> MzExtractionAssetStore<S, C> {
 
 impl<S, C> MzExtractionAssetStore<S, C>
 where
-    S: SqliteTransactionExecutor,
+    S: SqliteQueryExecutor + SqliteTransactionExecutor<Error = <S as SqliteQueryExecutor>::Error>,
     C: CpuTaskExecutor,
 {
     async fn replace(
@@ -278,7 +228,10 @@ where
         project: &OpenedProject,
         owner: MzStandardAssetOwner,
         groups: Vec<ExtractedTextGroup>,
-    ) -> Result<(), MzExtractionAssetStoreError<C::Error, S::Error>> {
+    ) -> Result<
+        SnapshotReplacementOutcome,
+        MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
+    > {
         let batches = split_groups(groups, self.config.groups_per_encode_job.get());
         let parameter_batches = stream::iter(batches.into_iter().map(|batch| async move {
             self.cpu
@@ -291,29 +244,91 @@ where
         .try_collect::<Vec<_>>()
         .await?;
 
-        let parameter_sets = parameter_batches.into_iter().flatten().collect();
-        let plan = build_transaction_plan(owner, parameter_sets);
+        let mut parameter_sets = parameter_batches.into_iter().flatten().collect::<Vec<_>>();
+        sort_parameter_sets(&mut parameter_sets);
         let database_path = project.database_path().to_path_buf();
+        let current = self
+            .read_owner_snapshot(database_path.clone(), owner)
+            .await?;
+        let desired = desired_snapshot_rows(
+            project.source_snapshot_fingerprint().as_bytes(),
+            &parameter_sets,
+        );
+        if current == desired {
+            return Ok(SnapshotReplacementOutcome::Unchanged);
+        }
+
+        let plan = build_transaction_plan(
+            owner,
+            project.source_snapshot_fingerprint().as_bytes(),
+            parameter_sets,
+        );
 
         self.sqlite
             .execute_transaction(database_path.clone(), plan)
             .await
-            .map_err(|error| map_persist_error(database_path, error))
+            .map_err(|error| map_persist_error(database_path, error))?;
+        Ok(SnapshotReplacementOutcome::Changed)
+    }
+
+    async fn deactivate(
+        &self,
+        project: &OpenedProject,
+        owner: MzStandardAssetOwner,
+    ) -> Result<
+        SnapshotReplacementOutcome,
+        MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
+    > {
+        let database_path = project.database_path().to_path_buf();
+        if self
+            .read_owner_snapshot(database_path.clone(), owner)
+            .await?
+            .is_empty()
+        {
+            return Ok(SnapshotReplacementOutcome::Unchanged);
+        }
+        let plan = SqliteTransactionPlan::new(vec![execute(
+            DEACTIVATE_OWNER,
+            vec![text(owner.storage_name())],
+        )]);
+        self.sqlite
+            .execute_transaction(database_path.clone(), plan)
+            .await
+            .map_err(|error| map_persist_error(database_path, error))?;
+        Ok(SnapshotReplacementOutcome::Changed)
+    }
+
+    async fn read_owner_snapshot(
+        &self,
+        database_path: PathBuf,
+        owner: MzStandardAssetOwner,
+    ) -> Result<
+        Vec<SqliteRow>,
+        MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
+    > {
+        let owner = text(owner.storage_name());
+        self.sqlite
+            .query_existing_database(
+                database_path.clone(),
+                SqliteQuery::new(READ_OWNER_SNAPSHOT, vec![owner; 6]),
+            )
+            .await
+            .map_err(|error| map_query_error(database_path, error))
     }
 }
 
 impl<S, C> BuiltinSnapshotStore for MzExtractionAssetStore<S, C>
 where
-    S: SqliteTransactionExecutor,
+    S: SqliteQueryExecutor + SqliteTransactionExecutor<Error = <S as SqliteQueryExecutor>::Error>,
     C: CpuTaskExecutor,
 {
-    type Error = MzExtractionAssetStoreError<C::Error, S::Error>;
+    type Error = MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>;
 
     async fn replace_builtin(
         &self,
         project: &OpenedProject,
         snapshot: BuiltinSnapshot,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
         self.replace(
             project,
             MzStandardAssetOwner::Builtin,
@@ -325,18 +340,49 @@ where
 
 impl<S, C> RulesSnapshotStore for MzExtractionAssetStore<S, C>
 where
-    S: SqliteTransactionExecutor,
+    S: SqliteQueryExecutor + SqliteTransactionExecutor<Error = <S as SqliteQueryExecutor>::Error>,
     C: CpuTaskExecutor,
 {
-    type Error = MzExtractionAssetStoreError<C::Error, S::Error>;
+    type Error = MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>;
 
     async fn replace_rules(
         &self,
         project: &OpenedProject,
         snapshot: RulesSnapshot,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
         self.replace(project, MzStandardAssetOwner::Rules, snapshot.into_groups())
             .await
+    }
+
+    async fn deactivate_rules(
+        &self,
+        project: &OpenedProject,
+    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+        self.deactivate(project, MzStandardAssetOwner::Rules).await
+    }
+}
+
+impl<S, C> LuaSnapshotStore for MzExtractionAssetStore<S, C>
+where
+    S: SqliteQueryExecutor + SqliteTransactionExecutor<Error = <S as SqliteQueryExecutor>::Error>,
+    C: CpuTaskExecutor,
+{
+    type Error = MzExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>;
+
+    async fn replace_lua(
+        &self,
+        project: &OpenedProject,
+        snapshot: LuaSnapshot,
+    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+        self.replace(project, MzStandardAssetOwner::Lua, snapshot.into_groups())
+            .await
+    }
+
+    async fn deactivate_lua(
+        &self,
+        project: &OpenedProject,
+    ) -> Result<SnapshotReplacementOutcome, Self::Error> {
+        self.deactivate(project, MzStandardAssetOwner::Lua).await
     }
 }
 
@@ -346,6 +392,7 @@ pub(crate) enum MzExtractionAssetStoreError<C, S> {
     ScheduleEncoding(CpuTaskExecutionError<C>),
     EncodeLocation(MzLocationCodecError),
     DatabaseNotFound { database_path: PathBuf },
+    ReadCurrentState { database_path: PathBuf, source: S },
     OwnershipConflict { database_path: PathBuf },
     NotCommitted { database_path: PathBuf, source: S },
     OutcomeUnknown { database_path: PathBuf, source: S },
@@ -363,9 +410,17 @@ where
             Self::DatabaseNotFound { database_path } => {
                 write!(formatter, "项目数据库不存在：{}", database_path.display())
             }
+            Self::ReadCurrentState {
+                database_path,
+                source,
+            } => write!(
+                formatter,
+                "无法读取当前 owner 快照 {}：{source}",
+                database_path.display()
+            ),
             Self::OwnershipConflict { database_path } => write!(
                 formatter,
-                "Builtin 与 Rules 拥有了同一文本位置：{}",
+                "当前来源下的新鲜标准资产 owner 拥有了同一文本位置：{}",
                 database_path.display()
             ),
             Self::NotCommitted {
@@ -397,6 +452,7 @@ where
         match self {
             Self::ScheduleEncoding(source) => Some(source),
             Self::EncodeLocation(source) => Some(source),
+            Self::ReadCurrentState { source, .. } => Some(source),
             Self::NotCommitted { source, .. } | Self::OutcomeUnknown { source, .. } => Some(source),
             Self::DatabaseNotFound { .. } | Self::OwnershipConflict { .. } => None,
         }
@@ -450,25 +506,72 @@ fn text(value: impl Into<String>) -> SqliteValue {
     SqliteValue::Text(value.into())
 }
 
+fn sqlite_text(value: &SqliteValue) -> &str {
+    let SqliteValue::Text(value) = value else {
+        unreachable!("内部编码的表名与位置必须是 TEXT")
+    };
+    value
+}
+
+fn encoded_asset_table(table: &str) -> MzStandardAssetTable {
+    MzStandardAssetTable::from_storage_name(table).expect("内部编码只能产生当前五张标准资产表")
+}
+
+fn sort_parameter_sets(parameter_sets: &mut [Vec<SqliteValue>]) {
+    parameter_sets.sort_by(|left, right| {
+        encoded_asset_table(sqlite_text(&left[0]))
+            .cmp(&encoded_asset_table(sqlite_text(&right[0])))
+            .then_with(|| sqlite_text(&left[1]).cmp(sqlite_text(&right[1])))
+    });
+}
+
+fn desired_snapshot_rows(
+    fingerprint: &[u8; 32],
+    parameter_sets: &[Vec<SqliteValue>],
+) -> Vec<SqliteRow> {
+    let mut rows = Vec::with_capacity(parameter_sets.len() + 1);
+    rows.push(SqliteRow::new(vec![
+        text("owner"),
+        text(""),
+        text(""),
+        text(""),
+        text(""),
+        text(""),
+        SqliteValue::Null,
+        SqliteValue::Blob(fingerprint.to_vec()),
+    ]));
+    rows.extend(parameter_sets.iter().map(|parameters| {
+        SqliteRow::new(vec![
+            text("asset"),
+            parameters[0].clone(),
+            parameters[1].clone(),
+            parameters[3].clone(),
+            parameters[4].clone(),
+            parameters[5].clone(),
+            parameters[6].clone(),
+            SqliteValue::Null,
+        ])
+    }));
+    rows
+}
+
 fn build_transaction_plan(
     owner: MzStandardAssetOwner,
+    source_snapshot_fingerprint: &[u8; 32],
     parameter_sets: Vec<Vec<SqliteValue>>,
 ) -> SqliteTransactionPlan {
-    let mut steps = Vec::with_capacity(24);
+    let mut steps = Vec::with_capacity(20);
     for statement in [
-        CREATE_ENTRY_TABLE,
-        CREATE_SYSTEM_TEXT_TABLE,
-        CREATE_MAP_TEXT_TABLE,
-        CREATE_TEXT_BODY_TABLE,
-        CREATE_PLUGIN_PARAM_TABLE,
-        CREATE_TERMINOLOGY_DEPENDENCY_TABLE,
         DROP_STAGING_TABLE,
         DROP_PREVIOUS_TABLE,
         CREATE_STAGING_TABLE,
-        CREATE_PREVIOUS_TABLE,
     ] {
         steps.push(execute(statement, Vec::new()));
     }
+    steps.push(execute(
+        CREATE_PREVIOUS_TABLE,
+        vec![text(owner.storage_name()); 5],
+    ));
 
     if !parameter_sets.is_empty() {
         steps.push(SqliteTransactionStep::ExecuteMany(SqliteBatch::new(
@@ -482,18 +585,17 @@ fn build_transaction_plan(
         query: SqliteQuery::new(FIND_OWNER_CONFLICT, Vec::new()),
     });
     steps.push(execute(INHERIT_TRANSLATIONS, Vec::new()));
-    steps.push(execute(
-        MIGRATE_INHERITED_TERMINOLOGY_DEPENDENCIES,
-        Vec::new(),
-    ));
-    steps.push(execute(
-        DELETE_INVALIDATED_TERMINOLOGY_DEPENDENCIES,
-        vec![text(owner.storage_name())],
-    ));
 
     for statement in DELETE_OWNER_FROM_TABLES {
         steps.push(execute(statement, vec![text(owner.storage_name())]));
     }
+    steps.push(execute(
+        UPSERT_OWNER_STATE,
+        vec![
+            text(owner.storage_name()),
+            SqliteValue::Blob(source_snapshot_fingerprint.to_vec()),
+        ],
+    ));
 
     for (statement, table) in [
         (INSERT_ENTRY, MzStandardAssetTable::Entry),
@@ -540,6 +642,23 @@ fn map_persist_error<C, S>(
     }
 }
 
+fn map_query_error<C, S>(
+    database_path: PathBuf,
+    error: QueryExistingDatabaseError<S>,
+) -> MzExtractionAssetStoreError<C, S> {
+    match error {
+        QueryExistingDatabaseError::NotFound => {
+            MzExtractionAssetStoreError::DatabaseNotFound { database_path }
+        }
+        QueryExistingDatabaseError::QueryFailed(source) => {
+            MzExtractionAssetStoreError::ReadCurrentState {
+                database_path,
+                source,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -549,6 +668,8 @@ mod tests {
     use crate::att_mz::extract::document::StandardDataFile;
     use crate::att_mz::extract::model::{ExtractedTextField, MzLocation, MzLocationStep, MzSource};
     use crate::att_mz::text::TextGroupKind;
+    use rusqlite::types::Value as RusqliteValue;
+    use rusqlite::{Connection, params_from_iter};
 
     use super::*;
 
@@ -586,6 +707,8 @@ mod tests {
     struct RecordingSqlite {
         calls: Arc<Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>>,
         response: Arc<Mutex<Option<SqliteResponse>>>,
+        query_calls: Arc<AtomicUsize>,
+        current_snapshot: Arc<Mutex<Vec<SqliteRow>>>,
     }
 
     impl SqliteTransactionExecutor for RecordingSqlite {
@@ -613,6 +736,27 @@ mod tests {
                     Err(ExecuteTransactionError::OutcomeUnknown(FakeError("commit")))
                 }
             }
+        }
+    }
+
+    impl SqliteQueryExecutor for RecordingSqlite {
+        type Error = FakeError;
+
+        async fn query_existing_database(
+            &self,
+            path: PathBuf,
+            query: SqliteQuery,
+        ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>> {
+            assert_eq!(path, PathBuf::from("C:/projects/demo/project.db"));
+            assert_eq!(query.statement(), READ_OWNER_SNAPSHOT);
+            assert_eq!(query.parameters().len(), 6);
+            assert!(query.parameters().windows(2).all(|pair| pair[0] == pair[1]));
+            self.query_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .current_snapshot
+                .lock()
+                .expect("当前快照锁不应中毒")
+                .clone())
         }
     }
 
@@ -759,7 +903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn domain_tables_keep_original_and_translation_together_and_inherit_by_leaf() {
+    async fn store_uses_init_schema_and_inherits_translation_state_by_exact_leaf_semantics() {
         let harness = Harness::new(None);
 
         harness
@@ -770,64 +914,331 @@ mod tests {
 
         let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
         let steps = calls[0].1.steps();
-        let table_definitions = steps
-            .iter()
-            .filter_map(|step| match step {
-                SqliteTransactionStep::Execute(command)
-                    if command
-                        .statement()
-                        .starts_with("CREATE TABLE IF NOT EXISTS") =>
-                {
-                    Some(command.statement())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(table_definitions.len(), 6);
-        let domain_tables = table_definitions
-            .iter()
-            .copied()
-            .filter(|statement| !statement.contains("translation_terminology_dependency"))
-            .collect::<Vec<_>>();
-        assert_eq!(domain_tables.len(), 5);
-        assert!(domain_tables.iter().all(|statement| {
-            statement.contains("original_text")
-                && statement.contains("translation")
-                && !statement.contains(" status")
-        }));
-        assert!(table_definitions.iter().any(|statement| {
-            statement.contains("translation_terminology_dependency")
-                && statement.contains("PRIMARY KEY (asset_table, exact_location, term)")
-        }));
         assert!(steps.iter().any(|step| {
             matches!(
                 step,
                 SqliteTransactionStep::Execute(command)
                     if command.statement() == INHERIT_TRANSLATIONS
+                        && command.statement().contains("translation_state")
+                        && command.statement().contains("previous.target_table")
                         && command.statement().contains("previous.exact_location")
+                        && command.statement().contains("previous.field_name")
                         && command.statement().contains("previous.original_text")
+                        && command.statement().contains("previous.unit_type IS")
             )
         }));
         assert!(steps.iter().any(|step| {
             matches!(
                 step,
                 SqliteTransactionStep::Execute(command)
-                    if command.statement() == MIGRATE_INHERITED_TERMINOLOGY_DEPENDENCIES
-                        && command.statement().contains("SET asset_table")
-                        && command.statement().contains("staged.translation IS NOT NULL")
+                    if command.statement() == UPSERT_OWNER_STATE
+                        && command.parameters()[0] == text("builtin")
+                        && matches!(&command.parameters()[1], SqliteValue::Blob(bytes) if bytes.len() == 32)
             )
         }));
-        assert!(steps.iter().any(|step| {
-            matches!(
-                step,
-                SqliteTransactionStep::Execute(command)
-                    if command.statement() == DELETE_INVALIDATED_TERMINOLOGY_DEPENDENCIES
-                        && command.parameters() == [text("builtin")]
-                        && command.statement().contains("staged.original_text = previous.original_text")
-                        && command.statement().contains("staged.translation IS NOT NULL")
+        assert!(
+            !INHERIT_TRANSLATIONS.contains("group_location"),
+            "group 变化不得扩大逐叶译文失效范围"
+        );
+        assert!(FIND_OWNER_CONFLICT.contains("standard_asset_owner_state"));
+        assert!(
+            FIND_OWNER_CONFLICT.contains(
+                "metadata.source_snapshot_fingerprint = state.source_snapshot_fingerprint"
             )
-        }));
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_owner_snapshot_returns_unchanged_without_a_write_transaction() {
+        let harness = Harness::new(None);
+        let project = project();
+        let mut parameters = encode_batch(all_kind_groups(), MzStandardAssetOwner::Builtin)
+            .expect("测试快照位置应该可编码");
+        sort_parameter_sets(&mut parameters);
+        *harness.current_snapshot.lock().expect("当前快照锁不应中毒") = desired_snapshot_rows(
+            project.source_snapshot_fingerprint().as_bytes(),
+            &parameters,
+        );
+
+        let outcome = harness
+            .service(3, 2)
+            .replace_builtin(&project, BuiltinSnapshot::new(all_kind_groups()).unwrap())
+            .await
+            .expect("完全相同的 owner 快照应该正常收敛");
+
+        assert_eq!(outcome, SnapshotReplacementOutcome::Unchanged);
+        assert_eq!(harness.sqlite_query_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            harness
+                .sqlite_calls
+                .lock()
+                .expect("SQLite 调用锁不应中毒")
+                .is_empty(),
+            "Unchanged 不得删除重插或更新 owner state"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_empty_rules_snapshot_and_deactivated_rules_are_distinct_states() {
+        let harness = Harness::new(None);
+        let project = project();
+
+        let activated = harness
+            .service(1, 1)
+            .replace_rules(&project, RulesSnapshot::empty())
+            .await
+            .expect("非空定义生成的空快照应可激活 Rules owner");
+        assert_eq!(activated, SnapshotReplacementOutcome::Changed);
+        {
+            let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].1.steps().iter().any(|step| {
+                matches!(
+                    step,
+                    SqliteTransactionStep::Execute(command)
+                        if command.statement() == UPSERT_OWNER_STATE
+                            && command.parameters()[0] == text("rules")
+                )
+            }));
+        }
+
+        harness
+            .sqlite_calls
+            .lock()
+            .expect("SQLite 调用锁不应中毒")
+            .clear();
+        *harness.current_snapshot.lock().expect("当前快照锁不应中毒") =
+            desired_snapshot_rows(project.source_snapshot_fingerprint().as_bytes(), &[]);
+        let unchanged = harness
+            .service(1, 1)
+            .replace_rules(&project, RulesSnapshot::empty())
+            .await
+            .expect("active 空快照重复提交应可收敛");
+        assert_eq!(unchanged, SnapshotReplacementOutcome::Unchanged);
+        assert!(
+            harness
+                .sqlite_calls
+                .lock()
+                .expect("SQLite 调用锁不应中毒")
+                .is_empty()
+        );
+
+        let deactivated = harness
+            .service(1, 1)
+            .deactivate_rules(&project)
+            .await
+            .expect("停用 active 空快照应该删除 owner state");
+        assert_eq!(deactivated, SnapshotReplacementOutcome::Changed);
+        {
+            let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].1.steps().len(), 1);
+            let SqliteTransactionStep::Execute(command) = &calls[0].1.steps()[0] else {
+                panic!("停用 Rules 应该只删除 owner state")
+            };
+            assert_eq!(command.statement(), DEACTIVATE_OWNER);
+            assert_eq!(command.parameters(), &[text("rules")]);
+        }
+        harness
+            .sqlite_calls
+            .lock()
+            .expect("SQLite 调用锁不应中毒")
+            .clear();
+        harness
+            .current_snapshot
+            .lock()
+            .expect("当前快照锁不应中毒")
+            .clear();
+        let already_inactive = harness
+            .service(1, 1)
+            .deactivate_rules(&project)
+            .await
+            .expect("已停用 Rules 重复收敛应成功");
+        assert_eq!(already_inactive, SnapshotReplacementOutcome::Unchanged);
+        assert!(
+            harness
+                .sqlite_calls
+                .lock()
+                .expect("SQLite 调用锁不应中毒")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_store_uses_lua_owner_for_active_empty_and_deactivation() {
+        let harness = Harness::new(None);
+        let project = project();
+
+        let activated = harness
+            .service(1, 1)
+            .replace_lua(&project, LuaSnapshot::empty())
+            .await
+            .expect("replace_standard({}) 应建立 active Lua owner");
+        assert_eq!(activated, SnapshotReplacementOutcome::Changed);
+        {
+            let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
+            assert!(calls[0].1.steps().iter().any(|step| {
+                matches!(
+                    step,
+                    SqliteTransactionStep::Execute(command)
+                        if command.statement() == UPSERT_OWNER_STATE
+                            && command.parameters()[0] == text("lua")
+                )
+            }));
+        }
+
+        harness
+            .sqlite_calls
+            .lock()
+            .expect("SQLite 调用锁不应中毒")
+            .clear();
+        *harness.current_snapshot.lock().expect("当前快照锁不应中毒") =
+            desired_snapshot_rows(project.source_snapshot_fingerprint().as_bytes(), &[]);
+        let deactivated = harness
+            .service(1, 1)
+            .deactivate_lua(&project)
+            .await
+            .expect("clear_standard 应停用 Lua owner");
+        assert_eq!(deactivated, SnapshotReplacementOutcome::Changed);
+        let calls = harness.sqlite_calls.lock().expect("SQLite 调用锁不应中毒");
+        let SqliteTransactionStep::Execute(command) = &calls[0].1.steps()[0] else {
+            panic!("停用 Lua owner 应只删除 owner state")
+        };
+        assert_eq!(command.statement(), DEACTIVATE_OWNER);
+        assert_eq!(command.parameters(), &[text("lua")]);
+    }
+
+    #[test]
+    fn real_sqlite_plan_inherits_only_exact_leaf_semantics_and_ignores_stale_owner_conflicts() {
+        let mut connection = Connection::open_in_memory().expect("应该可打开内存 SQLite");
+        create_current_asset_schema(&connection);
+        let current_fingerprint = vec![0xa5; 32];
+        let stale_fingerprint = vec![0xb4; 32];
+        connection
+            .execute("INSERT INTO metadata VALUES (?1)", [&current_fingerprint])
+            .expect("应该可写入项目来源指纹");
+        connection
+            .execute(
+                "INSERT INTO standard_asset_owner_state VALUES ('builtin', ?1)",
+                [&current_fingerprint],
+            )
+            .expect("应该可建立 Builtin owner state");
+
+        let mut desired = encode_batch(
+            vec![single_entry_group("name", "宝剑")],
+            MzStandardAssetOwner::Builtin,
+        )
+        .expect("测试叶子应该可编码")
+        .remove(0);
+        let exact_location = sqlite_text(&desired[1]).to_owned();
+        connection
+            .execute(
+                "INSERT INTO entry (owner, exact_location, group_location, field_name, original_text, translation, translation_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "builtin",
+                    exact_location,
+                    "old group",
+                    "name",
+                    "宝剑",
+                    "Sword",
+                    vec![0x11_u8; 32],
+                ],
+            )
+            .expect("应该可写入已翻译叶子");
+
+        desired[3] = text("new group");
+        execute_test_plan(
+            &mut connection,
+            build_transaction_plan(
+                MzStandardAssetOwner::Builtin,
+                &[0xa5; 32],
+                vec![desired.clone()],
+            ),
+        )
+        .expect("group 变化不应阻止快照替换");
+        let inherited = connection
+            .query_row(
+                "SELECT group_location, translation, translation_state FROM entry WHERE owner = 'builtin' AND exact_location = ?1",
+                [&exact_location],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .expect("替换后叶子应该存在");
+        assert_eq!(inherited.0, "new group");
+        assert_eq!(inherited.1.as_deref(), Some("Sword"));
+        assert_eq!(inherited.2, Some(vec![0x11; 32]));
+
+        connection
+            .execute(
+                "INSERT INTO standard_asset_owner_state VALUES ('rules', ?1)",
+                [&stale_fingerprint],
+            )
+            .expect("应该可建立过期 Rules owner state");
+        connection
+            .execute(
+                "INSERT INTO entry (owner, exact_location, group_location, field_name, original_text) VALUES ('rules', ?1, 'rules group', 'name', '宝剑')",
+                [&exact_location],
+            )
+            .expect("过期 owner 应可暂时保留重叠叶子");
+        execute_test_plan(
+            &mut connection,
+            build_transaction_plan(
+                MzStandardAssetOwner::Builtin,
+                &[0xa5; 32],
+                vec![desired.clone()],
+            ),
+        )
+        .expect("过期 owner 不得阻止当前 owner 刷新");
+
+        connection
+            .execute(
+                "UPDATE standard_asset_owner_state SET source_snapshot_fingerprint = ?1 WHERE owner = 'rules'",
+                [&current_fingerprint],
+            )
+            .expect("应该可把 Rules owner 标记为新鲜");
+        assert!(
+            execute_test_plan(
+                &mut connection,
+                build_transaction_plan(
+                    MzStandardAssetOwner::Builtin,
+                    &[0xa5; 32],
+                    vec![desired.clone()],
+                ),
+            )
+            .is_err(),
+            "新鲜其他 owner 的精确地址冲突必须回滚整个替换"
+        );
+
+        desired[4] = text("renamed");
+        connection
+            .execute(
+                "DELETE FROM standard_asset_owner_state WHERE owner = 'rules'",
+                [],
+            )
+            .expect("应该可停用 Rules owner");
+        execute_test_plan(
+            &mut connection,
+            build_transaction_plan(MzStandardAssetOwner::Builtin, &[0xa5; 32], vec![desired]),
+        )
+        .expect("字段身份变化后应可提交新叶子");
+        let invalidated = connection
+            .query_row(
+                "SELECT translation, translation_state FROM entry WHERE owner = 'builtin' AND exact_location = ?1",
+                [&exact_location],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .expect("字段身份变化后叶子应该存在");
+        assert_eq!(invalidated, (None, None));
     }
 
     #[tokio::test]
@@ -1013,6 +1424,144 @@ mod tests {
         .expect("字段应该合法")
     }
 
+    fn single_entry_group(field_name: &str, original_text: &str) -> ExtractedTextGroup {
+        let source = MzSource::data(StandardDataFile::Items);
+        ExtractedTextGroup::new(
+            TextGroupKind::DatabaseEntry,
+            MzLocation::value(source.clone(), vec![MzLocationStep::index(1)]),
+            vec![field(source, 1, field_name, original_text)],
+        )
+        .expect("单叶子测试组应该合法")
+    }
+
+    fn create_current_asset_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE metadata (
+                    source_snapshot_fingerprint BLOB NOT NULL
+                );
+                CREATE TABLE standard_asset_owner_state (
+                    owner TEXT PRIMARY KEY,
+                    source_snapshot_fingerprint BLOB NOT NULL
+                );
+                CREATE TABLE entry (
+                    owner TEXT NOT NULL,
+                    exact_location TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    original_text TEXT NOT NULL,
+                    translation TEXT,
+                    translation_state BLOB,
+                    PRIMARY KEY (owner, exact_location),
+                    FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
+                );
+                CREATE TABLE system_text (
+                    owner TEXT NOT NULL,
+                    exact_location TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    original_text TEXT NOT NULL,
+                    translation TEXT,
+                    translation_state BLOB,
+                    PRIMARY KEY (owner, exact_location),
+                    FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
+                );
+                CREATE TABLE map_text (
+                    owner TEXT NOT NULL,
+                    exact_location TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    original_text TEXT NOT NULL,
+                    translation TEXT,
+                    translation_state BLOB,
+                    PRIMARY KEY (owner, exact_location),
+                    FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
+                );
+                CREATE TABLE text_body (
+                    owner TEXT NOT NULL,
+                    exact_location TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    unit_type TEXT NOT NULL,
+                    original_text TEXT NOT NULL,
+                    translation TEXT,
+                    translation_state BLOB,
+                    PRIMARY KEY (owner, exact_location),
+                    FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
+                );
+                CREATE TABLE plugin_param (
+                    owner TEXT NOT NULL,
+                    exact_location TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    original_text TEXT NOT NULL,
+                    translation TEXT,
+                    translation_state BLOB,
+                    PRIMARY KEY (owner, exact_location),
+                    FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
+                );
+                "#,
+            )
+            .expect("应该可建立当前标准资产测试 schema");
+    }
+
+    fn execute_test_plan(
+        connection: &mut Connection,
+        plan: SqliteTransactionPlan,
+    ) -> Result<(), String> {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        for step in plan.steps() {
+            match step {
+                SqliteTransactionStep::Execute(command) => {
+                    transaction
+                        .execute(
+                            command.statement(),
+                            params_from_iter(command.parameters().iter().map(to_rusqlite_value)),
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                SqliteTransactionStep::ExecuteMany(batch) => {
+                    let mut statement = transaction
+                        .prepare(batch.statement())
+                        .map_err(|error| error.to_string())?;
+                    for parameters in batch.parameter_sets() {
+                        statement
+                            .execute(params_from_iter(parameters.iter().map(to_rusqlite_value)))
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                SqliteTransactionStep::RequireNoRows { query, .. } => {
+                    let mut statement = transaction
+                        .prepare(query.statement())
+                        .map_err(|error| error.to_string())?;
+                    let mut rows = statement
+                        .query(params_from_iter(
+                            query.parameters().iter().map(to_rusqlite_value),
+                        ))
+                        .map_err(|error| error.to_string())?;
+                    if rows.next().map_err(|error| error.to_string())?.is_some() {
+                        return Err("事务要求查询返回了行".to_owned());
+                    }
+                }
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn to_rusqlite_value(value: &SqliteValue) -> RusqliteValue {
+        match value {
+            SqliteValue::Null => RusqliteValue::Null,
+            SqliteValue::Integer(value) => RusqliteValue::Integer(*value),
+            SqliteValue::Real(value) => RusqliteValue::Real(*value),
+            SqliteValue::Text(value) => RusqliteValue::Text(value.clone()),
+            SqliteValue::Blob(value) => RusqliteValue::Blob(value.clone()),
+        }
+    }
+
     fn project() -> OpenedProject {
         OpenedProject::new(
             "demo".parse::<ProjectName>().expect("项目名应该合法"),
@@ -1028,6 +1577,8 @@ mod tests {
         cpu_calls: Arc<AtomicUsize>,
         max_cpu_active: Arc<AtomicUsize>,
         sqlite_calls: Arc<Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>>,
+        sqlite_query_calls: Arc<AtomicUsize>,
+        current_snapshot: Arc<Mutex<Vec<SqliteRow>>>,
         response: Arc<Mutex<Option<SqliteResponse>>>,
     }
 
@@ -1037,6 +1588,8 @@ mod tests {
                 cpu_calls: Arc::new(AtomicUsize::new(0)),
                 max_cpu_active: Arc::new(AtomicUsize::new(0)),
                 sqlite_calls: Arc::new(Mutex::new(Vec::new())),
+                sqlite_query_calls: Arc::new(AtomicUsize::new(0)),
+                current_snapshot: Arc::new(Mutex::new(Vec::new())),
                 response: Arc::new(Mutex::new(response)),
             }
         }
@@ -1050,6 +1603,8 @@ mod tests {
                 RecordingSqlite {
                     calls: Arc::clone(&self.sqlite_calls),
                     response: Arc::clone(&self.response),
+                    query_calls: Arc::clone(&self.sqlite_query_calls),
+                    current_snapshot: Arc::clone(&self.current_snapshot),
                 },
                 RecordingCpu {
                     calls: Arc::clone(&self.cpu_calls),

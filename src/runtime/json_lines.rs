@@ -40,7 +40,7 @@ use crate::att_mz::translate::standard::{
 };
 use crate::att_mz::write_back::StandardWriteBackSummary;
 use crate::att_mz::write_back::standard::{
-    ManualLayoutDiagnostic, MzWriteBackLayoutRegion, StandardWriteBackRunLog,
+    ManualLayoutDiagnostic, MzWriteBackLayoutRegion, WriteBackRunLog,
 };
 use crate::llm::LlmUsage;
 use crate::observability::{PersistentEventLog, RunId};
@@ -1096,10 +1096,10 @@ impl WriteBackJsonLinesEventLog {
     }
 }
 
-impl PersistentEventLog<StandardWriteBackRunLog> for WriteBackJsonLinesEventLog {
+impl PersistentEventLog<WriteBackRunLog> for WriteBackJsonLinesEventLog {
     type Error = JsonLinesAppendError;
 
-    async fn append(&self, event: StandardWriteBackRunLog) -> Result<(), Self::Error> {
+    async fn append(&self, event: WriteBackRunLog) -> Result<(), Self::Error> {
         self.stream
             .append(WriteBackRecord {
                 context: Arc::clone(&self.context),
@@ -1116,7 +1116,7 @@ struct TranslationRecord {
 
 struct WriteBackRecord {
     context: Arc<WriteBackRunLogContext>,
-    event: StandardWriteBackRunLog,
+    event: WriteBackRunLog,
 }
 
 // DTO 定义位于本文件后半部分；领域类型不直接承担持久化格式。
@@ -1235,6 +1235,7 @@ impl JsonLineRecord for WriteBackRecord {
             layout_profile: LayoutProfileWire::from(self.event.layout_profile()),
             event: WriteBackRunCompletedEvent::RunCompleted,
             output_root,
+            lua_executed: self.event.lua_executed(),
             summary: WriteBackSummaryWire::from(self.event.summary()),
             manual_layout_diagnostics: self
                 .event
@@ -1643,6 +1644,10 @@ struct TranslationSummaryWire {
     unresolved_locations: usize,
     protocol_diagnostics: usize,
     recoverable_request_exhaustions: usize,
+    retained: usize,
+    invalidated: usize,
+    not_applicable: usize,
+    reused: usize,
 }
 
 impl From<&StandardTranslationRunReport> for TranslationSummaryWire {
@@ -1658,6 +1663,10 @@ impl From<&StandardTranslationRunReport> for TranslationSummaryWire {
             unresolved_locations: summary.unresolved_locations(),
             protocol_diagnostics: summary.protocol_diagnostics(),
             recoverable_request_exhaustions: summary.recoverable_request_exhaustions(),
+            retained: summary.retained(),
+            invalidated: summary.invalidated(),
+            not_applicable: summary.not_applicable(),
+            reused: summary.reused(),
         }
     }
 }
@@ -1671,6 +1680,7 @@ struct WriteBackRunCompletedWire {
     layout_profile: LayoutProfileWire,
     event: WriteBackRunCompletedEvent,
     output_root: String,
+    lua_executed: bool,
     summary: WriteBackSummaryWire,
     manual_layout_diagnostics: Vec<ManualLayoutDiagnosticWire>,
 }
@@ -1873,6 +1883,7 @@ mod tests {
 
     use super::*;
     use crate::att_mz::project::MaxFullwidthChars;
+    use crate::att_mz::standard_asset::MzStandardAssetOwner;
     use crate::att_mz::text::{StandardDataFile, TextGroupKind};
     use crate::att_mz::translate::executor::FinalLlmResponseMetadata;
     use crate::att_mz::translate::standard::{
@@ -1925,7 +1936,9 @@ mod tests {
             vec![MzLocationStep::index(1), MzLocationStep::key("description")],
         );
         let identity = TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
+            "description",
             group,
             exact,
             "不得进入日志的原文",
@@ -2090,6 +2103,25 @@ mod tests {
     }
 
     #[test]
+    fn translation_summary_wire_preserves_reconciliation_counts() {
+        let bytes = TranslationRecord {
+            context: Arc::new(context()),
+            event: TranslationLogEvent::RunCompleted(
+                StandardTranslationRunReport::with_reconciliation(3, 5, 7, 11, 13),
+            ),
+        }
+        .serialize("2026-07-17T12:34:56.789Z".to_owned())
+        .expect("包含对账计数的汇总记录应可序列化");
+        TranslationRecord::validate(&bytes).expect("汇总记录应满足当前严格 wire");
+
+        let value: Value = serde_json::from_slice(&bytes).expect("汇总记录应是 JSON");
+        assert_eq!(value["summary"]["retained"], 5);
+        assert_eq!(value["summary"]["invalidated"], 7);
+        assert_eq!(value["summary"]["not_applicable"], 11);
+        assert_eq!(value["summary"]["reused"], 13);
+    }
+
+    #[test]
     fn task_wire_separates_provider_identities_and_final_usage_without_text() {
         let bytes = TranslationRecord {
             context: Arc::new(context()),
@@ -2190,6 +2222,7 @@ mod tests {
             )),
             event: WriteBackRunCompletedEvent::RunCompleted,
             output_root: "C:/ATT/项目/write_back".to_owned(),
+            lua_executed: true,
             summary: WriteBackSummaryWire::from(StandardWriteBackSummary {
                 translated_locations: 2,
                 original_locations: 1,
@@ -2222,6 +2255,7 @@ mod tests {
             18
         );
         assert_eq!(decoded.manual_layout_diagnostics.len(), 1);
+        assert!(decoded.lua_executed);
     }
 
     #[tokio::test]
@@ -2237,11 +2271,12 @@ mod tests {
             "zh-Hans".to_owned(),
             event_profile,
         );
-        let event = StandardWriteBackRunLog::new(
+        let event = WriteBackRunLog::new(
             &project,
             event_profile,
             StandardWriteBackSummary::default(),
             Vec::new(),
+            false,
         );
         let (log, finalizer) = WriteBackJsonLinesEventLog::start(
             directory.path().to_path_buf(),
@@ -2260,6 +2295,7 @@ mod tests {
         let value: Value =
             serde_json::from_slice(&bytes[..bytes.len() - 1]).expect("写回记录应是 JSON");
         assert_eq!(value["project"], "游戏 一");
+        assert_eq!(value["lua_executed"], false);
         assert_eq!(
             value["layout_profile"]["dialogue_body_max_fullwidth_chars"],
             19

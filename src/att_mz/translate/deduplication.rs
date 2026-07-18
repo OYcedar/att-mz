@@ -8,9 +8,11 @@ use std::error::Error;
 use std::fmt;
 
 use super::standard::{
-    AppliedPlaceholder, TerminologyDependency, TranslationInvalidation, TranslationLeafIdentity,
-    TranslationReuse, TranslationReuseSeed, TranslationReuseTarget, TranslationVirtualReason,
+    AppliedPlaceholder, TranslationInvalidation, TranslationLeafIdentity,
+    TranslationPropagationTarget, TranslationReuse, TranslationReuseSeed, TranslationReuseTarget,
+    TranslationStateContext, TranslationVirtualReason,
 };
+use crate::fingerprint::Sha256Fingerprint;
 
 /// 一个已经完成语言判定和占位符保护的可翻译叶子。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,7 +21,8 @@ pub(crate) struct TranslationDeduplicationCandidate {
     protected_text: String,
     applied_placeholders: Vec<AppliedPlaceholder>,
     translation: Option<String>,
-    terminology_dependencies: Vec<TerminologyDependency>,
+    translation_state: Option<Sha256Fingerprint>,
+    state_context: TranslationStateContext,
     invalidated: bool,
 }
 
@@ -29,7 +32,8 @@ impl TranslationDeduplicationCandidate {
         protected_text: impl Into<String>,
         applied_placeholders: Vec<AppliedPlaceholder>,
         translation: Option<String>,
-        terminology_dependencies: Vec<TerminologyDependency>,
+        translation_state: Option<Sha256Fingerprint>,
+        state_context: TranslationStateContext,
         invalidated: bool,
     ) -> Self {
         Self {
@@ -37,7 +41,8 @@ impl TranslationDeduplicationCandidate {
             protected_text: protected_text.into(),
             applied_placeholders,
             translation,
-            terminology_dependencies,
+            translation_state,
+            state_context,
             invalidated,
         }
     }
@@ -47,7 +52,7 @@ impl TranslationDeduplicationCandidate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationDeduplicationOutcome {
     Active {
-        propagation_targets: Vec<TranslationLeafIdentity>,
+        propagation_targets: Vec<TranslationPropagationTarget>,
     },
     Virtual {
         reason: TranslationVirtualReason,
@@ -220,7 +225,8 @@ fn plan_reuse_family(
         targets.push(TranslationReuseTarget::new(
             candidate.identity.clone(),
             candidate.translation.clone(),
-            candidate.terminology_dependencies.clone(),
+            candidate.translation_state,
+            candidate.state_context.finish(seed_translation),
         ));
         outcomes[index] = Some(TranslationDeduplicationOutcome::Virtual {
             reason: TranslationVirtualReason::Reused {
@@ -234,7 +240,8 @@ fn plan_reuse_family(
             TranslationReuseSeed::new(
                 seed.identity.clone(),
                 seed_translation,
-                seed.terminology_dependencies.clone(),
+                seed.translation_state
+                    .expect("当前译文必须同时具有 translation_state"),
             ),
             targets,
         ));
@@ -251,7 +258,12 @@ fn plan_active_family(
     let leader = &candidates[leader_index];
     let propagation_targets = family.member_indices[1..]
         .iter()
-        .map(|&index| candidates[index].identity.clone())
+        .map(|&index| {
+            TranslationPropagationTarget::new(
+                candidates[index].identity.clone(),
+                candidates[index].state_context,
+            )
+        })
         .collect();
     outcomes[leader_index] = Some(TranslationDeduplicationOutcome::Active {
         propagation_targets,
@@ -274,7 +286,9 @@ fn plan_active_family(
                     .translation
                     .as_deref()
                     .expect("只有已有译文的候选项才可能失效"),
-                candidate.terminology_dependencies.clone(),
+                candidate
+                    .translation_state
+                    .expect("已有译文必须同时具有 translation_state"),
             ));
         }
     }
@@ -338,6 +352,7 @@ impl Error for TranslationDeduplicationError {}
 
 #[cfg(test)]
 mod tests {
+    use crate::att_mz::standard_asset::MzStandardAssetOwner;
     use crate::att_mz::text::{
         MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
     };
@@ -345,13 +360,23 @@ mod tests {
     use super::*;
     use crate::att_mz::translate::standard::{PlaceholderRuleOrigin, PlaceholderSegment};
 
+    fn fingerprint(marker: u8) -> Sha256Fingerprint {
+        Sha256Fingerprint::from_bytes([marker; 32])
+    }
+
+    fn state_context(marker: u8) -> TranslationStateContext {
+        TranslationStateContext::new(fingerprint(marker))
+    }
+
     fn identity(index: usize, original: &str) -> TranslationLeafIdentity {
         let group_location = MzLocation::value(
             MzSource::data(StandardDataFile::Items),
             vec![MzLocationStep::index(index)],
         );
         TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
+            "name",
             group_location.clone(),
             MzLocation::value(
                 MzSource::data(StandardDataFile::Items),
@@ -361,28 +386,43 @@ mod tests {
         )
     }
 
+    struct StoredTranslation<'a> {
+        text: &'a str,
+        state: Sha256Fingerprint,
+    }
+
+    impl<'a> StoredTranslation<'a> {
+        const fn new(text: &'a str, state: Sha256Fingerprint) -> Self {
+            Self { text, state }
+        }
+    }
+
     fn candidate(
         index: usize,
         original: &str,
         protected_text: &str,
         placeholders: Vec<AppliedPlaceholder>,
-        translation: Option<&str>,
-        dependencies: Vec<TerminologyDependency>,
+        stored_translation: Option<StoredTranslation<'_>>,
+        state_context: TranslationStateContext,
         invalidated: bool,
     ) -> TranslationDeduplicationCandidate {
+        let (translation, translation_state) = stored_translation
+            .map(|stored| (Some(stored.text.to_owned()), Some(stored.state)))
+            .unwrap_or_default();
         TranslationDeduplicationCandidate::new(
             identity(index, original),
             protected_text,
             placeholders,
-            translation.map(str::to_owned),
-            dependencies,
+            translation,
+            translation_state,
+            state_context,
             invalidated,
         )
     }
 
     fn placeholder(scope: &str) -> AppliedPlaceholder {
         AppliedPlaceholder::new(
-            "<att:actor-name:0>",
+            "⟦ATT_00000000_00000000⟧",
             "\\N[1]",
             PlaceholderRuleOrigin::BuiltIn,
             "ACTOR_NAME",
@@ -392,9 +432,12 @@ mod tests {
     }
 
     #[test]
-    fn first_pending_member_owns_one_output_and_all_later_locations() {
+    fn family_without_current_seed_uses_first_member_and_propagates_in_natural_order() {
         let first = identity(1, "保存しますか？");
         let second = identity(2, "保存しますか？");
+        let third = identity(3, "保存しますか？");
+        let second_context = state_context(2);
+        let third_context = state_context(3);
         let result = deduplicate_translation_candidates(vec![
             candidate(
                 1,
@@ -402,7 +445,7 @@ mod tests {
                 "保存しますか？",
                 Vec::new(),
                 None,
-                Vec::new(),
+                state_context(1),
                 false,
             ),
             candidate(
@@ -411,23 +454,43 @@ mod tests {
                 "保存しますか？",
                 Vec::new(),
                 None,
+                second_context,
+                false,
+            ),
+            candidate(
+                3,
+                "保存しますか？",
+                "保存しますか？",
                 Vec::new(),
+                None,
+                third_context,
                 false,
             ),
         ])
-        .expect("相同原文应建立唯一代表");
+        .expect("没有当前译文时应建立唯一模型责任");
         let (outcomes, invalidations, reuses) = result.into_parts();
 
-        assert_eq!(invalidations, Vec::new());
-        assert_eq!(reuses, Vec::new());
+        assert!(invalidations.is_empty());
+        assert!(reuses.is_empty());
         assert_eq!(
             outcomes[0],
             TranslationDeduplicationOutcome::Active {
-                propagation_targets: vec![second]
+                propagation_targets: vec![
+                    TranslationPropagationTarget::new(second, second_context),
+                    TranslationPropagationTarget::new(third, third_context),
+                ],
             }
         );
         assert_eq!(
             outcomes[1],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::Duplicate {
+                    leader: Box::new(first.clone())
+                }
+            }
+        );
+        assert_eq!(
+            outcomes[2],
             TranslationDeduplicationOutcome::Virtual {
                 reason: TranslationVirtualReason::Duplicate {
                     leader: Box::new(first)
@@ -437,8 +500,10 @@ mod tests {
     }
 
     #[test]
-    fn valid_translation_becomes_a_preparation_reuse_without_llm_owner() {
-        let dependency = TerminologyDependency::new("保存", "Save");
+    fn current_state_translation_becomes_a_reuse_seed() {
+        let seed_context = state_context(1);
+        let target_context = state_context(2);
+        let seed_state = seed_context.finish("Save");
         let seed = identity(1, "保存");
         let target = identity(2, "保存");
         let result = deduplicate_translation_candidates(vec![
@@ -447,25 +512,32 @@ mod tests {
                 "保存",
                 "保存",
                 Vec::new(),
-                Some("Save"),
-                vec![dependency.clone()],
+                Some(StoredTranslation::new("Save", seed_state)),
+                seed_context,
                 false,
             ),
-            candidate(2, "保存", "保存", Vec::new(), None, Vec::new(), false),
+            candidate(2, "保存", "保存", Vec::new(), None, target_context, false),
         ])
-        .expect("唯一有效译文应直接复用");
+        .expect("当前译文应直接复用");
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
         assert_eq!(reuses.len(), 1);
         assert_eq!(reuses[0].seed().identity(), &seed);
         assert_eq!(reuses[0].seed().expected_translation(), "Save");
-        assert_eq!(
-            reuses[0].seed().expected_terminology_dependencies(),
-            &[dependency]
-        );
+        assert_eq!(reuses[0].seed().expected_translation_state(), seed_state);
         assert_eq!(reuses[0].targets()[0].identity(), &target);
         assert_eq!(reuses[0].targets()[0].expected_translation(), None);
+        assert_eq!(
+            reuses[0].targets()[0].replacement_translation_state(),
+            target_context.finish("Save")
+        );
+        assert!(matches!(
+            &outcomes[0],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::ExistingTranslation
+            }
+        ));
         assert!(matches!(
             &outcomes[1],
             TranslationDeduplicationOutcome::Virtual {
@@ -475,9 +547,10 @@ mod tests {
     }
 
     #[test]
-    fn earliest_equal_translation_seed_supplies_the_reused_dependencies() {
-        let earliest_dependency = TerminologyDependency::new("保存", "保存");
-        let later_dependency = TerminologyDependency::new("記録", "保存");
+    fn earliest_equal_current_translation_is_the_deterministic_seed() {
+        let earliest_context = state_context(1);
+        let later_context = state_context(2);
+        let target_context = state_context(3);
         let earliest_seed = identity(1, "保存");
         let result = deduplicate_translation_candidates(vec![
             candidate(
@@ -485,8 +558,11 @@ mod tests {
                 "保存",
                 "保存",
                 Vec::new(),
-                Some("保存"),
-                vec![earliest_dependency.clone()],
+                Some(StoredTranslation::new(
+                    "保存",
+                    earliest_context.finish("保存"),
+                )),
+                earliest_context,
                 false,
             ),
             candidate(
@@ -494,37 +570,39 @@ mod tests {
                 "保存",
                 "保存",
                 Vec::new(),
-                Some("保存"),
-                vec![later_dependency],
+                Some(StoredTranslation::new("保存", later_context.finish("保存"))),
+                later_context,
                 false,
             ),
-            candidate(3, "保存", "保存", Vec::new(), None, Vec::new(), false),
+            candidate(3, "保存", "保存", Vec::new(), None, target_context, false),
         ])
-        .expect("相同有效译文不构成冲突");
+        .expect("相同当前译文不构成冲突");
         let (_, _, reuses) = result.into_parts();
 
         assert_eq!(reuses.len(), 1);
         assert_eq!(reuses[0].seed().identity(), &earliest_seed);
-        assert_eq!(
-            reuses[0].seed().expected_terminology_dependencies(),
-            &[earliest_dependency]
-        );
         assert_eq!(reuses[0].targets().len(), 1);
         assert_eq!(reuses[0].targets()[0].identity(), &identity(3, "保存"));
+        assert_eq!(
+            reuses[0].targets()[0].replacement_translation_state(),
+            target_context.finish("保存")
+        );
     }
 
     #[test]
-    fn stale_translation_is_a_reuse_target_when_another_valid_seed_exists() {
-        let stale_dependency = TerminologyDependency::new("保存", "旧译名");
-        let valid_dependency = TerminologyDependency::new("保存", "保存");
+    fn stale_translation_is_overwritten_when_a_current_seed_exists() {
+        let stale_context = state_context(1);
+        let current_context = state_context(2);
+        let stale_state = fingerprint(91);
+        let current_state = current_context.finish("保存");
         let result = deduplicate_translation_candidates(vec![
             candidate(
                 1,
                 "保存",
                 "保存",
                 Vec::new(),
-                Some("旧译文"),
-                vec![stale_dependency.clone()],
+                Some(StoredTranslation::new("旧译文", stale_state)),
+                stale_context,
                 true,
             ),
             candidate(
@@ -532,28 +610,29 @@ mod tests {
                 "保存",
                 "保存",
                 Vec::new(),
-                Some("保存"),
-                vec![valid_dependency.clone()],
+                Some(StoredTranslation::new("保存", current_state)),
+                current_context,
                 false,
             ),
         ])
-        .expect("失效译文不能成为种子，但可以由其他有效种子覆盖");
+        .expect("失效译文不能成为种子，但可以由当前种子覆盖");
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
         assert_eq!(reuses.len(), 1);
         assert_eq!(reuses[0].seed().identity(), &identity(2, "保存"));
-        assert_eq!(
-            reuses[0].seed().expected_terminology_dependencies(),
-            &[valid_dependency]
-        );
+        assert_eq!(reuses[0].seed().expected_translation_state(), current_state);
         assert_eq!(
             reuses[0].targets()[0].expected_translation(),
             Some("旧译文")
         );
         assert_eq!(
-            reuses[0].targets()[0].expected_terminology_dependencies(),
-            &[stale_dependency]
+            reuses[0].targets()[0].expected_translation_state(),
+            Some(stale_state)
+        );
+        assert_eq!(
+            reuses[0].targets()[0].replacement_translation_state(),
+            stale_context.finish("保存")
         );
         assert!(matches!(
             &outcomes[0],
@@ -564,15 +643,17 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_valid_translations_fail_before_a_plan_exists() {
+    fn conflicting_current_translations_fail_before_a_plan_exists() {
+        let first_context = state_context(1);
+        let second_context = state_context(2);
         let error = deduplicate_translation_candidates(vec![
             candidate(
                 1,
                 "保存",
                 "保存",
                 Vec::new(),
-                Some("Save"),
-                Vec::new(),
+                Some(StoredTranslation::new("Save", first_context.finish("Save"))),
+                first_context,
                 false,
             ),
             candidate(
@@ -580,12 +661,15 @@ mod tests {
                 "保存",
                 "保存",
                 Vec::new(),
-                Some("Store"),
-                Vec::new(),
+                Some(StoredTranslation::new(
+                    "Store",
+                    second_context.finish("Store"),
+                )),
+                second_context,
                 false,
             ),
         ])
-        .expect_err("同族有效译文冲突必须显式失败");
+        .expect_err("同族当前译文冲突必须显式失败");
 
         assert!(matches!(
             error,
@@ -597,30 +681,32 @@ mod tests {
     }
 
     #[test]
-    fn different_placeholder_contracts_form_independent_families() {
+    fn placeholder_contracts_are_part_of_the_exact_family_identity() {
         let result = deduplicate_translation_candidates(vec![
             candidate(
                 1,
                 "\\N[1]",
-                "<att:actor-name:0>",
+                "⟦ATT_00000000_00000000⟧",
                 vec![placeholder("database_entry")],
                 None,
-                Vec::new(),
+                state_context(1),
                 false,
             ),
             candidate(
                 2,
                 "\\N[1]",
-                "<att:actor-name:0>",
+                "⟦ATT_00000000_00000000⟧",
                 vec![placeholder("event_dialogue")],
                 None,
-                Vec::new(),
+                state_context(2),
                 false,
             ),
         ])
-        .expect("不同保护契约不应互相冲突");
-        let (outcomes, _, _) = result.into_parts();
+        .expect("不同精确占位符契约必须形成独立去重族");
+        let (outcomes, invalidations, reuses) = result.into_parts();
 
+        assert!(invalidations.is_empty());
+        assert!(reuses.is_empty());
         assert!(outcomes.iter().all(|outcome| matches!(
             outcome,
             TranslationDeduplicationOutcome::Active {
@@ -632,17 +718,25 @@ mod tests {
     #[test]
     fn textual_near_matches_are_not_deduplicated() {
         let result = deduplicate_translation_candidates(vec![
-            candidate(1, "Save", "Save", Vec::new(), None, Vec::new(), false),
-            candidate(2, "save", "save", Vec::new(), None, Vec::new(), false),
-            candidate(3, "Save ", "Save ", Vec::new(), None, Vec::new(), false),
-            candidate(4, "é", "é", Vec::new(), None, Vec::new(), false),
+            candidate(1, "Save", "Save", Vec::new(), None, state_context(1), false),
+            candidate(2, "save", "save", Vec::new(), None, state_context(2), false),
+            candidate(
+                3,
+                "Save ",
+                "Save ",
+                Vec::new(),
+                None,
+                state_context(3),
+                false,
+            ),
+            candidate(4, "é", "é", Vec::new(), None, state_context(4), false),
             candidate(
                 5,
                 "e\u{301}",
                 "e\u{301}",
                 Vec::new(),
                 None,
-                Vec::new(),
+                state_context(5),
                 false,
             ),
         ])
@@ -658,19 +752,21 @@ mod tests {
     }
 
     #[test]
-    fn stale_translations_cannot_seed_reuse_and_are_invalidated() {
-        let old_dependency = TerminologyDependency::new("保存", "旧译名");
+    fn stale_translation_without_current_seed_is_invalidated() {
+        let stale_context = state_context(1);
+        let pending_context = state_context(2);
+        let stale_state = fingerprint(81);
         let result = deduplicate_translation_candidates(vec![
             candidate(
                 1,
                 "保存",
                 "保存",
                 Vec::new(),
-                Some("旧译文"),
-                vec![old_dependency.clone()],
+                Some(StoredTranslation::new("旧译文", stale_state)),
+                stale_context,
                 true,
             ),
-            candidate(2, "保存", "保存", Vec::new(), None, Vec::new(), false),
+            candidate(2, "保存", "保存", Vec::new(), None, pending_context, false),
         ])
         .expect("失效译文应按待翻译原文处理");
         let (outcomes, invalidations, reuses) = result.into_parts();
@@ -678,14 +774,52 @@ mod tests {
         assert!(matches!(
             &outcomes[0],
             TranslationDeduplicationOutcome::Active { propagation_targets }
-                if propagation_targets == &[identity(2, "保存")]
+                if propagation_targets == &[TranslationPropagationTarget::new(
+                    identity(2, "保存"),
+                    pending_context,
+                )]
         ));
         assert_eq!(invalidations.len(), 1);
+        assert_eq!(invalidations[0].identity(), &identity(1, "保存"));
         assert_eq!(invalidations[0].expected_translation(), "旧译文");
-        assert_eq!(
-            invalidations[0].expected_terminology_dependencies(),
-            &[old_dependency]
-        );
+        assert_eq!(invalidations[0].expected_translation_state(), stale_state);
         assert!(reuses.is_empty());
+    }
+
+    #[test]
+    fn repeated_planning_preserves_interleaved_family_order() {
+        let candidates = vec![
+            candidate(1, "保存", "保存", Vec::new(), None, state_context(1), false),
+            candidate(2, "終了", "終了", Vec::new(), None, state_context(2), false),
+            candidate(3, "保存", "保存", Vec::new(), None, state_context(3), false),
+            candidate(4, "終了", "終了", Vec::new(), None, state_context(4), false),
+        ];
+
+        let first =
+            deduplicate_translation_candidates(candidates.clone()).expect("稳定输入应能完成去重");
+        let second = deduplicate_translation_candidates(candidates).expect("重复规划应能完成去重");
+
+        assert_eq!(first, second);
+        let (outcomes, invalidations, reuses) = first.into_parts();
+        assert!(invalidations.is_empty());
+        assert!(reuses.is_empty());
+        assert_eq!(
+            outcomes[0],
+            TranslationDeduplicationOutcome::Active {
+                propagation_targets: vec![TranslationPropagationTarget::new(
+                    identity(3, "保存"),
+                    state_context(3),
+                )],
+            }
+        );
+        assert_eq!(
+            outcomes[1],
+            TranslationDeduplicationOutcome::Active {
+                propagation_targets: vec![TranslationPropagationTarget::new(
+                    identity(4, "終了"),
+                    state_context(4),
+                )],
+            }
+        );
     }
 }

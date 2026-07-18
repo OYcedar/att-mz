@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use serde::Deserialize;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde_json::Value;
 
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
@@ -18,34 +20,46 @@ use super::standard::TerminologyDependency;
 
 /// Planner 一次运行实际读取到的全部外部资料。
 pub(crate) struct TranslationPlanningResources {
-    terminology: Option<Arc<CompiledTerminology>>,
+    terminology: Arc<CompiledTerminology>,
     placeholder_rules: Vec<PlaceholderRuleDefinition>,
+    terminology_json: String,
+    placeholder_rules_json: String,
 }
 
 impl TranslationPlanningResources {
     pub(crate) fn new(
-        terminology: Option<CompiledTerminology>,
+        terminology: CompiledTerminology,
         placeholder_rules: Vec<PlaceholderRuleDefinition>,
+        terminology_json: String,
+        placeholder_rules_json: String,
     ) -> Self {
         Self {
-            terminology: terminology.map(Arc::new),
+            terminology: Arc::new(terminology),
             placeholder_rules,
+            terminology_json,
+            placeholder_rules_json,
         }
     }
 
-    /// `None` 表示本次没有提供权威术语表；`Some(empty)` 表示权威空集合。
     #[cfg(test)]
-    pub(crate) fn terminology(&self) -> Option<&Arc<CompiledTerminology>> {
-        self.terminology.as_ref()
+    pub(crate) fn terminology(&self) -> &Arc<CompiledTerminology> {
+        &self.terminology
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
-        Option<Arc<CompiledTerminology>>,
+        Arc<CompiledTerminology>,
         Vec<PlaceholderRuleDefinition>,
+        String,
+        String,
     ) {
-        (self.terminology, self.placeholder_rules)
+        (
+            self.terminology,
+            self.placeholder_rules,
+            self.terminology_json,
+            self.placeholder_rules_json,
+        )
     }
 }
 
@@ -74,20 +88,22 @@ impl TerminologyEntry {
 /// 以 Aho-Corasick 一次扫描全部 trigger 的权威术语集合。
 pub(crate) struct CompiledTerminology {
     entries: Vec<TerminologyEntry>,
-    entry_by_term: BTreeMap<String, usize>,
     matcher: Option<AhoCorasick>,
     pattern_to_entry: Vec<usize>,
 }
 
 impl CompiledTerminology {
-    pub(crate) fn entries(&self) -> &[TerminologyEntry] {
-        &self.entries
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            matcher: None,
+            pattern_to_entry: Vec::new(),
+        }
     }
 
-    pub(crate) fn entry(&self, term: &str) -> Option<&TerminologyEntry> {
-        self.entry_by_term
-            .get(term)
-            .map(|index| &self.entries[*index])
+    pub(crate) fn entries(&self) -> &[TerminologyEntry] {
+        &self.entries
     }
 
     /// 返回由任意给定原文触发的术语，顺序稳定为术语文件顺序。
@@ -150,6 +166,8 @@ pub(crate) trait TranslationPlanningResourceReader: Send + Sync {
         &self,
         terminology_path: Option<PathBuf>,
         placeholder_rules_path: Option<PathBuf>,
+        current_terminology_json: String,
+        current_placeholder_rules_json: String,
     ) -> impl Future<Output = Result<TranslationPlanningResources, Self::Error>> + Send;
 }
 
@@ -176,6 +194,8 @@ where
         &self,
         terminology_path: Option<PathBuf>,
         placeholder_rules_path: Option<PathBuf>,
+        current_terminology_json: String,
+        current_placeholder_rules_json: String,
     ) -> Result<TranslationPlanningResources, Self::Error> {
         let terminology_request_path = terminology_path.clone();
         let placeholder_request_path = placeholder_rules_path.clone();
@@ -196,16 +216,26 @@ where
             }
         })?;
 
-        let terminology_parse =
-            parse_terminology_optional::<F::Error, C>(&self.cpu, terminology_file);
-        let placeholder_parse =
-            parse_placeholder_optional::<F::Error, C>(&self.cpu, placeholder_file);
+        let terminology_parse = parse_terminology_resource::<F::Error, C>(
+            &self.cpu,
+            terminology_file,
+            current_terminology_json,
+        );
+        let placeholder_parse = parse_placeholder_resource::<F::Error, C>(
+            &self.cpu,
+            placeholder_file,
+            current_placeholder_rules_json,
+        );
         let (terminology, placeholder_rules) =
             futures_util::join!(terminology_parse, placeholder_parse);
+        let (terminology, terminology_json) = terminology?;
+        let (placeholder_rules, placeholder_rules_json) = placeholder_rules?;
 
         Ok(TranslationPlanningResources::new(
-            terminology?,
-            placeholder_rules?,
+            terminology,
+            placeholder_rules,
+            terminology_json,
+            placeholder_rules_json,
         ))
     }
 }
@@ -220,50 +250,179 @@ async fn read_optional<F: FileReader>(
     }
 }
 
-async fn parse_terminology_optional<F, C: CpuTaskExecutor>(
+async fn parse_terminology_resource<F, C: CpuTaskExecutor>(
     cpu: &C,
     file: Option<ReadFile>,
-) -> Result<Option<CompiledTerminology>, TranslationPlanningResourceReadingError<F, C::Error>> {
-    let Some(file) = file else {
-        return Ok(None);
-    };
-    let path = file.resolved_path().to_owned();
-    let bytes = file.into_bytes();
+    current_json: String,
+) -> Result<(CompiledTerminology, String), TranslationPlanningResourceReadingError<F, C::Error>> {
+    let (path, bytes) = file.map_or_else(
+        || (None, current_json.into_bytes()),
+        |file| (Some(file.resolved_path().to_owned()), file.into_bytes()),
+    );
+    let error_path = path.clone();
     let parsed = cpu
-        .execute(move || parse_terminology(&bytes))
+        .execute(move || {
+            let canonical =
+                canonicalize_json(&bytes).map_err(TerminologyDefinitionError::InvalidJson)?;
+            let terminology = parse_terminology(canonical.as_bytes())?;
+            Ok::<_, TerminologyDefinitionError>((terminology, canonical))
+        })
         .await
         .map_err(
             |source| TranslationPlanningResourceReadingError::ParseTerminologyCompute {
-                path: path.clone(),
+                path: error_path.clone(),
                 source,
             },
         )?;
-    parsed.map(Some).map_err(
+    parsed.map_err(
         |source| TranslationPlanningResourceReadingError::InvalidTerminology { path, source },
     )
 }
 
-async fn parse_placeholder_optional<F, C: CpuTaskExecutor>(
+async fn parse_placeholder_resource<F, C: CpuTaskExecutor>(
     cpu: &C,
     file: Option<ReadFile>,
-) -> Result<Vec<PlaceholderRuleDefinition>, TranslationPlanningResourceReadingError<F, C::Error>> {
-    let Some(file) = file else {
-        return Ok(Vec::new());
-    };
-    let path = file.resolved_path().to_owned();
-    let bytes = file.into_bytes();
+    current_json: String,
+) -> Result<
+    (Vec<PlaceholderRuleDefinition>, String),
+    TranslationPlanningResourceReadingError<F, C::Error>,
+> {
+    let (path, bytes) = file.map_or_else(
+        || (None, current_json.into_bytes()),
+        |file| (Some(file.resolved_path().to_owned()), file.into_bytes()),
+    );
+    let error_path = path.clone();
     let parsed = cpu
-        .execute(move || serde_json::from_slice::<Vec<PlaceholderRuleDefinition>>(&bytes))
+        .execute(move || {
+            let canonical = canonicalize_json(&bytes)?;
+            let definitions = serde_json::from_str::<Vec<PlaceholderRuleDefinition>>(&canonical)?;
+            Ok::<_, serde_json::Error>((definitions, canonical))
+        })
         .await
         .map_err(|source| {
             TranslationPlanningResourceReadingError::ParsePlaceholderRulesCompute {
-                path: path.clone(),
+                path: error_path.clone(),
                 source,
             }
         })?;
     parsed.map_err(
         |source| TranslationPlanningResourceReadingError::InvalidPlaceholderRules { path, source },
     )
+}
+
+fn canonicalize_json(bytes: &[u8]) -> Result<String, serde_json::Error> {
+    fn sort(value: Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.into_iter().map(sort).collect()),
+            Value::Object(values) => {
+                let mut sorted = values.into_iter().collect::<Vec<_>>();
+                sorted.sort_by(|left, right| left.0.cmp(&right.0));
+                Value::Object(
+                    sorted
+                        .into_iter()
+                        .map(|(key, value)| (key, sort(value)))
+                        .collect(),
+                )
+            }
+            value => value,
+        }
+    }
+
+    let mut duplicate_check = serde_json::Deserializer::from_slice(bytes);
+    DuplicateKeyCheckedValue::deserialize(&mut duplicate_check)?;
+    duplicate_check.end()?;
+
+    let value = serde_json::from_slice::<Value>(bytes)?;
+    serde_json::to_string(&sort(value))
+}
+
+struct DuplicateKeyCheckedValue;
+
+impl<'de> Deserialize<'de> for DuplicateKeyCheckedValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateKeyCheckedVisitor)
+    }
+}
+
+struct DuplicateKeyCheckedVisitor;
+
+impl<'de> Visitor<'de> for DuplicateKeyCheckedVisitor {
+    type Value = DuplicateKeyCheckedValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("完整且对象键唯一的 JSON 值")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        DuplicateKeyCheckedValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence
+            .next_element::<DuplicateKeyCheckedValue>()?
+            .is_some()
+        {}
+        Ok(DuplicateKeyCheckedValue)
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !keys.insert(key.clone()) {
+                return Err(de::Error::custom(format!("JSON 对象键重复：{key:?}")));
+            }
+            object.next_value::<DuplicateKeyCheckedValue>()?;
+        }
+        Ok(DuplicateKeyCheckedValue)
+    }
 }
 
 #[derive(Deserialize)]
@@ -329,7 +488,6 @@ fn parse_terminology(bytes: &[u8]) -> Result<CompiledTerminology, TerminologyDef
 
     Ok(CompiledTerminology {
         entries,
-        entry_by_term,
         matcher,
         pattern_to_entry,
     })
@@ -367,19 +525,19 @@ pub(crate) enum TranslationPlanningResourceReadingError<F, C> {
         source: ReadFileError<F>,
     },
     ParseTerminologyCompute {
-        path: PathBuf,
+        path: Option<PathBuf>,
         source: CpuTaskExecutionError<C>,
     },
     InvalidTerminology {
-        path: PathBuf,
+        path: Option<PathBuf>,
         source: TerminologyDefinitionError,
     },
     ParsePlaceholderRulesCompute {
-        path: PathBuf,
+        path: Option<PathBuf>,
         source: CpuTaskExecutionError<C>,
     },
     InvalidPlaceholderRules {
-        path: PathBuf,
+        path: Option<PathBuf>,
         source: serde_json::Error,
     },
 }
@@ -400,23 +558,34 @@ where
                 path.display()
             ),
             Self::ParseTerminologyCompute { path, source } => {
-                write!(formatter, "无法调度术语解析 {}：{source}", path.display())
+                write!(
+                    formatter,
+                    "无法调度术语解析 {}：{source}",
+                    resource_label(path)
+                )
             }
             Self::InvalidTerminology { path, source } => {
-                write!(formatter, "术语文件无效 {}：{source}", path.display())
+                write!(formatter, "术语资源无效 {}：{source}", resource_label(path))
             }
             Self::ParsePlaceholderRulesCompute { path, source } => write!(
                 formatter,
                 "无法调度占位符规则解析 {}：{source}",
-                path.display()
+                resource_label(path)
             ),
             Self::InvalidPlaceholderRules { path, source } => write!(
                 formatter,
-                "占位符规则 JSON 无效 {}：{source}",
-                path.display()
+                "占位符规则资源无效 {}：{source}",
+                resource_label(path)
             ),
         }
     }
+}
+
+fn resource_label(path: &Option<PathBuf>) -> String {
+    path.as_ref().map_or_else(
+        || "（项目当前快照）".to_owned(),
+        |path| path.display().to_string(),
+    )
 }
 
 impl<F, C> Error for TranslationPlanningResourceReadingError<F, C>
@@ -597,6 +766,51 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn terminology_duplicate_key_is_rejected_before_canonicalization() {
+        let error = parse_terminology_resource::<FakeError, _>(
+            &ImmediateCpu,
+            None,
+            r#"[{"term":"A","term":"B","translation":"甲","triggers":["A"]}]"#.to_owned(),
+        )
+        .await
+        .expect_err("术语对象重复键必须拒绝");
+
+        assert!(matches!(
+            &error,
+            TranslationPlanningResourceReadingError::InvalidTerminology {
+                source: TerminologyDefinitionError::InvalidJson(_),
+                ..
+            }
+        ));
+        assert!(format!("{error}").contains("对象键重复"));
+    }
+
+    #[tokio::test]
+    async fn placeholder_duplicate_key_is_rejected_before_canonicalization() {
+        let error = parse_placeholder_resource::<FakeError, _>(
+            &ImmediateCpu,
+            None,
+            r#"[{"scopes":["event_dialogue"],"pattern":"x","pattern":"y","label":"X"}]"#.to_owned(),
+        )
+        .await
+        .expect_err("占位符对象重复键必须拒绝");
+
+        assert!(matches!(
+            &error,
+            TranslationPlanningResourceReadingError::InvalidPlaceholderRules { .. }
+        ));
+        assert!(format!("{error}").contains("对象键重复"));
+    }
+
+    #[test]
+    fn canonicalization_rejects_duplicate_keys_at_arbitrary_depth() {
+        let error = canonicalize_json(br#"{"outer":[{"nested":1,"nested":2}]}"#)
+            .expect_err("任意深度的重复对象键都必须拒绝");
+
+        assert!(error.to_string().contains("对象键重复"));
+    }
+
     #[test]
     fn ten_thousand_literal_triggers_share_one_compiled_matcher() {
         let definitions = (0..10_000)
@@ -636,20 +850,17 @@ mod tests {
             .read(
                 Some(PathBuf::from("C:/input/terms.json")),
                 Some(PathBuf::from("C:/input/placeholders.json")),
+                "[]".to_owned(),
+                "[]".to_owned(),
             )
             .await
             .expect("两份外部资料应该并发读取并分别解析");
 
         assert_eq!(max_active.load(Ordering::SeqCst), 2);
         assert_eq!(active.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            resources
-                .terminology()
-                .expect("应保留权威术语表")
-                .entries()
-                .len(),
-            1
-        );
+        assert_eq!(resources.terminology().entries().len(), 1);
         assert_eq!(resources.placeholder_rules.len(), 1);
+        assert!(resources.terminology_json.contains("魔法剣"));
+        assert!(resources.placeholder_rules_json.contains("SOUND_EFFECT"));
     }
 }

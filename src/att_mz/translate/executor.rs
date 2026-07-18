@@ -589,13 +589,23 @@ fn process_response(
                 return Err(TranslationResponseTechnicalError::InternalInvariant { message });
             }
         };
+        let translation_state = expected.state_context().finish(&translation);
+        let propagation_targets = expected
+            .propagation_targets()
+            .iter()
+            .cloned()
+            .zip(expected.propagation_state_contexts().iter().copied())
+            .map(|(identity, state_context)| {
+                super::standard::TranslationPropagationTarget::new(identity, state_context)
+            })
+            .collect();
         accepted.push(AcceptedTranslationDecision::new(
             expected.id(),
             TranslationPatch::new(
                 expected.identity().clone(),
-                expected.propagation_targets().to_vec(),
+                propagation_targets,
                 translation,
-                expected.terminology_dependencies().to_vec(),
+                translation_state,
             ),
         ));
     }
@@ -812,6 +822,71 @@ fn validate_and_restore_translation(
     Ok(restored)
 }
 
+pub(super) fn accept_prepared_translation_candidate(
+    translation: String,
+    placeholders: &[AppliedPlaceholder],
+    language_analysis: &crate::language::LanguageAnalysis,
+    language_module: &dyn LanguageModule,
+) -> Result<super::semantics::PreparedTranslationAcceptance, TranslationCandidateTechnicalError> {
+    match validate_and_restore_translation(
+        translation,
+        placeholders,
+        language_analysis,
+        language_module,
+    ) {
+        Ok(translation) => Ok(super::semantics::PreparedTranslationAcceptance::Accepted(
+            translation,
+        )),
+        Err(TranslationCandidateValidationError::Rejected(reason)) => {
+            Ok(super::semantics::PreparedTranslationAcceptance::Rejected(
+                super::semantics::PreparedTranslationRejection::Candidate(reason),
+            ))
+        }
+        Err(TranslationCandidateValidationError::LanguageModule(source)) => {
+            Err(TranslationCandidateTechnicalError::LanguageModule(source))
+        }
+        Err(TranslationCandidateValidationError::LanguageProjection(source)) => Err(
+            TranslationCandidateTechnicalError::LanguageProjection(source),
+        ),
+        Err(TranslationCandidateValidationError::LanguageRepair(source)) => {
+            Err(TranslationCandidateTechnicalError::LanguageRepair(source))
+        }
+        Err(TranslationCandidateValidationError::InternalInvariant { message }) => {
+            Err(TranslationCandidateTechnicalError::InternalInvariant { message })
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TranslationCandidateTechnicalError {
+    LanguageModule(LanguageModuleError),
+    LanguageProjection(LanguageTextProjectionError),
+    LanguageRepair(LanguageRepairApplicationError),
+    InternalInvariant { message: String },
+}
+
+impl fmt::Display for TranslationCandidateTechnicalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LanguageModule(source) => write!(formatter, "语言模块失败：{source}"),
+            Self::LanguageProjection(source) => write!(formatter, "语言投影失败：{source}"),
+            Self::LanguageRepair(source) => write!(formatter, "语言修复失败：{source}"),
+            Self::InternalInvariant { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for TranslationCandidateTechnicalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::LanguageModule(source) => Some(source),
+            Self::LanguageProjection(source) => Some(source),
+            Self::LanguageRepair(source) => Some(source),
+            Self::InternalInvariant { .. } => None,
+        }
+    }
+}
+
 fn normalize_language_text(
     language_text: &LanguageText,
 ) -> Result<LanguageText, TranslationUnitRejectionReason> {
@@ -929,6 +1004,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::att_mz::standard_asset::MzStandardAssetOwner;
     use crate::att_mz::text::{
         MzLocation, MzLocationStep, MzSource, StandardDataFile, TextGroupKind,
     };
@@ -939,8 +1015,9 @@ mod tests {
     use crate::att_mz::translate::standard::{
         AppliedPlaceholder, ExpectedTranslationOutput, PlaceholderRuleOrigin, PlaceholderSegment,
         StandardTranslationTaskIndex, TerminologyDependency, TranslationLanguagePair,
-        TranslationLeafIdentity, TranslationTaskStatus,
+        TranslationLeafIdentity, TranslationStateContext, TranslationTaskStatus,
     };
+    use crate::fingerprint::Sha256Fingerprint;
     use crate::language::{
         EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
         JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageModule,
@@ -1035,7 +1112,9 @@ mod tests {
             vec![MzLocationStep::index(1)],
         );
         TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
+            "description",
             group.clone(),
             MzLocation::value(
                 MzSource::data(StandardDataFile::Items),
@@ -1062,7 +1141,9 @@ mod tests {
             vec![MzLocationStep::index(2)],
         );
         TranslationLeafIdentity::new(
+            MzStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
+            "description",
             group.clone(),
             MzLocation::value(
                 MzSource::data(StandardDataFile::Items),
@@ -1102,7 +1183,8 @@ mod tests {
                         vec![propagation_target()],
                         vec![placeholder()],
                         japanese_analysis(),
-                        vec![TerminologyDependency::new("炎の剣", "炎之剑")],
+                        state_context(id as u8 + 1),
+                        vec![state_context(id as u8 + 101)],
                     )
                 })
                 .collect(),
@@ -1191,9 +1273,15 @@ mod tests {
         assert_eq!(result.accepted()[0].translation(), "炎之剑\\N[1]！");
         assert_eq!(
             result.accepted()[0].propagation_targets(),
-            &[propagation_target()]
+            &[super::super::standard::TranslationPropagationTarget::new(
+                propagation_target(),
+                state_context(101),
+            )]
         );
-        assert_eq!(result.accepted()[0].terminology_dependencies().len(), 1);
+    }
+
+    fn state_context(byte: u8) -> TranslationStateContext {
+        TranslationStateContext::new(Sha256Fingerprint::from_bytes([byte; 32]))
     }
 
     #[tokio::test]

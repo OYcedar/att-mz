@@ -296,45 +296,17 @@ impl CpuRuntimeConfiguration {
 #[derive(Clone, Copy)]
 pub(crate) struct DirectoryPublisherConfiguration {
     max_prepared_candidates: NonZeroUsize,
-    max_candidate_entries: NonZeroUsize,
-    max_candidate_depth: NonZeroUsize,
-    max_candidate_bytes: NonZeroUsize,
-    max_single_file_bytes: NonZeroUsize,
     max_recovery_artifacts_per_target: NonZeroUsize,
     target_lock_timeout: Duration,
 }
 
 impl DirectoryPublisherConfiguration {
     fn build(raw: RawDirectoryPublisherConfiguration) -> Result<Self, ConfigurationValueError> {
-        let max_candidate_bytes = non_zero_usize(
-            "runtime.filesystem.publisher.max_candidate_bytes",
-            raw.max_candidate_bytes,
-        )?;
-        let max_single_file_bytes = non_zero_usize(
-            "runtime.filesystem.publisher.max_single_file_bytes",
-            raw.max_single_file_bytes,
-        )?;
-        if max_single_file_bytes > max_candidate_bytes {
-            return Err(invalid(
-                "runtime.filesystem.publisher.max_single_file_bytes",
-                "单文件上限不得大于候选总字节上限",
-            ));
-        }
         Ok(Self {
             max_prepared_candidates: non_zero_usize(
                 "runtime.filesystem.publisher.max_prepared_candidates",
                 raw.max_prepared_candidates,
             )?,
-            max_candidate_entries: non_zero_usize(
-                "runtime.filesystem.publisher.max_candidate_entries",
-                raw.max_candidate_entries,
-            )?,
-            max_candidate_depth: non_zero_usize(
-                "runtime.filesystem.publisher.max_candidate_depth",
-                raw.max_candidate_depth,
-            )?,
-            max_candidate_bytes,
-            max_single_file_bytes,
             max_recovery_artifacts_per_target: non_zero_usize(
                 "runtime.filesystem.publisher.max_recovery_artifacts_per_target",
                 raw.max_recovery_artifacts_per_target,
@@ -350,22 +322,6 @@ impl DirectoryPublisherConfiguration {
         self.max_prepared_candidates
     }
 
-    pub(crate) const fn max_candidate_entries(self) -> NonZeroUsize {
-        self.max_candidate_entries
-    }
-
-    pub(crate) const fn max_candidate_depth(self) -> NonZeroUsize {
-        self.max_candidate_depth
-    }
-
-    pub(crate) const fn max_candidate_bytes(self) -> NonZeroUsize {
-        self.max_candidate_bytes
-    }
-
-    pub(crate) const fn max_single_file_bytes(self) -> NonZeroUsize {
-        self.max_single_file_bytes
-    }
-
     pub(crate) const fn max_recovery_artifacts_per_target(self) -> NonZeroUsize {
         self.max_recovery_artifacts_per_target
     }
@@ -376,11 +332,79 @@ impl DirectoryPublisherConfiguration {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct DirectoryTreeConfiguration {
+    max_entries: NonZeroUsize,
+    max_depth: NonZeroUsize,
+    max_bytes: NonZeroUsize,
+    max_single_file_bytes: NonZeroUsize,
+}
+
+impl DirectoryTreeConfiguration {
+    fn build(raw: RawDirectoryTreeConfiguration) -> Result<Self, ConfigurationValueError> {
+        let max_bytes = non_zero_usize("runtime.filesystem.tree.max_bytes", raw.max_bytes)?;
+        let max_single_file_bytes = non_zero_usize(
+            "runtime.filesystem.tree.max_single_file_bytes",
+            raw.max_single_file_bytes,
+        )?;
+        if max_single_file_bytes > max_bytes {
+            return Err(invalid(
+                "runtime.filesystem.tree.max_single_file_bytes",
+                "单文件上限不得大于目录树总字节上限",
+            ));
+        }
+        Ok(Self {
+            max_entries: non_zero_usize("runtime.filesystem.tree.max_entries", raw.max_entries)?,
+            max_depth: non_zero_usize("runtime.filesystem.tree.max_depth", raw.max_depth)?,
+            max_bytes,
+            max_single_file_bytes,
+        })
+    }
+
+    pub(crate) const fn max_entries(self) -> NonZeroUsize {
+        self.max_entries
+    }
+
+    pub(crate) const fn max_depth(self) -> NonZeroUsize {
+        self.max_depth
+    }
+
+    pub(crate) const fn max_bytes(self) -> NonZeroUsize {
+        self.max_bytes
+    }
+
+    pub(crate) const fn max_single_file_bytes(self) -> NonZeroUsize {
+        self.max_single_file_bytes
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProjectLockConfiguration {
+    timeout: Duration,
+}
+
+impl ProjectLockConfiguration {
+    fn build(raw: RawProjectLockConfiguration) -> Result<Self, ConfigurationValueError> {
+        Ok(Self {
+            timeout: positive_duration(
+                "runtime.filesystem.project_lock.timeout_ms",
+                raw.timeout_ms,
+            )?,
+        })
+    }
+
+    pub(crate) const fn timeout(self) -> Duration {
+        self.timeout
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct FilesystemRuntimeConfiguration {
     worker_threads: NonZeroUsize,
     queue_capacity: NonZeroUsize,
     max_read_bytes: NonZeroUsize,
     max_directory_entries: NonZeroUsize,
+    tree: DirectoryTreeConfiguration,
+    project_lock: ProjectLockConfiguration,
     publisher: DirectoryPublisherConfiguration,
 }
 
@@ -403,6 +427,8 @@ impl FilesystemRuntimeConfiguration {
                 "runtime.filesystem.max_directory_entries",
                 raw.max_directory_entries,
             )?,
+            tree: DirectoryTreeConfiguration::build(raw.tree)?,
+            project_lock: ProjectLockConfiguration::build(raw.project_lock)?,
             publisher: DirectoryPublisherConfiguration::build(raw.publisher)?,
         })
     }
@@ -425,6 +451,14 @@ impl FilesystemRuntimeConfiguration {
 
     pub(crate) const fn publisher(self) -> DirectoryPublisherConfiguration {
         self.publisher
+    }
+
+    pub(crate) const fn tree(self) -> DirectoryTreeConfiguration {
+        self.tree
+    }
+
+    pub(crate) const fn project_lock(self) -> ProjectLockConfiguration {
+        self.project_lock
     }
 }
 
@@ -469,6 +503,12 @@ impl SqliteRuntimeConfiguration {
             "runtime.sqlite.max_open_connections",
             raw.max_open_connections,
         )?;
+        if max_open_connections.get() < 2 {
+            return Err(invalid(
+                "runtime.sqlite.max_open_connections",
+                "SQLite online backup 需要同时使用源与目标连接，连接总上限必须至少为 2",
+            ));
+        }
         let max_interactive_sessions = non_zero_usize(
             "runtime.sqlite.max_interactive_sessions",
             raw.max_interactive_sessions,
@@ -732,6 +772,7 @@ pub(crate) struct LuaRuntimeConfiguration {
     memory_limit_bytes_per_vm: NonZeroUsize,
     cancel_check_instruction_interval: NonZeroU32,
     max_error_bytes: NonZeroUsize,
+    host_values: LuaHostValueConfiguration,
 }
 
 impl LuaRuntimeConfiguration {
@@ -752,6 +793,7 @@ impl LuaRuntimeConfiguration {
                 raw.cancel_check_instruction_interval,
             )?,
             max_error_bytes: non_zero_usize("runtime.lua.max_error_bytes", raw.max_error_bytes)?,
+            host_values: LuaHostValueConfiguration::build(raw.host_values)?,
         })
     }
 
@@ -777,6 +819,39 @@ impl LuaRuntimeConfiguration {
 
     pub(crate) const fn max_error_bytes(self) -> NonZeroUsize {
         self.max_error_bytes
+    }
+
+    pub(crate) const fn host_values(self) -> LuaHostValueConfiguration {
+        self.host_values
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct LuaHostValueConfiguration {
+    max_bytes: NonZeroUsize,
+    max_nodes: NonZeroUsize,
+    max_depth: NonZeroUsize,
+}
+
+impl LuaHostValueConfiguration {
+    fn build(raw: RawLuaHostValueConfiguration) -> Result<Self, ConfigurationValueError> {
+        Ok(Self {
+            max_bytes: non_zero_usize("runtime.lua.host_values.max_bytes", raw.max_bytes)?,
+            max_nodes: non_zero_usize("runtime.lua.host_values.max_nodes", raw.max_nodes)?,
+            max_depth: non_zero_usize("runtime.lua.host_values.max_depth", raw.max_depth)?,
+        })
+    }
+
+    pub(crate) const fn max_bytes(self) -> NonZeroUsize {
+        self.max_bytes
+    }
+
+    pub(crate) const fn max_nodes(self) -> NonZeroUsize {
+        self.max_nodes
+    }
+
+    pub(crate) const fn max_depth(self) -> NonZeroUsize {
+        self.max_depth
     }
 }
 
@@ -1569,18 +1644,21 @@ fn build_llm_client(
         }
     };
 
-    let request_body_value = serde_json::from_str::<StrictJsonValue>(&raw.request_body_extra)
-        .map_err(|error| {
-            invalid(
-                format!("{field}.request_body_extra").as_str(),
-                format!(
-                    "不是有效的严格 JSON（第 {} 行，第 {} 列）",
-                    error.line(),
-                    error.column()
-                ),
-            )
-        })?
-        .0;
+    // 任意精度数字会在 Serde 访问器内使用一个私有 map 信封传递原始十进制
+    // 文本。第一遍自定义访问器只负责递归拒绝重复键；第二遍由
+    // `serde_json::Value` 自身还原真正的 Number，避免把内部信封泄漏到请求正文。
+    serde_json::from_str::<StrictJsonValue>(&raw.request_body_extra).map_err(|error| {
+        invalid(
+            format!("{field}.request_body_extra").as_str(),
+            format!(
+                "不是有效的严格 JSON（第 {} 行，第 {} 列）",
+                error.line(),
+                error.column()
+            ),
+        )
+    })?;
+    let request_body_value = serde_json::from_str::<JsonValue>(&raw.request_body_extra)
+        .expect("已通过同一 serde_json 语法边界的源文必须可重建为 Value");
     let JsonValue::Object(request_body_extra) = request_body_value else {
         return Err(invalid(
             format!("{field}.request_body_extra").as_str(),
@@ -2056,6 +2134,8 @@ struct RawFilesystemRuntimeConfiguration {
     queue_capacity: u64,
     max_read_bytes: u64,
     max_directory_entries: u64,
+    tree: RawDirectoryTreeConfiguration,
+    project_lock: RawProjectLockConfiguration,
     publisher: RawDirectoryPublisherConfiguration,
 }
 
@@ -2063,12 +2143,23 @@ struct RawFilesystemRuntimeConfiguration {
 #[serde(deny_unknown_fields)]
 struct RawDirectoryPublisherConfiguration {
     max_prepared_candidates: u64,
-    max_candidate_entries: u64,
-    max_candidate_depth: u64,
-    max_candidate_bytes: u64,
-    max_single_file_bytes: u64,
     max_recovery_artifacts_per_target: u64,
     target_lock_timeout_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDirectoryTreeConfiguration {
+    max_entries: u64,
+    max_depth: u64,
+    max_bytes: u64,
+    max_single_file_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProjectLockConfiguration {
+    timeout_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -2126,6 +2217,15 @@ struct RawLuaRuntimeConfiguration {
     memory_limit_bytes_per_vm: u64,
     cancel_check_instruction_interval: u64,
     max_error_bytes: u64,
+    host_values: RawLuaHostValueConfiguration,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLuaHostValueConfiguration {
+    max_bytes: u64,
+    max_nodes: u64,
+    max_depth: u64,
 }
 
 #[derive(Deserialize)]
@@ -2644,7 +2744,8 @@ mod tests {
   "n": 2,
   "max_tokens": 4096,
   "max_completion_tokens": 8192,
-  "thinking": {"model": "nested", "values": [null, true, 1.5]}
+  "thinking": {"model": "nested", "values": [null, true, 1.5]},
+  "precise": 123456789012345678901234567890.00000000000000000001
 }"#,
         );
         let configuration = load_configuration(&directory.write("accepted.toml", &accepted))
@@ -2659,6 +2760,10 @@ mod tests {
         assert_eq!(
             extra.get("thinking").and_then(|value| value.get("model")),
             Some(&JsonValue::from("nested"))
+        );
+        assert_eq!(
+            extra.get("precise").map(JsonValue::to_string).as_deref(),
+            Some("123456789012345678901234567890.00000000000000000001")
         );
 
         for (name, json, expected_suffix) in [
@@ -2728,6 +2833,22 @@ mod tests {
             load_configuration(&directory.write("wrong-type.toml", &wrong_type)),
             Err(ConfigurationLoadError::InvalidToml { .. })
         ));
+    }
+
+    #[test]
+    fn sqlite_connection_budget_reserves_source_and_destination_for_online_backup() {
+        let directory = TestDirectory::new();
+        let source =
+            valid_configuration().replace("max_open_connections = 8", "max_open_connections = 1");
+
+        let ConfigurationLoadError::InvalidValue(error) =
+            load_configuration(&directory.write("sqlite-one-connection.toml", &source))
+                .err()
+                .expect("单连接预算必须在配置边界被拒绝")
+        else {
+            panic!("应返回配置值错误");
+        };
+        assert_eq!(error.field(), "runtime.sqlite.max_open_connections");
     }
 
     #[test]
@@ -2837,12 +2958,17 @@ queue_capacity = 16
 max_read_bytes = 8388608
 max_directory_entries = 10000
 
+[runtime.filesystem.tree]
+max_entries = 100000
+max_depth = 64
+max_bytes = 1073741824
+max_single_file_bytes = 67108864
+
+[runtime.filesystem.project_lock]
+timeout_ms = 5000
+
 [runtime.filesystem.publisher]
 max_prepared_candidates = 2
-max_candidate_entries = 100000
-max_candidate_depth = 64
-max_candidate_bytes = 1073741824
-max_single_file_bytes = 67108864
 max_recovery_artifacts_per_target = 8
 target_lock_timeout_ms = 5000
 
@@ -2882,6 +3008,11 @@ worker_stack_bytes = 4194304
 memory_limit_bytes_per_vm = 67108864
 cancel_check_instruction_interval = 10000
 max_error_bytes = 65536
+
+[runtime.lua.host_values]
+max_bytes = 33554432
+max_nodes = 500000
+max_depth = 64
 
 [observability]
 root = "logs"

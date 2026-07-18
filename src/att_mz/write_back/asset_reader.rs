@@ -1,9 +1,11 @@
 //! 从五张 MZ 标准资产表建立不含术语数据的写回快照。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 
@@ -14,6 +16,7 @@ use crate::att_mz::standard_asset::{
     MzStandardAssetStorageKind, MzStandardAssetTable, MzTextBodyUnit,
 };
 use crate::att_mz::text::{MzLocation, TextGroupKind};
+use crate::project_database::SourceSnapshotFingerprint;
 use crate::storage::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
@@ -24,93 +27,108 @@ use super::standard::{
     StandardWriteBackLeaf, StandardWriteBackSnapshot, StandardWriteBackSnapshotError,
 };
 
-const READ_STANDARD_WRITE_BACK_ASSETS: &str = r#"SELECT
-    asset_table,
+const READ_STANDARD_WRITE_BACK_SNAPSHOT: &str = r#"SELECT
+    'owner_state' AS record_kind,
+    NULL AS asset_table,
+    NULL AS exact_location,
+    owner,
+    NULL AS group_location,
+    NULL AS field_name,
+    NULL AS unit_type,
+    NULL AS original_text,
+    NULL AS translation,
+    source_snapshot_fingerprint
+FROM standard_asset_owner_state
+
+UNION ALL
+
+SELECT
+    'asset' AS record_kind,
+    'entry' AS asset_table,
+    exact_location,
+    owner,
+    group_location,
+    field_name,
+    NULL AS unit_type,
+    original_text,
+    translation,
+    NULL AS source_snapshot_fingerprint
+FROM entry
+
+UNION ALL
+
+SELECT
+    'asset',
+    'system_text',
+    exact_location,
+    owner,
+    group_location,
+    field_name,
+    NULL,
+    original_text,
+    translation,
+    NULL
+FROM system_text
+
+UNION ALL
+
+SELECT
+    'asset',
+    'map_text',
+    exact_location,
+    owner,
+    group_location,
+    field_name,
+    NULL,
+    original_text,
+    translation,
+    NULL
+FROM map_text
+
+UNION ALL
+
+SELECT
+    'asset',
+    'text_body',
     exact_location,
     owner,
     group_location,
     field_name,
     unit_type,
     original_text,
-    translation
-FROM (
-    SELECT
-        'entry' AS asset_table,
-        exact_location,
-        owner,
-        group_location,
-        field_name,
-        NULL AS unit_type,
-        original_text,
-        translation
-    FROM entry
+    translation,
+    NULL
+FROM text_body
 
-    UNION ALL
+UNION ALL
 
-    SELECT
-        'system_text',
-        exact_location,
-        owner,
-        group_location,
-        field_name,
-        NULL,
-        original_text,
-        translation
-    FROM system_text
+SELECT
+    'asset',
+    'plugin_param',
+    exact_location,
+    owner,
+    group_location,
+    field_name,
+    NULL,
+    original_text,
+    translation,
+    NULL
+FROM plugin_param
 
-    UNION ALL
+ORDER BY record_kind DESC, owner, asset_table, exact_location"#;
 
-    SELECT
-        'map_text',
-        exact_location,
-        owner,
-        group_location,
-        field_name,
-        NULL,
-        original_text,
-        translation
-    FROM map_text
-
-    UNION ALL
-
-    SELECT
-        'text_body',
-        exact_location,
-        owner,
-        group_location,
-        field_name,
-        unit_type,
-        original_text,
-        translation
-    FROM text_body
-
-    UNION ALL
-
-    SELECT
-        'plugin_param',
-        exact_location,
-        owner,
-        group_location,
-        field_name,
-        NULL,
-        original_text,
-        translation
-    FROM plugin_param
-)
-ORDER BY asset_table, exact_location"#;
-
-/// 使用单次 SQLite 一致查询和受控 CPU 解码建立 Standard 写回快照。
+/// 先验证 active owner 新鲜度，再用受控 CPU 解码建立 Standard 写回快照。
 pub(crate) struct MzStandardWriteBackAssetReadingService<Q, C> {
-    sqlite: Q,
-    cpu: C,
+    sqlite: Arc<Q>,
+    cpu: Arc<C>,
     config: MzStandardAssetReadingConfig,
 }
 
 impl<Q, C> MzStandardWriteBackAssetReadingService<Q, C> {
     pub(crate) fn new(sqlite: Q, cpu: C, config: MzStandardAssetReadingConfig) -> Self {
         Self {
-            sqlite,
-            cpu,
+            sqlite: Arc::new(sqlite),
+            cpu: Arc::new(cpu),
             config,
         }
     }
@@ -123,48 +141,66 @@ where
 {
     type Error = MzStandardWriteBackAssetReadingError<Q::Error, C::Error>;
 
-    async fn read(
+    fn read(
         &self,
         project: &OpenedProject,
-    ) -> Result<StandardWriteBackSnapshot, Self::Error> {
+    ) -> impl Future<Output = Result<StandardWriteBackSnapshot, Self::Error>> + Send + use<Q, C>
+    {
         let database_path = project.database_path().to_path_buf();
-        let rows = self
-            .sqlite
-            .query_existing_database(
-                database_path.clone(),
-                SqliteQuery::new(READ_STANDARD_WRITE_BACK_ASSETS, Vec::new()),
-            )
-            .await
-            .map_err(|error| map_query_error(database_path, error))?;
-
-        if rows.is_empty() {
-            return Ok(StandardWriteBackSnapshot::empty());
-        }
-
+        let current_source = project.source_snapshot_fingerprint();
+        let sqlite = Arc::clone(&self.sqlite);
+        let cpu = Arc::clone(&self.cpu);
         let leaves_per_job = self.config.leaves_per_decode_job().get();
-        let batches = self
-            .cpu
-            .execute(move || partition_rows(rows, leaves_per_job))
-            .await
-            .map_err(MzStandardWriteBackAssetReadingError::SchedulePartition)?;
+        let decode_concurrency = self.config.decode_concurrency().get();
 
-        let decoded_batches = stream::iter(batches.into_iter().map(|batch| async move {
-            self.cpu
-                .execute(move || decode_rows(batch))
+        async move {
+            let rows = sqlite
+                .query_existing_database(
+                    database_path.clone(),
+                    SqliteQuery::new(READ_STANDARD_WRITE_BACK_SNAPSHOT, Vec::new()),
+                )
                 .await
-                .map_err(MzStandardWriteBackAssetReadingError::ScheduleDecode)?
-                .map_err(MzStandardWriteBackAssetReadingError::InvalidSnapshot)
-        }))
-        .buffered(self.config.decode_concurrency().get())
-        .try_collect::<Vec<_>>()
-        .await?;
+                .map_err(|error| map_query_error(database_path, error))?;
 
-        let decoded = decoded_batches.into_iter().flatten().collect::<Vec<_>>();
-        self.cpu
-            .execute(move || assemble_snapshot(decoded))
-            .await
-            .map_err(MzStandardWriteBackAssetReadingError::ScheduleAssembly)?
-            .map_err(MzStandardWriteBackAssetReadingError::InvalidSnapshot)
+            let prepared = cpu
+                .execute(move || prepare_snapshot_rows(rows, current_source, leaves_per_job))
+                .await
+                .map_err(MzStandardWriteBackAssetReadingError::SchedulePartition)?
+                .map_err(MzStandardWriteBackAssetReadingError::InvalidSnapshot)?;
+            let PreparedSnapshotRows {
+                stale_owners,
+                active_owners,
+                batches,
+            } = prepared;
+            if !stale_owners.is_empty() {
+                return Err(MzStandardWriteBackAssetReadingError::ExtractionOutOfDate {
+                    owners: stale_owners,
+                });
+            }
+            if batches.is_empty() {
+                return Ok(StandardWriteBackSnapshot::empty());
+            }
+
+            let decoded_batches = stream::iter(batches.into_iter().map(|batch| {
+                let active_owners = active_owners.clone();
+                let cpu = Arc::clone(&cpu);
+                async move {
+                    cpu.execute(move || decode_rows(batch, &active_owners))
+                        .await
+                        .map_err(MzStandardWriteBackAssetReadingError::ScheduleDecode)?
+                        .map_err(MzStandardWriteBackAssetReadingError::InvalidSnapshot)
+                }
+            }))
+            .buffered(decode_concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+            let decoded = decoded_batches.into_iter().flatten().collect::<Vec<_>>();
+            cpu.execute(move || assemble_snapshot(decoded))
+                .await
+                .map_err(MzStandardWriteBackAssetReadingError::ScheduleAssembly)?
+                .map_err(MzStandardWriteBackAssetReadingError::InvalidSnapshot)
+        }
     }
 }
 
@@ -173,6 +209,7 @@ where
 pub(crate) enum MzStandardWriteBackAssetReadingError<Q, C> {
     DatabaseNotFound { database_path: PathBuf },
     Query { database_path: PathBuf, source: Q },
+    ExtractionOutOfDate { owners: Vec<MzStandardAssetOwner> },
     SchedulePartition(CpuTaskExecutionError<C>),
     ScheduleDecode(CpuTaskExecutionError<C>),
     ScheduleAssembly(CpuTaskExecutionError<C>),
@@ -196,6 +233,15 @@ where
                 formatter,
                 "无法从 {} 读取标准写回资产：{source}",
                 database_path.display()
+            ),
+            Self::ExtractionOutOfDate { owners } => write!(
+                formatter,
+                "标准资产提取已过期：{}",
+                owners
+                    .iter()
+                    .map(|owner| owner.storage_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Self::SchedulePartition(source) => {
                 write!(formatter, "写回资产解码分批任务执行失败：{source}")
@@ -223,7 +269,7 @@ where
             | Self::ScheduleDecode(source)
             | Self::ScheduleAssembly(source) => Some(source),
             Self::InvalidSnapshot(source) => Some(source),
-            Self::DatabaseNotFound { .. } => None,
+            Self::DatabaseNotFound { .. } | Self::ExtractionOutOfDate { .. } => None,
         }
     }
 }
@@ -242,6 +288,7 @@ struct DecodedRow {
 #[derive(Debug)]
 pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
     WrongColumnCount {
+        expected: usize,
         actual: usize,
     },
     WrongColumnType {
@@ -250,7 +297,14 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
         actual: &'static str,
     },
     UnknownAssetTable(String),
+    UnknownSnapshotRecordKind(String),
     UnknownOwner(String),
+    DuplicateOwner(String),
+    InvalidOwnerFingerprintLength {
+        owner: String,
+        actual: usize,
+    },
+    AssetOwnerWithoutState(String),
     UnknownUnitType(String),
     UnexpectedUnitType {
         table: String,
@@ -270,8 +324,11 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
 impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WrongColumnCount { actual } => {
-                write!(formatter, "写回资产查询行应包含 8 列，实际为 {actual} 列")
+            Self::WrongColumnCount { expected, actual } => {
+                write!(
+                    formatter,
+                    "写回资产查询行应包含 {expected} 列，实际为 {actual} 列"
+                )
             }
             Self::WrongColumnType {
                 column,
@@ -279,7 +336,18 @@ impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
                 actual,
             } => write!(formatter, "列 {column} 应为 {expected}，实际为 {actual}"),
             Self::UnknownAssetTable(table) => write!(formatter, "未知标准资产表：{table}"),
+            Self::UnknownSnapshotRecordKind(kind) => {
+                write!(formatter, "未知写回快照记录类型：{kind}")
+            }
             Self::UnknownOwner(owner) => write!(formatter, "未知资产所有者：{owner}"),
+            Self::DuplicateOwner(owner) => write!(formatter, "资产所有者状态重复：{owner}"),
+            Self::InvalidOwnerFingerprintLength { owner, actual } => write!(
+                formatter,
+                "资产所有者 {owner} 的来源快照指纹应为 32 字节，实际为 {actual} 字节"
+            ),
+            Self::AssetOwnerWithoutState(owner) => {
+                write!(formatter, "资产所有者没有 active owner state：{owner}")
+            }
             Self::UnknownUnitType(unit_type) => {
                 write!(formatter, "未知文本单元类型：{unit_type}")
             }
@@ -328,6 +396,87 @@ fn map_query_error<Q, C>(
     }
 }
 
+struct PreparedSnapshotRows {
+    stale_owners: Vec<MzStandardAssetOwner>,
+    active_owners: BTreeSet<&'static str>,
+    batches: Vec<Vec<SqliteRow>>,
+}
+
+fn prepare_snapshot_rows(
+    rows: Vec<SqliteRow>,
+    current: SourceSnapshotFingerprint,
+    leaves_per_job: usize,
+) -> Result<PreparedSnapshotRows, InvalidStandardWriteBackAssetSnapshot> {
+    let (owner_rows, asset_rows) = split_snapshot_rows(rows)?;
+    let (stale_owners, active_owners) = decode_owner_states(owner_rows, current)?;
+    Ok(PreparedSnapshotRows {
+        stale_owners,
+        active_owners,
+        batches: partition_rows(asset_rows, leaves_per_job),
+    })
+}
+
+fn split_snapshot_rows(
+    rows: Vec<SqliteRow>,
+) -> Result<(Vec<SqliteRow>, Vec<SqliteRow>), InvalidStandardWriteBackAssetSnapshot> {
+    let mut owner_rows = Vec::new();
+    let mut asset_rows = Vec::new();
+    for row in rows {
+        let values = row.into_values();
+        let actual = values.len();
+        let [
+            record_kind,
+            asset_table,
+            exact_location,
+            owner,
+            group_location,
+            field_name,
+            unit_type,
+            original_text,
+            translation,
+            source_snapshot_fingerprint,
+        ] = <[SqliteValue; 10]>::try_from(values).map_err(|_| {
+            InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
+                expected: 10,
+                actual,
+            }
+        })?;
+        match required_text(record_kind, "record_kind")?.as_str() {
+            "owner_state" => {
+                required_null(asset_table, "asset_table")?;
+                required_null(exact_location, "exact_location")?;
+                required_null(group_location, "group_location")?;
+                required_null(field_name, "field_name")?;
+                required_null(unit_type, "unit_type")?;
+                required_null(original_text, "original_text")?;
+                required_null(translation, "translation")?;
+                owner_rows.push(SqliteRow::new(vec![owner, source_snapshot_fingerprint]));
+            }
+            "asset" => {
+                required_null(source_snapshot_fingerprint, "source_snapshot_fingerprint")?;
+                asset_rows.push(SqliteRow::new(vec![
+                    asset_table,
+                    exact_location,
+                    owner,
+                    group_location,
+                    field_name,
+                    unit_type,
+                    original_text,
+                    translation,
+                ]));
+            }
+            kind => {
+                return Err(
+                    InvalidStandardWriteBackAssetSnapshot::UnknownSnapshotRecordKind(
+                        kind.to_owned(),
+                    ),
+                );
+            }
+        }
+    }
+    Ok((owner_rows, asset_rows))
+}
+
 fn partition_rows(rows: Vec<SqliteRow>, leaves_per_job: usize) -> Vec<Vec<SqliteRow>> {
     let mut rows = rows.into_iter();
     let mut batches = Vec::new();
@@ -340,16 +489,76 @@ fn partition_rows(rows: Vec<SqliteRow>, leaves_per_job: usize) -> Vec<Vec<Sqlite
     }
 }
 
-fn decode_rows(
+fn decode_owner_states(
     rows: Vec<SqliteRow>,
-) -> Result<Vec<DecodedRow>, InvalidStandardWriteBackAssetSnapshot> {
-    rows.into_iter().map(decode_row).collect()
+    current: SourceSnapshotFingerprint,
+) -> Result<
+    (Vec<MzStandardAssetOwner>, BTreeSet<&'static str>),
+    InvalidStandardWriteBackAssetSnapshot,
+> {
+    let mut active = BTreeSet::new();
+    let mut stale = Vec::new();
+    for row in rows {
+        let values = row.into_values();
+        if values.len() != 2 {
+            return Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
+                expected: 2,
+                actual: values.len(),
+            });
+        }
+        let mut values = values.into_iter();
+        let owner_name = required_text(next(&mut values), "owner")?;
+        let owner = MzStandardAssetOwner::from_storage_name(&owner_name).ok_or_else(|| {
+            InvalidStandardWriteBackAssetSnapshot::UnknownOwner(owner_name.clone())
+        })?;
+        if !active.insert(owner.storage_name()) {
+            return Err(InvalidStandardWriteBackAssetSnapshot::DuplicateOwner(
+                owner_name,
+            ));
+        }
+        let fingerprint_value = next(&mut values);
+        let SqliteValue::Blob(bytes) = fingerprint_value else {
+            return Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnType {
+                column: "source_snapshot_fingerprint",
+                expected: "BLOB",
+                actual: fingerprint_value.kind_name(),
+            });
+        };
+        let fingerprint = SourceSnapshotFingerprint::from_slice(&bytes).map_err(|error| {
+            InvalidStandardWriteBackAssetSnapshot::InvalidOwnerFingerprintLength {
+                owner: owner.storage_name().to_owned(),
+                actual: error.actual(),
+            }
+        })?;
+        if fingerprint != current {
+            stale.push(owner);
+        }
+    }
+    stale.sort_by_key(|owner| match owner {
+        MzStandardAssetOwner::Builtin => 0,
+        MzStandardAssetOwner::Rules => 1,
+        MzStandardAssetOwner::Lua => 2,
+    });
+    Ok((stale, active))
 }
 
-fn decode_row(row: SqliteRow) -> Result<DecodedRow, InvalidStandardWriteBackAssetSnapshot> {
+fn decode_rows(
+    rows: Vec<SqliteRow>,
+    active_owners: &BTreeSet<&'static str>,
+) -> Result<Vec<DecodedRow>, InvalidStandardWriteBackAssetSnapshot> {
+    rows.into_iter()
+        .map(|row| decode_row(row, active_owners))
+        .collect()
+}
+
+fn decode_row(
+    row: SqliteRow,
+    active_owners: &BTreeSet<&'static str>,
+) -> Result<DecodedRow, InvalidStandardWriteBackAssetSnapshot> {
     let values = row.into_values();
     if values.len() != 8 {
         return Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
+            expected: 8,
             actual: values.len(),
         });
     }
@@ -366,8 +575,14 @@ fn decode_row(row: SqliteRow) -> Result<DecodedRow, InvalidStandardWriteBackAsse
     let table = MzStandardAssetTable::from_storage_name(&table_name).ok_or_else(|| {
         InvalidStandardWriteBackAssetSnapshot::UnknownAssetTable(table_name.clone())
     })?;
-    if MzStandardAssetOwner::from_storage_name(&owner).is_none() {
-        return Err(InvalidStandardWriteBackAssetSnapshot::UnknownOwner(owner));
+    let owner = MzStandardAssetOwner::from_storage_name(&owner)
+        .ok_or(InvalidStandardWriteBackAssetSnapshot::UnknownOwner(owner))?;
+    if !active_owners.contains(owner.storage_name()) {
+        return Err(
+            InvalidStandardWriteBackAssetSnapshot::AssetOwnerWithoutState(
+                owner.storage_name().to_owned(),
+            ),
+        );
     }
     let unit_type = unit_type
         .as_deref()
@@ -474,9 +689,25 @@ fn optional_text(
     }
 }
 
+fn required_null(
+    value: SqliteValue,
+    column: &'static str,
+) -> Result<(), InvalidStandardWriteBackAssetSnapshot> {
+    match value {
+        SqliteValue::Null => Ok(()),
+        actual => Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnType {
+            column,
+            expected: "NULL",
+            actual: actual.kind_name(),
+        }),
+    }
+}
+
 fn assemble_snapshot(
     rows: Vec<DecodedRow>,
 ) -> Result<StandardWriteBackSnapshot, InvalidStandardWriteBackAssetSnapshot> {
+    // owner 只拥有提取快照与新鲜度，不改变真实 MZ 文档中的组身份。不同 owner 对同一
+    // 业务对象贡献互不冲突的叶时必须合并，才能形成一次完整且确定性的文档改写。
     let mut groups = BTreeMap::<(TextGroupKind, MzLocation), Vec<StandardWriteBackLeaf>>::new();
     for row in rows {
         let leaf = StandardWriteBackLeaf::new(
@@ -543,7 +774,7 @@ mod tests {
                 .lock()
                 .expect("查询响应锁不应中毒")
                 .take()
-                .expect("测试查询只应调用一次");
+                .expect("一次快照读取只应提交一条 SQLite statement");
             async move { response }
         }
     }
@@ -589,7 +820,7 @@ mod tests {
     impl Error for FakeError {}
 
     #[tokio::test]
-    async fn one_eight_column_query_builds_all_storage_kinds_without_terminology() {
+    async fn one_snapshot_statement_builds_all_storage_kinds_without_terminology() {
         let dialogue_group = command_location(2, 10);
         let scrolling_group = command_location(4, 20);
         let rows = vec![
@@ -684,9 +915,21 @@ mod tests {
         let calls = harness.query_calls.lock().expect("查询调用锁不应中毒");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, PathBuf::from("C:/projects/demo/project.db"));
-        assert_eq!(calls[0].1.statement(), READ_STANDARD_WRITE_BACK_ASSETS);
+        assert_eq!(calls[0].1.statement(), READ_STANDARD_WRITE_BACK_SNAPSHOT);
         assert!(calls[0].1.parameters().is_empty());
-        assert_eq!(calls[0].1.statement().matches("UNION ALL").count(), 4);
+        assert_eq!(calls[0].1.statement().matches("UNION ALL").count(), 5);
+        assert!(
+            calls[0]
+                .1
+                .statement()
+                .contains("'owner_state' AS record_kind")
+        );
+        assert!(
+            calls[0]
+                .1
+                .statement()
+                .contains("owner, asset_table, exact_location")
+        );
         assert!(!calls[0].1.statement().contains("terminology"));
         assert_eq!(snapshot.groups().len(), 8);
         assert_eq!(
@@ -742,7 +985,331 @@ mod tests {
             .expect("空写回快照合法");
 
         assert!(snapshot.groups().is_empty());
-        assert_eq!(harness.cpu_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.cpu_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_active_owners_stop_before_the_five_asset_tables_are_read() {
+        let harness = Harness::with_response(Ok(combined_snapshot_rows(
+            owner_state_rows(&[
+                (MzStandardAssetOwner::Lua, 0x11),
+                (MzStandardAssetOwner::Rules, 0x22),
+                (MzStandardAssetOwner::Builtin, 0xa5),
+            ]),
+            vec![scalar_row(
+                "entry",
+                MzSource::data(StandardDataFile::Items),
+                "name",
+                "剑",
+                Some("Sword"),
+            )],
+        )));
+
+        let error = harness
+            .service(1, 1, None)
+            .read(&project())
+            .await
+            .expect_err("任一 active owner 过期都必须停止写回读取");
+
+        assert!(matches!(
+            error,
+            MzStandardWriteBackAssetReadingError::ExtractionOutOfDate { owners }
+                if owners == vec![MzStandardAssetOwner::Rules, MzStandardAssetOwner::Lua]
+        ));
+        let calls = harness.query_calls.lock().expect("查询记录锁不应中毒");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.statement(), READ_STANDARD_WRITE_BACK_SNAPSHOT);
+        assert_eq!(harness.cpu_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_asset_row_without_active_owner_state_is_database_corruption() {
+        let mut orphan = scalar_row(
+            "entry",
+            MzSource::data(StandardDataFile::Items),
+            "name",
+            "剑",
+            Some("Sword"),
+        )
+        .into_values();
+        orphan[2] = SqliteValue::Text("rules".to_owned());
+        let harness = Harness::with_response(Ok(combined_snapshot_rows(
+            owner_state_rows(&[(MzStandardAssetOwner::Builtin, 0xa5)]),
+            vec![SqliteRow::new(orphan)],
+        )));
+
+        let error = harness
+            .service(1, 1, None)
+            .read(&project())
+            .await
+            .expect_err("没有 owner state 的资产行必须视为数据库损坏");
+
+        assert!(matches!(
+            error,
+            MzStandardWriteBackAssetReadingError::InvalidSnapshot(
+                InvalidStandardWriteBackAssetSnapshot::AssetOwnerWithoutState(owner)
+            ) if owner == "rules"
+        ));
+    }
+
+    #[test]
+    fn owner_state_rows_require_unique_known_owners_and_exact_fingerprints() {
+        assert!(matches!(
+            decode_owner_states(
+                owner_state_rows(&[
+                    (MzStandardAssetOwner::Builtin, 0xa5),
+                    (MzStandardAssetOwner::Builtin, 0xa5),
+                ]),
+                project().source_snapshot_fingerprint(),
+            ),
+            Err(InvalidStandardWriteBackAssetSnapshot::DuplicateOwner(owner))
+                if owner == "builtin"
+        ));
+        assert!(matches!(
+            decode_owner_states(
+                vec![SqliteRow::new(vec![
+                    SqliteValue::Text("lua".to_owned()),
+                    SqliteValue::Blob(vec![0; 31]),
+                ])],
+                project().source_snapshot_fingerprint(),
+            ),
+            Err(
+                InvalidStandardWriteBackAssetSnapshot::InvalidOwnerFingerprintLength {
+                    owner,
+                    actual: 31,
+                }
+            ) if owner == "lua"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rows_from_different_owners_merge_by_their_real_mz_group() {
+        let source = MzSource::data(StandardDataFile::Items);
+        let group = MzLocation::value(source.clone(), vec![MzLocationStep::index(1)]);
+        let first = row(
+            "entry",
+            &MzLocation::value(
+                source.clone(),
+                vec![MzLocationStep::index(1), MzLocationStep::key("name")],
+            ),
+            &group,
+            "name",
+            None,
+            "剑",
+            Some("Sword"),
+        );
+        let mut second = row(
+            "entry",
+            &MzLocation::value(
+                source,
+                vec![MzLocationStep::index(1), MzLocationStep::key("description")],
+            ),
+            &group,
+            "description",
+            None,
+            "说明",
+            Some("Description"),
+        )
+        .into_values();
+        second[2] = SqliteValue::Text("rules".to_owned());
+        let harness = Harness::new(Ok(vec![first, SqliteRow::new(second)]));
+
+        let snapshot = harness
+            .service(1, 10, None)
+            .read(&project())
+            .await
+            .expect("不同 owner 对同一 MZ 对象的互补叶应合并");
+
+        assert_eq!(snapshot.groups().len(), 1);
+        assert_eq!(snapshot.groups()[0].leaves().len(), 2);
+        assert_eq!(
+            snapshot.groups()[0]
+                .leaves()
+                .iter()
+                .map(|leaf| leaf.original_text())
+                .collect::<Vec<_>>(),
+            ["说明", "剑"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_from_different_owners_still_reject_the_same_exact_location() {
+        let source = MzSource::data(StandardDataFile::Items);
+        let exact = MzLocation::value(
+            source.clone(),
+            vec![MzLocationStep::index(1), MzLocationStep::key("name")],
+        );
+        let group = MzLocation::value(source, vec![MzLocationStep::index(1)]);
+        let first = row("entry", &exact, &group, "name", None, "剑", Some("Sword"));
+        let second = replace_column(
+            row("entry", &exact, &group, "name", None, "剑", Some("Blade")),
+            2,
+            SqliteValue::Text("rules".to_owned()),
+        );
+        let harness = Harness::new(Ok(vec![first, second]));
+
+        let error = harness
+            .service(1, 10, None)
+            .read(&project())
+            .await
+            .expect_err("不同 owner 不得覆盖同一权威 exact 位置");
+
+        assert!(matches!(
+            error,
+            MzStandardWriteBackAssetReadingError::InvalidSnapshot(
+                InvalidStandardWriteBackAssetSnapshot::InvalidModel(
+                    StandardWriteBackSnapshotError::DuplicateLocation { exact_location }
+                )
+            ) if *exact_location == exact
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_note_tag_names_with_distinct_occurrences_are_complementary_leaves() {
+        let source = MzSource::data(StandardDataFile::Items);
+        let container_steps = vec![MzLocationStep::index(1)];
+        let group = MzLocation::value(source.clone(), container_steps.clone());
+        let first = row(
+            "entry",
+            &MzLocation::note_tag(source.clone(), container_steps.clone(), "Help", 0),
+            &group,
+            "Help",
+            None,
+            "第一段",
+            Some("First"),
+        );
+        let second = replace_column(
+            row(
+                "entry",
+                &MzLocation::note_tag(source, container_steps, "Help", 1),
+                &group,
+                "Help",
+                None,
+                "第二段",
+                Some("Second"),
+            ),
+            2,
+            SqliteValue::Text("rules".to_owned()),
+        );
+        let harness = Harness::new(Ok(vec![first, second]));
+
+        let snapshot = harness
+            .service(1, 10, None)
+            .read(&project())
+            .await
+            .expect("同标签的不同 occurrence 是两个合法权威位置");
+
+        assert_eq!(snapshot.groups().len(), 1);
+        assert_eq!(snapshot.groups()[0].leaves().len(), 2);
+    }
+
+    #[test]
+    fn real_sqlite_union_merges_complementary_owner_leaves() {
+        let connection = rusqlite::Connection::open_in_memory().expect("内存 SQLite 应可打开");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE standard_asset_owner_state (
+                    owner TEXT NOT NULL,
+                    source_snapshot_fingerprint BLOB NOT NULL
+                );
+                CREATE TABLE entry (
+                    exact_location TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    original_text TEXT NOT NULL,
+                    translation TEXT
+                );
+                CREATE TABLE system_text AS SELECT * FROM entry WHERE 0;
+                CREATE TABLE map_text AS SELECT * FROM entry WHERE 0;
+                CREATE TABLE text_body (
+                    exact_location TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    unit_type TEXT NOT NULL,
+                    original_text TEXT NOT NULL,
+                    translation TEXT
+                );
+                CREATE TABLE plugin_param AS SELECT * FROM entry WHERE 0;
+                "#,
+            )
+            .expect("写回查询的当前表形状应可建立");
+
+        let fingerprint = project().source_snapshot_fingerprint().as_bytes().to_vec();
+        for owner in ["builtin", "rules"] {
+            connection
+                .execute(
+                    "INSERT INTO standard_asset_owner_state VALUES (?1, ?2)",
+                    rusqlite::params![owner, &fingerprint],
+                )
+                .expect("owner state 应可写入");
+        }
+
+        let source = MzSource::data(StandardDataFile::Items);
+        let group = MzLocation::value(source.clone(), vec![MzLocationStep::index(1)]);
+        let group = MzLocationCodec::encode(&group).expect("测试组位置应可编码");
+        for (owner, field, original, translation) in [
+            ("builtin", "name", "剑", "Sword"),
+            ("rules", "description", "说明", "Description"),
+        ] {
+            let exact = MzLocation::value(
+                source.clone(),
+                vec![MzLocationStep::index(1), MzLocationStep::key(field)],
+            );
+            let exact = MzLocationCodec::encode(&exact).expect("测试 exact 位置应可编码");
+            connection
+                .execute(
+                    "INSERT INTO entry VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![exact, owner, &group, field, original, translation],
+                )
+                .expect("标准资产行应可写入");
+        }
+
+        let mut statement = connection
+            .prepare(READ_STANDARD_WRITE_BACK_SNAPSHOT)
+            .expect("生产写回快照 SQL 应可在真实 SQLite 执行");
+        let column_count = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                let values = (0..column_count)
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|value| match value {
+                        rusqlite::types::Value::Null => SqliteValue::Null,
+                        rusqlite::types::Value::Integer(value) => SqliteValue::Integer(value),
+                        rusqlite::types::Value::Real(value) => SqliteValue::Real(value),
+                        rusqlite::types::Value::Text(value) => SqliteValue::Text(value),
+                        rusqlite::types::Value::Blob(value) => SqliteValue::Blob(value),
+                    })
+                    .collect();
+                Ok(SqliteRow::new(values))
+            })
+            .expect("生产查询应返回快照行")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("真实 SQLite 快照行应可读取");
+
+        let PreparedSnapshotRows {
+            stale_owners,
+            active_owners,
+            batches,
+        } = prepare_snapshot_rows(rows, project().source_snapshot_fingerprint(), 10)
+            .expect("真实 SQLite 快照应可准备");
+        assert!(stale_owners.is_empty());
+        let decoded = batches
+            .into_iter()
+            .map(|batch| decode_rows(batch, &active_owners))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("真实 SQLite 快照应可解码")
+            .into_iter()
+            .flatten()
+            .collect();
+        let snapshot = assemble_snapshot(decoded).expect("互补 owner 叶应合成单一 MZ 组");
+
+        assert_eq!(snapshot.groups().len(), 1);
+        assert_eq!(snapshot.groups()[0].leaves().len(), 2);
     }
 
     #[test]
@@ -792,7 +1359,7 @@ mod tests {
                 "table",
             ),
             (
-                replace_column(valid.clone(), 2, SqliteValue::Text("lua".to_owned())),
+                replace_column(valid.clone(), 2, SqliteValue::Text("unknown".to_owned())),
                 "owner",
             ),
             (
@@ -803,7 +1370,10 @@ mod tests {
         ];
 
         for (row, label) in cases {
-            assert!(decode_row(row).is_err(), "{label} 损坏应被拒绝");
+            assert!(
+                decode_row(row, &active_owners()).is_err(),
+                "{label} 损坏应被拒绝"
+            );
         }
     }
 
@@ -822,22 +1392,20 @@ mod tests {
         );
 
         assert!(matches!(
-            decode_row(replace_column(
-                valid.clone(),
-                1,
-                SqliteValue::Text("not-json".to_owned())
-            )),
+            decode_row(
+                replace_column(valid.clone(), 1, SqliteValue::Text("not-json".to_owned())),
+                &active_owners(),
+            ),
             Err(InvalidStandardWriteBackAssetSnapshot::InvalidLocation {
                 column: "exact_location",
                 ..
             })
         ));
         assert!(matches!(
-            decode_row(replace_column(
-                valid,
-                5,
-                SqliteValue::Text("dialog".to_owned())
-            )),
+            decode_row(
+                replace_column(valid, 5, SqliteValue::Text("dialog".to_owned())),
+                &active_owners(),
+            ),
             Err(InvalidStandardWriteBackAssetSnapshot::UnknownUnitType(unit)) if unit == "dialog"
         ));
     }
@@ -847,15 +1415,18 @@ mod tests {
         let group = data_group_location(StandardDataFile::Items, 1);
         let exact = data_location(StandardDataFile::Items, 1, "Name");
 
-        let error = decode_row(row(
-            "plugin_param",
-            &exact,
-            &group,
-            "Name",
-            None,
-            "插件参数",
-            Some("Plugin parameter"),
-        ))
+        let error = decode_row(
+            row(
+                "plugin_param",
+                &exact,
+                &group,
+                "Name",
+                None,
+                "插件参数",
+                Some("Plugin parameter"),
+            ),
+            &active_owners(),
+        )
         .expect_err("PluginParam 不应接受 Data 来源");
 
         assert!(matches!(
@@ -896,7 +1467,8 @@ mod tests {
         .into_values();
         values[2] = SqliteValue::Text("rules".to_owned());
 
-        let decoded = decode_row(SqliteRow::new(values)).expect("合法 Rules Entry→Map 应被接受");
+        let decoded = decode_row(SqliteRow::new(values), &active_owners())
+            .expect("合法 Rules Entry→Map 应被接受");
 
         assert_eq!(decoded.kind, TextGroupKind::DatabaseEntry);
         assert_eq!(decoded.exact_location, exact);
@@ -958,7 +1530,7 @@ mod tests {
             Err(QueryExistingDatabaseError::NotFound),
             Err(QueryExistingDatabaseError::QueryFailed(FakeError("read"))),
         ] {
-            let harness = Harness::new(response);
+            let harness = Harness::with_response(response);
             let error = harness
                 .service(1, 1, None)
                 .read(&project())
@@ -1024,7 +1596,13 @@ mod tests {
     }
 
     impl Harness {
-        fn new(response: QueryResponse) -> Self {
+        fn new(asset_response: QueryResponse) -> Self {
+            let response = asset_response
+                .map(|asset_rows| combined_snapshot_rows(fresh_owner_rows(), asset_rows));
+            Self::with_response(response)
+        }
+
+        fn with_response(response: QueryResponse) -> Self {
             Self {
                 query_calls: Arc::new(Mutex::new(Vec::new())),
                 response: Arc::new(Mutex::new(Some(response))),
@@ -1168,6 +1746,86 @@ mod tests {
         let mut values = row.into_values();
         values[index] = value;
         SqliteRow::new(values)
+    }
+
+    fn fresh_owner_rows() -> Vec<SqliteRow> {
+        owner_state_rows(&[
+            (MzStandardAssetOwner::Builtin, 0xa5),
+            (MzStandardAssetOwner::Rules, 0xa5),
+            (MzStandardAssetOwner::Lua, 0xa5),
+        ])
+    }
+
+    fn combined_snapshot_rows(
+        owner_rows: Vec<SqliteRow>,
+        asset_rows: Vec<SqliteRow>,
+    ) -> Vec<SqliteRow> {
+        let mut rows = owner_rows
+            .into_iter()
+            .map(|row| {
+                let [owner, fingerprint] = <[SqliteValue; 2]>::try_from(row.into_values())
+                    .expect("测试 owner state 应恰好两列");
+                SqliteRow::new(vec![
+                    SqliteValue::Text("owner_state".to_owned()),
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    owner,
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    fingerprint,
+                ])
+            })
+            .collect::<Vec<_>>();
+        rows.extend(asset_rows.into_iter().map(|row| {
+            let [
+                asset_table,
+                exact_location,
+                owner,
+                group_location,
+                field_name,
+                unit_type,
+                original_text,
+                translation,
+            ] = <[SqliteValue; 8]>::try_from(row.into_values()).expect("测试资产行应恰好八列");
+            SqliteRow::new(vec![
+                SqliteValue::Text("asset".to_owned()),
+                asset_table,
+                exact_location,
+                owner,
+                group_location,
+                field_name,
+                unit_type,
+                original_text,
+                translation,
+                SqliteValue::Null,
+            ])
+        }));
+        rows
+    }
+
+    fn owner_state_rows(owners: &[(MzStandardAssetOwner, u8)]) -> Vec<SqliteRow> {
+        owners
+            .iter()
+            .map(|(owner, fingerprint_byte)| {
+                SqliteRow::new(vec![
+                    SqliteValue::Text(owner.storage_name().to_owned()),
+                    SqliteValue::Blob(vec![*fingerprint_byte; 32]),
+                ])
+            })
+            .collect()
+    }
+
+    fn active_owners() -> BTreeSet<&'static str> {
+        [
+            MzStandardAssetOwner::Builtin.storage_name(),
+            MzStandardAssetOwner::Rules.storage_name(),
+            MzStandardAssetOwner::Lua.storage_name(),
+        ]
+        .into_iter()
+        .collect()
     }
 
     fn project() -> OpenedProject {

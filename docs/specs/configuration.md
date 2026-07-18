@@ -19,12 +19,27 @@ ATT 每次进程只读取一个 TOML 文件。顶层 `--config FILE` 指定文�
 | `runtime.async` | Tokio 工作线程、阻塞线程上限和保活时间 |
 | `runtime.cpu` | CPU 专用线程数和有界队列 |
 | `runtime.filesystem` | 文件工作线程、队列、单文件读取和单目录枚举上限 |
-| `runtime.filesystem.publisher` | 目录候选、递归复制、恢复产物和同目标锁的资源上限 |
+| `runtime.filesystem.tree` | 来源指纹、候选树和候选编辑共同使用的树条目、深度、总字节与单文件字节上限 |
+| `runtime.filesystem.publisher` | 同时存活的暂存候选数、单目标恢复产物数和目录发布锁等待上限 |
+| `runtime.filesystem.project_lock` | 同项目四命令跨进程租约的等待上限 |
 | `runtime.sqlite` | 短操作线程、连接总预算、交互会话、SQL/参数/结果上限和 SQLite 持久策略 |
 | `runtime.llm` | HTTP 连接池、总准入、活动请求、等待时限、代理和 TLS 根 |
 | `runtime.lua` | Lua VM 线程、队列、栈、单 VM 内存和取消检查周期 |
+| `runtime.lua.host_values` | Lua Host 值在 JSON、来源、MZ 与候选文件门面中的总字节、节点数和嵌套深度上限 |
 
 `runtime.llm.proxy` 只接受 `false` 或一个显式 URL；程序不读取系统代理。`runtime.llm.tls.additional_pem_files` 是额外 PEM 根证书文件列表，Windows 原生根仍然使用。
+
+`runtime.filesystem.project_lock.timeout_ms` 是项目租约的必填非零等待时间。租约文件
+固定放在 `<projects.root>/.att-project-locks/`；同一项目超时映射为 `ProjectBusy`，
+业务模块不另行推断或重试。
+
+`runtime.filesystem.tree` 的 `max_entries`、`max_depth`、`max_bytes` 和
+`max_single_file_bytes` 全部必填且必须非零；单文件上限不得大于树总字节上限。
+来源指纹、目录候选复制与复核以及 WriteBack 候选编辑使用同一份受信树预算。
+
+`runtime.lua.host_values` 的 `max_bytes`、`max_nodes` 和 `max_depth` 全部必填且必须
+非零。该预算统一限制 Lua 与 Host 交换的结构化值，不由 Runtime 根据脚本或输入规模
+另行推断。
 
 SQLite `journal_mode` 只允许 `delete`、`truncate`、`persist`、`wal`；`synchronous` 只允许 `normal`、`full`、`extra`。这些选择作用于建库、短操作和交互会话的共享生产策略。
 

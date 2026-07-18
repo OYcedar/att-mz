@@ -1,13 +1,12 @@
 # MZ 可信 Lua 运行现行规格
 
-本文记录 MZ 在 Extract、Translate 与 WriteBack 三个阶段运行用户明确指定的
-可信 Lua 程序时，Host、Lua 5.4 Runtime 和 SQLite 交互会话共同提供的当前契约。
-Lua 程序拥有自己的数据协议、事务划分、模型响应解析、重试与幂等语义；标准
-业务流程不解释 Lua 自有数据，也不替 Lua 猜测这些策略。
+本文定义 Extract、Translate 与 WriteBack 可信 Lua 的唯一 `ctx` 门面。Lua 可以直接
+复用 Rust 的 JSON、MZ 文档、翻译准备、布局和受控文件能力，同时保留完整 SQLite
+逃生口；各阶段没有的能力明确为 nil。
 
 ## 1. 调用顺序与所有权
 
-一次调用固定按以下顺序建立资源：
+一次调用固定执行：
 
 ```text
 读取完整主程序
@@ -16,148 +15,229 @@ runtime.reserve().await
       ↓
 打开项目 SQLite 交互会话
       ↓
-构造共享 Host calls + 唯一 session finalizer
+构造 Host calls + 唯一 session finalizer
       ↓
 reservation.start(program, bindings)
       ↓
 等待 VM 终态与清理终态
 ```
 
-Runtime 容量必须先于数据库会话取得，排队期间不占用 SQLite 连接。数据库会话
-打开后到 `start` 之间没有 `await` 窗口；`start` 同步接管 Host calls 与不可克隆的
-唯一 finalizer，而且不返回移交失败。一旦接管，Runtime 的 job supervisor 必须在
-VM 完成、失败、取消或 worker panic 后恰好调用一次 `finalize(self)`。
+Runtime 容量先于数据库会话取得，排队不占 SQLite 连接。打开会话到同步 `start`
+之间没有 await 窗口；一旦接管，job supervisor 在 VM 完成、失败、取消或 worker
+panic 后恰好调用一次 `finalize(self)`。
 
-reservation 不可克隆。直接丢弃尚未启动的 reservation 只释放容量，不会打开 VM。
-执行 handle 被丢弃只发出合作式取消信号；supervisor 继续拥有 finalizer，并把已
-接管资源推进到明确清理终态。执行错误和清理错误分别保存，二者都发生时不得让
-清理错误覆盖主错。
+reservation 不可克隆，未启动时丢弃只释放容量。execution handle 被丢弃只发送合作
+取消；supervisor 继续终结会话。执行错误和清理错误分别保存，清理错误不覆盖主错。
 
-## 2. VM 与模块环境
+## 2. VM、租约与可信边界
 
-生产 Runtime 使用进程内 vendored Lua 5.4。每个 VM 只在固定数量的专用 OS worker
-上创建、运行和销毁，不启用 `mlua` 的 async 或 send 模式。SQLite 与 LLM Future
-始终由进程主 Tokio Runtime 驱动；Lua worker 通过同步桥等待 Host 返回，不建立
-自己的 Tokio Runtime。
+生产 Runtime 使用进程内 vendored Lua 5.4，每个 VM 只在专用有界 OS worker 上
+创建、运行和销毁。SQLite、LLM 和 Host 文件 Future 由主 Tokio Runtime 驱动；Lua
+worker 通过同步桥等待结果，不建立私有 Tokio Runtime。
 
-VM 开放完整 Lua 标准库，包括 `require`、`io`、`os` 和 `debug`。主程序所在目录
-加入该 VM 的 `package.path` 与 `package.cpath`，进程当前工作目录不改变。主程序
-路径和所有项目路径必须能无损转换为 UTF-8；无法转换时在构造 `ctx` 前失败，不用
-损失性字符串替代。
+VM 开放完整标准库，包括 `require`、`io`、`os` 和 `debug`。主程序目录加入该 VM 的
+`package.path/cpath`，不修改进程 cwd；路径必须无损转换为 UTF-8。Unicode Lua/C
+模块搜索和 Lua 5.4 `luaopen_*` 规则由 Runtime 实现，模块句柄持有到 VM 销毁。
 
-`require` 的模块搜索器依次为 preload、Unicode Lua 文件、Unicode C 模块和
-Unicode C root 模块。每次搜索都读取该 VM 当时的 `package.path` 或
-`package.cpath`，以 Windows Unicode 路径 API 加载文件，不经过窄字符文件搜索器。
-C 模块入口严格采用 Lua 5.4 的 `luaopen_*` 点号替换、连字符前后缀回退和 C root
-规则；已载入的模块句柄持续持有到 VM 完全销毁后再释放。
+每个 VM 使用配置给定的内存、栈、队列和取消检查预算。完整标准库意味着脚本可调用
+`os.execute`、加载 native 模块、替换 debug hook，甚至通过 `os.exit` 或 native crash
+终止进程。因此只承诺进程仍存活且 VM/Host 调用交还控制时的合作取消和唯一清理。
 
-每个 VM 使用配置给定的内存上限，并按配置的指令间隔检查合作式取消。worker 数、
-队列容量、worker 栈、单 VM 内存上限、取消检查间隔和最大错误字节数都由统一配置
-边界建立，Runtime 不根据硬件或脚本内容自行推断。
+Lua 调用始终处于外层命令持有的项目租约内。脚本用 `os.execute` 再启动同项目 ATT
+命令不能重入；子进程等待租约并最终返回 `ProjectBusy`，脚本不应同步等待自己持有
+的同项目命令。
 
-## 3. `ctx` 精确接口
-
-主程序获得一个全局 `ctx`：
+## 3. 最终 `ctx` 形态
 
 ```lua
 ctx = {
   phase = "extract" | "translate" | "write_back",
-
   project = {
     name = string,
     source_root = string,
     database_path = string,
     source_language = string,
     target_language = string,
-    output_root = string | nil,
   },
+  json = JsonApi,
+  source = SourceApi,
+  mz = MzApi,
+  db = DatabaseApi,
 
-  db = {
-    NULL = sentinel,
-    blob = function(bytes) -> Blob,
-    query = function(sql, parameters?) -> rows,
-    execute = function(sql, parameters?) -> integer,
-    begin = function(),
-    commit = function(),
-    rollback = function(),
-  },
-
-  llm = function(messages) -> response, -- 仅 Translate；其他阶段为 nil
+  extract = ExtractApi | nil,
+  translation = TranslationApi | nil,
+  llm = function(messages) -> response | nil,
+  output = OutputApi | nil,
+  write_back = WriteBackApi | nil,
 }
 ```
 
-`project.source_root` 是 Init 冻结的 `<workspace>/source`。`database_path` 是该工作区
-的 `project.db`。只有 WriteBack 在 Standard 输出已经整体发布后获得
-`project.output_root`，其值为固定 `<workspace>/write_back`；其他阶段该字段为 nil。
+| 阶段 | 始终存在 | 额外存在 | 必须为 nil |
+|---|---|---|---|
+| Extract | `project/json/source/mz/db` | `extract` | `translation/llm/output/write_back` |
+| Translate | `project/json/source/mz/db` | `translation/llm` | `extract/output/write_back` |
+| WriteBack | `project/json/source/mz/db` | `output/write_back` | `extract/translation/llm` |
 
-阶段能力固定如下：
+字段存在性是协议的一部分；Host 不注入会失败的占位函数。`project.source_root` 永远是
+Init 冻结来源，WriteBack 的未发布候选只通过 `ctx.output` 暴露。
 
-| 阶段 | `ctx.phase` | `ctx.db` | `ctx.llm` | `project.output_root` |
-|---|---|---|---|---|
-| Extract | `extract` | 有 | nil | nil |
-| Translate | `translate` | 有 | 有 | nil |
-| WriteBack | `write_back` | 有 | nil | 已发布输出路径 |
+## 4. 公共数据与来源门面
 
-Translate 的 `ctx.llm` 与 Standard 使用本次 Profile 引用的同一公共 LLM Client，
-共享 Executor、HTTP 连接池、全局准入和客户端速率额度。
-其他阶段不构造 LLM 能力，也不注入占位函数。
+### 4.1 `ctx.json`
 
-## 4. SQLite 值与事务
-
-SQLite 与 Lua 的值映射是确定的：
-
-| SQLite | Lua |
-|---|---|
-| NULL | `ctx.db.NULL` sentinel |
-| INTEGER | integer |
-| REAL | number，NaN 与 Inf 拒绝 |
-| TEXT | string |
-| BLOB | opaque Blob userdata；`:bytes()` 返回原始字节 |
-
-普通 Lua string 始终是 TEXT，不根据内容猜测 BLOB。只有 `ctx.db.blob(bytes)` 显式
-建立 BLOB。参数数组必须从 1 开始、连续且没有其他键；nil 表示无参数。支持的参数
-只有 NULL sentinel、integer、有限 number、string 和 Blob，boolean、table 及其他
-userdata 均拒绝。
-
-`query` 返回 `rows[row][column]` 的两层无洞数组，严格保留数据库列顺序，不根据列名
-建立对象。`begin()` 固定委托 SQLite 会话执行 `BEGIN DEFERRED`；`commit()` 与
-`rollback()` 使用同一连接。主程序正常返回时若 finalizer 观察到活动事务，会先
-回滚并把本次调用报告为 `UnclosedTransaction`，不能伪装成成功。
-
-## 5. LLM 接口
-
-Translate 的 `ctx.llm` 只接受一个无洞 messages 数组。每一项必须且只能包含
-`role` 与 `content` 两个字符串字段；role 只接受 `system`、`user`、`assistant`。
-Lua 完整拥有响应 content 的解释、验收和是否再次调用模型的决定，Host 不修复或
-解析其业务内容。
-
-Lua 不能提交 model、认证、stream 或额外请求字段，也不能读取配置中的 Bearer。
-公共 Client 固定提供 `model` 与 `stream=false`，并透传自身受信
-`request_body_extra`；因此 Lua 与 Standard 使用完全相同的 endpoint、凭据、请求
-参数和速率事实，只由各自提供的 messages 区分调用。
-
-成功返回：
-
-```lua
-{
-  content = string,
-  finish_reason = string,
-  request_id = string | nil,
-  response_id = string,
-  usage = {
-    prompt_tokens = integer,
-    completion_tokens = integer,
-    total_tokens = integer,
-  } | nil,
-}
+```text
+NULL
+array
+object
+number
+decode
+encode
+kind
+number_text
 ```
 
-`request_id` 是 HTTP `x-request-id`，`response_id` 是响应正文 completion ID；两者
-不得混用。usage 只描述本次成功 HTTP 响应。
+该门面无损区分 JSON null、array、object、string、boolean 与任意精度 number。
+`number(text)` 从严格 JSON 数字文本建立值，`number_text` 取回规范数字文本；普通 Lua
+number 不能替代不可精确表示的大整数。规范十进制文本能精确表示为 i64 时，`number`
+和 `decode` 都建立 Lua integer；其他 JSON number 才建立精确 number userdata，二者不
+产生两套数值类型规则。`decode` 完整消费一份 UTF-8 JSON，`encode` 产生规范 JSON；
+object 键、数组连续性、循环引用和非法值都在边界明确拒绝。
 
-## 6. Host 错误
+### 4.2 统一 Host 值预算
 
-SQLite、LLM、参数绑定和 Host 结果映射错误以 userdata 抛给 Lua，可由 `pcall` 检查：
+`runtime.lua.host_values` 约束每次 Lua→Host 或 Host→Lua 值转换。根值深度为 1，容器
+和标量各计一个节点，动态 UTF-8 字符串和二进制叶子的原始字节共同计入字节预算；
+协议固定字段名不重复计入调用值。JSON 文本解码以完整输入字节为边界，编码以完整
+输出字节为边界。
+
+同一计数能力覆盖 JSON、来源和候选路径/内容、MZ 路径、Extract groups、Translate
+prepare/accept、LLM messages/response、SQLite 参数/结果及 WriteBack layout 参数/
+结果。各门面不得另建不一致的节点、深度或字节上限。超过预算统一抛出
+`domain="binding"`、`kind="host_value_budget_exceeded"` 的 Host error。
+
+`json.array/object` 只给现有 Lua table 安装私有类型标记，`json.kind` 只查询该标记或
+标量类型；二者不把 table 内容转换到 Host，因此不为标记或查询额外遍历整棵 table。
+该 table 在 `json.encode`、`output.write_json` 或其他真正消费其内容的 Host 门面处，
+才按完整值执行节点、深度和字节预算。这样私有标记是常数操作，同时任何实际跨边界
+的数据都不能绕过预算。
+
+### 4.3 `ctx.source`
+
+```text
+read
+read_text
+read_json
+list
+```
+
+所有路径相对冻结 `source/`，拒绝绝对路径、父级逃逸、reparse point 和资源超限。
+`read` 返回原始字节，`read_text` 要求 UTF-8，`read_json` 使用 `ctx.json` 的无损模型，
+`list` 返回稳定直接子项。该门面只读，不访问 Init 时的外部游戏目录。
+
+### 4.4 `ctx.mz`
+
+```text
+DECODE_JSON
+data
+map
+plugin_parameter
+open
+
+document.value
+document.location
+document.text
+document.note_tag
+document.comment_tag
+```
+
+`data`、`map` 和 `plugin_parameter` 精确建立 MZ 来源，`open` 从 `ctx.source` 打开并
+解析受限文档。Document 的 value/location/text API 使用与 Rust Builtin、Rules、
+Translate 和 WriteBack 相同的 `MzLocation`、嵌套 JSON 解码和字符串叶语义；
+`DECODE_JSON` 明确表示穿过一层 JSON 字符串。Note/Comment Tag 使用共享标签解析器和
+occurrence 定位，不按键名递归猜结构。
+
+## 5. 数据库门面
+
+`ctx.db` 在三个阶段都保留：
+
+```text
+NULL / blob
+query / execute
+begin / commit / rollback
+```
+
+SQLite NULL 映射 sentinel；INTEGER、有限 REAL、TEXT 和 opaque Blob 保持类型。普通
+Lua string 永远是 TEXT。参数必须是无洞数组；query 返回按列顺序排列的二维数组。
+`begin()` 固定执行 `BEGIN DEFERRED`。正常返回仍有活动事务时，finalizer 回滚并返回
+`UnclosedTransaction`；先前显式提交保持。
+
+完整 SQL 是可信脚本的逃生口。Lua 自建事务与 WriteBack 候选目录发布不是同一个
+原子单元；脚本必须自行承担已提交数据库副作用的幂等和恢复语义。
+
+## 6. 阶段专属核心能力
+
+### 6.1 Extract：`ctx.extract`
+
+```text
+replace_standard
+clear_standard
+```
+
+`replace_standard(snapshot)` 使用 `ctx.mz` 建立的文档文本和位置，按 Lua owner 原子
+替换五张标准表。空 snapshot 是 active 空快照，并把 owner 来源指纹刷新到当前
+metadata。`clear_standard()` 停用 Lua owner并级联删除其标准资产。Rust 按完整叶身份
+成对继承 translation/state；脚本不手写标准表 SQL。
+
+### 6.2 Translate：`ctx.translation` 与 `ctx.llm`
+
+```text
+translation.system_prompt
+translation.language_pair
+translation.prepare
+
+PreparedText.status
+PreparedText.model_text
+PreparedText.terms
+PreparedText.accept
+```
+
+`prepare` 复用当前持久术语/占位符快照、语言模块和逐叶 state 规则，返回 Current、
+NotApplicable 或 Pending。脚本只为 Pending 组织自己的批次和 messages；
+`model_text/terms` 提供受保护文本和本叶术语。`accept` 复用 Rust 的空白、ATT token、
+源语残留、可选修复、控制符恢复及最终 state 计算，不能绕过验收伪造 Current。
+
+`ctx.llm(messages)` 只接受无洞 `{ role, content }` 数组。它与 Standard 使用同一个
+公共 Client 和 Executor；Lua 不能覆盖 model、认证、stream 或额外 JSON 参数。
+成功返回 content、finish_reason、HTTP request ID、正文 response ID 和可选 usage。
+Lua 决定分组、调用次数、Retryable 重试和事务提交。
+
+### 6.3 WriteBack：`ctx.output` 与 `ctx.write_back`
+
+`ctx.output` 绑定本次尚未发布的唯一候选：
+
+```text
+read / read_text / read_json / list
+create_directory
+write / write_text / write_json
+remove
+```
+
+路径相对候选根，拒绝逃逸和 reparse point；写入和删除只作用于候选。`write_json`
+使用 `ctx.json` 规范编码。所有读写共同计入目录候选条目、深度、单文件和总字节预算。
+
+`ctx.write_back.layout(region, segments)` 复用 Rust 保守布局器。region 只接受
+`dialogue_body`、`scrolling_text`、`help_description`；segments 保留显式文本/控制
+边界，返回自动布局结果或结构化人工诊断，不让 Lua 重写宽度算法。
+
+Lua Host 只负责候选编辑，不拥有完整候选的最终校验。可选脚本结束后，外层
+WriteBack 无条件调用 Publisher 的借用式候选校验；即使未选择 Lua 也执行同一校验。
+候选必须仍恰好包含普通 `data/` 与 `js/` 树且全部预算成立，随后才按值消费 token
+发布。校验失败时只丢弃一次，并同时保留校验首因与清理次错。Lua 看不到最终输出
+路径的可写句柄，也不能自行 validate、discard 或 publish。
+
+## 7. Host 错误、取消与关闭
+
+JSON、来源、MZ、SQLite、LLM、候选文件和布局错误都以类型化 userdata 抛给 Lua：
 
 ```lua
 {
@@ -168,20 +248,15 @@ SQLite、LLM、参数绑定和 Host 结果映射错误以 userdata 抛给 Lua，
 }
 ```
 
-`domain` 与 `kind` 是机器可判断字段，`message` 只用于诊断。Lua 捕获错误后可以按
-自身策略继续；未捕获的 Host userdata 作为 Binding 失败返回。Lua 语法错误、普通
-Lua 运行错误、上下文错误、取消和 worker panic 保持各自独立终态。
+`domain/kind` 可供 `pcall` 判断，message 只用于诊断且不含密钥或完整敏感载荷。未捕获
+Host 错误作为 Binding 失败返回；Lua 语法、普通运行错误、上下文错误、取消和 worker
+panic 保持独立终态。
 
-## 7. 取消、关闭与可信边界
+`ctx.json` 的结构、语法和参数错误固定使用 `domain="json"`、
+`kind="invalid_value"`；包括 `array/object/number/decode/encode/kind/number_text` 在内
+的所有 JSON 调用都经过同一类型化错误信封。错误被 `pcall` 捕获时四个公开字段可读，
+未捕获时仍按其 JSON Host error 身份进入 Binding 终态，不降格为普通 Lua Execute。
 
-Runtime shutdown 停止新 reservation，取消已预留、排队和运行中的脚本，等待所有
-supervisor 完成唯一 finalizer，再 join 全部 Lua worker。没有超时后强拆或伪造成功。
-正常进程边界必须显式等待 shutdown。最后一个 Runtime 句柄被直接释放时，实现仍会
-停止准入、请求取消并关闭队列作为安全兜底，但调用方无法取得 worker join 结果，
-不能把该路径视为已经确认的成功关闭。
-
-Lua 脚本属于完全可信的本机程序。完整标准库意味着脚本可以调用 `os.execute`、加载
-本地 C 模块、替换 debug hook，甚至通过 `os.exit` 或 native crash 直接终止进程。
-因此系统不承诺任意可信脚本下都有界取消或必然 finalization。系统只承诺：进程仍
-存活，并且 VM 或 Host 调用能够交还控制时，取消会被观察，Runtime 会执行唯一
-finalizer，并准确报告 VM 与清理的两个终态。
+Runtime shutdown 停止新 reservation，取消已预留、排队和运行脚本，等待全部
+supervisor 完成唯一 finalizer，再 join worker。进程不设置超时后强拆，也不伪造
+清理成功。
