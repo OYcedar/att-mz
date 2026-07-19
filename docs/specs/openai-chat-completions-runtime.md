@@ -4,7 +4,7 @@
 
 `OpenAiChatCompletionExecutor` 按受信 Client 执行一次非流式 Chat Completions 请求。它拥有进程内全局并发、有限队列、连接池、超时、客户端 RPM/burst 和实际 HTTP 协议；不自动重试、不探测供应商、不修复响应。
 
-Standard 的有限重试属于 MZ 翻译策略；Translate Lua 自己决定调用和重试。二者共享同一个 Executor、Client、连接池、全局容量和 RPM/burst。
+Standard 的有限重试属于 RPG Maker 翻译策略；Translate Lua 自己决定调用和重试。二者共享同一个 Executor、Client、连接池、全局容量和 RPM/burst。
 
 ## 2. 请求
 
@@ -40,7 +40,7 @@ HTTP 200 后只严格要求实际消费的核心：
 
 因此 `provider_request_id` 与 `provider_response_id` 都是可选值，互不补位；审计写 `null`，Lua 返回 `nil`。`final_response_usage` 只表示最终成功 HTTP 响应可用的 usage，不声称覆盖失败尝试或完整计费。
 
-这里的宽松只针对第三方供应商 HTTP 信封。`message.content` 内由模型生成的 MZ 翻译正文仍执行完整顶层数组、强类型元素、ID、ATT token、语言和逐 ID 内容验收，二者不得混为一层。
+这里的宽松只针对第三方供应商 HTTP 信封。`message.content` 内由模型生成的 RPG Maker 翻译正文仍执行完整顶层数组、强类型元素、ID、ATT token、语言和逐 ID 内容验收，二者不得混为一层。
 
 ## 4. 失败分类
 

@@ -6,80 +6,110 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::application::config::{
-    ConfiguredExtractCommand, ConfiguredInitCommand, ConfiguredMzCommand,
+    ConfiguredExtractCommand, ConfiguredInitCommand, ConfiguredRpgMakerCommand,
     ConfiguredTranslateCommand, ConfiguredWriteBackCommand, TranslateConfiguration,
 };
-use crate::att_mz::audit::{
+use crate::execution::{CooperativeCancellation, OperationCompletion};
+use crate::rpg_maker::RpgMakerLayout;
+use crate::rpg_maker::SelectedLua;
+use crate::rpg_maker::audit::{
     AuditContext, AuditEvent, AuditFailureCategory, AuditLedger, AuditRunOutcome,
     JsonLinesAuditLedger, JsonLinesAuditRun,
 };
-use crate::att_mz::extract::builtin::BuiltInExtractionService;
-use crate::att_mz::extract::document::MzProjectDocumentReadingService;
-use crate::att_mz::extract::lua::LuaExtractionService;
-use crate::att_mz::extract::rules::RulesExtractionService;
-use crate::att_mz::extract::service::ExtractService;
-use crate::att_mz::extract::service::ExtractServiceError;
-use crate::att_mz::extract::store::asset_store::MzExtractionAssetStore;
-use crate::att_mz::extract::{ExtractInput, ExtractOutput, SelectedRules};
-use crate::att_mz::init::{
+use crate::rpg_maker::dialogue::{
+    MvDialogueDefinition, MvDialogueDefinitionError, MvDialogueProjector,
+};
+use crate::rpg_maker::extract::builtin::{BuiltInExtractionService, MvDialogueDefinitionSelection};
+use crate::rpg_maker::extract::document::RpgMakerProjectDocumentReadingService;
+use crate::rpg_maker::extract::lua::LuaExtractionService;
+use crate::rpg_maker::extract::rules::RulesExtractionService;
+use crate::rpg_maker::extract::service::ExtractService;
+use crate::rpg_maker::extract::service::ExtractServiceError;
+use crate::rpg_maker::extract::store::asset_store::RpgMakerExtractionAssetStore;
+use crate::rpg_maker::extract::{ExtractInput, ExtractOutput, SelectedRules};
+use crate::rpg_maker::init::{
     InitInput, InitOutcome, InitOutput, InitService, InitServiceError, InitStaleOwner,
     ProjectWorkspaceConvergenceFailureImpact, ProjectWorkspaceConvergenceService,
 };
-use crate::att_mz::lua::hosting::TrustedLuaExecutionHostingService;
-use crate::att_mz::project::ExistingProjectOpeningService;
-use crate::att_mz::project_database::{
+use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingService;
+use crate::rpg_maker::lua::lua54::TrustedLua54Runtime;
+use crate::rpg_maker::project::ExistingProjectOpeningService;
+use crate::rpg_maker::project_database::{
     ProjectDatabaseCreationService, ProjectDatabaseRecordReadingService,
     ProjectDatabaseStateReconciliationService,
 };
-use crate::att_mz::project_lease::ProjectCommandLeaseService;
-use crate::att_mz::translate::TranslateInput;
-use crate::att_mz::translate::TranslateOutput;
-use crate::att_mz::translate::asset_reader::MzStandardTranslationAssetReadingService;
-use crate::att_mz::translate::executor::{
-    MzStandardTranslationTaskExecutionService, TranslationTaskResponseProcessingService,
+use crate::rpg_maker::project_lease::ProjectCommandLeaseService;
+use crate::rpg_maker::translate::TranslateInput;
+use crate::rpg_maker::translate::TranslateOutput;
+use crate::rpg_maker::translate::asset_reader::RpgMakerStandardTranslationAssetReadingService;
+use crate::rpg_maker::translate::executor::{
+    AsyncDelay, RpgMakerStandardTranslationTaskExecutionService,
+    TranslationTaskResponseProcessingService,
 };
-use crate::att_mz::translate::lua::LuaTranslationService;
-use crate::att_mz::translate::placeholder::Pcre2PlaceholderService;
-use crate::att_mz::translate::planner::MzStandardTranslationTaskPlanningService;
-use crate::att_mz::translate::planning_resource::JsonTranslationPlanningResourceReadingService;
-use crate::att_mz::translate::profile::{
-    MzSystemPrompt, MzTranslationPlanningConfiguration, MzTranslationProfile,
-    ResolvedMzTranslationResources,
+use crate::rpg_maker::translate::lua::LuaTranslationService;
+use crate::rpg_maker::translate::placeholder::Pcre2PlaceholderService;
+use crate::rpg_maker::translate::planner::RpgMakerStandardTranslationTaskPlanningService;
+use crate::rpg_maker::translate::planning_resource::TranslationPlanningResourceReadingService;
+use crate::rpg_maker::translate::profile::{
+    ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
+    RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
 };
-use crate::att_mz::translate::result_store::MzStandardTranslationResultStorageService;
-use crate::att_mz::translate::service::{
+use crate::rpg_maker::translate::result_store::RpgMakerStandardTranslationResultStorageService;
+use crate::rpg_maker::translate::service::{
     SelectedTranslationExecution, SelectedTranslationExecutionBuilder, TranslateService,
     TranslateServiceError,
 };
-use crate::att_mz::translate::standard::{
+use crate::rpg_maker::translate::standard::{
     StandardTranslationFailureImpact, StandardTranslationService,
 };
-use crate::att_mz::write_back::asset_reader::MzStandardWriteBackAssetReadingService;
-use crate::att_mz::write_back::lua::LuaWriteBackService;
-use crate::att_mz::write_back::publisher::StandardWriteBackPublishingService;
-use crate::att_mz::write_back::rewriter::MzWriteBackDocumentRewritingService;
-use crate::att_mz::write_back::standard::{
-    ConservativeMzWriteBackTextLayouter, StandardWriteBackService,
+use crate::rpg_maker::write_back::asset_reader::RpgMakerStandardWriteBackAssetReadingService;
+use crate::rpg_maker::write_back::lua::LuaWriteBackService;
+use crate::rpg_maker::write_back::publisher::StandardWriteBackPublishingService;
+use crate::rpg_maker::write_back::rewriter::RpgMakerWriteBackDocumentRewritingService;
+use crate::rpg_maker::write_back::standard::{
+    ConservativeRpgMakerWriteBackTextLayouter, StandardWriteBackService,
 };
-use crate::att_mz::write_back::{
+use crate::rpg_maker::write_back::{
     WriteBackFailureImpact, WriteBackInput, WriteBackOutput, WriteBackService,
     WriteBackServiceError,
 };
-use crate::att_mz::{ENGINE_DIRECTORY_NAME, SelectedLua};
-use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::runtime::cpu::BoundedCpuExecutor;
-use crate::runtime::delay::TokioAsyncDelay;
-use crate::runtime::filesystem::SystemFileSystem;
+use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemError};
 use crate::runtime::json_lines::{JsonLinesEventLogFinalizer, JsonLinesStreamConfig};
 use crate::runtime::llm::{OpenAiChatCompletionClient, OpenAiChatCompletionExecutor};
-use crate::runtime::lua::TrustedLua54Runtime;
 use crate::runtime::run_id::generate_run_id;
 use crate::runtime::sqlite::RusqliteStorage;
-use crate::storage::file_system::FileReader;
+use crate::storage::file_system::{FileReader, ReadFileError};
 
 type BoxedError = Box<dyn Error + Send + Sync + 'static>;
+const RPG_MAKER_PROMPT_DIRECTORY_NAME: &str = "rpg_maker";
+const MAX_MV_DIALOGUE_DEFINITION_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TokioAsyncDelay;
+
+impl AsyncDelay for TokioAsyncDelay {
+    async fn wait(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
+#[cfg(test)]
+mod async_delay_tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn waits_for_requested_duration() {
+        let started = Instant::now();
+        TokioAsyncDelay.wait(Duration::from_millis(5)).await;
+        assert!(started.elapsed() >= Duration::from_millis(5));
+    }
+}
 
 #[derive(Clone)]
 struct ProductionLuaSelection {
@@ -87,28 +117,33 @@ struct ProductionLuaSelection {
     runtime: TrustedLua54Runtime,
 }
 
-/// 一个 MZ 命令成功完成后的类型化结果。
-pub(crate) enum MzCommandOutput {
+/// 一个 RPG Maker 命令成功完成后的类型化结果。
+pub(crate) enum RpgMakerCommandOutput {
     Init(InitOutput),
     Extract(ExtractOutput),
     Translate(TranslateOutput),
     WriteBack(WriteBackOutput),
 }
 
-/// 按本次命令只构造实际需要的生产纵向切片。
-pub(crate) struct ProductionMzCommandRunner;
+/// 按本次命令只构造实际需要的 RPG Maker 生产纵向切片。
+pub(crate) struct ProductionRpgMakerCommandRunner {
+    layout: RpgMakerLayout,
+}
 
-impl ProductionMzCommandRunner {
-    pub(crate) const fn new() -> Self {
-        Self
+impl ProductionRpgMakerCommandRunner {
+    pub(crate) const fn new(layout: RpgMakerLayout) -> Self {
+        Self { layout }
     }
 
-    pub(crate) async fn run(self, command: ConfiguredMzCommand) -> ProductionCommandRunReport {
+    pub(crate) async fn run(
+        self,
+        command: ConfiguredRpgMakerCommand,
+    ) -> ProductionCommandRunReport {
         match command {
-            ConfiguredMzCommand::Init(command) => self.run_init(command).await,
-            ConfiguredMzCommand::Extract(command) => self.run_extract(command).await,
-            ConfiguredMzCommand::Translate(command) => self.run_translate(*command).await,
-            ConfiguredMzCommand::WriteBack(command) => self.run_write_back(command).await,
+            ConfiguredRpgMakerCommand::Init(command) => self.run_init(command).await,
+            ConfiguredRpgMakerCommand::Extract(command) => self.run_extract(command).await,
+            ConfiguredRpgMakerCommand::Translate(command) => self.run_translate(*command).await,
+            ConfiguredRpgMakerCommand::WriteBack(command) => self.run_write_back(command).await,
         }
     }
 
@@ -124,7 +159,11 @@ impl ProductionMzCommandRunner {
         let audit = match start_audit(
             command.common().audit_root().to_path_buf(),
             command.common().audit(),
-            AuditContext::init(run_id, command.arguments.project.name.as_str()),
+            AuditContext::init(
+                run_id,
+                self.layout.engine(),
+                command.arguments.project.name.as_str(),
+            ),
         )
         .await
         {
@@ -160,6 +199,7 @@ impl ProductionMzCommandRunner {
             ProjectDatabaseStateReconciliationService::new(sqlite.clone(), sqlite.clone());
         let workspace = ProjectWorkspaceConvergenceService::new(
             projects_root.clone(),
+            self.layout,
             database,
             sqlite.clone(),
             database_reconciler,
@@ -167,7 +207,11 @@ impl ProductionMzCommandRunner {
             directory_publisher,
             cancellation.clone(),
         );
-        let project_lease = ProjectCommandLeaseService::new(projects_root, file_system.clone());
+        let project_lease = ProjectCommandLeaseService::new(
+            projects_root,
+            self.layout.engine(),
+            file_system.clone(),
+        );
         let service = InitService::new(workspace, project_lease, cancellation.clone());
         let arguments = &command.arguments;
         let input = InitInput {
@@ -197,7 +241,7 @@ impl ProductionMzCommandRunner {
         finish_audit(audit, audit_outcome, &mut shutdown).await;
         ProductionCommandRunReport::from_completion(
             execution.map(|result| {
-                result.map(|completion| map_completion(completion, MzCommandOutput::Init))
+                result.map(|completion| map_completion(completion, RpgMakerCommandOutput::Init))
             }),
             shutdown,
         )
@@ -215,7 +259,11 @@ impl ProductionMzCommandRunner {
         let audit = match start_audit(
             command.common().audit_root().to_path_buf(),
             command.common().audit(),
-            AuditContext::extract(run_id, command.project_name().as_str()),
+            AuditContext::extract(
+                run_id,
+                self.layout.engine(),
+                command.project_name().as_str(),
+            ),
         )
         .await
         {
@@ -245,6 +293,36 @@ impl ProductionMzCommandRunner {
                 return audited_construction_failure(audit, error, shutdown).await;
             }
         };
+        let mv_dialogue_selection = if self.layout == RpgMakerLayout::MV
+            && command.rpg_maker().builtin().is_some()
+        {
+            match command.dialogue_rules_path() {
+                Some(path) => match load_mv_dialogue_definition(&file_system, path).await {
+                    Ok((definition, projector)) => Some(MvDialogueDefinitionSelection::Replace {
+                        projector,
+                        definition,
+                    }),
+                    Err(source) => {
+                        let mut shutdown = ShutdownFailures::default();
+                        if let Err(error) = sqlite.shutdown().await {
+                            shutdown.push("SQLite", error);
+                        }
+                        if let Err(error) = file_system.shutdown().await {
+                            shutdown.push("FileSystem", error);
+                        }
+                        return audited_construction_failure(
+                            audit,
+                            ProductionCommandError::ConfigurationOrInput(Box::new(source)),
+                            shutdown,
+                        )
+                        .await;
+                    }
+                },
+                None => Some(MvDialogueDefinitionSelection::ReuseProjectDefinition),
+            }
+        } else {
+            None
+        };
         let cpu = match BoundedCpuExecutor::start(command.cpu())
             .map_err(ProductionCommandError::construct)
         {
@@ -268,33 +346,47 @@ impl ProductionMzCommandRunner {
             ),
         });
 
-        let project_reader =
-            ProjectDatabaseRecordReadingService::new(projects_root.clone(), sqlite.clone());
+        let project_reader = ProjectDatabaseRecordReadingService::new(
+            projects_root.clone(),
+            self.layout,
+            sqlite.clone(),
+        );
         let opener = ExistingProjectOpeningService::new(
             project_reader,
             file_system.clone(),
             file_system.clone(),
         );
-        let document_config = command.mz().document();
-        let store_config = command.mz().extract_store();
-        let builtin = command.mz().builtin().map(|configuration| {
-            let reader = MzProjectDocumentReadingService::new(
+        let document_config = command.rpg_maker().document();
+        let store_config = command.rpg_maker().extract_store();
+        let builtin = command.rpg_maker().builtin().map(|configuration| {
+            let reader = RpgMakerProjectDocumentReadingService::new(
                 file_system.clone(),
                 file_system.clone(),
                 cpu.clone(),
                 document_config,
             );
-            let store = MzExtractionAssetStore::new(sqlite.clone(), cpu.clone(), store_config);
-            BuiltInExtractionService::new(reader, store, cpu.clone(), configuration)
+            let store =
+                RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone(), store_config);
+            match mv_dialogue_selection {
+                Some(selection) => BuiltInExtractionService::for_mv(
+                    reader,
+                    store,
+                    cpu.clone(),
+                    configuration,
+                    selection,
+                ),
+                None => BuiltInExtractionService::new(reader, store, cpu.clone(), configuration),
+            }
         });
-        let selected_rules = command.mz().rules().map(|selected| {
-            let reader = MzProjectDocumentReadingService::new(
+        let selected_rules = command.rpg_maker().rules().map(|selected| {
+            let reader = RpgMakerProjectDocumentReadingService::new(
                 file_system.clone(),
                 file_system.clone(),
                 cpu.clone(),
                 document_config,
             );
-            let store = MzExtractionAssetStore::new(sqlite.clone(), cpu.clone(), store_config);
+            let store =
+                RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone(), store_config);
             SelectedRules::new(
                 selected.rules_path().to_path_buf(),
                 RulesExtractionService::new(
@@ -310,13 +402,17 @@ impl ProductionMzCommandRunner {
                 let host = TrustedLuaExecutionHostingService::<_, OpenAiChatCompletionExecutor, _, _>::without_llm(
                     file_system.clone(), selected.runtime.clone(), sqlite.clone(),
                 );
-                let store = MzExtractionAssetStore::new(sqlite.clone(), cpu.clone(), store_config);
+                let store = RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone(), store_config);
                 SelectedLua::new(
                     selected.script_path.clone(),
                     LuaExtractionService::new(host, store),
                 )
         });
-        let project_lease = ProjectCommandLeaseService::new(projects_root, file_system.clone());
+        let project_lease = ProjectCommandLeaseService::new(
+            projects_root,
+            self.layout.engine(),
+            file_system.clone(),
+        );
         let service = ExtractService::new(
             opener,
             builtin,
@@ -350,7 +446,7 @@ impl ProductionMzCommandRunner {
         finish_audit(audit, audit_outcome, &mut shutdown).await;
         ProductionCommandRunReport::from_completion(
             execution.map(|result| {
-                result.map(|completion| map_completion(completion, MzCommandOutput::Extract))
+                result.map(|completion| map_completion(completion, RpgMakerCommandOutput::Extract))
             }),
             shutdown,
         )
@@ -373,8 +469,9 @@ impl ProductionMzCommandRunner {
             command.common().audit(),
             AuditContext::translate(
                 run_id,
+                self.layout.engine(),
                 command.project_name().as_str(),
-                command.mz().profile().id(),
+                command.rpg_maker().profile().id(),
             ),
         )
         .await
@@ -454,15 +551,18 @@ impl ProductionMzCommandRunner {
                 tokio::runtime::Handle::current(),
             ),
         });
-        let project_reader =
-            ProjectDatabaseRecordReadingService::new(projects_root.clone(), sqlite.clone());
+        let project_reader = ProjectDatabaseRecordReadingService::new(
+            projects_root.clone(),
+            self.layout,
+            sqlite.clone(),
+        );
         let opener = ExistingProjectOpeningService::new(
             project_reader,
             file_system.clone(),
             file_system.clone(),
         );
         let builder = ProductionSelectedTranslationExecutionBuilder {
-            configuration: command.mz(),
+            configuration: command.rpg_maker(),
             file_system: file_system.clone(),
             cpu: cpu.clone(),
             sqlite: sqlite.clone(),
@@ -471,7 +571,11 @@ impl ProductionMzCommandRunner {
             audit: audit.run.clone(),
             cancellation: cancellation.clone(),
         };
-        let project_lease = ProjectCommandLeaseService::new(projects_root, file_system.clone());
+        let project_lease = ProjectCommandLeaseService::new(
+            projects_root,
+            self.layout.engine(),
+            file_system.clone(),
+        );
         let service = TranslateService::new(opener, builder, project_lease, cancellation.clone());
         let input = TranslateInput {
             name: command.project_name().clone(),
@@ -509,7 +613,8 @@ impl ProductionMzCommandRunner {
         finish_audit(audit, audit_outcome, &mut shutdown).await;
         ProductionCommandRunReport::from_completion(
             execution.map(|result| {
-                result.map(|completion| map_completion(completion, MzCommandOutput::Translate))
+                result
+                    .map(|completion| map_completion(completion, RpgMakerCommandOutput::Translate))
             }),
             shutdown,
         )
@@ -530,7 +635,11 @@ impl ProductionMzCommandRunner {
         let audit = match start_audit(
             command.common().audit_root().to_path_buf(),
             command.common().audit(),
-            AuditContext::write_back(run_id, command.project_name().as_str()),
+            AuditContext::write_back(
+                run_id,
+                self.layout.engine(),
+                command.project_name().as_str(),
+            ),
         )
         .await
         {
@@ -583,28 +692,31 @@ impl ProductionMzCommandRunner {
             ),
         });
         let directory_publisher = file_system.directory_publisher(command.publisher().clone());
-        let project_reader =
-            ProjectDatabaseRecordReadingService::new(projects_root.clone(), sqlite.clone());
+        let project_reader = ProjectDatabaseRecordReadingService::new(
+            projects_root.clone(),
+            self.layout,
+            sqlite.clone(),
+        );
         let opener = ExistingProjectOpeningService::new(
             project_reader,
             file_system.clone(),
             file_system.clone(),
         );
-        let asset_reader = MzStandardWriteBackAssetReadingService::new(
+        let asset_reader = RpgMakerStandardWriteBackAssetReadingService::new(
             sqlite.clone(),
             cpu.clone(),
-            command.mz().standard_asset(),
+            command.rpg_maker().standard_asset(),
         );
-        let document_reader = MzProjectDocumentReadingService::new(
+        let document_reader = RpgMakerProjectDocumentReadingService::new(
             file_system.clone(),
             file_system.clone(),
             cpu.clone(),
-            command.mz().document(),
+            command.rpg_maker().document(),
         );
-        let rewriter = MzWriteBackDocumentRewritingService::new(document_reader, cpu.clone());
+        let rewriter = RpgMakerWriteBackDocumentRewritingService::new(document_reader, cpu.clone());
         let standard = StandardWriteBackService::new(
             asset_reader,
-            ConservativeMzWriteBackTextLayouter,
+            ConservativeRpgMakerWriteBackTextLayouter,
             rewriter,
             cancellation.clone(),
         );
@@ -618,7 +730,11 @@ impl ProductionMzCommandRunner {
                     LuaWriteBackService::new(host, directory_publisher),
                 )
         });
-        let project_lease = ProjectCommandLeaseService::new(projects_root, file_system.clone());
+        let project_lease = ProjectCommandLeaseService::new(
+            projects_root,
+            self.layout.engine(),
+            file_system.clone(),
+        );
         let service = WriteBackService::new(
             opener,
             standard,
@@ -653,10 +769,115 @@ impl ProductionMzCommandRunner {
         finish_audit(audit, audit_outcome, &mut shutdown).await;
         ProductionCommandRunReport::from_completion(
             execution.map(|result| {
-                result.map(|completion| map_completion(completion, MzCommandOutput::WriteBack))
+                result
+                    .map(|completion| map_completion(completion, RpgMakerCommandOutput::WriteBack))
             }),
             shutdown,
         )
+    }
+}
+
+async fn load_mv_dialogue_definition(
+    file_system: &SystemFileSystem,
+    path: &Path,
+) -> Result<(MvDialogueDefinition, MvDialogueProjector), MvDialogueDefinitionInputError> {
+    let requested_path = path.to_path_buf();
+    let file = file_system
+        .read_file(requested_path.clone())
+        .await
+        .map_err(|source| MvDialogueDefinitionInputError::Read {
+            path: requested_path.clone(),
+            source,
+        })?;
+    let bytes = file.into_bytes();
+    if bytes.len() > MAX_MV_DIALOGUE_DEFINITION_BYTES {
+        return Err(MvDialogueDefinitionInputError::TooLarge {
+            path: requested_path,
+            actual: bytes.len(),
+            maximum: MAX_MV_DIALOGUE_DEFINITION_BYTES,
+        });
+    }
+    let source = std::str::from_utf8(&bytes).map_err(|source| {
+        MvDialogueDefinitionInputError::InvalidUtf8 {
+            path: requested_path.clone(),
+            source,
+        }
+    })?;
+    let definition = MvDialogueDefinition::parse_toml(source).map_err(|source| {
+        MvDialogueDefinitionInputError::InvalidDefinition {
+            path: requested_path.clone(),
+            source,
+        }
+    })?;
+    let projector = definition.compile().map_err(|source| {
+        MvDialogueDefinitionInputError::InvalidDefinition {
+            path: requested_path,
+            source,
+        }
+    })?;
+    Ok((definition, projector))
+}
+
+#[derive(Debug)]
+enum MvDialogueDefinitionInputError {
+    Read {
+        path: PathBuf,
+        source: ReadFileError<SystemFileSystemError>,
+    },
+    TooLarge {
+        path: PathBuf,
+        actual: usize,
+        maximum: usize,
+    },
+    InvalidUtf8 {
+        path: PathBuf,
+        source: std::str::Utf8Error,
+    },
+    InvalidDefinition {
+        path: PathBuf,
+        source: MvDialogueDefinitionError,
+    },
+}
+
+impl fmt::Display for MvDialogueDefinitionInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, source } => {
+                write!(
+                    formatter,
+                    "无法读取 MV 对话定义 {}：{source}",
+                    path.display()
+                )
+            }
+            Self::TooLarge {
+                path,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "MV 对话定义 {} 过大：实际 {actual} 字节，上限 {maximum} 字节",
+                path.display(),
+            ),
+            Self::InvalidUtf8 { path, source } => write!(
+                formatter,
+                "MV 对话定义 {} 不是有效 UTF-8：{source}",
+                path.display(),
+            ),
+            Self::InvalidDefinition { path, source } => {
+                write!(formatter, "MV 对话定义 {} 无效：{source}", path.display(),)
+            }
+        }
+    }
+}
+
+impl Error for MvDialogueDefinitionInputError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::InvalidUtf8 { source, .. } => Some(source),
+            Self::InvalidDefinition { source, .. } => Some(source),
+            Self::TooLarge { .. } => None,
+        }
     }
 }
 
@@ -715,22 +936,22 @@ async fn audited_construction_failure(
     ProductionCommandRunReport::construction_failed_with_shutdown(error, shutdown)
 }
 
-type ProductionTranslationProfile = Arc<MzTranslationProfile<OpenAiChatCompletionClient>>;
+type ProductionTranslationProfile = Arc<RpgMakerTranslationProfile<OpenAiChatCompletionClient>>;
 type ProductionTranslationAssetReader =
-    MzStandardTranslationAssetReadingService<RusqliteStorage, BoundedCpuExecutor>;
-type ProductionTranslationPlanner = MzStandardTranslationTaskPlanningService<
-    JsonTranslationPlanningResourceReadingService<SystemFileSystem, BoundedCpuExecutor>,
+    RpgMakerStandardTranslationAssetReadingService<RusqliteStorage, BoundedCpuExecutor>;
+type ProductionTranslationPlanner = RpgMakerStandardTranslationTaskPlanningService<
+    TranslationPlanningResourceReadingService<SystemFileSystem, BoundedCpuExecutor>,
     BoundedCpuExecutor,
     OpenAiChatCompletionClient,
 >;
-type ProductionTranslationExecutor = MzStandardTranslationTaskExecutionService<
+type ProductionTranslationExecutor = RpgMakerStandardTranslationTaskExecutionService<
     OpenAiChatCompletionExecutor,
     TokioAsyncDelay,
     TranslationTaskResponseProcessingService<BoundedCpuExecutor>,
     ProductionTranslationProfile,
 >;
 type ProductionTranslationStore =
-    MzStandardTranslationResultStorageService<RusqliteStorage, BoundedCpuExecutor>;
+    RpgMakerStandardTranslationResultStorageService<RusqliteStorage, BoundedCpuExecutor>;
 type ProductionStandardTranslation = StandardTranslationService<
     ProductionTranslationAssetReader,
     ProductionTranslationPlanner,
@@ -765,7 +986,7 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
 
     async fn build(
         &self,
-        project: &crate::att_mz::project::OpenedProject,
+        project: &crate::rpg_maker::project::OpenedProject,
     ) -> Result<SelectedTranslationExecution<Self::Client, Self::Standard, Self::Lua>, Self::Error>
     {
         let profile_configuration = self.configuration.profile();
@@ -773,7 +994,7 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
         let path = self
             .configuration
             .prompt_root()
-            .join(ENGINE_DIRECTORY_NAME)
+            .join(RPG_MAKER_PROMPT_DIRECTORY_NAME)
             .join(format!(
                 "{}--{}.md",
                 language_pair.source(),
@@ -816,7 +1037,7 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             )
         })?;
         let system_prompt =
-            MzSystemPrompt::new(language_pair.clone(), markdown).map_err(|source| {
+            RpgMakerSystemPrompt::new(language_pair.clone(), markdown).map_err(|source| {
                 ProductionTranslationExecutionBuildError::prompt(
                     &language_pair,
                     &path,
@@ -831,15 +1052,15 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             .map_err(|source| {
                 ProductionTranslationExecutionBuildError::language_module(&language_pair, source)
             })?;
-        let translation_resources = Arc::new(ResolvedMzTranslationResources::new(
+        let translation_resources = Arc::new(ResolvedRpgMakerTranslationResources::new(
             system_prompt,
             source_language,
         ));
-        let planning = MzTranslationPlanningConfiguration::new(
+        let planning = RpgMakerTranslationPlanningConfiguration::new(
             profile_configuration.planning().scope_concurrency(),
             profile_configuration.planning().max_message_characters(),
         );
-        let profile = Arc::new(MzTranslationProfile::new(
+        let profile = Arc::new(RpgMakerTranslationProfile::new(
             profile_configuration.id(),
             profile_configuration.max_in_flight_tasks(),
             planning,
@@ -848,31 +1069,34 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
         ));
         let placeholders = Pcre2PlaceholderService::new()
             .map_err(ProductionTranslationExecutionBuildError::internal)?;
-        let asset_reader = MzStandardTranslationAssetReadingService::new(
+        let asset_reader = RpgMakerStandardTranslationAssetReadingService::new(
             self.sqlite.clone(),
             self.cpu.clone(),
             self.configuration.standard_asset(),
         );
-        let resources = JsonTranslationPlanningResourceReadingService::new(
+        let resources = TranslationPlanningResourceReadingService::new(
             self.file_system.clone(),
             self.cpu.clone(),
         );
-        let planner =
-            MzStandardTranslationTaskPlanningService::<_, _, OpenAiChatCompletionClient>::new(
-                resources,
-                Arc::clone(&translation_resources),
-                placeholders,
-                self.cpu.clone(),
-            );
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<
+            _,
+            _,
+            OpenAiChatCompletionClient,
+        >::new(
+            resources,
+            Arc::clone(&translation_resources),
+            placeholders,
+            self.cpu.clone(),
+        );
         let processor =
             TranslationTaskResponseProcessingService::new(self.cpu.clone(), translation_resources);
-        let executor = MzStandardTranslationTaskExecutionService::<
+        let executor = RpgMakerStandardTranslationTaskExecutionService::<
             _,
             _,
             _,
             ProductionTranslationProfile,
         >::new(self.llm.clone(), TokioAsyncDelay, processor);
-        let result_store = MzStandardTranslationResultStorageService::new(
+        let result_store = RpgMakerStandardTranslationResultStorageService::new(
             self.sqlite.clone(),
             self.cpu.clone(),
             self.configuration.translate_store(),
@@ -923,7 +1147,7 @@ impl ProductionTranslationExecutionBuildError {
         Self {
             impact: TranslationExecutionBuildFailureImpact::ConfigurationOrInput,
             safe_detail: format!(
-                "MZ Prompt {} -> {}（{}）：{reason}",
+                "RPG Maker Prompt {} -> {}（{}）：{reason}",
                 language_pair.source(),
                 language_pair.target(),
                 path.display()
@@ -939,7 +1163,7 @@ impl ProductionTranslationExecutionBuildError {
         Self {
             impact: TranslationExecutionBuildFailureImpact::ConfigurationOrInput,
             safe_detail: format!(
-                "MZ 翻译语言对 {} -> {}：缺少源语言模块",
+                "RPG Maker 翻译语言对 {} -> {}：缺少源语言模块",
                 language_pair.source(),
                 language_pair.target()
             ),
@@ -1082,7 +1306,7 @@ pub(crate) struct ProductionCommandRunReport {
 }
 
 pub(crate) enum CommandRunResult {
-    Succeeded(MzCommandOutput),
+    Succeeded(RpgMakerCommandOutput),
     Interrupted,
     Failed(ProductionCommandError),
 }
@@ -1107,7 +1331,7 @@ impl ProductionCommandRunReport {
 
     fn from_completion(
         execution: DrivenCommand<
-            Result<OperationCompletion<MzCommandOutput>, ProductionCommandError>,
+            Result<OperationCompletion<RpgMakerCommandOutput>, ProductionCommandError>,
         >,
         shutdown: ShutdownFailures,
     ) -> Self {
@@ -1494,11 +1718,11 @@ pub(crate) struct CommandResultRenderer;
 
 impl CommandResultRenderer {
     pub(crate) fn render_success(
-        output: MzCommandOutput,
+        output: RpgMakerCommandOutput,
         stdout: &mut dyn Write,
     ) -> io::Result<()> {
         match output {
-            MzCommandOutput::Init(output) => {
+            RpgMakerCommandOutput::Init(output) => {
                 writeln!(stdout, "初始化完成：{}", output.name)?;
                 match output.outcome {
                     InitOutcome::Created => writeln!(stdout, "项目状态：已创建"),
@@ -1521,8 +1745,10 @@ impl CommandResultRenderer {
                     }
                 }
             }
-            MzCommandOutput::Extract(output) => writeln!(stdout, "提取完成：{}", output.name),
-            MzCommandOutput::Translate(output) => {
+            RpgMakerCommandOutput::Extract(output) => {
+                writeln!(stdout, "提取完成：{}", output.name)
+            }
+            RpgMakerCommandOutput::Translate(output) => {
                 writeln!(
                     stdout,
                     "翻译执行完成：{}（Profile：{}）",
@@ -1551,7 +1777,7 @@ impl CommandResultRenderer {
                 }
                 Ok(())
             }
-            MzCommandOutput::WriteBack(output) => {
+            RpgMakerCommandOutput::WriteBack(output) => {
                 writeln!(stdout, "写回完成：{}", output.name)?;
                 writeln!(stdout, "输出目录：{}", output.output_root.display())?;
                 writeln!(
@@ -1621,7 +1847,7 @@ mod command_error_rendering_tests {
     #[test]
     fn configuration_or_input_failure_renders_its_safe_detail() {
         let error = ProductionCommandError::ConfigurationOrInput(Box::new(TestError(
-            "MZ system prompt 文件 prompts/mz/ja--zh-Hans.md 不存在",
+            "RPG Maker system prompt 文件 prompts/rpg_maker/ja--zh-Hans.md 不存在",
         )));
         let mut stderr = Vec::new();
 
@@ -1630,7 +1856,7 @@ mod command_error_rendering_tests {
 
         assert_eq!(
             String::from_utf8(stderr).expect("诊断应为 UTF-8"),
-            "配置或输入错误：MZ system prompt 文件 prompts/mz/ja--zh-Hans.md 不存在\n"
+            "配置或输入错误：RPG Maker system prompt 文件 prompts/rpg_maker/ja--zh-Hans.md 不存在\n"
         );
     }
 

@@ -1,14 +1,39 @@
-# ATT 生产运行时与 CLI 规格
+# ATT 生产运行时与 CLI 现行规格
 
-## 1. 唯一入口
+## 1. 统一入口与独立命令域
 
 ```text
-att --config FILE mz <init|extract|translate|write-back>
+att --config FILE mz init|extract|translate|write-back ...
+att --config FILE mv init|extract|translate|write-back ...
 ```
 
-四个命令是唯一用户入口，也是状态收敛入口；不增加维护、重试或恢复命令。普通命令
-缺少 `--config FILE` 是 Clap 参数错误；Help/Version 不需要也不读取配置。不存在默认
-配置路径。当前生产目标只支持 `x86_64-pc-windows-msvc`。
+MZ 与 MV 是独立命令域，但都路由到同一 RPG Maker 纵向实现。引擎切片只建立引擎身份、
+项目/游戏布局和 MV 姓名投影输入；共享业务代码不通过引擎分支复制两套流程。
+
+普通命令缺少 `--config FILE` 是 CLI 解析错误；Help/Version 不需要配置。不存在默认配置
+路径。当前生产目标是 `x86_64-pc-windows-msvc`。
+
+命令参数如下：
+
+```text
+att mz|mv init --name NAME --path GAME_ROOT ...
+
+att mz extract --name NAME
+  (--builtin | --rules RULES_TOML | --lua SCRIPT_LUA)+
+
+att mv extract --name NAME
+  (--builtin | --rules RULES_TOML | --lua SCRIPT_LUA)+
+  [--dialogue-rules DIALOGUE_TOML]
+
+att mz|mv translate --name NAME PROFILE_ID
+  [--terms TERMS_TOML]
+  [--placeholders PLACEHOLDERS_TOML]
+  [--lua SCRIPT_LUA]
+
+att mz|mv write-back --name NAME [--lua SCRIPT_LUA]
+```
+
+`--dialogue-rules` 只属于 MV 且要求同时选择 `--builtin`。成功文案不额外添加引擎前缀。
 
 ## 2. 启动与配置选择
 
@@ -17,108 +42,85 @@ att --config FILE mz <init|extract|translate|write-back>
   ↓
 读取一次受限 TOML，检查完整语法和未知顶层分区
   ↓
-仅解析当前命令实际选择的分区并建立受信类型
+只解析当前命令需要的配置并建立受信类型
   ↓
-构造 ConfiguredMzCommand 互斥变体
+构造 ConfiguredRpgMakerCommand(layout, command)
   ↓
-构造 Tokio Runtime 和当前纵向切片
+构造 Tokio Runtime 与当前纵向切片
   ↓
-构造 audit.jsonl，持久化 run_started
+构造 audit.jsonl，持久化带 engine 的 run_started
   ↓
-取得项目租约并执行命令
-  ↓ Translate：打开项目，按 metadata 解析 LanguagePair、语言模块与 MZ Prompt
+取得对应引擎项目租约并执行命令
   ↓
 终结非审计根，持久化 run_finished，终结账本
   ↓
 呈现结果
 ```
 
-已知但未选的配置分区不解析、不验证；未选 Profile 除选择用 ID 外的内容与未选 Client
-的密钥都不物化。Translate 的第一阶段完整建立全局语言目录、Prompt 根、所选
-`MzTranslationProfile` 与 Client；项目
-开启后的第二阶段才使用 metadata 的规范 `LanguagePair` 精确读取
-`<prompts.root>/mz/<source>--<target>.md`，并构造 `ResolvedMzTranslationResources`。
-Standard 与可选 Lua 复用同一个 Client 和已解析翻译语义；Lua 不接收 planning 或
-request 策略。业务输入只携带已经建立的受信执行事实。
+已知但未选的配置分区不解析、不验证；未选 Profile 除选择所需 ID 外的内容与未选 Client
+密钥不物化。Translate 第一阶段建立全局语言目录、Prompt 根、所选 RPG Maker Profile
+与 Client；项目开启后才按 metadata 的规范 `LanguagePair` 读取
+`<prompts.root>/rpg_maker/<source>--<target>.md`。
 
 ## 3. 按命令构造
 
 | 命令 | 当前纵向切片 |
 |---|---|
 | Init | 文件、SQLite 建库/快照、目录发布、审计 |
-| Extract | 文件、SQLite、CPU、所选提取能力、审计；显式 `--lua` 才构造 Lua |
+| Extract | 文件、SQLite、CPU、所选 Builtin/Rules、审计；显式 `--lua` 才构造 Lua |
 | Translate | 文件、SQLite、CPU、Delay、LLM、Standard、审计；显式 `--lua` 才构造 Lua |
 | WriteBack | 文件、SQLite、CPU、目录发布/候选编辑、Standard、审计；显式 `--lua` 才构造 Lua |
 
-三个可选 Lua 命令把脚本路径和执行能力组合成一个 `SelectedLua`；不存在“路径已选但依赖缺失”的内部状态。
+可选 Lua 把脚本和执行能力组合成一个受信选择，不允许“有路径但缺依赖”的内部状态。
 
-## 4. 项目租约
+## 4. 引擎布局与项目租约
 
-四个顶层 MZ 服务在读取项目、打开 SQLite、发送网络请求或建立候选前取得项目租约，并持有到业务终态及相关操作审计确认结束。MZ 的 `ProjectCommandLeaseService` 只选择固定锁目录并提交受信项目 identity，通用文件根负责按 Windows 非大小写敏感语义生成稳定锁文件名：
+MZ 只接受包含 `data/js/rmmz_core.js` 的游戏根；MV 只接受包含
+`www/data`、`www/js` 和 `www/js/rpg_core.js` 的游戏根。不探测另一种布局，不自动修正
+传入的 MV `www`。
+
+项目、项目锁与发布锁分别位于：
 
 ```text
-ProjectName + <projects.root>/.att-locks/projects/mz
-  ↓ 通用文件根规范化不透明 identity 并计算 SHA-256
-<projects.root>/.att-locks/projects/mz/<digest>.lock
+<projects.root>/<engine>/<project-name>
+<projects.root>/.att-locks/projects/<engine>/<digest>.lock
+<projects.root>/.att-locks/directory-publish/<engine>/
 ```
 
-文件系统根只提供通用独占文件租约，不理解 identity 是项目名，也不理解 MZ。项目
-工作区固定为 `<projects.root>/mz/<project-name>`；目录发布锁位于
-`<projects.root>/.att-locks/directory-publish/mz/`，stage、backup 和 journal 仍在目标
-同父目录。MZ 只使用这些精确路径，不搜索其他项目或锁目录。
+`engine` 只能是 `mz | mv`。同一引擎同一项目的四个命令互斥；不同引擎的同名项目独立。
+通用文件根只规范化不透明 identity 并管理锁，不解释项目或引擎业务。
 
-锁序固定为：
+锁顺序固定为：
 
 ```text
 项目租约 → 目录发布锁 → SQLite/session
 ```
 
-同项目四命令互斥，不同项目并行。超时是稳定的“项目正忙”用户结果，不继续副作用。可信 Lua 通过子进程启动同项目命令也不能重入。
-
-不对整个 `projects.root` 做 NTFS 品牌预检。普通读取、Extract 和 Translate 不承担目录发布才需要的限制；各根在实际操作时验证自己需要的独占锁、稳定身份、同卷 rename、追加和刷盘能力。
+超时返回稳定的“项目正忙”结果，不继续副作用。可信 Lua 子进程也不能重入同项目租约。
 
 ## 5. 四命令收敛
 
-- Init 首次创建项目；已有项目逐项继承未显式给出的语言/布局，并在来源与全部事实相同时快速返回 `Unchanged`，不建立候选；
-- Extract 只替换当前选择的 owner，同快照返回 `Unchanged`；
-- Translate 复用持久资源和逐叶 state，全部 Current 时不请求模型、不写译文；
-- WriteBack 每次从冻结来源重建一个候选，Standard 与可选 Lua 修改同一候选，只发布一次。
+- Init 建立或收敛一个项目，来源与全部事实相同时快速返回 `Unchanged`；
+- Extract 只替换选中的 owner；MV Builtin 的对话定义与资产快照原子提交；
+- Translate 复用持久 TOML 资源的 canonical 形式和逐逻辑叶 state，全部 Current 时不请求
+  模型；
+- WriteBack 每次从冻结来源重建候选，Standard 与可选 Lua 修改同一候选，只发布一次。
 
-## 6. 强审计顺序
+## 6. 强审计、取消与退出码
 
-所有命令在取得项目租约前确认 `run_started` 已持久化。Translate 在每个 TaskBlock 请求模型前写任务意图，任务验收和提交确定后写任务终态；WriteBack 在发布前写发布意图，发布取得终态后写发布终态。
+所有业务事件都带 `engine`。所有命令在取得租约前确认 `run_started`；Translate 在请求
+前写任务意图，WriteBack 在发布前写发布意图。副作用已经生效而终态审计失败时报告
+“状态已生效但审计未确认”，不伪装普通失败或自动重做。
 
-意图审计失败意味着对应网络/发布副作用没有开始。副作用已生效而终态审计失败时，命令报告“状态已生效但审计未确认”。其他根 shutdown 完成后才写 `run_finished`，账本最后关闭。只有上述事实全部确认后才输出成功文案。
-
-## 7. 取消与进程结果
-
-合作取消是正常完成分支：
-
-```text
-OperationCompletion<T>
-├─ Completed(T)
-└─ Cancelled
-
-ProductionCommandRunReport
-├─ Succeeded(output)
-├─ Interrupted
-└─ Failed(failure)
-```
-
-进程不通过错误文本、`source.to_string()` 或 downcast 判断 Ctrl-C。第一次 Ctrl-C 后停止派生新阶段；根已经接管的 SQLite、目录发布、审计、CPU 和 HTTP 工作继续到明确终态。候选尚未发布时显式 discard；publish 已开始时等待终态。Lua handle 的取消是合作式的，脚本不交还控制时不伪造成功或超时。
-
-## 8. shutdown 与退出码
-
-只终结当前命令实际构造的实例。完整 Translate 的顺序是：Lua 等待唯一 finalizer、LLM 停止准入并等待活动请求、SQLite 终结唯一会话并排空短操作、FileSystem/CPU 排空、记录 `run_finished`、最后排空并关闭 audit writer。
+第一次 Ctrl-C 后停止派生新阶段；SQLite、发布、审计、CPU 和 HTTP 已接管的工作继续到
+明确终态。候选尚未发布时 discard；publish 已开始时等待终态。
 
 | 退出码 | 含义 |
 |---|---|
 | `0` | Help、Version、命令成功，包括正常 Partial/Unavailable |
-| `2` | Clap 参数错误 |
-| `1` | 配置、技术错误、任一 shutdown/审计失败，或状态已生效但收尾未确认 |
+| `2` | CLI 解析错误 |
+| `1` | 配置、输入或技术错误，shutdown/审计失败，或状态生效但收尾未确认 |
 | `130` | Ctrl-C 后完成受控收尾 |
 
-用户可修复的配置、输入和 Prompt 资源错误呈现稳定中文类别以及安全详情，包括配置
-路径、可用的一基行列、字段或资源路径和原因；不得包含配置原文、密钥、Client
-parameters 或 Prompt 内容。内部技术故障仍只呈现稳定类别，不暴露根类型名、内部状态
-枚举、检查 ID 或底层错误文本；完整技术原因链只供内部诊断。
+用户可修复错误只呈现安全的路径、行列、字段和原因，不包含配置原文、API key、Client
+parameters、Prompt 内容、完整模型消息或内部错误链。

@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
-use crate::att_mz::{MaxFullwidthChars, ProjectName};
 use crate::language::LanguageId;
+use crate::rpg_maker::{MaxFullwidthChars, ProjectName};
 
 /// 已确认显式配置路径的 ATT 进程参数。
 #[derive(Debug)]
@@ -66,14 +66,12 @@ pub(crate) enum ProductCommand {
         #[command(subcommand)]
         command: MzCommand,
     },
-}
-
-impl ProductCommand {
-    pub(crate) fn into_mz(self) -> MzCommand {
-        match self {
-            Self::Mz { command } => command,
-        }
-    }
+    /// RPG Maker MV 游戏翻译。
+    #[command(name = "mv")]
+    Mv {
+        #[command(subcommand)]
+        command: MvCommand,
+    },
 }
 
 /// `att mz` 当前支持的用户意图。
@@ -93,11 +91,28 @@ pub(crate) enum MzCommand {
     WriteBack(WriteBackArguments),
 }
 
+/// `att mv` 当前支持的用户意图。
+#[derive(Debug, Subcommand)]
+pub(crate) enum MvCommand {
+    /// 初始化一个命名的 MV 游戏。
+    #[command(name = "init")]
+    Init(InitArguments),
+    /// 提取已初始化游戏中的原文。
+    #[command(name = "extract")]
+    Extract(MvExtractArguments),
+    /// 使用指定翻译 Profile 翻译已提取原文。
+    #[command(name = "translate")]
+    Translate(TranslateArguments),
+    /// 把已验收译文写回游戏。
+    #[command(name = "write-back")]
+    WriteBack(WriteBackArguments),
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct InitArguments {
     #[command(flatten)]
     pub(crate) project: ProjectArguments,
-    /// RPG Maker MZ 游戏根目录。
+    /// RPG Maker 游戏根目录。
     #[arg(long, value_name = "DIR", value_parser = parse_non_blank_path)]
     pub(crate) path: PathBuf,
     /// 游戏原文语言 ID。
@@ -127,12 +142,41 @@ pub(crate) struct InitArguments {
 pub(crate) struct ExtractArguments {
     #[command(flatten)]
     pub(crate) project: ProjectArguments,
-    /// 使用内置 MZ 文本位置规格。
+    /// 使用内置 RPG Maker 文本位置规格。
     #[arg(long)]
     pub(crate) builtin: bool,
-    /// 按指定 JSON 规则提取外部明确声明的位置。
-    #[arg(long, value_name = "RULES_JSON", value_parser = parse_non_blank_path)]
+    /// 按指定 TOML 规则提取外部明确声明的位置。
+    #[arg(long, value_name = "RULES_TOML", value_parser = parse_non_blank_path)]
     pub(crate) rules: Option<PathBuf>,
+    /// 运行指定可信 Lua 程序。
+    #[arg(long, value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
+    pub(crate) lua: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("extract_tasks")
+        .required(true)
+        .multiple(true)
+        .args(["builtin", "rules", "lua"])
+))]
+pub(crate) struct MvExtractArguments {
+    #[command(flatten)]
+    pub(crate) project: ProjectArguments,
+    /// 使用内置 RPG Maker 文本位置规格。
+    #[arg(long)]
+    pub(crate) builtin: bool,
+    /// 按指定 TOML 规则提取外部明确声明的位置。
+    #[arg(long, value_name = "RULES_TOML", value_parser = parse_non_blank_path)]
+    pub(crate) rules: Option<PathBuf>,
+    /// 用该 TOML 定义替换项目当前 MV 对话姓名投影；省略时复用已保存定义。
+    #[arg(
+        long,
+        value_name = "DIALOGUE_TOML",
+        value_parser = parse_non_blank_path,
+        requires = "builtin"
+    )]
+    pub(crate) dialogue_rules: Option<PathBuf>,
     /// 运行指定可信 Lua 程序。
     #[arg(long, value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
     pub(crate) lua: Option<PathBuf>,
@@ -145,11 +189,11 @@ pub(crate) struct TranslateArguments {
     /// 配置文件中要使用的翻译 Profile ID。
     #[arg(value_name = "PROFILE_ID", value_parser = parse_non_blank)]
     pub(crate) profile_id: String,
-    /// 用该 JSON 文件替换项目当前术语表；省略时复用已保存内容。
-    #[arg(long, value_name = "TERMS_JSON", value_parser = parse_non_blank_path)]
+    /// 用该 TOML 文件替换项目当前术语表；省略时复用已保存内容。
+    #[arg(long, value_name = "TERMS_TOML", value_parser = parse_non_blank_path)]
     pub(crate) terms: Option<PathBuf>,
-    /// 用该 JSON 文件替换项目当前占位符规则；省略时复用已保存内容。
-    #[arg(long, value_name = "PLACEHOLDERS_JSON", value_parser = parse_non_blank_path)]
+    /// 用该 TOML 文件替换项目当前占位符规则；省略时复用已保存内容。
+    #[arg(long, value_name = "PLACEHOLDERS_TOML", value_parser = parse_non_blank_path)]
     pub(crate) placeholders: Option<PathBuf>,
     /// 运行指定可信 Lua 程序。
     #[arg(long, value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
@@ -167,7 +211,7 @@ pub(crate) struct WriteBackArguments {
 
 #[derive(Debug, Args)]
 pub(crate) struct ProjectArguments {
-    /// MZ 游戏的稳定项目名称。
+    /// RPG Maker 游戏的稳定项目名称。
     #[arg(long, value_name = "NAME")]
     pub(crate) name: ProjectName,
 }
@@ -230,7 +274,7 @@ mod tests {
         ] {
             let parsed = AttArguments::try_parse_from(arguments).expect("参数应合法");
             assert_eq!(parsed.config.as_path(), Path::new("settings/config.toml"));
-            assert!(matches!(parsed.product.into_mz(), MzCommand::WriteBack(_)));
+            assert!(matches!(expect_mz(parsed.product), MzCommand::WriteBack(_)));
         }
     }
 
@@ -268,25 +312,25 @@ mod tests {
             "demo",
             "Profile-A",
             "--terms",
-            "input/terms.json",
+            "input/terms.toml",
             "--placeholders",
-            "input/placeholders.json",
+            "input/placeholders.toml",
             "--lua",
             "scripts/translate.lua",
         ])
         .expect("翻译参数应合法");
 
-        let MzCommand::Translate(arguments) = parsed.product.into_mz() else {
+        let MzCommand::Translate(arguments) = expect_mz(parsed.product) else {
             panic!("应解析为翻译命令");
         };
         assert_eq!(arguments.profile_id, "Profile-A");
         assert_eq!(
             arguments.terms.as_deref(),
-            Some(Path::new("input/terms.json"))
+            Some(Path::new("input/terms.toml"))
         );
         assert_eq!(
             arguments.placeholders.as_deref(),
-            Some(Path::new("input/placeholders.json"))
+            Some(Path::new("input/placeholders.toml"))
         );
         assert_eq!(
             arguments.lua.as_deref(),
@@ -308,7 +352,7 @@ mod tests {
             "game",
         ])
         .expect("后续 Init 应允许复用已经保存的语言和布局");
-        let MzCommand::Init(arguments) = parsed.product.into_mz() else {
+        let MzCommand::Init(arguments) = expect_mz(parsed.product) else {
             panic!("应解析为 Init 命令");
         };
         assert_eq!(arguments.path, Path::new("game"));
@@ -337,7 +381,7 @@ mod tests {
             "24",
         ])
         .expect("Init 覆盖值应可以逐项提供");
-        let MzCommand::Init(arguments) = parsed.product.into_mz() else {
+        let MzCommand::Init(arguments) = expect_mz(parsed.product) else {
             panic!("应解析为 Init 命令");
         };
         assert_eq!(
@@ -373,5 +417,56 @@ mod tests {
         .expect_err("语言 ID 的首尾空白不得被静默裁剪");
 
         assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn mv_exposes_the_four_stage_command_domain() {
+        for command in ["init", "extract", "translate", "write-back"] {
+            let mut arguments = vec![
+                "att",
+                "--config",
+                "config.toml",
+                "mv",
+                command,
+                "--name",
+                "demo",
+            ];
+            match command {
+                "init" => arguments.extend(["--path", "game"]),
+                "extract" => arguments.push("--builtin"),
+                "translate" => arguments.push("profile"),
+                "write-back" => {}
+                _ => unreachable!(),
+            }
+            let parsed = AttArguments::try_parse_from(arguments).expect("MV 四阶段参数应合法");
+            assert!(matches!(parsed.product, ProductCommand::Mv { .. }));
+        }
+    }
+
+    #[test]
+    fn mv_dialogue_rules_require_builtin_extraction() {
+        let error = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "mv",
+            "extract",
+            "--name",
+            "demo",
+            "--rules",
+            "rules.toml",
+            "--dialogue-rules",
+            "dialogue.toml",
+        ])
+        .expect_err("姓名投影只能作为 Builtin 对话提取的输入");
+
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    fn expect_mz(product: ProductCommand) -> MzCommand {
+        match product {
+            ProductCommand::Mz { command } => command,
+            ProductCommand::Mv { .. } => panic!("应解析为 MZ 命令"),
+        }
     }
 }

@@ -18,13 +18,6 @@ use rusqlite::types::{Value as RusqliteValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use tokio::sync::oneshot;
 
-use crate::att_mz::lua::session::{
-    OpenSqliteInteractiveSessionError, OpenedSqliteInteractiveSession,
-    SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
-    SqliteInteractiveSessionFinalization, SqliteInteractiveSessionFinalizationError,
-    SqliteInteractiveSessionFinalizationFailure, SqliteInteractiveSessionFinalizer,
-    SqliteInteractiveSessionOperations,
-};
 use crate::runtime::windows::{
     FileIdentity, WindowsFsError, delete_regular_file_if_identity, pin_directory_without_reparse,
     pin_path_without_reparse,
@@ -34,6 +27,13 @@ use crate::storage::sqlite::{
     SnapshotDatabaseError, SqliteCommand, SqliteDatabaseCreator, SqliteDatabaseSnapshotter,
     SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
     SqliteTransactionStep, SqliteValue,
+};
+use crate::storage::sqlite_session::{
+    OpenSqliteInteractiveSessionError, OpenedSqliteInteractiveSession,
+    SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
+    SqliteInteractiveSessionFinalization, SqliteInteractiveSessionFinalizationError,
+    SqliteInteractiveSessionFinalizationFailure, SqliteInteractiveSessionFinalizer,
+    SqliteInteractiveSessionOperations,
 };
 
 const STORAGE_RUNNING: u8 = 0;

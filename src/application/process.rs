@@ -7,8 +7,8 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 
 use super::arguments::AttArguments;
-use super::command::{CommandResultRenderer, CommandRunResult, ProductionMzCommandRunner};
-use super::config::{load_configuration, resolve_configuration_path};
+use super::command::{CommandResultRenderer, CommandRunResult, ProductionRpgMakerCommandRunner};
+use super::config::{load_product_configuration, resolve_configuration_path};
 
 /// 运行真实进程入口。
 pub(crate) fn run() -> ExitCode {
@@ -35,8 +35,7 @@ where
         Ok(path) => path,
         Err(error) => return render_user_error("配置或输入错误", &error, stderr),
     };
-    let command = arguments.product.into_mz();
-    let configuration = match load_configuration(&configuration_path, command) {
+    let configuration = match load_product_configuration(&configuration_path, arguments.product) {
         Ok(configuration) => configuration,
         Err(error) => return render_user_error("配置或输入错误", &error, stderr),
     };
@@ -52,7 +51,8 @@ where
         Err(error) => return render_fatal("内部技术故障", &error, stderr),
     };
 
-    let report = runtime.block_on(ProductionMzCommandRunner::new().run(configuration));
+    let (layout, command) = configuration.into_parts();
+    let report = runtime.block_on(ProductionRpgMakerCommandRunner::new(layout).run(command));
     // 所有根已经显式 shutdown；丢弃 Runtime 是最终进程资源终结步骤。
     drop(runtime);
 

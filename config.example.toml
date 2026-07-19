@@ -93,25 +93,25 @@ parameters = '''
 }
 '''
 
-[mz.document]
+[rpg_maker.document]
 read_concurrency = 8
 parse_concurrency = 4
 
-[mz.standard_asset]
+[rpg_maker.standard_asset]
 decode_concurrency = 4
 leaves_per_decode_job = 512
 
-[mz.extract.builtin]
+[rpg_maker.extract.builtin]
 scan_concurrency = 4
 
-[mz.extract.rules]
+[rpg_maker.extract.rules]
 scan_concurrency = 4
 
-[mz.extract.store]
+[rpg_maker.extract.store]
 encode_concurrency = 4
 groups_per_encode_job = 256
 
-[mz.translate.store]
+[rpg_maker.translate.store]
 encode_concurrency = 4
 leaves_per_encode_job = 512
 
@@ -132,15 +132,15 @@ minimum_copied_word_count = 2
 minimum_copied_letter_count = 4
 allowed_terms = []
 
-[[mz.translation_profiles]]
+[[rpg_maker.translation_profiles]]
 id = "primary"
 llm_client = "primary"
 max_in_flight_tasks = 4
 
-[mz.translation_profiles.planning]
+[rpg_maker.translation_profiles.planning]
 scope_concurrency = 4
 max_message_characters = 24000
 
-[mz.translation_profiles.execution]
+[rpg_maker.translation_profiles.execution]
 network_retry_delays_ms = [500, 1500, 5000]
 max_network_retry_after_ms = 30000

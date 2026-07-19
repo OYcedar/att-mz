@@ -1,2804 +1,354 @@
-<!DOCTYPE html>
-<html lang="zh-CN" data-theme="paper">
+<!doctype html>
+<html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ATT MZ 四棵功能职责树</title>
-<meta name="description" content="用四棵可交互职责树解释 ATT MZ 当前业务模块、环境根契约与生产适配器的真实装配关系。">
-<link rel="icon" href="data:,">
-<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/lxgwwenkai-regular.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/lxgwwenkai-bold.css">
-<style>
-:root {
-  --paper: #faf7f0;
-  --paper-alt: #fffdf8;
-  --ink: #35322b;
-  --ink-soft: #6f6a5e;
-  --ink-faint: #a8a191;
-  --line: #cfc8b8;
-  --blue: #3b6ec9;
-  --teal: #0e9d84;
-  --amber: #d9930d;
-  --red: #d64550;
-  --purple: #8958d8;
-  --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
-  --font-hand: "LXGW WenKai", "Xiaolai SC", "KaiTi", "STKaiti", "AR PL UKai CN", cursive;
-  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
-  --wobble-a: 255px 15px 225px 15px / 15px 225px 15px 255px;
-  --wobble-b: 15px 225px 15px 255px / 255px 15px 225px 15px;
-}
-
-* {
-  box-sizing: border-box;
-}
-
-html {
-  color-scheme: light;
-  scroll-behavior: smooth;
-}
-
-body {
-  margin: 0;
-  min-width: 320px;
-  color: var(--ink);
-  background-color: var(--paper);
-  background-image: radial-gradient(var(--line) 0.8px, transparent 0.8px);
-  background-size: 26px 26px;
-  font-family: var(--font-hand);
-  font-size: 15px;
-  line-height: 1.7;
-}
-
-button,
-a {
-  font: inherit;
-}
-
-button {
-  color: inherit;
-}
-
-button:focus-visible,
-a:focus-visible,
-[tabindex="0"]:focus-visible {
-  outline: 3px solid color-mix(in srgb, var(--blue) 38%, transparent);
-  outline-offset: 3px;
-}
-
-::selection {
-  background: color-mix(in srgb, var(--amber) 28%, transparent);
-}
-
-.page {
-  width: min(1480px, calc(100% - 32px));
-  margin: 0 auto;
-  padding: 34px 0 64px;
-}
-
-.hero {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 24px;
-  align-items: end;
-  padding: 10px 8px 24px;
-}
-
-.kicker,
-.section-kicker,
-.branch-kicker,
-.inspector-kicker {
-  margin: 0;
-  color: var(--blue);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-h1 {
-  max-width: 820px;
-  margin: 6px 0 0;
-  font-size: clamp(29px, 4vw, 48px);
-  line-height: 1.18;
-  letter-spacing: -0.025em;
-}
-
-.hero-copy {
-  max-width: 850px;
-  margin: 14px 0 0;
-  color: var(--ink-soft);
-  font-size: 16px;
-}
-
-.hero-copy strong {
-  color: var(--ink);
-}
-
-.hero-note {
-  width: min(330px, 100%);
-  padding: 13px 16px;
-  border-left: 3px solid var(--blue);
-  background: color-mix(in srgb, var(--blue) 5%, var(--paper-alt));
-  color: var(--ink-soft);
-  font-size: 13px;
-}
-
-.hero-note strong {
-  display: block;
-  margin-bottom: 2px;
-  color: var(--ink);
-  font-size: 14px;
-}
-
-.legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 14px;
-  margin: 0 8px 25px;
-  color: var(--ink-soft);
-  font-size: 13px;
-}
-
-.legend span {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.legend-mark {
-  display: inline-grid;
-  width: 22px;
-  height: 22px;
-  place-items: center;
-  border: 1.5px solid var(--ink-soft);
-  border-radius: 50%;
-  background: var(--paper-alt);
-  color: var(--ink);
-  font-weight: 700;
-  line-height: 1;
-}
-
-.forest {
-  padding: 22px;
-  border: 1.7px solid var(--ink);
-  border-radius: var(--wobble-a);
-  background: color-mix(in srgb, var(--paper-alt) 96%, transparent);
-  box-shadow: 7px 8px 0 color-mix(in srgb, var(--ink) 6%, transparent);
-}
-
-.forest-heading {
-  display: flex;
-  justify-content: space-between;
-  gap: 18px;
-  align-items: end;
-  margin-bottom: 16px;
-}
-
-.forest-heading h2 {
-  margin: 2px 0 0;
-  font-size: 21px;
-}
-
-.forest-heading p {
-  max-width: 620px;
-  margin: 0;
-  color: var(--ink-soft);
-  font-size: 13px;
-  text-align: right;
-}
-
-.root-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 13px;
-}
-
-.root-card {
-  --c: var(--ink);
-  position: relative;
-  min-height: 154px;
-  padding: 17px 17px 15px;
-  overflow: hidden;
-  border: 1.8px solid var(--ink);
-  border-radius: var(--wobble-b);
-  background: var(--paper-alt);
-  text-align: left;
-  cursor: pointer;
-  transition:
-    transform 0.22s var(--ease),
-    border-color 0.22s var(--ease),
-    background-color 0.22s var(--ease),
-    box-shadow 0.22s var(--ease);
-}
-
-.root-card:nth-child(even) {
-  border-radius: var(--wobble-a);
-}
-
-.root-card::before {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 5px;
-  background: var(--c);
-  opacity: 0.82;
-}
-
-.root-card::after {
-  content: "↓";
-  position: absolute;
-  right: 15px;
-  bottom: 11px;
-  color: var(--c);
-  font-size: 21px;
-  font-weight: 700;
-  transition: transform 0.24s var(--ease);
-}
-
-.root-card:hover {
-  transform: translateY(-3px);
-  border-color: var(--c);
-  box-shadow: 5px 6px 0 color-mix(in srgb, var(--c) 12%, transparent);
-}
-
-.root-card.is-open {
-  transform: translateY(-2px);
-  border-color: var(--c);
-  background: color-mix(in srgb, var(--c) 8%, var(--paper-alt));
-  box-shadow: 5px 6px 0 color-mix(in srgb, var(--c) 14%, transparent);
-}
-
-.root-card.is-open::after {
-  transform: rotate(180deg);
-}
-
-.root-topline {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  align-items: start;
-}
-
-.root-index {
-  color: var(--c);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-
-.root-status {
-  padding: 2px 8px;
-  border: 1px solid color-mix(in srgb, var(--c) 58%, var(--line));
-  border-radius: 999px;
-  color: var(--c);
-  background: color-mix(in srgb, var(--c) 7%, var(--paper-alt));
-  font-size: 11px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.root-name {
-  display: block;
-  margin-top: 10px;
-  font-family: var(--font-mono);
-  font-size: clamp(18px, 2vw, 25px);
-  font-weight: 800;
-  line-height: 1.1;
-}
-
-.root-zh {
-  display: block;
-  margin-top: 4px;
-  color: var(--ink);
-  font-size: 14px;
-  font-weight: 700;
-}
-
-.root-desc {
-  display: block;
-  max-width: 92%;
-  margin-top: 10px;
-  color: var(--ink-soft);
-  font-size: 12.5px;
-  line-height: 1.55;
-}
-
-.branch-shell {
-  display: grid;
-  grid-template-rows: 0fr;
-  margin-top: 0;
-  opacity: 0;
-  transition:
-    grid-template-rows 0.44s var(--ease),
-    opacity 0.3s var(--ease),
-    margin-top 0.44s var(--ease);
-}
-
-.branch-shell.is-open {
-  grid-template-rows: 1fr;
-  margin-top: 20px;
-  opacity: 1;
-}
-
-.branch-clip {
-  min-height: 0;
-  overflow: hidden;
-}
-
-.branch-card {
-  --c: var(--blue);
-  position: relative;
-  padding: 18px;
-  border: 1.6px solid var(--ink);
-  border-radius: var(--wobble-a);
-  background: var(--paper-alt);
-}
-
-.branch-card::before {
-  content: "";
-  position: absolute;
-  top: -14px;
-  left: 50%;
-  width: 1.6px;
-  height: 14px;
-  background: var(--c);
-}
-
-.branch-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  align-items: start;
-  padding: 2px 2px 13px;
-  border-bottom: 1px dashed var(--line);
-}
-
-.branch-title {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 9px;
-  align-items: baseline;
-}
-
-.branch-title h3 {
-  margin: 0;
-  font-size: 21px;
-}
-
-.branch-summary {
-  margin: 3px 0 0;
-  color: var(--ink-soft);
-  font-size: 13px;
-}
-
-.tree-controls {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: end;
-  gap: 7px;
-}
-
-.small-btn {
-  padding: 5px 11px;
-  border: 1.4px solid var(--ink-soft);
-  border-radius: var(--wobble-b);
-  background: var(--paper-alt);
-  color: var(--ink-soft);
-  font-size: 12px;
-  cursor: pointer;
-  transition:
-    color 0.18s var(--ease),
-    border-color 0.18s var(--ease),
-    background-color 0.18s var(--ease),
-    transform 0.18s var(--ease);
-}
-
-.small-btn:hover {
-  transform: translateY(-1px);
-  border-color: var(--c);
-  color: var(--c);
-  background: color-mix(in srgb, var(--c) 6%, var(--paper-alt));
-}
-
-.small-btn.is-strong {
-  border-color: var(--c);
-  color: var(--c);
-}
-
-.sequence-strip {
-  display: flex;
-  gap: 9px;
-  align-items: start;
-  margin: 12px 2px 0;
-  padding: 9px 11px;
-  border-left: 3px solid var(--c);
-  background: color-mix(in srgb, var(--c) 5%, var(--paper-alt));
-  color: var(--ink-soft);
-  font-size: 12.5px;
-}
-
-.sequence-strip strong {
-  flex: none;
-  color: var(--ink);
-}
-
-.workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 0fr;
-  gap: 0;
-  align-items: start;
-  margin-top: 14px;
-  transition:
-    grid-template-columns 0.36s var(--ease),
-    gap 0.36s var(--ease);
-}
-
-.workspace.has-inspector {
-  grid-template-columns: minmax(0, 1fr) minmax(310px, 360px);
-  gap: 14px;
-}
-
-.tree-pane {
-  min-width: 0;
-  border: 1.4px solid var(--line);
-  border-radius: var(--wobble-b);
-  background:
-    linear-gradient(color-mix(in srgb, var(--line) 32%, transparent) 1px, transparent 1px),
-    linear-gradient(90deg, color-mix(in srgb, var(--line) 32%, transparent) 1px, transparent 1px),
-    var(--paper-alt);
-  background-size: 34px 34px;
-}
-
-.tree-guide {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 12px;
-  border-bottom: 1px dashed var(--line);
-  color: var(--ink-soft);
-  background: color-mix(in srgb, var(--paper) 65%, transparent);
-  font-size: 11.5px;
-}
-
-.tree-guide span:last-child {
-  text-align: right;
-}
-
-.tree-scroller {
-  min-height: 300px;
-  overflow: auto;
-  overscroll-behavior-inline: contain;
-  scrollbar-color: var(--line) transparent;
-  scrollbar-width: thin;
-}
-
-.tree-scroller svg {
-  display: block;
-  max-width: none;
-}
-
-.tree-empty {
-  display: grid;
-  min-height: 290px;
-  place-items: center;
-  color: var(--ink-soft);
-}
-
-.tree-foot {
-  padding: 7px 12px;
-  border-top: 1px dashed var(--line);
-  color: var(--ink-faint);
-  font-size: 11.5px;
-}
-
-.inspector-rail {
-  min-width: 0;
-  overflow: hidden;
-}
-
-.inspector {
-  --c: var(--blue);
-  min-width: 310px;
-  max-height: min(720px, calc(100vh - 100px));
-  overflow: auto;
-  border: 1.6px solid var(--ink);
-  border-radius: var(--wobble-a);
-  background: var(--paper-alt);
-  box-shadow: 5px 6px 0 color-mix(in srgb, var(--c) 10%, transparent);
-}
-
-.inspector-head {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  align-items: start;
-  padding: 16px 16px 13px;
-  border-bottom: 1px dashed var(--line);
-  background: color-mix(in srgb, var(--paper-alt) 94%, transparent);
-  backdrop-filter: blur(8px);
-}
-
-.inspector-title {
-  margin: 3px 0 0;
-  font-size: 19px;
-  line-height: 1.25;
-}
-
-.inspector-symbol {
-  display: block;
-  margin-top: 4px;
-  color: var(--ink-soft);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-}
-
-.close-inspector {
-  display: grid;
-  flex: none;
-  width: 31px;
-  height: 31px;
-  place-items: center;
-  border: 1.3px solid var(--ink-soft);
-  border-radius: 50%;
-  background: var(--paper-alt);
-  color: var(--ink-soft);
-  cursor: pointer;
-}
-
-.close-inspector:hover {
-  border-color: var(--c);
-  color: var(--c);
-}
-
-.inspector-body {
-  padding: 15px 16px 18px;
-}
-
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 13px;
-}
-
-.chip {
-  padding: 2px 8px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--ink-soft);
-  background: var(--paper);
-  font-size: 11px;
-}
-
-.chip.is-tone {
-  border-color: color-mix(in srgb, var(--c) 52%, var(--line));
-  color: var(--c);
-  background: color-mix(in srgb, var(--c) 6%, var(--paper-alt));
-}
-
-.detail-block + .detail-block {
-  margin-top: 15px;
-}
-
-.detail-label {
-  display: block;
-  margin-bottom: 4px;
-  color: var(--ink-faint);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-
-.detail-block p {
-  margin: 0;
-  color: var(--ink-soft);
-  font-size: 13px;
-  line-height: 1.75;
-}
-
-.detail-block p strong {
-  color: var(--ink);
-}
-
-.example-box {
-  position: relative;
-  padding: 11px 12px 11px 14px;
-  border-left: 3px solid var(--c);
-  background: color-mix(in srgb, var(--c) 6%, var(--paper-alt));
-  color: var(--ink);
-  font-size: 13px;
-  line-height: 1.75;
-}
-
-.io-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-}
-
-.io-item {
-  padding: 9px 10px;
-  border: 1px dashed var(--line);
-  background: var(--paper);
-}
-
-.io-item b {
-  display: block;
-  margin-bottom: 2px;
-  color: var(--c);
-  font-size: 11px;
-}
-
-.io-item span {
-  color: var(--ink-soft);
-  font-size: 12px;
-  line-height: 1.55;
-  overflow-wrap: anywhere;
-}
-
-.location-box {
-  padding: 9px 10px;
-  border: 1px dashed var(--line);
-  color: var(--ink-soft);
-  background: var(--paper);
-  font-size: 12px;
-}
-
-.location-box strong {
-  color: var(--ink);
-}
-
-.source-link {
-  display: block;
-  margin-top: 6px;
-  color: var(--c);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-  text-decoration-thickness: 1px;
-  text-underline-offset: 3px;
-}
-
-.boundary-note {
-  margin-top: 14px;
-  padding: 9px 10px;
-  border: 1px solid color-mix(in srgb, var(--red) 32%, var(--line));
-  background: color-mix(in srgb, var(--red) 4%, var(--paper-alt));
-  color: var(--ink-soft);
-  font-size: 11.5px;
-  line-height: 1.65;
-}
-
-.page-foot {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  margin: 18px 8px 0;
-  color: var(--ink-faint);
-  font-size: 11.5px;
-}
-
-.tree-edge path,
-.tree-edge polyline {
-  fill: none;
-  stroke: var(--ink-soft);
-  stroke-width: 1.55;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.tree-edge .edge-rough path {
-  stroke: var(--ink-soft);
-}
-
-.tree-node {
-  --c: var(--blue);
-  cursor: pointer;
-  transition: opacity 0.22s var(--ease);
-}
-
-.tree-node .node-bg {
-  fill: var(--paper-alt);
-  stroke: none;
-  transition: fill 0.2s var(--ease);
-}
-
-.tree-node .node-shape path,
-.tree-node .node-shape rect,
-.tree-node path.node-shape,
-.tree-node rect.node-shape {
-  fill: none;
-  stroke: var(--c);
-  stroke-width: 1.55;
-  transition: stroke-width 0.2s var(--ease);
-}
-
-.tree-node:hover .node-bg,
-.tree-node.is-active .node-bg {
-  fill: color-mix(in srgb, var(--c) 10%, var(--paper-alt));
-}
-
-.tree-node:hover .node-shape path,
-.tree-node:hover .node-shape rect,
-.tree-node:hover path.node-shape,
-.tree-node:hover rect.node-shape,
-.tree-node.is-active .node-shape path,
-.tree-node.is-active .node-shape rect,
-.tree-node.is-active path.node-shape,
-.tree-node.is-active rect.node-shape {
-  stroke-width: 2.5;
-}
-
-.tree-node.is-same-module .node-shape path,
-.tree-node.is-same-module .node-shape rect,
-.tree-node.is-same-module path.node-shape,
-.tree-node.is-same-module rect.node-shape {
-  stroke-dasharray: 7 4;
-  stroke-width: 2.15;
-}
-
-.node-title {
-  fill: var(--ink);
-  font-family: var(--font-hand);
-  font-size: 14px;
-  font-weight: 700;
-  text-anchor: middle;
-  dominant-baseline: middle;
-  pointer-events: none;
-}
-
-.node-symbol {
-  fill: var(--ink-soft);
-  font-family: var(--font-mono);
-  font-size: 9.6px;
-  text-anchor: middle;
-  dominant-baseline: middle;
-  pointer-events: none;
-}
-
-.node-corner {
-  fill: var(--c);
-  font-family: var(--font-hand);
-  font-size: 11px;
-  font-weight: 700;
-  dominant-baseline: middle;
-  pointer-events: none;
-}
-
-.node-reused {
-  fill: var(--c);
-  font-family: var(--font-hand);
-  font-size: 9.5px;
-  font-weight: 700;
-  text-anchor: end;
-  pointer-events: none;
-}
-
-.draw-in {
-  stroke-dasharray: 1;
-  stroke-dashoffset: 1;
-  animation: draw-on 0.52s var(--ease) both;
-  animation-delay: calc(var(--di, 0) * 14ms);
-}
-
-.fade-in {
-  opacity: 0;
-  animation: fade-up 0.34s var(--ease) both;
-  animation-delay: calc(var(--di, 0) * 18ms);
-}
-
-.panel-in {
-  animation: panel-in 0.3s var(--ease) both;
-}
-
-@keyframes draw-on {
-  to {
-    stroke-dashoffset: 0;
-  }
-}
-
-@keyframes fade-up {
-  from {
-    opacity: 0;
-    transform: translateY(7px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-@keyframes panel-in {
-  from {
-    opacity: 0;
-    transform: translateX(7px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-@media (max-width: 1080px) {
-  .root-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .workspace.has-inspector {
-    grid-template-columns: minmax(0, 1fr) minmax(290px, 330px);
-  }
-}
-
-@media (max-width: 900px) {
-  .page {
-    width: min(100% - 20px, 1480px);
-    padding-top: 20px;
-  }
-
-  .hero {
-    grid-template-columns: 1fr;
-  }
-
-  .hero-note {
-    width: 100%;
-  }
-
-  .forest {
-    padding: 15px;
-  }
-
-  .forest-heading,
-  .branch-head {
-    align-items: start;
-    flex-direction: column;
-  }
-
-  .forest-heading p {
-    text-align: left;
-  }
-
-  .tree-controls {
-    justify-content: start;
-  }
-
-  .workspace,
-  .workspace.has-inspector {
-    grid-template-columns: 1fr;
-    gap: 0;
-  }
-
-  .inspector-rail {
-    display: grid;
-    grid-template-rows: 0fr;
-    margin-top: 0;
-    transition:
-      grid-template-rows 0.36s var(--ease),
-      margin-top 0.36s var(--ease);
-  }
-
-  .workspace.has-inspector .inspector-rail {
-    grid-template-rows: 1fr;
-    margin-top: 14px;
-  }
-
-  .inspector {
-    min-width: 0;
-    max-height: none;
-  }
-}
-
-@media (max-width: 560px) {
-  .root-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .root-card {
-    min-height: 138px;
-  }
-
-  .hero {
-    padding-inline: 3px;
-  }
-
-  .legend {
-    margin-inline: 3px;
-  }
-
-  .forest {
-    padding: 12px;
-  }
-
-  .branch-card {
-    padding: 12px;
-  }
-
-  .tree-guide,
-  .page-foot {
-    flex-direction: column;
-  }
-
-  .tree-guide span:last-child {
-    text-align: left;
-  }
-
-  .io-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
-  }
-
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    scroll-behavior: auto !important;
-    transition-duration: 0.01ms !important;
-  }
-}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ATT RPG Maker MV/MZ 职责与依赖</title>
+  <meta name="description" content="ATT RPG Maker MV/MZ 四条纵向切片、共享能力与环境根的当前依赖图。">
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f7f3e9;
+      --card: #fffdf8;
+      --ink: #292821;
+      --muted: #68655c;
+      --line: #c9c1b0;
+      --blue: #315fa8;
+      --teal: #157e71;
+      --amber: #a66d08;
+      --red: #b83d49;
+      --violet: #7151ad;
+      --shadow: 0 14px 40px rgb(67 58 39 / 10%);
+      font-family: "LXGW WenKai", "Microsoft YaHei UI", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 1px 1px, rgb(88 78 55 / 13%) 1px, transparent 1.2px) 0 0 / 24px 24px,
+        var(--paper);
+      line-height: 1.65;
+    }
+
+    main {
+      width: min(1480px, calc(100% - 28px));
+      margin: 0 auto;
+      padding: 36px 0 60px;
+    }
+
+    header,
+    .overview,
+    .slice,
+    .roots {
+      background: color-mix(in srgb, var(--card) 94%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 24px 8px 22px 10px;
+      box-shadow: var(--shadow);
+    }
+
+    header {
+      padding: clamp(24px, 4vw, 48px);
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(260px, .7fr);
+      gap: 30px;
+      align-items: end;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { font-size: clamp(32px, 5vw, 64px); line-height: 1.05; margin-bottom: 18px; }
+    h2 { font-size: clamp(24px, 3vw, 38px); line-height: 1.2; }
+    h3 { font-size: 20px; margin-bottom: 8px; }
+
+    .kicker {
+      color: var(--blue);
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    .lead { max-width: 850px; font-size: 18px; color: var(--muted); margin-bottom: 0; }
+
+    .note {
+      border-left: 4px solid var(--amber);
+      padding: 12px 0 12px 18px;
+      color: var(--muted);
+    }
+
+    .note strong { color: var(--ink); display: block; margin-bottom: 4px; }
+
+    .overview { margin-top: 24px; padding: clamp(20px, 3vw, 34px); }
+
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1.25fr;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .box {
+      border: 2px solid currentColor;
+      border-radius: 16px 5px 14px 7px;
+      padding: 18px;
+      background: var(--card);
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .box strong { display: block; font-size: 18px; margin-bottom: 6px; overflow-wrap: anywhere; }
+    .box span { color: var(--muted); overflow-wrap: anywhere; }
+    .arrow { font-size: 30px; color: var(--muted); text-align: center; }
+    .product { color: var(--blue); }
+    .shared { color: var(--teal); }
+
+    .layout-grid,
+    .slice-grid,
+    .root-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .layout-grid { margin-top: 20px; }
+    .layout-card { padding: 16px 18px; border: 1px dashed var(--line); border-radius: 12px; }
+    .layout-card code { display: block; margin-top: 5px; }
+
+    .slice-grid { margin-top: 24px; }
+
+    .slice { overflow: hidden; }
+    .slice.init { --accent: var(--amber); }
+    .slice.extract { --accent: var(--teal); }
+    .slice.translate { --accent: var(--blue); }
+    .slice.writeback { --accent: var(--red); }
+
+    summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 24px 26px;
+      border-bottom: 1px solid transparent;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 14px;
+      align-items: center;
+    }
+
+    summary::-webkit-details-marker { display: none; }
+    details[open] summary { border-bottom-color: var(--line); }
+
+    .index {
+      width: 42px;
+      height: 42px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      color: white;
+      background: var(--accent);
+      font-weight: 800;
+    }
+
+    .slice-title strong { display: block; font-size: 23px; }
+    .slice-title span { color: var(--muted); }
+    .toggle { color: var(--accent); font-weight: 800; }
+    details[open] .toggle::before { content: "收起"; }
+    details:not([open]) .toggle::before { content: "展开"; }
+
+    .tree { padding: 24px 26px 28px; }
+    .tree ol { margin: 0; padding-left: 25px; }
+    .tree li { position: relative; padding: 0 0 16px 16px; }
+    .tree li::marker { color: var(--accent); font-weight: 800; }
+    .tree li:last-child { padding-bottom: 0; }
+    .tree p { color: var(--muted); margin: 4px 0 0; }
+
+    .path {
+      display: inline-block;
+      margin-top: 7px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      color: var(--violet);
+      background: rgb(113 81 173 / 8%);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    code {
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: .9em;
+      color: var(--violet);
+      overflow-wrap: anywhere;
+    }
+
+    .invariant {
+      margin: 16px 0 0;
+      padding: 12px 14px;
+      border-left: 4px solid var(--accent);
+      background: color-mix(in srgb, var(--accent) 7%, transparent);
+    }
+
+    .roots { margin-top: 24px; padding: clamp(22px, 3vw, 34px); }
+    .root-grid { margin-top: 18px; }
+    .root-card { border: 1px solid var(--line); border-radius: 14px 5px 12px 7px; padding: 18px; }
+    .root-card p { color: var(--muted); margin-bottom: 8px; }
+    .root-card .path { margin-top: 0; }
+
+    .stopline {
+      margin-top: 24px;
+      border: 2px dashed var(--red);
+      border-radius: 14px;
+      padding: 18px 20px;
+      background: rgb(184 61 73 / 4%);
+    }
+
+    footer { margin-top: 24px; color: var(--muted); text-align: center; }
+
+    @media (max-width: 900px) {
+      header, .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); }
+      .slice-grid, .layout-grid, .root-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      details[open] .tree { animation: reveal .22s ease-out; }
+      @keyframes reveal { from { opacity: 0; transform: translateY(-7px); } }
+    }
+  </style>
 </head>
 <body>
-<main class="page">
-  <header class="hero">
+<main>
+  <header>
     <div>
-      <p class="kicker">ATT MZ · 当前已落地职责</p>
-      <h1>四个顶层功能，点开后顺着树往下看</h1>
-      <p class="hero-copy">
-        <strong>Init、Extract、Translate、WriteBack</strong> 是仅有的四个顶层功能。
-        每棵树先显示总控，再把它真正拥有的内部职责逐级展开；最底层标“根”的节点同时说明环境契约及其当前生产适配器。
-      </p>
+      <p class="kicker">ATT · 当前唯一 RPG Maker 实现</p>
+      <h1>MV / MZ 四条纵向切片</h1>
+      <p class="lead">两个 CLI 命令域复用 <code>src/rpg_maker</code> 中同一套项目、提取、翻译与写回能力。MZ/MV 的差异只停留在游戏目录布局，以及 MV 第一条 401 的姓名投影。</p>
     </div>
-    <aside class="hero-note" aria-label="阅读说明">
-      <strong>先认归属，再看细节</strong>
-      从上往下是“谁负责谁”。同一行只是同一个父模块的直接下级，不代表它们和父模块平级。
-    </aside>
+    <div class="note">
+      <strong>图中只画当前职责</strong>
+      人写外部定义统一为 TOML；共享能力不建立未知引擎 trait 或平行的 MV/MZ 业务实现。
+    </div>
   </header>
 
-  <div class="legend" aria-label="图例">
-    <span><i class="legend-mark">↓</i> 上级直接拥有或调用下级</span>
-    <span><i class="legend-mark">①</i> 编号表示固定执行顺序</span>
-    <span><i class="legend-mark">复</i> 同一个已实现模块在这里再次使用</span>
-    <span><i class="legend-mark">根</i> 环境根契约及其生产适配器</span>
-  </div>
-
-  <section class="forest" aria-labelledby="forest-title">
-    <div class="forest-heading">
-      <div>
-        <p class="section-kicker">四个顶层功能</p>
-        <h2 id="forest-title">选择一棵树</h2>
+  <section class="overview" aria-labelledby="overview-title">
+    <p class="kicker">统一路由与共享语义</p>
+    <h2 id="overview-title">依赖从产品命令直接进入语义所有者</h2>
+    <div class="flow">
+      <div class="box product">
+        <strong>ProductCommand::{Mz, Mv}</strong>
+        <span>各自拥有 CLI 契约与 <code>RpgMakerLayout</code></span>
       </div>
-      <p>初始只显示四个根。点击一个根展开，重复点击同一个根即可整棵收起；一次只打开一棵。</p>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="box shared">
+        <strong>ProductionRpgMakerCommandRunner</strong>
+        <span>把 Init / Extract / Translate / WriteBack 路由到唯一共享能力网络</span>
+      </div>
     </div>
-
-    <div class="root-grid" id="root-grid">
-      <button class="root-card" type="button" data-root="init" aria-expanded="false" style="--c:var(--amber)">
-        <span class="root-topline">
-          <span class="root-index">01 / ROOT</span>
-          <span class="root-status">生产树已装配</span>
-        </span>
-        <span class="root-name">Init</span>
-        <span class="root-zh">建立项目</span>
-        <span class="root-desc">创建或收敛来源、语言、布局和工作区结构。</span>
-      </button>
-
-      <button class="root-card" type="button" data-root="extract" aria-expanded="false" style="--c:var(--teal)">
-        <span class="root-topline">
-          <span class="root-index">02 / ROOT</span>
-          <span class="root-status">生产树已装配</span>
-        </span>
-        <span class="root-name">Extract</span>
-        <span class="root-zh">提取文本</span>
-        <span class="root-desc">按 owner 独立刷新 Builtin、Rules 和 Lua 标准快照。</span>
-      </button>
-
-      <button class="root-card" type="button" data-root="translate" aria-expanded="false" style="--c:var(--blue)">
-        <span class="root-topline">
-          <span class="root-index">03 / ROOT</span>
-          <span class="root-status">生产树已装配</span>
-        </span>
-        <span class="root-name">Translate</span>
-        <span class="root-zh">翻译总控</span>
-        <span class="root-desc">按持久资源和逐叶 state 只翻译仍 Pending 的文本。</span>
-      </button>
-
-      <button class="root-card" type="button" data-root="writeback" aria-expanded="false" style="--c:var(--red)">
-        <span class="root-topline">
-          <span class="root-index">04 / ROOT</span>
-          <span class="root-status">生产树已装配</span>
-        </span>
-        <span class="root-name">WriteBack</span>
-        <span class="root-zh">写回游戏</span>
-        <span class="root-desc">Standard 与 Lua 共改一个候选，验证后只发布一次。</span>
-      </button>
-    </div>
-
-    <div class="branch-shell" id="branch-shell" aria-hidden="true" inert>
-      <div class="branch-clip">
-        <div class="branch-card" id="branch-card">
-          <div class="branch-head">
-            <div>
-              <p class="branch-kicker" id="branch-kicker">当前职责树</p>
-              <div class="branch-title">
-                <h3 id="branch-title"></h3>
-              </div>
-              <p class="branch-summary" id="branch-summary"></p>
-            </div>
-            <div class="tree-controls" aria-label="树控制">
-              <button class="small-btn" id="first-level-btn" type="button">只看第一层</button>
-              <button class="small-btn is-strong" id="expand-all-btn" type="button">展开整棵树</button>
-              <button class="small-btn" id="close-tree-btn" type="button">收起整棵</button>
-            </div>
-          </div>
-
-          <div class="sequence-strip" id="sequence-strip">
-            <strong>总控顺序</strong>
-            <span id="sequence-text"></span>
-          </div>
-
-          <div class="workspace" id="workspace">
-            <div class="tree-pane">
-              <div class="tree-guide">
-                <span>点击有 “+” 的模块：展开下级，同时查看通俗解释</span>
-                <span>点击叶子：只打开说明；按 Esc 收起说明</span>
-              </div>
-              <div class="tree-scroller" id="tree-scroller">
-                <div class="tree-empty">选择上方四个根之一</div>
-              </div>
-              <div class="tree-foot" id="tree-foot">树中展示业务模块、直接根契约及其当前生产适配器。</div>
-            </div>
-            <div class="inspector-rail">
-              <aside class="inspector" id="inspector" aria-live="polite"></aside>
-            </div>
-          </div>
-        </div>
+    <div class="layout-grid">
+      <div class="layout-card">
+        <strong>MZ 布局适配</strong>
+        <code>GAME_ROOT/data · GAME_ROOT/js/rmmz_core.js</code>
+        <code>projects.root/mz/name</code>
+      </div>
+      <div class="layout-card">
+        <strong>MV 布局适配</strong>
+        <code>GAME_ROOT/www/data · GAME_ROOT/www/js/rpg_core.js</code>
+        <code>projects.root/mv/name</code>
       </div>
     </div>
   </section>
 
-  <footer class="page-foot">
-    <span>页面口径：源码中已经落地的职责与真实调用关系。</span>
-    <span>四条纵向切片已经连接真实文件、CPU、SQLite、网络、等待、Lua 与统一强审计账本。</span>
-  </footer>
+  <section class="slice-grid" aria-label="四条职责树">
+    <details class="slice init" open>
+      <summary>
+        <span class="index">01</span>
+        <span class="slice-title"><strong>Init</strong><span>收敛项目、冻结来源与当前 schema</span></span>
+        <span class="toggle" aria-hidden="true"></span>
+      </summary>
+      <div class="tree">
+        <ol>
+          <li><strong>布局边界验证游戏根</strong><p>MZ 确认 data/js 与 rmmz_core.js；MV 确认 www/data、www/js 与 rpg_core.js，不探测或自动修正。</p><span class="path">src/rpg_maker/init.rs · src/rpg_maker/mod.rs</span></li>
+          <li><strong>项目租约与来源指纹</strong><p>项目、锁和发布锁按 engine 分开；冻结树的完整 SHA-256 是后续三命令的 freshness 权威。</p><span class="path">src/rpg_maker/project_lease.rs · src/rpg_maker/project.rs</span></li>
+          <li><strong>建立当前数据库</strong><p>核心资产结构是 standard_text_group、standard_text_leaf、standard_text_target；owner 同时保存 source 与 asset snapshot fingerprint。</p><span class="path">src/rpg_maker/project_database.rs</span></li>
+          <li><strong>一次候选发布</strong><p>MZ 保留 data/js，MV 保留 www/data/js。完全相同返回 Unchanged，否则只发布一个完整候选。</p><span class="path">src/rpg_maker/init.rs · src/runtime/filesystem.rs</span></li>
+        </ol>
+        <p class="invariant"><strong>项目身份：</strong><code>projects.root / engine / name</code>。同名 MZ 与 MV 项目可以共存。</p>
+      </div>
+    </details>
+
+    <details class="slice extract" open>
+      <summary>
+        <span class="index">02</span>
+        <span class="slice-title"><strong>Extract</strong><span>物化逻辑叶、物理目标与可逆 recipe</span></span>
+        <span class="toggle" aria-hidden="true"></span>
+      </summary>
+      <div class="tree">
+        <ol>
+          <li><strong>Builtin 共享事件骨架</strong><p>Map、CommonEvents、Troops、数据库条目、101+401、选择项与滚动文本共用遍历和组模型。</p><span class="path">src/rpg_maker/extract/builtin.rs · src/rpg_maker/dialogue.rs</span></li>
+          <li><strong>引擎姓名投影</strong><p>MZ 从可选 101.parameters[4] 建立 direct Speaker；MV 只在首条 401 上应用项目内已提交的 dialogue TOML，并生成 Literal/SpeakerSlot recipe。</p><span class="path">src/rpg_maker/dialogue.rs</span></li>
+          <li><strong>统一 Rules TOML</strong><p>一个 [[rule]] 数组只支持 file、plugin 或任意 code+parameter，加窄路径、逐层 JSON decode 与可选 text 捕获。</p><span class="path">src/rpg_maker/extract/rules</span></li>
+          <li><strong>三表原子 Store</strong><p>逻辑身份是 owner + group_location + field_role；物理 MutationTarget 独立存放。MV 对话定义与 Builtin 快照原子切换。</p><span class="path">src/rpg_maker/extract/store/asset_store.rs · src/rpg_maker/text.rs</span></li>
+          <li><strong>可信 Lua</strong><p><code>ctx.rpg_maker</code> 复用 data、map、plugin、document 与 db 能力；跨命令插件协议留给 Lua。</p><span class="path">src/rpg_maker/lua · src/rpg_maker/lua/lua54.rs · src/rpg_maker/extract/lua.rs</span></li>
+        </ol>
+        <p class="invariant"><strong>Owner 顺序：</strong>Builtin → Rules → Lua。失败 owner 保留旧快照；成功 owner 原子提交。</p>
+      </div>
+    </details>
+
+    <details class="slice translate" open>
+      <summary>
+        <span class="index">03</span>
+        <span class="slice-title"><strong>Translate</strong><span>按逻辑角色、上下文与 state 翻译</span></span>
+        <span class="toggle" aria-hidden="true"></span>
+      </summary>
+      <div class="tree">
+        <ol>
+          <li><strong>共享 Profile 与 Prompt</strong><p>配置只使用 [rpg_maker]；Prompt 固定来自 prompts.root/rpg_maker/source--target.md。</p><span class="path">src/application/config.rs · src/rpg_maker/translate/profile.rs</span></li>
+          <li><strong>TOML 资源边界</strong><p>Terminology 与 Placeholder 从严格 TOML 建立受信类型，再以 canonical JSON 持久化。</p><span class="path">src/rpg_maker/translate/planning_resource.rs · src/rpg_maker/translate/placeholder.rs</span></li>
+          <li><strong>逻辑资产读取与 Planner</strong><p>Speaker → Body(0..n) 强角色排序；同一 Dialogue Group 不拆分。Body 去重和 state 包含源 Speaker 上下文，Speaker 与 Body 不互相去重。</p><span class="path">src/rpg_maker/translate/asset_reader.rs · src/rpg_maker/translate/planner.rs</span></li>
+          <li><strong>LLM 执行与验收</strong><p>公共 Client、有限重试、严格 JSON 信封、占位符多重集和语言检查共同产生 Complete / Partial / Unavailable。</p><span class="path">src/rpg_maker/translate/executor.rs</span></li>
+          <li><strong>按逻辑叶提交</strong><p>写入前再次核对 metadata、owner 双指纹、资源快照和组/角色/原文/上下文，随后更新 standard_text_leaf。</p><span class="path">src/rpg_maker/translate/result_store.rs</span></li>
+        </ol>
+        <p class="invariant"><strong>审计位置：</strong><code>{group_location, field_role}</code>；confirmed/accepted/unresolved 的计数均表示逻辑叶。</p>
+      </div>
+    </details>
+
+    <details class="slice writeback" open>
+      <summary>
+        <span class="index">04</span>
+        <span class="slice-title"><strong>WriteBack</strong><span>统一 Mutation、候选验证与单次发布</span></span>
+        <span class="toggle" aria-hidden="true"></span>
+      </summary>
+      <div class="tree">
+        <ol>
+          <li><strong>读取完整物化快照</strong><p>重新计算 owner asset fingerprint，验证 recipe、逻辑叶、物理目标、来源块与 target 冲突。</p><span class="path">src/rpg_maker/write_back/asset_reader.rs</span></li>
+          <li><strong>统一对话修改</strong><p>一个 ReplaceDialogueMutation 同时选择 Speaker/Body 译文，只布局 Body，填入 SpeakerSlot，并一次替换完整 101+401*。</p><span class="path">src/rpg_maker/write_back/standard.rs · src/rpg_maker/write_back/rewriter.rs</span></li>
+          <li><strong>保持正文硬边界</strong><p>单个 body[n] 可展开为多条 401，不跨不同 Body 合并；none、speaker-only、body-only、both 使用同一算法。</p><span class="path">src/rpg_maker/write_back/standard/layout.rs</span></li>
+          <li><strong>Lua 编辑同一候选</strong><p>Lua 使用逻辑 data/js 路径；MV Host 映射到 www 内。脚本没有 publish 能力。</p><span class="path">src/rpg_maker/write_back/lua.rs · src/rpg_maker/lua</span></li>
+          <li><strong>引擎布局验证与发布</strong><p>MZ 验证顶层 data/js；MV 验证顶层 www 及其 data/js。审计发布意图后只 publish 一次。</p><span class="path">src/rpg_maker/write_back/publisher.rs · src/runtime/filesystem.rs</span></li>
+        </ol>
+        <p class="invariant"><strong>写回权威：</strong>只消费 Extract 物化 recipe；不重读 TOML，不重新运行 PCRE2。</p>
+      </div>
+    </details>
+  </section>
+
+  <section class="roots" aria-labelledby="roots-title">
+    <p class="kicker">生产根与边界适配器</p>
+    <h2 id="roots-title">业务能力直接依赖所需机制</h2>
+    <div class="root-grid">
+      <article class="root-card"><h3>文件、指纹与可恢复发布</h3><p>有界读取、稳定对象身份、项目锁、候选编辑与 Windows 目录发布。</p><span class="path">src/runtime/filesystem.rs</span></article>
+      <article class="root-card"><h3>SQLite</h3><p>通用存储契约承载建库、短事务和交互会话；rusqlite 根负责预算、线程与 shutdown，不拥有 RPG Maker 语义。</p><span class="path">src/storage/sqlite.rs · src/storage/sqlite_session.rs · src/runtime/sqlite.rs</span></article>
+      <article class="root-card"><h3>CPU 与 Tokio</h3><p>PCRE2、JSON、规划与写回进入有界 CPU/文件资源；并发不改变自然顺序。</p><span class="path">src/runtime/cpu.rs · src/runtime/mod.rs</span></article>
+      <article class="root-card"><h3>LLM 与 Delay</h3><p>公共非流式 Chat Completion 根负责连接池、限流与 shutdown；生产组合根直接提供 RPG Maker 重试等待。</p><span class="path">src/runtime/llm.rs · src/application/command.rs</span></article>
+      <article class="root-card"><h3>RPG Maker Lua 5.4 适配器</h3><p>直接实现当前可信 Host 协议，负责每脚本专用线程、Host 值预算、合作取消和唯一 finalizer。</p><span class="path">src/rpg_maker/lua/lua54.rs</span></article>
+      <article class="root-card"><h3>强审计 JSONL</h3><p>每条事件带 engine；任务和发布的意图先刷盘，accepted/unresolved 使用逻辑位置。</p><span class="path">src/rpg_maker/audit.rs · src/runtime/json_lines.rs</span></article>
+    </div>
+    <div class="stopline">
+      <strong>当前停止线：</strong>跨命令 Speaker 状态、ChoiceHelp 等块协议和 JS 字符串语义由 <code>ctx.rpg_maker</code> Lua 处理。共享层不包含 TOML 状态机、JSONPath、规则优先级、版本字段或面向其他引擎的框架。
+    </div>
+  </section>
+
+  <footer>页面口径：当前唯一规格与本轮落地结构；点击四张职责卡可展开或收起。</footer>
 </main>
-
-<script>
-(function () {
-  "use strict";
-
-  var ROOTS = {
-    init: {
-      label: "Init",
-      zh: "建立项目",
-      color: "var(--amber)",
-      summary: "InitService 在项目租约内创建、更新或修复完整冻结工作区；完全一致时快速返回 Unchanged，不建立候选。",
-      sequence: "审计运行意图 → 取得租约 → 复核现有状态与来源指纹 → 快速 Unchanged，或准备并整体发布一次",
-      tree: null
-    },
-    extract: {
-      label: "Extract",
-      zh: "提取文本",
-      color: "var(--teal)",
-      summary: "ExtractService 验证冻结来源后，只替换本次选中的 owner 快照并更新各自 freshness。",
-      sequence: "审计运行意图 → 取得租约 → 打开并复核来源 → Builtin → Rules → Lua（可选）",
-      tree: null
-    },
-    translate: {
-      label: "Translate",
-      zh: "翻译总控",
-      color: "var(--blue)",
-      summary: "Translate 复用持久术语/占位符与逐叶 state，只为 Pending 叶装配模型任务；Standard 与 Lua 共享核心门面。",
-      sequence: "配置选择 Profile/Client/语言目录 → 审计运行意图 → 项目租约与 freshness → metadata 语言对精确解析 Prompt/模块 → 逐叶状态收敛 → 审计每个 Pending 任务 → Lua（可选）",
-      tree: null
-    },
-    writeback: {
-      label: "WriteBack",
-      zh: "写回游戏",
-      color: "var(--red)",
-      summary: "WriteBack 把 Standard overlays 和可选 Lua 修改汇入同一个未发布候选，验证后只 publish 一次。",
-      sequence: "审计运行意图 → 项目租约 → freshness → Standard → prepare → Lua（可选）→ MZ/文件双边界验证 → 审计发布意图 → 发布一次 → 审计发布终态",
-      tree: null
-    }
-  };
-
-  var MODULES = {
-    "command-configuration": {
-      title: "按命令配置选择",
-      symbol: "load_configuration → ConfiguredMzCommand",
-      shortSymbol: "Command Configuration",
-      path: "src/application/config.rs",
-      status: "生产配置边界已实现",
-      role: "读取一次受限 TOML，在检查完整语法和未知顶层分区后，只解析当前命令实际使用的配置。",
-      plain: "普通命令必须显式传入 --config；Help/Version 不读取配置。Translate 完整验证顶层 languages，并持有 prompts.root、选定 MZ Profile 与 Client；打开项目后才按 metadata 解析精确语言资源。",
-      example: "ConfiguredMzCommand::Translate 持有强类型语言目录、Prompt 根、选定 Profile 与 Client，不保存待业务层解释的 toml::Value。",
-      input: "必填配置路径与 MzCommand",
-      output: "Init/Extract/Translate/WriteBack 四个互斥受信变体",
-      boundary: "完整 TOML 语法、重复 key 和未知顶层始终检查；未选分区不反序列化、不校验、不物化秘密；没有默认配置路径。"
-    },
-    "production-command-runner": {
-      title: "生产命令装配",
-      symbol: "ProductionMzCommandRunner",
-      shortSymbol: "Production Command Runner",
-      path: "src/application/command.rs",
-      status: "生产组合边界已实现",
-      role: "接收按命令选择完成的 ConfiguredMzCommand，只构造当前纵向切片，并编排强审计与根 shutdown。",
-      plain: "Init 不会构造未使用的 LLM 或 Lua 运行时；Translate 打开项目后以规范 LanguagePair 精确读取 prompts.root/mz/source--target.md，并把同一解析资源注入 Standard 与可选 Lua。",
-      example: "att --config config.toml mz init 不解析未使用的 LLM Client；Translate 在 Prompt 缺失、非 UTF-8 或空白时不会开始模型请求。",
-      input: "ConfiguredMzCommand 的互斥命令变体",
-      output: "ProductionCommandRunReport 与独立 shutdown 结果",
-      boundary: "run_started 刷盘后才取得项目租约；非审计根终结后写 run_finished，最后关闭账本并呈现结果。"
-    },
-    "cooperative-cancellation": {
-      title: "合作式取消事实",
-      symbol: "CooperativeCancellation",
-      shortSymbol: "Cooperative Cancellation",
-      path: "src/execution.rs",
-      status: "共享核心值类型已实现",
-      role: "把进程收到的一次 Ctrl-C 变成单向、可共享的受信事实，让业务只在安全阶段边界停止派生新工作。",
-      plain: "它不是强行杀线程的开关。已经交给文件、SQLite、CPU、强审计或目录发布根的工作仍要收尾；尚未开始的下一阶段和 TaskBlock 则不再启动。",
-      example: "WriteBack 在 prepare 返回后发现取消，会显式 discard 候选；如果 publish 已开始，则等待发布终态并记录已经生效的输出。",
-      input: "进程边界发出的取消请求",
-      output: "OperationCompletion::Completed(T) 或 Cancelled",
-      boundary: "取消是正常数据分支；进程直接形成 CommandRunResult::Interrupted，不解析底层错误文本或 source 链。"
-    },
-    "project-command-lease": {
-      title: "项目命令租约",
-      symbol: "ProjectCommandLeaseService → ExclusiveFileLeaseProvider",
-      shortSymbol: "Project Command Lease",
-      path: "src/att_mz/project_lease.rs · src/storage/file_system.rs · src/runtime/filesystem.rs",
-      status: "领域映射与生产根已实现",
-      role: "MZ 选择固定锁目录并提交 ProjectName 语义 identity，通用文件根确定性编码锁文件名并取得独占锁，让同项目四命令跨进程互斥。",
-      plain: "项目服务不拥有摘要算法；文件根按 Windows 非大小写敏感语义规范化不透明 identity、生成稳定 SHA-256 文件名并取得锁，但不知道项目或 MZ。",
-      example: "demo 正在 WriteBack 时再次启动 demo Translate 会等待并超时；other Translate 不受影响。",
-      input: "projects.root、ProjectName 与外部等待上限",
-      output: "不可复制的 ProjectCommandLease，或 ProjectBusy/Unavailable",
-      boundary: "工作区固定在 projects.root/mz/name；项目锁固定在 .att-locks/projects/mz；目录发布锁在 .att-locks/directory-publish/mz；锁序是项目租约 → 发布锁 → SQLite。"
-    },
-    "source-fingerprint": {
-      title: "冻结来源指纹",
-      symbol: "SourceSnapshotFingerprint · DirectoryTreeFingerprintRequest",
-      shortSymbol: "Source Snapshot Fingerprint",
-      path: "src/att_mz/project.rs · src/fingerprint.rs",
-      status: "领域请求与 SHA-256 值已实现",
-      role: "用稳定、无歧义的完整目录树指纹证明 source/data 与 source/js 没有在 Init 之外变化。",
-      plain: "相对 UTF-16 名称、文件/目录类型、空目录、长度和全部字节都会进入哈希；时间戳和绝对路径不会。",
-      example: "外部只改了 source/data/Items.json 一个字节，下一次 Extract 在入库前就发现 metadata 指纹不匹配。",
-      input: "冻结 source/data 与 source/js 普通目录树",
-      output: "固定 32 字节 SHA-256，或精确文件错误",
-      boundary: "领域层决定哪些字段进入指纹；共享 fingerprint 模块只提供 domain separation 与长度 framing。"
-    },
-    "directory-fingerprint-root": {
-      title: "目录树指纹根",
-      symbol: "SystemFileSystem as DirectoryTreeFingerprinter",
-      shortSymbol: "SystemFileSystem · Fingerprint",
-      path: "src/runtime/filesystem.rs",
-      status: "生产根已实现",
-      role: "在文件 worker 上精确遍历一个或多个逻辑目录根，并返回与绝对路径无关的 32 字节 SHA-256。",
-      plain: "它会把 Windows UTF-16 相对名、类型、空目录、文件长度和全部字节稳定送入哈希，同时拒绝 reparse、观察期间替换和资源超限。",
-      example: "同一份 data/js 复制到另一个绝对目录仍有相同指纹；改一个文件字节、增加空目录或改名都会得到不同指纹。",
-      input: "DirectoryTreeFingerprintRequest",
-      output: "Sha256Fingerprint 或 NotFound/NotDirectory/ChangedDuringObservation/Failed",
-      boundary: "不解释 MZ metadata 或 owner freshness；这些语义由 ExistingProjectOpeningService 和 Init 拥有。"
-    },
-    "init-service": {
-      title: "Init 总控",
-      symbol: "InitService",
-      shortSymbol: "InitService",
-      path: "src/att_mz/init.rs",
-      status: "业务逻辑已实现",
-      role: "把一次 Init 请求收敛为 Created、Updated 或 Unchanged 的完整项目状态；工作区修复属于 Updated。",
-      plain: "它像项目校准器：同样输入在现有工作区完成快速精确比较并直接返回；来源、语言、布局或结构变化时，才把全部变化放进一个候选整体生效。",
-      example: "只改布局宽度会保留资产和 state，但清空旧 write_back；来源变化会更新 metadata 指纹并让 active owner 自然 stale。",
-      input: "项目名、原游戏目录，以及首次必填/已有项目可逐项继承的源目标语言与三个布局宽度",
-      output: "Created、Updated 或 Unchanged",
-      boundary: "有效 project.db 才允许更新；无法读取、身份不符或 schema 不受管时技术失败且绝不覆盖。"
-    },
-    "project-name": {
-      title: "项目名规则",
-      symbol: "ProjectName",
-      shortSymbol: "ProjectName",
-      path: "src/att_mz/project_name.rs",
-      status: "已实现值类型",
-      role: "把普通字符串变成可安全用于项目身份和数据库文件名的可信名称。",
-      plain: "它相当于门卫：名称一旦通过，后面的模块就不用反复担心空白名、路径穿越或 Windows 保留名。",
-      example: "“游戏 一”可以通过；“../game”会被拒绝，因为它像在偷偷换目录；“CON”也会被拒绝，因为它是 Windows 保留名。",
-      input: "用户输入的一段文字",
-      output: "经过校验的 ProjectName"
-    },
-    "project-db-create": {
-      title: "项目建库",
-      symbol: "ProjectDatabaseCreationService",
-      shortSymbol: "Project DB Creation",
-      path: "src/att_mz/project_database.rs",
-      status: "业务逻辑已实现",
-      role: "一次建立 metadata、owner state、固定资源和五张标准表组成的完整受管数据库。",
-      plain: "新库从第一刻就有全部 schema 和 terminology/placeholder_rules 两行 []，不存在后续命令按需补表。",
-      example: "metadata 保存来源 SHA-256；owner 初始 inactive；五表要求 translation 与 32 字节 state 成对。",
-      input: "明确目标数据库路径与 NewProject metadata",
-      output: "成功确认或清楚的建库错误",
-      boundary: "schema 与对账属于 att_mz::project_database；服务只由工作区收敛的新建分支消费，并把精确建库命令交给共享 RusqliteStorage。"
-    },
-    "project-workspace-creator": {
-      title: "收敛冻结项目工作区",
-      symbol: "ProjectWorkspaceConvergenceService",
-      shortSymbol: "Project Workspace Convergence",
-      path: "src/att_mz/init.rs",
-      status: "非根业务实现完成",
-      role: "在唯一候选中创建或转换有效数据库、冻结来源和空输出，再一次 CreateNew/ReplaceExisting 发布。",
-      plain: "它不直接改活工作区。Init 已在调用它之前完成快速 Unchanged 判断；进入这里表示需要在候选中创建、更新或修复完整工作区。",
-      example: "语言变化在候选 DB 清 translation/state 和 terminology，保留 placeholder_rules；发布前旧工作区一直可用。",
-      input: "期望来源指纹、语言、布局与已观测工作区",
-      output: "收敛结果或带候选终结事实的明确失败",
-      boundary: "existing project.db 通过 SQLite online backup 进入 stage；publish 消费 token 后不再 discard。"
-    },
-    "project-workspace-layout": {
-      title: "唯一工作区布局",
-      symbol: "ProjectWorkspaceLayout",
-      shortSymbol: "Project Workspace Layout",
-      path: "src/att_mz/project_database.rs",
-      status: "MZ 受信值已实现",
-      role: "从 projects.root/mz 和项目名或已选工作区根，唯一派生数据库、冻结源和写回路径。",
-      plain: "创建器、档案读取器和项目开启服务共用同一份目录知识，不再各自 join 字符串。",
-      example: "对 demo 只建立一次布局，即可取得 mz/demo/project.db、source/data、source/js 和 write_back/data/js。",
-      input: "projects.root + ProjectName，或已选工作区根",
-      output: "全部标准工作区路径"
-    },
-    "extract-service": {
-      title: "Extract 总控",
-      symbol: "ExtractService",
-      shortSymbol: "ExtractService",
-      path: "src/att_mz/extract/service.rs",
-      status: "业务逻辑已实现",
-      role: "在同一项目租约和来源指纹下，固定安排 Builtin、Rules、Lua 三个独立 owner 刷新。",
-      plain: "它像提取班组长：先拿到一份可信的已打开项目，然后依次叫不同工种干活。某一段失败，后面的段不会继续；前面已经成功提交的成果不会假装没发生。",
-      example: "Builtin 已经把标准物品名存好，但 Rules 随后发现规则文件有错。Extract 会停止，不再运行 Lua；Builtin 已确认的那部分仍然保留。",
-      input: "项目名与三段提取的开关/配置",
-      output: "每个选中 owner 的 Updated、Cleared 或 Unchanged 报告",
-      boundary: "文件、CPU、SQLite 与 Lua 均在树底连接对应生产根；总控只拥有阶段顺序。"
-    },
-    "project-opener": {
-      title: "打开既有项目",
-      symbol: "ExistingProjectOpeningService",
-      shortSymbol: "Existing Project Opening",
-      path: "src/att_mz/project.rs",
-      status: "业务逻辑已实现",
-      role: "读取受管档案并重算冻结来源指纹；消费标准资产的命令再要求全部 active owner 与当前来源同代。",
-      plain: "目录存在还不够；来源字节必须和 metadata 属于同一快照。Extract 可据此刷新 owner，Translate/WriteBack 则拒绝混用不同世代的 active owner。",
-      example: "外部改过 source 后，Extract 在写入前失败；Init 重新导入后，Translate 又会在 owner 未重提取时返回 ExtractionOutOfDate。",
-      input: "ProjectName",
-      output: "OpenedProject：工作区、冻结源、固定输出、数据库、语言与布局宽度",
-      boundary: "指纹覆盖完整 data/js；项目租约在打开前取得并持有到命令终态。"
-    },
-    "project-record-reader": {
-      title: "读取项目档案",
-      symbol: "ProjectDatabaseRecordReadingService",
-      shortSymbol: "Project Record Reader",
-      path: "src/att_mz/project_database.rs",
-      status: "业务逻辑已实现",
-      role: "读取唯一 metadata、来源指纹、owner freshness 和固定翻译资源，并严格验证受管 schema。",
-      plain: "它像查档员。不是随便拿到一行数据就算成功，而是确认档案只有一份、字段完整、名字没有对不上。",
-      example: "用户请求项目“demo”，数据库 metadata 却写着“other”。读取会报身份不一致，而不是把 other 当成 demo 继续运行。",
-      input: "请求的 ProjectName",
-      output: "StoredProjectRecord 与 owner/resource 状态",
-      boundary: "SqliteQueryExecutor 由共享 RusqliteStorage 承载。"
-    },
-    "builtin-extraction": {
-      title: "内建字段提取",
-      symbol: "BuiltInExtractionService",
-      shortSymbol: "BuiltIn Extraction",
-      path: "src/att_mz/extract/builtin.rs",
-      status: "业务逻辑已实现",
-      role: "按程序内置 MZ 知识原子替换 builtin owner，并把其 freshness 更新到当前来源指纹。",
-      plain: "它认识 RPG Maker MZ 的常规结构，知道物品名称、技能说明、事件对白等标准位置，不需要用户再写规则。",
-      example: "在 Items.json 第 3 个物品里，它知道 name 和 description 是翻译对象；数值 price 不是文本，所以不会硬塞进翻译库。",
-      input: "OpenedProject 与 Builtin 配置",
-      output: "BuiltinSnapshot 已安全存入"
-    },
-    "rules-extraction": {
-      title: "规则字段提取",
-      symbol: "RulesExtractionService",
-      shortSymbol: "Rules Extraction",
-      path: "src/att_mz/extract/rules.rs",
-      status: "业务逻辑已实现",
-      role: "读取精确路径并替换 rules owner；{} 停用，非空规则即使零命中也保持 active。",
-      plain: "它只访问规则明确写出的路径，不会递归猜测名为 note 或 list 的字段；来源、结构位置和标签用紧凑映射直接表达。",
-      example: "Items.json → [].note → [Category] 精确提取 Note 标签；Map*.json → events[].pages[].list → [QuestDescription] 精确提取事件 Comment。",
-      input: "OpenedProject、规则文件与读取配置",
-      output: "Rules owner 已刷新、停用或 Unchanged"
-    },
-    "document-reader": {
-      title: "读取 MZ 文档",
-      symbol: "MzProjectDocumentReadingService",
-      shortSymbol: "MZ Document Reader",
-      path: "src/att_mz/extract/document.rs",
-      status: "已实现，可复用",
-      role: "按选择读取冻结 source 中的 data JSON、地图和插件参数，并保留原始结构供上层判断。",
-      plain: "它只负责把文件可靠地拿进来，不越权决定哪些字段要翻译。Builtin 和 Rules 都用同一个读取能力，但各自解释数据。",
-      example: "读取 Items.json 时，即使里面有程序不消费的 extraMeta，也会原样保留；真正选择 name 还是自定义字段由上层负责。",
-      input: "OpenedProject 的冻结 source 根与文档选择",
-      output: "MzProjectDocuments",
-      boundary: "文件契约由 SystemFileSystem 承载，CPU 契约由 BoundedCpuExecutor 承载。"
-    },
-    "snapshot-model": {
-      title: "提取快照模型",
-      symbol: "extract::model",
-      shortSymbol: "Extraction Snapshot Model",
-      path: "src/att_mz/extract/model.rs",
-      status: "已实现领域模型",
-      role: "用“相关组 + 精确叶子”表达提取结果，让上下文和最小失效粒度同时成立。",
-      plain: "它像一张既有文件夹又有页码的清单：一组文本可以一起给翻译看，但每个具体叶子仍有自己的身份。",
-      example: "一个物品的名称和说明属于同一上下文组；如果只改了说明，名称的既有译文仍可保留，不会整组作废。",
-      input: "提取器识别出的组、叶子、原文和位置",
-      output: "BuiltinSnapshot 或 RulesSnapshot"
-    },
-    "asset-store": {
-      title: "提取资产入库",
-      symbol: "MzExtractionAssetStore",
-      shortSymbol: "Extraction Asset Store",
-      path: "src/att_mz/extract/store/asset_store.rs",
-      status: "业务逻辑已实现",
-      role: "按 owner 原子替换快照，以完整叶身份成对继承 translation/state 并更新 owner 来源指纹。",
-      plain: "只有 owner、表、unit、exact、字段和原文都相同才继承；其他 owner 完全不动，可能继续 stale。",
-      example: "来源更新后只跑 Builtin：builtin 变新鲜且同叶 state 被继承，rules/lua 仍 stale，Translate 会要求继续提取。",
-      input: "OpenedProject 与一份完整快照",
-      output: "一个事务内完成的资产替换"
-    },
-    "location-codec": {
-      title: "位置编码",
-      symbol: "MzLocationCodec",
-      shortSymbol: "MZ Location Codec",
-      path: "src/att_mz/location_codec.rs",
-      status: "已实现，可复用",
-      role: "把结构化 MZ 位置稳定编码进数据库，并能无损还原。",
-      plain: "它像地址翻译器：程序内部使用强类型地址，数据库里保存稳定文本；展示用的好看字符串不能反过来冒充权威地址。",
-      example: "“Items.json 第 3 项的 description”会编码成明确结构。以后读回来仍知道文件、数组下标和字段，不靠猜字符串。",
-      input: "MzLocation",
-      output: "稳定存储文本，或从文本还原 MzLocation"
-    },
-    "standard-asset-storage": {
-      title: "标准资产存储语义",
-      symbol: "MzStandardAssetStorageKind",
-      shortSymbol: "Standard Asset Schema",
-      path: "src/att_mz/standard_asset.rs",
-      status: "共享纯能力已实现",
-      role: "唯一定义五张标准表、三个 owner、text_body unit、位置矩阵和 translation/state 成对不变量。",
-      plain: "Extract、Translate 和 WriteBack 不再各写一套 entry/text_body 字符串判断；Reader 也在这里确认表语义与 exact/group 地址确实一致。",
-      example: "text_body + scrolling_text 始终映射为 EventScrollingText；可解码但来自 Items.json 的 SystemText 地址会被判为数据库损坏。",
-      input: "表名、owner、unit_type、TextGroupKind 或 exact/group MzLocation",
-      output: "受信存储种类、owner/unit 编码、位置与状态语义，或精确损坏错误"
-    },
-    "tag-span-parser": {
-      title: "Tag Span 解析",
-      symbol: "simple_tag_spans",
-      shortSymbol: "Tag Span Parser",
-      path: "src/att_mz/tag.rs",
-      status: "共享纯能力已实现",
-      role: "以同一 occurrence 规则定位 Note 和 Comment 中的简单 tag 值边界。",
-      plain: "Rules 提取和 Rewriter 写回必须对“第几个 tag”有同一理解，否则译文可能写到另一个同名 tag。",
-      example: "note 内有两个 <desc:...>，occurrence=1 在提取和写回时始终指向第二个。",
-      input: "一段 note/comment 文本",
-      output: "按自然顺序排列的 tag 名、值与字节 span"
-    },
-    "sqlite-query-root": {
-      title: "SQLite 只读查询根",
-      symbol: "RusqliteStorage as SqliteQueryExecutor",
-      shortSymbol: "RusqliteStorage · Query",
-      path: "src/runtime/sqlite.rs",
-      status: "生产根已实现",
-      role: "以只读方式打开必须存在的 SQLite 数据库，在固定 worker 与连接预算内返回拥有型结果。",
-      plain: "业务层只决定查什么；RusqliteStorage 负责只读打开、背压、结果预算和连接关闭，缺失数据库不会被意外创建。",
-      example: "WriteBack Reader 交付一次五表 UNION 查询；RusqliteStorage 返回拥有型行或明确失败。",
-      input: "数据库路径与 SqliteQuery",
-      output: "Vec<SqliteRow> 或查询终态",
-      boundary: "同一个 RusqliteStorage 也承载建库、短事务和 Lua 交互会话，共享连接总预算。"
-    },
-    "sqlite-database-creator-root": {
-      title: "SQLite 建库根",
-      symbol: "RusqliteStorage as SqliteDatabaseCreator",
-      shortSymbol: "RusqliteStorage · Create",
-      path: "src/runtime/sqlite.rs",
-      status: "生产根已实现",
-      role: "原子占有精确目标路径，以无 CREATE 的 SQLite 打开方式在单一初始化事务中执行建表与 metadata。",
-      plain: "项目建库服务决定写什么；RusqliteStorage 负责 create_new 占位、事务、刷盘判断与 sidecar 清理。",
-      example: "候选工作区已准备好后，它在 staging/project.db 创建唯一 metadata，不推导或改写路径。",
-      input: "精确数据库路径与 SqliteCommand 列表",
-      output: "新数据库已创建，或 AlreadyExists/NotCreated/ResidualArtifact/OutcomeUnknown",
-      boundary: "建库和其他 SQLite 能力共享同一外部策略与连接预算，但保持各自终态语义。"
-    },
-    "sqlite-transaction-root": {
-      title: "SQLite 短事务根",
-      symbol: "RusqliteStorage as SqliteTransactionExecutor",
-      shortSymbol: "RusqliteStorage · Transaction",
-      path: "src/runtime/sqlite.rs",
-      status: "生产根已实现",
-      role: "在固定 worker 上用 BEGIN IMMEDIATE 执行业务给出的短事务计划，并准确区分提交与不确定终态。",
-      plain: "Extract 的快照替换和 Translate 的结果提交共用这一根；业务拥有步骤含义，根拥有连接、事务和资源边界。",
-      example: "RequireNoRows 一旦命中就停止后续步骤并回滚；提交失败后用 SQLite 权威 autocommit 状态判断是否确定未提交。",
-      input: "数据库路径与 SqliteTransactionPlan",
-      output: "事务提交结果或 NotCommitted/OutcomeUnknown",
-      boundary: "不做应用层重试；被工作队列接管的事务即使调用 Future 被丢弃也会到达终态。"
-    },
-    "cpu-root": {
-      title: "CPU 任务根",
-      symbol: "BoundedCpuExecutor as CpuTaskExecutor",
-      shortSymbol: "BoundedCpuExecutor",
-      path: "src/execution/cpu.rs · src/runtime/cpu.rs",
-      status: "生产根已实现",
-      role: "在外部配置的有界工作资源中执行拥有型纯 CPU 计算。",
-      plain: "固定 std::thread worker 与有界队列让解码、JSON 改写和序列化不堵住异步 I/O 线程；线程数完全来自配置。",
-      example: "Reader 把数据库行分批解码；Rewriter 把内存文档改写交给同一根执行。",
-      input: "Send + 'static 的纯计算闭包",
-      output: "计算结果或不可用/panic 终态",
-      boundary: "CpuTaskExecutor 契约位于共享 execution::cpu，生产 worker 位于 runtime::cpu；每个任务隔离 panic，shutdown 停止准入、排空已接管任务并 join worker。"
-    },
-    "file-reader-root": {
-      title: "文件读取根",
-      symbol: "SystemFileSystem as FileReader",
-      shortSymbol: "SystemFileSystem · Read",
-      path: "src/runtime/filesystem.rs",
-      status: "生产根已实现",
-      role: "异步读取一个现存文件并交回解析后的真实路径与字节。",
-      plain: "MZ 文档读取器和 Lua Host 共用有界文件 worker；读取前检查文件大小并拒绝任意 reparse point。",
-      example: "Rewriter 读 source/data/Items.json；Lua Host 读用户指定脚本，两者依赖同一根契约。",
-      input: "PathBuf",
-      output: "ReadFile 或明确文件错误",
-      boundary: "进入 worker 后即使调用 Future 被丢弃，已接管的文件工作仍完成。"
-    },
-    "directory-lister-root": {
-      title: "目录列举根",
-      symbol: "SystemFileSystem as DirectoryLister",
-      shortSymbol: "SystemFileSystem · List",
-      path: "src/runtime/filesystem.rs",
-      status: "生产根已实现",
-      role: "异步列举现存目录的直接子项，不在业务层隐式递归。",
-      plain: "文档读取器只说需要哪些 Map；SystemFileSystem 负责 Unicode 路径、条目预算、稳定结果和 reparse 拒绝。",
-      example: "需要全部 Map 时列举 source/data；只需 Map042 时文档读取器可直接精确请求而不列目录。",
-      input: "目录路径",
-      output: "稳定子项列表或列举错误",
-      boundary: "只列直接子项；递归候选复制属于同一根承载的可恢复发布契约。"
-    },
-    "scoped-directory-editor-root": {
-      title: "候选目录编辑与复核根",
-      symbol: "SystemFileSystem as ScopedDirectoryEditor",
-      shortSymbol: "SystemFileSystem · Candidate Scope",
-      path: "src/runtime/filesystem.rs",
-      status: "生产根已实现",
-      role: "把 scope 绑定到候选物理身份和调用方声明的可编辑顶层集合，提供通用受控编辑与文件事实复核。",
-      plain: "文件根只理解安全相对路径、声明范围、身份、reparse、hardlink 和预算；data/js 顶层规则由 MZ WriteBack 拥有。",
-      example: "调用方声明 data/js 后，Lua 不能越界写入根下第三个顶层；硬链接或 reparse 也会在发布前被拒绝。",
-      input: "候选身份、安全相对路径与调用方声明的顶层集合",
-      output: "物理身份绑定、受控文件操作或完整树校验结果",
-      boundary: "不持有发布 token，不理解 MZ；MZ 自己验证顶层精确为 data/js，SystemFileSystem 负责环境机制。"
-    },
-    "existing-directory-root": {
-      title: "现存目录解析根",
-      symbol: "SystemFileSystem as ExistingDirectoryResolver",
-      shortSymbol: "SystemFileSystem · Resolve",
-      path: "src/runtime/filesystem.rs",
-      status: "生产根已实现",
-      role: "在操作发生前重新观测指定路径是否仍是可用目录。",
-      plain: "SystemFileSystem 返回规范绝对目录并拒绝 reparse；OpenedProject 因而不只相信数据库中的既有 metadata。",
-      example: "source/js 被外部删除后，打开项目在这个根边界明确失败。",
-      input: "期望的目录路径",
-      output: "解析后目录路径或 NotFound/NotDirectory/IO",
-      boundary: "与文件读取、目录列举和可恢复发布共享同一文件 worker 生命周期。"
-    },
-    "recoverable-directory-root": {
-      title: "可恢复目录发布根",
-      symbol: "SystemFileSystem as RecoverableDirectoryPublisher",
-      shortSymbol: "SystemFileSystem · Publish",
-      path: "src/runtime/filesystem.rs",
-      status: "生产根已实现",
-      role: "在目标同级准备完整候选，按 prepare 时确定的 CreateNew 或 ReplaceExisting 意图可恢复地整体发布。",
-      plain: "不可复制的 staged token 绑定 publisher 实例、操作身份、句柄与发布意图，只能由同一根 publish 或 discard 一次。",
-      example: "Init 新建项目时 CreateNew，收敛既有项目时 ReplaceExisting；WriteBack 用 journal、backup 和 Win32 file ID 整体替换固定输出。",
-      input: "DirectoryStageRequest，以及之后按值消费的 StagedDirectory",
-      output: "候选、发布、恢复或清理的精确终态",
-      boundary: "同目标跨进程锁、CRC journal、Win32 handle rename、file ID 复核与按目标惰性恢复均由 SystemFileSystem 完整负责。"
-    },
-    "lua-runtime-root": {
-      title: "可信 Lua Runtime 根",
-      symbol: "TrustedLua54Runtime as TrustedLuaRuntimeExecutor",
-      shortSymbol: "TrustedLua54Runtime",
-      path: "src/runtime/lua.rs",
-      status: "生产根已实现",
-      role: "每次脚本创建一个专用 OS 线程，并用同步 start 接管程序、Host calls 与唯一 finalizer。",
-      plain: "start 接管后，无论线程创建、编译、执行、取消或 panic，都产生执行与清理报告并恰好终结一次会话。",
-      example: "WriteBack 脚本开始后 execution handle 被丢弃只发送取消；job supervisor 仍持有 finalizer 并完成数据库清理报告。",
-      input: "start(OwnedLuaProgram, calls, finalizer)",
-      output: "分别保留 VM、Host 调用与清理终态的执行报告",
-      boundary: "一次命令最多一个脚本；vendored Lua 5.4 VM 位于该脚本的专用线程，SQLite 与 LLM Future 由主 Tokio Runtime 驱动。"
-    },
-    "sqlite-session-root": {
-      title: "SQLite 交互会话根",
-      symbol: "RusqliteStorage as SqliteInteractiveSessionFactory",
-      shortSymbol: "RusqliteStorage · Session",
-      path: "src/runtime/sqlite.rs",
-      status: "生产根已实现",
-      role: "为可信 Lua 启动单连接 actor，并返回可共享 operations 与不可复制的唯一 SessionFinalizer。",
-      plain: "operations 只负责 query、execute 与事务操作；finalizer 按值消费，禁止新命令、排空已接管命令、回滚活动事务并关闭和 join actor。",
-      example: "脚本正常返回但仍有活动事务时，finalizer 回滚并以 had_unclosed_transaction 告知 Host；清理首因与可选关闭次因可以同时保留。",
-      input: "project.db 路径",
-      output: "OpenedSqliteInteractiveSession { operations, finalizer } 或打开错误",
-      boundary: "BEGIN 固定为 DEFERRED；命令通道容量固定为 1，finalizer 走独立控制通道；复杂事务观察留在 SQLite 内部。"
-    },
-    "llm-contract": {
-      title: "公共 LLM 请求契约",
-      symbol: "LlmRequestExecutor · ChatMessage · LlmResponse",
-      shortSymbol: "Shared LLM Contract",
-      path: "src/llm.rs",
-      status: "crate 私有共享核心已实现",
-      role: "让不同引擎业务与可信 Lua 用同一组消息、响应和单次失败语义调用模型根。",
-      plain: "公共层只表达一次非流式调用需要什么、返回什么；它不知道 MZ 资产、提示词规划或网络重试策略。",
-      example: "MZ Standard 和 Translate Lua 都提交 ChatMessage，并收到同一种 LlmResponse，共享同一客户端、连接池和 RPM/burst 配额。",
-      input: "受信 Client 与 ChatMessage 列表",
-      output: "LlmResponse 或 Retryable/Fatal 单次请求错误",
-      boundary: "请求 wire、固定 Bearer、并发队列、RPM/burst 和网络错误分类属于具体根；重试、响应业务解析和结果提交仍属于调用方。"
-    },
-    "llm-root": {
-      title: "LLM 请求生产根",
-      symbol: "OpenAiChatCompletionExecutor as LlmRequestExecutor",
-      shortSymbol: "OpenAiChatCompletionExecutor",
-      path: "src/runtime/llm.rs",
-      status: "生产根已实现",
-      role: "按受信公共 Client 发出 OpenAI-compatible Chat Completions 非流式请求。",
-      plain: "Standard Translate 与 Translate Lua 共享同一 Executor、Client、连接池和速率额度；其他阶段的 ctx.llm 为 nil。",
-      example: "parameters 为空对象时，请求正文严格只有 model、messages、stream=false；WriteBack 不会偷用某个默认 Client。",
-      input: "公共 Client 与消息",
-      output: "content、finish reason、可选 provider request/response ID、可选 usage，或结构化请求错误",
-      boundary: "HTTP 200 只要求完整 JSON、唯一数值 index 0 及其 content/finish_reason；Content-Type、role 和可选元数据不成为供应商兼容障碍。"
-    },
-    "delay-root": {
-      title: "异步等待根",
-      symbol: "TokioAsyncDelay as AsyncDelay",
-      shortSymbol: "TokioAsyncDelay",
-      path: "src/runtime/delay.rs",
-      status: "生产根已实现",
-      role: "用 Tokio time driver 执行业务层已经决定的网络重试等待。",
-      plain: "根只睡眠指定时长，不拥有重试次数、间隔或 Retry-After 策略；Future 被丢弃即取消等待。",
-      example: "Executor 判断一次 429 可重试并选定等待时长后，TokioAsyncDelay 只执行这次等待。",
-      input: "Duration",
-      output: "等待完成；Future 被丢弃时取消本次等待",
-      boundary: "重试判断仍由 Standard Task Executor 拥有。"
-    },
-    "audit-ledger": {
-      title: "统一强审计账本",
-      symbol: "JsonLinesAuditLedger · AuditLedger",
-      shortSymbol: "audit.jsonl",
-      path: "src/att_mz/audit.rs · src/runtime/json_lines.rs",
-      status: "领域 wire 与通用持久根已实现",
-      role: "为四个命令持久化 run 生命周期、翻译任务意图/终态和写回发布意图/终态，并在 sync_data 后确认。",
-      plain: "MZ 拥有 command/event/payload 与结构化位置；通用 JSONL 根只负责有界队列、跨进程锁、追加、尾部恢复、轮转、retention 和刷盘。",
-      example: "translation_task_started 未确认时不发送模型请求；write_back_publish_started 未确认时不交换目录。",
-      input: "AuditEvent 与本次 run/project/command/profile 上下文",
-      output: "EventId，或 NotPersisted/OutcomeUnknown/PersistedButMaintenanceFailed",
-      boundary: "固定 audit.jsonl；每条事件独立 UUID，意图与终态共享 operation_id；副作用已生效但终态审计失败时明确报告审计未确认。"
-    },
-    "lua-extraction": {
-      title: "Lua 提取",
-      symbol: "LuaExtractionService",
-      shortSymbol: "Lua Extraction",
-      path: "src/att_mz/extract/lua.rs",
-      status: "业务逻辑已实现",
-      role: "把可信项目上下文交给 Lua Host，运行项目自己的提取脚本。",
-      plain: "它是定制出口。Rust 标准流程不猜脚本想做什么，只把本次 Extract 所需的可信事实交过去，并等 Host 给出明确结果。",
-      example: "项目把文本放在自建表 custom_dialogue。Lua 脚本可以按自己的协议读取并写入自己的表，不强迫它伪装成 Builtin 资产。",
-      input: "OpenedProject 与 Lua 脚本路径",
-      output: "Lua 阶段完成或明确失败"
-    },
-    "lua-host": {
-      title: "可信 Lua Host",
-      symbol: "TrustedLuaExecutionHostingService",
-      shortSymbol: "Trusted Lua Host",
-      path: "src/att_mz/lua/hosting.rs",
-      status: "业务逻辑已实现，可复用",
-      role: "统一提供 project/json/source/mz/db 与阶段专属核心门面，并管理会话、候选和唯一清理。",
-      plain: "Extract 只多出 extract，Translate 只多出 translation/llm，WriteBack 只多出 candidate output/write_back；不存在的能力就是 nil。",
-      example: "WriteBack 脚本报错时，Host 回滚未提交的数据库事务并关闭会话；脚本已显式提交的结果不会被伪装成从未发生。",
-      input: "LuaInvocation：阶段、脚本、项目事实、可选 LLM Client 或未发布候选",
-      output: "脚本完成，或带清理结果的明确错误",
-      boundary: "ctx.db 始终保留完整 SQL 逃生口；JSON/MZ/翻译准备/布局/候选文件优先复用 Rust 核心语义。"
-    },
-    "translate-service": {
-      title: "Translate 总控",
-      symbol: "TranslateService",
-      shortSymbol: "TranslateService",
-      path: "src/att_mz/translate/service.rs",
-      status: "业务逻辑已实现",
-      role: "在项目租约内使用配置边界已选定的 MZ Profile 与项目开启后解析的语言资源，验证来源与 owner freshness，再依次运行 Standard 和可选 Lua。",
-      plain: "它是翻译总负责人。规划、执行、验收和入库都不是与它平行的“大功能”，而是它交给 Standard 子总控继续管理的内部职责。",
-      example: "用户选择 profile=quality。Translate 找到唯一配置，读取 demo 项目，先让 Standard 完整结束；只有成功后，才运行可选 Lua 翻译脚本。",
-      input: "项目名、MzTranslationProfile、ResolvedMzTranslationResources、可选完整术语/占位符快照路径与 SelectedLua",
-      output: "Standard 报告与可选 Lua 完成结果",
-      boundary: "Standard 执行分支直接展示模型与等待生产根；Lua 分支复用同一公共 LLM Client。"
-    },
-    "standard-translation": {
-      title: "Standard 子总控",
-      symbol: "StandardTranslationService",
-      shortSymbol: "Standard Translation",
-      path: "src/att_mz/translate/standard.rs",
-      status: "业务逻辑已实现",
-      role: "完整拥有标准翻译的资源收敛、逐叶状态准备、Pending 执行和结果提交顺序。",
-      plain: "它先解析本次可选资源替换并读取一致语料，再在第一笔事务里保存资源、清理失效译文和传播可复用结果；只有仍为 Pending 的叶子会进入模型。",
-      example: "完全相同的再次运行会发现所有叶子都是 Current，既不调用模型，也不写数据库；只改术语时只让受影响叶子重新进入 Pending。",
-      input: "StoredProjectRecord、MzTranslationProfile、ResolvedMzTranslationResources 与可选完整资源替换",
-      output: "StandardTranslationRunReport",
-      boundary: "每个模型任务先审计意图，再发送请求；验收和提交确定后审计终态。任务结果由 Complete/Partial/Unavailable 数据枚举直接表达。"
-    },
-    "asset-reader": {
-      title: "标准资产读取",
-      symbol: "MzStandardTranslationAssetReadingService",
-      shortSymbol: "Standard Asset Reader",
-      path: "src/att_mz/translate/asset_reader.rs",
-      status: "业务逻辑已实现",
-      role: "把新鲜 owner 的标准资产、既有译文/state、分组和两行持久资源读成一份一致语料。",
-      plain: "它不是分表读一点就交一点，而是在同一读取视图里拼出 Planner 真正需要的完整现场，避免不同读取时点彼此错位。",
-      example: "一条物品说明、它所属物品组、既有译文/state、terminology 和 placeholder_rules 必须来自同一个一致快照。",
-      input: "StoredProjectRecord",
-      output: "StandardTranslationCorpus"
-    },
-    "planner": {
-      title: "任务规划",
-      symbol: "MzStandardTranslationTaskPlanningService",
-      shortSymbol: "Task Planner",
-      path: "src/att_mz/translate/planner.rs",
-      status: "业务逻辑已实现",
-      role: "按自然顺序保护占位符、建立逐叶 state、完成全局去重，并只把 Pending 代表切成任务块。",
-      plain: "它先为每个叶子判定 Current、Stale、NotApplicable 或 Pending，再把可复用结果传播计划和模型工作分开；它不调用模型。",
-      example: "十处契约相同的“保存”会选自然顺序最早的一处作 Pending 代表；已有匹配 state 的译文则直接 Current，不再产生模型任务。",
-      input: "一致语料、MzTranslationProfile 与同一份 LanguagePair/Prompt/语言模块解析资源",
-      output: "包含 preparation 与 Pending TaskBlock 的 StandardTranslationPlan"
-    },
-    "planning-resource": {
-      title: "收敛翻译资源",
-      symbol: "JsonTranslationPlanningResourceReadingService",
-      shortSymbol: "Planning Resource Reader",
-      path: "src/att_mz/translate/planning_resource.rs",
-      status: "业务逻辑已实现",
-      role: "把可选外部文件解释为完整替换；未提供的种类直接复用数据库中的规范快照。",
-      plain: "文件路径表示该资源的完整替换。提供文件就替换整行，[] 明确清空；省略则继续使用数据库当前内容。",
-      example: "本轮只提供 terminology.json 时，术语整行被替换，而 placeholder_rules 保持数据库原值；下次两者都省略仍复用这两行。",
-      input: "数据库 terminology/placeholder_rules 与两个可选完整替换文件",
-      output: "两份规范 JSON、受信规划资源与待持久化替换"
-    },
-    "translation-state": {
-      title: "逐叶翻译状态",
-      symbol: "TranslationStateFingerprint",
-      shortSymbol: "Translation State",
-      path: "src/att_mz/translate/planner.rs",
-      status: "标准翻译领域能力已实现",
-      role: "用 32 字节 SHA-256 唯一证明一条译文仍对应当前可翻译语义，并据此建立 Current、Stale、NotApplicable、Pending。",
-      plain: "state 只包含会改变该叶翻译含义的事实；并发、装箱容量、组上下文和配置名字不会让正确译文无故失效。",
-      example: "改 URL/model/parameters、系统提示、语言策略、该叶术语或保护绑定会让 state 变化；只改 max_message_characters 或 Profile ID 不会。",
-      input: "语言策略、提示、模型请求语义、叶身份、原文、保护绑定、逐叶术语与最终译文",
-      output: "固定 32 字节 state 与逐叶分类",
-      boundary: "包含 owner/table/unit/field/exact，不包含 group/scope/sibling、secret 或网络容量策略。"
-    },
-    "language-catalog": {
-      title: "共享语言目录",
-      symbol: "LanguageId · LanguagePair · LanguageModuleCatalog",
-      shortSymbol: "Language Catalog",
-      path: "src/language.rs",
-      status: "共享领域能力已实现",
-      role: "按规范 LanguageId 精确选择一个 LanguageModule，并把同一个 Arc 注入译前分析与译后处理。",
-      plain: "LanguageId 在边界执行 RFC 5646 解析、注册表校验与 canonicalization。Translate 完整验证全局目录，规范化后重复、缺失或默认回退都不成立。",
-      example: "项目源语言 en-us 在 Init 时保存为 en-US，并以 en-US 精确查询模块；目标 zh-Hans 仍用于 Prompt 和项目事实，不创建一个“简中模块”。",
-      input: "规范源 LanguageId",
-      output: "共享 LanguageModule，或明确的未知 ID",
-      boundary: "LanguageId、LanguagePair 与 Catalog 是 crate 级共享领域能力，不依赖 MZ、数据库、CLI、控制符或模型协议；Catalog 没有目标语言分支。"
-    },
-    "resolved-mz-translation-resources": {
-      title: "精确 MZ 翻译资源",
-      symbol: "ResolvedMzTranslationResources",
-      shortSymbol: "Resolved MZ Resources",
-      path: "src/att_mz/translate/profile.rs · src/application/command.rs",
-      status: "MZ 受信资源已实现",
-      role: "项目打开后按规范 LanguagePair 一次选择源语言模块，并读取唯一 MZ system prompt。",
-      plain: "Prompt 固定来自 prompts.root/mz/source--target.md；它不属于 Profile。普通文件、UTF-8、非空白和精确语言对全部成立后，Planner、Executor 与 Lua 复用同一语言模块和 Prompt。",
-      example: "ja → zh-Hans 只读取 mz/ja--zh-Hans.md；文件缺失时不尝试父语言、大小写变体或默认文件，也不会开始 LLM 请求。",
-      input: "项目 metadata 的 LanguagePair、全局 LanguageModuleCatalog 与 prompts.root",
-      output: "MzSystemPrompt + 同一 Arc<dyn LanguageModule>",
-      boundary: "Prompt 协议和路由由 MZ 拥有；共享层只拥有 LanguageId/Pair、语言模块和文件能力。"
-    },
-    "japanese-language": {
-      title: "日语语言能力",
-      symbol: "JapaneseLanguageModule",
-      shortSymbol: "Japanese Language",
-      path: "src/language.rs",
-      status: "共享领域能力已实现",
-      role: "判断日文原文是否需要翻译、检查真实连续假名残留，并在结构唯一时修复日文引号风格。",
-      plain: "它只看自然文本，保护区对它是不透明边界。译前记住完整的「」和『』嵌套结构；译后若模型只是换成了能唯一对应的其他引号，就安全换回来。",
-      example: "原文“彼は「これは『勇者』の剣だ」と言った。”若译成“他说：“这是‘勇者’之剑。””，唯一拓扑可修成“他说：「这是『勇者』之剑。」”；数量或嵌套对不上时原样保留，不判失败。",
-      input: "LanguageText、译前 LanguageAnalysis 与外部日语策略",
-      output: "是否需要翻译、可选残留事实或安全 RepairPlan"
-    },
-    "english-language": {
-      title: "英语语言能力",
-      symbol: "EnglishLanguageModule",
-      shortSymbol: "English Language",
-      path: "src/language.rs",
-      status: "共享领域能力已实现",
-      role: "用彼此独立的外部策略判断英文原文是否需要翻译，并检查译文中真实连续的英文复制残留。",
-      plain: "它不会把译文里散落的英文词硬拼成一句残留，也不会跨保护区连接单词。译前门槛和译后门槛分别配置，不能互相冒充。",
-      example: "原文里的连续短语“New Game”原样出现在译文时可以按残留策略报告；“New”与“Game”分散在不同位置时不会拼成虚构命中。",
-      input: "LanguageText、译前 LanguageAnalysis 与外部英语策略",
-      output: "是否需要翻译、可选连续残留；不修改译文"
-    },
-    "placeholder-service": {
-      title: "占位符保护",
-      symbol: "Pcre2PlaceholderService",
-      shortSymbol: "Placeholder Service",
-      path: "src/att_mz/translate/placeholder.rs",
-      status: "业务逻辑已实现",
-      role: "精确识别内建和自定义控制片段，替换成稳定 token，并保留可恢复契约。",
-      plain: "它只给 Builtin 或外部规则精确命中的片段套保护壳；其他反斜杠序列作为自然文本进入翻译，不触发启发式阻断。模型返回后再检查 token 数量和身份。",
-      example: "“\\C[2]勇者”里的“\\C[2]”会被保护，只把“勇者”交给翻译。结果缺少 token 时不会被接受。",
-      input: "原文与自定义占位符规则",
-      output: "保护后的文本与 AppliedPlaceholder 列表"
-    },
-    "placeholder-token-envelope": {
-      title: "ATT token 信封",
-      symbol: "placeholder_token",
-      shortSymbol: "ATT Token Envelope",
-      path: "src/att_mz/placeholder_token.rs",
-      status: "crate 私有共享协议已实现",
-      role: "唯一拥有 ATT token 的保留前缀、闭合信封扫描和命名空间残留检测。",
-      plain: "它让生成器、响应质检和写回布局对什么算完整 token、什么算破损保留前缀持有同一答案。",
-      example: "⟦ATT_NAME_WHOLE_0000⟧ 是完整信封；只有 ⟦ATT_ 而没有闭合符时会被明确拒绝。",
-      input: "待生成或扫描的文本",
-      output: "稳定信封文本、完整 token 序列或未闭合前缀错误"
-    },
-    "deduplication": {
-      title: "全局确定性去重",
-      symbol: "deduplicate_translation_candidates",
-      shortSymbol: "Deterministic Deduplication",
-      path: "src/att_mz/translate/deduplication.rs",
-      status: "算法已实现",
-      role: "在全项目候选中稳定选代表，并区分可直接复用、需要翻译和存在冲突的情况。",
-      plain: "它不只是删重复字符串。原文、占位符契约、既有译文等事实必须满足相同契约，才能安全共用一个决定；代表选择不受并发完成顺序影响。",
-      example: "十个“保存”且契约相同，只翻一次；如果其中两处已有互相冲突的可信译文，去重会明确报冲突，不会随便挑一个。",
-      input: "按自然顺序排列的 TranslationDeduplicationCandidate",
-      output: "代表、复用关系、失效关系或冲突"
-    },
-    "executor": {
-      title: "任务执行",
-      symbol: "MzStandardTranslationTaskExecutionService",
-      shortSymbol: "Task Executor",
-      path: "src/att_mz/translate/executor.rs",
-      status: "业务逻辑已实现",
-      role: "在有界并发下调用翻译能力，只重试可恢复网络失败，并逐任务产出结果。",
-      plain: "它像受控派单员：不会无限并发，也不会见错就重试。模型返回后还必须交给响应处理模块逐 ID 验货。",
-      example: "网络暂时断开可以按配置重试；若模型回了非法协议，重试也不会变正确，因此直接作为该任务的失败结果。",
-      input: "TranslationTaskBlock、MzTranslationProfile 的 request/并发策略与同一已解析语言模块",
-      output: "Complete / Partial / Unavailable 数据枚举，含唯一 NonZeroUsize 尝试次数"
-    },
-    "response-processor": {
-      title: "响应结构与逐 ID 验收",
-      symbol: "TranslationTaskResponseProcessingService",
-      shortSymbol: "Response Processor",
-      path: "src/att_mz/translate/executor.rs",
-      status: "业务逻辑已实现",
-      role: "先按严格信封、完整顶层数组和整批 wire schema 原子验收响应；结构通过后逐 ID 完成通用文本检查，再用译前 LanguageAnalysis 检查残留、执行可选安全修复并恢复控制码。",
-      plain: "它像两道质检门：前一道不从说明文字中猜数组，也不修尾逗号或坏字段，整批结构不合格就成为不重试的 ModelResponseUnusable；结构合格后才逐 ID 检查空白、BOM、换行、占位符和源语残留，此时一个 ID 坏了不会拖掉其他合格结果。",
-      example: "任务期待 ID0 和 ID1。若任一元素缺字段，整批响应不可用；若结构完整但 ID0 有源语残留，ID1 仍可通过并形成 Partial。",
-      input: "任务契约与模型原始响应",
-      output: "逐 ID 的合格 Patch、未解决原因与协议诊断"
-    },
-    "result-store": {
-      title: "结果入库",
-      symbol: "MzStandardTranslationResultStorageService",
-      shortSymbol: "Translation Result Store",
-      path: "src/att_mz/translate/result_store.rs",
-      status: "业务逻辑已实现",
-      role: "先原子保存资源替换、清除 Stale/NotApplicable 并传播复用，再按自然任务顺序提交已验收译文/state。",
-      plain: "第一笔事务先把数据库变成规划所依据的权威状态；之后每次提交仍复核叶身份，防止等待模型期间的新事实被旧计划覆盖。",
-      example: "规划后某条原文已被重新提取并修改，Store 会判定计划过时；完全 Current 的重跑则 preparation 为空，不产生写事务。",
-      input: "StandardTranslationPlan 与已验收任务结果",
-      output: "已提交数量、未解决项与持久状态"
-    },
-    "lua-translation": {
-      title: "Lua 翻译",
-      symbol: "LuaTranslationService",
-      shortSymbol: "Lua Translation",
-      path: "src/att_mz/translate/lua.rs",
-      status: "业务逻辑已实现",
-      role: "在 Standard 正常完成后，把公共翻译准备门面、同一 LLM Client 和完整 db 逃生口交给可信 Lua。",
-      plain: "脚本可用 ctx.translation.prepare 复用 Rust 的占位符、术语、语言分析和结果验收；只有真正自定义的数据协议才需要自行处理。",
-      example: "脚本读取自建 quest_text 后调用 prepared=ctx.translation.prepare(text)，只在 Pending 时把 prepared.model_text 发送给 ctx.llm，再用 prepared:accept 验收。",
-      input: "StoredProjectRecord、ResolvedMzTranslationResources、同一 LLM Client 与脚本路径",
-      output: "Lua 翻译阶段完成或明确失败"
-    },
-    "writeback-service": {
-      title: "WriteBack 总控",
-      symbol: "WriteBackService",
-      shortSymbol: "WriteBackService",
-      path: "src/att_mz/write_back.rs",
-      status: "顶层业务逻辑已实现",
-      role: "在项目租约内打开一次项目，把 Standard 与可选 Lua 的修改汇入同一个候选，验证后只发布一次。",
-      plain: "它像写回班组长：Standard 先交出完整文件覆盖，Publisher 建候选，Lua 只改这个未发布候选；任何发布前失败都会终结候选并保留旧输出。",
-      example: "Lua 修改候选后报错，WriteBack 只调用一次 discard，demo/write_back 仍是上一轮完整输出；publish 接管 token 后上层不再清理。",
-      input: "项目名与可选 Lua 脚本路径",
-      output: "固定输出根、Standard 汇总与 Lua 执行状态",
-      boundary: "MZ 复核 data/js 领域结构，文件根复核通用身份与预算；发布意图先刷盘，发布终态随后写入统一 audit.jsonl。"
-    },
-    "standard-writeback": {
-      title: "Standard 写回准备",
-      symbol: "StandardWriteBackService",
-      shortSymbol: "Standard WriteBack",
-      path: "src/att_mz/write_back/standard.rs",
-      status: "业务编排已实现",
-      role: "读取新鲜资产快照，按稳定顺序完成布局、Mutation 规划和完整文档重写，但不发布。",
-      plain: "它交付完整文件覆盖、汇总和人工诊断。候选、Lua、发布与强审计由 WriteBack 总控继续编排，因此整个命令只有一个可见发布点。",
-      example: "某段译文超过对话宽度但没有安全断点。Standard 仍把原译文写入候选覆盖，manual_layout_units 加一，不把正常人工处理升级成技术错误。",
-      input: "OpenedProject 与显式 MzWriteBackLayoutProfile",
-      output: "StandardWriteBackPreparation：重写文档、汇总与完整人工诊断",
-      boundary: "Reader 与 Rewriter 分别连接 RusqliteStorage、BoundedCpuExecutor 和 SystemFileSystem；不拥有目录发布或审计。"
-    },
-    "writeback-asset-reader": {
-      title: "读取写回资产",
-      symbol: "MzStandardWriteBackAssetReadingService",
-      shortSymbol: "WriteBack Asset Reader",
-      path: "src/att_mz/write_back/asset_reader.rs",
-      status: "非根业务实现完成",
-      role: "在 owner freshness 已验证后，从五张标准资产表读取不含术语数据的一致写回快照。",
-      plain: "它只交付每个文本位置的原文、可选数据库译文和结构化角色。一次八列 UNION 查询不包含任何术语表或术语字段。",
-      example: "某个物品名称有译文而说明没有译文。Reader 同时返回两个叶子，Standard 对名称计入应用译文，对说明计入保留原文。",
-      input: "OpenedProject",
-      output: "StandardWriteBackSnapshot",
-      boundary: "五表 SQL、位置/角色解码与并行组装由 RusqliteStorage 和 BoundedCpuExecutor 支撑。"
-    },
-    "writeback-layouter": {
-      title: "保守文本布局",
-      symbol: "ConservativeMzWriteBackTextLayouter",
-      shortSymbol: "WriteBack Layouter",
-      path: "src/att_mz/write_back/standard/layout.rs",
-      status: "非根业务实现完成",
-      role: "按显式区域行宽处理对话正文块、滚动文本块和规范帮助说明，并返回 Applied 或正常 Manual。",
-      plain: "它按 grapheme 与全角等价宽度扫描可见文本，只在词界/标点安全断点换行，再追踪行首包裹符状态补全角缩进。",
-      example: "对话正文超宽但没有安全断点，或存在破损控制序列，Layouter 返回 Manual；Standard 保留原始数据库译文。",
-      input: "MzWriteBackLayoutRequest 与对应 MaxFullwidthChars",
-      output: "MzWriteBackLayoutOutcome",
-      boundary: "布局是已实现的同步纯业务能力，不依赖环境根；不可判定的自定义占位符仍按可见文本或 Manual 保守处理。"
-    },
-    "writeback-rewriter": {
-      title: "重建 MZ 文档",
-      symbol: "MzWriteBackDocumentRewritingService",
-      shortSymbol: "MZ Document Rewriter",
-      path: "src/att_mz/write_back/rewriter.rs",
-      status: "非根业务实现完成",
-      role: "把强类型 Mutation Plan 应用到冻结文档，生成候选文档而不直接发布。",
-      plain: "它理解普通 JSON 位置、插件参数以及会改变数量的 401/405 指令块；Standard 因此无需操作裸命令码。",
-      example: "一个对话译文含三个硬行时，Rewriter 把对应正文段重建为三条 401 指令，同时让缺译的相邻原命令整个保持不变。",
-      input: "OpenedProject 与 StandardWriteBackMutationPlan",
-      output: "带项目身份与完整文件覆盖的 MzRewrittenDocuments",
-      boundary: "JSON/Note/Comment/插件参数改写、401/405 重建和序列化已实现；文档读取与 CPU 分别连接 SystemFileSystem 和 BoundedCpuExecutor。"
-    },
-    "writeback-publisher": {
-      title: "完整候选生命周期",
-      symbol: "StandardWriteBackPublishingService",
-      shortSymbol: "WriteBack Publisher",
-      path: "src/att_mz/write_back/publisher.rs",
-      status: "非根业务实现完成",
-      role: "把重写文档与冻结 data/js 组成唯一候选，提供借用式 validate，并以按值 token 提供 publish 或 discard 两种终结路径。",
-      plain: "prepare 后候选仍不可见；无论 Lua 是否执行，WriteBack 都先调用 validate。失败时 token 仍可只丢弃一次，成功后才交给 publish 整体替换固定输出。",
-      example: "即使没有 Lua，候选缺少 js 也会在 validate 阶段失败并丢弃；Lua 新增 reparse point 时经过同一条校验路径。",
-      input: "OpenedProject 与 RewrittenDocuments",
-      output: "PreparedWriteBackCandidate、PublishedWriteBack 或明确终结错误",
-      boundary: "候选递归复制和发布由 RecoverableDirectoryPublisher 承担；借用式身份绑定与普通树预算复核由同一 SystemFileSystem 的 ScopedDirectoryEditor 承担。"
-    },
-    "lua-writeback": {
-      title: "Lua 写回",
-      symbol: "LuaWriteBackService",
-      shortSymbol: "Lua WriteBack",
-      path: "src/att_mz/write_back/lua.rs",
-      status: "非根业务实现完成",
-      role: "在 Standard 已完成但尚未发布的同一个完整候选上运行用户明确选择的可信 Lua 程序。",
-      plain: "它先确认 candidate token 与当前项目身份一致，再把 ctx.output 绑定到候选根；脚本看不到把半成品发布到固定输出的能力。",
-      example: "脚本通过 ctx.output 为自定义插件补写 js 数据。若它失败，错误包含脚本和候选路径，WriteBack 随后丢弃候选一次。",
-      input: "OpenedProject、PreparedWriteBackCandidate 与脚本路径",
-      output: "Lua 阶段成功或带上下文的明确失败",
-      boundary: "ctx.output 只操作候选；ctx.write_back.layout 复用 Rust 布局语义，完整候选最终校验属于外层 Publisher，ctx.db 的显式提交不与目录发布组成跨资源事务。"
-    }
-  };
-
-  function n(uid, moduleId, children, options) {
-    var node = {
-      uid: uid,
-      module: moduleId,
-      children: children || []
-    };
-    if (options) {
-      Object.keys(options).forEach(function (key) {
-        node[key] = options[key];
-      });
-    }
-    return node;
-  }
-
-  ROOTS.init.tree = n("init-command-runner", "production-command-runner", [
-    n("init-command-config", "command-configuration", [], { reused: true }),
-    n("init-audit", "audit-ledger", [], { order: "①", reused: true }),
-    n("init-service", "init-service", [
-    n("init-cancellation", "cooperative-cancellation", [], { reused: true }),
-    n("init-project-name", "project-name", [], { order: "①" }),
-    n("init-project-lease", "project-command-lease", [], { order: "②", reused: true }),
-    n("init-existing-directory", "existing-directory-root", [], { order: "③" }),
-    n("init-source-fingerprint", "source-fingerprint", [
-      n("init-directory-fingerprint", "directory-fingerprint-root", [], { reused: true })
-    ], { order: "④", reused: true }),
-    n("init-workspace-create", "project-workspace-creator", [
-      n("init-workspace-cancellation", "cooperative-cancellation", [], { reused: true }),
-      n("init-workspace-layout", "project-workspace-layout"),
-      n("init-existing-project-record", "project-record-reader", [
-        n("init-project-record-sql", "sqlite-query-root", [], { reused: true })
-      ], { reused: true, optional: true }),
-      n("init-project-db-create", "project-db-create", [
-        n("init-project-db-sqlite", "sqlite-database-creator-root")
-      ]),
-      n("init-recoverable-publish", "recoverable-directory-root")
-    ], { order: "⑤" })
-    ])
-  ]);
-
-  ROOTS.extract.tree = n("extract-command-runner", "production-command-runner", [
-    n("extract-command-config", "command-configuration", [], { reused: true }),
-    n("extract-audit", "audit-ledger", [], { order: "①", reused: true }),
-    n("extract-service", "extract-service", [
-    n("extract-cancellation", "cooperative-cancellation", [], { reused: true }),
-    n("extract-project-lease", "project-command-lease", [], { order: "①", reused: true }),
-    n("extract-project-open", "project-opener", [
-      n("extract-project-record", "project-record-reader", [
-        n("extract-project-layout", "project-workspace-layout", [], { reused: true }),
-        n("extract-project-record-sql", "sqlite-query-root", [], { reused: true })
-      ]),
-      n("extract-existing-directory", "existing-directory-root", [], { reused: true }),
-      n("extract-source-fingerprint", "source-fingerprint", [
-        n("extract-directory-fingerprint", "directory-fingerprint-root", [], { reused: true })
-      ], { reused: true })
-    ], { order: "②" }),
-    n("extract-builtin", "builtin-extraction", [
-      n("builtin-doc-reader", "document-reader", [
-        n("builtin-file-reader", "file-reader-root", [], { reused: true }),
-        n("builtin-directory-lister", "directory-lister-root", [], { reused: true }),
-        n("builtin-doc-cpu", "cpu-root", [], { reused: true })
-      ], { reused: true }),
-      n("builtin-snapshot-model", "snapshot-model", [], { reused: true }),
-      n("builtin-asset-store", "asset-store", [
-        n("builtin-standard-storage", "standard-asset-storage", [], { reused: true }),
-        n("builtin-location-codec", "location-codec", [], { reused: true }),
-        n("builtin-asset-store-sql", "sqlite-transaction-root", [], { reused: true })
-      ], { reused: true })
-    ], { order: "③" }),
-    n("extract-rules", "rules-extraction", [
-      n("rules-doc-reader", "document-reader", [
-        n("rules-file-reader", "file-reader-root", [], { reused: true }),
-        n("rules-directory-lister", "directory-lister-root", [], { reused: true }),
-        n("rules-doc-cpu", "cpu-root", [], { reused: true })
-      ], { reused: true }),
-      n("rules-snapshot-model", "snapshot-model", [], { reused: true }),
-      n("rules-asset-store", "asset-store", [
-        n("rules-standard-storage", "standard-asset-storage", [], { reused: true }),
-        n("rules-location-codec", "location-codec", [], { reused: true }),
-        n("rules-asset-store-sql", "sqlite-transaction-root", [], { reused: true })
-      ], { reused: true }),
-      n("rules-tag-spans", "tag-span-parser", [], { reused: true })
-    ], { order: "④" }),
-    n("extract-lua", "lua-extraction", [
-      n("extract-lua-host", "lua-host", [
-        n("extract-lua-file", "file-reader-root", [], { reused: true }),
-        n("extract-lua-runtime", "lua-runtime-root", [], { reused: true }),
-        n("extract-lua-session", "sqlite-session-root", [], { reused: true })
-      ], { reused: true })
-    ], { order: "⑤", optional: true })
-    ])
-  ]);
-
-  ROOTS.translate.tree = n("translate-command-runner", "production-command-runner", [
-    n("translate-command-config", "command-configuration", [
-      n("translate-language-catalog", "language-catalog", [
-        n("translate-language-ja", "japanese-language", [], { reused: true }),
-        n("translate-language-en", "english-language", [], { reused: true })
-      ], { reused: true })
-    ], { reused: true }),
-    n("translate-audit", "audit-ledger", [], { order: "①", reused: true }),
-    n("translate-service", "translate-service", [
-    n("translate-cancellation", "cooperative-cancellation", [], { reused: true }),
-    n("translate-project-lease", "project-command-lease", [], { order: "①", reused: true }),
-    n("translate-project-open", "project-opener", [
-      n("translate-project-record", "project-record-reader", [
-        n("translate-project-layout", "project-workspace-layout", [], { reused: true }),
-        n("translate-project-record-sql", "sqlite-query-root", [], { reused: true })
-      ], { reused: true }),
-      n("translate-existing-directory", "existing-directory-root", [], { reused: true }),
-      n("translate-source-fingerprint", "source-fingerprint", [
-        n("translate-directory-fingerprint", "directory-fingerprint-root", [], { reused: true })
-      ], { reused: true })
-    ], { order: "③", reused: true }),
-    n("translate-resolved-resources", "resolved-mz-translation-resources", [
-      n("translate-prompt-file", "file-reader-root", [], { reused: true }),
-      n("translate-resolved-language", "language-catalog", [], { reused: true })
-    ], { order: "④" }),
-    n("translate-standard", "standard-translation", [
-      n("standard-cancellation", "cooperative-cancellation", [], { reused: true }),
-      n("standard-audit", "audit-ledger", [], { reused: true }),
-      n("standard-asset-reader", "asset-reader", [
-        n("reader-standard-storage", "standard-asset-storage", [], { reused: true }),
-        n("reader-location-codec", "location-codec", [], { reused: true }),
-        n("reader-sql", "sqlite-query-root", [], { reused: true }),
-        n("reader-cpu", "cpu-root", [], { reused: true })
-      ], { order: "①" }),
-      n("standard-planner", "planner", [
-        n("planner-resources", "planning-resource", [
-          n("planner-resources-file", "file-reader-root", [], { reused: true }),
-          n("planner-resources-cpu", "cpu-root", [], { reused: true })
-        ]),
-        n("planner-language", "resolved-mz-translation-resources", [], { reused: true }),
-        n("planner-placeholder", "placeholder-service", [
-          n("planner-placeholder-token", "placeholder-token-envelope", [], { reused: true })
-        ]),
-        n("planner-translation-state", "translation-state"),
-        n("planner-dedup", "deduplication")
-      ], { order: "②" }),
-      n("standard-prepare-store", "result-store", [
-        n("prepare-store-standard-storage", "standard-asset-storage", [], { reused: true }),
-        n("prepare-store-location-codec", "location-codec", [], { reused: true }),
-        n("prepare-store-sql", "sqlite-transaction-root", [], { reused: true })
-      ], { order: "③" }),
-      n("standard-executor", "executor", [
-        n("executor-llm-contract", "llm-contract", [
-          n("executor-llm", "llm-root", [], { reused: true })
-        ], { reused: true }),
-        n("executor-delay", "delay-root"),
-        n("executor-response", "response-processor", [
-          n("response-token", "placeholder-token-envelope", [], { reused: true }),
-          n("response-language", "resolved-mz-translation-resources", [], { reused: true })
-        ])
-      ], { order: "④" }),
-      n("standard-store", "result-store", [
-        n("store-standard-storage", "standard-asset-storage", [], { reused: true }),
-        n("store-location-codec", "location-codec", [], { reused: true }),
-        n("store-sql", "sqlite-transaction-root", [], { reused: true })
-      ], { order: "⑤", reused: true })
-    ], { order: "⑤" }),
-    n("translate-lua", "lua-translation", [
-      n("translate-lua-resources", "resolved-mz-translation-resources", [], { reused: true }),
-      n("translate-lua-host", "lua-host", [
-        n("translate-lua-file", "file-reader-root", [], { reused: true }),
-        n("translate-lua-runtime", "lua-runtime-root", [], { reused: true }),
-        n("translate-lua-session", "sqlite-session-root", [], { reused: true }),
-        n("translate-lua-llm-contract", "llm-contract", [
-          n("translate-lua-llm", "llm-root", [], { reused: true })
-        ], { reused: true })
-      ], { reused: true })
-    ], { order: "⑥", optional: true })
-    ])
-  ]);
-
-  ROOTS.writeback.tree = n("writeback-command-runner", "production-command-runner", [
-    n("writeback-command-config", "command-configuration", [], { reused: true }),
-    n("writeback-audit", "audit-ledger", [], { order: "①", reused: true }),
-    n("writeback-service", "writeback-service", [
-    n("writeback-cancellation", "cooperative-cancellation", [], { reused: true }),
-    n("writeback-project-lease", "project-command-lease", [], { order: "①", reused: true }),
-    n("writeback-project-open", "project-opener", [
-      n("writeback-project-record", "project-record-reader", [
-        n("writeback-project-layout", "project-workspace-layout", [], { reused: true }),
-        n("writeback-project-record-sql", "sqlite-query-root", [], { reused: true })
-      ], { reused: true }),
-      n("writeback-existing-directory", "existing-directory-root", [], { reused: true }),
-      n("writeback-source-fingerprint", "source-fingerprint", [
-        n("writeback-directory-fingerprint", "directory-fingerprint-root", [], { reused: true })
-      ], { reused: true })
-    ], { order: "②", reused: true }),
-    n("writeback-standard", "standard-writeback", [
-      n("writeback-standard-cancellation", "cooperative-cancellation", [], { reused: true }),
-      n("writeback-asset-read", "writeback-asset-reader", [
-        n("writeback-reader-storage", "standard-asset-storage", [], { reused: true }),
-        n("writeback-reader-codec", "location-codec", [], { reused: true }),
-        n("writeback-reader-sql", "sqlite-query-root", [], { reused: true }),
-        n("writeback-reader-cpu", "cpu-root", [], { reused: true })
-      ], { order: "①" }),
-      n("writeback-layout", "writeback-layouter", [
-        n("writeback-layout-token", "placeholder-token-envelope", [], { reused: true })
-      ], { order: "②" }),
-      n("writeback-rewrite", "writeback-rewriter", [
-        n("writeback-document-reader", "document-reader", [
-          n("writeback-doc-file", "file-reader-root", [], { reused: true }),
-          n("writeback-doc-list", "directory-lister-root", [], { reused: true }),
-          n("writeback-doc-cpu", "cpu-root", [], { reused: true })
-        ], { reused: true }),
-        n("writeback-tag-spans", "tag-span-parser", [], { reused: true }),
-        n("writeback-rewriter-cpu", "cpu-root", [], { reused: true })
-      ], { order: "③" }),
-    ], { order: "③" }),
-    n("writeback-prepare-candidate", "writeback-publisher", [
-      n("writeback-prepare-cancellation", "cooperative-cancellation", [], { reused: true }),
-      n("writeback-prepare-recoverable", "recoverable-directory-root", [], { reused: true })
-    ], { order: "④" }),
-    n("writeback-lua", "lua-writeback", [
-      n("writeback-lua-host", "lua-host", [
-        n("writeback-lua-file", "file-reader-root", [], { reused: true }),
-        n("writeback-lua-runtime", "lua-runtime-root", [], { reused: true }),
-        n("writeback-lua-session", "sqlite-session-root", [], { reused: true })
-      ], { reused: true })
-    ], { order: "⑤", optional: true }),
-    n("writeback-validate", "writeback-publisher", [
-      n("writeback-validate-scope", "scoped-directory-editor-root", [], { reused: true })
-    ], { order: "⑥", reused: true }),
-    n("writeback-publish", "writeback-publisher", [
-      n("writeback-publisher-cancellation", "cooperative-cancellation", [], { reused: true }),
-      n("writeback-recoverable-publish", "recoverable-directory-root", [], { reused: true })
-    ], { order: "⑦", reused: true }),
-    n("writeback-operation-audit", "audit-ledger", [], { order: "⑧", reused: true })
-    ])
-  ]);
-
-  var NS = "http://www.w3.org/2000/svg";
-  var NODE_W = 188;
-  var NODE_H = 68;
-  var LEAF_SPAN = 210;
-  var LEVEL_GAP = 124;
-  var PAD_X = 28;
-  var PAD_Y = 30;
-  var MIN_TREE_WIDTH = 720;
-  var reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var hasRough = false;
-  var roughController = null;
-  var activeRootId = null;
-  var selectedUid = null;
-  var expanded = new Set();
-  var lastPositions = new Map();
-
-  var rootGrid = document.getElementById("root-grid");
-  var rootButtons = Array.prototype.slice.call(rootGrid.querySelectorAll(".root-card"));
-  var branchShell = document.getElementById("branch-shell");
-  var branchCard = document.getElementById("branch-card");
-  var branchKicker = document.getElementById("branch-kicker");
-  var branchTitle = document.getElementById("branch-title");
-  var branchSummary = document.getElementById("branch-summary");
-  var sequenceText = document.getElementById("sequence-text");
-  var workspace = document.getElementById("workspace");
-  var treeScroller = document.getElementById("tree-scroller");
-  var treeFoot = document.getElementById("tree-foot");
-  var inspector = document.getElementById("inspector");
-  var firstLevelButton = document.getElementById("first-level-btn");
-  var expandAllButton = document.getElementById("expand-all-btn");
-  var closeTreeButton = document.getElementById("close-tree-btn");
-
-  function escapeHtml(value) {
-    return String(value)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
-  }
-
-  function renderSourceLinks(path) {
-    return String(path)
-      .split(" · ")
-      .map(function (sourcePath) {
-        var escaped = escapeHtml(sourcePath);
-        return '<a class="source-link" href="' + escaped + '">' + escaped + '</a>';
-      })
-      .join("");
-  }
-
-  function svgEl(tag, attrs) {
-    var el = document.createElementNS(NS, tag);
-    Object.keys(attrs || {}).forEach(function (key) {
-      el.setAttribute(key, attrs[key]);
-    });
-    return el;
-  }
-
-  function loadScriptWithFallback(urls, timeout) {
-    return new Promise(function (resolve) {
-      var index = 0;
-      var settled = false;
-
-      function next() {
-        if (settled) {
-          return;
-        }
-        if (index >= urls.length) {
-          settled = true;
-          resolve(false);
-          return;
-        }
-
-        var script = document.createElement("script");
-        var timer = window.setTimeout(function () {
-          script.onload = null;
-          script.onerror = null;
-          script.remove();
-          next();
-        }, timeout);
-
-        script.src = urls[index++];
-        script.async = true;
-        script.onload = function () {
-          window.clearTimeout(timer);
-          if (!settled) {
-            settled = true;
-            resolve(Boolean(window.rough));
-          }
-        };
-        script.onerror = function () {
-          window.clearTimeout(timer);
-          script.remove();
-          next();
-        };
-        document.head.appendChild(script);
-      }
-
-      next();
-    });
-  }
-
-  function flattenTree(root) {
-    var result = [];
-    function visit(node, parent) {
-      result.push({ node: node, parent: parent || null });
-      node.children.forEach(function (child) {
-        visit(child, node);
-      });
-    }
-    visit(root, null);
-    return result;
-  }
-
-  function findNode(root, uid) {
-    var stack = [root];
-    while (stack.length) {
-      var current = stack.pop();
-      if (current.uid === uid) {
-        return current;
-      }
-      for (var i = current.children.length - 1; i >= 0; i -= 1) {
-        stack.push(current.children[i]);
-      }
-    }
-    return null;
-  }
-
-  function findParent(root, uid) {
-    var flat = flattenTree(root);
-    for (var i = 0; i < flat.length; i += 1) {
-      if (flat[i].node.uid === uid) {
-        return flat[i].parent;
-      }
-    }
-    return null;
-  }
-
-  function moduleOccurrenceCount(moduleId) {
-    var count = 0;
-    Object.keys(ROOTS).forEach(function (rootId) {
-      flattenTree(ROOTS[rootId].tree).forEach(function (entry) {
-        if (entry.node.module === moduleId) {
-          count += 1;
-        }
-      });
-    });
-    return count;
-  }
-
-  function syncRootButtons() {
-    rootButtons.forEach(function (button) {
-      var open = button.getAttribute("data-root") === activeRootId;
-      button.classList.toggle("is-open", open);
-      button.setAttribute("aria-expanded", open ? "true" : "false");
-    });
-  }
-
-  function closeInspector() {
-    workspace.classList.remove("has-inspector");
-    selectedUid = null;
-    inspector.innerHTML = "";
-    if (activeRootId) {
-      renderTree(false);
-    }
-  }
-
-  function closeRoot() {
-    activeRootId = null;
-    selectedUid = null;
-    expanded = new Set();
-    syncRootButtons();
-    workspace.classList.remove("has-inspector");
-    branchShell.classList.remove("is-open");
-    branchShell.setAttribute("aria-hidden", "true");
-    branchShell.inert = true;
-    window.setTimeout(function () {
-      if (!activeRootId) {
-        treeScroller.innerHTML = '<div class="tree-empty">选择上方四个根之一</div>';
-        inspector.innerHTML = "";
-      }
-    }, reducedMotion ? 0 : 420);
-  }
-
-  function openRoot(rootId) {
-    if (activeRootId === rootId) {
-      closeRoot();
-      return;
-    }
-
-    activeRootId = rootId;
-    var root = ROOTS[rootId];
-    expanded = new Set([root.tree.uid]);
-    selectedUid = root.tree.uid;
-
-    syncRootButtons();
-    branchCard.style.setProperty("--c", root.color);
-    branchKicker.textContent = root.label + " · 职责树";
-    branchKicker.style.color = root.color;
-    branchTitle.textContent = root.label + " — " + root.zh;
-    branchSummary.textContent = root.summary;
-    sequenceText.textContent = root.sequence;
-    treeFoot.textContent = rootId === "writeback"
-      ? "WriteBack 从业务编排展开到全部生产环境根；固定磁盘输出与统一 audit.jsonl 强审计均在真实装配中完成。"
-      : rootId === "init"
-        ? "Init 从业务编排展开到 SystemFileSystem 与 RusqliteStorage；冻结工作区由真实根创建或收敛。"
-        : "点击模块逐层展开。重复出现的“复用”节点仍是同一个实现，不会被另分成第五类。";
-
-    branchShell.classList.add("is-open");
-    branchShell.setAttribute("aria-hidden", "false");
-    branchShell.inert = false;
-    firstLevelButton.hidden = false;
-    expandAllButton.hidden = false;
-    workspace.classList.add("has-inspector");
-    renderTree(false);
-    renderInspector(root.tree);
-
-    window.requestAnimationFrame(function () {
-      branchShell.scrollIntoView({
-        behavior: reducedMotion ? "auto" : "smooth",
-        block: "nearest"
-      });
-    });
-  }
-
-  function buildVisible(node, depth) {
-    var item = {
-      data: node,
-      depth: depth,
-      children: [],
-      span: LEAF_SPAN,
-      x: 0,
-      y: 0
-    };
-    if (expanded.has(node.uid)) {
-      item.children = node.children.map(function (child) {
-        return buildVisible(child, depth + 1);
-      });
-    }
-    if (item.children.length) {
-      item.span = item.children.reduce(function (sum, child) {
-        return sum + child.span;
-      }, 0);
-      item.span = Math.max(item.span, LEAF_SPAN);
-    }
-    return item;
-  }
-
-  function placeVisible(item, startX, positions) {
-    var center = startX + item.span / 2;
-    item.x = center;
-    item.y = PAD_Y + item.depth * LEVEL_GAP;
-    positions.set(item.data.uid, item);
-
-    var childStart = startX;
-    item.children.forEach(function (child) {
-      placeVisible(child, childStart, positions);
-      childStart += child.span;
-    });
-  }
-
-  function visibleMaxDepth(item) {
-    if (!item.children.length) {
-      return item.depth;
-    }
-    return Math.max.apply(null, item.children.map(visibleMaxDepth));
-  }
-
-  function regularRect(x, y, width, height) {
-    return svgEl("rect", {
-      x: x,
-      y: y,
-      width: width,
-      height: height,
-      rx: 10
-    });
-  }
-
-  function sketchRect(x, y, width, height, seed) {
-    if (!hasRough || !roughController) {
-      return regularRect(x, y, width, height);
-    }
-    return roughController.rectangle(x, y, width, height, {
-      roughness: 1.05,
-      bowing: 0.9,
-      seed: seed,
-      strokeWidth: 1.55
-    });
-  }
-
-  function sketchPath(path, seed) {
-    if (!hasRough || !roughController) {
-      return svgEl("path", { d: path });
-    }
-    return roughController.path(path, {
-      roughness: 0.82,
-      bowing: 0.65,
-      seed: seed,
-      strokeWidth: 1.5
-    });
-  }
-
-  function drawEdge(svg, parent, child, index) {
-    var startY = parent.y + NODE_H;
-    var endY = child.y;
-    var middleY = startY + (endY - startY) * 0.52;
-    var path = "M " + parent.x + " " + startY +
-      " C " + parent.x + " " + middleY +
-      ", " + child.x + " " + middleY +
-      ", " + child.x + " " + endY;
-
-    var group = svgEl("g", { class: "tree-edge" });
-    var roughPath = sketchPath(path, 100 + index);
-    roughPath.classList.add("edge-rough");
-    Array.prototype.slice.call(roughPath.querySelectorAll ? roughPath.querySelectorAll("path") : [roughPath]).forEach(function (piece, pieceIndex) {
-      piece.setAttribute("pathLength", "1");
-      piece.classList.add("draw-in");
-      piece.style.setProperty("--di", String(index + pieceIndex));
-    });
-    if (roughPath.tagName && roughPath.tagName.toLowerCase() === "path") {
-      roughPath.setAttribute("pathLength", "1");
-      roughPath.classList.add("draw-in");
-      roughPath.style.setProperty("--di", String(index));
-    }
-    group.appendChild(roughPath);
-
-    var arrow = svgEl("polyline", {
-      points: (child.x - 5) + "," + (endY - 7) + " " + child.x + "," + endY + " " + (child.x + 5) + "," + (endY - 7),
-      pathLength: "1"
-    });
-    arrow.classList.add("draw-in");
-    arrow.style.setProperty("--di", String(index + 1));
-    group.appendChild(arrow);
-    svg.appendChild(group);
-  }
-
-  function drawNode(svg, item, index, rootColor) {
-    var data = item.data;
-    var module = MODULES[data.module];
-    var x = item.x - NODE_W / 2;
-    var y = item.y;
-    var classes = ["tree-node", "fade-in"];
-    if (selectedUid === data.uid) {
-      classes.push("is-active");
-    } else if (selectedUid) {
-      var selectedNode = findNode(ROOTS[activeRootId].tree, selectedUid);
-      if (selectedNode && selectedNode.module === data.module) {
-        classes.push("is-same-module");
-      }
-    }
-
-    var group = svgEl("g", {
-      class: classes.join(" "),
-      "data-uid": data.uid,
-      "data-module": data.module,
-      role: "button",
-      tabindex: "0",
-      "aria-label": module.title + (data.children.length ? "，点击展开或收起下级并查看说明" : "，点击查看说明")
-    });
-    group.style.setProperty("--c", rootColor);
-    group.style.setProperty("--di", String(index));
-
-    group.appendChild(svgEl("rect", {
-      class: "node-bg",
-      x: x + 1,
-      y: y + 1,
-      width: NODE_W - 2,
-      height: NODE_H - 2,
-      rx: 10
-    }));
-
-    var shape = sketchRect(x, y, NODE_W, NODE_H, 300 + index);
-    shape.classList.add("node-shape");
-    group.appendChild(shape);
-
-    if (data.order) {
-      var order = svgEl("text", {
-        class: "node-corner",
-        x: x + 11,
-        y: y + 14
-      });
-      order.textContent = data.order;
-      group.appendChild(order);
-    }
-
-    if (data.children.length) {
-      var state = svgEl("text", {
-        class: "node-corner",
-        x: x + NODE_W - 12,
-        y: y + 14,
-        "text-anchor": "end"
-      });
-      state.textContent = (expanded.has(data.uid) ? "−" : "+") + data.children.length;
-      group.appendChild(state);
-    } else if (module.status === "直接依赖契约" || module.status.indexOf("生产根") === 0) {
-      var rootMarker = svgEl("text", {
-        class: "node-corner",
-        x: x + NODE_W - 12,
-        y: y + 14,
-        "text-anchor": "end"
-      });
-      rootMarker.textContent = module.status.indexOf("生产根") === 0 ? "根" : "契约";
-      group.appendChild(rootMarker);
-    }
-
-    var title = svgEl("text", {
-      class: "node-title",
-      x: item.x,
-      y: y + 29
-    });
-    title.textContent = module.title;
-    group.appendChild(title);
-
-    var symbol = svgEl("text", {
-      class: "node-symbol",
-      x: item.x,
-      y: y + 49
-    });
-    symbol.textContent = module.shortSymbol;
-    group.appendChild(symbol);
-
-    if (data.reused || moduleOccurrenceCount(data.module) > 1) {
-      var reused = svgEl("text", {
-        class: "node-reused",
-        x: x + NODE_W - 10,
-        y: y + NODE_H - 8
-      });
-      reused.textContent = "复用";
-      group.appendChild(reused);
-    }
-
-    function activate(event) {
-      event.preventDefault();
-      selectNode(data);
-    }
-
-    group.addEventListener("click", activate);
-    group.addEventListener("keydown", function (event) {
-      if (event.key === "Enter" || event.key === " ") {
-        activate(event);
-      }
-    });
-    svg.appendChild(group);
-  }
-
-  function renderTree(keepScroll) {
-    if (!activeRootId) {
-      return;
-    }
-
-    var previousScrollLeft = treeScroller.scrollLeft;
-    var root = ROOTS[activeRootId];
-    var visible = buildVisible(root.tree, 0);
-    var contentWidth = visible.span;
-    var width = Math.max(MIN_TREE_WIDTH, contentWidth + PAD_X * 2);
-    var offset = (width - contentWidth) / 2;
-    var positions = new Map();
-    placeVisible(visible, offset, positions);
-    lastPositions = positions;
-    var height = PAD_Y * 2 + visibleMaxDepth(visible) * LEVEL_GAP + NODE_H;
-
-    var svg = svgEl("svg", {
-      viewBox: "0 0 " + width + " " + height,
-      width: width,
-      height: height,
-      role: "tree",
-      "aria-label": root.label + " 模块职责树"
-    });
-    roughController = hasRough && window.rough ? window.rough.svg(svg) : null;
-
-    var visibleList = [];
-    function collect(item) {
-      visibleList.push(item);
-      item.children.forEach(collect);
-    }
-    collect(visible);
-
-    var edgeIndex = 0;
-    visibleList.forEach(function (item) {
-      item.children.forEach(function (child) {
-        drawEdge(svg, item, child, edgeIndex++);
-      });
-    });
-
-    visibleList.forEach(function (item, index) {
-      drawNode(svg, item, index, root.color);
-    });
-
-    treeScroller.innerHTML = "";
-    treeScroller.appendChild(svg);
-
-    if (keepScroll) {
-      treeScroller.scrollLeft = previousScrollLeft;
-    }
-
-    if (selectedUid && positions.has(selectedUid)) {
-      var selected = positions.get(selectedUid);
-      window.requestAnimationFrame(function () {
-        var target = Math.max(0, selected.x - treeScroller.clientWidth / 2);
-        treeScroller.scrollTo({
-          left: target,
-          behavior: reducedMotion ? "auto" : "smooth"
-        });
-      });
-    }
-  }
-
-  function selectNode(node) {
-    selectedUid = node.uid;
-    if (node.children.length) {
-      if (expanded.has(node.uid)) {
-        expanded.delete(node.uid);
-      } else {
-        expanded.add(node.uid);
-      }
-    }
-    workspace.classList.add("has-inspector");
-    renderTree(true);
-    renderInspector(node);
-  }
-
-  function renderInspector(node) {
-    var module = MODULES[node.module];
-    var root = ROOTS[activeRootId];
-    var parent = findParent(root.tree, node.uid);
-    var parentText = parent ? MODULES[parent.module].title : root.label + " 顶层功能";
-    var childText = node.children.length
-      ? node.children.map(function (child) {
-          return MODULES[child.module].title;
-        }).join("、")
-      : "没有下级职责";
-    var occurrenceCount = moduleOccurrenceCount(node.module);
-    var chips = [
-      '<span class="chip is-tone">' + escapeHtml(module.status) + '</span>'
-    ];
-
-    if (node.optional) {
-      chips.push('<span class="chip">可选阶段</span>');
-    }
-    if (node.reused || occurrenceCount > 1) {
-      chips.push('<span class="chip">同一实现被复用</span>');
-    }
-    if (node.order) {
-      chips.push('<span class="chip">顺序 ' + escapeHtml(node.order) + '</span>');
-    }
-
-    var boundary = module.boundary
-      ? '<div class="boundary-note"><strong>接线现状：</strong>' + escapeHtml(module.boundary) + '</div>'
-      : "";
-
-    inspector.style.setProperty("--c", root.color);
-    inspector.innerHTML =
-      '<div class="inspector-head panel-in">' +
-        '<div>' +
-          '<p class="inspector-kicker" style="color:' + root.color + '">点击模块后的说明</p>' +
-          '<h4 class="inspector-title">' + escapeHtml(module.title) + '</h4>' +
-          '<span class="inspector-symbol">' + escapeHtml(module.symbol) + '</span>' +
-        '</div>' +
-        '<button class="close-inspector" type="button" aria-label="收起当前说明">×</button>' +
-      '</div>' +
-      '<div class="inspector-body panel-in">' +
-        '<div class="chips">' + chips.join("") + '</div>' +
-        '<div class="detail-block">' +
-          '<span class="detail-label">一句话作用</span>' +
-          '<p><strong>' + escapeHtml(module.role) + '</strong></p>' +
-        '</div>' +
-        '<div class="detail-block">' +
-          '<span class="detail-label">大白话</span>' +
-          '<p>' + escapeHtml(module.plain) + '</p>' +
-        '</div>' +
-        '<div class="detail-block">' +
-          '<span class="detail-label">简单直白例子</span>' +
-          '<div class="example-box">' + escapeHtml(module.example) + '</div>' +
-        '</div>' +
-        '<div class="detail-block">' +
-          '<span class="detail-label">输入 → 产出</span>' +
-          '<div class="io-grid">' +
-            '<div class="io-item"><b>输入</b><span>' + escapeHtml(module.input) + '</span></div>' +
-            '<div class="io-item"><b>产出</b><span>' + escapeHtml(module.output) + '</span></div>' +
-          '</div>' +
-        '</div>' +
-        '<div class="detail-block">' +
-          '<span class="detail-label">它在树里的归属</span>' +
-          '<div class="location-box">' +
-            '<div><strong>直接上级：</strong>' + escapeHtml(parentText) + '</div>' +
-            '<div><strong>直接下级：</strong>' + escapeHtml(childText) + '</div>' +
-          '</div>' +
-        '</div>' +
-        '<div class="detail-block">' +
-          '<span class="detail-label">代码位置</span>' +
-          renderSourceLinks(module.path) +
-        '</div>' +
-        boundary +
-      '</div>';
-
-    var closeButton = inspector.querySelector(".close-inspector");
-    closeButton.addEventListener("click", closeInspector);
-  }
-
-  function addAllExpandable(node) {
-    if (node.children.length) {
-      expanded.add(node.uid);
-      node.children.forEach(addAllExpandable);
-    }
-  }
-
-  rootButtons.forEach(function (button) {
-    button.addEventListener("click", function () {
-      openRoot(button.getAttribute("data-root"));
-    });
-  });
-
-  firstLevelButton.addEventListener("click", function () {
-    if (!activeRootId) {
-      return;
-    }
-    expanded = new Set([ROOTS[activeRootId].tree.uid]);
-    selectedUid = ROOTS[activeRootId].tree.uid;
-    workspace.classList.add("has-inspector");
-    renderTree(false);
-    renderInspector(ROOTS[activeRootId].tree);
-  });
-
-  expandAllButton.addEventListener("click", function () {
-    if (!activeRootId) {
-      return;
-    }
-    expanded = new Set();
-    addAllExpandable(ROOTS[activeRootId].tree);
-    renderTree(false);
-  });
-
-  closeTreeButton.addEventListener("click", closeRoot);
-
-  document.addEventListener("keydown", function (event) {
-    if (event.key !== "Escape" || !activeRootId) {
-      return;
-    }
-    if (workspace.classList.contains("has-inspector")) {
-      closeInspector();
-    } else {
-      closeRoot();
-    }
-  });
-
-  loadScriptWithFallback([
-    "https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js",
-    "https://unpkg.com/roughjs@4.6.6/bundled/rough.js"
-  ], 2200).then(function (loaded) {
-    hasRough = loaded;
-    if (activeRootId) {
-      renderTree(true);
-    }
-  });
-}());
-</script>
 </body>
 </html>

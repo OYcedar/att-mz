@@ -18,26 +18,26 @@ CLI 命令 + 必填 --config FILE
   ↓
 选择当前命令所需分区并建立受信类型
   ↓
-构造 ConfiguredMzCommand 的互斥变体
+构造 ConfiguredProductCommand(RpgMakerLayout + ConfiguredRpgMakerCommand)
 ```
 
 Translate 在这个公共配置阶段完整建立 `prompts.root`、全局语言模块目录、CLI 选中的
-MZ Profile 及其引用的公共 LLM Client。打开项目后才取得权威 `LanguagePair`，再执行
+RPG Maker Profile 及其引用的公共 LLM Client。打开项目后才取得权威 `LanguagePair`，再执行
 第二阶段资源解析：
 
 ```text
-打开 <projects.root>/mz/<project-name>
+打开 <projects.root>/<engine>/<project-name>
   ↓
 从 metadata 取得受信 LanguagePair
   ↓
 按 source LanguageId 精确选择一个共享语言模块
   ↓
-读取 <prompts.root>/mz/<source>--<target>.md
+读取 <prompts.root>/rpg_maker/<source>--<target>.md
   ↓
-构造 ResolvedMzTranslationResources
+构造 ResolvedRpgMakerTranslationResources
 ```
 
-原始 `toml::Value` 只停留在未受信的 TOML 文档选择边界；`ConfiguredMzCommand`、
+原始 `toml::Value` 只停留在未受信的 TOML 文档选择边界；`ConfiguredProductCommand`、
 `TranslateConfiguration` 及业务模块不得保存延后解释的语言或 Prompt 原始值。已选择
 分区严格拒绝缺失字段、未知字段、错误类型、非法值、空白 ID 和重复 ID。已知但未选择
 的分区允许缺失，其内部内容不反序列化、不校验、不物化密钥。
@@ -63,16 +63,17 @@ MZ Profile 及其引用的公共 LLM Client。打开项目后才取得权威 `La
 |---|---|
 | Init | 目录发布、SQLite 建库与数据库快照 |
 | Extract | CPU、所选 Builtin/Rules/Store；只有 `--lua` 才选择 Lua 和交互会话 |
-| Translate | `prompts.root`、完整 `languages`、CPU、LLM Runtime、指定 MZ Profile、该 Profile 引用的 Client、标准资产与 Store；只有 `--lua` 才选择 Lua |
+| Translate | `prompts.root`、完整 `languages`、CPU、LLM Runtime、指定 RPG Maker Profile、该 Profile 引用的 Client、标准资产与 Store；只有 `--lua` 才选择 Lua |
 | WriteBack | CPU、目录发布与候选编辑、文档和标准资产；只有 `--lua` 才选择 Lua |
 
 Translate 必须解析并验证全部 `[[languages]]` 条目，因此任一非法语言配置或规范化后
-重复 ID 都会阻止运行。其他 MZ Profile 和公共 Client 不因存在而被选择；当前 Profile
+重复 ID 都会阻止运行。其他 RPG Maker Profile 和公共 Client 不因存在而被选择；当前 Profile
 或 Client ID 重复、引用缺失仍然失败。Profile 通过第一遍只读 ID、第二遍只解析命中
 条目的方式选择；未选择 Profile 除 ID 外的内容和未选择 Client 的 API key 都不会被
 反序列化或额外物化为秘密值，也不会进入受信配置、Debug、错误链或输出。
 
-四个 `ConfiguredMzCommand` 变体分别把命令输入与相应受信配置绑定，不能把 Translate
+四个 `ConfiguredRpgMakerCommand` 变体分别把命令输入与相应受信配置绑定，外层
+`ConfiguredProductCommand` 绑定引擎布局；不能把 Translate
 配置交给 Init。业务模块不读取配置文件，也不重新解释配置字段。
 
 ## 3. 根资源配置与路径
@@ -97,10 +98,10 @@ Lua 每次脚本使用一个专用线程；SQLite 交互命令通道容量固定
 SQLite `journal_mode` 只允许 `delete`、`truncate`、`persist`、`wal`；`synchronous`
 只允许 `normal`、`full`、`extra`。短操作、建库和唯一交互会话共享这些策略。
 
-MZ 工作区固定为 `<projects.root>/mz/<project-name>`。MZ 项目租约服务选择
-`<projects.root>/.att-locks/projects/mz/`，MZ 目录发布选择
-`<projects.root>/.att-locks/directory-publish/mz/`；两者均不增加可配置锁根，也不搜索
-其他工作区或锁目录。
+工作区固定为 `<projects.root>/<engine>/<project-name>`，其中 `engine` 只能是 `mz | mv`。
+项目租约服务选择 `<projects.root>/.att-locks/projects/<engine>/`，目录发布选择
+`<projects.root>/.att-locks/directory-publish/<engine>/`；两者均不增加可配置锁根，也不
+搜索其他工作区或锁目录。同名 MZ/MV 项目拥有不同工作区和锁命名空间。
 
 不对 `projects.root` 做全局文件系统品牌预检。读取、提取和翻译只要求其实际文件操作
 成立；项目租约、目录发布和审计分别在真实操作发生时验证自己需要的锁、身份、同卷
@@ -128,7 +129,7 @@ retained_rotated_files = 8
 ## 5. 公共 LLM Client
 
 公共 Client 使用 `url`、`api_key`、`model`、`timeout_ms`、`rpm`、`burst` 和严格 JSON
-`parameters`。MZ Profile 只按精确 `llm_client` ID 引用它，不重复拥有网络身份。
+`parameters`。RPG Maker Profile 只按精确 `llm_client` ID 引用它，不重复拥有网络身份。
 
 ```toml
 [llm.clients.primary]
@@ -144,10 +145,10 @@ parameters = '''{}'''
 `parameters` 必须是完整 JSON 对象，递归拒绝重复键，并拒绝注释、尾逗号、并列值和
 截断内容。顶层不得包含 `model`、`messages` 或 `stream`；其余字段由用户拥有，程序
 不解释或改写。Standard 与 Translate Lua 使用配置边界已经选择的同一个 Client，
-共享 HTTP 连接池、全局容量与客户端 RPM/burst；Lua 不接收 MZ planning 或 request
+共享 HTTP 连接池、全局容量与客户端 RPM/burst；Lua 不接收 RPG Maker planning 或 request
 策略。
 
-## 6. 共享语言目录与 MZ Prompt
+## 6. 共享语言目录与 RPG Maker Prompt
 
 翻译语言能力属于跨引擎共享配置，使用顶层 `[[languages]]`：
 
@@ -179,45 +180,59 @@ allowed_terms = []
 承载规范源语言和目标语言；`LanguageModuleCatalog` 以规范 `LanguageId` 为唯一 key，
 精确查询，不做父语言或别名回退。
 
-`prompts.root` 对 Translate 必填。MZ Prompt 不属于共享语言模块，也不属于 Profile；
-它由 MZ 按权威项目语言对派生精确路径：
+`prompts.root` 对 Translate 必填。RPG Maker Prompt 不属于共享语言模块，也不属于
+Profile；它由 RPG Maker 翻译能力按权威项目语言对派生精确路径：
 
 ```text
-<prompts.root>/mz/<source>--<target>.md
+<prompts.root>/rpg_maker/<source>--<target>.md
 ```
 
 例如 `ja--zh-Hans.md` 和 `en--zh-Hans.md`。文件名直接使用规范语言标签；只读取该路径
 指向的普通文件，不尝试大小写变体、父语言、默认文件或目录首项。文件必须是合法
-UTF-8 且内容不能全为空白。`MzSystemPrompt` 绑定读取时的精确 `LanguagePair`，并与
-同一 `Arc<dyn LanguageModule>` 共同组成 `ResolvedMzTranslationResources`。Prompt
+UTF-8 且内容不能全为空白。系统 Prompt 绑定读取时的精确 `LanguagePair`，并与
+同一 `Arc<dyn LanguageModule>` 共同组成 RPG Maker 翻译资源。Prompt
 内容和语言策略指纹继续参与逐叶翻译状态指纹。
 
-## 7. MZ Profile 与所有权
+## 7. RPG Maker Profile 与所有权
+
+所有 RPG Maker 算法配置只使用共享的 `[rpg_maker]` 分区：
 
 ```toml
-[[mz.translation_profiles]]
+[rpg_maker.document]
+[rpg_maker.standard_asset]
+[rpg_maker.extract.builtin]
+[rpg_maker.extract.rules]
+[rpg_maker.extract.store]
+[rpg_maker.translate.store]
+```
+
+各表中的必填资源预算由当前实现的受信配置类型定义；缺失时显式失败，不根据引擎、
+输入大小或硬件推断默认策略。
+
+```toml
+[[rpg_maker.translation_profiles]]
 id = "primary"
 llm_client = "primary"
 max_in_flight_tasks = 4
 
-[mz.translation_profiles.planning]
+[rpg_maker.translation_profiles.planning]
 scope_concurrency = 4
 max_message_characters = 24000
 
-[mz.translation_profiles.execution]
+[rpg_maker.translation_profiles.execution]
 network_retry_delays_ms = [500, 1500, 5000]
 max_network_retry_after_ms = 30000
 ```
 
-配置中不存在语言对到 Prompt 的映射。受信 `MzTranslationProfile<L>` 只保存 ID、非零
-任务并发、`MzTranslationPlanningConfiguration`、`MzTranslationRequestConfiguration`
+配置中不存在语言对到 Prompt 的映射。受信 RPG Maker Profile 只保存 ID、非零
+任务并发、Planning 配置、Request 配置
 和所选公共 Client。Profile ID 精确匹配，不 trim、不折叠大小写、不提供别名或默认项。
 
 `LanguageId`、`LanguagePair`、`LanguageModuleCatalog`、公共 LLM、文件、SQLite 和 CPU
-执行器属于共享能力。MZ Profile、Prompt 协议、项目 schema、工作区布局、数据库对账
-和写回布局仍由 `att_mz` 拥有；MZ 项目数据库能力位于 `att_mz::project_database`，
-不建立通用项目数据库或跨引擎 Prompt Resolver。
+执行器、RPG Maker Profile 与 Prompt 协议属于 MV/MZ 共享能力。引擎切片只拥有命令
+契约、游戏目录适配和引擎特有投影；项目 schema、数据库对账和翻译资源由共享
+RPG Maker 实现拥有。
 
-`mz.document`、`mz.standard_asset`、Extract/Translate Store 和实际算法并发仍由其现实
-消费配置建立。Init 的五项项目事实来自 CLI 或已有数据库，不从配置推断默认值。首次
+`rpg_maker.document`、`rpg_maker.standard_asset`、Extract/Translate Store 和实际算法
+并发仍由其现实消费配置建立。Init 的五项项目事实来自 CLI 或已有数据库，不从配置推断默认值。首次
 创建时五项全部必需；已有项目省略单项表示复用数据库中的当前事实。

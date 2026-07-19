@@ -1,6 +1,6 @@
 # 强审计 JSON Lines 账本现行规格
 
-本文定义四个 MZ 命令共同使用的强审计账本。它不是可丢失的排障日志：业务意图必须先持久化，才允许开始对应副作用；副作用取得终态后必须记录终态，才可报告完整成功。
+本文定义 RPG Maker MV/MZ 命令共同使用的强审计账本。它不是可丢失的排障日志：业务意图必须先持久化，才允许开始对应副作用；副作用取得终态后必须记录终态，才可报告完整成功。
 
 ## 1. 唯一账本
 
@@ -25,6 +25,7 @@
 recorded_at_utc
 event_id
 run_id
+engine
 project
 command
 profile | null
@@ -35,9 +36,10 @@ payload
 - `recorded_at_utc` 由 worker 在持久化时生成，格式为 UTC 毫秒；
 - `event_id` 是每条记录独立的 UUID；
 - `run_id` 标识一次命令运行；
+- `engine` 是 `mz | mv`，明确标识本次纵向切片；
 - `command` 是 `init | extract | translate | write_back`；
 - `profile` 仅 Translate 使用，其他命令写 `null`；
-- `payload` 是 MZ 可观测性模块拥有的稳定领域 DTO，通用 JSONL Runtime 不认识 MZ 类型。
+- `payload` 是 RPG Maker 可观测性模块拥有的稳定领域 DTO，通用 JSONL Runtime 不认识游戏引擎类型。
 
 允许的事件只有：
 
@@ -52,9 +54,9 @@ run_finished
 
 翻译任务意图与终态、写回发布意图与终态分别共享一个稳定 `operation_id`。新一次命令总是生成新的 `run_id`，不得把重新运行猜成先前操作的恢复。
 
-`translation_task_finished` 从任务结果枚举派生 `complete | partial | unavailable`、唯一非零尝试次数、可选供应商请求/响应 ID、可选最终 usage、验收决定、未解决结果、协议诊断和已确认数据库写入。`provider_response_id` 缺失时写 `null`。
+`translation_task_finished` 从任务结果枚举派生 `complete | partial | unavailable`、唯一非零尝试次数、可选供应商请求/响应 ID、可选最终 usage、验收决定、未解决结果、协议诊断和已确认数据库写入。`provider_response_id` 缺失时写 `null`；`confirmed_written_leaves` 明确统计逻辑文本叶。
 
-`write_back_publish_finished` 保存目录发布的明确终态、实际布局、输出根、写回摘要、人工布局诊断和 `lua_executed`。所有 MZ 位置都使用来源、路径步骤和 Tag 语义的结构化 DTO，不使用展示文本。
+`write_back_publish_finished` 保存目录发布的明确终态、实际布局、输出根、写回摘要、人工布局诊断和 `lua_executed`。摘要中的 `translated_leaves` 与 `original_leaves` 只统计逻辑文本叶。accepted、unresolved 使用 `{group_location, field_role}` 逻辑文本位置；每项写回诊断使用非空 `locations` 列表关联一个或多个这样的受影响逻辑叶。物理修改目标只属于内部写回配方，不进入这些字段。
 
 账本不记录 API key、完整 messages、完整模型响应、完整原文或译文。外部松散字段只在当前事件确实需要无损承载时停留于 wire 边界，不扩散为 Runtime 业务模型。
 

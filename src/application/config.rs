@@ -21,23 +21,26 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::arguments::{
-    ExtractArguments, InitArguments, MzCommand, TranslateArguments, WriteBackArguments,
+    ExtractArguments, InitArguments, MvCommand, MzCommand, ProductCommand, TranslateArguments,
+    WriteBackArguments,
 };
 
-use crate::att_mz::extract::builtin::BuiltInExtractionConfig;
-use crate::att_mz::extract::document::MzDocumentReadingConfig;
-use crate::att_mz::extract::rules::RulesExtractionConfig;
-use crate::att_mz::extract::store::asset_store::MzExtractionAssetStoreConfig;
-use crate::att_mz::lua::json::HostValueBudget;
-use crate::att_mz::standard_asset::MzStandardAssetReadingConfig;
-use crate::att_mz::translate::profile::MzTranslationRequestConfiguration;
-use crate::att_mz::translate::result_store::MzStandardTranslationResultStorageConfig;
-use crate::att_mz::{ENGINE_DIRECTORY_NAME, ProjectName};
 use crate::language::{
     EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
     JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageId,
     LanguageModule, LanguageModuleCatalog, QuotePair,
 };
+use crate::rpg_maker::ProjectName;
+use crate::rpg_maker::extract::builtin::BuiltInExtractionConfig;
+use crate::rpg_maker::extract::document::RpgMakerDocumentReadingConfig;
+use crate::rpg_maker::extract::rules::RulesExtractionConfig;
+use crate::rpg_maker::extract::store::asset_store::RpgMakerExtractionAssetStoreConfig;
+use crate::rpg_maker::lua::json::HostValueBudget;
+use crate::rpg_maker::lua::lua54::TrustedLua54RuntimeConfiguration;
+use crate::rpg_maker::standard_asset::RpgMakerStandardAssetReadingConfig;
+use crate::rpg_maker::translate::profile::RpgMakerTranslationRequestConfiguration;
+use crate::rpg_maker::translate::result_store::RpgMakerStandardTranslationResultStorageConfig;
+use crate::rpg_maker::{RpgMakerEngine, RpgMakerLayout};
 use crate::runtime::cpu::CpuExecutorConfig;
 use crate::runtime::filesystem::{
     DirectoryPublisherConfig, ExclusiveFileLeaseConfig, SystemFileSystemConfig, TreeBudget,
@@ -46,7 +49,6 @@ use crate::runtime::json_lines::JsonLinesStreamConfig;
 use crate::runtime::llm::{
     LlmProxyConfiguration, OpenAiChatCompletionClient, OpenAiExecutorConfiguration,
 };
-use crate::runtime::lua::TrustedLua54RuntimeConfiguration;
 use crate::runtime::sqlite::{
     RusqliteStorageConfiguration, SqliteJournalMode as RuntimeSqliteJournalMode,
     SqliteSynchronous as RuntimeSqliteSynchronous,
@@ -75,10 +77,10 @@ pub(crate) fn resolve_configuration_path(
 }
 
 /// 读取配置，并且只建立本次命令实际消费的受信配置。
-pub(crate) fn load_configuration(
+pub(crate) fn load_product_configuration(
     requested_path: &Path,
-    command: MzCommand,
-) -> Result<ConfiguredMzCommand, ConfigurationLoadError> {
+    product: ProductCommand,
+) -> Result<ConfiguredProductCommand, ConfigurationLoadError> {
     let configuration_path =
         std::fs::canonicalize(requested_path).map_err(|source| ConfigurationLoadError::Open {
             path: requested_path.to_path_buf(),
@@ -136,36 +138,123 @@ pub(crate) fn load_configuration(
         .parent()
         .expect("规范绝对文件路径必须拥有父目录")
         .to_path_buf();
-    ConfiguredMzCommand::build(
+    let (layout, command, dialogue_rules_path) = normalize_product_command(product);
+    ConfiguredRpgMakerCommand::build(
         &configuration_path,
         &configuration_directory,
         source,
+        layout,
         command,
+        dialogue_rules_path,
     )
+    .map(|command| ConfiguredProductCommand { layout, command })
     .map_err(|error| error.with_configuration_path(&configuration_path))
 }
 
+#[cfg(test)]
+fn load_configuration(
+    requested_path: &Path,
+    command: MzCommand,
+) -> Result<ConfiguredRpgMakerCommand, ConfigurationLoadError> {
+    load_product_configuration(requested_path, ProductCommand::Mz { command })
+        .map(|configured| configured.command)
+}
+
+pub(crate) struct ConfiguredProductCommand {
+    layout: RpgMakerLayout,
+    command: ConfiguredRpgMakerCommand,
+}
+
+impl ConfiguredProductCommand {
+    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
+        self.command.common()
+    }
+
+    pub(crate) fn into_parts(self) -> (RpgMakerLayout, ConfiguredRpgMakerCommand) {
+        (self.layout, self.command)
+    }
+}
+
+fn normalize_product_command(
+    product: ProductCommand,
+) -> (RpgMakerLayout, RpgMakerCommandArguments, Option<PathBuf>) {
+    match product {
+        ProductCommand::Mz { command } => (
+            RpgMakerLayout::MZ,
+            RpgMakerCommandArguments::from(command),
+            None,
+        ),
+        ProductCommand::Mv { command } => match command {
+            MvCommand::Init(arguments) => (
+                RpgMakerLayout::MV,
+                RpgMakerCommandArguments::Init(arguments),
+                None,
+            ),
+            MvCommand::Extract(arguments) => (
+                RpgMakerLayout::MV,
+                RpgMakerCommandArguments::Extract(ExtractArguments {
+                    project: arguments.project,
+                    builtin: arguments.builtin,
+                    rules: arguments.rules,
+                    lua: arguments.lua,
+                }),
+                arguments.dialogue_rules,
+            ),
+            MvCommand::Translate(arguments) => (
+                RpgMakerLayout::MV,
+                RpgMakerCommandArguments::Translate(arguments),
+                None,
+            ),
+            MvCommand::WriteBack(arguments) => (
+                RpgMakerLayout::MV,
+                RpgMakerCommandArguments::WriteBack(arguments),
+                None,
+            ),
+        },
+    }
+}
+
+enum RpgMakerCommandArguments {
+    Init(InitArguments),
+    Extract(ExtractArguments),
+    Translate(TranslateArguments),
+    WriteBack(WriteBackArguments),
+}
+
+impl From<MzCommand> for RpgMakerCommandArguments {
+    fn from(command: MzCommand) -> Self {
+        match command {
+            MzCommand::Init(arguments) => Self::Init(arguments),
+            MzCommand::Extract(arguments) => Self::Extract(arguments),
+            MzCommand::Translate(arguments) => Self::Translate(arguments),
+            MzCommand::WriteBack(arguments) => Self::WriteBack(arguments),
+        }
+    }
+}
+
 /// 四个互斥命令各自拥有且只拥有现实消费的配置。
-pub(crate) enum ConfiguredMzCommand {
+pub(crate) enum ConfiguredRpgMakerCommand {
     Init(ConfiguredInitCommand),
     Extract(ConfiguredExtractCommand),
     Translate(Box<ConfiguredTranslateCommand>),
     WriteBack(ConfiguredWriteBackCommand),
 }
 
-impl ConfiguredMzCommand {
+impl ConfiguredRpgMakerCommand {
     fn build(
         configuration_path: &Path,
         configuration_directory: &Path,
         source: &str,
-        command: MzCommand,
+        layout: RpgMakerLayout,
+        command: RpgMakerCommandArguments,
+        dialogue_rules_path: Option<PathBuf>,
     ) -> Result<Self, ConfigurationLoadError> {
         let raw_common: RawCommonConfiguration = parse_selected(source, configuration_path)?;
         let requires_two_sqlite_connections = match &command {
-            MzCommand::Init(_) => true,
-            MzCommand::Extract(arguments) => arguments.lua.is_some(),
-            MzCommand::Translate(arguments) => arguments.lua.is_some(),
-            MzCommand::WriteBack(arguments) => arguments.lua.is_some(),
+            RpgMakerCommandArguments::Init(_) => true,
+            RpgMakerCommandArguments::Extract(arguments) => arguments.lua.is_some(),
+            RpgMakerCommandArguments::Translate(arguments) => arguments.lua.is_some(),
+            RpgMakerCommandArguments::WriteBack(arguments) => arguments.lua.is_some(),
         };
         if requires_two_sqlite_connections && raw_common.runtime.sqlite.max_open_connections < 2 {
             return Err(ConfigurationLoadError::InvalidValue(invalid(
@@ -177,10 +266,11 @@ impl ConfiguredMzCommand {
             .map_err(ConfigurationLoadError::InvalidValue)?;
 
         match command {
-            MzCommand::Init(arguments) => {
+            RpgMakerCommandArguments::Init(arguments) => {
                 let raw: RawInitSelection = parse_selected(source, configuration_path)?;
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
+                    layout.engine(),
                     raw.runtime.filesystem.publisher,
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
@@ -190,7 +280,7 @@ impl ConfiguredMzCommand {
                     publisher,
                 }))
             }
-            MzCommand::Extract(arguments) => {
+            RpgMakerCommandArguments::Extract(arguments) => {
                 let raw: RawExtractSelection = parse_selected(source, configuration_path)?;
                 let cpu = build_cpu_configuration(raw.runtime.cpu)
                     .map_err(ConfigurationLoadError::InvalidValue)?;
@@ -206,17 +296,18 @@ impl ConfiguredMzCommand {
                             .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
                     })
                     .transpose()?;
-                let mz = ExtractConfiguration::build(raw.mz, builtin, rules)
+                let rpg_maker = ExtractConfiguration::build(raw.rpg_maker, builtin, rules)
                     .map_err(ConfigurationLoadError::InvalidValue)?;
                 Ok(Self::Extract(ConfiguredExtractCommand {
                     project_name: project.name,
                     common,
                     cpu,
                     lua,
-                    mz,
+                    rpg_maker,
+                    dialogue_rules_path,
                 }))
             }
-            MzCommand::Translate(arguments) => {
+            RpgMakerCommandArguments::Translate(arguments) => {
                 let raw: RawTranslateSelection = parse_selected(source, configuration_path)?;
                 let cpu = build_cpu_configuration(raw.runtime.cpu)
                     .map_err(ConfigurationLoadError::InvalidValue)?;
@@ -249,11 +340,11 @@ impl ConfiguredMzCommand {
                     build_llm_client(format!("llm.clients.{llm_client_id}").as_str(), raw_client)
                         .map_err(ConfigurationLoadError::InvalidValue)?,
                 );
-                let mz = TranslateConfiguration::build(
+                let rpg_maker = TranslateConfiguration::build(
                     configuration_directory,
                     raw.prompts,
                     raw.languages,
-                    raw.mz,
+                    raw.rpg_maker,
                     selected_profile,
                     client,
                 )
@@ -266,15 +357,16 @@ impl ConfiguredMzCommand {
                     cpu,
                     llm,
                     lua,
-                    mz,
+                    rpg_maker,
                 })))
             }
-            MzCommand::WriteBack(arguments) => {
+            RpgMakerCommandArguments::WriteBack(arguments) => {
                 let raw: RawWriteBackSelection = parse_selected(source, configuration_path)?;
                 let cpu = build_cpu_configuration(raw.runtime.cpu)
                     .map_err(ConfigurationLoadError::InvalidValue)?;
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
+                    layout.engine(),
                     raw.runtime.filesystem.publisher,
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
@@ -285,7 +377,7 @@ impl ConfiguredMzCommand {
                             .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
                     })
                     .transpose()?;
-                let mz = WriteBackConfiguration::build(raw.mz)
+                let rpg_maker = WriteBackConfiguration::build(raw.rpg_maker)
                     .map_err(ConfigurationLoadError::InvalidValue)?;
                 Ok(Self::WriteBack(ConfiguredWriteBackCommand {
                     project_name: project.name,
@@ -293,7 +385,7 @@ impl ConfiguredMzCommand {
                     cpu,
                     publisher,
                     lua,
-                    mz,
+                    rpg_maker,
                 }))
             }
         }
@@ -385,7 +477,8 @@ pub(crate) struct ConfiguredExtractCommand {
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     lua: Option<SelectedLuaConfiguration>,
-    mz: ExtractConfiguration,
+    rpg_maker: ExtractConfiguration,
+    dialogue_rules_path: Option<PathBuf>,
 }
 
 impl ConfiguredExtractCommand {
@@ -405,8 +498,12 @@ impl ConfiguredExtractCommand {
         self.lua.as_ref()
     }
 
-    pub(crate) const fn mz(&self) -> &ExtractConfiguration {
-        &self.mz
+    pub(crate) const fn rpg_maker(&self) -> &ExtractConfiguration {
+        &self.rpg_maker
+    }
+
+    pub(crate) fn dialogue_rules_path(&self) -> Option<&Path> {
+        self.dialogue_rules_path.as_deref()
     }
 }
 
@@ -418,7 +515,7 @@ pub(crate) struct ConfiguredTranslateCommand {
     cpu: CpuExecutorConfig,
     llm: SelectedLlmExecutorConfiguration,
     lua: Option<SelectedLuaConfiguration>,
-    mz: TranslateConfiguration,
+    rpg_maker: TranslateConfiguration,
 }
 
 impl ConfiguredTranslateCommand {
@@ -452,11 +549,11 @@ impl ConfiguredTranslateCommand {
 
     #[cfg(test)]
     pub(crate) const fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
-        self.mz.client()
+        self.rpg_maker.client()
     }
 
-    pub(crate) const fn mz(&self) -> &TranslateConfiguration {
-        &self.mz
+    pub(crate) const fn rpg_maker(&self) -> &TranslateConfiguration {
+        &self.rpg_maker
     }
 }
 
@@ -466,7 +563,7 @@ pub(crate) struct ConfiguredWriteBackCommand {
     cpu: CpuExecutorConfig,
     publisher: DirectoryPublisherConfig,
     lua: Option<SelectedLuaConfiguration>,
-    mz: WriteBackConfiguration,
+    rpg_maker: WriteBackConfiguration,
 }
 
 impl ConfiguredWriteBackCommand {
@@ -490,8 +587,8 @@ impl ConfiguredWriteBackCommand {
         self.lua.as_ref()
     }
 
-    pub(crate) const fn mz(&self) -> &WriteBackConfiguration {
-        &self.mz
+    pub(crate) const fn rpg_maker(&self) -> &WriteBackConfiguration {
+        &self.rpg_maker
     }
 }
 
@@ -572,13 +669,14 @@ fn build_file_system_configuration(
 
 fn build_directory_publisher_configuration(
     projects_root: &Path,
+    engine: RpgMakerEngine,
     raw: RawDirectoryPublisherConfiguration,
 ) -> Result<DirectoryPublisherConfig, ConfigurationValueError> {
     DirectoryPublisherConfig::new(
         projects_root
             .join(".att-locks")
             .join("directory-publish")
-            .join(ENGINE_DIRECTORY_NAME),
+            .join(engine.storage_name()),
         usize_value(
             "runtime.filesystem.publisher.max_recovery_artifacts_per_target",
             raw.max_recovery_artifacts_per_target,
@@ -776,26 +874,26 @@ impl SelectedRulesConfiguration {
 }
 
 pub(crate) struct ExtractConfiguration {
-    document: MzDocumentReadingConfig,
+    document: RpgMakerDocumentReadingConfig,
     builtin: Option<BuiltInExtractionConfig>,
     rules: Option<SelectedRulesConfiguration>,
-    extract_store: MzExtractionAssetStoreConfig,
+    extract_store: RpgMakerExtractionAssetStoreConfig,
 }
 
 impl ExtractConfiguration {
     fn build(
-        raw: RawExtractMzSelection,
+        raw: RawExtractRpgMakerSelection,
         select_builtin: bool,
         rules_path: Option<PathBuf>,
     ) -> Result<Self, ConfigurationValueError> {
         let builtin = select_optional_scan_concurrency(
-            "mz.extract.builtin",
+            "rpg_maker.extract.builtin",
             select_builtin,
             raw.extract.builtin,
         )?
         .map(BuiltInExtractionConfig::new);
         let rules = select_optional_scan_concurrency(
-            "mz.extract.rules",
+            "rpg_maker.extract.rules",
             rules_path.is_some(),
             raw.extract.rules,
         )?
@@ -814,7 +912,7 @@ impl ExtractConfiguration {
         })
     }
 
-    pub(crate) const fn document(&self) -> MzDocumentReadingConfig {
+    pub(crate) const fn document(&self) -> RpgMakerDocumentReadingConfig {
         self.document
     }
 
@@ -826,14 +924,14 @@ impl ExtractConfiguration {
         self.rules.as_ref()
     }
 
-    pub(crate) const fn extract_store(&self) -> MzExtractionAssetStoreConfig {
+    pub(crate) const fn extract_store(&self) -> RpgMakerExtractionAssetStoreConfig {
         self.extract_store
     }
 }
 
 pub(crate) struct TranslateConfiguration {
-    standard_asset: MzStandardAssetReadingConfig,
-    translate_store: MzStandardTranslationResultStorageConfig,
+    standard_asset: RpgMakerStandardAssetReadingConfig,
+    translate_store: RpgMakerStandardTranslationResultStorageConfig,
     prompt_root: PathBuf,
     language_modules: LanguageModuleCatalog,
     profile: TranslationProfileConfiguration,
@@ -845,7 +943,7 @@ impl TranslateConfiguration {
         configuration_directory: &Path,
         raw_prompts: RawPromptsConfiguration,
         raw_languages: Vec<RawLanguageConfiguration>,
-        raw: RawTranslateMzSelection,
+        raw: RawTranslateRpgMakerSelection,
         selected_profile: RawSelectedTranslationProfileConfiguration,
         client: Arc<OpenAiChatCompletionClient>,
     ) -> Result<Self, ConfigurationValueError> {
@@ -855,18 +953,18 @@ impl TranslateConfiguration {
             prompt_root: checked_path("prompts.root", configuration_directory, raw_prompts.root)?,
             language_modules: build_language_modules(raw_languages)?,
             profile: build_selected_translation_profile(
-                "mz.translation_profiles",
+                "rpg_maker.translation_profiles",
                 selected_profile,
             )?,
             client,
         })
     }
 
-    pub(crate) const fn standard_asset(&self) -> MzStandardAssetReadingConfig {
+    pub(crate) const fn standard_asset(&self) -> RpgMakerStandardAssetReadingConfig {
         self.standard_asset
     }
 
-    pub(crate) const fn translate_store(&self) -> MzStandardTranslationResultStorageConfig {
+    pub(crate) const fn translate_store(&self) -> RpgMakerStandardTranslationResultStorageConfig {
         self.translate_store
     }
 
@@ -888,76 +986,79 @@ impl TranslateConfiguration {
 }
 
 pub(crate) struct WriteBackConfiguration {
-    document: MzDocumentReadingConfig,
-    standard_asset: MzStandardAssetReadingConfig,
+    document: RpgMakerDocumentReadingConfig,
+    standard_asset: RpgMakerStandardAssetReadingConfig,
 }
 
 impl WriteBackConfiguration {
-    fn build(raw: RawWriteBackMzSelection) -> Result<Self, ConfigurationValueError> {
+    fn build(raw: RawWriteBackRpgMakerSelection) -> Result<Self, ConfigurationValueError> {
         Ok(Self {
             document: build_document_configuration(raw.document)?,
             standard_asset: build_standard_asset_configuration(raw.standard_asset)?,
         })
     }
 
-    pub(crate) const fn document(&self) -> MzDocumentReadingConfig {
+    pub(crate) const fn document(&self) -> RpgMakerDocumentReadingConfig {
         self.document
     }
 
-    pub(crate) const fn standard_asset(&self) -> MzStandardAssetReadingConfig {
+    pub(crate) const fn standard_asset(&self) -> RpgMakerStandardAssetReadingConfig {
         self.standard_asset
     }
 }
 
 fn build_document_configuration(
-    raw: RawMzDocumentConfiguration,
-) -> Result<MzDocumentReadingConfig, ConfigurationValueError> {
-    Ok(MzDocumentReadingConfig::new(
-        non_zero_usize("mz.document.read_concurrency", raw.read_concurrency)?,
-        non_zero_usize("mz.document.parse_concurrency", raw.parse_concurrency)?,
+    raw: RawRpgMakerDocumentConfiguration,
+) -> Result<RpgMakerDocumentReadingConfig, ConfigurationValueError> {
+    Ok(RpgMakerDocumentReadingConfig::new(
+        non_zero_usize("rpg_maker.document.read_concurrency", raw.read_concurrency)?,
+        non_zero_usize(
+            "rpg_maker.document.parse_concurrency",
+            raw.parse_concurrency,
+        )?,
     ))
 }
 
 fn build_standard_asset_configuration(
-    raw: RawMzStandardAssetConfiguration,
-) -> Result<MzStandardAssetReadingConfig, ConfigurationValueError> {
-    Ok(MzStandardAssetReadingConfig::new(
+    raw: RawRpgMakerStandardAssetConfiguration,
+) -> Result<RpgMakerStandardAssetReadingConfig, ConfigurationValueError> {
+    Ok(RpgMakerStandardAssetReadingConfig::new(
         non_zero_usize(
-            "mz.standard_asset.decode_concurrency",
+            "rpg_maker.standard_asset.decode_concurrency",
             raw.decode_concurrency,
         )?,
         non_zero_usize(
-            "mz.standard_asset.leaves_per_decode_job",
+            "rpg_maker.standard_asset.leaves_per_decode_job",
             raw.leaves_per_decode_job,
         )?,
     ))
 }
 
 fn build_extraction_store_configuration(
-    raw: RawMzExtractStoreConfiguration,
-) -> Result<MzExtractionAssetStoreConfig, ConfigurationValueError> {
-    Ok(MzExtractionAssetStoreConfig::new(
+    raw: RawRpgMakerExtractStoreConfiguration,
+) -> Result<RpgMakerExtractionAssetStoreConfig, ConfigurationValueError> {
+    Ok(RpgMakerExtractionAssetStoreConfig::new(
         non_zero_usize(
-            "mz.extract.store.encode_concurrency",
+            "rpg_maker.extract.store.encode_concurrency",
             raw.encode_concurrency,
         )?,
         non_zero_usize(
-            "mz.extract.store.groups_per_encode_job",
+            "rpg_maker.extract.store.groups_per_encode_job",
             raw.groups_per_encode_job,
         )?,
     ))
 }
 
 fn build_translation_store_configuration(
-    raw: RawMzTranslateStoreConfiguration,
-) -> Result<MzStandardTranslationResultStorageConfig, ConfigurationValueError> {
-    Ok(MzStandardTranslationResultStorageConfig::new(
+    raw: RawRpgMakerTranslateStoreConfiguration,
+) -> Result<RpgMakerStandardTranslationResultStorageConfig, ConfigurationValueError> {
+    Ok(RpgMakerStandardTranslationResultStorageConfig::new(
         non_zero_usize(
-            "mz.translate.store.encode_concurrency",
+            "rpg_maker.translate.store.encode_concurrency",
             raw.encode_concurrency,
         )?,
         non_zero_usize(
-            "mz.translate.store.leaves_per_encode_job",
+            "rpg_maker.translate.store.leaves_per_encode_job",
             raw.leaves_per_encode_job,
         )?,
     ))
@@ -984,7 +1085,7 @@ pub(crate) struct TranslationProfileConfiguration {
     id: String,
     max_in_flight_tasks: NonZeroUsize,
     planning: TranslationPlanningConfiguration,
-    request: MzTranslationRequestConfiguration,
+    request: RpgMakerTranslationRequestConfiguration,
 }
 
 impl TranslationProfileConfiguration {
@@ -1000,7 +1101,7 @@ impl TranslationProfileConfiguration {
         &self.planning
     }
 
-    pub(crate) const fn request(&self) -> &MzTranslationRequestConfiguration {
+    pub(crate) const fn request(&self) -> &RpgMakerTranslationRequestConfiguration {
         &self.request
     }
 }
@@ -1117,7 +1218,7 @@ fn build_selected_translation_profile(
                 raw.planning.max_message_characters,
             )?,
         },
-        request: MzTranslationRequestConfiguration::new(
+        request: RpgMakerTranslationRequestConfiguration::new(
             raw.execution
                 .network_retry_delays_ms
                 .into_iter()
@@ -1571,7 +1672,7 @@ fn validate_top_level(source: &str, path: &Path) -> Result<(), ConfigurationLoad
         _llm,
         _prompts,
         _languages,
-        _mz,
+        _rpg_maker,
     } = raw;
     let _ = (
         _projects,
@@ -1580,7 +1681,7 @@ fn validate_top_level(source: &str, path: &Path) -> Result<(), ConfigurationLoad
         _llm,
         _prompts,
         _languages,
-        _mz,
+        _rpg_maker,
     );
     Ok(())
 }
@@ -1752,7 +1853,7 @@ fn select_optional_scan_concurrency(
         return Ok(None);
     }
     let raw = raw.ok_or_else(|| invalid(field, "本次选择需要该配置"))?;
-    let raw: RawMzScanConfiguration = raw
+    let raw: RawRpgMakerScanConfiguration = raw
         .try_into()
         .map_err(|_| invalid(field, "结构或字段类型无效"))?;
     Ok(Some(non_zero_usize(
@@ -1774,13 +1875,13 @@ fn parse_selected_translation_profile(
         .unwrap_or_default();
     if selection.duplicate {
         return Err(ConfigurationLoadError::InvalidValue(invalid(
-            "mz.translation_profiles",
+            "rpg_maker.translation_profiles",
             format!("ID 重复：{requested_id}"),
         )));
     }
     let selected_index = selection.selected_index.ok_or_else(|| {
         ConfigurationLoadError::InvalidValue(invalid(
-            "mz.translation_profiles",
+            "rpg_maker.translation_profiles",
             format!("没有 ID 为 {requested_id} 的条目"),
         ))
     })?;
@@ -1792,7 +1893,7 @@ fn parse_selected_translation_profile(
         .map_err(|error| invalid_toml(path, source, &error))?
         .ok_or_else(|| {
             ConfigurationLoadError::InvalidValue(invalid(
-                "mz.translation_profiles",
+                "rpg_maker.translation_profiles",
                 "所选 Profile 结构或字段类型无效",
             ))
         })
@@ -1836,15 +1937,15 @@ impl<'de> Visitor<'de> for TranslationProfileIndexTopVisitor<'_> {
     where
         A: MapAccess<'de>,
     {
-        let mut seen_mz = false;
+        let mut seen_rpg_maker = false;
         let mut selection = None;
         while let Some(key) = map.next_key::<String>()? {
-            if key == "mz" {
-                if seen_mz {
-                    return Err(de::Error::duplicate_field("mz"));
+            if key == "rpg_maker" {
+                if seen_rpg_maker {
+                    return Err(de::Error::duplicate_field("rpg_maker"));
                 }
-                seen_mz = true;
-                selection = map.next_value_seed(TranslationProfileIndexMzSeed {
+                seen_rpg_maker = true;
+                selection = map.next_value_seed(TranslationProfileIndexRpgMakerSeed {
                     requested_id: self.requested_id,
                 })?;
             } else {
@@ -1855,32 +1956,32 @@ impl<'de> Visitor<'de> for TranslationProfileIndexTopVisitor<'_> {
     }
 }
 
-struct TranslationProfileIndexMzSeed<'a> {
+struct TranslationProfileIndexRpgMakerSeed<'a> {
     requested_id: &'a str,
 }
 
-impl<'de> DeserializeSeed<'de> for TranslationProfileIndexMzSeed<'_> {
+impl<'de> DeserializeSeed<'de> for TranslationProfileIndexRpgMakerSeed<'_> {
     type Value = Option<TranslationProfileIndexSelection>;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(TranslationProfileIndexMzVisitor {
+        deserializer.deserialize_map(TranslationProfileIndexRpgMakerVisitor {
             requested_id: self.requested_id,
         })
     }
 }
 
-struct TranslationProfileIndexMzVisitor<'a> {
+struct TranslationProfileIndexRpgMakerVisitor<'a> {
     requested_id: &'a str,
 }
 
-impl<'de> Visitor<'de> for TranslationProfileIndexMzVisitor<'_> {
+impl<'de> Visitor<'de> for TranslationProfileIndexRpgMakerVisitor<'_> {
     type Value = Option<TranslationProfileIndexSelection>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("MZ 配置")
+        formatter.write_str("RPG Maker 配置")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -1931,7 +2032,7 @@ impl<'de> Visitor<'de> for TranslationProfileIndexSequenceVisitor<'_> {
     type Value = TranslationProfileIndexSelection;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("MZ translation profile 数组")
+        formatter.write_str("RPG Maker translation profile 数组")
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -1971,7 +2072,7 @@ impl<'de> Visitor<'de> for TranslationProfileIdVisitor {
     type Value = Option<String>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("只读取 id 的 MZ translation profile")
+        formatter.write_str("只读取 id 的 RPG Maker translation profile")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -2098,15 +2199,15 @@ impl<'de> Visitor<'de> for SelectedTranslationProfileTopVisitor {
     where
         A: MapAccess<'de>,
     {
-        let mut seen_mz = false;
+        let mut seen_rpg_maker = false;
         let mut selected = None;
         while let Some(key) = map.next_key::<String>()? {
-            if key == "mz" {
-                if seen_mz {
-                    return Err(de::Error::duplicate_field("mz"));
+            if key == "rpg_maker" {
+                if seen_rpg_maker {
+                    return Err(de::Error::duplicate_field("rpg_maker"));
                 }
-                seen_mz = true;
-                selected = map.next_value_seed(SelectedTranslationProfileMzSeed {
+                seen_rpg_maker = true;
+                selected = map.next_value_seed(SelectedTranslationProfileRpgMakerSeed {
                     selected_index: self.selected_index,
                 })?;
             } else {
@@ -2117,32 +2218,32 @@ impl<'de> Visitor<'de> for SelectedTranslationProfileTopVisitor {
     }
 }
 
-struct SelectedTranslationProfileMzSeed {
+struct SelectedTranslationProfileRpgMakerSeed {
     selected_index: usize,
 }
 
-impl<'de> DeserializeSeed<'de> for SelectedTranslationProfileMzSeed {
+impl<'de> DeserializeSeed<'de> for SelectedTranslationProfileRpgMakerSeed {
     type Value = Option<RawSelectedTranslationProfileConfiguration>;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(SelectedTranslationProfileMzVisitor {
+        deserializer.deserialize_map(SelectedTranslationProfileRpgMakerVisitor {
             selected_index: self.selected_index,
         })
     }
 }
 
-struct SelectedTranslationProfileMzVisitor {
+struct SelectedTranslationProfileRpgMakerVisitor {
     selected_index: usize,
 }
 
-impl<'de> Visitor<'de> for SelectedTranslationProfileMzVisitor {
+impl<'de> Visitor<'de> for SelectedTranslationProfileRpgMakerVisitor {
     type Value = Option<RawSelectedTranslationProfileConfiguration>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("MZ 配置")
+        formatter.write_str("RPG Maker 配置")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -2193,7 +2294,7 @@ impl<'de> Visitor<'de> for SelectedTranslationProfileSequenceVisitor {
     type Value = Option<RawSelectedTranslationProfileConfiguration>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("MZ translation profile 数组")
+        formatter.write_str("RPG Maker translation profile 数组")
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -2417,8 +2518,8 @@ struct RawTopLevelSyntax {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "languages")]
     _languages: Option<IgnoredAny>,
-    #[serde(default, rename = "mz")]
-    _mz: Option<IgnoredAny>,
+    #[serde(default, rename = "rpg_maker")]
+    _rpg_maker: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2433,8 +2534,8 @@ struct RawCommonConfiguration {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "languages")]
     _languages: Option<IgnoredAny>,
-    #[serde(default, rename = "mz")]
-    _mz: Option<IgnoredAny>,
+    #[serde(default, rename = "rpg_maker")]
+    _rpg_maker: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2451,15 +2552,15 @@ struct RawInitSelection {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "languages")]
     _languages: Option<IgnoredAny>,
-    #[serde(default, rename = "mz")]
-    _mz: Option<IgnoredAny>,
+    #[serde(default, rename = "rpg_maker")]
+    _rpg_maker: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawExtractSelection {
     runtime: RawCpuRuntimeSelection,
-    mz: RawExtractMzSelection,
+    rpg_maker: RawExtractRpgMakerSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
     #[serde(default, rename = "observability")]
@@ -2478,7 +2579,7 @@ struct RawTranslateSelection {
     runtime: RawTranslateRuntimeSelection,
     prompts: RawPromptsConfiguration,
     languages: Vec<RawLanguageConfiguration>,
-    mz: RawTranslateMzSelection,
+    rpg_maker: RawTranslateRpgMakerSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
     #[serde(default, rename = "observability")]
@@ -2491,7 +2592,7 @@ struct RawTranslateSelection {
 #[serde(deny_unknown_fields)]
 struct RawWriteBackSelection {
     runtime: RawWriteBackRuntimeSelection,
-    mz: RawWriteBackMzSelection,
+    rpg_maker: RawWriteBackRpgMakerSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
     #[serde(default, rename = "observability")]
@@ -2518,8 +2619,8 @@ struct RawLuaSelection {
     _prompts: Option<IgnoredAny>,
     #[serde(default, rename = "languages")]
     _languages: Option<IgnoredAny>,
-    #[serde(default, rename = "mz")]
-    _mz: Option<IgnoredAny>,
+    #[serde(default, rename = "rpg_maker")]
+    _rpg_maker: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2620,9 +2721,9 @@ struct RawPublisherFilesystemSelection {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawExtractMzSelection {
-    document: RawMzDocumentConfiguration,
-    extract: RawSelectedMzExtractConfiguration,
+struct RawExtractRpgMakerSelection {
+    document: RawRpgMakerDocumentConfiguration,
+    extract: RawSelectedRpgMakerExtractConfiguration,
     #[serde(default, rename = "standard_asset")]
     _standard_asset: Option<IgnoredAny>,
     #[serde(default, rename = "translate")]
@@ -2633,9 +2734,9 @@ struct RawExtractMzSelection {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTranslateMzSelection {
-    standard_asset: RawMzStandardAssetConfiguration,
-    translate: RawMzTranslateConfiguration,
+struct RawTranslateRpgMakerSelection {
+    standard_asset: RawRpgMakerStandardAssetConfiguration,
+    translate: RawRpgMakerTranslateConfiguration,
     #[serde(rename = "translation_profiles")]
     _translation_profiles: IgnoredAny,
     #[serde(default, rename = "document")]
@@ -2646,9 +2747,9 @@ struct RawTranslateMzSelection {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawWriteBackMzSelection {
-    document: RawMzDocumentConfiguration,
-    standard_asset: RawMzStandardAssetConfiguration,
+struct RawWriteBackRpgMakerSelection {
+    document: RawRpgMakerDocumentConfiguration,
+    standard_asset: RawRpgMakerStandardAssetConfiguration,
     #[serde(default, rename = "extract")]
     _extract: Option<IgnoredAny>,
     #[serde(default, rename = "translate")]
@@ -2831,50 +2932,50 @@ struct RawEventLogConfiguration {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMzDocumentConfiguration {
+struct RawRpgMakerDocumentConfiguration {
     read_concurrency: u64,
     parse_concurrency: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMzStandardAssetConfiguration {
+struct RawRpgMakerStandardAssetConfiguration {
     decode_concurrency: u64,
     leaves_per_decode_job: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawSelectedMzExtractConfiguration {
+struct RawSelectedRpgMakerExtractConfiguration {
     #[serde(default)]
     builtin: Option<toml::Value>,
     #[serde(default)]
     rules: Option<toml::Value>,
-    store: RawMzExtractStoreConfiguration,
+    store: RawRpgMakerExtractStoreConfiguration,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMzScanConfiguration {
+struct RawRpgMakerScanConfiguration {
     scan_concurrency: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMzExtractStoreConfiguration {
+struct RawRpgMakerExtractStoreConfiguration {
     encode_concurrency: u64,
     groups_per_encode_job: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMzTranslateConfiguration {
-    store: RawMzTranslateStoreConfiguration,
+struct RawRpgMakerTranslateConfiguration {
+    store: RawRpgMakerTranslateStoreConfiguration,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMzTranslateStoreConfiguration {
+struct RawRpgMakerTranslateStoreConfiguration {
     encode_concurrency: u64,
     leaves_per_encode_job: u64,
 }
@@ -2982,6 +3083,7 @@ mod tests {
         let projects_root = absolute_test_path("projects");
         let configured = build_directory_publisher_configuration(
             &projects_root,
+            RpgMakerEngine::Mz,
             RawDirectoryPublisherConfiguration {
                 max_recovery_artifacts_per_target: 1,
                 target_lock_timeout_ms: 1,
@@ -2991,6 +3093,20 @@ mod tests {
         assert_eq!(
             configured.lock_directory(),
             projects_root.join(".att-locks/directory-publish/mz")
+        );
+
+        let configured = build_directory_publisher_configuration(
+            &projects_root,
+            RpgMakerEngine::Mv,
+            RawDirectoryPublisherConfiguration {
+                max_recovery_artifacts_per_target: 1,
+                target_lock_timeout_ms: 1,
+            },
+        )
+        .expect("MV 目录发布配置应合法");
+        assert_eq!(
+            configured.lock_directory(),
+            projects_root.join(".att-locks/directory-publish/mv")
         );
     }
 
@@ -3006,9 +3122,9 @@ mod tests {
             .replace("read_concurrency = 8", "read_concurrency = \"invalid\"");
         let path = directory.write("init.toml", &source);
 
-        let configured =
-            load_configuration(&path, init_command()).expect("Init 不应解析 LLM、Lua 或 MZ 配置");
-        assert!(matches!(configured, ConfiguredMzCommand::Init(_)));
+        let configured = load_configuration(&path, init_command())
+            .expect("Init 不应解析未选择的 LLM、Lua 或 RPG Maker 执行配置");
+        assert!(matches!(configured, ConfiguredRpgMakerCommand::Init(_)));
     }
 
     #[test]
@@ -3017,8 +3133,8 @@ mod tests {
         let path = directory.write("minimal-init.toml", minimal_init_configuration());
 
         let configured = load_configuration(&path, init_command())
-            .expect("Init 不应要求 CPU、LLM、Lua 或 MZ 配置存在");
-        assert!(matches!(configured, ConfiguredMzCommand::Init(_)));
+            .expect("Init 不应要求未选择的 CPU、LLM、Lua 或 RPG Maker 执行配置存在");
+        assert!(matches!(configured, ConfiguredRpgMakerCommand::Init(_)));
     }
 
     #[test]
@@ -3048,7 +3164,7 @@ mod tests {
                 "--name",
                 "demo",
                 "--rules",
-                "rules.json",
+                "rules.toml",
                 "--lua",
                 "script.lua",
             ]),
@@ -3086,7 +3202,7 @@ mod tests {
                     "--name",
                     "demo",
                     "--rules",
-                    "rules.json",
+                    "rules.toml",
                     "--lua",
                     "script.lua",
                 ]),
@@ -3108,7 +3224,7 @@ rpm = []
 burst = []
 parameters = []
 
-[[mz.translation_profiles]]
+[[rpg_maker.translation_profiles]]
 llm_client = ["{sentinel}"]
 max_in_flight_tasks = {{ secret = "{sentinel}" }}
 planning = ["{sentinel}"]
@@ -3126,19 +3242,19 @@ id = "unused"
         let directory = TestDirectory::new();
         let source = configuration_with_unselected_profile_sentinel(SENTINEL);
         let path = directory.write("translate.toml", &source);
-        let ConfiguredMzCommand::Translate(configured) =
+        let ConfiguredRpgMakerCommand::Translate(configured) =
             load_configuration(&path, translate_command(false, "primary"))
                 .expect("无关客户端和 Profile 不应阻止本次翻译")
         else {
             panic!("应建立 Translate 配置");
         };
         configured
-            .mz()
+            .rpg_maker()
             .language_modules()
             .resolve(&LanguageId::parse("ja").expect("测试语言应合法"))
             .expect("应建立日语模块");
         configured
-            .mz()
+            .rpg_maker()
             .language_modules()
             .resolve(&LanguageId::parse("en").expect("测试语言应合法"))
             .expect("应建立英语模块");
@@ -3147,7 +3263,7 @@ id = "unused"
             configured.client().api_key().expose_secret(),
             "replace-with-api-key"
         );
-        let profile_debug = format!("{:?}", configured.mz().profile());
+        let profile_debug = format!("{:?}", configured.rpg_maker().profile());
         assert!(profile_debug.contains("primary"));
         assert!(!profile_debug.contains(SENTINEL));
     }
@@ -3194,7 +3310,7 @@ id = "unused"
     fn prompt_root_is_resolved_from_the_configuration_directory() {
         let directory = TestDirectory::new();
         let path = directory.write("config.toml", include_str!("../../config.example.toml"));
-        let ConfiguredMzCommand::Translate(configured) =
+        let ConfiguredRpgMakerCommand::Translate(configured) =
             load_configuration(&path, translate_command(false, "primary"))
                 .expect("示例 Translate 配置应合法")
         else {
@@ -3206,7 +3322,7 @@ id = "unused"
             .parent()
             .expect("规范配置路径应有父目录")
             .join("prompts");
-        assert_eq!(configured.mz().prompt_root(), expected);
+        assert_eq!(configured.rpg_maker().prompt_root(), expected);
     }
 
     #[test]
@@ -3234,7 +3350,11 @@ id = "unused"
             ),
             (
                 "languages",
-                remove_configuration_range(&source, "[[languages]]", "[[mz.translation_profiles]]"),
+                remove_configuration_range(
+                    &source,
+                    "[[languages]]",
+                    "[[rpg_maker.translation_profiles]]",
+                ),
             ),
             ("profile-id", source.replacen("id = \"primary\"\n", "", 1)),
             (
@@ -3280,7 +3400,7 @@ id = "unused"
             (
                 "selected-profile-missing",
                 source.replacen("llm_client = \"primary\"\n", "", 1),
-                "mz.translation_profiles.llm_client",
+                "rpg_maker.translation_profiles.llm_client",
                 "缺少必填字段",
                 None,
             ),
@@ -3358,7 +3478,7 @@ id = "unused"
     fn translate_rejects_duplicate_current_profile_and_language_ids() {
         let directory = TestDirectory::new();
         let duplicate_profile = format!(
-            "{}\n[[mz.translation_profiles]]\nid = \"primary\"\n",
+            "{}\n[[rpg_maker.translation_profiles]]\nid = \"primary\"\n",
             include_str!("../../config.example.toml")
         );
         let path = directory.write("duplicate-profile.toml", &duplicate_profile);
@@ -3433,7 +3553,7 @@ id = "unused"
                 "\"private_vendor_value\": \"PRIVATE_SENTINEL\"",
             );
         let path = directory.write("secret.toml", &source);
-        let ConfiguredMzCommand::Translate(configured) =
+        let ConfiguredRpgMakerCommand::Translate(configured) =
             load_configuration(&path, translate_command(false, "primary"))
                 .expect("所选客户端应合法")
         else {
@@ -3492,7 +3612,7 @@ id = "unused"
                 "--name",
                 "demo",
                 "--rules",
-                "rules.json",
+                "rules.toml",
             ])
         }
     }
@@ -3535,8 +3655,10 @@ id = "unused"
             .into_iter()
             .chain(arguments.into_iter().skip(1));
         let parsed = AttArguments::try_parse_from(arguments).expect("测试命令应合法");
-        let ProductCommand::Mz { command } = parsed.product;
-        command
+        match parsed.product {
+            ProductCommand::Mz { command } => command,
+            ProductCommand::Mv { .. } => panic!("配置测试只应构造 MZ 命令"),
+        }
     }
 
     fn absolute_test_path(label: &str) -> PathBuf {

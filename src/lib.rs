@@ -3,14 +3,13 @@
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")))]
 compile_error!("ATT 仅支持 x86_64-pc-windows-msvc");
 
-mod att_mz;
-
 mod application;
 mod execution;
 mod fingerprint;
 mod language;
 mod llm;
 mod observability;
+mod rpg_maker;
 mod runtime;
 mod storage;
 
