@@ -1,4 +1,6 @@
 /archive/
 /target/
+/tmp/
+/测试集/
 /config.toml
 **/*.rs.bk
