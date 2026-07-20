@@ -11,7 +11,7 @@ att --config FILE mz write-back --name NAME [--lua SCRIPT_LUA]
 att --config FILE mv write-back --name NAME [--lua SCRIPT_LUA]
 ```
 
-候选每次从 `source` 原始字节完整复制，不在旧 `write_back` 上增量修改：
+候选每次以 `source` 完整树为权威基线重新建立，不在旧 `write_back` 上增量修改：
 
 ```text
 MZ candidate/data + candidate/js
@@ -24,8 +24,9 @@ MV candidate/www/data + candidate/www/js
 
 ## 2. 读取与发布前不变量
 
-Standard Reader 在一致视图中读取 metadata、活动 owner 状态、
-`standard_text_group/leaf/target` 和译文。读取后重算每个 owner 的资产快照指纹，并验证：
+项目开启边界先读取 metadata；Standard Reader 随后在同一个只读数据库视图中读取活动
+owner 状态、`standard_text_group/leaf/target` 和译文。读取后重算每个 owner 的资产
+快照指纹，并验证：
 
 - owner 的来源指纹等于项目当前来源；
 - group recipe、逻辑叶、翻译上下文和 Mutation Target 构成同一完整快照；
@@ -92,7 +93,9 @@ Standard 与可选 Lua 完成后，领域边界无条件验证候选：
 
 随后通用发布器复核完整文件清单、普通对象、Windows 等价名称、reparse、hardlink、
 file ID、文件数、深度和字节预算。被改写文档以合法 JSON 重新编码；未成为 mutation
-target 的字段和未知命令字段保持来源值。
+target 的字段和未知命令字段保持来源值。未改写文件从来源稳定复制并同步；被改写文档
+在 Standard 初始候选中作为 overlay 直接写入并同步一次，不先复制同一路径的来源字节
+再覆盖；后续显式 Lua 仍可按其既有契约编辑该候选。
 
 publish 前先持久化 `write_back_publish_started`；只有意图确认后才调用 publisher。
 终态写入 `write_back_publish_finished`，包含 `engine`、实际布局、输出根、逻辑叶摘要、

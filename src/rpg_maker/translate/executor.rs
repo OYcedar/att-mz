@@ -74,10 +74,12 @@ impl FinalLlmResponseMetadata {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn provider_request_id(&self) -> Option<&str> {
         self.provider_request_id.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn provider_response_id(&self) -> Option<&str> {
         self.provider_response_id.as_deref()
     }
@@ -86,8 +88,18 @@ impl FinalLlmResponseMetadata {
         &self.finish_reason
     }
 
+    #[cfg(test)]
     pub(crate) const fn usage(&self) -> Option<LlmUsage> {
         self.usage
+    }
+
+    pub(crate) fn into_parts(self) -> (Option<String>, Option<String>, String, Option<LlmUsage>) {
+        (
+            self.provider_request_id,
+            self.provider_response_id,
+            self.finish_reason,
+            self.usage,
+        )
     }
 }
 

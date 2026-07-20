@@ -29,44 +29,37 @@ use super::standard::{
     StandardWriteBackSnapshot, StandardWriteBackSnapshotError,
 };
 
-const READ_STANDARD_WRITE_BACK_SNAPSHOT: &str = r#"SELECT
-    'owner' AS record_kind,
+const READ_STANDARD_WRITE_BACK_OWNER_STATES: &str = r#"SELECT
     owner,
-    NULL AS group_location,
-    NULL AS group_kind,
-    NULL AS projection_recipe_json,
-    NULL AS field_role,
-    NULL AS original_text,
-    NULL AS translation_context_json,
-    NULL AS translation,
-    NULL AS mutation_target,
     source_snapshot_fingerprint,
     asset_snapshot_fingerprint
 FROM standard_asset_owner_state
+ORDER BY owner COLLATE BINARY"#;
 
-UNION ALL
-
-SELECT
-    'group', owner, group_location, group_kind, projection_recipe_json,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL
+const READ_STANDARD_WRITE_BACK_GROUPS: &str = r#"SELECT
+    owner,
+    group_location,
+    group_kind,
+    projection_recipe_json
 FROM standard_text_group
+ORDER BY owner COLLATE BINARY, group_location COLLATE BINARY"#;
 
-UNION ALL
-
-SELECT
-    'leaf', owner, group_location, NULL, NULL,
-    field_role, original_text, translation_context_json, translation,
-    NULL, NULL, NULL
+const READ_STANDARD_WRITE_BACK_LEAVES: &str = r#"SELECT
+    owner,
+    group_location,
+    field_role,
+    original_text,
+    translation_context_json,
+    translation
 FROM standard_text_leaf
+ORDER BY owner COLLATE BINARY, group_location COLLATE BINARY, field_role COLLATE BINARY"#;
 
-UNION ALL
-
-SELECT
-    'target', owner, group_location, NULL, NULL,
-    NULL, NULL, NULL, NULL, mutation_target, NULL, NULL
+const READ_STANDARD_WRITE_BACK_TARGETS: &str = r#"SELECT
+    owner,
+    group_location,
+    mutation_target
 FROM standard_text_target
-
-ORDER BY owner, record_kind, group_location, field_role, mutation_target"#;
+ORDER BY mutation_target COLLATE BINARY"#;
 
 /// 先验证 active owner 与资产指纹，再用受控 CPU 解码建立写回快照。
 pub(crate) struct RpgMakerStandardWriteBackAssetReadingService<Q, C> {
@@ -112,16 +105,42 @@ where
                         InvalidStandardWriteBackAssetSnapshot::InvalidDialogueDefinition(source),
                     )
                 })?;
-            let rows = sqlite
-                .query_existing_database(
+            let query_results = sqlite
+                .query_existing_database_snapshot(
                     database_path.clone(),
-                    SqliteQuery::new(READ_STANDARD_WRITE_BACK_SNAPSHOT, Vec::new()),
+                    vec![
+                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_OWNER_STATES, Vec::new()),
+                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_GROUPS, Vec::new()),
+                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_LEAVES, Vec::new()),
+                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_TARGETS, Vec::new()),
+                    ],
                 )
                 .await
                 .map_err(|error| map_query_error(database_path, error))?;
+            let actual = query_results.len();
+            let [owner_rows, group_rows, leaf_rows, target_rows] =
+                query_results.try_into().map_err(|_| {
+                    RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot(
+                        InvalidStandardWriteBackAssetSnapshot::WrongQueryResultCount {
+                            expected: 4,
+                            actual,
+                        },
+                    )
+                })?;
 
             let prepared = cpu
-                .execute(move || prepare_rows(rows, current_source, records_per_job))
+                .execute(move || {
+                    prepare_rows(
+                        SnapshotRows {
+                            owners: owner_rows,
+                            groups: group_rows,
+                            leaves: leaf_rows,
+                            targets: target_rows,
+                        },
+                        current_source,
+                        records_per_job,
+                    )
+                })
                 .await
                 .map_err(RpgMakerStandardWriteBackAssetReadingError::SchedulePartition)?
                 .map_err(RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot)?;
@@ -140,13 +159,12 @@ where
 
             let owner_states = prepared.owner_states;
             cpu.execute(move || {
-                let decoded = decoded_batches
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>();
-                assemble_snapshot(owner_states, decoded, &dialogue_definition_json)
+                let decoded = decoded_batches.into_iter().collect::<Result<Vec<_>, _>>()?;
+                assemble_snapshot(
+                    owner_states,
+                    decoded.into_iter().flatten(),
+                    &dialogue_definition_json,
+                )
             })
             .await
             .map_err(RpgMakerStandardWriteBackAssetReadingError::ScheduleAssembly)?
@@ -229,6 +247,10 @@ impl<Q: Error + 'static, C: Error + 'static> Error
 
 #[derive(Debug)]
 pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
+    WrongQueryResultCount {
+        expected: usize,
+        actual: usize,
+    },
     WrongColumnCount {
         expected: usize,
         actual: usize,
@@ -238,7 +260,6 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
         expected: &'static str,
         actual: &'static str,
     },
-    UnknownRecordKind(String),
     UnknownOwner(String),
     DuplicateOwner(String),
     InvalidFingerprintLength {
@@ -268,6 +289,10 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
 impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WrongQueryResultCount { expected, actual } => write!(
+                formatter,
+                "写回资产查询应返回 {expected} 组结果，实际为 {actual} 组"
+            ),
             Self::WrongColumnCount { expected, actual } => {
                 write!(
                     formatter,
@@ -279,7 +304,6 @@ impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
                 expected,
                 actual,
             } => write!(formatter, "列 {column} 应为 {expected}，实际为 {actual}"),
-            Self::UnknownRecordKind(kind) => write!(formatter, "未知写回记录类型：{kind}"),
             Self::UnknownOwner(owner) => write!(formatter, "未知资产所有者：{owner}"),
             Self::DuplicateOwner(owner) => write!(formatter, "资产所有者状态重复：{owner}"),
             Self::InvalidFingerprintLength {
@@ -336,52 +360,69 @@ struct OwnerState {
     asset_fingerprint: AssetSnapshotFingerprint,
 }
 
+struct SnapshotRows {
+    owners: Vec<SqliteRow>,
+    groups: Vec<SqliteRow>,
+    leaves: Vec<SqliteRow>,
+    targets: Vec<SqliteRow>,
+}
+
+enum SnapshotAssetRow {
+    Group(SqliteRow),
+    Leaf(SqliteRow),
+    Target(SqliteRow),
+}
+
 struct PreparedRows {
     stale_owners: Vec<RpgMakerStandardAssetOwner>,
     owner_states: BTreeMap<String, OwnerState>,
-    batches: Vec<Vec<SqliteRow>>,
+    batches: Vec<Vec<SnapshotAssetRow>>,
 }
 
 fn prepare_rows(
-    rows: Vec<SqliteRow>,
+    rows: SnapshotRows,
     current_source: SourceSnapshotFingerprint,
     records_per_job: usize,
 ) -> Result<PreparedRows, InvalidStandardWriteBackAssetSnapshot> {
+    assert!(records_per_job > 0, "写回资产解码批大小必须非零");
+    let asset_row_count = rows
+        .groups
+        .len()
+        .saturating_add(rows.leaves.len())
+        .saturating_add(rows.targets.len());
+    let initial_batch_capacity = records_per_job.min(asset_row_count);
     let mut owner_states = BTreeMap::new();
-    let mut asset_rows = Vec::new();
+    let mut batches = Vec::new();
+    let mut asset_rows = Vec::with_capacity(initial_batch_capacity);
     let mut stale_owners = Vec::new();
-    for row in rows {
+    for row in rows.owners {
         let values = row.into_values();
-        if values.len() != 12 {
-            return Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
-                expected: 12,
-                actual: values.len(),
-            });
-        }
-        let kind = required_text(&values[0], "record_kind")?;
-        if kind != "owner" {
-            asset_rows.push(SqliteRow::new(values));
-            continue;
-        }
-        for (column, value) in [
-            ("group_location", &values[2]),
-            ("group_kind", &values[3]),
-            ("projection_recipe_json", &values[4]),
-            ("field_role", &values[5]),
-            ("original_text", &values[6]),
-            ("translation_context_json", &values[7]),
-            ("translation", &values[8]),
-            ("mutation_target", &values[9]),
-        ] {
-            required_null(value, column)?;
-        }
-        let owner_name = required_text(&values[1], "owner")?;
-        let owner = parse_owner(owner_name)?;
-        let source = fingerprint(&values[10], owner_name, "source_snapshot_fingerprint")?;
-        let asset = fingerprint(&values[11], owner_name, "asset_snapshot_fingerprint")?;
+        let actual = values.len();
+        let [
+            owner,
+            source_snapshot_fingerprint,
+            asset_snapshot_fingerprint,
+        ] = values.try_into().map_err(|_| {
+            InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
+                expected: 3,
+                actual,
+            }
+        })?;
+        let owner_name = owned_text(owner, "owner")?;
+        let owner = parse_owner(&owner_name)?;
+        let source = owned_fingerprint(
+            source_snapshot_fingerprint,
+            &owner_name,
+            "source_snapshot_fingerprint",
+        )?;
+        let asset = owned_fingerprint(
+            asset_snapshot_fingerprint,
+            &owner_name,
+            "asset_snapshot_fingerprint",
+        )?;
         if owner_states
             .insert(
-                owner_name.to_owned(),
+                owner_name.clone(),
                 OwnerState {
                     owner,
                     asset_fingerprint: AssetSnapshotFingerprint::from_bytes(asset),
@@ -390,7 +431,7 @@ fn prepare_rows(
             .is_some()
         {
             return Err(InvalidStandardWriteBackAssetSnapshot::DuplicateOwner(
-                owner_name.to_owned(),
+                owner_name,
             ));
         }
         if SourceSnapshotFingerprint::from_bytes(source) != current_source {
@@ -398,10 +439,25 @@ fn prepare_rows(
         }
     }
     stale_owners.sort_by_key(owner_order);
-    let batches = asset_rows
-        .chunks(records_per_job)
-        .map(<[SqliteRow]>::to_vec)
-        .collect();
+
+    let ordered_asset_rows = rows
+        .groups
+        .into_iter()
+        .map(SnapshotAssetRow::Group)
+        .chain(rows.leaves.into_iter().map(SnapshotAssetRow::Leaf))
+        .chain(rows.targets.into_iter().map(SnapshotAssetRow::Target));
+    for row in ordered_asset_rows {
+        asset_rows.push(row);
+        if asset_rows.len() == records_per_job {
+            batches.push(std::mem::replace(
+                &mut asset_rows,
+                Vec::with_capacity(records_per_job),
+            ));
+        }
+    }
+    if !asset_rows.is_empty() {
+        batches.push(asset_rows);
+    }
     Ok(PreparedRows {
         stale_owners,
         owner_states,
@@ -409,7 +465,6 @@ fn prepare_rows(
     })
 }
 
-#[derive(Clone)]
 enum DecodedRecord {
     Group {
         owner: String,
@@ -438,91 +493,97 @@ enum DecodedRecord {
 }
 
 fn decode_batch(
-    rows: Vec<SqliteRow>,
+    rows: Vec<SnapshotAssetRow>,
 ) -> Result<Vec<DecodedRecord>, InvalidStandardWriteBackAssetSnapshot> {
-    rows.into_iter().map(decode_record).collect()
+    rows.into_iter()
+        .map(|row| match row {
+            SnapshotAssetRow::Group(row) => decode_group(row),
+            SnapshotAssetRow::Leaf(row) => decode_leaf(row),
+            SnapshotAssetRow::Target(row) => decode_target(row),
+        })
+        .collect()
 }
 
-fn decode_record(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
+fn decode_group(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
     let values = row.into_values();
-    if values.len() != 12 {
-        return Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
-            expected: 12,
-            actual: values.len(),
-        });
-    }
-    required_null(&values[10], "source_snapshot_fingerprint")?;
-    required_null(&values[11], "asset_snapshot_fingerprint")?;
-    let kind = required_text(&values[0], "record_kind")?;
-    let owner = required_text(&values[1], "owner")?.to_owned();
+    let actual = values.len();
+    let [owner, group_location, group_kind, projection_recipe_json] = values.try_into().map_err(
+        |_| InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
+            expected: 4,
+            actual,
+        },
+    )?;
+    let owner = owned_text(owner, "owner")?;
     parse_owner(&owner)?;
-    let group_location_raw = required_text(&values[2], "group_location")?.to_owned();
-    match kind {
-        "group" => {
-            let group_kind_raw = required_text(&values[3], "group_kind")?.to_owned();
-            let recipes_raw = required_text(&values[4], "projection_recipe_json")?.to_owned();
-            for (column, value) in [
-                ("field_role", &values[5]),
-                ("original_text", &values[6]),
-                ("translation_context_json", &values[7]),
-                ("translation", &values[8]),
-                ("mutation_target", &values[9]),
-            ] {
-                required_null(value, column)?;
-            }
-            Ok(DecodedRecord::Group {
-                owner,
-                group_location: RpgMakerLocationCodec::decode(&group_location_raw)
-                    .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidLocation)?,
-                group_location_raw,
-                kind: parse_group_kind(&group_kind_raw)?,
-                group_kind_raw,
-                recipes: RpgMakerProjectionCodec::decode_recipes(&recipes_raw)
-                    .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
-                recipes_raw,
-            })
-        }
-        "leaf" => {
-            required_null(&values[3], "group_kind")?;
-            required_null(&values[4], "projection_recipe_json")?;
-            required_null(&values[9], "mutation_target")?;
-            let role_raw = required_text(&values[5], "field_role")?.to_owned();
-            Ok(DecodedRecord::Leaf {
-                owner,
-                group_location_raw,
-                role: RpgMakerProjectionCodec::decode_role(&role_raw)
-                    .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
-                role_raw,
-                original_text: required_text(&values[6], "original_text")?.to_owned(),
-                translation_context_json: required_text(&values[7], "translation_context_json")?
-                    .to_owned(),
-                translation: optional_text(&values[8], "translation")?,
-            })
-        }
-        "target" => {
-            for (column, value) in [
-                ("group_kind", &values[3]),
-                ("projection_recipe_json", &values[4]),
-                ("field_role", &values[5]),
-                ("original_text", &values[6]),
-                ("translation_context_json", &values[7]),
-                ("translation", &values[8]),
-            ] {
-                required_null(value, column)?;
-            }
-            let target_raw = required_text(&values[9], "mutation_target")?.to_owned();
-            Ok(DecodedRecord::Target {
-                owner,
-                group_location_raw,
-                target: RpgMakerProjectionCodec::decode_target(&target_raw)
-                    .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
-                target_raw,
-            })
-        }
-        other => Err(InvalidStandardWriteBackAssetSnapshot::UnknownRecordKind(
-            other.to_owned(),
-        )),
-    }
+    let group_location_raw = owned_text(group_location, "group_location")?;
+    let group_kind_raw = owned_text(group_kind, "group_kind")?;
+    let recipes_raw = owned_text(projection_recipe_json, "projection_recipe_json")?;
+    Ok(DecodedRecord::Group {
+        owner,
+        group_location: RpgMakerLocationCodec::decode(&group_location_raw)
+            .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidLocation)?,
+        group_location_raw,
+        kind: parse_group_kind(&group_kind_raw)?,
+        group_kind_raw,
+        recipes: RpgMakerProjectionCodec::decode_recipes(&recipes_raw)
+            .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
+        recipes_raw,
+    })
+}
+
+fn decode_leaf(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
+    let values = row.into_values();
+    let actual = values.len();
+    let [
+        owner,
+        group_location,
+        field_role,
+        original_text,
+        translation_context_json,
+        translation,
+    ] = values.try_into().map_err(
+        |_| InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
+            expected: 6,
+            actual,
+        },
+    )?;
+    let owner = owned_text(owner, "owner")?;
+    parse_owner(&owner)?;
+    let group_location_raw = owned_text(group_location, "group_location")?;
+    let role_raw = owned_text(field_role, "field_role")?;
+    Ok(DecodedRecord::Leaf {
+        owner,
+        group_location_raw,
+        role: RpgMakerProjectionCodec::decode_role(&role_raw)
+            .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
+        role_raw,
+        original_text: owned_text(original_text, "original_text")?,
+        translation_context_json: owned_text(translation_context_json, "translation_context_json")?,
+        translation: optional_owned_text(translation, "translation")?,
+    })
+}
+
+fn decode_target(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
+    let values = row.into_values();
+    let actual = values.len();
+    let [owner, group_location, mutation_target] =
+        values.try_into().map_err(
+            |_| InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
+                expected: 3,
+                actual,
+            },
+        )?;
+    let owner = owned_text(owner, "owner")?;
+    parse_owner(&owner)?;
+    let group_location_raw = owned_text(group_location, "group_location")?;
+    let target_raw = owned_text(mutation_target, "mutation_target")?;
+    Ok(DecodedRecord::Target {
+        owner,
+        group_location_raw,
+        target: RpgMakerProjectionCodec::decode_target(&target_raw)
+            .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
+        target_raw,
+    })
 }
 
 struct GroupBuilder {
@@ -533,22 +594,68 @@ struct GroupBuilder {
     targets: Vec<MutationTarget>,
 }
 
-#[derive(Default)]
-struct FingerprintRows {
-    groups: Vec<(String, String, String)>,
-    leaves: Vec<(String, String, String, String)>,
-    targets: Vec<(String, String)>,
+struct SnapshotFingerprintAccumulator {
+    hasher: Sha256FramedHasher,
+}
+
+impl SnapshotFingerprintAccumulator {
+    fn new(owner: RpgMakerStandardAssetOwner, dialogue_definition_json: &str) -> Self {
+        let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.standard_text_snapshot");
+        hasher.frame(1, owner.storage_name().as_bytes());
+        if owner == RpgMakerStandardAssetOwner::Builtin {
+            hasher
+                .frame(14, b"project_definition")
+                .frame(15, dialogue_definition_json.as_bytes());
+        }
+        Self { hasher }
+    }
+
+    fn group(&mut self, group_location: &str, group_kind: &str, recipes: &str) {
+        self.hasher
+            .frame(2, b"group")
+            .frame(3, group_location.as_bytes())
+            .frame(4, group_kind.as_bytes())
+            .frame(5, recipes.as_bytes());
+    }
+
+    fn leaf(&mut self, group_location: &str, role: &str, original: &str, context: &str) {
+        self.hasher
+            .frame(6, b"leaf")
+            .frame(7, group_location.as_bytes())
+            .frame(8, role.as_bytes())
+            .frame(9, original.as_bytes())
+            .frame(10, context.as_bytes());
+    }
+
+    fn target(&mut self, target: &str, group_location: &str) {
+        self.hasher
+            .frame(11, b"target")
+            .frame(12, target.as_bytes())
+            .frame(13, group_location.as_bytes());
+    }
+
+    fn finish(self) -> AssetSnapshotFingerprint {
+        AssetSnapshotFingerprint::from_bytes(self.hasher.finish().into_bytes())
+    }
 }
 
 fn assemble_snapshot(
     owner_states: BTreeMap<String, OwnerState>,
-    records: Vec<DecodedRecord>,
+    records: impl IntoIterator<Item = DecodedRecord>,
     dialogue_definition_json: &str,
 ) -> Result<StandardWriteBackSnapshot, InvalidStandardWriteBackAssetSnapshot> {
     let mut groups = BTreeMap::<(String, String), GroupBuilder>::new();
     let mut leaves = Vec::new();
     let mut targets = Vec::new();
-    let mut fingerprint_rows = BTreeMap::<String, FingerprintRows>::new();
+    let mut fingerprint_accumulators = owner_states
+        .iter()
+        .map(|(owner_name, state)| {
+            (
+                owner_name.clone(),
+                SnapshotFingerprintAccumulator::new(state.owner, dialogue_definition_json),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     for record in records {
         let owner = match &record {
@@ -571,6 +678,10 @@ fn assemble_snapshot(
                 recipes,
                 recipes_raw,
             } => {
+                fingerprint_accumulators
+                    .get_mut(&owner)
+                    .expect("active owner 已在循环入口确认")
+                    .group(&group_location_raw, &group_kind_raw, &recipes_raw);
                 let key = (owner.clone(), group_location_raw.clone());
                 if groups
                     .insert(
@@ -590,11 +701,6 @@ fn assemble_snapshot(
                         group_location: group_location_raw,
                     });
                 }
-                fingerprint_rows.entry(owner).or_default().groups.push((
-                    group_location_raw,
-                    group_kind_raw,
-                    recipes_raw,
-                ));
             }
             DecodedRecord::Leaf {
                 owner,
@@ -605,16 +711,15 @@ fn assemble_snapshot(
                 translation_context_json,
                 translation,
             } => {
-                fingerprint_rows
-                    .entry(owner.clone())
-                    .or_default()
-                    .leaves
-                    .push((
-                        group_location_raw.clone(),
-                        role_raw,
-                        original_text.clone(),
-                        translation_context_json,
-                    ));
+                fingerprint_accumulators
+                    .get_mut(&owner)
+                    .expect("active owner 已在循环入口确认")
+                    .leaf(
+                        &group_location_raw,
+                        &role_raw,
+                        &original_text,
+                        &translation_context_json,
+                    );
                 leaves.push((
                     owner,
                     group_location_raw,
@@ -628,11 +733,10 @@ fn assemble_snapshot(
                 target,
                 target_raw,
             } => {
-                fingerprint_rows
-                    .entry(owner.clone())
-                    .or_default()
-                    .targets
-                    .push((target_raw, group_location_raw.clone()));
+                fingerprint_accumulators
+                    .get_mut(&owner)
+                    .expect("active owner 已在循环入口确认")
+                    .target(&target_raw, &group_location_raw);
                 targets.push((owner, group_location_raw, target));
             }
         }
@@ -660,10 +764,11 @@ fn assemble_snapshot(
     }
 
     for (owner_name, state) in &owner_states {
-        let rows = fingerprint_rows.remove(owner_name).unwrap_or_default();
-        if snapshot_fingerprint(state.owner, rows, dialogue_definition_json)
-            != state.asset_fingerprint
-        {
+        let actual = fingerprint_accumulators
+            .remove(owner_name)
+            .expect("每个 active owner 都应建立指纹累加器")
+            .finish();
+        if actual != state.asset_fingerprint {
             return Err(
                 InvalidStandardWriteBackAssetSnapshot::AssetFingerprintMismatch {
                     owner: owner_name.clone(),
@@ -689,6 +794,15 @@ fn assemble_snapshot(
         .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidModel)
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct FingerprintRows {
+    groups: Vec<(String, String, String)>,
+    leaves: Vec<(String, String, String, String)>,
+    targets: Vec<(String, String)>,
+}
+
+#[cfg(test)]
 fn snapshot_fingerprint(
     owner: RpgMakerStandardAssetOwner,
     mut rows: FingerprintRows,
@@ -697,35 +811,17 @@ fn snapshot_fingerprint(
     rows.groups.sort();
     rows.leaves.sort();
     rows.targets.sort();
-    let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.standard_text_snapshot");
-    hasher.frame(1, owner.storage_name().as_bytes());
-    if owner == RpgMakerStandardAssetOwner::Builtin {
-        hasher
-            .frame(14, b"project_definition")
-            .frame(15, dialogue_definition_json.as_bytes());
-    }
+    let mut accumulator = SnapshotFingerprintAccumulator::new(owner, dialogue_definition_json);
     for (group_location, group_kind, recipes) in rows.groups {
-        hasher
-            .frame(2, b"group")
-            .frame(3, group_location.as_bytes())
-            .frame(4, group_kind.as_bytes())
-            .frame(5, recipes.as_bytes());
+        accumulator.group(&group_location, &group_kind, &recipes);
     }
     for (group_location, role, original, context) in rows.leaves {
-        hasher
-            .frame(6, b"leaf")
-            .frame(7, group_location.as_bytes())
-            .frame(8, role.as_bytes())
-            .frame(9, original.as_bytes())
-            .frame(10, context.as_bytes());
+        accumulator.leaf(&group_location, &role, &original, &context);
     }
     for (target, group_location) in rows.targets {
-        hasher
-            .frame(11, b"target")
-            .frame(12, target.as_bytes())
-            .frame(13, group_location.as_bytes());
+        accumulator.target(&target, &group_location);
     }
-    AssetSnapshotFingerprint::from_bytes(hasher.finish().into_bytes())
+    accumulator.finish()
 }
 
 fn parse_owner(
@@ -751,27 +847,27 @@ fn parse_group_kind(value: &str) -> Result<TextGroupKind, InvalidStandardWriteBa
     }
 }
 
-fn required_text<'a>(
-    value: &'a SqliteValue,
+fn owned_text(
+    value: SqliteValue,
     column: &'static str,
-) -> Result<&'a str, InvalidStandardWriteBackAssetSnapshot> {
-    let SqliteValue::Text(value) = value else {
-        return Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnType {
+) -> Result<String, InvalidStandardWriteBackAssetSnapshot> {
+    match value {
+        SqliteValue::Text(value) => Ok(value),
+        value => Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnType {
             column,
             expected: "TEXT",
             actual: value.kind_name(),
-        });
-    };
-    Ok(value)
+        }),
+    }
 }
 
-fn optional_text(
-    value: &SqliteValue,
+fn optional_owned_text(
+    value: SqliteValue,
     column: &'static str,
 ) -> Result<Option<String>, InvalidStandardWriteBackAssetSnapshot> {
     match value {
         SqliteValue::Null => Ok(None),
-        SqliteValue::Text(value) => Ok(Some(value.clone())),
+        SqliteValue::Text(value) => Ok(Some(value)),
         value => Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnType {
             column,
             expected: "TEXT 或 NULL",
@@ -780,23 +876,8 @@ fn optional_text(
     }
 }
 
-fn required_null(
-    value: &SqliteValue,
-    column: &'static str,
-) -> Result<(), InvalidStandardWriteBackAssetSnapshot> {
-    if matches!(value, SqliteValue::Null) {
-        Ok(())
-    } else {
-        Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnType {
-            column,
-            expected: "NULL",
-            actual: value.kind_name(),
-        })
-    }
-}
-
-fn fingerprint(
-    value: &SqliteValue,
+fn owned_fingerprint(
+    value: SqliteValue,
     owner: &str,
     column: &'static str,
 ) -> Result<[u8; 32], InvalidStandardWriteBackAssetSnapshot> {
@@ -807,13 +888,14 @@ fn fingerprint(
             actual: value.kind_name(),
         });
     };
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-        InvalidStandardWriteBackAssetSnapshot::InvalidFingerprintLength {
+    let actual = bytes.len();
+    bytes.try_into().map_err(
+        |_| InvalidStandardWriteBackAssetSnapshot::InvalidFingerprintLength {
             owner: owner.to_owned(),
             column,
-            actual: bytes.len(),
-        }
-    })
+            actual,
+        },
+    )
 }
 
 fn owner_order(owner: &RpgMakerStandardAssetOwner) -> u8 {
@@ -844,29 +926,239 @@ fn map_query_error<Q, C>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpg_maker::model::ScalarFieldKey;
 
     fn owner_row(source: [u8; 32], asset: [u8; 32]) -> SqliteRow {
         SqliteRow::new(vec![
-            SqliteValue::Text("owner".to_owned()),
             SqliteValue::Text("builtin".to_owned()),
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
             SqliteValue::Blob(source.to_vec()),
             SqliteValue::Blob(asset.to_vec()),
         ])
+    }
+
+    fn snapshot_rows(owners: Vec<SqliteRow>) -> SnapshotRows {
+        SnapshotRows {
+            owners,
+            groups: Vec::new(),
+            leaves: Vec::new(),
+            targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn snapshot_queries_follow_primary_key_order_without_temporary_sorting() {
+        let connection = rusqlite::Connection::open_in_memory().expect("应可建立内存数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE standard_asset_owner_state (
+                    owner TEXT NOT NULL PRIMARY KEY,
+                    source_snapshot_fingerprint BLOB NOT NULL,
+                    asset_snapshot_fingerprint BLOB NOT NULL
+                );
+                CREATE TABLE standard_text_group (
+                    owner TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    group_kind TEXT NOT NULL,
+                    projection_recipe_json TEXT NOT NULL,
+                    PRIMARY KEY (owner, group_location)
+                );
+                CREATE TABLE standard_text_leaf (
+                    owner TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    field_role TEXT NOT NULL,
+                    original_text TEXT NOT NULL,
+                    translation_context_json TEXT NOT NULL,
+                    translation TEXT,
+                    PRIMARY KEY (owner, group_location, field_role)
+                );
+                CREATE TABLE standard_text_target (
+                    mutation_target TEXT NOT NULL PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    group_location TEXT NOT NULL
+                );
+
+                INSERT INTO standard_asset_owner_state VALUES ('rules', zeroblob(32), zeroblob(32));
+                INSERT INTO standard_asset_owner_state VALUES ('builtin', zeroblob(32), zeroblob(32));
+                INSERT INTO standard_text_group VALUES ('builtin', 'group-b', 'map', '[]');
+                INSERT INTO standard_text_group VALUES ('builtin', 'group-a', 'map', '[]');
+                INSERT INTO standard_text_leaf VALUES ('builtin', 'group-b', 'role-z', 'z', '{}', NULL);
+                INSERT INTO standard_text_leaf VALUES ('builtin', 'group-a', 'role-y', 'y', '{}', NULL);
+                INSERT INTO standard_text_target VALUES ('target-z', 'builtin', 'group-a');
+                INSERT INTO standard_text_target VALUES ('target-a', 'builtin', 'group-z');
+                "#,
+            )
+            .expect("测试快照表与行应可建立");
+
+        for query in [
+            READ_STANDARD_WRITE_BACK_OWNER_STATES,
+            READ_STANDARD_WRITE_BACK_GROUPS,
+            READ_STANDARD_WRITE_BACK_LEAVES,
+            READ_STANDARD_WRITE_BACK_TARGETS,
+        ] {
+            let plan = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .expect("快照查询计划应可建立")
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("快照查询计划应可读取")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("快照查询计划行应可读取");
+            assert!(
+                plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+                "快照查询不应产生临时排序：{plan:?}"
+            );
+        }
+
+        let owners = connection
+            .prepare(READ_STANDARD_WRITE_BACK_OWNER_STATES)
+            .expect("owner 查询应可建立")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("owner 查询应可执行")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("owner 行应可读取");
+        let groups = connection
+            .prepare(READ_STANDARD_WRITE_BACK_GROUPS)
+            .expect("group 查询应可建立")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("group 查询应可执行")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("group 行应可读取");
+        let leaves = connection
+            .prepare(READ_STANDARD_WRITE_BACK_LEAVES)
+            .expect("leaf 查询应可建立")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .expect("leaf 查询应可执行")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("leaf 行应可读取");
+        let targets = connection
+            .prepare(READ_STANDARD_WRITE_BACK_TARGETS)
+            .expect("target 查询应可建立")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(2)?, row.get::<_, String>(1)?))
+            })
+            .expect("target 查询应可执行")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("target 行应可读取");
+
+        assert_eq!(owners, ["builtin", "rules"]);
+        assert_eq!(groups, ["group-a", "group-b"]);
+        assert_eq!(
+            leaves,
+            [
+                ("group-a".to_owned(), "role-y".to_owned()),
+                ("group-b".to_owned(), "role-z".to_owned()),
+            ]
+        );
+        assert_eq!(
+            targets,
+            [
+                ("target-a".to_owned(), "group-z".to_owned()),
+                ("target-z".to_owned(), "group-a".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn prepare_rows_moves_asset_rows_into_natural_order_batches() {
+        let mut pointers = Vec::new();
+        let mut make_row = |label: &str, columns: usize| {
+            let owner = label.to_owned();
+            pointers.push(owner.as_ptr());
+            let mut values = Vec::with_capacity(columns);
+            values.push(SqliteValue::Text(owner));
+            values.resize(columns, SqliteValue::Null);
+            SqliteRow::new(values)
+        };
+        let rows = SnapshotRows {
+            owners: Vec::new(),
+            groups: vec![make_row("group-0", 4), make_row("group-1", 4)],
+            leaves: vec![make_row("leaf-0", 6), make_row("leaf-1", 6)],
+            targets: vec![make_row("target-0", 3)],
+        };
+
+        let prepared = prepare_rows(rows, SourceSnapshotFingerprint::from_bytes([1; 32]), 2)
+            .expect("非 owner 行只应按所有权分批");
+
+        assert_eq!(
+            prepared.batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        assert_eq!(
+            prepared
+                .batches
+                .iter()
+                .flatten()
+                .map(|row| match row {
+                    SnapshotAssetRow::Group(row)
+                    | SnapshotAssetRow::Leaf(row)
+                    | SnapshotAssetRow::Target(row) => match &row.values()[0] {
+                        SqliteValue::Text(value) => value.as_ptr(),
+                        value => panic!("owner 应为 TEXT，实际为 {}", value.kind_name()),
+                    },
+                })
+                .collect::<Vec<_>>(),
+            pointers
+        );
+    }
+
+    #[test]
+    fn decode_record_moves_owned_text_out_of_sqlite_values() {
+        let owner = "builtin".to_owned();
+        let owner_pointer = owner.as_ptr();
+        let group_location = RpgMakerLocationCodec::encode(&RpgMakerLocation::value(
+            crate::rpg_maker::text::RpgMakerSource::map(1),
+            vec![crate::rpg_maker::text::RpgMakerLocationStep::key("name")],
+        ))
+        .expect("测试位置应可编码");
+        let group_location_pointer = group_location.as_ptr();
+        let role = RpgMakerProjectionCodec::encode_role(&TextFieldRole::Scalar(
+            ScalarFieldKey::new("name").expect("测试字段键应合法"),
+        ))
+        .expect("测试角色应可编码");
+        let role_pointer = role.as_ptr();
+        let original = "原文".to_owned();
+        let original_pointer = original.as_ptr();
+        let context = "{}".to_owned();
+        let context_pointer = context.as_ptr();
+        let translation = "译文".to_owned();
+        let translation_pointer = translation.as_ptr();
+        let row = SqliteRow::new(vec![
+            SqliteValue::Text(owner),
+            SqliteValue::Text(group_location),
+            SqliteValue::Text(role),
+            SqliteValue::Text(original),
+            SqliteValue::Text(context),
+            SqliteValue::Text(translation),
+        ]);
+
+        let DecodedRecord::Leaf {
+            owner,
+            group_location_raw,
+            role_raw,
+            original_text,
+            translation_context_json,
+            translation: Some(translation),
+            ..
+        } = decode_leaf(row).expect("测试叶行应可解码")
+        else {
+            panic!("测试行应解码为 leaf")
+        };
+
+        assert_eq!(owner.as_ptr(), owner_pointer);
+        assert_eq!(group_location_raw.as_ptr(), group_location_pointer);
+        assert_eq!(role_raw.as_ptr(), role_pointer);
+        assert_eq!(original_text.as_ptr(), original_pointer);
+        assert_eq!(translation_context_json.as_ptr(), context_pointer);
+        assert_eq!(translation.as_ptr(), translation_pointer);
     }
 
     #[test]
     fn stale_source_and_asset_fingerprint_corruption_are_distinct_failures() {
         const DIALOGUE_DEFINITION: &str = "{\"rules\":[]}";
         let stale = prepare_rows(
-            vec![owner_row([1; 32], [2; 32])],
+            snapshot_rows(vec![owner_row([1; 32], [2; 32])]),
             SourceSnapshotFingerprint::from_bytes([9; 32]),
             16,
         )
@@ -874,7 +1166,7 @@ mod tests {
         assert_eq!(stale.stale_owners, [RpgMakerStandardAssetOwner::Builtin]);
 
         let prepared = prepare_rows(
-            vec![owner_row([1; 32], [2; 32])],
+            snapshot_rows(vec![owner_row([1; 32], [2; 32])]),
             SourceSnapshotFingerprint::from_bytes([1; 32]),
             16,
         )
@@ -896,7 +1188,7 @@ mod tests {
             DIALOGUE_DEFINITION,
         );
         let prepared = prepare_rows(
-            vec![owner_row([1; 32], *valid_fingerprint.as_bytes())],
+            snapshot_rows(vec![owner_row([1; 32], *valid_fingerprint.as_bytes())]),
             SourceSnapshotFingerprint::from_bytes([1; 32]),
             16,
         )
@@ -912,21 +1204,13 @@ mod tests {
             vec![crate::rpg_maker::text::RpgMakerLocationStep::key("list")],
         );
         let row = SqliteRow::new(vec![
-            SqliteValue::Text("group".to_owned()),
             SqliteValue::Text("builtin".to_owned()),
             SqliteValue::Text(RpgMakerLocationCodec::encode(&location).expect("位置应可编码")),
             SqliteValue::Text("event_dialogue".to_owned()),
             SqliteValue::Text("{not-json".to_owned()),
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
         ]);
         assert!(matches!(
-            decode_record(row),
+            decode_group(row),
             Err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection(_))
         ));
     }

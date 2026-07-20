@@ -236,6 +236,18 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
             standard_asset_row(2),
         ])
     }
+
+    async fn query_existing_database_snapshot(
+        &self,
+        path: PathBuf,
+        queries: Vec<SqliteQuery>,
+    ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
+        let mut results = Vec::with_capacity(queries.len());
+        for query in queries {
+            results.push(self.query_existing_database(path.clone(), query).await?);
+        }
+        Ok(results)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -371,17 +383,27 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
                 .join("demo")
                 .join("project.db")
         );
-        let translated_leaf_count =
-            plan.steps()
-                .iter()
-                .filter(|step| match step {
-                    SqliteTransactionStep::Execute(command) => command
+        let translated_leaf_count = plan
+            .steps()
+            .iter()
+            .map(|step| match step {
+                SqliteTransactionStep::Execute(command) => usize::from(
+                    command
                         .parameters()
                         .contains(&SqliteValue::Text("魔法剑".to_owned())),
-                    SqliteTransactionStep::ExecuteMany(_)
-                    | SqliteTransactionStep::RequireNoRows(_) => false,
-                })
-                .count();
+                ),
+                SqliteTransactionStep::ExecuteMany(batch)
+                | SqliteTransactionStep::ExecuteManyExactlyOne(batch) => batch
+                    .parameter_sets()
+                    .iter()
+                    .filter(|parameters| {
+                        parameters.contains(&SqliteValue::Text("魔法剑".to_owned()))
+                    })
+                    .count(),
+                SqliteTransactionStep::RequireNoRows(_)
+                | SqliteTransactionStep::RequireNoRowsMany(_) => 0,
+            })
+            .sum::<usize>();
         let event = if translated_leaf_count == 0 {
             assert!(plan.steps().iter().any(|step| matches!(
                 step,

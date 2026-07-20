@@ -727,6 +727,102 @@ impl Drop for ExclusiveFileLock {
     }
 }
 
+/// 可在同一 worker 生命周期内重复加锁的跨进程 Win32 文件句柄。
+///
+/// 打开句柄本身不代表持有锁；每次 `lock` 返回的 guard 独立覆盖一个事件的临界区，
+/// guard 释放时立即解锁。`&mut self` 保证同一句柄不会同时建立两个本进程 guard。
+pub(crate) struct ReusableExclusiveFileLock {
+    _parent: PinnedPath,
+    file: File,
+}
+
+// 句柄只由拥有它的 worker 顺序使用，不在多个线程间并发加锁。
+// SAFETY: 文件句柄和固定父路径都可以在线程之间移动，且类型不暴露并发共享入口。
+unsafe impl Send for ReusableExclusiveFileLock {}
+
+impl ReusableExclusiveFileLock {
+    pub(crate) fn open(path: &Path) -> Result<Self, WindowsFsError> {
+        let parent_path = path.parent().ok_or_else(|| {
+            io_error(
+                "打开锁文件",
+                path,
+                io::Error::new(io::ErrorKind::InvalidInput, "锁文件路径没有父目录"),
+            )
+        })?;
+        let parent = pin_directory_without_reparse(parent_path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|source| io_error("打开锁文件", path, source))?;
+        reject_reparse(&file, path)?;
+        Ok(Self {
+            _parent: parent,
+            file,
+        })
+    }
+
+    pub(crate) fn lock(
+        &mut self,
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<ReusableExclusiveFileLockGuard<'_>, WindowsFsError> {
+        let mut overlapped = OVERLAPPED::default();
+        let started_at = Instant::now();
+        loop {
+            // SAFETY: 文件句柄与 `overlapped` 在同步调用期间有效；调用不保留指针。
+            let locked = unsafe {
+                LockFileEx(
+                    handle(&self.file),
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    1,
+                    0,
+                    &raw mut overlapped,
+                )
+            };
+            if locked != 0 {
+                return Ok(ReusableExclusiveFileLockGuard {
+                    file: &self.file,
+                    overlapped,
+                });
+            }
+            let source = io::Error::last_os_error();
+            if !matches!(
+                source.raw_os_error().map(|code| code as u32),
+                Some(ERROR_LOCK_VIOLATION) | Some(ERROR_SHARING_VIOLATION)
+            ) {
+                return Err(io_error("取得文件锁", path, source));
+            }
+            let elapsed = started_at.elapsed();
+            if elapsed >= timeout {
+                return Err(WindowsFsError::LockTimeout {
+                    path: path.to_path_buf(),
+                    timeout,
+                });
+            }
+            thread::sleep((timeout - elapsed).min(Duration::from_millis(5)));
+        }
+    }
+}
+
+pub(crate) struct ReusableExclusiveFileLockGuard<'a> {
+    file: &'a File,
+    overlapped: OVERLAPPED,
+}
+
+impl Drop for ReusableExclusiveFileLockGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: 该有效句柄与字节范围正是本 guard 同步加锁时使用且唯一拥有的对象。
+        unsafe {
+            UnlockFileEx(handle(self.file), 0, 1, 0, &raw mut self.overlapped);
+        }
+    }
+}
+
 /// 把已经打开的来源对象重命名到目标路径，且绝不覆盖已有目标。
 pub(crate) fn rename_without_replace(source: &Path, target: &Path) -> Result<(), WindowsFsError> {
     rename_without_replace_inner(source, target, None)

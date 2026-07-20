@@ -11,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[cfg(test)]
 use std::collections::{HashMap, VecDeque};
@@ -22,8 +22,10 @@ use async_channel::{Receiver, Sender};
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
 
+#[cfg(test)]
+use super::windows::ExclusiveFileLock;
 use super::windows::{
-    ExclusiveFileLock, FileIdentity, PinnedPath, WindowsFsError,
+    FileIdentity, PinnedPath, ReusableExclusiveFileLock, WindowsFsError,
     create_directories_without_reparse, delete_regular_file_if_identity,
     open_read_write_file_without_reparse, pin_path_without_reparse, rename_without_replace,
 };
@@ -247,7 +249,7 @@ impl Error for JsonLinesShutdownError {}
 /// Runtime 只负责为记录注入确认时刻、验证已经存在的完整行并持久化字节；
 /// 它不解释任何领域事件。
 pub(crate) trait JsonLineRecord: Send + 'static {
-    fn serialize(self, recorded_at_utc: String) -> Result<Vec<u8>, String>;
+    fn serialize_into(self, recorded_at_utc: &str, output: &mut Vec<u8>) -> Result<(), String>;
 
     fn validate(bytes: &[u8]) -> Result<(), String>;
 }
@@ -444,23 +446,34 @@ fn run_worker<R>(
 ) where
     R: JsonLineRecord,
 {
-    let mut validation = ActiveValidationCursor::default();
+    let mut state = WorkerState::default();
     while let Ok(job) = receiver.recv_blocking() {
-        let result = persist_record::<R>(job.record, &paths, config, &mut validation);
+        let result = persist_record::<R>(job.record, &paths, config, &mut state);
         let _ = job.acknowledgement.send(result);
     }
+}
+
+#[derive(Default)]
+struct WorkerState {
+    validation: ActiveValidationCursor,
+    record_bytes: Vec<u8>,
+    validation_line: Vec<u8>,
+    lock_file: Option<ReusableExclusiveFileLock>,
+    discard_lock_file: bool,
 }
 
 #[derive(Default)]
 struct ActiveValidationCursor {
     identity: Option<FileIdentity>,
     validated_length: u64,
+    modified: Option<SystemTime>,
 }
 
 impl ActiveValidationCursor {
     fn reset(&mut self) {
         self.identity = None;
         self.validated_length = 0;
+        self.modified = None;
     }
 }
 
@@ -468,15 +481,25 @@ fn persist_record<R>(
     record: R,
     paths: &StreamPaths,
     config: JsonLinesStreamConfig,
-    validation: &mut ActiveValidationCursor,
+    state: &mut WorkerState,
 ) -> Result<(), JsonLinesAppendError>
 where
     R: JsonLineRecord,
 {
+    let WorkerState {
+        validation,
+        record_bytes: bytes,
+        validation_line,
+        lock_file,
+        discard_lock_file,
+    } = state;
     let recorded_at = recorded_at_utc();
-    let mut bytes = record.serialize(recorded_at).map_err(|source| {
-        JsonLinesAppendError::not_persisted(&paths.active, "serialize", source)
-    })?;
+    bytes.clear();
+    record
+        .serialize_into(&recorded_at, bytes)
+        .map_err(|source| {
+            JsonLinesAppendError::not_persisted(&paths.active, "serialize", source)
+        })?;
     bytes.push(b'\n');
     if bytes.len() > config.max_record_bytes {
         return Err(JsonLinesAppendError::not_persisted(
@@ -490,28 +513,51 @@ where
         ));
     }
 
-    let _lock = ExclusiveFileLock::acquire(&paths.lock, config.lock_timeout)
-        .map_err(|source| JsonLinesAppendError::not_persisted(&paths.active, "lock", source))?;
-    let current_size = recover_and_validate_active::<R>(paths, config, validation)?;
+    if *discard_lock_file {
+        *lock_file = None;
+        *discard_lock_file = false;
+    }
+    if lock_file.is_none() {
+        *lock_file = Some(
+            ReusableExclusiveFileLock::open(&paths.lock).map_err(|source| {
+                JsonLinesAppendError::not_persisted(&paths.active, "lock", source)
+            })?,
+        );
+    }
+    let _lock = match lock_file
+        .as_mut()
+        .expect("JSONL worker 必须持有已经成功打开的锁文件")
+        .lock(&paths.lock, config.lock_timeout)
+    {
+        Ok(lock) => lock,
+        Err(source) => {
+            let error = JsonLinesAppendError::not_persisted(&paths.active, "lock", source);
+            *discard_lock_file = true;
+            return Err(error);
+        }
+    };
+    let recovered = recover_and_validate_active::<R>(paths, config, validation, validation_line)?;
+    let current_size = recovered.length;
     let record_length = u64::try_from(bytes.len()).expect("受检记录长度必须可表示为 u64");
     let rotated =
         current_size > 0 && current_size.saturating_add(record_length) > config.max_file_bytes;
-    if rotated {
+    let mut active = if rotated {
+        drop(recovered.file);
         if let Err(error) = rotate_active(paths) {
             validation.reset();
             return Err(error);
         }
         validation.reset();
-    }
-
-    let mut active =
         open_read_write_file_without_reparse(&paths.active, true).map_err(|source| {
             JsonLinesAppendError::not_persisted(&paths.active, "open_active", source)
-        })?;
+        })?
+    } else {
+        recovered.file
+    };
     active.file_mut().seek(SeekFrom::End(0)).map_err(|source| {
         JsonLinesAppendError::not_persisted(&paths.active, "seek_active_end", source)
     })?;
-    if let Err(source) = write_record_bytes(active.file_mut(), &paths.active, &bytes) {
+    if let Err(source) = write_record_bytes(active.file_mut(), &paths.active, bytes) {
         validation.reset();
         return Err(JsonLinesAppendError::outcome_unknown(
             &paths.active,
@@ -528,6 +574,10 @@ where
         ));
     }
     validation.identity = FileIdentity::of(active.file(), &paths.active).ok();
+    validation.modified = active
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
     validation.validated_length = if validation.identity.is_some() {
         if rotated {
             record_length
@@ -546,6 +596,11 @@ where
         }
     })?;
     Ok(())
+}
+
+struct RecoveredActive {
+    file: PinnedPath,
+    length: u64,
 }
 
 fn write_record_bytes(file: &mut fs::File, _active: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -574,93 +629,99 @@ fn recover_and_validate_active<R>(
     paths: &StreamPaths,
     config: JsonLinesStreamConfig,
     validation: &mut ActiveValidationCursor,
-) -> Result<u64, JsonLinesAppendError>
+    line: &mut Vec<u8>,
+) -> Result<RecoveredActive, JsonLinesAppendError>
 where
     R: JsonLineRecord,
 {
-    let file = open_read_write_file_without_reparse(&paths.active, true).map_err(|source| {
+    let mut file = open_read_write_file_without_reparse(&paths.active, true).map_err(|source| {
         JsonLinesAppendError::not_persisted(&paths.active, "open_for_recovery", source)
     })?;
     let identity = FileIdentity::of(file.file(), &paths.active).ok();
-    let file_length = file
-        .metadata()
-        .map_err(|source| {
-            JsonLinesAppendError::not_persisted(&paths.active, "read_active_metadata", source)
-        })?
-        .len();
+    let metadata = file.metadata().map_err(|source| {
+        JsonLinesAppendError::not_persisted(&paths.active, "read_active_metadata", source)
+    })?;
+    let file_length = metadata.len();
+    let modified = metadata.modified().ok();
     let start = if identity.is_some()
         && identity == validation.identity
-        && validation.validated_length <= file_length
+        && validation.validated_length == file_length
+        && modified.is_some()
+        && modified == validation.modified
     {
         validation.validated_length
     } else {
         0
     };
-    let mut reader_file = file.file().try_clone().map_err(|source| {
-        JsonLinesAppendError::not_persisted(&paths.active, "clone_for_validation", source)
-    })?;
-    reader_file.seek(SeekFrom::Start(start)).map_err(|source| {
-        JsonLinesAppendError::not_persisted(&paths.active, "seek_for_validation", source)
-    })?;
-    let mut reader = BufReader::new(reader_file);
+    file.file_mut()
+        .seek(SeekFrom::Start(start))
+        .map_err(|source| {
+            JsonLinesAppendError::not_persisted(&paths.active, "seek_for_validation", source)
+        })?;
     let mut valid_length = start;
     let mut incomplete_tail = false;
 
-    loop {
-        let mut line = Vec::new();
-        let max_read = u64::try_from(config.max_record_bytes)
-            .expect("JSONL 配置已确认记录上限可表示为 u64")
-            .saturating_add(1);
-        let read = reader
-            .by_ref()
-            .take(max_read)
-            .read_until(b'\n', &mut line)
-            .map_err(|source| {
-                JsonLinesAppendError::not_persisted(&paths.active, "validate_existing", source)
-            })?;
-        if read == 0 {
-            break;
-        }
-        if line.last() != Some(&b'\n') {
-            if line.len() > config.max_record_bytes
-                && remaining_line_contains_lf(&mut reader).map_err(|source| {
+    {
+        let mut reader = BufReader::new(file.file_mut());
+        loop {
+            line.clear();
+            let max_read = u64::try_from(config.max_record_bytes)
+                .expect("JSONL 配置已确认记录上限可表示为 u64")
+                .saturating_add(1);
+            let read = reader
+                .by_ref()
+                .take(max_read)
+                .read_until(b'\n', line)
+                .map_err(|source| {
                     JsonLinesAppendError::not_persisted(&paths.active, "validate_existing", source)
-                })?
-            {
+                })?;
+            if read == 0 {
+                break;
+            }
+            if line.last() != Some(&b'\n') {
+                if line.len() > config.max_record_bytes
+                    && remaining_line_contains_lf(&mut reader).map_err(|source| {
+                        JsonLinesAppendError::not_persisted(
+                            &paths.active,
+                            "validate_existing",
+                            source,
+                        )
+                    })?
+                {
+                    return Err(JsonLinesAppendError::not_persisted(
+                        &paths.active,
+                        "validate_existing",
+                        "活动文件包含超过单条记录上限的完整记录",
+                    ));
+                }
+                incomplete_tail = true;
+                break;
+            }
+            if line.len() > config.max_record_bytes {
                 return Err(JsonLinesAppendError::not_persisted(
                     &paths.active,
                     "validate_existing",
                     "活动文件包含超过单条记录上限的完整记录",
                 ));
             }
-            incomplete_tail = true;
-            break;
-        }
-        if line.len() > config.max_record_bytes {
-            return Err(JsonLinesAppendError::not_persisted(
-                &paths.active,
-                "validate_existing",
-                "活动文件包含超过单条记录上限的完整记录",
-            ));
-        }
-        R::validate(&line[..line.len() - 1]).map_err(|message| {
-            JsonLinesAppendError::not_persisted(
-                &paths.active,
-                "validate_existing",
-                format!("活动文件包含完整但损坏的记录：{message}"),
-            )
-        })?;
-        valid_length = valid_length
-            .checked_add(u64::try_from(line.len()).expect("记录长度必须可表示为 u64"))
-            .ok_or_else(|| {
+            R::validate(&line[..line.len() - 1]).map_err(|message| {
                 JsonLinesAppendError::not_persisted(
                     &paths.active,
                     "validate_existing",
-                    "活动文件长度溢出",
+                    format!("活动文件包含完整但损坏的记录：{message}"),
                 )
             })?;
+            valid_length = valid_length
+                .checked_add(u64::try_from(line.len()).expect("记录长度必须可表示为 u64"))
+                .ok_or_else(|| {
+                    JsonLinesAppendError::not_persisted(
+                        &paths.active,
+                        "validate_existing",
+                        "活动文件长度溢出",
+                    )
+                })?;
+        }
     }
-    drop(reader);
 
     if incomplete_tail {
         file.file().set_len(valid_length).map_err(|source| {
@@ -672,7 +733,11 @@ where
     }
     validation.identity = identity;
     validation.validated_length = valid_length;
-    Ok(valid_length)
+    validation.modified = modified;
+    Ok(RecoveredActive {
+        file,
+        length: valid_length,
+    })
 }
 
 fn remaining_line_contains_lf(reader: &mut impl BufRead) -> io::Result<bool> {
@@ -983,6 +1048,8 @@ fn recorded_at_utc() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use serde::{Deserialize, Serialize};
     use tempfile::tempdir;
 
@@ -994,6 +1061,7 @@ mod tests {
     struct TestRecord {
         sequence: usize,
         padding: String,
+        observed_output_capacity: Option<std::sync::mpsc::Sender<usize>>,
     }
 
     #[derive(Debug, Deserialize, Serialize)]
@@ -1004,13 +1072,57 @@ mod tests {
         padding: String,
     }
 
+    static INCREMENTAL_VALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug)]
+    struct IncrementalRecord {
+        sequence: usize,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct IncrementalWire {
+        recorded_at_utc: String,
+        sequence: usize,
+    }
+
+    impl JsonLineRecord for IncrementalRecord {
+        fn serialize_into(self, recorded_at_utc: &str, output: &mut Vec<u8>) -> Result<(), String> {
+            serde_json::to_writer(
+                output,
+                &IncrementalWire {
+                    recorded_at_utc: recorded_at_utc.to_owned(),
+                    sequence: self.sequence,
+                },
+            )
+            .map_err(|error| error.to_string())
+        }
+
+        fn validate(bytes: &[u8]) -> Result<(), String> {
+            INCREMENTAL_VALIDATIONS.fetch_add(1, Ordering::Relaxed);
+            let wire: IncrementalWire =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            let canonical = serde_json::to_vec(&wire).map_err(|error| error.to_string())?;
+            if canonical != bytes {
+                return Err("记录不是当前紧凑 wire".to_owned());
+            }
+            Ok(())
+        }
+    }
+
     impl JsonLineRecord for TestRecord {
-        fn serialize(self, recorded_at_utc: String) -> Result<Vec<u8>, String> {
-            serde_json::to_vec(&TestWire {
-                recorded_at_utc,
-                sequence: self.sequence,
-                padding: self.padding,
-            })
+        fn serialize_into(self, recorded_at_utc: &str, output: &mut Vec<u8>) -> Result<(), String> {
+            if let Some(observed) = self.observed_output_capacity {
+                let _ = observed.send(output.capacity());
+            }
+            serde_json::to_writer(
+                output,
+                &TestWire {
+                    recorded_at_utc: recorded_at_utc.to_owned(),
+                    sequence: self.sequence,
+                    padding: self.padding,
+                },
+            )
             .map_err(|error| error.to_string())
         }
 
@@ -1034,6 +1146,7 @@ mod tests {
         TestRecord {
             sequence,
             padding: String::new(),
+            observed_output_capacity: None,
         }
     }
 
@@ -1041,6 +1154,7 @@ mod tests {
         TestRecord {
             sequence,
             padding: "x".repeat(256),
+            observed_output_capacity: None,
         }
     }
 
@@ -1084,6 +1198,205 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
         TestRecord::validate(&bytes[..bytes.len() - 1]).expect("完整记录应可读取");
+    }
+
+    #[tokio::test]
+    async fn worker_reuses_the_serialization_buffer_between_records() {
+        let directory = tempdir().expect("临时目录应可创建");
+        let (log, finalizer) = start(directory.path(), config());
+        let (observed, capacities) = std::sync::mpsc::channel();
+
+        log.append(TestRecord {
+            sequence: 1,
+            padding: "x".repeat(1024),
+            observed_output_capacity: Some(observed.clone()),
+        })
+        .await
+        .expect("首条大记录应成功");
+        log.append(TestRecord {
+            sequence: 2,
+            padding: String::new(),
+            observed_output_capacity: Some(observed),
+        })
+        .await
+        .expect("第二条记录应成功");
+        finalizer.finalize().await.expect("worker 应可排空");
+
+        assert_eq!(capacities.recv().expect("应观察首条记录缓冲"), 0);
+        assert!(
+            capacities.recv().expect("应观察第二条记录缓冲") >= 1024,
+            "第二条记录应复用首条记录扩张后的容量"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_active_file_keeps_incremental_validation_between_appends() {
+        let directory = tempdir().expect("临时目录应可创建");
+        let (first, first_finalizer) = start_stream::<IncrementalRecord>(
+            directory.path().to_path_buf(),
+            "incremental",
+            config(),
+        )
+        .expect("首个测试流应可启动");
+        first
+            .append(IncrementalRecord { sequence: 1 })
+            .await
+            .expect("首条记录应成功");
+        first_finalizer
+            .finalize()
+            .await
+            .expect("首个 worker 应排空");
+
+        INCREMENTAL_VALIDATIONS.store(0, Ordering::Relaxed);
+        let (second, second_finalizer) = start_stream::<IncrementalRecord>(
+            directory.path().to_path_buf(),
+            "incremental",
+            config(),
+        )
+        .expect("第二个测试流应可启动");
+        second
+            .append(IncrementalRecord { sequence: 2 })
+            .await
+            .expect("新 worker 应先验证既有记录");
+        assert_eq!(INCREMENTAL_VALIDATIONS.load(Ordering::Relaxed), 1);
+        second
+            .append(IncrementalRecord { sequence: 3 })
+            .await
+            .expect("同一 worker 的连续追加应成功");
+        assert_eq!(
+            INCREMENTAL_VALIDATIONS.load(Ordering::Relaxed),
+            1,
+            "本 worker 已确认且未变化的前缀不应重复解码"
+        );
+        second_finalizer
+            .finalize()
+            .await
+            .expect("第二个 worker 应排空");
+    }
+
+    #[tokio::test]
+    async fn same_identity_same_length_corruption_is_rejected_on_the_next_append() {
+        let directory = tempdir().expect("临时目录应可创建");
+        let active = directory.path().join("audit.jsonl");
+        let (log, finalizer) = start(directory.path(), config());
+        log.append(record(1)).await.expect("首条记录应成功");
+        let original_identity = FileIdentity::of(
+            &fs::File::open(&active).expect("应可打开首次写入日志"),
+            &active,
+        )
+        .expect("应可读取首次文件身份");
+        let original_modified = fs::metadata(&active)
+            .and_then(|metadata| metadata.modified())
+            .expect("应可读取首次写入时间");
+        let mut corrupted = fs::read(&active).expect("应可读取活动日志");
+        let marker = b"\"sequence\":1";
+        let marker_start = corrupted
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("测试记录应包含 sequence 字段");
+        corrupted[marker_start + marker.len() - 1] = b'x';
+        fs::write(&active, &corrupted).expect("应可原地写坏既有完整行");
+        let rewritten = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&active)
+            .expect("应可重新打开被改写日志");
+        assert_eq!(
+            FileIdentity::of(&rewritten, &active).expect("应可读取改写后文件身份"),
+            original_identity,
+            "测试必须原地改写同一文件身份"
+        );
+        if rewritten
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .expect("应可读取改写时间")
+            == original_modified
+        {
+            rewritten
+                .set_modified(original_modified + Duration::from_secs(1))
+                .expect("测试应可显式推进改写时间");
+        }
+
+        assert!(matches!(
+            log.append(record(2)).await,
+            Err(JsonLinesAppendError::NotPersisted {
+                stage: "validate_existing",
+                ..
+            })
+        ));
+        finalizer.finalize().await.expect("worker 应可排空");
+        assert_eq!(fs::read(active).expect("坏行应保留"), corrupted);
+    }
+
+    #[tokio::test]
+    async fn growing_active_file_revalidates_the_previously_confirmed_prefix() {
+        let directory = tempdir().expect("临时目录应可创建");
+        let active = directory.path().join("audit.jsonl");
+        let (log, finalizer) = start(directory.path(), config());
+        log.append(record(1)).await.expect("首条记录应成功");
+
+        let mut corrupted = fs::read(&active).expect("应可读取活动日志");
+        let marker = b"\"sequence\":1";
+        let marker_start = corrupted
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("测试记录应包含 sequence 字段");
+        corrupted[marker_start + marker.len() - 1] = b'x';
+        let external = serde_json::to_vec(&TestWire {
+            recorded_at_utc: "2026-07-20T00:00:00.000Z".to_owned(),
+            sequence: 99,
+            padding: String::new(),
+        })
+        .expect("外部完整记录应可编码");
+        corrupted.extend_from_slice(&external);
+        corrupted.push(b'\n');
+        fs::write(&active, &corrupted).expect("应可原地写坏旧前缀并追加完整记录");
+
+        assert!(matches!(
+            log.append(record(2)).await,
+            Err(JsonLinesAppendError::NotPersisted {
+                stage: "validate_existing",
+                ..
+            })
+        ));
+        finalizer.finalize().await.expect("worker 应可排空");
+        assert_eq!(fs::read(active).expect("坏行应保留"), corrupted);
+    }
+
+    #[tokio::test]
+    async fn lock_timeout_discards_the_reusable_handle_and_the_next_event_reopens_it() {
+        let directory = tempdir().expect("临时目录应可创建");
+        let lock_path = directory.path().join(".audit.lock");
+        let held = ExclusiveFileLock::acquire(&lock_path, Duration::from_secs(1))
+            .expect("测试应先持有竞争锁");
+        let short_timeout = JsonLinesStreamConfig::new(8, Duration::from_millis(20), 4096, 4096, 2)
+            .expect("短锁等待测试配置应合法");
+        let (log, finalizer) = start(directory.path(), short_timeout);
+
+        assert!(matches!(
+            log.append(record(1)).await,
+            Err(JsonLinesAppendError::NotPersisted { stage: "lock", .. })
+        ));
+        drop(held);
+        log.append(record(2))
+            .await
+            .expect("竞争解除后的下一事件应重开锁句柄并成功");
+        finalizer.finalize().await.expect("worker 应可排空");
+
+        let bytes = fs::read(directory.path().join("audit.jsonl")).expect("活动日志应存在");
+        let records = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<TestWire>(line).expect("记录应可解码"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .into_iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "锁超时事件不得进入活动日志"
+        );
     }
 
     #[tokio::test]
@@ -1314,6 +1627,7 @@ mod tests {
             log.append(TestRecord {
                 sequence,
                 padding: "x".repeat(128),
+                observed_output_capacity: None,
             })
             .await
             .expect("追加应成功");

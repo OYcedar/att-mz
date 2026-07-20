@@ -129,16 +129,25 @@ Prompt、上下文、术语和受保护文本共同形成 user message。
 JSON parameters。网络重试只按 Profile 的明确延迟和 `Retry-After` 上限执行；协议失败
 不伪装成网络故障。
 
-Standard 使用 `max_in_flight_tasks = N` 个持续消费者执行已经物化的有序 TaskBlock。
-后序任务完成后立即补入新任务，不等待更早的慢请求；每个结果按计划 index 落入独立槽，
-另一个顺序 finalizer 只按 `0..n` 提交数据库、更新报告并写终态审计。活动执行不超过
-`N`，已启动但尚未 finalization 的任务不超过 `2N`；重试始终属于原 TaskBlock 并占用
-原执行槽。
+Standard 使用 `max_in_flight_tasks = N` 个持续 HTTP 消费者执行已经物化的有序
+TaskBlock。HTTP 完成后，结果立即进入命令私有 CPU 根进行无副作用的提交准备；原 HTTP
+消费者随即补入新任务，不等待 CPU 准备、较早慢请求或顺序 finalizer。不同任务的准备
+可以乱序完成，准备产物仍按计划 index 落入独立槽；没有合格译文的结果不建立数据库
+提交产物。
 
-正常 `Complete`、`Partial` 与 `Unavailable` 都继续补位。技术错误或合作取消停止领取
-新任务，但已启动任务全部排空；并存技术错误按最小计划 index 选择主错误，且只提交首个
-技术失败前的连续成功前缀。后续成功标记为未提交，取消排空中出现的技术错误优先于取消。
-并发只改变完成时间，不改变提交、报告或终态审计顺序。
+顺序 finalizer 只按 `0..n` 消费槽位。每个需要写入译文的任务各自执行独立的
+`BEGIN IMMEDIATE → COMMIT` 短事务，不合并任务，也不降低 SQLite 根配置建立的同步等级；
+提交明确成功后才更新报告并写该任务的终态审计。没有数据库写入的正常结果同样按序
+更新报告和审计。任务许可直到对应终态审计完成后才释放，因此活动 HTTP 执行不超过
+`N`，已启动但尚未 finalization 的 HTTP 执行、CPU 准备、已准备等待和顺序最终化合计
+不超过 `2N`。重试始终属于原 TaskBlock，同时占用原 HTTP 执行槽和窗口许可。
+
+正常 `Complete`、`Partial` 与 `Unavailable` 都继续补位。HTTP 执行、CPU 提交准备或
+其他技术错误以及合作取消都会停止领取新任务，但已启动任务全部排空；并存技术错误按
+最小计划 index 选择主错误，只继续提交首个技术失败前可确认的连续成功前缀。若失败
+发生在某任务数据库已经明确提交后的终态审计，该任务写入不回滚，后序成功仍标记为
+未提交。取消排空中出现的技术错误优先于取消。并发只改变完成时间，不改变提交、报告
+或终态审计顺序。
 
 响应只接受一个可完整消费的 JSON 数组信封，可有首尾空白、至多一个开头 BOM，以及
 恰好包裹全部 JSON 的单层无标记或 `json` 围栏。不搜索说明文字中的数组，不修复尾逗号、
@@ -153,18 +162,25 @@ Standard 使用 `max_in_flight_tasks = N` 个持续消费者执行已经物化�
 
 ## 7. 原子验收与持久化
 
-每个 TaskBlock 在发送第一次请求前写 `translation_task_started`。验收后，Result Store
-在一个事务中再次确认：
+每个 TaskBlock 在发送第一次请求前写 `translation_task_started`。发送任何请求前，
+Result Store 的 Planner 准备事务一次确认：
 
 - metadata 来源指纹；
 - 所有 owner 的来源与资产快照指纹；
 - 本次术语和占位符 canonical JSON；
-- 每个目标逻辑叶的 group、role、原文、上下文和旧 state。
+- 每个需要失效或复用的逻辑叶之 owner、group、role、原文、上下文，以及预期旧译文与
+  state 同时精确匹配或预期二者均为空。
 
-只有全部事实仍与规划时一致，才按逻辑身份更新译文与 state。单个批次不会留下半提交；
-已经确认的前序批次不因后续 `Partial`、`Unavailable` 或取消而回滚。任务终态审计记录
-accepted、unresolved、协议诊断及 `confirmed_written_leaves`；位置均为逻辑组与字段角色，
-计数明确表示逻辑叶。
+上述逐叶只读条件按自然顺序批量校验，失效清理、复用写入与资源更新仍在同一准备事务中。
+HTTP 验收结果随后由 Result Store 的 `prepare_commit` 在 CPU 根中校验重复叶、传播原文
+与上下文并编码为只读提交产物，不做 SQLite I/O。顺序 finalizer 调用 `commit_prepared`，
+用一条条件 UPDATE 只 prepare 一次，再按自然顺序处理全部合格叶；每组条件同时确认
+owner、逻辑 group、role、原文、上下文以及译文和 state 仍为空，并且必须恰好修改一行。
+任一条件失效都回滚该任务的整笔事务。
+
+单个任务不会留下半提交；已经确认的前序任务不因后续 `Partial`、`Unavailable`、技术
+错误或取消而回滚。任务终态审计记录 accepted、unresolved、协议诊断及
+`confirmed_written_leaves`；位置均为逻辑组与字段角色，计数明确表示逻辑叶。
 
 ## 8. Translate Lua 与完成结果
 

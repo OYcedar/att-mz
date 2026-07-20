@@ -676,7 +676,7 @@ mod tests {
                 &project,
                 documents(
                     &project,
-                    vec![("data/Items.json", b"items"), ("js/plugins.js", b"plugins")],
+                    vec![("js/plugins.js", b"plugins"), ("data/Items.json", b"items")],
                 ),
             )
             .await

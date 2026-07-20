@@ -14,7 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rusqlite::backup::{Backup, StepResult};
-use rusqlite::types::{Value as RusqliteValue, ValueRef};
+use rusqlite::types::{ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use tokio::sync::oneshot;
 
@@ -43,6 +43,7 @@ const SESSION_OPEN: u8 = 0;
 const SESSION_INDETERMINATE: u8 = 1;
 const SESSION_FINALIZING: u8 = 2;
 const SESSION_CLOSED: u8 = 3;
+const MAX_QUERIES_PER_READ_SNAPSHOT: usize = 4;
 
 /// SQLite journal mode 的受信配置值。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -436,17 +437,36 @@ fn validate_query(
     validate_parameters(query.parameters(), config)
 }
 
-fn owned_driver_values(values: &[SqliteValue]) -> Vec<RusqliteValue> {
-    values
-        .iter()
-        .map(|value| match value {
-            SqliteValue::Null => RusqliteValue::Null,
-            SqliteValue::Integer(value) => RusqliteValue::Integer(*value),
-            SqliteValue::Real(value) => RusqliteValue::Real(*value),
-            SqliteValue::Text(value) => RusqliteValue::Text(value.clone()),
-            SqliteValue::Blob(value) => RusqliteValue::Blob(value.clone()),
-        })
-        .collect()
+fn validate_query_snapshot(
+    queries: &[SqliteQuery],
+    config: &RusqliteStorageConfiguration,
+) -> Result<(), SqliteRuntimeError> {
+    if queries.is_empty() {
+        return Err(SqliteRuntimeError::InvalidValue("只读快照查询集合不得为空"));
+    }
+    if queries.len() > MAX_QUERIES_PER_READ_SNAPSHOT {
+        return Err(SqliteRuntimeError::ResourceLimit {
+            resource: "只读快照查询数",
+            limit: MAX_QUERIES_PER_READ_SNAPSHOT,
+        });
+    }
+
+    for query in queries {
+        validate_query(query, config)?;
+    }
+    Ok(())
+}
+
+impl ToSql for SqliteValue {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Borrowed(match self {
+            SqliteValue::Null => ValueRef::Null,
+            SqliteValue::Integer(value) => ValueRef::Integer(*value),
+            SqliteValue::Real(value) => ValueRef::Real(*value),
+            SqliteValue::Text(value) => ValueRef::Text(value.as_bytes()),
+            SqliteValue::Blob(value) => ValueRef::Blob(value),
+        }))
+    }
 }
 
 fn preflight_existing_file(path: &Path) -> Result<(), ExistingFileError> {
@@ -562,28 +582,32 @@ fn apply_read_write_policy(
     Ok(())
 }
 
-fn read_query_rows(
+#[derive(Default)]
+struct QueryResultBudget {
+    rows: usize,
+    bytes: usize,
+}
+
+fn read_query_rows_with_budget(
     connection: &Connection,
     query: &SqliteQuery,
     config: &RusqliteStorageConfiguration,
+    budget: &mut QueryResultBudget,
 ) -> Result<Vec<SqliteRow>, SqliteRuntimeError> {
-    validate_query(query, config)?;
-    let parameters = owned_driver_values(query.parameters());
     let mut statement = connection
         .prepare(query.statement())
         .map_err(|source| SqliteRuntimeError::driver("准备查询", source))?;
     let column_count = statement.column_count();
     let mut cursor = statement
-        .query(params_from_iter(parameters.iter()))
+        .query(params_from_iter(query.parameters().iter()))
         .map_err(|source| SqliteRuntimeError::driver("绑定查询参数", source))?;
     let mut result = Vec::new();
-    let mut result_bytes = 0usize;
 
     while let Some(row) = cursor
         .next()
         .map_err(|source| SqliteRuntimeError::driver("读取查询行", source))?
     {
-        if result.len() == config.max_rows_per_query.get() {
+        if budget.rows == config.max_rows_per_query.get() {
             return Err(SqliteRuntimeError::ResourceLimit {
                 resource: "查询行数",
                 limit: config.max_rows_per_query.get(),
@@ -605,13 +629,14 @@ fn read_query_rows(
                 ),
                 ValueRef::Blob(value) => SqliteValue::Blob(value.to_vec()),
             };
-            result_bytes = result_bytes
+            budget.bytes = budget
+                .bytes
                 .checked_add(sqlite_value_bytes(&value)?)
                 .ok_or(SqliteRuntimeError::ResourceLimit {
                     resource: "查询结果字节数",
                     limit: config.max_result_bytes_per_query.get(),
                 })?;
-            if result_bytes > config.max_result_bytes_per_query.get() {
+            if budget.bytes > config.max_result_bytes_per_query.get() {
                 return Err(SqliteRuntimeError::ResourceLimit {
                     resource: "查询结果字节数",
                     limit: config.max_result_bytes_per_query.get(),
@@ -620,8 +645,18 @@ fn read_query_rows(
             values.push(value);
         }
         result.push(SqliteRow::new(values));
+        budget.rows += 1;
     }
     Ok(result)
+}
+
+fn read_query_rows(
+    connection: &Connection,
+    query: &SqliteQuery,
+    config: &RusqliteStorageConfiguration,
+) -> Result<Vec<SqliteRow>, SqliteRuntimeError> {
+    validate_query(query, config)?;
+    read_query_rows_with_budget(connection, query, config, &mut QueryResultBudget::default())
 }
 
 fn run_query_existing(
@@ -629,7 +664,16 @@ fn run_query_existing(
     query: &SqliteQuery,
     config: &RusqliteStorageConfiguration,
 ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<SqliteRuntimeError>> {
-    let connection = open_existing_read_only(path, config).map_err(|error| match error {
+    let connection =
+        open_existing_read_only(path, config).map_err(|error| map_query_open_error(path, error))?;
+    read_query_rows(&connection, query, config).map_err(QueryExistingDatabaseError::QueryFailed)
+}
+
+fn map_query_open_error(
+    path: &Path,
+    error: ExistingFileErrorOrRuntime,
+) -> QueryExistingDatabaseError<SqliteRuntimeError> {
+    match error {
         ExistingFileErrorOrRuntime::Existing(ExistingFileError::NotFound) => {
             QueryExistingDatabaseError::NotFound
         }
@@ -648,8 +692,69 @@ fn run_query_existing(
         ExistingFileErrorOrRuntime::Runtime(source) => {
             QueryExistingDatabaseError::QueryFailed(source)
         }
-    })?;
-    read_query_rows(&connection, query, config).map_err(QueryExistingDatabaseError::QueryFailed)
+    }
+}
+
+fn rollback_query_snapshot(
+    connection: &Connection,
+    primary: SqliteRuntimeError,
+) -> SqliteRuntimeError {
+    if connection.is_autocommit() {
+        return primary;
+    }
+    match connection.execute_batch("ROLLBACK") {
+        Ok(()) => primary,
+        Err(source) => SqliteRuntimeError::Cleanup {
+            primary: Box::new(primary),
+            failures: vec![format!("回滚只读查询快照失败：{source}")],
+        },
+    }
+}
+
+fn read_queries_in_snapshot(
+    connection: &Connection,
+    queries: &[SqliteQuery],
+    config: &RusqliteStorageConfiguration,
+    mut after_query: impl FnMut(usize),
+) -> Result<Vec<Vec<SqliteRow>>, SqliteRuntimeError> {
+    validate_query_snapshot(queries, config)?;
+    connection
+        .execute_batch("BEGIN")
+        .map_err(|source| SqliteRuntimeError::driver("开始只读查询快照", source))?;
+
+    let mut results = Vec::with_capacity(queries.len());
+    for (index, query) in queries.iter().enumerate() {
+        let mut budget = QueryResultBudget::default();
+        match read_query_rows_with_budget(connection, query, config, &mut budget) {
+            Ok(rows) => results.push(rows),
+            Err(primary) => return Err(rollback_query_snapshot(connection, primary)),
+        }
+        after_query(index);
+    }
+
+    if let Err(source) = connection.execute_batch("COMMIT") {
+        let primary = SqliteRuntimeError::driver("结束只读查询快照", source);
+        return Err(rollback_query_snapshot(connection, primary));
+    }
+    if !connection.is_autocommit() {
+        return Err(rollback_query_snapshot(
+            connection,
+            SqliteRuntimeError::Internal("只读查询快照提交后仍非 autocommit"),
+        ));
+    }
+    Ok(results)
+}
+
+fn run_query_snapshot_existing(
+    path: &Path,
+    queries: &[SqliteQuery],
+    config: &RusqliteStorageConfiguration,
+) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<SqliteRuntimeError>> {
+    validate_query_snapshot(queries, config).map_err(QueryExistingDatabaseError::QueryFailed)?;
+    let connection =
+        open_existing_read_only(path, config).map_err(|error| map_query_open_error(path, error))?;
+    read_queries_in_snapshot(&connection, queries, config, |_| {})
+        .map_err(QueryExistingDatabaseError::QueryFailed)
 }
 
 fn validate_transaction_plan(
@@ -659,7 +764,9 @@ fn validate_transaction_plan(
     for step in plan.steps() {
         match step {
             SqliteTransactionStep::Execute(command) => validate_command(command, config)?,
-            SqliteTransactionStep::ExecuteMany(batch) => {
+            SqliteTransactionStep::ExecuteMany(batch)
+            | SqliteTransactionStep::ExecuteManyExactlyOne(batch)
+            | SqliteTransactionStep::RequireNoRowsMany(batch) => {
                 validate_statement(batch.statement(), config)?;
                 for parameters in batch.parameter_sets() {
                     validate_parameters(parameters, config)?;
@@ -687,6 +794,20 @@ fn rollback_after_failure(
             primary: Box::new(primary),
             failures: vec![format!("回滚失败：{source}")],
         }),
+    }
+}
+
+fn rollback_requirement_failure(
+    connection: &Connection,
+) -> Result<(), ExecuteTransactionError<SqliteRuntimeError>> {
+    match connection.execute_batch("ROLLBACK") {
+        Ok(()) if connection.is_autocommit() => Err(ExecuteTransactionError::RequirementFailed),
+        Ok(()) => Err(ExecuteTransactionError::OutcomeUnknown(
+            SqliteRuntimeError::Internal("事务条件失败回滚后仍非 autocommit"),
+        )),
+        Err(source) => Err(ExecuteTransactionError::OutcomeUnknown(
+            SqliteRuntimeError::driver("回滚事务条件失败", source),
+        )),
     }
 }
 
@@ -723,63 +844,75 @@ fn run_transaction(
         })?;
 
     for step in plan.steps() {
-        let result = match step {
-            SqliteTransactionStep::Execute(command) => {
-                let parameters = owned_driver_values(command.parameters());
-                connection
-                    .execute(command.statement(), params_from_iter(parameters.iter()))
-                    .map(|_| ())
-                    .map_err(|source| SqliteRuntimeError::driver("执行事务命令", source))
-            }
+        let requirement_satisfied = match step {
+            SqliteTransactionStep::Execute(command) => connection
+                .execute(
+                    command.statement(),
+                    params_from_iter(command.parameters().iter()),
+                )
+                .map(|_| true)
+                .map_err(|source| SqliteRuntimeError::driver("执行事务命令", source)),
             SqliteTransactionStep::ExecuteMany(batch) => (|| {
                 let mut statement = connection
                     .prepare(batch.statement())
                     .map_err(|source| SqliteRuntimeError::driver("准备批量命令", source))?;
-                let mut result = Ok(());
                 for parameters in batch.parameter_sets() {
-                    let parameters = owned_driver_values(parameters);
                     if let Err(source) = statement.execute(params_from_iter(parameters.iter())) {
-                        result = Err(SqliteRuntimeError::driver("执行批量命令", source));
-                        break;
+                        return Err(SqliteRuntimeError::driver("执行批量命令", source));
                     }
                 }
-                result
+                Ok(true)
             })(),
-            SqliteTransactionStep::RequireNoRows(query) => {
-                let exists = (|| {
-                    let parameters = owned_driver_values(query.parameters());
-                    let mut statement = connection
-                        .prepare(query.statement())
-                        .map_err(|source| SqliteRuntimeError::driver("准备事务条件查询", source))?;
-                    statement
-                        .exists(params_from_iter(parameters.iter()))
-                        .map_err(|source| SqliteRuntimeError::driver("执行事务条件查询", source))
-                })();
-                match exists {
-                    Ok(false) => Ok(()),
-                    Ok(true) => {
-                        return match connection.execute_batch("ROLLBACK") {
-                            Ok(()) if connection.is_autocommit() => {
-                                Err(ExecuteTransactionError::RequirementFailed)
-                            }
-                            Ok(()) => Err(ExecuteTransactionError::OutcomeUnknown(
-                                SqliteRuntimeError::Internal("事务条件失败回滚后仍非 autocommit"),
-                            )),
-                            Err(source) => Err(ExecuteTransactionError::OutcomeUnknown(
-                                SqliteRuntimeError::driver("回滚事务条件失败", source),
-                            )),
-                        };
+            SqliteTransactionStep::ExecuteManyExactlyOne(batch) => (|| {
+                let mut statement = connection
+                    .prepare(batch.statement())
+                    .map_err(|source| SqliteRuntimeError::driver("准备精确批量命令", source))?;
+                for parameters in batch.parameter_sets() {
+                    let affected = statement
+                        .execute(params_from_iter(parameters.iter()))
+                        .map_err(|source| SqliteRuntimeError::driver("执行精确批量命令", source))?;
+                    if affected != 1 {
+                        return Ok(false);
                     }
-                    Err(source) => Err(source),
                 }
-            }
+                Ok(true)
+            })(),
+            SqliteTransactionStep::RequireNoRows(query) => (|| {
+                let mut statement = connection
+                    .prepare(query.statement())
+                    .map_err(|source| SqliteRuntimeError::driver("准备事务条件查询", source))?;
+                statement
+                    .exists(params_from_iter(query.parameters().iter()))
+                    .map(|exists| !exists)
+                    .map_err(|source| SqliteRuntimeError::driver("执行事务条件查询", source))
+            })(),
+            SqliteTransactionStep::RequireNoRowsMany(batch) => (|| {
+                let mut statement = connection
+                    .prepare(batch.statement())
+                    .map_err(|source| SqliteRuntimeError::driver("准备批量事务条件查询", source))?;
+                for parameters in batch.parameter_sets() {
+                    let exists = statement
+                        .exists(params_from_iter(parameters.iter()))
+                        .map_err(|source| {
+                            SqliteRuntimeError::driver("执行批量事务条件查询", source)
+                        })?;
+                    if exists {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })(),
         };
 
-        if let Err(primary) = result {
-            return match rollback_after_failure(&connection, primary) {
-                Ok(primary) => Err(ExecuteTransactionError::NotCommitted(primary)),
-                Err(source) => Err(ExecuteTransactionError::OutcomeUnknown(source)),
-            };
+        match requirement_satisfied {
+            Ok(true) => {}
+            Ok(false) => return rollback_requirement_failure(&connection),
+            Err(primary) => {
+                return match rollback_after_failure(&connection, primary) {
+                    Ok(primary) => Err(ExecuteTransactionError::NotCommitted(primary)),
+                    Err(source) => Err(ExecuteTransactionError::OutcomeUnknown(source)),
+                };
+            }
         }
         if connection.is_autocommit() {
             return Err(ExecuteTransactionError::OutcomeUnknown(
@@ -995,10 +1128,10 @@ fn initialize_new_database(
             .map_err(|source| SqliteRuntimeError::driver("开始新数据库事务", source))?;
 
         for command in commands {
-            let parameters = owned_driver_values(command.parameters());
-            if let Err(source) =
-                connection.execute(command.statement(), params_from_iter(parameters.iter()))
-            {
+            if let Err(source) = connection.execute(
+                command.statement(),
+                params_from_iter(command.parameters().iter()),
+            ) {
                 let primary = SqliteRuntimeError::driver("初始化新数据库", source);
                 return Err(match rollback_after_failure(&connection, primary) {
                     Ok(primary) | Err(primary) => primary,
@@ -1502,9 +1635,11 @@ fn process_interactive_command(
         }
         InteractiveCommand::Execute { command, response } => {
             let result = validate_command(&command, config).and_then(|()| {
-                let parameters = owned_driver_values(command.parameters());
                 connection
-                    .execute(command.statement(), params_from_iter(parameters.iter()))
+                    .execute(
+                        command.statement(),
+                        params_from_iter(command.parameters().iter()),
+                    )
                     .map_err(|source| SqliteRuntimeError::driver("执行交互式命令", source))
                     .and_then(|affected| {
                         u64::try_from(affected)
@@ -1944,6 +2079,13 @@ enum ShortJob {
         response:
             oneshot::Sender<Result<Vec<SqliteRow>, QueryExistingDatabaseError<SqliteRuntimeError>>>,
     },
+    QuerySnapshot {
+        path: PathBuf,
+        queries: Vec<SqliteQuery>,
+        response: oneshot::Sender<
+            Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<SqliteRuntimeError>>,
+        >,
+    },
     Transaction {
         path: PathBuf,
         plan: SqliteTransactionPlan,
@@ -2016,6 +2158,21 @@ fn run_short_worker(
             } => {
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     run_query_existing(&path, &query, &config)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(QueryExistingDatabaseError::QueryFailed(
+                        SqliteRuntimeError::WorkerPanicked("短操作"),
+                    ))
+                });
+                let _ = response.send(result);
+            }
+            ShortJob::QuerySnapshot {
+                path,
+                queries,
+                response,
+            } => {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    run_query_snapshot_existing(&path, &queries, &config)
                 }))
                 .unwrap_or_else(|_| {
                     Err(QueryExistingDatabaseError::QueryFailed(
@@ -2409,6 +2566,33 @@ impl SqliteQueryExecutor for RusqliteStorage {
                 )))
         }
     }
+
+    fn query_existing_database_snapshot(
+        &self,
+        path: PathBuf,
+        queries: Vec<SqliteQuery>,
+    ) -> impl Future<Output = Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>>> + Send
+    {
+        let sender = self.inner.short_sender.clone();
+        let accepting = self.ensure_accepting();
+        async move {
+            accepting.map_err(QueryExistingDatabaseError::QueryFailed)?;
+            let (response, receiver) = oneshot::channel();
+            sender
+                .send(ShortJob::QuerySnapshot {
+                    path,
+                    queries,
+                    response,
+                })
+                .await
+                .map_err(|_| QueryExistingDatabaseError::QueryFailed(SqliteRuntimeError::Closed))?;
+            receiver
+                .await
+                .unwrap_or(Err(QueryExistingDatabaseError::QueryFailed(
+                    SqliteRuntimeError::WorkerPanicked("短操作"),
+                )))
+        }
+    }
 }
 
 impl SqliteTransactionExecutor for RusqliteStorage {
@@ -2655,6 +2839,201 @@ mod tests {
     }
 
     #[test]
+    fn multi_query_read_uses_one_consistent_wal_snapshot() {
+        let directory = TestDirectory::new();
+        let database = directory.database("read-snapshot-wal.db");
+        let writer_path = database.clone();
+        let initializer = Connection::open(&database).expect("测试数据库应可创建");
+        initializer
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("测试数据库应可启用 WAL");
+        initializer
+            .execute_batch(
+                "CREATE TABLE snapshot_value (value INTEGER NOT NULL);\
+                 INSERT INTO snapshot_value VALUES (1);",
+            )
+            .expect("测试数据应可建立");
+        drop(initializer);
+
+        let reader = open_existing_read_only(&database, &configuration())
+            .unwrap_or_else(|_| panic!("测试数据库应可只读打开"));
+        let (start_writer, writer_started) = mpsc::sync_channel(0);
+        let (writer_finished, wait_writer) = mpsc::sync_channel(0);
+        let writer = thread::spawn(move || {
+            writer_started.recv().expect("应通知 writer 开始");
+            let connection = Connection::open(writer_path).expect("writer 应可打开数据库");
+            connection
+                .execute("UPDATE snapshot_value SET value = 2", [])
+                .expect("WAL writer 应可在 reader 快照期间提交");
+            writer_finished.send(()).expect("应通知 writer 完成");
+        });
+
+        let queries = [
+            SqliteQuery::new("SELECT value FROM snapshot_value", Vec::new()),
+            SqliteQuery::new("SELECT value FROM snapshot_value", Vec::new()),
+        ];
+        let results =
+            read_queries_in_snapshot(&reader, &queries, &configuration(), |completed_index| {
+                if completed_index == 0 {
+                    start_writer.send(()).expect("应释放 writer");
+                    wait_writer.recv().expect("应等待 writer 提交");
+                }
+            })
+            .expect("两条查询应共享同一 WAL 视图");
+        writer.join().expect("writer 不应 panic");
+
+        let expected = vec![SqliteRow::new(vec![SqliteValue::Integer(1)])];
+        assert_eq!(results, [expected.clone(), expected]);
+        let current: i64 = Connection::open(&database)
+            .expect("应可重新打开测试数据库")
+            .query_row("SELECT value FROM snapshot_value", [], |row| row.get(0))
+            .expect("应可读取 writer 的新值");
+        assert_eq!(current, 2);
+    }
+
+    #[test]
+    fn multi_query_read_rolls_back_query_failure_and_reports_commit_failure_as_read_error() {
+        let connection = Connection::open_in_memory().expect("内存数据库应可打开");
+        let query_error = read_queries_in_snapshot(
+            &connection,
+            &[
+                SqliteQuery::new("SELECT 1", Vec::new()),
+                SqliteQuery::new("SELECT missing FROM absent", Vec::new()),
+            ],
+            &configuration(),
+            |_| {},
+        )
+        .expect_err("第二条查询失败必须终止快照");
+        assert!(connection.is_autocommit(), "查询失败后必须结束读事务");
+        assert!(matches!(
+            query_error,
+            SqliteRuntimeError::Driver {
+                operation: "准备查询",
+                ..
+            }
+        ));
+
+        let commit_error = read_queries_in_snapshot(
+            &connection,
+            &[SqliteQuery::new("SELECT 1", Vec::new())],
+            &configuration(),
+            |_| {
+                connection
+                    .execute_batch("ROLLBACK")
+                    .expect("测试注入应先结束读事务")
+            },
+        )
+        .expect_err("被测试注入提前结束的事务必须令 COMMIT 失败");
+        assert!(connection.is_autocommit());
+        assert!(matches!(
+            commit_error,
+            SqliteRuntimeError::Driver {
+                operation: "结束只读查询快照",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn multi_query_read_preserves_order_and_applies_each_query_budget() {
+        let directory = TestDirectory::new();
+        let database = directory.database("read-snapshot-budget.db");
+        Connection::open(&database)
+            .expect("测试数据库应可创建")
+            .close()
+            .expect("测试数据库应可关闭");
+        let mut config = configuration();
+        config.max_rows_per_query = nonzero(1);
+        let storage = RusqliteStorage::start(config).expect("SQLite 根应可启动");
+
+        let results = storage
+            .query_existing_database_snapshot(
+                database.clone(),
+                vec![
+                    SqliteQuery::new("SELECT 2", Vec::new()),
+                    SqliteQuery::new("SELECT 1", Vec::new()),
+                ],
+            )
+            .await
+            .expect("两条查询应分别使用各自的一行预算");
+        assert_eq!(
+            results,
+            [
+                vec![SqliteRow::new(vec![SqliteValue::Integer(2)])],
+                vec![SqliteRow::new(vec![SqliteValue::Integer(1)])],
+            ]
+        );
+
+        let error = storage
+            .query_existing_database_snapshot(
+                database,
+                vec![SqliteQuery::new("SELECT 1 UNION ALL SELECT 2", Vec::new())],
+            )
+            .await
+            .expect_err("单条查询自身仍不得超过行预算");
+        assert!(matches!(
+            error,
+            QueryExistingDatabaseError::QueryFailed(SqliteRuntimeError::ResourceLimit {
+                resource: "查询行数",
+                limit: 1,
+            })
+        ));
+        storage.shutdown().await.expect("SQLite 根应可关闭");
+    }
+
+    #[test]
+    fn multi_query_read_rejects_empty_or_too_many_queries_and_keeps_per_query_input_budgets() {
+        assert!(matches!(
+            run_query_snapshot_existing(
+                Path::new("C:/不存在/且不应访问.db"),
+                &[],
+                &configuration(),
+            ),
+            Err(QueryExistingDatabaseError::QueryFailed(
+                SqliteRuntimeError::InvalidValue("只读快照查询集合不得为空")
+            ))
+        ));
+
+        let queries = (0..=MAX_QUERIES_PER_READ_SNAPSHOT)
+            .map(|_| SqliteQuery::new("SELECT 1", Vec::new()))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            validate_query_snapshot(&queries, &configuration()),
+            Err(SqliteRuntimeError::ResourceLimit {
+                resource: "只读快照查询数",
+                limit: MAX_QUERIES_PER_READ_SNAPSHOT,
+            })
+        ));
+
+        let mut config = configuration();
+        config.max_statement_bytes = nonzero("SELECT 1".len());
+        config.max_parameter_bytes = nonzero(4);
+        assert!(
+            validate_query_snapshot(
+                &[
+                    SqliteQuery::new("SELECT 1", Vec::new()),
+                    SqliteQuery::new("SELECT 2", Vec::new()),
+                ],
+                &config,
+            )
+            .is_ok(),
+            "多条查询不得聚合收紧每条 statement 的现有预算"
+        );
+        config.max_statement_bytes = nonzero("SELECT ?1".len());
+        assert!(
+            validate_query_snapshot(
+                &[
+                    SqliteQuery::new("SELECT ?1", vec![SqliteValue::Text("1234".to_owned())]),
+                    SqliteQuery::new("SELECT ?1", vec![SqliteValue::Text("5678".to_owned())]),
+                ],
+                &config,
+            )
+            .is_ok(),
+            "多条查询不得聚合收紧每条参数的现有预算"
+        );
+    }
+
+    #[test]
     fn configuration_accepts_one_connection_for_non_snapshot_operations() {
         let configuration = configuration_with_max_open_connections(1);
 
@@ -2823,6 +3202,285 @@ mod tests {
             ])]
         );
         storage.shutdown().await.expect("根应可关闭");
+    }
+
+    #[tokio::test]
+    async fn batch_requirements_and_exact_updates_follow_natural_parameter_order() {
+        let directory = TestDirectory::new();
+        let database = directory.database("ordered-batches.db");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
+        storage
+            .create_new_database(database.clone(), schema_commands())
+            .await
+            .expect("数据库应可创建");
+        storage
+            .execute_transaction(
+                database.clone(),
+                SqliteTransactionPlan::new(vec![
+                    SqliteTransactionStep::Execute(SqliteCommand::new(
+                        "INSERT INTO values_table (id, n) VALUES (1, 0)",
+                        Vec::new(),
+                    )),
+                    SqliteTransactionStep::RequireNoRowsMany(SqliteBatch::new(
+                        "SELECT 1 FROM values_table WHERE id = ?1 AND n <> ?2",
+                        vec![
+                            vec![SqliteValue::Integer(1), SqliteValue::Integer(0)],
+                            vec![SqliteValue::Integer(2), SqliteValue::Integer(0)],
+                        ],
+                    )),
+                    SqliteTransactionStep::ExecuteManyExactlyOne(SqliteBatch::new(
+                        "UPDATE values_table SET n = ?1 WHERE id = 1 AND n = ?2",
+                        vec![
+                            vec![SqliteValue::Integer(1), SqliteValue::Integer(0)],
+                            vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
+                            vec![SqliteValue::Integer(3), SqliteValue::Integer(2)],
+                        ],
+                    )),
+                ]),
+            )
+            .await
+            .expect("批量步骤应按自然参数顺序提交");
+
+        let rows = storage
+            .query_existing_database(
+                database,
+                SqliteQuery::new("SELECT n FROM values_table WHERE id = 1", Vec::new()),
+            )
+            .await
+            .expect("提交后应可查询");
+        assert_eq!(rows, vec![SqliteRow::new(vec![SqliteValue::Integer(3)])]);
+        storage.shutdown().await.expect("根应可关闭");
+    }
+
+    #[tokio::test]
+    async fn require_no_rows_many_reports_the_earliest_result_and_rolls_back() {
+        let directory = TestDirectory::new();
+        let database = directory.database("ordered-requirement.db");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
+        storage
+            .create_new_database(database.clone(), schema_commands())
+            .await
+            .expect("数据库应可创建");
+        storage
+            .execute_transaction(
+                database.clone(),
+                SqliteTransactionPlan::new(vec![SqliteTransactionStep::Execute(
+                    SqliteCommand::new(
+                        "INSERT INTO values_table (id, n) VALUES (1, 0)",
+                        Vec::new(),
+                    ),
+                )]),
+            )
+            .await
+            .expect("基础行应可提交");
+
+        let result = storage
+            .execute_transaction(
+                database.clone(),
+                SqliteTransactionPlan::new(vec![
+                    SqliteTransactionStep::Execute(SqliteCommand::new(
+                        "UPDATE values_table SET n = 9 WHERE id = 1",
+                        Vec::new(),
+                    )),
+                    SqliteTransactionStep::RequireNoRowsMany(SqliteBatch::new(
+                        "SELECT CASE ?1 WHEN 1 THEN 1 ELSE abs(-9223372036854775808) END",
+                        vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]],
+                    )),
+                ]),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ExecuteTransactionError::RequirementFailed)
+        ));
+
+        let rows = storage
+            .query_existing_database(
+                database.clone(),
+                SqliteQuery::new("SELECT n FROM values_table WHERE id = 1", Vec::new()),
+            )
+            .await
+            .expect("回滚后应可查询");
+        assert_eq!(rows, vec![SqliteRow::new(vec![SqliteValue::Integer(0)])]);
+
+        let result = storage
+            .execute_transaction(
+                database,
+                SqliteTransactionPlan::new(vec![SqliteTransactionStep::RequireNoRowsMany(
+                    SqliteBatch::new(
+                        "SELECT CASE ?1 WHEN 1 THEN 1 ELSE abs(-9223372036854775808) END",
+                        vec![vec![SqliteValue::Integer(2)], vec![SqliteValue::Integer(1)]],
+                    ),
+                )]),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ExecuteTransactionError::NotCommitted(
+                SqliteRuntimeError::Driver { .. }
+            ))
+        ));
+        storage.shutdown().await.expect("根应可关闭");
+    }
+
+    #[tokio::test]
+    async fn execute_many_exactly_one_rejects_zero_or_multiple_rows_and_rolls_back() {
+        let directory = TestDirectory::new();
+        let database = directory.database("exactly-one-count.db");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
+        storage
+            .create_new_database(database.clone(), schema_commands())
+            .await
+            .expect("数据库应可创建");
+        storage
+            .execute_transaction(
+                database.clone(),
+                SqliteTransactionPlan::new(vec![SqliteTransactionStep::ExecuteMany(
+                    SqliteBatch::new(
+                        "INSERT INTO values_table (id, n) VALUES (?1, 0)",
+                        vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]],
+                    ),
+                )]),
+            )
+            .await
+            .expect("基础行应可提交");
+
+        let zero_rows = storage
+            .execute_transaction(
+                database.clone(),
+                SqliteTransactionPlan::new(vec![
+                    SqliteTransactionStep::ExecuteManyExactlyOne(SqliteBatch::new(
+                        "UPDATE values_table SET n = ?1 WHERE id = ?2",
+                        vec![
+                            vec![SqliteValue::Integer(7), SqliteValue::Integer(1)],
+                            vec![SqliteValue::Integer(8), SqliteValue::Integer(99)],
+                        ],
+                    )),
+                    SqliteTransactionStep::Execute(SqliteCommand::new(
+                        "UPDATE values_table SET n = 10 WHERE id = 2",
+                        Vec::new(),
+                    )),
+                ]),
+            )
+            .await;
+        assert!(matches!(
+            zero_rows,
+            Err(ExecuteTransactionError::RequirementFailed)
+        ));
+
+        let multiple_rows = storage
+            .execute_transaction(
+                database.clone(),
+                SqliteTransactionPlan::new(vec![
+                    SqliteTransactionStep::ExecuteManyExactlyOne(SqliteBatch::new(
+                        "UPDATE values_table SET n = ?1 WHERE n = ?2",
+                        vec![vec![SqliteValue::Integer(3), SqliteValue::Integer(0)]],
+                    )),
+                    SqliteTransactionStep::Execute(SqliteCommand::new(
+                        "UPDATE values_table SET n = 10 WHERE id = 2",
+                        Vec::new(),
+                    )),
+                ]),
+            )
+            .await;
+        assert!(matches!(
+            multiple_rows,
+            Err(ExecuteTransactionError::RequirementFailed)
+        ));
+
+        let rows = storage
+            .query_existing_database(
+                database,
+                SqliteQuery::new("SELECT id, n FROM values_table ORDER BY id", Vec::new()),
+            )
+            .await
+            .expect("两笔失败事务后应可查询");
+        assert_eq!(
+            rows,
+            vec![
+                SqliteRow::new(vec![SqliteValue::Integer(1), SqliteValue::Integer(0)]),
+                SqliteRow::new(vec![SqliteValue::Integer(2), SqliteValue::Integer(0)]),
+            ]
+        );
+        storage.shutdown().await.expect("根应可关闭");
+    }
+
+    #[tokio::test]
+    async fn execute_many_exactly_one_driver_error_rolls_back_earlier_parameter_sets() {
+        let directory = TestDirectory::new();
+        let database = directory.database("exactly-one-driver.db");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
+        storage
+            .create_new_database(database.clone(), schema_commands())
+            .await
+            .expect("数据库应可创建");
+        storage
+            .execute_transaction(
+                database.clone(),
+                SqliteTransactionPlan::new(vec![SqliteTransactionStep::ExecuteMany(
+                    SqliteBatch::new(
+                        "INSERT INTO values_table (id) VALUES (?1)",
+                        vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]],
+                    ),
+                )]),
+            )
+            .await
+            .expect("基础行应可提交");
+
+        let result = storage
+            .execute_transaction(
+                database.clone(),
+                SqliteTransactionPlan::new(vec![
+                    SqliteTransactionStep::ExecuteManyExactlyOne(SqliteBatch::new(
+                        "UPDATE values_table SET id = ?1 WHERE id = ?2",
+                        vec![
+                            vec![SqliteValue::Integer(3), SqliteValue::Integer(1)],
+                            vec![SqliteValue::Integer(2), SqliteValue::Integer(3)],
+                        ],
+                    )),
+                    SqliteTransactionStep::Execute(SqliteCommand::new(
+                        "INSERT INTO values_table (id) VALUES (4)",
+                        Vec::new(),
+                    )),
+                ]),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ExecuteTransactionError::NotCommitted(
+                SqliteRuntimeError::Driver { .. }
+            ))
+        ));
+
+        let rows = storage
+            .query_existing_database(
+                database,
+                SqliteQuery::new("SELECT id FROM values_table ORDER BY id", Vec::new()),
+            )
+            .await
+            .expect("驱动失败回滚后应可查询");
+        assert_eq!(
+            rows,
+            vec![
+                SqliteRow::new(vec![SqliteValue::Integer(1)]),
+                SqliteRow::new(vec![SqliteValue::Integer(2)]),
+            ]
+        );
+        storage.shutdown().await.expect("根应可关闭");
+    }
+
+    #[test]
+    fn requirement_rollback_failure_is_outcome_unknown() {
+        let connection = Connection::open_in_memory().expect("内存数据库应可打开");
+
+        let result = rollback_requirement_failure(&connection);
+
+        assert!(matches!(
+            result,
+            Err(ExecuteTransactionError::OutcomeUnknown(
+                SqliteRuntimeError::Driver { .. }
+            ))
+        ));
     }
 
     #[tokio::test]

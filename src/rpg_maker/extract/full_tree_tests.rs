@@ -218,6 +218,18 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
             SqliteValue::Text(r#"{"rules":[]}"#.to_owned()),
         ])])
     }
+
+    async fn query_existing_database_snapshot(
+        &self,
+        path: PathBuf,
+        queries: Vec<SqliteQuery>,
+    ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
+        let mut results = Vec::with_capacity(queries.len());
+        for query in queries {
+            results.push(self.query_existing_database(path.clone(), query).await?);
+        }
+        Ok(results)
+    }
 }
 
 #[derive(Clone)]
@@ -277,10 +289,24 @@ impl SqliteQueryExecutor for FakeSqliteTransactionExecutor {
         }
         assert!(
             query.statement().contains("standard_asset_owner_state")
-                || query.statement().contains("UNION ALL"),
+                || query.statement().contains("standard_text_group")
+                || query.statement().contains("standard_text_leaf")
+                || query.statement().contains("standard_text_target"),
             "Store 只应读取当前 owner 快照或新鲜 owner"
         );
         Ok(Vec::new())
+    }
+
+    async fn query_existing_database_snapshot(
+        &self,
+        path: PathBuf,
+        queries: Vec<SqliteQuery>,
+    ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
+        let mut results = Vec::with_capacity(queries.len());
+        for query in queries {
+            results.push(self.query_existing_database(path.clone(), query).await?);
+        }
+        Ok(results)
     }
 }
 

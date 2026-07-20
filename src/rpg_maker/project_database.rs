@@ -2872,6 +2872,18 @@ mod tests {
 
             async move { response }
         }
+
+        async fn query_existing_database_snapshot(
+            &self,
+            path: PathBuf,
+            queries: Vec<SqliteQuery>,
+        ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
+            let mut results = Vec::with_capacity(queries.len());
+            for query in queries {
+                results.push(self.query_existing_database(path.clone(), query).await?);
+            }
+            Ok(results)
+        }
     }
 
     struct RecordingTransactionExecutor {

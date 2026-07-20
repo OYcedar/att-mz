@@ -160,30 +160,35 @@ const UPDATE_PROJECT_DEFINITION: &str = r#"UPDATE standard_project_definition
 SET canonical_json = ?
 WHERE definition_kind = ?"#;
 
-const READ_OWNER_SNAPSHOT: &str = r#"SELECT
-    '0_owner' AS record_kind,
-    '' AS group_location,
-    '' AS identity,
-    '' AS original_text,
-    '' AS translation_context_json,
-    '' AS projection_recipe_json,
+const READ_OWNER_STATE: &str = r#"SELECT
     source_snapshot_fingerprint,
     asset_snapshot_fingerprint
 FROM standard_asset_owner_state
-WHERE owner = ?
-UNION ALL
-SELECT '1_group', group_location, group_kind, '', '', projection_recipe_json, NULL, NULL
+WHERE owner = ?"#;
+
+const READ_OWNER_GROUPS: &str = r#"SELECT
+    group_location,
+    group_kind,
+    projection_recipe_json
 FROM standard_text_group
 WHERE owner = ?
-UNION ALL
-SELECT '2_leaf', group_location, field_role, original_text, translation_context_json, '', NULL, NULL
+ORDER BY group_location"#;
+
+const READ_OWNER_LEAVES: &str = r#"SELECT
+    group_location,
+    field_role,
+    original_text,
+    translation_context_json
 FROM standard_text_leaf
 WHERE owner = ?
-UNION ALL
-SELECT '3_target', group_location, mutation_target, '', '', '', NULL, NULL
-FROM standard_text_target
+ORDER BY group_location, field_role"#;
+
+const READ_OWNER_TARGETS: &str = r#"SELECT
+    mutation_target,
+    group_location
+FROM standard_text_target INDEXED BY sqlite_autoindex_standard_text_target_1
 WHERE owner = ?
-ORDER BY 1, 2, 3"#;
+ORDER BY mutation_target"#;
 
 /// 标准提取资产编码阶段的必填资源上限。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,6 +255,7 @@ where
             .map_err(RpgMakerExtractionAssetStoreError::EncodeSnapshot)?;
 
         let database_path = project.database_path().to_path_buf();
+        let current_owner_state = self.read_owner_state(database_path.clone(), owner).await?;
         let project_definition = match project_definition_update {
             None => None,
             Some(update) => {
@@ -263,53 +269,61 @@ where
                     ),
                 };
                 Some(ResolvedProjectDefinition {
-                    canonical_json: replacement.clone().unwrap_or_else(|| current.clone()),
                     current_canonical_json: current,
                     replacement,
                 })
             }
         };
-        let source_snapshot_fingerprint =
-            project.source_snapshot_fingerprint().as_bytes().to_owned();
-        let canonical_project_definition = project_definition
-            .as_ref()
-            .map(|definition| definition.canonical_json.clone());
-        let (encoded, desired) = self
+        let source_snapshot_fingerprint = *project.source_snapshot_fingerprint().as_bytes();
+        let (encoded, project_definition) = self
             .cpu
             .execute(move || {
                 let encoded = EncodedSnapshot::merge(
                     owner,
                     encoded_batches,
-                    canonical_project_definition.as_deref(),
+                    project_definition
+                        .as_ref()
+                        .map(ResolvedProjectDefinition::canonical_json),
                 )?;
-                let desired = encoded.desired_rows(&source_snapshot_fingerprint);
-                Ok::<_, EncodeAssetSnapshotError>((encoded, desired))
+                Ok::<_, EncodeAssetSnapshotError>((encoded, project_definition))
             })
             .await
             .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?
             .map_err(RpgMakerExtractionAssetStoreError::EncodeSnapshot)?;
-        let current = self
-            .read_owner_snapshot(database_path.clone(), owner)
-            .await?;
-        let definition_is_current = project_definition.as_ref().is_none_or(|definition| {
-            definition.current_canonical_json == definition.canonical_json
-        });
-        let snapshot_is_current = self
-            .cpu
-            .execute(move || current == desired && definition_is_current)
-            .await
-            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
-        if snapshot_is_current {
-            return Ok(());
-        }
 
-        let source_snapshot_fingerprint =
-            project.source_snapshot_fingerprint().as_bytes().to_owned();
+        let encoded = if owner_state_matches(
+            current_owner_state,
+            &source_snapshot_fingerprint,
+            encoded.fingerprint.as_bytes(),
+        ) {
+            let current = self
+                .read_stored_snapshot_rows(database_path.clone(), owner)
+                .await?;
+            let definition_is_current = project_definition
+                .as_ref()
+                .is_none_or(ResolvedProjectDefinition::is_current);
+            let (encoded_snapshot, snapshot_is_current) = self
+                .cpu
+                .execute(move || {
+                    let snapshot_is_current = encoded
+                        .matches_rows(current, &source_snapshot_fingerprint)
+                        && definition_is_current;
+                    (encoded, snapshot_is_current)
+                })
+                .await
+                .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
+            if snapshot_is_current {
+                return Ok(());
+            }
+            encoded_snapshot
+        } else {
+            encoded
+        };
         let replacement = project_definition.and_then(|definition| definition.replacement);
         let plan = self
             .cpu
             .execute(move || {
-                build_transaction_plan(owner, &source_snapshot_fingerprint, encoded, replacement)
+                build_transaction_plan(owner, source_snapshot_fingerprint, encoded, replacement)
             })
             .await
             .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
@@ -328,7 +342,7 @@ where
     {
         let database_path = project.database_path().to_path_buf();
         if self
-            .read_owner_snapshot(database_path.clone(), owner)
+            .read_owner_state(database_path.clone(), owner)
             .await?
             .is_empty()
         {
@@ -346,7 +360,7 @@ where
         Ok(())
     }
 
-    async fn read_owner_snapshot(
+    async fn read_owner_state(
         &self,
         database_path: PathBuf,
         owner: RpgMakerStandardAssetOwner,
@@ -354,14 +368,49 @@ where
         Vec<SqliteRow>,
         RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
     > {
-        let owner = text(owner.storage_name());
         self.sqlite
             .query_existing_database(
                 database_path.clone(),
-                SqliteQuery::new(READ_OWNER_SNAPSHOT, vec![owner; 4]),
+                SqliteQuery::new(READ_OWNER_STATE, vec![text(owner.storage_name())]),
             )
             .await
             .map_err(|error| map_query_error(database_path, error))
+    }
+
+    async fn read_stored_snapshot_rows(
+        &self,
+        database_path: PathBuf,
+        owner: RpgMakerStandardAssetOwner,
+    ) -> Result<
+        StoredSnapshotRows,
+        RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
+    > {
+        let query_results = self
+            .sqlite
+            .query_existing_database_snapshot(
+                database_path.clone(),
+                vec![
+                    SqliteQuery::new(READ_OWNER_STATE, vec![text(owner.storage_name())]),
+                    SqliteQuery::new(READ_OWNER_GROUPS, vec![text(owner.storage_name())]),
+                    SqliteQuery::new(READ_OWNER_LEAVES, vec![text(owner.storage_name())]),
+                    SqliteQuery::new(READ_OWNER_TARGETS, vec![text(owner.storage_name())]),
+                ],
+            )
+            .await
+            .map_err(|error| map_query_error(database_path, error))?;
+        let actual = query_results.len();
+        let [owner_state, groups, leaves, targets] = query_results.try_into().map_err(|_| {
+            RpgMakerExtractionAssetStoreError::UnexpectedSnapshotQueryResultCount {
+                expected: 4,
+                actual,
+            }
+        })?;
+        Ok(StoredSnapshotRows {
+            owner_state,
+            groups,
+            leaves,
+            targets,
+        })
     }
 
     async fn read_project_definition(
@@ -481,6 +530,10 @@ pub(crate) enum RpgMakerExtractionAssetStoreError<C, S> {
         database_path: PathBuf,
         source: S,
     },
+    UnexpectedSnapshotQueryResultCount {
+        expected: usize,
+        actual: usize,
+    },
     ReadProjectDefinition {
         database_path: PathBuf,
         source: S,
@@ -524,6 +577,10 @@ where
                 formatter,
                 "无法读取当前 owner 快照 {}：{source}",
                 database_path.display()
+            ),
+            Self::UnexpectedSnapshotQueryResultCount { expected, actual } => write!(
+                formatter,
+                "资产快照查询应返回 {expected} 组结果，实际为 {actual} 组"
             ),
             Self::ReadProjectDefinition {
                 database_path,
@@ -581,7 +638,9 @@ where
             }
             Self::InvalidProjectDefinition { source, .. } => Some(source),
             Self::NotCommitted { source, .. } | Self::OutcomeUnknown { source, .. } => Some(source),
-            Self::DatabaseNotFound { .. } | Self::MutationTargetConflict { .. } => None,
+            Self::DatabaseNotFound { .. }
+            | Self::UnexpectedSnapshotQueryResultCount { .. }
+            | Self::MutationTargetConflict { .. } => None,
         }
     }
 }
@@ -671,9 +730,22 @@ struct EncodedBatch {
 }
 
 struct ResolvedProjectDefinition {
-    canonical_json: String,
     current_canonical_json: String,
     replacement: Option<String>,
+}
+
+impl ResolvedProjectDefinition {
+    fn canonical_json(&self) -> &str {
+        self.replacement
+            .as_deref()
+            .unwrap_or(&self.current_canonical_json)
+    }
+
+    fn is_current(&self) -> bool {
+        self.replacement
+            .as_deref()
+            .is_none_or(|replacement| replacement == self.current_canonical_json.as_str())
+    }
 }
 
 struct EncodedSnapshot {
@@ -683,6 +755,14 @@ struct EncodedSnapshot {
     leaves: Vec<EncodedLeaf>,
     targets: Vec<EncodedTarget>,
     fingerprint: AssetSnapshotFingerprint,
+}
+
+#[cfg_attr(test, derive(Clone, Debug, Default, PartialEq))]
+struct StoredSnapshotRows {
+    owner_state: Vec<SqliteRow>,
+    groups: Vec<SqliteRow>,
+    leaves: Vec<SqliteRow>,
+    targets: Vec<SqliteRow>,
 }
 
 impl EncodedSnapshot {
@@ -728,57 +808,116 @@ impl EncodedSnapshot {
         })
     }
 
-    fn desired_rows(&self, source_snapshot_fingerprint: &[u8; 32]) -> Vec<SqliteRow> {
-        let mut rows =
-            Vec::with_capacity(1 + self.groups.len() + self.leaves.len() + self.targets.len());
-        rows.push(SqliteRow::new(vec![
-            text("0_owner"),
-            text(""),
-            text(""),
-            text(""),
-            text(""),
-            text(""),
-            SqliteValue::Blob(source_snapshot_fingerprint.to_vec()),
-            SqliteValue::Blob(self.fingerprint.as_bytes().to_vec()),
-        ]));
-        rows.extend(self.groups.iter().map(|group| {
-            SqliteRow::new(vec![
-                text("1_group"),
-                text(group.group_location.clone()),
-                text(group.group_kind),
-                text(""),
-                text(""),
-                text(group.projection_recipe_json.clone()),
-                SqliteValue::Null,
-                SqliteValue::Null,
-            ])
-        }));
-        rows.extend(self.leaves.iter().map(|leaf| {
-            SqliteRow::new(vec![
-                text("2_leaf"),
-                text(leaf.group_location.clone()),
-                text(leaf.field_role.clone()),
-                text(leaf.original_text.clone()),
-                text(leaf.translation_context_json.clone()),
-                text(""),
-                SqliteValue::Null,
-                SqliteValue::Null,
-            ])
-        }));
-        rows.extend(self.targets.iter().map(|target| {
-            SqliteRow::new(vec![
-                text("3_target"),
-                text(target.group_location.clone()),
-                text(target.mutation_target.clone()),
-                text(""),
-                text(""),
-                text(""),
-                SqliteValue::Null,
-                SqliteValue::Null,
-            ])
-        }));
-        rows
+    fn matches_rows(
+        &self,
+        rows: StoredSnapshotRows,
+        source_snapshot_fingerprint: &[u8; 32],
+    ) -> bool {
+        let StoredSnapshotRows {
+            owner_state,
+            groups,
+            leaves,
+            targets,
+        } = rows;
+        if !owner_state_matches(
+            owner_state,
+            source_snapshot_fingerprint,
+            self.fingerprint.as_bytes(),
+        ) {
+            return false;
+        }
+        let mut rows = groups.into_iter();
+        for group in &self.groups {
+            if !stored_group_row_matches(rows.next(), group) {
+                return false;
+            }
+        }
+        if rows.next().is_some() {
+            return false;
+        }
+
+        let mut rows = leaves.into_iter();
+        for leaf in &self.leaves {
+            if !stored_leaf_row_matches(rows.next(), leaf) {
+                return false;
+            }
+        }
+        if rows.next().is_some() {
+            return false;
+        }
+
+        let mut rows = targets.into_iter();
+        for target in &self.targets {
+            if !stored_target_row_matches(rows.next(), target) {
+                return false;
+            }
+        }
+        rows.next().is_none()
     }
+}
+
+fn owner_state_matches(
+    rows: Vec<SqliteRow>,
+    source_snapshot_fingerprint: &[u8; 32],
+    asset_snapshot_fingerprint: &[u8; 32],
+) -> bool {
+    let mut rows = rows.into_iter();
+    let Some(row) = rows.next() else {
+        return false;
+    };
+    if rows.next().is_some() {
+        return false;
+    }
+    let values = row.values();
+    matches!(values, [SqliteValue::Blob(source), SqliteValue::Blob(asset)]
+        if source.as_slice() == source_snapshot_fingerprint
+            && asset.as_slice() == asset_snapshot_fingerprint)
+}
+
+fn stored_group_row_matches(row: Option<SqliteRow>, expected: &EncodedGroup) -> bool {
+    let Some(row) = row else {
+        return false;
+    };
+    matches!(
+        row.values(),
+        [
+            SqliteValue::Text(group_location),
+            SqliteValue::Text(group_kind),
+            SqliteValue::Text(projection_recipe_json),
+        ] if group_location == &expected.group_location
+            && group_kind == expected.group_kind
+            && projection_recipe_json == &expected.projection_recipe_json
+    )
+}
+
+fn stored_leaf_row_matches(row: Option<SqliteRow>, expected: &EncodedLeaf) -> bool {
+    let Some(row) = row else {
+        return false;
+    };
+    matches!(
+        row.values(),
+        [
+            SqliteValue::Text(group_location),
+            SqliteValue::Text(field_role),
+            SqliteValue::Text(original_text),
+            SqliteValue::Text(translation_context_json),
+        ] if group_location == &expected.group_location
+            && field_role == &expected.field_role
+            && original_text == &expected.original_text
+            && translation_context_json == &expected.translation_context_json
+    )
+}
+
+fn stored_target_row_matches(row: Option<SqliteRow>, expected: &EncodedTarget) -> bool {
+    let Some(row) = row else {
+        return false;
+    };
+    matches!(
+        row.values(),
+        [SqliteValue::Text(mutation_target), SqliteValue::Text(group_location)]
+            if mutation_target == &expected.mutation_target
+                && group_location == &expected.group_location
+    )
 }
 
 struct EncodedGroup {
@@ -923,10 +1062,17 @@ fn asset_snapshot_fingerprint(
 
 fn build_transaction_plan(
     owner: RpgMakerStandardAssetOwner,
-    source_snapshot_fingerprint: &[u8; 32],
+    source_snapshot_fingerprint: [u8; 32],
     snapshot: EncodedSnapshot,
     project_definition_replacement: Option<String>,
 ) -> SqliteTransactionPlan {
+    let EncodedSnapshot {
+        groups,
+        leaves,
+        targets,
+        fingerprint,
+        ..
+    } = snapshot;
     let mut steps = Vec::new();
     for statement in [
         DROP_STAGING_GROUP,
@@ -944,52 +1090,49 @@ fn build_transaction_plan(
         vec![text(owner.storage_name())],
     ));
 
-    if !snapshot.groups.is_empty() {
+    if !groups.is_empty() {
         steps.push(SqliteTransactionStep::ExecuteMany(SqliteBatch::new(
             INSERT_STAGING_GROUP,
-            snapshot
-                .groups
-                .iter()
+            groups
+                .into_iter()
                 .map(|group| {
                     vec![
                         text(owner.storage_name()),
-                        text(group.group_location.clone()),
+                        text(group.group_location),
                         text(group.group_kind),
-                        text(group.projection_recipe_json.clone()),
+                        text(group.projection_recipe_json),
                     ]
                 })
                 .collect(),
         )));
     }
-    if !snapshot.leaves.is_empty() {
+    if !leaves.is_empty() {
         steps.push(SqliteTransactionStep::ExecuteMany(SqliteBatch::new(
             INSERT_STAGING_LEAF,
-            snapshot
-                .leaves
-                .iter()
+            leaves
+                .into_iter()
                 .map(|leaf| {
                     vec![
                         text(owner.storage_name()),
-                        text(leaf.group_location.clone()),
-                        text(leaf.field_role.clone()),
-                        text(leaf.original_text.clone()),
-                        text(leaf.translation_context_json.clone()),
+                        text(leaf.group_location),
+                        text(leaf.field_role),
+                        text(leaf.original_text),
+                        text(leaf.translation_context_json),
                     ]
                 })
                 .collect(),
         )));
     }
-    if !snapshot.targets.is_empty() {
+    if !targets.is_empty() {
         steps.push(SqliteTransactionStep::ExecuteMany(SqliteBatch::new(
             INSERT_STAGING_TARGET,
-            snapshot
-                .targets
-                .iter()
+            targets
+                .into_iter()
                 .map(|target| {
                     vec![
-                        text(target.mutation_target.clone()),
+                        text(target.mutation_target),
                         text(owner.storage_name()),
-                        text(target.group_location.clone()),
+                        text(target.group_location),
                     ]
                 })
                 .collect(),
@@ -1021,8 +1164,8 @@ fn build_transaction_plan(
         UPSERT_OWNER_STATE,
         vec![
             text(owner.storage_name()),
-            SqliteValue::Blob(source_snapshot_fingerprint.to_vec()),
-            SqliteValue::Blob(snapshot.fingerprint.as_bytes().to_vec()),
+            SqliteValue::Blob(Vec::from(source_snapshot_fingerprint)),
+            SqliteValue::Blob(fingerprint.as_bytes().to_vec()),
         ],
     ));
     for statement in [INSERT_GROUPS, INSERT_LEAVES, INSERT_TARGETS] {
@@ -1208,10 +1351,12 @@ mod tests {
     #[derive(Clone)]
     struct RecordingSqlite {
         plans: Arc<Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>>,
-        current: Arc<Mutex<Vec<SqliteRow>>>,
+        owner_state: Arc<Mutex<Vec<SqliteRow>>>,
+        deep_owner_state_override: Arc<Mutex<Option<Vec<SqliteRow>>>>,
+        snapshot_rows: Arc<Mutex<StoredSnapshotRows>>,
         project_definition: Arc<Mutex<String>>,
         response: Arc<Mutex<Option<SqliteResponse>>>,
-        queries: Arc<AtomicUsize>,
+        queries: Arc<Mutex<Vec<String>>>,
     }
 
     impl SqliteQueryExecutor for RecordingSqlite {
@@ -1223,7 +1368,10 @@ mod tests {
             query: SqliteQuery,
         ) -> Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>> {
             assert_eq!(path, PathBuf::from("C:/projects/demo/project.db"));
-            self.queries.fetch_add(1, Ordering::SeqCst);
+            self.queries
+                .lock()
+                .expect("查询记录锁不应中毒")
+                .push(query.statement().to_owned());
             if query.statement() == READ_PROJECT_DEFINITION {
                 assert_eq!(
                     query.parameters(),
@@ -1236,10 +1384,57 @@ mod tests {
                         .clone(),
                 )])]);
             }
-            assert_eq!(query.statement(), READ_OWNER_SNAPSHOT);
-            assert_eq!(query.parameters().len(), 4);
-            assert!(query.parameters().windows(2).all(|pair| pair[0] == pair[1]));
-            Ok(self.current.lock().expect("当前快照锁不应中毒").clone())
+            if query.statement() == READ_OWNER_STATE {
+                assert!(matches!(
+                    query.parameters(),
+                    [SqliteValue::Text(owner)]
+                        if matches!(owner.as_str(), "builtin" | "rules" | "lua")
+                ));
+                return Ok(self
+                    .owner_state
+                    .lock()
+                    .expect("owner state 锁不应中毒")
+                    .clone());
+            }
+            assert!(matches!(
+                query.parameters(),
+                [SqliteValue::Text(owner)]
+                    if matches!(owner.as_str(), "builtin" | "rules" | "lua")
+            ));
+            let snapshot = self.snapshot_rows.lock().expect("当前快照锁不应中毒");
+            match query.statement() {
+                READ_OWNER_GROUPS => Ok(snapshot.groups.clone()),
+                READ_OWNER_LEAVES => Ok(snapshot.leaves.clone()),
+                READ_OWNER_TARGETS => Ok(snapshot.targets.clone()),
+                statement => panic!("收到未预期的查询：{statement}"),
+            }
+        }
+
+        async fn query_existing_database_snapshot(
+            &self,
+            path: PathBuf,
+            queries: Vec<SqliteQuery>,
+        ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
+            let mut results = Vec::with_capacity(queries.len());
+            for query in queries {
+                if query.statement() == READ_OWNER_STATE
+                    && let Some(rows) = self
+                        .deep_owner_state_override
+                        .lock()
+                        .expect("深读 owner state 覆盖锁不应中毒")
+                        .clone()
+                {
+                    assert_eq!(path, PathBuf::from("C:/projects/demo/project.db"));
+                    self.queries
+                        .lock()
+                        .expect("查询记录锁不应中毒")
+                        .push(query.statement().to_owned());
+                    results.push(rows);
+                    continue;
+                }
+                results.push(self.query_existing_database(path.clone(), query).await?);
+            }
+            Ok(results)
         }
     }
 
@@ -1298,14 +1493,16 @@ mod tests {
             Self {
                 sqlite: RecordingSqlite {
                     plans: Arc::new(Mutex::new(Vec::new())),
-                    current: Arc::new(Mutex::new(Vec::new())),
+                    owner_state: Arc::new(Mutex::new(Vec::new())),
+                    deep_owner_state_override: Arc::new(Mutex::new(None)),
+                    snapshot_rows: Arc::new(Mutex::new(StoredSnapshotRows::default())),
                     project_definition: Arc::new(Mutex::new(
                         MvDialogueDefinition::empty()
                             .to_canonical_json()
                             .expect("空定义应可编码"),
                     )),
                     response: Arc::new(Mutex::new(response)),
-                    queries: Arc::new(AtomicUsize::new(0)),
+                    queries: Arc::new(Mutex::new(Vec::new())),
                 },
                 cpu: RecordingCpu {
                     calls: Arc::new(AtomicUsize::new(0)),
@@ -1439,6 +1636,30 @@ mod tests {
     }
 
     #[test]
+    fn owner_state_shortcut_requires_both_exact_fingerprints() {
+        assert!(owner_state_matches(
+            owner_state_rows(&[0xa5; 32], &[0xb4; 32]),
+            &[0xa5; 32],
+            &[0xb4; 32],
+        ));
+        assert!(!owner_state_matches(
+            owner_state_rows(&[0x33; 32], &[0xb4; 32]),
+            &[0xa5; 32],
+            &[0xb4; 32],
+        ));
+        assert!(!owner_state_matches(
+            owner_state_rows(&[0xa5; 32], &[0x44; 32]),
+            &[0xa5; 32],
+            &[0xb4; 32],
+        ));
+        assert!(!owner_state_matches(
+            vec![SqliteRow::new(vec![text("not-a-blob"), text("bad")])],
+            &[0xa5; 32],
+            &[0xb4; 32],
+        ));
+    }
+
+    #[test]
     fn translation_inheritance_uses_logical_identity_text_and_context_only() {
         assert!(INHERIT_TRANSLATIONS.contains("previous.group_location"));
         assert!(INHERIT_TRANSLATIONS.contains("previous.field_role"));
@@ -1470,7 +1691,7 @@ mod tests {
         seed_snapshot(&connection, &old, "译文", &[0x44; 32]);
         execute_plan(
             &mut connection,
-            build_transaction_plan(owner, &[0xa5; 32], new, None),
+            build_transaction_plan(owner, [0xa5; 32], new, None),
         )
         .expect("配方外壳变化应完成替换");
 
@@ -1511,7 +1732,14 @@ mod tests {
             .await
             .expect("快照应完成替换");
 
-        assert_eq!(harness.cpu.calls.load(Ordering::SeqCst), 12);
+        assert_eq!(harness.cpu.calls.load(Ordering::SeqCst), 11);
+        assert_eq!(
+            *harness.sqlite.queries.lock().expect("查询记录锁不应中毒"),
+            [
+                READ_OWNER_STATE.to_owned(),
+                READ_PROJECT_DEFINITION.to_owned()
+            ]
+        );
         let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
         assert_eq!(plans.len(), 1);
         let statements = plan_statements(&plans[0].1).join("\n");
@@ -1634,8 +1862,20 @@ mod tests {
             Some(r#"{"rules":[]}"#),
         )
         .expect("快照应可合并");
-        *harness.sqlite.current.lock().expect("当前快照锁不应中毒") =
-            encoded.desired_rows(project().source_snapshot_fingerprint().as_bytes());
+        let source_snapshot_fingerprint = project().source_snapshot_fingerprint();
+        *harness
+            .sqlite
+            .owner_state
+            .lock()
+            .expect("owner state 锁不应中毒") = owner_state_rows(
+            source_snapshot_fingerprint.as_bytes(),
+            encoded.fingerprint.as_bytes(),
+        );
+        *harness
+            .sqlite
+            .snapshot_rows
+            .lock()
+            .expect("当前快照锁不应中毒") = snapshot_rows(&encoded);
 
         harness
             .service(1)
@@ -1647,7 +1887,17 @@ mod tests {
             .await
             .expect("相同快照应正常收敛");
 
-        assert_eq!(harness.sqlite.queries.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *harness.sqlite.queries.lock().expect("查询记录锁不应中毒"),
+            [
+                READ_OWNER_STATE.to_owned(),
+                READ_PROJECT_DEFINITION.to_owned(),
+                READ_OWNER_STATE.to_owned(),
+                READ_OWNER_GROUPS.to_owned(),
+                READ_OWNER_LEAVES.to_owned(),
+                READ_OWNER_TARGETS.to_owned(),
+            ]
+        );
         assert!(
             harness
                 .sqlite
@@ -1655,6 +1905,154 @@ mod tests {
                 .lock()
                 .expect("事务记录锁不应中毒")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_snapshot_rechecks_owner_state_in_the_same_read_view() {
+        let harness = Harness::new(None);
+        let owner = RpgMakerStandardAssetOwner::Rules;
+        let group = scalar_group(1, "name", "原文");
+        let encoded = EncodedSnapshot::merge(
+            owner,
+            vec![encode_batch(vec![group.clone()]).expect("快照应可编码")],
+            None,
+        )
+        .expect("快照应可合并");
+        let source_snapshot_fingerprint = project().source_snapshot_fingerprint();
+        *harness
+            .sqlite
+            .owner_state
+            .lock()
+            .expect("owner state 锁不应中毒") = owner_state_rows(
+            source_snapshot_fingerprint.as_bytes(),
+            encoded.fingerprint.as_bytes(),
+        );
+        *harness
+            .sqlite
+            .snapshot_rows
+            .lock()
+            .expect("当前快照锁不应中毒") = snapshot_rows(&encoded);
+        *harness
+            .sqlite
+            .deep_owner_state_override
+            .lock()
+            .expect("深读 owner state 覆盖锁不应中毒") = Some(owner_state_rows(
+            source_snapshot_fingerprint.as_bytes(),
+            &[0x44; 32],
+        ));
+
+        harness
+            .service(1)
+            .replace_rules(
+                &project(),
+                RulesSnapshot::new(vec![group]).expect("快照应合法"),
+            )
+            .await
+            .expect("深读视图中的 owner 变化应触发权威替换");
+
+        assert_eq!(
+            *harness.sqlite.queries.lock().expect("查询记录锁不应中毒"),
+            [
+                READ_OWNER_STATE.to_owned(),
+                READ_OWNER_STATE.to_owned(),
+                READ_OWNER_GROUPS.to_owned(),
+                READ_OWNER_LEAVES.to_owned(),
+                READ_OWNER_TARGETS.to_owned(),
+            ]
+        );
+        assert_eq!(
+            harness
+                .sqlite
+                .plans
+                .lock()
+                .expect("事务记录锁不应中毒")
+                .len(),
+            1,
+            "深读 owner state 与期望不一致时不得错误早退"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_fingerprints_deep_read_and_repair_a_damaged_snapshot() {
+        let harness = Harness::new(None);
+        let owner = RpgMakerStandardAssetOwner::Rules;
+        let group = scalar_group(1, "name", "原文");
+        let encoded = EncodedSnapshot::merge(
+            owner,
+            vec![encode_batch(vec![group.clone()]).expect("快照应可编码")],
+            None,
+        )
+        .expect("快照应可合并");
+        let source_snapshot_fingerprint = project().source_snapshot_fingerprint();
+        *harness
+            .sqlite
+            .owner_state
+            .lock()
+            .expect("owner state 锁不应中毒") = owner_state_rows(
+            source_snapshot_fingerprint.as_bytes(),
+            encoded.fingerprint.as_bytes(),
+        );
+        harness
+            .service(1)
+            .replace_rules(
+                &project(),
+                RulesSnapshot::new(vec![group]).expect("快照应合法"),
+            )
+            .await
+            .expect("损坏快照应通过权威替换修复");
+
+        assert_eq!(
+            *harness.sqlite.queries.lock().expect("查询记录锁不应中毒"),
+            [
+                READ_OWNER_STATE.to_owned(),
+                READ_OWNER_STATE.to_owned(),
+                READ_OWNER_GROUPS.to_owned(),
+                READ_OWNER_LEAVES.to_owned(),
+                READ_OWNER_TARGETS.to_owned(),
+            ]
+        );
+        assert_eq!(
+            harness
+                .sqlite
+                .plans
+                .lock()
+                .expect("事务记录锁不应中毒")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_fingerprint_skips_the_deep_snapshot_read() {
+        let harness = Harness::new(None);
+        *harness
+            .sqlite
+            .owner_state
+            .lock()
+            .expect("owner state 锁不应中毒") = owner_state_rows(&[0xa5; 32], &[0xb4; 32]);
+
+        harness
+            .service(1)
+            .replace_rules(
+                &project(),
+                RulesSnapshot::new(vec![scalar_group(1, "name", "原文")]).expect("快照应合法"),
+            )
+            .await
+            .expect("指纹变化应直接执行权威替换");
+
+        assert_eq!(
+            *harness.sqlite.queries.lock().expect("查询记录锁不应中毒"),
+            [READ_OWNER_STATE.to_owned()]
+        );
+        assert_eq!(
+            harness
+                .sqlite
+                .plans
+                .lock()
+                .expect("事务记录锁不应中毒")
+                .len(),
+            1
         );
     }
 
@@ -1688,16 +2086,11 @@ mod tests {
             );
         }
 
-        *harness.sqlite.current.lock().expect("当前快照锁不应中毒") = vec![SqliteRow::new(vec![
-            text("0_owner"),
-            text(""),
-            text(""),
-            text(""),
-            text(""),
-            text(""),
-            SqliteValue::Blob(vec![0xa5; 32]),
-            SqliteValue::Blob(vec![0xb4; 32]),
-        ])];
+        *harness
+            .sqlite
+            .owner_state
+            .lock()
+            .expect("owner state 锁不应中毒") = owner_state_rows(&[0xa5; 32], &[0xb4; 32]);
         harness
             .service(1)
             .deactivate_rules(&project())
@@ -1708,6 +2101,10 @@ mod tests {
         assert_eq!(
             plan_statements(&plans[1].1),
             vec![DEACTIVATE_OWNER.to_owned()]
+        );
+        assert_eq!(
+            *harness.sqlite.queries.lock().expect("查询记录锁不应中毒"),
+            [READ_OWNER_STATE.to_owned(), READ_OWNER_STATE.to_owned()]
         );
     }
 
@@ -1774,6 +2171,132 @@ mod tests {
                     RpgMakerExtractionAssetStoreError::OutcomeUnknown { .. },
                 )
             ));
+        }
+    }
+
+    #[test]
+    fn consuming_transaction_plan_preserves_snapshot_values_and_natural_order() {
+        let owner = RpgMakerStandardAssetOwner::Rules;
+        let snapshot = EncodedSnapshot::merge(
+            owner,
+            vec![
+                encode_batch(vec![
+                    scalar_group(2, "description", "说明"),
+                    scalar_group(1, "name", "名称"),
+                ])
+                .expect("测试快照应可编码"),
+            ],
+            None,
+        )
+        .expect("测试快照应可合并");
+        let expected = snapshot_rows(&snapshot);
+
+        let mut connection = Connection::open_in_memory().expect("应创建内存数据库");
+        create_current_schema(&connection);
+        execute_plan(
+            &mut connection,
+            build_transaction_plan(owner, [0xa5; 32], snapshot, None),
+        )
+        .expect("消费式事务计划应完整写入快照");
+
+        assert_eq!(read_snapshot_rows(&connection, owner), expected);
+    }
+
+    #[test]
+    fn narrow_snapshot_rows_require_exact_table_contents_and_types() {
+        let snapshot = EncodedSnapshot::merge(
+            RpgMakerStandardAssetOwner::Rules,
+            vec![
+                encode_batch(vec![
+                    scalar_group(2, "description", "说明"),
+                    scalar_group(1, "name", "名称"),
+                ])
+                .expect("测试快照应可编码"),
+            ],
+            None,
+        )
+        .expect("测试快照应可合并");
+        let current = snapshot_rows(&snapshot);
+        assert!(snapshot.matches_rows(current.clone(), &[0xa5; 32]));
+
+        for column in 0..3 {
+            let mut damaged = current.clone();
+            let mut values = damaged.groups[0].values().to_vec();
+            values[column] = SqliteValue::Null;
+            damaged.groups[0] = SqliteRow::new(values);
+            assert!(!snapshot.matches_rows(damaged, &[0xa5; 32]));
+        }
+        for column in 0..4 {
+            let mut damaged = current.clone();
+            let mut values = damaged.leaves[0].values().to_vec();
+            values[column] = SqliteValue::Null;
+            damaged.leaves[0] = SqliteRow::new(values);
+            assert!(!snapshot.matches_rows(damaged, &[0xa5; 32]));
+        }
+        for column in 0..2 {
+            let mut damaged = current.clone();
+            let mut values = damaged.targets[0].values().to_vec();
+            values[column] = SqliteValue::Null;
+            damaged.targets[0] = SqliteRow::new(values);
+            assert!(!snapshot.matches_rows(damaged, &[0xa5; 32]));
+        }
+
+        for table in 0..3 {
+            let mut missing = current.clone();
+            match table {
+                0 => {
+                    missing.groups.pop();
+                }
+                1 => {
+                    missing.leaves.pop();
+                }
+                2 => {
+                    missing.targets.pop();
+                }
+                _ => unreachable!("测试表编号固定为 0..3"),
+            }
+            assert!(!snapshot.matches_rows(missing, &[0xa5; 32]));
+
+            let mut extra = current.clone();
+            match table {
+                0 => extra.groups.push(current.groups[0].clone()),
+                1 => extra.leaves.push(current.leaves[0].clone()),
+                2 => extra.targets.push(current.targets[0].clone()),
+                _ => unreachable!("测试表编号固定为 0..3"),
+            }
+            assert!(!snapshot.matches_rows(extra, &[0xa5; 32]));
+        }
+    }
+
+    #[test]
+    fn narrow_snapshot_queries_use_authoritative_indexes_without_temp_sorting() {
+        let connection = Connection::open_in_memory().expect("应创建内存数据库");
+        create_current_schema(&connection);
+
+        for query in [
+            READ_OWNER_STATE,
+            READ_OWNER_GROUPS,
+            READ_OWNER_LEAVES,
+            READ_OWNER_TARGETS,
+        ] {
+            let explain = format!("EXPLAIN QUERY PLAN {query}");
+            let mut statement = connection.prepare(&explain).expect("查询计划应可准备");
+            let details = statement
+                .query_map([RpgMakerStandardAssetOwner::Rules.storage_name()], |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("查询计划应可读取")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("查询计划行应可解码");
+
+            assert!(
+                details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+                "深快照查询不得创建临时排序树：{details:?}"
+            );
+            assert!(
+                details.iter().any(|detail| detail.contains("USING INDEX")),
+                "深快照查询必须按现有权威索引读取：{details:?}"
+            );
         }
     }
 
@@ -1904,12 +2427,112 @@ mod tests {
         NonZeroUsize::new(value).expect("测试值应非零")
     }
 
+    fn owner_state_rows(
+        source_snapshot_fingerprint: &[u8; 32],
+        asset_snapshot_fingerprint: &[u8; 32],
+    ) -> Vec<SqliteRow> {
+        vec![SqliteRow::new(vec![
+            SqliteValue::Blob(source_snapshot_fingerprint.to_vec()),
+            SqliteValue::Blob(asset_snapshot_fingerprint.to_vec()),
+        ])]
+    }
+
+    fn snapshot_rows(snapshot: &EncodedSnapshot) -> StoredSnapshotRows {
+        let groups = snapshot
+            .groups
+            .iter()
+            .map(|group| {
+                SqliteRow::new(vec![
+                    text(group.group_location.clone()),
+                    text(group.group_kind),
+                    text(group.projection_recipe_json.clone()),
+                ])
+            })
+            .collect();
+        let leaves = snapshot
+            .leaves
+            .iter()
+            .map(|leaf| {
+                SqliteRow::new(vec![
+                    text(leaf.group_location.clone()),
+                    text(leaf.field_role.clone()),
+                    text(leaf.original_text.clone()),
+                    text(leaf.translation_context_json.clone()),
+                ])
+            })
+            .collect();
+        let targets = snapshot
+            .targets
+            .iter()
+            .map(|target| {
+                SqliteRow::new(vec![
+                    text(target.mutation_target.clone()),
+                    text(target.group_location.clone()),
+                ])
+            })
+            .collect();
+        StoredSnapshotRows {
+            owner_state: owner_state_rows(&[0xa5; 32], snapshot.fingerprint.as_bytes()),
+            groups,
+            leaves,
+            targets,
+        }
+    }
+
+    fn read_snapshot_rows(
+        connection: &Connection,
+        owner: RpgMakerStandardAssetOwner,
+    ) -> StoredSnapshotRows {
+        StoredSnapshotRows {
+            owner_state: read_rows(connection, READ_OWNER_STATE, owner, 2),
+            groups: read_rows(connection, READ_OWNER_GROUPS, owner, 3),
+            leaves: read_rows(connection, READ_OWNER_LEAVES, owner, 4),
+            targets: read_rows(connection, READ_OWNER_TARGETS, owner, 2),
+        }
+    }
+
+    fn read_rows(
+        connection: &Connection,
+        query: &str,
+        owner: RpgMakerStandardAssetOwner,
+        column_count: usize,
+    ) -> Vec<SqliteRow> {
+        let mut statement = connection.prepare(query).expect("快照查询应可准备");
+        let mut rows = statement
+            .query([owner.storage_name()])
+            .expect("快照查询应可执行");
+        let mut snapshot = Vec::new();
+        while let Some(row) = rows.next().expect("快照行应可读取") {
+            let values = (0..column_count)
+                .map(|column| {
+                    row.get::<_, RusqliteValue>(column)
+                        .map(sqlite_value_from_rusqlite)
+                        .expect("快照列应可读取")
+                })
+                .collect();
+            snapshot.push(SqliteRow::new(values));
+        }
+        snapshot
+    }
+
+    fn sqlite_value_from_rusqlite(value: RusqliteValue) -> SqliteValue {
+        match value {
+            RusqliteValue::Null => SqliteValue::Null,
+            RusqliteValue::Integer(value) => SqliteValue::Integer(value),
+            RusqliteValue::Real(value) => SqliteValue::Real(value),
+            RusqliteValue::Text(value) => SqliteValue::Text(value),
+            RusqliteValue::Blob(value) => SqliteValue::Blob(value),
+        }
+    }
+
     fn plan_statements(plan: &SqliteTransactionPlan) -> Vec<String> {
         plan.steps()
             .iter()
             .map(|step| match step {
                 SqliteTransactionStep::Execute(command) => command.statement().to_owned(),
-                SqliteTransactionStep::ExecuteMany(batch) => batch.statement().to_owned(),
+                SqliteTransactionStep::ExecuteMany(batch)
+                | SqliteTransactionStep::ExecuteManyExactlyOne(batch)
+                | SqliteTransactionStep::RequireNoRowsMany(batch) => batch.statement().to_owned(),
                 SqliteTransactionStep::RequireNoRows(query) => query.statement().to_owned(),
             })
             .collect()
@@ -2051,6 +2674,21 @@ mod tests {
                             .map_err(|error| error.to_string())?;
                     }
                 }
+                SqliteTransactionStep::ExecuteManyExactlyOne(batch) => {
+                    let mut statement = transaction
+                        .prepare(batch.statement())
+                        .map_err(|error| error.to_string())?;
+                    for parameters in batch.parameter_sets() {
+                        let affected = statement
+                            .execute(params_from_iter(parameters.iter().map(to_rusqlite_value)))
+                            .map_err(|error| error.to_string())?;
+                        if affected != 1 {
+                            return Err(format!(
+                                "exactly-one requirement failed: affected {affected} rows"
+                            ));
+                        }
+                    }
+                }
                 SqliteTransactionStep::RequireNoRows(query) => {
                     let mut statement = transaction
                         .prepare(query.statement())
@@ -2062,6 +2700,19 @@ mod tests {
                         .map_err(|error| error.to_string())?;
                     if rows.next().map_err(|error| error.to_string())?.is_some() {
                         return Err("requirement failed".to_owned());
+                    }
+                }
+                SqliteTransactionStep::RequireNoRowsMany(batch) => {
+                    let mut statement = transaction
+                        .prepare(batch.statement())
+                        .map_err(|error| error.to_string())?;
+                    for parameters in batch.parameter_sets() {
+                        let mut rows = statement
+                            .query(params_from_iter(parameters.iter().map(to_rusqlite_value)))
+                            .map_err(|error| error.to_string())?;
+                        if rows.next().map_err(|error| error.to_string())?.is_some() {
+                            return Err("requirement failed".to_owned());
+                        }
                     }
                 }
             }

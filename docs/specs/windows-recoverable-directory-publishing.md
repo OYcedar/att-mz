@@ -57,6 +57,14 @@ MZ WriteBack 声明 `{data, js}`；MV WriteBack 声明 `{www}`，并由 Host 把
 
 `DirectoryStageRequest` 包含目标、`CreateNew | ReplaceExisting`、来源映射、overlay 和空目录。所有候选路径必须是安全相对路径；来源、覆盖、空目录的重叠与预算在 prepare 前拒绝。
 
+prepare 先按来源目录项的 Windows UTF-16 稳定顺序建立确定性 manifest，再物化候选。
+manifest 固定完整来源清单、目录与文件物理身份、普通对象类型、文件大小、hardlink 状态、
+overlay 对应关系和替换后的完整树预算；每个 overlay 必须精确对应唯一的既有来源普通
+文件。物化时重新核对来源目录清单，并在处理每个文件前后复核其身份、大小和链接状态。
+未覆盖文件稳定读取来源字节、写入候选并 `sync_data`；被 overlay 覆盖的来源文件仍接受
+相同身份、类型、大小和预算约束，但不先复制原字节，最终 overlay 字节只建立、写入并
+`sync_data` 一次。
+
 prepare 取得同目标跨进程锁、恢复已知残留，并在 target 同父目录建立 stage。任一准备失败都统一返回 `NotPrepared`，同时保留目标、首因及可选候选清理失败。成功 token 不可复制，只能由同一 publisher 按值 `publish` 或 `discard`。stage、backup 和 journal 位于 target 同父目录以保证同卷切换；RPG Maker 映射的锁文件单独位于 `<projects.root>/.att-locks/directory-publish/<engine>/`。
 
 当前产品一次命令只拥有一个候选。树条目、深度、总字节、单文件和单目标恢复产物预算继续存在。

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(test)]
 use std::collections::{HashMap, VecDeque};
 #[cfg(test)]
@@ -2982,29 +2982,140 @@ fn build_candidate(
         empty_directories,
         &system_config.tree,
     )?;
-    let mut budget = TreeBudgetUsage::default();
+    // 先冻结确定性来源 manifest 和完整预算，再创建候选内容；覆盖文件只在物化时
+    // 写入最终字节一次，但仍与普通文件一样接受来源身份、类型和大小复核。
+    let manifest = build_candidate_manifest(
+        stage_root,
+        target_root,
+        source_mappings,
+        overlays,
+        empty_directories,
+        system_config,
+    )?;
+    materialize_candidate_manifest(stage_root, &manifest, overlays, system_config)
+}
+
+#[derive(Debug)]
+struct CandidateManifest {
+    operations: Vec<CandidateManifestOperation>,
+}
+
+#[derive(Debug)]
+enum CandidateManifestOperation {
+    EnsureDirectory(PathBuf),
+    CopySource {
+        relative_target: PathBuf,
+        directory: CandidateManifestDirectory,
+    },
+}
+
+#[derive(Debug)]
+struct CandidateManifestDirectory {
+    source: PathBuf,
+    expected_identity: FileIdentity,
+    entries: Vec<CandidateManifestEntry>,
+}
+
+#[derive(Debug)]
+struct CandidateManifestEntry {
+    name: OsString,
+    kind: CandidateManifestEntryKind,
+}
+
+#[derive(Debug)]
+enum CandidateManifestEntryKind {
+    Directory(CandidateManifestDirectory),
+    File(CandidateManifestFile),
+}
+
+#[derive(Debug)]
+struct CandidateManifestFile {
+    source: PathBuf,
+    expected_identity: FileIdentity,
+    observed_size: u64,
+    overlay_index: Option<usize>,
+}
+
+struct CandidateSourceEntry {
+    name: OsString,
+    wide_name: Vec<u16>,
+    physical_path: PathBuf,
+}
+
+struct CandidateOverlayLookup<'a> {
+    exact: BTreeMap<PathBuf, usize>,
+    overlays: &'a [DirectoryFileOverlay],
+}
+
+struct CandidateManifestObservation<'a> {
+    overlay_lookup: CandidateOverlayLookup<'a>,
+    matched_overlay_sizes: Vec<Option<u64>>,
+    budget: TreeBudgetUsage,
+    system_config: &'a SystemFileSystemConfig,
+}
+
+impl<'a> CandidateOverlayLookup<'a> {
+    fn new(overlays: &'a [DirectoryFileOverlay]) -> Self {
+        Self {
+            exact: overlays
+                .iter()
+                .enumerate()
+                .map(|(index, overlay)| (overlay.relative_file().to_path_buf(), index))
+                .collect(),
+            overlays,
+        }
+    }
+
+    fn find(&self, relative_file: &Path) -> Option<usize> {
+        self.exact.get(relative_file).copied().or_else(|| {
+            self.overlays.iter().position(|overlay| {
+                windows_relative_paths_equal(relative_file, overlay.relative_file())
+            })
+        })
+    }
+}
+
+fn build_candidate_manifest(
+    stage_root: &Path,
+    target_root: &Path,
+    source_mappings: &[DirectorySourceMapping],
+    overlays: &[DirectoryFileOverlay],
+    empty_directories: &[PathBuf],
+    system_config: &SystemFileSystemConfig,
+) -> Result<CandidateManifest, SystemFileSystemError> {
+    let mut operations = Vec::new();
+    let mut declared_directories = HashSet::new();
+    let mut observation = CandidateManifestObservation {
+        overlay_lookup: CandidateOverlayLookup::new(overlays),
+        matched_overlay_sizes: vec![None; overlays.len()],
+        budget: TreeBudgetUsage::default(),
+        system_config,
+    };
     for mapping in source_mappings {
         validate_relative_windows_path(mapping.relative_target())?;
         ensure_source_is_physically_disjoint(mapping.source_directory(), stage_root, target_root)?;
         if let Some(relative_parent) = mapping.relative_target().parent() {
-            ensure_empty_directory(
-                stage_root,
+            reserve_manifest_directories(
                 relative_parent,
-                &mut budget,
+                &mut declared_directories,
+                &mut operations,
+                &mut observation.budget,
                 &system_config.tree,
             )?;
         }
-        let destination = stage_root.join(mapping.relative_target());
-        copy_directory_tree(
+        let directory = observe_candidate_directory(
             mapping.source_directory(),
-            &destination,
+            mapping.relative_target(),
             None,
             mapping.relative_target().components().count(),
-            &mut budget,
-            system_config,
+            &mut observation,
         )?;
+        operations.push(CandidateManifestOperation::CopySource {
+            relative_target: mapping.relative_target().to_path_buf(),
+            directory,
+        });
     }
-    for overlay in overlays {
+    for (index, overlay) in overlays.iter().enumerate() {
         validate_relative_windows_path(overlay.relative_file())?;
         let depth = overlay.relative_file().components().count();
         if depth > system_config.tree.max_depth {
@@ -3021,26 +3132,32 @@ fn build_candidate(
                 observed: overlay.bytes().len() as u64,
             });
         }
-        let destination = stage_root.join(overlay.relative_file());
-        let mut pinned = open_read_write_file_without_reparse(&destination, false)?;
-        let metadata = pinned.metadata()?;
-        budget.replace_bytes(
-            metadata.len(),
+        let Some(original_size) = observation.matched_overlay_sizes[index] else {
+            let source_path = source_mappings
+                .iter()
+                .find_map(|mapping| {
+                    overlay
+                        .relative_file()
+                        .strip_prefix(mapping.relative_target())
+                        .ok()
+                        .map(|relative| mapping.source_directory().join(relative))
+                })
+                .expect("覆盖路径在请求边界已经确认属于唯一来源映射");
+            match pin_regular_file_for_snapshot_read(&source_path) {
+                Err(source) => return Err(source.into()),
+                Ok(_) => {
+                    return Err(SystemFileSystemError::InvalidPath {
+                        path: source_path,
+                        reason: "复制来源目录在 manifest 构建期间增加了覆盖目标",
+                    });
+                }
+            }
+        };
+        observation.budget.replace_bytes(
+            original_size,
             overlay.bytes().len() as u64,
             &system_config.tree,
         )?;
-        pinned
-            .file_mut()
-            .set_len(0)
-            .map_err(|source| io_error("截断覆盖目标", &destination, source))?;
-        pinned
-            .file_mut()
-            .write_all(overlay.bytes())
-            .map_err(|source| io_error("写入候选覆盖", &destination, source))?;
-        pinned
-            .file()
-            .sync_data()
-            .map_err(|source| io_error("同步候选覆盖", &destination, source))?;
     }
     for directory in empty_directories {
         validate_relative_windows_path(directory)?;
@@ -3052,9 +3169,299 @@ fn build_candidate(
                 observed: depth as u64,
             });
         }
-        ensure_empty_directory(stage_root, directory, &mut budget, &system_config.tree)?;
+        reserve_manifest_directories(
+            directory,
+            &mut declared_directories,
+            &mut operations,
+            &mut observation.budget,
+            &system_config.tree,
+        )?;
+    }
+    Ok(CandidateManifest { operations })
+}
+
+fn reserve_manifest_directories(
+    relative: &Path,
+    declared_directories: &mut HashSet<PathBuf>,
+    operations: &mut Vec<CandidateManifestOperation>,
+    budget: &mut TreeBudgetUsage,
+    config: &TreeBudget,
+) -> Result<(), SystemFileSystemError> {
+    let mut current = PathBuf::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            unreachable!("候选目录路径已经过结构校验")
+        };
+        current.push(name);
+        if declared_directories.insert(current.clone()) {
+            budget.add_entry(config)?;
+            operations.push(CandidateManifestOperation::EnsureDirectory(current.clone()));
+        }
     }
     Ok(())
+}
+
+fn observe_candidate_directory(
+    source: &Path,
+    relative: &Path,
+    expected_identity: Option<FileIdentity>,
+    depth: usize,
+    observation: &mut CandidateManifestObservation<'_>,
+) -> Result<CandidateManifestDirectory, SystemFileSystemError> {
+    let system_config = observation.system_config;
+    if depth > system_config.tree.max_depth {
+        return Err(SystemFileSystemError::ResourceLimit {
+            resource: "目录候选深度",
+            limit: system_config.tree.max_depth as u64,
+            observed: depth as u64,
+        });
+    }
+    let source_path = pin_directory_without_reparse(source)?;
+    let source_resolved = source_path.resolved_path().to_path_buf();
+    let source_identity = FileIdentity::of(source_path.file(), source)?;
+    if expected_identity.is_some_and(|expected| expected != source_identity) {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: source.to_path_buf(),
+            reason: "复制来源目录在枚举后物理身份发生变化",
+        });
+    }
+    observation.budget.add_entry(&system_config.tree)?;
+
+    let source_entries = read_candidate_source_entries(&source_resolved, system_config)?;
+    let mut entries = Vec::with_capacity(source_entries.len());
+    for entry in source_entries {
+        let child_source = entry.physical_path;
+        let child_relative = relative.join(&entry.name);
+        let pinned_child = pin_path_without_reparse(&child_source)?;
+        let metadata = pinned_child.metadata()?;
+        let child_identity = FileIdentity::of(pinned_child.file(), &child_source)?;
+        let kind = if metadata.is_dir() {
+            CandidateManifestEntryKind::Directory(observe_candidate_directory(
+                &child_source,
+                &child_relative,
+                Some(child_identity),
+                depth + 1,
+                observation,
+            )?)
+        } else if metadata.is_file() {
+            let observed_size = metadata.len();
+            if observed_size > system_config.tree.max_single_file_bytes {
+                return Err(SystemFileSystemError::ResourceLimit {
+                    resource: "目录候选单文件字节数",
+                    limit: system_config.tree.max_single_file_bytes,
+                    observed: observed_size,
+                });
+            }
+            observation.budget.add_entry(&system_config.tree)?;
+            if number_of_links(pinned_child.file(), &child_source)? != 1 {
+                return Err(SystemFileSystemError::InvalidPath {
+                    path: child_source,
+                    reason: "复制来源包含硬链接文件",
+                });
+            }
+            observation
+                .budget
+                .add_bytes(observed_size, &system_config.tree)?;
+            let overlay_index = observation.overlay_lookup.find(&child_relative);
+            if let Some(index) = overlay_index
+                && observation.matched_overlay_sizes[index]
+                    .replace(observed_size)
+                    .is_some()
+            {
+                return Err(SystemFileSystemError::InvalidPath {
+                    path: child_relative,
+                    reason: "同一候选覆盖匹配了多个来源文件",
+                });
+            }
+            CandidateManifestEntryKind::File(CandidateManifestFile {
+                source: child_source,
+                expected_identity: child_identity,
+                observed_size,
+                overlay_index,
+            })
+        } else {
+            return Err(SystemFileSystemError::InvalidPath {
+                path: child_source,
+                reason: "复制来源包含非普通文件对象",
+            });
+        };
+        entries.push(CandidateManifestEntry {
+            name: entry.name,
+            kind,
+        });
+    }
+    let after = pin_directory_without_reparse(source)?;
+    let after_identity = FileIdentity::of(after.file(), source)?;
+    let held_identity = FileIdentity::of(source_path.file(), source)?;
+    if after_identity != source_identity || held_identity != source_identity {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: source.to_path_buf(),
+            reason: "复制来源目录在枚举期间物理身份发生变化",
+        });
+    }
+    Ok(CandidateManifestDirectory {
+        source: source.to_path_buf(),
+        expected_identity: source_identity,
+        entries,
+    })
+}
+
+fn read_candidate_source_entries(
+    directory: &Path,
+    system_config: &SystemFileSystemConfig,
+) -> Result<Vec<CandidateSourceEntry>, SystemFileSystemError> {
+    let mut entries = Vec::new();
+    for entry in
+        fs::read_dir(directory).map_err(|source| io_error("列举复制来源", directory, source))?
+    {
+        if entries.len() == system_config.max_directory_entries {
+            return Err(SystemFileSystemError::ResourceLimit {
+                resource: "复制来源单目录条目数",
+                limit: system_config.max_directory_entries as u64,
+                observed: system_config.max_directory_entries as u64 + 1,
+            });
+        }
+        let entry = entry.map_err(|source| io_error("读取复制来源目录项", directory, source))?;
+        let name = entry.file_name();
+        entries.push(CandidateSourceEntry {
+            wide_name: name.encode_wide().collect(),
+            name,
+            physical_path: entry.path(),
+        });
+    }
+    entries.sort_by(|first, second| first.wide_name.cmp(&second.wide_name));
+    let mut names: Vec<&[u16]> = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        validate_windows_name(&entry.name, &entry.physical_path)?;
+        if names
+            .iter()
+            .any(|existing| windows_names_equal(existing, &entry.wide_name))
+        {
+            return Err(SystemFileSystemError::InvalidPath {
+                path: entry.physical_path.clone(),
+                reason: "同一目录包含 Windows 大小写等价名称",
+            });
+        }
+        names.push(&entry.wide_name);
+    }
+    Ok(entries)
+}
+
+fn materialize_candidate_manifest(
+    stage_root: &Path,
+    manifest: &CandidateManifest,
+    overlays: &[DirectoryFileOverlay],
+    system_config: &SystemFileSystemConfig,
+) -> Result<(), SystemFileSystemError> {
+    for operation in &manifest.operations {
+        match operation {
+            CandidateManifestOperation::EnsureDirectory(relative) => {
+                let path = stage_root.join(relative);
+                match fs::create_dir(&path) {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(source) => return Err(io_error("建立候选目录", &path, source)),
+                }
+                let _pinned = pin_directory_without_reparse(&path)?;
+            }
+            CandidateManifestOperation::CopySource {
+                relative_target,
+                directory,
+            } => materialize_candidate_directory(
+                directory,
+                &stage_root.join(relative_target),
+                overlays,
+                system_config,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+fn materialize_candidate_directory(
+    manifest: &CandidateManifestDirectory,
+    destination: &Path,
+    overlays: &[DirectoryFileOverlay],
+    system_config: &SystemFileSystemConfig,
+) -> Result<(), SystemFileSystemError> {
+    let source_path = pin_directory_without_reparse(&manifest.source)?;
+    let source_identity = FileIdentity::of(source_path.file(), &manifest.source)?;
+    if source_identity != manifest.expected_identity {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: manifest.source.clone(),
+            reason: "复制来源目录在 manifest 后物理身份发生变化",
+        });
+    }
+    validate_manifest_directory_entries(manifest, source_path.resolved_path(), system_config)?;
+    fs::create_dir(destination).map_err(|source| io_error("建立候选目录", destination, source))?;
+    let destination_path = pin_directory_without_reparse(destination)?;
+    let destination_resolved = destination_path.resolved_path().to_path_buf();
+
+    for entry in &manifest.entries {
+        let child_destination = destination_resolved.join(&entry.name);
+        match &entry.kind {
+            CandidateManifestEntryKind::Directory(directory) => {
+                materialize_candidate_directory(
+                    directory,
+                    &child_destination,
+                    overlays,
+                    system_config,
+                )?;
+            }
+            CandidateManifestEntryKind::File(file) => match file.overlay_index {
+                Some(index) => write_candidate_overlay(file, &child_destination, &overlays[index])?,
+                None => {
+                    copy_manifest_regular_file(file, &child_destination, &system_config.tree)?;
+                }
+            },
+        }
+    }
+    let after = pin_directory_without_reparse(&manifest.source)?;
+    let after_identity = FileIdentity::of(after.file(), &manifest.source)?;
+    let held_identity = FileIdentity::of(source_path.file(), &manifest.source)?;
+    if after_identity != manifest.expected_identity || held_identity != manifest.expected_identity {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: manifest.source.clone(),
+            reason: "复制来源目录在物化期间物理身份发生变化",
+        });
+    }
+    Ok(())
+}
+
+fn validate_manifest_directory_entries(
+    manifest: &CandidateManifestDirectory,
+    source_resolved: &Path,
+    system_config: &SystemFileSystemConfig,
+) -> Result<(), SystemFileSystemError> {
+    let current = read_candidate_source_entries(source_resolved, system_config)?;
+    if current.len() != manifest.entries.len()
+        || current
+            .iter()
+            .zip(&manifest.entries)
+            .any(|(current, expected)| current.name != expected.name)
+    {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: manifest.source.clone(),
+            reason: "复制来源目录在 manifest 后内容发生变化",
+        });
+    }
+    Ok(())
+}
+
+fn windows_relative_paths_equal(first: &Path, second: &Path) -> bool {
+    let mut first = first.components();
+    let mut second = second.components();
+    loop {
+        match (first.next(), second.next()) {
+            (None, None) => return true,
+            (Some(Component::Normal(first)), Some(Component::Normal(second)))
+                if windows_names_equal(
+                    &first.encode_wide().collect::<Vec<_>>(),
+                    &second.encode_wide().collect::<Vec<_>>(),
+                ) => {}
+            _ => return false,
+        }
+    }
 }
 
 fn validate_declared_windows_paths(
@@ -3307,107 +3714,119 @@ fn directory_ancestor_identities(path: &Path) -> Result<Vec<FileIdentity>, Syste
         .map_err(Into::into)
 }
 
-fn copy_directory_tree(
-    source: &Path,
-    destination: &Path,
-    expected_identity: Option<FileIdentity>,
-    depth: usize,
-    budget: &mut TreeBudgetUsage,
-    system_config: &SystemFileSystemConfig,
-) -> Result<(), SystemFileSystemError> {
-    if depth > system_config.tree.max_depth {
-        return Err(SystemFileSystemError::ResourceLimit {
-            resource: "目录候选深度",
-            limit: system_config.tree.max_depth as u64,
-            observed: depth as u64,
-        });
-    }
-    let source_path = pin_directory_without_reparse(source)?;
-    let source_resolved = source_path.resolved_path().to_path_buf();
-    let source_identity = FileIdentity::of(source_path.file(), source)?;
-    if expected_identity.is_some_and(|expected| expected != source_identity) {
+fn pin_manifest_regular_file(
+    manifest: &CandidateManifestFile,
+) -> Result<PinnedPath, SystemFileSystemError> {
+    let input = pin_regular_file_for_snapshot_read(&manifest.source)?;
+    let before = input.metadata()?;
+    if !before.is_file() {
         return Err(SystemFileSystemError::InvalidPath {
-            path: source.to_path_buf(),
-            reason: "复制来源目录在枚举后物理身份发生变化",
+            path: manifest.source.clone(),
+            reason: "复制来源不再是普通文件",
         });
     }
-    fs::create_dir(destination)
-        .map_err(|source_error| io_error("建立候选目录", destination, source_error))?;
-    let destination_path = pin_directory_without_reparse(destination)?;
-    let destination_resolved = destination_path.resolved_path().to_path_buf();
-    budget.add_entry(&system_config.tree)?;
+    let identity = FileIdentity::of(input.file(), &manifest.source)?;
+    if identity != manifest.expected_identity || before.len() != manifest.observed_size {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: manifest.source.clone(),
+            reason: "复制来源文件在枚举后身份或大小发生变化",
+        });
+    }
+    if number_of_links(input.file(), &manifest.source)? != 1 {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: manifest.source.clone(),
+            reason: "复制来源包含硬链接文件",
+        });
+    }
+    Ok(input)
+}
 
-    let mut names: Vec<Vec<u16>> = Vec::new();
-    let mut direct_entries = 0_usize;
-    for entry in fs::read_dir(&source_resolved)
-        .map_err(|source_error| io_error("列举复制来源", &source_resolved, source_error))?
+fn validate_materialized_source_file(
+    input: &PinnedPath,
+    manifest: &CandidateManifestFile,
+) -> Result<(), SystemFileSystemError> {
+    let after = input.metadata()?;
+    let after_identity = FileIdentity::of(input.file(), &manifest.source)?;
+    let after_links = number_of_links(input.file(), &manifest.source)?;
+    if after.len() != manifest.observed_size
+        || after_identity != manifest.expected_identity
+        || after_links != 1
     {
-        direct_entries += 1;
-        if direct_entries > system_config.max_directory_entries {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "复制来源单目录条目数",
-                limit: system_config.max_directory_entries as u64,
-                observed: direct_entries as u64,
-            });
-        }
-        let entry = entry.map_err(|source_error| {
-            io_error("读取复制来源目录项", &source_resolved, source_error)
-        })?;
-        let name = entry.file_name();
-        let child_source = entry.path();
-        validate_windows_name(&name, &child_source)?;
-        let wide: Vec<u16> = name.encode_wide().collect();
-        if names
-            .iter()
-            .any(|existing| windows_names_equal(existing, &wide))
-        {
-            return Err(SystemFileSystemError::InvalidPath {
-                path: child_source,
-                reason: "同一目录包含 Windows 大小写等价名称",
-            });
-        }
-        names.push(wide);
-        let child_destination = destination_resolved.join(&name);
-        let pinned_child = pin_path_without_reparse(&child_source)?;
-        let metadata = pinned_child.metadata()?;
-        let child_identity = FileIdentity::of(pinned_child.file(), &child_source)?;
-        if metadata.is_dir() {
-            copy_directory_tree(
-                &child_source,
-                &child_destination,
-                Some(child_identity),
-                depth + 1,
-                budget,
-                system_config,
-            )?;
-        } else if metadata.is_file() {
-            copy_regular_file(
-                &child_source,
-                &child_destination,
-                child_identity,
-                metadata.len(),
-                budget,
-                &system_config.tree,
-            )?;
-        } else {
-            return Err(SystemFileSystemError::InvalidPath {
-                path: child_source,
-                reason: "复制来源包含非普通文件对象",
-            });
-        }
-    }
-    let after = pin_directory_without_reparse(source)?;
-    let after_identity = FileIdentity::of(after.file(), source)?;
-    let held_identity = FileIdentity::of(source_path.file(), source)?;
-    if after_identity != source_identity || held_identity != source_identity {
         return Err(SystemFileSystemError::InvalidPath {
-            path: source.to_path_buf(),
-            reason: "复制来源目录在枚举期间物理身份发生变化",
+            path: manifest.source.clone(),
+            reason: "复制来源文件在稳定读取期间发生变化",
         });
     }
     Ok(())
 }
 
+fn copy_manifest_regular_file(
+    manifest: &CandidateManifestFile,
+    destination: &Path,
+    config: &TreeBudget,
+) -> Result<u64, SystemFileSystemError> {
+    let mut input = pin_manifest_regular_file(manifest)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|source| io_error("建立候选文件", destination, source))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        let read = input
+            .file_mut()
+            .read(&mut buffer)
+            .map_err(|source| io_error("读取复制来源文件", &manifest.source, source))?;
+        if read == 0 {
+            break;
+        }
+        copied = copied.saturating_add(read as u64);
+        if copied > config.max_single_file_bytes {
+            return Err(SystemFileSystemError::ResourceLimit {
+                resource: "目录候选单文件字节数",
+                limit: config.max_single_file_bytes,
+                observed: copied,
+            });
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|source| io_error("写入候选文件", destination, source))?;
+    }
+    validate_materialized_source_file(&input, manifest)?;
+    if copied != manifest.observed_size {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: manifest.source.clone(),
+            reason: "复制来源文件在稳定读取期间发生变化",
+        });
+    }
+    output
+        .sync_data()
+        .map_err(|source| io_error("同步候选文件", destination, source))?;
+    Ok(copied)
+}
+
+fn write_candidate_overlay(
+    manifest: &CandidateManifestFile,
+    destination: &Path,
+    overlay: &DirectoryFileOverlay,
+) -> Result<(), SystemFileSystemError> {
+    let input = pin_manifest_regular_file(manifest)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|source| io_error("建立候选覆盖", destination, source))?;
+    output
+        .write_all(overlay.bytes())
+        .map_err(|source| io_error("写入候选覆盖", destination, source))?;
+    output
+        .sync_data()
+        .map_err(|source| io_error("同步候选覆盖", destination, source))?;
+    validate_materialized_source_file(&input, manifest)
+}
+
+#[cfg(test)]
 fn copy_regular_file(
     source: &Path,
     destination: &Path,
@@ -3424,97 +3843,14 @@ fn copy_regular_file(
         });
     }
     budget.add_entry(config)?;
-    let mut input = pin_regular_file_for_snapshot_read(source)?;
-    let before = input.metadata()?;
-    if !before.is_file() {
-        return Err(SystemFileSystemError::InvalidPath {
-            path: source.to_path_buf(),
-            reason: "复制来源不再是普通文件",
-        });
-    }
-    let identity = FileIdentity::of(input.file(), source)?;
-    if identity != expected_identity || before.len() != observed_size {
-        return Err(SystemFileSystemError::InvalidPath {
-            path: source.to_path_buf(),
-            reason: "复制来源文件在枚举后身份或大小发生变化",
-        });
-    }
-    if number_of_links(input.file(), source)? != 1 {
-        return Err(SystemFileSystemError::InvalidPath {
-            path: source.to_path_buf(),
-            reason: "复制来源包含硬链接文件",
-        });
-    }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|source_error| io_error("建立候选文件", destination, source_error))?;
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut copied = 0_u64;
-    loop {
-        let read = input
-            .file_mut()
-            .read(&mut buffer)
-            .map_err(|source_error| io_error("读取复制来源文件", source, source_error))?;
-        if read == 0 {
-            break;
-        }
-        copied = copied.saturating_add(read as u64);
-        if copied > config.max_single_file_bytes {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "目录候选单文件字节数",
-                limit: config.max_single_file_bytes,
-                observed: copied,
-            });
-        }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|source_error| io_error("写入候选文件", destination, source_error))?;
-    }
-    let after = input.metadata()?;
-    let after_identity = FileIdentity::of(input.file(), source)?;
-    let after_links = number_of_links(input.file(), source)?;
-    if copied != observed_size
-        || after.len() != observed_size
-        || after_identity != expected_identity
-        || after_links != 1
-    {
-        return Err(SystemFileSystemError::InvalidPath {
-            path: source.to_path_buf(),
-            reason: "复制来源文件在稳定读取期间发生变化",
-        });
-    }
+    let manifest = CandidateManifestFile {
+        source: source.to_path_buf(),
+        expected_identity,
+        observed_size,
+        overlay_index: None,
+    };
+    let copied = copy_manifest_regular_file(&manifest, destination, config)?;
     budget.add_bytes(copied, config)?;
-    output
-        .sync_data()
-        .map_err(|source_error| io_error("同步候选文件", destination, source_error))?;
-    Ok(())
-}
-
-fn ensure_empty_directory(
-    stage_root: &Path,
-    relative: &Path,
-    budget: &mut TreeBudgetUsage,
-    config: &TreeBudget,
-) -> Result<(), SystemFileSystemError> {
-    let mut current = stage_root.to_path_buf();
-    let mut pinned_directories = Vec::new();
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            return Err(SystemFileSystemError::InvalidPath {
-                path: relative.to_path_buf(),
-                reason: "空目录路径包含非普通段",
-            });
-        };
-        current.push(name);
-        match fs::create_dir(&current) {
-            Ok(()) => budget.add_entry(config)?,
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => return Err(io_error("建立候选空目录", &current, source)),
-        }
-        pinned_directories.push(pin_directory_without_reparse(&current)?);
-    }
     Ok(())
 }
 
@@ -5370,6 +5706,179 @@ mod tests {
             }
         ));
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn overlay_aware_manifest_is_sorted_and_materializes_each_file_once() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        let stage = temporary.path().join("stage");
+        let target = temporary.path().join("target");
+        fs::create_dir(&source).expect("应该可建立来源目录");
+        fs::create_dir(&stage).expect("应该可建立候选目录");
+        fs::write(source.join("z.json"), b"untouched").expect("应该可建立未覆盖来源");
+        fs::write(source.join("catalog.json"), b"source bytes").expect("应该可建立待覆盖来源");
+        let mappings = vec![
+            DirectorySourceMapping::new(source, PathBuf::from("snapshot/content"))
+                .expect("测试来源映射应合法"),
+        ];
+        let overlays = vec![
+            DirectoryFileOverlay::new(
+                PathBuf::from("snapshot/content/catalog.json"),
+                b"translated".to_vec(),
+            )
+            .expect("测试覆盖应合法"),
+        ];
+        let config = file_system_config();
+
+        let manifest =
+            build_candidate_manifest(&stage, &target, &mappings, &overlays, &[], &config)
+                .expect("覆盖感知 manifest 应可建立");
+        let directory = manifest
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                CandidateManifestOperation::CopySource { directory, .. } => Some(directory),
+                CandidateManifestOperation::EnsureDirectory(_) => None,
+            })
+            .expect("manifest 应包含来源树");
+        assert_eq!(
+            directory
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>(),
+            [OsString::from("catalog.json"), OsString::from("z.json")]
+        );
+        let CandidateManifestEntryKind::File(catalog) = &directory.entries[0].kind else {
+            panic!("catalog 应为普通文件")
+        };
+        let CandidateManifestEntryKind::File(untouched) = &directory.entries[1].kind else {
+            panic!("z.json 应为普通文件")
+        };
+        assert_eq!(catalog.overlay_index, Some(0));
+        assert_eq!(untouched.overlay_index, None);
+
+        materialize_candidate_manifest(&stage, &manifest, &overlays, &config)
+            .expect("manifest 应可物化");
+        assert_eq!(
+            fs::read(stage.join("snapshot/content/catalog.json")).expect("应该可读取最终覆盖"),
+            b"translated"
+        );
+        assert_eq!(
+            fs::read(stage.join("snapshot/content/z.json")).expect("应该可读取未覆盖副本"),
+            b"untouched"
+        );
+    }
+
+    #[test]
+    fn overlay_source_identity_is_rechecked_before_the_single_write() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        let stage = temporary.path().join("stage");
+        let target = temporary.path().join("target");
+        fs::create_dir(&source).expect("应该可建立来源目录");
+        fs::create_dir(&stage).expect("应该可建立候选目录");
+        let observed = source.join("catalog.json");
+        let replacement = temporary.path().join("replacement.json");
+        fs::write(&observed, b"same bytes").expect("应该可建立原来源文件");
+        fs::write(&replacement, b"same bytes").expect("应该可建立替换文件");
+        let mappings = vec![
+            DirectorySourceMapping::new(source, PathBuf::from("content"))
+                .expect("测试来源映射应合法"),
+        ];
+        let overlays = vec![
+            DirectoryFileOverlay::new(
+                PathBuf::from("content/catalog.json"),
+                b"translated".to_vec(),
+            )
+            .expect("测试覆盖应合法"),
+        ];
+        let config = file_system_config();
+        let manifest =
+            build_candidate_manifest(&stage, &target, &mappings, &overlays, &[], &config)
+                .expect("manifest 应冻结枚举身份");
+        fs::remove_file(&observed).expect("应该可移除已枚举来源");
+        fs::rename(&replacement, &observed).expect("应该可换入同大小来源");
+
+        let error = materialize_candidate_manifest(&stage, &manifest, &overlays, &config)
+            .expect_err("覆盖来源身份变化必须阻止写入");
+        assert!(matches!(
+            error,
+            SystemFileSystemError::InvalidPath {
+                reason: "复制来源文件在枚举后身份或大小发生变化",
+                ..
+            }
+        ));
+        assert!(!stage.join("content/catalog.json").exists());
+    }
+
+    #[test]
+    fn overlay_source_still_obeys_source_file_limits_and_hardlink_rules() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let oversized_source = temporary.path().join("oversized-source");
+        let oversized_stage = temporary.path().join("oversized-stage");
+        fs::create_dir(&oversized_source).expect("应该可建立超限来源目录");
+        fs::create_dir(&oversized_stage).expect("应该可建立超限候选目录");
+        fs::write(
+            oversized_source.join("catalog.json"),
+            vec![0_u8; 512 * 1024 + 1],
+        )
+        .expect("应该可建立超限来源文件");
+        let oversized_mappings = vec![
+            DirectorySourceMapping::new(oversized_source, PathBuf::from("content"))
+                .expect("测试来源映射应合法"),
+        ];
+        let overlays = vec![
+            DirectoryFileOverlay::new(PathBuf::from("content/catalog.json"), vec![1])
+                .expect("测试覆盖应合法"),
+        ];
+        let config = file_system_config();
+        let error = build_candidate_manifest(
+            &oversized_stage,
+            &temporary.path().join("oversized-target"),
+            &oversized_mappings,
+            &overlays,
+            &[],
+            &config,
+        )
+        .expect_err("覆盖不能绕过来源单文件大小上限");
+        assert!(matches!(
+            error,
+            SystemFileSystemError::ResourceLimit {
+                resource: "目录候选单文件字节数",
+                ..
+            }
+        ));
+
+        let hardlink_source = temporary.path().join("hardlink-source");
+        let hardlink_stage = temporary.path().join("hardlink-stage");
+        fs::create_dir(&hardlink_source).expect("应该可建立硬链接来源目录");
+        fs::create_dir(&hardlink_stage).expect("应该可建立硬链接候选目录");
+        let linked = hardlink_source.join("catalog.json");
+        fs::write(&linked, b"source").expect("应该可建立硬链接来源文件");
+        fs::hard_link(&linked, temporary.path().join("external-link.json"))
+            .expect("本地 NTFS 测试目录应该支持硬链接");
+        let hardlink_mappings = vec![
+            DirectorySourceMapping::new(hardlink_source, PathBuf::from("content"))
+                .expect("测试来源映射应合法"),
+        ];
+        let error = build_candidate_manifest(
+            &hardlink_stage,
+            &temporary.path().join("hardlink-target"),
+            &hardlink_mappings,
+            &overlays,
+            &[],
+            &config,
+        )
+        .expect_err("覆盖不能绕过来源硬链接拒绝");
+        assert!(matches!(
+            error,
+            SystemFileSystemError::InvalidPath {
+                reason: "复制来源包含硬链接文件",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

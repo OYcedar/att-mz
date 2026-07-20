@@ -130,8 +130,12 @@ pub(crate) enum SqliteTransactionStep {
     Execute(SqliteCommand),
     /// 只准备一次语句，按顺序执行全部参数组。
     ExecuteMany(SqliteBatch),
+    /// 只准备一次语句，按顺序执行全部参数组，每组必须恰好修改一行。
+    ExecuteManyExactlyOne(SqliteBatch),
     /// 查询必须不返回任何行，否则事务在后续步骤之前失败并回滚。
     RequireNoRows(SqliteQuery),
+    /// 只准备一次查询，按顺序校验全部参数组均不返回任何行。
+    RequireNoRowsMany(SqliteBatch),
 }
 
 /// 必须在同一个连接和写事务中顺序执行的完整计划。
@@ -250,7 +254,7 @@ impl<E: Error + 'static> Error for QueryExistingDatabaseError<E> {
 pub(crate) enum ExecuteTransactionError<E> {
     /// 目标主数据库文件不存在；实现没有创建文件。
     NotFound,
-    /// 指定事务条件命中了至少一行；整个事务已回滚。
+    /// 指定事务条件未满足；整个事务已回滚。
     RequirementFailed,
     /// 事务未提交，驱动确认其修改均未生效。
     NotCommitted(E),
@@ -311,8 +315,9 @@ pub(crate) trait SqliteDatabaseSnapshotter: Send + Sync {
 
 /// 只读查询一个必须已经存在的 SQLite 数据库。
 ///
-/// 实现不得因数据库缺失而创建主文件；查询完成后不向调用方泄漏连接、statement
-/// 或行游标。返回的 Future 必须为 `Send`，且不得阻塞异步执行器线程。
+/// 实现不得因数据库缺失而创建主文件；多查询快照必须在同一个连接和只读事务中按
+/// 输入顺序执行。查询完成后不向调用方泄漏连接、statement 或行游标。返回的 Future
+/// 必须为 `Send`，且不得阻塞异步执行器线程。
 pub(crate) trait SqliteQueryExecutor: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
@@ -321,12 +326,23 @@ pub(crate) trait SqliteQueryExecutor: Send + Sync {
         path: PathBuf,
         query: SqliteQuery,
     ) -> impl Future<Output = Result<Vec<SqliteRow>, QueryExistingDatabaseError<Self::Error>>> + Send;
+
+    /// 在同一个只读事务快照中按顺序执行多条查询。
+    ///
+    /// 返回结果与输入查询一一对应。一次快照必须包含一至四条查询；每条查询独立受到
+    /// 现有单查询资源预算约束，因此整组资源占用最多为该预算的四倍。
+    fn query_existing_database_snapshot(
+        &self,
+        path: PathBuf,
+        queries: Vec<SqliteQuery>,
+    ) -> impl Future<Output = Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>>> + Send;
 }
 
 /// 在现存数据库中执行一个拥有型事务计划。
 ///
-/// 实现以单一连接和写事务按顺序执行全部步骤。`ExecuteMany` 只准备一次语句；
-/// `RequireNoRows` 命中时必须在执行后续步骤前回滚。实现完整拥有连接、TEMP 对象、
+/// 实现以单一连接和写事务按顺序执行全部步骤。批量步骤只准备一次语句；
+/// `RequireNoRows` / `RequireNoRowsMany` 命中或 `ExecuteManyExactlyOne`
+/// 的参数组影响行数不为一时，必须在执行后续步骤前回滚。实现完整拥有连接、TEMP 对象、
 /// statement、回滚、关闭、并发预算和背压，不向调用方暴露这些机制。Future 必须
 /// 为 `Send` 且不得阻塞异步执行器线程；事务开始后，调用方必须等待到明确终态。
 pub(crate) trait SqliteTransactionExecutor: Send + Sync {

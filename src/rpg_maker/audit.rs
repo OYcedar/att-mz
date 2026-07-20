@@ -3,15 +3,18 @@
 //! 本模块拥有审计事件语义和稳定 JSON wire；通用 JSONL Runtime 只负责按物理顺序
 //! 追加、刷盘、轮转与恢复完整记录，不理解 RPG Maker 项目、命令或位置。
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
+use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::value::RawValue;
 use uuid::Uuid;
 
 use crate::llm::LlmUsage;
@@ -410,18 +413,62 @@ enum AuditEventKindWire {
     RunFinished,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct AuditEnvelopeWire<P> {
-    recorded_at_utc: String,
-    event_id: String,
-    run_id: String,
+#[derive(Serialize)]
+struct AuditEnvelopeWriteWire<'a, P> {
+    recorded_at_utc: &'a str,
+    event_id: DisplayWriteWire<EventId>,
+    run_id: DisplayWriteWire<RunId>,
     engine: RpgMakerEngineWire,
-    project: String,
+    project: &'a str,
     command: AuditCommandWire,
-    profile: Option<String>,
+    profile: Option<&'a str>,
     event: AuditEventKindWire,
     payload: P,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditEnvelopeProbe<'a> {
+    recorded_at_utc: &'a str,
+    event_id: &'a str,
+    run_id: &'a str,
+    engine: RpgMakerEngineWire,
+    #[serde(borrow)]
+    project: Cow<'a, str>,
+    command: AuditCommandWire,
+    #[serde(borrow)]
+    profile: Option<Cow<'a, str>>,
+    event: AuditEventKindWire,
+    #[serde(borrow)]
+    payload: &'a RawValue,
+}
+
+#[derive(Serialize)]
+struct AuditEnvelopeRawWire<'a> {
+    recorded_at_utc: &'a str,
+    event_id: &'a str,
+    run_id: &'a str,
+    engine: RpgMakerEngineWire,
+    project: &'a str,
+    command: AuditCommandWire,
+    profile: Option<&'a str>,
+    event: AuditEventKindWire,
+    payload: &'a RawValue,
+}
+
+#[derive(Clone, Copy)]
+struct DisplayWriteWire<T>(T);
+
+impl<T> Serialize for DisplayWriteWire<T>
+where
+    T: fmt::Display,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(&self.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -491,6 +538,12 @@ struct TranslationTaskStartedPayloadWire {
     task_index: usize,
 }
 
+#[derive(Serialize)]
+struct TranslationTaskStartedPayloadWriteWire {
+    operation_id: DisplayWriteWire<OperationId>,
+    task_index: usize,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TranslationTaskFinishedPayloadWire {
@@ -507,11 +560,51 @@ enum TranslationTaskResultWire {
     ExecutionFailed { task_index: usize },
 }
 
+#[derive(Serialize)]
+struct TranslationTaskFinishedPayloadWriteWire<'a> {
+    operation_id: DisplayWriteWire<OperationId>,
+    result: TranslationTaskResultWriteWire<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TranslationTaskResultWriteWire<'a> {
+    Completed { task: TranslationTaskWriteWire<'a> },
+    CommitFailed { task: TranslationTaskWriteWire<'a> },
+    NotCommitted { task: TranslationTaskWriteWire<'a> },
+    ExecutionFailed { task_index: usize },
+}
+
+impl<'a> From<&'a TranslationTaskAuditResult> for TranslationTaskResultWriteWire<'a> {
+    fn from(result: &'a TranslationTaskAuditResult) -> Self {
+        match result {
+            TranslationTaskAuditResult::Completed(task) => Self::Completed {
+                task: TranslationTaskWriteWire::new(task, true),
+            },
+            TranslationTaskAuditResult::CommitFailed(task) => Self::CommitFailed {
+                task: TranslationTaskWriteWire::new(task, false),
+            },
+            TranslationTaskAuditResult::NotCommitted(task) => Self::NotCommitted {
+                task: TranslationTaskWriteWire::new(task, false),
+            },
+            TranslationTaskAuditResult::ExecutionFailed { task_index } => Self::ExecutionFailed {
+                task_index: task_index.get(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WriteBackPublishStartedPayloadWire {
     operation_id: String,
     output_root: String,
+}
+
+#[derive(Serialize)]
+struct WriteBackPublishStartedPayloadWriteWire<'a> {
+    operation_id: DisplayWriteWire<OperationId>,
+    output_root: &'a str,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -545,6 +638,76 @@ enum WriteBackPublishResultWire {
     },
 }
 
+#[derive(Serialize)]
+struct WriteBackPublishFinishedPayloadWriteWire<'a> {
+    operation_id: DisplayWriteWire<OperationId>,
+    result: WriteBackPublishResultWriteWire<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WriteBackPublishResultWriteWire<'a> {
+    Published {
+        write_back: WriteBackPayloadWriteWire<'a>,
+    },
+    NotPublished {
+        output_root: &'a str,
+        residual_paths: PathsWriteWire<'a>,
+    },
+    PublishedWithResiduals {
+        output_root: &'a str,
+        residual_paths: PathsWriteWire<'a>,
+    },
+    RecoveryRequired {
+        output_root: &'a str,
+        recovery_artifacts: PathsWriteWire<'a>,
+    },
+    OutcomeUnknown {
+        output_root: &'a str,
+        recovery_artifacts: PathsWriteWire<'a>,
+    },
+}
+
+impl<'a> TryFrom<&'a WriteBackPublishAuditResult> for WriteBackPublishResultWriteWire<'a> {
+    type Error = String;
+
+    fn try_from(result: &'a WriteBackPublishAuditResult) -> Result<Self, Self::Error> {
+        match result {
+            WriteBackPublishAuditResult::Published(event) => Ok(Self::Published {
+                write_back: WriteBackPayloadWriteWire::try_from(event)?,
+            }),
+            WriteBackPublishAuditResult::NotPublished {
+                output_root,
+                residual_paths,
+            } => Ok(Self::NotPublished {
+                output_root: output_root_text_ref(output_root)?,
+                residual_paths: PathsWriteWire(residual_paths),
+            }),
+            WriteBackPublishAuditResult::PublishedWithResiduals {
+                output_root,
+                residual_paths,
+            } => Ok(Self::PublishedWithResiduals {
+                output_root: output_root_text_ref(output_root)?,
+                residual_paths: PathsWriteWire(residual_paths),
+            }),
+            WriteBackPublishAuditResult::RecoveryRequired {
+                output_root,
+                recovery_artifacts,
+            } => Ok(Self::RecoveryRequired {
+                output_root: output_root_text_ref(output_root)?,
+                recovery_artifacts: PathsWriteWire(recovery_artifacts),
+            }),
+            WriteBackPublishAuditResult::OutcomeUnknown {
+                output_root,
+                recovery_artifacts,
+            } => Ok(Self::OutcomeUnknown {
+                output_root: output_root_text_ref(output_root)?,
+                recovery_artifacts: PathsWriteWire(recovery_artifacts),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TranslationTaskWire {
@@ -562,45 +725,253 @@ struct TranslationTaskWire {
     diagnostics: Vec<ProtocolDiagnosticWire>,
 }
 
-impl TranslationTaskWire {
-    fn from_record(record: &TranslationTaskLogRecord) -> Self {
-        Self {
-            task_index: record.task_index().get(),
-            status: TranslationTaskStatusWire::from(record),
-            attempts: record.attempts().get(),
-            provider_request_id: record.provider_request_id().map(str::to_owned),
-            provider_response_id: record.provider_response_id().map(str::to_owned),
-            finish_reason: record.finish_reason().map(str::to_owned),
-            final_response_usage: record.final_response_usage().map(LlmUsageWire::from),
-            accepted_decisions: record.accepted_decisions(),
-            confirmed_written_leaves: None,
-            accepted: record
+#[derive(Serialize)]
+struct TranslationTaskWriteWire<'a> {
+    task_index: usize,
+    status: TranslationTaskStatusWriteWire<'a>,
+    attempts: usize,
+    provider_request_id: Option<&'a str>,
+    provider_response_id: Option<&'a str>,
+    finish_reason: Option<&'a str>,
+    final_response_usage: Option<LlmUsageWire>,
+    accepted_decisions: usize,
+    confirmed_written_leaves: Option<usize>,
+    accepted: AcceptedTranslationsWriteWire<'a>,
+    unresolved: UnresolvedTranslationsWriteWire<'a>,
+    diagnostics: ProtocolDiagnosticsWriteWire<'a>,
+}
+
+impl<'a> TranslationTaskWriteWire<'a> {
+    fn new(record: &'a TranslationTaskLogRecord, committed: bool) -> Self {
+        let confirmed_written_leaves = committed.then(|| {
+            record
                 .accepted()
                 .iter()
-                .map(AcceptedTranslationWire::from)
-                .collect(),
-            unresolved: record
-                .unresolved()
-                .iter()
-                .map(UnresolvedTranslationWire::from)
-                .collect(),
-            diagnostics: record
-                .diagnostics()
-                .iter()
-                .map(ProtocolDiagnosticWire::from)
-                .collect(),
+                .map(|accepted| 1 + accepted.propagation_targets().len())
+                .sum()
+        });
+        Self {
+            task_index: record.task_index().get(),
+            status: TranslationTaskStatusWriteWire::from(record),
+            attempts: record.attempts().get(),
+            provider_request_id: record.provider_request_id(),
+            provider_response_id: record.provider_response_id(),
+            finish_reason: record.finish_reason(),
+            final_response_usage: record.final_response_usage().map(LlmUsageWire::from),
+            accepted_decisions: record.accepted_decisions(),
+            confirmed_written_leaves,
+            accepted: AcceptedTranslationsWriteWire(record.accepted()),
+            unresolved: UnresolvedTranslationsWriteWire(record.unresolved()),
+            diagnostics: ProtocolDiagnosticsWriteWire(record.diagnostics()),
         }
     }
+}
 
-    fn from_confirmed_record(record: &TranslationTaskLogRecord) -> Self {
-        let mut wire = Self::from_record(record);
-        wire.confirmed_written_leaves = Some(
-            wire.accepted
-                .iter()
-                .map(|accepted| 1 + accepted.propagation_targets.len())
-                .sum(),
-        );
-        wire
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TranslationTaskStatusWriteWire<'a> {
+    Complete,
+    Partial,
+    Unavailable {
+        reason: TranslationTaskUnavailableReasonWriteWire<'a>,
+    },
+}
+
+impl<'a> From<&'a TranslationTaskLogRecord> for TranslationTaskStatusWriteWire<'a> {
+    fn from(record: &'a TranslationTaskLogRecord) -> Self {
+        match record {
+            TranslationTaskLogRecord::Complete { .. } => Self::Complete,
+            TranslationTaskLogRecord::Partial { .. } => Self::Partial,
+            TranslationTaskLogRecord::Unavailable { reason, .. } => Self::Unavailable {
+                reason: TranslationTaskUnavailableReasonWriteWire::from(reason),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TranslationTaskUnavailableReasonWriteWire<'a> {
+    ModelResponseUnusable,
+    AllOutputsRejected,
+    RecoverableRequestExhausted {
+        message: &'a str,
+    },
+    RetryAfterExceedsConfiguredMaximum {
+        retry_after_ms: u128,
+        maximum_ms: u128,
+        message: &'a str,
+    },
+}
+
+impl<'a> From<&'a TranslationTaskUnavailableReason>
+    for TranslationTaskUnavailableReasonWriteWire<'a>
+{
+    fn from(reason: &'a TranslationTaskUnavailableReason) -> Self {
+        match reason {
+            TranslationTaskUnavailableReason::ModelResponseUnusable => Self::ModelResponseUnusable,
+            TranslationTaskUnavailableReason::AllOutputsRejected => Self::AllOutputsRejected,
+            TranslationTaskUnavailableReason::RecoverableRequestExhausted { message } => {
+                Self::RecoverableRequestExhausted { message }
+            }
+            TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
+                retry_after,
+                maximum,
+                message,
+            } => Self::RetryAfterExceedsConfiguredMaximum {
+                retry_after_ms: retry_after.as_millis(),
+                maximum_ms: maximum.as_millis(),
+                message,
+            },
+        }
+    }
+}
+
+struct AcceptedTranslationsWriteWire<'a>(&'a [LoggedAcceptedTranslationDecision]);
+
+impl Serialize for AcceptedTranslationsWriteWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for decision in self.0 {
+            sequence.serialize_element(&AcceptedTranslationWriteWire::from(decision))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct AcceptedTranslationWriteWire<'a> {
+    id: usize,
+    leader: LogicalTextLocationWriteWire<'a>,
+    propagation_targets: LogicalTextLocationsWriteWire<'a>,
+}
+
+impl<'a> From<&'a LoggedAcceptedTranslationDecision> for AcceptedTranslationWriteWire<'a> {
+    fn from(decision: &'a LoggedAcceptedTranslationDecision) -> Self {
+        Self {
+            id: decision.id(),
+            leader: LogicalTextLocationWriteWire::from(decision.leader()),
+            propagation_targets: LogicalTextLocationsWriteWire(decision.propagation_targets()),
+        }
+    }
+}
+
+struct UnresolvedTranslationsWriteWire<'a>(&'a [LoggedUnresolvedTranslationUnit]);
+
+impl Serialize for UnresolvedTranslationsWriteWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for unit in self.0 {
+            sequence.serialize_element(&UnresolvedTranslationWriteWire::from(unit))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct UnresolvedTranslationWriteWire<'a> {
+    id: usize,
+    locations: LogicalTextLocationsWriteWire<'a>,
+    reason: TranslationUnitRejectionReasonWriteWire<'a>,
+}
+
+impl<'a> From<&'a LoggedUnresolvedTranslationUnit> for UnresolvedTranslationWriteWire<'a> {
+    fn from(unit: &'a LoggedUnresolvedTranslationUnit) -> Self {
+        Self {
+            id: unit.id(),
+            locations: LogicalTextLocationsWriteWire(unit.locations()),
+            reason: TranslationUnitRejectionReasonWriteWire::from(unit.reason()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TranslationUnitRejectionReasonWriteWire<'a> {
+    Missing,
+    Duplicate,
+    InvalidShape { message: &'a str },
+    BlankTranslation,
+    InvalidSpeakerText,
+    NoNaturalLanguageText,
+    ContainsByteOrderMark,
+    PlaceholderMismatch { token: &'a str },
+    UnexpectedPlaceholderToken { token: &'a str },
+    PlaceholderNormalizationAmbiguous { original: &'a str },
+    SourceResidual { fragment: &'a str },
+}
+
+impl<'a> From<&'a TranslationUnitRejectionReason> for TranslationUnitRejectionReasonWriteWire<'a> {
+    fn from(reason: &'a TranslationUnitRejectionReason) -> Self {
+        match reason {
+            TranslationUnitRejectionReason::Missing => Self::Missing,
+            TranslationUnitRejectionReason::Duplicate => Self::Duplicate,
+            TranslationUnitRejectionReason::InvalidShape { message } => {
+                Self::InvalidShape { message }
+            }
+            TranslationUnitRejectionReason::BlankTranslation => Self::BlankTranslation,
+            TranslationUnitRejectionReason::InvalidSpeakerText => Self::InvalidSpeakerText,
+            TranslationUnitRejectionReason::NoNaturalLanguageText => Self::NoNaturalLanguageText,
+            TranslationUnitRejectionReason::ContainsByteOrderMark => Self::ContainsByteOrderMark,
+            TranslationUnitRejectionReason::PlaceholderMismatch { token } => {
+                Self::PlaceholderMismatch { token }
+            }
+            TranslationUnitRejectionReason::UnexpectedPlaceholderToken { token } => {
+                Self::UnexpectedPlaceholderToken { token }
+            }
+            TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { original } => {
+                Self::PlaceholderNormalizationAmbiguous { original }
+            }
+            TranslationUnitRejectionReason::SourceResidual { fragment } => {
+                Self::SourceResidual { fragment }
+            }
+        }
+    }
+}
+
+struct ProtocolDiagnosticsWriteWire<'a>(&'a [TranslationProtocolDiagnostic]);
+
+impl Serialize for ProtocolDiagnosticsWriteWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for diagnostic in self.0 {
+            sequence.serialize_element(&ProtocolDiagnosticWriteWire::from(diagnostic))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ProtocolDiagnosticWriteWire<'a> {
+    NonStopFinish { reason: &'a str },
+    InvalidResponse { message: &'a str },
+    UnknownId { item_index: usize, id: usize },
+}
+
+impl<'a> From<&'a TranslationProtocolDiagnostic> for ProtocolDiagnosticWriteWire<'a> {
+    fn from(diagnostic: &'a TranslationProtocolDiagnostic) -> Self {
+        match diagnostic {
+            TranslationProtocolDiagnostic::NonStopFinish { reason } => {
+                Self::NonStopFinish { reason }
+            }
+            TranslationProtocolDiagnostic::InvalidResponse { message } => {
+                Self::InvalidResponse { message }
+            }
+            TranslationProtocolDiagnostic::UnknownId { item_index, id } => Self::UnknownId {
+                item_index: *item_index,
+                id: *id,
+            },
+        }
     }
 }
 
@@ -612,18 +983,6 @@ enum TranslationTaskStatusWire {
     Unavailable {
         reason: TranslationTaskUnavailableReasonWire,
     },
-}
-
-impl From<&TranslationTaskLogRecord> for TranslationTaskStatusWire {
-    fn from(record: &TranslationTaskLogRecord) -> Self {
-        match record {
-            TranslationTaskLogRecord::Complete { .. } => Self::Complete,
-            TranslationTaskLogRecord::Partial { .. } => Self::Partial,
-            TranslationTaskLogRecord::Unavailable { reason, .. } => Self::Unavailable {
-                reason: TranslationTaskUnavailableReasonWire::from(reason),
-            },
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -639,29 +998,6 @@ enum TranslationTaskUnavailableReasonWire {
         maximum_ms: u128,
         message: String,
     },
-}
-
-impl From<&TranslationTaskUnavailableReason> for TranslationTaskUnavailableReasonWire {
-    fn from(reason: &TranslationTaskUnavailableReason) -> Self {
-        match reason {
-            TranslationTaskUnavailableReason::ModelResponseUnusable => Self::ModelResponseUnusable,
-            TranslationTaskUnavailableReason::AllOutputsRejected => Self::AllOutputsRejected,
-            TranslationTaskUnavailableReason::RecoverableRequestExhausted { message } => {
-                Self::RecoverableRequestExhausted {
-                    message: message.clone(),
-                }
-            }
-            TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
-                retry_after,
-                maximum,
-                message,
-            } => Self::RetryAfterExceedsConfiguredMaximum {
-                retry_after_ms: retry_after.as_millis(),
-                maximum_ms: maximum.as_millis(),
-                message: message.clone(),
-            },
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -690,40 +1026,12 @@ struct AcceptedTranslationWire {
     propagation_targets: Vec<LogicalTextLocationWire>,
 }
 
-impl From<&LoggedAcceptedTranslationDecision> for AcceptedTranslationWire {
-    fn from(decision: &LoggedAcceptedTranslationDecision) -> Self {
-        Self {
-            id: decision.id(),
-            leader: LogicalTextLocationWire::from(decision.leader()),
-            propagation_targets: decision
-                .propagation_targets()
-                .iter()
-                .map(LogicalTextLocationWire::from)
-                .collect(),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct UnresolvedTranslationWire {
     id: usize,
     locations: Vec<LogicalTextLocationWire>,
     reason: TranslationUnitRejectionReasonWire,
-}
-
-impl From<&LoggedUnresolvedTranslationUnit> for UnresolvedTranslationWire {
-    fn from(unit: &LoggedUnresolvedTranslationUnit) -> Self {
-        Self {
-            id: unit.id(),
-            locations: unit
-                .locations()
-                .iter()
-                .map(LogicalTextLocationWire::from)
-                .collect(),
-            reason: TranslationUnitRejectionReasonWire::from(unit.reason()),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -742,63 +1050,12 @@ enum TranslationUnitRejectionReasonWire {
     SourceResidual { fragment: String },
 }
 
-impl From<&TranslationUnitRejectionReason> for TranslationUnitRejectionReasonWire {
-    fn from(reason: &TranslationUnitRejectionReason) -> Self {
-        match reason {
-            TranslationUnitRejectionReason::Missing => Self::Missing,
-            TranslationUnitRejectionReason::Duplicate => Self::Duplicate,
-            TranslationUnitRejectionReason::InvalidShape { message } => Self::InvalidShape {
-                message: message.clone(),
-            },
-            TranslationUnitRejectionReason::BlankTranslation => Self::BlankTranslation,
-            TranslationUnitRejectionReason::InvalidSpeakerText => Self::InvalidSpeakerText,
-            TranslationUnitRejectionReason::NoNaturalLanguageText => Self::NoNaturalLanguageText,
-            TranslationUnitRejectionReason::ContainsByteOrderMark => Self::ContainsByteOrderMark,
-            TranslationUnitRejectionReason::PlaceholderMismatch { token } => {
-                Self::PlaceholderMismatch {
-                    token: token.clone(),
-                }
-            }
-            TranslationUnitRejectionReason::UnexpectedPlaceholderToken { token } => {
-                Self::UnexpectedPlaceholderToken {
-                    token: token.clone(),
-                }
-            }
-            TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { original } => {
-                Self::PlaceholderNormalizationAmbiguous {
-                    original: original.clone(),
-                }
-            }
-            TranslationUnitRejectionReason::SourceResidual { fragment } => Self::SourceResidual {
-                fragment: fragment.clone(),
-            },
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ProtocolDiagnosticWire {
     NonStopFinish { reason: String },
     InvalidResponse { message: String },
     UnknownId { item_index: usize, id: usize },
-}
-
-impl From<&TranslationProtocolDiagnostic> for ProtocolDiagnosticWire {
-    fn from(diagnostic: &TranslationProtocolDiagnostic) -> Self {
-        match diagnostic {
-            TranslationProtocolDiagnostic::NonStopFinish { reason } => Self::NonStopFinish {
-                reason: reason.clone(),
-            },
-            TranslationProtocolDiagnostic::InvalidResponse { message } => Self::InvalidResponse {
-                message: message.clone(),
-            },
-            TranslationProtocolDiagnostic::UnknownId { item_index, id } => Self::UnknownId {
-                item_index: *item_index,
-                id: *id,
-            },
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -811,20 +1068,27 @@ struct WriteBackPayloadWire {
     manual_layout_diagnostics: Vec<ManualLayoutDiagnosticWire>,
 }
 
-impl TryFrom<&WriteBackRunLog> for WriteBackPayloadWire {
+#[derive(Serialize)]
+struct WriteBackPayloadWriteWire<'a> {
+    layout_profile: LayoutProfileWire,
+    output_root: &'a str,
+    lua_executed: bool,
+    summary: WriteBackSummaryWire,
+    manual_layout_diagnostics: ManualLayoutDiagnosticsWriteWire<'a>,
+}
+
+impl<'a> TryFrom<&'a WriteBackRunLog> for WriteBackPayloadWriteWire<'a> {
     type Error = String;
 
-    fn try_from(event: &WriteBackRunLog) -> Result<Self, Self::Error> {
+    fn try_from(event: &'a WriteBackRunLog) -> Result<Self, Self::Error> {
         Ok(Self {
             layout_profile: LayoutProfileWire::from(event.layout_profile()),
-            output_root: output_root_text(event.output_root())?,
+            output_root: output_root_text_ref(event.output_root())?,
             lua_executed: event.lua_executed(),
             summary: WriteBackSummaryWire::from(event.summary()),
-            manual_layout_diagnostics: event
-                .manual_layout_diagnostics()
-                .iter()
-                .map(ManualLayoutDiagnosticWire::from)
-                .collect(),
+            manual_layout_diagnostics: ManualLayoutDiagnosticsWriteWire(
+                event.manual_layout_diagnostics(),
+            ),
         })
     }
 }
@@ -879,26 +1143,44 @@ struct ManualLayoutDiagnosticWire {
     max_fullwidth_chars: u32,
 }
 
-impl From<&ManualLayoutDiagnostic> for ManualLayoutDiagnosticWire {
-    fn from(diagnostic: &ManualLayoutDiagnostic) -> Self {
-        Self {
-            locations: diagnostic
-                .locations()
-                .iter()
-                .map(LogicalTextLocationWire::from)
-                .collect(),
-            region: LayoutRegionWire::from(diagnostic.region()),
-            max_fullwidth_chars: diagnostic.max_fullwidth_chars().get(),
-        }
-    }
-}
-
 impl ManualLayoutDiagnosticWire {
     fn validate(&self) -> Result<(), String> {
         if self.locations.is_empty() {
             return Err("人工布局诊断必须关联至少一个逻辑文本位置".to_owned());
         }
         Ok(())
+    }
+}
+
+struct ManualLayoutDiagnosticsWriteWire<'a>(&'a [ManualLayoutDiagnostic]);
+
+impl Serialize for ManualLayoutDiagnosticsWriteWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for diagnostic in self.0 {
+            sequence.serialize_element(&ManualLayoutDiagnosticWriteWire::from(diagnostic))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct ManualLayoutDiagnosticWriteWire<'a> {
+    locations: LogicalTextLocationsWriteWire<'a>,
+    region: LayoutRegionWire,
+    max_fullwidth_chars: u32,
+}
+
+impl<'a> From<&'a ManualLayoutDiagnostic> for ManualLayoutDiagnosticWriteWire<'a> {
+    fn from(diagnostic: &'a ManualLayoutDiagnostic) -> Self {
+        Self {
+            locations: LogicalTextLocationsWriteWire(diagnostic.locations()),
+            region: LayoutRegionWire::from(diagnostic.region()),
+            max_fullwidth_chars: diagnostic.max_fullwidth_chars().get(),
+        }
     }
 }
 
@@ -948,15 +1230,6 @@ struct LogicalTextLocationWire {
     field_role: TextFieldRoleWire,
 }
 
-impl From<&LogicalTextLocation> for LogicalTextLocationWire {
-    fn from(location: &LogicalTextLocation) -> Self {
-        Self {
-            group_location: RpgMakerLocationWire::from(location.group_location()),
-            field_role: TextFieldRoleWire::from(location.role()),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum TextFieldRoleWire {
@@ -964,58 +1237,6 @@ enum TextFieldRoleWire {
     DialogueSpeaker,
     DialogueBody { index: usize },
     ScrollingTextBody { index: usize },
-}
-
-impl From<&TextFieldRole> for TextFieldRoleWire {
-    fn from(role: &TextFieldRole) -> Self {
-        match role {
-            TextFieldRole::Scalar(field) => Self::Scalar {
-                field: field.as_str().to_owned(),
-            },
-            TextFieldRole::DialogueSpeaker => Self::DialogueSpeaker,
-            TextFieldRole::DialogueBody { index } => Self::DialogueBody { index: *index },
-            TextFieldRole::ScrollingTextBody { index } => Self::ScrollingTextBody { index: *index },
-        }
-    }
-}
-
-impl From<&RpgMakerLocation> for RpgMakerLocationWire {
-    fn from(location: &RpgMakerLocation) -> Self {
-        match location {
-            RpgMakerLocation::Value { source, steps } => Self::Value {
-                source: RpgMakerSourceWire::from(source),
-                steps: steps.iter().map(RpgMakerLocationStepWire::from).collect(),
-            },
-            RpgMakerLocation::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => Self::NoteTag {
-                source: RpgMakerSourceWire::from(source),
-                container_steps: container_steps
-                    .iter()
-                    .map(RpgMakerLocationStepWire::from)
-                    .collect(),
-                tag_name: tag_name.clone(),
-                occurrence: *occurrence,
-            },
-            RpgMakerLocation::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => Self::CommentTag {
-                source: RpgMakerSourceWire::from(source),
-                command_steps: command_steps
-                    .iter()
-                    .map(RpgMakerLocationStepWire::from)
-                    .collect(),
-                tag_name: tag_name.clone(),
-                occurrence: *occurrence,
-            },
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1034,29 +1255,6 @@ enum RpgMakerSourceWire {
     },
 }
 
-impl From<&RpgMakerSource> for RpgMakerSourceWire {
-    fn from(source: &RpgMakerSource) -> Self {
-        match source {
-            RpgMakerSource::Data(file) => Self::Data {
-                file: file.file_name().to_owned(),
-            },
-            RpgMakerSource::DataFile(file) => Self::Data {
-                file: file.as_str().to_owned(),
-            },
-            RpgMakerSource::Map(map_id) => Self::Map { map_id: *map_id },
-            RpgMakerSource::PluginParameter {
-                plugin_index,
-                plugin_name,
-                parameter_name,
-            } => Self::PluginParameter {
-                plugin_index: *plugin_index,
-                plugin_name: plugin_name.clone(),
-                parameter_name: parameter_name.clone(),
-            },
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RpgMakerLocationStepWire {
@@ -1065,24 +1263,204 @@ enum RpgMakerLocationStepWire {
     DecodeJsonString,
 }
 
-impl From<&RpgMakerLocationStep> for RpgMakerLocationStepWire {
-    fn from(step: &RpgMakerLocationStep) -> Self {
+struct LogicalTextLocationsWriteWire<'a>(&'a [LogicalTextLocation]);
+
+impl Serialize for LogicalTextLocationsWriteWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for location in self.0 {
+            sequence.serialize_element(&LogicalTextLocationWriteWire::from(location))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct LogicalTextLocationWriteWire<'a> {
+    group_location: RpgMakerLocationWriteWire<'a>,
+    field_role: TextFieldRoleWriteWire<'a>,
+}
+
+impl<'a> From<&'a LogicalTextLocation> for LogicalTextLocationWriteWire<'a> {
+    fn from(location: &'a LogicalTextLocation) -> Self {
+        Self {
+            group_location: RpgMakerLocationWriteWire::from(location.group_location()),
+            field_role: TextFieldRoleWriteWire::from(location.role()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TextFieldRoleWriteWire<'a> {
+    Scalar { field: &'a str },
+    DialogueSpeaker,
+    DialogueBody { index: usize },
+    ScrollingTextBody { index: usize },
+}
+
+impl<'a> From<&'a TextFieldRole> for TextFieldRoleWriteWire<'a> {
+    fn from(role: &'a TextFieldRole) -> Self {
+        match role {
+            TextFieldRole::Scalar(field) => Self::Scalar {
+                field: field.as_str(),
+            },
+            TextFieldRole::DialogueSpeaker => Self::DialogueSpeaker,
+            TextFieldRole::DialogueBody { index } => Self::DialogueBody { index: *index },
+            TextFieldRole::ScrollingTextBody { index } => Self::ScrollingTextBody { index: *index },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RpgMakerLocationWriteWire<'a> {
+    Value {
+        source: RpgMakerSourceWriteWire<'a>,
+        steps: RpgMakerLocationStepsWriteWire<'a>,
+    },
+    NoteTag {
+        source: RpgMakerSourceWriteWire<'a>,
+        container_steps: RpgMakerLocationStepsWriteWire<'a>,
+        tag_name: &'a str,
+        occurrence: usize,
+    },
+    CommentTag {
+        source: RpgMakerSourceWriteWire<'a>,
+        command_steps: RpgMakerLocationStepsWriteWire<'a>,
+        tag_name: &'a str,
+        occurrence: usize,
+    },
+}
+
+impl<'a> From<&'a RpgMakerLocation> for RpgMakerLocationWriteWire<'a> {
+    fn from(location: &'a RpgMakerLocation) -> Self {
+        match location {
+            RpgMakerLocation::Value { source, steps } => Self::Value {
+                source: RpgMakerSourceWriteWire::from(source),
+                steps: RpgMakerLocationStepsWriteWire(steps),
+            },
+            RpgMakerLocation::NoteTag {
+                source,
+                container_steps,
+                tag_name,
+                occurrence,
+            } => Self::NoteTag {
+                source: RpgMakerSourceWriteWire::from(source),
+                container_steps: RpgMakerLocationStepsWriteWire(container_steps),
+                tag_name,
+                occurrence: *occurrence,
+            },
+            RpgMakerLocation::CommentTag {
+                source,
+                command_steps,
+                tag_name,
+                occurrence,
+            } => Self::CommentTag {
+                source: RpgMakerSourceWriteWire::from(source),
+                command_steps: RpgMakerLocationStepsWriteWire(command_steps),
+                tag_name,
+                occurrence: *occurrence,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RpgMakerSourceWriteWire<'a> {
+    Data {
+        file: &'a str,
+    },
+    Map {
+        map_id: u32,
+    },
+    PluginParameter {
+        plugin_index: usize,
+        plugin_name: &'a str,
+        parameter_name: &'a str,
+    },
+}
+
+impl<'a> From<&'a RpgMakerSource> for RpgMakerSourceWriteWire<'a> {
+    fn from(source: &'a RpgMakerSource) -> Self {
+        match source {
+            RpgMakerSource::Data(file) => Self::Data {
+                file: file.file_name(),
+            },
+            RpgMakerSource::DataFile(file) => Self::Data {
+                file: file.as_str(),
+            },
+            RpgMakerSource::Map(map_id) => Self::Map { map_id: *map_id },
+            RpgMakerSource::PluginParameter {
+                plugin_index,
+                plugin_name,
+                parameter_name,
+            } => Self::PluginParameter {
+                plugin_index: *plugin_index,
+                plugin_name,
+                parameter_name,
+            },
+        }
+    }
+}
+
+struct RpgMakerLocationStepsWriteWire<'a>(&'a [RpgMakerLocationStep]);
+
+impl Serialize for RpgMakerLocationStepsWriteWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for step in self.0 {
+            sequence.serialize_element(&RpgMakerLocationStepWriteWire::from(step))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RpgMakerLocationStepWriteWire<'a> {
+    ObjectKey { key: &'a str },
+    ArrayIndex { index: usize },
+    DecodeJsonString,
+}
+
+impl<'a> From<&'a RpgMakerLocationStep> for RpgMakerLocationStepWriteWire<'a> {
+    fn from(step: &'a RpgMakerLocationStep) -> Self {
         match step {
-            RpgMakerLocationStep::ObjectKey(key) => Self::ObjectKey { key: key.clone() },
+            RpgMakerLocationStep::ObjectKey(key) => Self::ObjectKey { key },
             RpgMakerLocationStep::ArrayIndex(index) => Self::ArrayIndex { index: *index },
             RpgMakerLocationStep::DecodeJsonString => Self::DecodeJsonString,
         }
     }
 }
 
-fn output_root_text(path: &Path) -> Result<String, String> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| "写回输出路径无法无损表示为 UTF-8".to_owned())
+struct PathsWriteWire<'a>(&'a [PathBuf]);
+
+impl Serialize for PathsWriteWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for path in self.0 {
+            let path =
+                output_root_text_ref(path).map_err(<S::Error as serde::ser::Error>::custom)?;
+            sequence.serialize_element(path)?;
+        }
+        sequence.end()
+    }
 }
 
-fn output_root_texts(paths: &[PathBuf]) -> Result<Vec<String>, String> {
-    paths.iter().map(|path| output_root_text(path)).collect()
+fn output_root_text_ref(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| "写回输出路径无法无损表示为 UTF-8".to_owned())
 }
 
 fn validate_uuid_v4(value: &str, field: &str) -> Result<(), String> {
@@ -1128,11 +1506,48 @@ fn validate_recorded_at_utc(value: &str) -> Result<(), String> {
 }
 
 fn validate_canonical_wire(bytes: &[u8], wire: &impl Serialize) -> Result<(), String> {
-    let canonical = serde_json::to_vec(wire).map_err(|error| error.to_string())?;
-    if canonical != bytes {
+    let mut comparison = CanonicalCompareWriter::new(bytes);
+    serde_json::to_writer(&mut comparison, wire).map_err(|error| error.to_string())?;
+    if !comparison.matches() {
         return Err("记录不是当前紧凑 UTF-8 wire".to_owned());
     }
     Ok(())
+}
+
+struct CanonicalCompareWriter<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    mismatch: bool,
+}
+
+impl<'a> CanonicalCompareWriter<'a> {
+    const fn new(expected: &'a [u8]) -> Self {
+        Self {
+            expected,
+            offset: 0,
+            mismatch: false,
+        }
+    }
+
+    fn matches(&self) -> bool {
+        !self.mismatch && self.offset == self.expected.len()
+    }
+}
+
+impl Write for CanonicalCompareWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let expected = self.expected.get(self.offset..).unwrap_or_default();
+        let compared_length = expected.len().min(bytes.len());
+        if expected[..compared_length] != bytes[..compared_length] || bytes.len() > expected.len() {
+            self.mismatch = true;
+        }
+        self.offset = self.offset.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 trait AuditPayloadValidation {
@@ -1241,29 +1656,30 @@ impl AuditPayloadValidation for WriteBackPublishFinishedPayloadWire {
 
 fn validate_payload<P>(
     bytes: &[u8],
+    probe: &AuditEnvelopeProbe<'_>,
     expected_event: AuditEventKindWire,
     expected_command: Option<AuditCommandWire>,
 ) -> Result<(), String>
 where
     P: AuditPayloadValidation + DeserializeOwned + Serialize,
 {
-    let wire: AuditEnvelopeWire<P> =
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-    if wire.event != expected_event {
+    let payload: P =
+        serde_json::from_str(probe.payload.get()).map_err(|error| error.to_string())?;
+    if probe.event != expected_event {
         return Err("审计事件类型与 payload 不一致".to_owned());
     }
-    if expected_command.is_some_and(|command| command != wire.command) {
+    if expected_command.is_some_and(|command| command != probe.command) {
         return Err("审计事件不属于当前命令".to_owned());
     }
-    validate_recorded_at_utc(&wire.recorded_at_utc)?;
-    validate_uuid_v4(&wire.event_id, "event_id")?;
-    validate_uuid_v4(&wire.run_id, "run_id")?;
-    if wire.project.trim().is_empty() {
+    validate_recorded_at_utc(probe.recorded_at_utc)?;
+    validate_uuid_v4(probe.event_id, "event_id")?;
+    validate_uuid_v4(probe.run_id, "run_id")?;
+    if probe.project.trim().is_empty() {
         return Err("project 不能为空".to_owned());
     }
-    match wire.command {
+    match probe.command {
         AuditCommandWire::Translate => {
-            if wire
+            if probe
                 .profile
                 .as_deref()
                 .is_none_or(|value| value.trim().is_empty())
@@ -1272,186 +1688,157 @@ where
             }
         }
         AuditCommandWire::Init | AuditCommandWire::Extract | AuditCommandWire::WriteBack => {
-            if wire.profile.is_some() {
+            if probe.profile.is_some() {
                 return Err("非 Translate 审计记录不得携带 profile".to_owned());
             }
         }
     }
-    wire.payload.validate()?;
-    validate_canonical_wire(bytes, &wire)
+    payload.validate()?;
+    validate_canonical_wire(probe.payload.get().as_bytes(), &payload)?;
+    validate_canonical_wire(
+        bytes,
+        &AuditEnvelopeRawWire {
+            recorded_at_utc: probe.recorded_at_utc,
+            event_id: probe.event_id,
+            run_id: probe.run_id,
+            engine: probe.engine,
+            project: probe.project.as_ref(),
+            command: probe.command,
+            profile: probe.profile.as_deref(),
+            event: probe.event,
+            payload: probe.payload,
+        },
+    )
+}
+
+fn serialize_audit_envelope<P>(
+    context: &AuditContext,
+    event_id: EventId,
+    recorded_at_utc: &str,
+    event: AuditEventKindWire,
+    payload: P,
+    output: &mut Vec<u8>,
+) -> Result<(), String>
+where
+    P: Serialize,
+{
+    serde_json::to_writer(
+        output,
+        &AuditEnvelopeWriteWire {
+            recorded_at_utc,
+            event_id: DisplayWriteWire(event_id),
+            run_id: DisplayWriteWire(context.run_id()),
+            engine: context.engine().into(),
+            project: context.project(),
+            command: context.command().into(),
+            profile: context.profile(),
+            event,
+            payload,
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
 impl JsonLineRecord for AuditRecord {
-    fn serialize(self, recorded_at_utc: String) -> Result<Vec<u8>, String> {
-        macro_rules! envelope {
-            ($event:expr, $payload:expr) => {
-                AuditEnvelopeWire {
-                    recorded_at_utc: recorded_at_utc.clone(),
-                    event_id: self.event_id.to_string(),
-                    run_id: self.context.run_id().to_string(),
-                    engine: self.context.engine().into(),
-                    project: self.context.project().to_owned(),
-                    command: self.context.command().into(),
-                    profile: self.context.profile().map(str::to_owned),
-                    event: $event,
-                    payload: $payload,
-                }
-            };
-        }
-        match self.event {
-            AuditEvent::RunStarted => serde_json::to_vec(&envelope!(
+    fn serialize_into(self, recorded_at_utc: &str, output: &mut Vec<u8>) -> Result<(), String> {
+        match &self.event {
+            AuditEvent::RunStarted => serialize_audit_envelope(
+                &self.context,
+                self.event_id,
+                recorded_at_utc,
                 AuditEventKindWire::RunStarted,
-                EmptyPayloadWire::default()
-            )),
-            AuditEvent::RunFinished { outcome } => serde_json::to_vec(&envelope!(
+                EmptyPayloadWire::default(),
+                output,
+            ),
+            AuditEvent::RunFinished { outcome } => serialize_audit_envelope(
+                &self.context,
+                self.event_id,
+                recorded_at_utc,
                 AuditEventKindWire::RunFinished,
                 RunFinishedPayloadWire {
-                    outcome: outcome.into(),
-                }
-            )),
+                    outcome: (*outcome).into(),
+                },
+                output,
+            ),
             AuditEvent::TranslationTaskStarted {
                 operation_id,
                 task_index,
-            } => serde_json::to_vec(&envelope!(
+            } => serialize_audit_envelope(
+                &self.context,
+                self.event_id,
+                recorded_at_utc,
                 AuditEventKindWire::TranslationTaskStarted,
-                TranslationTaskStartedPayloadWire {
-                    operation_id: operation_id.to_string(),
+                TranslationTaskStartedPayloadWriteWire {
+                    operation_id: DisplayWriteWire(*operation_id),
                     task_index: task_index.get(),
-                }
-            )),
+                },
+                output,
+            ),
             AuditEvent::TranslationTaskFinished {
                 operation_id,
                 result,
-            } => {
-                let result = match result {
-                    TranslationTaskAuditResult::Completed(task) => {
-                        TranslationTaskResultWire::Completed {
-                            task: TranslationTaskWire::from_confirmed_record(&task),
-                        }
-                    }
-                    TranslationTaskAuditResult::CommitFailed(task) => {
-                        TranslationTaskResultWire::CommitFailed {
-                            task: TranslationTaskWire::from_record(&task),
-                        }
-                    }
-                    TranslationTaskAuditResult::NotCommitted(task) => {
-                        TranslationTaskResultWire::NotCommitted {
-                            task: TranslationTaskWire::from_record(&task),
-                        }
-                    }
-                    TranslationTaskAuditResult::ExecutionFailed { task_index } => {
-                        TranslationTaskResultWire::ExecutionFailed {
-                            task_index: task_index.get(),
-                        }
-                    }
-                };
-                serde_json::to_vec(&envelope!(
-                    AuditEventKindWire::TranslationTaskFinished,
-                    TranslationTaskFinishedPayloadWire {
-                        operation_id: operation_id.to_string(),
-                        result,
-                    }
-                ))
-            }
+            } => serialize_audit_envelope(
+                &self.context,
+                self.event_id,
+                recorded_at_utc,
+                AuditEventKindWire::TranslationTaskFinished,
+                TranslationTaskFinishedPayloadWriteWire {
+                    operation_id: DisplayWriteWire(*operation_id),
+                    result: TranslationTaskResultWriteWire::from(result),
+                },
+                output,
+            ),
             AuditEvent::WriteBackPublishStarted {
                 operation_id,
                 output_root,
-            } => serde_json::to_vec(&envelope!(
+            } => serialize_audit_envelope(
+                &self.context,
+                self.event_id,
+                recorded_at_utc,
                 AuditEventKindWire::WriteBackPublishStarted,
-                WriteBackPublishStartedPayloadWire {
-                    operation_id: operation_id.to_string(),
-                    output_root: output_root_text(&output_root)?,
-                }
-            )),
+                WriteBackPublishStartedPayloadWriteWire {
+                    operation_id: DisplayWriteWire(*operation_id),
+                    output_root: output_root_text_ref(output_root)?,
+                },
+                output,
+            ),
             AuditEvent::WriteBackPublishFinished {
                 operation_id,
                 result,
-            } => {
-                let result = match result {
-                    WriteBackPublishAuditResult::Published(event) => {
-                        WriteBackPublishResultWire::Published {
-                            write_back: WriteBackPayloadWire::try_from(&event)?,
-                        }
-                    }
-                    WriteBackPublishAuditResult::NotPublished {
-                        output_root,
-                        residual_paths,
-                    } => WriteBackPublishResultWire::NotPublished {
-                        output_root: output_root_text(&output_root)?,
-                        residual_paths: output_root_texts(&residual_paths)?,
-                    },
-                    WriteBackPublishAuditResult::PublishedWithResiduals {
-                        output_root,
-                        residual_paths,
-                    } => WriteBackPublishResultWire::PublishedWithResiduals {
-                        output_root: output_root_text(&output_root)?,
-                        residual_paths: output_root_texts(&residual_paths)?,
-                    },
-                    WriteBackPublishAuditResult::RecoveryRequired {
-                        output_root,
-                        recovery_artifacts,
-                    } => WriteBackPublishResultWire::RecoveryRequired {
-                        output_root: output_root_text(&output_root)?,
-                        recovery_artifacts: output_root_texts(&recovery_artifacts)?,
-                    },
-                    WriteBackPublishAuditResult::OutcomeUnknown {
-                        output_root,
-                        recovery_artifacts,
-                    } => WriteBackPublishResultWire::OutcomeUnknown {
-                        output_root: output_root_text(&output_root)?,
-                        recovery_artifacts: output_root_texts(&recovery_artifacts)?,
-                    },
-                };
-                serde_json::to_vec(&envelope!(
-                    AuditEventKindWire::WriteBackPublishFinished,
-                    WriteBackPublishFinishedPayloadWire {
-                        operation_id: operation_id.to_string(),
-                        result,
-                    }
-                ))
-            }
+            } => serialize_audit_envelope(
+                &self.context,
+                self.event_id,
+                recorded_at_utc,
+                AuditEventKindWire::WriteBackPublishFinished,
+                WriteBackPublishFinishedPayloadWriteWire {
+                    operation_id: DisplayWriteWire(*operation_id),
+                    result: WriteBackPublishResultWriteWire::try_from(result)?,
+                },
+                output,
+            ),
         }
-        .map_err(|error| error.to_string())
     }
 
     fn validate(bytes: &[u8]) -> Result<(), String> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Probe {
-            recorded_at_utc: Value,
-            event_id: Value,
-            run_id: Value,
-            engine: Value,
-            project: Value,
-            command: Value,
-            profile: Value,
-            event: AuditEventKindWire,
-            payload: Value,
-        }
-
-        let probe: Probe = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-        let _ = (
-            probe.recorded_at_utc,
-            probe.event_id,
-            probe.run_id,
-            probe.engine,
-            probe.project,
-            probe.command,
-            probe.profile,
-            probe.payload,
-        );
+        let probe: AuditEnvelopeProbe<'_> =
+            serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         match probe.event {
-            AuditEventKindWire::RunStarted => {
-                validate_payload::<EmptyPayloadWire>(bytes, AuditEventKindWire::RunStarted, None)
-            }
+            AuditEventKindWire::RunStarted => validate_payload::<EmptyPayloadWire>(
+                bytes,
+                &probe,
+                AuditEventKindWire::RunStarted,
+                None,
+            ),
             AuditEventKindWire::RunFinished => validate_payload::<RunFinishedPayloadWire>(
                 bytes,
+                &probe,
                 AuditEventKindWire::RunFinished,
                 None,
             ),
             AuditEventKindWire::TranslationTaskStarted => {
                 validate_payload::<TranslationTaskStartedPayloadWire>(
                     bytes,
+                    &probe,
                     AuditEventKindWire::TranslationTaskStarted,
                     Some(AuditCommandWire::Translate),
                 )
@@ -1459,6 +1846,7 @@ impl JsonLineRecord for AuditRecord {
             AuditEventKindWire::TranslationTaskFinished => {
                 validate_payload::<TranslationTaskFinishedPayloadWire>(
                     bytes,
+                    &probe,
                     AuditEventKindWire::TranslationTaskFinished,
                     Some(AuditCommandWire::Translate),
                 )
@@ -1466,6 +1854,7 @@ impl JsonLineRecord for AuditRecord {
             AuditEventKindWire::WriteBackPublishStarted => {
                 validate_payload::<WriteBackPublishStartedPayloadWire>(
                     bytes,
+                    &probe,
                     AuditEventKindWire::WriteBackPublishStarted,
                     Some(AuditCommandWire::WriteBack),
                 )
@@ -1473,6 +1862,7 @@ impl JsonLineRecord for AuditRecord {
             AuditEventKindWire::WriteBackPublishFinished => {
                 validate_payload::<WriteBackPublishFinishedPayloadWire>(
                     bytes,
+                    &probe,
                     AuditEventKindWire::WriteBackPublishFinished,
                     Some(AuditCommandWire::WriteBack),
                 )
@@ -1483,12 +1873,19 @@ impl JsonLineRecord for AuditRecord {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::time::Duration;
 
     use serde_json::{Value, json};
     use tempfile::tempdir;
 
     use super::*;
+    use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
+    use crate::rpg_maker::text::TextGroupKind;
+    use crate::rpg_maker::translate::standard::{
+        NonEmptyTaskItems, TranslationLeafIdentity, TranslationTaskOutcome,
+        TranslationTaskOutcomeContext, UnresolvedTranslationUnit,
+    };
 
     fn run_id() -> RunId {
         RunId::from_uuid(Uuid::from_u128(0x550e_8400_e29b_41d4_a716_4466_5544_0000))
@@ -1497,6 +1894,129 @@ mod tests {
     fn config() -> JsonLinesStreamConfig {
         JsonLinesStreamConfig::new(8, Duration::from_secs(1), 16_384, 65_536, 2)
             .expect("测试账本配置应合法")
+    }
+
+    #[test]
+    fn borrowed_writer_preserves_the_exact_audit_wire() {
+        let event_id =
+            EventId::from_uuid(Uuid::from_u128(0x550e_8400_e29b_41d4_a716_4466_5544_0001));
+        let operation_id =
+            OperationId::from_uuid(Uuid::from_u128(0x550e_8400_e29b_41d4_a716_4466_5544_0002));
+        let record = AuditRecord {
+            context: Arc::new(AuditContext::translate(
+                run_id(),
+                RpgMakerEngine::Mv,
+                "demo",
+                "quality",
+            )),
+            event_id,
+            event: AuditEvent::TranslationTaskStarted {
+                operation_id,
+                task_index: StandardTranslationTaskIndex::new(3),
+            },
+        };
+        let mut bytes = Vec::new();
+
+        record
+            .serialize_into("2026-07-20T12:34:56.789Z", &mut bytes)
+            .expect("借用 wire 应可直接写入 worker 缓冲");
+
+        let expected = r#"{"recorded_at_utc":"2026-07-20T12:34:56.789Z","event_id":"550e8400-e29b-41d4-a716-446655440001","run_id":"550e8400-e29b-41d4-a716-446655440000","engine":"mv","project":"demo","command":"translate","profile":"quality","event":"translation_task_started","payload":{"operation_id":"550e8400-e29b-41d4-a716-446655440002","task_index":3}}"#;
+        assert_eq!(bytes, expected.as_bytes());
+        AuditRecord::validate(&bytes).expect("固定 wire 应通过强类型校验");
+
+        let noncanonical_payload = expected.replacen("\"payload\":{", "\"payload\":{ ", 1);
+        assert_eq!(
+            AuditRecord::validate(noncanonical_payload.as_bytes())
+                .expect_err("payload 内部空白不得绕过规范 wire 校验"),
+            "记录不是当前紧凑 UTF-8 wire"
+        );
+    }
+
+    #[test]
+    fn canonical_comparison_rejects_short_long_and_middle_differences() {
+        let wire = json!({ "value": 7 });
+        validate_canonical_wire(br#"{"value":7}"#, &wire).expect("完全相同的 wire 应通过");
+        for candidate in [
+            br#"{"value":7"#.as_slice(),
+            br#"{"value":7} "#.as_slice(),
+            br#"{"value":8}"#.as_slice(),
+        ] {
+            assert_eq!(
+                validate_canonical_wire(candidate, &wire).expect_err("字节差异必须被拒绝"),
+                "记录不是当前紧凑 UTF-8 wire"
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_translation_payload_matches_the_strict_owned_wire_model() {
+        let task_index = StandardTranslationTaskIndex::new(4);
+        let identity = TranslationLeafIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventDialogue,
+            RpgMakerLocation::value(
+                RpgMakerSource::map(2),
+                vec![
+                    RpgMakerLocationStep::key("events"),
+                    RpgMakerLocationStep::index(7),
+                ],
+            ),
+            TextFieldRole::DialogueBody { index: 1 },
+            "原文",
+            r#"{"speaker":null}"#,
+        );
+        let outcome = TranslationTaskOutcome::Unavailable {
+            context: TranslationTaskOutcomeContext::new(
+                task_index,
+                NonZeroUsize::new(2).expect("测试尝试次数应非零"),
+                vec![TranslationProtocolDiagnostic::InvalidResponse {
+                    message: "响应形状错误".to_owned(),
+                }],
+            ),
+            final_response: None,
+            reason: TranslationTaskUnavailableReason::RecoverableRequestExhausted {
+                message: "上游暂时不可用".to_owned(),
+            },
+            unresolved: NonEmptyTaskItems::new(
+                UnresolvedTranslationUnit::new(
+                    9,
+                    identity,
+                    Vec::new(),
+                    TranslationUnitRejectionReason::InvalidShape {
+                        message: "缺少 translation".to_owned(),
+                    },
+                ),
+                Vec::new(),
+            ),
+        };
+        let record = AuditRecord {
+            context: Arc::new(AuditContext::translate(
+                run_id(),
+                RpgMakerEngine::Mz,
+                "demo",
+                "quality",
+            )),
+            event_id: EventId::from_uuid(Uuid::from_u128(
+                0x550e_8400_e29b_41d4_a716_4466_5544_0001,
+            )),
+            event: AuditEvent::TranslationTaskFinished {
+                operation_id: OperationId::from_uuid(Uuid::from_u128(
+                    0x550e_8400_e29b_41d4_a716_4466_5544_0002,
+                )),
+                result: TranslationTaskAuditResult::Completed(
+                    TranslationTaskLogRecord::from_outcome(outcome),
+                ),
+            },
+        };
+        let mut bytes = Vec::new();
+
+        record
+            .serialize_into("2026-07-20T12:34:56.789Z", &mut bytes)
+            .expect("复杂翻译终态应可借用序列化");
+
+        AuditRecord::validate(&bytes)
+            .expect("借用序列化结果必须逐字节等于严格拥有型 wire 的规范输出");
     }
 
     fn dialogue_location(index: usize) -> LogicalTextLocation {
@@ -1522,7 +2042,7 @@ mod tests {
             crate::rpg_maker::project::MaxFullwidthChars::new(24).expect("测试行宽应合法"),
         );
 
-        let wire = serde_json::to_value(ManualLayoutDiagnosticWire::from(&diagnostic))
+        let wire = serde_json::to_value(ManualLayoutDiagnosticWriteWire::from(&diagnostic))
             .expect("人工布局诊断 wire 应可序列化");
         assert_eq!(
             wire,
@@ -1650,6 +2170,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn escaped_profile_can_be_validated_during_consecutive_appends() {
+        let directory = tempdir().expect("临时目录应可创建");
+        let (ledger, finalizer) =
+            JsonLinesAuditLedger::start(directory.path().to_path_buf(), config())
+                .expect("审计账本应可启动");
+        let profile = "quality\"x\\y";
+        let run = ledger.bind(AuditContext::translate(
+            run_id(),
+            RpgMakerEngine::Mv,
+            "demo",
+            profile,
+        ));
+        let operation_id = run.new_operation_id().expect("操作身份应可生成");
+
+        run.append(AuditEvent::TranslationTaskStarted {
+            operation_id,
+            task_index: StandardTranslationTaskIndex::new(0),
+        })
+        .await
+        .expect("首条含转义 profile 的记录应持久化");
+        run.append(AuditEvent::TranslationTaskFinished {
+            operation_id,
+            result: TranslationTaskAuditResult::ExecutionFailed {
+                task_index: StandardTranslationTaskIndex::new(0),
+            },
+        })
+        .await
+        .expect("续写时应能重新校验含转义 profile 的现存记录");
+        finalizer.finalize().await.expect("账本应可排空");
+
+        let bytes =
+            std::fs::read(directory.path().join("audit.jsonl")).expect("统一活动账本应存在");
+        let records = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                AuditRecord::validate(line).expect("含转义 profile 的记录应保持规范 wire");
+                serde_json::from_slice::<Value>(line).expect("审计记录应是 JSON")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record["profile"] == profile));
+    }
+
+    #[tokio::test]
     async fn command_mismatch_is_rejected_before_any_record_is_enqueued() {
         let directory = tempdir().expect("临时目录应可创建");
         let (ledger, finalizer) =
@@ -1704,11 +2269,12 @@ mod tests {
 
         let bytes =
             std::fs::read(directory.path().join("audit.jsonl")).expect("统一活动账本应存在");
-        let terminal = bytes
+        let terminal_line = bytes
             .split(|byte| *byte == b'\n')
             .rfind(|line| !line.is_empty())
-            .map(|line| serde_json::from_slice::<Value>(line).expect("终态应是 JSON"))
             .expect("应存在发布终态");
+        AuditRecord::validate(terminal_line).expect("借用路径列表 wire 应保持严格规范");
+        let terminal = serde_json::from_slice::<Value>(terminal_line).expect("终态应是 JSON");
         assert_eq!(terminal["event"], "write_back_publish_finished");
         assert_eq!(terminal["payload"]["result"]["kind"], "recovery_required");
         assert_eq!(

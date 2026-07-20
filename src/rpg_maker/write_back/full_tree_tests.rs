@@ -118,13 +118,37 @@ impl SqliteQueryExecutor for RecordingSqliteQuery {
             .push((path, query.clone()));
         if query.statement().contains("FROM metadata") {
             Ok(vec![metadata_row()])
-        } else if query.statement().contains("'owner' AS record_kind") {
-            Ok(write_back_snapshot_rows())
         } else {
-            Err(QueryExistingDatabaseError::QueryFailed(TestError(
-                "意外的全树测试查询",
-            )))
+            let rows = write_back_snapshot_rows();
+            if query
+                .statement()
+                .contains("FROM standard_asset_owner_state")
+            {
+                Ok(rows.owners)
+            } else if query.statement().contains("FROM standard_text_group") {
+                Ok(rows.groups)
+            } else if query.statement().contains("FROM standard_text_leaf") {
+                Ok(rows.leaves)
+            } else if query.statement().contains("FROM standard_text_target") {
+                Ok(rows.targets)
+            } else {
+                Err(QueryExistingDatabaseError::QueryFailed(TestError(
+                    "意外的全树测试查询",
+                )))
+            }
         }
+    }
+
+    async fn query_existing_database_snapshot(
+        &self,
+        path: PathBuf,
+        queries: Vec<SqliteQuery>,
+    ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
+        let mut results = Vec::with_capacity(queries.len());
+        for query in queries {
+            results.push(self.query_existing_database(path.clone(), query).await?);
+        }
+        Ok(results)
     }
 }
 
@@ -961,10 +985,22 @@ fn assert_project_open_and_asset_queries(observations: &FullTreeObservations) {
         .sqlite_calls
         .lock()
         .expect("SQLite 记录锁不应中毒");
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 5);
     assert!(calls[0].1.statement().contains("FROM metadata"));
-    assert!(calls[1].1.statement().contains("UNION ALL"));
-    assert!(!calls[1].1.statement().contains("terminology"));
+    assert!(
+        calls[1]
+            .1
+            .statement()
+            .contains("FROM standard_asset_owner_state")
+    );
+    assert!(calls[2].1.statement().contains("FROM standard_text_group"));
+    assert!(calls[3].1.statement().contains("FROM standard_text_leaf"));
+    assert!(calls[4].1.statement().contains("FROM standard_text_target"));
+    assert!(
+        calls
+            .iter()
+            .all(|(_, query)| !query.statement().contains("UNION ALL"))
+    );
     assert!(calls.iter().all(|(_, query)| query.parameters().is_empty()));
     assert!(calls.iter().all(|(path, _)| path == &database_path()));
     drop(calls);
@@ -1150,7 +1186,14 @@ fn metadata_row() -> SqliteRow {
     ])
 }
 
-fn write_back_snapshot_rows() -> Vec<SqliteRow> {
+struct WriteBackSnapshotRows {
+    owners: Vec<SqliteRow>,
+    groups: Vec<SqliteRow>,
+    leaves: Vec<SqliteRow>,
+    targets: Vec<SqliteRow>,
+}
+
+fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectTextPart,
         DirectTextRecipe, ScalarFieldKey, TextFieldRole, TextProjectionRecipe,
@@ -1269,70 +1312,71 @@ fn write_back_snapshot_rows() -> Vec<SqliteRow> {
         ),
     ];
 
-    let mut rows = Vec::new();
-    for owner in ["builtin", "rules"] {
-        rows.push(SqliteRow::new(vec![
-            SqliteValue::Text("owner".to_owned()),
-            SqliteValue::Text(owner.to_owned()),
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Blob(vec![7; 32]),
-            SqliteValue::Blob(fixture_asset_fingerprint(owner, &groups).to_vec()),
-        ]));
-    }
+    let owners = ["builtin", "rules"]
+        .into_iter()
+        .map(|owner| {
+            SqliteRow::new(vec![
+                SqliteValue::Text(owner.to_owned()),
+                SqliteValue::Blob(vec![7; 32]),
+                SqliteValue::Blob(fixture_asset_fingerprint(owner, &groups).to_vec()),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut group_rows = Vec::new();
+    let mut leaf_rows = Vec::new();
+    let mut target_rows = Vec::new();
     for group in groups {
-        rows.push(SqliteRow::new(vec![
-            SqliteValue::Text("group".to_owned()),
+        group_rows.push(SqliteRow::new(vec![
             SqliteValue::Text(group.owner.clone()),
             SqliteValue::Text(group.group_location.clone()),
             SqliteValue::Text(group.kind.to_owned()),
             SqliteValue::Text(group.recipes.clone()),
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
         ]));
-        rows.push(SqliteRow::new(vec![
-            SqliteValue::Text("leaf".to_owned()),
+        leaf_rows.push(SqliteRow::new(vec![
             SqliteValue::Text(group.owner.clone()),
             SqliteValue::Text(group.group_location.clone()),
-            SqliteValue::Null,
-            SqliteValue::Null,
             SqliteValue::Text(group.role.clone()),
             SqliteValue::Text(group.original.clone()),
             SqliteValue::Text("{}".to_owned()),
             SqliteValue::Text(group.translation),
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Null,
         ]));
         for target in group.targets {
-            rows.push(SqliteRow::new(vec![
-                SqliteValue::Text("target".to_owned()),
+            target_rows.push(SqliteRow::new(vec![
                 SqliteValue::Text(group.owner.clone()),
                 SqliteValue::Text(group.group_location.clone()),
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Null,
-                SqliteValue::Null,
                 SqliteValue::Text(target),
-                SqliteValue::Null,
-                SqliteValue::Null,
             ]));
         }
     }
-    rows
+    group_rows.sort_by(|left, right| {
+        snapshot_row_text(left, 0)
+            .cmp(snapshot_row_text(right, 0))
+            .then_with(|| snapshot_row_text(left, 1).cmp(snapshot_row_text(right, 1)))
+    });
+    leaf_rows.sort_by(|left, right| {
+        snapshot_row_text(left, 0)
+            .cmp(snapshot_row_text(right, 0))
+            .then_with(|| snapshot_row_text(left, 1).cmp(snapshot_row_text(right, 1)))
+            .then_with(|| snapshot_row_text(left, 2).cmp(snapshot_row_text(right, 2)))
+    });
+    target_rows.sort_by(|left, right| snapshot_row_text(left, 2).cmp(snapshot_row_text(right, 2)));
+    WriteBackSnapshotRows {
+        owners,
+        groups: group_rows,
+        leaves: leaf_rows,
+        targets: target_rows,
+    }
+}
+
+fn snapshot_row_text(row: &SqliteRow, index: usize) -> &str {
+    match &row.values()[index] {
+        SqliteValue::Text(value) => value,
+        SqliteValue::Null => "",
+        value => panic!(
+            "测试快照排序列应为 TEXT 或 NULL，实际为 {}",
+            value.kind_name()
+        ),
+    }
 }
 
 struct FixtureGroup {

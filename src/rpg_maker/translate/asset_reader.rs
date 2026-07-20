@@ -1017,6 +1017,18 @@ mod tests {
             let rows = self.rows.lock().expect("响应锁").take().expect("单次响应");
             async move { Ok(rows) }
         }
+
+        async fn query_existing_database_snapshot(
+            &self,
+            path: PathBuf,
+            queries: Vec<SqliteQuery>,
+        ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
+            let mut results = Vec::with_capacity(queries.len());
+            for query in queries {
+                results.push(self.query_existing_database(path.clone(), query).await?);
+            }
+            Ok(results)
+        }
     }
 
     #[derive(Clone, Copy)]
