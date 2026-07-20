@@ -6,8 +6,6 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures_util::stream::{self, StreamExt, TryStreamExt};
-
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256FramedHasher;
 use crate::rpg_maker::dialogue::MvDialogueDefinitionError;
@@ -106,7 +104,6 @@ where
         let sqlite = Arc::clone(&self.sqlite);
         let cpu = Arc::clone(&self.cpu);
         let records_per_job = self.config.leaves_per_decode_job().get();
-        let decode_concurrency = self.config.decode_concurrency().get();
 
         async move {
             let dialogue_definition_json =
@@ -136,27 +133,24 @@ where
                 );
             }
 
-            let decoded = stream::iter(prepared.batches.into_iter().map(|batch| {
-                let cpu = Arc::clone(&cpu);
-                async move {
-                    cpu.execute(move || decode_batch(batch))
-                        .await
-                        .map_err(RpgMakerStandardWriteBackAssetReadingError::ScheduleDecode)?
-                        .map_err(RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot)
-                }
-            }))
-            .buffered(decode_concurrency)
-            .try_collect::<Vec<_>>()
-            .await?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+            let decoded_batches = cpu
+                .execute_ordered_map(prepared.batches, decode_batch)
+                .await
+                .map_err(RpgMakerStandardWriteBackAssetReadingError::ScheduleDecode)?;
 
             let owner_states = prepared.owner_states;
-            cpu.execute(move || assemble_snapshot(owner_states, decoded, &dialogue_definition_json))
-                .await
-                .map_err(RpgMakerStandardWriteBackAssetReadingError::ScheduleAssembly)?
-                .map_err(RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot)
+            cpu.execute(move || {
+                let decoded = decoded_batches
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                assemble_snapshot(owner_states, decoded, &dialogue_definition_json)
+            })
+            .await
+            .map_err(RpgMakerStandardWriteBackAssetReadingError::ScheduleAssembly)?
+            .map_err(RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot)
         }
     }
 }

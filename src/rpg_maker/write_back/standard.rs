@@ -9,8 +9,10 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{StandardWriteBack, StandardWriteBackSummary};
+use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, LogicalTextLocation,
@@ -1230,6 +1232,10 @@ impl StandardWriteBackMutationPlan {
     pub(crate) fn mutations(&self) -> &[StandardWriteBackMutation] {
         &self.mutations
     }
+
+    pub(crate) fn into_mutations(self) -> Vec<StandardWriteBackMutation> {
+        self.mutations
+    }
 }
 
 fn insert_plan_target(
@@ -1473,37 +1479,41 @@ impl<D> StandardWriteBackPreparation<D> {
 }
 
 /// 使用资产读取、布局和文档改写能力准备 Standard 写回候选。
-pub(crate) struct StandardWriteBackService<R, L, D> {
+pub(crate) struct StandardWriteBackService<R, L, D, C> {
     asset_reader: R,
-    text_layouter: L,
+    text_layouter: Arc<L>,
     document_rewriter: D,
+    cpu: Arc<C>,
     cancellation: CooperativeCancellation,
 }
 
-impl<R, L, D> StandardWriteBackService<R, L, D> {
+impl<R, L, D, C> StandardWriteBackService<R, L, D, C> {
     pub(crate) fn new(
         asset_reader: R,
         text_layouter: L,
         document_rewriter: D,
+        cpu: C,
         cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
             asset_reader,
-            text_layouter,
+            text_layouter: Arc::new(text_layouter),
             document_rewriter,
+            cpu: Arc::new(cpu),
             cancellation,
         }
     }
 }
 
-impl<R, L, D> StandardWriteBack for StandardWriteBackService<R, L, D>
+impl<R, L, D, C> StandardWriteBack for StandardWriteBackService<R, L, D, C>
 where
     R: StandardWriteBackAssetReader,
-    L: RpgMakerWriteBackTextLayouter,
+    L: RpgMakerWriteBackTextLayouter + 'static,
     D: RpgMakerWriteBackDocumentRewriter,
+    C: CpuTaskExecutor,
 {
     type Documents = D::RewrittenDocuments;
-    type Error = StandardWriteBackServiceError<R::Error, D::Error>;
+    type Error = StandardWriteBackServiceError<R::Error, D::Error, C::Error>;
 
     async fn prepare(
         &self,
@@ -1522,7 +1532,21 @@ where
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
-        let planned = plan_standard_write_back(snapshot, layout_profile, &self.text_layouter);
+        let groups = snapshot.into_groups();
+        let profile = *layout_profile;
+        let layouter = Arc::clone(&self.text_layouter);
+        let planned_groups = self
+            .cpu
+            .execute_ordered_map(groups, move |group| {
+                plan_standard_write_back_group(group, &profile, layouter.as_ref())
+            })
+            .await
+            .map_err(StandardWriteBackServiceError::SchedulePlanning)?;
+        let planned = self
+            .cpu
+            .execute(move || assemble_planned_standard_write_back(planned_groups))
+            .await
+            .map_err(StandardWriteBackServiceError::SchedulePlanning)?;
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
@@ -1550,17 +1574,37 @@ struct PlannedStandardWriteBack {
     manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
 }
 
+struct PlannedStandardWriteBackGroup {
+    mutations: Vec<StandardWriteBackMutation>,
+    summary: StandardWriteBackSummary,
+    manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
+}
+
 struct GroupPlanningOutputs<'a> {
     mutations: &'a mut Vec<StandardWriteBackMutation>,
     summary: &'a mut StandardWriteBackSummary,
     manual_layout_diagnostics: &'a mut Vec<ManualLayoutDiagnostic>,
 }
 
+#[cfg(test)]
 fn plan_standard_write_back(
     snapshot: StandardWriteBackSnapshot,
     profile: &RpgMakerWriteBackLayoutProfile,
     layouter: &impl RpgMakerWriteBackTextLayouter,
 ) -> PlannedStandardWriteBack {
+    let groups = snapshot
+        .into_groups()
+        .into_iter()
+        .map(|group| plan_standard_write_back_group(group, profile, layouter))
+        .collect();
+    assemble_planned_standard_write_back(groups)
+}
+
+fn plan_standard_write_back_group(
+    group: StandardWriteBackGroup,
+    profile: &RpgMakerWriteBackLayoutProfile,
+    layouter: &impl RpgMakerWriteBackTextLayouter,
+) -> PlannedStandardWriteBackGroup {
     let mut mutations = Vec::new();
     let mut summary = StandardWriteBackSummary::default();
     let mut manual_layout_diagnostics = Vec::new();
@@ -1571,46 +1615,64 @@ fn plan_standard_write_back(
             summary: &mut summary,
             manual_layout_diagnostics: &mut manual_layout_diagnostics,
         };
-        for group in snapshot.into_groups() {
-            for leaf in &group.leaves {
-                if leaf.translation.is_some() {
-                    outputs.summary.translated_locations += 1;
-                } else {
-                    outputs.summary.original_locations += 1;
-                }
+        for leaf in &group.leaves {
+            if leaf.translation.is_some() {
+                outputs.summary.translated_locations += 1;
+            } else {
+                outputs.summary.original_locations += 1;
             }
+        }
 
-            let (kind, group_location, leaves, recipes) = group.into_parts();
-            match kind {
-                TextGroupKind::EventDialogue => plan_dialogue_group(
-                    group_location,
-                    leaves,
-                    recipes,
-                    profile.dialogue_body(),
-                    layouter,
-                    &mut outputs,
-                ),
-                TextGroupKind::EventScrollingText => plan_scrolling_group(
-                    group_location,
-                    leaves,
-                    recipes,
-                    profile.scrolling_text(),
-                    layouter,
-                    &mut outputs,
-                ),
-                _ => plan_scalar_group(
-                    kind,
-                    group_location,
-                    leaves,
-                    recipes,
-                    profile.help_description(),
-                    layouter,
-                    &mut outputs,
-                ),
-            }
+        let (kind, group_location, leaves, recipes) = group.into_parts();
+        match kind {
+            TextGroupKind::EventDialogue => plan_dialogue_group(
+                group_location,
+                leaves,
+                recipes,
+                profile.dialogue_body(),
+                layouter,
+                &mut outputs,
+            ),
+            TextGroupKind::EventScrollingText => plan_scrolling_group(
+                group_location,
+                leaves,
+                recipes,
+                profile.scrolling_text(),
+                layouter,
+                &mut outputs,
+            ),
+            _ => plan_scalar_group(
+                kind,
+                group_location,
+                leaves,
+                recipes,
+                profile.help_description(),
+                layouter,
+                &mut outputs,
+            ),
         }
         outputs.summary.manual_layout_units = outputs.manual_layout_diagnostics.len();
     }
+
+    PlannedStandardWriteBackGroup {
+        mutations,
+        summary,
+        manual_layout_diagnostics,
+    }
+}
+
+fn assemble_planned_standard_write_back(
+    groups: Vec<PlannedStandardWriteBackGroup>,
+) -> PlannedStandardWriteBack {
+    let mut mutations = Vec::new();
+    let mut summary = StandardWriteBackSummary::default();
+    let mut manual_layout_diagnostics = Vec::new();
+    for group in groups {
+        mutations.extend(group.mutations);
+        merge_standard_write_back_summary(&mut summary, group.summary);
+        manual_layout_diagnostics.extend(group.manual_layout_diagnostics);
+    }
+    summary.manual_layout_units = manual_layout_diagnostics.len();
 
     let mutation_plan = StandardWriteBackMutationPlan::new(mutations)
         .expect("受信快照和布局结果不应产生冲突 Mutation");
@@ -1619,6 +1681,17 @@ fn plan_standard_write_back(
         summary,
         manual_layout_diagnostics,
     }
+}
+
+fn merge_standard_write_back_summary(
+    total: &mut StandardWriteBackSummary,
+    group: StandardWriteBackSummary,
+) {
+    total.translated_locations += group.translated_locations;
+    total.original_locations += group.original_locations;
+    total.auto_wrapped_units += group.auto_wrapped_units;
+    total.inserted_line_breaks += group.inserted_line_breaks;
+    total.inserted_fullwidth_indents += group.inserted_fullwidth_indents;
 }
 
 fn plan_dialogue_group(
@@ -1968,19 +2041,24 @@ fn is_canonical_help_description(
 
 /// Standard 在资产读取和文档改写边界上遇到的技术失败。
 #[derive(Debug)]
-pub(crate) enum StandardWriteBackServiceError<R, D> {
+pub(crate) enum StandardWriteBackServiceError<R, D, C> {
     ReadAssets(R),
+    SchedulePlanning(CpuTaskExecutionError<C>),
     RewriteDocuments(D),
 }
 
-impl<R, D> fmt::Display for StandardWriteBackServiceError<R, D>
+impl<R, D, C> fmt::Display for StandardWriteBackServiceError<R, D, C>
 where
     R: fmt::Display,
     D: fmt::Display,
+    C: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReadAssets(source) => write!(formatter, "读取 Standard 写回资产失败：{source}"),
+            Self::SchedulePlanning(source) => {
+                write!(formatter, "调度 Standard 写回规划失败：{source}")
+            }
             Self::RewriteDocuments(source) => {
                 write!(formatter, "改写 RPG Maker 文档失败：{source}")
             }
@@ -1988,14 +2066,16 @@ where
     }
 }
 
-impl<R, D> Error for StandardWriteBackServiceError<R, D>
+impl<R, D, C> Error for StandardWriteBackServiceError<R, D, C>
 where
     R: Error + 'static,
     D: Error + 'static,
+    C: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ReadAssets(source) => Some(source),
+            Self::SchedulePlanning(source) => Some(source),
             Self::RewriteDocuments(source) => Some(source),
         }
     }

@@ -6,8 +6,6 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use futures_util::stream::{self, StreamExt};
-
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguagePair};
@@ -155,118 +153,124 @@ where
             global_semantics,
         ));
         let max_characters = planning.max_message_characters().get();
-        let scope_concurrency = planning.scope_concurrency().get();
-        let mut preprocessed_scopes = stream::iter(prepared.into_iter().map(|scope| {
-            let semantics = Arc::clone(&semantics);
-            async move {
+        let scope_semantics = Arc::clone(&semantics);
+        let preprocessed_scopes = self
+            .cpu
+            .execute_ordered_map(prepared.scopes, move |scope| {
                 let scope_name = scope.key.clone();
-                self.cpu
-                    .execute(move || preprocess_scope(scope, semantics))
-                    .await
-                    .map_err(|source| ScopePreprocessingFailure::Compute {
-                        scope: scope_name.clone(),
-                        source,
-                    })?
-                    .map_err(|source| ScopePreprocessingFailure::Invalid {
-                        scope: scope_name,
-                        source,
-                    })
-            }
-        }))
-        .buffered(scope_concurrency);
+                (
+                    scope_name,
+                    preprocess_scope(scope, Arc::clone(&scope_semantics)),
+                )
+            })
+            .await
+            .map_err(RpgMakerStandardTranslationTaskPlanningError::PreprocessScopesCompute)?;
 
-        let mut scopes = Vec::new();
-        while let Some(result) = preprocessed_scopes.next().await {
-            scopes.push(result.map_err(|failure| match failure {
-                ScopePreprocessingFailure::Compute { scope, source } => {
-                    RpgMakerStandardTranslationTaskPlanningError::PreprocessScopeCompute {
-                        scope,
-                        source,
-                    }
+        let (scopes, invalidations, reuses, preparation_counts) = self
+            .cpu
+            .execute(move || {
+                let mut scopes = Vec::with_capacity(preprocessed_scopes.len());
+                for (scope, result) in preprocessed_scopes {
+                    scopes.push(result.map_err(|source| {
+                        GlobalPreparationFailure::InvalidScopePreprocessing { scope, source }
+                    })?);
                 }
-                ScopePreprocessingFailure::Invalid { scope, source } => {
+                let (candidates, positions, mut invalidations) =
+                    collect_deduplication_inputs(&scopes);
+                let deduplicated = deduplicate_translation_candidates(candidates)
+                    .map_err(GlobalPreparationFailure::InvalidDeduplication)?;
+                let (outcomes, deduplication_invalidations, reuses) = deduplicated.into_parts();
+                invalidations.extend(deduplication_invalidations);
+                apply_deduplication_outcomes(&mut scopes, positions, outcomes);
+
+                let retained = scopes
+                    .iter()
+                    .flat_map(|scope| &scope.groups)
+                    .flat_map(|group| &group.units)
+                    .filter(|unit| unit.current)
+                    .count();
+                let not_applicable = scopes
+                    .iter()
+                    .flat_map(|scope| &scope.groups)
+                    .flat_map(|group| &group.units)
+                    .filter(|unit| unit.not_applicable)
+                    .count();
+                let invalidated = scopes
+                    .iter()
+                    .flat_map(|scope| &scope.groups)
+                    .flat_map(|group| &group.units)
+                    .filter(|unit| unit.invalidated && !unit.not_applicable)
+                    .count();
+
+                Ok::<_, GlobalPreparationFailure>((
+                    scopes,
+                    invalidations,
+                    reuses,
+                    TranslationPlanPreparationCounts::new(retained, invalidated, not_applicable),
+                ))
+            })
+            .await
+            .map_err(RpgMakerStandardTranslationTaskPlanningError::DeduplicateCompute)?
+            .map_err(|failure| match failure {
+                GlobalPreparationFailure::InvalidScopePreprocessing { scope, source } => {
                     RpgMakerStandardTranslationTaskPlanningError::InvalidScopePreprocessing {
                         scope,
                         source,
                     }
                 }
-            })?);
-        }
+                GlobalPreparationFailure::InvalidDeduplication(source) => {
+                    RpgMakerStandardTranslationTaskPlanningError::InvalidDeduplication(source)
+                }
+            })?;
 
-        let (candidates, positions, mut invalidations) = collect_deduplication_inputs(&scopes);
-        let deduplicated = self
+        let scope_terminology = Arc::clone(&terminology);
+        let scope_system_markdown = Arc::new(system_markdown.clone());
+        let planned_scopes = self
             .cpu
-            .execute(move || deduplicate_translation_candidates(candidates))
-            .await
-            .map_err(RpgMakerStandardTranslationTaskPlanningError::DeduplicateCompute)?
-            .map_err(RpgMakerStandardTranslationTaskPlanningError::InvalidDeduplication)?;
-        let (outcomes, deduplication_invalidations, reuses) = deduplicated.into_parts();
-        invalidations.extend(deduplication_invalidations);
-        apply_deduplication_outcomes(&mut scopes, positions, outcomes);
-
-        let retained = scopes
-            .iter()
-            .flat_map(|scope| &scope.groups)
-            .flat_map(|group| &group.units)
-            .filter(|unit| unit.current)
-            .count();
-        let not_applicable = scopes
-            .iter()
-            .flat_map(|scope| &scope.groups)
-            .flat_map(|group| &group.units)
-            .filter(|unit| unit.not_applicable)
-            .count();
-        let invalidated = scopes
-            .iter()
-            .flat_map(|scope| &scope.groups)
-            .flat_map(|group| &group.units)
-            .filter(|unit| unit.invalidated && !unit.not_applicable)
-            .count();
-
-        let mut planned_scopes = stream::iter(scopes.into_iter().map(|scope| {
-            let terminology = terminology.clone();
-            let system_markdown = system_markdown.clone();
-            async move {
+            .execute_ordered_map(scopes, move |scope| {
                 let scope_name = scope.key.clone();
-                self.cpu
-                    .execute(move || {
-                        build_scope_tasks(scope, terminology, &system_markdown, max_characters)
-                    })
-                    .await
-                    .map_err(|source| ScopePlanningFailure::Compute {
-                        scope: scope_name.clone(),
-                        source,
-                    })?
-                    .map_err(|source| ScopePlanningFailure::Invalid {
-                        scope: scope_name,
-                        source,
-                    })
-            }
-        }))
-        .buffered(scope_concurrency);
-
-        let mut unindexed_tasks = Vec::new();
-        while let Some(result) = planned_scopes.next().await {
-            unindexed_tasks.extend(result.map_err(|failure| match failure {
-                ScopePlanningFailure::Compute { scope, source } => {
-                    RpgMakerStandardTranslationTaskPlanningError::PlanScopeCompute { scope, source }
-                }
-                ScopePlanningFailure::Invalid { scope, source } => {
-                    RpgMakerStandardTranslationTaskPlanningError::InvalidScope { scope, source }
-                }
-            })?);
-        }
-
-        let tasks = unindexed_tasks
-            .into_iter()
-            .enumerate()
-            .map(|(index, task)| {
-                task.with_index(
-                    StandardTranslationTaskIndex::new(index),
-                    task_language_pair.clone(),
+                (
+                    scope_name,
+                    build_scope_tasks(
+                        scope,
+                        Arc::clone(&scope_terminology),
+                        scope_system_markdown.as_str(),
+                        max_characters,
+                    ),
                 )
             })
-            .collect();
+            .await
+            .map_err(RpgMakerStandardTranslationTaskPlanningError::PlanScopesCompute)?;
+
+        let tasks = self
+            .cpu
+            .execute(move || {
+                let mut unindexed_tasks = Vec::new();
+                for (scope, result) in planned_scopes {
+                    unindexed_tasks.extend(
+                        result.map_err(|source| ScopeTaskFinalizationFailure { scope, source })?,
+                    );
+                }
+                let tasks = unindexed_tasks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, task)| {
+                        task.with_index(
+                            StandardTranslationTaskIndex::new(index),
+                            task_language_pair.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                Ok::<_, ScopeTaskFinalizationFailure>(tasks)
+            })
+            .await
+            .map_err(RpgMakerStandardTranslationTaskPlanningError::FinalizePlanCompute)?
+            .map_err(
+                |failure| RpgMakerStandardTranslationTaskPlanningError::InvalidScope {
+                    scope: failure.scope,
+                    source: failure.source,
+                },
+            )?;
 
         Ok(StandardTranslationPlan::new(
             Arc::clone(&semantics),
@@ -275,7 +279,7 @@ where
                 reuses,
                 terminology_json,
                 placeholder_rules_json,
-                TranslationPlanPreparationCounts::new(retained, invalidated, not_applicable),
+                preparation_counts,
                 snapshot_baseline,
             ),
             tasks,
@@ -285,15 +289,6 @@ where
 
 struct PreparedCorpus {
     scopes: Vec<PreparedScope>,
-}
-
-impl IntoIterator for PreparedCorpus {
-    type Item = PreparedScope;
-    type IntoIter = std::vec::IntoIter<PreparedScope>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.scopes.into_iter()
-    }
 }
 
 struct PreparedScope {
@@ -1047,26 +1042,17 @@ const fn group_kind_name(kind: TextGroupKind) -> &'static [u8] {
     }
 }
 
-enum ScopePlanningFailure<C> {
-    Compute {
-        scope: SemanticScopeKey,
-        source: CpuTaskExecutionError<C>,
-    },
-    Invalid {
-        scope: SemanticScopeKey,
-        source: ScopePlanningError,
-    },
-}
-
-enum ScopePreprocessingFailure<C> {
-    Compute {
-        scope: SemanticScopeKey,
-        source: CpuTaskExecutionError<C>,
-    },
-    Invalid {
+enum GlobalPreparationFailure {
+    InvalidScopePreprocessing {
         scope: SemanticScopeKey,
         source: ScopePreprocessingError,
     },
+    InvalidDeduplication(TranslationDeduplicationError),
+}
+
+struct ScopeTaskFinalizationFailure {
+    scope: SemanticScopeKey,
+    source: ScopePlanningError,
 }
 
 #[derive(Debug)]
@@ -1082,24 +1068,19 @@ pub(crate) enum RpgMakerStandardTranslationTaskPlanningError<R, C> {
     InvalidPlaceholderRules(PlaceholderRuleCompilationError),
     PrepareCorpusCompute(CpuTaskExecutionError<C>),
     InvalidCorpus(CorpusPlanningError),
-    PreprocessScopeCompute {
-        scope: SemanticScopeKey,
-        source: CpuTaskExecutionError<C>,
-    },
+    PreprocessScopesCompute(CpuTaskExecutionError<C>),
     InvalidScopePreprocessing {
         scope: SemanticScopeKey,
         source: ScopePreprocessingError,
     },
     DeduplicateCompute(CpuTaskExecutionError<C>),
     InvalidDeduplication(TranslationDeduplicationError),
-    PlanScopeCompute {
-        scope: SemanticScopeKey,
-        source: CpuTaskExecutionError<C>,
-    },
+    PlanScopesCompute(CpuTaskExecutionError<C>),
     InvalidScope {
         scope: SemanticScopeKey,
         source: ScopePlanningError,
     },
+    FinalizePlanCompute(CpuTaskExecutionError<C>),
 }
 
 impl<R: fmt::Display, C: fmt::Display> fmt::Display
@@ -1125,8 +1106,8 @@ impl<R: fmt::Display, C: fmt::Display> fmt::Display
                 write!(formatter, "无法调度标准语料排序：{source}")
             }
             Self::InvalidCorpus(source) => write!(formatter, "标准语料无法建立语义范围：{source}"),
-            Self::PreprocessScopeCompute { scope, source } => {
-                write!(formatter, "无法调度语义范围 {scope} 的译前处理：{source}")
+            Self::PreprocessScopesCompute(source) => {
+                write!(formatter, "无法调度语义范围的并行译前处理：{source}")
             }
             Self::InvalidScopePreprocessing { scope, source } => {
                 write!(formatter, "语义范围 {scope} 无法完成译前处理：{source}")
@@ -1137,11 +1118,14 @@ impl<R: fmt::Display, C: fmt::Display> fmt::Display
             Self::InvalidDeduplication(source) => {
                 write!(formatter, "标准语料无法建立唯一翻译责任：{source}")
             }
-            Self::PlanScopeCompute { scope, source } => {
-                write!(formatter, "无法调度语义范围 {scope} 的任务规划：{source}")
+            Self::PlanScopesCompute(source) => {
+                write!(formatter, "无法调度语义范围的并行任务规划：{source}")
             }
             Self::InvalidScope { scope, source } => {
                 write!(formatter, "语义范围 {scope} 无法建立任务：{source}")
+            }
+            Self::FinalizePlanCompute(source) => {
+                write!(formatter, "无法调度翻译任务最终编号：{source}")
             }
         }
     }
@@ -1157,12 +1141,13 @@ impl<R: Error + 'static, C: Error + 'static> Error
             Self::InvalidPlaceholderRules(source) => Some(source),
             Self::PrepareCorpusCompute(source) => Some(source),
             Self::InvalidCorpus(source) => Some(source),
-            Self::PreprocessScopeCompute { source, .. } => Some(source),
+            Self::PreprocessScopesCompute(source) => Some(source),
             Self::InvalidScopePreprocessing { source, .. } => Some(source),
             Self::DeduplicateCompute(source) => Some(source),
             Self::InvalidDeduplication(source) => Some(source),
-            Self::PlanScopeCompute { source, .. } => Some(source),
+            Self::PlanScopesCompute(source) => Some(source),
             Self::InvalidScope { source, .. } => Some(source),
+            Self::FinalizePlanCompute(source) => Some(source),
             Self::ResolvedLanguagePairMismatch { .. } => None,
         }
     }
@@ -1252,7 +1237,6 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::rpg_maker::model::{ScalarFieldKey, TextFieldRole};
     use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep};
@@ -1286,29 +1270,6 @@ mod tests {
             F: FnOnce() -> T + Send + 'static,
         {
             Ok(task())
-        }
-    }
-
-    #[derive(Clone)]
-    struct YieldingCpu {
-        active: Arc<AtomicUsize>,
-        max_active: Arc<AtomicUsize>,
-    }
-
-    impl CpuTaskExecutor for YieldingCpu {
-        type Error = FakeError;
-
-        async fn execute<T, F>(&self, task: F) -> Result<T, CpuTaskExecutionError<Self::Error>>
-        where
-            T: Send + 'static,
-            F: FnOnce() -> T + Send + 'static,
-        {
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_active.fetch_max(active, Ordering::SeqCst);
-            tokio::task::yield_now().await;
-            let output = task();
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(output)
         }
     }
 
@@ -1394,15 +1355,7 @@ mod tests {
     }
 
     fn profile(max_message_characters: usize) -> Arc<RpgMakerTranslationProfile<()>> {
-        profile_with_scope_concurrency(max_message_characters, 2)
-    }
-
-    fn profile_with_scope_concurrency(
-        max_message_characters: usize,
-        scope_concurrency: usize,
-    ) -> Arc<RpgMakerTranslationProfile<()>> {
         let planning = RpgMakerTranslationPlanningConfiguration::new(
-            NonZeroUsize::new(scope_concurrency).expect("测试范围并发数必须非零"),
             NonZeroUsize::new(max_message_characters).expect("测试容量必须非零"),
         );
         Arc::new(RpgMakerTranslationProfile::new(
@@ -1704,7 +1657,7 @@ mod tests {
         let (_, _, tasks) = planner
             .plan(
                 &project_with_languages("ja", "zh-Hant"),
-                &profile_with_scope_concurrency(10_000, 2),
+                &profile(10_000),
                 StandardTranslationCorpus::new(vec![group(
                     RpgMakerSource::data(StandardDataFile::Items),
                     1,
@@ -1754,50 +1707,6 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].index().get(), 0);
         assert_eq!(tasks[1].index().get(), 1);
-    }
-
-    #[tokio::test]
-    async fn semantic_scope_compute_obeys_the_external_concurrency_limit() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let cpu = YieldingCpu {
-            active: Arc::clone(&active),
-            max_active: Arc::clone(&max_active),
-        };
-        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
-            EmptyResources,
-            translation_resources(),
-            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
-            cpu,
-        );
-        let corpus = StandardTranslationCorpus::new(
-            (1..=4)
-                .map(|map_id| {
-                    group(
-                        RpgMakerSource::map(map_id),
-                        0,
-                        format!("第{map_id}番目"),
-                        None,
-                        Vec::new(),
-                    )
-                })
-                .collect(),
-        );
-
-        let (_, _, tasks) = planner
-            .plan(
-                &project(),
-                &profile_with_scope_concurrency(10_000, 2),
-                corpus,
-                StandardTranslationInput::new(None, None),
-            )
-            .await
-            .expect("四个 Map 范围应该在显式上限内并行规划")
-            .into_parts();
-
-        assert_eq!(tasks.len(), 4);
-        assert_eq!(max_active.load(Ordering::SeqCst), 2);
-        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

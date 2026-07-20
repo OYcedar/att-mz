@@ -186,12 +186,34 @@ where
             .map_err(RpgMakerWriteBackDocumentRewritingError::ReadDocuments)?;
         let project_name = project.name().clone();
         let workspace_root = project.workspace_root().to_path_buf();
-        let rewritten = self
+        let prepared = self
             .cpu_executor
-            .execute(move || rewrite_documents(project_name, workspace_root, documents, plan))
+            .execute(move || prepare_rewrite_jobs(project_name, workspace_root, documents, plan))
             .await
             .map_err(RpgMakerWriteBackDocumentRewritingError::ScheduleRewrite)?;
-        rewritten.map_err(RpgMakerWriteBackDocumentRewritingError::Rewrite)
+        let PreparedDocumentRewrite {
+            project_name,
+            workspace_root,
+            jobs,
+        } = prepared.map_err(RpgMakerWriteBackDocumentRewritingError::Rewrite)?;
+        let rewritten = self
+            .cpu_executor
+            .execute_ordered_map(jobs, rewrite_document)
+            .await
+            .map_err(RpgMakerWriteBackDocumentRewritingError::ScheduleRewrite)?;
+        self.cpu_executor
+            .execute(move || {
+                let files = rewritten
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                RpgMakerRewrittenDocuments::new(project_name, workspace_root, files)
+            })
+            .await
+            .map_err(RpgMakerWriteBackDocumentRewritingError::ScheduleRewrite)?
+            .map_err(RpgMakerWriteBackDocumentRewritingError::Rewrite)
     }
 }
 
@@ -239,14 +261,19 @@ struct MutableDocuments {
 }
 
 impl MutableDocuments {
-    fn new(documents: RpgMakerProjectDocuments) -> Self {
-        let (documents, plugins) = documents.into_parts();
+    fn from_document(id: RpgMakerDocumentId, value: Value) -> Self {
         Self {
-            documents,
-            plugins: plugins
-                .into_iter()
-                .map(|configuration| configuration.into_parts())
-                .collect(),
+            documents: BTreeMap::from([(id, value)]),
+            plugins: Vec::new(),
+            changed_documents: BTreeSet::new(),
+            plugins_changed: false,
+        }
+    }
+
+    fn from_plugins(plugins: Vec<(usize, Map<String, Value>)>) -> Self {
+        Self {
+            documents: BTreeMap::new(),
+            plugins,
             changed_documents: BTreeSet::new(),
             plugins_changed: false,
         }
@@ -317,22 +344,201 @@ impl StructuralOperation<'_> {
     }
 }
 
-fn rewrite_documents(
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PhysicalDocumentKey {
+    Json(RpgMakerDocumentId),
+    Plugins,
+}
+
+struct DocumentRewriteJob {
+    documents: MutableDocuments,
+    mutations: Vec<StandardWriteBackMutation>,
+}
+
+struct PreparedDocumentRewrite {
+    project_name: ProjectName,
+    workspace_root: PathBuf,
+    jobs: Vec<DocumentRewriteJob>,
+}
+
+fn prepare_rewrite_jobs(
     project_name: ProjectName,
     workspace_root: PathBuf,
     documents: RpgMakerProjectDocuments,
     plan: StandardWriteBackMutationPlan,
-) -> Result<RpgMakerRewrittenDocuments, RpgMakerWriteBackDocumentRewriteFailure> {
-    let mut documents = MutableDocuments::new(documents);
+) -> Result<PreparedDocumentRewrite, RpgMakerWriteBackDocumentRewriteFailure> {
+    validate_structural_conflicts(plan.mutations())?;
+
+    let mut partitions = BTreeMap::<PhysicalDocumentKey, Vec<StandardWriteBackMutation>>::new();
+    for mutation in plan.into_mutations() {
+        let key = mutation_document_key(&mutation)?;
+        partitions.entry(key).or_default().push(mutation);
+    }
+
+    let (mut json_documents, plugins) = documents.into_parts();
+    let mut plugins = Some(
+        plugins
+            .into_iter()
+            .map(|configuration| configuration.into_parts())
+            .collect(),
+    );
+    let mut jobs = Vec::with_capacity(partitions.len());
+    for (key, mutations) in partitions {
+        let representative = mutation_location(
+            mutations
+                .first()
+                .expect("每个物理文档分区必须至少包含一项 Mutation"),
+        );
+        let documents = match key {
+            PhysicalDocumentKey::Json(id) => {
+                let value = json_documents.remove(&id).ok_or_else(|| {
+                    mutation_failure(representative, "文档读取器没有返回 Mutation 请求的文档")
+                })?;
+                MutableDocuments::from_document(id, value)
+            }
+            PhysicalDocumentKey::Plugins => MutableDocuments::from_plugins(
+                plugins.take().expect("plugins.js 只能形成一个物理文档分区"),
+            ),
+        };
+        jobs.push(DocumentRewriteJob {
+            documents,
+            mutations,
+        });
+    }
+
+    Ok(PreparedDocumentRewrite {
+        project_name,
+        workspace_root,
+        jobs,
+    })
+}
+
+fn mutation_document_key(
+    mutation: &StandardWriteBackMutation,
+) -> Result<PhysicalDocumentKey, RpgMakerWriteBackDocumentRewriteFailure> {
+    let (location, other_locations): (&RpgMakerLocation, Vec<&RpgMakerLocation>) = match mutation {
+        StandardWriteBackMutation::SetText(mutation) => (mutation.exact_location(), Vec::new()),
+        StandardWriteBackMutation::ReplaceDialogue(mutation) => {
+            let mut locations = mutation
+                .recipe()
+                .lines()
+                .iter()
+                .map(|line| line.physical_location())
+                .collect::<Vec<_>>();
+            if let Some(speaker) = mutation.recipe().direct_speaker() {
+                locations.push(speaker.physical_location());
+            }
+            (mutation.group_location(), locations)
+        }
+        StandardWriteBackMutation::ReplaceEventBody(mutation) => (
+            mutation.group_location(),
+            mutation
+                .segments()
+                .iter()
+                .map(|segment| segment.exact_location())
+                .collect(),
+        ),
+    };
+    let key = physical_document_key(location.source());
+    for other in other_locations {
+        if physical_document_key(other.source()) != key {
+            return Err(mutation_failure(
+                other,
+                "一项原子 Mutation 跨越了不同物理文档",
+            ));
+        }
+    }
+    Ok(key)
+}
+
+fn physical_document_key(source: &RpgMakerSource) -> PhysicalDocumentKey {
+    document_id(source).map_or(PhysicalDocumentKey::Plugins, PhysicalDocumentKey::Json)
+}
+
+fn mutation_location(mutation: &StandardWriteBackMutation) -> &RpgMakerLocation {
+    match mutation {
+        StandardWriteBackMutation::SetText(mutation) => mutation.exact_location(),
+        StandardWriteBackMutation::ReplaceDialogue(mutation) => mutation.group_location(),
+        StandardWriteBackMutation::ReplaceEventBody(mutation) => mutation.group_location(),
+    }
+}
+
+fn validate_structural_conflicts(
+    mutations: &[StandardWriteBackMutation],
+) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
+    let mut comment_groups = BTreeMap::<ContainerKey, &RpgMakerLocation>::new();
+    let mut structural = Vec::<(StructuralKey, &RpgMakerLocation)>::new();
+    for mutation in mutations {
+        match mutation {
+            StandardWriteBackMutation::SetText(mutation) => {
+                if let RpgMakerLocation::CommentTag {
+                    source,
+                    command_steps,
+                    ..
+                } = mutation.exact_location()
+                {
+                    comment_groups
+                        .entry(ContainerKey {
+                            source: source.clone(),
+                            steps: command_steps.clone(),
+                        })
+                        .or_insert_with(|| mutation.exact_location());
+                }
+            }
+            StandardWriteBackMutation::ReplaceDialogue(mutation) => structural.push((
+                dialogue_structural_key(mutation)?,
+                mutation.group_location(),
+            )),
+            StandardWriteBackMutation::ReplaceEventBody(mutation) => {
+                structural.push((event_structural_key(mutation)?, mutation.group_location()))
+            }
+        }
+    }
+    for (key, location) in comment_groups {
+        structural.push((structural_key(&key.source, &key.steps, location)?, location));
+    }
+    structural.sort_by(|left, right| {
+        left.0
+            .source
+            .cmp(&right.0.source)
+            .then_with(|| left.0.list_steps.cmp(&right.0.list_steps))
+            .then_with(|| right.0.start_index.cmp(&left.0.start_index))
+    });
+    for pair in structural.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(mutation_failure(
+                pair[0].1,
+                "两个结构修改指向同一冻结事件命令",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_document(
+    job: DocumentRewriteJob,
+) -> Result<Vec<RpgMakerRewrittenFile>, RpgMakerWriteBackDocumentRewriteFailure> {
+    let DocumentRewriteJob {
+        mut documents,
+        mutations,
+    } = job;
+    apply_mutations(&mut documents, &mutations)?;
+    serialize_rewritten_files(documents)
+}
+
+fn apply_mutations(
+    documents: &mut MutableDocuments,
+    mutations: &[StandardWriteBackMutation],
+) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
     let mut note_groups = BTreeMap::<ContainerKey, Vec<&SetTextMutation>>::new();
     let mut comment_groups = BTreeMap::<ContainerKey, Vec<&SetTextMutation>>::new();
     let mut event_mutations = Vec::new();
     let mut dialogue_mutations = Vec::new();
 
-    for mutation in plan.mutations() {
+    for mutation in mutations {
         match mutation {
             StandardWriteBackMutation::SetText(mutation) => match mutation.exact_location() {
-                RpgMakerLocation::Value { .. } => apply_value_mutation(&mut documents, mutation)?,
+                RpgMakerLocation::Value { .. } => apply_value_mutation(documents, mutation)?,
                 RpgMakerLocation::NoteTag {
                     source,
                     container_steps,
@@ -364,7 +570,7 @@ fn rewrite_documents(
     }
 
     for (key, mutations) in note_groups {
-        apply_note_mutations(&mut documents, &key, mutations)?;
+        apply_note_mutations(documents, &key, mutations)?;
     }
 
     let mut structural = Vec::new();
@@ -385,39 +591,43 @@ fn rewrite_documents(
         structural.push(StructuralOperation::Dialogue { key, mutation });
     }
     structural.sort_by(compare_structural_operations);
-    for pair in structural.windows(2) {
-        if pair[0].key() == pair[1].key() {
-            return Err(mutation_failure(
-                structural_operation_location(&pair[0]),
-                "两个结构修改指向同一冻结事件命令",
-            ));
-        }
-    }
     for operation in structural {
         match operation {
             StructuralOperation::Comment { key, mutations } => {
-                apply_comment_mutations(&mut documents, &key, mutations)?;
+                apply_comment_mutations(documents, &key, mutations)?;
             }
             StructuralOperation::Event { key, mutation } => {
-                apply_event_body_mutation(&mut documents, &key, mutation)?;
+                apply_event_body_mutation(documents, &key, mutation)?;
             }
             StructuralOperation::Dialogue { key, mutation } => {
-                apply_dialogue_mutation(&mut documents, &key, mutation)?;
+                apply_dialogue_mutation(documents, &key, mutation)?;
             }
         }
     }
 
-    serialize_rewritten_documents(project_name, workspace_root, documents)
+    Ok(())
 }
 
-fn structural_operation_location<'a>(
-    operation: &'a StructuralOperation<'a>,
-) -> &'a RpgMakerLocation {
-    match operation {
-        StructuralOperation::Comment { mutations, .. } => mutations[0].exact_location(),
-        StructuralOperation::Event { mutation, .. } => mutation.group_location(),
-        StructuralOperation::Dialogue { mutation, .. } => mutation.group_location(),
-    }
+#[cfg(test)]
+fn rewrite_documents(
+    project_name: ProjectName,
+    workspace_root: PathBuf,
+    documents: RpgMakerProjectDocuments,
+    plan: StandardWriteBackMutationPlan,
+) -> Result<RpgMakerRewrittenDocuments, RpgMakerWriteBackDocumentRewriteFailure> {
+    let PreparedDocumentRewrite {
+        project_name,
+        workspace_root,
+        jobs,
+    } = prepare_rewrite_jobs(project_name, workspace_root, documents, plan)?;
+    let files = jobs
+        .into_iter()
+        .map(rewrite_document)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    RpgMakerRewrittenDocuments::new(project_name, workspace_root, files)
 }
 
 fn compare_structural_operations(
@@ -1160,11 +1370,9 @@ fn rewrite_command(
     Ok(command)
 }
 
-fn serialize_rewritten_documents(
-    project_name: ProjectName,
-    workspace_root: PathBuf,
+fn serialize_rewritten_files(
     mut documents: MutableDocuments,
-) -> Result<RpgMakerRewrittenDocuments, RpgMakerWriteBackDocumentRewriteFailure> {
+) -> Result<Vec<RpgMakerRewrittenFile>, RpgMakerWriteBackDocumentRewriteFailure> {
     let mut files = Vec::new();
     for id in documents.changed_documents {
         let value = documents.documents.remove(&id).ok_or_else(|| {
@@ -1206,7 +1414,7 @@ fn serialize_rewritten_documents(
         bytes.extend_from_slice(b";\n");
         files.push(RpgMakerRewrittenFile::new(path, bytes)?);
     }
-    RpgMakerRewrittenDocuments::new(project_name, workspace_root, files)
+    Ok(files)
 }
 
 fn relative_document_path(id: &RpgMakerDocumentId) -> PathBuf {
@@ -2205,6 +2413,47 @@ mod tests {
             error,
             RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { message, .. }
                 if message.contains("expected_original")
+        ));
+    }
+
+    #[test]
+    fn document_failures_follow_stable_physical_order_instead_of_plan_order() {
+        let actor_location = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::Actors),
+            vec![
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("name"),
+            ],
+        );
+        let map_location = RpgMakerLocation::value(
+            RpgMakerSource::map(1),
+            vec![RpgMakerLocationStep::key("displayName")],
+        );
+        let documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([
+                (
+                    RpgMakerDocumentId::Data(StandardDataFile::Actors),
+                    json!([null, {"name": "角色现值"}]),
+                ),
+                (
+                    RpgMakerDocumentId::Map(1),
+                    json!({"displayName": "地图现值"}),
+                ),
+            ]),
+            Vec::new(),
+        );
+        let plan = plan(vec![
+            set_text(map_location, "地图旧值", "地图译文"),
+            set_text(actor_location.clone(), "角色旧值", "角色译文"),
+        ]);
+
+        let error = rewrite_documents(project_name(), workspace_root(), documents, plan)
+            .expect_err("两个物理文档都不匹配时必须稳定选择自然顺序中的首个错误");
+
+        assert!(matches!(
+            error,
+            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { location, .. }
+                if location.as_ref() == &actor_location
         ));
     }
 

@@ -113,23 +113,14 @@ impl fmt::Debug for ResolvedRpgMakerTranslationResources {
 /// RPG Maker 规划阶段全部由外部明确提供的资源策略。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerTranslationPlanningConfiguration {
-    scope_concurrency: NonZeroUsize,
     max_message_characters: NonZeroUsize,
 }
 
 impl RpgMakerTranslationPlanningConfiguration {
-    pub(crate) const fn new(
-        scope_concurrency: NonZeroUsize,
-        max_message_characters: NonZeroUsize,
-    ) -> Self {
+    pub(crate) const fn new(max_message_characters: NonZeroUsize) -> Self {
         Self {
-            scope_concurrency,
             max_message_characters,
         }
-    }
-
-    pub(crate) const fn scope_concurrency(&self) -> NonZeroUsize {
-        self.scope_concurrency
     }
 
     pub(crate) const fn max_message_characters(&self) -> NonZeroUsize {
@@ -257,7 +248,7 @@ mod tests {
         RpgMakerTranslationProfile::new(
             "primary",
             non_zero(3),
-            RpgMakerTranslationPlanningConfiguration::new(non_zero(4), non_zero(24_000)),
+            RpgMakerTranslationPlanningConfiguration::new(non_zero(24_000)),
             RpgMakerTranslationRequestConfiguration::new(
                 vec![Duration::from_millis(250), Duration::from_secs(2)],
                 Duration::from_secs(30),
@@ -287,7 +278,6 @@ mod tests {
         let profile = profile("secret");
         assert_eq!(profile.id(), "primary");
         assert_eq!(profile.max_in_flight_tasks(), non_zero(3));
-        assert_eq!(profile.planning().scope_concurrency(), non_zero(4));
         assert_eq!(
             profile.planning().max_message_characters(),
             non_zero(24_000)

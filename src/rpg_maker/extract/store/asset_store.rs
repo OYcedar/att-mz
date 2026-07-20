@@ -5,7 +5,6 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
 
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -189,24 +188,14 @@ ORDER BY 1, 2, 3"#;
 /// 标准提取资产编码阶段的必填资源上限。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerExtractionAssetStoreConfig {
-    encode_concurrency: NonZeroUsize,
     groups_per_encode_job: NonZeroUsize,
 }
 
 impl RpgMakerExtractionAssetStoreConfig {
-    pub(crate) const fn new(
-        encode_concurrency: NonZeroUsize,
-        groups_per_encode_job: NonZeroUsize,
-    ) -> Self {
+    pub(crate) const fn new(groups_per_encode_job: NonZeroUsize) -> Self {
         Self {
-            encode_concurrency,
             groups_per_encode_job,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn encode_concurrency(self) -> NonZeroUsize {
-        self.encode_concurrency
     }
 
     #[cfg(test)]
@@ -245,17 +234,20 @@ where
         project_definition_update: Option<BuiltinProjectDefinitionUpdate>,
     ) -> Result<(), RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>>
     {
-        let batches = split_groups(groups, self.config.groups_per_encode_job.get());
-        let encoded_batches = stream::iter(batches.into_iter().map(|batch| async move {
-            self.cpu
-                .execute(move || encode_batch(batch))
-                .await
-                .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?
-                .map_err(RpgMakerExtractionAssetStoreError::EncodeSnapshot)
-        }))
-        .buffered(self.config.encode_concurrency.get())
-        .try_collect::<Vec<_>>()
-        .await?;
+        let groups_per_encode_job = self.config.groups_per_encode_job.get();
+        let batches = self
+            .cpu
+            .execute(move || split_groups(groups, groups_per_encode_job))
+            .await
+            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
+        let encoded_batches = self
+            .cpu
+            .execute_ordered_map(batches, encode_batch)
+            .await
+            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RpgMakerExtractionAssetStoreError::EncodeSnapshot)?;
 
         let database_path = project.database_path().to_path_buf();
         let project_definition = match project_definition_update {
@@ -277,31 +269,50 @@ where
                 })
             }
         };
-        let encoded = EncodedSnapshot::merge(
-            owner,
-            encoded_batches,
-            project_definition
-                .as_ref()
-                .map(|definition| definition.canonical_json.as_str()),
-        )
-        .map_err(RpgMakerExtractionAssetStoreError::EncodeSnapshot)?;
+        let source_snapshot_fingerprint =
+            project.source_snapshot_fingerprint().as_bytes().to_owned();
+        let canonical_project_definition = project_definition
+            .as_ref()
+            .map(|definition| definition.canonical_json.clone());
+        let (encoded, desired) = self
+            .cpu
+            .execute(move || {
+                let encoded = EncodedSnapshot::merge(
+                    owner,
+                    encoded_batches,
+                    canonical_project_definition.as_deref(),
+                )?;
+                let desired = encoded.desired_rows(&source_snapshot_fingerprint);
+                Ok::<_, EncodeAssetSnapshotError>((encoded, desired))
+            })
+            .await
+            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?
+            .map_err(RpgMakerExtractionAssetStoreError::EncodeSnapshot)?;
         let current = self
             .read_owner_snapshot(database_path.clone(), owner)
             .await?;
-        let desired = encoded.desired_rows(project.source_snapshot_fingerprint().as_bytes());
         let definition_is_current = project_definition.as_ref().is_none_or(|definition| {
             definition.current_canonical_json == definition.canonical_json
         });
-        if current == desired && definition_is_current {
+        let snapshot_is_current = self
+            .cpu
+            .execute(move || current == desired && definition_is_current)
+            .await
+            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
+        if snapshot_is_current {
             return Ok(());
         }
 
-        let plan = build_transaction_plan(
-            owner,
-            project.source_snapshot_fingerprint().as_bytes(),
-            encoded,
-            project_definition.and_then(|definition| definition.replacement),
-        );
+        let source_snapshot_fingerprint =
+            project.source_snapshot_fingerprint().as_bytes().to_owned();
+        let replacement = project_definition.and_then(|definition| definition.replacement);
+        let plan = self
+            .cpu
+            .execute(move || {
+                build_transaction_plan(owner, &source_snapshot_fingerprint, encoded, replacement)
+            })
+            .await
+            .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
         self.sqlite
             .execute_transaction(database_path.clone(), plan)
             .await
@@ -1175,6 +1186,23 @@ mod tests {
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(result)
         }
+
+        async fn execute_ordered_map<I, T, F>(
+            &self,
+            inputs: Vec<I>,
+            operation: F,
+        ) -> Result<Vec<T>, CpuTaskExecutionError<Self::Error>>
+        where
+            I: Send + 'static,
+            T: Send + 'static,
+            F: Fn(I) -> T + Send + Sync + 'static,
+        {
+            if self.fail {
+                return Err(CpuTaskExecutionError::Unavailable(FakeError("cpu")));
+            }
+            self.calls.fetch_add(inputs.len(), Ordering::SeqCst);
+            Ok(inputs.into_iter().map(operation).collect())
+        }
     }
 
     #[derive(Clone)]
@@ -1290,25 +1318,20 @@ mod tests {
 
         fn service(
             &self,
-            concurrency: usize,
             groups_per_job: usize,
         ) -> RpgMakerExtractionAssetStore<RecordingSqlite, RecordingCpu> {
             RpgMakerExtractionAssetStore::new(
                 self.sqlite.clone(),
                 self.cpu.clone(),
-                RpgMakerExtractionAssetStoreConfig::new(
-                    non_zero(concurrency),
-                    non_zero(groups_per_job),
-                ),
+                RpgMakerExtractionAssetStoreConfig::new(non_zero(groups_per_job)),
             )
         }
     }
 
     #[test]
-    fn config_exposes_only_explicit_non_zero_values() {
-        let config = RpgMakerExtractionAssetStoreConfig::new(non_zero(3), non_zero(20));
+    fn config_exposes_the_explicit_batch_size() {
+        let config = RpgMakerExtractionAssetStoreConfig::new(non_zero(20));
 
-        assert_eq!(config.encode_concurrency().get(), 3);
         assert_eq!(config.groups_per_encode_job().get(), 20);
     }
 
@@ -1472,14 +1495,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_uses_bounded_cpu_jobs_and_only_three_asset_tables() {
+    async fn replacement_keeps_all_snapshot_planning_in_cpu_jobs_and_uses_three_asset_tables() {
         let harness = Harness::new(None);
         let groups = (0..8)
             .map(|index| scalar_group(index, "name", &format!("文本 {index}")))
             .collect::<Vec<_>>();
 
         harness
-            .service(2, 1)
+            .service(1)
             .replace_builtin(
                 &project(),
                 BuiltinSnapshot::new(groups).expect("快照应合法"),
@@ -1488,8 +1511,7 @@ mod tests {
             .await
             .expect("快照应完成替换");
 
-        assert_eq!(harness.cpu.calls.load(Ordering::SeqCst), 8);
-        assert_eq!(harness.cpu.max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(harness.cpu.calls.load(Ordering::SeqCst), 12);
         let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
         assert_eq!(plans.len(), 1);
         let statements = plan_statements(&plans[0].1).join("\n");
@@ -1511,7 +1533,7 @@ mod tests {
         let expected_json = definition.to_canonical_json().expect("定义应可编码");
 
         harness
-            .service(1, 1)
+            .service(1)
             .replace_builtin(
                 &project(),
                 BuiltinSnapshot::new(vec![scalar_group(1, "name", "原文")]).expect("快照应合法"),
@@ -1616,7 +1638,7 @@ mod tests {
             encoded.desired_rows(project().source_snapshot_fingerprint().as_bytes());
 
         harness
-            .service(3, 1)
+            .service(1)
             .replace_builtin(
                 &project(),
                 BuiltinSnapshot::new(vec![group]).expect("快照应合法"),
@@ -1641,7 +1663,7 @@ mod tests {
         let harness = Harness::new(None);
 
         harness
-            .service(1, 1)
+            .service(1)
             .replace_rules(&project(), RulesSnapshot::empty())
             .await
             .expect("active 空快照应写入 owner state");
@@ -1677,7 +1699,7 @@ mod tests {
             SqliteValue::Blob(vec![0xb4; 32]),
         ])];
         harness
-            .service(1, 1)
+            .service(1)
             .deactivate_rules(&project())
             .await
             .expect("停用应删除 owner state");
@@ -1693,7 +1715,7 @@ mod tests {
     async fn global_target_requirement_maps_to_a_specific_conflict_error() {
         let harness = Harness::new(Some(SqliteResponse::Conflict));
         let error = harness
-            .service(1, 1)
+            .service(1)
             .replace_rules(
                 &project(),
                 RulesSnapshot::new(vec![scalar_group(1, "name", "原文")]).expect("快照应合法"),
@@ -1732,7 +1754,7 @@ mod tests {
         ] {
             let harness = Harness::new(Some(response));
             let error = harness
-                .service(1, 1)
+                .service(1)
                 .replace_lua(
                     &project(),
                     LuaSnapshot::new(vec![scalar_group(1, "name", "原文")]).expect("快照应合法"),

@@ -41,7 +41,8 @@ where
 ///
 /// 实现必须保证闭包不在异步 I/O 执行器线程上运行。队列满时应异步背压而不是
 /// 无界堆积；已经开始的任务即使调用 Future 被丢弃，也必须安全运行至结束。
-/// 闭包不得执行文件、数据库、Lua、网络等副作用。
+/// 闭包不得执行文件、数据库、Lua、网络等副作用，也不得启动脱离闭包生命周期的
+/// 后台计算任务。
 pub(crate) trait CpuTaskExecutor: Send + Sync {
     /// CPU 执行器自身的不可用原因。
     type Error: Error + Send + Sync + 'static;
@@ -54,4 +55,21 @@ pub(crate) trait CpuTaskExecutor: Send + Sync {
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static;
+
+    /// 并行计算一组相互独立的输入，并按输入顺序返回结果。
+    ///
+    /// 生产适配器可以在自己的受控执行资源中覆盖此方法；串行测试替身无需理解
+    /// 并行调度，默认实现仍通过同一个 CPU 根执行整批计算。
+    fn execute_ordered_map<I, T, F>(
+        &self,
+        inputs: Vec<I>,
+        operation: F,
+    ) -> impl Future<Output = Result<Vec<T>, CpuTaskExecutionError<Self::Error>>> + Send
+    where
+        I: Send + 'static,
+        T: Send + 'static,
+        F: Fn(I) -> T + Send + Sync + 'static,
+    {
+        self.execute(move || inputs.into_iter().map(operation).collect())
+    }
 }

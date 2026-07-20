@@ -7,13 +7,10 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::Utf8Error;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
-use futures_util::stream;
 use serde_json::Value;
 
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -50,7 +47,6 @@ pub(crate) struct RulesExtractionService<F, D, S, C> {
     document_reader: D,
     snapshot_store: S,
     cpu_executor: C,
-    config: RulesExtractionConfig,
 }
 
 impl<F, D, S, C> RulesExtractionService<F, D, S, C> {
@@ -59,31 +55,13 @@ impl<F, D, S, C> RulesExtractionService<F, D, S, C> {
         document_reader: D,
         snapshot_store: S,
         cpu_executor: C,
-        config: RulesExtractionConfig,
     ) -> Self {
         Self {
             file_reader,
             document_reader,
             snapshot_store,
             cpu_executor,
-            config,
         }
-    }
-}
-
-/// Rules 按规则扫描冻结来源时允许并行占用的 CPU 工作单元数。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RulesExtractionConfig {
-    scan_concurrency: NonZeroUsize,
-}
-
-impl RulesExtractionConfig {
-    pub(crate) const fn new(scan_concurrency: NonZeroUsize) -> Self {
-        Self { scan_concurrency }
-    }
-
-    pub(crate) const fn scan_concurrency(self) -> NonZeroUsize {
-        self.scan_concurrency
     }
 }
 
@@ -149,12 +127,21 @@ where
                 rules_path: rules_path.clone(),
                 source,
             })?;
-        let input = build_match_input(&definition, documents).map_err(|source| {
-            RulesExtractionError::InvalidTarget {
+        let (definition, input) = self
+            .cpu_executor
+            .execute(move || {
+                let input = build_match_input(&definition, documents)?;
+                Ok::<_, RulesMatchError>((definition, input))
+            })
+            .await
+            .map_err(|source| RulesExtractionError::MatchSourceCompute {
                 rules_path: rules_path.clone(),
                 source,
-            }
-        })?;
+            })?
+            .map_err(|source| RulesExtractionError::InvalidTarget {
+                rules_path: rules_path.clone(),
+                source,
+            })?;
 
         let matches = self
             .match_rules_parallel(definition, input)
@@ -201,24 +188,16 @@ where
         input: RulesMatchInput,
     ) -> Result<RulesSnapshot, ParallelRulesBuildError<C::Error>> {
         let input = Arc::new(input);
-        let concurrency = self.config.scan_concurrency().get();
-        let work = stream::iter(definition.into_rules().into_iter().map(|rule| {
-            let input = Arc::clone(&input);
-            async move {
-                self.cpu_executor
-                    .execute(move || match_rule(&rule, &input))
-                    .await
-                    .map_err(ParallelRulesBuildError::MatchCompute)?
-                    .map_err(ParallelRulesBuildError::Match)
-            }
-        }))
-        .buffered(concurrency);
-        futures_util::pin_mut!(work);
-
-        let mut completed = Vec::new();
-        while let Some(result) = work.next().await {
-            completed.push(result?);
-        }
+        let completed = self
+            .cpu_executor
+            .execute_ordered_map(definition.into_rules(), move |rule| {
+                match_rule(&rule, &input)
+            })
+            .await
+            .map_err(ParallelRulesBuildError::MatchCompute)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ParallelRulesBuildError::Match)?;
 
         self.cpu_executor
             .execute(move || {
@@ -728,15 +707,6 @@ path = 'entries[0].right.Name'
         );
     }
 
-    #[test]
-    fn config_keeps_explicit_scan_limit() {
-        let concurrency = NonZeroUsize::new(4).expect("并发上限应非零");
-        assert_eq!(
-            RulesExtractionConfig::new(concurrency).scan_concurrency(),
-            concurrency
-        );
-    }
-
     #[tokio::test]
     async fn failed_candidate_never_replaces_or_deactivates_the_previous_snapshot() {
         let state = Arc::new(StoreState::default());
@@ -789,7 +759,6 @@ path = '[].name'
                 state: Arc::clone(&state),
             },
             InlineCpu,
-            RulesExtractionConfig::new(NonZeroUsize::new(2).expect("并发数应非零")),
         );
 
         service
@@ -815,7 +784,6 @@ path = '[].name'
             },
             FakeStore { state },
             InlineCpu,
-            RulesExtractionConfig::new(NonZeroUsize::new(2).expect("并发数应非零")),
         )
     }
 

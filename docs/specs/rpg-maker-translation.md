@@ -129,6 +129,17 @@ Prompt、上下文、术语和受保护文本共同形成 user message。
 JSON parameters。网络重试只按 Profile 的明确延迟和 `Retry-After` 上限执行；协议失败
 不伪装成网络故障。
 
+Standard 使用 `max_in_flight_tasks = N` 个持续消费者执行已经物化的有序 TaskBlock。
+后序任务完成后立即补入新任务，不等待更早的慢请求；每个结果按计划 index 落入独立槽，
+另一个顺序 finalizer 只按 `0..n` 提交数据库、更新报告并写终态审计。活动执行不超过
+`N`，已启动但尚未 finalization 的任务不超过 `2N`；重试始终属于原 TaskBlock 并占用
+原执行槽。
+
+正常 `Complete`、`Partial` 与 `Unavailable` 都继续补位。技术错误或合作取消停止领取
+新任务，但已启动任务全部排空；并存技术错误按最小计划 index 选择主错误，且只提交首个
+技术失败前的连续成功前缀。后续成功标记为未提交，取消排空中出现的技术错误优先于取消。
+并发只改变完成时间，不改变提交、报告或终态审计顺序。
+
 响应只接受一个可完整消费的 JSON 数组信封，可有首尾空白、至多一个开头 BOM，以及
 恰好包裹全部 JSON 的单层无标记或 `json` 围栏。不搜索说明文字中的数组，不修复尾逗号、
 注释、引号、ID 或译文。结构失败使整批 `Unavailable(ModelResponseUnusable)`；结构

@@ -185,10 +185,11 @@ Extract Lua 获得公共 `ctx.project/json/source/rpg_maker/db` 和阶段专属 
 原子替换 Lua owner，`clear_standard` 停用该 owner。脚本可以使用 `ctx.rpg_maker` 的
 data、map、plugin、document 与位置能力，不需要复制 JSON/路径 codec。
 
-文档读取、JSON/PCRE2 处理和资产编码使用 `[rpg_maker.document]`、
-`[rpg_maker.extract.*]` 与 CPU 配置给出的有界资源。Builtin 和 Rules 的局部工作可以
-并行，但归并始终按 RPG Maker 自然顺序确定；并发完成顺序不改变逻辑位置、冲突结果
-或提交内容。
+文档磁盘读取使用 `[rpg_maker.document].read_concurrency`；JSON/PCRE2 处理与资产编码
+全部进入命令私有 CPU 根，Store 配置只决定每个编码作业的批量粒度。读取完成的文档可
+立即交给 CPU，不等待较早文件；Builtin 和 Rules 的独立局部工作使用有序批量计算，归并
+始终按 RPG Maker 权威身份和自然顺序确定。完成顺序不改变逻辑位置、冲突结果或提交
+内容。
 
 ## 7. 完成语义
 

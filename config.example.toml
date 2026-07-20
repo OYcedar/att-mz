@@ -10,7 +10,7 @@ max_blocking_threads = 8
 blocking_thread_keep_alive_ms = 1000
 
 [runtime.cpu]
-worker_threads = 4
+worker_threads = "auto"
 queue_capacity = 64
 
 [runtime.filesystem]
@@ -95,24 +95,14 @@ parameters = '''
 
 [rpg_maker.document]
 read_concurrency = 8
-parse_concurrency = 4
 
 [rpg_maker.standard_asset]
-decode_concurrency = 4
 leaves_per_decode_job = 512
 
-[rpg_maker.extract.builtin]
-scan_concurrency = 4
-
-[rpg_maker.extract.rules]
-scan_concurrency = 4
-
 [rpg_maker.extract.store]
-encode_concurrency = 4
 groups_per_encode_job = 256
 
 [rpg_maker.translate.store]
-encode_concurrency = 4
 leaves_per_encode_job = 512
 
 [[languages]]
@@ -138,7 +128,6 @@ llm_client = "primary"
 max_in_flight_tasks = 4
 
 [rpg_maker.translation_profiles.planning]
-scope_concurrency = 4
 max_message_characters = 24000
 
 [rpg_maker.translation_profiles.execution]

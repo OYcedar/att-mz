@@ -210,30 +210,19 @@ pub(crate) trait RpgMakerProjectDocumentReader: Send + Sync {
 
 /// RPG Maker 文档读取阶段的外部配置。
 ///
-/// 两个上限必须由组合根显式提供；本类型不读取环境、不检测硬件，也不提供默认值。
+/// 读取上限必须由组合根显式提供；CPU 解析并行度统一由 CPU 根执行器管理。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerDocumentReadingConfig {
     read_concurrency: NonZeroUsize,
-    parse_concurrency: NonZeroUsize,
 }
 
 impl RpgMakerDocumentReadingConfig {
-    pub(crate) const fn new(
-        read_concurrency: NonZeroUsize,
-        parse_concurrency: NonZeroUsize,
-    ) -> Self {
-        Self {
-            read_concurrency,
-            parse_concurrency,
-        }
+    pub(crate) const fn new(read_concurrency: NonZeroUsize) -> Self {
+        Self { read_concurrency }
     }
 
     pub(crate) const fn read_concurrency(self) -> NonZeroUsize {
         self.read_concurrency
-    }
-
-    pub(crate) const fn parse_concurrency(self) -> NonZeroUsize {
-        self.parse_concurrency
     }
 }
 
@@ -287,46 +276,55 @@ where
             .await
             .map_err(RpgMakerProjectDocumentReadingError::ListMaps)?;
         let read_concurrency = self.config.read_concurrency().get();
-        let parse_concurrency = self.config.parse_concurrency().get();
-
-        let reads = stream::iter(requests.into_iter().map(|request| async move {
-            let requested_path = request.path.clone();
-            let file = self
-                .file_reader
-                .read_file(requested_path.clone())
-                .await
-                .map_err(|source| RpgMakerProjectDocumentReadingError::ReadDocument {
-                    path: requested_path,
-                    source,
-                })?;
-            Ok((request.kind, file))
-        }))
-        .buffered(read_concurrency);
-
-        let parses = reads
-            .map(|read_result| async move {
-                let (kind, file) = read_result?;
-                let resolved_path = file.resolved_path().to_path_buf();
-                let schedule_path = resolved_path.clone();
-                let bytes = file.into_bytes();
-                let parsed = self
-                    .cpu_executor
-                    .execute(move || parse_document(kind, resolved_path, bytes))
+        // 第二层只覆盖本次有限请求集合，使读取完成后立即进入 CPU 根的准入等待；
+        // 实际执行与已接管队列仍由 CPU 根的统一预算约束。
+        let parse_submission_capacity = requests.len().max(1);
+        let reads = stream::iter(requests.into_iter().enumerate().map(
+            |(request_index, request)| async move {
+                let requested_path = request.path.clone();
+                let result = self
+                    .file_reader
+                    .read_file(requested_path.clone())
                     .await
-                    .map_err(
-                        |source| RpgMakerProjectDocumentReadingError::ScheduleParse {
-                            path: schedule_path,
-                            source,
-                        },
-                    )?;
-                parsed.map_err(RpgMakerProjectDocumentReadingError::from_parse_failure)
-            })
-            .buffered(parse_concurrency);
+                    .map(|file| (request.kind, file))
+                    .map_err(|source| RpgMakerProjectDocumentReadingError::ReadDocument {
+                        path: requested_path,
+                        source,
+                    });
+                (request_index, result)
+            },
+        ))
+        .buffer_unordered(read_concurrency);
 
-        futures_util::pin_mut!(parses);
+        let work = reads
+            .map(|(request_index, read_result)| async move {
+                let result = async {
+                    let (kind, file) = read_result?;
+                    let resolved_path = file.resolved_path().to_path_buf();
+                    let schedule_path = resolved_path.clone();
+                    let bytes = file.into_bytes();
+                    let parsed = self
+                        .cpu_executor
+                        .execute(move || parse_document(kind, resolved_path, bytes))
+                        .await
+                        .map_err(
+                            |source| RpgMakerProjectDocumentReadingError::ScheduleParse {
+                                path: schedule_path,
+                                source,
+                            },
+                        )?;
+                    parsed.map_err(RpgMakerProjectDocumentReadingError::from_parse_failure)
+                }
+                .await;
+                (request_index, result)
+            })
+            .buffer_unordered(parse_submission_capacity);
+
+        let mut completed = work.collect::<Vec<_>>().await;
+        completed.sort_by_key(|(request_index, _)| *request_index);
         let mut documents = BTreeMap::new();
         let mut plugins = Vec::new();
-        while let Some(result) = parses.next().await {
+        for (_, result) in completed {
             match result? {
                 ParsedDocument::Json { id, value } => {
                     documents.insert(id, value);
@@ -678,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_selection_does_not_touch_any_root_capability() {
-        let harness = Harness::new(HashMap::new(), Vec::new(), 2, 2);
+        let harness = Harness::new(HashMap::new(), Vec::new(), 2);
 
         let documents = harness
             .service()
@@ -694,7 +692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_documents_are_read_and_parsed_with_bounded_overlap() {
+    async fn selected_documents_keep_bounded_reads_and_submit_parses_as_reads_finish() {
         let root = project().source_root().to_path_buf();
         let actors = root.join("data").join("Actors.json");
         let map_one = root.join("data").join("Map001.json");
@@ -733,7 +731,7 @@ var $plugins =
             root.join("data").join("QuestData.json"),
             map_one,
         ];
-        let harness = Harness::new(files, entries, 3, 2);
+        let harness = Harness::new(files, entries, 3);
         let selection = RpgMakerDocumentSelection::new([StandardDataFile::Actors], true, true);
 
         let documents = harness
@@ -747,7 +745,7 @@ var $plugins =
         assert!(harness.max_file_active.load(Ordering::SeqCst) > 1);
         assert!(harness.max_file_active.load(Ordering::SeqCst) <= 3);
         assert!(harness.max_cpu_active.load(Ordering::SeqCst) > 1);
-        assert!(harness.max_cpu_active.load(Ordering::SeqCst) <= 2);
+        assert_eq!(harness.cpu_calls.load(Ordering::SeqCst), 4);
         assert_eq!(
             documents
                 .document(RpgMakerDocumentId::Data(StandardDataFile::Actors))
@@ -786,7 +784,6 @@ var $plugins =
             HashMap::from([(map, r#"{"displayName":"精确地图"}"#.as_bytes().to_vec())]),
             Vec::new(),
             1,
-            1,
         );
         let mut selection = RpgMakerDocumentSelection::empty();
         selection.insert_map(42);
@@ -816,7 +813,6 @@ var $plugins =
             HashMap::from([(path, r#"[{"Name":"Baking"}]"#.as_bytes().to_vec())]),
             Vec::new(),
             1,
-            1,
         );
         let mut selection = RpgMakerDocumentSelection::empty();
         selection.insert_data_file(file.clone());
@@ -840,12 +836,8 @@ var $plugins =
     async fn invalid_utf8_and_invalid_plugin_record_keep_precise_stage() {
         let root = project().source_root().to_path_buf();
         let actors = root.join("data").join("Actors.json");
-        let invalid_utf8 = Harness::new(
-            HashMap::from([(actors.clone(), vec![0xff])]),
-            Vec::new(),
-            1,
-            1,
-        );
+        let invalid_utf8 =
+            Harness::new(HashMap::from([(actors.clone(), vec![0xff])]), Vec::new(), 1);
 
         let error = invalid_utf8
             .service()
@@ -864,7 +856,6 @@ var $plugins =
         let invalid_record = Harness::new(
             HashMap::from([(plugins.clone(), b"var $plugins = [null];".to_vec())]),
             Vec::new(),
-            1,
             1,
         );
         let error = invalid_record
@@ -885,7 +876,6 @@ var $plugins =
         let harness = Harness::new(
             HashMap::from([(plugins.clone(), b"const plugins = [];".to_vec())]),
             Vec::new(),
-            1,
             1,
         );
 
@@ -919,10 +909,7 @@ var $plugins =
                 calls: Arc::new(AtomicUsize::new(0)),
             },
             PanickedCpuExecutor,
-            RpgMakerDocumentReadingConfig::new(
-                NonZeroUsize::new(1).expect("测试读取并发必须非零"),
-                NonZeroUsize::new(1).expect("测试解析并发必须非零"),
-            ),
+            RpgMakerDocumentReadingConfig::new(NonZeroUsize::new(1).expect("测试读取并发必须非零")),
         );
 
         let error = service
@@ -946,7 +933,7 @@ var $plugins =
     fn reading_future_is_send() {
         fn assert_send(_: impl Send) {}
 
-        let harness = Harness::new(HashMap::new(), Vec::new(), 1, 1);
+        let harness = Harness::new(HashMap::new(), Vec::new(), 1);
         let service = harness.service();
         let project = project();
         assert_send(service.read(&project, RpgMakerDocumentSelection::empty()));
@@ -1067,7 +1054,6 @@ var $plugins =
         cpu_active: Arc<AtomicUsize>,
         max_cpu_active: Arc<AtomicUsize>,
         read_concurrency: NonZeroUsize,
-        parse_concurrency: NonZeroUsize,
     }
 
     impl Harness {
@@ -1075,7 +1061,6 @@ var $plugins =
             files: HashMap<PathBuf, Vec<u8>>,
             entries: Vec<PathBuf>,
             read_concurrency: usize,
-            parse_concurrency: usize,
         ) -> Self {
             Self {
                 files: Arc::new(files),
@@ -1089,8 +1074,6 @@ var $plugins =
                 max_cpu_active: Arc::new(AtomicUsize::new(0)),
                 read_concurrency: NonZeroUsize::new(read_concurrency)
                     .expect("测试读取并发必须非零"),
-                parse_concurrency: NonZeroUsize::new(parse_concurrency)
-                    .expect("测试解析并发必须非零"),
             }
         }
 
@@ -1117,7 +1100,7 @@ var $plugins =
                     active: Arc::clone(&self.cpu_active),
                     max_active: Arc::clone(&self.max_cpu_active),
                 },
-                RpgMakerDocumentReadingConfig::new(self.read_concurrency, self.parse_concurrency),
+                RpgMakerDocumentReadingConfig::new(self.read_concurrency),
             )
         }
     }

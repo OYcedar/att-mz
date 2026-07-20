@@ -848,7 +848,7 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
         calls: Arc::clone(&lua_runtime_calls),
     };
 
-    let planning = RpgMakerTranslationPlanningConfiguration::new(non_zero(1), non_zero(10_000));
+    let planning = RpgMakerTranslationPlanningConfiguration::new(non_zero(10_000));
     let profile = Arc::new(RpgMakerTranslationProfile::new(
         "quality",
         non_zero(1),
@@ -874,7 +874,7 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     let asset_reader = RpgMakerStandardTranslationAssetReadingService::new(
         sqlite_query,
         cpu.clone(),
-        RpgMakerStandardAssetReadingConfig::new(non_zero(1), non_zero(1)),
+        RpgMakerStandardAssetReadingConfig::new(non_zero(1)),
     );
     let languages = translation_resources();
     let resources =
@@ -895,7 +895,7 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     let result_store = RpgMakerStandardTranslationResultStorageService::new(
         sqlite_transaction,
         cpu,
-        RpgMakerStandardTranslationResultStorageConfig::new(non_zero(1), non_zero(1)),
+        RpgMakerStandardTranslationResultStorageConfig::new(non_zero(1)),
     );
     let standard = StandardTranslationService::new(
         asset_reader,

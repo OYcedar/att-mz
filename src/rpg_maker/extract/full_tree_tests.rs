@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::builtin::{BuiltInExtractionConfig, BuiltInExtractionService};
+use super::builtin::BuiltInExtractionService;
 use super::document::{RpgMakerDocumentReadingConfig, RpgMakerProjectDocumentReadingService};
 use super::lua::{
     LuaExtractionService, LuaInvocation, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
 };
-use super::rules::{RulesExtractionConfig, RulesExtractionService};
+use super::rules::RulesExtractionService;
 use super::service::ExtractService;
 use super::store::asset_store::{RpgMakerExtractionAssetStore, RpgMakerExtractionAssetStoreConfig};
 use super::{ExtractInput, SelectedRules};
@@ -371,8 +371,8 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
         fail_owner: Arc::clone(&fail_owner),
     };
 
-    let document_config = RpgMakerDocumentReadingConfig::new(non_zero(2), non_zero(2));
-    let store_config = RpgMakerExtractionAssetStoreConfig::new(non_zero(2), non_zero(2));
+    let document_config = RpgMakerDocumentReadingConfig::new(non_zero(2));
+    let store_config = RpgMakerExtractionAssetStoreConfig::new(non_zero(2));
 
     let opener = ExistingProjectOpeningService::new(
         ProjectDatabaseRecordReadingService::new(
@@ -394,7 +394,6 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
         ),
         RpgMakerExtractionAssetStore::new(sqlite_transactions.clone(), cpu.clone(), store_config),
         cpu.clone(),
-        BuiltInExtractionConfig::new(non_zero(2)),
     );
     let rules = RulesExtractionService::new(
         file_reader.clone(),
@@ -406,7 +405,6 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
         ),
         RpgMakerExtractionAssetStore::new(sqlite_transactions.clone(), cpu.clone(), store_config),
         cpu.clone(),
-        RulesExtractionConfig::new(non_zero(2)),
     );
     let lua = LuaExtractionService::new(
         FakeTrustedLuaExecutionHost {

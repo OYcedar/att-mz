@@ -1319,24 +1319,14 @@ retained_rotated_files = 2
 
 [rpg_maker.document]
 read_concurrency = 2
-parse_concurrency = 2
 
 [rpg_maker.standard_asset]
-decode_concurrency = 2
 leaves_per_decode_job = 32
 
-[rpg_maker.extract.builtin]
-scan_concurrency = 2
-
-[rpg_maker.extract.rules]
-scan_concurrency = 2
-
 [rpg_maker.extract.store]
-encode_concurrency = 2
 groups_per_encode_job = 32
 
 [rpg_maker.translate.store]
-encode_concurrency = 2
 leaves_per_encode_job = 32
 
 [[languages]]
@@ -1372,7 +1362,6 @@ llm_client = "primary"
 max_in_flight_tasks = 1
 
 [rpg_maker.translation_profiles.planning]
-scope_concurrency = 2
 max_message_characters = 10000
 
 [rpg_maker.translation_profiles.execution]
@@ -1385,7 +1374,6 @@ llm_client = "primary"
 max_in_flight_tasks = 1
 
 [rpg_maker.translation_profiles.planning]
-scope_concurrency = 1
 max_message_characters = 10000
 
 [rpg_maker.translation_profiles.execution]

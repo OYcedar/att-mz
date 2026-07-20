@@ -73,6 +73,11 @@ att mz|mv write-back --name NAME [--lua SCRIPT_LUA]
 
 可选 Lua 把脚本和执行能力组合成一个受信选择，不允许“有路径但缺依赖”的内部状态。
 
+Extract、Translate 与 WriteBack 各自在命令生命周期内构造一个私有 Rayon CPU 池；文档
+解析、规则扫描、资产编解码、规划准备与写回计算都通过同一根能力共享线程和准入预算，
+业务模块不使用全局 Rayon 池。等待 CPU 准入时取消则任务不执行；已经准入的任务即使
+调用 Future 被丢弃也会完成，shutdown 停止新准入并排空全部已接管作业。
+
 ## 4. 引擎布局与项目租约
 
 MZ 只接受包含 `data/js/rmmz_core.js` 的游戏根；MV 只接受包含

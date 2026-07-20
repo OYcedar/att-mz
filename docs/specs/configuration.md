@@ -83,7 +83,7 @@ Translate 必须解析并验证全部 `[[languages]]` 条目，因此任一非�
 | 分区 | 职责 |
 |---|---|
 | `runtime.async` | Tokio 工作线程、阻塞线程上限和保活时间 |
-| `runtime.cpu` | 共享执行层的 CPU 专用线程数和有界队列 |
+| `runtime.cpu` | 命令私有 Rayon 池的工作线程选择和有界等待队列 |
 | `runtime.filesystem` | 文件工作线程、队列、单文件读取和单目录枚举上限 |
 | `runtime.filesystem.tree` | 来源指纹、候选树和候选编辑共用的条目、深度、总字节与单文件预算 |
 | `runtime.filesystem.publisher` | 单目标恢复产物数和目录发布锁等待上限 |
@@ -94,6 +94,20 @@ Translate 必须解析并验证全部 `[[languages]]` 条目，因此任一非�
 
 Lua 每次脚本使用一个专用线程；SQLite 交互命令通道容量固定为 1；每个命令至多持有
 一个目录候选。这些是当前产品固定的生命周期事实，不需要用户配置。
+
+CPU 根使用单一现行配置：
+
+```toml
+[runtime.cpu]
+worker_threads = "auto" # 或正整数
+queue_capacity = 64
+```
+
+`worker_threads` 只接受精确小写 `"auto"` 或正整数。`auto` 在命令启动时读取进程可用
+并行度；探测失败即启动失败。无论自动还是固定值，线程数都显式交给命令私有 Rayon
+池，不读取全局 Rayon 池或 `RAYON_NUM_THREADS`。`queue_capacity` 必须大于零；CPU
+总准入量等于实际线程数加等待队列容量。所有 RPG Maker 纯 CPU 作业共享该预算，业务
+阶段不再拥有重复的解析、扫描、编解码或 scope 并发上限。
 
 SQLite `journal_mode` 只允许 `delete`、`truncate`、`persist`、`wal`；`synchronous`
 只允许 `normal`、`full`、`extra`。短操作、建库和唯一交互会话共享这些策略。
@@ -200,8 +214,6 @@ UTF-8 且内容不能全为空白。系统 Prompt 绑定读取时的精确 `Lang
 ```toml
 [rpg_maker.document]
 [rpg_maker.standard_asset]
-[rpg_maker.extract.builtin]
-[rpg_maker.extract.rules]
 [rpg_maker.extract.store]
 [rpg_maker.translate.store]
 ```
@@ -216,7 +228,6 @@ llm_client = "primary"
 max_in_flight_tasks = 4
 
 [rpg_maker.translation_profiles.planning]
-scope_concurrency = 4
 max_message_characters = 24000
 
 [rpg_maker.translation_profiles.execution]
@@ -227,12 +238,17 @@ max_network_retry_after_ms = 30000
 配置中不存在语言对到 Prompt 的映射。受信 RPG Maker Profile 只保存 ID、非零
 任务并发、Planning 配置、Request 配置
 和所选公共 Client。Profile ID 精确匹配，不 trim、不折叠大小写、不提供别名或默认项。
+所选 Profile 的 `max_in_flight_tasks` 不得超过 `runtime.llm.max_active_requests +
+queue_capacity`，且不得使 Standard 的 `2N` 顺序最终化窗口超过运行时 Semaphore 上限。
+`runtime.llm` 的活动与排队总容量本身也不得超过该上限；任一组合不满足时都在启动网络
+请求前作为配置错误失败。
 
 `LanguageId`、`LanguagePair`、`LanguageModuleCatalog`、公共 LLM、文件、SQLite 和 CPU
 执行器、RPG Maker Profile 与 Prompt 协议属于 MV/MZ 共享能力。引擎切片只拥有命令
 契约、游戏目录适配和引擎特有投影；项目 schema、数据库对账和翻译资源由共享
 RPG Maker 实现拥有。
 
-`rpg_maker.document`、`rpg_maker.standard_asset`、Extract/Translate Store 和实际算法
-并发仍由其现实消费配置建立。Init 的五项项目事实来自 CLI 或已有数据库，不从配置推断默认值。首次
+`rpg_maker.document` 只配置磁盘读取并发；`rpg_maker.standard_asset` 与
+Extract/Translate Store 只配置 CPU 作业的批量粒度。实际 CPU 并行预算统一来自
+`runtime.cpu`。Init 的五项项目事实来自 CLI 或已有数据库，不从配置推断默认值。首次
 创建时五项全部必需；已有项目省略单项表示复用数据库中的当前事实。

@@ -1936,10 +1936,8 @@ mod tests {
     }
 
     fn profile() -> RpgMakerTranslationProfile<&'static str> {
-        let planning = RpgMakerTranslationPlanningConfiguration::new(
-            NonZeroUsize::new(2).expect("非零"),
-            NonZeroUsize::new(4096).expect("非零"),
-        );
+        let planning =
+            RpgMakerTranslationPlanningConfiguration::new(NonZeroUsize::new(4096).expect("非零"));
         RpgMakerTranslationProfile::new(
             "quality",
             NonZeroUsize::new(3).expect("非零"),

@@ -749,13 +749,13 @@ fn build_full_tree_with_publish_error(
     let asset_reader = RpgMakerStandardWriteBackAssetReadingService::new(
         sqlite.clone(),
         cpu.clone(),
-        RpgMakerStandardAssetReadingConfig::new(non_zero(2), non_zero(1)),
+        RpgMakerStandardAssetReadingConfig::new(non_zero(2)),
     );
     let document_reader = RpgMakerProjectDocumentReadingService::new(
         file_reader.clone(),
         RejectingDirectoryLister,
         cpu.clone(),
-        RpgMakerDocumentReadingConfig::new(non_zero(2), non_zero(2)),
+        RpgMakerDocumentReadingConfig::new(non_zero(2)),
     );
     let rewriter = RpgMakerWriteBackDocumentRewritingService::new(document_reader, cpu.clone());
     let cancellation = crate::execution::CooperativeCancellation::default();
@@ -764,6 +764,7 @@ fn build_full_tree_with_publish_error(
         asset_reader,
         ConservativeRpgMakerWriteBackTextLayouter,
         rewriter,
+        cpu.clone(),
         cancellation.clone(),
     );
     let host = TrustedLuaExecutionHostingService::<_, RecordingLlm, _, _>::without_llm(

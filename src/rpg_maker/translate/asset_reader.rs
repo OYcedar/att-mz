@@ -4,8 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-
-use futures_util::stream::{self, StreamExt, TryStreamExt};
+use std::sync::Arc;
 
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
@@ -159,59 +158,42 @@ where
             )
             .await
             .map_err(|error| map_query_error(database_path.clone(), error))?;
-        let snapshot = split_snapshot_rows(rows)
-            .map_err(RpgMakerStandardTranslationAssetReadingError::InvalidSnapshot)?;
-        let source_snapshot_fingerprint = decode_metadata(snapshot.metadata)
-            .map_err(RpgMakerStandardTranslationAssetReadingError::InvalidSnapshot)?;
-        if source_snapshot_fingerprint != project.source_snapshot_fingerprint() {
-            return Err(
-                RpgMakerStandardTranslationAssetReadingError::ProjectSnapshotChanged {
-                    expected: project.source_snapshot_fingerprint(),
-                    actual: source_snapshot_fingerprint,
-                },
-            );
-        }
-
-        let owner_states = decode_owner_states(snapshot.owners, source_snapshot_fingerprint)
-            .map_err(RpgMakerStandardTranslationAssetReadingError::InvalidSnapshot)?;
-        if !owner_states.stale.is_empty() {
-            return Err(
-                RpgMakerStandardTranslationAssetReadingError::ExtractionOutOfDate {
-                    owners: owner_states.stale,
-                },
-            );
-        }
-        let (terminology_json, placeholder_rules_json) = decode_resources(snapshot.resources)
-            .map_err(RpgMakerStandardTranslationAssetReadingError::InvalidSnapshot)?;
-
-        let jobs = partition_rows(snapshot.leaves, self.config.leaves_per_decode_job().get());
-        let decoded_batches = stream::iter(jobs.into_iter().map(|job| {
-            let active_owners = owner_states.active.clone();
-            async move {
-                self.cpu
-                    .execute(move || decode_rows(job, &active_owners))
-                    .await
-                    .map_err(RpgMakerStandardTranslationAssetReadingError::ScheduleDecode)?
-                    .map_err(RpgMakerStandardTranslationAssetReadingError::InvalidSnapshot)
-            }
-        }))
-        .buffered(self.config.decode_concurrency().get())
-        .try_collect::<Vec<_>>()
-        .await?;
-
-        let decoded = decoded_batches.into_iter().flatten().collect::<Vec<_>>();
+        let expected_source_snapshot = project.source_snapshot_fingerprint();
+        let leaves_per_job = self.config.leaves_per_decode_job().get();
+        let prepared = self
+            .cpu
+            .execute(move || prepare_snapshot(rows, expected_source_snapshot, leaves_per_job))
+            .await
+            .map_err(RpgMakerStandardTranslationAssetReadingError::SchedulePreparation)?
+            .map_err(map_snapshot_preparation_error)?;
+        let active_owners = Arc::new(prepared.active_owners);
+        let decoded_batches = self
+            .cpu
+            .execute_ordered_map(prepared.jobs, move |job| {
+                decode_rows(job, active_owners.as_ref())
+            })
+            .await
+            .map_err(RpgMakerStandardTranslationAssetReadingError::ScheduleDecode)?;
         let groups = self
             .cpu
-            .execute(move || assemble_corpus(decoded))
+            .execute(move || {
+                let decoded = decoded_batches
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                assemble_corpus(decoded)
+            })
             .await
             .map_err(RpgMakerStandardTranslationAssetReadingError::ScheduleAssembly)?
             .map_err(RpgMakerStandardTranslationAssetReadingError::InvalidSnapshot)?;
         Ok(StandardTranslationCorpus::with_snapshot(
             groups,
-            source_snapshot_fingerprint,
-            owner_states.snapshots,
-            terminology_json,
-            placeholder_rules_json,
+            prepared.source_snapshot_fingerprint,
+            prepared.owner_snapshots,
+            prepared.terminology_json,
+            prepared.placeholder_rules_json,
         ))
     }
 }
@@ -232,6 +214,7 @@ pub(crate) enum RpgMakerStandardTranslationAssetReadingError<Q, C> {
     ExtractionOutOfDate {
         owners: Vec<RpgMakerStandardAssetOwner>,
     },
+    SchedulePreparation(CpuTaskExecutionError<C>),
     ScheduleDecode(CpuTaskExecutionError<C>),
     ScheduleAssembly(CpuTaskExecutionError<C>),
     InvalidSnapshot(InvalidStandardTranslationAssetSnapshot),
@@ -266,6 +249,9 @@ impl<Q: fmt::Display, C: fmt::Display> fmt::Display
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::SchedulePreparation(source) => {
+                write!(formatter, "资产快照准备任务执行失败：{source}")
+            }
             Self::ScheduleDecode(source) => write!(formatter, "资产解码任务执行失败：{source}"),
             Self::ScheduleAssembly(source) => {
                 write!(formatter, "资产语料组装任务执行失败：{source}")
@@ -281,7 +267,9 @@ impl<Q: Error + 'static, C: Error + 'static> Error
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Query { source, .. } => Some(source),
-            Self::ScheduleDecode(source) | Self::ScheduleAssembly(source) => Some(source),
+            Self::SchedulePreparation(source)
+            | Self::ScheduleDecode(source)
+            | Self::ScheduleAssembly(source) => Some(source),
             Self::InvalidSnapshot(source) => Some(source),
             Self::DatabaseNotFound { .. }
             | Self::ProjectSnapshotChanged { .. }
@@ -446,6 +434,80 @@ struct SnapshotRows {
     owners: Vec<SqliteRow>,
     resources: Vec<SqliteRow>,
     leaves: Vec<SqliteRow>,
+}
+
+struct PreparedSnapshot {
+    source_snapshot_fingerprint: SourceSnapshotFingerprint,
+    owner_snapshots: Vec<TranslationOwnerSnapshot>,
+    active_owners: BTreeSet<&'static str>,
+    terminology_json: String,
+    placeholder_rules_json: String,
+    jobs: Vec<Vec<SqliteRow>>,
+}
+
+enum SnapshotPreparationError {
+    Invalid(InvalidStandardTranslationAssetSnapshot),
+    ProjectSnapshotChanged {
+        expected: SourceSnapshotFingerprint,
+        actual: SourceSnapshotFingerprint,
+    },
+    ExtractionOutOfDate {
+        owners: Vec<RpgMakerStandardAssetOwner>,
+    },
+}
+
+fn prepare_snapshot(
+    rows: Vec<SqliteRow>,
+    expected_source_snapshot: SourceSnapshotFingerprint,
+    leaves_per_job: usize,
+) -> Result<PreparedSnapshot, SnapshotPreparationError> {
+    let snapshot = split_snapshot_rows(rows).map_err(SnapshotPreparationError::Invalid)?;
+    let source_snapshot_fingerprint =
+        decode_metadata(snapshot.metadata).map_err(SnapshotPreparationError::Invalid)?;
+    if source_snapshot_fingerprint != expected_source_snapshot {
+        return Err(SnapshotPreparationError::ProjectSnapshotChanged {
+            expected: expected_source_snapshot,
+            actual: source_snapshot_fingerprint,
+        });
+    }
+
+    let owner_states = decode_owner_states(snapshot.owners, source_snapshot_fingerprint)
+        .map_err(SnapshotPreparationError::Invalid)?;
+    if !owner_states.stale.is_empty() {
+        return Err(SnapshotPreparationError::ExtractionOutOfDate {
+            owners: owner_states.stale,
+        });
+    }
+    let (terminology_json, placeholder_rules_json) =
+        decode_resources(snapshot.resources).map_err(SnapshotPreparationError::Invalid)?;
+
+    Ok(PreparedSnapshot {
+        source_snapshot_fingerprint,
+        owner_snapshots: owner_states.snapshots,
+        active_owners: owner_states.active,
+        terminology_json,
+        placeholder_rules_json,
+        jobs: partition_rows(snapshot.leaves, leaves_per_job),
+    })
+}
+
+fn map_snapshot_preparation_error<Q, C>(
+    error: SnapshotPreparationError,
+) -> RpgMakerStandardTranslationAssetReadingError<Q, C> {
+    match error {
+        SnapshotPreparationError::Invalid(source) => {
+            RpgMakerStandardTranslationAssetReadingError::InvalidSnapshot(source)
+        }
+        SnapshotPreparationError::ProjectSnapshotChanged { expected, actual } => {
+            RpgMakerStandardTranslationAssetReadingError::ProjectSnapshotChanged {
+                expected,
+                actual,
+            }
+        }
+        SnapshotPreparationError::ExtractionOutOfDate { owners } => {
+            RpgMakerStandardTranslationAssetReadingError::ExtractionOutOfDate { owners }
+        }
+    }
 }
 
 fn split_snapshot_rows(
@@ -997,7 +1059,7 @@ mod tests {
                 rows: Arc::new(Mutex::new(Some(rows))),
             },
             InlineCpu,
-            RpgMakerStandardAssetReadingConfig::new(non_zero(2), non_zero(1)),
+            RpgMakerStandardAssetReadingConfig::new(non_zero(1)),
         );
 
         let corpus = service.read(&project()).await.expect("统一表应可读取");

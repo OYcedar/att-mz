@@ -76,7 +76,7 @@ use crate::rpg_maker::write_back::{
     WriteBackFailureImpact, WriteBackInput, WriteBackOutput, WriteBackService,
     WriteBackServiceError,
 };
-use crate::runtime::cpu::BoundedCpuExecutor;
+use crate::runtime::cpu::RayonCpuExecutor;
 use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemError};
 use crate::runtime::json_lines::{JsonLinesEventLogFinalizer, JsonLinesStreamConfig};
 use crate::runtime::llm::{OpenAiChatCompletionClient, OpenAiChatCompletionExecutor};
@@ -294,7 +294,7 @@ impl ProductionRpgMakerCommandRunner {
             }
         };
         let mv_dialogue_selection = if self.layout == RpgMakerLayout::MV
-            && command.rpg_maker().builtin().is_some()
+            && command.rpg_maker().builtin()
         {
             match command.dialogue_rules_path() {
                 Some(path) => match load_mv_dialogue_definition(&file_system, path).await {
@@ -323,7 +323,7 @@ impl ProductionRpgMakerCommandRunner {
         } else {
             None
         };
-        let cpu = match BoundedCpuExecutor::start(command.cpu())
+        let cpu = match RayonCpuExecutor::start(command.cpu())
             .map_err(ProductionCommandError::construct)
         {
             Ok(value) => value,
@@ -358,7 +358,7 @@ impl ProductionRpgMakerCommandRunner {
         );
         let document_config = command.rpg_maker().document();
         let store_config = command.rpg_maker().extract_store();
-        let builtin = command.rpg_maker().builtin().map(|configuration| {
+        let builtin = command.rpg_maker().builtin().then(|| {
             let reader = RpgMakerProjectDocumentReadingService::new(
                 file_system.clone(),
                 file_system.clone(),
@@ -368,14 +368,10 @@ impl ProductionRpgMakerCommandRunner {
             let store =
                 RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone(), store_config);
             match mv_dialogue_selection {
-                Some(selection) => BuiltInExtractionService::for_mv(
-                    reader,
-                    store,
-                    cpu.clone(),
-                    configuration,
-                    selection,
-                ),
-                None => BuiltInExtractionService::new(reader, store, cpu.clone(), configuration),
+                Some(selection) => {
+                    BuiltInExtractionService::for_mv(reader, store, cpu.clone(), selection)
+                }
+                None => BuiltInExtractionService::new(reader, store, cpu.clone()),
             }
         });
         let selected_rules = command.rpg_maker().rules().map(|selected| {
@@ -389,13 +385,7 @@ impl ProductionRpgMakerCommandRunner {
                 RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone(), store_config);
             SelectedRules::new(
                 selected.rules_path().to_path_buf(),
-                RulesExtractionService::new(
-                    file_system.clone(),
-                    reader,
-                    store,
-                    cpu.clone(),
-                    selected.runtime(),
-                ),
+                RulesExtractionService::new(file_system.clone(), reader, store, cpu.clone()),
             )
         });
         let selected_lua = lua.as_ref().map(|selected| {
@@ -528,7 +518,7 @@ impl ProductionRpgMakerCommandRunner {
                 return audited_construction_failure(audit, error, shutdown).await;
             }
         };
-        let cpu = match BoundedCpuExecutor::start(command.cpu())
+        let cpu = match RayonCpuExecutor::start(command.cpu())
             .map_err(ProductionCommandError::construct)
         {
             Ok(value) => value,
@@ -669,7 +659,7 @@ impl ProductionRpgMakerCommandRunner {
                 return audited_construction_failure(audit, error, shutdown).await;
             }
         };
-        let cpu = match BoundedCpuExecutor::start(command.cpu())
+        let cpu = match RayonCpuExecutor::start(command.cpu())
             .map_err(ProductionCommandError::construct)
         {
             Ok(value) => value,
@@ -718,6 +708,7 @@ impl ProductionRpgMakerCommandRunner {
             asset_reader,
             ConservativeRpgMakerWriteBackTextLayouter,
             rewriter,
+            cpu.clone(),
             cancellation.clone(),
         );
         let publisher = StandardWriteBackPublishingService::new(directory_publisher.clone());
@@ -938,20 +929,20 @@ async fn audited_construction_failure(
 
 type ProductionTranslationProfile = Arc<RpgMakerTranslationProfile<OpenAiChatCompletionClient>>;
 type ProductionTranslationAssetReader =
-    RpgMakerStandardTranslationAssetReadingService<RusqliteStorage, BoundedCpuExecutor>;
+    RpgMakerStandardTranslationAssetReadingService<RusqliteStorage, RayonCpuExecutor>;
 type ProductionTranslationPlanner = RpgMakerStandardTranslationTaskPlanningService<
-    TranslationPlanningResourceReadingService<SystemFileSystem, BoundedCpuExecutor>,
-    BoundedCpuExecutor,
+    TranslationPlanningResourceReadingService<SystemFileSystem, RayonCpuExecutor>,
+    RayonCpuExecutor,
     OpenAiChatCompletionClient,
 >;
 type ProductionTranslationExecutor = RpgMakerStandardTranslationTaskExecutionService<
     OpenAiChatCompletionExecutor,
     TokioAsyncDelay,
-    TranslationTaskResponseProcessingService<BoundedCpuExecutor>,
+    TranslationTaskResponseProcessingService<RayonCpuExecutor>,
     ProductionTranslationProfile,
 >;
 type ProductionTranslationStore =
-    RpgMakerStandardTranslationResultStorageService<RusqliteStorage, BoundedCpuExecutor>;
+    RpgMakerStandardTranslationResultStorageService<RusqliteStorage, RayonCpuExecutor>;
 type ProductionStandardTranslation = StandardTranslationService<
     ProductionTranslationAssetReader,
     ProductionTranslationPlanner,
@@ -970,7 +961,7 @@ type ProductionLuaTranslation = LuaTranslationService<ProductionLuaHost>;
 struct ProductionSelectedTranslationExecutionBuilder<'a> {
     configuration: &'a TranslateConfiguration,
     file_system: SystemFileSystem,
-    cpu: BoundedCpuExecutor,
+    cpu: RayonCpuExecutor,
     sqlite: RusqliteStorage,
     llm: OpenAiChatCompletionExecutor,
     lua: Option<ProductionLuaSelection>,
@@ -1057,7 +1048,6 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             source_language,
         ));
         let planning = RpgMakerTranslationPlanningConfiguration::new(
-            profile_configuration.planning().scope_concurrency(),
             profile_configuration.planning().max_message_characters(),
         );
         let profile = Arc::new(RpgMakerTranslationProfile::new(

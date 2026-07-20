@@ -3,10 +3,6 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::num::NonZeroUsize;
-
-use futures_util::StreamExt;
-use futures_util::stream;
 
 use serde_json::{Map, Value};
 
@@ -46,22 +42,15 @@ pub(crate) struct BuiltInExtractionService<R, S, C> {
     document_reader: R,
     snapshot_store: S,
     cpu_executor: C,
-    config: BuiltInExtractionConfig,
     dialogue_definition: BuiltinDialogueDefinition,
 }
 
 impl<R, S, C> BuiltInExtractionService<R, S, C> {
-    pub(crate) fn new(
-        document_reader: R,
-        snapshot_store: S,
-        cpu_executor: C,
-        config: BuiltInExtractionConfig,
-    ) -> Self {
+    pub(crate) fn new(document_reader: R, snapshot_store: S, cpu_executor: C) -> Self {
         Self {
             document_reader,
             snapshot_store,
             cpu_executor,
-            config,
             dialogue_definition: BuiltinDialogueDefinition::MzNative,
         }
     }
@@ -71,14 +60,12 @@ impl<R, S, C> BuiltInExtractionService<R, S, C> {
         document_reader: R,
         snapshot_store: S,
         cpu_executor: C,
-        config: BuiltInExtractionConfig,
         dialogue_definition: MvDialogueDefinitionSelection,
     ) -> Self {
         Self {
             document_reader,
             snapshot_store,
             cpu_executor,
-            config,
             dialogue_definition: match dialogue_definition {
                 MvDialogueDefinitionSelection::ReuseProjectDefinition => {
                     BuiltinDialogueDefinition::MvReuseProjectDefinition
@@ -140,22 +127,6 @@ impl BuiltinDialogueDefinition {
     }
 }
 
-/// Builtin 阶段由外部明确提供的 CPU 并行上限。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BuiltInExtractionConfig {
-    scan_concurrency: NonZeroUsize,
-}
-
-impl BuiltInExtractionConfig {
-    pub(crate) const fn new(scan_concurrency: NonZeroUsize) -> Self {
-        Self { scan_concurrency }
-    }
-
-    pub(crate) const fn scan_concurrency(self) -> NonZeroUsize {
-        self.scan_concurrency
-    }
-}
-
 enum BuiltinDialogueProjection {
     MzNative,
     MvInline(MvDialogueProjector),
@@ -206,7 +177,6 @@ where
 
         let snapshot = match build_builtin_snapshot_parallel(
             &self.cpu_executor,
-            self.config,
             documents,
             &dialogue_projection,
         )
@@ -399,7 +369,6 @@ enum ParallelBuiltinBuildError<CE> {
 
 async fn build_builtin_snapshot_parallel<C>(
     cpu_executor: &C,
-    config: BuiltInExtractionConfig,
     documents: RpgMakerProjectDocuments,
     dialogue_projection: &BuiltinDialogueProjection,
 ) -> Result<BuiltinSnapshot, ParallelBuiltinBuildError<C::Error>>
@@ -409,35 +378,32 @@ where
     let work_units = builtin_work_units(documents, dialogue_projection).map_err(|error| {
         ParallelBuiltinBuildError::Build(BuildBuiltinSnapshotError::Malformed(error))
     })?;
-    let results = stream::iter(
-        work_units
-            .into_iter()
-            .map(|work_unit| cpu_executor.execute(move || work_unit.run())),
-    )
-    .buffered(config.scan_concurrency().get())
-    .collect::<Vec<_>>()
-    .await;
+    let results = cpu_executor
+        .execute_ordered_map(work_units, BuiltinWorkUnit::run)
+        .await
+        .map_err(ParallelBuiltinBuildError::Compute)?;
+    let dialogue_projection = dialogue_projection.fork_for_scan();
+    cpu_executor
+        .execute(move || finish_builtin_work_units(results, dialogue_projection))
+        .await
+        .map_err(ParallelBuiltinBuildError::Compute)?
+        .map_err(ParallelBuiltinBuildError::Build)
+}
 
+fn finish_builtin_work_units(
+    results: Vec<Result<BuiltinWorkUnitResult, BuildBuiltinSnapshotError>>,
+    mut dialogue_projection: BuiltinDialogueProjection,
+) -> Result<BuiltinSnapshot, BuildBuiltinSnapshotError> {
     let mut groups = Vec::new();
-    let mut dialogue_projection = dialogue_projection.fork_for_scan();
     for result in results {
-        let local_result = result.map_err(ParallelBuiltinBuildError::Compute)?;
-        let local_result = local_result.map_err(ParallelBuiltinBuildError::Build)?;
+        let local_result = result?;
         groups.extend(local_result.groups);
         if let Some(scanned) = local_result.dialogue_projection {
             dialogue_projection.merge_scan(scanned);
         }
     }
-    dialogue_projection
-        .finish()
-        .map_err(BuildBuiltinSnapshotError::Dialogue)
-        .map_err(ParallelBuiltinBuildError::Build)?;
-
-    cpu_executor
-        .execute(move || BuiltinSnapshot::new(groups).map_err(Into::into))
-        .await
-        .map_err(ParallelBuiltinBuildError::Compute)?
-        .map_err(ParallelBuiltinBuildError::Build)
+    dialogue_projection.finish()?;
+    BuiltinSnapshot::new(groups).map_err(Into::into)
 }
 
 enum BuiltinWorkUnit {
@@ -1510,6 +1476,22 @@ mod tests {
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(output)
         }
+
+        async fn execute_ordered_map<I, T, F>(
+            &self,
+            inputs: Vec<I>,
+            operation: F,
+        ) -> Result<Vec<T>, CpuTaskExecutionError<Self::Error>>
+        where
+            I: Send + 'static,
+            T: Send + 'static,
+            F: Fn(I) -> T + Send + Sync + 'static,
+        {
+            self.calls.fetch_add(inputs.len(), Ordering::SeqCst);
+            self.max_active
+                .fetch_max(inputs.len().min(self.root_limit), Ordering::SeqCst);
+            Ok(inputs.into_iter().map(operation).collect())
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -1527,16 +1509,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn config_keeps_the_explicit_scan_limit() {
-        let config =
-            BuiltInExtractionConfig::new(NonZeroUsize::new(3).expect("测试并发数必须非零"));
-
-        assert_eq!(config.scan_concurrency().get(), 3);
-    }
-
     #[tokio::test]
-    async fn parallel_scan_obeys_the_stage_limit_and_keeps_serial_results() {
+    async fn parallel_scan_uses_the_root_ordered_map_and_keeps_serial_results() {
         let expected = build_builtin_snapshot(&complete_documents()).expect("串行规格实现应该成功");
         let calls = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
@@ -1549,7 +1523,6 @@ mod tests {
 
         let actual = build_builtin_snapshot_parallel(
             &cpu,
-            BuiltInExtractionConfig::new(NonZeroUsize::new(3).expect("测试并发数必须非零")),
             complete_documents(),
             &BuiltinDialogueProjection::MzNative,
         )
@@ -1580,14 +1553,9 @@ mod tests {
             build_builtin_snapshot_with_dialogue_projection(&documents, projection.fork_for_scan())
                 .expect("两个规则分布在不同文档时应在整份快照上验收");
 
-        let actual = build_builtin_snapshot_parallel(
-            &FakeCpu,
-            BuiltInExtractionConfig::new(NonZeroUsize::new(3).expect("测试并发数必须非零")),
-            documents,
-            &projection,
-        )
-        .await
-        .expect("并行扫描必须合并各分片的规则命中数");
+        let actual = build_builtin_snapshot_parallel(&FakeCpu, documents, &projection)
+            .await
+            .expect("并行扫描必须合并各分片的规则命中数");
 
         assert_eq!(actual, expected);
         let common_dialogue = actual
@@ -1659,7 +1627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_cpu_budget_can_backpressure_a_larger_stage_limit() {
+    async fn root_cpu_budget_is_the_only_parallel_scan_limit() {
         let max_active = Arc::new(AtomicUsize::new(0));
         let cpu = RecordingCpu {
             calls: Arc::new(AtomicUsize::new(0)),
@@ -1670,7 +1638,6 @@ mod tests {
 
         build_builtin_snapshot_parallel(
             &cpu,
-            BuiltInExtractionConfig::new(NonZeroUsize::new(4).expect("测试并发数必须非零")),
             complete_documents(),
             &BuiltinDialogueProjection::MzNative,
         )
@@ -1694,7 +1661,6 @@ mod tests {
                 failure: None,
             },
             PanickedCpu,
-            BuiltInExtractionConfig::new(NonZeroUsize::new(2).expect("测试并发数必须非零")),
         );
 
         let error = service
@@ -1783,7 +1749,6 @@ mod tests {
                 failure: None,
             },
             FakeCpu,
-            BuiltInExtractionConfig::new(NonZeroUsize::new(2).expect("测试并发数必须非零")),
             MvDialogueDefinitionSelection::Replace {
                 projector: definition.compile().expect("测试定义应能编译"),
                 definition: definition.clone(),
@@ -1813,7 +1778,6 @@ mod tests {
                 failure: None,
             },
             FakeCpu,
-            BuiltInExtractionConfig::new(NonZeroUsize::new(2).expect("测试并发数必须非零")),
             MvDialogueDefinitionSelection::ReuseProjectDefinition,
         );
 
@@ -1867,7 +1831,6 @@ mod tests {
                 failure: None,
             },
             FakeCpu,
-            BuiltInExtractionConfig::new(NonZeroUsize::new(2).expect("测试并发数必须非零")),
             MvDialogueDefinitionSelection::Replace {
                 projector: definition.compile().expect("测试定义应能编译"),
                 definition,
@@ -1995,7 +1958,6 @@ mod tests {
                 failure: store_failure,
             },
             FakeCpu,
-            BuiltInExtractionConfig::new(NonZeroUsize::new(3).expect("测试并发数必须非零")),
         )
     }
 

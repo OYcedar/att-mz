@@ -31,9 +31,7 @@ use crate::language::{
     LanguageModule, LanguageModuleCatalog, QuotePair,
 };
 use crate::rpg_maker::ProjectName;
-use crate::rpg_maker::extract::builtin::BuiltInExtractionConfig;
 use crate::rpg_maker::extract::document::RpgMakerDocumentReadingConfig;
-use crate::rpg_maker::extract::rules::RulesExtractionConfig;
 use crate::rpg_maker::extract::store::asset_store::RpgMakerExtractionAssetStoreConfig;
 use crate::rpg_maker::lua::json::HostValueBudget;
 use crate::rpg_maker::lua::lua54::TrustedLua54RuntimeConfiguration;
@@ -41,7 +39,7 @@ use crate::rpg_maker::standard_asset::RpgMakerStandardAssetReadingConfig;
 use crate::rpg_maker::translate::profile::RpgMakerTranslationRequestConfiguration;
 use crate::rpg_maker::translate::result_store::RpgMakerStandardTranslationResultStorageConfig;
 use crate::rpg_maker::{RpgMakerEngine, RpgMakerLayout};
-use crate::runtime::cpu::CpuExecutorConfig;
+use crate::runtime::cpu::{CpuExecutorConfig, CpuWorkerThreads};
 use crate::runtime::filesystem::{
     DirectoryPublisherConfig, ExclusiveFileLeaseConfig, SystemFileSystemConfig, TreeBudget,
 };
@@ -349,6 +347,27 @@ impl ConfiguredRpgMakerCommand {
                     client,
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
+                if rpg_maker.profile().max_in_flight_tasks() > llm.total_capacity() {
+                    return Err(ConfigurationLoadError::InvalidValue(invalid(
+                        "rpg_maker.translation_profiles.max_in_flight_tasks",
+                        format!(
+                            "任务并发数 {} 超过 runtime.llm 的活动与排队总容量 {}",
+                            rpg_maker.profile().max_in_flight_tasks(),
+                            llm.total_capacity()
+                        ),
+                    )));
+                }
+                if rpg_maker.profile().max_in_flight_tasks().get()
+                    > tokio::sync::Semaphore::MAX_PERMITS / 2
+                {
+                    return Err(ConfigurationLoadError::InvalidValue(invalid(
+                        "rpg_maker.translation_profiles.max_in_flight_tasks",
+                        format!(
+                            "任务并发数超过顺序最终化窗口支持上限 {}",
+                            tokio::sync::Semaphore::MAX_PERMITS / 2
+                        ),
+                    )));
+                }
                 Ok(Self::Translate(Box::new(ConfiguredTranslateCommand {
                     project_name: project.name,
                     terminology_path: terms,
@@ -630,8 +649,20 @@ impl AsyncRuntimeConfiguration {
 fn build_cpu_configuration(
     raw: RawCpuRuntimeConfiguration,
 ) -> Result<CpuExecutorConfig, ConfigurationValueError> {
+    let worker_threads = match raw.worker_threads {
+        RawCpuWorkerThreads::Auto(value) if value == "auto" => CpuWorkerThreads::Auto,
+        RawCpuWorkerThreads::Auto(_) => {
+            return Err(invalid(
+                "runtime.cpu.worker_threads",
+                "字符串只接受精确小写 auto",
+            ));
+        }
+        RawCpuWorkerThreads::Fixed(value) => {
+            CpuWorkerThreads::Fixed(non_zero_usize("runtime.cpu.worker_threads", value)?)
+        }
+    };
     CpuExecutorConfig::new(
-        usize_value("runtime.cpu.worker_threads", raw.worker_threads)?,
+        worker_threads,
         usize_value("runtime.cpu.queue_capacity", raw.queue_capacity)?,
     )
     .map_err(|source| invalid("runtime.cpu", source.to_string()))
@@ -779,6 +810,7 @@ impl SelectedLuaConfiguration {
 #[derive(Clone)]
 pub(crate) struct SelectedLlmExecutorConfiguration {
     runtime: OpenAiExecutorConfiguration,
+    total_capacity: NonZeroUsize,
     additional_pem_files: Vec<PathBuf>,
 }
 
@@ -830,6 +862,15 @@ impl SelectedLlmExecutorConfiguration {
             .checked_add(queue_capacity)
             .and_then(NonZeroUsize::new)
             .ok_or_else(|| invalid("runtime.llm.queue_capacity", "活动与排队总容量溢出"))?;
+        if total_capacity.get() > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(invalid(
+                "runtime.llm.queue_capacity",
+                format!(
+                    "活动与排队总容量超过调度器支持上限 {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
+            ));
+        }
         let runtime = OpenAiExecutorConfiguration::new(
             max_active_requests,
             total_capacity,
@@ -845,12 +886,17 @@ impl SelectedLlmExecutorConfiguration {
         );
         Ok(Self {
             runtime,
+            total_capacity,
             additional_pem_files,
         })
     }
 
     pub(crate) fn additional_pem_files(&self) -> &[PathBuf] {
         &self.additional_pem_files
+    }
+
+    pub(crate) const fn total_capacity(&self) -> NonZeroUsize {
+        self.total_capacity
     }
 
     pub(crate) fn with_pem_roots(&self, roots: Vec<Vec<u8>>) -> OpenAiExecutorConfiguration {
@@ -860,22 +906,17 @@ impl SelectedLlmExecutorConfiguration {
 
 pub(crate) struct SelectedRulesConfiguration {
     rules_path: PathBuf,
-    runtime: RulesExtractionConfig,
 }
 
 impl SelectedRulesConfiguration {
     pub(crate) fn rules_path(&self) -> &Path {
         &self.rules_path
     }
-
-    pub(crate) const fn runtime(&self) -> RulesExtractionConfig {
-        self.runtime
-    }
 }
 
 pub(crate) struct ExtractConfiguration {
     document: RpgMakerDocumentReadingConfig,
-    builtin: Option<BuiltInExtractionConfig>,
+    builtin: bool,
     rules: Option<SelectedRulesConfiguration>,
     extract_store: RpgMakerExtractionAssetStoreConfig,
 }
@@ -886,27 +927,10 @@ impl ExtractConfiguration {
         select_builtin: bool,
         rules_path: Option<PathBuf>,
     ) -> Result<Self, ConfigurationValueError> {
-        let builtin = select_optional_scan_concurrency(
-            "rpg_maker.extract.builtin",
-            select_builtin,
-            raw.extract.builtin,
-        )?
-        .map(BuiltInExtractionConfig::new);
-        let rules = select_optional_scan_concurrency(
-            "rpg_maker.extract.rules",
-            rules_path.is_some(),
-            raw.extract.rules,
-        )?
-        .zip(rules_path)
-        .map(
-            |(scan_concurrency, rules_path)| SelectedRulesConfiguration {
-                rules_path,
-                runtime: RulesExtractionConfig::new(scan_concurrency),
-            },
-        );
+        let rules = rules_path.map(|rules_path| SelectedRulesConfiguration { rules_path });
         Ok(Self {
             document: build_document_configuration(raw.document)?,
-            builtin,
+            builtin: select_builtin,
             rules,
             extract_store: build_extraction_store_configuration(raw.extract.store)?,
         })
@@ -916,7 +940,7 @@ impl ExtractConfiguration {
         self.document
     }
 
-    pub(crate) const fn builtin(&self) -> Option<BuiltInExtractionConfig> {
+    pub(crate) const fn builtin(&self) -> bool {
         self.builtin
     }
 
@@ -1010,53 +1034,34 @@ impl WriteBackConfiguration {
 fn build_document_configuration(
     raw: RawRpgMakerDocumentConfiguration,
 ) -> Result<RpgMakerDocumentReadingConfig, ConfigurationValueError> {
-    Ok(RpgMakerDocumentReadingConfig::new(
-        non_zero_usize("rpg_maker.document.read_concurrency", raw.read_concurrency)?,
-        non_zero_usize(
-            "rpg_maker.document.parse_concurrency",
-            raw.parse_concurrency,
-        )?,
-    ))
+    Ok(RpgMakerDocumentReadingConfig::new(non_zero_usize(
+        "rpg_maker.document.read_concurrency",
+        raw.read_concurrency,
+    )?))
 }
 
 fn build_standard_asset_configuration(
     raw: RawRpgMakerStandardAssetConfiguration,
 ) -> Result<RpgMakerStandardAssetReadingConfig, ConfigurationValueError> {
-    Ok(RpgMakerStandardAssetReadingConfig::new(
-        non_zero_usize(
-            "rpg_maker.standard_asset.decode_concurrency",
-            raw.decode_concurrency,
-        )?,
-        non_zero_usize(
-            "rpg_maker.standard_asset.leaves_per_decode_job",
-            raw.leaves_per_decode_job,
-        )?,
-    ))
+    Ok(RpgMakerStandardAssetReadingConfig::new(non_zero_usize(
+        "rpg_maker.standard_asset.leaves_per_decode_job",
+        raw.leaves_per_decode_job,
+    )?))
 }
 
 fn build_extraction_store_configuration(
     raw: RawRpgMakerExtractStoreConfiguration,
 ) -> Result<RpgMakerExtractionAssetStoreConfig, ConfigurationValueError> {
-    Ok(RpgMakerExtractionAssetStoreConfig::new(
-        non_zero_usize(
-            "rpg_maker.extract.store.encode_concurrency",
-            raw.encode_concurrency,
-        )?,
-        non_zero_usize(
-            "rpg_maker.extract.store.groups_per_encode_job",
-            raw.groups_per_encode_job,
-        )?,
-    ))
+    Ok(RpgMakerExtractionAssetStoreConfig::new(non_zero_usize(
+        "rpg_maker.extract.store.groups_per_encode_job",
+        raw.groups_per_encode_job,
+    )?))
 }
 
 fn build_translation_store_configuration(
     raw: RawRpgMakerTranslateStoreConfiguration,
 ) -> Result<RpgMakerStandardTranslationResultStorageConfig, ConfigurationValueError> {
     Ok(RpgMakerStandardTranslationResultStorageConfig::new(
-        non_zero_usize(
-            "rpg_maker.translate.store.encode_concurrency",
-            raw.encode_concurrency,
-        )?,
         non_zero_usize(
             "rpg_maker.translate.store.leaves_per_encode_job",
             raw.leaves_per_encode_job,
@@ -1066,15 +1071,10 @@ fn build_translation_store_configuration(
 
 #[derive(Clone, Debug)]
 pub(crate) struct TranslationPlanningConfiguration {
-    scope_concurrency: NonZeroUsize,
     max_message_characters: NonZeroUsize,
 }
 
 impl TranslationPlanningConfiguration {
-    pub(crate) const fn scope_concurrency(&self) -> NonZeroUsize {
-        self.scope_concurrency
-    }
-
     pub(crate) const fn max_message_characters(&self) -> NonZeroUsize {
         self.max_message_characters
     }
@@ -1209,10 +1209,6 @@ fn build_selected_translation_profile(
             raw.max_in_flight_tasks,
         )?,
         planning: TranslationPlanningConfiguration {
-            scope_concurrency: non_zero_usize(
-                format!("{field}.planning.scope_concurrency").as_str(),
-                raw.planning.scope_concurrency,
-            )?,
             max_message_characters: non_zero_usize(
                 format!("{field}.planning.max_message_characters").as_str(),
                 raw.planning.max_message_characters,
@@ -1842,24 +1838,6 @@ fn build_lua_configuration(
             )?,
         ),
     ))
-}
-
-fn select_optional_scan_concurrency(
-    field: &str,
-    selected: bool,
-    raw: Option<toml::Value>,
-) -> Result<Option<NonZeroUsize>, ConfigurationValueError> {
-    if !selected {
-        return Ok(None);
-    }
-    let raw = raw.ok_or_else(|| invalid(field, "本次选择需要该配置"))?;
-    let raw: RawRpgMakerScanConfiguration = raw
-        .try_into()
-        .map_err(|_| invalid(field, "结构或字段类型无效"))?;
-    Ok(Some(non_zero_usize(
-        format!("{field}.scan_concurrency").as_str(),
-        raw.scan_concurrency,
-    )?))
 }
 
 fn parse_selected_translation_profile(
@@ -2796,8 +2774,15 @@ struct RawAsyncRuntimeConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCpuRuntimeConfiguration {
-    worker_threads: u64,
+    worker_threads: RawCpuWorkerThreads,
     queue_capacity: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawCpuWorkerThreads {
+    Fixed(u64),
+    Auto(String),
 }
 
 #[derive(Deserialize)]
@@ -2934,36 +2919,23 @@ struct RawEventLogConfiguration {
 #[serde(deny_unknown_fields)]
 struct RawRpgMakerDocumentConfiguration {
     read_concurrency: u64,
-    parse_concurrency: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRpgMakerStandardAssetConfiguration {
-    decode_concurrency: u64,
     leaves_per_decode_job: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSelectedRpgMakerExtractConfiguration {
-    #[serde(default)]
-    builtin: Option<toml::Value>,
-    #[serde(default)]
-    rules: Option<toml::Value>,
     store: RawRpgMakerExtractStoreConfiguration,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawRpgMakerScanConfiguration {
-    scan_concurrency: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawRpgMakerExtractStoreConfiguration {
-    encode_concurrency: u64,
     groups_per_encode_job: u64,
 }
 
@@ -2976,7 +2948,6 @@ struct RawRpgMakerTranslateConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRpgMakerTranslateStoreConfiguration {
-    encode_concurrency: u64,
     leaves_per_encode_job: u64,
 }
 
@@ -3013,7 +2984,6 @@ struct RawSelectedTranslationProfileConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSelectedTranslationPlanningConfiguration {
-    scope_concurrency: u64,
     max_message_characters: u64,
 }
 
@@ -3061,6 +3031,118 @@ mod tests {
         ] {
             load_configuration(&path, command).expect("仓库示例必须满足每个命令的当前契约");
         }
+    }
+
+    #[test]
+    fn cpu_worker_threads_accepts_auto_or_a_positive_integer() {
+        let directory = TestDirectory::new();
+        let auto_path = directory.write("cpu-auto.toml", include_str!("../../config.example.toml"));
+        let ConfiguredRpgMakerCommand::Extract(auto) =
+            load_configuration(&auto_path, extract_command(false)).expect("auto 应为合法选择")
+        else {
+            panic!("应建立 Extract 配置");
+        };
+        assert_eq!(auto.cpu().worker_threads(), CpuWorkerThreads::Auto);
+
+        let fixed_source = include_str!("../../config.example.toml")
+            .replace("worker_threads = \"auto\"", "worker_threads = 2");
+        let fixed_path = directory.write("cpu-fixed.toml", &fixed_source);
+        let ConfiguredRpgMakerCommand::Extract(fixed) =
+            load_configuration(&fixed_path, extract_command(false)).expect("正整数应为合法选择")
+        else {
+            panic!("应建立 Extract 配置");
+        };
+        assert_eq!(
+            fixed.cpu().worker_threads(),
+            CpuWorkerThreads::Fixed(NonZeroUsize::new(2).expect("测试值非零"))
+        );
+    }
+
+    #[test]
+    fn cpu_worker_threads_rejects_invalid_choices() {
+        let directory = TestDirectory::new();
+        for (name, value) in [
+            ("misspelled", "\"atuo\""),
+            ("uppercase", "\"AUTO\""),
+            ("zero", "0"),
+        ] {
+            let source = include_str!("../../config.example.toml").replace(
+                "worker_threads = \"auto\"",
+                format!("worker_threads = {value}").as_str(),
+            );
+            let path = directory.write(format!("cpu-{name}.toml").as_str(), &source);
+            assert!(
+                load_configuration(&path, extract_command(false)).is_err(),
+                "无效 CPU 线程选择 {name} 必须被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_profile_cannot_exceed_http_admission_capacity() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml")
+            .replace("max_active_requests = 8", "max_active_requests = 1")
+            .replace("queue_capacity = 64", "queue_capacity = 1");
+        let path = directory.write("profile-over-http-capacity.toml", &source);
+
+        assert!(
+            load_configuration(&path, translate_command(false, "primary")).is_err(),
+            "Profile 并发超过 HTTP 活动与排队总容量时必须在启动前失败"
+        );
+    }
+
+    #[test]
+    fn http_admission_capacity_cannot_exceed_the_runtime_semaphore_limit() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml")
+            .replace("\r\n", "\n")
+            .replace(
+                "max_active_requests = 8\nqueue_capacity = 64",
+                format!(
+                    "max_active_requests = {}\nqueue_capacity = 1",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                )
+                .as_str(),
+            );
+        let path = directory.write("http-capacity-overflow.toml", &source);
+
+        let error = match load_configuration(&path, translate_command(false, "primary")) {
+            Ok(_) => panic!("HTTP 总准入量不得在生产构造 Semaphore 时 panic"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("活动与排队总容量超过调度器支持上限")
+        );
+    }
+
+    #[test]
+    fn profile_concurrency_cannot_overflow_the_ordered_finalization_window() {
+        let directory = TestDirectory::new();
+        let task_limit = tokio::sync::Semaphore::MAX_PERMITS / 2 + 1;
+        let source = include_str!("../../config.example.toml")
+            .replace("\r\n", "\n")
+            .replace(
+                "max_active_requests = 8\nqueue_capacity = 64",
+                format!("max_active_requests = {task_limit}\nqueue_capacity = 0").as_str(),
+            )
+            .replace(
+                "max_in_flight_tasks = 4",
+                format!("max_in_flight_tasks = {task_limit}").as_str(),
+            );
+        let path = directory.write("profile-window-overflow.toml", &source);
+
+        let error = match load_configuration(&path, translate_command(false, "primary")) {
+            Ok(_) => panic!("2N 顺序最终化窗口超过 Semaphore 上限时必须在启动前失败"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("任务并发数超过顺序最终化窗口支持上限")
+        );
     }
 
     #[test]
@@ -3179,19 +3261,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_only_parses_selected_rule_kinds_and_lua() {
+    fn extract_only_parses_lua_when_selected() {
         let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml")
-            .replacen("scan_concurrency = 4", "scan_concurrency = \"invalid\"", 1)
-            .replace(
-                "worker_stack_bytes = 8388608",
-                "worker_stack_bytes = \"invalid\"",
-            );
+        let source = include_str!("../../config.example.toml").replace(
+            "worker_stack_bytes = 8388608",
+            "worker_stack_bytes = \"invalid\"",
+        );
         let path = directory.write("extract.toml", &source);
 
-        load_configuration(&path, extract_command(false))
-            .expect("仅 Rules 且没有 Lua 时不应解析 Builtin 或 Lua");
-        assert!(load_configuration(&path, extract_command(true)).is_err());
+        load_configuration(&path, extract_command(false)).expect("没有 Lua 时不应解析 Lua 配置");
         assert!(
             load_configuration(
                 &path,
@@ -3364,10 +3442,6 @@ id = "unused"
             (
                 "profile-max-in-flight",
                 source.replacen("max_in_flight_tasks = 4\n", "", 1),
-            ),
-            (
-                "planning-scope-concurrency",
-                source.replacen("scope_concurrency = 4\n", "", 1),
             ),
             (
                 "planning-max-message-characters",

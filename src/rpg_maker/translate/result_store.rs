@@ -6,8 +6,6 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use futures_util::stream::{self, StreamExt, TryStreamExt};
-
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
 use crate::rpg_maker::location_codec::{
@@ -30,17 +28,12 @@ use super::standard::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerStandardTranslationResultStorageConfig {
-    encode_concurrency: NonZeroUsize,
     leaves_per_encode_job: NonZeroUsize,
 }
 
 impl RpgMakerStandardTranslationResultStorageConfig {
-    pub(crate) const fn new(
-        encode_concurrency: NonZeroUsize,
-        leaves_per_encode_job: NonZeroUsize,
-    ) -> Self {
+    pub(crate) const fn new(leaves_per_encode_job: NonZeroUsize) -> Self {
         Self {
-            encode_concurrency,
             leaves_per_encode_job,
         }
     }
@@ -109,30 +102,40 @@ where
         SqliteTransactionPlan,
         RpgMakerStandardTranslationResultStorageError<S::Error, C::Error>,
     > {
-        let (work, terminology_json, placeholder_rules_json, snapshot_baseline) =
-            preparation_work(preparation)
-                .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)?;
-        let jobs = split_jobs(work, self.config.leaves_per_encode_job.get());
-        let batches = stream::iter(jobs.into_iter().map(|job| {
-            let cpu = &self.cpu;
-            async move {
-                cpu.execute(move || encode_preparation_job(job))
-                    .await
-                    .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?
-                    .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)
-            }
-        }))
-        .buffered(self.config.encode_concurrency.get())
-        .try_collect::<Vec<_>>()
-        .await?;
+        let leaves_per_job = self.config.leaves_per_encode_job.get();
+        let (jobs, terminology_json, placeholder_rules_json, snapshot_baseline) = self
+            .cpu
+            .execute(move || {
+                let (work, terminology_json, placeholder_rules_json, snapshot_baseline) =
+                    preparation_work(preparation)?;
+                Ok::<_, ResultStoragePlanError>((
+                    split_jobs(work, leaves_per_job),
+                    terminology_json,
+                    placeholder_rules_json,
+                    snapshot_baseline,
+                ))
+            })
+            .await
+            .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?
+            .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)?;
+        let batches = self
+            .cpu
+            .execute_ordered_map(jobs, encode_preparation_job)
+            .await
+            .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?;
 
-        finish_preparation_plan(
-            batches,
-            terminology_json,
-            placeholder_rules_json,
-            snapshot_baseline,
-        )
-        .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)
+        self.cpu
+            .execute(move || {
+                finish_preparation_plan(
+                    batches.into_iter().collect::<Result<Vec<_>, _>>()?,
+                    terminology_json,
+                    placeholder_rules_json,
+                    snapshot_baseline,
+                )
+            })
+            .await
+            .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?
+            .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)
     }
 
     async fn encode_commit_plan(
@@ -142,23 +145,25 @@ where
         SqliteTransactionPlan,
         RpgMakerStandardTranslationResultStorageError<S::Error, C::Error>,
     > {
-        let work = commit_work(result)
+        let leaves_per_job = self.config.leaves_per_encode_job.get();
+        let jobs = self
+            .cpu
+            .execute(move || commit_work(result).map(|work| split_jobs(work, leaves_per_job)))
+            .await
+            .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?
             .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)?;
-        let jobs = split_jobs(work, self.config.leaves_per_encode_job.get());
-        let batches = stream::iter(jobs.into_iter().map(|job| {
-            let cpu = &self.cpu;
-            async move {
-                cpu.execute(move || encode_commit_job(job))
-                    .await
-                    .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?
-                    .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)
-            }
-        }))
-        .buffered(self.config.encode_concurrency.get())
-        .try_collect::<Vec<_>>()
-        .await?;
+        let batches = self
+            .cpu
+            .execute_ordered_map(jobs, encode_commit_job)
+            .await
+            .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?;
 
-        finish_commit_plan(batches)
+        self.cpu
+            .execute(move || {
+                finish_commit_plan(batches.into_iter().collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?
             .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)
     }
 
@@ -883,10 +888,7 @@ mod tests {
         let service = RpgMakerStandardTranslationResultStorageService::new(
             sqlite,
             InlineCpu,
-            RpgMakerStandardTranslationResultStorageConfig::new(
-                NonZeroUsize::MIN,
-                NonZeroUsize::MIN,
-            ),
+            RpgMakerStandardTranslationResultStorageConfig::new(NonZeroUsize::MIN),
         );
         let identity = scalar_identity(1, "name", "原文", "{}");
         let context = state_context(0x11);
