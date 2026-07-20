@@ -107,7 +107,7 @@ MZ 只接受包含 `data/js/rmmz_core.js` 的游戏根；MV 只接受包含
 
 - Init 建立或收敛一个项目，来源与全部事实相同时快速返回 `Unchanged`；
 - Extract 只替换选中的 owner；MV Builtin 的对话定义与资产快照原子提交；
-- Translate 复用持久 TOML 资源的 canonical 形式和逐逻辑叶 state，全部 Current 时不请求
+- Translate 复用持久 TOML 资源的 canonical 形式和逐语义单元 state，全部 Current 时不请求
   模型；
 - WriteBack 每次从冻结来源重建候选，Standard 与可选 Lua 修改同一候选，只发布一次。
 

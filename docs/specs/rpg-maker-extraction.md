@@ -31,23 +31,45 @@ Builtin 资产快照在同一个数据库事务中提交。WriteBack 只消费�
 Group
 ├─ group_location + group_kind
 ├─ TextProjectionRecipe
-├─ Leaf(field_role, original_text, translation_context)
+├─ Unit(unit_role, source_content, source_context)
 └─ MutationTarget（一个或多个物理修改目标）
 ```
 
-逻辑叶身份固定为 `owner + group_location + field_role`。`TextFieldRole` 包含：
+语义单元身份固定为 `owner + group_location + unit_role`。`TextUnitRole` 包含：
 
 - `Scalar`；
 - `DialogueSpeaker`；
-- `DialogueBody(index)`；
-- `ScrollingTextBody(index)`。
+- `DialogueBody`；
+- `Choices`；
+- `ScrollingText`。
+
+内容只有 `Value(String)` 与 `Lines(Vec<String>)` 两种形状。Scalar 与 Speaker 使用
+Value；完整对话正文、完整选项组和完整滚动文本块使用 Lines。数组元素边界属于翻译
+事实，不能把 Lines 连接成普通字符串后再计算身份或状态。单个 Lines 元素不得包含
+CR、LF 或 NUL。
+
+`standard_text_unit` 的当前持久字段固定为：
+
+```text
+owner
+group_location
+unit_role
+source_content_json
+source_context_json
+translation_content_json
+translation_state
+```
+
+Value 编码为 JSON string，Lines 编码为 JSON string array；译文内容必须与原文内容保持
+同一 JSON 形状。`source_context_json` 是 JSON object，当前仅 DialogueBody 保存源
+Speaker，其余单元保存空对象。译文与 32 字节 state 必须同时存在或同时为空。
 
 物理 JSON 地址只用于冻结来源复核和写回，不再充当译文身份。Group 保存完整 recipe，
-包括没有形成翻译叶但写回时必须保留的空白行、Literal、SpeakerSlot 和原始命令边界。
+包括 Literal、SpeakerSlot、源行到物理命令模板的映射和原始命令边界。
 每次 owner 替换都计算完整资产快照指纹，并原子写入：
 
 - `standard_text_group`；
-- `standard_text_leaf`；
+- `standard_text_unit`；
 - `standard_text_target`；
 - `standard_asset_owner_state` 中的来源与资产快照指纹。
 
@@ -59,17 +81,19 @@ Builtin 共用数据库条目、System、Map、CommonEvents、Troops、事件列
 文本及插件目录遍历。固定字段包括 RPG Maker 标准名称、描述、消息、选择项、滚动文本
 和已确认的事件文本字段；额外引擎/插件数据通过 Rules 或 Lua 提取。
 
-标准消息块是 `101 + 连续 401*`。每个块建立一个 Dialogue Group，并记录所有连续
-`401`，包括空白行或没有翻译叶的行。差异仅在 Speaker 投影：
+标准消息块是 `101 + 连续 401*`。每个块建立一个 Dialogue Group；全部正文行形成一个
+DialogueBody，混合正文中的空白 `401` 作为显式空元素保留，全空正文不建立 Body。
+差异仅在 Speaker 投影：
 
 - MZ 从 `101.parameters[4]` 读取可选原生 Speaker；参数缺失、空字符串或全空白均表示
   没有 Speaker。非空 Speaker 使用 direct target；
 - MV 标准 `101` 没有原生 Speaker，只在第一条 `401.parameters[0]` 上应用项目当前
   姓名投影定义。其余对话结构与 MZ 使用同一 recipe、翻译与写回能力。
 
-正文叶保持为 `DialogueBody(0..n)`，不能用一个“整组正文”叶替代逐叶身份。
-滚动文本按 `105 + 连续 405*` 建组；所有 `405` 都进入物理 recipe，空白行不建立逻辑叶，
-后续 `ScrollingTextBody(index)` 仍使用原物理行索引而不压缩。
+MV 的纯姓名首行只属于物理姓名外壳，不建立空正文。一个 `102` 的完整有序选项数组形成
+一个 Choices 单元，包括空槽；提取同时记录对应同层 `402` 标签目标。滚动文本按
+`105 + 连续 405*` 建组，全部 `405` 形成一个 ScrollingText 单元，包括空行。选项与
+滚动文本的源元素索引只用于 recipe 定位，不进入单元身份。
 
 ## 4. MV 姓名投影 TOML
 
@@ -97,7 +121,7 @@ rule = []
 
 同一第一行可以有多个不重叠匹配，但所有非空 Speaker 必须逐字相同；同一物理字段只能
 由一条规则拥有，跨规则完整匹配重叠失败。空 Speaker 的外壳原样冻结，不建立 Speaker
-叶。
+单元。
 
 第一行从开头到最后一个完整匹配结束处被物化为 `Literal/SpeakerSlot`；最后一个匹配
 之后的后缀才是该行 Body。marker 前的控制符、空白及重复 marker 之间的外壳逐字冻结。
@@ -170,11 +194,11 @@ A[3].B
 
 `pattern` 缺席时翻译整个最终字符串；存在时必须有且只有一个 `text` 命名捕获，其他
 命名捕获无效。一个字符串可以产生多个按来源顺序排列且不重叠的匹配；非空捕获形成
-逻辑叶，其余内容冻结为 Literal。零宽、不参与、重叠捕获、跨规则重复物理目标都使
+语义单元，其余内容冻结为 Literal。零宽、不参与、重叠捕获、跨规则重复物理目标都使
 整个 Rules 候选失败。完整匹配与捕获必须有序、位于原字符串内并对齐 UTF-8 边界，
-`text` 还必须完整位于对应匹配内。提交前必须使用原始叶逐字重建最终字符串。
+`text` 还必须完整位于对应匹配内。提交前必须使用原始单元逐字重建最终字符串。
 
-每条非空规则在当前来源中必须产生至少一个非空翻译叶，否则整个 Rules 替换失败并
+每条非空规则在当前来源中必须产生至少一个非空翻译单元，否则整个 Rules 替换失败并
 保留旧快照。规则顺序只用于诊断编号，不构成优先级。外部契约不包含 `label`、
 `field_name`、`required`、`priority`、版本或跨命令状态字段。
 
@@ -193,15 +217,16 @@ data、map、plugin、document 与位置能力，不需要复制 JSON/路径 cod
 
 ## 7. 完成语义
 
-同一 owner 的来源指纹、项目定义、组、叶、目标和资产快照指纹在一个事务中校验并
+同一 owner 的来源指纹、项目定义、组、单元、目标和资产快照指纹在一个事务中校验并
 替换；失败不暴露半快照。相同快照返回 `Unchanged`，真实替换返回更新摘要。
 
 Store 编码候选后先只读取 owner 的来源与资产快照指纹。owner 不存在或任一指纹不同时，
-候选直接形成权威替换事务，不把即将被整体替换的旧 group、leaf 和 target 完整读回进程；
-事务内部仍按既有精确条件继承可复用译文。两个指纹都相同时，以同一个只读数据库视图
-再次读取 owner 状态以及完整 group、leaf、target，并逐项核对期望指纹与内容；只有这些
+候选直接形成权威替换事务，不把即将被整体替换的 group、unit 和 target 完整读回进程；
+事务内部仅在 unit role、完整源内容和源上下文都逐字一致时继承可复用译文。两个指纹都
+相同时，以同一个只读数据库视图
+再次读取 owner 状态以及完整 group、unit、target，并逐项核对期望指纹与内容；只有这些
 事实同时一致才返回 `Unchanged`。因此轻量判定不会掩盖同指纹下的持久化损坏，也不会因
 两次读取之间 owner 发生变化而错误早退。
 
-成功摘要统计逻辑组和逻辑叶，不把物理位置数混入叶计数。审计位置使用
+成功摘要统计逻辑组和语义单元，不把物理位置数混入单元计数。审计位置使用
 `LogicalTextLocation`；物理 Mutation Target 仅在内部错误定位和 WriteBack 配方中存在。

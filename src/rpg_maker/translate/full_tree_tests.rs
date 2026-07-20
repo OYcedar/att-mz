@@ -48,7 +48,7 @@ use crate::rpg_maker::lua::runtime::{
     OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeBindings,
     TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
 };
-use crate::rpg_maker::model::{ScalarFieldKey, TextFieldRole};
+use crate::rpg_maker::model::{ScalarFieldKey, TextUnitRole};
 use crate::rpg_maker::project::ExistingProjectOpeningService;
 use crate::rpg_maker::project_database::ProjectDatabaseRecordReadingService;
 use crate::rpg_maker::project_lease::{
@@ -338,13 +338,13 @@ fn standard_asset_row(index: usize) -> SqliteRow {
         RpgMakerSource::data(StandardDataFile::Items),
         vec![RpgMakerLocationStep::index(index)],
     );
-    let field_role = RpgMakerProjectionCodec::encode_role(&TextFieldRole::Scalar(
+    let unit_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::Scalar(
         ScalarFieldKey::new("name").expect("字段键应合法"),
     ))
     .expect("字段角色应可编码");
 
     SqliteRow::new(vec![
-        SqliteValue::Text("3_leaf".to_owned()),
+        SqliteValue::Text("3_unit".to_owned()),
         SqliteValue::Text("builtin".to_owned()),
         SqliteValue::Null,
         SqliteValue::Null,
@@ -354,8 +354,8 @@ fn standard_asset_row(index: usize) -> SqliteRow {
             RpgMakerLocationCodec::encode(&group_location).expect("测试位置应可编码"),
         ),
         SqliteValue::Text("database_entry".to_owned()),
-        SqliteValue::Text(field_role),
-        SqliteValue::Text("魔法剣".to_owned()),
+        SqliteValue::Text(unit_role),
+        SqliteValue::Text(r#""魔法剣""#.to_owned()),
         SqliteValue::Text("{}".to_owned()),
         SqliteValue::Null,
         SqliteValue::Null,
@@ -383,28 +383,28 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
                 .join("demo")
                 .join("project.db")
         );
-        let translated_leaf_count = plan
+        let translated_unit_count = plan
             .steps()
             .iter()
             .map(|step| match step {
                 SqliteTransactionStep::Execute(command) => usize::from(
                     command
                         .parameters()
-                        .contains(&SqliteValue::Text("魔法剑".to_owned())),
+                        .contains(&SqliteValue::Text(r#""魔法剑""#.to_owned())),
                 ),
                 SqliteTransactionStep::ExecuteMany(batch)
                 | SqliteTransactionStep::ExecuteManyExactlyOne(batch) => batch
                     .parameter_sets()
                     .iter()
                     .filter(|parameters| {
-                        parameters.contains(&SqliteValue::Text("魔法剑".to_owned()))
+                        parameters.contains(&SqliteValue::Text(r#""魔法剑""#.to_owned()))
                     })
                     .count(),
                 SqliteTransactionStep::RequireNoRows(_)
                 | SqliteTransactionStep::RequireNoRowsMany(_) => 0,
             })
             .sum::<usize>();
-        let event = if translated_leaf_count == 0 {
+        let event = if translated_unit_count == 0 {
             assert!(plan.steps().iter().any(|step| matches!(
                 step,
                 SqliteTransactionStep::Execute(command)
@@ -413,7 +413,7 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
             Event::PreparationTransaction
         } else {
             assert_eq!(
-                translated_leaf_count, 2,
+                translated_unit_count, 2,
                 "一次代表译文必须在同一事务中扩散到两个物理位置"
             );
             Event::CommitTransaction
@@ -487,7 +487,7 @@ impl LlmRequestExecutor for FakeLlmRequestExecutor {
         }
 
         Ok(LlmResponse::new(
-            r#"[{"id":"0","translation":"魔法剑"}]"#,
+            r#"{"1":["魔法剑"]}"#,
             LlmFinishReason::Stop,
             Some("standard-request".to_owned()),
             Some("standard-response".to_owned()),
@@ -963,7 +963,7 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     assert_eq!(output.name.as_str(), "demo");
     assert_eq!(output.profile_id, "quality");
     assert!(cpu_calls.load(Ordering::SeqCst) > 0);
-    assert_eq!(transaction_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transaction_calls.load(Ordering::SeqCst), 2);
     assert_eq!(standard_attempts.load(Ordering::SeqCst), 2);
     assert_eq!(delay_calls.load(Ordering::SeqCst), 1);
     assert_eq!(file_calls.load(Ordering::SeqCst), 1);
@@ -975,12 +975,9 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     let events = events.lock().expect("事件锁不应中毒").clone();
     let metadata = event_position(&events, |event| matches!(event, Event::QueryMetadata));
     let assets = event_position(&events, |event| matches!(event, Event::QueryAssets));
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, Event::PreparationTransaction)),
-        "资源和待清状态均未变化时不应提交 Preparation 事务"
-    );
+    let preparation_transaction = event_position(&events, |event| {
+        matches!(event, Event::PreparationTransaction)
+    });
     let first_llm = event_position(&events, |event| {
         matches!(event, Event::LlmStandard { attempt: 1, .. })
     });
@@ -1003,7 +1000,8 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     let lua_close = event_position(&events, |event| matches!(event, Event::LuaClose));
 
     assert!(metadata < assets);
-    assert!(assets < log_start && log_start < first_llm);
+    assert!(assets < preparation_transaction && preparation_transaction < log_start);
+    assert!(log_start < first_llm);
     assert!(first_llm < delay && delay < second_llm);
     assert!(second_llm < commit_transaction);
     assert!(commit_transaction < log_task && log_task < read_lua);

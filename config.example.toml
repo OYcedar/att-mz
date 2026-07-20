@@ -97,13 +97,13 @@ parameters = '''
 read_concurrency = 8
 
 [rpg_maker.standard_asset]
-leaves_per_decode_job = 512
+units_per_decode_job = 512
 
 [rpg_maker.extract.store]
 groups_per_encode_job = 256
 
 [rpg_maker.translate.store]
-leaves_per_encode_job = 512
+units_per_encode_job = 512
 
 [[languages]]
 type = "japanese"

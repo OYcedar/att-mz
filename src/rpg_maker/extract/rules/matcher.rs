@@ -11,7 +11,7 @@ use std::fmt;
 use serde_json::{Map, Value};
 
 use crate::rpg_maker::model::{
-    DirectTextPart, DirectTextRecipe, ScalarFieldKey, TextFieldRole, TextProjectionRecipe,
+    DirectTextPart, DirectTextRecipe, ScalarFieldKey, TextProjectionRecipe, TextUnitRole,
 };
 use crate::rpg_maker::text::{
     DataFileName, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
@@ -108,7 +108,7 @@ pub(super) struct MatchedRuleTarget {
     group_steps: Vec<RulesValueStep>,
     steps: Vec<RulesValueStep>,
     expected_text: String,
-    leaves: Vec<MatchedRuleLeaf>,
+    units: Vec<MatchedRuleUnit>,
     parts: Vec<MatchedRulePart>,
 }
 
@@ -117,8 +117,8 @@ impl MatchedRuleTarget {
         self.kind
     }
 
-    pub(super) fn leaves(&self) -> &[MatchedRuleLeaf] {
-        &self.leaves
+    pub(super) fn units(&self) -> &[MatchedRuleUnit] {
+        &self.units
     }
 
     pub(super) fn physical_location(&self) -> Result<RpgMakerLocation, RulesMatchError> {
@@ -166,8 +166,8 @@ impl MatchedRuleTarget {
             .iter()
             .map(|part| match part {
                 MatchedRulePart::Literal(literal) => Ok(DirectTextPart::Literal(literal.clone())),
-                MatchedRulePart::TextSlot { leaf_index } => Ok(DirectTextPart::TextSlot {
-                    role: self.role_for(*leaf_index),
+                MatchedRulePart::TextSlot { unit_index } => Ok(DirectTextPart::TextSlot {
+                    role: self.role_for(*unit_index),
                 }),
             })
             .collect::<Result<Vec<_>, RulesMatchError>>()?;
@@ -179,7 +179,7 @@ impl MatchedRuleTarget {
             })
     }
 
-    pub(super) fn role_for(&self, leaf_index: usize) -> TextFieldRole {
+    pub(super) fn role_for(&self, unit_index: usize) -> TextUnitRole {
         let relative_steps = self
             .steps
             .strip_prefix(self.group_steps.as_slice())
@@ -201,38 +201,38 @@ impl MatchedRuleTarget {
         if !key.is_empty() {
             key.push('.');
         }
-        key.push_str(&format!("text[{leaf_index}]"));
+        key.push_str(&format!("text[{unit_index}]"));
         ScalarFieldKey::new(key)
-            .map(TextFieldRole::Scalar)
+            .map(TextUnitRole::Scalar)
             .expect("生成的 Rules 标量角色键始终非空")
     }
 
-    /// 使用叶子值重建最终字符串，供模型构造边界校验配方完整性。
+    /// 使用单元值重建最终字符串，供模型构造边界校验配方完整性。
     #[cfg(test)]
     pub(super) fn materialize(&self, values: &[String]) -> Result<String, RulesMatchError> {
-        if values.len() != self.leaves.len() {
+        if values.len() != self.units.len() {
             return Err(RulesMatchError::InvalidMaterialization {
                 rule_number: self.rule_number,
                 message: format!(
                     "配方需要 {} 个文本值，但收到 {} 个",
-                    self.leaves.len(),
+                    self.units.len(),
                     values.len()
                 ),
             });
         }
-        Ok(materialize_parts(&self.parts, values).expect("配方构造已保证 TextSlot 引用存在的叶子"))
+        Ok(materialize_parts(&self.parts, values).expect("配方构造已保证 TextSlot 引用存在的单元"))
     }
 }
 
-/// 同一最终字符串中一个可独立翻译的逻辑叶。
+/// 同一最终字符串中一个可独立翻译的语义单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct MatchedRuleLeaf {
-    original_text: String,
+pub(super) struct MatchedRuleUnit {
+    source_text: String,
 }
 
-impl MatchedRuleLeaf {
-    pub(super) fn original_text(&self) -> &str {
-        &self.original_text
+impl MatchedRuleUnit {
+    pub(super) fn source_text(&self) -> &str {
+        &self.source_text
     }
 }
 
@@ -240,7 +240,7 @@ impl MatchedRuleLeaf {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum MatchedRulePart {
     Literal(String),
-    TextSlot { leaf_index: usize },
+    TextSlot { unit_index: usize },
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -275,11 +275,11 @@ pub(super) fn match_rule(
             match_command_rule(rule, *code, *parameter, input)?
         }
     };
-    let leaf_count = targets
+    let unit_count = targets
         .iter()
-        .map(|target| target.leaves.len())
+        .map(|target| target.units.len())
         .sum::<usize>();
-    if leaf_count == 0 {
+    if unit_count == 0 {
         return Err(RulesMatchError::NoNonBlankMatch {
             rule_number: rule.rule_number(),
         });
@@ -725,7 +725,7 @@ fn materialize_target(
     group_steps: Vec<RulesValueStep>,
     steps: Vec<RulesValueStep>,
 ) -> Result<Option<MatchedRuleTarget>, RulesMatchError> {
-    let (leaves, parts) = if let Some(pattern) = rule.pattern() {
+    let (units, parts) = if let Some(pattern) = rule.pattern() {
         let mut captures = Vec::new();
         for result in pattern.regex().captures_iter(text.as_bytes()) {
             let result = result.map_err(|source| RulesMatchError::PatternMatch {
@@ -761,18 +761,18 @@ fn materialize_target(
         (Vec::new(), Vec::new())
     } else {
         (
-            vec![MatchedRuleLeaf {
-                original_text: text.to_owned(),
+            vec![MatchedRuleUnit {
+                source_text: text.to_owned(),
             }],
-            vec![MatchedRulePart::TextSlot { leaf_index: 0 }],
+            vec![MatchedRulePart::TextSlot { unit_index: 0 }],
         )
     };
-    if leaves.is_empty() {
+    if units.is_empty() {
         return Ok(None);
     }
-    let originals = leaves
+    let originals = units
         .iter()
-        .map(|leaf| leaf.original_text.as_str())
+        .map(|unit| unit.source_text.as_str())
         .collect::<Vec<_>>();
     if materialize_parts(&parts, &originals).as_deref() != Some(text) {
         return Err(RulesMatchError::InvalidMaterialization {
@@ -789,7 +789,7 @@ fn materialize_target(
         group_steps,
         steps,
         expected_text: text.to_owned(),
-        leaves,
+        units,
         parts,
     }))
 }
@@ -817,8 +817,8 @@ fn materialize_captures(
     rule_number: usize,
     text: &str,
     captures: Vec<(usize, usize)>,
-) -> Result<(Vec<MatchedRuleLeaf>, Vec<MatchedRulePart>), RulesMatchError> {
-    let mut leaves = Vec::new();
+) -> Result<(Vec<MatchedRuleUnit>, Vec<MatchedRulePart>), RulesMatchError> {
+    let mut units = Vec::new();
     let mut parts = Vec::new();
     let mut cursor = 0;
     let mut previous_capture_end = 0;
@@ -836,17 +836,17 @@ fn materialize_captures(
         if cursor < start {
             push_literal(&mut parts, &text[cursor..start]);
         }
-        let leaf_index = leaves.len();
-        leaves.push(MatchedRuleLeaf {
-            original_text: text[start..end].to_owned(),
+        let unit_index = units.len();
+        units.push(MatchedRuleUnit {
+            source_text: text[start..end].to_owned(),
         });
-        parts.push(MatchedRulePart::TextSlot { leaf_index });
+        parts.push(MatchedRulePart::TextSlot { unit_index });
         cursor = end;
     }
     if cursor < text.len() {
         push_literal(&mut parts, &text[cursor..]);
     }
-    Ok((leaves, parts))
+    Ok((units, parts))
 }
 
 fn push_literal(parts: &mut Vec<MatchedRulePart>, literal: &str) {
@@ -867,8 +867,8 @@ where
     for part in parts {
         match part {
             MatchedRulePart::Literal(literal) => output.push_str(literal),
-            MatchedRulePart::TextSlot { leaf_index } => {
-                output.push_str(values.get(*leaf_index)?.as_ref());
+            MatchedRulePart::TextSlot { unit_index } => {
+                output.push_str(values.get(*unit_index)?.as_ref());
             }
         }
     }
@@ -1015,7 +1015,10 @@ impl fmt::Display for RulesMatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoNonBlankMatch { rule_number } => {
-                write!(formatter, "Rules 规则 {rule_number} 没有产生任何非空翻译叶")
+                write!(
+                    formatter,
+                    "Rules 规则 {rule_number} 没有产生任何非空语义单元"
+                )
             }
             Self::InvalidTarget {
                 rule_number,
@@ -1101,13 +1104,13 @@ pattern = '(?ms)<DESC:(?<text>.*?)>'
         let targets = match_rules(&definition, &input).expect("两段文本都应物化");
 
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].leaves.len(), 2);
-        assert_eq!(targets[0].leaves[0].original_text, "第一段");
-        assert_eq!(targets[0].leaves[1].original_text, "第二段");
+        assert_eq!(targets[0].units.len(), 2);
+        assert_eq!(targets[0].units[0].source_text, "第一段");
+        assert_eq!(targets[0].units[1].source_text, "第二段");
         let originals = targets[0]
-            .leaves
+            .units
             .iter()
-            .map(|leaf| leaf.original_text.clone())
+            .map(|unit| unit.source_text.clone())
             .collect::<Vec<_>>();
         assert_eq!(
             targets[0].materialize(&originals).expect("配方应可重建"),
@@ -1140,7 +1143,7 @@ decode_json = true
         let targets = match_rules(&definition, &input).expect("嵌套值应匹配");
 
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].leaves[0].original_text, "手柄未连接");
+        assert_eq!(targets[0].units[0].source_text, "手柄未连接");
         assert_eq!(
             targets[0].steps,
             vec![
@@ -1191,7 +1194,7 @@ path = 'dText'
         assert_eq!(
             targets
                 .iter()
-                .map(|target| target.leaves[0].original_text.as_str())
+                .map(|target| target.units[0].source_text.as_str())
                 .collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from(["命令正文", "文件正文"])
         );
@@ -1226,8 +1229,8 @@ path = 'dText'
 
         let originals = targets
             .iter()
-            .flat_map(|target| target.leaves.iter())
-            .map(|leaf| leaf.original_text.as_str())
+            .flat_map(|target| target.units.iter())
+            .map(|unit| unit.source_text.as_str())
             .collect::<BTreeSet<_>>();
         assert_eq!(originals, BTreeSet::from(["你好", "说明"]));
     }
@@ -1258,7 +1261,7 @@ path = 'displayName'
     }
 
     #[test]
-    fn every_nonempty_rule_must_produce_a_nonblank_leaf() {
+    fn every_nonempty_rule_must_produce_a_nonblank_unit() {
         let definition = RulesDefinition::parse(
             r#"
 [[rule]]
@@ -1315,10 +1318,10 @@ pattern = '<x>(?<text>.*?)</x>'
         .expect("规则应合法");
         let input = input([("Items.json", json!([null, {"note":"<x> </x><x>甲</x>"}]))]);
 
-        let targets = match_rules(&definition, &input).expect("非空捕获应产生翻译叶");
+        let targets = match_rules(&definition, &input).expect("非空捕获应产生语义单元");
 
-        assert_eq!(targets[0].leaves.len(), 1);
-        assert_eq!(targets[0].leaves[0].original_text, "甲");
+        assert_eq!(targets[0].units.len(), 1);
+        assert_eq!(targets[0].units[0].source_text, "甲");
         assert_eq!(
             targets[0]
                 .materialize(&["乙".to_owned()])

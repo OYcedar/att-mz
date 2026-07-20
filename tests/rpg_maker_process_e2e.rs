@@ -33,11 +33,21 @@ const MV_SPEAKER: &str = "アリス";
 const MV_BODY: &str = "こんにちは、世界！";
 const MV_SPEAKER_TRANSLATION: &str = "爱丽丝";
 const MV_BODY_TRANSLATION: &str = "你好，世界！";
+const MIXED_PROJECT: &str = "mixed-map";
+const MIXED_MAP_NAME: &str = "始まりの町";
+const MIXED_MAP_NAME_TRANSLATION: &str = "起始之镇";
+const MIXED_SPEAKER: &str = "アリス";
+const MIXED_SPEAKER_TRANSLATION: &str = "爱丽丝";
+const MIXED_DIALOGUE_SOURCE: [&str; 3] = ["今日はいい天気ですね。", "一緒に町へ", "行きませんか？"];
+const MIXED_DIALOGUE_TRANSLATION: [&str; 2] = ["今天天气真好。", "要一起去城里吗？"];
+const MIXED_CHOICES_SOURCE: [&str; 2] = ["はい", "いいえ"];
+const MIXED_CHOICES_TRANSLATION: [&str; 2] = ["是", "否"];
+const MIXED_SCROLLING_SOURCE: [&str; 3] = ["スタッフ", "", "終わり"];
+const MIXED_SCROLLING_TRANSLATION: [&str; 3] = ["制作人员", "", "结束"];
 const SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT";
 const UPDATED_SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT UPDATED";
 const JS_MARKER: &str = "/* ATT MZ process e2e */";
-const EXPECTED_USER_MESSAGE: &str =
-    "# 翻译任务\n\n\n# 文本\n\n## 语义组 1 · 数据库对象\n\n### [0] description\n> 薬草です\n";
+const EXPECTED_USER_MESSAGE: &str = "## 数据库文本\n\n说明 [1]（自由断行）：\n\n> 薬草です\n";
 const EXTRACT_LUA: &str = "scripts/extract.lua";
 const TRANSLATE_LUA: &str = "scripts/translate.lua";
 const WRITE_BACK_LUA: &str = "scripts/write_back.lua";
@@ -168,7 +178,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     let write_back_stdout = assert_success("write-back", &write_back);
     assert!(write_back_stdout.starts_with("写回完成：e2e\n输出目录："));
     assert!(write_back_stdout.contains(
-        "标准写回：应用译文 1 处，保留原文 0 处；自动换行 0 段，新增换行 0 处；续行全角缩进 0 处；需人工换行 0 段\n"
+        "标准写回：应用译文 1 个单元，保留原文 0 个单元；自动换行 0 段，新增换行 0 处；续行全角缩进 0 处；需人工换行 0 段\n"
     ));
     assert!(write_back_stdout.ends_with("Lua 写回：已执行\n"));
 
@@ -187,7 +197,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         "完全相同的 Init 必须保留既有写回输出"
     );
 
-    let leaf_before_reextract = read_translation_leaf(&database);
+    let unit_before_reextract = read_translation_unit(&database);
     let repeated_extract = run_att(
         root,
         arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
@@ -197,8 +207,8 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         "提取完成：e2e\n"
     );
     assert_eq!(
-        read_translation_leaf(&database),
-        leaf_before_reextract,
+        read_translation_unit(&database),
+        unit_before_reextract,
         "完全相同的 Builtin 快照必须精确继承译文与 translation_state"
     );
 
@@ -213,8 +223,8 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         "翻译执行完成：e2e（Profile：local）\n标准翻译：任务 0，完整 0，部分 0，不可用 0；写入 0 处，剩余 0 处\n状态收敛：保留 1，失效 0，不适用 0，复用 0\n"
     );
     assert_eq!(
-        read_translation_leaf(&database),
-        leaf_before_reextract,
+        read_translation_unit(&database),
+        unit_before_reextract,
         "完全收敛的 Translate 不得发出请求，也不得重写译文或 translation_state"
     );
 
@@ -285,14 +295,14 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_success("source-refreshed write-back", &updated_write_back);
     assert_updated_written_game(&workspace, &output_root);
 
-    let builtin_before_rules = read_translation_leaf(&database);
+    let builtin_before_rules = read_translation_unit(&database);
     write_rules(root, "customShortName");
     let initial_rules_extract = run_att(
         root,
         arguments(&["mz", "extract", "--name", PROJECT, "--rules", RULES_TOML]),
     );
     assert_success("initial rules extract", &initial_rules_extract);
-    assert_rules_leaf(&database, "customShortName", "Potion");
+    assert_rules_unit(&database, "customShortName", "Potion");
 
     write_rules(root, "customLongName");
     let updated_rules_extract = run_att(
@@ -300,15 +310,15 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         arguments(&["mz", "extract", "--name", PROJECT, "--rules", RULES_TOML]),
     );
     assert_success("updated rules extract", &updated_rules_extract);
-    assert_rules_leaf(&database, "customLongName", "Restorative Potion");
+    assert_rules_unit(&database, "customLongName", "Restorative Potion");
     assert_eq!(
-        read_translation_leaf(&database),
+        read_translation_unit(&database),
         builtin_before_rules,
-        "Rules owner 的精确替换不得扰动 Builtin 叶"
+        "Rules owner 的精确替换不得扰动 Builtin 单元"
     );
 
     write_terminology(root);
-    let before_terminology = read_translation_leaf(&database);
+    let before_terminology = read_translation_unit(&database);
     let terminology_translate = run_att(
         root,
         arguments(&[
@@ -325,11 +335,11 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         assert_success("terminology-updated translate", &terminology_translate);
     assert!(terminology_stdout.contains("任务 1"));
     assert!(terminology_stdout.contains("失效 1"));
-    let after_terminology = read_translation_leaf(&database);
-    assert_eq!(after_terminology.1, TRANSLATION);
+    let after_terminology = read_translation_unit(&database);
+    assert_eq!(after_terminology.1, json!(TRANSLATION).to_string());
     assert_ne!(
         after_terminology.2, before_terminology.2,
-        "实际触发的术语变化必须更新逐叶语义状态"
+        "实际触发的术语变化必须更新语义单元状态"
     );
     assert_persisted_terminology(&database);
 
@@ -338,7 +348,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         UPDATED_SYSTEM_PROMPT,
     )
     .expect("更新后的系统提示词应可写入");
-    let before_profile_semantics = read_translation_leaf(&database);
+    let before_profile_semantics = read_translation_unit(&database);
     let profile_semantics_translate = run_att(
         root,
         arguments(&["mz", "translate", "--name", PROJECT, PROFILE]),
@@ -347,11 +357,11 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         assert_success("profile-semantics translate", &profile_semantics_translate);
     assert!(profile_stdout.contains("任务 1"));
     assert!(profile_stdout.contains("失效 1"));
-    let after_profile_semantics = read_translation_leaf(&database);
-    assert_eq!(after_profile_semantics.1, TRANSLATION);
+    let after_profile_semantics = read_translation_unit(&database);
+    assert_eq!(after_profile_semantics.1, json!(TRANSLATION).to_string());
     assert_ne!(
         after_profile_semantics.2, before_profile_semantics.2,
-        "实际 system prompt 内容变化必须更新逐叶语义状态"
+        "实际 system prompt 内容变化必须更新语义单元状态"
     );
     assert_persisted_terminology(&database);
 
@@ -373,7 +383,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         &[UPDATED_SOURCE_TEXT, "上薬草", "高级药草"],
     );
 
-    let before_layout = read_translation_leaf(&database);
+    let before_layout = read_translation_unit(&database);
     let layout_init = run_att(root, mz_init_arguments_with_layout(&game_root, 24, 30, 2));
     assert_eq!(
         assert_success("layout-updated init", &layout_init),
@@ -381,7 +391,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     );
     assert_layout_metadata(&database, 24, 30, 2);
     assert_eq!(
-        read_translation_leaf(&database),
+        read_translation_unit(&database),
         before_layout,
         "只改变布局必须保留标准译文及其语义状态"
     );
@@ -457,6 +467,69 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     ] {
         assert_process_output_does_not_contain_client_secrets(phase, output);
     }
+}
+
+#[test]
+fn mz_map_mixes_five_semantic_unit_types_in_one_translation_task() {
+    let temporary = tempfile::tempdir().expect("应可建立混合 Map 端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir(root.join("projects")).expect("项目根应可建立");
+    fs::create_dir(root.join("logs")).expect("日志根应可建立");
+    fs::create_dir_all(root.join("prompts/rpg_maker")).expect("提示词根应可建立");
+    write_mixed_semantic_mz_game(&game_root);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), EMPTY_PARAMETERS);
+
+    let init = run_att(
+        root,
+        mz_init_arguments_for(&game_root, MIXED_PROJECT, "ja", "zh-Hans", 24, 30, 40),
+    );
+    assert_success("混合 Map init", &init);
+
+    let extract = run_att(
+        root,
+        arguments(&["mz", "extract", "--name", MIXED_PROJECT, "--builtin"]),
+    );
+    assert_success("混合 Map extract", &extract);
+    let workspace = root.join("projects/mz").join(MIXED_PROJECT);
+    let database = workspace.join("project.db");
+    assert_mixed_semantic_units_extracted(&database);
+
+    fs::write(root.join("prompts/rpg_maker/ja--zh-Hans.md"), SYSTEM_PROMPT)
+        .expect("混合 Map 提示词应可写入");
+    let running_server = server.start_with_responses(vec![ChatResponseFixture::MixedSemanticUnits]);
+    let translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", MIXED_PROJECT, PROFILE]),
+    );
+    let translate_stdout = assert_success("混合 Map translate", &translate);
+    assert!(
+        translate_stdout.contains("任务 1，完整 1，部分 0，不可用 0"),
+        "五种语义单元应位于同一完整任务：{translate_stdout}"
+    );
+    assert!(
+        translate_stdout.contains("写入 5 处，剩余 0 处"),
+        "五种语义单元应全部原子提交：{translate_stdout}"
+    );
+    let requests = running_server.finish();
+    assert_eq!(requests.len(), 1, "同一 Map 范围的五种类型不得按类型拆请求");
+    assert_mixed_semantic_request(&requests[0]);
+    assert_mixed_semantic_translations(&database);
+
+    let write_back = run_att(
+        root,
+        arguments(&["mz", "write-back", "--name", MIXED_PROJECT]),
+    );
+    let write_back_stdout = assert_success("混合 Map write-back", &write_back);
+    assert!(
+        write_back_stdout.contains("标准写回：应用译文 5 个单元，保留原文 0 个单元"),
+        "写回应按五个逻辑 unit 计数：{write_back_stdout}"
+    );
+    let output_root = workspace.join("write_back");
+    assert_mixed_semantic_game_written(&output_root);
+    assert_mixed_semantic_audit(&root.join("logs/audit.jsonl"));
 }
 
 #[test]
@@ -1013,6 +1086,90 @@ fn write_minimal_mz_game(game_root: &Path) {
     fs::write(js.join("rmmz_core.js"), "/* MZ core */").expect("MZ core 标记应可写入");
 }
 
+fn write_mixed_semantic_mz_game(game_root: &Path) {
+    write_minimal_mz_game(game_root);
+    let data = game_root.join("data");
+    fs::write(data.join("Items.json"), b"[null]").expect("混合 Map 不应额外产生 Items 单元");
+    fs::write(
+        data.join("Map001.json"),
+        serde_json::to_vec(&json!({
+            "displayName": MIXED_MAP_NAME,
+            "events": [
+                null,
+                {
+                    "id": 1,
+                    "name": "Semantic Units",
+                    "note": "",
+                    "pages": [{
+                        "conditions": {},
+                        "image": {},
+                        "moveRoute": { "list": [{ "code": 0, "parameters": [] }] },
+                        "list": [
+                            {
+                                "code": 101,
+                                "indent": 0,
+                                "parameters": ["", 0, 0, 2, MIXED_SPEAKER]
+                            },
+                            {
+                                "code": 401,
+                                "indent": 0,
+                                "parameters": [MIXED_DIALOGUE_SOURCE[0]]
+                            },
+                            {
+                                "code": 401,
+                                "indent": 0,
+                                "parameters": [MIXED_DIALOGUE_SOURCE[1]]
+                            },
+                            {
+                                "code": 401,
+                                "indent": 0,
+                                "parameters": [MIXED_DIALOGUE_SOURCE[2]]
+                            },
+                            {
+                                "code": 102,
+                                "indent": 0,
+                                "parameters": [MIXED_CHOICES_SOURCE, -2, 0, 2, 0]
+                            },
+                            {
+                                "code": 402,
+                                "indent": 0,
+                                "parameters": [0, MIXED_CHOICES_SOURCE[0]]
+                            },
+                            { "code": 0, "indent": 1, "parameters": [] },
+                            {
+                                "code": 402,
+                                "indent": 0,
+                                "parameters": [1, MIXED_CHOICES_SOURCE[1]]
+                            },
+                            { "code": 0, "indent": 1, "parameters": [] },
+                            { "code": 404, "indent": 0, "parameters": [] },
+                            { "code": 105, "indent": 0, "parameters": [2, false] },
+                            {
+                                "code": 405,
+                                "indent": 0,
+                                "parameters": [MIXED_SCROLLING_SOURCE[0]]
+                            },
+                            {
+                                "code": 405,
+                                "indent": 0,
+                                "parameters": [MIXED_SCROLLING_SOURCE[1]]
+                            },
+                            {
+                                "code": 405,
+                                "indent": 0,
+                                "parameters": [MIXED_SCROLLING_SOURCE[2]]
+                            },
+                            { "code": 0, "indent": 0, "parameters": [] }
+                        ]
+                    }]
+                }
+            ]
+        }))
+        .expect("混合 Map 夹具应可序列化"),
+    )
+    .expect("混合 Map 夹具应可写入");
+}
+
 fn write_minimal_mv_game(game_root: &Path) {
     let content_root = game_root.join("www");
     write_minimal_mz_game(&content_root);
@@ -1120,7 +1277,7 @@ assert(type(ctx.rpg_maker) == "table")
 
 ctx.db.begin()
 local translated = ctx.db.query(
-  "SELECT translation FROM standard_text_leaf WHERE original_text = ?1",
+  "SELECT json_extract(translation_content_json, '$') FROM standard_text_unit WHERE source_content_json = json_quote(?1)",
   {"薬草です"}
 )
 assert(#translated == 1 and translated[1][1] == "治疗药草")
@@ -1159,7 +1316,7 @@ assert(type(ctx.rpg_maker) == "table")
 
 ctx.db.begin()
 local translated = ctx.db.query(
-  "SELECT translation FROM standard_text_leaf WHERE original_text = ?1",
+  "SELECT json_extract(translation_content_json, '$') FROM standard_text_unit WHERE source_content_json = json_quote(?1)",
   {"薬草です"}
 )
 assert(#translated == 1 and translated[1][1] == "治疗药草")
@@ -1321,13 +1478,13 @@ retained_rotated_files = 2
 read_concurrency = 2
 
 [rpg_maker.standard_asset]
-leaves_per_decode_job = 32
+units_per_decode_job = 32
 
 [rpg_maker.extract.store]
 groups_per_encode_job = 32
 
 [rpg_maker.translate.store]
-leaves_per_encode_job = 32
+units_per_encode_job = 32
 
 [[languages]]
 type = "japanese"
@@ -1424,7 +1581,7 @@ fn assert_extracted_database(database: &Path) {
     let connection = open_read_only(database);
     let expected_tables = BTreeSet::from([
         "standard_text_group".to_owned(),
-        "standard_text_leaf".to_owned(),
+        "standard_text_unit".to_owned(),
         "standard_text_target".to_owned(),
     ]);
     let mut statement = connection
@@ -1438,12 +1595,12 @@ fn assert_extracted_database(database: &Path) {
     assert!(expected_tables.is_subset(&actual_tables));
     let row: (String, String, String, String, Option<String>) = connection
         .query_row(
-            "SELECT text_group.owner, text_group.group_kind, leaf.field_role, \
-                    leaf.original_text, leaf.translation \
+            "SELECT text_group.owner, text_group.group_kind, unit.unit_role, \
+                    unit.source_content_json, unit.translation_content_json \
              FROM standard_text_group AS text_group \
-             JOIN standard_text_leaf AS leaf \
-               ON leaf.owner = text_group.owner \
-              AND leaf.group_location = text_group.group_location",
+             JOIN standard_text_unit AS unit \
+               ON unit.owner = text_group.owner \
+              AND unit.group_location = text_group.group_location",
             [],
             |row| {
                 Ok((
@@ -1455,14 +1612,17 @@ fn assert_extracted_database(database: &Path) {
                 ))
             },
         )
-        .expect("Builtin 应写入唯一 Items 叶子");
+        .expect("Builtin 应写入唯一 Items 语义单元");
     assert_eq!(row.0, "builtin");
     assert_eq!(row.1, "database_entry");
     assert_eq!(
         serde_json::from_str::<Value>(&row.2).expect("逻辑角色应为规范 JSON"),
         json!({ "kind": "scalar", "key": "description" })
     );
-    assert_eq!(row.3, SOURCE_TEXT);
+    assert_eq!(
+        serde_json::from_str::<Value>(&row.3).expect("源内容应为规范 JSON"),
+        json!(SOURCE_TEXT)
+    );
     assert_eq!(row.4, None);
 
     let targets: i64 = connection
@@ -1473,15 +1633,129 @@ fn assert_extracted_database(database: &Path) {
     assert_eq!(targets, 1, "唯一文本组应拥有唯一物理修改目标");
 }
 
+fn assert_mixed_semantic_units_extracted(database: &Path) {
+    let connection = open_read_only(database);
+    let mut statement = connection
+        .prepare(
+            "SELECT unit_role, source_content_json, source_context_json \
+             FROM standard_text_unit WHERE owner = 'builtin' ORDER BY group_location, unit_role",
+        )
+        .expect("混合 Map 单元查询应可准备");
+    let units = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("混合 Map 单元查询应可执行")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("混合 Map 单元应可读取");
+    assert_eq!(units.len(), 5, "五种类型必须各形成一个语义单元");
+
+    let decoded = units
+        .iter()
+        .map(|(role, source, context)| {
+            (
+                serde_json::from_str::<Value>(role).expect("unit_role 应为规范 JSON"),
+                serde_json::from_str::<Value>(source).expect("source_content_json 应为规范 JSON"),
+                serde_json::from_str::<Value>(context).expect("source_context_json 应为规范 JSON"),
+            )
+        })
+        .collect::<Vec<_>>();
+    for expected in [
+        (
+            json!({ "kind": "scalar", "key": "displayName" }),
+            json!(MIXED_MAP_NAME),
+            json!({}),
+        ),
+        (
+            json!({ "kind": "dialogue_speaker" }),
+            json!(MIXED_SPEAKER),
+            json!({}),
+        ),
+        (
+            json!({ "kind": "dialogue_body" }),
+            json!(MIXED_DIALOGUE_SOURCE),
+            json!({ "source_speaker": MIXED_SPEAKER }),
+        ),
+        (
+            json!({ "kind": "choices" }),
+            json!(MIXED_CHOICES_SOURCE),
+            json!({}),
+        ),
+        (
+            json!({ "kind": "scrolling_text" }),
+            json!(MIXED_SCROLLING_SOURCE),
+            json!({}),
+        ),
+    ] {
+        assert!(decoded.contains(&expected), "缺少语义单元：{expected:?}");
+    }
+}
+
+fn assert_mixed_semantic_translations(database: &Path) {
+    let connection = open_read_only(database);
+    let mut statement = connection
+        .prepare(
+            "SELECT unit_role, translation_content_json \
+             FROM standard_text_unit WHERE owner = 'builtin' ORDER BY group_location, unit_role",
+        )
+        .expect("混合 Map 译文查询应可准备");
+    let translations = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("混合 Map 译文查询应可执行")
+        .map(|row| {
+            let (role, translation) = row.expect("混合 Map 译文行应可读取");
+            (
+                serde_json::from_str::<Value>(&role).expect("unit_role 应为规范 JSON"),
+                serde_json::from_str::<Value>(&translation)
+                    .expect("translation_content_json 应为规范 JSON"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(translations.len(), 5);
+    for expected in [
+        (
+            json!({ "kind": "scalar", "key": "displayName" }),
+            json!(MIXED_MAP_NAME_TRANSLATION),
+        ),
+        (
+            json!({ "kind": "dialogue_body" }),
+            json!(MIXED_DIALOGUE_TRANSLATION),
+        ),
+        (
+            json!({ "kind": "dialogue_speaker" }),
+            json!(MIXED_SPEAKER_TRANSLATION),
+        ),
+        (
+            json!({ "kind": "choices" }),
+            json!(MIXED_CHOICES_TRANSLATION),
+        ),
+        (
+            json!({ "kind": "scrolling_text" }),
+            json!(MIXED_SCROLLING_TRANSLATION),
+        ),
+    ] {
+        assert!(
+            translations.contains(&expected),
+            "缺少已提交译文：{expected:?}"
+        );
+    }
+}
+
 fn assert_mv_dialogue_extracted(database: &Path) {
     let connection = open_read_only(database);
     let mut statement = connection
         .prepare(
-            "SELECT field_role, original_text, translation \
-             FROM standard_text_leaf WHERE owner = 'builtin' ORDER BY field_role",
+            "SELECT unit_role, source_content_json, translation_content_json \
+             FROM standard_text_unit WHERE owner = 'builtin' ORDER BY unit_role",
         )
-        .expect("MV 逻辑叶查询应可准备");
-    let leaves = statement
+        .expect("MV 语义单元查询应可准备");
+    let units = statement
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1489,27 +1763,29 @@ fn assert_mv_dialogue_extracted(database: &Path) {
                 row.get::<_, Option<String>>(2)?,
             ))
         })
-        .expect("MV 逻辑叶查询应可执行")
+        .expect("MV 语义单元查询应可执行")
         .collect::<Result<Vec<_>, _>>()
-        .expect("MV 逻辑叶应可读取");
-    assert_eq!(leaves.len(), 2, "MV 姓名和正文应物化为两个逻辑叶");
+        .expect("MV 语义单元应可读取");
+    assert_eq!(units.len(), 2, "MV 姓名和正文应物化为两个语义单元");
 
-    let logical = leaves
+    let logical = units
         .iter()
-        .map(|(role, original, translation)| {
+        .map(|(role, source, translation)| {
             (
                 serde_json::from_str::<Value>(role).expect("MV 逻辑角色应为规范 JSON"),
-                original.as_str(),
-                translation.as_deref(),
+                serde_json::from_str::<Value>(source).expect("MV 源内容应为规范 JSON"),
+                translation.as_deref().map(|value| {
+                    serde_json::from_str::<Value>(value).expect("MV 译文应为规范 JSON")
+                }),
             )
         })
         .collect::<Vec<_>>();
-    assert!(logical.contains(&(json!({ "kind": "dialogue_speaker" }), MV_SPEAKER, None,)));
     assert!(logical.contains(&(
-        json!({ "kind": "dialogue_body", "index": 0 }),
-        MV_BODY,
+        json!({ "kind": "dialogue_speaker" }),
+        json!(MV_SPEAKER),
         None,
     )));
+    assert!(logical.contains(&(json!({ "kind": "dialogue_body" }), json!([MV_BODY]), None,)));
 
     let (groups, targets): (i64, i64) = connection
         .query_row(
@@ -1539,19 +1815,22 @@ fn assert_mv_dialogue_extracted(database: &Path) {
 
 fn assert_mv_dialogue_translated(database: &Path) {
     let connection = open_read_only(database);
-    for (original, expected) in [
-        (MV_SPEAKER, MV_SPEAKER_TRANSLATION),
-        (MV_BODY, MV_BODY_TRANSLATION),
+    for (source, expected) in [
+        (json!(MV_SPEAKER), json!(MV_SPEAKER_TRANSLATION)),
+        (json!([MV_BODY]), json!([MV_BODY_TRANSLATION])),
     ] {
-        let translation: String = connection
+        let translation_json: String = connection
             .query_row(
-                "SELECT translation FROM standard_text_leaf \
-                 WHERE owner = 'builtin' AND original_text = ?1",
-                [original],
+                "SELECT translation_content_json FROM standard_text_unit \
+                 WHERE owner = 'builtin' AND source_content_json = ?1",
+                [source.to_string()],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|error| panic!("MV 逻辑叶 {original:?} 译文应已提交：{error}"));
-        assert_eq!(translation, expected);
+            .unwrap_or_else(|error| panic!("MV 语义单元 {source:?} 译文应已提交：{error}"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&translation_json).expect("MV 译文应为规范 JSON"),
+            expected
+        );
     }
 }
 
@@ -1577,39 +1856,129 @@ fn assert_mv_dialogue_written(output_root: &Path) {
     );
 }
 
+fn assert_mixed_semantic_game_written(output_root: &Path) {
+    let output_map: Value = serde_json::from_slice(
+        &fs::read(output_root.join("data/Map001.json")).expect("混合 Map 写回文件应存在"),
+    )
+    .expect("混合 Map 写回文件应为 JSON");
+    assert_eq!(output_map["displayName"], MIXED_MAP_NAME_TRANSLATION);
+    let commands = output_map["events"][1]["pages"][0]["list"]
+        .as_array()
+        .expect("混合 Map 事件命令应为数组");
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command["code"].as_i64().expect("事件 code 应为整数"))
+            .collect::<Vec<_>>(),
+        vec![
+            101, 401, 401, 102, 402, 0, 402, 0, 404, 105, 405, 405, 405, 0
+        ],
+        "三条正文 401 必须由模型的两条语义行整体替换"
+    );
+    assert_eq!(
+        commands[0]["parameters"],
+        json!(["", 0, 0, 2, MIXED_SPEAKER_TRANSLATION])
+    );
+    assert_eq!(
+        commands[1]["parameters"],
+        json!([MIXED_DIALOGUE_TRANSLATION[0]])
+    );
+    assert_eq!(
+        commands[2]["parameters"],
+        json!([MIXED_DIALOGUE_TRANSLATION[1]])
+    );
+    assert_eq!(
+        commands[3]["parameters"][0],
+        json!(MIXED_CHOICES_TRANSLATION)
+    );
+    assert_eq!(
+        commands[4]["parameters"],
+        json!([0, MIXED_CHOICES_TRANSLATION[0]])
+    );
+    assert_eq!(
+        commands[6]["parameters"],
+        json!([1, MIXED_CHOICES_TRANSLATION[1]])
+    );
+    assert_eq!(
+        commands[10]["parameters"],
+        json!([MIXED_SCROLLING_TRANSLATION[0]])
+    );
+    assert_eq!(
+        commands[11]["parameters"],
+        json!([MIXED_SCROLLING_TRANSLATION[1]])
+    );
+    assert_eq!(
+        commands[12]["parameters"],
+        json!([MIXED_SCROLLING_TRANSLATION[2]])
+    );
+}
+
+fn assert_mixed_semantic_audit(audit_path: &Path) {
+    let (_, records) = read_json_lines(audit_path);
+    let translation = records
+        .iter()
+        .find(|record| {
+            record["project"] == MIXED_PROJECT
+                && record["command"] == "translate"
+                && record["event"] == "translation_task_finished"
+                && record["payload"]["result"]["kind"] == "completed"
+        })
+        .expect("混合 Map 应记录完整翻译任务");
+    assert_eq!(
+        translation["payload"]["result"]["task"]["confirmed_written_units"],
+        5
+    );
+
+    let write_back = records
+        .iter()
+        .find(|record| {
+            record["project"] == MIXED_PROJECT
+                && record["command"] == "write_back"
+                && record["event"] == "write_back_publish_finished"
+                && record["payload"]["result"]["kind"] == "published"
+        })
+        .expect("混合 Map 应记录写回发布终态");
+    let summary = &write_back["payload"]["result"]["write_back"]["summary"];
+    assert_eq!(summary["translated_units"], 5);
+    assert_eq!(summary["original_units"], 0);
+}
+
 fn assert_translation_committed(database: &Path) {
     let connection = open_read_only(database);
-    let translation: String = connection
+    let translation_json: String = connection
         .query_row(
-            "SELECT translation FROM standard_text_leaf WHERE original_text = ?1",
-            [SOURCE_TEXT],
+            "SELECT translation_content_json FROM standard_text_unit WHERE source_content_json = ?1",
+            [json!(SOURCE_TEXT).to_string()],
             |row| row.get(0),
         )
         .expect("真实模型结果应提交到项目数据库");
-    assert_eq!(translation, TRANSLATION);
+    assert_eq!(
+        serde_json::from_str::<Value>(&translation_json).expect("译文内容应为规范 JSON"),
+        json!(TRANSLATION)
+    );
 }
 
 fn assert_translation_absent(database: &Path) {
     let connection = open_read_only(database);
-    let translation: Option<String> = connection
+    let translation_json: Option<String> = connection
         .query_row(
-            "SELECT translation FROM standard_text_leaf WHERE original_text = ?1",
-            [SOURCE_TEXT],
+            "SELECT translation_content_json FROM standard_text_unit WHERE source_content_json = ?1",
+            [json!(SOURCE_TEXT).to_string()],
             |row| row.get(0),
         )
         .expect("取消后仍应保留原资产行");
-    assert!(translation.is_none(), "取消运行不得提交空数组响应");
+    assert!(translation_json.is_none(), "取消运行不得提交空数组响应");
 }
 
-fn read_translation_leaf(database: &Path) -> (String, String, Vec<u8>) {
+fn read_translation_unit(database: &Path) -> (String, String, Vec<u8>) {
     open_read_only(database)
         .query_row(
-            "SELECT original_text, translation, translation_state \
-             FROM standard_text_leaf WHERE owner = 'builtin'",
+            "SELECT source_content_json, translation_content_json, translation_state \
+             FROM standard_text_unit WHERE owner = 'builtin'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .expect("Builtin 已翻译叶及其 state 应可读取")
+        .expect("Builtin 已翻译语义单元及其 state 应可读取")
 }
 
 fn install_translation_write_guard(database: &Path) {
@@ -1617,7 +1986,7 @@ fn install_translation_write_guard(database: &Path) {
         .expect("应可打开项目数据库安装测试写保护")
         .execute_batch(
             "CREATE TRIGGER e2e_reject_translation_write \
-             BEFORE UPDATE OF translation, translation_state ON standard_text_leaf \
+             BEFORE UPDATE OF translation_content_json, translation_state ON standard_text_unit \
              BEGIN SELECT RAISE(ABORT, 'converged translation must not be rewritten'); END;",
         )
         .expect("应可安装译文零写入守卫");
@@ -1658,27 +2027,37 @@ fn builtin_owner_is_fresh(database: &Path) -> bool {
 }
 
 fn assert_translation_for_original(database: &Path, original: &str, expected: Option<&str>) {
-    let (actual_original, actual_translation): (String, Option<String>) = open_read_only(database)
-        .query_row(
-            "SELECT original_text, translation FROM standard_text_leaf WHERE owner = 'builtin'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("Builtin 当前叶应可读取");
-    assert_eq!(actual_original, original);
-    assert_eq!(actual_translation.as_deref(), expected);
+    let (actual_source_json, actual_translation_json): (String, Option<String>) =
+        open_read_only(database)
+            .query_row(
+                "SELECT source_content_json, translation_content_json \
+             FROM standard_text_unit WHERE owner = 'builtin'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("Builtin 当前语义单元应可读取");
+    assert_eq!(
+        serde_json::from_str::<Value>(&actual_source_json).expect("源内容应为规范 JSON"),
+        json!(original)
+    );
+    assert_eq!(
+        actual_translation_json
+            .as_deref()
+            .map(|value| serde_json::from_str::<Value>(value).expect("译文应为规范 JSON")),
+        expected.map(|value| json!(value))
+    );
 }
 
-fn assert_rules_leaf(database: &Path, field_name: &str, original_text: &str) {
+fn assert_rules_unit(database: &Path, field_name: &str, source_text: &str) {
     let connection = open_read_only(database);
     let row: (String, String, Option<String>, Option<Vec<u8>>) = connection
         .query_row(
-            "SELECT field_role, original_text, translation, translation_state \
-             FROM standard_text_leaf WHERE owner = 'rules'",
+            "SELECT unit_role, source_content_json, translation_content_json, translation_state \
+             FROM standard_text_unit WHERE owner = 'rules'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .expect("Rules 当前唯一叶应可读取");
+        .expect("Rules 当前唯一语义单元应可读取");
     assert_eq!(
         serde_json::from_str::<Value>(&row.0).expect("Rules 逻辑角色应为规范 JSON"),
         json!({
@@ -1686,16 +2065,19 @@ fn assert_rules_leaf(database: &Path, field_name: &str, original_text: &str) {
             "key": format!(r#"["{field_name}"].text[0]"#)
         })
     );
-    assert_eq!(row.1, original_text);
+    assert_eq!(
+        serde_json::from_str::<Value>(&row.1).expect("Rules 源内容应为规范 JSON"),
+        json!(source_text)
+    );
     assert_eq!(row.2, None);
     assert_eq!(row.3, None);
     let count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM standard_text_leaf WHERE owner = 'rules'",
+            "SELECT COUNT(*) FROM standard_text_unit WHERE owner = 'rules'",
             [],
             |row| row.get(0),
         )
-        .expect("Rules 叶数量应可读取");
+        .expect("Rules 单元数量应可读取");
     assert_eq!(count, 1, "Rules 修改后必须精确替换 owner 快照");
     assert!(
         connection
@@ -1918,7 +2300,7 @@ fn assert_json_lines(log_root: &Path, output_root: &Path) {
     assert_eq!(task_wire["final_response_usage"]["prompt_tokens"], 11);
     assert_eq!(task_wire["final_response_usage"]["completion_tokens"], 3);
     assert_eq!(task_wire["final_response_usage"]["total_tokens"], 14);
-    assert_eq!(task_wire["confirmed_written_leaves"], 1);
+    assert_eq!(task_wire["confirmed_written_units"], 1);
     assert!(records.iter().any(|record| {
         record["run_id"] == successful_run_id
             && record["event"] == "run_finished"
@@ -1939,7 +2321,7 @@ fn assert_json_lines(log_root: &Path, output_root: &Path) {
     );
     assert_eq!(
         cancelled_task["payload"]["result"]["task"]["status"]["reason"]["kind"],
-        "all_outputs_rejected"
+        "model_response_unusable"
     );
     let cancelled_run_id = cancelled_task["run_id"]
         .as_str()
@@ -1972,8 +2354,8 @@ fn assert_json_lines(log_root: &Path, output_root: &Path) {
         write_back_wire["layout_profile"]["help_description_max_fullwidth_chars"],
         40
     );
-    assert_eq!(write_back_wire["summary"]["translated_leaves"], 1);
-    assert_eq!(write_back_wire["summary"]["original_leaves"], 0);
+    assert_eq!(write_back_wire["summary"]["translated_units"], 1);
+    assert_eq!(write_back_wire["summary"]["original_units"], 0);
     assert_eq!(write_back_wire["manual_layout_diagnostics"], json!([]));
     let write_back_run_id = write_back["run_id"].as_str().expect("run_id 应为字符串");
     assert_ne!(write_back_run_id, successful_run_id);
@@ -2044,12 +2426,12 @@ fn assert_last_write_back_log(log_root: &Path, help_width: u64, lua_executed: bo
                     "source": { "kind": "data", "file": "Items.json" },
                     "steps": [{ "kind": "array_index", "index": 1 }]
                 },
-                "field_role": { "kind": "scalar", "field": "description" }
+                "unit_role": { "kind": "scalar", "field": "description" }
             }],
             "region": "help_description",
             "max_fullwidth_chars": help_width
         }),
-        "人工布局诊断必须指向受影响逻辑叶，而不是物理布局单元"
+        "人工布局诊断必须指向受影响语义单元，而不是物理布局单元"
     );
 }
 
@@ -2327,6 +2709,7 @@ enum ChatResponseFixture {
     Standard,
     Lua,
     MvDialogue,
+    MixedSemanticUnits,
 }
 
 struct RunningChatServer {
@@ -2402,11 +2785,8 @@ fn serve_chat_completion(
                 } else {
                     format!("response-e2e-{request_index}")
                 },
-                serde_json::to_string(&json!([{
-                    "id": 0,
-                    "translation": TRANSLATION
-                }]))
-                .map_err(|error| error.to_string())?,
+                serde_json::to_string(&json!({ "1": [TRANSLATION] }))
+                    .map_err(|error| error.to_string())?,
                 11,
                 3,
                 14,
@@ -2422,14 +2802,29 @@ fn serve_chat_completion(
             ChatResponseFixture::MvDialogue => (
                 "request-mv-dialogue".to_owned(),
                 "response-mv-dialogue".to_owned(),
-                serde_json::to_string(&json!([
-                    { "id": 0, "translation": MV_SPEAKER_TRANSLATION },
-                    { "id": 1, "translation": MV_BODY_TRANSLATION }
-                ]))
+                serde_json::to_string(&json!({
+                    "1": [MV_SPEAKER_TRANSLATION],
+                    "2": [MV_BODY_TRANSLATION]
+                }))
                 .map_err(|error| error.to_string())?,
                 13,
                 7,
                 20,
+            ),
+            ChatResponseFixture::MixedSemanticUnits => (
+                "request-mixed-semantic-units".to_owned(),
+                "response-mixed-semantic-units".to_owned(),
+                serde_json::to_string(&json!({
+                    "1": [MIXED_MAP_NAME_TRANSLATION],
+                    "2": [MIXED_SPEAKER_TRANSLATION],
+                    "3": MIXED_DIALOGUE_TRANSLATION,
+                    "4": MIXED_CHOICES_TRANSLATION,
+                    "5": MIXED_SCROLLING_TRANSLATION,
+                }))
+                .map_err(|error| error.to_string())?,
+                29,
+                16,
+                45,
             ),
         };
     let body = json!({
@@ -2577,6 +2972,68 @@ fn assert_exact_standard_chat_request(request: &CapturedRequest) {
     assert_eq!(actual, expected, "Chat Completions 请求 wire 必须精确匹配");
 }
 
+fn assert_mixed_semantic_request(request: &CapturedRequest) {
+    assert_common_chat_request_headers(request);
+    let actual: Value = serde_json::from_slice(&request.body).expect("混合 Map 请求必须是 JSON");
+    assert_eq!(actual["model"], "e2e-model");
+    assert_eq!(actual["stream"], false);
+    let messages = actual["messages"].as_array().expect("messages 必须是数组");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["content"], SYSTEM_PROMPT);
+    let user = messages[1]["content"]
+        .as_str()
+        .expect("混合 Map user message 必须是 Markdown 字符串");
+    let expected_fragments = [
+        format!("地图名称 [1]（单行）：{MIXED_MAP_NAME}"),
+        format!("说话人 [2]（单行）：{MIXED_SPEAKER}"),
+        "正文 [3]（自由断行）：".to_owned(),
+        format!("选项 [4]（{} 项，逐项对应）：", MIXED_CHOICES_SOURCE.len()),
+        format!(
+            "滚动文本 [5]（{} 行，逐行对应）：",
+            MIXED_SCROLLING_SOURCE.len()
+        ),
+    ];
+    let mut previous = 0;
+    for fragment in &expected_fragments {
+        let position = user
+            .find(fragment)
+            .unwrap_or_else(|| panic!("混合 Map 消息缺少 {fragment:?}：{user}"));
+        assert!(position >= previous, "五种类型必须保持自然顺序：{user}");
+        previous = position;
+    }
+    for line in MIXED_DIALOGUE_SOURCE
+        .iter()
+        .chain(MIXED_CHOICES_SOURCE.iter())
+        .chain(
+            MIXED_SCROLLING_SOURCE
+                .iter()
+                .filter(|line| !line.is_empty()),
+        )
+    {
+        assert!(
+            user.contains(&format!("> {line}")),
+            "复合语义单元必须以可读 Markdown 保留行边界：{user}"
+        );
+    }
+    assert!(
+        user.contains("> \n"),
+        "滚动文本空槽必须保留在请求中：{user}"
+    );
+    for forbidden in [
+        "source_language",
+        "target_language",
+        "owner",
+        "group_location",
+        "source_content_json",
+        "groups",
+    ] {
+        assert!(
+            !user.contains(forbidden),
+            "最小 user message 不得泄漏内部字段 {forbidden:?}：{user}"
+        );
+    }
+}
+
 fn assert_exact_lua_chat_request(request: &CapturedRequest) {
     assert_common_chat_request_headers(request);
     let actual: Value = serde_json::from_slice(&request.body).expect("Lua LLM 请求必须是 JSON");
@@ -2611,9 +3068,9 @@ fn assert_mv_dialogue_request(request: &CapturedRequest) {
         .expect("MV 翻译用户消息必须是字符串");
     assert!(
         user.contains(MV_SPEAKER),
-        "MV 请求应包含 Speaker 叶：{user}"
+        "MV 请求应包含 Speaker 单元：{user}"
     );
-    assert!(user.contains(MV_BODY), "MV 请求应包含 Body 叶：{user}");
+    assert!(user.contains(MV_BODY), "MV 请求应包含 Body 单元：{user}");
     assert!(
         user.find(MV_SPEAKER) < user.find(MV_BODY),
         "同一对话组应按 Speaker 后 Body 的稳定角色顺序请求"

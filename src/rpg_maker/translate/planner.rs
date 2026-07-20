@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -11,6 +12,7 @@ use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguagePair};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmClientSemanticIdentity};
 use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
+use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::text::DataFileName;
 use crate::rpg_maker::text::{
@@ -29,12 +31,12 @@ use super::semantics::{
     ResolvedTranslationSemantics,
 };
 use super::standard::{
-    ExpectedTranslationOutput, StandardTranslationCorpus, StandardTranslationGroup,
-    StandardTranslationInput, StandardTranslationPlan, StandardTranslationTaskIndex,
-    StandardTranslationTaskPlanner, TerminologyDependency, TranslationInvalidation,
-    TranslationLeafIdentity, TranslationPlanPreparation, TranslationPlanPreparationCounts,
-    TranslationPropagationTarget, TranslationStateContext, TranslationTaskBlock,
-    TranslationTaskGroup, TranslationTaskUnit, TranslationVirtualReason,
+    ExpectedLineShape, ExpectedTranslationOutput, ExpectedTranslationValidation,
+    StandardTranslationCorpus, StandardTranslationGroup, StandardTranslationInput,
+    StandardTranslationPlan, StandardTranslationTaskIndex, StandardTranslationTaskPlanner,
+    TerminologyDependency, TranslationInvalidation, TranslationPlanPreparation,
+    TranslationPlanPreparationCounts, TranslationPropagationTarget, TranslationStateContext,
+    TranslationTaskBlock, TranslationUnitIdentity, TranslationVirtualReason,
 };
 
 /// 使用三个职责模块与 CPU 根建立确定性 RPG Maker 翻译计划。
@@ -303,8 +305,8 @@ struct PreparedGroup {
 }
 
 struct PreparedAsset {
-    identity: TranslationLeafIdentity,
-    translation: Option<String>,
+    identity: TranslationUnitIdentity,
+    translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
 }
 
@@ -428,16 +430,15 @@ struct PreprocessedScope {
 
 struct PreprocessedGroup {
     kind: TextGroupKind,
-    group_location: crate::rpg_maker::text::RpgMakerLocation,
     units: Vec<PreprocessedUnit>,
 }
 
 struct PreprocessedUnit {
-    identity: TranslationLeafIdentity,
+    identity: TranslationUnitIdentity,
     protected_text: String,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
-    translation: Option<String>,
+    translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     invalidated: bool,
     state_context: TranslationStateContext,
@@ -465,8 +466,9 @@ fn preprocess_scope(
     for group in scope.groups {
         let mut units = Vec::with_capacity(group.assets.len());
         for asset in group.assets {
+            let source_text = semantic_text(asset.identity.source_content());
             let prepared = semantics
-                .prepare(group.kind, asset.identity.original_text())
+                .prepare(group.kind, &source_text)
                 .map_err(ScopePreprocessingError::Semantics)?;
             let protected_text = prepared.model_text().to_owned();
             let placeholders = prepared.placeholders().to_vec();
@@ -482,14 +484,15 @@ fn preprocess_scope(
             let not_applicable = prepared.status() != PreparedTranslationStatus::Active;
             let current = if not_applicable {
                 false
-            } else if let Some(translation) = asset.translation.as_deref() {
+            } else if let Some(translation) = asset.translation.as_ref() {
+                let translation_text = semantic_text(translation);
                 asset.translation_state == Some(state_context.finish(translation))
                     && matches!(
                         prepared
-                            .accept(translation)
+                            .accept(&translation_text)
                             .map_err(ScopePreprocessingError::Semantics)?,
                         PreparedTranslationAcceptance::Accepted(accepted)
-                            if accepted == translation
+                            if accepted == translation_text
                     )
             } else {
                 false
@@ -524,7 +527,6 @@ fn preprocess_scope(
         }
         groups.push(PreprocessedGroup {
             kind: group.kind,
-            group_location: group.group_location,
             units,
         });
     }
@@ -532,6 +534,13 @@ fn preprocess_scope(
         key: scope.key,
         groups,
     })
+}
+
+fn semantic_text(content: &TextUnitContent) -> String {
+    match content {
+        TextUnitContent::Value(value) => value.clone(),
+        TextUnitContent::Lines(lines) => lines.join("\n"),
+    }
 }
 
 fn global_translation_semantics(
@@ -553,7 +562,7 @@ fn global_translation_semantics(
 
 fn translation_state_context(
     global_semantics: Sha256Fingerprint,
-    identity: &TranslationLeafIdentity,
+    identity: &TranslationUnitIdentity,
     protected_text: &str,
     placeholders: &[super::standard::AppliedPlaceholder],
     terminology: &[TerminologyDependency],
@@ -562,16 +571,29 @@ fn translation_state_context(
         .map_err(ScopePreprocessingError::EncodeStateLocation)?;
     let role = RpgMakerProjectionCodec::encode_role(identity.role())
         .map_err(ScopePreprocessingError::EncodeStateRole)?;
-    let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-leaf-context");
+    let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-unit-context");
     hasher
         .frame(1, global_semantics.as_bytes())
         .frame(2, identity.owner().storage_name().as_bytes())
         .frame(3, group_kind_name(identity.kind()))
         .frame(4, group_location.as_bytes())
         .frame(5, role.as_bytes())
-        .frame(6, identity.translation_context_json().as_bytes())
-        .frame(7, identity.original_text().as_bytes())
-        .frame(8, protected_text.as_bytes());
+        .frame(6, identity.source_context_json().as_bytes());
+    match identity.source_content() {
+        TextUnitContent::Value(value) => {
+            hasher.frame(7, b"value").frame(8, value.as_bytes());
+        }
+        TextUnitContent::Lines(lines) => {
+            let count = u64::try_from(lines.len())
+                .expect("源行数必须能表示为 u64")
+                .to_le_bytes();
+            hasher.frame(7, b"lines").frame(8, &count);
+            for line in lines {
+                hasher.frame(9, line.as_bytes());
+            }
+        }
+    }
+    hasher.frame(10, protected_text.as_bytes());
     for placeholder in placeholders {
         let origin = match placeholder.origin() {
             super::standard::PlaceholderRuleOrigin::BuiltIn => b"builtin".as_slice(),
@@ -631,8 +653,8 @@ fn collect_deduplication_inputs(
                     invalidations.push(TranslationInvalidation::new(
                         unit.identity.clone(),
                         unit.translation
-                            .as_deref()
-                            .expect("只有已有译文的叶子才可能术语失效"),
+                            .clone()
+                            .expect("只有已有译文的单元才可能语义失效"),
                         unit.translation_state
                             .expect("已有译文必须同时具有 translation_state"),
                     ));
@@ -651,7 +673,7 @@ fn apply_deduplication_outcomes(
     assert_eq!(
         positions.len(),
         outcomes.len(),
-        "全局去重必须为每个候选叶子返回一个责任"
+        "全局去重必须为每个候选单元返回一个责任"
     );
     for ((scope_index, group_index, unit_index), outcome) in positions.into_iter().zip(outcomes) {
         let unit = &mut scopes[scope_index].groups[group_index].units[unit_index];
@@ -671,7 +693,6 @@ fn apply_deduplication_outcomes(
 #[derive(Clone)]
 struct PreparedTaskGroup {
     kind: TextGroupKind,
-    group_location: crate::rpg_maker::text::RpgMakerLocation,
     units: Vec<PreparedUnit>,
     triggered_terms: Vec<usize>,
 }
@@ -679,8 +700,9 @@ struct PreparedTaskGroup {
 #[derive(Clone)]
 struct PreparedUnit {
     field_name: String,
-    identity: TranslationLeafIdentity,
+    identity: TranslationUnitIdentity,
     protected_text: String,
+    translation: Option<TextUnitContent>,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
     state_context: TranslationStateContext,
@@ -702,17 +724,27 @@ fn build_scope_tasks(
                 field_name: unit.identity.role_label(),
                 identity: unit.identity,
                 protected_text: unit.protected_text,
+                translation: unit.translation,
                 placeholders: unit.placeholders,
                 language_analysis: unit.language_analysis,
                 state_context: unit.state_context,
                 responsibility: unit.responsibility,
             })
             .collect::<Vec<_>>();
+        let active_sources = units
+            .iter()
+            .filter(|unit| {
+                matches!(
+                    unit.responsibility,
+                    PreparedUnitResponsibility::Active { .. }
+                )
+            })
+            .map(|unit| semantic_text(unit.identity.source_content()))
+            .collect::<Vec<_>>();
         let triggered_terms =
-            terminology.triggered_indices(units.iter().map(|unit| unit.identity.original_text()));
+            terminology.triggered_indices(active_sources.iter().map(String::as_str));
         prepared_groups.push(PreparedTaskGroup {
             kind: group.kind,
-            group_location: group.group_location,
             units,
             triggered_terms,
         });
@@ -727,7 +759,7 @@ fn build_scope_tasks(
 }
 
 struct RenderedGroup {
-    group: TranslationTaskGroup,
+    kind: TextGroupKind,
     markdown: String,
     expected: Vec<ExpectedBase>,
     active_count: usize,
@@ -736,71 +768,244 @@ struct RenderedGroup {
 
 struct ExpectedBase {
     id: usize,
-    identity: TranslationLeafIdentity,
+    line_shape: ExpectedLineShape,
+    identity: TranslationUnitIdentity,
     propagation_targets: Vec<TranslationPropagationTarget>,
+    protected_text: String,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
     state_context: TranslationStateContext,
 }
 
-fn render_group(seed: PreparedTaskGroup, first_active_id: usize, ordinal: usize) -> RenderedGroup {
+fn render_group(seed: PreparedTaskGroup, first_active_id: usize) -> RenderedGroup {
     let mut active_id = first_active_id;
-    let mut units = Vec::with_capacity(seed.units.len());
     let mut expected = Vec::new();
-    let mut markdown = format!(
-        "\n## 语义组 {} · {}\n",
-        ordinal + 1,
-        human_group_kind(seed.kind)
-    );
+    let active_count = seed
+        .units
+        .iter()
+        .filter(|unit| is_active_unit(unit))
+        .count();
+    if active_count == 0 {
+        return RenderedGroup {
+            kind: seed.kind,
+            markdown: String::new(),
+            expected,
+            active_count,
+            triggered_terms: seed.triggered_terms,
+        };
+    }
+
+    let mut markdown = format!("## {}\n", human_group_kind(seed.kind));
+    let active_dialogue_body = seed.units.iter().any(|unit| {
+        is_active_unit(unit) && matches!(unit.identity.role(), TextUnitRole::DialogueBody)
+    });
+    let active_database_value = seed.units.iter().any(|unit| {
+        is_active_unit(unit)
+            && matches!(
+                unit.identity.role(),
+                TextUnitRole::Scalar(key) if key.as_str() != "name"
+            )
+    });
+
+    for unit in &seed.units {
+        if is_useful_context(unit, seed.kind, active_dialogue_body, active_database_value) {
+            markdown.push('\n');
+            markdown.push_str(human_context_label(unit.identity.role()));
+            markdown.push('：');
+            markdown.push_str(&context_text(unit));
+            markdown.push('\n');
+        }
+    }
 
     for unit in seed.units {
-        match unit.responsibility {
-            PreparedUnitResponsibility::Active {
+        if is_active_unit(&unit) {
+            markdown.push('\n');
+            render_active_unit(&mut markdown, active_id, &unit);
+            let line_shape = expected_line_shape(&unit.identity);
+            let PreparedUnitResponsibility::Active {
                 propagation_targets,
-            } => {
-                markdown.push_str(&format!("\n### [{}] {}\n", active_id, unit.field_name));
-                push_blockquote(&mut markdown, &unit.protected_text);
-                expected.push(ExpectedBase {
-                    id: active_id,
-                    identity: unit.identity.clone(),
-                    propagation_targets,
-                    placeholders: unit.placeholders.clone(),
-                    language_analysis: unit.language_analysis,
-                    state_context: unit.state_context,
-                });
-                units.push(TranslationTaskUnit::active(
-                    unit.field_name,
-                    unit.identity,
-                    unit.protected_text,
-                    unit.placeholders,
-                    active_id,
-                ));
-                active_id += 1;
-            }
-            PreparedUnitResponsibility::Virtual { reason } => {
-                markdown.push_str(&format!("\n### [仅上下文] {}\n", unit.field_name));
-                push_blockquote(&mut markdown, &unit.protected_text);
-                units.push(TranslationTaskUnit::virtual_context(
-                    unit.field_name,
-                    unit.identity,
-                    unit.protected_text,
-                    unit.placeholders,
-                    reason,
-                ));
-            }
-            PreparedUnitResponsibility::AwaitingDeduplication => {
-                unreachable!("任务切块前必须完成全局去重")
-            }
+            } = unit.responsibility
+            else {
+                unreachable!("已确认的活跃单元必须携带传播目标")
+            };
+            expected.push(ExpectedBase {
+                id: active_id,
+                line_shape,
+                identity: unit.identity,
+                propagation_targets,
+                protected_text: unit.protected_text,
+                placeholders: unit.placeholders,
+                language_analysis: unit.language_analysis,
+                state_context: unit.state_context,
+            });
+            active_id += 1;
+        } else if matches!(
+            unit.responsibility,
+            PreparedUnitResponsibility::AwaitingDeduplication
+        ) {
+            unreachable!("任务切块前必须完成全局去重")
         }
     }
 
     RenderedGroup {
-        group: TranslationTaskGroup::new(seed.kind, seed.group_location, units),
+        kind: seed.kind,
         markdown,
         expected,
-        active_count: active_id - first_active_id,
+        active_count,
         triggered_terms: seed.triggered_terms,
     }
+}
+
+fn is_active_unit(unit: &PreparedUnit) -> bool {
+    matches!(
+        unit.responsibility,
+        PreparedUnitResponsibility::Active { .. }
+    )
+}
+
+fn is_useful_context(
+    unit: &PreparedUnit,
+    kind: TextGroupKind,
+    active_dialogue_body: bool,
+    active_database_value: bool,
+) -> bool {
+    if !matches!(
+        unit.responsibility,
+        PreparedUnitResponsibility::Virtual { .. }
+    ) {
+        return false;
+    }
+    (kind == TextGroupKind::EventDialogue
+        && active_dialogue_body
+        && matches!(unit.identity.role(), TextUnitRole::DialogueSpeaker))
+        || (kind == TextGroupKind::DatabaseEntry
+            && active_database_value
+            && matches!(
+                unit.identity.role(),
+                TextUnitRole::Scalar(key) if key.as_str() == "name"
+            ))
+}
+
+fn context_text(unit: &PreparedUnit) -> String {
+    match &unit.responsibility {
+        PreparedUnitResponsibility::Virtual {
+            reason: TranslationVirtualReason::ExistingTranslation,
+        } => unit
+            .translation
+            .as_ref()
+            .map(semantic_text)
+            .unwrap_or_else(|| semantic_text(unit.identity.source_content())),
+        PreparedUnitResponsibility::Virtual {
+            reason: TranslationVirtualReason::Reused { translation, .. },
+        } => semantic_text(translation),
+        PreparedUnitResponsibility::Virtual { .. }
+        | PreparedUnitResponsibility::AwaitingDeduplication
+        | PreparedUnitResponsibility::Active { .. } => {
+            semantic_text(unit.identity.source_content())
+        }
+    }
+}
+
+fn human_context_label(role: &TextUnitRole) -> &'static str {
+    match role {
+        TextUnitRole::DialogueSpeaker => "说话人",
+        TextUnitRole::Scalar(_) => "名称",
+        TextUnitRole::DialogueBody | TextUnitRole::Choices | TextUnitRole::ScrollingText => {
+            unreachable!("只有说话人和数据库名称可以作为无编号语境")
+        }
+    }
+}
+
+fn render_active_unit(markdown: &mut String, id: usize, unit: &PreparedUnit) {
+    match unit.identity.role() {
+        TextUnitRole::DialogueSpeaker => {
+            markdown.push_str(&format!("说话人 [{id}]（单行）：{}\n", unit.protected_text));
+        }
+        TextUnitRole::DialogueBody => {
+            markdown.push_str(&format!("正文 [{id}]（自由断行）：\n\n"));
+            push_blockquote(markdown, &unit.protected_text);
+        }
+        TextUnitRole::Choices => {
+            let count = source_line_count(&unit.identity);
+            markdown.push_str(&format!("选项 [{id}]（{count} 项，逐项对应）：\n\n"));
+            push_blockquote(markdown, &unit.protected_text);
+        }
+        TextUnitRole::ScrollingText => {
+            let count = source_line_count(&unit.identity);
+            markdown.push_str(&format!("滚动文本 [{id}]（{count} 行，逐行对应）：\n\n"));
+            push_blockquote(markdown, &unit.protected_text);
+        }
+        TextUnitRole::Scalar(_)
+            if expected_line_shape(&unit.identity) == ExpectedLineShape::Reflow =>
+        {
+            markdown.push_str(&format!(
+                "{} [{id}]（自由断行）：\n\n",
+                human_scalar_label(&unit.field_name)
+            ));
+            push_blockquote(markdown, &unit.protected_text);
+        }
+        TextUnitRole::Scalar(_) => {
+            markdown.push_str(&format!(
+                "{} [{id}]（单行）：{}\n",
+                human_scalar_label(&unit.field_name),
+                unit.protected_text
+            ));
+        }
+    }
+}
+
+fn human_scalar_label(field_name: &str) -> &str {
+    match field_name {
+        "name" => "名称",
+        "displayName" => "地图名称",
+        "nickname" => "昵称",
+        "profile" => "简介",
+        "description" => "说明",
+        _ => field_name,
+    }
+}
+
+fn expected_line_shape(identity: &TranslationUnitIdentity) -> ExpectedLineShape {
+    match identity.role() {
+        TextUnitRole::DialogueBody => ExpectedLineShape::Reflow,
+        TextUnitRole::Choices | TextUnitRole::ScrollingText => ExpectedLineShape::Aligned(
+            NonZeroUsize::new(source_line_count(identity))
+                .expect("选项与滚动文本必须至少包含一个语义槽"),
+        ),
+        TextUnitRole::DialogueSpeaker => ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+        TextUnitRole::Scalar(key) if scalar_allows_reflow(identity, key.as_str()) => {
+            ExpectedLineShape::Reflow
+        }
+        TextUnitRole::Scalar(_) => ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+    }
+}
+
+fn source_line_count(identity: &TranslationUnitIdentity) -> usize {
+    identity
+        .source_content()
+        .as_lines()
+        .expect("复合行角色必须保存完整行序列")
+        .len()
+}
+
+fn scalar_allows_reflow(identity: &TranslationUnitIdentity, field_name: &str) -> bool {
+    matches!(
+        (identity.group_location().source(), field_name),
+        (RpgMakerSource::Data(StandardDataFile::Actors), "profile")
+            | (
+                RpgMakerSource::Data(StandardDataFile::Skills),
+                "description"
+            )
+            | (RpgMakerSource::Data(StandardDataFile::Items), "description")
+            | (
+                RpgMakerSource::Data(StandardDataFile::Weapons),
+                "description"
+            )
+            | (
+                RpgMakerSource::Data(StandardDataFile::Armors),
+                "description"
+            )
+    )
 }
 
 fn push_blockquote(markdown: &mut String, text: &str) {
@@ -823,7 +1028,10 @@ fn pack_scope(
     let mut current_terms = Vec::<bool>::new();
 
     for seed in groups {
-        let rendered = render_group(seed.clone(), current_active, current_groups.len());
+        let rendered = render_group(seed.clone(), current_active + 1);
+        if rendered.active_count == 0 {
+            continue;
+        }
         let candidate_terms = merged_term_flags(
             &current_terms,
             &rendered.triggered_terms,
@@ -857,14 +1065,14 @@ fn pack_scope(
         current_active = 0;
         current_terms.clear();
 
-        let rendered = render_group(seed, 0, 0);
+        let rendered = render_group(seed, 1);
         let terms = merged_term_flags(&[], &rendered.triggered_terms, terminology.entries().len());
         let group_size =
             message_character_count(system_markdown, &[], Some(&rendered), terminology, &terms);
         if group_size > max_characters {
             if rendered.active_count > 0 {
                 return Err(ScopePlanningError::GroupExceedsCapacity {
-                    group_kind: human_group_kind(rendered.group.kind()),
+                    group_kind: human_group_kind(rendered.kind),
                     actual_characters: group_size,
                     maximum_characters: max_characters,
                 });
@@ -918,7 +1126,7 @@ fn render_user_markdown(
     terminology: &CompiledTerminology,
     term_flags: &[bool],
 ) -> String {
-    let mut markdown = String::from("# 翻译任务\n\n");
+    let mut markdown = String::new();
     let terms = terminology
         .entries()
         .iter()
@@ -927,20 +1135,25 @@ fn render_user_markdown(
         .map(|(_, entry)| entry)
         .collect::<Vec<_>>();
     if !terms.is_empty() {
-        markdown.push_str("## 本任务术语\n\n");
+        markdown.push_str("术语：\n\n");
         for entry in terms {
-            markdown.push_str("- **");
+            markdown.push_str("- ");
             markdown.push_str(entry.term());
-            markdown.push_str("** → **");
+            markdown.push_str(" → ");
             markdown.push_str(entry.translation());
-            markdown.push_str("**\n");
+            markdown.push('\n');
         }
     }
-    markdown.push_str("\n# 文本\n");
     for group in groups {
+        if !markdown.is_empty() {
+            markdown.push('\n');
+        }
         markdown.push_str(&group.markdown);
     }
     if let Some(group) = additional_group {
+        if !markdown.is_empty() {
+            markdown.push('\n');
+        }
         markdown.push_str(&group.markdown);
     }
     markdown
@@ -952,18 +1165,9 @@ fn finalize_task(
     term_flags: &[bool],
     system_markdown: &str,
 ) -> UnindexedTask {
-    let injected = terminology
-        .entries()
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| term_flags.get(*index).copied().unwrap_or(false))
-        .map(|(_, entry)| entry.dependency())
-        .collect::<Vec<_>>();
     let user_markdown = render_user_markdown(&groups, None, terminology, term_flags);
-    let mut task_groups = Vec::with_capacity(groups.len());
     let mut expected_outputs = Vec::new();
     for group in groups {
-        task_groups.push(group.group);
         expected_outputs.extend(group.expected.into_iter().map(|expected| {
             let (propagation_targets, propagation_state_contexts) = expected
                 .propagation_targets
@@ -974,16 +1178,18 @@ fn finalize_task(
                 expected.id,
                 expected.identity,
                 propagation_targets,
-                expected.placeholders,
-                expected.language_analysis,
+                ExpectedTranslationValidation::new(
+                    expected.line_shape,
+                    expected.protected_text,
+                    expected.placeholders,
+                    expected.language_analysis,
+                ),
                 expected.state_context,
                 propagation_state_contexts,
             )
         }));
     }
     UnindexedTask {
-        groups: task_groups,
-        injected_terminology: injected,
         messages: vec![
             ChatMessage::new(ChatMessageRole::System, system_markdown),
             ChatMessage::new(ChatMessageRole::User, user_markdown),
@@ -993,8 +1199,6 @@ fn finalize_task(
 }
 
 struct UnindexedTask {
-    groups: Vec<TranslationTaskGroup>,
-    injected_terminology: Vec<TerminologyDependency>,
     messages: Vec<ChatMessage>,
     expected_outputs: Vec<ExpectedTranslationOutput>,
 }
@@ -1005,24 +1209,17 @@ impl UnindexedTask {
         index: StandardTranslationTaskIndex,
         language_pair: LanguagePair,
     ) -> TranslationTaskBlock {
-        TranslationTaskBlock::new(
-            index,
-            language_pair,
-            self.groups,
-            self.injected_terminology,
-            self.messages,
-            self.expected_outputs,
-        )
+        TranslationTaskBlock::new(index, language_pair, self.messages, self.expected_outputs)
     }
 }
 
 const fn human_group_kind(kind: TextGroupKind) -> &'static str {
     match kind {
-        TextGroupKind::DatabaseEntry => "数据库对象",
+        TextGroupKind::DatabaseEntry => "数据库文本",
         TextGroupKind::System => "系统文本",
         TextGroupKind::Map => "地图文本",
-        TextGroupKind::EventDialogue => "事件对话",
-        TextGroupKind::EventChoices => "事件选项",
+        TextGroupKind::EventDialogue => "对话",
+        TextGroupKind::EventChoices => "选项",
         TextGroupKind::EventScrollingText => "滚动文本",
         TextGroupKind::EventCommand => "事件命令",
         TextGroupKind::PluginParameter => "插件参数",
@@ -1238,7 +1435,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use crate::rpg_maker::model::{ScalarFieldKey, TextFieldRole};
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep};
     use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
 
@@ -1256,7 +1453,6 @@ mod tests {
         RpgMakerTranslationRequestConfiguration,
     };
     use crate::rpg_maker::translate::standard::StandardTranslationAsset;
-    use crate::rpg_maker::translate::standard::TranslationTaskUnitMode;
 
     #[derive(Clone, Copy)]
     struct ImmediateCpu;
@@ -1394,12 +1590,13 @@ mod tests {
             source.clone(),
             vec![RpgMakerLocationStep::index(object_index)],
         );
-        let identity = TranslationLeafIdentity::new(
+        let source_content = TextUnitContent::Value(original.clone());
+        let identity = TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group_location.clone(),
-            TextFieldRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            original.clone(),
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+            source_content,
             "{}",
         );
         let translation_state = translation.map(|translation| {
@@ -1421,14 +1618,14 @@ mod tests {
             );
             translation_state_context(global, &identity, &protected_text, &bindings, &terms)
                 .expect("测试译文状态应可建立")
-                .finish(translation)
+                .finish(&TextUnitContent::Value(translation.to_owned()))
         });
         StandardTranslationGroup::new(
             TextGroupKind::DatabaseEntry,
             group_location,
             vec![StandardTranslationAsset::new(
                 identity,
-                translation.map(str::to_owned),
+                translation.map(|value| TextUnitContent::Value(value.to_owned())),
                 translation_state,
             )],
         )
@@ -1454,18 +1651,24 @@ mod tests {
             ],
             _ => panic!("Map 事件测试位置必须同时给出 event/page/command"),
         };
-        let role = if group_steps.is_empty() {
-            TextFieldRole::Scalar(ScalarFieldKey::new("displayName").expect("字段键应合法"))
+        let (role, source_content) = if group_steps.is_empty() {
+            (
+                TextUnitRole::Scalar(ScalarFieldKey::new("displayName").expect("字段键应合法")),
+                TextUnitContent::Value(original.to_owned()),
+            )
         } else {
-            TextFieldRole::DialogueBody { index: 0 }
+            (
+                TextUnitRole::DialogueBody,
+                TextUnitContent::Lines(vec![original.to_owned()]),
+            )
         };
         let group_location = RpgMakerLocation::value(source, group_steps);
-        let identity = TranslationLeafIdentity::new(
+        let identity = TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             kind,
             group_location.clone(),
             role,
-            original,
+            source_content,
             "{}",
         );
         StandardTranslationGroup::new(
@@ -1473,6 +1676,42 @@ mod tests {
             group_location,
             vec![StandardTranslationAsset::new(identity, None, None)],
         )
+    }
+
+    fn map_unit_group(
+        kind: TextGroupKind,
+        command_index: usize,
+        units: Vec<(TextUnitRole, TextUnitContent, &str)>,
+    ) -> StandardTranslationGroup {
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::map(1),
+            vec![
+                RpgMakerLocationStep::key("events"),
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("pages"),
+                RpgMakerLocationStep::index(0),
+                RpgMakerLocationStep::key("list"),
+                RpgMakerLocationStep::index(command_index),
+            ],
+        );
+        let assets = units
+            .into_iter()
+            .map(|(role, content, context)| {
+                StandardTranslationAsset::new(
+                    TranslationUnitIdentity::new(
+                        RpgMakerStandardAssetOwner::Builtin,
+                        kind,
+                        group_location.clone(),
+                        role,
+                        content,
+                        context,
+                    ),
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        StandardTranslationGroup::new(kind, group_location, assets)
     }
 
     #[test]
@@ -1486,28 +1725,28 @@ mod tests {
                 RpgMakerLocationStep::index(0),
             ],
         );
-        let body = TranslationLeafIdentity::new(
+        let body = TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::EventDialogue,
             group_location.clone(),
-            TextFieldRole::DialogueBody { index: 0 },
-            "同一句",
+            TextUnitRole::DialogueBody,
+            TextUnitContent::Lines(vec!["同一句".to_owned()]),
             r#"{"source_speaker":"甲"}"#,
         );
-        let other_body = TranslationLeafIdentity::new(
+        let other_body = TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::EventDialogue,
             group_location.clone(),
-            TextFieldRole::DialogueBody { index: 0 },
-            "同一句",
+            TextUnitRole::DialogueBody,
+            TextUnitContent::Lines(vec!["同一句".to_owned()]),
             r#"{"source_speaker":"乙"}"#,
         );
-        let speaker = TranslationLeafIdentity::new(
+        let speaker = TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::EventDialogue,
             group_location.clone(),
-            TextFieldRole::DialogueSpeaker,
-            "甲",
+            TextUnitRole::DialogueSpeaker,
+            TextUnitContent::Value("甲".to_owned()),
             "{}",
         );
         let prepared = prepare_corpus(vec![StandardTranslationGroup::new(
@@ -1521,7 +1760,7 @@ mod tests {
         .expect("对话组应可准备");
         assert_eq!(
             prepared.scopes[0].groups[0].assets[0].identity.role(),
-            &TextFieldRole::DialogueSpeaker
+            &TextUnitRole::DialogueSpeaker
         );
 
         let global = Sha256Fingerprint::from_bytes([0x11; 32]);
@@ -1581,30 +1820,24 @@ mod tests {
         assert_eq!(preparation.invalidations().len(), 1);
         assert_eq!(
             preparation.invalidations()[0].expected_translation(),
-            "魔法剑"
+            &TextUnitContent::Value("魔法剑".to_owned())
         );
         assert_eq!(preparation.invalidated(), 1);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].expected_outputs()[0].id(), 0);
-        assert_eq!(
-            tasks[0].injected_terminology(),
-            &[TerminologyDependency::new("魔法剣", "魔法之剑")]
-        );
+        assert_eq!(tasks[0].expected_outputs()[0].id(), 1);
         assert_eq!(
             tasks[0].expected_outputs()[0].applied_placeholders().len(),
             1
         );
-        assert!(matches!(
-            tasks[0].groups()[0].units()[0].mode(),
-            TranslationTaskUnitMode::Active { id: 0 }
-        ));
         assert_eq!(
             tasks[0].messages()[0].content(),
             "# System\n完整且由外部提供。"
         );
         let user = tasks[0].messages()[1].content();
-        assert!(user.contains("**魔法剣** → **魔法之剑**"));
-        assert!(user.contains("### [0] name"));
+        assert!(user.contains("- 魔法剣 → 魔法之剑"));
+        assert!(user.contains("名称 [1]（单行）："));
+        assert!(!user.contains("source_language"));
+        assert!(!user.contains("target_language"));
         assert!(!user.contains("data/Items.json"));
         assert!(!user.contains("exact_location"));
     }
@@ -1643,6 +1876,275 @@ mod tests {
                 .applied_placeholders()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn one_minimal_message_can_mix_all_five_semantic_unit_roles() {
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            EmptyResources,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let scalar = map_group(TextGroupKind::Map, None, None, None, "始まりの町");
+        let dialogue = map_unit_group(
+            TextGroupKind::EventDialogue,
+            0,
+            vec![
+                (
+                    TextUnitRole::DialogueSpeaker,
+                    TextUnitContent::Value("アリス".to_owned()),
+                    "{}",
+                ),
+                (
+                    TextUnitRole::DialogueBody,
+                    TextUnitContent::Lines(vec![
+                        "今日はいい天気ですね。".to_owned(),
+                        "一緒に町へ".to_owned(),
+                        "行きませんか？".to_owned(),
+                    ]),
+                    r#"{"source_speaker":"アリス"}"#,
+                ),
+            ],
+        );
+        let choices = map_unit_group(
+            TextGroupKind::EventChoices,
+            10,
+            vec![(
+                TextUnitRole::Choices,
+                TextUnitContent::Lines(vec!["はい".to_owned(), "いいえ".to_owned()]),
+                "{}",
+            )],
+        );
+        let scrolling = map_unit_group(
+            TextGroupKind::EventScrollingText,
+            20,
+            vec![(
+                TextUnitRole::ScrollingText,
+                TextUnitContent::Lines(vec!["制作".to_owned(), String::new(), "終わり".to_owned()]),
+                "{}",
+            )],
+        );
+
+        let (_, _, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                StandardTranslationCorpus::new(vec![scrolling, choices, dialogue, scalar]),
+                StandardTranslationInput::new(None, None),
+            )
+            .await
+            .expect("同一 Map 的五种角色应进入同一个请求")
+            .into_parts();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0]
+                .expected_outputs()
+                .iter()
+                .map(ExpectedTranslationOutput::id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            tasks[0]
+                .expected_outputs()
+                .iter()
+                .map(ExpectedTranslationOutput::line_shape)
+                .collect::<Vec<_>>(),
+            vec![
+                ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                ExpectedLineShape::Reflow,
+                ExpectedLineShape::Aligned(NonZeroUsize::new(2).unwrap()),
+                ExpectedLineShape::Aligned(NonZeroUsize::new(3).unwrap()),
+            ]
+        );
+        let user = tasks[0].messages()[1].content();
+        assert_eq!(
+            user,
+            concat!(
+                "## 地图文本\n",
+                "\n",
+                "地图名称 [1]（单行）：始まりの町\n",
+                "\n",
+                "## 对话\n",
+                "\n",
+                "说话人 [2]（单行）：アリス\n",
+                "\n",
+                "正文 [3]（自由断行）：\n",
+                "\n",
+                "> 今日はいい天気ですね。\n",
+                "> 一緒に町へ\n",
+                "> 行きませんか？\n",
+                "\n",
+                "## 选项\n",
+                "\n",
+                "选项 [4]（2 项，逐项对应）：\n",
+                "\n",
+                "> はい\n",
+                "> いいえ\n",
+                "\n",
+                "## 滚动文本\n",
+                "\n",
+                "滚动文本 [5]（3 行，逐行对应）：\n",
+                "\n",
+                "> 制作\n",
+                "> \n",
+                "> 終わり\n",
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn current_speaker_translation_is_unnumbered_context_for_active_body() {
+        let resources = translation_resources();
+        let placeholders = Pcre2PlaceholderService::new().expect("内置占位符应该可编译");
+        let custom = placeholders
+            .compile_custom(Vec::new())
+            .expect("空占位符规则应可编译");
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::map(1),
+            vec![
+                RpgMakerLocationStep::key("events"),
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("pages"),
+                RpgMakerLocationStep::index(0),
+                RpgMakerLocationStep::key("list"),
+                RpgMakerLocationStep::index(0),
+            ],
+        );
+        let speaker = TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventDialogue,
+            group_location.clone(),
+            TextUnitRole::DialogueSpeaker,
+            TextUnitContent::Value("アリス".to_owned()),
+            "{}",
+        );
+        let (protected_speaker, bindings) = placeholders
+            .protect(TextGroupKind::EventDialogue, "アリス", &custom)
+            .expect("说话人应可保护")
+            .into_parts();
+        let global = global_translation_semantics(
+            "ja",
+            "zh-Hans",
+            resources.source_language().semantic_fingerprint(),
+            "# System\n完整且由外部提供。",
+            ().semantic_fingerprint(),
+        );
+        let speaker_translation = TextUnitContent::Value("爱丽丝".to_owned());
+        let speaker_state =
+            translation_state_context(global, &speaker, &protected_speaker, &bindings, &[])
+                .expect("说话人状态应可建立")
+                .finish(&speaker_translation);
+        let body = TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventDialogue,
+            group_location.clone(),
+            TextUnitRole::DialogueBody,
+            TextUnitContent::Lines(vec!["出かけましょう。".to_owned()]),
+            r#"{"source_speaker":"アリス"}"#,
+        );
+        let corpus = StandardTranslationCorpus::new(vec![StandardTranslationGroup::new(
+            TextGroupKind::EventDialogue,
+            group_location,
+            vec![
+                StandardTranslationAsset::new(
+                    speaker,
+                    Some(speaker_translation),
+                    Some(speaker_state),
+                ),
+                StandardTranslationAsset::new(body, None, None),
+            ],
+        )]);
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            EmptyResources,
+            resources,
+            placeholders,
+            ImmediateCpu,
+        );
+
+        let (_, _, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                corpus,
+                StandardTranslationInput::new(None, None),
+            )
+            .await
+            .expect("已有说话人译文应作为正文语境")
+            .into_parts();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].expected_outputs().len(), 1);
+        assert_eq!(tasks[0].expected_outputs()[0].id(), 1);
+        let user = tasks[0].messages()[1].content();
+        assert!(user.contains("说话人：爱丽丝"));
+        assert!(!user.contains("说话人 ["));
+        assert!(!user.contains("アリス"));
+        assert!(user.contains("正文 [1]（自由断行）："));
+    }
+
+    #[test]
+    fn reused_translation_is_preferred_over_source_for_virtual_context() {
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventDialogue,
+            RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new()),
+            TextUnitRole::DialogueSpeaker,
+            TextUnitContent::Value("アリス".to_owned()),
+            "{}",
+        );
+        let language_analysis = translation_resources()
+            .source_language()
+            .analyze_source(&crate::language::LanguageText::natural("アリス"));
+        let unit = PreparedUnit {
+            field_name: "speaker".to_owned(),
+            identity: identity.clone(),
+            protected_text: "アリス".to_owned(),
+            translation: None,
+            placeholders: Vec::new(),
+            language_analysis,
+            state_context: TranslationStateContext::new(Sha256Fingerprint::from_bytes([7; 32])),
+            responsibility: PreparedUnitResponsibility::Virtual {
+                reason: TranslationVirtualReason::Reused {
+                    seed: Box::new(identity),
+                    translation: TextUnitContent::Value("爱丽丝".to_owned()),
+                },
+            },
+        };
+
+        assert_eq!(context_text(&unit), "爱丽丝");
+    }
+
+    #[test]
+    fn virtual_context_without_translation_uses_source_instead_of_placeholder_protocol_text() {
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventDialogue,
+            RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new()),
+            TextUnitRole::DialogueSpeaker,
+            TextUnitContent::Value("\\N[1]".to_owned()),
+            "{}",
+        );
+        let language_analysis = translation_resources()
+            .source_language()
+            .analyze_source(&crate::language::LanguageText::natural("角色"));
+        let unit = PreparedUnit {
+            field_name: "speaker".to_owned(),
+            identity,
+            protected_text: "⟦ATT_ACTOR_NAME_WHOLE_0000⟧".to_owned(),
+            translation: None,
+            placeholders: Vec::new(),
+            language_analysis,
+            state_context: TranslationStateContext::new(Sha256Fingerprint::from_bytes([8; 32])),
+            responsibility: PreparedUnitResponsibility::Virtual {
+                reason: TranslationVirtualReason::FullyProtected,
+            },
+        };
+
+        assert_eq!(context_text(&unit), "\\N[1]");
     }
 
     #[tokio::test]
@@ -1757,19 +2259,12 @@ mod tests {
             .into_parts();
 
         assert_eq!(tasks.len(), 1);
-        assert_eq!(
-            tasks[0]
-                .groups()
-                .iter()
-                .map(|group| group.group_location().to_string())
-                .collect::<Vec<_>>(),
-            [
-                "data/Map001.json",
-                "data/Map001.json.events[1].pages[0].list[2]",
-                "data/Map001.json.events[1].pages[1].list[0]",
-                "data/Map001.json.events[2].pages[0].list[0]",
-            ]
-        );
+        let user = tasks[0].messages()[1].content();
+        let display = user.find("始まりの町").expect("地图名应在请求中");
+        let first = user.find("最初の会話").expect("首个事件应在请求中");
+        let next_page = user.find("次のページ").expect("下一页应在请求中");
+        let next_event = user.find("次のイベント").expect("下一事件应在请求中");
+        assert!(display < first && first < next_page && next_page < next_event);
     }
 
     #[tokio::test]
@@ -1825,22 +2320,14 @@ mod tests {
             .into_parts();
 
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].groups().len(), 2);
-        assert_eq!(
-            tasks[0].groups()[0].units()[0].mode(),
-            &TranslationTaskUnitMode::Virtual {
-                reason: TranslationVirtualReason::FullyProtected
-            }
-        );
-        assert_eq!(
-            tasks[0].groups()[1].units()[0].mode(),
-            &TranslationTaskUnitMode::Active { id: 0 }
-        );
         assert_eq!(tasks[0].expected_outputs().len(), 1);
+        assert_eq!(tasks[0].expected_outputs()[0].id(), 1);
+        assert!(!tasks[0].messages()[1].content().contains("保護対象"));
+        assert!(!tasks[0].messages()[1].content().contains("仅上下文"));
     }
 
     #[tokio::test]
-    async fn global_deduplication_keeps_later_context_and_one_llm_owner() {
+    async fn global_deduplication_sends_only_the_first_unit_and_propagates_atomically() {
         let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
             translation_resources(),
@@ -1855,14 +2342,20 @@ mod tests {
             Vec::new(),
         );
         let leader = first.assets()[0].identity().clone();
-        let duplicate = map_group(TextGroupKind::Map, None, None, None, "保存しますか？");
+        let duplicate = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            2,
+            "保存しますか？",
+            None,
+            Vec::new(),
+        );
         let target = duplicate.assets()[0].identity().clone();
-        let neighbouring = map_group(
-            TextGroupKind::EventDialogue,
-            Some(1),
-            Some(0),
-            Some(0),
+        let neighbouring = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            3,
             "別の翻訳対象です。",
+            None,
+            Vec::new(),
         );
 
         let (_, preparation, tasks) = planner
@@ -1878,21 +2371,16 @@ mod tests {
 
         assert!(preparation.invalidations().is_empty());
         assert!(preparation.reuses().is_empty());
-        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks.len(), 1);
         assert_eq!(
             tasks[0].expected_outputs()[0].propagation_targets(),
             &[target]
         );
-        let duplicate_unit = &tasks[1].groups()[0].units()[0];
-        assert!(matches!(
-            duplicate_unit.mode(),
-            TranslationTaskUnitMode::Virtual {
-                reason: TranslationVirtualReason::Duplicate { leader: actual }
-            } if actual.as_ref() == &leader
-        ));
-        assert!(tasks[1].messages()[1].content().contains("保存しますか？"));
-        assert!(tasks[1].messages()[1].content().contains("[仅上下文]"));
-        assert_eq!(tasks[1].expected_outputs().len(), 1);
+        assert_eq!(tasks[0].expected_outputs()[0].identity(), &leader);
+        let user = tasks[0].messages()[1].content();
+        assert_eq!(user.matches("保存しますか？").count(), 1);
+        assert!(!user.contains("仅上下文"));
+        assert_eq!(tasks[0].expected_outputs().len(), 2);
     }
 
     #[tokio::test]
@@ -1911,7 +2399,7 @@ mod tests {
             Vec::new(),
         );
         let target = group(
-            RpgMakerSource::data(StandardDataFile::Skills),
+            RpgMakerSource::data(StandardDataFile::Items),
             2,
             "保存",
             None,
@@ -1933,7 +2421,7 @@ mod tests {
         assert_eq!(preparation.reuses().len(), 1);
         assert_eq!(
             preparation.reuses()[0].seed().expected_translation(),
-            "Save"
+            &TextUnitContent::Value("Save".to_owned())
         );
         assert_eq!(preparation.reuses()[0].targets().len(), 1);
         assert!(tasks.is_empty());
@@ -1956,7 +2444,7 @@ mod tests {
                 Vec::new(),
             ),
             group(
-                RpgMakerSource::data(StandardDataFile::Skills),
+                RpgMakerSource::data(StandardDataFile::Items),
                 2,
                 "保存",
                 Some("Store"),
@@ -2032,8 +2520,8 @@ mod tests {
             .into_parts();
 
         assert_eq!(split.len(), 2);
-        assert_eq!(split[0].expected_outputs()[0].id(), 0);
-        assert_eq!(split[1].expected_outputs()[0].id(), 0);
+        assert_eq!(split[0].expected_outputs()[0].id(), 1);
+        assert_eq!(split[1].expected_outputs()[0].id(), 1);
     }
 
     #[tokio::test]

@@ -1772,9 +1772,9 @@ impl CommandResultRenderer {
                 writeln!(stdout, "输出目录：{}", output.output_root.display())?;
                 writeln!(
                     stdout,
-                    "标准写回：应用译文 {} 处，保留原文 {} 处；自动换行 {} 段，新增换行 {} 处；续行全角缩进 {} 处；需人工换行 {} 段",
-                    output.standard.translated_locations,
-                    output.standard.original_locations,
+                    "标准写回：应用译文 {} 个单元，保留原文 {} 个单元；自动换行 {} 段，新增换行 {} 处；续行全角缩进 {} 处；需人工换行 {} 段",
+                    output.standard.translated_units,
+                    output.standard.original_units,
                     output.standard.auto_wrapped_units,
                     output.standard.inserted_line_breaks,
                     output.standard.inserted_fullwidth_indents,

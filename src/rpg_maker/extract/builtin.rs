@@ -1,5 +1,6 @@
 //! RPG Maker 固定位置文本与标准事件块的完整 Builtin 快照提取。
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -13,7 +14,7 @@ use crate::rpg_maker::dialogue::{
 };
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
-    DirectTextRecipe, TextFieldRole, TextProjectionRecipe,
+    DirectTextRecipe, TextProjectionRecipe, TextUnitContent, TextUnitRole,
 };
 use crate::rpg_maker::project::OpenedProject;
 
@@ -22,8 +23,8 @@ use super::document::{
     RpgMakerProjectDocuments, StandardDataFile,
 };
 use super::model::{
-    BuiltinSnapshot, ExtractedTextField, ExtractedTextGroup, RpgMakerLocation,
-    RpgMakerLocationStep, RpgMakerSource, SnapshotModelError, TextGroupKind,
+    BuiltinSnapshot, ExtractedTextGroup, ExtractedTextUnit, RpgMakerLocation, RpgMakerLocationStep,
+    RpgMakerSource, SnapshotModelError, TextGroupKind,
 };
 use super::store::{BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore};
 
@@ -929,6 +930,7 @@ fn extract_event_list(
             102 => extract_choices(
                 &source,
                 &list_steps,
+                list,
                 command_index,
                 command.parameters,
                 groups,
@@ -1006,6 +1008,17 @@ fn command_at<'a>(
     })
 }
 
+fn command_indent(
+    list: &[Value],
+    command_index: usize,
+    location: &RpgMakerLocation,
+) -> Result<i64, BuiltinDocumentError> {
+    expect_object(&list[command_index], location.to_string())?
+        .get("indent")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| BuiltinDocumentError::new(location.to_string(), "indent 必须是整数"))
+}
+
 fn extract_dialogue(
     source: &RpgMakerSource,
     list_steps: &[RpgMakerLocationStep],
@@ -1042,7 +1055,9 @@ fn extract_dialogue(
             project_mv_dialogue(projector, group_location, lines)?
         }
     };
-    groups.push(group);
+    if let Some(group) = group {
+        groups.push(group);
+    }
     Ok(next_index.saturating_sub(1))
 }
 
@@ -1053,8 +1068,8 @@ fn project_mz_dialogue(
     parameters: &[Value],
     group_location: RpgMakerLocation,
     lines: Vec<DialoguePhysicalLine>,
-) -> Result<ExtractedTextGroup, BuildBuiltinSnapshotError> {
-    let mut fields = Vec::new();
+) -> Result<Option<ExtractedTextGroup>, BuildBuiltinSnapshotError> {
+    let mut units = Vec::new();
     let speaker_location = parameter_location(source, list_steps, start_index, 4);
     let direct_speaker = match parameters.get(4) {
         None => None,
@@ -1063,35 +1078,48 @@ fn project_mz_dialogue(
             if speaker.trim().is_empty() {
                 None
             } else {
-                fields.push(ExtractedTextField::projected(
-                    TextFieldRole::DialogueSpeaker,
+                units.push(ExtractedTextUnit::projected(
+                    TextUnitRole::DialogueSpeaker,
                     speaker_location.clone(),
-                    speaker,
+                    TextUnitContent::Value(speaker.to_owned()),
                 )?);
                 Some(DirectSpeakerTarget::new(speaker_location, speaker))
             }
         }
     };
 
-    let mut body_index = 0;
+    let has_body = lines
+        .iter()
+        .any(|line| !line.expected_raw().trim().is_empty());
+    let body_projection_location = lines.first().map(|line| line.physical_location().clone());
+    let body_lines = has_body.then(|| {
+        lines
+            .iter()
+            .map(|line| line.expected_raw().to_owned())
+            .collect::<Vec<_>>()
+    });
     let mut line_recipes = Vec::with_capacity(lines.len());
-    for line in lines {
-        let parts = if line.expected_raw().trim().is_empty() {
-            vec![DialogueLinePart::Literal(line.expected_raw().to_owned())]
+    for (source_line_index, line) in lines.into_iter().enumerate() {
+        let parts = if has_body {
+            vec![DialogueLinePart::BodyLine { source_line_index }]
         } else {
-            fields.push(ExtractedTextField::projected(
-                TextFieldRole::DialogueBody { index: body_index },
-                line.physical_location().clone(),
-                line.expected_raw(),
-            )?);
-            let parts = vec![DialogueLinePart::BodySlot { index: body_index }];
-            body_index += 1;
-            parts
+            vec![DialogueLinePart::Literal(line.expected_raw().to_owned())]
         };
         line_recipes.push(
             DialogueLineRecipe::new(line.physical_location().clone(), line.expected_raw(), parts)
                 .map_err(SnapshotModelError::Projection)?,
         );
+    }
+    if let Some(body_lines) = body_lines {
+        units.push(ExtractedTextUnit::projected(
+            TextUnitRole::DialogueBody,
+            body_projection_location.expect("非空正文必须有首个物理来源"),
+            TextUnitContent::Lines(body_lines),
+        )?);
+    }
+
+    if units.is_empty() {
+        return Ok(None);
     }
 
     let recipe = DialogueWriteRecipe::new(group_location.clone(), direct_speaker, line_recipes)
@@ -1099,9 +1127,10 @@ fn project_mz_dialogue(
     ExtractedTextGroup::projected(
         TextGroupKind::EventDialogue,
         group_location,
-        fields,
+        units,
         vec![TextProjectionRecipe::Dialogue(recipe)],
     )
+    .map(Some)
     .map_err(Into::into)
 }
 
@@ -1109,28 +1138,33 @@ fn project_mv_dialogue(
     projector: &mut MvDialogueProjector,
     group_location: RpgMakerLocation,
     lines: Vec<DialoguePhysicalLine>,
-) -> Result<ExtractedTextGroup, BuildBuiltinSnapshotError> {
+) -> Result<Option<ExtractedTextGroup>, BuildBuiltinSnapshotError> {
     let projected = projector.project(group_location.clone(), lines)?;
-    let (leaves, recipe) = projected.into_parts();
-    let fields = leaves
+    let (projected_units, recipe) = projected.into_parts();
+    let units = projected_units
         .into_iter()
-        .map(|leaf| {
-            let (role, physical_location, original_text) = leaf.into_parts();
-            ExtractedTextField::projected(role, physical_location, original_text)
+        .map(|unit| {
+            let (role, projection_location, source_content) = unit.into_parts();
+            ExtractedTextUnit::projected(role, projection_location, source_content)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if units.is_empty() {
+        return Ok(None);
+    }
     ExtractedTextGroup::projected(
         TextGroupKind::EventDialogue,
         group_location,
-        fields,
+        units,
         vec![TextProjectionRecipe::Dialogue(recipe)],
     )
+    .map(Some)
     .map_err(Into::into)
 }
 
 fn extract_choices(
     source: &RpgMakerSource,
     list_steps: &[RpgMakerLocationStep],
+    list: &[Value],
     command_index: usize,
     parameters: &[Value],
     groups: &mut Vec<ExtractedTextGroup>,
@@ -1140,25 +1174,119 @@ fn extract_choices(
         .first()
         .ok_or_else(|| missing_value(&choices_location))?;
     let choices = expect_array(choices, choices_location.to_string())?;
-    let mut fields = Vec::new();
+    let choice_texts = choices
+        .iter()
+        .enumerate()
+        .map(|(choice_index, choice)| {
+            let mut steps = value_steps(&choices_location);
+            steps.push(RpgMakerLocationStep::index(choice_index));
+            let exact_location = RpgMakerLocation::value(source.clone(), steps);
+            expect_string(choice, &exact_location).map(str::to_owned)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if choice_texts.iter().all(|choice| choice.trim().is_empty()) {
+        return Ok(());
+    }
+
+    let mut recipes = Vec::new();
     for (choice_index, choice) in choices.iter().enumerate() {
         let mut steps = value_steps(&choices_location);
         steps.push(RpgMakerLocationStep::index(choice_index));
         let exact_location = RpgMakerLocation::value(source.clone(), steps);
         let text = expect_string(choice, &exact_location)?;
-        push_text_field(
-            &mut fields,
-            format!("choice[{choice_index}]"),
-            exact_location,
-            text,
-        )?;
+        recipes.push(TextProjectionRecipe::Direct(
+            DirectTextRecipe::new(
+                exact_location,
+                text,
+                vec![DirectTextPart::LineSlot {
+                    role: TextUnitRole::Choices,
+                    source_line_index: choice_index,
+                }],
+            )
+            .map_err(SnapshotModelError::Projection)?,
+        ));
     }
-    push_group(
-        groups,
+
+    let choice_indent = command_indent(
+        list,
+        command_index,
+        &command_location(source, list_steps, command_index),
+    )?;
+    let mut branch_indexes = BTreeSet::new();
+    let mut found_end = false;
+    for branch_command_index in command_index + 1..list.len() {
+        let command = command_at(source, list_steps, list, branch_command_index)?;
+        if !matches!(command.code, 402 | 404) {
+            continue;
+        }
+        let indent = command_indent(list, branch_command_index, &command.location)?;
+        if command.code == 404 && indent == choice_indent {
+            found_end = true;
+            break;
+        }
+        if command.code != 402 || indent != choice_indent {
+            continue;
+        }
+        let index_location = parameter_location(source, list_steps, branch_command_index, 0);
+        let choice_index = command
+            .parameters
+            .first()
+            .and_then(Value::as_i64)
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < choice_texts.len())
+            .ok_or_else(|| {
+                BuiltinDocumentError::new(
+                    index_location.to_string(),
+                    "402 选项索引必须指向当前 102 的一个选项",
+                )
+            })?;
+        if !branch_indexes.insert(choice_index) {
+            return Err(BuiltinDocumentError::new(
+                index_location.to_string(),
+                format!("当前 102 重复包含选项分支 {choice_index}"),
+            )
+            .into());
+        }
+        let text_location = parameter_location(source, list_steps, branch_command_index, 1);
+        let branch_text = parameter_string(command.parameters, 1, &text_location)?;
+        if branch_text != choice_texts[choice_index] {
+            return Err(BuiltinDocumentError::new(
+                text_location.to_string(),
+                format!("402 分支文本与 102 选项 {choice_index} 不一致"),
+            )
+            .into());
+        }
+        recipes.push(TextProjectionRecipe::Direct(
+            DirectTextRecipe::new(
+                text_location,
+                branch_text,
+                vec![DirectTextPart::LineSlot {
+                    role: TextUnitRole::Choices,
+                    source_line_index: choice_index,
+                }],
+            )
+            .map_err(SnapshotModelError::Projection)?,
+        ));
+    }
+    if !found_end || branch_indexes.len() != choice_texts.len() {
+        return Err(BuiltinDocumentError::new(
+            command_location(source, list_steps, command_index).to_string(),
+            "102 必须包含完整且唯一的同层 402 分支以及 404 结束指令",
+        )
+        .into());
+    }
+
+    let unit = ExtractedTextUnit::projected(
+        TextUnitRole::Choices,
+        choices_location,
+        TextUnitContent::Lines(choice_texts),
+    )?;
+    groups.push(ExtractedTextGroup::projected(
         TextGroupKind::EventChoices,
         command_location(source, list_steps, command_index),
-        fields,
-    )?;
+        vec![unit],
+        recipes,
+    )?);
     Ok(())
 }
 
@@ -1169,10 +1297,8 @@ fn extract_scrolling_text(
     start_index: usize,
     groups: &mut Vec<ExtractedTextGroup>,
 ) -> Result<usize, BuildBuiltinSnapshotError> {
-    let mut fields = Vec::new();
-    let mut recipes = Vec::new();
+    let mut lines = Vec::new();
     let mut next_index = start_index + 1;
-    let mut body_index = 0;
     while next_index < list.len() {
         let command = command_at(source, list_steps, list, next_index)?;
         if command.code != 405 {
@@ -1180,29 +1306,44 @@ fn extract_scrolling_text(
         }
         let exact_location = parameter_location(source, list_steps, next_index, 0);
         let text = parameter_string(command.parameters, 0, &exact_location)?;
-        let parts = if text.trim().is_empty() {
-            vec![DirectTextPart::Literal(text.to_owned())]
-        } else {
-            let role = TextFieldRole::ScrollingTextBody { index: body_index };
-            fields.push(ExtractedTextField::projected(
-                role.clone(),
-                exact_location.clone(),
-                text,
-            )?);
-            vec![DirectTextPart::TextSlot { role }]
-        };
-        recipes.push(TextProjectionRecipe::Direct(
-            DirectTextRecipe::new(exact_location, text, parts)
-                .map_err(SnapshotModelError::Projection)?,
-        ));
-        body_index += 1;
+        lines.push((exact_location, text.to_owned()));
         next_index += 1;
     }
-    if !fields.is_empty() {
+    if lines.iter().any(|(_, text)| !text.trim().is_empty()) {
+        let source_lines = lines
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
+        let projection_location = lines
+            .first()
+            .expect("非空滚动文本必须有首个物理来源")
+            .0
+            .clone();
+        let recipes = lines
+            .into_iter()
+            .enumerate()
+            .map(|(source_line_index, (exact_location, text))| {
+                DirectTextRecipe::new(
+                    exact_location,
+                    &text,
+                    vec![DirectTextPart::LineSlot {
+                        role: TextUnitRole::ScrollingText,
+                        source_line_index,
+                    }],
+                )
+                .map(TextProjectionRecipe::Direct)
+                .map_err(SnapshotModelError::Projection)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let unit = ExtractedTextUnit::projected(
+            TextUnitRole::ScrollingText,
+            projection_location,
+            TextUnitContent::Lines(source_lines),
+        )?;
         groups.push(ExtractedTextGroup::projected(
             TextGroupKind::EventScrollingText,
             command_location(source, list_steps, start_index),
-            fields,
+            vec![unit],
             recipes,
         )?);
     }
@@ -1271,7 +1412,7 @@ fn parameter_string<'a>(
 }
 
 fn push_text_field(
-    fields: &mut Vec<ExtractedTextField>,
+    fields: &mut Vec<ExtractedTextUnit>,
     field_name: impl Into<String>,
     exact_location: RpgMakerLocation,
     original_text: &str,
@@ -1279,7 +1420,7 @@ fn push_text_field(
     if original_text.trim().is_empty() {
         return Ok(());
     }
-    fields.push(ExtractedTextField::new(
+    fields.push(ExtractedTextUnit::new(
         field_name,
         exact_location,
         original_text,
@@ -1291,7 +1432,7 @@ fn push_group(
     groups: &mut Vec<ExtractedTextGroup>,
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
-    fields: Vec<ExtractedTextField>,
+    fields: Vec<ExtractedTextUnit>,
 ) -> Result<(), SnapshotModelError> {
     if fields.is_empty() {
         return Ok(());
@@ -1569,16 +1710,23 @@ mod tests {
                         .starts_with("data/CommonEvents.json")
             })
             .expect("应提取公共事件中的 inline 姓名");
-        assert_eq!(field_text(common_dialogue, "speaker"), "莉莉");
-        assert_eq!(field_text(common_dialogue, "body[0]"), "你好");
-        assert_eq!(field_text(common_dialogue, "body[1]"), "第二行");
+        assert_eq!(
+            unit_value(common_dialogue, TextUnitRole::DialogueSpeaker),
+            "莉莉"
+        );
+        assert_eq!(
+            unit_lines(common_dialogue, TextUnitRole::DialogueBody),
+            ["你好", "   ", "第二行"]
+        );
         let [TextProjectionRecipe::Dialogue(recipe)] = common_dialogue.recipes() else {
             panic!("MV 对话必须使用唯一块级配方");
         };
         assert_eq!(recipe.lines().len(), 3, "空白 401 也必须进入写回配方");
         assert!(matches!(
             recipe.lines()[1].parts(),
-            [DialogueLinePart::Literal(value)] if value == "   "
+            [DialogueLinePart::BodyLine {
+                source_line_index: 1
+            }]
         ));
 
         let map_dialogue = actual
@@ -1592,8 +1740,14 @@ mod tests {
                         .starts_with("data/Map001.json")
             })
             .expect("应提取地图中的精确首行姓名");
-        assert_eq!(field_text(map_dialogue, "speaker"), "バニー淫魔");
-        assert_eq!(field_text(map_dialogue, "body[0]"), "「台词」");
+        assert_eq!(
+            unit_value(map_dialogue, TextUnitRole::DialogueSpeaker),
+            "バニー淫魔"
+        );
+        assert_eq!(
+            unit_lines(map_dialogue, TextUnitRole::DialogueBody),
+            ["「台词」"]
+        );
         let [TextProjectionRecipe::Dialogue(recipe)] = map_dialogue.recipes() else {
             panic!("MV 对话必须使用唯一块级配方");
         };
@@ -1601,8 +1755,8 @@ mod tests {
             recipe.lines()[0]
                 .parts()
                 .iter()
-                .all(|part| !matches!(part, DialogueLinePart::BodySlot { .. })),
-            "整条第一行是姓名时不得建立正文叶"
+                .all(|part| !matches!(part, DialogueLinePart::BodyLine { .. })),
+            "整条第一行是姓名时不得进入正文单元"
         );
     }
 
@@ -1800,12 +1954,15 @@ mod tests {
             .expect("应提取公共事件对话");
         assert!(
             dialogue
-                .fields()
+                .units()
                 .iter()
-                .all(|field| field.role() != &TextFieldRole::DialogueSpeaker),
+                .all(|unit| unit.role() != &TextUnitRole::DialogueSpeaker),
             "MV 不得把 101.parameters[4] 当作原生姓名"
         );
-        assert_eq!(field_text(dialogue, "body[0]"), "你好");
+        assert_eq!(
+            unit_lines(dialogue, TextUnitRole::DialogueBody),
+            ["你好", "Welcome"]
+        );
         assert_eq!(
             *updates.lock().expect("项目定义更新记录锁不应中毒"),
             [BuiltinProjectDefinitionUpdate::Reuse]
@@ -1979,21 +2136,19 @@ mod tests {
 
         let item_group = group_at(&snapshot, "data/Items.json[1]");
         assert_eq!(item_group.kind(), TextGroupKind::DatabaseEntry);
-        assert_eq!(field_text(item_group, "name"), "  宝剑  ");
-        assert_eq!(field_text(item_group, "description"), "锋利的宝剑");
+        assert_eq!(scalar_value(item_group, "name"), "  宝剑  ");
+        assert_eq!(scalar_value(item_group, "description"), "锋利的宝剑");
 
         let dialogue = snapshot
             .groups()
             .iter()
             .find(|group| group.kind() == TextGroupKind::EventDialogue)
             .expect("应该提取对话组");
-        assert_eq!(field_text(dialogue, "speaker"), "莉莉");
-        assert_eq!(field_text(dialogue, "body[0]"), "你好");
-        assert_eq!(field_text(dialogue, "body[1]"), "Welcome");
-        assert_ne!(
-            dialogue.fields()[1].exact_location(),
-            dialogue.fields()[2].exact_location(),
-            "每个 401 正文行必须拥有独立地址"
+        assert_eq!(unit_value(dialogue, TextUnitRole::DialogueSpeaker), "莉莉");
+        assert_eq!(
+            unit_lines(dialogue, TextUnitRole::DialogueBody),
+            ["你好", "Welcome"],
+            "完整 401 正文必须形成一个语义单元"
         );
 
         let choices = snapshot
@@ -2001,23 +2156,22 @@ mod tests {
             .iter()
             .find(|group| group.kind() == TextGroupKind::EventChoices)
             .expect("应该提取选项组");
-        assert_eq!(choices.fields().len(), 2);
-        assert_ne!(
-            choices.fields()[0].exact_location(),
-            choices.fields()[1].exact_location()
-        );
+        assert_eq!(choices.units().len(), 1);
+        assert_eq!(unit_lines(choices, TextUnitRole::Choices), ["接受", "拒绝"]);
+        assert_eq!(choices.recipes().len(), 4, "102 与两个 402 都必须物化");
+        assert_eq!(choices.mutation_targets().len(), 4);
 
         assert!(snapshot.groups().iter().any(|group| {
             group
-                .fields()
+                .units()
                 .iter()
-                .any(|field| field.field_name() == "message4")
+                .any(|unit| matches!(unit.role(), TextUnitRole::Scalar(key) if key.as_str() == "message4"))
         }));
         assert!(snapshot.groups().iter().any(|group| {
             group
-                .fields()
+                .units()
                 .iter()
-                .any(|field| field.field_name() == "terms.messages.alwaysDash")
+                .any(|unit| matches!(unit.role(), TextUnitRole::Scalar(key) if key.as_str() == "terms.messages.alwaysDash"))
         }));
         assert!(snapshot.groups().iter().any(|group| {
             group.kind() == TextGroupKind::EventDialogue
@@ -2033,6 +2187,34 @@ mod tests {
                     .to_string()
                     .starts_with("data/Troops.json")
         }));
+    }
+
+    #[test]
+    fn choices_require_complete_matching_same_indent_branches() {
+        for list in [
+            json!([
+                {"code": 102, "indent": 0, "parameters": [["是", "否"]]},
+                {"code": 402, "indent": 0, "parameters": [0, "错误文本"]},
+                {"code": 402, "indent": 0, "parameters": [1, "否"]},
+                {"code": 404, "indent": 0, "parameters": []}
+            ]),
+            json!([
+                {"code": 102, "indent": 0, "parameters": [["是", "否"]]},
+                {"code": 402, "indent": 0, "parameters": [0, "是"]},
+                {"code": 404, "indent": 0, "parameters": []}
+            ]),
+        ] {
+            let mut documents = complete_documents();
+            documents.insert_document(
+                RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+                json!([null, {"list": list}]),
+            );
+
+            assert!(matches!(
+                build_builtin_snapshot(&documents),
+                Err(BuildBuiltinSnapshotError::Malformed(_))
+            ));
+        }
     }
 
     #[test]
@@ -2063,23 +2245,28 @@ mod tests {
 
         assert!(
             dialogue
-                .fields()
+                .units()
                 .iter()
-                .all(|field| field.role() != &TextFieldRole::DialogueSpeaker)
+                .all(|unit| unit.role() != &TextUnitRole::DialogueSpeaker)
         );
-        assert_eq!(field_text(dialogue, "body[0]"), "正文");
+        assert_eq!(
+            unit_lines(dialogue, TextUnitRole::DialogueBody),
+            ["   ", "正文"]
+        );
         let [TextProjectionRecipe::Dialogue(recipe)] = dialogue.recipes() else {
             panic!("Builtin 对话必须使用唯一块级配方");
         };
         assert_eq!(recipe.lines().len(), 2);
         assert!(matches!(
             recipe.lines()[0].parts(),
-            [DialogueLinePart::Literal(value)] if value == "   "
+            [DialogueLinePart::BodyLine {
+                source_line_index: 0
+            }]
         ));
     }
 
     #[test]
-    fn keeps_blank_405_as_a_frozen_physical_recipe_without_a_logical_leaf() {
+    fn keeps_blank_405_as_a_semantic_aligned_slot() {
         let mut documents = complete_documents();
         documents.insert_document(
             RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
@@ -2099,16 +2286,21 @@ mod tests {
             .find(|group| group.kind() == TextGroupKind::EventScrollingText)
             .expect("应保留滚动文本组");
 
-        assert_eq!(field_text(scrolling, "body[0]"), "第一行");
-        assert_eq!(field_text(scrolling, "body[2]"), "第三行");
-        assert_eq!(scrolling.fields().len(), 2);
+        assert_eq!(
+            unit_lines(scrolling, TextUnitRole::ScrollingText),
+            ["第一行", "   ", "第三行"]
+        );
+        assert_eq!(scrolling.units().len(), 1);
         assert_eq!(scrolling.recipes().len(), 3);
         assert_eq!(scrolling.mutation_targets().len(), 3);
         assert!(matches!(
             &scrolling.recipes()[1],
             TextProjectionRecipe::Direct(recipe)
                 if recipe.expected_raw() == "   "
-                    && matches!(recipe.parts(), [DirectTextPart::Literal(value)] if value == "   ")
+                    && matches!(recipe.parts(), [DirectTextPart::LineSlot {
+                        role: TextUnitRole::ScrollingText,
+                        source_line_index: 1,
+                    }])
         ));
     }
 
@@ -2118,13 +2310,13 @@ mod tests {
             build_builtin_snapshot(&complete_documents()).expect("完整最小 MZ 文档应该形成快照");
         let actor = group_at(&snapshot, "data/Actors.json[1]");
 
-        assert_eq!(field_text(actor, "name"), "勇者");
-        assert_eq!(field_text(actor, "profile"), " mixed 日本語 English ");
+        assert_eq!(scalar_value(actor, "name"), "勇者");
+        assert_eq!(scalar_value(actor, "profile"), " mixed 日本語 English ");
         assert!(
             actor
-                .fields()
+                .units()
                 .iter()
-                .all(|field| field.field_name() != "nickname"),
+                .all(|unit| !matches!(unit.role(), TextUnitRole::Scalar(key) if key.as_str() == "nickname")),
             "纯空白昵称应该跳过"
         );
     }
@@ -2274,7 +2466,10 @@ mod tests {
                 {"code": 101, "parameters": ["", 0, 0, 2, "莉莉"]},
                 {"code": 401, "parameters": ["你好"]},
                 {"code": 401, "parameters": ["Welcome"]},
-                {"code": 102, "parameters": [["接受", "拒绝"], -1, 0, 2, 0]},
+                {"code": 102, "indent": 0, "parameters": [["接受", "拒绝"], -1, 0, 2, 0]},
+                {"code": 402, "indent": 0, "parameters": [0, "接受"]},
+                {"code": 402, "indent": 0, "parameters": [1, "拒绝"]},
+                {"code": 404, "indent": 0, "parameters": []},
                 {"code": 105, "parameters": [2, false]},
                 {"code": 405, "parameters": ["滚动一"]},
                 {"code": 405, "parameters": ["滚动二"]},
@@ -2314,12 +2509,38 @@ mod tests {
             .unwrap_or_else(|| panic!("缺少文本组 {location}"))
     }
 
-    fn field_text<'a>(group: &'a ExtractedTextGroup, field_name: &str) -> &'a str {
+    fn scalar_value<'a>(group: &'a ExtractedTextGroup, field_name: &str) -> &'a str {
         group
-            .fields()
+            .units()
             .iter()
-            .find(|field| field.field_name() == field_name)
+            .find(|unit| {
+                matches!(unit.role(), TextUnitRole::Scalar(key) if key.as_str() == field_name)
+            })
             .unwrap_or_else(|| panic!("缺少字段 {field_name}"))
-            .original_text()
+            .source_content()
+            .as_value()
+            .expect("标量单元必须保存单值原文")
+    }
+
+    fn unit_value(group: &ExtractedTextGroup, role: TextUnitRole) -> &str {
+        group
+            .units()
+            .iter()
+            .find(|unit| unit.role() == &role)
+            .unwrap_or_else(|| panic!("缺少语义单元 {role:?}"))
+            .source_content()
+            .as_value()
+            .expect("指定语义单元必须保存单值原文")
+    }
+
+    fn unit_lines(group: &ExtractedTextGroup, role: TextUnitRole) -> &[String] {
+        group
+            .units()
+            .iter()
+            .find(|unit| unit.role() == &role)
+            .unwrap_or_else(|| panic!("缺少语义单元 {role:?}"))
+            .source_content()
+            .as_lines()
+            .expect("指定语义单元必须保存有序原文行")
     }
 }

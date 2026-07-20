@@ -7,7 +7,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{
     RpgMakerAppliedTextLayout, RpgMakerLayoutTextPair, RpgMakerTextLayoutOutcome,
-    RpgMakerWriteBackAppliedLayout, RpgMakerWriteBackLaidOutSegment,
+    RpgMakerWriteBackAppliedLayout, RpgMakerWriteBackLaidOutLine, RpgMakerWriteBackLaidOutSegment,
     RpgMakerWriteBackLayoutCandidate, RpgMakerWriteBackLayoutOutcome,
     RpgMakerWriteBackLayoutRegion, RpgMakerWriteBackLayoutRequest, RpgMakerWriteBackTextLayouter,
 };
@@ -38,14 +38,8 @@ pub(crate) fn layout(
         RpgMakerWriteBackLayoutRegion::ScrollingText => profile.scrolling_text(),
         RpgMakerWriteBackLayoutRegion::HelpDescription => profile.help_description(),
     };
-    let auto_wrap_enabled = match region {
-        RpgMakerWriteBackLayoutRegion::DialogueBody
-        | RpgMakerWriteBackLayoutRegion::ScrollingText => true,
-        RpgMakerWriteBackLayoutRegion::HelpDescription => {
-            pairs.iter().any(|pair| pair.original_text().contains('\n'))
-        }
-    };
-    layout_pairs_result(pairs, max_fullwidth_chars, auto_wrap_enabled)
+    // 三种显示区域都使用自身的显式宽度做安全兜底换行；找不到安全断点时转人工。
+    layout_pairs_result(pairs, max_fullwidth_chars)
 }
 
 fn layout_request(
@@ -64,19 +58,19 @@ fn layout_request(
             RpgMakerLayoutTextPair::new(segment.original_text().to_owned(), replacement)
         })
         .collect::<Vec<_>>();
-    let RpgMakerTextLayoutOutcome::Applied(applied) = layout_pairs_result(
-        &pairs,
-        request.max_fullwidth_chars(),
-        request.auto_wrap_enabled(),
-    ) else {
+    let Some(applied) = layout_pairs(&pairs, request.max_fullwidth_chars()) else {
         return Some(RpgMakerWriteBackLayoutOutcome::Manual);
     };
-    let (texts, inserted_line_breaks, inserted_fullwidth_indents) = applied.into_parts();
+    let CoreAppliedLayout {
+        lines_by_pair,
+        inserted_line_breaks,
+        inserted_fullwidth_indents,
+    } = applied;
     let laid_out_segments = request
         .segments()
         .iter()
-        .zip(texts)
-        .filter_map(|(segment, text)| {
+        .zip(lines_by_pair)
+        .filter_map(|(segment, lines)| {
             matches!(
                 segment.candidate(),
                 RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(_)
@@ -84,7 +78,15 @@ fn layout_request(
             .then(|| {
                 RpgMakerWriteBackLaidOutSegment::new(
                     segment.exact_location().clone(),
-                    text.split('\n').map(str::to_owned).collect(),
+                    lines
+                        .into_iter()
+                        .map(|line| {
+                            RpgMakerWriteBackLaidOutLine::new(
+                                line.text,
+                                line.source_semantic_line_index,
+                            )
+                        })
+                        .collect(),
                 )
                 .expect("受信布局过程必须为每个数据库译文保留至少一个无换行显示行")
             })
@@ -98,16 +100,15 @@ fn layout_request(
             inserted_line_breaks,
             inserted_fullwidth_indents,
         )
-        .expect("受信布局过程必须逐一返回请求中的数据库译文叶"),
+        .expect("受信布局过程必须逐一返回请求中的数据库译文单元"),
     ))
 }
 
 fn layout_pairs_result(
     pairs: &[RpgMakerLayoutTextPair],
     max_fullwidth_chars: MaxFullwidthChars,
-    auto_wrap_enabled: bool,
 ) -> RpgMakerTextLayoutOutcome {
-    layout_pairs(pairs, max_fullwidth_chars, auto_wrap_enabled).map_or_else(
+    layout_pairs(pairs, max_fullwidth_chars).map_or_else(
         || {
             RpgMakerTextLayoutOutcome::Manual(RpgMakerAppliedTextLayout::new(
                 pairs
@@ -119,17 +120,31 @@ fn layout_pairs_result(
             ))
         },
         |applied| {
+            let CoreAppliedLayout {
+                lines_by_pair,
+                inserted_line_breaks,
+                inserted_fullwidth_indents,
+            } = applied;
             RpgMakerTextLayoutOutcome::Applied(RpgMakerAppliedTextLayout::new(
-                applied.texts,
-                applied.inserted_line_breaks,
-                applied.inserted_fullwidth_indents,
+                lines_by_pair
+                    .into_iter()
+                    .map(|lines| {
+                        lines
+                            .into_iter()
+                            .map(|line| line.text)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .collect(),
+                inserted_line_breaks,
+                inserted_fullwidth_indents,
             ))
         },
     )
 }
 
 struct CoreAppliedLayout {
-    texts: Vec<String>,
+    lines_by_pair: Vec<Vec<WorkingLine>>,
     inserted_line_breaks: usize,
     inserted_fullwidth_indents: usize,
 }
@@ -137,7 +152,6 @@ struct CoreAppliedLayout {
 fn layout_pairs(
     pairs: &[RpgMakerLayoutTextPair],
     max_fullwidth_chars: MaxFullwidthChars,
-    auto_wrap_enabled: bool,
 ) -> Option<CoreAppliedLayout> {
     let max_cells = u64::from(max_fullwidth_chars.get()) * 2;
     let mut working_segments = Vec::with_capacity(pairs.len());
@@ -146,36 +160,48 @@ fn layout_pairs(
     for pair in pairs {
         let translated = pair.replacement().is_some();
         let mut lines = Vec::new();
-        for hard_line in pair.effective_text().split('\n') {
+        for (source_semantic_line_index, hard_line) in pair.effective_text().split('\n').enumerate()
+        {
             let tokens = scan_line(hard_line)?;
             if !translated {
-                lines.push(hard_line.to_owned());
+                lines.push(WorkingLine::semantic(
+                    hard_line.to_owned(),
+                    source_semantic_line_index,
+                ));
                 continue;
             }
 
             if line_width(&tokens) <= max_cells {
-                lines.push(hard_line.to_owned());
+                lines.push(WorkingLine::semantic(
+                    hard_line.to_owned(),
+                    source_semantic_line_index,
+                ));
                 continue;
             }
-            if !auto_wrap_enabled {
-                return None;
-            }
-
             let wrapped = wrap_line(&tokens, max_cells)?;
             inserted_line_breaks =
                 inserted_line_breaks.checked_add(wrapped.len().saturating_sub(1))?;
-            lines.extend(wrapped);
+            lines.extend(
+                wrapped
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, text)| WorkingLine {
+                        text,
+                        automatically_generated_continuation: index > 0,
+                        source_semantic_line_index,
+                    }),
+            );
         }
         working_segments.push(WorkingSegment { translated, lines });
     }
 
     let inserted_fullwidth_indents = apply_continuation_indents(&mut working_segments, max_cells)?;
-    let texts = working_segments
+    let lines_by_pair = working_segments
         .into_iter()
-        .map(|segment| segment.lines.join("\n"))
+        .map(|segment| segment.lines)
         .collect();
     Some(CoreAppliedLayout {
-        texts,
+        lines_by_pair,
         inserted_line_breaks,
         inserted_fullwidth_indents,
     })
@@ -183,7 +209,24 @@ fn layout_pairs(
 
 struct WorkingSegment {
     translated: bool,
-    lines: Vec<String>,
+    lines: Vec<WorkingLine>,
+}
+
+struct WorkingLine {
+    text: String,
+    automatically_generated_continuation: bool,
+    /// 模型语义硬行的序号；自动续行始终继承母行序号。
+    source_semantic_line_index: usize,
+}
+
+impl WorkingLine {
+    fn semantic(text: String, source_semantic_line_index: usize) -> Self {
+        Self {
+            text,
+            automatically_generated_continuation: false,
+            source_semantic_line_index,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,18 +547,21 @@ fn apply_continuation_indents(segments: &mut [WorkingSegment], max_cells: u64) -
 
     for segment in segments {
         for line in &mut segment.lines {
-            let insert_at = if segment.translated && !wrapping_stack.is_empty() {
-                let tokens = scan_line(line)?;
+            let insert_at = if segment.translated
+                && line.automatically_generated_continuation
+                && !wrapping_stack.is_empty()
+            {
+                let tokens = scan_line(&line.text)?;
                 continuation_indent_position(&tokens)
             } else {
                 None
             };
             if let Some(insert_at) = insert_at {
-                line.insert_str(insert_at, FULLWIDTH_INDENT);
+                line.text.insert_str(insert_at, FULLWIDTH_INDENT);
                 inserted = inserted.checked_add(1)?;
             }
 
-            let tokens = scan_line(line)?;
+            let tokens = scan_line(&line.text)?;
             if segment.translated && line_width(&tokens) > max_cells {
                 return None;
             }
@@ -588,13 +634,13 @@ fn pair_closer(opener: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpg_maker::model::{ScalarFieldKey, TextFieldRole};
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitRole};
     use crate::rpg_maker::project::{MaxFullwidthChars, RpgMakerWriteBackLayoutProfile};
     use crate::rpg_maker::text::{
         RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
     };
     use crate::rpg_maker::write_back::standard::{
-        RpgMakerWriteBackLayoutRegion, RpgMakerWriteBackLayoutSegment, StandardWriteBackLeaf,
+        RpgMakerWriteBackLayoutRegion, RpgMakerWriteBackLayoutSegment,
     };
 
     fn width(value: u32) -> MaxFullwidthChars {
@@ -616,24 +662,22 @@ mod tests {
         original: &str,
         translation: Option<&str>,
     ) -> RpgMakerWriteBackLayoutSegment {
-        let leaf = StandardWriteBackLeaf::new(
-            TextFieldRole::Scalar(ScalarFieldKey::new("description").expect("测试字段键应合法")),
-            original,
+        RpgMakerWriteBackLayoutSegment::from_line_at(
+            &location(999),
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("测试字段键应合法")),
+            location(index),
+            original.to_owned(),
             translation.map(str::to_owned),
         )
-        .expect("测试叶应合法");
-        RpgMakerWriteBackLayoutSegment::from_leaf_at(&location(999), &leaf, location(index))
     }
 
     fn request(
         max_fullwidth_chars: u32,
-        auto_wrap_enabled: bool,
         segments: Vec<RpgMakerWriteBackLayoutSegment>,
     ) -> RpgMakerWriteBackLayoutRequest {
         RpgMakerWriteBackLayoutRequest::new(
             RpgMakerWriteBackLayoutRegion::HelpDescription,
             width(max_fullwidth_chars),
-            auto_wrap_enabled,
             segments,
         )
     }
@@ -648,7 +692,15 @@ mod tests {
     }
 
     fn line_texts(segment: &RpgMakerWriteBackLaidOutSegment) -> Vec<&str> {
-        segment.lines().iter().map(String::as_str).collect()
+        segment.lines().iter().map(|line| line.text()).collect()
+    }
+
+    fn source_semantic_line_indexes(segment: &RpgMakerWriteBackLaidOutSegment) -> Vec<usize> {
+        segment
+            .lines()
+            .iter()
+            .map(|line| line.source_semantic_line_index())
+            .collect()
     }
 
     fn assert_manual(request: &RpgMakerWriteBackLayoutRequest) {
@@ -697,6 +749,38 @@ mod tests {
             assert_eq!(manual.inserted_line_breaks(), 0);
             assert_eq!(manual.inserted_fullwidth_indents(), 0);
         }
+    }
+
+    #[test]
+    fn single_line_help_source_uses_help_width_for_safe_auto_wrap() {
+        let pairs = vec![RpgMakerLayoutTextPair::new(
+            "单行原文".to_owned(),
+            Some("甲乙，丙丁。".to_owned()),
+        )];
+
+        let RpgMakerTextLayoutOutcome::Applied(applied) = layout(
+            RpgMakerWriteBackLayoutRegion::HelpDescription,
+            &pairs,
+            &profile(20, 20, 3),
+        ) else {
+            panic!("单行帮助说明应按帮助宽度安全换行")
+        };
+
+        assert_eq!(applied.texts(), ["甲乙，\n丙丁。"]);
+        assert_eq!(applied.inserted_line_breaks(), 1);
+        assert_eq!(applied.inserted_fullwidth_indents(), 0);
+    }
+
+    #[test]
+    fn help_request_wraps_a_single_line_source_at_the_explicit_help_width() {
+        let request = request(3, vec![segment(1, "单行原文", Some("甲乙，丙丁。"))]);
+
+        let applied = applied(&request);
+
+        assert_eq!(line_texts(&applied.segments()[0]), ["甲乙，", "丙丁。"][..]);
+        assert_eq!(source_semantic_line_indexes(&applied.segments()[0]), [0, 0]);
+        assert_eq!(applied.inserted_line_breaks(), 1);
+        assert_eq!(applied.inserted_fullwidth_indents(), 0);
     }
 
     #[test]
@@ -759,31 +843,26 @@ mod tests {
     #[test]
     fn uncertain_controls_and_residual_att_tokens_make_the_whole_unit_manual() {
         for text in [r"甲\broken乙", r"甲\C[1乙", "甲\\", "甲⟦ATT_X_0001⟧乙"] {
-            assert_manual(&request(20, true, vec![segment(1, "原文", Some(text))]));
+            assert_manual(&request(20, vec![segment(1, "原文", Some(text))]));
         }
     }
 
     #[test]
     fn cr_tab_and_other_control_characters_make_the_whole_unit_manual() {
         for text in ["甲\r乙", "甲\t乙", "甲\u{7}乙", "甲\u{2028}乙"] {
-            assert_manual(&request(20, true, vec![segment(1, "原文", Some(text))]));
+            assert_manual(&request(20, vec![segment(1, "原文", Some(text))]));
         }
     }
 
     #[test]
     fn non_breaking_spaces_are_not_used_as_word_boundaries() {
-        assert_manual(&request(
-            2,
-            true,
-            vec![segment(1, "原文", Some("ab\u{a0}cd"))],
-        ));
+        assert_manual(&request(2, vec![segment(1, "原文", Some("ab\u{a0}cd"))]));
     }
 
     #[test]
     fn wraps_at_chinese_punctuation_without_moving_text_between_segments() {
         let request = request(
             3,
-            true,
             vec![
                 segment(1, "原一", Some("甲乙，丙丁。")),
                 segment(2, "原二", Some("戊己，庚辛。")),
@@ -799,7 +878,7 @@ mod tests {
 
     #[test]
     fn replaces_a_horizontal_whitespace_boundary_with_a_line_break() {
-        let request = request(2, true, vec![segment(1, "原文", Some("abcd  efgh"))]);
+        let request = request(2, vec![segment(1, "原文", Some("abcd  efgh"))]);
 
         let applied = applied(&request);
 
@@ -809,27 +888,18 @@ mod tests {
 
     #[test]
     fn refuses_a_whitespace_break_that_places_ascii_punctuation_at_line_start() {
-        assert_manual(&request(
-            2,
-            true,
-            vec![segment(1, "原文", Some("abcd ,efg"))],
-        ));
+        assert_manual(&request(2, vec![segment(1, "原文", Some("abcd ,efg"))]));
     }
 
     #[test]
     fn refuses_to_hard_split_an_unsplittable_run() {
-        assert_manual(&request(
-            3,
-            true,
-            vec![segment(1, "原文", Some("甲乙丙丁"))],
-        ));
+        assert_manual(&request(3, vec![segment(1, "原文", Some("甲乙丙丁"))]));
     }
 
     #[test]
     fn rejects_a_break_before_the_forty_five_percent_readability_threshold() {
         assert_manual(&request(
             10,
-            true,
             vec![segment(1, "原文", Some("甲甲甲，乙乙乙乙乙乙乙乙"))],
         ));
     }
@@ -838,14 +908,13 @@ mod tests {
     fn rejects_a_tiny_final_tail() {
         assert_manual(&request(
             6,
-            true,
             vec![segment(1, "原文", Some("甲乙丙丁戊，乙"))],
         ));
     }
 
     #[test]
     fn keeps_closing_pair_with_preceding_punctuation_line() {
-        let request = request(4, true, vec![segment(1, "原文", Some("甲乙，」丙丁"))]);
+        let request = request(4, vec![segment(1, "原文", Some("甲乙，」丙丁"))]);
 
         let applied = applied(&request);
 
@@ -854,16 +923,12 @@ mod tests {
 
     #[test]
     fn refuses_a_break_that_would_leave_an_opening_pair_at_line_end() {
-        assert_manual(&request(
-            3,
-            true,
-            vec![segment(1, "原文", Some("甲乙（ 丙丁丁"))],
-        ));
+        assert_manual(&request(3, vec![segment(1, "原文", Some("甲乙（ 丙丁丁"))]));
     }
 
     #[test]
     fn preserves_database_hard_lines_without_counting_them_as_inserted() {
-        let request = request(2, false, vec![segment(1, "原文", Some("甲乙\n\n丙丁"))]);
+        let request = request(2, vec![segment(1, "原文", Some("甲乙\n\n丙丁"))]);
 
         let applied = applied(&request);
 
@@ -872,13 +937,31 @@ mod tests {
     }
 
     #[test]
-    fn disabled_auto_wrap_reports_overwidth_hard_line_as_manual() {
-        assert_manual(&request(2, false, vec![segment(1, "原文", Some("甲乙丙"))]));
+    fn inserted_line_breaks_count_only_automatic_wraps_after_semantic_lines() {
+        let request = request(4, vec![segment(1, "原文", Some("甲乙\n「甲乙，丙丁」"))]);
+
+        let applied = applied(&request);
+
+        assert_eq!(
+            line_texts(&applied.segments()[0]),
+            ["甲乙", "「甲乙，", "　丙丁」"][..]
+        );
+        assert_eq!(
+            source_semantic_line_indexes(&applied.segments()[0]),
+            [0, 1, 1]
+        );
+        assert_eq!(applied.inserted_line_breaks(), 1);
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
+    }
+
+    #[test]
+    fn overwidth_line_without_a_safe_break_remains_manual() {
+        assert_manual(&request(2, vec![segment(1, "原文", Some("甲乙丙"))]));
     }
 
     #[test]
     fn wraps_before_adding_fullwidth_continuation_indent() {
-        let request = request(4, true, vec![segment(1, "原文", Some("「甲乙，丙丁」"))]);
+        let request = request(4, vec![segment(1, "原文", Some("「甲乙，丙丁」"))]);
 
         let applied = applied(&request);
 
@@ -891,38 +974,34 @@ mod tests {
     }
 
     #[test]
-    fn inserts_indent_after_leading_controls() {
-        let request = request(
-            3,
-            false,
-            vec![segment(1, "原文", Some("「甲\n\\SE[2]乙」"))],
-        );
+    fn preserves_semantic_line_after_leading_controls_byte_for_byte() {
+        let request = request(3, vec![segment(1, "原文", Some("「甲\n\\SE[2]乙」"))]);
 
         let applied = applied(&request);
 
         assert_eq!(
             line_texts(&applied.segments()[0]),
-            ["「甲", r"\SE[2]　乙」"][..]
+            ["「甲", r"\SE[2]乙」"][..]
         );
-        assert_eq!(applied.inserted_fullwidth_indents(), 1);
+        assert_eq!(applied.inserted_fullwidth_indents(), 0);
     }
 
     #[test]
     fn does_not_duplicate_existing_half_or_fullwidth_whitespace() {
         for continuation in [" 乙」", "　乙」", "\u{a0}乙」"] {
             let text = format!("「甲\n{continuation}");
-            let request = request(3, false, vec![segment(1, "原文", Some(&text))]);
+            let request = request(3, vec![segment(1, "原文", Some(&text))]);
 
             let applied = applied(&request);
 
-            assert_eq!(applied.segments()[0].lines()[1], continuation);
+            assert_eq!(applied.segments()[0].lines()[1].text(), continuation);
             assert_eq!(applied.inserted_fullwidth_indents(), 0);
         }
     }
 
     #[test]
     fn line_mid_opening_pair_does_not_start_continuation_indent() {
-        let request = request(5, false, vec![segment(1, "原文", Some("他说「甲\n乙」"))]);
+        let request = request(5, vec![segment(1, "原文", Some("他说「甲\n乙」"))]);
 
         let applied = applied(&request);
 
@@ -931,10 +1010,9 @@ mod tests {
     }
 
     #[test]
-    fn wrapping_state_crosses_segment_boundaries_and_observes_frozen_original() {
+    fn semantic_lines_observe_cross_segment_state_without_inserting_indents() {
         let request = request(
             5,
-            false,
             vec![
                 segment(1, "原一", Some("「甲")),
                 segment(2, "缺译", None),
@@ -946,18 +1024,14 @@ mod tests {
 
         assert_eq!(applied.segments().len(), 2);
         assert_eq!(line_texts(&applied.segments()[0]), ["「甲"][..]);
-        assert_eq!(
-            line_texts(&applied.segments()[1]),
-            ["　【乙", "　丙】」"][..]
-        );
-        assert_eq!(applied.inserted_fullwidth_indents(), 2);
+        assert_eq!(line_texts(&applied.segments()[1]), ["【乙", "丙】」"][..]);
+        assert_eq!(applied.inserted_fullwidth_indents(), 0);
     }
 
     #[test]
     fn frozen_original_can_close_wrapping_state_without_being_modified() {
         let request = request(
             4,
-            false,
             vec![
                 segment(1, "原一", Some("「甲")),
                 segment(2, "缺译」", None),
@@ -975,17 +1049,18 @@ mod tests {
     fn malformed_control_in_frozen_original_makes_state_observation_manual() {
         assert_manual(&request(
             20,
-            true,
             vec![segment(1, "原一", Some("译文")), segment(2, "缺译\\", None)],
         ));
     }
 
     #[test]
-    fn indent_that_would_exceed_the_explicit_width_makes_the_unit_manual() {
-        assert_manual(&request(
-            3,
-            false,
-            vec![segment(1, "原文", Some("「甲\n乙丙」"))],
-        ));
+    fn semantic_hard_line_is_not_indented_or_rejected_by_width() {
+        let request = request(3, vec![segment(1, "原文", Some("「甲\n乙丙」"))]);
+
+        let applied = applied(&request);
+
+        assert_eq!(line_texts(&applied.segments()[0]), ["「甲", "乙丙」"][..]);
+        assert_eq!(applied.inserted_line_breaks(), 0);
+        assert_eq!(applied.inserted_fullwidth_indents(), 0);
     }
 }

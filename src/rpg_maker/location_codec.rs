@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use super::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
-    DirectTextRecipe, MutationTarget, ProjectionModelError, ScalarFieldKey, TextFieldRole,
-    TextProjectionRecipe,
+    DirectTextRecipe, MutationTarget, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe,
+    TextUnitRole,
 };
 use crate::rpg_maker::text::DataFileName;
 
@@ -40,13 +40,11 @@ impl RpgMakerLocationCodec {
 pub(crate) struct RpgMakerProjectionCodec;
 
 impl RpgMakerProjectionCodec {
-    pub(crate) fn encode_role(
-        role: &TextFieldRole,
-    ) -> Result<String, RpgMakerProjectionCodecError> {
+    pub(crate) fn encode_role(role: &TextUnitRole) -> Result<String, RpgMakerProjectionCodecError> {
         serde_json::to_string(&StoredRole::from(role)).map_err(RpgMakerProjectionCodecError::Encode)
     }
 
-    pub(crate) fn decode_role(value: &str) -> Result<TextFieldRole, RpgMakerProjectionCodecError> {
+    pub(crate) fn decode_role(value: &str) -> Result<TextUnitRole, RpgMakerProjectionCodecError> {
         serde_json::from_str::<StoredRole>(value)
             .map_err(RpgMakerProjectionCodecError::Decode)?
             .try_into()
@@ -297,24 +295,26 @@ impl From<StoredStep> for RpgMakerLocationStep {
 enum StoredRole {
     Scalar { key: String },
     DialogueSpeaker,
-    DialogueBody { index: usize },
-    ScrollingTextBody { index: usize },
+    DialogueBody,
+    Choices,
+    ScrollingText,
 }
 
-impl From<&TextFieldRole> for StoredRole {
-    fn from(role: &TextFieldRole) -> Self {
+impl From<&TextUnitRole> for StoredRole {
+    fn from(role: &TextUnitRole) -> Self {
         match role {
-            TextFieldRole::Scalar(key) => Self::Scalar {
+            TextUnitRole::Scalar(key) => Self::Scalar {
                 key: key.as_str().to_owned(),
             },
-            TextFieldRole::DialogueSpeaker => Self::DialogueSpeaker,
-            TextFieldRole::DialogueBody { index } => Self::DialogueBody { index: *index },
-            TextFieldRole::ScrollingTextBody { index } => Self::ScrollingTextBody { index: *index },
+            TextUnitRole::DialogueSpeaker => Self::DialogueSpeaker,
+            TextUnitRole::DialogueBody => Self::DialogueBody,
+            TextUnitRole::Choices => Self::Choices,
+            TextUnitRole::ScrollingText => Self::ScrollingText,
         }
     }
 }
 
-impl TryFrom<StoredRole> for TextFieldRole {
+impl TryFrom<StoredRole> for TextUnitRole {
     type Error = RpgMakerProjectionCodecError;
 
     fn try_from(role: StoredRole) -> Result<Self, Self::Error> {
@@ -323,8 +323,9 @@ impl TryFrom<StoredRole> for TextFieldRole {
                 .map(Self::Scalar)
                 .map_err(RpgMakerProjectionCodecError::Projection),
             StoredRole::DialogueSpeaker => Ok(Self::DialogueSpeaker),
-            StoredRole::DialogueBody { index } => Ok(Self::DialogueBody { index }),
-            StoredRole::ScrollingTextBody { index } => Ok(Self::ScrollingTextBody { index }),
+            StoredRole::DialogueBody => Ok(Self::DialogueBody),
+            StoredRole::Choices => Ok(Self::Choices),
+            StoredRole::ScrollingText => Ok(Self::ScrollingText),
         }
     }
 }
@@ -444,8 +445,16 @@ impl TryFrom<StoredRecipe> for TextProjectionRecipe {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum StoredDirectTextPart {
-    Literal { value: String },
-    TextSlot { role: StoredRole },
+    Literal {
+        value: String,
+    },
+    TextSlot {
+        role: StoredRole,
+    },
+    LineSlot {
+        role: StoredRole,
+        source_line_index: usize,
+    },
 }
 
 impl From<&DirectTextPart> for StoredDirectTextPart {
@@ -456,6 +465,13 @@ impl From<&DirectTextPart> for StoredDirectTextPart {
             },
             DirectTextPart::TextSlot { role } => Self::TextSlot {
                 role: StoredRole::from(role),
+            },
+            DirectTextPart::LineSlot {
+                role,
+                source_line_index,
+            } => Self::LineSlot {
+                role: StoredRole::from(role),
+                source_line_index: *source_line_index,
             },
         }
     }
@@ -469,6 +485,13 @@ impl TryFrom<StoredDirectTextPart> for DirectTextPart {
             StoredDirectTextPart::Literal { value } => Ok(Self::Literal(value)),
             StoredDirectTextPart::TextSlot { role } => Ok(Self::TextSlot {
                 role: role.try_into()?,
+            }),
+            StoredDirectTextPart::LineSlot {
+                role,
+                source_line_index,
+            } => Ok(Self::LineSlot {
+                role: role.try_into()?,
+                source_line_index,
             }),
         }
     }
@@ -545,7 +568,7 @@ impl TryFrom<StoredDialogueLineRecipe> for DialogueLineRecipe {
 enum StoredDialogueLinePart {
     Literal { value: String },
     SpeakerSlot,
-    BodySlot { index: usize },
+    BodyLine { source_line_index: usize },
 }
 
 impl From<&DialogueLinePart> for StoredDialogueLinePart {
@@ -555,7 +578,9 @@ impl From<&DialogueLinePart> for StoredDialogueLinePart {
                 value: value.clone(),
             },
             DialogueLinePart::SpeakerSlot => Self::SpeakerSlot,
-            DialogueLinePart::BodySlot { index } => Self::BodySlot { index: *index },
+            DialogueLinePart::BodyLine { source_line_index } => Self::BodyLine {
+                source_line_index: *source_line_index,
+            },
         }
     }
 }
@@ -567,7 +592,9 @@ impl TryFrom<StoredDialogueLinePart> for DialogueLinePart {
         match part {
             StoredDialogueLinePart::Literal { value } => Ok(Self::Literal(value)),
             StoredDialogueLinePart::SpeakerSlot => Ok(Self::SpeakerSlot),
-            StoredDialogueLinePart::BodySlot { index } => Ok(Self::BodySlot { index }),
+            StoredDialogueLinePart::BodyLine { source_line_index } => {
+                Ok(Self::BodyLine { source_line_index })
+            }
         }
     }
 }
@@ -686,5 +713,53 @@ mod tests {
 
         let decoded = RpgMakerLocationCodec::decode(encoded).expect("非标准 JSON 基名应可持久化");
         assert_eq!(decoded.to_string(), "data/Custom.json");
+    }
+
+    #[test]
+    fn semantic_unit_roles_have_no_physical_line_identity() {
+        let cases = [
+            (
+                TextUnitRole::DialogueSpeaker,
+                r#"{"kind":"dialogue_speaker"}"#,
+            ),
+            (TextUnitRole::DialogueBody, r#"{"kind":"dialogue_body"}"#),
+            (TextUnitRole::Choices, r#"{"kind":"choices"}"#),
+            (TextUnitRole::ScrollingText, r#"{"kind":"scrolling_text"}"#),
+        ];
+
+        for (role, expected) in cases {
+            let encoded = RpgMakerProjectionCodec::encode_role(&role).expect("角色应可编码");
+            assert_eq!(encoded, expected);
+            assert_eq!(
+                RpgMakerProjectionCodec::decode_role(&encoded).expect("角色应可解码"),
+                role
+            );
+        }
+    }
+
+    #[test]
+    fn line_slots_round_trip_only_inside_projection_recipes() {
+        let target =
+            RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(3)]);
+        let recipe = TextProjectionRecipe::Direct(
+            DirectTextRecipe::new(
+                target,
+                "第二项",
+                vec![DirectTextPart::LineSlot {
+                    role: TextUnitRole::Choices,
+                    source_line_index: 1,
+                }],
+            )
+            .expect("行槽配方应合法"),
+        );
+        let encoded = RpgMakerProjectionCodec::encode_recipes(std::slice::from_ref(&recipe))
+            .expect("配方应可编码");
+
+        assert!(encoded.contains(r#""kind":"line_slot""#));
+        assert!(encoded.contains(r#""source_line_index":1"#));
+        assert_eq!(
+            RpgMakerProjectionCodec::decode_recipes(&encoded).expect("配方应可解码"),
+            [recipe]
+        );
     }
 }

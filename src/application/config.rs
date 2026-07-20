@@ -1044,8 +1044,8 @@ fn build_standard_asset_configuration(
     raw: RawRpgMakerStandardAssetConfiguration,
 ) -> Result<RpgMakerStandardAssetReadingConfig, ConfigurationValueError> {
     Ok(RpgMakerStandardAssetReadingConfig::new(non_zero_usize(
-        "rpg_maker.standard_asset.leaves_per_decode_job",
-        raw.leaves_per_decode_job,
+        "rpg_maker.standard_asset.units_per_decode_job",
+        raw.units_per_decode_job,
     )?))
 }
 
@@ -1063,8 +1063,8 @@ fn build_translation_store_configuration(
 ) -> Result<RpgMakerStandardTranslationResultStorageConfig, ConfigurationValueError> {
     Ok(RpgMakerStandardTranslationResultStorageConfig::new(
         non_zero_usize(
-            "rpg_maker.translate.store.leaves_per_encode_job",
-            raw.leaves_per_encode_job,
+            "rpg_maker.translate.store.units_per_encode_job",
+            raw.units_per_encode_job,
         )?,
     ))
 }
@@ -2924,7 +2924,7 @@ struct RawRpgMakerDocumentConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRpgMakerStandardAssetConfiguration {
-    leaves_per_decode_job: u64,
+    units_per_decode_job: u64,
 }
 
 #[derive(Deserialize)]
@@ -2948,7 +2948,7 @@ struct RawRpgMakerTranslateConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRpgMakerTranslateStoreConfiguration {
-    leaves_per_encode_job: u64,
+    units_per_encode_job: u64,
 }
 
 #[derive(Deserialize)]

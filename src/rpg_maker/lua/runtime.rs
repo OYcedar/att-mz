@@ -258,7 +258,7 @@ impl TrustedLuaPreparedTranslationStatus {
     }
 }
 
-/// 当前叶子实际命中的一个有序术语对。
+/// 当前单段文本实际命中的一个有序术语对。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TrustedLuaTranslationTerm {
     term: String,

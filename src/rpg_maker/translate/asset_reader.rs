@@ -12,7 +12,7 @@ use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
 };
-use crate::rpg_maker::model::TextFieldRole;
+use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{
     AssetSnapshotFingerprint, PLACEHOLDER_RULES_RESOURCE_KIND, SourceSnapshotFingerprint,
@@ -28,7 +28,7 @@ use crate::storage::sqlite::{
 
 use super::standard::{
     StandardTranslationAsset, StandardTranslationAssetReader, StandardTranslationCorpus,
-    StandardTranslationGroup, TranslationLeafIdentity, TranslationOwnerSnapshot,
+    StandardTranslationGroup, TranslationOwnerSnapshot, TranslationUnitIdentity,
 };
 
 const READ_TRANSLATION_SNAPSHOT: &str = r#"SELECT
@@ -40,10 +40,10 @@ const READ_TRANSLATION_SNAPSHOT: &str = r#"SELECT
     canonical_json,
     group_location,
     group_kind,
-    field_role,
-    original_text,
-    translation_context_json,
-    translation,
+    unit_role,
+    source_content_json,
+    source_context_json,
+    translation_content_json,
     translation_state
 FROM (
     SELECT
@@ -55,10 +55,10 @@ FROM (
         NULL AS canonical_json,
         NULL AS group_location,
         NULL AS group_kind,
-        NULL AS field_role,
-        NULL AS original_text,
-        NULL AS translation_context_json,
-        NULL AS translation,
+        NULL AS unit_role,
+        NULL AS source_content_json,
+        NULL AS source_context_json,
+        NULL AS translation_content_json,
         NULL AS translation_state
     FROM metadata
 
@@ -101,25 +101,25 @@ FROM (
     UNION ALL
 
     SELECT
-        '3_leaf',
-        leaf.owner,
+        '3_unit',
+        unit.owner,
         NULL,
         NULL,
         NULL,
         NULL,
-        leaf.group_location,
+        unit.group_location,
         text_group.group_kind,
-        leaf.field_role,
-        leaf.original_text,
-        leaf.translation_context_json,
-        leaf.translation,
-        leaf.translation_state
-    FROM standard_text_leaf AS leaf
+        unit.unit_role,
+        unit.source_content_json,
+        unit.source_context_json,
+        unit.translation_content_json,
+        unit.translation_state
+    FROM standard_text_unit AS unit
     JOIN standard_text_group AS text_group
-      ON text_group.owner = leaf.owner
-     AND text_group.group_location = leaf.group_location
+      ON text_group.owner = unit.owner
+     AND text_group.group_location = unit.group_location
 )
-ORDER BY row_kind, owner, resource_kind, group_location, field_role"#;
+ORDER BY row_kind, owner, resource_kind, group_location, unit_role"#;
 
 /// 验证 owner 新鲜度、读取当前资源，并用受控 CPU 解码标准翻译语料。
 pub(crate) struct RpgMakerStandardTranslationAssetReadingService<Q, C> {
@@ -159,10 +159,10 @@ where
             .await
             .map_err(|error| map_query_error(database_path.clone(), error))?;
         let expected_source_snapshot = project.source_snapshot_fingerprint();
-        let leaves_per_job = self.config.leaves_per_decode_job().get();
+        let units_per_job = self.config.units_per_decode_job().get();
         let prepared = self
             .cpu
-            .execute(move || prepare_snapshot(rows, expected_source_snapshot, leaves_per_job))
+            .execute(move || prepare_snapshot(rows, expected_source_snapshot, units_per_job))
             .await
             .map_err(RpgMakerStandardTranslationAssetReadingError::SchedulePreparation)?
             .map_err(map_snapshot_preparation_error)?;
@@ -315,21 +315,42 @@ pub(crate) enum InvalidStandardTranslationAssetSnapshot {
     InvalidLocation(RpgMakerLocationCodecError),
     InvalidRole(RpgMakerProjectionCodecError),
     RoleDoesNotBelongToGroup {
-        role: TextFieldRole,
+        role: TextUnitRole,
         kind: TextGroupKind,
     },
-    BlankOriginalText,
-    BlankTranslation,
-    InvalidTranslationContext(serde_json::Error),
-    TranslationContextMustBeObject,
+    InvalidSourceContent(serde_json::Error),
+    InvalidTranslationContent(serde_json::Error),
+    SourceContentShapeMismatch {
+        role: TextUnitRole,
+    },
+    TranslationContentShapeMismatch {
+        role: TextUnitRole,
+    },
+    BlankSourceContent,
+    BlankTranslationContent,
+    InvalidSourceLineText {
+        index: usize,
+    },
+    InvalidTranslationLineText {
+        index: usize,
+    },
+    AlignedLineCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    AlignedBlankSlotMismatch {
+        index: usize,
+    },
+    InvalidSourceContext(serde_json::Error),
+    SourceContextMustBeObject,
     InvalidTranslationStatePair,
     InvalidTranslationStateLength {
         actual: usize,
     },
-    DuplicateLogicalLeaf {
+    DuplicateLogicalUnit {
         owner: RpgMakerStandardAssetOwner,
         group_location: Box<RpgMakerLocation>,
-        role: TextFieldRole,
+        role: TextUnitRole,
     },
 }
 
@@ -346,7 +367,7 @@ impl fmt::Display for InvalidStandardTranslationAssetSnapshot {
                 actual,
             } => write!(formatter, "列 {column} 应为 {expected}，实际为 {actual}"),
             Self::UnknownOwner(owner) => write!(formatter, "未知资产所有者：{owner}"),
-            Self::InactiveOwner(owner) => write!(formatter, "文本叶引用未激活 owner：{owner}"),
+            Self::InactiveOwner(owner) => write!(formatter, "文本单元引用未激活 owner：{owner}"),
             Self::DuplicateOwner(owner) => write!(formatter, "资产 owner 状态重复：{owner}"),
             Self::InvalidOwnerSourceFingerprintLength { owner, actual } => write!(
                 formatter,
@@ -369,32 +390,56 @@ impl fmt::Display for InvalidStandardTranslationAssetSnapshot {
             Self::BlankTranslationResource(kind) => write!(formatter, "翻译资源 {kind} 为空"),
             Self::UnknownGroupKind(kind) => write!(formatter, "未知文本组类型：{kind}"),
             Self::InvalidLocation(source) => write!(formatter, "组位置无效：{source}"),
-            Self::InvalidRole(source) => write!(formatter, "字段角色无效：{source}"),
+            Self::InvalidRole(source) => write!(formatter, "单元角色无效：{source}"),
             Self::RoleDoesNotBelongToGroup { role, kind } => {
-                write!(formatter, "字段角色 {role:?} 不属于文本组 {kind:?}")
+                write!(formatter, "单元角色 {role:?} 不属于文本组 {kind:?}")
             }
-            Self::BlankOriginalText => formatter.write_str("标准文本原文仅包含空白"),
-            Self::BlankTranslation => formatter.write_str("标准文本译文仅包含空白"),
-            Self::InvalidTranslationContext(source) => {
-                write!(formatter, "translation_context_json 无效：{source}")
+            Self::InvalidSourceContent(source) => {
+                write!(formatter, "source_content_json 无效：{source}")
             }
-            Self::TranslationContextMustBeObject => {
-                formatter.write_str("translation_context_json 必须是 JSON 对象")
+            Self::InvalidTranslationContent(source) => {
+                write!(formatter, "translation_content_json 无效：{source}")
             }
-            Self::InvalidTranslationStatePair => {
-                formatter.write_str("translation 与 translation_state 必须同时存在或同时为空")
+            Self::SourceContentShapeMismatch { role } => {
+                write!(formatter, "源内容形状不符合单元角色 {role:?}")
             }
+            Self::TranslationContentShapeMismatch { role } => {
+                write!(formatter, "译文内容形状不符合单元角色 {role:?}")
+            }
+            Self::BlankSourceContent => formatter.write_str("标准文本源内容仅包含空白"),
+            Self::BlankTranslationContent => formatter.write_str("标准文本译文内容仅包含空白"),
+            Self::InvalidSourceLineText { index } => {
+                write!(formatter, "源内容第 {index} 行包含 CR、LF 或 NUL")
+            }
+            Self::InvalidTranslationLineText { index } => {
+                write!(formatter, "译文内容第 {index} 行包含 CR、LF 或 NUL")
+            }
+            Self::AlignedLineCountMismatch { expected, actual } => write!(
+                formatter,
+                "严格对齐译文应包含 {expected} 行，实际为 {actual} 行"
+            ),
+            Self::AlignedBlankSlotMismatch { index } => {
+                write!(formatter, "严格对齐译文第 {index} 行改变了源空槽状态")
+            }
+            Self::InvalidSourceContext(source) => {
+                write!(formatter, "source_context_json 无效：{source}")
+            }
+            Self::SourceContextMustBeObject => {
+                formatter.write_str("source_context_json 必须是 JSON 对象")
+            }
+            Self::InvalidTranslationStatePair => formatter
+                .write_str("translation_content_json 与 translation_state 必须同时存在或同时为空"),
             Self::InvalidTranslationStateLength { actual } => write!(
                 formatter,
                 "translation_state 必须是 32 字节 BLOB，实际为 {actual} 字节"
             ),
-            Self::DuplicateLogicalLeaf {
+            Self::DuplicateLogicalUnit {
                 owner,
                 group_location,
                 role,
             } => write!(
                 formatter,
-                "同一逻辑文本叶重复：{} / {group_location} / {role:?}",
+                "同一语义文本单元重复：{} / {group_location} / {role:?}",
                 owner.storage_name()
             ),
         }
@@ -406,7 +451,9 @@ impl Error for InvalidStandardTranslationAssetSnapshot {
         match self {
             Self::InvalidLocation(source) => Some(source),
             Self::InvalidRole(source) => Some(source),
-            Self::InvalidTranslationContext(source) => Some(source),
+            Self::InvalidSourceContent(source)
+            | Self::InvalidTranslationContent(source)
+            | Self::InvalidSourceContext(source) => Some(source),
             _ => None,
         }
     }
@@ -433,7 +480,7 @@ struct SnapshotRows {
     metadata: Vec<SqliteRow>,
     owners: Vec<SqliteRow>,
     resources: Vec<SqliteRow>,
-    leaves: Vec<SqliteRow>,
+    units: Vec<SqliteRow>,
 }
 
 struct PreparedSnapshot {
@@ -459,7 +506,7 @@ enum SnapshotPreparationError {
 fn prepare_snapshot(
     rows: Vec<SqliteRow>,
     expected_source_snapshot: SourceSnapshotFingerprint,
-    leaves_per_job: usize,
+    units_per_job: usize,
 ) -> Result<PreparedSnapshot, SnapshotPreparationError> {
     let snapshot = split_snapshot_rows(rows).map_err(SnapshotPreparationError::Invalid)?;
     let source_snapshot_fingerprint =
@@ -487,7 +534,7 @@ fn prepare_snapshot(
         active_owners: owner_states.active,
         terminology_json,
         placeholder_rules_json,
-        jobs: partition_rows(snapshot.leaves, leaves_per_job),
+        jobs: partition_rows(snapshot.units, units_per_job),
     })
 }
 
@@ -517,7 +564,7 @@ fn split_snapshot_rows(
         metadata: Vec::new(),
         owners: Vec::new(),
         resources: Vec::new(),
-        leaves: Vec::new(),
+        units: Vec::new(),
     };
     for row in rows {
         let values = row.into_values();
@@ -531,10 +578,10 @@ fn split_snapshot_rows(
             canonical_json,
             group_location,
             group_kind,
-            field_role,
-            original_text,
-            translation_context_json,
-            translation,
+            unit_role,
+            source_content_json,
+            source_context_json,
+            translation_content_json,
             translation_state,
         ]: [SqliteValue; 13] = values.try_into().map_err(|_| {
             InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
@@ -554,14 +601,14 @@ fn split_snapshot_rows(
             "2_resource" => snapshot
                 .resources
                 .push(SqliteRow::new(vec![resource_kind, canonical_json])),
-            "3_leaf" => snapshot.leaves.push(SqliteRow::new(vec![
+            "3_unit" => snapshot.units.push(SqliteRow::new(vec![
                 owner,
                 group_location,
                 group_kind,
-                field_role,
-                original_text,
-                translation_context_json,
-                translation,
+                unit_role,
+                source_content_json,
+                source_context_json,
+                translation_content_json,
                 translation_state,
             ])),
             unknown => {
@@ -714,40 +761,40 @@ fn decode_resources(
     Ok((terminology, placeholders))
 }
 
-fn partition_rows(rows: Vec<SqliteRow>, leaves_per_job: usize) -> Vec<Vec<SqliteRow>> {
+fn partition_rows(rows: Vec<SqliteRow>, units_per_job: usize) -> Vec<Vec<SqliteRow>> {
     let mut rows = rows.into_iter();
     std::iter::from_fn(|| {
-        let job = rows.by_ref().take(leaves_per_job).collect::<Vec<_>>();
+        let job = rows.by_ref().take(units_per_job).collect::<Vec<_>>();
         (!job.is_empty()).then_some(job)
     })
     .collect()
 }
 
 #[derive(Debug)]
-struct DecodedLeaf {
+struct DecodedUnit {
     owner: RpgMakerStandardAssetOwner,
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
-    role: TextFieldRole,
-    original_text: String,
-    translation_context_json: String,
-    translation: Option<String>,
+    role: TextUnitRole,
+    source_content: TextUnitContent,
+    source_context_json: String,
+    translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
 }
 
 fn decode_rows(
     rows: Vec<SqliteRow>,
     active_owners: &BTreeSet<&'static str>,
-) -> Result<Vec<DecodedLeaf>, InvalidStandardTranslationAssetSnapshot> {
+) -> Result<Vec<DecodedUnit>, InvalidStandardTranslationAssetSnapshot> {
     rows.into_iter()
-        .map(|row| decode_leaf(row, active_owners))
+        .map(|row| decode_unit(row, active_owners))
         .collect()
 }
 
-fn decode_leaf(
+fn decode_unit(
     row: SqliteRow,
     active_owners: &BTreeSet<&'static str>,
-) -> Result<DecodedLeaf, InvalidStandardTranslationAssetSnapshot> {
+) -> Result<DecodedUnit, InvalidStandardTranslationAssetSnapshot> {
     let values = row.into_values();
     if values.len() != 8 {
         return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
@@ -770,26 +817,49 @@ fn decode_leaf(
             .map_err(InvalidStandardTranslationAssetSnapshot::InvalidLocation)?;
     let kind = decode_group_kind(&required_text(next(&mut values), "group_kind")?)?;
     let role =
-        RpgMakerProjectionCodec::decode_role(&required_text(next(&mut values), "field_role")?)
+        RpgMakerProjectionCodec::decode_role(&required_text(next(&mut values), "unit_role")?)
             .map_err(InvalidStandardTranslationAssetSnapshot::InvalidRole)?;
     validate_role(&role, kind)?;
-    let original_text = required_text(next(&mut values), "original_text")?;
-    if original_text.trim().is_empty() {
-        return Err(InvalidStandardTranslationAssetSnapshot::BlankOriginalText);
+    let source_content_json = required_text(next(&mut values), "source_content_json")?;
+    let source_content: TextUnitContent = serde_json::from_str(&source_content_json)
+        .map_err(InvalidStandardTranslationAssetSnapshot::InvalidSourceContent)?;
+    if source_content.is_blank() {
+        return Err(InvalidStandardTranslationAssetSnapshot::BlankSourceContent);
     }
-    let translation_context_json = required_text(next(&mut values), "translation_context_json")?;
-    let context: serde_json::Value = serde_json::from_str(&translation_context_json)
-        .map_err(InvalidStandardTranslationAssetSnapshot::InvalidTranslationContext)?;
+    if role.expects_lines() != source_content.as_lines().is_some() {
+        return Err(
+            InvalidStandardTranslationAssetSnapshot::SourceContentShapeMismatch {
+                role: role.clone(),
+            },
+        );
+    }
+    let source_context_json = required_text(next(&mut values), "source_context_json")?;
+    let context: serde_json::Value = serde_json::from_str(&source_context_json)
+        .map_err(InvalidStandardTranslationAssetSnapshot::InvalidSourceContext)?;
     if !context.is_object() {
-        return Err(InvalidStandardTranslationAssetSnapshot::TranslationContextMustBeObject);
+        return Err(InvalidStandardTranslationAssetSnapshot::SourceContextMustBeObject);
     }
-    let translation = optional_text(next(&mut values), "translation")?;
+    let translation_content_json = optional_text(next(&mut values), "translation_content_json")?;
+    let translation = translation_content_json
+        .map(|translation| {
+            serde_json::from_str::<TextUnitContent>(&translation)
+                .map_err(InvalidStandardTranslationAssetSnapshot::InvalidTranslationContent)
+        })
+        .transpose()?;
+    if translation.as_ref().is_some_and(TextUnitContent::is_blank) {
+        return Err(InvalidStandardTranslationAssetSnapshot::BlankTranslationContent);
+    }
     if translation
-        .as_deref()
-        .is_some_and(|value| value.trim().is_empty())
+        .as_ref()
+        .is_some_and(|translation| translation.as_lines().is_some() != role.expects_lines())
     {
-        return Err(InvalidStandardTranslationAssetSnapshot::BlankTranslation);
+        return Err(
+            InvalidStandardTranslationAssetSnapshot::TranslationContentShapeMismatch {
+                role: role.clone(),
+            },
+        );
     }
+    validate_persisted_content(&role, &source_content, translation.as_ref())?;
     let translation_state = optional_blob(next(&mut values), "translation_state")?;
     let translation_state = match (translation.as_ref(), translation_state) {
         (None, None) => None,
@@ -800,16 +870,83 @@ fn decode_leaf(
         })?),
         _ => return Err(InvalidStandardTranslationAssetSnapshot::InvalidTranslationStatePair),
     };
-    Ok(DecodedLeaf {
+    Ok(DecodedUnit {
         owner,
         kind,
         group_location,
         role,
-        original_text,
-        translation_context_json,
+        source_content,
+        source_context_json,
         translation,
         translation_state,
     })
+}
+
+fn validate_persisted_content(
+    role: &TextUnitRole,
+    source: &TextUnitContent,
+    translation: Option<&TextUnitContent>,
+) -> Result<(), InvalidStandardTranslationAssetSnapshot> {
+    if let Some(lines) = source.as_lines() {
+        if let Some(index) = lines.iter().position(|line| contains_line_separator(line)) {
+            return Err(InvalidStandardTranslationAssetSnapshot::InvalidSourceLineText { index });
+        }
+    } else if matches!(role, TextUnitRole::DialogueSpeaker)
+        && source.as_value().is_some_and(contains_line_separator)
+    {
+        return Err(InvalidStandardTranslationAssetSnapshot::InvalidSourceLineText { index: 0 });
+    }
+
+    let Some(translation) = translation else {
+        return Ok(());
+    };
+    if let Some(lines) = translation.as_lines() {
+        if let Some(index) = lines.iter().position(|line| contains_line_separator(line)) {
+            return Err(
+                InvalidStandardTranslationAssetSnapshot::InvalidTranslationLineText { index },
+            );
+        }
+    } else if matches!(role, TextUnitRole::DialogueSpeaker)
+        && translation.as_value().is_some_and(contains_line_separator)
+    {
+        return Err(
+            InvalidStandardTranslationAssetSnapshot::InvalidTranslationLineText { index: 0 },
+        );
+    }
+
+    if matches!(role, TextUnitRole::Choices | TextUnitRole::ScrollingText) {
+        let source_lines = source.as_lines().expect("严格对齐角色的源内容形状已验证");
+        let translation_lines = translation
+            .as_lines()
+            .expect("严格对齐角色的译文内容形状已验证");
+        if source_lines.len() != translation_lines.len() {
+            return Err(
+                InvalidStandardTranslationAssetSnapshot::AlignedLineCountMismatch {
+                    expected: source_lines.len(),
+                    actual: translation_lines.len(),
+                },
+            );
+        }
+        if let Some(index) =
+            source_lines
+                .iter()
+                .zip(translation_lines)
+                .position(|(source, translation)| {
+                    source.trim().is_empty() != translation.trim().is_empty()
+                })
+        {
+            return Err(
+                InvalidStandardTranslationAssetSnapshot::AlignedBlankSlotMismatch { index },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn contains_line_separator(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| matches!(character, '\r' | '\n' | '\0'))
 }
 
 fn decode_group_kind(
@@ -831,15 +968,16 @@ fn decode_group_kind(
 }
 
 fn validate_role(
-    role: &TextFieldRole,
+    role: &TextUnitRole,
     kind: TextGroupKind,
 ) -> Result<(), InvalidStandardTranslationAssetSnapshot> {
     let valid = match role {
-        TextFieldRole::DialogueSpeaker | TextFieldRole::DialogueBody { .. } => {
+        TextUnitRole::DialogueSpeaker | TextUnitRole::DialogueBody => {
             kind == TextGroupKind::EventDialogue
         }
-        TextFieldRole::ScrollingTextBody { .. } => kind == TextGroupKind::EventScrollingText,
-        TextFieldRole::Scalar(_) => true,
+        TextUnitRole::Choices => kind == TextGroupKind::EventChoices,
+        TextUnitRole::ScrollingText => kind == TextGroupKind::EventScrollingText,
+        TextUnitRole::Scalar(_) => true,
     };
     if valid {
         Ok(())
@@ -854,43 +992,43 @@ fn validate_role(
 }
 
 fn assemble_corpus(
-    leaves: Vec<DecodedLeaf>,
+    units: Vec<DecodedUnit>,
 ) -> Result<Vec<StandardTranslationGroup>, InvalidStandardTranslationAssetSnapshot> {
     let mut seen = BTreeSet::new();
     let mut groups =
         BTreeMap::<(TextGroupKind, RpgMakerLocation), Vec<StandardTranslationAsset>>::new();
-    for leaf in leaves {
+    for unit in units {
         let key = (
-            leaf.owner.storage_name(),
-            leaf.group_location.clone(),
-            leaf.role.clone(),
+            unit.owner.storage_name(),
+            unit.group_location.clone(),
+            unit.role.clone(),
         );
         if !seen.insert(key) {
             return Err(
-                InvalidStandardTranslationAssetSnapshot::DuplicateLogicalLeaf {
-                    owner: leaf.owner,
-                    group_location: Box::new(leaf.group_location),
-                    role: leaf.role,
+                InvalidStandardTranslationAssetSnapshot::DuplicateLogicalUnit {
+                    owner: unit.owner,
+                    group_location: Box::new(unit.group_location),
+                    role: unit.role,
                 },
             );
         }
-        let kind = leaf.kind;
-        let group_location = leaf.group_location.clone();
-        let identity = TranslationLeafIdentity::new(
-            leaf.owner,
+        let kind = unit.kind;
+        let group_location = unit.group_location.clone();
+        let identity = TranslationUnitIdentity::new(
+            unit.owner,
             kind,
-            leaf.group_location,
-            leaf.role,
-            leaf.original_text,
-            leaf.translation_context_json,
+            unit.group_location,
+            unit.role,
+            unit.source_content,
+            unit.source_context_json,
         );
         groups
             .entry((kind, group_location))
             .or_default()
             .push(StandardTranslationAsset::new(
                 identity,
-                leaf.translation,
-                leaf.translation_state,
+                unit.translation,
+                unit.translation_state,
             ));
     }
     Ok(groups
@@ -982,7 +1120,7 @@ mod tests {
 
     use crate::execution::cpu::CpuTaskExecutionError;
     use crate::rpg_maker::ProjectName;
-    use crate::rpg_maker::model::TextFieldRole;
+    use crate::rpg_maker::model::TextUnitRole;
     use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource};
 
     use super::*;
@@ -1049,20 +1187,19 @@ mod tests {
     #[tokio::test]
     async fn unified_tables_preserve_role_order_context_and_asset_baseline() {
         let group = dialogue_group();
-        let speaker_role = RpgMakerProjectionCodec::encode_role(&TextFieldRole::DialogueSpeaker)
+        let speaker_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueSpeaker)
             .expect("角色应可编码");
-        let body_role =
-            RpgMakerProjectionCodec::encode_role(&TextFieldRole::DialogueBody { index: 0 })
-                .expect("角色应可编码");
+        let body_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueBody)
+            .expect("角色应可编码");
         let rows = snapshot_rows(vec![
-            leaf_row(
+            unit_row(
                 &group,
                 "event_dialogue",
                 &body_role,
-                "同一句",
+                r#"["同一句"]"#,
                 r#"{"source_speaker":"甲"}"#,
             ),
-            leaf_row(&group, "event_dialogue", &speaker_role, "甲", "{}"),
+            unit_row(&group, "event_dialogue", &speaker_role, r#""甲""#, "{}"),
         ]);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let service = RpgMakerStandardTranslationAssetReadingService::new(
@@ -1078,10 +1215,14 @@ mod tests {
 
         assert_eq!(corpus.groups().len(), 1);
         let assets = corpus.groups()[0].assets();
-        assert_eq!(assets[0].identity().role(), &TextFieldRole::DialogueSpeaker);
+        assert_eq!(assets[0].identity().role(), &TextUnitRole::DialogueSpeaker);
         assert_eq!(
-            assets[1].identity().translation_context_json(),
+            assets[1].identity().source_context_json(),
             r#"{"source_speaker":"甲"}"#
+        );
+        assert_eq!(
+            assets[1].identity().source_content(),
+            &TextUnitContent::Lines(vec!["同一句".to_owned()])
         );
         let (_, baseline) = corpus.into_parts();
         assert_eq!(baseline.owner_snapshots().len(), 1);
@@ -1090,25 +1231,56 @@ mod tests {
             AssetSnapshotFingerprint::from_bytes([0xb4; 32])
         );
         let calls = calls.lock().expect("查询锁");
-        assert!(calls[0].1.statement().contains("standard_text_leaf"));
+        assert!(calls[0].1.statement().contains("standard_text_unit"));
     }
 
     #[test]
     fn body_context_must_be_a_json_object() {
-        let role = RpgMakerProjectionCodec::encode_role(&TextFieldRole::DialogueBody { index: 0 })
+        let role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueBody)
             .expect("角色应可编码");
-        let error = decode_leaf(
-            leaf_payload_row(&dialogue_group(), "event_dialogue", &role, "正文", "[]"),
+        let error = decode_unit(
+            unit_payload_row(
+                &dialogue_group(),
+                "event_dialogue",
+                &role,
+                r#"["正文"]"#,
+                "[]",
+            ),
             &BTreeSet::from(["builtin"]),
         )
-        .expect_err("数组不能充当翻译上下文");
+        .expect_err("数组不能充当源上下文");
         assert!(matches!(
             error,
-            InvalidStandardTranslationAssetSnapshot::TranslationContextMustBeObject
+            InvalidStandardTranslationAssetSnapshot::SourceContextMustBeObject
         ));
     }
 
-    fn snapshot_rows(leaves: Vec<SqliteRow>) -> Vec<SqliteRow> {
+    #[test]
+    fn persisted_content_must_match_the_semantic_unit_shape() {
+        let body_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueBody)
+            .expect("角色应可编码");
+        let mut values = unit_payload_row(
+            &dialogue_group(),
+            "event_dialogue",
+            &body_role,
+            r#"["正文"]"#,
+            "{}",
+        )
+        .into_values();
+        values[6] = text(r#""错误形状""#);
+        values[7] = SqliteValue::Blob(vec![0x44; 32]);
+
+        let error = decode_unit(SqliteRow::new(values), &BTreeSet::from(["builtin"]))
+            .expect_err("正文译文必须保持 Lines 形状");
+        assert!(matches!(
+            error,
+            InvalidStandardTranslationAssetSnapshot::TranslationContentShapeMismatch {
+                role: TextUnitRole::DialogueBody
+            }
+        ));
+    }
+
+    fn snapshot_rows(units: Vec<SqliteRow>) -> Vec<SqliteRow> {
         let mut rows = vec![
             snapshot_row(
                 "0_metadata",
@@ -1147,19 +1319,19 @@ mod tests {
                 null_tail(),
             ),
         ];
-        rows.extend(leaves);
+        rows.extend(units);
         rows
     }
 
-    fn leaf_row(
+    fn unit_row(
         group: &RpgMakerLocation,
         kind: &str,
         role: &str,
-        original: &str,
+        source_content_json: &str,
         context: &str,
     ) -> SqliteRow {
         snapshot_row(
-            "3_leaf",
+            "3_unit",
             text("builtin"),
             SqliteValue::Null,
             SqliteValue::Null,
@@ -1169,7 +1341,7 @@ mod tests {
                 text(RpgMakerLocationCodec::encode(group).expect("位置应可编码")),
                 text(kind),
                 text(role),
-                text(original),
+                text(source_content_json),
                 text(context),
                 SqliteValue::Null,
                 SqliteValue::Null,
@@ -1177,11 +1349,11 @@ mod tests {
         )
     }
 
-    fn leaf_payload_row(
+    fn unit_payload_row(
         group: &RpgMakerLocation,
         kind: &str,
         role: &str,
-        original: &str,
+        source_content_json: &str,
         context: &str,
     ) -> SqliteRow {
         SqliteRow::new(vec![
@@ -1189,7 +1361,7 @@ mod tests {
             text(RpgMakerLocationCodec::encode(group).expect("位置应可编码")),
             text(kind),
             text(role),
-            text(original),
+            text(source_content_json),
             text(context),
             SqliteValue::Null,
             SqliteValue::Null,

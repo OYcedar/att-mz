@@ -24,7 +24,7 @@ use crate::language::{LanguageAnalysis, LanguagePair};
 use crate::llm::{ChatMessage, LlmUsage};
 use crate::observability::OperationId;
 use crate::rpg_maker::audit::{AuditEvent, AuditLedger, TranslationTaskAuditResult};
-use crate::rpg_maker::model::{LogicalTextLocation, TextFieldRole};
+use crate::rpg_maker::model::{LogicalTextLocation, TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
 use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
@@ -85,33 +85,33 @@ where
     }
 }
 
-/// 一个叶子的持久化身份与读取时的原文事实。
+/// 一个语义翻译单元的持久化身份与读取时的原文事实。
 ///
 /// Store 在写入时可以用原文事实防止把旧计划提交到已变化的资产上。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct TranslationLeafIdentity {
+pub(crate) struct TranslationUnitIdentity {
     owner: RpgMakerStandardAssetOwner,
     kind: TextGroupKind,
     logical_location: LogicalTextLocation,
-    original_text: String,
-    translation_context_json: String,
+    source_content: TextUnitContent,
+    source_context_json: String,
 }
 
-impl TranslationLeafIdentity {
+impl TranslationUnitIdentity {
     pub(crate) fn new(
         owner: RpgMakerStandardAssetOwner,
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
-        role: TextFieldRole,
-        original_text: impl Into<String>,
-        translation_context_json: impl Into<String>,
+        role: TextUnitRole,
+        source_content: TextUnitContent,
+        source_context_json: impl Into<String>,
     ) -> Self {
         Self {
             owner,
             kind,
             logical_location: LogicalTextLocation::new(group_location, role),
-            original_text: original_text.into(),
-            translation_context_json: translation_context_json.into(),
+            source_content,
+            source_context_json: source_context_json.into(),
         }
     }
 
@@ -119,23 +119,22 @@ impl TranslationLeafIdentity {
         self.owner
     }
 
-    /// 返回逻辑叶所属的领域组种类。
+    /// 返回语义单元所属的领域组种类。
     pub(crate) const fn kind(&self) -> TextGroupKind {
         self.kind
     }
 
-    pub(crate) fn role(&self) -> &TextFieldRole {
+    pub(crate) fn role(&self) -> &TextUnitRole {
         self.logical_location.role()
     }
 
     pub(crate) fn role_label(&self) -> String {
         match self.role() {
-            TextFieldRole::Scalar(key) => key.as_str().to_owned(),
-            TextFieldRole::DialogueSpeaker => "speaker".to_owned(),
-            TextFieldRole::DialogueBody { index } => format!("body[{index}]"),
-            TextFieldRole::ScrollingTextBody { index } => {
-                format!("scrolling_body[{index}]")
-            }
+            TextUnitRole::Scalar(key) => key.as_str().to_owned(),
+            TextUnitRole::DialogueSpeaker => "speaker".to_owned(),
+            TextUnitRole::DialogueBody => "body".to_owned(),
+            TextUnitRole::Choices => "choices".to_owned(),
+            TextUnitRole::ScrollingText => "scrolling_text".to_owned(),
         }
     }
 
@@ -149,12 +148,12 @@ impl TranslationLeafIdentity {
         &self.logical_location
     }
 
-    pub(crate) fn original_text(&self) -> &str {
-        &self.original_text
+    pub(crate) fn source_content(&self) -> &TextUnitContent {
+        &self.source_content
     }
 
-    pub(crate) fn translation_context_json(&self) -> &str {
-        &self.translation_context_json
+    pub(crate) fn source_context_json(&self) -> &str {
+        &self.source_context_json
     }
 }
 
@@ -182,18 +181,18 @@ impl TerminologyDependency {
     }
 }
 
-/// 从标准资产表读出的一个叶子。
+/// 从标准资产表读出的一个语义单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StandardTranslationAsset {
-    identity: TranslationLeafIdentity,
-    translation: Option<String>,
+    identity: TranslationUnitIdentity,
+    translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
 }
 
 impl StandardTranslationAsset {
     pub(crate) fn new(
-        identity: TranslationLeafIdentity,
-        translation: Option<String>,
+        identity: TranslationUnitIdentity,
+        translation: Option<TextUnitContent>,
         translation_state: Option<Sha256Fingerprint>,
     ) -> Self {
         Self {
@@ -203,15 +202,15 @@ impl StandardTranslationAsset {
         }
     }
 
-    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
-        TranslationLeafIdentity,
-        Option<String>,
+        TranslationUnitIdentity,
+        Option<TextUnitContent>,
         Option<Sha256Fingerprint>,
     ) {
         (self.identity, self.translation, self.translation_state)
@@ -384,8 +383,8 @@ impl StandardTranslationCorpus {
 /// 术语差异或译文失效规则。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationInvalidation {
-    identity: TranslationLeafIdentity,
-    expected_translation: String,
+    identity: TranslationUnitIdentity,
+    expected_translation: TextUnitContent,
     expected_translation_state: Sha256Fingerprint,
 }
 
@@ -395,29 +394,29 @@ pub(crate) struct TranslationInvalidation {
 /// 已被并发修改的旧事实扩散到其他位置。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationReuseSeed {
-    identity: TranslationLeafIdentity,
-    expected_translation: String,
+    identity: TranslationUnitIdentity,
+    expected_translation: TextUnitContent,
     expected_translation_state: Sha256Fingerprint,
 }
 
 impl TranslationReuseSeed {
     pub(crate) fn new(
-        identity: TranslationLeafIdentity,
-        expected_translation: impl Into<String>,
+        identity: TranslationUnitIdentity,
+        expected_translation: TextUnitContent,
         expected_translation_state: Sha256Fingerprint,
     ) -> Self {
         Self {
             identity,
-            expected_translation: expected_translation.into(),
+            expected_translation,
             expected_translation_state,
         }
     }
 
-    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
-    pub(crate) fn expected_translation(&self) -> &str {
+    pub(crate) fn expected_translation(&self) -> &TextUnitContent {
         &self.expected_translation
     }
 
@@ -429,16 +428,16 @@ impl TranslationReuseSeed {
 /// 一个将被现有译文覆盖的目标及其读取时状态。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationReuseTarget {
-    identity: TranslationLeafIdentity,
-    expected_translation: Option<String>,
+    identity: TranslationUnitIdentity,
+    expected_translation: Option<TextUnitContent>,
     expected_translation_state: Option<Sha256Fingerprint>,
     replacement_translation_state: Sha256Fingerprint,
 }
 
 impl TranslationReuseTarget {
     pub(crate) fn new(
-        identity: TranslationLeafIdentity,
-        expected_translation: Option<String>,
+        identity: TranslationUnitIdentity,
+        expected_translation: Option<TextUnitContent>,
         expected_translation_state: Option<Sha256Fingerprint>,
         replacement_translation_state: Sha256Fingerprint,
     ) -> Self {
@@ -450,12 +449,12 @@ impl TranslationReuseTarget {
         }
     }
 
-    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
-    pub(crate) fn expected_translation(&self) -> Option<&str> {
-        self.expected_translation.as_deref()
+    pub(crate) fn expected_translation(&self) -> Option<&TextUnitContent> {
+        self.expected_translation.as_ref()
     }
 
     pub(crate) const fn expected_translation_state(&self) -> Option<Sha256Fingerprint> {
@@ -490,22 +489,22 @@ impl TranslationReuse {
 
 impl TranslationInvalidation {
     pub(crate) fn new(
-        identity: TranslationLeafIdentity,
-        expected_translation: impl Into<String>,
+        identity: TranslationUnitIdentity,
+        expected_translation: TextUnitContent,
         expected_translation_state: Sha256Fingerprint,
     ) -> Self {
         Self {
             identity,
-            expected_translation: expected_translation.into(),
+            expected_translation,
             expected_translation_state,
         }
     }
 
-    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
-    pub(crate) fn expected_translation(&self) -> &str {
+    pub(crate) fn expected_translation(&self) -> &TextUnitContent {
         &self.expected_translation
     }
 
@@ -514,7 +513,7 @@ impl TranslationInvalidation {
     }
 }
 
-/// 标准翻译计划准备阶段的逐叶对账计数。
+/// 标准翻译计划准备阶段的逐单元对账计数。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationPlanPreparationCounts {
     retained: usize,
@@ -620,13 +619,6 @@ impl TranslationPlanPreparation {
         self.reuses.iter().map(|reuse| reuse.targets().len()).sum()
     }
 
-    pub(crate) fn requires_storage_changes(&self) -> bool {
-        !self.invalidations.is_empty()
-            || !self.reuses.is_empty()
-            || self.terminology_json != self.snapshot_baseline.terminology_json()
-            || self.placeholder_rules_json != self.snapshot_baseline.placeholder_rules_json()
-    }
-
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -685,7 +677,7 @@ pub(crate) enum PlaceholderSegment {
     End,
 }
 
-/// Planner 为某个活跃叶子建立的一条占位符反查事实。
+/// Planner 为某个活跃语义单元建立的一条占位符反查事实。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct AppliedPlaceholder {
     token: String,
@@ -741,7 +733,7 @@ impl AppliedPlaceholder {
     }
 }
 
-/// 一个叶子除最终译文以外的全部当前翻译语义。
+/// 一个语义单元除最终译文以外的全部当前翻译语义。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationStateContext(Sha256Fingerprint);
 
@@ -750,25 +742,37 @@ impl TranslationStateContext {
         Self(fingerprint)
     }
 
-    pub(crate) fn finish(self, translation: &str) -> Sha256Fingerprint {
-        let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-state");
-        hasher
-            .frame(1, self.0.as_bytes())
-            .frame(2, translation.as_bytes());
+    pub(crate) fn finish(self, translation: &TextUnitContent) -> Sha256Fingerprint {
+        let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-unit-state");
+        hasher.frame(1, self.0.as_bytes());
+        match translation {
+            TextUnitContent::Value(value) => {
+                hasher.frame(2, b"value").frame(3, value.as_bytes());
+            }
+            TextUnitContent::Lines(lines) => {
+                let line_count = u64::try_from(lines.len())
+                    .expect("译文行数必须能表示为 u64")
+                    .to_le_bytes();
+                hasher.frame(2, b"lines").frame(3, &line_count);
+                for line in lines {
+                    hasher.frame(4, line.as_bytes());
+                }
+            }
+        }
         hasher.finish()
     }
 }
 
-/// 去重传播目标以及该逻辑叶子的独立语义上下文。
+/// 去重传播目标以及该语义单元的独立语义上下文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationPropagationTarget {
-    identity: TranslationLeafIdentity,
+    identity: TranslationUnitIdentity,
     state_context: TranslationStateContext,
 }
 
 impl TranslationPropagationTarget {
     pub(crate) const fn new(
-        identity: TranslationLeafIdentity,
+        identity: TranslationUnitIdentity,
         state_context: TranslationStateContext,
     ) -> Self {
         Self {
@@ -777,7 +781,7 @@ impl TranslationPropagationTarget {
         }
     }
 
-    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
@@ -793,143 +797,56 @@ pub(crate) enum TranslationVirtualReason {
     NonSourceLanguage,
     FullyProtected,
     Duplicate {
-        leader: Box<TranslationLeafIdentity>,
+        leader: Box<TranslationUnitIdentity>,
     },
     Reused {
-        seed: Box<TranslationLeafIdentity>,
+        seed: Box<TranslationUnitIdentity>,
+        translation: TextUnitContent,
     },
-}
-
-/// TaskBlock 单元是需要模型返回结果的活跃原文，或只提供上下文的虚原文。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationTaskUnitMode {
-    Active { id: usize },
-    Virtual { reason: TranslationVirtualReason },
-}
-
-/// TaskBlock 中按 RPG Maker 语义顺序排列的一个原文单元。
-///
-/// 虚原文只保留原文上下文且不要求模型返回结果；活跃原文持有从 0 开始连续的 ID。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationTaskUnit {
-    field_name: String,
-    identity: TranslationLeafIdentity,
-    protected_text: String,
-    applied_placeholders: Vec<AppliedPlaceholder>,
-    mode: TranslationTaskUnitMode,
-}
-
-impl TranslationTaskUnit {
-    pub(crate) fn new(
-        field_name: impl Into<String>,
-        identity: TranslationLeafIdentity,
-        protected_text: impl Into<String>,
-        applied_placeholders: Vec<AppliedPlaceholder>,
-        mode: TranslationTaskUnitMode,
-    ) -> Self {
-        Self {
-            field_name: field_name.into(),
-            identity,
-            protected_text: protected_text.into(),
-            applied_placeholders,
-            mode,
-        }
-    }
-
-    pub(crate) fn active(
-        field_name: impl Into<String>,
-        identity: TranslationLeafIdentity,
-        protected_text: impl Into<String>,
-        applied_placeholders: Vec<AppliedPlaceholder>,
-        id: usize,
-    ) -> Self {
-        Self::new(
-            field_name,
-            identity,
-            protected_text,
-            applied_placeholders,
-            TranslationTaskUnitMode::Active { id },
-        )
-    }
-
-    pub(crate) fn virtual_context(
-        field_name: impl Into<String>,
-        identity: TranslationLeafIdentity,
-        protected_text: impl Into<String>,
-        applied_placeholders: Vec<AppliedPlaceholder>,
-        reason: TranslationVirtualReason,
-    ) -> Self {
-        Self::new(
-            field_name,
-            identity,
-            protected_text,
-            applied_placeholders,
-            TranslationTaskUnitMode::Virtual { reason },
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
-        &self.identity
-    }
-
-    #[cfg(test)]
-    pub(crate) fn protected_text(&self) -> &str {
-        &self.protected_text
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn mode(&self) -> &TranslationTaskUnitMode {
-        &self.mode
-    }
-}
-
-/// 一个任务块中的不可拆复合组。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationTaskGroup {
-    kind: TextGroupKind,
-    group_location: RpgMakerLocation,
-    units: Vec<TranslationTaskUnit>,
-}
-
-impl TranslationTaskGroup {
-    pub(crate) fn new(
-        kind: TextGroupKind,
-        group_location: RpgMakerLocation,
-        units: Vec<TranslationTaskUnit>,
-    ) -> Self {
-        Self {
-            kind,
-            group_location,
-            units,
-        }
-    }
-
-    pub(crate) const fn kind(&self) -> TextGroupKind {
-        self.kind
-    }
-
-    #[cfg(test)]
-    pub(crate) fn group_location(&self) -> &RpgMakerLocation {
-        &self.group_location
-    }
-
-    #[cfg(test)]
-    pub(crate) fn units(&self) -> &[TranslationTaskUnit] {
-        &self.units
-    }
 }
 
 /// 需要 Executor 返回的一个活跃翻译单元。
 ///
 /// 虚原文没有 ID，因此不会出现在该集合中。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExpectedLineShape {
+    /// 模型可以按译文语义返回任意非空行序列。
+    Reflow,
+    /// 模型必须返回精确数量的独立行。
+    Aligned(NonZeroUsize),
+}
+
+/// Executor 验收一个模型 ID 所需的全部 Planner 事实。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExpectedTranslationValidation {
+    line_shape: ExpectedLineShape,
+    protected_text: String,
+    applied_placeholders: Vec<AppliedPlaceholder>,
+    language_analysis: LanguageAnalysis,
+}
+
+impl ExpectedTranslationValidation {
+    pub(crate) fn new(
+        line_shape: ExpectedLineShape,
+        protected_text: impl Into<String>,
+        applied_placeholders: Vec<AppliedPlaceholder>,
+        language_analysis: LanguageAnalysis,
+    ) -> Self {
+        Self {
+            line_shape,
+            protected_text: protected_text.into(),
+            applied_placeholders,
+            language_analysis,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExpectedTranslationOutput {
     id: usize,
-    identity: TranslationLeafIdentity,
-    propagation_targets: Vec<TranslationLeafIdentity>,
-    applied_placeholders: Vec<AppliedPlaceholder>,
-    language_analysis: LanguageAnalysis,
+    identity: TranslationUnitIdentity,
+    propagation_targets: Vec<TranslationUnitIdentity>,
+    validation: ExpectedTranslationValidation,
     state_context: TranslationStateContext,
     propagation_state_contexts: Vec<TranslationStateContext>,
 }
@@ -937,19 +854,23 @@ pub(crate) struct ExpectedTranslationOutput {
 impl ExpectedTranslationOutput {
     pub(crate) fn new(
         id: usize,
-        identity: TranslationLeafIdentity,
-        propagation_targets: Vec<TranslationLeafIdentity>,
-        applied_placeholders: Vec<AppliedPlaceholder>,
-        language_analysis: LanguageAnalysis,
+        identity: TranslationUnitIdentity,
+        propagation_targets: Vec<TranslationUnitIdentity>,
+        validation: ExpectedTranslationValidation,
         state_context: TranslationStateContext,
         propagation_state_contexts: Vec<TranslationStateContext>,
     ) -> Self {
+        assert!(id > 0, "模型输出 ID 必须是正整数");
+        assert_eq!(
+            propagation_targets.len(),
+            propagation_state_contexts.len(),
+            "每个传播目标必须具有对应的独立状态上下文"
+        );
         Self {
             id,
             identity,
             propagation_targets,
-            applied_placeholders,
-            language_analysis,
+            validation,
             state_context,
             propagation_state_contexts,
         }
@@ -959,21 +880,29 @@ impl ExpectedTranslationOutput {
         self.id
     }
 
-    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+    pub(crate) const fn line_shape(&self) -> ExpectedLineShape {
+        self.validation.line_shape
+    }
+
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
-    pub(crate) fn propagation_targets(&self) -> &[TranslationLeafIdentity] {
+    pub(crate) fn propagation_targets(&self) -> &[TranslationUnitIdentity] {
         &self.propagation_targets
     }
 
+    pub(crate) fn protected_text(&self) -> &str {
+        &self.validation.protected_text
+    }
+
     pub(crate) fn applied_placeholders(&self) -> &[AppliedPlaceholder] {
-        &self.applied_placeholders
+        &self.validation.applied_placeholders
     }
 
     /// 返回 Planner 针对代表原文建立、供译后处理使用的唯一语言事实。
     pub(crate) fn language_analysis(&self) -> &LanguageAnalysis {
-        &self.language_analysis
+        &self.validation.language_analysis
     }
 
     pub(crate) const fn state_context(&self) -> TranslationStateContext {
@@ -985,13 +914,11 @@ impl ExpectedTranslationOutput {
     }
 }
 
-/// 一个已完成语义切块、虚原文组装、术语注入和占位符保护的任务块。
+/// 一个已经完成语义切块并生成最终最小消息的任务块。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationTaskBlock {
     index: StandardTranslationTaskIndex,
     language_pair: LanguagePair,
-    groups: Vec<TranslationTaskGroup>,
-    injected_terminology: Vec<TerminologyDependency>,
     messages: Vec<ChatMessage>,
     expected_outputs: Vec<ExpectedTranslationOutput>,
 }
@@ -1000,16 +927,19 @@ impl TranslationTaskBlock {
     pub(crate) fn new(
         index: StandardTranslationTaskIndex,
         language_pair: LanguagePair,
-        groups: Vec<TranslationTaskGroup>,
-        injected_terminology: Vec<TerminologyDependency>,
         messages: Vec<ChatMessage>,
         expected_outputs: Vec<ExpectedTranslationOutput>,
     ) -> Self {
+        assert!(
+            expected_outputs
+                .iter()
+                .enumerate()
+                .all(|(index, output)| output.id() == index + 1),
+            "任务内模型输出 ID 必须从 1 连续编号"
+        );
         Self {
             index,
             language_pair,
-            groups,
-            injected_terminology,
             messages,
             expected_outputs,
         }
@@ -1021,16 +951,6 @@ impl TranslationTaskBlock {
 
     pub(crate) fn language_pair(&self) -> &LanguagePair {
         &self.language_pair
-    }
-
-    #[cfg(test)]
-    pub(crate) fn groups(&self) -> &[TranslationTaskGroup] {
-        &self.groups
-    }
-
-    #[cfg(test)]
-    pub(crate) fn injected_terminology(&self) -> &[TerminologyDependency] {
-        &self.injected_terminology
     }
 
     pub(crate) fn messages(&self) -> &[ChatMessage] {
@@ -1074,31 +994,31 @@ impl StandardTranslationPlan {
     }
 }
 
-/// 经过 Executor 完整验收并可直接写入的一个叶子译文。
+/// 经过 Executor 完整验收并可直接写入的一个语义单元译文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationPatch {
-    identity: TranslationLeafIdentity,
+    identity: TranslationUnitIdentity,
     propagation_targets: Vec<TranslationPropagationTarget>,
-    translation: String,
+    translation: TextUnitContent,
     translation_state: Sha256Fingerprint,
 }
 
 impl TranslationPatch {
     pub(crate) fn new(
-        identity: TranslationLeafIdentity,
+        identity: TranslationUnitIdentity,
         propagation_targets: Vec<TranslationPropagationTarget>,
-        translation: impl Into<String>,
+        translation: TextUnitContent,
         translation_state: Sha256Fingerprint,
     ) -> Self {
         Self {
             identity,
             propagation_targets,
-            translation: translation.into(),
+            translation,
             translation_state,
         }
     }
 
-    pub(crate) fn identity(&self) -> &TranslationLeafIdentity {
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
@@ -1106,7 +1026,7 @@ impl TranslationPatch {
         &self.propagation_targets
     }
 
-    pub(crate) fn translation(&self) -> &str {
+    pub(crate) fn translation(&self) -> &TextUnitContent {
         &self.translation
     }
 
@@ -1140,7 +1060,7 @@ impl AcceptedTranslationDecision {
     }
 
     #[cfg(test)]
-    pub(crate) fn translation(&self) -> &str {
+    pub(crate) fn translation(&self) -> &TextUnitContent {
         self.patch.translation()
     }
 
@@ -1177,31 +1097,51 @@ impl ValidatedTranslationTaskResult {
 pub(crate) enum TranslationUnitRejectionReason {
     Missing,
     Duplicate,
-    InvalidShape { message: String },
+    InvalidShape {
+        message: String,
+    },
+    LineCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidLineText {
+        line_index: usize,
+    },
+    BlankLineMismatch {
+        line_index: usize,
+        expected_blank: bool,
+    },
     BlankTranslation,
-    InvalidSpeakerText,
     NoNaturalLanguageText,
     ContainsByteOrderMark,
-    PlaceholderMismatch { token: String },
-    UnexpectedPlaceholderToken { token: String },
-    PlaceholderNormalizationAmbiguous { original: String },
-    SourceResidual { fragment: String },
+    PlaceholderMismatch {
+        token: String,
+    },
+    UnexpectedPlaceholderToken {
+        token: String,
+    },
+    PlaceholderNormalizationAmbiguous {
+        original: String,
+    },
+    SourceResidual {
+        fragment: String,
+    },
 }
 
 /// 一个仍需在后续 CLI 运行中重新翻译的预期单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UnresolvedTranslationUnit {
     id: usize,
-    identity: TranslationLeafIdentity,
-    propagation_targets: Vec<TranslationLeafIdentity>,
+    identity: TranslationUnitIdentity,
+    propagation_targets: Vec<TranslationUnitIdentity>,
     reason: TranslationUnitRejectionReason,
 }
 
 impl UnresolvedTranslationUnit {
     pub(crate) fn new(
         id: usize,
-        identity: TranslationLeafIdentity,
-        propagation_targets: Vec<TranslationLeafIdentity>,
+        identity: TranslationUnitIdentity,
+        propagation_targets: Vec<TranslationUnitIdentity>,
         reason: TranslationUnitRejectionReason,
     ) -> Self {
         Self {
@@ -1232,6 +1172,7 @@ impl UnresolvedTranslationUnit {
 pub(crate) enum TranslationProtocolDiagnostic {
     NonStopFinish { reason: String },
     InvalidResponse { message: String },
+    InvalidId { item_index: usize },
     UnknownId { item_index: usize, id: usize },
 }
 
@@ -1836,8 +1777,8 @@ pub(crate) trait StandardTranslationAssetReader: Send + Sync {
 ///
 /// Planner 必须先在最大仍有关联的 RPG Maker 结构范围内组织复合 Group，再按外部 Profile
 /// 提供的容量切割；不得为了填满容量拼接无关范围。每个 TaskBlock 内待翻译单元的
-/// ID 从 0 连续递增，虚原文只保留原文且没有 ID。省略外部资源时复用项目当前快照；
-/// 显式资源在全部解析成功后成为新快照。Planner 按每个叶子实际触发的术语和占位符
+/// ID 从 1 连续递增，虚原文只保留原文且没有 ID。省略外部资源时复用项目当前快照；
+/// 显式资源在全部解析成功后成为新快照。Planner 按每个语义单元实际触发的术语和占位符
 /// 语义对账，并把资源更新、失效清理与可复用传播一并写入 Preparation。
 pub(crate) trait StandardTranslationTaskPlanner: Send + Sync {
     type Profile: StandardTranslationProfile;
@@ -1877,7 +1818,7 @@ pub(crate) trait StandardTranslationResultStore: Send + Sync {
 
     /// 在任何 LLM 请求前原子应用一次 Planner 建立的准备。
     ///
-    /// 对每个受影响叶子同时清除译文及旧语义状态，并用预期原文阻止过时计划写入；
+    /// 对每个受影响语义单元同时清除译文及旧语义状态，并用预期原文阻止过时计划写入；
     /// 未列出的译文保持不变。
     fn apply_preparation(
         &self,
@@ -2788,7 +2729,7 @@ mod tests {
     use crate::llm::ChatMessageRole;
     use crate::observability::{EventId, OperationId};
     use crate::rpg_maker::ProjectName;
-    use crate::rpg_maker::model::{ScalarFieldKey, TextFieldRole};
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource, StandardDataFile};
     use uuid::Uuid;
@@ -2812,28 +2753,19 @@ mod tests {
     }
 
     #[test]
-    fn task_block_keeps_prompt_context_and_internal_post_processing_facts_separate() {
+    fn task_block_keeps_only_the_execution_contract() {
         let group_location = RpgMakerLocation::value(
             RpgMakerSource::data(StandardDataFile::Items),
             vec![RpgMakerLocationStep::index(10)],
         );
-        let name_identity = TranslationLeafIdentity::new(
+        let description_identity = TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group_location.clone(),
-            TextFieldRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            "宝剑",
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
+            TextUnitContent::Value("装备后提升 \\N[1] 的攻击力".to_owned()),
             "{}",
         );
-        let description_identity = TranslationLeafIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
-            TextGroupKind::DatabaseEntry,
-            group_location.clone(),
-            TextFieldRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
-            "装备后提升 \\N[1] 的攻击力",
-            "{}",
-        );
-        let terminology = TerminologyDependency::new("攻击力", "Attack");
         let placeholder = AppliedPlaceholder::new(
             "<att:actor-name:0>",
             "\\N[1]",
@@ -2845,37 +2777,20 @@ mod tests {
         let block = TranslationTaskBlock::new(
             StandardTranslationTaskIndex::new(4),
             test_language_pair(),
-            vec![TranslationTaskGroup::new(
-                TextGroupKind::DatabaseEntry,
-                group_location.clone(),
-                vec![
-                    TranslationTaskUnit::virtual_context(
-                        "name",
-                        name_identity.clone(),
-                        "宝剑",
-                        Vec::new(),
-                        TranslationVirtualReason::ExistingTranslation,
-                    ),
-                    TranslationTaskUnit::active(
-                        "description",
-                        description_identity.clone(),
-                        "装备后提升 <att:actor-name:0> 的攻击力",
-                        vec![placeholder.clone()],
-                        0,
-                    ),
-                ],
-            )],
-            vec![terminology.clone()],
             vec![
                 ChatMessage::new(ChatMessageRole::System, "# Translation contract"),
                 ChatMessage::new(ChatMessageRole::User, "# Content\n\n..."),
             ],
             vec![ExpectedTranslationOutput::new(
-                0,
+                1,
                 description_identity,
                 Vec::new(),
-                vec![placeholder],
-                test_language_analysis(),
+                ExpectedTranslationValidation::new(
+                    ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                    "装备后提升 <att:actor-name:0> 的攻击力",
+                    vec![placeholder],
+                    test_language_analysis(),
+                ),
                 test_state_context(1),
                 Vec::new(),
             )],
@@ -2884,22 +2799,6 @@ mod tests {
         assert_eq!(block.index(), StandardTranslationTaskIndex::new(4));
         assert_eq!(block.language_pair().source().as_str(), "ja");
         assert_eq!(block.language_pair().target().as_str(), "zh-Hans");
-        assert_eq!(block.groups()[0].group_location(), &group_location);
-        assert!(matches!(
-            block.groups()[0].units()[0].mode(),
-            TranslationTaskUnitMode::Virtual {
-                reason: TranslationVirtualReason::ExistingTranslation
-            }
-        ));
-        assert_eq!(block.groups()[0].units()[0].identity(), &name_identity);
-        assert_eq!(
-            block.groups()[0].units()[1].mode(),
-            &TranslationTaskUnitMode::Active { id: 0 }
-        );
-        assert_eq!(
-            block.groups()[0].units()[1].protected_text(),
-            "装备后提升 <att:actor-name:0> 的攻击力"
-        );
         assert_eq!(
             block.expected_outputs()[0].identity().kind(),
             TextGroupKind::DatabaseEntry
@@ -2908,9 +2807,12 @@ mod tests {
             block.expected_outputs()[0].identity().group_location(),
             &group_location
         );
-        assert_eq!(block.injected_terminology()[0].term(), "攻击力");
         assert_eq!(block.messages().len(), 2);
-        assert_eq!(block.expected_outputs()[0].id(), 0);
+        assert_eq!(block.expected_outputs()[0].id(), 1);
+        assert_eq!(
+            block.expected_outputs()[0].line_shape(),
+            ExpectedLineShape::Aligned(NonZeroUsize::MIN)
+        );
         assert_eq!(
             block.expected_outputs()[0].applied_placeholders()[0].scope(),
             "rpg_maker.event.control_character.actor_name"
@@ -2919,6 +2821,17 @@ mod tests {
             block.expected_outputs()[0].applied_placeholders()[0].original(),
             "\\N[1]"
         );
+    }
+
+    #[test]
+    fn translation_state_preserves_content_kind_and_line_boundaries() {
+        let context = test_state_context(7);
+        let value = TextUnitContent::Value("甲\n乙".to_owned());
+        let two_lines = TextUnitContent::Lines(vec!["甲".to_owned(), "乙".to_owned()]);
+        let one_line = TextUnitContent::Lines(vec!["甲乙".to_owned()]);
+
+        assert_ne!(context.finish(&value), context.finish(&two_lines));
+        assert_ne!(context.finish(&two_lines), context.finish(&one_line));
     }
 
     #[derive(Clone, Copy)]
@@ -3011,14 +2924,12 @@ mod tests {
             let tasks: Vec<TranslationTaskBlock> = (0..self.task_count)
                 .map(|index| {
                     let expected_outputs = vec![
-                        expected_output(index, 0, true),
-                        expected_output(index, 1, false),
+                        expected_output(index, 1, true),
+                        expected_output(index, 2, false),
                     ];
                     TranslationTaskBlock::new(
                         StandardTranslationTaskIndex::new(index),
                         test_language_pair(),
-                        Vec::new(),
-                        Vec::new(),
                         vec![ChatMessage::new(
                             ChatMessageRole::User,
                             format!("# Task {index}"),
@@ -4235,7 +4146,7 @@ mod tests {
         let preparation = TranslationPlanPreparation::new(
             vec![TranslationInvalidation::new(
                 translation_identity(),
-                "旧译文",
+                TextUnitContent::Value("旧译文".to_owned()),
                 Sha256Fingerprint::from_bytes([0x44; 32]),
             )],
             Vec::new(),
@@ -4324,10 +4235,10 @@ mod tests {
         let partial = completed[0];
         assert!(matches!(partial, TranslationTaskLogRecord::Partial { .. }));
         assert_eq!(partial.accepted_decisions(), 1);
-        assert_eq!(partial.accepted()[0].id(), 0);
+        assert_eq!(partial.accepted()[0].id(), 1);
         assert_eq!(
             partial.accepted()[0].leader(),
-            expected_output(0, 0, true).identity().logical_location()
+            expected_output(0, 1, true).identity().logical_location()
         );
         assert_eq!(partial.accepted()[0].propagation_targets().len(), 1);
         assert!(matches!(
@@ -4499,8 +4410,12 @@ mod tests {
             id,
             identity,
             propagation_targets,
-            Vec::new(),
-            test_language_analysis(),
+            ExpectedTranslationValidation::new(
+                ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                "宝剑",
+                Vec::new(),
+                test_language_analysis(),
+            ),
             test_state_context((task_index * 10 + id) as u8),
             with_propagation_target
                 .then(|| test_state_context((100 + task_index * 10 + id) as u8))
@@ -4527,7 +4442,7 @@ mod tests {
         kind: FakeOutcomeKind,
     ) -> TranslationTaskOutcome {
         let patch = |output: &ExpectedTranslationOutput| {
-            let translation = format!("译文 {}", output.id());
+            let translation = TextUnitContent::Value(format!("译文 {}", output.id()));
             let propagation_targets = output
                 .propagation_targets()
                 .iter()
@@ -4628,21 +4543,21 @@ mod tests {
         NonEmptyTaskItems::new(first, items.collect())
     }
 
-    fn translation_identity() -> TranslationLeafIdentity {
+    fn translation_identity() -> TranslationUnitIdentity {
         translation_identity_at(10, "name")
     }
 
-    fn translation_identity_at(index: usize, field_name: &str) -> TranslationLeafIdentity {
+    fn translation_identity_at(index: usize, field_name: &str) -> TranslationUnitIdentity {
         let group_location = RpgMakerLocation::value(
             RpgMakerSource::data(StandardDataFile::Items),
             vec![RpgMakerLocationStep::index(index)],
         );
-        TranslationLeafIdentity::new(
+        TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group_location,
-            TextFieldRole::Scalar(ScalarFieldKey::new(field_name).expect("字段键应合法")),
-            "宝剑",
+            TextUnitRole::Scalar(ScalarFieldKey::new(field_name).expect("字段键应合法")),
+            TextUnitContent::Value("宝剑".to_owned()),
             "{}",
         )
     }

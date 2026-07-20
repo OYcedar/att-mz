@@ -40,7 +40,9 @@ HTTP 200 后只严格要求实际消费的核心：
 
 因此 `provider_request_id` 与 `provider_response_id` 都是可选值，互不补位；审计写 `null`，Lua 返回 `nil`。`final_response_usage` 只表示最终成功 HTTP 响应可用的 usage，不声称覆盖失败尝试或完整计费。
 
-这里的宽松只针对第三方供应商 HTTP 信封。`message.content` 内由模型生成的 RPG Maker 翻译正文仍执行完整顶层数组、强类型元素、ID、ATT token、语言和逐 ID 内容验收，二者不得混为一层。
+这里的宽松只针对第三方供应商 HTTP 信封。`message.content` 内由模型生成的 RPG Maker
+翻译正文仍执行完整的 ID 到字符串数组对象、权威行形状、ATT token、语言和逐 ID 内容
+验收，二者不得混为一层。
 
 ## 4. 失败分类
 

@@ -14,7 +14,7 @@ use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
 };
-use crate::rpg_maker::model::TextFieldRole;
+use crate::rpg_maker::model::TextUnitRole;
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{
     AssetSnapshotFingerprint, MV_DIALOGUE_RULES_DEFINITION_KIND,
@@ -33,9 +33,9 @@ use super::{
 };
 
 const DROP_STAGING_GROUP: &str = "DROP TABLE IF EXISTS temp.rpg_maker_staging_group";
-const DROP_STAGING_LEAF: &str = "DROP TABLE IF EXISTS temp.rpg_maker_staging_leaf";
+const DROP_STAGING_UNIT: &str = "DROP TABLE IF EXISTS temp.rpg_maker_staging_unit";
 const DROP_STAGING_TARGET: &str = "DROP TABLE IF EXISTS temp.rpg_maker_staging_target";
-const DROP_PREVIOUS_LEAF: &str = "DROP TABLE IF EXISTS temp.rpg_maker_previous_leaf";
+const DROP_PREVIOUS_UNIT: &str = "DROP TABLE IF EXISTS temp.rpg_maker_previous_unit";
 
 const CREATE_STAGING_GROUP: &str = r#"CREATE TEMP TABLE rpg_maker_staging_group (
     owner                  TEXT NOT NULL,
@@ -45,15 +45,15 @@ const CREATE_STAGING_GROUP: &str = r#"CREATE TEMP TABLE rpg_maker_staging_group 
     PRIMARY KEY (owner, group_location)
 )"#;
 
-const CREATE_STAGING_LEAF: &str = r#"CREATE TEMP TABLE rpg_maker_staging_leaf (
+const CREATE_STAGING_UNIT: &str = r#"CREATE TEMP TABLE rpg_maker_staging_unit (
     owner                    TEXT NOT NULL,
     group_location           TEXT NOT NULL,
-    field_role               TEXT NOT NULL,
-    original_text            TEXT NOT NULL,
-    translation_context_json TEXT NOT NULL,
-    translation              TEXT,
+    unit_role                TEXT NOT NULL,
+    source_content_json      TEXT NOT NULL,
+    source_context_json      TEXT NOT NULL,
+    translation_content_json TEXT,
     translation_state        BLOB,
-    PRIMARY KEY (owner, group_location, field_role)
+    PRIMARY KEY (owner, group_location, unit_role)
 )"#;
 
 const CREATE_STAGING_TARGET: &str = r#"CREATE TEMP TABLE rpg_maker_staging_target (
@@ -62,26 +62,26 @@ const CREATE_STAGING_TARGET: &str = r#"CREATE TEMP TABLE rpg_maker_staging_targe
     group_location   TEXT NOT NULL
 )"#;
 
-const CREATE_PREVIOUS_LEAF: &str = r#"CREATE TEMP TABLE rpg_maker_previous_leaf AS
+const CREATE_PREVIOUS_UNIT: &str = r#"CREATE TEMP TABLE rpg_maker_previous_unit AS
 SELECT group_location,
-       field_role,
-       original_text,
-       translation_context_json,
-       translation,
+       unit_role,
+       source_content_json,
+       source_context_json,
+       translation_content_json,
        translation_state
-FROM standard_text_leaf
+FROM standard_text_unit
 WHERE owner = ?"#;
 
 const INSERT_STAGING_GROUP: &str = r#"INSERT INTO rpg_maker_staging_group (
     owner, group_location, group_kind, projection_recipe_json
 ) VALUES (?, ?, ?, ?)"#;
 
-const INSERT_STAGING_LEAF: &str = r#"INSERT INTO rpg_maker_staging_leaf (
+const INSERT_STAGING_UNIT: &str = r#"INSERT INTO rpg_maker_staging_unit (
     owner,
     group_location,
-    field_role,
-    original_text,
-    translation_context_json
+    unit_role,
+    source_content_json,
+    source_context_json
 ) VALUES (?, ?, ?, ?, ?)"#;
 
 const INSERT_STAGING_TARGET: &str = r#"INSERT INTO rpg_maker_staging_target (
@@ -95,19 +95,19 @@ JOIN standard_text_target AS current
 WHERE current.owner <> staged.owner
 LIMIT 1"#;
 
-const INHERIT_TRANSLATIONS: &str = r#"UPDATE rpg_maker_staging_leaf
-SET (translation, translation_state) = (
-    SELECT previous.translation, previous.translation_state
-    FROM rpg_maker_previous_leaf AS previous
-    WHERE previous.group_location = rpg_maker_staging_leaf.group_location
-      AND previous.field_role = rpg_maker_staging_leaf.field_role
-      AND previous.original_text = rpg_maker_staging_leaf.original_text
-      AND previous.translation_context_json = rpg_maker_staging_leaf.translation_context_json
+const INHERIT_TRANSLATIONS: &str = r#"UPDATE rpg_maker_staging_unit
+SET (translation_content_json, translation_state) = (
+    SELECT previous.translation_content_json, previous.translation_state
+    FROM rpg_maker_previous_unit AS previous
+    WHERE previous.group_location = rpg_maker_staging_unit.group_location
+      AND previous.unit_role = rpg_maker_staging_unit.unit_role
+      AND previous.source_content_json = rpg_maker_staging_unit.source_content_json
+      AND previous.source_context_json = rpg_maker_staging_unit.source_context_json
     LIMIT 1
 )"#;
 
 const DELETE_OWNER_TARGETS: &str = "DELETE FROM standard_text_target WHERE owner = ?";
-const DELETE_OWNER_LEAVES: &str = "DELETE FROM standard_text_leaf WHERE owner = ?";
+const DELETE_OWNER_UNITS: &str = "DELETE FROM standard_text_unit WHERE owner = ?";
 const DELETE_OWNER_GROUPS: &str = "DELETE FROM standard_text_group WHERE owner = ?";
 
 const UPSERT_OWNER_STATE: &str = r#"INSERT INTO standard_asset_owner_state (
@@ -124,24 +124,24 @@ SELECT owner, group_location, group_kind, projection_recipe_json
 FROM rpg_maker_staging_group
 ORDER BY group_location"#;
 
-const INSERT_LEAVES: &str = r#"INSERT INTO standard_text_leaf (
+const INSERT_UNITS: &str = r#"INSERT INTO standard_text_unit (
     owner,
     group_location,
-    field_role,
-    original_text,
-    translation_context_json,
-    translation,
+    unit_role,
+    source_content_json,
+    source_context_json,
+    translation_content_json,
     translation_state
 )
 SELECT owner,
        group_location,
-       field_role,
-       original_text,
-       translation_context_json,
-       translation,
+       unit_role,
+       source_content_json,
+       source_context_json,
+       translation_content_json,
        translation_state
-FROM rpg_maker_staging_leaf
-ORDER BY group_location, field_role"#;
+FROM rpg_maker_staging_unit
+ORDER BY group_location, unit_role"#;
 
 const INSERT_TARGETS: &str = r#"INSERT INTO standard_text_target (
     mutation_target, owner, group_location
@@ -174,14 +174,14 @@ FROM standard_text_group
 WHERE owner = ?
 ORDER BY group_location"#;
 
-const READ_OWNER_LEAVES: &str = r#"SELECT
+const READ_OWNER_UNITS: &str = r#"SELECT
     group_location,
-    field_role,
-    original_text,
-    translation_context_json
-FROM standard_text_leaf
+    unit_role,
+    source_content_json,
+    source_context_json
+FROM standard_text_unit
 WHERE owner = ?
-ORDER BY group_location, field_role"#;
+ORDER BY group_location, unit_role"#;
 
 const READ_OWNER_TARGETS: &str = r#"SELECT
     mutation_target,
@@ -392,14 +392,14 @@ where
                 vec![
                     SqliteQuery::new(READ_OWNER_STATE, vec![text(owner.storage_name())]),
                     SqliteQuery::new(READ_OWNER_GROUPS, vec![text(owner.storage_name())]),
-                    SqliteQuery::new(READ_OWNER_LEAVES, vec![text(owner.storage_name())]),
+                    SqliteQuery::new(READ_OWNER_UNITS, vec![text(owner.storage_name())]),
                     SqliteQuery::new(READ_OWNER_TARGETS, vec![text(owner.storage_name())]),
                 ],
             )
             .await
             .map_err(|error| map_query_error(database_path, error))?;
         let actual = query_results.len();
-        let [owner_state, groups, leaves, targets] = query_results.try_into().map_err(|_| {
+        let [owner_state, groups, units, targets] = query_results.try_into().map_err(|_| {
             RpgMakerExtractionAssetStoreError::UnexpectedSnapshotQueryResultCount {
                 expected: 4,
                 actual,
@@ -408,7 +408,7 @@ where
         Ok(StoredSnapshotRows {
             owner_state,
             groups,
-            leaves,
+            units,
             targets,
         })
     }
@@ -691,7 +691,8 @@ impl Error for StoredProjectDefinitionError {
 pub(crate) enum EncodeAssetSnapshotError {
     Location(RpgMakerLocationCodecError),
     Projection(RpgMakerProjectionCodecError),
-    TranslationContext(serde_json::Error),
+    SourceContent(serde_json::Error),
+    SourceContext(serde_json::Error),
     DuplicateGroupLocation { group_location: String },
 }
 
@@ -700,7 +701,8 @@ impl fmt::Display for EncodeAssetSnapshotError {
         match self {
             Self::Location(source) => write!(formatter, "位置编码失败：{source}"),
             Self::Projection(source) => write!(formatter, "文本投影编码失败：{source}"),
-            Self::TranslationContext(source) => write!(formatter, "翻译上下文编码失败：{source}"),
+            Self::SourceContent(source) => write!(formatter, "源内容编码失败：{source}"),
+            Self::SourceContext(source) => write!(formatter, "源上下文编码失败：{source}"),
             Self::DuplicateGroupLocation { group_location } => {
                 write!(
                     formatter,
@@ -716,7 +718,7 @@ impl Error for EncodeAssetSnapshotError {
         match self {
             Self::Location(source) => Some(source),
             Self::Projection(source) => Some(source),
-            Self::TranslationContext(source) => Some(source),
+            Self::SourceContent(source) | Self::SourceContext(source) => Some(source),
             Self::DuplicateGroupLocation { .. } => None,
         }
     }
@@ -725,7 +727,7 @@ impl Error for EncodeAssetSnapshotError {
 #[derive(Default)]
 struct EncodedBatch {
     groups: Vec<EncodedGroup>,
-    leaves: Vec<EncodedLeaf>,
+    units: Vec<EncodedUnit>,
     targets: Vec<EncodedTarget>,
 }
 
@@ -752,7 +754,7 @@ struct EncodedSnapshot {
     #[cfg(test)]
     owner: RpgMakerStandardAssetOwner,
     groups: Vec<EncodedGroup>,
-    leaves: Vec<EncodedLeaf>,
+    units: Vec<EncodedUnit>,
     targets: Vec<EncodedTarget>,
     fingerprint: AssetSnapshotFingerprint,
 }
@@ -761,7 +763,7 @@ struct EncodedSnapshot {
 struct StoredSnapshotRows {
     owner_state: Vec<SqliteRow>,
     groups: Vec<SqliteRow>,
-    leaves: Vec<SqliteRow>,
+    units: Vec<SqliteRow>,
     targets: Vec<SqliteRow>,
 }
 
@@ -772,18 +774,18 @@ impl EncodedSnapshot {
         project_definition_json: Option<&str>,
     ) -> Result<Self, EncodeAssetSnapshotError> {
         let mut groups = Vec::new();
-        let mut leaves = Vec::new();
+        let mut units = Vec::new();
         let mut targets = Vec::new();
         for batch in batches {
             groups.extend(batch.groups);
-            leaves.extend(batch.leaves);
+            units.extend(batch.units);
             targets.extend(batch.targets);
         }
         groups.sort_by(|left, right| left.group_location.cmp(&right.group_location));
-        leaves.sort_by(|left, right| {
+        units.sort_by(|left, right| {
             left.group_location
                 .cmp(&right.group_location)
-                .then_with(|| left.field_role.cmp(&right.field_role))
+                .then_with(|| left.unit_role.cmp(&right.unit_role))
         });
         targets.sort_by(|left, right| left.mutation_target.cmp(&right.mutation_target));
 
@@ -797,12 +799,12 @@ impl EncodedSnapshot {
         }
 
         let fingerprint =
-            asset_snapshot_fingerprint(owner, project_definition_json, &groups, &leaves, &targets);
+            asset_snapshot_fingerprint(owner, project_definition_json, &groups, &units, &targets);
         Ok(Self {
             #[cfg(test)]
             owner,
             groups,
-            leaves,
+            units,
             targets,
             fingerprint,
         })
@@ -816,7 +818,7 @@ impl EncodedSnapshot {
         let StoredSnapshotRows {
             owner_state,
             groups,
-            leaves,
+            units,
             targets,
         } = rows;
         if !owner_state_matches(
@@ -836,9 +838,9 @@ impl EncodedSnapshot {
             return false;
         }
 
-        let mut rows = leaves.into_iter();
-        for leaf in &self.leaves {
-            if !stored_leaf_row_matches(rows.next(), leaf) {
+        let mut rows = units.into_iter();
+        for unit in &self.units {
+            if !stored_unit_row_matches(rows.next(), unit) {
                 return false;
             }
         }
@@ -890,7 +892,7 @@ fn stored_group_row_matches(row: Option<SqliteRow>, expected: &EncodedGroup) -> 
     )
 }
 
-fn stored_leaf_row_matches(row: Option<SqliteRow>, expected: &EncodedLeaf) -> bool {
+fn stored_unit_row_matches(row: Option<SqliteRow>, expected: &EncodedUnit) -> bool {
     let Some(row) = row else {
         return false;
     };
@@ -898,13 +900,13 @@ fn stored_leaf_row_matches(row: Option<SqliteRow>, expected: &EncodedLeaf) -> bo
         row.values(),
         [
             SqliteValue::Text(group_location),
-            SqliteValue::Text(field_role),
-            SqliteValue::Text(original_text),
-            SqliteValue::Text(translation_context_json),
+            SqliteValue::Text(unit_role),
+            SqliteValue::Text(source_content_json),
+            SqliteValue::Text(source_context_json),
         ] if group_location == &expected.group_location
-            && field_role == &expected.field_role
-            && original_text == &expected.original_text
-            && translation_context_json == &expected.translation_context_json
+            && unit_role == &expected.unit_role
+            && source_content_json == &expected.source_content_json
+            && source_context_json == &expected.source_context_json
     )
 }
 
@@ -926,11 +928,11 @@ struct EncodedGroup {
     projection_recipe_json: String,
 }
 
-struct EncodedLeaf {
+struct EncodedUnit {
     group_location: String,
-    field_role: String,
-    original_text: String,
-    translation_context_json: String,
+    unit_role: String,
+    source_content_json: String,
+    source_context_json: String,
 }
 
 struct EncodedTarget {
@@ -939,7 +941,7 @@ struct EncodedTarget {
 }
 
 #[derive(Serialize)]
-struct DialogueBodyTranslationContext<'a> {
+struct DialogueBodySourceContext<'a> {
     source_speaker: &'a str,
 }
 
@@ -964,30 +966,30 @@ fn encode_batch(groups: Vec<ExtractedTextGroup>) -> Result<EncodedBatch, EncodeA
         let group_location = RpgMakerLocationCodec::encode(group.group_location())
             .map_err(EncodeAssetSnapshotError::Location)?;
         let source_speaker = group
-            .fields()
+            .units()
             .iter()
-            .find(|field| field.role() == &TextFieldRole::DialogueSpeaker)
-            .map(|field| field.original_text());
+            .find(|unit| unit.role() == &TextUnitRole::DialogueSpeaker)
+            .and_then(|unit| unit.source_content().as_value());
         let dialogue_context = source_speaker
             .map(|source_speaker| {
-                serde_json::to_string(&DialogueBodyTranslationContext { source_speaker })
-                    .map_err(EncodeAssetSnapshotError::TranslationContext)
+                serde_json::to_string(&DialogueBodySourceContext { source_speaker })
+                    .map_err(EncodeAssetSnapshotError::SourceContext)
             })
             .transpose()?;
 
-        for field in group.fields() {
-            let translation_context_json =
-                if matches!(field.role(), TextFieldRole::DialogueBody { .. }) {
-                    dialogue_context.as_deref().unwrap_or("{}")
-                } else {
-                    "{}"
-                };
-            encoded.leaves.push(EncodedLeaf {
+        for unit in group.units() {
+            let source_context_json = if matches!(unit.role(), TextUnitRole::DialogueBody) {
+                dialogue_context.as_deref().unwrap_or("{}")
+            } else {
+                "{}"
+            };
+            encoded.units.push(EncodedUnit {
                 group_location: group_location.clone(),
-                field_role: RpgMakerProjectionCodec::encode_role(field.role())
+                unit_role: RpgMakerProjectionCodec::encode_role(unit.role())
                     .map_err(EncodeAssetSnapshotError::Projection)?,
-                original_text: field.original_text().to_owned(),
-                translation_context_json: translation_context_json.to_owned(),
+                source_content_json: serde_json::to_string(unit.source_content())
+                    .map_err(EncodeAssetSnapshotError::SourceContent)?,
+                source_context_json: source_context_json.to_owned(),
             });
         }
 
@@ -1026,7 +1028,7 @@ fn asset_snapshot_fingerprint(
     owner: RpgMakerStandardAssetOwner,
     project_definition_json: Option<&str>,
     groups: &[EncodedGroup],
-    leaves: &[EncodedLeaf],
+    units: &[EncodedUnit],
     targets: &[EncodedTarget],
 ) -> AssetSnapshotFingerprint {
     let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.standard_text_snapshot");
@@ -1043,13 +1045,13 @@ fn asset_snapshot_fingerprint(
             .frame(4, group.group_kind.as_bytes())
             .frame(5, group.projection_recipe_json.as_bytes());
     }
-    for leaf in leaves {
+    for unit in units {
         hasher
-            .frame(6, b"leaf")
-            .frame(7, leaf.group_location.as_bytes())
-            .frame(8, leaf.field_role.as_bytes())
-            .frame(9, leaf.original_text.as_bytes())
-            .frame(10, leaf.translation_context_json.as_bytes());
+            .frame(6, b"unit")
+            .frame(7, unit.group_location.as_bytes())
+            .frame(8, unit.unit_role.as_bytes())
+            .frame(9, unit.source_content_json.as_bytes())
+            .frame(10, unit.source_context_json.as_bytes());
     }
     for target in targets {
         hasher
@@ -1068,7 +1070,7 @@ fn build_transaction_plan(
 ) -> SqliteTransactionPlan {
     let EncodedSnapshot {
         groups,
-        leaves,
+        units,
         targets,
         fingerprint,
         ..
@@ -1076,17 +1078,17 @@ fn build_transaction_plan(
     let mut steps = Vec::new();
     for statement in [
         DROP_STAGING_GROUP,
-        DROP_STAGING_LEAF,
+        DROP_STAGING_UNIT,
         DROP_STAGING_TARGET,
-        DROP_PREVIOUS_LEAF,
+        DROP_PREVIOUS_UNIT,
         CREATE_STAGING_GROUP,
-        CREATE_STAGING_LEAF,
+        CREATE_STAGING_UNIT,
         CREATE_STAGING_TARGET,
     ] {
         steps.push(execute(statement, Vec::new()));
     }
     steps.push(execute(
-        CREATE_PREVIOUS_LEAF,
+        CREATE_PREVIOUS_UNIT,
         vec![text(owner.storage_name())],
     ));
 
@@ -1106,18 +1108,18 @@ fn build_transaction_plan(
                 .collect(),
         )));
     }
-    if !leaves.is_empty() {
+    if !units.is_empty() {
         steps.push(SqliteTransactionStep::ExecuteMany(SqliteBatch::new(
-            INSERT_STAGING_LEAF,
-            leaves
+            INSERT_STAGING_UNIT,
+            units
                 .into_iter()
-                .map(|leaf| {
+                .map(|unit| {
                     vec![
                         text(owner.storage_name()),
-                        text(leaf.group_location),
-                        text(leaf.field_role),
-                        text(leaf.original_text),
-                        text(leaf.translation_context_json),
+                        text(unit.group_location),
+                        text(unit.unit_role),
+                        text(unit.source_content_json),
+                        text(unit.source_context_json),
                     ]
                 })
                 .collect(),
@@ -1155,7 +1157,7 @@ fn build_transaction_plan(
     steps.push(execute(INHERIT_TRANSLATIONS, Vec::new()));
     for statement in [
         DELETE_OWNER_TARGETS,
-        DELETE_OWNER_LEAVES,
+        DELETE_OWNER_UNITS,
         DELETE_OWNER_GROUPS,
     ] {
         steps.push(execute(statement, vec![text(owner.storage_name())]));
@@ -1168,14 +1170,14 @@ fn build_transaction_plan(
             SqliteValue::Blob(fingerprint.as_bytes().to_vec()),
         ],
     ));
-    for statement in [INSERT_GROUPS, INSERT_LEAVES, INSERT_TARGETS] {
+    for statement in [INSERT_GROUPS, INSERT_UNITS, INSERT_TARGETS] {
         steps.push(execute(statement, Vec::new()));
     }
     for statement in [
         DROP_STAGING_GROUP,
-        DROP_STAGING_LEAF,
+        DROP_STAGING_UNIT,
         DROP_STAGING_TARGET,
-        DROP_PREVIOUS_LEAF,
+        DROP_PREVIOUS_UNIT,
     ] {
         steps.push(execute(statement, Vec::new()));
     }
@@ -1292,10 +1294,11 @@ mod tests {
 
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::extract::model::{
-        ExtractedTextField, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
+        ExtractedTextUnit, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
     };
     use crate::rpg_maker::model::{
-        DirectTextPart, DirectTextRecipe, ScalarFieldKey, TextProjectionRecipe,
+        DirectTextPart, DirectTextRecipe, ScalarFieldKey, TextProjectionRecipe, TextUnitContent,
+        TextUnitRole,
     };
     use crate::rpg_maker::project::test_layout_profile;
     use crate::rpg_maker::text::StandardDataFile;
@@ -1404,7 +1407,7 @@ mod tests {
             let snapshot = self.snapshot_rows.lock().expect("当前快照锁不应中毒");
             match query.statement() {
                 READ_OWNER_GROUPS => Ok(snapshot.groups.clone()),
-                READ_OWNER_LEAVES => Ok(snapshot.leaves.clone()),
+                READ_OWNER_UNITS => Ok(snapshot.units.clone()),
                 READ_OWNER_TARGETS => Ok(snapshot.targets.clone()),
                 statement => panic!("收到未预期的查询：{statement}"),
             }
@@ -1556,7 +1559,7 @@ mod tests {
         let encoded = encode_batch(vec![group]).expect("对话快照应可编码");
 
         assert_eq!(encoded.groups.len(), 1);
-        assert_eq!(encoded.leaves.len(), 2);
+        assert_eq!(encoded.units.len(), 2);
         assert_eq!(encoded.targets.len(), 2);
         assert_eq!(encoded.groups[0].group_kind, "event_dialogue");
         RpgMakerProjectionCodec::decode_recipes(&encoded.groups[0].projection_recipe_json)
@@ -1565,36 +1568,35 @@ mod tests {
             RpgMakerProjectionCodec::decode_target(&target.mutation_target)
                 .expect("修改目标必须是可逆的内部 canonical JSON");
         }
-        for leaf in &encoded.leaves {
-            RpgMakerProjectionCodec::decode_role(&leaf.field_role)
+        for unit in &encoded.units {
+            RpgMakerProjectionCodec::decode_role(&unit.unit_role)
                 .expect("角色必须是可逆的内部 canonical JSON");
         }
 
         let body = encoded
-            .leaves
+            .units
             .iter()
-            .find(|leaf| {
-                RpgMakerProjectionCodec::decode_role(&leaf.field_role)
-                    .is_ok_and(|role| role == TextFieldRole::DialogueBody { index: 0 })
+            .find(|unit| {
+                RpgMakerProjectionCodec::decode_role(&unit.unit_role)
+                    .is_ok_and(|role| role == TextUnitRole::DialogueBody)
             })
-            .expect("应存在正文叶");
-        assert_eq!(
-            body.translation_context_json,
-            r#"{"source_speaker":"角色"}"#
-        );
+            .expect("应存在正文单元");
+        assert_eq!(body.source_content_json, r#"["第一句"]"#);
+        assert_eq!(body.source_context_json, r#"{"source_speaker":"角色"}"#);
         let speaker = encoded
-            .leaves
+            .units
             .iter()
-            .find(|leaf| {
-                RpgMakerProjectionCodec::decode_role(&leaf.field_role)
-                    .is_ok_and(|role| role == TextFieldRole::DialogueSpeaker)
+            .find(|unit| {
+                RpgMakerProjectionCodec::decode_role(&unit.unit_role)
+                    .is_ok_and(|role| role == TextUnitRole::DialogueSpeaker)
             })
-            .expect("应存在 Speaker 叶");
-        assert_eq!(speaker.translation_context_json, "{}");
+            .expect("应存在 Speaker 单元");
+        assert_eq!(speaker.source_content_json, r#""角色""#);
+        assert_eq!(speaker.source_context_json, "{}");
     }
 
     #[test]
-    fn asset_fingerprint_covers_owner_groups_leaves_context_recipes_and_targets() {
+    fn asset_fingerprint_covers_owner_groups_units_context_recipes_and_targets() {
         let base = snapshot_fingerprint(
             RpgMakerStandardAssetOwner::Builtin,
             projected_group("<a>", "</a>"),
@@ -1662,9 +1664,9 @@ mod tests {
     #[test]
     fn translation_inheritance_uses_logical_identity_text_and_context_only() {
         assert!(INHERIT_TRANSLATIONS.contains("previous.group_location"));
-        assert!(INHERIT_TRANSLATIONS.contains("previous.field_role"));
-        assert!(INHERIT_TRANSLATIONS.contains("previous.original_text"));
-        assert!(INHERIT_TRANSLATIONS.contains("previous.translation_context_json"));
+        assert!(INHERIT_TRANSLATIONS.contains("previous.unit_role"));
+        assert!(INHERIT_TRANSLATIONS.contains("previous.source_content_json"));
+        assert!(INHERIT_TRANSLATIONS.contains("previous.source_context_json"));
         assert!(!INHERIT_TRANSLATIONS.contains("projection_recipe_json"));
         assert!(!INHERIT_TRANSLATIONS.contains("mutation_target"));
     }
@@ -1688,7 +1690,7 @@ mod tests {
 
         let mut connection = Connection::open_in_memory().expect("应创建内存数据库");
         create_current_schema(&connection);
-        seed_snapshot(&connection, &old, "译文", &[0x44; 32]);
+        seed_snapshot(&connection, &old, r#""译文""#, &[0x44; 32]);
         execute_plan(
             &mut connection,
             build_transaction_plan(owner, [0xa5; 32], new, None),
@@ -1697,12 +1699,12 @@ mod tests {
 
         let (translation, state): (String, Vec<u8>) = connection
             .query_row(
-                "SELECT translation, translation_state FROM standard_text_leaf",
+                "SELECT translation_content_json, translation_state FROM standard_text_unit",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("继承后的叶应存在");
-        assert_eq!(translation, "译文");
+            .expect("继承后的单元应存在");
+        assert_eq!(translation, r#""译文""#);
         assert_eq!(state, vec![0x44; 32]);
         let recipe: String = connection
             .query_row(
@@ -1744,7 +1746,7 @@ mod tests {
         assert_eq!(plans.len(), 1);
         let statements = plan_statements(&plans[0].1).join("\n");
         assert!(statements.contains("standard_text_group"));
-        assert!(statements.contains("standard_text_leaf"));
+        assert!(statements.contains("standard_text_unit"));
         assert!(statements.contains("standard_text_target"));
     }
 
@@ -1894,7 +1896,7 @@ mod tests {
                 READ_PROJECT_DEFINITION.to_owned(),
                 READ_OWNER_STATE.to_owned(),
                 READ_OWNER_GROUPS.to_owned(),
-                READ_OWNER_LEAVES.to_owned(),
+                READ_OWNER_UNITS.to_owned(),
                 READ_OWNER_TARGETS.to_owned(),
             ]
         );
@@ -1957,7 +1959,7 @@ mod tests {
                 READ_OWNER_STATE.to_owned(),
                 READ_OWNER_STATE.to_owned(),
                 READ_OWNER_GROUPS.to_owned(),
-                READ_OWNER_LEAVES.to_owned(),
+                READ_OWNER_UNITS.to_owned(),
                 READ_OWNER_TARGETS.to_owned(),
             ]
         );
@@ -2008,7 +2010,7 @@ mod tests {
                 READ_OWNER_STATE.to_owned(),
                 READ_OWNER_STATE.to_owned(),
                 READ_OWNER_GROUPS.to_owned(),
-                READ_OWNER_LEAVES.to_owned(),
+                READ_OWNER_UNITS.to_owned(),
                 READ_OWNER_TARGETS.to_owned(),
             ]
         );
@@ -2228,9 +2230,9 @@ mod tests {
         }
         for column in 0..4 {
             let mut damaged = current.clone();
-            let mut values = damaged.leaves[0].values().to_vec();
+            let mut values = damaged.units[0].values().to_vec();
             values[column] = SqliteValue::Null;
-            damaged.leaves[0] = SqliteRow::new(values);
+            damaged.units[0] = SqliteRow::new(values);
             assert!(!snapshot.matches_rows(damaged, &[0xa5; 32]));
         }
         for column in 0..2 {
@@ -2248,7 +2250,7 @@ mod tests {
                     missing.groups.pop();
                 }
                 1 => {
-                    missing.leaves.pop();
+                    missing.units.pop();
                 }
                 2 => {
                     missing.targets.pop();
@@ -2260,7 +2262,7 @@ mod tests {
             let mut extra = current.clone();
             match table {
                 0 => extra.groups.push(current.groups[0].clone()),
-                1 => extra.leaves.push(current.leaves[0].clone()),
+                1 => extra.units.push(current.units[0].clone()),
                 2 => extra.targets.push(current.targets[0].clone()),
                 _ => unreachable!("测试表编号固定为 0..3"),
             }
@@ -2276,7 +2278,7 @@ mod tests {
         for query in [
             READ_OWNER_STATE,
             READ_OWNER_GROUPS,
-            READ_OWNER_LEAVES,
+            READ_OWNER_UNITS,
             READ_OWNER_TARGETS,
         ] {
             let explain = format!("EXPLAIN QUERY PLAN {query}");
@@ -2313,7 +2315,7 @@ mod tests {
         .fingerprint
     }
 
-    fn scalar_group(index: usize, field_name: &str, original_text: &str) -> ExtractedTextGroup {
+    fn scalar_group(index: usize, field_name: &str, source_text: &str) -> ExtractedTextGroup {
         let source = RpgMakerSource::data(StandardDataFile::Items);
         let group_location =
             RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(index)]);
@@ -2328,7 +2330,7 @@ mod tests {
             TextGroupKind::DatabaseEntry,
             group_location,
             vec![
-                ExtractedTextField::new(field_name, physical_location, original_text)
+                ExtractedTextUnit::new(field_name, physical_location, source_text)
                     .expect("标量字段应合法"),
             ],
         )
@@ -2346,9 +2348,13 @@ mod tests {
                 RpgMakerLocationStep::key("note"),
             ],
         );
-        let role = TextFieldRole::Scalar(ScalarFieldKey::new("match[0]").expect("角色应合法"));
-        let field = ExtractedTextField::projected(role.clone(), target.clone(), "原文")
-            .expect("投影叶应合法");
+        let role = TextUnitRole::Scalar(ScalarFieldKey::new("match[0]").expect("角色应合法"));
+        let unit = ExtractedTextUnit::projected(
+            role.clone(),
+            target.clone(),
+            TextUnitContent::Value("原文".to_owned()),
+        )
+        .expect("投影单元应合法");
         let recipe = TextProjectionRecipe::Direct(
             DirectTextRecipe::new(
                 target,
@@ -2364,7 +2370,7 @@ mod tests {
         ExtractedTextGroup::projected(
             TextGroupKind::DatabaseEntry,
             group_location,
-            vec![field],
+            vec![unit],
             vec![recipe],
         )
         .expect("投影组应合法")
@@ -2400,14 +2406,42 @@ mod tests {
                 RpgMakerLocationStep::index(0),
             ],
         );
-        ExtractedTextGroup::new(
+        let speaker_unit = ExtractedTextUnit::projected(
+            TextUnitRole::DialogueSpeaker,
+            speaker_location.clone(),
+            TextUnitContent::Value(speaker.to_owned()),
+        )
+        .expect("Speaker 单元应合法");
+        let body_unit = ExtractedTextUnit::projected(
+            TextUnitRole::DialogueBody,
+            body_location.clone(),
+            TextUnitContent::Lines(vec![body.to_owned()]),
+        )
+        .expect("正文单元应合法");
+        let speaker_recipe = DirectTextRecipe::new(
+            speaker_location,
+            speaker,
+            vec![DirectTextPart::TextSlot {
+                role: TextUnitRole::DialogueSpeaker,
+            }],
+        )
+        .map(TextProjectionRecipe::Direct)
+        .expect("Speaker 配方应合法");
+        let body_recipe = DirectTextRecipe::new(
+            body_location,
+            body,
+            vec![DirectTextPart::LineSlot {
+                role: TextUnitRole::DialogueBody,
+                source_line_index: 0,
+            }],
+        )
+        .map(TextProjectionRecipe::Direct)
+        .expect("正文配方应合法");
+        ExtractedTextGroup::projected(
             TextGroupKind::EventDialogue,
             group_location,
-            vec![
-                ExtractedTextField::new("speaker", speaker_location, speaker)
-                    .expect("Speaker 应合法"),
-                ExtractedTextField::new("body[0]", body_location, body).expect("Body 应合法"),
-            ],
+            vec![speaker_unit, body_unit],
+            vec![speaker_recipe, body_recipe],
         )
         .expect("对话组应合法")
     }
@@ -2449,15 +2483,15 @@ mod tests {
                 ])
             })
             .collect();
-        let leaves = snapshot
-            .leaves
+        let units = snapshot
+            .units
             .iter()
-            .map(|leaf| {
+            .map(|unit| {
                 SqliteRow::new(vec![
-                    text(leaf.group_location.clone()),
-                    text(leaf.field_role.clone()),
-                    text(leaf.original_text.clone()),
-                    text(leaf.translation_context_json.clone()),
+                    text(unit.group_location.clone()),
+                    text(unit.unit_role.clone()),
+                    text(unit.source_content_json.clone()),
+                    text(unit.source_context_json.clone()),
                 ])
             })
             .collect();
@@ -2474,7 +2508,7 @@ mod tests {
         StoredSnapshotRows {
             owner_state: owner_state_rows(&[0xa5; 32], snapshot.fingerprint.as_bytes()),
             groups,
-            leaves,
+            units,
             targets,
         }
     }
@@ -2486,7 +2520,7 @@ mod tests {
         StoredSnapshotRows {
             owner_state: read_rows(connection, READ_OWNER_STATE, owner, 2),
             groups: read_rows(connection, READ_OWNER_GROUPS, owner, 3),
-            leaves: read_rows(connection, READ_OWNER_LEAVES, owner, 4),
+            units: read_rows(connection, READ_OWNER_UNITS, owner, 4),
             targets: read_rows(connection, READ_OWNER_TARGETS, owner, 2),
         }
     }
@@ -2564,15 +2598,15 @@ mod tests {
                     PRIMARY KEY (owner, group_location),
                     FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
                 );
-                CREATE TABLE standard_text_leaf (
+                CREATE TABLE standard_text_unit (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
-                    field_role TEXT NOT NULL,
-                    original_text TEXT NOT NULL,
-                    translation_context_json TEXT NOT NULL,
-                    translation TEXT,
+                    unit_role TEXT NOT NULL,
+                    source_content_json TEXT NOT NULL,
+                    source_context_json TEXT NOT NULL,
+                    translation_content_json TEXT,
                     translation_state BLOB,
-                    PRIMARY KEY (owner, group_location, field_role),
+                    PRIMARY KEY (owner, group_location, unit_role),
                     FOREIGN KEY (owner, group_location)
                         REFERENCES standard_text_group(owner, group_location) ON DELETE CASCADE
                 );
@@ -2617,21 +2651,21 @@ mod tests {
                 )
                 .expect("组应写入");
         }
-        for leaf in &snapshot.leaves {
+        for unit in &snapshot.units {
             connection
                 .execute(
-                    "INSERT INTO standard_text_leaf VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO standard_text_unit VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     (
                         snapshot.owner.storage_name(),
-                        &leaf.group_location,
-                        &leaf.field_role,
-                        &leaf.original_text,
-                        &leaf.translation_context_json,
+                        &unit.group_location,
+                        &unit.unit_role,
+                        &unit.source_content_json,
+                        &unit.source_context_json,
                         translation,
                         translation_state.to_vec(),
                     ),
                 )
-                .expect("叶应写入");
+                .expect("单元应写入");
         }
         for target in &snapshot.targets {
             connection

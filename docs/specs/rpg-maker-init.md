@@ -59,14 +59,14 @@ reparse point、hardlink、名称碰撞、读取中对象身份变化和资源�
 - `metadata`：项目名、规范源/目标 `LanguageId`、三个布局宽度和来源指纹；
 - `standard_asset_owner_state`：`builtin | rules | lua` 的来源指纹与资产快照指纹；
 - `standard_text_group`：逻辑组、组角色和完整投影/写回 recipe；
-- `standard_text_leaf`：组内 `field_role`、原文、翻译上下文、译文与状态；
+- `standard_text_unit`：组内 `unit_role`、源内容 JSON、源上下文、译文内容 JSON 与状态；
 - `standard_text_target`：物理修改目标到逻辑组的唯一归属；
 - `standard_translation_resource`：术语与自定义占位符的 canonical JSON；
 - `standard_project_definition`：活动 MV 对话定义的 canonical JSON。MZ 使用同一结构，
   但不消费 MV 姓名投影。
 
-逻辑译文身份是 `owner + group_location + field_role`，不等于物理 JSON 地址。删除 owner
-状态会级联删除该 owner 的组、叶和目标。owner 状态同时绑定来源与完整资产快照，翻译
+语义译文身份是 `owner + group_location + unit_role`，不等于物理 JSON 地址。删除 owner
+状态会级联删除该 owner 的组、单元和目标。owner 状态同时绑定来源与完整资产快照，翻译
 和写回均据此拒绝提取后发生的项目或资产变化。
 
 来源变化保留既有 owner 快照与译文，直到下一次对应 Extract 用当前来源原子替换；语言

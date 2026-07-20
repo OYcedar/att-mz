@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{Map, Value};
 
 use super::standard::{
-    EventBodyMutationAction, ReplaceDialogueMutation, ReplaceEventBodyMutation,
+    ReplaceChoicesMutation, ReplaceDialogueMutation, ReplaceEventBodyMutation,
     RpgMakerWriteBackDocumentRewriter, SetTextMutation, StandardWriteBackMutation,
     StandardWriteBackMutationPlan,
 };
@@ -129,16 +129,16 @@ fn validate_relative_output_path(
             path: path.to_path_buf(),
         });
     }
-    let mut has_leaf = false;
+    let mut has_file_name = false;
     for component in components {
         if !matches!(component, Component::Normal(_)) {
             return Err(RpgMakerWriteBackDocumentRewriteFailure::InvalidOutputPath {
                 path: path.to_path_buf(),
             });
         }
-        has_leaf = true;
+        has_file_name = true;
     }
-    if !has_leaf {
+    if !has_file_name {
         return Err(RpgMakerWriteBackDocumentRewriteFailure::InvalidOutputPath {
             path: path.to_path_buf(),
         });
@@ -231,6 +231,12 @@ fn selection_for_plan(plan: &StandardWriteBackMutationPlan) -> RpgMakerDocumentS
                 }
                 for line in mutation.recipe().lines() {
                     select_source(&mut selection, line.physical_location().source());
+                }
+            }
+            StandardWriteBackMutation::ReplaceChoices(mutation) => {
+                select_source(&mut selection, mutation.group_location().source());
+                for recipe in mutation.recipes() {
+                    select_source(&mut selection, recipe.target().source());
                 }
             }
             StandardWriteBackMutation::ReplaceEventBody(mutation) => {
@@ -430,6 +436,14 @@ fn mutation_document_key(
             }
             (mutation.group_location(), locations)
         }
+        StandardWriteBackMutation::ReplaceChoices(mutation) => (
+            mutation.group_location(),
+            mutation
+                .recipes()
+                .iter()
+                .map(|recipe| recipe.target())
+                .collect(),
+        ),
         StandardWriteBackMutation::ReplaceEventBody(mutation) => (
             mutation.group_location(),
             mutation
@@ -459,6 +473,7 @@ fn mutation_location(mutation: &StandardWriteBackMutation) -> &RpgMakerLocation 
     match mutation {
         StandardWriteBackMutation::SetText(mutation) => mutation.exact_location(),
         StandardWriteBackMutation::ReplaceDialogue(mutation) => mutation.group_location(),
+        StandardWriteBackMutation::ReplaceChoices(mutation) => mutation.group_location(),
         StandardWriteBackMutation::ReplaceEventBody(mutation) => mutation.group_location(),
     }
 }
@@ -489,6 +504,7 @@ fn validate_structural_conflicts(
                 dialogue_structural_key(mutation)?,
                 mutation.group_location(),
             )),
+            StandardWriteBackMutation::ReplaceChoices(_) => {}
             StandardWriteBackMutation::ReplaceEventBody(mutation) => {
                 structural.push((event_structural_key(mutation)?, mutation.group_location()))
             }
@@ -534,6 +550,7 @@ fn apply_mutations(
     let mut comment_groups = BTreeMap::<ContainerKey, Vec<&SetTextMutation>>::new();
     let mut event_mutations = Vec::new();
     let mut dialogue_mutations = Vec::new();
+    let mut choices_mutations = Vec::new();
 
     for mutation in mutations {
         match mutation {
@@ -565,12 +582,18 @@ fn apply_mutations(
             StandardWriteBackMutation::ReplaceDialogue(mutation) => {
                 dialogue_mutations.push(mutation)
             }
+            StandardWriteBackMutation::ReplaceChoices(mutation) => choices_mutations.push(mutation),
             StandardWriteBackMutation::ReplaceEventBody(mutation) => event_mutations.push(mutation),
         }
     }
 
     for (key, mutations) in note_groups {
         apply_note_mutations(documents, &key, mutations)?;
+    }
+
+    // 选项只修改既有值，但必须在任何事件列表 splice 前按整组验收并同步 102/402。
+    for mutation in choices_mutations {
+        apply_choices_mutation(documents, mutation)?;
     }
 
     let mut structural = Vec::new();
@@ -970,6 +993,169 @@ fn comment_block_end(
     Ok(end)
 }
 
+fn apply_choices_mutation(
+    documents: &mut MutableDocuments,
+    mutation: &ReplaceChoicesMutation,
+) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
+    let location = mutation.group_location();
+    let RpgMakerLocation::Value { source, steps } = location else {
+        return Err(mutation_failure(
+            location,
+            "选项 group_location 不是 Value 位置",
+        ));
+    };
+    let key = structural_key(source, steps, location)?;
+    let (document, id) = documents.document_mut(source, location)?;
+    let list = event_list_mut(document, &key.list_steps, location)?;
+    let header = list
+        .get(key.start_index)
+        .ok_or_else(|| mutation_failure(location, "选项起始命令索引越界"))?;
+    if command_code(header, location)? != 102 {
+        return Err(mutation_failure(location, "选项起始命令不是 102"));
+    }
+    let header_indent = command_indent(header, location)?;
+    let current_choices = command_parameter_array(header, 0, location)?;
+    if current_choices.len() != mutation.source_lines().len()
+        || current_choices
+            .iter()
+            .zip(mutation.source_lines())
+            .any(|(value, expected)| value.as_str() != Some(expected))
+    {
+        return Err(mutation_failure(
+            location,
+            "冻结 102.parameters[0] 与选项原文不一致",
+        ));
+    }
+
+    let mut branches = BTreeMap::<usize, (usize, Value)>::new();
+    let mut command_index = key.start_index + 1;
+    let mut found_end = false;
+    while let Some(command) = list.get(command_index) {
+        let code = command_code(command, location)?;
+        let indent = command_indent(command, location)?;
+        if code == 404 && indent == header_indent {
+            found_end = true;
+            break;
+        }
+        if code == 402 && indent == header_indent {
+            let parameters = command_parameters(command, location)?;
+            let choice_index = parameters
+                .first()
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    mutation_failure(location, "同层 402.parameters[0] 不是有效选项索引")
+                })?;
+            let label = parameters
+                .get(1)
+                .and_then(Value::as_str)
+                .ok_or_else(|| mutation_failure(location, "同层 402.parameters[1] 不是字符串"))?;
+            if mutation
+                .source_lines()
+                .get(choice_index)
+                .map(String::as_str)
+                != Some(label)
+            {
+                return Err(mutation_failure(
+                    location,
+                    "同层 402 标签与冻结 102 选项不一致",
+                ));
+            }
+            if branches
+                .insert(choice_index, (command_index, command.clone()))
+                .is_some()
+            {
+                return Err(mutation_failure(location, "同层 402 重复选项索引"));
+            }
+        }
+        command_index += 1;
+    }
+    if !found_end {
+        return Err(mutation_failure(location, "选项块缺少同层 404 结束命令"));
+    }
+    if branches.len() != mutation.source_lines().len()
+        || (0..mutation.source_lines().len()).any(|index| !branches.contains_key(&index))
+    {
+        return Err(mutation_failure(location, "选项块没有完整覆盖全部同层 402"));
+    }
+
+    let mut expected_targets = BTreeSet::new();
+    for choice_index in 0..mutation.source_lines().len() {
+        expected_targets.insert(choice_value_location(
+            source,
+            &key.list_steps,
+            key.start_index,
+            0,
+            Some(choice_index),
+        ));
+        let branch_index = branches.get(&choice_index).expect("已经验证分支索引完整").0;
+        expected_targets.insert(choice_value_location(
+            source,
+            &key.list_steps,
+            branch_index,
+            1,
+            None,
+        ));
+    }
+    let actual_targets = mutation
+        .recipes()
+        .iter()
+        .map(|recipe| recipe.target().clone())
+        .collect::<BTreeSet<_>>();
+    if actual_targets != expected_targets {
+        return Err(mutation_failure(
+            location,
+            "选项配方目标与冻结 102/402 块不一致",
+        ));
+    }
+
+    // 所有冻结事实都已验证；以下只在局部副本中物化，再一次性替换原值。
+    let mut rebuilt_header = header.clone();
+    let header_choices = command_parameter_array_mut(&mut rebuilt_header, 0, location)?;
+    *header_choices = mutation
+        .replacement_lines()
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect();
+    let mut rebuilt_branches = Vec::with_capacity(branches.len());
+    for (choice_index, (command_index, mut command)) in branches {
+        set_command_parameter_text(
+            &mut command,
+            1,
+            &mutation.replacement_lines()[choice_index],
+            location,
+        )?;
+        rebuilt_branches.push((command_index, command));
+    }
+
+    list[key.start_index] = rebuilt_header;
+    for (command_index, command) in rebuilt_branches {
+        list[command_index] = command;
+    }
+    documents.mark_document_changed(id);
+    Ok(())
+}
+
+fn choice_value_location(
+    source: &RpgMakerSource,
+    list_steps: &[RpgMakerLocationStep],
+    command_index: usize,
+    parameter_index: usize,
+    array_index: Option<usize>,
+) -> RpgMakerLocation {
+    let mut steps = list_steps.to_vec();
+    steps.extend([
+        RpgMakerLocationStep::index(command_index),
+        RpgMakerLocationStep::key("parameters"),
+        RpgMakerLocationStep::index(parameter_index),
+    ]);
+    if let Some(array_index) = array_index {
+        steps.push(RpgMakerLocationStep::index(array_index));
+    }
+    RpgMakerLocation::value(source.clone(), steps)
+}
+
 fn apply_event_body_mutation(
     documents: &mut MutableDocuments,
     key: &StructuralKey,
@@ -1026,18 +1212,13 @@ fn apply_event_body_mutation(
                 "冻结正文与 expected_original 不一致",
             ));
         }
-        match segment.action() {
-            EventBodyMutationAction::KeepOriginal => rebuilt.push(command.clone()),
-            EventBodyMutationAction::ReplaceWithLines(lines) => {
-                for line in lines {
-                    rebuilt.push(rewrite_command(
-                        command,
-                        body_code,
-                        line,
-                        segment.exact_location(),
-                    )?);
-                }
-            }
+        for line in segment.replacement_lines() {
+            rebuilt.push(rewrite_command(
+                command,
+                body_code,
+                line,
+                segment.exact_location(),
+            )?);
         }
     }
     list.splice(body_start..body_end, rebuilt);
@@ -1106,10 +1287,8 @@ fn apply_dialogue_mutation(
         )?;
     }
 
-    let originals = &list[body_start..body_end];
-    let mut rebuilt_body = Vec::new();
-    for (offset, (line_recipe, command)) in recipe.lines().iter().zip(originals.iter()).enumerate()
-    {
+    let originals = list[body_start..body_end].to_vec();
+    for (offset, (line_recipe, command)) in recipe.lines().iter().zip(&originals).enumerate() {
         validate_dialogue_parameter_location(
             line_recipe.physical_location(),
             &key.source,
@@ -1130,8 +1309,90 @@ fn apply_dialogue_mutation(
                 "冻结对话正文与 expected_raw 不一致",
             ));
         }
-        let rendered = render_dialogue_line(mutation, line_recipe.parts())?;
-        for text in rendered {
+    }
+
+    let mut structural_templates = Vec::new();
+    let mut body_templates = Vec::new();
+    let mut encountered_body = false;
+    for (line_recipe, command) in recipe.lines().iter().zip(&originals) {
+        let body_index = dialogue_body_index(line_recipe.parts(), line_recipe.physical_location())?;
+        match body_index {
+            Some(source_line_index) => {
+                encountered_body = true;
+                body_templates.push((source_line_index, line_recipe, command));
+            }
+            None if encountered_body => {
+                return Err(mutation_failure(
+                    line_recipe.physical_location(),
+                    "对话结构行不能位于正文行之后",
+                ));
+            }
+            None => structural_templates.push((line_recipe, command)),
+        }
+    }
+    body_templates.sort_by_key(|(source_line_index, _, _)| *source_line_index);
+
+    let mut rebuilt_body = Vec::new();
+    for (line_recipe, command) in structural_templates {
+        let text = render_dialogue_prefix(
+            line_recipe.parts(),
+            mutation.speaker(),
+            line_recipe.physical_location(),
+        )?;
+        rebuilt_body.push(rewrite_command(
+            command,
+            401,
+            &text,
+            line_recipe.physical_location(),
+        )?);
+    }
+
+    if let Some(lines) = mutation.body_lines() {
+        body_templates.last().ok_or_else(|| {
+            mutation_failure(location, "对话 Mutation 提供正文译文但配方没有 BodyLine")
+        })?;
+        for (output_index, line) in lines.iter().enumerate() {
+            let (_, line_recipe, command) = body_templates
+                .get(line.source_semantic_line_index())
+                .unwrap_or_else(|| body_templates.last().expect("已经确认正文模板至少有一项"));
+            let mut text = String::new();
+            if output_index == 0 {
+                text.push_str(&render_dialogue_prefix(
+                    line_recipe.parts(),
+                    mutation.speaker(),
+                    line_recipe.physical_location(),
+                )?);
+            }
+            text.push_str(line.text());
+            rebuilt_body.push(rewrite_command(
+                command,
+                401,
+                &text,
+                line_recipe.physical_location(),
+            )?);
+        }
+    } else {
+        for (_, line_recipe, command) in body_templates {
+            let source_prefix = render_dialogue_prefix(
+                line_recipe.parts(),
+                mutation.source_speaker(),
+                line_recipe.physical_location(),
+            )?;
+            let body = line_recipe
+                .expected_raw()
+                .strip_prefix(&source_prefix)
+                .ok_or_else(|| {
+                    mutation_failure(
+                        line_recipe.physical_location(),
+                        "冻结对话正文不以物化 Speaker shell 开头",
+                    )
+                })?;
+            let mut text = render_dialogue_prefix(
+                line_recipe.parts(),
+                mutation.speaker(),
+                line_recipe.physical_location(),
+            )?;
+            text.push_str(body);
             rebuilt_body.push(rewrite_command(
                 command,
                 401,
@@ -1147,52 +1408,44 @@ fn apply_dialogue_mutation(
     Ok(())
 }
 
-fn render_dialogue_line(
-    mutation: &ReplaceDialogueMutation,
+fn dialogue_body_index(
     parts: &[DialogueLinePart],
-) -> Result<Vec<String>, RpgMakerWriteBackDocumentRewriteFailure> {
-    let location = mutation.group_location();
+    location: &RpgMakerLocation,
+) -> Result<Option<usize>, RpgMakerWriteBackDocumentRewriteFailure> {
     let body_position = parts
         .iter()
-        .position(|part| matches!(part, DialogueLinePart::BodySlot { .. }));
+        .position(|part| matches!(part, DialogueLinePart::BodyLine { .. }));
     if body_position.is_some_and(|index| index + 1 != parts.len()) {
         return Err(mutation_failure(
             location,
-            "对话 BodySlot 必须是物理行的最后一部分",
+            "对话 BodyLine 必须是物理行的最后一部分",
         ));
     }
+    Ok(body_position.map(|position| {
+        let DialogueLinePart::BodyLine { source_line_index } = parts[position] else {
+            unreachable!()
+        };
+        source_line_index
+    }))
+}
 
+fn render_dialogue_prefix(
+    parts: &[DialogueLinePart],
+    speaker: Option<&str>,
+    location: &RpgMakerLocation,
+) -> Result<String, RpgMakerWriteBackDocumentRewriteFailure> {
     let mut prefix = String::new();
-    for part in parts.iter().take(body_position.unwrap_or(parts.len())) {
+    for part in parts {
         match part {
             DialogueLinePart::Literal(value) => prefix.push_str(value),
             DialogueLinePart::SpeakerSlot => prefix.push_str(
-                mutation
-                    .speaker()
-                    .expect("受信对话 Mutation 必须提供内嵌 Speaker"),
+                speaker
+                    .ok_or_else(|| mutation_failure(location, "内嵌 SpeakerSlot 缺少 Speaker"))?,
             ),
-            DialogueLinePart::BodySlot { .. } => unreachable!("已在 BodySlot 前停止"),
+            DialogueLinePart::BodyLine { .. } => break,
         }
     }
-
-    let Some(body_position) = body_position else {
-        return Ok(vec![prefix]);
-    };
-    let DialogueLinePart::BodySlot { index } = parts[body_position] else {
-        unreachable!()
-    };
-    let lines = mutation
-        .body_lines(index)
-        .expect("受信对话 Mutation 必须覆盖 BodySlot");
-    let mut rendered = Vec::with_capacity(lines.len());
-    for (line_index, line) in lines.iter().enumerate() {
-        if line_index == 0 {
-            rendered.push(format!("{prefix}{line}"));
-        } else {
-            rendered.push(line.clone());
-        }
-    }
-    Ok(rendered)
+    Ok(prefix)
 }
 
 fn validate_dialogue_parameter_location(
@@ -1294,6 +1547,54 @@ fn command_code(
         .and_then(|object| object.get("code"))
         .and_then(Value::as_i64)
         .ok_or_else(|| mutation_failure(location, "事件命令不是带整数 code 的对象"))
+}
+
+fn command_indent(
+    command: &Value,
+    location: &RpgMakerLocation,
+) -> Result<i64, RpgMakerWriteBackDocumentRewriteFailure> {
+    command
+        .as_object()
+        .and_then(|object| object.get("indent"))
+        .and_then(Value::as_i64)
+        .ok_or_else(|| mutation_failure(location, "事件命令不是带整数 indent 的对象"))
+}
+
+fn command_parameters<'a>(
+    command: &'a Value,
+    location: &RpgMakerLocation,
+) -> Result<&'a [Value], RpgMakerWriteBackDocumentRewriteFailure> {
+    command
+        .as_object()
+        .and_then(|object| object.get("parameters"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| mutation_failure(location, "事件命令缺少 parameters 数组"))
+}
+
+fn command_parameter_array<'a>(
+    command: &'a Value,
+    parameter_index: usize,
+    location: &RpgMakerLocation,
+) -> Result<&'a Vec<Value>, RpgMakerWriteBackDocumentRewriteFailure> {
+    command_parameters(command, location)?
+        .get(parameter_index)
+        .and_then(Value::as_array)
+        .ok_or_else(|| mutation_failure(location, "事件命令目标参数不是数组"))
+}
+
+fn command_parameter_array_mut<'a>(
+    command: &'a mut Value,
+    parameter_index: usize,
+    location: &RpgMakerLocation,
+) -> Result<&'a mut Vec<Value>, RpgMakerWriteBackDocumentRewriteFailure> {
+    command
+        .as_object_mut()
+        .and_then(|object| object.get_mut("parameters"))
+        .and_then(Value::as_array_mut)
+        .and_then(|parameters| parameters.get_mut(parameter_index))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| mutation_failure(location, "事件命令目标参数不是数组"))
 }
 
 fn command_text<'a>(
@@ -1579,11 +1880,12 @@ mod tests {
     use crate::rpg_maker::extract::document::PluginConfiguration;
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
+        DirectTextPart, DirectTextRecipe, TextUnitRole,
     };
     use crate::rpg_maker::project::test_layout_profile;
     use crate::rpg_maker::text::StandardDataFile;
     use crate::rpg_maker::write_back::standard::{
-        EventBodyMutationSegment, StandardWriteBackMutation,
+        EventBodyMutationSegment, RpgMakerWriteBackLaidOutLine, StandardWriteBackMutation,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -1947,13 +2249,17 @@ mod tests {
                 DialogueLineRecipe::new(
                     segment_location(1),
                     "甲",
-                    vec![DialogueLinePart::BodySlot { index: 0 }],
+                    vec![DialogueLinePart::BodyLine {
+                        source_line_index: 0,
+                    }],
                 )
                 .expect("第一行配方应合法"),
                 DialogueLineRecipe::new(
                     segment_location(2),
                     "乙",
-                    vec![DialogueLinePart::BodySlot { index: 1 }],
+                    vec![DialogueLinePart::BodyLine {
+                        source_line_index: 1,
+                    }],
                 )
                 .expect("第二行配方应合法"),
             ],
@@ -1961,10 +2267,12 @@ mod tests {
         .expect("对话配方应合法");
         let body = ReplaceDialogueMutation::new(
             recipe,
+            Some("莉莉".to_owned()),
             Some("莉莉译".to_owned()),
-            BTreeMap::from([
-                (0, vec!["甲一".to_owned(), "甲二".to_owned()]),
-                (1, vec!["乙".to_owned()]),
+            Some(vec![
+                RpgMakerWriteBackLaidOutLine::new("甲一".to_owned(), 0),
+                RpgMakerWriteBackLaidOutLine::new("甲二".to_owned(), 0),
+                RpgMakerWriteBackLaidOutLine::new("乙".to_owned(), 1),
             ]),
         )
         .expect("对话测试计划应该合法");
@@ -2010,6 +2318,105 @@ mod tests {
     }
 
     #[test]
+    fn three_source_401_lines_can_be_replaced_by_one_two_or_four_semantic_lines() {
+        let source = RpgMakerSource::map(70);
+        let list_steps = vec![RpgMakerLocationStep::key("list")];
+        let group_location = RpgMakerLocation::value(
+            source.clone(),
+            [list_steps.clone(), vec![RpgMakerLocationStep::index(0)]].concat(),
+        );
+        let line_location = |command_index| {
+            RpgMakerLocation::value(
+                source.clone(),
+                [
+                    list_steps.clone(),
+                    vec![
+                        RpgMakerLocationStep::index(command_index),
+                        RpgMakerLocationStep::key("parameters"),
+                        RpgMakerLocationStep::index(0),
+                    ],
+                ]
+                .concat(),
+            )
+        };
+        let recipe = DialogueWriteRecipe::new(
+            group_location,
+            None,
+            ["源一", "源二", "源三"]
+                .into_iter()
+                .enumerate()
+                .map(|(source_line_index, text)| {
+                    DialogueLineRecipe::new(
+                        line_location(source_line_index + 1),
+                        text,
+                        vec![DialogueLinePart::BodyLine { source_line_index }],
+                    )
+                    .expect("正文行配方应合法")
+                })
+                .collect(),
+        )
+        .expect("三行对话配方应合法");
+
+        for (texts, expected_templates) in [
+            (vec!["译一"], vec![(1, "A")]),
+            (vec!["译一", "译二"], vec![(1, "A"), (2, "B")]),
+            (
+                vec!["译一", "译二", "译三", "译四"],
+                vec![(1, "A"), (2, "B"), (3, "C"), (3, "C")],
+            ),
+        ] {
+            let body_lines = texts
+                .iter()
+                .enumerate()
+                .map(|(source_semantic_line_index, text)| {
+                    RpgMakerWriteBackLaidOutLine::new(
+                        (*text).to_owned(),
+                        source_semantic_line_index,
+                    )
+                })
+                .collect();
+            let mutation =
+                ReplaceDialogueMutation::new(recipe.clone(), None, None, Some(body_lines))
+                    .expect("自由断行正文应建立一个原子 Mutation");
+            let documents = RpgMakerProjectDocuments::new(
+                BTreeMap::from([(
+                    RpgMakerDocumentId::Map(70),
+                    json!({
+                        "list": [
+                            {"code":101,"indent":0,"parameters":["",0,0,2],"headerUnknown":true},
+                            {"code":401,"indent":1,"parameters":["源一"],"lineUnknown":"A"},
+                            {"code":401,"indent":2,"parameters":["源二"],"lineUnknown":"B"},
+                            {"code":401,"indent":3,"parameters":["源三"],"lineUnknown":"C"},
+                            {"code":0,"indent":0,"parameters":[]}
+                        ]
+                    }),
+                )]),
+                Vec::new(),
+            );
+
+            let candidate = rewrite_documents(
+                project_name(),
+                workspace_root(),
+                documents,
+                plan(vec![StandardWriteBackMutation::ReplaceDialogue(mutation)]),
+            )
+            .expect("完整正文应按模型语义行数原子重建");
+            let map: Value =
+                serde_json::from_str(file_text(&candidate, Path::new("data/Map070.json")))
+                    .expect("Map 候选应是 JSON");
+            let list = map["list"].as_array().expect("事件列表应存在");
+            assert_eq!(list.len(), texts.len() + 2);
+            for (index, (expected_indent, expected_unknown)) in
+                expected_templates.into_iter().enumerate()
+            {
+                assert_eq!(list[index + 1]["parameters"][0], texts[index]);
+                assert_eq!(list[index + 1]["indent"], expected_indent);
+                assert_eq!(list[index + 1]["lineUnknown"], expected_unknown);
+            }
+        }
+    }
+
+    #[test]
     fn rebuilds_mv_inline_speaker_once_and_keeps_each_body_hard_boundary() {
         let source = RpgMakerSource::map(8);
         let list_steps = vec![RpgMakerLocationStep::key("list")];
@@ -2044,14 +2451,18 @@ mod tests {
                         DialogueLinePart::Literal(":>\\n<".to_owned()),
                         DialogueLinePart::SpeakerSlot,
                         DialogueLinePart::Literal(":>".to_owned()),
-                        DialogueLinePart::BodySlot { index: 0 },
+                        DialogueLinePart::BodyLine {
+                            source_line_index: 0,
+                        },
                     ],
                 )
                 .expect("内嵌姓名行配方应合法"),
                 DialogueLineRecipe::new(
                     line_location(2),
                     "Tail",
-                    vec![DialogueLinePart::BodySlot { index: 1 }],
+                    vec![DialogueLinePart::BodyLine {
+                        source_line_index: 1,
+                    }],
                 )
                 .expect("第二正文行配方应合法"),
             ],
@@ -2059,10 +2470,12 @@ mod tests {
         .expect("MV 对话配方应合法");
         let mutation = ReplaceDialogueMutation::new(
             recipe,
+            Some("Alice".to_owned()),
             Some("爱丽丝".to_owned()),
-            BTreeMap::from([
-                (0, vec!["第一行".to_owned(), "第二行".to_owned()]),
-                (1, vec!["尾行".to_owned()]),
+            Some(vec![
+                RpgMakerWriteBackLaidOutLine::new("第一行".to_owned(), 0),
+                RpgMakerWriteBackLaidOutLine::new("第二行".to_owned(), 0),
+                RpgMakerWriteBackLaidOutLine::new("尾行".to_owned(), 1),
             ]),
         )
         .expect("MV 对话 Mutation 应合法");
@@ -2139,7 +2552,9 @@ mod tests {
                     DialogueLineRecipe::new(
                         line_location(2),
                         "台词",
-                        vec![DialogueLinePart::BodySlot { index: 0 }],
+                        vec![DialogueLinePart::BodyLine {
+                            source_line_index: 0,
+                        }],
                     )
                     .unwrap(),
                 ],
@@ -2149,8 +2564,12 @@ mod tests {
         let mutation = || {
             ReplaceDialogueMutation::new(
                 recipe(),
+                Some("バニー淫魔".to_owned()),
                 Some("兔女郎魅魔".to_owned()),
-                BTreeMap::from([(0, vec!["译文".to_owned()])]),
+                Some(vec![RpgMakerWriteBackLaidOutLine::new(
+                    "译文".to_owned(),
+                    0,
+                )]),
             )
             .unwrap()
         };
@@ -2199,6 +2618,86 @@ mod tests {
                     if message.contains(expected_message)
             ));
         }
+    }
+
+    #[test]
+    fn choices_update_the_102_list_and_same_level_402_labels_atomically() {
+        let source = RpgMakerSource::map(10);
+        let list_steps = vec![RpgMakerLocationStep::key("list")];
+        let group_location = RpgMakerLocation::value(
+            source.clone(),
+            [list_steps.clone(), vec![RpgMakerLocationStep::index(0)]].concat(),
+        );
+        let target = |command_index, parameter_index, choice_index: Option<usize>| {
+            choice_value_location(
+                &source,
+                &list_steps,
+                command_index,
+                parameter_index,
+                choice_index,
+            )
+        };
+        let recipe = |location, source_line_index, expected: &str| {
+            DirectTextRecipe::new(
+                location,
+                expected,
+                vec![DirectTextPart::LineSlot {
+                    role: TextUnitRole::Choices,
+                    source_line_index,
+                }],
+            )
+            .expect("选项行配方应合法")
+        };
+        let recipes = vec![
+            recipe(target(0, 0, Some(0)), 0, "はい"),
+            recipe(target(0, 0, Some(1)), 1, "いいえ"),
+            recipe(target(1, 1, None), 0, "はい"),
+            recipe(target(6, 1, None), 1, "いいえ"),
+        ];
+        let mutation = ReplaceChoicesMutation::new(
+            group_location,
+            recipes,
+            vec!["はい".to_owned(), "いいえ".to_owned()],
+            vec!["是".to_owned(), "否".to_owned()],
+        )
+        .expect("选项 Mutation 应合法");
+        let documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([(
+                RpgMakerDocumentId::Map(10),
+                json!({
+                    "list": [
+                        {"code":102,"indent":0,"parameters":[["はい","いいえ"],0,0,2,0],"headerUnknown":true},
+                        {"code":402,"indent":0,"parameters":[0,"はい"],"branchUnknown":"first"},
+                        {"code":102,"indent":1,"parameters":[["内側"],0,0,2,0]},
+                        {"code":402,"indent":1,"parameters":[0,"内側"]},
+                        {"code":404,"indent":1,"parameters":[]},
+                        {"code":0,"indent":1,"parameters":[]},
+                        {"code":402,"indent":0,"parameters":[1,"いいえ"],"branchUnknown":"second"},
+                        {"code":404,"indent":0,"parameters":[]},
+                        {"code":0,"indent":0,"parameters":[]}
+                    ]
+                }),
+            )]),
+            Vec::new(),
+        );
+
+        let candidate = rewrite_documents(
+            project_name(),
+            workspace_root(),
+            documents,
+            plan(vec![StandardWriteBackMutation::ReplaceChoices(mutation)]),
+        )
+        .expect("选项头与分支标签应能原子同步");
+        let map: Value =
+            serde_json::from_str(file_text(&candidate, Path::new("data/Map010.json"))).unwrap();
+        let list = map["list"].as_array().unwrap();
+        assert_eq!(list[0]["parameters"][0], json!(["是", "否"]));
+        assert_eq!(list[1]["parameters"][1], "是");
+        assert_eq!(list[6]["parameters"][1], "否");
+        assert_eq!(list[3]["parameters"][1], "内側");
+        assert_eq!(list[0]["headerUnknown"], true);
+        assert_eq!(list[1]["branchUnknown"], "first");
+        assert_eq!(list[6]["branchUnknown"], "second");
     }
 
     #[test]

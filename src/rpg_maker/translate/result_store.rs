@@ -13,6 +13,7 @@ use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
 };
+use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{
     PLACEHOLDER_RULES_RESOURCE_KIND, TERMINOLOGY_RESOURCE_KIND,
@@ -23,19 +24,19 @@ use crate::storage::sqlite::{
 };
 
 use super::standard::{
-    StandardTranslationResultStore, TranslationLeafIdentity, TranslationPlanPreparation,
-    TranslationSnapshotBaseline, TranslationTaskOutcome, ValidatedTranslationTaskResult,
+    StandardTranslationResultStore, TranslationPlanPreparation, TranslationSnapshotBaseline,
+    TranslationTaskOutcome, TranslationUnitIdentity, ValidatedTranslationTaskResult,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerStandardTranslationResultStorageConfig {
-    leaves_per_encode_job: NonZeroUsize,
+    units_per_encode_job: NonZeroUsize,
 }
 
 impl RpgMakerStandardTranslationResultStorageConfig {
-    pub(crate) const fn new(leaves_per_encode_job: NonZeroUsize) -> Self {
+    pub(crate) const fn new(units_per_encode_job: NonZeroUsize) -> Self {
         Self {
-            leaves_per_encode_job,
+            units_per_encode_job,
         }
     }
 }
@@ -73,9 +74,6 @@ where
         project: &OpenedProject,
         preparation: TranslationPlanPreparation,
     ) -> Result<(), Self::Error> {
-        if !preparation.requires_storage_changes() {
-            return Ok(());
-        }
         let plan = self.encode_preparation_plan(preparation).await?;
         self.execute(project.database_path().to_path_buf(), plan)
             .await
@@ -116,14 +114,14 @@ where
         SqliteTransactionPlan,
         RpgMakerStandardTranslationResultStorageError<S::Error, C::Error>,
     > {
-        let leaves_per_job = self.config.leaves_per_encode_job.get();
+        let units_per_job = self.config.units_per_encode_job.get();
         let (jobs, terminology_json, placeholder_rules_json, snapshot_baseline) = self
             .cpu
             .execute(move || {
                 let (work, terminology_json, placeholder_rules_json, snapshot_baseline) =
                     preparation_work(preparation)?;
                 Ok::<_, ResultStoragePlanError>((
-                    split_jobs(work, leaves_per_job),
+                    split_jobs(work, units_per_job),
                     terminology_json,
                     placeholder_rules_json,
                     snapshot_baseline,
@@ -159,14 +157,14 @@ where
         RpgMakerPreparedTranslationCommit,
         RpgMakerStandardTranslationResultStorageError<S::Error, C::Error>,
     > {
-        let leaves_per_job = self.config.leaves_per_encode_job.get();
+        let units_per_job = self.config.units_per_encode_job.get();
         let jobs = self
             .cpu
             .execute(move || {
                 let result = outcome
                     .validated_result()
                     .expect("Store 只应准备至少包含一项合格译文的任务结果");
-                commit_work(result).map(|work| split_jobs(work, leaves_per_job))
+                commit_work(result).map(|work| split_jobs(work, units_per_job))
             })
             .await
             .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?
@@ -262,15 +260,16 @@ impl<S: Error + 'static, C: Error + 'static> Error
 pub(crate) enum ResultStoragePlanError {
     Location(RpgMakerLocationCodecError),
     Projection(RpgMakerProjectionCodecError),
+    Content(serde_json::Error),
     EmptyTaskResult,
     EmptyReuseTargets,
     BlankTranslation,
     InconsistentTranslationState,
-    MismatchedReuseOriginal,
-    MismatchedReuseContext,
-    MismatchedPropagationOriginal,
-    MismatchedPropagationContext,
-    DuplicateLeaf,
+    MismatchedReuseSourceContent,
+    MismatchedReuseSourceContext,
+    MismatchedPropagationSourceContent,
+    MismatchedPropagationSourceContext,
+    DuplicateUnit,
 }
 
 impl fmt::Display for ResultStoragePlanError {
@@ -278,23 +277,26 @@ impl fmt::Display for ResultStoragePlanError {
         match self {
             Self::Location(source) => source.fmt(formatter),
             Self::Projection(source) => source.fmt(formatter),
+            Self::Content(source) => write!(formatter, "文本单元内容无法编码为 JSON：{source}"),
             Self::EmptyTaskResult => formatter.write_str("任务结果不包含任何译文"),
             Self::EmptyReuseTargets => formatter.write_str("译文复用计划不包含任何目标"),
             Self::BlankTranslation => formatter.write_str("任务结果包含空白译文"),
             Self::InconsistentTranslationState => {
                 formatter.write_str("读取时的译文与译文状态没有同时存在或同时缺失")
             }
-            Self::MismatchedReuseOriginal => formatter.write_str("译文复用种子与目标的原文不一致"),
-            Self::MismatchedReuseContext => {
-                formatter.write_str("译文复用种子与目标的翻译上下文不一致")
+            Self::MismatchedReuseSourceContent => {
+                formatter.write_str("译文复用种子与目标的完整源内容不一致")
             }
-            Self::MismatchedPropagationOriginal => {
-                formatter.write_str("译文代表与传播目标的原文不一致")
+            Self::MismatchedReuseSourceContext => {
+                formatter.write_str("译文复用种子与目标的源上下文不一致")
             }
-            Self::MismatchedPropagationContext => {
-                formatter.write_str("译文代表与传播目标的翻译上下文不一致")
+            Self::MismatchedPropagationSourceContent => {
+                formatter.write_str("译文代表与传播目标的完整源内容不一致")
             }
-            Self::DuplicateLeaf => formatter.write_str("同一事务重复修改同一文本叶子"),
+            Self::MismatchedPropagationSourceContext => {
+                formatter.write_str("译文代表与传播目标的源上下文不一致")
+            }
+            Self::DuplicateUnit => formatter.write_str("同一事务重复修改同一文本单元"),
         }
     }
 }
@@ -304,6 +306,7 @@ impl Error for ResultStoragePlanError {
         match self {
             Self::Location(source) => Some(source),
             Self::Projection(source) => Some(source),
+            Self::Content(source) => Some(source),
             _ => None,
         }
     }
@@ -313,62 +316,62 @@ impl Error for ResultStoragePlanError {
 struct EncodedIdentity {
     owner: &'static str,
     group_location: String,
-    field_role: String,
-    original_text: String,
-    translation_context_json: String,
+    unit_role: String,
+    source_content_json: String,
+    source_context_json: String,
 }
 
-enum PreparationLeafWork {
+enum PreparationUnitWork {
     Invalidation {
-        identity: TranslationLeafIdentity,
+        identity: TranslationUnitIdentity,
+        expected_translation: TextUnitContent,
+        expected_translation_state: Sha256Fingerprint,
+    },
+    ReuseSeed {
+        identity: TranslationUnitIdentity,
+        expected_translation: TextUnitContent,
+        expected_translation_state: Sha256Fingerprint,
+    },
+    ReuseTarget {
+        seed_source_content: TextUnitContent,
+        seed_source_context_json: String,
+        translation: TextUnitContent,
+        identity: TranslationUnitIdentity,
+        expected_translation: Option<TextUnitContent>,
+        expected_translation_state: Option<Sha256Fingerprint>,
+        replacement_translation_state: Sha256Fingerprint,
+    },
+}
+
+enum EncodedPreparationUnit {
+    Invalidation {
+        identity: EncodedIdentity,
         expected_translation: String,
         expected_translation_state: Sha256Fingerprint,
     },
     ReuseSeed {
-        identity: TranslationLeafIdentity,
+        identity: EncodedIdentity,
         expected_translation: String,
         expected_translation_state: Sha256Fingerprint,
     },
     ReuseTarget {
-        seed_original: String,
-        seed_translation_context_json: String,
         translation: String,
-        identity: TranslationLeafIdentity,
+        identity: EncodedIdentity,
         expected_translation: Option<String>,
         expected_translation_state: Option<Sha256Fingerprint>,
         replacement_translation_state: Sha256Fingerprint,
     },
 }
 
-enum EncodedPreparationLeaf {
-    Invalidation {
-        identity: EncodedIdentity,
-        expected_translation: String,
-        expected_translation_state: Sha256Fingerprint,
-    },
-    ReuseSeed {
-        identity: EncodedIdentity,
-        expected_translation: String,
-        expected_translation_state: Sha256Fingerprint,
-    },
-    ReuseTarget {
-        translation: String,
-        identity: EncodedIdentity,
-        expected_translation: Option<String>,
-        expected_translation_state: Option<Sha256Fingerprint>,
-        replacement_translation_state: Sha256Fingerprint,
-    },
-}
-
-struct CommitLeafWork {
-    identity: TranslationLeafIdentity,
-    required_original: Option<String>,
-    required_translation_context_json: Option<String>,
-    translation: String,
+struct CommitUnitWork {
+    identity: TranslationUnitIdentity,
+    required_source_content: Option<TextUnitContent>,
+    required_source_context_json: Option<String>,
+    translation: TextUnitContent,
     translation_state: Sha256Fingerprint,
 }
 
-struct EncodedCommitLeaf {
+struct EncodedCommitUnit {
     identity: EncodedIdentity,
     translation: String,
     translation_state: Sha256Fingerprint,
@@ -378,7 +381,7 @@ fn preparation_work(
     preparation: TranslationPlanPreparation,
 ) -> Result<
     (
-        Vec<PreparationLeafWork>,
+        Vec<PreparationUnitWork>,
         String,
         String,
         TranslationSnapshotBaseline,
@@ -390,9 +393,9 @@ fn preparation_work(
     let mut work = Vec::new();
 
     for invalidation in invalidations {
-        work.push(PreparationLeafWork::Invalidation {
+        work.push(PreparationUnitWork::Invalidation {
             identity: invalidation.identity().clone(),
-            expected_translation: invalidation.expected_translation().to_owned(),
+            expected_translation: invalidation.expected_translation().clone(),
             expected_translation_state: invalidation.expected_translation_state(),
         });
     }
@@ -401,26 +404,22 @@ fn preparation_work(
         if reuse.targets().is_empty() {
             return Err(ResultStoragePlanError::EmptyReuseTargets);
         }
-        let seed_original = reuse.seed().identity().original_text().to_owned();
-        let seed_translation_context_json = reuse
-            .seed()
-            .identity()
-            .translation_context_json()
-            .to_owned();
-        let translation = reuse.seed().expected_translation().to_owned();
-        work.push(PreparationLeafWork::ReuseSeed {
+        let seed_source_content = reuse.seed().identity().source_content().clone();
+        let seed_source_context_json = reuse.seed().identity().source_context_json().to_owned();
+        let translation = reuse.seed().expected_translation().clone();
+        work.push(PreparationUnitWork::ReuseSeed {
             identity: reuse.seed().identity().clone(),
             expected_translation: translation.clone(),
             expected_translation_state: reuse.seed().expected_translation_state(),
         });
 
         for target in reuse.targets() {
-            work.push(PreparationLeafWork::ReuseTarget {
-                seed_original: seed_original.clone(),
-                seed_translation_context_json: seed_translation_context_json.clone(),
+            work.push(PreparationUnitWork::ReuseTarget {
+                seed_source_content: seed_source_content.clone(),
+                seed_source_context_json: seed_source_context_json.clone(),
                 translation: translation.clone(),
                 identity: target.identity().clone(),
-                expected_translation: target.expected_translation().map(str::to_owned),
+                expected_translation: target.expected_translation().cloned(),
                 expected_translation_state: target.expected_translation_state(),
                 replacement_translation_state: target.replacement_translation_state(),
             });
@@ -436,37 +435,37 @@ fn preparation_work(
 }
 
 fn encode_preparation_job(
-    job: Vec<PreparationLeafWork>,
-) -> Result<Vec<EncodedPreparationLeaf>, ResultStoragePlanError> {
+    job: Vec<PreparationUnitWork>,
+) -> Result<Vec<EncodedPreparationUnit>, ResultStoragePlanError> {
     job.into_iter()
         .map(|work| match work {
-            PreparationLeafWork::Invalidation {
+            PreparationUnitWork::Invalidation {
                 identity,
                 expected_translation,
                 expected_translation_state,
             } => {
                 ensure_nonblank(&expected_translation)?;
-                Ok(EncodedPreparationLeaf::Invalidation {
+                Ok(EncodedPreparationUnit::Invalidation {
                     identity: encode_identity(&identity)?,
-                    expected_translation,
+                    expected_translation: encode_content(&expected_translation)?,
                     expected_translation_state,
                 })
             }
-            PreparationLeafWork::ReuseSeed {
+            PreparationUnitWork::ReuseSeed {
                 identity,
                 expected_translation,
                 expected_translation_state,
             } => {
                 ensure_nonblank(&expected_translation)?;
-                Ok(EncodedPreparationLeaf::ReuseSeed {
+                Ok(EncodedPreparationUnit::ReuseSeed {
                     identity: encode_identity(&identity)?,
-                    expected_translation,
+                    expected_translation: encode_content(&expected_translation)?,
                     expected_translation_state,
                 })
             }
-            PreparationLeafWork::ReuseTarget {
-                seed_original,
-                seed_translation_context_json,
+            PreparationUnitWork::ReuseTarget {
+                seed_source_content,
+                seed_source_context_json,
                 translation,
                 identity,
                 expected_translation,
@@ -474,25 +473,28 @@ fn encode_preparation_job(
                 replacement_translation_state,
             } => {
                 ensure_nonblank(&translation)?;
-                if identity.original_text() != seed_original {
-                    return Err(ResultStoragePlanError::MismatchedReuseOriginal);
+                if identity.source_content() != &seed_source_content {
+                    return Err(ResultStoragePlanError::MismatchedReuseSourceContent);
                 }
-                if identity.translation_context_json() != seed_translation_context_json {
-                    return Err(ResultStoragePlanError::MismatchedReuseContext);
+                if identity.source_context_json() != seed_source_context_json {
+                    return Err(ResultStoragePlanError::MismatchedReuseSourceContext);
                 }
                 if expected_translation.is_some() != expected_translation_state.is_some() {
                     return Err(ResultStoragePlanError::InconsistentTranslationState);
                 }
                 if expected_translation
-                    .as_deref()
-                    .is_some_and(|value| value.trim().is_empty())
+                    .as_ref()
+                    .is_some_and(TextUnitContent::is_blank)
                 {
                     return Err(ResultStoragePlanError::BlankTranslation);
                 }
-                Ok(EncodedPreparationLeaf::ReuseTarget {
-                    translation,
+                Ok(EncodedPreparationUnit::ReuseTarget {
+                    translation: encode_content(&translation)?,
                     identity: encode_identity(&identity)?,
-                    expected_translation,
+                    expected_translation: expected_translation
+                        .as_ref()
+                        .map(encode_content)
+                        .transpose()?,
                     expected_translation_state,
                     replacement_translation_state,
                 })
@@ -502,7 +504,7 @@ fn encode_preparation_job(
 }
 
 fn finish_preparation_plan(
-    batches: Vec<Vec<EncodedPreparationLeaf>>,
+    batches: Vec<Vec<EncodedPreparationUnit>>,
     terminology_json: String,
     placeholder_rules_json: String,
     snapshot_baseline: TranslationSnapshotBaseline,
@@ -512,9 +514,9 @@ fn finish_preparation_plan(
     let mut snapshot_parameter_sets = Vec::new();
     let mut clear_parameter_sets = Vec::new();
     let mut reuse_parameter_sets = Vec::new();
-    for leaf in batches.into_iter().flatten() {
-        match leaf {
-            EncodedPreparationLeaf::Invalidation {
+    for unit in batches.into_iter().flatten() {
+        match unit {
+            EncodedPreparationUnit::Invalidation {
                 identity,
                 expected_translation,
                 expected_translation_state,
@@ -530,7 +532,7 @@ fn finish_preparation_plan(
                     expected_translation_state,
                 ));
             }
-            EncodedPreparationLeaf::ReuseSeed {
+            EncodedPreparationUnit::ReuseSeed {
                 identity,
                 expected_translation,
                 expected_translation_state,
@@ -541,7 +543,7 @@ fn finish_preparation_plan(
                     Some((&expected_translation, expected_translation_state)),
                 ));
             }
-            EncodedPreparationLeaf::ReuseTarget {
+            EncodedPreparationUnit::ReuseTarget {
                 translation,
                 identity,
                 expected_translation,
@@ -585,27 +587,27 @@ fn finish_preparation_plan(
 
 fn commit_work(
     result: ValidatedTranslationTaskResult,
-) -> Result<Vec<CommitLeafWork>, ResultStoragePlanError> {
+) -> Result<Vec<CommitUnitWork>, ResultStoragePlanError> {
     let patches = result.into_updates();
     if patches.is_empty() {
         return Err(ResultStoragePlanError::EmptyTaskResult);
     }
     let mut work = Vec::new();
     for patch in patches {
-        let translation = patch.translation().to_owned();
-        work.push(CommitLeafWork {
+        let translation = patch.translation().clone();
+        work.push(CommitUnitWork {
             identity: patch.identity().clone(),
-            required_original: None,
-            required_translation_context_json: None,
+            required_source_content: None,
+            required_source_context_json: None,
             translation: translation.clone(),
             translation_state: patch.translation_state(),
         });
         for target in patch.propagation_targets() {
-            work.push(CommitLeafWork {
+            work.push(CommitUnitWork {
                 identity: target.identity().clone(),
-                required_original: Some(patch.identity().original_text().to_owned()),
-                required_translation_context_json: Some(
-                    patch.identity().translation_context_json().to_owned(),
+                required_source_content: Some(patch.identity().source_content().clone()),
+                required_source_context_json: Some(
+                    patch.identity().source_context_json().to_owned(),
                 ),
                 translation: translation.clone(),
                 translation_state: target.state_context().finish(&translation),
@@ -616,28 +618,28 @@ fn commit_work(
 }
 
 fn encode_commit_job(
-    job: Vec<CommitLeafWork>,
-) -> Result<Vec<EncodedCommitLeaf>, ResultStoragePlanError> {
+    job: Vec<CommitUnitWork>,
+) -> Result<Vec<EncodedCommitUnit>, ResultStoragePlanError> {
     job.into_iter()
         .map(|work| {
             ensure_nonblank(&work.translation)?;
             if work
-                .required_original
-                .as_deref()
-                .is_some_and(|original| original != work.identity.original_text())
+                .required_source_content
+                .as_ref()
+                .is_some_and(|source_content| source_content != work.identity.source_content())
             {
-                return Err(ResultStoragePlanError::MismatchedPropagationOriginal);
+                return Err(ResultStoragePlanError::MismatchedPropagationSourceContent);
             }
             if work
-                .required_translation_context_json
+                .required_source_context_json
                 .as_deref()
-                .is_some_and(|context| context != work.identity.translation_context_json())
+                .is_some_and(|context| context != work.identity.source_context_json())
             {
-                return Err(ResultStoragePlanError::MismatchedPropagationContext);
+                return Err(ResultStoragePlanError::MismatchedPropagationSourceContext);
             }
-            Ok(EncodedCommitLeaf {
+            Ok(EncodedCommitUnit {
                 identity: encode_identity(&work.identity)?,
-                translation: work.translation,
+                translation: encode_content(&work.translation)?,
                 translation_state: work.translation_state,
             })
         })
@@ -645,13 +647,13 @@ fn encode_commit_job(
 }
 
 fn finish_commit_plan(
-    batches: Vec<Vec<EncodedCommitLeaf>>,
+    batches: Vec<Vec<EncodedCommitUnit>>,
 ) -> Result<SqliteTransactionPlan, ResultStoragePlanError> {
     let mut seen = BTreeSet::new();
     let mut parameter_sets = Vec::new();
-    for leaf in batches.into_iter().flatten() {
-        ensure_unique(&mut seen, &leaf.identity)?;
-        parameter_sets.push(commit_translation_parameters(leaf));
+    for unit in batches.into_iter().flatten() {
+        ensure_unique(&mut seen, &unit.identity)?;
+        parameter_sets.push(commit_translation_parameters(unit));
     }
     Ok(SqliteTransactionPlan::new(vec![
         SqliteTransactionStep::ExecuteManyExactlyOne(SqliteBatch::new(
@@ -661,28 +663,32 @@ fn finish_commit_plan(
     ]))
 }
 
-fn split_jobs<T>(items: Vec<T>, leaves_per_job: usize) -> Vec<Vec<T>> {
-    debug_assert!(leaves_per_job > 0);
+fn split_jobs<T>(items: Vec<T>, units_per_job: usize) -> Vec<Vec<T>> {
+    debug_assert!(units_per_job > 0);
     let mut items = items.into_iter();
     std::iter::from_fn(|| {
-        let job = items.by_ref().take(leaves_per_job).collect::<Vec<_>>();
+        let job = items.by_ref().take(units_per_job).collect::<Vec<_>>();
         (!job.is_empty()).then_some(job)
     })
     .collect()
 }
 
 fn encode_identity(
-    identity: &TranslationLeafIdentity,
+    identity: &TranslationUnitIdentity,
 ) -> Result<EncodedIdentity, ResultStoragePlanError> {
     Ok(EncodedIdentity {
         owner: identity.owner().storage_name(),
         group_location: RpgMakerLocationCodec::encode(identity.group_location())
             .map_err(ResultStoragePlanError::Location)?,
-        field_role: RpgMakerProjectionCodec::encode_role(identity.role())
+        unit_role: RpgMakerProjectionCodec::encode_role(identity.role())
             .map_err(ResultStoragePlanError::Projection)?,
-        original_text: identity.original_text().to_owned(),
-        translation_context_json: identity.translation_context_json().to_owned(),
+        source_content_json: encode_content(identity.source_content())?,
+        source_context_json: identity.source_context_json().to_owned(),
     })
+}
+
+fn encode_content(content: &TextUnitContent) -> Result<String, ResultStoragePlanError> {
+    serde_json::to_string(content).map_err(ResultStoragePlanError::Content)
 }
 
 fn ensure_unique(
@@ -692,16 +698,16 @@ fn ensure_unique(
     if seen.insert((
         identity.owner,
         identity.group_location.clone(),
-        identity.field_role.clone(),
+        identity.unit_role.clone(),
     )) {
         Ok(())
     } else {
-        Err(ResultStoragePlanError::DuplicateLeaf)
+        Err(ResultStoragePlanError::DuplicateUnit)
     }
 }
 
-fn ensure_nonblank(translation: &str) -> Result<(), ResultStoragePlanError> {
-    if translation.trim().is_empty() {
+fn ensure_nonblank(translation: &TextUnitContent) -> Result<(), ResultStoragePlanError> {
+    if translation.is_blank() {
         Err(ResultStoragePlanError::BlankTranslation)
     } else {
         Ok(())
@@ -750,13 +756,13 @@ fn require_snapshot_baseline(baseline: &TranslationSnapshotBaseline) -> SqliteTr
     ))
 }
 
-const REQUIRE_SNAPSHOT: &str = "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM standard_text_leaf WHERE owner = ?1 AND group_location = ?2 AND field_role = ?3 AND original_text = ?4 AND translation_context_json = ?5 AND ((?6 IS NULL AND ?7 IS NULL AND translation IS NULL AND translation_state IS NULL) OR (translation = ?6 AND translation_state = ?7)))";
+const REQUIRE_SNAPSHOT: &str = "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM standard_text_unit WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3 AND source_content_json = ?4 AND source_context_json = ?5 AND ((?6 IS NULL AND ?7 IS NULL AND translation_content_json IS NULL AND translation_state IS NULL) OR (translation_content_json = ?6 AND translation_state = ?7)))";
 
-const CLEAR_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE standard_text_leaf SET translation = NULL, translation_state = NULL WHERE owner = ?1 AND group_location = ?2 AND field_role = ?3 AND original_text = ?4 AND translation_context_json = ?5 AND translation = ?6 AND translation_state = ?7";
+const CLEAR_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE standard_text_unit SET translation_content_json = NULL, translation_state = NULL WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3 AND source_content_json = ?4 AND source_context_json = ?5 AND translation_content_json = ?6 AND translation_state = ?7";
 
-const WRITE_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE standard_text_leaf SET translation = ?1, translation_state = ?2 WHERE owner = ?3 AND group_location = ?4 AND field_role = ?5 AND original_text = ?6 AND translation_context_json = ?7 AND ((?8 IS NULL AND ?9 IS NULL AND translation IS NULL AND translation_state IS NULL) OR (translation = ?8 AND translation_state = ?9))";
+const WRITE_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE standard_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_location = ?4 AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND ((?8 IS NULL AND ?9 IS NULL AND translation_content_json IS NULL AND translation_state IS NULL) OR (translation_content_json = ?8 AND translation_state = ?9))";
 
-const COMMIT_TRANSLATION: &str = "UPDATE standard_text_leaf SET translation = ?1, translation_state = ?2 WHERE owner = ?3 AND group_location = ?4 AND field_role = ?5 AND original_text = ?6 AND translation_context_json = ?7 AND translation IS NULL AND translation_state IS NULL";
+const COMMIT_TRANSLATION: &str = "UPDATE standard_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_location = ?4 AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND translation_content_json IS NULL AND translation_state IS NULL";
 
 fn snapshot_parameters(
     identity: &EncodedIdentity,
@@ -765,9 +771,9 @@ fn snapshot_parameters(
     let mut parameters = vec![
         text(identity.owner),
         text(identity.group_location.clone()),
-        text(identity.field_role.clone()),
-        text(identity.original_text.clone()),
-        text(identity.translation_context_json.clone()),
+        text(identity.unit_role.clone()),
+        text(identity.source_content_json.clone()),
+        text(identity.source_context_json.clone()),
     ];
     if let Some((translation, state)) = expected_translation {
         parameters.push(text(translation));
@@ -786,9 +792,9 @@ fn clear_translation_parameters(
     vec![
         text(identity.owner),
         text(identity.group_location),
-        text(identity.field_role),
-        text(identity.original_text),
-        text(identity.translation_context_json),
+        text(identity.unit_role),
+        text(identity.source_content_json),
+        text(identity.source_context_json),
         text(expected_translation),
         blob(expected_translation_state),
     ]
@@ -806,23 +812,23 @@ fn write_translation_from_snapshot_parameters(
         blob(replacement_translation_state),
         text(identity.owner),
         text(identity.group_location),
-        text(identity.field_role),
-        text(identity.original_text),
-        text(identity.translation_context_json),
+        text(identity.unit_role),
+        text(identity.source_content_json),
+        text(identity.source_context_json),
         expected_translation.map_or(SqliteValue::Null, text),
         expected_translation_state.map_or(SqliteValue::Null, blob),
     ]
 }
 
-fn commit_translation_parameters(leaf: EncodedCommitLeaf) -> Vec<SqliteValue> {
+fn commit_translation_parameters(unit: EncodedCommitUnit) -> Vec<SqliteValue> {
     vec![
-        text(leaf.translation),
-        blob(leaf.translation_state),
-        text(leaf.identity.owner),
-        text(leaf.identity.group_location),
-        text(leaf.identity.field_role),
-        text(leaf.identity.original_text),
-        text(leaf.identity.translation_context_json),
+        text(unit.translation),
+        blob(unit.translation_state),
+        text(unit.identity.owner),
+        text(unit.identity.group_location),
+        text(unit.identity.unit_role),
+        text(unit.identity.source_content_json),
+        text(unit.identity.source_context_json),
     ]
 }
 
@@ -892,7 +898,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::rpg_maker::ProjectName;
-    use crate::rpg_maker::model::{ScalarFieldKey, TextFieldRole};
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
     use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::{
@@ -959,7 +965,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_commit_uses_one_conditional_batch_update_for_all_leaf_checks() {
+    async fn prepared_commit_uses_one_conditional_batch_update_for_all_unit_checks() {
         let sqlite = RecordingSqlite::default();
         let plans = Arc::clone(&sqlite.plans);
         let service = RpgMakerStandardTranslationResultStorageService::new(
@@ -969,6 +975,7 @@ mod tests {
         );
         let identity = scalar_identity(1, "name", "原文", "{}");
         let context = state_context(0x11);
+        let translation = value("译文");
         let outcome = Arc::new(TranslationTaskOutcome::Complete {
             context: TranslationTaskOutcomeContext::new(
                 StandardTranslationTaskIndex::new(0),
@@ -982,8 +989,8 @@ mod tests {
                     TranslationPatch::new(
                         identity.clone(),
                         Vec::new(),
-                        "译文",
-                        context.finish("译文"),
+                        translation.clone(),
+                        context.finish(&translation),
                     ),
                 ),
                 Vec::new(),
@@ -1005,12 +1012,16 @@ mod tests {
         let plan = &plans[0].1;
         assert_eq!(plan.steps().len(), 1);
         let SqliteTransactionStep::ExecuteManyExactlyOne(update) = &plan.steps()[0] else {
-            panic!("提交应以一条条件批量修改核对并写入逻辑叶");
+            panic!("提交应以一条条件批量修改核对并写入逻辑单元");
         };
         assert_eq!(update.statement(), COMMIT_TRANSLATION);
-        assert!(update.statement().contains("original_text = ?6"));
-        assert!(update.statement().contains("translation_context_json = ?7"));
-        assert!(update.statement().contains("translation IS NULL"));
+        assert!(update.statement().contains("source_content_json = ?6"));
+        assert!(update.statement().contains("source_context_json = ?7"));
+        assert!(
+            update
+                .statement()
+                .contains("translation_content_json IS NULL")
+        );
         assert!(update.statement().contains("translation_state IS NULL"));
         assert!(!update.statement().contains("exact_location"));
         let parameters = &update.parameter_sets()[0];
@@ -1026,7 +1037,7 @@ mod tests {
                 RpgMakerProjectionCodec::encode_role(identity.role()).expect("角色应可编码")
             )
         );
-        assert_eq!(parameters[5], SqliteValue::Text("原文".to_owned()));
+        assert_eq!(parameters[5], SqliteValue::Text(r#""原文""#.to_owned()));
         assert_eq!(parameters[6], SqliteValue::Text("{}".to_owned()));
     }
 
@@ -1047,19 +1058,19 @@ mod tests {
             vec![
                 TranslationInvalidation::new(
                     invalidation_one.clone(),
-                    "旧译文一",
+                    value("旧译文一"),
                     Sha256Fingerprint::from_bytes([0x11; 32]),
                 ),
                 TranslationInvalidation::new(
                     invalidation_two.clone(),
-                    "旧译文二",
+                    value("旧译文二"),
                     Sha256Fingerprint::from_bytes([0x22; 32]),
                 ),
             ],
             vec![TranslationReuse::new(
                 TranslationReuseSeed::new(
                     reuse_seed.clone(),
-                    "复用译文",
+                    value("复用译文"),
                     Sha256Fingerprint::from_bytes([0x33; 32]),
                 ),
                 vec![TranslationReuseTarget::new(
@@ -1085,7 +1096,7 @@ mod tests {
         let steps = plans[0].1.steps();
         assert!(matches!(steps[0], SqliteTransactionStep::RequireNoRows(_)));
         let SqliteTransactionStep::RequireNoRowsMany(guards) = &steps[1] else {
-            panic!("逐叶快照条件应批量查询");
+            panic!("逐单元快照条件应批量查询");
         };
         assert_eq!(guards.statement(), REQUIRE_SNAPSHOT);
         assert_eq!(guards.parameter_sets().len(), 4);
@@ -1116,7 +1127,7 @@ mod tests {
         assert_eq!(clears.parameter_sets().len(), 2);
         assert_eq!(
             clears.parameter_sets()[0][5],
-            SqliteValue::Text("旧译文一".to_owned())
+            SqliteValue::Text(r#""旧译文一""#.to_owned())
         );
 
         let SqliteTransactionStep::ExecuteManyExactlyOne(reuses) = &steps[3] else {
@@ -1126,30 +1137,69 @@ mod tests {
         assert_eq!(reuses.parameter_sets().len(), 1);
         assert_eq!(
             reuses.parameter_sets()[0][0],
-            SqliteValue::Text("复用译文".to_owned())
+            SqliteValue::Text(r#""复用译文""#.to_owned())
         );
         assert_eq!(reuses.parameter_sets()[0][7], SqliteValue::Null);
         assert_eq!(reuses.parameter_sets()[0][8], SqliteValue::Null);
     }
 
+    #[tokio::test]
+    async fn preparation_without_writes_still_checks_the_complete_snapshot_baseline() {
+        let sqlite = RecordingSqlite::default();
+        let plans = Arc::clone(&sqlite.plans);
+        let service = RpgMakerStandardTranslationResultStorageService::new(
+            sqlite,
+            InlineCpu,
+            RpgMakerStandardTranslationResultStorageConfig::new(NonZeroUsize::MIN),
+        );
+        let preparation = TranslationPlanPreparation::new(
+            Vec::new(),
+            Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            1,
+            0,
+            0,
+        );
+
+        service
+            .apply_preparation(&project(), preparation)
+            .await
+            .expect("无状态写入的计划仍必须在请求模型前核对读取基线");
+
+        let plans = plans.lock().expect("事务锁");
+        assert_eq!(plans.len(), 1);
+        assert!(!plans[0].1.steps().is_empty());
+        assert!(matches!(
+            plans[0].1.steps()[0],
+            SqliteTransactionStep::RequireNoRows(_)
+        ));
+    }
+
     #[test]
-    fn duplicate_logical_leaf_is_rejected_before_a_commit_plan_is_created() {
+    fn duplicate_logical_unit_is_rejected_before_a_commit_plan_is_created() {
         let identity = scalar_identity(1, "name", "原文", "{}");
         let context = state_context(0x55);
-        let patch = TranslationPatch::new(identity, Vec::new(), "译文", context.finish("译文"));
+        let translation = value("译文");
+        let patch = TranslationPatch::new(
+            identity,
+            Vec::new(),
+            translation.clone(),
+            context.finish(&translation),
+        );
         let work = commit_work(ValidatedTranslationTaskResult::new(
             StandardTranslationTaskIndex::new(0),
             vec![patch.clone(), patch],
         ))
         .expect("重复应由最终计划阶段按编码身份识别");
-        let encoded = encode_commit_job(work).expect("重复叶本身应可编码");
+        let encoded = encode_commit_job(work).expect("重复单元本身应可编码");
 
-        let error = finish_commit_plan(vec![encoded]).expect_err("重复逻辑叶不得进入事务");
-        assert!(matches!(error, ResultStoragePlanError::DuplicateLeaf));
+        let error = finish_commit_plan(vec![encoded]).expect_err("重复逻辑单元不得进入事务");
+        assert!(matches!(error, ResultStoragePlanError::DuplicateUnit));
     }
 
     #[tokio::test]
-    async fn real_sqlite_rejects_stale_original_context_and_translation_state() {
+    async fn real_sqlite_rejects_stale_source_context_and_translation_state() {
         let directory = tempfile::tempdir().expect("临时目录应可创建");
         let storage = runtime_storage();
         let service = RpgMakerStandardTranslationResultStorageService::new(
@@ -1158,7 +1208,7 @@ mod tests {
             RpgMakerStandardTranslationResultStorageConfig::new(NonZeroUsize::MIN),
         );
         let cases = [
-            ("stale-original.db", "旧原文", "{}", None, None),
+            ("stale-source.db", "旧原文", "{}", None, None),
             ("stale-context.db", "原文", r#"{"old":true}"#, None, None),
             (
                 "stale-translation.db",
@@ -1170,14 +1220,14 @@ mod tests {
             ("orphan-state.db", "原文", "{}", None, Some(vec![0x62; 32])),
         ];
 
-        for (name, actual_original, actual_context, translation, translation_state) in cases {
+        for (name, actual_source, actual_context, translation, translation_state) in cases {
             let database_path = directory.path().join(name).join("project.db");
             let identity = scalar_identity(1, "name", "原文", "{}");
-            create_leaf_database(
+            create_unit_database(
                 &database_path,
-                &[StoredLeaf::new(
+                &[StoredUnit::new(
                     &identity,
-                    actual_original,
+                    actual_source,
                     actual_context,
                     translation,
                     translation_state.as_deref(),
@@ -1199,7 +1249,7 @@ mod tests {
             ));
             assert_eq!(
                 stored_translation(&database_path, 1),
-                (translation.map(str::to_owned), translation_state,),
+                (translation.map(value), translation_state,),
                 "被拒绝的条件 UPDATE 不得改变行"
             );
         }
@@ -1209,16 +1259,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_sqlite_rolls_back_earlier_batch_updates_when_a_later_leaf_is_stale() {
+    async fn real_sqlite_rolls_back_earlier_batch_updates_when_a_later_unit_is_stale() {
         let directory = tempfile::tempdir().expect("临时目录应可创建");
         let database_path = directory.path().join("rollback").join("project.db");
         let first = scalar_identity(1, "name", "原文一", "{}");
         let second = scalar_identity(2, "name", "原文二", "{}");
-        create_leaf_database(
+        create_unit_database(
             &database_path,
             &[
-                StoredLeaf::new(&first, "原文一", "{}", None, None),
-                StoredLeaf::new(&second, "原文二", r#"{"old":true}"#, None, None),
+                StoredUnit::new(&first, "原文一", "{}", None, None),
+                StoredUnit::new(&second, "原文二", r#"{"old":true}"#, None, None),
             ],
         );
         let storage = runtime_storage();
@@ -1238,7 +1288,7 @@ mod tests {
         let error = service
             .commit_prepared(&project_at(database_path.clone()), prepared)
             .await
-            .expect_err("后序叶过时必须回滚整笔任务");
+            .expect_err("后序单元过时必须回滚整笔任务");
         assert!(matches!(
             error,
             RpgMakerStandardTranslationResultStorageError::StalePlan { .. }
@@ -1255,11 +1305,11 @@ mod tests {
         let directory = tempfile::tempdir().expect("临时目录应可创建");
         let database_path = directory.path().join("duplicate-rows").join("project.db");
         let identity = scalar_identity(1, "name", "原文", "{}");
-        create_leaf_database(
+        create_unit_database(
             &database_path,
             &[
-                StoredLeaf::new(&identity, "原文", "{}", None, None),
-                StoredLeaf::new(&identity, "原文", "{}", None, None),
+                StoredUnit::new(&identity, "原文", "{}", None, None),
+                StoredUnit::new(&identity, "原文", "{}", None, None),
             ],
         );
         let storage = runtime_storage();
@@ -1286,7 +1336,7 @@ mod tests {
         let connection = Connection::open(&database_path).expect("数据库应可重开");
         let translated: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM standard_text_leaf WHERE translation IS NOT NULL OR translation_state IS NOT NULL",
+                "SELECT COUNT(*) FROM standard_text_unit WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL",
                 [],
                 |row| row.get(0),
             )
@@ -1303,13 +1353,14 @@ mod tests {
         let leader = dialogue_body_identity(1, "同一句", r#"{"source_speaker":"甲"}"#);
         let target = dialogue_body_identity(2, "同一句", r#"{"source_speaker":"乙"}"#);
         let context = state_context(0x22);
+        let translation = lines(&["相同译文"]);
         let result = ValidatedTranslationTaskResult::new(
             StandardTranslationTaskIndex::new(0),
             vec![TranslationPatch::new(
                 leader,
                 vec![TranslationPropagationTarget::new(target, context)],
-                "相同译文",
-                context.finish("相同译文"),
+                translation.clone(),
+                context.finish(&translation),
             )],
         );
 
@@ -1320,7 +1371,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ResultStoragePlanError::MismatchedPropagationContext
+            ResultStoragePlanError::MismatchedPropagationSourceContext
         ));
     }
 
@@ -1350,96 +1401,111 @@ mod tests {
         );
     }
 
-    struct StoredLeaf<'a> {
-        identity: &'a TranslationLeafIdentity,
-        original: &'a str,
-        context: &'a str,
-        translation: Option<&'a str>,
+    struct StoredUnit<'a> {
+        identity: &'a TranslationUnitIdentity,
+        source_content_json: String,
+        source_context_json: &'a str,
+        translation_content_json: Option<String>,
         translation_state: Option<&'a [u8]>,
     }
 
-    impl<'a> StoredLeaf<'a> {
+    impl<'a> StoredUnit<'a> {
         fn new(
-            identity: &'a TranslationLeafIdentity,
-            original: &'a str,
-            context: &'a str,
+            identity: &'a TranslationUnitIdentity,
+            source_content: &str,
+            source_context_json: &'a str,
             translation: Option<&'a str>,
             translation_state: Option<&'a [u8]>,
         ) -> Self {
             Self {
                 identity,
-                original,
-                context,
-                translation,
+                source_content_json: encode_content(&value(source_content))
+                    .expect("测试源内容应可编码"),
+                source_context_json,
+                translation_content_json: translation
+                    .map(value)
+                    .as_ref()
+                    .map(encode_content)
+                    .transpose()
+                    .expect("测试译文应可编码"),
                 translation_state,
             }
         }
     }
 
-    fn create_leaf_database(path: &std::path::Path, leaves: &[StoredLeaf<'_>]) {
+    fn create_unit_database(path: &std::path::Path, units: &[StoredUnit<'_>]) {
         std::fs::create_dir_all(path.parent().expect("测试数据库必须有父目录"))
             .expect("测试数据库目录应可创建");
         let connection = Connection::open(path).expect("测试数据库应可创建");
         connection
             .execute_batch(
-                "CREATE TABLE standard_text_leaf (
+                "CREATE TABLE standard_text_unit (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
-                    field_role TEXT NOT NULL,
-                    original_text TEXT NOT NULL,
-                    translation_context_json TEXT NOT NULL,
-                    translation TEXT,
+                    unit_role TEXT NOT NULL,
+                    source_content_json TEXT NOT NULL,
+                    source_context_json TEXT NOT NULL,
+                    translation_content_json TEXT,
                     translation_state BLOB
                 );",
             )
             .expect("测试表应可创建");
-        for leaf in leaves {
+        for unit in units {
             connection
                 .execute(
-                    "INSERT INTO standard_text_leaf (
-                        owner, group_location, field_role, original_text,
-                        translation_context_json, translation, translation_state
+                    "INSERT INTO standard_text_unit (
+                        owner, group_location, unit_role, source_content_json,
+                        source_context_json, translation_content_json, translation_state
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     params![
-                        leaf.identity.owner().storage_name(),
-                        RpgMakerLocationCodec::encode(leaf.identity.group_location())
+                        unit.identity.owner().storage_name(),
+                        RpgMakerLocationCodec::encode(unit.identity.group_location())
                             .expect("组位置应可编码"),
-                        RpgMakerProjectionCodec::encode_role(leaf.identity.role())
-                            .expect("字段角色应可编码"),
-                        leaf.original,
-                        leaf.context,
-                        leaf.translation,
-                        leaf.translation_state,
+                        RpgMakerProjectionCodec::encode_role(unit.identity.role())
+                            .expect("单元角色应可编码"),
+                        &unit.source_content_json,
+                        unit.source_context_json,
+                        &unit.translation_content_json,
+                        unit.translation_state,
                     ],
                 )
-                .expect("测试叶应可写入");
+                .expect("测试单元应可写入");
         }
     }
 
     fn stored_translation(
         path: &std::path::Path,
         rowid: usize,
-    ) -> (Option<String>, Option<Vec<u8>>) {
+    ) -> (Option<TextUnitContent>, Option<Vec<u8>>) {
         Connection::open(path)
             .expect("数据库应可重开")
             .query_row(
-                "SELECT translation, translation_state FROM standard_text_leaf WHERE rowid = ?",
+                "SELECT translation_content_json, translation_state FROM standard_text_unit WHERE rowid = ?",
                 [i64::try_from(rowid).expect("测试 rowid 应可表示为 i64")],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    let translation_json: Option<String> = row.get(0)?;
+                    Ok((
+                        translation_json.map(|json| {
+                            serde_json::from_str(&json).expect("测试译文 JSON 应可解码")
+                        }),
+                        row.get(1)?,
+                    ))
+                },
             )
-            .expect("测试叶应仍存在")
+            .expect("测试单元应仍存在")
     }
 
     fn translation_patch(
-        identity: TranslationLeafIdentity,
+        identity: TranslationUnitIdentity,
         translation: &str,
         state_byte: u8,
     ) -> TranslationPatch {
+        let translation = value(translation);
         TranslationPatch::new(
             identity,
             Vec::new(),
-            translation,
-            state_context(state_byte).finish(translation),
+            translation.clone(),
+            state_context(state_byte).finish(&translation),
         )
     }
 
@@ -1496,25 +1562,25 @@ mod tests {
     fn scalar_identity(
         index: usize,
         field: &str,
-        original: &str,
+        source: &str,
         context: &str,
-    ) -> TranslationLeafIdentity {
-        TranslationLeafIdentity::new(
+    ) -> TranslationUnitIdentity {
+        TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             data_group(index),
-            TextFieldRole::Scalar(ScalarFieldKey::new(field).expect("字段键应合法")),
-            original,
+            TextUnitRole::Scalar(ScalarFieldKey::new(field).expect("字段键应合法")),
+            value(source),
             context,
         )
     }
 
     fn dialogue_body_identity(
         index: usize,
-        original: &str,
+        source: &str,
         context: &str,
-    ) -> TranslationLeafIdentity {
-        TranslationLeafIdentity::new(
+    ) -> TranslationUnitIdentity {
+        TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::EventDialogue,
             RpgMakerLocation::value(
@@ -1526,10 +1592,18 @@ mod tests {
                     RpgMakerLocationStep::index(0),
                 ],
             ),
-            TextFieldRole::DialogueBody { index: 0 },
-            original,
+            TextUnitRole::DialogueBody,
+            lines(&[source]),
             context,
         )
+    }
+
+    fn value(text: &str) -> TextUnitContent {
+        TextUnitContent::Value(text.to_owned())
+    }
+
+    fn lines(lines: &[&str]) -> TextUnitContent {
+        TextUnitContent::Lines(lines.iter().map(|line| (*line).to_owned()).collect())
     }
 
     fn data_group(index: usize) -> RpgMakerLocation {

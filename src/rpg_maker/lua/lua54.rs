@@ -30,7 +30,7 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 // 已位于共享 RPG Maker 边界，不依赖具体引擎的命令编排。
 use crate::llm::{ChatMessage, ChatMessageRole, LlmResponse, LlmUsage};
 use crate::rpg_maker::extract::store::{
-    ExtractedTextField, ExtractedTextGroup, LuaSnapshot, SnapshotModelError,
+    ExtractedTextGroup, ExtractedTextUnit, LuaSnapshot, SnapshotModelError,
 };
 use crate::rpg_maker::lua::document::{
     OpenedRpgMakerDocument, RpgMakerDocumentError, RpgMakerTextReference, data_source, map_source,
@@ -1049,7 +1049,7 @@ fn parse_lua_standard_field(
     group_location: &RpgMakerLocation,
     tracker: &mut HostValueBudgetTracker,
     depth: usize,
-) -> Result<ExtractedTextField, TrustedLuaHostCallError> {
+) -> Result<ExtractedTextUnit, TrustedLuaHostCallError> {
     tracker
         .container(depth)
         .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
@@ -1094,7 +1094,7 @@ fn parse_lua_standard_field(
         .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
     validate_standard_text_locations(kind, text.location(), group_location)
         .map_err(|error| extract_argument_error(error.to_string()))?;
-    ExtractedTextField::new(name, text.location().clone(), text.original().to_owned())
+    ExtractedTextUnit::new(name, text.location().clone(), text.original().to_owned())
         .map_err(snapshot_model_error)
 }
 
@@ -1133,9 +1133,6 @@ fn parse_standard_group_kind(
         "database_entry" => Ok(TextGroupKind::DatabaseEntry),
         "system" => Ok(TextGroupKind::System),
         "map" => Ok(TextGroupKind::Map),
-        "dialogue" => Ok(TextGroupKind::EventDialogue),
-        "choices" => Ok(TextGroupKind::EventChoices),
-        "scrolling_text" => Ok(TextGroupKind::EventScrollingText),
         "event_command" => Ok(TextGroupKind::EventCommand),
         "plugin_parameter" => Ok(TextGroupKind::PluginParameter),
         _ => Err(extract_argument_error(format!(
@@ -4452,9 +4449,54 @@ ctx.extract.replace_standard({
             assert_eq!(snapshot.groups().len(), 1);
             let group = &snapshot.groups()[0];
             assert_eq!(group.kind(), TextGroupKind::DatabaseEntry);
-            assert_eq!(group.fields()[0].field_name(), "name");
-            assert_eq!(group.fields()[0].original_text(), "药水");
+            let unit = &group.units()[0];
+            assert!(matches!(
+                unit.role(),
+                crate::rpg_maker::model::TextUnitRole::Scalar(key) if key.as_str() == "name"
+            ));
+            assert_eq!(
+                unit.source_content(),
+                &crate::rpg_maker::model::TextUnitContent::Value("药水".to_owned())
+            );
         }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extract_replace_standard_accepts_only_single_value_group_kinds() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+
+        for kind in ["dialogue", "choices", "scrolling_text"] {
+            let observations = Arc::new(Mutex::new(TestObservations::default()));
+            let program = format!(
+                r#"
+local items = ctx.rpg_maker.open(ctx.rpg_maker.data("Items.json"))
+ctx.extract.replace_standard({{
+  {{
+    kind = "{kind}",
+    location = items:location({{1}}),
+    fields = {{{{ name = "name", text = items:text({{1, "name"}}) }}}},
+  }},
+}})
+"#
+            );
+            let error = run_extract_program(&runtime, Arc::clone(&observations), program.as_str())
+                .await
+                .expect_err("复合标准组不能通过单值 Lua Extract 契约建立");
+            assert!(matches!(
+                error,
+                TrustedLuaRuntimeExecutionError::Binding(ref error)
+                    if error.kind() == "invalid_standard_snapshot"
+            ));
+            assert!(
+                observations
+                    .lock()
+                    .expect("测试观察锁不应中毒")
+                    .extract_intents
+                    .is_empty()
+            );
+        }
+
         runtime.shutdown().await.unwrap();
     }
 

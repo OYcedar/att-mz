@@ -8,20 +8,24 @@ use std::error::Error;
 use std::fmt;
 
 use super::standard::{
-    AppliedPlaceholder, TranslationInvalidation, TranslationLeafIdentity,
-    TranslationPropagationTarget, TranslationReuse, TranslationReuseSeed, TranslationReuseTarget,
-    TranslationStateContext, TranslationVirtualReason,
+    AppliedPlaceholder, TranslationInvalidation, TranslationPropagationTarget, TranslationReuse,
+    TranslationReuseSeed, TranslationReuseTarget, TranslationStateContext, TranslationUnitIdentity,
+    TranslationVirtualReason,
 };
 use crate::fingerprint::Sha256Fingerprint;
-use crate::rpg_maker::model::TextFieldRole;
+use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
+use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
+use crate::rpg_maker::text::{
+    DataFileName, RpgMakerLocation, RpgMakerSource, StandardDataFile, TextGroupKind,
+};
 
-/// 一个已经完成语言判定和占位符保护的可翻译叶子。
+/// 一个已经完成语言判定和占位符保护的可翻译语义单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationDeduplicationCandidate {
-    identity: TranslationLeafIdentity,
+    identity: TranslationUnitIdentity,
     protected_text: String,
     applied_placeholders: Vec<AppliedPlaceholder>,
-    translation: Option<String>,
+    translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     state_context: TranslationStateContext,
     invalidated: bool,
@@ -29,10 +33,10 @@ pub(crate) struct TranslationDeduplicationCandidate {
 
 impl TranslationDeduplicationCandidate {
     pub(crate) fn new(
-        identity: TranslationLeafIdentity,
+        identity: TranslationUnitIdentity,
         protected_text: impl Into<String>,
         applied_placeholders: Vec<AppliedPlaceholder>,
-        translation: Option<String>,
+        translation: Option<TextUnitContent>,
         translation_state: Option<Sha256Fingerprint>,
         state_context: TranslationStateContext,
         invalidated: bool,
@@ -49,7 +53,7 @@ impl TranslationDeduplicationCandidate {
     }
 }
 
-/// 去重后一个可翻译叶子的任务责任。
+/// 去重后一个可翻译语义单元的任务责任。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationDeduplicationOutcome {
     Active {
@@ -83,7 +87,7 @@ impl TranslationDeduplicationResult {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DeduplicationKey {
     role: DeduplicationRole,
-    original_text: String,
+    source_content: TextUnitContent,
     protected_text: String,
     applied_placeholders: Vec<AppliedPlaceholder>,
 }
@@ -92,38 +96,85 @@ impl DeduplicationKey {
     fn from_candidate(candidate: &TranslationDeduplicationCandidate) -> Self {
         Self {
             role: DeduplicationRole::from_identity(&candidate.identity),
-            original_text: candidate.identity.original_text().to_owned(),
+            source_content: candidate.identity.source_content().clone(),
             protected_text: candidate.protected_text.clone(),
             applied_placeholders: candidate.applied_placeholders.clone(),
         }
     }
 }
 
-/// 只表达姓名投影已经证明需要的去重边界。
-///
-/// Speaker 可以跨组复用；Body 可以跨组复用，但必须具有相同的源 Speaker
-/// 上下文。其余叶子沿用既有按文本语义去重的行为。
+/// 各语义角色已经确认的精确去重边界。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum DeduplicationRole {
     Speaker,
-    Body { translation_context_json: String },
-    Other,
+    Body {
+        source_context_json: String,
+    },
+    Choices {
+        owner: RpgMakerStandardAssetOwner,
+        group_location: RpgMakerLocation,
+    },
+    ScrollingText,
+    Scalar {
+        kind: TextGroupKind,
+        source_domain: ScalarSourceDomain,
+        field: ScalarFieldKey,
+    },
+}
+
+/// 标量的语义来源类别；物理实例序号不参与翻译复用身份。
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ScalarSourceDomain {
+    Data(StandardDataFile),
+    DataFile(DataFileName),
+    Map,
+    PluginParameter {
+        plugin_name: String,
+        parameter_name: String,
+    },
+}
+
+impl ScalarSourceDomain {
+    fn from_source(source: &RpgMakerSource) -> Self {
+        match source {
+            RpgMakerSource::Data(file) => Self::Data(*file),
+            RpgMakerSource::DataFile(file) => Self::DataFile(file.clone()),
+            RpgMakerSource::Map(_) => Self::Map,
+            RpgMakerSource::PluginParameter {
+                plugin_name,
+                parameter_name,
+                ..
+            } => Self::PluginParameter {
+                plugin_name: plugin_name.clone(),
+                parameter_name: parameter_name.clone(),
+            },
+        }
+    }
 }
 
 impl DeduplicationRole {
-    fn from_identity(identity: &TranslationLeafIdentity) -> Self {
+    fn from_identity(identity: &TranslationUnitIdentity) -> Self {
         match identity.role() {
-            TextFieldRole::DialogueSpeaker => Self::Speaker,
-            TextFieldRole::DialogueBody { .. } => Self::Body {
-                translation_context_json: identity.translation_context_json().to_owned(),
+            TextUnitRole::DialogueSpeaker => Self::Speaker,
+            TextUnitRole::DialogueBody => Self::Body {
+                source_context_json: identity.source_context_json().to_owned(),
             },
-            TextFieldRole::Scalar(_) | TextFieldRole::ScrollingTextBody { .. } => Self::Other,
+            TextUnitRole::Choices => Self::Choices {
+                owner: identity.owner(),
+                group_location: identity.group_location().clone(),
+            },
+            TextUnitRole::ScrollingText => Self::ScrollingText,
+            TextUnitRole::Scalar(field) => Self::Scalar {
+                kind: identity.kind(),
+                source_domain: ScalarSourceDomain::from_source(identity.group_location().source()),
+                field: field.clone(),
+            },
         }
     }
 }
 
 struct Family {
-    original_text: String,
+    source_content: TextUnitContent,
     member_indices: Vec<usize>,
 }
 
@@ -137,7 +188,7 @@ pub(crate) fn deduplicate_translation_candidates(
         let key = DeduplicationKey::from_candidate(candidate);
         let index = *family_index.entry(key).or_insert_with(|| {
             families.push(Family {
-                original_text: candidate.identity.original_text().to_owned(),
+                source_content: candidate.identity.source_content().clone(),
                 member_indices: Vec::new(),
             });
             families.len() - 1
@@ -175,11 +226,11 @@ fn plan_family(
     invalidations: &mut Vec<TranslationInvalidation>,
     reuses: &mut Vec<TranslationReuse>,
 ) -> Result<(), TranslationDeduplicationError> {
-    let mut valid_translations = BTreeMap::<&str, Vec<usize>>::new();
+    let mut valid_translations = BTreeMap::<&TextUnitContent, Vec<usize>>::new();
     for &index in &family.member_indices {
         let candidate = &candidates[index];
         if !candidate.invalidated
-            && let Some(translation) = candidate.translation.as_deref()
+            && let Some(translation) = candidate.translation.as_ref()
         {
             valid_translations
                 .entry(translation)
@@ -206,7 +257,7 @@ fn plan_family(
             .collect();
         return Err(
             TranslationDeduplicationError::ConflictingReusableTranslations {
-                original_text: family.original_text.clone(),
+                source_content: family.source_content.clone(),
                 conflicts,
             },
         );
@@ -235,13 +286,13 @@ fn plan_reuse_family(
     let seed = &candidates[seed_index];
     let seed_translation = seed
         .translation
-        .as_deref()
+        .as_ref()
         .expect("只有具有有效译文的成员才能成为复用种子");
     let mut targets = Vec::new();
 
     for &index in &family.member_indices {
         let candidate = &candidates[index];
-        if !candidate.invalidated && candidate.translation.as_deref() == Some(seed_translation) {
+        if !candidate.invalidated && candidate.translation.as_ref() == Some(seed_translation) {
             outcomes[index] = Some(TranslationDeduplicationOutcome::Virtual {
                 reason: TranslationVirtualReason::ExistingTranslation,
             });
@@ -257,6 +308,7 @@ fn plan_reuse_family(
         outcomes[index] = Some(TranslationDeduplicationOutcome::Virtual {
             reason: TranslationVirtualReason::Reused {
                 seed: Box::new(seed.identity.clone()),
+                translation: seed_translation.clone(),
             },
         });
     }
@@ -265,7 +317,7 @@ fn plan_reuse_family(
         reuses.push(TranslationReuse::new(
             TranslationReuseSeed::new(
                 seed.identity.clone(),
-                seed_translation,
+                seed_translation.clone(),
                 seed.translation_state
                     .expect("当前译文必须同时具有 translation_state"),
             ),
@@ -310,7 +362,7 @@ fn plan_active_family(
                 candidate.identity.clone(),
                 candidate
                     .translation
-                    .as_deref()
+                    .clone()
                     .expect("只有已有译文的候选项才可能失效"),
                 candidate
                     .translation_state
@@ -323,12 +375,12 @@ fn plan_active_family(
 /// 同一可安全复用族内的一条冲突译文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConflictingReusableTranslation {
-    identity: TranslationLeafIdentity,
-    translation: String,
+    identity: TranslationUnitIdentity,
+    translation: TextUnitContent,
 }
 
 impl ConflictingReusableTranslation {
-    fn new(identity: TranslationLeafIdentity, translation: String) -> Self {
+    fn new(identity: TranslationUnitIdentity, translation: TextUnitContent) -> Self {
         Self {
             identity,
             translation,
@@ -340,7 +392,7 @@ impl ConflictingReusableTranslation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationDeduplicationError {
     ConflictingReusableTranslations {
-        original_text: String,
+        source_content: TextUnitContent,
         conflicts: Vec<ConflictingReusableTranslation>,
     },
 }
@@ -349,12 +401,12 @@ impl fmt::Display for TranslationDeduplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConflictingReusableTranslations {
-                original_text,
+                source_content,
                 conflicts,
             } => {
                 write!(
                     formatter,
-                    "原文 {original_text:?} 存在 {} 个互相冲突的有效译文：",
+                    "原文语义单元 {source_content:?} 存在 {} 个互相冲突的有效译文：",
                     conflicts.len()
                 )?;
                 for (index, conflict) in conflicts.iter().enumerate() {
@@ -374,7 +426,7 @@ impl fmt::Display for TranslationDeduplicationError {
     }
 }
 
-fn format_logical_location(identity: &TranslationLeafIdentity) -> String {
+fn format_logical_location(identity: &TranslationUnitIdentity) -> String {
     format!("{} / {:?}", identity.group_location(), identity.role())
 }
 
@@ -382,10 +434,11 @@ impl Error for TranslationDeduplicationError {}
 
 #[cfg(test)]
 mod tests {
-    use crate::rpg_maker::model::{ScalarFieldKey, TextFieldRole};
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::{
-        RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
+        DataFileName, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
+        TextGroupKind,
     };
 
     use super::*;
@@ -399,86 +452,94 @@ mod tests {
         TranslationStateContext::new(fingerprint(marker))
     }
 
-    fn identity(index: usize, original: &str) -> TranslationLeafIdentity {
-        let group_location = RpgMakerLocation::value(
-            RpgMakerSource::data(StandardDataFile::Items),
-            vec![RpgMakerLocationStep::index(index)],
-        );
-        TranslationLeafIdentity::new(
+    fn value(text: &str) -> TextUnitContent {
+        TextUnitContent::Value(text.to_owned())
+    }
+
+    fn lines(values: &[&str]) -> TextUnitContent {
+        TextUnitContent::Lines(values.iter().map(|value| (*value).to_owned()).collect())
+    }
+
+    fn identity(
+        kind: TextGroupKind,
+        source: RpgMakerSource,
+        group_index: usize,
+        role: TextUnitRole,
+        source_content: TextUnitContent,
+        source_context_json: &str,
+    ) -> TranslationUnitIdentity {
+        TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
+            kind,
+            RpgMakerLocation::value(source, vec![RpgMakerLocationStep::index(group_index)]),
+            role,
+            source_content,
+            source_context_json,
+        )
+    }
+
+    fn scalar_identity(
+        file: StandardDataFile,
+        group_index: usize,
+        field: &str,
+        source_text: &str,
+    ) -> TranslationUnitIdentity {
+        identity(
             TextGroupKind::DatabaseEntry,
-            group_location,
-            TextFieldRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            original,
+            RpgMakerSource::data(file),
+            group_index,
+            TextUnitRole::Scalar(ScalarFieldKey::new(field).expect("字段键应合法")),
+            value(source_text),
             "{}",
         )
     }
 
-    struct StoredTranslation<'a> {
-        text: &'a str,
+    fn dialogue_identity(
+        group_index: usize,
+        role: TextUnitRole,
+        source_content: TextUnitContent,
+        source_context_json: &str,
+    ) -> TranslationUnitIdentity {
+        identity(
+            TextGroupKind::EventDialogue,
+            RpgMakerSource::map(1),
+            group_index,
+            role,
+            source_content,
+            source_context_json,
+        )
+    }
+
+    struct StoredTranslation {
+        content: TextUnitContent,
         state: Sha256Fingerprint,
     }
 
-    impl<'a> StoredTranslation<'a> {
-        const fn new(text: &'a str, state: Sha256Fingerprint) -> Self {
-            Self { text, state }
+    impl StoredTranslation {
+        fn new(content: TextUnitContent, state: Sha256Fingerprint) -> Self {
+            Self { content, state }
         }
     }
 
     fn candidate(
-        index: usize,
-        original: &str,
+        identity: TranslationUnitIdentity,
         protected_text: &str,
         placeholders: Vec<AppliedPlaceholder>,
-        stored_translation: Option<StoredTranslation<'_>>,
+        stored_translation: Option<StoredTranslation>,
         state_context: TranslationStateContext,
         invalidated: bool,
     ) -> TranslationDeduplicationCandidate {
         let (translation, translation_state) = stored_translation
-            .map(|stored| (Some(stored.text.to_owned()), Some(stored.state)))
+            .map(|stored| (Some(stored.content), Some(stored.state)))
             .unwrap_or_default();
         TranslationDeduplicationCandidate::new(
-            identity(index, original),
+            identity,
             protected_text,
             placeholders,
             translation,
             translation_state,
             state_context,
             invalidated,
-        )
-    }
-
-    fn dialogue_candidate(
-        group_index: usize,
-        role: TextFieldRole,
-        original: &str,
-        translation_context_json: &str,
-        context_marker: u8,
-    ) -> TranslationDeduplicationCandidate {
-        let identity = TranslationLeafIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
-            TextGroupKind::EventDialogue,
-            RpgMakerLocation::value(
-                RpgMakerSource::map(1),
-                vec![
-                    RpgMakerLocationStep::key("events"),
-                    RpgMakerLocationStep::index(group_index),
-                    RpgMakerLocationStep::key("list"),
-                    RpgMakerLocationStep::index(0),
-                ],
-            ),
-            role,
-            original,
-            translation_context_json,
-        );
-        TranslationDeduplicationCandidate::new(
-            identity,
-            original,
-            Vec::new(),
-            None,
-            None,
-            state_context(context_marker),
-            false,
         )
     }
 
@@ -494,16 +555,15 @@ mod tests {
     }
 
     #[test]
-    fn family_without_current_seed_uses_first_member_and_propagates_in_natural_order() {
-        let first = identity(1, "保存しますか？");
-        let second = identity(2, "保存しますか？");
-        let third = identity(3, "保存しますか？");
+    fn family_without_current_seed_uses_first_unit_and_propagates_in_natural_order() {
+        let first = scalar_identity(StandardDataFile::Items, 1, "name", "保存しますか？");
+        let second = scalar_identity(StandardDataFile::Items, 2, "name", "保存しますか？");
+        let third = scalar_identity(StandardDataFile::Items, 3, "name", "保存しますか？");
         let second_context = state_context(2);
         let third_context = state_context(3);
         let result = deduplicate_translation_candidates(vec![
             candidate(
-                1,
-                "保存しますか？",
+                first.clone(),
                 "保存しますか？",
                 Vec::new(),
                 None,
@@ -511,8 +571,7 @@ mod tests {
                 false,
             ),
             candidate(
-                2,
-                "保存しますか？",
+                second.clone(),
                 "保存しますか？",
                 Vec::new(),
                 None,
@@ -520,8 +579,7 @@ mod tests {
                 false,
             ),
             candidate(
-                3,
-                "保存しますか？",
+                third.clone(),
                 "保存しますか？",
                 Vec::new(),
                 None,
@@ -565,20 +623,27 @@ mod tests {
     fn current_state_translation_becomes_a_reuse_seed() {
         let seed_context = state_context(1);
         let target_context = state_context(2);
-        let seed_state = seed_context.finish("Save");
-        let seed = identity(1, "保存");
-        let target = identity(2, "保存");
+        let translation = value("Save");
+        let seed_state = seed_context.finish(&translation);
+        let seed = scalar_identity(StandardDataFile::Items, 1, "name", "保存");
+        let target = scalar_identity(StandardDataFile::Items, 2, "name", "保存");
         let result = deduplicate_translation_candidates(vec![
             candidate(
-                1,
-                "保存",
+                seed.clone(),
                 "保存",
                 Vec::new(),
-                Some(StoredTranslation::new("Save", seed_state)),
+                Some(StoredTranslation::new(translation.clone(), seed_state)),
                 seed_context,
                 false,
             ),
-            candidate(2, "保存", "保存", Vec::new(), None, target_context, false),
+            candidate(
+                target.clone(),
+                "保存",
+                Vec::new(),
+                None,
+                target_context,
+                false,
+            ),
         ])
         .expect("当前译文应直接复用");
         let (outcomes, invalidations, reuses) = result.into_parts();
@@ -586,13 +651,13 @@ mod tests {
         assert!(invalidations.is_empty());
         assert_eq!(reuses.len(), 1);
         assert_eq!(reuses[0].seed().identity(), &seed);
-        assert_eq!(reuses[0].seed().expected_translation(), "Save");
+        assert_eq!(reuses[0].seed().expected_translation(), &translation);
         assert_eq!(reuses[0].seed().expected_translation_state(), seed_state);
         assert_eq!(reuses[0].targets()[0].identity(), &target);
         assert_eq!(reuses[0].targets()[0].expected_translation(), None);
         assert_eq!(
             reuses[0].targets()[0].replacement_translation_state(),
-            target_context.finish("Save")
+            target_context.finish(&translation)
         );
         assert!(matches!(
             &outcomes[0],
@@ -603,7 +668,7 @@ mod tests {
         assert!(matches!(
             &outcomes[1],
             TranslationDeduplicationOutcome::Virtual {
-                reason: TranslationVirtualReason::Reused { seed: actual }
+                reason: TranslationVirtualReason::Reused { seed: actual, .. }
             } if actual.as_ref() == &seed
         ));
     }
@@ -613,80 +678,120 @@ mod tests {
         let earliest_context = state_context(1);
         let later_context = state_context(2);
         let target_context = state_context(3);
-        let earliest_seed = identity(1, "保存");
+        let translation = value("保存");
+        let earliest_seed = scalar_identity(StandardDataFile::Items, 1, "name", "保存");
+        let later_seed = scalar_identity(StandardDataFile::Items, 2, "name", "保存");
+        let target = scalar_identity(StandardDataFile::Items, 3, "name", "保存");
         let result = deduplicate_translation_candidates(vec![
             candidate(
-                1,
-                "保存",
+                earliest_seed.clone(),
                 "保存",
                 Vec::new(),
                 Some(StoredTranslation::new(
-                    "保存",
-                    earliest_context.finish("保存"),
+                    translation.clone(),
+                    earliest_context.finish(&translation),
                 )),
                 earliest_context,
                 false,
             ),
             candidate(
-                2,
-                "保存",
+                later_seed,
                 "保存",
                 Vec::new(),
-                Some(StoredTranslation::new("保存", later_context.finish("保存"))),
+                Some(StoredTranslation::new(
+                    translation.clone(),
+                    later_context.finish(&translation),
+                )),
                 later_context,
                 false,
             ),
-            candidate(3, "保存", "保存", Vec::new(), None, target_context, false),
-        ])
-        .expect("相同当前译文不构成冲突");
-        let (_, _, reuses) = result.into_parts();
-
-        assert_eq!(reuses.len(), 1);
-        assert_eq!(reuses[0].seed().identity(), &earliest_seed);
-        assert_eq!(reuses[0].targets().len(), 1);
-        assert_eq!(reuses[0].targets()[0].identity(), &identity(3, "保存"));
-        assert_eq!(
-            reuses[0].targets()[0].replacement_translation_state(),
-            target_context.finish("保存")
-        );
-    }
-
-    #[test]
-    fn stale_translation_is_overwritten_when_a_current_seed_exists() {
-        let stale_context = state_context(1);
-        let current_context = state_context(2);
-        let stale_state = fingerprint(91);
-        let current_state = current_context.finish("保存");
-        let result = deduplicate_translation_candidates(vec![
             candidate(
-                1,
-                "保存",
+                target.clone(),
                 "保存",
                 Vec::new(),
-                Some(StoredTranslation::new("旧译文", stale_state)),
-                stale_context,
-                true,
-            ),
-            candidate(
-                2,
-                "保存",
-                "保存",
-                Vec::new(),
-                Some(StoredTranslation::new("保存", current_state)),
-                current_context,
+                None,
+                target_context,
                 false,
             ),
         ])
-        .expect("失效译文不能成为种子，但可以由当前种子覆盖");
+        .expect("相同当前译文不构成冲突");
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
         assert_eq!(reuses.len(), 1);
-        assert_eq!(reuses[0].seed().identity(), &identity(2, "保存"));
+        assert_eq!(reuses[0].seed().identity(), &earliest_seed);
+        assert_eq!(reuses[0].targets().len(), 1);
+        assert_eq!(reuses[0].targets()[0].identity(), &target);
+        assert_eq!(
+            reuses[0].targets()[0].replacement_translation_state(),
+            target_context.finish(&translation)
+        );
+        assert!(matches!(
+            outcomes[0],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::ExistingTranslation
+            }
+        ));
+        assert!(matches!(
+            outcomes[1],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::ExistingTranslation
+            }
+        ));
+        assert!(matches!(
+            &outcomes[2],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::Reused { seed, .. }
+            } if seed.as_ref() == &earliest_seed
+        ));
+    }
+
+    #[test]
+    fn current_seed_atomically_overwrites_a_stale_target() {
+        let stale_context = state_context(1);
+        let current_context = state_context(2);
+        let stale_translation = value("旧译文");
+        let current_translation = value("保存");
+        let stale_state = fingerprint(91);
+        let current_state = current_context.finish(&current_translation);
+        let stale_target = scalar_identity(StandardDataFile::Items, 1, "name", "保存");
+        let current_seed = scalar_identity(StandardDataFile::Items, 2, "name", "保存");
+        let result = deduplicate_translation_candidates(vec![
+            candidate(
+                stale_target.clone(),
+                "保存",
+                Vec::new(),
+                Some(StoredTranslation::new(
+                    stale_translation.clone(),
+                    stale_state,
+                )),
+                stale_context,
+                true,
+            ),
+            candidate(
+                current_seed.clone(),
+                "保存",
+                Vec::new(),
+                Some(StoredTranslation::new(
+                    current_translation.clone(),
+                    current_state,
+                )),
+                current_context,
+                false,
+            ),
+        ])
+        .expect("失效译文不能成为种子，但可由当前种子原子覆盖");
+        let (outcomes, invalidations, reuses) = result.into_parts();
+
+        assert!(invalidations.is_empty());
+        assert_eq!(reuses.len(), 1);
+        assert_eq!(reuses[0].seed().identity(), &current_seed);
         assert_eq!(reuses[0].seed().expected_translation_state(), current_state);
+        assert_eq!(reuses[0].targets().len(), 1);
+        assert_eq!(reuses[0].targets()[0].identity(), &stale_target);
         assert_eq!(
             reuses[0].targets()[0].expected_translation(),
-            Some("旧译文")
+            Some(&stale_translation)
         );
         assert_eq!(
             reuses[0].targets()[0].expected_translation_state(),
@@ -694,13 +799,19 @@ mod tests {
         );
         assert_eq!(
             reuses[0].targets()[0].replacement_translation_state(),
-            stale_context.finish("保存")
+            stale_context.finish(&current_translation)
         );
         assert!(matches!(
             &outcomes[0],
             TranslationDeduplicationOutcome::Virtual {
-                reason: TranslationVirtualReason::Reused { seed }
-            } if seed.as_ref() == &identity(2, "保存")
+                reason: TranslationVirtualReason::Reused { seed, .. }
+            } if seed.as_ref() == &current_seed
+        ));
+        assert!(matches!(
+            outcomes[1],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::ExistingTranslation
+            }
         ));
     }
 
@@ -708,24 +819,27 @@ mod tests {
     fn conflicting_current_translations_fail_before_a_plan_exists() {
         let first_context = state_context(1);
         let second_context = state_context(2);
+        let first_translation = value("Save");
+        let second_translation = value("Store");
         let error = deduplicate_translation_candidates(vec![
             candidate(
-                1,
-                "保存",
+                scalar_identity(StandardDataFile::Items, 1, "name", "保存"),
                 "保存",
                 Vec::new(),
-                Some(StoredTranslation::new("Save", first_context.finish("Save"))),
+                Some(StoredTranslation::new(
+                    first_translation.clone(),
+                    first_context.finish(&first_translation),
+                )),
                 first_context,
                 false,
             ),
             candidate(
-                2,
-                "保存",
+                scalar_identity(StandardDataFile::Items, 2, "name", "保存"),
                 "保存",
                 Vec::new(),
                 Some(StoredTranslation::new(
-                    "Store",
-                    second_context.finish("Store"),
+                    second_translation.clone(),
+                    second_context.finish(&second_translation),
                 )),
                 second_context,
                 false,
@@ -746,8 +860,7 @@ mod tests {
     fn placeholder_contracts_are_part_of_the_exact_family_identity() {
         let result = deduplicate_translation_candidates(vec![
             candidate(
-                1,
-                "\\N[1]",
+                scalar_identity(StandardDataFile::Items, 1, "name", "\\N[1]"),
                 "⟦ATT_00000000_00000000⟧",
                 vec![placeholder("database_entry")],
                 None,
@@ -755,8 +868,7 @@ mod tests {
                 false,
             ),
             candidate(
-                2,
-                "\\N[1]",
+                scalar_identity(StandardDataFile::Items, 2, "name", "\\N[1]"),
                 "⟦ATT_00000000_00000000⟧",
                 vec![placeholder("event_dialogue")],
                 None,
@@ -778,33 +890,76 @@ mod tests {
     }
 
     #[test]
-    fn dialogue_roles_and_source_speaker_context_define_deduplication_families() {
+    fn complete_dialogue_sequence_and_source_speaker_define_the_family() {
+        let same = lines(&["同", "一句"]);
         let result = deduplicate_translation_candidates(vec![
-            dialogue_candidate(1, TextFieldRole::DialogueSpeaker, "同一句", "{}", 1),
-            dialogue_candidate(
-                1,
-                TextFieldRole::DialogueBody { index: 0 },
-                "同一句",
-                r#"{"source_speaker":"甲"}"#,
-                2,
+            candidate(
+                dialogue_identity(
+                    1,
+                    TextUnitRole::DialogueBody,
+                    same.clone(),
+                    r#"{"source_speaker":"甲"}"#,
+                ),
+                "相同保护结果",
+                Vec::new(),
+                None,
+                state_context(1),
+                false,
             ),
-            dialogue_candidate(
-                2,
-                TextFieldRole::DialogueBody { index: 0 },
-                "同一句",
-                r#"{"source_speaker":"甲"}"#,
-                3,
+            candidate(
+                dialogue_identity(
+                    2,
+                    TextUnitRole::DialogueBody,
+                    same,
+                    r#"{"source_speaker":"甲"}"#,
+                ),
+                "相同保护结果",
+                Vec::new(),
+                None,
+                state_context(2),
+                false,
             ),
-            dialogue_candidate(
-                3,
-                TextFieldRole::DialogueBody { index: 0 },
-                "同一句",
-                r#"{"source_speaker":"乙"}"#,
-                4,
+            candidate(
+                dialogue_identity(
+                    3,
+                    TextUnitRole::DialogueBody,
+                    lines(&["同", "一句"]),
+                    r#"{"source_speaker":"乙"}"#,
+                ),
+                "相同保护结果",
+                Vec::new(),
+                None,
+                state_context(3),
+                false,
             ),
-            dialogue_candidate(4, TextFieldRole::DialogueSpeaker, "同一句", "{}", 5),
+            candidate(
+                dialogue_identity(
+                    4,
+                    TextUnitRole::DialogueBody,
+                    lines(&["同一句"]),
+                    r#"{"source_speaker":"甲"}"#,
+                ),
+                "相同保护结果",
+                Vec::new(),
+                None,
+                state_context(4),
+                false,
+            ),
+            candidate(
+                dialogue_identity(
+                    5,
+                    TextUnitRole::DialogueBody,
+                    lines(&["同", "", "一句"]),
+                    r#"{"source_speaker":"甲"}"#,
+                ),
+                "相同保护结果",
+                Vec::new(),
+                None,
+                state_context(5),
+                false,
+            ),
         ])
-        .expect("姓名和正文应按强角色及源姓名上下文去重");
+        .expect("正文必须按完整有序行及源姓名上下文去重");
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(invalidations.is_empty());
@@ -813,58 +968,55 @@ mod tests {
             &outcomes[0],
             TranslationDeduplicationOutcome::Active { propagation_targets }
                 if propagation_targets.len() == 1
-                    && propagation_targets[0].identity().role()
-                        == &TextFieldRole::DialogueSpeaker
-        ));
-        assert!(matches!(
-            &outcomes[1],
-            TranslationDeduplicationOutcome::Active { propagation_targets }
-                if propagation_targets.len() == 1
                     && propagation_targets[0].identity().group_location()
                         == &RpgMakerLocation::value(
                             RpgMakerSource::map(1),
-                            vec![
-                                RpgMakerLocationStep::key("events"),
-                                RpgMakerLocationStep::index(2),
-                                RpgMakerLocationStep::key("list"),
-                                RpgMakerLocationStep::index(0),
-                            ],
+                            vec![RpgMakerLocationStep::index(2)],
                         )
         ));
-        assert!(matches!(
-            outcomes[3],
+        assert!(outcomes[2..].iter().all(|outcome| matches!(
+            outcome,
             TranslationDeduplicationOutcome::Active {
-                ref propagation_targets
+                propagation_targets
             } if propagation_targets.is_empty()
-        ));
+        )));
     }
 
     #[test]
-    fn textual_near_matches_are_not_deduplicated() {
+    fn choices_never_deduplicate_across_groups() {
         let result = deduplicate_translation_candidates(vec![
-            candidate(1, "Save", "Save", Vec::new(), None, state_context(1), false),
-            candidate(2, "save", "save", Vec::new(), None, state_context(2), false),
             candidate(
-                3,
-                "Save ",
-                "Save ",
+                identity(
+                    TextGroupKind::EventChoices,
+                    RpgMakerSource::map(1),
+                    1,
+                    TextUnitRole::Choices,
+                    lines(&["はい", "いいえ"]),
+                    "{}",
+                ),
+                "はい\nいいえ",
                 Vec::new(),
                 None,
-                state_context(3),
+                state_context(1),
                 false,
             ),
-            candidate(4, "é", "é", Vec::new(), None, state_context(4), false),
             candidate(
-                5,
-                "e\u{301}",
-                "e\u{301}",
+                identity(
+                    TextGroupKind::EventChoices,
+                    RpgMakerSource::map(1),
+                    2,
+                    TextUnitRole::Choices,
+                    lines(&["はい", "いいえ"]),
+                    "{}",
+                ),
+                "はい\nいいえ",
                 Vec::new(),
                 None,
-                state_context(5),
+                state_context(2),
                 false,
             ),
         ])
-        .expect("大小写、空白和 Unicode 表示差异必须保留为不同原文");
+        .expect("相同选项文本在不同问题下也必须独立翻译");
         let (outcomes, _, _) = result.into_parts();
 
         assert!(outcomes.iter().all(|outcome| matches!(
@@ -876,74 +1028,403 @@ mod tests {
     }
 
     #[test]
-    fn stale_translation_without_current_seed_is_invalidated() {
-        let stale_context = state_context(1);
-        let pending_context = state_context(2);
-        let stale_state = fingerprint(81);
+    fn scrolling_text_deduplicates_only_the_exact_ordered_sequence() {
         let result = deduplicate_translation_candidates(vec![
             candidate(
-                1,
-                "保存",
+                identity(
+                    TextGroupKind::EventScrollingText,
+                    RpgMakerSource::map(1),
+                    1,
+                    TextUnitRole::ScrollingText,
+                    lines(&["制作", "", "甲"]),
+                    "{}",
+                ),
+                "相同保护结果",
+                Vec::new(),
+                None,
+                state_context(1),
+                false,
+            ),
+            candidate(
+                identity(
+                    TextGroupKind::EventScrollingText,
+                    RpgMakerSource::map(2),
+                    2,
+                    TextUnitRole::ScrollingText,
+                    lines(&["制作", "", "甲"]),
+                    "{}",
+                ),
+                "相同保护结果",
+                Vec::new(),
+                None,
+                state_context(2),
+                false,
+            ),
+            candidate(
+                identity(
+                    TextGroupKind::EventScrollingText,
+                    RpgMakerSource::map(3),
+                    3,
+                    TextUnitRole::ScrollingText,
+                    lines(&["制作", "甲", ""]),
+                    "{}",
+                ),
+                "相同保护结果",
+                Vec::new(),
+                None,
+                state_context(3),
+                false,
+            ),
+        ])
+        .expect("滚动文本只应按完整有序行序列去重");
+        let (outcomes, _, _) = result.into_parts();
+
+        assert!(matches!(
+            &outcomes[0],
+            TranslationDeduplicationOutcome::Active { propagation_targets }
+                if propagation_targets == &[TranslationPropagationTarget::new(
+                    identity(
+                        TextGroupKind::EventScrollingText,
+                        RpgMakerSource::map(2),
+                        2,
+                        TextUnitRole::ScrollingText,
+                        lines(&["制作", "", "甲"]),
+                        "{}",
+                    ),
+                    state_context(2),
+                )]
+        ));
+        assert!(matches!(
+            &outcomes[2],
+            TranslationDeduplicationOutcome::Active { propagation_targets }
+                if propagation_targets.is_empty()
+        ));
+    }
+
+    #[test]
+    fn scalar_semantic_domain_and_field_are_part_of_the_family() {
+        let result = deduplicate_translation_candidates(vec![
+            candidate(
+                scalar_identity(StandardDataFile::Items, 1, "name", "共通"),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(1),
+                false,
+            ),
+            candidate(
+                scalar_identity(StandardDataFile::Items, 2, "name", "共通"),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(2),
+                false,
+            ),
+            candidate(
+                scalar_identity(StandardDataFile::Skills, 1, "name", "共通"),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(3),
+                false,
+            ),
+            candidate(
+                scalar_identity(StandardDataFile::Items, 3, "description", "共通"),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(4),
+                false,
+            ),
+        ])
+        .expect("相同标量只有语义域和字段都相同才可复用");
+        let (outcomes, _, _) = result.into_parts();
+
+        assert!(matches!(
+            &outcomes[0],
+            TranslationDeduplicationOutcome::Active { propagation_targets }
+                if propagation_targets.len() == 1
+        ));
+        assert!(outcomes[2..].iter().all(|outcome| matches!(
+            outcome,
+            TranslationDeduplicationOutcome::Active { propagation_targets }
+                if propagation_targets.is_empty()
+        )));
+    }
+
+    #[test]
+    fn scalar_semantic_domain_ignores_physical_map_and_plugin_indexes() {
+        let scalar = |kind, source, index, field: &str| {
+            identity(
+                kind,
+                source,
+                index,
+                TextUnitRole::Scalar(ScalarFieldKey::new(field).expect("字段键应合法")),
+                value("共通"),
+                "{}",
+            )
+        };
+        let map_target = scalar(TextGroupKind::Map, RpgMakerSource::map(9), 2, "displayName");
+        let plugin_target = scalar(
+            TextGroupKind::PluginParameter,
+            RpgMakerSource::plugin_parameter(8, "MenuCore", "title"),
+            5,
+            "text",
+        );
+        let result = deduplicate_translation_candidates(vec![
+            candidate(
+                scalar(TextGroupKind::Map, RpgMakerSource::map(1), 1, "displayName"),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(1),
+                false,
+            ),
+            candidate(
+                map_target.clone(),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(2),
+                false,
+            ),
+            candidate(
+                scalar(
+                    TextGroupKind::EventCommand,
+                    RpgMakerSource::map(2),
+                    3,
+                    "displayName",
+                ),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(3),
+                false,
+            ),
+            candidate(
+                scalar(
+                    TextGroupKind::PluginParameter,
+                    RpgMakerSource::plugin_parameter(1, "MenuCore", "title"),
+                    4,
+                    "text",
+                ),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(4),
+                false,
+            ),
+            candidate(
+                plugin_target.clone(),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(5),
+                false,
+            ),
+            candidate(
+                scalar(
+                    TextGroupKind::PluginParameter,
+                    RpgMakerSource::plugin_parameter(9, "MenuCore", "subtitle"),
+                    6,
+                    "text",
+                ),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(6),
+                false,
+            ),
+        ])
+        .expect("Map ID 与插件加载索引不应切碎标量语义域");
+        let (outcomes, _, _) = result.into_parts();
+
+        assert!(matches!(
+            &outcomes[0],
+            TranslationDeduplicationOutcome::Active { propagation_targets }
+                if propagation_targets == &[TranslationPropagationTarget::new(
+                    map_target,
+                    state_context(2),
+                )]
+        ));
+        assert!(matches!(
+            outcomes[1],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::Duplicate { .. }
+            }
+        ));
+        assert!(matches!(
+            &outcomes[2],
+            TranslationDeduplicationOutcome::Active { propagation_targets }
+                if propagation_targets.is_empty()
+        ));
+        assert!(matches!(
+            &outcomes[3],
+            TranslationDeduplicationOutcome::Active { propagation_targets }
+                if propagation_targets == &[TranslationPropagationTarget::new(
+                    plugin_target,
+                    state_context(5),
+                )]
+        ));
+        assert!(matches!(
+            outcomes[4],
+            TranslationDeduplicationOutcome::Virtual {
+                reason: TranslationVirtualReason::Duplicate { .. }
+            }
+        ));
+        assert!(matches!(
+            &outcomes[5],
+            TranslationDeduplicationOutcome::Active { propagation_targets }
+                if propagation_targets.is_empty()
+        ));
+    }
+
+    #[test]
+    fn scalar_semantic_domain_preserves_custom_file_and_plugin_names() {
+        let scalar = |kind, source, index| {
+            identity(
+                kind,
+                source,
+                index,
+                TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+                value("共通"),
+                "{}",
+            )
+        };
+        let result = deduplicate_translation_candidates(vec![
+            candidate(
+                scalar(
+                    TextGroupKind::DatabaseEntry,
+                    RpgMakerSource::data_file(
+                        DataFileName::parse("Quests.json").expect("自定义文件名应合法"),
+                    ),
+                    1,
+                ),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(1),
+                false,
+            ),
+            candidate(
+                scalar(
+                    TextGroupKind::DatabaseEntry,
+                    RpgMakerSource::data_file(
+                        DataFileName::parse("Bestiary.json").expect("自定义文件名应合法"),
+                    ),
+                    2,
+                ),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(2),
+                false,
+            ),
+            candidate(
+                scalar(
+                    TextGroupKind::PluginParameter,
+                    RpgMakerSource::plugin_parameter(1, "MenuCore", "title"),
+                    3,
+                ),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(3),
+                false,
+            ),
+            candidate(
+                scalar(
+                    TextGroupKind::PluginParameter,
+                    RpgMakerSource::plugin_parameter(2, "BattleCore", "title"),
+                    4,
+                ),
+                "共通",
+                Vec::new(),
+                None,
+                state_context(4),
+                false,
+            ),
+        ])
+        .expect("不同自定义文件或插件不能因字段和原文相同而误复用");
+        let (outcomes, _, _) = result.into_parts();
+
+        assert!(outcomes.iter().all(|outcome| matches!(
+            outcome,
+            TranslationDeduplicationOutcome::Active {
+                propagation_targets
+            } if propagation_targets.is_empty()
+        )));
+    }
+
+    #[test]
+    fn speaker_values_deduplicate_globally() {
+        let first = dialogue_identity(1, TextUnitRole::DialogueSpeaker, value("アリス"), "{}");
+        let second = identity(
+            TextGroupKind::EventDialogue,
+            RpgMakerSource::map(9),
+            2,
+            TextUnitRole::DialogueSpeaker,
+            value("アリス"),
+            "{}",
+        );
+        let result = deduplicate_translation_candidates(vec![
+            candidate(first, "アリス", Vec::new(), None, state_context(1), false),
+            candidate(second, "アリス", Vec::new(), None, state_context(2), false),
+        ])
+        .expect("完全相同的说话人应全局去重");
+        let (outcomes, _, _) = result.into_parts();
+
+        assert!(matches!(
+            &outcomes[0],
+            TranslationDeduplicationOutcome::Active { propagation_targets }
+                if propagation_targets.len() == 1
+        ));
+    }
+
+    #[test]
+    fn stale_translation_without_current_seed_is_invalidated_atomically() {
+        let stale_context = state_context(1);
+        let pending_context = state_context(2);
+        let stale_translation = value("旧译文");
+        let stale_state = fingerprint(81);
+        let first = scalar_identity(StandardDataFile::Items, 1, "name", "保存");
+        let second = scalar_identity(StandardDataFile::Items, 2, "name", "保存");
+        let result = deduplicate_translation_candidates(vec![
+            candidate(
+                first.clone(),
                 "保存",
                 Vec::new(),
-                Some(StoredTranslation::new("旧译文", stale_state)),
+                Some(StoredTranslation::new(
+                    stale_translation.clone(),
+                    stale_state,
+                )),
                 stale_context,
                 true,
             ),
-            candidate(2, "保存", "保存", Vec::new(), None, pending_context, false),
+            candidate(
+                second.clone(),
+                "保存",
+                Vec::new(),
+                None,
+                pending_context,
+                false,
+            ),
         ])
-        .expect("失效译文应按待翻译原文处理");
+        .expect("失效译文应按待翻译语义单元处理");
         let (outcomes, invalidations, reuses) = result.into_parts();
 
         assert!(matches!(
             &outcomes[0],
             TranslationDeduplicationOutcome::Active { propagation_targets }
                 if propagation_targets == &[TranslationPropagationTarget::new(
-                    identity(2, "保存"),
+                    second,
                     pending_context,
                 )]
         ));
         assert_eq!(invalidations.len(), 1);
-        assert_eq!(invalidations[0].identity(), &identity(1, "保存"));
-        assert_eq!(invalidations[0].expected_translation(), "旧译文");
+        assert_eq!(invalidations[0].identity(), &first);
+        assert_eq!(invalidations[0].expected_translation(), &stale_translation);
         assert_eq!(invalidations[0].expected_translation_state(), stale_state);
         assert!(reuses.is_empty());
-    }
-
-    #[test]
-    fn repeated_planning_preserves_interleaved_family_order() {
-        let candidates = vec![
-            candidate(1, "保存", "保存", Vec::new(), None, state_context(1), false),
-            candidate(2, "終了", "終了", Vec::new(), None, state_context(2), false),
-            candidate(3, "保存", "保存", Vec::new(), None, state_context(3), false),
-            candidate(4, "終了", "終了", Vec::new(), None, state_context(4), false),
-        ];
-
-        let first =
-            deduplicate_translation_candidates(candidates.clone()).expect("稳定输入应能完成去重");
-        let second = deduplicate_translation_candidates(candidates).expect("重复规划应能完成去重");
-
-        assert_eq!(first, second);
-        let (outcomes, invalidations, reuses) = first.into_parts();
-        assert!(invalidations.is_empty());
-        assert!(reuses.is_empty());
-        assert_eq!(
-            outcomes[0],
-            TranslationDeduplicationOutcome::Active {
-                propagation_targets: vec![TranslationPropagationTarget::new(
-                    identity(3, "保存"),
-                    state_context(3),
-                )],
-            }
-        );
-        assert_eq!(
-            outcomes[1],
-            TranslationDeduplicationOutcome::Active {
-                propagation_targets: vec![TranslationPropagationTarget::new(
-                    identity(4, "終了"),
-                    state_context(4),
-                )],
-            }
-        );
     }
 }

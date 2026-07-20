@@ -16,51 +16,164 @@ use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, LogicalTextLocation,
-    MutationTarget, TextFieldRole, TextProjectionRecipe,
+    MutationTarget, TextProjectionRecipe, TextUnitContent, TextUnitRole,
 };
 use crate::rpg_maker::project::{MaxFullwidthChars, OpenedProject, RpgMakerWriteBackLayoutProfile};
 use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
 };
 
-/// 一个可独立拥有译文的逻辑文本叶。
+/// 一个可独立拥有译文、验收并原子写回的语义文本单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StandardWriteBackLeaf {
-    role: TextFieldRole,
-    original_text: String,
-    translation: Option<String>,
+pub(crate) struct StandardWriteBackUnit {
+    role: TextUnitRole,
+    source_content: TextUnitContent,
+    translation_content: Option<TextUnitContent>,
 }
 
-impl StandardWriteBackLeaf {
+impl StandardWriteBackUnit {
     pub(crate) fn new(
-        role: TextFieldRole,
-        original_text: impl Into<String>,
-        translation: Option<String>,
+        role: TextUnitRole,
+        source_content: TextUnitContent,
+        translation_content: Option<TextUnitContent>,
     ) -> Result<Self, StandardWriteBackSnapshotError> {
-        let original_text = original_text.into();
-        if original_text.trim().is_empty() {
-            return Err(StandardWriteBackSnapshotError::BlankOriginal { role });
+        validate_content_shape(&role, &source_content)?;
+        validate_content_lines(&role, &source_content, "原文")?;
+        if source_content.is_blank() {
+            return Err(StandardWriteBackSnapshotError::BlankSourceContent { role });
         }
-        if translation
-            .as_deref()
-            .is_some_and(|translation| translation.trim().is_empty())
-        {
-            return Err(StandardWriteBackSnapshotError::BlankTranslation { role });
+        if let Some(translation) = &translation_content {
+            validate_content_shape(&role, translation)?;
+            validate_content_lines(&role, translation, "译文")?;
+            if translation.is_blank() {
+                return Err(StandardWriteBackSnapshotError::BlankTranslationContent { role });
+            }
+            if matches!(role, TextUnitRole::Choices | TextUnitRole::ScrollingText) {
+                let source_lines = source_content
+                    .as_lines()
+                    .expect("严格对齐角色的原文必须是行序列");
+                let translated_lines = translation
+                    .as_lines()
+                    .expect("严格对齐角色的译文必须是行序列");
+                if source_lines.len() != translated_lines.len() {
+                    return Err(StandardWriteBackSnapshotError::AlignedLineCountMismatch {
+                        role,
+                        expected: source_lines.len(),
+                        actual: translated_lines.len(),
+                    });
+                }
+                for (line_index, (source, translated)) in
+                    source_lines.iter().zip(translated_lines).enumerate()
+                {
+                    let source_is_blank = source.trim().is_empty();
+                    if (source_is_blank && !translated.is_empty())
+                        || (!source_is_blank && translated.trim().is_empty())
+                    {
+                        return Err(StandardWriteBackSnapshotError::AlignedBlankLineMismatch {
+                            role,
+                            line_index,
+                        });
+                    }
+                }
+            }
         }
         Ok(Self {
             role,
-            original_text,
-            translation,
+            source_content,
+            translation_content,
         })
+    }
+
+    fn effective_content(&self) -> &TextUnitContent {
+        self.translation_content
+            .as_ref()
+            .unwrap_or(&self.source_content)
     }
 }
 
-/// 一组逻辑叶及其已经物化的物理写回配方。
+fn aligned_replacement_lines(unit: &StandardWriteBackUnit) -> Option<Vec<String>> {
+    let translated = unit.translation_content.as_ref()?.as_lines()?;
+    let source = unit
+        .source_content
+        .as_lines()
+        .expect("严格对齐单元的原文必须是行序列");
+    Some(
+        source
+            .iter()
+            .zip(translated)
+            .map(|(source, translated)| {
+                if source.trim().is_empty() {
+                    source.clone()
+                } else {
+                    translated.clone()
+                }
+            })
+            .collect(),
+    )
+}
+
+fn validate_content_shape(
+    role: &TextUnitRole,
+    content: &TextUnitContent,
+) -> Result<(), StandardWriteBackSnapshotError> {
+    if role.expects_lines() != matches!(content, TextUnitContent::Lines(_)) {
+        return Err(StandardWriteBackSnapshotError::ContentShapeMismatch { role: role.clone() });
+    }
+    Ok(())
+}
+
+fn validate_content_lines(
+    role: &TextUnitRole,
+    content: &TextUnitContent,
+    column: &'static str,
+) -> Result<(), StandardWriteBackSnapshotError> {
+    match content {
+        TextUnitContent::Value(value) => {
+            if value.contains('\0') {
+                return Err(StandardWriteBackSnapshotError::InvalidContentLine {
+                    role: role.clone(),
+                    column,
+                    line_index: 0,
+                });
+            }
+            if matches!(role, TextUnitRole::DialogueSpeaker)
+                && (value.contains('\r') || value.contains('\n'))
+            {
+                return Err(StandardWriteBackSnapshotError::InvalidContentLine {
+                    role: role.clone(),
+                    column,
+                    line_index: 0,
+                });
+            }
+        }
+        TextUnitContent::Lines(lines) => {
+            if lines.is_empty() {
+                return Err(StandardWriteBackSnapshotError::EmptyLineContent {
+                    role: role.clone(),
+                    column,
+                });
+            }
+            if let Some(line_index) = lines.iter().position(|line| {
+                line.chars()
+                    .any(|value| matches!(value, '\r' | '\n' | '\0'))
+            }) {
+                return Err(StandardWriteBackSnapshotError::InvalidContentLine {
+                    role: role.clone(),
+                    column,
+                    line_index,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 一组语义单元及其已经物化的物理写回配方。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StandardWriteBackGroup {
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
-    leaves: Vec<StandardWriteBackLeaf>,
+    units: Vec<StandardWriteBackUnit>,
     recipes: Vec<TextProjectionRecipe>,
     mutation_targets: Vec<MutationTarget>,
 }
@@ -69,7 +182,7 @@ impl StandardWriteBackGroup {
     pub(crate) fn new(
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
-        mut leaves: Vec<StandardWriteBackLeaf>,
+        mut units: Vec<StandardWriteBackUnit>,
         recipes: Vec<TextProjectionRecipe>,
         mut mutation_targets: Vec<MutationTarget>,
     ) -> Result<Self, StandardWriteBackSnapshotError> {
@@ -78,16 +191,16 @@ impl StandardWriteBackGroup {
                 group_location: Box::new(group_location),
             });
         }
-        for leaf in &leaves {
-            if !role_matches_kind(kind, &leaf.role) {
+        for unit in &units {
+            if !role_matches_kind(kind, &unit.role) {
                 return Err(StandardWriteBackSnapshotError::InvalidRole {
                     kind,
-                    role: leaf.role.clone(),
+                    role: unit.role.clone(),
                 });
             }
         }
-        leaves.sort_by(|left, right| left.role.cmp(&right.role));
-        for pair in leaves.windows(2) {
+        units.sort_by(|left, right| left.role.cmp(&right.role));
+        for pair in units.windows(2) {
             if pair[0].role == pair[1].role {
                 return Err(StandardWriteBackSnapshotError::DuplicateRole {
                     group_location: Box::new(group_location),
@@ -96,22 +209,23 @@ impl StandardWriteBackGroup {
             }
         }
 
-        let leaf_roles = leaves
+        let unit_roles = units
             .iter()
-            .map(|leaf| leaf.role.clone())
+            .map(|unit| unit.role.clone())
             .collect::<BTreeSet<_>>();
         let recipe_roles = recipes
             .iter()
             .flat_map(TextProjectionRecipe::referenced_roles)
             .collect::<BTreeSet<_>>();
-        if leaf_roles != recipe_roles {
+        if unit_roles != recipe_roles {
             return Err(StandardWriteBackSnapshotError::RecipeRoleMismatch {
                 group_location: Box::new(group_location),
-                leaves: leaf_roles,
+                units: unit_roles,
                 recipes: recipe_roles,
             });
         }
-        validate_projection_round_trip(&group_location, &leaves, &recipes)?;
+        validate_line_references(&group_location, &units, &recipes)?;
+        validate_projection_round_trip(&group_location, &units, &recipes)?;
 
         let mut expected_targets = recipes
             .iter()
@@ -170,7 +284,17 @@ impl StandardWriteBackGroup {
                         group_location: Box::new(group_location),
                     });
                 }
-                validate_scrolling_projection(&group_location, &leaves, &recipes)?;
+                validate_scrolling_projection(&group_location, &units, &recipes)?;
+            }
+            TextGroupKind::EventChoices => {
+                if recipes
+                    .iter()
+                    .any(|recipe| !matches!(recipe, TextProjectionRecipe::Direct(_)))
+                {
+                    return Err(StandardWriteBackSnapshotError::InvalidChoicesProjection {
+                        group_location: Box::new(group_location),
+                    });
+                }
             }
             _ => {
                 if recipes
@@ -187,7 +311,7 @@ impl StandardWriteBackGroup {
         Ok(Self {
             kind,
             group_location,
-            leaves,
+            units,
             recipes,
             mutation_targets,
         })
@@ -198,21 +322,66 @@ impl StandardWriteBackGroup {
     ) -> (
         TextGroupKind,
         RpgMakerLocation,
-        Vec<StandardWriteBackLeaf>,
+        Vec<StandardWriteBackUnit>,
         Vec<TextProjectionRecipe>,
     ) {
-        (self.kind, self.group_location, self.leaves, self.recipes)
+        (self.kind, self.group_location, self.units, self.recipes)
     }
+}
+
+fn validate_line_references(
+    group_location: &RpgMakerLocation,
+    units: &[StandardWriteBackUnit],
+    recipes: &[TextProjectionRecipe],
+) -> Result<(), StandardWriteBackSnapshotError> {
+    let mut referenced = BTreeMap::<TextUnitRole, BTreeMap<usize, usize>>::new();
+    for (role, source_line_index) in recipes
+        .iter()
+        .flat_map(TextProjectionRecipe::referenced_lines)
+    {
+        *referenced
+            .entry(role)
+            .or_default()
+            .entry(source_line_index)
+            .or_default() += 1;
+    }
+    for unit in units {
+        let actual = referenced.remove(&unit.role).unwrap_or_default();
+        let Some(lines) = unit.source_content.as_lines() else {
+            if !actual.is_empty() {
+                return Err(StandardWriteBackSnapshotError::RecipeLineMismatch {
+                    group_location: Box::new(group_location.clone()),
+                    role: unit.role.clone(),
+                });
+            }
+            continue;
+        };
+        let expected_uses = if matches!(unit.role, TextUnitRole::Choices) {
+            2
+        } else {
+            1
+        };
+        if actual.len() != lines.len()
+            || (0..lines.len()).any(|index| actual.get(&index) != Some(&expected_uses))
+        {
+            return Err(StandardWriteBackSnapshotError::RecipeLineMismatch {
+                group_location: Box::new(group_location.clone()),
+                role: unit.role.clone(),
+            });
+        }
+    }
+    debug_assert!(referenced.is_empty(), "角色集合已经在调用前验证一致");
+    Ok(())
 }
 
 fn validate_projection_round_trip(
     group_location: &RpgMakerLocation,
-    leaves: &[StandardWriteBackLeaf],
+    units: &[StandardWriteBackUnit],
     recipes: &[TextProjectionRecipe],
 ) -> Result<(), StandardWriteBackSnapshotError> {
-    let leaves = leaves
+    let units = units
         .iter()
-        .map(|leaf| (leaf.role.clone(), leaf))
+        .map(|unit| (unit.role.clone(), unit))
         .collect::<BTreeMap<_, _>>();
     for recipe in recipes {
         match recipe {
@@ -222,11 +391,32 @@ fn validate_projection_round_trip(
                     match part {
                         DirectTextPart::Literal(value) => rebuilt.push_str(value),
                         DirectTextPart::TextSlot { role } => rebuilt.push_str(
-                            &leaves
+                            units
                                 .get(role)
-                                .expect("调用前已经确认配方角色与逻辑叶完全一致")
-                                .original_text,
+                                .and_then(|unit| unit.source_content.as_value())
+                                .ok_or_else(|| {
+                                    StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                        group_location: Box::new(group_location.clone()),
+                                        target: Box::new(recipe.target().clone()),
+                                    }
+                                })?,
                         ),
+                        DirectTextPart::LineSlot {
+                            role,
+                            source_line_index,
+                        } => {
+                            let line = units
+                                .get(role)
+                                .and_then(|unit| unit.source_content.as_lines())
+                                .and_then(|lines| lines.get(*source_line_index))
+                                .ok_or_else(|| {
+                                    StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                        group_location: Box::new(group_location.clone()),
+                                        target: Box::new(recipe.target().clone()),
+                                    }
+                                })?;
+                            rebuilt.push_str(line);
+                        }
                     }
                 }
                 if rebuilt != recipe.expected_raw() {
@@ -239,9 +429,9 @@ fn validate_projection_round_trip(
                 }
             }
             TextProjectionRecipe::Dialogue(recipe) => {
-                let speaker = leaves
-                    .get(&TextFieldRole::DialogueSpeaker)
-                    .map(|leaf| leaf.original_text.as_str());
+                let speaker = units
+                    .get(&TextUnitRole::DialogueSpeaker)
+                    .and_then(|unit| unit.source_content.as_value());
                 if let Some(target) = recipe.direct_speaker()
                     && speaker != Some(target.expected_raw())
                 {
@@ -257,11 +447,11 @@ fn validate_projection_round_trip(
                     for (part_index, part) in line.parts().iter().enumerate() {
                         match part {
                             DialogueLinePart::Literal(value) => rebuilt.push_str(value),
-                            DialogueLinePart::SpeakerSlot => rebuilt.push_str(
-                                speaker
-                                    .expect("调用前已经确认内嵌 SpeakerSlot 对应逻辑 Speaker 叶"),
-                            ),
-                            DialogueLinePart::BodySlot { index } => {
+                            DialogueLinePart::SpeakerSlot => rebuilt
+                                .push_str(speaker.expect(
+                                    "调用前已经确认内嵌 SpeakerSlot 对应逻辑 Speaker 单元",
+                                )),
+                            DialogueLinePart::BodyLine { source_line_index } => {
                                 if part_index + 1 != line.parts().len() {
                                     return Err(
                                         StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
@@ -271,10 +461,14 @@ fn validate_projection_round_trip(
                                     );
                                 }
                                 rebuilt.push_str(
-                                    &leaves
-                                        .get(&TextFieldRole::DialogueBody { index: *index })
-                                        .expect("调用前已经确认 BodySlot 对应完整连续逻辑 Body 叶")
-                                        .original_text,
+                                    units
+                                        .get(&TextUnitRole::DialogueBody)
+                                        .and_then(|unit| unit.source_content.as_lines())
+                                        .and_then(|lines| lines.get(*source_line_index))
+                                        .ok_or_else(|| StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                            group_location: Box::new(group_location.clone()),
+                                            target: Box::new(line.physical_location().clone()),
+                                        })?,
                                 );
                             }
                         }
@@ -296,36 +490,28 @@ fn validate_projection_round_trip(
 
 fn validate_scrolling_projection(
     group_location: &RpgMakerLocation,
-    leaves: &[StandardWriteBackLeaf],
+    units: &[StandardWriteBackUnit],
     recipes: &[TextProjectionRecipe],
 ) -> Result<(), StandardWriteBackSnapshotError> {
-    let leaves = leaves
+    let lines = units
         .iter()
-        .map(|leaf| (&leaf.role, leaf))
-        .collect::<BTreeMap<_, _>>();
+        .find(|unit| unit.role == TextUnitRole::ScrollingText)
+        .and_then(|unit| unit.source_content.as_lines())
+        .expect("受信滚动文本必须包含行序列单元");
     for (physical_index, recipe) in recipes.iter().enumerate() {
         let TextProjectionRecipe::Direct(recipe) = recipe else {
             unreachable!("调用前已经验证滚动文本只包含直接配方")
         };
         match recipe.parts() {
             [
-                DirectTextPart::TextSlot {
-                    role: role @ TextFieldRole::ScrollingTextBody { index },
+                DirectTextPart::LineSlot {
+                    role: TextUnitRole::ScrollingText,
+                    source_line_index,
                 },
-            ] if *index == physical_index => {
-                let Some(leaf) = leaves.get(role) else {
-                    return Err(StandardWriteBackSnapshotError::InvalidScrollingRecipe {
-                        group_location: Box::new(group_location.clone()),
-                    });
-                };
-                if recipe.expected_raw() != leaf.original_text {
-                    return Err(StandardWriteBackSnapshotError::InvalidScrollingRecipe {
-                        group_location: Box::new(group_location.clone()),
-                    });
-                }
-            }
-            [DirectTextPart::Literal(value)]
-                if value == recipe.expected_raw() && value.trim().is_empty() => {}
+            ] if *source_line_index == physical_index
+                && lines
+                    .get(physical_index)
+                    .is_some_and(|line| line == recipe.expected_raw()) => {}
             _ => {
                 return Err(StandardWriteBackSnapshotError::InvalidScrollingRecipe {
                     group_location: Box::new(group_location.clone()),
@@ -370,43 +556,69 @@ impl StandardWriteBackSnapshot {
     }
 }
 
-fn role_matches_kind(kind: TextGroupKind, role: &TextFieldRole) -> bool {
+fn role_matches_kind(kind: TextGroupKind, role: &TextUnitRole) -> bool {
     match kind {
         TextGroupKind::EventDialogue => matches!(
             role,
-            TextFieldRole::DialogueSpeaker | TextFieldRole::DialogueBody { .. }
+            TextUnitRole::DialogueSpeaker | TextUnitRole::DialogueBody
         ),
         TextGroupKind::EventScrollingText => {
-            matches!(role, TextFieldRole::ScrollingTextBody { .. })
+            matches!(role, TextUnitRole::ScrollingText)
         }
-        _ => matches!(role, TextFieldRole::Scalar(_)),
+        TextGroupKind::EventChoices => matches!(role, TextUnitRole::Choices),
+        _ => matches!(role, TextUnitRole::Scalar(_)),
     }
 }
 
 /// Reader 交回受信快照前必须排除的数据损坏。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StandardWriteBackSnapshotError {
-    BlankOriginal {
-        role: TextFieldRole,
+    BlankSourceContent {
+        role: TextUnitRole,
     },
-    BlankTranslation {
-        role: TextFieldRole,
+    BlankTranslationContent {
+        role: TextUnitRole,
+    },
+    ContentShapeMismatch {
+        role: TextUnitRole,
+    },
+    EmptyLineContent {
+        role: TextUnitRole,
+        column: &'static str,
+    },
+    InvalidContentLine {
+        role: TextUnitRole,
+        column: &'static str,
+        line_index: usize,
+    },
+    AlignedLineCountMismatch {
+        role: TextUnitRole,
+        expected: usize,
+        actual: usize,
+    },
+    AlignedBlankLineMismatch {
+        role: TextUnitRole,
+        line_index: usize,
     },
     EmptyProjection {
         group_location: Box<RpgMakerLocation>,
     },
     InvalidRole {
         kind: TextGroupKind,
-        role: TextFieldRole,
+        role: TextUnitRole,
     },
     DuplicateRole {
         group_location: Box<RpgMakerLocation>,
-        role: TextFieldRole,
+        role: TextUnitRole,
     },
     RecipeRoleMismatch {
         group_location: Box<RpgMakerLocation>,
-        leaves: BTreeSet<TextFieldRole>,
-        recipes: BTreeSet<TextFieldRole>,
+        units: BTreeSet<TextUnitRole>,
+        recipes: BTreeSet<TextUnitRole>,
+    },
+    RecipeLineMismatch {
+        group_location: Box<RpgMakerLocation>,
+        role: TextUnitRole,
     },
     RecipeTargetMismatch {
         group_location: Box<RpgMakerLocation>,
@@ -431,6 +643,9 @@ pub(crate) enum StandardWriteBackSnapshotError {
     InvalidScrollingRecipe {
         group_location: Box<RpgMakerLocation>,
     },
+    InvalidChoicesProjection {
+        group_location: Box<RpgMakerLocation>,
+    },
     InvalidDirectProjection {
         group_location: Box<RpgMakerLocation>,
     },
@@ -443,12 +658,38 @@ pub(crate) enum StandardWriteBackSnapshotError {
 impl fmt::Display for StandardWriteBackSnapshotError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BlankOriginal { role } => {
+            Self::BlankSourceContent { role } => {
                 write!(formatter, "写回资产原文仅包含空白：{role:?}")
             }
-            Self::BlankTranslation { role } => {
+            Self::BlankTranslationContent { role } => {
                 write!(formatter, "写回资产译文仅包含空白：{role:?}")
             }
+            Self::ContentShapeMismatch { role } => {
+                write!(formatter, "写回资产内容形状与角色不一致：{role:?}")
+            }
+            Self::EmptyLineContent { role, column } => {
+                write!(formatter, "写回资产{column}行序列为空：{role:?}")
+            }
+            Self::InvalidContentLine {
+                role,
+                column,
+                line_index,
+            } => write!(
+                formatter,
+                "写回资产{column}第 {line_index} 行包含不允许的控制字符：{role:?}"
+            ),
+            Self::AlignedLineCountMismatch {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "严格对齐译文行数不一致：{role:?}，期待 {expected}，实际 {actual}"
+            ),
+            Self::AlignedBlankLineMismatch { role, line_index } => write!(
+                formatter,
+                "严格对齐译文第 {line_index} 行的空白状态与原文不一致：{role:?}"
+            ),
             Self::EmptyProjection { group_location } => {
                 write!(formatter, "写回资产组不包含投影配方：{group_location}")
             }
@@ -464,11 +705,18 @@ impl fmt::Display for StandardWriteBackSnapshotError {
             ),
             Self::RecipeRoleMismatch {
                 group_location,
-                leaves,
+                units,
                 recipes,
             } => write!(
                 formatter,
-                "写回资产组 {group_location} 的叶角色与配方角色不一致：{leaves:?} / {recipes:?}"
+                "写回资产组 {group_location} 的单元角色与配方角色不一致：{units:?} / {recipes:?}"
+            ),
+            Self::RecipeLineMismatch {
+                group_location,
+                role,
+            } => write!(
+                formatter,
+                "写回资产组 {group_location} 的行槽索引或引用次数无效：{role:?}"
             ),
             Self::RecipeTargetMismatch { group_location } => {
                 write!(
@@ -502,8 +750,11 @@ impl fmt::Display for StandardWriteBackSnapshotError {
             }
             Self::InvalidScrollingRecipe { group_location } => write!(
                 formatter,
-                "滚动文本组的 Body 索引或直接配方无效：{group_location}"
+                "滚动文本组的语义行索引或直接配方无效：{group_location}"
             ),
+            Self::InvalidChoicesProjection { group_location } => {
+                write!(formatter, "选项组只能包含直接配方：{group_location}")
+            }
             Self::InvalidDirectProjection { group_location } => {
                 write!(formatter, "普通文本组只能包含直接配方：{group_location}")
             }
@@ -556,10 +807,6 @@ impl RpgMakerLayoutTextPair {
             original_text,
             replacement,
         }
-    }
-
-    pub(crate) fn original_text(&self) -> &str {
-        &self.original_text
     }
 
     pub(crate) fn replacement(&self) -> Option<&str> {
@@ -633,7 +880,7 @@ pub(crate) enum RpgMakerWriteBackLayoutCandidate {
     DatabaseTranslation(String),
 }
 
-/// 布局请求中一个仍与数据库叶子保持对应关系的内容段。
+/// 布局请求中一个仍与数据库语义单元保持对应关系的内容段。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerWriteBackLayoutSegment {
     logical_location: Option<LogicalTextLocation>,
@@ -643,32 +890,41 @@ pub(crate) struct RpgMakerWriteBackLayoutSegment {
 }
 
 impl RpgMakerWriteBackLayoutSegment {
-    fn from_leaf_at(
+    fn from_unit_at(
         group_location: &RpgMakerLocation,
-        leaf: &StandardWriteBackLeaf,
+        unit: &StandardWriteBackUnit,
         exact_location: RpgMakerLocation,
     ) -> Self {
-        let candidate = leaf.translation.clone().map_or(
+        let candidate = unit.translation_content.as_ref().map_or(
             RpgMakerWriteBackLayoutCandidate::FrozenOriginal,
-            RpgMakerWriteBackLayoutCandidate::DatabaseTranslation,
+            |content| RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(content_text(content)),
         );
         Self {
             logical_location: Some(LogicalTextLocation::new(
                 group_location.clone(),
-                leaf.role.clone(),
+                unit.role.clone(),
             )),
             exact_location,
-            original_text: leaf.original_text.clone(),
+            original_text: content_text(&unit.source_content),
             candidate,
         }
     }
 
-    fn frozen_at(exact_location: RpgMakerLocation, original_text: impl Into<String>) -> Self {
+    fn from_line_at(
+        group_location: &RpgMakerLocation,
+        role: TextUnitRole,
+        exact_location: RpgMakerLocation,
+        original_text: String,
+        translation: Option<String>,
+    ) -> Self {
         Self {
-            logical_location: None,
+            logical_location: Some(LogicalTextLocation::new(group_location.clone(), role)),
             exact_location,
-            original_text: original_text.into(),
-            candidate: RpgMakerWriteBackLayoutCandidate::FrozenOriginal,
+            original_text,
+            candidate: translation.map_or(
+                RpgMakerWriteBackLayoutCandidate::FrozenOriginal,
+                RpgMakerWriteBackLayoutCandidate::DatabaseTranslation,
+            ),
         }
     }
 
@@ -685,12 +941,18 @@ impl RpgMakerWriteBackLayoutSegment {
     }
 }
 
+fn content_text(content: &TextUnitContent) -> String {
+    match content {
+        TextUnitContent::Value(value) => value.clone(),
+        TextUnitContent::Lines(lines) => lines.join("\n"),
+    }
+}
+
 /// Standard 为一个完整布局单元建立的显式请求。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerWriteBackLayoutRequest {
     region: RpgMakerWriteBackLayoutRegion,
     max_fullwidth_chars: MaxFullwidthChars,
-    auto_wrap_enabled: bool,
     segments: Vec<RpgMakerWriteBackLayoutSegment>,
 }
 
@@ -698,7 +960,6 @@ impl RpgMakerWriteBackLayoutRequest {
     pub(crate) fn new(
         region: RpgMakerWriteBackLayoutRegion,
         max_fullwidth_chars: MaxFullwidthChars,
-        auto_wrap_enabled: bool,
         segments: Vec<RpgMakerWriteBackLayoutSegment>,
     ) -> Self {
         debug_assert!(!segments.is_empty(), "布局单元必须包含至少一个文本段");
@@ -712,7 +973,6 @@ impl RpgMakerWriteBackLayoutRequest {
         Self {
             region,
             max_fullwidth_chars,
-            auto_wrap_enabled,
             segments,
         }
     }
@@ -721,33 +981,53 @@ impl RpgMakerWriteBackLayoutRequest {
         self.max_fullwidth_chars
     }
 
-    pub(crate) const fn auto_wrap_enabled(&self) -> bool {
-        self.auto_wrap_enabled
-    }
-
     pub(crate) fn segments(&self) -> &[RpgMakerWriteBackLayoutSegment] {
         &self.segments
     }
 }
 
-/// 布局器为一个数据库译文叶子产生的最终显示行。
+/// 布局器产生的一条最终显示行及其所属译文语义行。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RpgMakerWriteBackLaidOutLine {
+    text: String,
+    source_semantic_line_index: usize,
+}
+
+impl RpgMakerWriteBackLaidOutLine {
+    pub(crate) fn new(text: String, source_semantic_line_index: usize) -> Self {
+        Self {
+            text,
+            source_semantic_line_index,
+        }
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) const fn source_semantic_line_index(&self) -> usize {
+        self.source_semantic_line_index
+    }
+}
+
+/// 布局器为一个数据库译文单元产生的最终显示行。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerWriteBackLaidOutSegment {
     exact_location: RpgMakerLocation,
-    lines: Vec<String>,
+    lines: Vec<RpgMakerWriteBackLaidOutLine>,
 }
 
 impl RpgMakerWriteBackLaidOutSegment {
     pub(crate) fn new(
         exact_location: RpgMakerLocation,
-        lines: Vec<String>,
+        lines: Vec<RpgMakerWriteBackLaidOutLine>,
     ) -> Result<Self, RpgMakerWriteBackAppliedLayoutError> {
         if lines.is_empty() {
             return Err(RpgMakerWriteBackAppliedLayoutError::EmptyReplacement {
                 exact_location: Box::new(exact_location),
             });
         }
-        if let Some(line_index) = lines.iter().position(|line| line.contains('\n')) {
+        if let Some(line_index) = lines.iter().position(|line| line.text.contains('\n')) {
             return Err(RpgMakerWriteBackAppliedLayoutError::EmbeddedLineBreak {
                 exact_location: Box::new(exact_location),
                 line_index,
@@ -760,7 +1040,7 @@ impl RpgMakerWriteBackLaidOutSegment {
     }
 
     #[cfg(test)]
-    pub(crate) fn lines(&self) -> &[String] {
+    pub(crate) fn lines(&self) -> &[RpgMakerWriteBackLaidOutLine] {
         &self.lines
     }
 }
@@ -915,9 +1195,8 @@ pub(crate) enum RpgMakerWriteBackLayoutOutcome {
 /// 本能力是同步纯业务计算，并且必须遵守以下交接约束：
 ///
 /// - 请求已经显式给出区域与该区域的行宽，不得自行读取或选择整个布局 Profile；
-/// - `auto_wrap_enabled == false` 只禁止新增自动换行，数据库译文已有的真实换行仍是
-///   必须保留的硬边界；
-/// - 段边界就是数据库叶子的来源边界：可以跨段观察括号和缩进状态，但不得把字符
+/// - 数据库译文已有的真实换行是必须保留的硬边界，只对其中过宽的语义行新增自动换行；
+/// - 段边界就是数据库语义单元的来源边界：可以跨段观察括号和缩进状态，但不得把字符
 ///   移动到其他段，也不得返回对 `FrozenOriginal` 的修改；
 /// - 必须先决定自动换行，再为符合规则的续行补全角空格；
 /// - `inserted_line_breaks` 与 `inserted_fullwidth_indents` 只统计本次自动新增内容，
@@ -976,46 +1255,64 @@ impl SetTextMutation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReplaceDialogueMutation {
     recipe: DialogueWriteRecipe,
+    source_speaker: Option<String>,
     speaker: Option<String>,
-    body_lines: BTreeMap<usize, Vec<String>>,
+    body_lines: Option<Vec<RpgMakerWriteBackLaidOutLine>>,
 }
 
 impl ReplaceDialogueMutation {
     pub(crate) fn new(
         recipe: DialogueWriteRecipe,
+        source_speaker: Option<String>,
         speaker: Option<String>,
-        body_lines: BTreeMap<usize, Vec<String>>,
+        body_lines: Option<Vec<RpgMakerWriteBackLaidOutLine>>,
     ) -> Result<Self, StandardWriteBackMutationPlanError> {
         let referenced = TextProjectionRecipe::Dialogue(recipe.clone()).referenced_roles();
-        let expects_speaker = referenced.contains(&TextFieldRole::DialogueSpeaker);
-        if expects_speaker != speaker.is_some() {
+        let expects_speaker = referenced.contains(&TextUnitRole::DialogueSpeaker);
+        if expects_speaker != speaker.is_some() || expects_speaker != source_speaker.is_some() {
             return Err(StandardWriteBackMutationPlanError::InvalidDialogue {
                 group_location: Box::new(recipe.group_location().clone()),
                 message: "Speaker 槽与最终 Speaker 不一致",
             });
         }
-        let expected_body = referenced
-            .iter()
-            .filter_map(|role| match role {
-                TextFieldRole::DialogueBody { index } => Some(*index),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let actual_body = body_lines.keys().copied().collect::<BTreeSet<_>>();
-        if expected_body != actual_body {
+        let expects_body = referenced.contains(&TextUnitRole::DialogueBody);
+        if !expects_body && body_lines.is_some() {
             return Err(StandardWriteBackMutationPlanError::InvalidDialogue {
                 group_location: Box::new(recipe.group_location().clone()),
-                message: "Body 槽与最终 Body 行不一致",
+                message: "没有 Body 槽的对话不能提供 Body 译文",
             });
         }
-        if body_lines.values().any(Vec::is_empty) {
-            return Err(StandardWriteBackMutationPlanError::InvalidDialogue {
-                group_location: Box::new(recipe.group_location().clone()),
-                message: "Body 没有产生显示行",
-            });
+        if let Some(lines) = &body_lines {
+            if lines.is_empty() {
+                return Err(StandardWriteBackMutationPlanError::InvalidDialogue {
+                    group_location: Box::new(recipe.group_location().clone()),
+                    message: "Body 没有产生显示行",
+                });
+            }
+            let semantic_indexes = lines
+                .iter()
+                .map(RpgMakerWriteBackLaidOutLine::source_semantic_line_index)
+                .collect::<Vec<_>>();
+            if semantic_indexes.first() != Some(&0)
+                || semantic_indexes.windows(2).any(|pair| pair[0] > pair[1])
+                || semantic_indexes
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .any(|(expected, actual)| expected != actual)
+            {
+                return Err(StandardWriteBackMutationPlanError::InvalidDialogue {
+                    group_location: Box::new(recipe.group_location().clone()),
+                    message: "Body 显示行的语义来源索引不连续",
+                });
+            }
         }
         Ok(Self {
             recipe,
+            source_speaker,
             speaker,
             body_lines,
         })
@@ -1033,8 +1330,12 @@ impl ReplaceDialogueMutation {
         self.speaker.as_deref()
     }
 
-    pub(crate) fn body_lines(&self, index: usize) -> Option<&[String]> {
-        self.body_lines.get(&index).map(Vec::as_slice)
+    pub(crate) fn source_speaker(&self) -> Option<&str> {
+        self.source_speaker.as_deref()
+    }
+
+    pub(crate) fn body_lines(&self) -> Option<&[RpgMakerWriteBackLaidOutLine]> {
+        self.body_lines.as_deref()
     }
 
     fn mutation_targets(&self) -> Vec<MutationTarget> {
@@ -1042,13 +1343,99 @@ impl ReplaceDialogueMutation {
     }
 }
 
-/// 事件正文中一个原始命令的最终处理方式。
+/// 一个选项头及其同层分支标签的唯一原子修改。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum EventBodyMutationAction {
-    /// 数据库没有译文，Rewriter 必须保留原命令及文本。
-    KeepOriginal,
-    /// 用一条或多条原生正文命令替换当前译文叶子。
-    ReplaceWithLines(Vec<String>),
+pub(crate) struct ReplaceChoicesMutation {
+    group_location: RpgMakerLocation,
+    recipes: Vec<DirectTextRecipe>,
+    source_lines: Vec<String>,
+    replacement_lines: Vec<String>,
+}
+
+impl ReplaceChoicesMutation {
+    pub(crate) fn new(
+        group_location: RpgMakerLocation,
+        recipes: Vec<DirectTextRecipe>,
+        source_lines: Vec<String>,
+        replacement_lines: Vec<String>,
+    ) -> Result<Self, StandardWriteBackMutationPlanError> {
+        if source_lines.is_empty() || source_lines.len() != replacement_lines.len() {
+            return Err(StandardWriteBackMutationPlanError::InvalidChoices {
+                group_location: Box::new(group_location),
+                message: "选项原文与译文必须是等长非空行序列",
+            });
+        }
+        if source_lines
+            .iter()
+            .zip(&replacement_lines)
+            .any(|(source, replacement)| source.trim().is_empty() && source != replacement)
+        {
+            return Err(StandardWriteBackMutationPlanError::InvalidChoices {
+                group_location: Box::new(group_location),
+                message: "选项空白槽必须逐字保持冻结原文",
+            });
+        }
+        let mut references = BTreeMap::<usize, usize>::new();
+        for recipe in &recipes {
+            let [
+                DirectTextPart::LineSlot {
+                    role: TextUnitRole::Choices,
+                    source_line_index,
+                },
+            ] = recipe.parts()
+            else {
+                return Err(StandardWriteBackMutationPlanError::InvalidChoices {
+                    group_location: Box::new(group_location),
+                    message: "选项配方必须只包含一个 Choices 行槽",
+                });
+            };
+            if source_lines.get(*source_line_index).map(String::as_str)
+                != Some(recipe.expected_raw())
+            {
+                return Err(StandardWriteBackMutationPlanError::InvalidChoices {
+                    group_location: Box::new(group_location),
+                    message: "选项配方与冻结原文不一致",
+                });
+            }
+            *references.entry(*source_line_index).or_default() += 1;
+        }
+        if references.len() != source_lines.len()
+            || (0..source_lines.len()).any(|index| references.get(&index) != Some(&2))
+        {
+            return Err(StandardWriteBackMutationPlanError::InvalidChoices {
+                group_location: Box::new(group_location),
+                message: "每个选项必须同时对应 102 列表项和同层 402 标签",
+            });
+        }
+        Ok(Self {
+            group_location,
+            recipes,
+            source_lines,
+            replacement_lines,
+        })
+    }
+
+    pub(crate) fn group_location(&self) -> &RpgMakerLocation {
+        &self.group_location
+    }
+
+    pub(crate) fn recipes(&self) -> &[DirectTextRecipe] {
+        &self.recipes
+    }
+
+    pub(crate) fn source_lines(&self) -> &[String] {
+        &self.source_lines
+    }
+
+    pub(crate) fn replacement_lines(&self) -> &[String] {
+        &self.replacement_lines
+    }
+
+    fn mutation_targets(&self) -> impl Iterator<Item = MutationTarget> + '_ {
+        self.recipes
+            .iter()
+            .map(|recipe| MutationTarget::Value(recipe.target().clone()))
+    }
 }
 
 /// 一条原始 401/405 正文在块级重建计划中的对应项。
@@ -1056,7 +1443,7 @@ pub(crate) enum EventBodyMutationAction {
 pub(crate) struct EventBodyMutationSegment {
     exact_location: RpgMakerLocation,
     expected_original: String,
-    action: EventBodyMutationAction,
+    replacement_lines: Vec<String>,
 }
 
 impl EventBodyMutationSegment {
@@ -1069,15 +1456,7 @@ impl EventBodyMutationSegment {
         Self {
             exact_location,
             expected_original: expected_original.into(),
-            action: EventBodyMutationAction::ReplaceWithLines(lines),
-        }
-    }
-
-    fn keep_original(exact_location: RpgMakerLocation, expected_original: String) -> Self {
-        Self {
-            exact_location,
-            expected_original,
-            action: EventBodyMutationAction::KeepOriginal,
+            replacement_lines: lines,
         }
     }
 
@@ -1086,11 +1465,11 @@ impl EventBodyMutationSegment {
         expected_original: String,
         lines: Vec<String>,
     ) -> Self {
-        debug_assert!(!lines.is_empty(), "译文叶必须至少产生一个原生正文行");
+        debug_assert!(!lines.is_empty(), "译文语义行必须至少产生一个原生正文行");
         Self {
             exact_location,
             expected_original,
-            action: EventBodyMutationAction::ReplaceWithLines(lines),
+            replacement_lines: lines,
         }
     }
 
@@ -1102,8 +1481,8 @@ impl EventBodyMutationSegment {
         &self.expected_original
     }
 
-    pub(crate) fn action(&self) -> &EventBodyMutationAction {
-        &self.action
+    pub(crate) fn replacement_lines(&self) -> &[String] {
+        &self.replacement_lines
     }
 }
 
@@ -1124,16 +1503,6 @@ impl ReplaceEventBodyMutation {
                 group_location: Box::new(group_location),
             });
         }
-        if !segments
-            .iter()
-            .any(|segment| matches!(segment.action, EventBodyMutationAction::ReplaceWithLines(_)))
-        {
-            return Err(
-                StandardWriteBackMutationPlanError::EventBodyWithoutTranslation {
-                    group_location: Box::new(group_location),
-                },
-            );
-        }
         let mut exact_locations = BTreeSet::new();
         for segment in &segments {
             if !exact_locations.insert(segment.exact_location.clone()) {
@@ -1141,9 +1510,7 @@ impl ReplaceEventBodyMutation {
                     target: Box::new(MutationTarget::Value(segment.exact_location.clone())),
                 });
             }
-            if let EventBodyMutationAction::ReplaceWithLines(lines) = &segment.action
-                && lines.is_empty()
-            {
+            if segment.replacement_lines.is_empty() {
                 return Err(StandardWriteBackMutationPlanError::EmptyEventReplacement {
                     exact_location: Box::new(segment.exact_location.clone()),
                 });
@@ -1169,6 +1536,7 @@ impl ReplaceEventBodyMutation {
 pub(crate) enum StandardWriteBackMutation {
     SetText(SetTextMutation),
     ReplaceDialogue(ReplaceDialogueMutation),
+    ReplaceChoices(ReplaceChoicesMutation),
     ReplaceEventBody(ReplaceEventBodyMutation),
 }
 
@@ -1198,6 +1566,11 @@ impl StandardWriteBackMutationPlan {
                             group_location: Box::new(mutation.group_location().clone()),
                         });
                     }
+                    for target in mutation.mutation_targets() {
+                        insert_plan_target(&mut targets, target)?;
+                    }
+                }
+                StandardWriteBackMutation::ReplaceChoices(mutation) => {
                     for target in mutation.mutation_targets() {
                         insert_plan_target(&mut targets, target)?;
                     }
@@ -1256,13 +1629,14 @@ pub(crate) enum StandardWriteBackMutationPlanError {
     EmptyEventBody {
         group_location: Box<RpgMakerLocation>,
     },
-    EventBodyWithoutTranslation {
-        group_location: Box<RpgMakerLocation>,
-    },
     EmptyEventReplacement {
         exact_location: Box<RpgMakerLocation>,
     },
     InvalidDialogue {
+        group_location: Box<RpgMakerLocation>,
+        message: &'static str,
+    },
+    InvalidChoices {
         group_location: Box<RpgMakerLocation>,
         message: &'static str,
     },
@@ -1280,12 +1654,6 @@ impl fmt::Display for StandardWriteBackMutationPlanError {
             Self::EmptyEventBody { group_location } => {
                 write!(formatter, "事件正文修改不包含原始段：{group_location}")
             }
-            Self::EventBodyWithoutTranslation { group_location } => {
-                write!(
-                    formatter,
-                    "事件正文修改没有任何数据库译文：{group_location}"
-                )
-            }
             Self::EmptyEventReplacement { exact_location } => {
                 write!(formatter, "事件正文译文没有产生显示行：{exact_location}")
             }
@@ -1293,6 +1661,10 @@ impl fmt::Display for StandardWriteBackMutationPlanError {
                 group_location,
                 message,
             } => write!(formatter, "对话修改 {group_location} 无效：{message}"),
+            Self::InvalidChoices {
+                group_location,
+                message,
+            } => write!(formatter, "选项修改 {group_location} 无效：{message}"),
             Self::DuplicateTarget { target } => {
                 write!(formatter, "Mutation 计划重复修改物理目标：{target:?}")
             }
@@ -1333,17 +1705,19 @@ pub(crate) struct ManualLayoutDiagnostic {
 
 impl ManualLayoutDiagnostic {
     fn from_request(request: &RpgMakerWriteBackLayoutRequest) -> Self {
+        let mut seen = BTreeSet::new();
         let locations = request
             .segments
             .iter()
             .filter_map(|segment| match segment.candidate {
                 RpgMakerWriteBackLayoutCandidate::FrozenOriginal => None,
-                RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(_) => Some(
-                    segment
+                RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(_) => {
+                    let location = segment
                         .logical_location
                         .clone()
-                        .expect("数据库译文布局段必须属于逻辑叶"),
-                ),
+                        .expect("数据库译文布局段必须属于逻辑单元");
+                    seen.insert(location.clone()).then_some(location)
+                }
             })
             .collect();
         Self::new(locations, request.region, request.max_fullwidth_chars)
@@ -1354,7 +1728,10 @@ impl ManualLayoutDiagnostic {
         region: RpgMakerWriteBackLayoutRegion,
         max_fullwidth_chars: MaxFullwidthChars,
     ) -> Self {
-        debug_assert!(!locations.is_empty(), "人工布局诊断必须关联至少一个逻辑叶");
+        debug_assert!(
+            !locations.is_empty(),
+            "人工布局诊断必须关联至少一个逻辑单元"
+        );
         Self {
             locations,
             region,
@@ -1615,19 +1992,19 @@ fn plan_standard_write_back_group(
             summary: &mut summary,
             manual_layout_diagnostics: &mut manual_layout_diagnostics,
         };
-        for leaf in &group.leaves {
-            if leaf.translation.is_some() {
-                outputs.summary.translated_locations += 1;
+        for unit in &group.units {
+            if unit.translation_content.is_some() {
+                outputs.summary.translated_units += 1;
             } else {
-                outputs.summary.original_locations += 1;
+                outputs.summary.original_units += 1;
             }
         }
 
-        let (kind, group_location, leaves, recipes) = group.into_parts();
+        let (kind, group_location, units, recipes) = group.into_parts();
         match kind {
             TextGroupKind::EventDialogue => plan_dialogue_group(
                 group_location,
-                leaves,
+                units,
                 recipes,
                 profile.dialogue_body(),
                 layouter,
@@ -1635,16 +2012,19 @@ fn plan_standard_write_back_group(
             ),
             TextGroupKind::EventScrollingText => plan_scrolling_group(
                 group_location,
-                leaves,
+                units,
                 recipes,
                 profile.scrolling_text(),
                 layouter,
                 &mut outputs,
             ),
+            TextGroupKind::EventChoices => {
+                plan_choices_group(group_location, units, recipes, &mut outputs)
+            }
             _ => plan_scalar_group(
                 kind,
                 group_location,
-                leaves,
+                units,
                 recipes,
                 profile.help_description(),
                 layouter,
@@ -1687,8 +2067,8 @@ fn merge_standard_write_back_summary(
     total: &mut StandardWriteBackSummary,
     group: StandardWriteBackSummary,
 ) {
-    total.translated_locations += group.translated_locations;
-    total.original_locations += group.original_locations;
+    total.translated_units += group.translated_units;
+    total.original_units += group.original_units;
     total.auto_wrapped_units += group.auto_wrapped_units;
     total.inserted_line_breaks += group.inserted_line_breaks;
     total.inserted_fullwidth_indents += group.inserted_fullwidth_indents;
@@ -1696,13 +2076,13 @@ fn merge_standard_write_back_summary(
 
 fn plan_dialogue_group(
     group_location: RpgMakerLocation,
-    leaves: Vec<StandardWriteBackLeaf>,
+    units: Vec<StandardWriteBackUnit>,
     mut recipes: Vec<TextProjectionRecipe>,
     max_fullwidth_chars: MaxFullwidthChars,
     layouter: &impl RpgMakerWriteBackTextLayouter,
     outputs: &mut GroupPlanningOutputs<'_>,
 ) {
-    if !leaves.iter().any(|leaf| leaf.translation.is_some()) {
+    if !units.iter().any(|unit| unit.translation_content.is_some()) {
         return;
     }
     let TextProjectionRecipe::Dialogue(recipe) = recipes.pop().expect("受信对话组必须包含唯一配方")
@@ -1711,58 +2091,47 @@ fn plan_dialogue_group(
     };
     debug_assert!(recipes.is_empty());
 
-    let leaves = leaves
+    let units = units
         .into_iter()
-        .map(|leaf| (leaf.role.clone(), leaf))
+        .map(|unit| (unit.role.clone(), unit))
         .collect::<BTreeMap<_, _>>();
-    let speaker = leaves
-        .get(&TextFieldRole::DialogueSpeaker)
-        .map(effective_leaf_text);
-    let body = leaves
-        .iter()
-        .filter_map(|(role, leaf)| match role {
-            TextFieldRole::DialogueBody { index } => Some((*index, leaf)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    let mut body_lines = body
-        .iter()
-        .map(|(index, leaf)| (*index, vec![leaf.original_text.clone()]))
-        .collect::<BTreeMap<_, _>>();
-    if body.iter().any(|(_, leaf)| leaf.translation.is_some()) {
+    let speaker_unit = units.get(&TextUnitRole::DialogueSpeaker);
+    let source_speaker = speaker_unit.map(|unit| {
+        unit.source_content
+            .as_value()
+            .expect("受信 Speaker 原文必须是单值")
+            .to_owned()
+    });
+    let speaker = speaker_unit.map(|unit| {
+        unit.effective_content()
+            .as_value()
+            .expect("受信 Speaker 必须是单值")
+            .to_owned()
+    });
+    let body = units.get(&TextUnitRole::DialogueBody);
+    let body_lines = if body.is_some_and(|unit| unit.translation_content.is_some()) {
+        let body = body.expect("已经确认 Body 存在");
+        let exact_location =
+            dialogue_body_location(&recipe).expect("受信对话正文配方必须引用至少一个 BodyLine");
         let request = RpgMakerWriteBackLayoutRequest::new(
             RpgMakerWriteBackLayoutRegion::DialogueBody,
             max_fullwidth_chars,
-            true,
-            body.iter()
-                .map(|(index, leaf)| {
-                    RpgMakerWriteBackLayoutSegment::from_leaf_at(
-                        &group_location,
-                        leaf,
-                        dialogue_body_location(&recipe, *index)
-                            .expect("受信对话配方必须引用每个 Body"),
-                    )
-                })
-                .collect(),
+            vec![RpgMakerWriteBackLayoutSegment::from_unit_at(
+                &group_location,
+                body,
+                exact_location.clone(),
+            )],
         );
-        let replacements = layout_replacements(&request, layouter, outputs);
-        for (index, leaf) in &body {
-            if leaf.translation.is_some() {
-                let location =
-                    dialogue_body_location(&recipe, *index).expect("受信对话配方必须引用每个 Body");
-                body_lines.insert(
-                    *index,
-                    replacements
-                        .get(&location)
-                        .expect("布局结果必须覆盖每个对话译文叶")
-                        .clone(),
-                );
-            }
-        }
-    }
+        Some(
+            layout_replacements(&request, layouter, outputs)
+                .remove(&exact_location)
+                .expect("布局结果必须覆盖对话正文语义单元"),
+        )
+    } else {
+        None
+    };
 
-    let mutation = ReplaceDialogueMutation::new(recipe, speaker, body_lines)
+    let mutation = ReplaceDialogueMutation::new(recipe, source_speaker, speaker, body_lines)
         .expect("受信对话资产必须建立合法原子 Mutation");
     outputs
         .mutations
@@ -1771,75 +2140,72 @@ fn plan_dialogue_group(
 
 fn plan_scrolling_group(
     group_location: RpgMakerLocation,
-    leaves: Vec<StandardWriteBackLeaf>,
+    units: Vec<StandardWriteBackUnit>,
     recipes: Vec<TextProjectionRecipe>,
     max_fullwidth_chars: MaxFullwidthChars,
     layouter: &impl RpgMakerWriteBackTextLayouter,
     outputs: &mut GroupPlanningOutputs<'_>,
 ) {
-    if !leaves.iter().any(|leaf| leaf.translation.is_some()) {
+    let [unit] = units.as_slice() else {
+        unreachable!("受信滚动文本组必须只包含一个语义单元")
+    };
+    let Some(replacement_lines) = aligned_replacement_lines(unit) else {
         return;
-    }
-    let leaves = leaves
-        .into_iter()
-        .map(|leaf| (leaf.role.clone(), leaf))
-        .collect::<BTreeMap<_, _>>();
+    };
+    let source_lines = unit
+        .source_content
+        .as_lines()
+        .expect("受信滚动文本原文必须是行序列");
     let entries = recipes
         .iter()
-        .enumerate()
-        .map(|(physical_index, recipe)| {
+        .map(|recipe| {
             let TextProjectionRecipe::Direct(recipe) = recipe else {
                 unreachable!("受信滚动文本组只包含直接配方")
             };
-            let leaf = match recipe.parts() {
-                [DirectTextPart::TextSlot { role }] => {
-                    Some(leaves.get(role).expect("配方角色必须存在叶"))
-                }
-                [DirectTextPart::Literal(_)] => None,
-                _ => unreachable!("受信滚动文本配方必须是文本槽或冻结空白行"),
+            let [
+                DirectTextPart::LineSlot {
+                    role: TextUnitRole::ScrollingText,
+                    source_line_index,
+                },
+            ] = recipe.parts()
+            else {
+                unreachable!("受信滚动文本配方必须只包含一个行槽")
             };
-            (physical_index, recipe, leaf)
+            (recipe, *source_line_index)
         })
         .collect::<Vec<_>>();
 
     let request = RpgMakerWriteBackLayoutRequest::new(
         RpgMakerWriteBackLayoutRegion::ScrollingText,
         max_fullwidth_chars,
-        true,
         entries
             .iter()
-            .map(|(_, recipe, leaf)| match leaf {
-                Some(leaf) => RpgMakerWriteBackLayoutSegment::from_leaf_at(
+            .map(|(recipe, source_line_index)| {
+                RpgMakerWriteBackLayoutSegment::from_line_at(
                     &group_location,
-                    leaf,
+                    TextUnitRole::ScrollingText,
                     recipe.target().clone(),
-                ),
-                None => RpgMakerWriteBackLayoutSegment::frozen_at(
-                    recipe.target().clone(),
-                    recipe.expected_raw(),
-                ),
+                    source_lines[*source_line_index].clone(),
+                    Some(replacement_lines[*source_line_index].clone()),
+                )
             })
             .collect(),
     );
     let replacements = layout_replacements(&request, layouter, outputs);
     let segments = entries
         .into_iter()
-        .map(|(_, recipe, leaf)| {
-            if leaf.is_some_and(|leaf| leaf.translation.is_some()) {
-                let lines = replacements
-                    .get(recipe.target())
-                    .expect("受信布局结果必须覆盖每个数据库译文叶");
-                EventBodyMutationSegment::replace(
-                    recipe.target().clone(),
-                    recipe.expected_raw().to_owned(),
-                    lines.clone(),
-                )
-            } else {
-                EventBodyMutationSegment::keep_original(
-                    recipe.target().clone(),
-                    recipe.expected_raw().to_owned(),
-                )
-            }
+        .map(|(recipe, _)| {
+            let lines = replacements
+                .get(recipe.target())
+                .expect("受信布局结果必须覆盖每个滚动文本语义行")
+                .iter()
+                .map(|line| line.text().to_owned())
+                .collect();
+            EventBodyMutationSegment::replace(
+                recipe.target().clone(),
+                recipe.expected_raw().to_owned(),
+                lines,
+            )
         })
         .collect();
     let mutation = ReplaceEventBodyMutation::new(group_location, segments)
@@ -1849,18 +2215,53 @@ fn plan_scrolling_group(
         .push(StandardWriteBackMutation::ReplaceEventBody(mutation));
 }
 
+fn plan_choices_group(
+    group_location: RpgMakerLocation,
+    units: Vec<StandardWriteBackUnit>,
+    recipes: Vec<TextProjectionRecipe>,
+    outputs: &mut GroupPlanningOutputs<'_>,
+) {
+    let [unit] = units.as_slice() else {
+        unreachable!("受信选项组必须只包含一个语义单元")
+    };
+    let Some(replacement_lines) = aligned_replacement_lines(unit) else {
+        return;
+    };
+    let source_lines = unit
+        .source_content
+        .as_lines()
+        .expect("受信选项原文必须是行序列");
+    let recipes = recipes
+        .into_iter()
+        .map(|recipe| match recipe {
+            TextProjectionRecipe::Direct(recipe) => recipe,
+            TextProjectionRecipe::Dialogue(_) => unreachable!("受信选项组只包含直接配方"),
+        })
+        .collect();
+    let mutation = ReplaceChoicesMutation::new(
+        group_location,
+        recipes,
+        source_lines.to_vec(),
+        replacement_lines,
+    )
+    .expect("受信选项资产必须建立合法原子 Mutation");
+    outputs
+        .mutations
+        .push(StandardWriteBackMutation::ReplaceChoices(mutation));
+}
+
 fn plan_scalar_group(
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
-    leaves: Vec<StandardWriteBackLeaf>,
+    units: Vec<StandardWriteBackUnit>,
     recipes: Vec<TextProjectionRecipe>,
     help_max_fullwidth_chars: MaxFullwidthChars,
     layouter: &impl RpgMakerWriteBackTextLayouter,
     outputs: &mut GroupPlanningOutputs<'_>,
 ) {
-    let leaves = leaves
+    let units = units
         .into_iter()
-        .map(|leaf| (leaf.role.clone(), leaf))
+        .map(|unit| (unit.role.clone(), unit))
         .collect::<BTreeMap<_, _>>();
     for recipe in recipes {
         let TextProjectionRecipe::Direct(recipe) = recipe else {
@@ -1871,13 +2272,15 @@ fn plan_scalar_group(
             .iter()
             .filter_map(|part| match part {
                 DirectTextPart::Literal(_) => None,
-                DirectTextPart::TextSlot { role } => Some(role),
+                DirectTextPart::TextSlot { role } | DirectTextPart::LineSlot { role, .. } => {
+                    Some(role)
+                }
             })
             .collect::<Vec<_>>();
         if !roles.iter().any(|role| {
-            leaves
+            units
                 .get(*role)
-                .is_some_and(|leaf| leaf.translation.is_some())
+                .is_some_and(|unit| unit.translation_content.is_some())
         }) {
             continue;
         }
@@ -1885,27 +2288,31 @@ fn plan_scalar_group(
         let mut overrides = BTreeMap::new();
         if roles.len() == 1 {
             let role = roles[0];
-            let leaf = leaves.get(role).expect("受信配方角色必须存在叶");
-            if leaf.translation.is_some() && is_canonical_help_description(kind, leaf, &recipe) {
+            let unit = units.get(role).expect("受信配方角色必须存在语义单元");
+            if unit.translation_content.is_some()
+                && is_canonical_help_description(kind, unit, &recipe)
+            {
                 let request = RpgMakerWriteBackLayoutRequest::new(
                     RpgMakerWriteBackLayoutRegion::HelpDescription,
                     help_max_fullwidth_chars,
-                    leaf.original_text.contains('\n'),
-                    vec![RpgMakerWriteBackLayoutSegment::from_leaf_at(
+                    vec![RpgMakerWriteBackLayoutSegment::from_unit_at(
                         &group_location,
-                        leaf,
+                        unit,
                         recipe.target().clone(),
                     )],
                 );
                 let replacement = layout_replacements(&request, layouter, outputs)
                     .remove(recipe.target())
-                    .expect("帮助说明布局必须返回唯一译文叶")
+                    .expect("帮助说明布局必须返回唯一译文单元")
+                    .iter()
+                    .map(RpgMakerWriteBackLaidOutLine::text)
+                    .collect::<Vec<_>>()
                     .join("\n");
                 overrides.insert(role.clone(), replacement);
             }
         }
 
-        let replacement = render_direct_recipe(&recipe, &leaves, &overrides);
+        let replacement = render_direct_recipe(&recipe, &units, &overrides);
         outputs.mutations.push(StandardWriteBackMutation::SetText(
             SetTextMutation::from_recipe(&recipe, replacement),
         ));
@@ -1916,7 +2323,7 @@ fn layout_replacements(
     request: &RpgMakerWriteBackLayoutRequest,
     layouter: &impl RpgMakerWriteBackTextLayouter,
     outputs: &mut GroupPlanningOutputs<'_>,
-) -> BTreeMap<RpgMakerLocation, Vec<String>> {
+) -> BTreeMap<RpgMakerLocation, Vec<RpgMakerWriteBackLaidOutLine>> {
     match layouter.layout(request) {
         RpgMakerWriteBackLayoutOutcome::Applied(applied) => {
             let (segments, inserted_line_breaks, inserted_fullwidth_indents) = applied.into_parts();
@@ -1941,7 +2348,13 @@ fn layout_replacements(
                     RpgMakerWriteBackLayoutCandidate::FrozenOriginal => None,
                     RpgMakerWriteBackLayoutCandidate::DatabaseTranslation(translation) => Some((
                         segment.exact_location.clone(),
-                        split_hard_lines(translation),
+                        split_hard_lines(translation)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(source_semantic_line_index, text)| {
+                                RpgMakerWriteBackLaidOutLine::new(text, source_semantic_line_index)
+                            })
+                            .collect(),
                     )),
                 })
                 .collect()
@@ -1949,25 +2362,19 @@ fn layout_replacements(
     }
 }
 
-fn effective_leaf_text(leaf: &StandardWriteBackLeaf) -> String {
-    leaf.translation
-        .clone()
-        .unwrap_or_else(|| leaf.original_text.clone())
-}
-
-fn dialogue_body_location(recipe: &DialogueWriteRecipe, index: usize) -> Option<RpgMakerLocation> {
+fn dialogue_body_location(recipe: &DialogueWriteRecipe) -> Option<RpgMakerLocation> {
     recipe.lines().iter().find_map(|line| {
         line.parts()
             .iter()
-            .any(|part| matches!(part, DialogueLinePart::BodySlot { index: value } if *value == index))
+            .any(|part| matches!(part, DialogueLinePart::BodyLine { .. }))
             .then(|| line.physical_location().clone())
     })
 }
 
 fn render_direct_recipe(
     recipe: &DirectTextRecipe,
-    leaves: &BTreeMap<TextFieldRole, StandardWriteBackLeaf>,
-    overrides: &BTreeMap<TextFieldRole, String>,
+    units: &BTreeMap<TextUnitRole, StandardWriteBackUnit>,
+    overrides: &BTreeMap<TextUnitRole, String>,
 ) -> String {
     let mut rendered = String::new();
     for part in recipe.parts() {
@@ -1977,11 +2384,28 @@ fn render_direct_recipe(
                 if let Some(value) = overrides.get(role) {
                     rendered.push_str(value);
                 } else {
-                    rendered.push_str(&effective_leaf_text(
-                        leaves.get(role).expect("受信直接配方角色必须存在叶"),
-                    ));
+                    rendered.push_str(
+                        units
+                            .get(role)
+                            .expect("受信直接配方角色必须存在语义单元")
+                            .effective_content()
+                            .as_value()
+                            .expect("TextSlot 必须引用单值内容"),
+                    );
                 }
             }
+            DirectTextPart::LineSlot {
+                role,
+                source_line_index,
+            } => rendered.push_str(
+                units
+                    .get(role)
+                    .expect("受信直接配方角色必须存在语义单元")
+                    .effective_content()
+                    .as_lines()
+                    .and_then(|lines| lines.get(*source_line_index))
+                    .expect("LineSlot 必须引用存在的语义行"),
+            ),
         }
     }
     rendered
@@ -2005,15 +2429,15 @@ fn split_hard_lines(text: &str) -> Vec<String> {
 
 fn is_canonical_help_description(
     kind: TextGroupKind,
-    leaf: &StandardWriteBackLeaf,
+    unit: &StandardWriteBackUnit,
     recipe: &DirectTextRecipe,
 ) -> bool {
     if kind != TextGroupKind::DatabaseEntry {
         return false;
     }
     if !matches!(
-        &leaf.role,
-        TextFieldRole::Scalar(field_name) if field_name.as_str() == "description"
+        &unit.role,
+        TextUnitRole::Scalar(field_name) if field_name.as_str() == "description"
     ) {
         return false;
     }
@@ -2126,7 +2550,9 @@ mod tests {
                         DialogueLinePart::Literal("\\n<".to_owned()),
                         DialogueLinePart::SpeakerSlot,
                         DialogueLinePart::Literal(">".to_owned()),
-                        DialogueLinePart::BodySlot { index: 0 },
+                        DialogueLinePart::BodyLine {
+                            source_line_index: 0,
+                        },
                     ],
                 )
                 .expect("测试对话行应合法"),
@@ -2138,16 +2564,18 @@ mod tests {
             TextGroupKind::EventDialogue,
             header,
             vec![
-                StandardWriteBackLeaf::new(
-                    TextFieldRole::DialogueSpeaker,
-                    "Alice",
-                    speaker_translation.map(str::to_owned),
+                StandardWriteBackUnit::new(
+                    TextUnitRole::DialogueSpeaker,
+                    TextUnitContent::Value("Alice".to_owned()),
+                    speaker_translation
+                        .map(|translation| TextUnitContent::Value(translation.to_owned())),
                 )
                 .expect("测试 Speaker 应合法"),
-                StandardWriteBackLeaf::new(
-                    TextFieldRole::DialogueBody { index: 0 },
-                    "Hello",
-                    body_translation.map(str::to_owned),
+                StandardWriteBackUnit::new(
+                    TextUnitRole::DialogueBody,
+                    TextUnitContent::Lines(vec!["Hello".to_owned()]),
+                    body_translation
+                        .map(|translation| TextUnitContent::Lines(split_hard_lines(translation))),
                 )
                 .expect("测试 Body 应合法"),
             ],
@@ -2175,23 +2603,22 @@ mod tests {
     }
 
     #[test]
-    fn manual_layout_diagnostic_identifies_single_and_multiple_affected_logical_leaves() {
+    fn manual_layout_diagnostic_identifies_affected_logical_units() {
         let scalar_group = location(8, None);
         let scalar_role =
-            TextFieldRole::Scalar(ScalarFieldKey::new("description").expect("测试字段键应合法"));
-        let scalar_leaf = StandardWriteBackLeaf::new(
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("测试字段键应合法"));
+        let scalar_unit = StandardWriteBackUnit::new(
             scalar_role.clone(),
-            "原说明",
-            Some("很长的译文".to_owned()),
+            TextUnitContent::Value("原说明".to_owned()),
+            Some(TextUnitContent::Value("很长的译文".to_owned())),
         )
-        .expect("测试标量叶应合法");
+        .expect("测试标量单元应合法");
         let scalar_request = RpgMakerWriteBackLayoutRequest::new(
             RpgMakerWriteBackLayoutRegion::HelpDescription,
             MaxFullwidthChars::new(2).expect("测试行宽应合法"),
-            false,
-            vec![RpgMakerWriteBackLayoutSegment::from_leaf_at(
+            vec![RpgMakerWriteBackLayoutSegment::from_unit_at(
                 &scalar_group,
-                &scalar_leaf,
+                &scalar_unit,
                 location(8, Some(0)),
             )],
         );
@@ -2202,47 +2629,57 @@ mod tests {
         );
 
         let dialogue_group = location(10, None);
-        let first_role = TextFieldRole::DialogueBody { index: 0 };
-        let original_role = TextFieldRole::DialogueBody { index: 1 };
-        let third_role = TextFieldRole::DialogueBody { index: 2 };
-        let first =
-            StandardWriteBackLeaf::new(first_role.clone(), "原文一", Some("译文一".to_owned()))
-                .expect("首个对话叶应合法");
-        let original =
-            StandardWriteBackLeaf::new(original_role, "原文二", None).expect("未翻译对话叶应合法");
-        let third =
-            StandardWriteBackLeaf::new(third_role.clone(), "原文三", Some("译文三".to_owned()))
-                .expect("末个对话叶应合法");
+        let body_role = TextUnitRole::DialogueBody;
+        let body = StandardWriteBackUnit::new(
+            body_role.clone(),
+            TextUnitContent::Lines(vec!["原文一".to_owned(), "原文二".to_owned()]),
+            Some(TextUnitContent::Lines(vec![
+                "译文一".to_owned(),
+                "译文二".to_owned(),
+            ])),
+        )
+        .expect("对话正文单元应合法");
         let dialogue_request = RpgMakerWriteBackLayoutRequest::new(
             RpgMakerWriteBackLayoutRegion::DialogueBody,
             MaxFullwidthChars::new(2).expect("测试行宽应合法"),
-            true,
-            vec![
-                RpgMakerWriteBackLayoutSegment::from_leaf_at(
-                    &dialogue_group,
-                    &first,
-                    location(11, Some(0)),
-                ),
-                RpgMakerWriteBackLayoutSegment::from_leaf_at(
-                    &dialogue_group,
-                    &original,
-                    location(12, Some(0)),
-                ),
-                RpgMakerWriteBackLayoutSegment::frozen_at(location(13, Some(0)), "   "),
-                RpgMakerWriteBackLayoutSegment::from_leaf_at(
-                    &dialogue_group,
-                    &third,
-                    location(14, Some(0)),
-                ),
-            ],
+            vec![RpgMakerWriteBackLayoutSegment::from_unit_at(
+                &dialogue_group,
+                &body,
+                location(11, Some(0)),
+            )],
         );
         let dialogue_diagnostic = ManualLayoutDiagnostic::from_request(&dialogue_request);
         assert_eq!(
             dialogue_diagnostic.locations(),
-            [
-                LogicalTextLocation::new(dialogue_group.clone(), first_role),
-                LogicalTextLocation::new(dialogue_group, third_role),
-            ]
+            [LogicalTextLocation::new(dialogue_group, body_role)]
+        );
+
+        let scrolling_group = location(20, None);
+        let scrolling_role = TextUnitRole::ScrollingText;
+        let scrolling_request = RpgMakerWriteBackLayoutRequest::new(
+            RpgMakerWriteBackLayoutRegion::ScrollingText,
+            MaxFullwidthChars::new(2).expect("测试行宽应合法"),
+            vec![
+                RpgMakerWriteBackLayoutSegment::from_line_at(
+                    &scrolling_group,
+                    scrolling_role.clone(),
+                    location(21, Some(0)),
+                    "原文一".to_owned(),
+                    Some("译文一".to_owned()),
+                ),
+                RpgMakerWriteBackLayoutSegment::from_line_at(
+                    &scrolling_group,
+                    scrolling_role.clone(),
+                    location(22, Some(0)),
+                    "原文二".to_owned(),
+                    Some("译文二".to_owned()),
+                ),
+            ],
+        );
+        let scrolling_diagnostic = ManualLayoutDiagnostic::from_request(&scrolling_request);
+        assert_eq!(
+            scrolling_diagnostic.locations(),
+            [LogicalTextLocation::new(scrolling_group, scrolling_role)]
         );
     }
 
@@ -2252,45 +2689,61 @@ mod tests {
 
         let speaker_only = dialogue_mutation(Some("爱丽丝"), None).expect("Speaker 译文应触发写回");
         assert_eq!(speaker_only.speaker(), Some("爱丽丝"));
-        assert_eq!(
-            speaker_only.body_lines(0),
-            Some(["Hello".to_owned()].as_slice())
-        );
+        assert_eq!(speaker_only.body_lines(), None);
 
         let body_only = dialogue_mutation(None, Some("你好")).expect("Body 译文应触发写回");
         assert_eq!(body_only.speaker(), Some("Alice"));
         assert_eq!(
-            body_only.body_lines(0),
-            Some(["你好".to_owned()].as_slice())
+            body_only.body_lines().map(|lines| lines
+                .iter()
+                .map(RpgMakerWriteBackLaidOutLine::text)
+                .collect::<Vec<_>>()),
+            Some(vec!["你好"])
         );
 
         let both = dialogue_mutation(Some("爱丽丝"), Some("你好")).expect("两类译文应触发写回");
         assert_eq!(both.speaker(), Some("爱丽丝"));
-        assert_eq!(both.body_lines(0), Some(["你好".to_owned()].as_slice()));
-    }
-
-    #[test]
-    fn dialogue_body_hard_line_break_expands_only_that_body_leaf() {
-        let mutation =
-            dialogue_mutation(None, Some("第一行\n第二行")).expect("Body 译文应触发写回");
         assert_eq!(
-            mutation.body_lines(0),
-            Some(["第一行".to_owned(), "第二行".to_owned()].as_slice())
+            both.body_lines().map(|lines| lines
+                .iter()
+                .map(RpgMakerWriteBackLaidOutLine::text)
+                .collect::<Vec<_>>()),
+            Some(vec!["你好"])
         );
     }
 
     #[test]
-    fn scrolling_recipe_keeps_blank_physical_lines_without_creating_logical_leaves() {
+    fn dialogue_body_hard_line_breaks_preserve_semantic_line_provenance() {
+        let mutation =
+            dialogue_mutation(None, Some("第一行\n第二行")).expect("Body 译文应触发写回");
+        assert_eq!(
+            mutation.body_lines().map(|lines| lines
+                .iter()
+                .map(RpgMakerWriteBackLaidOutLine::text)
+                .collect::<Vec<_>>()),
+            Some(vec!["第一行", "第二行"])
+        );
+        assert_eq!(
+            mutation.body_lines().map(|lines| lines
+                .iter()
+                .map(RpgMakerWriteBackLaidOutLine::source_semantic_line_index)
+                .collect::<Vec<_>>()),
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn scrolling_recipe_keeps_blank_slots_inside_the_atomic_unit() {
         let group_location = location(0, None);
-        let first_role = TextFieldRole::ScrollingTextBody { index: 0 };
-        let third_role = TextFieldRole::ScrollingTextBody { index: 2 };
+        let role = TextUnitRole::ScrollingText;
         let recipes = vec![
             TextProjectionRecipe::Direct(
                 DirectTextRecipe::new(
                     location(1, Some(0)),
                     "第一行",
-                    vec![DirectTextPart::TextSlot {
-                        role: first_role.clone(),
+                    vec![DirectTextPart::LineSlot {
+                        role: role.clone(),
+                        source_line_index: 0,
                     }],
                 )
                 .expect("首行配方应合法"),
@@ -2299,7 +2752,10 @@ mod tests {
                 DirectTextRecipe::new(
                     location(2, Some(0)),
                     "   ",
-                    vec![DirectTextPart::Literal("   ".to_owned())],
+                    vec![DirectTextPart::LineSlot {
+                        role: role.clone(),
+                        source_line_index: 1,
+                    }],
                 )
                 .expect("冻结空白配方应合法"),
             ),
@@ -2307,8 +2763,9 @@ mod tests {
                 DirectTextRecipe::new(
                     location(3, Some(0)),
                     "第三行",
-                    vec![DirectTextPart::TextSlot {
-                        role: third_role.clone(),
+                    vec![DirectTextPart::LineSlot {
+                        role: role.clone(),
+                        source_line_index: 2,
                     }],
                 )
                 .expect("末行配方应合法"),
@@ -2322,9 +2779,20 @@ mod tests {
             TextGroupKind::EventScrollingText,
             group_location,
             vec![
-                StandardWriteBackLeaf::new(first_role, "第一行", Some("译文".to_owned()))
-                    .expect("首行叶应合法"),
-                StandardWriteBackLeaf::new(third_role, "第三行", None).expect("末行叶应合法"),
+                StandardWriteBackUnit::new(
+                    role,
+                    TextUnitContent::Lines(vec![
+                        "第一行".to_owned(),
+                        "   ".to_owned(),
+                        "第三行".to_owned(),
+                    ]),
+                    Some(TextUnitContent::Lines(vec![
+                        "译文".to_owned(),
+                        String::new(),
+                        "第三行".to_owned(),
+                    ])),
+                )
+                .expect("滚动文本单元应合法"),
             ],
             recipes,
             targets,
@@ -2342,18 +2810,92 @@ mod tests {
             panic!("滚动组应产生唯一块级 Mutation")
         };
         assert_eq!(mutation.segments().len(), 3);
-        assert!(matches!(
-            mutation.segments()[0].action(),
-            EventBodyMutationAction::ReplaceWithLines(lines) if lines == &["译文"]
-        ));
-        assert!(matches!(
-            mutation.segments()[1].action(),
-            EventBodyMutationAction::KeepOriginal
-        ));
+        assert_eq!(mutation.segments()[0].replacement_lines(), &["译文"]);
+        assert_eq!(mutation.segments()[1].replacement_lines(), &["   "]);
         assert_eq!(mutation.segments()[1].expected_original(), "   ");
+        assert_eq!(mutation.segments()[2].replacement_lines(), &["第三行"]);
+    }
+
+    #[test]
+    fn choices_are_planned_as_one_strictly_aligned_atomic_mutation() {
+        let group_location = location(20, None);
+        let source_lines = vec!["はい".to_owned(), "いいえ".to_owned()];
+        let translated_lines = vec!["是".to_owned(), "否".to_owned()];
+        let recipes = [
+            (location(20, Some(0)), 0),
+            (location(20, Some(1)), 1),
+            (location(21, Some(1)), 0),
+            (location(22, Some(1)), 1),
+        ]
+        .into_iter()
+        .map(|(target, source_line_index)| {
+            TextProjectionRecipe::Direct(
+                DirectTextRecipe::new(
+                    target,
+                    source_lines[source_line_index].clone(),
+                    vec![DirectTextPart::LineSlot {
+                        role: TextUnitRole::Choices,
+                        source_line_index,
+                    }],
+                )
+                .expect("选项配方应合法"),
+            )
+        })
+        .collect::<Vec<_>>();
+        let targets = recipes
+            .iter()
+            .flat_map(TextProjectionRecipe::mutation_targets)
+            .collect();
+        let group = StandardWriteBackGroup::new(
+            TextGroupKind::EventChoices,
+            group_location,
+            vec![
+                StandardWriteBackUnit::new(
+                    TextUnitRole::Choices,
+                    TextUnitContent::Lines(source_lines.clone()),
+                    Some(TextUnitContent::Lines(translated_lines.clone())),
+                )
+                .expect("选项单元应合法"),
+            ],
+            recipes,
+            targets,
+        )
+        .expect("选项组应合法");
+
+        let planned = plan_standard_write_back(
+            StandardWriteBackSnapshot::new(vec![group]).expect("选项快照应合法"),
+            &profile(),
+            &ConservativeRpgMakerWriteBackTextLayouter,
+        );
+        let [StandardWriteBackMutation::ReplaceChoices(mutation)] =
+            planned.mutation_plan.mutations()
+        else {
+            panic!("选项组应产生唯一原子 Mutation")
+        };
+        assert_eq!(mutation.source_lines(), source_lines);
+        assert_eq!(mutation.replacement_lines(), translated_lines);
+    }
+
+    #[test]
+    fn aligned_units_reject_line_count_and_blank_slot_changes() {
         assert!(matches!(
-            mutation.segments()[2].action(),
-            EventBodyMutationAction::KeepOriginal
+            StandardWriteBackUnit::new(
+                TextUnitRole::ScrollingText,
+                TextUnitContent::Lines(vec!["甲".to_owned(), "乙".to_owned()]),
+                Some(TextUnitContent::Lines(vec!["译文".to_owned()])),
+            ),
+            Err(StandardWriteBackSnapshotError::AlignedLineCountMismatch { .. })
+        ));
+        assert!(matches!(
+            StandardWriteBackUnit::new(
+                TextUnitRole::Choices,
+                TextUnitContent::Lines(vec!["是".to_owned(), "   ".to_owned()]),
+                Some(TextUnitContent::Lines(vec![
+                    "はい".to_owned(),
+                    "填充".to_owned()
+                ])),
+            ),
+            Err(StandardWriteBackSnapshotError::AlignedBlankLineMismatch { line_index: 1, .. })
         ));
     }
 
@@ -2361,8 +2903,8 @@ mod tests {
     fn direct_recipe_renders_literals_and_all_logical_slots_once() {
         let group_location = location(3, None);
         let target = location(3, Some(0));
-        let left = TextFieldRole::Scalar(ScalarFieldKey::new("left").expect("键应合法"));
-        let right = TextFieldRole::Scalar(ScalarFieldKey::new("right").expect("键应合法"));
+        let left = TextUnitRole::Scalar(ScalarFieldKey::new("left").expect("键应合法"));
+        let right = TextUnitRole::Scalar(ScalarFieldKey::new("right").expect("键应合法"));
         let recipe = DirectTextRecipe::new(
             target,
             "<x>甲</x><x>乙</x>",
@@ -2382,8 +2924,14 @@ mod tests {
             TextGroupKind::EventCommand,
             group_location,
             vec![
-                StandardWriteBackLeaf::new(left, "甲", Some("一".to_owned())).expect("左叶应合法"),
-                StandardWriteBackLeaf::new(right, "乙", None).expect("右叶应合法"),
+                StandardWriteBackUnit::new(
+                    left,
+                    TextUnitContent::Value("甲".to_owned()),
+                    Some(TextUnitContent::Value("一".to_owned())),
+                )
+                .expect("左单元应合法"),
+                StandardWriteBackUnit::new(right, TextUnitContent::Value("乙".to_owned()), None)
+                    .expect("右单元应合法"),
             ],
             vec![projection.clone()],
             projection.mutation_targets(),
@@ -2405,7 +2953,7 @@ mod tests {
     fn snapshot_rejects_recipe_target_corruption_and_cross_group_conflicts() {
         let group_location = location(4, None);
         let target = location(4, Some(0));
-        let role = TextFieldRole::Scalar(ScalarFieldKey::new("name").expect("键应合法"));
+        let role = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("键应合法"));
         let recipe = DirectTextRecipe::new(
             target.clone(),
             "原文",
@@ -2417,7 +2965,14 @@ mod tests {
             StandardWriteBackGroup::new(
                 TextGroupKind::EventCommand,
                 group_location.clone(),
-                vec![StandardWriteBackLeaf::new(role.clone(), "原文", None).expect("叶应合法")],
+                vec![
+                    StandardWriteBackUnit::new(
+                        role.clone(),
+                        TextUnitContent::Value("原文".to_owned()),
+                        None,
+                    )
+                    .expect("单元应合法")
+                ],
                 vec![projection.clone()],
                 vec![MutationTarget::Value(location(9, Some(0)))],
             ),
@@ -2425,12 +2980,12 @@ mod tests {
         ));
 
         let make_group = |field: &str| {
-            let field_role = TextFieldRole::Scalar(ScalarFieldKey::new(field).expect("键应合法"));
+            let unit_role = TextUnitRole::Scalar(ScalarFieldKey::new(field).expect("键应合法"));
             let direct = DirectTextRecipe::new(
                 target.clone(),
                 "原文",
                 vec![DirectTextPart::TextSlot {
-                    role: field_role.clone(),
+                    role: unit_role.clone(),
                 }],
             )
             .expect("配方应合法");
@@ -2438,7 +2993,14 @@ mod tests {
             StandardWriteBackGroup::new(
                 TextGroupKind::EventCommand,
                 group_location.clone(),
-                vec![StandardWriteBackLeaf::new(field_role, "原文", None).expect("叶应合法")],
+                vec![
+                    StandardWriteBackUnit::new(
+                        unit_role,
+                        TextUnitContent::Value("原文".to_owned()),
+                        None,
+                    )
+                    .expect("单元应合法"),
+                ],
                 vec![projection.clone()],
                 projection.mutation_targets(),
             )
@@ -2454,7 +3016,7 @@ mod tests {
     fn snapshot_rejects_recipe_that_cannot_rebuild_frozen_original() {
         let direct_group = location(20, None);
         let direct_target = location(20, Some(0));
-        let direct_role = TextFieldRole::Scalar(ScalarFieldKey::new("name").expect("键应合法"));
+        let direct_role = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("键应合法"));
         let direct = TextProjectionRecipe::Direct(
             DirectTextRecipe::new(
                 direct_target,
@@ -2473,7 +3035,14 @@ mod tests {
             StandardWriteBackGroup::new(
                 TextGroupKind::EventCommand,
                 direct_group,
-                vec![StandardWriteBackLeaf::new(direct_role, "Alice", None).expect("叶应合法")],
+                vec![
+                    StandardWriteBackUnit::new(
+                        direct_role,
+                        TextUnitContent::Value("Alice".to_owned()),
+                        None,
+                    )
+                    .expect("单元应合法")
+                ],
                 vec![direct.clone()],
                 direct.mutation_targets(),
             ),
@@ -2490,7 +3059,9 @@ mod tests {
                     DialogueLineRecipe::new(
                         location(31, Some(0)),
                         "Hello",
-                        vec![DialogueLinePart::BodySlot { index: 0 }],
+                        vec![DialogueLinePart::BodyLine {
+                            source_line_index: 0,
+                        }],
                     )
                     .expect("正文配方应合法"),
                 ],
@@ -2502,14 +3073,18 @@ mod tests {
                 TextGroupKind::EventDialogue,
                 dialogue_group,
                 vec![
-                    StandardWriteBackLeaf::new(TextFieldRole::DialogueSpeaker, "Bob", None)
-                        .expect("Speaker 叶应合法"),
-                    StandardWriteBackLeaf::new(
-                        TextFieldRole::DialogueBody { index: 0 },
-                        "Hello",
+                    StandardWriteBackUnit::new(
+                        TextUnitRole::DialogueSpeaker,
+                        TextUnitContent::Value("Bob".to_owned()),
                         None,
                     )
-                    .expect("Body 叶应合法"),
+                    .expect("Speaker 单元应合法"),
+                    StandardWriteBackUnit::new(
+                        TextUnitRole::DialogueBody,
+                        TextUnitContent::Lines(vec!["Hello".to_owned()]),
+                        None,
+                    )
+                    .expect("Body 单元应合法"),
                 ],
                 vec![dialogue.clone()],
                 dialogue.mutation_targets(),
@@ -2527,7 +3102,9 @@ mod tests {
                         location(41, Some(0)),
                         "Hello",
                         vec![
-                            DialogueLinePart::BodySlot { index: 0 },
+                            DialogueLinePart::BodyLine {
+                                source_line_index: 0,
+                            },
                             DialogueLinePart::Literal(String::new()),
                         ],
                     )
@@ -2541,12 +3118,12 @@ mod tests {
                 TextGroupKind::EventDialogue,
                 trailing_group,
                 vec![
-                    StandardWriteBackLeaf::new(
-                        TextFieldRole::DialogueBody { index: 0 },
-                        "Hello",
+                    StandardWriteBackUnit::new(
+                        TextUnitRole::DialogueBody,
+                        TextUnitContent::Lines(vec!["Hello".to_owned()]),
                         None,
                     )
-                    .expect("Body 叶应合法")
+                    .expect("Body 单元应合法")
                 ],
                 vec![trailing.clone()],
                 trailing.mutation_targets(),

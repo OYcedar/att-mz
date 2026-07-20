@@ -1,4 +1,4 @@
-//! RPG Maker 固定提取、规则提取与 Lua 提取共用的逻辑文本快照。
+//! RPG Maker 固定提取、规则提取与 Lua 提取共用的语义文本快照。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -6,84 +6,74 @@ use std::fmt;
 
 use crate::rpg_maker::model::{
     DirectTextPart, DirectTextRecipe, LogicalTextLocation, MutationTarget, ProjectionModelError,
-    ScalarFieldKey, TextFieldRole, TextProjectionRecipe,
+    ScalarFieldKey, TextProjectionRecipe, TextUnitContent, TextUnitRole,
 };
 pub(crate) use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind,
 };
 
-/// 一个可独立继承、翻译或清除译文的逻辑文本叶。
+/// 一个可独立继承、翻译、验收和写回的语义文本单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ExtractedTextField {
-    field_name: String,
-    role: TextFieldRole,
-    physical_location: RpgMakerLocation,
-    original_text: String,
+pub(crate) struct ExtractedTextUnit {
+    role: TextUnitRole,
+    projection_location: RpgMakerLocation,
+    source_content: TextUnitContent,
 }
 
-impl ExtractedTextField {
-    /// 为现有 Builtin/Lua 字段建立强角色；字段名只保留为诊断展示。
+impl ExtractedTextUnit {
+    /// 为 Builtin、规则或 Lua 的普通单值字段建立标量单元。
     pub(crate) fn new(
         field_name: impl Into<String>,
-        physical_location: RpgMakerLocation,
+        projection_location: RpgMakerLocation,
         original_text: impl Into<String>,
     ) -> Result<Self, SnapshotModelError> {
-        let field_name = field_name.into();
-        if field_name.is_empty() {
-            return Err(SnapshotModelError::EmptyFieldName {
-                exact_location: Box::new(physical_location),
-            });
-        }
-        let role = role_from_field_name(&field_name)?;
-        Self::with_role(field_name, role, physical_location, original_text)
+        let role = ScalarFieldKey::new(field_name)
+            .map(TextUnitRole::Scalar)
+            .map_err(SnapshotModelError::Projection)?;
+        Self::projected(
+            role,
+            projection_location,
+            TextUnitContent::Value(original_text.into()),
+        )
     }
 
-    /// 为投影器已经确定角色的逻辑叶建立受信字段。
+    /// 为投影器已经确定角色和完整内容的语义单元建立受信快照。
     pub(crate) fn projected(
-        role: TextFieldRole,
-        physical_location: RpgMakerLocation,
-        original_text: impl Into<String>,
+        role: TextUnitRole,
+        projection_location: RpgMakerLocation,
+        source_content: TextUnitContent,
     ) -> Result<Self, SnapshotModelError> {
-        let field_name = role_field_name(&role);
-        Self::with_role(field_name, role, physical_location, original_text)
-    }
-
-    fn with_role(
-        field_name: String,
-        role: TextFieldRole,
-        physical_location: RpgMakerLocation,
-        original_text: impl Into<String>,
-    ) -> Result<Self, SnapshotModelError> {
-        if field_name.is_empty() {
-            return Err(SnapshotModelError::EmptyFieldName {
-                exact_location: Box::new(physical_location),
+        let actual_lines = matches!(source_content, TextUnitContent::Lines(_));
+        if role.expects_lines() != actual_lines {
+            return Err(SnapshotModelError::ContentShapeMismatch {
+                role,
+                exact_location: Box::new(projection_location),
             });
         }
-        let original_text = original_text.into();
-        if original_text.trim().is_empty() {
-            return Err(SnapshotModelError::BlankOriginal {
-                exact_location: Box::new(physical_location),
+        if let TextUnitContent::Lines(lines) = &source_content
+            && let Some(source_line_index) = lines.iter().position(|line| {
+                line.chars()
+                    .any(|character| matches!(character, '\r' | '\n' | '\0'))
+            })
+        {
+            return Err(SnapshotModelError::InvalidSourceLine {
+                source_line_index,
+                exact_location: Box::new(projection_location),
+            });
+        }
+        if source_content.is_blank() {
+            return Err(SnapshotModelError::BlankSourceContent {
+                exact_location: Box::new(projection_location),
             });
         }
         Ok(Self {
-            field_name,
             role,
-            physical_location,
-            original_text,
+            projection_location,
+            source_content,
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn field_name(&self) -> &str {
-        &self.field_name
-    }
-
-    #[cfg(test)]
-    pub(crate) fn exact_location(&self) -> &RpgMakerLocation {
-        &self.physical_location
-    }
-
-    pub(crate) fn role(&self) -> &TextFieldRole {
+    pub(crate) fn role(&self) -> &TextUnitRole {
         &self.role
     }
 
@@ -94,8 +84,8 @@ impl ExtractedTextField {
         LogicalTextLocation::new(group_location.clone(), self.role.clone())
     }
 
-    pub(crate) fn original_text(&self) -> &str {
-        &self.original_text
+    pub(crate) fn source_content(&self) -> &TextUnitContent {
+        &self.source_content
     }
 }
 
@@ -104,70 +94,74 @@ impl ExtractedTextField {
 pub(crate) struct ExtractedTextGroup {
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
-    fields: Vec<ExtractedTextField>,
+    units: Vec<ExtractedTextUnit>,
     mutation_targets: Vec<MutationTarget>,
     recipes: Vec<TextProjectionRecipe>,
 }
 
 impl ExtractedTextGroup {
-    /// 为一个字段对应一个物理目标的既有 Builtin/Lua 组建立直接配方。
+    /// 为一个单值单元对应一个物理目标的 Builtin、规则或 Lua 组建立直接配方。
     pub(crate) fn new(
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
-        mut fields: Vec<ExtractedTextField>,
+        units: Vec<ExtractedTextUnit>,
     ) -> Result<Self, SnapshotModelError> {
-        if fields.is_empty() {
+        if units.is_empty() {
             return Err(SnapshotModelError::EmptyGroup {
                 group_location: Box::new(group_location),
             });
         }
-        if kind == TextGroupKind::EventScrollingText {
-            for field in &mut fields {
-                if let TextFieldRole::DialogueBody { index } = field.role {
-                    field.role = TextFieldRole::ScrollingTextBody { index };
-                }
-            }
-        }
-        let recipes = fields
+        let recipes = units
             .iter()
-            .map(|field| {
+            .map(|unit| {
+                let source = unit.source_content.as_value().ok_or_else(|| {
+                    SnapshotModelError::DirectGroupRequiresValue {
+                        role: unit.role.clone(),
+                        exact_location: Box::new(unit.projection_location.clone()),
+                    }
+                })?;
                 DirectTextRecipe::new(
-                    field.physical_location.clone(),
-                    field.original_text.clone(),
+                    unit.projection_location.clone(),
+                    source,
                     vec![DirectTextPart::TextSlot {
-                        role: field.role.clone(),
+                        role: unit.role.clone(),
                     }],
                 )
                 .map(TextProjectionRecipe::Direct)
                 .map_err(SnapshotModelError::Projection)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Self::projected(kind, group_location, fields, recipes)
+        Self::projected(kind, group_location, units, recipes)
     }
 
-    /// 为同一物理目标可以包含多个逻辑槽的物化投影建立文本组。
+    /// 为一个语义单元可以投影到多个物理目标的组建立完整快照。
     pub(crate) fn projected(
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
-        mut fields: Vec<ExtractedTextField>,
+        mut units: Vec<ExtractedTextUnit>,
         recipes: Vec<TextProjectionRecipe>,
     ) -> Result<Self, SnapshotModelError> {
+        if units.is_empty() {
+            return Err(SnapshotModelError::EmptyGroup {
+                group_location: Box::new(group_location),
+            });
+        }
         if recipes.is_empty() {
             return Err(SnapshotModelError::EmptyProjection {
                 group_location: Box::new(group_location),
             });
         }
-        fields.sort_by(|left, right| {
+        units.sort_by(|left, right| {
             left.role
                 .cmp(&right.role)
-                .then_with(|| left.physical_location.cmp(&right.physical_location))
+                .then_with(|| left.projection_location.cmp(&right.projection_location))
         });
 
         let mut roles = BTreeSet::new();
-        for field in &fields {
-            if !roles.insert(field.role.clone()) {
+        for unit in &units {
+            if !roles.insert(unit.role.clone()) {
                 return Err(SnapshotModelError::DuplicateLogicalLocation {
-                    logical_location: Box::new(field.logical_location(&group_location)),
+                    logical_location: Box::new(unit.logical_location(&group_location)),
                 });
             }
         }
@@ -179,10 +173,11 @@ impl ExtractedTextGroup {
         if roles != referenced_roles {
             return Err(SnapshotModelError::RecipeRoleMismatch {
                 group_location: Box::new(group_location),
-                leaves: roles,
+                units: roles,
                 referenced: referenced_roles,
             });
         }
+        validate_line_references(&group_location, &units, &recipes)?;
 
         let mut mutation_targets = recipes
             .iter()
@@ -200,7 +195,7 @@ impl ExtractedTextGroup {
         Ok(Self {
             kind,
             group_location,
-            fields,
+            units,
             mutation_targets,
             recipes,
         })
@@ -214,8 +209,8 @@ impl ExtractedTextGroup {
         &self.group_location
     }
 
-    pub(crate) fn fields(&self) -> &[ExtractedTextField] {
-        &self.fields
+    pub(crate) fn units(&self) -> &[ExtractedTextUnit] {
+        &self.units
     }
 
     pub(crate) fn mutation_targets(&self) -> &[MutationTarget] {
@@ -225,6 +220,41 @@ impl ExtractedTextGroup {
     pub(crate) fn recipes(&self) -> &[TextProjectionRecipe] {
         &self.recipes
     }
+}
+
+fn validate_line_references(
+    group_location: &RpgMakerLocation,
+    units: &[ExtractedTextUnit],
+    recipes: &[TextProjectionRecipe],
+) -> Result<(), SnapshotModelError> {
+    let mut referenced = BTreeMap::<TextUnitRole, BTreeSet<usize>>::new();
+    for (role, source_line_index) in recipes
+        .iter()
+        .flat_map(TextProjectionRecipe::referenced_lines)
+    {
+        referenced
+            .entry(role)
+            .or_default()
+            .insert(source_line_index);
+    }
+
+    for unit in units {
+        let actual = referenced.remove(unit.role()).unwrap_or_default();
+        let expected = match unit.source_content() {
+            TextUnitContent::Value(_) => BTreeSet::new(),
+            TextUnitContent::Lines(lines) => (0..lines.len()).collect(),
+        };
+        if actual != expected {
+            return Err(SnapshotModelError::RecipeLineMismatch {
+                group_location: Box::new(group_location.clone()),
+                role: unit.role().clone(),
+                expected,
+                referenced: actual,
+            });
+        }
+    }
+    debug_assert!(referenced.is_empty(), "角色集合已经在调用前验证一致");
+    Ok(())
 }
 
 /// 一个标准资产 owner 拥有的完整当前快照。
@@ -315,22 +345,22 @@ fn normalize_groups(
 ) -> Result<Vec<ExtractedTextGroup>, SnapshotModelError> {
     let mut merged = BTreeMap::<
         (RpgMakerLocation, TextGroupKind),
-        (Vec<ExtractedTextField>, Vec<TextProjectionRecipe>),
+        (Vec<ExtractedTextUnit>, Vec<TextProjectionRecipe>),
     >::new();
     for group in groups {
         let entry = merged
             .entry((group.group_location, group.kind))
             .or_default();
-        entry.0.extend(group.fields);
+        entry.0.extend(group.units);
         entry.1.extend(group.recipes);
     }
 
     let mut groups = Vec::with_capacity(merged.len());
-    for ((group_location, kind), (fields, recipes)) in merged {
+    for ((group_location, kind), (units, recipes)) in merged {
         groups.push(ExtractedTextGroup::projected(
             kind,
             group_location,
-            fields,
+            units,
             recipes,
         )?);
     }
@@ -338,8 +368,8 @@ fn normalize_groups(
     let mut logical_locations = BTreeSet::new();
     let mut targets = BTreeSet::new();
     for group in &groups {
-        for field in &group.fields {
-            let logical_location = field.logical_location(&group.group_location);
+        for unit in &group.units {
+            let logical_location = unit.logical_location(&group.group_location);
             if !logical_locations.insert(logical_location.clone()) {
                 return Err(SnapshotModelError::DuplicateLogicalLocation {
                     logical_location: Box::new(logical_location),
@@ -357,43 +387,21 @@ fn normalize_groups(
     Ok(groups)
 }
 
-fn role_from_field_name(field_name: &str) -> Result<TextFieldRole, SnapshotModelError> {
-    if field_name == "speaker" {
-        return Ok(TextFieldRole::DialogueSpeaker);
-    }
-    if let Some(index) = parse_indexed_field(field_name, "body") {
-        return Ok(TextFieldRole::DialogueBody { index });
-    }
-    ScalarFieldKey::new(field_name)
-        .map(TextFieldRole::Scalar)
-        .map_err(SnapshotModelError::Projection)
-}
-
-fn parse_indexed_field(value: &str, prefix: &str) -> Option<usize> {
-    value
-        .strip_prefix(prefix)?
-        .strip_prefix('[')?
-        .strip_suffix(']')?
-        .parse()
-        .ok()
-}
-
-fn role_field_name(role: &TextFieldRole) -> String {
-    match role {
-        TextFieldRole::Scalar(key) => key.as_str().to_owned(),
-        TextFieldRole::DialogueSpeaker => "speaker".to_owned(),
-        TextFieldRole::DialogueBody { index } | TextFieldRole::ScrollingTextBody { index } => {
-            format!("body[{index}]")
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SnapshotModelError {
-    EmptyFieldName {
+    BlankSourceContent {
         exact_location: Box<RpgMakerLocation>,
     },
-    BlankOriginal {
+    ContentShapeMismatch {
+        role: TextUnitRole,
+        exact_location: Box<RpgMakerLocation>,
+    },
+    DirectGroupRequiresValue {
+        role: TextUnitRole,
+        exact_location: Box<RpgMakerLocation>,
+    },
+    InvalidSourceLine {
+        source_line_index: usize,
         exact_location: Box<RpgMakerLocation>,
     },
     EmptyGroup {
@@ -410,8 +418,14 @@ pub(crate) enum SnapshotModelError {
     },
     RecipeRoleMismatch {
         group_location: Box<RpgMakerLocation>,
-        leaves: BTreeSet<TextFieldRole>,
-        referenced: BTreeSet<TextFieldRole>,
+        units: BTreeSet<TextUnitRole>,
+        referenced: BTreeSet<TextUnitRole>,
+    },
+    RecipeLineMismatch {
+        group_location: Box<RpgMakerLocation>,
+        role: TextUnitRole,
+        expected: BTreeSet<usize>,
+        referenced: BTreeSet<usize>,
     },
     Projection(ProjectionModelError),
 }
@@ -419,14 +433,38 @@ pub(crate) enum SnapshotModelError {
 impl fmt::Display for SnapshotModelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyFieldName { exact_location } => {
-                write!(formatter, "文本字段名为空：{exact_location}")
+            Self::BlankSourceContent { exact_location } => {
+                write!(
+                    formatter,
+                    "纯空白原文不应进入语义文本单元：{exact_location}"
+                )
             }
-            Self::BlankOriginal { exact_location } => {
-                write!(formatter, "纯空白原文不应进入逻辑叶：{exact_location}")
-            }
+            Self::ContentShapeMismatch {
+                role,
+                exact_location,
+            } => write!(
+                formatter,
+                "语义角色 {role:?} 与原文内容形状不一致：{exact_location}"
+            ),
+            Self::DirectGroupRequiresValue {
+                role,
+                exact_location,
+            } => write!(
+                formatter,
+                "直接文本组中的 {role:?} 必须是单值内容：{exact_location}"
+            ),
+            Self::InvalidSourceLine {
+                source_line_index,
+                exact_location,
+            } => write!(
+                formatter,
+                "语义行 {source_line_index} 含有 CR、LF 或 NUL：{exact_location}"
+            ),
             Self::EmptyGroup { group_location } => {
-                write!(formatter, "复合文本组不包含任何文本：{group_location}")
+                write!(
+                    formatter,
+                    "复合文本组不包含任何语义文本单元：{group_location}"
+                )
             }
             Self::EmptyProjection { group_location } => {
                 write!(formatter, "复合文本组没有物化写回配方：{group_location}")
@@ -439,11 +477,20 @@ impl fmt::Display for SnapshotModelError {
             }
             Self::RecipeRoleMismatch {
                 group_location,
-                leaves,
+                units,
                 referenced,
             } => write!(
                 formatter,
-                "组 {group_location} 的逻辑叶与写回配方引用不一致：leaves={leaves:?}, referenced={referenced:?}"
+                "组 {group_location} 的语义单元与写回配方引用不一致：units={units:?}, referenced={referenced:?}"
+            ),
+            Self::RecipeLineMismatch {
+                group_location,
+                role,
+                expected,
+                referenced,
+            } => write!(
+                formatter,
+                "组 {group_location} 的 {role:?} 行引用不完整：expected={expected:?}, referenced={referenced:?}"
             ),
             Self::Projection(source) => write!(formatter, "文本投影无效：{source}"),
         }
@@ -477,16 +524,20 @@ mod tests {
                 RpgMakerLocationStep::key("text"),
             ],
         );
-        let field =
-            ExtractedTextField::new("speaker", location.clone(), "角色").expect("非空字段应该合法");
+        let unit = ExtractedTextUnit::projected(
+            TextUnitRole::DialogueSpeaker,
+            location.clone(),
+            TextUnitContent::Value("角色".to_owned()),
+        )
+        .expect("非空单元应该合法");
         let first = ExtractedTextGroup::new(
             TextGroupKind::EventDialogue,
             group_location.clone(),
-            vec![field.clone()],
+            vec![unit.clone()],
         )
         .expect("组应合法");
         let second =
-            ExtractedTextGroup::new(TextGroupKind::EventDialogue, group_location, vec![field])
+            ExtractedTextGroup::new(TextGroupKind::EventDialogue, group_location, vec![unit])
                 .expect("单个组应合法");
 
         assert!(matches!(
@@ -497,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn one_physical_string_can_project_multiple_scalar_leaves() {
+    fn one_physical_string_can_project_multiple_scalar_units() {
         let source = RpgMakerSource::data(StandardDataFile::Items);
         let group_location =
             RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(1)]);
@@ -508,13 +559,21 @@ mod tests {
                 RpgMakerLocationStep::key("note"),
             ],
         );
-        let left_role = TextFieldRole::Scalar(ScalarFieldKey::new("match[0]").expect("键应合法"));
-        let right_role = TextFieldRole::Scalar(ScalarFieldKey::new("match[1]").expect("键应合法"));
-        let fields = vec![
-            ExtractedTextField::projected(left_role.clone(), target.clone(), "甲")
-                .expect("叶应合法"),
-            ExtractedTextField::projected(right_role.clone(), target.clone(), "乙")
-                .expect("叶应合法"),
+        let left_role = TextUnitRole::Scalar(ScalarFieldKey::new("match[0]").expect("键应合法"));
+        let right_role = TextUnitRole::Scalar(ScalarFieldKey::new("match[1]").expect("键应合法"));
+        let units = vec![
+            ExtractedTextUnit::projected(
+                left_role.clone(),
+                target.clone(),
+                TextUnitContent::Value("甲".to_owned()),
+            )
+            .expect("单元应合法"),
+            ExtractedTextUnit::projected(
+                right_role.clone(),
+                target.clone(),
+                TextUnitContent::Value("乙".to_owned()),
+            )
+            .expect("单元应合法"),
         ];
         let recipe = TextProjectionRecipe::Direct(
             DirectTextRecipe::new(
@@ -534,12 +593,64 @@ mod tests {
         let group = ExtractedTextGroup::projected(
             TextGroupKind::DatabaseEntry,
             group_location,
-            fields,
+            units,
             vec![recipe],
         )
-        .expect("同址多逻辑叶应合法");
+        .expect("同址多语义单元应合法");
 
-        assert_eq!(group.fields().len(), 2);
+        assert_eq!(group.units().len(), 2);
         assert_eq!(group.mutation_targets().len(), 1);
+    }
+
+    #[test]
+    fn line_content_requires_every_source_index_in_the_recipe() {
+        let source = RpgMakerSource::map(1);
+        let group_location = RpgMakerLocation::value(source.clone(), Vec::new());
+        let target = RpgMakerLocation::value(source, vec![RpgMakerLocationStep::index(1)]);
+        let unit = ExtractedTextUnit::projected(
+            TextUnitRole::Choices,
+            group_location.clone(),
+            TextUnitContent::Lines(vec!["是".to_owned(), "否".to_owned()]),
+        )
+        .expect("选项单元应合法");
+        let recipe = TextProjectionRecipe::Direct(
+            DirectTextRecipe::new(
+                target,
+                "是",
+                vec![DirectTextPart::LineSlot {
+                    role: TextUnitRole::Choices,
+                    source_line_index: 0,
+                }],
+            )
+            .expect("首个选项配方应合法"),
+        );
+
+        assert!(matches!(
+            ExtractedTextGroup::projected(
+                TextGroupKind::EventChoices,
+                group_location,
+                vec![unit],
+                vec![recipe]
+            ),
+            Err(SnapshotModelError::RecipeLineMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn line_content_rejects_embedded_line_breaks_and_nul() {
+        let location = RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new());
+        for invalid in ["一\n二", "一\r二", "一\0二"] {
+            assert!(matches!(
+                ExtractedTextUnit::projected(
+                    TextUnitRole::DialogueBody,
+                    location.clone(),
+                    TextUnitContent::Lines(vec![invalid.to_owned()]),
+                ),
+                Err(SnapshotModelError::InvalidSourceLine {
+                    source_line_index: 0,
+                    ..
+                })
+            ));
+        }
     }
 }

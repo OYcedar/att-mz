@@ -127,8 +127,8 @@ impl SqliteQueryExecutor for RecordingSqliteQuery {
                 Ok(rows.owners)
             } else if query.statement().contains("FROM standard_text_group") {
                 Ok(rows.groups)
-            } else if query.statement().contains("FROM standard_text_leaf") {
-                Ok(rows.leaves)
+            } else if query.statement().contains("FROM standard_text_unit") {
+                Ok(rows.units)
             } else if query.statement().contains("FROM standard_text_target") {
                 Ok(rows.targets)
             } else {
@@ -852,8 +852,8 @@ async fn real_write_back_non_root_tree_rewrites_publishes_logs_and_runs_lua() {
     assert_eq!(output.name.as_str(), PROJECT_NAME);
     assert_eq!(output.output_root, workspace_root().join("write_back"));
     assert!(output.lua_executed);
-    assert_eq!(output.standard.translated_locations, 3);
-    assert_eq!(output.standard.original_locations, 0);
+    assert_eq!(output.standard.translated_units, 3);
+    assert_eq!(output.standard.original_units, 0);
     assert_eq!(output.standard.auto_wrapped_units, 2);
     assert_eq!(output.standard.inserted_line_breaks, 2);
     assert_eq!(output.standard.inserted_fullwidth_indents, 1);
@@ -994,7 +994,7 @@ fn assert_project_open_and_asset_queries(observations: &FullTreeObservations) {
             .contains("FROM standard_asset_owner_state")
     );
     assert!(calls[2].1.statement().contains("FROM standard_text_group"));
-    assert!(calls[3].1.statement().contains("FROM standard_text_leaf"));
+    assert!(calls[3].1.statement().contains("FROM standard_text_unit"));
     assert!(calls[4].1.statement().contains("FROM standard_text_target"));
     assert!(
         calls
@@ -1189,14 +1189,14 @@ fn metadata_row() -> SqliteRow {
 struct WriteBackSnapshotRows {
     owners: Vec<SqliteRow>,
     groups: Vec<SqliteRow>,
-    leaves: Vec<SqliteRow>,
+    units: Vec<SqliteRow>,
     targets: Vec<SqliteRow>,
 }
 
 fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectTextPart,
-        DirectTextRecipe, ScalarFieldKey, TextFieldRole, TextProjectionRecipe,
+        DirectTextRecipe, ScalarFieldKey, TextProjectionRecipe, TextUnitContent, TextUnitRole,
     };
 
     let item_source = RpgMakerSource::data(StandardDataFile::Items);
@@ -1243,7 +1243,7 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
     );
 
     let description_role =
-        TextFieldRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法"));
+        TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法"));
     let description_recipe = TextProjectionRecipe::Direct(
         DirectTextRecipe::new(
             item_description,
@@ -1254,7 +1254,7 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
         )
         .expect("说明配方应合法"),
     );
-    let name_role = TextFieldRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法"));
+    let name_role = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法"));
     let name_recipe = TextProjectionRecipe::Direct(
         DirectTextRecipe::new(
             item_name,
@@ -1265,7 +1265,7 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
         )
         .expect("名称配方应合法"),
     );
-    let dialogue_role = TextFieldRole::DialogueBody { index: 0 };
+    let dialogue_role = TextUnitRole::DialogueBody;
     let dialogue_recipe = TextProjectionRecipe::Dialogue(
         DialogueWriteRecipe::new(
             dialogue_group.clone(),
@@ -1274,7 +1274,9 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
                 DialogueLineRecipe::new(
                     dialogue_body,
                     "原始对话",
-                    vec![DialogueLinePart::BodySlot { index: 0 }],
+                    vec![DialogueLinePart::BodyLine {
+                        source_line_index: 0,
+                    }],
                 )
                 .expect("对话行配方应合法"),
             ],
@@ -1289,8 +1291,8 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
             "database_entry",
             description_recipe,
             description_role,
-            "旧说明\n第二行",
-            "甲乙，丙丁。",
+            TextUnitContent::Value("旧说明\n第二行".to_owned()),
+            TextUnitContent::Value("甲乙，丙丁。".to_owned()),
         ),
         fixture_group(
             "rules",
@@ -1298,8 +1300,8 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
             "database_entry",
             name_recipe,
             name_role,
-            "药水",
-            "Potion",
+            TextUnitContent::Value("药水".to_owned()),
+            TextUnitContent::Value("Potion".to_owned()),
         ),
         fixture_group(
             "builtin",
@@ -1307,8 +1309,8 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
             "event_dialogue",
             dialogue_recipe,
             dialogue_role,
-            "原始对话",
-            "「甲乙，丙丁」",
+            TextUnitContent::Lines(vec!["原始对话".to_owned()]),
+            TextUnitContent::Lines(vec!["「甲乙，丙丁」".to_owned()]),
         ),
     ];
 
@@ -1323,7 +1325,7 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
         })
         .collect::<Vec<_>>();
     let mut group_rows = Vec::new();
-    let mut leaf_rows = Vec::new();
+    let mut unit_rows = Vec::new();
     let mut target_rows = Vec::new();
     for group in groups {
         group_rows.push(SqliteRow::new(vec![
@@ -1332,13 +1334,13 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
             SqliteValue::Text(group.kind.to_owned()),
             SqliteValue::Text(group.recipes.clone()),
         ]));
-        leaf_rows.push(SqliteRow::new(vec![
+        unit_rows.push(SqliteRow::new(vec![
             SqliteValue::Text(group.owner.clone()),
             SqliteValue::Text(group.group_location.clone()),
             SqliteValue::Text(group.role.clone()),
-            SqliteValue::Text(group.original.clone()),
+            SqliteValue::Text(group.source_content_json.clone()),
             SqliteValue::Text("{}".to_owned()),
-            SqliteValue::Text(group.translation),
+            SqliteValue::Text(group.translation_content_json),
         ]));
         for target in group.targets {
             target_rows.push(SqliteRow::new(vec![
@@ -1353,7 +1355,7 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
             .cmp(snapshot_row_text(right, 0))
             .then_with(|| snapshot_row_text(left, 1).cmp(snapshot_row_text(right, 1)))
     });
-    leaf_rows.sort_by(|left, right| {
+    unit_rows.sort_by(|left, right| {
         snapshot_row_text(left, 0)
             .cmp(snapshot_row_text(right, 0))
             .then_with(|| snapshot_row_text(left, 1).cmp(snapshot_row_text(right, 1)))
@@ -1363,7 +1365,7 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
     WriteBackSnapshotRows {
         owners,
         groups: group_rows,
-        leaves: leaf_rows,
+        units: unit_rows,
         targets: target_rows,
     }
 }
@@ -1385,8 +1387,8 @@ struct FixtureGroup {
     kind: &'static str,
     recipes: String,
     role: String,
-    original: String,
-    translation: String,
+    source_content_json: String,
+    translation_content_json: String,
     targets: Vec<String>,
 }
 
@@ -1395,9 +1397,9 @@ fn fixture_group(
     group_location: &RpgMakerLocation,
     kind: &'static str,
     recipe: crate::rpg_maker::model::TextProjectionRecipe,
-    role: crate::rpg_maker::model::TextFieldRole,
-    original: &str,
-    translation: &str,
+    role: crate::rpg_maker::model::TextUnitRole,
+    source_content: crate::rpg_maker::model::TextUnitContent,
+    translation_content: crate::rpg_maker::model::TextUnitContent,
 ) -> FixtureGroup {
     use crate::rpg_maker::location_codec::RpgMakerProjectionCodec;
 
@@ -1408,8 +1410,9 @@ fn fixture_group(
         recipes: RpgMakerProjectionCodec::encode_recipes(std::slice::from_ref(&recipe))
             .expect("配方应可编码"),
         role: RpgMakerProjectionCodec::encode_role(&role).expect("角色应可编码"),
-        original: original.to_owned(),
-        translation: translation.to_owned(),
+        source_content_json: serde_json::to_string(&source_content).expect("单元原文应可编码"),
+        translation_content_json: serde_json::to_string(&translation_content)
+            .expect("单元译文应可编码"),
         targets: recipe
             .mutation_targets()
             .iter()
@@ -1426,8 +1429,8 @@ fn fixture_asset_fingerprint(owner: &str, groups: &[FixtureGroup]) -> [u8; 32] {
         .filter(|group| group.owner == owner)
         .collect::<Vec<_>>();
     owner_groups.sort_by(|left, right| left.group_location.cmp(&right.group_location));
-    let mut leaves = owner_groups.clone();
-    leaves.sort_by(|left, right| {
+    let mut units = owner_groups.clone();
+    units.sort_by(|left, right| {
         left.group_location
             .cmp(&right.group_location)
             .then_with(|| left.role.cmp(&right.role))
@@ -1457,12 +1460,12 @@ fn fixture_asset_fingerprint(owner: &str, groups: &[FixtureGroup]) -> [u8; 32] {
             .frame(4, group.kind.as_bytes())
             .frame(5, group.recipes.as_bytes());
     }
-    for leaf in leaves {
+    for unit in units {
         hasher
-            .frame(6, b"leaf")
-            .frame(7, leaf.group_location.as_bytes())
-            .frame(8, leaf.role.as_bytes())
-            .frame(9, leaf.original.as_bytes())
+            .frame(6, b"unit")
+            .frame(7, unit.group_location.as_bytes())
+            .frame(8, unit.role.as_bytes())
+            .frame(9, unit.source_content_json.as_bytes())
             .frame(10, b"{}");
     }
     for (target, group_location) in targets {

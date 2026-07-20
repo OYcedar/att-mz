@@ -148,7 +148,7 @@ impl ResolvedTranslationSemantics {
     }
 }
 
-/// 当前叶子相对于源语言与保护规则的处理状态。
+/// 当前单段文本相对于源语言与保护规则的处理状态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedTranslationStatus {
     Active,
@@ -166,7 +166,7 @@ impl PreparedTranslationStatus {
     }
 }
 
-/// `prepare` 建立的不可伪造、可跨 worker 持有的叶子验收句柄。
+/// `prepare` 建立的不可伪造、可跨 worker 持有的单段文本验收句柄。
 #[derive(Clone)]
 pub(crate) struct PreparedTranslationText {
     status: PreparedTranslationStatus,

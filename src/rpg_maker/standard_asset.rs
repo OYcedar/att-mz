@@ -205,21 +205,21 @@ fn location_kind(location: &RpgMakerLocation) -> &'static str {
     }
 }
 
-/// 标准资产读取时每个 CPU 解码作业的逻辑叶上限。
+/// 标准资产读取时每个 CPU 解码作业的语义单元上限。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerStandardAssetReadingConfig {
-    leaves_per_decode_job: NonZeroUsize,
+    units_per_decode_job: NonZeroUsize,
 }
 
 impl RpgMakerStandardAssetReadingConfig {
-    pub(crate) const fn new(leaves_per_decode_job: NonZeroUsize) -> Self {
+    pub(crate) const fn new(units_per_decode_job: NonZeroUsize) -> Self {
         Self {
-            leaves_per_decode_job,
+            units_per_decode_job,
         }
     }
 
-    pub(crate) const fn leaves_per_decode_job(self) -> NonZeroUsize {
-        self.leaves_per_decode_job
+    pub(crate) const fn units_per_decode_job(self) -> NonZeroUsize {
+        self.units_per_decode_job
     }
 }
 

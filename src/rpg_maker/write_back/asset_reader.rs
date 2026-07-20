@@ -1,4 +1,4 @@
-//! 从 RPG Maker 标准文本三表建立写回快照。
+//! 从 RPG Maker 标准文本资产表建立写回快照。
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -13,7 +13,9 @@ use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
 };
-use crate::rpg_maker::model::{MutationTarget, TextFieldRole, TextProjectionRecipe};
+use crate::rpg_maker::model::{
+    MutationTarget, TextProjectionRecipe, TextUnitContent, TextUnitRole,
+};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
 use crate::rpg_maker::standard_asset::{
@@ -25,8 +27,8 @@ use crate::storage::sqlite::{
 };
 
 use super::standard::{
-    StandardWriteBackAssetReader, StandardWriteBackGroup, StandardWriteBackLeaf,
-    StandardWriteBackSnapshot, StandardWriteBackSnapshotError,
+    StandardWriteBackAssetReader, StandardWriteBackGroup, StandardWriteBackSnapshot,
+    StandardWriteBackSnapshotError, StandardWriteBackUnit,
 };
 
 const READ_STANDARD_WRITE_BACK_OWNER_STATES: &str = r#"SELECT
@@ -44,15 +46,15 @@ const READ_STANDARD_WRITE_BACK_GROUPS: &str = r#"SELECT
 FROM standard_text_group
 ORDER BY owner COLLATE BINARY, group_location COLLATE BINARY"#;
 
-const READ_STANDARD_WRITE_BACK_LEAVES: &str = r#"SELECT
+const READ_STANDARD_WRITE_BACK_UNITS: &str = r#"SELECT
     owner,
     group_location,
-    field_role,
-    original_text,
-    translation_context_json,
-    translation
-FROM standard_text_leaf
-ORDER BY owner COLLATE BINARY, group_location COLLATE BINARY, field_role COLLATE BINARY"#;
+    unit_role,
+    source_content_json,
+    source_context_json,
+    translation_content_json
+FROM standard_text_unit
+ORDER BY owner COLLATE BINARY, group_location COLLATE BINARY, unit_role COLLATE BINARY"#;
 
 const READ_STANDARD_WRITE_BACK_TARGETS: &str = r#"SELECT
     owner,
@@ -96,7 +98,7 @@ where
         let dialogue_definition = project.mv_dialogue_definition().clone();
         let sqlite = Arc::clone(&self.sqlite);
         let cpu = Arc::clone(&self.cpu);
-        let records_per_job = self.config.leaves_per_decode_job().get();
+        let records_per_job = self.config.units_per_decode_job().get();
 
         async move {
             let dialogue_definition_json =
@@ -111,14 +113,14 @@ where
                     vec![
                         SqliteQuery::new(READ_STANDARD_WRITE_BACK_OWNER_STATES, Vec::new()),
                         SqliteQuery::new(READ_STANDARD_WRITE_BACK_GROUPS, Vec::new()),
-                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_LEAVES, Vec::new()),
+                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_UNITS, Vec::new()),
                         SqliteQuery::new(READ_STANDARD_WRITE_BACK_TARGETS, Vec::new()),
                     ],
                 )
                 .await
                 .map_err(|error| map_query_error(database_path, error))?;
             let actual = query_results.len();
-            let [owner_rows, group_rows, leaf_rows, target_rows] =
+            let [owner_rows, group_rows, unit_rows, target_rows] =
                 query_results.try_into().map_err(|_| {
                     RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot(
                         InvalidStandardWriteBackAssetSnapshot::WrongQueryResultCount {
@@ -134,7 +136,7 @@ where
                         SnapshotRows {
                             owners: owner_rows,
                             groups: group_rows,
-                            leaves: leaf_rows,
+                            units: unit_rows,
                             targets: target_rows,
                         },
                         current_source,
@@ -283,6 +285,10 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
     InvalidDialogueDefinition(MvDialogueDefinitionError),
     InvalidLocation(RpgMakerLocationCodecError),
     InvalidProjection(RpgMakerProjectionCodecError),
+    InvalidUnitContent {
+        column: &'static str,
+        source: serde_json::Error,
+    },
     InvalidModel(StandardWriteBackSnapshotError),
 }
 
@@ -327,7 +333,7 @@ impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
                 group_location,
             } => write!(
                 formatter,
-                "叶或目标没有对应资产组：{owner} / {group_location}"
+                "单元或目标没有对应资产组：{owner} / {group_location}"
             ),
             Self::AssetFingerprintMismatch { owner } => {
                 write!(formatter, "资产所有者 {owner} 的快照指纹与三表内容不一致")
@@ -337,6 +343,9 @@ impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
             }
             Self::InvalidLocation(source) => write!(formatter, "组位置无效：{source}"),
             Self::InvalidProjection(source) => write!(formatter, "文本投影无效：{source}"),
+            Self::InvalidUnitContent { column, source } => {
+                write!(formatter, "列 {column} 不是合法文本单元内容：{source}")
+            }
             Self::InvalidModel(source) => source.fmt(formatter),
         }
     }
@@ -347,6 +356,7 @@ impl Error for InvalidStandardWriteBackAssetSnapshot {
         match self {
             Self::InvalidLocation(source) => Some(source),
             Self::InvalidProjection(source) => Some(source),
+            Self::InvalidUnitContent { source, .. } => Some(source),
             Self::InvalidModel(source) => Some(source),
             Self::InvalidDialogueDefinition(source) => Some(source),
             _ => None,
@@ -363,13 +373,13 @@ struct OwnerState {
 struct SnapshotRows {
     owners: Vec<SqliteRow>,
     groups: Vec<SqliteRow>,
-    leaves: Vec<SqliteRow>,
+    units: Vec<SqliteRow>,
     targets: Vec<SqliteRow>,
 }
 
 enum SnapshotAssetRow {
     Group(SqliteRow),
-    Leaf(SqliteRow),
+    Unit(SqliteRow),
     Target(SqliteRow),
 }
 
@@ -388,7 +398,7 @@ fn prepare_rows(
     let asset_row_count = rows
         .groups
         .len()
-        .saturating_add(rows.leaves.len())
+        .saturating_add(rows.units.len())
         .saturating_add(rows.targets.len());
     let initial_batch_capacity = records_per_job.min(asset_row_count);
     let mut owner_states = BTreeMap::new();
@@ -444,7 +454,7 @@ fn prepare_rows(
         .groups
         .into_iter()
         .map(SnapshotAssetRow::Group)
-        .chain(rows.leaves.into_iter().map(SnapshotAssetRow::Leaf))
+        .chain(rows.units.into_iter().map(SnapshotAssetRow::Unit))
         .chain(rows.targets.into_iter().map(SnapshotAssetRow::Target));
     for row in ordered_asset_rows {
         asset_rows.push(row);
@@ -475,14 +485,15 @@ enum DecodedRecord {
         recipes: Vec<TextProjectionRecipe>,
         recipes_raw: String,
     },
-    Leaf {
+    Unit {
         owner: String,
         group_location_raw: String,
-        role: TextFieldRole,
+        role: TextUnitRole,
         role_raw: String,
-        original_text: String,
-        translation_context_json: String,
-        translation: Option<String>,
+        source_content: TextUnitContent,
+        source_content_json: String,
+        source_context_json: String,
+        translation_content: Option<TextUnitContent>,
     },
     Target {
         owner: String,
@@ -498,7 +509,7 @@ fn decode_batch(
     rows.into_iter()
         .map(|row| match row {
             SnapshotAssetRow::Group(row) => decode_group(row),
-            SnapshotAssetRow::Leaf(row) => decode_leaf(row),
+            SnapshotAssetRow::Unit(row) => decode_unit(row),
             SnapshotAssetRow::Target(row) => decode_target(row),
         })
         .collect()
@@ -531,16 +542,16 @@ fn decode_group(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBac
     })
 }
 
-fn decode_leaf(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
+fn decode_unit(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
     let values = row.into_values();
     let actual = values.len();
     let [
         owner,
         group_location,
-        field_role,
-        original_text,
-        translation_context_json,
-        translation,
+        unit_role,
+        source_content_json,
+        source_context_json,
+        translation_content_json,
     ] = values.try_into().map_err(
         |_| InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
             expected: 6,
@@ -550,16 +561,37 @@ fn decode_leaf(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBack
     let owner = owned_text(owner, "owner")?;
     parse_owner(&owner)?;
     let group_location_raw = owned_text(group_location, "group_location")?;
-    let role_raw = owned_text(field_role, "field_role")?;
-    Ok(DecodedRecord::Leaf {
+    let role_raw = owned_text(unit_role, "unit_role")?;
+    let source_content_json = owned_text(source_content_json, "source_content_json")?;
+    let source_content = serde_json::from_str(&source_content_json).map_err(|source| {
+        InvalidStandardWriteBackAssetSnapshot::InvalidUnitContent {
+            column: "source_content_json",
+            source,
+        }
+    })?;
+    let source_context_json = owned_text(source_context_json, "source_context_json")?;
+    let translation_content_json =
+        optional_owned_text(translation_content_json, "translation_content_json")?;
+    let translation_content = translation_content_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(
+            |source| InvalidStandardWriteBackAssetSnapshot::InvalidUnitContent {
+                column: "translation_content_json",
+                source,
+            },
+        )?;
+    Ok(DecodedRecord::Unit {
         owner,
         group_location_raw,
         role: RpgMakerProjectionCodec::decode_role(&role_raw)
             .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
         role_raw,
-        original_text: owned_text(original_text, "original_text")?,
-        translation_context_json: owned_text(translation_context_json, "translation_context_json")?,
-        translation: optional_owned_text(translation, "translation")?,
+        source_content,
+        source_content_json,
+        source_context_json,
+        translation_content,
     })
 }
 
@@ -590,7 +622,7 @@ struct GroupBuilder {
     kind: TextGroupKind,
     location: RpgMakerLocation,
     recipes: Vec<TextProjectionRecipe>,
-    leaves: Vec<StandardWriteBackLeaf>,
+    units: Vec<StandardWriteBackUnit>,
     targets: Vec<MutationTarget>,
 }
 
@@ -618,12 +650,12 @@ impl SnapshotFingerprintAccumulator {
             .frame(5, recipes.as_bytes());
     }
 
-    fn leaf(&mut self, group_location: &str, role: &str, original: &str, context: &str) {
+    fn unit(&mut self, group_location: &str, role: &str, source: &str, context: &str) {
         self.hasher
-            .frame(6, b"leaf")
+            .frame(6, b"unit")
             .frame(7, group_location.as_bytes())
             .frame(8, role.as_bytes())
-            .frame(9, original.as_bytes())
+            .frame(9, source.as_bytes())
             .frame(10, context.as_bytes());
     }
 
@@ -645,7 +677,7 @@ fn assemble_snapshot(
     dialogue_definition_json: &str,
 ) -> Result<StandardWriteBackSnapshot, InvalidStandardWriteBackAssetSnapshot> {
     let mut groups = BTreeMap::<(String, String), GroupBuilder>::new();
-    let mut leaves = Vec::new();
+    let mut units = Vec::new();
     let mut targets = Vec::new();
     let mut fingerprint_accumulators = owner_states
         .iter()
@@ -660,7 +692,7 @@ fn assemble_snapshot(
     for record in records {
         let owner = match &record {
             DecodedRecord::Group { owner, .. }
-            | DecodedRecord::Leaf { owner, .. }
+            | DecodedRecord::Unit { owner, .. }
             | DecodedRecord::Target { owner, .. } => owner,
         };
         if !owner_states.contains_key(owner) {
@@ -690,7 +722,7 @@ fn assemble_snapshot(
                             kind,
                             location: group_location,
                             recipes,
-                            leaves: Vec::new(),
+                            units: Vec::new(),
                             targets: Vec::new(),
                         },
                     )
@@ -702,28 +734,29 @@ fn assemble_snapshot(
                     });
                 }
             }
-            DecodedRecord::Leaf {
+            DecodedRecord::Unit {
                 owner,
                 group_location_raw,
                 role,
                 role_raw,
-                original_text,
-                translation_context_json,
-                translation,
+                source_content,
+                source_content_json,
+                source_context_json,
+                translation_content,
             } => {
                 fingerprint_accumulators
                     .get_mut(&owner)
                     .expect("active owner 已在循环入口确认")
-                    .leaf(
+                    .unit(
                         &group_location_raw,
                         &role_raw,
-                        &original_text,
-                        &translation_context_json,
+                        &source_content_json,
+                        &source_context_json,
                     );
-                leaves.push((
+                units.push((
                     owner,
                     group_location_raw,
-                    StandardWriteBackLeaf::new(role, original_text, translation)
+                    StandardWriteBackUnit::new(role, source_content, translation_content)
                         .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidModel)?,
                 ));
             }
@@ -742,15 +775,15 @@ fn assemble_snapshot(
         }
     }
 
-    for (owner, group_location, leaf) in leaves {
+    for (owner, group_location, unit) in units {
         groups
             .get_mut(&(owner.clone(), group_location.clone()))
             .ok_or(InvalidStandardWriteBackAssetSnapshot::MissingGroup {
                 owner,
                 group_location,
             })?
-            .leaves
-            .push(leaf);
+            .units
+            .push(unit);
     }
     for (owner, group_location, target) in targets {
         groups
@@ -783,7 +816,7 @@ fn assemble_snapshot(
             StandardWriteBackGroup::new(
                 group.kind,
                 group.location,
-                group.leaves,
+                group.units,
                 group.recipes,
                 group.targets,
             )
@@ -798,7 +831,7 @@ fn assemble_snapshot(
 #[derive(Default)]
 struct FingerprintRows {
     groups: Vec<(String, String, String)>,
-    leaves: Vec<(String, String, String, String)>,
+    units: Vec<(String, String, String, String)>,
     targets: Vec<(String, String)>,
 }
 
@@ -809,14 +842,14 @@ fn snapshot_fingerprint(
     dialogue_definition_json: &str,
 ) -> AssetSnapshotFingerprint {
     rows.groups.sort();
-    rows.leaves.sort();
+    rows.units.sort();
     rows.targets.sort();
     let mut accumulator = SnapshotFingerprintAccumulator::new(owner, dialogue_definition_json);
     for (group_location, group_kind, recipes) in rows.groups {
         accumulator.group(&group_location, &group_kind, &recipes);
     }
-    for (group_location, role, original, context) in rows.leaves {
-        accumulator.leaf(&group_location, &role, &original, &context);
+    for (group_location, role, source, context) in rows.units {
+        accumulator.unit(&group_location, &role, &source, &context);
     }
     for (target, group_location) in rows.targets {
         accumulator.target(&target, &group_location);
@@ -940,7 +973,7 @@ mod tests {
         SnapshotRows {
             owners,
             groups: Vec::new(),
-            leaves: Vec::new(),
+            units: Vec::new(),
             targets: Vec::new(),
         }
     }
@@ -963,14 +996,15 @@ mod tests {
                     projection_recipe_json TEXT NOT NULL,
                     PRIMARY KEY (owner, group_location)
                 );
-                CREATE TABLE standard_text_leaf (
+                CREATE TABLE standard_text_unit (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
-                    field_role TEXT NOT NULL,
-                    original_text TEXT NOT NULL,
-                    translation_context_json TEXT NOT NULL,
-                    translation TEXT,
-                    PRIMARY KEY (owner, group_location, field_role)
+                    unit_role TEXT NOT NULL,
+                    source_content_json TEXT NOT NULL,
+                    source_context_json TEXT NOT NULL,
+                    translation_content_json TEXT,
+                    translation_state TEXT NOT NULL,
+                    PRIMARY KEY (owner, group_location, unit_role)
                 );
                 CREATE TABLE standard_text_target (
                     mutation_target TEXT NOT NULL PRIMARY KEY,
@@ -982,8 +1016,8 @@ mod tests {
                 INSERT INTO standard_asset_owner_state VALUES ('builtin', zeroblob(32), zeroblob(32));
                 INSERT INTO standard_text_group VALUES ('builtin', 'group-b', 'map', '[]');
                 INSERT INTO standard_text_group VALUES ('builtin', 'group-a', 'map', '[]');
-                INSERT INTO standard_text_leaf VALUES ('builtin', 'group-b', 'role-z', 'z', '{}', NULL);
-                INSERT INTO standard_text_leaf VALUES ('builtin', 'group-a', 'role-y', 'y', '{}', NULL);
+                INSERT INTO standard_text_unit VALUES ('builtin', 'group-b', 'role-z', '"z"', '{}', NULL, 'untranslated');
+                INSERT INTO standard_text_unit VALUES ('builtin', 'group-a', 'role-y', '"y"', '{}', NULL, 'untranslated');
                 INSERT INTO standard_text_target VALUES ('target-z', 'builtin', 'group-a');
                 INSERT INTO standard_text_target VALUES ('target-a', 'builtin', 'group-z');
                 "#,
@@ -993,7 +1027,7 @@ mod tests {
         for query in [
             READ_STANDARD_WRITE_BACK_OWNER_STATES,
             READ_STANDARD_WRITE_BACK_GROUPS,
-            READ_STANDARD_WRITE_BACK_LEAVES,
+            READ_STANDARD_WRITE_BACK_UNITS,
             READ_STANDARD_WRITE_BACK_TARGETS,
         ] {
             let plan = connection
@@ -1023,15 +1057,15 @@ mod tests {
             .expect("group 查询应可执行")
             .collect::<Result<Vec<_>, _>>()
             .expect("group 行应可读取");
-        let leaves = connection
-            .prepare(READ_STANDARD_WRITE_BACK_LEAVES)
-            .expect("leaf 查询应可建立")
+        let units = connection
+            .prepare(READ_STANDARD_WRITE_BACK_UNITS)
+            .expect("unit 查询应可建立")
             .query_map([], |row| {
                 Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
             })
-            .expect("leaf 查询应可执行")
+            .expect("unit 查询应可执行")
             .collect::<Result<Vec<_>, _>>()
-            .expect("leaf 行应可读取");
+            .expect("unit 行应可读取");
         let targets = connection
             .prepare(READ_STANDARD_WRITE_BACK_TARGETS)
             .expect("target 查询应可建立")
@@ -1045,7 +1079,7 @@ mod tests {
         assert_eq!(owners, ["builtin", "rules"]);
         assert_eq!(groups, ["group-a", "group-b"]);
         assert_eq!(
-            leaves,
+            units,
             [
                 ("group-a".to_owned(), "role-y".to_owned()),
                 ("group-b".to_owned(), "role-z".to_owned()),
@@ -1074,7 +1108,7 @@ mod tests {
         let rows = SnapshotRows {
             owners: Vec::new(),
             groups: vec![make_row("group-0", 4), make_row("group-1", 4)],
-            leaves: vec![make_row("leaf-0", 6), make_row("leaf-1", 6)],
+            units: vec![make_row("unit-0", 6), make_row("unit-1", 6)],
             targets: vec![make_row("target-0", 3)],
         };
 
@@ -1092,7 +1126,7 @@ mod tests {
                 .flatten()
                 .map(|row| match row {
                     SnapshotAssetRow::Group(row)
-                    | SnapshotAssetRow::Leaf(row)
+                    | SnapshotAssetRow::Unit(row)
                     | SnapshotAssetRow::Target(row) => match &row.values()[0] {
                         SqliteValue::Text(value) => value.as_ptr(),
                         value => panic!("owner 应为 TEXT，实际为 {}", value.kind_name()),
@@ -1113,45 +1147,46 @@ mod tests {
         ))
         .expect("测试位置应可编码");
         let group_location_pointer = group_location.as_ptr();
-        let role = RpgMakerProjectionCodec::encode_role(&TextFieldRole::Scalar(
+        let role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::Scalar(
             ScalarFieldKey::new("name").expect("测试字段键应合法"),
         ))
         .expect("测试角色应可编码");
         let role_pointer = role.as_ptr();
-        let original = "原文".to_owned();
-        let original_pointer = original.as_ptr();
+        let source_content_json = r#""原文""#.to_owned();
+        let source_content_json_pointer = source_content_json.as_ptr();
         let context = "{}".to_owned();
         let context_pointer = context.as_ptr();
-        let translation = "译文".to_owned();
-        let translation_pointer = translation.as_ptr();
+        let translation_content_json = r#""译文""#.to_owned();
         let row = SqliteRow::new(vec![
             SqliteValue::Text(owner),
             SqliteValue::Text(group_location),
             SqliteValue::Text(role),
-            SqliteValue::Text(original),
+            SqliteValue::Text(source_content_json),
             SqliteValue::Text(context),
-            SqliteValue::Text(translation),
+            SqliteValue::Text(translation_content_json),
         ]);
 
-        let DecodedRecord::Leaf {
+        let DecodedRecord::Unit {
             owner,
             group_location_raw,
             role_raw,
-            original_text,
-            translation_context_json,
-            translation: Some(translation),
+            source_content,
+            source_content_json,
+            source_context_json,
+            translation_content: Some(translation_content),
             ..
-        } = decode_leaf(row).expect("测试叶行应可解码")
+        } = decode_unit(row).expect("测试单元行应可解码")
         else {
-            panic!("测试行应解码为 leaf")
+            panic!("测试行应解码为 unit")
         };
 
         assert_eq!(owner.as_ptr(), owner_pointer);
         assert_eq!(group_location_raw.as_ptr(), group_location_pointer);
         assert_eq!(role_raw.as_ptr(), role_pointer);
-        assert_eq!(original_text.as_ptr(), original_pointer);
-        assert_eq!(translation_context_json.as_ptr(), context_pointer);
-        assert_eq!(translation.as_ptr(), translation_pointer);
+        assert_eq!(source_content_json.as_ptr(), source_content_json_pointer);
+        assert_eq!(source_context_json.as_ptr(), context_pointer);
+        assert_eq!(source_content.as_value(), Some("原文"));
+        assert_eq!(translation_content.as_value(), Some("译文"));
     }
 
     #[test]

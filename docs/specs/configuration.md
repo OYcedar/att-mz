@@ -205,7 +205,9 @@ Profile；它由 RPG Maker 翻译能力按权威项目语言对派生精确路�
 指向的普通文件，不尝试大小写变体、父语言、默认文件或目录首项。文件必须是合法
 UTF-8 且内容不能全为空白。系统 Prompt 绑定读取时的精确 `LanguagePair`，并与
 同一 `Arc<dyn LanguageModule>` 共同组成 RPG Maker 翻译资源。Prompt
-内容和语言策略指纹继续参与逐叶翻译状态指纹。
+内容和语言策略指纹继续参与语义单元翻译状态指纹。Prompt 作者必须要求模型只翻译带
+ID 内容、把无 ID 内容仅作语境、按 ID 到字符串数组的当前 wire 返回、遵守自由断行或
+严格对齐约束、精确保留 ATT token，并且不输出说明文字；项目不提供内置 Prompt 正文。
 
 ## 7. RPG Maker Profile 与所有权
 
@@ -214,8 +216,10 @@ UTF-8 且内容不能全为空白。系统 Prompt 绑定读取时的精确 `Lang
 ```toml
 [rpg_maker.document]
 [rpg_maker.standard_asset]
+units_per_decode_job = 32
 [rpg_maker.extract.store]
 [rpg_maker.translate.store]
+units_per_encode_job = 32
 ```
 
 各表中的必填资源预算由当前实现的受信配置类型定义；缺失时显式失败，不根据引擎、

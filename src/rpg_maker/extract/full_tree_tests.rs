@@ -290,7 +290,7 @@ impl SqliteQueryExecutor for FakeSqliteTransactionExecutor {
         assert!(
             query.statement().contains("standard_asset_owner_state")
                 || query.statement().contains("standard_text_group")
-                || query.statement().contains("standard_text_leaf")
+                || query.statement().contains("standard_text_unit")
                 || query.statement().contains("standard_text_target"),
             "Store 只应读取当前 owner 快照或新鲜 owner"
         );

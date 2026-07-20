@@ -270,7 +270,7 @@
         <ol>
           <li><strong>布局边界验证游戏根</strong><p>MZ 确认 data/js 与 rmmz_core.js；MV 确认 www/data、www/js 与 rpg_core.js，不探测或自动修正。</p><span class="path">src/rpg_maker/init.rs · src/rpg_maker/mod.rs</span></li>
           <li><strong>项目租约与来源指纹</strong><p>项目、锁和发布锁按 engine 分开；冻结树的完整 SHA-256 是后续三命令的 freshness 权威。</p><span class="path">src/rpg_maker/project_lease.rs · src/rpg_maker/project.rs</span></li>
-          <li><strong>建立当前数据库</strong><p>核心资产结构是 standard_text_group、standard_text_leaf、standard_text_target；owner 同时保存 source 与 asset snapshot fingerprint。</p><span class="path">src/rpg_maker/project_database.rs</span></li>
+          <li><strong>建立当前数据库</strong><p>核心资产结构是 standard_text_group、standard_text_unit、standard_text_target；unit 保存角色、完整源内容、源上下文、译文内容与 state，owner 同时保存 source 与 asset snapshot fingerprint。</p><span class="path">src/rpg_maker/project_database.rs</span></li>
           <li><strong>一次候选发布</strong><p>MZ 保留 data/js，MV 保留 www/data/js。完全相同返回 Unchanged，否则只发布一个完整候选。</p><span class="path">src/rpg_maker/init.rs · src/runtime/filesystem.rs</span></li>
         </ol>
         <p class="invariant"><strong>项目身份：</strong><code>projects.root / engine / name</code>。同名 MZ 与 MV 项目可以共存。</p>
@@ -280,15 +280,15 @@
     <details class="slice extract" open>
       <summary>
         <span class="index">02</span>
-        <span class="slice-title"><strong>Extract</strong><span>物化逻辑叶、物理目标与可逆 recipe</span></span>
+        <span class="slice-title"><strong>Extract</strong><span>物化语义单元、物理目标与可逆 recipe</span></span>
         <span class="toggle" aria-hidden="true"></span>
       </summary>
       <div class="tree">
         <ol>
-          <li><strong>Builtin 共享事件骨架</strong><p>Map、CommonEvents、Troops、数据库条目、101+401、选择项与滚动文本共用遍历和组模型。</p><span class="path">src/rpg_maker/extract/builtin.rs · src/rpg_maker/dialogue.rs</span></li>
+          <li><strong>Builtin 共享事件骨架</strong><p>Map、CommonEvents、Troops 与数据库条目共用遍历；101+401* 的正文、一个 102 的有序选项和 105+405* 的滚动块各形成一个完整语义单元。</p><span class="path">src/rpg_maker/extract/builtin.rs · src/rpg_maker/dialogue.rs</span></li>
           <li><strong>引擎姓名投影</strong><p>MZ 从可选 101.parameters[4] 建立 direct Speaker；MV 只在首条 401 上应用项目内已提交的 dialogue TOML，并生成 Literal/SpeakerSlot recipe。</p><span class="path">src/rpg_maker/dialogue.rs</span></li>
           <li><strong>统一 Rules TOML</strong><p>一个 [[rule]] 数组只支持 file、plugin 或任意 code+parameter，加窄路径、逐层 JSON decode 与可选 text 捕获。</p><span class="path">src/rpg_maker/extract/rules</span></li>
-          <li><strong>三表原子 Store</strong><p>逻辑身份是 owner + group_location + field_role；物理 MutationTarget 独立存放。MV 对话定义与 Builtin 快照原子切换。</p><span class="path">src/rpg_maker/extract/store/asset_store.rs · src/rpg_maker/text.rs</span></li>
+          <li><strong>三表原子 Store</strong><p>语义身份是 owner + group_location + unit_role；Value 保存为 JSON string，Lines 保存为 JSON array，物理 MutationTarget 独立存放。MV 对话定义与 Builtin 快照原子切换。</p><span class="path">src/rpg_maker/extract/store/asset_store.rs · src/rpg_maker/text.rs</span></li>
           <li><strong>可信 Lua</strong><p><code>ctx.rpg_maker</code> 复用 data、map、plugin、document 与 db 能力；跨命令插件协议留给 Lua。</p><span class="path">src/rpg_maker/lua · src/rpg_maker/lua/lua54.rs · src/rpg_maker/extract/lua.rs</span></li>
         </ol>
         <p class="invariant"><strong>Owner 顺序：</strong>Builtin → Rules → Lua。失败 owner 保留旧快照；成功 owner 原子提交。</p>
@@ -298,18 +298,18 @@
     <details class="slice translate" open>
       <summary>
         <span class="index">03</span>
-        <span class="slice-title"><strong>Translate</strong><span>按逻辑角色、上下文与 state 翻译</span></span>
+        <span class="slice-title"><strong>Translate</strong><span>按语义单元、上下文与 state 翻译</span></span>
         <span class="toggle" aria-hidden="true"></span>
       </summary>
       <div class="tree">
         <ol>
           <li><strong>共享 Profile 与 Prompt</strong><p>配置只使用 [rpg_maker]；Prompt 固定来自 prompts.root/rpg_maker/source--target.md。</p><span class="path">src/application/config.rs · src/rpg_maker/translate/profile.rs</span></li>
           <li><strong>TOML 资源边界</strong><p>Terminology 与 Placeholder 从严格 TOML 建立受信类型，再以 canonical JSON 持久化。</p><span class="path">src/rpg_maker/translate/planning_resource.rs · src/rpg_maker/translate/placeholder.rs</span></li>
-          <li><strong>逻辑资产读取与 Planner</strong><p>Speaker → Body(0..n) 强角色排序；同一 Dialogue Group 不拆分。Body 去重和 state 包含源 Speaker 上下文，Speaker 与 Body 不互相去重。</p><span class="path">src/rpg_maker/translate/asset_reader.rs · src/rpg_maker/translate/planner.rs</span></li>
-          <li><strong>LLM 执行与验收</strong><p>公共 Client、有限重试、严格 JSON 信封、占位符多重集和语言检查共同产生 Complete / Partial / Unavailable。</p><span class="path">src/rpg_maker/translate/executor.rs</span></li>
-          <li><strong>按逻辑叶提交</strong><p>写入前再次核对 metadata、owner 双指纹、资源快照和组/角色/原文/上下文，随后更新 standard_text_leaf。</p><span class="path">src/rpg_maker/translate/result_store.rs</span></li>
+          <li><strong>语义资产读取与 Planner</strong><p>Speaker、完整 Body、Choices、ScrollingText 与 Scalar 可以进入同一任务；相关组不拆分。Body 按完整行序列和源 Speaker 去重，Choices 保持组内独立。</p><span class="path">src/rpg_maker/translate/asset_reader.rs · src/rpg_maker/translate/planner.rs</span></li>
+          <li><strong>最小模型协议</strong><p>user message 只用 Markdown 表达命中术语、无编号直接语境和活动 ID，例如 <code>正文 [2]（自由断行）：<br>&gt; 第一行<br>&gt; 第二行</code>；模型只返回 ID 到字符串数组的 JSON 对象，例如 <code>{&quot;2&quot;:[&quot;译文一&quot;,&quot;译文二&quot;]}</code>。Reflow 允许重断行，Aligned(N) 必须逐槽对应。</p><span class="path">src/rpg_maker/translate/planner.rs · src/rpg_maker/translate/executor.rs</span></li>
+          <li><strong>按语义单元提交</strong><p>写入前再次核对 metadata、owner 双指纹、资源快照、unit role、完整源内容与上下文，随后原子更新 standard_text_unit 并传播完整译文。</p><span class="path">src/rpg_maker/translate/result_store.rs</span></li>
         </ol>
-        <p class="invariant"><strong>审计位置：</strong><code>{group_location, field_role}</code>；confirmed/accepted/unresolved 的计数均表示逻辑叶。</p>
+        <p class="invariant"><strong>审计位置：</strong><code>{group_location, unit_role}</code>；confirmed/accepted/unresolved 的计数均表示语义单元，不表示模型行或物理命令。</p>
       </div>
     </details>
 
@@ -321,9 +321,9 @@
       </summary>
       <div class="tree">
         <ol>
-          <li><strong>读取完整物化快照</strong><p>重新计算 owner asset fingerprint，验证 recipe、逻辑叶、物理目标、来源块与 target 冲突。</p><span class="path">src/rpg_maker/write_back/asset_reader.rs</span></li>
-          <li><strong>统一对话修改</strong><p>一个 ReplaceDialogueMutation 同时选择 Speaker/Body 译文，只布局 Body，填入 SpeakerSlot，并一次替换完整 101+401*。</p><span class="path">src/rpg_maker/write_back/standard.rs · src/rpg_maker/write_back/rewriter.rs</span></li>
-          <li><strong>保持正文硬边界</strong><p>单个 body[n] 可展开为多条 401，不跨不同 Body 合并；none、speaker-only、body-only、both 使用同一算法。</p><span class="path">src/rpg_maker/write_back/standard/layout.rs</span></li>
+          <li><strong>读取完整物化快照</strong><p>重新计算 owner asset fingerprint，验证 recipe、语义单元、物理目标、来源块与 target 冲突。</p><span class="path">src/rpg_maker/write_back/asset_reader.rs</span></li>
+          <li><strong>统一对话修改</strong><p>一个 ReplaceDialogueMutation 同时处理 Speaker 与完整 Body；模型正文可以从三行变为一、二或四行，验证后一次替换完整 101+401*。</p><span class="path">src/rpg_maker/write_back/standard.rs · src/rpg_maker/write_back/rewriter.rs</span></li>
+          <li><strong>语义断行与兜底布局</strong><p>模型行保持原样，只拆分过宽行；每条语义行使用对应源模板，新增语义行与自动续行沿用确定模板。Choices 同步更新 102/402，ScrollingText 原子更新完整 105+405*。</p><span class="path">src/rpg_maker/write_back/standard/layout.rs</span></li>
           <li><strong>Lua 编辑同一候选</strong><p>Lua 使用逻辑 data/js 路径；MV Host 映射到 www 内。脚本没有 publish 能力。</p><span class="path">src/rpg_maker/write_back/lua.rs · src/rpg_maker/lua</span></li>
           <li><strong>引擎布局验证与发布</strong><p>MZ 验证顶层 data/js；MV 验证顶层 www 及其 data/js。审计发布意图后只 publish 一次。</p><span class="path">src/rpg_maker/write_back/publisher.rs · src/runtime/filesystem.rs</span></li>
         </ol>

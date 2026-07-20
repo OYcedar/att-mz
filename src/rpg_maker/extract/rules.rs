@@ -14,6 +14,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::text::{DataFileName, StandardDataFile};
 use crate::storage::file_system::{FileReader, ReadFileError};
@@ -27,7 +28,7 @@ use super::document::{
     PluginConfiguration, RpgMakerDocumentId, RpgMakerDocumentSelection,
     RpgMakerProjectDocumentReader, RpgMakerProjectDocuments,
 };
-use super::model::{ExtractedTextField, ExtractedTextGroup, RulesSnapshot, SnapshotModelError};
+use super::model::{ExtractedTextGroup, ExtractedTextUnit, RulesSnapshot, SnapshotModelError};
 use super::store::RulesSnapshotStore;
 
 /// 使用调用方提供的当前 Rules TOML 完整替换 Rules 提取快照。
@@ -329,15 +330,15 @@ fn snapshot_from_targets(
         let physical_location = target
             .physical_location()
             .expect("匹配器只会产生已通过 Rules 定义校验的来源");
-        let fields = target
-            .leaves()
+        let units = target
+            .units()
             .iter()
             .enumerate()
-            .map(|(leaf_index, leaf)| {
-                ExtractedTextField::projected(
-                    target.role_for(leaf_index),
+            .map(|(unit_index, unit)| {
+                ExtractedTextUnit::projected(
+                    target.role_for(unit_index),
                     physical_location.clone(),
-                    leaf.original_text(),
+                    TextUnitContent::Value(unit.source_text().to_owned()),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -349,7 +350,7 @@ fn snapshot_from_targets(
             target
                 .group_location()
                 .expect("匹配器只会产生已通过 Rules 定义校验的来源"),
-            fields,
+            units,
             vec![recipe],
         )?);
     }
@@ -574,7 +575,7 @@ pattern = '\A(?<text>.+)\z'
     }
 
     #[test]
-    fn matched_regex_slots_become_one_direct_recipe_and_multiple_logical_leaves() {
+    fn matched_regex_slots_become_one_direct_recipe_and_multiple_logical_units() {
         let definition = RulesDefinition::parse(
             r#"
 [[rule]]
@@ -597,7 +598,7 @@ pattern = '<x>(?<text>.*?)</x>'
 
         let groups = snapshot.groups();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].fields().len(), 2);
+        assert_eq!(groups[0].units().len(), 2);
         assert_eq!(groups[0].mutation_targets().len(), 1);
         let TextProjectionRecipe::Direct(recipe) = &groups[0].recipes()[0] else {
             panic!("Rules 局部文本必须生成直接配方")
@@ -638,7 +639,7 @@ path = '[].description'
         let snapshot = snapshot_from_targets(targets).expect("同一数据库条目应合并为复合文本组");
 
         assert_eq!(snapshot.groups().len(), 1);
-        assert_eq!(snapshot.groups()[0].fields().len(), 2);
+        assert_eq!(snapshot.groups()[0].units().len(), 2);
         assert_eq!(snapshot.groups()[0].mutation_targets().len(), 2);
         assert_eq!(snapshot.groups()[0].recipes().len(), 2);
     }
@@ -688,7 +689,7 @@ path = 'entries[0].right.Name'
             snapshot
                 .groups()
                 .iter()
-                .all(|group| group.fields().len() == 1)
+                .all(|group| group.units().len() == 1)
         );
     }
 
@@ -730,7 +731,7 @@ path = '[].name'
         let error = service
             .replace(&project(), PathBuf::from("rules.toml"))
             .await
-            .expect_err("零个非空翻译叶必须放弃整个替换");
+            .expect_err("零个非空语义单元必须放弃整个替换");
 
         assert!(matches!(
             error,

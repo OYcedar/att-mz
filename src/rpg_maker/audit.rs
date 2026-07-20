@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::llm::LlmUsage;
 use crate::observability::{EventId, OperationId, RunId};
 use crate::rpg_maker::RpgMakerEngine;
-use crate::rpg_maker::model::{LogicalTextLocation, TextFieldRole};
+use crate::rpg_maker::model::{LogicalTextLocation, TextUnitRole};
 use crate::rpg_maker::project::RpgMakerWriteBackLayoutProfile;
 use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
 use crate::rpg_maker::translate::standard::{
@@ -719,7 +719,7 @@ struct TranslationTaskWire {
     finish_reason: Option<String>,
     final_response_usage: Option<LlmUsageWire>,
     accepted_decisions: usize,
-    confirmed_written_leaves: Option<usize>,
+    confirmed_written_units: Option<usize>,
     accepted: Vec<AcceptedTranslationWire>,
     unresolved: Vec<UnresolvedTranslationWire>,
     diagnostics: Vec<ProtocolDiagnosticWire>,
@@ -735,7 +735,7 @@ struct TranslationTaskWriteWire<'a> {
     finish_reason: Option<&'a str>,
     final_response_usage: Option<LlmUsageWire>,
     accepted_decisions: usize,
-    confirmed_written_leaves: Option<usize>,
+    confirmed_written_units: Option<usize>,
     accepted: AcceptedTranslationsWriteWire<'a>,
     unresolved: UnresolvedTranslationsWriteWire<'a>,
     diagnostics: ProtocolDiagnosticsWriteWire<'a>,
@@ -743,7 +743,7 @@ struct TranslationTaskWriteWire<'a> {
 
 impl<'a> TranslationTaskWriteWire<'a> {
     fn new(record: &'a TranslationTaskLogRecord, committed: bool) -> Self {
-        let confirmed_written_leaves = committed.then(|| {
+        let confirmed_written_units = committed.then(|| {
             record
                 .accepted()
                 .iter()
@@ -759,7 +759,7 @@ impl<'a> TranslationTaskWriteWire<'a> {
             finish_reason: record.finish_reason(),
             final_response_usage: record.final_response_usage().map(LlmUsageWire::from),
             accepted_decisions: record.accepted_decisions(),
-            confirmed_written_leaves,
+            confirmed_written_units,
             accepted: AcceptedTranslationsWriteWire(record.accepted()),
             unresolved: UnresolvedTranslationsWriteWire(record.unresolved()),
             diagnostics: ProtocolDiagnosticsWriteWire(record.diagnostics()),
@@ -896,15 +896,35 @@ impl<'a> From<&'a LoggedUnresolvedTranslationUnit> for UnresolvedTranslationWrit
 enum TranslationUnitRejectionReasonWriteWire<'a> {
     Missing,
     Duplicate,
-    InvalidShape { message: &'a str },
+    InvalidShape {
+        message: &'a str,
+    },
+    LineCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidLineText {
+        line_index: usize,
+    },
+    BlankLineMismatch {
+        line_index: usize,
+        expected_blank: bool,
+    },
     BlankTranslation,
-    InvalidSpeakerText,
     NoNaturalLanguageText,
     ContainsByteOrderMark,
-    PlaceholderMismatch { token: &'a str },
-    UnexpectedPlaceholderToken { token: &'a str },
-    PlaceholderNormalizationAmbiguous { original: &'a str },
-    SourceResidual { fragment: &'a str },
+    PlaceholderMismatch {
+        token: &'a str,
+    },
+    UnexpectedPlaceholderToken {
+        token: &'a str,
+    },
+    PlaceholderNormalizationAmbiguous {
+        original: &'a str,
+    },
+    SourceResidual {
+        fragment: &'a str,
+    },
 }
 
 impl<'a> From<&'a TranslationUnitRejectionReason> for TranslationUnitRejectionReasonWriteWire<'a> {
@@ -915,8 +935,25 @@ impl<'a> From<&'a TranslationUnitRejectionReason> for TranslationUnitRejectionRe
             TranslationUnitRejectionReason::InvalidShape { message } => {
                 Self::InvalidShape { message }
             }
+            TranslationUnitRejectionReason::LineCountMismatch { expected, actual } => {
+                Self::LineCountMismatch {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            TranslationUnitRejectionReason::InvalidLineText { line_index } => {
+                Self::InvalidLineText {
+                    line_index: *line_index,
+                }
+            }
+            TranslationUnitRejectionReason::BlankLineMismatch {
+                line_index,
+                expected_blank,
+            } => Self::BlankLineMismatch {
+                line_index: *line_index,
+                expected_blank: *expected_blank,
+            },
             TranslationUnitRejectionReason::BlankTranslation => Self::BlankTranslation,
-            TranslationUnitRejectionReason::InvalidSpeakerText => Self::InvalidSpeakerText,
             TranslationUnitRejectionReason::NoNaturalLanguageText => Self::NoNaturalLanguageText,
             TranslationUnitRejectionReason::ContainsByteOrderMark => Self::ContainsByteOrderMark,
             TranslationUnitRejectionReason::PlaceholderMismatch { token } => {
@@ -955,6 +992,7 @@ impl Serialize for ProtocolDiagnosticsWriteWire<'_> {
 enum ProtocolDiagnosticWriteWire<'a> {
     NonStopFinish { reason: &'a str },
     InvalidResponse { message: &'a str },
+    InvalidId { item_index: usize },
     UnknownId { item_index: usize, id: usize },
 }
 
@@ -967,6 +1005,9 @@ impl<'a> From<&'a TranslationProtocolDiagnostic> for ProtocolDiagnosticWriteWire
             TranslationProtocolDiagnostic::InvalidResponse { message } => {
                 Self::InvalidResponse { message }
             }
+            TranslationProtocolDiagnostic::InvalidId { item_index } => Self::InvalidId {
+                item_index: *item_index,
+            },
             TranslationProtocolDiagnostic::UnknownId { item_index, id } => Self::UnknownId {
                 item_index: *item_index,
                 id: *id,
@@ -1039,15 +1080,35 @@ struct UnresolvedTranslationWire {
 enum TranslationUnitRejectionReasonWire {
     Missing,
     Duplicate,
-    InvalidShape { message: String },
+    InvalidShape {
+        message: String,
+    },
+    LineCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidLineText {
+        line_index: usize,
+    },
+    BlankLineMismatch {
+        line_index: usize,
+        expected_blank: bool,
+    },
     BlankTranslation,
-    InvalidSpeakerText,
     NoNaturalLanguageText,
     ContainsByteOrderMark,
-    PlaceholderMismatch { token: String },
-    UnexpectedPlaceholderToken { token: String },
-    PlaceholderNormalizationAmbiguous { original: String },
-    SourceResidual { fragment: String },
+    PlaceholderMismatch {
+        token: String,
+    },
+    UnexpectedPlaceholderToken {
+        token: String,
+    },
+    PlaceholderNormalizationAmbiguous {
+        original: String,
+    },
+    SourceResidual {
+        fragment: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1055,6 +1116,7 @@ enum TranslationUnitRejectionReasonWire {
 enum ProtocolDiagnosticWire {
     NonStopFinish { reason: String },
     InvalidResponse { message: String },
+    InvalidId { item_index: usize },
     UnknownId { item_index: usize, id: usize },
 }
 
@@ -1114,8 +1176,8 @@ impl From<RpgMakerWriteBackLayoutProfile> for LayoutProfileWire {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WriteBackSummaryWire {
-    translated_leaves: usize,
-    original_leaves: usize,
+    translated_units: usize,
+    original_units: usize,
     auto_wrapped_units: usize,
     inserted_line_breaks: usize,
     inserted_fullwidth_indents: usize,
@@ -1125,8 +1187,8 @@ struct WriteBackSummaryWire {
 impl From<StandardWriteBackSummary> for WriteBackSummaryWire {
     fn from(summary: StandardWriteBackSummary) -> Self {
         Self {
-            translated_leaves: summary.translated_locations,
-            original_leaves: summary.original_locations,
+            translated_units: summary.translated_units,
+            original_units: summary.original_units,
             auto_wrapped_units: summary.auto_wrapped_units,
             inserted_line_breaks: summary.inserted_line_breaks,
             inserted_fullwidth_indents: summary.inserted_fullwidth_indents,
@@ -1227,16 +1289,17 @@ enum RpgMakerLocationWire {
 #[serde(deny_unknown_fields)]
 struct LogicalTextLocationWire {
     group_location: RpgMakerLocationWire,
-    field_role: TextFieldRoleWire,
+    unit_role: TextUnitRoleWire,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum TextFieldRoleWire {
+enum TextUnitRoleWire {
     Scalar { field: String },
     DialogueSpeaker,
-    DialogueBody { index: usize },
-    ScrollingTextBody { index: usize },
+    DialogueBody,
+    Choices,
+    ScrollingText,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1281,36 +1344,38 @@ impl Serialize for LogicalTextLocationsWriteWire<'_> {
 #[derive(Serialize)]
 struct LogicalTextLocationWriteWire<'a> {
     group_location: RpgMakerLocationWriteWire<'a>,
-    field_role: TextFieldRoleWriteWire<'a>,
+    unit_role: TextUnitRoleWriteWire<'a>,
 }
 
 impl<'a> From<&'a LogicalTextLocation> for LogicalTextLocationWriteWire<'a> {
     fn from(location: &'a LogicalTextLocation) -> Self {
         Self {
             group_location: RpgMakerLocationWriteWire::from(location.group_location()),
-            field_role: TextFieldRoleWriteWire::from(location.role()),
+            unit_role: TextUnitRoleWriteWire::from(location.role()),
         }
     }
 }
 
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum TextFieldRoleWriteWire<'a> {
+enum TextUnitRoleWriteWire<'a> {
     Scalar { field: &'a str },
     DialogueSpeaker,
-    DialogueBody { index: usize },
-    ScrollingTextBody { index: usize },
+    DialogueBody,
+    Choices,
+    ScrollingText,
 }
 
-impl<'a> From<&'a TextFieldRole> for TextFieldRoleWriteWire<'a> {
-    fn from(role: &'a TextFieldRole) -> Self {
+impl<'a> From<&'a TextUnitRole> for TextUnitRoleWriteWire<'a> {
+    fn from(role: &'a TextUnitRole) -> Self {
         match role {
-            TextFieldRole::Scalar(field) => Self::Scalar {
+            TextUnitRole::Scalar(field) => Self::Scalar {
                 field: field.as_str(),
             },
-            TextFieldRole::DialogueSpeaker => Self::DialogueSpeaker,
-            TextFieldRole::DialogueBody { index } => Self::DialogueBody { index: *index },
-            TextFieldRole::ScrollingTextBody { index } => Self::ScrollingTextBody { index: *index },
+            TextUnitRole::DialogueSpeaker => Self::DialogueSpeaker,
+            TextUnitRole::DialogueBody => Self::DialogueBody,
+            TextUnitRole::Choices => Self::Choices,
+            TextUnitRole::ScrollingText => Self::ScrollingText,
         }
     }
 }
@@ -1591,14 +1656,14 @@ impl AuditPayloadValidation for TranslationTaskFinishedPayloadWire {
                 .map(|accepted| 1 + accepted.propagation_targets.len())
                 .sum();
             if committed {
-                if task.confirmed_written_leaves != Some(expected_written) {
+                if task.confirmed_written_units != Some(expected_written) {
                     return Err(
-                        "completed 的 confirmed_written_leaves 必须等于结构化写入逻辑叶数"
+                        "completed 的 confirmed_written_units 必须等于结构化写入逻辑单元数"
                             .to_owned(),
                     );
                 }
-            } else if task.confirmed_written_leaves.is_some() {
-                return Err("未提交任务的 confirmed_written_leaves 必须为 null".to_owned());
+            } else if task.confirmed_written_units.is_some() {
+                return Err("未提交任务的 confirmed_written_units 必须为 null".to_owned());
             }
         }
         Ok(())
@@ -1880,11 +1945,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::rpg_maker::model::TextUnitContent;
     use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::TextGroupKind;
     use crate::rpg_maker::translate::standard::{
-        NonEmptyTaskItems, TranslationLeafIdentity, TranslationTaskOutcome,
-        TranslationTaskOutcomeContext, UnresolvedTranslationUnit,
+        NonEmptyTaskItems, TranslationTaskOutcome, TranslationTaskOutcomeContext,
+        TranslationUnitIdentity, UnresolvedTranslationUnit,
     };
 
     fn run_id() -> RunId {
@@ -1952,7 +2018,7 @@ mod tests {
     #[test]
     fn borrowed_translation_payload_matches_the_strict_owned_wire_model() {
         let task_index = StandardTranslationTaskIndex::new(4);
-        let identity = TranslationLeafIdentity::new(
+        let identity = TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::EventDialogue,
             RpgMakerLocation::value(
@@ -1962,8 +2028,8 @@ mod tests {
                     RpgMakerLocationStep::index(7),
                 ],
             ),
-            TextFieldRole::DialogueBody { index: 1 },
-            "原文",
+            TextUnitRole::DialogueBody,
+            TextUnitContent::Lines(vec!["原文".to_owned()]),
             r#"{"speaker":null}"#,
         );
         let outcome = TranslationTaskOutcome::Unavailable {
@@ -2019,7 +2085,7 @@ mod tests {
             .expect("借用序列化结果必须逐字节等于严格拥有型 wire 的规范输出");
     }
 
-    fn dialogue_location(index: usize) -> LogicalTextLocation {
+    fn dialogue_location() -> LogicalTextLocation {
         LogicalTextLocation::new(
             RpgMakerLocation::value(
                 RpgMakerSource::map(1),
@@ -2030,14 +2096,14 @@ mod tests {
                     RpgMakerLocationStep::index(7),
                 ],
             ),
-            TextFieldRole::DialogueBody { index },
+            TextUnitRole::DialogueBody,
         )
     }
 
     #[test]
     fn manual_layout_wire_contains_one_or_more_logical_locations_and_no_physical_unit() {
         let diagnostic = ManualLayoutDiagnostic::for_test(
-            vec![dialogue_location(0), dialogue_location(1)],
+            vec![dialogue_location()],
             RpgMakerWriteBackLayoutRegion::DialogueBody,
             crate::rpg_maker::project::MaxFullwidthChars::new(24).expect("测试行宽应合法"),
         );
@@ -2059,20 +2125,7 @@ mod tests {
                                 { "kind": "array_index", "index": 7 }
                             ]
                         },
-                        "field_role": { "kind": "dialogue_body", "index": 0 }
-                    },
-                    {
-                        "group_location": {
-                            "kind": "value",
-                            "source": { "kind": "map", "map_id": 1 },
-                            "steps": [
-                                { "kind": "object_key", "key": "events" },
-                                { "kind": "array_index", "index": 2 },
-                                { "kind": "object_key", "key": "list" },
-                                { "kind": "array_index", "index": 7 }
-                            ]
-                        },
-                        "field_role": { "kind": "dialogue_body", "index": 1 }
+                        "unit_role": { "kind": "dialogue_body" }
                     }
                 ],
                 "region": "dialogue_body",
@@ -2089,6 +2142,100 @@ mod tests {
             empty.validate().expect_err("空位置诊断不属于当前 wire"),
             "人工布局诊断必须关联至少一个逻辑文本位置"
         );
+    }
+
+    #[test]
+    fn unit_location_wire_serializes_current_no_index_roles() {
+        for (role, expected_kind) in [
+            (TextUnitRole::DialogueBody, "dialogue_body"),
+            (TextUnitRole::Choices, "choices"),
+            (TextUnitRole::ScrollingText, "scrolling_text"),
+        ] {
+            let location = LogicalTextLocation::new(
+                RpgMakerLocation::value(RpgMakerSource::map(3), Vec::new()),
+                role,
+            );
+            let wire = serde_json::to_value(LogicalTextLocationWriteWire::from(&location))
+                .expect("语义单元位置应可序列化");
+
+            assert_eq!(wire["unit_role"], json!({ "kind": expected_kind }));
+        }
+    }
+
+    #[test]
+    fn line_validation_rejections_preserve_structured_counts_and_indexes() {
+        let mismatch = TranslationUnitRejectionReason::LineCountMismatch {
+            expected: 2,
+            actual: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(TranslationUnitRejectionReasonWriteWire::from(&mismatch))
+                .expect("行数拒绝应可序列化"),
+            json!({ "kind": "line_count_mismatch", "expected": 2, "actual": 1 })
+        );
+
+        let invalid_line = TranslationUnitRejectionReason::InvalidLineText { line_index: 3 };
+        assert_eq!(
+            serde_json::to_value(TranslationUnitRejectionReasonWriteWire::from(&invalid_line))
+                .expect("非法行拒绝应可序列化"),
+            json!({ "kind": "invalid_line_text", "line_index": 3 })
+        );
+
+        let blank_mismatch = TranslationUnitRejectionReason::BlankLineMismatch {
+            line_index: 1,
+            expected_blank: true,
+        };
+        assert_eq!(
+            serde_json::to_value(TranslationUnitRejectionReasonWriteWire::from(
+                &blank_mismatch,
+            ))
+            .expect("空槽拒绝应可序列化"),
+            json!({
+                "kind": "blank_line_mismatch",
+                "line_index": 1,
+                "expected_blank": true
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_id_diagnostic_records_only_the_item_index() {
+        let diagnostic = TranslationProtocolDiagnostic::InvalidId { item_index: 4 };
+        let wire = serde_json::to_value(ProtocolDiagnosticWriteWire::from(&diagnostic))
+            .expect("非法 ID 诊断应可序列化");
+
+        assert_eq!(wire, json!({ "kind": "invalid_id", "item_index": 4 }));
+        assert!(wire.get("id").is_none(), "非法原始键不得进入审计账本");
+        assert!(serde_json::from_value::<ProtocolDiagnosticWire>(wire).is_ok());
+    }
+
+    #[test]
+    fn unit_counter_wires_use_current_field_names() {
+        let current_task = json!({
+            "task_index": 0,
+            "status": { "kind": "complete" },
+            "attempts": 1,
+            "provider_request_id": null,
+            "provider_response_id": null,
+            "finish_reason": null,
+            "final_response_usage": null,
+            "accepted_decisions": 0,
+            "confirmed_written_units": 0,
+            "accepted": [],
+            "unresolved": [],
+            "diagnostics": []
+        });
+        assert!(serde_json::from_value::<TranslationTaskWire>(current_task).is_ok());
+
+        let current_summary = json!({
+            "translated_units": 2,
+            "original_units": 3,
+            "auto_wrapped_units": 1,
+            "inserted_line_breaks": 1,
+            "inserted_fullwidth_indents": 0,
+            "manual_layout_units": 0
+        });
+        assert!(serde_json::from_value::<WriteBackSummaryWire>(current_summary).is_ok());
     }
 
     #[test]

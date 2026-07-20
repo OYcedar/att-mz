@@ -54,9 +54,15 @@ run_finished
 
 翻译任务意图与终态、写回发布意图与终态分别共享一个稳定 `operation_id`。新一次命令总是生成新的 `run_id`，不得把重新运行猜成先前操作的恢复。
 
-`translation_task_finished` 从任务结果枚举派生 `complete | partial | unavailable`、唯一非零尝试次数、可选供应商请求/响应 ID、可选最终 usage、验收决定、未解决结果、协议诊断和已确认数据库写入。`provider_response_id` 缺失时写 `null`；`confirmed_written_leaves` 明确统计逻辑文本叶。
+`translation_task_finished` 从任务结果枚举派生 `complete | partial | unavailable`、唯一非零尝试次数、可选供应商请求/响应 ID、可选最终 usage、验收决定、未解决结果、协议诊断和已确认数据库写入。`provider_response_id` 缺失时写 `null`；`confirmed_written_units` 明确统计语义文本单元。
 
-`write_back_publish_finished` 保存目录发布的明确终态、实际布局、输出根、写回摘要、人工布局诊断和 `lua_executed`。摘要中的 `translated_leaves` 与 `original_leaves` 只统计逻辑文本叶。accepted、unresolved 使用 `{group_location, field_role}` 逻辑文本位置；每项写回诊断使用非空 `locations` 列表关联一个或多个这样的受影响逻辑叶。物理修改目标只属于内部写回配方，不进入这些字段。
+审计位置的 `unit_role` 只有 `scalar`、`dialogue_speaker`、`dialogue_body`、`choices`、
+`scrolling_text` 五类变体；`scalar` 同时携带字段语义键，任何角色都不携带物理行索引。
+逐 ID 拒绝原因包括缺失或重复 ID、形状错误、行数不符、非法行元素、空槽不符以及既有
+的空白、语言和 token 验收失败；这些诊断只记录 ID、逻辑位置与原因，不记录原文、译文
+或消息正文。
+
+`write_back_publish_finished` 保存目录发布的明确终态、实际布局、输出根、写回摘要、人工布局诊断和 `lua_executed`。摘要中的 `translated_units` 与 `original_units` 只统计语义文本单元。accepted、unresolved 使用 `{group_location, unit_role}` 语义文本位置；每项写回诊断使用非空 `locations` 列表关联一个或多个这样的受影响单元。物理修改目标、模型行数和最终物理命令数只属于内部写回，不进入这些计数。
 
 账本不记录 API key、完整 messages、完整模型响应、完整原文或译文。外部松散字段只在当前事件确实需要无损承载时停留于 wire 边界，不扩散为 Runtime 业务模型。
 

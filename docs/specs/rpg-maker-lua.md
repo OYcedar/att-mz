@@ -103,7 +103,7 @@ object 键、数组连续性、循环引用和非法值都在边界明确拒绝�
 ### 4.2 统一 Host 值预算
 
 `runtime.lua.host_values` 约束每次 Lua→Host 或 Host→Lua 值转换。根值深度为 1，容器
-和标量各计一个节点，动态 UTF-8 字符串和二进制叶子的原始字节共同计入字节预算；
+和标量各计一个节点，动态 UTF-8 字符串和二进制值的原始字节共同计入字节预算；
 协议固定字段名不重复计入调用值。JSON 文本解码以完整输入字节为边界，编码以完整
 输出字节为边界。
 
@@ -149,7 +149,7 @@ document.comment_tag
 
 `data`、`map` 和 `plugin_parameter` 精确建立 RPG Maker 来源，`open` 从 `ctx.source` 打开并
 解析受限文档。Document 的 value/location/text API 使用与 Rust Builtin、Rules、
-Translate 和 WriteBack 相同的 `RpgMakerLocation`、嵌套 JSON 解码和字符串叶语义；
+Translate 和 WriteBack 相同的 `RpgMakerLocation`、嵌套 JSON 解码和字符串终值语义；
 `DECODE_JSON` 明确表示穿过一层 JSON 字符串。Note/Comment Tag 使用共享标签解析器和
 occurrence 定位，不按键名递归猜结构。
 
@@ -180,11 +180,12 @@ replace_standard
 clear_standard
 ```
 
-`replace_standard(snapshot)` 使用 `ctx.rpg_maker` 建立的逻辑组、叶、recipe 和物理目标，
-按 Lua owner 原子替换 `standard_text_group/leaf/target` 并刷新 owner 的来源与资产快照
-指纹。空 snapshot 是 active 空快照。`clear_standard()` 停用 Lua owner 并级联删除其
-标准资产。Rust 按 `owner + group_location + field_role` 继承 translation/state；脚本
-不手写标准表 SQL。
+`replace_standard(snapshot)` 只建立当前已有现实消费者的单值标准组：
+`database_entry | system | map | event_command | plugin_parameter`，字段固定使用
+`{name, text}`；其他 kind 或字段形状作为普通无效输入拒绝。Host 使用 `ctx.rpg_maker`
+建立的受信引用，按 Lua owner 原子替换 `standard_text_group/unit/target` 并刷新来源与资产
+快照指纹。空 snapshot 是 active 空快照；
+`clear_standard()` 停用 Lua owner 并级联删除其标准资产。脚本不手写标准表 SQL。
 
 ### 6.2 Translate：`ctx.translation` 与 `ctx.llm`
 
@@ -199,15 +200,16 @@ PreparedText.terms
 PreparedText.accept
 ```
 
-`prepare` 复用当前持久术语/占位符快照、语言模块和逐叶 state 规则，返回 Current、
+`prepare` 复用当前持久术语/占位符快照、语言模块和单段文本 state 规则，返回 Current、
 NotApplicable 或 Pending。脚本只为 Pending 组织自己的批次和 messages；
-`model_text/terms` 提供受保护文本和本叶术语。`accept` 复用 Rust 的空白、ATT token、
+`model_text/terms` 提供受保护文本和本段术语。`accept` 复用 Rust 的空白、ATT token、
 源语残留、可选修复、控制符恢复及最终 state 计算，不能绕过验收伪造 Current。
+`prepare/accept` 的输入和结果始终是一个字符串，不承载 Standard 的 Lines 或行形状协议。
 
 `ctx.llm(messages)` 只接受无洞 `{ role, content }` 数组。它与 Standard 使用同一个
 公共 Client 和 Executor；Lua 不能覆盖 URL、API key、model、stream 或 parameters。
 成功返回 content、finish_reason、可选 HTTP request ID、可选正文 response ID 和可选
-usage；缺失元数据在 Lua 中为 `nil`。
+usage；其中 content 是供应商返回的单个字符串，缺失元数据在 Lua 中为 `nil`。
 Lua 决定分组、调用次数、Retryable 重试和事务提交。
 
 ### 6.3 WriteBack：`ctx.output` 与 `ctx.write_back`

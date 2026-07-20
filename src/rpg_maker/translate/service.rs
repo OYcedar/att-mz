@@ -298,7 +298,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::rpg_maker::model::{ScalarFieldKey, TextFieldRole};
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::project::{ExistingProjectOpener, OpenedProject};
     use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::{
@@ -311,9 +311,8 @@ mod tests {
     use crate::rpg_maker::translate::semantics::ResolvedTranslationSemantics;
     use crate::rpg_maker::translate::standard::{
         NonEmptyTaskItems, StandardTranslationRunReport, StandardTranslationTaskIndex,
-        TranslationLeafIdentity, TranslationTaskOutcome, TranslationTaskOutcomeContext,
-        TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
-        UnresolvedTranslationUnit,
+        TranslationTaskOutcome, TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
+        TranslationUnitIdentity, TranslationUnitRejectionReason, UnresolvedTranslationUnit,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -593,12 +592,12 @@ mod tests {
             RpgMakerSource::data(StandardDataFile::Items),
             vec![RpgMakerLocationStep::index(1)],
         );
-        let identity = TranslationLeafIdentity::new(
+        let identity = TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group_location,
-            TextFieldRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
-            "宝剑",
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+            TextUnitContent::Value("宝剑".to_owned()),
             "{}",
         );
         let outcome = TranslationTaskOutcome::Unavailable {
@@ -616,7 +615,7 @@ mod tests {
             reason: TranslationTaskUnavailableReason::AllOutputsRejected,
             unresolved: NonEmptyTaskItems::new(
                 UnresolvedTranslationUnit::new(
-                    0,
+                    1,
                     identity,
                     Vec::new(),
                     TranslationUnitRejectionReason::Missing,

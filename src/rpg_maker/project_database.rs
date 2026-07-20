@@ -45,7 +45,7 @@ const CREATE_STANDARD_ASSET_OWNER_STATE_TABLE: &str = r#"CREATE TABLE standard_a
 )"#;
 
 pub(crate) const STANDARD_TEXT_GROUP_TABLE_NAME: &str = "standard_text_group";
-pub(crate) const STANDARD_TEXT_LEAF_TABLE_NAME: &str = "standard_text_leaf";
+pub(crate) const STANDARD_TEXT_UNIT_TABLE_NAME: &str = "standard_text_unit";
 pub(crate) const STANDARD_TEXT_TARGET_TABLE_NAME: &str = "standard_text_target";
 
 const CREATE_STANDARD_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE standard_text_group (
@@ -66,21 +66,29 @@ const CREATE_STANDARD_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE standard_text_gro
     FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
 )"#;
 
-const CREATE_STANDARD_TEXT_LEAF_TABLE: &str = r#"CREATE TABLE standard_text_leaf (
+const CREATE_STANDARD_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE standard_text_unit (
     owner                    TEXT NOT NULL CHECK (owner IN ('builtin', 'rules', 'lua')),
     group_location           TEXT NOT NULL CHECK (length(group_location) > 0),
-    field_role               TEXT NOT NULL CHECK (length(field_role) > 0),
-    original_text            TEXT NOT NULL CHECK (length(original_text) > 0),
-    translation_context_json TEXT NOT NULL CHECK (length(translation_context_json) > 0),
-    translation              TEXT,
+    unit_role                TEXT NOT NULL CHECK (length(unit_role) > 0),
+    source_content_json      TEXT NOT NULL CHECK (
+        json_valid(source_content_json)
+        AND json_type(source_content_json) IN ('text', 'array')
+    ),
+    source_context_json      TEXT NOT NULL CHECK (
+        json_valid(source_context_json)
+        AND json_type(source_context_json) = 'object'
+    ),
+    translation_content_json TEXT,
     translation_state        BLOB,
-    PRIMARY KEY (owner, group_location, field_role),
+    PRIMARY KEY (owner, group_location, unit_role),
     FOREIGN KEY (owner, group_location)
         REFERENCES standard_text_group(owner, group_location) ON DELETE CASCADE,
     CHECK (
-        (translation IS NULL AND translation_state IS NULL)
+        (translation_content_json IS NULL AND translation_state IS NULL)
         OR (
-            translation IS NOT NULL
+            translation_content_json IS NOT NULL
+            AND json_valid(translation_content_json)
+            AND json_type(translation_content_json) = json_type(source_content_json)
             AND typeof(translation_state) = 'blob'
             AND length(translation_state) = 32
         )
@@ -165,7 +173,7 @@ WHERE sql IS NOT NULL
       'metadata',
       'standard_asset_owner_state',
       'standard_text_group',
-      'standard_text_leaf',
+      'standard_text_unit',
       'standard_text_target',
       'standard_translation_resource',
       'standard_project_definition'
@@ -195,7 +203,7 @@ SET source_language = ?1,
     scrolling_text_max_fullwidth_chars = ?5,
     help_description_max_fullwidth_chars = ?6
 WHERE name = ?7"#;
-const CLEAR_STANDARD_TEXT_TRANSLATIONS: &str = "UPDATE standard_text_leaf SET translation = NULL, translation_state = NULL WHERE translation IS NOT NULL OR translation_state IS NOT NULL";
+const CLEAR_STANDARD_TEXT_TRANSLATIONS: &str = "UPDATE standard_text_unit SET translation_content_json = NULL, translation_state = NULL WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL";
 const RESET_TERMINOLOGY_RESOURCE: &str = r#"UPDATE standard_translation_resource
 SET canonical_json = '[]'
 WHERE resource_kind = 'terminology'"#;
@@ -218,7 +226,7 @@ impl SourceSnapshotFingerprint {
     }
 }
 
-/// 一个 owner 当前逻辑叶、物化配方与物理目标集合的精确身份。
+/// 一个 owner 当前语义单元、物化配方与物理目标集合的精确身份。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct AssetSnapshotFingerprint(Sha256Fingerprint);
 
@@ -1120,9 +1128,9 @@ fn expected_managed_schema() -> Vec<(&'static str, &'static str, &'static str, &
         ),
         (
             "table",
-            STANDARD_TEXT_LEAF_TABLE_NAME,
-            STANDARD_TEXT_LEAF_TABLE_NAME,
-            CREATE_STANDARD_TEXT_LEAF_TABLE,
+            STANDARD_TEXT_UNIT_TABLE_NAME,
+            STANDARD_TEXT_UNIT_TABLE_NAME,
+            CREATE_STANDARD_TEXT_UNIT_TABLE,
         ),
         (
             "table",
@@ -2117,7 +2125,7 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
         CREATE_METADATA_TABLE,
         CREATE_STANDARD_ASSET_OWNER_STATE_TABLE,
         CREATE_STANDARD_TEXT_GROUP_TABLE,
-        CREATE_STANDARD_TEXT_LEAF_TABLE,
+        CREATE_STANDARD_TEXT_UNIT_TABLE,
         CREATE_STANDARD_TEXT_TARGET_TABLE,
         CREATE_STANDARD_TEXT_TARGET_GROUP_INDEX,
         CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE,
@@ -2428,7 +2436,7 @@ mod tests {
         );
         assert_eq!(
             invocation.commands[3].statement(),
-            CREATE_STANDARD_TEXT_LEAF_TABLE
+            CREATE_STANDARD_TEXT_UNIT_TABLE
         );
         assert_eq!(
             invocation.commands[4].statement(),
@@ -2476,7 +2484,7 @@ mod tests {
         assert!(
             invocation.commands[3]
                 .statement()
-                .contains("translation_context_json")
+                .contains("source_context_json")
         );
         assert!(
             invocation.commands[3]
@@ -2505,7 +2513,7 @@ mod tests {
             CREATE_METADATA_TABLE,
             CREATE_STANDARD_ASSET_OWNER_STATE_TABLE,
             CREATE_STANDARD_TEXT_GROUP_TABLE,
-            CREATE_STANDARD_TEXT_LEAF_TABLE,
+            CREATE_STANDARD_TEXT_UNIT_TABLE,
             CREATE_STANDARD_TEXT_TARGET_TABLE,
             CREATE_STANDARD_TEXT_TARGET_GROUP_INDEX,
             CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE,
@@ -2542,7 +2550,7 @@ mod tests {
             .expect("Lua 自建表不得污染受管 schema 检查");
         connection
             .execute_batch(
-                "CREATE TRIGGER injected_leaf_trigger AFTER INSERT ON standard_text_leaf BEGIN SELECT 1; END",
+                "CREATE TRIGGER injected_unit_trigger AFTER INSERT ON standard_text_unit BEGIN SELECT 1; END",
             )
             .expect("测试触发器应可创建");
         assert!(matches!(
@@ -2551,7 +2559,7 @@ mod tests {
         ));
 
         let insert_group = "INSERT INTO standard_text_group (owner, group_location, group_kind, projection_recipe_json) VALUES (?1, ?2, 'database_entry', '[]')";
-        let insert_leaf = "INSERT INTO standard_text_leaf (owner, group_location, field_role, original_text, translation_context_json, translation, translation_state) VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)";
+        let insert_unit = "INSERT INTO standard_text_unit (owner, group_location, unit_role, source_content_json, source_context_json, translation_content_json, translation_state) VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)";
         connection
             .execute(insert_group, rusqlite::params!["builtin", "group-a",])
             .expect_err("没有 owner state 的资产必须被外键拒绝");
@@ -2570,38 +2578,64 @@ mod tests {
             .expect("owner 可以保存文本组");
         connection
             .execute(
-                insert_leaf,
+                insert_unit,
                 rusqlite::params![
                     "builtin",
                     "group-a",
                     "scalar:name",
-                    "original",
+                    r#""original""#,
                     Option::<String>::None,
                     Option::<Vec<u8>>::None,
                 ],
             )
-            .expect("未翻译逻辑叶应可保存");
+            .expect("未翻译语义单元应可保存");
         connection
             .execute(
-                insert_leaf,
+                insert_unit,
                 rusqlite::params![
                     "builtin",
                     "group-a",
                     "scalar:description",
-                    "original",
-                    "译文",
+                    r#""original""#,
+                    r#""译文""#,
                     Option::<Vec<u8>>::None,
                 ],
             )
-            .expect_err("译文与逐叶状态必须成对保存");
+            .expect_err("译文与语义单元状态必须成对保存");
         connection
             .execute(
-                insert_leaf,
+                insert_unit,
+                rusqlite::params![
+                    "builtin",
+                    "group-a",
+                    "choices",
+                    r#"["是","否"]"#,
+                    r#""合并译文""#,
+                    vec![0x7c_u8; 32],
+                ],
+            )
+            .expect_err("译文内容形状必须与源内容一致");
+        connection
+            .execute(
+                insert_unit,
+                rusqlite::params![
+                    "builtin",
+                    "group-a",
+                    "choices",
+                    r#"["是","否"]"#,
+                    r#"["Yes","No"]"#,
+                    vec![0x7c_u8; 32],
+                ],
+            )
+            .expect("有序行集合应以 JSON 数组保存");
+        connection
+            .execute(
+                insert_unit,
                 rusqlite::params![
                     "builtin",
                     "group-a",
                     "scalar:name",
-                    "original",
+                    r#""original""#,
                     Option::<String>::None,
                     Option::<Vec<u8>>::None,
                 ],

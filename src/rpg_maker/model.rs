@@ -1,8 +1,10 @@
-//! 逻辑文本身份、物理修改目标与物化写回配方。
+//! 语义文本单元身份、物理修改目标与物化写回配方。
 
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 use super::text::RpgMakerLocation;
 
@@ -24,24 +26,68 @@ impl ScalarFieldKey {
     }
 }
 
-/// 翻译叶在语义组中的强类型角色。
+/// 可独立翻译、验收、持久化和写回的语义角色。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum TextFieldRole {
+pub(crate) enum TextUnitRole {
     Scalar(ScalarFieldKey),
     DialogueSpeaker,
-    DialogueBody { index: usize },
-    ScrollingTextBody { index: usize },
+    DialogueBody,
+    Choices,
+    ScrollingText,
 }
 
-/// 译文叶的权威身份，不等同于物理 JSON 地址。
+impl TextUnitRole {
+    pub(crate) const fn expects_lines(&self) -> bool {
+        matches!(
+            self,
+            Self::DialogueBody | Self::Choices | Self::ScrollingText
+        )
+    }
+}
+
+/// 一个语义单元的完整文本内容。
+///
+/// 无标签序列化使 SQLite 中的权威内容直接表现为 JSON string 或 string array，
+/// 不把内部类型包装泄漏到持久化数据中。
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(untagged)]
+pub(crate) enum TextUnitContent {
+    Value(String),
+    Lines(Vec<String>),
+}
+
+impl TextUnitContent {
+    pub(crate) fn as_value(&self) -> Option<&str> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Lines(_) => None,
+        }
+    }
+
+    pub(crate) fn as_lines(&self) -> Option<&[String]> {
+        match self {
+            Self::Value(_) => None,
+            Self::Lines(lines) => Some(lines),
+        }
+    }
+
+    pub(crate) fn is_blank(&self) -> bool {
+        match self {
+            Self::Value(value) => value.trim().is_empty(),
+            Self::Lines(lines) => lines.iter().all(|line| line.trim().is_empty()),
+        }
+    }
+}
+
+/// 译文单元的权威身份，不等同于物理 JSON 地址。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct LogicalTextLocation {
     group_location: RpgMakerLocation,
-    role: TextFieldRole,
+    role: TextUnitRole,
 }
 
 impl LogicalTextLocation {
-    pub(crate) fn new(group_location: RpgMakerLocation, role: TextFieldRole) -> Self {
+    pub(crate) fn new(group_location: RpgMakerLocation, role: TextUnitRole) -> Self {
         Self {
             group_location,
             role,
@@ -52,7 +98,7 @@ impl LogicalTextLocation {
         &self.group_location
     }
 
-    pub(crate) fn role(&self) -> &TextFieldRole {
+    pub(crate) fn role(&self) -> &TextUnitRole {
         &self.role
     }
 }
@@ -93,14 +139,16 @@ impl TextProjectionRecipe {
         }
     }
 
-    pub(crate) fn referenced_roles(&self) -> BTreeSet<TextFieldRole> {
+    pub(crate) fn referenced_roles(&self) -> BTreeSet<TextUnitRole> {
         match self {
             Self::Direct(recipe) => recipe
                 .parts()
                 .iter()
                 .filter_map(|part| match part {
                     DirectTextPart::Literal(_) => None,
-                    DirectTextPart::TextSlot { role } => Some(role.clone()),
+                    DirectTextPart::TextSlot { role } | DirectTextPart::LineSlot { role, .. } => {
+                        Some(role.clone())
+                    }
                 })
                 .collect(),
             Self::Dialogue(recipe) => {
@@ -112,22 +160,49 @@ impl TextProjectionRecipe {
                             .any(|part| matches!(part, DialogueLinePart::SpeakerSlot))
                     })
                 {
-                    roles.insert(TextFieldRole::DialogueSpeaker);
+                    roles.insert(TextUnitRole::DialogueSpeaker);
                 }
-                for line in recipe.lines() {
-                    for part in line.parts() {
-                        if let DialogueLinePart::BodySlot { index } = part {
-                            roles.insert(TextFieldRole::DialogueBody { index: *index });
-                        }
-                    }
+                if recipe.lines().iter().any(|line| {
+                    line.parts()
+                        .iter()
+                        .any(|part| matches!(part, DialogueLinePart::BodyLine { .. }))
+                }) {
+                    roles.insert(TextUnitRole::DialogueBody);
                 }
                 roles
             }
         }
     }
+
+    pub(crate) fn referenced_lines(&self) -> Vec<(TextUnitRole, usize)> {
+        match self {
+            Self::Direct(recipe) => recipe
+                .parts()
+                .iter()
+                .filter_map(|part| match part {
+                    DirectTextPart::LineSlot {
+                        role,
+                        source_line_index,
+                    } => Some((role.clone(), *source_line_index)),
+                    DirectTextPart::Literal(_) | DirectTextPart::TextSlot { .. } => None,
+                })
+                .collect(),
+            Self::Dialogue(recipe) => recipe
+                .lines()
+                .iter()
+                .flat_map(DialogueLineRecipe::parts)
+                .filter_map(|part| match part {
+                    DialogueLinePart::BodyLine { source_line_index } => {
+                        Some((TextUnitRole::DialogueBody, *source_line_index))
+                    }
+                    DialogueLinePart::Literal(_) | DialogueLinePart::SpeakerSlot => None,
+                })
+                .collect(),
+        }
+    }
 }
 
-/// 整字段或局部正则文本的可逆配方。
+/// 整字段、局部正则文本或语义行的可逆配方。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DirectTextRecipe {
     target: RpgMakerLocation,
@@ -142,22 +217,36 @@ impl DirectTextRecipe {
         parts: Vec<DirectTextPart>,
     ) -> Result<Self, ProjectionModelError> {
         let expected_raw = expected_raw.into();
-        let has_text_slot = parts
-            .iter()
-            .any(|part| matches!(part, DirectTextPart::TextSlot { .. }));
+        let has_text_slot = parts.iter().any(|part| {
+            matches!(
+                part,
+                DirectTextPart::TextSlot { .. } | DirectTextPart::LineSlot { .. }
+            )
+        });
         let is_frozen_literal =
             matches!(parts.as_slice(), [DirectTextPart::Literal(value)] if value == &expected_raw);
         if parts.is_empty() || (!has_text_slot && !is_frozen_literal) {
             return Err(ProjectionModelError::RecipeHasNoTextSlot);
         }
-        let mut roles = BTreeSet::new();
+
+        let mut slots = BTreeSet::new();
         for part in &parts {
-            if let DirectTextPart::TextSlot { role } = part
-                && !roles.insert(role.clone())
-            {
-                return Err(ProjectionModelError::DuplicateRole { role: role.clone() });
+            let slot = match part {
+                DirectTextPart::Literal(_) => continue,
+                DirectTextPart::TextSlot { role } => (role.clone(), None),
+                DirectTextPart::LineSlot {
+                    role,
+                    source_line_index,
+                } => (role.clone(), Some(*source_line_index)),
+            };
+            if !slots.insert(slot.clone()) {
+                return Err(ProjectionModelError::DuplicateProjectionSlot {
+                    role: slot.0,
+                    source_line_index: slot.1,
+                });
             }
         }
+
         Ok(Self {
             target,
             expected_raw,
@@ -181,7 +270,13 @@ impl DirectTextRecipe {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DirectTextPart {
     Literal(String),
-    TextSlot { role: TextFieldRole },
+    TextSlot {
+        role: TextUnitRole,
+    },
+    LineSlot {
+        role: TextUnitRole,
+        source_line_index: usize,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,25 +292,32 @@ impl DialogueWriteRecipe {
         direct_speaker: Option<DirectSpeakerTarget>,
         lines: Vec<DialogueLineRecipe>,
     ) -> Result<Self, ProjectionModelError> {
-        let mut body_indexes = BTreeSet::new();
+        let mut body_line_indexes = BTreeSet::new();
         let mut has_speaker_slot = false;
         for line in &lines {
             for part in line.parts() {
                 match part {
                     DialogueLinePart::SpeakerSlot => has_speaker_slot = true,
-                    DialogueLinePart::BodySlot { index } if !body_indexes.insert(*index) => {
-                        return Err(ProjectionModelError::DuplicateDialogueBody { index: *index });
+                    DialogueLinePart::BodyLine { source_line_index }
+                        if !body_line_indexes.insert(*source_line_index) =>
+                    {
+                        return Err(ProjectionModelError::DuplicateDialogueBodyLine {
+                            source_line_index: *source_line_index,
+                        });
                     }
-                    DialogueLinePart::Literal(_) | DialogueLinePart::BodySlot { .. } => {}
+                    DialogueLinePart::Literal(_) | DialogueLinePart::BodyLine { .. } => {}
                 }
             }
         }
         if direct_speaker.is_some() && has_speaker_slot {
             return Err(ProjectionModelError::MixedDirectAndInlineSpeaker);
         }
-        for (expected, actual) in body_indexes.iter().copied().enumerate() {
+        for (expected, actual) in body_line_indexes.iter().copied().enumerate() {
             if expected != actual {
-                return Err(ProjectionModelError::NonContiguousDialogueBody { expected, actual });
+                return Err(ProjectionModelError::NonContiguousDialogueBodyLines {
+                    expected,
+                    actual,
+                });
             }
         }
         Ok(Self {
@@ -277,12 +379,12 @@ impl DialogueLineRecipe {
         expected_raw: impl Into<String>,
         parts: Vec<DialogueLinePart>,
     ) -> Result<Self, ProjectionModelError> {
-        let body_slots = parts
+        let body_lines = parts
             .iter()
-            .filter(|part| matches!(part, DialogueLinePart::BodySlot { .. }))
+            .filter(|part| matches!(part, DialogueLinePart::BodyLine { .. }))
             .count();
-        if body_slots > 1 {
-            return Err(ProjectionModelError::MultipleBodySlotsInLine);
+        if body_lines > 1 {
+            return Err(ProjectionModelError::MultipleBodyLinesInPhysicalLine);
         }
         Ok(Self {
             physical_location,
@@ -308,17 +410,25 @@ impl DialogueLineRecipe {
 pub(crate) enum DialogueLinePart {
     Literal(String),
     SpeakerSlot,
-    BodySlot { index: usize },
+    BodyLine { source_line_index: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectionModelError {
     EmptyScalarFieldKey,
     RecipeHasNoTextSlot,
-    DuplicateRole { role: TextFieldRole },
-    MultipleBodySlotsInLine,
-    DuplicateDialogueBody { index: usize },
-    NonContiguousDialogueBody { expected: usize, actual: usize },
+    DuplicateProjectionSlot {
+        role: TextUnitRole,
+        source_line_index: Option<usize>,
+    },
+    MultipleBodyLinesInPhysicalLine,
+    DuplicateDialogueBodyLine {
+        source_line_index: usize,
+    },
+    NonContiguousDialogueBodyLines {
+        expected: usize,
+        actual: usize,
+    },
     MixedDirectAndInlineSpeaker,
 }
 
@@ -329,14 +439,22 @@ impl fmt::Display for ProjectionModelError {
             Self::RecipeHasNoTextSlot => {
                 formatter.write_str("直接文本配方既没有文本槽，也不是完整冻结字面量")
             }
-            Self::DuplicateRole { role } => write!(formatter, "直接文本配方重复引用角色 {role:?}"),
-            Self::MultipleBodySlotsInLine => formatter.write_str("一条对话物理行最多引用一个 Body"),
-            Self::DuplicateDialogueBody { index } => {
-                write!(formatter, "对话配方重复引用 Body({index})")
-            }
-            Self::NonContiguousDialogueBody { expected, actual } => write!(
+            Self::DuplicateProjectionSlot {
+                role,
+                source_line_index,
+            } => write!(
                 formatter,
-                "对话 Body 索引不连续：期待 {expected}，实际 {actual}"
+                "直接文本配方重复引用槽 {role:?}/{source_line_index:?}"
+            ),
+            Self::MultipleBodyLinesInPhysicalLine => {
+                formatter.write_str("一条对话物理行最多引用一个正文源行")
+            }
+            Self::DuplicateDialogueBodyLine { source_line_index } => {
+                write!(formatter, "对话配方重复引用正文源行 {source_line_index}")
+            }
+            Self::NonContiguousDialogueBodyLines { expected, actual } => write!(
+                formatter,
+                "对话正文源行索引不连续：期待 {expected}，实际 {actual}"
             ),
             Self::MixedDirectAndInlineSpeaker => {
                 formatter.write_str("同一对话不能同时使用直接 Speaker 和内嵌 SpeakerSlot")
@@ -363,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn dialogue_recipe_keeps_blank_physical_lines_without_creating_body_leaves() {
+    fn dialogue_recipe_keeps_blank_lines_as_body_source_slots() {
         let recipe = DialogueWriteRecipe::new(
             location(0),
             None,
@@ -371,57 +489,86 @@ mod tests {
                 DialogueLineRecipe::new(
                     location(1),
                     "正文",
-                    vec![DialogueLinePart::BodySlot { index: 0 }],
+                    vec![DialogueLinePart::BodyLine {
+                        source_line_index: 0,
+                    }],
                 )
                 .expect("正文行应合法"),
                 DialogueLineRecipe::new(
                     location(2),
                     "",
-                    vec![DialogueLinePart::Literal(String::new())],
+                    vec![DialogueLinePart::BodyLine {
+                        source_line_index: 1,
+                    }],
                 )
-                .expect("空白物理行应保留"),
+                .expect("空白正文行应保留"),
             ],
         )
-        .expect("含空白物理行的配方应合法");
+        .expect("含空白正文行的配方应合法");
 
         assert_eq!(recipe.lines().len(), 2);
     }
 
     #[test]
-    fn dialogue_recipe_rejects_duplicate_or_gapped_body_indexes() {
+    fn dialogue_recipe_rejects_duplicate_or_gapped_source_line_indexes() {
         let duplicate = vec![
             DialogueLineRecipe::new(
                 location(1),
                 "一",
-                vec![DialogueLinePart::BodySlot { index: 0 }],
+                vec![DialogueLinePart::BodyLine {
+                    source_line_index: 0,
+                }],
             )
             .expect("单行应合法"),
             DialogueLineRecipe::new(
                 location(2),
                 "二",
-                vec![DialogueLinePart::BodySlot { index: 0 }],
+                vec![DialogueLinePart::BodyLine {
+                    source_line_index: 0,
+                }],
             )
             .expect("单行应合法"),
         ];
         assert!(matches!(
             DialogueWriteRecipe::new(location(0), None, duplicate),
-            Err(ProjectionModelError::DuplicateDialogueBody { index: 0 })
+            Err(ProjectionModelError::DuplicateDialogueBodyLine {
+                source_line_index: 0
+            })
         ));
 
         let gap = vec![
             DialogueLineRecipe::new(
                 location(1),
                 "一",
-                vec![DialogueLinePart::BodySlot { index: 1 }],
+                vec![DialogueLinePart::BodyLine {
+                    source_line_index: 1,
+                }],
             )
             .expect("单行应合法"),
         ];
         assert!(matches!(
             DialogueWriteRecipe::new(location(0), None, gap),
-            Err(ProjectionModelError::NonContiguousDialogueBody {
+            Err(ProjectionModelError::NonContiguousDialogueBodyLines {
                 expected: 0,
                 actual: 1
             })
         ));
+    }
+
+    #[test]
+    fn content_serializes_as_plain_json_value_or_array() {
+        assert_eq!(
+            serde_json::to_string(&TextUnitContent::Value("姓名".to_owned()))
+                .expect("单值应可序列化"),
+            r#""姓名""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TextUnitContent::Lines(vec![
+                "第一行".to_owned(),
+                String::new(),
+            ]))
+            .expect("行集合应可序列化"),
+            r#"["第一行",""]"#
+        );
     }
 }

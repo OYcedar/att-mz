@@ -41,13 +41,13 @@ pub struct WriteBackInput {
 /// 一轮标准写回的正常业务汇总。
 ///
 /// `manual_layout_units` 大于零仍表示写回成功：相应数据库译文会保持原样写入，
-/// 调用方应把这些位置呈现为需要人工换行的诊断，而不是把它们升级为错误。
+/// 调用方应把这些文本单元呈现为需要人工换行的诊断，而不是把它们升级为错误。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StandardWriteBackSummary {
-    /// 已应用数据库译文的位置数。
-    pub translated_locations: usize,
-    /// 因数据库中没有译文而保留冻结原文的位置数。
-    pub original_locations: usize,
+    /// 已应用数据库译文的语义单元数。
+    pub translated_units: usize,
+    /// 因数据库中没有译文而保留冻结原文的语义单元数。
+    pub original_units: usize,
     /// 成功应用自动换行的文本单元数。
     pub auto_wrapped_units: usize,
     /// 自动换行新增的换行符数。
@@ -125,8 +125,8 @@ impl<E> WriteBackPublishFailure<E> {
 /// 从项目数据库译文生成 Standard 文件候选。
 ///
 /// 实现必须显式使用项目开启边界提供的三个区域行宽，并只对对话正文、滚动文本和
-/// 帮助/说明框应用布局。帮助/说明框仅在原文已有换行时参与自动换行；译文已有换行
-/// 始终作为人工硬边界保留。每个文本先自动换行，再为符合条件的续行补全角空格。
+/// 帮助/说明框应用布局。模型给出的语义换行始终作为人工硬边界保留；只有超过对应
+/// 区域行宽的语义行才参与兜底自动换行。每个文本先自动换行，再为符合条件的续行补全角空格。
 /// 布局无法安全处理某个完整文本时，必须撤销该文本的自动布局、原样写入数据库译文，
 /// 并在正常报告中累计人工项，而不是返回技术错误。
 pub(crate) trait StandardWriteBack: Send + Sync {
@@ -1185,8 +1185,8 @@ mod tests {
 
     fn standard_summary() -> StandardWriteBackSummary {
         StandardWriteBackSummary {
-            translated_locations: 31,
-            original_locations: 7,
+            translated_units: 31,
+            original_units: 7,
             auto_wrapped_units: 5,
             inserted_line_breaks: 8,
             inserted_fullwidth_indents: 4,

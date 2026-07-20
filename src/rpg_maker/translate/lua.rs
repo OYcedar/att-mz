@@ -220,8 +220,10 @@ fn rejection_code(reason: &PreparedTranslationRejection) -> &'static str {
             TranslationUnitRejectionReason::Missing => "missing",
             TranslationUnitRejectionReason::Duplicate => "duplicate",
             TranslationUnitRejectionReason::InvalidShape { .. } => "invalid_shape",
+            TranslationUnitRejectionReason::LineCountMismatch { .. } => "line_count_mismatch",
+            TranslationUnitRejectionReason::InvalidLineText { .. } => "invalid_line_text",
+            TranslationUnitRejectionReason::BlankLineMismatch { .. } => "blank_line_mismatch",
             TranslationUnitRejectionReason::BlankTranslation => "blank_translation",
-            TranslationUnitRejectionReason::InvalidSpeakerText => "invalid_speaker_text",
             TranslationUnitRejectionReason::NoNaturalLanguageText => "no_natural_language_text",
             TranslationUnitRejectionReason::ContainsByteOrderMark => "contains_byte_order_mark",
             TranslationUnitRejectionReason::PlaceholderMismatch { .. } => "placeholder_mismatch",
@@ -377,6 +379,81 @@ mod tests {
             "zh-Hans".to_owned(),
             crate::rpg_maker::project::test_layout_profile(),
         )
+    }
+
+    #[test]
+    fn candidate_rejection_codes_cover_the_current_unit_protocol() {
+        let cases = [
+            (TranslationUnitRejectionReason::Missing, "missing"),
+            (TranslationUnitRejectionReason::Duplicate, "duplicate"),
+            (
+                TranslationUnitRejectionReason::InvalidShape {
+                    message: "测试".to_owned(),
+                },
+                "invalid_shape",
+            ),
+            (
+                TranslationUnitRejectionReason::LineCountMismatch {
+                    expected: 2,
+                    actual: 1,
+                },
+                "line_count_mismatch",
+            ),
+            (
+                TranslationUnitRejectionReason::InvalidLineText { line_index: 1 },
+                "invalid_line_text",
+            ),
+            (
+                TranslationUnitRejectionReason::BlankLineMismatch {
+                    line_index: 1,
+                    expected_blank: true,
+                },
+                "blank_line_mismatch",
+            ),
+            (
+                TranslationUnitRejectionReason::BlankTranslation,
+                "blank_translation",
+            ),
+            (
+                TranslationUnitRejectionReason::NoNaturalLanguageText,
+                "no_natural_language_text",
+            ),
+            (
+                TranslationUnitRejectionReason::ContainsByteOrderMark,
+                "contains_byte_order_mark",
+            ),
+            (
+                TranslationUnitRejectionReason::PlaceholderMismatch {
+                    token: "TOKEN".to_owned(),
+                },
+                "placeholder_mismatch",
+            ),
+            (
+                TranslationUnitRejectionReason::UnexpectedPlaceholderToken {
+                    token: "TOKEN".to_owned(),
+                },
+                "unexpected_placeholder_token",
+            ),
+            (
+                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
+                    original: "原文".to_owned(),
+                },
+                "placeholder_normalization_ambiguous",
+            ),
+            (
+                TranslationUnitRejectionReason::SourceResidual {
+                    fragment: "残留".to_owned(),
+                },
+                "source_residual",
+            ),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(
+                rejection_code(&PreparedTranslationRejection::Candidate(reason)),
+                expected
+            );
+        }
     }
 
     #[test]

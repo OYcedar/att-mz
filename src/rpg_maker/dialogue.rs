@@ -7,7 +7,8 @@ use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, ProjectionModelError, TextFieldRole,
+    DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, ProjectionModelError,
+    TextUnitContent, TextUnitRole,
 };
 use super::text::RpgMakerLocation;
 
@@ -152,64 +153,81 @@ impl MvDialogueProjector {
         group_location: RpgMakerLocation,
         lines: Vec<DialoguePhysicalLine>,
     ) -> Result<ProjectedDialogue, MvDialogueProjectionError> {
-        let mut leaves = Vec::new();
-        let mut line_recipes = Vec::with_capacity(lines.len());
-        let mut body_index = 0;
+        let mut units = Vec::new();
+        let mut pending_lines = Vec::with_capacity(lines.len());
+        let mut lines = lines.into_iter();
 
-        for (line_index, line) in lines.into_iter().enumerate() {
-            if line_index == 0 {
-                let projection = self.project_first_line(&line)?;
-                if let Some(value) = projection.speaker {
-                    leaves.push(ProjectedDialogueLeaf::new(
-                        TextFieldRole::DialogueSpeaker,
-                        line.physical_location.clone(),
-                        value,
-                    ));
-                }
-                let mut parts = projection.prefix_parts;
-                if !projection.body.trim().is_empty() {
-                    leaves.push(ProjectedDialogueLeaf::new(
-                        TextFieldRole::DialogueBody { index: body_index },
-                        line.physical_location.clone(),
-                        projection.body,
-                    ));
-                    parts.push(DialogueLinePart::BodySlot { index: body_index });
-                    body_index += 1;
-                } else if !projection.body.is_empty() {
-                    push_literal(&mut parts, &projection.body);
-                } else if parts.is_empty() {
-                    parts.push(DialogueLinePart::Literal(line.expected_raw.clone()));
-                }
-                line_recipes.push(
-                    DialogueLineRecipe::new(line.physical_location, line.expected_raw, parts)
-                        .map_err(|source| {
-                            MvDialogueProjectionError::InvalidRecipe(Box::new(source))
-                        })?,
-                );
-                continue;
+        if let Some(first_line) = lines.next() {
+            let projection = self.project_first_line(&first_line)?;
+            if let Some(value) = projection.speaker {
+                units.push(ProjectedDialogueUnit::new(
+                    TextUnitRole::DialogueSpeaker,
+                    first_line.physical_location.clone(),
+                    TextUnitContent::Value(value),
+                ));
             }
 
-            let parts = if line.expected_raw.trim().is_empty() {
-                vec![DialogueLinePart::Literal(line.expected_raw.clone())]
+            let mut prefix_parts = projection.prefix_parts;
+            let body = if projection.body.trim().is_empty() && !prefix_parts.is_empty() {
+                push_literal(&mut prefix_parts, &projection.body);
+                None
             } else {
-                leaves.push(ProjectedDialogueLeaf::new(
-                    TextFieldRole::DialogueBody { index: body_index },
-                    line.physical_location.clone(),
-                    line.expected_raw.clone(),
-                ));
-                let parts = vec![DialogueLinePart::BodySlot { index: body_index }];
-                body_index += 1;
-                parts
+                Some(projection.body)
             };
+            pending_lines.push(PendingDialogueLine {
+                physical_location: first_line.physical_location,
+                expected_raw: first_line.expected_raw,
+                prefix_parts,
+                body,
+            });
+        }
+        pending_lines.extend(lines.map(|line| PendingDialogueLine {
+            physical_location: line.physical_location,
+            expected_raw: line.expected_raw.clone(),
+            prefix_parts: Vec::new(),
+            body: Some(line.expected_raw),
+        }));
+
+        let has_body = pending_lines.iter().any(|line| {
+            line.body
+                .as_deref()
+                .is_some_and(|body| !body.trim().is_empty())
+        });
+        let mut body_lines = Vec::new();
+        let mut body_projection_location = None;
+        let mut line_recipes = Vec::with_capacity(pending_lines.len());
+        for pending in pending_lines {
+            let mut parts = pending.prefix_parts;
+            if let Some(body) = pending.body {
+                if has_body {
+                    body_projection_location
+                        .get_or_insert_with(|| pending.physical_location.clone());
+                    let source_line_index = body_lines.len();
+                    body_lines.push(body);
+                    parts.push(DialogueLinePart::BodyLine { source_line_index });
+                } else {
+                    push_literal(&mut parts, &body);
+                }
+            }
+            if parts.is_empty() {
+                parts.push(DialogueLinePart::Literal(pending.expected_raw.clone()));
+            }
             line_recipes.push(
-                DialogueLineRecipe::new(line.physical_location, line.expected_raw, parts)
+                DialogueLineRecipe::new(pending.physical_location, pending.expected_raw, parts)
                     .map_err(|source| MvDialogueProjectionError::InvalidRecipe(Box::new(source)))?,
             );
+        }
+        if has_body {
+            units.push(ProjectedDialogueUnit::new(
+                TextUnitRole::DialogueBody,
+                body_projection_location.expect("非空正文必须有首个物理来源"),
+                TextUnitContent::Lines(body_lines),
+            ));
         }
 
         let recipe = DialogueWriteRecipe::new(group_location, None, line_recipes)
             .map_err(|source| MvDialogueProjectionError::InvalidRecipe(Box::new(source)))?;
-        Ok(ProjectedDialogue { leaves, recipe })
+        Ok(ProjectedDialogue { units, recipe })
     }
 
     pub(crate) fn finish(self) -> Result<(), MvDialogueProjectionError> {
@@ -378,6 +396,13 @@ struct FirstLineProjection {
     body: String,
 }
 
+struct PendingDialogueLine {
+    physical_location: RpgMakerLocation,
+    expected_raw: String,
+    prefix_parts: Vec<DialogueLinePart>,
+    body: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DialoguePhysicalLine {
     physical_location: RpgMakerLocation,
@@ -406,45 +431,47 @@ impl DialoguePhysicalLine {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectedDialogue {
-    leaves: Vec<ProjectedDialogueLeaf>,
+    units: Vec<ProjectedDialogueUnit>,
     recipe: DialogueWriteRecipe,
 }
 
 impl ProjectedDialogue {
     #[cfg(test)]
     pub(crate) fn speaker(&self) -> Option<&str> {
-        self.leaves.iter().find_map(|leaf| {
-            (leaf.role == TextFieldRole::DialogueSpeaker).then_some(leaf.original_text.as_str())
+        self.units.iter().find_map(|unit| {
+            (unit.role == TextUnitRole::DialogueSpeaker)
+                .then(|| unit.source_content.as_value())
+                .flatten()
         })
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<ProjectedDialogueLeaf>, DialogueWriteRecipe) {
-        (self.leaves, self.recipe)
+    pub(crate) fn into_parts(self) -> (Vec<ProjectedDialogueUnit>, DialogueWriteRecipe) {
+        (self.units, self.recipe)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProjectedDialogueLeaf {
-    role: TextFieldRole,
-    physical_location: RpgMakerLocation,
-    original_text: String,
+pub(crate) struct ProjectedDialogueUnit {
+    role: TextUnitRole,
+    projection_location: RpgMakerLocation,
+    source_content: TextUnitContent,
 }
 
-impl ProjectedDialogueLeaf {
+impl ProjectedDialogueUnit {
     fn new(
-        role: TextFieldRole,
-        physical_location: RpgMakerLocation,
-        original_text: String,
+        role: TextUnitRole,
+        projection_location: RpgMakerLocation,
+        source_content: TextUnitContent,
     ) -> Self {
         Self {
             role,
-            physical_location,
-            original_text,
+            projection_location,
+            source_content,
         }
     }
 
-    pub(crate) fn into_parts(self) -> (TextFieldRole, RpgMakerLocation, String) {
-        (self.role, self.physical_location, self.original_text)
+    pub(crate) fn into_parts(self) -> (TextUnitRole, RpgMakerLocation, TextUnitContent) {
+        (self.role, self.projection_location, self.source_content)
     }
 }
 
@@ -636,8 +663,16 @@ pattern = '(?i)\\n<(?<speaker>[^>]*?)(?::)?>'
         projector.finish().expect("规则已捕获非空姓名");
 
         assert_eq!(projected.speaker(), Some("莉莉"));
-        let (leaves, recipe) = projected.into_parts();
-        assert_eq!(leaves.len(), 3);
+        let (units, recipe) = projected.into_parts();
+        assert_eq!(units.len(), 2);
+        let body = units
+            .iter()
+            .find(|unit| unit.role == TextUnitRole::DialogueBody)
+            .expect("应形成一个完整正文单元");
+        assert_eq!(
+            body.source_content.as_lines(),
+            Some(["你好".to_owned(), "第二行".to_owned()].as_slice())
+        );
         assert_eq!(recipe.lines().len(), 2);
         assert_eq!(
             recipe.lines()[0].parts(),
@@ -647,7 +682,9 @@ pattern = '(?i)\\n<(?<speaker>[^>]*?)(?::)?>'
                 DialogueLinePart::Literal(":>\\n<".to_owned()),
                 DialogueLinePart::SpeakerSlot,
                 DialogueLinePart::Literal(":>".to_owned()),
-                DialogueLinePart::BodySlot { index: 0 },
+                DialogueLinePart::BodyLine {
+                    source_line_index: 0,
+                },
             ]
         );
     }
@@ -675,7 +712,7 @@ pattern = '(?i)\\n<(?<speaker>[^>]*?)(?::)?>'
             recipe.lines()[0]
                 .parts()
                 .iter()
-                .all(|part| !matches!(part, DialogueLinePart::BodySlot { .. }))
+                .all(|part| !matches!(part, DialogueLinePart::BodyLine { .. }))
         );
     }
 

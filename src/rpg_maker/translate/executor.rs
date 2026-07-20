@@ -13,7 +13,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::de::{self, Visitor};
+use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -22,7 +22,7 @@ use crate::language::{
     LanguageText, LanguageTextSegment,
 };
 use crate::llm::{LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse, LlmUsage};
-use crate::rpg_maker::model::TextFieldRole;
+use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::placeholder_token;
 
 use super::language_projection::{
@@ -30,11 +30,11 @@ use super::language_projection::{
 };
 use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
 use super::standard::{
-    AcceptedTranslationDecision, AppliedPlaceholder, ExpectedTranslationOutput, NonEmptyTaskItems,
-    StandardTranslationProfile, StandardTranslationTaskExecutor, StandardTranslationTaskIndex,
-    TranslationPatch, TranslationProtocolDiagnostic, TranslationTaskBlock, TranslationTaskOutcome,
-    TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
-    TranslationUnitRejectionReason, UnresolvedTranslationUnit,
+    AcceptedTranslationDecision, AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
+    NonEmptyTaskItems, StandardTranslationProfile, StandardTranslationTaskExecutor,
+    StandardTranslationTaskIndex, TranslationPatch, TranslationProtocolDiagnostic,
+    TranslationTaskBlock, TranslationTaskOutcome, TranslationTaskOutcomeContext,
+    TranslationTaskUnavailableReason, TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
 
 /// 一次最终成功 HTTP 响应中可安全进入任务结果与持久日志的元数据。
@@ -521,6 +521,7 @@ fn process_response(
     let mut accepted = Vec::with_capacity(expected_by_id.len());
     let mut unresolved = Vec::new();
     for expected in &input.expected_outputs {
+        validate_expected_output_contract(expected)?;
         let Some(candidates) = actual_by_id.get(&expected.id()) else {
             unresolved.push(unresolved_unit(
                 expected,
@@ -535,16 +536,26 @@ fn process_response(
             ));
             continue;
         }
-        let translation = candidates[0].clone();
-        if translation.trim().is_empty() {
-            unresolved.push(unresolved_unit(
-                expected,
-                TranslationUnitRejectionReason::BlankTranslation,
-            ));
+        let translation_lines = match &candidates[0] {
+            Ok(lines) => lines.clone(),
+            Err(message) => {
+                unresolved.push(unresolved_unit(
+                    expected,
+                    TranslationUnitRejectionReason::InvalidShape {
+                        message: message.clone(),
+                    },
+                ));
+                continue;
+            }
+        };
+        if let Err(reason) = validate_translation_lines(expected, &translation_lines) {
+            unresolved.push(unresolved_unit(expected, reason));
             continue;
         }
-        let translation = match validate_and_restore_translation(
-            translation,
+        let translation_lines = match validate_and_restore_translation_lines(
+            translation_lines,
+            expected.protected_text(),
+            expected.line_shape(),
             expected.applied_placeholders(),
             expected.language_analysis(),
             language_module.as_ref(),
@@ -569,12 +580,7 @@ fn process_response(
                 return Err(TranslationResponseTechnicalError::InternalInvariant { message });
             }
         };
-        if let Err(reason) =
-            validate_role_specific_translation(expected.identity().role(), &translation)
-        {
-            unresolved.push(unresolved_unit(expected, reason));
-            continue;
-        }
+        let translation = translation_content(expected, translation_lines);
         let translation_state = expected.state_context().finish(&translation);
         let propagation_targets = expected
             .propagation_targets()
@@ -639,54 +645,159 @@ fn non_empty_known<T>(items: Vec<T>, established_by: &'static str) -> NonEmptyTa
     NonEmptyTaskItems::new(first, items.collect())
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelOutputWire {
-    id: ModelOutputId,
-    translation: String,
+fn validate_expected_output_contract(
+    expected: &ExpectedTranslationOutput,
+) -> Result<(), TranslationResponseTechnicalError> {
+    if expected.propagation_targets().len() != expected.propagation_state_contexts().len() {
+        return Err(TranslationResponseTechnicalError::InternalInvariant {
+            message: format!(
+                "翻译单元 {} 的传播目标与状态上下文数量不一致",
+                expected.id()
+            ),
+        });
+    }
+    if let Err(reason) =
+        validate_token_multiset(expected.protected_text(), expected.applied_placeholders())
+    {
+        return Err(TranslationResponseTechnicalError::InternalInvariant {
+            message: format!(
+                "翻译单元 {} 的受保护原文与占位符绑定不一致：{reason:?}",
+                expected.id()
+            ),
+        });
+    }
+    if let ExpectedLineShape::Aligned(line_count) = expected.line_shape()
+        && expected.protected_text().split('\n').count() != line_count.get()
+    {
+        return Err(TranslationResponseTechnicalError::InternalInvariant {
+            message: format!(
+                "翻译单元 {} 的受保护原文槽位数与对齐数不一致",
+                expected.id()
+            ),
+        });
+    }
+    match (expected.identity().source_content(), expected.line_shape()) {
+        (TextUnitContent::Value(_), ExpectedLineShape::Aligned(line_count))
+            if line_count.get() == 1 =>
+        {
+            Ok(())
+        }
+        (TextUnitContent::Value(_), ExpectedLineShape::Reflow) => Ok(()),
+        (TextUnitContent::Value(_), ExpectedLineShape::Aligned(_)) => {
+            Err(TranslationResponseTechnicalError::InternalInvariant {
+                message: format!("单值翻译单元 {} 的严格对齐数必须为一", expected.id()),
+            })
+        }
+        (TextUnitContent::Lines(source_lines), ExpectedLineShape::Aligned(line_count))
+            if source_lines.len() != line_count.get() =>
+        {
+            Err(TranslationResponseTechnicalError::InternalInvariant {
+                message: format!("行序列翻译单元 {} 的对齐数与源行数不一致", expected.id()),
+            })
+        }
+        (TextUnitContent::Lines(_), _) => Ok(()),
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ModelOutputId(usize);
+fn validate_translation_lines(
+    expected_output: &ExpectedTranslationOutput,
+    lines: &[String],
+) -> Result<(), TranslationUnitRejectionReason> {
+    let shape = expected_output.line_shape();
+    if let ExpectedLineShape::Aligned(expected) = shape
+        && lines.len() != expected.get()
+    {
+        return Err(TranslationUnitRejectionReason::LineCountMismatch {
+            expected: expected.get(),
+            actual: lines.len(),
+        });
+    }
+    if let Some(line_index) = lines.iter().position(|line| {
+        line.chars()
+            .any(|character| matches!(character, '\r' | '\n' | '\0'))
+    }) {
+        return Err(TranslationUnitRejectionReason::InvalidLineText { line_index });
+    }
+    match shape {
+        ExpectedLineShape::Reflow => {
+            if lines.iter().all(|line| line.trim().is_empty()) {
+                return Err(TranslationUnitRejectionReason::BlankTranslation);
+            }
+        }
+        ExpectedLineShape::Aligned(_) => {
+            let source_lines = match expected_output.identity().source_content() {
+                TextUnitContent::Value(value) => std::slice::from_ref(value),
+                TextUnitContent::Lines(lines) => lines.as_slice(),
+            };
+            if let Some((line_index, expected_blank)) =
+                source_lines.iter().zip(lines).enumerate().find_map(
+                    |(line_index, (source, translation))| {
+                        let expected_blank = source.trim().is_empty();
+                        let mismatched = if expected_blank {
+                            !translation.is_empty()
+                        } else {
+                            translation.trim().is_empty()
+                        };
+                        mismatched.then_some((line_index, expected_blank))
+                    },
+                )
+            {
+                return Err(TranslationUnitRejectionReason::BlankLineMismatch {
+                    line_index,
+                    expected_blank,
+                });
+            }
+        }
+    }
+    Ok(())
+}
 
-impl<'de> Deserialize<'de> for ModelOutputId {
+fn translation_content(
+    expected: &ExpectedTranslationOutput,
+    lines: Vec<String>,
+) -> TextUnitContent {
+    match expected.identity().source_content() {
+        TextUnitContent::Value(_) => TextUnitContent::Value(lines.join("\n")),
+        TextUnitContent::Lines(_) => TextUnitContent::Lines(lines),
+    }
+}
+
+#[derive(Debug)]
+struct ModelOutputWire {
+    id: String,
+    value: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct ModelOutputBatch(Vec<ModelOutputWire>);
+
+impl<'de> Deserialize<'de> for ModelOutputBatch {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(ModelOutputIdVisitor)
+        deserializer.deserialize_map(ModelOutputBatchVisitor)
     }
 }
 
-struct ModelOutputIdVisitor;
+struct ModelOutputBatchVisitor;
 
-impl Visitor<'_> for ModelOutputIdVisitor {
-    type Value = ModelOutputId;
+impl<'de> Visitor<'de> for ModelOutputBatchVisitor {
+    type Value = ModelOutputBatch;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("非负整数或非空 ASCII 十进制字符串")
+        formatter.write_str("以正整数 ID 为键、字符串数组为值的 JSON 对象")
     }
 
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
     where
-        E: de::Error,
+        A: MapAccess<'de>,
     {
-        usize::try_from(value)
-            .map(ModelOutputId)
-            .map_err(|_| E::custom("id 整数超出 usize 范围"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(E::custom("id 字符串必须是非空 ASCII 十进制整数"));
+        let mut outputs = Vec::with_capacity(map.size_hint().unwrap_or_default());
+        while let Some((id, value)) = map.next_entry::<String, serde_json::Value>()? {
+            outputs.push(ModelOutputWire { id, value });
         }
-        value
-            .parse::<usize>()
-            .map(ModelOutputId)
-            .map_err(|_| E::custom("id 字符串超出 usize 范围"))
+        Ok(ModelOutputBatch(outputs))
     }
 }
 
@@ -694,22 +805,54 @@ fn collect_model_outputs(
     outputs: Vec<ModelOutputWire>,
     expected_by_id: &BTreeMap<usize, &ExpectedTranslationOutput>,
     diagnostics: &mut Vec<TranslationProtocolDiagnostic>,
-) -> BTreeMap<usize, Vec<String>> {
-    let mut by_id = BTreeMap::<usize, Vec<String>>::new();
+) -> BTreeMap<usize, Vec<Result<Vec<String>, String>>> {
+    let mut by_id = BTreeMap::<usize, Vec<Result<Vec<String>, String>>>::new();
     for (item_index, output) in outputs.into_iter().enumerate() {
-        let id = output.id.0;
+        let Some(id) = parse_model_output_id(&output.id) else {
+            diagnostics.push(TranslationProtocolDiagnostic::InvalidId { item_index });
+            continue;
+        };
         if !expected_by_id.contains_key(&id) {
             diagnostics.push(TranslationProtocolDiagnostic::UnknownId { item_index, id });
             continue;
         }
-        by_id.entry(id).or_default().push(output.translation);
+        by_id
+            .entry(id)
+            .or_default()
+            .push(parse_translation_lines(output.value));
     }
     by_id
 }
 
+fn parse_model_output_id(value: &str) -> Option<usize> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || value.starts_with('0')
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn parse_translation_lines(value: serde_json::Value) -> Result<Vec<String>, String> {
+    let serde_json::Value::Array(values) = value else {
+        return Err("译文必须是字符串数组".to_owned());
+    };
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(line_index, value)| match value {
+            serde_json::Value::String(line) => Ok(line),
+            _ => Err(format!("译文数组第 {line_index} 项必须是字符串")),
+        })
+        .collect()
+}
+
 fn parse_model_output_batch(value: &str) -> Result<Vec<ModelOutputWire>, String> {
     let value = strip_model_response_envelope(value)?;
-    serde_json::from_str(value).map_err(|source| source.to_string())
+    serde_json::from_str::<ModelOutputBatch>(value)
+        .map(|batch| batch.0)
+        .map_err(|source| source.to_string())
 }
 
 fn unresolved_unit(
@@ -770,6 +913,134 @@ fn strip_single_markdown_fence(value: &str) -> Result<&str, String> {
     Ok(body)
 }
 
+fn validate_and_restore_translation_lines(
+    mut lines: Vec<String>,
+    protected_text: &str,
+    line_shape: ExpectedLineShape,
+    placeholders: &[AppliedPlaceholder],
+    language_analysis: &crate::language::LanguageAnalysis,
+    language_module: &dyn LanguageModule,
+) -> Result<Vec<String>, TranslationCandidateValidationError> {
+    normalize_original_controls_in_lines(&mut lines, placeholders)
+        .map_err(TranslationCandidateValidationError::Rejected)?;
+    let line_placeholders = match line_shape {
+        ExpectedLineShape::Reflow => {
+            validate_token_multiset_in_lines(&lines, placeholders)
+                .map_err(TranslationCandidateValidationError::Rejected)?;
+            lines
+                .iter()
+                .map(|line| {
+                    placeholders
+                        .iter()
+                        .filter(|placeholder| line.contains(placeholder.token()))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        }
+        ExpectedLineShape::Aligned(_) => {
+            let protected_lines = protected_text.split('\n').collect::<Vec<_>>();
+            let bindings = protected_lines
+                .into_iter()
+                .map(|source_line| {
+                    placeholders
+                        .iter()
+                        .filter(|placeholder| source_line.contains(placeholder.token()))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            for (line, bindings) in lines.iter().zip(&bindings) {
+                validate_token_multiset(line, bindings)
+                    .map_err(TranslationCandidateValidationError::Rejected)?;
+            }
+            bindings
+        }
+    };
+
+    let mut projected_segments = Vec::new();
+    let mut line_segment_counts = Vec::with_capacity(lines.len());
+    for (line_index, (line, bindings)) in lines.iter().zip(&line_placeholders).enumerate() {
+        let projected = project_protected_text(line, bindings)
+            .map_err(TranslationCandidateValidationError::LanguageProjection)?;
+        line_segment_counts.push(projected.segments().len());
+        projected_segments.extend(projected.segments().iter().cloned());
+        if line_index + 1 < lines.len() {
+            projected_segments.push(LanguageTextSegment::OpaqueBoundary);
+        }
+    }
+
+    let projected = LanguageText::new(projected_segments);
+    let normalized = normalize_language_text(&projected)
+        .map_err(TranslationCandidateValidationError::Rejected)?;
+    if let Some(residual) = language_module
+        .find_source_residual(language_analysis, &normalized)
+        .map_err(TranslationCandidateValidationError::LanguageModule)?
+    {
+        return Err(TranslationCandidateValidationError::Rejected(
+            TranslationUnitRejectionReason::SourceResidual {
+                fragment: residual.fragment().to_owned(),
+            },
+        ));
+    }
+    let repair = language_module
+        .plan_translation_repair(language_analysis, &normalized)
+        .map_err(TranslationCandidateValidationError::LanguageModule)?;
+    let repaired = normalized
+        .apply_repair(&repair)
+        .map_err(TranslationCandidateValidationError::LanguageRepair)?;
+
+    let mut restored = Vec::with_capacity(lines.len());
+    let mut segment_offset = 0;
+    for (line_index, ((line, bindings), segment_count)) in lines
+        .iter()
+        .zip(&line_placeholders)
+        .zip(line_segment_counts)
+        .enumerate()
+    {
+        let line_end = segment_offset + segment_count;
+        let Some(repaired_segments) = repaired.segments().get(segment_offset..line_end) else {
+            return Err(TranslationCandidateValidationError::InternalInvariant {
+                message: "语言修复改变了译文行的分段边界".to_owned(),
+            });
+        };
+        restored.push(
+            restore_protected_text(
+                line,
+                bindings,
+                &LanguageText::new(repaired_segments.to_vec()),
+            )
+            .map_err(TranslationCandidateValidationError::LanguageProjection)?,
+        );
+        segment_offset = line_end;
+        if line_index + 1 < lines.len() {
+            if !matches!(
+                repaired.segments().get(segment_offset),
+                Some(LanguageTextSegment::OpaqueBoundary)
+            ) {
+                return Err(TranslationCandidateValidationError::InternalInvariant {
+                    message: "语言修复改变了译文行边界".to_owned(),
+                });
+            }
+            segment_offset += 1;
+        }
+    }
+    if segment_offset != repaired.segments().len() {
+        return Err(TranslationCandidateValidationError::InternalInvariant {
+            message: "语言修复产生了无法归属到译文行的分段".to_owned(),
+        });
+    }
+    if restored
+        .iter()
+        .any(|line| placeholder_token::contains_reserved_prefix(line))
+    {
+        return Err(TranslationCandidateValidationError::InternalInvariant {
+            message: "恢复占位符原片段后仍残留 ATT token 保留前缀".to_owned(),
+        });
+    }
+    Ok(restored)
+}
+
 fn validate_and_restore_translation(
     mut translation: String,
     placeholders: &[AppliedPlaceholder],
@@ -809,20 +1080,6 @@ fn validate_and_restore_translation(
         });
     }
     Ok(restored)
-}
-
-fn validate_role_specific_translation(
-    role: &TextFieldRole,
-    translation: &str,
-) -> Result<(), TranslationUnitRejectionReason> {
-    if matches!(role, TextFieldRole::DialogueSpeaker)
-        && translation
-            .chars()
-            .any(|character| matches!(character, '\r' | '\n' | '\0'))
-    {
-        return Err(TranslationUnitRejectionReason::InvalidSpeakerText);
-    }
-    Ok(())
 }
 
 pub(super) fn accept_prepared_translation_candidate(
@@ -929,6 +1186,13 @@ fn normalize_original_controls(
     translation: &mut String,
     placeholders: &[AppliedPlaceholder],
 ) -> Result<(), TranslationUnitRejectionReason> {
+    normalize_original_controls_in_lines(std::slice::from_mut(translation), placeholders)
+}
+
+fn normalize_original_controls_in_lines(
+    lines: &mut [String],
+    placeholders: &[AppliedPlaceholder],
+) -> Result<(), TranslationUnitRejectionReason> {
     let mut originals = BTreeMap::<&str, Vec<&AppliedPlaceholder>>::new();
     for placeholder in placeholders {
         originals
@@ -938,10 +1202,10 @@ fn normalize_original_controls(
     }
     for (original, bindings) in originals {
         if bindings.len() != 1 {
-            if translation.contains(original)
+            if lines.iter().any(|line| line.contains(original))
                 && bindings
                     .iter()
-                    .any(|binding| !translation.contains(binding.token()))
+                    .any(|binding| !lines.iter().any(|line| line.contains(binding.token())))
             {
                 return Err(
                     TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
@@ -952,10 +1216,28 @@ fn normalize_original_controls(
             continue;
         }
         let binding = bindings[0];
-        let token_count = translation.matches(binding.token()).count();
-        let original_count = translation.matches(original).count();
-        if token_count == 0 && original_count == 1 {
-            *translation = translation.replacen(original, binding.token(), 1);
+        let token_count = lines
+            .iter()
+            .map(|line| line.matches(binding.token()).count())
+            .sum::<usize>();
+        let original_count = lines
+            .iter()
+            .map(|line| line.matches(original).count())
+            .sum::<usize>();
+        if token_count == 0 && original_count > 0 {
+            if original_count == 1 {
+                let line = lines
+                    .iter_mut()
+                    .find(|line| line.contains(original))
+                    .expect("已确认唯一原片段存在于某个译文行");
+                *line = line.replacen(original, binding.token(), 1);
+            } else {
+                return Err(
+                    TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
+                        original: original.to_owned(),
+                    },
+                );
+            }
         } else if original_count > 0 && token_count != 0 {
             return Err(
                 TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
@@ -971,31 +1253,53 @@ fn validate_token_multiset(
     translation: &str,
     placeholders: &[AppliedPlaceholder],
 ) -> Result<(), TranslationUnitRejectionReason> {
+    validate_token_multiset_in_texts(&[translation], placeholders)
+}
+
+fn validate_token_multiset_in_lines(
+    lines: &[String],
+    placeholders: &[AppliedPlaceholder],
+) -> Result<(), TranslationUnitRejectionReason> {
+    let texts = lines.iter().map(String::as_str).collect::<Vec<_>>();
+    validate_token_multiset_in_texts(&texts, placeholders)
+}
+
+fn validate_token_multiset_in_texts(
+    texts: &[&str],
+    placeholders: &[AppliedPlaceholder],
+) -> Result<(), TranslationUnitRejectionReason> {
     let mut expected = BTreeMap::<&str, usize>::new();
     for placeholder in placeholders {
         *expected.entry(placeholder.token()).or_default() += 1;
     }
 
     for (&token, &count) in &expected {
-        if translation.matches(token).count() != count {
+        if texts
+            .iter()
+            .map(|text| text.matches(token).count())
+            .sum::<usize>()
+            != count
+        {
             return Err(TranslationUnitRejectionReason::PlaceholderMismatch {
                 token: token.to_owned(),
             });
         }
     }
 
-    let scanned = placeholder_token::scan_envelopes(translation).map_err(|error| {
-        TranslationUnitRejectionReason::UnexpectedPlaceholderToken {
-            token: error.into_fragment(),
+    for text in texts {
+        let scanned = placeholder_token::scan_envelopes(text).map_err(|error| {
+            TranslationUnitRejectionReason::UnexpectedPlaceholderToken {
+                token: error.into_fragment(),
+            }
+        })?;
+        if let Some(token) = scanned
+            .into_iter()
+            .find(|token| !expected.contains_key(*token))
+        {
+            return Err(TranslationUnitRejectionReason::UnexpectedPlaceholderToken {
+                token: token.to_owned(),
+            });
         }
-    })?;
-    if let Some(token) = scanned
-        .into_iter()
-        .find(|token| !expected.contains_key(*token))
-    {
-        return Err(TranslationUnitRejectionReason::UnexpectedPlaceholderToken {
-            token: token.to_owned(),
-        });
     }
     Ok(())
 }
@@ -1014,7 +1318,7 @@ mod tests {
         LanguageModule, LanguagePair, LanguageText, QuotePair,
     };
     use crate::llm::{ChatMessage, ChatMessageRole};
-    use crate::rpg_maker::model::{ScalarFieldKey, TextFieldRole};
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::{
         RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
@@ -1025,9 +1329,9 @@ mod tests {
         RpgMakerTranslationRequestConfiguration,
     };
     use crate::rpg_maker::translate::standard::{
-        AppliedPlaceholder, ExpectedTranslationOutput, PlaceholderRuleOrigin, PlaceholderSegment,
-        StandardTranslationTaskIndex, TerminologyDependency, TranslationLeafIdentity,
-        TranslationStateContext,
+        AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
+        ExpectedTranslationValidation, PlaceholderRuleOrigin, PlaceholderSegment,
+        StandardTranslationTaskIndex, TranslationStateContext, TranslationUnitIdentity,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1124,17 +1428,17 @@ mod tests {
         japanese_module().analyze_source(&LanguageText::natural("炎の剣"))
     }
 
-    fn identity() -> TranslationLeafIdentity {
+    fn identity() -> TranslationUnitIdentity {
         let group = RpgMakerLocation::value(
             RpgMakerSource::data(StandardDataFile::Items),
             vec![RpgMakerLocationStep::index(1)],
         );
-        TranslationLeafIdentity::new(
+        TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group,
-            TextFieldRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
-            "炎の剣",
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
+            TextUnitContent::Value("炎の剣\\N[1]".to_owned()),
             "{}",
         )
     }
@@ -1150,31 +1454,139 @@ mod tests {
         )
     }
 
-    fn propagation_target() -> TranslationLeafIdentity {
+    fn propagation_target() -> TranslationUnitIdentity {
         let group = RpgMakerLocation::value(
             RpgMakerSource::data(StandardDataFile::Items),
             vec![RpgMakerLocationStep::index(2)],
         );
-        TranslationLeafIdentity::new(
+        TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group,
-            TextFieldRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
-            "炎の剣",
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
+            TextUnitContent::Value("炎の剣\\N[1]".to_owned()),
             "{}",
         )
     }
 
-    fn speaker_identity() -> TranslationLeafIdentity {
+    fn reflow_value_identity() -> TranslationUnitIdentity {
+        let group = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(3)],
+        );
+        TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            group,
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
+            TextUnitContent::Value("炎の剣。装備すると攻撃力が上がる。".to_owned()),
+            "{}",
+        )
+    }
+
+    fn speaker_identity() -> TranslationUnitIdentity {
         let group =
             RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(0)]);
-        TranslationLeafIdentity::new(
+        TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::EventDialogue,
             group,
-            TextFieldRole::DialogueSpeaker,
-            "炎の剣",
+            TextUnitRole::DialogueSpeaker,
+            TextUnitContent::Value("炎の剣".to_owned()),
             "{}",
+        )
+    }
+
+    fn dialogue_body_identity() -> TranslationUnitIdentity {
+        let group =
+            RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(1)]);
+        TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventDialogue,
+            group,
+            TextUnitRole::DialogueBody,
+            TextUnitContent::Lines(vec![
+                "今日はいい天気ですね。".to_owned(),
+                "一緒に町へ".to_owned(),
+                "行きませんか？".to_owned(),
+            ]),
+            r#"{"source_speaker":"アリス"}"#,
+        )
+    }
+
+    fn choices_identity() -> TranslationUnitIdentity {
+        let group =
+            RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(2)]);
+        TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventChoices,
+            group,
+            TextUnitRole::Choices,
+            TextUnitContent::Lines(vec!["はい".to_owned(), "いいえ".to_owned()]),
+            "{}",
+        )
+    }
+
+    fn scrolling_identity_with_blank_slot() -> TranslationUnitIdentity {
+        let group =
+            RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(3)]);
+        TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventScrollingText,
+            group,
+            TextUnitRole::ScrollingText,
+            TextUnitContent::Lines(vec![
+                "スタッフ".to_owned(),
+                String::new(),
+                "アリス".to_owned(),
+            ]),
+            "{}",
+        )
+    }
+
+    fn line_content_analysis(lines: &[&str]) -> crate::language::LanguageAnalysis {
+        let mut segments = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                segments.push(LanguageTextSegment::OpaqueBoundary);
+            }
+            segments.push(LanguageTextSegment::NaturalText((*line).to_owned()));
+        }
+        japanese_module().analyze_source(&LanguageText::new(segments))
+    }
+
+    fn line_task(
+        identity: TranslationUnitIdentity,
+        line_shape: ExpectedLineShape,
+        analysis: crate::language::LanguageAnalysis,
+    ) -> TranslationTaskBlock {
+        let protected_text = match identity.source_content() {
+            TextUnitContent::Value(value) => value.clone(),
+            TextUnitContent::Lines(lines) => lines.join("\n"),
+        };
+        TranslationTaskBlock::new(
+            StandardTranslationTaskIndex::new(4),
+            LanguagePair::new(
+                LanguageId::parse("ja").expect("测试源语言合法"),
+                LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
+            ),
+            vec![
+                ChatMessage::new(ChatMessageRole::System, "# Contract"),
+                ChatMessage::new(ChatMessageRole::User, "# Task"),
+            ],
+            vec![ExpectedTranslationOutput::new(
+                1,
+                identity,
+                Vec::new(),
+                ExpectedTranslationValidation::new(
+                    line_shape,
+                    protected_text,
+                    Vec::new(),
+                    analysis,
+                ),
+                state_context(4),
+                Vec::new(),
+            )],
         )
     }
 
@@ -1193,18 +1605,20 @@ mod tests {
                 LanguageId::parse("ja").expect("测试源语言合法"),
                 LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
             ),
-            Vec::new(),
-            Vec::new(),
             vec![
                 ChatMessage::new(ChatMessageRole::System, "# Contract"),
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
             vec![ExpectedTranslationOutput::new(
-                0,
+                1,
                 speaker_identity(),
                 Vec::new(),
-                Vec::new(),
-                japanese_analysis(),
+                ExpectedTranslationValidation::new(
+                    ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                    "炎の剣",
+                    Vec::new(),
+                    japanese_analysis(),
+                ),
                 state_context(3),
                 Vec::new(),
             )],
@@ -1222,20 +1636,22 @@ mod tests {
                 LanguageId::parse(source_language).expect("测试源语言合法"),
                 LanguageId::parse(target_language).expect("测试目标语言合法"),
             ),
-            Vec::new(),
-            vec![TerminologyDependency::new("炎の剣", "炎之剑")],
             vec![
                 ChatMessage::new(ChatMessageRole::System, "# Contract"),
                 ChatMessage::new(ChatMessageRole::User, "# Task"),
             ],
-            (0..output_count)
+            (1..=output_count)
                 .map(|id| {
                     ExpectedTranslationOutput::new(
                         id,
                         identity(),
                         vec![propagation_target()],
-                        vec![placeholder()],
-                        japanese_analysis(),
+                        ExpectedTranslationValidation::new(
+                            ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                            "炎の剣⟦ATT_ACTOR_NAME_WHOLE_0000⟧",
+                            vec![placeholder()],
+                            japanese_analysis(),
+                        ),
                         state_context(id as u8 + 1),
                         vec![state_context(id as u8 + 101)],
                     )
@@ -1247,12 +1663,12 @@ mod tests {
     #[test]
     fn response_envelope_accepts_only_the_explicit_contract() {
         for value in [
-            "[]",
-            " \r\n [] \n ",
-            "\u{feff}[]",
-            "```\n[]\n```",
-            "```json\r\n[]\r\n```",
-            "```JSON\n[{\"id\":0,\"translation\":\"括号 [ ]、逗号 ,} 与反引号 ```\"}]\n```",
+            "{}",
+            " \r\n {} \n ",
+            "\u{feff}{}",
+            "```\n{}\n```",
+            "```json\r\n{}\r\n```",
+            "```JSON\n{\"0\":[\"括号 [ ]、逗号 ,} 与反引号 ```\"]}\n```",
         ] {
             assert!(
                 parse_model_output_batch(value).is_ok(),
@@ -1261,20 +1677,20 @@ mod tests {
         }
 
         for value in [
-            "说明：[]",
-            "[] 后记",
-            "{\"result\":[]}",
-            "[]\n[]",
-            "[{\"id\":0,\"translation\":\"译文\",}]",
-            "[{\"id\":0,\"translation\":\"译文\"},]",
-            "[// comment\n]",
-            "```yaml\n[]\n```",
-            "```json\n[]",
-            "```json\n[]```",
+            "说明：{}",
+            "{} 后记",
+            "{}\n{}",
+            "{\"0\":[\"译文\",]}",
+            "{\"0\":[\"译文\"] ,}",
+            "{// comment\n}",
+            "```yaml\n{}\n```",
+            "```json\n{}",
+            "```json\n{}```",
             "```json\n\n```",
-            "```json\n[]\n```\n后记",
-            "[{\"id\":0,\"translation\":\"截断",
-            "\u{feff}\u{feff}[]",
+            "```json\n{}\n```\n后记",
+            "{\"0\":[\"截断",
+            "\u{feff}\u{feff}{}",
+            "[]",
         ] {
             assert!(
                 parse_model_output_batch(value).is_err(),
@@ -1284,26 +1700,345 @@ mod tests {
     }
 
     #[test]
-    fn model_output_id_accepts_only_explicit_numeric_forms() {
-        let outputs = parse_model_output_batch(
-            r#"[{"id":0,"translation":"甲"},{"id":"001","translation":"乙"}]"#,
-        )
-        .expect("数字和 ASCII 十进制字符串 ID 都应合法");
+    fn model_output_id_accepts_only_canonical_object_keys() {
+        let outputs = parse_model_output_batch(r#"{"1":["甲"],"2":["乙"]}"#)
+            .expect("无前导零的 ASCII 十进制键应合法");
 
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0].id, ModelOutputId(0));
-        assert_eq!(outputs[1].id, ModelOutputId(1));
+        assert_eq!(outputs[0].id, "1");
+        assert_eq!(outputs[1].id, "2");
+        assert_eq!(parse_model_output_id("1"), Some(1));
+        for invalid in ["", "0", "01", "-1", "1.5", "true"] {
+            assert_eq!(parse_model_output_id(invalid), None);
+        }
+        assert_eq!(
+            parse_model_output_id("999999999999999999999999999999999999"),
+            None
+        );
     }
 
     #[tokio::test]
-    async fn response_processor_accepts_string_id_and_restores_original_control() {
+    async fn reflow_output_accepts_a_different_non_empty_line_count_as_one_unit() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        for expected_lines in [
+            vec!["今天天气真好。", "要不要一起去城里？"],
+            vec!["今天", "天气真好。", "要不要一起", "去城里？"],
+        ] {
+            let task = line_task(
+                dialogue_body_identity(),
+                ExpectedLineShape::Reflow,
+                line_content_analysis(&["今日はいい天気ですね。", "一緒に町へ", "行きませんか？"]),
+            );
+            let content = serde_json::to_string(&serde_json::json!({"1": &expected_lines}))
+                .expect("测试响应应可序列化");
+            let outcome = processor
+                .process(
+                    &task,
+                    LlmResponse::new(content, LlmFinishReason::Stop, None, None, None),
+                    1,
+                )
+                .await
+                .expect("自由断行应按一个语义单元验收");
+
+            assert!(matches!(outcome, TranslationTaskOutcome::Complete { .. }));
+            assert_eq!(
+                outcome.accepted()[0].translation(),
+                &TextUnitContent::Lines(expected_lines.into_iter().map(str::to_owned).collect())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reflow_blank_collections_reject_only_their_id() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let body = dialogue_body_identity();
+        let body_protected_text = match body.source_content() {
+            TextUnitContent::Lines(lines) => lines.join("\n"),
+            TextUnitContent::Value(_) => unreachable!("对话正文必须是完整行序列"),
+        };
+        let task = TranslationTaskBlock::new(
+            StandardTranslationTaskIndex::new(6),
+            LanguagePair::new(
+                LanguageId::parse("ja").expect("测试源语言合法"),
+                LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
+            ),
+            vec![
+                ChatMessage::new(ChatMessageRole::System, "# Contract"),
+                ChatMessage::new(ChatMessageRole::User, "# Task"),
+            ],
+            vec![
+                ExpectedTranslationOutput::new(
+                    1,
+                    body,
+                    Vec::new(),
+                    ExpectedTranslationValidation::new(
+                        ExpectedLineShape::Reflow,
+                        body_protected_text,
+                        Vec::new(),
+                        line_content_analysis(&[
+                            "今日はいい天気ですね。",
+                            "一緒に町へ",
+                            "行きませんか？",
+                        ]),
+                    ),
+                    state_context(6),
+                    Vec::new(),
+                ),
+                ExpectedTranslationOutput::new(
+                    2,
+                    speaker_identity(),
+                    Vec::new(),
+                    ExpectedTranslationValidation::new(
+                        ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                        "炎の剣",
+                        Vec::new(),
+                        japanese_analysis(),
+                    ),
+                    state_context(7),
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        for response in [
+            r#"{"1":[],"2":["爱丽丝"]}"#,
+            r#"{"1":["","   "],"2":["爱丽丝"]}"#,
+        ] {
+            let outcome = processor
+                .process(
+                    &task,
+                    LlmResponse::new(response, LlmFinishReason::Stop, None, None, None),
+                    1,
+                )
+                .await
+                .expect("自由断行的空集合应成为单 ID 正常拒绝");
+
+            assert!(matches!(outcome, TranslationTaskOutcome::Partial { .. }));
+            assert_eq!(outcome.accepted().len(), 1);
+            assert_eq!(outcome.accepted()[0].id(), 2);
+            assert_eq!(outcome.unresolved().len(), 1);
+            assert_eq!(outcome.unresolved()[0].id(), 1);
+            assert!(matches!(
+                outcome.unresolved()[0].reason(),
+                TranslationUnitRejectionReason::BlankTranslation
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn reflow_value_joins_model_lines_into_one_scalar_value() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let task = line_task(
+            reflow_value_identity(),
+            ExpectedLineShape::Reflow,
+            line_content_analysis(&["炎の剣。装備すると攻撃力が上がる。"]),
+        );
+        let outcome = processor
+            .process(
+                &task,
+                LlmResponse::new(
+                    r#"{"1":["炎之剑。","装备后可提升攻击力。"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("自由断行的标量字段应按一个值验收");
+
+        assert_eq!(
+            outcome.accepted()[0].translation(),
+            &TextUnitContent::Value("炎之剑。\n装备后可提升攻击力。".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn aligned_output_rejects_only_the_id_with_the_wrong_line_count() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let task = line_task(
+            choices_identity(),
+            ExpectedLineShape::Aligned(NonZeroUsize::new(2).expect("选项数非零")),
+            line_content_analysis(&["はい", "いいえ"]),
+        );
+        let outcome = processor
+            .process(
+                &task,
+                LlmResponse::new(
+                    r#"{"1":["是／否"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("行数不符是当前 ID 的正常拒绝");
+
+        assert!(matches!(
+            outcome.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::LineCountMismatch {
+                expected: 2,
+                actual: 1
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn single_line_speaker_rejects_multiple_array_elements() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let outcome = processor
+            .process(
+                &speaker_task(),
+                LlmResponse::new(
+                    r#"{"1":["爱丽","丝"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("姓名多行应成为当前 ID 的正常拒绝");
+
+        assert!(matches!(
+            outcome.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::LineCountMismatch {
+                expected: 1,
+                actual: 2
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn aligned_output_preserves_source_blank_slots() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let task = line_task(
+            scrolling_identity_with_blank_slot(),
+            ExpectedLineShape::Aligned(NonZeroUsize::new(3).expect("滚动文本行数非零")),
+            line_content_analysis(&["スタッフ", "", "アリス"]),
+        );
+
+        let accepted = processor
+            .process(
+                &task,
+                LlmResponse::new(
+                    r#"{"1":["制作人员","","爱丽丝"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("保留空槽位的对齐译文应通过");
+        assert_eq!(
+            accepted.accepted()[0].translation(),
+            &TextUnitContent::Lines(vec![
+                "制作人员".to_owned(),
+                String::new(),
+                "爱丽丝".to_owned(),
+            ])
+        );
+
+        for lines in [
+            r#"{"1":["制作人员","填充了空槽","爱丽丝"]}"#,
+            r#"{"1":["制作人员","   ","爱丽丝"]}"#,
+            r#"{"1":["","","爱丽丝"]}"#,
+        ] {
+            let rejected = processor
+                .process(
+                    &task,
+                    LlmResponse::new(lines, LlmFinishReason::Stop, None, None, None),
+                    1,
+                )
+                .await
+                .expect("空槽不对齐应成为当前 ID 的正常拒绝");
+            assert!(matches!(
+                rejected.unresolved()[0].reason(),
+                TranslationUnitRejectionReason::BlankLineMismatch { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn aligned_output_does_not_allow_placeholders_to_move_between_slots() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let group =
+            RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(4)]);
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventChoices,
+            group,
+            TextUnitRole::Choices,
+            TextUnitContent::Lines(vec!["\\N[1]に話す".to_owned(), "やめる".to_owned()]),
+            "{}",
+        );
+        let task = TranslationTaskBlock::new(
+            StandardTranslationTaskIndex::new(5),
+            LanguagePair::new(
+                LanguageId::parse("ja").expect("测试源语言合法"),
+                LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
+            ),
+            vec![
+                ChatMessage::new(ChatMessageRole::System, "# Contract"),
+                ChatMessage::new(ChatMessageRole::User, "# Task"),
+            ],
+            vec![ExpectedTranslationOutput::new(
+                1,
+                identity,
+                Vec::new(),
+                ExpectedTranslationValidation::new(
+                    ExpectedLineShape::Aligned(NonZeroUsize::new(2).expect("选项数非零")),
+                    "⟦ATT_ACTOR_NAME_WHOLE_0000⟧に話す\nやめる",
+                    vec![placeholder()],
+                    line_content_analysis(&["彼に話す", "やめる"]),
+                ),
+                state_context(5),
+                Vec::new(),
+            )],
+        );
+        let outcome = processor
+            .process(
+                &task,
+                LlmResponse::new(
+                    r#"{"1":["和他交谈","取消⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("占位符跨槽位应成为当前 ID 的正常拒绝");
+
+        assert!(matches!(
+            outcome.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::PlaceholderMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_processor_restores_original_control_in_a_mapped_id() {
         let processor =
             TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
         let result = processor
             .process(
                 &task_with_language_pair("ja", "zh-Hans", 1),
                 LlmResponse::new(
-                    r#"[{"id":"0","translation":"炎之剑\\N[1]！"}]"#,
+                    r#"{"1":["炎之剑\\N[1]！"]}"#,
                     LlmFinishReason::Stop,
                     Some("request-1".to_owned()),
                     Some("response-1".to_owned()),
@@ -1323,12 +2058,15 @@ mod tests {
             result.final_response_usage(),
             Some(LlmUsage::new(10, 5, 15))
         );
-        assert_eq!(result.accepted()[0].translation(), "炎之剑\\N[1]！");
+        assert_eq!(
+            result.accepted()[0].translation(),
+            &TextUnitContent::Value("炎之剑\\N[1]！".to_owned())
+        );
         assert_eq!(
             result.accepted()[0].propagation_targets(),
             &[super::super::standard::TranslationPropagationTarget::new(
                 propagation_target(),
-                state_context(101),
+                state_context(102),
             )]
         );
     }
@@ -1341,7 +2079,7 @@ mod tests {
             .process(
                 &task_with_language_pair("ja", "zh-Hans", 1),
                 LlmResponse::new(
-                    r#"[{"id":0,"translation":"炎之剑\\N[1]！"}]"#,
+                    r#"{"1":["炎之剑\\N[1]！"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     None,
@@ -1371,7 +2109,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    r#"[{"id":0,"translation":"炎\uFEFF之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
+                    r#"{"1":["炎\uFEFF之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-bom".to_owned()),
@@ -1390,7 +2128,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    r#"[{"id":0,"translation":" \r\n⟦ATT_ACTOR_NAME_WHOLE_0000⟧\r"}]"#,
+                    r#"{"1":["  ⟦ATT_ACTOR_NAME_WHOLE_0000⟧  "]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-natural".to_owned()),
@@ -1404,38 +2142,16 @@ mod tests {
             no_natural.unresolved()[0].reason(),
             TranslationUnitRejectionReason::NoNaturalLanguageText
         ));
-
-        let normalized = processor
-            .process(
-                &task(),
-                LlmResponse::new(
-                    r#"[{"id":0,"translation":"第一行\r\n第二行\r⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-normalized".to_owned()),
-                    None,
-                ),
-                1,
-            )
-            .await
-            .expect("通用换行正规化应成功");
-        assert_eq!(
-            normalized.accepted()[0].translation(),
-            "第一行\n第二行\n\\N[1]"
-        );
     }
 
     #[tokio::test]
-    async fn response_processor_rejects_control_characters_in_speaker_text() {
+    async fn response_processor_rejects_controls_embedded_in_any_returned_line() {
         let processor =
             TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
 
         for translation in ["炎之\r剑", "炎之\n剑", "炎之\0剑"] {
-            let content = serde_json::to_string(&serde_json::json!([{
-                "id": 0,
-                "translation": translation,
-            }]))
-            .expect("测试响应应可序列化");
+            let content = serde_json::to_string(&serde_json::json!({"1": [translation]}))
+                .expect("测试响应应可序列化");
             let result = processor
                 .process(
                     &speaker_task(),
@@ -1449,7 +2165,7 @@ mod tests {
                     1,
                 )
                 .await
-                .expect("非法 Speaker 内容应成为当前 ID 的正常拒绝");
+                .expect("行内控制字符应成为当前 ID 的正常拒绝");
 
             assert!(matches!(
                 &result,
@@ -1460,7 +2176,7 @@ mod tests {
             ));
             assert!(matches!(
                 result.unresolved()[0].reason(),
-                TranslationUnitRejectionReason::InvalidSpeakerText
+                TranslationUnitRejectionReason::InvalidLineText { line_index: 0 }
             ));
         }
     }
@@ -1536,6 +2252,25 @@ mod tests {
         assert!(validate_token_multiset("ATT 说明与 ⟦ATTENTION⟧", &[]).is_ok());
     }
 
+    #[test]
+    fn reflow_validation_allows_a_placeholder_to_move_between_lines() {
+        let module = japanese_module();
+        let restored = validate_and_restore_translation_lines(
+            vec![
+                "第一行".to_owned(),
+                "第二行⟦ATT_ACTOR_NAME_WHOLE_0000⟧".to_owned(),
+            ],
+            "⟦ATT_ACTOR_NAME_WHOLE_0000⟧と炎の剣",
+            ExpectedLineShape::Reflow,
+            &[placeholder()],
+            &japanese_analysis(),
+            module.as_ref(),
+        )
+        .expect("自由断行只约束整个单元的占位符集合");
+
+        assert_eq!(restored, ["第一行", "第二行\\N[1]"]);
+    }
+
     #[tokio::test]
     async fn unexpected_token_only_rejects_its_own_id() {
         let processor =
@@ -1544,10 +2279,10 @@ mod tests {
             .process(
                 &task_with_output_count(2),
                 LlmResponse::new(
-                    r#"[
-                        {"id":0,"translation":"甲⟦ATT_ACTOR_NAME_WHOLE_0000⟧"},
-                        {"id":1,"translation":"乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧⟦ATT_UNKNOWN_WHOLE_9999⟧"}
-                    ]"#,
+                    r#"{
+                        "1":["甲⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "2":["乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧⟦ATT_UNKNOWN_WHOLE_9999⟧"]
+                    }"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-unknown-token".to_owned()),
@@ -1560,9 +2295,9 @@ mod tests {
 
         assert!(matches!(&result, TranslationTaskOutcome::Partial { .. }));
         assert_eq!(result.accepted().len(), 1);
-        assert_eq!(result.accepted()[0].id(), 0);
+        assert_eq!(result.accepted()[0].id(), 1);
         assert_eq!(result.unresolved().len(), 1);
-        assert_eq!(result.unresolved()[0].id(), 1);
+        assert_eq!(result.unresolved()[0].id(), 2);
         assert!(matches!(
             result.unresolved()[0].reason(),
             TranslationUnitRejectionReason::UnexpectedPlaceholderToken { token }
@@ -1638,15 +2373,15 @@ mod tests {
             .process(
                 &task_with_output_count(6),
                 LlmResponse::new(
-                    r#"[
-                        {"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"},
-                        {"id":1,"translation":"甲⟦ATT_ACTOR_NAME_WHOLE_0000⟧"},
-                        {"id":"1","translation":"乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧"},
-                        {"id":3,"translation":""},
-                        {"id":4,"translation":"缺少控制符"},
-                        {"id":5,"translation":"译文です⟦ATT_ACTOR_NAME_WHOLE_0000⟧"},
-                        {"id":99,"translation":"未知"}
-                    ]"#,
+                    r#"{
+                        "1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "2":123,
+                        "2":["乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "4":[""],
+                        "5":["缺少控制符"],
+                        "6":["译文です⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "99":["未知"]
+                    }"#,
                     LlmFinishReason::Length,
                     Some("request-partial".to_owned()),
                     Some("response-partial".to_owned()),
@@ -1661,27 +2396,30 @@ mod tests {
         assert_eq!(result.attempts().get(), 2);
         assert_eq!(result.accepted().len(), 1);
         assert_eq!(result.unresolved().len(), 5);
-        assert_eq!(result.unresolved()[0].id(), 1);
+        assert_eq!(result.unresolved()[0].id(), 2);
         assert!(matches!(
             result.unresolved()[0].reason(),
             TranslationUnitRejectionReason::Duplicate
         ));
-        assert_eq!(result.unresolved()[1].id(), 2);
+        assert_eq!(result.unresolved()[1].id(), 3);
         assert!(matches!(
             result.unresolved()[1].reason(),
             TranslationUnitRejectionReason::Missing
         ));
-        assert_eq!(result.unresolved()[2].id(), 3);
+        assert_eq!(result.unresolved()[2].id(), 4);
         assert!(matches!(
             result.unresolved()[2].reason(),
-            TranslationUnitRejectionReason::BlankTranslation
+            TranslationUnitRejectionReason::BlankLineMismatch {
+                line_index: 0,
+                expected_blank: false
+            }
         ));
-        assert_eq!(result.unresolved()[3].id(), 4);
+        assert_eq!(result.unresolved()[3].id(), 5);
         assert!(matches!(
             result.unresolved()[3].reason(),
             TranslationUnitRejectionReason::PlaceholderMismatch { .. }
         ));
-        assert_eq!(result.unresolved()[4].id(), 5);
+        assert_eq!(result.unresolved()[4].id(), 6);
         assert!(matches!(
             result.unresolved()[4].reason(),
             TranslationUnitRejectionReason::SourceResidual { .. }
@@ -1698,60 +2436,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_schema_errors_reject_the_entire_batch() {
+    async fn invalid_ids_and_per_id_shapes_do_not_discard_valid_ids() {
         let processor =
             TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
-        for invalid_item in [
-            r#""不是对象""#,
-            r#"{"translation":"无 ID"}"#,
-            r#"{"id":"bad","translation":"非法 ID"}"#,
-            r#"{"id":"","translation":"空 ID"}"#,
-            r#"{"id":-1,"translation":"负数 ID"}"#,
-            r#"{"id":1.5,"translation":"浮点 ID"}"#,
-            r#"{"id":true,"translation":"布尔 ID"}"#,
-            r#"{"id":"999999999999999999999999999999999999","translation":"溢出 ID"}"#,
-            r#"{"id":1}"#,
-            r#"{"id":1,"translation":123}"#,
-            r#"{"id":1,"translation":"未知字段","extra":true}"#,
-            r#"{"id":1,"id":2,"translation":"重复 ID 字段"}"#,
-            r#"{"id":1,"translation":"甲","translation":"重复译文字段"}"#,
-        ] {
-            let content = format!(
-                r#"[{{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}},{invalid_item}]"#
-            );
-            let result = processor
-                .process(
-                    &task_with_output_count(2),
-                    LlmResponse::new(
-                        content,
-                        LlmFinishReason::Stop,
-                        None,
-                        Some("response-schema".to_owned()),
-                        None,
-                    ),
-                    1,
-                )
-                .await
-                .expect("模型结构错误应成为正常不可用结果");
+        let result = processor
+            .process(
+                &task_with_output_count(2),
+                LlmResponse::new(
+                    r#"{
+                        "1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"],
+                        "bad":["非法 ID"],
+                        "2":[123],
+                        "99":["未知 ID"]
+                    }"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-schema".to_owned()),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("单项协议错误应成为可持久的部分结果");
 
-            assert!(matches!(
-                &result,
-                TranslationTaskOutcome::Unavailable {
-                    reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
-                    ..
-                }
-            ));
-            assert!(result.accepted().is_empty());
-            assert_eq!(result.unresolved().len(), 2);
-            assert!(result.unresolved().iter().all(|unit| matches!(
-                unit.reason(),
-                TranslationUnitRejectionReason::InvalidShape { .. }
-            )));
-            assert!(matches!(
-                result.diagnostics(),
-                [TranslationProtocolDiagnostic::InvalidResponse { .. }]
-            ));
-        }
+        assert!(matches!(&result, TranslationTaskOutcome::Partial { .. }));
+        assert_eq!(result.accepted().len(), 1);
+        assert_eq!(result.accepted()[0].id(), 1);
+        assert_eq!(result.unresolved().len(), 1);
+        assert_eq!(result.unresolved()[0].id(), 2);
+        assert!(matches!(
+            result.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::InvalidShape { .. }
+        ));
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::InvalidId { .. }
+        )));
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::UnknownId { id: 99, .. }
+        )));
     }
 
     #[tokio::test]
@@ -1792,7 +2516,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    r#"[{"id":0,"translation":""}]"#,
+                    r#"{"1":[""]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-rejected".to_owned()),
@@ -1811,7 +2535,10 @@ mod tests {
         ));
         assert!(matches!(
             all_rejected.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::BlankTranslation
+            TranslationUnitRejectionReason::BlankLineMismatch {
+                line_index: 0,
+                expected_blank: false
+            }
         ));
     }
 
@@ -1823,7 +2550,7 @@ mod tests {
             .process(
                 &task(),
                 LlmResponse::new(
-                    "[]",
+                    "{}",
                     LlmFinishReason::Stop,
                     None,
                     Some("response-cpu".to_owned()),
@@ -1850,7 +2577,7 @@ mod tests {
             .process(
                 &task_with_language_pair("en", "zh-Hant", 1),
                 LlmResponse::new(
-                    r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
+                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-language".to_owned()),
@@ -1871,7 +2598,7 @@ mod tests {
                 .process(
                     &task_with_language_pair("ja", "zh-Hans", 1),
                     LlmResponse::new(
-                        r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
+                        r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                         LlmFinishReason::Stop,
                         None,
                         Some("response-mismatch".to_owned()),
@@ -1890,7 +2617,7 @@ mod tests {
             .process(
                 &task_with_output_count(0),
                 LlmResponse::new(
-                    "[]",
+                    "{}",
                     LlmFinishReason::Stop,
                     None,
                     Some("response-invariant".to_owned()),
@@ -1974,7 +2701,7 @@ mod tests {
                         retry_after: Some(Duration::from_millis(50)),
                     }),
                     Ok(LlmResponse::new(
-                        r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
+                        r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                         LlmFinishReason::Stop,
                         None,
                         Some("response-retry".to_owned()),
@@ -2004,7 +2731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_never_retries_invalid_response_schema() {
+    async fn executor_never_retries_a_per_id_shape_rejection() {
         let waits = Arc::new(Mutex::new(Vec::new()));
         let messages = Arc::new(Mutex::new(Vec::new()));
         let service = RpgMakerStandardTranslationTaskExecutionService::<
@@ -2016,14 +2743,14 @@ mod tests {
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([
                     Ok(LlmResponse::new(
-                        r#"[{"id":0,"translation":123}]"#,
+                        r#"{"1":123}"#,
                         LlmFinishReason::Stop,
                         None,
                         Some("response-invalid-shape".to_owned()),
                         None,
                     )),
                     Ok(LlmResponse::new(
-                        r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
+                        r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                         LlmFinishReason::Stop,
                         None,
                         Some("response-unused".to_owned()),
@@ -2044,7 +2771,7 @@ mod tests {
         assert!(matches!(
             &outcome,
             TranslationTaskOutcome::Unavailable {
-                reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
+                reason: TranslationTaskUnavailableReason::AllOutputsRejected,
                 ..
             }
         ));
@@ -2169,7 +2896,7 @@ mod tests {
         >::new(
             FakeLlm {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
-                    r#"[{"id":0,"translation":"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"}]"#,
+                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-send".to_owned()),

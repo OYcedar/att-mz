@@ -19,8 +19,8 @@ canonical JSON。文件严格解析和资源解析全部成功后，Standard 才
 结果，技术错误才阻止后续阶段。
 
 项目开启时必须确认冻结来源、每个活动 owner 的来源指纹和资产快照指纹。翻译只读取
-`standard_text_group/leaf`；译文按逻辑身份写回 `standard_text_leaf`，不以物理 JSON
-地址寻址。
+`standard_text_group/unit`；译文按语义单元身份写回 `standard_text_unit`，不以物理
+JSON 地址寻址。
 
 ## 2. Terminology TOML
 
@@ -74,7 +74,7 @@ rule = []
 完整匹配与捕获必须有序、位于原字符串内并对齐 UTF-8 边界，`text` 还必须完整位于
 对应匹配内。不接受 `label`、`translate`、`"all"` 或其他命名捕获。
 
-自定义规则零命中合法。Builtin 与 Custom、Custom 与 Custom 的任何跨度重叠都使本叶
+自定义规则零命中合法。Builtin 与 Custom、Custom 与 Custom 的任何跨度重叠都使本单元
 规划失败，不按顺序切割，也没有优先级。`rule = []` 只清除自定义规则；固定 RPG Maker
 控制符保护继续生效。
 
@@ -96,34 +96,90 @@ Profile 拥有 planning、request、任务并发及所选 Client；Prompt 与源
 语义，Lua 不取得 Standard 的 planning、request 或任务并发策略。
 
 Prompt 内容、语言策略、术语、占位符和相关翻译事实共同进入 translation state；这些
-事实未变且叶仍 Current 时不请求模型。
+事实未变且语义单元仍 Current 时不请求模型。
 
 ## 5. 自然顺序、上下文与去重
 
-Planner 按稳定 RPG Maker 来源顺序读取活动 owner，再按组与角色组织逻辑叶：
+Planner 按稳定 RPG Maker 来源顺序读取活动 owner，再按组与角色组织语义单元：
 
 ```text
-DialogueSpeaker → DialogueBody(0) → DialogueBody(1) → ...
+DialogueSpeaker → DialogueBody
+Choices
+ScrollingText
+Scalar
 ```
 
-一个 Dialogue Group 永不跨 TaskBlock 拆分。正文按原始 `body[n]` 硬边界保留；选择项、
-滚动文本和标量使用各自稳定角色顺序。并发准备只改变完成时间，不改变顺序、代表叶、
-任务 ID 或提交顺序。
+一个完整语义组永不跨 TaskBlock 拆分。`101 + 401*` 的全部正文、一个 `102` 的全部选项
+以及 `105 + 405*` 的全部滚动文本分别形成一个单元；原物理行索引只属于写回 recipe。
+五类单元可以进入同一 TaskBlock。并发准备只改变完成时间，不改变顺序、代表单元、任务
+ID 或提交顺序。
 
-Speaker 与 Body 不互相去重。相同 Speaker 可以跨对话组复用；Body 的去重与 translation
-state 包含该组源 Speaker 原文上下文，因此同一句正文在不同说话人下不是同一翻译事实。
-recipe 中的 Literal/SpeakerSlot 外壳不属于翻译语义：仅外壳变化且逻辑原文与上下文
+Speaker 与 Body 不互相去重。Speaker 按完整源值全局精确复用；Body 的去重与 translation
+state 包含完整有序正文和该组源 Speaker 原文上下文，因此同一句正文在不同说话人下
+不是同一翻译事实。Choices 不跨 group 去重；ScrollingText 按完整有序行序列去重；
+Scalar 按来源语义域与字段角色去重，例如数据库文件类型加字段键，不能把所有 `name`
+混为一类。
+recipe 中的 Literal/SpeakerSlot 外壳不属于翻译语义：仅外壳变化且语义内容与上下文
 不变时可以继承译文。
 
 去重只接受当前项目、当前语言对中完全相同的受信翻译输入；不 trim、不折叠大小写、
-不做 Unicode 模糊匹配。哈希只作索引，最终仍以类型相等确认。重复叶使用自然顺序中
-最早的代表，验收后把同一译文传播到完整等价集合。
+不做 Unicode 或换行边界模糊匹配。哈希只作索引，最终仍以类型相等确认。重复单元使用
+自然顺序中最早的代表，其他传播目标不发送给模型；已有一个有效译文时直接复用，验收
+后把完整译文原子传播到等价集合；多个有效译文互相冲突时显式失败。
 
 ## 6. 任务规划与模型协议
 
 Planner 先保持最大相关组，再按 Profile 的完整 messages 字符预算切分 TaskBlock；单个
-语义组超过预算时明确失败，不切碎逻辑原子。每个可翻译叶获得稳定任务内 ID，System
-Prompt、上下文、术语和受保护文本共同形成 user message。
+语义组超过预算时明确失败，不切碎逻辑原子。每个活动语义单元获得从 `1` 连续编号的
+任务内 ID。TaskBlock 只保留任务身份、语言对、messages 和权威 ExpectedOutputs。容量
+以最终 system message 与最小 user message 的实际字符数计算。
+
+user message 使用最小 Markdown，只发送命中术语、活动 ID、自然语言角色、必要形状约束
+和直接有用的无编号上下文。语言对、路径、owner、内部 kind、去重原因、空区域和内部
+数据模型都不属于消息内容。已有或复用译文作为上下文时优先显示目标译文；没有译文时显示
+源文；Speaker 可作为活动正文的语境，数据库名称可作为同一条目说明的语境。传播目标、
+与活动单元无直接关系的虚项和纯虚组完全省略。术语只在本请求活动原文命中时出现，零命中
+时不生成术语区。Prompt 由外部提供，本规格只要求 Prompt 作者明确：只翻译带 ID 内容、
+无 ID 内容只作语境、ID 恰好返回一次、遵守当前返回 wire、区分自由断行与严格对齐、
+精确保留 ATT token，并禁止解释文字。
+
+同一 user message 可以直接混合五种角色，例如：
+
+```markdown
+术语：
+
+- 町 → 城里
+
+## 对话
+
+说话人 [1]（单行）：アリス
+
+正文 [2]（自由断行）：
+
+> 今日はいい天気ですね。
+> 一緒に町へ行きませんか？
+
+## 选项
+
+选项 [3]（2 项，逐项对应）：
+
+> はい
+> いいえ
+
+## 滚动文本
+
+滚动文本 [4]（2 行，逐行对应）：
+
+> 第一章
+> はじまり
+
+## 数据库文本
+
+简介 [5]（自由断行）：
+
+> 王都で暮らす冒険者。
+> 新たな旅に出る。
+```
 
 公共 LLM 根固定提交 `model`、`messages` 和 `stream=false`，并透传 Client 的其他受信
 JSON parameters。网络重试只按 Profile 的明确延迟和 `Retry-After` 上限执行；协议失败
@@ -149,16 +205,41 @@ TaskBlock。HTTP 完成后，结果立即进入命令私有 CPU 根进行无副�
 未提交。取消排空中出现的技术错误优先于取消。并发只改变完成时间，不改变提交、报告
 或终态审计顺序。
 
-响应只接受一个可完整消费的 JSON 数组信封，可有首尾空白、至多一个开头 BOM，以及
-恰好包裹全部 JSON 的单层无标记或 `json` 围栏。不搜索说明文字中的数组，不修复尾逗号、
-注释、引号、ID 或译文。结构失败使整批 `Unavailable(ModelResponseUnusable)`；结构
-成立后，单个 ID 的缺失、重复、未知、空白、无自然语言、源文残留或占位符错误只拒绝
-该 ID，其他结果仍可形成 `Partial`。
+上述消息的合法响应可以是：
 
-译后处理固定执行：结构与空白检查、已知控制符归一为 token、严格校验 token 多重集、
-投影目标语言文本、源语残留检查、可选安全语言修复、恢复保护片段，并确认没有 ATT
-保留前缀残留。DialogueSpeaker 还拒绝包含 CR、LF 或 NUL 的译文，避免把多行或非法
-字符串写入姓名框。模型输出不会修改原文、物理目标或 recipe。
+```json
+{
+  "1": ["爱丽丝"],
+  "2": ["今天天气真好。", "要不要一起去城里？"],
+  "3": ["是", "否"],
+  "4": ["第一章", "开始"],
+  "5": ["生活在王都的冒险者。", "正在踏上新的旅程。"]
+}
+```
+
+响应只接受一个可完整消费的 ID 到字符串数组的 JSON 对象。允许首尾空白、至多一个
+开头 BOM，以及恰好包裹全部 JSON 的单层无标记或 `json` 围栏；不搜索说明文字，不修复
+JSON、ID 或译文。顶层只能包含任务 ID；key 必须是规范正十进制形式，每个值都必须是
+字符串数组。
+
+权威输出形状只有 `Reflow` 与 `Aligned(N)`，由 ATT 根据角色建立，模型不能返回或修改。
+DialogueBody 使用 `Reflow`；允许自由断行的 Scalar 仅为 `Actors.profile`、
+`Skills.description`、`Items.description`、`Weapons.description` 与
+`Armors.description`。Speaker、姓名和其他 Scalar 使用 `Aligned(1)`；Choices 与
+ScrollingText 使用 `Aligned(N)`。数组元素不得包含 CR、LF 或 NUL。`Reflow` 允许显式
+空行但不能是空数组或全空白；`Aligned` 的非空源槽不得返回空白，源空槽必须返回空字符串。
+验收后，源内容为 Value 的 Reflow 结果以 `\n` 连接为一个 Value；源内容为 Lines 的结果
+保持数组元素边界。
+
+JSON 语法、顶层类型或协议外信封错误使整批
+`Unavailable(ModelResponseUnusable)`。缺失、重复、未知或非法 ID，错误值类型、行数
+不符、非法行、空白、无自然语言、源文残留或占位符错误只拒绝对应 ID，其他结果仍可
+形成 `Partial`。`Reflow` 对完整连接后的语义文本执行 token、语言与占位符验收，允许
+token 跨原物理行移动；`Aligned` 逐槽验收，禁止 token 跨槽移动，包括从一个选项移动到
+另一个选项。一个严格对齐 ID 整体成功或整体拒绝。
+
+每个 ID 只产生一个原子 Translation Decision；同一任务的来源、状态条件或任一传播目标
+在提交前发生漂移时，整笔任务事务回滚，不留下部分传播。
 
 ## 7. 原子验收与持久化
 
@@ -168,19 +249,21 @@ Result Store 的 Planner 准备事务一次确认：
 - metadata 来源指纹；
 - 所有 owner 的来源与资产快照指纹；
 - 本次术语和占位符 canonical JSON；
-- 每个需要失效或复用的逻辑叶之 owner、group、role、原文、上下文，以及预期旧译文与
+- 每个需要失效或复用的语义单元之 owner、group、role、完整源内容、上下文，以及预期旧译文与
   state 同时精确匹配或预期二者均为空。
 
-上述逐叶只读条件按自然顺序批量校验，失效清理、复用写入与资源更新仍在同一准备事务中。
-HTTP 验收结果随后由 Result Store 的 `prepare_commit` 在 CPU 根中校验重复叶、传播原文
-与上下文并编码为只读提交产物，不做 SQLite I/O。顺序 finalizer 调用 `commit_prepared`，
-用一条条件 UPDATE 只 prepare 一次，再按自然顺序处理全部合格叶；每组条件同时确认
-owner、逻辑 group、role、原文、上下文以及译文和 state 仍为空，并且必须恰好修改一行。
+上述只读条件按自然顺序批量校验，失效清理、复用写入与资源更新仍在同一准备事务中。
+HTTP 验收结果随后由 Result Store 的 `prepare_commit` 在 CPU 根中校验重复单元、传播完整
+内容与上下文并编码为只读提交产物，不做 SQLite I/O。顺序 finalizer 调用
+`commit_prepared`，用一条条件 UPDATE 只 prepare 一次，再按自然顺序处理全部合格单元；
+每组条件同时确认 owner、逻辑 group、role、完整源内容、上下文以及译文和 state 仍为空，
+并且必须恰好修改一行。
 任一条件失效都回滚该任务的整笔事务。
 
 单个任务不会留下半提交；已经确认的前序任务不因后续 `Partial`、`Unavailable`、技术
 错误或取消而回滚。任务终态审计记录 accepted、unresolved、协议诊断及
-`confirmed_written_leaves`；位置均为逻辑组与字段角色，计数明确表示逻辑叶。
+`confirmed_written_units`；位置均为逻辑组与单元角色，计数明确表示语义单元，而不是模型
+返回行数或写回后的物理命令数。
 
 ## 8. Translate Lua 与完成结果
 
@@ -190,6 +273,6 @@ Translate Lua 获得公共 `ctx.project/json/source/rpg_maker/db`、阶段专属
 `ctx.llm` 复用本次 Client。可信脚本仍可通过 `ctx.db` 实现游戏专用协议；RPG Maker
 文档能力的唯一门面是 `ctx.rpg_maker`。
 
-成功输出报告任务、写入和剩余逻辑叶摘要；`Partial` 或 `Unavailable` 不冒充全部翻译
+成功输出报告任务、写入和剩余语义单元摘要；`Partial` 或 `Unavailable` 不冒充全部翻译
 完成，也不升级为退出码 1。合作取消完成受控收尾后返回 130；配置、输入、技术、审计
 或 shutdown 失败返回 1。
