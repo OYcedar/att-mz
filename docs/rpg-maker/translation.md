@@ -1,7 +1,8 @@
 # RPG Maker 翻译现行规格
 
-MZ 与 MV 共用唯一的翻译 Profile、Prompt、资源、Planner、LLM 执行和 SQLite 提交能力。
-引擎只决定项目位置和审计中的 `engine`，不会改变翻译协议。
+RPG Maker 领域当前只支持 MZ 与 MV；两者共用唯一的翻译 Profile、Prompt、资源、
+Planner、LLM 执行和 SQLite 提交能力。域内版本只决定项目位置和审计中的 `engine`，
+不会改变翻译协议。
 
 ## 1. 命令与资源选择
 
@@ -23,6 +24,9 @@ canonical JSON。文件严格解析和资源解析全部成功后，Standard 才
 JSON 地址寻址。
 
 ## 2. Terminology TOML
+
+如何从 MV/MZ 结构化字段和上下文提炼术语，而不把术语表做成字段全集镜像，见
+[术语表制作指南](terminology.md)。
 
 ```toml
 [[term]]
@@ -54,6 +58,9 @@ term = []
 
 ## 3. Placeholder TOML
 
+如何区分提取目标与保护协议、选择 scope 并验证正反样本，见
+[规则编写指南](rules.md#6-placeholder-rules)。
+
 ```toml
 [[rule]]
 pattern = '\\SE\[[^]]+\]'
@@ -74,11 +81,26 @@ rule = []
 完整匹配与捕获必须有序、位于原字符串内并对齐 UTF-8 边界，`text` 还必须完整位于
 对应匹配内。不接受 `label`、`translate`、`"all"` 或其他命名捕获。
 
+`scopes` 只接受以下当前值：
+
+```text
+database_entry
+system
+map
+event_dialogue
+event_choices
+event_scrolling_text
+event_command
+plugin_parameter
+```
+
+列表中的值精确匹配，不存在别名或父级 scope；同一条规则内不能重复声明 scope。
+
 自定义规则零命中合法。Builtin 与 Custom、Custom 与 Custom 的任何跨度重叠都使本单元
 规划失败，不按顺序切割，也没有优先级。`rule = []` 只清除自定义规则；固定 RPG Maker
 控制符保护继续生效。
 
-三类人写 TOML（Extract Rules、Terminology、Placeholder）都严格拒绝未知与重复字段，
+三类人工编写的 TOML（Extract Rules、Terminology、Placeholder）都严格拒绝未知与重复字段，
 在边界建立受信类型。术语和自定义占位符随后编码为内部 canonical JSON 持久化。
 
 ## 4. Profile、Prompt 与共享语言能力
@@ -145,40 +167,42 @@ user message 使用最小 Markdown，只发送命中术语、活动 ID、自然�
 
 同一 user message 可以直接混合五种角色，例如：
 
+以下内容是人工构造的协议示例，不来自游戏材料或验证样本。
+
 ```markdown
 术语：
 
-- 町 → 城里
+- 星港 → 星港
 
 ## 对话
 
-说话人 [1]（单行）：アリス
+说话人 [1]（单行）：ミレア
 
 正文 [2]（自由断行）：
 
-> 今日はいい天気ですね。
-> 一緒に町へ行きませんか？
+> 潮風が強くなってきました。
+> 灯台へ戻りましょう。
 
 ## 选项
 
 选项 [3]（2 项，逐项对应）：
 
-> はい
-> いいえ
+> 戻る
+> 進む
 
 ## 滚动文本
 
 滚动文本 [4]（2 行，逐行对应）：
 
-> 第一章
-> はじまり
+> 航海記
+> 第三夜
 
 ## 数据库文本
 
 简介 [5]（自由断行）：
 
-> 王都で暮らす冒険者。
-> 新たな旅に出る。
+> 星を読む航海士。
+> 古い灯台を守っている。
 ```
 
 公共 LLM 根固定提交 `model`、`messages` 和 `stream=false`，并透传 Client 的其他受信
@@ -209,11 +233,11 @@ TaskBlock。HTTP 完成后，结果立即进入命令私有 CPU 根进行无副�
 
 ```json
 {
-  "1": ["爱丽丝"],
-  "2": ["今天天气真好。", "要不要一起去城里？"],
-  "3": ["是", "否"],
-  "4": ["第一章", "开始"],
-  "5": ["生活在王都的冒险者。", "正在踏上新的旅程。"]
+  "1": ["米蕾娅"],
+  "2": ["海风越来越强了。", "我们回灯塔吧。"],
+  "3": ["返回", "前进"],
+  "4": ["航海记", "第三夜"],
+  "5": ["能够解读星象的航海士。", "守护着一座古老的灯塔。"]
 }
 ```
 
@@ -232,11 +256,12 @@ ScrollingText 使用 `Aligned(N)`。数组元素不得包含 CR、LF 或 NUL。`
 保持数组元素边界。
 
 JSON 语法、顶层类型或协议外信封错误使整批
-`Unavailable(ModelResponseUnusable)`。缺失、重复、未知或非法 ID，错误值类型、行数
-不符、非法行、空白、无自然语言、源文残留或占位符错误只拒绝对应 ID，其他结果仍可
-形成 `Partial`。`Reflow` 对完整连接后的语义文本执行 token、语言与占位符验收，允许
-token 跨原物理行移动；`Aligned` 逐槽验收，禁止 token 跨槽移动，包括从一个选项移动到
-另一个选项。一个严格对齐 ID 整体成功或整体拒绝。
+`Unavailable(ModelResponseUnusable)`。某个预期 ID 缺失、重复，或其值类型、行数、行内容、
+自然语言、源文残留或占位符验收失败时，该预期输出保持未解决；其他合格输出仍可形成
+`Partial`。响应中未知或非法的额外键只产生协议诊断并被忽略；只要全部预期 ID 都合格，
+任务仍可为 `Complete`。`Reflow` 对完整连接后的语义文本执行 token、语言与占位符验收，
+允许 token 跨原物理行移动；`Aligned` 逐槽验收，禁止 token 跨槽移动，包括从一个选项
+移动到另一个选项。一个严格对齐 ID 整体成功或整体拒绝。
 
 每个 ID 只产生一个原子 Translation Decision；同一任务的来源、状态条件或任一传播目标
 在提交前发生漂移时，整笔任务事务回滚，不留下部分传播。

@@ -1,30 +1,40 @@
 # RPG Maker 项目初始化现行规格
 
-Init 是 MZ 与 MV 命名工作区的状态收敛命令。两个引擎使用同一套项目、数据库、来源
-指纹与发布能力；引擎切片只负责确认游戏目录布局，并把已经验证的内容根交给共享实现。
+RPG Maker 是本规格所属领域，ATT 当前只支持 MZ 与 MV。Init 是两个受支持版本命名
+工作区的状态收敛命令；它们使用同一套项目、数据库、来源指纹与发布能力，版本切片只
+负责确认游戏目录布局，并把已经验证的内容根交给共享实现。
 
 ## 1. 命令与游戏目录
 
 ```text
-att --config FILE mz init --name NAME --path GAME_ROOT ...
-att --config FILE mv init --name NAME --path GAME_ROOT ...
+att --config FILE mz init --name NAME --path GAME_ROOT \
+  [--source-language LANG] [--target-language LANG] \
+  [--dialogue-max-fullwidth-chars COUNT] \
+  [--scrolling-text-max-fullwidth-chars COUNT] \
+  [--help-description-max-fullwidth-chars COUNT]
+
+att --config FILE mv init --name NAME --path GAME_ROOT \
+  [--source-language LANG] [--target-language LANG] \
+  [--dialogue-max-fullwidth-chars COUNT] \
+  [--scrolling-text-max-fullwidth-chars COUNT] \
+  [--help-description-max-fullwidth-chars COUNT]
 ```
 
 - MZ 的 `GAME_ROOT` 必须直接包含普通 `data/`、`js/` 和 `js/rmmz_core.js`；
 - MV 的 `GAME_ROOT` 必须直接包含普通 `www/`，且其中包含 `data/`、`js/` 和
   `js/rpg_core.js`；
-- 两者都只接受游戏根，不探测另一种引擎，也不把传入的 `www` 自动修正为 MV 游戏根；
+- 两者都只接受游戏根，不探测另一种受支持布局，也不把传入的 `www` 自动修正为 MV 游戏根；
 - 项目名和游戏根始终必填。源语言、目标语言及三个布局宽度在首次创建时全部必填；
   已有项目省略单项表示复用数据库中的当前事实。
 
-项目按引擎分开定位，因此同名项目可以共存：
+项目按版本身份分开定位，因此同名项目可以共存：
 
 ```text
 <projects.root>/mz/<name>/
 <projects.root>/mv/<name>/
 ```
 
-工作区完整保留对应引擎的相对布局：
+工作区完整保留对应版本的相对布局：
 
 ```text
 MZ                              MV
@@ -38,7 +48,7 @@ MZ                              MV
 
 ## 2. 收敛、租约与来源指纹
 
-`run_started` 持久化后，命令先取得对应引擎与项目名的租约，再观测工作区。目标不存在
+`run_started` 持久化后，命令先取得对应版本身份与项目名的租约，再观测工作区。目标不存在
 时建立完整项目；目标存在时，`project.db` 必须属于同名项目并严格符合当前 schema，
 否则作为无效项目数据库失败。
 
@@ -50,7 +60,7 @@ reparse point、hardlink、名称碰撞、读取中对象身份变化和资源�
 
 若现有工作区、来源、语言与布局全部一致，Init 直接返回 `Unchanged`，不建立候选，
 也不清空既有输出。任何真实变化或可判定结构修复都在一个未发布候选内完成，并把
-`write_back` 重建为空的对应引擎布局；候选只发布一次。
+`write_back` 重建为空的对应版本布局；候选只发布一次。
 
 ## 3. 当前项目数据库
 
@@ -82,7 +92,7 @@ Init 不直接修改可见工作区。创建、更新或修复都在候选中完
 锁顺序固定为：
 
 ```text
-项目租约 → 对应引擎的目录发布锁 → SQLite
+项目租约 → 对应版本的目录发布锁 → SQLite
 ```
 
 锁分别位于 `<projects.root>/.att-locks/projects/<engine>/` 和

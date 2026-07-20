@@ -1,8 +1,8 @@
 # RPG Maker 写回现行规格
 
 WriteBack 从冻结来源重建一次完整候选，把所有活动 owner 的已确认译文应用到候选，
-可选执行可信 Lua，验证后只发布一次。MZ 与 MV 共用读取、修改、排版、复核和发布流程；
-差异只有工作区相对布局。
+可选执行可信 Lua，验证后只发布一次。RPG Maker 领域当前只支持 MZ 与 MV；两者共用
+读取、修改、排版、复核和发布流程，差异只有工作区相对布局。
 
 ## 1. 命令与候选布局
 
@@ -19,7 +19,7 @@ MV candidate/www/data + candidate/www/js
 ```
 
 命令先取得 `<projects.root>/.att-locks/projects/<engine>/` 中的项目租约，打开
-`<projects.root>/<engine>/<name>`，验证冻结来源指纹，再准备对应引擎的目录发布候选。
+`<projects.root>/<engine>/<name>`，验证冻结来源指纹，再准备对应版本的目录发布候选。
 任何失败发生在 publish 之前时都显式 discard 候选；publish 已开始后等待唯一明确终态。
 
 ## 2. 读取与发布前不变量
@@ -91,7 +91,8 @@ ScrollingText 的块级 mutation 覆盖完整 `105 + 405*`。模型必须返回�
 
 模型提供的未超宽行逐字保持，不合并、不重排，也不因引号状态补缩进。只有 ATT 自动
 生成的续行可以增加全角缩进；`inserted_line_breaks` 只统计这类新增物理换行。没有安全
-断点时返回 Manual 诊断，不硬切单词或 grapheme。
+断点时返回 `Manual` 诊断，不硬切单词或 grapheme；这仍是正常写回结果，ATT 会写入当前
+有效译文而不添加强制换行，并把该项计入人工处理数量，命令本身可以成功。
 
 ## 5. Lua 候选能力
 
@@ -100,8 +101,10 @@ ScrollingText 的块级 mutation 覆盖完整 `105 + 405*`。模型必须返回�
 `ctx.write_back.layout` 复用 Rust 布局器。
 
 Lua 使用逻辑 `data/...` 与 `js/...` 访问候选；MV Host 在边界映射到候选的 `www/`，MZ
-直接映射到顶层。脚本不能取得 publish 能力，只能修改本次未发布候选。Lua 显式提交的
-数据库事务不随 candidate discard 回滚，因此脚本必须自己拥有这类副作用的协议。
+直接映射到顶层。`ctx` 不提供受管的 validate、discard 或 publish 接口；通过 `ctx.output`
+进行的编辑只作用于本次未发布候选。可信 Lua 仍有完整标准库，直接执行文件系统或进程
+操作不属于 ATT 的候选发布契约。Lua 显式提交的数据库事务不随 candidate discard 回滚，
+因此脚本必须自己拥有这类副作用的协议。
 
 ## 6. 顶层验证与强审计发布
 
@@ -119,7 +122,7 @@ target 的字段和未知命令字段保持来源值。未改写文件从来源�
 publish 前先持久化 `write_back_publish_started`；只有意图确认后才调用 publisher。
 终态写入 `write_back_publish_finished`，包含 `engine`、实际布局、输出根、语义单元摘要、
 布局诊断和 `lua_executed`。发布已生效但终态审计失败时不回滚输出，而是报告“状态已
-生效但审计未确认”。
+生效但收尾失败”。
 
 目录交换未生效且 publisher 已确认 `NotPublished` 时，顶层报告项目暂时不可用；它不
 表示数据库损坏或提取过期。已经生效、需要恢复或结果未知的终态继续分别保留其更强的

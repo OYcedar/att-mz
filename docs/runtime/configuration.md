@@ -1,4 +1,7 @@
-# ATT 生产配置规格
+# ATT 生产配置现行规格
+
+根据当前命令寻找需要填写的分区、理解路径基准并校准资源值，见
+[配置编写与运行能力导航](README.md)。
 
 ## 1. 配置读取、选择与解析阶段
 
@@ -73,7 +76,7 @@ Translate 必须解析并验证全部 `[[languages]]` 条目，因此任一非�
 反序列化或额外物化为秘密值，也不会进入受信配置、Debug、错误链或输出。
 
 四个 `ConfiguredRpgMakerCommand` 变体分别把命令输入与相应受信配置绑定，外层
-`ConfiguredProductCommand` 绑定引擎布局；不能把 Translate
+`ConfiguredProductCommand` 绑定 RPG Maker 版本布局；不能把 Translate
 配置交给 Init。业务模块不读取配置文件，也不重新解释配置字段。
 
 ## 3. 根资源配置与路径
@@ -164,7 +167,7 @@ parameters = '''{}'''
 
 ## 6. 共享语言目录与 RPG Maker Prompt
 
-翻译语言能力属于跨引擎共享配置，使用顶层 `[[languages]]`：
+翻译语言能力属于进程级共享配置，不归属于 MV 或 MZ 任一版本，使用顶层 `[[languages]]`：
 
 ```toml
 [prompts]
@@ -222,7 +225,7 @@ units_per_decode_job = 32
 units_per_encode_job = 32
 ```
 
-各表中的必填资源预算由当前实现的受信配置类型定义；缺失时显式失败，不根据引擎、
+各表中的必填资源预算由当前实现的受信配置类型定义；缺失时显式失败，不根据版本、
 输入大小或硬件推断默认策略。
 
 ```toml
@@ -248,8 +251,8 @@ queue_capacity`，且不得使 Standard 的 `2N` 顺序最终化窗口超过运�
 请求前作为配置错误失败。
 
 `LanguageId`、`LanguagePair`、`LanguageModuleCatalog`、公共 LLM、文件、SQLite 和 CPU
-执行器、RPG Maker Profile 与 Prompt 协议属于 MV/MZ 共享能力。引擎切片只拥有命令
-契约、游戏目录适配和引擎特有投影；项目 schema、数据库对账和翻译资源由共享
+执行器、RPG Maker Profile 与 Prompt 协议属于 MV/MZ 共享能力。版本切片只拥有命令
+契约、游戏目录适配和版本特有投影；项目 schema、数据库对账和翻译资源由共享
 RPG Maker 实现拥有。
 
 `rpg_maker.document` 只配置磁盘读取并发；`rpg_maker.standard_asset` 与

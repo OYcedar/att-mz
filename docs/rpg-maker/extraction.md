@@ -1,6 +1,6 @@
 # RPG Maker 文本提取现行规格
 
-本文定义 MZ 与 MV 共用的提取能力。一次命令可以组合 Builtin、Rules 和 Lua，执行顺序
+本文定义 RPG Maker 领域当前两个受支持版本 MZ 与 MV 共用的提取能力。一次命令可以组合 Builtin、Rules 和 Lua，执行顺序
 固定为 `Builtin → Rules → Lua`；至少选择一项。三个 owner 分别原子替换自己的快照，
 不会互相清理资产。
 
@@ -77,9 +77,10 @@ Speaker，其余单元保存空对象。译文与 32 字节 state 必须同时�
 
 ## 3. Builtin 与对话差异
 
-Builtin 共用数据库条目、System、Map、CommonEvents、Troops、事件列表、选择项、滚动
-文本及插件目录遍历。固定字段包括 RPG Maker 标准名称、描述、消息、选择项、滚动文本
-和已确认的事件文本字段；额外引擎/插件数据通过 Rules 或 Lua 提取。
+Builtin 覆盖标准数据库条目、System、Map、CommonEvents、Troops，以及其中的事件列表、
+选择项和滚动文本。固定字段包括 RPG Maker 标准名称、描述、消息、选择项、滚动文本和
+已确认的事件文本字段；Builtin 不遍历插件数据，额外版本字段或插件数据通过 Rules 或
+Lua 提取。
 
 标准消息块是 `101 + 连续 401*`。每个块建立一个 Dialogue Group；全部正文行形成一个
 DialogueBody，混合正文中的空白 `401` 作为显式空元素保留，全空正文不建立 Body。
@@ -97,6 +98,9 @@ MV 的纯姓名首行只属于物理姓名外壳，不建立空正文。一个 `
 
 ## 4. MV 姓名投影 TOML
 
+从实际游戏约定推导姓名投影、收窄正则并验证误收的方法见
+[规则编写指南](rules.md#4-mv-对话姓名投影)。
+
 姓名文件只解释标准对话块第一条 `401.parameters[0]`。非空定义只需编写 PCRE2：
 
 ```toml
@@ -104,7 +108,7 @@ MV 的纯姓名首行只属于物理姓名外壳，不建立空正文。一个 `
 pattern = '(?i)\\n<(?<speaker>[^>]*?)(?::)?>'
 
 [[rule]]
-pattern = '\A(?<speaker>バニー淫魔)\z'
+pattern = '\A(?<speaker>星見の司書)\z'
 ```
 
 显式清空使用另一份完整文件：
@@ -131,22 +135,25 @@ rule = []
 
 ## 5. Extract Rules TOML
 
+定位插件参数、事件命令与嵌套 JSON 载体，以及判断 Rules 是否足够的方法见
+[规则编写指南](rules.md#5-extract-rules)。
+
 Rules 只从明确来源选择最终字符串或其中的 `text` 跨度，并立即物化可逆 recipe。非空
 定义使用一个数组，通过互斥字段选择来源：
 
 ```toml
 [[rule]]
-file = "Disciplines.json"
+file = "LoreEntries.json"
 path = '[].Name'
 
 [[rule]]
-plugin = "YEP_QuestJournal"
-path = '["Quest 1"].Title'
+plugin = "AstralJournal"
+path = '["entry_1"].title'
 
 [[rule]]
 code = 356
 parameter = 0
-pattern = '(?i)\AGabText\s+(?<text>.+)\z'
+pattern = '\ADisplayNotice\s+(?<text>.+)\z'
 
 [[rule]]
 code = 357
@@ -159,10 +166,13 @@ path = '[].note'
 pattern = '(?ms)<DESC:(?<text>.*?)>'
 
 [[rule]]
-plugin = "Mano_InputConfig"
-path = 'GamepadIsNotConnected'
+plugin = "InputGuide"
+path = 'deviceNotice'
 decode_json = true
 ```
+
+上述文件、插件、命令协议和文本均为人工构造的格式示例，只用于说明当前字段如何组合；
+实际值必须从目标游戏的运行时消费者与冻结来源取得。
 
 显式停用 Rules owner 使用另一份完整文件：
 

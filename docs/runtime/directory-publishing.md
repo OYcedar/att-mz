@@ -29,13 +29,13 @@ ProjectName → <projects.root>/.att-locks/projects/<engine> + 不透明 identit
             → 稳定 SHA-256 摘要文件名 → 独占文件锁
 ```
 
-因此 RPG Maker 领域不拥有锁文件名算法，通用根也不理解项目或引擎；两者只在“锁目录 + identity”的契约处交接。
+因此 RPG Maker 领域不拥有锁文件名算法，通用根也不理解项目或版本；两者只在“锁目录 + identity”的契约处交接。
 
 工作区固定在 `<projects.root>/<engine>/<project-name>`，目录发布器的目标锁位于
 `<projects.root>/.att-locks/directory-publish/<engine>/`，其中 `engine` 是 `mz | mv`。
-同一引擎同一项目的四命令互斥，不同引擎的同名项目可以并行；
+同一版本同一项目的四命令互斥，不同版本的同名项目可以并行；
 固定锁序是项目租约、目录发布锁、SQLite/session。锁文件不进入会被 Init 替换的项目
-工作区。命令不搜索其他引擎的工作区或锁目录。
+工作区。命令不搜索另一版本的工作区或锁目录。
 
 ## 4. 通用候选编辑
 
@@ -69,7 +69,7 @@ prepare 取得同目标跨进程锁、恢复已知残留，并在 target 同父�
 
 当前产品一次命令只拥有一个候选。树条目、深度、总字节、单文件和单目标恢复产物预算继续存在。
 
-发布前重新枚举完整候选，纳入后续数据库产物和 Lua 编辑，并再次验证 file ID、普通对象、Windows 等价名称、reparse、hardlink 和预算。当前引擎的顶层结构校验在这一通用复核之前由 WriteBack 自己完成。
+发布前重新枚举完整候选，纳入后续数据库产物和 Lua 编辑，并再次验证 file ID、普通对象、Windows 等价名称、reparse、hardlink 和预算。当前版本的顶层结构校验在这一通用复核之前由 WriteBack 自己完成。
 
 ## 6. CreateNew 与 ReplaceExisting
 

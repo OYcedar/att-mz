@@ -2,13 +2,17 @@
 
 ## 1. 统一入口与独立命令域
 
+RPG Maker 是 ATT 当前唯一已实现的游戏领域，该领域目前只支持 MV 与 MZ。CLI 使用
+`mv | mz` 选择域内版本、目录布局和工作区身份；这两个值不与 RPG Maker 并列，也不
+表示其他 RPG Maker 版本已经实现。
+
 ```text
 att --config FILE mz init|extract|translate|write-back ...
 att --config FILE mv init|extract|translate|write-back ...
 ```
 
-MZ 与 MV 是独立命令域，但都路由到同一 RPG Maker 纵向实现。引擎切片只建立引擎身份、
-项目/游戏布局和 MV 姓名投影输入；共享业务代码不通过引擎分支复制两套流程。
+MZ 与 MV 是 RPG Maker 域内的独立命令域，但都路由到同一纵向实现。版本切片只建立
+持久身份、项目/游戏布局和 MV 姓名投影输入；共享业务代码不按版本复制两套流程。
 
 普通命令缺少 `--config FILE` 是 CLI 解析错误；Help/Version 不需要配置。不存在默认配置
 路径。当前生产目标是 `x86_64-pc-windows-msvc`。
@@ -16,7 +20,12 @@ MZ 与 MV 是独立命令域，但都路由到同一 RPG Maker 纵向实现。�
 命令参数如下：
 
 ```text
-att mz|mv init --name NAME --path GAME_ROOT ...
+att mz|mv init --name NAME --path GAME_ROOT
+  [--source-language LANG]
+  [--target-language LANG]
+  [--dialogue-max-fullwidth-chars COUNT]
+  [--scrolling-text-max-fullwidth-chars COUNT]
+  [--help-description-max-fullwidth-chars COUNT]
 
 att mz extract --name NAME
   (--builtin | --rules RULES_TOML | --lua SCRIPT_LUA)+
@@ -33,7 +42,7 @@ att mz|mv translate --name NAME PROFILE_ID
 att mz|mv write-back --name NAME [--lua SCRIPT_LUA]
 ```
 
-`--dialogue-rules` 只属于 MV 且要求同时选择 `--builtin`。成功文案不额外添加引擎前缀。
+`--dialogue-rules` 只属于 MV 且要求同时选择 `--builtin`。成功文案不额外添加版本前缀。
 
 ## 2. 启动与配置选择
 
@@ -50,7 +59,7 @@ att mz|mv write-back --name NAME [--lua SCRIPT_LUA]
   ↓
 构造 audit.jsonl，持久化带 engine 的 run_started
   ↓
-取得对应引擎项目租约并执行命令
+取得对应版本的项目租约并执行命令
   ↓
 终结非审计根，持久化 run_finished，终结账本
   ↓
@@ -78,9 +87,9 @@ Extract、Translate 与 WriteBack 各自在命令生命周期内构造一个私�
 业务模块不使用全局 Rayon 池。等待 CPU 准入时取消则任务不执行；已经准入的任务即使
 调用 Future 被丢弃也会完成，shutdown 停止新准入并排空全部已接管作业。
 
-## 4. 引擎布局与项目租约
+## 4. MV/MZ 布局与项目租约
 
-MZ 只接受包含 `data/js/rmmz_core.js` 的游戏根；MV 只接受包含
+MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏根；MV 只接受包含
 `www/data`、`www/js` 和 `www/js/rpg_core.js` 的游戏根。不探测另一种布局，不自动修正
 传入的 MV `www`。
 
@@ -92,8 +101,9 @@ MZ 只接受包含 `data/js/rmmz_core.js` 的游戏根；MV 只接受包含
 <projects.root>/.att-locks/directory-publish/<engine>/
 ```
 
-`engine` 只能是 `mz | mv`。同一引擎同一项目的四个命令互斥；不同引擎的同名项目独立。
-通用文件根只规范化不透明 identity 并管理锁，不解释项目或引擎业务。
+当前外部契约仍以 `engine` 命名该身份字段，其值只能是 `mz | mv`，二者都属于 RPG Maker。
+同一版本同一项目的四个命令互斥；不同版本的同名项目独立。通用文件根只规范化不透明
+identity 并管理锁，不解释 RPG Maker 版本业务。
 
 锁顺序固定为：
 
@@ -101,7 +111,8 @@ MZ 只接受包含 `data/js/rmmz_core.js` 的游戏根；MV 只接受包含
 项目租约 → 目录发布锁 → SQLite/session
 ```
 
-超时返回稳定的“项目正忙”结果，不继续副作用。可信 Lua 子进程也不能重入同项目租约。
+超时返回稳定的“项目不存在或正忙”结果，不继续副作用。可信 Lua VM 运行在专用 OS
+线程中，同样不能重入自己所在命令已经持有的项目租约。
 
 ## 5. 四命令收敛
 
@@ -115,7 +126,7 @@ MZ 只接受包含 `data/js/rmmz_core.js` 的游戏根；MV 只接受包含
 
 所有业务事件都带 `engine`。所有命令在取得租约前确认 `run_started`；Translate 在请求
 前写任务意图，WriteBack 在发布前写发布意图。副作用已经生效而终态审计失败时报告
-“状态已生效但审计未确认”，不伪装普通失败或自动重做。
+“状态已生效但收尾失败”，不伪装普通失败或自动重做。
 
 第一次 Ctrl-C 后停止派生新阶段；SQLite、发布、审计、CPU 和 HTTP 已接管的工作继续到
 明确终态。候选尚未发布时 discard；publish 已开始时等待终态。
