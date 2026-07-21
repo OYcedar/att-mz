@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use super::builtin::BuiltInExtraction;
 use super::lua::LuaExtraction;
 use super::rules::RulesExtraction;
-use super::{ExtractInput, ExtractOutput, SelectedRules};
+use super::{ExtractInput, ExtractOutput, ExtractProgress, ExtractProgressPhase, SelectedRules};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
+use crate::progress::ProgressObserver;
 use crate::rpg_maker::SelectedLua;
 use crate::rpg_maker::project::ExistingProjectOpener;
 use crate::rpg_maker::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
@@ -22,6 +23,7 @@ pub(crate) struct ExtractService<O, B, R, L, P> {
     selected_lua: Option<SelectedLua<L>>,
     project_lease: P,
     cancellation: CooperativeCancellation,
+    progress: ExtractProgress,
 }
 
 impl<O, B, R, L, P> ExtractService<O, B, R, L, P> {
@@ -40,7 +42,21 @@ impl<O, B, R, L, P> ExtractService<O, B, R, L, P> {
             selected_lua,
             project_lease,
             cancellation,
+            progress: ExtractProgress::default(),
         }
+    }
+
+    /// 为本次 Extract 绑定同步、不可失败的业务进度观察者。
+    pub(crate) fn with_progress<Q>(mut self, progress: Q) -> Self
+    where
+        Q: ProgressObserver<ExtractProgressPhase> + 'static,
+    {
+        self.progress = ExtractProgress::new(progress);
+        self
+    }
+
+    fn observe_owner(&self, phase: ExtractProgressPhase, completed: u64, total: u64) {
+        self.progress.determinate(phase, completed, total);
     }
 }
 
@@ -80,26 +96,49 @@ where
             return Ok(OperationCompletion::Cancelled);
         }
 
+        let total_owners = u64::from(self.built_in_extraction.is_some() as u8)
+            + u64::from(self.selected_rules.is_some() as u8)
+            + u64::from(self.selected_lua.is_some() as u8);
+        let mut completed_owners = 0_u64;
+
         if let Some(built_in_extraction) = &self.built_in_extraction {
+            self.observe_owner(
+                ExtractProgressPhase::Builtin,
+                completed_owners,
+                total_owners,
+            );
             built_in_extraction
-                .refresh(&project)
+                .refresh(&project, self.progress.clone())
                 .await
                 .map_err(ExtractServiceError::BuiltIn)?;
+            completed_owners += 1;
+            self.observe_owner(
+                ExtractProgressPhase::Builtin,
+                completed_owners,
+                total_owners,
+            );
             if self.cancellation.is_requested() {
                 return Ok(OperationCompletion::Cancelled);
             }
         }
 
         if let Some(selected_rules) = &self.selected_rules {
-            let error_path = selected_rules.rules_path().to_path_buf();
+            self.observe_owner(ExtractProgressPhase::Rules, completed_owners, total_owners);
+            let error_path = selected_rules.program().diagnostic_path().to_path_buf();
             selected_rules
                 .executor()
-                .replace(&project, error_path.clone())
+                .replace(
+                    &project,
+                    selected_rules.program().clone(),
+                    self.progress.clone(),
+                )
                 .await
                 .map_err(|source| ExtractServiceError::Rules {
                     rules_path: error_path,
                     source,
                 })?;
+            completed_owners += 1;
+            self.observe_owner(ExtractProgressPhase::Rules, completed_owners, total_owners);
             if self.cancellation.is_requested() {
                 return Ok(OperationCompletion::Cancelled);
             }
@@ -109,10 +148,15 @@ where
             if self.cancellation.is_requested() {
                 return Ok(OperationCompletion::Cancelled);
             }
+            self.observe_owner(ExtractProgressPhase::Lua, completed_owners, total_owners);
             let error_path = selected_lua.script_path().to_path_buf();
             let completion = selected_lua
                 .executor()
-                .run(&project, error_path.clone())
+                .run(
+                    &project,
+                    selected_lua.program().clone(),
+                    self.progress.clone(),
+                )
                 .await
                 .map_err(|source| ExtractServiceError::Lua {
                     script_path: error_path,
@@ -121,6 +165,8 @@ where
             let OperationCompletion::Completed(()) = completion else {
                 return Ok(OperationCompletion::Cancelled);
             };
+            completed_owners += 1;
+            self.observe_owner(ExtractProgressPhase::Lua, completed_owners, total_owners);
         }
 
         if self.cancellation.is_requested() {
@@ -193,8 +239,24 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::progress::{ProgressObserver, ProgressSnapshot};
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::project::OpenedProject;
+
+    #[derive(Clone, Default)]
+    struct RecordingProgress(Arc<Mutex<Vec<ProgressSnapshot<ExtractProgressPhase>>>>);
+
+    impl ProgressObserver<ExtractProgressPhase> for RecordingProgress {
+        fn observe(&self, snapshot: ProgressSnapshot<ExtractProgressPhase>) {
+            self.0.lock().expect("进度记录锁不应中毒").push(snapshot);
+        }
+    }
+
+    impl RecordingProgress {
+        fn snapshots(&self) -> Vec<ProgressSnapshot<ExtractProgressPhase>> {
+            self.0.lock().expect("进度记录锁不应中毒").clone()
+        }
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
@@ -282,7 +344,7 @@ mod tests {
     impl BuiltInExtraction for FakeBuiltIn {
         type Error = FakeError;
 
-        async fn refresh(&self, _: &OpenedProject) -> Result<(), Self::Error> {
+        async fn refresh(&self, _: &OpenedProject, _: ExtractProgress) -> Result<(), Self::Error> {
             self.events
                 .lock()
                 .expect("事件锁不应中毒")
@@ -304,11 +366,16 @@ mod tests {
     impl RulesExtraction for FakeRules {
         type Error = FakeError;
 
-        async fn replace(&self, _: &OpenedProject, path: PathBuf) -> Result<(), Self::Error> {
+        async fn replace(
+            &self,
+            _: &OpenedProject,
+            program: crate::rpg_maker::extract::rules::RulesProgram,
+            _: ExtractProgress,
+        ) -> Result<(), Self::Error> {
             self.events
                 .lock()
                 .expect("事件锁不应中毒")
-                .push(Event::Rules(path));
+                .push(Event::Rules(program.diagnostic_path().to_path_buf()));
             if self.fail {
                 Err(FakeError("rules"))
             } else {
@@ -330,12 +397,13 @@ mod tests {
         async fn run(
             &self,
             _: &OpenedProject,
-            path: PathBuf,
+            program: crate::rpg_maker::lua::runtime::OwnedLuaProgram,
+            _: ExtractProgress,
         ) -> Result<OperationCompletion<()>, Self::Error> {
             self.events
                 .lock()
                 .expect("事件锁不应中毒")
-                .push(Event::Lua(path));
+                .push(Event::Lua(program.main_script_path().to_path_buf()));
             if self.fail {
                 Err(FakeError("lua"))
             } else if self.cancelled {
@@ -367,7 +435,7 @@ mod tests {
             }),
             rules_path.map(|path| {
                 SelectedRules::new(
-                    PathBuf::from(path),
+                    rules_program(path),
                     FakeRules {
                         events: Arc::clone(&events),
                         fail: failing_stage == Some("rules"),
@@ -376,7 +444,7 @@ mod tests {
             }),
             lua_script.map(|path| {
                 SelectedLua::new(
-                    PathBuf::from(path),
+                    lua_program(path),
                     FakeLua {
                         events: Arc::clone(&events),
                         fail: failing_stage == Some("lua"),
@@ -407,6 +475,21 @@ mod tests {
         "alice".parse().expect("项目名应合法")
     }
 
+    fn rules_program(path: &str) -> crate::rpg_maker::extract::rules::RulesProgram {
+        crate::rpg_maker::extract::rules::RulesProgram::from_toml(
+            PathBuf::from(path),
+            b"rule = []".to_vec(),
+        )
+        .expect("测试 Rules 程序应合法")
+    }
+
+    fn lua_program(path: &str) -> crate::rpg_maker::lua::runtime::OwnedLuaProgram {
+        crate::rpg_maker::lua::runtime::OwnedLuaProgram::new(
+            PathBuf::from(path),
+            b"return nil".to_vec(),
+        )
+    }
+
     #[tokio::test]
     async fn cancellation_after_open_prevents_every_extraction_stage() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -422,14 +505,14 @@ mod tests {
                 fail: false,
             }),
             Some(SelectedRules::new(
-                PathBuf::from("rules.toml"),
+                rules_program("rules.toml"),
                 FakeRules {
                     events: Arc::clone(&events),
                     fail: false,
                 },
             )),
             Some(SelectedLua::new(
-                PathBuf::from("translate.lua"),
+                lua_program("translate.lua"),
                 FakeLua {
                     events: Arc::clone(&events),
                     fail: false,
@@ -491,6 +574,80 @@ mod tests {
                 Event::Lua(PathBuf::from("extract.lua")),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn owner_progress_uses_absolute_monotonic_snapshots() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let progress = RecordingProgress::default();
+        let service = service(
+            recorded,
+            None,
+            true,
+            Some("rules.toml"),
+            Some("extract.lua"),
+        )
+        .with_progress(progress.clone());
+
+        service.execute(input()).await.expect("组合提取应该成功");
+
+        assert_eq!(
+            progress.snapshots(),
+            vec![
+                ProgressSnapshot::determinate(ExtractProgressPhase::Builtin, 0, 3),
+                ProgressSnapshot::determinate(ExtractProgressPhase::Builtin, 1, 3),
+                ProgressSnapshot::determinate(ExtractProgressPhase::Rules, 1, 3),
+                ProgressSnapshot::determinate(ExtractProgressPhase::Rules, 2, 3),
+                ProgressSnapshot::determinate(ExtractProgressPhase::Lua, 2, 3),
+                ProgressSnapshot::determinate(ExtractProgressPhase::Lua, 3, 3),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_owner_never_reports_completion() {
+        for (failure, expected) in [
+            (
+                "rules",
+                vec![
+                    ProgressSnapshot::determinate(ExtractProgressPhase::Builtin, 0, 3),
+                    ProgressSnapshot::determinate(ExtractProgressPhase::Builtin, 1, 3),
+                    ProgressSnapshot::determinate(ExtractProgressPhase::Rules, 1, 3),
+                ],
+            ),
+            (
+                "cancel-lua",
+                vec![ProgressSnapshot::determinate(
+                    ExtractProgressPhase::Lua,
+                    0,
+                    1,
+                )],
+            ),
+        ] {
+            let progress = RecordingProgress::default();
+            let service = if failure == "rules" {
+                service(
+                    Arc::new(Mutex::new(Vec::new())),
+                    Some(failure),
+                    true,
+                    Some("rules.toml"),
+                    Some("extract.lua"),
+                )
+            } else {
+                service(
+                    Arc::new(Mutex::new(Vec::new())),
+                    Some(failure),
+                    false,
+                    None,
+                    Some("extract.lua"),
+                )
+            }
+            .with_progress(progress.clone());
+
+            let _ = service.execute(input()).await;
+
+            assert_eq!(progress.snapshots(), expected);
+        }
     }
 
     #[tokio::test]

@@ -21,9 +21,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguagePair};
-use crate::llm::{ChatMessage, LlmUsage};
-use crate::observability::OperationId;
-use crate::rpg_maker::audit::{AuditEvent, AuditLedger, TranslationTaskAuditResult};
+use crate::llm::ChatMessage;
+#[cfg(test)]
+use crate::llm::LlmUsage;
 use crate::rpg_maker::model::{LogicalTextLocation, TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
@@ -141,10 +141,6 @@ impl TranslationUnitIdentity {
     /// 返回译文所属复合语义组的结构化位置。
     pub(crate) fn group_location(&self) -> &RpgMakerLocation {
         self.logical_location.group_location()
-    }
-
-    pub(crate) fn logical_location(&self) -> &LogicalTextLocation {
-        &self.logical_location
     }
 
     pub(crate) fn source_content(&self) -> &TextUnitContent {
@@ -674,10 +670,7 @@ impl TranslationPlanningFailure {
         Self { identity, reason }
     }
 
-    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
-        &self.identity
-    }
-
+    #[cfg(test)]
     pub(crate) fn reason(&self) -> &TranslationPlanningFailureReason {
         &self.reason
     }
@@ -1085,8 +1078,8 @@ impl TranslationPatch {
 
 /// 一个已经通过独立验收的任务 ID 及其可写 Patch。
 ///
-/// ID 只属于本次 TaskBlock 协议，不进入资产表；保留在业务结果中是为了让持久日志
-/// 能准确表达“哪个 ID 成功，以及它会传播到哪些位置”。
+/// ID 只属于本次 TaskBlock 协议，不进入资产表；保留在业务结果中用于准确关联
+/// 已验收译文及其传播位置。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AcceptedTranslationDecision {
     id: usize,
@@ -1215,7 +1208,7 @@ impl UnresolvedTranslationUnit {
     }
 }
 
-/// 无法绑定为某个可写译文、但必须进入持久日志的模型协议事实。
+/// 无法绑定为某个可写译文、但必须进入结构化运行诊断的模型协议事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationProtocolDiagnostic {
     NonStopFinish { reason: String },
@@ -1253,21 +1246,8 @@ impl<T> NonEmptyTaskItems<T> {
         Self { items: rest }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.items.len()
-    }
-
     pub(crate) fn as_slice(&self) -> &[T] {
         &self.items
-    }
-
-    fn map<U>(self, mut map: impl FnMut(T) -> U) -> NonEmptyTaskItems<U> {
-        let mut items = self.items.into_iter();
-        let first = map(items
-            .next()
-            .expect("NonEmptyTaskItems 内部必须始终包含首项"));
-        let rest = items.map(map).collect();
-        NonEmptyTaskItems::new(first, rest)
     }
 }
 
@@ -1331,7 +1311,6 @@ impl TranslationTaskOutcome {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn attempts(&self) -> NonZeroUsize {
         match self {
             Self::Complete { context, .. }
@@ -1566,252 +1545,6 @@ impl StandardTranslationRunReport {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationTaskLogContext {
-    task_index: StandardTranslationTaskIndex,
-    attempts: NonZeroUsize,
-    provider_request_id: Option<String>,
-    provider_response_id: Option<String>,
-    finish_reason: Option<String>,
-    final_response_usage: Option<LlmUsage>,
-    diagnostics: Vec<TranslationProtocolDiagnostic>,
-}
-
-/// 一个任务的脱敏强审计事实。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationTaskLogRecord {
-    Complete {
-        context: TranslationTaskLogContext,
-        accepted: NonEmptyTaskItems<LoggedAcceptedTranslationDecision>,
-    },
-    Partial {
-        context: TranslationTaskLogContext,
-        accepted: NonEmptyTaskItems<LoggedAcceptedTranslationDecision>,
-        unresolved: NonEmptyTaskItems<LoggedUnresolvedTranslationUnit>,
-    },
-    Unavailable {
-        context: TranslationTaskLogContext,
-        reason: TranslationTaskUnavailableReason,
-        unresolved: NonEmptyTaskItems<LoggedUnresolvedTranslationUnit>,
-    },
-}
-
-impl TranslationTaskLogRecord {
-    fn context(
-        context: TranslationTaskOutcomeContext,
-        final_response: Option<FinalLlmResponseMetadata>,
-    ) -> TranslationTaskLogContext {
-        let TranslationTaskOutcomeContext {
-            task_index,
-            attempts,
-            diagnostics,
-        } = context;
-        let (provider_request_id, provider_response_id, finish_reason, final_response_usage) =
-            match final_response {
-                Some(response) => {
-                    let (request_id, response_id, finish_reason, usage) = response.into_parts();
-                    (request_id, response_id, Some(finish_reason), usage)
-                }
-                None => (None, None, None, None),
-            };
-        TranslationTaskLogContext {
-            task_index,
-            attempts,
-            provider_request_id,
-            provider_response_id,
-            finish_reason,
-            final_response_usage,
-            diagnostics,
-        }
-    }
-
-    pub(crate) fn from_outcome(outcome: TranslationTaskOutcome) -> Self {
-        match outcome {
-            TranslationTaskOutcome::Complete {
-                context,
-                final_response,
-                accepted,
-            } => Self::Complete {
-                context: Self::context(context, Some(final_response)),
-                accepted: accepted.map(LoggedAcceptedTranslationDecision::from_accepted),
-            },
-            TranslationTaskOutcome::Partial {
-                context,
-                final_response,
-                accepted,
-                unresolved,
-            } => Self::Partial {
-                context: Self::context(context, Some(final_response)),
-                accepted: accepted.map(LoggedAcceptedTranslationDecision::from_accepted),
-                unresolved: unresolved.map(LoggedUnresolvedTranslationUnit::from_unresolved),
-            },
-            TranslationTaskOutcome::Unavailable {
-                context,
-                final_response,
-                reason,
-                unresolved,
-            } => Self::Unavailable {
-                context: Self::context(context, final_response),
-                reason,
-                unresolved: unresolved.map(LoggedUnresolvedTranslationUnit::from_unresolved),
-            },
-        }
-    }
-
-    fn context_ref(&self) -> &TranslationTaskLogContext {
-        match self {
-            Self::Complete { context, .. }
-            | Self::Partial { context, .. }
-            | Self::Unavailable { context, .. } => context,
-        }
-    }
-
-    pub(crate) const fn task_index(&self) -> StandardTranslationTaskIndex {
-        match self {
-            Self::Complete { context, .. }
-            | Self::Partial { context, .. }
-            | Self::Unavailable { context, .. } => context.task_index,
-        }
-    }
-
-    pub(crate) const fn attempts(&self) -> NonZeroUsize {
-        match self {
-            Self::Complete { context, .. }
-            | Self::Partial { context, .. }
-            | Self::Unavailable { context, .. } => context.attempts,
-        }
-    }
-
-    pub(crate) fn provider_request_id(&self) -> Option<&str> {
-        self.context_ref().provider_request_id.as_deref()
-    }
-
-    pub(crate) fn provider_response_id(&self) -> Option<&str> {
-        self.context_ref().provider_response_id.as_deref()
-    }
-
-    pub(crate) fn finish_reason(&self) -> Option<&str> {
-        self.context_ref().finish_reason.as_deref()
-    }
-
-    pub(crate) const fn final_response_usage(&self) -> Option<LlmUsage> {
-        match self {
-            Self::Complete { context, .. }
-            | Self::Partial { context, .. }
-            | Self::Unavailable { context, .. } => context.final_response_usage,
-        }
-    }
-
-    pub(crate) fn accepted_decisions(&self) -> usize {
-        match self {
-            Self::Complete { accepted, .. } | Self::Partial { accepted, .. } => accepted.len(),
-            Self::Unavailable { .. } => 0,
-        }
-    }
-
-    pub(crate) fn accepted(&self) -> &[LoggedAcceptedTranslationDecision] {
-        match self {
-            Self::Complete { accepted, .. } | Self::Partial { accepted, .. } => accepted.as_slice(),
-            Self::Unavailable { .. } => &[],
-        }
-    }
-
-    pub(crate) fn unresolved(&self) -> &[LoggedUnresolvedTranslationUnit] {
-        match self {
-            Self::Partial { unresolved, .. } | Self::Unavailable { unresolved, .. } => {
-                unresolved.as_slice()
-            }
-            Self::Complete { .. } => &[],
-        }
-    }
-
-    pub(crate) fn diagnostics(&self) -> &[TranslationProtocolDiagnostic] {
-        &self.context_ref().diagnostics
-    }
-}
-
-/// 日志中的一个合格 ID 及其去重传播族。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LoggedAcceptedTranslationDecision {
-    id: usize,
-    leader: LogicalTextLocation,
-    propagation_targets: Vec<LogicalTextLocation>,
-}
-
-impl LoggedAcceptedTranslationDecision {
-    fn from_accepted(accepted: AcceptedTranslationDecision) -> Self {
-        let AcceptedTranslationDecision { id, patch } = accepted;
-        let TranslationPatch {
-            identity,
-            propagation_targets,
-            ..
-        } = patch;
-        Self {
-            id,
-            leader: identity.logical_location,
-            propagation_targets: propagation_targets
-                .into_iter()
-                .map(|target| target.identity.logical_location)
-                .collect(),
-        }
-    }
-
-    pub(crate) const fn id(&self) -> usize {
-        self.id
-    }
-
-    pub(crate) fn leader(&self) -> &LogicalTextLocation {
-        &self.leader
-    }
-
-    pub(crate) fn propagation_targets(&self) -> &[LogicalTextLocation] {
-        &self.propagation_targets
-    }
-}
-
-/// 日志只保留结构化位置和拒绝原因，不复制原文或模型响应。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LoggedUnresolvedTranslationUnit {
-    id: usize,
-    locations: Vec<LogicalTextLocation>,
-    reason: TranslationUnitRejectionReason,
-}
-
-impl LoggedUnresolvedTranslationUnit {
-    fn from_unresolved(unresolved: UnresolvedTranslationUnit) -> Self {
-        let UnresolvedTranslationUnit {
-            id,
-            identity,
-            propagation_targets,
-            reason,
-        } = unresolved;
-        let mut locations = Vec::with_capacity(1 + propagation_targets.len());
-        locations.push(identity.logical_location);
-        locations.extend(
-            propagation_targets
-                .into_iter()
-                .map(|target| target.logical_location),
-        );
-        Self {
-            id,
-            locations,
-            reason,
-        }
-    }
-
-    pub(crate) const fn id(&self) -> usize {
-        self.id
-    }
-
-    pub(crate) fn locations(&self) -> &[LogicalTextLocation] {
-        &self.locations
-    }
-
-    pub(crate) fn reason(&self) -> &TranslationUnitRejectionReason {
-        &self.reason
-    }
-}
-
 /// 在一个一致读视图中取得统一标准文本表的当前事实。
 pub(crate) trait StandardTranslationAssetReader: Send + Sync {
     type Error: Error + Send + Sync + 'static;
@@ -1884,7 +1617,7 @@ pub(crate) trait StandardTranslationResultStore: Send + Sync {
     /// 不同任务的准备可以乱序并行；返回值只能由 `commit_prepared` 消费。
     /// 实现应只在本次 Future 内借助共享引用读取任务结果，且不应让
     /// `PreparedCommit` 长期持有它；生产实现借此让顺序最终化线在报告后以零复制
-    /// 路径把结果移动进终态审计记录。替代实现即使保留共享引用也不得影响正确性。
+    /// 路径把结果移动进后续终态处理。替代实现即使保留共享引用也不得影响正确性。
     fn prepare_commit(
         &self,
         outcome: Arc<TranslationTaskOutcome>,
@@ -1919,22 +1652,57 @@ pub(crate) trait StandardTranslation: Send + Sync {
     + Send;
 }
 
+/// Standard 翻译向可观测性边界提交的非秘密业务事实。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StandardTranslationLogEvent {
+    PlanningUnresolved {
+        units: usize,
+    },
+    TaskStarted {
+        task_index: StandardTranslationTaskIndex,
+        total_tasks: usize,
+    },
+    TaskFinished {
+        task_index: StandardTranslationTaskIndex,
+        outcome: StandardTranslationLogTaskOutcome,
+        attempts: Option<NonZeroUsize>,
+        retry_exhausted: bool,
+    },
+}
+
+/// 一项任务在顺序最终化边界得到的可观察终态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StandardTranslationLogTaskOutcome {
+    Complete,
+    Partial,
+    Unavailable,
+    ExecutionFailed,
+    CommitFailed,
+    NotCommitted,
+    InvalidResult,
+}
+
+/// 同步、不可失败的 Standard 翻译观察入口。
+pub(crate) trait StandardTranslationLog: Send + Sync {
+    fn emit(&self, event: StandardTranslationLogEvent);
+}
+
 /// 执行线交给顺序最终化线的一个已启动任务结果。
-struct ScheduledTaskCompletion<E, J> {
+struct ScheduledTaskCompletion<E> {
     task_index: StandardTranslationTaskIndex,
-    execution: TaskExecutionCompletion<E, J>,
+    execution: TaskExecutionCompletion<E>,
     /// 每个已启动任务持有窗口许可，直到对应计划位置完成最终化。
     window_permit: OwnedSemaphorePermit,
 }
 
 /// 纯计算准备完成后交给顺序最终化线的任务结果。
-struct PreparedScheduledTaskCompletion<E, S, J, C> {
+struct PreparedScheduledTaskCompletion<E, S, C> {
     task_index: StandardTranslationTaskIndex,
-    execution: PreparedTaskExecutionCompletion<E, S, J, C>,
+    execution: PreparedTaskExecutionCompletion<E, S, C>,
     window_permit: OwnedSemaphorePermit,
 }
 
-impl<E, S, J, C> PreparedScheduledTaskCompletion<E, S, J, C> {
+impl<E, S, C> PreparedScheduledTaskCompletion<E, S, C> {
     fn task_index(&self) -> StandardTranslationTaskIndex {
         self.task_index
     }
@@ -1946,22 +1714,20 @@ impl<E, S, J, C> PreparedScheduledTaskCompletion<E, S, J, C> {
                 prepared_commit,
                 ..
             } => outcome.task_index() != self.task_index || matches!(prepared_commit, Some(Err(_))),
-            PreparedTaskExecutionCompletion::Failed(_) => true,
+            PreparedTaskExecutionCompletion::Failed { .. } => true,
         }
     }
 }
 
-enum PreparedTaskExecutionCompletion<E, S, J, C> {
+enum PreparedTaskExecutionCompletion<E, S, C> {
     Outcome {
-        operation_id: OperationId,
         outcome: Arc<TranslationTaskOutcome>,
         prepared_commit: Option<Result<C, S>>,
     },
-    Failed(TaskExecutionFailure<E, J>),
-}
-
-fn recover_prepared_outcome(outcome: Arc<TranslationTaskOutcome>) -> TranslationTaskOutcome {
-    Arc::unwrap_or_clone(outcome)
+    Failed {
+        task_index: StandardTranslationTaskIndex,
+        source: E,
+    },
 }
 
 fn closed_result_sequence_violation<T>(
@@ -1985,47 +1751,17 @@ fn closed_result_sequence_violation<T>(
     (!cancelled && next_task_index < result_slots.len()).then_some((expected, None))
 }
 
-enum TaskExecutionCompletion<E, J> {
+enum TaskExecutionCompletion<E> {
     Outcome {
-        operation_id: OperationId,
         outcome: Box<TranslationTaskOutcome>,
     },
-    Failed(TaskExecutionFailure<E, J>),
-}
-
-enum TaskExecutionFailure<E, J> {
-    CreateOperationId {
-        task_index: StandardTranslationTaskIndex,
-        source: J,
-    },
-    RecordStarted {
-        task_index: StandardTranslationTaskIndex,
-        source: J,
-    },
-    Execute {
-        operation_id: OperationId,
+    Failed {
         task_index: StandardTranslationTaskIndex,
         source: E,
     },
 }
 
-impl<E, J> TaskExecutionFailure<E, J> {
-    fn into_service_error<R, P, S>(self) -> StandardTranslationServiceError<R, P, E, S, J> {
-        match self {
-            Self::CreateOperationId { task_index, source } => {
-                StandardTranslationServiceError::CreateTaskOperationId { task_index, source }
-            }
-            Self::RecordStarted { task_index, source } => {
-                StandardTranslationServiceError::RecordTaskStarted { task_index, source }
-            }
-            Self::Execute {
-                task_index, source, ..
-            } => StandardTranslationServiceError::ExecuteTask { task_index, source },
-        }
-    }
-}
-
-/// 使用四个业务能力和统一强审计账本编排一次标准资产翻译。
+/// 使用四个业务能力和不可失败观察入口编排一次标准资产翻译。
 pub(crate) struct StandardTranslationService<R, P, E, S, J> {
     asset_reader: R,
     task_planner: P,
@@ -2064,64 +1800,40 @@ where
     P: StandardTranslationTaskPlanner,
     E: StandardTranslationTaskExecutor<Profile = P::Profile>,
     S: StandardTranslationResultStore,
-    J: AuditLedger,
+    J: StandardTranslationLog,
 {
     async fn execute_planned_task(
         &self,
         profile: &P::Profile,
         task: TranslationTaskBlock,
-    ) -> TaskExecutionCompletion<E::Error, J::Error> {
+        total_tasks: usize,
+    ) -> TaskExecutionCompletion<E::Error> {
         let task_index = task.index();
-        let operation_id = match self.event_log.new_operation_id() {
-            Ok(operation_id) => operation_id,
-            Err(source) => {
-                return TaskExecutionCompletion::Failed(TaskExecutionFailure::CreateOperationId {
-                    task_index,
-                    source,
-                });
-            }
-        };
-        if let Err(source) = self
-            .event_log
-            .append(AuditEvent::TranslationTaskStarted {
-                operation_id,
+        self.event_log
+            .emit(StandardTranslationLogEvent::TaskStarted {
                 task_index,
-            })
-            .await
-        {
-            return TaskExecutionCompletion::Failed(TaskExecutionFailure::RecordStarted {
-                task_index,
-                source,
+                total_tasks,
             });
-        }
 
         match self.task_executor.execute(profile, task).await {
             Ok(outcome) => TaskExecutionCompletion::Outcome {
-                operation_id,
                 outcome: Box::new(outcome),
             },
-            Err(source) => TaskExecutionCompletion::Failed(TaskExecutionFailure::Execute {
-                operation_id,
-                task_index,
-                source,
-            }),
+            Err(source) => TaskExecutionCompletion::Failed { task_index, source },
         }
     }
 
     async fn prepare_scheduled_task(
         &self,
-        completion: ScheduledTaskCompletion<E::Error, J::Error>,
-    ) -> PreparedScheduledTaskCompletion<E::Error, S::Error, J::Error, S::PreparedCommit> {
+        completion: ScheduledTaskCompletion<E::Error>,
+    ) -> PreparedScheduledTaskCompletion<E::Error, S::Error, S::PreparedCommit> {
         let ScheduledTaskCompletion {
             task_index,
             execution,
             window_permit,
         } = completion;
         let execution = match execution {
-            TaskExecutionCompletion::Outcome {
-                operation_id,
-                outcome,
-            } => {
+            TaskExecutionCompletion::Outcome { outcome } => {
                 let outcome: Arc<TranslationTaskOutcome> = Arc::from(outcome);
                 let prepared_commit =
                     if outcome.task_index() == task_index && !outcome.accepted().is_empty() {
@@ -2130,13 +1842,12 @@ where
                         None
                     };
                 PreparedTaskExecutionCompletion::Outcome {
-                    operation_id,
                     outcome,
                     prepared_commit,
                 }
             }
-            TaskExecutionCompletion::Failed(failure) => {
-                PreparedTaskExecutionCompletion::Failed(failure)
+            TaskExecutionCompletion::Failed { task_index, source } => {
+                PreparedTaskExecutionCompletion::Failed { task_index, source }
             }
         };
         PreparedScheduledTaskCompletion {
@@ -2153,10 +1864,10 @@ where
     P: StandardTranslationTaskPlanner,
     E: StandardTranslationTaskExecutor<Profile = P::Profile>,
     S: StandardTranslationResultStore,
-    J: AuditLedger,
+    J: StandardTranslationLog,
 {
     type Profile = P::Profile;
-    type Error = StandardTranslationServiceError<R::Error, P::Error, E::Error, S::Error, J::Error>;
+    type Error = StandardTranslationServiceError<R::Error, P::Error, E::Error, S::Error>;
 
     async fn run(
         &self,
@@ -2200,11 +1911,11 @@ where
             .await
             .map_err(StandardTranslationServiceError::ApplyPreparation)?;
 
-        for failure in planning_failures {
+        if !planning_failures.is_empty() {
             self.event_log
-                .append(AuditEvent::TranslationPlanningUnresolved { failure })
-                .await
-                .map_err(StandardTranslationServiceError::RecordPlanningFailures)?;
+                .emit(StandardTranslationLogEvent::PlanningUnresolved {
+                    units: planning_failures.len(),
+                });
         }
 
         if self.cancellation.is_requested() {
@@ -2222,9 +1933,9 @@ where
         let execution_window = Arc::new(Semaphore::new(window_capacity));
         let stop_admission = Arc::new(AtomicBool::new(false));
         let (execution_sender, mut execution_receiver) =
-            tokio::sync::mpsc::unbounded_channel::<ScheduledTaskCompletion<E::Error, J::Error>>();
+            tokio::sync::mpsc::unbounded_channel::<ScheduledTaskCompletion<E::Error>>();
         let (prepared_sender, mut prepared_receiver) = tokio::sync::mpsc::unbounded_channel::<
-            PreparedScheduledTaskCompletion<E::Error, S::Error, J::Error, S::PreparedCommit>,
+            PreparedScheduledTaskCompletion<E::Error, S::Error, S::PreparedCommit>,
         >();
 
         let execution_lane = {
@@ -2267,8 +1978,9 @@ where
                             };
 
                             let task_index = task.index();
-                            let execution = self.execute_planned_task(profile, task).await;
-                            if matches!(&execution, TaskExecutionCompletion::Failed(_)) {
+                            let execution =
+                                self.execute_planned_task(profile, task, task_count).await;
+                            if matches!(&execution, TaskExecutionCompletion::Failed { .. }) {
                                 stop_admission.store(true, Ordering::Release);
                             }
                             if execution_sender
@@ -2337,17 +2049,11 @@ where
                     .take(task_count)
                     .collect::<Vec<
                         Option<
-                            PreparedScheduledTaskCompletion<
-                                E::Error,
-                                S::Error,
-                                J::Error,
-                                S::PreparedCommit,
-                            >,
+                            PreparedScheduledTaskCompletion<E::Error, S::Error, S::PreparedCommit>,
                         >,
                     >>();
                 let mut next_task_index = 0;
                 let mut primary_failure: Option<Self::Error> = None;
-                let mut drain_audit_failures = Vec::new();
 
                 while let Some(completion) = prepared_receiver.recv().await {
                     let completed_index = completion.task_index().get();
@@ -2368,75 +2074,39 @@ where
                         } = completion;
 
                         match execution {
-                            PreparedTaskExecutionCompletion::Failed(
-                                TaskExecutionFailure::Execute {
-                                    operation_id,
-                                    task_index,
-                                    source,
-                                },
-                            ) => {
+                            PreparedTaskExecutionCompletion::Failed { task_index, source } => {
                                 stop_admission.store(true, Ordering::Release);
-                                let terminal = self
-                                    .event_log
-                                    .append(AuditEvent::TranslationTaskFinished {
-                                        operation_id,
-                                        result: TranslationTaskAuditResult::ExecutionFailed {
-                                            task_index,
-                                        },
-                                    })
-                                    .await;
-                                match terminal {
-                                    Ok(_) if primary_failure.is_none() => {
-                                        primary_failure =
-                                            Some(StandardTranslationServiceError::ExecuteTask {
-                                                task_index,
-                                                source,
-                                            });
-                                    }
-                                    Ok(_) => {}
-                                    Err(log_source) if primary_failure.is_none() => {
-                                        primary_failure = Some(
-                                            StandardTranslationServiceError::ExecuteTaskAndRecordFailure {
-                                                task_index,
-                                                source,
-                                                log_source,
-                                            },
-                                        );
-                                    }
-                                    Err(log_source) => {
-                                        drain_audit_failures.push(TaskDrainAuditFailure {
-                                            task_index,
-                                            source: log_source,
-                                        });
-                                    }
-                                }
-                            }
-                            PreparedTaskExecutionCompletion::Failed(failure) => {
+                                self.event_log
+                                    .emit(StandardTranslationLogEvent::TaskFinished {
+                                        task_index,
+                                        outcome: StandardTranslationLogTaskOutcome::ExecutionFailed,
+                                        attempts: None,
+                                        retry_exhausted: false,
+                                    });
                                 if primary_failure.is_none() {
-                                    stop_admission.store(true, Ordering::Release);
-                                    primary_failure = Some(
-                                        failure
-                                            .into_service_error::<R::Error, P::Error, S::Error>(),
-                                    );
+                                    primary_failure =
+                                        Some(StandardTranslationServiceError::ExecuteTask {
+                                            task_index,
+                                            source,
+                                        });
                                 }
                             }
                             PreparedTaskExecutionCompletion::Outcome {
-                                operation_id,
                                 outcome,
                                 prepared_commit,
                             } => {
                                 let task_index = outcome.task_index();
                                 if task_index != scheduled_task_index {
                                     stop_admission.store(true, Ordering::Release);
-                                    let terminal = self
-                                        .event_log
-                                        .append(AuditEvent::TranslationTaskFinished {
-                                            operation_id,
-                                            result: TranslationTaskAuditResult::ExecutionFailed {
-                                                task_index: scheduled_task_index,
-                                            },
-                                        })
-                                        .await;
+                                    self.event_log.emit(
+                                        StandardTranslationLogEvent::TaskFinished {
+                                            task_index: scheduled_task_index,
+                                            outcome:
+                                                StandardTranslationLogTaskOutcome::InvalidResult,
+                                            attempts: Some(outcome.attempts()),
+                                            retry_exhausted: false,
+                                        },
+                                    );
                                     if primary_failure.is_none() {
                                         primary_failure = Some(
                                             StandardTranslationServiceError::InvalidTaskResultSequence {
@@ -2445,25 +2115,16 @@ where
                                             },
                                         );
                                     }
-                                    if let Err(source) = terminal {
-                                        drain_audit_failures.push(TaskDrainAuditFailure {
-                                            task_index: scheduled_task_index,
-                                            source,
-                                        });
-                                    }
                                 } else if primary_failure.is_some() {
-                                    let terminal = AuditEvent::TranslationTaskFinished {
-                                        operation_id,
-                                        result: TranslationTaskAuditResult::NotCommitted(
-                                            TranslationTaskLogRecord::from_outcome(
-                                                recover_prepared_outcome(outcome),
-                                            ),
-                                        ),
-                                    };
-                                    if let Err(source) = self.event_log.append(terminal).await {
-                                        drain_audit_failures
-                                            .push(TaskDrainAuditFailure { task_index, source });
-                                    }
+                                    self.event_log.emit(
+                                        StandardTranslationLogEvent::TaskFinished {
+                                            task_index,
+                                            outcome:
+                                                StandardTranslationLogTaskOutcome::NotCommitted,
+                                            attempts: Some(outcome.attempts()),
+                                            retry_exhausted: false,
+                                        },
+                                    );
                                 } else {
                                     let commit = match prepared_commit {
                                         Some(Ok(prepared)) => {
@@ -2476,53 +2137,56 @@ where
                                     };
                                     if let Err(commit_source) = commit {
                                         stop_admission.store(true, Ordering::Release);
-                                        let event = AuditEvent::TranslationTaskFinished {
-                                            operation_id,
-                                            result: TranslationTaskAuditResult::CommitFailed(
-                                                TranslationTaskLogRecord::from_outcome(
-                                                    recover_prepared_outcome(outcome),
-                                                ),
-                                            ),
-                                        };
-                                        let failure = match self.event_log.append(event).await {
-                                            Ok(_) => StandardTranslationServiceError::CommitTask {
+                                        self.event_log.emit(
+                                            StandardTranslationLogEvent::TaskFinished {
+                                                task_index,
+                                                outcome:
+                                                    StandardTranslationLogTaskOutcome::CommitFailed,
+                                                attempts: Some(outcome.attempts()),
+                                                retry_exhausted: false,
+                                            },
+                                        );
+                                        primary_failure =
+                                            Some(StandardTranslationServiceError::CommitTask {
                                                 task_index,
                                                 source: commit_source,
-                                            },
-                                            Err(log_source) => {
-                                                StandardTranslationServiceError::CommitTaskAndRecordFailure {
-                                                    task_index,
-                                                    commit_source,
-                                                    log_source,
-                                                }
-                                            }
-                                        };
-                                        primary_failure = Some(failure);
+                                            });
                                     } else {
                                         report.record(&outcome);
-                                        let terminal = AuditEvent::TranslationTaskFinished {
-                                            operation_id,
-                                            result: TranslationTaskAuditResult::Completed(
-                                                TranslationTaskLogRecord::from_outcome(
-                                                    recover_prepared_outcome(outcome),
-                                                ),
-                                            ),
+                                        let retry_exhausted = matches!(
+                                            outcome.as_ref(),
+                                            TranslationTaskOutcome::Unavailable {
+                                                reason:
+                                                    TranslationTaskUnavailableReason::RecoverableRequestExhausted { .. }
+                                                    | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum { .. },
+                                                ..
+                                            }
+                                        );
+                                        let observed_outcome = match outcome.as_ref() {
+                                            TranslationTaskOutcome::Complete { .. } => {
+                                                StandardTranslationLogTaskOutcome::Complete
+                                            }
+                                            TranslationTaskOutcome::Partial { .. } => {
+                                                StandardTranslationLogTaskOutcome::Partial
+                                            }
+                                            TranslationTaskOutcome::Unavailable { .. } => {
+                                                StandardTranslationLogTaskOutcome::Unavailable
+                                            }
                                         };
-                                        if let Err(source) = self.event_log.append(terminal).await {
-                                            stop_admission.store(true, Ordering::Release);
-                                            primary_failure = Some(
-                                                StandardTranslationServiceError::RecordTaskFinished {
-                                                    task_index,
-                                                    source,
-                                                },
-                                            );
-                                        }
+                                        self.event_log.emit(
+                                            StandardTranslationLogEvent::TaskFinished {
+                                                task_index,
+                                                outcome: observed_outcome,
+                                                attempts: Some(outcome.attempts()),
+                                                retry_exhausted,
+                                            },
+                                        );
                                     }
                                 }
                             }
                         }
 
-                        // 许可必须在对应任务完成提交或终态记录后才重新用于下一次补位。
+                        // 许可必须在对应任务完成提交和同步观察后才重新用于下一次补位。
                         drop(window_permit);
                     }
                 }
@@ -2542,15 +2206,7 @@ where
                         });
                 }
                 if let Some(primary) = primary_failure {
-                    if drain_audit_failures.is_empty() {
-                        return Err(primary);
-                    }
-                    return Err(
-                        StandardTranslationServiceError::TaskFailureAndDrainAuditFailures {
-                            primary: Box::new(primary),
-                            drain_audit_failures,
-                        },
-                    );
+                    return Err(primary);
                 }
 
                 if self.cancellation.is_requested() {
@@ -2569,48 +2225,21 @@ where
 
 /// Standard 在直接依赖边界上遇到的技术失败。
 #[derive(Debug)]
-pub(crate) enum StandardTranslationServiceError<R, P, E, S, J> {
+pub(crate) enum StandardTranslationServiceError<R, P, E, S> {
     ReadAssets(R),
     PlanTasks(P),
     ApplyPreparation(S),
-    RecordPlanningFailures(J),
-    CreateTaskOperationId {
-        task_index: StandardTranslationTaskIndex,
-        source: J,
-    },
-    RecordTaskStarted {
-        task_index: StandardTranslationTaskIndex,
-        source: J,
-    },
     ExecuteTask {
         task_index: StandardTranslationTaskIndex,
         source: E,
-    },
-    ExecuteTaskAndRecordFailure {
-        task_index: StandardTranslationTaskIndex,
-        source: E,
-        log_source: J,
     },
     CommitTask {
         task_index: StandardTranslationTaskIndex,
         source: S,
     },
-    CommitTaskAndRecordFailure {
-        task_index: StandardTranslationTaskIndex,
-        commit_source: S,
-        log_source: J,
-    },
-    RecordTaskFinished {
-        task_index: StandardTranslationTaskIndex,
-        source: J,
-    },
     InvalidTaskResultSequence {
         expected_task_index: StandardTranslationTaskIndex,
         actual_task_index: Option<StandardTranslationTaskIndex>,
-    },
-    TaskFailureAndDrainAuditFailures {
-        primary: Box<StandardTranslationServiceError<R, P, E, S, J>>,
-        drain_audit_failures: Vec<TaskDrainAuditFailure<J>>,
     },
 }
 
@@ -2620,11 +2249,10 @@ pub(crate) enum StandardTranslationFailureImpact {
     ConfigurationOrInput,
     ProjectState,
     ExternalModel,
-    AuditLedger,
     StateAppliedButFinalizationFailed,
 }
 
-impl<R, P, E, S, J> StandardTranslationServiceError<R, P, E, S, J> {
+impl<R, P, E, S> StandardTranslationServiceError<R, P, E, S> {
     /// 将内部阶段失败归并为命令边界可以准确呈现的用户影响。
     pub(crate) fn failure_impact(&self) -> StandardTranslationFailureImpact {
         use StandardTranslationFailureImpact as Impact;
@@ -2634,46 +2262,18 @@ impl<R, P, E, S, J> StandardTranslationServiceError<R, P, E, S, J> {
                 Impact::ProjectState
             }
             Self::PlanTasks(_) => Impact::ConfigurationOrInput,
-            Self::CreateTaskOperationId { .. } | Self::RecordTaskStarted { .. } => {
-                Impact::AuditLedger
-            }
             Self::ExecuteTask { .. } => Impact::ExternalModel,
-            Self::ExecuteTaskAndRecordFailure { .. } | Self::CommitTaskAndRecordFailure { .. } => {
-                Impact::AuditLedger
-            }
-            Self::RecordPlanningFailures(_)
-            | Self::RecordTaskFinished { .. }
-            | Self::InvalidTaskResultSequence { .. } => Impact::StateAppliedButFinalizationFailed,
-            Self::TaskFailureAndDrainAuditFailures {
-                primary,
-                drain_audit_failures,
-            } => {
-                let primary = primary.failure_impact();
-                if drain_audit_failures.is_empty()
-                    || primary == Impact::StateAppliedButFinalizationFailed
-                {
-                    primary
-                } else {
-                    Impact::AuditLedger
-                }
-            }
+            Self::InvalidTaskResultSequence { .. } => Impact::StateAppliedButFinalizationFailed,
         }
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct TaskDrainAuditFailure<J> {
-    task_index: StandardTranslationTaskIndex,
-    source: J,
-}
-
-impl<R, P, E, S, J> fmt::Display for StandardTranslationServiceError<R, P, E, S, J>
+impl<R, P, E, S> fmt::Display for StandardTranslationServiceError<R, P, E, S>
 where
     R: fmt::Display,
     P: fmt::Display,
     E: fmt::Display,
     S: fmt::Display,
-    J: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2682,47 +2282,11 @@ where
             Self::ApplyPreparation(source) => {
                 write!(formatter, "无法应用标准翻译准备：{source}")
             }
-            Self::RecordPlanningFailures(source) => {
-                write!(
-                    formatter,
-                    "标准翻译规划期未解决单元无法写入审计账本：{source}"
-                )
-            }
-            Self::CreateTaskOperationId { task_index, source } => write!(
-                formatter,
-                "标准翻译任务 {task_index} 无法建立审计操作身份：{source}"
-            ),
-            Self::RecordTaskStarted { task_index, source } => write!(
-                formatter,
-                "标准翻译任务 {task_index} 的执行意图未能写入审计账本：{source}"
-            ),
             Self::ExecuteTask { task_index, source } => {
                 write!(formatter, "标准翻译任务 {task_index} 执行失败：{source}")
             }
-            Self::ExecuteTaskAndRecordFailure {
-                task_index,
-                source,
-                log_source,
-            } => write!(
-                formatter,
-                "标准翻译任务 {task_index} 执行失败且无法记录终态：执行：{source}；审计：{log_source}"
-            ),
             Self::CommitTask { task_index, source } => {
                 write!(formatter, "标准翻译任务 {task_index} 提交失败：{source}")
-            }
-            Self::CommitTaskAndRecordFailure {
-                task_index,
-                commit_source,
-                log_source,
-            } => write!(
-                formatter,
-                "标准翻译任务 {task_index} 提交失败且无法记录诊断：提交：{commit_source}；日志：{log_source}"
-            ),
-            Self::RecordTaskFinished { task_index, source } => {
-                write!(
-                    formatter,
-                    "标准翻译任务 {task_index} 的已确认结果无法写入审计账本：{source}"
-                )
             }
             Self::InvalidTaskResultSequence {
                 expected_task_index,
@@ -2738,51 +2302,25 @@ where
                 formatter,
                 "标准翻译结果序列不完整：执行通道在任务 {expected_task_index} 返回前关闭"
             ),
-            Self::TaskFailureAndDrainAuditFailures {
-                primary,
-                drain_audit_failures,
-            } => {
-                write!(
-                    formatter,
-                    "{primary}；排空已启动任务时另有 {} 个终态未能写入审计账本",
-                    drain_audit_failures.len()
-                )?;
-                for failure in drain_audit_failures {
-                    write!(
-                        formatter,
-                        "；任务 {}：{}",
-                        failure.task_index, failure.source
-                    )?;
-                }
-                Ok(())
-            }
         }
     }
 }
 
-impl<R, P, E, S, J> Error for StandardTranslationServiceError<R, P, E, S, J>
+impl<R, P, E, S> Error for StandardTranslationServiceError<R, P, E, S>
 where
     R: Error + 'static,
     P: Error + 'static,
     E: Error + 'static,
     S: Error + 'static,
-    J: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ReadAssets(source) => Some(source),
             Self::PlanTasks(source) => Some(source),
             Self::ApplyPreparation(source) => Some(source),
-            Self::RecordPlanningFailures(source) => Some(source),
-            Self::CreateTaskOperationId { source, .. }
-            | Self::RecordTaskStarted { source, .. }
-            | Self::RecordTaskFinished { source, .. } => Some(source),
             Self::ExecuteTask { source, .. } => Some(source),
-            Self::ExecuteTaskAndRecordFailure { source, .. } => Some(source),
             Self::CommitTask { source, .. } => Some(source),
-            Self::CommitTaskAndRecordFailure { commit_source, .. } => Some(commit_source),
             Self::InvalidTaskResultSequence { .. } => None,
-            Self::TaskFailureAndDrainAuditFailures { primary, .. } => Some(primary.as_ref()),
         }
     }
 }
@@ -2797,12 +2335,10 @@ mod tests {
         JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageModule, LanguageText,
     };
     use crate::llm::ChatMessageRole;
-    use crate::observability::{EventId, OperationId};
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource, StandardDataFile};
-    use uuid::Uuid;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -2921,7 +2457,7 @@ mod tests {
         Plan,
         Prepare,
         LogPlanningFailure,
-        AuditTaskStarted(usize),
+        LogTaskStarted(usize),
         Execute(usize),
         Complete(usize),
         PrepareCommit(usize),
@@ -3163,99 +2699,52 @@ mod tests {
     #[derive(Clone)]
     struct FakeEventLog {
         events: Arc<Mutex<Vec<Event>>>,
-        records: Arc<Mutex<Vec<AuditEvent>>>,
-        fail_task_at: Option<usize>,
-        fail_started_at: Option<usize>,
-        fail_operation_id_call: Option<usize>,
-        block_finished_at: Option<(usize, Arc<Semaphore>)>,
-        next_operation_id: Arc<AtomicUsize>,
+        records: Arc<Mutex<Vec<StandardTranslationLogEvent>>>,
         started_not_finalized: Arc<AtomicUsize>,
         max_started_not_finalized: Arc<AtomicUsize>,
     }
 
-    impl AuditLedger for FakeEventLog {
-        type Error = FakeError;
-
-        fn new_operation_id(&self) -> Result<OperationId, Self::Error> {
-            let value = self.next_operation_id.fetch_add(1, Ordering::SeqCst);
-            if self.fail_operation_id_call == Some(value) {
-                return Err(FakeError("operation-id"));
-            }
-            Ok(OperationId::from_uuid(Uuid::from_u128(
-                0x550e_8400_e29b_41d4_a716_4466_5544_0000 + value as u128,
-            )))
-        }
-
-        async fn append(&self, event: AuditEvent) -> Result<EventId, Self::Error> {
-            let mut finished_task_index = None;
-            let failure = match &event {
-                AuditEvent::TranslationTaskStarted { task_index, .. } => {
-                    if self.fail_started_at == Some(task_index.get()) {
-                        return Err(FakeError("log"));
-                    }
-                    record(&self.events, Event::AuditTaskStarted(task_index.get()));
+    impl StandardTranslationLog for FakeEventLog {
+        fn emit(&self, event: StandardTranslationLogEvent) {
+            match event {
+                StandardTranslationLogEvent::TaskStarted { task_index, .. } => {
+                    record(&self.events, Event::LogTaskStarted(task_index.get()));
                     let started = self.started_not_finalized.fetch_add(1, Ordering::SeqCst) + 1;
                     self.max_started_not_finalized
                         .fetch_max(started, Ordering::SeqCst);
-                    false
                 }
-                AuditEvent::TranslationTaskFinished { result, .. } => {
+                StandardTranslationLogEvent::TaskFinished {
+                    task_index,
+                    outcome,
+                    ..
+                } => {
                     self.started_not_finalized.fetch_sub(1, Ordering::SeqCst);
-                    let task_index = match result {
-                        TranslationTaskAuditResult::Completed(task) => {
-                            record(&self.events, Event::LogTask(task.task_index().get()));
-                            task.task_index().get()
+                    match outcome {
+                        StandardTranslationLogTaskOutcome::Complete
+                        | StandardTranslationLogTaskOutcome::Partial
+                        | StandardTranslationLogTaskOutcome::Unavailable => {
+                            record(&self.events, Event::LogTask(task_index.get()));
                         }
-                        TranslationTaskAuditResult::CommitFailed(task) => {
-                            record(
-                                &self.events,
-                                Event::LogCommitFailure(task.task_index().get()),
-                            );
-                            task.task_index().get()
+                        StandardTranslationLogTaskOutcome::CommitFailed => {
+                            record(&self.events, Event::LogCommitFailure(task_index.get()));
                         }
-                        TranslationTaskAuditResult::NotCommitted(task) => {
-                            record(
-                                &self.events,
-                                Event::LogNotCommitted(task.task_index().get()),
-                            );
-                            task.task_index().get()
+                        StandardTranslationLogTaskOutcome::NotCommitted => {
+                            record(&self.events, Event::LogNotCommitted(task_index.get()));
                         }
-                        TranslationTaskAuditResult::ExecutionFailed { task_index } => {
+                        StandardTranslationLogTaskOutcome::ExecutionFailed
+                        | StandardTranslationLogTaskOutcome::InvalidResult => {
                             record(&self.events, Event::LogExecutionFailure(task_index.get()));
-                            task_index.get()
                         }
-                    };
-                    finished_task_index = Some(task_index);
-                    self.fail_task_at == Some(task_index)
+                    }
                 }
-                AuditEvent::TranslationPlanningUnresolved { .. } => {
+                StandardTranslationLogEvent::PlanningUnresolved { .. } => {
                     record(&self.events, Event::LogPlanningFailure);
-                    false
                 }
-                AuditEvent::RunStarted
-                | AuditEvent::RunFinished { .. }
-                | AuditEvent::WriteBackPublishStarted { .. }
-                | AuditEvent::WriteBackPublishFinished { .. } => false,
-            };
+            }
             self.records
                 .lock()
                 .expect("日志事件记录锁不应中毒")
                 .push(event);
-            if let Some((blocked_task_index, gate)) = &self.block_finished_at
-                && finished_task_index == Some(*blocked_task_index)
-            {
-                gate.acquire()
-                    .await
-                    .expect("测试终态审计闸门不得关闭")
-                    .forget();
-            }
-            if failure {
-                Err(FakeError("log"))
-            } else {
-                Ok(EventId::from_uuid(Uuid::from_u128(
-                    0x7c9e_6679_7425_40de_944b_e07f_c1f9_0ae7,
-                )))
-            }
         }
     }
 
@@ -3267,7 +2756,7 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         planner_inputs: Arc<Mutex<Vec<StandardTranslationInput>>>,
         preparations: Arc<Mutex<Vec<TranslationPlanPreparation>>>,
-        log_records: Arc<Mutex<Vec<AuditEvent>>>,
+        log_records: Arc<Mutex<Vec<StandardTranslationLogEvent>>>,
         max_active: Arc<AtomicUsize>,
         started_not_finalized: Arc<AtomicUsize>,
         max_started_not_finalized: Arc<AtomicUsize>,
@@ -3319,8 +2808,6 @@ mod tests {
             commit_failure_at,
             preparation,
             vec![FakeOutcomeKind::Complete; task_count],
-            None,
-            false,
         )
     }
 
@@ -3338,8 +2825,6 @@ mod tests {
         commit_failure_at: Option<usize>,
         preparation: TranslationPlanPreparation,
         outcome_kinds: Vec<FakeOutcomeKind>,
-        log_failure_at: Option<usize>,
-        _run_log_failure: bool,
     ) -> Harness {
         let events = Arc::new(Mutex::new(Vec::new()));
         let planner_inputs = Arc::new(Mutex::new(Vec::new()));
@@ -3385,11 +2870,6 @@ mod tests {
                 FakeEventLog {
                     events: Arc::clone(&events),
                     records: Arc::clone(&log_records),
-                    fail_task_at: log_failure_at,
-                    fail_started_at: None,
-                    fail_operation_id_call: None,
-                    block_finished_at: None,
-                    next_operation_id: Arc::new(AtomicUsize::new(0)),
                     started_not_finalized: Arc::clone(&started_not_finalized),
                     max_started_not_finalized: Arc::clone(&max_started_not_finalized),
                 },
@@ -3429,7 +2909,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planning_unresolved_is_committed_audited_and_counted_without_blocking_good_tasks() {
+    async fn planning_unresolved_is_committed_observed_and_counted_without_blocking_good_tasks() {
         let preparation = TranslationPlanPreparation::new(
             Vec::new(),
             Vec::new(),
@@ -3467,28 +2947,15 @@ mod tests {
         let records = harness.log_records.lock().expect("日志记录锁不应中毒");
         assert!(matches!(
             records.as_slice(),
-            [AuditEvent::TranslationPlanningUnresolved { .. }, ..]
+            [
+                StandardTranslationLogEvent::PlanningUnresolved { units: 1 },
+                ..
+            ]
         ));
     }
 
-    #[test]
-    fn planning_unresolved_audit_failure_reports_state_already_applied() {
-        let error = StandardTranslationServiceError::<
-            FakeError,
-            FakeError,
-            FakeError,
-            FakeError,
-            FakeError,
-        >::RecordPlanningFailures(FakeError("log"));
-
-        assert_eq!(
-            error.failure_impact(),
-            StandardTranslationFailureImpact::StateAppliedButFinalizationFailed
-        );
-    }
-
     #[tokio::test]
-    async fn a_store_retaining_the_shared_outcome_does_not_break_final_audit() {
+    async fn a_store_retaining_the_shared_outcome_does_not_break_final_observation() {
         let mut harness = harness(1, vec![1], false, false, false, None, None);
         let retained = Arc::new(Mutex::new(Vec::new()));
         harness.service.result_store.retained_commit_outcomes = Some(Arc::clone(&retained));
@@ -3641,8 +3108,6 @@ mod tests {
         harness.service.result_store.block_commit_preparation_at =
             Some((1, Arc::clone(&preparation_gate)));
         harness.service.result_store.fail_commit_preparation_at = Arc::new(vec![3]);
-        let audit_gate = Arc::new(Semaphore::new(0));
-        harness.service.event_log.block_finished_at = Some((0, Arc::clone(&audit_gate)));
         let stop_notify = Arc::new(tokio::sync::Notify::new());
         harness.service.stop_admission_notify = Some(Arc::clone(&stop_notify));
         let recorded_events = Arc::clone(&harness.events);
@@ -3653,14 +3118,21 @@ mod tests {
         let run = harness.service.run(&project, &profile, input);
         let observe_stop = async move {
             stop_notify.notified().await;
-            assert!(events(&recorded_events).contains(&Event::PrepareCommit(3)));
-            assert!(events(&recorded_events).contains(&Event::LogTask(0)));
-            audit_gate.add_permits(1);
+            let at_stop = events(&recorded_events);
+            assert!(at_stop.contains(&Event::PrepareCommit(3)));
+            let admitted_at_stop = at_stop
+                .iter()
+                .filter(|event| matches!(event, Event::Execute(_)))
+                .count();
             for _ in 0..100 {
                 tokio::task::yield_now().await;
             }
-            assert!(
-                !events(&recorded_events).contains(&Event::Execute(4)),
+            assert_eq!(
+                events(&recorded_events)
+                    .iter()
+                    .filter(|event| matches!(event, Event::Execute(_)))
+                    .count(),
+                admitted_at_stop,
                 "准备失败一经得知，释放较早终态许可也不得继续领取新任务"
             );
             preparation_gate.add_permits(1);
@@ -3862,7 +3334,7 @@ mod tests {
         let recorded_events = events(&harness.events);
         assert!(!recorded_events.contains(&Event::CommitAttempt(0)));
         assert!(recorded_events.contains(&Event::LogExecutionFailure(0)));
-        assert_all_started_operations_finished(&harness.log_records);
+        assert_all_started_tasks_observed(&harness.log_records);
     }
 
     #[tokio::test]
@@ -3871,8 +3343,6 @@ mod tests {
         harness.service.task_executor.outcome_index_at = Some((3, 9));
         let execution_gate = Arc::new(Semaphore::new(0));
         harness.service.task_executor.block_at = Some((1, Arc::clone(&execution_gate)));
-        let audit_gate = Arc::new(Semaphore::new(0));
-        harness.service.event_log.block_finished_at = Some((0, Arc::clone(&audit_gate)));
         let stop_notify = Arc::new(tokio::sync::Notify::new());
         harness.service.stop_admission_notify = Some(Arc::clone(&stop_notify));
         let recorded_events = Arc::clone(&harness.events);
@@ -3883,14 +3353,21 @@ mod tests {
         let run = harness.service.run(&project, &profile, input);
         let observe_stop = async move {
             stop_notify.notified().await;
-            assert!(events(&recorded_events).contains(&Event::Complete(3)));
-            assert!(events(&recorded_events).contains(&Event::LogTask(0)));
-            audit_gate.add_permits(1);
+            let at_stop = events(&recorded_events);
+            assert!(at_stop.contains(&Event::Complete(3)));
+            let admitted_at_stop = at_stop
+                .iter()
+                .filter(|event| matches!(event, Event::Execute(_)))
+                .count();
             for _ in 0..100 {
                 tokio::task::yield_now().await;
             }
-            assert!(
-                !events(&recorded_events).contains(&Event::Execute(4)),
+            assert_eq!(
+                events(&recorded_events)
+                    .iter()
+                    .filter(|event| matches!(event, Event::Execute(_)))
+                    .count(),
+                admitted_at_stop,
                 "错序结果已知后，释放较早终态许可也不得继续领取新任务"
             );
             execution_gate.add_permits(1);
@@ -3971,78 +3448,7 @@ mod tests {
                 source: FakeError("execute")
             } if task_index == StandardTranslationTaskIndex::new(0)
         ));
-        assert_all_started_operations_finished(&harness.log_records);
-    }
-
-    #[tokio::test]
-    async fn operation_id_failure_stops_before_persisting_or_executing_any_task() {
-        let mut harness = harness(3, vec![1; 3], false, false, false, None, None);
-        harness.service.event_log.fail_operation_id_call = Some(0);
-
-        let error = harness
-            .service
-            .run(&project(), &profile(1), input())
-            .await
-            .expect_err("无法建立任务操作身份时必须立即停止准入");
-
-        assert!(matches!(
-            error,
-            StandardTranslationServiceError::CreateTaskOperationId {
-                task_index,
-                source: FakeError("operation-id"),
-            } if task_index == StandardTranslationTaskIndex::new(0)
-        ));
-        let recorded_events = events(&harness.events);
-        assert!(
-            !recorded_events
-                .iter()
-                .any(|event| matches!(event, Event::AuditTaskStarted(_) | Event::Execute(_)))
-        );
-        assert_all_started_operations_finished(&harness.log_records);
-    }
-
-    #[tokio::test]
-    async fn record_started_failure_stops_admission_and_drains_persisted_intents() {
-        let mut harness = harness(6, vec![100; 6], false, false, false, None, None);
-        harness.service.event_log.fail_started_at = Some(1);
-
-        let error = harness
-            .service
-            .run(&project(), &profile(2), input())
-            .await
-            .expect_err("Started 审计失败必须停止领取新任务");
-
-        assert!(matches!(
-            error,
-            StandardTranslationServiceError::RecordTaskStarted {
-                task_index,
-                source: FakeError("log"),
-            } if task_index == StandardTranslationTaskIndex::new(1)
-        ));
-        let recorded_events = events(&harness.events);
-        assert_eq!(
-            recorded_events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::AuditTaskStarted(index) => Some(*index),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            vec![0]
-        );
-        assert_eq!(
-            recorded_events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Execute(index) => Some(*index),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            vec![0],
-            "Started 持久化失败的任务不得调用执行器，也不得继续领取后序任务"
-        );
-        assert_all_started_operations_finished(&harness.log_records);
-        assert_eq!(harness.started_not_finalized.load(Ordering::SeqCst), 0);
+        assert_all_started_tasks_observed(&harness.log_records);
     }
 
     #[tokio::test]
@@ -4071,46 +3477,7 @@ mod tests {
         assert!(!events.contains(&Event::CommitAttempt(2)));
         assert!(events.contains(&Event::LogNotCommitted(2)));
         assert!(events.contains(&Event::LogNotCommitted(3)));
-        assert_all_started_operations_finished(&harness.log_records);
-    }
-
-    #[tokio::test]
-    async fn task_failure_preserves_audit_failures_while_draining_every_started_request() {
-        let harness = harness_with_behavior(
-            4,
-            vec![1; 4],
-            false,
-            false,
-            false,
-            Some(1),
-            None,
-            empty_preparation(),
-            vec![FakeOutcomeKind::Complete; 4],
-            Some(2),
-            false,
-        );
-
-        let error = harness
-            .service
-            .run(&project(), &profile(4), input())
-            .await
-            .expect_err("首因和排空审计失败都必须上交");
-        assert!(matches!(
-            error,
-            StandardTranslationServiceError::TaskFailureAndDrainAuditFailures {
-                primary,
-                drain_audit_failures,
-            } if matches!(
-                *primary,
-                StandardTranslationServiceError::ExecuteTask {
-                    task_index,
-                    source: FakeError("execute"),
-                } if task_index == StandardTranslationTaskIndex::new(1)
-            ) && drain_audit_failures.len() == 1
-                && drain_audit_failures[0].task_index == StandardTranslationTaskIndex::new(2)
-                && drain_audit_failures[0].source == FakeError("log")
-        ));
-        assert_all_started_operations_finished(&harness.log_records);
+        assert_all_started_tasks_observed(&harness.log_records);
     }
 
     #[tokio::test]
@@ -4130,8 +3497,6 @@ mod tests {
                 FakeOutcomeKind::Complete,
                 FakeOutcomeKind::Complete,
             ],
-            None,
-            false,
         );
 
         let error = harness
@@ -4156,25 +3521,19 @@ mod tests {
         assert!(events.contains(&Event::LogNotCommitted(3)));
 
         let records = harness.log_records.lock().expect("日志事件记录锁不应中毒");
-        let failure = records
-            .iter()
-            .find_map(|event| match event {
-                AuditEvent::TranslationTaskFinished {
-                    result: TranslationTaskAuditResult::CommitFailed(failure),
-                    ..
-                } => Some(failure),
-                _ => None,
-            })
-            .expect("提交失败时应持久记录已经形成的内容诊断");
-        assert_eq!(failure.accepted_decisions(), 1);
-        assert!(matches!(
-            failure.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::Duplicate
-        ));
+        assert!(records.iter().any(|event| matches!(
+            event,
+            StandardTranslationLogEvent::TaskFinished {
+                task_index,
+                outcome: StandardTranslationLogTaskOutcome::CommitFailed,
+                attempts: Some(_),
+                retry_exhausted: false,
+            } if *task_index == StandardTranslationTaskIndex::new(1)
+        )));
     }
 
     #[tokio::test]
-    async fn commit_failure_stops_admission_before_terminal_audit_finishes() {
+    async fn commit_failure_stops_admission_without_waiting_on_observability() {
         let mut harness = harness(
             6,
             vec![1, 1, 10_000, 1, 1, 1],
@@ -4186,8 +3545,6 @@ mod tests {
         );
         let executor_gate = Arc::new(Semaphore::new(0));
         harness.service.task_executor.block_at = Some((1, Arc::clone(&executor_gate)));
-        let audit_gate = Arc::new(Semaphore::new(0));
-        harness.service.event_log.block_finished_at = Some((0, Arc::clone(&audit_gate)));
         let recorded_events = Arc::clone(&harness.events);
         let project = project();
         let profile = profile(2);
@@ -4203,7 +3560,7 @@ mod tests {
             }
             assert!(
                 events(&recorded_events).contains(&Event::LogCommitFailure(0)),
-                "测试必须先观察到正在等待的提交失败终态审计"
+                "测试必须先观察到提交失败业务事实"
             );
 
             executor_gate.add_permits(1);
@@ -4219,9 +3576,8 @@ mod tests {
             }
             assert!(
                 !events(&recorded_events).contains(&Event::Execute(3)),
-                "提交失败一经得知就必须停发，不能等待终态审计返回后再停发"
+                "提交失败一经得知就必须停发"
             );
-            audit_gate.add_permits(1);
         };
 
         let (result, ()) = tokio::join!(run, observe_stop);
@@ -4233,7 +3589,7 @@ mod tests {
                 source: FakeError("commit"),
             } if task_index == StandardTranslationTaskIndex::new(0)
         ));
-        assert_all_started_operations_finished(&harness.log_records);
+        assert_all_started_tasks_observed(&harness.log_records);
     }
 
     #[tokio::test]
@@ -4333,8 +3689,6 @@ mod tests {
                 FakeOutcomeKind::Unavailable,
                 FakeOutcomeKind::Complete,
             ],
-            None,
-            false,
         );
 
         let report = expect_completed(
@@ -4359,111 +3713,29 @@ mod tests {
         let completed = records
             .iter()
             .filter_map(|event| match event {
-                AuditEvent::TranslationTaskFinished {
-                    result: TranslationTaskAuditResult::Completed(task),
-                    ..
-                } => Some(task),
+                StandardTranslationLogEvent::TaskFinished {
+                    outcome, attempts, ..
+                } => Some((*outcome, *attempts)),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let partial = completed[0];
-        assert!(matches!(partial, TranslationTaskLogRecord::Partial { .. }));
-        assert_eq!(partial.accepted_decisions(), 1);
-        assert_eq!(partial.accepted()[0].id(), 1);
         assert_eq!(
-            partial.accepted()[0].leader(),
-            expected_output(0, 1, true).identity().logical_location()
+            completed,
+            vec![
+                (
+                    StandardTranslationLogTaskOutcome::Partial,
+                    NonZeroUsize::new(1)
+                ),
+                (
+                    StandardTranslationLogTaskOutcome::Unavailable,
+                    NonZeroUsize::new(1)
+                ),
+                (
+                    StandardTranslationLogTaskOutcome::Complete,
+                    NonZeroUsize::new(1)
+                ),
+            ]
         );
-        assert_eq!(partial.accepted()[0].propagation_targets().len(), 1);
-        assert!(matches!(
-            partial.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::Duplicate
-        ));
-        assert!(matches!(
-            partial.diagnostics()[0],
-            TranslationProtocolDiagnostic::UnknownId { id: 99, .. }
-        ));
-
-        let unavailable = completed[1];
-        assert!(matches!(
-            unavailable,
-            TranslationTaskLogRecord::Unavailable {
-                reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
-                ..
-            }
-        ));
-        assert_eq!(unavailable.unresolved().len(), 2);
-        assert!(matches!(
-            unavailable.diagnostics()[0],
-            TranslationProtocolDiagnostic::InvalidResponse { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn persistent_log_failure_is_a_technical_error_after_the_task_commit() {
-        let harness = harness_with_behavior(
-            3,
-            vec![1; 3],
-            false,
-            false,
-            false,
-            None,
-            None,
-            empty_preparation(),
-            vec![FakeOutcomeKind::Complete; 3],
-            Some(1),
-            false,
-        );
-
-        let error = harness
-            .service
-            .run(&project(), &profile(3), input())
-            .await
-            .expect_err("持久日志失败必须阻断后续任务");
-
-        assert!(matches!(
-            error,
-            StandardTranslationServiceError::RecordTaskFinished {
-                task_index,
-                source: FakeError("log")
-            } if task_index == StandardTranslationTaskIndex::new(1)
-        ));
-        let events = events(&harness.events);
-        assert_eq!(committed(&events), vec![0, 1]);
-        assert!(!events.contains(&Event::CommitAttempt(2)));
-        assert!(events.contains(&Event::LogNotCommitted(2)));
-    }
-
-    #[tokio::test]
-    async fn commit_and_diagnostic_log_failures_are_preserved_together() {
-        let harness = harness_with_behavior(
-            2,
-            vec![1; 2],
-            false,
-            false,
-            false,
-            None,
-            Some(1),
-            empty_preparation(),
-            vec![FakeOutcomeKind::Complete, FakeOutcomeKind::Partial],
-            Some(1),
-            false,
-        );
-
-        let error = harness
-            .service
-            .run(&project(), &profile(2), input())
-            .await
-            .expect_err("提交和诊断日志同时失败必须保留两个原因");
-
-        assert!(matches!(
-            error,
-            StandardTranslationServiceError::CommitTaskAndRecordFailure {
-                task_index,
-                commit_source: FakeError("commit"),
-                log_source: FakeError("log")
-            } if task_index == StandardTranslationTaskIndex::new(1)
-        ));
     }
 
     #[tokio::test]
@@ -4755,25 +4027,25 @@ mod tests {
             .collect()
     }
 
-    fn assert_all_started_operations_finished(records: &Arc<Mutex<Vec<AuditEvent>>>) {
-        let records = records.lock().expect("审计记录锁不应中毒");
+    fn assert_all_started_tasks_observed(records: &Arc<Mutex<Vec<StandardTranslationLogEvent>>>) {
+        let records = records.lock().expect("观察记录锁不应中毒");
         let mut started = records
             .iter()
             .filter_map(|event| match event {
-                AuditEvent::TranslationTaskStarted { operation_id, .. } => Some(*operation_id),
+                StandardTranslationLogEvent::TaskStarted { task_index, .. } => Some(*task_index),
                 _ => None,
             })
             .collect::<Vec<_>>();
         let mut finished = records
             .iter()
             .filter_map(|event| match event {
-                AuditEvent::TranslationTaskFinished { operation_id, .. } => Some(*operation_id),
+                StandardTranslationLogEvent::TaskFinished { task_index, .. } => Some(*task_index),
                 _ => None,
             })
             .collect::<Vec<_>>();
         started.sort_unstable();
         finished.sort_unstable();
-        assert_eq!(finished, started, "正常返回前必须终结每个已持久化意图");
+        assert_eq!(finished, started, "正常返回前必须观察每个已启动任务的终态");
     }
 
     fn completed(events: &[Event]) -> Vec<usize> {

@@ -166,7 +166,7 @@ where
                     &project,
                     execution.profile.shared_llm_client(),
                     semantics,
-                    error_path.clone(),
+                    selected_lua.program().clone(),
                 )
                 .await
                 .map_err(|source| TranslateServiceError::Lua {
@@ -432,7 +432,7 @@ mod tests {
             project: &OpenedProject,
             llm_client: Arc<Self::Client>,
             semantics: Arc<dyn TrustedLuaTranslationSemantics>,
-            script_path: PathBuf,
+            program: crate::rpg_maker::lua::runtime::OwnedLuaProgram,
         ) -> Result<OperationCompletion<()>, Self::Error> {
             assert!(Arc::ptr_eq(&llm_client, &self.expected_client));
             assert_eq!(
@@ -446,7 +446,7 @@ mod tests {
                 .push(Event::Lua {
                     project: project.clone(),
                     client_name: llm_client.0.to_owned(),
-                    script_path,
+                    script_path: program.main_script_path().to_path_buf(),
                 });
 
             if self.failure == Some(Failure::Lua) {
@@ -482,10 +482,7 @@ mod tests {
                 Arc::clone(&self.profile),
                 self.standard.clone(),
                 self.lua.as_ref().map(|selected| {
-                    SelectedLua::new(
-                        selected.script_path().to_path_buf(),
-                        selected.executor().clone(),
-                    )
+                    SelectedLua::new(selected.program().clone(), selected.executor().clone())
                 }),
             ))
         }
@@ -540,7 +537,10 @@ mod tests {
                 },
                 lua: lua_script.map(|path| {
                     SelectedLua::new(
-                        PathBuf::from(path),
+                        crate::rpg_maker::lua::runtime::OwnedLuaProgram::new(
+                            PathBuf::from(path),
+                            b"return nil".to_vec(),
+                        ),
                         FakeLuaTranslation {
                             events,
                             failure,

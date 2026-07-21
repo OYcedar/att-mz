@@ -24,6 +24,20 @@ MV candidate/www/data + candidate/www/js
 `<projects.root>/<engine>/<name>`，验证冻结来源指纹，再准备对应版本的目录发布候选。
 任何失败发生在 publish 之前时都显式 discard 候选；publish 已开始后等待唯一明确终态。
 
+WriteBack 的 Lua 选择属于项目运行方案：
+
+- 项目从未成功保存 WriteBack 方案且省略 `--lua` 时，本次执行 Standard-only；成功后保存
+  “不启用 Lua”的方案；
+- 已有保存方案时，省略 `--lua` 精确复用上次成功选择；若方案启用 Lua，则执行数据库中
+  保存的主程序正文；
+- 显式提供非空 Lua 文件时，本次启用 Lua，并以文件正文、SHA-256 与无损 Windows 解析路径
+  精确替换旧的 WriteBack Lua 程序；
+- 显式提供零字节 Lua 文件时，本次执行 Standard-only，并清除 WriteBack Lua 主程序；Lua
+  私有数据库状态不由核心猜测或删除。
+
+路径只用于 chunk 名、`require` 搜索目录和诊断；主程序主动加载的模块、文件与进程仍是
+可信 Lua 的动态外部依赖，不随主程序进入快照。
+
 ## 2. 读取与发布前不变量
 
 项目开启边界先读取 metadata；Standard Reader 随后在同一个只读数据库视图中读取活动
@@ -98,7 +112,8 @@ ScrollingText 的块级 mutation 覆盖完整 `105 + 405*`。模型必须返回�
 
 ## 5. Lua 候选能力
 
-显式 Lua 在 Standard 成功后运行，获得公共 `ctx.project/json/source/rpg_maker/db`、
+本次运行方案启用的 Lua 在 Standard 成功后运行，获得公共
+`ctx.project/json/source/rpg_maker/db`、
 候选专属 `ctx.output` 和 `ctx.write_back`；`extract`、`translation`、`llm` 为 nil。
 `ctx.write_back.layout` 复用 Rust 布局器。
 
@@ -115,7 +130,7 @@ Lua 使用严格逻辑 `data/...` 与 `js/...` 访问候选；只接受 `/`，�
 [Lua 技术参考](lua.md#10-writeback-候选与布局)和
 [Lua Cookbook](lua-cookbook.md#3-幂等-writeback)。
 
-## 6. 顶层验证与强审计发布
+## 6. 顶层验证、发布与完成边界
 
 Standard 与可选 Lua 完成后，领域边界无条件验证候选：
 
@@ -126,16 +141,23 @@ Standard 与可选 Lua 完成后，领域边界无条件验证候选：
 file ID、文件数、深度和字节预算。被改写文档以合法 JSON 重新编码；未成为 mutation
 Claim 之外的字段和未知命令字段保持来源值。未改写文件从来源稳定复制并同步；被改写文档
 在 Standard 初始候选中作为 overlay 直接写入并同步一次，不先复制同一路径的来源字节
-再覆盖；后续显式 Lua 仍可按其既有契约编辑该候选。
-
-publish 前先持久化 `write_back_publish_started`；只有意图确认后才调用 publisher。
-终态写入 `write_back_publish_finished`，包含 `engine`、实际布局、输出根、语义单元摘要、
-布局诊断和 `lua_executed`。发布已生效但终态审计失败时不回滚输出，而是报告“状态已
-生效但收尾失败”。
+再覆盖；本次启用的 Lua 仍可按其既有契约编辑该候选。
 
 目录交换未生效且 publisher 已确认 `NotPublished` 时，顶层报告项目暂时不可用；它不
 表示数据库损坏或提取过期。已经生效、需要恢复或结果未知的终态继续分别保留其更强的
 失败语义，不自动重试发布。
 
-命令、候选终结、非审计根 shutdown、`run_finished` 和审计 writer shutdown 全部成功
-后才报告完成。合作取消在 publish 前丢弃候选；publish 开始后等待终态。
+目录发布、候选终结及全部必要非日志根完成后，命令才用最后一个短 SQLite 事务替换整套
+WriteBack 运行方案。业务失败、取消或必要收尾失败不更新方案；事务确认回滚时旧方案保持
+不变并退出 1；若提交终态无法确认，则退出 1，明确提示输出结果与方案状态无法确认，并
+建议下次显式传参。输出已经生效但方案保存失败时，诊断必须明确区分“结果已生效”和
+“运行方案未保存”，不能伪装成普通成功。
+
+项目日志只接收不可失败的结构化事件。启动、排队、锁、写入、轮转或关闭故障至多显示
+一次本地化警告，不阻止候选验证、发布或方案保存，也不改变退出码。日志从不作为恢复
+依据。
+
+实时进度只报告已经建立的真实事实：资产读取、规划与文档改写在分母可得时显示局部计数，
+Lua、候选验证和目录发布使用阶段 spinner。局部达到 `N/N` 后仍进入“正在收尾/保存运行
+方案”，必要业务操作全部完成后才显示成功。合作取消在 publish 前丢弃候选；publish 开始
+后切换为安全停止并等待唯一终态，最后保留已确认计数。

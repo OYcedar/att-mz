@@ -18,7 +18,7 @@ Standard 的有限重试属于 RPG Maker 翻译策略；Translate Lua 自己决�
 }
 ```
 
-Client 的严格 JSON `parameters` 顶层字段随后合并；程序不解释 `n`、token 上限或供应商私有字段。只有 `model`、`messages`、`stream` 不得被覆盖。API key 固定作为 Bearer Header 发送，不进入 Debug、错误、审计或输出。
+Client 的严格 JSON `parameters` 顶层字段随后合并；程序不解释 `n`、token 上限或供应商私有字段。只有 `model`、`messages`、`stream` 不得被覆盖。API key 固定作为 Bearer Header 发送，不进入 Debug、错误、普通项目日志或终端输出。
 
 准入顺序为完整序列化、总容量（活动+队列）、Client RPM/burst、活动许可、单次 HTTP。队列已满或准入超时返回 Retryable；Future 取消通过 RAII 归还尚未进入 HTTP 的许可。Client `timeout_ms` 限制完整请求，连接和连续读取超时限制相应网络阶段。
 
@@ -38,7 +38,7 @@ HTTP 200 后只严格要求实际消费的核心：
 - 正文 `id` 缺失、null 或类型错误时为 `None`；
 - `usage` 缺失、null、不完整或类型错误时整体为 `None`。
 
-因此 `provider_request_id` 与 `provider_response_id` 都是可选值，互不补位；审计写 `null`，Lua 返回 `nil`。`final_response_usage` 只表示最终成功 HTTP 响应可用的 usage，不声称覆盖失败尝试或完整计费。
+因此 `provider_request_id` 与 `provider_response_id` 都是可选值，互不补位；允许记录该事实的类型化项目日志 payload 写 `null`，Lua 返回 `nil`。`final_response_usage` 只表示最终成功 HTTP 响应可用的 usage，不声称覆盖失败尝试或完整计费。
 
 这里的宽松只针对第三方供应商 HTTP 信封。`message.content` 内由模型生成的 RPG Maker
 翻译正文仍执行完整的 ID 到字符串数组对象、权威行形状、ATT token、语言和逐 ID 内容
@@ -54,4 +54,4 @@ Fatal 包含请求序列化/构造、TLS/证书、其他 HTTP 状态，以及 HT
 
 shutdown 停止新准入并唤醒尚未进入 HTTP 的等待者；已开始的请求继续到单次明确终态。所有路径归还容量，shutdown 等待活动请求结束。
 
-错误、Debug 和审计不包含 API key、完整 messages、完整请求正文、完整响应、原文或译文。Client Debug 不显示秘密或完整 parameters 值。
+错误、Debug、普通项目日志和终端不包含 API key、Authorization Header、完整 messages、完整请求正文、完整响应、模型正文、原文或译文。Client Debug 不显示秘密或完整 parameters 值。日志写入、轮转或关闭失败不停止请求、不丢弃合法响应，也不改变原本的退出码。

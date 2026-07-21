@@ -2,7 +2,6 @@
 //!
 //! 应用入口只选择受信引擎布局；项目、提取、翻译、写回及 Lua 均由本模块拥有。
 
-pub(crate) mod audit;
 pub(crate) mod dialogue;
 #[cfg(test)]
 pub(crate) mod documentation_test;
@@ -123,20 +122,21 @@ impl RpgMakerLayout {
 
 /// 把一次命令选择的 Lua 脚本和唯一执行能力绑定为不可拆分的依赖。
 pub(crate) struct SelectedLua<L> {
-    script_path: PathBuf,
+    program: lua::runtime::OwnedLuaProgram,
     executor: L,
 }
 
 impl<L> SelectedLua<L> {
-    pub(crate) fn new(script_path: PathBuf, executor: L) -> Self {
-        Self {
-            script_path,
-            executor,
-        }
+    pub(crate) fn new(program: lua::runtime::OwnedLuaProgram, executor: L) -> Self {
+        Self { program, executor }
     }
 
     pub(crate) fn script_path(&self) -> &Path {
-        &self.script_path
+        self.program.main_script_path()
+    }
+
+    pub(crate) const fn program(&self) -> &lua::runtime::OwnedLuaProgram {
+        &self.program
     }
 
     pub(crate) fn executor(&self) -> &L {

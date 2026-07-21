@@ -5,15 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
 
+use super::WriteBackProgressPhase;
 use super::standard::{
     ReplaceChoicesMutation, ReplaceDialogueMutation, ReplaceEventBodyMutation,
     RpgMakerWriteBackDocumentRewriter, SetTextMutation, StandardWriteBackMutation,
     StandardWriteBackMutationPlan,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::ProjectName;
 use crate::rpg_maker::extract::document::{
     RpgMakerDocumentId, RpgMakerDocumentSelection, RpgMakerProjectDocumentReader,
@@ -150,14 +153,25 @@ fn validate_relative_output_path(
 pub(crate) struct RpgMakerWriteBackDocumentRewritingService<R, C> {
     document_reader: R,
     cpu_executor: C,
+    progress: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
 }
 
 impl<R, C> RpgMakerWriteBackDocumentRewritingService<R, C> {
-    pub(crate) const fn new(document_reader: R, cpu_executor: C) -> Self {
+    pub(crate) fn new(document_reader: R, cpu_executor: C) -> Self {
         Self {
             document_reader,
             cpu_executor,
+            progress: Arc::new(NoopProgressObserver),
         }
+    }
+
+    /// 为文档改写绑定同步、不可失败的业务进度观察者。
+    pub(crate) fn with_progress<Q>(mut self, progress: Q) -> Self
+    where
+        Q: ProgressObserver<WriteBackProgressPhase> + 'static,
+    {
+        self.progress = Arc::new(progress);
+        self
     }
 }
 
@@ -174,7 +188,13 @@ where
         project: &OpenedProject,
         plan: StandardWriteBackMutationPlan,
     ) -> Result<Self::RewrittenDocuments, Self::Error> {
+        let progress = Arc::clone(&self.progress);
         if plan.mutations().is_empty() {
+            progress.observe(ProgressSnapshot::determinate(
+                WriteBackProgressPhase::RewritingDocuments,
+                0,
+                0,
+            ));
             return Ok(RpgMakerRewrittenDocuments::empty(project));
         }
 
@@ -196,9 +216,25 @@ where
             workspace_root,
             jobs,
         } = prepared.map_err(RpgMakerWriteBackDocumentRewritingError::Rewrite)?;
+        let total_documents = u64::try_from(jobs.len()).expect("写回文档数量必须可表示为 u64");
+        progress.observe(ProgressSnapshot::determinate(
+            WriteBackProgressPhase::RewritingDocuments,
+            0,
+            total_documents,
+        ));
+        let completed_documents = Arc::new(Mutex::new(0_u64));
+        let jobs = jobs
+            .into_iter()
+            .map(|job| ProgressTrackedRewriteJob {
+                job,
+                progress: Arc::clone(&progress),
+                completed_documents: Arc::clone(&completed_documents),
+                total_documents,
+            })
+            .collect();
         let rewritten = self
             .cpu_executor
-            .execute_ordered_map(jobs, rewrite_document)
+            .execute_ordered_map(jobs, rewrite_document_with_progress)
             .await
             .map_err(RpgMakerWriteBackDocumentRewritingError::ScheduleRewrite)?;
         self.cpu_executor
@@ -359,6 +395,13 @@ enum PhysicalDocumentKey {
 struct DocumentRewriteJob {
     documents: MutableDocuments,
     mutations: Vec<StandardWriteBackMutation>,
+}
+
+struct ProgressTrackedRewriteJob {
+    job: DocumentRewriteJob,
+    progress: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
+    completed_documents: Arc<Mutex<u64>>,
+    total_documents: u64,
 }
 
 struct PreparedDocumentRewrite {
@@ -540,6 +583,25 @@ fn rewrite_document(
     } = job;
     apply_mutations(&mut documents, &mutations)?;
     serialize_rewritten_files(documents)
+}
+
+fn rewrite_document_with_progress(
+    tracked: ProgressTrackedRewriteJob,
+) -> Result<Vec<RpgMakerRewrittenFile>, RpgMakerWriteBackDocumentRewriteFailure> {
+    let result = rewrite_document(tracked.job);
+    if result.is_ok() {
+        let mut completed = tracked
+            .completed_documents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *completed += 1;
+        tracked.progress.observe(ProgressSnapshot::determinate(
+            WriteBackProgressPhase::RewritingDocuments,
+            *completed,
+            tracked.total_documents,
+        ));
+    }
+    result
 }
 
 fn apply_mutations(
@@ -1896,6 +1958,7 @@ impl Error for RpgMakerWriteBackDocumentRewriteFailure {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::sync::{Arc, Mutex};
 
     use serde_json::json;
 
@@ -1912,6 +1975,21 @@ mod tests {
     use crate::rpg_maker::write_back::standard::{
         EventBodyMutationSegment, RpgMakerWriteBackLaidOutLine, StandardWriteBackMutation,
     };
+
+    #[derive(Clone, Default)]
+    struct RecordingProgress(Arc<Mutex<Vec<ProgressSnapshot<WriteBackProgressPhase>>>>);
+
+    impl ProgressObserver<WriteBackProgressPhase> for RecordingProgress {
+        fn observe(&self, snapshot: ProgressSnapshot<WriteBackProgressPhase>) {
+            self.0.lock().expect("进度记录锁不应中毒").push(snapshot);
+        }
+    }
+
+    impl RecordingProgress {
+        fn snapshots(&self) -> Vec<ProgressSnapshot<WriteBackProgressPhase>> {
+            self.0.lock().expect("进度记录锁不应中毒").clone()
+        }
+    }
 
     #[derive(Clone, Copy, Debug)]
     struct FakeError;
@@ -1994,10 +2072,26 @@ mod tests {
         }
     }
 
+    struct InlineCpu;
+
+    impl CpuTaskExecutor for InlineCpu {
+        type Error = FakeError;
+
+        async fn execute<T, F>(&self, task: F) -> Result<T, CpuTaskExecutionError<Self::Error>>
+        where
+            T: Send + 'static,
+            F: FnOnce() -> T + Send + 'static,
+        {
+            Ok(task())
+        }
+    }
+
     #[tokio::test]
     async fn empty_plan_returns_project_bound_empty_candidate_without_dependencies() {
         let project = project();
-        let service = RpgMakerWriteBackDocumentRewritingService::new(PanickingReader, PanickingCpu);
+        let progress = RecordingProgress::default();
+        let service = RpgMakerWriteBackDocumentRewritingService::new(PanickingReader, PanickingCpu)
+            .with_progress(progress.clone());
 
         let candidate = service
             .rewrite(&project, StandardWriteBackMutationPlan::empty())
@@ -2007,6 +2101,14 @@ mod tests {
         assert_eq!(candidate.project_name(), project.name());
         assert_eq!(candidate.workspace_root(), project.workspace_root());
         assert!(candidate.files().is_empty());
+        assert_eq!(
+            progress.snapshots(),
+            vec![ProgressSnapshot::determinate(
+                WriteBackProgressPhase::RewritingDocuments,
+                0,
+                0,
+            )]
+        );
     }
 
     #[tokio::test]
@@ -2050,6 +2152,110 @@ mod tests {
                 CpuTaskExecutionError::Unavailable(FakeError)
             )
         ));
+    }
+
+    #[tokio::test]
+    async fn document_progress_counts_only_successfully_rewritten_physical_documents() {
+        let project = project();
+        let items_source = RpgMakerSource::data(StandardDataFile::Items);
+        let actors_source = RpgMakerSource::data(StandardDataFile::Actors);
+        let documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([
+                (
+                    RpgMakerDocumentId::Data(StandardDataFile::Items),
+                    json!([null, {"name": "道具"}]),
+                ),
+                (
+                    RpgMakerDocumentId::Data(StandardDataFile::Actors),
+                    json!([null, {"name": "角色"}]),
+                ),
+            ]),
+            Vec::new(),
+        );
+        let progress = RecordingProgress::default();
+        let service =
+            RpgMakerWriteBackDocumentRewritingService::new(StaticReader(documents), InlineCpu)
+                .with_progress(progress.clone());
+
+        service
+            .rewrite(
+                &project,
+                plan(vec![
+                    set_text(
+                        RpgMakerLocation::value(
+                            items_source,
+                            vec![
+                                RpgMakerLocationStep::index(1),
+                                RpgMakerLocationStep::key("name"),
+                            ],
+                        ),
+                        "道具",
+                        "Item",
+                    ),
+                    set_text(
+                        RpgMakerLocation::value(
+                            actors_source,
+                            vec![
+                                RpgMakerLocationStep::index(1),
+                                RpgMakerLocationStep::key("name"),
+                            ],
+                        ),
+                        "角色",
+                        "Actor",
+                    ),
+                ]),
+            )
+            .await
+            .expect("两个物理文档都应成功改写");
+
+        assert_eq!(
+            progress.snapshots(),
+            vec![
+                ProgressSnapshot::determinate(WriteBackProgressPhase::RewritingDocuments, 0, 2,),
+                ProgressSnapshot::determinate(WriteBackProgressPhase::RewritingDocuments, 1, 2,),
+                ProgressSnapshot::determinate(WriteBackProgressPhase::RewritingDocuments, 2, 2,),
+            ]
+        );
+
+        let invalid_documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([(
+                RpgMakerDocumentId::Data(StandardDataFile::Items),
+                json!([null, {"name": "已变化"}]),
+            )]),
+            Vec::new(),
+        );
+        let failed_progress = RecordingProgress::default();
+        let failed_service = RpgMakerWriteBackDocumentRewritingService::new(
+            StaticReader(invalid_documents),
+            InlineCpu,
+        )
+        .with_progress(failed_progress.clone());
+
+        failed_service
+            .rewrite(
+                &project,
+                plan(vec![set_text(
+                    RpgMakerLocation::value(
+                        RpgMakerSource::data(StandardDataFile::Items),
+                        vec![
+                            RpgMakerLocationStep::index(1),
+                            RpgMakerLocationStep::key("name"),
+                        ],
+                    ),
+                    "道具",
+                    "Item",
+                )]),
+            )
+            .await
+            .expect_err("原文不匹配的物理文档必须失败");
+        assert_eq!(
+            failed_progress.snapshots(),
+            vec![ProgressSnapshot::determinate(
+                WriteBackProgressPhase::RewritingDocuments,
+                0,
+                1,
+            )]
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use pcre2::bytes::{Regex, RegexBuilder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::rpg_maker::text::DataFileName;
 
@@ -12,6 +12,7 @@ use crate::rpg_maker::text::DataFileName;
 #[derive(Clone, Debug)]
 pub(super) struct RulesDefinition {
     rules: Vec<RuleDefinition>,
+    canonical_json: String,
 }
 
 #[cfg(test)]
@@ -75,13 +76,32 @@ impl RulesDefinition {
     pub(super) fn parse(source: &str) -> Result<Self, RulesDefinitionError> {
         let raw: RawRulesDefinition =
             toml::from_str(source).map_err(RulesDefinitionError::InvalidToml)?;
+        Self::from_raw_rules(raw.rule)
+    }
+
+    /// 从项目数据库保存的当前 canonical 语义重建已验证规则。
+    pub(super) fn parse_canonical_json(source: &str) -> Result<Self, RulesDefinitionError> {
+        let raw = serde_json::from_str::<Vec<RawRuleDefinition>>(source)
+            .map_err(RulesDefinitionError::InvalidCanonicalJson)?;
+        let definition = Self::from_raw_rules(raw)?;
+        if definition.canonical_json != source {
+            return Err(RulesDefinitionError::NonCanonicalJson);
+        }
+        Ok(definition)
+    }
+
+    fn from_raw_rules(raw: Vec<RawRuleDefinition>) -> Result<Self, RulesDefinitionError> {
+        let canonical_json =
+            serde_json::to_string(&raw).map_err(RulesDefinitionError::EncodeCanonicalJson)?;
         let rules = raw
-            .rule
             .into_iter()
             .enumerate()
             .map(|(index, rule)| RuleDefinition::try_from_raw(index + 1, rule))
             .collect::<Result<_, _>>()?;
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            canonical_json,
+        })
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -95,6 +115,10 @@ impl RulesDefinition {
     pub(super) fn into_rules(self) -> Vec<RuleDefinition> {
         self.rules
     }
+
+    pub(super) fn canonical_json(&self) -> &str {
+        &self.canonical_json
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,17 +127,27 @@ struct RawRulesDefinition {
     rule: Vec<RawRuleDefinition>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawRuleDefinition {
+    #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     plugin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parameter: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pattern: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     decode_json: bool,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// 一条规则的受信内部表达。
@@ -464,6 +498,9 @@ impl fmt::Debug for CompiledPattern {
 #[derive(Debug)]
 pub(crate) enum RulesDefinitionError {
     InvalidToml(toml::de::Error),
+    InvalidCanonicalJson(serde_json::Error),
+    EncodeCanonicalJson(serde_json::Error),
+    NonCanonicalJson,
     MissingSource {
         rule_number: usize,
     },
@@ -515,6 +552,13 @@ impl fmt::Display for RulesDefinitionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidToml(error) => write!(formatter, "Rules TOML 无效：{error}"),
+            Self::InvalidCanonicalJson(error) => {
+                write!(formatter, "保存的 Rules canonical JSON 无效：{error}")
+            }
+            Self::EncodeCanonicalJson(error) => {
+                write!(formatter, "无法编码 Rules canonical JSON：{error}")
+            }
+            Self::NonCanonicalJson => formatter.write_str("保存的 Rules 定义不是 canonical JSON"),
             Self::MissingSource { rule_number } => write!(
                 formatter,
                 "Rules 第 {rule_number} 条规则必须指定 file、plugin 或 code + parameter 来源"
@@ -585,8 +629,10 @@ impl Error for RulesDefinitionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidToml(source) => Some(source),
+            Self::InvalidCanonicalJson(source) | Self::EncodeCanonicalJson(source) => Some(source),
             Self::InvalidPattern { source, .. } => Some(source),
-            Self::MissingSource { .. }
+            Self::NonCanonicalJson
+            | Self::MissingSource { .. }
             | Self::ConflictingSources { .. }
             | Self::ParameterWithoutCode { .. }
             | Self::MissingParameter { .. }

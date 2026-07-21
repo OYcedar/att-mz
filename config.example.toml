@@ -72,12 +72,17 @@ max_depth = 128
 [observability]
 root = "logs"
 
-[observability.audit]
-queue_capacity = 256
-lock_timeout_ms = 30000
-max_record_bytes = 4194304
-max_file_bytes = 268435456
-retained_rotated_files = 8
+[observability.log]
+level = "info"
+queue_capacity = 1024
+batch_max_records = 64
+batch_max_bytes = 1048576
+flush_interval_ms = 100
+shutdown_timeout_ms = 2000
+lock_timeout_ms = 1000
+max_record_bytes = 262144
+max_file_bytes = 67108864
+retained_rotated_files = 4
 
 [llm.clients.primary]
 url = "https://api.example.com/v1/chat/completions"

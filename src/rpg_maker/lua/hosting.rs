@@ -18,12 +18,14 @@ use crate::storage::sqlite_session::{
     SqliteInteractiveSessionOperations,
 };
 
+#[cfg(test)]
+use super::runtime::OwnedLuaProgram;
 use super::runtime::{
-    OwnedLuaProgram, TrustedLuaBindingFinalization, TrustedLuaBindingFinalizationError,
-    TrustedLuaBindingFinalizer, TrustedLuaCommonBindings, TrustedLuaCommonHostCalls,
-    TrustedLuaExtractHostCalls, TrustedLuaExtractIntent, TrustedLuaHostCallError,
-    TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor,
-    TrustedLuaTranslateHostCalls, TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
+    TrustedLuaBindingFinalization, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
+    TrustedLuaCommonBindings, TrustedLuaCommonHostCalls, TrustedLuaExtractHostCalls,
+    TrustedLuaExtractIntent, TrustedLuaHostCallError, TrustedLuaRuntimeBindings,
+    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor, TrustedLuaTranslateHostCalls,
+    TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
 };
 use super::{
     LuaInvocation, LuaProjectContext, LuaSourcePath, TrustedLuaExecutionHost,
@@ -80,19 +82,18 @@ where
     S: SqliteInteractiveSessionFactory,
 {
     type TranslationClient = L::Client;
-    type Error = TrustedLuaExecutionHostingError<<F as FileReader>::Error, S::Error, R::Error>;
+    type Error = TrustedLuaExecutionHostingError<S::Error, R::Error>;
 
     async fn execute(
         &self,
         invocation: LuaInvocation<Self::TranslationClient>,
     ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
-        let (phase, script_path, project) = match invocation {
-            LuaInvocation::Extract {
-                script_path,
-                project,
-            } => (HostingPhase::Extract, script_path, project),
+        let (phase, program, project) = match invocation {
+            LuaInvocation::Extract { program, project } => {
+                (HostingPhase::Extract, program, project)
+            }
             LuaInvocation::Translate {
-                script_path,
+                program,
                 project,
                 llm_client,
                 semantics,
@@ -101,29 +102,15 @@ where
                     llm_client,
                     semantics,
                 },
-                script_path,
+                program,
                 project,
             ),
             LuaInvocation::WriteBack {
-                script_path,
+                program,
                 project,
                 calls,
-            } => (HostingPhase::WriteBack(calls), script_path, project),
+            } => (HostingPhase::WriteBack(calls), program, project),
         };
-
-        let requested_script_path = script_path.clone();
-        let read_file = self
-            .file_system
-            .read_file(script_path)
-            .await
-            .map_err(|source| TrustedLuaExecutionHostingError::ReadScript {
-                script_path: requested_script_path,
-                source,
-            })?;
-        let program = OwnedLuaProgram::new(
-            read_file.resolved_path().to_path_buf(),
-            read_file.into_bytes(),
-        );
 
         let database_path = project.database_path().to_path_buf();
         let opened = self
@@ -574,13 +561,9 @@ where
     }
 }
 
-/// Host 在脚本加载、数据库建立、VM 或收尾阶段遇到的失败。
+/// Host 在数据库建立、VM 或收尾阶段遇到的失败。
 #[derive(Debug)]
-pub(crate) enum TrustedLuaExecutionHostingError<F, O, R> {
-    ReadScript {
-        script_path: PathBuf,
-        source: ReadFileError<F>,
-    },
+pub(crate) enum TrustedLuaExecutionHostingError<O, R> {
     OpenDatabase {
         database_path: PathBuf,
         source: OpenSqliteInteractiveSessionError<O>,
@@ -594,22 +577,13 @@ pub(crate) enum TrustedLuaExecutionHostingError<F, O, R> {
     },
 }
 
-impl<F, O, R> fmt::Display for TrustedLuaExecutionHostingError<F, O, R>
+impl<O, R> fmt::Display for TrustedLuaExecutionHostingError<O, R>
 where
-    F: fmt::Display,
     O: fmt::Display,
     R: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ReadScript {
-                script_path,
-                source,
-            } => write!(
-                formatter,
-                "无法读取可信 Lua 主程序 {}：{source}",
-                script_path.display()
-            ),
             Self::OpenDatabase {
                 database_path,
                 source,
@@ -630,15 +604,13 @@ where
     }
 }
 
-impl<F, O, R> Error for TrustedLuaExecutionHostingError<F, O, R>
+impl<O, R> Error for TrustedLuaExecutionHostingError<O, R>
 where
-    F: Error + 'static,
     O: Error + 'static,
     R: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ReadScript { source, .. } => Some(source),
             Self::OpenDatabase { source, .. } => Some(source),
             Self::Runtime(source) => Some(source),
             Self::Cleanup(source) => Some(source),
@@ -700,7 +672,7 @@ mod tests {
         type Error = FakeError;
 
         async fn read_file(&self, _path: PathBuf) -> Result<ReadFile, ReadFileError<Self::Error>> {
-            record(&self.events, "read");
+            record(&self.events, "source-read");
             Ok(ReadFile::new(
                 PathBuf::from("C:/resolved/main.lua"),
                 b"return true".to_vec(),
@@ -934,7 +906,7 @@ mod tests {
             crate::rpg_maker::project::test_layout_profile(),
         );
         LuaInvocation::extract(
-            PathBuf::from("main.lua"),
+            OwnedLuaProgram::new(PathBuf::from("main.lua"), b"return nil".to_vec()),
             LuaProjectContext::for_frozen_source(
                 project.name().as_str(),
                 crate::rpg_maker::RpgMakerEngine::Mz,
@@ -963,10 +935,7 @@ mod tests {
             OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty)
         );
 
-        assert_eq!(
-            *events.lock().unwrap(),
-            ["read", "open", "start", "finalize"]
-        );
+        assert_eq!(*events.lock().unwrap(), ["open", "start", "finalize"]);
     }
 
     #[tokio::test]
@@ -1041,10 +1010,7 @@ mod tests {
                 FakeError("unavailable")
             ))
         ));
-        assert_eq!(
-            *events.lock().unwrap(),
-            ["read", "open", "start", "finalize"]
-        );
+        assert_eq!(*events.lock().unwrap(), ["open", "start", "finalize"]);
     }
 
     #[tokio::test]
@@ -1061,10 +1027,7 @@ mod tests {
         .expect("取消时回滚活动事务并关闭会话应是正常结果");
 
         assert_eq!(completion, OperationCompletion::Cancelled);
-        assert_eq!(
-            *events.lock().unwrap(),
-            ["read", "open", "start", "finalize"]
-        );
+        assert_eq!(*events.lock().unwrap(), ["open", "start", "finalize"]);
     }
 
     #[tokio::test]
@@ -1084,7 +1047,7 @@ mod tests {
             error,
             TrustedLuaExecutionHostingError::OpenDatabase { .. }
         ));
-        assert_eq!(*events.lock().unwrap(), ["read", "open"]);
+        assert_eq!(*events.lock().unwrap(), ["open"]);
     }
 
     #[tokio::test]

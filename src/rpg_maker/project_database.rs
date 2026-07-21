@@ -1,5 +1,7 @@
 //! RPG Maker 项目数据库的创建、读取与状态收敛职责。
 
+mod run_plan;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -16,6 +18,24 @@ use crate::storage::sqlite::{
     CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand,
     SqliteDatabaseCreator, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor,
     SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
+};
+
+use run_plan::{
+    CREATE_EXTRACT_RULES_DEFINITION_TABLE, CREATE_EXTRACT_RUN_PLAN_TABLE,
+    CREATE_INIT_RUN_PLAN_TABLE, CREATE_LUA_PROGRAM_TABLE, CREATE_TRANSLATE_RUN_PLAN_TABLE,
+    CREATE_WRITE_BACK_RUN_PLAN_TABLE, SELECT_LUA_PROGRAMS, SELECT_RUN_PLAN_SINGLETONS,
+    decode_project_run_plans,
+};
+#[allow(
+    unused_imports,
+    reason = "运行方案组合根 API 在同次纵向重构完成接线后由 application 消费"
+)]
+pub(crate) use run_plan::{
+    ExtractRulesCanonicalJson, ExtractRunPlan, FinalProjectRunPlanPersistenceService, InitRunPlan,
+    InvalidProjectRunPlans, InvalidRunPlanValue, LuaProgramPhase, LuaProgramSnapshot,
+    ProjectRunPlanFinalizer, ProjectRunPlanPersistenceService, ProjectRunPlanReadError,
+    ProjectRunPlanReplaceError, ProjectRunPlanReplacement, ProjectRunPlanRepository,
+    ProjectRunPlans, TranslateRunPlan, WriteBackRunPlan,
 };
 
 const PROJECT_DATABASE_FILE_NAME: &str = "project.db";
@@ -177,6 +197,12 @@ WHERE sql IS NOT NULL
   AND (
     tbl_name IN (
       'metadata',
+      'init_run_plan',
+      'extract_run_plan',
+      'extract_rules_definition',
+      'translate_run_plan',
+      'write_back_run_plan',
+      'lua_program',
       'standard_asset_owner_state',
       'standard_text_group',
       'standard_text_unit',
@@ -977,6 +1003,7 @@ pub(crate) struct ProjectDatabaseState {
     terminology_json: String,
     placeholder_rules_json: String,
     mv_dialogue_rules_json: String,
+    run_plans: ProjectRunPlans,
     schema_version: i64,
 }
 
@@ -1009,6 +1036,7 @@ impl ProjectDatabaseState {
             terminology_json: "[]".to_owned(),
             placeholder_rules_json: "[]".to_owned(),
             mv_dialogue_rules_json: r#"{"rules":[]}"#.to_owned(),
+            run_plans: ProjectRunPlans::default(),
             schema_version: 13,
         }
     }
@@ -1081,6 +1109,7 @@ pub(crate) enum InvalidCurrentProjectDatabase {
     OwnerState { reason: String },
     TranslationResources { reason: String },
     ProjectDefinitions { reason: String },
+    RunPlans(InvalidProjectRunPlans),
     Integrity { reason: String },
 }
 
@@ -1099,6 +1128,7 @@ impl fmt::Display for InvalidCurrentProjectDatabase {
             Self::ProjectDefinitions { reason } => {
                 write!(formatter, "项目定义状态无效：{reason}")
             }
+            Self::RunPlans(reason) => write!(formatter, "运行方案状态无效：{reason}"),
             Self::Integrity { reason } => write!(formatter, "数据库完整性无效：{reason}"),
         }
     }
@@ -1108,6 +1138,7 @@ impl Error for InvalidCurrentProjectDatabase {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Metadata(source) => Some(source),
+            Self::RunPlans(source) => Some(source),
             Self::ManagedSchema { .. }
             | Self::SchemaChangedDuringInspection { .. }
             | Self::OwnerState { .. }
@@ -1121,6 +1152,42 @@ impl Error for InvalidCurrentProjectDatabase {
 fn expected_managed_schema() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     vec![
         ("table", "metadata", "metadata", CREATE_METADATA_TABLE),
+        (
+            "table",
+            "init_run_plan",
+            "init_run_plan",
+            CREATE_INIT_RUN_PLAN_TABLE,
+        ),
+        (
+            "table",
+            "extract_run_plan",
+            "extract_run_plan",
+            CREATE_EXTRACT_RUN_PLAN_TABLE,
+        ),
+        (
+            "table",
+            "extract_rules_definition",
+            "extract_rules_definition",
+            CREATE_EXTRACT_RULES_DEFINITION_TABLE,
+        ),
+        (
+            "table",
+            "translate_run_plan",
+            "translate_run_plan",
+            CREATE_TRANSLATE_RUN_PLAN_TABLE,
+        ),
+        (
+            "table",
+            "write_back_run_plan",
+            "write_back_run_plan",
+            CREATE_WRITE_BACK_RUN_PLAN_TABLE,
+        ),
+        (
+            "table",
+            "lua_program",
+            "lua_program",
+            CREATE_LUA_PROGRAM_TABLE,
+        ),
         (
             "table",
             "standard_asset_owner_state",
@@ -1639,6 +1706,9 @@ where
 }
 
 /// Init 所依赖的路径级项目数据库检查与收敛职责。
+///
+/// 调用方必须在检查前取得项目命令租约，并持有到检查或收敛返回明确终态，避免同一
+/// 项目的 ATT 命令在多次严格读取与最终 CAS 之间改变权威状态。
 pub(crate) trait ProjectDatabaseStateReconciler: Send + Sync {
     type InspectionError: Error + Send + Sync + 'static;
     type ReconciliationError: Error + Send + Sync + 'static;
@@ -1718,6 +1788,34 @@ where
 {
     queries
         .query_existing_database(database_path.to_path_buf(), query)
+        .await
+        .map_err(|error| match error {
+            QueryExistingDatabaseError::NotFound => {
+                ProjectDatabaseInspectionError::DatabaseNotFound {
+                    path: database_path.to_path_buf(),
+                }
+            }
+            QueryExistingDatabaseError::QueryFailed(source) => {
+                ProjectDatabaseInspectionError::ReadDatabase {
+                    path: database_path.to_path_buf(),
+                    stage,
+                    source,
+                }
+            }
+        })
+}
+
+async fn read_inspection_snapshot<Q>(
+    queries: &Q,
+    database_path: &Path,
+    stage: &'static str,
+    requested: Vec<SqliteQuery>,
+) -> Result<Vec<Vec<SqliteRow>>, ProjectDatabaseInspectionError<Q::Error>>
+where
+    Q: SqliteQueryExecutor,
+{
+    queries
+        .query_existing_database_snapshot(database_path.to_path_buf(), requested)
         .await
         .map_err(|error| match error {
             QueryExistingDatabaseError::NotFound => {
@@ -1824,6 +1922,31 @@ where
         path: database_path.clone(),
         reason,
     })?;
+    let run_plan_results = read_inspection_snapshot(
+        queries,
+        &database_path,
+        "读取运行方案与 Lua 主程序快照",
+        vec![
+            SqliteQuery::new(SELECT_RUN_PLAN_SINGLETONS, Vec::new()),
+            SqliteQuery::new(SELECT_LUA_PROGRAMS, Vec::new()),
+        ],
+    )
+    .await?;
+    let [run_plan_singletons, lua_programs] = <[Vec<SqliteRow>; 2]>::try_from(run_plan_results)
+        .map_err(|results| ProjectDatabaseInspectionError::InvalidDatabase {
+            path: database_path.clone(),
+            reason: InvalidCurrentProjectDatabase::RunPlans(InvalidProjectRunPlans::new(format!(
+                "运行方案快照应返回两组结果，实际为 {} 组",
+                results.len()
+            ))),
+        })?;
+    let run_plans =
+        decode_project_run_plans(run_plan_singletons, lua_programs).map_err(|reason| {
+            ProjectDatabaseInspectionError::InvalidDatabase {
+                path: database_path.clone(),
+                reason: InvalidCurrentProjectDatabase::RunPlans(reason),
+            }
+        })?;
 
     let quick_check = read_inspection_rows(
         queries,
@@ -1875,6 +1998,7 @@ where
         terminology_json,
         placeholder_rules_json,
         mv_dialogue_rules_json,
+        run_plans,
         schema_version: schema_version_after,
     })
 }
@@ -2075,6 +2199,7 @@ where
         },
         placeholder_rules_json: current.placeholder_rules_json,
         mv_dialogue_rules_json: current.mv_dialogue_rules_json,
+        run_plans: current.run_plans,
         schema_version: current.schema_version,
     };
     Ok(ProjectDatabaseReconciliation { state })
@@ -2136,6 +2261,12 @@ where
 fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
     let mut commands = [
         CREATE_METADATA_TABLE,
+        CREATE_INIT_RUN_PLAN_TABLE,
+        CREATE_EXTRACT_RUN_PLAN_TABLE,
+        CREATE_EXTRACT_RULES_DEFINITION_TABLE,
+        CREATE_TRANSLATE_RUN_PLAN_TABLE,
+        CREATE_WRITE_BACK_RUN_PLAN_TABLE,
+        CREATE_LUA_PROGRAM_TABLE,
         CREATE_STANDARD_ASSET_OWNER_STATE_TABLE,
         CREATE_STANDARD_TEXT_GROUP_TABLE,
         CREATE_STANDARD_TEXT_UNIT_TABLE,
@@ -2437,36 +2568,49 @@ mod tests {
             invocation.path,
             PathBuf::from("C:/projects/测试 游戏/project.db")
         );
-        assert_eq!(invocation.commands.len(), 13);
+        assert_eq!(invocation.commands.len(), 19);
         assert_eq!(invocation.commands[0].statement(), CREATE_METADATA_TABLE);
         assert!(invocation.commands[0].parameters().is_empty());
         assert_eq!(
             invocation.commands[1].statement(),
-            CREATE_STANDARD_ASSET_OWNER_STATE_TABLE
+            CREATE_INIT_RUN_PLAN_TABLE
         );
         assert_eq!(
             invocation.commands[2].statement(),
-            CREATE_STANDARD_TEXT_GROUP_TABLE
+            CREATE_EXTRACT_RUN_PLAN_TABLE
         );
         assert_eq!(
             invocation.commands[3].statement(),
-            CREATE_STANDARD_TEXT_UNIT_TABLE
+            CREATE_EXTRACT_RULES_DEFINITION_TABLE
         );
         assert_eq!(
             invocation.commands[4].statement(),
-            CREATE_STANDARD_MUTATION_CLAIM_TABLE
+            CREATE_TRANSLATE_RUN_PLAN_TABLE
         );
         assert_eq!(
             invocation.commands[5].statement(),
-            CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX
+            CREATE_WRITE_BACK_RUN_PLAN_TABLE
+        );
+        assert_eq!(invocation.commands[6].statement(), CREATE_LUA_PROGRAM_TABLE);
+        assert_eq!(
+            invocation.commands[7].statement(),
+            CREATE_STANDARD_ASSET_OWNER_STATE_TABLE
         );
         assert_eq!(
-            invocation.commands[6].statement(),
-            CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX
+            invocation.commands[8].statement(),
+            CREATE_STANDARD_TEXT_GROUP_TABLE
         );
-        assert_eq!(invocation.commands[9].statement(), INSERT_METADATA);
         assert_eq!(
-            invocation.commands[9].parameters(),
+            invocation.commands[9].statement(),
+            CREATE_STANDARD_TEXT_UNIT_TABLE
+        );
+        assert_eq!(
+            invocation.commands[10].statement(),
+            CREATE_STANDARD_MUTATION_CLAIM_TABLE
+        );
+        assert_eq!(invocation.commands[15].statement(), INSERT_METADATA);
+        assert_eq!(
+            invocation.commands[15].parameters(),
             &[
                 SqliteValue::Text("测试 游戏".to_owned()),
                 SqliteValue::Text("ja".to_owned()),
@@ -2478,48 +2622,48 @@ mod tests {
             ]
         );
         assert_eq!(
-            invocation.commands[10].parameters(),
+            invocation.commands[16].parameters(),
             &[
                 SqliteValue::Text(TERMINOLOGY_RESOURCE_KIND.to_owned()),
                 SqliteValue::Text("[]".to_owned()),
             ]
         );
         assert_eq!(
-            invocation.commands[11].parameters(),
+            invocation.commands[17].parameters(),
             &[
                 SqliteValue::Text(PLACEHOLDER_RULES_RESOURCE_KIND.to_owned()),
                 SqliteValue::Text("[]".to_owned()),
             ]
         );
         assert_eq!(
-            invocation.commands[12].parameters(),
+            invocation.commands[18].parameters(),
             &[
                 SqliteValue::Text(MV_DIALOGUE_RULES_DEFINITION_KIND.to_owned()),
                 SqliteValue::Text(r#"{"rules":[]}"#.to_owned()),
             ]
         );
         assert!(
-            invocation.commands[2]
+            invocation.commands[8]
                 .statement()
                 .contains("PRIMARY KEY (owner, group_location)")
         );
         assert!(
-            invocation.commands[3]
+            invocation.commands[9]
                 .statement()
                 .contains("source_context_json")
         );
         assert!(
-            invocation.commands[3]
+            invocation.commands[9]
                 .statement()
                 .contains("translation_state")
         );
         assert!(
-            invocation.commands[4]
+            invocation.commands[10]
                 .statement()
                 .contains("resource_key   TEXT NOT NULL")
         );
         assert!(
-            invocation.commands[1]
+            invocation.commands[7]
                 .statement()
                 .contains("'builtin', 'rules', 'lua'")
         );
@@ -2533,6 +2677,12 @@ mod tests {
             .expect("测试必须启用外键约束");
         for statement in [
             CREATE_METADATA_TABLE,
+            CREATE_INIT_RUN_PLAN_TABLE,
+            CREATE_EXTRACT_RUN_PLAN_TABLE,
+            CREATE_EXTRACT_RULES_DEFINITION_TABLE,
+            CREATE_TRANSLATE_RUN_PLAN_TABLE,
+            CREATE_WRITE_BACK_RUN_PLAN_TABLE,
+            CREATE_LUA_PROGRAM_TABLE,
             CREATE_STANDARD_ASSET_OWNER_STATE_TABLE,
             CREATE_STANDARD_TEXT_GROUP_TABLE,
             CREATE_STANDARD_TEXT_UNIT_TABLE,
@@ -2580,6 +2730,37 @@ mod tests {
             validate_managed_schema(read_managed_schema(&connection)),
             Err(InvalidCurrentProjectDatabase::ManagedSchema { .. })
         ));
+
+        connection
+            .execute(
+                "INSERT INTO extract_run_plan (singleton, builtin_enabled, rules_enabled, lua_enabled) VALUES (1, 0, 0, 0)",
+                [],
+            )
+            .expect_err("空 Extract owner 集合不得持久化");
+        connection
+            .execute(
+                "INSERT INTO extract_rules_definition (singleton, canonical_json) VALUES (1, '[]')",
+                [],
+            )
+            .expect_err("空 Rules 集合表示停用，不得保存为 active 定义");
+        connection
+            .execute(
+                "INSERT INTO extract_rules_definition (singleton, canonical_json) VALUES (1, ?1)",
+                rusqlite::params![br#"[{"file":"Actors.json","path":"[].name"}]"#.to_vec()],
+            )
+            .expect_err("Rules canonical_json 的 BLOB 伪装不得通过 TEXT schema 约束");
+        connection
+            .execute(
+                "INSERT INTO translate_run_plan (singleton, profile_id) VALUES (1, ?1)",
+                rusqlite::params![b"quality".to_vec()],
+            )
+            .expect_err("Profile ID 的 BLOB 伪装不得通过 TEXT schema 约束");
+        connection
+            .execute(
+                "INSERT INTO lua_program (phase, source, source_sha256, resolved_path_utf16) VALUES ('extract', ?1, ?2, ?3)",
+                rusqlite::params![Vec::<u8>::new(), vec![0_u8; 32], vec![0x43_u8, 0_u8]],
+            )
+            .expect_err("零字节 Lua 应由命令语义清除，不能进入快照表");
 
         let insert_group = "INSERT INTO standard_text_group (owner, group_location, group_order, group_kind, projection_recipe_json) VALUES (?1, ?2, 0, 'database_entry', '[]')";
         let insert_unit = "INSERT INTO standard_text_unit (owner, group_location, unit_role, unit_order, source_content_json, source_context_json, translation_content_json, translation_state) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7)";
@@ -2891,6 +3072,7 @@ mod tests {
 
     struct RecordingQueryExecutor {
         invocations: Mutex<Vec<QueryInvocation>>,
+        snapshots: Mutex<Vec<(PathBuf, Vec<SqliteQuery>)>>,
         responses:
             Mutex<VecDeque<Result<Vec<SqliteRow>, QueryExistingDatabaseError<FakeDriverError>>>>,
     }
@@ -2907,6 +3089,7 @@ mod tests {
         ) -> Self {
             Self {
                 invocations: Mutex::new(Vec::new()),
+                snapshots: Mutex::new(Vec::new()),
                 responses: Mutex::new(VecDeque::from(responses)),
             }
         }
@@ -2940,6 +3123,10 @@ mod tests {
             path: PathBuf,
             queries: Vec<SqliteQuery>,
         ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
+            self.snapshots
+                .lock()
+                .expect("query snapshots mutex should not be poisoned")
+                .push((path.clone(), queries.clone()));
             let mut results = Vec::with_capacity(queries.len());
             for query in queries {
                 results.push(self.query_existing_database(path.clone(), query).await?);
@@ -3030,6 +3217,16 @@ mod tests {
                 SqliteValue::Text(MV_DIALOGUE_RULES_DEFINITION_KIND.to_owned()),
                 SqliteValue::Text(r#"{"rules":[]}"#.to_owned()),
             ])]),
+            Ok(vec![SqliteRow::new(vec![
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+            ])]),
+            Ok(Vec::new()),
             Ok(vec![SqliteRow::new(vec![SqliteValue::Text(
                 "ok".to_owned(),
             )])]),
@@ -3129,9 +3326,19 @@ mod tests {
             .lock()
             .expect("query invocations mutex should not be poisoned");
         assert_eq!(state.mv_dialogue_rules_json(), r#"{"rules":[]}"#);
-        assert_eq!(invocations.len(), 9);
+        assert_eq!(invocations.len(), 11);
         assert_eq!(invocations[0].query.statement(), SELECT_SCHEMA_VERSION);
-        assert_eq!(invocations[8].query.statement(), SELECT_SCHEMA_VERSION);
+        assert_eq!(invocations[10].query.statement(), SELECT_SCHEMA_VERSION);
+        let snapshots = service
+            .queries
+            .snapshots
+            .lock()
+            .expect("query snapshots mutex should not be poisoned");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].0, PathBuf::from("C:/projects/demo/project.db"));
+        assert_eq!(snapshots[0].1.len(), 2);
+        assert_eq!(snapshots[0].1[0].statement(), SELECT_RUN_PLAN_SINGLETONS);
+        assert_eq!(snapshots[0].1[1].statement(), SELECT_LUA_PROGRAMS);
     }
 
     #[tokio::test]

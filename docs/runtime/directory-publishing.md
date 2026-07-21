@@ -2,7 +2,7 @@
 
 ## 1. 边界
 
-`SystemFileSystem` 提供普通读取、目录树指纹、通用独占文件租约、受控候选编辑和可恢复目录发布。根只理解文件、目录、路径范围、物理身份、锁和资源预算，不理解项目、RPG Maker、`data/js`、`www` 或审计 wire。
+`SystemFileSystem` 提供普通读取、目录树指纹、通用独占文件租约、受控候选编辑和可恢复目录发布。根只理解文件、目录、路径范围、物理身份、锁和资源预算，不理解项目、RPG Maker、`data/js`、`www` 或项目日志记录格式。
 
 不对 `projects.root` 做全局 NTFS 品牌检查。普通读取和指纹只验证当前操作需要的普通文件、稳定身份、reparse/hardlink 拒绝与预算。独占租约在实际取得锁时验证锁能力；发布器在真实 prepare/publish 时验证同卷、handle rename、稳定 file ID 与恢复能力。
 
@@ -107,3 +107,7 @@ journal 使用长度、严格 JSON payload 和 CRC32 framing。只有最终不�
 只有完全成功表示目标已经生效且无残留。`PublishedWithResiduals` 明确表示新目标已生效；`RecoveryRequired`/`OutcomeUnknown` 保留现场，不由调用方猜测、重试或删除。
 
 shutdown 停止新准入，排空已接管的文件、候选、恢复和清理工作。契约保证正常 Win32 故障和进程崩溃后能够依据 journal 恢复，不承诺任意硬件断电下绝对耐久。
+
+WriteBack 只在 publisher 返回明确终态后产生对应的类型化运行事件。普通项目日志是否成功
+接收或写出该事件，不改变上述终态、恢复现场、运行方案保存条件或进程退出码；恢复只
+依据 journal、目录物理身份与项目数据库。

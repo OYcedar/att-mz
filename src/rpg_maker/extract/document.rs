@@ -10,6 +10,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
+use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt};
 use serde_json::{Map, Value};
@@ -221,6 +222,45 @@ pub(crate) trait RpgMakerProjectDocumentReader: Send + Sync {
         project: &OpenedProject,
         selection: RpgMakerDocumentSelection,
     ) -> impl Future<Output = Result<RpgMakerProjectDocuments, Self::Error>> + Send;
+
+    /// 在文档请求集合建立后报告真实分母，并在每份文档完成读取与解析后
+    /// 报告绝对完成数。不需要局部进度的调用方继续使用 `read`。
+    fn read_with_progress(
+        &self,
+        project: &OpenedProject,
+        selection: RpgMakerDocumentSelection,
+        progress: DocumentReadProgress,
+    ) -> impl Future<Output = Result<RpgMakerProjectDocuments, Self::Error>> + Send {
+        let _ = progress;
+        self.read(project, selection)
+    }
+}
+
+/// 文档读取的同步、不可失败绝对进度入口。
+#[derive(Clone)]
+pub(crate) struct DocumentReadProgress {
+    observe: Arc<dyn Fn(u64, u64) + Send + Sync>,
+}
+
+impl DocumentReadProgress {
+    pub(crate) fn new<F>(observe: F) -> Self
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
+        Self {
+            observe: Arc::new(observe),
+        }
+    }
+
+    fn observe(&self, completed: u64, total: u64) {
+        (self.observe)(completed, total);
+    }
+}
+
+impl Default for DocumentReadProgress {
+    fn default() -> Self {
+        Self::new(|_, _| {})
+    }
 }
 
 /// RPG Maker 文档读取阶段的外部配置。
@@ -278,6 +318,16 @@ where
         project: &OpenedProject,
         selection: RpgMakerDocumentSelection,
     ) -> Result<RpgMakerProjectDocuments, Self::Error> {
+        self.read_with_progress(project, selection, DocumentReadProgress::default())
+            .await
+    }
+
+    async fn read_with_progress(
+        &self,
+        project: &OpenedProject,
+        selection: RpgMakerDocumentSelection,
+        progress: DocumentReadProgress,
+    ) -> Result<RpgMakerProjectDocuments, Self::Error> {
         if selection.is_empty() {
             return Ok(RpgMakerProjectDocuments::empty());
         }
@@ -300,10 +350,15 @@ where
                     RpgMakerProjectDocumentReadingError::FileNameCaseMismatch(source)
                 }
             })?;
+        let request_count = requests.len();
+        let total = u64::try_from(request_count).expect("RPG Maker 文档请求数必须能用 u64 表达");
+        if total > 0 {
+            progress.observe(0, total);
+        }
         let read_concurrency = self.config.read_concurrency().get();
         // 第二层只覆盖本次有限请求集合，使读取完成后立即进入 CPU 根的准入等待；
         // 实际执行与已接管队列仍由 CPU 根的统一预算约束。
-        let parse_submission_capacity = requests.len().max(1);
+        let parse_submission_capacity = request_count.max(1);
         let reads = stream::iter(requests.into_iter().enumerate().map(
             |(request_index, request)| async move {
                 let requested_path = request.path.clone();
@@ -345,11 +400,20 @@ where
             })
             .buffer_unordered(parse_submission_capacity);
 
-        let mut completed = work.collect::<Vec<_>>().await;
-        completed.sort_by_key(|(request_index, _)| *request_index);
+        futures_util::pin_mut!(work);
+        let mut outcomes = Vec::with_capacity(request_count);
+        let mut completed = 0_u64;
+        while let Some(outcome) = work.next().await {
+            if outcome.1.is_ok() {
+                completed = completed.saturating_add(1);
+                progress.observe(completed, total);
+            }
+            outcomes.push(outcome);
+        }
+        outcomes.sort_by_key(|(request_index, _)| *request_index);
         let mut documents = BTreeMap::new();
         let mut plugins = Vec::new();
-        for (_, result) in completed {
+        for (_, result) in outcomes {
             match result? {
                 ParsedDocument::Json { id, value } => {
                     documents.insert(id, value);
@@ -669,8 +733,8 @@ fn parse_plugins(path: PathBuf, text: &str) -> Result<ParsedDocument, ParseFailu
 mod tests {
     use std::collections::HashMap;
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
     use crate::rpg_maker::ProjectName;
@@ -800,10 +864,23 @@ var $plugins =
         ];
         let harness = Harness::new(files, entries, 3);
         let selection = RpgMakerDocumentSelection::new([StandardDataFile::Actors], true, true);
+        let progress = Arc::new(Mutex::new(Vec::new()));
 
         let documents = harness
             .service()
-            .read(&project(), selection)
+            .read_with_progress(
+                &project(),
+                selection,
+                DocumentReadProgress::new({
+                    let progress = Arc::clone(&progress);
+                    move |completed, total| {
+                        progress
+                            .lock()
+                            .expect("进度记录锁不应中毒")
+                            .push((completed, total));
+                    }
+                }),
+            )
             .await
             .expect("规范文档应该成功读取");
 
@@ -841,6 +918,10 @@ var $plugins =
         assert_eq!(documents.plugins()[0].index(), 0);
         assert_eq!(documents.plugins()[0].fields()["status"], false);
         assert_eq!(documents.plugins()[0].fields()["future"]["kept"], true);
+        assert_eq!(
+            *progress.lock().expect("进度记录锁不应中毒"),
+            [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]
+        );
     }
 
     #[tokio::test]
@@ -905,12 +986,22 @@ var $plugins =
         let actors = root.join("data").join("Actors.json");
         let invalid_utf8 =
             Harness::new(HashMap::from([(actors.clone(), vec![0xff])]), Vec::new(), 1);
+        let progress = Arc::new(Mutex::new(Vec::new()));
 
         let error = invalid_utf8
             .service()
-            .read(
+            .read_with_progress(
                 &project(),
                 RpgMakerDocumentSelection::new([StandardDataFile::Actors], false, false),
+                DocumentReadProgress::new({
+                    let progress = Arc::clone(&progress);
+                    move |completed, total| {
+                        progress
+                            .lock()
+                            .expect("进度记录锁不应中毒")
+                            .push((completed, total));
+                    }
+                }),
             )
             .await
             .expect_err("非法 UTF-8 应该失败");
@@ -918,6 +1009,7 @@ var $plugins =
             error,
             RpgMakerProjectDocumentReadingError::InvalidUtf8 { path, .. } if path == actors
         ));
+        assert_eq!(*progress.lock().expect("进度记录锁不应中毒"), [(0, 1)]);
 
         let plugins = root.join("js").join("plugins.js");
         let invalid_record = Harness::new(

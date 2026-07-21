@@ -6,6 +6,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use self::runtime::OwnedLuaProgram;
 use self::runtime::TrustedLuaExtractIntent;
 use self::runtime::TrustedLuaTranslationSemantics;
 use self::runtime::TrustedLuaWriteBackHostCalls;
@@ -252,38 +253,35 @@ pub(crate) enum TrustedLuaExecutionOutcome {
 /// 后继续完成受控清理。
 pub(crate) enum LuaInvocation<C> {
     Extract {
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
         project: LuaProjectContext,
     },
     Translate {
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
         project: LuaProjectContext,
         llm_client: Arc<C>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     },
     WriteBack {
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
         project: LuaProjectContext,
         calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
     },
 }
 
 impl<C> LuaInvocation<C> {
-    pub(crate) fn extract(script_path: PathBuf, project: LuaProjectContext) -> Self {
-        Self::Extract {
-            script_path,
-            project,
-        }
+    pub(crate) fn extract(program: OwnedLuaProgram, project: LuaProjectContext) -> Self {
+        Self::Extract { program, project }
     }
 
     pub(crate) fn translate(
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
         project: LuaProjectContext,
         llm_client: Arc<C>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     ) -> Self {
         Self::Translate {
-            script_path,
+            program,
             project,
             llm_client,
             semantics,
@@ -291,12 +289,12 @@ impl<C> LuaInvocation<C> {
     }
 
     pub(crate) fn write_back(
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
         project: LuaProjectContext,
         calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
     ) -> Self {
         Self::WriteBack {
-            script_path,
+            program,
             project,
             calls,
         }
@@ -305,9 +303,9 @@ impl<C> LuaInvocation<C> {
 
 /// 完整拥有可信 Lua 程序生命周期与项目能力桥接的 Host。
 ///
-/// Lua 是用户明确选择并完全信任的本机程序，不建立安全沙箱。Host 负责加载脚本、
-/// 建立 VM、打开同一项目数据库，向全部阶段注入冻结来源 `ctx.source`、RPG Maker
-/// 结构化只读门面 `ctx.rpg_maker` 与 `ctx.db`，在 Translate 阶段根据拥有的 Client
+/// Lua 是用户明确选择并完全信任的本机程序，不建立安全沙箱。Host 接收已经冻结的
+/// 主程序快照、建立 VM、打开同一项目数据库，向全部阶段注入冻结来源 `ctx.source`、
+/// RPG Maker 结构化只读门面 `ctx.rpg_maker` 与 `ctx.db`，在 Translate 阶段根据拥有的 Client
 /// 注入 `ctx.llm`，
 /// 以及执行和关闭全部资源。Host 不把原始数据库连接或凭据暴露
 /// 给脚本。

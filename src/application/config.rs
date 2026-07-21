@@ -43,10 +43,10 @@ use crate::runtime::cpu::{CpuExecutorConfig, CpuWorkerThreads};
 use crate::runtime::filesystem::{
     DirectoryPublisherConfig, ExclusiveFileLeaseConfig, SystemFileSystemConfig, TreeBudget,
 };
-use crate::runtime::json_lines::JsonLinesStreamConfig;
 use crate::runtime::llm::{
     LlmProxyConfiguration, OpenAiChatCompletionClient, OpenAiExecutorConfiguration,
 };
+use crate::runtime::project_log::{ProjectLogConfig, ProjectLogConfigInput, ProjectLogLevel};
 use crate::runtime::sqlite::{
     RusqliteStorageConfiguration, SqliteJournalMode as RuntimeSqliteJournalMode,
     SqliteSynchronous as RuntimeSqliteSynchronous,
@@ -260,6 +260,7 @@ impl ConfiguredRpgMakerCommand {
                 "Init 的数据库快照或本次所选 Lua 会话需要至少两个连接",
             )));
         }
+        let supports_lua_session = raw_common.runtime.sqlite.max_open_connections >= 2;
         let common = CommonCommandConfiguration::build(configuration_directory, raw_common)
             .map_err(ConfigurationLoadError::InvalidValue)?;
 
@@ -279,6 +280,12 @@ impl ConfiguredRpgMakerCommand {
                 }))
             }
             RpgMakerCommandArguments::Extract(arguments) => {
+                let deferred_source =
+                    Arc::new(DeferredConfigurationSource::new(configuration_path, source));
+                let deferred_lua = DeferredLuaRuntimeConfiguration::new(
+                    Arc::clone(&deferred_source),
+                    supports_lua_session,
+                );
                 let raw: RawExtractSelection = parse_selected(source, configuration_path)?;
                 let cpu = build_cpu_configuration(raw.runtime.cpu)
                     .map_err(ConfigurationLoadError::InvalidValue)?;
@@ -290,7 +297,8 @@ impl ConfiguredRpgMakerCommand {
                 } = arguments;
                 let lua = lua
                     .map(|script_path| {
-                        parse_lua_configuration(source, configuration_path)
+                        deferred_lua
+                            .resolve()
                             .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
                     })
                     .transpose()?;
@@ -301,11 +309,18 @@ impl ConfiguredRpgMakerCommand {
                     common,
                     cpu,
                     lua,
+                    deferred_lua,
                     rpg_maker,
                     dialogue_rules_path,
                 }))
             }
             RpgMakerCommandArguments::Translate(arguments) => {
+                let deferred_source =
+                    Arc::new(DeferredConfigurationSource::new(configuration_path, source));
+                let deferred_lua = DeferredLuaRuntimeConfiguration::new(
+                    Arc::clone(&deferred_source),
+                    supports_lua_session,
+                );
                 let raw: RawTranslateSelection = parse_selected(source, configuration_path)?;
                 let cpu = build_cpu_configuration(raw.runtime.cpu)
                     .map_err(ConfigurationLoadError::InvalidValue)?;
@@ -323,52 +338,19 @@ impl ConfiguredRpgMakerCommand {
                 } = arguments;
                 let lua = lua
                     .map(|script_path| {
-                        parse_lua_configuration(source, configuration_path)
+                        deferred_lua
+                            .resolve()
                             .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
                     })
                     .transpose()?;
-                validate_exact_identifier("命令行 PROFILE_ID", &profile_id)
-                    .map_err(ConfigurationLoadError::InvalidValue)?;
-                let selected_profile =
-                    parse_selected_translation_profile(source, configuration_path, &profile_id)?;
-                let llm_client_id = selected_profile.llm_client.clone();
-                let raw_client =
-                    parse_selected_llm_client(source, configuration_path, &llm_client_id)?;
-                let client = Arc::new(
-                    build_llm_client(format!("llm.clients.{llm_client_id}").as_str(), raw_client)
-                        .map_err(ConfigurationLoadError::InvalidValue)?,
-                );
-                let rpg_maker = TranslateConfiguration::build(
+                let rpg_maker = PendingTranslateConfiguration::build(
                     configuration_directory,
                     raw.prompts,
                     raw.languages,
                     raw.rpg_maker,
-                    selected_profile,
-                    client,
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
-                if rpg_maker.profile().max_in_flight_tasks() > llm.total_capacity() {
-                    return Err(ConfigurationLoadError::InvalidValue(invalid(
-                        "rpg_maker.translation_profiles.max_in_flight_tasks",
-                        format!(
-                            "任务并发数 {} 超过 runtime.llm 的活动与排队总容量 {}",
-                            rpg_maker.profile().max_in_flight_tasks(),
-                            llm.total_capacity()
-                        ),
-                    )));
-                }
-                if rpg_maker.profile().max_in_flight_tasks().get()
-                    > tokio::sync::Semaphore::MAX_PERMITS / 2
-                {
-                    return Err(ConfigurationLoadError::InvalidValue(invalid(
-                        "rpg_maker.translation_profiles.max_in_flight_tasks",
-                        format!(
-                            "任务并发数超过顺序最终化窗口支持上限 {}",
-                            tokio::sync::Semaphore::MAX_PERMITS / 2
-                        ),
-                    )));
-                }
-                Ok(Self::Translate(Box::new(ConfiguredTranslateCommand {
+                let configured = ConfiguredTranslateCommand {
                     project_name: project.name,
                     terminology_path: terms,
                     placeholder_rules_path: placeholders,
@@ -376,10 +358,23 @@ impl ConfiguredRpgMakerCommand {
                     cpu,
                     llm,
                     lua,
-                    rpg_maker,
-                })))
+                    deferred_lua,
+                    profile: ConfiguredTranslateProfile::Deferred {
+                        source: deferred_source,
+                        configuration: rpg_maker,
+                    },
+                };
+                let configured = match profile_id {
+                    Some(profile_id) => configured.resolve_profile(&profile_id)?,
+                    None => configured,
+                };
+                Ok(Self::Translate(Box::new(configured)))
             }
             RpgMakerCommandArguments::WriteBack(arguments) => {
+                let deferred_source =
+                    Arc::new(DeferredConfigurationSource::new(configuration_path, source));
+                let deferred_lua =
+                    DeferredLuaRuntimeConfiguration::new(deferred_source, supports_lua_session);
                 let raw: RawWriteBackSelection = parse_selected(source, configuration_path)?;
                 let cpu = build_cpu_configuration(raw.runtime.cpu)
                     .map_err(ConfigurationLoadError::InvalidValue)?;
@@ -392,7 +387,8 @@ impl ConfiguredRpgMakerCommand {
                 let WriteBackArguments { project, lua } = arguments;
                 let lua = lua
                     .map(|script_path| {
-                        parse_lua_configuration(source, configuration_path)
+                        deferred_lua
+                            .resolve()
                             .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
                     })
                     .transpose()?;
@@ -404,6 +400,7 @@ impl ConfiguredRpgMakerCommand {
                     cpu,
                     publisher,
                     lua,
+                    deferred_lua,
                     rpg_maker,
                 }))
             }
@@ -425,8 +422,8 @@ pub(crate) struct CommonCommandConfiguration {
     async_runtime: AsyncRuntimeConfiguration,
     filesystem: SystemFileSystemConfig,
     sqlite: RusqliteStorageConfiguration,
-    audit_root: PathBuf,
-    audit: JsonLinesStreamConfig,
+    observability_root: PathBuf,
+    project_log: ProjectLogConfig,
 }
 
 impl CommonCommandConfiguration {
@@ -441,12 +438,12 @@ impl CommonCommandConfiguration {
             async_runtime: AsyncRuntimeConfiguration::build(raw.runtime.async_runtime)?,
             filesystem: build_file_system_configuration(raw.runtime.filesystem)?,
             sqlite: build_sqlite_configuration(raw.runtime.sqlite)?,
-            audit_root: checked_path(
+            observability_root: checked_path(
                 "observability.root",
                 configuration_directory,
                 raw.observability.root,
             )?,
-            audit: build_audit_configuration(raw.observability.audit)?,
+            project_log: build_project_log_configuration(raw.observability.log)?,
         })
     }
 
@@ -466,12 +463,12 @@ impl CommonCommandConfiguration {
         &self.sqlite
     }
 
-    pub(crate) fn audit_root(&self) -> &Path {
-        &self.audit_root
+    pub(crate) fn observability_root(&self) -> &Path {
+        &self.observability_root
     }
 
-    pub(crate) const fn audit(&self) -> JsonLinesStreamConfig {
-        self.audit
+    pub(crate) const fn project_log(&self) -> ProjectLogConfig {
+        self.project_log
     }
 }
 
@@ -496,6 +493,7 @@ pub(crate) struct ConfiguredExtractCommand {
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     lua: Option<SelectedLuaConfiguration>,
+    deferred_lua: DeferredLuaRuntimeConfiguration,
     rpg_maker: ExtractConfiguration,
     dialogue_rules_path: Option<PathBuf>,
 }
@@ -517,6 +515,13 @@ impl ConfiguredExtractCommand {
         self.lua.as_ref()
     }
 
+    /// 仅在项目状态要求复用 Lua 程序时解析并校验 Lua 运行时配置。
+    pub(crate) fn resolve_lua_runtime(
+        &self,
+    ) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
+        self.deferred_lua.resolve()
+    }
+
     pub(crate) const fn rpg_maker(&self) -> &ExtractConfiguration {
         &self.rpg_maker
     }
@@ -534,7 +539,16 @@ pub(crate) struct ConfiguredTranslateCommand {
     cpu: CpuExecutorConfig,
     llm: SelectedLlmExecutorConfiguration,
     lua: Option<SelectedLuaConfiguration>,
-    rpg_maker: TranslateConfiguration,
+    deferred_lua: DeferredLuaRuntimeConfiguration,
+    profile: ConfiguredTranslateProfile,
+}
+
+enum ConfiguredTranslateProfile {
+    Deferred {
+        source: Arc<DeferredConfigurationSource>,
+        configuration: PendingTranslateConfiguration,
+    },
+    Resolved(TranslateConfiguration),
 }
 
 impl ConfiguredTranslateCommand {
@@ -566,13 +580,99 @@ impl ConfiguredTranslateCommand {
         self.lua.as_ref()
     }
 
-    #[cfg(test)]
-    pub(crate) const fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
-        self.rpg_maker.client()
+    /// 仅在项目状态要求复用 Lua 程序时解析并校验 Lua 运行时配置。
+    pub(crate) fn resolve_lua_runtime(
+        &self,
+    ) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
+        self.deferred_lua.resolve()
     }
 
-    pub(crate) const fn rpg_maker(&self) -> &TranslateConfiguration {
-        &self.rpg_maker
+    /// 返回已经在命令行显式选择并于加载阶段完成校验的 Profile。
+    ///
+    /// `None` 表示调用方必须从项目运行方案取得 Profile，并调用
+    /// [`Self::resolve_profile`]；不会隐式选择配置中的其他条目。
+    pub(crate) fn resolved_profile_id(&self) -> Option<&str> {
+        match &self.profile {
+            ConfiguredTranslateProfile::Deferred { .. } => None,
+            ConfiguredTranslateProfile::Resolved(configuration) => {
+                Some(configuration.profile().id())
+            }
+        }
+    }
+
+    /// 消费待解析命令，并精确选择调用方提供的 Profile。
+    ///
+    /// 显式 Profile 已在加载阶段解析；用同一 ID 再调用是幂等的。若调用方
+    /// 提供不同 ID，则返回配置错误，避免项目状态覆盖显式命令行意图。
+    pub(crate) fn resolve_profile(self, profile_id: &str) -> Result<Self, ConfigurationLoadError> {
+        let configuration_path = self.configuration_path().to_path_buf();
+        validate_exact_identifier("Profile ID", profile_id)
+            .map_err(ConfigurationLoadError::InvalidValue)
+            .map_err(|error| error.with_configuration_path(&configuration_path))?;
+
+        let Self {
+            project_name,
+            terminology_path,
+            placeholder_rules_path,
+            common,
+            cpu,
+            llm,
+            lua,
+            deferred_lua,
+            profile,
+        } = self;
+        let profile = match profile {
+            ConfiguredTranslateProfile::Deferred {
+                source,
+                configuration,
+            } => ConfiguredTranslateProfile::Resolved(configuration.resolve(
+                source.as_ref(),
+                profile_id,
+                llm.total_capacity(),
+            )?),
+            ConfiguredTranslateProfile::Resolved(configuration)
+                if configuration.profile().id() == profile_id =>
+            {
+                ConfiguredTranslateProfile::Resolved(configuration)
+            }
+            ConfiguredTranslateProfile::Resolved(configuration) => {
+                let explicit_profile = configuration.profile().id().to_owned();
+                return Err(ConfigurationLoadError::ProfileSelectionConflict {
+                    path: configuration_path,
+                    explicit_profile,
+                    requested_profile: profile_id.to_owned(),
+                });
+            }
+        };
+        Ok(Self {
+            project_name,
+            terminology_path,
+            placeholder_rules_path,
+            common,
+            cpu,
+            llm,
+            lua,
+            deferred_lua,
+            profile,
+        })
+    }
+
+    fn configuration_path(&self) -> &Path {
+        self.deferred_lua.source.path()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
+        self.rpg_maker().client()
+    }
+
+    pub(crate) fn rpg_maker(&self) -> &TranslateConfiguration {
+        match &self.profile {
+            ConfiguredTranslateProfile::Deferred { .. } => {
+                panic!("Translate Profile 必须在业务装配前完成解析")
+            }
+            ConfiguredTranslateProfile::Resolved(configuration) => configuration,
+        }
     }
 }
 
@@ -582,6 +682,7 @@ pub(crate) struct ConfiguredWriteBackCommand {
     cpu: CpuExecutorConfig,
     publisher: DirectoryPublisherConfig,
     lua: Option<SelectedLuaConfiguration>,
+    deferred_lua: DeferredLuaRuntimeConfiguration,
     rpg_maker: WriteBackConfiguration,
 }
 
@@ -604,6 +705,13 @@ impl ConfiguredWriteBackCommand {
 
     pub(crate) const fn lua(&self) -> Option<&SelectedLuaConfiguration> {
         self.lua.as_ref()
+    }
+
+    /// 仅在项目状态要求复用 Lua 程序时解析并校验 Lua 运行时配置。
+    pub(crate) fn resolve_lua_runtime(
+        &self,
+    ) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
+        self.deferred_lua.resolve()
     }
 
     pub(crate) const fn rpg_maker(&self) -> &WriteBackConfiguration {
@@ -769,20 +877,93 @@ fn build_sqlite_configuration(
     .map_err(|source| invalid("runtime.sqlite", source.to_string()))
 }
 
-fn build_audit_configuration(
-    raw: RawEventLogConfiguration,
-) -> Result<JsonLinesStreamConfig, ConfigurationValueError> {
-    JsonLinesStreamConfig::new(
-        usize_value("observability.audit.queue_capacity", raw.queue_capacity)?,
-        positive_duration("observability.audit.lock_timeout_ms", raw.lock_timeout_ms)?,
-        usize_value("observability.audit.max_record_bytes", raw.max_record_bytes)?,
-        raw.max_file_bytes,
-        usize_value(
-            "observability.audit.retained_rotated_files",
+fn build_project_log_configuration(
+    raw: RawProjectLogConfiguration,
+) -> Result<ProjectLogConfig, ConfigurationValueError> {
+    let level = match raw.level {
+        RawProjectLogLevel::Error => ProjectLogLevel::Error,
+        RawProjectLogLevel::Warn => ProjectLogLevel::Warn,
+        RawProjectLogLevel::Info => ProjectLogLevel::Info,
+        RawProjectLogLevel::Debug => ProjectLogLevel::Debug,
+    };
+    ProjectLogConfig::try_from(ProjectLogConfigInput {
+        level,
+        queue_capacity: usize_value("observability.log.queue_capacity", raw.queue_capacity)?,
+        batch_max_records: usize_value(
+            "observability.log.batch_max_records",
+            raw.batch_max_records,
+        )?,
+        batch_max_bytes: usize_value("observability.log.batch_max_bytes", raw.batch_max_bytes)?,
+        flush_interval: positive_duration(
+            "observability.log.flush_interval_ms",
+            raw.flush_interval_ms,
+        )?,
+        shutdown_timeout: positive_duration(
+            "observability.log.shutdown_timeout_ms",
+            raw.shutdown_timeout_ms,
+        )?,
+        lock_timeout: positive_duration("observability.log.lock_timeout_ms", raw.lock_timeout_ms)?,
+        max_record_bytes: usize_value("observability.log.max_record_bytes", raw.max_record_bytes)?,
+        max_file_bytes: raw.max_file_bytes,
+        retained_rotated_files: usize_value(
+            "observability.log.retained_rotated_files",
             raw.retained_rotated_files,
         )?,
-    )
-    .map_err(|source| invalid("observability.audit", source.to_string()))
+    })
+    .map_err(|source| invalid("observability.log", source.to_string()))
+}
+
+/// 保留仅能在项目运行方案解析后按需消费的配置原文。
+///
+/// 配置可能包含凭据，因此不实现 `Debug`，并在最后一个引用释放时清零正文。
+struct DeferredConfigurationSource {
+    path: PathBuf,
+    source: Zeroizing<String>,
+}
+
+impl DeferredConfigurationSource {
+    fn new(path: &Path, source: &str) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            source: Zeroizing::new(source.to_owned()),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn source(&self) -> &str {
+        self.source.as_str()
+    }
+}
+
+struct DeferredLuaRuntimeConfiguration {
+    source: Arc<DeferredConfigurationSource>,
+    has_sqlite_session_capacity: bool,
+}
+
+impl DeferredLuaRuntimeConfiguration {
+    fn new(source: Arc<DeferredConfigurationSource>, has_sqlite_session_capacity: bool) -> Self {
+        Self {
+            source,
+            has_sqlite_session_capacity,
+        }
+    }
+
+    fn resolve(&self) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
+        if !self.has_sqlite_session_capacity {
+            return Err(ConfigurationLoadError::InvalidValueAtPath {
+                path: self.source.path().to_path_buf(),
+                source: invalid(
+                    "runtime.sqlite.max_open_connections",
+                    "项目状态所选 Lua 会话与命令短操作共享连接预算，必须拥有第二个连接",
+                ),
+            });
+        }
+        parse_lua_configuration(self.source.source(), self.source.path())
+            .map_err(|error| error.with_configuration_path(self.source.path()))
+    }
 }
 
 pub(crate) struct SelectedLuaConfiguration {
@@ -962,28 +1143,84 @@ pub(crate) struct TranslateConfiguration {
     client: Arc<OpenAiChatCompletionClient>,
 }
 
-impl TranslateConfiguration {
+struct PendingTranslateConfiguration {
+    standard_asset: RpgMakerStandardAssetReadingConfig,
+    translate_store: RpgMakerStandardTranslationResultStorageConfig,
+    prompt_root: PathBuf,
+    language_modules: LanguageModuleCatalog,
+}
+
+impl PendingTranslateConfiguration {
     fn build(
         configuration_directory: &Path,
         raw_prompts: RawPromptsConfiguration,
         raw_languages: Vec<RawLanguageConfiguration>,
         raw: RawTranslateRpgMakerSelection,
-        selected_profile: RawSelectedTranslationProfileConfiguration,
-        client: Arc<OpenAiChatCompletionClient>,
     ) -> Result<Self, ConfigurationValueError> {
         Ok(Self {
             standard_asset: build_standard_asset_configuration(raw.standard_asset)?,
             translate_store: build_translation_store_configuration(raw.translate.store)?,
             prompt_root: checked_path("prompts.root", configuration_directory, raw_prompts.root)?,
             language_modules: build_language_modules(raw_languages)?,
-            profile: build_selected_translation_profile(
-                "rpg_maker.translation_profiles",
-                selected_profile,
-            )?,
-            client,
         })
     }
 
+    fn resolve(
+        self,
+        source: &DeferredConfigurationSource,
+        profile_id: &str,
+        llm_capacity: NonZeroUsize,
+    ) -> Result<TranslateConfiguration, ConfigurationLoadError> {
+        let selected_profile =
+            parse_selected_translation_profile(source.source(), source.path(), profile_id)?;
+        let llm_client_id = selected_profile.llm_client.clone();
+        let raw_client = parse_selected_llm_client(source.source(), source.path(), &llm_client_id)?;
+        let client = Arc::new(
+            build_llm_client(format!("llm.clients.{llm_client_id}").as_str(), raw_client)
+                .map_err(ConfigurationLoadError::InvalidValue)
+                .map_err(|error| error.with_configuration_path(source.path()))?,
+        );
+        let profile =
+            build_selected_translation_profile("rpg_maker.translation_profiles", selected_profile)
+                .map_err(ConfigurationLoadError::InvalidValue)
+                .map_err(|error| error.with_configuration_path(source.path()))?;
+        if profile.max_in_flight_tasks() > llm_capacity {
+            return Err(ConfigurationLoadError::InvalidValueAtPath {
+                path: source.path().to_path_buf(),
+                source: invalid(
+                    "rpg_maker.translation_profiles.max_in_flight_tasks",
+                    format!(
+                        "任务并发数 {} 超过 runtime.llm 的活动与排队总容量 {}",
+                        profile.max_in_flight_tasks(),
+                        llm_capacity
+                    ),
+                ),
+            });
+        }
+        if profile.max_in_flight_tasks().get() > tokio::sync::Semaphore::MAX_PERMITS / 2 {
+            return Err(ConfigurationLoadError::InvalidValueAtPath {
+                path: source.path().to_path_buf(),
+                source: invalid(
+                    "rpg_maker.translation_profiles.max_in_flight_tasks",
+                    format!(
+                        "任务并发数超过顺序最终化窗口支持上限 {}",
+                        tokio::sync::Semaphore::MAX_PERMITS / 2
+                    ),
+                ),
+            });
+        }
+        Ok(TranslateConfiguration {
+            standard_asset: self.standard_asset,
+            translate_store: self.translate_store,
+            prompt_root: self.prompt_root,
+            language_modules: self.language_modules,
+            profile,
+            client,
+        })
+    }
+}
+
+impl TranslateConfiguration {
     pub(crate) const fn standard_asset(&self) -> RpgMakerStandardAssetReadingConfig {
         self.standard_asset
     }
@@ -1495,7 +1732,7 @@ fn positive_duration(field: &str, milliseconds: u64) -> Result<Duration, Configu
     Ok(Duration::from_millis(milliseconds))
 }
 
-fn invalid(field: &str, message: impl Into<String>) -> ConfigurationValueError {
+pub(super) fn invalid(field: &str, message: impl Into<String>) -> ConfigurationValueError {
     ConfigurationValueError {
         field: field.to_owned(),
         message: message.into(),
@@ -1554,6 +1791,15 @@ pub(crate) enum ConfigurationLoadError {
     InvalidValueAtPath {
         path: PathBuf,
         source: ConfigurationValueError,
+    },
+    TranslationProfileNotFound {
+        path: PathBuf,
+        profile_id: String,
+    },
+    ProfileSelectionConflict {
+        path: PathBuf,
+        explicit_profile: String,
+        requested_profile: String,
     },
 }
 
@@ -1622,6 +1868,20 @@ impl fmt::Display for ConfigurationLoadError {
                     path.display()
                 )
             }
+            Self::TranslationProfileNotFound { path, profile_id } => write!(
+                formatter,
+                "配置文件 {}：rpg_maker.translation_profiles 中不存在 ID 为 {profile_id} 的 Profile",
+                path.display()
+            ),
+            Self::ProfileSelectionConflict {
+                path,
+                explicit_profile,
+                requested_profile,
+            } => write!(
+                formatter,
+                "配置文件 {}：命令行已显式选择 Profile {explicit_profile}，不能再改用 {requested_profile}",
+                path.display()
+            ),
         }
     }
 }
@@ -1634,7 +1894,9 @@ impl Error for ConfigurationLoadError {
             Self::NotAFile { .. }
             | Self::TooLarge { .. }
             | Self::InvalidUtf8 { .. }
-            | Self::InvalidToml { .. } => None,
+            | Self::InvalidToml { .. }
+            | Self::TranslationProfileNotFound { .. }
+            | Self::ProfileSelectionConflict { .. } => None,
         }
     }
 }
@@ -1645,10 +1907,32 @@ pub(crate) struct SourceLocation {
     column: usize,
 }
 
+impl SourceLocation {
+    #[cfg(test)]
+    pub(super) const fn new(line: usize, column: usize) -> Self {
+        Self { line, column }
+    }
+
+    pub(crate) const fn line(self) -> usize {
+        self.line
+    }
+
+    pub(crate) const fn column(self) -> usize {
+        self.column
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConfigurationValueError {
     field: String,
     message: String,
+}
+
+impl ConfigurationValueError {
+    /// 返回配置契约中的稳定字段身份；面向用户的原因由 i18n 闭集负责呈现。
+    pub(crate) fn field(&self) -> &str {
+        &self.field
+    }
 }
 
 impl fmt::Display for ConfigurationValueError {
@@ -1858,10 +2142,10 @@ fn parse_selected_translation_profile(
         )));
     }
     let selected_index = selection.selected_index.ok_or_else(|| {
-        ConfigurationLoadError::InvalidValue(invalid(
-            "rpg_maker.translation_profiles",
-            format!("没有 ID 为 {requested_id} 的条目"),
-        ))
+        ConfigurationLoadError::TranslationProfileNotFound {
+            path: path.to_path_buf(),
+            profile_id: requested_id.to_owned(),
+        }
     })?;
 
     let profile_deserializer = toml::de::Deserializer::parse(source)
@@ -2902,17 +3186,31 @@ struct RawLuaHostValueConfiguration {
 #[serde(deny_unknown_fields)]
 struct RawObservabilityConfiguration {
     root: PathBuf,
-    audit: RawEventLogConfiguration,
+    log: RawProjectLogConfiguration,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawEventLogConfiguration {
+struct RawProjectLogConfiguration {
+    level: RawProjectLogLevel,
     queue_capacity: u64,
+    batch_max_records: u64,
+    batch_max_bytes: u64,
+    flush_interval_ms: u64,
+    shutdown_timeout_ms: u64,
     lock_timeout_ms: u64,
     max_record_bytes: u64,
     max_file_bytes: u64,
     retained_rotated_files: u64,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawProjectLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
 }
 
 #[derive(Deserialize)]
@@ -3290,6 +3588,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_state_lua_runtime_is_validated_only_when_consumed() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml").replace(
+            "worker_stack_bytes = 8388608",
+            "worker_stack_bytes = \"invalid\"",
+        );
+        let path = directory.write("deferred-lua.toml", &source);
+
+        let ConfiguredRpgMakerCommand::Extract(extract) =
+            load_configuration(&path, extract_command(false))
+                .expect("未复用 Lua 时 Extract 不应解析 Lua 配置")
+        else {
+            panic!("应建立 Extract 配置");
+        };
+        assert!(extract.resolve_lua_runtime().is_err());
+
+        let ConfiguredRpgMakerCommand::Translate(translate) =
+            load_configuration(&path, translate_command_without_profile())
+                .expect("未复用 Lua 时 Translate 不应解析 Lua 配置")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        assert!(translate.resolve_lua_runtime().is_err());
+
+        let ConfiguredRpgMakerCommand::WriteBack(write_back) =
+            load_configuration(&path, write_back_command(false))
+                .expect("未复用 Lua 时 WriteBack 不应解析 Lua 配置")
+        else {
+            panic!("应建立 WriteBack 配置");
+        };
+        assert!(write_back.resolve_lua_runtime().is_err());
+    }
+
+    #[test]
+    fn project_state_lua_runtime_checks_sqlite_session_capacity_on_demand() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml")
+            .replace("max_open_connections = 16", "max_open_connections = 1");
+        let path = directory.write("deferred-lua-capacity.toml", &source);
+        let ConfiguredRpgMakerCommand::WriteBack(configured) =
+            load_configuration(&path, write_back_command(false))
+                .expect("没有实际 Lua 消费时单连接配置应合法")
+        else {
+            panic!("应建立 WriteBack 配置");
+        };
+
+        let error = configured
+            .resolve_lua_runtime()
+            .expect_err("复用项目 Lua 时必须检查第二个 SQLite 连接");
+        assert!(error.to_string().contains("必须拥有第二个连接"));
+    }
+
+    #[test]
+    fn omitted_translate_profile_remains_deferred_until_project_state_is_known() {
+        let directory = TestDirectory::new();
+        let path = directory.write(
+            "deferred-profile.toml",
+            include_str!("../../config.example.toml"),
+        );
+        let ConfiguredRpgMakerCommand::Translate(configured) =
+            load_configuration(&path, translate_command_without_profile())
+                .expect("省略 Profile 应先完成与 Profile 无关的配置加载")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        assert_eq!(configured.resolved_profile_id(), None);
+
+        let configured = (*configured)
+            .resolve_profile("primary")
+            .expect("项目状态中的现行 Profile 应可精确解析");
+        assert_eq!(configured.resolved_profile_id(), Some("primary"));
+        assert_eq!(configured.rpg_maker().profile().id(), "primary");
+    }
+
+    #[test]
+    fn missing_project_state_profile_has_a_distinct_configuration_error() {
+        let directory = TestDirectory::new();
+        let path = directory.write(
+            "missing-profile.toml",
+            include_str!("../../config.example.toml"),
+        );
+        let ConfiguredRpgMakerCommand::Translate(configured) =
+            load_configuration(&path, translate_command_without_profile())
+                .expect("省略 Profile 应等待项目状态解析")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+
+        let error = match (*configured).resolve_profile("removed-profile") {
+            Ok(_) => panic!("已从当前配置移除的保存 Profile 必须显式失败"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigurationLoadError::TranslationProfileNotFound {
+                ref profile_id,
+                ..
+            } if profile_id == "removed-profile"
+        ));
+    }
+
+    #[test]
+    fn explicit_translate_profile_is_still_validated_during_load() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml").replace(
+            "max_message_characters = 24000",
+            "max_message_characters = 0",
+        );
+        let path = directory.write("invalid-explicit-profile.toml", &source);
+
+        assert!(
+            load_configuration(&path, translate_command(false, "primary")).is_err(),
+            "显式 Profile 的无效字段必须在配置加载阶段被拒绝"
+        );
+    }
+
     fn configuration_with_unselected_profile_sentinel(sentinel: &str) -> String {
         format!(
             r#"{}
@@ -3574,9 +3989,9 @@ id = "unused"
         let path = directory.write("client.toml", &invalid_client);
         assert!(load_configuration(&path, translate_command(false, "primary")).is_err());
 
-        let invalid_audit = include_str!("../../config.example.toml")
-            .replace("queue_capacity = 256", "queue_capacity = 0");
-        let path = directory.write("audit.toml", &invalid_audit);
+        let invalid_project_log = include_str!("../../config.example.toml")
+            .replace("queue_capacity = 1024", "queue_capacity = 0");
+        let path = directory.write("project-log.toml", &invalid_project_log);
         assert!(load_configuration(&path, init_command()).is_err());
     }
 
@@ -3645,10 +4060,10 @@ id = "unused"
             "{}\n[llm.clients.unused]\nurl = []\napi_key = \"UNSELECTED_SECRET_SENTINEL\"\nmodel = []\ntimeout_ms = []\nrpm = []\nburst = []\nparameters = []\n",
             include_str!("../../config.example.toml")
         )
-        .replace("queue_capacity = 256", "queue_capacity = 0");
+        .replace("queue_capacity = 1024", "queue_capacity = 0");
         let path = directory.write("unselected-secret.toml", &source);
         let error = match load_configuration(&path, translate_command(false, "primary")) {
-            Ok(_) => panic!("无效审计配置必须拒绝"),
+            Ok(_) => panic!("无效项目日志配置必须拒绝"),
             Err(error) => error,
         };
         let mut diagnostics = format!("{error:?}\n{error}");
@@ -3706,6 +4121,10 @@ id = "unused"
         } else {
             parse_command(["att", "mz", "translate", "--name", "demo", profile])
         }
+    }
+
+    fn translate_command_without_profile() -> MzCommand {
+        parse_command(["att", "mz", "translate", "--name", "demo"])
     }
 
     fn write_back_command(lua: bool) -> MzCommand {
@@ -3784,8 +4203,13 @@ synchronous = "full"
 [observability]
 root = "logs"
 
-[observability.audit]
+[observability.log]
+level = "info"
 queue_capacity = 1
+batch_max_records = 1
+batch_max_bytes = 1
+flush_interval_ms = 1
+shutdown_timeout_ms = 1
 lock_timeout_ms = 1
 max_record_bytes = 1
 max_file_bytes = 1

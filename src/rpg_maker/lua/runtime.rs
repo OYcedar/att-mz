@@ -23,10 +23,20 @@ use crate::rpg_maker::text::TextGroupKind;
 type HostFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 /// 已完整读取并可交给专用 Lua worker 的主程序。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct OwnedLuaProgram {
     main_script_path: PathBuf,
     source: Vec<u8>,
+}
+
+impl fmt::Debug for OwnedLuaProgram {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedLuaProgram")
+            .field("main_script_path", &self.main_script_path)
+            .field("source_bytes", &self.source.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl OwnedLuaProgram {
@@ -735,4 +745,27 @@ pub(crate) trait TrustedLuaRuntimeExecutor: Send + Sync {
         program: OwnedLuaProgram,
         bindings: TrustedLuaRuntimeBindings,
     ) -> TrustedLuaExecutionHandle<Self::Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_program_debug_never_exposes_source_bytes() {
+        const SENTINEL: &str = "ATT_SECRET_LUA_BODY_SENTINEL";
+        let program = OwnedLuaProgram::new(
+            PathBuf::from("C:/scripts/main.lua"),
+            SENTINEL.as_bytes().to_vec(),
+        );
+
+        let debug = format!("{program:?}");
+
+        assert!(debug.contains("OwnedLuaProgram"));
+        assert!(debug.contains("source_bytes"));
+        assert!(
+            !debug.contains(SENTINEL),
+            "Debug 不得泄露 Lua 正文：{debug}"
+        );
+    }
 }

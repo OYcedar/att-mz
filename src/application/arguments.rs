@@ -3,11 +3,19 @@
 //! 本模块只把命令行转换为用户意图，不构造运行时、读取配置或执行业务。
 
 use std::ffi::OsString;
+use std::fmt;
 use std::path::PathBuf;
 
-use clap::error::ErrorKind;
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::error::{ContextKind, ErrorKind};
+use clap::{
+    Arg, ArgAction, ArgMatches, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand,
+    ValueEnum,
+};
 
+use crate::i18n::{
+    ResolvedUiLocale, UiLocaleInputSource, UiLocalizer, UiMessage,
+    resolve_lower_priority_ui_locale, resolve_ui_locale,
+};
 use crate::language::LanguageId;
 use crate::rpg_maker::{MaxFullwidthChars, ProjectName};
 
@@ -15,17 +23,131 @@ use crate::rpg_maker::{MaxFullwidthChars, ProjectName};
 #[derive(Debug)]
 pub(crate) struct AttArguments {
     pub(crate) config: PathBuf,
+    pub(crate) progress: ProgressArgument,
     pub(crate) product: ProductCommand,
 }
 
 impl AttArguments {
+    /// 在 Clap 生成任何用户可见内容前选择 UI locale，并以该语言解析完整命令行。
+    ///
+    /// 成功时同时返回参数与语言来源；Help、Version 和所有参数错误通过
+    /// [`LocalizedCliError`] 返回，调用方无需再次选择 locale 或解析 Clap 文本。
+    pub(crate) fn try_parse_localized_from<I, T>(
+        arguments: I,
+    ) -> Result<(Self, ResolvedUiLocale), LocalizedCliError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+        let explicit_language = match scan_ui_language(&arguments) {
+            UiLanguageScan::Absent => None,
+            UiLanguageScan::Value(value) => Some(value),
+            UiLanguageScan::MissingValue => {
+                let resolved = resolve_lower_priority_ui_locale(UiLocaleInputSource::CommandLine);
+                let localizer = UiLocalizer::new(resolved.locale());
+                let mut command = localized_command(&localizer);
+                let usage = localized_usage(&command.render_usage().to_string(), &localizer);
+                return Err(LocalizedCliError::input(
+                    ErrorKind::MissingRequiredArgument,
+                    localizer.format(UiMessage::CliMissingValue {
+                        argument: "--ui-language",
+                    }),
+                    Some(usage),
+                    &localizer,
+                ));
+            }
+            UiLanguageScan::InvalidUnicode => {
+                let resolved = resolve_lower_priority_ui_locale(UiLocaleInputSource::CommandLine);
+                let localizer = UiLocalizer::new(resolved.locale());
+                let mut command = localized_command(&localizer);
+                let usage = localized_usage(&command.render_usage().to_string(), &localizer);
+                return Err(LocalizedCliError::input(
+                    ErrorKind::InvalidUtf8,
+                    localizer.format(UiMessage::CliInvalidUtf8),
+                    Some(usage),
+                    &localizer,
+                ));
+            }
+        };
+
+        let resolved = match resolve_ui_locale(explicit_language.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let failed_input = match error {
+                    crate::i18n::UiLocaleSelectionError::InvalidLanguageTag { input, .. }
+                    | crate::i18n::UiLocaleSelectionError::UnsupportedLanguage { input, .. } => {
+                        input
+                    }
+                    crate::i18n::UiLocaleSelectionError::EnvironmentNotUnicode => {
+                        UiLocaleInputSource::Environment
+                    }
+                };
+                let fallback = resolve_lower_priority_ui_locale(failed_input);
+                let localizer = UiLocalizer::new(fallback.locale());
+                let mut command = localized_command(&localizer);
+                let usage = localized_usage(&command.render_usage().to_string(), &localizer);
+                return Err(LocalizedCliError::input(
+                    ErrorKind::ValueValidation,
+                    localizer.format(error.ui_message()),
+                    Some(usage),
+                    &localizer,
+                ));
+            }
+        };
+        let localizer = UiLocalizer::new(resolved.locale());
+        let command = localized_command(&localizer);
+        let usage_command = command.clone();
+        let mut fallback_usage_command = command.clone();
+        let fallback_usage = localized_usage(
+            &fallback_usage_command.render_usage().to_string(),
+            &localizer,
+        );
+        let matches = command.try_get_matches_from(arguments).map_err(|error| {
+            LocalizedCliError::from_clap(error, &localizer, Some(fallback_usage.clone()))
+        })?;
+        let raw = RawAttArguments::from_arg_matches(&matches).map_err(|error| {
+            LocalizedCliError::from_clap(error, &localizer, Some(fallback_usage))
+        })?;
+        let RawAttArguments {
+            config,
+            ui_language: _,
+            progress,
+            product,
+        } = raw;
+        let Some(config) = config else {
+            let usage = localized_usage_for_matches(usage_command, &matches, &localizer);
+            return Err(LocalizedCliError::input(
+                ErrorKind::MissingRequiredArgument,
+                localizer.format(UiMessage::CliMissingConfig),
+                Some(usage),
+                &localizer,
+            ));
+        };
+        Ok((
+            Self {
+                config,
+                progress,
+                product,
+            },
+            resolved,
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_parse_from<I, T>(arguments: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
         let raw = RawAttArguments::try_parse_from(arguments)?;
-        let Some(config) = raw.config else {
+        let RawAttArguments {
+            config,
+            ui_language: _,
+            progress,
+            product,
+        } = raw;
+        let Some(config) = config else {
             return Err(RawAttArguments::command().error(
                 ErrorKind::MissingRequiredArgument,
                 "缺少必需的配置路径 `--config <FILE>`",
@@ -33,7 +155,8 @@ impl AttArguments {
         };
         Ok(Self {
             config,
-            product: raw.product,
+            progress,
+            product,
         })
     }
 
@@ -42,6 +165,87 @@ impl AttArguments {
         RawAttArguments::command()
     }
 }
+
+/// 已完成本地化的 CLI 提前退出或输入错误。
+#[derive(Debug)]
+pub(crate) struct LocalizedCliError {
+    kind: ErrorKind,
+    output: String,
+}
+
+impl LocalizedCliError {
+    #[cfg(test)]
+    pub(crate) const fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    pub(crate) const fn exit_code(&self) -> u8 {
+        match self.kind {
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+            _ => 2,
+        }
+    }
+
+    pub(crate) const fn use_stderr(&self) -> bool {
+        self.exit_code() != 0
+    }
+
+    pub(crate) fn output(&self) -> &str {
+        &self.output
+    }
+
+    fn from_clap(
+        error: clap::Error,
+        localizer: &UiLocalizer,
+        fallback_usage: Option<String>,
+    ) -> Self {
+        let kind = error.kind();
+        if matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+            return Self {
+                kind,
+                output: error.to_string(),
+            };
+        }
+
+        let detail = localize_clap_error(&error, localizer);
+        let usage = error
+            .get(ContextKind::Usage)
+            .map(ToString::to_string)
+            .map(|usage| localized_usage(&usage, localizer))
+            .or(fallback_usage);
+        Self::input(kind, detail, usage, localizer)
+    }
+
+    fn input(
+        kind: ErrorKind,
+        detail: String,
+        usage: Option<String>,
+        localizer: &UiLocalizer,
+    ) -> Self {
+        let mut output = format!(
+            "{} {}\n",
+            localizer.format(UiMessage::CliErrorHeading),
+            detail
+        );
+        if let Some(usage) = usage {
+            output.push('\n');
+            output.push_str(&usage);
+            output.push('\n');
+        }
+        output.push('\n');
+        output.push_str(&localizer.format(UiMessage::CliTryHelp));
+        output.push('\n');
+        Self { kind, output }
+    }
+}
+
+impl fmt::Display for LocalizedCliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.output)
+    }
+}
+
+impl std::error::Error for LocalizedCliError {}
 
 /// Clap 解析阶段允许全局参数在子命令前后出现，再由上方边界建立必填不变量。
 #[derive(Debug, Parser)]
@@ -53,8 +257,28 @@ struct RawAttArguments {
     #[arg(long, global = true, value_name = "FILE", value_parser = parse_non_blank_path)]
     config: Option<PathBuf>,
 
+    /// 终端、帮助与项目日志消息使用的界面语言。
+    #[arg(long, global = true, value_name = "LANG", value_parser = parse_non_blank)]
+    ui_language: Option<String>,
+
+    /// 实时进度的呈现方式。
+    #[arg(long, global = true, value_enum, default_value_t = ProgressArgument::Auto)]
+    progress: ProgressArgument,
+
     #[command(subcommand)]
     product: ProductCommand,
+}
+
+/// 用户选择的实时进度呈现策略。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ProgressArgument {
+    /// 仅当 stderr 是交互终端时呈现单行动态进度。
+    #[default]
+    Auto,
+    /// 输出适合 CI 与重定向保存的稀疏纯文本阶段行。
+    Plain,
+    /// 关闭实时进度；最终结果与错误仍会输出。
+    Off,
 }
 
 /// 统一产品入口当前支持的命令域。
@@ -114,7 +338,7 @@ pub(crate) struct InitArguments {
     pub(crate) project: ProjectArguments,
     /// RPG Maker 游戏根目录。
     #[arg(long, value_name = "DIR", value_parser = parse_non_blank_path)]
-    pub(crate) path: PathBuf,
+    pub(crate) path: Option<PathBuf>,
     /// 游戏原文语言 ID。
     #[arg(long, value_name = "LANG", value_parser = parse_language_id)]
     pub(crate) source_language: Option<LanguageId>,
@@ -133,12 +357,6 @@ pub(crate) struct InitArguments {
 }
 
 #[derive(Debug, Args)]
-#[command(group(
-    clap::ArgGroup::new("extract_tasks")
-        .required(true)
-        .multiple(true)
-        .args(["builtin", "rules", "lua"])
-))]
 pub(crate) struct ExtractArguments {
     #[command(flatten)]
     pub(crate) project: ProjectArguments,
@@ -154,12 +372,6 @@ pub(crate) struct ExtractArguments {
 }
 
 #[derive(Debug, Args)]
-#[command(group(
-    clap::ArgGroup::new("extract_tasks")
-        .required(true)
-        .multiple(true)
-        .args(["builtin", "rules", "lua"])
-))]
 pub(crate) struct MvExtractArguments {
     #[command(flatten)]
     pub(crate) project: ProjectArguments,
@@ -188,7 +400,7 @@ pub(crate) struct TranslateArguments {
     pub(crate) project: ProjectArguments,
     /// 配置文件中要使用的翻译 Profile ID。
     #[arg(value_name = "PROFILE_ID", value_parser = parse_non_blank)]
-    pub(crate) profile_id: String,
+    pub(crate) profile_id: Option<String>,
     /// 用该 TOML 文件替换项目当前术语表；省略时复用已保存内容。
     #[arg(long, value_name = "TERMS_TOML", value_parser = parse_non_blank_path)]
     pub(crate) terms: Option<PathBuf>,
@@ -214,6 +426,320 @@ pub(crate) struct ProjectArguments {
     /// RPG Maker 游戏的稳定项目名称。
     #[arg(long, value_name = "NAME")]
     pub(crate) name: ProjectName,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum UiLanguageScan {
+    Absent,
+    Value(String),
+    MissingValue,
+    InvalidUnicode,
+}
+
+fn scan_ui_language(arguments: &[OsString]) -> UiLanguageScan {
+    let mut index = 1;
+    while index < arguments.len() {
+        let Some(argument) = arguments[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if argument == "--" {
+            break;
+        }
+        if let Some(value) = argument.strip_prefix("--ui-language=") {
+            return UiLanguageScan::Value(value.to_owned());
+        }
+        if argument == "--ui-language" {
+            let Some(value) = arguments.get(index + 1) else {
+                return UiLanguageScan::MissingValue;
+            };
+            let Some(value) = value.to_str() else {
+                return UiLanguageScan::InvalidUnicode;
+            };
+            if value.starts_with('-') {
+                return UiLanguageScan::MissingValue;
+            }
+            return UiLanguageScan::Value(value.to_owned());
+        }
+        index += 1;
+    }
+    UiLanguageScan::Absent
+}
+
+fn localized_command(localizer: &UiLocalizer) -> Command {
+    let command = RawAttArguments::command();
+    let command_path = command.get_name().to_owned();
+    localize_command_tree(command, localizer, &command_path)
+}
+
+fn localize_command_tree(
+    mut command: Command,
+    localizer: &UiLocalizer,
+    command_path: &str,
+) -> Command {
+    let command_name = command.get_name().to_owned();
+    let about = localizer.format(command_about(&command_name));
+    let help_template = localized_help_template(&command, localizer);
+    let usage = localized_usage_syntax(command_path, &command_name, localizer);
+
+    command = command
+        .about(about.clone())
+        .long_about(about)
+        .help_template(help_template)
+        .override_usage(usage)
+        .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .disable_version_flag(true);
+
+    const ARGUMENT_IDENTIFIERS: [&str; 17] = [
+        "config",
+        "ui_language",
+        "progress",
+        "name",
+        "path",
+        "source_language",
+        "target_language",
+        "dialogue_max_fullwidth_chars",
+        "scrolling_text_max_fullwidth_chars",
+        "help_description_max_fullwidth_chars",
+        "builtin",
+        "rules",
+        "dialogue_rules",
+        "lua",
+        "profile_id",
+        "terms",
+        "placeholders",
+    ];
+    for identifier in ARGUMENT_IDENTIFIERS {
+        let Some(takes_values) = command
+            .get_arguments()
+            .find(|argument| argument.get_id().as_str() == identifier)
+            .map(|argument| argument.get_action().takes_values())
+        else {
+            continue;
+        };
+        let message = argument_help(identifier).expect("已列出的参数必须拥有本地化帮助消息");
+        let help = localizer.format(message);
+        command = command.mut_arg(identifier, move |argument| {
+            let localized = argument.help(help.clone()).long_help(help);
+            if takes_values {
+                localized.hide_possible_values(true)
+            } else {
+                localized
+            }
+        });
+    }
+
+    command = command.arg(
+        Arg::new("help")
+            .short('h')
+            .long("help")
+            .action(ArgAction::Help)
+            .help(localizer.format(UiMessage::CliPrintHelp)),
+    );
+    if command_name == "att" {
+        command = command.arg(
+            Arg::new("version")
+                .short('V')
+                .long("version")
+                .action(ArgAction::Version)
+                .help(localizer.format(UiMessage::CliPrintVersion)),
+        );
+    }
+
+    for subcommand in command.get_subcommands_mut() {
+        let subcommand_path = format!("{command_path} {}", subcommand.get_name());
+        *subcommand = localize_command_tree(subcommand.clone(), localizer, &subcommand_path);
+    }
+    command
+}
+
+fn localized_usage_syntax(
+    command_path: &str,
+    command_name: &str,
+    localizer: &UiLocalizer,
+) -> String {
+    let options = localizer.format(UiMessage::CliOptionsMetavar);
+    let nested_command = localizer.format(UiMessage::CliCommandMetavar);
+    let syntax = match command_name {
+        "att" | "mz" | "mv" => {
+            format!("{command_path} --config <FILE> [{options}] <{nested_command}>")
+        }
+        "translate" => {
+            format!("{command_path} --config <FILE> --name <NAME> [PROFILE_ID] [{options}]")
+        }
+        "init" | "extract" | "write-back" => {
+            format!("{command_path} --config <FILE> --name <NAME> [{options}]")
+        }
+        _ => format!("{command_path} --config <FILE> [{options}]"),
+    };
+    format!("\u{2068}{syntax}\u{2069}")
+}
+
+fn localized_help_template(command: &Command, localizer: &UiLocalizer) -> String {
+    let mut template = format!(
+        "{{before-help}}{{about-with-newline}}\n{} {{usage}}",
+        localizer.format(UiMessage::CliUsageHeading)
+    );
+    if command.get_subcommands().next().is_some() {
+        template.push_str("\n\n");
+        template.push_str(&localizer.format(UiMessage::CliCommandsHeading));
+        template.push_str("\n{subcommands}");
+    }
+    if command.get_positionals().next().is_some() {
+        template.push_str("\n\n");
+        template.push_str(&localizer.format(UiMessage::CliArgumentsHeading));
+        template.push_str("\n{positionals}");
+    }
+    // 每个命令都显式提供本地化的 `--help`，因此 Options 段始终存在；全局选项在
+    // Clap build 时传播到子命令后也会由同一个占位符呈现。
+    template.push_str("\n\n");
+    template.push_str(&localizer.format(UiMessage::CliOptionsHeading));
+    template.push_str("\n{options}{after-help}");
+    template
+}
+
+fn command_about(name: &str) -> UiMessage<'static> {
+    match name {
+        "att" => UiMessage::AppAbout,
+        "mz" => UiMessage::CliMzAbout,
+        "mv" => UiMessage::CliMvAbout,
+        "init" => UiMessage::CliInitAbout,
+        "extract" => UiMessage::CliExtractAbout,
+        "translate" => UiMessage::CliTranslateAbout,
+        "write-back" => UiMessage::CliWriteBackAbout,
+        _ => UiMessage::AppAbout,
+    }
+}
+
+fn argument_help(identifier: &str) -> Option<UiMessage<'static>> {
+    match identifier {
+        "config" => Some(UiMessage::CliConfigHelp),
+        "ui_language" => Some(UiMessage::CliUiLanguageHelp),
+        "progress" => Some(UiMessage::CliProgressHelp),
+        "name" => Some(UiMessage::CliProjectNameHelp),
+        "path" => Some(UiMessage::CliInitPathHelp),
+        "source_language" => Some(UiMessage::CliSourceLanguageHelp),
+        "target_language" => Some(UiMessage::CliTargetLanguageHelp),
+        "dialogue_max_fullwidth_chars" => Some(UiMessage::CliDialogueWidthHelp),
+        "scrolling_text_max_fullwidth_chars" => Some(UiMessage::CliScrollingWidthHelp),
+        "help_description_max_fullwidth_chars" => Some(UiMessage::CliHelpWidthHelp),
+        "builtin" => Some(UiMessage::CliBuiltinHelp),
+        "rules" => Some(UiMessage::CliRulesHelp),
+        "dialogue_rules" => Some(UiMessage::CliDialogueRulesHelp),
+        "lua" => Some(UiMessage::CliLuaHelp),
+        "profile_id" => Some(UiMessage::CliProfileHelp),
+        "terms" => Some(UiMessage::CliTermsHelp),
+        "placeholders" => Some(UiMessage::CliPlaceholdersHelp),
+        _ => None,
+    }
+}
+
+fn localize_clap_error(error: &clap::Error, localizer: &UiLocalizer) -> String {
+    let argument = error_context(error, ContextKind::InvalidArg)
+        .or_else(|| error_context(error, ContextKind::PriorArg))
+        .unwrap_or_default();
+    let value = error_context(error, ContextKind::InvalidValue)
+        .or_else(|| error_context(error, ContextKind::InvalidSubcommand))
+        .or_else(|| error_context(error, ContextKind::TrailingArg))
+        .unwrap_or_default();
+
+    match error.kind() {
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
+            if value.trim().is_empty() {
+                localizer.format(UiMessage::CliBlankValue)
+            } else if argument.contains("--progress") || argument.contains("progress") {
+                localizer.format(UiMessage::CliInvalidProgress { value: &value })
+            } else if argument.contains("fullwidth") {
+                localizer.format(UiMessage::CliInvalidPositiveInteger)
+            } else if argument.is_empty() {
+                localizer.format(UiMessage::CliParseFailure)
+            } else {
+                localizer.format(UiMessage::CliInvalidValue {
+                    value: &value,
+                    argument: &argument,
+                })
+            }
+        }
+        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => {
+            let unexpected = if value.is_empty() { &argument } else { &value };
+            localizer.format(UiMessage::CliUnexpectedArgument { value: unexpected })
+        }
+        ErrorKind::MissingRequiredArgument => {
+            if argument.contains("--config") || argument.contains("config") {
+                localizer.format(UiMessage::CliMissingConfig)
+            } else if argument.is_empty() {
+                localizer.format(UiMessage::CliParseFailure)
+            } else {
+                localizer.format(UiMessage::CliMissingRequiredArgument { value: &argument })
+            }
+        }
+        ErrorKind::MissingSubcommand => localizer.format(UiMessage::CliMissingSubcommand),
+        ErrorKind::ArgumentConflict if !argument.is_empty() => {
+            localizer.format(UiMessage::CliArgumentConflict {
+                argument: &argument,
+            })
+        }
+        ErrorKind::TooFewValues | ErrorKind::NoEquals => {
+            if argument.is_empty() {
+                localizer.format(UiMessage::CliParseFailure)
+            } else {
+                localizer.format(UiMessage::CliMissingValue {
+                    argument: &argument,
+                })
+            }
+        }
+        ErrorKind::TooManyValues | ErrorKind::WrongNumberOfValues => {
+            if argument.is_empty() {
+                localizer.format(UiMessage::CliParseFailure)
+            } else {
+                localizer.format(UiMessage::CliWrongNumberOfValues {
+                    argument: &argument,
+                })
+            }
+        }
+        ErrorKind::InvalidUtf8 => localizer.format(UiMessage::CliInvalidUtf8),
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::DisplayVersion
+        | ErrorKind::Io
+        | ErrorKind::Format => localizer.format(UiMessage::CliParseFailure),
+        _ => localizer.format(UiMessage::CliParseFailure),
+    }
+}
+
+fn error_context(error: &clap::Error, kind: ContextKind) -> Option<String> {
+    error.get(kind).map(ToString::to_string)
+}
+
+fn localized_usage(usage: &str, localizer: &UiLocalizer) -> String {
+    let usage = usage.trim();
+    let syntax = usage
+        .strip_prefix("Usage:")
+        .map(str::trim_start)
+        .unwrap_or(usage);
+    format!(
+        "{} {}",
+        localizer.format(UiMessage::CliUsageHeading),
+        syntax
+    )
+}
+
+fn localized_usage_for_matches(
+    mut command: Command,
+    matches: &ArgMatches,
+    localizer: &UiLocalizer,
+) -> String {
+    command.build();
+    let mut active_command = &mut command;
+    let mut active_matches = matches;
+    while let Some((name, subcommand_matches)) = active_matches.subcommand() {
+        active_command = active_command
+            .find_subcommand_mut(name)
+            .expect("Clap matches 中的子命令必须存在于同一命令 schema");
+        active_matches = subcommand_matches;
+    }
+    localized_usage(&active_command.render_usage().to_string(), localizer)
 }
 
 fn parse_non_blank(value: &str) -> Result<String, String> {
@@ -244,6 +770,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::i18n::UiLocale;
 
     #[test]
     fn command_schema_is_self_consistent() {
@@ -279,8 +806,8 @@ mod tests {
     }
 
     #[test]
-    fn extract_requires_at_least_one_explicit_task() {
-        let error = AttArguments::try_parse_from([
+    fn extract_without_explicit_owner_is_preserved_for_project_state_resolution() {
+        let parsed = AttArguments::try_parse_from([
             "att",
             "--config",
             "config.toml",
@@ -289,8 +816,13 @@ mod tests {
             "--name",
             "demo",
         ])
-        .expect_err("空提取选择必须拒绝");
-        assert_eq!(error.exit_code(), 2);
+        .expect("省略 owner 应交给项目状态解析");
+        let MzCommand::Extract(arguments) = expect_mz(parsed.product) else {
+            panic!("应解析为提取命令");
+        };
+        assert!(!arguments.builtin);
+        assert!(arguments.rules.is_none());
+        assert!(arguments.lua.is_none());
     }
 
     #[test]
@@ -323,7 +855,7 @@ mod tests {
         let MzCommand::Translate(arguments) = expect_mz(parsed.product) else {
             panic!("应解析为翻译命令");
         };
-        assert_eq!(arguments.profile_id, "Profile-A");
+        assert_eq!(arguments.profile_id.as_deref(), Some("Profile-A"));
         assert_eq!(
             arguments.terms.as_deref(),
             Some(Path::new("input/terms.toml"))
@@ -355,12 +887,209 @@ mod tests {
         let MzCommand::Init(arguments) = expect_mz(parsed.product) else {
             panic!("应解析为 Init 命令");
         };
-        assert_eq!(arguments.path, Path::new("game"));
+        assert_eq!(arguments.path.as_deref(), Some(Path::new("game")));
         assert!(arguments.source_language.is_none());
         assert!(arguments.target_language.is_none());
         assert!(arguments.dialogue_max_fullwidth_chars.is_none());
         assert!(arguments.scrolling_text_max_fullwidth_chars.is_none());
         assert!(arguments.help_description_max_fullwidth_chars.is_none());
+    }
+
+    #[test]
+    fn init_and_translate_allow_project_state_reuse() {
+        let init = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "mz",
+            "init",
+            "--name",
+            "demo",
+        ])
+        .expect("后续 Init 可省略来源路径");
+        let MzCommand::Init(arguments) = expect_mz(init.product) else {
+            panic!("应解析为 Init 命令");
+        };
+        assert!(arguments.path.is_none());
+
+        let translate = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "mz",
+            "translate",
+            "--name",
+            "demo",
+        ])
+        .expect("后续 Translate 可省略 Profile");
+        let MzCommand::Translate(arguments) = expect_mz(translate.product) else {
+            panic!("应解析为 Translate 命令");
+        };
+        assert!(arguments.profile_id.is_none());
+    }
+
+    #[test]
+    fn parses_global_ui_language_and_progress_mode() {
+        let (parsed, resolved) = AttArguments::try_parse_localized_from([
+            "att",
+            "--config",
+            "config.toml",
+            "--ui-language",
+            "zh-Hant",
+            "--progress",
+            "plain",
+            "mz",
+            "write-back",
+            "--name",
+            "demo",
+        ])
+        .expect("全局界面选项应可解析");
+        assert_eq!(resolved.locale(), UiLocale::TraditionalChinese);
+        assert_eq!(parsed.progress, ProgressArgument::Plain);
+    }
+
+    #[test]
+    fn localized_parser_renders_root_and_subcommand_help_in_all_supported_locales() {
+        for locale in UiLocale::ALL {
+            let root_error = AttArguments::try_parse_localized_from([
+                "att",
+                "--ui-language",
+                locale.as_str(),
+                "--help",
+            ])
+            .expect_err("Help 应作为正常提前退出返回");
+            let localizer = UiLocalizer::new(locale);
+            assert_eq!(root_error.kind(), ErrorKind::DisplayHelp);
+            assert_eq!(root_error.exit_code(), 0);
+            assert!(!root_error.use_stderr());
+            for expected in [
+                localizer.format(UiMessage::AppAbout),
+                localizer.format(UiMessage::CliUsageHeading),
+                localizer.format(UiMessage::CliCommandsHeading),
+                localizer.format(UiMessage::CliOptionsHeading),
+                localizer.format(UiMessage::CliConfigHelp),
+                localizer.format(UiMessage::CliPrintHelp),
+            ] {
+                assert!(
+                    root_error.output().contains(&expected),
+                    "{} 根帮助缺少 {expected:?}:\n{}",
+                    locale,
+                    root_error.output()
+                );
+            }
+
+            let init_error = AttArguments::try_parse_localized_from([
+                "att",
+                "mz",
+                "init",
+                "--ui-language",
+                locale.as_str(),
+                "--help",
+            ])
+            .expect_err("子命令 Help 应作为正常提前退出返回");
+            for expected in [
+                localizer.format(UiMessage::CliInitAbout),
+                localizer.format(UiMessage::CliUsageHeading),
+                localizer.format(UiMessage::CliOptionsHeading),
+                localizer.format(UiMessage::CliProjectNameHelp),
+                localizer.format(UiMessage::CliInitPathHelp),
+                localizer.format(UiMessage::CliSourceLanguageHelp),
+            ] {
+                assert!(
+                    init_error.output().contains(&expected),
+                    "{} Init 帮助缺少 {expected:?}:\n{}",
+                    locale,
+                    init_error.output()
+                );
+            }
+        }
+
+        let chinese =
+            AttArguments::try_parse_localized_from(["att", "--ui-language", "zh-Hans", "--help"])
+                .expect_err("Help 应作为正常提前退出返回");
+        assert!(chinese.output().contains("[选项]"));
+        assert!(chinese.output().contains("<命令>"));
+        assert!(!chinese.output().contains("[OPTIONS]"));
+        assert!(!chinese.output().contains("<COMMAND>"));
+
+        let arabic =
+            AttArguments::try_parse_localized_from(["att", "--ui-language", "ar", "--help"])
+                .expect_err("Help 应作为正常提前退出返回");
+        assert!(arabic.output().contains('\u{2068}'));
+        assert!(arabic.output().contains('\u{2069}'));
+    }
+
+    #[test]
+    fn localized_parser_translates_clap_validation_and_usage() {
+        let error = AttArguments::try_parse_localized_from([
+            "att",
+            "--ui-language",
+            "fr",
+            "--config",
+            "config.toml",
+            "--progress",
+            "fast",
+            "mz",
+            "write-back",
+            "--name",
+            "demo",
+        ])
+        .expect_err("非法 progress 应被拒绝");
+        let localizer = UiLocalizer::new(UiLocale::French);
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.use_stderr());
+        assert!(
+            error
+                .output()
+                .contains(&localizer.format(UiMessage::CliInvalidProgress { value: "fast" }))
+        );
+        assert!(
+            error
+                .output()
+                .contains(&localizer.format(UiMessage::CliUsageHeading))
+        );
+        assert!(
+            error
+                .output()
+                .contains(&localizer.format(UiMessage::CliTryHelp))
+        );
+        assert!(!error.output().contains("Usage:"));
+    }
+
+    #[test]
+    fn localized_parser_reports_missing_config_in_the_selected_language() {
+        let error = AttArguments::try_parse_localized_from([
+            "att",
+            "--ui-language",
+            "ja",
+            "mz",
+            "write-back",
+            "--name",
+            "demo",
+        ])
+        .expect_err("配置路径仍是显式必填");
+        let localizer = UiLocalizer::new(UiLocale::Japanese);
+        assert!(
+            error
+                .output()
+                .contains(&localizer.format(UiMessage::CliMissingConfig))
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_ui_language_is_a_localized_input_error() {
+        let error =
+            AttArguments::try_parse_localized_from(["att", "--ui-language=de-DE", "--help"])
+                .expect_err("不支持的显式 locale 必须优先于 Help 报错");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        assert_eq!(error.exit_code(), 2);
+        assert!(UiLocale::ALL.into_iter().any(|locale| {
+            error.output().contains(
+                &UiLocalizer::new(locale)
+                    .format(UiMessage::CliUnsupportedUiLanguageArgument { value: "de-DE" }),
+            )
+        }));
     }
 
     #[test]

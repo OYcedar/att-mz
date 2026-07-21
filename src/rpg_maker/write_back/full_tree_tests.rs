@@ -16,17 +16,17 @@ use super::asset_reader::RpgMakerStandardWriteBackAssetReadingService;
 use super::lua::LuaWriteBackService;
 use super::publisher::StandardWriteBackPublishingService;
 use super::rewriter::RpgMakerWriteBackDocumentRewritingService;
-use super::standard::{
-    ConservativeRpgMakerWriteBackTextLayouter, StandardWriteBackService, WriteBackRunLog,
+use super::standard::{ConservativeRpgMakerWriteBackTextLayouter, StandardWriteBackService};
+use super::{
+    WriteBackInput, WriteBackLog, WriteBackLogEvent, WriteBackLogPublicationOutcome,
+    WriteBackOutput, WriteBackProgressPhase, WriteBackService,
 };
-use super::{WriteBackInput, WriteBackOutput, WriteBackService};
 use crate::execution::OperationCompletion;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
 use crate::llm::{ChatMessage, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse};
-use crate::observability::{EventId, OperationId};
+use crate::progress::{ProgressAmount, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::RpgMakerLayout;
-use crate::rpg_maker::audit::{AuditEvent, AuditLedger, WriteBackPublishAuditResult};
 use crate::rpg_maker::extract::document::{
     RpgMakerDocumentReadingConfig, RpgMakerProjectDocumentReadingService,
 };
@@ -72,6 +72,15 @@ const PROJECTS_ROOT: &str = "C:/att/projects";
 const PROJECT_NAME: &str = "demo";
 const LUA_SCRIPT: &str = "C:/att/scripts/write_back.lua";
 const DIALOGUE_DEFINITION_JSON: &str = r#"{"rules":[]}"#;
+
+#[derive(Clone, Default)]
+struct RecordingProgress(Arc<Mutex<Vec<ProgressSnapshot<WriteBackProgressPhase>>>>);
+
+impl ProgressObserver<WriteBackProgressPhase> for RecordingProgress {
+    fn observe(&self, snapshot: ProgressSnapshot<WriteBackProgressPhase>) {
+        self.0.lock().expect("进度记录锁不应中毒").push(snapshot);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TestError(&'static str);
@@ -400,45 +409,13 @@ impl ScopedDirectoryEditor for RecordingRecoverablePublisher {
 }
 
 #[derive(Clone, Default)]
-struct RecordingRunLog {
-    events: Arc<Mutex<Vec<WriteBackRunLog>>>,
+struct RecordingProjectLog {
+    events: Arc<Mutex<Vec<WriteBackLogEvent>>>,
 }
 
-impl AuditLedger for RecordingRunLog {
-    type Error = TestError;
-
-    fn new_operation_id(&self) -> Result<OperationId, Self::Error> {
-        Ok(OperationId::from_uuid(uuid::Uuid::from_u128(
-            0x550e_8400_e29b_41d4_a716_4466_5544_0000,
-        )))
-    }
-
-    async fn append(&self, event: AuditEvent) -> Result<EventId, Self::Error> {
-        match event {
-            AuditEvent::WriteBackPublishStarted { .. } => {}
-            AuditEvent::WriteBackPublishFinished {
-                result: WriteBackPublishAuditResult::Published(event),
-                ..
-            } => self.events.lock().expect("日志记录锁不应中毒").push(event),
-            AuditEvent::WriteBackPublishFinished {
-                result:
-                    WriteBackPublishAuditResult::NotPublished { .. }
-                    | WriteBackPublishAuditResult::PublishedWithResiduals { .. }
-                    | WriteBackPublishAuditResult::RecoveryRequired { .. }
-                    | WriteBackPublishAuditResult::OutcomeUnknown { .. },
-                ..
-            } => {}
-            AuditEvent::RunStarted
-            | AuditEvent::RunFinished { .. }
-            | AuditEvent::TranslationPlanningUnresolved { .. }
-            | AuditEvent::TranslationTaskStarted { .. }
-            | AuditEvent::TranslationTaskFinished { .. } => {
-                return Err(TestError("意外审计事件"));
-            }
-        }
-        Ok(EventId::from_uuid(uuid::Uuid::from_u128(
-            0x7c9e_6679_7425_40de_944b_e07f_c1f9_0ae7,
-        )))
+impl WriteBackLog for RecordingProjectLog {
+    fn emit(&self, event: WriteBackLogEvent) {
+        self.events.lock().expect("日志记录锁不应中毒").push(event);
     }
 }
 
@@ -685,11 +662,12 @@ struct FullTreeObservations {
     validation_calls: Arc<Mutex<Vec<PathBuf>>>,
     publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishIntent)>>>,
     discard_calls: Arc<Mutex<Vec<PathBuf>>>,
-    run_logs: Arc<Mutex<Vec<WriteBackRunLog>>>,
+    log_events: Arc<Mutex<Vec<WriteBackLogEvent>>>,
     llm_calls: Arc<AtomicUsize>,
     runtime_facts: Arc<Mutex<RuntimeFacts>>,
     session_facts: Arc<Mutex<SessionFacts>>,
     opened_database_paths: Arc<Mutex<Vec<PathBuf>>>,
+    progress: Arc<Mutex<Vec<ProgressSnapshot<WriteBackProgressPhase>>>>,
 }
 
 type FullTreeRunFuture = Pin<
@@ -732,7 +710,7 @@ fn build_full_tree_with_publish_error(
         publish_error: Arc::new(Mutex::new(publish_error)),
         ..RecordingRecoverablePublisher::default()
     };
-    let run_log = RecordingRunLog::default();
+    let project_log = RecordingProjectLog::default();
     let llm = RecordingLlm::default();
     let runtime = ExercisingLuaRuntime {
         mode,
@@ -743,6 +721,7 @@ fn build_full_tree_with_publish_error(
         session: session.clone(),
         opened_paths: Arc::new(Mutex::new(Vec::new())),
     };
+    let progress = RecordingProgress::default();
 
     let record_reader = ProjectDatabaseRecordReadingService::new(
         PathBuf::from(PROJECTS_ROOT),
@@ -765,7 +744,8 @@ fn build_full_tree_with_publish_error(
         cpu.clone(),
         RpgMakerDocumentReadingConfig::new(non_zero(2)),
     );
-    let rewriter = RpgMakerWriteBackDocumentRewritingService::new(document_reader, cpu.clone());
+    let rewriter = RpgMakerWriteBackDocumentRewritingService::new(document_reader, cpu.clone())
+        .with_progress(progress.clone());
     let cancellation = crate::execution::CooperativeCancellation::default();
     let publisher = StandardWriteBackPublishingService::new(directory_publisher.clone());
     let standard = StandardWriteBackService::new(
@@ -774,7 +754,8 @@ fn build_full_tree_with_publish_error(
         rewriter,
         cpu.clone(),
         cancellation.clone(),
-    );
+    )
+    .with_progress(progress.clone());
     let host = TrustedLuaExecutionHostingService::<_, RecordingLlm, _, _>::without_llm(
         file_reader.clone(),
         runtime.clone(),
@@ -785,11 +766,18 @@ fn build_full_tree_with_publish_error(
         opener,
         standard,
         publisher,
-        Some(SelectedLua::new(PathBuf::from(LUA_SCRIPT), lua)),
-        run_log.clone(),
+        Some(SelectedLua::new(
+            crate::rpg_maker::lua::runtime::OwnedLuaProgram::new(
+                PathBuf::from(LUA_SCRIPT),
+                b"-- trusted write-back".to_vec(),
+            ),
+            lua,
+        )),
+        project_log.clone(),
         FakeProjectLease,
         cancellation,
-    );
+    )
+    .with_progress(progress.clone());
     let service = Arc::new(service);
     let run_service = Arc::clone(&service);
     let service = FullTreeService {
@@ -812,11 +800,12 @@ fn build_full_tree_with_publish_error(
         validation_calls: directory_publisher.validation_calls,
         publish_calls: directory_publisher.publish_calls,
         discard_calls: directory_publisher.discard_calls,
-        run_logs: run_log.events,
+        log_events: project_log.events,
         llm_calls: llm.calls,
         runtime_facts: runtime.facts,
         session_facts: session.facts,
         opened_database_paths: session_factory.opened_paths,
+        progress: progress.0,
     };
     (service, observations)
 }
@@ -847,6 +836,76 @@ async fn real_write_back_non_root_tree_rewrites_publishes_logs_and_runs_lua() {
     assert_document_reads_and_cpu_work(&observations);
     assert_published_documents(&observations, output.standard);
     assert_successful_lua_execution(&observations);
+    assert_real_progress(&observations);
+}
+
+fn assert_real_progress(observations: &FullTreeObservations) {
+    let snapshots = observations
+        .progress
+        .lock()
+        .expect("进度记录锁不应中毒")
+        .clone();
+
+    let reading = determinate_counts(&snapshots, WriteBackProgressPhase::ReadingAssets);
+    assert_eq!(reading, vec![(0, 1), (1, 1)]);
+
+    assert_complete_monotonic_counts(&snapshots, WriteBackProgressPhase::PlanningStandard);
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot.phase == WriteBackProgressPhase::RewritingDocuments
+            && snapshot.amount == ProgressAmount::Indeterminate
+    }));
+    assert_complete_monotonic_counts(&snapshots, WriteBackProgressPhase::RewritingDocuments);
+
+    let expected_order = [
+        WriteBackProgressPhase::ReadingAssets,
+        WriteBackProgressPhase::PlanningStandard,
+        WriteBackProgressPhase::RewritingDocuments,
+        WriteBackProgressPhase::PreparingCandidate,
+        WriteBackProgressPhase::RunningLua,
+        WriteBackProgressPhase::ValidatingCandidate,
+        WriteBackProgressPhase::Publishing,
+    ];
+    let mut cursor = 0;
+    for phase in expected_order {
+        let offset = snapshots[cursor..]
+            .iter()
+            .position(|snapshot| snapshot.phase == phase)
+            .unwrap_or_else(|| panic!("真实写回未观测到阶段 {phase:?}：{snapshots:?}"));
+        cursor += offset + 1;
+    }
+}
+
+fn assert_complete_monotonic_counts(
+    snapshots: &[ProgressSnapshot<WriteBackProgressPhase>],
+    phase: WriteBackProgressPhase,
+) {
+    let counts = determinate_counts(snapshots, phase);
+    assert!(!counts.is_empty(), "阶段 {phase:?} 必须报告真实数量");
+    let total = counts[0].1;
+    assert!(total > 0, "真实样本的阶段 {phase:?} 必须包含工作项");
+    assert_eq!(counts[0], (0, total));
+    assert_eq!(counts.last(), Some(&(total, total)));
+    assert!(
+        counts
+            .windows(2)
+            .all(|pair| pair[0].1 == total && pair[1] == (pair[0].0 + 1, total)),
+        "阶段 {phase:?} 的绝对快照必须单调且共享同一分母：{counts:?}"
+    );
+}
+
+fn determinate_counts(
+    snapshots: &[ProgressSnapshot<WriteBackProgressPhase>],
+    phase: WriteBackProgressPhase,
+) -> Vec<(u64, u64)> {
+    snapshots
+        .iter()
+        .filter_map(|snapshot| match snapshot.amount {
+            ProgressAmount::Determinate { completed, total } if snapshot.phase == phase => {
+                Some((completed, total))
+            }
+            ProgressAmount::Indeterminate | ProgressAmount::Determinate { .. } => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -889,7 +948,7 @@ async fn unclosed_lua_transaction_discards_the_unpublished_candidate() {
     );
     assert!(
         observations
-            .run_logs
+            .log_events
             .lock()
             .expect("日志记录锁不应中毒")
             .is_empty(),
@@ -946,12 +1005,17 @@ async fn published_cleanup_failure_is_not_logged_as_complete_standard_success() 
             .len(),
         1
     );
-    assert!(
-        observations
-            .run_logs
-            .lock()
-            .expect("日志记录锁不应中毒")
-            .is_empty()
+    assert_eq!(
+        *observations.log_events.lock().expect("日志记录锁不应中毒"),
+        vec![
+            WriteBackLogEvent::PublicationStarted {
+                output_root: target_root.clone(),
+            },
+            WriteBackLogEvent::PublicationFinished {
+                output_root: target_root.clone(),
+                outcome: WriteBackLogPublicationOutcome::PublishedWithResiduals,
+            },
+        ]
     );
     assert!(
         observations
@@ -1013,8 +1077,7 @@ fn assert_document_reads_and_cpu_work(observations: &FullTreeObservations) {
         .expect("文件读取记录锁不应中毒");
     assert!(calls.contains(&workspace_root().join("source/data/Items.json")));
     assert!(calls.contains(&workspace_root().join("source/data/Map001.json")));
-    assert!(calls.contains(&PathBuf::from(LUA_SCRIPT)));
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 2);
     assert!(observations.cpu_calls.load(Ordering::SeqCst) >= 6);
 }
 
@@ -1097,12 +1160,22 @@ fn assert_published_documents(
     assert_eq!(map["unknown"], 7);
     drop(requests);
 
-    let logs = observations.run_logs.lock().expect("日志记录锁不应中毒");
-    assert_eq!(logs.len(), 1);
-    assert_eq!(logs[0].output_root(), workspace_root().join("write_back"));
-    assert_eq!(logs[0].summary(), summary);
-    assert!(logs[0].manual_layout_diagnostics().is_empty());
-    assert!(logs[0].lua_executed());
+    let log_events = observations.log_events.lock().expect("日志记录锁不应中毒");
+    assert_eq!(
+        log_events.as_slice(),
+        [
+            WriteBackLogEvent::PublicationStarted {
+                output_root: workspace_root().join("write_back"),
+            },
+            WriteBackLogEvent::PublicationFinished {
+                output_root: workspace_root().join("write_back"),
+                outcome: WriteBackLogPublicationOutcome::Published {
+                    standard: summary,
+                    lua_executed: true,
+                },
+            },
+        ]
+    );
 }
 
 fn assert_successful_lua_execution(observations: &FullTreeObservations) {

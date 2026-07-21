@@ -17,7 +17,6 @@ use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::text::{DataFileName, StandardDataFile};
-use crate::storage::file_system::{FileReader, ReadFileError};
 
 use self::definition::{FileRuleSource, RuleSource, RulesDefinition, RulesDefinitionError};
 use self::matcher::{
@@ -25,11 +24,12 @@ use self::matcher::{
     merge_rule_matches,
 };
 use super::document::{
-    PluginConfiguration, RpgMakerDocumentId, RpgMakerDocumentSelection,
+    DocumentReadProgress, PluginConfiguration, RpgMakerDocumentId, RpgMakerDocumentSelection,
     RpgMakerProjectDocumentReader, RpgMakerProjectDocuments,
 };
 use super::model::{ExtractedTextGroup, ExtractedTextUnit, RulesSnapshot, SnapshotModelError};
 use super::store::RulesSnapshotStore;
+use super::{ExtractProgress, ExtractProgressPhase};
 
 /// 使用调用方提供的当前 Rules TOML 完整替换 Rules 提取快照。
 pub(crate) trait RulesExtraction: Send + Sync {
@@ -38,27 +38,103 @@ pub(crate) trait RulesExtraction: Send + Sync {
     fn replace(
         &self,
         project: &OpenedProject,
-        rules_path: PathBuf,
+        program: RulesProgram,
+        progress: ExtractProgress,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
+/// 已读取、验证并规范编码的 Extract Rules 程序。
+///
+/// 显式文件和项目状态复用都在进入业务服务前建立该值；复用路径因此不会重新读取
+/// 原 TOML 文件。`diagnostic_path` 只用于人类诊断，不参与规则语义。
+#[derive(Clone, Debug)]
+pub(crate) struct RulesProgram {
+    diagnostic_path: PathBuf,
+    definition: RulesDefinition,
+}
+
+impl RulesProgram {
+    pub(crate) fn from_toml(
+        diagnostic_path: PathBuf,
+        bytes: Vec<u8>,
+    ) -> Result<Self, RulesProgramError> {
+        let text = String::from_utf8(bytes)
+            .map_err(|source| RulesProgramError::InvalidUtf8(source.utf8_error()))?;
+        let definition =
+            RulesDefinition::parse(&text).map_err(RulesProgramError::InvalidDefinition)?;
+        Ok(Self {
+            diagnostic_path,
+            definition,
+        })
+    }
+
+    pub(crate) fn from_canonical_json(
+        diagnostic_path: PathBuf,
+        canonical_json: &str,
+    ) -> Result<Self, RulesProgramError> {
+        let definition = RulesDefinition::parse_canonical_json(canonical_json)
+            .map_err(RulesProgramError::InvalidDefinition)?;
+        Ok(Self {
+            diagnostic_path,
+            definition,
+        })
+    }
+
+    pub(crate) fn diagnostic_path(&self) -> &std::path::Path {
+        &self.diagnostic_path
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.definition.is_empty()
+    }
+
+    pub(crate) fn canonical_json(&self) -> &str {
+        self.definition.canonical_json()
+    }
+}
+
+/// Rules 程序在用户输入/项目状态边界无法建立。
+#[derive(Debug)]
+pub(crate) enum RulesProgramError {
+    InvalidUtf8(Utf8Error),
+    InvalidDefinition(RulesDefinitionError),
+}
+
+impl fmt::Display for RulesProgramError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUtf8(source) => write!(formatter, "Rules 定义不是 UTF-8：{source}"),
+            Self::InvalidDefinition(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for RulesProgramError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidUtf8(source) => Some(source),
+            Self::InvalidDefinition(source) => Some(source),
+        }
+    }
+}
+
+/// 在项目数据库边界确认 canonical Rules 仍满足当前来源、路径与 PCRE2 语义。
+pub(crate) fn validate_rules_canonical_json(source: &str) -> Result<(), RulesProgramError> {
+    RulesDefinition::parse_canonical_json(source)
+        .map(|_| ())
+        .map_err(RulesProgramError::InvalidDefinition)
+}
+
 /// 读取、解析、匹配并原子提交一次 Rules 快照。
-pub(crate) struct RulesExtractionService<F, D, S, C> {
-    file_reader: F,
+pub(crate) struct RulesExtractionService<D, S, C> {
     document_reader: D,
     snapshot_store: S,
     cpu_executor: C,
 }
 
-impl<F, D, S, C> RulesExtractionService<F, D, S, C> {
-    pub(crate) fn new(
-        file_reader: F,
-        document_reader: D,
-        snapshot_store: S,
-        cpu_executor: C,
-    ) -> Self {
+impl<D, S, C> RulesExtractionService<D, S, C> {
+    pub(crate) fn new(document_reader: D, snapshot_store: S, cpu_executor: C) -> Self {
         Self {
-            file_reader,
             document_reader,
             snapshot_store,
             cpu_executor,
@@ -66,52 +142,25 @@ impl<F, D, S, C> RulesExtractionService<F, D, S, C> {
     }
 }
 
-impl<F, D, S, C> RulesExtraction for RulesExtractionService<F, D, S, C>
+impl<D, S, C> RulesExtraction for RulesExtractionService<D, S, C>
 where
-    F: FileReader,
     D: RpgMakerProjectDocumentReader,
     S: RulesSnapshotStore,
     C: CpuTaskExecutor,
 {
-    type Error = RulesExtractionError<F::Error, D::Error, S::Error, C::Error>;
+    type Error = RulesExtractionError<D::Error, S::Error, C::Error>;
 
     async fn replace(
         &self,
         project: &OpenedProject,
-        rules_path: PathBuf,
+        program: RulesProgram,
+        progress: ExtractProgress,
     ) -> Result<(), Self::Error> {
-        let file = self
-            .file_reader
-            .read_file(rules_path.clone())
-            .await
-            .map_err(|source| RulesExtractionError::ReadRules {
-                rules_path: rules_path.clone(),
-                source,
-            })?;
-        let definition = self
-            .cpu_executor
-            .execute(move || parse_rules_definition(file.into_bytes()))
-            .await
-            .map_err(|source| RulesExtractionError::ParseDefinitionCompute {
-                rules_path: rules_path.clone(),
-                source,
-            })?
-            .map_err(|error| match error {
-                ParseRulesDefinitionError::InvalidUtf8(source) => {
-                    RulesExtractionError::InvalidUtf8 {
-                        rules_path: rules_path.clone(),
-                        source,
-                    }
-                }
-                ParseRulesDefinitionError::InvalidDefinition(source) => {
-                    RulesExtractionError::InvalidDefinition {
-                        rules_path: rules_path.clone(),
-                        source,
-                    }
-                }
-            })?;
+        let rules_path = program.diagnostic_path().to_path_buf();
+        let definition = program.definition;
 
         if definition.is_empty() {
+            progress.indeterminate(ExtractProgressPhase::RulesCommit);
             self.snapshot_store
                 .deactivate_rules(project)
                 .await
@@ -122,7 +171,20 @@ where
         let selection = document_selection(&definition);
         let documents = self
             .document_reader
-            .read(project, selection)
+            .read_with_progress(
+                project,
+                selection,
+                DocumentReadProgress::new({
+                    let progress = progress.clone();
+                    move |completed, total| {
+                        progress.determinate(
+                            ExtractProgressPhase::RulesDocuments,
+                            completed,
+                            total,
+                        );
+                    }
+                }),
+            )
             .await
             .map_err(|source| RulesExtractionError::ReadDocuments {
                 rules_path: rules_path.clone(),
@@ -145,7 +207,7 @@ where
             })?;
 
         let matches = self
-            .match_rules_parallel(definition, input)
+            .match_rules_parallel(definition, input, progress.clone())
             .await
             .map_err(|error| match error {
                 ParallelRulesBuildError::MatchCompute(source) => {
@@ -172,6 +234,7 @@ where
                 }
             })?;
 
+        progress.indeterminate(ExtractProgressPhase::RulesCommit);
         self.snapshot_store
             .replace_rules(project, matches)
             .await
@@ -179,7 +242,7 @@ where
     }
 }
 
-impl<F, D, S, C> RulesExtractionService<F, D, S, C>
+impl<D, S, C> RulesExtractionService<D, S, C>
 where
     C: CpuTaskExecutor,
 {
@@ -187,13 +250,20 @@ where
         &self,
         definition: RulesDefinition,
         input: RulesMatchInput,
+        progress: ExtractProgress,
     ) -> Result<RulesSnapshot, ParallelRulesBuildError<C::Error>> {
         let input = Arc::new(input);
         let merge_input = Arc::clone(&input);
+        let rules = definition.into_rules();
+        let total = u64::try_from(rules.len()).expect("Rules 规则数必须能用 u64 表达");
+        progress.determinate(ExtractProgressPhase::RulesMatches, 0, total);
         let completed = self
             .cpu_executor
-            .execute_ordered_map(definition.into_rules(), move |rule| {
-                match_rule(&rule, &input)
+            .execute_ordered_map_observed(rules, move |rule| match_rule(&rule, &input), {
+                let progress = progress.clone();
+                move |completed| {
+                    progress.determinate(ExtractProgressPhase::RulesMatches, completed, total);
+                }
             })
             .await
             .map_err(ParallelRulesBuildError::MatchCompute)?
@@ -210,12 +280,6 @@ where
             .await
             .map_err(ParallelRulesBuildError::FinalizeCompute)?
     }
-}
-
-fn parse_rules_definition(bytes: Vec<u8>) -> Result<RulesDefinition, ParseRulesDefinitionError> {
-    let text = String::from_utf8(bytes)
-        .map_err(|source| ParseRulesDefinitionError::InvalidUtf8(source.utf8_error()))?;
-    RulesDefinition::parse(&text).map_err(ParseRulesDefinitionError::InvalidDefinition)
 }
 
 fn document_selection(definition: &RulesDefinition) -> RpgMakerDocumentSelection {
@@ -352,12 +416,6 @@ fn snapshot_from_targets(
     RulesSnapshot::new(groups)
 }
 
-#[derive(Debug)]
-enum ParseRulesDefinitionError {
-    InvalidUtf8(Utf8Error),
-    InvalidDefinition(RulesDefinitionError),
-}
-
 enum ParallelRulesBuildError<CE> {
     MatchCompute(CpuTaskExecutionError<CE>),
     FinalizeCompute(CpuTaskExecutionError<CE>),
@@ -367,23 +425,7 @@ enum ParallelRulesBuildError<CE> {
 
 /// Rules 提取在自身职责边界产生的阶段错误。
 #[derive(Debug)]
-pub(crate) enum RulesExtractionError<FE, DE, SE, CE> {
-    ReadRules {
-        rules_path: PathBuf,
-        source: ReadFileError<FE>,
-    },
-    InvalidUtf8 {
-        rules_path: PathBuf,
-        source: Utf8Error,
-    },
-    InvalidDefinition {
-        rules_path: PathBuf,
-        source: RulesDefinitionError,
-    },
-    ParseDefinitionCompute {
-        rules_path: PathBuf,
-        source: CpuTaskExecutionError<CE>,
-    },
+pub(crate) enum RulesExtractionError<DE, SE, CE> {
     ReadDocuments {
         rules_path: PathBuf,
         source: DE,
@@ -410,37 +452,14 @@ pub(crate) enum RulesExtractionError<FE, DE, SE, CE> {
     },
 }
 
-impl<FE, DE, SE, CE> fmt::Display for RulesExtractionError<FE, DE, SE, CE>
+impl<DE, SE, CE> fmt::Display for RulesExtractionError<DE, SE, CE>
 where
-    FE: Error,
     DE: Error,
     SE: Error,
     CE: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ReadRules { rules_path, source } => {
-                write!(
-                    formatter,
-                    "读取 Rules TOML 失败 {}：{source}",
-                    rules_path.display()
-                )
-            }
-            Self::InvalidUtf8 { rules_path, source } => write!(
-                formatter,
-                "Rules TOML 不是有效 UTF-8 {}：{source}",
-                rules_path.display()
-            ),
-            Self::InvalidDefinition { rules_path, source } => write!(
-                formatter,
-                "Rules TOML 定义无效 {}：{source}",
-                rules_path.display()
-            ),
-            Self::ParseDefinitionCompute { rules_path, source } => write!(
-                formatter,
-                "调度 Rules TOML 解析失败 {}：{source}",
-                rules_path.display()
-            ),
             Self::ReadDocuments { rules_path, source } => write!(
                 formatter,
                 "读取 Rules 所需 RPG Maker 文档失败 {}：{source}",
@@ -477,21 +496,17 @@ where
     }
 }
 
-impl<FE, DE, SE, CE> Error for RulesExtractionError<FE, DE, SE, CE>
+impl<DE, SE, CE> Error for RulesExtractionError<DE, SE, CE>
 where
-    FE: Error + 'static,
     DE: Error + 'static,
     SE: Error + 'static,
     CE: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ReadRules { source, .. } => Some(source),
-            Self::InvalidUtf8 { source, .. } => Some(source),
-            Self::InvalidDefinition { source, .. } => Some(source),
-            Self::ParseDefinitionCompute { source, .. }
-            | Self::MatchSourceCompute { source, .. }
-            | Self::BuildSnapshotCompute { source, .. } => Some(source),
+            Self::MatchSourceCompute { source, .. } | Self::BuildSnapshotCompute { source, .. } => {
+                Some(source)
+            }
             Self::ReadDocuments { source, .. } => Some(source),
             Self::InvalidTarget { source, .. } => Some(source),
             Self::InvalidSnapshot { source, .. } => Some(source),
@@ -502,19 +517,34 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use serde_json::{Map, json};
 
     use super::*;
     use crate::execution::cpu::CpuTaskExecutionError;
+    use crate::progress::{ProgressObserver, ProgressSnapshot};
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::model::{
         DirectTextPart, DirectTextRecipe, TextProjectionRecipe, TextUnitRole,
     };
     use crate::rpg_maker::text::MapId;
-    use crate::storage::file_system::ReadFile;
+
+    #[derive(Clone, Default)]
+    struct RecordingProgress(Arc<Mutex<Vec<ProgressSnapshot<ExtractProgressPhase>>>>);
+
+    impl ProgressObserver<ExtractProgressPhase> for RecordingProgress {
+        fn observe(&self, snapshot: ProgressSnapshot<ExtractProgressPhase>) {
+            self.0.lock().expect("进度记录锁不应中毒").push(snapshot);
+        }
+    }
+
+    impl RecordingProgress {
+        fn snapshots(&self) -> Vec<ProgressSnapshot<ExtractProgressPhase>> {
+            self.0.lock().expect("进度记录锁不应中毒").clone()
+        }
+    }
 
     #[test]
     fn selection_requests_only_declared_sources_and_builtin_event_documents() {
@@ -958,12 +988,12 @@ path = 'entries[0].right.Name'
     fn zero_byte_and_comment_only_are_invalid_but_explicit_empty_deactivates() {
         for bytes in [Vec::new(), b"# comment only\n".to_vec()] {
             assert!(matches!(
-                parse_rules_definition(bytes),
-                Err(ParseRulesDefinitionError::InvalidDefinition(_))
+                RulesProgram::from_toml(PathBuf::from("rules.toml"), bytes),
+                Err(RulesProgramError::InvalidDefinition(_))
             ));
         }
         assert!(
-            parse_rules_definition(b"rule = []".to_vec())
+            RulesProgram::from_toml(PathBuf::from("rules.toml"), b"rule = []".to_vec(),)
                 .expect("显式空集合应合法")
                 .is_empty()
         );
@@ -972,7 +1002,7 @@ path = 'entries[0].right.Name'
     #[tokio::test]
     async fn failed_candidate_never_replaces_or_deactivates_the_previous_snapshot() {
         let state = Arc::new(StoreState::default());
-        let service = test_service(
+        let (service, program) = test_service(
             br#"
 [[rule]]
 file = "Items.json"
@@ -988,9 +1018,10 @@ path = '[].name'
             ),
             Arc::clone(&state),
         );
+        let progress = RecordingProgress::default();
 
         let error = service
-            .replace(&project(), PathBuf::from("rules.toml"))
+            .replace(&project(), program, ExtractProgress::new(progress.clone()))
             .await
             .expect_err("零个非空语义单元必须放弃整个替换");
 
@@ -1003,6 +1034,13 @@ path = '[].name'
         ));
         assert_eq!(state.replacements.load(Ordering::SeqCst), 0);
         assert_eq!(state.deactivations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            progress.snapshots(),
+            [
+                ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 0, 1),
+                ProgressSnapshot::determinate(ExtractProgressPhase::RulesMatches, 1, 1),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1010,9 +1048,6 @@ path = '[].name'
         let state = Arc::new(StoreState::default());
         let document_reads = Arc::new(AtomicUsize::new(0));
         let service = RulesExtractionService::new(
-            FakeFileReader {
-                bytes: b"rule = []".to_vec(),
-            },
             FakeDocumentReader {
                 documents: RpgMakerProjectDocuments::empty(),
                 reads: Arc::clone(&document_reads),
@@ -1022,31 +1057,48 @@ path = '[].name'
             },
             InlineCpu,
         );
+        let progress = RecordingProgress::default();
 
         service
-            .replace(&project(), PathBuf::from("rules.toml"))
+            .replace(
+                &project(),
+                RulesProgram::from_toml(PathBuf::from("rules.toml"), b"rule = []".to_vec())
+                    .expect("显式空定义应可建立"),
+                ExtractProgress::new(progress.clone()),
+            )
             .await
             .expect("显式空集合应停用 Rules owner");
 
         assert_eq!(document_reads.load(Ordering::SeqCst), 0);
         assert_eq!(state.replacements.load(Ordering::SeqCst), 0);
         assert_eq!(state.deactivations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            progress.snapshots(),
+            [ProgressSnapshot::indeterminate(
+                ExtractProgressPhase::RulesCommit
+            )]
+        );
     }
 
     fn test_service(
         bytes: Vec<u8>,
         documents: RpgMakerProjectDocuments,
         state: Arc<StoreState>,
-    ) -> RulesExtractionService<FakeFileReader, FakeDocumentReader, FakeStore, InlineCpu> {
-        RulesExtractionService::new(
-            FakeFileReader { bytes },
+    ) -> (
+        RulesExtractionService<FakeDocumentReader, FakeStore, InlineCpu>,
+        RulesProgram,
+    ) {
+        let program = RulesProgram::from_toml(PathBuf::from("rules.toml"), bytes)
+            .expect("测试 Rules 应通过输入边界");
+        let service = RulesExtractionService::new(
             FakeDocumentReader {
                 documents,
                 reads: Arc::new(AtomicUsize::new(0)),
             },
             FakeStore { state },
             InlineCpu,
-        )
+        );
+        (service, program)
     }
 
     fn project() -> OpenedProject {
@@ -1070,19 +1122,6 @@ path = '[].name'
     }
 
     impl Error for FakeError {}
-
-    #[derive(Clone)]
-    struct FakeFileReader {
-        bytes: Vec<u8>,
-    }
-
-    impl FileReader for FakeFileReader {
-        type Error = FakeError;
-
-        async fn read_file(&self, path: PathBuf) -> Result<ReadFile, ReadFileError<Self::Error>> {
-            Ok(ReadFile::new(path, self.bytes.clone()))
-        }
-    }
 
     #[derive(Clone)]
     struct FakeDocumentReader {

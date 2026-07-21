@@ -20,14 +20,15 @@ use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::text::MapId;
 
 use super::document::{
-    RpgMakerDocumentId, RpgMakerDocumentSelection, RpgMakerProjectDocumentReader,
-    RpgMakerProjectDocuments, StandardDataFile,
+    DocumentReadProgress, RpgMakerDocumentId, RpgMakerDocumentSelection,
+    RpgMakerProjectDocumentReader, RpgMakerProjectDocuments, StandardDataFile,
 };
 use super::model::{
     BuiltinSnapshot, ExtractedTextGroup, ExtractedTextUnit, RpgMakerLocation, RpgMakerLocationStep,
     RpgMakerSource, SnapshotModelError, TextGroupKind,
 };
 use super::store::{BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore};
+use super::{ExtractProgress, ExtractProgressPhase};
 
 /// 刷新 RPG Maker 内置规格能够确定的标准文本资产。
 pub(crate) trait BuiltInExtraction: Send + Sync {
@@ -36,6 +37,7 @@ pub(crate) trait BuiltInExtraction: Send + Sync {
     fn refresh(
         &self,
         project: &OpenedProject,
+        progress: ExtractProgress,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -166,14 +168,31 @@ where
 {
     type Error = BuiltInExtractionError<R::Error, S::Error, C::Error>;
 
-    async fn refresh(&self, project: &OpenedProject) -> Result<(), Self::Error> {
+    async fn refresh(
+        &self,
+        project: &OpenedProject,
+        progress: ExtractProgress,
+    ) -> Result<(), Self::Error> {
         let (dialogue_projection, project_definition_update) = self
             .dialogue_definition
             .resolve(project)
             .map_err(BuiltInExtractionError::CompileDialogueDefinition)?;
         let documents = self
             .document_reader
-            .read(project, builtin_document_selection())
+            .read_with_progress(
+                project,
+                builtin_document_selection(),
+                DocumentReadProgress::new({
+                    let progress = progress.clone();
+                    move |completed, total| {
+                        progress.determinate(
+                            ExtractProgressPhase::BuiltinDocuments,
+                            completed,
+                            total,
+                        );
+                    }
+                }),
+            )
             .await
             .map_err(BuiltInExtractionError::ReadDocuments)?;
 
@@ -181,6 +200,7 @@ where
             &self.cpu_executor,
             documents,
             &dialogue_projection,
+            progress.clone(),
         )
         .await
         {
@@ -199,6 +219,7 @@ where
             }
         };
 
+        progress.indeterminate(ExtractProgressPhase::BuiltinCommit);
         self.snapshot_store
             .replace_builtin(project, snapshot, project_definition_update)
             .await
@@ -373,6 +394,7 @@ async fn build_builtin_snapshot_parallel<C>(
     cpu_executor: &C,
     documents: RpgMakerProjectDocuments,
     dialogue_projection: &BuiltinDialogueProjection,
+    progress: ExtractProgress,
 ) -> Result<BuiltinSnapshot, ParallelBuiltinBuildError<C::Error>>
 where
     C: CpuTaskExecutor,
@@ -380,8 +402,15 @@ where
     let work_units = builtin_work_units(documents, dialogue_projection).map_err(|error| {
         ParallelBuiltinBuildError::Build(BuildBuiltinSnapshotError::Malformed(error))
     })?;
+    let total = u64::try_from(work_units.len()).expect("Builtin 工作单元数必须能用 u64 表达");
+    progress.determinate(ExtractProgressPhase::BuiltinWorkUnits, 0, total);
     let results = cpu_executor
-        .execute_ordered_map(work_units, BuiltinWorkUnit::run)
+        .execute_ordered_map_observed(work_units, BuiltinWorkUnit::run, {
+            let progress = progress.clone();
+            move |completed| {
+                progress.determinate(ExtractProgressPhase::BuiltinWorkUnits, completed, total);
+            }
+        })
         .await
         .map_err(ParallelBuiltinBuildError::Compute)?;
     let dialogue_projection = dialogue_projection.fork_for_scan();
@@ -1546,6 +1575,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::progress::{ProgressAmount, ProgressObserver, ProgressSnapshot};
+
+    #[derive(Clone, Default)]
+    struct RecordingProgress(Arc<Mutex<Vec<ProgressSnapshot<ExtractProgressPhase>>>>);
+
+    impl ProgressObserver<ExtractProgressPhase> for RecordingProgress {
+        fn observe(&self, snapshot: ProgressSnapshot<ExtractProgressPhase>) {
+            self.0.lock().expect("进度记录锁不应中毒").push(snapshot);
+        }
+    }
+
+    impl RecordingProgress {
+        fn snapshots(&self) -> Vec<ProgressSnapshot<ExtractProgressPhase>> {
+            self.0.lock().expect("进度记录锁不应中毒").clone()
+        }
+    }
 
     #[derive(Clone)]
     struct FakeReader {
@@ -1710,6 +1755,7 @@ mod tests {
             &cpu,
             complete_documents(),
             &BuiltinDialogueProjection::MzNative,
+            ExtractProgress::default(),
         )
         .await
         .expect("并行 Builtin 扫描应该成功");
@@ -1738,9 +1784,14 @@ mod tests {
             build_builtin_snapshot_with_dialogue_projection(&documents, projection.fork_for_scan())
                 .expect("两个规则分布在不同文档时应在整份快照上验收");
 
-        let actual = build_builtin_snapshot_parallel(&FakeCpu, documents, &projection)
-            .await
-            .expect("并行扫描必须合并各分片的规则命中数");
+        let actual = build_builtin_snapshot_parallel(
+            &FakeCpu,
+            documents,
+            &projection,
+            ExtractProgress::default(),
+        )
+        .await
+        .expect("并行扫描必须合并各分片的规则命中数");
 
         assert_eq!(actual, expected);
         let common_dialogue = actual
@@ -1838,6 +1889,7 @@ mod tests {
             &cpu,
             complete_documents(),
             &BuiltinDialogueProjection::MzNative,
+            ExtractProgress::default(),
         )
         .await
         .expect("根预算背压不应改变 Builtin 结果");
@@ -1862,7 +1914,7 @@ mod tests {
         );
 
         let error = service
-            .refresh(&project())
+            .refresh(&project(), ExtractProgress::default())
             .await
             .expect_err("CPU panic 必须作为计算阶段失败返回");
 
@@ -1876,11 +1928,34 @@ mod tests {
     #[tokio::test]
     async fn service_requests_exact_builtin_documents_and_persists_once() {
         let service = service(Ok(complete_documents()), None);
+        let progress = RecordingProgress::default();
 
         service
-            .refresh(&project())
+            .refresh(&project(), ExtractProgress::new(progress.clone()))
             .await
             .expect("完整文档应该被保存");
+
+        let snapshots = progress.snapshots();
+        let work_units = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.phase == ExtractProgressPhase::BuiltinWorkUnits)
+            .map(|snapshot| snapshot.amount)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            work_units,
+            (0..=12)
+                .map(|completed| ProgressAmount::Determinate {
+                    completed,
+                    total: 12
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            snapshots.last(),
+            Some(&ProgressSnapshot::indeterminate(
+                ExtractProgressPhase::BuiltinCommit
+            ))
+        );
 
         let selections = service
             .document_reader
@@ -1953,7 +2028,10 @@ mod tests {
             },
         );
 
-        service.refresh(&project()).await.expect("快照应成功保存");
+        service
+            .refresh(&project(), ExtractProgress::default())
+            .await
+            .expect("快照应成功保存");
 
         assert_eq!(
             *updates.lock().expect("项目定义更新记录锁不应中毒"),
@@ -1980,7 +2058,7 @@ mod tests {
         );
 
         service
-            .refresh(&project())
+            .refresh(&project(), ExtractProgress::default())
             .await
             .expect("项目中的显式空 MV 对话定义应可复用");
 
@@ -2039,7 +2117,7 @@ mod tests {
         );
 
         let error = service
-            .refresh(&project())
+            .refresh(&project(), ExtractProgress::default())
             .await
             .expect_err("零命中规则不得替换定义或 Builtin 快照");
 
@@ -2058,7 +2136,7 @@ mod tests {
         let service = service(Err(FakeError("read failed")), None);
 
         let error = service
-            .refresh(&project())
+            .refresh(&project(), ExtractProgress::default())
             .await
             .expect_err("读取失败应该直接返回");
 
@@ -2086,7 +2164,7 @@ mod tests {
         let service = service(Ok(documents), None);
 
         let error = service
-            .refresh(&project())
+            .refresh(&project(), ExtractProgress::default())
             .await
             .expect_err("文档结构错误应该直接返回");
 
@@ -2109,7 +2187,7 @@ mod tests {
         let service = service(Ok(complete_documents()), Some(FakeError("persist failed")));
 
         let error = service
-            .refresh(&project())
+            .refresh(&project(), ExtractProgress::default())
             .await
             .expect_err("保存失败应该返回 Persist 阶段");
 
@@ -2139,7 +2217,7 @@ mod tests {
         let service = service(Ok(complete_documents()), None);
         let project = project();
 
-        assert_send(service.refresh(&project));
+        assert_send(service.refresh(&project, ExtractProgress::default()));
     }
 
     fn assert_send(_: impl Send) {}

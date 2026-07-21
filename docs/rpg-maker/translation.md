@@ -9,28 +9,38 @@
 
 <!-- att-example: illustrative -->
 ```text
-att --config FILE mz translate --name NAME PROFILE_ID \
+att --config FILE mz translate --name NAME [PROFILE_ID] \
   [--terms TERMS_TOML] [--placeholders PLACEHOLDERS_TOML] [--lua SCRIPT_LUA]
 
-att --config FILE mv translate --name NAME PROFILE_ID \
+att --config FILE mv translate --name NAME [PROFILE_ID] \
   [--terms TERMS_TOML] [--placeholders PLACEHOLDERS_TOML] [--lua SCRIPT_LUA]
 ```
+
+显式提供 `PROFILE_ID` 时精确选择并替换本次方案；省略时复用上次成功 Translate 保存的
+Profile。项目尚无保存 Profile 时省略是输入错误；保存 ID 在当前配置中不存在时明确失败，
+绝不选择其他 Profile。
 
 提供术语或 Placeholder 文件时，先严格解析并完整替换对应 canonical 资源；省略参数复用
 项目当前资源。空定义必须分别显式提供 `term = []` 或 `rule = []`。任一资源无效时不开始
 Standard 请求。
 
-Standard 完成后才执行显式 Lua。Standard 的 `Complete`、`Partial`、`Unavailable` 是
-正常业务结果，不阻止 Lua；技术错误阻止后续阶段。Standard 已提交译文不会因 Lua 失败
-组合回滚。
+非空 `--lua FILE` 读取并保存该阶段主程序正文、SHA-256 与无损解析路径；省略 `--lua`
+复用 Translate 阶段已保存程序，零字节文件只清除该阶段程序并且本轮不执行。Standard
+完成后才执行本轮选中的 Lua。Standard 的 `Complete`、`Partial`、`Unavailable` 是正常
+业务结果，不阻止 Lua；技术错误阻止后续阶段。Standard 已提交译文不会因 Lua 失败组合
+回滚。Lua 私有数据库状态不因清除主程序而被猜测或删除。
+
+Profile 与 Lua 各自保留类型化来源。显式 Profile 配合省略 `--lua` 时，Profile 来源为
+显式输入，Lua 来源仍为项目状态（项目尚无 Translate 方案时为产品行为）。终端摘要和
+项目日志分别呈现这两个来源，不能把混合方案笼统标成全部显式或全部复用。
 
 项目开启时验证冻结来源、活动 owner 来源指纹和资产快照指纹。翻译以标准语义单元身份
 读写，不以物理 JSON 地址寻址。
 
 ## 2. 公共翻译语义
 
-Profile 由 `[[rpg_maker.translation_profiles]]` 精确选择 `PROFILE_ID`，再解析它引用的
-公共 LLM Client。语言对来自项目 metadata，Prompt 精确读取：
+Profile 由显式或项目状态解析出的 ID 在 `[[rpg_maker.translation_profiles]]` 中精确
+选择，再解析它引用的公共 LLM Client。语言对来自项目 metadata，Prompt 精确读取：
 
 <!-- att-example: illustrative -->
 ```text
@@ -176,14 +186,18 @@ CPU 准备。产物仍落到计划 index 的独立槽，顺序 finalizer 只按 
 没有可执行产出为 `Unavailable`。三者是业务结果，退出成功不等于 `Complete`。技术错误、
 状态不一致或提交结果未知使用更强失败语义。
 
-模型响应拒绝作为 task unresolved 记录；每个译前 Placeholder 投影失败单元各用一条独立
-`translation_planning_unresolved` 审计事件记录逻辑位置和专用原因，不伪造 task ID、模型
-attempt 或响应拒绝原因，也不把任意数量失败塞进一条无界记录。两者都计入最终
-`remaining_decisions` 与 `remaining_locations`；
-因此即使所有已发送任务都完成，只要仍有 planning-unresolved，本轮也不能解释为全部
-Current。
+模型响应拒绝作为 task unresolved 记录；每个译前 Placeholder 投影失败单元保留独立的
+结构化诊断事实，包含逻辑位置和专用原因，不伪造 task ID、模型 attempt 或响应拒绝原因。
+两者都计入最终 `remaining_decisions` 与 `remaining_locations`；因此即使所有已发送任务
+都完成，只要仍有 planning-unresolved，本轮也不能解释为全部 Current。普通项目日志可
+按稳定 code 和类型化 payload 记录摘要，但日志缺失不改变这些业务事实或提交结果。
 
-该事件的 `payload.failure` 恰好描述一个单元，包含 `location` 和 `reason`；`reason.kind`
-只有 `placeholder_protection`（匹配、保留前缀或保护跨度无法成立）和
-`placeholder_projection`（已选 token 无法建立 NaturalText/opaque 投影），并携带非空
-`message` 用于诊断。事件没有 `task_index`、`id`、`attempts` 或模型响应元数据。
+翻译规划建立真实任务总数后，进度显示“已确认任务 `x/N`”；只有该任务必要的数据库提交
+成功后才推进，`Complete`、`Partial` 与 `Unavailable` 都计入。零任务显示“无需调用模型”，
+不显示 `0/0`。到达 `N/N` 后仍进入必要收尾与保存运行方案。
+
+全部业务阶段成功且必要非日志根完成收尾后，最后一个短事务精确替换
+`translate_run_plan` 及 Translate Lua 程序。确认提交失败时旧方案保持；终态无法确认时
+命令说明翻译结果已生效但方案状态无法确认，并建议下次显式传入 Profile 与 Lua 选择。
+项目日志的启动、队列、写入、轮转或关闭故障不停止模型任务、不丢弃合法候选，也不改变
+退出码。

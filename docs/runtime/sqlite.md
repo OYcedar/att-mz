@@ -6,7 +6,7 @@
 
 配置显式建立短操作线程/队列、连接总数、worker 栈、statement/参数/查询行数/查询字节、busy timeout、journal mode 和 synchronous。短操作在固定 OS worker 上有界背压；进入队列后由根执行到明确终态，即使等待 Future 被丢弃也不撤销。
 
-当前产品同一时刻最多有一个 Lua 交互会话。交互命令通道容量固定为 1，会话计入连接总预算。
+当前产品同一时刻最多有一个 Lua 交互会话。交互命令通道容量固定为 1，会话计入连接总预算。Lua 可以来自本次显式非空文件，也可以来自项目数据库中按阶段保存的主程序快照。
 
 ## 2. 建库与快照
 
@@ -40,9 +40,34 @@ Owner 冲突或翻译计划失效由各领域消费方在自己的边界映射�
 
 提交失败后使用 `is_autocommit()` 判断是否仍在事务，并在可能时回滚。可确认回滚才返回 `NotCommitted`；提交或回滚结果不明返回 `OutcomeUnknown`。根不做应用层重试。
 
-## 4. 唯一 Lua 交互会话
+## 4. 命令运行方案与 Lua 主程序
 
-每次显式 Lua 打开一个 actor 线程和一条 `rusqlite::Connection`：
+项目数据库采用当前唯一 schema，分别保存 Init、Extract、Translate、WriteBack 的强类型
+singleton 运行方案：
+
+- Init 保存上次成功来源路径；语言对和三类宽度继续以 metadata 为权威；
+- Extract 保存可执行 owner 的完整集合；Rules 保存已验证的 canonical 语义，不保存输入
+  TOML 路径；
+- Translate 保存上次成功 Profile ID；术语与 Placeholder 继续使用已有 canonical 资源表；
+- WriteBack 保存 Lua 是否启用；尚无记录时由上层解释为固定的 Standard-only 行为。
+
+Extract、Translate、WriteBack 的 Lua 主程序使用 phase-keyed 表分别保存非空正文 BLOB、
+SHA-256 和无损 Windows 规范解析路径。自动复用执行 BLOB，不重新读取主文件；路径只用于
+chunk 名、`require` 搜索目录和诊断。脚本主动加载的模块、文件和进程仍是外部动态依赖。
+零字节输入由命令边界解释为清除对应阶段程序，不以空程序写入表。
+
+项目租约覆盖方案读取、业务执行和最终方案替换。只有业务成功且所有必要非日志根完成
+收尾后，才以最后一个短 `BEGIN IMMEDIATE` 事务原子替换本命令整套方案。确认回滚时旧
+方案保持不变；提交终态无法确认时返回 `OutcomeUnknown`，上层明确说明业务结果及方案
+状态不能确认。失败、取消或其他必要收尾失败不尝试更新方案。
+
+运行方案是后续命令消费的权威状态，保存失败会影响命令结果；普通项目日志不是数据库
+事务参与方，其任何故障都不改变方案读取、提交或退出码。当前 schema 一次性生效，不在
+运行时识别、迁移或兼容其他 schema。
+
+## 5. 唯一 Lua 交互会话
+
+每次解析后的运行方案启用 Lua 时，打开一个 actor 线程和一条 `rusqlite::Connection`：
 
 ```text
 OpenedSqliteInteractiveSession
@@ -61,7 +86,7 @@ OpenedSqliteInteractiveSession
 
 Lua 正常结束但留下活动事务时，actor 回滚并以 `had_unclosed_transaction = true` 告知 Host，Host 将其作为未关闭事务失败处理。finalizer 直接 Drop 仍触发唯一清理，但正常调用必须按值消费它以取得报告。
 
-## 5. shutdown
+## 6. shutdown
 
 shutdown 停止新短操作和新交互会话；若唯一会话存在，则与 finalizer 共享同一次终结，停止命令准入、排空已接管命令、回滚并关闭。finalizer 与 shutdown 并发只执行一次清理。
 

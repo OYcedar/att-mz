@@ -8,7 +8,7 @@
 ## 当前产品范围
 
 ATT 当前实现的游戏领域只有 **RPG Maker**，该领域目前只包含 **MV** 与 **MZ** 两种
-受支持版本和目录布局。CLI、工作区与审计中的 `mv | mz` 是 RPG Maker 域内身份；它们
+受支持版本和目录布局。CLI、工作区与项目日志中的 `mv | mz` 是 RPG Maker 域内身份；它们
 不与 RPG Maker 并列，也不表示 XP、VX、VX Ace 等其他版本已经受支持。
 
 ## 文档导航
@@ -33,7 +33,7 @@ ATT 当前实现的游戏领域只有 **RPG Maker**，该领域目前只包含 *
   Profile、Prompt 与 Client 选择。
 - [生产配置](runtime/configuration.md)
 - [运行时与 CLI](runtime/cli.md)
-- [强审计账本](runtime/audit-log.md)
+- [普通项目日志](runtime/project-log.md)
 - [Chat Completions 运行根](runtime/chat-completions.md)
 - [SQLite 运行时](runtime/sqlite.md)
 - [Windows 文件能力与可恢复目录发布](runtime/directory-publishing.md)

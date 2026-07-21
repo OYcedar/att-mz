@@ -9,21 +9,35 @@
 <!-- att-example: illustrative -->
 ```text
 att --config FILE mz extract --name NAME \
-  (--builtin | --rules RULES_TOML | --lua SCRIPT_LUA)+
+  [--builtin] [--rules RULES_TOML] [--lua SCRIPT_LUA]
 
 att --config FILE mv extract --name NAME \
-  (--builtin | --rules RULES_TOML | --lua SCRIPT_LUA)+ \
+  [--builtin] [--rules RULES_TOML] [--lua SCRIPT_LUA] \
   [--dialogue-rules DIALOGUE_TOML]
 ```
 
-一次命令至少选择 Builtin、Rules、Lua 之一，执行和 owner 总顺序固定为
-`Builtin → Rules → Lua`。三个 owner 分别原子替换自己的快照，不清理未选择 owner。
-首个技术失败阻止后续 owner；此前已成功提交的 owner 不做组合回滚。
+未提供 `--builtin/--rules/--lua` 时，命令复用项目上次成功 Extract 保存的完整 owner 方案；
+项目尚无方案时明确要求至少提供一个提取选项。只要显式提供任一 owner，本轮显式集合就
+精确替换自动方案：未列出的 owner 不执行，但其既有资产不会仅因未列出而删除。执行和
+owner 总顺序始终是 `Builtin → Rules → Lua`。三个实际执行的 owner 分别原子替换自己的
+快照；首个技术失败阻止后续 owner，此前已成功提交的 owner 不做组合回滚，但本次保存
+方案不会替换旧方案。
 
 `--dialogue-rules` 只属于 MV 且必须同时选择 `--builtin`。提供文件完整替换姓名定义，
-省略时复用项目定义，`rule = []` 明确清空。定义与 Builtin 快照同事务提交。Rules 参数
-省略表示本次不执行 Rules；只有提供 `rule = []` 才停用 Rules owner。WriteBack 只消费
-已物化 recipe，不重读 TOML 或正则。
+省略时复用项目定义，`rule = []` 明确清空。定义与 Builtin 快照同事务提交。
+
+- 非空 `--rules FILE` 在读取、解析、编译成功后保存已验证的 canonical 语义；自动复用
+  直接执行该语义，不重新读取原 TOML 路径；
+- `rule = []` 停用 Rules owner、删除其标准资产，并把 Rules 移出后续自动方案；
+- 非空 `--lua FILE` 保存主程序正文、SHA-256 和无损解析路径；自动复用执行保存的正文；
+- 零字节 Extract Lua 文件不执行程序，而是停用 Lua owner、删除其标准资产并清除该阶段
+  程序；
+- 清除后若没有任何可执行 owner，则删除保存的 Extract 方案；下次无参数运行会得到
+  “尚无可复用方案”的输入错误。
+
+Lua 保存路径只用于 chunk 名、`require` 搜索目录和诊断。主程序主动加载的模块、文件与
+进程仍是可信 Lua 的动态外部依赖，不纳入快照。WriteBack 只消费已物化 recipe，不重读
+TOML 或正则。
 
 命令按 `<projects.root>/<engine>/<name>` 取得项目租约，验证当前 schema 和冻结来源指纹。
 
@@ -57,6 +71,9 @@ translation state 必须成对存在或成对为空。Lua 私有表使用的 64 
 - `standard_mutation_claim`：`owner + group_location + resource_key + access`；
 - `standard_translation_resource`：术语与自定义占位符 canonical 资源；
 - `standard_project_definition`：MV 姓名投影定义。
+- `extract_run_plan`：上次成功 Extract 的非空完整 owner 集合；
+- `extract_rules_definition`：可自动复用的非空 Rules canonical 语义；
+- `lua_program` 中的 `extract` 行：可自动复用的非空 Lua 主程序快照。
 
 当前 schema 一次性替换旧 schema，不提供迁移、识别或兼容读取。旧项目应在项目根外备份
 后重新 Init/Extract/Translate；不符合当前 schema 的数据库只作为普通无效项目数据库。
@@ -172,3 +189,12 @@ Extract Lua 获得公共 `ctx.project/json/source/rpg_maker/db` 和 `ctx.extract
 
 提取成功证明候选满足 ATT 契约，不单独证明所有文本都玩家可见。作者仍应做正反样本、
 未翻译 round-trip、翻译 round-trip 和游戏内抽查。
+
+只有全部所选 owner 成功且必要非日志根完成收尾后，命令才在最后一个短事务中精确替换
+`extract_run_plan`、Rules 定义和 Extract Lua 程序。事务确认失败时旧方案保持；提交终态
+无法确认时明确报告业务结果与方案状态无法确认。项目日志失败不会停止 owner、回滚合法
+快照或改变退出码。
+
+实时进度先显示 owner 阶段 `i/N`；文档、Builtin 工作单元和 Rules 规则只有在真实分母
+建立后才显示局部计数，Lua 与 SQLite 提交使用 spinner。到达局部 `N/N` 后仍会显示收尾
+和保存运行方案，不能提前解释为命令成功。

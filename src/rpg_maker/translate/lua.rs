@@ -8,7 +8,7 @@ use crate::execution::OperationCompletion;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::lua::runtime::{
-    TrustedLuaHostCallError, TrustedLuaPreparedTranslation,
+    OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaPreparedTranslation,
     TrustedLuaPreparedTranslationAcceptance, TrustedLuaPreparedTranslationStatus,
     TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
 };
@@ -40,7 +40,7 @@ pub(crate) trait LuaTranslation: Send + Sync {
         project: &OpenedProject,
         llm_client: Arc<Self::Client>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
     ) -> impl Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send;
 }
 
@@ -67,11 +67,11 @@ where
         project: &OpenedProject,
         llm_client: Arc<Self::Client>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
     ) -> Result<OperationCompletion<()>, Self::Error> {
-        let error_path = script_path.clone();
+        let error_path = program.main_script_path().to_path_buf();
         let invocation = LuaInvocation::translate(
-            script_path,
+            program,
             LuaProjectContext::for_frozen_source(
                 project.name().as_str(),
                 project.layout().rpg_maker_layout().engine(),
@@ -413,13 +413,13 @@ mod tests {
         ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
             let recorded = match invocation {
                 LuaInvocation::Translate {
-                    script_path,
+                    program,
                     project,
                     llm_client,
                     semantics,
                 } => RecordedInvocation {
                     phase: LuaPhase::Translate,
-                    script_path,
+                    script_path: program.main_script_path().to_path_buf(),
                     project,
                     client_address: Arc::as_ptr(&llm_client).addr(),
                     client_name: llm_client.name,
@@ -505,6 +505,10 @@ mod tests {
             "zh-Hans".to_owned(),
             crate::rpg_maker::project::test_layout_profile(),
         )
+    }
+
+    fn program(path: &str) -> OwnedLuaProgram {
+        OwnedLuaProgram::new(PathBuf::from(path), b"return nil".to_vec())
     }
 
     #[test]
@@ -741,7 +745,7 @@ mod tests {
                 &project(),
                 Arc::clone(&client),
                 semantics,
-                PathBuf::from("scripts/translate.lua"),
+                program("scripts/translate.lua"),
             )
             .await
             .expect("Lua 翻译应该成功");
@@ -786,7 +790,7 @@ mod tests {
                 &project(),
                 Arc::new(FakeClient { name: "quality" }),
                 semantics(),
-                PathBuf::from("broken translation.lua"),
+                program("broken translation.lua"),
             )
             .await
             .expect_err("Host 失败应该传播");
@@ -819,7 +823,7 @@ mod tests {
                 &project(),
                 Arc::new(FakeClient { name: "quality" }),
                 semantics(),
-                PathBuf::from("translation.lua"),
+                program("translation.lua"),
             )
             .await
             .expect_err("Translate 只能接受 Empty Host 结果");
@@ -844,7 +848,7 @@ mod tests {
                 &project(),
                 Arc::new(FakeClient { name: "quality" }),
                 semantics(),
-                PathBuf::from("translation.lua"),
+                program("translation.lua"),
             )
             .await
             .expect("Lua 取消应是正常结果");
@@ -864,11 +868,6 @@ mod tests {
         });
         let project = project();
         let client = Arc::new(FakeClient { name: "quality" });
-        assert_send(service.run(
-            &project,
-            client,
-            semantics(),
-            PathBuf::from("translate.lua"),
-        ));
+        assert_send(service.run(&project, client, semantics(), program("translate.lua")));
     }
 }

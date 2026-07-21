@@ -23,10 +23,11 @@ use crate::runtime::windows::{
     pin_path_without_reparse,
 };
 use crate::storage::sqlite::{
-    CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError,
-    SnapshotDatabaseError, SqliteCommand, SqliteDatabaseCreator, SqliteDatabaseSnapshotter,
-    SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
-    SqliteTransactionStep, SqliteValue,
+    CreateDatabaseError, ExecuteFinalTransactionError, ExecuteTransactionError,
+    QueryExistingDatabaseError, SnapshotDatabaseError, SqliteCommand, SqliteDatabaseCreator,
+    SqliteDatabaseSnapshotter, SqliteFinalTransactionExecutor, SqliteQuery, SqliteQueryExecutor,
+    SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan, SqliteTransactionStep,
+    SqliteValue,
 };
 use crate::storage::sqlite_session::{
     OpenSqliteInteractiveSessionError, OpenedSqliteInteractiveSession,
@@ -817,7 +818,15 @@ fn run_transaction(
     config: &RusqliteStorageConfiguration,
 ) -> Result<(), ExecuteTransactionError<SqliteRuntimeError>> {
     validate_transaction_plan(plan, config).map_err(ExecuteTransactionError::NotCommitted)?;
-    let connection = open_existing_read_write(path, config).map_err(|error| match error {
+    let connection = open_transaction_connection(path, config)?;
+    run_transaction_on_connection(&connection, plan)
+}
+
+fn open_transaction_connection(
+    path: &Path,
+    config: &RusqliteStorageConfiguration,
+) -> Result<Connection, ExecuteTransactionError<SqliteRuntimeError>> {
+    open_existing_read_write(path, config).map_err(|error| match error {
         ExistingFileErrorOrRuntime::Existing(ExistingFileError::NotFound) => {
             ExecuteTransactionError::NotFound
         }
@@ -836,7 +845,13 @@ fn run_transaction(
         ExistingFileErrorOrRuntime::Runtime(source) => {
             ExecuteTransactionError::NotCommitted(source)
         }
-    })?;
+    })
+}
+
+fn run_transaction_on_connection(
+    connection: &Connection,
+    plan: &SqliteTransactionPlan,
+) -> Result<(), ExecuteTransactionError<SqliteRuntimeError>> {
     connection
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|source| {
@@ -906,9 +921,9 @@ fn run_transaction(
 
         match requirement_satisfied {
             Ok(true) => {}
-            Ok(false) => return rollback_requirement_failure(&connection),
+            Ok(false) => return rollback_requirement_failure(connection),
             Err(primary) => {
-                return match rollback_after_failure(&connection, primary) {
+                return match rollback_after_failure(connection, primary) {
                     Ok(primary) => Err(ExecuteTransactionError::NotCommitted(primary)),
                     Err(source) => Err(ExecuteTransactionError::OutcomeUnknown(source)),
                 };
@@ -931,10 +946,86 @@ fn run_transaction(
         )),
         Err(source) => {
             let primary = SqliteRuntimeError::driver("提交写事务", source);
-            match rollback_after_failure(&connection, primary) {
+            match rollback_after_failure(connection, primary) {
                 Ok(primary) => Err(ExecuteTransactionError::NotCommitted(primary)),
                 Err(source) => Err(ExecuteTransactionError::OutcomeUnknown(source)),
             }
+        }
+    }
+}
+
+fn run_final_transaction(
+    path: &Path,
+    plan: &SqliteTransactionPlan,
+    config: &RusqliteStorageConfiguration,
+) -> Result<(), ExecuteFinalTransactionError<SqliteRuntimeError>> {
+    validate_transaction_plan(plan, config).map_err(ExecuteFinalTransactionError::NotCommitted)?;
+    let connection = open_transaction_connection(path, config).map_err(|error| match error {
+        ExecuteTransactionError::NotFound => ExecuteFinalTransactionError::NotFound,
+        ExecuteTransactionError::RequirementFailed => {
+            ExecuteFinalTransactionError::RequirementFailed
+        }
+        ExecuteTransactionError::NotCommitted(source) => {
+            ExecuteFinalTransactionError::NotCommitted(source)
+        }
+        ExecuteTransactionError::OutcomeUnknown(source) => {
+            ExecuteFinalTransactionError::OutcomeUnknown(source)
+        }
+    })?;
+    let transaction = run_transaction_on_connection(&connection, plan);
+    let close_error = connection
+        .close()
+        .err()
+        .map(|(_connection, source)| SqliteRuntimeError::driver("关闭最终事务连接", source));
+
+    match (transaction, close_error) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some(source)) => {
+            Err(ExecuteFinalTransactionError::CommittedButFinalizationFailed(source))
+        }
+        (Err(error), None) => Err(map_final_transaction_error(error)),
+        (Err(ExecuteTransactionError::NotFound), Some(close)) => Err(
+            ExecuteFinalTransactionError::OutcomeUnknown(SqliteRuntimeError::Cleanup {
+                primary: Box::new(SqliteRuntimeError::Internal(
+                    "连接打开后的事务意外返回 NotFound",
+                )),
+                failures: vec![close.to_string()],
+            }),
+        ),
+        (Err(ExecuteTransactionError::RequirementFailed), Some(close)) => Err(
+            ExecuteFinalTransactionError::NotCommitted(SqliteRuntimeError::Cleanup {
+                primary: Box::new(SqliteRuntimeError::Internal("事务条件未满足并已确认回滚")),
+                failures: vec![close.to_string()],
+            }),
+        ),
+        (Err(ExecuteTransactionError::NotCommitted(primary)), Some(close)) => Err(
+            ExecuteFinalTransactionError::NotCommitted(SqliteRuntimeError::Cleanup {
+                primary: Box::new(primary),
+                failures: vec![close.to_string()],
+            }),
+        ),
+        (Err(ExecuteTransactionError::OutcomeUnknown(primary)), Some(close)) => Err(
+            ExecuteFinalTransactionError::OutcomeUnknown(SqliteRuntimeError::Cleanup {
+                primary: Box::new(primary),
+                failures: vec![close.to_string()],
+            }),
+        ),
+    }
+}
+
+fn map_final_transaction_error(
+    error: ExecuteTransactionError<SqliteRuntimeError>,
+) -> ExecuteFinalTransactionError<SqliteRuntimeError> {
+    match error {
+        ExecuteTransactionError::NotFound => ExecuteFinalTransactionError::NotFound,
+        ExecuteTransactionError::RequirementFailed => {
+            ExecuteFinalTransactionError::RequirementFailed
+        }
+        ExecuteTransactionError::NotCommitted(source) => {
+            ExecuteFinalTransactionError::NotCommitted(source)
+        }
+        ExecuteTransactionError::OutcomeUnknown(source) => {
+            ExecuteFinalTransactionError::OutcomeUnknown(source)
         }
     }
 }
@@ -2351,6 +2442,20 @@ pub(crate) struct RusqliteStorage {
     inner: Arc<RusqliteStorageInner>,
 }
 
+/// 主 SQLite 根完成关闭后，用一个独立连接提交最终运行方案的短生命周期根。
+#[derive(Clone)]
+pub(crate) struct RusqliteFinalTransactionExecutor {
+    config: Arc<RusqliteStorageConfiguration>,
+}
+
+impl RusqliteFinalTransactionExecutor {
+    pub(crate) fn new(config: RusqliteStorageConfiguration) -> Self {
+        Self {
+            config: Arc::new(config),
+        }
+    }
+}
+
 impl RusqliteStorage {
     pub(crate) fn start(config: RusqliteStorageConfiguration) -> Result<Self, SqliteRuntimeError> {
         let config = Arc::new(config);
@@ -2622,6 +2727,48 @@ impl SqliteTransactionExecutor for RusqliteStorage {
                 .await
                 .unwrap_or(Err(ExecuteTransactionError::OutcomeUnknown(
                     SqliteRuntimeError::WorkerPanicked("短操作"),
+                )))
+        }
+    }
+}
+
+impl SqliteFinalTransactionExecutor for RusqliteFinalTransactionExecutor {
+    type Error = SqliteRuntimeError;
+
+    fn execute_final_transaction(
+        &self,
+        path: PathBuf,
+        plan: SqliteTransactionPlan,
+    ) -> impl Future<Output = Result<(), ExecuteFinalTransactionError<Self::Error>>> + Send {
+        let config = Arc::clone(&self.config);
+        async move {
+            let (response, receiver) = oneshot::channel();
+            let stack_size = config.worker_stack_bytes.get();
+            thread::Builder::new()
+                .name("att-sqlite-final-transaction".to_owned())
+                .stack_size(stack_size)
+                .spawn(move || {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        run_final_transaction(&path, &plan, &config)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(ExecuteFinalTransactionError::OutcomeUnknown(
+                            SqliteRuntimeError::WorkerPanicked("最终短事务"),
+                        ))
+                    });
+                    let _ = response.send(result);
+                })
+                .map_err(|source| {
+                    ExecuteFinalTransactionError::NotCommitted(SqliteRuntimeError::WorkerSpawn {
+                        worker: "final-transaction".to_owned(),
+                        source,
+                    })
+                })?;
+
+            receiver
+                .await
+                .unwrap_or(Err(ExecuteFinalTransactionError::OutcomeUnknown(
+                    SqliteRuntimeError::WorkerPanicked("最终短事务"),
                 )))
         }
     }
@@ -3202,6 +3349,45 @@ mod tests {
             ])]
         );
         storage.shutdown().await.expect("根应可关闭");
+    }
+
+    #[tokio::test]
+    async fn final_transaction_uses_an_independent_connection_after_main_root_shutdown() {
+        let directory = TestDirectory::new();
+        let database = directory.database("final-transaction.db");
+        let config = configuration();
+        let storage = RusqliteStorage::start(config.clone()).expect("主根应可启动");
+        storage
+            .create_new_database(database.clone(), schema_commands())
+            .await
+            .expect("数据库应可创建");
+        storage.shutdown().await.expect("主根必须先确认关闭");
+
+        let final_executor = RusqliteFinalTransactionExecutor::new(config);
+        final_executor
+            .execute_final_transaction(
+                database.clone(),
+                SqliteTransactionPlan::new(vec![SqliteTransactionStep::Execute(
+                    SqliteCommand::new(
+                        "INSERT INTO values_table (id, t) VALUES (?1, ?2)",
+                        vec![
+                            SqliteValue::Integer(1),
+                            SqliteValue::Text("最终方案".to_owned()),
+                        ],
+                    ),
+                )]),
+            )
+            .await
+            .expect("独立最终事务必须提交并显式关闭连接");
+
+        let connection = Connection::open(&database).expect("最终事务结束后数据库应可重开");
+        let stored: String = connection
+            .query_row("SELECT t FROM values_table WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("最终事务结果应已提交");
+        assert_eq!(stored, "最终方案");
+        assert!(connection.close().is_ok(), "验证连接应可关闭");
     }
 
     #[tokio::test]

@@ -352,18 +352,14 @@ impl TrustedLuaExecutionHost for FakeTrustedLuaExecutionHost {
         invocation: LuaInvocation<Self::TranslationClient>,
     ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
         self.events.lock().expect("事件锁不应中毒").push(Event::Lua);
-        let LuaInvocation::Extract {
-            script_path,
-            project,
-        } = invocation
-        else {
+        let LuaInvocation::Extract { program, project } = invocation else {
             panic!("Extract 完整树不应提交 Translate Lua 调用")
         };
         self.invocations
             .lock()
             .expect("Lua 调用锁不应中毒")
             .push(RecordedLuaInvocation {
-                script_path,
+                script_path: program.main_script_path().to_path_buf(),
                 project,
             });
         Ok(OperationCompletion::Completed(
@@ -422,7 +418,6 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
         cpu.clone(),
     );
     let rules = RulesExtractionService::new(
-        file_reader.clone(),
         RpgMakerProjectDocumentReadingService::new(
             file_reader,
             directory_lister,
@@ -442,8 +437,26 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
     let extract = ExtractService::new(
         opener,
         Some(builtin),
-        Some(SelectedRules::new(PathBuf::from("rules.toml"), rules)),
-        Some(SelectedLua::new(PathBuf::from("extract.lua"), lua)),
+        Some(SelectedRules::new(
+            crate::rpg_maker::extract::rules::RulesProgram::from_toml(
+                PathBuf::from("rules.toml"),
+                br#"
+[[rule]]
+file = "Items.json"
+path = '[].customRule'
+"#
+                .to_vec(),
+            )
+            .expect("测试 Rules 应合法"),
+            rules,
+        )),
+        Some(SelectedLua::new(
+            crate::rpg_maker::lua::runtime::OwnedLuaProgram::new(
+                PathBuf::from("extract.lua"),
+                b"return nil".to_vec(),
+            ),
+            lua,
+        )),
         FakeProjectLease,
         crate::execution::CooperativeCancellation::default(),
     );

@@ -2,8 +2,8 @@
 
 pub(crate) mod cpu;
 pub(crate) mod filesystem;
-pub(crate) mod json_lines;
 pub(crate) mod llm;
+pub(crate) mod project_log;
 pub(crate) mod run_id;
 pub(crate) mod sqlite;
 pub(crate) mod windows;

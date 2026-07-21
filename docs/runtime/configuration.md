@@ -1,36 +1,76 @@
 # ATT 生产配置现行规格
 
 根据当前命令寻找需要填写的分区、理解路径基准并校准资源值，见
-[配置编写与运行能力导航](README.md)。
+[配置编写与运行能力导航](README.md)。CLI、省略参数和运行方案的完整契约见
+[生产运行时与 CLI](cli.md)。
 
-## 1. 配置读取、选择与解析阶段
+## 1. 配置读取与受信边界
 
 除 Help 和 Version 外，每次 ATT 进程都必须通过顶层 `--config FILE` 指定一个 TOML
 配置文件。相对配置路径以进程当前工作目录为基准；配置内部的相对路径以配置文件所在
-目录为基准。不存在环境变量、用户目录或其他隐式配置文件回退。
+目录为基准。不存在默认配置路径、用户目录配置或配置环境变量插值。
+
+`--ui-language`、`ATT_UI_LANGUAGE` 和 `--progress` 是进程界面选择，不属于 TOML，也不
+写入项目数据库。UI locale 的检测和支持范围见 [CLI 现行规格](cli.md#2-ui-语言)。
 
 配置源码受 4 MiB 固定上限保护，并且只读取一次。配置边界始终检查 UTF-8、完整 TOML
-语法、重复 key 和未知顶层分区，随后仅反序列化当前 CLI 命令实际消费的已知分区：
+语法、重复 key 和未知顶层分区。随后结合 CLI 意图与项目保存方案，只选择本次命令真实
+消费的已知分区：
 
 ```text
 CLI 命令 + 必填 --config FILE
   ↓
-受限读取一次 TOML
+受限读取一次 TOML，检查完整语法与未知顶层分区
   ↓
-检查完整语法、重复 key、未知顶层分区
+建立通用配置、项目路径、租约和项目日志配置
   ↓
-选择当前命令所需分区并建立受信类型
+读取项目 metadata 与本命令保存方案
   ↓
-构造 ConfiguredProductCommand(RpgMakerLayout + ConfiguredRpgMakerCommand)
+把显式输入、项目状态或固定产品行为解析为完整运行方案
+  ↓
+选择本方案使用的 Profile、Client、Lua 与纵向配置并建立受信类型
 ```
 
-Translate 在这个公共配置阶段完整建立 `prompts.root`、全局语言模块目录、CLI 选中的
-RPG Maker Profile 及其引用的公共 LLM Client。打开项目后才取得权威 `LanguagePair`，再执行
-第二阶段资源解析：
+已选择分区严格拒绝缺失字段、未知字段、错误类型、非法值、空白 ID 和重复 ID。已知但
+未选择的分区允许缺失，其内部内容不反序列化、不校验、不物化密钥。原始 `toml::Value`
+只停留在选择边界；业务模块不得保存它并延后解释。
+
+用户可修复的配置或资源错误呈现稳定类别以及安全详情：配置路径、可用的一基行列、字段
+或资源路径和原因。TOML/JSON 原文、API key、Client parameters、Prompt 内容和完整配置
+源码不进入错误对象、内部来源链、终端或项目日志。读取缓冲在配置边界完成后清零。
+
+## 2. 按命令选择
+
+所有普通命令都选择：
+
+- `projects.root`；
+- `runtime.async`；
+- 文件读取、目录树预算和项目锁等待时间；
+- SQLite 基础资源与持久策略；
+- `observability.root` 与 `observability.log`。
+
+其余选择如下：
+
+| 命令 | 额外选择 |
+|---|---|
+| Init | 目录发布、SQLite 建库与数据库快照 |
+| Extract | CPU、文档、Store，以及解析后的 Builtin/Rules owner；本次方案启用 Lua 时选择 `runtime.lua` 和交互会话 |
+| Translate | `prompts.root`、完整 `languages`、CPU、LLM Runtime、解析后的 RPG Maker Profile、该 Profile 引用的 Client、标准资产与 Store；本次方案启用 Lua 时再选择 `runtime.lua` |
+| WriteBack | CPU、目录发布与候选编辑、文档和标准资产；本次方案启用 Lua 时选择 `runtime.lua` |
+
+“本次方案启用 Lua”既包括显式非空 `--lua`，也包括从相应阶段数据库快照自动复用。
+配置中存在 `runtime.lua` 不会自行启用程序；零字节 Lua 显式清除阶段程序，本次不选择
+或执行 Lua。
+
+Translate 的 `PROFILE_ID` 可以来自本次显式输入或项目保存方案。选定 ID 后才以两遍选择
+精确解析对应 `[[rpg_maker.translation_profiles]]` 和它引用的 `[llm.clients.<id>]`。保存的
+Profile 在当前配置中不存在时是输入错误，不自动选择其他 Profile。未选择 Profile 除 ID
+外的内容和未选择 Client 的 API key 不物化为受信值。
+
+Translate 需要解析并验证全部 `[[languages]]` 条目；任一非法语言配置或规范化后重复 ID
+都会阻止运行。项目开启后取得权威 `LanguagePair`，再执行第二阶段资源解析：
 
 ```text
-打开 <projects.root>/<engine>/<project-name>
-  ↓
 从 metadata 取得受信 LanguagePair
   ↓
 按 source LanguageId 精确选择一个共享语言模块
@@ -40,48 +80,12 @@ RPG Maker Profile 及其引用的公共 LLM Client。打开项目后才取得权
 构造 ResolvedRpgMakerTranslationResources
 ```
 
-原始 `toml::Value` 只停留在未受信的 TOML 文档选择边界；`ConfiguredProductCommand`、
-`TranslateConfiguration` 及业务模块不得保存延后解释的语言或 Prompt 原始值。已选择
-分区严格拒绝缺失字段、未知字段、错误类型、非法值、空白 ID 和重复 ID。已知但未选择
-的分区允许缺失，其内部内容不反序列化、不校验、不物化密钥。
-
-用户可修复的配置或资源错误呈现稳定类别以及安全详情：配置路径、可用的一基行列、
-字段或资源路径和原因。TOML/JSON 原文、API key、Client parameters、Prompt 内容和完整
-配置源码不进入错误对象、错误链或输出。进程输出格式为
-`配置或输入错误：<安全详情>`；读取缓冲在配置边界完成后清零。
-
-## 2. 按命令选择
-
-所有命令都选择：
-
-- `projects.root`；
-- `runtime.async`；
-- 文件读取、目录树预算和项目锁等待时间；
-- SQLite 基础资源与持久策略；
-- `observability.root` 与 `observability.audit`。
-
-其余选择如下：
-
-| 命令 | 额外选择 |
-|---|---|
-| Init | 目录发布、SQLite 建库与数据库快照 |
-| Extract | CPU、所选 Builtin/Rules/Store；只有 `--lua` 才选择 Lua 和交互会话 |
-| Translate | `prompts.root`、完整 `languages`、CPU、LLM Runtime、指定 RPG Maker Profile、该 Profile 引用的 Client、标准资产与 Store；只有 `--lua` 才选择 Lua |
-| WriteBack | CPU、目录发布与候选编辑、文档和标准资产；只有 `--lua` 才选择 Lua |
-
-Translate 必须解析并验证全部 `[[languages]]` 条目，因此任一非法语言配置或规范化后
-重复 ID 都会阻止运行。其他 RPG Maker Profile 和公共 Client 不因存在而被选择；当前 Profile
-或 Client ID 重复、引用缺失仍然失败。Profile 通过第一遍只读 ID、第二遍只解析命中
-条目的方式选择；未选择 Profile 除 ID 外的内容和未选择 Client 的 API key 都不会被
-反序列化或额外物化为秘密值，也不会进入受信配置、Debug、错误链或输出。
-
-四个 `ConfiguredRpgMakerCommand` 变体分别把命令输入与相应受信配置绑定，外层
-`ConfiguredProductCommand` 绑定 RPG Maker 版本布局；不能把 Translate
-配置交给 Init。业务模块不读取配置文件，也不重新解释配置字段。
+四个命令分别把已解析运行方案与相应受信配置绑定；不能把 Translate 配置交给 Init。
+业务模块不读取配置文件，也不重新解释配置字段。
 
 ## 3. 根资源配置与路径
 
-以下配置保留，因为它们拥有当前现实消费者：
+以下配置拥有当前现实消费者：
 
 | 分区 | 职责 |
 |---|---|
@@ -95,8 +99,8 @@ Translate 必须解析并验证全部 `[[languages]]` 条目，因此任一非�
 | `runtime.llm` | HTTP 连接池、进程内全局并发、有限队列、准入超时、代理和 TLS |
 | `runtime.lua` | 每次脚本线程栈、单 VM 内存、取消检查、错误长度和 Host 值预算 |
 
-Lua 每次脚本使用一个专用线程；SQLite 交互命令通道容量固定为 1；每个命令至多持有
-一个目录候选。这些是当前产品固定的生命周期事实，不需要用户配置。
+Lua 每次脚本使用一个专用线程；SQLite 交互命令通道容量固定为 1；每个命令至多持有一个
+目录候选。这些是当前产品固定的生命周期事实，不需要用户配置。
 
 CPU 根使用单一现行配置：
 
@@ -107,41 +111,49 @@ queue_capacity = 64
 ```
 
 `worker_threads` 只接受精确小写 `"auto"` 或正整数。`auto` 在命令启动时读取进程可用
-并行度；探测失败即启动失败。无论自动还是固定值，线程数都显式交给命令私有 Rayon
-池，不读取全局 Rayon 池或 `RAYON_NUM_THREADS`。`queue_capacity` 必须大于零；CPU
-总准入量等于实际线程数加等待队列容量。所有 RPG Maker 纯 CPU 作业共享该预算，业务
-阶段不再拥有重复的解析、扫描、编解码或 scope 并发上限。
+并行度；探测失败即启动失败。无论自动还是固定值，线程数都显式交给命令私有 Rayon 池，
+不读取全局 Rayon 池或 `RAYON_NUM_THREADS`。`queue_capacity` 必须大于零；总准入量等于
+实际线程数加等待队列容量。全部 RPG Maker 纯 CPU 作业共享该预算。
 
-SQLite `journal_mode` 只允许 `delete`、`truncate`、`persist`、`wal`；`synchronous`
-只允许 `normal`、`full`、`extra`。短操作、建库和唯一交互会话共享这些策略。
+SQLite `journal_mode` 只允许 `delete`、`truncate`、`persist`、`wal`；`synchronous` 只
+允许 `normal`、`full`、`extra`。短操作、建库、运行方案事务和唯一交互会话共享策略。
 
 工作区固定为 `<projects.root>/<engine>/<project-name>`，其中 `engine` 只能是 `mz | mv`。
-项目租约服务选择 `<projects.root>/.att-locks/projects/<engine>/`，目录发布选择
-`<projects.root>/.att-locks/directory-publish/<engine>/`；两者均不增加可配置锁根，也不
-搜索其他工作区或锁目录。同名 MZ/MV 项目拥有不同工作区和锁命名空间。
+项目租约位于 `<projects.root>/.att-locks/projects/<engine>/`，目录发布锁位于
+`<projects.root>/.att-locks/directory-publish/<engine>/`。同名 MZ/MV 项目拥有不同工作区
+和锁命名空间，不搜索其他工作区或锁目录。
 
-不对 `projects.root` 做全局文件系统品牌预检。读取、提取和翻译只要求其实际文件操作
-成立；项目租约、目录发布和审计分别在真实操作发生时验证自己需要的锁、身份、同卷
-切换、追加和刷盘能力。
+不对 `projects.root` 做全局文件系统品牌预检。读取、提取和翻译只要求真实文件操作成立；
+项目租约、目录发布和项目日志分别在实际操作时验证自己需要的锁、身份、同卷切换或追加
+能力。日志能力验证失败只影响日志健康，不能反向改变业务结果。
 
-## 4. 审计配置
+## 4. 项目日志配置
 
-四个命令共用一份强审计账本：
+四个命令共用一份不可失败的普通项目日志：
 
 ```toml
 [observability]
 root = "logs"
 
-[observability.audit]
-queue_capacity = 256
-lock_timeout_ms = 30000
-max_record_bytes = 4194304
-max_file_bytes = 268435456
-retained_rotated_files = 8
+[observability.log]
+level = "info"
+queue_capacity = 1024
+batch_max_records = 64
+batch_max_bytes = 1048576
+flush_interval_ms = 100
+shutdown_timeout_ms = 2000
+lock_timeout_ms = 1000
+max_record_bytes = 262144
+max_file_bytes = 67108864
+retained_rotated_files = 4
 ```
 
-这些值分别控制唯一审计 worker 的队列、跨进程锁等待、单条记录、活动文件和轮转保留。
-审计不是可丢失的调试日志；意图没有持久化时不得开始对应网络请求或目录发布。
+所有字段必填。`level` 只接受 `error | warn | info | debug`；容量、字节、间隔、超时和
+保留数量由配置边界完成组合校验。配置本身无效是输入错误；配置成功后，日志启动、队列、
+锁、写入、轮转、保留和关闭故障最多警告一次，不停止业务也不改变退出码。
+
+`root` 的相对路径以配置文件目录为基准。文件布局、JSONL 字段、批处理和安全边界见
+[普通项目日志](project-log.md)。
 
 ## 5. 公共 LLM Client
 
@@ -159,15 +171,17 @@ burst = 8
 parameters = '''{}'''
 ```
 
-`parameters` 必须是完整 JSON 对象，递归拒绝重复键，并拒绝注释、尾逗号、并列值和
-截断内容。顶层不得包含 `model`、`messages` 或 `stream`；其余字段由用户拥有，程序
-不解释或改写。Standard 与 Translate Lua 使用配置边界已经选择的同一个 Client，
-共享 HTTP 连接池、全局容量与客户端 RPM/burst；Lua 不接收 RPG Maker planning 或 request
-策略。
+`parameters` 必须是完整 JSON 对象，递归拒绝重复键，并拒绝注释、尾逗号、并列值和截断
+内容。顶层不得包含 `model`、`messages` 或 `stream`；其余字段由用户拥有，程序不解释或
+改写。Standard 与 Translate Lua 使用同一个已选 Client，共享 HTTP 连接池、全局容量与
+客户端 RPM/burst；Lua 不接收 RPG Maker planning 或 request 策略。
+
+`api_key` 是配置中的实际字符串，当前不会展开环境变量。`"$NAME"` 只表示字面值；真实
+凭据应放在不纳入版本控制且访问受限的本地配置中。代理 URL 不得内嵌凭据。
 
 ## 6. 共享语言目录与 RPG Maker Prompt
 
-翻译语言能力属于进程级共享配置，不归属于 MV 或 MZ 任一版本，使用顶层 `[[languages]]`：
+翻译语言能力属于进程级共享配置，使用顶层 `[[languages]]`：
 
 ```toml
 [prompts]
@@ -191,44 +205,35 @@ minimum_copied_letter_count = 4
 allowed_terms = []
 ```
 
-`LanguageId` 在 CLI、TOML 和其他外部文本进入内部时执行 RFC 5646 解析、IANA 注册表
-校验和 canonicalization。合法大小写变体会立即规范化，例如 `en-us` 成为 `en-US`；
-首尾空白、下划线、非法或未注册子标签以及主语言 `und` 均被拒绝。`LanguagePair`
-承载规范源语言和目标语言；`LanguageModuleCatalog` 以规范 `LanguageId` 为唯一 key，
-精确查询，不做父语言或别名回退。
+游戏翻译的开放 `LanguageId` 与终端闭集 `UiLocale` 是两个独立类型。`LanguageId` 在 CLI、
+TOML 和其他外部文本进入内部时执行 RFC 5646 解析、IANA 注册表校验和 canonicalization；
+精确查询时不做父语言或别名回退。
 
-`prompts.root` 对 Translate 必填。RPG Maker Prompt 不属于共享语言模块，也不属于
-Profile；它由 RPG Maker 翻译能力按权威项目语言对派生精确路径：
+`prompts.root` 对 Translate 必填。Prompt 按权威项目语言对派生唯一路径：
 
 ```text
 <prompts.root>/rpg_maker/<source>--<target>.md
 ```
 
-例如 `ja--zh-Hans.md` 和 `en--zh-Hans.md`。文件名直接使用规范语言标签；只读取该路径
-指向的普通文件，不尝试大小写变体、父语言、默认文件或目录首项。文件必须是合法
-UTF-8 且内容不能全为空白。系统 Prompt 绑定读取时的精确 `LanguagePair`，并与
-同一 `Arc<dyn LanguageModule>` 共同组成 RPG Maker 翻译资源。Prompt
-内容和语言策略指纹继续参与语义单元翻译状态指纹。Prompt 作者必须要求模型只翻译带
-ID 内容、把无 ID 内容仅作语境、按 ID 到字符串数组的当前 wire 返回、遵守自由断行或
-严格对齐约束、精确保留 ATT token，并且不输出说明文字；项目不提供内置 Prompt 正文。
+例如 `ja--zh-Hans.md`。只读取该路径指向的普通 UTF-8 非空白文件，不尝试大小写变体、父
+语言、默认文件或目录首项。Prompt 内容和语言策略指纹参与语义单元翻译状态指纹；项目不
+提供内置 Prompt 正文。
 
-## 7. RPG Maker Profile 与所有权
+## 7. RPG Maker 配置与运行方案所有权
 
-所有 RPG Maker 算法配置只使用共享的 `[rpg_maker]` 分区：
+RPG Maker 算法配置使用共享的 `[rpg_maker]` 分区：
 
 ```toml
 [rpg_maker.document]
+
 [rpg_maker.standard_asset]
 units_per_decode_job = 32
+
 [rpg_maker.extract.store]
+
 [rpg_maker.translate.store]
 units_per_encode_job = 32
-```
 
-各表中的必填资源预算由当前实现的受信配置类型定义；缺失时显式失败，不根据版本、
-输入大小或硬件推断默认策略。
-
-```toml
 [[rpg_maker.translation_profiles]]
 id = "primary"
 llm_client = "primary"
@@ -242,20 +247,19 @@ network_retry_delays_ms = [500, 1500, 5000]
 max_network_retry_after_ms = 30000
 ```
 
-配置中不存在语言对到 Prompt 的映射。受信 RPG Maker Profile 只保存 ID、非零
-任务并发、Planning 配置、Request 配置
-和所选公共 Client。Profile ID 精确匹配，不 trim、不折叠大小写、不提供别名或默认项。
-所选 Profile 的 `max_in_flight_tasks` 不得超过 `runtime.llm.max_active_requests +
-queue_capacity`，且不得使 Standard 的 `2N` 顺序最终化窗口超过运行时 Semaphore 上限。
-`runtime.llm` 的活动与排队总容量本身也不得超过该上限；任一组合不满足时都在启动网络
-请求前作为配置错误失败。
+各表的必填资源预算由受信配置类型定义；缺失时显式失败，不根据版本、输入大小或硬件
+推断默认策略。Profile ID 精确匹配，不 trim、不折叠大小写、不提供别名。所选 Profile 的
+`max_in_flight_tasks` 必须与 `runtime.llm` 的活动、排队和顺序最终化容量共同通过校验。
 
-`LanguageId`、`LanguagePair`、`LanguageModuleCatalog`、公共 LLM、文件、SQLite 和 CPU
-执行器、RPG Maker Profile 与 Prompt 协议属于 MV/MZ 共享能力。版本切片只拥有命令
-契约、游戏目录适配和版本特有投影；项目 schema、数据库对账和翻译资源由共享
-RPG Maker 实现拥有。
+运行方案不写入生产配置：
 
-`rpg_maker.document` 只配置磁盘读取并发；`rpg_maker.standard_asset` 与
-Extract/Translate Store 只配置 CPU 作业的批量粒度。实际 CPU 并行预算统一来自
-`runtime.cpu`。Init 的五项项目事实来自 CLI 或已有数据库，不从配置推断默认值。首次
-创建时五项全部必需；已有项目省略单项表示复用数据库中的当前事实。
+- Init 的上次成功来源路径、Extract 的完整 owner 集合、Translate 的 Profile 和 WriteBack
+  的 Lua 启用选择属于项目数据库；
+- Extract Rules 保存 canonical 规则语义，不保存 TOML 路径；
+- 三个阶段的 Lua 主程序保存正文、SHA-256 和无损 Windows 解析路径，自动复用正文；
+- 术语、Placeholder 与 MV 对话定义继续使用已有权威项目表，不在运行方案中重复存储；
+- UI locale、进度模式和日志健康状态不进入项目数据库。
+
+显式 CLI 文件路径以当前工作目录解析。保存的 Lua 路径只提供 chunk 名、`require` 搜索
+目录和诊断；脚本主动加载的外部模块、文件或进程仍按执行时环境解析。运行方案的替换
+事务与失败语义见 [CLI 现行规格](cli.md#36-成功替换边界) 和 [SQLite 运行时](sqlite.md)。

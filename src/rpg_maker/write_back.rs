@@ -5,14 +5,16 @@ use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::ProjectName;
 use super::SelectedLua;
 use super::project::{ExistingProjectOpener, OpenedProject, RpgMakerWriteBackLayoutProfile};
 use super::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
+use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::RpgMakerLayout;
-use crate::rpg_maker::audit::{AuditEvent, AuditLedger, WriteBackPublishAuditResult};
+use crate::rpg_maker::lua::runtime::OwnedLuaProgram;
 use crate::storage::file_system::ScopedDirectoryScope;
 
 pub(crate) mod asset_reader;
@@ -36,6 +38,18 @@ mod full_tree_tests;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteBackInput {
     pub name: ProjectName,
+}
+
+/// WriteBack 当前可被真实观测的业务阶段；只有存在权威分母的阶段才发布数量进度。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteBackProgressPhase {
+    ReadingAssets,
+    PlanningStandard,
+    RewritingDocuments,
+    PreparingCandidate,
+    RunningLua,
+    ValidatingCandidate,
+    Publishing,
 }
 
 /// 一轮标准写回的正常业务汇总。
@@ -110,6 +124,38 @@ pub(crate) enum WriteBackPublishFailureState {
 pub(crate) struct WriteBackPublishFailure<E> {
     state: WriteBackPublishFailureState,
     source: E,
+}
+
+/// WriteBack 业务服务交给外层可观测性适配器的不可失败事实。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WriteBackLogEvent {
+    PublicationStarted {
+        output_root: PathBuf,
+    },
+    PublicationFinished {
+        output_root: PathBuf,
+        outcome: WriteBackLogPublicationOutcome,
+    },
+}
+
+/// 发布边界已经确认的终态；日志适配器不得再从错误文本推断结果。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteBackLogPublicationOutcome {
+    Published {
+        standard: StandardWriteBackSummary,
+        lua_executed: bool,
+    },
+    NotPublished,
+    PublishedWithResiduals,
+    RecoveryRequired,
+    OutcomeUnknown,
+}
+
+/// 同步、不可失败的 WriteBack 观察入口。
+///
+/// 实现只能接收事实；队列拥塞、文件损坏或关闭失败均不得反馈给业务流程。
+pub(crate) trait WriteBackLog: Send + Sync {
+    fn emit(&self, event: WriteBackLogEvent);
 }
 
 impl<E> WriteBackPublishFailure<E> {
@@ -196,7 +242,7 @@ where
         &self,
         project: &OpenedProject,
         candidate: &C,
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
     ) -> impl Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send;
 }
 
@@ -212,6 +258,7 @@ pub(crate) struct WriteBackService<O, S, P, L, J, K> {
     event_log: J,
     project_lease: K,
     cancellation: CooperativeCancellation,
+    progress: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
 }
 
 impl<O, S, P, L, J, K> WriteBackService<O, S, P, L, J, K> {
@@ -232,7 +279,22 @@ impl<O, S, P, L, J, K> WriteBackService<O, S, P, L, J, K> {
             event_log,
             project_lease,
             cancellation,
+            progress: Arc::new(NoopProgressObserver),
         }
+    }
+
+    /// 为本次 WriteBack 绑定同步、不可失败的业务进度观察者。
+    pub(crate) fn with_progress<Q>(mut self, progress: Q) -> Self
+    where
+        Q: ProgressObserver<WriteBackProgressPhase> + 'static,
+    {
+        self.progress = Arc::new(progress);
+        self
+    }
+
+    fn observe(&self, phase: WriteBackProgressPhase) {
+        self.progress
+            .observe(ProgressSnapshot::indeterminate(phase));
     }
 }
 
@@ -242,7 +304,7 @@ where
     S: StandardWriteBack,
     P: StandardWriteBackPublisher<S::Documents>,
     L: LuaWriteBack<P::Candidate>,
-    J: AuditLedger,
+    J: WriteBackLog,
     K: ProjectCommandLeaseProvider,
 {
     pub(crate) async fn execute(
@@ -250,7 +312,7 @@ where
         input: WriteBackInput,
     ) -> Result<
         OperationCompletion<WriteBackOutput>,
-        WriteBackServiceError<O::Error, S::Error, P::Error, L::Error, J::Error, K::Error>,
+        WriteBackServiceError<O::Error, S::Error, P::Error, L::Error, K::Error>,
     > {
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
@@ -281,11 +343,12 @@ where
         let OperationCompletion::Completed(preparation) = preparation else {
             return Ok(OperationCompletion::Cancelled);
         };
-        let (documents, standard, manual_layout_diagnostics) = preparation.into_parts();
+        let (documents, standard, _) = preparation.into_parts();
 
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
+        self.observe(WriteBackProgressPhase::PreparingCandidate);
         let candidate = self
             .publisher
             .prepare(&project, documents)
@@ -304,10 +367,11 @@ where
         }
 
         let lua_executed = if let Some(selected_lua) = &self.selected_lua {
+            self.observe(WriteBackProgressPhase::RunningLua);
             let error_script_path = selected_lua.script_path().to_path_buf();
             let lua_completion = selected_lua
                 .executor()
-                .run(&project, &candidate, error_script_path.clone())
+                .run(&project, &candidate, selected_lua.program().clone())
                 .await;
             match lua_completion {
                 Ok(OperationCompletion::Completed(())) => true,
@@ -342,6 +406,7 @@ where
             false
         };
 
+        self.observe(WriteBackProgressPhase::ValidatingCandidate);
         if let Err(source) = self.publisher.validate(&candidate).await {
             let candidate_root = candidate.candidate_root().to_path_buf();
             return match self.publisher.discard(candidate).await {
@@ -370,123 +435,51 @@ where
 
         // 借用式业务校验已经通过；`publish` 现在按值接管 token，并在实际目标交换前
         // 再次复核完整候选以覆盖检查与使用之间的变化。从此边界开始，无论根返回何种
-        // 终态，上层都不得再次尝试 discard。
-        let publish_operation_id = match self.event_log.new_operation_id() {
-            Ok(operation_id) => operation_id,
-            Err(source) => {
-                let candidate_root = candidate.candidate_root().to_path_buf();
-                return match self.publisher.discard(candidate).await {
-                    Ok(()) => Err(WriteBackServiceError::CreatePublishOperationId {
-                        candidate_root,
-                        source,
-                    }),
-                    Err(discard) => {
-                        Err(WriteBackServiceError::CreatePublishOperationIdAndDiscard {
-                            candidate_root,
-                            source,
-                            discard,
-                        })
-                    }
-                };
-            }
-        };
+        // 终态，上层都不得再次尝试 discard。观察入口不可失败，因此不会成为发布门槛。
+        self.observe(WriteBackProgressPhase::Publishing);
         let intended_output_root = project.write_back_root().to_path_buf();
-        if let Err(source) = self
-            .event_log
-            .append(AuditEvent::WriteBackPublishStarted {
-                operation_id: publish_operation_id,
-                output_root: intended_output_root.clone(),
-            })
-            .await
-        {
-            let candidate_root = candidate.candidate_root().to_path_buf();
-            return match self.publisher.discard(candidate).await {
-                Ok(()) => Err(WriteBackServiceError::RecordPublishStarted {
-                    candidate_root,
-                    source,
-                }),
-                Err(discard) => Err(WriteBackServiceError::RecordPublishStartedAndDiscard {
-                    candidate_root,
-                    source,
-                    discard,
-                }),
-            };
-        }
+        self.event_log.emit(WriteBackLogEvent::PublicationStarted {
+            output_root: intended_output_root,
+        });
         let published = match self.publisher.publish(candidate).await {
             Ok(published) => published,
             Err(failure) => {
                 let (state, source) = failure.into_parts();
-                let error_state = state.clone();
-                let audit_result = match state {
-                    WriteBackPublishFailureState::NotPublished {
-                        output_root,
-                        residual_paths,
-                    } => WriteBackPublishAuditResult::NotPublished {
-                        output_root,
-                        residual_paths,
-                    },
+                let (output_root, outcome) = match &state {
+                    WriteBackPublishFailureState::NotPublished { output_root, .. } => (
+                        output_root.clone(),
+                        WriteBackLogPublicationOutcome::NotPublished,
+                    ),
                     WriteBackPublishFailureState::PublishedWithResiduals {
-                        output_root,
-                        residual_paths,
-                    } => WriteBackPublishAuditResult::PublishedWithResiduals {
-                        output_root,
-                        residual_paths,
-                    },
-                    WriteBackPublishFailureState::RecoveryRequired {
-                        output_root,
-                        recovery_artifacts,
-                    } => WriteBackPublishAuditResult::RecoveryRequired {
-                        output_root,
-                        recovery_artifacts,
-                    },
-                    WriteBackPublishFailureState::OutcomeUnknown {
-                        output_root,
-                        recovery_artifacts,
-                    } => WriteBackPublishAuditResult::OutcomeUnknown {
-                        output_root,
-                        recovery_artifacts,
-                    },
+                        output_root, ..
+                    } => (
+                        output_root.clone(),
+                        WriteBackLogPublicationOutcome::PublishedWithResiduals,
+                    ),
+                    WriteBackPublishFailureState::RecoveryRequired { output_root, .. } => (
+                        output_root.clone(),
+                        WriteBackLogPublicationOutcome::RecoveryRequired,
+                    ),
+                    WriteBackPublishFailureState::OutcomeUnknown { output_root, .. } => (
+                        output_root.clone(),
+                        WriteBackLogPublicationOutcome::OutcomeUnknown,
+                    ),
                 };
-                let finish = self
-                    .event_log
-                    .append(AuditEvent::WriteBackPublishFinished {
-                        operation_id: publish_operation_id,
-                        result: audit_result,
-                    })
-                    .await;
-                return match finish {
-                    Ok(_) => Err(WriteBackServiceError::Publish {
-                        state: error_state,
-                        source,
-                    }),
-                    Err(log_source) => Err(WriteBackServiceError::PublishAndRecordFailure {
-                        state: error_state,
-                        source,
-                        log_source,
-                    }),
-                };
+                self.event_log.emit(WriteBackLogEvent::PublicationFinished {
+                    output_root,
+                    outcome,
+                });
+                return Err(WriteBackServiceError::Publish { state, source });
             }
         };
         let output_root = published.output_root().to_path_buf();
-
-        let run_log = standard::WriteBackRunLog::new(
-            &project,
-            *project.layout_profile(),
-            standard,
-            manual_layout_diagnostics,
-            lua_executed,
-        );
-        self.event_log
-            .append(AuditEvent::WriteBackPublishFinished {
-                operation_id: publish_operation_id,
-                result: WriteBackPublishAuditResult::Published(run_log),
-            })
-            .await
-            .map_err(|source| WriteBackServiceError::RecordPublishedRun {
-                output_root: output_root.clone(),
+        self.event_log.emit(WriteBackLogEvent::PublicationFinished {
+            output_root: output_root.clone(),
+            outcome: WriteBackLogPublicationOutcome::Published {
+                standard,
                 lua_executed,
-                source,
-            })?;
+            },
+        });
 
         Ok(OperationCompletion::Completed(WriteBackOutput {
             name: project.name().clone(),
@@ -497,9 +490,9 @@ where
     }
 }
 
-/// WriteBack 顶层用例在打开、准备、候选终结、Lua 与日志边界遇到的阶段失败。
+/// WriteBack 顶层用例在打开、准备、候选终结与 Lua 边界遇到的阶段失败。
 #[derive(Debug)]
-pub(crate) enum WriteBackServiceError<OE, SE, PE, LE, JE, KE> {
+pub(crate) enum WriteBackServiceError<OE, SE, PE, LE, KE> {
     ProjectLease(ProjectCommandLeaseError<KE>),
     CancellationDiscard {
         candidate_root: PathBuf,
@@ -528,37 +521,9 @@ pub(crate) enum WriteBackServiceError<OE, SE, PE, LE, JE, KE> {
         source: PE,
         discard: PE,
     },
-    CreatePublishOperationId {
-        candidate_root: PathBuf,
-        source: JE,
-    },
-    CreatePublishOperationIdAndDiscard {
-        candidate_root: PathBuf,
-        source: JE,
-        discard: PE,
-    },
-    RecordPublishStarted {
-        candidate_root: PathBuf,
-        source: JE,
-    },
-    RecordPublishStartedAndDiscard {
-        candidate_root: PathBuf,
-        source: JE,
-        discard: PE,
-    },
     Publish {
         state: WriteBackPublishFailureState,
         source: PE,
-    },
-    PublishAndRecordFailure {
-        state: WriteBackPublishFailureState,
-        source: PE,
-        log_source: JE,
-    },
-    RecordPublishedRun {
-        output_root: PathBuf,
-        lua_executed: bool,
-        source: JE,
     },
 }
 
@@ -567,14 +532,13 @@ pub(crate) enum WriteBackServiceError<OE, SE, PE, LE, JE, KE> {
 pub(crate) enum WriteBackFailureImpact {
     ProjectUnavailable,
     ProjectState,
-    AuditLedger,
     StateAppliedButFinalizationFailed,
     OutcomeUnknown,
     Internal,
 }
 
-impl<OE, SE, PE, LE, JE, KE> WriteBackServiceError<OE, SE, PE, LE, JE, KE> {
-    /// 将候选、审计与目录发布终态归并为命令边界可以准确呈现的用户影响。
+impl<OE, SE, PE, LE, KE> WriteBackServiceError<OE, SE, PE, LE, KE> {
+    /// 将候选与目录发布终态归并为命令边界可以准确呈现的用户影响。
     pub(crate) fn failure_impact(&self) -> WriteBackFailureImpact {
         use WriteBackFailureImpact as Impact;
 
@@ -588,10 +552,6 @@ impl<OE, SE, PE, LE, JE, KE> WriteBackServiceError<OE, SE, PE, LE, JE, KE> {
             | Self::LuaAndDiscard { .. }
             | Self::ValidateCandidate { .. }
             | Self::ValidateCandidateAndDiscard { .. } => Impact::ProjectState,
-            Self::CreatePublishOperationId { .. }
-            | Self::CreatePublishOperationIdAndDiscard { .. }
-            | Self::RecordPublishStarted { .. }
-            | Self::RecordPublishStartedAndDiscard { .. } => Impact::AuditLedger,
             Self::Publish { state, .. } => match state {
                 WriteBackPublishFailureState::NotPublished { .. } => Impact::ProjectUnavailable,
                 WriteBackPublishFailureState::PublishedWithResiduals { .. } => {
@@ -600,26 +560,16 @@ impl<OE, SE, PE, LE, JE, KE> WriteBackServiceError<OE, SE, PE, LE, JE, KE> {
                 WriteBackPublishFailureState::RecoveryRequired { .. }
                 | WriteBackPublishFailureState::OutcomeUnknown { .. } => Impact::OutcomeUnknown,
             },
-            Self::PublishAndRecordFailure { state, .. } => match state {
-                WriteBackPublishFailureState::NotPublished { .. } => Impact::AuditLedger,
-                WriteBackPublishFailureState::PublishedWithResiduals { .. } => {
-                    Impact::StateAppliedButFinalizationFailed
-                }
-                WriteBackPublishFailureState::RecoveryRequired { .. }
-                | WriteBackPublishFailureState::OutcomeUnknown { .. } => Impact::OutcomeUnknown,
-            },
-            Self::RecordPublishedRun { .. } => Impact::StateAppliedButFinalizationFailed,
         }
     }
 }
 
-impl<OE, SE, PE, LE, JE, KE> fmt::Display for WriteBackServiceError<OE, SE, PE, LE, JE, KE>
+impl<OE, SE, PE, LE, KE> fmt::Display for WriteBackServiceError<OE, SE, PE, LE, KE>
 where
     OE: Error,
     SE: Error,
     PE: Error,
     LE: Error,
-    JE: Error,
     KE: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -674,74 +624,22 @@ where
                 "写回候选未通过发布前完整校验（候选：{}）：{source}；随后丢弃候选失败：{discard}",
                 candidate_root.display()
             ),
-            Self::CreatePublishOperationId {
-                candidate_root,
-                source,
-            } => write!(
-                formatter,
-                "无法为写回候选 {} 建立审计操作身份：{source}",
-                candidate_root.display()
-            ),
-            Self::CreatePublishOperationIdAndDiscard {
-                candidate_root,
-                source,
-                discard,
-            } => write!(
-                formatter,
-                "无法为写回候选 {} 建立审计操作身份：{source}；随后丢弃候选失败：{discard}",
-                candidate_root.display()
-            ),
-            Self::RecordPublishStarted {
-                candidate_root,
-                source,
-            } => write!(
-                formatter,
-                "写回候选 {} 的发布意图未能写入审计账本：{source}",
-                candidate_root.display()
-            ),
-            Self::RecordPublishStartedAndDiscard {
-                candidate_root,
-                source,
-                discard,
-            } => write!(
-                formatter,
-                "写回候选 {} 的发布意图未能写入审计账本：{source}；随后丢弃候选失败：{discard}",
-                candidate_root.display()
-            ),
             Self::Publish { state, source } => {
                 write!(
                     formatter,
                     "发布完整写回候选失败（终态：{state:?}）：{source}"
                 )
             }
-            Self::PublishAndRecordFailure {
-                state,
-                source,
-                log_source,
-            } => write!(
-                formatter,
-                "发布完整写回候选失败（终态：{state:?}）且无法记录发布终态：发布：{source}；审计：{log_source}"
-            ),
-            Self::RecordPublishedRun {
-                output_root,
-                lua_executed,
-                source,
-            } => write!(
-                formatter,
-                "完整写回输出已发布到 {}（Lua 已执行：{lua_executed}），但持久日志记录失败：{source}",
-                output_root.display()
-            ),
         }
     }
 }
 
-impl<OE, SE, PE, LE, JE, KE> Error for WriteBackServiceError<OE, SE, PE, LE, JE, KE>
+impl<OE, SE, PE, LE, KE> Error for WriteBackServiceError<OE, SE, PE, LE, KE>
 where
     OE: Error + 'static,
     SE: Error + 'static,
     PE: Error + 'static,
     LE: Error + 'static,
-    JE: Error + 'static,
     KE: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -755,12 +653,6 @@ where
             | Self::ValidateCandidateAndDiscard { source, .. }
             | Self::Publish { source, .. } => Some(source),
             Self::Lua { source, .. } | Self::LuaAndDiscard { source, .. } => Some(source),
-            Self::CreatePublishOperationId { source, .. }
-            | Self::CreatePublishOperationIdAndDiscard { source, .. }
-            | Self::RecordPublishStarted { source, .. }
-            | Self::RecordPublishStartedAndDiscard { source, .. }
-            | Self::RecordPublishedRun { source, .. } => Some(source),
-            Self::PublishAndRecordFailure { source, .. } => Some(source),
         }
     }
 }
@@ -770,9 +662,23 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::observability::{EventId, OperationId};
+    use crate::progress::{ProgressObserver, ProgressSnapshot};
     use crate::rpg_maker::project::{MaxFullwidthChars, RpgMakerWriteBackLayoutProfile};
-    use uuid::Uuid;
+
+    #[derive(Clone, Default)]
+    struct RecordingProgress(Arc<Mutex<Vec<ProgressSnapshot<WriteBackProgressPhase>>>>);
+
+    impl ProgressObserver<WriteBackProgressPhase> for RecordingProgress {
+        fn observe(&self, snapshot: ProgressSnapshot<WriteBackProgressPhase>) {
+            self.0.lock().expect("进度记录锁不应中毒").push(snapshot);
+        }
+    }
+
+    impl RecordingProgress {
+        fn snapshots(&self) -> Vec<ProgressSnapshot<WriteBackProgressPhase>> {
+            self.0.lock().expect("进度记录锁不应中毒").clone()
+        }
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
@@ -784,7 +690,7 @@ mod tests {
             candidate_root: PathBuf,
         },
         ValidateCandidate,
-        AuditPublishStarted,
+        PublicationStarted,
         Publish,
         Discard,
         Log {
@@ -1005,13 +911,13 @@ mod tests {
             &self,
             _: &OpenedProject,
             candidate: &FakeCandidate,
-            script_path: PathBuf,
+            program: OwnedLuaProgram,
         ) -> Result<OperationCompletion<()>, Self::Error> {
             self.events
                 .lock()
                 .expect("事件锁不应中毒")
                 .push(Event::Lua {
-                    script_path,
+                    script_path: program.main_script_path().to_path_buf(),
                     candidate_root: candidate.candidate_root().to_path_buf(),
                 });
             if self.fail {
@@ -1027,67 +933,25 @@ mod tests {
     #[derive(Clone)]
     struct FakeEventLog {
         events: Arc<Mutex<Vec<Event>>>,
-        fail_start: bool,
-        fail_finish: bool,
     }
 
-    impl AuditLedger for FakeEventLog {
-        type Error = FakeError;
-
-        fn new_operation_id(&self) -> Result<OperationId, Self::Error> {
-            Ok(OperationId::from_uuid(Uuid::from_u128(
-                0x550e_8400_e29b_41d4_a716_4466_5544_0000,
-            )))
-        }
-
-        async fn append(&self, event: AuditEvent) -> Result<EventId, Self::Error> {
-            let fail = match event {
-                AuditEvent::WriteBackPublishStarted { .. } => {
+    impl WriteBackLog for FakeEventLog {
+        fn emit(&self, event: WriteBackLogEvent) {
+            let recorded = match event {
+                WriteBackLogEvent::PublicationStarted { .. } => {
                     self.events
                         .lock()
                         .expect("事件锁不应中毒")
-                        .push(Event::AuditPublishStarted);
-                    self.fail_start
+                        .push(Event::PublicationStarted);
+                    return;
                 }
-                AuditEvent::WriteBackPublishFinished {
-                    result: WriteBackPublishAuditResult::Published(event),
+                WriteBackLogEvent::PublicationFinished {
+                    outcome: WriteBackLogPublicationOutcome::Published { lua_executed, .. },
                     ..
-                } => {
-                    self.events
-                        .lock()
-                        .expect("事件锁不应中毒")
-                        .push(Event::Log {
-                            lua_executed: event.lua_executed(),
-                        });
-                    self.fail_finish
-                }
-                AuditEvent::WriteBackPublishFinished {
-                    result:
-                        WriteBackPublishAuditResult::NotPublished { .. }
-                        | WriteBackPublishAuditResult::PublishedWithResiduals { .. }
-                        | WriteBackPublishAuditResult::RecoveryRequired { .. }
-                        | WriteBackPublishAuditResult::OutcomeUnknown { .. },
-                    ..
-                } => {
-                    self.events
-                        .lock()
-                        .expect("事件锁不应中毒")
-                        .push(Event::LogPublishFailure);
-                    self.fail_finish
-                }
-                AuditEvent::RunStarted
-                | AuditEvent::RunFinished { .. }
-                | AuditEvent::TranslationPlanningUnresolved { .. }
-                | AuditEvent::TranslationTaskStarted { .. }
-                | AuditEvent::TranslationTaskFinished { .. } => false,
+                } => Event::Log { lua_executed },
+                WriteBackLogEvent::PublicationFinished { .. } => Event::LogPublishFailure,
             };
-            if fail {
-                Err(FakeError("log"))
-            } else {
-                Ok(EventId::from_uuid(Uuid::from_u128(
-                    0x7c9e_6679_7425_40de_944b_e07f_c1f9_0ae7,
-                )))
-            }
+            self.events.lock().expect("事件锁不应中毒").push(recorded);
         }
     }
 
@@ -1128,7 +992,7 @@ mod tests {
             },
             lua_script.map(|path| {
                 SelectedLua::new(
-                    PathBuf::from(path),
+                    OwnedLuaProgram::new(PathBuf::from(path), b"return nil".to_vec()),
                     FakeLuaWriteBack {
                         events: Arc::clone(&events),
                         fail: matches!(failing_stage, Some("lua" | "lua-discard")),
@@ -1139,11 +1003,7 @@ mod tests {
                     },
                 )
             }),
-            FakeEventLog {
-                events,
-                fail_start: failing_stage == Some("log-start"),
-                fail_finish: failing_stage == Some("log"),
-            },
+            FakeEventLog { events },
             FakeProjectLease,
             cancellation,
         )
@@ -1230,7 +1090,7 @@ mod tests {
                 Event::Standard(layout_profile()),
                 Event::PrepareCandidate,
                 Event::ValidateCandidate,
-                Event::AuditPublishStarted,
+                Event::PublicationStarted,
                 Event::Publish,
                 Event::Log {
                     lua_executed: false,
@@ -1266,11 +1126,72 @@ mod tests {
                     candidate_root: candidate_root(),
                 },
                 Event::ValidateCandidate,
-                Event::AuditPublishStarted,
+                Event::PublicationStarted,
                 Event::Publish,
                 Event::Log { lua_executed: true },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn progress_reports_only_started_top_level_phases_in_business_order() {
+        let progress = RecordingProgress::default();
+        service(
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            Some("scripts/write_back.lua"),
+        )
+        .with_progress(progress.clone())
+        .execute(input(Some("scripts/write_back.lua")))
+        .await
+        .expect("带 Lua 的写回应成功");
+
+        assert_eq!(
+            progress.snapshots(),
+            vec![
+                ProgressSnapshot::indeterminate(WriteBackProgressPhase::PreparingCandidate),
+                ProgressSnapshot::indeterminate(WriteBackProgressPhase::RunningLua),
+                ProgressSnapshot::indeterminate(WriteBackProgressPhase::ValidatingCandidate),
+                ProgressSnapshot::indeterminate(WriteBackProgressPhase::Publishing),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_top_level_phase_does_not_start_later_phases() {
+        for stage in ["lua", "cancel-after-prepare"] {
+            let progress = RecordingProgress::default();
+            let result = service(
+                Arc::new(Mutex::new(Vec::new())),
+                Some(stage),
+                Some("scripts/write_back.lua"),
+            )
+            .with_progress(progress.clone())
+            .execute(input(Some("scripts/write_back.lua")))
+            .await;
+
+            if stage == "lua" {
+                result.expect_err("Lua 失败必须传播");
+                assert_eq!(
+                    progress.snapshots(),
+                    vec![
+                        ProgressSnapshot::indeterminate(WriteBackProgressPhase::PreparingCandidate,),
+                        ProgressSnapshot::indeterminate(WriteBackProgressPhase::RunningLua),
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    result.expect("候选准备后取消应为正常结果"),
+                    OperationCompletion::Cancelled
+                );
+                assert_eq!(
+                    progress.snapshots(),
+                    vec![ProgressSnapshot::indeterminate(
+                        WriteBackProgressPhase::PreparingCandidate,
+                    )]
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1411,7 +1332,7 @@ mod tests {
                         candidate_root: candidate_root(),
                     },
                     Event::ValidateCandidate,
-                    Event::AuditPublishStarted,
+                    Event::PublicationStarted,
                     Event::Publish,
                     Event::LogPublishFailure,
                 ],
@@ -1561,56 +1482,6 @@ mod tests {
                 Event::Discard,
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn log_failure_reports_that_publish_already_took_effect() {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-
-        let error = service(Arc::clone(&recorded), Some("log"), Some("write.lua"))
-            .execute(input(Some("write.lua")))
-            .await
-            .expect_err("日志失败必须显式传播");
-
-        assert!(matches!(
-            error,
-            WriteBackServiceError::RecordPublishedRun {
-                output_root: published_root,
-                lua_executed: true,
-                source: FakeError("log"),
-            } if published_root == output_root()
-        ));
-        let recorded = events(&recorded);
-        assert_eq!(
-            recorded
-                .iter()
-                .filter(|event| matches!(event, Event::Publish))
-                .count(),
-            1
-        );
-        assert!(!recorded.contains(&Event::Discard));
-    }
-
-    #[tokio::test]
-    async fn publish_intent_failure_discards_candidate_and_never_publishes() {
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-
-        let error = service(Arc::clone(&recorded), Some("log-start"), None)
-            .execute(input(None))
-            .await
-            .expect_err("未确认审计意图时不得发布");
-
-        assert!(matches!(
-            error,
-            WriteBackServiceError::RecordPublishStarted {
-                source: FakeError("log"),
-                ..
-            }
-        ));
-        let recorded = events(&recorded);
-        assert!(recorded.contains(&Event::AuditPublishStarted));
-        assert!(recorded.contains(&Event::Discard));
-        assert!(!recorded.contains(&Event::Publish));
     }
 
     #[tokio::test]

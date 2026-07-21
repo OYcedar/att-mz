@@ -27,7 +27,10 @@ use super::result_store::{
 use super::service::{
     SelectedTranslationExecution, SelectedTranslationExecutionBuilder, TranslateService,
 };
-use super::standard::{StandardTranslation, StandardTranslationService};
+use super::standard::{
+    StandardTranslation, StandardTranslationLog, StandardTranslationLogEvent,
+    StandardTranslationLogTaskOutcome, StandardTranslationService,
+};
 use crate::execution::OperationCompletion;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
@@ -38,9 +41,7 @@ use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError,
     LlmRequestExecutor, LlmResponse,
 };
-use crate::observability::{EventId, OperationId};
 use crate::rpg_maker::RpgMakerLayout;
-use crate::rpg_maker::audit::{AuditEvent, AuditLedger, TranslationTaskAuditResult};
 use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
 use crate::rpg_maker::lua::LuaPhase;
 use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingService;
@@ -115,52 +116,27 @@ enum Event {
 }
 
 #[derive(Clone)]
-struct FakeAuditLedger {
+struct FakeTranslationLog {
     events: EventLog,
     calls: Arc<AtomicUsize>,
 }
 
-impl AuditLedger for FakeAuditLedger {
-    type Error = FakeRootError;
-
-    fn new_operation_id(&self) -> Result<OperationId, Self::Error> {
-        Ok(OperationId::from_uuid(uuid::Uuid::from_u128(
-            0x550e_8400_e29b_41d4_a716_4466_5544_0000,
-        )))
-    }
-
-    async fn append(&self, event: AuditEvent) -> Result<EventId, Self::Error> {
+impl StandardTranslationLog for FakeTranslationLog {
+    fn emit(&self, event: StandardTranslationLogEvent) {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let recorded = match event {
-            AuditEvent::TranslationTaskStarted { .. } => Event::LogTaskStarted,
-            AuditEvent::TranslationTaskFinished {
-                result: TranslationTaskAuditResult::Completed(_),
+            StandardTranslationLogEvent::TaskStarted { .. } => Event::LogTaskStarted,
+            StandardTranslationLogEvent::TaskFinished {
+                outcome:
+                    StandardTranslationLogTaskOutcome::Complete
+                    | StandardTranslationLogTaskOutcome::Partial
+                    | StandardTranslationLogTaskOutcome::Unavailable,
                 ..
             } => Event::LogTask,
-            AuditEvent::TranslationTaskFinished {
-                result: TranslationTaskAuditResult::CommitFailed(_),
-                ..
-            }
-            | AuditEvent::TranslationTaskFinished {
-                result: TranslationTaskAuditResult::NotCommitted(_),
-                ..
-            }
-            | AuditEvent::TranslationTaskFinished {
-                result: TranslationTaskAuditResult::ExecutionFailed { .. },
-                ..
-            } => Event::LogCommitFailure,
-            AuditEvent::RunStarted
-            | AuditEvent::RunFinished { .. }
-            | AuditEvent::TranslationPlanningUnresolved { .. }
-            | AuditEvent::WriteBackPublishStarted { .. }
-            | AuditEvent::WriteBackPublishFinished { .. } => {
-                return Err(FakeRootError("意外审计事件"));
-            }
+            StandardTranslationLogEvent::TaskFinished { .. } => Event::LogCommitFailure,
+            StandardTranslationLogEvent::PlanningUnresolved { .. } => return,
         };
         record(&self.events, recorded);
-        Ok(EventId::from_uuid(uuid::Uuid::from_u128(
-            0x7c9e_6679_7425_40de_944b_e07f_c1f9_0ae7,
-        )))
     }
 }
 
@@ -954,7 +930,7 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
         planner,
         executor,
         result_store,
-        FakeAuditLedger {
+        FakeTranslationLog {
             events: Arc::clone(&events),
             calls: Arc::clone(&persistent_log_calls),
         },
@@ -967,7 +943,10 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
         profile,
         standard: Mutex::new(Some(standard)),
         lua: Mutex::new(Some(crate::rpg_maker::SelectedLua::new(
-            PathBuf::from("scripts/translate.lua"),
+            crate::rpg_maker::lua::runtime::OwnedLuaProgram::new(
+                PathBuf::from("C:/resolved/scripts/translate.lua"),
+                b"return true".to_vec(),
+            ),
             LuaTranslationService::new(lua_host),
         ))),
     };
@@ -996,7 +975,7 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     assert_eq!(transaction_calls.load(Ordering::SeqCst), 2);
     assert_eq!(standard_attempts.load(Ordering::SeqCst), 2);
     assert_eq!(delay_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(file_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(file_calls.load(Ordering::SeqCst), 0);
     assert_eq!(lua_runtime_calls.load(Ordering::SeqCst), 1);
     assert_eq!(session_factory_calls.load(Ordering::SeqCst), 1);
     assert_eq!(persistent_log_calls.load(Ordering::SeqCst), 2);
@@ -1019,7 +998,6 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
         event_position(&events, |event| matches!(event, Event::CommitTransaction));
     let log_start = event_position(&events, |event| matches!(event, Event::LogTaskStarted));
     let log_task = event_position(&events, |event| matches!(event, Event::LogTask));
-    let read_lua = event_position(&events, |event| matches!(event, Event::ReadLua(_)));
     let open_lua = event_position(&events, |event| matches!(event, Event::OpenLuaDatabase(_)));
     let lua_runtime = event_position(&events, |event| matches!(event, Event::LuaRuntime));
     let lua_begin = event_position(&events, |event| matches!(event, Event::LuaBegin));
@@ -1034,8 +1012,8 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     assert!(log_start < first_llm);
     assert!(first_llm < delay && delay < second_llm);
     assert!(second_llm < commit_transaction);
-    assert!(commit_transaction < log_task && log_task < read_lua);
-    assert!(read_lua < open_lua && open_lua < lua_runtime);
+    assert!(commit_transaction < log_task && log_task < open_lua);
+    assert!(open_lua < lua_runtime);
     assert!(lua_runtime < lua_begin && lua_begin < lua_execute);
     assert!(lua_execute < lua_llm && lua_llm < lua_commit);
     assert!(lua_commit < lua_inspect && lua_inspect < lua_close);

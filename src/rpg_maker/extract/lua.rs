@@ -5,13 +5,14 @@ use std::path::PathBuf;
 
 use crate::execution::OperationCompletion;
 use crate::rpg_maker::lua::LuaProjectContext;
-use crate::rpg_maker::lua::runtime::TrustedLuaExtractIntent;
+use crate::rpg_maker::lua::runtime::{OwnedLuaProgram, TrustedLuaExtractIntent};
 pub(crate) use crate::rpg_maker::lua::{
     LuaInvocation, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
 };
 use crate::rpg_maker::project::OpenedProject;
 
 use super::store::LuaSnapshotStore;
+use super::{ExtractProgress, ExtractProgressPhase};
 
 /// 执行一次可信 Lua 提取，并在 Host 干净结束后收敛其可选标准快照意图。
 pub(crate) trait LuaExtraction: Send + Sync {
@@ -20,7 +21,8 @@ pub(crate) trait LuaExtraction: Send + Sync {
     fn run(
         &self,
         project: &OpenedProject,
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
+        progress: ExtractProgress,
     ) -> impl Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send;
 }
 
@@ -46,11 +48,21 @@ where
     async fn run(
         &self,
         project: &OpenedProject,
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
+        progress: ExtractProgress,
     ) -> Result<OperationCompletion<()>, Self::Error> {
-        let error_path = script_path.clone();
+        if program.source().is_empty() {
+            progress.indeterminate(ExtractProgressPhase::LuaCommit);
+            return self
+                .store
+                .deactivate_lua(project)
+                .await
+                .map(|_| OperationCompletion::Completed(()))
+                .map_err(LuaExtractionError::StoreSnapshot);
+        }
+        let error_path = program.main_script_path().to_path_buf();
         let invocation = LuaInvocation::extract(
-            script_path,
+            program,
             LuaProjectContext::for_frozen_source(
                 project.name().as_str(),
                 project.layout().rpg_maker_layout().engine(),
@@ -60,6 +72,7 @@ where
             ),
         );
 
+        progress.indeterminate(ExtractProgressPhase::LuaExecution);
         let completion = self.host.execute(invocation).await.map_err(|source| {
             LuaExtractionError::ExecuteHost {
                 script_path: error_path,
@@ -74,18 +87,22 @@ where
             TrustedLuaExecutionOutcome::Empty => Ok(OperationCompletion::Completed(())),
             TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Replace(
                 snapshot,
-            )) => self
-                .store
-                .replace_lua(project, snapshot)
-                .await
-                .map(|_| OperationCompletion::Completed(()))
-                .map_err(LuaExtractionError::StoreSnapshot),
-            TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Deactivate) => self
-                .store
-                .deactivate_lua(project)
-                .await
-                .map(|_| OperationCompletion::Completed(()))
-                .map_err(LuaExtractionError::StoreSnapshot),
+            )) => {
+                progress.indeterminate(ExtractProgressPhase::LuaCommit);
+                self.store
+                    .replace_lua(project, snapshot)
+                    .await
+                    .map(|_| OperationCompletion::Completed(()))
+                    .map_err(LuaExtractionError::StoreSnapshot)
+            }
+            TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Deactivate) => {
+                progress.indeterminate(ExtractProgressPhase::LuaCommit);
+                self.store
+                    .deactivate_lua(project)
+                    .await
+                    .map(|_| OperationCompletion::Completed(()))
+                    .map_err(LuaExtractionError::StoreSnapshot)
+            }
         }
     }
 }
@@ -136,10 +153,26 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::progress::{ProgressObserver, ProgressSnapshot};
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::extract::store::LuaSnapshot;
     use crate::rpg_maker::lua::runtime::TrustedLuaExtractIntent;
     use crate::rpg_maker::lua::{LuaPhase, LuaProjectContext};
+
+    #[derive(Clone, Default)]
+    struct RecordingProgress(Arc<Mutex<Vec<ProgressSnapshot<ExtractProgressPhase>>>>);
+
+    impl ProgressObserver<ExtractProgressPhase> for RecordingProgress {
+        fn observe(&self, snapshot: ProgressSnapshot<ExtractProgressPhase>) {
+            self.0.lock().expect("进度记录锁不应中毒").push(snapshot);
+        }
+    }
+
+    impl RecordingProgress {
+        fn snapshots(&self) -> Vec<ProgressSnapshot<ExtractProgressPhase>> {
+            self.0.lock().expect("进度记录锁不应中毒").clone()
+        }
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct RecordedInvocation {
@@ -165,12 +198,9 @@ mod tests {
             invocation: LuaInvocation<Self::TranslationClient>,
         ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
             let recorded = match invocation {
-                LuaInvocation::Extract {
-                    script_path,
-                    project,
-                } => RecordedInvocation {
+                LuaInvocation::Extract { program, project } => RecordedInvocation {
                     phase: LuaPhase::Extract,
-                    script_path,
+                    script_path: program.main_script_path().to_path_buf(),
                     project,
                 },
                 LuaInvocation::Translate { .. } => {
@@ -256,6 +286,10 @@ mod tests {
         )
     }
 
+    fn program(path: &str) -> OwnedLuaProgram {
+        OwnedLuaProgram::new(PathBuf::from(path), b"return nil".to_vec())
+    }
+
     #[tokio::test]
     async fn passes_complete_extract_context_to_host_once() {
         let recorded = Arc::new(Mutex::new(None));
@@ -272,7 +306,11 @@ mod tests {
         );
 
         service
-            .run(&opened_project(), PathBuf::from("scripts/extract.lua"))
+            .run(
+                &opened_project(),
+                program("scripts/extract.lua"),
+                ExtractProgress::default(),
+            )
             .await
             .expect("Lua 提取应该成功");
 
@@ -312,7 +350,11 @@ mod tests {
         );
 
         let error = service
-            .run(&opened_project(), PathBuf::from("broken extract.lua"))
+            .run(
+                &opened_project(),
+                program("broken extract.lua"),
+                ExtractProgress::default(),
+            )
             .await
             .expect_err("Host 失败应该传播");
 
@@ -334,6 +376,7 @@ mod tests {
     async fn commits_exactly_the_extract_intent_returned_by_clean_host() {
         let store = FakeStore::default();
         let calls = Arc::clone(&store.calls);
+        let progress = RecordingProgress::default();
         let service = LuaExtractionService::new(
             FakeHost {
                 invocation: Arc::new(Mutex::new(None)),
@@ -347,13 +390,24 @@ mod tests {
         );
 
         service
-            .run(&opened_project(), PathBuf::from("extract.lua"))
+            .run(
+                &opened_project(),
+                program("extract.lua"),
+                ExtractProgress::new(progress.clone()),
+            )
             .await
             .expect("Host 已确认的 active 空快照应该提交");
 
         assert_eq!(
             calls.lock().expect("Store 调用锁不应中毒").as_slice(),
             &[StoreCall::Replace(0)]
+        );
+        assert_eq!(
+            progress.snapshots(),
+            [
+                ProgressSnapshot::indeterminate(ExtractProgressPhase::LuaExecution),
+                ProgressSnapshot::indeterminate(ExtractProgressPhase::LuaCommit),
+            ]
         );
     }
 
@@ -374,7 +428,11 @@ mod tests {
         );
 
         let completion = service
-            .run(&opened_project(), PathBuf::from("extract.lua"))
+            .run(
+                &opened_project(),
+                program("extract.lua"),
+                ExtractProgress::default(),
+            )
             .await
             .expect("Lua 取消应是正常结果");
 
@@ -400,7 +458,11 @@ mod tests {
         );
 
         let error = service
-            .run(&opened_project(), PathBuf::from("extract.lua"))
+            .run(
+                &opened_project(),
+                program("extract.lua"),
+                ExtractProgress::default(),
+            )
             .await
             .expect_err("Store 失败必须传播");
         assert!(matches!(
@@ -423,6 +485,6 @@ mod tests {
             FakeStore::default(),
         );
         let project = opened_project();
-        assert_send(service.run(&project, PathBuf::from("extract.lua")));
+        assert_send(service.run(&project, program("extract.lua"), ExtractProgress::default()));
     }
 }

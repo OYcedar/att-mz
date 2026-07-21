@@ -93,7 +93,6 @@ pub(crate) enum TrustedLua54RuntimeError {
     WorkerSpawn(String),
     ShuttingDown,
     WorkerChannelClosed,
-    Context(String),
     Vm(String),
 }
 
@@ -103,7 +102,6 @@ impl fmt::Display for TrustedLua54RuntimeError {
             Self::WorkerSpawn(message) => write!(formatter, "无法创建 Lua worker：{message}"),
             Self::ShuttingDown => formatter.write_str("Lua Runtime 正在关闭"),
             Self::WorkerChannelClosed => formatter.write_str("Lua worker 通道已关闭"),
-            Self::Context(message) => write!(formatter, "Lua 上下文无效：{message}"),
             Self::Vm(message) => formatter.write_str(message),
         }
     }
@@ -422,10 +420,8 @@ fn execute_program(
         return WorkerOutcome::Cancelled;
     }
 
-    let (script_path, script_directory) = match strict_script_paths(program.main_script_path()) {
-        Ok(paths) => paths,
-        Err(error) => return WorkerOutcome::Context(error),
-    };
+    let script_path = safe_path_identity(program.main_script_path());
+    let script_directory = script_directory(program.main_script_path());
 
     let native_modules = Rc::new(NativeModuleRegistry::default());
     // SAFETY: 脚本是用户明确选择的完全可信本机程序；契约明确允许 debug、io、os、
@@ -547,69 +543,65 @@ fn execute_program(
     )))
 }
 
-fn strict_script_paths(path: &Path) -> Result<(String, String), TrustedLua54RuntimeError> {
-    let script_path = path
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| TrustedLua54RuntimeError::Context("Lua 主程序路径不是 UTF-8".to_owned()))?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let parent = parent
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| TrustedLua54RuntimeError::Context("Lua 主程序目录不是 UTF-8".to_owned()))?;
-    Ok((script_path, parent))
+/// 把 Windows 原始路径逐 UTF-16 code unit 编码成 Lua 可安全展示的无控制字符身份。
+///
+/// 该身份只用于 chunk 名、loader data 与诊断；真实模块查找始终使用原始 `PathBuf`。
+fn safe_path_identity(path: &Path) -> String {
+    use std::fmt::Write as _;
+
+    let mut identity = String::from("@att-utf16");
+    for unit in path.as_os_str().encode_wide() {
+        write!(&mut identity, "-{unit:04X}").expect("写入 String 不会失败");
+    }
+    identity
+}
+
+fn script_directory(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
 }
 
 fn configure_module_paths(
     lua: &Lua,
-    script_directory: &str,
+    script_directory: &Path,
     native_modules: Rc<NativeModuleRegistry>,
 ) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
-    let current_path: String = package.get("path")?;
-    let current_cpath: String = package.get("cpath")?;
-    let separator = if script_directory.ends_with(['/', '\\']) {
-        ""
-    } else if cfg!(windows) {
-        "\\"
-    } else {
-        "/"
-    };
-    package.set(
-        "path",
-        format!(
-            "{script_directory}{separator}?.lua;{script_directory}{separator}?{separator}init.lua;{current_path}"
-        ),
-    )?;
-    package.set(
-        "cpath",
-        format!("{script_directory}{separator}?.dll;{current_cpath}"),
-    )?;
-    install_unicode_module_searchers(lua, &package, native_modules)
+    install_unicode_module_searchers(
+        lua,
+        &package,
+        script_directory.to_path_buf(),
+        native_modules,
+    )
 }
 
 fn install_unicode_module_searchers(
     lua: &Lua,
     package: &Table,
+    script_directory: PathBuf,
     native_modules: Rc<NativeModuleRegistry>,
 ) -> mlua::Result<()> {
+    let lua_module_directory = script_directory.clone();
     let lua_searcher = lua.create_function(move |lua, module: mlua::LuaString| {
         let module = strict_module_name(&module)?;
-        let candidates = package_candidates(lua, "path", &module)?;
+        let mut candidates = local_lua_module_candidates(&lua_module_directory, &module);
+        candidates.extend(package_candidates(lua, "path", &module)?);
         let mut diagnostics = String::new();
         for candidate in candidates {
             match std::fs::read(&candidate) {
                 Ok(source) => {
-                    let name = strict_module_path(&candidate)?;
-                    let loader = lua.load(source).set_name(name).into_function()?;
+                    let name = safe_path_identity(&candidate);
+                    let loader = lua.load(source).set_name(&name).into_function()?;
                     return Ok(MultiValue::from_vec(vec![
                         Value::Function(loader),
-                        Value::String(lua.create_string(name)?),
+                        Value::String(lua.create_string(&name)?),
                     ]));
                 }
                 Err(error) => {
                     use std::fmt::Write as _;
-                    let name = strict_module_path(&candidate)?;
+                    let name = safe_path_identity(&candidate);
                     let _ = write!(diagnostics, "\n\tno file '{name}' ({error})");
                 }
             }
@@ -620,18 +612,22 @@ fn install_unicode_module_searchers(
     })?;
 
     let direct_modules = Rc::clone(&native_modules);
+    let direct_module_directory = script_directory.clone();
     let direct_c_searcher = lua.create_function(move |lua, module: mlua::LuaString| {
         let module = strict_module_name(&module)?;
-        let candidates = package_candidates(lua, "cpath", &module)?;
+        let mut candidates = local_native_module_candidates(&direct_module_directory, &module);
+        candidates.extend(package_candidates(lua, "cpath", &module)?);
         native_module_search(lua, &direct_modules, &module, candidates, false)
     })?;
 
+    let root_module_directory = script_directory;
     let root_c_searcher = lua.create_function(move |lua, module: mlua::LuaString| {
         let module = strict_module_name(&module)?;
         let Some((root, _)) = module.split_once('.') else {
             return Ok(MultiValue::new());
         };
-        let candidates = package_candidates(lua, "cpath", root)?;
+        let mut candidates = local_native_module_candidates(&root_module_directory, root);
+        candidates.extend(package_candidates(lua, "cpath", root)?);
         native_module_search(lua, &native_modules, &module, candidates, true)
     })?;
 
@@ -652,9 +648,17 @@ fn strict_module_name(module: &mlua::LuaString) -> mlua::Result<String> {
         .map_err(|_| mlua::Error::runtime("Lua 模块名不是 UTF-8"))
 }
 
-fn strict_module_path(path: &Path) -> mlua::Result<&str> {
-    path.to_str()
-        .ok_or_else(|| mlua::Error::runtime("Lua 模块路径无法无损转换为 UTF-8"))
+fn local_lua_module_candidates(script_directory: &Path, module: &str) -> Vec<PathBuf> {
+    let module_path = PathBuf::from(module.replace('.', "\\"));
+    let mut direct = script_directory.join(&module_path);
+    direct.set_extension("lua");
+    vec![direct, script_directory.join(module_path).join("init.lua")]
+}
+
+fn local_native_module_candidates(script_directory: &Path, module: &str) -> Vec<PathBuf> {
+    let mut candidate = script_directory.join(module.replace('.', "\\"));
+    candidate.set_extension("dll");
+    vec![candidate]
 }
 
 fn package_candidates(lua: &Lua, field: &str, module: &str) -> mlua::Result<Vec<PathBuf>> {
@@ -688,17 +692,17 @@ fn native_module_search(
                         // 按 Lua 5.4 luaopen_* 契约解析出的入口；本能力只运行用户明确
                         // 信任的本机模块，且 registry 的寿命覆盖 VM。
                         let loader = unsafe { lua.create_c_function(function) }?;
-                        let loaded_path = strict_module_path(&loaded_path)?;
+                        let loaded_path = safe_path_identity(&loaded_path);
                         return Ok(MultiValue::from_vec(vec![
                             Value::Function(loader),
-                            Value::String(lua.create_string(loaded_path)?),
+                            Value::String(lua.create_string(&loaded_path)?),
                         ]));
                     }
                     Err(NativeModuleLoadError::MissingSymbol { path, .. })
                         if missing_symbol_is_diagnostic =>
                     {
                         use std::fmt::Write as _;
-                        let path = strict_module_path(&path)?;
+                        let path = safe_path_identity(&path);
                         let _ = write!(diagnostics, "\n\tno module '{module}' in file '{path}'");
                         return Ok(MultiValue::from_vec(vec![Value::String(
                             lua.create_string(diagnostics)?,
@@ -709,12 +713,12 @@ fn native_module_search(
             }
             Ok(_) => {
                 use std::fmt::Write as _;
-                let path = strict_module_path(&candidate)?;
+                let path = safe_path_identity(&candidate);
                 let _ = write!(diagnostics, "\n\tno file '{path}' (not a regular file)");
             }
             Err(error) => {
                 use std::fmt::Write as _;
-                let path = strict_module_path(&candidate)?;
+                let path = safe_path_identity(&candidate);
                 let _ = write!(diagnostics, "\n\tno file '{path}' ({error})");
             }
         }
@@ -739,7 +743,6 @@ impl NativeModuleRegistry {
             path: path.to_path_buf(),
             source,
         })?;
-        path.to_str().ok_or(NativeModuleLoadError::InvalidPath)?;
 
         let handle = if let Some(handle) = self.handles.borrow().get(&path).copied() {
             handle
@@ -818,25 +821,22 @@ enum NativeModuleLoadError {
 impl fmt::Display for NativeModuleLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPath => {
-                formatter.write_str("Lua C 模块路径无法无损转换为 UTF-8 或包含 NUL")
-            }
+            Self::InvalidPath => formatter.write_str("Lua C 模块路径包含 NUL"),
             Self::InvalidSymbol { module } => {
                 write!(formatter, "Lua C 模块名无法形成导出符号：{module}")
             }
             Self::Load { path, source } => {
+                let path = safe_path_identity(path);
+                write!(formatter, "无法加载 Lua C 模块 {path}：{source}")
+            }
+            Self::MissingSymbol { path, symbols } => {
+                let path = safe_path_identity(path);
                 write!(
                     formatter,
-                    "无法加载 Lua C 模块 {}：{source}",
-                    path.display()
+                    "Lua C 模块 {path} 缺少导出符号 {}",
+                    symbols.join(" 或 ")
                 )
             }
-            Self::MissingSymbol { path, symbols } => write!(
-                formatter,
-                "Lua C 模块 {} 缺少导出符号 {}",
-                path.display(),
-                symbols.join(" 或 ")
-            ),
         }
     }
 }
@@ -3748,6 +3748,8 @@ fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::Duration;
@@ -5762,20 +5764,27 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn require_loads_a_lua_module_beside_the_main_script() {
+    async fn snapshotted_main_program_survives_deletion_and_requires_from_its_saved_parent() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("local_helper.lua"),
             "return { value = 'loaded' }",
         )
         .unwrap();
+        let main_script = directory.path().join("main.lua");
+        std::fs::write(
+            &main_script,
+            "local value, loader = require('local_helper'); assert(value.value == 'loaded'); assert(string.find(loader, '@att-utf16-', 1, true) == 1)",
+        )
+        .unwrap();
+        let snapshot = std::fs::read(&main_script).unwrap();
+        std::fs::remove_file(&main_script).unwrap();
+        assert!(!main_script.exists());
+
         let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let report = runtime
             .start(
-                OwnedLuaProgram::new(
-                    directory.path().join("main.lua"),
-                    b"assert(require('local_helper').value == 'loaded')".to_vec(),
-                ),
+                OwnedLuaProgram::new(main_script, snapshot),
                 test_bindings(
                     None,
                     Arc::new(Mutex::new(TestObservations::default())),
@@ -5784,6 +5793,60 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
                 ),
             )
             .await;
+        report.into_parts().0.unwrap();
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn path_identity_is_ascii_control_free_and_preserves_each_utf16_code_unit() {
+        let path = PathBuf::from(OsString::from_wide(&[
+            0x0043, 0x003A, 0x005C, 0xD83D, 0xDE00, 0x005C, 0xD800, 0x005C, 0x0009,
+        ]));
+
+        let identity = safe_path_identity(&path);
+
+        assert_eq!(
+            identity,
+            "@att-utf16-0043-003A-005C-D83D-DE00-005C-D800-005C-0009"
+        );
+        assert!(identity.is_ascii());
+        assert!(!identity.chars().any(char::is_control));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_memory_main_and_local_module_support_an_unpaired_surrogate_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let script_directory = directory.path().join(OsString::from_wide(&[0xD800]));
+        std::fs::create_dir(&script_directory).unwrap();
+        std::fs::write(
+            script_directory.join("local_helper.lua"),
+            "return { value = 'loaded' }",
+        )
+        .unwrap();
+        let main_script = script_directory.join("main.lua");
+        let script = br#"
+local source = debug.getinfo(1, "S").source
+assert(string.find(source, "@att-utf16-", 1, true) == 1)
+assert(string.find(source, "D800", 1, true) ~= nil)
+assert(string.find(source, "%c") == nil)
+local value, loader = require("local_helper")
+assert(value.value == "loaded")
+assert(string.find(loader, "D800", 1, true) ~= nil)
+"#;
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+
+        let report = runtime
+            .start(
+                OwnedLuaProgram::new(main_script, script.to_vec()),
+                test_bindings(
+                    None,
+                    Arc::new(Mutex::new(TestObservations::default())),
+                    Arc::new(Mutex::new(Vec::new())),
+                    None,
+                ),
+            )
+            .await;
+
         report.into_parts().0.unwrap();
         runtime.shutdown().await.unwrap();
     }
@@ -5799,24 +5862,34 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn require_loads_native_modules_from_a_unicode_directory() {
+    async fn require_loads_native_modules_from_an_unpaired_surrogate_directory() {
         let directory = tempfile::tempdir().unwrap();
-        let module_directory = directory.path().join("本地模块");
+        let build_directory = directory.path().join("build");
+        std::fs::create_dir(&build_directory).unwrap();
+        let library = compile_test_native_module(&build_directory);
+        let module_directory = directory.path().join(OsString::from_wide(&[0xD800]));
         std::fs::create_dir(&module_directory).unwrap();
-        let library = compile_test_native_module(&module_directory);
-        for name in ["root.dll", "versioned-v1.dll", "wrong_symbol.dll"] {
+        for name in [
+            "unicode_native.dll",
+            "root.dll",
+            "versioned-v1.dll",
+            "wrong_symbol.dll",
+        ] {
             std::fs::copy(&library, module_directory.join(name)).unwrap();
         }
 
         let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let script = r#"
 assert(#package.searchers == 4)
-assert(require("unicode_native") == true)
+local unicode_native, native_loader = require("unicode_native")
+assert(unicode_native == true)
+assert(string.find(native_loader, "D800", 1, true) ~= nil)
 assert(require("root.child") == true)
 assert(require("versioned-v1") == true)
 local ok, error = pcall(require, "wrong_symbol")
 assert(not ok)
 assert(string.find(tostring(error), "luaopen_wrong_symbol", 1, true))
+assert(string.find(tostring(error), "D800", 1, true))
 "#;
         let report = runtime
             .start(

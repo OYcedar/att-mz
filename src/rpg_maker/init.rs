@@ -4,12 +4,14 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::ProjectName;
 use super::project::{MaxFullwidthChars, RpgMakerWriteBackLayoutProfile};
 use super::standard_asset::RpgMakerStandardAssetOwner;
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::language::{LanguageId, LanguagePair};
+use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::project_database::{
     NewProject, ProjectDatabaseCreator, ProjectDatabaseStateReconciler, ProjectWorkspaceLayout,
@@ -59,6 +61,16 @@ pub enum InitOutcome {
 pub struct InitOutput {
     pub name: ProjectName,
     pub outcome: InitOutcome,
+}
+
+/// Init 收敛过程中能够被真实观测、但没有稳定数量分母的阶段。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitProgressPhase {
+    CheckingProject,
+    ScanningSource,
+    PreparingCandidate,
+    UpdatingDatabase,
+    Publishing,
 }
 
 /// 完成一次工作区状态收敛所需的全部受信事实。
@@ -154,6 +166,7 @@ pub(crate) struct ProjectWorkspaceConvergenceService<D, S, R, F, A> {
     file_system: F,
     directories: A,
     cancellation: CooperativeCancellation,
+    progress: Arc<dyn ProgressObserver<InitProgressPhase>>,
 }
 
 impl<D, S, R, F, A> ProjectWorkspaceConvergenceService<D, S, R, F, A> {
@@ -180,7 +193,22 @@ impl<D, S, R, F, A> ProjectWorkspaceConvergenceService<D, S, R, F, A> {
             file_system,
             directories,
             cancellation,
+            progress: Arc::new(NoopProgressObserver),
         }
+    }
+
+    /// 为本次 Init 绑定同步、不可失败的业务进度观察者。
+    pub(crate) fn with_progress<Q>(mut self, progress: Q) -> Self
+    where
+        Q: ProgressObserver<InitProgressPhase> + 'static,
+    {
+        self.progress = Arc::new(progress);
+        self
+    }
+
+    fn observe(&self, phase: InitProgressPhase) {
+        self.progress
+            .observe(ProgressSnapshot::indeterminate(phase));
     }
 }
 
@@ -212,6 +240,7 @@ where
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
+        self.observe(InitProgressPhase::CheckingProject);
         let final_layout = ProjectWorkspaceLayout::for_project(
             &self.projects_root,
             self.rpg_maker_layout,
@@ -242,6 +271,7 @@ where
         };
         let settings = resolve_project_settings(&request, current_state.as_ref())
             .map_err(ProjectWorkspaceConvergenceError::MissingInitialSettings)?;
+        self.observe(InitProgressPhase::ScanningSource);
         let source_game_root = self
             .file_system
             .resolve_existing_directory(request.source_game_root)
@@ -305,6 +335,7 @@ where
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
+        self.observe(InitProgressPhase::PreparingCandidate);
         self.file_system
             .ensure_direct_child_directory(
                 self.projects_root.clone(),
@@ -372,6 +403,7 @@ where
             settings.layout_profile,
         );
 
+        self.observe(InitProgressPhase::UpdatingDatabase);
         if target_exists {
             if let Err(source) = self
                 .database_snapshotter
@@ -426,6 +458,7 @@ where
         if self.cancellation.is_requested() {
             return discard_cancelled_candidate(&self.directories, staged).await;
         }
+        self.observe(InitProgressPhase::Publishing);
         self.directories
             .publish(staged)
             .await
@@ -1071,6 +1104,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct Observations {
         events: Arc<Mutex<Vec<&'static str>>>,
+        progress: Arc<Mutex<Vec<ProgressSnapshot<InitProgressPhase>>>>,
         stage_requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
         created_projects: Arc<Mutex<Vec<(PathBuf, NewProject)>>>,
         snapshots: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
@@ -1090,6 +1124,22 @@ mod tests {
                 .lock()
                 .expect("events mutex should not be poisoned")
                 .clone()
+        }
+
+        fn progress(&self) -> Vec<ProgressSnapshot<InitProgressPhase>> {
+            self.progress
+                .lock()
+                .expect("progress mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl ProgressObserver<InitProgressPhase> for Observations {
+        fn observe(&self, snapshot: ProgressSnapshot<InitProgressPhase>) {
+            self.progress
+                .lock()
+                .expect("progress mutex should not be poisoned")
+                .push(snapshot);
         }
     }
 
@@ -1622,7 +1672,8 @@ mod tests {
                     discard_error: Arc::new(Mutex::new(None)),
                 },
                 CooperativeCancellation::default(),
-            ),
+            )
+            .with_progress(observations.clone()),
             observations,
         )
     }
@@ -1699,6 +1750,12 @@ mod tests {
                 ]
         ));
         assert_eq!(observations.events(), vec!["workspace_root"]);
+        assert_eq!(
+            observations.progress(),
+            vec![ProgressSnapshot::indeterminate(
+                InitProgressPhase::CheckingProject
+            )]
+        );
         assert!(
             observations
                 .stage_requests
@@ -1755,6 +1812,16 @@ mod tests {
                 "create_database",
                 "reconcile_database",
                 "publish",
+            ]
+        );
+        assert_eq!(
+            observations.progress(),
+            vec![
+                ProgressSnapshot::indeterminate(InitProgressPhase::CheckingProject),
+                ProgressSnapshot::indeterminate(InitProgressPhase::ScanningSource),
+                ProgressSnapshot::indeterminate(InitProgressPhase::PreparingCandidate),
+                ProgressSnapshot::indeterminate(InitProgressPhase::UpdatingDatabase),
+                ProgressSnapshot::indeterminate(InitProgressPhase::Publishing),
             ]
         );
         let stage_requests = observations
@@ -1829,6 +1896,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_before_convergence_emits_no_unstarted_phase() {
+        let candidate_state = database_state(0x22, Vec::new());
+        let (service, observations) = service(
+            false,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Missing,
+            0x22,
+            Ok(candidate_state.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(candidate_state)),
+            Ok(()),
+        );
+        service.cancellation.request();
+
+        let completion = service
+            .converge(request())
+            .await
+            .expect("预先取消应作为正常结果传播");
+
+        assert_eq!(completion, OperationCompletion::Cancelled);
+        assert!(observations.progress().is_empty());
+        assert!(observations.events().is_empty());
+    }
+
+    #[tokio::test]
     async fn existing_project_inherits_each_omitted_setting() {
         let current = database_state(0x33, Vec::new());
         let (service, observations) = service(
@@ -1849,6 +1940,13 @@ mod tests {
         assert_eq!(
             outcome,
             OperationCompletion::Completed(ProjectWorkspaceConvergence::Unchanged)
+        );
+        assert_eq!(
+            observations.progress(),
+            vec![
+                ProgressSnapshot::indeterminate(InitProgressPhase::CheckingProject),
+                ProgressSnapshot::indeterminate(InitProgressPhase::ScanningSource),
+            ]
         );
         assert!(!observations.events().contains(&"prepare"));
         assert!(!observations.events().contains(&"snapshot_database"));

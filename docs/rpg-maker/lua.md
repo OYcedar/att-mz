@@ -1,7 +1,7 @@
 # RPG Maker Lua 技术参考
 
 本文定义 MV/MZ 向可信 Lua 5.4 主程序公开的当前接口。Lua 用于 Extract、Translate、
-WriteBack 的显式扩展；Init 没有 Lua。可复制的完整协议见 [Lua Cookbook](lua-cookbook.md)
+WriteBack 的阶段扩展；Init 没有 Lua。可复制的完整协议见 [Lua Cookbook](lua-cookbook.md)
 和 [`examples/`](examples/README.md)。
 
 “可信”不是沙箱：脚本拥有完整 Lua 标准库，并按 ATT 进程的操作系统权限运行。`ctx`
@@ -23,6 +23,16 @@ WriteBack 的显式扩展；Init 没有 Lua。可复制的完整协议见 [Lua C
 WriteBack；复杂跨文档/多目标插件由 Lua 自己拥有三阶段身份、私有表、state、事务和幂等
 写回。核心不增加通用多目标投影 DSL、自动发布状态或 post-publish hook。
 
+每个阶段独立保存自己的 Lua 主程序快照：非空主程序正文、SHA-256 和无损 Windows 解析
+路径。显式提供非空 `--lua` 时精确替换该阶段快照；省略 `--lua` 时，仅在上次成功运行
+方案启用了 Lua 的情况下复用；零字节文件显式清除该阶段主程序。自动复用执行数据库中的
+正文，不重新读取原文件；保存路径只用于 chunk 名、`require` 搜索目录和诊断。主程序通过
+`require`、`io`、`os` 或本机模块动态读取的模块、文件和进程仍是外部依赖，不纳入快照。
+
+清除语义按阶段区分：Extract 同时停用 Lua owner、删除其标准资产，并从后续自动方案中
+移除 Lua；Translate 与 WriteBack 只清除各自主程序，不猜测或删除 Lua 私有数据库状态。
+三个阶段即使最初来自同一个文件，也仍是彼此独立的快照和运行方案。
+
 ## 2. VM、连接与 `ctx`
 
 每次阶段调用都创建新的 OS worker、Lua VM 和 SQLite 连接，主程序结束后销毁。因此：
@@ -30,7 +40,7 @@ WriteBack；复杂跨文档/多目标插件由 Lua 自己拥有三阶段身份�
 - Lua globals、`package.loaded`、闭包、userdata 不跨阶段；
 - SQLite TEMP 表、临时 pragma 和连接状态不跨阶段；
 - 只有持久数据库表、冻结来源、标准资产或已发布文件能跨阶段交接；
-- Extract、Translate、WriteBack 即使使用同一脚本路径，也不能依赖前一 VM 的内存。
+- Extract、Translate、WriteBack 即使保存了同一路径，也不能依赖前一 VM 的内存。
 
 主程序目录加入当前 VM 的 `package.path`/`package.cpath`；进程 cwd 不改变。`require`、
 `io`、`os`、`debug` 与 Lua 5.4 本机模块开放。直接 I/O/进程/本机模块不自动进入 ATT 的

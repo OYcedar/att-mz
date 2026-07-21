@@ -4,6 +4,17 @@ ATT 当前支持 RPG Maker 的 MV 与 MZ 游戏。面对一个新游戏时，先
 [RPG Maker 调查与决策指南](docs/rpg-maker/README.md)：从游戏实际运行时如何消费文本
 出发，确认初始化参数、文本载体及适合的提取方式。
 
+CLI 会按 `--ui-language`、`ATT_UI_LANGUAGE`、Windows 用户首选 UI 语言、英语的顺序选择
+界面语言；支持 `ar`、`zh-Hans`、`zh-Hant`、`en`、`fr`、`ru`、`es`、`ja`、`ko` 与
+`vi`。`--progress auto|plain|off` 控制实时进度：`auto` 只在 stderr 是终端时动态显示，
+`plain` 输出适合日志采集的稀疏阶段行，`off` 关闭实时状态。最终摘要写 stdout，进度、
+友好提示与错误写 stderr。
+
+已有项目会保存 Init、Extract、Translate 与 WriteBack 各自上次成功的运行方案。省略
+本次无需重新选择的参数时，ATT 会明确提示并沿用项目状态；显式参数则按对应命令的
+现行规格替换方案。运行方案只在业务成功且必要收尾完成后保存，项目日志故障不会改变
+业务结果或退出码。
+
 ## 1. 初始化项目
 
 先确认游戏版本、正确的游戏根目录、源语言、目标语言，以及对话、滚动文本和帮助说明

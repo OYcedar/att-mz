@@ -146,7 +146,7 @@ ctx.output.write_json(path, entries)
 
 这里先断言候选原文，防止把旧协议的译文写入结构已变化的新游戏。相同 source 与私有表
 重复运行两次，编码结果相同。脚本返回后由 Host 统一验证和发布；不要在返回前把私有表
-写成“published”，因为之后仍可能在验证、审计或目录发布时失败。
+写成“published”，因为之后仍可能在候选验证、目录发布或必要收尾时失败。
 
 需要布局时，在写 JSON 前调用 `ctx.write_back.layout`，并同时处理 `applied` 与正常的
 `manual` 结果；不要自行猜测 Standard 的窗口宽度。

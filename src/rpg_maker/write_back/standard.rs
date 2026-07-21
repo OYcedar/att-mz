@@ -8,12 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use super::{StandardWriteBack, StandardWriteBackSummary};
+use super::{StandardWriteBack, StandardWriteBackSummary, WriteBackProgressPhase};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
+use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, LogicalTextLocation,
     MutationClaim, MutationClaimSet, MutationResource, MutationResourceLock, TextProjectionRecipe,
@@ -1843,78 +1843,9 @@ impl ManualLayoutDiagnostic {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn locations(&self) -> &[LogicalTextLocation] {
         &self.locations
-    }
-
-    pub(crate) const fn region(&self) -> RpgMakerWriteBackLayoutRegion {
-        self.region
-    }
-
-    pub(crate) const fn max_fullwidth_chars(&self) -> MaxFullwidthChars {
-        self.max_fullwidth_chars
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        locations: Vec<LogicalTextLocation>,
-        region: RpgMakerWriteBackLayoutRegion,
-        max_fullwidth_chars: MaxFullwidthChars,
-    ) -> Self {
-        Self::new(locations, region, max_fullwidth_chars)
-    }
-}
-
-/// 一次完整 WriteBack 成功发布后写入持久日志的运行事实。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WriteBackRunLog {
-    layout_profile: RpgMakerWriteBackLayoutProfile,
-    output_root: PathBuf,
-    summary: StandardWriteBackSummary,
-    manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
-    lua_executed: bool,
-}
-
-impl WriteBackRunLog {
-    pub(crate) fn new(
-        project: &OpenedProject,
-        layout_profile: RpgMakerWriteBackLayoutProfile,
-        summary: StandardWriteBackSummary,
-        manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
-        lua_executed: bool,
-    ) -> Self {
-        assert_eq!(
-            summary.manual_layout_units,
-            manual_layout_diagnostics.len(),
-            "人工布局计数必须由结构化诊断唯一建立"
-        );
-        Self {
-            layout_profile,
-            output_root: project.write_back_root().to_path_buf(),
-            summary,
-            manual_layout_diagnostics,
-            lua_executed,
-        }
-    }
-
-    pub(crate) const fn layout_profile(&self) -> RpgMakerWriteBackLayoutProfile {
-        self.layout_profile
-    }
-
-    pub(crate) fn output_root(&self) -> &Path {
-        &self.output_root
-    }
-
-    pub(crate) const fn summary(&self) -> StandardWriteBackSummary {
-        self.summary
-    }
-
-    pub(crate) fn manual_layout_diagnostics(&self) -> &[ManualLayoutDiagnostic] {
-        &self.manual_layout_diagnostics
-    }
-
-    pub(crate) const fn lua_executed(&self) -> bool {
-        self.lua_executed
     }
 }
 
@@ -1966,6 +1897,7 @@ pub(crate) struct StandardWriteBackService<R, L, D, C> {
     document_rewriter: D,
     cpu: Arc<C>,
     cancellation: CooperativeCancellation,
+    progress: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
 }
 
 impl<R, L, D, C> StandardWriteBackService<R, L, D, C> {
@@ -1982,7 +1914,17 @@ impl<R, L, D, C> StandardWriteBackService<R, L, D, C> {
             document_rewriter,
             cpu: Arc::new(cpu),
             cancellation,
+            progress: Arc::new(NoopProgressObserver),
         }
+    }
+
+    /// 为 Standard WriteBack 绑定同步、不可失败的业务进度观察者。
+    pub(crate) fn with_progress<Q>(mut self, progress: Q) -> Self
+    where
+        Q: ProgressObserver<WriteBackProgressPhase> + 'static,
+    {
+        self.progress = Arc::new(progress);
+        self
     }
 }
 
@@ -2005,22 +1947,47 @@ where
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
+        self.progress.observe(ProgressSnapshot::determinate(
+            WriteBackProgressPhase::ReadingAssets,
+            0,
+            1,
+        ));
         let snapshot = self
             .asset_reader
             .read(project)
             .await
             .map_err(StandardWriteBackServiceError::ReadAssets)?;
+        self.progress.observe(ProgressSnapshot::determinate(
+            WriteBackProgressPhase::ReadingAssets,
+            1,
+            1,
+        ));
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
         let groups = snapshot.into_groups();
+        let total_groups = u64::try_from(groups.len()).expect("写回组数量必须可表示为 u64");
+        self.progress.observe(ProgressSnapshot::determinate(
+            WriteBackProgressPhase::PlanningStandard,
+            0,
+            total_groups,
+        ));
         let profile = *layout_profile;
-        let layouter = Arc::clone(&self.text_layouter);
+        let completed_groups = Arc::new(Mutex::new(0_u64));
+        let groups = groups
+            .into_iter()
+            .map(|group| ProgressTrackedPlanningJob {
+                group,
+                profile,
+                layouter: Arc::clone(&self.text_layouter),
+                progress: Arc::clone(&self.progress),
+                completed_groups: Arc::clone(&completed_groups),
+                total_groups,
+            })
+            .collect();
         let planned_groups = self
             .cpu
-            .execute_ordered_map(groups, move |group| {
-                plan_standard_write_back_group(group, &profile, layouter.as_ref())
-            })
+            .execute_ordered_map(groups, plan_standard_write_back_group_with_progress)
             .await
             .map_err(StandardWriteBackServiceError::SchedulePlanning)?;
         let planned = self
@@ -2031,6 +1998,9 @@ where
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
+        self.progress.observe(ProgressSnapshot::indeterminate(
+            WriteBackProgressPhase::RewritingDocuments,
+        ));
         let rewritten = self
             .document_rewriter
             .rewrite(project, planned.mutation_plan)
@@ -2059,6 +2029,35 @@ struct PlannedStandardWriteBackGroup {
     mutations: Vec<StandardWriteBackMutation>,
     summary: StandardWriteBackSummary,
     manual_layout_diagnostics: Vec<ManualLayoutDiagnostic>,
+}
+
+struct ProgressTrackedPlanningJob<L> {
+    group: StandardWriteBackGroup,
+    profile: RpgMakerWriteBackLayoutProfile,
+    layouter: Arc<L>,
+    progress: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
+    completed_groups: Arc<Mutex<u64>>,
+    total_groups: u64,
+}
+
+fn plan_standard_write_back_group_with_progress<L>(
+    job: ProgressTrackedPlanningJob<L>,
+) -> PlannedStandardWriteBackGroup
+where
+    L: RpgMakerWriteBackTextLayouter,
+{
+    let planned = plan_standard_write_back_group(job.group, &job.profile, job.layouter.as_ref());
+    let mut completed = job
+        .completed_groups
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *completed += 1;
+    job.progress.observe(ProgressSnapshot::determinate(
+        WriteBackProgressPhase::PlanningStandard,
+        *completed,
+        job.total_groups,
+    ));
+    planned
 }
 
 struct GroupPlanningOutputs<'a> {

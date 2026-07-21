@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::execution::OperationCompletion;
 use crate::rpg_maker::lua::runtime::{
-    TrustedLuaHostCallError, TrustedLuaOutputEntry, TrustedLuaOutputEntryKind,
+    OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaOutputEntry, TrustedLuaOutputEntryKind,
     TrustedLuaWriteBackHostCalls, TrustedLuaWriteBackLayoutPair, TrustedLuaWriteBackLayoutRegion,
     TrustedLuaWriteBackLayoutResult, TrustedLuaWriteBackLayoutStatus,
 };
@@ -63,7 +63,7 @@ where
         &self,
         project: &OpenedProject,
         candidate: &C,
-        script_path: PathBuf,
+        program: OwnedLuaProgram,
     ) -> impl std::future::Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send
     {
         let prepared = if !candidate.belongs_to(project) {
@@ -72,7 +72,7 @@ where
                 candidate_root: candidate.candidate_root().to_path_buf(),
             })
         } else {
-            let error_path = script_path.clone();
+            let error_path = program.main_script_path().to_path_buf();
             let candidate_root = candidate.candidate_root().to_path_buf();
             let bind = self.editor.bind_scoped_directory(
                 candidate.staged_directory(),
@@ -82,7 +82,7 @@ where
             let layout_profile = *project.layout_profile();
             let rpg_maker_layout = project.layout().rpg_maker_layout();
             Ok((
-                script_path,
+                program,
                 LuaProjectContext::for_write_back_candidate(
                     project.name().as_str(),
                     project.layout().rpg_maker_layout().engine(),
@@ -102,7 +102,7 @@ where
 
         async move {
             let (
-                script_path,
+                program,
                 project,
                 error_path,
                 candidate_root,
@@ -125,7 +125,7 @@ where
                     layout_profile,
                     rpg_maker_layout,
                 });
-            let invocation = LuaInvocation::write_back(script_path, project, calls);
+            let invocation = LuaInvocation::write_back(program, project, calls);
             match self.host.execute(invocation).await {
                 Ok(OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty)) => {
                     Ok(OperationCompletion::Completed(()))
@@ -1008,7 +1008,7 @@ mod tests {
             invocation: LuaInvocation<Self::TranslationClient>,
         ) -> Result<OperationCompletion<TrustedLuaExecutionOutcome>, Self::Error> {
             let LuaInvocation::WriteBack {
-                script_path,
+                program,
                 project,
                 calls: _,
             } = invocation
@@ -1017,7 +1017,7 @@ mod tests {
             };
             *self.invocation.lock().expect("调用记录锁不应中毒") = Some(RecordedInvocation {
                 phase: LuaPhase::WriteBack,
-                script_path,
+                script_path: program.main_script_path().to_path_buf(),
                 project,
             });
             if self.fail {
@@ -1291,6 +1291,10 @@ mod tests {
         }
     }
 
+    fn program(path: &str) -> OwnedLuaProgram {
+        OwnedLuaProgram::new(PathBuf::from(path), b"return nil".to_vec())
+    }
+
     #[tokio::test]
     async fn passes_write_back_phase_and_only_this_phase_receives_output_root() {
         let recorded = Arc::new(Mutex::new(None));
@@ -1307,7 +1311,7 @@ mod tests {
         let candidate = candidate(&project);
 
         service
-            .run(&project, &candidate, PathBuf::from("scripts/write.lua"))
+            .run(&project, &candidate, program("scripts/write.lua"))
             .await
             .expect("Lua 写回应该成功");
 
@@ -1346,7 +1350,7 @@ mod tests {
         let project = project("alice");
 
         let completion = service
-            .run(&project, &candidate(&project), PathBuf::from("write.lua"))
+            .run(&project, &candidate(&project), program("write.lua"))
             .await
             .expect("Lua 取消应是正常结果");
 
@@ -1369,11 +1373,7 @@ mod tests {
         let other = project("bob");
 
         let error = service
-            .run(
-                &current_project,
-                &candidate(&other),
-                PathBuf::from("write.lua"),
-            )
+            .run(&current_project, &candidate(&other), program("write.lua"))
             .await
             .expect_err("跨项目候选 token 必须拒绝");
 
@@ -1397,11 +1397,7 @@ mod tests {
         );
         let project = project("alice");
         let error = service
-            .run(
-                &project,
-                &candidate(&project),
-                PathBuf::from("broken write.lua"),
-            )
+            .run(&project, &candidate(&project), program("broken write.lua"))
             .await
             .expect_err("Host 失败应该传播");
 
@@ -1435,7 +1431,7 @@ mod tests {
         );
         let project = project("alice");
         let candidate = candidate(&project);
-        assert_send(service.run(&project, &candidate, PathBuf::from("write.lua")));
+        assert_send(service.run(&project, &candidate, program("write.lua")));
     }
 
     #[tokio::test]
@@ -1452,7 +1448,7 @@ mod tests {
         let project = project("alice");
 
         let error = service
-            .run(&project, &candidate(&project), PathBuf::from("write.lua"))
+            .run(&project, &candidate(&project), program("write.lua"))
             .await
             .expect_err("WriteBack 只能接收空阶段结果");
 
@@ -1480,7 +1476,7 @@ mod tests {
         let project = project("alice");
 
         let error = service
-            .run(&project, &candidate(&project), PathBuf::from("write.lua"))
+            .run(&project, &candidate(&project), program("write.lua"))
             .await
             .expect_err("无法绑定物理候选时不得启动 Lua Host");
 

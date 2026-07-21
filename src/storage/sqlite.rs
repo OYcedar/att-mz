@@ -262,6 +262,19 @@ pub(crate) enum ExecuteTransactionError<E> {
     OutcomeUnknown(E),
 }
 
+/// 使用独立短生命周期连接执行最终事务的明确终态。
+///
+/// 与常驻 SQLite 根不同，该契约把连接显式关闭也纳入一次调用。提交成功但关闭失败
+/// 时，提交事实仍然已知，不能降格成 `OutcomeUnknown` 或伪装为回滚。
+#[derive(Debug)]
+pub(crate) enum ExecuteFinalTransactionError<E> {
+    NotFound,
+    RequirementFailed,
+    NotCommitted(E),
+    OutcomeUnknown(E),
+    CommittedButFinalizationFailed(E),
+}
+
 impl<E: fmt::Display> fmt::Display for ExecuteTransactionError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -278,6 +291,31 @@ impl<E: Error + 'static> Error for ExecuteTransactionError<E> {
         match self {
             Self::NotFound | Self::RequirementFailed => None,
             Self::NotCommitted(source) | Self::OutcomeUnknown(source) => Some(source),
+        }
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for ExecuteFinalTransactionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("目标数据库不存在"),
+            Self::RequirementFailed => formatter.write_str("事务条件未满足"),
+            Self::NotCommitted(source) => write!(formatter, "数据库事务未提交：{source}"),
+            Self::OutcomeUnknown(source) => write!(formatter, "数据库事务结果未知：{source}"),
+            Self::CommittedButFinalizationFailed(source) => {
+                write!(formatter, "数据库事务已提交，但连接关闭失败：{source}")
+            }
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for ExecuteFinalTransactionError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::NotFound | Self::RequirementFailed => None,
+            Self::NotCommitted(source)
+            | Self::OutcomeUnknown(source)
+            | Self::CommittedButFinalizationFailed(source) => Some(source),
         }
     }
 }
@@ -353,4 +391,19 @@ pub(crate) trait SqliteTransactionExecutor: Send + Sync {
         path: PathBuf,
         plan: SqliteTransactionPlan,
     ) -> impl Future<Output = Result<(), ExecuteTransactionError<Self::Error>>> + Send;
+}
+
+/// 在独立短生命周期连接中执行最终 SQLite 事务。
+///
+/// 实现必须只打开已经存在的数据库，完成事务后显式关闭连接，并在 Future 返回前给出
+/// 提交、确认未提交、提交终态未知或已提交但连接收尾失败中的精确终态。调用 Future
+/// 开始后，编排方必须持续等待到返回，不得通过取消伪造终态。
+pub(crate) trait SqliteFinalTransactionExecutor: Send + Sync {
+    type Error: Error + Send + Sync + 'static;
+
+    fn execute_final_transaction(
+        &self,
+        path: PathBuf,
+        plan: SqliteTransactionPlan,
+    ) -> impl Future<Output = Result<(), ExecuteFinalTransactionError<Self::Error>>> + Send;
 }

@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 /// CPU 任务未能产生结果的原因。
 #[derive(Debug)]
@@ -71,5 +72,34 @@ pub(crate) trait CpuTaskExecutor: Send + Sync {
         F: Fn(I) -> T + Send + Sync + 'static,
     {
         self.execute(move || inputs.into_iter().map(operation).collect())
+    }
+
+    /// 并行计算一组输入，并在每个工作单元真实返回后观察绝对完成数。
+    ///
+    /// 观察回调不返回错误，而且会按 `1..=N` 的顺序被调用；它不得执行
+    /// 阻塞 I/O 或依赖输入顺序。结果仍按输入顺序返回，完成观察只反映
+    /// 实际调度顺序。
+    fn execute_ordered_map_observed<I, T, F, O>(
+        &self,
+        inputs: Vec<I>,
+        operation: F,
+        on_completed: O,
+    ) -> impl Future<Output = Result<Vec<T>, CpuTaskExecutionError<Self::Error>>> + Send
+    where
+        I: Send + 'static,
+        T: Send + 'static,
+        F: Fn(I) -> T + Send + Sync + 'static,
+        O: Fn(u64) + Send + Sync + 'static,
+    {
+        let completed = Arc::new(Mutex::new(0_u64));
+        self.execute_ordered_map(inputs, move |input| {
+            let output = operation(input);
+            let mut completed = completed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *completed = completed.saturating_add(1);
+            on_completed(*completed);
+            output
+        })
     }
 }
