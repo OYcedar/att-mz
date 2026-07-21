@@ -1,0 +1,5 @@
+[[rule]]
+pattern = '\A\\N<(?<speaker>[^>]*)>'
+
+[[rule]]
+pattern = '\A【(?<speaker>[^】]+)】\z'

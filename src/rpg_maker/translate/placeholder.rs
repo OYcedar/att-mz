@@ -7,12 +7,17 @@ use std::sync::Arc;
 use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::placeholder_token;
 use crate::rpg_maker::text::TextGroupKind;
 
 use super::standard::{AppliedPlaceholder, PlaceholderRuleOrigin, PlaceholderSegment};
 
-const BUILTIN_CONTROL_PATTERN: &str = r"\\(?:(?i:V|N|P|C|I|PX|PY|FS)\[\d+\]|(?i:G)|[\\{}$.|!><^])";
+const MV_BUILTIN_CONTROL_PATTERN: &str = r"\\(?:[VvNnPpCcIi]\[[0-9]+\]|[Gg]|[\\{}$.|!><^])";
+const MZ_BUILTIN_CONTROL_PATTERN: &str =
+    r"\\(?:(?:[VvNnPpCcIi]|[Pp][Xx]|[Pp][Yy]|[Ff][Ss])\[[0-9]+\]|[Gg]|[\\{}$.|!><^])";
+const BUILTIN_SEMANTIC_LABEL: &str = "RPG_MAKER_CONTROL";
+const CUSTOM_SEMANTIC_LABEL: &str = "CUSTOM";
 
 /// 外部 TOML 中一条自定义占位符规则的最小表达。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,13 +73,16 @@ struct CompiledPlaceholderRule {
 /// PCRE2 只存在于这一个外部规则边界，内部仍使用 Rust 结构化绑定。
 #[derive(Clone)]
 pub(crate) struct Pcre2PlaceholderService {
-    builtin: Regex,
+    mv_builtin: Regex,
+    mz_builtin: Regex,
 }
 
 impl Pcre2PlaceholderService {
     pub(crate) fn new() -> Result<Self, Pcre2PlaceholderConstructionError> {
         Ok(Self {
-            builtin: compile_regex(BUILTIN_CONTROL_PATTERN)
+            mv_builtin: compile_regex(MV_BUILTIN_CONTROL_PATTERN)
+                .map_err(Pcre2PlaceholderConstructionError)?,
+            mz_builtin: compile_regex(MZ_BUILTIN_CONTROL_PATTERN)
                 .map_err(Pcre2PlaceholderConstructionError)?,
         })
     }
@@ -143,6 +151,7 @@ impl Pcre2PlaceholderService {
     /// 验证所有规则区间互不重叠后，生成可逆 Rust 绑定。
     pub(crate) fn protect(
         &self,
+        engine: RpgMakerEngine,
         kind: TextGroupKind,
         original: &str,
         custom: &CompiledPlaceholderRules,
@@ -152,7 +161,7 @@ impl Pcre2PlaceholderService {
         }
 
         let scope = PlaceholderScope::from_kind(kind);
-        let mut matches = self.builtin_matches(original, scope)?;
+        let mut matches = self.builtin_matches(engine, original, scope)?;
         for rule in custom.rules.iter() {
             if rule
                 .scopes
@@ -163,38 +172,34 @@ impl Pcre2PlaceholderService {
             }
             matches.extend(custom_matches(rule, original, scope)?);
         }
-        for (index, current) in matches.iter().enumerate() {
-            for previous in &matches[..index] {
-                if current.start < previous.end
-                    && previous.start < current.end
-                    && (current.origin == PlaceholderRuleOrigin::Custom
-                        || previous.origin == PlaceholderRuleOrigin::Custom)
-                {
-                    return Err(PlaceholderProtectionError::OverlappingMatches {
-                        first: previous.label.clone(),
-                        second: current.label.clone(),
-                    });
-                }
-            }
-        }
         let mut selected = matches
             .into_iter()
             .flat_map(|matched| matched.protected)
             .collect::<Vec<_>>();
         selected.sort_by_key(|span| (span.start, span.end));
+        for (index, current) in selected.iter().enumerate() {
+            for previous in &selected[..index] {
+                if current.start < previous.end && previous.start < current.end {
+                    return Err(PlaceholderProtectionError::OverlappingMatches {
+                        first: previous.diagnostic_label.clone(),
+                        second: current.diagnostic_label.clone(),
+                    });
+                }
+            }
+        }
 
         let mut protected = String::with_capacity(original.len());
         let mut placeholders = Vec::with_capacity(selected.len());
         let mut cursor = 0;
         for (index, span) in selected.into_iter().enumerate() {
             protected.push_str(&original[cursor..span.start]);
-            let token = semantic_token(&span.label, span.segment, index);
+            let token = semantic_token(span.semantic_label, span.segment, index);
             protected.push_str(&token);
             placeholders.push(AppliedPlaceholder::new(
                 token,
                 &original[span.start..span.end],
                 span.origin,
-                span.label,
+                span.semantic_label,
                 span.scope.name(),
                 span.segment,
             ));
@@ -210,27 +215,29 @@ impl Pcre2PlaceholderService {
 
     fn builtin_matches(
         &self,
+        engine: RpgMakerEngine,
         original: &str,
         scope: PlaceholderScope,
     ) -> Result<Vec<ProtectionMatch>, PlaceholderProtectionError> {
         let mut result = Vec::new();
-        for matched in self.builtin.find_iter(original.as_bytes()) {
+        let regex = match engine {
+            RpgMakerEngine::Mv => &self.mv_builtin,
+            RpgMakerEngine::Mz => &self.mz_builtin,
+        };
+        for matched in regex.find_iter(original.as_bytes()) {
             let matched = matched.map_err(PlaceholderProtectionError::Match)?;
             if matched.start() == matched.end() {
                 return Err(PlaceholderProtectionError::EmptyMatch {
-                    label: "RPG_MAKER_CONTROL".to_owned(),
+                    label: BUILTIN_SEMANTIC_LABEL.to_owned(),
                 });
             }
             result.push(ProtectionMatch {
-                start: matched.start(),
-                end: matched.end(),
-                origin: PlaceholderRuleOrigin::BuiltIn,
-                label: "RPG_MAKER_CONTROL".to_owned(),
                 protected: vec![SelectedSpan {
                     start: matched.start(),
                     end: matched.end(),
                     origin: PlaceholderRuleOrigin::BuiltIn,
-                    label: "RPG_MAKER_CONTROL".to_owned(),
+                    semantic_label: BUILTIN_SEMANTIC_LABEL,
+                    diagnostic_label: BUILTIN_SEMANTIC_LABEL.to_owned(),
                     scope,
                     segment: PlaceholderSegment::Whole,
                 }],
@@ -266,11 +273,11 @@ fn custom_matches(
         }
         if whole.start() == whole.end() {
             return Err(PlaceholderProtectionError::EmptyMatch {
-                label: custom_label(rule.rule_number),
+                label: custom_diagnostic_label(rule.rule_number),
             });
         }
 
-        let label = custom_label(rule.rule_number);
+        let diagnostic_label = custom_diagnostic_label(rule.rule_number);
         let protected = if rule.has_text_capture {
             let capture =
                 captures
@@ -292,7 +299,8 @@ fn custom_matches(
                     start: whole.start(),
                     end: capture.start(),
                     origin: PlaceholderRuleOrigin::Custom,
-                    label: label.clone(),
+                    semantic_label: CUSTOM_SEMANTIC_LABEL,
+                    diagnostic_label: diagnostic_label.clone(),
                     scope,
                     segment: PlaceholderSegment::Begin,
                 });
@@ -302,7 +310,8 @@ fn custom_matches(
                     start: capture.end(),
                     end: whole.end(),
                     origin: PlaceholderRuleOrigin::Custom,
-                    label: label.clone(),
+                    semantic_label: CUSTOM_SEMANTIC_LABEL,
+                    diagnostic_label: diagnostic_label.clone(),
                     scope,
                     segment: PlaceholderSegment::End,
                 });
@@ -313,18 +322,13 @@ fn custom_matches(
                 start: whole.start(),
                 end: whole.end(),
                 origin: PlaceholderRuleOrigin::Custom,
-                label: label.clone(),
+                semantic_label: CUSTOM_SEMANTIC_LABEL,
+                diagnostic_label: diagnostic_label.clone(),
                 scope,
                 segment: PlaceholderSegment::Whole,
             }]
         };
-        result.push(ProtectionMatch {
-            start: whole.start(),
-            end: whole.end(),
-            origin: PlaceholderRuleOrigin::Custom,
-            label,
-            protected,
-        });
+        result.push(ProtectionMatch { protected });
     }
     Ok(result)
 }
@@ -333,7 +337,7 @@ fn valid_utf8_range(text: &str, start: usize, end: usize) -> bool {
     start <= end && end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end)
 }
 
-fn custom_label(rule_number: usize) -> String {
+fn custom_diagnostic_label(rule_number: usize) -> String {
     format!("CUSTOM_{rule_number:04}")
 }
 
@@ -410,10 +414,6 @@ fn ensure_unique_scopes(
 }
 
 struct ProtectionMatch {
-    start: usize,
-    end: usize,
-    origin: PlaceholderRuleOrigin,
-    label: String,
     protected: Vec<SelectedSpan>,
 }
 
@@ -421,7 +421,8 @@ struct SelectedSpan {
     start: usize,
     end: usize,
     origin: PlaceholderRuleOrigin,
-    label: String,
+    semantic_label: &'static str,
+    diagnostic_label: String,
     scope: PlaceholderScope,
     segment: PlaceholderSegment,
 }
@@ -591,7 +592,12 @@ mod tests {
             .expect("自定义规则应该有效");
 
         assert!(matches!(
-            service.protect(TextGroupKind::EventDialogue, r"\C[2]勇者", &custom),
+            service.protect(
+                RpgMakerEngine::Mz,
+                TextGroupKind::EventDialogue,
+                r"\C[2]勇者",
+                &custom,
+            ),
             Err(PlaceholderProtectionError::OverlappingMatches { .. })
         ));
     }
@@ -609,6 +615,7 @@ mod tests {
         for &(original, expected) in cases {
             let (_, bindings) = service
                 .protect(
+                    RpgMakerEngine::Mz,
                     TextGroupKind::EventDialogue,
                     original,
                     &CompiledPlaceholderRules::empty(),
@@ -637,6 +644,7 @@ mod tests {
         ] {
             let (_, bindings) = service
                 .protect(
+                    RpgMakerEngine::Mz,
                     TextGroupKind::EventDialogue,
                     control,
                     &CompiledPlaceholderRules::empty(),
@@ -650,11 +658,55 @@ mod tests {
     }
 
     #[test]
+    fn builtin_controls_are_engine_specific_and_strictly_ascii() {
+        let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
+        let empty = CompiledPlaceholderRules::empty();
+
+        for control in [r"\PX[6]", r"\pY[7]", r"\Fs[8]"] {
+            let (_, mv) = service
+                .protect(
+                    RpgMakerEngine::Mv,
+                    TextGroupKind::EventDialogue,
+                    control,
+                    &empty,
+                )
+                .expect("MV 不支持的控制符应保留为自然文本")
+                .into_parts();
+            let (_, mz) = service
+                .protect(
+                    RpgMakerEngine::Mz,
+                    TextGroupKind::EventDialogue,
+                    control,
+                    &empty,
+                )
+                .expect("MZ 控制符应可保护")
+                .into_parts();
+            assert!(mv.is_empty(), "MV 不应内建保护 {control:?}");
+            assert_eq!(mz.len(), 1, "MZ 应内建保护 {control:?}");
+        }
+
+        for invalid in [r"\V[１]", r"\Fſ[8]"] {
+            let (text, bindings) = service
+                .protect(
+                    RpgMakerEngine::Mz,
+                    TextGroupKind::EventDialogue,
+                    invalid,
+                    &empty,
+                )
+                .expect("非 ASCII 形式只是不命中")
+                .into_parts();
+            assert_eq!(text, invalid);
+            assert!(bindings.is_empty());
+        }
+    }
+
+    #[test]
     fn original_text_cannot_enter_the_reserved_token_namespace() {
         let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
 
         assert!(matches!(
             service.protect(
+                RpgMakerEngine::Mz,
                 TextGroupKind::DatabaseEntry,
                 "自然文本⟦ATT_FAKE",
                 &CompiledPlaceholderRules::empty(),
@@ -675,6 +727,7 @@ mod tests {
 
         let (text, bindings) = service
             .protect(
+                RpgMakerEngine::Mz,
                 TextGroupKind::PluginParameter,
                 "<name>魔法剣</name>",
                 &custom,
@@ -691,13 +744,77 @@ mod tests {
     }
 
     #[test]
+    fn structured_wrapper_allows_builtin_controls_inside_its_natural_text_capture() {
+        let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
+        let custom = service
+            .compile_custom(vec![PlaceholderRuleDefinition::new(
+                None,
+                r"<name>(?<text>.*?)</name>",
+            )])
+            .expect("结构化规则应该有效");
+
+        let (text, bindings) = service
+            .protect(
+                RpgMakerEngine::Mz,
+                TextGroupKind::PluginParameter,
+                r"<name>\C[2]勇者</name>",
+                &custom,
+            )
+            .expect("只有实际保护跨度互不重叠时应允许组合规则")
+            .into_parts();
+
+        assert_eq!(bindings.len(), 3);
+        assert_eq!(bindings[0].original(), "<name>");
+        assert_eq!(bindings[1].original(), r"\C[2]");
+        assert_eq!(bindings[2].original(), "</name>");
+        assert!(text.contains("勇者"));
+    }
+
+    #[test]
+    fn unmatched_rule_insertion_does_not_change_selected_tokens_or_bindings() {
+        let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
+        let original = "前<TOKEN>後";
+        let first = service
+            .compile_custom(vec![PlaceholderRuleDefinition::new(None, "<TOKEN>")])
+            .expect("命中规则应该有效");
+        let shifted = service
+            .compile_custom(vec![
+                PlaceholderRuleDefinition::new(None, "DOES_NOT_MATCH"),
+                PlaceholderRuleDefinition::new(None, "<TOKEN>"),
+            ])
+            .expect("插入的不命中规则应该有效");
+
+        let first = service
+            .protect(
+                RpgMakerEngine::Mz,
+                TextGroupKind::DatabaseEntry,
+                original,
+                &first,
+            )
+            .expect("首份规则应该保护成功");
+        let shifted = service
+            .protect(
+                RpgMakerEngine::Mz,
+                TextGroupKind::DatabaseEntry,
+                original,
+                &shifted,
+            )
+            .expect("规则编号变化不应改变有效保护结果");
+
+        assert_eq!(first, shifted);
+        let (text, bindings) = shifted.into_parts();
+        assert_eq!(text, "前⟦ATT_CUSTOM_WHOLE_0000⟧後");
+        assert_eq!(bindings[0].label(), CUSTOM_SEMANTIC_LABEL);
+    }
+
+    #[test]
     fn omitted_scope_is_global_but_explicit_scope_is_local() {
         let service = Pcre2PlaceholderService::new().expect("内置规则应该有效");
         let global = service
             .compile_custom(vec![PlaceholderRuleDefinition::new(None, "TOKEN")])
             .expect("缺省 scopes 应表示全局");
         let (_, bindings) = service
-            .protect(TextGroupKind::System, "TOKEN", &global)
+            .protect(RpgMakerEngine::Mz, TextGroupKind::System, "TOKEN", &global)
             .expect("全局规则应适用于 System")
             .into_parts();
         assert_eq!(bindings.len(), 1);
@@ -709,7 +826,7 @@ mod tests {
             )])
             .expect("显式作用域应该有效");
         let (text, bindings) = service
-            .protect(TextGroupKind::System, "TOKEN", &local)
+            .protect(RpgMakerEngine::Mz, TextGroupKind::System, "TOKEN", &local)
             .expect("未命中作用域不是错误")
             .into_parts();
         assert_eq!(text, "TOKEN");
@@ -742,7 +859,7 @@ mod tests {
             ])
             .expect("两条规则均可编译");
         assert!(matches!(
-            service.protect(TextGroupKind::Map, "abc", &overlapping),
+            service.protect(RpgMakerEngine::Mz, TextGroupKind::Map, "abc", &overlapping),
             Err(PlaceholderProtectionError::OverlappingMatches { .. })
         ));
 
@@ -750,7 +867,7 @@ mod tests {
             .compile_custom(vec![PlaceholderRuleDefinition::new(None, "missing")])
             .expect("规则应可编译");
         let (text, bindings) = service
-            .protect(TextGroupKind::Map, "source", &no_hit)
+            .protect(RpgMakerEngine::Mz, TextGroupKind::Map, "source", &no_hit)
             .expect("零命中合法")
             .into_parts();
         assert_eq!(text, "source");
@@ -764,7 +881,7 @@ mod tests {
             .compile_custom(vec![PlaceholderRuleDefinition::new(None, r"\A")])
             .expect("零宽正则可编译");
         assert!(matches!(
-            service.protect(TextGroupKind::Map, "source", &custom),
+            service.protect(RpgMakerEngine::Mz, TextGroupKind::Map, "source", &custom),
             Err(PlaceholderProtectionError::EmptyMatch { .. })
         ));
     }
@@ -778,7 +895,7 @@ mod tests {
                 .expect("PCRE2 允许按单个字节匹配");
 
             assert!(matches!(
-                service.protect(TextGroupKind::Map, "莉", &custom),
+                service.protect(RpgMakerEngine::Mz, TextGroupKind::Map, "莉", &custom),
                 Err(PlaceholderProtectionError::InvalidMatchRange { rule_number: 1 })
             ));
         }
@@ -795,7 +912,7 @@ mod tests {
             .expect("PCRE2 允许 lookahead 捕获超出完整匹配");
 
         assert!(matches!(
-            service.protect(TextGroupKind::Map, "AB", &custom),
+            service.protect(RpgMakerEngine::Mz, TextGroupKind::Map, "AB", &custom),
             Err(PlaceholderProtectionError::InvalidMatchRange { rule_number: 1 })
         ));
     }
@@ -827,6 +944,7 @@ mod tests {
         ] {
             let (protected, placeholders) = service
                 .protect(
+                    RpgMakerEngine::Mz,
                     TextGroupKind::EventDialogue,
                     original,
                     &CompiledPlaceholderRules::empty(),
@@ -846,6 +964,7 @@ mod tests {
 
         let (protected, placeholders) = service
             .protect(
+                RpgMakerEngine::Mz,
                 TextGroupKind::EventDialogue,
                 original,
                 &CompiledPlaceholderRules::empty(),
@@ -874,6 +993,7 @@ mod tests {
             .expect("用户规则应该接管插件控制符");
         let protected = service
             .protect(
+                RpgMakerEngine::Mz,
                 TextGroupKind::EventDialogue,
                 r"播放 \SE[Bell] 后继续",
                 &custom,
@@ -883,6 +1003,6 @@ mod tests {
 
         assert_eq!(placeholders.len(), 1);
         assert_eq!(placeholders[0].origin(), PlaceholderRuleOrigin::Custom);
-        assert_eq!(placeholders[0].label(), "CUSTOM_0001");
+        assert_eq!(placeholders[0].label(), CUSTOM_SEMANTIC_LABEL);
     }
 }

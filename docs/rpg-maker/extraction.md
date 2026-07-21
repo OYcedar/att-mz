@@ -1,11 +1,12 @@
 # RPG Maker 文本提取现行规格
 
-本文定义 RPG Maker 领域当前两个受支持版本 MZ 与 MV 共用的提取能力。一次命令可以组合 Builtin、Rules 和 Lua，执行顺序
-固定为 `Builtin → Rules → Lua`；至少选择一项。三个 owner 分别原子替换自己的快照，
-不会互相清理资产。
+本文定义 MV/MZ Extract 的生命周期、标准资产、Builtin 覆盖、顺序与事务。三类声明式
+文件的字段和错误由[规则文件现行规格](rules.md)唯一规定；Lua 形状由
+[Lua 技术参考](lua.md)规定。
 
-## 1. 命令与项目状态
+## 1. 命令与 owner 生命周期
 
+<!-- att-example: illustrative -->
 ```text
 att --config FILE mz extract --name NAME \
   (--builtin | --rules RULES_TOML | --lua SCRIPT_LUA)+
@@ -15,228 +16,159 @@ att --config FILE mv extract --name NAME \
   [--dialogue-rules DIALOGUE_TOML]
 ```
 
-`--dialogue-rules` 只属于 MV，并且必须与 `--builtin` 同时使用。提供文件时，它完整替换
-项目当前 MV 对话定义；省略时 Builtin 复用项目状态；`rule = []` 明确清空定义。定义与
-Builtin 资产快照在同一个数据库事务中提交。WriteBack 只消费物化后的 recipe 和项目
-定义，不重读 TOML。
+一次命令至少选择 Builtin、Rules、Lua 之一，执行和 owner 总顺序固定为
+`Builtin → Rules → Lua`。三个 owner 分别原子替换自己的快照，不清理未选择 owner。
+首个技术失败阻止后续 owner；此前已成功提交的 owner 不做组合回滚。
 
-命令按 `<projects.root>/<engine>/<name>` 开启项目，取得项目租约并校验冻结来源指纹。
-任一 owner 失败时，该 owner 的旧状态保持不变；先前已成功提交的其他 owner 不回滚。
+`--dialogue-rules` 只属于 MV 且必须同时选择 `--builtin`。提供文件完整替换姓名定义，
+省略时复用项目定义，`rule = []` 明确清空。定义与 Builtin 快照同事务提交。Rules 参数
+省略表示本次不执行 Rules；只有提供 `rule = []` 才停用 Rules owner。WriteBack 只消费
+已物化 recipe，不重读 TOML 或正则。
 
-## 2. 共享标准资产模型
+命令按 `<projects.root>/<engine>/<name>` 取得项目租约，验证当前 schema 和冻结来源指纹。
 
-每个提取结果由三层事实组成：
+## 2. 共享标准资产与当前 schema
 
+<!-- att-example: illustrative -->
 ```text
-Group
-├─ group_location + group_kind
-├─ TextProjectionRecipe
-├─ Unit(unit_role, source_content, source_context)
-└─ MutationTarget（一个或多个物理修改目标）
+Owner
+└─ Group(group_order, group_location, group_kind, projection_recipe)
+   ├─ Unit(unit_order, unit_role, source_content, source_context,
+   │      translation, translation_state)
+   └─ MutationClaim(resource_key, access = intent | exclusive)
 ```
 
-语义单元身份固定为 `owner + group_location + unit_role`。`TextUnitRole` 包含：
+语义身份是 `owner + group_location + unit_role`；`group_order` 和 `unit_order` 是非身份字段。
+`group_order` 在 owner 内从 0 连续，`unit_order` 在组内从 0 连续。内容形状只有：
 
-- `Scalar`；
-- `DialogueSpeaker`；
-- `DialogueBody`；
-- `Choices`；
-- `ScrollingText`。
+- `Value(String)`：Scalar 和 DialogueSpeaker；
+- `Lines(Vec<String>)`：DialogueBody、Choices、ScrollingText。
 
-内容只有 `Value(String)` 与 `Lines(Vec<String>)` 两种形状。Scalar 与 Speaker 使用
-Value；完整对话正文、完整选项组和完整滚动文本块使用 Lines。数组元素边界属于翻译
-事实，不能把 Lines 连接成普通字符串后再计算身份或状态。单个 Lines 元素不得包含
-CR、LF 或 NUL。
+Lines 的元素边界属于翻译事实；元素不得含 CR、LF 或 NUL。`source_context` 当前由
+DialogueBody 保存源 Speaker，其余为空对象。译文内容必须与原文形状相同，译文与
+translation state 必须成对存在或成对为空。Lua 私有表使用的 64 字符十六进制表示见
+[Lua Translate](lua.md#7-translatepreparecurrent-与-accept)。
 
-`standard_text_unit` 的当前持久字段固定为：
+当前数据库相关表为：
 
-```text
-owner
-group_location
-unit_role
-source_content_json
-source_context_json
-translation_content_json
-translation_state
-```
+- `standard_asset_owner_state`：owner 的来源与资产快照指纹；
+- `standard_text_group`：含 `group_order` 的组与完整 recipe；
+- `standard_text_unit`：含 `unit_order` 的语义单元、译文和 state；
+- `standard_mutation_claim`：`owner + group_location + resource_key + access`；
+- `standard_translation_resource`：术语与自定义占位符 canonical 资源；
+- `standard_project_definition`：MV 姓名投影定义。
 
-Value 编码为 JSON string，Lines 编码为 JSON string array；译文内容必须与原文内容保持
-同一 JSON 形状。`source_context_json` 是 JSON object，当前仅 DialogueBody 保存源
-Speaker，其余单元保存空对象。译文与 32 字节 state 必须同时存在或同时为空。
+当前 schema 一次性替换旧 schema，不提供迁移、识别或兼容读取。旧项目应在项目根外备份
+后重新 Init/Extract/Translate；不符合当前 schema 的数据库只作为普通无效项目数据库。
 
-物理 JSON 地址只用于冻结来源复核和写回，不再充当译文身份。Group 保存完整 recipe，
-包括 Literal、SpeakerSlot、源行到物理命令模板的映射和原始命令边界。
-每次 owner 替换都计算完整资产快照指纹，并原子写入：
+## 3. Builtin 覆盖矩阵
 
-- `standard_text_group`；
-- `standard_text_unit`；
-- `standard_text_target`；
-- `standard_asset_owner_state` 中的来源与资产快照指纹。
+Builtin 只覆盖下表明确列出的玩家文本。字段按表中顺序建立 unit；数组按数值下标顺序，
+对象按来源结构顺序。空白字段是否产出遵循对应标准资产语义，不扩展为“遍历所有 string”。
 
-同一物理目标只能归属一个 owner/group；跨 owner 或跨规则冲突在写入前失败。
+| 来源 | `group_kind` / Placeholder scope | 字段或结构（声明顺序） |
+|---|---|---|
+| `Actors.json` | `database_entry` | `name`、`nickname`、`profile` |
+| `Classes.json` | `database_entry` | `name` |
+| `Skills.json` | `database_entry` | `name`、`description`、`message1`、`message2` |
+| `Items.json` | `database_entry` | `name`、`description` |
+| `Weapons.json` | `database_entry` | `name`、`description` |
+| `Armors.json` | `database_entry` | `name`、`description` |
+| `Enemies.json` | `database_entry` | `name` |
+| `States.json` | `database_entry` | `name`、`message1`、`message2`、`message3`、`message4` |
+| `System.json` 根 | `system` | `gameTitle`、`currencyUnit` |
+| `System.json.terms` | `system` | `basic[]`、`commands[]`、`params[]`、`messages` 中所有 string |
+| `System.json` 类型数组 | `system` | `elements[]`、`skillTypes[]`、`weaponTypes[]`、`armorTypes[]`、`equipTypes[]` |
+| 规范 `MapNNN.json` 根 | `map` | `displayName` |
+| Map/CommonEvents/Troops `101 + 401*` | `event_dialogue` | 可选 Speaker、完整有序 Body |
+| Map/CommonEvents/Troops `102`，对应同层 `402/404` | `event_choices` | 完整有序选择数组；写回同时维护分支标签 |
+| Map/CommonEvents/Troops `105 + 405*` | `event_scrolling_text` | 完整有序滚动文本 |
+| Map/CommonEvents/Troops `320` | `event_command` | `parameters[1]`（角色名） |
+| Map/CommonEvents/Troops `324` | `event_command` | `parameters[1]`（昵称） |
+| Map/CommonEvents/Troops `325` | `event_command` | `parameters[1]`（简介） |
 
-## 3. Builtin 与对话差异
+Builtin **不**翻译 `Animations.json`、`MapInfos.json`、`Tilesets.json`、`js/plugins.js`、
+插件自定义文件、任意 note/meta 或未列出的标准字段。文件可被项目冻结、Lua 打开或 Rules
+精确选择，不代表 Builtin 会翻译它。
 
-Builtin 覆盖标准数据库条目、System、Map、CommonEvents、Troops，以及其中的事件列表、
-选择项和滚动文本。固定字段包括 RPG Maker 标准名称、描述、消息、选择项、滚动文本和
-已确认的事件文本字段；Builtin 不遍历插件数据，额外版本字段或插件数据通过 Rules 或
-Lua 提取。
+### 3.1 对话、选项和滚动文本
 
-标准消息块是 `101 + 连续 401*`。每个块建立一个 Dialogue Group；全部正文行形成一个
-DialogueBody，混合正文中的空白 `401` 作为显式空元素保留，全空正文不建立 Body。
-差异仅在 Speaker 投影：
+标准消息块是 `101 + 连续 401*`。MZ 从可选 `101.parameters[4]` 建立原生 Speaker；缺失、
+空或全空白表示没有 Speaker。MV 按项目当前姓名投影处理第一条 `401`，精确语义见
+[规则文件](rules.md#3-mv-对话姓名投影)。全部正文形成一个 DialogueBody，正文中的空白
+`401` 作为 Lines 空元素保留；全空正文不建立 Body。
 
-- MZ 从 `101.parameters[4]` 读取可选原生 Speaker；参数缺失、空字符串或全空白均表示
-  没有 Speaker。非空 Speaker 使用 direct target；
-- MV 标准 `101` 没有原生 Speaker，只在第一条 `401.parameters[0]` 上应用项目当前
-  姓名投影定义。其余对话结构与 MZ 使用同一 recipe、翻译与写回能力。
+一个 `102` 的完整选项数组形成一个 Choices，包括空槽；recipe 同时声明对应同 indent
+的 `402.parameters[1]` 和终止 `404`。滚动文本按 `105 + 连续 405*` 建组，全部 `405`
+形成一个 ScrollingText，包括空行。`320/324/325` 只取参数 1。
 
-MV 的纯姓名首行只属于物理姓名外壳，不建立空正文。一个 `102` 的完整有序选项数组形成
-一个 Choices 单元，包括空槽；提取同时记录对应同层 `402` 标签目标。滚动文本按
-`105 + 连续 405*` 建组，全部 `405` 形成一个 ScrollingText 单元，包括空行。选项与
-滚动文本的源元素索引只用于 recipe 定位，不进入单元身份。
+## 4. Rules 与 Lua 的 group kind 映射
 
-## 4. MV 姓名投影 TOML
+Rules 的完整字段契约、路径、逐层解码和失败范围见[规则文件第 4 节](rules.md#4-extract-rules)。
+其来源自动决定 `group_kind` 与 Placeholder scope：
 
-从实际游戏约定推导姓名投影、收窄正则并验证误收的方法见
-[规则编写指南](rules.md#4-mv-对话姓名投影)。
+| Rules 来源 | `group_kind` / scope |
+|---|---|
+| 精确 `System.json` | `system` |
+| 规范 Map 或 `Map*.json` 中的 Map | `map` |
+| 其他精确标准/自定义 DataFile（包括近似 Map 名） | `database_entry` |
+| 启用插件参数 | `plugin_parameter` |
+| `code + parameter` 事件来源 | `event_command` |
 
-姓名文件只解释标准对话块第一条 `401.parameters[0]`。非空定义只需编写 PCRE2：
+Lua `replace_standard` 显式声明 kind，但 Host 会按同一来源矩阵校验；详见
+[Lua Extract 矩阵](lua.md#6-extractreplace_standard)。
 
-```toml
-[[rule]]
-pattern = '(?i)\\n<(?<speaker>[^>]*?)(?::)?>'
+## 5. 自动分组和自然顺序
 
-[[rule]]
-pattern = '\A(?<speaker>星見の司書)\z'
-```
+Builtin 数据库对象以对象条目为组，System 各逻辑数组/对象、每张 Map、每个事件块分别
+按语义分组。Rules 沿路径展开后，以最终 string 的稳定父容器建立组；同一 string 中
+同一规则的多次 `text` 捕获合并为一个组，并按捕获起始字节形成 sibling fields。Lua
+严格使用 `groups`/`fields` 无洞数组声明顺序；同一次 `replace_standard` 中的
+`(group.location, group.kind)` 必须唯一，重复项直接失败，不会交给共享归一化自动合并。
 
-显式清空使用另一份完整文件：
+自然顺序为：
 
-```toml
-rule = []
-```
+1. owner：Builtin、Rules、Lua；
+2. Builtin：来源结构、字段规格声明、数组数值下标；
+3. Rules：先是标准 DataFile 固定顺序
+   `Actors.json → Animations.json → Armors.json → Classes.json → CommonEvents.json → Enemies.json → Items.json → MapInfos.json → Skills.json → States.json → System.json → Tilesets.json → Troops.json → Weapons.json`；
+   再是自定义 DataFile 按精确 UTF-8 基名字典序；再是 MapId 数值升序；最后是
+   `plugins.js` 按插件数组 index、同一插件内按 `parameters` 对象成员的来源顺序。每个来源
+   内按 JSON 对象成员来源顺序、数组数值下标、嵌套结构路径和同 string 捕获起始字节排列；
+   规则编号和 OS 目录枚举顺序均不参与；
+4. Lua：`groups` 数组、随后每组 `fields` 数组。
 
-根必须显式声明 `rule`。零字节、仅注释、未知或重复字段均无效。每条非空规则必须：
+并发读取和计算只改变完成时间。顺序进入资产快照指纹，但不进入语义身份，也不单独阻止
+原文、角色和上下文相同的译文继承。Reader、Planner 和 WriteBack 不再按角色字符串或
+位置显示文本重新排序。
 
-- 只有一个名为 `speaker` 的命名捕获，不接受 `text` 或其他命名捕获；
-- 在当前冻结来源中至少捕获一个非空 Speaker，否则整个 Builtin 替换失败；
-- 不产生零宽匹配或零宽 Speaker。
+## 6. Mutation Claim 与冲突
 
-同一第一行可以有多个不重叠匹配，但所有非空 Speaker 必须逐字相同；同一物理字段只能
-由一条规则拥有，跨规则完整匹配重叠失败。空 Speaker 的外壳原样冻结，不建立 Speaker
-单元。
+每个 recipe 派生 Value、NoteTag、CommentTag 或事件块的物理 Claim，并展开成 Intent 与
+Exclusive 资源锁。同一资源只允许 Intent+Intent；任一 Exclusive 即冲突。组内、同 owner、
+跨 owner Store 与 WriteBack 发布前共用这一验证。
 
-第一行从开头到最后一个完整匹配结束处被物化为 `Literal/SpeakerSlot`；最后一个匹配
-之后的后缀才是该行 Body。marker 前的控制符、空白及重复 marker 之间的外壳逐字冻结。
-若整条第一行被姓名匹配，该物理行只有 Speaker，后续 `401` 仍属于同一组正文。畸形
-近似值保持普通 Body，不猜测修复。完整匹配与 `speaker` 捕获必须有序、位于原字符串
-内并对齐 UTF-8 边界，捕获还必须完整位于对应匹配内；否则对话定义候选失败。
+完整冲突矩阵见[规则文件第 5 节](rules.md#5-自然顺序与-mutation-claim)。关键结果是：
+raw JSON string 与 decoded descendant 冲突，不同 decoded sibling 允许；raw note 与
+NoteTag 冲突而不同 occurrence 允许；raw 108/408 与 CommentTag 冲突；Dialogue、Choices、
+ScrollingText 与其覆盖字段或 descendant 冲突。
 
-## 5. Extract Rules TOML
+## 7. Lua 与三阶段停止线
 
-定位插件参数、事件命令与嵌套 JSON 载体，以及判断 Rules 是否足够的方法见
-[规则编写指南](rules.md#5-extract-rules)。
+Extract Lua 获得公共 `ctx.project/json/source/rpg_maker/db` 和 `ctx.extract`。简单的
+“一个标量语义字段 → 一个受信物理文本位置”可用 `replace_standard` 接入 Standard。
+跨文档、多目标复杂插件由 Lua 自己拥有 Extract/Translate/WriteBack 三阶段身份、私有表、
+事务和幂等协议；核心不提供通用多目标 DSL 或发布后回调。完整示例见
+[Lua Cookbook](lua-cookbook.md)。
 
-Rules 只从明确来源选择最终字符串或其中的 `text` 跨度，并立即物化可逆 recipe。非空
-定义使用一个数组，通过互斥字段选择来源：
+## 8. 提交、继承与完成语义
 
-```toml
-[[rule]]
-file = "LoreEntries.json"
-path = '[].Name'
+每个 owner 的来源指纹、group、unit、claim 和资产快照指纹在一个事务中验证并替换。
+失败不暴露半快照。相同快照经完整读取复核后返回 `Unchanged`；真实替换返回更新摘要。
 
-[[rule]]
-plugin = "AstralJournal"
-path = '["entry_1"].title'
+替换时，只有逻辑身份、unit role、完整源内容与源上下文逐字相同才继承译文/state；
+`group_order`/`unit_order` 的单独变化不破坏继承，但会改变资产快照指纹。跨 owner 的 Claim
+冲突在提交前失败。成功摘要统计逻辑组和语义单元，不把物理位置或资源锁计为单元。
 
-[[rule]]
-code = 356
-parameter = 0
-pattern = '\ADisplayNotice\s+(?<text>.+)\z'
-
-[[rule]]
-code = 357
-parameter = 3
-path = 'dText'
-
-[[rule]]
-file = "Classes.json"
-path = '[].note'
-pattern = '(?ms)<DESC:(?<text>.*?)>'
-
-[[rule]]
-plugin = "InputGuide"
-path = 'deviceNotice'
-decode_json = true
-```
-
-上述文件、插件、命令协议和文本均为人工构造的格式示例，只用于说明当前字段如何组合；
-实际值必须从目标游戏的运行时消费者与冻结来源取得。
-
-显式停用 Rules owner 使用另一份完整文件：
-
-```toml
-rule = []
-```
-
-`rule = []` 停用 Rules owner 并清理其资产。每条非空规则必须且只能选择以下一种来源：
-
-1. `file`：安全的精确 `.json` 基名、精确 `MapNNN.json` 或 `Map*.json`；
-2. `plugin`：启用插件的参数对象；
-3. `code + parameter`：Map、CommonEvents 与 Troops 中任意非负事件 code 的指定参数。
-
-`file` 和 `plugin` 必须给出 `path`。命令参数可以直接成为终点，也可以继续给出 `path`。
-不对 code 356、357 或其他数值附加硬编码语义。
-
-路径只支持对象 key、固定数组 index、`[]` 展开和精确带点 key，例如：
-
-```text
-A.B
-A[3].B
-[].field
-["exact.key"].value
-```
-
-路径不支持 JSONPath、递归、过滤器、对象 key 正则或其他通配符。路径需要继续深入而
-当前值是字符串时，ATT 将其作为 JSON 自动逐层解码；每个边界进入物理 recipe，并在
-写回时按相反顺序编码。`decode_json = true` 只控制最终字符串再解码一次。
-
-`pattern` 缺席时翻译整个最终字符串；存在时必须有且只有一个 `text` 命名捕获，其他
-命名捕获无效。一个字符串可以产生多个按来源顺序排列且不重叠的匹配；非空捕获形成
-语义单元，其余内容冻结为 Literal。零宽、不参与、重叠捕获、跨规则重复物理目标都使
-整个 Rules 候选失败。完整匹配与捕获必须有序、位于原字符串内并对齐 UTF-8 边界，
-`text` 还必须完整位于对应匹配内。提交前必须使用原始单元逐字重建最终字符串。
-
-每条非空规则在当前来源中必须产生至少一个非空翻译单元，否则整个 Rules 替换失败并
-保留旧快照。规则顺序只用于诊断编号，不构成优先级。外部契约不包含 `label`、
-`field_name`、`required`、`priority`、版本或跨命令状态字段。
-
-## 6. Lua 与并发
-
-Extract Lua 获得公共 `ctx.project/json/source/rpg_maker/db` 和阶段专属 `ctx.extract`；
-`translation`、`llm`、`output` 与 `write_back` 为 nil。`ctx.extract.replace_standard`
-原子替换 Lua owner，`clear_standard` 停用该 owner。脚本可以使用 `ctx.rpg_maker` 的
-data、map、plugin、document 与位置能力，不需要复制 JSON/路径 codec。
-
-文档磁盘读取使用 `[rpg_maker.document].read_concurrency`；JSON/PCRE2 处理与资产编码
-全部进入命令私有 CPU 根，Store 配置只决定每个编码作业的批量粒度。读取完成的文档可
-立即交给 CPU，不等待较早文件；Builtin 和 Rules 的独立局部工作使用有序批量计算，归并
-始终按 RPG Maker 权威身份和自然顺序确定。完成顺序不改变逻辑位置、冲突结果或提交
-内容。
-
-## 7. 完成语义
-
-同一 owner 的来源指纹、项目定义、组、单元、目标和资产快照指纹在一个事务中校验并
-替换；失败不暴露半快照。相同快照返回 `Unchanged`，真实替换返回更新摘要。
-
-Store 编码候选后先只读取 owner 的来源与资产快照指纹。owner 不存在或任一指纹不同时，
-候选直接形成权威替换事务，不把即将被整体替换的 group、unit 和 target 完整读回进程；
-事务内部仅在 unit role、完整源内容和源上下文都逐字一致时继承可复用译文。两个指纹都
-相同时，以同一个只读数据库视图
-再次读取 owner 状态以及完整 group、unit、target，并逐项核对期望指纹与内容；只有这些
-事实同时一致才返回 `Unchanged`。因此轻量判定不会掩盖同指纹下的持久化损坏，也不会因
-两次读取之间 owner 发生变化而错误早退。
-
-成功摘要统计逻辑组和语义单元，不把物理位置数混入单元计数。审计位置使用
-`LogicalTextLocation`；物理 Mutation Target 仅在内部错误定位和 WriteBack 配方中存在。
+提取成功证明候选满足 ATT 契约，不单独证明所有文本都玩家可见。作者仍应做正反样本、
+未翻译 round-trip、翻译 round-trip 和游戏内抽查。

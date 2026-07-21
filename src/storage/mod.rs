@@ -4,5 +4,6 @@
 //! 的生产实现。
 
 pub(crate) mod file_system;
+pub(crate) mod scoped_path;
 pub(crate) mod sqlite;
 pub(crate) mod sqlite_session;

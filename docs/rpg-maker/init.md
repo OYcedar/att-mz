@@ -6,6 +6,7 @@ RPG Maker 是本规格所属领域，ATT 当前只支持 MZ 与 MV。Init 是两
 
 ## 1. 命令与游戏目录
 
+<!-- att-example: illustrative -->
 ```text
 att --config FILE mz init --name NAME --path GAME_ROOT \
   [--source-language LANG] [--target-language LANG] \
@@ -29,6 +30,7 @@ att --config FILE mv init --name NAME --path GAME_ROOT \
 
 项目按版本身份分开定位，因此同名项目可以共存：
 
+<!-- att-example: illustrative -->
 ```text
 <projects.root>/mz/<name>/
 <projects.root>/mv/<name>/
@@ -36,6 +38,7 @@ att --config FILE mv init --name NAME --path GAME_ROOT \
 
 工作区完整保留对应版本的相对布局：
 
+<!-- att-example: illustrative -->
 ```text
 MZ                              MV
 <project>/source/data           <project>/source/www/data
@@ -64,20 +67,24 @@ reparse point、hardlink、名称碰撞、读取中对象身份变化和资源�
 
 ## 3. 当前项目数据库
 
-项目数据库的当前核心结构为：
+项目数据库严格使用当前单一 schema，不迁移、探测或兼容旧 schema。当前核心结构为：
 
 - `metadata`：项目名、规范源/目标 `LanguageId`、三个布局宽度和来源指纹；
 - `standard_asset_owner_state`：`builtin | rules | lua` 的来源指纹与资产快照指纹；
-- `standard_text_group`：逻辑组、组角色和完整投影/写回 recipe；
-- `standard_text_unit`：组内 `unit_role`、源内容 JSON、源上下文、译文内容 JSON 与状态；
-- `standard_text_target`：物理修改目标到逻辑组的唯一归属；
+- `standard_text_group`：逻辑组、owner 内连续 `group_order`、组角色和完整投影/写回 recipe；
+- `standard_text_unit`：组内连续 `unit_order`、`unit_role`、源内容 JSON、源上下文、译文内容
+  JSON 与状态；
+- `standard_mutation_claim`：每组派生的物理资源键及 `intent | exclusive` 访问声明；
 - `standard_translation_resource`：术语与自定义占位符的 canonical JSON；
 - `standard_project_definition`：活动 MV 对话定义的 canonical JSON。MZ 使用同一结构，
   但不消费 MV 姓名投影。
 
-语义译文身份是 `owner + group_location + unit_role`，不等于物理 JSON 地址。删除 owner
-状态会级联删除该 owner 的组、单元和目标。owner 状态同时绑定来源与完整资产快照，翻译
+语义译文身份是 `owner + group_location + unit_role`，不等于物理 JSON 地址；顺序字段也
+不进入身份。删除 owner 状态会级联删除该 owner 的组、单元和 Claim。owner 状态同时绑定来源与完整资产快照，翻译
 和写回均据此拒绝提取后发生的项目或资产变化。
+
+旧项目需要在项目根外备份后重新 Init/Extract/Translate。不符合当前 schema 的数据库按
+普通无效项目数据库处理；ATT 不识别它可能属于哪个历史格式，也不提供迁移入口。
 
 来源变化保留既有 owner 快照与译文，直到下一次对应 Extract 用当前来源原子替换；语言
 对变化清除所有标准译文与 state，并把术语表重置为空，保留占位符定义。布局宽度变化
@@ -91,6 +98,7 @@ Init 不直接修改可见工作区。创建、更新或修复都在候选中完
 
 锁顺序固定为：
 
+<!-- att-example: illustrative -->
 ```text
 项目租约 → 对应版本的目录发布锁 → SQLite
 ```

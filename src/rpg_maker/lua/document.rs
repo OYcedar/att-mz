@@ -6,9 +6,11 @@ use std::fmt;
 use crate::rpg_maker::lua::json::{
     HostValueBudget, LosslessJsonError, LosslessJsonValue, decode as decode_json,
 };
+use crate::rpg_maker::model::MutationClaim;
 use crate::rpg_maker::tag::simple_tag_spans;
 use crate::rpg_maker::text::{
-    RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
+    DataFileName, DataFileNameError, MapId, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
+    StandardDataFile,
 };
 
 use super::LuaSourcePath;
@@ -131,6 +133,7 @@ impl OpenedRpgMakerDocument {
             return Err(RpgMakerDocumentError::ExpectedCommandList);
         };
         let mut lines = Vec::new();
+        let mut backing_values = Vec::new();
         for (relative, command) in commands.iter().skip(*start_index).enumerate() {
             let LosslessJsonValue::Object(fields) = command else {
                 if relative == 0 {
@@ -159,17 +162,26 @@ impl OpenedRpgMakerDocument {
                 return Err(RpgMakerDocumentError::ExpectedCommentLine);
             };
             lines.push(line.as_str());
+            let mut backing_steps = list_steps.to_vec();
+            backing_steps.push(RpgMakerLocationStep::ArrayIndex(start_index + relative));
+            backing_steps.push(RpgMakerLocationStep::ObjectKey("parameters".to_owned()));
+            backing_steps.push(RpgMakerLocationStep::ArrayIndex(0));
+            backing_values.push(RpgMakerLocation::value(self.source.clone(), backing_steps));
         }
         let text = lines.join("\n");
         let value = find_tag(&text, tag_name, occurrence)?;
-        Ok(RpgMakerTextReference::new(
+        let location = RpgMakerLocation::comment_tag(
+            self.source.clone(),
+            command_steps.to_vec(),
+            tag_name,
+            occurrence,
+        );
+        let mutation_claim = MutationClaim::comment_tag(location.clone(), backing_values)
+            .expect("Host 已验证 CommentTag 及其完整 108/408 backing");
+        Ok(RpgMakerTextReference::new_with_claim(
             value.to_owned(),
-            RpgMakerLocation::comment_tag(
-                self.source.clone(),
-                command_steps.to_vec(),
-                tag_name,
-                occurrence,
-            ),
+            location,
+            mutation_claim,
         ))
     }
 }
@@ -179,11 +191,27 @@ impl OpenedRpgMakerDocument {
 pub(crate) struct RpgMakerTextReference {
     original: String,
     location: RpgMakerLocation,
+    mutation_claim: MutationClaim,
 }
 
 impl RpgMakerTextReference {
     fn new(original: String, location: RpgMakerLocation) -> Self {
-        Self { original, location }
+        let mutation_claim = MutationClaim::for_location(location.clone())
+            .expect("Host 只会建立可直接写回的 Value 或 NoteTag 文本引用");
+        Self::new_with_claim(original, location, mutation_claim)
+    }
+
+    fn new_with_claim(
+        original: String,
+        location: RpgMakerLocation,
+        mutation_claim: MutationClaim,
+    ) -> Self {
+        debug_assert_eq!(mutation_claim.representative_location(), &location);
+        Self {
+            original,
+            location,
+            mutation_claim,
+        }
     }
 
     pub(crate) fn original(&self) -> &str {
@@ -193,6 +221,10 @@ impl RpgMakerTextReference {
     pub(crate) fn location(&self) -> &RpgMakerLocation {
         &self.location
     }
+
+    pub(crate) fn mutation_claim(&self) -> &MutationClaim {
+        &self.mutation_claim
+    }
 }
 
 /// 一个 RPG Maker 来源在冻结项目根中的物理文件。
@@ -200,7 +232,7 @@ pub(crate) fn source_path(source: &RpgMakerSource) -> LuaSourcePath {
     let path = match source {
         RpgMakerSource::Data(file) => format!("data/{}", file.file_name()),
         RpgMakerSource::DataFile(file) => format!("data/{file}"),
-        RpgMakerSource::Map(map_id) => format!("data/Map{map_id:03}.json"),
+        RpgMakerSource::Map(map_id) => format!("data/{}", map_id.file_name()),
         RpgMakerSource::PluginParameter { .. } => "js/plugins.js".to_owned(),
     };
     LuaSourcePath::parse(&path).expect("固定 RPG Maker 来源路径必须满足 Lua 来源边界")
@@ -213,13 +245,22 @@ pub(crate) fn data_source(file_name: &str) -> Result<RpgMakerSource, RpgMakerDoc
         .ok_or(RpgMakerDocumentError::UnknownStandardDataFile)
 }
 
+/// Lua `ctx.rpg_maker.data_file` 能建立的精确安全 Data 文件来源。
+///
+/// 标准文件和规范 Map 复用同一物理身份分类；`Map000.json`、`Map01.json` 等
+/// 非规范名称仍是调用方明确选择的自定义 Data 文件。
+pub(crate) fn data_file_source(file_name: &str) -> Result<RpgMakerSource, RpgMakerDocumentError> {
+    DataFileName::parse(file_name.to_owned())
+        .map(RpgMakerSource::data_file)
+        .map_err(RpgMakerDocumentError::InvalidDataFileName)
+}
+
 /// Lua `ctx.rpg_maker.map` 能建立的正整数地图来源。
 pub(crate) fn map_source(map_id: i64) -> Result<RpgMakerSource, RpgMakerDocumentError> {
     let map_id = u32::try_from(map_id).map_err(|_| RpgMakerDocumentError::InvalidMapId)?;
-    if map_id == 0 {
-        return Err(RpgMakerDocumentError::InvalidMapId);
-    }
-    Ok(RpgMakerSource::map(map_id))
+    MapId::new(map_id)
+        .map(RpgMakerSource::map_id)
+        .map_err(|_| RpgMakerDocumentError::InvalidMapId)
 }
 
 /// Lua `ctx.rpg_maker.plugin_parameter` 能建立的插件参数来源。
@@ -421,6 +462,7 @@ fn find_tag<'a>(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpgMakerDocumentError {
     UnknownStandardDataFile,
+    InvalidDataFileName(DataFileNameError),
     InvalidMapId,
     InvalidPluginParameterSource,
     InputTooLarge { actual: usize, maximum: usize },
@@ -454,7 +496,9 @@ pub(crate) enum RpgMakerDocumentError {
 impl RpgMakerDocumentError {
     pub(crate) const fn kind(&self) -> &'static str {
         match self {
-            Self::UnknownStandardDataFile | Self::InvalidMapId => "invalid_source",
+            Self::UnknownStandardDataFile | Self::InvalidDataFileName(_) | Self::InvalidMapId => {
+                "invalid_source"
+            }
             Self::InvalidPluginParameterSource
             | Self::PluginIndexMissing
             | Self::PluginNameMissing
@@ -489,6 +533,7 @@ impl fmt::Display for RpgMakerDocumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownStandardDataFile => formatter.write_str("不是标准 RPG Maker Data 文件名"),
+            Self::InvalidDataFileName(error) => error.fmt(formatter),
             Self::InvalidMapId => formatter.write_str("RPG Maker map ID 必须是正 u32 整数"),
             Self::InvalidPluginParameterSource => {
                 formatter.write_str("RPG Maker 插件参数来源的索引或名称无效")
@@ -551,6 +596,7 @@ impl fmt::Display for RpgMakerDocumentError {
 impl Error for RpgMakerDocumentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidDataFileName(error) => Some(error),
             Self::InvalidJson(error) | Self::InvalidNestedJson(error) => Some(error),
             _ => None,
         }
@@ -640,5 +686,38 @@ var $plugins = [{"name":"Other","parameters":{}},{"name":"Quest","parameters":{"
             ])
             .unwrap();
         assert_eq!(text.original(), "任务");
+    }
+
+    #[test]
+    fn data_file_source_reuses_standard_and_map_identity() {
+        assert_eq!(
+            data_file_source("Actors.json").unwrap(),
+            RpgMakerSource::Data(StandardDataFile::Actors)
+        );
+        assert_eq!(
+            data_file_source("Map001.json").unwrap(),
+            RpgMakerSource::Map(MapId::new(1).unwrap())
+        );
+        for file_name in ["Map000.json", "Map01.json", "Map0001.json"] {
+            assert!(matches!(
+                data_file_source(file_name).unwrap(),
+                RpgMakerSource::DataFile(file) if file.as_str() == file_name
+            ));
+        }
+        assert!(data_file_source("../Actors.json").is_err());
+    }
+
+    #[test]
+    fn map_source_accepts_only_positive_u32_ids() {
+        assert_eq!(
+            map_source(1).unwrap(),
+            RpgMakerSource::Map(MapId::new(1).unwrap())
+        );
+        for invalid in [-1, 0, i64::from(u32::MAX) + 1] {
+            assert_eq!(
+                map_source(invalid),
+                Err(RpgMakerDocumentError::InvalidMapId)
+            );
+        }
     }
 }

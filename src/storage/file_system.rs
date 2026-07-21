@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use crate::fingerprint::Sha256Fingerprint;
 
+pub(crate) use super::scoped_path::ScopedDirectoryPath;
+
 /// 解析现存目录时可能发生的失败。
 #[derive(Debug)]
 pub(crate) enum ResolveDirectoryError<E> {
@@ -148,10 +150,6 @@ impl DirectoryEntry {
 
     pub(crate) const fn kind(&self) -> DirectoryEntryKind {
         self.kind
-    }
-
-    pub(crate) fn into_path(self) -> PathBuf {
-        self.resolved_path
     }
 }
 
@@ -898,58 +896,6 @@ impl<T> StagedDirectory<T> {
     }
 }
 
-/// 未发布目录候选内的受检相对路径。
-///
-/// 本类型只建立通用路径安全不变量；路径是否位于调用方声明的编辑范围，由绑定后的
-/// `ScopedDirectoryScope` 统一判断。
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ScopedDirectoryPath(PathBuf);
-
-impl ScopedDirectoryPath {
-    pub(crate) fn new(path: PathBuf) -> Result<Self, ScopedDirectoryPathError> {
-        let mut components = path.components();
-        let Some(Component::Normal(root)) = components.next() else {
-            return Err(ScopedDirectoryPathError { path });
-        };
-        if root.to_string_lossy().contains(':')
-            || components.any(|component| {
-                !matches!(component, Component::Normal(name) if !name.to_string_lossy().contains(':'))
-            })
-        {
-            return Err(ScopedDirectoryPathError { path });
-        }
-        Ok(Self(path))
-    }
-
-    pub(crate) fn as_path(&self) -> &Path {
-        &self.0
-    }
-
-    fn first_component(&self) -> &OsStr {
-        match self.0.components().next() {
-            Some(Component::Normal(root)) => root,
-            _ => unreachable!("ScopedDirectoryPath 已建立普通相对路径不变量"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ScopedDirectoryPathError {
-    path: PathBuf,
-}
-
-impl fmt::Display for ScopedDirectoryPathError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "候选编辑路径必须是无 ADS、当前段或父级逃逸的安全相对路径：{}",
-            self.path.display()
-        )
-    }
-}
-
-impl Error for ScopedDirectoryPathError {}
-
 /// 调用方为一个目录候选声明的可编辑顶层目录集合。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScopedDirectoryScope {
@@ -995,7 +941,7 @@ impl ScopedDirectoryScope {
     }
 
     pub(crate) fn is_scope_root(&self, path: &ScopedDirectoryPath) -> bool {
-        path.0.components().count() == 1 && self.contains(path)
+        path.is_top_level() && self.contains(path)
     }
 }
 
@@ -1637,6 +1583,10 @@ mod directory_stage_tests {
             "assets/../scripts/file",
             "assets/file:stream",
             "C:/assets/file",
+            r"assets\catalog.json",
+            "assets//catalog.json",
+            "assets/catalog.json/",
+            "assets/./catalog.json",
         ] {
             assert!(
                 ScopedDirectoryPath::new(PathBuf::from(path)).is_err(),

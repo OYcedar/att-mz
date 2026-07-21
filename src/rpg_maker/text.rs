@@ -4,6 +4,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroU32;
 
 /// RPG Maker `data/` 中由 Builtin 理解语义的标准数据文件。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -110,7 +111,12 @@ fn is_reserved_windows_file_name(value: &str) -> bool {
     ) || device_name
         .strip_prefix("COM")
         .or_else(|| device_name.strip_prefix("LPT"))
-        .is_some_and(|number| number.len() == 1 && matches!(number.as_bytes()[0], b'1'..=b'9'))
+        .is_some_and(|number| {
+            matches!(
+                number,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
 }
 
 impl fmt::Display for DataFileName {
@@ -136,12 +142,65 @@ impl fmt::Display for DataFileNameError {
 
 impl Error for DataFileNameError {}
 
+/// RPG Maker 规范 Map 文件能够表达的正整数地图身份。
+///
+/// 文件名只在这个类型中规范化：小于三位时补零，三位及以上保持十进制原样；
+/// `Map000.json` 与带冗余前导零的名称都不是 Map 身份。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MapId(NonZeroU32);
+
+impl MapId {
+    pub(crate) fn new(value: u32) -> Result<Self, MapIdError> {
+        NonZeroU32::new(value).map(Self).ok_or(MapIdError { value })
+    }
+
+    pub(crate) const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    pub(crate) fn from_canonical_file_name(file_name: &str) -> Option<Self> {
+        let digits = file_name.strip_prefix("Map")?.strip_suffix(".json")?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let id = Self::new(digits.parse().ok()?).ok()?;
+        (id.file_name() == file_name).then_some(id)
+    }
+
+    pub(crate) fn file_name(self) -> String {
+        format!("Map{:03}.json", self.get())
+    }
+}
+
+impl fmt::Display for MapId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MapIdError {
+    value: u32,
+}
+
+impl fmt::Display for MapIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "RPG Maker map ID 必须是正 u32 整数，实际为 {}",
+            self.value
+        )
+    }
+}
+
+impl Error for MapIdError {}
+
 /// RPG Maker 文本所在的物理来源。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RpgMakerSource {
     Data(StandardDataFile),
     DataFile(DataFileName),
-    Map(u32),
+    Map(MapId),
     PluginParameter {
         plugin_index: usize,
         plugin_name: String,
@@ -155,10 +214,21 @@ impl RpgMakerSource {
     }
 
     pub(crate) fn data_file(file: DataFileName) -> Self {
-        StandardDataFile::from_file_name(file.as_str()).map_or(Self::DataFile(file), Self::Data)
+        if let Some(standard) = StandardDataFile::from_file_name(file.as_str()) {
+            Self::Data(standard)
+        } else if let Some(map_id) = MapId::from_canonical_file_name(file.as_str()) {
+            Self::map_id(map_id)
+        } else {
+            Self::DataFile(file)
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn map(map_id: u32) -> Self {
+        Self::map_id(MapId::new(map_id).expect("RPG Maker map 来源必须使用正整数身份"))
+    }
+
+    pub(crate) fn map_id(map_id: MapId) -> Self {
         Self::Map(map_id)
     }
 
@@ -180,7 +250,7 @@ impl fmt::Display for RpgMakerSource {
         match self {
             Self::Data(file) => write!(formatter, "data/{}", file.file_name()),
             Self::DataFile(file) => write!(formatter, "data/{file}"),
-            Self::Map(map_id) => write!(formatter, "data/Map{map_id:03}.json"),
+            Self::Map(map_id) => write!(formatter, "data/{}", map_id.file_name()),
             Self::PluginParameter {
                 plugin_name,
                 parameter_name,
@@ -383,8 +453,60 @@ mod tests {
             "NUL.json",
             "NUL.metadata.json",
             "COM1.any.json",
+            "COM¹.json",
+            "com².metadata.json",
+            "LPT³.json",
         ] {
             assert!(DataFileName::parse(value).is_err(), "{value:?} 应拒绝");
+        }
+    }
+
+    #[test]
+    fn canonical_map_names_require_positive_ids_without_redundant_zeroes() {
+        for (file_name, expected) in [
+            ("Map001.json", 1),
+            ("Map042.json", 42),
+            ("Map999.json", 999),
+            ("Map1000.json", 1000),
+        ] {
+            let map_id = MapId::from_canonical_file_name(file_name).expect("规范 Map 名应识别");
+            assert_eq!(map_id.get(), expected);
+            assert_eq!(map_id.file_name(), file_name);
+        }
+
+        for file_name in [
+            "Map000.json",
+            "Map00.json",
+            "Map01.json",
+            "Map0001.json",
+            "Map.json",
+            "map001.json",
+            "MapInfos.json",
+        ] {
+            assert_eq!(
+                MapId::from_canonical_file_name(file_name),
+                None,
+                "{file_name}"
+            );
+        }
+        assert!(MapId::new(0).is_err());
+    }
+
+    #[test]
+    fn data_file_classification_keeps_noncanonical_map_names_custom() {
+        assert_eq!(
+            RpgMakerSource::data_file(DataFileName::parse("Actors.json").unwrap()),
+            RpgMakerSource::Data(StandardDataFile::Actors)
+        );
+        assert_eq!(
+            RpgMakerSource::data_file(DataFileName::parse("Map001.json").unwrap()),
+            RpgMakerSource::Map(MapId::new(1).unwrap())
+        );
+        for file_name in ["Map000.json", "Map01.json", "Map0001.json"] {
+            assert!(matches!(
+                RpgMakerSource::data_file(DataFileName::parse(file_name).unwrap()),
+                RpgMakerSource::DataFile(file) if file.as_str() == file_name
+            ));
         }
     }
 }

@@ -14,7 +14,7 @@ use crate::rpg_maker::model::{
     DirectTextPart, DirectTextRecipe, ScalarFieldKey, TextProjectionRecipe, TextUnitRole,
 };
 use crate::rpg_maker::text::{
-    DataFileName, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
+    DataFileName, MapId, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
     TextGroupKind,
 };
 
@@ -25,14 +25,20 @@ use super::definition::{CompiledPath, FileRuleSource, PathSegment, RuleDefinitio
 /// 一组已经由文档读取边界冻结的 Rules 输入。
 #[derive(Clone, Debug, Default)]
 pub(super) struct RulesMatchInput {
-    files: BTreeMap<String, Value>,
+    files: Vec<(String, Value)>,
     plugins: Vec<RulesPlugin>,
 }
 
 impl RulesMatchInput {
-    pub(super) fn new(files: BTreeMap<String, Value>, mut plugins: Vec<RulesPlugin>) -> Self {
+    pub(super) fn new(
+        files: impl IntoIterator<Item = (String, Value)>,
+        mut plugins: Vec<RulesPlugin>,
+    ) -> Self {
         plugins.sort_by_key(RulesPlugin::index);
-        Self { files, plugins }
+        Self {
+            files: files.into_iter().collect(),
+            plugins,
+        }
     }
 }
 
@@ -137,17 +143,12 @@ impl MatchedRuleTarget {
 
     fn shared_source(&self) -> Result<RpgMakerSource, RulesMatchError> {
         match &self.source {
-            RulesMatchSource::DataFile { file } => canonical_map_id(file).map_or_else(
-                || {
-                    DataFileName::parse(file.clone())
-                        .map(RpgMakerSource::data_file)
-                        .map_err(|source| RulesMatchError::InvalidTarget {
-                            rule_number: self.rule_number,
-                            message: source.to_string(),
-                        })
-                },
-                |map_id| Ok(RpgMakerSource::map(map_id)),
-            ),
+            RulesMatchSource::DataFile { file } => DataFileName::parse(file.clone())
+                .map(RpgMakerSource::data_file)
+                .map_err(|source| RulesMatchError::InvalidTarget {
+                    rule_number: self.rule_number,
+                    message: source.to_string(),
+                }),
             RulesMatchSource::PluginParameter {
                 plugin_index,
                 plugin_name,
@@ -260,7 +261,7 @@ pub(super) fn match_rules(
         .iter()
         .map(|rule| match_rule(rule, input))
         .collect::<Result<Vec<_>, _>>()?;
-    merge_rule_matches(matches)
+    merge_rule_matches(matches, input)
 }
 
 /// 匹配一条已受信规则，供服务按外部并发上限建立独立 CPU 工作单元。
@@ -290,8 +291,10 @@ pub(super) fn match_rule(
 /// 汇总独立规则结果，并在提交前完成跨规则物理目标冲突检查。
 pub(super) fn merge_rule_matches(
     matches: Vec<Vec<MatchedRuleTarget>>,
+    input: &RulesMatchInput,
 ) -> Result<Vec<MatchedRuleTarget>, RulesMatchError> {
-    let mut targets = BTreeMap::<TargetKey, MatchedRuleTarget>::new();
+    let mut target_indexes = BTreeMap::<TargetKey, usize>::new();
+    let mut targets = Vec::<MatchedRuleTarget>::new();
     for rule_targets in matches {
         for target in rule_targets {
             let key = TargetKey {
@@ -299,17 +302,111 @@ pub(super) fn merge_rule_matches(
                 steps: target.steps.clone(),
             };
             let second_rule = target.rule_number;
-            if let Some(previous) = targets.insert(key, target) {
+            if let Some(previous_index) = target_indexes.get(&key).copied() {
+                let previous = &targets[previous_index];
                 return Err(RulesMatchError::DuplicateTarget {
                     first_rule: previous.rule_number,
                     second_rule,
-                    source: previous.source,
-                    steps: previous.steps,
+                    source: previous.source.clone(),
+                    steps: previous.steps.clone(),
                 });
+            }
+            target_indexes.insert(key, targets.len());
+            targets.push(target);
+        }
+    }
+    targets.sort_by_cached_key(|target| physical_target_order(input, target));
+    Ok(targets)
+}
+
+fn physical_target_order(
+    input: &RulesMatchInput,
+    target: &MatchedRuleTarget,
+) -> (usize, Vec<usize>, Vec<RulesValueStep>) {
+    match &target.source {
+        RulesMatchSource::DataFile { file } => {
+            let (source_order, root) = input
+                .files
+                .iter()
+                .enumerate()
+                .find(|(_, (candidate, _))| candidate == file)
+                .map(|(index, (_, root))| (index, root))
+                .expect("匹配目标必然来自冻结 Rules 文件输入");
+            (
+                source_order,
+                physical_path_order(root, &target.steps),
+                target.steps.clone(),
+            )
+        }
+        RulesMatchSource::PluginParameter {
+            plugin_index,
+            plugin_name,
+            parameter_name,
+        } => {
+            let mut source_order = input.files.len();
+            for plugin in &input.plugins {
+                for (candidate_parameter, root) in &plugin.parameters {
+                    if plugin.index == *plugin_index
+                        && plugin.name == *plugin_name
+                        && candidate_parameter == parameter_name
+                    {
+                        return (
+                            source_order,
+                            physical_path_order(root, &target.steps),
+                            target.steps.clone(),
+                        );
+                    }
+                    source_order += 1;
+                }
+            }
+            unreachable!("匹配目标必然来自冻结 Rules 插件参数输入")
+        }
+    }
+}
+
+fn physical_path_order(root: &Value, steps: &[RulesValueStep]) -> Vec<usize> {
+    fn visit(value: &Value, steps: &[RulesValueStep], order: &mut Vec<usize>) {
+        let Some((step, tail)) = steps.split_first() else {
+            return;
+        };
+        match step {
+            RulesValueStep::Key(key) => {
+                let object = value.as_object().expect("已匹配路径的 Key 父值必然是对象");
+                let position = object
+                    .keys()
+                    .position(|candidate| candidate == key)
+                    .expect("已匹配路径的 Key 必然存在");
+                order.push(position);
+                visit(
+                    object.get(key).expect("已匹配路径的 Key 必然存在"),
+                    tail,
+                    order,
+                );
+            }
+            RulesValueStep::Index(index) => {
+                let array = value.as_array().expect("已匹配路径的 Index 父值必然是数组");
+                order.push(*index);
+                visit(
+                    array.get(*index).expect("已匹配路径的 Index 必然存在"),
+                    tail,
+                    order,
+                );
+            }
+            RulesValueStep::DecodeJsonString => {
+                let decoded = serde_json::from_str::<Value>(
+                    value
+                        .as_str()
+                        .expect("已匹配 DecodeJsonString 父值必然是字符串"),
+                )
+                .expect("匹配阶段已经验证嵌套 JSON");
+                visit(&decoded, tail, order);
             }
         }
     }
-    Ok(targets.into_values().collect())
+
+    let mut order = Vec::new();
+    visit(root, steps, &mut order);
+    order
 }
 
 fn match_file_rule(
@@ -320,8 +417,9 @@ fn match_file_rule(
     let files = match source {
         FileRuleSource::Exact(file) => input
             .files
-            .get(file)
-            .map(|value| vec![(file.as_str(), value)])
+            .iter()
+            .find(|(candidate, _)| candidate == file)
+            .map(|(file, value)| vec![(file.as_str(), value)])
             .unwrap_or_default(),
         FileRuleSource::AllMaps => input
             .files
@@ -880,20 +978,7 @@ fn is_event_document(file: &str) -> bool {
 }
 
 fn is_canonical_map_file(file: &str) -> bool {
-    canonical_map_id(file).is_some()
-}
-
-fn canonical_map_id(file: &str) -> Option<u32> {
-    let digits = file
-        .strip_prefix("Map")
-        .and_then(|value| value.strip_suffix(".json"))?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    digits
-        .parse::<u32>()
-        .ok()
-        .filter(|id| format!("Map{id:03}.json") == file)
+    MapId::from_canonical_file_name(file).is_some()
 }
 
 fn shared_step(step: &RulesValueStep) -> RpgMakerLocationStep {
@@ -1261,6 +1346,94 @@ path = 'displayName'
     }
 
     #[test]
+    fn all_maps_keep_numeric_physical_source_order_past_three_digits() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+file = "Map*.json"
+path = 'displayName'
+"#,
+        )
+        .expect("AllMaps 规则应合法");
+        let input = input([
+            ("Map999.json", json!({"displayName":"第 999 张"})),
+            ("Map1000.json", json!({"displayName":"第 1000 张"})),
+        ]);
+
+        let targets = match_rules(&definition, &input).expect("两张地图都应命中");
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.units[0].source_text.as_str())
+                .collect::<Vec<_>>(),
+            ["第 999 张", "第 1000 张"],
+            "Map1000 不得因文件名词法顺序排到 Map999 前"
+        );
+    }
+
+    #[test]
+    fn merged_rules_follow_object_insertion_order_instead_of_rule_or_key_order() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+file = "Custom.json"
+path = 'a'
+
+[[rule]]
+file = "Custom.json"
+path = 'z'
+"#,
+        )
+        .expect("两条精确字段规则应合法");
+        let input = input([("Custom.json", json!({"z":"物理第一", "a":"物理第二"}))]);
+
+        let targets = match_rules(&definition, &input).expect("两条规则都应命中");
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.units[0].source_text.as_str())
+                .collect::<Vec<_>>(),
+            ["物理第一", "物理第二"],
+            "规则编号与键名词法序都不得覆盖来源结构顺序"
+        );
+    }
+
+    #[test]
+    fn one_string_keeps_twelve_capture_units_in_byte_position_order() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+file = "Custom.json"
+path = 'text'
+pattern = '<x>(?<text>.*?)</x>'
+"#,
+        )
+        .expect("多次捕获规则应合法");
+        let expected = (0..12)
+            .map(|index| format!("值{index}"))
+            .collect::<Vec<_>>();
+        let source = expected
+            .iter()
+            .map(|value| format!("<x>{value}</x>"))
+            .collect::<String>();
+        let input = input([("Custom.json", json!({"text":source}))]);
+
+        let targets = match_rules(&definition, &input).expect("十二次捕获都应命中");
+
+        assert_eq!(
+            targets[0]
+                .units
+                .iter()
+                .map(|unit| unit.source_text.clone())
+                .collect::<Vec<_>>(),
+            expected,
+            "第 10 次捕获不得因字符串化编号排到第 2 次前"
+        );
+    }
+
+    #[test]
     fn every_nonempty_rule_must_produce_a_nonblank_unit() {
         let definition = RulesDefinition::parse(
             r#"
@@ -1418,7 +1591,7 @@ pattern = '(?<text>\C)'
             files
                 .into_iter()
                 .map(|(name, value)| (name.to_owned(), value))
-                .collect(),
+                .collect::<Vec<_>>(),
             Vec::new(),
         )
     }

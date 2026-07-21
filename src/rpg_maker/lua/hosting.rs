@@ -3,13 +3,14 @@
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use crate::execution::OperationCompletion;
 use crate::llm::{ChatMessage, LlmRequestError, LlmRequestExecutor, LlmResponse};
 use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
+use crate::storage::scoped_path::{ExactPathCaseMismatch, resolve_exact_directory_entry};
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
 use crate::storage::sqlite_session::{
     OpenSqliteInteractiveSessionError, SqliteInteractiveSessionError,
@@ -226,8 +227,10 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TrustedLuaHostCallError>> + Send + 'static>>
     {
         let file_system = Arc::clone(&self.file_system);
-        let requested = path.join_to(self.project.source_root());
+        let source_root = self.project.source_root().to_path_buf();
         Box::pin(async move {
+            let requested =
+                resolve_exact_source_path(file_system.as_ref(), &source_root, &path).await?;
             file_system
                 .read_file(requested)
                 .await
@@ -242,8 +245,10 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, TrustedLuaHostCallError>> + Send + 'static>>
     {
         let file_system = Arc::clone(&self.file_system);
-        let requested = path.join_to(self.project.source_root());
+        let source_root = self.project.source_root().to_path_buf();
         Box::pin(async move {
+            let requested =
+                resolve_exact_source_path(file_system.as_ref(), &source_root, &path).await?;
             let entries = file_system
                 .list_directory(requested)
                 .await
@@ -324,6 +329,38 @@ where
     }
 }
 
+async fn resolve_exact_source_path<F>(
+    file_system: &F,
+    source_root: &Path,
+    logical_path: &LuaSourcePath,
+) -> Result<PathBuf, TrustedLuaHostCallError>
+where
+    F: DirectoryLister,
+{
+    let mut current = source_root.to_path_buf();
+    for component in logical_path.components() {
+        let entries = file_system
+            .list_directory(current.clone())
+            .await
+            .map_err(source_list_error)?;
+        let resolved = resolve_exact_directory_entry(
+            &current,
+            component,
+            entries.iter().map(|entry| entry.resolved_path()),
+        )
+        .map_err(source_case_mismatch)?;
+        match resolved {
+            Some(resolved) => current = resolved,
+            None => {
+                // 缺失不是身份冲突：让最终 read/list 或下一层目录列举通过各自
+                // 已有的 NotFound 契约报告，避免解析器制造第二套文件系统错误。
+                current = current.join(component);
+            }
+        };
+    }
+    Ok(current)
+}
+
 #[derive(Default)]
 struct LuaExtractHostCalls {
     intent: Mutex<Option<TrustedLuaExtractIntent>>,
@@ -398,9 +435,11 @@ where
         &self,
         kind: crate::rpg_maker::text::TextGroupKind,
         original: String,
+        semantic_context: String,
     ) -> Result<Arc<dyn super::runtime::TrustedLuaPreparedTranslation>, TrustedLuaHostCallError>
     {
-        self.semantics.prepare_translation(kind, original)
+        self.semantics
+            .prepare_translation(kind, original, semantic_context)
     }
 
     fn request_llm(
@@ -469,6 +508,17 @@ where
     };
     let message = error.to_string();
     TrustedLuaHostCallError::new("filesystem", kind, message, None, Some(Arc::new(error)))
+}
+
+fn source_case_mismatch(error: ExactPathCaseMismatch) -> TrustedLuaHostCallError {
+    let message = error.to_string();
+    TrustedLuaHostCallError::new(
+        "filesystem",
+        "case_mismatch",
+        message,
+        None,
+        Some(Arc::new(error)),
+    )
 }
 
 fn llm_call_error<E>(error: LlmRequestError<E>) -> TrustedLuaHostCallError
@@ -600,9 +650,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::*;
     use crate::llm::{LlmFinishReason, LlmUsage};
@@ -611,6 +663,9 @@ mod tests {
         TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeExecutionReport,
     };
     use crate::rpg_maker::project::OpenedProject;
+    use crate::runtime::filesystem::{
+        ExclusiveFileLeaseConfig, SystemFileSystem, SystemFileSystemConfig, TreeBudget,
+    };
     use crate::storage::file_system::{
         DirectoryEntry, DirectoryEntryKind, DirectoryLister, ListDirectoryError, ReadFile,
     };
@@ -882,6 +937,7 @@ mod tests {
             PathBuf::from("main.lua"),
             LuaProjectContext::for_frozen_source(
                 project.name().as_str(),
+                crate::rpg_maker::RpgMakerEngine::Mz,
                 project.source_root().to_path_buf(),
                 project.database_path().to_path_buf(),
                 project.language_pair().clone(),
@@ -1089,10 +1145,23 @@ mod tests {
         );
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct SourceFileSystem {
         reads: Arc<Mutex<Vec<PathBuf>>>,
         lists: Arc<Mutex<Vec<PathBuf>>>,
+        data_name: &'static str,
+        items_name: &'static str,
+    }
+
+    impl Default for SourceFileSystem {
+        fn default() -> Self {
+            Self {
+                reads: Arc::new(Mutex::new(Vec::new())),
+                lists: Arc::new(Mutex::new(Vec::new())),
+                data_name: "data",
+                items_name: "Items.json",
+            }
+        }
     }
 
     impl FileReader for SourceFileSystem {
@@ -1100,7 +1169,11 @@ mod tests {
 
         async fn read_file(&self, path: PathBuf) -> Result<ReadFile, ReadFileError<Self::Error>> {
             self.reads.lock().unwrap().push(path.clone());
-            Ok(ReadFile::new(path, b"source".to_vec()))
+            if path.file_name().and_then(|name| name.to_str()) == Some(self.items_name) {
+                Ok(ReadFile::new(path, b"source".to_vec()))
+            } else {
+                Err(ReadFileError::NotFound { path })
+            }
         }
     }
 
@@ -1112,16 +1185,29 @@ mod tests {
             path: PathBuf,
         ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<Self::Error>> {
             self.lists.lock().unwrap().push(path.clone());
-            Ok(vec![
-                DirectoryEntry::new(path.join("z.json"), DirectoryEntryKind::RegularFile),
-                DirectoryEntry::new(path.join("a.json"), DirectoryEntryKind::RegularFile),
-            ])
+            if path.ends_with("source") {
+                Ok(vec![
+                    DirectoryEntry::new(path.join(self.data_name), DirectoryEntryKind::Directory),
+                    DirectoryEntry::new(path.join("js"), DirectoryEntryKind::Directory),
+                ])
+            } else if path.file_name().and_then(|name| name.to_str()) == Some(self.data_name) {
+                Ok(vec![
+                    DirectoryEntry::new(
+                        path.join(self.items_name),
+                        DirectoryEntryKind::RegularFile,
+                    ),
+                    DirectoryEntry::new(path.join("z.json"), DirectoryEntryKind::RegularFile),
+                    DirectoryEntry::new(path.join("a.json"), DirectoryEntryKind::RegularFile),
+                ])
+            } else {
+                Err(ListDirectoryError::NotFound { path })
+            }
         }
     }
 
-    #[tokio::test]
-    async fn source_calls_join_the_frozen_root_and_return_sorted_relative_paths() {
-        let file_system = Arc::new(SourceFileSystem::default());
+    fn source_calls(
+        file_system: Arc<SourceFileSystem>,
+    ) -> LuaCommonHostCalls<SourceFileSystem, FakeOperations> {
         let opened = OpenedProject::new(
             "demo".parse::<ProjectName>().unwrap(),
             PathBuf::from("C:/projects/demo"),
@@ -1130,16 +1216,23 @@ mod tests {
             "zh-Hans".to_owned(),
             crate::rpg_maker::project::test_layout_profile(),
         );
-        let calls = LuaCommonHostCalls::<_, _> {
+        LuaCommonHostCalls::<_, _> {
             project: LuaProjectContext::for_frozen_source(
                 opened.name().as_str(),
+                crate::rpg_maker::RpgMakerEngine::Mz,
                 opened.source_root().to_path_buf(),
                 opened.database_path().to_path_buf(),
                 opened.language_pair().clone(),
             ),
             operations: Arc::new(FakeOperations),
-            file_system: Arc::clone(&file_system),
-        };
+            file_system,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_calls_join_the_frozen_root_and_return_sorted_relative_paths() {
+        let file_system = Arc::new(SourceFileSystem::default());
+        let calls = source_calls(Arc::clone(&file_system));
 
         let bytes = calls
             .read_source(LuaSourcePath::parse("data/Items.json").unwrap())
@@ -1152,7 +1245,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             entries,
-            vec!["data/a.json".to_owned(), "data/z.json".to_owned()]
+            vec![
+                "data/Items.json".to_owned(),
+                "data/a.json".to_owned(),
+                "data/z.json".to_owned(),
+            ]
         );
         assert_eq!(
             *file_system.reads.lock().unwrap(),
@@ -1160,7 +1257,129 @@ mod tests {
         );
         assert_eq!(
             *file_system.lists.lock().unwrap(),
-            [PathBuf::from("C:/projects/demo/source/data")]
+            [
+                PathBuf::from("C:/projects/demo/source"),
+                PathBuf::from("C:/projects/demo/source/data"),
+                PathBuf::from("C:/projects/demo/source"),
+                PathBuf::from("C:/projects/demo/source/data"),
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn source_calls_reject_case_aliases_before_reading() {
+        let file_system = Arc::new(SourceFileSystem {
+            items_name: "items.json",
+            ..SourceFileSystem::default()
+        });
+        let calls = source_calls(Arc::clone(&file_system));
+
+        let error = calls
+            .read_source(LuaSourcePath::parse("data/Items.json").unwrap())
+            .await
+            .expect_err("大小写别名必须显式失败");
+        assert_eq!(error.domain(), "filesystem");
+        assert_eq!(error.kind(), "case_mismatch");
+        assert!(file_system.reads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_calls_check_intermediate_directories_and_list_targets_exactly() {
+        let directory_alias = Arc::new(SourceFileSystem {
+            data_name: "Data",
+            ..SourceFileSystem::default()
+        });
+        let error = source_calls(Arc::clone(&directory_alias))
+            .read_source(LuaSourcePath::parse("data/Items.json").unwrap())
+            .await
+            .expect_err("中间目录的大小写别名必须在读取前失败");
+        assert_eq!(error.kind(), "case_mismatch");
+        assert!(directory_alias.reads.lock().unwrap().is_empty());
+        assert_eq!(directory_alias.lists.lock().unwrap().len(), 1);
+
+        let file_alias = Arc::new(SourceFileSystem {
+            items_name: "items.json",
+            ..SourceFileSystem::default()
+        });
+        let error = source_calls(Arc::clone(&file_alias))
+            .list_source(LuaSourcePath::parse("data/Items.json").unwrap())
+            .await
+            .expect_err("list_source 的最终目录项也必须逐字匹配");
+        assert_eq!(error.kind(), "case_mismatch");
+        assert_eq!(file_alias.lists.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn missing_sources_keep_the_underlying_read_and_list_error_contracts() {
+        let file_system = Arc::new(SourceFileSystem::default());
+        let calls = source_calls(Arc::clone(&file_system));
+
+        let read_error = calls
+            .read_source(LuaSourcePath::parse("data/Missing.json").unwrap())
+            .await
+            .expect_err("缺失文件应由读取能力报告");
+        assert_eq!(read_error.kind(), "not_found");
+        assert!(read_error.to_string().contains("文件不存在"));
+
+        let list_error = calls
+            .list_source(LuaSourcePath::parse("data/Missing").unwrap())
+            .await
+            .expect_err("缺失目录应由列举能力报告");
+        assert_eq!(list_error.kind(), "not_found");
+        assert!(list_error.to_string().contains("目录不存在"));
+        assert_eq!(file_system.reads.lock().unwrap().len(), 1);
+        assert_eq!(file_system.lists.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn windows_file_system_cannot_open_a_case_alias_through_lua_source() {
+        let workspace = tempfile::tempdir().expect("应能建立临时工作区");
+        let source_root = workspace.path().join("source");
+        let data_root = source_root.join("data");
+        fs::create_dir_all(&data_root).expect("应能建立真实 data 目录");
+        fs::write(data_root.join("Items.json"), b"{}").expect("应能写入真实来源文件");
+
+        let file_system = Arc::new(
+            SystemFileSystem::new(
+                SystemFileSystemConfig::new(
+                    1,
+                    8,
+                    1024 * 1024,
+                    128,
+                    TreeBudget::new(128, 16, 1024 * 1024, 512 * 1024)
+                        .expect("测试目录树预算应合法"),
+                    ExclusiveFileLeaseConfig::new(Duration::from_secs(1))
+                        .expect("测试租约配置应合法"),
+                )
+                .expect("测试文件系统配置应合法"),
+            )
+            .expect("应能建立真实文件系统根"),
+        );
+        let calls = LuaCommonHostCalls::<_, _> {
+            project: LuaProjectContext::for_frozen_source(
+                "demo",
+                crate::rpg_maker::RpgMakerEngine::Mz,
+                source_root,
+                workspace.path().join("project.db"),
+                crate::language::LanguagePair::new(
+                    "ja".parse().expect("测试源语言应合法"),
+                    "zh-Hans".parse().expect("测试目标语言应合法"),
+                ),
+            ),
+            operations: Arc::new(FakeOperations),
+            file_system: Arc::clone(&file_system),
+        };
+
+        let error = calls
+            .read_source(LuaSourcePath::parse("data/items.json").unwrap())
+            .await
+            .expect_err("真实 Windows 文件系统上的大小写别名也必须失败");
+        assert_eq!(error.domain(), "filesystem");
+        assert_eq!(error.kind(), "case_mismatch");
+        drop(calls);
+        file_system
+            .shutdown()
+            .await
+            .expect("文件系统 worker 应正常关闭");
     }
 }

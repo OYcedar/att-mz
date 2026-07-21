@@ -1,6 +1,5 @@
 //! RPG Maker 标准翻译任务规划：自然排序、语义范围、虚原文、术语和占位符。
 
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
@@ -11,10 +10,11 @@ use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguagePair};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmClientSemanticIdentity};
+use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
 use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
-use crate::rpg_maker::text::DataFileName;
+use crate::rpg_maker::text::{DataFileName, MapId};
 use crate::rpg_maker::text::{
     RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
 };
@@ -27,16 +27,16 @@ use super::placeholder::{Pcre2PlaceholderService, PlaceholderRuleCompilationErro
 use super::planning_resource::{CompiledTerminology, TranslationPlanningResourceReader};
 use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
 use super::semantics::{
-    PreparedTranslationAcceptance, PreparedTranslationStatus, ResolvedTranslationSemanticError,
-    ResolvedTranslationSemantics,
+    PreparedTranslationStatus, ResolvedTranslationSemanticError, ResolvedTranslationSemantics,
 };
 use super::standard::{
     ExpectedLineShape, ExpectedTranslationOutput, ExpectedTranslationValidation,
     StandardTranslationCorpus, StandardTranslationGroup, StandardTranslationInput,
     StandardTranslationPlan, StandardTranslationTaskIndex, StandardTranslationTaskPlanner,
     TerminologyDependency, TranslationInvalidation, TranslationPlanPreparation,
-    TranslationPlanPreparationCounts, TranslationPropagationTarget, TranslationStateContext,
-    TranslationTaskBlock, TranslationUnitIdentity, TranslationVirtualReason,
+    TranslationPlanPreparationCounts, TranslationPlanningFailure, TranslationPlanningFailureReason,
+    TranslationPropagationTarget, TranslationStateContext, TranslationTaskBlock,
+    TranslationUnitIdentity, TranslationVirtualReason,
 };
 
 /// 使用三个职责模块与 CPU 根建立确定性 RPG Maker 翻译计划。
@@ -137,7 +137,9 @@ where
 
         let source_language_id = project.source_language().to_owned();
         let target_language_id = project.target_language().to_owned();
+        let engine = project.layout().rpg_maker_layout().engine();
         let global_semantics = global_translation_semantics(
+            engine,
             source_language_id.as_str(),
             target_language_id.as_str(),
             source_language.semantic_fingerprint(),
@@ -146,6 +148,7 @@ where
         );
         let task_language_pair = LanguagePair::new(source_language_id, target_language_id);
         let semantics = Arc::new(ResolvedTranslationSemantics::new(
+            engine,
             system_markdown.clone(),
             task_language_pair.clone(),
             Arc::clone(&terminology),
@@ -168,17 +171,25 @@ where
             .await
             .map_err(RpgMakerStandardTranslationTaskPlanningError::PreprocessScopesCompute)?;
 
-        let (scopes, invalidations, reuses, preparation_counts) = self
+        let (scopes, invalidations, reuses, planning_failures, preparation_counts) = self
             .cpu
             .execute(move || {
                 let mut scopes = Vec::with_capacity(preprocessed_scopes.len());
+                let mut planning_failures = Vec::new();
+                let mut preprocessing_invalidations = Vec::new();
+                let mut preprocessing_invalidated = 0;
                 for (scope, result) in preprocessed_scopes {
-                    scopes.push(result.map_err(|source| {
+                    let result = result.map_err(|source| {
                         GlobalPreparationFailure::InvalidScopePreprocessing { scope, source }
-                    })?);
+                    })?;
+                    planning_failures.extend(result.planning_failures);
+                    preprocessing_invalidations.extend(result.invalidations);
+                    preprocessing_invalidated += result.invalidated;
+                    scopes.push(result.scope);
                 }
                 let (candidates, positions, mut invalidations) =
                     collect_deduplication_inputs(&scopes);
+                invalidations.extend(preprocessing_invalidations);
                 let deduplicated = deduplicate_translation_candidates(candidates)
                     .map_err(GlobalPreparationFailure::InvalidDeduplication)?;
                 let (outcomes, deduplication_invalidations, reuses) = deduplicated.into_parts();
@@ -202,12 +213,14 @@ where
                     .flat_map(|scope| &scope.groups)
                     .flat_map(|group| &group.units)
                     .filter(|unit| unit.invalidated && !unit.not_applicable)
-                    .count();
+                    .count()
+                    + preprocessing_invalidated;
 
                 Ok::<_, GlobalPreparationFailure>((
                     scopes,
                     invalidations,
                     reuses,
+                    planning_failures,
                     TranslationPlanPreparationCounts::new(retained, invalidated, not_applicable),
                 ))
             })
@@ -276,13 +289,14 @@ where
 
         Ok(StandardTranslationPlan::new(
             Arc::clone(&semantics),
-            TranslationPlanPreparation::with_baseline(
+            TranslationPlanPreparation::with_baseline_and_planning_failures(
                 invalidations,
                 reuses,
                 terminology_json,
                 placeholder_rules_json,
                 preparation_counts,
                 snapshot_baseline,
+                planning_failures,
             ),
             tasks,
         ))
@@ -300,7 +314,6 @@ struct PreparedScope {
 
 struct PreparedGroup {
     kind: TextGroupKind,
-    group_location: crate::rpg_maker::text::RpgMakerLocation,
     assets: Vec<PreparedAsset>,
 }
 
@@ -313,11 +326,10 @@ struct PreparedAsset {
 fn prepare_corpus(
     groups: Vec<StandardTranslationGroup>,
 ) -> Result<PreparedCorpus, CorpusPlanningError> {
-    let mut by_scope = BTreeMap::<SemanticScopeKey, Vec<PreparedGroup>>::new();
+    let mut scopes = Vec::<PreparedScope>::new();
     for group in groups {
         let scope = SemanticScopeKey::from_group(&group)?;
         let kind = group.kind();
-        let group_location = group.group_location().clone();
         let mut assets = Vec::new();
         for asset in group.into_assets() {
             let (identity, translation, translation_state) = asset.into_parts();
@@ -327,31 +339,18 @@ fn prepare_corpus(
                 translation_state,
             });
         }
-        assets.sort_by(|left, right| {
-            left.identity
-                .role()
-                .cmp(right.identity.role())
-                .then_with(|| {
-                    left.identity
-                        .owner()
-                        .storage_name()
-                        .cmp(right.identity.owner().storage_name())
-                })
-        });
-        by_scope.entry(scope).or_default().push(PreparedGroup {
-            kind,
-            group_location,
-            assets,
-        });
+        let prepared_group = PreparedGroup { kind, assets };
+        if let Some(current_scope) = scopes.last_mut()
+            && current_scope.key == scope
+        {
+            current_scope.groups.push(prepared_group);
+        } else {
+            scopes.push(PreparedScope {
+                key: scope,
+                groups: vec![prepared_group],
+            });
+        }
     }
-
-    let scopes = by_scope
-        .into_iter()
-        .map(|(key, mut groups)| {
-            groups.sort_by(|left, right| left.group_location.cmp(&right.group_location));
-            PreparedScope { key, groups }
-        })
-        .collect();
 
     Ok(PreparedCorpus { scopes })
 }
@@ -361,7 +360,7 @@ pub(crate) enum SemanticScopeKey {
     StandardDatabase(StandardDataFile),
     DataFile(DataFileName),
     System,
-    Map(u32),
+    Map(MapId),
     CommonEvent(usize),
     Troop(usize),
     Plugin {
@@ -401,7 +400,7 @@ impl fmt::Display for SemanticScopeKey {
             Self::StandardDatabase(file) => write!(formatter, "data/{}", file.file_name()),
             Self::DataFile(file) => write!(formatter, "data/{file}"),
             Self::System => formatter.write_str("data/System.json"),
-            Self::Map(map_id) => write!(formatter, "Map{map_id:03}"),
+            Self::Map(map_id) => write!(formatter, "Map{:03}", map_id.get()),
             Self::CommonEvent(event_id) => write!(formatter, "CommonEvent[{event_id}]"),
             Self::Troop(troop_id) => write!(formatter, "Troop[{troop_id}]"),
             Self::Plugin { plugin_name, .. } => write!(formatter, "Plugin[{plugin_name}]"),
@@ -428,6 +427,13 @@ struct PreprocessedScope {
     groups: Vec<PreprocessedGroup>,
 }
 
+struct PreprocessedScopeResult {
+    scope: PreprocessedScope,
+    planning_failures: Vec<TranslationPlanningFailure>,
+    invalidations: Vec<TranslationInvalidation>,
+    invalidated: usize,
+}
+
 struct PreprocessedGroup {
     kind: TextGroupKind,
     units: Vec<PreprocessedUnit>,
@@ -438,6 +444,7 @@ struct PreprocessedUnit {
     protected_text: String,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
+    triggered_terms: Vec<usize>,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     invalidated: bool,
@@ -461,18 +468,38 @@ enum PreparedUnitResponsibility {
 fn preprocess_scope(
     scope: PreparedScope,
     semantics: Arc<ResolvedTranslationSemantics>,
-) -> Result<PreprocessedScope, ScopePreprocessingError> {
+) -> Result<PreprocessedScopeResult, ScopePreprocessingError> {
     let mut groups = Vec::with_capacity(scope.groups.len());
+    let mut planning_failures = Vec::new();
+    let mut invalidations = Vec::new();
+    let mut invalidated = 0;
     for group in scope.groups {
         let mut units = Vec::with_capacity(group.assets.len());
         for asset in group.assets {
-            let source_text = semantic_text(asset.identity.source_content());
-            let prepared = semantics
-                .prepare(group.kind, &source_text)
-                .map_err(ScopePreprocessingError::Semantics)?;
+            let prepared = match semantics
+                .prepare_content(group.kind, asset.identity.source_content())
+            {
+                Ok(prepared) => prepared,
+                Err(source) => {
+                    let reason = planning_failure_reason(source);
+                    if let Some(translation) = asset.translation {
+                        invalidations.push(TranslationInvalidation::new(
+                            asset.identity.clone(),
+                            translation,
+                            asset
+                                .translation_state
+                                .expect("已有译文必须同时具有 translation_state"),
+                        ));
+                        invalidated += 1;
+                    }
+                    planning_failures.push(TranslationPlanningFailure::new(asset.identity, reason));
+                    continue;
+                }
+            };
             let protected_text = prepared.model_text().to_owned();
             let placeholders = prepared.placeholders().to_vec();
             let language_analysis = prepared.language_analysis().clone();
+            let triggered_terms = prepared.term_indices().to_vec();
             let terminology_dependencies = prepared.terms().to_vec();
             let state_context = translation_state_context(
                 semantics.global_fingerprint(),
@@ -485,15 +512,7 @@ fn preprocess_scope(
             let current = if not_applicable {
                 false
             } else if let Some(translation) = asset.translation.as_ref() {
-                let translation_text = semantic_text(translation);
                 asset.translation_state == Some(state_context.finish(translation))
-                    && matches!(
-                        prepared
-                            .accept(&translation_text)
-                            .map_err(ScopePreprocessingError::Semantics)?,
-                        PreparedTranslationAcceptance::Accepted(accepted)
-                            if accepted == translation_text
-                    )
             } else {
                 false
             };
@@ -516,6 +535,7 @@ fn preprocess_scope(
                 protected_text,
                 placeholders,
                 language_analysis,
+                triggered_terms,
                 translation: asset.translation,
                 translation_state: asset.translation_state,
                 invalidated,
@@ -530,10 +550,35 @@ fn preprocess_scope(
             units,
         });
     }
-    Ok(PreprocessedScope {
-        key: scope.key,
-        groups,
+    Ok(PreprocessedScopeResult {
+        scope: PreprocessedScope {
+            key: scope.key,
+            groups,
+        },
+        planning_failures,
+        invalidations,
+        invalidated,
     })
+}
+
+fn planning_failure_reason(
+    source: ResolvedTranslationSemanticError,
+) -> TranslationPlanningFailureReason {
+    match source {
+        ResolvedTranslationSemanticError::ProtectPlaceholder(source) => {
+            TranslationPlanningFailureReason::PlaceholderProtection {
+                message: source.to_string(),
+            }
+        }
+        ResolvedTranslationSemanticError::ProjectLanguageText(source) => {
+            TranslationPlanningFailureReason::PlaceholderProjection {
+                message: source.to_string(),
+            }
+        }
+        ResolvedTranslationSemanticError::AcceptCandidate(_) => {
+            unreachable!("译前准备不会执行候选译文验收")
+        }
+    }
 }
 
 fn semantic_text(content: &TextUnitContent) -> String {
@@ -544,6 +589,7 @@ fn semantic_text(content: &TextUnitContent) -> String {
 }
 
 fn global_translation_semantics(
+    engine: RpgMakerEngine,
     source_language: &str,
     target_language: &str,
     language_semantics: Sha256Fingerprint,
@@ -556,7 +602,8 @@ fn global_translation_semantics(
         .frame(2, target_language.as_bytes())
         .frame(3, language_semantics.as_bytes())
         .frame(4, system_markdown.as_bytes())
-        .frame(5, client_semantics.as_bytes());
+        .frame(5, client_semantics.as_bytes())
+        .frame(6, engine.storage_name().as_bytes());
     hasher.finish()
 }
 
@@ -705,6 +752,7 @@ struct PreparedUnit {
     translation: Option<TextUnitContent>,
     placeholders: Vec<super::standard::AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
+    triggered_terms: Vec<usize>,
     state_context: TranslationStateContext,
     responsibility: PreparedUnitResponsibility,
 }
@@ -727,22 +775,27 @@ fn build_scope_tasks(
                 translation: unit.translation,
                 placeholders: unit.placeholders,
                 language_analysis: unit.language_analysis,
+                triggered_terms: unit.triggered_terms,
                 state_context: unit.state_context,
                 responsibility: unit.responsibility,
             })
             .collect::<Vec<_>>();
-        let active_sources = units
-            .iter()
-            .filter(|unit| {
-                matches!(
-                    unit.responsibility,
-                    PreparedUnitResponsibility::Active { .. }
-                )
-            })
-            .map(|unit| semantic_text(unit.identity.source_content()))
-            .collect::<Vec<_>>();
-        let triggered_terms =
-            terminology.triggered_indices(active_sources.iter().map(String::as_str));
+        let mut triggered_term_flags = vec![false; terminology.entries().len()];
+        for unit in units.iter().filter(|unit| {
+            matches!(
+                unit.responsibility,
+                PreparedUnitResponsibility::Active { .. }
+            )
+        }) {
+            for &index in &unit.triggered_terms {
+                triggered_term_flags[index] = true;
+            }
+        }
+        let triggered_terms = triggered_term_flags
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, triggered)| triggered.then_some(index))
+            .collect();
         prepared_groups.push(PreparedTaskGroup {
             kind: group.kind,
             units,
@@ -1138,9 +1191,9 @@ fn render_user_markdown(
         markdown.push_str("术语：\n\n");
         for entry in terms {
             markdown.push_str("- ");
-            markdown.push_str(entry.term());
+            push_markdown_literal(&mut markdown, entry.term());
             markdown.push_str(" → ");
-            markdown.push_str(entry.translation());
+            push_markdown_literal(&mut markdown, entry.translation());
             markdown.push('\n');
         }
     }
@@ -1157,6 +1210,15 @@ fn render_user_markdown(
         markdown.push_str(&group.markdown);
     }
     markdown
+}
+
+fn push_markdown_literal(markdown: &mut String, value: &str) {
+    for character in value.chars() {
+        if character.is_ascii_punctuation() {
+            markdown.push('\\');
+        }
+        markdown.push(character);
+    }
 }
 
 fn finalize_task(
@@ -1369,7 +1431,6 @@ impl Error for CorpusPlanningError {}
 
 #[derive(Debug)]
 pub(crate) enum ScopePreprocessingError {
-    Semantics(ResolvedTranslationSemanticError),
     EncodeStateLocation(crate::rpg_maker::location_codec::RpgMakerLocationCodecError),
     EncodeStateRole(crate::rpg_maker::location_codec::RpgMakerProjectionCodecError),
 }
@@ -1377,7 +1438,6 @@ pub(crate) enum ScopePreprocessingError {
 impl fmt::Display for ScopePreprocessingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Semantics(source) => write!(formatter, "无法建立受信翻译语义：{source}"),
             Self::EncodeStateLocation(source) => {
                 write!(formatter, "无法编码译文状态位置：{source}")
             }
@@ -1389,7 +1449,6 @@ impl fmt::Display for ScopePreprocessingError {
 impl Error for ScopePreprocessingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Semantics(source) => Some(source),
             Self::EncodeStateLocation(source) => Some(source),
             Self::EncodeStateRole(source) => Some(source),
         }
@@ -1600,25 +1659,7 @@ mod tests {
             "{}",
         );
         let translation_state = translation.map(|translation| {
-            let placeholders = Pcre2PlaceholderService::new().expect("内建占位符应可编译");
-            let custom = placeholders
-                .compile_custom(Vec::new())
-                .expect("空自定义占位符应可编译");
-            let (protected_text, bindings) = placeholders
-                .protect(TextGroupKind::DatabaseEntry, &original, &custom)
-                .expect("测试原文应可保护")
-                .into_parts();
-            let source_language = translation_resources().source_language();
-            let global = global_translation_semantics(
-                "ja",
-                "zh-Hans",
-                source_language.semantic_fingerprint(),
-                "# System\n完整且由外部提供。",
-                ().semantic_fingerprint(),
-            );
-            translation_state_context(global, &identity, &protected_text, &bindings, &terms)
-                .expect("测试译文状态应可建立")
-                .finish(&TextUnitContent::Value(translation.to_owned()))
+            translation_state_for(&identity, &original, translation, &terms, Vec::new())
         });
         StandardTranslationGroup::new(
             TextGroupKind::DatabaseEntry,
@@ -1629,6 +1670,35 @@ mod tests {
                 translation_state,
             )],
         )
+    }
+
+    fn translation_state_for(
+        identity: &TranslationUnitIdentity,
+        original: &str,
+        translation: &str,
+        terms: &[TerminologyDependency],
+        placeholder_definitions: Vec<super::super::placeholder::PlaceholderRuleDefinition>,
+    ) -> Sha256Fingerprint {
+        let placeholders = Pcre2PlaceholderService::new().expect("内建占位符应可编译");
+        let custom = placeholders
+            .compile_custom(placeholder_definitions)
+            .expect("测试自定义占位符应可编译");
+        let (protected_text, bindings) = placeholders
+            .protect(RpgMakerEngine::Mz, identity.kind(), original, &custom)
+            .expect("测试原文应可保护")
+            .into_parts();
+        let source_language = translation_resources().source_language();
+        let global = global_translation_semantics(
+            RpgMakerEngine::Mz,
+            "ja",
+            "zh-Hans",
+            source_language.semantic_fingerprint(),
+            "# System\n完整且由外部提供。",
+            ().semantic_fingerprint(),
+        );
+        translation_state_context(global, identity, &protected_text, &bindings, terms)
+            .expect("测试译文状态应可建立")
+            .finish(&TextUnitContent::Value(translation.to_owned()))
     }
 
     fn map_group(
@@ -1715,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    fn dialogue_group_is_sorted_speaker_before_body_and_state_includes_source_speaker() {
+    fn dialogue_group_preserves_reader_unit_order_and_state_includes_source_speaker() {
         let group_location = RpgMakerLocation::value(
             RpgMakerSource::map(1),
             vec![
@@ -1760,7 +1830,7 @@ mod tests {
         .expect("对话组应可准备");
         assert_eq!(
             prepared.scopes[0].groups[0].assets[0].identity.role(),
-            &TextUnitRole::DialogueSpeaker
+            &TextUnitRole::DialogueBody
         );
 
         let global = Sha256Fingerprint::from_bytes([0x11; 32]);
@@ -1769,6 +1839,55 @@ mod tests {
         let second = translation_state_context(global, &other_body, "同一句", &[], &[])
             .expect("状态应可建立");
         assert_ne!(first, second, "源 Speaker 必须参与正文译文状态");
+    }
+
+    #[test]
+    fn non_contiguous_equal_scope_keys_do_not_cross_the_reader_global_order() {
+        let prepared = prepare_corpus(vec![
+            group(
+                RpgMakerSource::data(StandardDataFile::Items),
+                1,
+                "一",
+                None,
+                Vec::new(),
+            ),
+            group(
+                RpgMakerSource::data(StandardDataFile::Actors),
+                1,
+                "二",
+                None,
+                Vec::new(),
+            ),
+            group(
+                RpgMakerSource::data(StandardDataFile::Items),
+                2,
+                "三",
+                None,
+                Vec::new(),
+            ),
+        ])
+        .expect("Reader 顺序应可准备");
+
+        assert_eq!(prepared.scopes.len(), 3);
+        assert!(matches!(
+            &prepared.scopes[0].key,
+            SemanticScopeKey::StandardDatabase(StandardDataFile::Items)
+        ));
+        assert!(matches!(
+            &prepared.scopes[1].key,
+            SemanticScopeKey::StandardDatabase(StandardDataFile::Actors)
+        ));
+        assert!(matches!(
+            &prepared.scopes[2].key,
+            SemanticScopeKey::StandardDatabase(StandardDataFile::Items)
+        ));
+    }
+
+    #[test]
+    fn terminology_values_are_rendered_as_markdown_literals() {
+        let mut markdown = String::new();
+        push_markdown_literal(&mut markdown, r"A*[B] <C> \");
+        assert_eq!(markdown, r"A\*\[B\] \<C\> \\");
     }
 
     #[tokio::test]
@@ -1953,45 +2072,45 @@ mod tests {
                 .map(ExpectedTranslationOutput::line_shape)
                 .collect::<Vec<_>>(),
             vec![
-                ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                ExpectedLineShape::Aligned(NonZeroUsize::new(3).unwrap()),
+                ExpectedLineShape::Aligned(NonZeroUsize::new(2).unwrap()),
                 ExpectedLineShape::Aligned(NonZeroUsize::MIN),
                 ExpectedLineShape::Reflow,
-                ExpectedLineShape::Aligned(NonZeroUsize::new(2).unwrap()),
-                ExpectedLineShape::Aligned(NonZeroUsize::new(3).unwrap()),
+                ExpectedLineShape::Aligned(NonZeroUsize::MIN),
             ]
         );
         let user = tasks[0].messages()[1].content();
         assert_eq!(
             user,
             concat!(
-                "## 地图文本\n",
+                "## 滚动文本\n",
                 "\n",
-                "地图名称 [1]（单行）：始まりの町\n",
+                "滚动文本 [1]（3 行，逐行对应）：\n",
+                "\n",
+                "> 制作\n",
+                "> \n",
+                "> 終わり\n",
+                "\n",
+                "## 选项\n",
+                "\n",
+                "选项 [2]（2 项，逐项对应）：\n",
+                "\n",
+                "> はい\n",
+                "> いいえ\n",
                 "\n",
                 "## 对话\n",
                 "\n",
-                "说话人 [2]（单行）：アリス\n",
+                "说话人 [3]（单行）：アリス\n",
                 "\n",
-                "正文 [3]（自由断行）：\n",
+                "正文 [4]（自由断行）：\n",
                 "\n",
                 "> 今日はいい天気ですね。\n",
                 "> 一緒に町へ\n",
                 "> 行きませんか？\n",
                 "\n",
-                "## 选项\n",
+                "## 地图文本\n",
                 "\n",
-                "选项 [4]（2 项，逐项对应）：\n",
-                "\n",
-                "> はい\n",
-                "> いいえ\n",
-                "\n",
-                "## 滚动文本\n",
-                "\n",
-                "滚动文本 [5]（3 行，逐行对应）：\n",
-                "\n",
-                "> 制作\n",
-                "> \n",
-                "> 終わり\n",
+                "地图名称 [5]（单行）：始まりの町\n",
             )
         );
     }
@@ -2023,10 +2142,16 @@ mod tests {
             "{}",
         );
         let (protected_speaker, bindings) = placeholders
-            .protect(TextGroupKind::EventDialogue, "アリス", &custom)
+            .protect(
+                RpgMakerEngine::Mz,
+                TextGroupKind::EventDialogue,
+                "アリス",
+                &custom,
+            )
             .expect("说话人应可保护")
             .into_parts();
         let global = global_translation_semantics(
+            RpgMakerEngine::Mz,
             "ja",
             "zh-Hans",
             resources.source_language().semantic_fingerprint(),
@@ -2106,6 +2231,7 @@ mod tests {
             translation: None,
             placeholders: Vec::new(),
             language_analysis,
+            triggered_terms: Vec::new(),
             state_context: TranslationStateContext::new(Sha256Fingerprint::from_bytes([7; 32])),
             responsibility: PreparedUnitResponsibility::Virtual {
                 reason: TranslationVirtualReason::Reused {
@@ -2138,6 +2264,7 @@ mod tests {
             translation: None,
             placeholders: Vec::new(),
             language_analysis,
+            triggered_terms: Vec::new(),
             state_context: TranslationStateContext::new(Sha256Fingerprint::from_bytes([8; 32])),
             responsibility: PreparedUnitResponsibility::Virtual {
                 reason: TranslationVirtualReason::FullyProtected,
@@ -2212,7 +2339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shuffled_map_groups_follow_display_event_page_list_and_command_order() {
+    async fn map_groups_preserve_reader_natural_order() {
         let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
             translation_resources(),
@@ -2247,15 +2374,15 @@ mod tests {
                 &project(),
                 &profile(10_000),
                 StandardTranslationCorpus::new(vec![
-                    event_2_page_0_command_0,
-                    event_1_page_1_command_0,
                     display,
                     event_1_page_0_command_2,
+                    event_1_page_1_command_0,
+                    event_2_page_0_command_0,
                 ]),
                 StandardTranslationInput::new(None, None),
             )
             .await
-            .expect("乱序语料应该按 Map 真实结构稳定排序")
+            .expect("Reader 已验证的 Map 自然顺序应原样进入计划")
             .into_parts();
 
         assert_eq!(tasks.len(), 1);
@@ -2327,6 +2454,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminology_for_prompt_is_the_same_natural_segment_match_prepared_for_state() {
+        let terminology_path = PathBuf::from("C:/input/terms.toml");
+        let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([
+                    (
+                        terminology_path.clone(),
+                        r#"
+                            [[term]]
+                            term = "秘密"
+                            translation = "机密"
+
+                            [[term]]
+                            term = "前後"
+                            translation = "前后"
+
+                            [[term]]
+                            term = "勇者"
+                            translation = "英雄"
+                        "#
+                        .as_bytes()
+                        .to_vec(),
+                    ),
+                    (
+                        placeholder_path.clone(),
+                        r#"
+                            [[rule]]
+                            pattern = '<code:[^>]+>'
+                        "#
+                        .as_bytes()
+                        .to_vec(),
+                    ),
+                ])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+
+        let (_, _, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                StandardTranslationCorpus::new(vec![group(
+                    RpgMakerSource::data(StandardDataFile::Items),
+                    1,
+                    r"<code:秘密>前\C[2]後勇者翻訳",
+                    None,
+                    Vec::new(),
+                )]),
+                StandardTranslationInput::new(Some(terminology_path), Some(placeholder_path)),
+            )
+            .await
+            .expect("自然段术语应可建立任务")
+            .into_parts();
+
+        let user = tasks[0].messages()[1].content();
+        assert!(user.contains("- 勇者 → 英雄"));
+        assert!(!user.contains("- 秘密 →"), "协议壳不得触发术语");
+        assert!(!user.contains("- 前後 →"), "术语不得跨不透明边界拼接");
+    }
+
+    #[tokio::test]
+    async fn terminology_prompt_does_not_join_distinct_lines_elements() {
+        let terminology_path = PathBuf::from("C:/input/terms.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    terminology_path.clone(),
+                    r#"
+                        [[term]]
+                        term = "跨元素"
+                        translation = "不应命中"
+                        triggers = ["海へ\n出よう"]
+
+                    "#
+                    .as_bytes()
+                    .to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let body = map_unit_group(
+            TextGroupKind::EventDialogue,
+            0,
+            vec![(
+                TextUnitRole::DialogueBody,
+                TextUnitContent::Lines(vec![
+                    "海へ".to_owned(),
+                    "出よう".to_owned(),
+                    "別の翻訳".to_owned(),
+                ]),
+                "{}",
+            )],
+        );
+
+        let (_, _, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                StandardTranslationCorpus::new(vec![body]),
+                StandardTranslationInput::new(Some(terminology_path), None),
+            )
+            .await
+            .expect("Lines 术语扫描域应可建立任务")
+            .into_parts();
+
+        let user = tasks[0].messages()[1].content();
+        assert!(!user.contains("- 跨元素 →"));
+    }
+
+    #[tokio::test]
     async fn global_deduplication_sends_only_the_first_unit_and_propagates_atomically() {
         let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
@@ -2341,7 +2591,7 @@ mod tests {
             None,
             Vec::new(),
         );
-        let leader = first.assets()[0].identity().clone();
+        let last_duplicate = first.assets()[0].identity().clone();
         let duplicate = group(
             RpgMakerSource::data(StandardDataFile::Items),
             2,
@@ -2349,7 +2599,7 @@ mod tests {
             None,
             Vec::new(),
         );
-        let target = duplicate.assets()[0].identity().clone();
+        let natural_leader = duplicate.assets()[0].identity().clone();
         let neighbouring = group(
             RpgMakerSource::data(StandardDataFile::Items),
             3,
@@ -2372,11 +2622,12 @@ mod tests {
         assert!(preparation.invalidations().is_empty());
         assert!(preparation.reuses().is_empty());
         assert_eq!(tasks.len(), 1);
-        assert_eq!(
-            tasks[0].expected_outputs()[0].propagation_targets(),
-            &[target]
-        );
-        assert_eq!(tasks[0].expected_outputs()[0].identity(), &leader);
+        let deduplicated = tasks[0]
+            .expected_outputs()
+            .iter()
+            .find(|output| output.identity() == &natural_leader)
+            .expect("Reader 自然顺序中的首个重复单元应成为代表");
+        assert_eq!(deduplicated.propagation_targets(), &[last_duplicate]);
         let user = tasks[0].messages()[1].content();
         assert_eq!(user.matches("保存しますか？").count(), 1);
         assert!(!user.contains("仅上下文"));
@@ -2425,6 +2676,174 @@ mod tests {
         );
         assert_eq!(preparation.reuses()[0].targets().len(), 1);
         assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_state_is_current_without_renormalizing_repeated_original_placeholders() {
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            EmptyResources,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let corpus = StandardTranslationCorpus::new(vec![group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            1,
+            r"\C[2]翻訳\C[2]",
+            Some(r"\C[2]译文\C[2]"),
+            Vec::new(),
+        )]);
+
+        let (_, preparation, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                corpus,
+                StandardTranslationInput::new(None, None),
+            )
+            .await
+            .expect("精确 state 应直接复用既有译文")
+            .into_parts();
+
+        assert_eq!(preparation.retained(), 1);
+        assert!(preparation.invalidations().is_empty());
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inserting_an_unmatched_placeholder_rule_keeps_the_existing_translation_current() {
+        let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    placeholder_path.clone(),
+                    r#"
+                        [[rule]]
+                        pattern = 'DOES_NOT_MATCH'
+
+                        [[rule]]
+                        pattern = '<TOKEN>'
+                    "#
+                    .as_bytes()
+                    .to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let original = "翻訳<TOKEN>";
+        let translation = "译文<TOKEN>";
+        let base = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            1,
+            original,
+            None,
+            Vec::new(),
+        );
+        let identity = base.assets()[0].identity().clone();
+        let state = translation_state_for(
+            &identity,
+            original,
+            translation,
+            &[],
+            vec![super::super::placeholder::PlaceholderRuleDefinition::new(
+                None, "<TOKEN>",
+            )],
+        );
+        let corpus = StandardTranslationCorpus::new(vec![StandardTranslationGroup::new(
+            base.kind(),
+            base.group_location().clone(),
+            vec![StandardTranslationAsset::new(
+                identity,
+                Some(TextUnitContent::Value(translation.to_owned())),
+                Some(state),
+            )],
+        )]);
+
+        let (_, preparation, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                corpus,
+                StandardTranslationInput::new(None, Some(placeholder_path)),
+            )
+            .await
+            .expect("不命中规则的插入不应使有效译文失效")
+            .into_parts();
+
+        assert_eq!(preparation.retained(), 1);
+        assert!(preparation.invalidations().is_empty());
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn placeholder_projection_failure_isolated_to_one_unit_and_invalidates_its_old_translation()
+     {
+        let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    placeholder_path.clone(),
+                    br#"
+                        [[rule]]
+                        pattern = '<BAD>'
+
+                        [[rule]]
+                        pattern = 'BAD'
+                    "#
+                    .to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let bad = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            1,
+            "翻訳<BAD>",
+            Some("旧译文<BAD>"),
+            Vec::new(),
+        );
+        let good = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            2,
+            "正常な翻訳",
+            None,
+            Vec::new(),
+        );
+
+        let (_, preparation, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                StandardTranslationCorpus::new(vec![bad, good]),
+                StandardTranslationInput::new(None, Some(placeholder_path)),
+            )
+            .await
+            .expect("一个单元的 Placeholder 冲突不应阻断其他单元")
+            .into_parts();
+
+        assert_eq!(preparation.planning_failures().len(), 1);
+        assert!(matches!(
+            preparation.planning_failures()[0].reason(),
+            TranslationPlanningFailureReason::PlaceholderProtection { .. }
+        ));
+        assert_eq!(preparation.invalidations().len(), 1);
+        assert_eq!(preparation.invalidated(), 1);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].expected_outputs().len(), 1);
+        assert!(tasks[0].messages()[1].content().contains("正常な翻訳"));
+        assert!(!tasks[0].messages()[1].content().contains("翻訳<BAD>"));
     }
 
     #[tokio::test]

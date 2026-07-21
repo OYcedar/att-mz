@@ -151,6 +151,7 @@ impl AuditLedger for FakeAuditLedger {
             } => Event::LogCommitFailure,
             AuditEvent::RunStarted
             | AuditEvent::RunFinished { .. }
+            | AuditEvent::TranslationPlanningUnresolved { .. }
             | AuditEvent::WriteBackPublishStarted { .. }
             | AuditEvent::WriteBackPublishFinished { .. } => {
                 return Err(FakeRootError("意外审计事件"));
@@ -232,8 +233,10 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
             owner_snapshot_row(),
             resource_snapshot_row("placeholder_rules"),
             resource_snapshot_row("terminology"),
-            standard_asset_row(1),
-            standard_asset_row(2),
+            standard_group_row(1, 0),
+            standard_group_row(2, 1),
+            standard_asset_row(1, 0),
+            standard_asset_row(2, 1),
         ])
     }
 
@@ -280,50 +283,75 @@ impl DirectoryTreeFingerprinter for FakeDirectoryTreeFingerprinter {
 }
 
 fn metadata_snapshot_row() -> SqliteRow {
-    SqliteRow::new(vec![
-        SqliteValue::Text("0_metadata".to_owned()),
+    snapshot_prefix_row(
+        "0_metadata",
         SqliteValue::Null,
         SqliteValue::Blob(vec![0xa5; 32]),
         SqliteValue::Null,
         SqliteValue::Null,
         SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-    ])
+    )
 }
 
 fn owner_snapshot_row() -> SqliteRow {
-    SqliteRow::new(vec![
-        SqliteValue::Text("1_owner".to_owned()),
+    snapshot_prefix_row(
+        "1_owner",
         SqliteValue::Text("builtin".to_owned()),
         SqliteValue::Blob(vec![0xa5; 32]),
         SqliteValue::Blob(vec![0xb4; 32]),
         SqliteValue::Null,
         SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-    ])
+    )
 }
 
 fn resource_snapshot_row(kind: &str) -> SqliteRow {
-    SqliteRow::new(vec![
-        SqliteValue::Text("2_resource".to_owned()),
+    snapshot_prefix_row(
+        "2_resource",
         SqliteValue::Null,
         SqliteValue::Null,
         SqliteValue::Null,
         SqliteValue::Text(kind.to_owned()),
         SqliteValue::Text("[]".to_owned()),
+    )
+}
+
+fn snapshot_prefix_row(
+    row_kind: &str,
+    owner: SqliteValue,
+    source_fingerprint: SqliteValue,
+    asset_fingerprint: SqliteValue,
+    resource_kind: SqliteValue,
+    canonical_json: SqliteValue,
+) -> SqliteRow {
+    let mut values = vec![
+        SqliteValue::Text(row_kind.to_owned()),
+        owner,
+        source_fingerprint,
+        asset_fingerprint,
+        resource_kind,
+        canonical_json,
+    ];
+    values.extend(std::iter::repeat_n(SqliteValue::Null, 9));
+    SqliteRow::new(values)
+}
+
+fn standard_group_row(index: usize, group_order: i64) -> SqliteRow {
+    let group_location = RpgMakerLocation::value(
+        RpgMakerSource::data(StandardDataFile::Items),
+        vec![RpgMakerLocationStep::index(index)],
+    );
+    SqliteRow::new(vec![
+        SqliteValue::Text("3_group".to_owned()),
+        SqliteValue::Text("builtin".to_owned()),
         SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Text(
+            RpgMakerLocationCodec::encode(&group_location).expect("测试位置应可编码"),
+        ),
+        SqliteValue::Text("database_entry".to_owned()),
+        SqliteValue::Integer(group_order),
         SqliteValue::Null,
         SqliteValue::Null,
         SqliteValue::Null,
@@ -333,7 +361,7 @@ fn resource_snapshot_row(kind: &str) -> SqliteRow {
     ])
 }
 
-fn standard_asset_row(index: usize) -> SqliteRow {
+fn standard_asset_row(index: usize, group_order: i64) -> SqliteRow {
     let group_location = RpgMakerLocation::value(
         RpgMakerSource::data(StandardDataFile::Items),
         vec![RpgMakerLocationStep::index(index)],
@@ -344,7 +372,7 @@ fn standard_asset_row(index: usize) -> SqliteRow {
     .expect("字段角色应可编码");
 
     SqliteRow::new(vec![
-        SqliteValue::Text("3_unit".to_owned()),
+        SqliteValue::Text("4_unit".to_owned()),
         SqliteValue::Text("builtin".to_owned()),
         SqliteValue::Null,
         SqliteValue::Null,
@@ -354,7 +382,9 @@ fn standard_asset_row(index: usize) -> SqliteRow {
             RpgMakerLocationCodec::encode(&group_location).expect("测试位置应可编码"),
         ),
         SqliteValue::Text("database_entry".to_owned()),
+        SqliteValue::Integer(group_order),
         SqliteValue::Text(unit_role),
+        SqliteValue::Integer(0),
         SqliteValue::Text(r#""魔法剣""#.to_owned()),
         SqliteValue::Text("{}".to_owned()),
         SqliteValue::Null,

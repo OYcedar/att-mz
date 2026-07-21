@@ -5,8 +5,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::rpg_maker::model::{
-    DirectTextPart, DirectTextRecipe, LogicalTextLocation, MutationTarget, ProjectionModelError,
-    ScalarFieldKey, TextProjectionRecipe, TextUnitContent, TextUnitRole,
+    DirectTextPart, DirectTextRecipe, LogicalTextLocation, MutationClaim, MutationClaimSet,
+    MutationResource, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe, TextUnitContent,
+    TextUnitRole, mutation_claims_for_group,
 };
 pub(crate) use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind,
@@ -17,6 +18,7 @@ pub(crate) use crate::rpg_maker::text::{
 pub(crate) struct ExtractedTextUnit {
     role: TextUnitRole,
     projection_location: RpgMakerLocation,
+    mutation_claim: MutationClaim,
     source_content: TextUnitContent,
 }
 
@@ -37,12 +39,45 @@ impl ExtractedTextUnit {
         )
     }
 
+    pub(crate) fn new_with_claim(
+        field_name: impl Into<String>,
+        projection_location: RpgMakerLocation,
+        mutation_claim: MutationClaim,
+        original_text: impl Into<String>,
+    ) -> Result<Self, SnapshotModelError> {
+        let role = ScalarFieldKey::new(field_name)
+            .map(TextUnitRole::Scalar)
+            .map_err(SnapshotModelError::Projection)?;
+        Self::projected_with_claim(
+            role,
+            projection_location,
+            mutation_claim,
+            TextUnitContent::Value(original_text.into()),
+        )
+    }
+
     /// 为投影器已经确定角色和完整内容的语义单元建立受信快照。
     pub(crate) fn projected(
         role: TextUnitRole,
         projection_location: RpgMakerLocation,
         source_content: TextUnitContent,
     ) -> Result<Self, SnapshotModelError> {
+        let mutation_claim = MutationClaim::for_location(projection_location.clone())
+            .map_err(SnapshotModelError::Projection)?;
+        Self::projected_with_claim(role, projection_location, mutation_claim, source_content)
+    }
+
+    pub(crate) fn projected_with_claim(
+        role: TextUnitRole,
+        projection_location: RpgMakerLocation,
+        mutation_claim: MutationClaim,
+        source_content: TextUnitContent,
+    ) -> Result<Self, SnapshotModelError> {
+        if mutation_claim.representative_location() != &projection_location {
+            return Err(SnapshotModelError::Projection(
+                ProjectionModelError::MutationClaimTargetMismatch,
+            ));
+        }
         let actual_lines = matches!(source_content, TextUnitContent::Lines(_));
         if role.expects_lines() != actual_lines {
             return Err(SnapshotModelError::ContentShapeMismatch {
@@ -69,6 +104,7 @@ impl ExtractedTextUnit {
         Ok(Self {
             role,
             projection_location,
+            mutation_claim,
             source_content,
         })
     }
@@ -95,7 +131,7 @@ pub(crate) struct ExtractedTextGroup {
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
     units: Vec<ExtractedTextUnit>,
-    mutation_targets: Vec<MutationTarget>,
+    mutation_claims: MutationClaimSet,
     recipes: Vec<TextProjectionRecipe>,
 }
 
@@ -120,8 +156,9 @@ impl ExtractedTextGroup {
                         exact_location: Box::new(unit.projection_location.clone()),
                     }
                 })?;
-                DirectTextRecipe::new(
+                DirectTextRecipe::new_with_claim(
                     unit.projection_location.clone(),
+                    unit.mutation_claim.clone(),
                     source,
                     vec![DirectTextPart::TextSlot {
                         role: unit.role.clone(),
@@ -138,7 +175,7 @@ impl ExtractedTextGroup {
     pub(crate) fn projected(
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
-        mut units: Vec<ExtractedTextUnit>,
+        units: Vec<ExtractedTextUnit>,
         recipes: Vec<TextProjectionRecipe>,
     ) -> Result<Self, SnapshotModelError> {
         if units.is_empty() {
@@ -151,12 +188,6 @@ impl ExtractedTextGroup {
                 group_location: Box::new(group_location),
             });
         }
-        units.sort_by(|left, right| {
-            left.role
-                .cmp(&right.role)
-                .then_with(|| left.projection_location.cmp(&right.projection_location))
-        });
-
         let mut roles = BTreeSet::new();
         for unit in &units {
             if !roles.insert(unit.role.clone()) {
@@ -179,24 +210,18 @@ impl ExtractedTextGroup {
         }
         validate_line_references(&group_location, &units, &recipes)?;
 
-        let mut mutation_targets = recipes
-            .iter()
-            .flat_map(TextProjectionRecipe::mutation_targets)
-            .collect::<Vec<_>>();
-        mutation_targets.sort();
-        for pair in mutation_targets.windows(2) {
-            if pair[0] == pair[1] {
-                return Err(SnapshotModelError::DuplicateMutationTarget {
-                    target: Box::new(pair[0].clone()),
-                });
-            }
-        }
+        let mutation_claims =
+            mutation_claims_for_group(kind, &group_location, &recipes).map_err(|conflict| {
+                SnapshotModelError::MutationClaimConflict {
+                    resource: Box::new(conflict.resource().clone()),
+                }
+            })?;
 
         Ok(Self {
             kind,
             group_location,
             units,
-            mutation_targets,
+            mutation_claims,
             recipes,
         })
     }
@@ -213,8 +238,8 @@ impl ExtractedTextGroup {
         &self.units
     }
 
-    pub(crate) fn mutation_targets(&self) -> &[MutationTarget] {
-        &self.mutation_targets
+    pub(crate) fn mutation_claims(&self) -> &MutationClaimSet {
+        &self.mutation_claims
     }
 
     pub(crate) fn recipes(&self) -> &[TextProjectionRecipe] {
@@ -343,14 +368,22 @@ impl LuaSnapshot {
 fn normalize_groups(
     groups: Vec<ExtractedTextGroup>,
 ) -> Result<Vec<ExtractedTextGroup>, SnapshotModelError> {
-    let mut merged = BTreeMap::<
+    let mut merged = Vec::<(
         (RpgMakerLocation, TextGroupKind),
         (Vec<ExtractedTextUnit>, Vec<TextProjectionRecipe>),
-    >::new();
+    )>::new();
+    let mut indexes = BTreeMap::<(RpgMakerLocation, TextGroupKind), usize>::new();
     for group in groups {
-        let entry = merged
-            .entry((group.group_location, group.kind))
-            .or_default();
+        let key = (group.group_location, group.kind);
+        let index = if let Some(index) = indexes.get(&key).copied() {
+            index
+        } else {
+            let index = merged.len();
+            indexes.insert(key.clone(), index);
+            merged.push((key, (Vec::new(), Vec::new())));
+            index
+        };
+        let entry = &mut merged[index].1;
         entry.0.extend(group.units);
         entry.1.extend(group.recipes);
     }
@@ -366,7 +399,7 @@ fn normalize_groups(
     }
 
     let mut logical_locations = BTreeSet::new();
-    let mut targets = BTreeSet::new();
+    let mut claim_sets = Vec::<&MutationClaimSet>::new();
     for group in &groups {
         for unit in &group.units {
             let logical_location = unit.logical_location(&group.group_location);
@@ -376,13 +409,14 @@ fn normalize_groups(
                 });
             }
         }
-        for target in &group.mutation_targets {
-            if !targets.insert(target.clone()) {
-                return Err(SnapshotModelError::DuplicateMutationTarget {
-                    target: Box::new(target.clone()),
+        for existing in &claim_sets {
+            if let Some(conflict) = existing.conflict_with(&group.mutation_claims) {
+                return Err(SnapshotModelError::MutationClaimConflict {
+                    resource: Box::new(conflict.resource().clone()),
                 });
             }
         }
+        claim_sets.push(&group.mutation_claims);
     }
     Ok(groups)
 }
@@ -413,8 +447,8 @@ pub(crate) enum SnapshotModelError {
     DuplicateLogicalLocation {
         logical_location: Box<LogicalTextLocation>,
     },
-    DuplicateMutationTarget {
-        target: Box<MutationTarget>,
+    MutationClaimConflict {
+        resource: Box<MutationResource>,
     },
     RecipeRoleMismatch {
         group_location: Box<RpgMakerLocation>,
@@ -472,8 +506,8 @@ impl fmt::Display for SnapshotModelError {
             Self::DuplicateLogicalLocation { logical_location } => {
                 write!(formatter, "快照包含重复逻辑文本地址：{logical_location:?}")
             }
-            Self::DuplicateMutationTarget { target } => {
-                write!(formatter, "快照包含重复物理修改目标：{target:?}")
+            Self::MutationClaimConflict { resource } => {
+                write!(formatter, "快照包含冲突的物理修改声明：{resource:?}")
             }
             Self::RecipeRoleMismatch {
                 group_location,
@@ -513,7 +547,7 @@ mod tests {
     use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource, StandardDataFile};
 
     #[test]
-    fn snapshot_uses_roles_for_order_and_rejects_duplicate_physical_targets() {
+    fn snapshot_preserves_declared_order_and_rejects_duplicate_physical_claims() {
         let source = RpgMakerSource::data(StandardDataFile::CommonEvents);
         let group_location =
             RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(1)]);
@@ -543,8 +577,78 @@ mod tests {
         assert!(matches!(
             BuiltinSnapshot::new(vec![first, second]),
             Err(SnapshotModelError::DuplicateLogicalLocation { .. })
-                | Err(SnapshotModelError::DuplicateMutationTarget { .. })
+                | Err(SnapshotModelError::MutationClaimConflict { .. })
         ));
+    }
+
+    #[test]
+    fn raw_and_decoded_claims_fail_within_group_and_owner_while_siblings_coexist() {
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let raw = RpgMakerLocation::value(
+            source.clone(),
+            vec![
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("payload"),
+            ],
+        );
+        let decoded = |key: &str| {
+            RpgMakerLocation::value(
+                source.clone(),
+                vec![
+                    RpgMakerLocationStep::index(1),
+                    RpgMakerLocationStep::key("payload"),
+                    RpgMakerLocationStep::DecodeJsonString,
+                    RpgMakerLocationStep::key(key),
+                ],
+            )
+        };
+        let unit = |field: &str, location: RpgMakerLocation| {
+            ExtractedTextUnit::new(field, location, "原文").expect("测试单元应合法")
+        };
+        let group_location = |index| {
+            RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(index)])
+        };
+
+        assert!(matches!(
+            ExtractedTextGroup::new(
+                TextGroupKind::DatabaseEntry,
+                group_location(10),
+                vec![unit("raw", raw.clone()), unit("decoded", decoded("left"))],
+            ),
+            Err(SnapshotModelError::MutationClaimConflict { .. })
+        ));
+
+        let raw_group = ExtractedTextGroup::new(
+            TextGroupKind::DatabaseEntry,
+            group_location(11),
+            vec![unit("raw", raw)],
+        )
+        .expect("raw 组本身应合法");
+        let decoded_left_group = ExtractedTextGroup::new(
+            TextGroupKind::DatabaseEntry,
+            group_location(12),
+            vec![unit("decoded", decoded("left"))],
+        )
+        .expect("decoded 组本身应合法");
+        assert!(matches!(
+            RulesSnapshot::new(vec![raw_group, decoded_left_group]),
+            Err(SnapshotModelError::MutationClaimConflict { .. })
+        ));
+
+        let decoded_left_group = ExtractedTextGroup::new(
+            TextGroupKind::DatabaseEntry,
+            group_location(13),
+            vec![unit("left", decoded("left"))],
+        )
+        .expect("decoded left 组应合法");
+        let decoded_right_group = ExtractedTextGroup::new(
+            TextGroupKind::DatabaseEntry,
+            group_location(14),
+            vec![unit("right", decoded("right"))],
+        )
+        .expect("decoded right 组应合法");
+        RulesSnapshot::new(vec![decoded_left_group, decoded_right_group])
+            .expect("decoded siblings 只能共享 Intent，必须允许同 owner 共存");
     }
 
     #[test]
@@ -599,7 +703,7 @@ mod tests {
         .expect("同址多语义单元应合法");
 
         assert_eq!(group.units().len(), 2);
-        assert_eq!(group.mutation_targets().len(), 1);
+        assert_eq!(group.mutation_claims().claims().len(), 1);
     }
 
     #[test]

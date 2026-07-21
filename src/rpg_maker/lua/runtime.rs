@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 
 use tokio::sync::oneshot;
 
+use crate::fingerprint::Sha256Fingerprint;
 use crate::llm::{ChatMessage, LlmResponse};
 use crate::rpg_maker::extract::store::LuaSnapshot;
 use crate::storage::file_system::ScopedDirectoryPath;
@@ -217,6 +218,7 @@ pub(crate) trait TrustedLuaTranslateHostCalls: Send + Sync + 'static {
         &self,
         kind: TextGroupKind,
         original: String,
+        semantic_context: String,
     ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError>;
 
     fn request_llm(
@@ -237,6 +239,7 @@ pub(crate) trait TrustedLuaTranslationSemantics: Send + Sync + 'static {
         &self,
         kind: TextGroupKind,
         original: String,
+        semantic_context: String,
     ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError>;
 }
 
@@ -288,14 +291,20 @@ impl TrustedLuaTranslationTerm {
 /// `TrustedLuaHostCallError`。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TrustedLuaPreparedTranslationAcceptance {
-    Accepted { translation: String },
-    Rejected { reason: String },
+    Accepted {
+        translation: String,
+        state: Sha256Fingerprint,
+    },
+    Rejected {
+        reason: String,
+    },
 }
 
 impl TrustedLuaPreparedTranslationAcceptance {
-    pub(crate) fn accepted(translation: impl Into<String>) -> Self {
+    pub(crate) fn accepted(translation: impl Into<String>, state: Sha256Fingerprint) -> Self {
         Self::Accepted {
             translation: translation.into(),
+            state,
         }
     }
 
@@ -311,6 +320,16 @@ pub(crate) trait TrustedLuaPreparedTranslation: Send + Sync + 'static {
     fn status(&self) -> TrustedLuaPreparedTranslationStatus;
     fn model_text(&self) -> &str;
     fn terms(&self) -> &[TrustedLuaTranslationTerm];
+
+    /// 只比较脚本持久化的译文与 opaque state 是否仍等于当前语义。
+    ///
+    /// `state` 已由 Lua 边界验证为当前协议的 SHA-256 文本；这里不得重新执行
+    /// `accept`，避免旧译文因新的正规化实现被反向改写或误判。
+    fn is_current(
+        &self,
+        translation: String,
+        state: Sha256Fingerprint,
+    ) -> Result<bool, TrustedLuaHostCallError>;
 
     fn accept(
         &self,

@@ -1,0 +1,17 @@
+[[rule]]
+pattern = '\\SE\[[^]]+\]'
+
+[[rule]]
+scopes = ["event_dialogue", "event_choices"]
+pattern = '<msg>(?<text>.*?)</msg>'
+
+[[rule]]
+scopes = [
+  "database_entry",
+  "system",
+  "map",
+  "event_scrolling_text",
+  "event_command",
+  "plugin_parameter",
+]
+pattern = '\{icon:[0-9]+\}'

@@ -22,11 +22,12 @@ use crate::observability::{EventId, OperationId, RunId};
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::model::{LogicalTextLocation, TextUnitRole};
 use crate::rpg_maker::project::RpgMakerWriteBackLayoutProfile;
-use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
+use crate::rpg_maker::text::{MapId, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
 use crate::rpg_maker::translate::standard::{
     LoggedAcceptedTranslationDecision, LoggedUnresolvedTranslationUnit,
-    StandardTranslationTaskIndex, TranslationProtocolDiagnostic, TranslationTaskLogRecord,
-    TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
+    StandardTranslationTaskIndex, TranslationPlanningFailure, TranslationPlanningFailureReason,
+    TranslationProtocolDiagnostic, TranslationTaskLogRecord, TranslationTaskUnavailableReason,
+    TranslationUnitRejectionReason,
 };
 use crate::rpg_maker::write_back::StandardWriteBackSummary;
 use crate::rpg_maker::write_back::standard::{
@@ -225,6 +226,9 @@ pub(crate) enum AuditEvent {
         operation_id: OperationId,
         result: TranslationTaskAuditResult,
     },
+    TranslationPlanningUnresolved {
+        failure: TranslationPlanningFailure,
+    },
     WriteBackPublishStarted {
         operation_id: OperationId,
         output_root: PathBuf,
@@ -239,9 +243,9 @@ impl AuditEvent {
     fn required_command(&self) -> Option<AuditCommand> {
         match self {
             Self::RunStarted | Self::RunFinished { .. } => None,
-            Self::TranslationTaskStarted { .. } | Self::TranslationTaskFinished { .. } => {
-                Some(AuditCommand::Translate)
-            }
+            Self::TranslationTaskStarted { .. }
+            | Self::TranslationTaskFinished { .. }
+            | Self::TranslationPlanningUnresolved { .. } => Some(AuditCommand::Translate),
             Self::WriteBackPublishStarted { .. } | Self::WriteBackPublishFinished { .. } => {
                 Some(AuditCommand::WriteBack)
             }
@@ -408,6 +412,7 @@ enum AuditEventKindWire {
     RunStarted,
     TranslationTaskStarted,
     TranslationTaskFinished,
+    TranslationPlanningUnresolved,
     WriteBackPublishStarted,
     WriteBackPublishFinished,
     RunFinished,
@@ -542,6 +547,68 @@ struct TranslationTaskStartedPayloadWire {
 struct TranslationTaskStartedPayloadWriteWire {
     operation_id: DisplayWriteWire<OperationId>,
     task_index: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TranslationPlanningUnresolvedPayloadWire {
+    failure: TranslationPlanningFailureWire,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TranslationPlanningFailureWire {
+    location: LogicalTextLocationWire,
+    reason: TranslationPlanningFailureReasonWire,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TranslationPlanningFailureReasonWire {
+    PlaceholderProtection { message: String },
+    PlaceholderProjection { message: String },
+}
+
+#[derive(Serialize)]
+struct TranslationPlanningUnresolvedPayloadWriteWire<'a> {
+    failure: TranslationPlanningFailureWriteWire<'a>,
+}
+
+#[derive(Serialize)]
+struct TranslationPlanningFailureWriteWire<'a> {
+    location: LogicalTextLocationWriteWire<'a>,
+    reason: TranslationPlanningFailureReasonWriteWire<'a>,
+}
+
+impl<'a> From<&'a TranslationPlanningFailure> for TranslationPlanningFailureWriteWire<'a> {
+    fn from(failure: &'a TranslationPlanningFailure) -> Self {
+        Self {
+            location: LogicalTextLocationWriteWire::from(failure.identity().logical_location()),
+            reason: TranslationPlanningFailureReasonWriteWire::from(failure.reason()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TranslationPlanningFailureReasonWriteWire<'a> {
+    PlaceholderProtection { message: &'a str },
+    PlaceholderProjection { message: &'a str },
+}
+
+impl<'a> From<&'a TranslationPlanningFailureReason>
+    for TranslationPlanningFailureReasonWriteWire<'a>
+{
+    fn from(reason: &'a TranslationPlanningFailureReason) -> Self {
+        match reason {
+            TranslationPlanningFailureReason::PlaceholderProtection { message } => {
+                Self::PlaceholderProtection { message }
+            }
+            TranslationPlanningFailureReason::PlaceholderProjection { message } => {
+                Self::PlaceholderProjection { message }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1309,13 +1376,41 @@ enum RpgMakerSourceWire {
         file: String,
     },
     Map {
-        map_id: u32,
+        map_id: MapIdWire,
     },
     PluginParameter {
         plugin_index: usize,
         plugin_name: String,
         parameter_name: String,
     },
+}
+
+/// 审计 wire 中的 Map 身份。
+///
+/// 读写两侧都经过领域 `MapId`，避免拥有型校验模型在反序列化后短暂承载
+/// `map_id = 0`，也避免写侧绕过正整数不变量。
+#[derive(Clone, Copy, Debug)]
+struct MapIdWire(MapId);
+
+impl Serialize for MapIdWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u32(self.0.get())
+    }
+}
+
+impl<'de> Deserialize<'de> for MapIdWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        MapId::new(value)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1441,7 +1536,7 @@ enum RpgMakerSourceWriteWire<'a> {
         file: &'a str,
     },
     Map {
-        map_id: u32,
+        map_id: MapIdWire,
     },
     PluginParameter {
         plugin_index: usize,
@@ -1459,7 +1554,9 @@ impl<'a> From<&'a RpgMakerSource> for RpgMakerSourceWriteWire<'a> {
             RpgMakerSource::DataFile(file) => Self::Data {
                 file: file.as_str(),
             },
-            RpgMakerSource::Map(map_id) => Self::Map { map_id: *map_id },
+            RpgMakerSource::Map(map_id) => Self::Map {
+                map_id: MapIdWire(*map_id),
+            },
             RpgMakerSource::PluginParameter {
                 plugin_index,
                 plugin_name,
@@ -1634,6 +1731,19 @@ impl AuditPayloadValidation for RunFinishedPayloadWire {
 impl AuditPayloadValidation for TranslationTaskStartedPayloadWire {
     fn validate(&self) -> Result<(), String> {
         validate_uuid_v4(&self.operation_id, "operation_id")
+    }
+}
+
+impl AuditPayloadValidation for TranslationPlanningUnresolvedPayloadWire {
+    fn validate(&self) -> Result<(), String> {
+        let message = match &self.failure.reason {
+            TranslationPlanningFailureReasonWire::PlaceholderProtection { message }
+            | TranslationPlanningFailureReasonWire::PlaceholderProjection { message } => message,
+        };
+        if message.trim().is_empty() {
+            return Err("规划期未解决原因不能为空".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -1853,6 +1963,16 @@ impl JsonLineRecord for AuditRecord {
                 },
                 output,
             ),
+            AuditEvent::TranslationPlanningUnresolved { failure } => serialize_audit_envelope(
+                &self.context,
+                self.event_id,
+                recorded_at_utc,
+                AuditEventKindWire::TranslationPlanningUnresolved,
+                TranslationPlanningUnresolvedPayloadWriteWire {
+                    failure: TranslationPlanningFailureWriteWire::from(failure),
+                },
+                output,
+            ),
             AuditEvent::WriteBackPublishStarted {
                 operation_id,
                 output_root,
@@ -1916,6 +2036,14 @@ impl JsonLineRecord for AuditRecord {
                     Some(AuditCommandWire::Translate),
                 )
             }
+            AuditEventKindWire::TranslationPlanningUnresolved => {
+                validate_payload::<TranslationPlanningUnresolvedPayloadWire>(
+                    bytes,
+                    &probe,
+                    AuditEventKindWire::TranslationPlanningUnresolved,
+                    Some(AuditCommandWire::Translate),
+                )
+            }
             AuditEventKindWire::WriteBackPublishStarted => {
                 validate_payload::<WriteBackPublishStartedPayloadWire>(
                     bytes,
@@ -1949,8 +2077,9 @@ mod tests {
     use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::TextGroupKind;
     use crate::rpg_maker::translate::standard::{
-        NonEmptyTaskItems, TranslationTaskOutcome, TranslationTaskOutcomeContext,
-        TranslationUnitIdentity, UnresolvedTranslationUnit,
+        NonEmptyTaskItems, TranslationPlanningFailure, TranslationPlanningFailureReason,
+        TranslationTaskOutcome, TranslationTaskOutcomeContext, TranslationUnitIdentity,
+        UnresolvedTranslationUnit,
     };
 
     fn run_id() -> RunId {
@@ -1960,6 +2089,133 @@ mod tests {
     fn config() -> JsonLinesStreamConfig {
         JsonLinesStreamConfig::new(8, Duration::from_secs(1), 16_384, 65_536, 2)
             .expect("测试账本配置应合法")
+    }
+
+    fn map_source_wire() -> RpgMakerSourceWire {
+        RpgMakerSourceWire::Map {
+            map_id: MapIdWire(MapId::new(1).expect("测试 Map ID 应为正整数")),
+        }
+    }
+
+    fn map_value_location_wire() -> LogicalTextLocationWire {
+        LogicalTextLocationWire {
+            group_location: RpgMakerLocationWire::Value {
+                source: map_source_wire(),
+                steps: Vec::new(),
+            },
+            unit_role: TextUnitRoleWire::Scalar {
+                field: "text".to_owned(),
+            },
+        }
+    }
+
+    fn map_note_tag_location_wire() -> LogicalTextLocationWire {
+        LogicalTextLocationWire {
+            group_location: RpgMakerLocationWire::NoteTag {
+                source: map_source_wire(),
+                container_steps: Vec::new(),
+                tag_name: "Name".to_owned(),
+                occurrence: 0,
+            },
+            unit_role: TextUnitRoleWire::Scalar {
+                field: "text".to_owned(),
+            },
+        }
+    }
+
+    fn map_comment_tag_location_wire() -> LogicalTextLocationWire {
+        LogicalTextLocationWire {
+            group_location: RpgMakerLocationWire::CommentTag {
+                source: map_source_wire(),
+                command_steps: Vec::new(),
+                tag_name: "Name".to_owned(),
+                occurrence: 0,
+            },
+            unit_role: TextUnitRoleWire::Scalar {
+                field: "text".to_owned(),
+            },
+        }
+    }
+
+    fn translation_task_wire(confirmed_written_units: Option<usize>) -> TranslationTaskWire {
+        TranslationTaskWire {
+            task_index: 0,
+            status: TranslationTaskStatusWire::Partial,
+            attempts: 1,
+            provider_request_id: None,
+            provider_response_id: None,
+            finish_reason: None,
+            final_response_usage: None,
+            accepted_decisions: 1,
+            confirmed_written_units,
+            accepted: vec![AcceptedTranslationWire {
+                id: 0,
+                leader: map_note_tag_location_wire(),
+                propagation_targets: vec![map_comment_tag_location_wire()],
+            }],
+            unresolved: vec![UnresolvedTranslationWire {
+                id: 1,
+                locations: vec![map_value_location_wire()],
+                reason: TranslationUnitRejectionReasonWire::Missing,
+            }],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn serialize_test_payload<P>(
+        context: &AuditContext,
+        event: AuditEventKindWire,
+        payload: P,
+    ) -> Vec<u8>
+    where
+        P: Serialize,
+    {
+        let mut bytes = Vec::new();
+        serialize_audit_envelope(
+            context,
+            EventId::from_uuid(Uuid::from_u128(0x550e_8400_e29b_41d4_a716_4466_5544_0001)),
+            "2026-07-20T12:34:56.789Z",
+            event,
+            payload,
+            &mut bytes,
+        )
+        .expect("测试审计 payload 应可序列化");
+        bytes
+    }
+
+    fn assert_positive_maps_pass_and_each_zero_is_rejected(
+        case: &str,
+        bytes: &[u8],
+        expected_map_count: usize,
+    ) {
+        AuditRecord::validate(bytes)
+            .unwrap_or_else(|error| panic!("{case} 的正 Map ID 应通过校验：{error}"));
+
+        let wire = std::str::from_utf8(bytes).expect("审计 wire 应为 UTF-8");
+        let needle = "\"map_id\":1";
+        let positions = wire
+            .match_indices(needle)
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions.len(),
+            expected_map_count,
+            "{case} 的 Map 来源覆盖数应固定"
+        );
+
+        for (map_index, position) in positions.into_iter().enumerate() {
+            let mut invalid = wire.to_owned();
+            let digit = position + needle.len() - 1;
+            invalid.replace_range(digit..digit + 1, "0");
+            let error = match AuditRecord::validate(invalid.as_bytes()) {
+                Ok(()) => panic!("{case} 的第 {map_index} 个 map_id=0 不得通过"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("RPG Maker map ID 必须是正 u32 整数"),
+                "{case} 的第 {map_index} 个零 Map ID 应由 MapId 边界拒绝，实际错误：{error}"
+            );
+        }
     }
 
     #[test]
@@ -2013,6 +2269,99 @@ mod tests {
                 "记录不是当前紧凑 UTF-8 wire"
             );
         }
+    }
+
+    #[test]
+    fn every_location_bearing_audit_payload_requires_positive_map_ids() {
+        let translate_context =
+            AuditContext::translate(run_id(), RpgMakerEngine::Mz, "demo", "quality");
+        let planning = serialize_test_payload(
+            &translate_context,
+            AuditEventKindWire::TranslationPlanningUnresolved,
+            TranslationPlanningUnresolvedPayloadWire {
+                failure: TranslationPlanningFailureWire {
+                    location: map_value_location_wire(),
+                    reason: TranslationPlanningFailureReasonWire::PlaceholderProjection {
+                        message: "投影失败".to_owned(),
+                    },
+                },
+            },
+        );
+        assert_positive_maps_pass_and_each_zero_is_rejected(
+            "translation_planning_unresolved",
+            &planning,
+            1,
+        );
+
+        let operation_id = "550e8400-e29b-41d4-a716-446655440002".to_owned();
+        for (case, result) in [
+            (
+                "translation_task_finished/completed",
+                TranslationTaskResultWire::Completed {
+                    task: translation_task_wire(Some(2)),
+                },
+            ),
+            (
+                "translation_task_finished/commit_failed",
+                TranslationTaskResultWire::CommitFailed {
+                    task: translation_task_wire(None),
+                },
+            ),
+            (
+                "translation_task_finished/not_committed",
+                TranslationTaskResultWire::NotCommitted {
+                    task: translation_task_wire(None),
+                },
+            ),
+        ] {
+            let task = serialize_test_payload(
+                &translate_context,
+                AuditEventKindWire::TranslationTaskFinished,
+                TranslationTaskFinishedPayloadWire {
+                    operation_id: operation_id.clone(),
+                    result,
+                },
+            );
+            assert_positive_maps_pass_and_each_zero_is_rejected(case, &task, 3);
+        }
+
+        let write_back_context = AuditContext::write_back(run_id(), RpgMakerEngine::Mv, "demo");
+        let write_back = serialize_test_payload(
+            &write_back_context,
+            AuditEventKindWire::WriteBackPublishFinished,
+            WriteBackPublishFinishedPayloadWire {
+                operation_id,
+                result: WriteBackPublishResultWire::Published {
+                    write_back: WriteBackPayloadWire {
+                        layout_profile: LayoutProfileWire {
+                            dialogue_body_max_fullwidth_chars: 24,
+                            scrolling_text_max_fullwidth_chars: 24,
+                            help_description_max_fullwidth_chars: 24,
+                        },
+                        output_root: "output".to_owned(),
+                        lua_executed: false,
+                        summary: WriteBackSummaryWire {
+                            translated_units: 1,
+                            original_units: 0,
+                            auto_wrapped_units: 0,
+                            inserted_line_breaks: 0,
+                            inserted_fullwidth_indents: 0,
+                            manual_layout_units: 1,
+                        },
+                        manual_layout_diagnostics: vec![ManualLayoutDiagnosticWire {
+                            locations: vec![map_comment_tag_location_wire()],
+                            region: LayoutRegionWire::DialogueBody,
+                            max_fullwidth_chars: 24,
+                        }],
+                    },
+                },
+            },
+        );
+        assert_positive_maps_pass_and_each_zero_is_rejected(
+            "write_back_publish_finished/published",
+            &write_back,
+            1,
+        );
     }
 
     #[test]
@@ -2083,6 +2432,56 @@ mod tests {
 
         AuditRecord::validate(&bytes)
             .expect("借用序列化结果必须逐字节等于严格拥有型 wire 的规范输出");
+    }
+
+    #[test]
+    fn planning_unresolved_wire_has_location_and_no_llm_task_protocol_fields() {
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Rules,
+            TextGroupKind::PluginParameter,
+            RpgMakerLocation::value(
+                RpgMakerSource::plugin_parameter(2, "QuestLog", "title"),
+                Vec::new(),
+            ),
+            TextUnitRole::Scalar(
+                crate::rpg_maker::model::ScalarFieldKey::new("title").expect("字段应合法"),
+            ),
+            TextUnitContent::Value("翻訳<BAD>".to_owned()),
+            "{}",
+        );
+        let record = AuditRecord {
+            context: Arc::new(AuditContext::translate(
+                run_id(),
+                RpgMakerEngine::Mz,
+                "demo",
+                "quality",
+            )),
+            event_id: EventId::from_uuid(Uuid::from_u128(
+                0x550e_8400_e29b_41d4_a716_4466_5544_0001,
+            )),
+            event: AuditEvent::TranslationPlanningUnresolved {
+                failure: TranslationPlanningFailure::new(
+                    identity,
+                    TranslationPlanningFailureReason::PlaceholderProtection {
+                        message: "实际保护跨度冲突".to_owned(),
+                    },
+                ),
+            },
+        };
+        let mut bytes = Vec::new();
+
+        record
+            .serialize_into("2026-07-20T12:34:56.789Z", &mut bytes)
+            .expect("规划期未解决事件应可序列化");
+        AuditRecord::validate(&bytes).expect("规划期未解决 wire 应通过强类型校验");
+        let value: Value = serde_json::from_slice(&bytes).expect("审计 JSON 应有效");
+        assert_eq!(value["event"], "translation_planning_unresolved");
+        assert_eq!(
+            value["payload"]["failure"]["reason"]["kind"],
+            "placeholder_protection"
+        );
+        assert!(value["payload"]["failure"].get("id").is_none());
+        assert!(value["payload"]["failure"].get("attempts").is_none());
     }
 
     fn dialogue_location() -> LogicalTextLocation {

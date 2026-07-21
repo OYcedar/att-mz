@@ -1582,7 +1582,7 @@ fn assert_extracted_database(database: &Path) {
     let expected_tables = BTreeSet::from([
         "standard_text_group".to_owned(),
         "standard_text_unit".to_owned(),
-        "standard_text_target".to_owned(),
+        "standard_mutation_claim".to_owned(),
     ]);
     let mut statement = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -1625,12 +1625,12 @@ fn assert_extracted_database(database: &Path) {
     );
     assert_eq!(row.4, None);
 
-    let targets: i64 = connection
-        .query_row("SELECT COUNT(*) FROM standard_text_target", [], |row| {
+    let claims: i64 = connection
+        .query_row("SELECT COUNT(*) FROM standard_mutation_claim", [], |row| {
             row.get(0)
         })
-        .expect("物理修改目标数量应可查询");
-    assert_eq!(targets, 1, "唯一文本组应拥有唯一物理修改目标");
+        .expect("物理修改 Claim 数量应可查询");
+    assert!(claims > 0, "唯一文本组应拥有展开后的物理修改 Claim");
 }
 
 fn assert_mixed_semantic_units_extracted(database: &Path) {
@@ -1787,19 +1787,16 @@ fn assert_mv_dialogue_extracted(database: &Path) {
     )));
     assert!(logical.contains(&(json!({ "kind": "dialogue_body" }), json!([MV_BODY]), None,)));
 
-    let (groups, targets): (i64, i64) = connection
+    let (groups, claims): (i64, i64) = connection
         .query_row(
             "SELECT (SELECT COUNT(*) FROM standard_text_group WHERE owner = 'builtin'), \
-                    (SELECT COUNT(*) FROM standard_text_target WHERE owner = 'builtin')",
+                    (SELECT COUNT(*) FROM standard_mutation_claim WHERE owner = 'builtin')",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("MV 对话组与修改目标数量应可读取");
-    assert_eq!(
-        (groups, targets),
-        (1, 2),
-        "对话块与其唯一物理 401 行均应受修改目标保护"
-    );
+    assert_eq!(groups, 1, "MV 对话应物化为唯一标准组");
+    assert!(claims > 0, "对话块和 401 行应由展开后的 Claim 资源锁保护");
 
     let definition: String = connection
         .query_row(

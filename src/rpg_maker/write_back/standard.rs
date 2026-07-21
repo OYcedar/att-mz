@@ -16,7 +16,8 @@ use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, LogicalTextLocation,
-    MutationTarget, TextProjectionRecipe, TextUnitContent, TextUnitRole,
+    MutationClaim, MutationClaimSet, MutationResource, MutationResourceLock, TextProjectionRecipe,
+    TextUnitContent, TextUnitRole, mutation_claims_for_group,
 };
 use crate::rpg_maker::project::{MaxFullwidthChars, OpenedProject, RpgMakerWriteBackLayoutProfile};
 use crate::rpg_maker::text::{
@@ -175,16 +176,16 @@ pub(crate) struct StandardWriteBackGroup {
     group_location: RpgMakerLocation,
     units: Vec<StandardWriteBackUnit>,
     recipes: Vec<TextProjectionRecipe>,
-    mutation_targets: Vec<MutationTarget>,
+    mutation_claims: MutationClaimSet,
 }
 
 impl StandardWriteBackGroup {
     pub(crate) fn new(
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
-        mut units: Vec<StandardWriteBackUnit>,
+        units: Vec<StandardWriteBackUnit>,
         recipes: Vec<TextProjectionRecipe>,
-        mut mutation_targets: Vec<MutationTarget>,
+        mutation_locks: Vec<MutationResourceLock>,
     ) -> Result<Self, StandardWriteBackSnapshotError> {
         if recipes.is_empty() {
             return Err(StandardWriteBackSnapshotError::EmptyProjection {
@@ -199,12 +200,12 @@ impl StandardWriteBackGroup {
                 });
             }
         }
-        units.sort_by(|left, right| left.role.cmp(&right.role));
-        for pair in units.windows(2) {
-            if pair[0].role == pair[1].role {
+        let mut seen_roles = BTreeSet::new();
+        for unit in &units {
+            if !seen_roles.insert(unit.role.clone()) {
                 return Err(StandardWriteBackSnapshotError::DuplicateRole {
                     group_location: Box::new(group_location),
-                    role: pair[0].role.clone(),
+                    role: unit.role.clone(),
                 });
             }
         }
@@ -227,33 +228,40 @@ impl StandardWriteBackGroup {
         validate_line_references(&group_location, &units, &recipes)?;
         validate_projection_round_trip(&group_location, &units, &recipes)?;
 
-        let mut expected_targets = recipes
-            .iter()
-            .flat_map(TextProjectionRecipe::mutation_targets)
-            .collect::<Vec<_>>();
-        expected_targets.sort();
-        mutation_targets.sort();
-        if expected_targets != mutation_targets {
-            return Err(StandardWriteBackSnapshotError::RecipeTargetMismatch {
+        let expected_claims =
+            mutation_claims_for_group(kind, &group_location, &recipes).map_err(|conflict| {
+                StandardWriteBackSnapshotError::MutationClaimConflict {
+                    resource: Box::new(conflict.resource().clone()),
+                }
+            })?;
+        let mutation_claims = MutationClaimSet::from_locks(mutation_locks).map_err(|conflict| {
+            StandardWriteBackSnapshotError::MutationClaimConflict {
+                resource: Box::new(conflict.resource().clone()),
+            }
+        })?;
+        if expected_claims.locks() != mutation_claims.locks() {
+            return Err(StandardWriteBackSnapshotError::RecipeClaimMismatch {
                 group_location: Box::new(group_location),
             });
         }
-        for pair in mutation_targets.windows(2) {
-            if pair[0] == pair[1] {
-                return Err(StandardWriteBackSnapshotError::DuplicateTarget {
-                    target: Box::new(pair[0].clone()),
-                });
-            }
-        }
-        for target in &mutation_targets {
-            let target_location = match target {
-                MutationTarget::Value(location) => location,
-                MutationTarget::DialogueBlock { header } => header,
-            };
-            if target_location.source() != group_location.source() {
-                return Err(StandardWriteBackSnapshotError::MismatchedTargetSource {
+        if let Some(lock) = mutation_claims
+            .locks()
+            .iter()
+            .find(|lock| lock.resource().source() != group_location.source())
+        {
+            return Err(
+                StandardWriteBackSnapshotError::MismatchedClaimResourceSource {
                     group_location: Box::new(group_location),
-                    target: Box::new(target.clone()),
+                    resource: Box::new(lock.resource().clone()),
+                },
+            );
+        }
+        for claim in expected_claims.claims() {
+            let claim_location = claim.representative_location();
+            if claim_location.source() != group_location.source() {
+                return Err(StandardWriteBackSnapshotError::MismatchedClaimSource {
+                    group_location: Box::new(group_location),
+                    claim: Box::new(claim.clone()),
                 });
             }
         }
@@ -287,9 +295,16 @@ impl StandardWriteBackGroup {
                 validate_scrolling_projection(&group_location, &units, &recipes)?;
             }
             TextGroupKind::EventChoices => {
-                if recipes
+                if recipes.iter().any(|recipe| {
+                    !matches!(
+                        recipe,
+                        TextProjectionRecipe::Direct(_) | TextProjectionRecipe::Claim(_)
+                    )
+                }) || recipes
                     .iter()
-                    .any(|recipe| !matches!(recipe, TextProjectionRecipe::Direct(_)))
+                    .filter(|recipe| matches!(recipe, TextProjectionRecipe::Claim(_)))
+                    .count()
+                    != 1
                 {
                     return Err(StandardWriteBackSnapshotError::InvalidChoicesProjection {
                         group_location: Box::new(group_location),
@@ -313,7 +328,7 @@ impl StandardWriteBackGroup {
             group_location,
             units,
             recipes,
-            mutation_targets,
+            mutation_claims,
         })
     }
 
@@ -324,8 +339,15 @@ impl StandardWriteBackGroup {
         RpgMakerLocation,
         Vec<StandardWriteBackUnit>,
         Vec<TextProjectionRecipe>,
+        MutationClaimSet,
     ) {
-        (self.kind, self.group_location, self.units, self.recipes)
+        (
+            self.kind,
+            self.group_location,
+            self.units,
+            self.recipes,
+            self.mutation_claims,
+        )
     }
 }
 
@@ -483,6 +505,7 @@ fn validate_projection_round_trip(
                     }
                 }
             }
+            TextProjectionRecipe::Claim(_) => {}
         }
     }
     Ok(())
@@ -530,23 +553,18 @@ pub(crate) struct StandardWriteBackSnapshot {
 
 impl StandardWriteBackSnapshot {
     pub(crate) fn new(
-        mut groups: Vec<StandardWriteBackGroup>,
+        groups: Vec<StandardWriteBackGroup>,
     ) -> Result<Self, StandardWriteBackSnapshotError> {
-        groups.sort_by(|left, right| {
-            left.kind
-                .cmp(&right.kind)
-                .then_with(|| left.group_location.cmp(&right.group_location))
-        });
-
-        let mut mutation_targets = BTreeSet::new();
+        let mut claim_sets = Vec::<&MutationClaimSet>::new();
         for group in &groups {
-            for target in &group.mutation_targets {
-                if !mutation_targets.insert(target.clone()) {
-                    return Err(StandardWriteBackSnapshotError::DuplicateTarget {
-                        target: Box::new(target.clone()),
+            for existing in &claim_sets {
+                if let Some(conflict) = existing.conflict_with(&group.mutation_claims) {
+                    return Err(StandardWriteBackSnapshotError::MutationClaimConflict {
+                        resource: Box::new(conflict.resource().clone()),
                     });
                 }
             }
+            claim_sets.push(&group.mutation_claims);
         }
         Ok(Self { groups })
     }
@@ -620,19 +638,23 @@ pub(crate) enum StandardWriteBackSnapshotError {
         group_location: Box<RpgMakerLocation>,
         role: TextUnitRole,
     },
-    RecipeTargetMismatch {
+    RecipeClaimMismatch {
         group_location: Box<RpgMakerLocation>,
     },
     RecipeDoesNotRebuildOriginal {
         group_location: Box<RpgMakerLocation>,
         target: Box<RpgMakerLocation>,
     },
-    DuplicateTarget {
-        target: Box<MutationTarget>,
+    MutationClaimConflict {
+        resource: Box<MutationResource>,
     },
-    MismatchedTargetSource {
+    MismatchedClaimSource {
         group_location: Box<RpgMakerLocation>,
-        target: Box<MutationTarget>,
+        claim: Box<MutationClaim>,
+    },
+    MismatchedClaimResourceSource {
+        group_location: Box<RpgMakerLocation>,
+        resource: Box<MutationResource>,
     },
     InvalidDialogueProjection {
         group_location: Box<RpgMakerLocation>,
@@ -718,10 +740,10 @@ impl fmt::Display for StandardWriteBackSnapshotError {
                 formatter,
                 "写回资产组 {group_location} 的行槽索引或引用次数无效：{role:?}"
             ),
-            Self::RecipeTargetMismatch { group_location } => {
+            Self::RecipeClaimMismatch { group_location } => {
                 write!(
                     formatter,
-                    "写回资产组 {group_location} 的物理目标与配方不一致"
+                    "写回资产组 {group_location} 的物理修改声明没有覆盖配方"
                 )
             }
             Self::RecipeDoesNotRebuildOriginal {
@@ -731,15 +753,22 @@ impl fmt::Display for StandardWriteBackSnapshotError {
                 formatter,
                 "写回资产组 {group_location} 的投影配方无法逐字重建冻结原文：{target}"
             ),
-            Self::DuplicateTarget { target } => {
-                write!(formatter, "写回快照包含重复物理目标：{target:?}")
+            Self::MutationClaimConflict { resource } => {
+                write!(formatter, "写回快照包含冲突的物理修改声明：{resource:?}")
             }
-            Self::MismatchedTargetSource {
+            Self::MismatchedClaimSource {
                 group_location,
-                target,
+                claim,
             } => write!(
                 formatter,
-                "写回资产组与物理目标不属于同一来源：{group_location} / {target:?}"
+                "写回资产组与物理修改声明不属于同一来源：{group_location} / {claim:?}"
+            ),
+            Self::MismatchedClaimResourceSource {
+                group_location,
+                resource,
+            } => write!(
+                formatter,
+                "写回资产组与物理修改资源不属于同一来源：{group_location} / {resource:?}"
             ),
             Self::InvalidDialogueProjection { group_location } => write!(
                 formatter,
@@ -1212,6 +1241,7 @@ pub(crate) trait RpgMakerWriteBackTextLayouter: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SetTextMutation {
     exact_location: RpgMakerLocation,
+    mutation_claims: MutationClaimSet,
     expected_original: String,
     replacement: String,
 }
@@ -1223,8 +1253,32 @@ impl SetTextMutation {
         expected_original: impl Into<String>,
         replacement: impl Into<String>,
     ) -> Self {
+        let mutation_claim = MutationClaim::for_location(exact_location.clone())
+            .expect("测试 SetText 的普通位置必须能建立 Claim");
+        Self::for_test_with_claim(
+            exact_location,
+            mutation_claim,
+            expected_original,
+            replacement,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_claim(
+        exact_location: RpgMakerLocation,
+        mutation_claim: MutationClaim,
+        expected_original: impl Into<String>,
+        replacement: impl Into<String>,
+    ) -> Self {
+        assert_eq!(
+            mutation_claim.representative_location(),
+            &exact_location,
+            "测试 SetText Claim 必须描述同一位置"
+        );
         Self {
             exact_location,
+            mutation_claims: MutationClaimSet::new(vec![mutation_claim])
+                .expect("单一测试 Claim 不应自冲突"),
             expected_original: expected_original.into(),
             replacement: replacement.into(),
         }
@@ -1233,6 +1287,8 @@ impl SetTextMutation {
     fn from_recipe(recipe: &DirectTextRecipe, replacement: String) -> Self {
         Self {
             exact_location: recipe.target().clone(),
+            mutation_claims: MutationClaimSet::new(vec![recipe.mutation_claim().clone()])
+                .expect("受信直接配方的单一 Claim 不应自冲突"),
             expected_original: recipe.expected_raw().to_owned(),
             replacement,
         }
@@ -1249,20 +1305,46 @@ impl SetTextMutation {
     pub(crate) fn replacement(&self) -> &str {
         &self.replacement
     }
+
+    fn mutation_claims(&self) -> &MutationClaimSet {
+        &self.mutation_claims
+    }
 }
 
 /// 一个 `101 + 401*` 对话块的唯一原子修改。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReplaceDialogueMutation {
     recipe: DialogueWriteRecipe,
+    mutation_claims: MutationClaimSet,
     source_speaker: Option<String>,
     speaker: Option<String>,
     body_lines: Option<Vec<RpgMakerWriteBackLaidOutLine>>,
 }
 
 impl ReplaceDialogueMutation {
+    #[cfg(test)]
     pub(crate) fn new(
         recipe: DialogueWriteRecipe,
+        source_speaker: Option<String>,
+        speaker: Option<String>,
+        body_lines: Option<Vec<RpgMakerWriteBackLaidOutLine>>,
+    ) -> Result<Self, StandardWriteBackMutationPlanError> {
+        let mutation_claims = mutation_claims_for_group(
+            TextGroupKind::EventDialogue,
+            recipe.group_location(),
+            &[TextProjectionRecipe::Dialogue(recipe.clone())],
+        )
+        .map_err(
+            |conflict| StandardWriteBackMutationPlanError::MutationClaimConflict {
+                resource: Box::new(conflict.resource().clone()),
+            },
+        )?;
+        Self::new_with_claims(recipe, mutation_claims, source_speaker, speaker, body_lines)
+    }
+
+    fn new_with_claims(
+        recipe: DialogueWriteRecipe,
+        mutation_claims: MutationClaimSet,
         source_speaker: Option<String>,
         speaker: Option<String>,
         body_lines: Option<Vec<RpgMakerWriteBackLaidOutLine>>,
@@ -1312,6 +1394,7 @@ impl ReplaceDialogueMutation {
         }
         Ok(Self {
             recipe,
+            mutation_claims,
             source_speaker,
             speaker,
             body_lines,
@@ -1338,8 +1421,8 @@ impl ReplaceDialogueMutation {
         self.body_lines.as_deref()
     }
 
-    fn mutation_targets(&self) -> Vec<MutationTarget> {
-        TextProjectionRecipe::Dialogue(self.recipe.clone()).mutation_targets()
+    fn mutation_claims(&self) -> &MutationClaimSet {
+        &self.mutation_claims
     }
 }
 
@@ -1348,14 +1431,44 @@ impl ReplaceDialogueMutation {
 pub(crate) struct ReplaceChoicesMutation {
     group_location: RpgMakerLocation,
     recipes: Vec<DirectTextRecipe>,
+    mutation_claims: MutationClaimSet,
     source_lines: Vec<String>,
     replacement_lines: Vec<String>,
 }
 
 impl ReplaceChoicesMutation {
+    #[cfg(test)]
     pub(crate) fn new(
         group_location: RpgMakerLocation,
         recipes: Vec<DirectTextRecipe>,
+        source_lines: Vec<String>,
+        replacement_lines: Vec<String>,
+    ) -> Result<Self, StandardWriteBackMutationPlanError> {
+        let projections = recipes
+            .iter()
+            .cloned()
+            .map(TextProjectionRecipe::Direct)
+            .collect::<Vec<_>>();
+        let mutation_claims =
+            mutation_claims_for_group(TextGroupKind::EventChoices, &group_location, &projections)
+                .map_err(
+                |conflict| StandardWriteBackMutationPlanError::MutationClaimConflict {
+                    resource: Box::new(conflict.resource().clone()),
+                },
+            )?;
+        Self::new_with_claims(
+            group_location,
+            recipes,
+            mutation_claims,
+            source_lines,
+            replacement_lines,
+        )
+    }
+
+    fn new_with_claims(
+        group_location: RpgMakerLocation,
+        recipes: Vec<DirectTextRecipe>,
+        mutation_claims: MutationClaimSet,
         source_lines: Vec<String>,
         replacement_lines: Vec<String>,
     ) -> Result<Self, StandardWriteBackMutationPlanError> {
@@ -1410,6 +1523,7 @@ impl ReplaceChoicesMutation {
         Ok(Self {
             group_location,
             recipes,
+            mutation_claims,
             source_lines,
             replacement_lines,
         })
@@ -1431,10 +1545,8 @@ impl ReplaceChoicesMutation {
         &self.replacement_lines
     }
 
-    fn mutation_targets(&self) -> impl Iterator<Item = MutationTarget> + '_ {
-        self.recipes
-            .iter()
-            .map(|recipe| MutationTarget::Value(recipe.target().clone()))
+    fn mutation_claims(&self) -> &MutationClaimSet {
+        &self.mutation_claims
     }
 }
 
@@ -1491,9 +1603,11 @@ impl EventBodyMutationSegment {
 pub(crate) struct ReplaceEventBodyMutation {
     group_location: RpgMakerLocation,
     segments: Vec<EventBodyMutationSegment>,
+    mutation_claims: MutationClaimSet,
 }
 
 impl ReplaceEventBodyMutation {
+    #[cfg(test)]
     pub(crate) fn new(
         group_location: RpgMakerLocation,
         segments: Vec<EventBodyMutationSegment>,
@@ -1503,11 +1617,35 @@ impl ReplaceEventBodyMutation {
                 group_location: Box::new(group_location),
             });
         }
+        let covered_values = segments
+            .iter()
+            .map(|segment| segment.exact_location.clone())
+            .collect();
+        let event_claim = MutationClaim::event_block(group_location.clone(), covered_values)
+            .expect("测试滚动文本 Claim 必须由同一来源的 Value 地址组成");
+        let mutation_claims = MutationClaimSet::new(vec![event_claim]).map_err(|conflict| {
+            StandardWriteBackMutationPlanError::MutationClaimConflict {
+                resource: Box::new(conflict.resource().clone()),
+            }
+        })?;
+        Self::new_with_claims(group_location, segments, mutation_claims)
+    }
+
+    fn new_with_claims(
+        group_location: RpgMakerLocation,
+        segments: Vec<EventBodyMutationSegment>,
+        mutation_claims: MutationClaimSet,
+    ) -> Result<Self, StandardWriteBackMutationPlanError> {
+        if segments.is_empty() {
+            return Err(StandardWriteBackMutationPlanError::EmptyEventBody {
+                group_location: Box::new(group_location),
+            });
+        }
         let mut exact_locations = BTreeSet::new();
         for segment in &segments {
             if !exact_locations.insert(segment.exact_location.clone()) {
-                return Err(StandardWriteBackMutationPlanError::DuplicateTarget {
-                    target: Box::new(MutationTarget::Value(segment.exact_location.clone())),
+                return Err(StandardWriteBackMutationPlanError::DuplicateLocation {
+                    exact_location: Box::new(segment.exact_location.clone()),
                 });
             }
             if segment.replacement_lines.is_empty() {
@@ -1519,6 +1657,7 @@ impl ReplaceEventBodyMutation {
         Ok(Self {
             group_location,
             segments,
+            mutation_claims,
         })
     }
 
@@ -1528,6 +1667,10 @@ impl ReplaceEventBodyMutation {
 
     pub(crate) fn segments(&self) -> &[EventBodyMutationSegment] {
         &self.segments
+    }
+
+    fn mutation_claims(&self) -> &MutationClaimSet {
+        &self.mutation_claims
     }
 }
 
@@ -1550,49 +1693,22 @@ impl StandardWriteBackMutationPlan {
     pub(crate) fn new(
         mutations: Vec<StandardWriteBackMutation>,
     ) -> Result<Self, StandardWriteBackMutationPlanError> {
-        let mut targets = BTreeSet::new();
-        let mut event_groups = BTreeSet::new();
+        let mut claim_sets = Vec::<&MutationClaimSet>::new();
         for mutation in &mutations {
-            match mutation {
-                StandardWriteBackMutation::SetText(mutation) => {
-                    insert_plan_target(
-                        &mut targets,
-                        MutationTarget::Value(mutation.exact_location.clone()),
-                    )?;
-                }
-                StandardWriteBackMutation::ReplaceDialogue(mutation) => {
-                    if !event_groups.insert(mutation.group_location().clone()) {
-                        return Err(StandardWriteBackMutationPlanError::DuplicateEventBody {
-                            group_location: Box::new(mutation.group_location().clone()),
-                        });
-                    }
-                    for target in mutation.mutation_targets() {
-                        insert_plan_target(&mut targets, target)?;
-                    }
-                }
-                StandardWriteBackMutation::ReplaceChoices(mutation) => {
-                    for target in mutation.mutation_targets() {
-                        insert_plan_target(&mut targets, target)?;
-                    }
-                }
-                StandardWriteBackMutation::ReplaceEventBody(mutation) => {
-                    if !event_groups.insert(mutation.group_location.clone()) {
-                        return Err(StandardWriteBackMutationPlanError::DuplicateEventBody {
-                            group_location: Box::new(mutation.group_location.clone()),
-                        });
-                    }
-                    insert_plan_target(
-                        &mut targets,
-                        MutationTarget::Value(mutation.group_location.clone()),
-                    )?;
-                    for segment in &mutation.segments {
-                        insert_plan_target(
-                            &mut targets,
-                            MutationTarget::Value(segment.exact_location.clone()),
-                        )?;
-                    }
+            let claims = match mutation {
+                StandardWriteBackMutation::SetText(mutation) => mutation.mutation_claims(),
+                StandardWriteBackMutation::ReplaceDialogue(mutation) => mutation.mutation_claims(),
+                StandardWriteBackMutation::ReplaceChoices(mutation) => mutation.mutation_claims(),
+                StandardWriteBackMutation::ReplaceEventBody(mutation) => mutation.mutation_claims(),
+            };
+            for existing in &claim_sets {
+                if let Some(conflict) = existing.conflict_with(claims) {
+                    return Err(StandardWriteBackMutationPlanError::MutationClaimConflict {
+                        resource: Box::new(conflict.resource().clone()),
+                    });
                 }
             }
+            claim_sets.push(claims);
         }
         Ok(Self { mutations })
     }
@@ -1609,18 +1725,6 @@ impl StandardWriteBackMutationPlan {
     pub(crate) fn into_mutations(self) -> Vec<StandardWriteBackMutation> {
         self.mutations
     }
-}
-
-fn insert_plan_target(
-    targets: &mut BTreeSet<MutationTarget>,
-    target: MutationTarget,
-) -> Result<(), StandardWriteBackMutationPlanError> {
-    if !targets.insert(target.clone()) {
-        return Err(StandardWriteBackMutationPlanError::DuplicateTarget {
-            target: Box::new(target),
-        });
-    }
-    Ok(())
 }
 
 /// Mutation 计划构造时发现的内部冲突。
@@ -1640,11 +1744,11 @@ pub(crate) enum StandardWriteBackMutationPlanError {
         group_location: Box<RpgMakerLocation>,
         message: &'static str,
     },
-    DuplicateTarget {
-        target: Box<MutationTarget>,
+    DuplicateLocation {
+        exact_location: Box<RpgMakerLocation>,
     },
-    DuplicateEventBody {
-        group_location: Box<RpgMakerLocation>,
+    MutationClaimConflict {
+        resource: Box<MutationResource>,
     },
 }
 
@@ -1665,11 +1769,11 @@ impl fmt::Display for StandardWriteBackMutationPlanError {
                 group_location,
                 message,
             } => write!(formatter, "选项修改 {group_location} 无效：{message}"),
-            Self::DuplicateTarget { target } => {
-                write!(formatter, "Mutation 计划重复修改物理目标：{target:?}")
+            Self::DuplicateLocation { exact_location } => {
+                write!(formatter, "Mutation 计划重复修改物理地址：{exact_location}")
             }
-            Self::DuplicateEventBody { group_location } => {
-                write!(formatter, "Mutation 计划重复修改事件正文：{group_location}")
+            Self::MutationClaimConflict { resource } => {
+                write!(formatter, "Mutation 计划的物理修改声明冲突：{resource:?}")
             }
         }
     }
@@ -2000,12 +2104,13 @@ fn plan_standard_write_back_group(
             }
         }
 
-        let (kind, group_location, units, recipes) = group.into_parts();
+        let (kind, group_location, units, recipes, mutation_claims) = group.into_parts();
         match kind {
             TextGroupKind::EventDialogue => plan_dialogue_group(
                 group_location,
                 units,
                 recipes,
+                mutation_claims,
                 profile.dialogue_body(),
                 layouter,
                 &mut outputs,
@@ -2014,13 +2119,18 @@ fn plan_standard_write_back_group(
                 group_location,
                 units,
                 recipes,
+                mutation_claims,
                 profile.scrolling_text(),
                 layouter,
                 &mut outputs,
             ),
-            TextGroupKind::EventChoices => {
-                plan_choices_group(group_location, units, recipes, &mut outputs)
-            }
+            TextGroupKind::EventChoices => plan_choices_group(
+                group_location,
+                units,
+                recipes,
+                mutation_claims,
+                &mut outputs,
+            ),
             _ => plan_scalar_group(
                 kind,
                 group_location,
@@ -2078,6 +2188,7 @@ fn plan_dialogue_group(
     group_location: RpgMakerLocation,
     units: Vec<StandardWriteBackUnit>,
     mut recipes: Vec<TextProjectionRecipe>,
+    mutation_claims: MutationClaimSet,
     max_fullwidth_chars: MaxFullwidthChars,
     layouter: &impl RpgMakerWriteBackTextLayouter,
     outputs: &mut GroupPlanningOutputs<'_>,
@@ -2131,8 +2242,14 @@ fn plan_dialogue_group(
         None
     };
 
-    let mutation = ReplaceDialogueMutation::new(recipe, source_speaker, speaker, body_lines)
-        .expect("受信对话资产必须建立合法原子 Mutation");
+    let mutation = ReplaceDialogueMutation::new_with_claims(
+        recipe,
+        mutation_claims,
+        source_speaker,
+        speaker,
+        body_lines,
+    )
+    .expect("受信对话资产必须建立合法原子 Mutation");
     outputs
         .mutations
         .push(StandardWriteBackMutation::ReplaceDialogue(mutation));
@@ -2142,6 +2259,7 @@ fn plan_scrolling_group(
     group_location: RpgMakerLocation,
     units: Vec<StandardWriteBackUnit>,
     recipes: Vec<TextProjectionRecipe>,
+    mutation_claims: MutationClaimSet,
     max_fullwidth_chars: MaxFullwidthChars,
     layouter: &impl RpgMakerWriteBackTextLayouter,
     outputs: &mut GroupPlanningOutputs<'_>,
@@ -2208,8 +2326,9 @@ fn plan_scrolling_group(
             )
         })
         .collect();
-    let mutation = ReplaceEventBodyMutation::new(group_location, segments)
-        .expect("受信滚动正文应建立合法块级 Mutation");
+    let mutation =
+        ReplaceEventBodyMutation::new_with_claims(group_location, segments, mutation_claims)
+            .expect("受信滚动正文应建立合法块级 Mutation");
     outputs
         .mutations
         .push(StandardWriteBackMutation::ReplaceEventBody(mutation));
@@ -2219,6 +2338,7 @@ fn plan_choices_group(
     group_location: RpgMakerLocation,
     units: Vec<StandardWriteBackUnit>,
     recipes: Vec<TextProjectionRecipe>,
+    mutation_claims: MutationClaimSet,
     outputs: &mut GroupPlanningOutputs<'_>,
 ) {
     let [unit] = units.as_slice() else {
@@ -2233,14 +2353,16 @@ fn plan_choices_group(
         .expect("受信选项原文必须是行序列");
     let recipes = recipes
         .into_iter()
-        .map(|recipe| match recipe {
-            TextProjectionRecipe::Direct(recipe) => recipe,
+        .filter_map(|recipe| match recipe {
+            TextProjectionRecipe::Direct(recipe) => Some(recipe),
             TextProjectionRecipe::Dialogue(_) => unreachable!("受信选项组只包含直接配方"),
+            TextProjectionRecipe::Claim(_) => None,
         })
         .collect();
-    let mutation = ReplaceChoicesMutation::new(
+    let mutation = ReplaceChoicesMutation::new_with_claims(
         group_location,
         recipes,
+        mutation_claims,
         source_lines.to_vec(),
         replacement_lines,
     )
@@ -2533,6 +2655,17 @@ mod tests {
         RpgMakerWriteBackLayoutProfile::new(width, width, width)
     }
 
+    fn recipe_locks(
+        kind: TextGroupKind,
+        group_location: &RpgMakerLocation,
+        recipes: &[TextProjectionRecipe],
+    ) -> Vec<MutationResourceLock> {
+        mutation_claims_for_group(kind, group_location, recipes)
+            .expect("测试配方应形成无冲突 Claim")
+            .locks()
+            .to_vec()
+    }
+
     fn dialogue_snapshot(
         speaker_translation: Option<&str>,
         body_translation: Option<&str>,
@@ -2560,6 +2693,11 @@ mod tests {
         )
         .expect("测试对话配方应合法");
         let projection = TextProjectionRecipe::Dialogue(recipe);
+        let mutation_locks = recipe_locks(
+            TextGroupKind::EventDialogue,
+            &header,
+            std::slice::from_ref(&projection),
+        );
         let group = StandardWriteBackGroup::new(
             TextGroupKind::EventDialogue,
             header,
@@ -2579,8 +2717,8 @@ mod tests {
                 )
                 .expect("测试 Body 应合法"),
             ],
-            vec![projection.clone()],
-            projection.mutation_targets(),
+            vec![projection],
+            mutation_locks,
         )
         .expect("测试对话组应合法");
         StandardWriteBackSnapshot::new(vec![group]).expect("测试快照应合法")
@@ -2771,10 +2909,8 @@ mod tests {
                 .expect("末行配方应合法"),
             ),
         ];
-        let targets = recipes
-            .iter()
-            .flat_map(TextProjectionRecipe::mutation_targets)
-            .collect();
+        let mutation_locks =
+            recipe_locks(TextGroupKind::EventScrollingText, &group_location, &recipes);
         let group = StandardWriteBackGroup::new(
             TextGroupKind::EventScrollingText,
             group_location,
@@ -2795,7 +2931,7 @@ mod tests {
                 .expect("滚动文本单元应合法"),
             ],
             recipes,
-            targets,
+            mutation_locks,
         )
         .expect("包含空白物理行的滚动组应合法");
 
@@ -2821,31 +2957,39 @@ mod tests {
         let group_location = location(20, None);
         let source_lines = vec!["はい".to_owned(), "いいえ".to_owned()];
         let translated_lines = vec!["是".to_owned(), "否".to_owned()];
-        let recipes = [
+        let physical_targets = [
             (location(20, Some(0)), 0),
             (location(20, Some(1)), 1),
             (location(21, Some(1)), 0),
             (location(22, Some(1)), 1),
-        ]
-        .into_iter()
-        .map(|(target, source_line_index)| {
-            TextProjectionRecipe::Direct(
-                DirectTextRecipe::new(
-                    target,
-                    source_lines[source_line_index].clone(),
-                    vec![DirectTextPart::LineSlot {
-                        role: TextUnitRole::Choices,
-                        source_line_index,
-                    }],
+        ];
+        let mut recipes = physical_targets
+            .clone()
+            .into_iter()
+            .map(|(target, source_line_index)| {
+                TextProjectionRecipe::Direct(
+                    DirectTextRecipe::new(
+                        target,
+                        source_lines[source_line_index].clone(),
+                        vec![DirectTextPart::LineSlot {
+                            role: TextUnitRole::Choices,
+                            source_line_index,
+                        }],
+                    )
+                    .expect("选项配方应合法"),
                 )
-                .expect("选项配方应合法"),
-            )
-        })
-        .collect::<Vec<_>>();
-        let targets = recipes
-            .iter()
-            .flat_map(TextProjectionRecipe::mutation_targets)
-            .collect();
+            })
+            .collect::<Vec<_>>();
+        let mut covered_values = physical_targets
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect::<Vec<_>>();
+        covered_values.extend([location(21, None), location(22, None), location(23, None)]);
+        recipes.push(TextProjectionRecipe::Claim(
+            MutationClaim::event_block(group_location.clone(), covered_values)
+                .expect("选项测试 EventBlock Claim 应合法"),
+        ));
+        let mutation_locks = recipe_locks(TextGroupKind::EventChoices, &group_location, &recipes);
         let group = StandardWriteBackGroup::new(
             TextGroupKind::EventChoices,
             group_location,
@@ -2858,7 +3002,7 @@ mod tests {
                 .expect("选项单元应合法"),
             ],
             recipes,
-            targets,
+            mutation_locks,
         )
         .expect("选项组应合法");
 
@@ -2920,6 +3064,11 @@ mod tests {
         )
         .expect("直接配方应合法");
         let projection = TextProjectionRecipe::Direct(recipe);
+        let mutation_locks = recipe_locks(
+            TextGroupKind::EventCommand,
+            &group_location,
+            std::slice::from_ref(&projection),
+        );
         let group = StandardWriteBackGroup::new(
             TextGroupKind::EventCommand,
             group_location,
@@ -2933,8 +3082,8 @@ mod tests {
                 StandardWriteBackUnit::new(right, TextUnitContent::Value("乙".to_owned()), None)
                     .expect("右单元应合法"),
             ],
-            vec![projection.clone()],
-            projection.mutation_targets(),
+            vec![projection],
+            mutation_locks,
         )
         .expect("直接组应合法");
         let planned = plan_standard_write_back(
@@ -2961,6 +3110,12 @@ mod tests {
         )
         .expect("配方应合法");
         let projection = TextProjectionRecipe::Direct(recipe);
+        let wrong_locks = MutationClaimSet::new(vec![
+            MutationClaim::for_location(location(9, Some(0))).expect("测试 Value Claim 应合法"),
+        ])
+        .expect("测试 Claim 应无内部冲突")
+        .locks()
+        .to_vec();
         assert!(matches!(
             StandardWriteBackGroup::new(
                 TextGroupKind::EventCommand,
@@ -2974,9 +3129,9 @@ mod tests {
                     .expect("单元应合法")
                 ],
                 vec![projection.clone()],
-                vec![MutationTarget::Value(location(9, Some(0)))],
+                wrong_locks,
             ),
-            Err(StandardWriteBackSnapshotError::RecipeTargetMismatch { .. })
+            Err(StandardWriteBackSnapshotError::RecipeClaimMismatch { .. })
         ));
 
         let make_group = |field: &str| {
@@ -2990,6 +3145,11 @@ mod tests {
             )
             .expect("配方应合法");
             let projection = TextProjectionRecipe::Direct(direct);
+            let mutation_locks = recipe_locks(
+                TextGroupKind::EventCommand,
+                &group_location,
+                std::slice::from_ref(&projection),
+            );
             StandardWriteBackGroup::new(
                 TextGroupKind::EventCommand,
                 group_location.clone(),
@@ -3001,14 +3161,14 @@ mod tests {
                     )
                     .expect("单元应合法"),
                 ],
-                vec![projection.clone()],
-                projection.mutation_targets(),
+                vec![projection],
+                mutation_locks,
             )
             .expect("单组应合法")
         };
         assert!(matches!(
             StandardWriteBackSnapshot::new(vec![make_group("first"), make_group("second")]),
-            Err(StandardWriteBackSnapshotError::DuplicateTarget { .. })
+            Err(StandardWriteBackSnapshotError::MutationClaimConflict { .. })
         ));
     }
 
@@ -3031,6 +3191,11 @@ mod tests {
             )
             .expect("形状合法但不能还原原文的直接配方应可进入快照边界"),
         );
+        let direct_locks = recipe_locks(
+            TextGroupKind::EventCommand,
+            &direct_group,
+            std::slice::from_ref(&direct),
+        );
         assert!(matches!(
             StandardWriteBackGroup::new(
                 TextGroupKind::EventCommand,
@@ -3044,7 +3209,7 @@ mod tests {
                     .expect("单元应合法")
                 ],
                 vec![direct.clone()],
-                direct.mutation_targets(),
+                direct_locks,
             ),
             Err(StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal { .. })
         ));
@@ -3068,6 +3233,11 @@ mod tests {
             )
             .expect("对话配方形状应合法"),
         );
+        let dialogue_locks = recipe_locks(
+            TextGroupKind::EventDialogue,
+            &dialogue_group,
+            std::slice::from_ref(&dialogue),
+        );
         assert!(matches!(
             StandardWriteBackGroup::new(
                 TextGroupKind::EventDialogue,
@@ -3087,7 +3257,7 @@ mod tests {
                     .expect("Body 单元应合法"),
                 ],
                 vec![dialogue.clone()],
-                dialogue.mutation_targets(),
+                dialogue_locks,
             ),
             Err(StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal { .. })
         ));
@@ -3113,6 +3283,11 @@ mod tests {
             )
             .expect("对话配方形状应合法"),
         );
+        let trailing_locks = recipe_locks(
+            TextGroupKind::EventDialogue,
+            &trailing_group,
+            std::slice::from_ref(&trailing),
+        );
         assert!(matches!(
             StandardWriteBackGroup::new(
                 TextGroupKind::EventDialogue,
@@ -3126,7 +3301,7 @@ mod tests {
                     .expect("Body 单元应合法")
                 ],
                 vec![trailing.clone()],
-                trailing.mutation_targets(),
+                trailing_locks,
             ),
             Err(StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal { .. })
         ));

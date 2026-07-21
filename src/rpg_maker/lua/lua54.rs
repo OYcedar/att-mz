@@ -28,13 +28,14 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 // 标准快照及其数据库存储分类仍由当前资产适配器提供；Lua VM 与宿主协议本身
 // 已位于共享 RPG Maker 边界，不依赖具体引擎的命令编排。
+use crate::fingerprint::{SHA256_FINGERPRINT_BYTES, Sha256Fingerprint};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmResponse, LlmUsage};
 use crate::rpg_maker::extract::store::{
     ExtractedTextGroup, ExtractedTextUnit, LuaSnapshot, SnapshotModelError,
 };
 use crate::rpg_maker::lua::document::{
-    OpenedRpgMakerDocument, RpgMakerDocumentError, RpgMakerTextReference, data_source, map_source,
-    plugin_parameter_source, source_path,
+    OpenedRpgMakerDocument, RpgMakerDocumentError, RpgMakerTextReference, data_file_source,
+    data_source, map_source, plugin_parameter_source, source_path,
 };
 use crate::rpg_maker::lua::json::{
     HostValueBudget, HostValueBudgetExceeded, HostValueBudgetTracker, LosslessJsonValue,
@@ -982,7 +983,37 @@ fn parse_lua_standard_snapshot(
     .into_iter()
     .map(|value| parse_lua_standard_group(value, &mut tracker, 2, budget))
     .collect::<Result<Vec<_>, _>>()?;
+    validate_unique_lua_standard_groups(&groups)?;
     LuaSnapshot::new(groups).map_err(snapshot_model_error)
+}
+
+fn validate_unique_lua_standard_groups(
+    groups: &[ExtractedTextGroup],
+) -> Result<(), TrustedLuaHostCallError> {
+    let mut identities = HashSet::with_capacity(groups.len());
+    for group in groups {
+        if !identities.insert((group.group_location(), group.kind())) {
+            return Err(extract_argument_error(format!(
+                "extract.replace_standard groups 不允许重复的 group.location + kind：{} + {}",
+                group.group_location(),
+                standard_group_kind_name(group.kind())
+            )));
+        }
+    }
+    Ok(())
+}
+
+const fn standard_group_kind_name(kind: TextGroupKind) -> &'static str {
+    match kind {
+        TextGroupKind::DatabaseEntry => "database_entry",
+        TextGroupKind::System => "system",
+        TextGroupKind::Map => "map",
+        TextGroupKind::EventDialogue => "dialogue",
+        TextGroupKind::EventChoices => "choices",
+        TextGroupKind::EventScrollingText => "scrolling_text",
+        TextGroupKind::EventCommand => "event_command",
+        TextGroupKind::PluginParameter => "plugin_parameter",
+    }
 }
 
 fn parse_lua_standard_group(
@@ -1094,8 +1125,13 @@ fn parse_lua_standard_field(
         .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
     validate_standard_text_locations(kind, text.location(), group_location)
         .map_err(|error| extract_argument_error(error.to_string()))?;
-    ExtractedTextUnit::new(name, text.location().clone(), text.original().to_owned())
-        .map_err(snapshot_model_error)
+    ExtractedTextUnit::new_with_claim(
+        name,
+        text.location().clone(),
+        text.mutation_claim().clone(),
+        text.original().to_owned(),
+    )
+    .map_err(snapshot_model_error)
 }
 
 fn parse_lua_rpg_maker_location(
@@ -1186,17 +1222,21 @@ fn build_translation_table(
     language_pair.set("target", calls.target_language())?;
     table.set("language_pair", language_pair)?;
 
-    let native = lua.create_function(move |lua, (kind, original): (Value, Value)| {
-        let result = parse_translation_prepare(kind, original, budget)
-            .and_then(|(kind, original)| calls.prepare_translation(kind, original))
-            .and_then(|prepared| {
-                validate_prepared_translation_budget(prepared.as_ref(), budget)?;
-                Ok(prepared)
-            });
-        host_result_to_lua(lua, result, |lua, prepared| {
-            prepared_translation_to_lua(lua, prepared, budget)
-        })
-    })?;
+    let native = lua.create_function(
+        move |lua, (kind, original, semantic_context): (Value, Value, Value)| {
+            let result = parse_translation_prepare(kind, original, semantic_context, budget)
+                .and_then(|(kind, original, semantic_context)| {
+                    calls.prepare_translation(kind, original, semantic_context)
+                })
+                .and_then(|prepared| {
+                    validate_prepared_translation_budget(prepared.as_ref(), budget)?;
+                    Ok(prepared)
+                });
+            host_result_to_lua(lua, result, |lua, prepared| {
+                prepared_translation_to_lua(lua, prepared, budget)
+            })
+        },
+    )?;
     table.set("prepare", checked_host_function(lua, native)?)?;
     Ok(table)
 }
@@ -1204,8 +1244,9 @@ fn build_translation_table(
 fn parse_translation_prepare(
     kind: Value,
     original: Value,
+    semantic_context: Value,
     budget: HostValueBudget,
-) -> Result<(TextGroupKind, String), TrustedLuaHostCallError> {
+) -> Result<(TextGroupKind, String, String), TrustedLuaHostCallError> {
     let Value::String(kind) = kind else {
         return Err(binding_error(mlua::Error::runtime(format!(
             "translation.prepare kind 必须是字符串，实际为 {}",
@@ -1236,13 +1277,23 @@ fn parse_translation_prepare(
     };
     let original =
         lua_string_to_text(&original, "translation.prepare original").map_err(binding_error)?;
+    let Value::String(semantic_context) = semantic_context else {
+        return Err(binding_error(mlua::Error::runtime(format!(
+            "translation.prepare semantic_context 必须是字符串，实际为 {}",
+            semantic_context.type_name()
+        ))));
+    };
+    let semantic_context =
+        lua_string_to_text(&semantic_context, "translation.prepare semantic_context")
+            .map_err(binding_error)?;
     let mut tracker = HostValueBudgetTracker::new(budget);
     tracker
         .container(1)
         .and_then(|()| tracker.string(2, &kind_name))
         .and_then(|()| tracker.string(2, &original))
+        .and_then(|()| tracker.string(2, &semantic_context))
         .map_err(|error| host_value_budget_error("Translate prepare 参数", error))?;
-    Ok((kind, original))
+    Ok((kind, original, semantic_context))
 }
 
 fn prepared_translation_to_lua(
@@ -1262,6 +1313,23 @@ fn prepared_translation_to_lua(
     }
     table.set("terms", terms)?;
 
+    let current_prepared = Arc::clone(&prepared);
+    let current = lua.create_function(
+        move |lua, (_self, translation, state): (Value, Value, Value)| {
+            let result = parse_prepared_translation_text(
+                translation,
+                budget,
+                "PreparedText:is_current translation",
+            )
+            .and_then(|translation| {
+                parse_translation_state(state).map(|state| (translation, state))
+            })
+            .and_then(|(translation, state)| current_prepared.is_current(translation, state));
+            host_result_to_lua(lua, result, |_, current| Ok(Value::Boolean(current)))
+        },
+    )?;
+    table.set("is_current", checked_host_function(lua, current)?)?;
+
     let native_prepared = Arc::clone(&prepared);
     let native = lua.create_function(move |lua, (_self, candidate): (Value, Value)| {
         let result = parse_translation_candidate(candidate, budget)
@@ -1280,16 +1348,69 @@ fn parse_translation_candidate(
     candidate: Value,
     budget: HostValueBudget,
 ) -> Result<String, TrustedLuaHostCallError> {
-    let Value::String(candidate) = candidate else {
+    parse_prepared_translation_text(candidate, budget, "PreparedText:accept candidate")
+}
+
+fn parse_prepared_translation_text(
+    value: Value,
+    budget: HostValueBudget,
+    role: &str,
+) -> Result<String, TrustedLuaHostCallError> {
+    let Value::String(value) = value else {
         return Err(binding_error(mlua::Error::runtime(format!(
-            "PreparedText:accept candidate 必须是字符串，实际为 {}",
-            candidate.type_name()
+            "{role} 必须是字符串，实际为 {}",
+            value.type_name()
         ))));
     };
-    let candidate =
-        lua_string_to_text(&candidate, "PreparedText:accept candidate").map_err(binding_error)?;
-    validate_host_string(&candidate, budget, "PreparedText:accept candidate")?;
-    Ok(candidate)
+    let value = lua_string_to_text(&value, role).map_err(binding_error)?;
+    validate_host_string(&value, budget, role)?;
+    Ok(value)
+}
+
+fn parse_translation_state(value: Value) -> Result<Sha256Fingerprint, TrustedLuaHostCallError> {
+    let Value::String(value) = value else {
+        return Err(invalid_translation_state(format!(
+            "PreparedText:is_current state 必须是 64 位小写十六进制字符串，实际为 {}",
+            value.type_name()
+        )));
+    };
+    let bytes = value.as_bytes();
+    if bytes.len() != SHA256_FINGERPRINT_BYTES * 2
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(invalid_translation_state(
+            "PreparedText:is_current state 必须是 64 位小写十六进制 SHA-256 文本",
+        ));
+    }
+    let mut decoded = [0_u8; SHA256_FINGERPRINT_BYTES];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+    }
+    Ok(Sha256Fingerprint::from_bytes(decoded))
+}
+
+fn hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        _ => unreachable!("state 格式已验证为小写十六进制"),
+    }
+}
+
+fn invalid_translation_state(message: impl Into<String>) -> TrustedLuaHostCallError {
+    TrustedLuaHostCallError::new("translation", "invalid_state", message, None, None)
+}
+
+fn translation_state_text(state: Sha256Fingerprint) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(SHA256_FINGERPRINT_BYTES * 2);
+    for byte in state.as_bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn prepared_acceptance_to_lua(
@@ -1298,9 +1419,10 @@ fn prepared_acceptance_to_lua(
 ) -> mlua::Result<Value> {
     let table = lua.create_table()?;
     match acceptance {
-        TrustedLuaPreparedTranslationAcceptance::Accepted { translation } => {
+        TrustedLuaPreparedTranslationAcceptance::Accepted { translation, state } => {
             table.set("accepted", true)?;
             table.set("translation", translation)?;
+            table.set("state", translation_state_text(state))?;
         }
         TrustedLuaPreparedTranslationAcceptance::Rejected { reason } => {
             table.set("accepted", false)?;
@@ -1338,8 +1460,9 @@ fn validate_prepared_acceptance_budget(
     let result = tracker.container(1).and_then(|()| {
         tracker.scalar(2)?;
         match acceptance {
-            TrustedLuaPreparedTranslationAcceptance::Accepted { translation } => {
-                tracker.string(2, translation)
+            TrustedLuaPreparedTranslationAcceptance::Accepted { translation, state } => {
+                tracker.string(2, translation)?;
+                tracker.string(2, &translation_state_text(*state))
             }
             TrustedLuaPreparedTranslationAcceptance::Rejected { reason } => {
                 tracker.string(2, reason)
@@ -2383,6 +2506,21 @@ fn build_rpg_maker_table(
         })?,
     )?;
     native.set(
+        "data_file",
+        lua.create_function(move |lua, file_name: Value| {
+            let result = parse_rpg_maker_string(file_name, "RPG Maker DataFile 文件名")
+                .and_then(|file_name| {
+                    validate_host_string(&file_name, budget, "RPG Maker DataFile 文件名")?;
+                    Ok(file_name)
+                })
+                .and_then(|file_name| data_file_source(&file_name).map_err(rpg_maker_host_error));
+            host_result_to_lua(lua, result, |lua, source| {
+                lua.create_userdata(LuaRpgMakerSource(source))
+                    .map(Value::UserData)
+            })
+        })?,
+    )?;
+    native.set(
         "map",
         lua.create_function(|lua, map_id: Value| {
             let result = parse_rpg_maker_integer(map_id, "RPG Maker map ID")
@@ -2450,7 +2588,11 @@ fn build_rpg_maker_table(
             })
         })?,
     )?;
-    let table = checked_function_table(lua, native, &["data", "map", "plugin_parameter", "open"])?;
+    let table = checked_function_table(
+        lua,
+        native,
+        &["data", "data_file", "map", "plugin_parameter", "open"],
+    )?;
     table.set("DECODE_JSON", lua.create_userdata(LuaDecodeJsonString)?)?;
     Ok(table)
 }
@@ -2658,6 +2800,7 @@ fn validate_rpg_maker_plugin_source_budget(
 fn build_project_table(lua: &Lua, project: &LuaProjectContext) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("name", project.name())?;
+    table.set("engine", project.engine().storage_name())?;
     table.set("source_root", strict_path(project.source_root())?)?;
     table.set("database_path", strict_path(project.database_path())?)?;
     table.set("source_language", project.source_language().as_str())?;
@@ -3612,15 +3755,24 @@ mod tests {
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::lua::runtime::{
         TrustedLuaBindingFinalization, TrustedLuaBindingFinalizer, TrustedLuaExtractIntent,
-        TrustedLuaPreparedTranslationStatus, TrustedLuaRuntimeBindings, TrustedLuaTranslationTerm,
+        TrustedLuaPreparedTranslationStatus, TrustedLuaRuntimeBindings,
+        TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
     };
     use crate::rpg_maker::project::OpenedProject;
+    use crate::runtime::sqlite::{
+        RusqliteInteractiveSessionFinalizer, RusqliteInteractiveSessionOperations, RusqliteStorage,
+        RusqliteStorageConfiguration, SqliteJournalMode, SqliteSynchronous,
+    };
+    use crate::storage::sqlite_session::{
+        SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
+        SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
+    };
 
     #[derive(Default)]
     struct TestObservations {
         executed_parameters: Vec<SqliteValue>,
         messages: Vec<ChatMessage>,
-        prepared: Vec<(TextGroupKind, String)>,
+        prepared: Vec<(TextGroupKind, String, String)>,
         extract_intents: Vec<TrustedLuaExtractIntent>,
         output_operations: Vec<String>,
         output_writes: Vec<(String, Vec<u8>)>,
@@ -3807,12 +3959,13 @@ mod tests {
             &self,
             kind: TextGroupKind,
             original: String,
+            semantic_context: String,
         ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
             self.observations
                 .lock()
                 .expect("测试记录锁不应中毒")
                 .prepared
-                .push((kind, original.clone()));
+                .push((kind, original.clone(), semantic_context));
             if original == "__prepare_error__" {
                 return Err(TrustedLuaHostCallError::new(
                     "translation",
@@ -3887,6 +4040,15 @@ mod tests {
             &self.terms
         }
 
+        fn is_current(
+            &self,
+            translation: String,
+            state: Sha256Fingerprint,
+        ) -> Result<bool, TrustedLuaHostCallError> {
+            Ok(translation == r"勇者\C[2]"
+                && state == Sha256Fingerprint::from_bytes([0xab; SHA256_FINGERPRINT_BYTES]))
+        }
+
         fn accept(
             &self,
             candidate: String,
@@ -3902,9 +4064,10 @@ mod tests {
                     None,
                     None,
                 )),
-                _ => Ok(TrustedLuaPreparedTranslationAcceptance::accepted(format!(
-                    "{candidate}\\C[2]"
-                ))),
+                _ => Ok(TrustedLuaPreparedTranslationAcceptance::accepted(
+                    format!("{candidate}\\C[2]"),
+                    Sha256Fingerprint::from_bytes([0xab; SHA256_FINGERPRINT_BYTES]),
+                )),
             }
         }
     }
@@ -4167,6 +4330,7 @@ mod tests {
         );
         LuaProjectContext::for_frozen_source(
             project.name().as_str(),
+            project.layout().rpg_maker_layout().engine(),
             project.source_root().to_path_buf(),
             project.database_path().to_path_buf(),
             project.language_pair().clone(),
@@ -4383,7 +4547,10 @@ mod tests {
             budget,
         ));
         assert_host_budget_error(validate_prepared_acceptance_budget(
-            &TrustedLuaPreparedTranslationAcceptance::accepted("123456789"),
+            &TrustedLuaPreparedTranslationAcceptance::accepted(
+                "123456789",
+                Sha256Fingerprint::from_bytes([0x33; SHA256_FINGERPRINT_BYTES]),
+            ),
             budget,
         ));
     }
@@ -4430,7 +4597,8 @@ ctx.extract.replace_standard({
     kind = "database_entry",
     location = items:location({1}),
     fields = {
-      { name = "name", text = items:text({1, "name"}) },
+      { name = "zeta", text = items:text({1, "name"}) },
+      { name = "alpha", text = items:text({1, "note"}) },
     },
   },
 })
@@ -4449,16 +4617,69 @@ ctx.extract.replace_standard({
             assert_eq!(snapshot.groups().len(), 1);
             let group = &snapshot.groups()[0];
             assert_eq!(group.kind(), TextGroupKind::DatabaseEntry);
+            assert_eq!(group.units().len(), 2);
             let unit = &group.units()[0];
             assert!(matches!(
                 unit.role(),
-                crate::rpg_maker::model::TextUnitRole::Scalar(key) if key.as_str() == "name"
+                crate::rpg_maker::model::TextUnitRole::Scalar(key) if key.as_str() == "zeta"
             ));
             assert_eq!(
                 unit.source_content(),
                 &crate::rpg_maker::model::TextUnitContent::Value("药水".to_owned())
             );
+            assert!(matches!(
+                group.units()[1].role(),
+                crate::rpg_maker::model::TextUnitRole::Scalar(key) if key.as_str() == "alpha"
+            ));
+            assert_eq!(
+                group.units()[1].source_content(),
+                &crate::rpg_maker::model::TextUnitContent::Value("<Help:恢复 HP>".to_owned())
+            );
         }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extract_replace_standard_rejects_duplicate_group_location_and_kind() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let observations = Arc::new(Mutex::new(TestObservations::default()));
+        let error = run_extract_program(
+            &runtime,
+            Arc::clone(&observations),
+            r#"
+local items = ctx.rpg_maker.open(ctx.rpg_maker.data("Items.json"))
+local location = items:location({1})
+ctx.extract.replace_standard({
+  {
+    kind = "database_entry",
+    location = location,
+    fields = {{ name = "name", text = items:text({1, "name"}) }},
+  },
+  {
+    kind = "database_entry",
+    location = location,
+    fields = {{ name = "note", text = items:text({1, "note"}) }},
+  },
+})
+"#,
+        )
+        .await
+        .expect_err("Lua 边界不得把重复 group.location + kind 静默合并");
+
+        let TrustedLuaRuntimeExecutionError::Binding(binding) = &error else {
+            panic!("重复组必须映射成普通 Host 参数错误，实际为 {error}")
+        };
+        assert_eq!(binding.domain(), "extract");
+        assert_eq!(binding.kind(), "invalid_standard_snapshot");
+        assert!(binding.to_string().contains("group.location + kind"));
+        assert!(
+            observations
+                .lock()
+                .expect("测试观察锁不应中毒")
+                .extract_intents
+                .is_empty(),
+            "无效快照不得声明 Replace 意图"
+        );
         runtime.shutdown().await.unwrap();
     }
 
@@ -4602,6 +4823,7 @@ ctx.extract.replace_standard({{
         let script = r#"
 assert(ctx.phase == "translate")
 assert(ctx.project.name == "demo")
+assert(ctx.project.engine == "mz")
 assert(ctx.project.source_root == [[C:\projects\demo\source]])
 assert(ctx.project.database_path == [[C:\projects\demo\project.db]])
 assert(ctx.project.source_language == "ja")
@@ -4623,7 +4845,7 @@ local kinds = {
 }
 local prepared
 for index, kind in ipairs(kinds) do
-  local current = ctx.translation.prepare(kind, "kind:" .. kind)
+  local current = ctx.translation.prepare(kind, "kind:" .. kind, "context:" .. kind)
   assert(current.status == "active")
   if index == 1 then prepared = current end
 end
@@ -4634,18 +4856,19 @@ assert(prepared.terms[1].term == "勇者")
 assert(prepared.terms[1].translation == "Hero")
 assert(prepared.terms[2].term == "魔王")
 assert(prepared.terms[2].translation == "Demon King")
-local non_source = ctx.translation.prepare("map", "__non_source__")
+local non_source = ctx.translation.prepare("map", "__non_source__", "")
 assert(non_source.status == "non_source_language")
 assert(non_source.model_text == "")
 assert(#non_source.terms == 0)
-local fully_protected = ctx.translation.prepare("map", "__fully_protected__")
+local fully_protected = ctx.translation.prepare("map", "__fully_protected__", "")
 assert(fully_protected.status == "fully_protected")
 assert(fully_protected.model_text == "")
 assert(#fully_protected.terms == 0)
 local prepare_ok, prepare_error = pcall(
   ctx.translation.prepare,
   "map",
-  "__prepare_error__"
+  "__prepare_error__",
+  ""
 )
 assert(not prepare_ok)
 assert(prepare_error.domain == "translation")
@@ -4653,6 +4876,13 @@ assert(prepare_error.kind == "prepare_failed")
 local accepted = prepared:accept("勇者")
 assert(accepted.accepted == true)
 assert(accepted.translation == [=[勇者\C[2]]=])
+assert(type(accepted.state) == "string" and #accepted.state == 64)
+assert(accepted.state:match("^[0-9a-f]+$") ~= nil)
+assert(prepared:is_current(accepted.translation, accepted.state))
+assert(not prepared:is_current("其他译文", accepted.state))
+local state_ok, state_error = pcall(prepared.is_current, prepared, accepted.translation, string.upper(accepted.state))
+assert(not state_ok)
+assert(state_error.domain == "translation" and state_error.kind == "invalid_state")
 local rejected = prepared:accept("bad")
 assert(rejected.accepted == false)
 assert(rejected.reason == "source_language_residual")
@@ -4725,24 +4955,59 @@ ctx.db.commit()
                 vec![
                     (
                         TextGroupKind::DatabaseEntry,
-                        "kind:database_entry".to_owned()
+                        "kind:database_entry".to_owned(),
+                        "context:database_entry".to_owned(),
                     ),
-                    (TextGroupKind::System, "kind:system".to_owned()),
-                    (TextGroupKind::Map, "kind:map".to_owned()),
-                    (TextGroupKind::EventDialogue, "kind:dialogue".to_owned()),
-                    (TextGroupKind::EventChoices, "kind:choices".to_owned()),
+                    (
+                        TextGroupKind::System,
+                        "kind:system".to_owned(),
+                        "context:system".to_owned(),
+                    ),
+                    (
+                        TextGroupKind::Map,
+                        "kind:map".to_owned(),
+                        "context:map".to_owned(),
+                    ),
+                    (
+                        TextGroupKind::EventDialogue,
+                        "kind:dialogue".to_owned(),
+                        "context:dialogue".to_owned(),
+                    ),
+                    (
+                        TextGroupKind::EventChoices,
+                        "kind:choices".to_owned(),
+                        "context:choices".to_owned(),
+                    ),
                     (
                         TextGroupKind::EventScrollingText,
-                        "kind:scrolling_text".to_owned()
+                        "kind:scrolling_text".to_owned(),
+                        "context:scrolling_text".to_owned(),
                     ),
-                    (TextGroupKind::EventCommand, "kind:event_command".to_owned()),
+                    (
+                        TextGroupKind::EventCommand,
+                        "kind:event_command".to_owned(),
+                        "context:event_command".to_owned(),
+                    ),
                     (
                         TextGroupKind::PluginParameter,
-                        "kind:plugin_parameter".to_owned()
+                        "kind:plugin_parameter".to_owned(),
+                        "context:plugin_parameter".to_owned(),
                     ),
-                    (TextGroupKind::Map, "__non_source__".to_owned()),
-                    (TextGroupKind::Map, "__fully_protected__".to_owned()),
-                    (TextGroupKind::Map, "__prepare_error__".to_owned()),
+                    (
+                        TextGroupKind::Map,
+                        "__non_source__".to_owned(),
+                        String::new()
+                    ),
+                    (
+                        TextGroupKind::Map,
+                        "__fully_protected__".to_owned(),
+                        String::new(),
+                    ),
+                    (
+                        TextGroupKind::Map,
+                        "__prepare_error__".to_owned(),
+                        String::new(),
+                    ),
                 ]
             );
             let messages = &observation_guard.messages;
@@ -4937,6 +5202,10 @@ end
 local item_source = ctx.rpg_maker.data("Items.json")
 assert(type(item_source) == "userdata")
 assert(tostring(item_source) == "data/Items.json")
+assert(tostring(ctx.rpg_maker.data_file("Items.json")) == "data/Items.json")
+assert(tostring(ctx.rpg_maker.data_file("Map001.json")) == "data/Map001.json")
+assert(tostring(ctx.rpg_maker.data_file("Map000.json")) == "data/Map000.json")
+assert(tostring(ctx.rpg_maker.data_file("Custom.json")) == "data/Custom.json")
 local items = ctx.rpg_maker.open(item_source)
 assert(type(items) == "userdata")
 local value = items:value({1, "nested", ctx.rpg_maker.DECODE_JSON, 0, "Title"})
@@ -4964,6 +5233,8 @@ assert(plugin_text.original == "插件任务")
 assert(tostring(plugin_text.location) == "plugins.js[Quest].Entries<json>[0].Title")
 
 local ok, error = pcall(ctx.rpg_maker.data, "Custom.json")
+assert(not ok and error.domain == "rpg_maker" and error.kind == "invalid_source")
+ok, error = pcall(ctx.rpg_maker.data_file, "../Custom.json")
 assert(not ok and error.domain == "rpg_maker" and error.kind == "invalid_source")
 ok, error = pcall(ctx.rpg_maker.map, 0)
 assert(not ok and error.domain == "rpg_maker" and error.kind == "invalid_source")
@@ -5083,7 +5354,12 @@ assert(not ok)
 assert(error.domain == "binding")
 assert(error.kind == "invalid_value")
 
-local prepared = ctx.translation.prepare("map", "text")
+ok, error = pcall(ctx.translation.prepare, "map", "text")
+assert(not ok)
+assert(error.domain == "binding")
+assert(error.kind == "invalid_value")
+
+local prepared = ctx.translation.prepare("map", "text", "")
 ok, error = pcall(prepared.accept, prepared, 42)
 assert(not ok)
 assert(error.domain == "binding")
@@ -5221,6 +5497,7 @@ assert(error.kind == "invalid_value")
             panic_on_project: false,
             project: LuaProjectContext::for_write_back_candidate(
                 opened.name().as_str(),
+                opened.layout().rpg_maker_layout().engine(),
                 opened.source_root().to_path_buf(),
                 opened.database_path().to_path_buf(),
                 opened.language_pair().clone(),
@@ -5315,6 +5592,7 @@ assert(error.kind == "invalid_value")
             panic_on_project: false,
             project: LuaProjectContext::for_write_back_candidate(
                 opened.name().as_str(),
+                opened.layout().rpg_maker_layout().engine(),
                 opened.source_root().to_path_buf(),
                 opened.database_path().to_path_buf(),
                 opened.language_pair().clone(),
@@ -5672,5 +5950,876 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
         ));
         finalization.unwrap();
         assert_eq!(*finalizations.lock().unwrap(), [()]);
+    }
+
+    #[derive(Default)]
+    struct DocumentedExampleObservations {
+        extract_intents: Vec<TrustedLuaExtractIntent>,
+        llm_requests: usize,
+    }
+
+    struct DocumentedExampleCalls {
+        project: LuaProjectContext,
+        operations: Arc<RusqliteInteractiveSessionOperations>,
+        sources: Arc<HashMap<String, Vec<u8>>>,
+        outputs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        observations: Arc<Mutex<DocumentedExampleObservations>>,
+        semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+    }
+
+    impl TrustedLuaCommonHostCalls for DocumentedExampleCalls {
+        fn project(&self) -> &LuaProjectContext {
+            &self.project
+        }
+
+        fn read_source(
+            &self,
+            path: LuaSourcePath,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Vec<u8>, TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let sources = Arc::clone(&self.sources);
+            Box::pin(async move {
+                sources.get(path.as_str()).cloned().ok_or_else(|| {
+                    TrustedLuaHostCallError::new(
+                        "filesystem",
+                        "not_found",
+                        format!("文档示例来源不存在：{}", path.as_str()),
+                        None,
+                        None,
+                    )
+                })
+            })
+        }
+
+        fn list_source(
+            &self,
+            path: LuaSourcePath,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Vec<String>, TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let sources = Arc::clone(&self.sources);
+            Box::pin(async move {
+                let prefix = format!("{}/", path.as_str());
+                let mut entries = sources
+                    .keys()
+                    .filter_map(|candidate| {
+                        candidate
+                            .strip_prefix(&prefix)
+                            .filter(|relative| !relative.contains('/'))
+                            .map(|_| candidate.clone())
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort();
+                Ok(entries)
+            })
+        }
+
+        fn query(
+            &self,
+            query: SqliteQuery,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<Vec<SqliteRow>, TrustedLuaHostCallError>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let operations = Arc::clone(&self.operations);
+            Box::pin(async move {
+                operations
+                    .query(query)
+                    .await
+                    .map_err(documented_example_database_error)
+            })
+        }
+
+        fn execute(
+            &self,
+            command: SqliteCommand,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<u64, TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let operations = Arc::clone(&self.operations);
+            Box::pin(async move {
+                operations
+                    .execute(command)
+                    .await
+                    .map_err(documented_example_database_error)
+            })
+        }
+
+        fn begin(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let operations = Arc::clone(&self.operations);
+            Box::pin(async move {
+                operations
+                    .begin()
+                    .await
+                    .map_err(documented_example_database_error)
+            })
+        }
+
+        fn commit(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let operations = Arc::clone(&self.operations);
+            Box::pin(async move {
+                operations
+                    .commit()
+                    .await
+                    .map_err(documented_example_database_error)
+            })
+        }
+
+        fn rollback(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let operations = Arc::clone(&self.operations);
+            Box::pin(async move {
+                operations
+                    .rollback()
+                    .await
+                    .map_err(documented_example_database_error)
+            })
+        }
+    }
+
+    fn documented_example_database_error<E>(
+        error: SqliteInteractiveSessionError<E>,
+    ) -> TrustedLuaHostCallError
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        let kind = match &error {
+            SqliteInteractiveSessionError::Closed => "closed",
+            SqliteInteractiveSessionError::Indeterminate => "indeterminate",
+            SqliteInteractiveSessionError::TransactionAlreadyActive => "transaction_already_active",
+            SqliteInteractiveSessionError::NoActiveTransaction => "no_active_transaction",
+            SqliteInteractiveSessionError::OperationFailed(_) => "operation_failed",
+            SqliteInteractiveSessionError::OutcomeUnknown(_) => "outcome_unknown",
+        };
+        let message = error.to_string();
+        TrustedLuaHostCallError::new("sqlite", kind, message, None, Some(Arc::new(error)))
+    }
+
+    impl TrustedLuaExtractHostCalls for DocumentedExampleCalls {
+        fn replace_standard(&self, snapshot: LuaSnapshot) -> Result<(), TrustedLuaHostCallError> {
+            self.observations
+                .lock()
+                .expect("文档示例观察锁不应中毒")
+                .extract_intents
+                .push(TrustedLuaExtractIntent::Replace(snapshot));
+            Ok(())
+        }
+
+        fn clear_standard(&self) -> Result<(), TrustedLuaHostCallError> {
+            self.observations
+                .lock()
+                .expect("文档示例观察锁不应中毒")
+                .extract_intents
+                .push(TrustedLuaExtractIntent::Deactivate);
+            Ok(())
+        }
+    }
+
+    impl TrustedLuaTranslateHostCalls for DocumentedExampleCalls {
+        fn system_prompt(&self) -> &str {
+            self.semantics.system_prompt()
+        }
+
+        fn source_language(&self) -> &str {
+            self.semantics.source_language()
+        }
+
+        fn target_language(&self) -> &str {
+            self.semantics.target_language()
+        }
+
+        fn prepare_translation(
+            &self,
+            kind: TextGroupKind,
+            original: String,
+            semantic_context: String,
+        ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
+            self.semantics
+                .prepare_translation(kind, original, semantic_context)
+        }
+
+        fn request_llm(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<LlmResponse, TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let observations = Arc::clone(&self.observations);
+            Box::pin(async move {
+                observations
+                    .lock()
+                    .expect("文档示例观察锁不应中毒")
+                    .llm_requests += 1;
+                Ok(LlmResponse::new(
+                    "星港",
+                    crate::llm::LlmFinishReason::Stop,
+                    Some("documented-request".to_owned()),
+                    Some("documented-response".to_owned()),
+                    Some(LlmUsage::new(4, 2, 6)),
+                ))
+            })
+        }
+    }
+
+    impl TrustedLuaWriteBackHostCalls for DocumentedExampleCalls {
+        fn read_output(
+            &self,
+            path: ScopedDirectoryPath,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Vec<u8>, TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let outputs = Arc::clone(&self.outputs);
+            let path = documented_example_output_path(&path);
+            Box::pin(async move {
+                outputs
+                    .lock()
+                    .expect("文档示例候选锁不应中毒")
+                    .get(&path)
+                    .cloned()
+                    .ok_or_else(|| {
+                        TrustedLuaHostCallError::new(
+                            "output",
+                            "not_found",
+                            format!("文档示例候选不存在：{path}"),
+                            None,
+                            None,
+                        )
+                    })
+            })
+        }
+
+        fn list_output(
+            &self,
+            _path: ScopedDirectoryPath,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<Vec<TrustedLuaOutputEntry>, TrustedLuaHostCallError>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn create_output_directory(
+            &self,
+            _path: ScopedDirectoryPath,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn write_output(
+            &self,
+            path: ScopedDirectoryPath,
+            bytes: Vec<u8>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let outputs = Arc::clone(&self.outputs);
+            let path = documented_example_output_path(&path);
+            Box::pin(async move {
+                outputs
+                    .lock()
+                    .expect("文档示例候选锁不应中毒")
+                    .insert(path, bytes);
+                Ok(())
+            })
+        }
+
+        fn remove_output(
+            &self,
+            path: ScopedDirectoryPath,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let outputs = Arc::clone(&self.outputs);
+            let path = documented_example_output_path(&path);
+            Box::pin(async move {
+                outputs
+                    .lock()
+                    .expect("文档示例候选锁不应中毒")
+                    .remove(&path);
+                Ok(())
+            })
+        }
+
+        fn layout(
+            &self,
+            _region: TrustedLuaWriteBackLayoutRegion,
+            pairs: Vec<TrustedLuaWriteBackLayoutPair>,
+        ) -> Result<TrustedLuaWriteBackLayoutResult, TrustedLuaHostCallError> {
+            Ok(TrustedLuaWriteBackLayoutResult::new(
+                crate::rpg_maker::lua::runtime::TrustedLuaWriteBackLayoutStatus::Applied,
+                pairs
+                    .iter()
+                    .map(|pair| pair.translation().unwrap_or(pair.original()).to_owned())
+                    .collect(),
+                0,
+                0,
+            ))
+        }
+    }
+
+    fn documented_example_output_path(path: &ScopedDirectoryPath) -> String {
+        path.as_path().to_string_lossy().replace('\\', "/")
+    }
+
+    struct DocumentedExampleSessionFinalizer {
+        finalizer: RusqliteInteractiveSessionFinalizer,
+    }
+
+    impl TrustedLuaBindingFinalizer for DocumentedExampleSessionFinalizer {
+        fn finalize(
+            self: Box<Self>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            TrustedLuaBindingFinalization,
+                            TrustedLuaBindingFinalizationError,
+                        >,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            let Self { finalizer } = *self;
+            Box::pin(async move {
+                finalizer
+                    .finalize()
+                    .await
+                    .map(|finalization| {
+                        TrustedLuaBindingFinalization::new(finalization.had_unclosed_transaction())
+                    })
+                    .map_err(|error| {
+                        let message = error.to_string();
+                        TrustedLuaBindingFinalizationError::new(message, Some(Arc::new(error)))
+                    })
+            })
+        }
+    }
+
+    fn documented_example_sqlite_storage() -> RusqliteStorage {
+        let nonzero = |value| NonZeroUsize::new(value).expect("测试资源配置必须非零");
+        let configuration = RusqliteStorageConfiguration::new(
+            nonzero(1),
+            nonzero(8),
+            nonzero(4),
+            nonzero(1024 * 1024),
+            nonzero(256 * 1024),
+            nonzero(256 * 1024),
+            nonzero(1_000),
+            nonzero(4 * 1024 * 1024),
+            Duration::from_secs(2),
+            SqliteJournalMode::Delete,
+            SqliteSynchronous::Full,
+        )
+        .expect("文档示例 SQLite 配置应合法");
+        RusqliteStorage::start(configuration).expect("文档示例 SQLite 根应启动")
+    }
+
+    fn documented_example_semantics(revision: &str) -> Arc<dyn TrustedLuaTranslationSemantics> {
+        let placeholder_service =
+            crate::rpg_maker::translate::placeholder::Pcre2PlaceholderService::new()
+                .expect("文档示例内建 Placeholder 应编译");
+        let custom_placeholders = placeholder_service
+            .compile_custom(Vec::new())
+            .expect("文档示例空 Placeholder 集应编译");
+        let source_language = Arc::new(crate::language::JapaneseLanguageModule::new(
+            crate::language::JapaneseResidualPolicy::new(
+                NonZeroUsize::new(1).expect("常量非零"),
+                Vec::new(),
+            )
+            .expect("文档示例日文残留策略应有效"),
+            None,
+        ));
+        let mut fingerprint = crate::fingerprint::Sha256FramedHasher::new(
+            b"att.rpg-maker.documented-lua-example-semantics",
+        );
+        fingerprint.frame(1, revision.as_bytes());
+        Arc::new(
+            crate::rpg_maker::translate::semantics::ResolvedTranslationSemantics::new(
+                crate::rpg_maker::RpgMakerEngine::Mz,
+                "把日文翻译为简体中文".to_owned(),
+                crate::language::LanguagePair::new(
+                    crate::language::LanguageId::parse("ja").expect("源语言应合法"),
+                    crate::language::LanguageId::parse("zh-Hans").expect("目标语言应合法"),
+                ),
+                Arc::new(
+                    crate::rpg_maker::translate::planning_resource::CompiledTerminology::empty(),
+                ),
+                placeholder_service,
+                custom_placeholders,
+                source_language,
+                fingerprint.finish(),
+            ),
+        )
+    }
+
+    fn documented_example_sources() -> Arc<HashMap<String, Vec<u8>>> {
+        Arc::new(HashMap::from([
+            (
+                "data/QuestEntries.json".to_owned(),
+                r#"[{"id":"arrival","title":"星港へ","description":"港へ向かう。"}]"#
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                "data/QuestGraph.json".to_owned(),
+                r#"[{"id":"arrival","actorId":1,"mapId":1,"title":"星港へ"}]"#
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                "data/QuestIndex.json".to_owned(),
+                r#"{"arrival":{"label":"星港へ"}}"#.as_bytes().to_vec(),
+            ),
+            (
+                "data/Actors.json".to_owned(),
+                r#"[null,{"name":"航海士"}]"#.as_bytes().to_vec(),
+            ),
+            (
+                "data/Map001.json".to_owned(),
+                r#"{"displayName":"第一星港"}"#.as_bytes().to_vec(),
+            ),
+        ]))
+    }
+
+    fn documented_example_source(name: &str) -> &'static str {
+        match name {
+            "lua-standard-data-file.lua" => {
+                include_str!("../../../docs/rpg-maker/examples/lua-standard-data-file.lua")
+            }
+            "lua-translate-state.lua" => {
+                include_str!("../../../docs/rpg-maker/examples/lua-translate-state.lua")
+            }
+            "lua-idempotent-write-back.lua" => {
+                include_str!("../../../docs/rpg-maker/examples/lua-idempotent-write-back.lua")
+            }
+            "lua-complex-protocol.lua" => {
+                include_str!("../../../docs/rpg-maker/examples/lua-complex-protocol.lua")
+            }
+            other => panic!("未知文档 Lua 示例：{other}"),
+        }
+    }
+
+    fn documented_example_project(
+        workspace: &Path,
+        database_path: &Path,
+        phase: LuaPhase,
+    ) -> LuaProjectContext {
+        let opened = OpenedProject::new(
+            "documented".parse::<ProjectName>().expect("项目名应合法"),
+            workspace.to_path_buf(),
+            database_path.to_path_buf(),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            crate::rpg_maker::project::test_layout_profile(),
+        );
+        match phase {
+            LuaPhase::Extract | LuaPhase::Translate => LuaProjectContext::for_frozen_source(
+                opened.name().as_str(),
+                opened.layout().rpg_maker_layout().engine(),
+                opened.source_root().to_path_buf(),
+                opened.database_path().to_path_buf(),
+                opened.language_pair().clone(),
+            ),
+            LuaPhase::WriteBack => LuaProjectContext::for_write_back_candidate(
+                opened.name().as_str(),
+                opened.layout().rpg_maker_layout().engine(),
+                opened.source_root().to_path_buf(),
+                opened.database_path().to_path_buf(),
+                opened.language_pair().clone(),
+                workspace.join("write-back-candidate"),
+            ),
+        }
+    }
+
+    struct DocumentedExampleRun<'a> {
+        workspace: &'a Path,
+        database_path: &'a Path,
+        script_name: &'a str,
+        phase: LuaPhase,
+        sources: Arc<HashMap<String, Vec<u8>>>,
+        outputs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        observations: Arc<Mutex<DocumentedExampleObservations>>,
+        semantic_revision: &'a str,
+    }
+
+    async fn run_documented_example(
+        runtime: &TrustedLua54Runtime,
+        storage: &RusqliteStorage,
+        run: DocumentedExampleRun<'_>,
+    ) {
+        let opened = storage
+            .open_existing(run.database_path.to_path_buf())
+            .await
+            .expect("每次文档示例阶段应打开一个新的真实 SQLite 连接");
+        let (operations, finalizer) = opened.into_parts();
+        let calls = Arc::new(DocumentedExampleCalls {
+            project: documented_example_project(run.workspace, run.database_path, run.phase),
+            operations,
+            sources: run.sources,
+            outputs: run.outputs,
+            observations: run.observations,
+            semantics: documented_example_semantics(run.semantic_revision),
+        });
+        let common_calls: Arc<dyn TrustedLuaCommonHostCalls> = calls.clone();
+        let common = TrustedLuaCommonBindings::new(common_calls);
+        let finalizer: Box<dyn TrustedLuaBindingFinalizer> =
+            Box::new(DocumentedExampleSessionFinalizer { finalizer });
+        let bindings = match run.phase {
+            LuaPhase::Extract => {
+                let phase_calls: Arc<dyn TrustedLuaExtractHostCalls> = calls;
+                TrustedLuaRuntimeBindings::extract(common, phase_calls, finalizer)
+            }
+            LuaPhase::Translate => {
+                let phase_calls: Arc<dyn TrustedLuaTranslateHostCalls> = calls;
+                TrustedLuaRuntimeBindings::translate(common, phase_calls, finalizer)
+            }
+            LuaPhase::WriteBack => {
+                let phase_calls: Arc<dyn TrustedLuaWriteBackHostCalls> = calls;
+                TrustedLuaRuntimeBindings::write_back(common, phase_calls, finalizer)
+            }
+        };
+        let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/rpg-maker/examples")
+            .join(run.script_name);
+        let report = runtime
+            .start(
+                OwnedLuaProgram::new(
+                    script_path,
+                    documented_example_source(run.script_name)
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                bindings,
+            )
+            .await;
+        let (execution, finalization) = report.into_parts();
+        execution
+            .unwrap_or_else(|error| panic!("文档示例 {} 原样执行失败：{error}", run.script_name));
+        let finalization = finalization.unwrap_or_else(|error| {
+            panic!("文档示例 {} SQLite 收尾失败：{error}", run.script_name)
+        });
+        assert!(
+            !finalization.had_unclosed_transaction(),
+            "文档示例 {} 不得遗留事务",
+            run.script_name
+        );
+    }
+
+    fn empty_documented_outputs() -> Arc<Mutex<HashMap<String, Vec<u8>>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn documented_custom_data_file_example_executes_in_the_real_vm() {
+        let directory = tempfile::tempdir().expect("应建立文档示例临时目录");
+        let database_path = directory.path().join("project.db");
+        drop(rusqlite::Connection::open(&database_path).expect("应建立文档示例数据库"));
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let storage = documented_example_sqlite_storage();
+        let observations = Arc::new(Mutex::new(DocumentedExampleObservations::default()));
+
+        run_documented_example(
+            &runtime,
+            &storage,
+            DocumentedExampleRun {
+                workspace: directory.path(),
+                database_path: &database_path,
+                script_name: "lua-standard-data-file.lua",
+                phase: LuaPhase::Extract,
+                sources: documented_example_sources(),
+                outputs: empty_documented_outputs(),
+                observations: Arc::clone(&observations),
+                semantic_revision: "semantics-a",
+            },
+        )
+        .await;
+
+        {
+            let observations = observations.lock().expect("文档示例观察锁不应中毒");
+            let [TrustedLuaExtractIntent::Replace(snapshot)] =
+                observations.extract_intents.as_slice()
+            else {
+                panic!("自定义 DataFile 示例应声明一次标准快照")
+            };
+            let [group] = snapshot.groups() else {
+                panic!("自定义 DataFile 示例应生成一个组")
+            };
+            assert!(matches!(
+                group.group_location().source(),
+                RpgMakerSource::DataFile(file) if file.as_str() == "QuestEntries.json"
+            ));
+            assert_eq!(group.units().len(), 2);
+            assert!(matches!(
+                group.units()[0].role(),
+                crate::rpg_maker::model::TextUnitRole::Scalar(name) if name.as_str() == "title"
+            ));
+            assert!(matches!(
+                group.units()[1].role(),
+                crate::rpg_maker::model::TextUnitRole::Scalar(name)
+                    if name.as_str() == "description"
+            ));
+        }
+
+        runtime.shutdown().await.expect("Lua Runtime 应关闭");
+        storage.shutdown().await.expect("SQLite 根应关闭");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn documented_translate_state_and_idempotent_write_back_examples_execute() {
+        let directory = tempfile::tempdir().expect("应建立文档示例临时目录");
+        let database_path = directory.path().join("project.db");
+        drop(rusqlite::Connection::open(&database_path).expect("应建立文档示例数据库"));
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let storage = documented_example_sqlite_storage();
+        let observations = Arc::new(Mutex::new(DocumentedExampleObservations::default()));
+        let sources = documented_example_sources();
+
+        for semantic_revision in ["semantics-a", "semantics-a"] {
+            run_documented_example(
+                &runtime,
+                &storage,
+                DocumentedExampleRun {
+                    workspace: directory.path(),
+                    database_path: &database_path,
+                    script_name: "lua-translate-state.lua",
+                    phase: LuaPhase::Translate,
+                    sources: Arc::clone(&sources),
+                    outputs: empty_documented_outputs(),
+                    observations: Arc::clone(&observations),
+                    semantic_revision,
+                },
+            )
+            .await;
+        }
+        assert_eq!(
+            observations
+                .lock()
+                .expect("文档示例观察锁不应中毒")
+                .llm_requests,
+            1,
+            "同语义二跑必须由 state 判为 Current，完全不调用 LLM"
+        );
+        let state_before_change: String = rusqlite::Connection::open(&database_path)
+            .expect("应重开文档示例数据库")
+            .query_row(
+                "SELECT state FROM lua_example_translation WHERE identity = 'quest:arrival:title'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("首轮应原子保存 translation/state");
+
+        run_documented_example(
+            &runtime,
+            &storage,
+            DocumentedExampleRun {
+                workspace: directory.path(),
+                database_path: &database_path,
+                script_name: "lua-translate-state.lua",
+                phase: LuaPhase::Translate,
+                sources: Arc::clone(&sources),
+                outputs: empty_documented_outputs(),
+                observations: Arc::clone(&observations),
+                semantic_revision: "semantics-b",
+            },
+        )
+        .await;
+        assert_eq!(
+            observations
+                .lock()
+                .expect("文档示例观察锁不应中毒")
+                .llm_requests,
+            2,
+            "有效公共语义变化后旧 state 必须失效并重新请求 LLM"
+        );
+        let state_after_change: String = rusqlite::Connection::open(&database_path)
+            .expect("应重开文档示例数据库")
+            .query_row(
+                "SELECT state FROM lua_example_translation WHERE identity = 'quest:arrival:title'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("语义变化后应保存新 state");
+        assert_ne!(state_before_change, state_after_change);
+
+        let initial_candidate = HashMap::from([(
+            "data/QuestEntries.json".to_owned(),
+            sources
+                .get("data/QuestEntries.json")
+                .expect("应有 QuestEntries 来源")
+                .clone(),
+        )]);
+        let outputs = Arc::new(Mutex::new(initial_candidate.clone()));
+        let mut generated = Vec::new();
+        for _ in 0..2 {
+            *outputs.lock().expect("文档示例候选锁不应中毒") = initial_candidate.clone();
+            run_documented_example(
+                &runtime,
+                &storage,
+                DocumentedExampleRun {
+                    workspace: directory.path(),
+                    database_path: &database_path,
+                    script_name: "lua-idempotent-write-back.lua",
+                    phase: LuaPhase::WriteBack,
+                    sources: Arc::clone(&sources),
+                    outputs: Arc::clone(&outputs),
+                    observations: Arc::clone(&observations),
+                    semantic_revision: "semantics-b",
+                },
+            )
+            .await;
+            generated.push(
+                outputs
+                    .lock()
+                    .expect("文档示例候选锁不应中毒")
+                    .get("data/QuestEntries.json")
+                    .expect("WriteBack 应写回 QuestEntries")
+                    .clone(),
+            );
+        }
+        assert_eq!(generated[0], generated[1], "从相同 source 重建必须幂等");
+        let materialized: serde_json::Value =
+            serde_json::from_slice(&generated[0]).expect("写回结果应为 JSON");
+        assert_eq!(materialized[0]["title"], "星港");
+
+        runtime.shutdown().await.expect("Lua Runtime 应关闭");
+        storage.shutdown().await.expect("SQLite 根应关闭");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn documented_complex_protocol_executes_all_three_phases_with_private_sqlite_state() {
+        let directory = tempfile::tempdir().expect("应建立文档示例临时目录");
+        let database_path = directory.path().join("project.db");
+        drop(rusqlite::Connection::open(&database_path).expect("应建立文档示例数据库"));
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let storage = documented_example_sqlite_storage();
+        let observations = Arc::new(Mutex::new(DocumentedExampleObservations::default()));
+        let sources = documented_example_sources();
+        let initial_candidate = HashMap::from([
+            (
+                "data/QuestGraph.json".to_owned(),
+                sources
+                    .get("data/QuestGraph.json")
+                    .expect("应有 QuestGraph 来源")
+                    .clone(),
+            ),
+            (
+                "data/QuestIndex.json".to_owned(),
+                sources
+                    .get("data/QuestIndex.json")
+                    .expect("应有 QuestIndex 来源")
+                    .clone(),
+            ),
+        ]);
+        let outputs = Arc::new(Mutex::new(initial_candidate.clone()));
+
+        for phase in [LuaPhase::Extract, LuaPhase::Translate, LuaPhase::WriteBack] {
+            run_documented_example(
+                &runtime,
+                &storage,
+                DocumentedExampleRun {
+                    workspace: directory.path(),
+                    database_path: &database_path,
+                    script_name: "lua-complex-protocol.lua",
+                    phase,
+                    sources: Arc::clone(&sources),
+                    outputs: Arc::clone(&outputs),
+                    observations: Arc::clone(&observations),
+                    semantic_revision: "semantics-a",
+                },
+            )
+            .await;
+        }
+        assert_eq!(
+            observations
+                .lock()
+                .expect("文档示例观察锁不应中毒")
+                .llm_requests,
+            1
+        );
+
+        let connection =
+            rusqlite::Connection::open(&database_path).expect("应重开复杂协议示例数据库");
+        let (translation, state): (String, String) = connection
+            .query_row(
+                "SELECT translation, state FROM lua_complex_unit WHERE identity = 'quest:arrival'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("复杂协议应保存私有翻译状态");
+        assert_eq!(translation, "星港");
+        assert_eq!(state.len(), 64);
+        let target_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM lua_complex_target WHERE identity = 'quest:arrival'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("复杂协议应保存两个有序写回目标");
+        assert_eq!(target_count, 2);
+        drop(connection);
+
+        let first_graph = outputs
+            .lock()
+            .expect("文档示例候选锁不应中毒")
+            .get("data/QuestGraph.json")
+            .expect("复杂协议应写 QuestGraph")
+            .clone();
+        let first_index = outputs
+            .lock()
+            .expect("文档示例候选锁不应中毒")
+            .get("data/QuestIndex.json")
+            .expect("复杂协议应写 QuestIndex")
+            .clone();
+        let graph: serde_json::Value =
+            serde_json::from_slice(&first_graph).expect("QuestGraph 写回应为 JSON");
+        let index: serde_json::Value =
+            serde_json::from_slice(&first_index).expect("QuestIndex 写回应为 JSON");
+        assert_eq!(graph[0]["title"], "星港");
+        assert_eq!(index["arrival"]["label"], "星港");
+
+        *outputs.lock().expect("文档示例候选锁不应中毒") = initial_candidate;
+        run_documented_example(
+            &runtime,
+            &storage,
+            DocumentedExampleRun {
+                workspace: directory.path(),
+                database_path: &database_path,
+                script_name: "lua-complex-protocol.lua",
+                phase: LuaPhase::WriteBack,
+                sources,
+                outputs: Arc::clone(&outputs),
+                observations,
+                semantic_revision: "semantics-a",
+            },
+        )
+        .await;
+        {
+            let outputs = outputs.lock().expect("文档示例候选锁不应中毒");
+            assert_eq!(outputs["data/QuestGraph.json"], first_graph);
+            assert_eq!(outputs["data/QuestIndex.json"], first_index);
+        }
+
+        runtime.shutdown().await.expect("Lua Runtime 应关闭");
+        storage.shutdown().await.expect("SQLite 根应关闭");
     }
 }

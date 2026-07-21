@@ -44,7 +44,7 @@ use crate::rpg_maker::project_lease::{
 };
 use crate::rpg_maker::standard_asset::RpgMakerStandardAssetReadingConfig;
 use crate::rpg_maker::text::{
-    RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
+    RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
 };
 use crate::rpg_maker::{ProjectName, SelectedLua};
 use crate::storage::file_system::{
@@ -129,8 +129,8 @@ impl SqliteQueryExecutor for RecordingSqliteQuery {
                 Ok(rows.groups)
             } else if query.statement().contains("FROM standard_text_unit") {
                 Ok(rows.units)
-            } else if query.statement().contains("FROM standard_text_target") {
-                Ok(rows.targets)
+            } else if query.statement().contains("FROM standard_mutation_claim") {
+                Ok(rows.claims)
             } else {
                 Err(QueryExistingDatabaseError::QueryFailed(TestError(
                     "意外的全树测试查询",
@@ -223,23 +223,6 @@ impl DirectoryLister for RecordingFileReader {
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.resolved_path().cmp(right.resolved_path()));
         Ok(entries)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RejectingDirectoryLister;
-
-impl DirectoryLister for RejectingDirectoryLister {
-    type Error = TestError;
-
-    async fn list_directory(
-        &self,
-        path: PathBuf,
-    ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<Self::Error>> {
-        Err(ListDirectoryError::Io {
-            path,
-            source: TestError("精确 Map 选择不应列举 data"),
-        })
     }
 }
 
@@ -447,6 +430,7 @@ impl AuditLedger for RecordingRunLog {
             } => {}
             AuditEvent::RunStarted
             | AuditEvent::RunFinished { .. }
+            | AuditEvent::TranslationPlanningUnresolved { .. }
             | AuditEvent::TranslationTaskStarted { .. }
             | AuditEvent::TranslationTaskFinished { .. } => {
                 return Err(TestError("意外审计事件"));
@@ -777,7 +761,7 @@ fn build_full_tree_with_publish_error(
     );
     let document_reader = RpgMakerProjectDocumentReadingService::new(
         file_reader.clone(),
-        RejectingDirectoryLister,
+        file_reader.clone(),
         cpu.clone(),
         RpgMakerDocumentReadingConfig::new(non_zero(2)),
     );
@@ -995,7 +979,12 @@ fn assert_project_open_and_asset_queries(observations: &FullTreeObservations) {
     );
     assert!(calls[2].1.statement().contains("FROM standard_text_group"));
     assert!(calls[3].1.statement().contains("FROM standard_text_unit"));
-    assert!(calls[4].1.statement().contains("FROM standard_text_target"));
+    assert!(
+        calls[4]
+            .1
+            .statement()
+            .contains("FROM standard_mutation_claim")
+    );
     assert!(
         calls
             .iter()
@@ -1190,7 +1179,7 @@ struct WriteBackSnapshotRows {
     owners: Vec<SqliteRow>,
     groups: Vec<SqliteRow>,
     units: Vec<SqliteRow>,
-    targets: Vec<SqliteRow>,
+    claims: Vec<SqliteRow>,
 }
 
 fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
@@ -1287,30 +1276,39 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
     let groups = vec![
         fixture_group(
             "builtin",
+            0,
             &item_group,
-            "database_entry",
+            TextGroupKind::DatabaseEntry,
             description_recipe,
-            description_role,
-            TextUnitContent::Value("旧说明\n第二行".to_owned()),
-            TextUnitContent::Value("甲乙，丙丁。".to_owned()),
-        ),
-        fixture_group(
-            "rules",
-            &item_group,
-            "database_entry",
-            name_recipe,
-            name_role,
-            TextUnitContent::Value("药水".to_owned()),
-            TextUnitContent::Value("Potion".to_owned()),
+            (
+                description_role,
+                TextUnitContent::Value("旧说明\n第二行".to_owned()),
+                TextUnitContent::Value("甲乙，丙丁。".to_owned()),
+            ),
         ),
         fixture_group(
             "builtin",
+            1,
             &dialogue_group,
-            "event_dialogue",
+            TextGroupKind::EventDialogue,
             dialogue_recipe,
-            dialogue_role,
-            TextUnitContent::Lines(vec!["原始对话".to_owned()]),
-            TextUnitContent::Lines(vec!["「甲乙，丙丁」".to_owned()]),
+            (
+                dialogue_role,
+                TextUnitContent::Lines(vec!["原始对话".to_owned()]),
+                TextUnitContent::Lines(vec!["「甲乙，丙丁」".to_owned()]),
+            ),
+        ),
+        fixture_group(
+            "rules",
+            0,
+            &item_group,
+            TextGroupKind::DatabaseEntry,
+            name_recipe,
+            (
+                name_role,
+                TextUnitContent::Value("药水".to_owned()),
+                TextUnitContent::Value("Potion".to_owned()),
+            ),
         ),
     ];
 
@@ -1326,11 +1324,12 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
         .collect::<Vec<_>>();
     let mut group_rows = Vec::new();
     let mut unit_rows = Vec::new();
-    let mut target_rows = Vec::new();
+    let mut claim_rows = Vec::new();
     for group in groups {
         group_rows.push(SqliteRow::new(vec![
             SqliteValue::Text(group.owner.clone()),
             SqliteValue::Text(group.group_location.clone()),
+            SqliteValue::Integer(i64::try_from(group.group_order).expect("测试顺序应可编码")),
             SqliteValue::Text(group.kind.to_owned()),
             SqliteValue::Text(group.recipes.clone()),
         ]));
@@ -1338,15 +1337,17 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
             SqliteValue::Text(group.owner.clone()),
             SqliteValue::Text(group.group_location.clone()),
             SqliteValue::Text(group.role.clone()),
+            SqliteValue::Integer(0),
             SqliteValue::Text(group.source_content_json.clone()),
             SqliteValue::Text("{}".to_owned()),
             SqliteValue::Text(group.translation_content_json),
         ]));
-        for target in group.targets {
-            target_rows.push(SqliteRow::new(vec![
+        for (resource_key, access) in group.claims {
+            claim_rows.push(SqliteRow::new(vec![
                 SqliteValue::Text(group.owner.clone()),
                 SqliteValue::Text(group.group_location.clone()),
-                SqliteValue::Text(target),
+                SqliteValue::Text(resource_key),
+                SqliteValue::Text(access),
             ]));
         }
     }
@@ -1361,12 +1362,18 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
             .then_with(|| snapshot_row_text(left, 1).cmp(snapshot_row_text(right, 1)))
             .then_with(|| snapshot_row_text(left, 2).cmp(snapshot_row_text(right, 2)))
     });
-    target_rows.sort_by(|left, right| snapshot_row_text(left, 2).cmp(snapshot_row_text(right, 2)));
+    claim_rows.sort_by(|left, right| {
+        snapshot_row_text(left, 2)
+            .cmp(snapshot_row_text(right, 2))
+            .then_with(|| snapshot_row_text(left, 3).cmp(snapshot_row_text(right, 3)))
+            .then_with(|| snapshot_row_text(left, 0).cmp(snapshot_row_text(right, 0)))
+            .then_with(|| snapshot_row_text(left, 1).cmp(snapshot_row_text(right, 1)))
+    });
     WriteBackSnapshotRows {
         owners,
         groups: group_rows,
         units: unit_rows,
-        targets: target_rows,
+        claims: claim_rows,
     }
 }
 
@@ -1383,41 +1390,55 @@ fn snapshot_row_text(row: &SqliteRow, index: usize) -> &str {
 
 struct FixtureGroup {
     owner: String,
+    group_order: usize,
     group_location: String,
     kind: &'static str,
     recipes: String,
     role: String,
     source_content_json: String,
     translation_content_json: String,
-    targets: Vec<String>,
+    claims: Vec<(String, String)>,
 }
 
 fn fixture_group(
     owner: &str,
+    group_order: usize,
     group_location: &RpgMakerLocation,
-    kind: &'static str,
+    kind: TextGroupKind,
     recipe: crate::rpg_maker::model::TextProjectionRecipe,
-    role: crate::rpg_maker::model::TextUnitRole,
-    source_content: crate::rpg_maker::model::TextUnitContent,
-    translation_content: crate::rpg_maker::model::TextUnitContent,
+    unit: (
+        crate::rpg_maker::model::TextUnitRole,
+        crate::rpg_maker::model::TextUnitContent,
+        crate::rpg_maker::model::TextUnitContent,
+    ),
 ) -> FixtureGroup {
     use crate::rpg_maker::location_codec::RpgMakerProjectionCodec;
 
+    let (role, source_content, translation_content) = unit;
+    let recipes = [recipe];
+    let claims = crate::rpg_maker::model::mutation_claims_for_group(kind, group_location, &recipes)
+        .expect("测试配方 Claim 应合法")
+        .locks()
+        .iter()
+        .map(|lock| {
+            (
+                RpgMakerProjectionCodec::encode_mutation_resource(lock.resource())
+                    .expect("资源应可编码"),
+                lock.access().storage_name().to_owned(),
+            )
+        })
+        .collect();
     FixtureGroup {
         owner: owner.to_owned(),
+        group_order,
         group_location: RpgMakerLocationCodec::encode(group_location).expect("组位置应可编码"),
-        kind,
-        recipes: RpgMakerProjectionCodec::encode_recipes(std::slice::from_ref(&recipe))
-            .expect("配方应可编码"),
+        kind: fixture_group_kind(kind),
+        recipes: RpgMakerProjectionCodec::encode_recipes(&recipes).expect("配方应可编码"),
         role: RpgMakerProjectionCodec::encode_role(&role).expect("角色应可编码"),
         source_content_json: serde_json::to_string(&source_content).expect("单元原文应可编码"),
         translation_content_json: serde_json::to_string(&translation_content)
             .expect("单元译文应可编码"),
-        targets: recipe
-            .mutation_targets()
-            .iter()
-            .map(|target| RpgMakerProjectionCodec::encode_target(target).expect("目标应可编码"))
-            .collect(),
+        claims,
     }
 }
 
@@ -1428,23 +1449,19 @@ fn fixture_asset_fingerprint(owner: &str, groups: &[FixtureGroup]) -> [u8; 32] {
         .iter()
         .filter(|group| group.owner == owner)
         .collect::<Vec<_>>();
-    owner_groups.sort_by(|left, right| left.group_location.cmp(&right.group_location));
+    owner_groups.sort_by_key(|group| group.group_order);
     let mut units = owner_groups.clone();
-    units.sort_by(|left, right| {
-        left.group_location
-            .cmp(&right.group_location)
-            .then_with(|| left.role.cmp(&right.role))
-    });
-    let mut targets = owner_groups
+    units.sort_by_key(|group| group.group_order);
+    let mut claims = owner_groups
         .iter()
         .flat_map(|group| {
             group
-                .targets
+                .claims
                 .iter()
-                .map(|target| (target, &group.group_location))
+                .map(|(resource, access)| (resource, access, &group.group_location))
         })
         .collect::<Vec<_>>();
-    targets.sort();
+    claims.sort();
 
     let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.standard_text_snapshot");
     hasher.frame(1, owner.as_bytes());
@@ -1454,27 +1471,45 @@ fn fixture_asset_fingerprint(owner: &str, groups: &[FixtureGroup]) -> [u8; 32] {
             .frame(15, DIALOGUE_DEFINITION_JSON.as_bytes());
     }
     for group in owner_groups {
+        let group_order = u64::try_from(group.group_order).expect("测试顺序应可编码");
         hasher
             .frame(2, b"group")
             .frame(3, group.group_location.as_bytes())
+            .frame(16, &group_order.to_le_bytes())
             .frame(4, group.kind.as_bytes())
             .frame(5, group.recipes.as_bytes());
     }
     for unit in units {
+        let unit_order = 0_u64;
         hasher
             .frame(6, b"unit")
             .frame(7, unit.group_location.as_bytes())
             .frame(8, unit.role.as_bytes())
+            .frame(17, &unit_order.to_le_bytes())
             .frame(9, unit.source_content_json.as_bytes())
             .frame(10, b"{}");
     }
-    for (target, group_location) in targets {
+    for (resource, access, group_location) in claims {
         hasher
-            .frame(11, b"target")
-            .frame(12, target.as_bytes())
+            .frame(11, b"claim")
+            .frame(12, resource.as_bytes())
+            .frame(18, access.as_bytes())
             .frame(13, group_location.as_bytes());
     }
     hasher.finish().into_bytes()
+}
+
+const fn fixture_group_kind(kind: TextGroupKind) -> &'static str {
+    match kind {
+        TextGroupKind::DatabaseEntry => "database_entry",
+        TextGroupKind::System => "system",
+        TextGroupKind::Map => "map",
+        TextGroupKind::EventDialogue => "event_dialogue",
+        TextGroupKind::EventChoices => "event_choices",
+        TextGroupKind::EventScrollingText => "event_scrolling_text",
+        TextGroupKind::EventCommand => "event_command",
+        TextGroupKind::PluginParameter => "plugin_parameter",
+    }
 }
 
 fn source_files() -> BTreeMap<PathBuf, Vec<u8>> {

@@ -40,7 +40,9 @@ const READ_TRANSLATION_SNAPSHOT: &str = r#"SELECT
     canonical_json,
     group_location,
     group_kind,
+    group_order,
     unit_role,
+    unit_order,
     source_content_json,
     source_context_json,
     translation_content_json,
@@ -55,7 +57,9 @@ FROM (
         NULL AS canonical_json,
         NULL AS group_location,
         NULL AS group_kind,
+        NULL AS group_order,
         NULL AS unit_role,
+        NULL AS unit_order,
         NULL AS source_content_json,
         NULL AS source_context_json,
         NULL AS translation_content_json,
@@ -69,6 +73,8 @@ FROM (
         owner,
         source_snapshot_fingerprint,
         asset_snapshot_fingerprint,
+        NULL,
+        NULL,
         NULL,
         NULL,
         NULL,
@@ -95,13 +101,35 @@ FROM (
         NULL,
         NULL,
         NULL,
+        NULL,
+        NULL,
         NULL
     FROM standard_translation_resource
 
     UNION ALL
 
     SELECT
-        '3_unit',
+        '3_group',
+        text_group.owner,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        text_group.group_location,
+        text_group.group_kind,
+        text_group.group_order,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL
+    FROM standard_text_group AS text_group
+
+    UNION ALL
+
+    SELECT
+        '4_unit',
         unit.owner,
         NULL,
         NULL,
@@ -109,7 +137,9 @@ FROM (
         NULL,
         unit.group_location,
         text_group.group_kind,
+        text_group.group_order,
         unit.unit_role,
+        unit.unit_order,
         unit.source_content_json,
         unit.source_context_json,
         unit.translation_content_json,
@@ -119,7 +149,12 @@ FROM (
       ON text_group.owner = unit.owner
      AND text_group.group_location = unit.group_location
 )
-ORDER BY row_kind, owner, resource_kind, group_location, unit_role"#;
+ORDER BY
+    row_kind,
+    CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 WHEN 'lua' THEN 2 ELSE 3 END,
+    resource_kind,
+    group_order,
+    unit_order"#;
 
 /// 验证 owner 新鲜度、读取当前资源，并用受控 CPU 解码标准翻译语料。
 pub(crate) struct RpgMakerStandardTranslationAssetReadingService<Q, C> {
@@ -167,6 +202,7 @@ where
             .map_err(RpgMakerStandardTranslationAssetReadingError::SchedulePreparation)?
             .map_err(map_snapshot_preparation_error)?;
         let active_owners = Arc::new(prepared.active_owners);
+        let decoded_groups = prepared.groups;
         let decoded_batches = self
             .cpu
             .execute_ordered_map(prepared.jobs, move |job| {
@@ -183,7 +219,7 @@ where
                     .into_iter()
                     .flatten()
                     .collect::<Vec<_>>();
-                assemble_corpus(decoded)
+                assemble_corpus(decoded_groups, decoded)
             })
             .await
             .map_err(RpgMakerStandardTranslationAssetReadingError::ScheduleAssembly)?
@@ -290,6 +326,10 @@ pub(crate) enum InvalidStandardTranslationAssetSnapshot {
         expected: &'static str,
         actual: &'static str,
     },
+    InvalidOrderValue {
+        column: &'static str,
+        actual: i64,
+    },
     UnknownOwner(String),
     InactiveOwner(String),
     DuplicateOwner(String),
@@ -347,6 +387,33 @@ pub(crate) enum InvalidStandardTranslationAssetSnapshot {
     InvalidTranslationStateLength {
         actual: usize,
     },
+    DuplicateGroup {
+        owner: RpgMakerStandardAssetOwner,
+        group_location: Box<RpgMakerLocation>,
+    },
+    MissingGroup {
+        owner: RpgMakerStandardAssetOwner,
+        group_location: Box<RpgMakerLocation>,
+    },
+    EmptyGroup {
+        owner: RpgMakerStandardAssetOwner,
+        group_location: Box<RpgMakerLocation>,
+    },
+    InvalidGroupOrder {
+        owner: RpgMakerStandardAssetOwner,
+        expected: usize,
+        actual: usize,
+    },
+    InconsistentGroupDefinition {
+        owner: RpgMakerStandardAssetOwner,
+        group_location: Box<RpgMakerLocation>,
+    },
+    InvalidUnitOrder {
+        owner: RpgMakerStandardAssetOwner,
+        group_location: Box<RpgMakerLocation>,
+        expected: usize,
+        actual: usize,
+    },
     DuplicateLogicalUnit {
         owner: RpgMakerStandardAssetOwner,
         group_location: Box<RpgMakerLocation>,
@@ -366,6 +433,12 @@ impl fmt::Display for InvalidStandardTranslationAssetSnapshot {
                 expected,
                 actual,
             } => write!(formatter, "列 {column} 应为 {expected}，实际为 {actual}"),
+            Self::InvalidOrderValue { column, actual } => {
+                write!(
+                    formatter,
+                    "列 {column} 必须是可表示的非负顺序，实际为 {actual}"
+                )
+            }
             Self::UnknownOwner(owner) => write!(formatter, "未知资产所有者：{owner}"),
             Self::InactiveOwner(owner) => write!(formatter, "文本单元引用未激活 owner：{owner}"),
             Self::DuplicateOwner(owner) => write!(formatter, "资产 owner 状态重复：{owner}"),
@@ -433,6 +506,57 @@ impl fmt::Display for InvalidStandardTranslationAssetSnapshot {
                 formatter,
                 "translation_state 必须是 32 字节 BLOB，实际为 {actual} 字节"
             ),
+            Self::DuplicateGroup {
+                owner,
+                group_location,
+            } => write!(
+                formatter,
+                "资产组重复：{} / {group_location}",
+                owner.storage_name()
+            ),
+            Self::MissingGroup {
+                owner,
+                group_location,
+            } => write!(
+                formatter,
+                "文本单元没有对应资产组：{} / {group_location}",
+                owner.storage_name()
+            ),
+            Self::EmptyGroup {
+                owner,
+                group_location,
+            } => write!(
+                formatter,
+                "资产组不包含文本单元：{} / {group_location}",
+                owner.storage_name()
+            ),
+            Self::InvalidGroupOrder {
+                owner,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "owner {} 的 group_order 必须从 0 连续：期待 {expected}，实际 {actual}",
+                owner.storage_name()
+            ),
+            Self::InconsistentGroupDefinition {
+                owner,
+                group_location,
+            } => write!(
+                formatter,
+                "同一资产组的类型或 group_order 不一致：{} / {group_location}",
+                owner.storage_name()
+            ),
+            Self::InvalidUnitOrder {
+                owner,
+                group_location,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "组 {} / {group_location} 的 unit_order 必须从 0 连续：期待 {expected}，实际 {actual}",
+                owner.storage_name()
+            ),
             Self::DuplicateLogicalUnit {
                 owner,
                 group_location,
@@ -480,6 +604,7 @@ struct SnapshotRows {
     metadata: Vec<SqliteRow>,
     owners: Vec<SqliteRow>,
     resources: Vec<SqliteRow>,
+    groups: Vec<SqliteRow>,
     units: Vec<SqliteRow>,
 }
 
@@ -489,6 +614,7 @@ struct PreparedSnapshot {
     active_owners: BTreeSet<&'static str>,
     terminology_json: String,
     placeholder_rules_json: String,
+    groups: Vec<DecodedGroup>,
     jobs: Vec<Vec<SqliteRow>>,
 }
 
@@ -527,6 +653,8 @@ fn prepare_snapshot(
     }
     let (terminology_json, placeholder_rules_json) =
         decode_resources(snapshot.resources).map_err(SnapshotPreparationError::Invalid)?;
+    let groups = decode_groups(snapshot.groups, &owner_states.active)
+        .map_err(SnapshotPreparationError::Invalid)?;
 
     Ok(PreparedSnapshot {
         source_snapshot_fingerprint,
@@ -534,6 +662,7 @@ fn prepare_snapshot(
         active_owners: owner_states.active,
         terminology_json,
         placeholder_rules_json,
+        groups,
         jobs: partition_rows(snapshot.units, units_per_job),
     })
 }
@@ -564,6 +693,7 @@ fn split_snapshot_rows(
         metadata: Vec::new(),
         owners: Vec::new(),
         resources: Vec::new(),
+        groups: Vec::new(),
         units: Vec::new(),
     };
     for row in rows {
@@ -578,14 +708,16 @@ fn split_snapshot_rows(
             canonical_json,
             group_location,
             group_kind,
+            group_order,
             unit_role,
+            unit_order,
             source_content_json,
             source_context_json,
             translation_content_json,
             translation_state,
-        ]: [SqliteValue; 13] = values.try_into().map_err(|_| {
+        ]: [SqliteValue; 15] = values.try_into().map_err(|_| {
             InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
-                expected: 13,
+                expected: 15,
                 actual,
             }
         })?;
@@ -601,11 +733,19 @@ fn split_snapshot_rows(
             "2_resource" => snapshot
                 .resources
                 .push(SqliteRow::new(vec![resource_kind, canonical_json])),
-            "3_unit" => snapshot.units.push(SqliteRow::new(vec![
+            "3_group" => snapshot.groups.push(SqliteRow::new(vec![
                 owner,
                 group_location,
                 group_kind,
+                group_order,
+            ])),
+            "4_unit" => snapshot.units.push(SqliteRow::new(vec![
+                owner,
+                group_location,
+                group_kind,
+                group_order,
                 unit_role,
+                unit_order,
                 source_content_json,
                 source_context_json,
                 translation_content_json,
@@ -771,11 +911,59 @@ fn partition_rows(rows: Vec<SqliteRow>, units_per_job: usize) -> Vec<Vec<SqliteR
 }
 
 #[derive(Debug)]
+struct DecodedGroup {
+    owner: RpgMakerStandardAssetOwner,
+    kind: TextGroupKind,
+    group_location: RpgMakerLocation,
+    group_order: usize,
+}
+
+fn decode_groups(
+    rows: Vec<SqliteRow>,
+    active_owners: &BTreeSet<&'static str>,
+) -> Result<Vec<DecodedGroup>, InvalidStandardTranslationAssetSnapshot> {
+    rows.into_iter()
+        .map(|row| {
+            let values = row.into_values();
+            if values.len() != 4 {
+                return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
+                    expected: 4,
+                    actual: values.len(),
+                });
+            }
+            let mut values = values.into_iter();
+            let owner_name = required_text(next(&mut values), "owner")?;
+            let owner = RpgMakerStandardAssetOwner::from_storage_name(&owner_name).ok_or(
+                InvalidStandardTranslationAssetSnapshot::UnknownOwner(owner_name),
+            )?;
+            if !active_owners.contains(owner.storage_name()) {
+                return Err(InvalidStandardTranslationAssetSnapshot::InactiveOwner(
+                    owner.storage_name().to_owned(),
+                ));
+            }
+            let group_location =
+                RpgMakerLocationCodec::decode(&required_text(next(&mut values), "group_location")?)
+                    .map_err(InvalidStandardTranslationAssetSnapshot::InvalidLocation)?;
+            let kind = decode_group_kind(&required_text(next(&mut values), "group_kind")?)?;
+            let group_order = required_non_negative_order(next(&mut values), "group_order")?;
+            Ok(DecodedGroup {
+                owner,
+                kind,
+                group_location,
+                group_order,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug)]
 struct DecodedUnit {
     owner: RpgMakerStandardAssetOwner,
     kind: TextGroupKind,
     group_location: RpgMakerLocation,
+    group_order: usize,
     role: TextUnitRole,
+    unit_order: usize,
     source_content: TextUnitContent,
     source_context_json: String,
     translation: Option<TextUnitContent>,
@@ -796,9 +984,9 @@ fn decode_unit(
     active_owners: &BTreeSet<&'static str>,
 ) -> Result<DecodedUnit, InvalidStandardTranslationAssetSnapshot> {
     let values = row.into_values();
-    if values.len() != 8 {
+    if values.len() != 10 {
         return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
-            expected: 8,
+            expected: 10,
             actual: values.len(),
         });
     }
@@ -816,9 +1004,11 @@ fn decode_unit(
         RpgMakerLocationCodec::decode(&required_text(next(&mut values), "group_location")?)
             .map_err(InvalidStandardTranslationAssetSnapshot::InvalidLocation)?;
     let kind = decode_group_kind(&required_text(next(&mut values), "group_kind")?)?;
+    let group_order = required_non_negative_order(next(&mut values), "group_order")?;
     let role =
         RpgMakerProjectionCodec::decode_role(&required_text(next(&mut values), "unit_role")?)
             .map_err(InvalidStandardTranslationAssetSnapshot::InvalidRole)?;
+    let unit_order = required_non_negative_order(next(&mut values), "unit_order")?;
     validate_role(&role, kind)?;
     let source_content_json = required_text(next(&mut values), "source_content_json")?;
     let source_content: TextUnitContent = serde_json::from_str(&source_content_json)
@@ -874,7 +1064,9 @@ fn decode_unit(
         owner,
         kind,
         group_location,
+        group_order,
         role,
+        unit_order,
         source_content,
         source_context_json,
         translation,
@@ -992,17 +1184,78 @@ fn validate_role(
 }
 
 fn assemble_corpus(
+    group_rows: Vec<DecodedGroup>,
     units: Vec<DecodedUnit>,
 ) -> Result<Vec<StandardTranslationGroup>, InvalidStandardTranslationAssetSnapshot> {
+    struct GroupBuilder {
+        owner: RpgMakerStandardAssetOwner,
+        kind: TextGroupKind,
+        group_location: RpgMakerLocation,
+        group_order: usize,
+        assets: Vec<StandardTranslationAsset>,
+    }
+
+    let mut next_group_orders = BTreeMap::<&'static str, usize>::new();
+    let mut group_indexes = BTreeMap::<(&'static str, RpgMakerLocation), usize>::new();
+    let mut groups = Vec::<GroupBuilder>::new();
+    for group in group_rows {
+        let owner_name = group.owner.storage_name();
+        let expected = next_group_orders.entry(owner_name).or_default();
+        if group.group_order != *expected {
+            return Err(InvalidStandardTranslationAssetSnapshot::InvalidGroupOrder {
+                owner: group.owner,
+                expected: *expected,
+                actual: group.group_order,
+            });
+        }
+        *expected += 1;
+        let key = (owner_name, group.group_location.clone());
+        if group_indexes.contains_key(&key) {
+            return Err(InvalidStandardTranslationAssetSnapshot::DuplicateGroup {
+                owner: group.owner,
+                group_location: Box::new(group.group_location),
+            });
+        }
+        let index = groups.len();
+        group_indexes.insert(key, index);
+        groups.push(GroupBuilder {
+            owner: group.owner,
+            kind: group.kind,
+            group_location: group.group_location,
+            group_order: group.group_order,
+            assets: Vec::new(),
+        });
+    }
+
     let mut seen = BTreeSet::new();
-    let mut groups =
-        BTreeMap::<(TextGroupKind, RpgMakerLocation), Vec<StandardTranslationAsset>>::new();
     for unit in units {
-        let key = (
-            unit.owner.storage_name(),
-            unit.group_location.clone(),
-            unit.role.clone(),
-        );
+        let owner_name = unit.owner.storage_name();
+        let group_index = group_indexes
+            .get(&(owner_name, unit.group_location.clone()))
+            .copied()
+            .ok_or_else(|| InvalidStandardTranslationAssetSnapshot::MissingGroup {
+                owner: unit.owner,
+                group_location: Box::new(unit.group_location.clone()),
+            })?;
+        let group = &mut groups[group_index];
+        if group.kind != unit.kind || group.group_order != unit.group_order {
+            return Err(
+                InvalidStandardTranslationAssetSnapshot::InconsistentGroupDefinition {
+                    owner: unit.owner,
+                    group_location: Box::new(unit.group_location),
+                },
+            );
+        }
+        let expected_unit_order = group.assets.len();
+        if unit.unit_order != expected_unit_order {
+            return Err(InvalidStandardTranslationAssetSnapshot::InvalidUnitOrder {
+                owner: unit.owner,
+                group_location: Box::new(unit.group_location),
+                expected: expected_unit_order,
+                actual: unit.unit_order,
+            });
+        }
+        let key = (owner_name, unit.group_location.clone(), unit.role.clone());
         if !seen.insert(key) {
             return Err(
                 InvalidStandardTranslationAssetSnapshot::DuplicateLogicalUnit {
@@ -1012,39 +1265,30 @@ fn assemble_corpus(
                 },
             );
         }
-        let kind = unit.kind;
-        let group_location = unit.group_location.clone();
         let identity = TranslationUnitIdentity::new(
             unit.owner,
-            kind,
+            unit.kind,
             unit.group_location,
             unit.role,
             unit.source_content,
             unit.source_context_json,
         );
-        groups
-            .entry((kind, group_location))
-            .or_default()
-            .push(StandardTranslationAsset::new(
-                identity,
-                unit.translation,
-                unit.translation_state,
-            ));
+        group.assets.push(StandardTranslationAsset::new(
+            identity,
+            unit.translation,
+            unit.translation_state,
+        ));
+    }
+
+    if let Some(group) = groups.iter().find(|group| group.assets.is_empty()) {
+        return Err(InvalidStandardTranslationAssetSnapshot::EmptyGroup {
+            owner: group.owner,
+            group_location: Box::new(group.group_location.clone()),
+        });
     }
     Ok(groups
         .into_iter()
-        .map(|((kind, group_location), mut assets)| {
-            assets.sort_by(|left, right| {
-                left.identity()
-                    .role()
-                    .cmp(right.identity().role())
-                    .then_with(|| {
-                        owner_order(left.identity().owner())
-                            .cmp(&owner_order(right.identity().owner()))
-                    })
-            });
-            StandardTranslationGroup::new(kind, group_location, assets)
-        })
+        .map(|group| StandardTranslationGroup::new(group.kind, group.group_location, group.assets))
         .collect())
 }
 
@@ -1080,6 +1324,25 @@ fn required_blob(
             actual: actual.kind_name(),
         }),
     }
+}
+
+fn required_non_negative_order(
+    value: SqliteValue,
+    column: &'static str,
+) -> Result<usize, InvalidStandardTranslationAssetSnapshot> {
+    let SqliteValue::Integer(value) = value else {
+        return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnType {
+            column,
+            expected: "INTEGER",
+            actual: value.kind_name(),
+        });
+    };
+    usize::try_from(value).map_err(
+        |_| InvalidStandardTranslationAssetSnapshot::InvalidOrderValue {
+            column,
+            actual: value,
+        },
+    )
 }
 
 fn optional_text(
@@ -1120,7 +1383,7 @@ mod tests {
 
     use crate::execution::cpu::CpuTaskExecutionError;
     use crate::rpg_maker::ProjectName;
-    use crate::rpg_maker::model::TextUnitRole;
+    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitRole};
     use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource};
 
     use super::*;
@@ -1185,22 +1448,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unified_tables_preserve_role_order_context_and_asset_baseline() {
+    async fn unified_tables_preserve_persisted_unit_order_context_and_asset_baseline() {
         let group = dialogue_group();
         let speaker_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueSpeaker)
             .expect("角色应可编码");
         let body_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueBody)
             .expect("角色应可编码");
-        let rows = snapshot_rows(vec![
-            unit_row(
-                &group,
-                "event_dialogue",
-                &body_role,
-                r#"["同一句"]"#,
-                r#"{"source_speaker":"甲"}"#,
-            ),
-            unit_row(&group, "event_dialogue", &speaker_role, r#""甲""#, "{}"),
-        ]);
+        let rows = snapshot_rows(
+            &group,
+            vec![
+                unit_row(
+                    &group,
+                    "event_dialogue",
+                    &body_role,
+                    0,
+                    r#"["同一句"]"#,
+                    r#"{"source_speaker":"甲"}"#,
+                ),
+                unit_row(&group, "event_dialogue", &speaker_role, 1, r#""甲""#, "{}"),
+            ],
+        );
         let calls = Arc::new(Mutex::new(Vec::new()));
         let service = RpgMakerStandardTranslationAssetReadingService::new(
             FakeQuery {
@@ -1215,13 +1482,13 @@ mod tests {
 
         assert_eq!(corpus.groups().len(), 1);
         let assets = corpus.groups()[0].assets();
-        assert_eq!(assets[0].identity().role(), &TextUnitRole::DialogueSpeaker);
+        assert_eq!(assets[0].identity().role(), &TextUnitRole::DialogueBody);
         assert_eq!(
-            assets[1].identity().source_context_json(),
+            assets[0].identity().source_context_json(),
             r#"{"source_speaker":"甲"}"#
         );
         assert_eq!(
-            assets[1].identity().source_content(),
+            assets[0].identity().source_content(),
             &TextUnitContent::Lines(vec!["同一句".to_owned()])
         );
         let (_, baseline) = corpus.into_parts();
@@ -1232,6 +1499,61 @@ mod tests {
         );
         let calls = calls.lock().expect("查询锁");
         assert!(calls[0].1.statement().contains("standard_text_unit"));
+    }
+
+    #[test]
+    fn corpus_keeps_builtin_rules_lua_owner_order_and_independent_same_location_groups() {
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let owners = [
+            RpgMakerStandardAssetOwner::Builtin,
+            RpgMakerStandardAssetOwner::Rules,
+            RpgMakerStandardAssetOwner::Lua,
+        ];
+        let group_rows = owners
+            .into_iter()
+            .map(|owner| DecodedGroup {
+                owner,
+                kind: TextGroupKind::DatabaseEntry,
+                group_location: group_location.clone(),
+                group_order: 0,
+            })
+            .collect::<Vec<_>>();
+        let units = owners
+            .into_iter()
+            .map(|owner| DecodedUnit {
+                owner,
+                kind: TextGroupKind::DatabaseEntry,
+                group_location: group_location.clone(),
+                group_order: 0,
+                role: TextUnitRole::Scalar(
+                    ScalarFieldKey::new(format!("{}_name", owner.storage_name()))
+                        .expect("测试角色应合法"),
+                ),
+                unit_order: 0,
+                source_content: TextUnitContent::Value(owner.storage_name().to_owned()),
+                source_context_json: "{}".to_owned(),
+                translation: None,
+                translation_state: None,
+            })
+            .collect::<Vec<_>>();
+
+        let groups = assemble_corpus(group_rows, units).expect("三 owner 语料应能组装");
+
+        assert_eq!(groups.len(), 3, "同一逻辑位置不得跨 owner 合并");
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.assets()[0].identity().owner())
+                .collect::<Vec<_>>(),
+            owners,
+            "Standard 总顺序必须固定为 Builtin、Rules、Lua"
+        );
+        assert!(READ_TRANSLATION_SNAPSHOT.contains("WHEN 'builtin' THEN 0"));
+        assert!(READ_TRANSLATION_SNAPSHOT.contains("WHEN 'rules' THEN 1"));
+        assert!(READ_TRANSLATION_SNAPSHOT.contains("WHEN 'lua' THEN 2"));
     }
 
     #[test]
@@ -1267,8 +1589,8 @@ mod tests {
             "{}",
         )
         .into_values();
-        values[6] = text(r#""错误形状""#);
-        values[7] = SqliteValue::Blob(vec![0x44; 32]);
+        values[8] = text(r#""错误形状""#);
+        values[9] = SqliteValue::Blob(vec![0x44; 32]);
 
         let error = decode_unit(SqliteRow::new(values), &BTreeSet::from(["builtin"]))
             .expect_err("正文译文必须保持 Lines 形状");
@@ -1280,7 +1602,7 @@ mod tests {
         ));
     }
 
-    fn snapshot_rows(units: Vec<SqliteRow>) -> Vec<SqliteRow> {
+    fn snapshot_rows(group: &RpgMakerLocation, units: Vec<SqliteRow>) -> Vec<SqliteRow> {
         let mut rows = vec![
             snapshot_row(
                 "0_metadata",
@@ -1319,6 +1641,25 @@ mod tests {
                 null_tail(),
             ),
         ];
+        rows.push(snapshot_row(
+            "3_group",
+            text("builtin"),
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            SqliteValue::Null,
+            [
+                text(RpgMakerLocationCodec::encode(group).expect("位置应可编码")),
+                text("event_dialogue"),
+                SqliteValue::Integer(0),
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+            ],
+        ));
         rows.extend(units);
         rows
     }
@@ -1327,11 +1668,12 @@ mod tests {
         group: &RpgMakerLocation,
         kind: &str,
         role: &str,
+        unit_order: i64,
         source_content_json: &str,
         context: &str,
     ) -> SqliteRow {
         snapshot_row(
-            "3_unit",
+            "4_unit",
             text("builtin"),
             SqliteValue::Null,
             SqliteValue::Null,
@@ -1340,7 +1682,9 @@ mod tests {
             [
                 text(RpgMakerLocationCodec::encode(group).expect("位置应可编码")),
                 text(kind),
+                SqliteValue::Integer(0),
                 text(role),
+                SqliteValue::Integer(unit_order),
                 text(source_content_json),
                 text(context),
                 SqliteValue::Null,
@@ -1360,7 +1704,9 @@ mod tests {
             text("builtin"),
             text(RpgMakerLocationCodec::encode(group).expect("位置应可编码")),
             text(kind),
+            SqliteValue::Integer(0),
             text(role),
+            SqliteValue::Integer(0),
             text(source_content_json),
             text(context),
             SqliteValue::Null,
@@ -1375,7 +1721,7 @@ mod tests {
         asset: SqliteValue,
         resource_kind: SqliteValue,
         canonical_json: SqliteValue,
-        tail: [SqliteValue; 7],
+        tail: [SqliteValue; 9],
     ) -> SqliteRow {
         let mut values = vec![
             text(kind),
@@ -1389,7 +1735,7 @@ mod tests {
         SqliteRow::new(values)
     }
 
-    fn null_tail() -> [SqliteValue; 7] {
+    fn null_tail() -> [SqliteValue; 9] {
         std::array::from_fn(|_| SqliteValue::Null)
     }
 

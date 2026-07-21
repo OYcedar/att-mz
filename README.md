@@ -20,7 +20,7 @@ ATT 当前支持 RPG Maker 的 MV 与 MZ 游戏。面对一个新游戏时，先
 才需要 Lua。
 
 - [文本提取现行规格](docs/rpg-maker/extraction.md)
-- [规则编写指南](docs/rpg-maker/rules.md)
+- [规则文件现行规格与编写指南](docs/rpg-maker/rules.md)
 
 提取完成后，同时抽查误收与漏收；命令成功不等于所有玩家可见文本都已正确进入项目。
 
@@ -30,7 +30,7 @@ ATT 当前支持 RPG Maker 的 MV 与 MZ 游戏。面对一个新游戏时，先
 语言对、模型服务和机器资源编写配置。术语表用于约束概念口径，不应代替字段翻译或
 提取规则。
 
-- [术语表制作指南](docs/rpg-maker/terminology.md)
+- [术语文件现行规格与制作指南](docs/rpg-maker/terminology.md)
 - [配置编写与运行能力导航](docs/runtime/README.md)
 - [生产配置现行规格](docs/runtime/configuration.md)
 
@@ -49,5 +49,6 @@ WriteBack 从冻结来源重新建立候选树，不会修改原游戏，也不�
 
 - [写回现行规格](docs/rpg-maker/write-back.md)
 
-需要处理声明式规则无法表达的自定义协议时，再阅读
-[可信 Lua 现行规格](docs/rpg-maker/lua.md)。
+需要处理声明式规则无法表达的自定义协议时，阅读
+[Lua 技术参考](docs/rpg-maker/lua.md)与
+[Lua Cookbook](docs/rpg-maker/lua-cookbook.md)。

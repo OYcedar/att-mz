@@ -16,18 +16,19 @@ use serde_json::{Map, Value};
 
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::rpg_maker::project::OpenedProject;
-use crate::rpg_maker::text::DataFileName;
 pub(crate) use crate::rpg_maker::text::StandardDataFile;
+use crate::rpg_maker::text::{DataFileName, MapId, RpgMakerSource};
 use crate::storage::file_system::{
     DirectoryEntryKind, DirectoryLister, FileReader, ListDirectoryError, ReadFileError,
 };
+use crate::storage::scoped_path::{ExactPathCaseMismatch, resolve_exact_directory_entry};
 
 /// 一个已加载文档的稳定身份。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RpgMakerDocumentId {
     Data(StandardDataFile),
     DataFile(DataFileName),
-    Map(u32),
+    Map(MapId),
 }
 
 /// 调用方本次真正需要的 RPG Maker 文档集合。
@@ -35,7 +36,7 @@ pub(crate) enum RpgMakerDocumentId {
 pub(crate) struct RpgMakerDocumentSelection {
     standard_files: BTreeSet<StandardDataFile>,
     data_files: BTreeSet<DataFileName>,
-    map_ids: BTreeSet<u32>,
+    map_ids: BTreeSet<MapId>,
     all_maps: bool,
     plugins: bool,
 }
@@ -63,17 +64,31 @@ impl RpgMakerDocumentSelection {
         self.standard_files.insert(file);
     }
 
-    /// 请求一个已通过安全基名校验的非标准 `data/*.json` 文档。
+    /// 请求一个已通过安全基名校验的精确 `data/*.json` 文档，并统一收敛其
+    /// 标准文件、规范 Map 或自定义文件身份。
     pub(crate) fn insert_data_file(&mut self, file: DataFileName) {
-        self.data_files.insert(file);
+        match RpgMakerSource::data_file(file) {
+            RpgMakerSource::Data(file) => {
+                self.standard_files.insert(file);
+            }
+            RpgMakerSource::DataFile(file) => {
+                self.data_files.insert(file);
+            }
+            RpgMakerSource::Map(map_id) => {
+                self.map_ids.insert(map_id);
+            }
+            RpgMakerSource::PluginParameter { .. } => {
+                unreachable!("DataFileName 不会产生插件参数来源")
+            }
+        }
     }
 
     pub(crate) fn request_all_maps(&mut self) {
         self.all_maps = true;
     }
 
-    /// 请求一个已由结构化位置确定的精确 Map 文档，不触发目录枚举。
-    pub(crate) fn insert_map(&mut self, map_id: u32) {
+    /// 请求一个已由结构化位置确定的精确 Map 文档。
+    pub(crate) fn insert_map(&mut self, map_id: MapId) {
         self.map_ids.insert(map_id);
     }
 
@@ -93,7 +108,7 @@ impl RpgMakerDocumentSelection {
         self.all_maps
     }
 
-    pub(crate) fn map_ids(&self) -> &BTreeSet<u32> {
+    pub(crate) fn map_ids(&self) -> &BTreeSet<MapId> {
         &self.map_ids
     }
 
@@ -274,7 +289,17 @@ where
                 selection,
             )
             .await
-            .map_err(RpgMakerProjectDocumentReadingError::ListMaps)?;
+            .map_err(|error| match error {
+                BuildDocumentRequestsError::ListData(source) => {
+                    RpgMakerProjectDocumentReadingError::ListData(source)
+                }
+                BuildDocumentRequestsError::ListJs(source) => {
+                    RpgMakerProjectDocumentReadingError::ListJs(source)
+                }
+                BuildDocumentRequestsError::FileNameCaseMismatch(source) => {
+                    RpgMakerProjectDocumentReadingError::FileNameCaseMismatch(source)
+                }
+            })?;
         let read_concurrency = self.config.read_concurrency().get();
         // 第二层只覆盖本次有限请求集合，使读取完成后立即进入 CPU 根的准入等待；
         // 实际执行与已接管队列仍由 CPU 根的统一预算约束。
@@ -346,39 +371,49 @@ where
         data_root: &Path,
         js_root: &Path,
         selection: RpgMakerDocumentSelection,
-    ) -> Result<Vec<DocumentRequest>, ListDirectoryError<L::Error>> {
+    ) -> Result<Vec<DocumentRequest>, BuildDocumentRequestsError<L::Error>> {
+        let data_entries = if !selection.standard_files().is_empty()
+            || !selection.data_files().is_empty()
+            || !selection.map_ids().is_empty()
+            || selection.includes_all_maps()
+        {
+            self.directory_lister
+                .list_directory(data_root.to_path_buf())
+                .await
+                .map_err(BuildDocumentRequestsError::ListData)?
+        } else {
+            Vec::new()
+        };
         let mut documents = BTreeMap::new();
         for file in selection.standard_files() {
-            documents.insert(
-                RpgMakerDocumentId::Data(*file),
-                data_root.join(file.file_name()),
-            );
+            let path = exact_or_requested_path(data_root, file.file_name(), &data_entries)
+                .map_err(BuildDocumentRequestsError::FileNameCaseMismatch)?;
+            documents.insert(RpgMakerDocumentId::Data(*file), path);
         }
         for file in selection.data_files() {
-            documents.insert(
-                RpgMakerDocumentId::DataFile(file.clone()),
-                data_root.join(file.as_str()),
-            );
+            let path = exact_or_requested_path(data_root, file.as_str(), &data_entries)
+                .map_err(BuildDocumentRequestsError::FileNameCaseMismatch)?;
+            documents.insert(RpgMakerDocumentId::DataFile(file.clone()), path);
         }
         for map_id in selection.map_ids() {
-            documents.insert(
-                RpgMakerDocumentId::Map(*map_id),
-                data_root.join(format!("Map{map_id:03}.json")),
-            );
+            let file_name = map_id.file_name();
+            let path = exact_or_requested_path(data_root, &file_name, &data_entries)
+                .map_err(BuildDocumentRequestsError::FileNameCaseMismatch)?;
+            documents.insert(RpgMakerDocumentId::Map(*map_id), path);
         }
 
         if selection.includes_all_maps() {
-            let entries = self
-                .directory_lister
-                .list_directory(data_root.to_path_buf())
-                .await?;
-            for entry in entries {
+            for entry in &data_entries {
                 if entry.kind() != DirectoryEntryKind::RegularFile {
                     continue;
                 }
-                let path = entry.into_path();
-                if let Some(map_id) = canonical_map_id(&path) {
-                    documents.insert(RpgMakerDocumentId::Map(map_id), path);
+                let path = entry.resolved_path();
+                if let Some(map_id) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(MapId::from_canonical_file_name)
+                {
+                    documents.insert(RpgMakerDocumentId::Map(map_id), path.to_path_buf());
                 }
             }
         }
@@ -391,19 +426,48 @@ where
             })
             .collect();
         if selection.includes_plugins() {
+            let entries = self
+                .directory_lister
+                .list_directory(js_root.to_path_buf())
+                .await
+                .map_err(BuildDocumentRequestsError::ListJs)?;
+            let path = exact_or_requested_path(js_root, "plugins.js", &entries)
+                .map_err(BuildDocumentRequestsError::FileNameCaseMismatch)?;
             requests.push(DocumentRequest {
                 kind: DocumentRequestKind::Plugins,
-                path: js_root.join("plugins.js"),
+                path,
             });
         }
         Ok(requests)
     }
 }
 
+fn exact_or_requested_path(
+    parent: &Path,
+    file_name: &str,
+    entries: &[crate::storage::file_system::DirectoryEntry],
+) -> Result<PathBuf, ExactPathCaseMismatch> {
+    resolve_exact_directory_entry(
+        parent,
+        file_name,
+        entries.iter().map(|entry| entry.resolved_path()),
+    )
+    .map(|resolved| resolved.unwrap_or_else(|| parent.join(file_name)))
+}
+
+#[derive(Debug)]
+enum BuildDocumentRequestsError<L> {
+    ListData(ListDirectoryError<L>),
+    ListJs(ListDirectoryError<L>),
+    FileNameCaseMismatch(ExactPathCaseMismatch),
+}
+
 /// 无损读取 RPG Maker 文档时的阶段错误。
 #[derive(Debug)]
 pub(crate) enum RpgMakerProjectDocumentReadingError<F, L, C> {
-    ListMaps(ListDirectoryError<L>),
+    ListData(ListDirectoryError<L>),
+    ListJs(ListDirectoryError<L>),
+    FileNameCaseMismatch(ExactPathCaseMismatch),
     ReadDocument {
         path: PathBuf,
         source: ReadFileError<F>,
@@ -450,7 +514,9 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ListMaps(error) => write!(formatter, "无法发现 RPG Maker 地图文件：{error}"),
+            Self::ListData(error) => write!(formatter, "无法列举 RPG Maker data 目录：{error}"),
+            Self::ListJs(error) => write!(formatter, "无法列举 RPG Maker js 目录：{error}"),
+            Self::FileNameCaseMismatch(error) => error.fmt(formatter),
             Self::ReadDocument { path, source } => {
                 write!(
                     formatter,
@@ -499,7 +565,8 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ListMaps(error) => Some(error),
+            Self::ListData(error) | Self::ListJs(error) => Some(error),
+            Self::FileNameCaseMismatch(error) => Some(error),
             Self::ReadDocument { source, .. } => Some(source),
             Self::ScheduleParse { source, .. } => Some(source),
             Self::InvalidUtf8 { source, .. } => Some(source),
@@ -598,16 +665,6 @@ fn parse_plugins(path: PathBuf, text: &str) -> Result<ParsedDocument, ParseFailu
     Ok(ParsedDocument::Plugins(plugins))
 }
 
-fn canonical_map_id(path: &Path) -> Option<u32> {
-    let file_name = path.file_name()?.to_str()?;
-    let digits = file_name.strip_prefix("Map")?.strip_suffix(".json")?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let id = digits.parse::<u32>().ok()?;
-    (format!("Map{id:03}.json") == file_name).then_some(id)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -665,13 +722,23 @@ mod tests {
 
     #[test]
     fn only_canonical_map_file_names_are_recognized() {
-        assert_eq!(canonical_map_id(Path::new("Map001.json")), Some(1));
-        assert_eq!(canonical_map_id(Path::new("Map999.json")), Some(999));
-        assert_eq!(canonical_map_id(Path::new("Map1000.json")), Some(1000));
-        assert_eq!(canonical_map_id(Path::new("Map01.json")), None);
-        assert_eq!(canonical_map_id(Path::new("Map0001.json")), None);
-        assert_eq!(canonical_map_id(Path::new("MapInfos.json")), None);
-        assert_eq!(canonical_map_id(Path::new("QuestData.json")), None);
+        assert_eq!(
+            MapId::from_canonical_file_name("Map001.json"),
+            Some(map_id(1))
+        );
+        assert_eq!(
+            MapId::from_canonical_file_name("Map999.json"),
+            Some(map_id(999))
+        );
+        assert_eq!(
+            MapId::from_canonical_file_name("Map1000.json"),
+            Some(map_id(1000))
+        );
+        assert_eq!(MapId::from_canonical_file_name("Map000.json"), None);
+        assert_eq!(MapId::from_canonical_file_name("Map01.json"), None);
+        assert_eq!(MapId::from_canonical_file_name("Map0001.json"), None);
+        assert_eq!(MapId::from_canonical_file_name("MapInfos.json"), None);
+        assert_eq!(MapId::from_canonical_file_name("QuestData.json"), None);
     }
 
     #[tokio::test]
@@ -740,7 +807,7 @@ var $plugins =
             .await
             .expect("规范文档应该成功读取");
 
-        assert_eq!(harness.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.list_calls.load(Ordering::SeqCst), 2);
         assert_eq!(harness.file_calls.load(Ordering::SeqCst), 4);
         assert!(harness.max_file_active.load(Ordering::SeqCst) > 1);
         assert!(harness.max_file_active.load(Ordering::SeqCst) <= 3);
@@ -760,13 +827,13 @@ var $plugins =
         );
         assert_eq!(
             documents
-                .document(RpgMakerDocumentId::Map(1))
+                .document(RpgMakerDocumentId::Map(map_id(1)))
                 .expect("Map001 应该存在")["displayName"],
             "村庄"
         );
         assert_eq!(
             documents
-                .document(RpgMakerDocumentId::Map(1000))
+                .document(RpgMakerDocumentId::Map(map_id(1000)))
                 .expect("Map1000 应该存在")["displayName"],
             "隐藏地图"
         );
@@ -777,7 +844,7 @@ var $plugins =
     }
 
     #[tokio::test]
-    async fn exact_map_selection_reads_only_that_map_without_listing_data() {
+    async fn exact_map_selection_lists_data_to_preserve_exact_case_identity() {
         let root = project().source_root().to_path_buf();
         let map = root.join("data").join("Map042.json");
         let harness = Harness::new(
@@ -786,7 +853,7 @@ var $plugins =
             1,
         );
         let mut selection = RpgMakerDocumentSelection::empty();
-        selection.insert_map(42);
+        selection.insert_map(map_id(42));
 
         let documents = harness
             .service()
@@ -794,18 +861,18 @@ var $plugins =
             .await
             .expect("精确 Map 选择应该成功");
 
-        assert_eq!(harness.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.list_calls.load(Ordering::SeqCst), 1);
         assert_eq!(harness.file_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             documents
-                .document(RpgMakerDocumentId::Map(42))
+                .document(RpgMakerDocumentId::Map(map_id(42)))
                 .expect("Map042 应被读取")["displayName"],
             "精确地图"
         );
     }
 
     #[tokio::test]
-    async fn exact_nonstandard_data_file_is_read_without_directory_enumeration() {
+    async fn exact_nonstandard_data_file_is_resolved_from_the_real_directory_entry() {
         let root = project().source_root().to_path_buf();
         let file = DataFileName::parse("Disciplines.json").expect("安全基名应合法");
         let path = root.join("data").join(file.as_str());
@@ -823,7 +890,7 @@ var $plugins =
             .await
             .expect("非标准 JSON 应按精确基名读取");
 
-        assert_eq!(harness.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.list_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             documents
                 .document(RpgMakerDocumentId::DataFile(file))
@@ -892,6 +959,34 @@ var $plugins =
     }
 
     #[tokio::test]
+    async fn case_alias_is_rejected_before_a_platform_can_open_it() {
+        let root = project().source_root().to_path_buf();
+        let actual = root.join("data").join("actors.json");
+        let harness = Harness::new(
+            HashMap::from([(actual.clone(), b"[]".to_vec())]),
+            Vec::new(),
+            1,
+        );
+
+        let error = harness
+            .service()
+            .read(
+                &project(),
+                RpgMakerDocumentSelection::new([StandardDataFile::Actors], false, false),
+            )
+            .await
+            .expect_err("真实文件名大小写不匹配必须显式失败");
+
+        assert!(matches!(
+            error,
+            RpgMakerProjectDocumentReadingError::FileNameCaseMismatch(ref mismatch)
+                if mismatch.requested() == root.join("data").join("Actors.json")
+                    && mismatch.actual() == actual
+        ));
+        assert_eq!(harness.file_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn cpu_panic_is_not_confused_with_a_document_parse_error() {
         let actors = project().source_root().join("data").join("Actors.json");
         let service = RpgMakerProjectDocumentReadingService::new(
@@ -905,7 +1000,7 @@ var $plugins =
                 max_active: Arc::new(AtomicUsize::new(0)),
             },
             FakeDirectoryLister {
-                entries: Arc::new(Vec::new()),
+                entries: Arc::new(vec![actors.clone()]),
                 calls: Arc::new(AtomicUsize::new(0)),
             },
             PanickedCpuExecutor,
@@ -985,13 +1080,14 @@ var $plugins =
 
         async fn list_directory(
             &self,
-            _path: PathBuf,
+            path: PathBuf,
         ) -> Result<Vec<crate::storage::file_system::DirectoryEntry>, ListDirectoryError<Self::Error>>
         {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self
                 .entries
                 .iter()
+                .filter(|entry| entry.parent() == Some(path.as_path()))
                 .cloned()
                 .map(|path| {
                     crate::storage::file_system::DirectoryEntry::new(
@@ -1059,9 +1155,12 @@ var $plugins =
     impl Harness {
         fn new(
             files: HashMap<PathBuf, Vec<u8>>,
-            entries: Vec<PathBuf>,
+            mut entries: Vec<PathBuf>,
             read_concurrency: usize,
         ) -> Self {
+            entries.extend(files.keys().cloned());
+            entries.sort();
+            entries.dedup();
             Self {
                 files: Arc::new(files),
                 entries: Arc::new(entries),
@@ -1142,5 +1241,9 @@ var $plugins =
             "zh-Hans".to_owned(),
             crate::rpg_maker::project::test_layout_profile(),
         )
+    }
+
+    fn map_id(value: u32) -> MapId {
+        MapId::new(value).expect("测试 Map ID 必须为正整数")
     }
 }

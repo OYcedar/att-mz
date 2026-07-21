@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::execution::OperationCompletion;
+use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::lua::runtime::{
     TrustedLuaHostCallError, TrustedLuaPreparedTranslation,
     TrustedLuaPreparedTranslationAcceptance, TrustedLuaPreparedTranslationStatus,
@@ -72,6 +74,7 @@ where
             script_path,
             LuaProjectContext::for_frozen_source(
                 project.name().as_str(),
+                project.layout().rpg_maker_layout().engine(),
                 project.source_content_root(),
                 project.database_path().to_path_buf(),
                 project.language_pair().clone(),
@@ -155,22 +158,36 @@ impl TrustedLuaTranslationSemantics for ResolvedTranslationSemantics {
         &self,
         kind: TextGroupKind,
         original: String,
+        semantic_context: String,
     ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
         let prepared = self
             .prepare(kind, &original)
             .map_err(|source| translation_semantic_error("prepare", source))?;
+        let state_context = lua_translation_state_context(
+            self.global_fingerprint(),
+            self.engine(),
+            kind,
+            &original,
+            &semantic_context,
+            &prepared,
+        );
         let terms = prepared
             .terms()
             .iter()
             .map(|term| TrustedLuaTranslationTerm::new(term.term(), term.translation()))
             .collect();
-        Ok(Arc::new(ResolvedPreparedTranslation { prepared, terms }))
+        Ok(Arc::new(ResolvedPreparedTranslation {
+            prepared,
+            terms,
+            state_context,
+        }))
     }
 }
 
 struct ResolvedPreparedTranslation {
     prepared: PreparedTranslationText,
     terms: Vec<TrustedLuaTranslationTerm>,
+    state_context: LuaTranslationStateContext,
 }
 
 impl TrustedLuaPreparedTranslation for ResolvedPreparedTranslation {
@@ -194,46 +211,154 @@ impl TrustedLuaPreparedTranslation for ResolvedPreparedTranslation {
         &self.terms
     }
 
+    fn is_current(
+        &self,
+        translation: String,
+        state: Sha256Fingerprint,
+    ) -> Result<bool, TrustedLuaHostCallError> {
+        Ok(self.state_context.finish(&translation) == state)
+    }
+
     fn accept(
         &self,
         candidate: String,
     ) -> Result<TrustedLuaPreparedTranslationAcceptance, TrustedLuaHostCallError> {
+        if candidate.contains('\r') {
+            return Ok(TrustedLuaPreparedTranslationAcceptance::rejected(
+                "contains_carriage_return",
+            ));
+        }
+        if candidate.contains('\0') {
+            return Ok(TrustedLuaPreparedTranslationAcceptance::rejected(
+                "contains_nul",
+            ));
+        }
+        if candidate.chars().all(char::is_whitespace) {
+            return Ok(TrustedLuaPreparedTranslationAcceptance::rejected(
+                "blank_translation",
+            ));
+        }
         match self
             .prepared
             .accept(candidate)
             .map_err(|source| translation_semantic_error("accept", source))?
         {
-            PreparedTranslationAcceptance::Accepted(translation) => Ok(
-                TrustedLuaPreparedTranslationAcceptance::accepted(translation),
-            ),
+            PreparedTranslationAcceptance::Accepted(translation) => {
+                let state = self.state_context.finish(&translation);
+                Ok(TrustedLuaPreparedTranslationAcceptance::accepted(
+                    translation,
+                    state,
+                ))
+            }
             PreparedTranslationAcceptance::Rejected(reason) => Ok(
-                TrustedLuaPreparedTranslationAcceptance::rejected(rejection_code(&reason)),
+                TrustedLuaPreparedTranslationAcceptance::rejected(rejection_code(&reason)?),
             ),
         }
     }
 }
 
-fn rejection_code(reason: &PreparedTranslationRejection) -> &'static str {
+#[derive(Clone, Copy)]
+struct LuaTranslationStateContext(Sha256Fingerprint);
+
+impl LuaTranslationStateContext {
+    fn finish(self, translation: &str) -> Sha256Fingerprint {
+        let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.lua-translation-state");
+        hasher
+            .frame(1, self.0.as_bytes())
+            .frame(2, translation.as_bytes());
+        hasher.finish()
+    }
+}
+
+fn lua_translation_state_context(
+    global_semantics: Sha256Fingerprint,
+    engine: RpgMakerEngine,
+    kind: TextGroupKind,
+    original: &str,
+    semantic_context: &str,
+    prepared: &PreparedTranslationText,
+) -> LuaTranslationStateContext {
+    let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.lua-translation-context");
+    hasher
+        .frame(1, global_semantics.as_bytes())
+        .frame(2, engine.storage_name().as_bytes())
+        .frame(3, group_kind_name(kind))
+        .frame(4, original.as_bytes())
+        .frame(5, semantic_context.as_bytes())
+        .frame(6, prepared.status().storage_name().as_bytes())
+        .frame(7, prepared.model_text().as_bytes());
+    for placeholder in prepared.placeholders() {
+        let origin = match placeholder.origin() {
+            super::standard::PlaceholderRuleOrigin::BuiltIn => b"builtin".as_slice(),
+            super::standard::PlaceholderRuleOrigin::Custom => b"custom".as_slice(),
+        };
+        let segment = match placeholder.segment() {
+            super::standard::PlaceholderSegment::Whole => b"whole".as_slice(),
+            super::standard::PlaceholderSegment::Begin => b"begin".as_slice(),
+            super::standard::PlaceholderSegment::End => b"end".as_slice(),
+        };
+        hasher
+            .frame(20, placeholder.token().as_bytes())
+            .frame(21, placeholder.original().as_bytes())
+            .frame(22, origin)
+            .frame(23, placeholder.label().as_bytes())
+            .frame(24, placeholder.scope().as_bytes())
+            .frame(25, segment);
+    }
+    for term in prepared.terms() {
+        hasher
+            .frame(30, term.term().as_bytes())
+            .frame(31, term.translation().as_bytes());
+    }
+    LuaTranslationStateContext(hasher.finish())
+}
+
+const fn group_kind_name(kind: TextGroupKind) -> &'static [u8] {
+    match kind {
+        TextGroupKind::DatabaseEntry => b"database_entry",
+        TextGroupKind::System => b"system",
+        TextGroupKind::Map => b"map",
+        TextGroupKind::EventDialogue => b"dialogue",
+        TextGroupKind::EventChoices => b"choices",
+        TextGroupKind::EventScrollingText => b"scrolling_text",
+        TextGroupKind::EventCommand => b"event_command",
+        TextGroupKind::PluginParameter => b"plugin_parameter",
+    }
+}
+
+fn rejection_code(
+    reason: &PreparedTranslationRejection,
+) -> Result<&'static str, TrustedLuaHostCallError> {
     match reason {
-        PreparedTranslationRejection::NotActive(status) => status.storage_name(),
+        PreparedTranslationRejection::NotActive(status) => Ok(status.storage_name()),
         PreparedTranslationRejection::Candidate(reason) => match reason {
-            TranslationUnitRejectionReason::Missing => "missing",
-            TranslationUnitRejectionReason::Duplicate => "duplicate",
-            TranslationUnitRejectionReason::InvalidShape { .. } => "invalid_shape",
-            TranslationUnitRejectionReason::LineCountMismatch { .. } => "line_count_mismatch",
-            TranslationUnitRejectionReason::InvalidLineText { .. } => "invalid_line_text",
-            TranslationUnitRejectionReason::BlankLineMismatch { .. } => "blank_line_mismatch",
-            TranslationUnitRejectionReason::BlankTranslation => "blank_translation",
-            TranslationUnitRejectionReason::NoNaturalLanguageText => "no_natural_language_text",
-            TranslationUnitRejectionReason::ContainsByteOrderMark => "contains_byte_order_mark",
-            TranslationUnitRejectionReason::PlaceholderMismatch { .. } => "placeholder_mismatch",
+            TranslationUnitRejectionReason::BlankTranslation => Ok("blank_translation"),
+            TranslationUnitRejectionReason::NoNaturalLanguageText => Ok("no_natural_language_text"),
+            TranslationUnitRejectionReason::ContainsByteOrderMark => Ok("contains_byte_order_mark"),
+            TranslationUnitRejectionReason::PlaceholderMismatch { .. } => {
+                Ok("placeholder_mismatch")
+            }
             TranslationUnitRejectionReason::UnexpectedPlaceholderToken { .. } => {
-                "unexpected_placeholder_token"
+                Ok("unexpected_placeholder_token")
             }
             TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { .. } => {
-                "placeholder_normalization_ambiguous"
+                Ok("placeholder_normalization_ambiguous")
             }
-            TranslationUnitRejectionReason::SourceResidual { .. } => "source_residual",
+            TranslationUnitRejectionReason::SourceResidual { .. } => Ok("source_residual"),
+            TranslationUnitRejectionReason::Missing
+            | TranslationUnitRejectionReason::Duplicate
+            | TranslationUnitRejectionReason::InvalidShape { .. }
+            | TranslationUnitRejectionReason::LineCountMismatch { .. }
+            | TranslationUnitRejectionReason::InvalidLineText { .. }
+            | TranslationUnitRejectionReason::BlankLineMismatch { .. } => {
+                Err(TrustedLuaHostCallError::new(
+                    "translation",
+                    "internal_invariant",
+                    "Lua 标量验收产生了 Standard 响应结构专用拒绝原因",
+                    None,
+                    None,
+                ))
+            }
         },
     }
 }
@@ -344,6 +469,7 @@ mod tests {
             &self,
             _kind: TextGroupKind,
             _original: String,
+            _semantic_context: String,
         ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
             Err(TrustedLuaHostCallError::new(
                 "test",
@@ -382,34 +508,8 @@ mod tests {
     }
 
     #[test]
-    fn candidate_rejection_codes_cover_the_current_unit_protocol() {
+    fn candidate_rejection_codes_only_expose_scalar_protocol_reasons() {
         let cases = [
-            (TranslationUnitRejectionReason::Missing, "missing"),
-            (TranslationUnitRejectionReason::Duplicate, "duplicate"),
-            (
-                TranslationUnitRejectionReason::InvalidShape {
-                    message: "测试".to_owned(),
-                },
-                "invalid_shape",
-            ),
-            (
-                TranslationUnitRejectionReason::LineCountMismatch {
-                    expected: 2,
-                    actual: 1,
-                },
-                "line_count_mismatch",
-            ),
-            (
-                TranslationUnitRejectionReason::InvalidLineText { line_index: 1 },
-                "invalid_line_text",
-            ),
-            (
-                TranslationUnitRejectionReason::BlankLineMismatch {
-                    line_index: 1,
-                    expected_blank: true,
-                },
-                "blank_line_mismatch",
-            ),
             (
                 TranslationUnitRejectionReason::BlankTranslation,
                 "blank_translation",
@@ -450,9 +550,31 @@ mod tests {
 
         for (reason, expected) in cases {
             assert_eq!(
-                rejection_code(&PreparedTranslationRejection::Candidate(reason)),
-                expected
+                rejection_code(&PreparedTranslationRejection::Candidate(reason))
+                    .expect("标量拒绝原因应可公开"),
+                expected,
             );
+        }
+
+        for reason in [
+            TranslationUnitRejectionReason::Missing,
+            TranslationUnitRejectionReason::Duplicate,
+            TranslationUnitRejectionReason::InvalidShape {
+                message: "测试".to_owned(),
+            },
+            TranslationUnitRejectionReason::LineCountMismatch {
+                expected: 2,
+                actual: 1,
+            },
+            TranslationUnitRejectionReason::InvalidLineText { line_index: 1 },
+            TranslationUnitRejectionReason::BlankLineMismatch {
+                line_index: 1,
+                expected_blank: true,
+            },
+        ] {
+            let error = rejection_code(&PreparedTranslationRejection::Candidate(reason))
+                .expect_err("Standard 响应结构错误不属于 Lua 标量协议");
+            assert_eq!(error.kind(), "internal_invariant");
         }
     }
 
@@ -464,6 +586,7 @@ mod tests {
             &semantics,
             TextGroupKind::DatabaseEntry,
             r"\C[2]勇者".to_owned(),
+            "speaker=Harold".to_owned(),
         )
         .expect("共享语义应完成占位符保护");
         assert_eq!(active.status(), TrustedLuaPreparedTranslationStatus::Active);
@@ -472,17 +595,30 @@ mod tests {
             "⟦ATT_RPG_MAKER_CONTROL_WHOLE_0000⟧勇者"
         );
         assert!(active.terms().is_empty());
-        assert_eq!(
+        let acceptance = active
+            .accept("英雄⟦ATT_RPG_MAKER_CONTROL_WHOLE_0000⟧".to_owned())
+            .expect("共享验收应可执行");
+        let TrustedLuaPreparedTranslationAcceptance::Accepted { translation, state } = acceptance
+        else {
+            panic!("合法标量候选应被接受")
+        };
+        assert_eq!(translation, r"英雄\C[2]");
+        assert!(
             active
-                .accept("英雄⟦ATT_RPG_MAKER_CONTROL_WHOLE_0000⟧".to_owned())
-                .expect("共享验收应可执行"),
-            TrustedLuaPreparedTranslationAcceptance::accepted(r"英雄\C[2]")
+                .is_current(translation.clone(), state)
+                .expect("Current 比较应可执行")
+        );
+        assert!(
+            !active
+                .is_current("不同译文".to_owned(), state)
+                .expect("Current 比较应可执行")
         );
 
         let non_source = TrustedLuaTranslationSemantics::prepare_translation(
             &semantics,
             TextGroupKind::Map,
             "New Game".to_owned(),
+            String::new(),
         )
         .expect("非源语言文本应是正常状态");
         assert_eq!(
@@ -500,6 +636,7 @@ mod tests {
             &semantics,
             TextGroupKind::EventDialogue,
             r"\C[2]".to_owned(),
+            String::new(),
         )
         .expect("全保护文本应是正常状态");
         assert_eq!(
@@ -511,6 +648,77 @@ mod tests {
                 .accept("⟦ATT_RPG_MAKER_CONTROL_WHOLE_0000⟧".to_owned())
                 .expect("非 active 状态应返回普通拒绝"),
             TrustedLuaPreparedTranslationAcceptance::rejected("fully_protected")
+        );
+    }
+
+    #[test]
+    fn scalar_accept_allows_lf_and_rejects_cr_nul_and_blank_text() {
+        let semantics = ResolvedTranslationSemantics::for_test();
+        let prepared = TrustedLuaTranslationSemantics::prepare_translation(
+            &semantics,
+            TextGroupKind::Map,
+            "勇者".to_owned(),
+            String::new(),
+        )
+        .expect("测试文本应可准备");
+
+        let accepted = prepared
+            .accept("英雄\n再次出发".to_owned())
+            .expect("LF 标量应可验收");
+        assert!(matches!(
+            accepted,
+            TrustedLuaPreparedTranslationAcceptance::Accepted { ref translation, .. }
+                if translation == "英雄\n再次出发"
+        ));
+        for (candidate, expected) in [
+            ("英雄\r返回", "contains_carriage_return"),
+            ("英雄\0返回", "contains_nul"),
+            (" \n\t", "blank_translation"),
+        ] {
+            assert_eq!(
+                prepared
+                    .accept(candidate.to_owned())
+                    .expect("内容拒绝应是普通结果"),
+                TrustedLuaPreparedTranslationAcceptance::rejected(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_state_binds_script_context_and_final_translation_deterministically() {
+        let semantics = ResolvedTranslationSemantics::for_test();
+        let prepare = |context: &str| {
+            TrustedLuaTranslationSemantics::prepare_translation(
+                &semantics,
+                TextGroupKind::Map,
+                "勇者".to_owned(),
+                context.to_owned(),
+            )
+            .expect("测试文本应可准备")
+        };
+        let accept = |prepared: &Arc<dyn TrustedLuaPreparedTranslation>| {
+            let TrustedLuaPreparedTranslationAcceptance::Accepted { translation, state } = prepared
+                .accept("英雄".to_owned())
+                .expect("候选验收应可执行")
+            else {
+                panic!("合法候选应被接受")
+            };
+            (translation, state)
+        };
+
+        let first = prepare("speaker=Harold");
+        let same = prepare("speaker=Harold");
+        let changed = prepare("speaker=Therese");
+        let (translation, first_state) = accept(&first);
+        let (_, same_state) = accept(&same);
+        let (_, changed_state) = accept(&changed);
+
+        assert_eq!(first_state, same_state);
+        assert_ne!(first_state, changed_state);
+        assert!(
+            first
+                .is_current(translation, first_state)
+                .expect("Current 比较应可执行")
         );
     }
 

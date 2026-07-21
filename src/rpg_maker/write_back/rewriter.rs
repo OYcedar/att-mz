@@ -751,7 +751,7 @@ fn replace_string_at(
     replacement: &str,
     location: &RpgMakerLocation,
 ) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
-    let Some((step, remaining)) = steps.split_first() else {
+    edit_value_at_steps(value, steps, location, |value| {
         let actual = value
             .as_str()
             .ok_or_else(|| mutation_failure(location, "目标值不是字符串"))?;
@@ -762,7 +762,25 @@ fn replace_string_at(
             ));
         }
         *value = Value::String(replacement.to_owned());
-        return Ok(());
+        Ok(())
+    })
+}
+
+/// 沿结构化路径编辑一个值，并在每个 `DecodeJsonString` 边界成功返回后逐层写回。
+///
+/// 解码后的值只存在于当前调用的局部副本中；任一深层定位、验收或重编码失败时，
+/// 对应的外层 JSON string 都不会被替换。
+fn edit_value_at_steps<R, F>(
+    value: &mut Value,
+    steps: &[RpgMakerLocationStep],
+    location: &RpgMakerLocation,
+    edit: F,
+) -> Result<R, RpgMakerWriteBackDocumentRewriteFailure>
+where
+    F: FnOnce(&mut Value) -> Result<R, RpgMakerWriteBackDocumentRewriteFailure>,
+{
+    let Some((step, remaining)) = steps.split_first() else {
+        return edit(value);
     };
 
     match step {
@@ -771,14 +789,14 @@ fn replace_string_at(
                 .as_object_mut()
                 .and_then(|object| object.get_mut(key))
                 .ok_or_else(|| mutation_failure(location, "对象路径不存在或父值不是对象"))?;
-            replace_string_at(child, remaining, expected, replacement, location)
+            edit_value_at_steps(child, remaining, location, edit)
         }
         RpgMakerLocationStep::ArrayIndex(index) => {
             let child = value
                 .as_array_mut()
                 .and_then(|array| array.get_mut(*index))
                 .ok_or_else(|| mutation_failure(location, "数组路径越界或父值不是数组"))?;
-            replace_string_at(child, remaining, expected, replacement, location)
+            edit_value_at_steps(child, remaining, location, edit)
         }
         RpgMakerLocationStep::DecodeJsonString => {
             let raw = value
@@ -790,7 +808,7 @@ fn replace_string_at(
                     source,
                 }
             })?;
-            replace_string_at(&mut decoded, remaining, expected, replacement, location)?;
+            let result = edit_value_at_steps(&mut decoded, remaining, location, edit)?;
             let encoded = serde_json::to_string(&decoded).map_err(|source| {
                 RpgMakerWriteBackDocumentRewriteFailure::EncodeNestedJson {
                     location: Box::new(location.clone()),
@@ -798,7 +816,7 @@ fn replace_string_at(
                 }
             })?;
             *value = Value::String(encoded);
-            Ok(())
+            Ok(result)
         }
     }
 }
@@ -810,18 +828,18 @@ fn apply_note_mutations(
 ) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
     let representative = mutations[0].exact_location();
     let (document, id) = documents.document_mut(&key.source, representative)?;
-    let container = value_at_structural_steps_mut(document, &key.steps, representative)?;
-    let note = container
-        .as_object_mut()
-        .and_then(|object| object.get_mut("note"))
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| mutation_failure(representative, "NoteTag 容器没有字符串 note 字段"))?
-        .to_owned();
-    let replaced = replace_tag_values(&note, &mutations, TagKind::Note)?;
-    container
-        .as_object_mut()
-        .expect("上方已确认 NoteTag 容器是对象")
-        .insert("note".to_owned(), Value::String(replaced));
+    edit_value_at_steps(document, &key.steps, representative, |container| {
+        let object = container
+            .as_object_mut()
+            .ok_or_else(|| mutation_failure(representative, "NoteTag 容器不是对象"))?;
+        let note = object
+            .get("note")
+            .and_then(Value::as_str)
+            .ok_or_else(|| mutation_failure(representative, "NoteTag 容器没有字符串 note 字段"))?;
+        let replaced = replace_tag_values(note, &mutations, TagKind::Note)?;
+        object.insert("note".to_owned(), Value::String(replaced));
+        Ok(())
+    })?;
     documents.mark_document_changed(id);
     Ok(())
 }
@@ -944,28 +962,33 @@ fn apply_comment_mutations(
 ) -> Result<(), RpgMakerWriteBackDocumentRewriteFailure> {
     let representative = mutations[0].exact_location();
     let (document, id) = documents.document_mut(&key.source, representative)?;
-    let list = event_list_mut(document, &key.list_steps, representative)?;
-    let end = comment_block_end(list, key.start_index, representative)?;
-    let originals = list[key.start_index..end].to_vec();
-    let mut lines = Vec::with_capacity(originals.len());
-    for command in &originals {
-        lines.push(command_text(command, 108, 408, representative)?.to_owned());
-    }
-    let replaced = replace_tag_values(&lines.join("\n"), &mutations, TagKind::Comment)?;
-    let rebuilt_lines: Vec<_> = replaced.split('\n').collect();
-    let mut rebuilt = Vec::with_capacity(rebuilt_lines.len());
-    for (index, line) in rebuilt_lines.into_iter().enumerate() {
-        let template = originals
-            .get(index)
-            .unwrap_or_else(|| originals.last().expect("注释块至少有一条命令"));
-        rebuilt.push(rewrite_command(
-            template,
-            if index == 0 { 108 } else { 408 },
-            line,
-            representative,
-        )?);
-    }
-    list.splice(key.start_index..end, rebuilt);
+    edit_value_at_steps(document, &key.list_steps, representative, |value| {
+        let list = value
+            .as_array_mut()
+            .ok_or_else(|| mutation_failure(representative, "事件 list 位置不是数组"))?;
+        let end = comment_block_end(list, key.start_index, representative)?;
+        let originals = list[key.start_index..end].to_vec();
+        let mut lines = Vec::with_capacity(originals.len());
+        for command in &originals {
+            lines.push(command_text(command, 108, 408, representative)?.to_owned());
+        }
+        let replaced = replace_tag_values(&lines.join("\n"), &mutations, TagKind::Comment)?;
+        let rebuilt_lines: Vec<_> = replaced.split('\n').collect();
+        let mut rebuilt = Vec::with_capacity(rebuilt_lines.len());
+        for (index, line) in rebuilt_lines.into_iter().enumerate() {
+            let template = originals
+                .get(index)
+                .unwrap_or_else(|| originals.last().expect("注释块至少有一条命令"));
+            rebuilt.push(rewrite_command(
+                template,
+                if index == 0 { 108 } else { 408 },
+                line,
+                representative,
+            )?);
+        }
+        list.splice(key.start_index..end, rebuilt);
+        Ok(())
+    })?;
     documents.mark_document_changed(id);
     Ok(())
 }
@@ -1722,9 +1745,7 @@ fn relative_document_path(id: &RpgMakerDocumentId) -> PathBuf {
     match id {
         RpgMakerDocumentId::Data(file) => PathBuf::from("data").join(file.file_name()),
         RpgMakerDocumentId::DataFile(file) => PathBuf::from("data").join(file.as_str()),
-        RpgMakerDocumentId::Map(map_id) => {
-            PathBuf::from("data").join(format!("Map{map_id:03}.json"))
-        }
+        RpgMakerDocumentId::Map(map_id) => PathBuf::from("data").join(map_id.file_name()),
     }
 }
 
@@ -1874,16 +1895,20 @@ impl Error for RpgMakerWriteBackDocumentRewriteFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use serde_json::json;
 
     use super::*;
     use crate::rpg_maker::extract::document::PluginConfiguration;
+    use crate::rpg_maker::lua::document::{OpenedRpgMakerDocument, RpgMakerTextReference};
+    use crate::rpg_maker::lua::json::HostValueBudget;
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
-        DirectTextPart, DirectTextRecipe, TextUnitRole,
+        DirectTextPart, DirectTextRecipe, MutationClaim, TextUnitRole,
     };
     use crate::rpg_maker::project::test_layout_profile;
-    use crate::rpg_maker::text::StandardDataFile;
+    use crate::rpg_maker::text::{MapId, StandardDataFile};
     use crate::rpg_maker::write_back::standard::{
         EventBodyMutationSegment, RpgMakerWriteBackLaidOutLine, StandardWriteBackMutation,
     };
@@ -2046,7 +2071,10 @@ mod tests {
 
         let selection = selection_for_plan(&plan);
 
-        assert_eq!(selection.map_ids(), &BTreeSet::from([42]));
+        assert_eq!(
+            selection.map_ids(),
+            &BTreeSet::from([MapId::new(42).unwrap()])
+        );
         assert!(!selection.includes_all_maps());
         assert!(selection.includes_plugins());
     }
@@ -2203,6 +2231,148 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_note_tag_through_two_extract_reachable_decode_boundaries() {
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let document = json!([
+            null,
+            {
+                "payload": " { \"entry\" : \"{\\\"note\\\":\\\"<Help:旧帮助>\\\",\\\"kept\\\":7}\", \"title\" : \"勇者\" } ",
+                "outside": true
+            }
+        ]);
+        let frozen = serde_json::to_vec(&document).expect("冻结文档应可编码");
+        let opened = OpenedRpgMakerDocument::open(source.clone(), &frozen, lua_document_budget())
+            .expect("Lua Extract 应能打开冻结文档");
+        let container_steps = vec![
+            RpgMakerLocationStep::index(1),
+            RpgMakerLocationStep::key("payload"),
+            RpgMakerLocationStep::DecodeJsonString,
+            RpgMakerLocationStep::key("entry"),
+            RpgMakerLocationStep::DecodeJsonString,
+        ];
+        let reference = opened
+            .note_tag(&container_steps, "Help", 0)
+            .expect("Lua Extract 应能建立双层 decoded NoteTag 引用");
+        assert_eq!(reference.original(), "旧帮助");
+        let documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([(RpgMakerDocumentId::Data(StandardDataFile::Items), document)]),
+            Vec::new(),
+        );
+
+        let candidate = rewrite_documents(
+            project_name(),
+            workspace_root(),
+            documents,
+            plan(vec![set_text_reference(&reference, "新帮助")]),
+        )
+        .expect("双层 decoded NoteTag 应可写回");
+
+        let items: Value =
+            serde_json::from_str(file_text(&candidate, Path::new("data/Items.json")))
+                .expect("Items 候选应为 JSON");
+        assert_eq!(
+            items[1]["payload"],
+            r#"{"entry":"{\"note\":\"<Help:新帮助>\",\"kept\":7}","title":"勇者"}"#
+        );
+        assert_eq!(items[1]["outside"], true);
+    }
+
+    #[test]
+    fn rewrites_108_408_comment_tag_inside_extract_reachable_decoded_list() {
+        let source = RpgMakerSource::map(8);
+        let document = json!({
+            "payload": " { \"events\" : [{\"list\":[{\"code\":108,\"indent\":2,\"parameters\":[\"<Quest:第一\"],\"unknown\":\"first\"},{\"code\":408,\"indent\":2,\"parameters\":[\"行>\"],\"unknown\":\"continued\"},{\"code\":0,\"indent\":2,\"parameters\":[]}]}], \"kept\" : \"勇者\" } ",
+            "outside": 9
+        });
+        let frozen = serde_json::to_vec(&document).expect("冻结文档应可编码");
+        let opened = OpenedRpgMakerDocument::open(source.clone(), &frozen, lua_document_budget())
+            .expect("Lua Extract 应能打开冻结 Map");
+        let command_steps = vec![
+            RpgMakerLocationStep::key("payload"),
+            RpgMakerLocationStep::DecodeJsonString,
+            RpgMakerLocationStep::key("events"),
+            RpgMakerLocationStep::index(0),
+            RpgMakerLocationStep::key("list"),
+            RpgMakerLocationStep::index(0),
+        ];
+        let reference = opened
+            .comment_tag(&command_steps, "Quest", 0)
+            .expect("Lua Extract 应能建立 decoded 108+408 CommentTag 引用");
+        assert_eq!(reference.original(), "第一\n行");
+        let documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([(RpgMakerDocumentId::Map(MapId::new(8).unwrap()), document)]),
+            Vec::new(),
+        );
+
+        let candidate = rewrite_documents(
+            project_name(),
+            workspace_root(),
+            documents,
+            plan(vec![set_text_reference(&reference, "已译\n完成")]),
+        )
+        .expect("decoded 108+408 CommentTag 应可写回");
+
+        let map: Value = serde_json::from_str(file_text(&candidate, Path::new("data/Map008.json")))
+            .expect("Map 候选应为 JSON");
+        let payload = map["payload"]
+            .as_str()
+            .expect("外层 payload 应保持 JSON string");
+        assert_eq!(
+            payload,
+            r#"{"events":[{"list":[{"code":108,"indent":2,"parameters":["<Quest:已译"],"unknown":"first"},{"code":408,"indent":2,"parameters":["完成>"],"unknown":"continued"},{"code":0,"indent":2,"parameters":[]}]}],"kept":"勇者"}"#
+        );
+        assert_eq!(map["outside"], 9);
+    }
+
+    #[test]
+    fn failed_deep_validation_does_not_commit_any_decoded_container_level() {
+        let location = RpgMakerLocation::note_tag(
+            RpgMakerSource::data(StandardDataFile::Items),
+            vec![
+                RpgMakerLocationStep::key("payload"),
+                RpgMakerLocationStep::DecodeJsonString,
+                RpgMakerLocationStep::key("entry"),
+                RpgMakerLocationStep::DecodeJsonString,
+            ],
+            "Help",
+            0,
+        );
+        let mut document = json!({
+            "payload": " { \"entry\" : \"{\\\"note\\\":\\\"<Help:原文>\\\",\\\"kept\\\":7}\", \"outerKept\" : true } "
+        });
+        let original = document.clone();
+        let RpgMakerLocation::NoteTag {
+            container_steps, ..
+        } = &location
+        else {
+            unreachable!("测试位置固定为 NoteTag");
+        };
+
+        let error = edit_value_at_steps(&mut document, container_steps, &location, |container| {
+            let note = container
+                .as_object_mut()
+                .and_then(|object| object.get_mut("note"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| mutation_failure(&location, "测试 NoteTag 容器无效"))?;
+            if note != "<Help:漂移原文>" {
+                return Err(mutation_failure(
+                    &location,
+                    "标签值与 expected_original 不一致",
+                ));
+            }
+            Ok(())
+        })
+        .expect_err("深层 expected_original 漂移必须失败");
+
+        assert!(matches!(
+            error,
+            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { message, .. }
+                if message.contains("expected_original")
+        ));
+        assert_eq!(document, original, "失败不得提交任何一层 decoded string");
+    }
+
+    #[test]
     fn applies_structural_mutations_in_descending_frozen_index_order() {
         let source = RpgMakerSource::map(7);
         let list_steps = vec![RpgMakerLocationStep::key("list")];
@@ -2218,7 +2388,7 @@ mod tests {
             "unknown": {"kept": true}
         });
         let documents = RpgMakerProjectDocuments::new(
-            BTreeMap::from([(RpgMakerDocumentId::Map(7), document)]),
+            BTreeMap::from([(RpgMakerDocumentId::Map(MapId::new(7).unwrap()), document)]),
             Vec::new(),
         );
         let comment_steps = [list_steps.clone(), vec![RpgMakerLocationStep::index(3)]].concat();
@@ -2276,13 +2446,24 @@ mod tests {
             ]),
         )
         .expect("对话测试计划应该合法");
+        let comment_backing = vec![segment_location(3), segment_location(4)];
+        let comment_mutation = |location: RpgMakerLocation, expected: &str, replacement: &str| {
+            let claim = MutationClaim::comment_tag(location.clone(), comment_backing.clone())
+                .expect("CommentTag 测试 Claim 应声明完整 108/408 backing");
+            StandardWriteBackMutation::SetText(SetTextMutation::for_test_with_claim(
+                location,
+                claim,
+                expected,
+                replacement,
+            ))
+        };
         let plan = plan(vec![
-            set_text(
+            comment_mutation(
                 RpgMakerLocation::comment_tag(source.clone(), comment_steps.clone(), "Tag", 0),
                 "旧\n值",
                 "新",
             ),
-            set_text(
+            comment_mutation(
                 RpgMakerLocation::comment_tag(source, comment_steps, "Tag", 1),
                 "二",
                 "第二",
@@ -2380,7 +2561,7 @@ mod tests {
                     .expect("自由断行正文应建立一个原子 Mutation");
             let documents = RpgMakerProjectDocuments::new(
                 BTreeMap::from([(
-                    RpgMakerDocumentId::Map(70),
+                    RpgMakerDocumentId::Map(MapId::new(70).unwrap()),
                     json!({
                         "list": [
                             {"code":101,"indent":0,"parameters":["",0,0,2],"headerUnknown":true},
@@ -2481,7 +2662,7 @@ mod tests {
         .expect("MV 对话 Mutation 应合法");
         let documents = RpgMakerProjectDocuments::new(
             BTreeMap::from([(
-                RpgMakerDocumentId::Map(8),
+                RpgMakerDocumentId::Map(MapId::new(8).unwrap()),
                 json!({
                     "list": [
                         {"code":101,"indent":0,"parameters":["",0,0,2],"headerUnknown":true},
@@ -2584,7 +2765,10 @@ mod tests {
             }
             list.push(json!({"code":0,"indent":0,"parameters":[]}));
             RpgMakerProjectDocuments::new(
-                BTreeMap::from([(RpgMakerDocumentId::Map(9), json!({"list":list}))]),
+                BTreeMap::from([(
+                    RpgMakerDocumentId::Map(MapId::new(9).unwrap()),
+                    json!({"list":list}),
+                )]),
                 Vec::new(),
             )
         };
@@ -2663,7 +2847,7 @@ mod tests {
         .expect("选项 Mutation 应合法");
         let documents = RpgMakerProjectDocuments::new(
             BTreeMap::from([(
-                RpgMakerDocumentId::Map(10),
+                RpgMakerDocumentId::Map(MapId::new(10).unwrap()),
                 json!({
                     "list": [
                         {"code":102,"indent":0,"parameters":[["はい","いいえ"],0,0,2,0],"headerUnknown":true},
@@ -2935,7 +3119,7 @@ mod tests {
                     json!([null, {"name": "角色现值"}]),
                 ),
                 (
-                    RpgMakerDocumentId::Map(1),
+                    RpgMakerDocumentId::Map(MapId::new(1).unwrap()),
                     json!({"displayName": "地图现值"}),
                 ),
             ]),
@@ -2984,6 +3168,26 @@ mod tests {
             expected,
             replacement,
         ))
+    }
+
+    fn set_text_reference(
+        reference: &RpgMakerTextReference,
+        replacement: impl Into<String>,
+    ) -> StandardWriteBackMutation {
+        StandardWriteBackMutation::SetText(SetTextMutation::for_test_with_claim(
+            reference.location().clone(),
+            reference.mutation_claim().clone(),
+            reference.original(),
+            replacement,
+        ))
+    }
+
+    fn lua_document_budget() -> HostValueBudget {
+        HostValueBudget::new(
+            NonZeroUsize::new(64 * 1024).unwrap(),
+            NonZeroUsize::new(4096).unwrap(),
+            NonZeroUsize::new(64).unwrap(),
+        )
     }
 
     fn plan(mutations: Vec<StandardWriteBackMutation>) -> StandardWriteBackMutationPlan {

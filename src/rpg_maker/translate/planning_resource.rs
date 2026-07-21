@@ -24,6 +24,128 @@ pub(crate) struct TranslationPlanningResources {
     placeholder_rules_json: String,
 }
 
+#[cfg(test)]
+mod documentation_contract_tests {
+    use crate::rpg_maker::documentation_test::{ClassifiedExampleKind, classified_toml_fences};
+    use crate::rpg_maker::translate::placeholder::Pcre2PlaceholderService;
+
+    use super::{compile_terminology, parse_placeholder_toml, parse_terminology_toml};
+
+    const PLACEHOLDER_EXAMPLE: &[u8] =
+        include_bytes!("../../../docs/rpg-maker/examples/placeholders.toml");
+    const TERMINOLOGY_EXAMPLE: &[u8] =
+        include_bytes!("../../../docs/rpg-maker/examples/terminology.toml");
+    const RULES_GUIDE: &str = include_str!("../../../docs/rpg-maker/rules.md");
+    const TERMINOLOGY_GUIDE: &str = include_str!("../../../docs/rpg-maker/terminology.md");
+
+    #[test]
+    fn documented_placeholder_rules_use_the_production_parser_and_compiler() {
+        let definitions = parse_placeholder_toml(PLACEHOLDER_EXAMPLE)
+            .expect("文档中的 Placeholder Rules 必须通过生产解析边界");
+        assert!(!definitions.is_empty(), "完整示例必须至少声明一条规则");
+        Pcre2PlaceholderService::new()
+            .expect("Builtin Placeholder PCRE2 应可建立")
+            .compile_custom(definitions)
+            .expect("文档中的 Placeholder Rules 必须通过生产 PCRE2 编译边界");
+    }
+
+    #[test]
+    fn documented_terminology_uses_the_production_parser_and_compiler() {
+        let entries = parse_terminology_toml(TERMINOLOGY_EXAMPLE)
+            .expect("文档中的 Terminology 必须通过生产解析边界");
+        assert!(!entries.is_empty(), "完整示例必须至少声明一个术语");
+        compile_terminology(entries).expect("文档中的 Terminology 必须通过生产编译边界");
+    }
+
+    #[test]
+    fn classified_placeholder_fences_follow_the_production_contract() {
+        let service = Pcre2PlaceholderService::new().expect("Builtin Placeholder PCRE2 应可建立");
+        let mut valid = 0;
+        let mut invalid = 0;
+        for fence in classified_toml_fences(RULES_GUIDE) {
+            let common_root = fence.section().starts_with("2.") && fence.subsection().is_none();
+            let common_pcre2_example = fence
+                .subsection()
+                .is_some_and(|heading| heading.starts_with("2.1 "));
+            let placeholder_section = fence.section().starts_with("6.");
+            if (!common_root && !common_pcre2_example && !placeholder_section)
+                || fence.kind() == ClassifiedExampleKind::Illustrative
+            {
+                continue;
+            }
+            let result = parse_placeholder_toml(fence.body().as_bytes())
+                .map_err(|error| error.to_string())
+                .and_then(|definitions| {
+                    service
+                        .compile_custom(definitions)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                });
+            match fence.kind() {
+                ClassifiedExampleKind::Valid => {
+                    valid += 1;
+                    result.unwrap_or_else(|error| {
+                        panic!(
+                            "rules.md:{} 的 Placeholder valid TOML 未通过生产边界：{error}",
+                            fence.opening_line()
+                        )
+                    });
+                }
+                ClassifiedExampleKind::Invalid => {
+                    invalid += 1;
+                    assert!(
+                        result.is_err(),
+                        "rules.md:{} 的 Placeholder invalid TOML 被生产边界接受",
+                        fence.opening_line()
+                    );
+                }
+                ClassifiedExampleKind::Illustrative => unreachable!(),
+            }
+        }
+        assert!(
+            valid > 0 && invalid > 0,
+            "共同根、2.1 PCRE2 与 Placeholder 章节必须覆盖生产样例"
+        );
+    }
+
+    #[test]
+    fn classified_terminology_fences_follow_the_production_contract() {
+        let mut valid = 0;
+        let mut invalid = 0;
+        for fence in classified_toml_fences(TERMINOLOGY_GUIDE) {
+            if fence.kind() == ClassifiedExampleKind::Illustrative {
+                continue;
+            }
+            let result = parse_terminology_toml(fence.body().as_bytes())
+                .and_then(|entries| compile_terminology(entries).map(|_| ()));
+            match fence.kind() {
+                ClassifiedExampleKind::Valid => {
+                    valid += 1;
+                    result.unwrap_or_else(|error| {
+                        panic!(
+                            "terminology.md:{} 的 valid TOML 未通过生产边界：{error}",
+                            fence.opening_line()
+                        )
+                    });
+                }
+                ClassifiedExampleKind::Invalid => {
+                    invalid += 1;
+                    assert!(
+                        result.is_err(),
+                        "terminology.md:{} 的 invalid TOML 被生产边界接受",
+                        fence.opening_line()
+                    );
+                }
+                ClassifiedExampleKind::Illustrative => unreachable!(),
+            }
+        }
+        assert!(
+            valid > 0 && invalid > 0,
+            "Terminology 文档必须覆盖生产正反样例"
+        );
+    }
+}
+
 impl TranslationPlanningResources {
     pub(crate) fn new(
         terminology: CompiledTerminology,
@@ -71,6 +193,19 @@ pub(crate) struct TerminologyEntry {
 }
 
 impl TerminologyEntry {
+    #[cfg(test)]
+    pub(crate) fn new(
+        term: impl Into<String>,
+        translation: impl Into<String>,
+        triggers: Vec<String>,
+    ) -> Self {
+        Self {
+            term: term.into(),
+            translation: translation.into(),
+            triggers,
+        }
+    }
+
     pub(crate) fn term(&self) -> &str {
         &self.term
     }
@@ -388,7 +523,7 @@ fn parse_placeholder_toml(
     Ok(definition.rule)
 }
 
-fn compile_terminology(
+pub(super) fn compile_terminology(
     raw: Vec<TerminologyEntry>,
 ) -> Result<CompiledTerminology, TerminologyDefinitionError> {
     let mut entries = Vec::with_capacity(raw.len());
@@ -399,8 +534,8 @@ fn compile_terminology(
 
     for (index, raw_entry) in raw.into_iter().enumerate() {
         let entry_number = index + 1;
-        validate_term_string("term", &raw_entry.term, entry_number)?;
-        validate_term_string("translation", &raw_entry.translation, entry_number)?;
+        validate_term_string("term", &raw_entry.term, entry_number, false)?;
+        validate_term_string("translation", &raw_entry.translation, entry_number, false)?;
         if raw_entry.triggers.is_empty() {
             return Err(TerminologyDefinitionError::EmptyTriggers { entry_number });
         }
@@ -414,7 +549,7 @@ fn compile_terminology(
         }
         let mut local_triggers = BTreeSet::new();
         for trigger in &raw_entry.triggers {
-            validate_term_string("trigger", trigger, entry_number)?;
+            validate_term_string("trigger", trigger, entry_number, true)?;
             if !local_triggers.insert(trigger.clone()) || !all_triggers.insert(trigger.clone()) {
                 return Err(TerminologyDefinitionError::DuplicateTrigger {
                     trigger: trigger.clone(),
@@ -452,6 +587,7 @@ fn validate_term_string(
     field: &'static str,
     value: &str,
     entry_number: usize,
+    allow_line_feed: bool,
 ) -> Result<(), TerminologyDefinitionError> {
     if value.trim().is_empty() {
         return Err(TerminologyDefinitionError::BlankField {
@@ -463,6 +599,16 @@ fn validate_term_string(
         return Err(TerminologyDefinitionError::SurroundingWhitespace {
             entry_number,
             field,
+        });
+    }
+    if let Some(character) = value
+        .chars()
+        .find(|character| character.is_control() && (!allow_line_feed || *character != '\n'))
+    {
+        return Err(TerminologyDefinitionError::ControlCharacter {
+            entry_number,
+            field,
+            character,
         });
     }
     Ok(())
@@ -574,6 +720,11 @@ pub(crate) enum TerminologyDefinitionError {
         entry_number: usize,
         field: &'static str,
     },
+    ControlCharacter {
+        entry_number: usize,
+        field: &'static str,
+        character: char,
+    },
     EmptyTriggers {
         entry_number: usize,
     },
@@ -605,6 +756,15 @@ impl fmt::Display for TerminologyDefinitionError {
                 entry_number,
                 field,
             } => write!(formatter, "术语 {entry_number} 的 {field} 含首尾空白"),
+            Self::ControlCharacter {
+                entry_number,
+                field,
+                character,
+            } => write!(
+                formatter,
+                "术语 {entry_number} 的 {field} 含不允许的控制字符 U+{:04X}",
+                u32::from(*character)
+            ),
             Self::EmptyTriggers { entry_number } => {
                 write!(formatter, "术语 {entry_number} 的 triggers 为空")
             }
@@ -860,6 +1020,46 @@ mod tests {
             ),
             Err(TerminologyDefinitionError::InvalidToml(_))
         ));
+    }
+
+    #[test]
+    fn terminology_control_character_contract_distinguishes_values_from_triggers() {
+        for (field, value) in [("term", "A\nB"), ("translation", "甲\t乙")] {
+            let definition = TerminologyEntry {
+                term: if field == "term" { value } else { "A" }.to_owned(),
+                translation: if field == "translation" { value } else { "甲" }.to_owned(),
+                triggers: vec!["A".to_owned()],
+            };
+            assert!(matches!(
+                compile_terminology(vec![definition]),
+                Err(TerminologyDefinitionError::ControlCharacter {
+                    field: actual,
+                    ..
+                }) if actual == field
+            ));
+        }
+
+        let with_line_feed = compile_terminology(vec![TerminologyEntry {
+            term: "A".to_owned(),
+            translation: "甲".to_owned(),
+            triggers: vec!["前\n後".to_owned()],
+        }])
+        .expect("trigger 应允许内部 LF");
+        assert_eq!(with_line_feed.triggered_by(["前\n後"])[0].term(), "A");
+
+        for invalid in ["A\rB", "A\0B", "A\u{0085}B"] {
+            assert!(matches!(
+                compile_terminology(vec![TerminologyEntry {
+                    term: "A".to_owned(),
+                    translation: "甲".to_owned(),
+                    triggers: vec![invalid.to_owned()],
+                }]),
+                Err(TerminologyDefinitionError::ControlCharacter {
+                    field: "trigger",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

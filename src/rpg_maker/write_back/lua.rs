@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -21,6 +21,7 @@ use crate::storage::file_system::{
     BoundScopedDirectory, ScopedDirectoryBindError, ScopedDirectoryEditError,
     ScopedDirectoryEditor, ScopedDirectoryEntryKind, ScopedDirectoryPath, StagedDirectory,
 };
+use crate::storage::scoped_path::{ExactPathCaseMismatch, resolve_exact_directory_entry};
 
 use super::standard::{
     RpgMakerLayoutTextPair, RpgMakerTextLayoutOutcome, RpgMakerWriteBackLayoutRegion,
@@ -84,6 +85,7 @@ where
                 script_path,
                 LuaProjectContext::for_write_back_candidate(
                     project.name().as_str(),
+                    project.layout().rpg_maker_layout().engine(),
                     project.source_content_root(),
                     project.database_path().to_path_buf(),
                     project.language_pair().clone(),
@@ -148,9 +150,47 @@ where
 fn map_output_path(
     layout: crate::rpg_maker::RpgMakerLayout,
     path: ScopedDirectoryPath,
-) -> ScopedDirectoryPath {
-    ScopedDirectoryPath::new(layout.map_content_relative(path.as_path()))
-        .expect("受检逻辑输出路径加固定内容目录后仍必须安全")
+) -> Result<ScopedDirectoryPath, TrustedLuaHostCallError> {
+    if path.first_component() != "data" && path.first_component() != "js" {
+        return Err(TrustedLuaHostCallError::new(
+            "output",
+            "outside_content_roots",
+            format!(
+                "候选逻辑路径只允许小写 data/** 或 js/**：{}",
+                path.as_path().display()
+            ),
+            None,
+            None,
+        ));
+    }
+    ScopedDirectoryPath::from_internal_path(layout.map_content_relative(path.as_path())).map_err(
+        |error| {
+            let message = error.to_string();
+            TrustedLuaHostCallError::new(
+                "output",
+                "invalid_path",
+                message,
+                None,
+                Some(Arc::new(error)),
+            )
+        },
+    )
+}
+
+/// 修改操作必须按 Lua 看见的逻辑内容根判断，而不能按 MV 映射后的 `www/data`
+/// 或 `www/js` 判断，否则固定布局前缀会把内容根伪装成普通后代。
+fn map_output_mutation_path(
+    layout: crate::rpg_maker::RpgMakerLayout,
+    path: ScopedDirectoryPath,
+) -> Result<ScopedDirectoryPath, TrustedLuaHostCallError> {
+    if (path.first_component() == "data" || path.first_component() == "js") && path.is_top_level() {
+        return Err(output_edit_error::<std::convert::Infallible>(
+            ScopedDirectoryEditError::ScopeRootMutation {
+                path: path.as_path().to_path_buf(),
+            },
+        ));
+    }
+    map_output_path(layout, path)
 }
 
 struct ScopedLuaWriteBackHostCalls<E>
@@ -161,6 +201,57 @@ where
     scope: Arc<BoundScopedDirectory<E::ScopeState>>,
     layout_profile: RpgMakerWriteBackLayoutProfile,
     rpg_maker_layout: crate::rpg_maker::RpgMakerLayout,
+}
+
+/// 把候选中的每个现存路径段解析为目录实际列出的逐字身份。
+///
+/// 缺失段仍交给具体编辑操作解释：读、列举和删除会沿用它们已有的 `not_found`
+/// 语义，而写文件和建目录可以按各自契约创建新末段。仅大小写不同的现存别名则
+/// 必须在任何操作之前失败，避免 Windows 把脚本请求静默重定向到另一个物理身份。
+async fn resolve_exact_output_path<E>(
+    editor: &E,
+    scope: &BoundScopedDirectory<E::ScopeState>,
+    path: ScopedDirectoryPath,
+) -> Result<ScopedDirectoryPath, TrustedLuaHostCallError>
+where
+    E: ScopedDirectoryEditor,
+{
+    let mut exact_parent: Option<ScopedDirectoryPath> = None;
+    for component in path.as_path().components() {
+        let Component::Normal(expected_name) = component else {
+            unreachable!("ScopedDirectoryPath 已建立普通相对路径段不变量")
+        };
+        let expected_name = expected_name
+            .to_str()
+            .expect("ScopedDirectoryPath 已建立 UTF-8 路径段不变量");
+        let entries = match &exact_parent {
+            Some(parent) => editor
+                .list_scoped_directory(scope, parent.clone())
+                .await
+                .map_err(output_edit_error)?,
+            None => editor
+                .list_scoped_root(scope)
+                .await
+                .map_err(output_edit_error)?,
+        };
+        let parent = exact_parent
+            .as_ref()
+            .map_or_else(|| Path::new(""), ScopedDirectoryPath::as_path);
+        let resolved = resolve_exact_directory_entry(
+            parent,
+            expected_name,
+            entries.iter().map(|entry| parent.join(entry.name())),
+        )
+        .map_err(output_case_mismatch)?;
+        let Some(resolved) = resolved else {
+            return Ok(path);
+        };
+        exact_parent = Some(
+            ScopedDirectoryPath::from_internal_path(resolved)
+                .expect("实际目录项与受检父路径组合后仍应是安全内部路径"),
+        );
+    }
+    Ok(path)
 }
 
 impl<E> TrustedLuaWriteBackHostCalls for ScopedLuaWriteBackHostCalls<E>
@@ -181,6 +272,8 @@ where
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
         Box::pin(async move {
+            let path = path?;
+            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
             editor
                 .read_scoped_file(&scope, path)
                 .await
@@ -203,6 +296,8 @@ where
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
         Box::pin(async move {
+            let path = path?;
+            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
             editor
                 .list_scoped_directory(&scope, path)
                 .await
@@ -234,10 +329,12 @@ where
     ) -> Pin<
         Box<dyn std::future::Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
     > {
-        let path = map_output_path(self.rpg_maker_layout, path);
+        let path = map_output_mutation_path(self.rpg_maker_layout, path);
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
         Box::pin(async move {
+            let path = path?;
+            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
             editor
                 .create_scoped_directory(&scope, path)
                 .await
@@ -252,10 +349,12 @@ where
     ) -> Pin<
         Box<dyn std::future::Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
     > {
-        let path = map_output_path(self.rpg_maker_layout, path);
+        let path = map_output_mutation_path(self.rpg_maker_layout, path);
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
         Box::pin(async move {
+            let path = path?;
+            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
             editor
                 .write_scoped_file(&scope, path, bytes)
                 .await
@@ -269,10 +368,12 @@ where
     ) -> Pin<
         Box<dyn std::future::Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
     > {
-        let path = map_output_path(self.rpg_maker_layout, path);
+        let path = map_output_mutation_path(self.rpg_maker_layout, path);
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
         Box::pin(async move {
+            let path = path?;
+            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
             editor
                 .remove_scoped_path(&scope, path)
                 .await
@@ -341,6 +442,17 @@ where
     };
     let message = error.to_string();
     TrustedLuaHostCallError::new("output", kind, message, None, Some(Arc::new(error)))
+}
+
+fn output_case_mismatch(error: ExactPathCaseMismatch) -> TrustedLuaHostCallError {
+    let message = error.to_string();
+    TrustedLuaHostCallError::new(
+        "filesystem",
+        "case_mismatch",
+        message,
+        None,
+        Some(Arc::new(error)),
+    )
 }
 
 /// Lua WriteBack 在项目交接或 Host 执行边界遇到的失败。
@@ -428,6 +540,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -435,6 +549,440 @@ mod tests {
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::lua::LuaPhase;
     use crate::rpg_maker::project::MaxFullwidthChars;
+
+    #[test]
+    fn output_paths_keep_logical_roots_and_hide_mv_www_mapping() {
+        let data = ScopedDirectoryPath::new(PathBuf::from("data/Actors.json")).unwrap();
+        assert_eq!(
+            map_output_path(crate::rpg_maker::RpgMakerLayout::MZ, data.clone())
+                .unwrap()
+                .as_path(),
+            Path::new("data/Actors.json")
+        );
+        assert_eq!(
+            map_output_path(crate::rpg_maker::RpgMakerLayout::MV, data)
+                .unwrap()
+                .as_path(),
+            Path::new("www/data/Actors.json")
+        );
+
+        for path in [
+            "Data/Actors.json",
+            "www/data/Actors.json",
+            "assets/file.json",
+        ] {
+            let error = map_output_path(
+                crate::rpg_maker::RpgMakerLayout::MV,
+                ScopedDirectoryPath::new(PathBuf::from(path)).unwrap(),
+            )
+            .expect_err("Lua 逻辑输出只允许小写 data/js 根");
+            assert_eq!(error.kind(), "outside_content_roots");
+        }
+    }
+
+    #[tokio::test]
+    async fn logical_output_roots_are_read_only_before_mv_or_mz_layout_mapping() {
+        for (layout, entries) in [
+            (
+                crate::rpg_maker::RpgMakerLayout::MZ,
+                vec![
+                    (
+                        PathBuf::new(),
+                        vec![
+                            entry("data", ScopedDirectoryEntryKind::Directory),
+                            entry("js", ScopedDirectoryEntryKind::Directory),
+                        ],
+                    ),
+                    (PathBuf::from("data"), Vec::new()),
+                    (PathBuf::from("js"), Vec::new()),
+                ],
+            ),
+            (
+                crate::rpg_maker::RpgMakerLayout::MV,
+                vec![
+                    (
+                        PathBuf::new(),
+                        vec![entry("www", ScopedDirectoryEntryKind::Directory)],
+                    ),
+                    (
+                        PathBuf::from("www"),
+                        vec![
+                            entry("data", ScopedDirectoryEntryKind::Directory),
+                            entry("js", ScopedDirectoryEntryKind::Directory),
+                        ],
+                    ),
+                    (PathBuf::from("www/data"), Vec::new()),
+                    (PathBuf::from("www/js"), Vec::new()),
+                ],
+            ),
+        ] {
+            let editor = Arc::new(FakeEditor::with_entries(entries));
+            let calls = output_calls(layout, Arc::clone(&editor));
+
+            for root in ["data", "js"] {
+                calls
+                    .list_output(scoped_path(root))
+                    .await
+                    .expect("逻辑内容根允许列举");
+                calls
+                    .read_output(scoped_path(root))
+                    .await
+                    .expect("Host 不应把读取误判为根修改");
+
+                let mutations = [
+                    calls.create_output_directory(scoped_path(root)).await,
+                    calls
+                        .write_output(scoped_path(root), b"changed".to_vec())
+                        .await,
+                    calls.remove_output(scoped_path(root)).await,
+                ];
+                for error in
+                    mutations.map(|result| result.expect_err("逻辑 data/js 根禁止任何修改"))
+                {
+                    assert_eq!(error.domain(), "output");
+                    assert_eq!(error.kind(), "scope_root_mutation");
+                }
+            }
+
+            let expected_reads = ["data", "js"]
+                .map(|root| {
+                    format!(
+                        "read:{}",
+                        layout.map_content_relative(Path::new(root)).display()
+                    )
+                })
+                .to_vec();
+            assert_eq!(
+                *editor
+                    .terminal_operations
+                    .lock()
+                    .expect("候选操作记录锁不应中毒"),
+                expected_reads
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn output_operations_reject_case_aliases_before_reaching_the_terminal_edit() {
+        let editor = Arc::new(FakeEditor::with_entries([
+            (
+                PathBuf::new(),
+                vec![entry("data", ScopedDirectoryEntryKind::Directory)],
+            ),
+            (
+                PathBuf::from("data"),
+                vec![
+                    entry("Items.json", ScopedDirectoryEntryKind::File),
+                    entry("Generated", ScopedDirectoryEntryKind::Directory),
+                ],
+            ),
+            (PathBuf::from("data/Generated"), Vec::new()),
+        ]));
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+
+        let aliases = [
+            calls
+                .read_output(scoped_path("data/items.json"))
+                .await
+                .map(|_| ()),
+            calls
+                .list_output(scoped_path("data/items.json"))
+                .await
+                .map(|_| ()),
+            calls
+                .create_output_directory(scoped_path("data/generated/child"))
+                .await,
+            calls
+                .write_output(scoped_path("data/items.json"), b"changed".to_vec())
+                .await,
+            calls.remove_output(scoped_path("data/items.json")).await,
+        ];
+        for error in aliases.map(|result| result.expect_err("仅大小写不同的别名必须失败"))
+        {
+            assert_eq!(error.domain(), "filesystem");
+            assert_eq!(error.kind(), "case_mismatch");
+        }
+        assert!(
+            editor
+                .terminal_operations
+                .lock()
+                .expect("候选操作记录锁不应中毒")
+                .is_empty(),
+            "别名请求不得到达读写或删除终态操作"
+        );
+
+        calls
+            .read_output(scoped_path("data/Items.json"))
+            .await
+            .expect("逐字现存路径应能读取");
+        calls
+            .write_output(scoped_path("data/New.json"), b"new".to_vec())
+            .await
+            .expect("写文件允许创建不存在的末段");
+        calls
+            .create_output_directory(scoped_path("data/NewDirectory"))
+            .await
+            .expect("建目录允许创建不存在的末段");
+        assert_eq!(
+            *editor
+                .terminal_operations
+                .lock()
+                .expect("候选操作记录锁不应中毒"),
+            [
+                "read:data/Items.json",
+                "write:data/New.json",
+                "create:data/NewDirectory",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mv_output_case_resolution_keeps_www_internal() {
+        let editor = Arc::new(FakeEditor::with_entries([
+            (
+                PathBuf::new(),
+                vec![entry("www", ScopedDirectoryEntryKind::Directory)],
+            ),
+            (
+                PathBuf::from("www"),
+                vec![entry("data", ScopedDirectoryEntryKind::Directory)],
+            ),
+            (
+                PathBuf::from("www/data"),
+                vec![entry("Items.json", ScopedDirectoryEntryKind::File)],
+            ),
+        ]));
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MV, Arc::clone(&editor));
+
+        let error = calls
+            .write_output(scoped_path("data/items.json"), b"changed".to_vec())
+            .await
+            .expect_err("MV 也必须按映射后的真实目录项检查大小写");
+        assert_eq!(error.domain(), "filesystem");
+        assert_eq!(error.kind(), "case_mismatch");
+        assert!(
+            editor
+                .terminal_operations
+                .lock()
+                .expect("候选操作记录锁不应中毒")
+                .is_empty()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_candidate_does_not_overwrite_a_case_aliased_output_file() {
+        use std::fs;
+        use std::time::Duration;
+
+        use crate::runtime::filesystem::{
+            DirectoryPublisherConfig, ExclusiveFileLeaseConfig, SystemFileSystem,
+            SystemFileSystemConfig, TreeBudget,
+        };
+        use crate::storage::file_system::{
+            DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+            RecoverableDirectoryPublisher,
+        };
+
+        let workspace = tempfile::tempdir().expect("应建立 Windows 候选测试目录");
+        let source = workspace.path().join("source");
+        let source_data = source.join("data");
+        let source_js = source.join("js");
+        fs::create_dir_all(&source_data).expect("应建立来源 data");
+        fs::create_dir_all(&source_js).expect("应建立来源 js");
+        fs::write(source_data.join("Items.json"), b"original").expect("应建立大小写精确的来源文件");
+
+        let file_system = SystemFileSystem::new(
+            SystemFileSystemConfig::new(
+                2,
+                8,
+                1024 * 1024,
+                128,
+                TreeBudget::new(128, 16, 1024 * 1024, 512 * 1024).expect("测试目录预算应合法"),
+                ExclusiveFileLeaseConfig::new(Duration::from_secs(1)).expect("测试租约应合法"),
+            )
+            .expect("测试文件系统配置应合法"),
+        )
+        .expect("应建立生产文件系统根");
+        let publisher = file_system.directory_publisher(
+            DirectoryPublisherConfig::new(
+                workspace.path().join("locks"),
+                8,
+                Duration::from_secs(1),
+            )
+            .expect("测试发布配置应合法"),
+        );
+        let request = DirectoryStageRequest::new(
+            workspace.path().join("write_back"),
+            DirectoryPublishIntent::CreateNew,
+            vec![
+                DirectorySourceMapping::new(source_data, PathBuf::from("data"))
+                    .expect("data 映射应合法"),
+                DirectorySourceMapping::new(source_js, PathBuf::from("js")).expect("js 映射应合法"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("候选请求应合法");
+        let staged = publisher.prepare(request).await.expect("应准备候选");
+        let actual = staged.staging_root().join("data/Items.json");
+        let scope = Arc::new(
+            publisher
+                .bind_scoped_directory(
+                    &staged,
+                    super::super::rpg_maker_output_scope(crate::rpg_maker::RpgMakerLayout::MZ),
+                )
+                .await
+                .expect("应绑定候选编辑范围"),
+        );
+        let calls = ScopedLuaWriteBackHostCalls {
+            editor: Arc::new(publisher.clone()),
+            scope: Arc::clone(&scope),
+            layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
+            rpg_maker_layout: crate::rpg_maker::RpgMakerLayout::MZ,
+        };
+
+        let error = calls
+            .write_output(scoped_path("data/items.json"), b"changed".to_vec())
+            .await
+            .expect_err("Windows 不得把错误大小写静默解析到 Items.json");
+        assert_eq!(error.domain(), "filesystem");
+        assert_eq!(error.kind(), "case_mismatch");
+        assert_eq!(
+            fs::read(&actual).expect("真实候选文件应仍可读"),
+            b"original"
+        );
+
+        drop(calls);
+        drop(scope);
+        publisher.discard(staged).await.expect("测试结束应丢弃候选");
+        file_system
+            .shutdown()
+            .await
+            .expect("文件系统 worker 应正常关闭");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_mv_and_mz_candidates_keep_logical_content_roots_read_only() {
+        for layout in [
+            crate::rpg_maker::RpgMakerLayout::MZ,
+            crate::rpg_maker::RpgMakerLayout::MV,
+        ] {
+            assert_real_candidate_roots_are_read_only(layout).await;
+        }
+    }
+
+    #[cfg(windows)]
+    async fn assert_real_candidate_roots_are_read_only(layout: crate::rpg_maker::RpgMakerLayout) {
+        use std::fs;
+        use std::time::Duration;
+
+        use crate::runtime::filesystem::{
+            DirectoryPublisherConfig, ExclusiveFileLeaseConfig, SystemFileSystem,
+            SystemFileSystemConfig, TreeBudget,
+        };
+        use crate::storage::file_system::{
+            DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+            RecoverableDirectoryPublisher,
+        };
+
+        let workspace = tempfile::tempdir().expect("应建立候选根修改测试目录");
+        let source_data = workspace.path().join("source-data");
+        let source_js = workspace.path().join("source-js");
+        fs::create_dir_all(&source_data).expect("应建立来源 data");
+        fs::create_dir_all(&source_js).expect("应建立来源 js");
+        fs::write(source_data.join("Items.json"), b"{}").expect("应建立来源 data 文件");
+        fs::write(source_js.join("plugins.js"), b"var $plugins = [];").expect("应建立来源 js 文件");
+
+        let file_system = SystemFileSystem::new(
+            SystemFileSystemConfig::new(
+                2,
+                8,
+                1024 * 1024,
+                128,
+                TreeBudget::new(128, 16, 1024 * 1024, 512 * 1024).expect("测试目录预算应合法"),
+                ExclusiveFileLeaseConfig::new(Duration::from_secs(1)).expect("测试租约应合法"),
+            )
+            .expect("测试文件系统配置应合法"),
+        )
+        .expect("应建立生产文件系统根");
+        let publisher = file_system.directory_publisher(
+            DirectoryPublisherConfig::new(
+                workspace.path().join("locks"),
+                8,
+                Duration::from_secs(1),
+            )
+            .expect("测试发布配置应合法"),
+        );
+        let request = DirectoryStageRequest::new(
+            workspace.path().join("write_back"),
+            DirectoryPublishIntent::CreateNew,
+            vec![
+                DirectorySourceMapping::new(source_data, layout.data_relative())
+                    .expect("data 映射应合法"),
+                DirectorySourceMapping::new(source_js, layout.js_relative())
+                    .expect("js 映射应合法"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("候选请求应合法");
+        let staged = publisher.prepare(request).await.expect("应准备候选");
+        let scope = Arc::new(
+            publisher
+                .bind_scoped_directory(&staged, super::super::rpg_maker_output_scope(layout))
+                .await
+                .expect("应绑定候选编辑范围"),
+        );
+        let calls = ScopedLuaWriteBackHostCalls {
+            editor: Arc::new(publisher.clone()),
+            scope: Arc::clone(&scope),
+            layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
+            rpg_maker_layout: layout,
+        };
+
+        for root in ["data", "js"] {
+            calls
+                .list_output(scoped_path(root))
+                .await
+                .expect("真实候选逻辑根应允许列举");
+            let read_error = calls
+                .read_output(scoped_path(root))
+                .await
+                .expect_err("内容根是目录，读取应按普通 not_file 失败");
+            assert_eq!(read_error.domain(), "output");
+            assert_eq!(read_error.kind(), "not_file");
+
+            let mutations = [
+                calls.create_output_directory(scoped_path(root)).await,
+                calls
+                    .write_output(scoped_path(root), b"changed".to_vec())
+                    .await,
+                calls.remove_output(scoped_path(root)).await,
+            ];
+            for error in mutations.map(|result| result.expect_err("真实候选逻辑根禁止任何修改"))
+            {
+                assert_eq!(error.domain(), "output");
+                assert_eq!(error.kind(), "scope_root_mutation");
+            }
+
+            let physical_root = staged.staging_root().join(match root {
+                "data" => layout.data_relative(),
+                "js" => layout.js_relative(),
+                _ => unreachable!("测试只遍历 data/js"),
+            });
+            assert!(physical_root.is_dir(), "根修改失败后真实目录必须仍存在");
+        }
+
+        drop(calls);
+        drop(scope);
+        publisher.discard(staged).await.expect("测试结束应丢弃候选");
+        file_system
+            .shutdown()
+            .await
+            .expect("文件系统 worker 应正常关闭");
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct RecordedInvocation {
@@ -515,6 +1063,46 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeEditor {
         bind_fail: bool,
+        entries: Arc<BTreeMap<PathBuf, Vec<crate::storage::file_system::ScopedDirectoryEntry>>>,
+        terminal_operations: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeEditor {
+        fn with_entries(
+            entries: impl IntoIterator<
+                Item = (
+                    PathBuf,
+                    Vec<crate::storage::file_system::ScopedDirectoryEntry>,
+                ),
+            >,
+        ) -> Self {
+            Self {
+                entries: Arc::new(entries.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
+        fn entries_at(
+            &self,
+            path: &Path,
+        ) -> Result<
+            Vec<crate::storage::file_system::ScopedDirectoryEntry>,
+            ScopedDirectoryEditError<FakeEditorError>,
+        > {
+            self.entries
+                .get(path)
+                .cloned()
+                .ok_or_else(|| ScopedDirectoryEditError::NotFound {
+                    path: path.to_path_buf(),
+                })
+        }
+
+        fn record(&self, operation: &str, path: &ScopedDirectoryPath) {
+            self.terminal_operations
+                .lock()
+                .expect("候选操作记录锁不应中毒")
+                .push(format!("{operation}:{}", path.as_path().display()));
+        }
     }
 
     impl ScopedDirectoryEditor for FakeEditor {
@@ -553,24 +1141,29 @@ mod tests {
         fn read_scoped_file(
             &self,
             _scope: &BoundScopedDirectory<Self::ScopeState>,
-            _path: ScopedDirectoryPath,
+            path: ScopedDirectoryPath,
         ) -> impl std::future::Future<
             Output = Result<Vec<u8>, ScopedDirectoryEditError<Self::Error>>,
         > + Send {
+            self.record("read", &path);
             std::future::ready(Ok(Vec::new()))
         }
 
         fn list_scoped_directory(
             &self,
             _scope: &BoundScopedDirectory<Self::ScopeState>,
-            _path: ScopedDirectoryPath,
+            path: ScopedDirectoryPath,
         ) -> impl std::future::Future<
             Output = Result<
                 Vec<crate::storage::file_system::ScopedDirectoryEntry>,
                 ScopedDirectoryEditError<Self::Error>,
             >,
         > + Send {
-            std::future::ready(Ok(Vec::new()))
+            std::future::ready(if self.entries.is_empty() {
+                Ok(Vec::new())
+            } else {
+                self.entries_at(path.as_path())
+            })
         }
 
         fn list_scoped_root(
@@ -582,35 +1175,69 @@ mod tests {
                 ScopedDirectoryEditError<Self::Error>,
             >,
         > + Send {
-            std::future::ready(Ok(Vec::new()))
+            std::future::ready(if self.entries.is_empty() {
+                Ok(Vec::new())
+            } else {
+                self.entries_at(Path::new(""))
+            })
         }
 
         fn create_scoped_directory(
             &self,
             _scope: &BoundScopedDirectory<Self::ScopeState>,
-            _path: ScopedDirectoryPath,
+            path: ScopedDirectoryPath,
         ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
         {
+            self.record("create", &path);
             std::future::ready(Ok(()))
         }
 
         fn write_scoped_file(
             &self,
             _scope: &BoundScopedDirectory<Self::ScopeState>,
-            _path: ScopedDirectoryPath,
+            path: ScopedDirectoryPath,
             _bytes: Vec<u8>,
         ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
         {
+            self.record("write", &path);
             std::future::ready(Ok(()))
         }
 
         fn remove_scoped_path(
             &self,
             _scope: &BoundScopedDirectory<Self::ScopeState>,
-            _path: ScopedDirectoryPath,
+            path: ScopedDirectoryPath,
         ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
         {
+            self.record("remove", &path);
             std::future::ready(Ok(()))
+        }
+    }
+
+    fn entry(
+        name: &str,
+        kind: ScopedDirectoryEntryKind,
+    ) -> crate::storage::file_system::ScopedDirectoryEntry {
+        crate::storage::file_system::ScopedDirectoryEntry::new(OsString::from(name), kind)
+    }
+
+    fn scoped_path(path: &str) -> ScopedDirectoryPath {
+        ScopedDirectoryPath::new(PathBuf::from(path)).expect("测试输出路径应合法")
+    }
+
+    fn output_calls(
+        layout: crate::rpg_maker::RpgMakerLayout,
+        editor: Arc<FakeEditor>,
+    ) -> ScopedLuaWriteBackHostCalls<FakeEditor> {
+        ScopedLuaWriteBackHostCalls {
+            editor,
+            scope: Arc::new(BoundScopedDirectory::new(
+                PathBuf::from("C:/projects/alice/.write_back-stage"),
+                super::super::rpg_maker_output_scope(layout),
+                (),
+            )),
+            layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
+            rpg_maker_layout: layout,
         }
     }
 
@@ -845,7 +1472,10 @@ mod tests {
                 cancelled: false,
                 unexpected_outcome: false,
             },
-            FakeEditor { bind_fail: true },
+            FakeEditor {
+                bind_fail: true,
+                ..FakeEditor::default()
+            },
         );
         let project = project("alice");
 

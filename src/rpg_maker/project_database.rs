@@ -46,11 +46,12 @@ const CREATE_STANDARD_ASSET_OWNER_STATE_TABLE: &str = r#"CREATE TABLE standard_a
 
 pub(crate) const STANDARD_TEXT_GROUP_TABLE_NAME: &str = "standard_text_group";
 pub(crate) const STANDARD_TEXT_UNIT_TABLE_NAME: &str = "standard_text_unit";
-pub(crate) const STANDARD_TEXT_TARGET_TABLE_NAME: &str = "standard_text_target";
+pub(crate) const STANDARD_MUTATION_CLAIM_TABLE_NAME: &str = "standard_mutation_claim";
 
 const CREATE_STANDARD_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE standard_text_group (
     owner                  TEXT NOT NULL CHECK (owner IN ('builtin', 'rules', 'lua')),
     group_location         TEXT NOT NULL CHECK (length(group_location) > 0),
+    group_order            INTEGER NOT NULL CHECK (group_order >= 0),
     group_kind             TEXT NOT NULL CHECK (group_kind IN (
         'database_entry',
         'system',
@@ -63,6 +64,7 @@ const CREATE_STANDARD_TEXT_GROUP_TABLE: &str = r#"CREATE TABLE standard_text_gro
     )),
     projection_recipe_json TEXT NOT NULL CHECK (length(projection_recipe_json) > 0),
     PRIMARY KEY (owner, group_location),
+    UNIQUE (owner, group_order),
     FOREIGN KEY (owner) REFERENCES standard_asset_owner_state(owner) ON DELETE CASCADE
 )"#;
 
@@ -70,6 +72,7 @@ const CREATE_STANDARD_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE standard_text_unit
     owner                    TEXT NOT NULL CHECK (owner IN ('builtin', 'rules', 'lua')),
     group_location           TEXT NOT NULL CHECK (length(group_location) > 0),
     unit_role                TEXT NOT NULL CHECK (length(unit_role) > 0),
+    unit_order               INTEGER NOT NULL CHECK (unit_order >= 0),
     source_content_json      TEXT NOT NULL CHECK (
         json_valid(source_content_json)
         AND json_type(source_content_json) IN ('text', 'array')
@@ -81,6 +84,7 @@ const CREATE_STANDARD_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE standard_text_unit
     translation_content_json TEXT,
     translation_state        BLOB,
     PRIMARY KEY (owner, group_location, unit_role),
+    UNIQUE (owner, group_location, unit_order),
     FOREIGN KEY (owner, group_location)
         REFERENCES standard_text_group(owner, group_location) ON DELETE CASCADE,
     CHECK (
@@ -95,16 +99,18 @@ const CREATE_STANDARD_TEXT_UNIT_TABLE: &str = r#"CREATE TABLE standard_text_unit
     )
 )"#;
 
-const CREATE_STANDARD_TEXT_TARGET_TABLE: &str = r#"CREATE TABLE standard_text_target (
-    mutation_target TEXT NOT NULL PRIMARY KEY CHECK (length(mutation_target) > 0),
-    owner           TEXT NOT NULL CHECK (owner IN ('builtin', 'rules', 'lua')),
-    group_location  TEXT NOT NULL CHECK (length(group_location) > 0),
+const CREATE_STANDARD_MUTATION_CLAIM_TABLE: &str = r#"CREATE TABLE standard_mutation_claim (
+    owner          TEXT NOT NULL CHECK (owner IN ('builtin', 'rules', 'lua')),
+    group_location TEXT NOT NULL CHECK (length(group_location) > 0),
+    resource_key   TEXT NOT NULL CHECK (length(resource_key) > 0),
+    access         TEXT NOT NULL CHECK (access IN ('intent', 'exclusive')),
+    PRIMARY KEY (owner, group_location, resource_key),
     FOREIGN KEY (owner, group_location)
         REFERENCES standard_text_group(owner, group_location) ON DELETE CASCADE
 )"#;
 
-const CREATE_STANDARD_TEXT_TARGET_GROUP_INDEX: &str =
-    "CREATE INDEX standard_text_target_group_idx ON standard_text_target(owner, group_location)";
+const CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX: &str = "CREATE INDEX standard_mutation_claim_resource_idx ON standard_mutation_claim(resource_key, access, owner, group_location)";
+const CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str = "CREATE INDEX standard_mutation_claim_owner_resource_idx ON standard_mutation_claim(owner, resource_key, access, group_location)";
 
 pub(crate) const STANDARD_TRANSLATION_RESOURCE_TABLE_NAME: &str = "standard_translation_resource";
 pub(crate) const TERMINOLOGY_RESOURCE_KIND: &str = "terminology";
@@ -174,12 +180,13 @@ WHERE sql IS NOT NULL
       'standard_asset_owner_state',
       'standard_text_group',
       'standard_text_unit',
-      'standard_text_target',
+      'standard_mutation_claim',
       'standard_translation_resource',
       'standard_project_definition'
     )
     OR name IN (
-      'standard_text_target_group_idx'
+      'standard_mutation_claim_resource_idx',
+      'standard_mutation_claim_owner_resource_idx'
     )
   )
 ORDER BY type, name"#;
@@ -226,7 +233,7 @@ impl SourceSnapshotFingerprint {
     }
 }
 
-/// 一个 owner 当前语义单元、物化配方与物理目标集合的精确身份。
+/// 一个 owner 当前语义单元、自然顺序、物化配方与物理修改声明集合的精确身份。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct AssetSnapshotFingerprint(Sha256Fingerprint);
 
@@ -1134,9 +1141,9 @@ fn expected_managed_schema() -> Vec<(&'static str, &'static str, &'static str, &
         ),
         (
             "table",
-            STANDARD_TEXT_TARGET_TABLE_NAME,
-            STANDARD_TEXT_TARGET_TABLE_NAME,
-            CREATE_STANDARD_TEXT_TARGET_TABLE,
+            STANDARD_MUTATION_CLAIM_TABLE_NAME,
+            STANDARD_MUTATION_CLAIM_TABLE_NAME,
+            CREATE_STANDARD_MUTATION_CLAIM_TABLE,
         ),
         (
             "table",
@@ -1152,9 +1159,15 @@ fn expected_managed_schema() -> Vec<(&'static str, &'static str, &'static str, &
         ),
         (
             "index",
-            "standard_text_target_group_idx",
-            STANDARD_TEXT_TARGET_TABLE_NAME,
-            CREATE_STANDARD_TEXT_TARGET_GROUP_INDEX,
+            "standard_mutation_claim_owner_resource_idx",
+            STANDARD_MUTATION_CLAIM_TABLE_NAME,
+            CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+        ),
+        (
+            "index",
+            "standard_mutation_claim_resource_idx",
+            STANDARD_MUTATION_CLAIM_TABLE_NAME,
+            CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
         ),
     ]
 }
@@ -2126,8 +2139,9 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
         CREATE_STANDARD_ASSET_OWNER_STATE_TABLE,
         CREATE_STANDARD_TEXT_GROUP_TABLE,
         CREATE_STANDARD_TEXT_UNIT_TABLE,
-        CREATE_STANDARD_TEXT_TARGET_TABLE,
-        CREATE_STANDARD_TEXT_TARGET_GROUP_INDEX,
+        CREATE_STANDARD_MUTATION_CLAIM_TABLE,
+        CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+        CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
         CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE,
         CREATE_STANDARD_PROJECT_DEFINITION_TABLE,
     ]
@@ -2423,7 +2437,7 @@ mod tests {
             invocation.path,
             PathBuf::from("C:/projects/测试 游戏/project.db")
         );
-        assert_eq!(invocation.commands.len(), 12);
+        assert_eq!(invocation.commands.len(), 13);
         assert_eq!(invocation.commands[0].statement(), CREATE_METADATA_TABLE);
         assert!(invocation.commands[0].parameters().is_empty());
         assert_eq!(
@@ -2440,11 +2454,19 @@ mod tests {
         );
         assert_eq!(
             invocation.commands[4].statement(),
-            CREATE_STANDARD_TEXT_TARGET_TABLE
+            CREATE_STANDARD_MUTATION_CLAIM_TABLE
         );
-        assert_eq!(invocation.commands[8].statement(), INSERT_METADATA);
         assert_eq!(
-            invocation.commands[8].parameters(),
+            invocation.commands[5].statement(),
+            CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX
+        );
+        assert_eq!(
+            invocation.commands[6].statement(),
+            CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX
+        );
+        assert_eq!(invocation.commands[9].statement(), INSERT_METADATA);
+        assert_eq!(
+            invocation.commands[9].parameters(),
             &[
                 SqliteValue::Text("测试 游戏".to_owned()),
                 SqliteValue::Text("ja".to_owned()),
@@ -2456,21 +2478,21 @@ mod tests {
             ]
         );
         assert_eq!(
-            invocation.commands[9].parameters(),
+            invocation.commands[10].parameters(),
             &[
                 SqliteValue::Text(TERMINOLOGY_RESOURCE_KIND.to_owned()),
                 SqliteValue::Text("[]".to_owned()),
             ]
         );
         assert_eq!(
-            invocation.commands[10].parameters(),
+            invocation.commands[11].parameters(),
             &[
                 SqliteValue::Text(PLACEHOLDER_RULES_RESOURCE_KIND.to_owned()),
                 SqliteValue::Text("[]".to_owned()),
             ]
         );
         assert_eq!(
-            invocation.commands[11].parameters(),
+            invocation.commands[12].parameters(),
             &[
                 SqliteValue::Text(MV_DIALOGUE_RULES_DEFINITION_KIND.to_owned()),
                 SqliteValue::Text(r#"{"rules":[]}"#.to_owned()),
@@ -2494,7 +2516,7 @@ mod tests {
         assert!(
             invocation.commands[4]
                 .statement()
-                .contains("mutation_target TEXT NOT NULL PRIMARY KEY")
+                .contains("resource_key   TEXT NOT NULL")
         );
         assert!(
             invocation.commands[1]
@@ -2514,8 +2536,9 @@ mod tests {
             CREATE_STANDARD_ASSET_OWNER_STATE_TABLE,
             CREATE_STANDARD_TEXT_GROUP_TABLE,
             CREATE_STANDARD_TEXT_UNIT_TABLE,
-            CREATE_STANDARD_TEXT_TARGET_TABLE,
-            CREATE_STANDARD_TEXT_TARGET_GROUP_INDEX,
+            CREATE_STANDARD_MUTATION_CLAIM_TABLE,
+            CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX,
+            CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
             CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE,
             CREATE_STANDARD_PROJECT_DEFINITION_TABLE,
         ] {
@@ -2558,8 +2581,8 @@ mod tests {
             Err(InvalidCurrentProjectDatabase::ManagedSchema { .. })
         ));
 
-        let insert_group = "INSERT INTO standard_text_group (owner, group_location, group_kind, projection_recipe_json) VALUES (?1, ?2, 'database_entry', '[]')";
-        let insert_unit = "INSERT INTO standard_text_unit (owner, group_location, unit_role, source_content_json, source_context_json, translation_content_json, translation_state) VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)";
+        let insert_group = "INSERT INTO standard_text_group (owner, group_location, group_order, group_kind, projection_recipe_json) VALUES (?1, ?2, 0, 'database_entry', '[]')";
+        let insert_unit = "INSERT INTO standard_text_unit (owner, group_location, unit_role, unit_order, source_content_json, source_context_json, translation_content_json, translation_state) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7)";
         connection
             .execute(insert_group, rusqlite::params!["builtin", "group-a",])
             .expect_err("没有 owner state 的资产必须被外键拒绝");
@@ -2583,6 +2606,7 @@ mod tests {
                     "builtin",
                     "group-a",
                     "scalar:name",
+                    0,
                     r#""original""#,
                     Option::<String>::None,
                     Option::<Vec<u8>>::None,
@@ -2596,6 +2620,7 @@ mod tests {
                     "builtin",
                     "group-a",
                     "scalar:description",
+                    1,
                     r#""original""#,
                     r#""译文""#,
                     Option::<Vec<u8>>::None,
@@ -2609,6 +2634,7 @@ mod tests {
                     "builtin",
                     "group-a",
                     "choices",
+                    2,
                     r#"["是","否"]"#,
                     r#""合并译文""#,
                     vec![0x7c_u8; 32],
@@ -2622,6 +2648,7 @@ mod tests {
                     "builtin",
                     "group-a",
                     "choices",
+                    2,
                     r#"["是","否"]"#,
                     r#"["Yes","No"]"#,
                     vec![0x7c_u8; 32],
@@ -2635,6 +2662,7 @@ mod tests {
                     "builtin",
                     "group-a",
                     "scalar:name",
+                    3,
                     r#""original""#,
                     Option::<String>::None,
                     Option::<Vec<u8>>::None,
@@ -2644,19 +2672,19 @@ mod tests {
 
         connection
             .execute(
-                "INSERT INTO standard_text_target (mutation_target, owner, group_location) VALUES ('value:shared', 'builtin', 'group-a')",
+                "INSERT INTO standard_mutation_claim (owner, group_location, resource_key, access) VALUES ('builtin', 'group-a', 'value:shared', 'intent')",
                 [],
             )
-            .expect("第一个物理目标应可保存");
+            .expect("第一个物理资源锁应可保存");
         connection
             .execute(insert_group, rusqlite::params!["rules", "group-b"])
             .expect("第二个 owner 的组应可保存");
         connection
             .execute(
-                "INSERT INTO standard_text_target (mutation_target, owner, group_location) VALUES ('value:shared', 'rules', 'group-b')",
+                "INSERT INTO standard_mutation_claim (owner, group_location, resource_key, access) VALUES ('rules', 'group-b', 'value:shared', 'intent')",
                 [],
             )
-            .expect_err("不同 owner 也不能拥有同一物理修改目标");
+            .expect("两个 owner 的 Intent 锁可以共存，跨 owner 冲突由 Store 事务判定");
     }
 
     #[test]

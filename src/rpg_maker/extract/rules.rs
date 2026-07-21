@@ -189,6 +189,7 @@ where
         input: RulesMatchInput,
     ) -> Result<RulesSnapshot, ParallelRulesBuildError<C::Error>> {
         let input = Arc::new(input);
+        let merge_input = Arc::clone(&input);
         let completed = self
             .cpu_executor
             .execute_ordered_map(definition.into_rules(), move |rule| {
@@ -202,8 +203,8 @@ where
 
         self.cpu_executor
             .execute(move || {
-                let targets =
-                    merge_rule_matches(completed).map_err(ParallelRulesBuildError::Match)?;
+                let targets = merge_rule_matches(completed, &merge_input)
+                    .map_err(ParallelRulesBuildError::Match)?;
                 snapshot_from_targets(targets).map_err(ParallelRulesBuildError::Snapshot)
             })
             .await
@@ -237,15 +238,9 @@ fn document_selection(definition: &RulesDefinition) -> RpgMakerDocumentSelection
 }
 
 fn select_exact_data_file(selection: &mut RpgMakerDocumentSelection, file: &str) {
-    if let Some(standard) = StandardDataFile::from_file_name(file) {
-        selection.insert_standard_file(standard);
-    } else if let Some(map_id) = canonical_map_id(file) {
-        selection.insert_map(map_id);
-    } else {
-        let file = DataFileName::parse(file.to_owned())
-            .expect("Rules 定义解析已经校验安全的精确 JSON 基名");
-        selection.insert_data_file(file);
-    }
+    let file =
+        DataFileName::parse(file.to_owned()).expect("Rules 定义解析已经校验安全的精确 JSON 基名");
+    selection.insert_data_file(file);
 }
 
 fn build_match_input(
@@ -270,7 +265,7 @@ fn build_match_input(
     let files = documents
         .into_iter()
         .map(|(id, value)| (document_file_name(id), value))
-        .collect();
+        .collect::<Vec<_>>();
     let plugins = plugins
         .into_iter()
         .map(|plugin| plugin_for_rules(plugin, &plugin_rules))
@@ -285,7 +280,7 @@ fn document_file_name(id: RpgMakerDocumentId) -> String {
     match id {
         RpgMakerDocumentId::Data(file) => file.file_name().to_owned(),
         RpgMakerDocumentId::DataFile(file) => file.as_str().to_owned(),
-        RpgMakerDocumentId::Map(map_id) => format!("Map{map_id:03}.json"),
+        RpgMakerDocumentId::Map(map_id) => map_id.file_name(),
     }
 }
 
@@ -355,15 +350,6 @@ fn snapshot_from_targets(
         )?);
     }
     RulesSnapshot::new(groups)
-}
-
-fn canonical_map_id(file: &str) -> Option<u32> {
-    let digits = file.strip_prefix("Map")?.strip_suffix(".json")?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let id = digits.parse::<u32>().ok()?;
-    (format!("Map{id:03}.json") == file).then_some(id)
 }
 
 #[derive(Debug)]
@@ -519,12 +505,15 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use serde_json::json;
+    use serde_json::{Map, json};
 
     use super::*;
     use crate::execution::cpu::CpuTaskExecutionError;
     use crate::rpg_maker::ProjectName;
-    use crate::rpg_maker::model::{DirectTextPart, TextProjectionRecipe};
+    use crate::rpg_maker::model::{
+        DirectTextPart, DirectTextRecipe, TextProjectionRecipe, TextUnitRole,
+    };
+    use crate::rpg_maker::text::MapId;
     use crate::storage::file_system::ReadFile;
 
     #[test]
@@ -537,6 +526,10 @@ path = '[].Name'
 
 [[rule]]
 file = "Map042.json"
+path = 'displayName'
+
+[[rule]]
+file = "Map000.json"
 path = 'displayName'
 
 [[rule]]
@@ -565,12 +558,280 @@ pattern = '\A(?<text>.+)\z'
                 .standard_files()
                 .contains(&StandardDataFile::Troops)
         );
-        assert!(selection.map_ids().contains(&42));
+        assert!(selection.map_ids().contains(&MapId::new(42).unwrap()));
         assert!(
             selection
                 .data_files()
                 .iter()
                 .any(|file| file.as_str() == "Disciplines.json")
+        );
+        assert!(
+            selection
+                .data_files()
+                .iter()
+                .any(|file| file.as_str() == "Map000.json")
+        );
+    }
+
+    #[test]
+    fn rules_targets_follow_canonical_cross_source_order() {
+        assert_eq!(
+            StandardDataFile::ALL.map(StandardDataFile::file_name),
+            [
+                "Actors.json",
+                "Animations.json",
+                "Armors.json",
+                "Classes.json",
+                "CommonEvents.json",
+                "Enemies.json",
+                "Items.json",
+                "MapInfos.json",
+                "Skills.json",
+                "States.json",
+                "System.json",
+                "Tilesets.json",
+                "Troops.json",
+                "Weapons.json",
+            ],
+            "标准 DataFile 的固定顺序是 Rules canonical 来源顺序的一部分"
+        );
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+plugin = "Quest"
+path = 'alpha'
+
+[[rule]]
+file = "Map010.json"
+path = 'displayName'
+
+[[rule]]
+file = "Zulu.json"
+path = 'text'
+
+[[rule]]
+file = "Items.json"
+path = '[].name'
+
+[[rule]]
+plugin = "Earlier"
+path = 'only'
+
+[[rule]]
+file = "Map002.json"
+path = 'displayName'
+
+[[rule]]
+file = "AlphaCustom.json"
+path = 'text'
+
+[[rule]]
+file = "Actors.json"
+path = '[].name'
+
+[[rule]]
+plugin = "Quest"
+path = 'zeta'
+"#,
+        )
+        .expect("跨来源排序规则应合法");
+
+        let mut quest_parameters = Map::new();
+        quest_parameters.insert("zeta".to_owned(), json!("插件后声明字母"));
+        quest_parameters.insert("alpha".to_owned(), json!("插件先声明字母"));
+        let mut quest = Map::new();
+        quest.insert("name".to_owned(), json!("Quest"));
+        quest.insert("status".to_owned(), json!(true));
+        quest.insert("parameters".to_owned(), Value::Object(quest_parameters));
+
+        let mut earlier = Map::new();
+        earlier.insert("name".to_owned(), json!("Earlier"));
+        earlier.insert("status".to_owned(), json!(true));
+        earlier.insert("parameters".to_owned(), json!({"only":"较早插件"}));
+
+        let documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([
+                (
+                    RpgMakerDocumentId::Map(MapId::new(10).unwrap()),
+                    json!({"displayName":"地图十"}),
+                ),
+                (
+                    RpgMakerDocumentId::DataFile(
+                        DataFileName::parse("Zulu.json").expect("测试文件名应合法"),
+                    ),
+                    json!({"text":"自定义后"}),
+                ),
+                (
+                    RpgMakerDocumentId::Data(StandardDataFile::Items),
+                    json!([null, {"name":"物品"}]),
+                ),
+                (
+                    RpgMakerDocumentId::DataFile(
+                        DataFileName::parse("AlphaCustom.json").expect("测试文件名应合法"),
+                    ),
+                    json!({"text":"自定义前"}),
+                ),
+                (
+                    RpgMakerDocumentId::Map(MapId::new(2).unwrap()),
+                    json!({"displayName":"地图二"}),
+                ),
+                (
+                    RpgMakerDocumentId::Data(StandardDataFile::Actors),
+                    json!([null, {"name":"角色"}]),
+                ),
+            ]),
+            vec![
+                PluginConfiguration::new(7, quest),
+                PluginConfiguration::new(2, earlier),
+            ],
+        );
+        let input = build_match_input(&definition, documents).expect("冻结来源应建立匹配输入");
+
+        let targets = matcher::match_rules(&definition, &input).expect("全部规则都应命中");
+        assert_eq!(
+            targets
+                .iter()
+                .flat_map(MatchedRuleTarget::units)
+                .map(|unit| unit.source_text())
+                .collect::<Vec<_>>(),
+            [
+                "角色",
+                "物品",
+                "自定义前",
+                "自定义后",
+                "地图二",
+                "地图十",
+                "较早插件",
+                "插件后声明字母",
+                "插件先声明字母",
+            ],
+            "规则编号、调用方插入顺序和 OS 枚举都不得改变 canonical 来源顺序"
+        );
+    }
+
+    #[test]
+    fn documented_extract_rules_match_frozen_sources_and_round_trip_materialized_recipes() {
+        const EXAMPLE: &str = include_str!("../../../docs/rpg-maker/examples/extract-rules.toml");
+
+        fn rebuild(recipe: &DirectTextRecipe, values: &BTreeMap<TextUnitRole, String>) -> String {
+            let mut output = String::new();
+            for part in recipe.parts() {
+                match part {
+                    DirectTextPart::Literal(literal) => output.push_str(literal),
+                    DirectTextPart::TextSlot { role } => output.push_str(
+                        values
+                            .get(role)
+                            .expect("文档示例每个 recipe slot 都应有对应单元"),
+                    ),
+                    DirectTextPart::LineSlot { .. } => {
+                        panic!("Extract Rules 的 Scalar recipe 不应产生 LineSlot")
+                    }
+                }
+            }
+            output
+        }
+
+        let definition = RulesDefinition::parse(EXAMPLE)
+            .expect("完整 Extract Rules 示例必须通过生产解析与 PCRE2 编译边界");
+
+        let plugin_entry = json!({"title":"插件标题"}).to_string();
+        let encoded_plugin_entries = json!([plugin_entry]).to_string();
+        let mut plugin_parameters = Map::new();
+        plugin_parameters.insert("entries".to_owned(), Value::String(encoded_plugin_entries));
+        let mut plugin = Map::new();
+        plugin.insert("name".to_owned(), json!("QuestWindow"));
+        plugin.insert("status".to_owned(), json!(true));
+        plugin.insert("parameters".to_owned(), Value::Object(plugin_parameters));
+
+        let encoded_final_title = serde_json::to_string("终点标题").unwrap();
+        let encoded_title_object = json!({"title":encoded_final_title}).to_string();
+        let encoded_payload_object = json!({"payload":encoded_title_object}).to_string();
+        let encoded_empty_key_root = json!({"":encoded_payload_object}).to_string();
+        let documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([
+                (
+                    RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+                    json!([
+                        null,
+                        {
+                            "list": [
+                                {"code":356,"parameters":["DisplayNotice 出航命令"]},
+                                {"code":357,"parameters":["QuestWindow","Show","",encoded_empty_key_root]}
+                            ]
+                        }
+                    ]),
+                ),
+                (
+                    RpgMakerDocumentId::DataFile(
+                        DataFileName::parse("QuestEntries.json").expect("示例自定义文件名应合法"),
+                    ),
+                    json!([{"title":"委托标题"}]),
+                ),
+            ]),
+            vec![PluginConfiguration::new(4, plugin)],
+        );
+        let input = build_match_input(&definition, documents).expect("冻结来源应建立匹配输入");
+        let targets = matcher::match_rules(&definition, &input)
+            .expect("完整示例的四条规则都应命中代表性冻结来源");
+
+        assert_eq!(targets.len(), 4);
+        assert!(targets.iter().all(|target| target.units().len() == 1));
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.units()[0].source_text())
+                .collect::<Vec<_>>(),
+            ["出航命令", "终点标题", "委托标题", "插件标题"],
+            "插件与 357 来源必须经过生产路径的逐层 JSON 解码"
+        );
+
+        let mut original_round_trips = Vec::new();
+        let mut translated_round_trips = Vec::new();
+        for (target_index, target) in targets.iter().enumerate() {
+            let TextProjectionRecipe::Direct(recipe) = target
+                .projection_recipe()
+                .expect("匹配目标必须物化为 Direct recipe")
+            else {
+                panic!("Extract Rules 只应物化 Direct recipe")
+            };
+            let originals = target
+                .units()
+                .iter()
+                .enumerate()
+                .map(|(unit_index, unit)| {
+                    (target.role_for(unit_index), unit.source_text().to_owned())
+                })
+                .collect::<BTreeMap<_, _>>();
+            let translations = target
+                .units()
+                .iter()
+                .enumerate()
+                .map(|(unit_index, _)| {
+                    (
+                        target.role_for(unit_index),
+                        format!("译文{}", target_index + 1),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+
+            let original = rebuild(&recipe, &originals);
+            assert_eq!(
+                original,
+                recipe.expected_raw(),
+                "未翻译 recipe 必须逐字 round-trip"
+            );
+            original_round_trips.push(original);
+            translated_round_trips.push(rebuild(&recipe, &translations));
+        }
+
+        assert_eq!(
+            original_round_trips,
+            ["DisplayNotice 出航命令", "终点标题", "委托标题", "插件标题",]
+        );
+        assert_eq!(
+            translated_round_trips,
+            ["DisplayNotice 译文1", "译文2", "译文3", "译文4",],
+            "翻译后 recipe 必须只替换槽位并精确保留冻结外壳"
         );
     }
 
@@ -599,7 +860,7 @@ pattern = '<x>(?<text>.*?)</x>'
         let groups = snapshot.groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].units().len(), 2);
-        assert_eq!(groups[0].mutation_targets().len(), 1);
+        assert_eq!(groups[0].mutation_claims().claims().len(), 1);
         let TextProjectionRecipe::Direct(recipe) = &groups[0].recipes()[0] else {
             panic!("Rules 局部文本必须生成直接配方")
         };
@@ -640,7 +901,7 @@ path = '[].description'
 
         assert_eq!(snapshot.groups().len(), 1);
         assert_eq!(snapshot.groups()[0].units().len(), 2);
-        assert_eq!(snapshot.groups()[0].mutation_targets().len(), 2);
+        assert_eq!(snapshot.groups()[0].mutation_claims().claims().len(), 2);
         assert_eq!(snapshot.groups()[0].recipes().len(), 2);
     }
 

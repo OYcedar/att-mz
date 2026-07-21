@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 use super::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
-    DirectTextRecipe, MutationTarget, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe,
-    TextUnitRole,
+    DirectTextRecipe, MutationClaim, MutationResource, ProjectionModelError, ScalarFieldKey,
+    TextProjectionRecipe, TextUnitRole,
 };
-use crate::rpg_maker::text::DataFileName;
+use crate::rpg_maker::text::{DataFileName, MapId};
 
 /// 在数据库中无损保存 `RpgMakerLocation` 的规范编解码器。
 pub(crate) struct RpgMakerLocationCodec;
@@ -36,7 +36,7 @@ impl RpgMakerLocationCodec {
     }
 }
 
-/// 逻辑文本身份、强角色、物理目标和投影配方的内部规范 JSON 编解码器。
+/// 逻辑文本身份、强角色、物理修改资源与投影配方的内部规范 JSON 编解码器。
 pub(crate) struct RpgMakerProjectionCodec;
 
 impl RpgMakerProjectionCodec {
@@ -50,17 +50,17 @@ impl RpgMakerProjectionCodec {
             .try_into()
     }
 
-    pub(crate) fn encode_target(
-        target: &MutationTarget,
+    pub(crate) fn encode_mutation_resource(
+        resource: &MutationResource,
     ) -> Result<String, RpgMakerProjectionCodecError> {
-        serde_json::to_string(&StoredMutationTarget::from(target))
+        serde_json::to_string(&StoredMutationResource::from(resource))
             .map_err(RpgMakerProjectionCodecError::Encode)
     }
 
-    pub(crate) fn decode_target(
+    pub(crate) fn decode_mutation_resource(
         value: &str,
-    ) -> Result<MutationTarget, RpgMakerProjectionCodecError> {
-        serde_json::from_str::<StoredMutationTarget>(value)
+    ) -> Result<MutationResource, RpgMakerProjectionCodecError> {
+        serde_json::from_str::<StoredMutationResource>(value)
             .map_err(RpgMakerProjectionCodecError::Decode)?
             .try_into()
     }
@@ -89,6 +89,7 @@ pub(crate) enum RpgMakerLocationCodecError {
     Encode(serde_json::Error),
     Decode(serde_json::Error),
     InvalidDataFile(String),
+    InvalidMapId(u32),
 }
 
 impl fmt::Display for RpgMakerLocationCodecError {
@@ -99,6 +100,9 @@ impl fmt::Display for RpgMakerLocationCodecError {
             Self::InvalidDataFile(file_name) => {
                 write!(formatter, "RPG Maker 位置引用了无效 data 文件：{file_name}")
             }
+            Self::InvalidMapId(map_id) => {
+                write!(formatter, "RPG Maker 位置引用了无效 map ID：{map_id}")
+            }
         }
     }
 }
@@ -107,7 +111,7 @@ impl Error for RpgMakerLocationCodecError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Encode(source) | Self::Decode(source) => Some(source),
-            Self::InvalidDataFile(_) => None,
+            Self::InvalidDataFile(_) | Self::InvalidMapId(_) => None,
         }
     }
 }
@@ -226,7 +230,9 @@ impl From<&RpgMakerSource> for StoredSource {
             RpgMakerSource::DataFile(file) => Self::Data {
                 file: file.as_str().to_owned(),
             },
-            RpgMakerSource::Map(map_id) => Self::Map { map_id: *map_id },
+            RpgMakerSource::Map(map_id) => Self::Map {
+                map_id: map_id.get(),
+            },
             RpgMakerSource::PluginParameter {
                 plugin_index,
                 plugin_name,
@@ -248,7 +254,9 @@ impl TryFrom<StoredSource> for RpgMakerSource {
             StoredSource::Data { file } => DataFileName::parse(file.clone())
                 .map(Self::data_file)
                 .map_err(|_| RpgMakerLocationCodecError::InvalidDataFile(file)),
-            StoredSource::Map { map_id } => Ok(Self::map(map_id)),
+            StoredSource::Map { map_id } => MapId::new(map_id)
+                .map(Self::map_id)
+                .map_err(|_| RpgMakerLocationCodecError::InvalidMapId(map_id)),
             StoredSource::PluginParameter {
                 plugin_index,
                 plugin_name,
@@ -332,38 +340,94 @@ impl TryFrom<StoredRole> for TextUnitRole {
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum StoredMutationTarget {
-    Value { location: StoredLocation },
-    DialogueBlock { header: StoredLocation },
+enum StoredMutationResource {
+    Value {
+        source: StoredSource,
+        steps: Vec<StoredStep>,
+    },
+    NoteTag {
+        source: StoredSource,
+        container_steps: Vec<StoredStep>,
+        tag_name: String,
+        occurrence: usize,
+    },
+    CommentTag {
+        source: StoredSource,
+        command_steps: Vec<StoredStep>,
+        tag_name: String,
+        occurrence: usize,
+    },
 }
 
-impl From<&MutationTarget> for StoredMutationTarget {
-    fn from(target: &MutationTarget) -> Self {
-        match target {
-            MutationTarget::Value(location) => Self::Value {
-                location: StoredLocation::from(location),
+impl From<&MutationResource> for StoredMutationResource {
+    fn from(resource: &MutationResource) -> Self {
+        match resource {
+            MutationResource::Value { source, steps } => Self::Value {
+                source: source.into(),
+                steps: steps.iter().map(Into::into).collect(),
             },
-            MutationTarget::DialogueBlock { header } => Self::DialogueBlock {
-                header: StoredLocation::from(header),
+            MutationResource::NoteTag {
+                source,
+                container_steps,
+                tag_name,
+                occurrence,
+            } => Self::NoteTag {
+                source: source.into(),
+                container_steps: container_steps.iter().map(Into::into).collect(),
+                tag_name: tag_name.clone(),
+                occurrence: *occurrence,
+            },
+            MutationResource::CommentTag {
+                source,
+                command_steps,
+                tag_name,
+                occurrence,
+            } => Self::CommentTag {
+                source: source.into(),
+                command_steps: command_steps.iter().map(Into::into).collect(),
+                tag_name: tag_name.clone(),
+                occurrence: *occurrence,
             },
         }
     }
 }
 
-impl TryFrom<StoredMutationTarget> for MutationTarget {
+impl TryFrom<StoredMutationResource> for MutationResource {
     type Error = RpgMakerProjectionCodecError;
 
-    fn try_from(target: StoredMutationTarget) -> Result<Self, Self::Error> {
-        match target {
-            StoredMutationTarget::Value { location } => Ok(Self::Value(
-                location
+    fn try_from(resource: StoredMutationResource) -> Result<Self, Self::Error> {
+        match resource {
+            StoredMutationResource::Value { source, steps } => Ok(Self::Value {
+                source: source
                     .try_into()
                     .map_err(RpgMakerProjectionCodecError::Location)?,
-            )),
-            StoredMutationTarget::DialogueBlock { header } => Ok(Self::DialogueBlock {
-                header: header
+                steps: steps.into_iter().map(Into::into).collect(),
+            }),
+            StoredMutationResource::NoteTag {
+                source,
+                container_steps,
+                tag_name,
+                occurrence,
+            } => Ok(Self::NoteTag {
+                source: source
                     .try_into()
                     .map_err(RpgMakerProjectionCodecError::Location)?,
+                container_steps: container_steps.into_iter().map(Into::into).collect(),
+                tag_name,
+                occurrence,
+            }),
+            StoredMutationResource::CommentTag {
+                source,
+                command_steps,
+                tag_name,
+                occurrence,
+            } => Ok(Self::CommentTag {
+                source: source
+                    .try_into()
+                    .map_err(RpgMakerProjectionCodecError::Location)?,
+                command_steps: command_steps.into_iter().map(Into::into).collect(),
+                tag_name,
+                occurrence,
             }),
         }
     }
@@ -374,6 +438,7 @@ impl TryFrom<StoredMutationTarget> for MutationTarget {
 enum StoredRecipe {
     Direct {
         target: StoredLocation,
+        mutation_claim: StoredMutationClaim,
         expected_raw: String,
         parts: Vec<StoredDirectTextPart>,
     },
@@ -382,6 +447,9 @@ enum StoredRecipe {
         direct_speaker: Option<StoredDirectSpeakerTarget>,
         lines: Vec<StoredDialogueLineRecipe>,
     },
+    Claim {
+        mutation_claim: StoredMutationClaim,
+    },
 }
 
 impl From<&TextProjectionRecipe> for StoredRecipe {
@@ -389,6 +457,7 @@ impl From<&TextProjectionRecipe> for StoredRecipe {
         match recipe {
             TextProjectionRecipe::Direct(recipe) => Self::Direct {
                 target: StoredLocation::from(recipe.target()),
+                mutation_claim: StoredMutationClaim::from(recipe.mutation_claim()),
                 expected_raw: recipe.expected_raw().to_owned(),
                 parts: recipe.parts().iter().map(Into::into).collect(),
             },
@@ -396,6 +465,9 @@ impl From<&TextProjectionRecipe> for StoredRecipe {
                 group_location: StoredLocation::from(recipe.group_location()),
                 direct_speaker: recipe.direct_speaker().map(Into::into),
                 lines: recipe.lines().iter().map(Into::into).collect(),
+            },
+            TextProjectionRecipe::Claim(claim) => Self::Claim {
+                mutation_claim: StoredMutationClaim::from(claim),
             },
         }
     }
@@ -408,12 +480,14 @@ impl TryFrom<StoredRecipe> for TextProjectionRecipe {
         match recipe {
             StoredRecipe::Direct {
                 target,
+                mutation_claim,
                 expected_raw,
                 parts,
-            } => DirectTextRecipe::new(
+            } => DirectTextRecipe::new_with_claim(
                 target
                     .try_into()
                     .map_err(RpgMakerProjectionCodecError::Location)?,
+                mutation_claim.try_into()?,
                 expected_raw,
                 parts
                     .into_iter()
@@ -437,6 +511,111 @@ impl TryFrom<StoredRecipe> for TextProjectionRecipe {
                     .collect::<Result<Vec<_>, _>>()?,
             )
             .map(TextProjectionRecipe::Dialogue)
+            .map_err(RpgMakerProjectionCodecError::Projection),
+            StoredRecipe::Claim { mutation_claim } => {
+                mutation_claim.try_into().map(TextProjectionRecipe::Claim)
+            }
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StoredMutationClaim {
+    Value {
+        location: StoredLocation,
+    },
+    NoteTag {
+        location: StoredLocation,
+    },
+    CommentTag {
+        location: StoredLocation,
+        backing_values: Vec<StoredLocation>,
+    },
+    EventBlock {
+        header: StoredLocation,
+        covered_values: Vec<StoredLocation>,
+    },
+}
+
+impl From<&MutationClaim> for StoredMutationClaim {
+    fn from(claim: &MutationClaim) -> Self {
+        match claim {
+            MutationClaim::Value(location) => Self::Value {
+                location: location.into(),
+            },
+            MutationClaim::NoteTag(location) => Self::NoteTag {
+                location: location.into(),
+            },
+            MutationClaim::CommentTag {
+                location,
+                backing_values,
+            } => Self::CommentTag {
+                location: location.into(),
+                backing_values: backing_values.iter().map(Into::into).collect(),
+            },
+            MutationClaim::EventBlock {
+                header,
+                covered_values,
+            } => Self::EventBlock {
+                header: header.into(),
+                covered_values: covered_values.iter().map(Into::into).collect(),
+            },
+        }
+    }
+}
+
+impl TryFrom<StoredMutationClaim> for MutationClaim {
+    type Error = RpgMakerProjectionCodecError;
+
+    fn try_from(claim: StoredMutationClaim) -> Result<Self, Self::Error> {
+        let decode = |location: StoredLocation| {
+            location
+                .try_into()
+                .map_err(RpgMakerProjectionCodecError::Location)
+        };
+        match claim {
+            StoredMutationClaim::Value { location } => {
+                let location = decode(location)?;
+                if !matches!(location, RpgMakerLocation::Value { .. }) {
+                    return Err(RpgMakerProjectionCodecError::MutationClaimKindMismatch {
+                        expected: "value",
+                        actual: location_kind(&location),
+                    });
+                }
+                Ok(MutationClaim::Value(location))
+            }
+            StoredMutationClaim::NoteTag { location } => {
+                let location = decode(location)?;
+                if !matches!(location, RpgMakerLocation::NoteTag { .. }) {
+                    return Err(RpgMakerProjectionCodecError::MutationClaimKindMismatch {
+                        expected: "note_tag",
+                        actual: location_kind(&location),
+                    });
+                }
+                Ok(MutationClaim::NoteTag(location))
+            }
+            StoredMutationClaim::CommentTag {
+                location,
+                backing_values,
+            } => MutationClaim::comment_tag(
+                decode(location)?,
+                backing_values
+                    .into_iter()
+                    .map(decode)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map_err(RpgMakerProjectionCodecError::Projection),
+            StoredMutationClaim::EventBlock {
+                header,
+                covered_values,
+            } => MutationClaim::event_block(
+                decode(header)?,
+                covered_values
+                    .into_iter()
+                    .map(decode)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
             .map_err(RpgMakerProjectionCodecError::Projection),
         }
     }
@@ -605,6 +784,18 @@ pub(crate) enum RpgMakerProjectionCodecError {
     Decode(serde_json::Error),
     Location(RpgMakerLocationCodecError),
     Projection(ProjectionModelError),
+    MutationClaimKindMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+}
+
+fn location_kind(location: &RpgMakerLocation) -> &'static str {
+    match location {
+        RpgMakerLocation::Value { .. } => "value",
+        RpgMakerLocation::NoteTag { .. } => "note_tag",
+        RpgMakerLocation::CommentTag { .. } => "comment_tag",
+    }
 }
 
 impl fmt::Display for RpgMakerProjectionCodecError {
@@ -614,6 +805,10 @@ impl fmt::Display for RpgMakerProjectionCodecError {
             Self::Decode(source) => write!(formatter, "无法解码 RPG Maker 文本投影：{source}"),
             Self::Location(source) => write!(formatter, "文本投影位置无效：{source}"),
             Self::Projection(source) => write!(formatter, "文本投影配方无效：{source}"),
+            Self::MutationClaimKindMismatch { expected, actual } => write!(
+                formatter,
+                "文本投影 Claim 种类与位置不一致：期待 {expected}，实际为 {actual}"
+            ),
         }
     }
 }
@@ -624,6 +819,7 @@ impl Error for RpgMakerProjectionCodecError {
             Self::Encode(source) | Self::Decode(source) => Some(source),
             Self::Location(source) => Some(source),
             Self::Projection(source) => Some(source),
+            Self::MutationClaimKindMismatch { .. } => None,
         }
     }
 }
@@ -694,6 +890,71 @@ mod tests {
     }
 
     #[test]
+    fn stored_mutation_claim_kind_must_match_its_location_variant() {
+        let note = RpgMakerLocation::note_tag(
+            RpgMakerSource::data(StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+            "Help",
+            0,
+        );
+
+        let error = MutationClaim::try_from(StoredMutationClaim::Value {
+            location: StoredLocation::from(&note),
+        })
+        .expect_err("Value Claim 不得夹带 NoteTag 位置");
+
+        assert!(matches!(
+            error,
+            RpgMakerProjectionCodecError::MutationClaimKindMismatch {
+                expected: "value",
+                actual: "note_tag"
+            }
+        ));
+    }
+
+    #[test]
+    fn stored_event_block_claim_reuses_model_validation() {
+        let header = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::CommonEvents),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let covered = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::CommonEvents),
+            vec![RpgMakerLocationStep::index(2)],
+        );
+        let note = RpgMakerLocation::note_tag(
+            RpgMakerSource::data(StandardDataFile::CommonEvents),
+            vec![RpgMakerLocationStep::index(2)],
+            "Tag",
+            0,
+        );
+        let cross_source = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let stored = |coverage: Vec<&RpgMakerLocation>| StoredMutationClaim::EventBlock {
+            header: StoredLocation::from(&header),
+            covered_values: coverage.into_iter().map(StoredLocation::from).collect(),
+        };
+
+        assert!(MutationClaim::try_from(stored(vec![&covered])).is_ok());
+        assert!(matches!(
+            MutationClaim::try_from(stored(Vec::new())),
+            Err(RpgMakerProjectionCodecError::Projection(
+                ProjectionModelError::EventBlockCoverageRequired
+            ))
+        ));
+        for invalid in [&note, &cross_source] {
+            assert!(matches!(
+                MutationClaim::try_from(stored(vec![invalid])),
+                Err(RpgMakerProjectionCodecError::Projection(
+                    ProjectionModelError::InvalidEventBlockCoverage
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn display_text_is_not_accepted_as_authoritative_storage() {
         let location = RpgMakerLocation::value(
             RpgMakerSource::data(StandardDataFile::Items),
@@ -713,6 +974,16 @@ mod tests {
 
         let decoded = RpgMakerLocationCodec::decode(encoded).expect("非标准 JSON 基名应可持久化");
         assert_eq!(decoded.to_string(), "data/Custom.json");
+    }
+
+    #[test]
+    fn persisted_map_identity_rejects_zero() {
+        let encoded = r#"{"kind":"value","source":{"kind":"map","map_id":0},"steps":[]}"#;
+
+        assert!(matches!(
+            RpgMakerLocationCodec::decode(encoded),
+            Err(RpgMakerLocationCodecError::InvalidMapId(0))
+        ));
     }
 
     #[test]

@@ -1,0 +1,20 @@
+[[rule]]
+file = "QuestEntries.json"
+path = '[].title'
+decode_json = false
+pattern = '\A(?<text>.+)\z'
+
+[[rule]]
+plugin = "QuestWindow"
+path = 'entries[].title'
+
+[[rule]]
+code = 356
+parameter = 0
+pattern = '\ADisplayNotice\s+(?<text>.+)\z'
+
+[[rule]]
+code = 357
+parameter = 3
+path = '[""].payload.title'
+decode_json = true

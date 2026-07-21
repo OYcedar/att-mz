@@ -1077,6 +1077,7 @@ mod tests {
                 }
                 AuditEvent::RunStarted
                 | AuditEvent::RunFinished { .. }
+                | AuditEvent::TranslationPlanningUnresolved { .. }
                 | AuditEvent::TranslationTaskStarted { .. }
                 | AuditEvent::TranslationTaskFinished { .. } => false,
             };

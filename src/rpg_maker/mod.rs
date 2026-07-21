@@ -4,6 +4,8 @@
 
 pub(crate) mod audit;
 pub(crate) mod dialogue;
+#[cfg(test)]
+pub(crate) mod documentation_test;
 pub(crate) mod extract;
 pub(crate) mod init;
 pub(crate) mod location_codec;

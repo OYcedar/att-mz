@@ -143,7 +143,6 @@ impl TranslationUnitIdentity {
         self.logical_location.group_location()
     }
 
-    #[cfg(test)]
     pub(crate) fn logical_location(&self) -> &LogicalTextLocation {
         &self.logical_location
     }
@@ -202,6 +201,7 @@ impl StandardTranslationAsset {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
@@ -539,6 +539,7 @@ impl TranslationPlanPreparationCounts {
 pub(crate) struct TranslationPlanPreparation {
     invalidations: Vec<TranslationInvalidation>,
     reuses: Vec<TranslationReuse>,
+    planning_failures: Vec<TranslationPlanningFailure>,
     terminology_json: String,
     placeholder_rules_json: String,
     retained: usize,
@@ -558,7 +559,7 @@ impl TranslationPlanPreparation {
         invalidated: usize,
         not_applicable: usize,
     ) -> Self {
-        Self::with_baseline(
+        Self::with_baseline_and_planning_failures(
             invalidations,
             reuses,
             terminology_json,
@@ -570,20 +571,23 @@ impl TranslationPlanPreparation {
                 "[]".to_owned(),
                 "[]".to_owned(),
             ),
+            Vec::new(),
         )
     }
 
-    pub(crate) fn with_baseline(
+    pub(crate) fn with_baseline_and_planning_failures(
         invalidations: Vec<TranslationInvalidation>,
         reuses: Vec<TranslationReuse>,
         terminology_json: String,
         placeholder_rules_json: String,
         counts: TranslationPlanPreparationCounts,
         snapshot_baseline: TranslationSnapshotBaseline,
+        planning_failures: Vec<TranslationPlanningFailure>,
     ) -> Self {
         Self {
             invalidations,
             reuses,
+            planning_failures,
             terminology_json,
             placeholder_rules_json,
             retained: counts.retained,
@@ -601,6 +605,19 @@ impl TranslationPlanPreparation {
     #[cfg(test)]
     pub(crate) fn reuses(&self) -> &[TranslationReuse] {
         &self.reuses
+    }
+
+    pub(crate) fn planning_failures(&self) -> &[TranslationPlanningFailure] {
+        &self.planning_failures
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_planning_failures(
+        mut self,
+        planning_failures: Vec<TranslationPlanningFailure>,
+    ) -> Self {
+        self.planning_failures = planning_failures;
+        self
     }
 
     pub(crate) const fn retained(&self) -> usize {
@@ -640,6 +657,37 @@ impl TranslationPlanPreparation {
             self.snapshot_baseline,
         )
     }
+}
+
+/// Placeholder 投影阶段无法建立受信语义、因而不会进入任何 LLM 任务的标准单元。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationPlanningFailure {
+    identity: TranslationUnitIdentity,
+    reason: TranslationPlanningFailureReason,
+}
+
+impl TranslationPlanningFailure {
+    pub(crate) fn new(
+        identity: TranslationUnitIdentity,
+        reason: TranslationPlanningFailureReason,
+    ) -> Self {
+        Self { identity, reason }
+    }
+
+    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn reason(&self) -> &TranslationPlanningFailureReason {
+        &self.reason
+    }
+}
+
+/// 规划期失败与模型响应拒绝分属不同阶段，不共享 ID、attempt 或拒绝原因。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationPlanningFailureReason {
+    PlaceholderProtection { message: String },
+    PlaceholderProjection { message: String },
 }
 
 /// 任务在确定计划中的序号。
@@ -1456,6 +1504,11 @@ impl StandardTranslationRunReport {
         self.protocol_diagnostics += outcome.diagnostics().len();
     }
 
+    pub(crate) fn record_planning_failures(&mut self, failures: &[TranslationPlanningFailure]) {
+        self.unresolved_decisions += failures.len();
+        self.unresolved_locations += failures.len();
+    }
+
     pub(crate) const fn total_tasks(&self) -> usize {
         self.total_tasks
     }
@@ -2131,6 +2184,7 @@ where
             return Ok(OperationCompletion::Cancelled);
         }
         let (semantics, preparation, tasks) = plan.into_parts();
+        let planning_failures = preparation.planning_failures().to_vec();
         let mut report = StandardTranslationRunReport::with_reconciliation(
             tasks.len(),
             preparation.retained(),
@@ -2139,11 +2193,19 @@ where
             preparation.reused(),
         )
         .with_semantics(semantics);
+        report.record_planning_failures(&planning_failures);
 
         self.result_store
             .apply_preparation(project, preparation)
             .await
             .map_err(StandardTranslationServiceError::ApplyPreparation)?;
+
+        for failure in planning_failures {
+            self.event_log
+                .append(AuditEvent::TranslationPlanningUnresolved { failure })
+                .await
+                .map_err(StandardTranslationServiceError::RecordPlanningFailures)?;
+        }
 
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
@@ -2511,6 +2573,7 @@ pub(crate) enum StandardTranslationServiceError<R, P, E, S, J> {
     ReadAssets(R),
     PlanTasks(P),
     ApplyPreparation(S),
+    RecordPlanningFailures(J),
     CreateTaskOperationId {
         task_index: StandardTranslationTaskIndex,
         source: J,
@@ -2578,9 +2641,9 @@ impl<R, P, E, S, J> StandardTranslationServiceError<R, P, E, S, J> {
             Self::ExecuteTaskAndRecordFailure { .. } | Self::CommitTaskAndRecordFailure { .. } => {
                 Impact::AuditLedger
             }
-            Self::RecordTaskFinished { .. } | Self::InvalidTaskResultSequence { .. } => {
-                Impact::StateAppliedButFinalizationFailed
-            }
+            Self::RecordPlanningFailures(_)
+            | Self::RecordTaskFinished { .. }
+            | Self::InvalidTaskResultSequence { .. } => Impact::StateAppliedButFinalizationFailed,
             Self::TaskFailureAndDrainAuditFailures {
                 primary,
                 drain_audit_failures,
@@ -2618,6 +2681,12 @@ where
             Self::PlanTasks(source) => write!(formatter, "无法建立标准翻译计划：{source}"),
             Self::ApplyPreparation(source) => {
                 write!(formatter, "无法应用标准翻译准备：{source}")
+            }
+            Self::RecordPlanningFailures(source) => {
+                write!(
+                    formatter,
+                    "标准翻译规划期未解决单元无法写入审计账本：{source}"
+                )
             }
             Self::CreateTaskOperationId { task_index, source } => write!(
                 formatter,
@@ -2704,6 +2773,7 @@ where
             Self::ReadAssets(source) => Some(source),
             Self::PlanTasks(source) => Some(source),
             Self::ApplyPreparation(source) => Some(source),
+            Self::RecordPlanningFailures(source) => Some(source),
             Self::CreateTaskOperationId { source, .. }
             | Self::RecordTaskStarted { source, .. }
             | Self::RecordTaskFinished { source, .. } => Some(source),
@@ -2850,6 +2920,7 @@ mod tests {
         Read,
         Plan,
         Prepare,
+        LogPlanningFailure,
         AuditTaskStarted(usize),
         Execute(usize),
         Complete(usize),
@@ -3157,6 +3228,10 @@ mod tests {
                     finished_task_index = Some(task_index);
                     self.fail_task_at == Some(task_index)
                 }
+                AuditEvent::TranslationPlanningUnresolved { .. } => {
+                    record(&self.events, Event::LogPlanningFailure);
+                    false
+                }
                 AuditEvent::RunStarted
                 | AuditEvent::RunFinished { .. }
                 | AuditEvent::WriteBackPublishStarted { .. }
@@ -3351,6 +3426,65 @@ mod tests {
         assert_eq!(report.complete_tasks(), 3);
         assert_eq!(report.accepted_decisions(), 6);
         assert_eq!(report.written_locations(), 9);
+    }
+
+    #[tokio::test]
+    async fn planning_unresolved_is_committed_audited_and_counted_without_blocking_good_tasks() {
+        let preparation = TranslationPlanPreparation::new(
+            Vec::new(),
+            Vec::new(),
+            r#"[{"term":"勇者"}]"#.to_owned(),
+            r#"[{"pattern":"<BAD>"}]"#.to_owned(),
+            0,
+            1,
+            0,
+        )
+        .with_test_planning_failures(vec![TranslationPlanningFailure::new(
+            translation_identity_at(99, "description"),
+            TranslationPlanningFailureReason::PlaceholderProtection {
+                message: "实际保护跨度冲突".to_owned(),
+            },
+        )]);
+        let harness =
+            harness_with_preparation(1, vec![1], false, false, false, None, None, preparation);
+
+        let report = expect_completed(
+            harness
+                .service
+                .run(&project(), &profile(1), input())
+                .await
+                .expect("规划期未解决是正常部分结果"),
+        );
+
+        assert_eq!(report.complete_tasks(), 1);
+        assert_eq!(report.unresolved_decisions(), 1);
+        assert_eq!(report.unresolved_locations(), 1);
+        assert_eq!(report.invalidated(), 1);
+        assert!(events(&harness.events).contains(&Event::LogPlanningFailure));
+        let preparations = harness.preparations.lock().expect("准备记录锁不应中毒");
+        assert_eq!(preparations.len(), 1);
+        assert_eq!(preparations[0].planning_failures().len(), 1);
+        let records = harness.log_records.lock().expect("日志记录锁不应中毒");
+        assert!(matches!(
+            records.as_slice(),
+            [AuditEvent::TranslationPlanningUnresolved { .. }, ..]
+        ));
+    }
+
+    #[test]
+    fn planning_unresolved_audit_failure_reports_state_already_applied() {
+        let error = StandardTranslationServiceError::<
+            FakeError,
+            FakeError,
+            FakeError,
+            FakeError,
+            FakeError,
+        >::RecordPlanningFailures(FakeError("log"));
+
+        assert_eq!(
+            error.failure_impact(),
+            StandardTranslationFailureImpact::StateAppliedButFinalizationFailed
+        );
     }
 
     #[tokio::test]

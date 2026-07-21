@@ -53,6 +53,7 @@ where
             script_path,
             LuaProjectContext::for_frozen_source(
                 project.name().as_str(),
+                project.layout().rpg_maker_layout().engine(),
                 project.source_content_root(),
                 project.database_path().to_path_buf(),
                 project.language_pair().clone(),

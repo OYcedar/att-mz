@@ -291,7 +291,7 @@ impl SqliteQueryExecutor for FakeSqliteTransactionExecutor {
             query.statement().contains("standard_asset_owner_state")
                 || query.statement().contains("standard_text_group")
                 || query.statement().contains("standard_text_unit")
-                || query.statement().contains("standard_text_target"),
+                || query.statement().contains("standard_mutation_claim"),
             "Store 只应读取当前 owner 快照或新鲜 owner"
         );
         Ok(Vec::new())

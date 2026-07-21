@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use self::runtime::TrustedLuaExtractIntent;
@@ -11,6 +11,7 @@ use self::runtime::TrustedLuaTranslationSemantics;
 use self::runtime::TrustedLuaWriteBackHostCalls;
 use crate::execution::OperationCompletion;
 use crate::language::{LanguageId, LanguagePair};
+use crate::rpg_maker::RpgMakerEngine;
 
 pub(crate) mod document;
 pub(crate) mod hosting;
@@ -24,7 +25,6 @@ pub(crate) mod runtime;
 /// 根完成。进入 Host 后路径一定从 `data` 或 `js` 开始，且无法逃出冻结来源根。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct LuaSourcePath {
-    path: PathBuf,
     display: String,
 }
 
@@ -33,26 +33,28 @@ impl LuaSourcePath {
         if value.is_empty() {
             return Err(LuaSourcePathError::Empty);
         }
+        if value.starts_with('/') {
+            return Err(LuaSourcePathError::Absolute);
+        }
+        if value.contains('\\')
+            || value.ends_with('/')
+            || value.contains("//")
+            || value.chars().any(char::is_control)
+        {
+            return Err(LuaSourcePathError::NonCanonical);
+        }
         if value.contains(':') {
             return Err(LuaSourcePathError::AlternateDataStream);
         }
 
-        let mut path = PathBuf::new();
         let mut display_components = Vec::new();
-        for component in Path::new(value).components() {
-            let Component::Normal(component) = component else {
-                return Err(match component {
-                    Component::ParentDir => LuaSourcePathError::ParentTraversal,
-                    Component::Prefix(_) | Component::RootDir => LuaSourcePathError::Absolute,
-                    Component::CurDir => LuaSourcePathError::NonCanonical,
-                    Component::Normal(_) => unreachable!(),
-                });
-            };
-            let component = component.to_str().ok_or(LuaSourcePathError::InvalidUtf8)?;
-            if component.is_empty() {
+        for component in value.split('/') {
+            if component == ".." {
+                return Err(LuaSourcePathError::ParentTraversal);
+            }
+            if component.is_empty() || component == "." {
                 return Err(LuaSourcePathError::NonCanonical);
             }
-            path.push(component);
             display_components.push(component.to_owned());
         }
 
@@ -64,24 +66,23 @@ impl LuaSourcePath {
         }
 
         Ok(Self {
-            path,
             display: display_components.join("/"),
         })
-    }
-
-    pub(crate) fn join_to(&self, source_root: &Path) -> PathBuf {
-        source_root.join(&self.path)
     }
 
     pub(crate) fn as_str(&self) -> &str {
         &self.display
     }
 
+    pub(crate) fn components(&self) -> impl Iterator<Item = &str> {
+        self.display.split('/')
+    }
+
     pub(crate) fn child(&self, name: &str) -> Result<Self, LuaSourcePathError> {
         if name.is_empty()
             || name
                 .chars()
-                .any(|character| matches!(character, '/' | '\\' | ':'))
+                .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
             || matches!(name, "." | "..")
         {
             return Err(LuaSourcePathError::InvalidChildName);
@@ -99,7 +100,6 @@ pub(crate) enum LuaSourcePathError {
     AlternateDataStream,
     NonCanonical,
     OutsideSourceRoots,
-    InvalidUtf8,
     InvalidChildName,
 }
 
@@ -112,7 +112,6 @@ impl fmt::Display for LuaSourcePathError {
             Self::AlternateDataStream => formatter.write_str("来源路径不允许 NTFS ADS"),
             Self::NonCanonical => formatter.write_str("来源路径必须使用规范路径段"),
             Self::OutsideSourceRoots => formatter.write_str("来源路径只允许 data/** 或 js/**"),
-            Self::InvalidUtf8 => formatter.write_str("来源路径必须是 UTF-8"),
             Self::InvalidChildName => formatter.write_str("目录项名称不是有效来源路径段"),
         }
     }
@@ -156,6 +155,7 @@ impl LuaProjectFileAccess {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LuaProjectContext {
     name: String,
+    engine: RpgMakerEngine,
     file_access: LuaProjectFileAccess,
     database_path: PathBuf,
     language_pair: LanguagePair,
@@ -164,12 +164,14 @@ pub(crate) struct LuaProjectContext {
 impl LuaProjectContext {
     pub(crate) fn for_frozen_source(
         name: impl Into<String>,
+        engine: RpgMakerEngine,
         source_root: PathBuf,
         database_path: PathBuf,
         language_pair: LanguagePair,
     ) -> Self {
         Self {
             name: name.into(),
+            engine,
             file_access: LuaProjectFileAccess::FrozenSource { source_root },
             database_path,
             language_pair,
@@ -178,6 +180,7 @@ impl LuaProjectContext {
 
     pub(crate) fn for_write_back_candidate(
         name: impl Into<String>,
+        engine: RpgMakerEngine,
         source_root: PathBuf,
         database_path: PathBuf,
         language_pair: LanguagePair,
@@ -185,6 +188,7 @@ impl LuaProjectContext {
     ) -> Self {
         Self {
             name: name.into(),
+            engine,
             file_access: LuaProjectFileAccess::CandidateWriteBack {
                 source_root,
                 output_root,
@@ -196,6 +200,10 @@ impl LuaProjectContext {
 
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) const fn engine(&self) -> RpgMakerEngine {
+        self.engine
     }
 
     pub(crate) fn source_root(&self) -> &Path {
@@ -343,12 +351,19 @@ mod tests {
         for invalid in [
             "",
             ".",
+            "Data/Items.json",
+            "JS/plugins.js",
             "other/file",
             "../data/Items.json",
             "data/../js/plugins.js",
             "C:/game/data/Items.json",
             r"\\server\share\data\Items.json",
             "data/file:stream",
+            r"data\Items.json",
+            "data//Items.json",
+            "data/Items.json/",
+            "data/./Items.json",
+            "data/line\nfeed",
         ] {
             assert!(LuaSourcePath::parse(invalid).is_err(), "{invalid:?}");
         }
@@ -361,7 +376,7 @@ mod tests {
             root.child("Map001.json").unwrap().as_str(),
             "data/maps/Map001.json"
         );
-        for invalid in ["", ".", "..", "a/b", r"a\b", "a:stream"] {
+        for invalid in ["", ".", "..", "a/b", r"a\b", "a:stream", "line\nfeed"] {
             assert!(root.child(invalid).is_err(), "{invalid:?}");
         }
     }

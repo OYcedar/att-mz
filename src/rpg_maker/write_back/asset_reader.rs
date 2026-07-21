@@ -14,7 +14,8 @@ use crate::rpg_maker::location_codec::{
     RpgMakerProjectionCodecError,
 };
 use crate::rpg_maker::model::{
-    MutationTarget, TextProjectionRecipe, TextUnitContent, TextUnitRole,
+    MutationResourceAccess, MutationResourceLock, TextProjectionRecipe, TextUnitContent,
+    TextUnitRole,
 };
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
@@ -36,32 +37,44 @@ const READ_STANDARD_WRITE_BACK_OWNER_STATES: &str = r#"SELECT
     source_snapshot_fingerprint,
     asset_snapshot_fingerprint
 FROM standard_asset_owner_state
-ORDER BY owner COLLATE BINARY"#;
+ORDER BY CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 WHEN 'lua' THEN 2 END"#;
 
 const READ_STANDARD_WRITE_BACK_GROUPS: &str = r#"SELECT
     owner,
     group_location,
+    group_order,
     group_kind,
     projection_recipe_json
 FROM standard_text_group
-ORDER BY owner COLLATE BINARY, group_location COLLATE BINARY"#;
+ORDER BY CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 WHEN 'lua' THEN 2 END,
+         group_order"#;
 
 const READ_STANDARD_WRITE_BACK_UNITS: &str = r#"SELECT
-    owner,
-    group_location,
-    unit_role,
-    source_content_json,
-    source_context_json,
-    translation_content_json
-FROM standard_text_unit
-ORDER BY owner COLLATE BINARY, group_location COLLATE BINARY, unit_role COLLATE BINARY"#;
+    unit.owner,
+    unit.group_location,
+    unit.unit_role,
+    unit.unit_order,
+    unit.source_content_json,
+    unit.source_context_json,
+    unit.translation_content_json
+FROM standard_text_unit AS unit
+JOIN standard_text_group AS text_group
+  ON text_group.owner = unit.owner
+ AND text_group.group_location = unit.group_location
+ORDER BY CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 WHEN 'lua' THEN 2 END,
+         text_group.group_order,
+         unit.unit_order"#;
 
-const READ_STANDARD_WRITE_BACK_TARGETS: &str = r#"SELECT
+const READ_STANDARD_WRITE_BACK_CLAIMS: &str = r#"SELECT
     owner,
     group_location,
-    mutation_target
-FROM standard_text_target
-ORDER BY mutation_target COLLATE BINARY"#;
+    resource_key,
+    access
+FROM standard_mutation_claim
+ORDER BY resource_key COLLATE BINARY,
+         access COLLATE BINARY,
+         CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 WHEN 'lua' THEN 2 END,
+         group_location COLLATE BINARY"#;
 
 /// 先验证 active owner 与资产指纹，再用受控 CPU 解码建立写回快照。
 pub(crate) struct RpgMakerStandardWriteBackAssetReadingService<Q, C> {
@@ -114,13 +127,13 @@ where
                         SqliteQuery::new(READ_STANDARD_WRITE_BACK_OWNER_STATES, Vec::new()),
                         SqliteQuery::new(READ_STANDARD_WRITE_BACK_GROUPS, Vec::new()),
                         SqliteQuery::new(READ_STANDARD_WRITE_BACK_UNITS, Vec::new()),
-                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_TARGETS, Vec::new()),
+                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_CLAIMS, Vec::new()),
                     ],
                 )
                 .await
                 .map_err(|error| map_query_error(database_path, error))?;
             let actual = query_results.len();
-            let [owner_rows, group_rows, unit_rows, target_rows] =
+            let [owner_rows, group_rows, unit_rows, claim_rows] =
                 query_results.try_into().map_err(|_| {
                     RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot(
                         InvalidStandardWriteBackAssetSnapshot::WrongQueryResultCount {
@@ -137,7 +150,7 @@ where
                             owners: owner_rows,
                             groups: group_rows,
                             units: unit_rows,
-                            targets: target_rows,
+                            claims: claim_rows,
                         },
                         current_source,
                         records_per_job,
@@ -262,6 +275,10 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
         expected: &'static str,
         actual: &'static str,
     },
+    InvalidOrderValue {
+        column: &'static str,
+        actual: i64,
+    },
     UnknownOwner(String),
     DuplicateOwner(String),
     InvalidFingerprintLength {
@@ -279,6 +296,18 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
         owner: String,
         group_location: String,
     },
+    InvalidGroupOrder {
+        owner: String,
+        expected: usize,
+        actual: i64,
+    },
+    InvalidUnitOrder {
+        owner: String,
+        group_location: String,
+        expected: usize,
+        actual: i64,
+    },
+    UnknownMutationAccess(String),
     AssetFingerprintMismatch {
         owner: String,
     },
@@ -310,6 +339,12 @@ impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
                 expected,
                 actual,
             } => write!(formatter, "列 {column} 应为 {expected}，实际为 {actual}"),
+            Self::InvalidOrderValue { column, actual } => {
+                write!(
+                    formatter,
+                    "列 {column} 必须是可表示的非负顺序，实际为 {actual}"
+                )
+            }
             Self::UnknownOwner(owner) => write!(formatter, "未知资产所有者：{owner}"),
             Self::DuplicateOwner(owner) => write!(formatter, "资产所有者状态重复：{owner}"),
             Self::InvalidFingerprintLength {
@@ -335,6 +370,26 @@ impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
                 formatter,
                 "单元或目标没有对应资产组：{owner} / {group_location}"
             ),
+            Self::InvalidGroupOrder {
+                owner,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "owner {owner} 的 group_order 必须从 0 连续：期待 {expected}，实际 {actual}"
+            ),
+            Self::InvalidUnitOrder {
+                owner,
+                group_location,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "组 {owner} / {group_location} 的 unit_order 必须从 0 连续：期待 {expected}，实际 {actual}"
+            ),
+            Self::UnknownMutationAccess(access) => {
+                write!(formatter, "未知物理修改访问方式：{access}")
+            }
             Self::AssetFingerprintMismatch { owner } => {
                 write!(formatter, "资产所有者 {owner} 的快照指纹与三表内容不一致")
             }
@@ -374,13 +429,13 @@ struct SnapshotRows {
     owners: Vec<SqliteRow>,
     groups: Vec<SqliteRow>,
     units: Vec<SqliteRow>,
-    targets: Vec<SqliteRow>,
+    claims: Vec<SqliteRow>,
 }
 
 enum SnapshotAssetRow {
     Group(SqliteRow),
     Unit(SqliteRow),
-    Target(SqliteRow),
+    Claim(SqliteRow),
 }
 
 struct PreparedRows {
@@ -399,7 +454,7 @@ fn prepare_rows(
         .groups
         .len()
         .saturating_add(rows.units.len())
-        .saturating_add(rows.targets.len());
+        .saturating_add(rows.claims.len());
     let initial_batch_capacity = records_per_job.min(asset_row_count);
     let mut owner_states = BTreeMap::new();
     let mut batches = Vec::new();
@@ -455,7 +510,7 @@ fn prepare_rows(
         .into_iter()
         .map(SnapshotAssetRow::Group)
         .chain(rows.units.into_iter().map(SnapshotAssetRow::Unit))
-        .chain(rows.targets.into_iter().map(SnapshotAssetRow::Target));
+        .chain(rows.claims.into_iter().map(SnapshotAssetRow::Claim));
     for row in ordered_asset_rows {
         asset_rows.push(row);
         if asset_rows.len() == records_per_job {
@@ -480,6 +535,7 @@ enum DecodedRecord {
         owner: String,
         group_location_raw: String,
         group_location: RpgMakerLocation,
+        group_order: usize,
         kind: TextGroupKind,
         group_kind_raw: String,
         recipes: Vec<TextProjectionRecipe>,
@@ -490,16 +546,18 @@ enum DecodedRecord {
         group_location_raw: String,
         role: TextUnitRole,
         role_raw: String,
+        unit_order: usize,
         source_content: TextUnitContent,
         source_content_json: String,
         source_context_json: String,
         translation_content: Option<TextUnitContent>,
     },
-    Target {
+    Claim {
         owner: String,
         group_location_raw: String,
-        target: MutationTarget,
-        target_raw: String,
+        lock: MutationResourceLock,
+        resource_key_raw: String,
+        access_raw: String,
     },
 }
 
@@ -510,7 +568,7 @@ fn decode_batch(
         .map(|row| match row {
             SnapshotAssetRow::Group(row) => decode_group(row),
             SnapshotAssetRow::Unit(row) => decode_unit(row),
-            SnapshotAssetRow::Target(row) => decode_target(row),
+            SnapshotAssetRow::Claim(row) => decode_claim(row),
         })
         .collect()
 }
@@ -518,9 +576,15 @@ fn decode_batch(
 fn decode_group(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
     let values = row.into_values();
     let actual = values.len();
-    let [owner, group_location, group_kind, projection_recipe_json] = values.try_into().map_err(
+    let [
+        owner,
+        group_location,
+        group_order,
+        group_kind,
+        projection_recipe_json,
+    ] = values.try_into().map_err(
         |_| InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
-            expected: 4,
+            expected: 5,
             actual,
         },
     )?;
@@ -534,6 +598,7 @@ fn decode_group(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBac
         group_location: RpgMakerLocationCodec::decode(&group_location_raw)
             .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidLocation)?,
         group_location_raw,
+        group_order: owned_non_negative_order(group_order, "group_order")?,
         kind: parse_group_kind(&group_kind_raw)?,
         group_kind_raw,
         recipes: RpgMakerProjectionCodec::decode_recipes(&recipes_raw)
@@ -549,12 +614,13 @@ fn decode_unit(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBack
         owner,
         group_location,
         unit_role,
+        unit_order,
         source_content_json,
         source_context_json,
         translation_content_json,
     ] = values.try_into().map_err(
         |_| InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
-            expected: 6,
+            expected: 7,
             actual,
         },
     )?;
@@ -588,6 +654,7 @@ fn decode_unit(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBack
         role: RpgMakerProjectionCodec::decode_role(&role_raw)
             .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
         role_raw,
+        unit_order: owned_non_negative_order(unit_order, "unit_order")?,
         source_content,
         source_content_json,
         source_context_json,
@@ -595,26 +662,34 @@ fn decode_unit(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBack
     })
 }
 
-fn decode_target(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
+fn decode_claim(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
     let values = row.into_values();
     let actual = values.len();
-    let [owner, group_location, mutation_target] =
+    let [owner, group_location, resource_key, access] =
         values.try_into().map_err(
             |_| InvalidStandardWriteBackAssetSnapshot::WrongColumnCount {
-                expected: 3,
+                expected: 4,
                 actual,
             },
         )?;
     let owner = owned_text(owner, "owner")?;
     parse_owner(&owner)?;
     let group_location_raw = owned_text(group_location, "group_location")?;
-    let target_raw = owned_text(mutation_target, "mutation_target")?;
-    Ok(DecodedRecord::Target {
+    let resource_key_raw = owned_text(resource_key, "resource_key")?;
+    let access_raw = owned_text(access, "access")?;
+    let access = MutationResourceAccess::from_storage_name(&access_raw).ok_or_else(|| {
+        InvalidStandardWriteBackAssetSnapshot::UnknownMutationAccess(access_raw.clone())
+    })?;
+    Ok(DecodedRecord::Claim {
         owner,
         group_location_raw,
-        target: RpgMakerProjectionCodec::decode_target(&target_raw)
-            .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
-        target_raw,
+        lock: MutationResourceLock::new(
+            RpgMakerProjectionCodec::decode_mutation_resource(&resource_key_raw)
+                .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
+            access,
+        ),
+        resource_key_raw,
+        access_raw,
     })
 }
 
@@ -623,7 +698,7 @@ struct GroupBuilder {
     location: RpgMakerLocation,
     recipes: Vec<TextProjectionRecipe>,
     units: Vec<StandardWriteBackUnit>,
-    targets: Vec<MutationTarget>,
+    claims: Vec<MutationResourceLock>,
 }
 
 struct SnapshotFingerprintAccumulator {
@@ -642,27 +717,39 @@ impl SnapshotFingerprintAccumulator {
         Self { hasher }
     }
 
-    fn group(&mut self, group_location: &str, group_kind: &str, recipes: &str) {
+    fn group(&mut self, group_location: &str, group_order: usize, group_kind: &str, recipes: &str) {
+        let group_order = u64::try_from(group_order).expect("group_order 必须可编码为 u64");
         self.hasher
             .frame(2, b"group")
             .frame(3, group_location.as_bytes())
+            .frame(16, &group_order.to_le_bytes())
             .frame(4, group_kind.as_bytes())
             .frame(5, recipes.as_bytes());
     }
 
-    fn unit(&mut self, group_location: &str, role: &str, source: &str, context: &str) {
+    fn unit(
+        &mut self,
+        group_location: &str,
+        role: &str,
+        unit_order: usize,
+        source: &str,
+        context: &str,
+    ) {
+        let unit_order = u64::try_from(unit_order).expect("unit_order 必须可编码为 u64");
         self.hasher
             .frame(6, b"unit")
             .frame(7, group_location.as_bytes())
             .frame(8, role.as_bytes())
+            .frame(17, &unit_order.to_le_bytes())
             .frame(9, source.as_bytes())
             .frame(10, context.as_bytes());
     }
 
-    fn target(&mut self, target: &str, group_location: &str) {
+    fn claim(&mut self, resource_key: &str, access: &str, group_location: &str) {
         self.hasher
-            .frame(11, b"target")
-            .frame(12, target.as_bytes())
+            .frame(11, b"claim")
+            .frame(12, resource_key.as_bytes())
+            .frame(18, access.as_bytes())
             .frame(13, group_location.as_bytes());
     }
 
@@ -676,9 +763,9 @@ fn assemble_snapshot(
     records: impl IntoIterator<Item = DecodedRecord>,
     dialogue_definition_json: &str,
 ) -> Result<StandardWriteBackSnapshot, InvalidStandardWriteBackAssetSnapshot> {
-    let mut groups = BTreeMap::<(String, String), GroupBuilder>::new();
-    let mut units = Vec::new();
-    let mut targets = Vec::new();
+    let mut groups = Vec::<GroupBuilder>::new();
+    let mut group_indexes = BTreeMap::<(String, String), usize>::new();
+    let mut next_group_orders = BTreeMap::<String, usize>::new();
     let mut fingerprint_accumulators = owner_states
         .iter()
         .map(|(owner_name, state)| {
@@ -693,7 +780,7 @@ fn assemble_snapshot(
         let owner = match &record {
             DecodedRecord::Group { owner, .. }
             | DecodedRecord::Unit { owner, .. }
-            | DecodedRecord::Target { owner, .. } => owner,
+            | DecodedRecord::Claim { owner, .. } => owner,
         };
         if !owner_states.contains_key(owner) {
             return Err(InvalidStandardWriteBackAssetSnapshot::AssetWithoutOwner(
@@ -705,6 +792,7 @@ fn assemble_snapshot(
                 owner,
                 group_location_raw,
                 group_location,
+                group_order,
                 kind,
                 group_kind_raw,
                 recipes,
@@ -713,32 +801,46 @@ fn assemble_snapshot(
                 fingerprint_accumulators
                     .get_mut(&owner)
                     .expect("active owner 已在循环入口确认")
-                    .group(&group_location_raw, &group_kind_raw, &recipes_raw);
+                    .group(
+                        &group_location_raw,
+                        group_order,
+                        &group_kind_raw,
+                        &recipes_raw,
+                    );
                 let key = (owner.clone(), group_location_raw.clone());
-                if groups
-                    .insert(
-                        key,
-                        GroupBuilder {
-                            kind,
-                            location: group_location,
-                            recipes,
-                            units: Vec::new(),
-                            targets: Vec::new(),
-                        },
-                    )
-                    .is_some()
-                {
+                if group_indexes.contains_key(&key) {
                     return Err(InvalidStandardWriteBackAssetSnapshot::DuplicateGroup {
                         owner,
                         group_location: group_location_raw,
                     });
                 }
+                let expected = *next_group_orders.entry(owner.clone()).or_default();
+                if group_order != expected {
+                    return Err(InvalidStandardWriteBackAssetSnapshot::InvalidGroupOrder {
+                        owner,
+                        expected,
+                        actual: i64::try_from(group_order).unwrap_or(i64::MAX),
+                    });
+                }
+                *next_group_orders
+                    .get_mut(&owner)
+                    .expect("owner group_order 计数已建立") += 1;
+                let index = groups.len();
+                group_indexes.insert(key, index);
+                groups.push(GroupBuilder {
+                    kind,
+                    location: group_location,
+                    recipes,
+                    units: Vec::new(),
+                    claims: Vec::new(),
+                });
             }
             DecodedRecord::Unit {
                 owner,
                 group_location_raw,
                 role,
                 role_raw,
+                unit_order,
                 source_content,
                 source_content_json,
                 source_context_json,
@@ -750,50 +852,53 @@ fn assemble_snapshot(
                     .unit(
                         &group_location_raw,
                         &role_raw,
+                        unit_order,
                         &source_content_json,
                         &source_context_json,
                     );
-                units.push((
-                    owner,
-                    group_location_raw,
+                let index = group_indexes
+                    .get(&(owner.clone(), group_location_raw.clone()))
+                    .copied()
+                    .ok_or(InvalidStandardWriteBackAssetSnapshot::MissingGroup {
+                        owner: owner.clone(),
+                        group_location: group_location_raw.clone(),
+                    })?;
+                let group = &mut groups[index];
+                let expected = group.units.len();
+                if unit_order != expected {
+                    return Err(InvalidStandardWriteBackAssetSnapshot::InvalidUnitOrder {
+                        owner,
+                        group_location: group_location_raw,
+                        expected,
+                        actual: i64::try_from(unit_order).unwrap_or(i64::MAX),
+                    });
+                }
+                group.units.push(
                     StandardWriteBackUnit::new(role, source_content, translation_content)
                         .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidModel)?,
-                ));
+                );
             }
-            DecodedRecord::Target {
+            DecodedRecord::Claim {
                 owner,
                 group_location_raw,
-                target,
-                target_raw,
+                lock,
+                resource_key_raw,
+                access_raw,
             } => {
                 fingerprint_accumulators
                     .get_mut(&owner)
                     .expect("active owner 已在循环入口确认")
-                    .target(&target_raw, &group_location_raw);
-                targets.push((owner, group_location_raw, target));
+                    .claim(&resource_key_raw, &access_raw, &group_location_raw);
+                let index = group_indexes
+                    .get(&(owner.clone(), group_location_raw.clone()))
+                    .copied()
+                    .ok_or(InvalidStandardWriteBackAssetSnapshot::MissingGroup {
+                        owner,
+                        group_location: group_location_raw,
+                    })?;
+                groups[index].claims.push(lock);
             }
         }
-    }
-
-    for (owner, group_location, unit) in units {
-        groups
-            .get_mut(&(owner.clone(), group_location.clone()))
-            .ok_or(InvalidStandardWriteBackAssetSnapshot::MissingGroup {
-                owner,
-                group_location,
-            })?
-            .units
-            .push(unit);
-    }
-    for (owner, group_location, target) in targets {
-        groups
-            .get_mut(&(owner.clone(), group_location.clone()))
-            .ok_or(InvalidStandardWriteBackAssetSnapshot::MissingGroup {
-                owner,
-                group_location,
-            })?
-            .targets
-            .push(target);
     }
 
     for (owner_name, state) in &owner_states {
@@ -811,14 +916,14 @@ fn assemble_snapshot(
     }
 
     let groups = groups
-        .into_values()
+        .into_iter()
         .map(|group| {
             StandardWriteBackGroup::new(
                 group.kind,
                 group.location,
                 group.units,
                 group.recipes,
-                group.targets,
+                group.claims,
             )
             .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidModel)
         })
@@ -830,9 +935,9 @@ fn assemble_snapshot(
 #[cfg(test)]
 #[derive(Default)]
 struct FingerprintRows {
-    groups: Vec<(String, String, String)>,
-    units: Vec<(String, String, String, String)>,
-    targets: Vec<(String, String)>,
+    groups: Vec<(String, usize, String, String)>,
+    units: Vec<(String, String, usize, String, String)>,
+    claims: Vec<(String, String, String)>,
 }
 
 #[cfg(test)]
@@ -841,18 +946,18 @@ fn snapshot_fingerprint(
     mut rows: FingerprintRows,
     dialogue_definition_json: &str,
 ) -> AssetSnapshotFingerprint {
-    rows.groups.sort();
-    rows.units.sort();
-    rows.targets.sort();
+    rows.groups.sort_by_key(|row| row.1);
+    rows.units.sort_by_key(|row| row.2);
+    rows.claims.sort();
     let mut accumulator = SnapshotFingerprintAccumulator::new(owner, dialogue_definition_json);
-    for (group_location, group_kind, recipes) in rows.groups {
-        accumulator.group(&group_location, &group_kind, &recipes);
+    for (group_location, group_order, group_kind, recipes) in rows.groups {
+        accumulator.group(&group_location, group_order, &group_kind, &recipes);
     }
-    for (group_location, role, source, context) in rows.units {
-        accumulator.unit(&group_location, &role, &source, &context);
+    for (group_location, role, unit_order, source, context) in rows.units {
+        accumulator.unit(&group_location, &role, unit_order, &source, &context);
     }
-    for (target, group_location) in rows.targets {
-        accumulator.target(&target, &group_location);
+    for (resource_key, access, group_location) in rows.claims {
+        accumulator.claim(&resource_key, &access, &group_location);
     }
     accumulator.finish()
 }
@@ -892,6 +997,25 @@ fn owned_text(
             actual: value.kind_name(),
         }),
     }
+}
+
+fn owned_non_negative_order(
+    value: SqliteValue,
+    column: &'static str,
+) -> Result<usize, InvalidStandardWriteBackAssetSnapshot> {
+    let SqliteValue::Integer(value) = value else {
+        return Err(InvalidStandardWriteBackAssetSnapshot::WrongColumnType {
+            column,
+            expected: "INTEGER",
+            actual: value.kind_name(),
+        });
+    };
+    usize::try_from(value).map_err(
+        |_| InvalidStandardWriteBackAssetSnapshot::InvalidOrderValue {
+            column,
+            actual: value,
+        },
+    )
 }
 
 fn optional_owned_text(
@@ -974,12 +1098,12 @@ mod tests {
             owners,
             groups: Vec::new(),
             units: Vec::new(),
-            targets: Vec::new(),
+            claims: Vec::new(),
         }
     }
 
     #[test]
-    fn snapshot_queries_follow_primary_key_order_without_temporary_sorting() {
+    fn snapshot_queries_follow_persisted_natural_order() {
         let connection = rusqlite::Connection::open_in_memory().expect("应可建立内存数据库");
         connection
             .execute_batch(
@@ -992,56 +1116,43 @@ mod tests {
                 CREATE TABLE standard_text_group (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
+                    group_order INTEGER NOT NULL,
                     group_kind TEXT NOT NULL,
                     projection_recipe_json TEXT NOT NULL,
-                    PRIMARY KEY (owner, group_location)
+                    PRIMARY KEY (owner, group_location),
+                    UNIQUE (owner, group_order)
                 );
                 CREATE TABLE standard_text_unit (
                     owner TEXT NOT NULL,
                     group_location TEXT NOT NULL,
                     unit_role TEXT NOT NULL,
+                    unit_order INTEGER NOT NULL,
                     source_content_json TEXT NOT NULL,
                     source_context_json TEXT NOT NULL,
                     translation_content_json TEXT,
                     translation_state TEXT NOT NULL,
-                    PRIMARY KEY (owner, group_location, unit_role)
+                    PRIMARY KEY (owner, group_location, unit_role),
+                    UNIQUE (owner, group_location, unit_order)
                 );
-                CREATE TABLE standard_text_target (
-                    mutation_target TEXT NOT NULL PRIMARY KEY,
+                CREATE TABLE standard_mutation_claim (
                     owner TEXT NOT NULL,
-                    group_location TEXT NOT NULL
+                    group_location TEXT NOT NULL,
+                    resource_key TEXT NOT NULL,
+                    access TEXT NOT NULL,
+                    PRIMARY KEY (owner, group_location, resource_key)
                 );
 
                 INSERT INTO standard_asset_owner_state VALUES ('rules', zeroblob(32), zeroblob(32));
                 INSERT INTO standard_asset_owner_state VALUES ('builtin', zeroblob(32), zeroblob(32));
-                INSERT INTO standard_text_group VALUES ('builtin', 'group-b', 'map', '[]');
-                INSERT INTO standard_text_group VALUES ('builtin', 'group-a', 'map', '[]');
-                INSERT INTO standard_text_unit VALUES ('builtin', 'group-b', 'role-z', '"z"', '{}', NULL, 'untranslated');
-                INSERT INTO standard_text_unit VALUES ('builtin', 'group-a', 'role-y', '"y"', '{}', NULL, 'untranslated');
-                INSERT INTO standard_text_target VALUES ('target-z', 'builtin', 'group-a');
-                INSERT INTO standard_text_target VALUES ('target-a', 'builtin', 'group-z');
+                INSERT INTO standard_text_group VALUES ('builtin', 'group-b', 1, 'map', '[]');
+                INSERT INTO standard_text_group VALUES ('builtin', 'group-a', 0, 'map', '[]');
+                INSERT INTO standard_text_unit VALUES ('builtin', 'group-b', 'role-z', 0, '"z"', '{}', NULL, 'untranslated');
+                INSERT INTO standard_text_unit VALUES ('builtin', 'group-a', 'role-y', 0, '"y"', '{}', NULL, 'untranslated');
+                INSERT INTO standard_mutation_claim VALUES ('builtin', 'group-a', 'resource-z', 'exclusive');
+                INSERT INTO standard_mutation_claim VALUES ('builtin', 'group-b', 'resource-a', 'intent');
                 "#,
             )
             .expect("测试快照表与行应可建立");
-
-        for query in [
-            READ_STANDARD_WRITE_BACK_OWNER_STATES,
-            READ_STANDARD_WRITE_BACK_GROUPS,
-            READ_STANDARD_WRITE_BACK_UNITS,
-            READ_STANDARD_WRITE_BACK_TARGETS,
-        ] {
-            let plan = connection
-                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
-                .expect("快照查询计划应可建立")
-                .query_map([], |row| row.get::<_, String>(3))
-                .expect("快照查询计划应可读取")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("快照查询计划行应可读取");
-            assert!(
-                plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
-                "快照查询不应产生临时排序：{plan:?}"
-            );
-        }
 
         let owners = connection
             .prepare(READ_STANDARD_WRITE_BACK_OWNER_STATES)
@@ -1066,15 +1177,15 @@ mod tests {
             .expect("unit 查询应可执行")
             .collect::<Result<Vec<_>, _>>()
             .expect("unit 行应可读取");
-        let targets = connection
-            .prepare(READ_STANDARD_WRITE_BACK_TARGETS)
-            .expect("target 查询应可建立")
+        let claims = connection
+            .prepare(READ_STANDARD_WRITE_BACK_CLAIMS)
+            .expect("Claim 查询应可建立")
             .query_map([], |row| {
-                Ok((row.get::<_, String>(2)?, row.get::<_, String>(1)?))
+                Ok((row.get::<_, String>(2)?, row.get::<_, String>(3)?))
             })
-            .expect("target 查询应可执行")
+            .expect("Claim 查询应可执行")
             .collect::<Result<Vec<_>, _>>()
-            .expect("target 行应可读取");
+            .expect("Claim 行应可读取");
 
         assert_eq!(owners, ["builtin", "rules"]);
         assert_eq!(groups, ["group-a", "group-b"]);
@@ -1086,10 +1197,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            targets,
+            claims,
             [
-                ("target-a".to_owned(), "group-z".to_owned()),
-                ("target-z".to_owned(), "group-a".to_owned()),
+                ("resource-a".to_owned(), "intent".to_owned()),
+                ("resource-z".to_owned(), "exclusive".to_owned()),
             ]
         );
     }
@@ -1107,9 +1218,9 @@ mod tests {
         };
         let rows = SnapshotRows {
             owners: Vec::new(),
-            groups: vec![make_row("group-0", 4), make_row("group-1", 4)],
-            units: vec![make_row("unit-0", 6), make_row("unit-1", 6)],
-            targets: vec![make_row("target-0", 3)],
+            groups: vec![make_row("group-0", 5), make_row("group-1", 5)],
+            units: vec![make_row("unit-0", 7), make_row("unit-1", 7)],
+            claims: vec![make_row("claim-0", 4)],
         };
 
         let prepared = prepare_rows(rows, SourceSnapshotFingerprint::from_bytes([1; 32]), 2)
@@ -1127,7 +1238,7 @@ mod tests {
                 .map(|row| match row {
                     SnapshotAssetRow::Group(row)
                     | SnapshotAssetRow::Unit(row)
-                    | SnapshotAssetRow::Target(row) => match &row.values()[0] {
+                    | SnapshotAssetRow::Claim(row) => match &row.values()[0] {
                         SqliteValue::Text(value) => value.as_ptr(),
                         value => panic!("owner 应为 TEXT，实际为 {}", value.kind_name()),
                     },
@@ -1161,6 +1272,7 @@ mod tests {
             SqliteValue::Text(owner),
             SqliteValue::Text(group_location),
             SqliteValue::Text(role),
+            SqliteValue::Integer(0),
             SqliteValue::Text(source_content_json),
             SqliteValue::Text(context),
             SqliteValue::Text(translation_content_json),
@@ -1241,6 +1353,7 @@ mod tests {
         let row = SqliteRow::new(vec![
             SqliteValue::Text("builtin".to_owned()),
             SqliteValue::Text(RpgMakerLocationCodec::encode(&location).expect("位置应可编码")),
+            SqliteValue::Integer(0),
             SqliteValue::Text("event_dialogue".to_owned()),
             SqliteValue::Text("{not-json".to_owned()),
         ]);

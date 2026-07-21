@@ -1088,6 +1088,24 @@ pub(super) fn accept_prepared_translation_candidate(
     language_analysis: &crate::language::LanguageAnalysis,
     language_module: &dyn LanguageModule,
 ) -> Result<super::semantics::PreparedTranslationAcceptance, TranslationCandidateTechnicalError> {
+    if translation.trim().is_empty() {
+        return Ok(super::semantics::PreparedTranslationAcceptance::Rejected(
+            super::semantics::PreparedTranslationRejection::Candidate(
+                TranslationUnitRejectionReason::BlankTranslation,
+            ),
+        ));
+    }
+    if let Some(byte_index) = translation.find(['\r', '\0']) {
+        let line_index = translation[..byte_index]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        return Ok(super::semantics::PreparedTranslationAcceptance::Rejected(
+            super::semantics::PreparedTranslationRejection::Candidate(
+                TranslationUnitRejectionReason::InvalidLineText { line_index },
+            ),
+        ));
+    }
     match validate_and_restore_translation(
         translation,
         placeholders,

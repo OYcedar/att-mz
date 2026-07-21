@@ -14,6 +14,62 @@ pub(super) struct RulesDefinition {
     rules: Vec<RuleDefinition>,
 }
 
+#[cfg(test)]
+mod documentation_contract_tests {
+    use super::RulesDefinition;
+    use crate::rpg_maker::documentation_test::{ClassifiedExampleKind, classified_toml_fences};
+
+    const EXAMPLE: &str = include_str!("../../../../docs/rpg-maker/examples/extract-rules.toml");
+    const RULES_GUIDE: &str = include_str!("../../../../docs/rpg-maker/rules.md");
+
+    #[test]
+    fn documented_extract_rules_use_the_production_parser_and_compiler() {
+        let definition = RulesDefinition::parse(EXAMPLE)
+            .expect("文档中的 Extract Rules 必须通过生产解析与 PCRE2 编译边界");
+        assert!(!definition.is_empty(), "完整示例必须至少声明一条规则");
+    }
+
+    #[test]
+    fn classified_extract_rule_fences_follow_the_production_contract() {
+        let mut valid = 0;
+        let mut invalid = 0;
+        for fence in classified_toml_fences(RULES_GUIDE) {
+            let common_root = fence.section().starts_with("2.") && fence.subsection().is_none();
+            let extract_section = fence.section().starts_with("4.");
+            if (!common_root && !extract_section)
+                || fence.kind() == ClassifiedExampleKind::Illustrative
+            {
+                continue;
+            }
+            let result = RulesDefinition::parse(fence.body());
+            match fence.kind() {
+                ClassifiedExampleKind::Valid => {
+                    valid += 1;
+                    result.unwrap_or_else(|error| {
+                        panic!(
+                            "rules.md:{} 的 Extract valid TOML 未通过生产边界：{error}",
+                            fence.opening_line()
+                        )
+                    });
+                }
+                ClassifiedExampleKind::Invalid => {
+                    invalid += 1;
+                    assert!(
+                        result.is_err(),
+                        "rules.md:{} 的 Extract invalid TOML 被生产边界接受",
+                        fence.opening_line()
+                    );
+                }
+                ClassifiedExampleKind::Illustrative => unreachable!(),
+            }
+        }
+        assert!(
+            valid > 0 && invalid > 0,
+            "共同根与 Extract 章节必须覆盖正反样例"
+        );
+    }
+}
+
 impl RulesDefinition {
     /// 只接受当前 Rules TOML 契约；根必须显式声明 `rule`。
     pub(super) fn parse(source: &str) -> Result<Self, RulesDefinitionError> {
@@ -321,28 +377,15 @@ fn parse_bracket_segment(path: &str, start: usize) -> Result<(PathSegment, usize
     }
     if bytes[cursor] == b'"' {
         let string_start = cursor;
-        cursor += 1;
-        let mut escaped = false;
-        while cursor < bytes.len() {
-            let byte = bytes[cursor];
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                cursor += 1;
-                break;
-            }
-            cursor += 1;
-        }
-        if cursor >= bytes.len() || bytes[cursor] != b']' {
-            return Err("带引号的键没有以 ] 结束".to_owned());
-        }
-        let encoded = &path[string_start..cursor];
-        let key: String =
-            serde_json::from_str(encoded).map_err(|error| format!("键字符串无效：{error}"))?;
-        if key.is_empty() {
-            return Err("字段名不能为空".to_owned());
+        let mut strings =
+            serde_json::Deserializer::from_str(&path[string_start..]).into_iter::<String>();
+        let key = strings
+            .next()
+            .ok_or_else(|| "键字符串无效：缺少 JSON 字符串".to_owned())?
+            .map_err(|error| format!("键字符串无效：{error}"))?;
+        cursor = string_start + strings.byte_offset();
+        if bytes.get(cursor) != Some(&b']') {
+            return Err("带引号的键必须紧邻 ] 结束".to_owned());
         }
         return Ok((PathSegment::Key(key), cursor + 1));
     }
@@ -369,6 +412,9 @@ pub(super) struct CompiledPattern {
 
 impl CompiledPattern {
     fn compile(rule_number: usize, source: String) -> Result<Self, RulesDefinitionError> {
+        if source.is_empty() {
+            return Err(RulesDefinitionError::EmptyPattern { rule_number });
+        }
         let regex = RegexBuilder::new()
             .utf(true)
             .ucp(true)
@@ -451,6 +497,9 @@ pub(crate) enum RulesDefinitionError {
         path: String,
         reason: String,
     },
+    EmptyPattern {
+        rule_number: usize,
+    },
     InvalidPattern {
         rule_number: usize,
         pattern: String,
@@ -509,6 +558,10 @@ impl fmt::Display for RulesDefinitionError {
                 formatter,
                 "Rules 第 {rule_number} 条规则的路径 {path} 无效：{reason}"
             ),
+            Self::EmptyPattern { rule_number } => write!(
+                formatter,
+                "Rules 第 {rule_number} 条规则的 pattern 不能是空字符串"
+            ),
             Self::InvalidPattern {
                 rule_number,
                 pattern,
@@ -542,6 +595,7 @@ impl Error for RulesDefinitionError {
             | Self::EmptyField { .. }
             | Self::InvalidFile { .. }
             | Self::InvalidPath { .. }
+            | Self::EmptyPattern { .. }
             | Self::InvalidNamedCaptures { .. } => None,
         }
     }
@@ -748,7 +802,6 @@ decode_json = true
             "name.[0]",
             "name value",
             "[abc]",
-            "[\"\"]",
             "0name",
             "name]",
         ] {
@@ -757,6 +810,59 @@ decode_json = true
                 RulesDefinition::parse(&source),
                 Err(RulesDefinitionError::InvalidPath { rule_number: 1, .. })
             ));
+        }
+    }
+
+    #[test]
+    fn quoted_path_keys_follow_json_string_grammar_and_may_be_empty() {
+        for (path, expected) in [
+            (r#"[""]"#, vec![PathSegment::Key(String::new())]),
+            (r#"["中文"]"#, vec![PathSegment::Key("中文".to_owned())]),
+            (r#"["\u4E2D"]"#, vec![PathSegment::Key("中".to_owned())]),
+            (
+                r#"["\uD83D\uDE00"]"#,
+                vec![PathSegment::Key("😀".to_owned())],
+            ),
+            (
+                r#"["quote\"slash\\"]"#,
+                vec![PathSegment::Key("quote\"slash\\".to_owned())],
+            ),
+            (r#"["]"]"#, vec![PathSegment::Key("]".to_owned())]),
+            (
+                r#"[""].next[1]["尾"]"#,
+                vec![
+                    PathSegment::Key(String::new()),
+                    PathSegment::Key("next".to_owned()),
+                    PathSegment::Index(1),
+                    PathSegment::Key("尾".to_owned()),
+                ],
+            ),
+        ] {
+            let compiled = CompiledPath::parse(path).expect("合法 JSON 字符串应当成为精确键");
+            assert_eq!(compiled.source(), path);
+            assert_eq!(compiled.segments(), expected);
+        }
+    }
+
+    #[test]
+    fn quoted_path_keys_reject_invalid_json_or_non_adjacent_closing_bracket() {
+        for path in [
+            "",
+            r#"["unterminated"#,
+            r#"["\x41"]"#,
+            r#"["\uD83D"]"#,
+            r#"["\uDE00"]"#,
+            "[\"line\nbreak\"]",
+            r#"["missing""#,
+            r#"[ "value"]"#,
+            r#"["value" ]"#,
+            r#"["value"0]"#,
+            r#"["value"]extra"#,
+        ] {
+            assert!(
+                CompiledPath::parse(path).is_err(),
+                "路径应当被拒绝：{path:?}"
+            );
         }
     }
 
@@ -774,7 +880,13 @@ pattern = '(prefix)?(?<text>.+)'
         let pattern = valid.rules()[0].pattern().expect("应该有 pattern");
         assert!(pattern.regex().is_match(b"prefixbody").expect("匹配应成功"));
 
+        assert!(matches!(
+            RulesDefinition::parse("[[rule]]\ncode = 401\nparameter = 0\npattern = ''"),
+            Err(RulesDefinitionError::EmptyPattern { rule_number: 1 })
+        ));
+
         for pattern in [
+            " ",
             ".+",
             "(?<other>.+)",
             "(?<text>.+)(?<other>.*)",
