@@ -4251,12 +4251,18 @@ id = "unused"
     #[test]
     fn selected_llm_client_debug_redacts_secret_and_parameters() {
         let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml")
+        let example = include_str!("../../config.example.toml").replace("\r\n", "\n");
+        const EMPTY_PARAMETERS: &str = "parameters = '''\n{}\n'''";
+        const PRIVATE_PARAMETERS: &str =
+            "parameters = '''\n{\"private_vendor_value\":\"PRIVATE_SENTINEL\"}\n'''";
+        assert!(
+            example.contains(EMPTY_PARAMETERS),
+            "示例配置必须默认使用空 parameters，测试再显式注入脱敏探针"
+        );
+        let source = example
             .replace("replace-with-api-key", "SECRET_SENTINEL")
-            .replace(
-                "\"temperature\": 0.2",
-                "\"private_vendor_value\": \"PRIVATE_SENTINEL\"",
-            );
+            .replace(EMPTY_PARAMETERS, PRIVATE_PARAMETERS);
+        assert!(source.contains("PRIVATE_SENTINEL"));
         let path = directory.write("secret.toml", &source);
         let ConfiguredRpgMakerCommand::Translate(configured) =
             load_configuration(&path, translate_command(false, "primary"))

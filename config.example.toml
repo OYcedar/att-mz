@@ -94,10 +94,7 @@ timeout_ms = 120000
 rpm = 60
 burst = 8
 parameters = '''
-{
-  "max_tokens": 4096,
-  "temperature": 0.2
-}
+{}
 '''
 
 [rpg_maker.document]
