@@ -127,8 +127,9 @@ user message 是最小 Markdown 载荷，只包含实际命中术语、活动 ID
 > 進む
 ```
 
-Prompt 作者必须要求模型只翻译带 ID 内容、无 ID 内容只作语境、每个 ID 恰好返回一次、
-遵守当前返回 wire、区分自由断行与严格对齐、精确保留 ATT token，且不输出解释文字。
+Prompt 作者必须遵守[系统提示词编写指南](prompts.md)定义的输入解释、JSON wire、ID、行形状、
+空槽、ATT token 和响应信封约束。违反这些约束会使整个 TaskBlock 或对应 ID 不可用，
+不是单纯降低翻译质量。
 
 公共 LLM 根提交 `model`、`messages`、`stream=false` 并透传 Client 的受信 parameters。
 网络重试仅按 Profile 明确策略；协议失败不伪装成网络错误。
