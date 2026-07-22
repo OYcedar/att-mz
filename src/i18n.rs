@@ -545,8 +545,8 @@ pub(crate) enum UiMessage<'a> {
         requested_profile: &'a str,
     },
     ErrorRpgMakerPromptUnavailable {
-        source_language: &'a str,
-        target_language: &'a str,
+        locale: &'a str,
+        component: &'a str,
         path: &'a str,
     },
     ErrorRpgMakerLanguageModuleUnavailable {
@@ -1008,12 +1008,12 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "requested", requested_profile);
             }
             Self::ErrorRpgMakerPromptUnavailable {
-                source_language,
-                target_language,
+                locale,
+                component,
                 path,
             } => {
-                set_text(&mut arguments, "source", source_language);
-                set_text(&mut arguments, "target", target_language);
+                set_text(&mut arguments, "locale", locale);
+                set_text(&mut arguments, "component", component);
                 set_text(&mut arguments, "path", path);
             }
             Self::ErrorRpgMakerLanguageModuleUnavailable {
@@ -1731,9 +1731,9 @@ mod tests {
                 requested_profile: "other",
             },
             UiMessage::ErrorRpgMakerPromptUnavailable {
-                source_language: "ja",
-                target_language: "zh-Hans",
-                path: "prompts/rpg_maker/ja--zh-Hans.md",
+                locale: "zh-Hans",
+                component: "system",
+                path: "prompts/rpg_maker/zh-Hans/system.md",
             },
             UiMessage::ErrorRpgMakerLanguageModuleUnavailable {
                 source_language: "ja",

@@ -3,6 +3,8 @@ root = "projects"
 
 [prompts]
 root = "prompts"
+locale = "auto"
+thinking_output = false
 
 [runtime.async]
 worker_threads = 4

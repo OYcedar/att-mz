@@ -215,13 +215,18 @@ Lua。开始前确认：
 - 项目 metadata 中的权威语言对；
 - 配置精确命中的 Profile 及其引用的 Client；
 - 对应源语言模块；
-- `<prompts.root>/rpg_maker/<source>--<target>.md` 的精确 Prompt；
+- `[prompts]` 的规范 Prompt locale、`thinking_output` 模式，以及
+  `<prompts.root>/rpg_maker/<locale>/system.md`（开启时再加同目录 `thinking.md`）；
 - 真实语料是否需要术语或自定义占位符；
 - 模型服务的并发、超时、限流、重试与 parameters 约束。
 
-配置没有默认 Profile、默认 Prompt、父语言或大小写回退。使用者应根据当前环境修改实际
-配置，而不是复制一份万能模板。模型实际输入、ID 到字符串数组 wire、上下文、行形状、
-ATT token 保护和协议失败边界见[系统提示词编写指南](prompts.md)。
+`prompts.locale = "auto"` 跟随本进程已经解析的有效 UI locale，显式值覆盖它；两者都与
+游戏 LanguagePair 分离。system 模板再用项目规范源、目标 `LanguageId` 建立翻译方向。
+配置没有默认 Profile，也不为 Prompt 尝试父语言、中文、英文、目录首项或旧语言对文件
+回退。关闭思考输出时不读取 `thinking.md`。使用者应根据当前环境修改实际配置和外置
+资源，而不是复制一份万能模板。模型实际输入、模板硬限制、JSON/`<why>` 信封、ID 到
+字符串数组 wire、上下文、行形状、ATT token 保护和协议失败边界见
+[系统提示词编写指南](prompts.md)。
 
 术语候选的取得、上下文消歧和 TOML 写法见
 [术语文件现行规格与制作指南](terminology.md)；从命令反推

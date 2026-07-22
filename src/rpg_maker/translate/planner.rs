@@ -1509,7 +1509,7 @@ mod tests {
     use crate::rpg_maker::translate::profile::{
         ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
         RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
-        RpgMakerTranslationRequestConfiguration,
+        RpgMakerTranslationRequestConfiguration, TranslationResponseEnvelope,
     };
     use crate::rpg_maker::translate::standard::StandardTranslationAsset;
 
@@ -1600,8 +1600,12 @@ mod tests {
             LanguageId::parse(source_language).expect("测试源语言应合法"),
             LanguageId::parse(target_language).expect("测试目标语言应合法"),
         );
-        let prompt = RpgMakerSystemPrompt::new(pair, "# System\n完整且由外部提供。".to_owned())
-            .expect("测试 Prompt 应合法");
+        let prompt = RpgMakerSystemPrompt::new(
+            pair,
+            "# System\n完整且由外部提供。".to_owned(),
+            TranslationResponseEnvelope::JsonOnly,
+        )
+        .expect("测试 Prompt 应合法");
         Arc::new(ResolvedRpgMakerTranslationResources::new(prompt, module))
     }
 

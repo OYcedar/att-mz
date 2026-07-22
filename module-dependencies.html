@@ -303,10 +303,10 @@
       </summary>
       <div class="tree">
         <ol>
-          <li><strong>共享 Profile 与 Prompt</strong><p>配置只使用 [rpg_maker]；Prompt 固定来自 prompts.root/rpg_maker/source--target.md。</p><span class="path">src/application/config.rs · src/rpg_maker/translate/profile.rs</span></li>
+          <li><strong>共享 Profile 与 Prompt</strong><p>[prompts] 显式提供 root、locale 与 thinking_output；Prompt 从 prompts.root/rpg_maker/locale/system.md 渲染，开启时再追加同目录 thinking.md。Planner 与 Executor 共享响应信封模式。</p><span class="path">src/application/config.rs · src/rpg_maker/translate/profile.rs</span></li>
           <li><strong>TOML 资源边界</strong><p>Terminology 与 Placeholder 从严格 TOML 建立受信类型，再以 canonical JSON 持久化。</p><span class="path">src/rpg_maker/translate/planning_resource.rs · src/rpg_maker/translate/placeholder.rs</span></li>
           <li><strong>语义资产读取与 Planner</strong><p>Speaker、完整 Body、Choices、ScrollingText 与 Scalar 可以进入同一任务；相关组不拆分。Body 按完整行序列和源 Speaker 去重，Choices 保持组内独立。</p><span class="path">src/rpg_maker/translate/asset_reader.rs · src/rpg_maker/translate/planner.rs</span></li>
-          <li><strong>最小模型协议</strong><p>user message 只用 Markdown 表达命中术语、无编号直接语境和活动 ID，例如 <code>正文 [2]（自由断行）：<br>&gt; 第一行<br>&gt; 第二行</code>；模型只返回 ID 到字符串数组的 JSON 对象，例如 <code>{&quot;2&quot;:[&quot;译文一&quot;,&quot;译文二&quot;]}</code>。Reflow 允许重断行，Aligned(N) 必须逐槽对应。</p><span class="path">src/rpg_maker/translate/planner.rs · src/rpg_maker/translate/executor.rs</span></li>
+          <li><strong>最小模型协议</strong><p>user message 只用 Markdown 表达命中术语、无编号直接语境和活动 ID，例如 <code>正文 [2]（自由断行）：<br>&gt; 第一行<br>&gt; 第二行</code>；JsonOnly 直接返回 ID 到字符串数组的 JSON 对象，ThinkingThenJson 先返回唯一非空 <code>&lt;why&gt;...&lt;/why&gt;</code> 再返回同一 JSON。Reflow 允许重断行，Aligned(N) 必须逐槽对应。</p><span class="path">src/rpg_maker/translate/planner.rs · src/rpg_maker/translate/executor.rs</span></li>
           <li><strong>按语义单元提交</strong><p>写入前再次核对 metadata、owner 双指纹、资源快照、unit role、完整源内容与上下文，随后原子更新 standard_text_unit 并传播完整译文。</p><span class="path">src/rpg_maker/translate/result_store.rs</span></li>
         </ol>
         <p class="invariant"><strong>任务位置与计数：</strong><code>{group_location, unit_role}</code>；confirmed/accepted/unresolved 的计数均表示语义单元，不表示模型行或物理命令。省略 Profile 时只复用上次成功的 Translate 方案，不自行选择其他 Profile。</p>

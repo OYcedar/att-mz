@@ -21,8 +21,8 @@ ATT 当前实现的游戏领域只有 **RPG Maker**，该领域目前只包含 *
   与 Placeholder Rules。
 - [术语表制作指南](rpg-maker/terminology.md)：从结构化字段与上下文提炼可复用术语，
   并写成当前 Terminology TOML。
-- [系统提示词编写指南](rpg-maker/prompts.md)：理解模型实际输入、严格 JSON wire、ID 与行形状、
-  ATT token，以及哪些错误会导致整批或单条响应不可用。
+- [系统提示词编写指南](rpg-maker/prompts.md)：配置 Prompt locale，编写受限模板与本地化
+  资源，理解 JSON-only / `<why>` + JSON 信封、ID、行形状、ATT token 及失败边界。
 - [初始化现行规格](rpg-maker/init.md)
 - [文本提取现行规格](rpg-maker/extraction.md)
 - [翻译现行规格](rpg-maker/translation.md)

@@ -44,8 +44,13 @@ const MIXED_CHOICES_SOURCE: [&str; 2] = ["はい", "いいえ"];
 const MIXED_CHOICES_TRANSLATION: [&str; 2] = ["是", "否"];
 const MIXED_SCROLLING_SOURCE: [&str; 3] = ["スタッフ", "", "終わり"];
 const MIXED_SCROLLING_TRANSLATION: [&str; 3] = ["制作人员", "", "结束"];
-const SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT";
-const UPDATED_SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT UPDATED";
+const SYSTEM_PROMPT_TEMPLATE: &str = "E2E SYSTEM CONTRACT: {{source_language}} -> {{target_language}}; repeat {{source_language}} -> {{target_language}}";
+const SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT: ja -> zh-Hans; repeat ja -> zh-Hans";
+const UPDATED_SYSTEM_PROMPT_TEMPLATE: &str =
+    "E2E SYSTEM CONTRACT UPDATED: {{source_language}} -> {{target_language}}";
+const UPDATED_SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT UPDATED: ja -> zh-Hans";
+const THINKING_PROMPT: &str = "E2E THINKING OUTPUT CONTRACT";
+const THINKING_SENTINEL: &str = "e2e-private-thinking-sentinel";
 const JS_MARKER: &str = "/* ATT MZ process e2e */";
 const EXPECTED_USER_MESSAGE: &str = "## 数据库文本\n\n说明 [1]（自由断行）：\n\n> 薬草です\n";
 const EXTRACT_LUA: &str = "scripts/extract.lua";
@@ -57,6 +62,7 @@ const PLACEHOLDERS_TOML: &str = "placeholders.toml";
 const API_KEY: &str = "e2e-secret";
 const E2E_EXTRA_SECRET: &str = "e2e-extra-secret";
 const LEAK_SENTINEL: &str = "e2e-secret-must-not-leak";
+const INVALID_PROMPT_BODY_SENTINEL: &str = "e2e-invalid-prompt-body-sentinel";
 const EMPTY_PARAMETERS: &str = "{}";
 const E2E_PARAMETERS: &str = r#"{"temperature":0.0,"provider_extension":{"mode":"e2e","private_marker":"e2e-extra-secret"}}"#;
 const LOG_DEGRADED_WARNING: &str = "项目日志不可用或已降级；命令会继续，退出状态不受影响。";
@@ -132,8 +138,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     );
     assert_lua_probes(&database, &["extract"]);
 
-    fs::write(prompt_root.join("rpg_maker/ja--zh-Hans.md"), SYSTEM_PROMPT)
-        .expect("系统提示词应可写入");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
     let mut running_cancellation_server = cancellation_server.start();
     let cancelled_child = spawn_observable_att_in_new_process_group(
         root,
@@ -426,11 +431,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     );
     assert_persisted_terminology(&database);
 
-    fs::write(
-        prompt_root.join("rpg_maker/ja--zh-Hans.md"),
-        UPDATED_SYSTEM_PROMPT,
-    )
-    .expect("更新后的系统提示词应可写入");
+    write_system_prompt(root, "zh-Hans", UPDATED_SYSTEM_PROMPT_TEMPLATE);
     let before_profile_semantics = read_translation_unit(&database);
     let profile_semantics_translate = run_att(
         root,
@@ -541,8 +542,8 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_extract_run_plan(&database, None);
     assert_missing_extract_plan(root, "lua clear");
 
-    fs::remove_file(prompt_root.join("rpg_maker/ja--zh-Hans.md"))
-        .expect("应删除已消费的提示词夹具");
+    fs::remove_file(prompt_root.join("rpg_maker/zh-Hans/system.md"))
+        .expect("应删除已消费的 system Prompt 夹具");
 
     let failed = run_att(
         root,
@@ -551,12 +552,11 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_eq!(failed.status.code(), Some(1));
     assert!(failed.stdout.is_empty(), "命令失败不得打印成功文案");
     let failed_stderr = without_fluent_isolation(&String::from_utf8_lossy(&failed.stderr));
-    assert!(failed_stderr.starts_with("无法使用 "));
-    assert!(failed_stderr.contains("ja"));
+    assert!(failed_stderr.starts_with("无法使用"));
     assert!(failed_stderr.contains("zh-Hans"));
-    assert!(failed_stderr.contains("ja--zh-Hans.md"));
+    assert!(failed_stderr.contains("system.md"));
     assert!(failed_stderr.contains("翻译尚未开始"));
-    assert!(failed_stderr.contains("非空 UTF-8"));
+    assert!(failed_stderr.contains("非空 UTF-8") && failed_stderr.contains("模板有效"));
     assert_process_output_does_not_contain_client_secrets("missing prompt", &failed);
     for (phase, output) in [
         ("init", &init),
@@ -633,8 +633,7 @@ fn project_log_startup_failure_never_changes_success_or_cancellation_outcome() {
 
     let database = root.join("projects/mz").join(PROJECT).join("project.db");
     assert_extracted_database(&database);
-    fs::write(root.join("prompts/rpg_maker/ja--zh-Hans.md"), SYSTEM_PROMPT)
-        .expect("系统提示词应可写入");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
     let mut running_server = cancellation_server.start();
     let child = spawn_observable_att_in_new_process_group(
         root,
@@ -672,8 +671,7 @@ fn omitted_translate_profile_rejects_saved_profile_removed_from_configuration() 
     fs::create_dir(root.join("logs")).expect("日志根应可建立");
     fs::create_dir_all(root.join("prompts/rpg_maker")).expect("提示词根应可建立");
     write_minimal_mz_game(&game_root);
-    fs::write(root.join("prompts/rpg_maker/ja--zh-Hans.md"), SYSTEM_PROMPT)
-        .expect("系统提示词应可写入");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
 
     let initial_server = BoundChatServer::bind();
     write_configuration(root, initial_server.endpoint(), EMPTY_PARAMETERS);
@@ -751,8 +749,7 @@ fn mz_map_mixes_five_semantic_unit_types_in_one_translation_task() {
     let database = workspace.join("project.db");
     assert_mixed_semantic_units_extracted(&database);
 
-    fs::write(root.join("prompts/rpg_maker/ja--zh-Hans.md"), SYSTEM_PROMPT)
-        .expect("混合 Map 提示词应可写入");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
     let running_server = server.start_with_responses(vec![ChatResponseFixture::MixedSemanticUnits]);
     let translate = run_att(
         root,
@@ -845,7 +842,7 @@ fn mv_four_stages_preserve_www_layout_and_coexist_with_same_named_mz_project() {
     assert_success("MV extract", &extract);
     assert_mv_dialogue_extracted(&mv_workspace.join("project.db"));
 
-    fs::write(prompt_root.join("ja--zh-Hans.md"), SYSTEM_PROMPT).expect("MV 提示词应可写入");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
     let server = BoundChatServer::bind();
     write_configuration(root, server.endpoint(), EMPTY_PARAMETERS);
     let running_server = server.start_with_responses(vec![ChatResponseFixture::MvDialogue]);
@@ -977,12 +974,13 @@ fn configuration_path_is_required_for_commands_but_not_information_actions() {
 }
 
 #[test]
-fn prompt_routing_uses_exact_metadata_language_pairs_and_fails_before_llm() {
+fn prompt_locale_routing_renders_language_pairs_and_fails_before_llm_without_fallback() {
     const JA_PROJECT: &str = "prompt-ja";
     const EN_PROJECT: &str = "prompt-en";
     const CANONICAL_EN_US_PROJECT: &str = "canonical-en-us";
-    const JA_PROMPT: &str = "JA EXACT PROMPT";
-    const EN_PROMPT: &str = "EN EXACT PROMPT";
+    const SHARED_TEMPLATE: &str = "ZH-HANS MASTER {{source_language}} -> {{target_language}} / {{source_language}} -> {{target_language}}";
+    const FR_TEMPLATE: &str =
+        "FR LOCALE {{source_language}} vers {{target_language}} / {{target_language}}";
     const EN_SOURCE: &str = "Healing potion";
 
     let temporary = tempfile::tempdir().expect("应可建立 Prompt 路由测试目录");
@@ -995,7 +993,7 @@ fn prompt_routing_uses_exact_metadata_language_pairs_and_fails_before_llm() {
     let ja_game = root.join("game-ja");
     write_minimal_mz_game(&ja_game);
     initialize_and_extract_prompt_project(root, JA_PROJECT, &ja_game, "JA", "zh-hans");
-    fs::write(prompt_rpg_maker.join("ja--zh-Hans.md"), JA_PROMPT).expect("日文 Prompt 应可写入");
+    write_system_prompt(root, "zh-Hans", SHARED_TEMPLATE);
 
     let ja_server = BoundChatServer::bind();
     write_configuration(root, ja_server.endpoint(), E2E_PARAMETERS);
@@ -1007,14 +1005,16 @@ fn prompt_routing_uses_exact_metadata_language_pairs_and_fails_before_llm() {
     assert_success("exact ja prompt", &ja_translate);
     let ja_requests = ja_requests.finish();
     assert_eq!(ja_requests.len(), 1);
-    assert_standard_request_semantics(&ja_requests[0], JA_PROMPT, &[SOURCE_TEXT]);
+    assert_standard_request_semantics(
+        &ja_requests[0],
+        &render_system_prompt(SHARED_TEMPLATE, "ja", "zh-Hans"),
+        &[SOURCE_TEXT],
+    );
 
     let en_game = root.join("game-en");
     write_minimal_mz_game(&en_game);
     write_items_source(&en_game, EN_SOURCE);
     initialize_and_extract_prompt_project(root, EN_PROJECT, &en_game, "EN", "zh-Hans");
-    let exact_en_prompt = prompt_rpg_maker.join("en--zh-Hans.md");
-    fs::write(&exact_en_prompt, EN_PROMPT).expect("英文 Prompt 应可写入");
 
     let en_server = BoundChatServer::bind();
     write_configuration(root, en_server.endpoint(), E2E_PARAMETERS);
@@ -1026,7 +1026,67 @@ fn prompt_routing_uses_exact_metadata_language_pairs_and_fails_before_llm() {
     assert_success("exact en prompt", &en_translate);
     let en_requests = en_requests.finish();
     assert_eq!(en_requests.len(), 1);
-    assert_standard_request_semantics(&en_requests[0], EN_PROMPT, &[EN_SOURCE]);
+    assert_standard_request_semantics(
+        &en_requests[0],
+        &render_system_prompt(SHARED_TEMPLATE, "en", "zh-Hans"),
+        &[EN_SOURCE],
+    );
+
+    write_system_prompt(
+        root,
+        "en",
+        "UNSELECTED EN {{source_language}} {{target_language}}",
+    );
+    assert_prompt_failure_before_llm(root, JA_PROJECT, "fr", false, "system.md");
+
+    write_system_prompt(root, "fr", FR_TEMPLATE);
+    let fr_server = BoundChatServer::bind();
+    write_configuration_with_prompt_options(
+        root,
+        fr_server.endpoint(),
+        E2E_PARAMETERS,
+        "fr",
+        false,
+    );
+    let fr_requests = fr_server.start_for_requests(1);
+    let fr_translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", JA_PROJECT, PROFILE]),
+    );
+    assert_success("explicit fr prompt locale", &fr_translate);
+    let fr_requests = fr_requests.finish();
+    assert_eq!(fr_requests.len(), 1);
+    assert_standard_request_semantics(
+        &fr_requests[0],
+        &render_system_prompt(FR_TEMPLATE, "ja", "zh-Hans"),
+        &[SOURCE_TEXT],
+    );
+
+    const FR_AUTO_TEMPLATE: &str =
+        "FR AUTO {{source_language}} vers {{target_language}} / {{source_language}}";
+    write_system_prompt(root, "fr", FR_AUTO_TEMPLATE);
+    let auto_server = BoundChatServer::bind();
+    write_configuration_with_prompt_options(
+        root,
+        auto_server.endpoint(),
+        E2E_PARAMETERS,
+        "auto",
+        false,
+    );
+    let auto_requests = auto_server.start_for_requests(1);
+    let auto_translate = run_att_with_ui_locale(
+        root,
+        arguments(&["mz", "translate", "--name", JA_PROJECT, PROFILE]),
+        "fr",
+    );
+    assert_success("auto follows effective UI locale", &auto_translate);
+    let auto_requests = auto_requests.finish();
+    assert_eq!(auto_requests.len(), 1);
+    assert_standard_request_semantics(
+        &auto_requests[0],
+        &render_system_prompt(FR_AUTO_TEMPLATE, "ja", "zh-Hans"),
+        &[SOURCE_TEXT],
+    );
 
     initialize_prompt_project(root, CANONICAL_EN_US_PROJECT, &en_game, "en-us", "zh-Hans");
     assert_project_language_metadata(root, CANONICAL_EN_US_PROJECT, "en-US", "zh-Hans");
@@ -1041,34 +1101,170 @@ fn prompt_routing_uses_exact_metadata_language_pairs_and_fails_before_llm() {
         ]),
     );
     assert_success("canonical en-US project extract", &canonical_extract);
-    let canonical_en_us_prompt = prompt_rpg_maker.join("en-US--zh-Hans.md");
-    for (name, content) in [
-        ("en--zh-Hans.md", EN_PROMPT),
-        ("default.md", "default fallback"),
-    ] {
-        fs::write(prompt_rpg_maker.join(name), content).expect("回退探针应可写入");
-    }
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "en-US--zh-Hans.md");
+    let ko_system = prompt_rpg_maker.join("ko/system.md");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
 
-    fs::create_dir(&canonical_en_us_prompt).expect("同名目录探针应可建立");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "en-US--zh-Hans.md");
-    fs::remove_dir(&canonical_en_us_prompt).expect("同名目录探针应可删除");
+    fs::create_dir_all(&ko_system).expect("system.md 同名目录探针应可建立");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
+    fs::remove_dir(&ko_system).expect("system.md 同名目录探针应可删除");
 
-    fs::write(&canonical_en_us_prompt, [0xff, 0xfe]).expect("非法 UTF-8 Prompt 应可写入");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "en-US--zh-Hans.md");
+    fs::write(&ko_system, [0xff, 0xfe]).expect("非法 UTF-8 system Prompt 应可写入");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
 
-    fs::write(&canonical_en_us_prompt, " \r\n\t").expect("空白 Prompt 应可写入");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "en-US--zh-Hans.md");
+    fs::write(&ko_system, " \r\n\t").expect("空白 system Prompt 应可写入");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
 
-    fs::remove_file(&canonical_en_us_prompt).expect("空白 Prompt 探针应可删除");
-    let wrong_source_case = prompt_rpg_maker.join("en-us--zh-Hans.md");
-    fs::write(&wrong_source_case, "source case fallback").expect("源语言大小写探针应可写入");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "en-US--zh-Hans.md");
-    fs::remove_file(&wrong_source_case).expect("源语言大小写探针应可删除");
+    fs::write(
+        &ko_system,
+        format!("{INVALID_PROMPT_BODY_SENTINEL} {{{{source_language}}}}"),
+    )
+    .expect("无效模板 Prompt 应可写入");
+    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
 
-    let wrong_target_case = prompt_rpg_maker.join("en-US--zh-hans.md");
-    fs::write(&wrong_target_case, "target case fallback").expect("目标语言大小写探针应可写入");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "en-US--zh-Hans.md");
+    fs::write(prompt_rpg_maker.join("fr/system.md"), [0xff, 0xfe])
+        .expect("未选 locale 的损坏 system Prompt 应可写入");
+    fs::write(prompt_rpg_maker.join("zh-Hans/thinking.md"), [0xff, 0xfe])
+        .expect("关闭思考输出时的损坏 thinking Prompt 应可写入");
+    let selected_server = BoundChatServer::bind();
+    write_configuration(root, selected_server.endpoint(), E2E_PARAMETERS);
+    let selected_requests = selected_server.start_for_requests(1);
+    let selected_translate = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "translate",
+            "--name",
+            CANONICAL_EN_US_PROJECT,
+            PROFILE,
+        ]),
+    );
+    assert_success("unselected damaged prompt resources", &selected_translate);
+    let selected_requests = selected_requests.finish();
+    assert_eq!(selected_requests.len(), 1);
+    assert_standard_request_semantics(
+        &selected_requests[0],
+        &render_system_prompt(SHARED_TEMPLATE, "en-US", "zh-Hans"),
+        &[EN_SOURCE],
+    );
+    assert_prompt_failure_before_llm(
+        root,
+        CANONICAL_EN_US_PROJECT,
+        "zh-Hans",
+        true,
+        "thinking.md",
+    );
+}
+
+#[test]
+fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
+    const SUCCESS_PROJECT: &str = "thinking-success";
+    const RAW_JSON_PROJECT: &str = "thinking-raw-json";
+
+    let temporary = tempfile::tempdir().expect("应可建立思考输出端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
+    fs::create_dir_all(root.join("logs")).expect("日志根应可建立");
+    write_minimal_mz_game(&game_root);
+    initialize_and_extract_prompt_project(root, SUCCESS_PROJECT, &game_root, "ja", "zh-Hans");
+    initialize_and_extract_prompt_project(root, RAW_JSON_PROJECT, &game_root, "ja", "zh-Hans");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+    write_thinking_prompt(root, "zh-Hans", &format!(" \r\n{THINKING_PROMPT}\r\n\t"));
+
+    let baseline_server = BoundChatServer::bind();
+    write_configuration(root, baseline_server.endpoint(), E2E_PARAMETERS);
+    let baseline_requests =
+        baseline_server.start_with_responses(vec![ChatResponseFixture::Standard]);
+    let baseline = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", SUCCESS_PROJECT, PROFILE]),
+    );
+    assert_success("JSON-only baseline translate", &baseline);
+    assert_eq!(baseline_requests.finish().len(), 1);
+
+    let success_server = BoundChatServer::bind();
+    write_configuration_with_prompt_options(
+        root,
+        success_server.endpoint(),
+        E2E_PARAMETERS,
+        "zh-Hans",
+        true,
+    );
+    let success_requests =
+        success_server.start_with_responses(vec![ChatResponseFixture::ThinkingStandard]);
+    let success = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", SUCCESS_PROJECT, PROFILE]),
+    );
+    let success_stdout = assert_success("thinking envelope translate", &success);
+    assert!(
+        success_stdout.contains("任务 1，完整 1，部分 0，不可用 0"),
+        "合法思考信封应正常提交译文：{success_stdout}"
+    );
+    let success_requests = success_requests.finish();
+    assert_eq!(
+        success_requests.len(),
+        1,
+        "开启 thinking_output 必须使旧 JSON-only 译文不再 Current"
+    );
+    assert_standard_request_semantics(
+        &success_requests[0],
+        &format!("{SYSTEM_PROMPT}\n\n{THINKING_PROMPT}"),
+        &[SOURCE_TEXT],
+    );
+
+    let success_database = root
+        .join("projects/mz")
+        .join(SUCCESS_PROJECT)
+        .join("project.db");
+    assert_translation_committed(&success_database);
+    assert_output_does_not_contain("thinking success", &success, THINKING_SENTINEL);
+    assert_file_does_not_contain(
+        &root.join("logs/att.log.jsonl"),
+        THINKING_SENTINEL,
+        "项目日志",
+    );
+    assert_database_does_not_contain(&success_database, THINKING_SENTINEL);
+
+    let raw_json_server = BoundChatServer::bind();
+    write_configuration_with_prompt_options(
+        root,
+        raw_json_server.endpoint(),
+        E2E_PARAMETERS,
+        "zh-Hans",
+        true,
+    );
+    let raw_json_requests =
+        raw_json_server.start_with_responses(vec![ChatResponseFixture::Standard]);
+    let raw_json = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", RAW_JSON_PROJECT, PROFILE]),
+    );
+    let raw_json_stdout = assert_success("thinking mode raw JSON", &raw_json);
+    assert!(
+        raw_json_stdout.contains("任务 1，完整 0，部分 0，不可用 1")
+            && raw_json_stdout.contains("写入 0 处，剩余 1 处"),
+        "思考模式必须把裸 JSON 计为 ModelResponseUnusable：{raw_json_stdout}"
+    );
+    let raw_json_requests = raw_json_requests.finish();
+    assert_eq!(raw_json_requests.len(), 1, "信封错误不得作为网络错误重试");
+    assert_standard_request_semantics(
+        &raw_json_requests[0],
+        &format!("{SYSTEM_PROMPT}\n\n{THINKING_PROMPT}"),
+        &[SOURCE_TEXT],
+    );
+    let raw_json_database = root
+        .join("projects/mz")
+        .join(RAW_JSON_PROJECT)
+        .join("project.db");
+    assert_translation_absent(&raw_json_database);
+    assert_output_does_not_contain("thinking raw JSON", &raw_json, THINKING_SENTINEL);
+    assert_file_does_not_contain(
+        &root.join("logs/att.log.jsonl"),
+        THINKING_SENTINEL,
+        "项目日志",
+    );
+    assert_database_does_not_contain(&raw_json_database, THINKING_SENTINEL);
 }
 
 fn initialize_and_extract_prompt_project(
@@ -1135,9 +1331,21 @@ fn assert_project_language_metadata(
     );
 }
 
-fn assert_prompt_failure_before_llm(root: &Path, project: &str, expected_diagnostic: &str) {
+fn assert_prompt_failure_before_llm(
+    root: &Path,
+    project: &str,
+    locale: &str,
+    thinking_output: bool,
+    component: &str,
+) {
     let server = BoundChatServer::bind();
-    write_configuration(root, server.endpoint(), E2E_PARAMETERS);
+    write_configuration_with_prompt_options(
+        root,
+        server.endpoint(),
+        E2E_PARAMETERS,
+        locale,
+        thinking_output,
+    );
     let requests = server.start_observing_requests();
     let output = run_att(
         root,
@@ -1149,10 +1357,24 @@ fn assert_prompt_failure_before_llm(root: &Path, project: &str, expected_diagnos
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = without_fluent_isolation(&String::from_utf8_lossy(&output.stderr));
-    assert!(stderr.starts_with("无法使用 "), "{stderr}");
-    assert!(stderr.contains(expected_diagnostic), "{stderr}");
+    assert!(stderr.starts_with("无法使用"), "{stderr}");
+    assert!(stderr.contains(locale), "{stderr}");
+    assert!(stderr.contains(component), "{stderr}");
+    assert!(
+        stderr.contains(
+            &prompt_locale_root(root, locale)
+                .join(component)
+                .display()
+                .to_string()
+        ),
+        "{stderr}"
+    );
     assert!(stderr.contains("翻译尚未开始"), "{stderr}");
-    assert!(stderr.contains("非空 UTF-8"), "{stderr}");
+    assert!(
+        stderr.contains("普通文件") && stderr.contains("非空 UTF-8") && stderr.contains("模板有效"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(INVALID_PROMPT_BODY_SENTINEL), "{stderr}");
     assert_process_output_does_not_contain_client_secrets("prompt failure", &output);
 }
 
@@ -1228,6 +1450,12 @@ fn run_att(root: &Path, arguments: Vec<OsString>) -> Output {
     wait_for_att(child)
 }
 
+fn run_att_with_ui_locale(root: &Path, arguments: Vec<OsString>, ui_locale: &str) -> Output {
+    let mut command = att_command_with_ui_locale_and_progress(root, arguments, ui_locale, "off");
+    let child = command.spawn().expect("att.exe 应可启动");
+    wait_for_att(child)
+}
+
 fn assert_process_output_does_not_contain_client_secrets(phase: &str, output: &Output) {
     for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
         let text = String::from_utf8_lossy(bytes);
@@ -1239,6 +1467,38 @@ fn assert_process_output_does_not_contain_client_secrets(phase: &str, output: &O
             !text.contains(E2E_EXTRA_SECRET),
             "{phase} 的 {stream} 不得包含 parameters 敏感值：{text}"
         );
+    }
+}
+
+fn assert_output_does_not_contain(phase: &str, output: &Output, sentinel: &str) {
+    for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(
+            !text.contains(sentinel),
+            "{phase} 的 {stream} 不得包含已丢弃的思考正文：{text}"
+        );
+    }
+}
+
+fn assert_file_does_not_contain(path: &Path, sentinel: &str, label: &str) {
+    let bytes = fs::read(path)
+        .unwrap_or_else(|error| panic!("应可读取{label} {}：{error}", path.display()));
+    assert!(
+        find_subslice(&bytes, sentinel.as_bytes()).is_none(),
+        "{label} {} 不得包含已丢弃的思考正文",
+        path.display()
+    );
+}
+
+fn assert_database_does_not_contain(database: &Path, sentinel: &str) {
+    assert_file_does_not_contain(database, sentinel, "持久化数据库");
+    for suffix in ["-wal", "-shm"] {
+        let mut artifact = database.as_os_str().to_owned();
+        artifact.push(suffix);
+        let artifact = PathBuf::from(artifact);
+        if artifact.exists() {
+            assert_file_does_not_contain(&artifact, sentinel, "SQLite 附属文件");
+        }
     }
 }
 
@@ -1388,12 +1648,21 @@ fn att_command(root: &Path, arguments: Vec<OsString>) -> Command {
 }
 
 fn att_command_with_progress(root: &Path, arguments: Vec<OsString>, progress: &str) -> Command {
+    att_command_with_ui_locale_and_progress(root, arguments, "zh-Hans", progress)
+}
+
+fn att_command_with_ui_locale_and_progress(
+    root: &Path,
+    arguments: Vec<OsString>,
+    ui_locale: &str,
+    progress: &str,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_att"));
     command
         .current_dir(root)
         .arg("--config")
         .arg(root.join("config.toml"))
-        .args(["--ui-language", "zh-Hans", "--progress", progress])
+        .args(["--ui-language", ui_locale, "--progress", progress])
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1810,13 +2079,47 @@ fn write_mv_dialogue_rules(root: &Path) {
     .expect("MV 对话姓名投影夹具应可写入");
 }
 
+fn prompt_locale_root(root: &Path, locale: &str) -> PathBuf {
+    root.join("prompts").join("rpg_maker").join(locale)
+}
+
+fn write_system_prompt(root: &Path, locale: &str, template: &str) {
+    let locale_root = prompt_locale_root(root, locale);
+    fs::create_dir_all(&locale_root).expect("Prompt locale 目录应可建立");
+    fs::write(locale_root.join("system.md"), template).expect("system Prompt 应可写入");
+}
+
+fn write_thinking_prompt(root: &Path, locale: &str, prompt: &str) {
+    let locale_root = prompt_locale_root(root, locale);
+    fs::create_dir_all(&locale_root).expect("Prompt locale 目录应可建立");
+    fs::write(locale_root.join("thinking.md"), prompt).expect("thinking Prompt 应可写入");
+}
+
+fn render_system_prompt(template: &str, source_language: &str, target_language: &str) -> String {
+    template
+        .replace("{{source_language}}", source_language)
+        .replace("{{target_language}}", target_language)
+}
+
 fn write_configuration(root: &Path, url: &str, parameters: &str) {
+    write_configuration_with_prompt_options(root, url, parameters, "zh-Hans", false);
+}
+
+fn write_configuration_with_prompt_options(
+    root: &Path,
+    url: &str,
+    parameters: &str,
+    prompt_locale: &str,
+    thinking_output: bool,
+) {
     let configuration = format!(
         r#"[projects]
 root = "projects"
 
 [prompts]
 root = "prompts"
+locale = "{prompt_locale}"
+thinking_output = {thinking_output}
 
 [runtime.async]
 worker_threads = 2
@@ -3225,6 +3528,7 @@ impl BoundChatServer {
 #[derive(Clone, Copy)]
 enum ChatResponseFixture {
     Standard,
+    ThinkingStandard,
     Lua,
     MvDialogue,
     MixedSemanticUnits,
@@ -3308,6 +3612,18 @@ fn serve_chat_completion(
                 11,
                 3,
                 14,
+            ),
+            ChatResponseFixture::ThinkingStandard => (
+                "request-thinking-e2e".to_owned(),
+                "response-thinking-e2e".to_owned(),
+                format!(
+                    "<why>{THINKING_SENTINEL}\n逐项分析说话人、语气、术语、ATT token 与行结构。</why>\n{}",
+                    serde_json::to_string(&json!({ "1": [TRANSLATION] }))
+                        .map_err(|error| error.to_string())?
+                ),
+                19,
+                11,
+                30,
             ),
             ChatResponseFixture::Lua => (
                 "request-lua".to_owned(),

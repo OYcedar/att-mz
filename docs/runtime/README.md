@@ -12,8 +12,9 @@ Profile、术语、Placeholder、MV 对话定义和 Lua 程序属于 CLI 意图�
 ## 从当前命令反推配置范围
 
 除 Help 和 Version 外，每次运行都必须显式传入 `--config FILE`；`mv | mz` 和 `--name`
-同样必填。`--ui-language`、`ATT_UI_LANGUAGE` 与 `--progress auto|plain|off` 只控制本次
-终端界面，不属于配置文件。
+同样必填。`--ui-language`、`ATT_UI_LANGUAGE` 与 `--progress auto|plain|off` 不属于
+配置文件；前两者决定本进程有效 UI locale，并在 `prompts.locale = "auto"` 时同时选择
+同 locale 的外置 Prompt，`--progress` 只控制终端进度呈现。
 
 所有 Init、Extract、Translate 和 WriteBack 都会选择：
 
@@ -29,7 +30,7 @@ Profile、术语、Placeholder、MV 对话定义和 Lua 程序属于 CLI 意图�
 |---|---|
 | Init | `runtime.filesystem.publisher` |
 | Extract | `runtime.cpu`、`rpg_maker.document`、`rpg_maker.extract.store` 和本轮可执行 owner 所需能力 |
-| Translate | `prompts.root`、全部 `languages`、`runtime.cpu`、`runtime.llm`、显式或保存的 Profile、该 Profile 引用的 Client、`rpg_maker.standard_asset`、`rpg_maker.translate.store` |
+| Translate | `[prompts]` 的 `root`、`locale`、`thinking_output`，全部 `languages`、`runtime.cpu`、`runtime.llm`、显式或保存的 Profile、该 Profile 引用的 Client、`rpg_maker.standard_asset`、`rpg_maker.translate.store` |
 | WriteBack | `runtime.cpu`、`runtime.filesystem.publisher`、`rpg_maker.document`、`rpg_maker.standard_asset` |
 | 解析后启用任一阶段 Lua | `runtime.lua`；配置中存在该分区不会自行启用 Lua |
 
@@ -96,17 +97,25 @@ Translate 的 Profile ID 可以来自 CLI，也可以来自上次成功项目方
 
 项目 metadata 中的规范 LanguagePair
   ├─ source ─> [[languages]] 中精确 ID 的源语言模块
-  └─ source + target ─> <prompts.root>/rpg_maker/<source>--<target>.md
+  └─ source/target ─> system.md 的两个 LanguageId 模板变量
+
+[prompts].locale
+  ├─ auto ─> 本进程已经解析的有效 UI locale
+  └─ 显式值 ─> 覆盖 UI locale
+        └─> <prompts.root>/rpg_maker/<locale>/system.md
+              └─ thinking_output = true 时追加同目录 thinking.md
 ```
 
 保存的 Profile 不存在时 ATT 明确失败，不选择目录第一项、不按语言猜测，也不回退其他
-Profile。Prompt 同样没有大小写变体、父语言或备用文件。当前 Client 执行非流式、
+Profile。Prompt locale 规范化后也不尝试父语言、中文、英文、目录首项、旧语言对文件或
+其他备用资源；关闭思考输出时不读取 `thinking.md`。当前 Client 执行非流式、
 OpenAI-compatible Chat Completions；请求与响应边界见
 [Chat Completions 运行根](chat-completions.md)。
 
 游戏翻译使用的开放 `LanguageId` 与终端使用的闭集 `UiLocale` 不是同一种配置。终端支持
-`ar / zh-Hans / zh-Hant / en / fr / ru / es / ja / ko / vi`；其自动检测不会改变项目
-LanguagePair 或 Prompt 选择。
+`ar / zh-Hans / zh-Hant / en / fr / ru / es / ja / ko / vi`。UI locale 自动检测不会改变
+项目 LanguagePair；只有配置明确选择 `prompts.locale = "auto"` 时，它才成为本轮 Prompt
+locale。提示词模板仍使用项目规范 LanguageId 建立实际翻译方向。
 
 ## 根据环境确定资源值
 
@@ -147,7 +156,8 @@ ATT 不把 API key、Header、完整 Client parameters、Prompt、messages、模
 - 当前命令为何需要这些分区，是否误把未使用能力当成必需配置；
 - 每个路径最终解析到了哪个绝对位置；
 - 本次每项运行选择来自显式输入、项目状态还是固定产品行为；
-- Translate 的源语言模块、Prompt、Profile 与 Client 是否分别精确命中；
+- Translate 的源语言模块、规范 Prompt locale、实际资源、响应信封、Profile 与 Client
+  是否分别精确命中；
 - 资源上限是在保护真实负载，还是因复制示例值意外拒绝或放任输入；
 - Complete、Partial、Unavailable、配置失败和技术失败是否被正确区分；
 - 项目数据库与候选发布是否提供了与副作用相称的权威状态；
@@ -162,7 +172,8 @@ ATT 不把 API key、Header、完整 Client parameters、Prompt、messages、模
 - 显式提供一个 Extract owner，却期待未列出的旧 owner 仍自动执行；
 - 认为保存的 Profile 不存在时会自动选用其他 Profile；
 - 仅因配置中存在 `runtime.lua` 就认为 Lua 会运行；
-- 把 UI locale 与项目翻译语言混为一谈；
+- 把 Prompt locale 或 UI locale 与项目翻译语言混为一谈；
+- 认为关闭 `thinking_output` 时 ATT 仍会读取或校验 `thinking.md`；
 - 认为 `--progress off` 会关闭最终结果、错误或项目日志；
 - 期待 API key 环境变量插值，或把真实密钥提交到仓库；
 - 独立放大线程、队列和并发值，却不核对供应商限流、内存和磁盘证据；

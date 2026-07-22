@@ -1,6 +1,6 @@
 //! RPG Maker 作者文档与可复制示例的机器可验证契约。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -8,6 +8,10 @@ use mlua::Lua;
 use toml::Value as TomlValue;
 
 const CONTRACT_DOCUMENTS: [&str; 4] = ["rules.md", "terminology.md", "lua.md", "lua-cookbook.md"];
+
+const PROMPT_LOCALES: [&str; 10] = [
+    "ar", "zh-Hans", "zh-Hant", "en", "fr", "ru", "es", "ja", "ko", "vi",
+];
 
 const TOML_EXAMPLES: [&str; 4] = [
     "mv-dialogue.toml",
@@ -217,6 +221,113 @@ fn complete_toml_examples_are_utf8_parseable_and_listed_in_the_manifest() {
             )
         });
     }
+}
+
+#[test]
+fn external_prompt_locales_preserve_the_same_machine_contract() {
+    let prompt_root = workspace_root().join("prompts/rpg_maker");
+    let expected_locales = PROMPT_LOCALES
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let actual_locales = fs::read_dir(&prompt_root)
+        .expect("Prompt 资源根必须存在")
+        .map(|entry| {
+            let entry = entry.expect("Prompt locale 目录应可枚举");
+            assert!(
+                entry.file_type().expect("应可读取资源类型").is_dir(),
+                "Prompt 资源根只能包含 locale 目录：{}",
+                display_relative(&entry.path())
+            );
+            entry
+                .file_name()
+                .into_string()
+                .expect("Prompt locale 目录名必须是 Unicode")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual_locales, expected_locales);
+
+    for locale in PROMPT_LOCALES {
+        let locale_root = prompt_root.join(locale);
+        let actual_files = fs::read_dir(&locale_root)
+            .unwrap_or_else(|error| panic!("无法读取 {}：{error}", display_relative(&locale_root)))
+            .map(|entry| {
+                let entry = entry.expect("Prompt 组件应可枚举");
+                assert!(
+                    entry.file_type().expect("应可读取资源类型").is_file(),
+                    "Prompt locale 目录只能包含普通文件：{}",
+                    display_relative(&entry.path())
+                );
+                entry
+                    .file_name()
+                    .into_string()
+                    .expect("Prompt 组件文件名必须是 Unicode")
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual_files,
+            BTreeSet::from(["system.md".to_owned(), "thinking.md".to_owned()]),
+            "{locale} 必须且只能包含两份现行 Prompt 组件"
+        );
+
+        let system = read_utf8(&locale_root.join("system.md"));
+        let thinking = read_utf8(&locale_root.join("thinking.md"));
+        assert!(!system.trim().is_empty(), "{locale}/system.md 不能为空");
+        assert!(!thinking.trim().is_empty(), "{locale}/thinking.md 不能为空");
+        assert_eq!(
+            prompt_template_variables(&system),
+            BTreeSet::from(["source_language", "target_language"]),
+            "{locale}/system.md 只能使用两项现行模板变量"
+        );
+        assert!(
+            !thinking.contains("{{") && !thinking.contains("}}"),
+            "{locale}/thinking.md 不允许模板变量"
+        );
+
+        let combined = format!("{system}\n{thinking}");
+        for literal in [
+            "JSON",
+            "[ID]",
+            "<why>",
+            "</why>",
+            "ATT token",
+            "单行",
+            "自由断行",
+            "逐行对应",
+            "逐项对应",
+        ] {
+            assert!(
+                combined.contains(literal),
+                "{locale} Prompt 资源缺少协议字面量 {literal:?}"
+            );
+        }
+    }
+}
+
+fn prompt_template_variables(source: &str) -> BTreeSet<&str> {
+    let mut variables = BTreeSet::new();
+    let mut remaining = source;
+    loop {
+        let next_open = remaining.find("{{");
+        let next_close = remaining.find("}}");
+        let Some(open) = next_open else {
+            assert!(next_close.is_none(), "Prompt 模板含有未配对的结束定界符");
+            break;
+        };
+        assert!(
+            next_close.is_none_or(|close| open < close),
+            "Prompt 模板含有未配对的结束定界符"
+        );
+        let after_open = &remaining[open + 2..];
+        let close = after_open.find("}}").expect("Prompt 模板变量必须闭合");
+        assert!(
+            !after_open[..close].contains("{{"),
+            "Prompt 模板变量不得嵌套"
+        );
+        variables.insert(&after_open[..close]);
+        remaining = &after_open[close + 2..];
+    }
+    variables
 }
 
 fn validate_toml_example(path: &Path, example: &FencedExample) {

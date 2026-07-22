@@ -28,7 +28,9 @@ use crate::rpg_maker::placeholder_token;
 use super::language_projection::{
     LanguageTextProjectionError, project_protected_text, restore_protected_text,
 };
-use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
+use super::profile::{
+    ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile, TranslationResponseEnvelope,
+};
 use super::standard::{
     AcceptedTranslationDecision, AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
     NonEmptyTaskItems, StandardTranslationProfile, StandardTranslationTaskExecutor,
@@ -477,7 +479,10 @@ fn process_response(
         });
     }
 
-    let outputs = match parse_model_output_batch(response.content()) {
+    let outputs = match parse_model_output_batch(
+        response.content(),
+        resources.system_prompt().response_envelope(),
+    ) {
         Ok(outputs) => outputs,
         Err(message) => {
             diagnostics.push(TranslationProtocolDiagnostic::InvalidResponse {
@@ -839,8 +844,13 @@ fn parse_translation_lines(value: serde_json::Value) -> Result<Vec<String>, Stri
         .collect()
 }
 
-fn parse_model_output_batch(value: &str) -> Result<Vec<ModelOutputWire>, String> {
-    let value = strip_model_response_envelope(value)?;
+fn parse_model_output_batch(
+    value: &str,
+    response_envelope: TranslationResponseEnvelope,
+) -> Result<Vec<ModelOutputWire>, String> {
+    let value = trim_model_response(value);
+    let value = strip_translation_response_envelope(value, response_envelope)?;
+    let value = strip_single_markdown_fence(value.trim())?;
     serde_json::from_str::<ModelOutputBatch>(value)
         .map(|batch| batch.0)
         .map_err(|source| source.to_string())
@@ -868,11 +878,48 @@ fn unresolved_all(
         .collect()
 }
 
-/// 只剥离协议明确允许的响应信封，不修复或提取 JSON 内容。
-fn strip_model_response_envelope(value: &str) -> Result<&str, String> {
+/// 清理响应两端，并兼容供应商可能放在正文开头的单个 BOM。
+fn trim_model_response(value: &str) -> &str {
     let value = value.trim();
-    let value = value.strip_prefix('\u{feff}').unwrap_or(value).trim();
-    strip_single_markdown_fence(value)
+    value.strip_prefix('\u{feff}').unwrap_or(value).trim()
+}
+
+/// 按受信 Prompt 声明剥离唯一响应信封，不修复或提取 JSON 内容。
+fn strip_translation_response_envelope(
+    value: &str,
+    response_envelope: TranslationResponseEnvelope,
+) -> Result<&str, String> {
+    match response_envelope {
+        TranslationResponseEnvelope::JsonOnly => {
+            if value.contains("<why>") || value.contains("</why>") {
+                return Err("当前响应模式不接受思考输出".to_owned());
+            }
+            Ok(value)
+        }
+        TranslationResponseEnvelope::ThinkingThenJson => strip_thinking_then_json(value),
+    }
+}
+
+fn strip_thinking_then_json(value: &str) -> Result<&str, String> {
+    let Some(after_opening) = value.strip_prefix("<why>") else {
+        return Err("模型响应缺少规定的思考信封".to_owned());
+    };
+    let Some(closing_start) = after_opening.find("</why>") else {
+        return Err("模型响应的思考信封没有闭合".to_owned());
+    };
+    let thinking = &after_opening[..closing_start];
+    if thinking.trim().is_empty() {
+        return Err("模型响应的思考内容为空".to_owned());
+    }
+    if thinking.contains("<why>") || thinking.contains("</why>") {
+        return Err("模型响应包含嵌套的思考信封".to_owned());
+    }
+
+    let json = &after_opening[closing_start + "</why>".len()..];
+    if json.contains("<why>") || json.contains("</why>") {
+        return Err("模型响应包含重复的思考信封".to_owned());
+    }
+    Ok(json.trim_start())
 }
 
 fn strip_single_markdown_fence(value: &str) -> Result<&str, String> {
@@ -1335,7 +1382,7 @@ mod tests {
     use crate::rpg_maker::translate::profile::{
         ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
         RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
-        RpgMakerTranslationRequestConfiguration,
+        RpgMakerTranslationRequestConfiguration, TranslationResponseEnvelope,
     };
     use crate::rpg_maker::translate::standard::{
         AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
@@ -1420,17 +1467,40 @@ mod tests {
         target_language: &str,
         module: Arc<dyn LanguageModule>,
     ) -> Arc<ResolvedRpgMakerTranslationResources> {
+        translation_resources_with_envelope(
+            source_language,
+            target_language,
+            module,
+            TranslationResponseEnvelope::JsonOnly,
+        )
+    }
+
+    fn translation_resources_with_envelope(
+        source_language: &str,
+        target_language: &str,
+        module: Arc<dyn LanguageModule>,
+        response_envelope: TranslationResponseEnvelope,
+    ) -> Arc<ResolvedRpgMakerTranslationResources> {
         let pair = LanguagePair::new(
             LanguageId::parse(source_language).expect("测试源语言合法"),
             LanguageId::parse(target_language).expect("测试目标语言合法"),
         );
-        let prompt =
-            RpgMakerSystemPrompt::new(pair, "# Contract".to_owned()).expect("测试 Prompt 合法");
+        let prompt = RpgMakerSystemPrompt::new(pair, "# Contract".to_owned(), response_envelope)
+            .expect("测试 Prompt 合法");
         Arc::new(ResolvedRpgMakerTranslationResources::new(prompt, module))
     }
 
     fn translation_resources() -> Arc<ResolvedRpgMakerTranslationResources> {
         translation_resources_with("ja", "zh-Hans", japanese_module())
+    }
+
+    fn thinking_translation_resources() -> Arc<ResolvedRpgMakerTranslationResources> {
+        translation_resources_with_envelope(
+            "ja",
+            "zh-Hans",
+            japanese_module(),
+            TranslationResponseEnvelope::ThinkingThenJson,
+        )
     }
 
     fn japanese_analysis() -> crate::language::LanguageAnalysis {
@@ -1670,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn response_envelope_accepts_only_the_explicit_contract() {
+    fn json_only_response_envelope_accepts_only_the_explicit_contract() {
         for value in [
             "{}",
             " \r\n {} \n ",
@@ -1680,13 +1750,15 @@ mod tests {
             "```JSON\n{\"0\":[\"括号 [ ]、逗号 ,} 与反引号 ```\"]}\n```",
         ] {
             assert!(
-                parse_model_output_batch(value).is_ok(),
+                parse_model_output_batch(value, TranslationResponseEnvelope::JsonOnly).is_ok(),
                 "合法响应信封应通过：{value:?}"
             );
         }
 
         for value in [
             "说明：{}",
+            "<why>不应输出思考</why>{}",
+            r#"{"1":["</why>"]}"#,
             "{} 后记",
             "{}\n{}",
             "{\"0\":[\"译文\",]}",
@@ -1702,16 +1774,61 @@ mod tests {
             "[]",
         ] {
             assert!(
-                parse_model_output_batch(value).is_err(),
+                parse_model_output_batch(value, TranslationResponseEnvelope::JsonOnly).is_err(),
                 "协议外响应必须拒绝：{value:?}"
             );
         }
     }
 
     #[test]
+    fn thinking_response_envelope_accepts_one_non_blank_exact_tag_pair() {
+        for value in [
+            "<why>逐项分析。</why>{}",
+            "<why>第一行\n第二行</why>\n{}",
+            " \r\n\u{feff}<why>\n　逐项分析\t\n</why>\r\n```json\r\n{}\r\n``` \n",
+        ] {
+            assert!(
+                parse_model_output_batch(value, TranslationResponseEnvelope::ThinkingThenJson)
+                    .is_ok(),
+                "合法思考信封应通过：{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_response_envelope_rejects_every_protocol_variant() {
+        for value in [
+            "{}",
+            "<why></why>{}",
+            "<why> \n　\t</why>{}",
+            "<why>未闭合{}",
+            "<why>外层<why>内层</why></why>{}",
+            "<why>第一组</why><why>第二组</why>{}",
+            "<why>第一组</why></why>{}",
+            "<WHY>大小写错误</WHY>{}",
+            "<Why>大小写错误</why>{}",
+            "<why reason=\"analysis\">带属性</why>{}",
+            "说明文字<why>分析</why>{}",
+            "<why>分析</WHY>{}",
+            "<why>分析</why>说明文字{}",
+            "<why>分析</why>{}后记",
+            "```\n<why>分析</why>{}\n```",
+        ] {
+            assert!(
+                parse_model_output_batch(value, TranslationResponseEnvelope::ThinkingThenJson)
+                    .is_err(),
+                "协议外思考信封必须拒绝：{value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn model_output_id_accepts_only_canonical_object_keys() {
-        let outputs = parse_model_output_batch(r#"{"1":["甲"],"2":["乙"]}"#)
-            .expect("无前导零的 ASCII 十进制键应合法");
+        let outputs = parse_model_output_batch(
+            r#"{"1":["甲"],"2":["乙"]}"#,
+            TranslationResponseEnvelope::JsonOnly,
+        )
+        .expect("无前导零的 ASCII 十进制键应合法");
 
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].id, "1");
@@ -2552,6 +2669,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thinking_envelope_preserves_existing_outcome_classification() {
+        let processor = TranslationTaskResponseProcessingService::new(
+            InlineCpu,
+            thinking_translation_resources(),
+        );
+
+        let complete = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    "<why>确认语境、敬语、token 与单行结构。</why>\n{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}",
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-thinking-complete".to_owned()),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("合法思考信封后仍应使用既有逐 ID 验收");
+        assert!(matches!(complete, TranslationTaskOutcome::Complete { .. }));
+
+        let partial = processor
+            .process(
+                &task_with_output_count(2),
+                LlmResponse::new(
+                    "<why>两个 ID 均已逐项分析，但第二项未能产出。</why>\n{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}",
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-thinking-partial".to_owned()),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("思考模式不得改变部分结果语义");
+        assert!(matches!(&partial, TranslationTaskOutcome::Partial { .. }));
+        assert_eq!(partial.accepted().len(), 1);
+        assert!(matches!(
+            partial.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::Missing
+        ));
+
+        let all_rejected = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    "<why>已分析该 ID，但最终数组留下了不合法的空槽。</why>\n{\"1\":[\"\"]}",
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-thinking-rejected".to_owned()),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("思考模式不得改变逐 ID 全拒绝语义");
+        assert!(matches!(
+            all_rejected,
+            TranslationTaskOutcome::Unavailable {
+                reason: TranslationTaskUnavailableReason::AllOutputsRejected,
+                ..
+            }
+        ));
+
+        let unusable = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-thinking-missing".to_owned()),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("思考模式的裸 JSON 应成为模型响应不可用");
+        assert!(matches!(
+            &unusable,
+            TranslationTaskOutcome::Unavailable {
+                reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn thinking_content_is_discarded_before_results_and_diagnostics() {
+        const THINKING_SENTINEL: &str = "ATT_PRIVATE_THINKING_SENTINEL_7C4E";
+
+        let processor = TranslationTaskResponseProcessingService::new(
+            InlineCpu,
+            thinking_translation_resources(),
+        );
+        let complete = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    format!(
+                        "<why>{THINKING_SENTINEL}</why>{{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}}"
+                    ),
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("合法思考内容应在 JSON 验收前丢弃");
+        assert!(!format!("{complete:?}").contains(THINKING_SENTINEL));
+
+        let unusable = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    format!("<why>{THINKING_SENTINEL}</why>not-json"),
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("信封后的非法 JSON 应成为模型响应不可用");
+        assert!(matches!(
+            &unusable,
+            TranslationTaskOutcome::Unavailable {
+                reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
+                ..
+            }
+        ));
+        assert!(!format!("{unusable:?}").contains(THINKING_SENTINEL));
+        assert!(
+            unusable
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| { !format!("{diagnostic:?}").contains(THINKING_SENTINEL) })
+        );
+        assert!(
+            unusable
+                .unresolved()
+                .iter()
+                .all(|unit| { !format!("{:?}", unit.reason()).contains(THINKING_SENTINEL) })
+        );
+    }
+
+    #[tokio::test]
+    async fn json_only_mode_rejects_thinking_as_model_response_unusable() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let outcome = processor
+            .process(
+                &task(),
+                LlmResponse::new(
+                    "<why>不应出现。</why>{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}",
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("JSON-only 模式中的思考内容应成为正常不可用结果");
+
+        assert!(matches!(
+            outcome,
+            TranslationTaskOutcome::Unavailable {
+                reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn response_cpu_unavailable_is_fatal_instead_of_model_retryable() {
         let processor =
             TranslationTaskResponseProcessingService::new(UnavailableCpu, translation_resources());
@@ -2786,6 +3082,61 @@ mod tests {
         ));
         assert_eq!(messages.lock().expect("消息锁不应中毒").len(), 1);
         assert!(waits.lock().expect("等待锁不应中毒").is_empty());
+    }
+
+    #[tokio::test]
+    async fn executor_never_retries_an_invalid_thinking_envelope() {
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            Ok(LlmResponse::new(
+                r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                LlmFinishReason::Stop,
+                None,
+                Some("response-missing-thinking".to_owned()),
+                None,
+            )),
+            Ok(LlmResponse::new(
+                "<why>该响应不应被消费。</why>{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}",
+                LlmFinishReason::Stop,
+                None,
+                Some("response-unused".to_owned()),
+                None,
+            )),
+        ])));
+        let service = RpgMakerStandardTranslationTaskExecutionService::<
+            _,
+            _,
+            _,
+            RpgMakerTranslationProfile<&'static str>,
+        >::new(
+            FakeLlm {
+                responses: Arc::clone(&responses),
+                messages: Arc::clone(&messages),
+            },
+            FakeDelay {
+                waits: Arc::clone(&waits),
+            },
+            TranslationTaskResponseProcessingService::new(
+                InlineCpu,
+                thinking_translation_resources(),
+            ),
+        );
+
+        let outcome = service
+            .execute(&profile(), task())
+            .await
+            .expect("模型信封错误应成为正常不可用结果");
+        assert!(matches!(
+            outcome,
+            TranslationTaskOutcome::Unavailable {
+                reason: TranslationTaskUnavailableReason::ModelResponseUnusable,
+                ..
+            }
+        ));
+        assert_eq!(messages.lock().expect("消息锁不应中毒").len(), 1);
+        assert!(waits.lock().expect("等待锁不应中毒").is_empty());
+        assert_eq!(responses.lock().expect("响应锁不应中毒").len(), 1);
     }
 
     #[tokio::test]

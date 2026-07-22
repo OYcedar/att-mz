@@ -69,6 +69,7 @@ use crate::rpg_maker::translate::planning_resource::TranslationPlanningResourceR
 use crate::rpg_maker::translate::profile::{
     ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
     RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
+    TranslationResponseEnvelope,
 };
 use crate::rpg_maker::translate::result_store::RpgMakerStandardTranslationResultStorageService;
 use crate::rpg_maker::translate::service::{
@@ -105,6 +106,10 @@ use crate::storage::file_system::{ExistingDirectoryResolver, FileReader, ReadFil
 
 type BoxedError = Box<dyn Error + Send + Sync + 'static>;
 const RPG_MAKER_PROMPT_DIRECTORY_NAME: &str = "rpg_maker";
+const SYSTEM_PROMPT_FILE_NAME: &str = "system.md";
+const THINKING_PROMPT_FILE_NAME: &str = "thinking.md";
+const SOURCE_LANGUAGE_TEMPLATE_VARIABLE: &str = "{{source_language}}";
+const TARGET_LANGUAGE_TEMPLATE_VARIABLE: &str = "{{target_language}}";
 const MAX_MV_DIALOGUE_DEFINITION_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1473,6 +1478,7 @@ impl ProductionRpgMakerCommandRunner {
             ProductionBusinessLog::for_translation(&project_log, progress_observer.clone());
         let builder = ProductionSelectedTranslationExecutionBuilder {
             configuration: command.rpg_maker(),
+            ui_locale: self.locale,
             file_system: file_system.clone(),
             cpu: cpu.clone(),
             sqlite: sqlite.clone(),
@@ -2955,8 +2961,239 @@ type ProductionLuaHost = TrustedLuaExecutionHostingService<
 >;
 type ProductionLuaTranslation = LuaTranslationService<ProductionLuaHost>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptResourceComponent {
+    System,
+    Thinking,
+}
+
+impl PromptResourceComponent {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => SYSTEM_PROMPT_FILE_NAME,
+            Self::Thinking => THINKING_PROMPT_FILE_NAME,
+        }
+    }
+}
+
+async fn read_prompt_resource(
+    file_system: &SystemFileSystem,
+    locale: UiLocale,
+    component: PromptResourceComponent,
+    path: &Path,
+) -> Result<String, ProductionTranslationExecutionBuildError> {
+    let file = file_system
+        .read_file(path.to_owned())
+        .await
+        .map_err(|source| {
+            ProductionTranslationExecutionBuildError::prompt(locale, component, path, source)
+        })?;
+    if file.resolved_path().file_name() != path.file_name() {
+        return Err(ProductionTranslationExecutionBuildError::prompt(
+            locale,
+            component,
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "固定后的 Prompt 资源文件名与所选组件不一致",
+            ),
+        ));
+    }
+    let text = String::from_utf8(file.into_bytes()).map_err(|source| {
+        let utf8 = source.utf8_error();
+        ProductionTranslationExecutionBuildError::prompt(
+            locale,
+            component,
+            path,
+            Utf8ResourceError {
+                path: path.to_owned(),
+                valid_up_to: utf8.valid_up_to(),
+                error_len: utf8.error_len(),
+            },
+        )
+    })?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(ProductionTranslationExecutionBuildError::prompt(
+            locale,
+            component,
+            path,
+            io::Error::new(io::ErrorKind::InvalidData, "Prompt 资源正文为空"),
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+fn render_system_prompt_template(
+    template: &str,
+    language_pair: &crate::language::LanguagePair,
+) -> Result<String, PromptTemplateError> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    let mut source_seen = false;
+    let mut target_seen = false;
+
+    loop {
+        let next_open = remaining.find("{{");
+        let next_close = remaining.find("}}");
+        let Some(open) = next_open else {
+            if next_close.is_some() {
+                return Err(PromptTemplateError::InvalidSyntax);
+            }
+            rendered.push_str(remaining);
+            break;
+        };
+        if next_close.is_some_and(|close| close < open) {
+            return Err(PromptTemplateError::InvalidSyntax);
+        }
+
+        rendered.push_str(&remaining[..open]);
+        let after_open = &remaining[open + 2..];
+        let close = after_open
+            .find("}}")
+            .ok_or(PromptTemplateError::InvalidSyntax)?;
+        if after_open[..close].contains("{{") {
+            return Err(PromptTemplateError::InvalidSyntax);
+        }
+        let variable = &remaining[open..open + 2 + close + 2];
+        match variable {
+            SOURCE_LANGUAGE_TEMPLATE_VARIABLE => {
+                rendered.push_str(language_pair.source().as_str());
+                source_seen = true;
+            }
+            TARGET_LANGUAGE_TEMPLATE_VARIABLE => {
+                rendered.push_str(language_pair.target().as_str());
+                target_seen = true;
+            }
+            _ => return Err(PromptTemplateError::UnknownVariable),
+        }
+        remaining = &after_open[close + 2..];
+    }
+
+    if !source_seen {
+        return Err(PromptTemplateError::MissingSourceLanguage);
+    }
+    if !target_seen {
+        return Err(PromptTemplateError::MissingTargetLanguage);
+    }
+    if rendered.contains("{{") || rendered.contains("}}") {
+        return Err(PromptTemplateError::InvalidSyntax);
+    }
+    Ok(rendered)
+}
+
+fn ensure_no_prompt_template_variables(text: &str) -> Result<(), PromptTemplateError> {
+    if text.contains("{{") || text.contains("}}") {
+        return Err(PromptTemplateError::VariablesNotAllowed);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptTemplateError {
+    InvalidSyntax,
+    UnknownVariable,
+    MissingSourceLanguage,
+    MissingTargetLanguage,
+    VariablesNotAllowed,
+}
+
+impl fmt::Display for PromptTemplateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSyntax => formatter.write_str("Prompt 模板变量语法无效"),
+            Self::UnknownVariable => formatter.write_str("Prompt 模板包含不受支持的变量"),
+            Self::MissingSourceLanguage => {
+                formatter.write_str("Prompt 模板缺少 source_language 变量")
+            }
+            Self::MissingTargetLanguage => {
+                formatter.write_str("Prompt 模板缺少 target_language 变量")
+            }
+            Self::VariablesNotAllowed => formatter.write_str("该 Prompt 组件不允许包含模板变量"),
+        }
+    }
+}
+
+impl Error for PromptTemplateError {}
+
+#[cfg(test)]
+mod prompt_template_tests {
+    use crate::language::{LanguageId, LanguagePair};
+
+    use super::*;
+
+    fn language_pair() -> LanguagePair {
+        LanguagePair::new(
+            LanguageId::parse("ja").expect("测试源语言合法"),
+            LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
+        )
+    }
+
+    #[test]
+    fn system_template_replaces_every_occurrence_of_both_supported_variables() {
+        let rendered = render_system_prompt_template(
+            "{{source_language}} -> {{target_language}} / {{source_language}}",
+            &language_pair(),
+        )
+        .expect("两个受支持变量可多次渲染");
+
+        assert_eq!(rendered, "ja -> zh-Hans / ja");
+        assert!(!rendered.contains("{{"));
+        assert!(!rendered.contains("}}"));
+    }
+
+    #[test]
+    fn system_template_rejects_missing_unknown_and_malformed_variables() {
+        for (template, expected) in [
+            (
+                "{{target_language}}",
+                PromptTemplateError::MissingSourceLanguage,
+            ),
+            (
+                "{{source_language}}",
+                PromptTemplateError::MissingTargetLanguage,
+            ),
+            (
+                "{{source_language}} {{target_language}} {{other}}",
+                PromptTemplateError::UnknownVariable,
+            ),
+            (
+                "{{source_language}} {{target_language}",
+                PromptTemplateError::InvalidSyntax,
+            ),
+            (
+                "{{source_language}} }} {{target_language}}",
+                PromptTemplateError::InvalidSyntax,
+            ),
+            (
+                "{{{{source_language}} {{target_language}}",
+                PromptTemplateError::InvalidSyntax,
+            ),
+        ] {
+            assert_eq!(
+                render_system_prompt_template(template, &language_pair())
+                    .expect_err("无效模板必须失败"),
+                expected,
+                "模板：{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_component_rejects_all_template_delimiters() {
+        assert_eq!(ensure_no_prompt_template_variables("实际思考要求"), Ok(()));
+        for text in ["{{source_language}}", "前缀 {{", "后缀 }}"] {
+            assert_eq!(
+                ensure_no_prompt_template_variables(text),
+                Err(PromptTemplateError::VariablesNotAllowed)
+            );
+        }
+    }
+}
+
 struct ProductionSelectedTranslationExecutionBuilder<'a> {
     configuration: &'a TranslateConfiguration,
+    ui_locale: UiLocale,
     file_system: SystemFileSystem,
     cpu: RayonCpuExecutor,
     sqlite: RusqliteStorage,
@@ -2979,48 +3216,63 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
     {
         let profile_configuration = self.configuration.profile();
         let language_pair = project.language_pair().clone();
-        let path = self
+        let prompt_locale = self.configuration.prompt_locale().resolve(self.ui_locale);
+        let prompt_directory = self
             .configuration
             .prompt_root()
             .join(RPG_MAKER_PROMPT_DIRECTORY_NAME)
-            .join(format!(
-                "{}--{}.md",
-                language_pair.source(),
-                language_pair.target()
-            ));
-        let file = self
-            .file_system
-            .read_file(path.clone())
-            .await
+            .join(prompt_locale.as_str());
+        let system_path = prompt_directory.join(SYSTEM_PROMPT_FILE_NAME);
+        let system_template = read_prompt_resource(
+            &self.file_system,
+            prompt_locale,
+            PromptResourceComponent::System,
+            &system_path,
+        )
+        .await?;
+        let mut markdown = render_system_prompt_template(&system_template, &language_pair)
             .map_err(|source| {
-                ProductionTranslationExecutionBuildError::prompt(&language_pair, &path, source)
+                ProductionTranslationExecutionBuildError::prompt(
+                    prompt_locale,
+                    PromptResourceComponent::System,
+                    &system_path,
+                    source,
+                )
             })?;
-        if file.resolved_path().file_name() != path.file_name() {
-            return Err(ProductionTranslationExecutionBuildError::prompt(
-                &language_pair,
-                &path,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "固定后的 Prompt 文件名与规范语言对派生文件名不一致",
-                ),
-            ));
-        }
-        let markdown = String::from_utf8(file.into_bytes()).map_err(|source| {
-            let utf8 = source.utf8_error();
-            ProductionTranslationExecutionBuildError::prompt(
-                &language_pair,
-                &path,
-                Utf8ResourceError {
-                    path: path.clone(),
-                    valid_up_to: utf8.valid_up_to(),
-                    error_len: utf8.error_len(),
-                },
+        let response_envelope = if self.configuration.thinking_output() {
+            let thinking_path = prompt_directory.join(THINKING_PROMPT_FILE_NAME);
+            let thinking = read_prompt_resource(
+                &self.file_system,
+                prompt_locale,
+                PromptResourceComponent::Thinking,
+                &thinking_path,
             )
-        })?;
-        let system_prompt =
-            RpgMakerSystemPrompt::new(language_pair.clone(), markdown).map_err(|source| {
-                ProductionTranslationExecutionBuildError::prompt(&language_pair, &path, source)
+            .await?;
+            ensure_no_prompt_template_variables(&thinking).map_err(|source| {
+                ProductionTranslationExecutionBuildError::prompt(
+                    prompt_locale,
+                    PromptResourceComponent::Thinking,
+                    &thinking_path,
+                    source,
+                )
             })?;
+            markdown.push_str("\n\n");
+            markdown.push_str(&thinking);
+            TranslationResponseEnvelope::ThinkingThenJson
+        } else {
+            TranslationResponseEnvelope::JsonOnly
+        };
+        let system_prompt =
+            RpgMakerSystemPrompt::new(language_pair.clone(), markdown, response_envelope).map_err(
+                |source| {
+                    ProductionTranslationExecutionBuildError::prompt(
+                        prompt_locale,
+                        PromptResourceComponent::System,
+                        &system_path,
+                        source,
+                    )
+                },
+            )?;
         let source_language = self
             .configuration
             .language_modules()
@@ -3112,8 +3364,8 @@ enum TranslationExecutionBuildFailureImpact {
 #[derive(Debug)]
 enum TranslationExecutionBuildDiagnostic {
     PromptUnavailable {
-        source_language: String,
-        target_language: String,
+        locale: String,
+        component: &'static str,
         path: PathBuf,
     },
     LanguageModuleUnavailable {
@@ -3125,15 +3377,16 @@ enum TranslationExecutionBuildDiagnostic {
 
 impl ProductionTranslationExecutionBuildError {
     fn prompt(
-        language_pair: &crate::language::LanguagePair,
+        locale: UiLocale,
+        component: PromptResourceComponent,
         path: &Path,
         source: impl Error + Send + Sync + 'static,
     ) -> Self {
         Self {
             impact: TranslationExecutionBuildFailureImpact::ConfigurationOrInput,
             diagnostic: TranslationExecutionBuildDiagnostic::PromptUnavailable {
-                source_language: language_pair.source().to_string(),
-                target_language: language_pair.target().to_string(),
+                locale: locale.to_string(),
+                component: component.as_str(),
                 path: path.to_owned(),
             },
             source: Box::new(source),
@@ -3186,12 +3439,12 @@ impl fmt::Display for ProductionTranslationExecutionBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.diagnostic {
             TranslationExecutionBuildDiagnostic::PromptUnavailable {
-                source_language,
-                target_language,
+                locale,
+                component,
                 path,
             } => write!(
                 formatter,
-                "RPG Maker system prompt unavailable for {source_language} -> {target_language}: {}",
+                "RPG Maker prompt resource unavailable for locale {locale}, component {component}: {}",
                 path.display()
             ),
             TranslationExecutionBuildDiagnostic::LanguageModuleUnavailable {
@@ -4040,12 +4293,12 @@ fn render_command_failure(
             {
                 match error.diagnostic() {
                     TranslationExecutionBuildDiagnostic::PromptUnavailable {
-                        source_language,
-                        target_language,
+                        locale,
+                        component,
                         path,
                     } => localizer.format(UiMessage::ErrorRpgMakerPromptUnavailable {
-                        source_language,
-                        target_language,
+                        locale,
+                        component,
                         path: &path.to_string_lossy(),
                     }),
                     TranslationExecutionBuildDiagnostic::LanguageModuleUnavailable {
@@ -4178,7 +4431,7 @@ mod command_error_rendering_tests {
     #[test]
     fn configuration_or_input_failure_uses_localized_generic_guidance() {
         let error = ProductionCommandError::ConfigurationOrInput(Box::new(TestError(
-            "RPG Maker system prompt 文件 prompts/rpg_maker/ja--zh-Hans.md 不存在",
+            "RPG Maker Prompt 资源 prompts/rpg_maker/zh-Hans/system.md 不存在",
         )));
         let mut stderr = Vec::new();
 
@@ -4188,7 +4441,7 @@ mod command_error_rendering_tests {
 
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
         assert!(stderr.contains("配置或命令输入无效"));
-        assert!(!stderr.contains("prompts/rpg_maker/ja--zh-Hans.md"));
+        assert!(!stderr.contains("prompts/rpg_maker/zh-Hans/system.md"));
     }
 
     #[test]
@@ -4196,9 +4449,9 @@ mod command_error_rendering_tests {
         let build = ProductionTranslationExecutionBuildError {
             impact: TranslationExecutionBuildFailureImpact::ConfigurationOrInput,
             diagnostic: TranslationExecutionBuildDiagnostic::PromptUnavailable {
-                source_language: "ja".to_owned(),
-                target_language: "zh-Hans".to_owned(),
-                path: PathBuf::from("prompts/rpg_maker/ja--zh-Hans.md"),
+                locale: "zh-Hans".to_owned(),
+                component: "system.md",
+                path: PathBuf::from("prompts/rpg_maker/zh-Hans/system.md"),
             },
             source: Box::new(TestError("PROMPT_CONTENT_SENTINEL")),
         };
@@ -4210,7 +4463,8 @@ mod command_error_rendering_tests {
             .expect("诊断应可写入");
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
 
-        assert!(stderr.contains("ja--zh-Hans.md"));
+        assert!(stderr.contains("zh-Hans"));
+        assert!(stderr.contains("system.md"));
         assert!(stderr.contains("翻译尚未开始"));
         assert!(stderr.contains("非空 UTF-8"));
         assert!(!stderr.contains("PROMPT_CONTENT_SENTINEL"));
@@ -4288,7 +4542,7 @@ mod command_error_rendering_tests {
             source: io::Error::other("SIGNAL_SECRET_SENTINEL"),
             outcome: SignalOutcome::CommandFailed(Box::new(
                 ProductionCommandError::ConfigurationOrInput(Box::new(TestError(
-                    "语言对 ja -> zh-Hans 缺少 Prompt 资源",
+                    "locale zh-Hans 的 system.md Prompt 资源缺失",
                 ))),
             )),
         };
@@ -4300,7 +4554,7 @@ mod command_error_rendering_tests {
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
 
         assert!(stderr.contains("配置或命令输入无效"));
-        assert!(!stderr.contains("语言对 ja -> zh-Hans 缺少 Prompt 资源"));
+        assert!(!stderr.contains("locale zh-Hans 的 system.md Prompt 资源缺失"));
         assert!(!stderr.contains("SIGNAL_SECRET_SENTINEL"));
     }
 

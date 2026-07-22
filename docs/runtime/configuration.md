@@ -11,7 +11,9 @@
 目录为基准。不存在默认配置路径、用户目录配置或配置环境变量插值。
 
 `--ui-language`、`ATT_UI_LANGUAGE` 和 `--progress` 是进程界面选择，不属于 TOML，也不
-写入项目数据库。UI locale 的检测和支持范围见 [CLI 现行规格](cli.md#2-ui-语言)。
+写入项目数据库。已经解析出的有效 UI locale 还会供 `prompts.locale = "auto"` 直接复用，
+但不会因此成为项目语言对或持久状态。UI locale 的检测和支持范围见
+[CLI 现行规格](cli.md#2-ui-语言)。
 
 配置源码受 4 MiB 固定上限保护，并且只读取一次。配置边界始终检查 UTF-8、完整 TOML
 语法、重复 key 和未知顶层分区。随后结合 CLI 意图与项目保存方案，只选择本次命令真实
@@ -55,7 +57,7 @@ CLI 命令 + 必填 --config FILE
 |---|---|
 | Init | 目录发布、SQLite 建库与数据库快照 |
 | Extract | CPU、文档、Store，以及解析后的 Builtin/Rules owner；本次方案启用 Lua 时选择 `runtime.lua` 和交互会话 |
-| Translate | `prompts.root`、完整 `languages`、CPU、LLM Runtime、解析后的 RPG Maker Profile、该 Profile 引用的 Client、标准资产与 Store；本次方案启用 Lua 时再选择 `runtime.lua` |
+| Translate | 完整 `[prompts]`、完整 `languages`、CPU、LLM Runtime、解析后的 RPG Maker Profile、该 Profile 引用的 Client、标准资产与 Store；本次方案启用 Lua 时再选择 `runtime.lua` |
 | WriteBack | CPU、目录发布与候选编辑、文档和标准资产；本次方案启用 Lua 时选择 `runtime.lua` |
 
 “本次方案启用 Lua”既包括显式非空 `--lua`，也包括从相应阶段数据库快照自动复用。
@@ -71,11 +73,13 @@ Translate 需要解析并验证全部 `[[languages]]` 条目；任一非法语�
 都会阻止运行。项目开启后取得权威 `LanguagePair`，再执行第二阶段资源解析：
 
 ```text
-从 metadata 取得受信 LanguagePair
+从 [prompts].locale 与本进程有效 UI locale 取得规范 Prompt locale
   ↓
-按 source LanguageId 精确选择一个共享语言模块
+从 metadata 取得受信 LanguagePair，按 source LanguageId 精确选择共享语言模块
   ↓
-读取 <prompts.root>/rpg_maker/<source>--<target>.md
+读取并渲染 <prompts.root>/rpg_maker/<locale>/system.md
+  ↓ thinking_output = true 时
+读取同 locale 的 thinking.md，并用两个 LF 装配
   ↓
 构造 ResolvedRpgMakerTranslationResources
 ```
@@ -179,13 +183,15 @@ parameters = '''{}'''
 `api_key` 是配置中的实际字符串，当前不会展开环境变量。`"$NAME"` 只表示字面值；真实
 凭据应放在不纳入版本控制且访问受限的本地配置中。代理 URL 不得内嵌凭据。
 
-## 6. 共享语言目录与 RPG Maker Prompt
+## 6. 共享语言目录与 RPG Maker Prompt i18n
 
 翻译语言能力属于进程级共享配置，使用顶层 `[[languages]]`：
 
 ```toml
 [prompts]
 root = "prompts"
+locale = "auto"
+thinking_output = false
 
 [[languages]]
 type = "japanese"
@@ -209,15 +215,41 @@ allowed_terms = []
 TOML 和其他外部文本进入内部时执行 RFC 5646 解析、IANA 注册表校验和 canonicalization；
 精确查询时不做父语言或别名回退。
 
-`prompts.root` 对 Translate 必填。Prompt 按权威项目语言对派生唯一路径：
+`prompts.root`、`prompts.locale` 与 `prompts.thinking_output` 都是 Translate 必填字段；
+该表不允许其他字段，缺失、未知或错误类型都是配置输入错误。非 Translate 命令不反序列化
+或校验 `[prompts]` 内部字段。`locale` 接受精确小写 `auto`，
+或能按现有 UI i18n 规则映射到受支持语言的有效 BCP-47 locale；例如 `fr-CA` 规范为 `fr`，
+`zh-TW` 规范为 `zh-Hant`。显式值优先；`auto` 复用本进程已经解析完成的有效 UI locale，
+不再次读取 `--ui-language`、环境变量或 Windows 用户语言。资源路径只使用以下规范标签：
 
 ```text
-<prompts.root>/rpg_maker/<source>--<target>.md
+ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 ```
 
-例如 `ja--zh-Hans.md`。只读取该路径指向的普通 UTF-8 非空白文件，不尝试大小写变体、父
-语言、默认文件或目录首项。Prompt 内容和语言策略指纹参与语义单元翻译状态指纹；项目不
-提供内置 Prompt 正文。
+Prompt 资源按规范 Prompt locale 派生唯一路径：
+
+```text
+<prompts.root>/rpg_maker/<locale>/system.md
+<prompts.root>/rpg_maker/<locale>/thinking.md
+```
+
+`system.md` 始终读取；`thinking_output = false` 时完全不读取 `thinking.md`，开启时才
+读取同一 locale 的两份资源。每个被选择的资源都必须是普通 UTF-8 非空白文件。没有父
+语言、中文、英文、目录首项、大小写变体或旧语言对文件回退；未选择 locale 的资源和
+关闭模式下的 `thinking.md` 不影响运行。每次 Translate 重新读取所选文件，不做长期缓存。
+
+`system.md` 去除首尾空白后只允许 `{{source_language}}` 与 `{{target_language}}` 两个
+模板变量，两者都必须存在，可以多次出现。ATT 使用项目规范 `LanguageId` 完整替换；
+未知、缺失、malformed 或替换后残留的模板变量都使资源无效。`thinking.md` 去除首尾空白
+后不得含模板变量。关闭时 system message 只有渲染后的 `system.md`；开启时精确使用
+`rendered system.md + "\n\n" + thinking.md`。资源或模板错误在首次 LLM 请求前失败，
+用户诊断只包含安全的 locale、组件名和路径以及统一检查方向，不回显正文。
+
+装配后的完整 system Prompt 参与消息字符预算和 translation state。切换 locale、切换
+`thinking_output` 或修改本轮实际选择的资源，会自然使受影响旧译文不再 Current。
+`thinking_output` 只控制 `<why>` 人工思考信封，不控制 Client `parameters` 中供应商原生
+reasoning/thinking 选项。完整模板、响应信封与微调限制见
+[系统提示词编写指南](../rpg-maker/prompts.md)。
 
 ## 7. RPG Maker 配置与运行方案所有权
 

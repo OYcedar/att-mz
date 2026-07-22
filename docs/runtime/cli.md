@@ -69,6 +69,10 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 - `zh-Hans`、`zh-CN`、`zh-SG` 和普通 `zh` 选择 `zh-Hans`；
 - 其他受支持语言的区域变体按主语言匹配，例如 `fr-CA` 选择 `fr`。
 
+这个选择在进程入口只解析一次。Translate 配置使用 `prompts.locale = "auto"` 时直接
+复用该有效 UI locale 选择外置 Prompt，不重新读取参数、环境或 Windows 设置；显式
+`prompts.locale` 则覆盖它。两者都不改变项目 metadata 中的源语言或目标语言。
+
 用户控制的路径、ID 和其他动态文本在进入终端或日志前会移除 ESC、换行伪装及既有
 双向文本控制字符。阿拉伯语消息保持逻辑顺序；命令、路径、ID、数字和进度条作为独立
 方向片段渲染，不反转原字符串。
@@ -115,6 +119,12 @@ canonical `rule = []` 清空该 definition。它不是独立 owner。
 `term = []` 和 Placeholder 的 `rule = []` 分别清空对应资源。非空 `--lua` 替换并执行
 Translate 阶段程序；省略时自动复用该阶段保存的程序；零字节文件清除该程序且本次不执行
 Lua。清除不会猜测或删除 Lua 私有数据库状态。
+
+Translate 还会严格消费 `[prompts]` 的 `root`、`locale` 和 `thinking_output`，每次运行
+重新读取规范 locale 下的 `system.md`；只有开启思考输出时才读取同目录 `thinking.md`。
+所选资源或模板无效时在任何 LLM 请求前失败。关闭模式要求 JSON-only 响应，开启模式
+要求精确的一组非空 `<why>...</why>` 后接同一 JSON wire；信封或 JSON 解析失败形成
+`ModelResponseUnusable`，不会作为网络错误重试。
 
 ### 3.4 WriteBack
 
@@ -164,9 +174,11 @@ Extract、Translate、WriteBack 的非空 Lua 主程序按阶段分别保存在�
 ```
 
 Translate 在选定显式或保存的 Profile 后，精确选择当前配置中的 Profile 及其 Client；
-项目开启后按 metadata 的规范 `LanguagePair` 读取
-`<prompts.root>/rpg_maker/<source>--<target>.md`。只有最终方案启用某阶段 Lua 时才构造
-Lua Runtime；配置中存在 `runtime.lua` 本身不会启用程序。
+项目开启后取得 metadata 的规范 `LanguagePair`，再按 `[prompts].locale` 选择
+`<prompts.root>/rpg_maker/<locale>/system.md`，用两个项目 `LanguageId` 渲染模板。仅当
+`thinking_output = true` 时读取并追加同 locale 的 `thinking.md`。没有父语言、中文、
+英文、目录首项或旧语言对文件回退。只有最终方案启用某阶段 Lua 时才构造 Lua Runtime；
+配置中存在 `runtime.lua` 本身不会启用程序。
 
 Extract、Translate 与 WriteBack 各自在命令生命周期内构造一个私有 Rayon CPU 池。
 文档解析、规则扫描、资产编解码、规划准备与写回计算共享同一线程和准入预算。等待 CPU

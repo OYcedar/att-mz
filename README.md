@@ -41,7 +41,14 @@ CLI 会按 `--ui-language`、`ATT_UI_LANGUAGE`、Windows 用户首选 UI 语言�
 语言对、模型服务和机器资源编写配置。术语表用于约束概念口径，不应代替字段翻译或
 提取规则。
 
+Translate 的 `[prompts]` 必须提供 `root`、`locale` 与 `thinking_output`。`locale = "auto"`
+复用本进程有效 UI locale，显式值则覆盖它；提示词语言与游戏源/目标语言彼此独立。
+资源位于 `<prompts.root>/rpg_maker/<locale>/{system.md,thinking.md}`，关闭思考输出时不会读取
+`thinking.md`。system 模板只以 `{{source_language}}`、`{{target_language}}` 接收项目
+规范 LanguageId；资源缺失或模板无效会在首次模型请求前失败，不做任何 locale 回退。
+
 - [术语文件现行规格与制作指南](docs/rpg-maker/terminology.md)
+- [系统提示词编写指南](docs/rpg-maker/prompts.md)
 - [配置编写与运行能力导航](docs/runtime/README.md)
 - [生产配置现行规格](docs/runtime/configuration.md)
 

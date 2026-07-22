@@ -19,7 +19,7 @@ use super::planning_resource::TranslationPlanningResourceReadingService;
 use super::profile::{
     ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
     RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
-    RpgMakerTranslationRequestConfiguration,
+    RpgMakerTranslationRequestConfiguration, TranslationResponseEnvelope,
 };
 use super::result_store::{
     RpgMakerStandardTranslationResultStorageConfig, RpgMakerStandardTranslationResultStorageService,
@@ -762,9 +762,12 @@ fn translation_resources() -> Arc<ResolvedRpgMakerTranslationResources> {
         LanguageId::parse("ja").expect("测试源语言合法"),
         LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
     );
-    let prompt =
-        RpgMakerSystemPrompt::new(pair, "# 完整系统提示词\n\n只返回约定 JSON。".to_owned())
-            .expect("测试 Prompt 应合法");
+    let prompt = RpgMakerSystemPrompt::new(
+        pair,
+        "# 完整系统提示词\n\n只返回约定 JSON。".to_owned(),
+        TranslationResponseEnvelope::JsonOnly,
+    )
+    .expect("测试 Prompt 应合法");
     Arc::new(ResolvedRpgMakerTranslationResources::new(prompt, japanese))
 }
 

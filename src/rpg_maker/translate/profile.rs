@@ -6,11 +6,22 @@ use std::time::Duration;
 
 use crate::language::{LanguageModule, LanguagePair};
 
+/// RPG Maker 翻译响应必须遵循的受信外层协议。
+///
+/// 该模式与已装配的 system prompt 共同建立，Planner 与 Executor 必须通过同一份
+/// 已解析资源消费它，避免提示词要求与响应解析发生偏离。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationResponseEnvelope {
+    JsonOnly,
+    ThinkingThenJson,
+}
+
 /// 一个 RPG Maker system prompt 及其唯一适用的规范语言对。
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct RpgMakerSystemPrompt {
     language_pair: LanguagePair,
     markdown: String,
+    response_envelope: TranslationResponseEnvelope,
 }
 
 impl fmt::Debug for RpgMakerSystemPrompt {
@@ -19,6 +30,7 @@ impl fmt::Debug for RpgMakerSystemPrompt {
             .debug_struct("RpgMakerSystemPrompt")
             .field("language_pair", &self.language_pair)
             .field("markdown", &"[REDACTED]")
+            .field("response_envelope", &self.response_envelope)
             .finish()
     }
 }
@@ -27,13 +39,15 @@ impl RpgMakerSystemPrompt {
     pub(crate) fn new(
         language_pair: LanguagePair,
         markdown: String,
+        response_envelope: TranslationResponseEnvelope,
     ) -> Result<Self, RpgMakerSystemPromptError> {
         if markdown.trim().is_empty() {
-            return Err(RpgMakerSystemPromptError::Blank { language_pair });
+            return Err(RpgMakerSystemPromptError::Blank);
         }
         Ok(Self {
             language_pair,
             markdown,
+            response_envelope,
         })
     }
 
@@ -44,23 +58,22 @@ impl RpgMakerSystemPrompt {
     pub(crate) fn markdown(&self) -> &str {
         &self.markdown
     }
+
+    pub(crate) const fn response_envelope(&self) -> TranslationResponseEnvelope {
+        self.response_envelope
+    }
 }
 
 /// Prompt 文件内容无法建立为受信 RPG Maker system prompt。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpgMakerSystemPromptError {
-    Blank { language_pair: LanguagePair },
+    Blank,
 }
 
 impl fmt::Display for RpgMakerSystemPromptError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Blank { language_pair } => write!(
-                formatter,
-                "语言对 {} -> {} 的 RPG Maker system prompt 为空",
-                language_pair.source(),
-                language_pair.target()
-            ),
+            Self::Blank => formatter.write_str("RPG Maker system prompt 为空"),
         }
     }
 }
@@ -259,18 +272,31 @@ mod tests {
 
     #[test]
     fn prompt_binds_non_blank_markdown_to_one_exact_language_pair() {
-        let prompt = RpgMakerSystemPrompt::new(language_pair(), "# 完整提示词".to_owned())
-            .expect("非空提示词合法");
+        let prompt = RpgMakerSystemPrompt::new(
+            language_pair(),
+            "# 完整提示词".to_owned(),
+            TranslationResponseEnvelope::ThinkingThenJson,
+        )
+        .expect("非空提示词合法");
         assert_eq!(prompt.language_pair(), &language_pair());
         assert_eq!(prompt.markdown(), "# 完整提示词");
-
         assert_eq!(
-            RpgMakerSystemPrompt::new(language_pair(), " \n".to_owned())
-                .expect_err("空白提示词必须失败"),
-            RpgMakerSystemPromptError::Blank {
-                language_pair: language_pair(),
-            }
+            prompt.response_envelope(),
+            TranslationResponseEnvelope::ThinkingThenJson
         );
+        let debug = format!("{prompt:?}");
+        assert!(debug.contains("ThinkingThenJson"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("# 完整提示词"));
+
+        let error = RpgMakerSystemPrompt::new(
+            language_pair(),
+            " \n".to_owned(),
+            TranslationResponseEnvelope::JsonOnly,
+        )
+        .expect_err("空白提示词必须失败");
+        assert_eq!(error, RpgMakerSystemPromptError::Blank);
+        assert_eq!(error.to_string(), "RPG Maker system prompt 为空");
     }
 
     #[test]
@@ -307,11 +333,20 @@ mod tests {
             JapaneseResidualPolicy::new(non_zero(1), Vec::new()).expect("测试日文策略合法"),
             None,
         ));
-        let prompt = RpgMakerSystemPrompt::new(language_pair(), "system".to_owned()).unwrap();
+        let prompt = RpgMakerSystemPrompt::new(
+            language_pair(),
+            "system".to_owned(),
+            TranslationResponseEnvelope::JsonOnly,
+        )
+        .unwrap();
         let resources = ResolvedRpgMakerTranslationResources::new(prompt, Arc::clone(&module));
 
         assert_eq!(resources.language_pair(), &language_pair());
         assert_eq!(resources.system_prompt().markdown(), "system");
+        assert_eq!(
+            resources.system_prompt().response_envelope(),
+            TranslationResponseEnvelope::JsonOnly
+        );
         assert!(Arc::ptr_eq(&resources.source_language(), &module));
     }
 }
