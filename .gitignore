@@ -4,3 +4,4 @@
 /测试集/
 /config.toml
 **/*.rs.bk
+/dist/
