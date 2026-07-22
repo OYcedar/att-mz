@@ -120,22 +120,22 @@ user message 是最小 Markdown 载荷，只包含实际命中术语、活动 ID
 
 <!-- att-example: illustrative -->
 ```markdown
-术语：
+Terminology:
 
 - 星港 → 星港
 
-## 对话
+## Dialogue
 
-说话人 [1]（单行）：ミレア
+Speaker [1] (single line):ミレア
 
-正文 [2]（自由断行）：
+Body [2] (free line breaking):
 
 > 潮風が強くなってきました。
 > 灯台へ戻りましょう。
 
-## 选项
+## Choices
 
-选项 [3]（2 项，逐项对应）：
+Choices [3] (2 items, corresponding item by item):
 
 > 戻る
 > 進む
@@ -166,9 +166,9 @@ wire、ID、行形状、空槽、ATT token 和响应信封约束。Planner 与 E
 Standard 响应必须提供当前 TaskBlock 的每个 ID 恰好一次，不能缺失、重复或增加 ID。
 Value/Lines 形状必须符合角色：
 
-- Speaker 和严格单行字段是一条非空候选；
-- 自由断行 Value 可由多模型行组成，最终以 LF 连接；
-- Choices 和严格 ScrollingText 必须与源 Lines 数量逐项对应并保持空槽；
+- Speaker 和形状为 `single line` 的严格字段是一条非空候选；
+- `free line breaking` Value 可由多模型行组成，最终以 LF 连接；
+- Choices 和严格 ScrollingText 必须与源 Lines 按槽对齐并保持空槽；
 - 每个结构行拒绝 CR、LF、NUL 和非法空白形状。
 
 候选随后执行：BOM/全空白检查、ATT token 数量与对齐检查、占位符无歧义恢复、目标自然

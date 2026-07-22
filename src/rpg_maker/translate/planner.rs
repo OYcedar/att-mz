@@ -864,7 +864,7 @@ fn render_group(seed: PreparedTaskGroup, first_active_id: usize) -> RenderedGrou
         if is_useful_context(unit, seed.kind, active_dialogue_body, active_database_value) {
             markdown.push('\n');
             markdown.push_str(human_context_label(unit.identity.role()));
-            markdown.push('：');
+            markdown.push(':');
             markdown.push_str(&context_text(unit));
             markdown.push('\n');
         }
@@ -961,8 +961,8 @@ fn context_text(unit: &PreparedUnit) -> String {
 
 fn human_context_label(role: &TextUnitRole) -> &'static str {
     match role {
-        TextUnitRole::DialogueSpeaker => "说话人",
-        TextUnitRole::Scalar(_) => "名称",
+        TextUnitRole::DialogueSpeaker => "Speaker",
+        TextUnitRole::Scalar(_) => "Name",
         TextUnitRole::DialogueBody | TextUnitRole::Choices | TextUnitRole::ScrollingText => {
             unreachable!("只有说话人和数据库名称可以作为无编号语境")
         }
@@ -972,34 +972,41 @@ fn human_context_label(role: &TextUnitRole) -> &'static str {
 fn render_active_unit(markdown: &mut String, id: usize, unit: &PreparedUnit) {
     match unit.identity.role() {
         TextUnitRole::DialogueSpeaker => {
-            markdown.push_str(&format!("说话人 [{id}]（单行）：{}\n", unit.protected_text));
+            markdown.push_str(&format!(
+                "Speaker [{id}] (single line):{}\n",
+                unit.protected_text
+            ));
         }
         TextUnitRole::DialogueBody => {
-            markdown.push_str(&format!("正文 [{id}]（自由断行）：\n\n"));
+            markdown.push_str(&format!("Body [{id}] (free line breaking):\n\n"));
             push_blockquote(markdown, &unit.protected_text);
         }
         TextUnitRole::Choices => {
             let count = source_line_count(&unit.identity);
-            markdown.push_str(&format!("选项 [{id}]（{count} 项，逐项对应）：\n\n"));
+            markdown.push_str(&format!(
+                "Choices [{id}] ({count} items, corresponding item by item):\n\n"
+            ));
             push_blockquote(markdown, &unit.protected_text);
         }
         TextUnitRole::ScrollingText => {
             let count = source_line_count(&unit.identity);
-            markdown.push_str(&format!("滚动文本 [{id}]（{count} 行，逐行对应）：\n\n"));
+            markdown.push_str(&format!(
+                "Scrolling Text [{id}] ({count} lines, corresponding line by line):\n\n"
+            ));
             push_blockquote(markdown, &unit.protected_text);
         }
         TextUnitRole::Scalar(_)
             if expected_line_shape(&unit.identity) == ExpectedLineShape::Reflow =>
         {
             markdown.push_str(&format!(
-                "{} [{id}]（自由断行）：\n\n",
+                "{} [{id}] (free line breaking):\n\n",
                 human_scalar_label(&unit.field_name)
             ));
             push_blockquote(markdown, &unit.protected_text);
         }
         TextUnitRole::Scalar(_) => {
             markdown.push_str(&format!(
-                "{} [{id}]（单行）：{}\n",
+                "{} [{id}] (single line):{}\n",
                 human_scalar_label(&unit.field_name),
                 unit.protected_text
             ));
@@ -1009,11 +1016,11 @@ fn render_active_unit(markdown: &mut String, id: usize, unit: &PreparedUnit) {
 
 fn human_scalar_label(field_name: &str) -> &str {
     match field_name {
-        "name" => "名称",
-        "displayName" => "地图名称",
-        "nickname" => "昵称",
-        "profile" => "简介",
-        "description" => "说明",
+        "name" => "Name",
+        "displayName" => "Map Name",
+        "nickname" => "Nickname",
+        "profile" => "Profile",
+        "description" => "Description",
         _ => field_name,
     }
 }
@@ -1188,7 +1195,7 @@ fn render_user_markdown(
         .map(|(_, entry)| entry)
         .collect::<Vec<_>>();
     if !terms.is_empty() {
-        markdown.push_str("术语：\n\n");
+        markdown.push_str("Terminology:\n\n");
         for entry in terms {
             markdown.push_str("- ");
             push_markdown_literal(&mut markdown, entry.term());
@@ -1277,14 +1284,14 @@ impl UnindexedTask {
 
 const fn human_group_kind(kind: TextGroupKind) -> &'static str {
     match kind {
-        TextGroupKind::DatabaseEntry => "数据库文本",
-        TextGroupKind::System => "系统文本",
-        TextGroupKind::Map => "地图文本",
-        TextGroupKind::EventDialogue => "对话",
-        TextGroupKind::EventChoices => "选项",
-        TextGroupKind::EventScrollingText => "滚动文本",
-        TextGroupKind::EventCommand => "事件命令",
-        TextGroupKind::PluginParameter => "插件参数",
+        TextGroupKind::DatabaseEntry => "Database Text",
+        TextGroupKind::System => "System Text",
+        TextGroupKind::Map => "Map Text",
+        TextGroupKind::EventDialogue => "Dialogue",
+        TextGroupKind::EventChoices => "Choices",
+        TextGroupKind::EventScrollingText => "Scrolling Text",
+        TextGroupKind::EventCommand => "Event Command",
+        TextGroupKind::PluginParameter => "Plugin Parameters",
     }
 }
 
@@ -1538,6 +1545,52 @@ mod tests {
     }
 
     impl Error for FakeError {}
+
+    #[test]
+    fn prompt_protocol_uses_canonical_english_labels() {
+        assert_eq!(
+            [
+                TextGroupKind::DatabaseEntry,
+                TextGroupKind::System,
+                TextGroupKind::Map,
+                TextGroupKind::EventDialogue,
+                TextGroupKind::EventChoices,
+                TextGroupKind::EventScrollingText,
+                TextGroupKind::EventCommand,
+                TextGroupKind::PluginParameter,
+            ]
+            .map(human_group_kind),
+            [
+                "Database Text",
+                "System Text",
+                "Map Text",
+                "Dialogue",
+                "Choices",
+                "Scrolling Text",
+                "Event Command",
+                "Plugin Parameters",
+            ]
+        );
+        for (field_name, expected) in [
+            ("name", "Name"),
+            ("displayName", "Map Name"),
+            ("nickname", "Nickname"),
+            ("profile", "Profile"),
+            ("description", "Description"),
+        ] {
+            assert_eq!(human_scalar_label(field_name), expected);
+        }
+        assert_eq!(
+            human_context_label(&TextUnitRole::DialogueSpeaker),
+            "Speaker"
+        );
+        assert_eq!(
+            human_context_label(&TextUnitRole::Scalar(
+                ScalarFieldKey::new("name").expect("测试字段键应合法")
+            )),
+            "Name"
+        );
+    }
 
     impl LlmClientSemanticIdentity for () {
         fn semantic_fingerprint(&self) -> Sha256Fingerprint {
@@ -1957,8 +2010,9 @@ mod tests {
             "# System\n完整且由外部提供。"
         );
         let user = tasks[0].messages()[1].content();
+        assert!(user.starts_with("Terminology:\n\n"));
         assert!(user.contains("- 魔法剣 → 魔法之剑"));
-        assert!(user.contains("名称 [1]（单行）："));
+        assert!(user.contains("Name [1] (single line):"));
         assert!(!user.contains("source_language"));
         assert!(!user.contains("target_language"));
         assert!(!user.contains("data/Items.json"));
@@ -2087,34 +2141,34 @@ mod tests {
         assert_eq!(
             user,
             concat!(
-                "## 滚动文本\n",
+                "## Scrolling Text\n",
                 "\n",
-                "滚动文本 [1]（3 行，逐行对应）：\n",
+                "Scrolling Text [1] (3 lines, corresponding line by line):\n",
                 "\n",
                 "> 制作\n",
                 "> \n",
                 "> 終わり\n",
                 "\n",
-                "## 选项\n",
+                "## Choices\n",
                 "\n",
-                "选项 [2]（2 项，逐项对应）：\n",
+                "Choices [2] (2 items, corresponding item by item):\n",
                 "\n",
                 "> はい\n",
                 "> いいえ\n",
                 "\n",
-                "## 对话\n",
+                "## Dialogue\n",
                 "\n",
-                "说话人 [3]（单行）：アリス\n",
+                "Speaker [3] (single line):アリス\n",
                 "\n",
-                "正文 [4]（自由断行）：\n",
+                "Body [4] (free line breaking):\n",
                 "\n",
                 "> 今日はいい天気ですね。\n",
                 "> 一緒に町へ\n",
                 "> 行きませんか？\n",
                 "\n",
-                "## 地图文本\n",
+                "## Map Text\n",
                 "\n",
-                "地图名称 [5]（单行）：始まりの町\n",
+                "Map Name [5] (single line):始まりの町\n",
             )
         );
     }
@@ -2209,10 +2263,10 @@ mod tests {
         assert_eq!(tasks[0].expected_outputs().len(), 1);
         assert_eq!(tasks[0].expected_outputs()[0].id(), 1);
         let user = tasks[0].messages()[1].content();
-        assert!(user.contains("说话人：爱丽丝"));
-        assert!(!user.contains("说话人 ["));
+        assert!(user.contains("Speaker:爱丽丝"));
+        assert!(!user.contains("Speaker ["));
         assert!(!user.contains("アリス"));
-        assert!(user.contains("正文 [1]（自由断行）："));
+        assert!(user.contains("Body [1] (free line breaking):"));
     }
 
     #[test]

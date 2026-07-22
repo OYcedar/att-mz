@@ -284,18 +284,23 @@ fn external_prompt_locales_preserve_the_same_machine_contract() {
             "{locale}/thinking.md 不允许模板变量"
         );
 
-        let combined = format!("{system}\n{thinking}");
-        for literal in [
-            "JSON",
-            "[ID]",
-            "<why>",
-            "</why>",
-            "ATT token",
-            "单行",
-            "自由断行",
-            "逐行对应",
-            "逐项对应",
+        for shape_literal in [
+            "single line",
+            "free line breaking",
+            "N lines, corresponding line by line",
+            "N items, corresponding item by item",
         ] {
+            assert!(
+                system.contains(shape_literal),
+                "{locale}/system.md 缺少形状协议字面量 {shape_literal:?}"
+            );
+            assert!(
+                thinking.contains(shape_literal),
+                "{locale}/thinking.md 缺少形状协议字面量 {shape_literal:?}"
+            );
+        }
+        let combined = format!("{system}\n{thinking}");
+        for literal in ["JSON", "[ID]", "<why>", "</why>", "ATT token"] {
             assert!(
                 combined.contains(literal),
                 "{locale} Prompt 资源缺少协议字面量 {literal:?}"

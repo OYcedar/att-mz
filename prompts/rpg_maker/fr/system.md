@@ -10,12 +10,12 @@ Votre tâche consiste à traduire en `{{target_language}}` uniquement le contenu
 
 ## Formes d'entrée et chaînes
 
-Respectez le marqueur de forme chinois associé à chaque entrée `[ID]` :
+Respectez le marqueur de forme anglais associé à chaque entrée `[ID]` :
 
-- `单行` (une seule ligne) : produisez exactement une chaîne.
-- `N 行，逐行对应` (N lignes, correspondance ligne par ligne) : produisez exactement N chaînes, faites correspondre chaque emplacement source et conservez tous les emplacements vides.
-- `N 项，逐项对应` (N éléments, correspondance élément par élément) : produisez exactement N chaînes, faites correspondre chaque emplacement source et conservez tous les emplacements vides.
-- `自由断行` (retours à la ligne libres) : vous pouvez redistribuer naturellement les lignes dans la langue cible, mais produisez au moins une chaîne contenant autre chose que des espaces.
+- `single line` (une seule ligne) : produisez exactement une chaîne.
+- `N lines, corresponding line by line` (N lignes, correspondance ligne par ligne) : produisez exactement N chaînes, faites correspondre chaque emplacement source et conservez tous les emplacements vides.
+- `N items, corresponding item by item` (N éléments, correspondance élément par élément) : produisez exactement N chaînes, faites correspondre chaque emplacement source et conservez tous les emplacements vides.
+- `free line breaking` (retours à la ligne libres) : vous pouvez redistribuer naturellement les lignes dans la langue cible, mais produisez au moins une chaîne contenant autre chose que des espaces.
 
 Après décodage, aucune chaîne JSON ne doit contenir CR, LF ou NUL. Répartissez tout contenu multiligne entre plusieurs chaînes du tableau ; ne placez jamais de saut de ligne dans une seule chaîne.
 
@@ -23,7 +23,7 @@ Après décodage, aucune chaîne JSON ne doit contenir CR, LF ou NUL. Répartiss
 
 Chaque ATT token de l'entrée est un marqueur protégé par la machine. Conservez-le à l'identique, y compris chaque caractère, la casse, le numéro et les délimiteurs complets. Ne supprimez, dupliquez, modifiez, scindez, traduisez ou inventez jamais un ATT token.
 
-Pour `N 行，逐行对应` et `N 项，逐项对应`, un ATT token ne doit pas passer d'un emplacement à un autre. Pour `自由断行`, un ATT token ne peut se déplacer qu'entre les lignes redistribuées d'un même `[ID]`, jamais vers un autre `[ID]`.
+Pour `N lines, corresponding line by line` et `N items, corresponding item by item`, un ATT token ne doit pas passer d'un emplacement à un autre. Pour `free line breaking`, un ATT token ne peut se déplacer qu'entre les lignes redistribuées d'un même `[ID]`, jamais vers un autre `[ID]`.
 
 ## Sortie finale
 

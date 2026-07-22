@@ -52,7 +52,8 @@ const UPDATED_SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT UPDATED: ja -> zh-Hans"
 const THINKING_PROMPT: &str = "E2E THINKING OUTPUT CONTRACT";
 const THINKING_SENTINEL: &str = "e2e-private-thinking-sentinel";
 const JS_MARKER: &str = "/* ATT MZ process e2e */";
-const EXPECTED_USER_MESSAGE: &str = "## 数据库文本\n\n说明 [1]（自由断行）：\n\n> 薬草です\n";
+const EXPECTED_USER_MESSAGE: &str =
+    "## Database Text\n\nDescription [1] (free line breaking):\n\n> 薬草です\n";
 const EXTRACT_LUA: &str = "scripts/extract.lua";
 const TRANSLATE_LUA: &str = "scripts/translate.lua";
 const WRITE_BACK_LUA: &str = "scripts/write_back.lua";
@@ -3818,12 +3819,15 @@ fn assert_mixed_semantic_request(request: &CapturedRequest) {
         .as_str()
         .expect("混合 Map user message 必须是 Markdown 字符串");
     let expected_fragments = [
-        format!("地图名称 [1]（单行）：{MIXED_MAP_NAME}"),
-        format!("说话人 [2]（单行）：{MIXED_SPEAKER}"),
-        "正文 [3]（自由断行）：".to_owned(),
-        format!("选项 [4]（{} 项，逐项对应）：", MIXED_CHOICES_SOURCE.len()),
+        format!("Map Name [1] (single line):{MIXED_MAP_NAME}"),
+        format!("Speaker [2] (single line):{MIXED_SPEAKER}"),
+        "Body [3] (free line breaking):".to_owned(),
         format!(
-            "滚动文本 [5]（{} 行，逐行对应）：",
+            "Choices [4] ({} items, corresponding item by item):",
+            MIXED_CHOICES_SOURCE.len()
+        ),
+        format!(
+            "Scrolling Text [5] ({} lines, corresponding line by line):",
             MIXED_SCROLLING_SOURCE.len()
         ),
     ];

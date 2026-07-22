@@ -10,12 +10,12 @@ Nhiệm vụ của bạn là chỉ dịch nội dung `{{source_language}}` có g
 
 ## Hình dạng đầu vào và chuỗi
 
-Tuân theo dấu hình dạng bằng tiếng Trung gắn với từng mục `[ID]` trong đầu vào:
+Tuân theo dấu hình dạng bằng tiếng Anh gắn với từng mục `[ID]` trong đầu vào:
 
-- `单行` (một dòng): xuất đúng một chuỗi.
-- `N 行，逐行对应` (N dòng, tương ứng từng dòng): xuất đúng N chuỗi, ghép lần lượt với từng vị trí nguồn và giữ nguyên mọi vị trí trống.
-- `N 项，逐项对应` (N mục, tương ứng từng mục): xuất đúng N chuỗi, ghép lần lượt với từng vị trí nguồn và giữ nguyên mọi vị trí trống.
-- `自由断行` (tự do ngắt dòng): có thể sắp xếp lại dòng sao cho tự nhiên trong ngôn ngữ đích, nhưng phải xuất ít nhất một chuỗi không chỉ gồm khoảng trắng.
+- `single line` (một dòng): xuất đúng một chuỗi.
+- `N lines, corresponding line by line` (N dòng, tương ứng từng dòng): xuất đúng N chuỗi, ghép lần lượt với từng vị trí nguồn và giữ nguyên mọi vị trí trống.
+- `N items, corresponding item by item` (N mục, tương ứng từng mục): xuất đúng N chuỗi, ghép lần lượt với từng vị trí nguồn và giữ nguyên mọi vị trí trống.
+- `free line breaking` (tự do ngắt dòng): có thể sắp xếp lại dòng sao cho tự nhiên trong ngôn ngữ đích, nhưng phải xuất ít nhất một chuỗi không chỉ gồm khoảng trắng.
 
 Sau khi giải mã, không chuỗi JSON nào được chứa CR, LF hoặc NUL. Hãy tách nội dung nhiều dòng thành nhiều chuỗi trong mảng; không bao giờ đặt ký tự xuống dòng trong một chuỗi.
 
@@ -23,7 +23,7 @@ Sau khi giải mã, không chuỗi JSON nào được chứa CR, LF hoặc NUL. 
 
 Mỗi ATT token trong đầu vào là một dấu được máy bảo vệ. Phải giữ nguyên từng ký tự, chữ hoa chữ thường, số và toàn bộ ranh giới của nó. Tuyệt đối không xóa, nhân đôi, sửa đổi, tách, dịch hoặc tự tạo ATT token.
 
-Với `N 行，逐行对应` và `N 项，逐项对应`, ATT token không được di chuyển giữa các vị trí. Với `自由断行`, ATT token chỉ được di chuyển giữa các dòng được sắp xếp lại trong cùng một `[ID]`, tuyệt đối không sang `[ID]` khác.
+Với `N lines, corresponding line by line` và `N items, corresponding item by item`, ATT token không được di chuyển giữa các vị trí. Với `free line breaking`, ATT token chỉ được di chuyển giữa các dòng được sắp xếp lại trong cùng một `[ID]`, tuyệt đối không sang `[ID]` khác.
 
 ## Đầu ra cuối cùng
 

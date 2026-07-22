@@ -10,12 +10,12 @@ Tu tarea es traducir a `{{target_language}}` únicamente el contenido en `{{sour
 
 ## Formas de entrada y cadenas
 
-Sigue el marcador de forma chino asociado a cada entrada con `[ID]`:
+Sigue el marcador de forma inglés asociado a cada entrada con `[ID]`:
 
-- `单行` (una sola línea): genera exactamente una cadena.
-- `N 行，逐行对应` (N líneas, correspondencia línea por línea): genera exactamente N cadenas, haz que correspondan una a una con las posiciones de origen y conserva todas las posiciones vacías.
-- `N 项，逐项对应` (N elementos, correspondencia elemento por elemento): genera exactamente N cadenas, haz que correspondan una a una con las posiciones de origen y conserva todas las posiciones vacías.
-- `自由断行` (saltos de línea libres): puedes redistribuir las líneas de forma natural en el idioma de destino, pero debes generar al menos una cadena que no sea solo espacio en blanco.
+- `single line` (una sola línea): genera exactamente una cadena.
+- `N lines, corresponding line by line` (N líneas, correspondencia línea por línea): genera exactamente N cadenas, haz que correspondan una a una con las posiciones de origen y conserva todas las posiciones vacías.
+- `N items, corresponding item by item` (N elementos, correspondencia elemento por elemento): genera exactamente N cadenas, haz que correspondan una a una con las posiciones de origen y conserva todas las posiciones vacías.
+- `free line breaking` (saltos de línea libres): puedes redistribuir las líneas de forma natural en el idioma de destino, pero debes generar al menos una cadena que no sea solo espacio en blanco.
 
 Una vez decodificada, ninguna cadena JSON puede contener CR, LF ni NUL. Divide el contenido multilínea en varias cadenas del array; nunca incluyas un salto de línea dentro de una sola cadena.
 
@@ -23,7 +23,7 @@ Una vez decodificada, ninguna cadena JSON puede contener CR, LF ni NUL. Divide e
 
 Cada ATT token de la entrada es una marca protegida por la máquina. Consérvalo literalmente, incluidos todos sus caracteres, mayúsculas y minúsculas, número y límites completos. Nunca elimines, dupliques, alteres, dividas, traduzcas ni inventes un ATT token.
 
-En `N 行，逐行对应` y `N 项，逐项对应`, un ATT token no puede moverse entre posiciones. En `自由断行`, un ATT token solo puede moverse entre líneas redistribuidas dentro del mismo `[ID]`, nunca a otro `[ID]`.
+En `N lines, corresponding line by line` y `N items, corresponding item by item`, un ATT token no puede moverse entre posiciones. En `free line breaking`, un ATT token solo puede moverse entre líneas redistribuidas dentro del mismo `[ID]`, nunca a otro `[ID]`.
 
 ## Salida final
 

@@ -56,7 +56,7 @@ owner 状态、`standard_text_group/unit`、`standard_mutation_claim` 和译文�
 ## 3. 普通值与结构化 recipe
 
 Scalar recipe 选择译文或原文，按记录的解码边界反向编码，并只修改对应物理目标。
-未翻译单元保持原文；Literal 和结构外壳逐字保留。自由断行的 Scalar 把模型行以 `\n`
+未翻译单元保持原文；Literal 和结构外壳逐字保留。形状标记为 `free line breaking` 的 Scalar 把模型行以 `\n`
 连接后写回；当前只包括 Actor profile 及 Skills、Items、Weapons、Armors description。
 所有候选修改先在
 内存中完成形状验证，再写入目标文档；同一文档只在全部关联修改成功后编码。

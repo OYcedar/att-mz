@@ -10,12 +10,12 @@ Your task is to translate only the `{{source_language}}` content marked with `[I
 
 ## Input shapes and strings
 
-Follow the Chinese shape marker attached to each `[ID]` entry in the input:
+Follow the English shape marker attached to each `[ID]` entry in the input:
 
-- `单行` (single line): output exactly one string.
-- `N 行，逐行对应` (N lines, corresponding line by line): output exactly N strings, match the source slots one by one, and preserve every empty slot.
-- `N 项，逐项对应` (N items, corresponding item by item): output exactly N strings, match the source slots one by one, and preserve every empty slot.
-- `自由断行` (free line breaking): you may reflow the text naturally for the target language, but output at least one non-whitespace string.
+- `single line`: output exactly one string.
+- `N lines, corresponding line by line`: output exactly N strings, match the source slots one by one, and preserve every empty slot.
+- `N items, corresponding item by item`: output exactly N strings, match the source slots one by one, and preserve every empty slot.
+- `free line breaking`: you may reflow the text naturally for the target language, but output at least one non-whitespace string.
 
 After decoding, no JSON string may contain CR, LF, or NUL. Split multiline content into separate strings in the array; never place a line break inside one string.
 
@@ -23,7 +23,7 @@ After decoding, no JSON string may contain CR, LF, or NUL. Split multiline conte
 
 Every ATT token in the input is a machine-protected marker. Preserve it verbatim, including every character, letter case, number, and boundary. Never delete, duplicate, alter, split, translate, or invent an ATT token.
 
-For `N 行，逐行对应` and `N 项，逐项对应`, an ATT token must not move between slots. For `自由断行`, an ATT token may move only between reflowed lines within the same `[ID]`, never to another `[ID]`.
+For `N lines, corresponding line by line` and `N items, corresponding item by item`, an ATT token must not move between slots. For `free line breaking`, an ATT token may move only between reflowed lines within the same `[ID]`, never to another `[ID]`.
 
 ## Final output
 

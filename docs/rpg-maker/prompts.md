@@ -113,29 +113,30 @@ user message 不是 JSON，也不是 ATT 的内部领域对象。它只携带模
 传播目标和去重原因不会重复写入 user message；翻译方向由模板渲染后的 system message
 建立。
 
-Planner 生成的标题、字段标签和形状说明继续使用中文。所有本地化 Prompt 都必须保留并
-解释协议字面量 `单行`、`自由断行`、`逐行对应`、`逐项对应`，不能假设这些标签会随
-Prompt locale 一起本地化。翻译内容本身的语言由项目语言对建立，不能根据中文标签推断。
+Planner 生成的标题、字段标签和形状说明统一使用英文。所有本地化 Prompt 都必须保留并
+解释协议字面量 `single line`、`free line breaking`、
+`N lines, corresponding line by line`、`N items, corresponding item by item`。这些固定文本
+不随 Prompt locale 本地化；翻译内容本身的语言只由项目语言对建立，不能根据英文标签推断。
 
 一个任务通常形如：
 
 ```markdown
-术语：
+Terminology:
 
 - 星港 → 星港
 
-## 对话
+## Dialogue
 
-说话人：米蕾雅
+Speaker:米蕾雅
 
-正文 [1]（自由断行）：
+Body [1] (free line breaking):
 
 > 第一行⟦ATT_ICON_WHOLE_0000⟧
 > 第二行
 
-## 选项
+## Choices
 
-选项 [2]（3 项，逐项对应）：
+Choices [2] (3 items, corresponding item by item):
 
 > 返回
 >
@@ -149,8 +150,8 @@ Prompt locale 一起本地化。翻译内容本身的语言由项目语言对建
 ID 只在当前 TaskBlock 中有效，从 `1` 连续编号；下一个 TaskBlock 会重新从 `1` 开始。
 字段标签不是封闭枚举，模型应以“是否带 `[ID]`”和括号中的形状标记判断输出责任。
 
-多行、逐项对应和自由断行内容使用 `> ` 作为 Markdown blockquote 前缀；前缀不属于
-原文，只有 `> ` 的行表示空槽。单行内容直接出现在冒号后。输出不得复制标题、标签、
+多行、逐项严格对齐及允许重排换行的内容使用 `> ` 作为 Markdown blockquote 前缀；前缀
+不属于原文，只有 `> ` 的行表示空槽。`single line` 内容直接出现在冒号后。输出不得复制标题、标签、
 `[ID]`、形状说明或 `> ` 前缀，只返回 ID 到译文字符串数组的映射。
 
 ## 5. 翻译要求与四种输出形状
@@ -163,16 +164,16 @@ ID 只在当前 TaskBlock 中有效，从 `1` 连续编号；下一个 TaskBlock
 
 | 输入标记 | JSON 数组要求 | 额外硬限制 |
 |---|---|---|
-| `单行` | 恰好一个字符串 | 源槽非空时，译文不能是空串或纯空白 |
-| `N 行，逐行对应` | 恰好 `N` 个字符串 | 与源行逐槽对应，并保持空槽位置 |
-| `N 项，逐项对应` | 恰好 `N` 个字符串 | 与源项逐槽对应，并保持空槽位置 |
-| `自由断行` | 可以按目标语言自然表达重新断行 | 整个数组至少有一个非空白字符串 |
+| `single line` | 恰好一个字符串 | 源槽非空时，译文不能是空串或纯空白 |
+| `N lines, corresponding line by line` | 恰好 `N` 个字符串 | 与源行逐槽对应，并保持空槽位置 |
+| `N items, corresponding item by item` | 恰好 `N` 个字符串 | 与源项逐槽对应，并保持空槽位置 |
+| `free line breaking` | 可以按目标语言自然表达重新断行 | 整个数组至少有一个非空白字符串 |
 
 所有数组元素都必须是 JSON 字符串，解码后不能包含 CR、LF 或 NUL。需要多行时必须拆成
 多个数组元素；把换行写进一个字符串，即使 JSON 语法有效，也会使该 ID 被拒绝。
 
 严格对齐的源空槽必须对应精确空字符串 `""`，不能是 `" "`；源槽非空时，对应输出
-不能是空字符串或纯空白。自由断行不要求保持原行数。去除 ATT token 等受保护片段后，
+不能是空字符串或纯空白。`free line breaking` 不要求保持原行数。去除 ATT token 等受保护片段后，
 候选还必须包含非空白自然语言文本；只返回 token 或其他不透明片段也会被拒绝。
 
 ## 6. 响应信封模式
@@ -251,7 +252,7 @@ JSON 根成功后，以下问题只拒绝对应 ID：
 | ID 缺失 | `Missing` |
 | 同一 ID 出现多次 | `Duplicate` |
 | value 不是数组，或数组中含非字符串 | 形状无效 |
-| 单行或严格对齐数组长度错误 | 行数不匹配 |
+| `single line` 或严格对齐数组长度错误 | 行数不匹配 |
 | 字符串含 CR、LF 或 NUL | 结构行无效 |
 | 空槽位置错误，或非空槽只返回空白 | 空白形状不匹配 |
 | ATT token 丢失、重复、损坏、未知或跨严格槽移动 | Placeholder/ATT token 验收失败 |
@@ -280,7 +281,7 @@ user message 中可能出现：
 - 不删除、复制、改写、拆开、创造或翻译 token；
 - 不输出输入中不存在的未知或残缺 `⟦ATT_...` 内容。
 
-严格对齐条目按对应槽分别校验 token，因此 token 不能跨行或跨项移动。自由断行条目按
+严格对齐条目按对应槽分别校验 token，因此 token 不能跨行或跨项移动。允许重排换行的条目按
 整个 ID 校验 token 多重集，只允许 token 在同一 ID 的输出行之间随自然表达移动，不能
 跨 ID 移动。
 
@@ -309,7 +310,8 @@ user message 中可能出现：
 
 - `{{source_language}}` 与 `{{target_language}}`；
 - JSON、`[ID]`、`<why>`、`</why>`、ATT token 等协议字面量；
-- Planner 当前中文输入标记 `单行`、`自由断行`、`逐行对应`、`逐项对应`；
+- Planner 的英文输入标记 `single line`、`free line breaking`、
+  `N lines, corresponding line by line`、`N items, corresponding item by item`；
 - 两种信封的选择条件、ID/数组/空槽/token 规则以及 JSON 终止边界。
 
 可以微调的是翻译风格、表达提示和本地语言说明；不能增加模板变量、改变资源布局、要求
@@ -326,13 +328,13 @@ reasoning/thinking 参数；这些参数仍完全属于所选 Client 的受信 `
 - 两类文件保留相同协议字面量和 `<why>` 边界；
 - system Prompt 只把带 `[ID]` 的源语言内容翻译为目标语言；
 - JSON 中每个实际 ID 恰好一次，value 只能是字符串数组；
-- `单行`、严格逐行、严格逐项和自由断行分别遵守自己的形状与空槽规则；
+- `single line`、严格逐行、严格逐项和 `free line breaking` 分别遵守自己的形状与空槽规则；
 - JSON 字符串不含 CR、LF 或 NUL，ATT token 按形状逐字保留；
 - JsonOnly 直接输出 JSON，ThinkingThenJson 恰好输出一组非空 `<why>` 后接 JSON；
 - 最终 JSON 后没有任何内容。
 
-验证样本至少覆盖无术语、存在术语、无 ID 语境、单行、自由断行、带空槽的严格对齐、
-多个 ATT token，以及合法/非法思考信封。只测试一个单行 JSON 不能证明完整契约。
+验证样本至少覆盖无术语、存在术语、无 ID 语境、`single line`、`free line breaking`、带空槽的
+严格对齐、多个 ATT token，以及合法/非法思考信封。只测试一个单字符串 JSON 不能证明完整契约。
 
 任务输入的规划事实和结果状态见[翻译现行规格](translation.md#5-任务规划与模型消息)，
 ATT token 的来源与恢复规则见[规则编写指南](rules.md#6-placeholder-rules)，术语资源见
