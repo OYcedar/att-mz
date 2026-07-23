@@ -15,6 +15,8 @@ pub(crate) use super::model::{
 };
 
 pub(crate) mod asset_store;
+#[cfg(test)]
+pub(crate) use asset_store::RpgMakerExtractionAssetStoreError;
 
 /// Builtin 快照与 MV 对话定义在同一事务中的更新意图。
 ///

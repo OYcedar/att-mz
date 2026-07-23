@@ -134,6 +134,19 @@ impl<E> SqliteInteractiveSessionFinalizationError<E> {
             connection_close: connection_close.map(Box::new),
         }
     }
+
+    pub(crate) fn primary(&self) -> &SqliteInteractiveSessionFinalizationFailure<E> {
+        self.primary.as_ref()
+    }
+
+    pub(crate) fn connection_close(&self) -> Option<&E> {
+        self.connection_close.as_deref()
+    }
+
+    /// 消费收尾错误，保留主失败与连接关闭失败两个独立原因。
+    pub(crate) fn into_parts(self) -> (SqliteInteractiveSessionFinalizationFailure<E>, Option<E>) {
+        (*self.primary, self.connection_close.map(|source| *source))
+    }
 }
 
 impl<E: fmt::Display> fmt::Display for SqliteInteractiveSessionFinalizationError<E> {

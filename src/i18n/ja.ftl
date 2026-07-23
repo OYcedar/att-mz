@@ -50,21 +50,6 @@ cli-argument-conflict = { $argument } は指定済みのほかの引数と同時
 cli-wrong-number-of-values = { $argument } に指定された値の数が正しくありません。
 cli-invalid-utf8 = コマンドライン引数が有効な Unicode ではありません。
 cli-parse-failure = コマンドラインを解析できませんでした。
-error-configuration-or-input-generic = 設定またはコマンド入力が無効なため、変更は行われませんでした。示されたオプションと設定フィールドを確認して再試行してください。
-error-config-current-directory-not-absolute = 現在の作業ディレクトリ { $path } が絶対パスではないため、ATT は --config を解決できません。有効なディレクトリから ATT を起動するか、設定の絶対パスを指定してください。
-error-config-empty-path = --config を空にはできません。ATT 設定ファイルのパスを指定してください。
-error-config-open = 設定ファイル { $path } を開けません。ファイルの存在と読み取り権限を確認してください。
-error-config-not-a-file = 設定パス { $path } は通常ファイルではありません。ディレクトリや特殊ファイルではなく設定ファイルを指定してください。
-error-config-too-large = 設定ファイル { $path } は { $observed } バイトで、上限は { $maximum } バイトです。ファイルを小さくして再試行してください。
-error-config-read = 設定ファイル { $path } を読み取れません。権限とストレージの状態を確認して再試行してください。
-error-config-invalid-utf8-known-length = 設定ファイル { $path } は有効な UTF-8 ではありません。有効な接頭部は { $valid } バイト、不正なシーケンスは { $length } バイトです。UTF-8 で保存して再試行してください。
-error-config-invalid-utf8-unknown-length = 設定ファイル { $path } は { $valid } バイト目以降が有効な UTF-8 ではありません。UTF-8 で保存して再試行してください。
-error-config-invalid-toml-at = 設定ファイル { $path } の { $line } 行 { $column } 列にある { $resource } の TOML が無効です。現在の設定契約に従って修正し、再試行してください。
-error-config-invalid-toml = 設定ファイル { $path } の { $resource } に無効な TOML があります。現在の設定契約に従って修正し、再試行してください。
-error-config-invalid-value = 設定フィールド { $field } の値が無効です。現在の設定ドキュメントを確認して修正し、再試行してください。
-error-config-invalid-value-at-path = 設定ファイル { $path } のフィールド { $field } の値が無効です。現在の設定ドキュメントを確認して修正し、再試行してください。
-error-config-profile-not-found = 設定ファイル { $path } に { $profile } という翻訳 Profile がありません。追加するか、既存 Profile の ID を指定してください。
-error-config-profile-conflict = 設定ファイル { $path } は Profile { $requested } を要求していますが、コマンドでは { $explicit } が選択済みです。両方を同じ Profile にするか、一方の選択を削除してください。
 log-label-phase-check-project = プロジェクト確認
 log-label-phase-scan-source = ソース走査
 log-label-phase-prepare-candidate = 候補準備
@@ -84,19 +69,7 @@ log-label-task-complete = 完了
 log-label-task-partial = 一部利用可能
 log-label-task-unavailable = 利用不可
 log-label-task-failed = 失敗
-error-project-unavailable = プロジェクトが存在しないか使用中です。名前を確認し、ほかの実行が終わってから再試行してください。
-error-project-state = プロジェクト状態が破損しているか抽出が古くなっています。該当する Init または Extract を再実行してください。
-error-external-model = モデルサービスを利用できません。Profile とネットワークを確認して再試行してください。
 error-state-applied-finalization = 結果は反映されましたが、終了処理に失敗しました。再試行前にプロジェクト状態を確認してください。
-error-outcome-unknown = 最終結果を確認できません。作業領域を保持し、復旧情報を確認してから再試行してください。
-error-internal = ATT で内部障害が発生しました。秘密情報やモデル内容は表示されていません。
-error-shutdown = 必須のランタイム終了処理に失敗しました。
-error-no-reusable-extract-plan = このプロジェクトには保存済み Extract プランがありません。--builtin、--rules、--lua のいずれかを指定してください。
-error-init-path-required = このプロジェクトには保存済み Init 元パスがありません。--path <DIR> を指定してください。
-error-profile-required = このプロジェクトには保存済み Translate Profile がありません。PROFILE_ID を指定してください。
-error-saved-profile-unavailable = 保存済み Profile { $profile } は現在の設定にありません。有効な Profile を明示してください。
-error-rpg-maker-prompt-unavailable = 選択された locale { $locale } の RPG Maker プロンプトコンポーネント { $component }（{ $path }）を使用できないため、翻訳は開始されていません。パスが通常ファイルを指し、内容が空でない UTF-8 テキストで、テンプレートが有効であることを確認してください。
-error-rpg-maker-language-module-unavailable = { $source } → { $target } に必要な原文言語モジュールがないため、翻訳は開始されていません。現在の設定にモジュールを追加してから再試行してください。
 error-no-executable-extract-owner = 消去後に実行可能な Extract owner がないため、プランは保存されませんでした。
 error-plan-save-failed-applied = コマンド結果は反映されましたが、新しい実行プランは保存されませんでした。次回は意図したオプションを明示してください。
 error-plan-save-outcome-unknown = コマンド結果は反映されましたが、実行プランのコミット結果を確認できません。次回は意図したオプションを明示してください。
@@ -157,14 +130,56 @@ result-translate-plan-sources = 今回成功した実行プランを保存しま
 log-run-started = コマンド { $command } を開始しました。
 log-run-succeeded = コマンド { $command } は正常に完了しました。
 log-run-failed = コマンド { $command } に失敗しました。
+log-run-outcome-unknown = コマンド { $command } は終了しましたが、最終結果は不明です。エラーに示された復旧場所を確認してください。
 log-run-cancelled = コマンド { $command } をキャンセルしました。
+log-performance-counters = パフォーマンスカウンター：SQLite トランザクション制御の試行 { $sqlite_control_attempted_total } 回、候補ツリー全体の検証開始 { $candidate_validation_started } 回、完了 { $candidate_validation_completed } 回。
 log-plan-resolved = コマンド { $command } のプラン元: { $source }。
-log-translate-plan-resolved = Translate 実行プランを解決しました。Profile の指定元: { $profile_source }、Lua の指定元: { $lua_source }。
 log-phase-started = フェーズ開始: { $phase }。
 log-phase-finished = フェーズ完了: { $phase }。
 log-retry-summary = { $count } 回再試行しました。
 log-no-work = 作業は不要でした: { $reason }。
+log-no-work-translation-up-to-date = 翻訳は現在のソースとプロファイルに一致しています
 log-partial-result = 注意が必要な部分結果が { $count } 件あります。
-log-publish-finished = 出力の公開が完了しました: { $path }。
 log-translation-task-started = 翻訳タスク { $index }/{ $total } を開始しました。
 log-translation-task-finished = 翻訳タスク { $index } は結果 { $outcome } で終了しました。
+log-translation-task-diagnostic = 翻訳タスク { $index } は { $attempts } 回の試行後に診断を報告しました: { $diagnostic }
+diagnostic-title = エラー [{ $code }]
+diagnostic-stage = 段階：{ $stage }
+diagnostic-subject = 場所：{ $subject }
+diagnostic-subject-value = { $kind ->
+    [command] コマンド { $value }
+    [field] フィールド { $value }
+    [project] プロジェクト { $value }
+    [profile] プロファイル { $value }
+    [component] コンポーネント { $value }
+   *[other] { $value }
+}
+diagnostic-reason = 原因：{ $reason }
+diagnostic-impact = 影響：{ $impact }
+diagnostic-action = 対処：{ $action }
+diagnostic-recovery = 復旧場所：{ $recovery }
+diagnostic-recovery-value = { $kind ->
+    [component] コンポーネント { $value }
+    [transaction] トランザクション { $value }
+   *[other] { $value }
+}
+diagnostic-related = 関連エラー { $index }：
+diagnostic-stage-value = { $code ->
+    [process_output] プロセス出力
+   *[other] { $fallback }
+}
+diagnostic-impact-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-action-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-failure-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-io-kind-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-configuration-rule-value = { $code ->
+   *[other] { $fallback }{ $facts }
+}

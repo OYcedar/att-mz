@@ -517,7 +517,6 @@ mod tests {
         let client = Arc::new(FakeClient("shared-client"));
         let profile = Arc::new(RpgMakerTranslationProfile::new(
             "quality-profile",
-            std::num::NonZeroUsize::new(2).expect("测试并发数必须非零"),
             RpgMakerTranslationPlanningConfiguration::new(NonZeroUsize::MIN),
             RpgMakerTranslationRequestConfiguration::new(Vec::new(), Duration::ZERO),
             Arc::clone(&client),

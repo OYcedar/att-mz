@@ -50,21 +50,6 @@ cli-argument-conflict = { $argument } 不能與目前其他引數同時使用。
 cli-wrong-number-of-values = { $argument } 的值數量不正確。
 cli-invalid-utf8 = 命令列引數不是有效 Unicode。
 cli-parse-failure = 無法解析命令列。
-error-configuration-or-input-generic = 設定或命令輸入無效，本次未作任何變更。請檢查提示中的選項與設定欄位後重試。
-error-config-current-directory-not-absolute = 目前工作目錄 { $path } 不是絕對路徑，因此無法解析 --config。請從有效目錄啟動 ATT，或傳入設定檔的絕對路徑。
-error-config-empty-path = --config 不可為空。請傳入 ATT 設定檔路徑。
-error-config-open = 無法開啟設定檔 { $path }。請確認檔案存在且目前使用者具有讀取權限。
-error-config-not-a-file = 設定路徑 { $path } 不是一般檔案。請傳入設定檔，而不是目錄或特殊檔案。
-error-config-too-large = 設定檔 { $path } 大小為 { $observed } 位元組，超過 { $maximum } 位元組上限。請縮小檔案後重試。
-error-config-read = 無法讀取設定檔 { $path }。請檢查檔案權限與儲存裝置狀態後重試。
-error-config-invalid-utf8-known-length = 設定檔 { $path } 不是有效的 UTF-8；有效前綴為 { $valid } 位元組，無效序列長度為 { $length } 位元組。請將檔案儲存為 UTF-8 後重試。
-error-config-invalid-utf8-unknown-length = 設定檔 { $path } 從第 { $valid } 位元組後不是有效的 UTF-8。請將檔案儲存為 UTF-8 後重試。
-error-config-invalid-toml-at = 設定檔 { $path } 第 { $line } 行第 { $column } 欄的 { $resource } 包含無效 TOML。請依目前設定契約修正該處後重試。
-error-config-invalid-toml = 設定檔 { $path } 的 { $resource } 包含無效 TOML。請依目前設定契約修正該處後重試。
-error-config-invalid-value = 設定欄位 { $field } 的值無效。請對照目前設定文件修正該欄位後重試。
-error-config-invalid-value-at-path = 設定檔 { $path } 中欄位 { $field } 的值無效。請對照目前設定文件修正該欄位後重試。
-error-config-profile-not-found = 設定檔 { $path } 中沒有名為 { $profile } 的翻譯 Profile。請新增該 Profile，或傳入現有 Profile 的 ID。
-error-config-profile-conflict = 設定檔 { $path } 要求使用 Profile { $requested }，但命令已選擇 { $explicit }。請統一兩處 Profile，或移除其中一處選擇。
 log-label-phase-check-project = 檢查專案
 log-label-phase-scan-source = 掃描來源
 log-label-phase-prepare-candidate = 準備候選目錄
@@ -84,19 +69,7 @@ log-label-task-complete = 完整
 log-label-task-partial = 部分可用
 log-label-task-unavailable = 無法使用
 log-label-task-failed = 失敗
-error-project-unavailable = 專案不存在或忙碌中。請檢查專案名稱，並在其他執行結束後重試。
-error-project-state = 專案狀態損壞或擷取已過期。請重新執行相關 Init 或 Extract 命令。
-error-external-model = 模型服務無法使用。請檢查 Profile 與網路後重試。
 error-state-applied-finalization = 結果已生效，但收尾失敗。重試前請先檢查專案狀態。
-error-outcome-unknown = 無法確認最終結果。請保留工作現場並檢查復原資訊後再重試。
-error-internal = ATT 遇到內部故障；終端未輸出密鑰或模型內容。
-error-shutdown = 必要執行階段收尾失敗。
-error-no-reusable-extract-plan = 此專案尚未儲存 Extract 方案。請至少提供 --builtin、--rules 或 --lua 之一。
-error-init-path-required = 此專案尚未儲存 Init 來源路徑。請提供 --path <DIR>。
-error-profile-required = 此專案尚未儲存 Translate Profile。請提供 PROFILE_ID。
-error-saved-profile-unavailable = 目前設定中不存在已儲存的 Profile { $profile }。請明確傳入有效 Profile。
-error-rpg-maker-prompt-unavailable = 無法使用所選 locale { $locale } 的 RPG Maker 提示詞元件 { $component }（{ $path }），翻譯尚未開始。請確認該路徑是一般檔案，內容為非空 UTF-8 文字，且範本有效。
-error-rpg-maker-language-module-unavailable = 缺少 { $source } → { $target } 所需的來源語言模組，翻譯尚未開始。請在目前設定中補上該模組後重試。
 error-no-executable-extract-owner = 清除後沒有可執行的 Extract owner，因此未儲存方案。
 error-plan-save-failed-applied = 命令結果已生效，但新執行方案未儲存。下次請明確傳入預期選項。
 error-plan-save-outcome-unknown = 命令結果已生效，但無法確認執行方案提交結果。下次請明確傳入預期選項。
@@ -157,14 +130,56 @@ result-translate-plan-sources = 已儲存本次成功執行方案。Profile 來�
 log-run-started = 命令 { $command } 已開始。
 log-run-succeeded = 命令 { $command } 已成功完成。
 log-run-failed = 命令 { $command } 失敗。
+log-run-outcome-unknown = 命令 { $command } 已結束，但最終結果未知；請依錯誤中的復原位置處理。
 log-run-cancelled = 命令 { $command } 已取消。
+log-performance-counters = 效能計數：SQLite 事務控制嘗試 { $sqlite_control_attempted_total } 次；完整候選樹驗證開始 { $candidate_validation_started } 次，完成 { $candidate_validation_completed } 次。
 log-plan-resolved = 命令 { $command } 的方案來自{ $source }。
-log-translate-plan-resolved = 已解析 Translate 執行方案：Profile 來源 { $profile_source }，Lua 來源 { $lua_source }。
 log-phase-started = 階段開始：{ $phase }。
 log-phase-finished = 階段完成：{ $phase }。
 log-retry-summary = 共執行 { $count } 次重試。
 log-no-work = 不需執行工作：{ $reason }。
+log-no-work-translation-up-to-date = 譯文已與目前來源和設定檔一致
 log-partial-result = 有 { $count } 個部分結果需要關注。
-log-publish-finished = 輸出發佈完成：{ $path }。
 log-translation-task-started = 翻譯工作 { $index }/{ $total } 已開始。
 log-translation-task-finished = 翻譯工作 { $index } 已結束，結果為 { $outcome }。
+log-translation-task-diagnostic = 翻譯工作 { $index } 在嘗試 { $attempts } 次後回報診斷：{ $diagnostic }
+diagnostic-title = 錯誤 [{ $code }]
+diagnostic-stage = 階段：{ $stage }
+diagnostic-subject = 位置：{ $subject }
+diagnostic-subject-value = { $kind ->
+    [command] 指令 { $value }
+    [field] 欄位 { $value }
+    [project] 專案 { $value }
+    [profile] 設定檔 { $value }
+    [component] 元件 { $value }
+   *[other] { $value }
+}
+diagnostic-reason = 原因：{ $reason }
+diagnostic-impact = 影響：{ $impact }
+diagnostic-action = 處理方式：{ $action }
+diagnostic-recovery = 復原位置：{ $recovery }
+diagnostic-recovery-value = { $kind ->
+    [component] 元件 { $value }
+    [transaction] 交易 { $value }
+   *[other] { $value }
+}
+diagnostic-related = 相關錯誤 { $index }：
+diagnostic-stage-value = { $code ->
+    [process_output] 處理程序輸出
+   *[other] { $fallback }
+}
+diagnostic-impact-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-action-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-failure-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-io-kind-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-configuration-rule-value = { $code ->
+   *[other] { $fallback }{ $facts }
+}

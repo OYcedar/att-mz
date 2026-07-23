@@ -4,6 +4,10 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, SafeDiagnostic,
+};
 use crate::execution::OperationCompletion;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::rpg_maker::RpgMakerEngine;
@@ -367,8 +371,29 @@ fn translation_semantic_error(
     kind: &'static str,
     source: ResolvedTranslationSemanticError,
 ) -> TrustedLuaHostCallError {
-    let message = source.to_string();
-    TrustedLuaHostCallError::new("translation", kind, message, None, Some(Arc::new(source)))
+    let operation = match kind {
+        "prepare" => "translation.prepare",
+        "accept" => "translation.accept",
+        _ => "translation.semantic",
+    };
+    let detail = source.safe_detail();
+    let diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::LuaExecution,
+        DiagnosticStage::Translate,
+        DiagnosticSubject::operation(operation),
+        DiagnosticReason::failure_with_detail(DiagnosticFailureKind::LuaHostCallFailed, detail),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::CheckProjectState,
+    );
+    TrustedLuaHostCallError::new(
+        "translation",
+        kind,
+        "Lua 翻译语义处理失败",
+        None,
+        Some(Arc::new(source)),
+    )
+    .with_operation(operation)
+    .with_safe_diagnostic(diagnostic)
 }
 
 #[cfg(test)]
@@ -379,6 +404,9 @@ mod tests {
     use super::*;
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::lua::LuaPhase;
+    use crate::rpg_maker::translate::executor::TranslationCandidateTechnicalError;
+    use crate::rpg_maker::translate::language_projection::LanguageTextProjectionError;
+    use crate::rpg_maker::translate::placeholder::PlaceholderProtectionError;
 
     #[derive(Debug)]
     struct FakeClient {
@@ -579,6 +607,98 @@ mod tests {
             let error = rejection_code(&PreparedTranslationRejection::Candidate(reason))
                 .expect_err("Standard 响应结构错误不属于 Lua 标量协议");
             assert_eq!(error.kind(), "internal_invariant");
+        }
+    }
+
+    #[test]
+    fn semantic_error_publishes_stable_operation_without_source_text() {
+        const SOURCE_SENTINEL: &str = "TRANSLATION_SEMANTIC_SOURCE_SENTINEL";
+        let error = translation_semantic_error(
+            "prepare",
+            ResolvedTranslationSemanticError::ProjectLanguageText(
+                LanguageTextProjectionError::MissingToken {
+                    token: SOURCE_SENTINEL.to_owned(),
+                },
+            ),
+        );
+
+        assert_eq!(error.message(), "Lua 翻译语义处理失败");
+        assert_eq!(error.operation(), Some("translation.prepare"));
+        let diagnostic = error.safe_diagnostic().expect("语义错误必须携带安全投影");
+        let serialized = serde_json::to_string(diagnostic).expect("安全诊断应可序列化");
+        assert!(serialized.contains("translation.prepare"));
+        assert!(serialized.contains("semantic=language_projection"));
+        assert!(serialized.contains("missing_required_placeholder_token"));
+        assert!(!serialized.contains(SOURCE_SENTINEL));
+        assert!(!error.to_string().contains(SOURCE_SENTINEL));
+
+        for source in [
+            PlaceholderProtectionError::EmptyMatch {
+                label: SOURCE_SENTINEL.to_owned(),
+            },
+            PlaceholderProtectionError::OverlappingMatches {
+                first: SOURCE_SENTINEL.to_owned(),
+                second: SOURCE_SENTINEL.to_owned(),
+            },
+        ] {
+            let error = translation_semantic_error(
+                "prepare",
+                ResolvedTranslationSemanticError::ProtectPlaceholder(source),
+            );
+            let diagnostic = error.safe_diagnostic().expect("语义错误必须携带安全投影");
+            let serialized = serde_json::to_string(diagnostic).expect("安全诊断应可序列化");
+            assert!(serialized.contains("semantic=placeholder_protection"));
+            assert!(!serialized.contains(SOURCE_SENTINEL));
+            assert!(!error.to_string().contains(SOURCE_SENTINEL));
+        }
+    }
+
+    #[test]
+    fn semantic_error_keeps_typed_rule_count_and_segment_facts() {
+        let cases = [
+            (
+                "prepare",
+                ResolvedTranslationSemanticError::ProtectPlaceholder(
+                    PlaceholderProtectionError::MissingTextCapture { rule_number: 17 },
+                ),
+                ["semantic=placeholder_protection", "rule=17"].as_slice(),
+            ),
+            (
+                "prepare",
+                ResolvedTranslationSemanticError::ProjectLanguageText(
+                    LanguageTextProjectionError::ChangedSegmentCount {
+                        expected: 9,
+                        actual: 7,
+                    },
+                ),
+                [
+                    "language_repair_changed_segment_count",
+                    "expected=9",
+                    "actual=7",
+                ]
+                .as_slice(),
+            ),
+            (
+                "accept",
+                ResolvedTranslationSemanticError::AcceptCandidate(
+                    TranslationCandidateTechnicalError::LanguageProjection(
+                        LanguageTextProjectionError::ChangedSegmentKind { segment_index: 4 },
+                    ),
+                ),
+                ["translation.accept", "segment_index=4"].as_slice(),
+            ),
+        ];
+
+        for (kind, source, expected_facts) in cases {
+            let error = translation_semantic_error(kind, source);
+            let diagnostic = error.safe_diagnostic().expect("语义错误必须携带安全投影");
+            let serialized = serde_json::to_string(diagnostic).expect("安全诊断应可序列化");
+            for fact in expected_facts {
+                assert!(
+                    serialized.contains(fact),
+                    "缺少安全事实 {fact}: {serialized}"
+                );
+            }
         }
     }
 

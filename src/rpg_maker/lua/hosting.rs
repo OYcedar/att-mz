@@ -7,15 +7,22 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
+    SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::OperationCompletion;
-use crate::llm::{ChatMessage, LlmRequestError, LlmRequestExecutor, LlmResponse};
+use crate::llm::{
+    ChatMessage, LlmRequestDiagnosticSource, LlmRequestError, LlmRequestExecutor, LlmResponse,
+};
 use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
 use crate::storage::scoped_path::{ExactPathCaseMismatch, resolve_exact_directory_entry};
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
 use crate::storage::sqlite_session::{
     OpenSqliteInteractiveSessionError, SqliteInteractiveSessionError,
-    SqliteInteractiveSessionFactory, SqliteInteractiveSessionFinalizer,
-    SqliteInteractiveSessionOperations,
+    SqliteInteractiveSessionFactory, SqliteInteractiveSessionFinalizationFailure,
+    SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
 };
 
 #[cfg(test)]
@@ -77,9 +84,14 @@ impl<L> Clone for LuaLlmCapability<L> {
 impl<F, L, R, S> TrustedLuaExecutionHost for TrustedLuaExecutionHostingService<F, L, R, S>
 where
     F: FileReader + DirectoryLister<Error = <F as FileReader>::Error> + 'static,
+    <F as FileReader>::Error: SafeDiagnosticSource,
     L: LlmRequestExecutor + 'static,
+    L::Error: LlmRequestDiagnosticSource,
     R: TrustedLuaRuntimeExecutor,
+    R::Error: SafeDiagnosticSource,
     S: SqliteInteractiveSessionFactory,
+    S::Error: SafeDiagnosticSource,
+    <S::Operations as SqliteInteractiveSessionOperations>::Error: SafeDiagnosticSource,
 {
     type TranslationClient = L::Client;
     type Error = TrustedLuaExecutionHostingError<S::Error, R::Error>;
@@ -202,7 +214,9 @@ where
 impl<F, S> TrustedLuaCommonHostCalls for LuaCommonHostCalls<F, S>
 where
     F: FileReader + DirectoryLister<Error = <F as FileReader>::Error> + 'static,
+    <F as FileReader>::Error: SafeDiagnosticSource,
     S: SqliteInteractiveSessionOperations,
+    S::Error: SafeDiagnosticSource,
 {
     fn project(&self) -> &LuaProjectContext {
         &self.project
@@ -222,7 +236,7 @@ where
                 .read_file(requested)
                 .await
                 .map(|file| file.into_bytes())
-                .map_err(source_read_error)
+                .map_err(|error| source_read_error("source.read", error))
         })
     }
 
@@ -239,7 +253,7 @@ where
             let entries = file_system
                 .list_directory(requested)
                 .await
-                .map_err(source_list_error)?;
+                .map_err(|error| source_list_error("source.list", error))?;
             let mut result = Vec::with_capacity(entries.len());
             for entry in entries {
                 let name = entry
@@ -259,10 +273,11 @@ where
                     TrustedLuaHostCallError::new(
                         "filesystem",
                         "invalid_path",
-                        error.to_string(),
+                        "来源目录项无法构造安全相对路径",
                         None,
                         Some(Arc::new(error)),
                     )
+                    .with_operation("source.list")
                 })?;
                 result.push(child.as_str().to_owned());
             }
@@ -278,7 +293,12 @@ where
         Box<dyn Future<Output = Result<Vec<SqliteRow>, TrustedLuaHostCallError>> + Send + 'static>,
     > {
         let operations = Arc::clone(&self.operations);
-        Box::pin(async move { operations.query(query).await.map_err(database_call_error) })
+        Box::pin(async move {
+            operations
+                .query(query)
+                .await
+                .map_err(|error| database_call_error("db.query", error))
+        })
     }
 
     fn execute(
@@ -290,7 +310,7 @@ where
             operations
                 .execute(command)
                 .await
-                .map_err(database_call_error)
+                .map_err(|error| database_call_error("db.execute", error))
         })
     }
 
@@ -298,21 +318,36 @@ where
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
         let operations = Arc::clone(&self.operations);
-        Box::pin(async move { operations.begin().await.map_err(database_call_error) })
+        Box::pin(async move {
+            operations
+                .begin()
+                .await
+                .map_err(|error| database_call_error("db.begin", error))
+        })
     }
 
     fn commit(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
         let operations = Arc::clone(&self.operations);
-        Box::pin(async move { operations.commit().await.map_err(database_call_error) })
+        Box::pin(async move {
+            operations
+                .commit()
+                .await
+                .map_err(|error| database_call_error("db.commit", error))
+        })
     }
 
     fn rollback(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
         let operations = Arc::clone(&self.operations);
-        Box::pin(async move { operations.rollback().await.map_err(database_call_error) })
+        Box::pin(async move {
+            operations
+                .rollback()
+                .await
+                .map_err(|error| database_call_error("db.rollback", error))
+        })
     }
 }
 
@@ -323,19 +358,20 @@ async fn resolve_exact_source_path<F>(
 ) -> Result<PathBuf, TrustedLuaHostCallError>
 where
     F: DirectoryLister,
+    F::Error: SafeDiagnosticSource,
 {
     let mut current = source_root.to_path_buf();
     for component in logical_path.components() {
         let entries = file_system
             .list_directory(current.clone())
             .await
-            .map_err(source_list_error)?;
+            .map_err(|error| source_list_error("source.resolve", error))?;
         let resolved = resolve_exact_directory_entry(
             &current,
             component,
             entries.iter().map(|entry| entry.resolved_path()),
         )
-        .map_err(source_case_mismatch)?;
+        .map_err(|error| source_case_mismatch("source.resolve", error))?;
         match resolved {
             Some(resolved) => current = resolved,
             None => {
@@ -396,6 +432,7 @@ impl TrustedLuaExtractHostCalls for LuaExtractHostCalls {
 struct LuaTranslationHostCalls<L>
 where
     L: LlmRequestExecutor + 'static,
+    L::Error: LlmRequestDiagnosticSource,
 {
     llm_client: Arc<L::Client>,
     semantics: Arc<dyn TrustedLuaTranslationSemantics>,
@@ -405,6 +442,7 @@ where
 impl<L> TrustedLuaTranslateHostCalls for LuaTranslationHostCalls<L>
 where
     L: LlmRequestExecutor + 'static,
+    L::Error: LlmRequestDiagnosticSource,
 {
     fn system_prompt(&self) -> &str {
         self.semantics.system_prompt()
@@ -451,76 +489,227 @@ where
             llm.request(llm_client.as_ref(), &messages)
                 .await
                 .map_err(llm_call_error)
+                .map_err(|error| error.with_operation("llm.request"))
         })
     }
 }
 
-fn database_call_error<E>(error: SqliteInteractiveSessionError<E>) -> TrustedLuaHostCallError
+fn database_call_error<E>(
+    operation: &'static str,
+    error: SqliteInteractiveSessionError<E>,
+) -> TrustedLuaHostCallError
 where
-    E: Error + Send + Sync + 'static,
+    E: Error + SafeDiagnosticSource + Send + Sync + 'static,
 {
-    let kind = match &error {
-        SqliteInteractiveSessionError::Closed => "closed",
-        SqliteInteractiveSessionError::Indeterminate => "indeterminate",
-        SqliteInteractiveSessionError::TransactionAlreadyActive => "transaction_already_active",
-        SqliteInteractiveSessionError::NoActiveTransaction => "no_active_transaction",
-        SqliteInteractiveSessionError::OperationFailed(_) => "operation_failed",
-        SqliteInteractiveSessionError::OutcomeUnknown(_) => "outcome_unknown",
+    let (kind, message, diagnostic) = match &error {
+        SqliteInteractiveSessionError::Closed => (
+            "closed",
+            "SQLite Host 会话已经进入终结阶段",
+            sqlite_session_state_diagnostic(
+                operation,
+                DiagnosticFailureKind::ExecutorClosed,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            ),
+        ),
+        SqliteInteractiveSessionError::Indeterminate => (
+            "indeterminate",
+            "SQLite Host 会话的事务终态未知",
+            sqlite_session_state_diagnostic(
+                operation,
+                DiagnosticFailureKind::TransactionOutcomeUnknown,
+                DiagnosticImpact::OutcomeUnknown,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            ),
+        ),
+        SqliteInteractiveSessionError::TransactionAlreadyActive => (
+            "transaction_already_active",
+            "SQLite Host 事务已经开始",
+            sqlite_session_state_diagnostic(
+                operation,
+                DiagnosticFailureKind::StateMismatch,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            ),
+        ),
+        SqliteInteractiveSessionError::NoActiveTransaction => (
+            "no_active_transaction",
+            "SQLite Host 当前没有活动事务",
+            sqlite_session_state_diagnostic(
+                operation,
+                DiagnosticFailureKind::StateMismatch,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            ),
+        ),
+        SqliteInteractiveSessionError::OperationFailed(source) => (
+            "operation_failed",
+            "SQLite Host 操作失败",
+            source.safe_diagnostic_source(
+                DiagnosticStage::ProjectOpening,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            ),
+        ),
+        SqliteInteractiveSessionError::OutcomeUnknown(source) => (
+            "outcome_unknown",
+            "SQLite Host 操作的事务终态未知",
+            source.safe_diagnostic_source(
+                DiagnosticStage::ProjectOpening,
+                DiagnosticImpact::OutcomeUnknown,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            ),
+        ),
     };
-    let message = error.to_string();
     TrustedLuaHostCallError::new("sqlite", kind, message, None, Some(Arc::new(error)))
+        .with_operation(operation)
+        .with_safe_diagnostic(diagnostic)
 }
 
-fn source_read_error<E>(error: ReadFileError<E>) -> TrustedLuaHostCallError
+fn sqlite_session_state_diagnostic(
+    operation: &'static str,
+    failure: DiagnosticFailureKind,
+    impact: DiagnosticImpact,
+    action: DiagnosticAction,
+) -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        DiagnosticCode::SqliteOperation,
+        DiagnosticStage::ProjectOpening,
+        DiagnosticSubject::operation(operation),
+        DiagnosticReason::failure(failure),
+        impact,
+        action,
+    )
+}
+
+fn source_read_error<E>(operation: &'static str, error: ReadFileError<E>) -> TrustedLuaHostCallError
 where
-    E: Error + Send + Sync + 'static,
+    E: Error + SafeDiagnosticSource + Send + Sync + 'static,
 {
-    let kind = match &error {
-        ReadFileError::NotFound { .. } => "not_found",
-        ReadFileError::NotFile { .. } => "not_file",
-        ReadFileError::Io { .. } => "io",
+    let (kind, message, diagnostic) = match &error {
+        ReadFileError::NotFound { path } => (
+            "not_found",
+            "Lua Host 要读取的来源文件不存在",
+            file_state_diagnostic(path, DiagnosticFailureKind::NotFound),
+        ),
+        ReadFileError::NotFile { path } => (
+            "not_file",
+            "Lua Host 要读取的来源路径不是普通文件",
+            file_state_diagnostic(path, DiagnosticFailureKind::InvalidPath),
+        ),
+        ReadFileError::Io { path, source } => {
+            let mut diagnostic = source.safe_diagnostic_source(
+                DiagnosticStage::ProjectOpening,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            );
+            diagnostic.subject = DiagnosticSubject::path(path);
+            ("io", "Lua Host 读取来源文件失败", diagnostic)
+        }
     };
-    let message = error.to_string();
     TrustedLuaHostCallError::new("filesystem", kind, message, None, Some(Arc::new(error)))
+        .with_operation(operation)
+        .with_safe_diagnostic(diagnostic)
 }
 
-fn source_list_error<E>(error: ListDirectoryError<E>) -> TrustedLuaHostCallError
+fn source_list_error<E>(
+    operation: &'static str,
+    error: ListDirectoryError<E>,
+) -> TrustedLuaHostCallError
 where
-    E: Error + Send + Sync + 'static,
+    E: Error + SafeDiagnosticSource + Send + Sync + 'static,
 {
-    let kind = match &error {
-        ListDirectoryError::NotFound { .. } => "not_found",
-        ListDirectoryError::NotDirectory { .. } => "not_directory",
-        ListDirectoryError::Io { .. } => "io",
+    let (kind, message, diagnostic) = match &error {
+        ListDirectoryError::NotFound { path } => (
+            "not_found",
+            "Lua Host 要列举的来源目录不存在",
+            file_state_diagnostic(path, DiagnosticFailureKind::NotFound),
+        ),
+        ListDirectoryError::NotDirectory { path } => (
+            "not_directory",
+            "Lua Host 要列举的来源路径不是目录",
+            file_state_diagnostic(path, DiagnosticFailureKind::InvalidPath),
+        ),
+        ListDirectoryError::Io { path, source } => {
+            let mut diagnostic = source.safe_diagnostic_source(
+                DiagnosticStage::ProjectOpening,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            );
+            diagnostic.subject = DiagnosticSubject::path(path);
+            ("io", "Lua Host 列举来源目录失败", diagnostic)
+        }
     };
-    let message = error.to_string();
     TrustedLuaHostCallError::new("filesystem", kind, message, None, Some(Arc::new(error)))
+        .with_operation(operation)
+        .with_safe_diagnostic(diagnostic)
 }
 
-fn source_case_mismatch(error: ExactPathCaseMismatch) -> TrustedLuaHostCallError {
-    let message = error.to_string();
+fn file_state_diagnostic(path: &Path, failure: DiagnosticFailureKind) -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        DiagnosticCode::FileSystemOperation,
+        DiagnosticStage::ProjectOpening,
+        DiagnosticSubject::path(path),
+        DiagnosticReason::failure(failure),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::CheckPathAndPermissions,
+    )
+}
+
+fn source_case_mismatch(
+    operation: &'static str,
+    error: ExactPathCaseMismatch,
+) -> TrustedLuaHostCallError {
+    let diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::FileSystemOperation,
+        DiagnosticStage::ProjectOpening,
+        DiagnosticSubject::path(error.requested()),
+        DiagnosticReason::failure_with_detail(
+            DiagnosticFailureKind::InvalidPath,
+            "requested path casing does not match the actual directory entry",
+        ),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::FixInput,
+    )
+    .with_recovery(RecoveryFact::path(error.actual()));
     TrustedLuaHostCallError::new(
         "filesystem",
         "case_mismatch",
-        message,
+        "Lua Host 来源路径的大小写与磁盘上的真实名称不一致",
         None,
         Some(Arc::new(error)),
     )
+    .with_operation(operation)
+    .with_safe_diagnostic(diagnostic)
 }
 
 fn llm_call_error<E>(error: LlmRequestError<E>) -> TrustedLuaHostCallError
 where
-    E: Error + Send + Sync + 'static,
+    E: Error + LlmRequestDiagnosticSource + Send + Sync + 'static,
 {
-    let (kind, retry_after_ms) = match &error {
-        LlmRequestError::Retryable { retry_after, .. } => (
+    let (kind, retry_after_ms, diagnostic) = match &error {
+        LlmRequestError::Retryable {
+            source,
+            retry_after,
+        } => (
             "retryable",
             retry_after.map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+            source.request_diagnostic(*retry_after, DiagnosticImpact::Unchanged),
         ),
-        LlmRequestError::Fatal(_) => ("fatal", None),
+        LlmRequestError::Fatal(source) => (
+            "fatal",
+            None,
+            source.request_diagnostic(None, DiagnosticImpact::Unchanged),
+        ),
     };
-    let message = error.to_string();
-    TrustedLuaHostCallError::new("llm", kind, message, retry_after_ms, Some(Arc::new(error)))
+    TrustedLuaHostCallError::new(
+        "llm",
+        kind,
+        "Lua Host 模型请求失败",
+        retry_after_ms,
+        Some(Arc::new(error)),
+    )
+    .with_safe_diagnostic(diagnostic)
 }
 
 struct LuaSessionFinalizer<F> {
@@ -530,6 +719,7 @@ struct LuaSessionFinalizer<F> {
 impl<F> TrustedLuaBindingFinalizer for LuaSessionFinalizer<F>
 where
     F: SqliteInteractiveSessionFinalizer,
+    F::Error: SafeDiagnosticSource,
 {
     fn finalize(
         self: Box<Self>,
@@ -550,11 +740,32 @@ where
                     finalization.had_unclosed_transaction(),
                 )),
                 Err(error) => {
-                    let message = error.to_string();
-                    Err(TrustedLuaBindingFinalizationError::new(
-                        message,
-                        Some(Arc::new(error)),
-                    ))
+                    let (message, primary_impact) = match error.primary() {
+                        SqliteInteractiveSessionFinalizationFailure::CleanupFailed(_) => (
+                            "Lua Host 无法完整终结 SQLite 会话",
+                            DiagnosticImpact::RecoveryRequired,
+                        ),
+                        SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(_) => (
+                            "Lua Host 终结 SQLite 会话后的事务终态未知",
+                            DiagnosticImpact::OutcomeUnknown,
+                        ),
+                    };
+                    let mut diagnostics = vec![error.primary().source().safe_diagnostic_source(
+                        DiagnosticStage::ProjectOpening,
+                        primary_impact,
+                        DiagnosticAction::PreserveRecoveryArtifacts,
+                    )];
+                    if let Some(source) = error.connection_close() {
+                        diagnostics.push(source.safe_diagnostic_source(
+                            DiagnosticStage::ProjectOpening,
+                            DiagnosticImpact::RecoveryRequired,
+                            DiagnosticAction::PreserveRecoveryArtifacts,
+                        ));
+                    }
+                    Err(
+                        TrustedLuaBindingFinalizationError::new(message, Some(Arc::new(error)))
+                            .with_safe_diagnostics(diagnostics),
+                    )
                 }
             }
         })
@@ -575,6 +786,302 @@ pub(crate) enum TrustedLuaExecutionHostingError<O, R> {
         runtime: TrustedLuaRuntimeExecutionError<R>,
         cleanup: TrustedLuaBindingFinalizationError,
     },
+}
+
+impl<O, R> TrustedLuaExecutionHostingError<O, R>
+where
+    O: SafeDiagnosticSource,
+    R: SafeDiagnosticSource,
+{
+    /// 在 Host 仍持有数据库路径、VM 子阶段与稳定 Host code 时建立公开投影。
+    ///
+    /// VM 任意文本、Lua 正文、SQL/参数与底层 `Display` 永不进入该投影。
+    pub(crate) fn safe_diagnostic(
+        &self,
+        stage: DiagnosticStage,
+        script_path: &Path,
+        impact: DiagnosticImpact,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::OpenDatabase {
+                database_path,
+                source,
+            } => match source {
+                OpenSqliteInteractiveSessionError::NotFound => SafeDiagnostic::new(
+                    DiagnosticCode::LuaExecution,
+                    stage,
+                    DiagnosticSubject::path(database_path),
+                    DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+                    impact,
+                    DiagnosticAction::CheckProjectState,
+                )
+                .with_recovery(RecoveryFact::path(script_path))
+                .with_recovery(RecoveryFact::component("lua_runtime_phase=open_database")),
+                OpenSqliteInteractiveSessionError::OpenFailed(source) => {
+                    let mut diagnostic = source.safe_diagnostic_source(
+                        stage,
+                        impact,
+                        DiagnosticAction::CheckProjectState,
+                    );
+                    diagnostic.subject = DiagnosticSubject::path(database_path);
+                    with_lua_context(diagnostic, stage, script_path, impact, "open_database")
+                }
+            },
+            Self::Runtime(runtime) => lua_runtime_diagnostic(runtime, stage, script_path, impact),
+            Self::Cleanup(cleanup) => lua_cleanup_diagnostics(cleanup, stage, script_path)
+                .into_iter()
+                .next()
+                .expect("Lua cleanup 必须至少产生一条安全诊断"),
+            Self::UnclosedTransaction => SafeDiagnostic::new(
+                DiagnosticCode::LuaExecution,
+                stage,
+                DiagnosticSubject::path(script_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::LuaUnclosedTransaction),
+                impact,
+                DiagnosticAction::FixInput,
+            )
+            .with_recovery(RecoveryFact::transaction("rolled_back")),
+            Self::RuntimeAndCleanup { runtime, .. } => lua_runtime_diagnostic(
+                runtime,
+                stage,
+                script_path,
+                DiagnosticImpact::RecoveryRequired,
+            )
+            .with_recovery(RecoveryFact::component("lua_binding_finalization=failed")),
+        }
+    }
+
+    /// 消费 Host 错误并保留 VM 主错误与资源收尾错误两个独立终态。
+    pub(crate) fn into_failure_report(
+        self,
+        stage: DiagnosticStage,
+        script_path: &Path,
+        impact: DiagnosticImpact,
+    ) -> FailureReport
+    where
+        O: Error + Send + Sync + 'static,
+        R: Error + Send + Sync + 'static,
+    {
+        let diagnostic = self.safe_diagnostic(stage, script_path, impact);
+        match self {
+            Self::RuntimeAndCleanup { runtime, cleanup } => {
+                let mut report = FailureReport::new(ReportedFailure::new(diagnostic, runtime));
+                for public in lua_cleanup_diagnostics(&cleanup, stage, script_path) {
+                    report = report.with_related(ReportedFailure::new(public, cleanup.clone()));
+                }
+                report
+            }
+            Self::Cleanup(cleanup) => {
+                let mut diagnostics = lua_cleanup_diagnostics(&cleanup, stage, script_path);
+                let primary = diagnostics.remove(0);
+                let mut report = FailureReport::new(ReportedFailure::new(primary, cleanup.clone()));
+                for public in diagnostics {
+                    report = report.with_related(ReportedFailure::new(public, cleanup.clone()));
+                }
+                report
+            }
+            source => FailureReport::new(ReportedFailure::new(diagnostic, source)),
+        }
+    }
+}
+
+fn lua_runtime_diagnostic<R>(
+    source: &TrustedLuaRuntimeExecutionError<R>,
+    stage: DiagnosticStage,
+    script_path: &Path,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic
+where
+    R: SafeDiagnosticSource,
+{
+    match source {
+        TrustedLuaRuntimeExecutionError::Unavailable(source) => with_lua_context(
+            source.safe_diagnostic_source(stage, impact, DiagnosticAction::Retry),
+            stage,
+            script_path,
+            impact,
+            "unavailable",
+        ),
+        TrustedLuaRuntimeExecutionError::Context(source) => with_lua_context(
+            classify_lua_vm_phase(
+                source.safe_diagnostic_source(stage, impact, DiagnosticAction::FixInput),
+                DiagnosticFailureKind::LuaContextCreationFailed,
+                DiagnosticAction::FixInput,
+            ),
+            stage,
+            script_path,
+            impact,
+            "context",
+        ),
+        TrustedLuaRuntimeExecutionError::Compile(source) => with_lua_context(
+            classify_lua_vm_phase(
+                source.safe_diagnostic_source(stage, impact, DiagnosticAction::FixInput),
+                DiagnosticFailureKind::LuaCompilationFailed,
+                DiagnosticAction::FixInput,
+            ),
+            stage,
+            script_path,
+            impact,
+            "compile",
+        ),
+        TrustedLuaRuntimeExecutionError::Execute(source) => with_lua_context(
+            classify_lua_vm_phase(
+                source.safe_diagnostic_source(stage, impact, DiagnosticAction::FixInput),
+                DiagnosticFailureKind::LuaExecutionFailed,
+                DiagnosticAction::FixInput,
+            ),
+            stage,
+            script_path,
+            impact,
+            "execute",
+        ),
+        TrustedLuaRuntimeExecutionError::Binding(source) => {
+            let diagnostic = source.safe_diagnostic().cloned().unwrap_or_else(|| {
+                SafeDiagnostic::new(
+                    DiagnosticCode::LuaExecution,
+                    stage,
+                    DiagnosticSubject::path(script_path),
+                    DiagnosticReason::failure(DiagnosticFailureKind::LuaHostCallFailed),
+                    impact,
+                    DiagnosticAction::FixInput,
+                )
+            });
+            let mut diagnostic =
+                with_lua_context(diagnostic, stage, script_path, impact, "host_call")
+                    .with_recovery(RecoveryFact::component(format!(
+                        "host_domain={}; host_kind={}",
+                        source.domain(),
+                        source.kind()
+                    )));
+            if let Some(operation) = source.operation() {
+                diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
+                    "host_operation={operation}"
+                )));
+            }
+            diagnostic
+        }
+        TrustedLuaRuntimeExecutionError::Cancelled => with_lua_context(
+            SafeDiagnostic::new(
+                DiagnosticCode::LuaExecution,
+                stage,
+                DiagnosticSubject::path(script_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            stage,
+            script_path,
+            impact,
+            "cancelled",
+        ),
+        TrustedLuaRuntimeExecutionError::WorkerPanicked => with_lua_context(
+            SafeDiagnostic::new(
+                DiagnosticCode::LuaExecution,
+                stage,
+                DiagnosticSubject::path(script_path),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::WorkerPanicked,
+                    "lua_runtime_kind=worker_panicked",
+                ),
+                impact,
+                DiagnosticAction::ReportBug,
+            ),
+            stage,
+            script_path,
+            impact,
+            "worker",
+        ),
+        TrustedLuaRuntimeExecutionError::SupervisorLost => with_lua_context(
+            SafeDiagnostic::new(
+                DiagnosticCode::LuaExecution,
+                stage,
+                DiagnosticSubject::path(script_path),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::WorkerChannelClosed,
+                    "lua_runtime_kind=supervisor_lost",
+                ),
+                impact,
+                DiagnosticAction::ReportBug,
+            ),
+            stage,
+            script_path,
+            impact,
+            "supervisor",
+        ),
+    }
+}
+
+fn classify_lua_vm_phase(
+    mut diagnostic: SafeDiagnostic,
+    phase_failure: DiagnosticFailureKind,
+    action: DiagnosticAction,
+) -> SafeDiagnostic {
+    if matches!(
+        &diagnostic.reason,
+        DiagnosticReason::Failure {
+            failure: DiagnosticFailureKind::LuaExecutionFailed
+        }
+    ) {
+        diagnostic.reason = DiagnosticReason::failure(phase_failure);
+        diagnostic.action = action;
+    }
+    diagnostic
+}
+
+fn lua_cleanup_diagnostics(
+    cleanup: &TrustedLuaBindingFinalizationError,
+    stage: DiagnosticStage,
+    script_path: &Path,
+) -> Vec<SafeDiagnostic> {
+    let diagnostics = cleanup.safe_diagnostics();
+    if diagnostics.is_empty() {
+        return vec![with_lua_context(
+            SafeDiagnostic::new(
+                DiagnosticCode::LuaExecution,
+                stage,
+                DiagnosticSubject::path(script_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::LuaFinalizationFailed),
+                DiagnosticImpact::RecoveryRequired,
+                DiagnosticAction::Retry,
+            ),
+            stage,
+            script_path,
+            DiagnosticImpact::RecoveryRequired,
+            "finalization",
+        )];
+    }
+    diagnostics
+        .iter()
+        .cloned()
+        .map(|diagnostic| {
+            let impact = diagnostic.impact;
+            with_lua_context(diagnostic, stage, script_path, impact, "finalization")
+        })
+        .collect()
+}
+
+fn with_lua_context(
+    mut diagnostic: SafeDiagnostic,
+    stage: DiagnosticStage,
+    script_path: &Path,
+    outer_impact: DiagnosticImpact,
+    runtime_phase: &'static str,
+) -> SafeDiagnostic {
+    diagnostic.stage = stage;
+    diagnostic.impact = merge_diagnostic_impact(diagnostic.impact, outer_impact);
+    diagnostic
+        .with_recovery(RecoveryFact::path(script_path))
+        .with_recovery(RecoveryFact::component(format!(
+            "lua_runtime_phase={runtime_phase}"
+        )))
+}
+
+fn merge_diagnostic_impact(inner: DiagnosticImpact, outer: DiagnosticImpact) -> DiagnosticImpact {
+    if inner == DiagnosticImpact::Unchanged {
+        outer
+    } else {
+        inner
+    }
 }
 
 impl<O, R> fmt::Display for TrustedLuaExecutionHostingError<O, R>
@@ -626,7 +1133,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use super::*;
     use crate::llm::{LlmFinishReason, LlmUsage};
@@ -636,8 +1142,9 @@ mod tests {
     };
     use crate::rpg_maker::project::OpenedProject;
     use crate::runtime::filesystem::{
-        ExclusiveFileLeaseConfig, SystemFileSystem, SystemFileSystemConfig, TreeBudget,
+        SystemFileSystem, SystemFileSystemConfig, SystemFileSystemError,
     };
+    use crate::runtime::sqlite::SqliteRuntimeError;
     use crate::storage::file_system::{
         DirectoryEntry, DirectoryEntryKind, DirectoryLister, ListDirectoryError, ReadFile,
     };
@@ -647,15 +1154,311 @@ mod tests {
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FakeError(&'static str);
+    enum FakeError {
+        Private(&'static str),
+        Operation {
+            private_message: &'static str,
+            operation: &'static str,
+        },
+    }
 
     impl fmt::Display for FakeError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str(self.0)
+            match self {
+                Self::Private(message)
+                | Self::Operation {
+                    private_message: message,
+                    ..
+                } => formatter.write_str(message),
+            }
         }
     }
 
     impl Error for FakeError {}
+
+    impl SafeDiagnosticSource for FakeError {
+        fn safe_diagnostic_source(
+            &self,
+            stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+            action: DiagnosticAction,
+        ) -> SafeDiagnostic {
+            let subject = match self {
+                Self::Private(_) => DiagnosticSubject::component("fake Lua root"),
+                Self::Operation { operation, .. } => DiagnosticSubject::operation(operation),
+            };
+            SafeDiagnostic::new(
+                DiagnosticCode::LuaExecution,
+                stage,
+                subject,
+                DiagnosticReason::failure(DiagnosticFailureKind::LuaExecutionFailed),
+                impact,
+                action,
+            )
+        }
+    }
+
+    impl LlmRequestDiagnosticSource for FakeError {
+        fn request_diagnostic(
+            &self,
+            retry_after: Option<std::time::Duration>,
+            impact: DiagnosticImpact,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                DiagnosticCode::ModelRequest,
+                DiagnosticStage::ModelRequest,
+                DiagnosticSubject::component("fake Lua LLM"),
+                DiagnosticReason::Http {
+                    status: Some(503),
+                    retry_after_seconds: retry_after.map(|value| value.as_secs()),
+                    provider_code: Some("unavailable".to_owned()),
+                    provider_type: Some("test".to_owned()),
+                },
+                impact,
+                DiagnosticAction::CheckModelService,
+            )
+        }
+    }
+
+    struct DiagnosticFinalizer;
+
+    impl SqliteInteractiveSessionFinalizer for DiagnosticFinalizer {
+        type Error = SqliteRuntimeError;
+
+        async fn finalize(
+            self,
+        ) -> Result<
+            SqliteInteractiveSessionFinalization,
+            SqliteInteractiveSessionFinalizationError<Self::Error>,
+        > {
+            Err(SqliteInteractiveSessionFinalizationError::new(
+                SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(
+                    SqliteRuntimeError::Driver {
+                        operation: "rollback_transaction",
+                        source: rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR_FSYNC),
+                            Some("SQL_FINALIZATION_SENTINEL".to_owned()),
+                        ),
+                    },
+                ),
+                Some(SqliteRuntimeError::Io {
+                    operation: "close_connection",
+                    path: PathBuf::from("C:/project/project.db"),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "CLOSE_SOURCE_SENTINEL",
+                    ),
+                }),
+            ))
+        }
+    }
+
+    #[test]
+    fn host_call_diagnostic_keeps_stable_codes_and_hides_lua_message() {
+        let error: TrustedLuaExecutionHostingError<FakeError, FakeError> =
+            TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Binding(
+                TrustedLuaHostCallError::new(
+                    "filesystem",
+                    "permission_denied",
+                    "LUA_VM_AND_SOURCE_SECRET",
+                    None,
+                    None,
+                ),
+            ));
+        let diagnostic = error.safe_diagnostic(
+            DiagnosticStage::WriteBack,
+            Path::new("scripts/write-back.lua"),
+            DiagnosticImpact::Unchanged,
+        );
+        let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
+
+        assert!(!serialized.contains("LUA_VM_AND_SOURCE_SECRET"));
+        assert!(serialized.contains("lua_host_call_failed"));
+        assert!(serialized.contains("scripts/write-back.lua"));
+        assert!(serialized.contains("host_domain=filesystem; host_kind=permission_denied"));
+    }
+
+    #[test]
+    fn worker_panic_and_supervisor_loss_keep_distinct_stable_kind_and_phase() {
+        let worker: TrustedLuaExecutionHostingError<FakeError, FakeError> =
+            TrustedLuaExecutionHostingError::Runtime(
+                TrustedLuaRuntimeExecutionError::WorkerPanicked,
+            );
+        let supervisor: TrustedLuaExecutionHostingError<FakeError, FakeError> =
+            TrustedLuaExecutionHostingError::Runtime(
+                TrustedLuaRuntimeExecutionError::SupervisorLost,
+            );
+
+        let worker = worker.safe_diagnostic(
+            DiagnosticStage::Translate,
+            Path::new("C:/project/scripts/translate.lua"),
+            DiagnosticImpact::ProgressPreserved,
+        );
+        let supervisor = supervisor.safe_diagnostic(
+            DiagnosticStage::Translate,
+            Path::new("C:/project/scripts/translate.lua"),
+            DiagnosticImpact::ProgressPreserved,
+        );
+        let worker = serde_json::to_string(&worker).expect("worker 诊断应可序列化");
+        let supervisor = serde_json::to_string(&supervisor).expect("supervisor 诊断应可序列化");
+
+        assert!(worker.contains("\"failure\":\"worker_panicked\""));
+        assert!(worker.contains("lua_runtime_kind=worker_panicked"));
+        assert!(worker.contains("lua_runtime_phase=worker"));
+        assert!(supervisor.contains("\"failure\":\"worker_channel_closed\""));
+        assert!(supervisor.contains("lua_runtime_kind=supervisor_lost"));
+        assert!(supervisor.contains("lua_runtime_phase=supervisor"));
+        assert_ne!(worker, supervisor);
+    }
+
+    #[test]
+    fn sqlite_host_diagnostic_keeps_codes_operation_phase_and_path_without_sql_text() {
+        const SQL_AND_PARAMETER_SENTINEL: &str = "SQL_AND_PARAMETER_SENTINEL";
+        let driver = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+            Some(SQL_AND_PARAMETER_SENTINEL.to_owned()),
+        );
+        let host_error = database_call_error(
+            "db.execute",
+            SqliteInteractiveSessionError::OperationFailed(SqliteRuntimeError::Driver {
+                operation: "execute_statement",
+                source: driver,
+            }),
+        );
+        let error: TrustedLuaExecutionHostingError<FakeError, FakeError> =
+            TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Binding(
+                host_error,
+            ));
+
+        let diagnostic = error.safe_diagnostic(
+            DiagnosticStage::Translate,
+            Path::new("C:/project/scripts/translate.lua"),
+            DiagnosticImpact::ProgressPreserved,
+        );
+        let serialized = serde_json::to_string(&diagnostic).expect("SQLite 诊断应可序列化");
+
+        assert!(serialized.contains("\"primary_code\":19"));
+        assert!(serialized.contains("\"extended_code\":2067"));
+        assert!(serialized.contains("host_operation=db.execute"));
+        assert!(serialized.contains("lua_runtime_phase=host_call"));
+        assert!(serialized.contains("C:/project/scripts/translate.lua"));
+        assert_eq!(diagnostic.impact, DiagnosticImpact::ProgressPreserved);
+        assert!(!serialized.contains(SQL_AND_PARAMETER_SENTINEL));
+    }
+
+    #[test]
+    fn filesystem_host_diagnostic_keeps_safe_os_reason_and_paths_without_source_text() {
+        const FILE_SOURCE_SENTINEL: &str = "FILE_SOURCE_SENTINEL";
+        let path = PathBuf::from("C:/game/data/Actors.json");
+        let host_error = source_read_error(
+            "source.read_json",
+            ReadFileError::Io {
+                path: path.clone(),
+                source: SystemFileSystemError::Io {
+                    operation: "read_file",
+                    path: path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        FILE_SOURCE_SENTINEL,
+                    ),
+                },
+            },
+        );
+        let error: TrustedLuaExecutionHostingError<FakeError, FakeError> =
+            TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Binding(
+                host_error,
+            ));
+
+        let diagnostic = error.safe_diagnostic(
+            DiagnosticStage::Extract,
+            Path::new("C:/project/scripts/extract.lua"),
+            DiagnosticImpact::Unchanged,
+        );
+        let serialized = serde_json::to_string(&diagnostic).expect("文件诊断应可序列化");
+
+        assert!(serialized.contains("permission_denied"));
+        assert!(serialized.contains("read_file"));
+        assert!(serialized.contains("C:/game/data/Actors.json"));
+        assert!(serialized.contains("C:/project/scripts/extract.lua"));
+        assert!(serialized.contains("host_operation=source.read_json"));
+        assert!(!serialized.contains(FILE_SOURCE_SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn sqlite_finalization_keeps_outcome_unknown_and_close_failure_separately() {
+        let cleanup = Box::new(LuaSessionFinalizer {
+            finalizer: DiagnosticFinalizer,
+        })
+        .finalize()
+        .await
+        .expect_err("测试终结器必须失败");
+        let error: TrustedLuaExecutionHostingError<FakeError, FakeError> =
+            TrustedLuaExecutionHostingError::Cleanup(cleanup);
+        let report = error.into_failure_report(
+            DiagnosticStage::WriteBack,
+            Path::new("C:/project/scripts/write-back.lua"),
+            DiagnosticImpact::Unchanged,
+        );
+
+        assert_eq!(
+            report.primary.public().impact,
+            DiagnosticImpact::OutcomeUnknown
+        );
+        assert_eq!(report.related.len(), 1);
+        let serialized = format!(
+            "{} {}",
+            serde_json::to_string(report.primary.public()).expect("主诊断应可序列化"),
+            serde_json::to_string(report.related[0].public()).expect("相关诊断应可序列化")
+        );
+        assert!(serialized.contains("\"primary_code\":10"));
+        assert!(serialized.contains("\"extended_code\":1034"));
+        assert!(serialized.contains("close_connection"));
+        assert!(serialized.contains("permission_denied"));
+        assert!(serialized.contains("lua_runtime_phase=finalization"));
+        assert!(serialized.contains("C:/project/scripts/write-back.lua"));
+        assert!(!serialized.contains("SQL_FINALIZATION_SENTINEL"));
+        assert!(!serialized.contains("CLOSE_SOURCE_SENTINEL"));
+    }
+
+    #[test]
+    fn runtime_and_cleanup_become_primary_and_related_safe_failures() {
+        let error: TrustedLuaExecutionHostingError<FakeError, FakeError> =
+            TrustedLuaExecutionHostingError::RuntimeAndCleanup {
+                runtime: TrustedLuaRuntimeExecutionError::Execute(FakeError::Private(
+                    "LUA_VM_BODY_SENTINEL",
+                )),
+                cleanup: TrustedLuaBindingFinalizationError::new(
+                    "SQL_AND_PARAMETER_SENTINEL",
+                    Some(Arc::new(FakeError::Private("CLEANUP_SOURCE_SENTINEL"))),
+                ),
+            };
+        let report = error.into_failure_report(
+            DiagnosticStage::Extract,
+            Path::new("scripts/extract.lua"),
+            DiagnosticImpact::Unchanged,
+        );
+
+        assert_eq!(report.related.len(), 1);
+        assert_eq!(
+            report.primary.public().impact,
+            DiagnosticImpact::RecoveryRequired
+        );
+        let serialized = format!(
+            "{} {}",
+            serde_json::to_string(report.primary.public()).expect("主诊断应可序列化"),
+            serde_json::to_string(report.related[0].public()).expect("相关诊断应可序列化")
+        );
+        assert!(serialized.contains("lua_execution_failed"));
+        assert!(serialized.contains("lua_finalization_failed"));
+        assert!(serialized.contains("scripts/extract.lua"));
+        for sentinel in [
+            "LUA_VM_BODY_SENTINEL",
+            "SQL_AND_PARAMETER_SENTINEL",
+            "CLEANUP_SOURCE_SENTINEL",
+        ] {
+            assert!(!serialized.contains(sentinel), "泄露了 {sentinel}");
+        }
+    }
 
     type Events = Arc<Mutex<Vec<&'static str>>>;
 
@@ -773,9 +1576,12 @@ mod tests {
                 FinalizationBehavior::Active => Ok(SqliteInteractiveSessionFinalization::new(true)),
                 FinalizationBehavior::CloseFailed => {
                     Err(SqliteInteractiveSessionFinalizationError::new(
-                        SqliteInteractiveSessionFinalizationFailure::CleanupFailed(FakeError(
-                            "close",
-                        )),
+                        SqliteInteractiveSessionFinalizationFailure::CleanupFailed(
+                            FakeError::Operation {
+                                private_message: "SESSION_CLOSE_SOURCE_SENTINEL",
+                                operation: "close_connection",
+                            },
+                        ),
                         None,
                     ))
                 }
@@ -804,9 +1610,9 @@ mod tests {
         > {
             record(&self.events, "open");
             if self.fail {
-                Err(OpenSqliteInteractiveSessionError::OpenFailed(FakeError(
-                    "open",
-                )))
+                Err(OpenSqliteInteractiveSessionError::OpenFailed(
+                    FakeError::Private("open"),
+                ))
             } else {
                 Ok(OpenedSqliteInteractiveSession::new(
                     Arc::new(FakeOperations),
@@ -856,12 +1662,14 @@ mod tests {
                     RuntimeBehavior::DeclareDeactivate => extract
                         .clear_standard()
                         .map_err(TrustedLuaRuntimeExecutionError::Binding),
-                    RuntimeBehavior::Fail => {
-                        Err(TrustedLuaRuntimeExecutionError::Execute(FakeError("vm")))
+                    RuntimeBehavior::Fail => Err(TrustedLuaRuntimeExecutionError::Execute(
+                        FakeError::Private("vm"),
+                    )),
+                    RuntimeBehavior::Unavailable => {
+                        Err(TrustedLuaRuntimeExecutionError::Unavailable(
+                            FakeError::Private("unavailable"),
+                        ))
                     }
-                    RuntimeBehavior::Unavailable => Err(
-                        TrustedLuaRuntimeExecutionError::Unavailable(FakeError("unavailable")),
-                    ),
                     RuntimeBehavior::Cancelled => Err(TrustedLuaRuntimeExecutionError::Cancelled),
                 };
                 let finalization = finalizer.finalize().await;
@@ -1007,7 +1815,7 @@ mod tests {
         assert!(matches!(
             error,
             TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Unavailable(
-                FakeError("unavailable")
+                FakeError::Private("unavailable")
             ))
         ));
         assert_eq!(*events.lock().unwrap(), ["open", "start", "finalize"]);
@@ -1082,15 +1890,34 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            TrustedLuaExecutionHostingError::RuntimeAndCleanup {
-                runtime: TrustedLuaRuntimeExecutionError::Execute(FakeError("vm")),
-                ..
-            }
-        ));
-        assert!(error.to_string().contains("vm"));
-        assert!(error.to_string().contains("close"));
+        let report = error.into_failure_report(
+            DiagnosticStage::Extract,
+            Path::new("C:/project/scripts/extract.lua"),
+            DiagnosticImpact::Unchanged,
+        );
+
+        assert_eq!(report.related.len(), 1);
+        assert_eq!(
+            report.primary.public().impact,
+            DiagnosticImpact::RecoveryRequired
+        );
+        assert_eq!(
+            report.related[0].public().subject,
+            DiagnosticSubject::operation("close_connection")
+        );
+        let serialized = format!(
+            "{} {}",
+            serde_json::to_string(report.primary.public()).expect("主诊断应可序列化"),
+            serde_json::to_string(report.related[0].public()).expect("相关诊断应可序列化")
+        );
+        assert!(serialized.contains("lua_execution_failed"));
+        assert!(serialized.contains("lua_runtime_phase=execute"));
+        assert!(serialized.contains("close_connection"));
+        assert!(serialized.contains("lua_runtime_phase=finalization"));
+        assert!(serialized.contains("C:/project/scripts/extract.lua"));
+        for sentinel in ["vm", "SESSION_CLOSE_SOURCE_SENTINEL"] {
+            assert!(!serialized.contains(sentinel), "泄露了 {sentinel}");
+        }
     }
 
     #[test]
@@ -1303,20 +2130,8 @@ mod tests {
         fs::write(data_root.join("Items.json"), b"{}").expect("应能写入真实来源文件");
 
         let file_system = Arc::new(
-            SystemFileSystem::new(
-                SystemFileSystemConfig::new(
-                    1,
-                    8,
-                    1024 * 1024,
-                    128,
-                    TreeBudget::new(128, 16, 1024 * 1024, 512 * 1024)
-                        .expect("测试目录树预算应合法"),
-                    ExclusiveFileLeaseConfig::new(Duration::from_secs(1))
-                        .expect("测试租约配置应合法"),
-                )
-                .expect("测试文件系统配置应合法"),
-            )
-            .expect("应能建立真实文件系统根"),
+            SystemFileSystem::new(SystemFileSystemConfig::production())
+                .expect("应能建立真实文件系统根"),
         );
         let calls = LuaCommonHostCalls::<_, _> {
             project: LuaProjectContext::for_frozen_source(

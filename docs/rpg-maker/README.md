@@ -185,24 +185,30 @@ Init 成立的证据不仅是命令成功，还包括冻结来源、metadata 与
 - 不同 owner 或规则的 Mutation Claim 是否竞争同一物理资源；
 - 重复 Extract 是否收敛，失败 owner 是否保持旧快照。
 
-使用者可以直接查询 `project.db` 的 owner、group、unit、Mutation Claim 和 recipe。数据库能够证明
-持久化关系，不能单独证明运行时可见性；玩家是否真的看到文本仍由消费者或实际界面
-建立。数据与完成语义见[文本提取现行规格](extraction.md)。
+使用者可以直接查询 `project.db` 的 owner、group、unit、recipe 和 Mutation Claim
+冲突摘要。完整逻辑 Claim 由 group kind、location 和 recipe 重建；摘要表不是完整 Claim
+清单，不能用其行数代替提取覆盖判断。数据库能够证明持久化关系，不能单独证明运行时
+可见性；玩家是否真的看到文本仍由消费者或实际界面建立。数据与完成语义见
+[文本提取现行规格](extraction.md)。
 
 ## 直接检查或修改项目数据库
 
 `project.db` 是使用者可直接控制的项目状态，不要求所有调查和修复都绕回 CLI。直接查询
-适合核对 metadata、owner 快照、逻辑组、语义单元、Mutation Claim、译文和 state；直接 DDL
-或 DML 也可以用于明确的修复或自有扩展。ATT 不为通用 SQLite 工具自动取得项目租约，
-因此写入前应先确认没有同项目命令并发运行，并根据副作用风险保留可恢复副本或事务边界。
+适合核对 metadata、owner 快照、逻辑组、语义单元、recipe、Claim 冲突摘要、译文和
+state；直接 DDL 或 DML 也可以用于明确的修复或自有扩展。ATT 不为通用 SQLite 工具自动
+取得项目租约，因此写入前应先确认没有同项目命令并发运行，并根据副作用风险保留可恢复
+副本或事务边界。
 
 可信 Lua 和外部 SQLite 工具都可以执行直接 SQL，但官方支持的扩展路径只保证脚本私有
 命名空间表。ATT 受管 schema 不是稳定扩展 API。直接修改受管表属于高级操作，作者承担
-全部 schema 与业务不变量；修改后应重新证明相应不变量，而不是把“SQL 已提交”当作业务完成。例如，
-译文与 translation state 必须成对存在或成对为空；owner 的来源/资产指纹、group、unit、
-Mutation Claim 和 recipe 必须仍描述同一快照；来源是否可见、译文是否合格仍需由对应消费者和
-验收语义证明。发现不一致时，先判断冻结来源、提取资产、译文或数据库哪一个是权威事实，
-再选择重提取、重翻译、精确修复或恢复副本，不盲目重算校验值掩盖漂移。
+全部 schema 与业务不变量；修改后应重新证明相应不变量，而不是把“SQL 已提交”当作业务
+完成。例如，译文与 translation state 必须成对存在或成对为空；owner 的来源/资产指纹、
+group、unit、recipe、从 recipe 重建的完整逻辑 Claim 和持久化冲突摘要必须仍描述同一
+快照；来源是否可见、译文是否合格仍需由对应消费者和验收语义证明。位置、Mutation
+resource、unit role 和 recipe 还必须保持现行 compact canonical JSON 字节，语义等价的
+非规范表示也会被当作无效项目状态。发现不一致时，先判断冻结来源、提取资产、译文或
+数据库哪一个是权威事实，再选择重提取、重翻译、精确修复或恢复副本，不盲目重算校验值
+掩盖漂移。
 
 项目表关系见[初始化现行规格](init.md#3-当前项目数据库)，SQLite 连接与事务的运行边界见
 [SQLite 运行时](../runtime/sqlite.md)。
@@ -222,8 +228,8 @@ Lua。开始前确认：
 
 `prompts.locale = "auto"` 跟随本进程已经解析的有效 UI locale，显式值覆盖它；两者都与
 游戏 LanguagePair 分离。system 模板再用项目规范源、目标 `LanguageId` 建立翻译方向。
-配置没有默认 Profile，也不为 Prompt 尝试父语言、中文、英文、目录首项或旧语言对文件
-回退。关闭思考输出时不读取 `thinking.md`。使用者应根据当前环境修改实际配置和外置
+配置没有默认 Profile；Prompt 只按所选 locale 的精确路径读取。关闭思考输出时不读取
+`thinking.md`。使用者应根据当前环境修改实际配置和外置
 资源，而不是复制一份万能模板。模型实际输入、模板硬限制、JSON/`<why>` 信封、ID 到
 字符串数组 wire、上下文、行形状、ATT token 保护和协议失败边界见
 [系统提示词编写指南](prompts.md)。

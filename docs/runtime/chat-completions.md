@@ -2,13 +2,18 @@
 
 ## 1. 职责
 
-`OpenAiChatCompletionExecutor` 按受信 Client 执行一次非流式 Chat Completions 请求。它拥有进程内全局并发、有限队列、连接池、超时、客户端 RPM/burst 和实际 HTTP 协议；不自动重试、不探测供应商、不修复响应。
+`OpenAiChatCompletionExecutor` 按所选 Client 执行非流式请求，拥有共享 HTTP 连接池、
+Client 活动请求许可、可选 RPM limiter、连接/读取/完整请求超时和实际 HTTP 协议。
+Standard 与 Translate Lua 共享同一 Client 约束。
 
-Standard 的有限重试属于 RPG Maker 翻译策略；Translate Lua 自己决定调用和重试。二者共享同一个 Executor、Client、连接池、全局容量和 RPM/burst。
+只有 Client 的 `max_concurrent_requests` 和可选 `rate_limit` 控制请求。没有第二层用户队列、
+总容量或本地准入截止时间；等待活动许可或 RPM 时只响应取消/shutdown，不算模型失败或
+重试。响应完成后立即释放 Client 的 HTTP 许可；Translate 自己的确定性顺序提交窗口是
+独立的内部背压边界，不计作活动 HTTP 请求，也不进入用户配置。
 
 ## 2. 请求
 
-默认正文严格只有：
+基础正文是：
 
 ```json
 {
@@ -18,40 +23,38 @@ Standard 的有限重试属于 RPG Maker 翻译策略；Translate Lua 自己决�
 }
 ```
 
-Client 的严格 JSON `parameters` 顶层字段随后合并；程序不解释 `n`、token 上限或供应商私有字段。只有 `model`、`messages`、`stream` 不得被覆盖。API key 固定作为 Bearer Header 发送，不进入 Debug、错误、普通项目日志或终端输出。
+Client 的严格 JSON `parameters` 随后合并；`model`、`messages`、`stream` 不得覆盖。程序
+不解释供应商私有字段。API key 只作为 Bearer Header 发送。
 
-准入顺序为完整序列化、总容量（活动+队列）、Client RPM/burst、活动许可、单次 HTTP。队列已满或准入超时返回 Retryable；Future 取消通过 RAII 归还尚未进入 HTTP 的许可。Client `timeout_ms` 限制完整请求，连接和连续读取超时限制相应网络阶段。
+`connect_timeout_ms` 限制建立连接，`read_timeout_ms` 限制连续读取，
+`request_timeout_ms` 限制完整 HTTP 请求。它们不限制本地许可或限速等待。
 
-## 3. 供应商成功信封
+## 3. 成功信封
 
-HTTP 200 后只严格要求实际消费的核心：
+HTTP 200 后要求：
 
 - 正文是一个完整 JSON 值；
-- `choices` 中恰有一个 choice 的 `index` 是数值 `0`；
+- `choices` 中恰有一个数值 `index == 0`；
 - 该 choice 的 `message.content` 与 `finish_reason` 是字符串。
 
-不检查成功响应 `Content-Type`，不要求 `message.role`，并忽略其他 choice 和供应商扩展字段中不被消费的内容。多个 choice 可以存在，但数值 `index == 0` 必须恰好一个。
+其他 choice 和未消费供应商扩展字段忽略。`x-request-id`、正文 `id` 与 `usage` 使用宽松
+可选读取；缺失或类型不符时为 `None`，互不补位。模型 `message.content` 仍由 RPG Maker
+层执行完整 ID、数组形状、ATT token、语言和逐 ID 验收。
 
-元数据采用宽松读取：
+## 4. 失败与重试
 
-- `x-request-id` 缺失或不能作为有效字符串使用时为 `None`；
-- 正文 `id` 缺失、null 或类型错误时为 `None`；
-- `usage` 缺失、null、不完整或类型错误时整体为 `None`。
+Retryable 包含 DNS/连接/发送/读取/完整请求超时或中断，以及 HTTP 408、429、500、502、
+503、504。`Retry-After` 支持秒数和 HTTP-date，并受 Client `max_retry_after_ms` 约束。
+Standard 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。
 
-因此 `provider_request_id` 与 `provider_response_id` 都是可选值，互不补位；允许记录该事实的类型化项目日志 payload 写 `null`，Lua 返回 `nil`。`final_response_usage` 只表示最终成功 HTTP 响应可用的 usage，不声称覆盖失败尝试或完整计费。
-
-这里的宽松只针对第三方供应商 HTTP 信封。`message.content` 内由模型生成的 RPG Maker
-翻译正文仍执行完整的 ID 到字符串数组对象、权威行形状、ATT token、语言和逐 ID 内容
-验收，二者不得混为一层。
-
-## 4. 失败分类
-
-Retryable 包含队列满、准入超时、DNS/连接/发送/读取超时或连接中断，以及 HTTP 408、429、500、502、503、504。`Retry-After` 支持非负秒数和 HTTP-date，根只返回该事实，不自行等待或重试。
-
-Fatal 包含请求序列化/构造、TLS/证书、其他 HTTP 状态，以及 HTTP 200 正文不是完整 JSON、没有唯一数值 index 0、所选 content/finish_reason 不是字符串。非 200 响应不保存完整错误正文。
+Fatal 包含请求构造、TLS/证书、其他 HTTP 状态，以及 200 响应不满足成功信封。安全诊断
+公开 HTTP 状态、`Retry-After` 和允许公开的供应商 code/type，但不保存任意错误正文。
 
 ## 5. 生命周期与隐私
 
-shutdown 停止新准入并唤醒尚未进入 HTTP 的等待者；已开始的请求继续到单次明确终态。所有路径归还容量，shutdown 等待活动请求结束。
+shutdown 停止新请求并唤醒尚未进入 HTTP 的等待者；已进入 HTTP 的请求继续到明确终态。
+所有路径通过 RAII 归还活动许可。
 
-错误、Debug、普通项目日志和终端不包含 API key、Authorization Header、完整 messages、完整请求正文、完整响应、模型正文、原文或译文。Client Debug 不显示秘密或完整 parameters 值。日志写入、轮转或关闭失败不停止请求、不丢弃合法响应，也不改变原本的退出码。
+Debug、CLI 和 JSONL 不包含 API key、Header 值、完整 Client parameters、Prompt/messages、
+完整请求/响应、模型正文、原文或译文。它们仍必须显示安全的 Client ID、阶段、URL 对象、
+HTTP 状态、超时种类和状态影响。

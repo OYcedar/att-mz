@@ -9,19 +9,24 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::str::Utf8Error;
-use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
+    SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
-use crate::rpg_maker::model::TextUnitContent;
+use crate::rpg_maker::json::StackSafeJsonValue;
+use crate::rpg_maker::model::{ProjectionModelError, TextUnitContent};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::text::{DataFileName, StandardDataFile};
 
 use self::definition::{FileRuleSource, RuleSource, RulesDefinition, RulesDefinitionError};
 use self::matcher::{
-    MatchedRuleTarget, RulesMatchError, RulesMatchInput, RulesPlugin, match_rule,
-    merge_rule_matches,
+    MatchedRuleTarget, RulesMatchError, RulesMatchInput, RulesPlugin, RulesSourceMatchWorkUnit,
+    build_source_match_plan, finish_source_matches,
 };
 use super::document::{
     DocumentReadProgress, PluginConfiguration, RpgMakerDocumentId, RpgMakerDocumentSelection,
@@ -98,6 +103,37 @@ impl RulesProgram {
 pub(crate) enum RulesProgramError {
     InvalidUtf8(Utf8Error),
     InvalidDefinition(RulesDefinitionError),
+}
+
+impl RulesProgramError {
+    pub(crate) fn safe_diagnostic(&self, rules_path: &std::path::Path) -> SafeDiagnostic {
+        match self {
+            Self::InvalidUtf8(source) => SafeDiagnostic::new(
+                DiagnosticCode::ExtractRules,
+                DiagnosticStage::CommandPreparation,
+                DiagnosticSubject::path(rules_path),
+                DiagnosticReason::InvalidUtf8 {
+                    valid_up_to: u64::try_from(source.valid_up_to()).unwrap_or(u64::MAX),
+                    error_len: source
+                        .error_len()
+                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+                },
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            ),
+            Self::InvalidDefinition(source) => SafeDiagnostic::new(
+                DiagnosticCode::ExtractRules,
+                DiagnosticStage::CommandPreparation,
+                DiagnosticSubject::path(rules_path),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::RulesDefinitionInvalid,
+                    source.safe_detail(),
+                ),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            ),
+        }
+    }
 }
 
 impl fmt::Display for RulesProgramError {
@@ -252,28 +288,24 @@ where
         input: RulesMatchInput,
         progress: ExtractProgress,
     ) -> Result<RulesSnapshot, ParallelRulesBuildError<C::Error>> {
-        let input = Arc::new(input);
-        let merge_input = Arc::clone(&input);
-        let rules = definition.into_rules();
-        let total = u64::try_from(rules.len()).expect("Rules 规则数必须能用 u64 表达");
+        let plan = build_source_match_plan(definition.into_rules(), input);
+        let (rule_count, work_units) = plan.into_parts();
+        let total = u64::try_from(work_units.len()).expect("Rules 来源工作单元数必须能用 u64 表达");
         progress.determinate(ExtractProgressPhase::RulesMatches, 0, total);
         let completed = self
             .cpu_executor
-            .execute_ordered_map_observed(rules, move |rule| match_rule(&rule, &input), {
+            .execute_ordered_map_observed(work_units, RulesSourceMatchWorkUnit::run, {
                 let progress = progress.clone();
                 move |completed| {
                     progress.determinate(ExtractProgressPhase::RulesMatches, completed, total);
                 }
             })
             .await
-            .map_err(ParallelRulesBuildError::MatchCompute)?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ParallelRulesBuildError::Match)?;
+            .map_err(ParallelRulesBuildError::MatchCompute)?;
 
         self.cpu_executor
             .execute(move || {
-                let targets = merge_rule_matches(completed, &merge_input)
+                let targets = finish_source_matches(rule_count, completed)
                     .map_err(ParallelRulesBuildError::Match)?;
                 snapshot_from_targets(targets).map_err(ParallelRulesBuildError::Snapshot)
             })
@@ -325,7 +357,7 @@ fn build_match_input(
                 rules
             },
         );
-    let (documents, plugins) = documents.into_parts();
+    let (documents, plugins) = documents.into_shared_parts();
     let files = documents
         .into_iter()
         .map(|(id, value)| (document_file_name(id), value))
@@ -337,7 +369,7 @@ fn build_match_input(
         .into_iter()
         .flatten()
         .collect();
-    Ok(RulesMatchInput::new(files, plugins))
+    Ok(RulesMatchInput::from_shared(files, plugins))
 }
 
 fn document_file_name(id: RpgMakerDocumentId) -> String {
@@ -352,33 +384,53 @@ fn plugin_for_rules(
     plugin: PluginConfiguration,
     rules: &BTreeMap<String, usize>,
 ) -> Result<Option<RulesPlugin>, RulesMatchError> {
-    let (index, fields) = plugin.into_parts();
-    let Some(name) = fields.get("name").and_then(Value::as_str) else {
+    let (index, mut fields) = plugin.into_parts();
+    let Some(name) = fields
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
         return Ok(None);
     };
-    let Some(rule_number) = rules.get(name).copied() else {
+    let Some(rule_number) = rules.get(&name).copied() else {
         return Ok(None);
     };
+    let status = fields.get("status");
     let enabled = fields
         .get("status")
         .and_then(Value::as_bool)
-        .ok_or_else(|| RulesMatchError::InvalidTarget {
-            rule_number,
-            message: format!("插件 {name:?} 的 status 必须是布尔值"),
+        .ok_or_else(|| {
+            RulesMatchError::invalid_plugin_field(
+                rule_number,
+                index,
+                name.clone(),
+                "status",
+                "boolean",
+                status,
+            )
         })?;
     let parameters = if enabled {
-        fields
-            .get("parameters")
-            .and_then(Value::as_object)
-            .cloned()
-            .ok_or_else(|| RulesMatchError::InvalidTarget {
+        if !fields.get("parameters").is_some_and(Value::is_object) {
+            return Err(RulesMatchError::invalid_plugin_field(
                 rule_number,
-                message: format!("插件 {name:?} 的 parameters 必须是对象"),
-            })?
+                index,
+                name.clone(),
+                "parameters",
+                "object",
+                fields.get("parameters"),
+            ));
+        }
+        let parameters = fields
+            .as_object_mut()
+            .and_then(|fields| fields.remove("parameters"))
+            .expect("已经确认插件 parameters 是对象字段");
+        StackSafeJsonValue::new(parameters)
     } else {
-        Default::default()
+        StackSafeJsonValue::new(Value::Object(Default::default()))
     };
-    Ok(Some(RulesPlugin::new(index, name, enabled, parameters)))
+    Ok(Some(RulesPlugin::from_stack_safe(
+        index, name, enabled, parameters,
+    )))
 }
 
 fn snapshot_from_targets(
@@ -452,6 +504,196 @@ pub(crate) enum RulesExtractionError<DE, SE, CE> {
     },
 }
 
+impl<DE, SE, CE> RulesExtractionError<DE, SE, CE>
+where
+    DE: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    SE: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    CE: Error + Send + Sync + 'static,
+    CpuTaskExecutionError<CE>: SafeDiagnosticSource,
+{
+    /// 在直接依赖仍持有文件路径、OS/SQLite code 与 CPU 终态时建立具体安全投影。
+    ///
+    /// 借用型映射与拥有型 `FailureReport` 共用这份闭集投影；拥有型路径另行保留具体
+    /// source 以及 Store 已经拆出的相关错误。
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        match self {
+            Self::ReadDocuments { rules_path, source } => {
+                let mut diagnostic = source.safe_diagnostic_source(
+                    DiagnosticStage::Extract,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckProjectState,
+                );
+                // 当前共享文档读取器也服务 WriteBack，其自身投影仍携带 WriteBack 阶段；
+                // Rules 在仍知道真实调用意图时纠正阶段和责任 code，同时保留具体原因。
+                diagnostic.code = DiagnosticCode::ExtractRules;
+                diagnostic.stage = DiagnosticStage::Extract;
+                with_rules_context(diagnostic, rules_path, "read_documents")
+            }
+            Self::InvalidTarget { rules_path, source } => source.safe_diagnostic(rules_path),
+            Self::InvalidSnapshot { rules_path, source } => {
+                snapshot_model_diagnostic(source, rules_path)
+            }
+            Self::MatchSourceCompute { rules_path, source } => with_rules_context(
+                source.safe_diagnostic_source(
+                    DiagnosticStage::Extract,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                ),
+                rules_path,
+                "match_source",
+            ),
+            Self::BuildSnapshotCompute { rules_path, source } => with_rules_context(
+                source.safe_diagnostic_source(
+                    DiagnosticStage::Extract,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                ),
+                rules_path,
+                "build_snapshot",
+            ),
+            Self::Persist { rules_path, source } => with_rules_context(
+                source.safe_diagnostic_source(
+                    DiagnosticStage::Extract,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckProjectState,
+                ),
+                rules_path,
+                "persist_snapshot",
+            )
+            .with_recovery(RecoveryFact::component("owner=rules")),
+        }
+    }
+
+    /// 消费完整 Rules 阶段错误，保留具体主类型以及 Store 已经拆出的相关错误。
+    pub(crate) fn into_failure_report(self) -> FailureReport {
+        let diagnostic = self.safe_diagnostic();
+        match self {
+            Self::ReadDocuments { source, .. } => {
+                FailureReport::new(ReportedFailure::new(diagnostic, source))
+            }
+            Self::InvalidTarget { source, .. } => {
+                FailureReport::new(ReportedFailure::new(diagnostic, source))
+            }
+            Self::InvalidSnapshot { source, .. } => {
+                FailureReport::new(ReportedFailure::new(diagnostic, source))
+            }
+            Self::MatchSourceCompute { rules_path, source } => source
+                .into_failure_report(
+                    DiagnosticStage::Extract,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                )
+                .with_primary_recovery(RecoveryFact::path(rules_path))
+                .with_primary_recovery(RecoveryFact::component("rules_operation=match_source")),
+            Self::BuildSnapshotCompute { rules_path, source } => source
+                .into_failure_report(
+                    DiagnosticStage::Extract,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                )
+                .with_primary_recovery(RecoveryFact::path(rules_path))
+                .with_primary_recovery(RecoveryFact::component("rules_operation=build_snapshot")),
+            Self::Persist { rules_path, source } => source
+                .into_failure_report(
+                    DiagnosticStage::Extract,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckProjectState,
+                )
+                .with_primary_recovery(RecoveryFact::path(rules_path))
+                .with_primary_recovery(RecoveryFact::component("rules_operation=persist_snapshot"))
+                .with_primary_recovery(RecoveryFact::component("owner=rules")),
+        }
+    }
+}
+
+fn with_rules_context(
+    diagnostic: SafeDiagnostic,
+    rules_path: &std::path::Path,
+    operation: &'static str,
+) -> SafeDiagnostic {
+    diagnostic
+        .with_recovery(RecoveryFact::path(rules_path))
+        .with_recovery(RecoveryFact::component(format!(
+            "rules_operation={operation}"
+        )))
+}
+
+fn snapshot_model_diagnostic(
+    source: &SnapshotModelError,
+    rules_path: &std::path::Path,
+) -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        DiagnosticCode::ExtractRules,
+        DiagnosticStage::Extract,
+        DiagnosticSubject::path(rules_path),
+        DiagnosticReason::failure_with_detail(
+            DiagnosticFailureKind::RulesSnapshotInvalid,
+            snapshot_model_fact(source),
+        ),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::ReportBug,
+    )
+}
+
+fn snapshot_model_fact(source: &SnapshotModelError) -> String {
+    let variant = match source {
+        SnapshotModelError::BlankSourceContent { .. } => "blank_source_content",
+        SnapshotModelError::ContentShapeMismatch { .. } => "content_shape_mismatch",
+        SnapshotModelError::DirectGroupRequiresValue { .. } => "direct_group_requires_value",
+        SnapshotModelError::InvalidSourceLine { .. } => "invalid_source_line",
+        SnapshotModelError::EmptyGroup { .. } => "empty_group",
+        SnapshotModelError::EmptyProjection { .. } => "empty_projection",
+        SnapshotModelError::DuplicateLogicalLocation { .. } => "duplicate_logical_location",
+        SnapshotModelError::ConflictingGroupKind { .. } => "conflicting_group_kind",
+        SnapshotModelError::MutationClaimConflict { .. } => "mutation_claim_conflict",
+        SnapshotModelError::RecipeRoleMismatch { .. } => "recipe_role_mismatch",
+        SnapshotModelError::RecipeLineMismatch { .. } => "recipe_line_mismatch",
+        SnapshotModelError::Projection(source) => projection_model_variant(source),
+    };
+    format!("snapshot_error={variant}")
+}
+
+fn projection_model_variant(source: &ProjectionModelError) -> &'static str {
+    match source {
+        ProjectionModelError::EmptyScalarFieldKey => "projection.empty_scalar_field_key",
+        ProjectionModelError::CommentTagBackingRequired => {
+            "projection.comment_tag_backing_required"
+        }
+        ProjectionModelError::InvalidCommentTagBacking => "projection.invalid_comment_tag_backing",
+        ProjectionModelError::EventBlockHeaderMustBeValue => {
+            "projection.event_block_header_must_be_value"
+        }
+        ProjectionModelError::EventBlockCoverageRequired => {
+            "projection.event_block_coverage_required"
+        }
+        ProjectionModelError::InvalidEventBlockCoverage => {
+            "projection.invalid_event_block_coverage"
+        }
+        ProjectionModelError::MutationClaimTargetMismatch => {
+            "projection.mutation_claim_target_mismatch"
+        }
+        ProjectionModelError::InvalidDialoguePhysicalLocation => {
+            "projection.invalid_dialogue_physical_location"
+        }
+        ProjectionModelError::RecipeHasNoTextSlot => "projection.recipe_has_no_text_slot",
+        ProjectionModelError::DuplicateProjectionSlot { .. } => {
+            "projection.duplicate_projection_slot"
+        }
+        ProjectionModelError::MultipleBodyLinesInPhysicalLine => {
+            "projection.multiple_body_lines_in_physical_line"
+        }
+        ProjectionModelError::DuplicateDialogueBodyLine { .. } => {
+            "projection.duplicate_dialogue_body_line"
+        }
+        ProjectionModelError::NonContiguousDialogueBodyLines { .. } => {
+            "projection.non_contiguous_dialogue_body_lines"
+        }
+        ProjectionModelError::MixedDirectAndInlineSpeaker => {
+            "projection.mixed_direct_and_inline_speaker"
+        }
+    }
+}
+
 impl<DE, SE, CE> fmt::Display for RulesExtractionError<DE, SE, CE>
 where
     DE: Error,
@@ -517,6 +759,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+    use std::fs::File;
+    use std::io::{BufWriter, Write as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -530,6 +775,96 @@ mod tests {
         DirectTextPart, DirectTextRecipe, TextProjectionRecipe, TextUnitRole,
     };
     use crate::rpg_maker::text::MapId;
+    use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
+    use crate::storage::file_system::FileReader;
+
+    #[tokio::test]
+    async fn thousands_of_semantic_rules_larger_than_seventeen_mibibytes_cross_production_read_and_state_round_trip()
+     {
+        const RULE_COUNT: usize = 4_096;
+        const PATH_SEGMENTS_PER_RULE: usize = 112;
+
+        let directory = tempfile::tempdir().expect("应建立大 Rules 临时目录");
+        let path = directory.path().join("large-semantic-rules.toml");
+        let file = File::create(&path).expect("应建立大 Rules 文件");
+        let mut writer = BufWriter::new(file);
+        for index in 0..RULE_COUNT {
+            let mut semantic_path = String::with_capacity(PATH_SEGMENTS_PER_RULE * 56);
+            for segment in 0..PATH_SEGMENTS_PER_RULE {
+                if segment != 0 {
+                    semantic_path.push('.');
+                }
+                write!(
+                    semantic_path,
+                    "node_{index:04}_{segment:02}_localized_text_payload_field"
+                )
+                .expect("写入 String 不会失败");
+            }
+            writeln!(
+                writer,
+                "[[rule]]\nplugin = \"plugin-{index:04}\"\npath = '{semantic_path}'\ndecode_json = true"
+            )
+            .expect("应写入语义 Rules");
+        }
+        writer.flush().expect("应刷新大 Rules 文件");
+        let file = writer.into_inner().expect("应取回大 Rules 文件");
+        file.sync_all().expect("应完整落盘大 Rules 文件");
+        assert!(
+            file.metadata().expect("应读取 Rules 元数据").len() > 17 * 1024 * 1024,
+            "测试输入必须真实超过 17 MiB"
+        );
+
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("生产文件系统应启动");
+        let source = file_system
+            .read_file(path)
+            .await
+            .expect("17 MiB 以上语义 Rules 应通过生产文件读取");
+        let diagnostic_path = source.resolved_path().to_path_buf();
+        let program = RulesProgram::from_toml(diagnostic_path.clone(), source.into_bytes())
+            .expect("全部规则应通过生产 TOML、来源、路径和 canonical 编译边界");
+
+        assert_eq!(program.definition.rules().len(), RULE_COUNT);
+        assert_eq!(
+            program
+                .definition
+                .rules()
+                .iter()
+                .map(|rule| rule.path().expect("Plugin 规则必须有路径").segments().len())
+                .sum::<usize>(),
+            RULE_COUNT * PATH_SEGMENTS_PER_RULE
+        );
+        assert!(program.canonical_json().len() > 17 * 1024 * 1024);
+        let last = program
+            .definition
+            .rules()
+            .last()
+            .expect("大 Rules 必须包含最后一条规则");
+        assert_eq!(last.rule_number(), RULE_COUNT);
+        let last_path = last.path().expect("Plugin 规则必须有路径");
+        assert_eq!(last_path.segments().len(), PATH_SEGMENTS_PER_RULE);
+        assert_eq!(
+            last_path.segments().first(),
+            Some(&definition::PathSegment::Key(
+                "node_4095_00_localized_text_payload_field".to_owned()
+            ))
+        );
+        assert_eq!(
+            last_path.segments().last(),
+            Some(&definition::PathSegment::Key(
+                "node_4095_111_localized_text_payload_field".to_owned()
+            ))
+        );
+        assert!(last.decode_json());
+
+        let canonical_snapshot = program.canonical_json().to_owned();
+        drop(program);
+        let restored = RulesProgram::from_canonical_json(diagnostic_path, &canonical_snapshot)
+            .expect("17 MiB 以上 canonical Rules 应能从项目状态重建");
+        assert_eq!(restored.definition.rules().len(), RULE_COUNT);
+
+        file_system.shutdown().await.expect("文件系统应关闭");
+    }
 
     #[derive(Clone, Default)]
     struct RecordingProgress(Arc<Mutex<Vec<ProgressSnapshot<ExtractProgressPhase>>>>);
@@ -999,6 +1334,60 @@ path = 'entries[0].right.Name'
         );
     }
 
+    #[test]
+    fn rules_definition_diagnostics_keep_typed_locations_without_rule_payloads() {
+        fn toml_diagnostic(source: &str) -> String {
+            let path = PathBuf::from("rules/safe-main.toml");
+            let error = RulesProgram::from_toml(path.clone(), source.as_bytes().to_vec())
+                .expect_err("样本必须被 Rules 输入边界拒绝");
+            serde_json::to_string(&error.safe_diagnostic(&path)).expect("诊断应可序列化")
+        }
+
+        let invalid_toml =
+            toml_diagnostic("[[rule]]\ncode = 'TOML_VALUE_SENTINEL'\nparameter = 0\n");
+        assert!(invalid_toml.contains("format=toml"));
+        assert!(invalid_toml.contains("byte_start="));
+        assert!(!invalid_toml.contains("TOML_VALUE_SENTINEL"));
+
+        let invalid_path = toml_diagnostic(
+            "[[rule]]\nfile = 'Actors.json'\npath = 'PATH_PAYLOAD_SENTINEL..name'\n",
+        );
+        assert!(invalid_path.contains("rule=1"));
+        assert!(invalid_path.contains("target=path"));
+        assert!(invalid_path.contains("path_error=unexpected_dot"));
+        assert!(invalid_path.contains("byte_offset="));
+        assert!(!invalid_path.contains("PATH_PAYLOAD_SENTINEL"));
+
+        let invalid_pattern = toml_diagnostic(
+            "[[rule]]\ncode = 401\nparameter = 0\npattern = '(?<text>PATTERN_PAYLOAD_SENTINEL'\n",
+        );
+        assert!(invalid_pattern.contains("rule=1"));
+        assert!(invalid_pattern.contains("pcre2_kind=compile"));
+        assert!(invalid_pattern.contains("pcre2_code="));
+        assert!(invalid_pattern.contains("pcre2_offset="));
+        assert!(!invalid_pattern.contains("PATTERN_PAYLOAD_SENTINEL"));
+
+        let invalid_capture = toml_diagnostic(
+            "[[rule]]\ncode = 401\nparameter = 0\npattern = '(?<CAPTURE_NAME_SENTINEL>.+)'\n",
+        );
+        assert!(invalid_capture.contains("actual_count=1"));
+        assert!(!invalid_capture.contains("CAPTURE_NAME_SENTINEL"));
+
+        let path = PathBuf::from("rules/safe-main.toml");
+        let canonical_error = RulesProgram::from_canonical_json(
+            path.clone(),
+            r#"[{"code":"CANONICAL_VALUE_SENTINEL","parameter":0}]"#,
+        )
+        .expect_err("错误类型的 canonical 字段必须失败");
+        let canonical = serde_json::to_string(&canonical_error.safe_diagnostic(&path))
+            .expect("canonical 诊断应可序列化");
+        assert!(canonical.contains("format=canonical_json"));
+        assert!(canonical.contains("json_class=data"));
+        assert!(canonical.contains("json_line=1"));
+        assert!(canonical.contains("json_column="));
+        assert!(!canonical.contains("CANONICAL_VALUE_SENTINEL"));
+    }
+
     #[tokio::test]
     async fn failed_candidate_never_replaces_or_deactivates_the_previous_snapshot() {
         let state = Arc::new(StoreState::default());
@@ -1122,6 +1511,235 @@ path = '[].name'
     }
 
     impl Error for FakeError {}
+
+    impl SafeDiagnosticSource for FakeError {
+        fn safe_diagnostic_source(
+            &self,
+            stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+            fallback_action: DiagnosticAction,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                stage,
+                DiagnosticSubject::component("fake_rules_dependency"),
+                DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+                impact,
+                fallback_action,
+            )
+        }
+    }
+
+    impl SafeDiagnosticSource for CpuTaskExecutionError<FakeError> {
+        fn safe_diagnostic_source(
+            &self,
+            stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+            fallback_action: DiagnosticAction,
+        ) -> SafeDiagnostic {
+            match self {
+                Self::Unavailable(source) => {
+                    source.safe_diagnostic_source(stage, impact, fallback_action)
+                }
+                Self::Cancelled => SafeDiagnostic::new(
+                    DiagnosticCode::InternalOperation,
+                    stage,
+                    DiagnosticSubject::component("fake Rules CPU worker"),
+                    DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
+                    impact,
+                    DiagnosticAction::Retry,
+                ),
+                Self::TaskPanicked => SafeDiagnostic::new(
+                    DiagnosticCode::InternalOperation,
+                    stage,
+                    DiagnosticSubject::component("fake Rules CPU worker"),
+                    DiagnosticReason::failure(DiagnosticFailureKind::WorkerPanicked),
+                    impact,
+                    DiagnosticAction::ReportBug,
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn rules_projection_keeps_rule_and_path_without_matcher_free_text() {
+        let sensitive_parameter = json!("ORIGINAL_TEXT_AND_JSON_SECRET");
+        let error: RulesExtractionError<FakeError, FakeError, FakeError> =
+            RulesExtractionError::InvalidTarget {
+                rules_path: PathBuf::from("rules/main.toml"),
+                source: RulesMatchError::invalid_plugin_field(
+                    7,
+                    3,
+                    "QuestPlugin".to_owned(),
+                    "parameters",
+                    "object",
+                    Some(&sensitive_parameter),
+                ),
+            };
+        let diagnostic = error.safe_diagnostic();
+        let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
+
+        assert!(!serialized.contains("ORIGINAL_TEXT_AND_JSON_SECRET"));
+        assert!(serialized.contains("extract.rules"));
+        assert!(serialized.contains("rules/main.toml"));
+        assert!(serialized.contains("rules_invalid_target"));
+        assert!(serialized.contains("rule=7"));
+        assert!(serialized.contains("plugin_index=3"));
+        assert!(serialized.contains("target=parameters"));
+        assert!(serialized.contains("expected=object"));
+        assert!(serialized.contains("actual=string"));
+    }
+
+    #[test]
+    fn rules_failure_report_keeps_typed_document_cpu_match_and_snapshot_diagnostics() {
+        type TypedRulesError = RulesExtractionError<
+            crate::runtime::filesystem::SystemFileSystemError,
+            crate::runtime::sqlite::SqliteRuntimeError,
+            crate::runtime::cpu::CpuExecutorUnavailable,
+        >;
+
+        let rules_path = PathBuf::from("rules/main.toml");
+        let document_path = PathBuf::from(r"C:\games\demo\data\Items.json");
+        let read_error: TypedRulesError = RulesExtractionError::ReadDocuments {
+            rules_path: rules_path.clone(),
+            source: crate::runtime::filesystem::SystemFileSystemError::Io {
+                operation: "read_rules_document",
+                path: document_path.clone(),
+                source: std::io::Error::from_raw_os_error(5),
+            },
+        };
+        let borrowed = read_error.safe_diagnostic();
+        assert_eq!(borrowed.code, DiagnosticCode::ExtractRules);
+        assert_eq!(borrowed.stage, DiagnosticStage::Extract);
+        let report = read_error.into_failure_report();
+        assert!(
+            report
+                .primary
+                .source_error()
+                .is::<crate::runtime::filesystem::SystemFileSystemError>()
+        );
+        let read = serde_json::to_string(report.primary.public()).expect("文档诊断应可序列化");
+        assert_eq!(
+            report.primary.public().subject,
+            DiagnosticSubject::path(&document_path)
+        );
+        assert!(read.contains(rules_path.to_string_lossy().as_ref()));
+        assert!(read.contains("read_rules_document"));
+        assert!(read.contains("\"raw_os_code\":5"));
+
+        let cpu_error: TypedRulesError = RulesExtractionError::MatchSourceCompute {
+            rules_path: rules_path.clone(),
+            source: CpuTaskExecutionError::Unavailable(
+                crate::runtime::cpu::CpuExecutorUnavailable::StatePoisoned,
+            ),
+        };
+        let report = cpu_error.into_failure_report();
+        assert!(
+            report
+                .primary
+                .source_error()
+                .is::<CpuTaskExecutionError<crate::runtime::cpu::CpuExecutorUnavailable>>()
+        );
+        let cpu = serde_json::to_string(report.primary.public()).expect("CPU 诊断应可序列化");
+        assert!(cpu.contains("worker_panicked"));
+        assert!(cpu.contains("rules_operation=match_source"));
+        assert!(cpu.contains("rules/main.toml"));
+
+        let build_cpu_error: TypedRulesError = RulesExtractionError::BuildSnapshotCompute {
+            rules_path: rules_path.clone(),
+            source: CpuTaskExecutionError::Cancelled,
+        };
+        let report = build_cpu_error.into_failure_report();
+        let build_cpu =
+            serde_json::to_string(report.primary.public()).expect("快照 CPU 诊断应可序列化");
+        assert!(build_cpu.contains("lock_cancelled"));
+        assert!(build_cpu.contains("rules_operation=build_snapshot"));
+
+        let sensitive_parameter = json!("ORIGINAL_AND_JSON_SENTINEL");
+        let target_error: TypedRulesError = RulesExtractionError::InvalidTarget {
+            rules_path: rules_path.clone(),
+            source: RulesMatchError::invalid_plugin_field(
+                7,
+                4,
+                "QuestPlugin".to_owned(),
+                "parameters",
+                "object",
+                Some(&sensitive_parameter),
+            ),
+        };
+        let report = target_error.into_failure_report();
+        assert!(report.primary.source_error().is::<RulesMatchError>());
+        let target = serde_json::to_string(report.primary.public()).expect("匹配诊断应可序列化");
+        assert!(target.contains("rules_invalid_target"));
+        assert!(target.contains("rule=7"));
+        assert!(!target.contains("ORIGINAL_AND_JSON_SENTINEL"));
+
+        let snapshot_error: TypedRulesError = RulesExtractionError::InvalidSnapshot {
+            rules_path,
+            source: SnapshotModelError::Projection(ProjectionModelError::EmptyScalarFieldKey),
+        };
+        let report = snapshot_error.into_failure_report();
+        assert!(report.primary.source_error().is::<SnapshotModelError>());
+        let snapshot = serde_json::to_string(report.primary.public()).expect("快照诊断应可序列化");
+        assert!(snapshot.contains("rules_snapshot_invalid"));
+        assert!(snapshot.contains("snapshot_error=projection.empty_scalar_field_key"));
+    }
+
+    #[test]
+    fn rules_persist_report_preserves_store_outcome_unknown_and_related_cleanup() {
+        type StoreError = crate::rpg_maker::extract::store::RpgMakerExtractionAssetStoreError<
+            crate::runtime::cpu::CpuExecutorUnavailable,
+            crate::runtime::sqlite::SqliteRuntimeError,
+        >;
+        type TypedRulesError = RulesExtractionError<
+            crate::runtime::filesystem::SystemFileSystemError,
+            StoreError,
+            crate::runtime::cpu::CpuExecutorUnavailable,
+        >;
+
+        let rules_path = PathBuf::from("rules/main.toml");
+        let database_path = PathBuf::from(r"C:\projects\demo\project.db");
+        let error: TypedRulesError = RulesExtractionError::Persist {
+            rules_path: rules_path.clone(),
+            source: StoreError::OutcomeUnknown {
+                database_path: database_path.clone(),
+                source: crate::runtime::sqlite::SqliteRuntimeError::Cleanup {
+                    primary: Box::new(crate::runtime::sqlite::SqliteRuntimeError::Io {
+                        operation: "commit_rules_snapshot",
+                        path: database_path.clone(),
+                        source: std::io::Error::from_raw_os_error(1117),
+                    }),
+                    failures: vec![crate::runtime::sqlite::SqliteRuntimeError::Io {
+                        operation: "close_rules_snapshot",
+                        path: database_path,
+                        source: std::io::Error::from_raw_os_error(6),
+                    }],
+                },
+            },
+        };
+
+        let borrowed = error.safe_diagnostic();
+        assert_eq!(borrowed.impact, DiagnosticImpact::OutcomeUnknown);
+        let report = error.into_failure_report();
+        assert_eq!(
+            report.primary.public().impact,
+            DiagnosticImpact::OutcomeUnknown
+        );
+        assert_eq!(report.related.len(), 1);
+        assert_eq!(
+            report.related[0].public().impact,
+            DiagnosticImpact::OutcomeUnknown
+        );
+        let primary =
+            serde_json::to_string(report.primary.public()).expect("Store 主诊断应可序列化");
+        let related =
+            serde_json::to_string(report.related[0].public()).expect("Store 相关诊断应可序列化");
+        assert!(primary.contains("rules/main.toml"));
+        assert!(primary.contains("project.db"));
+        assert!(primary.contains("outcome_unknown"));
+        assert!(primary.contains("\"raw_os_code\":1117"));
+        assert!(related.contains("\"raw_os_code\":6"));
+    }
 
     #[derive(Clone)]
     struct FakeDocumentReader {

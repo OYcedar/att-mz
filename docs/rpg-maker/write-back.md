@@ -41,17 +41,23 @@ WriteBack 的 Lua 选择属于项目运行方案：
 ## 2. 读取与发布前不变量
 
 项目开启边界先读取 metadata；Standard Reader 随后在同一个只读数据库视图中读取活动
-owner 状态、`standard_text_group/unit`、`standard_mutation_claim` 和译文。读取后重算每个 owner 的资产
-快照指纹，并验证：
+owner 状态、`standard_text_group/unit`、`standard_mutation_claim` 冲突摘要和译文。
+Reader 从每组的 kind、location 与 recipe 重建完整逻辑 Mutation Claim，随后重算每个
+owner 的资产快照指纹，并验证：
 
 - owner 的来源指纹等于项目当前来源；
-- group recipe、语义单元、源上下文和 Mutation Claim 构成同一完整快照；
+- group recipe、语义单元、源上下文和重建出的完整逻辑 Mutation Claim 构成同一完整快照；
 - Claim 可从 recipe 重建，且 Intent/Exclusive 资源锁在组内、owner 内、跨 owner 均无冲突；
+- 重建集合按每个 `(owner, resource)` 折叠后的确定性摘要与
+  `standard_mutation_claim` 逐行一致；Exclusive 必须唯一，多个 Intent 的代表必须是
+  自然顺序最早的 group；
 - 译文与 translation state 成对存在；
 - 当前源文档仍能逐字满足 recipe 记录的命令形状、长度、值和嵌套 JSON 边界。
 
 任一事实不成立都在修改或发布前失败。WriteBack 不读取外部 TOML，也不重新执行 PCRE2；
 姓名、局部文本和嵌套 JSON 的选择均以 Extract 时物化的 recipe 为权威。
+`standard_mutation_claim` 是必须与 recipe 相符的跨 owner 冲突摘要，不是缓存，也不能
+代替完整逻辑 Claim 重建、旧指纹复算或发布前冲突验证。
 
 ## 3. 普通值与结构化 recipe
 
@@ -137,11 +143,12 @@ Standard 与可选 Lua 完成后，领域边界无条件验证候选：
 - MZ 顶层恰好是普通 `data/` 与 `js/`；
 - MV 顶层恰好是普通 `www/`，且 `www` 内恰好是普通 `data/` 与 `js/`。
 
-随后通用发布器复核完整文件清单、普通对象、Windows 等价名称、reparse、hardlink、
-file ID、文件数、深度和字节预算。被改写文档以合法 JSON 重新编码；未成为 mutation
-Claim 之外的字段和未知命令字段保持来源值。未改写文件从来源稳定复制并同步；被改写文档
-在 Standard 初始候选中作为 overlay 直接写入并同步一次，不先复制同一路径的来源字节
-再覆盖；本次启用的 Lua 仍可按其既有契约编辑该候选。
+随后通用发布器只做一次完整候选复核，覆盖普通对象、Windows 等价名称、reparse、
+hardlink 和稳定 file ID，不对文件数、深度或字节数设置 ATT 人工上限。被改写文档以合法
+JSON 重新编码；未成为 mutation Claim 的字段和未知命令字段保持来源值。候选 manifest
+拥有稳定 ordinal，未改写文件复制、overlay 写入和不同物理文档改写作为独立文件任务
+并行执行；完成顺序不改变主错误。Standard 后的 Lua 继续编辑同一不可见候选，随后进行
+上述唯一完整校验和唯一目录交换。
 
 目录交换未生效且 publisher 已确认 `NotPublished` 时，顶层报告项目暂时不可用；它不
 表示数据库损坏或提取过期。已经生效、需要恢复或结果未知的终态继续分别保留其更强的
@@ -153,9 +160,8 @@ WriteBack 运行方案。业务失败、取消或必要收尾失败不更新方�
 建议下次显式传参。输出已经生效但方案保存失败时，诊断必须明确区分“结果已生效”和
 “运行方案未保存”，不能伪装成普通成功。
 
-项目日志只接收不可失败的结构化事件。启动、排队、锁、写入、轮转或关闭故障至多显示
-一次本地化警告，不阻止候选验证、发布或方案保存，也不改变退出码。日志从不作为恢复
-依据。
+项目日志只接收闭集结构化事件。启动、写入或关闭故障明确显示日志路径、操作和安全的
+底层原因，但不阻止候选验证、发布或方案保存，也不改变退出码。日志从不作为恢复依据。
 
 实时进度只报告已经建立的真实事实：资产读取、规划与文档改写在分母可得时显示局部计数，
 Lua、候选验证和目录发布使用阶段 spinner。局部达到 `N/N` 后仍进入“正在收尾/保存运行

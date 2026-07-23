@@ -100,12 +100,10 @@ pub(crate) struct ExactPathCaseMismatch {
 }
 
 impl ExactPathCaseMismatch {
-    #[cfg(test)]
     pub(crate) fn requested(&self) -> &Path {
         &self.requested
     }
 
-    #[cfg(test)]
     pub(crate) fn actual(&self) -> &Path {
         &self.actual
     }

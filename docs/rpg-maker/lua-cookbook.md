@@ -46,8 +46,8 @@ ctx.extract.replace_standard({
 })
 ```
 
-若文件实际叫 `questentries.json`，不要改成大小写别名去“兼容”：应以真实目录项为权威，
-同时修改脚本；大小写不一致会显式失败。`Map000.json` 可由 `data_file` 打开，但它是自定义
+若文件实际叫 `questentries.json`，应以真实目录项为权威并同步修改脚本；大小写不一致会
+显式失败。`Map000.json` 可由 `data_file` 打开，但它是自定义
 DataFile，不是 Map 0。
 
 ## 2. Translate state：首跑、复用和失效
@@ -144,8 +144,8 @@ end
 ctx.output.write_json(path, entries)
 ```
 
-这里先断言候选原文，防止把旧协议的译文写入结构已变化的新游戏。相同 source 与私有表
-重复运行两次，编码结果相同。脚本返回后由 Host 统一验证和发布；不要在返回前把私有表
+这里先断言候选原文，防止把与当前候选结构不一致的私有译文写入新游戏。相同 source 与
+私有表重复运行两次，编码结果相同。脚本返回后由 Host 统一验证和发布；不要在返回前把私有表
 写成“published”，因为之后仍可能在候选验证、目录发布或必要收尾时失败。
 
 需要布局时，在写 JSON 前调用 `ctx.write_back.layout`，并同时处理 `applied` 与正常的

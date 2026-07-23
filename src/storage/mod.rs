@@ -7,3 +7,4 @@ pub(crate) mod file_system;
 pub(crate) mod scoped_path;
 pub(crate) mod sqlite;
 pub(crate) mod sqlite_session;
+pub(crate) mod sqlite_transaction_session;

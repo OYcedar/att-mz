@@ -1,12 +1,16 @@
 //! 标准译文状态的原子对账与提交。
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
+    SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
 use crate::rpg_maker::location_codec::{
@@ -19,51 +23,58 @@ use crate::rpg_maker::project_database::{
     PLACEHOLDER_RULES_RESOURCE_KIND, TERMINOLOGY_RESOURCE_KIND,
 };
 use crate::storage::sqlite::{
-    ExecuteTransactionError, SqliteBatch, SqliteCommand, SqliteQuery, SqliteTransactionExecutor,
-    SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
+    ExecuteTransactionError, SqliteBatch, SqliteCommand, SqliteQuery, SqliteTransactionPlan,
+    SqliteTransactionStep, SqliteValue,
+};
+use crate::storage::sqlite_session::{
+    SqliteInteractiveSessionFinalizationError, SqliteInteractiveSessionFinalizationFailure,
+    SqliteInteractiveSessionFinalizer,
+};
+use crate::storage::sqlite_transaction_session::{
+    OpenSqliteTransactionSessionError, SqliteTransactionSessionFactory,
+    SqliteTransactionSessionOperations,
 };
 
 use super::standard::{
     StandardTranslationResultStore, TranslationPlanPreparation, TranslationSnapshotBaseline,
-    TranslationTaskOutcome, TranslationUnitIdentity, ValidatedTranslationTaskResult,
+    TranslationTaskOutcome, TranslationUnitIdentity,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RpgMakerStandardTranslationResultStorageConfig {
-    units_per_encode_job: NonZeroUsize,
-}
-
-impl RpgMakerStandardTranslationResultStorageConfig {
-    pub(crate) const fn new(units_per_encode_job: NonZeroUsize) -> Self {
-        Self {
-            units_per_encode_job,
-        }
-    }
-}
-
-pub(crate) struct RpgMakerStandardTranslationResultStorageService<S, C> {
+pub(crate) struct RpgMakerStandardTranslationResultStorageService<S, C>
+where
+    S: SqliteTransactionSessionFactory,
+{
     sqlite: S,
     cpu: C,
-    config: RpgMakerStandardTranslationResultStorageConfig,
+    session: tokio::sync::Mutex<TranslationTransactionSession<S::Operations, S::Finalizer>>,
 }
 
-impl<S, C> RpgMakerStandardTranslationResultStorageService<S, C> {
-    pub(crate) fn new(
-        sqlite: S,
-        cpu: C,
-        config: RpgMakerStandardTranslationResultStorageConfig,
-    ) -> Self {
+enum TranslationTransactionSession<O, F> {
+    Unopened,
+    Open {
+        database_path: PathBuf,
+        operations: Arc<O>,
+        finalizer: F,
+    },
+    Finalized,
+}
+
+impl<S, C> RpgMakerStandardTranslationResultStorageService<S, C>
+where
+    S: SqliteTransactionSessionFactory,
+{
+    pub(crate) fn new(sqlite: S, cpu: C) -> Self {
         Self {
             sqlite,
             cpu,
-            config,
+            session: tokio::sync::Mutex::new(TranslationTransactionSession::Unopened),
         }
     }
 }
 
 impl<S, C> StandardTranslationResultStore for RpgMakerStandardTranslationResultStorageService<S, C>
 where
-    S: SqliteTransactionExecutor,
+    S: SqliteTransactionSessionFactory,
     C: CpuTaskExecutor,
 {
     type PreparedCommit = RpgMakerPreparedTranslationCommit;
@@ -95,6 +106,10 @@ where
         self.execute(project.database_path().to_path_buf(), plan)
             .await
     }
+
+    async fn finalize(&self) -> Result<(), Self::Error> {
+        self.finalize_session().await
+    }
 }
 
 /// 已完成全部纯计算编码与校验、只等待独立事务提交的任务结果。
@@ -104,7 +119,7 @@ pub(crate) struct RpgMakerPreparedTranslationCommit {
 
 impl<S, C> RpgMakerStandardTranslationResultStorageService<S, C>
 where
-    S: SqliteTransactionExecutor,
+    S: SqliteTransactionSessionFactory,
     C: CpuTaskExecutor,
 {
     async fn encode_preparation_plan(
@@ -114,32 +129,22 @@ where
         SqliteTransactionPlan,
         RpgMakerStandardTranslationResultStorageError<S::Error, C::Error>,
     > {
-        let units_per_job = self.config.units_per_encode_job.get();
-        let (jobs, terminology_json, placeholder_rules_json, snapshot_baseline) = self
+        let (work, terminology_json, placeholder_rules_json, snapshot_baseline) = self
             .cpu
-            .execute(move || {
-                let (work, terminology_json, placeholder_rules_json, snapshot_baseline) =
-                    preparation_work(preparation)?;
-                Ok::<_, ResultStoragePlanError>((
-                    split_jobs(work, units_per_job),
-                    terminology_json,
-                    placeholder_rules_json,
-                    snapshot_baseline,
-                ))
-            })
+            .execute(move || preparation_work(preparation))
             .await
             .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?
             .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)?;
-        let batches = self
+        let units = self
             .cpu
-            .execute_ordered_map(jobs, encode_preparation_job)
+            .execute_ordered_map(work, encode_preparation_unit)
             .await
             .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?;
 
         self.cpu
             .execute(move || {
                 finish_preparation_plan(
-                    batches.into_iter().collect::<Result<Vec<_>, _>>()?,
+                    units.into_iter().collect::<Result<Vec<_>, _>>()?,
                     terminology_json,
                     placeholder_rules_json,
                     snapshot_baseline,
@@ -157,28 +162,30 @@ where
         RpgMakerPreparedTranslationCommit,
         RpgMakerStandardTranslationResultStorageError<S::Error, C::Error>,
     > {
-        let units_per_job = self.config.units_per_encode_job.get();
-        let jobs = self
+        let work = self
             .cpu
-            .execute(move || {
-                let result = outcome
-                    .validated_result()
-                    .expect("Store 只应准备至少包含一项合格译文的任务结果");
-                commit_work(result).map(|work| split_jobs(work, units_per_job))
-            })
+            .execute(move || commit_work(outcome))
             .await
             .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?
             .map_err(RpgMakerStandardTranslationResultStorageError::InvalidPlan)?;
-        let batches = self
+        let decisions = self
             .cpu
-            .execute_ordered_map(jobs, encode_commit_job)
+            .execute_ordered_map(work.decisions, encode_commit_decision)
+            .await
+            .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?;
+        let units = self
+            .cpu
+            .execute_ordered_map(work.units, encode_commit_unit)
             .await
             .map_err(RpgMakerStandardTranslationResultStorageError::ScheduleEncoding)?;
 
         self.cpu
             .execute(move || {
                 Ok::<_, ResultStoragePlanError>(RpgMakerPreparedTranslationCommit {
-                    plan: finish_commit_plan(batches.into_iter().collect::<Result<Vec<_>, _>>()?)?,
+                    plan: finish_commit_plan(
+                        decisions.into_iter().collect::<Result<Vec<_>, _>>()?,
+                        units.into_iter().collect::<Result<Vec<_>, _>>()?,
+                    )?,
                 })
             })
             .await
@@ -191,10 +198,81 @@ where
         database_path: PathBuf,
         plan: SqliteTransactionPlan,
     ) -> Result<(), RpgMakerStandardTranslationResultStorageError<S::Error, C::Error>> {
-        self.sqlite
-            .execute_transaction(database_path.clone(), plan)
+        let mut session = self.session.lock().await;
+        if matches!(*session, TranslationTransactionSession::Unopened) {
+            let opened = self
+                .sqlite
+                .open_existing_transaction_session(database_path.clone())
+                .await
+                .map_err(|error| map_session_open_error(database_path.clone(), error))?;
+            let (operations, finalizer) = opened.into_parts();
+            *session = TranslationTransactionSession::Open {
+                database_path: database_path.clone(),
+                operations,
+                finalizer,
+            };
+        }
+
+        let TranslationTransactionSession::Open {
+            database_path: opened_path,
+            operations,
+            ..
+        } = &*session
+        else {
+            return Err(
+                RpgMakerStandardTranslationResultStorageError::SessionFinalized { database_path },
+            );
+        };
+        if opened_path != &database_path {
+            return Err(
+                RpgMakerStandardTranslationResultStorageError::SessionDatabaseChanged {
+                    opened_path: opened_path.clone(),
+                    requested_path: database_path,
+                },
+            );
+        }
+        operations
+            .execute_transaction(plan)
             .await
             .map_err(|error| map_transaction_error(database_path, error))
+    }
+
+    async fn finalize_session(
+        &self,
+    ) -> Result<(), RpgMakerStandardTranslationResultStorageError<S::Error, C::Error>> {
+        let open = {
+            let mut session = self.session.lock().await;
+            match std::mem::replace(&mut *session, TranslationTransactionSession::Finalized) {
+                TranslationTransactionSession::Unopened
+                | TranslationTransactionSession::Finalized => None,
+                TranslationTransactionSession::Open {
+                    database_path,
+                    operations,
+                    finalizer,
+                } => {
+                    // 先释放最后一个操作面引用，随后终结令牌关闭命令通道并等待 actor。
+                    drop(operations);
+                    Some((database_path, finalizer))
+                }
+            }
+        };
+        let Some((database_path, finalizer)) = open else {
+            return Ok(());
+        };
+        let report = finalizer.finalize().await.map_err(|source| {
+            RpgMakerStandardTranslationResultStorageError::FinalizationFailed {
+                database_path: database_path.clone(),
+                source,
+            }
+        })?;
+        if report.had_unclosed_transaction() {
+            return Err(
+                RpgMakerStandardTranslationResultStorageError::FinalizationRolledBackTransaction {
+                    database_path,
+                },
+            );
+        }
+        Ok(())
     }
 }
 
@@ -202,10 +280,221 @@ where
 pub(crate) enum RpgMakerStandardTranslationResultStorageError<S, C> {
     ScheduleEncoding(CpuTaskExecutionError<C>),
     InvalidPlan(ResultStoragePlanError),
-    DatabaseNotFound { database_path: PathBuf },
-    StalePlan { database_path: PathBuf },
-    NotCommitted { database_path: PathBuf, source: S },
-    OutcomeUnknown { database_path: PathBuf, source: S },
+    DatabaseNotFound {
+        database_path: PathBuf,
+    },
+    StalePlan {
+        database_path: PathBuf,
+    },
+    NotCommitted {
+        database_path: PathBuf,
+        source: S,
+    },
+    OutcomeUnknown {
+        database_path: PathBuf,
+        source: S,
+    },
+    SessionDatabaseChanged {
+        opened_path: PathBuf,
+        requested_path: PathBuf,
+    },
+    SessionFinalized {
+        database_path: PathBuf,
+    },
+    FinalizationRolledBackTransaction {
+        database_path: PathBuf,
+    },
+    FinalizationFailed {
+        database_path: PathBuf,
+        source: SqliteInteractiveSessionFinalizationError<S>,
+    },
+}
+
+impl<S, C> RpgMakerStandardTranslationResultStorageError<S, C>
+where
+    S: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    /// 在结果存储仍持有数据库路径、事务终态和具体根错误时建立公开投影。
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        match self {
+            Self::ScheduleEncoding(source) => source.safe_diagnostic_source(
+                DiagnosticStage::Translate,
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::ReportBug,
+            ),
+            Self::InvalidPlan(source) => source.safe_diagnostic(),
+            Self::DatabaseNotFound { database_path } => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                DiagnosticStage::Translate,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::StalePlan { database_path } => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                DiagnosticStage::Translate,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::Retry,
+            ),
+            Self::NotCommitted {
+                database_path,
+                source,
+            } => translation_storage_source_diagnostic(
+                source,
+                database_path,
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::Retry,
+            )
+            .with_recovery(RecoveryFact::transaction("rolled_back")),
+            Self::OutcomeUnknown {
+                database_path,
+                source,
+            } => translation_storage_source_diagnostic(
+                source,
+                database_path,
+                DiagnosticImpact::OutcomeUnknown,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            )
+            .with_recovery(RecoveryFact::transaction("outcome_unknown")),
+            Self::SessionDatabaseChanged {
+                opened_path,
+                requested_path,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                DiagnosticStage::Translate,
+                DiagnosticSubject::path(requested_path),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InternalInvariant,
+                    "storage_error=session_database_changed",
+                ),
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::ReportBug,
+            )
+            .with_recovery(RecoveryFact::path(opened_path)),
+            Self::SessionFinalized { database_path } => SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                DiagnosticStage::Translate,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InternalInvariant,
+                    "storage_error=session_finalized",
+                ),
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::ReportBug,
+            ),
+            Self::FinalizationRolledBackTransaction { database_path } => SafeDiagnostic::new(
+                DiagnosticCode::StateFinalizationFailed,
+                DiagnosticStage::Translate,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::TransactionRolledBack),
+                DiagnosticImpact::StateAppliedFinalizationFailed,
+                DiagnosticAction::Retry,
+            )
+            .with_recovery(RecoveryFact::transaction("rolled_back_during_finalization")),
+            Self::FinalizationFailed {
+                database_path,
+                source: finalization,
+            } => {
+                let mut diagnostic = translation_storage_finalization_diagnostic(
+                    finalization.primary(),
+                    database_path,
+                );
+                if finalization.connection_close().is_some() {
+                    diagnostic = diagnostic
+                        .with_recovery(RecoveryFact::component("sqlite_connection_close=failed"));
+                }
+                diagnostic
+            }
+        }
+    }
+}
+
+impl<S, C> RpgMakerStandardTranslationResultStorageError<S, C>
+where
+    S: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    C: Error + Send + Sync + 'static,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    /// 消费结果存储错误；SQLite 收尾的主失败与连接关闭失败分别进入报告。
+    pub(crate) fn into_failure_report(self) -> FailureReport {
+        match self {
+            Self::FinalizationFailed {
+                database_path,
+                source,
+            } => {
+                let (primary, connection_close) = source.into_parts();
+                let primary_diagnostic =
+                    translation_storage_finalization_diagnostic(&primary, &database_path);
+                let primary_source = match primary {
+                    SqliteInteractiveSessionFinalizationFailure::CleanupFailed(source)
+                    | SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(source) => source,
+                };
+                let mut report =
+                    FailureReport::new(ReportedFailure::new(primary_diagnostic, primary_source));
+                if let Some(source) = connection_close {
+                    let diagnostic = translation_storage_source_diagnostic(
+                        &source,
+                        &database_path,
+                        DiagnosticImpact::StateAppliedFinalizationFailed,
+                        DiagnosticAction::Retry,
+                    )
+                    .with_recovery(RecoveryFact::component("sqlite_connection_close=failed"));
+                    report = report.with_related(ReportedFailure::new(diagnostic, source));
+                }
+                report
+            }
+            source => {
+                let diagnostic = source.safe_diagnostic();
+                FailureReport::new(ReportedFailure::new(diagnostic, source))
+            }
+        }
+    }
+}
+
+fn translation_storage_finalization_diagnostic<S>(
+    finalization: &SqliteInteractiveSessionFinalizationFailure<S>,
+    database_path: &std::path::Path,
+) -> SafeDiagnostic
+where
+    S: SafeDiagnosticSource,
+{
+    let (source, impact, action, transaction) = match finalization {
+        SqliteInteractiveSessionFinalizationFailure::CleanupFailed(source) => (
+            source,
+            DiagnosticImpact::StateAppliedFinalizationFailed,
+            DiagnosticAction::Retry,
+            "cleanup_failed",
+        ),
+        SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(source) => (
+            source,
+            DiagnosticImpact::OutcomeUnknown,
+            DiagnosticAction::PreserveRecoveryArtifacts,
+            "outcome_unknown",
+        ),
+    };
+    translation_storage_source_diagnostic(source, database_path, impact, action)
+        .with_recovery(RecoveryFact::transaction(transaction))
+}
+
+fn translation_storage_source_diagnostic<S>(
+    source: &S,
+    database_path: &std::path::Path,
+    impact: DiagnosticImpact,
+    action: DiagnosticAction,
+) -> SafeDiagnostic
+where
+    S: SafeDiagnosticSource,
+{
+    let mut diagnostic = source.safe_diagnostic_source(DiagnosticStage::Translate, impact, action);
+    diagnostic.stage = DiagnosticStage::Translate;
+    diagnostic.subject = DiagnosticSubject::path(database_path);
+    diagnostic.impact = impact;
+    diagnostic.action = action;
+    diagnostic
 }
 
 impl<S: fmt::Display, C: fmt::Display> fmt::Display
@@ -239,6 +528,33 @@ impl<S: fmt::Display, C: fmt::Display> fmt::Display
                 "无法确认译文事务是否已提交到 {}：{source}",
                 database_path.display()
             ),
+            Self::SessionDatabaseChanged {
+                opened_path,
+                requested_path,
+            } => write!(
+                formatter,
+                "同一轮翻译不能把数据库会话从 {} 切换到 {}",
+                opened_path.display(),
+                requested_path.display()
+            ),
+            Self::SessionFinalized { database_path } => write!(
+                formatter,
+                "项目数据库会话已终结，不能继续写入 {}",
+                database_path.display()
+            ),
+            Self::FinalizationRolledBackTransaction { database_path } => write!(
+                formatter,
+                "终结项目数据库会话时发现并回滚了未结束事务：{}",
+                database_path.display()
+            ),
+            Self::FinalizationFailed {
+                database_path,
+                source,
+            } => write!(
+                formatter,
+                "无法终结项目数据库会话 {}：{source}",
+                database_path.display()
+            ),
         }
     }
 }
@@ -251,7 +567,12 @@ impl<S: Error + 'static, C: Error + 'static> Error
             Self::ScheduleEncoding(source) => Some(source),
             Self::InvalidPlan(source) => Some(source),
             Self::NotCommitted { source, .. } | Self::OutcomeUnknown { source, .. } => Some(source),
-            Self::DatabaseNotFound { .. } | Self::StalePlan { .. } => None,
+            Self::FinalizationFailed { source, .. } => Some(source),
+            Self::DatabaseNotFound { .. }
+            | Self::StalePlan { .. }
+            | Self::SessionDatabaseChanged { .. }
+            | Self::SessionFinalized { .. }
+            | Self::FinalizationRolledBackTransaction { .. } => None,
         }
     }
 }
@@ -270,6 +591,108 @@ pub(crate) enum ResultStoragePlanError {
     MismatchedPropagationSourceContent,
     MismatchedPropagationSourceContext,
     DuplicateUnit,
+    InvalidCommitDecisionSequence,
+    MissingCommitDecisionUnit,
+}
+
+impl ResultStoragePlanError {
+    /// 只投影闭集不变量、结构字段和类型化编解码事实，不公开正文或任意错误文本。
+    fn safe_diagnostic(&self) -> SafeDiagnostic {
+        let (subject, detail) = match self {
+            Self::Location(source) => (
+                DiagnosticSubject::field("group_location"),
+                result_storage_location_codec_detail(source),
+            ),
+            Self::Projection(source) => (
+                DiagnosticSubject::field("projection_recipe_json"),
+                result_storage_projection_codec_detail(source),
+            ),
+            Self::Content(source) => (
+                DiagnosticSubject::field("text_unit_content_json"),
+                result_storage_json_detail("content_encode", source),
+            ),
+            Self::EmptyTaskResult => (
+                DiagnosticSubject::component("translation_task_result"),
+                "plan_error=empty_task_result".to_owned(),
+            ),
+            Self::EmptyReuseTargets => (
+                DiagnosticSubject::component("translation_reuse_plan"),
+                "plan_error=empty_reuse_targets".to_owned(),
+            ),
+            Self::BlankTranslation => (
+                DiagnosticSubject::field("translation"),
+                "plan_error=blank_translation".to_owned(),
+            ),
+            Self::InconsistentTranslationState => (
+                DiagnosticSubject::field("translation_state"),
+                "plan_error=inconsistent_translation_state".to_owned(),
+            ),
+            Self::MismatchedReuseSourceContent => (
+                DiagnosticSubject::field("source_content"),
+                "plan_error=mismatched_reuse_source_content".to_owned(),
+            ),
+            Self::MismatchedReuseSourceContext => (
+                DiagnosticSubject::field("source_context"),
+                "plan_error=mismatched_reuse_source_context".to_owned(),
+            ),
+            Self::MismatchedPropagationSourceContent => (
+                DiagnosticSubject::field("source_content"),
+                "plan_error=mismatched_propagation_source_content".to_owned(),
+            ),
+            Self::MismatchedPropagationSourceContext => (
+                DiagnosticSubject::field("source_context"),
+                "plan_error=mismatched_propagation_source_context".to_owned(),
+            ),
+            Self::DuplicateUnit => (
+                DiagnosticSubject::component("translation_commit_units"),
+                "plan_error=duplicate_unit".to_owned(),
+            ),
+            Self::InvalidCommitDecisionSequence => (
+                DiagnosticSubject::component("translation_commit_decisions"),
+                "plan_error=invalid_commit_decision_sequence".to_owned(),
+            ),
+            Self::MissingCommitDecisionUnit => (
+                DiagnosticSubject::component("translation_commit_decisions"),
+                "plan_error=missing_commit_decision_unit".to_owned(),
+            ),
+        };
+        SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::Translate,
+            subject,
+            DiagnosticReason::failure_with_detail(DiagnosticFailureKind::InternalInvariant, detail),
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::ReportBug,
+        )
+    }
+}
+
+fn result_storage_location_codec_detail(source: &RpgMakerLocationCodecError) -> String {
+    format!(
+        "plan_error=location_codec; {}",
+        source.safe_diagnostic_detail()
+    )
+}
+
+fn result_storage_projection_codec_detail(source: &RpgMakerProjectionCodecError) -> String {
+    format!(
+        "plan_error=projection_codec; {}",
+        source.safe_diagnostic_detail()
+    )
+}
+
+fn result_storage_json_detail(operation: &'static str, source: &serde_json::Error) -> String {
+    let category = match source.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!(
+        "plan_error=json; operation={operation}; json_category={category}; json_line={}; json_column={}",
+        source.line(),
+        source.column()
+    )
 }
 
 impl fmt::Display for ResultStoragePlanError {
@@ -297,6 +720,12 @@ impl fmt::Display for ResultStoragePlanError {
                 formatter.write_str("译文代表与传播目标的源上下文不一致")
             }
             Self::DuplicateUnit => formatter.write_str("同一事务重复修改同一文本单元"),
+            Self::InvalidCommitDecisionSequence => {
+                formatter.write_str("任务 decision 与提交工作之间的自然顺序不一致")
+            }
+            Self::MissingCommitDecisionUnit => {
+                formatter.write_str("任务 decision 没有代表单元或传播目标提交工作")
+            }
         }
     }
 }
@@ -329,13 +758,13 @@ enum PreparationUnitWork {
     },
     ReuseSeed {
         identity: TranslationUnitIdentity,
-        expected_translation: TextUnitContent,
+        expected_translation: Arc<TextUnitContent>,
         expected_translation_state: Sha256Fingerprint,
     },
     ReuseTarget {
-        seed_source_content: TextUnitContent,
-        seed_source_context_json: String,
-        translation: TextUnitContent,
+        seed_source_content: Arc<TextUnitContent>,
+        seed_source_context_json: Arc<str>,
+        translation: Arc<TextUnitContent>,
         identity: TranslationUnitIdentity,
         expected_translation: Option<TextUnitContent>,
         expected_translation_state: Option<Sha256Fingerprint>,
@@ -363,17 +792,36 @@ enum EncodedPreparationUnit {
     },
 }
 
+#[derive(Clone, Copy)]
+enum CommitUnitPosition {
+    Representative,
+    PropagationTarget(usize),
+}
+
+struct CommitPlanWork {
+    decisions: Vec<CommitDecisionWork>,
+    units: Vec<CommitUnitWork>,
+}
+
+struct CommitDecisionWork {
+    outcome: Arc<TranslationTaskOutcome>,
+    decision_index: usize,
+}
+
 struct CommitUnitWork {
-    identity: TranslationUnitIdentity,
-    required_source_content: Option<TextUnitContent>,
-    required_source_context_json: Option<String>,
-    translation: TextUnitContent,
-    translation_state: Sha256Fingerprint,
+    outcome: Arc<TranslationTaskOutcome>,
+    decision_index: usize,
+    position: CommitUnitPosition,
+}
+
+struct EncodedCommitDecision {
+    decision_index: usize,
+    translation: String,
 }
 
 struct EncodedCommitUnit {
+    decision_index: usize,
     identity: EncodedIdentity,
-    translation: String,
     translation_state: Sha256Fingerprint,
 }
 
@@ -390,38 +838,53 @@ fn preparation_work(
 > {
     let (invalidations, reuses, terminology_json, placeholder_rules_json, _, _, snapshot_baseline) =
         preparation.into_parts();
-    let mut work = Vec::new();
+    let work_capacity = invalidations.len()
+        + reuses
+            .iter()
+            .map(|reuse| 1 + reuse.targets().len())
+            .sum::<usize>();
+    let mut work = Vec::with_capacity(work_capacity);
 
     for invalidation in invalidations {
+        let (identity, expected_translation, expected_translation_state) =
+            invalidation.into_parts();
         work.push(PreparationUnitWork::Invalidation {
-            identity: invalidation.identity().clone(),
-            expected_translation: invalidation.expected_translation().clone(),
-            expected_translation_state: invalidation.expected_translation_state(),
+            identity,
+            expected_translation,
+            expected_translation_state,
         });
     }
 
     for reuse in reuses {
-        if reuse.targets().is_empty() {
+        let (seed, targets) = reuse.into_parts();
+        if targets.is_empty() {
             return Err(ResultStoragePlanError::EmptyReuseTargets);
         }
-        let seed_source_content = reuse.seed().identity().source_content().clone();
-        let seed_source_context_json = reuse.seed().identity().source_context_json().to_owned();
-        let translation = reuse.seed().expected_translation().clone();
+        let (seed_identity, translation, expected_translation_state) = seed.into_parts();
+        let seed_source_content = Arc::new(seed_identity.source_content().clone());
+        let seed_source_context_json = Arc::<str>::from(seed_identity.source_context_json());
+        let translation = Arc::new(translation);
         work.push(PreparationUnitWork::ReuseSeed {
-            identity: reuse.seed().identity().clone(),
-            expected_translation: translation.clone(),
-            expected_translation_state: reuse.seed().expected_translation_state(),
+            identity: seed_identity,
+            expected_translation: Arc::clone(&translation),
+            expected_translation_state,
         });
 
-        for target in reuse.targets() {
+        for target in targets {
+            let (
+                identity,
+                expected_translation,
+                expected_translation_state,
+                replacement_translation_state,
+            ) = target.into_parts();
             work.push(PreparationUnitWork::ReuseTarget {
-                seed_source_content: seed_source_content.clone(),
-                seed_source_context_json: seed_source_context_json.clone(),
-                translation: translation.clone(),
-                identity: target.identity().clone(),
-                expected_translation: target.expected_translation().cloned(),
-                expected_translation_state: target.expected_translation_state(),
-                replacement_translation_state: target.replacement_translation_state(),
+                seed_source_content: Arc::clone(&seed_source_content),
+                seed_source_context_json: Arc::clone(&seed_source_context_json),
+                translation: Arc::clone(&translation),
+                identity,
+                expected_translation,
+                expected_translation_state,
+                replacement_translation_state,
             });
         }
     }
@@ -434,87 +897,85 @@ fn preparation_work(
     ))
 }
 
-fn encode_preparation_job(
-    job: Vec<PreparationUnitWork>,
-) -> Result<Vec<EncodedPreparationUnit>, ResultStoragePlanError> {
-    job.into_iter()
-        .map(|work| match work {
-            PreparationUnitWork::Invalidation {
-                identity,
-                expected_translation,
+fn encode_preparation_unit(
+    work: PreparationUnitWork,
+) -> Result<EncodedPreparationUnit, ResultStoragePlanError> {
+    match work {
+        PreparationUnitWork::Invalidation {
+            identity,
+            expected_translation,
+            expected_translation_state,
+        } => {
+            ensure_nonblank(&expected_translation)?;
+            Ok(EncodedPreparationUnit::Invalidation {
+                identity: encode_identity(&identity)?,
+                expected_translation: encode_content(&expected_translation)?,
                 expected_translation_state,
-            } => {
-                ensure_nonblank(&expected_translation)?;
-                Ok(EncodedPreparationUnit::Invalidation {
-                    identity: encode_identity(&identity)?,
-                    expected_translation: encode_content(&expected_translation)?,
-                    expected_translation_state,
-                })
-            }
-            PreparationUnitWork::ReuseSeed {
-                identity,
-                expected_translation,
+            })
+        }
+        PreparationUnitWork::ReuseSeed {
+            identity,
+            expected_translation,
+            expected_translation_state,
+        } => {
+            ensure_nonblank(&expected_translation)?;
+            Ok(EncodedPreparationUnit::ReuseSeed {
+                identity: encode_identity(&identity)?,
+                expected_translation: encode_content(&expected_translation)?,
                 expected_translation_state,
-            } => {
-                ensure_nonblank(&expected_translation)?;
-                Ok(EncodedPreparationUnit::ReuseSeed {
-                    identity: encode_identity(&identity)?,
-                    expected_translation: encode_content(&expected_translation)?,
-                    expected_translation_state,
-                })
+            })
+        }
+        PreparationUnitWork::ReuseTarget {
+            seed_source_content,
+            seed_source_context_json,
+            translation,
+            identity,
+            expected_translation,
+            expected_translation_state,
+            replacement_translation_state,
+        } => {
+            ensure_nonblank(translation.as_ref())?;
+            if identity.source_content() != seed_source_content.as_ref() {
+                return Err(ResultStoragePlanError::MismatchedReuseSourceContent);
             }
-            PreparationUnitWork::ReuseTarget {
-                seed_source_content,
-                seed_source_context_json,
-                translation,
-                identity,
-                expected_translation,
+            if identity.source_context_json() != seed_source_context_json.as_ref() {
+                return Err(ResultStoragePlanError::MismatchedReuseSourceContext);
+            }
+            if expected_translation.is_some() != expected_translation_state.is_some() {
+                return Err(ResultStoragePlanError::InconsistentTranslationState);
+            }
+            if expected_translation
+                .as_ref()
+                .is_some_and(TextUnitContent::is_blank)
+            {
+                return Err(ResultStoragePlanError::BlankTranslation);
+            }
+            Ok(EncodedPreparationUnit::ReuseTarget {
+                translation: encode_content(translation.as_ref())?,
+                identity: encode_identity(&identity)?,
+                expected_translation: expected_translation
+                    .as_ref()
+                    .map(encode_content)
+                    .transpose()?,
                 expected_translation_state,
                 replacement_translation_state,
-            } => {
-                ensure_nonblank(&translation)?;
-                if identity.source_content() != &seed_source_content {
-                    return Err(ResultStoragePlanError::MismatchedReuseSourceContent);
-                }
-                if identity.source_context_json() != seed_source_context_json {
-                    return Err(ResultStoragePlanError::MismatchedReuseSourceContext);
-                }
-                if expected_translation.is_some() != expected_translation_state.is_some() {
-                    return Err(ResultStoragePlanError::InconsistentTranslationState);
-                }
-                if expected_translation
-                    .as_ref()
-                    .is_some_and(TextUnitContent::is_blank)
-                {
-                    return Err(ResultStoragePlanError::BlankTranslation);
-                }
-                Ok(EncodedPreparationUnit::ReuseTarget {
-                    translation: encode_content(&translation)?,
-                    identity: encode_identity(&identity)?,
-                    expected_translation: expected_translation
-                        .as_ref()
-                        .map(encode_content)
-                        .transpose()?,
-                    expected_translation_state,
-                    replacement_translation_state,
-                })
-            }
-        })
-        .collect()
+            })
+        }
+    }
 }
 
 fn finish_preparation_plan(
-    batches: Vec<Vec<EncodedPreparationUnit>>,
+    units: Vec<EncodedPreparationUnit>,
     terminology_json: String,
     placeholder_rules_json: String,
     snapshot_baseline: TranslationSnapshotBaseline,
 ) -> Result<SqliteTransactionPlan, ResultStoragePlanError> {
     let mut steps = vec![require_snapshot_baseline(&snapshot_baseline)];
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::with_capacity(units.len());
     let mut snapshot_parameter_sets = Vec::new();
     let mut clear_parameter_sets = Vec::new();
     let mut reuse_parameter_sets = Vec::new();
-    for unit in batches.into_iter().flatten() {
+    for unit in units {
         match unit {
             EncodedPreparationUnit::Invalidation {
                 identity,
@@ -522,10 +983,6 @@ fn finish_preparation_plan(
                 expected_translation_state,
             } => {
                 ensure_unique(&mut seen, &identity)?;
-                snapshot_parameter_sets.push(snapshot_parameters(
-                    &identity,
-                    Some((&expected_translation, expected_translation_state)),
-                ));
                 clear_parameter_sets.push(clear_translation_parameters(
                     identity,
                     expected_translation,
@@ -551,10 +1008,6 @@ fn finish_preparation_plan(
                 replacement_translation_state,
             } => {
                 ensure_unique(&mut seen, &identity)?;
-                let expected = expected_translation
-                    .as_deref()
-                    .zip(expected_translation_state);
-                snapshot_parameter_sets.push(snapshot_parameters(&identity, expected));
                 reuse_parameter_sets.push(write_translation_from_snapshot_parameters(
                     identity,
                     translation,
@@ -586,91 +1039,131 @@ fn finish_preparation_plan(
 }
 
 fn commit_work(
-    result: ValidatedTranslationTaskResult,
-) -> Result<Vec<CommitUnitWork>, ResultStoragePlanError> {
-    let patches = result.into_updates();
-    if patches.is_empty() {
+    outcome: Arc<TranslationTaskOutcome>,
+) -> Result<CommitPlanWork, ResultStoragePlanError> {
+    let decisions = outcome.accepted();
+    if decisions.is_empty() {
         return Err(ResultStoragePlanError::EmptyTaskResult);
     }
-    let mut work = Vec::new();
-    for patch in patches {
-        let translation = patch.translation().clone();
-        work.push(CommitUnitWork {
-            identity: patch.identity().clone(),
-            required_source_content: None,
-            required_source_context_json: None,
-            translation: translation.clone(),
-            translation_state: patch.translation_state(),
+    let location_count = decisions
+        .iter()
+        .map(|decision| 1 + decision.propagation_targets().len())
+        .sum();
+    let mut decision_work = Vec::with_capacity(decisions.len());
+    let mut unit_work = Vec::with_capacity(location_count);
+    for (decision_index, decision) in decisions.iter().enumerate() {
+        decision_work.push(CommitDecisionWork {
+            outcome: Arc::clone(&outcome),
+            decision_index,
         });
-        for target in patch.propagation_targets() {
-            work.push(CommitUnitWork {
-                identity: target.identity().clone(),
-                required_source_content: Some(patch.identity().source_content().clone()),
-                required_source_context_json: Some(
-                    patch.identity().source_context_json().to_owned(),
-                ),
-                translation: translation.clone(),
-                translation_state: target.state_context().finish(&translation),
+        unit_work.push(CommitUnitWork {
+            outcome: Arc::clone(&outcome),
+            decision_index,
+            position: CommitUnitPosition::Representative,
+        });
+        for target_index in 0..decision.propagation_targets().len() {
+            unit_work.push(CommitUnitWork {
+                outcome: Arc::clone(&outcome),
+                decision_index,
+                position: CommitUnitPosition::PropagationTarget(target_index),
             });
         }
     }
-    Ok(work)
+    Ok(CommitPlanWork {
+        decisions: decision_work,
+        units: unit_work,
+    })
 }
 
-fn encode_commit_job(
-    job: Vec<CommitUnitWork>,
-) -> Result<Vec<EncodedCommitUnit>, ResultStoragePlanError> {
-    job.into_iter()
-        .map(|work| {
-            ensure_nonblank(&work.translation)?;
-            if work
-                .required_source_content
-                .as_ref()
-                .is_some_and(|source_content| source_content != work.identity.source_content())
-            {
+fn encode_commit_decision(
+    work: CommitDecisionWork,
+) -> Result<EncodedCommitDecision, ResultStoragePlanError> {
+    encode_commit_decision_with(work, encode_content)
+}
+
+fn encode_commit_decision_with(
+    work: CommitDecisionWork,
+    encode: impl FnOnce(&TextUnitContent) -> Result<String, ResultStoragePlanError>,
+) -> Result<EncodedCommitDecision, ResultStoragePlanError> {
+    let decision = work
+        .outcome
+        .accepted()
+        .get(work.decision_index)
+        .expect("提交工作必须引用已验收的 decision");
+    let translation = decision.patch().translation();
+    ensure_nonblank(translation)?;
+    Ok(EncodedCommitDecision {
+        decision_index: work.decision_index,
+        translation: encode(translation)?,
+    })
+}
+
+fn encode_commit_unit(work: CommitUnitWork) -> Result<EncodedCommitUnit, ResultStoragePlanError> {
+    let decision = work
+        .outcome
+        .accepted()
+        .get(work.decision_index)
+        .expect("提交工作必须引用已验收的 decision");
+    let patch = decision.patch();
+    let (identity, translation_state) = match work.position {
+        CommitUnitPosition::Representative => (patch.identity(), patch.translation_state()),
+        CommitUnitPosition::PropagationTarget(target_index) => {
+            let target = patch
+                .propagation_targets()
+                .get(target_index)
+                .expect("提交工作必须引用已验收的传播目标");
+            if target.identity().source_content() != patch.identity().source_content() {
                 return Err(ResultStoragePlanError::MismatchedPropagationSourceContent);
             }
-            if work
-                .required_source_context_json
-                .as_deref()
-                .is_some_and(|context| context != work.identity.source_context_json())
-            {
+            if target.identity().source_context_json() != patch.identity().source_context_json() {
                 return Err(ResultStoragePlanError::MismatchedPropagationSourceContext);
             }
-            Ok(EncodedCommitUnit {
-                identity: encode_identity(&work.identity)?,
-                translation: encode_content(&work.translation)?,
-                translation_state: work.translation_state,
-            })
-        })
-        .collect()
+            (
+                target.identity(),
+                target.state_context().finish(patch.translation()),
+            )
+        }
+    };
+    Ok(EncodedCommitUnit {
+        decision_index: work.decision_index,
+        identity: encode_identity(identity)?,
+        translation_state,
+    })
 }
 
 fn finish_commit_plan(
-    batches: Vec<Vec<EncodedCommitUnit>>,
+    decisions: Vec<EncodedCommitDecision>,
+    units: Vec<EncodedCommitUnit>,
 ) -> Result<SqliteTransactionPlan, ResultStoragePlanError> {
-    let mut seen = BTreeSet::new();
-    let mut parameter_sets = Vec::new();
-    for unit in batches.into_iter().flatten() {
-        ensure_unique(&mut seen, &unit.identity)?;
-        parameter_sets.push(commit_translation_parameters(unit));
+    let mut seen = HashSet::with_capacity(units.len());
+    let mut batches = Vec::with_capacity(decisions.len());
+    for (expected_index, decision) in decisions.into_iter().enumerate() {
+        if decision.decision_index != expected_index {
+            return Err(ResultStoragePlanError::InvalidCommitDecisionSequence);
+        }
+        batches.push((decision.translation, Vec::new()));
     }
-    Ok(SqliteTransactionPlan::new(vec![
-        SqliteTransactionStep::ExecuteManyExactlyOne(SqliteBatch::new(
-            COMMIT_TRANSLATION,
-            parameter_sets,
-        )),
-    ]))
-}
-
-fn split_jobs<T>(items: Vec<T>, units_per_job: usize) -> Vec<Vec<T>> {
-    debug_assert!(units_per_job > 0);
-    let mut items = items.into_iter();
-    std::iter::from_fn(|| {
-        let job = items.by_ref().take(units_per_job).collect::<Vec<_>>();
-        (!job.is_empty()).then_some(job)
-    })
-    .collect()
+    for unit in units {
+        ensure_unique(&mut seen, &unit.identity)?;
+        let decision = batches
+            .get_mut(unit.decision_index)
+            .ok_or(ResultStoragePlanError::InvalidCommitDecisionSequence)?;
+        decision.1.push(commit_translation_parameters(unit));
+    }
+    let mut steps = Vec::with_capacity(batches.len());
+    for (translation, parameter_sets) in batches {
+        if parameter_sets.is_empty() {
+            return Err(ResultStoragePlanError::MissingCommitDecisionUnit);
+        }
+        steps.push(SqliteTransactionStep::ExecuteManyExactlyOne(
+            SqliteBatch::with_shared_parameters(
+                COMMIT_TRANSLATION,
+                vec![text(translation)],
+                parameter_sets,
+            ),
+        ));
+    }
+    Ok(SqliteTransactionPlan::new(steps))
 }
 
 fn encode_identity(
@@ -692,7 +1185,7 @@ fn encode_content(content: &TextUnitContent) -> Result<String, ResultStoragePlan
 }
 
 fn ensure_unique(
-    seen: &mut BTreeSet<(&'static str, String, String)>,
+    seen: &mut HashSet<(&'static str, String, String)>,
     identity: &EncodedIdentity,
 ) -> Result<(), ResultStoragePlanError> {
     if seen.insert((
@@ -822,7 +1315,6 @@ fn write_translation_from_snapshot_parameters(
 
 fn commit_translation_parameters(unit: EncodedCommitUnit) -> Vec<SqliteValue> {
     vec![
-        text(unit.translation),
         blob(unit.translation_state),
         text(unit.identity.owner),
         text(unit.identity.group_location),
@@ -844,12 +1336,8 @@ fn resource_updates(
 
 fn update_resource(kind: &'static str, canonical_json: String) -> SqliteTransactionStep {
     execute(
-        "UPDATE standard_translation_resource SET canonical_json = ? WHERE resource_kind = ? AND canonical_json <> ?",
-        vec![
-            text(canonical_json.clone()),
-            text(kind),
-            text(canonical_json),
-        ],
+        "UPDATE standard_translation_resource SET canonical_json = ?1 WHERE resource_kind = ?2 AND canonical_json <> ?1",
+        vec![text(canonical_json), text(kind)],
     )
 }
 
@@ -865,6 +1353,23 @@ fn blob(value: Sha256Fingerprint) -> SqliteValue {
     SqliteValue::Blob(value.as_bytes().to_vec())
 }
 
+fn map_session_open_error<S, C>(
+    database_path: PathBuf,
+    error: OpenSqliteTransactionSessionError<S>,
+) -> RpgMakerStandardTranslationResultStorageError<S, C> {
+    match error {
+        OpenSqliteTransactionSessionError::NotFound => {
+            RpgMakerStandardTranslationResultStorageError::DatabaseNotFound { database_path }
+        }
+        OpenSqliteTransactionSessionError::OpenFailed(source) => {
+            RpgMakerStandardTranslationResultStorageError::NotCommitted {
+                database_path,
+                source,
+            }
+        }
+    }
+}
+
 fn map_transaction_error<S, C>(
     database_path: PathBuf,
     error: ExecuteTransactionError<S>,
@@ -873,8 +1378,15 @@ fn map_transaction_error<S, C>(
         ExecuteTransactionError::NotFound => {
             RpgMakerStandardTranslationResultStorageError::DatabaseNotFound { database_path }
         }
-        ExecuteTransactionError::RequirementFailed => {
+        ExecuteTransactionError::RequirementFailed
+        | ExecuteTransactionError::RequirementFailedWithRow { .. } => {
             RpgMakerStandardTranslationResultStorageError::StalePlan { database_path }
+        }
+        ExecuteTransactionError::RequirementFailedWithRowOutcomeUnknown { source, .. } => {
+            RpgMakerStandardTranslationResultStorageError::OutcomeUnknown {
+                database_path,
+                source: *source,
+            }
         }
         ExecuteTransactionError::NotCommitted(source) => {
             RpgMakerStandardTranslationResultStorageError::NotCommitted {
@@ -893,9 +1405,11 @@ fn map_transaction_error<S, C>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::future::{Future, ready};
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
@@ -904,10 +1418,12 @@ mod tests {
     use crate::rpg_maker::text::{
         RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
     };
-    use crate::runtime::sqlite::{
-        RusqliteStorage, RusqliteStorageConfiguration, SqliteJournalMode, SqliteSynchronous,
-    };
+    use crate::runtime::sqlite::{RusqliteStorage, RusqliteStorageConfiguration};
     use crate::storage::sqlite::SqliteTransactionStep;
+    use crate::storage::sqlite_session::{
+        SqliteInteractiveSessionFinalization, SqliteInteractiveSessionFinalizationError,
+    };
+    use crate::storage::sqlite_transaction_session::OpenedSqliteTransactionSession;
     use rusqlite::{Connection, params};
 
     use super::*;
@@ -931,6 +1447,134 @@ mod tests {
 
     impl Error for FakeError {}
 
+    #[test]
+    fn closed_result_storage_plan_invariants_keep_stable_safe_facts() {
+        let cases = [
+            (
+                ResultStoragePlanError::EmptyTaskResult,
+                DiagnosticSubject::component("translation_task_result"),
+                "plan_error=empty_task_result",
+            ),
+            (
+                ResultStoragePlanError::EmptyReuseTargets,
+                DiagnosticSubject::component("translation_reuse_plan"),
+                "plan_error=empty_reuse_targets",
+            ),
+            (
+                ResultStoragePlanError::BlankTranslation,
+                DiagnosticSubject::field("translation"),
+                "plan_error=blank_translation",
+            ),
+            (
+                ResultStoragePlanError::InconsistentTranslationState,
+                DiagnosticSubject::field("translation_state"),
+                "plan_error=inconsistent_translation_state",
+            ),
+            (
+                ResultStoragePlanError::MismatchedReuseSourceContent,
+                DiagnosticSubject::field("source_content"),
+                "plan_error=mismatched_reuse_source_content",
+            ),
+            (
+                ResultStoragePlanError::MismatchedReuseSourceContext,
+                DiagnosticSubject::field("source_context"),
+                "plan_error=mismatched_reuse_source_context",
+            ),
+            (
+                ResultStoragePlanError::MismatchedPropagationSourceContent,
+                DiagnosticSubject::field("source_content"),
+                "plan_error=mismatched_propagation_source_content",
+            ),
+            (
+                ResultStoragePlanError::MismatchedPropagationSourceContext,
+                DiagnosticSubject::field("source_context"),
+                "plan_error=mismatched_propagation_source_context",
+            ),
+            (
+                ResultStoragePlanError::DuplicateUnit,
+                DiagnosticSubject::component("translation_commit_units"),
+                "plan_error=duplicate_unit",
+            ),
+            (
+                ResultStoragePlanError::InvalidCommitDecisionSequence,
+                DiagnosticSubject::component("translation_commit_decisions"),
+                "plan_error=invalid_commit_decision_sequence",
+            ),
+            (
+                ResultStoragePlanError::MissingCommitDecisionUnit,
+                DiagnosticSubject::component("translation_commit_decisions"),
+                "plan_error=missing_commit_decision_unit",
+            ),
+        ];
+
+        for (source, expected_subject, expected_detail) in cases {
+            let diagnostic = source.safe_diagnostic();
+            assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+            assert_eq!(diagnostic.stage, DiagnosticStage::Translate);
+            assert_eq!(diagnostic.subject, expected_subject);
+            assert_eq!(
+                diagnostic.reason,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InternalInvariant,
+                    expected_detail,
+                )
+            );
+            assert_eq!(diagnostic.impact, DiagnosticImpact::ProgressPreserved);
+            assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+        }
+    }
+
+    #[test]
+    fn result_storage_plan_codecs_keep_typed_facts_without_leaking_source_text() {
+        const SECRET: &str = "SENTINEL_RESULT_STORAGE_BODY_8ebfa3";
+
+        let invalid_json = format!("{{\"{SECRET}\":");
+        let json_error =
+            serde_json::from_str::<serde_json::Value>(&invalid_json).expect_err("JSON 应不完整");
+        let content_diagnostic = ResultStoragePlanError::Content(json_error).safe_diagnostic();
+        let content_json = serde_json::to_string(&content_diagnostic).expect("公开诊断应可序列化");
+        assert!(!content_json.contains(SECRET));
+        assert!(content_json.contains("operation=content_encode"));
+        assert!(content_json.contains("json_category=eof"));
+        assert!(content_json.contains("json_line=1"));
+        assert!(content_json.contains("json_column="));
+
+        let location_diagnostic = ResultStoragePlanError::Location(
+            RpgMakerLocationCodecError::InvalidDataFile(SECRET.to_owned()),
+        )
+        .safe_diagnostic();
+        let location_json =
+            serde_json::to_string(&location_diagnostic).expect("公开诊断应可序列化");
+        assert!(!location_json.contains(SECRET));
+        assert!(location_json.contains("kind=invalid_data_file"));
+
+        let projection_diagnostic =
+            ResultStoragePlanError::Projection(RpgMakerProjectionCodecError::Projection(
+                crate::rpg_maker::model::ProjectionModelError::NonContiguousDialogueBodyLines {
+                    expected: 2,
+                    actual: 4,
+                },
+            ))
+            .safe_diagnostic();
+        let projection_json =
+            serde_json::to_string(&projection_diagnostic).expect("公开诊断应可序列化");
+        assert!(projection_json.contains("kind=invalid_projection"));
+        assert!(projection_json.contains("expected=2"));
+        assert!(projection_json.contains("actual=4"));
+
+        let claim_kind_diagnostic = ResultStoragePlanError::Projection(
+            RpgMakerProjectionCodecError::MutationClaimKindMismatch {
+                expected: "value",
+                actual: "event_block",
+            },
+        )
+        .safe_diagnostic();
+        let claim_kind_json =
+            serde_json::to_string(&claim_kind_diagnostic).expect("公开诊断应可序列化");
+        assert!(claim_kind_json.contains("expected=value"));
+        assert!(claim_kind_json.contains("actual=event_block"));
+    }
+
     #[derive(Clone, Copy)]
     struct InlineCpu;
 
@@ -949,30 +1593,141 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingSqlite {
         plans: Arc<Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>>,
+        opens: Arc<AtomicUsize>,
+        finalizations: Arc<AtomicUsize>,
     }
 
-    impl SqliteTransactionExecutor for RecordingSqlite {
+    struct RecordingOperations {
+        path: PathBuf,
+        plans: Arc<Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>>,
+    }
+
+    impl SqliteTransactionSessionOperations for RecordingOperations {
         type Error = FakeError;
 
         fn execute_transaction(
             &self,
-            path: PathBuf,
             plan: SqliteTransactionPlan,
         ) -> impl Future<Output = Result<(), ExecuteTransactionError<Self::Error>>> + Send {
-            self.plans.lock().expect("事务锁").push((path, plan));
+            self.plans
+                .lock()
+                .expect("事务锁")
+                .push((self.path.clone(), plan));
             ready(Ok(()))
         }
+    }
+
+    struct RecordingFinalizer {
+        finalizations: Arc<AtomicUsize>,
+    }
+
+    impl SqliteInteractiveSessionFinalizer for RecordingFinalizer {
+        type Error = FakeError;
+
+        fn finalize(
+            self,
+        ) -> impl Future<
+            Output = Result<
+                SqliteInteractiveSessionFinalization,
+                SqliteInteractiveSessionFinalizationError<Self::Error>,
+            >,
+        > + Send {
+            self.finalizations.fetch_add(1, Ordering::SeqCst);
+            ready(Ok(SqliteInteractiveSessionFinalization::new(false)))
+        }
+    }
+
+    impl SqliteTransactionSessionFactory for RecordingSqlite {
+        type Operations = RecordingOperations;
+        type Finalizer = RecordingFinalizer;
+        type Error = FakeError;
+
+        fn open_existing_transaction_session(
+            &self,
+            path: PathBuf,
+        ) -> impl Future<
+            Output = Result<
+                OpenedSqliteTransactionSession<Self::Operations, Self::Finalizer>,
+                OpenSqliteTransactionSessionError<Self::Error>,
+            >,
+        > + Send {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            ready(Ok(OpenedSqliteTransactionSession::new(
+                Arc::new(RecordingOperations {
+                    path,
+                    plans: Arc::clone(&self.plans),
+                }),
+                RecordingFinalizer {
+                    finalizations: Arc::clone(&self.finalizations),
+                },
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_and_task_commits_share_one_explicitly_finalized_session() {
+        let sqlite = RecordingSqlite::default();
+        let opens = Arc::clone(&sqlite.opens);
+        let finalizations = Arc::clone(&sqlite.finalizations);
+        let plans = Arc::clone(&sqlite.plans);
+        let service = RpgMakerStandardTranslationResultStorageService::new(sqlite, InlineCpu);
+        let preparation = TranslationPlanPreparation::new(
+            Vec::new(),
+            Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            1,
+            0,
+            0,
+        );
+        service
+            .apply_preparation(&project(), preparation)
+            .await
+            .expect("准备应建立会话");
+
+        let identity = scalar_identity(1, "name", "原文", "{}");
+        let context = state_context(0x42);
+        let translation = value("译文");
+        for task_index in 0..2 {
+            let outcome = Arc::new(TranslationTaskOutcome::Complete {
+                context: TranslationTaskOutcomeContext::new(
+                    StandardTranslationTaskIndex::new(task_index),
+                    NonZeroUsize::MIN,
+                    Vec::new(),
+                ),
+                final_response: FinalLlmResponseMetadata::new(None, None, "stop", None),
+                accepted: NonEmptyTaskItems::new(
+                    AcceptedTranslationDecision::new(
+                        0,
+                        TranslationPatch::new(
+                            identity.clone(),
+                            Vec::new(),
+                            translation.clone(),
+                            context.finish(&translation),
+                        ),
+                    ),
+                    Vec::new(),
+                ),
+            });
+            let prepared = service.prepare_commit(outcome).await.expect("提交应可编码");
+            service
+                .commit_prepared(&project(), prepared)
+                .await
+                .expect("任务应提交到同一会话");
+        }
+
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(plans.lock().expect("事务锁").len(), 3);
+        assert_eq!(finalizations.load(Ordering::SeqCst), 0);
+        service.finalize().await.expect("会话应显式终结");
+        assert_eq!(finalizations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn prepared_commit_uses_one_conditional_batch_update_for_all_unit_checks() {
         let sqlite = RecordingSqlite::default();
         let plans = Arc::clone(&sqlite.plans);
-        let service = RpgMakerStandardTranslationResultStorageService::new(
-            sqlite,
-            InlineCpu,
-            RpgMakerStandardTranslationResultStorageConfig::new(NonZeroUsize::MIN),
-        );
+        let service = RpgMakerStandardTranslationResultStorageService::new(sqlite, InlineCpu);
         let identity = scalar_identity(1, "name", "原文", "{}");
         let context = state_context(0x11);
         let translation = value("译文");
@@ -1024,32 +1779,163 @@ mod tests {
         );
         assert!(update.statement().contains("translation_state IS NULL"));
         assert!(!update.statement().contains("exact_location"));
-        let parameters = &update.parameter_sets()[0];
         assert_eq!(
-            parameters[3],
+            update.shared_parameters(),
+            &[SqliteValue::Text(r#""译文""#.to_owned())]
+        );
+        let parameters = update.parameter_rows().next().expect("应包含一组提交参数");
+        assert_eq!(
+            parameters[2],
             SqliteValue::Text(
                 RpgMakerLocationCodec::encode(identity.group_location()).expect("组位置应可编码")
             )
         );
         assert_eq!(
-            parameters[4],
+            parameters[3],
             SqliteValue::Text(
                 RpgMakerProjectionCodec::encode_role(identity.role()).expect("角色应可编码")
             )
         );
-        assert_eq!(parameters[5], SqliteValue::Text(r#""原文""#.to_owned()));
-        assert_eq!(parameters[6], SqliteValue::Text("{}".to_owned()));
+        assert_eq!(parameters[4], SqliteValue::Text(r#""原文""#.to_owned()));
+        assert_eq!(parameters[5], SqliteValue::Text("{}".to_owned()));
+    }
+
+    #[test]
+    fn huge_propagation_family_encodes_and_owns_translation_once_per_decision() {
+        const TARGETS: usize = 50_000;
+
+        let representative = scalar_identity(0, "name", "共同原文", "{}");
+        let propagation_targets = (1..=TARGETS)
+            .map(|index| {
+                TranslationPropagationTarget::new(
+                    scalar_identity(index, "name", "共同原文", "{}"),
+                    state_context(u8::try_from(index % 251).expect("余数应可表示为 u8")),
+                )
+            })
+            .collect();
+        let translation = value("超大全族共享译文");
+        let outcome = complete_outcome(vec![TranslationPatch::new(
+            representative,
+            propagation_targets,
+            translation.clone(),
+            state_context(0x5a).finish(&translation),
+        )]);
+        let work = commit_work(outcome).expect("超大全族应可建立提交工作");
+        assert_eq!(work.decisions.len(), 1);
+        assert_eq!(work.units.len(), TARGETS + 1);
+
+        let encoding_count = Cell::new(0_usize);
+        let decisions = work
+            .decisions
+            .into_iter()
+            .map(|work| {
+                encode_commit_decision_with(work, |translation| {
+                    encoding_count.set(encoding_count.get() + 1);
+                    encode_content(translation)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("共享译文应可编码");
+        let units = work
+            .units
+            .into_iter()
+            .map(encode_commit_unit)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("全部传播目标身份应可并行编码");
+        assert_eq!(encoding_count.get(), 1, "每个 decision 只能编码一次译文");
+
+        let plan = finish_commit_plan(decisions, units).expect("超大全族应形成原子提交计划");
+        assert_eq!(plan.steps().len(), 1);
+        let SqliteTransactionStep::ExecuteManyExactlyOne(batch) = &plan.steps()[0] else {
+            panic!("一个 decision 应形成一个精确共享参数批次");
+        };
+        let encoded_translation = SqliteValue::Text(r#""超大全族共享译文""#.to_owned());
+        assert_eq!(
+            batch.shared_parameters(),
+            std::slice::from_ref(&encoded_translation)
+        );
+        assert_eq!(batch.parameter_set_count(), TARGETS + 1);
+        assert!(batch.parameter_rows().all(|parameters| {
+            parameters.len() == 6 && !parameters.contains(&encoded_translation)
+        }));
+    }
+
+    #[test]
+    fn commit_batches_preserve_decision_and_target_natural_order() {
+        let first_representative = scalar_identity(1, "name", "共同原文", "{}");
+        let first_target = scalar_identity(2, "name", "共同原文", "{}");
+        let first_translation = value("第一条译文");
+        let second_representative = scalar_identity(3, "name", "另一原文", "{}");
+        let second_translation = value("第二条译文");
+        let outcome = complete_outcome(vec![
+            TranslationPatch::new(
+                first_representative,
+                vec![TranslationPropagationTarget::new(
+                    first_target,
+                    state_context(0x12),
+                )],
+                first_translation.clone(),
+                state_context(0x11).finish(&first_translation),
+            ),
+            TranslationPatch::new(
+                second_representative,
+                Vec::new(),
+                second_translation.clone(),
+                state_context(0x21).finish(&second_translation),
+            ),
+        ]);
+        let work = commit_work(outcome).expect("提交工作应保持任务自然顺序");
+        let decisions = work
+            .decisions
+            .into_iter()
+            .map(encode_commit_decision)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decision 译文应可编码");
+        let units = work
+            .units
+            .into_iter()
+            .map(encode_commit_unit)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("提交目标应可编码");
+
+        let plan = finish_commit_plan(decisions, units).expect("提交计划应可建立");
+        assert_eq!(plan.steps().len(), 2);
+        let SqliteTransactionStep::ExecuteManyExactlyOne(first) = &plan.steps()[0] else {
+            panic!("第一条 decision 应形成第一批提交");
+        };
+        let SqliteTransactionStep::ExecuteManyExactlyOne(second) = &plan.steps()[1] else {
+            panic!("第二条 decision 应形成第二批提交");
+        };
+        assert_eq!(
+            first.shared_parameters(),
+            &[SqliteValue::Text(r#""第一条译文""#.to_owned())]
+        );
+        assert_eq!(
+            second.shared_parameters(),
+            &[SqliteValue::Text(r#""第二条译文""#.to_owned())]
+        );
+        assert_eq!(first.parameter_set_count(), 2);
+        assert_eq!(second.parameter_set_count(), 1);
+        let first_parameters = first.parameter_rows().collect::<Vec<_>>();
+        assert_eq!(
+            first_parameters[0][2],
+            SqliteValue::Text(
+                RpgMakerLocationCodec::encode(&data_group(1)).expect("代表单元位置应可编码")
+            )
+        );
+        assert_eq!(
+            first_parameters[1][2],
+            SqliteValue::Text(
+                RpgMakerLocationCodec::encode(&data_group(2)).expect("传播目标位置应可编码")
+            )
+        );
     }
 
     #[tokio::test]
-    async fn preparation_batches_guards_clears_and_reuse_in_natural_order() {
+    async fn preparation_uses_updates_as_cas_and_only_guards_read_only_seeds() {
         let sqlite = RecordingSqlite::default();
         let plans = Arc::clone(&sqlite.plans);
-        let service = RpgMakerStandardTranslationResultStorageService::new(
-            sqlite,
-            InlineCpu,
-            RpgMakerStandardTranslationResultStorageConfig::new(NonZeroUsize::MIN),
-        );
+        let service = RpgMakerStandardTranslationResultStorageService::new(sqlite, InlineCpu);
         let invalidation_one = scalar_identity(1, "name", "原文一", "{}");
         let invalidation_two = scalar_identity(2, "name", "原文二", "{}");
         let reuse_seed = scalar_identity(3, "name", "共享原文", "{}");
@@ -1096,37 +1982,30 @@ mod tests {
         let steps = plans[0].1.steps();
         assert!(matches!(steps[0], SqliteTransactionStep::RequireNoRows(_)));
         let SqliteTransactionStep::RequireNoRowsMany(guards) = &steps[1] else {
-            panic!("逐单元快照条件应批量查询");
+            panic!("只有不写入的复用种子需要独立快照查询");
         };
         assert_eq!(guards.statement(), REQUIRE_SNAPSHOT);
-        assert_eq!(guards.parameter_sets().len(), 4);
-        let expected_groups = [
-            &invalidation_one,
-            &invalidation_two,
-            &reuse_seed,
-            &reuse_target,
-        ]
-        .map(|identity| {
-            SqliteValue::Text(
-                RpgMakerLocationCodec::encode(identity.group_location()).expect("位置应可编码"),
-            )
-        });
+        assert_eq!(guards.parameter_set_count(), 1);
+        let expected_group = SqliteValue::Text(
+            RpgMakerLocationCodec::encode(reuse_seed.group_location()).expect("位置应可编码"),
+        );
+        let guard_parameters = guards
+            .parameter_rows()
+            .next()
+            .expect("应包含一组快照核对参数");
         assert_eq!(
-            guards
-                .parameter_sets()
-                .iter()
-                .map(|parameters| parameters[1].clone())
-                .collect::<Vec<_>>(),
-            expected_groups
+            guard_parameters[1], expected_group,
+            "会被条件 UPDATE 核对的失效项和复用目标不得先重复查询"
         );
 
         let SqliteTransactionStep::ExecuteManyExactlyOne(clears) = &steps[2] else {
             panic!("失效清理应批量条件修改");
         };
         assert_eq!(clears.statement(), CLEAR_TRANSLATION_FROM_SNAPSHOT);
-        assert_eq!(clears.parameter_sets().len(), 2);
+        assert_eq!(clears.parameter_set_count(), 2);
+        let clear_parameters = clears.parameter_rows().next().expect("应包含失效清理参数");
         assert_eq!(
-            clears.parameter_sets()[0][5],
+            clear_parameters[5],
             SqliteValue::Text(r#""旧译文一""#.to_owned())
         );
 
@@ -1134,24 +2013,21 @@ mod tests {
             panic!("复用写入应批量条件修改");
         };
         assert_eq!(reuses.statement(), WRITE_TRANSLATION_FROM_SNAPSHOT);
-        assert_eq!(reuses.parameter_sets().len(), 1);
+        assert_eq!(reuses.parameter_set_count(), 1);
+        let reuse_parameters = reuses.parameter_rows().next().expect("应包含复用写入参数");
         assert_eq!(
-            reuses.parameter_sets()[0][0],
+            reuse_parameters[0],
             SqliteValue::Text(r#""复用译文""#.to_owned())
         );
-        assert_eq!(reuses.parameter_sets()[0][7], SqliteValue::Null);
-        assert_eq!(reuses.parameter_sets()[0][8], SqliteValue::Null);
+        assert_eq!(reuse_parameters[7], SqliteValue::Null);
+        assert_eq!(reuse_parameters[8], SqliteValue::Null);
     }
 
     #[tokio::test]
     async fn preparation_without_writes_still_checks_the_complete_snapshot_baseline() {
         let sqlite = RecordingSqlite::default();
         let plans = Arc::clone(&sqlite.plans);
-        let service = RpgMakerStandardTranslationResultStorageService::new(
-            sqlite,
-            InlineCpu,
-            RpgMakerStandardTranslationResultStorageConfig::new(NonZeroUsize::MIN),
-        );
+        let service = RpgMakerStandardTranslationResultStorageService::new(sqlite, InlineCpu);
         let preparation = TranslationPlanPreparation::new(
             Vec::new(),
             Vec::new(),
@@ -1187,14 +2063,22 @@ mod tests {
             translation.clone(),
             context.finish(&translation),
         );
-        let work = commit_work(ValidatedTranslationTaskResult::new(
-            StandardTranslationTaskIndex::new(0),
-            vec![patch.clone(), patch],
-        ))
-        .expect("重复应由最终计划阶段按编码身份识别");
-        let encoded = encode_commit_job(work).expect("重复单元本身应可编码");
+        let work = commit_work(complete_outcome(vec![patch.clone(), patch]))
+            .expect("重复应由最终计划阶段按编码身份识别");
+        let decisions = work
+            .decisions
+            .into_iter()
+            .map(encode_commit_decision)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decision 译文本身应可编码");
+        let encoded = work
+            .units
+            .into_iter()
+            .map(encode_commit_unit)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("重复单元本身应可编码");
 
-        let error = finish_commit_plan(vec![encoded]).expect_err("重复逻辑单元不得进入事务");
+        let error = finish_commit_plan(decisions, encoded).expect_err("重复逻辑单元不得进入事务");
         assert!(matches!(error, ResultStoragePlanError::DuplicateUnit));
     }
 
@@ -1202,11 +2086,6 @@ mod tests {
     async fn real_sqlite_rejects_stale_source_context_and_translation_state() {
         let directory = tempfile::tempdir().expect("临时目录应可创建");
         let storage = runtime_storage();
-        let service = RpgMakerStandardTranslationResultStorageService::new(
-            storage.clone(),
-            InlineCpu,
-            RpgMakerStandardTranslationResultStorageConfig::new(NonZeroUsize::MIN),
-        );
         let cases = [
             ("stale-source.db", "旧原文", "{}", None, None),
             ("stale-context.db", "原文", r#"{"old":true}"#, None, None),
@@ -1221,6 +2100,8 @@ mod tests {
         ];
 
         for (name, actual_source, actual_context, translation, translation_state) in cases {
+            let service =
+                RpgMakerStandardTranslationResultStorageService::new(storage.clone(), InlineCpu);
             let database_path = directory.path().join(name).join("project.db");
             let identity = scalar_identity(1, "name", "原文", "{}");
             create_unit_database(
@@ -1252,9 +2133,9 @@ mod tests {
                 (translation.map(value), translation_state,),
                 "被拒绝的条件 UPDATE 不得改变行"
             );
+            service.finalize().await.expect("测试数据库会话应正常终结");
         }
 
-        drop(service);
         storage.shutdown().await.expect("SQLite 根应正常关闭");
     }
 
@@ -1272,11 +2153,8 @@ mod tests {
             ],
         );
         let storage = runtime_storage();
-        let service = RpgMakerStandardTranslationResultStorageService::new(
-            storage.clone(),
-            InlineCpu,
-            RpgMakerStandardTranslationResultStorageConfig::new(NonZeroUsize::MIN),
-        );
+        let service =
+            RpgMakerStandardTranslationResultStorageService::new(storage.clone(), InlineCpu);
         let prepared = service
             .prepare_commit(complete_outcome(vec![
                 translation_patch(first, "译文一", 0x81),
@@ -1313,11 +2191,8 @@ mod tests {
             ],
         );
         let storage = runtime_storage();
-        let service = RpgMakerStandardTranslationResultStorageService::new(
-            storage.clone(),
-            InlineCpu,
-            RpgMakerStandardTranslationResultStorageConfig::new(NonZeroUsize::MIN),
-        );
+        let service =
+            RpgMakerStandardTranslationResultStorageService::new(storage.clone(), InlineCpu);
         let prepared = service
             .prepare_commit(complete_outcome(vec![translation_patch(
                 identity, "译文", 0x91,
@@ -1354,20 +2229,20 @@ mod tests {
         let target = dialogue_body_identity(2, "同一句", r#"{"source_speaker":"乙"}"#);
         let context = state_context(0x22);
         let translation = lines(&["相同译文"]);
-        let result = ValidatedTranslationTaskResult::new(
-            StandardTranslationTaskIndex::new(0),
-            vec![TranslationPatch::new(
-                leader,
-                vec![TranslationPropagationTarget::new(target, context)],
-                translation.clone(),
-                context.finish(&translation),
-            )],
-        );
+        let result = complete_outcome(vec![TranslationPatch::new(
+            leader,
+            vec![TranslationPropagationTarget::new(target, context)],
+            translation.clone(),
+            context.finish(&translation),
+        )]);
 
         let work = commit_work(result).expect("结果形状应合法");
-        let Err(error) = encode_commit_job(work) else {
-            panic!("不同 Speaker 上下文不得传播");
-        };
+        let error = work
+            .units
+            .into_iter()
+            .map(encode_commit_unit)
+            .find_map(Result::err)
+            .expect("不同 Speaker 上下文不得传播");
 
         assert!(matches!(
             error,
@@ -1528,20 +2403,7 @@ mod tests {
 
     fn runtime_storage() -> RusqliteStorage {
         let nonzero = |value| NonZeroUsize::new(value).expect("测试资源预算必须非零");
-        let config = RusqliteStorageConfiguration::new(
-            nonzero(2),
-            nonzero(8),
-            nonzero(4),
-            nonzero(1024 * 1024),
-            nonzero(1024 * 1024),
-            nonzero(1024 * 1024),
-            nonzero(100),
-            nonzero(1024 * 1024),
-            Duration::from_secs(2),
-            SqliteJournalMode::Delete,
-            SqliteSynchronous::Full,
-        )
-        .expect("测试 SQLite 配置应合法");
+        let config = RusqliteStorageConfiguration::new(nonzero(2), nonzero(4 * 1024 * 1024));
         RusqliteStorage::start(config).expect("测试 SQLite 根应可启动")
     }
 

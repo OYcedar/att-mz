@@ -57,8 +57,8 @@ thinking_output = false
 system Prompt。
 
 被读取的资源必须是普通 UTF-8 非空白文件，模板必须完整有效；任何错误都在首次 LLM
-请求前失败。没有父语言、中文、英文、目录首项、大小写变体或旧语言对文件回退。每次
-Translate 都重新读取所选资源；关闭模式不读取 `thinking.md`。完整契约见
+请求前失败。资源只按所选 locale 的精确路径读取。每次 Translate 都重新读取所选资源；
+关闭模式不读取 `thinking.md`。完整契约见
 [系统提示词编写指南](prompts.md)。
 
 Standard 与 Translate Lua 复用本轮解析出的 engine、语言对、语言模块、已装配 Prompt、
@@ -148,7 +148,7 @@ wire、ID、行形状、空槽、ATT token 和响应信封约束。Planner 与 E
 不是单纯降低翻译质量。
 
 公共 LLM 根提交 `model`、`messages`、`stream=false` 并透传 Client 的受信 parameters。
-网络重试仅按 Profile 明确策略；协议失败不伪装成网络错误。
+网络重试仅按所选 Client 的明确策略；协议失败不伪装成网络错误。
 
 ## 6. 响应结构与候选验收
 
@@ -205,8 +205,11 @@ Lua 暴露相同语义的 64 字符小写十六进制 state，但私有身份和
 
 ## 8. 并发、提交与任务结果
 
-`max_in_flight_tasks` 个 HTTP 消费者执行已经物化的有序 TaskBlock；完成响应立即进入有界
-CPU 准备。产物仍落到计划 index 的独立槽，顺序 finalizer 只按 `0..n` 提交。
+所选 Client 的 `max_concurrent_requests`（记为 N）决定活动 HTTP 数。完整 Corpus、Plan、
+Task 和传播目标可以保存在内存；调度器区分 HTTP 许可与顺序提交窗口，响应完成后立即
+释放网络许可。任务结果仍按计划 index 稳定归并，顺序 finalizer 只按 `0..n` 提交。
+SSPV 的 Release/MSVC 消融与慢首任务压力测试共同选定 2N 完成窗口，因此本地最多保留
+3N 个已经入场但尚未顺序最终化的任务；该内部值固化在代码中，不进入 Profile 配置。
 
 每个有写入的任务使用独立 SQLite 事务，验收通过的重复集合在同事务传播。技术失败停止
 后续工作；已经提交任务保持。取消停止新请求，等待已接管工作到明确终态，不猜测外部
@@ -229,5 +232,4 @@ CPU 准备。产物仍落到计划 index 的独立槽，顺序 finalizer 只按 
 全部业务阶段成功且必要非日志根完成收尾后，最后一个短事务精确替换
 `translate_run_plan` 及 Translate Lua 程序。确认提交失败时旧方案保持；终态无法确认时
 命令说明翻译结果已生效但方案状态无法确认，并建议下次显式传入 Profile 与 Lua 选择。
-项目日志的启动、队列、写入、轮转或关闭故障不停止模型任务、不丢弃合法候选，也不改变
-退出码。
+项目日志的启动、写入或关闭故障不停止模型任务、不丢弃合法候选，也不改变退出码。

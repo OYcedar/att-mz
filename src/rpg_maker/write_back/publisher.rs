@@ -4,6 +4,11 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
+    SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::rpg_maker::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::project::OpenedProject;
@@ -19,7 +24,7 @@ use super::lua::ScopedPreparedWriteBackCandidate;
 use super::rewriter::RpgMakerRewrittenDocuments;
 use super::{
     PreparedWriteBackCandidate, PublishedWriteBack, StandardWriteBackPublisher,
-    WriteBackPublishFailure, WriteBackPublishFailureState,
+    WriteBackPublishFailure, WriteBackPublishFailureState, WriteBackPublishingDiagnostic,
 };
 
 /// 根已准备、只能发布或丢弃一次的完整写回候选。
@@ -173,10 +178,6 @@ where
             let scope = bind
                 .await
                 .map_err(StandardWriteBackPublishingError::BindCandidate)?;
-            directory_publisher
-                .validate_scoped_directory(&scope)
-                .await
-                .map_err(StandardWriteBackPublishingError::ValidateCandidate)?;
             let entries = directory_publisher
                 .list_scoped_root(&scope)
                 .await
@@ -302,7 +303,6 @@ pub(crate) enum StandardWriteBackPublishingError<E> {
     InvalidRequest(DirectoryStageRequestError),
     Prepare(DirectoryPrepareError<E>),
     BindCandidate(ScopedDirectoryBindError<E>),
-    ValidateCandidate(ScopedDirectoryEditError<E>),
     InspectCandidateRoot(ScopedDirectoryEditError<E>),
     InvalidCandidateRoot {
         root: PathBuf,
@@ -335,9 +335,6 @@ where
             Self::BindCandidate(source) => {
                 write!(formatter, "无法绑定写回候选的物理身份：{source}")
             }
-            Self::ValidateCandidate(source) => {
-                write!(formatter, "写回候选未通过完整树校验：{source}")
-            }
             Self::InspectCandidateRoot(source) => {
                 write!(formatter, "无法检查写回候选顶层结构：{source}")
             }
@@ -362,13 +359,512 @@ where
             Self::InvalidRequest(source) => Some(source),
             Self::Prepare(source) => Some(source),
             Self::BindCandidate(source) => Some(source),
-            Self::ValidateCandidate(source) => Some(source),
             Self::InspectCandidateRoot(source) => Some(source),
             Self::InvalidCandidateRoot { .. } => None,
             Self::Publish(source) => Some(source),
             Self::Discard(source) => Some(source),
         }
     }
+}
+
+impl<E> StandardWriteBackPublishingError<E>
+where
+    E: SafeDiagnosticSource,
+{
+    /// 返回发布层掌握的主诊断；清理失败由 `related_diagnostics` 单独返回，不能覆盖主错。
+    pub(crate) fn safe_diagnostic(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::CandidateProjectMismatch {
+                expected_workspace_root,
+                candidate_workspace_root,
+                ..
+            } => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackCandidate,
+                stage,
+                DiagnosticSubject::path(candidate_workspace_root),
+                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackCandidateProjectMismatch),
+                impact,
+                DiagnosticAction::ReportBug,
+            )
+            .with_recovery(RecoveryFact::path(expected_workspace_root)),
+            Self::InvalidRequest(source) => invalid_stage_request_diagnostic(source, stage, impact),
+            Self::Prepare(source) => prepare_diagnostic(source, stage, impact),
+            Self::BindCandidate(source) => bind_diagnostic(source, stage, impact),
+            Self::InspectCandidateRoot(source) => edit_diagnostic(source, stage, impact),
+            Self::InvalidCandidateRoot { root } => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackValidate,
+                stage,
+                DiagnosticSubject::path(root),
+                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackCandidateInvalid),
+                impact,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::Publish(source) => publish_diagnostic(source, stage),
+            Self::Discard(source) => source
+                .source()
+                .safe_diagnostic_source(
+                    stage,
+                    DiagnosticImpact::RecoveryRequired,
+                    DiagnosticAction::CheckPathAndPermissions,
+                )
+                .with_recovery(RecoveryFact::path(source.staging_root())),
+        }
+    }
+}
+
+impl<E> WriteBackPublishingDiagnostic for StandardWriteBackPublishingError<E>
+where
+    E: Error + SafeDiagnosticSource + Send + Sync + 'static,
+{
+    fn into_write_back_failure_report(
+        self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+    ) -> FailureReport {
+        let diagnostic = self.safe_diagnostic(stage, impact);
+        match self {
+            Self::Prepare(DirectoryPrepareError::NotPrepared {
+                source,
+                cleanup_failure,
+                ..
+            }) => append_cleanup_failure(
+                FailureReport::new(ReportedFailure::new(diagnostic, source)),
+                cleanup_failure,
+                stage,
+            ),
+            Self::Publish(source) => publish_failure_report(source, diagnostic, stage),
+            source => FailureReport::new(ReportedFailure::new(diagnostic, source)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PublicationStateSource(&'static str);
+
+impl fmt::Display for PublicationStateSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl Error for PublicationStateSource {}
+
+fn append_cleanup_failure<E>(
+    mut report: FailureReport,
+    cleanup: Option<crate::storage::file_system::StagingCleanupFailure<E>>,
+    stage: DiagnosticStage,
+) -> FailureReport
+where
+    E: Error + SafeDiagnosticSource + Send + Sync + 'static,
+{
+    if let Some(cleanup) = cleanup {
+        let diagnostic = cleanup
+            .source()
+            .safe_diagnostic_source(
+                stage,
+                DiagnosticImpact::RecoveryRequired,
+                DiagnosticAction::CheckPathAndPermissions,
+            )
+            .with_recovery(RecoveryFact::path(cleanup.residual_path()));
+        let (_, source) = cleanup.into_parts();
+        report = report.with_related(ReportedFailure::new(diagnostic, source));
+    }
+    report
+}
+
+fn publish_failure_report<E>(
+    source: DirectoryPublishError<E>,
+    diagnostic: SafeDiagnostic,
+    stage: DiagnosticStage,
+) -> FailureReport
+where
+    E: Error + SafeDiagnosticSource + Send + Sync + 'static,
+{
+    match source {
+        DirectoryPublishError::TargetAlreadyExists {
+            cleanup_failure, ..
+        } => append_cleanup_failure(
+            FailureReport::new(ReportedFailure::new(
+                diagnostic,
+                PublicationStateSource("write-back target already exists"),
+            )),
+            cleanup_failure,
+            stage,
+        ),
+        DirectoryPublishError::TargetMissing {
+            cleanup_failure, ..
+        } => append_cleanup_failure(
+            FailureReport::new(ReportedFailure::new(
+                diagnostic,
+                PublicationStateSource("write-back target is missing"),
+            )),
+            cleanup_failure,
+            stage,
+        ),
+        DirectoryPublishError::TargetNotDirectory {
+            cleanup_failure, ..
+        } => append_cleanup_failure(
+            FailureReport::new(ReportedFailure::new(
+                diagnostic,
+                PublicationStateSource("write-back target is not a directory"),
+            )),
+            cleanup_failure,
+            stage,
+        ),
+        DirectoryPublishError::NotAttempted {
+            source,
+            cleanup_failure,
+            ..
+        }
+        | DirectoryPublishError::NotPublished {
+            source,
+            cleanup_failure,
+            ..
+        } => append_cleanup_failure(
+            FailureReport::new(ReportedFailure::new(diagnostic, source)),
+            cleanup_failure,
+            stage,
+        ),
+        DirectoryPublishError::PublishedWithResiduals { source, .. }
+        | DirectoryPublishError::RecoveryRequired { source, .. }
+        | DirectoryPublishError::OutcomeUnknown { source, .. } => {
+            FailureReport::new(ReportedFailure::new(diagnostic, source))
+        }
+    }
+}
+
+fn invalid_stage_request_diagnostic(
+    source: &DirectoryStageRequestError,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic {
+    let (subject, detail, related_path) = match source {
+        DirectoryStageRequestError::EmptyTargetRoot => (
+            DiagnosticSubject::field("target_root"),
+            "stage_request_error=empty_target_root",
+            None,
+        ),
+        DirectoryStageRequestError::EmptySourceDirectory => (
+            DiagnosticSubject::field("source_directory"),
+            "stage_request_error=empty_source_directory",
+            None,
+        ),
+        DirectoryStageRequestError::EmptySourceMappings => (
+            DiagnosticSubject::component("source_mappings"),
+            "stage_request_error=empty_source_mappings",
+            None,
+        ),
+        DirectoryStageRequestError::InvalidRelativePath { path } => (
+            DiagnosticSubject::path(path),
+            "stage_request_error=invalid_relative_path",
+            None,
+        ),
+        DirectoryStageRequestError::OverlappingSourceTargets { first, second } => (
+            DiagnosticSubject::path(first),
+            "stage_request_error=overlapping_source_targets",
+            Some(second.as_path()),
+        ),
+        DirectoryStageRequestError::OverlappingOverlays { first, second } => (
+            DiagnosticSubject::path(first),
+            "stage_request_error=overlapping_overlays",
+            Some(second.as_path()),
+        ),
+        DirectoryStageRequestError::OverlappingEmptyDirectories { first, second } => (
+            DiagnosticSubject::path(first),
+            "stage_request_error=overlapping_empty_directories",
+            Some(second.as_path()),
+        ),
+        DirectoryStageRequestError::OverlayOutsideSourceMappings { relative_file } => (
+            DiagnosticSubject::path(relative_file),
+            "stage_request_error=overlay_outside_source_mappings",
+            None,
+        ),
+        DirectoryStageRequestError::EmptyDirectoryOverlapsSourceTarget {
+            empty_directory,
+            source_target,
+        } => (
+            DiagnosticSubject::path(empty_directory),
+            "stage_request_error=empty_directory_overlaps_source_target",
+            Some(source_target.as_path()),
+        ),
+        DirectoryStageRequestError::EmptyDirectoryOverlapsOverlay {
+            empty_directory,
+            overlay,
+        } => (
+            DiagnosticSubject::path(empty_directory),
+            "stage_request_error=empty_directory_overlaps_overlay",
+            Some(overlay.as_path()),
+        ),
+    };
+    let mut diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::WriteBackCandidate,
+        stage,
+        subject,
+        DiagnosticReason::failure_with_detail(DiagnosticFailureKind::InternalInvariant, detail),
+        impact,
+        DiagnosticAction::ReportBug,
+    );
+    if let Some(path) = related_path {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::path(path));
+    }
+    diagnostic
+}
+
+fn prepare_diagnostic<E>(
+    source: &DirectoryPrepareError<E>,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic
+where
+    E: SafeDiagnosticSource,
+{
+    let DirectoryPrepareError::NotPrepared {
+        target_root,
+        source,
+        ..
+    } = source;
+    let mut diagnostic =
+        source.safe_diagnostic_source(stage, impact, DiagnosticAction::CheckPathAndPermissions);
+    diagnostic.code = DiagnosticCode::WriteBackCandidate;
+    diagnostic.with_recovery(RecoveryFact::path(target_root))
+}
+
+fn bind_diagnostic<E>(
+    source: &ScopedDirectoryBindError<E>,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic
+where
+    E: SafeDiagnosticSource,
+{
+    match source {
+        ScopedDirectoryBindError::WrongEditorInstance => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackCandidate,
+            stage,
+            DiagnosticSubject::operation("write-back candidate binding"),
+            DiagnosticReason::failure(DiagnosticFailureKind::WrongPublisherInstance),
+            impact,
+            DiagnosticAction::ReportBug,
+        ),
+        ScopedDirectoryBindError::CandidateFinalized { root } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackCandidate,
+            stage,
+            DiagnosticSubject::path(root),
+            DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
+            impact,
+            DiagnosticAction::ReportBug,
+        ),
+        ScopedDirectoryBindError::CandidateIdentityChanged { root } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackCandidate,
+            stage,
+            DiagnosticSubject::path(root),
+            DiagnosticReason::failure(DiagnosticFailureKind::FileIdentityChanged),
+            impact,
+            DiagnosticAction::CheckPathAndPermissions,
+        ),
+        ScopedDirectoryBindError::Failed { root, source } => source
+            .safe_diagnostic_source(stage, impact, DiagnosticAction::CheckPathAndPermissions)
+            .with_recovery(RecoveryFact::path(root)),
+    }
+}
+
+fn edit_diagnostic<E>(
+    source: &ScopedDirectoryEditError<E>,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic
+where
+    E: SafeDiagnosticSource,
+{
+    let (subject, failure, action, detail) = match source {
+        ScopedDirectoryEditError::WrongEditorInstance => (
+            DiagnosticSubject::operation("write-back candidate editor"),
+            DiagnosticFailureKind::WrongPublisherInstance,
+            DiagnosticAction::ReportBug,
+            "candidate_edit_error=wrong_editor_instance",
+        ),
+        ScopedDirectoryEditError::OutsideScope { path } => (
+            DiagnosticSubject::path(path),
+            DiagnosticFailureKind::InvalidPath,
+            DiagnosticAction::ReportBug,
+            "candidate_edit_error=outside_scope",
+        ),
+        ScopedDirectoryEditError::ScopeRootMutation { path } => (
+            DiagnosticSubject::path(path),
+            DiagnosticFailureKind::InvalidPath,
+            DiagnosticAction::ReportBug,
+            "candidate_edit_error=scope_root_mutation",
+        ),
+        ScopedDirectoryEditError::NotFound { path } => (
+            DiagnosticSubject::path(path),
+            DiagnosticFailureKind::NotFound,
+            DiagnosticAction::CheckProjectState,
+            "candidate_edit_error=not_found",
+        ),
+        ScopedDirectoryEditError::NotFile { path } => (
+            DiagnosticSubject::path(path),
+            DiagnosticFailureKind::StateMismatch,
+            DiagnosticAction::CheckProjectState,
+            "candidate_edit_error=not_file",
+        ),
+        ScopedDirectoryEditError::NotDirectory { path } => (
+            DiagnosticSubject::path(path),
+            DiagnosticFailureKind::StateMismatch,
+            DiagnosticAction::CheckProjectState,
+            "candidate_edit_error=not_directory",
+        ),
+        ScopedDirectoryEditError::DirectoryNotEmpty { path } => (
+            DiagnosticSubject::path(path),
+            DiagnosticFailureKind::StateMismatch,
+            DiagnosticAction::CheckProjectState,
+            "candidate_edit_error=directory_not_empty",
+        ),
+        ScopedDirectoryEditError::CandidateIdentityChanged { root } => (
+            DiagnosticSubject::path(root),
+            DiagnosticFailureKind::FileIdentityChanged,
+            DiagnosticAction::CheckPathAndPermissions,
+            "candidate_edit_error=identity_changed",
+        ),
+        ScopedDirectoryEditError::Failed { path, source } => {
+            return source
+                .safe_diagnostic_source(stage, impact, DiagnosticAction::CheckPathAndPermissions)
+                .with_recovery(RecoveryFact::path(path));
+        }
+    };
+    SafeDiagnostic::new(
+        DiagnosticCode::WriteBackValidate,
+        stage,
+        subject,
+        DiagnosticReason::failure_with_detail(failure, detail),
+        impact,
+        action,
+    )
+}
+
+fn publish_diagnostic<E>(
+    source: &DirectoryPublishError<E>,
+    stage: DiagnosticStage,
+) -> SafeDiagnostic
+where
+    E: SafeDiagnosticSource,
+{
+    match source {
+        DirectoryPublishError::TargetAlreadyExists { target_root, .. } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackPublish,
+            stage,
+            DiagnosticSubject::path(target_root),
+            DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        ),
+        DirectoryPublishError::TargetMissing { target_root, .. } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackPublish,
+            stage,
+            DiagnosticSubject::path(target_root),
+            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        ),
+        DirectoryPublishError::TargetNotDirectory { target_root, .. } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackPublish,
+            stage,
+            DiagnosticSubject::path(target_root),
+            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        ),
+        DirectoryPublishError::NotAttempted {
+            target_root,
+            source,
+            ..
+        } => {
+            let mut diagnostic = source.safe_diagnostic_source(
+                stage,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            );
+            diagnostic.code = DiagnosticCode::WriteBackPublish;
+            diagnostic
+                .with_recovery(RecoveryFact::path(target_root))
+                .with_recovery(RecoveryFact::component("publication_state=not_attempted"))
+        }
+        DirectoryPublishError::NotPublished {
+            target_root,
+            source,
+            ..
+        } => {
+            let mut diagnostic = source.safe_diagnostic_source(
+                stage,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            );
+            diagnostic.code = DiagnosticCode::WriteBackPublish;
+            diagnostic
+                .with_recovery(RecoveryFact::path(target_root))
+                .with_recovery(RecoveryFact::component("publication_state=not_published"))
+        }
+        DirectoryPublishError::PublishedWithResiduals {
+            target_root,
+            residual_path,
+            source,
+        } => {
+            let mut diagnostic = source.safe_diagnostic_source(
+                stage,
+                DiagnosticImpact::StateAppliedFinalizationFailed,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            );
+            diagnostic.code = DiagnosticCode::WriteBackPublish;
+            diagnostic
+                .with_recovery(RecoveryFact::path(target_root))
+                .with_recovery(RecoveryFact::path(residual_path))
+        }
+        DirectoryPublishError::RecoveryRequired {
+            target_root,
+            recovery_artifacts,
+            source,
+        } => publication_recovery_diagnostic(
+            source,
+            stage,
+            target_root,
+            recovery_artifacts,
+            DiagnosticImpact::RecoveryRequired,
+        ),
+        DirectoryPublishError::OutcomeUnknown {
+            target_root,
+            recovery_artifacts,
+            source,
+        } => publication_recovery_diagnostic(
+            source,
+            stage,
+            target_root,
+            recovery_artifacts,
+            DiagnosticImpact::OutcomeUnknown,
+        ),
+    }
+}
+
+fn publication_recovery_diagnostic<E>(
+    source: &E,
+    stage: DiagnosticStage,
+    target_root: &Path,
+    recovery_artifacts: &[PathBuf],
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic
+where
+    E: SafeDiagnosticSource,
+{
+    let mut diagnostic =
+        source.safe_diagnostic_source(stage, impact, DiagnosticAction::PreserveRecoveryArtifacts);
+    diagnostic.code = DiagnosticCode::WriteBackPublish;
+    diagnostic = diagnostic.with_recovery(RecoveryFact::path(target_root));
+    for path in recovery_artifacts {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::path(path));
+    }
+    diagnostic
 }
 
 fn validate_data_and_js(entries: &[ScopedDirectoryEntry]) -> bool {
@@ -515,15 +1011,6 @@ mod tests {
             std::future::ready(Ok(BoundScopedDirectory::new(root, scope, ())))
         }
 
-        fn validate_scoped_directory(
-            &self,
-            _scope: &BoundScopedDirectory<Self::ScopeState>,
-        ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>>
-        + Send
-        + use<> {
-            std::future::ready(Ok(()))
-        }
-
         fn read_scoped_file(
             &self,
             _scope: &BoundScopedDirectory<Self::ScopeState>,
@@ -595,6 +1082,226 @@ mod tests {
     }
 
     impl Error for FakeError {}
+
+    impl SafeDiagnosticSource for FakeError {
+        fn safe_diagnostic_source(
+            &self,
+            stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+            fallback_action: DiagnosticAction,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::operation("fake_filesystem"),
+                DiagnosticReason::failure(DiagnosticFailureKind::RequirementFailed),
+                impact,
+                fallback_action,
+            )
+        }
+    }
+
+    #[test]
+    fn invalid_stage_request_diagnostic_keeps_variant_and_all_safe_paths() {
+        let cases = [
+            (
+                DirectoryStageRequestError::EmptyTargetRoot,
+                DiagnosticSubject::field("target_root"),
+                "stage_request_error=empty_target_root",
+                None,
+            ),
+            (
+                DirectoryStageRequestError::EmptySourceDirectory,
+                DiagnosticSubject::field("source_directory"),
+                "stage_request_error=empty_source_directory",
+                None,
+            ),
+            (
+                DirectoryStageRequestError::EmptySourceMappings,
+                DiagnosticSubject::component("source_mappings"),
+                "stage_request_error=empty_source_mappings",
+                None,
+            ),
+            (
+                DirectoryStageRequestError::InvalidRelativePath {
+                    path: PathBuf::from("../outside"),
+                },
+                DiagnosticSubject::path("../outside"),
+                "stage_request_error=invalid_relative_path",
+                None,
+            ),
+            (
+                DirectoryStageRequestError::OverlappingSourceTargets {
+                    first: PathBuf::from("data"),
+                    second: PathBuf::from("data/maps"),
+                },
+                DiagnosticSubject::path("data"),
+                "stage_request_error=overlapping_source_targets",
+                Some(PathBuf::from("data/maps")),
+            ),
+            (
+                DirectoryStageRequestError::OverlappingOverlays {
+                    first: PathBuf::from("data/Items.json"),
+                    second: PathBuf::from("data/Items.json/name"),
+                },
+                DiagnosticSubject::path("data/Items.json"),
+                "stage_request_error=overlapping_overlays",
+                Some(PathBuf::from("data/Items.json/name")),
+            ),
+            (
+                DirectoryStageRequestError::OverlappingEmptyDirectories {
+                    first: PathBuf::from("data/empty"),
+                    second: PathBuf::from("data/empty/nested"),
+                },
+                DiagnosticSubject::path("data/empty"),
+                "stage_request_error=overlapping_empty_directories",
+                Some(PathBuf::from("data/empty/nested")),
+            ),
+            (
+                DirectoryStageRequestError::OverlayOutsideSourceMappings {
+                    relative_file: PathBuf::from("js/plugins.js"),
+                },
+                DiagnosticSubject::path("js/plugins.js"),
+                "stage_request_error=overlay_outside_source_mappings",
+                None,
+            ),
+            (
+                DirectoryStageRequestError::EmptyDirectoryOverlapsSourceTarget {
+                    empty_directory: PathBuf::from("data/maps"),
+                    source_target: PathBuf::from("data"),
+                },
+                DiagnosticSubject::path("data/maps"),
+                "stage_request_error=empty_directory_overlaps_source_target",
+                Some(PathBuf::from("data")),
+            ),
+            (
+                DirectoryStageRequestError::EmptyDirectoryOverlapsOverlay {
+                    empty_directory: PathBuf::from("data/empty"),
+                    overlay: PathBuf::from("data/empty/file.json"),
+                },
+                DiagnosticSubject::path("data/empty"),
+                "stage_request_error=empty_directory_overlaps_overlay",
+                Some(PathBuf::from("data/empty/file.json")),
+            ),
+        ];
+
+        for (source, expected_subject, expected_detail, expected_related_path) in cases {
+            let diagnostic = invalid_stage_request_diagnostic(
+                &source,
+                DiagnosticStage::Publication,
+                DiagnosticImpact::Unchanged,
+            );
+            assert_eq!(diagnostic.code, DiagnosticCode::WriteBackCandidate);
+            assert_eq!(diagnostic.stage, DiagnosticStage::Publication);
+            assert_eq!(diagnostic.subject, expected_subject);
+            assert_eq!(
+                diagnostic.reason,
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InternalInvariant,
+                    expected_detail,
+                )
+            );
+            assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
+            assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+            assert_eq!(
+                diagnostic.recovery,
+                expected_related_path
+                    .map(RecoveryFact::path)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_edit_and_publish_diagnostics_keep_typed_terminal_state() {
+        let edit_cases: [(ScopedDirectoryEditError<FakeError>, &str); 8] = [
+            (
+                ScopedDirectoryEditError::WrongEditorInstance,
+                "candidate_edit_error=wrong_editor_instance",
+            ),
+            (
+                ScopedDirectoryEditError::OutsideScope {
+                    path: PathBuf::from("outside"),
+                },
+                "candidate_edit_error=outside_scope",
+            ),
+            (
+                ScopedDirectoryEditError::ScopeRootMutation {
+                    path: PathBuf::from("data"),
+                },
+                "candidate_edit_error=scope_root_mutation",
+            ),
+            (
+                ScopedDirectoryEditError::NotFound {
+                    path: PathBuf::from("data/missing.json"),
+                },
+                "candidate_edit_error=not_found",
+            ),
+            (
+                ScopedDirectoryEditError::NotFile {
+                    path: PathBuf::from("data"),
+                },
+                "candidate_edit_error=not_file",
+            ),
+            (
+                ScopedDirectoryEditError::NotDirectory {
+                    path: PathBuf::from("data/Items.json"),
+                },
+                "candidate_edit_error=not_directory",
+            ),
+            (
+                ScopedDirectoryEditError::DirectoryNotEmpty {
+                    path: PathBuf::from("data"),
+                },
+                "candidate_edit_error=directory_not_empty",
+            ),
+            (
+                ScopedDirectoryEditError::CandidateIdentityChanged {
+                    root: PathBuf::from("candidate"),
+                },
+                "candidate_edit_error=identity_changed",
+            ),
+        ];
+        for (source, expected_detail) in edit_cases {
+            let diagnostic = edit_diagnostic(
+                &source,
+                DiagnosticStage::Publication,
+                DiagnosticImpact::Unchanged,
+            );
+            let DiagnosticReason::FailureWithDetail { detail, .. } = diagnostic.reason else {
+                panic!("候选编辑闭集错误必须保留稳定详情");
+            };
+            assert_eq!(detail, expected_detail);
+        }
+
+        let states = [
+            (
+                DirectoryPublishError::NotAttempted {
+                    target_root: PathBuf::from("output"),
+                    source: FakeError("not attempted"),
+                    cleanup_failure: None,
+                },
+                "publication_state=not_attempted",
+            ),
+            (
+                DirectoryPublishError::NotPublished {
+                    target_root: PathBuf::from("output"),
+                    source: FakeError("not published"),
+                    cleanup_failure: None,
+                },
+                "publication_state=not_published",
+            ),
+        ];
+        for (source, expected_state) in states {
+            let diagnostic = publish_diagnostic(&source, DiagnosticStage::Publication);
+            assert!(
+                diagnostic
+                    .recovery
+                    .contains(&RecoveryFact::component(expected_state))
+            );
+        }
+    }
 
     #[test]
     fn mz_candidate_root_owns_exact_data_and_js_structure() {

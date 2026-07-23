@@ -490,81 +490,63 @@ pub(crate) enum UiMessage<'a> {
     },
     CliInvalidUtf8,
     CliParseFailure,
-    ErrorConfigurationOrInputGeneric,
-    ErrorConfigCurrentDirectoryNotAbsolute {
-        path: &'a str,
-    },
-    ErrorConfigEmptyPath,
-    ErrorConfigOpen {
-        path: &'a str,
-    },
-    ErrorConfigNotAFile {
-        path: &'a str,
-    },
-    ErrorConfigTooLarge {
-        path: &'a str,
-        observed_bytes: u64,
-        maximum_bytes: u64,
-    },
-    ErrorConfigRead {
-        path: &'a str,
-    },
-    ErrorConfigInvalidUtf8KnownLength {
-        path: &'a str,
-        valid_up_to: u64,
-        error_len: u64,
-    },
-    ErrorConfigInvalidUtf8UnknownLength {
-        path: &'a str,
-        valid_up_to: u64,
-    },
-    ErrorConfigInvalidTomlAt {
-        path: &'a str,
-        line: u64,
-        column: u64,
-        resource: &'a str,
-    },
-    ErrorConfigInvalidToml {
-        path: &'a str,
-        resource: &'a str,
-    },
-    ErrorConfigInvalidValue {
-        field: &'a str,
-    },
-    ErrorConfigInvalidValueAtPath {
-        path: &'a str,
-        field: &'a str,
-    },
-    ErrorConfigProfileNotFound {
-        path: &'a str,
-        profile: &'a str,
-    },
-    ErrorConfigProfileConflict {
-        path: &'a str,
-        explicit_profile: &'a str,
-        requested_profile: &'a str,
-    },
-    ErrorRpgMakerPromptUnavailable {
-        locale: &'a str,
-        component: &'a str,
-        path: &'a str,
-    },
-    ErrorRpgMakerLanguageModuleUnavailable {
-        source_language: &'a str,
-        target_language: &'a str,
-    },
-    ErrorProjectUnavailable,
-    ErrorProjectState,
-    ErrorExternalModel,
     ErrorStateAppliedFinalization,
-    ErrorOutcomeUnknown,
-    ErrorInternal,
-    ErrorShutdown,
-    ErrorNoReusableExtractPlan,
-    ErrorInitPathRequired,
-    ErrorProfileRequired,
-    ErrorSavedProfileUnavailable {
-        profile: &'a str,
+    DiagnosticTitle {
+        code: &'a str,
+    },
+    DiagnosticStage {
+        stage: &'a str,
+    },
+    DiagnosticSubject {
+        subject: &'a str,
+    },
+    DiagnosticSubjectValue {
+        kind: &'a str,
+        value: &'a str,
+    },
+    DiagnosticReason {
+        reason: &'a str,
+    },
+    DiagnosticImpact {
+        impact: &'a str,
+    },
+    DiagnosticAction {
+        action: &'a str,
+    },
+    DiagnosticRecovery {
+        recovery: &'a str,
+    },
+    DiagnosticRecoveryValue {
+        kind: &'a str,
+        value: &'a str,
+    },
+    DiagnosticRelated {
+        index: u64,
+    },
+    DiagnosticStageValue {
+        code: &'a str,
+        fallback: &'a str,
+    },
+    DiagnosticImpactValue {
+        code: &'a str,
+        fallback: &'a str,
+    },
+    DiagnosticActionValue {
+        code: &'a str,
+        fallback: &'a str,
+    },
+    DiagnosticFailureValue {
+        code: &'a str,
+        fallback: &'a str,
+    },
+    DiagnosticIoKindValue {
+        code: &'a str,
+        fallback: &'a str,
+    },
+    DiagnosticConfigurationRuleValue {
+        code: &'a str,
+        fallback: &'a str,
+        facts: &'a str,
     },
     ErrorNoExecutableExtractOwner,
     ErrorPlanSaveFailedApplied,
@@ -700,16 +682,20 @@ pub(crate) enum UiMessage<'a> {
     LogRunFailed {
         command: &'a str,
     },
+    LogRunOutcomeUnknown {
+        command: &'a str,
+    },
     LogRunCancelled {
         command: &'a str,
+    },
+    LogPerformanceCounters {
+        sqlite_control_attempted_total: u64,
+        candidate_validation_started: u64,
+        candidate_validation_completed: u64,
     },
     LogPlanResolved {
         command: &'a str,
         source: &'a str,
-    },
-    LogTranslatePlanResolved {
-        profile_source: &'a str,
-        lua_source: &'a str,
     },
     LogPhaseStarted {
         phase: &'a str,
@@ -723,11 +709,9 @@ pub(crate) enum UiMessage<'a> {
     LogNoWork {
         reason: &'a str,
     },
+    LogNoWorkTranslationUpToDate,
     LogPartialResult {
         count: u64,
-    },
-    LogPublishFinished {
-        path: &'a str,
     },
     LogTranslationTaskStarted {
         index: u64,
@@ -736,6 +720,11 @@ pub(crate) enum UiMessage<'a> {
     LogTranslationTaskFinished {
         index: u64,
         outcome: &'a str,
+    },
+    LogTranslationTaskDiagnostic {
+        index: u64,
+        attempts: u64,
+        diagnostic: &'a str,
     },
 }
 
@@ -796,42 +785,23 @@ impl UiMessage<'_> {
             Self::CliWrongNumberOfValues { .. } => "cli-wrong-number-of-values",
             Self::CliInvalidUtf8 => "cli-invalid-utf8",
             Self::CliParseFailure => "cli-parse-failure",
-            Self::ErrorConfigurationOrInputGeneric => "error-configuration-or-input-generic",
-            Self::ErrorConfigCurrentDirectoryNotAbsolute { .. } => {
-                "error-config-current-directory-not-absolute"
-            }
-            Self::ErrorConfigEmptyPath => "error-config-empty-path",
-            Self::ErrorConfigOpen { .. } => "error-config-open",
-            Self::ErrorConfigNotAFile { .. } => "error-config-not-a-file",
-            Self::ErrorConfigTooLarge { .. } => "error-config-too-large",
-            Self::ErrorConfigRead { .. } => "error-config-read",
-            Self::ErrorConfigInvalidUtf8KnownLength { .. } => {
-                "error-config-invalid-utf8-known-length"
-            }
-            Self::ErrorConfigInvalidUtf8UnknownLength { .. } => {
-                "error-config-invalid-utf8-unknown-length"
-            }
-            Self::ErrorConfigInvalidTomlAt { .. } => "error-config-invalid-toml-at",
-            Self::ErrorConfigInvalidToml { .. } => "error-config-invalid-toml",
-            Self::ErrorConfigInvalidValue { .. } => "error-config-invalid-value",
-            Self::ErrorConfigInvalidValueAtPath { .. } => "error-config-invalid-value-at-path",
-            Self::ErrorConfigProfileNotFound { .. } => "error-config-profile-not-found",
-            Self::ErrorConfigProfileConflict { .. } => "error-config-profile-conflict",
-            Self::ErrorRpgMakerPromptUnavailable { .. } => "error-rpg-maker-prompt-unavailable",
-            Self::ErrorRpgMakerLanguageModuleUnavailable { .. } => {
-                "error-rpg-maker-language-module-unavailable"
-            }
-            Self::ErrorProjectUnavailable => "error-project-unavailable",
-            Self::ErrorProjectState => "error-project-state",
-            Self::ErrorExternalModel => "error-external-model",
             Self::ErrorStateAppliedFinalization => "error-state-applied-finalization",
-            Self::ErrorOutcomeUnknown => "error-outcome-unknown",
-            Self::ErrorInternal => "error-internal",
-            Self::ErrorShutdown => "error-shutdown",
-            Self::ErrorNoReusableExtractPlan => "error-no-reusable-extract-plan",
-            Self::ErrorInitPathRequired => "error-init-path-required",
-            Self::ErrorProfileRequired => "error-profile-required",
-            Self::ErrorSavedProfileUnavailable { .. } => "error-saved-profile-unavailable",
+            Self::DiagnosticTitle { .. } => "diagnostic-title",
+            Self::DiagnosticStage { .. } => "diagnostic-stage",
+            Self::DiagnosticSubject { .. } => "diagnostic-subject",
+            Self::DiagnosticSubjectValue { .. } => "diagnostic-subject-value",
+            Self::DiagnosticReason { .. } => "diagnostic-reason",
+            Self::DiagnosticImpact { .. } => "diagnostic-impact",
+            Self::DiagnosticAction { .. } => "diagnostic-action",
+            Self::DiagnosticRecovery { .. } => "diagnostic-recovery",
+            Self::DiagnosticRecoveryValue { .. } => "diagnostic-recovery-value",
+            Self::DiagnosticRelated { .. } => "diagnostic-related",
+            Self::DiagnosticStageValue { .. } => "diagnostic-stage-value",
+            Self::DiagnosticImpactValue { .. } => "diagnostic-impact-value",
+            Self::DiagnosticActionValue { .. } => "diagnostic-action-value",
+            Self::DiagnosticFailureValue { .. } => "diagnostic-failure-value",
+            Self::DiagnosticIoKindValue { .. } => "diagnostic-io-kind-value",
+            Self::DiagnosticConfigurationRuleValue { .. } => "diagnostic-configuration-rule-value",
             Self::ErrorNoExecutableExtractOwner => "error-no-executable-extract-owner",
             Self::ErrorPlanSaveFailedApplied => "error-plan-save-failed-applied",
             Self::ErrorPlanSaveOutcomeUnknown => "error-plan-save-outcome-unknown",
@@ -911,17 +881,19 @@ impl UiMessage<'_> {
             Self::LogRunStarted { .. } => "log-run-started",
             Self::LogRunSucceeded { .. } => "log-run-succeeded",
             Self::LogRunFailed { .. } => "log-run-failed",
+            Self::LogRunOutcomeUnknown { .. } => "log-run-outcome-unknown",
             Self::LogRunCancelled { .. } => "log-run-cancelled",
+            Self::LogPerformanceCounters { .. } => "log-performance-counters",
             Self::LogPlanResolved { .. } => "log-plan-resolved",
-            Self::LogTranslatePlanResolved { .. } => "log-translate-plan-resolved",
             Self::LogPhaseStarted { .. } => "log-phase-started",
             Self::LogPhaseFinished { .. } => "log-phase-finished",
             Self::LogRetrySummary { .. } => "log-retry-summary",
             Self::LogNoWork { .. } => "log-no-work",
+            Self::LogNoWorkTranslationUpToDate => "log-no-work-translation-up-to-date",
             Self::LogPartialResult { .. } => "log-partial-result",
-            Self::LogPublishFinished { .. } => "log-publish-finished",
             Self::LogTranslationTaskStarted { .. } => "log-translation-task-started",
             Self::LogTranslationTaskFinished { .. } => "log-translation-task-finished",
+            Self::LogTranslationTaskDiagnostic { .. } => "log-translation-task-diagnostic",
         }
     }
 
@@ -946,101 +918,19 @@ impl UiMessage<'_> {
             | Self::CliWrongNumberOfValues { argument } => {
                 set_text(&mut arguments, "argument", argument);
             }
-            Self::ErrorConfigCurrentDirectoryNotAbsolute { path }
-            | Self::ErrorConfigOpen { path }
-            | Self::ErrorConfigNotAFile { path }
-            | Self::ErrorConfigRead { path } => set_text(&mut arguments, "path", path),
-            Self::ErrorConfigTooLarge {
-                path,
-                observed_bytes,
-                maximum_bytes,
-            } => {
-                set_text(&mut arguments, "path", path);
-                set_number(&mut arguments, "observed", observed_bytes);
-                set_number(&mut arguments, "maximum", maximum_bytes);
-            }
-            Self::ErrorConfigInvalidUtf8KnownLength {
-                path,
-                valid_up_to,
-                error_len,
-            } => {
-                set_text(&mut arguments, "path", path);
-                set_number(&mut arguments, "valid", valid_up_to);
-                set_number(&mut arguments, "length", error_len);
-            }
-            Self::ErrorConfigInvalidUtf8UnknownLength { path, valid_up_to } => {
-                set_text(&mut arguments, "path", path);
-                set_number(&mut arguments, "valid", valid_up_to);
-            }
-            Self::ErrorConfigInvalidTomlAt {
-                path,
-                line,
-                column,
-                resource,
-            } => {
-                set_text(&mut arguments, "path", path);
-                set_number(&mut arguments, "line", line);
-                set_number(&mut arguments, "column", column);
-                set_text(&mut arguments, "resource", resource);
-            }
-            Self::ErrorConfigInvalidToml { path, resource } => {
-                set_text(&mut arguments, "path", path);
-                set_text(&mut arguments, "resource", resource);
-            }
-            Self::ErrorConfigInvalidValue { field } => {
-                set_text(&mut arguments, "field", field);
-            }
-            Self::ErrorConfigInvalidValueAtPath { path, field } => {
-                set_text(&mut arguments, "path", path);
-                set_text(&mut arguments, "field", field);
-            }
-            Self::ErrorConfigProfileNotFound { path, profile } => {
-                set_text(&mut arguments, "path", path);
-                set_text(&mut arguments, "profile", profile);
-            }
-            Self::ErrorConfigProfileConflict {
-                path,
-                explicit_profile,
-                requested_profile,
-            } => {
-                set_text(&mut arguments, "path", path);
-                set_text(&mut arguments, "explicit", explicit_profile);
-                set_text(&mut arguments, "requested", requested_profile);
-            }
-            Self::ErrorRpgMakerPromptUnavailable {
-                locale,
-                component,
-                path,
-            } => {
-                set_text(&mut arguments, "locale", locale);
-                set_text(&mut arguments, "component", component);
-                set_text(&mut arguments, "path", path);
-            }
-            Self::ErrorRpgMakerLanguageModuleUnavailable {
-                source_language,
-                target_language,
-            } => {
-                set_text(&mut arguments, "source", source_language);
-                set_text(&mut arguments, "target", target_language);
-            }
-            Self::ErrorSavedProfileUnavailable { profile }
-            | Self::NoticeTranslateReuseProfile { profile } => {
+            Self::NoticeTranslateReuseProfile { profile } => {
                 set_text(&mut arguments, "profile", profile);
             }
             Self::ResultTranslatePlanSources {
-                profile_source,
-                lua_source,
-            }
-            | Self::LogTranslatePlanResolved {
                 profile_source,
                 lua_source,
             } => {
                 set_text(&mut arguments, "profile_source", profile_source);
                 set_text(&mut arguments, "lua_source", lua_source);
             }
-            Self::NoticeInitReusePath { path }
-            | Self::ResultOutputDirectory { path }
-            | Self::LogPublishFinished { path } => set_text(&mut arguments, "path", path),
+            Self::NoticeInitReusePath { path } | Self::ResultOutputDirectory { path } => {
+                set_text(&mut arguments, "path", path)
+            }
             Self::NoticeExtractReuseOwners { owners } | Self::ResultInitStaleOwners { owners } => {
                 set_text(&mut arguments, "owners", owners);
             }
@@ -1105,7 +995,29 @@ impl UiMessage<'_> {
             Self::LogRunStarted { command }
             | Self::LogRunSucceeded { command }
             | Self::LogRunFailed { command }
+            | Self::LogRunOutcomeUnknown { command }
             | Self::LogRunCancelled { command } => set_text(&mut arguments, "command", command),
+            Self::LogPerformanceCounters {
+                sqlite_control_attempted_total,
+                candidate_validation_started,
+                candidate_validation_completed,
+            } => {
+                set_number(
+                    &mut arguments,
+                    "sqlite_control_attempted_total",
+                    sqlite_control_attempted_total,
+                );
+                set_number(
+                    &mut arguments,
+                    "candidate_validation_started",
+                    candidate_validation_started,
+                );
+                set_number(
+                    &mut arguments,
+                    "candidate_validation_completed",
+                    candidate_validation_completed,
+                );
+            }
             Self::LogPlanResolved { command, source } => {
                 set_text(&mut arguments, "command", command);
                 set_text(&mut arguments, "source", source);
@@ -1121,6 +1033,48 @@ impl UiMessage<'_> {
             Self::LogTranslationTaskFinished { index, outcome } => {
                 set_number(&mut arguments, "index", index);
                 set_text(&mut arguments, "outcome", outcome);
+            }
+            Self::LogTranslationTaskDiagnostic {
+                index,
+                attempts,
+                diagnostic,
+            } => {
+                set_number(&mut arguments, "index", index);
+                set_number(&mut arguments, "attempts", attempts);
+                set_text(&mut arguments, "diagnostic", diagnostic);
+            }
+            Self::DiagnosticTitle { code } => set_text(&mut arguments, "code", code),
+            Self::DiagnosticStage { stage } => set_text(&mut arguments, "stage", stage),
+            Self::DiagnosticSubject { subject } => set_text(&mut arguments, "subject", subject),
+            Self::DiagnosticSubjectValue { kind, value } => {
+                set_text(&mut arguments, "kind", kind);
+                set_text(&mut arguments, "value", value);
+            }
+            Self::DiagnosticReason { reason } => set_text(&mut arguments, "reason", reason),
+            Self::DiagnosticImpact { impact } => set_text(&mut arguments, "impact", impact),
+            Self::DiagnosticAction { action } => set_text(&mut arguments, "action", action),
+            Self::DiagnosticRecovery { recovery } => set_text(&mut arguments, "recovery", recovery),
+            Self::DiagnosticRecoveryValue { kind, value } => {
+                set_text(&mut arguments, "kind", kind);
+                set_text(&mut arguments, "value", value);
+            }
+            Self::DiagnosticRelated { index } => set_number(&mut arguments, "index", index),
+            Self::DiagnosticStageValue { code, fallback }
+            | Self::DiagnosticImpactValue { code, fallback }
+            | Self::DiagnosticActionValue { code, fallback }
+            | Self::DiagnosticFailureValue { code, fallback }
+            | Self::DiagnosticIoKindValue { code, fallback } => {
+                set_text(&mut arguments, "code", code);
+                set_text(&mut arguments, "fallback", fallback);
+            }
+            Self::DiagnosticConfigurationRuleValue {
+                code,
+                fallback,
+                facts,
+            } => {
+                set_text(&mut arguments, "code", code);
+                set_text(&mut arguments, "fallback", fallback);
+                set_text(&mut arguments, "facts", facts);
             }
             Self::AppAbout
             | Self::CliConfigHelp
@@ -1163,18 +1117,7 @@ impl UiMessage<'_> {
             | Self::CliMissingSubcommand
             | Self::CliInvalidUtf8
             | Self::CliParseFailure
-            | Self::ErrorConfigurationOrInputGeneric
-            | Self::ErrorConfigEmptyPath
-            | Self::ErrorProjectUnavailable
-            | Self::ErrorProjectState
-            | Self::ErrorExternalModel
             | Self::ErrorStateAppliedFinalization
-            | Self::ErrorOutcomeUnknown
-            | Self::ErrorInternal
-            | Self::ErrorShutdown
-            | Self::ErrorNoReusableExtractPlan
-            | Self::ErrorInitPathRequired
-            | Self::ErrorProfileRequired
             | Self::ErrorNoExecutableExtractOwner
             | Self::ErrorPlanSaveFailedApplied
             | Self::ErrorPlanSaveOutcomeUnknown
@@ -1200,6 +1143,7 @@ impl UiMessage<'_> {
             | Self::LogLabelTaskPartial
             | Self::LogLabelTaskUnavailable
             | Self::LogLabelTaskFailed
+            | Self::LogNoWorkTranslationUpToDate
             | Self::NoticeTranslateReuseLua
             | Self::NoticeWriteBackReuseLua
             | Self::NoticeWriteBackStandardOnly
@@ -1249,36 +1193,6 @@ pub(crate) fn project_log_value_source_label(code: &str) -> Option<UiMessage<'st
     }
 }
 
-/// 把各纵向切片写入 payload 的稳定阶段代码映射到本地化标签。
-pub(crate) fn project_log_phase_label(code: &str) -> Option<UiMessage<'static>> {
-    match code {
-        "check_project" => Some(UiMessage::LogLabelPhaseCheckProject),
-        "scan_source" => Some(UiMessage::LogLabelPhaseScanSource),
-        "prepare_candidate" => Some(UiMessage::LogLabelPhasePrepareCandidate),
-        "update_database" => Some(UiMessage::LogLabelPhaseUpdateDatabase),
-        "publish" => Some(UiMessage::LogLabelPhasePublish),
-        "builtin" => Some(UiMessage::LogLabelPhaseBuiltin),
-        "builtin_documents" => Some(UiMessage::ProgressExtractDocuments),
-        "builtin_work_units" => Some(UiMessage::ProgressExtractBuiltin),
-        "builtin_commit" => Some(UiMessage::ProgressExtractCommit),
-        "rules" => Some(UiMessage::LogLabelPhaseRules),
-        "rules_documents" => Some(UiMessage::ProgressExtractDocuments),
-        "rules_matches" => Some(UiMessage::ProgressExtractRules),
-        "rules_commit" => Some(UiMessage::ProgressExtractCommit),
-        "lua" => Some(UiMessage::LogLabelPhaseLua),
-        "lua_execution" => Some(UiMessage::ProgressExtractLua),
-        "lua_commit" => Some(UiMessage::ProgressExtractCommit),
-        "planning" => Some(UiMessage::LogLabelPhasePlanning),
-        "confirmed_tasks" => Some(UiMessage::LogLabelPhaseConfirmedTasks),
-        "no_work" => Some(UiMessage::LogLabelPhaseNoWork),
-        "read_assets" => Some(UiMessage::LogLabelPhaseReadAssets),
-        "plan_standard" => Some(UiMessage::LogLabelPhasePlanStandard),
-        "rewrite_documents" => Some(UiMessage::LogLabelPhaseRewriteDocuments),
-        "validate_candidate" => Some(UiMessage::LogLabelPhaseValidateCandidate),
-        _ => None,
-    }
-}
-
 /// 把翻译任务 payload 的稳定结果代码映射到本地化标签。
 pub(crate) fn project_log_task_outcome_label(code: &str) -> Option<UiMessage<'static>> {
     match code {
@@ -1300,7 +1214,6 @@ fn set_number(arguments: &mut FluentArgs<'static>, name: &'static str, value: u6
 
 /// 使用嵌入式 Fluent catalog 格式化用户可见消息。
 pub(crate) struct UiLocalizer {
-    #[cfg(test)]
     locale: UiLocale,
     selected: FluentBundle<FluentResource>,
     english_fallback: FluentBundle<FluentResource>,
@@ -1309,14 +1222,12 @@ pub(crate) struct UiLocalizer {
 impl UiLocalizer {
     pub(crate) fn new(locale: UiLocale) -> Self {
         Self {
-            #[cfg(test)]
             locale,
             selected: build_bundle(locale),
             english_fallback: build_bundle(UiLocale::English),
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn locale(&self) -> UiLocale {
         self.locale
     }
@@ -1463,6 +1374,33 @@ mod tests {
     }
 
     #[test]
+    fn process_output_stage_formats_with_the_same_parameters_in_every_locale() {
+        for locale in UiLocale::ALL {
+            let expected = match locale {
+                UiLocale::Arabic => "إخراج العملية",
+                UiLocale::SimplifiedChinese => "进程输出",
+                UiLocale::TraditionalChinese => "處理程序輸出",
+                UiLocale::English => "Process output",
+                UiLocale::French => "Sortie du processus",
+                UiLocale::Russian => "Вывод процесса",
+                UiLocale::Spanish => "Salida del proceso",
+                UiLocale::Japanese => "プロセス出力",
+                UiLocale::Korean => "프로세스 출력",
+                UiLocale::Vietnamese => "Đầu ra tiến trình",
+            };
+            let rendered = UiLocalizer::new(locale).format(UiMessage::DiagnosticStageValue {
+                code: "process_output",
+                fallback: "process output",
+            });
+            assert_eq!(
+                without_fluent_isolation(&rendered),
+                expected,
+                "{locale} 的 process_output 阶段标签不正确"
+            );
+        }
+    }
+
+    #[test]
     fn russian_and_arabic_retry_summaries_use_locale_plural_rules() {
         let russian = UiLocalizer::new(UiLocale::Russian);
         assert!(
@@ -1521,36 +1459,9 @@ mod tests {
     }
 
     #[test]
-    fn project_log_stable_codes_have_closed_localized_labels() {
+    fn project_log_string_codes_have_closed_localized_labels() {
         for source in ["explicit", "project_state", "product_default"] {
             assert!(project_log_value_source_label(source).is_some(), "{source}");
-        }
-        for phase in [
-            "check_project",
-            "scan_source",
-            "prepare_candidate",
-            "update_database",
-            "publish",
-            "builtin",
-            "builtin_documents",
-            "builtin_work_units",
-            "builtin_commit",
-            "rules",
-            "rules_documents",
-            "rules_matches",
-            "rules_commit",
-            "lua",
-            "lua_execution",
-            "lua_commit",
-            "planning",
-            "confirmed_tasks",
-            "no_work",
-            "read_assets",
-            "plan_standard",
-            "rewrite_documents",
-            "validate_candidate",
-        ] {
-            assert!(project_log_phase_label(phase).is_some(), "{phase}");
         }
         for outcome in ["complete", "partial", "unavailable", "failed"] {
             assert!(
@@ -1559,7 +1470,6 @@ mod tests {
             );
         }
         assert!(project_log_value_source_label("future").is_none());
-        assert!(project_log_phase_label("future").is_none());
         assert!(project_log_task_outcome_label("future").is_none());
     }
 
@@ -1686,70 +1596,60 @@ mod tests {
             UiMessage::CliWrongNumberOfValues { argument: "--path" },
             UiMessage::CliInvalidUtf8,
             UiMessage::CliParseFailure,
-            UiMessage::ErrorConfigurationOrInputGeneric,
-            UiMessage::ErrorConfigCurrentDirectoryNotAbsolute { path: "path" },
-            UiMessage::ErrorConfigEmptyPath,
-            UiMessage::ErrorConfigOpen { path: "path" },
-            UiMessage::ErrorConfigNotAFile { path: "path" },
-            UiMessage::ErrorConfigTooLarge {
-                path: "path",
-                observed_bytes: 5,
-                maximum_bytes: 4,
-            },
-            UiMessage::ErrorConfigRead { path: "path" },
-            UiMessage::ErrorConfigInvalidUtf8KnownLength {
-                path: "path",
-                valid_up_to: 3,
-                error_len: 1,
-            },
-            UiMessage::ErrorConfigInvalidUtf8UnknownLength {
-                path: "path",
-                valid_up_to: 3,
-            },
-            UiMessage::ErrorConfigInvalidTomlAt {
-                path: "path",
-                line: 2,
-                column: 3,
-                resource: "runtime.sqlite",
-            },
-            UiMessage::ErrorConfigInvalidToml {
-                path: "path",
-                resource: "runtime.sqlite",
-            },
-            UiMessage::ErrorConfigInvalidValue { field: "field" },
-            UiMessage::ErrorConfigInvalidValueAtPath {
-                path: "path",
-                field: "field",
-            },
-            UiMessage::ErrorConfigProfileNotFound {
-                path: "path",
-                profile: "main",
-            },
-            UiMessage::ErrorConfigProfileConflict {
-                path: "path",
-                explicit_profile: "main",
-                requested_profile: "other",
-            },
-            UiMessage::ErrorRpgMakerPromptUnavailable {
-                locale: "zh-Hans",
-                component: "system",
-                path: "prompts/rpg_maker/zh-Hans/system.md",
-            },
-            UiMessage::ErrorRpgMakerLanguageModuleUnavailable {
-                source_language: "ja",
-                target_language: "zh-Hans",
-            },
-            UiMessage::ErrorProjectUnavailable,
-            UiMessage::ErrorProjectState,
-            UiMessage::ErrorExternalModel,
             UiMessage::ErrorStateAppliedFinalization,
-            UiMessage::ErrorOutcomeUnknown,
-            UiMessage::ErrorInternal,
-            UiMessage::ErrorShutdown,
-            UiMessage::ErrorNoReusableExtractPlan,
-            UiMessage::ErrorInitPathRequired,
-            UiMessage::ErrorProfileRequired,
-            UiMessage::ErrorSavedProfileUnavailable { profile: "profile" },
+            UiMessage::DiagnosticTitle {
+                code: "project.state",
+            },
+            UiMessage::DiagnosticStage { stage: "extract" },
+            UiMessage::DiagnosticSubject {
+                subject: "project demo",
+            },
+            UiMessage::DiagnosticSubjectValue {
+                kind: "project",
+                value: "demo",
+            },
+            UiMessage::DiagnosticReason {
+                reason: "state mismatch",
+            },
+            UiMessage::DiagnosticImpact {
+                impact: "unchanged",
+            },
+            UiMessage::DiagnosticAction {
+                action: "check project state",
+            },
+            UiMessage::DiagnosticRecovery {
+                recovery: "C:\\project",
+            },
+            UiMessage::DiagnosticRecoveryValue {
+                kind: "transaction",
+                value: "rolled_back",
+            },
+            UiMessage::DiagnosticRelated { index: 1 },
+            UiMessage::DiagnosticStageValue {
+                code: "extract",
+                fallback: "extraction",
+            },
+            UiMessage::DiagnosticImpactValue {
+                code: "unchanged",
+                fallback: "unchanged",
+            },
+            UiMessage::DiagnosticActionValue {
+                code: "retry",
+                fallback: "retry",
+            },
+            UiMessage::DiagnosticFailureValue {
+                code: "not_found",
+                fallback: "not found",
+            },
+            UiMessage::DiagnosticIoKindValue {
+                code: "not_found",
+                fallback: "not found",
+            },
+            UiMessage::DiagnosticConfigurationRuleValue {
+                code: "value_blank",
+                fallback: "value must not be blank",
+                facts: "",
+            },
             UiMessage::ErrorNoExecutableExtractOwner,
             UiMessage::ErrorPlanSaveFailedApplied,
             UiMessage::ErrorPlanSaveOutcomeUnknown,
@@ -1854,25 +1754,32 @@ mod tests {
             UiMessage::LogRunStarted { command: "extract" },
             UiMessage::LogRunSucceeded { command: "extract" },
             UiMessage::LogRunFailed { command: "extract" },
+            UiMessage::LogRunOutcomeUnknown { command: "extract" },
             UiMessage::LogRunCancelled { command: "extract" },
+            UiMessage::LogPerformanceCounters {
+                sqlite_control_attempted_total: 7,
+                candidate_validation_started: 11,
+                candidate_validation_completed: 13,
+            },
             UiMessage::LogPlanResolved {
                 command: "extract",
                 source: "explicit",
-            },
-            UiMessage::LogTranslatePlanResolved {
-                profile_source: "explicit",
-                lua_source: "project state",
             },
             UiMessage::LogPhaseStarted { phase: "scan" },
             UiMessage::LogPhaseFinished { phase: "scan" },
             UiMessage::LogRetrySummary { count: 3 },
             UiMessage::LogNoWork { reason: "current" },
+            UiMessage::LogNoWorkTranslationUpToDate,
             UiMessage::LogPartialResult { count: 3 },
-            UiMessage::LogPublishFinished { path: "output" },
             UiMessage::LogTranslationTaskStarted { index: 1, total: 3 },
             UiMessage::LogTranslationTaskFinished {
                 index: 1,
                 outcome: "complete",
+            },
+            UiMessage::LogTranslationTaskDiagnostic {
+                index: 1,
+                attempts: 3,
+                diagnostic: "diagnostic",
             },
         ]
     }

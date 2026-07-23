@@ -1,39 +1,40 @@
-//! 普通项目日志的最佳努力运行时。
+//! 每次命令独占一个 JSONL 文件的项目日志运行时。
 //!
-//! 该模块只承担可观测性：生产者同步地尝试把已经类型化的事件放入有界队列，
-//! 独立 worker 批量写入 JSONL。启动、排队、写入、轮转或关闭失败只会进入健康
-//! 状态，永远不会作为业务错误返回。
+//! 普通事件进入单 writer 的内部有界队列；队列饱和时生产者自然背压，不丢记录。最终
+//! `performance.counters`、`failure.reported` 与 `run.finished` 保存在独立终态槽，
+//! worker 排空普通事件后按固定顺序直接写入，因而不会被普通队列压力挤掉。
+//! 已建立 writer 的 runtime 即使被意外丢弃，也会使用预登记的安全投影写出未知终态。
+//! 日志失败只进入健康状态，不改变业务结果。
 
-use std::error::Error;
-use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
 
-use async_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use async_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, render_safe_diagnostic,
+};
+use crate::i18n::{
+    UiLocale, UiLocalizer, UiMessage, project_log_task_outcome_label,
+    project_log_value_source_label,
+};
 use crate::user_text::sanitize_user_text;
 
-use super::windows::{
-    FileIdentity, PinnedPath, ReusableExclusiveFileLock, WindowsFsError,
-    create_directories_without_reparse, delete_regular_file_if_identity,
-    open_read_write_file_without_reparse, pin_path_without_reparse, rename_without_replace,
-};
+use super::performance::{RunPerformanceCounters, RunPerformanceSnapshot};
+use super::windows::{WindowsFsError, create_directories_without_reparse};
 
-const ACTIVE_FILE_NAME: &str = "att.log.jsonl";
-const LOCK_FILE_NAME: &str = ".att.log.lock";
-const ROTATED_PREFIX: &str = "att.log.";
-const ROTATED_SUFFIX: &str = ".jsonl";
+// 这些是单 writer 的内部吞吐策略，不是项目容量或用户策略。普通事件总量没有上限。
+const QUEUE_CAPACITY: usize = 8_192;
+const WRITER_BUFFER_BYTES: usize = 1024 * 1024;
 
-/// 项目日志的过滤级别。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ProjectLogLevel {
@@ -43,197 +44,16 @@ pub(crate) enum ProjectLogLevel {
     Debug,
 }
 
-impl ProjectLogLevel {
-    const fn priority(self) -> u8 {
-        match self {
-            Self::Error => 0,
-            Self::Warn => 1,
-            Self::Info => 2,
-            Self::Debug => 3,
-        }
-    }
-
-    const fn allows(self, event: Self) -> bool {
-        event.priority() <= self.priority()
-    }
-}
-
-impl FromStr for ProjectLogLevel {
-    type Err = ProjectLogLevelParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "error" => Ok(Self::Error),
-            "warn" => Ok(Self::Warn),
-            "info" => Ok(Self::Info),
-            "debug" => Ok(Self::Debug),
-            _ => Err(ProjectLogLevelParseError),
-        }
-    }
-}
-
-/// 日志级别文本不属于当前闭集。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProjectLogLevelParseError;
-
-impl fmt::Display for ProjectLogLevelParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("项目日志级别必须是 error、warn、info 或 debug")
-    }
-}
-
-impl Error for ProjectLogLevelParseError {}
-
-/// 尚未校验的项目日志配置值。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProjectLogConfigInput {
-    pub(crate) level: ProjectLogLevel,
-    pub(crate) queue_capacity: usize,
-    pub(crate) batch_max_records: usize,
-    pub(crate) batch_max_bytes: usize,
-    pub(crate) flush_interval: Duration,
-    pub(crate) shutdown_timeout: Duration,
-    pub(crate) lock_timeout: Duration,
-    pub(crate) max_record_bytes: usize,
-    pub(crate) max_file_bytes: u64,
-    pub(crate) retained_rotated_files: usize,
-}
-
-/// 已经建立全部资源边界的项目日志配置。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProjectLogConfig {
-    level: ProjectLogLevel,
-    queue_capacity: usize,
-    batch_max_records: usize,
-    batch_max_bytes: usize,
-    flush_interval: Duration,
-    shutdown_timeout: Duration,
-    lock_timeout: Duration,
-    max_record_bytes: usize,
-    max_file_bytes: u64,
-    retained_rotated_files: usize,
-    #[cfg(test)]
-    test_faults: ProjectLogTestFaults,
-}
-
-/// 只在模块测试中启用的确定性故障注入点。
-///
-/// 这些开关随单个运行时配置传递，不使用进程级全局状态，因此并行测试不会互相
-/// 污染；生产构建中该类型和全部分支都会被移除。
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ProjectLogTestFaults {
-    partial_write: bool,
-    rotation: bool,
-    retention: bool,
-    shutdown_delay: Duration,
-}
-
-impl TryFrom<ProjectLogConfigInput> for ProjectLogConfig {
-    type Error = ProjectLogConfigurationError;
-
-    fn try_from(input: ProjectLogConfigInput) -> Result<Self, Self::Error> {
-        if input.queue_capacity == 0 {
-            return Err(ProjectLogConfigurationError::ZeroQueueCapacity);
-        }
-        if input.batch_max_records == 0 {
-            return Err(ProjectLogConfigurationError::ZeroBatchMaxRecords);
-        }
-        if input.batch_max_bytes == 0 {
-            return Err(ProjectLogConfigurationError::ZeroBatchMaxBytes);
-        }
-        if input.flush_interval.is_zero() {
-            return Err(ProjectLogConfigurationError::ZeroFlushInterval);
-        }
-        if input.shutdown_timeout.is_zero() {
-            return Err(ProjectLogConfigurationError::ZeroShutdownTimeout);
-        }
-        if input.lock_timeout.is_zero() {
-            return Err(ProjectLogConfigurationError::ZeroLockTimeout);
-        }
-        if input.max_record_bytes == 0 {
-            return Err(ProjectLogConfigurationError::ZeroMaxRecordBytes);
-        }
-        if input.max_file_bytes == 0 {
-            return Err(ProjectLogConfigurationError::ZeroMaxFileBytes);
-        }
-        let record_limit = u64::try_from(input.max_record_bytes)
-            .map_err(|_| ProjectLogConfigurationError::RecordLimitDoesNotFitU64)?;
-        if record_limit > input.max_file_bytes {
-            return Err(ProjectLogConfigurationError::RecordExceedsFileLimit {
-                max_record_bytes: input.max_record_bytes,
-                max_file_bytes: input.max_file_bytes,
-            });
-        }
-        Ok(Self {
-            level: input.level,
-            queue_capacity: input.queue_capacity,
-            batch_max_records: input.batch_max_records,
-            batch_max_bytes: input.batch_max_bytes,
-            flush_interval: input.flush_interval,
-            shutdown_timeout: input.shutdown_timeout,
-            lock_timeout: input.lock_timeout,
-            max_record_bytes: input.max_record_bytes,
-            max_file_bytes: input.max_file_bytes,
-            retained_rotated_files: input.retained_rotated_files,
-            #[cfg(test)]
-            test_faults: ProjectLogTestFaults::default(),
-        })
-    }
-}
-
-/// 项目日志配置没有建立有效的有界资源策略。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ProjectLogConfigurationError {
-    ZeroQueueCapacity,
-    ZeroBatchMaxRecords,
-    ZeroBatchMaxBytes,
-    ZeroFlushInterval,
-    ZeroShutdownTimeout,
-    ZeroLockTimeout,
-    ZeroMaxRecordBytes,
-    ZeroMaxFileBytes,
-    RecordLimitDoesNotFitU64,
-    RecordExceedsFileLimit {
-        max_record_bytes: usize,
-        max_file_bytes: u64,
-    },
-}
-
-impl fmt::Display for ProjectLogConfigurationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroQueueCapacity => formatter.write_str("项目日志队列容量必须大于零"),
-            Self::ZeroBatchMaxRecords => formatter.write_str("项目日志批次记录数必须大于零"),
-            Self::ZeroBatchMaxBytes => formatter.write_str("项目日志批次字节数必须大于零"),
-            Self::ZeroFlushInterval => formatter.write_str("项目日志刷新间隔必须大于零"),
-            Self::ZeroShutdownTimeout => formatter.write_str("项目日志关闭等待上限必须大于零"),
-            Self::ZeroLockTimeout => formatter.write_str("项目日志文件锁等待上限必须大于零"),
-            Self::ZeroMaxRecordBytes => formatter.write_str("项目日志单条记录上限必须大于零"),
-            Self::ZeroMaxFileBytes => formatter.write_str("项目日志活动文件上限必须大于零"),
-            Self::RecordLimitDoesNotFitU64 => {
-                formatter.write_str("项目日志单条记录上限无法表示为文件长度")
-            }
-            Self::RecordExceedsFileLimit {
-                max_record_bytes,
-                max_file_bytes,
-            } => write!(
-                formatter,
-                "项目日志单条记录上限 {max_record_bytes} 大于活动文件上限 {max_file_bytes}"
-            ),
-        }
-    }
-}
-
-impl Error for ProjectLogConfigurationError {}
-
-/// 稳定的项目日志事件代码。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum ProjectLogCode {
     #[serde(rename = "run.started")]
     RunStarted,
     #[serde(rename = "run.finished")]
     RunFinished,
+    #[serde(rename = "performance.counters")]
+    PerformanceCounters,
+    #[serde(rename = "failure.reported")]
+    FailureReported,
     #[serde(rename = "run.cancel_requested")]
     CancellationRequested,
     #[serde(rename = "run.safe_stop_finished")]
@@ -266,9 +86,38 @@ pub(crate) enum ProjectLogCode {
     TaskStarted,
     #[serde(rename = "task.finished")]
     TaskFinished,
+    #[serde(rename = "task.diagnostic")]
+    TaskDiagnostic,
 }
 
-/// 运行方案字段的实际来源。
+impl ProjectLogCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunStarted => "run.started",
+            Self::RunFinished => "run.finished",
+            Self::PerformanceCounters => "performance.counters",
+            Self::FailureReported => "failure.reported",
+            Self::CancellationRequested => "run.cancel_requested",
+            Self::SafeStopFinished => "run.safe_stop_finished",
+            Self::RunPlanResolved => "run_plan.resolved",
+            Self::RunPlanSaved => "run_plan.saved",
+            Self::RunPlanSaveFailed => "run_plan.save_failed",
+            Self::RunPlanSaveOutcomeUnknown => "run_plan.save_outcome_unknown",
+            Self::RunPlanSavedFinalizationFailed => "run_plan.saved_finalization_failed",
+            Self::PhaseStarted => "phase.started",
+            Self::PhaseFinished => "phase.finished",
+            Self::RetrySummary => "retry.summary",
+            Self::NoWork => "work.none",
+            Self::PartialResult => "result.partial",
+            Self::PublicationStarted => "publication.started",
+            Self::PublicationFinished => "publication.finished",
+            Self::TaskStarted => "task.started",
+            Self::TaskFinished => "task.finished",
+            Self::TaskDiagnostic => "task.diagnostic",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProjectLogValueSource {
@@ -277,7 +126,6 @@ pub(crate) enum ProjectLogValueSource {
     ProductDefault,
 }
 
-/// 进度的绝对量；项目日志不会从增量事件自行推导状态。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ProjectLogAmount {
@@ -285,7 +133,6 @@ pub(crate) enum ProjectLogAmount {
     Determinate { completed: u64, total: u64 },
 }
 
-/// 一次运行的终态。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProjectLogRunOutcome {
@@ -295,7 +142,6 @@ pub(crate) enum ProjectLogRunOutcome {
     OutcomeUnknown,
 }
 
-/// 一个翻译任务的业务终态。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProjectLogTaskOutcome {
@@ -305,7 +151,6 @@ pub(crate) enum ProjectLogTaskOutcome {
     Failed,
 }
 
-/// 目录发布的业务终态。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProjectLogPublicationOutcome {
@@ -315,16 +160,98 @@ pub(crate) enum ProjectLogPublicationOutcome {
     OutcomeUnknown,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectLogPhase {
+    CheckProject,
+    ScanSource,
+    PrepareCandidate,
+    UpdateDatabase,
+    Publish,
+    Builtin,
+    BuiltinDocuments,
+    BuiltinWorkUnits,
+    BuiltinCommit,
+    Rules,
+    RulesDocuments,
+    RulesMatches,
+    RulesCommit,
+    Lua,
+    LuaExecution,
+    LuaCommit,
+    Planning,
+    ConfirmedTasks,
+    NoWork,
+    ReadAssets,
+    PlanStandard,
+    RewriteDocuments,
+    ValidateCandidate,
+}
+
+impl ProjectLogPhase {
+    const fn label(self) -> UiMessage<'static> {
+        match self {
+            Self::CheckProject => UiMessage::LogLabelPhaseCheckProject,
+            Self::ScanSource => UiMessage::LogLabelPhaseScanSource,
+            Self::PrepareCandidate => UiMessage::LogLabelPhasePrepareCandidate,
+            Self::UpdateDatabase => UiMessage::LogLabelPhaseUpdateDatabase,
+            Self::Publish => UiMessage::LogLabelPhasePublish,
+            Self::Builtin => UiMessage::LogLabelPhaseBuiltin,
+            Self::BuiltinDocuments | Self::RulesDocuments => UiMessage::ProgressExtractDocuments,
+            Self::BuiltinWorkUnits => UiMessage::ProgressExtractBuiltin,
+            Self::BuiltinCommit | Self::RulesCommit | Self::LuaCommit => {
+                UiMessage::ProgressExtractCommit
+            }
+            Self::Rules => UiMessage::LogLabelPhaseRules,
+            Self::RulesMatches => UiMessage::ProgressExtractRules,
+            Self::Lua => UiMessage::LogLabelPhaseLua,
+            Self::LuaExecution => UiMessage::ProgressExtractLua,
+            Self::Planning => UiMessage::LogLabelPhasePlanning,
+            Self::ConfirmedTasks => UiMessage::LogLabelPhaseConfirmedTasks,
+            Self::NoWork => UiMessage::LogLabelPhaseNoWork,
+            Self::ReadAssets => UiMessage::LogLabelPhaseReadAssets,
+            Self::PlanStandard => UiMessage::LogLabelPhasePlanStandard,
+            Self::RewriteDocuments => UiMessage::LogLabelPhaseRewriteDocuments,
+            Self::ValidateCandidate => UiMessage::LogLabelPhaseValidateCandidate,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectLogNoWorkReason {
+    TranslationUpToDate,
+}
+
+impl ProjectLogNoWorkReason {
+    const fn label(self) -> UiMessage<'static> {
+        match self {
+            Self::TranslationUpToDate => UiMessage::LogNoWorkTranslationUpToDate,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailureRelation {
+    Primary,
+    Related,
+}
+
 /// 项目日志允许持久化的结构化业务事实。
-///
-/// 该闭集刻意不提供任意 JSON 或模型正文载荷，避免调用方把 prompt、原文、译文、
-/// API 凭据或 Header 误塞入日志。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ProjectLogPayload {
     None,
     Run {
         outcome: Option<ProjectLogRunOutcome>,
+    },
+    Performance {
+        snapshot: RunPerformanceSnapshot,
+    },
+    Failure {
+        relation: FailureRelation,
+        diagnostic: SafeDiagnostic,
     },
     RunPlan {
         source: ProjectLogValueSource,
@@ -333,7 +260,7 @@ pub(crate) enum ProjectLogPayload {
         lua_enabled: Option<bool>,
     },
     Phase {
-        phase: String,
+        phase: ProjectLogPhase,
         amount: ProjectLogAmount,
     },
     RetrySummary {
@@ -342,7 +269,7 @@ pub(crate) enum ProjectLogPayload {
         exhausted: u64,
     },
     NoWork {
-        reason_code: String,
+        reason: ProjectLogNoWorkReason,
     },
     ResultSummary {
         complete: u64,
@@ -360,17 +287,41 @@ pub(crate) enum ProjectLogPayload {
         outcome: Option<ProjectLogTaskOutcome>,
         attempts: Option<u64>,
     },
+    TaskDiagnostic {
+        ordinal: u64,
+        total: u64,
+        attempts: u64,
+        diagnostic: SafeDiagnostic,
+    },
     Cancellation {
         confirmed: u64,
         total: Option<u64>,
     },
 }
 
-/// 一条事件共有的、非秘密运行上下文。
+impl ProjectLogPayload {
+    const fn kind_code(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Run { .. } => "run",
+            Self::Performance { .. } => "performance",
+            Self::Failure { .. } => "failure",
+            Self::RunPlan { .. } => "run_plan",
+            Self::Phase { .. } => "phase",
+            Self::RetrySummary { .. } => "retry_summary",
+            Self::NoWork { .. } => "no_work",
+            Self::ResultSummary { .. } => "result_summary",
+            Self::Publication { .. } => "publication",
+            Self::Task { .. } => "task",
+            Self::TaskDiagnostic { .. } => "task_diagnostic",
+            Self::Cancellation { .. } => "cancellation",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectLogContext {
-    run_id: Option<String>,
     engine: Option<String>,
     project: Option<String>,
     command: Option<String>,
@@ -384,11 +335,6 @@ impl ProjectLogContext {
             locale: locale.into(),
             ..Self::default()
         }
-    }
-
-    pub(crate) fn with_run_id(mut self, value: impl Into<String>) -> Self {
-        self.run_id = Some(value.into());
-        self
     }
 
     pub(crate) fn with_engine(mut self, value: impl Into<String>) -> Self {
@@ -412,13 +358,11 @@ impl ProjectLogContext {
     }
 }
 
-/// 调用方提交给项目日志的一条类型化事件。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectLogEvent {
     level: ProjectLogLevel,
     code: ProjectLogCode,
     context: ProjectLogContext,
-    message: String,
     payload: ProjectLogPayload,
 }
 
@@ -427,20 +371,17 @@ impl ProjectLogEvent {
         level: ProjectLogLevel,
         code: ProjectLogCode,
         context: ProjectLogContext,
-        message: impl Into<String>,
         payload: ProjectLogPayload,
     ) -> Self {
         Self {
             level,
             code,
             context,
-            message: message.into(),
             payload,
         }
     }
 }
 
-/// 业务层唯一依赖的不可失败项目日志入口。
 pub(crate) trait ProjectLog: Send + Sync {
     fn emit(&self, event: ProjectLogEvent);
 }
@@ -452,7 +393,7 @@ struct ProjectLogRecord {
     level: ProjectLogLevel,
     code: ProjectLogCode,
     pid: u32,
-    run_id: Option<String>,
+    run_id: String,
     sequence: u64,
     engine: Option<String>,
     project: Option<String>,
@@ -468,25 +409,22 @@ struct QueuedProjectLogEvent {
     event: ProjectLogEvent,
 }
 
-struct LoggerInner {
-    sender: Option<Sender<QueuedProjectLogEvent>>,
-    health: Arc<ProjectLogHealth>,
-    level: ProjectLogLevel,
-}
-
-/// 可克隆的同步项目日志句柄。
 #[derive(Clone)]
 pub(crate) struct ProjectLogger {
     inner: Arc<LoggerInner>,
 }
 
+struct LoggerInner {
+    sender: Option<Sender<QueuedProjectLogEvent>>,
+    health: Arc<ProjectLogHealth>,
+}
+
 impl ProjectLogger {
-    fn no_op(health: Arc<ProjectLogHealth>, level: ProjectLogLevel) -> Self {
+    fn no_op(health: Arc<ProjectLogHealth>) -> Self {
         Self {
             inner: Arc::new(LoggerInner {
                 sender: None,
                 health,
-                level,
             }),
         }
     }
@@ -495,7 +433,6 @@ impl ProjectLogger {
         self.inner.health.snapshot()
     }
 
-    /// 领取本次进程唯一一次日志降级警告资格。
     pub(crate) fn take_warning(&self) -> Option<ProjectLogWarning> {
         self.inner.health.take_warning()
     }
@@ -503,75 +440,54 @@ impl ProjectLogger {
 
 impl ProjectLog for ProjectLogger {
     fn emit(&self, event: ProjectLogEvent) {
-        if !self.inner.level.allows(event.level) {
-            return;
-        }
         let Some(sender) = &self.inner.sender else {
-            self.inner.health.add_dropped_records(1);
+            self.inner.health.record_queue_closed();
             return;
         };
-        match sender.try_send(QueuedProjectLogEvent {
+        let queued = QueuedProjectLogEvent {
             emitted_at: OffsetDateTime::now_utc(),
             event,
-        }) {
-            Ok(()) => self.inner.health.add_accepted_records(1),
-            Err(TrySendError::Full(_)) => {
-                self.inner.health.record_queue_full();
-                self.inner.health.add_dropped_records(1);
-            }
-            Err(TrySendError::Closed(_)) => {
+        };
+        match sender.send_blocking(queued) {
+            Ok(()) => self.inner.health.add_accepted(1),
+            Err(_) => {
                 self.inner.health.record_queue_closed();
-                self.inner.health.add_dropped_records(1);
+                self.inner.health.add_dropped(1);
             }
         }
     }
 }
 
-/// 项目日志运行期健康状态的稳定快照。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProjectLogHealthSnapshot {
     pub(crate) accepted_records: u64,
     pub(crate) persisted_records: u64,
     pub(crate) dropped_records: u64,
     pub(crate) startup_failures: u64,
-    pub(crate) queue_full: u64,
     pub(crate) queue_closed: u64,
     pub(crate) serialization_failures: u64,
-    pub(crate) oversized_records: u64,
-    pub(crate) lock_timeouts: u64,
-    pub(crate) lock_failures: u64,
-    pub(crate) recovered_incomplete_tails: u64,
-    pub(crate) malformed_records: u64,
     pub(crate) write_failures: u64,
-    pub(crate) rotation_failures: u64,
-    pub(crate) retention_failures: u64,
+    pub(crate) flush_failures: u64,
+    pub(crate) sync_failures: u64,
     pub(crate) worker_panics: u64,
-    pub(crate) shutdown_timeouts: u64,
 }
 
 impl ProjectLogHealthSnapshot {
     pub(crate) const fn is_degraded(self) -> bool {
         self.startup_failures > 0
-            || self.queue_full > 0
             || self.queue_closed > 0
             || self.serialization_failures > 0
-            || self.oversized_records > 0
-            || self.lock_timeouts > 0
-            || self.lock_failures > 0
-            || self.recovered_incomplete_tails > 0
-            || self.malformed_records > 0
             || self.write_failures > 0
-            || self.rotation_failures > 0
-            || self.retention_failures > 0
+            || self.flush_failures > 0
+            || self.sync_failures > 0
             || self.worker_panics > 0
-            || self.shutdown_timeouts > 0
+            || self.dropped_records > 0
     }
 }
 
-/// UI 可以本地化渲染的一次性日志降级警告事实。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectLogWarning {
-    pub(crate) health: ProjectLogHealthSnapshot,
+    pub(crate) diagnostic: Option<SafeDiagnostic>,
 }
 
 #[derive(Default)]
@@ -580,20 +496,14 @@ struct ProjectLogHealth {
     persisted_records: AtomicU64,
     dropped_records: AtomicU64,
     startup_failures: AtomicU64,
-    queue_full: AtomicU64,
     queue_closed: AtomicU64,
     serialization_failures: AtomicU64,
-    oversized_records: AtomicU64,
-    lock_timeouts: AtomicU64,
-    lock_failures: AtomicU64,
-    recovered_incomplete_tails: AtomicU64,
-    malformed_records: AtomicU64,
     write_failures: AtomicU64,
-    rotation_failures: AtomicU64,
-    retention_failures: AtomicU64,
+    flush_failures: AtomicU64,
+    sync_failures: AtomicU64,
     worker_panics: AtomicU64,
-    shutdown_timeouts: AtomicU64,
     warning_claimed: AtomicBool,
+    first_failure: Mutex<Option<SafeDiagnostic>>,
 }
 
 impl ProjectLogHealth {
@@ -603,72 +513,31 @@ impl ProjectLogHealth {
         });
     }
 
-    fn add_accepted_records(&self, amount: u64) {
+    fn add_accepted(&self, amount: u64) {
         Self::increment(&self.accepted_records, amount);
     }
 
-    fn add_persisted_records(&self, amount: u64) {
+    fn add_persisted(&self, amount: u64) {
         Self::increment(&self.persisted_records, amount);
     }
 
-    fn add_dropped_records(&self, amount: u64) {
+    fn add_dropped(&self, amount: u64) {
         Self::increment(&self.dropped_records, amount);
-    }
-
-    fn record_startup_failure(&self) {
-        Self::increment(&self.startup_failures, 1);
-    }
-
-    fn record_queue_full(&self) {
-        Self::increment(&self.queue_full, 1);
     }
 
     fn record_queue_closed(&self) {
         Self::increment(&self.queue_closed, 1);
     }
 
-    fn record_serialization_failure(&self) {
-        Self::increment(&self.serialization_failures, 1);
-    }
-
-    fn record_oversized_record(&self) {
-        Self::increment(&self.oversized_records, 1);
-    }
-
-    fn record_lock_failure(&self, timeout: bool) {
-        if timeout {
-            Self::increment(&self.lock_timeouts, 1);
-        } else {
-            Self::increment(&self.lock_failures, 1);
+    fn record_failure(&self, counter: &AtomicU64, diagnostic: SafeDiagnostic) {
+        Self::increment(counter, 1);
+        let mut first = self
+            .first_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if first.is_none() {
+            *first = Some(diagnostic);
         }
-    }
-
-    fn record_recovered_incomplete_tail(&self) {
-        Self::increment(&self.recovered_incomplete_tails, 1);
-    }
-
-    fn record_malformed_record(&self) {
-        Self::increment(&self.malformed_records, 1);
-    }
-
-    fn record_write_failure(&self) {
-        Self::increment(&self.write_failures, 1);
-    }
-
-    fn record_rotation_failure(&self) {
-        Self::increment(&self.rotation_failures, 1);
-    }
-
-    fn record_retention_failure(&self) {
-        Self::increment(&self.retention_failures, 1);
-    }
-
-    fn record_worker_panic(&self) {
-        Self::increment(&self.worker_panics, 1);
-    }
-
-    fn record_shutdown_timeout(&self) {
-        Self::increment(&self.shutdown_timeouts, 1);
     }
 
     fn snapshot(&self) -> ProjectLogHealthSnapshot {
@@ -677,63 +546,56 @@ impl ProjectLogHealth {
             persisted_records: self.persisted_records.load(Ordering::Relaxed),
             dropped_records: self.dropped_records.load(Ordering::Relaxed),
             startup_failures: self.startup_failures.load(Ordering::Relaxed),
-            queue_full: self.queue_full.load(Ordering::Relaxed),
             queue_closed: self.queue_closed.load(Ordering::Relaxed),
             serialization_failures: self.serialization_failures.load(Ordering::Relaxed),
-            oversized_records: self.oversized_records.load(Ordering::Relaxed),
-            lock_timeouts: self.lock_timeouts.load(Ordering::Relaxed),
-            lock_failures: self.lock_failures.load(Ordering::Relaxed),
-            recovered_incomplete_tails: self.recovered_incomplete_tails.load(Ordering::Relaxed),
-            malformed_records: self.malformed_records.load(Ordering::Relaxed),
             write_failures: self.write_failures.load(Ordering::Relaxed),
-            rotation_failures: self.rotation_failures.load(Ordering::Relaxed),
-            retention_failures: self.retention_failures.load(Ordering::Relaxed),
+            flush_failures: self.flush_failures.load(Ordering::Relaxed),
+            sync_failures: self.sync_failures.load(Ordering::Relaxed),
             worker_panics: self.worker_panics.load(Ordering::Relaxed),
-            shutdown_timeouts: self.shutdown_timeouts.load(Ordering::Relaxed),
         }
     }
 
     fn take_warning(&self) -> Option<ProjectLogWarning> {
         let health = self.snapshot();
-        if !health.is_degraded() {
+        if !health.is_degraded()
+            || self
+                .warning_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
             return None;
         }
-        self.warning_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| ProjectLogWarning { health })
+        Some(ProjectLogWarning {
+            diagnostic: self
+                .first_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        })
     }
 }
 
-struct StreamPaths {
-    _pinned_root: PinnedPath,
-    root: PathBuf,
-    active: PathBuf,
-    lock: PathBuf,
+#[derive(Clone)]
+struct TerminalRecords {
+    outcome: ProjectLogRunOutcome,
+    context: ProjectLogContext,
+    failures: Vec<SafeDiagnostic>,
+    performance: RunPerformanceSnapshot,
 }
 
-impl StreamPaths {
-    fn new(root: PathBuf, pinned_root: PinnedPath) -> Self {
-        Self {
-            active: root.join(ACTIVE_FILE_NAME),
-            lock: root.join(LOCK_FILE_NAME),
-            _pinned_root: pinned_root,
-            root,
-        }
-    }
-
-    fn rotated(&self, sequence: u64) -> PathBuf {
-        self.root
-            .join(format!("{ROTATED_PREFIX}{sequence:020}{ROTATED_SUFFIX}"))
-    }
+#[derive(Clone)]
+struct UnfinishedTerminalRecords {
+    context: ProjectLogContext,
+    failures: Vec<SafeDiagnostic>,
+    performance: Arc<RunPerformanceCounters>,
 }
 
-/// 唯一拥有日志 worker 关闭权的运行时。
 pub(crate) struct ProjectLogRuntime {
     logger: ProjectLogger,
-    completion: Option<mpsc::Receiver<()>>,
+    terminal: Arc<Mutex<Option<TerminalRecords>>>,
+    unfinished_terminal: Option<UnfinishedTerminalRecords>,
     worker: Option<JoinHandle<()>>,
-    shutdown_timeout: Duration,
+    path: Option<PathBuf>,
 }
 
 impl ProjectLogRuntime {
@@ -741,10 +603,71 @@ impl ProjectLogRuntime {
         self.logger.clone()
     }
 
-    /// 停止接纳新事件并在配置上限内等待已接纳批次。
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub(crate) fn unfinished_failures(&self) -> Option<Vec<SafeDiagnostic>> {
+        self.unfinished_terminal
+            .as_ref()
+            .map(|terminal| terminal.failures.clone())
+    }
+
+    /// 为尚未正常收尾的命令登记确定性的失败终态。
     ///
-    /// 超时、worker panic 或最终刷盘失败只反映在返回的健康快照中。
-    pub(crate) fn shutdown(mut self) -> ProjectLogHealthSnapshot {
+    /// 正常 `finish_with_performance` 会覆盖该兜底；若上层因 panic 或实现缺陷直接丢弃
+    /// runtime，`Drop` 使用这里保存的安全投影写出失败和 `run.finished`。panic payload
+    /// 不进入此接口，也不会被日志运行时读取。
+    pub(crate) fn arm_unfinished_terminal(
+        &mut self,
+        context: ProjectLogContext,
+        mut failures: Vec<SafeDiagnostic>,
+        performance: Arc<RunPerformanceCounters>,
+    ) {
+        if failures.is_empty() {
+            failures.push(unfinished_log_diagnostic(self.path.as_deref()));
+        }
+        self.unfinished_terminal = Some(UnfinishedTerminalRecords {
+            context,
+            failures,
+            performance,
+        });
+    }
+
+    /// 使用空性能快照的测试便利入口。
+    #[cfg(test)]
+    pub(crate) fn finish(
+        self,
+        outcome: ProjectLogRunOutcome,
+        context: ProjectLogContext,
+        failures: Vec<SafeDiagnostic>,
+    ) -> ProjectLogHealthSnapshot {
+        self.finish_with_performance(
+            outcome,
+            context,
+            failures,
+            RunPerformanceSnapshot::default(),
+        )
+    }
+
+    /// 原子设置性能计数、最终诊断与运行终态，然后排空普通事件并完成 flush/sync。
+    pub(crate) fn finish_with_performance(
+        mut self,
+        outcome: ProjectLogRunOutcome,
+        context: ProjectLogContext,
+        failures: Vec<SafeDiagnostic>,
+        performance: RunPerformanceSnapshot,
+    ) -> ProjectLogHealthSnapshot {
+        self.unfinished_terminal = None;
+        *self
+            .terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TerminalRecords {
+            outcome,
+            context,
+            failures,
+            performance,
+        });
         self.shutdown_inner();
         self.logger.health()
     }
@@ -753,238 +676,564 @@ impl ProjectLogRuntime {
         if let Some(sender) = &self.logger.inner.sender {
             sender.close();
         }
-        let Some(completion) = self.completion.take() else {
-            return;
-        };
-        match completion.recv_timeout(self.shutdown_timeout) {
-            Ok(()) => {
-                if let Some(worker) = self.worker.take()
-                    && worker.join().is_err()
-                {
-                    self.logger.inner.health.record_worker_panic();
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.logger.inner.health.record_shutdown_timeout();
-                self.worker.take();
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.logger.inner.health.record_worker_panic();
-                if let Some(worker) = self.worker.take() {
-                    let _ = worker.join();
-                }
-            }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            let diagnostic = internal_log_diagnostic(
+                DiagnosticCode::LogWorker,
+                self.path.as_deref(),
+                "join_writer",
+            );
+            self.logger
+                .inner
+                .health
+                .record_failure(&self.logger.inner.health.worker_panics, diagnostic);
         }
     }
 }
 
 impl Drop for ProjectLogRuntime {
     fn drop(&mut self) {
+        self.ensure_terminal_on_drop();
         self.shutdown_inner();
     }
 }
 
-/// 启动普通项目日志；任何启动失败都会返回已经降级的 no-op 运行时。
-pub(crate) fn start_project_log(root: PathBuf, config: ProjectLogConfig) -> ProjectLogRuntime {
+impl ProjectLogRuntime {
+    fn ensure_terminal_on_drop(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+        let mut terminal = self
+            .terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if terminal.is_some() {
+            return;
+        }
+        let fallback = self.unfinished_terminal.take().unwrap_or_else(|| {
+            let diagnostic = unfinished_log_diagnostic(self.path.as_deref());
+            UnfinishedTerminalRecords {
+                context: ProjectLogContext::new("en"),
+                failures: vec![diagnostic],
+                performance: Arc::new(RunPerformanceCounters::default()),
+            }
+        });
+        *terminal = Some(TerminalRecords {
+            outcome: ProjectLogRunOutcome::OutcomeUnknown,
+            context: fallback.context,
+            failures: fallback.failures,
+            performance: fallback.performance.snapshot(),
+        });
+    }
+}
+
+/// 启动当前 RunId 的独占日志文件；失败时返回带精确安全诊断的 no-op runtime。
+pub(crate) fn start_project_log(logs_root: PathBuf, run_id: String) -> ProjectLogRuntime {
     let health = Arc::new(ProjectLogHealth::default());
-    let pinned_root = match create_directories_without_reparse(&root) {
+    let terminal = Arc::new(Mutex::new(None));
+    let pinned_root = match create_directories_without_reparse(&logs_root) {
         Ok(root) => root,
-        Err(_) => {
-            health.record_startup_failure();
-            return no_op_runtime(health, config);
+        Err(error) => {
+            let diagnostic = windows_log_diagnostic(DiagnosticCode::LogStart, &error);
+            health.record_failure(&health.startup_failures, diagnostic);
+            return no_op_runtime(health, terminal);
         }
     };
-    if !matches!(pinned_root.metadata(), Ok(metadata) if metadata.is_dir()) {
-        health.record_startup_failure();
-        return no_op_runtime(health, config);
-    }
-    let root = pinned_root.resolved_path().to_path_buf();
-    let paths = StreamPaths::new(root, pinned_root);
-    let (sender, receiver) = async_channel::bounded(config.queue_capacity);
+    let resolved_root = pinned_root.resolved_path().to_path_buf();
+    let path = resolved_root.join(format!("{run_id}.jsonl"));
+    let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(source) => {
+            let diagnostic = SafeDiagnostic::io(
+                DiagnosticCode::LogStart,
+                DiagnosticStage::Logging,
+                DiagnosticSubject::path(&path),
+                "create_new",
+                &source,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            );
+            health.record_failure(&health.startup_failures, diagnostic);
+            return no_op_runtime(health, terminal);
+        }
+    };
+    let (sender, receiver) = async_channel::bounded(QUEUE_CAPACITY);
     let logger = ProjectLogger {
         inner: Arc::new(LoggerInner {
             sender: Some(sender),
             health: Arc::clone(&health),
-            level: config.level,
         }),
     };
-    let (completion_sender, completion) = mpsc::sync_channel(1);
-    let worker_runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(_) => {
-            health.record_startup_failure();
-            return no_op_runtime(health, config);
-        }
-    };
     let worker_health = Arc::clone(&health);
+    let worker_terminal = Arc::clone(&terminal);
+    let worker_run_id = run_id.clone();
+    let worker_path = path.clone();
+    let panic_path = path.clone();
     let worker = match thread::Builder::new()
-        .name("att-project-log".to_owned())
+        .name(format!("att-project-log-{run_id}"))
         .spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
-                worker_runtime.block_on(run_worker(
+                run_worker(
                     receiver,
-                    paths,
-                    config,
-                    Arc::clone(&worker_health),
-                ));
+                    file,
+                    worker_path,
+                    worker_run_id,
+                    worker_terminal,
+                    &worker_health,
+                );
+                drop(pinned_root);
             }));
             if result.is_err() {
-                worker_health.record_worker_panic();
+                let diagnostic = internal_log_diagnostic(
+                    DiagnosticCode::LogWorker,
+                    Some(&panic_path),
+                    "run_writer",
+                );
+                worker_health.record_failure(&worker_health.worker_panics, diagnostic);
             }
-            let _ = completion_sender.send(());
         }) {
         Ok(worker) => worker,
-        Err(_) => {
-            health.record_startup_failure();
-            return no_op_runtime(health, config);
+        Err(source) => {
+            let diagnostic = SafeDiagnostic::io(
+                DiagnosticCode::LogStart,
+                DiagnosticStage::Logging,
+                DiagnosticSubject::path(&path),
+                "spawn_writer",
+                &source,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            );
+            health.record_failure(&health.startup_failures, diagnostic);
+            return no_op_runtime(health, terminal);
         }
     };
     ProjectLogRuntime {
         logger,
-        completion: Some(completion),
+        terminal,
+        unfinished_terminal: None,
         worker: Some(worker),
-        shutdown_timeout: config.shutdown_timeout,
+        path: Some(path),
     }
 }
 
-fn no_op_runtime(health: Arc<ProjectLogHealth>, config: ProjectLogConfig) -> ProjectLogRuntime {
-    ProjectLogRuntime {
-        logger: ProjectLogger::no_op(health, config.level),
-        completion: None,
-        worker: None,
-        shutdown_timeout: config.shutdown_timeout,
-    }
-}
-
-async fn run_worker(
-    receiver: Receiver<QueuedProjectLogEvent>,
-    paths: StreamPaths,
-    config: ProjectLogConfig,
+fn no_op_runtime(
     health: Arc<ProjectLogHealth>,
+    terminal: Arc<Mutex<Option<TerminalRecords>>>,
+) -> ProjectLogRuntime {
+    ProjectLogRuntime {
+        logger: ProjectLogger::no_op(health),
+        terminal,
+        unfinished_terminal: None,
+        worker: None,
+        path: None,
+    }
+}
+
+fn run_worker(
+    receiver: Receiver<QueuedProjectLogEvent>,
+    file: File,
+    path: PathBuf,
+    run_id: String,
+    terminal: Arc<Mutex<Option<TerminalRecords>>>,
+    health: &ProjectLogHealth,
 ) {
-    let mut state = WorkerState::default();
-    let mut pending = None;
+    let mut writer = BufWriter::with_capacity(WRITER_BUFFER_BYTES, file);
     let mut sequence = 0_u64;
-    loop {
-        let first = match pending.take() {
-            Some(record) => record,
-            None => match receive_serialized(&receiver, config, &health, &mut sequence).await {
-                Some(record) => record,
-                None => break,
-            },
+    while let Ok(queued) = receiver.recv_blocking() {
+        write_event(
+            &mut writer,
+            &path,
+            &run_id,
+            queued.emitted_at,
+            queued.event,
+            &mut sequence,
+            health,
+        );
+    }
+
+    if let Some(terminal) = terminal
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        write_event(
+            &mut writer,
+            &path,
+            &run_id,
+            OffsetDateTime::now_utc(),
+            ProjectLogEvent::new(
+                ProjectLogLevel::Info,
+                ProjectLogCode::PerformanceCounters,
+                terminal.context.clone(),
+                ProjectLogPayload::Performance {
+                    snapshot: terminal.performance,
+                },
+            ),
+            &mut sequence,
+            health,
+        );
+        for (index, diagnostic) in terminal.failures.into_iter().enumerate() {
+            let event = ProjectLogEvent::new(
+                ProjectLogLevel::Error,
+                ProjectLogCode::FailureReported,
+                terminal.context.clone(),
+                ProjectLogPayload::Failure {
+                    relation: if index == 0 {
+                        FailureRelation::Primary
+                    } else {
+                        FailureRelation::Related
+                    },
+                    diagnostic,
+                },
+            );
+            write_event(
+                &mut writer,
+                &path,
+                &run_id,
+                OffsetDateTime::now_utc(),
+                event,
+                &mut sequence,
+                health,
+            );
+        }
+        let level = match terminal.outcome {
+            ProjectLogRunOutcome::Succeeded | ProjectLogRunOutcome::Cancelled => {
+                ProjectLogLevel::Info
+            }
+            ProjectLogRunOutcome::Failed | ProjectLogRunOutcome::OutcomeUnknown => {
+                ProjectLogLevel::Error
+            }
         };
-        let mut bytes = first.len();
-        let mut batch = vec![first];
-        let deadline = tokio::time::Instant::now() + config.flush_interval;
-        while batch.len() < config.batch_max_records {
-            let next_event = match receiver.try_recv() {
-                Ok(event) => Some(event),
-                Err(TryRecvError::Closed) => None,
-                Err(TryRecvError::Empty) => {
-                    match tokio::time::timeout_at(deadline, receiver.recv()).await {
-                        Ok(Ok(event)) => Some(event),
-                        Ok(Err(_)) | Err(_) => None,
-                    }
-                }
-            };
-            let Some(next_event) = next_event else {
-                break;
-            };
-            let Some(record) = serialize_event(next_event, config, &health, &mut sequence) else {
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                continue;
-            };
-            if !batch.is_empty() && bytes.saturating_add(record.len()) > config.batch_max_bytes {
-                pending = Some(record);
-                break;
-            }
-            bytes = bytes.saturating_add(record.len());
-            batch.push(record);
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-        }
-        persist_batch(&batch, &paths, config, &mut state, &health);
+        write_event(
+            &mut writer,
+            &path,
+            &run_id,
+            OffsetDateTime::now_utc(),
+            ProjectLogEvent::new(
+                level,
+                ProjectLogCode::RunFinished,
+                terminal.context,
+                ProjectLogPayload::Run {
+                    outcome: Some(terminal.outcome),
+                },
+            ),
+            &mut sequence,
+            health,
+        );
     }
-    sync_active_on_shutdown(&paths, config, &mut state, &health);
-}
 
-async fn receive_serialized(
-    receiver: &Receiver<QueuedProjectLogEvent>,
-    config: ProjectLogConfig,
-    health: &ProjectLogHealth,
-    sequence: &mut u64,
-) -> Option<Vec<u8>> {
-    loop {
-        let event = receiver.recv().await.ok()?;
-        if let Some(bytes) = serialize_event(event, config, health, sequence) {
-            return Some(bytes);
-        }
+    if let Err(source) = writer.flush() {
+        let diagnostic = SafeDiagnostic::io(
+            DiagnosticCode::LogFlush,
+            DiagnosticStage::Logging,
+            DiagnosticSubject::path(&path),
+            "flush",
+            &source,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        );
+        health.record_failure(&health.flush_failures, diagnostic);
+        return;
+    }
+    if let Err(source) = writer.get_ref().sync_all() {
+        let diagnostic = SafeDiagnostic::io(
+            DiagnosticCode::LogSync,
+            DiagnosticStage::Logging,
+            DiagnosticSubject::path(&path),
+            "sync_all",
+            &source,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        );
+        health.record_failure(&health.sync_failures, diagnostic);
     }
 }
 
-fn serialize_event(
-    queued: QueuedProjectLogEvent,
-    config: ProjectLogConfig,
-    health: &ProjectLogHealth,
+fn write_event(
+    writer: &mut BufWriter<File>,
+    path: &Path,
+    run_id: &str,
+    emitted_at: OffsetDateTime,
+    event: ProjectLogEvent,
     sequence: &mut u64,
-) -> Option<Vec<u8>> {
+    health: &ProjectLogHealth,
+) {
     let Some(record_sequence) = sequence.checked_add(1) else {
-        health.record_serialization_failure();
-        health.add_dropped_records(1);
-        return None;
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::LogSerialize,
+            DiagnosticStage::Logging,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::ReportBug,
+        );
+        health.record_failure(&health.serialization_failures, diagnostic);
+        health.add_dropped(1);
+        return;
     };
     let ProjectLogEvent {
         level,
         code,
         context,
-        message,
         payload,
-    } = queued.event;
+    } = event;
+    let payload = sanitize_payload(payload);
+    let message = render_message(code, &payload, &context);
     let record = ProjectLogRecord {
-        time: recorded_at_utc(queued.emitted_at),
+        time: recorded_at_utc(emitted_at),
         level,
         code,
         pid: std::process::id(),
-        run_id: sanitize_optional_text(context.run_id),
+        run_id: run_id.to_owned(),
         sequence: record_sequence,
-        engine: sanitize_optional_text(context.engine),
-        project: sanitize_optional_text(context.project),
-        command: sanitize_optional_text(context.command),
-        profile: sanitize_optional_text(context.profile),
+        engine: sanitize_optional(context.engine),
+        project: sanitize_optional(context.project),
+        command: sanitize_optional(context.command),
+        profile: sanitize_optional(context.profile),
         locale: sanitize_user_text(&context.locale),
-        message: sanitize_user_text(&message),
-        payload: sanitize_payload_text(payload),
+        message,
+        payload,
     };
     let mut bytes = match serde_json::to_vec(&record) {
         Ok(bytes) => bytes,
         Err(_) => {
-            health.record_serialization_failure();
-            health.add_dropped_records(1);
-            return None;
+            let diagnostic = SafeDiagnostic::new(
+                DiagnosticCode::LogSerialize,
+                DiagnosticStage::Logging,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::ReportBug,
+            );
+            health.record_failure(&health.serialization_failures, diagnostic);
+            health.add_dropped(1);
+            return;
         }
     };
     bytes.push(b'\n');
-    if bytes.len() > config.max_record_bytes {
-        health.record_oversized_record();
-        health.add_dropped_records(1);
-        return None;
+    if let Err(source) = writer.write_all(&bytes) {
+        let diagnostic = SafeDiagnostic::io(
+            DiagnosticCode::LogWrite,
+            DiagnosticStage::Logging,
+            DiagnosticSubject::path(path),
+            "write_all",
+            &source,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        );
+        health.record_failure(&health.write_failures, diagnostic);
+        health.add_dropped(1);
+        return;
     }
     *sequence = record_sequence;
-    Some(bytes)
+    health.add_persisted(1);
 }
 
-fn sanitize_optional_text(value: Option<String>) -> Option<String> {
+fn render_message(
+    code: ProjectLogCode,
+    payload: &ProjectLogPayload,
+    context: &ProjectLogContext,
+) -> String {
+    let locale = UiLocale::match_automatic(&context.locale).unwrap_or(UiLocale::English);
+    let localizer = UiLocalizer::new(locale);
+    match (code, payload) {
+        (ProjectLogCode::RunStarted, ProjectLogPayload::Run { .. }) => {
+            localizer.format(UiMessage::LogRunStarted {
+                command: context.command.as_deref().unwrap_or("unknown"),
+            })
+        }
+        (ProjectLogCode::RunFinished, ProjectLogPayload::Run { outcome }) => match outcome {
+            Some(ProjectLogRunOutcome::Succeeded) => localizer.format(UiMessage::LogRunSucceeded {
+                command: context.command.as_deref().unwrap_or("unknown"),
+            }),
+            Some(ProjectLogRunOutcome::Cancelled) => localizer.format(UiMessage::LogRunCancelled {
+                command: context.command.as_deref().unwrap_or("unknown"),
+            }),
+            Some(ProjectLogRunOutcome::OutcomeUnknown) => {
+                localizer.format(UiMessage::LogRunOutcomeUnknown {
+                    command: context.command.as_deref().unwrap_or("unknown"),
+                })
+            }
+            _ => localizer.format(UiMessage::LogRunFailed {
+                command: context.command.as_deref().unwrap_or("unknown"),
+            }),
+        },
+        (ProjectLogCode::PerformanceCounters, ProjectLogPayload::Performance { snapshot }) => {
+            localizer.format(UiMessage::LogPerformanceCounters {
+                sqlite_control_attempted_total: snapshot.sqlite_transactions.attempted_total(),
+                candidate_validation_started: snapshot.candidate_validations.started,
+                candidate_validation_completed: snapshot.candidate_validations.completed,
+            })
+        }
+        (ProjectLogCode::FailureReported, ProjectLogPayload::Failure { diagnostic, .. }) => {
+            render_failure_message(diagnostic, &localizer)
+        }
+        (
+            ProjectLogCode::PhaseStarted | ProjectLogCode::PhaseFinished,
+            ProjectLogPayload::Phase { phase, .. },
+        ) => {
+            let label = localizer.format(phase.label());
+            localizer.format(if code == ProjectLogCode::PhaseStarted {
+                UiMessage::LogPhaseStarted { phase: &label }
+            } else {
+                UiMessage::LogPhaseFinished { phase: &label }
+            })
+        }
+        (ProjectLogCode::RunPlanResolved, ProjectLogPayload::RunPlan { source, .. }) => {
+            let source = value_source_message(*source, &localizer);
+            localizer.format(UiMessage::LogPlanResolved {
+                command: context.command.as_deref().unwrap_or("unknown"),
+                source: &source,
+            })
+        }
+        (ProjectLogCode::TaskStarted, ProjectLogPayload::Task { ordinal, total, .. }) => localizer
+            .format(UiMessage::LogTranslationTaskStarted {
+                index: *ordinal,
+                total: *total,
+            }),
+        (
+            ProjectLogCode::TaskFinished,
+            ProjectLogPayload::Task {
+                ordinal, outcome, ..
+            },
+        ) => {
+            let outcome = outcome
+                .and_then(|outcome| project_log_task_outcome_label(task_outcome_code(outcome)))
+                .map(|message| localizer.format(message))
+                .unwrap_or_else(|| "unknown".to_owned());
+            localizer.format(UiMessage::LogTranslationTaskFinished {
+                index: *ordinal,
+                outcome: &outcome,
+            })
+        }
+        (
+            ProjectLogCode::TaskDiagnostic,
+            ProjectLogPayload::TaskDiagnostic {
+                ordinal,
+                attempts,
+                diagnostic,
+                ..
+            },
+        ) => {
+            let diagnostic = render_failure_message(diagnostic, &localizer);
+            localizer.format(UiMessage::LogTranslationTaskDiagnostic {
+                index: *ordinal,
+                attempts: *attempts,
+                diagnostic: &diagnostic,
+            })
+        }
+        (ProjectLogCode::RetrySummary, ProjectLogPayload::RetrySummary { attempted, .. }) => {
+            localizer.format(UiMessage::LogRetrySummary { count: *attempted })
+        }
+        (ProjectLogCode::NoWork, ProjectLogPayload::NoWork { reason }) => {
+            let reason = localizer.format(reason.label());
+            localizer.format(UiMessage::LogNoWork { reason: &reason })
+        }
+        (ProjectLogCode::PartialResult, ProjectLogPayload::ResultSummary { partial, .. }) => {
+            localizer.format(UiMessage::LogPartialResult { count: *partial })
+        }
+        (ProjectLogCode::RunPlanSaved, ProjectLogPayload::None) => {
+            localizer.format(UiMessage::ResultPlanSaved)
+        }
+        (ProjectLogCode::RunPlanSaveFailed, ProjectLogPayload::None) => {
+            localizer.format(UiMessage::ErrorPlanSaveFailedApplied)
+        }
+        (ProjectLogCode::RunPlanSaveOutcomeUnknown, ProjectLogPayload::None) => {
+            localizer.format(UiMessage::ErrorPlanSaveOutcomeUnknown)
+        }
+        (ProjectLogCode::RunPlanSavedFinalizationFailed, ProjectLogPayload::None) => {
+            localizer.format(UiMessage::ErrorStateAppliedFinalization)
+        }
+        (ProjectLogCode::CancellationRequested, ProjectLogPayload::Cancellation { .. }) => {
+            localizer.format(UiMessage::ProgressSafeStopping)
+        }
+        (ProjectLogCode::SafeStopFinished, ProjectLogPayload::Cancellation { .. }) => {
+            localizer.format(UiMessage::ResultCancelled)
+        }
+        (ProjectLogCode::PublicationStarted, ProjectLogPayload::Publication { .. }) => {
+            let phase = localizer.format(UiMessage::LogLabelPhasePublish);
+            localizer.format(UiMessage::LogPhaseStarted { phase: &phase })
+        }
+        (ProjectLogCode::PublicationFinished, ProjectLogPayload::Publication { outcome, .. }) => {
+            let phase = localizer.format(UiMessage::LogLabelPhasePublish);
+            let finished = localizer.format(UiMessage::LogPhaseFinished { phase: &phase });
+            format!("{finished} outcome={}", publication_outcome_code(*outcome))
+        }
+        _ => format!(
+            "log event {} cannot use payload {}; this is an ATT logging defect",
+            code.as_str(),
+            payload.kind_code()
+        ),
+    }
+}
+
+fn render_failure_message(diagnostic: &SafeDiagnostic, localizer: &UiLocalizer) -> String {
+    let mut rendered = Vec::new();
+    if render_safe_diagnostic(diagnostic, localizer, &mut rendered).is_err() {
+        return format!("error [{}]", diagnostic.code);
+    }
+    String::from_utf8_lossy(&rendered)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+const fn publication_outcome_code(outcome: ProjectLogPublicationOutcome) -> &'static str {
+    match outcome {
+        ProjectLogPublicationOutcome::Published => "published",
+        ProjectLogPublicationOutcome::NotPublished => "not_published",
+        ProjectLogPublicationOutcome::RecoveryRequired => "recovery_required",
+        ProjectLogPublicationOutcome::OutcomeUnknown => "outcome_unknown",
+    }
+}
+
+fn value_source_message(source: ProjectLogValueSource, localizer: &UiLocalizer) -> String {
+    let code = match source {
+        ProjectLogValueSource::Explicit => "explicit",
+        ProjectLogValueSource::ProjectState => "project_state",
+        ProjectLogValueSource::ProductDefault => "product_default",
+    };
+    project_log_value_source_label(code)
+        .map(|message| localizer.format(message))
+        .unwrap_or_else(|| code.to_owned())
+}
+
+const fn task_outcome_code(outcome: ProjectLogTaskOutcome) -> &'static str {
+    match outcome {
+        ProjectLogTaskOutcome::Complete => "complete",
+        ProjectLogTaskOutcome::Partial => "partial",
+        ProjectLogTaskOutcome::Unavailable => "unavailable",
+        ProjectLogTaskOutcome::Failed => "failed",
+    }
+}
+
+fn sanitize_optional(value: Option<String>) -> Option<String> {
     value.map(|value| sanitize_user_text(&value))
 }
 
-fn sanitize_payload_text(payload: ProjectLogPayload) -> ProjectLogPayload {
+fn sanitize_payload(payload: ProjectLogPayload) -> ProjectLogPayload {
     match payload {
+        ProjectLogPayload::Failure {
+            relation,
+            diagnostic,
+        } => ProjectLogPayload::Failure {
+            relation,
+            diagnostic: diagnostic.sanitized(),
+        },
+        ProjectLogPayload::TaskDiagnostic {
+            ordinal,
+            total,
+            attempts,
+            diagnostic,
+        } => ProjectLogPayload::TaskDiagnostic {
+            ordinal,
+            total,
+            attempts,
+            diagnostic: diagnostic.sanitized(),
+        },
         ProjectLogPayload::RunPlan {
             source,
             lua_source,
@@ -999,414 +1248,53 @@ fn sanitize_payload_text(payload: ProjectLogPayload) -> ProjectLogPayload {
                 .collect(),
             lua_enabled,
         },
-        ProjectLogPayload::Phase { phase, amount } => ProjectLogPayload::Phase {
-            phase: sanitize_user_text(&phase),
-            amount,
-        },
-        ProjectLogPayload::NoWork { reason_code } => ProjectLogPayload::NoWork {
-            reason_code: sanitize_user_text(&reason_code),
-        },
         payload => payload,
     }
 }
 
-#[derive(Default)]
-struct WorkerState {
-    validation: ActiveValidationCursor,
-    validation_line: Vec<u8>,
-    lock_file: Option<ReusableExclusiveFileLock>,
-    discard_lock_file: bool,
+fn windows_log_diagnostic(code: DiagnosticCode, error: &WindowsFsError) -> SafeDiagnostic {
+    error.safe_diagnostic(
+        code,
+        DiagnosticStage::Logging,
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::CheckPathAndPermissions,
+    )
 }
 
-#[derive(Default)]
-struct ActiveValidationCursor {
-    identity: Option<FileIdentity>,
-    validated_length: u64,
-    modified: Option<SystemTime>,
+fn internal_log_diagnostic(
+    code: DiagnosticCode,
+    path: Option<&Path>,
+    operation: &'static str,
+) -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        code,
+        DiagnosticStage::Logging,
+        path.map_or_else(
+            || DiagnosticSubject::operation(operation),
+            DiagnosticSubject::path,
+        ),
+        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::ReportBug,
+    )
 }
 
-impl ActiveValidationCursor {
-    fn reset(&mut self) {
-        self.identity = None;
-        self.validated_length = 0;
-        self.modified = None;
+fn unfinished_log_diagnostic(path: Option<&Path>) -> SafeDiagnostic {
+    let mut diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::InternalOperation,
+        DiagnosticStage::Logging,
+        path.map_or_else(
+            || DiagnosticSubject::operation("finish_project_log"),
+            DiagnosticSubject::path,
+        ),
+        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+        DiagnosticImpact::OutcomeUnknown,
+        DiagnosticAction::ReportBug,
+    );
+    if let Some(path) = path {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::path(path));
     }
-}
-
-fn persist_batch(
-    batch: &[Vec<u8>],
-    paths: &StreamPaths,
-    config: ProjectLogConfig,
-    state: &mut WorkerState,
-    health: &ProjectLogHealth,
-) {
-    let total = u64::try_from(batch.len()).unwrap_or(u64::MAX);
-    let WorkerState {
-        validation,
-        validation_line,
-        lock_file,
-        discard_lock_file,
-    } = state;
-    if *discard_lock_file {
-        *lock_file = None;
-        *discard_lock_file = false;
-    }
-    if lock_file.is_none() {
-        match ReusableExclusiveFileLock::open(&paths.lock) {
-            Ok(lock) => *lock_file = Some(lock),
-            Err(error) => {
-                health.record_lock_failure(matches!(error, WindowsFsError::LockTimeout { .. }));
-                health.add_dropped_records(total);
-                return;
-            }
-        }
-    }
-    let lock = lock_file
-        .as_mut()
-        .expect("项目日志 worker 必须持有已经成功打开的锁文件");
-    let _guard = match lock.lock(&paths.lock, config.lock_timeout) {
-        Ok(guard) => guard,
-        Err(error) => {
-            health.record_lock_failure(matches!(error, WindowsFsError::LockTimeout { .. }));
-            health.add_dropped_records(total);
-            *discard_lock_file = true;
-            return;
-        }
-    };
-    let recovered =
-        match recover_and_validate_active(paths, config, validation, validation_line, health) {
-            Ok(recovered) => recovered,
-            Err(ActiveRecoveryError::Malformed) => {
-                health.record_malformed_record();
-                health.add_dropped_records(total);
-                validation.reset();
-                return;
-            }
-            Err(ActiveRecoveryError::Io) => {
-                health.record_write_failure();
-                health.add_dropped_records(total);
-                validation.reset();
-                return;
-            }
-        };
-    let mut active = recovered.file;
-    let mut current_size = recovered.length;
-    let mut persisted = 0_u64;
-    let mut rotated = false;
-    for record in batch {
-        let record_length = u64::try_from(record.len()).expect("受检日志记录长度必须可表示为 u64");
-        if current_size > 0 && current_size.saturating_add(record_length) > config.max_file_bytes {
-            if active.file_mut().flush().is_err() || active.file().sync_data().is_err() {
-                health.record_write_failure();
-                break;
-            }
-            drop(active);
-            if rotate_active_best_effort(paths, config).is_err() {
-                health.record_rotation_failure();
-                validation.reset();
-                health.add_persisted_records(persisted);
-                health.add_dropped_records(total.saturating_sub(persisted));
-                return;
-            }
-            rotated = true;
-            validation.reset();
-            active = match open_read_write_file_without_reparse(&paths.active, true) {
-                Ok(active) => active,
-                Err(_) => {
-                    health.record_write_failure();
-                    health.add_persisted_records(persisted);
-                    health.add_dropped_records(total.saturating_sub(persisted));
-                    return;
-                }
-            };
-            current_size = 0;
-        }
-        if active.file_mut().seek(SeekFrom::End(0)).is_err()
-            || write_record_best_effort(&mut active, record, config).is_err()
-        {
-            health.record_write_failure();
-            validation.reset();
-            break;
-        }
-        current_size = current_size.saturating_add(record_length);
-        persisted = persisted.saturating_add(1);
-    }
-    if active.file_mut().flush().is_err() {
-        health.record_write_failure();
-        validation.reset();
-    } else {
-        validation.identity = FileIdentity::of(active.file(), &paths.active).ok();
-        validation.modified = active
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
-        validation.validated_length = if validation.identity.is_some() {
-            current_size
-        } else {
-            0
-        };
-    }
-    health.add_persisted_records(persisted);
-    health.add_dropped_records(total.saturating_sub(persisted));
-    if rotated
-        && maintain_retention_best_effort(paths, config.retained_rotated_files, config).is_err()
-    {
-        health.record_retention_failure();
-    }
-}
-
-fn write_record_best_effort(
-    active: &mut PinnedPath,
-    record: &[u8],
-    _config: ProjectLogConfig,
-) -> io::Result<()> {
-    #[cfg(test)]
-    if _config.test_faults.partial_write {
-        let partial_length = (record.len() / 2).max(1);
-        active.file_mut().write_all(&record[..partial_length])?;
-        return Err(io::Error::other("测试注入的日志部分写故障"));
-    }
-    active.file_mut().write_all(record)
-}
-
-fn rotate_active_best_effort(paths: &StreamPaths, _config: ProjectLogConfig) -> Result<(), ()> {
-    #[cfg(test)]
-    if _config.test_faults.rotation {
-        return Err(());
-    }
-    rotate_active(paths)
-}
-
-fn maintain_retention_best_effort(
-    paths: &StreamPaths,
-    retained: usize,
-    _config: ProjectLogConfig,
-) -> Result<(), ()> {
-    #[cfg(test)]
-    if _config.test_faults.retention {
-        return Err(());
-    }
-    maintain_retention(paths, retained)
-}
-
-fn sync_active_on_shutdown(
-    paths: &StreamPaths,
-    config: ProjectLogConfig,
-    state: &mut WorkerState,
-    health: &ProjectLogHealth,
-) {
-    #[cfg(test)]
-    if !config.test_faults.shutdown_delay.is_zero() {
-        thread::sleep(config.test_faults.shutdown_delay);
-    }
-    if state.discard_lock_file {
-        state.lock_file = None;
-    }
-    if state.lock_file.is_none() {
-        state.lock_file = ReusableExclusiveFileLock::open(&paths.lock).ok();
-    }
-    let Some(lock) = state.lock_file.as_mut() else {
-        health.record_lock_failure(false);
-        return;
-    };
-    let _guard = match lock.lock(&paths.lock, config.lock_timeout) {
-        Ok(guard) => guard,
-        Err(error) => {
-            health.record_lock_failure(matches!(error, WindowsFsError::LockTimeout { .. }));
-            return;
-        }
-    };
-    match open_read_write_file_without_reparse(&paths.active, false) {
-        Ok(active) => {
-            if active.file().sync_data().is_err() {
-                health.record_write_failure();
-            }
-        }
-        Err(_) if health.snapshot().accepted_records == 0 => {}
-        Err(_) => health.record_write_failure(),
-    }
-}
-
-struct RecoveredActive {
-    file: PinnedPath,
-    length: u64,
-}
-
-enum ActiveRecoveryError {
-    Malformed,
-    Io,
-}
-
-fn recover_and_validate_active(
-    paths: &StreamPaths,
-    config: ProjectLogConfig,
-    validation: &mut ActiveValidationCursor,
-    line: &mut Vec<u8>,
-    health: &ProjectLogHealth,
-) -> Result<RecoveredActive, ActiveRecoveryError> {
-    let mut file = open_read_write_file_without_reparse(&paths.active, true)
-        .map_err(|_| ActiveRecoveryError::Io)?;
-    let identity = FileIdentity::of(file.file(), &paths.active).ok();
-    let metadata = file.metadata().map_err(|_| ActiveRecoveryError::Io)?;
-    let file_length = metadata.len();
-    let modified = metadata.modified().ok();
-    let start = if identity.is_some()
-        && identity == validation.identity
-        && validation.validated_length == file_length
-        && modified.is_some()
-        && modified == validation.modified
-    {
-        validation.validated_length
-    } else {
-        0
-    };
-    file.file_mut()
-        .seek(SeekFrom::Start(start))
-        .map_err(|_| ActiveRecoveryError::Io)?;
-    let mut valid_length = start;
-    let mut incomplete_tail = false;
-    {
-        let mut reader = BufReader::new(file.file_mut());
-        loop {
-            line.clear();
-            let max_read = u64::try_from(config.max_record_bytes)
-                .expect("项目日志配置已确认记录上限可表示为 u64")
-                .saturating_add(1);
-            let read = reader
-                .by_ref()
-                .take(max_read)
-                .read_until(b'\n', line)
-                .map_err(|_| ActiveRecoveryError::Io)?;
-            if read == 0 {
-                break;
-            }
-            if line.last() != Some(&b'\n') {
-                if line.len() > config.max_record_bytes
-                    && remaining_line_contains_lf(&mut reader)
-                        .map_err(|_| ActiveRecoveryError::Io)?
-                {
-                    return Err(ActiveRecoveryError::Malformed);
-                }
-                incomplete_tail = true;
-                break;
-            }
-            if line.len() > config.max_record_bytes
-                || serde_json::from_slice::<ProjectLogRecord>(&line[..line.len() - 1]).is_err()
-            {
-                return Err(ActiveRecoveryError::Malformed);
-            }
-            valid_length = valid_length
-                .checked_add(u64::try_from(line.len()).expect("日志记录长度必须可表示为 u64"))
-                .ok_or(ActiveRecoveryError::Malformed)?;
-        }
-    }
-    if incomplete_tail {
-        file.file()
-            .set_len(valid_length)
-            .map_err(|_| ActiveRecoveryError::Io)?;
-        file.file()
-            .sync_data()
-            .map_err(|_| ActiveRecoveryError::Io)?;
-        health.record_recovered_incomplete_tail();
-    }
-    validation.identity = identity;
-    validation.validated_length = valid_length;
-    validation.modified = if incomplete_tail { None } else { modified };
-    Ok(RecoveredActive {
-        file,
-        length: valid_length,
-    })
-}
-
-fn remaining_line_contains_lf(reader: &mut impl BufRead) -> io::Result<bool> {
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(false);
-        }
-        if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
-            reader.consume(index + 1);
-            return Ok(true);
-        }
-        let consumed = available.len();
-        reader.consume(consumed);
-    }
-}
-
-fn rotate_active(paths: &StreamPaths) -> Result<(), ()> {
-    let sequence = next_rotation_sequence(paths).ok_or(())?;
-    let rotated = paths.rotated(sequence);
-    rename_without_replace(&paths.active, &rotated).map_err(|_| ())?;
-    match OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&paths.active)
-    {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            let _ = rename_without_replace(&rotated, &paths.active);
-            Err(())
-        }
-    }
-}
-
-fn next_rotation_sequence(paths: &StreamPaths) -> Option<u64> {
-    scan_rotation_entries(paths)
-        .ok()?
-        .into_iter()
-        .map(|entry| entry.sequence)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-}
-
-fn maintain_retention(paths: &StreamPaths, retained: usize) -> Result<(), ()> {
-    let mut rotations = scan_rotation_entries(paths)?;
-    rotations.sort_unstable_by_key(|entry| entry.sequence);
-    let delete_count = rotations.len().saturating_sub(retained);
-    for entry in rotations.into_iter().take(delete_count) {
-        delete_regular_file_if_identity(&entry.path, entry.identity).map_err(|_| ())?;
-    }
-    Ok(())
-}
-
-struct RotationEntry {
-    sequence: u64,
-    path: PathBuf,
-    identity: FileIdentity,
-}
-
-fn scan_rotation_entries(paths: &StreamPaths) -> Result<Vec<RotationEntry>, ()> {
-    let entries = fs::read_dir(&paths.root).map_err(|_| ())?;
-    let mut rotations = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|_| ())?;
-        let Some(sequence) = rotation_sequence(&entry.file_name()) else {
-            continue;
-        };
-        let path = entry.path();
-        let pinned = pin_path_without_reparse(&path).map_err(|_| ())?;
-        if !pinned.metadata().map_err(|_| ())?.is_file() {
-            return Err(());
-        }
-        let identity = FileIdentity::of(pinned.file(), &path).map_err(|_| ())?;
-        rotations.push(RotationEntry {
-            sequence,
-            path,
-            identity,
-        });
-    }
-    Ok(rotations)
-}
-
-fn rotation_sequence(name: &std::ffi::OsStr) -> Option<u64> {
-    let name = name.to_str()?;
-    let digits = name
-        .strip_prefix(ROTATED_PREFIX)?
-        .strip_suffix(ROTATED_SUFFIX)?;
-    (digits.len() == 20 && digits.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| digits.parse().ok())
-        .flatten()
+    diagnostic
 }
 
 fn recorded_at_utc(now: OffsetDateTime) -> String {
@@ -1424,215 +1312,165 @@ fn recorded_at_utc(now: OffsetDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::Path;
-
+    use super::*;
     use tempfile::tempdir;
 
-    use super::*;
-    use crate::runtime::windows::ExclusiveFileLock;
-
-    fn config_input() -> ProjectLogConfigInput {
-        ProjectLogConfigInput {
-            level: ProjectLogLevel::Info,
-            queue_capacity: 8,
-            batch_max_records: 4,
-            batch_max_bytes: 4096,
-            flush_interval: Duration::from_millis(10),
-            shutdown_timeout: Duration::from_secs(2),
-            lock_timeout: Duration::from_secs(1),
-            max_record_bytes: 4096,
-            max_file_bytes: 65_536,
-            retained_rotated_files: 2,
-        }
+    fn context() -> ProjectLogContext {
+        ProjectLogContext::new("en")
+            .with_engine("rpg_maker_mz")
+            .with_project("project")
+            .with_command("extract")
     }
 
-    fn event(sequence_hint: u64) -> ProjectLogEvent {
+    fn event(index: u64) -> ProjectLogEvent {
         ProjectLogEvent::new(
             ProjectLogLevel::Info,
             ProjectLogCode::PhaseFinished,
-            ProjectLogContext::new("zh-Hans")
-                .with_run_id("run")
-                .with_engine("rpg_maker_mv")
-                .with_project("project")
-                .with_command("translate")
-                .with_profile("default"),
-            format!("完成阶段 {sequence_hint}"),
+            context(),
             ProjectLogPayload::Phase {
-                phase: "translate".to_owned(),
+                phase: ProjectLogPhase::Builtin,
                 amount: ProjectLogAmount::Determinate {
-                    completed: sequence_hint,
-                    total: 4,
+                    completed: index,
+                    total: 32,
                 },
             },
         )
     }
 
-    fn padded_event(sequence_hint: u64) -> ProjectLogEvent {
-        ProjectLogEvent::new(
-            ProjectLogLevel::Info,
-            ProjectLogCode::PhaseFinished,
-            ProjectLogContext::new("en"),
-            format!("{}-{sequence_hint}", "x".repeat(128)),
-            ProjectLogPayload::None,
-        )
-    }
-
-    fn read_records(path: &Path) -> Vec<ProjectLogRecord> {
-        fs::read(path)
-            .expect("日志文件应可读取")
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_slice(line).expect("每一行都应是项目日志记录"))
+    fn records(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("日志应可读取")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("每行都应是 JSON"))
             .collect()
     }
 
     #[test]
-    fn validates_all_configured_resource_bounds() {
-        let mut input = config_input();
-        input.queue_capacity = 0;
-        assert_eq!(
-            ProjectLogConfig::try_from(input),
-            Err(ProjectLogConfigurationError::ZeroQueueCapacity)
-        );
-
-        let mut input = config_input();
-        input.batch_max_records = 0;
-        assert_eq!(
-            ProjectLogConfig::try_from(input),
-            Err(ProjectLogConfigurationError::ZeroBatchMaxRecords)
-        );
-
-        let mut input = config_input();
-        input.max_file_bytes = 1;
-        assert!(matches!(
-            ProjectLogConfig::try_from(input),
-            Err(ProjectLogConfigurationError::RecordExceedsFileLimit { .. })
+    fn dropping_an_unfinished_runtime_writes_an_outcome_unknown_terminal_record() {
+        let directory = tempdir().expect("临时目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655449998";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        runtime.logger().emit(ProjectLogEvent::new(
+            ProjectLogLevel::Info,
+            ProjectLogCode::RunStarted,
+            context(),
+            ProjectLogPayload::Run { outcome: None },
         ));
+
+        drop(runtime);
+
+        let path = directory.path().join(format!("{run_id}.jsonl"));
+        let records = records(&path);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["code"].as_str().expect("code 应为文本"))
+                .collect::<Vec<_>>(),
+            [
+                "run.started",
+                "performance.counters",
+                "failure.reported",
+                "run.finished",
+            ]
+        );
+        assert_eq!(
+            records[2]["payload"]["diagnostic"]["code"],
+            "internal.operation"
+        );
+        assert_eq!(
+            records[2]["payload"]["diagnostic"]["impact"],
+            "outcome_unknown"
+        );
+        assert_eq!(records[3]["payload"]["outcome"], "outcome_unknown");
     }
 
     #[test]
-    fn level_parser_accepts_only_the_documented_closed_set() {
-        assert_eq!("error".parse(), Ok(ProjectLogLevel::Error));
-        assert_eq!("warn".parse(), Ok(ProjectLogLevel::Warn));
-        assert_eq!("info".parse(), Ok(ProjectLogLevel::Info));
-        assert_eq!("debug".parse(), Ok(ProjectLogLevel::Debug));
-        assert_eq!(
-            "trace".parse::<ProjectLogLevel>(),
-            Err(ProjectLogLevelParseError)
-        );
-    }
-
-    #[test]
-    fn serialization_sanitizes_every_free_text_field_at_the_log_boundary() {
-        let hostile = "visible\n\u{202e}reordered\u{2068}\u{1b}[31m";
-        let queued = QueuedProjectLogEvent {
-            emitted_at: OffsetDateTime::now_utc(),
-            event: ProjectLogEvent::new(
-                ProjectLogLevel::Info,
-                ProjectLogCode::RunPlanResolved,
-                ProjectLogContext::new(hostile)
-                    .with_run_id(hostile)
-                    .with_engine(hostile)
-                    .with_project(hostile)
-                    .with_command(hostile)
-                    .with_profile(hostile),
-                hostile,
-                ProjectLogPayload::RunPlan {
-                    source: ProjectLogValueSource::Explicit,
-                    lua_source: Some(ProjectLogValueSource::ProjectState),
-                    selections: vec![hostile.to_owned()],
-                    lua_enabled: Some(true),
-                },
-            ),
-        };
-        let config = ProjectLogConfig::try_from(config_input()).expect("日志配置应有效");
-        let health = ProjectLogHealth::default();
-        let mut sequence = 0;
-        let bytes = serialize_event(queued, config, &health, &mut sequence)
-            .expect("恶意显示文本不得阻断日志序列化");
-        let record: ProjectLogRecord =
-            serde_json::from_slice(&bytes).expect("净化后的记录应是合法 JSONL");
-
-        let mut values = vec![record.locale, record.message];
-        values.extend([
-            record.run_id.expect("run id 应存在"),
-            record.engine.expect("engine 应存在"),
-            record.project.expect("project 应存在"),
-            record.command.expect("command 应存在"),
-            record.profile.expect("profile 应存在"),
-        ]);
-        let ProjectLogPayload::RunPlan { selections, .. } = record.payload else {
-            panic!("记录应保留 RunPlan payload 类型");
-        };
-        values.extend(selections);
-        for value in values {
-            assert_eq!(value, sanitize_user_text(&value));
-            assert!(!value.contains('\n'));
-            assert!(!value.contains('\u{1b}'));
-            assert!(!value.contains('\u{202e}'));
-            assert!(!value.contains('\u{2068}'));
-        }
-
-        assert_eq!(
-            sanitize_payload_text(ProjectLogPayload::Phase {
-                phase: hostile.to_owned(),
-                amount: ProjectLogAmount::Indeterminate,
-            }),
-            ProjectLogPayload::Phase {
-                phase: sanitize_user_text(hostile),
-                amount: ProjectLogAmount::Indeterminate,
-            }
-        );
-        assert_eq!(
-            sanitize_payload_text(ProjectLogPayload::NoWork {
-                reason_code: hostile.to_owned(),
-            }),
-            ProjectLogPayload::NoWork {
-                reason_code: sanitize_user_text(hostile),
-            }
-        );
-    }
-
-    #[test]
-    fn writes_compact_typed_jsonl_in_batches() {
+    fn armed_unfinished_terminal_uses_only_the_registered_safe_projection() {
+        const PRIVATE_PANIC_PAYLOAD: &str = "PANIC_PRIVATE_SENTINEL";
         let directory = tempdir().expect("临时目录应可建立");
-        let config = ProjectLogConfig::try_from(config_input()).expect("配置应合法");
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
-        let logger = runtime.logger();
-        for sequence in 1..=4 {
-            logger.emit(event(sequence));
-        }
-        let health = runtime.shutdown();
-
-        assert!(!health.is_degraded());
-        assert_eq!(health.accepted_records, 4);
-        assert_eq!(health.persisted_records, 4);
-        let records = read_records(&directory.path().join(ACTIVE_FILE_NAME));
-        assert_eq!(records.len(), 4);
-        assert_eq!(records[0].sequence, 1);
-        assert_eq!(records[3].sequence, 4);
-        assert_eq!(records[0].run_id.as_deref(), Some("run"));
-        assert_eq!(records[0].locale, "zh-Hans");
-        assert!(
-            !fs::read(directory.path().join(ACTIVE_FILE_NAME))
-                .expect("日志文件应可读取")
-                .windows(2)
-                .any(|window| window == b"\r\n")
+        let run_id = "550e8400-e29b-41d4-a716-446655449999";
+        let mut runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        let path = runtime.path().expect("真实日志应有路径").to_path_buf();
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::Extract,
+            DiagnosticSubject::path("C:\\game\\project"),
+            DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+            DiagnosticImpact::OutcomeUnknown,
+            DiagnosticAction::ReportBug,
+        )
+        .with_recovery(RecoveryFact::path(&path));
+        runtime.arm_unfinished_terminal(
+            context(),
+            vec![diagnostic.clone()],
+            Arc::new(RunPerformanceCounters::default()),
         );
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _runtime = runtime;
+            std::panic::panic_any(Box::new(PRIVATE_PANIC_PAYLOAD));
+        }));
+        assert!(caught.is_err());
+        drop(caught);
+
+        let raw = std::fs::read_to_string(&path).expect("日志应可读取");
+        assert!(!raw.contains(PRIVATE_PANIC_PAYLOAD));
+        let records = records(&path);
+        assert_eq!(records[0]["code"], "performance.counters");
+        assert_eq!(records[1]["code"], "failure.reported");
+        assert_eq!(
+            records[1]["payload"]["diagnostic"],
+            serde_json::to_value(diagnostic).expect("诊断应可序列化")
+        );
+        assert_eq!(records[2]["code"], "run.finished");
+        assert_eq!(records[2]["payload"]["outcome"], "outcome_unknown");
     }
 
     #[test]
-    fn debug_is_filtered_before_it_uses_queue_capacity() {
+    fn each_run_owns_one_file_and_terminal_records_are_last() {
         let directory = tempdir().expect("临时目录应可建立");
-        let config = ProjectLogConfig::try_from(config_input()).expect("配置应合法");
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
+        let run_id = "550e8400-e29b-41d4-a716-446655440000";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         logger.emit(ProjectLogEvent::new(
+            ProjectLogLevel::Info,
+            ProjectLogCode::RunStarted,
+            context(),
+            ProjectLogPayload::Run { outcome: None },
+        ));
+        for index in 1..=32 {
+            logger.emit(event(index));
+        }
+        let failure = SafeDiagnostic::new(
+            DiagnosticCode::ProjectState,
+            DiagnosticStage::Extract,
+            DiagnosticSubject::Project {
+                name: "project".to_owned(),
+            },
+            DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        );
+        let health = runtime.finish(ProjectLogRunOutcome::Failed, context(), vec![failure]);
+        assert!(!health.is_degraded());
+
+        let path = directory.path().join(format!("{run_id}.jsonl"));
+        let records = records(&path);
+        assert_eq!(records[records.len() - 3]["code"], "performance.counters");
+        assert_eq!(records[records.len() - 2]["code"], "failure.reported");
+        assert_eq!(records.last().expect("应有终态")["code"], "run.finished");
+        assert_eq!(records.last().expect("应有终态")["sequence"], 36);
+    }
+
+    #[test]
+    fn debug_event_is_persisted_and_event_has_no_free_message() {
+        let directory = tempdir().expect("临时目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440001";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        runtime.logger().emit(ProjectLogEvent::new(
             ProjectLogLevel::Debug,
             ProjectLogCode::TaskStarted,
-            ProjectLogContext::new("en"),
-            "task",
+            context(),
             ProjectLogPayload::Task {
                 ordinal: 1,
                 total: 1,
@@ -1640,262 +1478,225 @@ mod tests {
                 attempts: None,
             },
         ));
-        let health = runtime.shutdown();
-
-        assert_eq!(health.accepted_records, 0);
-        assert_eq!(health.dropped_records, 0);
-        assert!(!directory.path().join(ACTIVE_FILE_NAME).exists());
-    }
-
-    #[test]
-    fn startup_failure_returns_no_op_and_one_warning() {
-        let directory = tempdir().expect("临时目录应可建立");
-        let root_file = directory.path().join("not-a-directory");
-        fs::write(&root_file, b"file").expect("占位文件应可建立");
-        let config = ProjectLogConfig::try_from(config_input()).expect("配置应合法");
-        let runtime = start_project_log(root_file, config);
-        let logger = runtime.logger();
-        logger.emit(event(1));
-
-        assert_eq!(logger.health().startup_failures, 1);
-        assert!(logger.take_warning().is_some());
-        assert!(logger.take_warning().is_none());
-        let health = runtime.shutdown();
-        assert!(health.is_degraded());
-    }
-
-    #[test]
-    fn incomplete_tail_is_recovered_without_blocking_new_records() {
-        let directory = tempdir().expect("临时目录应可建立");
-        fs::write(directory.path().join(ACTIVE_FILE_NAME), b"{\"time\":\"cut")
-            .expect("不完整尾部应可建立");
-        let config = ProjectLogConfig::try_from(config_input()).expect("配置应合法");
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
-        runtime.logger().emit(event(1));
-        let health = runtime.shutdown();
-
-        assert_eq!(health.recovered_incomplete_tails, 1);
-        assert_eq!(health.persisted_records, 1);
-        assert_eq!(
-            read_records(&directory.path().join(ACTIVE_FILE_NAME)).len(),
-            1
-        );
-    }
-
-    #[test]
-    fn complete_bad_line_is_preserved_and_only_degrades_logging() {
-        let directory = tempdir().expect("临时目录应可建立");
-        let active = directory.path().join(ACTIVE_FILE_NAME);
-        fs::write(&active, b"{\"bad\":true}\n").expect("损坏记录应可建立");
-        let config = ProjectLogConfig::try_from(config_input()).expect("配置应合法");
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
-        runtime.logger().emit(event(1));
-        let health = runtime.shutdown();
-
-        assert_eq!(health.malformed_records, 1);
-        assert_eq!(health.dropped_records, 1);
-        assert_eq!(fs::read(active).expect("坏行应保留"), b"{\"bad\":true}\n");
-    }
-
-    #[test]
-    fn queue_pressure_and_lock_timeout_only_degrade_log_health() {
-        let directory = tempdir().expect("临时目录应可建立");
-        let held = ExclusiveFileLock::acquire(
-            &directory.path().join(LOCK_FILE_NAME),
-            Duration::from_secs(1),
-        )
-        .expect("测试应先持有日志锁");
-        let mut input = config_input();
-        input.queue_capacity = 1;
-        input.batch_max_records = 1;
-        input.lock_timeout = Duration::from_millis(20);
-        let config = ProjectLogConfig::try_from(input).expect("配置应合法");
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
-        let logger = runtime.logger();
-        for sequence in 1..=128 {
-            logger.emit(event(sequence));
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while logger.health().lock_timeouts == 0 && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
-        let during_run = logger.health();
-        assert!(during_run.queue_full > 0);
-        assert!(during_run.lock_timeouts > 0);
-        drop(held);
-
-        let after_shutdown = runtime.shutdown();
-        assert!(after_shutdown.is_degraded());
-        assert!(after_shutdown.dropped_records > 0);
-    }
-
-    #[test]
-    fn partial_write_is_counted_and_never_escapes_the_logging_boundary() {
-        let directory = tempdir().expect("临时目录应可建立");
-        let mut config = ProjectLogConfig::try_from(config_input()).expect("配置应合法");
-        config.test_faults.partial_write = true;
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
-        let logger = runtime.logger();
-
-        logger.emit(event(1));
-        let health = runtime.shutdown();
-
+        let health = runtime.finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new());
         assert_eq!(health.accepted_records, 1);
-        assert_eq!(health.persisted_records, 0);
-        assert_eq!(health.dropped_records, 1);
-        assert_eq!(health.write_failures, 1);
-        assert!(health.is_degraded());
-        let partial = fs::read(directory.path().join(ACTIVE_FILE_NAME))
-            .expect("部分写入的活动文件应保留给下次恢复");
-        assert!(!partial.is_empty());
-        assert_ne!(partial.last(), Some(&b'\n'));
-
-        // 即使 worker 已经关闭，业务线程继续发事件也只更新健康状态。
-        logger.emit(event(2));
-        assert_eq!(logger.health().queue_closed, 1);
+        let path = directory.path().join(format!("{run_id}.jsonl"));
+        let records = records(&path);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["code"], "task.started");
+        assert_eq!(records[0]["level"], "debug");
+        assert_eq!(records[1]["code"], "performance.counters");
+        assert_eq!(records[2]["code"], "run.finished");
     }
 
     #[test]
-    fn rotation_failure_drops_only_log_records() {
+    fn failure_payload_cannot_leak_private_source_text() {
         let directory = tempdir().expect("临时目录应可建立");
-        let mut input = config_input();
-        input.queue_capacity = 16;
-        input.batch_max_records = 16;
-        input.max_record_bytes = 512;
-        input.max_file_bytes = 512;
-        let mut config = ProjectLogConfig::try_from(input).expect("配置应合法");
-        config.test_faults.rotation = true;
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
-        let logger = runtime.logger();
-        for sequence in 1..=4 {
-            logger.emit(padded_event(sequence));
-        }
-
-        let health = runtime.shutdown();
-
-        assert_eq!(health.accepted_records, 4);
-        assert!(health.persisted_records > 0);
-        assert!(health.dropped_records > 0);
-        assert!(health.rotation_failures > 0);
-        assert!(health.is_degraded());
-        assert!(!read_records(&directory.path().join(ACTIVE_FILE_NAME)).is_empty());
+        let run_id = "550e8400-e29b-41d4-a716-446655440002";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        let wrapped = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "SECRET_SENTINEL");
+        let failure = SafeDiagnostic::io(
+            DiagnosticCode::ProjectUnavailable,
+            DiagnosticStage::ProjectOpening,
+            DiagnosticSubject::path("C:\\game\n\u{1b}[31m"),
+            "open",
+            &wrapped,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        )
+        .with_recovery(crate::diagnostic::RecoveryFact::path("C:\\game\\recovery"));
+        let _ = runtime.finish(ProjectLogRunOutcome::Failed, context(), vec![failure]);
+        let path = directory.path().join(format!("{run_id}.jsonl"));
+        let raw = std::fs::read_to_string(&path).expect("日志应可读取");
+        assert!(!raw.contains("SECRET_SENTINEL"));
+        assert!(!raw.contains('\u{1b}'));
+        assert!(raw.contains("project.unavailable"));
+        assert!(raw.contains("permission_denied"));
+        let records = records(&path);
+        let message = records
+            .iter()
+            .find(|record| record["code"] == "failure.reported")
+            .expect("应记录失败诊断")["message"]
+            .as_str()
+            .expect("消息应为文本")
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(message.contains("Error [project.unavailable]"));
+        assert!(message.contains("Stage: project opening"));
+        assert!(message.contains("Location: C:\\game [31m"));
+        assert!(message.contains("Reason: open: permission denied"));
+        assert!(message.contains("Impact: state was not changed"));
+        assert!(message.contains("Action: check the path, filesystem state, and permissions"));
+        assert!(message.contains("Recovery: C:\\game\\recovery"));
     }
 
     #[test]
-    fn retention_failure_preserves_successfully_written_records() {
+    fn primary_and_related_failures_preserve_the_exact_shared_projection() {
         let directory = tempdir().expect("临时目录应可建立");
-        let mut input = config_input();
-        input.queue_capacity = 32;
-        input.batch_max_records = 32;
-        input.batch_max_bytes = 16_384;
-        input.max_record_bytes = 512;
-        input.max_file_bytes = 512;
-        input.retained_rotated_files = 1;
-        let mut config = ProjectLogConfig::try_from(input).expect("配置应合法");
-        config.test_faults.retention = true;
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
+        let run_id = "550e8400-e29b-41d4-a716-446655440003";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        let primary = SafeDiagnostic::new(
+            DiagnosticCode::CommandInput,
+            DiagnosticStage::CommandPreparation,
+            DiagnosticSubject::field("PROFILE_ID"),
+            DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixInput,
+        );
+        let related = SafeDiagnostic::new(
+            DiagnosticCode::ShutdownComponent,
+            DiagnosticStage::Shutdown,
+            DiagnosticSubject::component("SQLite"),
+            DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
+            DiagnosticImpact::StateAppliedFinalizationFailed,
+            DiagnosticAction::Retry,
+        );
+        let _ = runtime.finish(
+            ProjectLogRunOutcome::Failed,
+            context(),
+            vec![primary.clone(), related.clone()],
+        );
+
+        let path = directory.path().join(format!("{run_id}.jsonl"));
+        let records = records(&path);
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0]["code"], "performance.counters");
+        assert_eq!(records[1]["code"], "failure.reported");
+        assert_eq!(records[1]["payload"]["relation"], "primary");
+        assert_eq!(
+            records[1]["payload"]["diagnostic"],
+            serde_json::to_value(primary).expect("诊断应可序列化")
+        );
+        assert_eq!(records[2]["code"], "failure.reported");
+        assert_eq!(records[2]["payload"]["relation"], "related");
+        assert_eq!(
+            records[2]["payload"]["diagnostic"],
+            serde_json::to_value(related).expect("诊断应可序列化")
+        );
+        assert_eq!(records[3]["code"], "run.finished");
+    }
+
+    #[test]
+    fn queue_pressure_backpressures_without_losing_events_or_terminal_records() {
+        let directory = tempdir().expect("临时目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440004";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
-        for sequence in 1..=20 {
-            logger.emit(padded_event(sequence));
+        let event_count = u64::try_from(QUEUE_CAPACITY)
+            .expect("队列容量应可转换")
+            .saturating_add(257);
+        for index in 1..=event_count {
+            logger.emit(event(index));
         }
-
-        let health = runtime.shutdown();
-
-        assert_eq!(health.accepted_records, 20);
-        assert_eq!(health.persisted_records, 20);
+        let health = runtime.finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new());
+        assert_eq!(health.accepted_records, event_count);
         assert_eq!(health.dropped_records, 0);
-        assert!(health.retention_failures > 0);
-        assert_eq!(health.rotation_failures, 0);
-        assert!(health.is_degraded());
-        let rotations = fs::read_dir(directory.path())
-            .expect("日志根应可枚举")
-            .filter_map(Result::ok)
-            .filter(|entry| rotation_sequence(&entry.file_name()).is_some())
-            .count();
-        assert!(rotations > input.retained_rotated_files);
-    }
+        assert!(!health.is_degraded());
 
-    #[test]
-    fn shutdown_timeout_returns_degraded_health_without_waiting_for_worker() {
-        let directory = tempdir().expect("临时目录应可建立");
-        let mut input = config_input();
-        input.shutdown_timeout = Duration::from_millis(5);
-        let mut config = ProjectLogConfig::try_from(input).expect("配置应合法");
-        config.test_faults.shutdown_delay = Duration::from_millis(100);
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
-        let logger = runtime.logger();
-
-        let health = runtime.shutdown();
-
-        assert_eq!(health.shutdown_timeouts, 1);
-        assert!(health.is_degraded());
-        for sequence in 1..=128 {
-            logger.emit(event(sequence));
-        }
-        let after_closed_emits = logger.health();
-        assert_eq!(after_closed_emits.queue_closed, 128);
-        assert_eq!(after_closed_emits.dropped_records, 128);
-
-        // 让已经脱离等待的 worker 完成，确认其延迟收尾不会 panic。
-        thread::sleep(Duration::from_millis(150));
-        assert_eq!(logger.health().worker_panics, 0);
-    }
-
-    #[test]
-    fn rotates_monotonically_and_keeps_only_configured_count() {
-        let directory = tempdir().expect("临时目录应可建立");
-        let mut input = config_input();
-        input.batch_max_records = 1;
-        input.max_record_bytes = 512;
-        input.max_file_bytes = 512;
-        input.retained_rotated_files = 2;
-        let config = ProjectLogConfig::try_from(input).expect("配置应合法");
-        let runtime = start_project_log(directory.path().to_path_buf(), config);
-        let logger = runtime.logger();
-        for sequence in 1..=20 {
-            logger.emit(padded_event(sequence));
-        }
-        let health = runtime.shutdown();
-
-        assert_eq!(health.rotation_failures, 0);
-        let rotations = fs::read_dir(directory.path())
-            .expect("日志根应可枚举")
-            .filter_map(Result::ok)
-            .filter(|entry| rotation_sequence(&entry.file_name()).is_some())
-            .count();
-        assert!((1..=2).contains(&rotations));
-    }
-
-    #[test]
-    fn independent_workers_never_interleave_physical_lines() {
-        let directory = tempdir().expect("临时目录应可建立");
-        let config = ProjectLogConfig::try_from(config_input()).expect("配置应合法");
-        let first = start_project_log(directory.path().to_path_buf(), config);
-        let second = start_project_log(directory.path().to_path_buf(), config);
-        let first_logger = first.logger();
-        let second_logger = second.logger();
-        let first_thread = thread::spawn(move || {
-            for sequence in 1..=8 {
-                first_logger.emit(event(sequence));
-            }
-        });
-        let second_thread = thread::spawn(move || {
-            for sequence in 9..=16 {
-                second_logger.emit(event(sequence));
-            }
-        });
-        first_thread.join().expect("第一生产线程不应 panic");
-        second_thread.join().expect("第二生产线程不应 panic");
-        let first_health = first.shutdown();
-        let second_health = second.shutdown();
-
+        let path = directory.path().join(format!("{run_id}.jsonl"));
+        let raw = std::fs::read_to_string(path).expect("日志应可读取");
         assert_eq!(
-            first_health.persisted_records + second_health.persisted_records,
-            16
+            u64::try_from(raw.lines().count()).expect("日志条数应可转换"),
+            event_count.saturating_add(2)
+        );
+        let terminal: serde_json::Value =
+            serde_json::from_str(raw.lines().last().expect("应有终态")).expect("终态应为 JSON");
+        assert_eq!(terminal["code"], "run.finished");
+    }
+
+    #[test]
+    fn performance_snapshot_is_strictly_serialized_before_failures_and_run_finished() {
+        let directory = tempdir().expect("临时目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440005";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        runtime.logger().emit(event(1));
+        let mut snapshot = RunPerformanceSnapshot::default();
+        snapshot.sqlite_transactions.write_plan.begin.attempted = 7;
+        snapshot.sqlite_transactions.write_plan.commit.attempted = 5;
+        snapshot.sqlite_transactions.write_plan.rollback.attempted = 1;
+        snapshot.candidate_validations.started = 11;
+        snapshot.candidate_validations.completed = 13;
+        let failure = SafeDiagnostic::new(
+            DiagnosticCode::ProjectState,
+            DiagnosticStage::WriteBack,
+            DiagnosticSubject::operation("validate_candidate"),
+            DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        );
+
+        let health = runtime.finish_with_performance(
+            ProjectLogRunOutcome::Failed,
+            context(),
+            vec![failure],
+            snapshot,
+        );
+        assert!(!health.is_degraded());
+
+        let path = directory.path().join(format!("{run_id}.jsonl"));
+        let records = records(&path);
+        let codes = records
+            .iter()
+            .map(|record| record["code"].as_str().expect("code 应为文本"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            [
+                "phase.finished",
+                "performance.counters",
+                "failure.reported",
+                "run.finished",
+            ]
+        );
+        let payload = records[1]["payload"].clone();
+        assert_eq!(payload["kind"], "performance");
+        assert_eq!(
+            payload["snapshot"],
+            serde_json::to_value(snapshot).expect("性能快照应可序列化")
         );
         assert_eq!(
-            read_records(&directory.path().join(ACTIVE_FILE_NAME)).len(),
-            16
+            serde_json::from_value::<ProjectLogPayload>(payload.clone())
+                .expect("闭集性能载荷应可反序列化"),
+            ProjectLogPayload::Performance { snapshot }
         );
+
+        let mut unknown_payload = payload.clone();
+        unknown_payload
+            .as_object_mut()
+            .expect("性能载荷应为 object")
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<ProjectLogPayload>(unknown_payload).is_err());
+
+        let mut unknown_snapshot = payload;
+        unknown_snapshot["snapshot"]
+            .as_object_mut()
+            .expect("性能快照应为 object")
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<ProjectLogPayload>(unknown_snapshot).is_err());
+    }
+
+    #[test]
+    fn performance_summary_uses_all_locales_and_preserves_each_counter() {
+        let mut snapshot = RunPerformanceSnapshot::default();
+        snapshot.sqlite_transactions.interactive.begin.attempted = 7;
+        snapshot.candidate_validations.started = 11;
+        snapshot.candidate_validations.completed = 13;
+        let payload = ProjectLogPayload::Performance { snapshot };
+
+        for locale in UiLocale::ALL {
+            let localized_context = ProjectLogContext::new(locale.as_str());
+            let rendered = render_message(
+                ProjectLogCode::PerformanceCounters,
+                &payload,
+                &localized_context,
+            )
+            .replace(['\u{2068}', '\u{2069}'], "");
+            for counter in ["7", "11", "13"] {
+                assert!(
+                    rendered.contains(counter),
+                    "{locale} 性能摘要缺少计数 {counter}: {rendered}"
+                );
+            }
+            assert!(!rendered.contains("cannot use payload"));
+        }
     }
 }

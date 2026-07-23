@@ -44,7 +44,7 @@ WriteBack；复杂跨文档/多目标插件由 Lua 自己拥有三阶段身份�
 
 主程序目录加入当前 VM 的 `package.path`/`package.cpath`；进程 cwd 不改变。`require`、
 `io`、`os`、`debug` 与 Lua 5.4 本机模块开放。直接 I/O/进程/本机模块不自动进入 ATT 的
-路径预算、取消、事务或候选发布协议。
+受管路径、取消、事务或候选发布协议。
 
 <!-- att-example: illustrative -->
 ```lua
@@ -255,9 +255,9 @@ groups = {
 投影。
 
 `groups` 和 `fields` 都是从 1 开始无洞数组；声明顺序分别成为 `group_order` 和
-`unit_order`，不得按字母重排。同一次调用中 `(group.location, group.kind)` 必须唯一；重复
-项是 `extract / invalid_standard_snapshot`，Host 不会把它们自动合并。每组至少一个 field；
-name 非空且组内唯一；原文不能全空白；逻辑身份和 Mutation Claim 不得冲突。
+`unit_order`，不得按字母重排。同一次调用中 `group.location` 本身必须唯一；同位置同 kind
+或不同 kind 都是 `extract / invalid_standard_snapshot`，Host 不会把它们自动合并。每组至少
+一个 field；name 非空且组内唯一；原文不能全空白；逻辑身份和 Mutation Claim 不得冲突。
 
 一次脚本最多声明一个意图：一次 `replace_standard` 或 `clear_standard`。第二次失败。
 `replace_standard({})` 是 active 的空 Lua owner；`clear_standard()` 停用 owner；不调用
@@ -387,8 +387,10 @@ TEXT、`ctx.db.NULL`、`ctx.db.blob`；boolean 不支持。结果按列顺序返
 
 官方支持的扩展路径只保证脚本自己的私有命名空间表，例如 `lua_quest_translation`。
 脚本可以直接读写 ATT 受管表，但这属于高级操作：作者自行承担全部 schema、身份、顺序、
-Claim、指纹、译文/state 和事务不变量，ATT 不承诺受管 schema 是稳定扩展 API。不要在
-官方范例中这样做。
+完整逻辑 Claim、冲突摘要、指纹、译文/state 和事务不变量。位置、Mutation resource、
+unit role 与 recipe 必须写成当前 compact canonical JSON；`standard_mutation_claim`
+只保存从 recipe 派生的确定性跨 owner 冲突摘要，不是完整 Claim 清单。ATT 不承诺受管
+schema 是稳定扩展 API。不要在官方范例中这样做。
 
 因为每阶段是新连接，TEMP 表和未持久化连接状态不能作为跨阶段协议。持久私有表是推荐
 交接位置。
@@ -423,7 +425,7 @@ ctx.output.remove(path)
 `remove` 不递归。脚本不能创建/删除/替换 `data`、`js` 根。最终候选顶层必须仍是 MZ 的
 `data/js`，或 MV Host 内部 `www/data`、`www/js`。没有 `www` 逻辑根。
 
-门面绑定当前候选身份并执行预算/终态检查；它不是文件系统沙箱。直接修改
+门面绑定当前候选身份并执行目标、祖先和回滚条件检查；它不是文件系统沙箱。直接修改
 `ctx.project.output_root` 会绕过门面，但仍面对最终全量候选验证。
 
 ### 10.2 `ctx.write_back.layout`
@@ -449,7 +451,7 @@ WriteBack 没有 validate/discard/publish 或 post-publish 回调。脚本应只
 发布；Lua 无法在成功发布后再把私有表标记成“已发布”。需要跨运行恢复时，以权威输入和
 候选可重建性设计协议，而不是猜测发布结果。
 
-## 11. 错误、预算、取消与副作用
+## 11. 错误、取消与副作用
 
 Host 错误以 userdata 抛出，可由 `pcall` 读取：
 
@@ -462,7 +464,7 @@ error.retry_after_ms = integer | nil
 ```
 
 只按 domain/kind 分支；message 仅诊断。JSON、普通 Host 值、RPG Maker 整文档、Extract
-快照、来源和输出转换各自保留不同错误域与预算。常见域包括 `json`、`binding`、
+快照、来源和输出转换各自保留不同错误域。常见域包括 `json`、`binding`、
 `rpg_maker`、`extract`、`filesystem`、`output`、`sqlite`、`translation`、`llm`、
 `runtime`。
 
@@ -471,8 +473,8 @@ error.retry_after_ms = integer | nil
 | domain | kind |
 |---|---|
 | `json` | `invalid_value` |
-| `binding` | `invalid_source_path`、`invalid_output_path`、`invalid_value`、`host_value_budget_exceeded` |
-| `rpg_maker` | `invalid_argument`、`invalid_source`、`invalid_plugin_parameter_source`、`invalid_plugins_envelope`、`invalid_location`、`invalid_tag`、`tag_not_found`、`invalid_utf8`、`invalid_json`、`resource_limit` |
+| `binding` | `invalid_source_path`、`invalid_output_path`、`invalid_value` |
+| `rpg_maker` | `invalid_argument`、`invalid_source`、`invalid_plugin_parameter_source`、`invalid_plugins_envelope`、`invalid_location`、`invalid_tag`、`tag_not_found`、`invalid_utf8`、`invalid_json` |
 | `extract` | `invalid_standard_snapshot`、`intent_already_declared` |
 | `filesystem` | `case_mismatch`、`not_found`、`not_file`、`not_directory`、`invalid_path`、`invalid_utf8`、`io` |
 | `output` | `outside_content_roots`、`invalid_path`、`outside_scope`、`scope_root_mutation`、`not_found`、`not_file`、`not_directory`、`directory_not_empty`、`candidate_identity_changed`、`wrong_editor_instance`、`invalid_utf8_name`、`io` |
@@ -482,7 +484,8 @@ error.retry_after_ms = integer | nil
 | `runtime` | `cancelled`、`host_bridge_closed` |
 
 接口参数/值错误和脚本编程错误仍可能由 `binding` 报告；不要通过解析 message 猜测新的
-kind。完整文档超过 Host 最大字节数是 `rpg_maker/resource_limit`，不是普通 Host 值预算。
+kind。ATT 不按 Lua VM 内存、Host 值字节、节点、深度、错误文本长度或完整文档字节数
+提前拒绝；真实分配、地址空间、文件系统、SQLite 或格式失败按其实际 domain/kind 报告。
 
 取消是合作式。Host 调用到达现实副作用后等待明确终态；脚本可捕获取消，但 VM 返回边界
 再次观察。完整标准库、本机模块、`os.execute`/`os.exit` 不受同等抢占保证。

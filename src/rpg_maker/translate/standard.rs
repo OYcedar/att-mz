@@ -18,12 +18,13 @@ use futures_util::future;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::diagnostic::SafeDiagnostic;
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguagePair};
-use crate::llm::ChatMessage;
 #[cfg(test)]
 use crate::llm::LlmUsage;
+use crate::llm::{ChatMessage, LlmClientConcurrency};
 use crate::rpg_maker::model::{LogicalTextLocation, TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
@@ -32,6 +33,32 @@ use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 
 use super::executor::FinalLlmResponseMetadata;
 use super::profile::RpgMakerTranslationProfile;
+
+/// 模型响应返回后仍要执行验收、传播准备和顺序提交；这些本地完成项可以在内存中
+/// 等待前序任务，但不能反向扩大进入 Executor 的任务数。Executor worker 始终等于
+/// Client 的活动请求上限。入场许可在 Executor 之前取得，因此最早未完成任务永远已
+/// 占有位置，不会被后序完成项挤出而死锁。
+///
+/// 该倍率是产品内部吞吐策略，不是项目规模上限，也不进入用户配置。以 SSPV 在同一
+/// Windows/MSVC Release 环境交错运行 7 轮后，无额外窗口、N、2N、4N 额外窗口的
+/// Translate 中位耗时分别为 4.862、4.870、4.966、5.005 秒。前两项无法在慢首任务下
+/// 持续补充 HTTP 工作，也无法及时发现窗口外的准备/错序失败，因此其性能成绩按核心
+/// 行为差异作废。2N 和 4N 额外窗口都通过该压力契约，2N 更小且更快，故本地在途宽度
+/// 固定为活动 HTTP 宽度加 2N 完成窗口，即 3N。
+const EXECUTION_WINDOW_MULTIPLIER: usize = 2;
+
+fn execution_worker_count(task_count: usize, max_concurrent_requests: usize) -> usize {
+    task_count.min(max_concurrent_requests.max(1))
+}
+
+fn local_in_flight_window_count(task_count: usize, max_concurrent_requests: usize) -> usize {
+    task_count.min(
+        max_concurrent_requests
+            .max(1)
+            .saturating_mul(EXECUTION_WINDOW_MULTIPLIER.saturating_add(1))
+            .max(1),
+    )
+}
 
 /// 一次标准资产翻译需要的可选外部资料。
 ///
@@ -61,27 +88,27 @@ impl StandardTranslationInput {
 
 /// Standard 编排本身真正消费的配置事实。
 ///
-/// Profile 由外部配置边界一次建立。Standard 不提供默认并发数，也不根据
-/// CPU 数量或任务数量自行缩放。
+/// Profile 由外部配置边界一次建立，只提供供应商允许的活动 HTTP 请求数。
+/// 响应返回后的本地流水线窗口由 Standard 的产品策略拥有，不反向成为配置。
 pub(crate) trait StandardTranslationProfile: Send + Sync + 'static {
-    fn max_in_flight_tasks(&self) -> NonZeroUsize;
+    fn max_concurrent_requests(&self) -> NonZeroUsize;
 }
 
 impl<L> StandardTranslationProfile for RpgMakerTranslationProfile<L>
 where
-    L: Send + Sync + 'static,
+    L: LlmClientConcurrency + 'static,
 {
-    fn max_in_flight_tasks(&self) -> NonZeroUsize {
-        self.max_in_flight_tasks()
+    fn max_concurrent_requests(&self) -> NonZeroUsize {
+        self.llm_client().max_concurrent_requests()
     }
 }
 
 impl<L> StandardTranslationProfile for Arc<RpgMakerTranslationProfile<L>>
 where
-    L: Send + Sync + 'static,
+    L: LlmClientConcurrency + 'static,
 {
-    fn max_in_flight_tasks(&self) -> NonZeroUsize {
-        RpgMakerTranslationProfile::max_in_flight_tasks(self.as_ref())
+    fn max_concurrent_requests(&self) -> NonZeroUsize {
+        self.as_ref().llm_client().max_concurrent_requests()
     }
 }
 
@@ -408,16 +435,29 @@ impl TranslationReuseSeed {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
+    #[cfg(test)]
     pub(crate) fn expected_translation(&self) -> &TextUnitContent {
         &self.expected_translation
     }
 
+    #[cfg(test)]
     pub(crate) const fn expected_translation_state(&self) -> Sha256Fingerprint {
         self.expected_translation_state
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (TranslationUnitIdentity, TextUnitContent, Sha256Fingerprint) {
+        (
+            self.identity,
+            self.expected_translation,
+            self.expected_translation_state,
+        )
     }
 }
 
@@ -445,20 +485,40 @@ impl TranslationReuseTarget {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
+    #[cfg(test)]
     pub(crate) fn expected_translation(&self) -> Option<&TextUnitContent> {
         self.expected_translation.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) const fn expected_translation_state(&self) -> Option<Sha256Fingerprint> {
         self.expected_translation_state
     }
 
+    #[cfg(test)]
     pub(crate) const fn replacement_translation_state(&self) -> Sha256Fingerprint {
         self.replacement_translation_state
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        TranslationUnitIdentity,
+        Option<TextUnitContent>,
+        Option<Sha256Fingerprint>,
+        Sha256Fingerprint,
+    ) {
+        (
+            self.identity,
+            self.expected_translation,
+            self.expected_translation_state,
+            self.replacement_translation_state,
+        )
     }
 }
 
@@ -474,12 +534,17 @@ impl TranslationReuse {
         Self { seed, targets }
     }
 
+    #[cfg(test)]
     pub(crate) fn seed(&self) -> &TranslationReuseSeed {
         &self.seed
     }
 
     pub(crate) fn targets(&self) -> &[TranslationReuseTarget] {
         &self.targets
+    }
+
+    pub(crate) fn into_parts(self) -> (TranslationReuseSeed, Vec<TranslationReuseTarget>) {
+        (self.seed, self.targets)
     }
 }
 
@@ -496,16 +561,29 @@ impl TranslationInvalidation {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
         &self.identity
     }
 
+    #[cfg(test)]
     pub(crate) fn expected_translation(&self) -> &TextUnitContent {
         &self.expected_translation
     }
 
+    #[cfg(test)]
     pub(crate) const fn expected_translation_state(&self) -> Sha256Fingerprint {
         self.expected_translation_state
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (TranslationUnitIdentity, TextUnitContent, Sha256Fingerprint) {
+        (
+            self.identity,
+            self.expected_translation,
+            self.expected_translation_state,
+        )
     }
 }
 
@@ -1100,36 +1178,13 @@ impl AcceptedTranslationDecision {
         self.patch.propagation_targets()
     }
 
+    pub(crate) fn patch(&self) -> &TranslationPatch {
+        &self.patch
+    }
+
     #[cfg(test)]
     pub(crate) fn translation(&self) -> &TextUnitContent {
         self.patch.translation()
-    }
-
-    fn into_patch(self) -> TranslationPatch {
-        self.patch
-    }
-}
-
-/// 只承载已经独立验收、可交给 Store 原子写入的译文 Patch。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ValidatedTranslationTaskResult {
-    task_index: StandardTranslationTaskIndex,
-    updates: Vec<TranslationPatch>,
-}
-
-impl ValidatedTranslationTaskResult {
-    pub(crate) fn new(
-        task_index: StandardTranslationTaskIndex,
-        updates: Vec<TranslationPatch>,
-    ) -> Self {
-        Self {
-            task_index,
-            updates,
-        }
-    }
-
-    pub(crate) fn into_updates(self) -> Vec<TranslationPatch> {
-        self.updates
     }
 }
 
@@ -1223,12 +1278,12 @@ pub(crate) enum TranslationTaskUnavailableReason {
     ModelResponseUnusable,
     AllOutputsRejected,
     RecoverableRequestExhausted {
-        message: String,
+        diagnostic: SafeDiagnostic,
     },
     RetryAfterExceedsConfiguredMaximum {
         retry_after: Duration,
         maximum: Duration,
-        message: String,
+        diagnostic: SafeDiagnostic,
     },
 }
 
@@ -1367,6 +1422,22 @@ impl TranslationTaskOutcome {
         &self.context().diagnostics
     }
 
+    /// 网络预算耗尽仍作为正常任务结果保留时，对应的安全、具体请求诊断。
+    pub(crate) fn request_diagnostic(&self) -> Option<&SafeDiagnostic> {
+        match self {
+            Self::Unavailable {
+                reason:
+                    TranslationTaskUnavailableReason::RecoverableRequestExhausted { diagnostic }
+                    | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
+                        diagnostic,
+                        ..
+                    },
+                ..
+            } => Some(diagnostic),
+            Self::Complete { .. } | Self::Partial { .. } | Self::Unavailable { .. } => None,
+        }
+    }
+
     pub(crate) fn accepted_location_count(&self) -> usize {
         self.accepted()
             .iter()
@@ -1379,19 +1450,6 @@ impl TranslationTaskOutcome {
             .iter()
             .map(UnresolvedTranslationUnit::location_count)
             .sum()
-    }
-
-    pub(crate) fn validated_result(&self) -> Option<ValidatedTranslationTaskResult> {
-        (!self.accepted().is_empty()).then(|| {
-            ValidatedTranslationTaskResult::new(
-                self.task_index(),
-                self.accepted()
-                    .iter()
-                    .cloned()
-                    .map(AcceptedTranslationDecision::into_patch)
-                    .collect(),
-            )
-        })
     }
 }
 
@@ -1629,6 +1687,12 @@ pub(crate) trait StandardTranslationResultStore: Send + Sync {
         project: &OpenedProject,
         prepared: Self::PreparedCommit,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// 显式终结本轮标准翻译持有的存储会话。
+    ///
+    /// 无论主流程成功、失败或取消都会调用；实现必须完成残留事务观察、回滚和连接关闭，
+    /// 并把收尾失败作为独立事实返回。
+    fn finalize(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// 完成一轮项目数据库标准 RPG Maker 资产翻译的职责契约。
@@ -1653,7 +1717,7 @@ pub(crate) trait StandardTranslation: Send + Sync {
 }
 
 /// Standard 翻译向可观测性边界提交的非秘密业务事实。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StandardTranslationLogEvent {
     PlanningUnresolved {
         units: usize,
@@ -1667,6 +1731,7 @@ pub(crate) enum StandardTranslationLogEvent {
         outcome: StandardTranslationLogTaskOutcome,
         attempts: Option<NonZeroUsize>,
         retry_exhausted: bool,
+        diagnostic: Option<SafeDiagnostic>,
     },
 }
 
@@ -1691,15 +1756,14 @@ pub(crate) trait StandardTranslationLog: Send + Sync {
 struct ScheduledTaskCompletion<E> {
     task_index: StandardTranslationTaskIndex,
     execution: TaskExecutionCompletion<E>,
-    /// 每个已启动任务持有窗口许可，直到对应计划位置完成最终化。
-    window_permit: OwnedSemaphorePermit,
+    in_flight_permit: OwnedSemaphorePermit,
 }
 
 /// 纯计算准备完成后交给顺序最终化线的任务结果。
 struct PreparedScheduledTaskCompletion<E, S, C> {
     task_index: StandardTranslationTaskIndex,
     execution: PreparedTaskExecutionCompletion<E, S, C>,
-    window_permit: OwnedSemaphorePermit,
+    in_flight_permit: OwnedSemaphorePermit,
 }
 
 impl<E, S, C> PreparedScheduledTaskCompletion<E, S, C> {
@@ -1830,7 +1894,7 @@ where
         let ScheduledTaskCompletion {
             task_index,
             execution,
-            window_permit,
+            in_flight_permit,
         } = completion;
         let execution = match execution {
             TaskExecutionCompletion::Outcome { outcome } => {
@@ -1853,7 +1917,7 @@ where
         PreparedScheduledTaskCompletion {
             task_index,
             execution,
-            window_permit,
+            in_flight_permit,
         }
     }
 }
@@ -1875,36 +1939,37 @@ where
         profile: &Self::Profile,
         input: StandardTranslationInput,
     ) -> Result<OperationCompletion<StandardTranslationRunReport>, Self::Error> {
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
-        let corpus = self
-            .asset_reader
-            .read(project)
-            .await
-            .map_err(StandardTranslationServiceError::ReadAssets)?;
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
-        let plan = self
-            .task_planner
-            .plan(project, profile, corpus, input)
-            .await
-            .map_err(StandardTranslationServiceError::PlanTasks)?;
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
-        let (semantics, preparation, tasks) = plan.into_parts();
-        let planning_failures = preparation.planning_failures().to_vec();
-        let mut report = StandardTranslationRunReport::with_reconciliation(
-            tasks.len(),
-            preparation.retained(),
-            preparation.invalidated(),
-            preparation.not_applicable(),
-            preparation.reused(),
-        )
-        .with_semantics(semantics);
-        report.record_planning_failures(&planning_failures);
+        let operation: Result<_, Self::Error> = async {
+            if self.cancellation.is_requested() {
+                return Ok(OperationCompletion::Cancelled);
+            }
+            let corpus = self
+                .asset_reader
+                .read(project)
+                .await
+                .map_err(StandardTranslationServiceError::ReadAssets)?;
+            if self.cancellation.is_requested() {
+                return Ok(OperationCompletion::Cancelled);
+            }
+            let plan = self
+                .task_planner
+                .plan(project, profile, corpus, input)
+                .await
+                .map_err(StandardTranslationServiceError::PlanTasks)?;
+            if self.cancellation.is_requested() {
+                return Ok(OperationCompletion::Cancelled);
+            }
+            let (semantics, preparation, tasks) = plan.into_parts();
+            let planning_failures = preparation.planning_failures().to_vec();
+            let mut report = StandardTranslationRunReport::with_reconciliation(
+                tasks.len(),
+                preparation.retained(),
+                preparation.invalidated(),
+                preparation.not_applicable(),
+                preparation.reused(),
+            )
+            .with_semantics(semantics);
+            report.record_planning_failures(&planning_failures);
 
         self.result_store
             .apply_preparation(project, preparation)
@@ -1922,15 +1987,17 @@ where
             return Ok(OperationCompletion::Cancelled);
         }
 
-        let max_in_flight = profile.max_in_flight_tasks().get();
+        let max_concurrent_requests = profile.max_concurrent_requests().get();
         let task_count = tasks.len();
+        let execution_worker_count =
+            execution_worker_count(task_count, max_concurrent_requests);
+        let local_in_flight_window = Arc::new(Semaphore::new(local_in_flight_window_count(
+            task_count,
+            max_concurrent_requests,
+        )));
         let pending_tasks = Arc::new(std::sync::Mutex::new(
             tasks.into_iter().collect::<VecDeque<_>>(),
         ));
-        let window_capacity = max_in_flight
-            .checked_mul(2)
-            .expect("Standard 执行窗口容量不得溢出 usize");
-        let execution_window = Arc::new(Semaphore::new(window_capacity));
         let stop_admission = Arc::new(AtomicBool::new(false));
         let (execution_sender, mut execution_receiver) =
             tokio::sync::mpsc::unbounded_channel::<ScheduledTaskCompletion<E::Error>>();
@@ -1940,14 +2007,14 @@ where
 
         let execution_lane = {
             let pending_tasks = Arc::clone(&pending_tasks);
-            let execution_window = Arc::clone(&execution_window);
             let stop_admission = Arc::clone(&stop_admission);
+            let local_in_flight_window = Arc::clone(&local_in_flight_window);
             async move {
                 let mut workers = FuturesUnordered::new();
-                for _ in 0..max_in_flight {
+                for _ in 0..execution_worker_count {
                     let pending_tasks = Arc::clone(&pending_tasks);
-                    let execution_window = Arc::clone(&execution_window);
                     let stop_admission = Arc::clone(&stop_admission);
+                    let local_in_flight_window = Arc::clone(&local_in_flight_window);
                     let execution_sender = execution_sender.clone();
                     workers.push(async move {
                         loop {
@@ -1957,14 +2024,13 @@ where
                                 break;
                             }
 
-                            let window_permit = Arc::clone(&execution_window)
+                            let in_flight_permit = Arc::clone(&local_in_flight_window)
                                 .acquire_owned()
                                 .await
-                                .expect("Standard 执行窗口信号量不得在运行中关闭");
+                                .expect("Standard 本地在途窗口在运行期间不得关闭");
                             if stop_admission.load(Ordering::Acquire)
                                 || self.cancellation.is_requested()
                             {
-                                drop(window_permit);
                                 break;
                             }
 
@@ -1980,6 +2046,9 @@ where
                             let task_index = task.index();
                             let execution =
                                 self.execute_planned_task(profile, task, task_count).await;
+                            if self.cancellation.is_requested() {
+                                break;
+                            }
                             if matches!(&execution, TaskExecutionCompletion::Failed { .. }) {
                                 stop_admission.store(true, Ordering::Release);
                             }
@@ -1987,7 +2056,7 @@ where
                                 .send(ScheduledTaskCompletion {
                                     task_index,
                                     execution,
-                                    window_permit,
+                                    in_flight_permit,
                                 })
                                 .is_err()
                             {
@@ -2070,7 +2139,7 @@ where
                         let PreparedScheduledTaskCompletion {
                             task_index: scheduled_task_index,
                             execution,
-                            window_permit,
+                            in_flight_permit,
                         } = completion;
 
                         match execution {
@@ -2082,6 +2151,7 @@ where
                                         outcome: StandardTranslationLogTaskOutcome::ExecutionFailed,
                                         attempts: None,
                                         retry_exhausted: false,
+                                        diagnostic: None,
                                     });
                                 if primary_failure.is_none() {
                                     primary_failure =
@@ -2105,6 +2175,7 @@ where
                                                 StandardTranslationLogTaskOutcome::InvalidResult,
                                             attempts: Some(outcome.attempts()),
                                             retry_exhausted: false,
+                                            diagnostic: None,
                                         },
                                     );
                                     if primary_failure.is_none() {
@@ -2123,6 +2194,7 @@ where
                                                 StandardTranslationLogTaskOutcome::NotCommitted,
                                             attempts: Some(outcome.attempts()),
                                             retry_exhausted: false,
+                                            diagnostic: None,
                                         },
                                     );
                                 } else {
@@ -2144,6 +2216,7 @@ where
                                                     StandardTranslationLogTaskOutcome::CommitFailed,
                                                 attempts: Some(outcome.attempts()),
                                                 retry_exhausted: false,
+                                                diagnostic: None,
                                             },
                                         );
                                         primary_failure =
@@ -2179,15 +2252,14 @@ where
                                                 outcome: observed_outcome,
                                                 attempts: Some(outcome.attempts()),
                                                 retry_exhausted,
+                                                diagnostic: outcome.request_diagnostic().cloned(),
                                             },
                                         );
                                     }
                                 }
                             }
                         }
-
-                        // 许可必须在对应任务完成提交和同步观察后才重新用于下一次补位。
-                        drop(window_permit);
+                        drop(in_flight_permit);
                     }
                 }
 
@@ -2217,9 +2289,26 @@ where
             }
         };
 
-        let (_, _, finalization) =
-            future::join3(execution_lane, preparation_lane, finalization_lane).await;
-        finalization
+            let (_, _, finalization) =
+                future::join3(execution_lane, preparation_lane, finalization_lane).await;
+            finalization
+        }
+        .await;
+
+        let storage_finalization = self.result_store.finalize().await;
+        match (operation, storage_finalization) {
+            (Ok(completion), Ok(())) => Ok(completion),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(source)) => {
+                Err(StandardTranslationServiceError::FinalizeResultStore(source))
+            }
+            (Err(primary), Err(finalization)) => {
+                Err(StandardTranslationServiceError::OperationAndFinalization {
+                    primary: Box::new(primary),
+                    finalization,
+                })
+            }
+        }
     }
 }
 
@@ -2241,31 +2330,11 @@ pub(crate) enum StandardTranslationServiceError<R, P, E, S> {
         expected_task_index: StandardTranslationTaskIndex,
         actual_task_index: Option<StandardTranslationTaskIndex>,
     },
-}
-
-/// Standard 翻译失败已经造成的最高层用户影响。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StandardTranslationFailureImpact {
-    ConfigurationOrInput,
-    ProjectState,
-    ExternalModel,
-    StateAppliedButFinalizationFailed,
-}
-
-impl<R, P, E, S> StandardTranslationServiceError<R, P, E, S> {
-    /// 将内部阶段失败归并为命令边界可以准确呈现的用户影响。
-    pub(crate) fn failure_impact(&self) -> StandardTranslationFailureImpact {
-        use StandardTranslationFailureImpact as Impact;
-
-        match self {
-            Self::ReadAssets(_) | Self::ApplyPreparation(_) | Self::CommitTask { .. } => {
-                Impact::ProjectState
-            }
-            Self::PlanTasks(_) => Impact::ConfigurationOrInput,
-            Self::ExecuteTask { .. } => Impact::ExternalModel,
-            Self::InvalidTaskResultSequence { .. } => Impact::StateAppliedButFinalizationFailed,
-        }
-    }
+    FinalizeResultStore(S),
+    OperationAndFinalization {
+        primary: Box<StandardTranslationServiceError<R, P, E, S>>,
+        finalization: S,
+    },
 }
 
 impl<R, P, E, S> fmt::Display for StandardTranslationServiceError<R, P, E, S>
@@ -2302,6 +2371,16 @@ where
                 formatter,
                 "标准翻译结果序列不完整：执行通道在任务 {expected_task_index} 返回前关闭"
             ),
+            Self::FinalizeResultStore(source) => {
+                write!(formatter, "标准翻译数据库会话收尾失败：{source}")
+            }
+            Self::OperationAndFinalization {
+                primary,
+                finalization,
+            } => write!(
+                formatter,
+                "{primary}；标准翻译数据库会话收尾也失败：{finalization}"
+            ),
         }
     }
 }
@@ -2320,6 +2399,8 @@ where
             Self::ApplyPreparation(source) => Some(source),
             Self::ExecuteTask { source, .. } => Some(source),
             Self::CommitTask { source, .. } => Some(source),
+            Self::FinalizeResultStore(source) => Some(source),
+            Self::OperationAndFinalization { primary, .. } => Some(primary.as_ref()),
             Self::InvalidTaskResultSequence { .. } => None,
         }
     }
@@ -2356,6 +2437,22 @@ mod tests {
             LanguageId::parse("ja").expect("测试源语言应合法"),
             LanguageId::parse("zh-Hans").expect("测试目标语言应合法"),
         )
+    }
+
+    #[test]
+    fn measured_strategy_keeps_two_extra_windows_beyond_request_workers() {
+        assert_eq!(execution_worker_count(0, 8), 0);
+        assert_eq!(execution_worker_count(3, 8), 3);
+        assert_eq!(execution_worker_count(100, 8), 8);
+        assert_eq!(execution_worker_count(usize::MAX, usize::MAX), usize::MAX);
+
+        assert_eq!(local_in_flight_window_count(0, 8), 0);
+        assert_eq!(local_in_flight_window_count(3, 8), 3);
+        assert_eq!(local_in_flight_window_count(100, 8), 24);
+        assert_eq!(
+            local_in_flight_window_count(usize::MAX, usize::MAX),
+            usize::MAX
+        );
     }
 
     #[test]
@@ -2442,12 +2539,12 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct FakeProfile {
-        max_in_flight_tasks: NonZeroUsize,
+        max_concurrent_requests: NonZeroUsize,
     }
 
     impl StandardTranslationProfile for FakeProfile {
-        fn max_in_flight_tasks(&self) -> NonZeroUsize {
-            self.max_in_flight_tasks
+        fn max_concurrent_requests(&self) -> NonZeroUsize {
+            self.max_concurrent_requests
         }
     }
 
@@ -2475,6 +2572,7 @@ mod tests {
         Complete,
         Partial,
         Unavailable,
+        RetryExhausted,
     }
 
     #[derive(Clone)]
@@ -2623,11 +2721,13 @@ mod tests {
     struct FakeStore {
         events: Arc<Mutex<Vec<Event>>>,
         preparations: Arc<Mutex<Vec<TranslationPlanPreparation>>>,
+        finalizations: Arc<AtomicUsize>,
         fail_preparation: bool,
         fail_commit_preparation_at: Arc<Vec<usize>>,
         block_commit_preparation_at: Option<(usize, Arc<Semaphore>)>,
         retained_commit_outcomes: Option<Arc<Mutex<Vec<Arc<TranslationTaskOutcome>>>>>,
         fail_commit_at: Option<usize>,
+        fail_finalization: bool,
     }
 
     impl StandardTranslationResultStore for FakeStore {
@@ -2694,6 +2794,15 @@ mod tests {
                 Ok(())
             }
         }
+
+        async fn finalize(&self) -> Result<(), Self::Error> {
+            self.finalizations.fetch_add(1, Ordering::SeqCst);
+            if self.fail_finalization {
+                Err(FakeError("finalize"))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -2706,7 +2815,7 @@ mod tests {
 
     impl StandardTranslationLog for FakeEventLog {
         fn emit(&self, event: StandardTranslationLogEvent) {
-            match event {
+            match &event {
                 StandardTranslationLogEvent::TaskStarted { task_index, .. } => {
                     record(&self.events, Event::LogTaskStarted(task_index.get()));
                     let started = self.started_not_finalized.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2760,6 +2869,7 @@ mod tests {
         max_active: Arc<AtomicUsize>,
         started_not_finalized: Arc<AtomicUsize>,
         max_started_not_finalized: Arc<AtomicUsize>,
+        finalizations: Arc<AtomicUsize>,
         cancellation: CooperativeCancellation,
     }
 
@@ -2833,6 +2943,7 @@ mod tests {
         let max_active = Arc::new(AtomicUsize::new(0));
         let started_not_finalized = Arc::new(AtomicUsize::new(0));
         let max_started_not_finalized = Arc::new(AtomicUsize::new(0));
+        let finalizations = Arc::new(AtomicUsize::new(0));
         let cancellation = CooperativeCancellation::default();
         Harness {
             service: StandardTranslationService::new(
@@ -2861,11 +2972,13 @@ mod tests {
                 FakeStore {
                     events: Arc::clone(&events),
                     preparations: Arc::clone(&preparations),
+                    finalizations: Arc::clone(&finalizations),
                     fail_preparation: preparation_failure,
                     fail_commit_preparation_at: Arc::new(Vec::new()),
                     block_commit_preparation_at: None,
                     retained_commit_outcomes: None,
                     fail_commit_at: commit_failure_at,
+                    fail_finalization: false,
                 },
                 FakeEventLog {
                     events: Arc::clone(&events),
@@ -2882,6 +2995,7 @@ mod tests {
             max_active,
             started_not_finalized,
             max_started_not_finalized,
+            finalizations,
             cancellation,
         }
     }
@@ -3008,8 +3122,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0]
         );
-        assert_eq!(committed(&events), [0]);
-        assert_eq!(logged_tasks(&events), [0]);
+        assert!(committed(&events).is_empty());
+        assert!(logged_tasks(&events).is_empty());
         assert!(!events.contains(&Event::LogTask(1)));
     }
 
@@ -3069,7 +3183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_refills_while_commit_preparation_is_still_running_within_two_window() {
+    async fn http_refills_while_an_earlier_commit_preparation_is_still_running() {
         let mut harness = harness(3, vec![1; 3], false, false, false, None, None);
         let gate = Arc::new(Semaphore::new(0));
         harness.service.result_store.block_commit_preparation_at = Some((0, Arc::clone(&gate)));
@@ -3090,15 +3204,15 @@ mod tests {
             assert!(before_release.contains(&Event::Complete(1)));
             assert!(!before_release.contains(&Event::PreparedCommit(0)));
             assert!(
-                !before_release.contains(&Event::Execute(2)),
-                "准备中与已准备任务仍必须占用 2N 窗口许可"
+                before_release.contains(&Event::Execute(2)),
+                "顺序提交等待不得占住模型执行许可"
             );
             gate.add_permits(1);
         };
 
         let (result, ()) = tokio::join!(run, observe_refill);
         result.expect("释放提交准备后运行应成功");
-        assert_eq!(harness.max_started_not_finalized.load(Ordering::SeqCst), 2);
+        assert_eq!(harness.max_started_not_finalized.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -3190,7 +3304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_tasks_refill_immediately_within_the_two_window_limit() {
+    async fn a_slow_first_task_does_not_stop_later_http_refill() {
         let mut harness = harness(12, vec![1; 12], false, false, false, None, None);
         let gate = Arc::new(Semaphore::new(0));
         harness.service.task_executor.block_at = Some((0, Arc::clone(&gate)));
@@ -3202,29 +3316,16 @@ mod tests {
         let run = harness.service.run(&project, &profile, input);
         let observe_refill = async move {
             for _ in 0..10_000 {
-                if events(&recorded_events).contains(&Event::Execute(7)) {
+                if events(&recorded_events).contains(&Event::Complete(11)) {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
             let before_release = events(&recorded_events);
-            assert!(
-                before_release.contains(&Event::Execute(4))
-                    && before_release.contains(&Event::Execute(5))
-                    && before_release.contains(&Event::Execute(6)),
-                "B/C/D 完成后必须在 A 释放前补入 E/F/G"
-            );
+            assert!((1..12).all(|index| before_release.contains(&Event::Complete(index))));
             assert!(
                 !before_release.contains(&Event::Complete(0)),
                 "观察补位时 A 必须仍被闸门阻塞"
-            );
-
-            for _ in 0..100 {
-                tokio::task::yield_now().await;
-            }
-            assert!(
-                !events(&recorded_events).contains(&Event::Execute(8)),
-                "A 未最终化时 started-not-finalized 不得越过 2N 窗口"
             );
             gate.add_permits(1);
         };
@@ -3233,11 +3334,11 @@ mod tests {
         result.expect("释放 A 后全部任务应该成功");
         let events = events(&harness.events);
         assert_eq!(committed(&events), (0..12).collect::<Vec<_>>());
-        assert_eq!(harness.max_started_not_finalized.load(Ordering::SeqCst), 8);
+        assert_eq!(harness.max_started_not_finalized.load(Ordering::SeqCst), 12);
     }
 
     #[tokio::test]
-    async fn two_window_limit_remains_reusable_after_a_finalized_prefix() {
+    async fn refill_remains_unblocked_after_a_finalized_prefix() {
         let mut harness = harness(20, vec![1; 20], false, false, false, None, None);
         let gate = Arc::new(Semaphore::new(0));
         harness.service.task_executor.block_at = Some((8, Arc::clone(&gate)));
@@ -3252,7 +3353,7 @@ mod tests {
             for _ in 0..10_000 {
                 let current_events = events(&recorded_events);
                 if current_events.contains(&Event::LogTask(7))
-                    && current_events.contains(&Event::Execute(15))
+                    && current_events.contains(&Event::Complete(19))
                 {
                     break;
                 }
@@ -3265,23 +3366,14 @@ mod tests {
                 "中段慢任务开始前必须已经成功最终化一段前缀"
             );
             assert!(
-                (12..=15).all(|index| before_release.contains(&Event::Execute(index))),
-                "中段任务 8 阻塞后仍必须补入后续 N 个任务"
+                (9..=19).all(|index| before_release.contains(&Event::Complete(index))),
+                "中段慢任务不得阻止其余 HTTP 工作继续补位"
             );
             assert_eq!(
                 started_not_finalized.load(Ordering::SeqCst),
-                8,
-                "滑动窗口在任意阶段都必须允许最多 2N 个已启动未最终化任务"
+                12,
+                "已完成但等待自然顺序提交的结果应留在内存，而不是阻塞模型请求"
             );
-            assert!(
-                !before_release.contains(&Event::Execute(16)),
-                "中段慢任务未最终化时不得越过 2N 窗口"
-            );
-
-            for _ in 0..100 {
-                tokio::task::yield_now().await;
-            }
-            assert!(!events(&recorded_events).contains(&Event::Execute(16)));
             gate.add_permits(1);
         };
 
@@ -3289,7 +3381,7 @@ mod tests {
         result.expect("释放中段慢任务后全部任务应该成功");
         let events = events(&harness.events);
         assert_eq!(committed(&events), (0..20).collect::<Vec<_>>());
-        assert_eq!(harness.max_started_not_finalized.load(Ordering::SeqCst), 8);
+        assert_eq!(harness.max_started_not_finalized.load(Ordering::SeqCst), 12);
     }
 
     #[test]
@@ -3431,24 +3523,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_does_not_hide_a_started_task_execution_failure() {
+    async fn business_cancellation_discards_the_wakeup_failure_from_a_started_task() {
         let mut harness = harness(1, vec![1], false, false, false, Some(0), None);
         harness.service.task_executor.cancel_on_start = Some((0, harness.cancellation.clone()));
 
-        let error = harness
+        let completion = harness
             .service
             .run(&project(), &profile(1), input())
             .await
-            .expect_err("取消后发生的已启动任务技术错误仍必须上交");
+            .expect("业务取消唤醒请求等待不是模型技术错误");
 
-        assert!(matches!(
-            error,
-            StandardTranslationServiceError::ExecuteTask {
-                task_index,
-                source: FakeError("execute")
-            } if task_index == StandardTranslationTaskIndex::new(0)
-        ));
-        assert_all_started_tasks_observed(&harness.log_records);
+        assert_eq!(completion, OperationCompletion::Cancelled);
+        assert!(logged_tasks(&events(&harness.events)).is_empty());
     }
 
     #[tokio::test]
@@ -3528,6 +3614,7 @@ mod tests {
                 outcome: StandardTranslationLogTaskOutcome::CommitFailed,
                 attempts: Some(_),
                 retry_exhausted: false,
+                diagnostic: None,
             } if *task_index == StandardTranslationTaskIndex::new(1)
         )));
     }
@@ -3739,6 +3826,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_exhaustion_keeps_its_safe_request_diagnostic_in_the_observation_event() {
+        let harness = harness_with_behavior(
+            1,
+            vec![1],
+            false,
+            false,
+            false,
+            None,
+            None,
+            empty_preparation(),
+            vec![FakeOutcomeKind::RetryExhausted],
+        );
+
+        let report = expect_completed(
+            harness
+                .service
+                .run(&project(), &profile(1), input())
+                .await
+                .expect("网络预算耗尽应保留进度并完成运行"),
+        );
+        assert_eq!(report.unavailable_tasks(), 1);
+
+        let records = harness.log_records.lock().expect("日志事件记录锁不应中毒");
+        let diagnostic = records
+            .iter()
+            .find_map(|event| match event {
+                StandardTranslationLogEvent::TaskFinished {
+                    outcome: StandardTranslationLogTaskOutcome::Unavailable,
+                    attempts: Some(attempts),
+                    retry_exhausted: true,
+                    diagnostic: Some(diagnostic),
+                    ..
+                } if attempts.get() == 3 => Some(diagnostic),
+                _ => None,
+            })
+            .expect("任务观察必须携带重试耗尽的安全诊断");
+        assert!(matches!(
+            &diagnostic.reason,
+            crate::diagnostic::DiagnosticReason::Http {
+                status: Some(503),
+                retry_after_seconds: Some(2),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn each_pre_execution_failure_stops_all_later_stages() {
         let cases = [
             (
@@ -3769,7 +3903,52 @@ mod tests {
                 error.source().expect("阶段错误应保留 source").to_string(),
                 expected_source
             );
+            assert_eq!(harness.finalizations.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn successful_operation_reports_a_store_finalization_failure() {
+        let mut harness = harness(0, Vec::new(), false, false, false, None, None);
+        harness.service.result_store.fail_finalization = true;
+
+        let error = harness
+            .service
+            .run(&project(), &profile(1), input())
+            .await
+            .expect_err("存储收尾失败不能伪装成成功");
+
+        assert!(matches!(
+            error,
+            StandardTranslationServiceError::FinalizeResultStore(FakeError("finalize"))
+        ));
+        assert_eq!(harness.finalizations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operation_and_store_finalization_failures_are_both_preserved() {
+        let mut harness = harness(0, Vec::new(), true, false, false, None, None);
+        harness.service.result_store.fail_finalization = true;
+
+        let error = harness
+            .service
+            .run(&project(), &profile(1), input())
+            .await
+            .expect_err("主失败和收尾失败必须聚合");
+
+        let StandardTranslationServiceError::OperationAndFinalization {
+            primary,
+            finalization,
+        } = &error
+        else {
+            panic!("必须同时保留两个失败")
+        };
+        assert!(matches!(
+            primary.as_ref(),
+            StandardTranslationServiceError::ReadAssets(FakeError("read"))
+        ));
+        assert_eq!(*finalization, FakeError("finalize"));
+        assert_eq!(harness.finalizations.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3781,9 +3960,9 @@ mod tests {
         assert_send(harness.service.run(&project, &profile, input()));
     }
 
-    fn profile(max_in_flight_tasks: usize) -> FakeProfile {
+    fn profile(max_concurrent_requests: usize) -> FakeProfile {
         FakeProfile {
-            max_in_flight_tasks: NonZeroUsize::new(max_in_flight_tasks)
+            max_concurrent_requests: NonZeroUsize::new(max_concurrent_requests)
                 .expect("测试并发上限必须非零"),
         }
     }
@@ -3937,6 +4116,35 @@ mod tests {
                                 },
                             )
                         })
+                        .collect(),
+                ),
+            },
+            FakeOutcomeKind::RetryExhausted => TranslationTaskOutcome::Unavailable {
+                context: TranslationTaskOutcomeContext::new(
+                    task_index,
+                    NonZeroUsize::new(3).expect("测试尝试数必须非零"),
+                    Vec::new(),
+                ),
+                final_response: None,
+                reason: TranslationTaskUnavailableReason::RecoverableRequestExhausted {
+                    diagnostic: SafeDiagnostic::new(
+                        crate::diagnostic::DiagnosticCode::ModelRequest,
+                        crate::diagnostic::DiagnosticStage::ModelRequest,
+                        crate::diagnostic::DiagnosticSubject::component("test provider"),
+                        crate::diagnostic::DiagnosticReason::Http {
+                            status: Some(503),
+                            retry_after_seconds: Some(2),
+                            provider_code: Some("busy".to_owned()),
+                            provider_type: Some("service_error".to_owned()),
+                        },
+                        crate::diagnostic::DiagnosticImpact::ProgressPreserved,
+                        crate::diagnostic::DiagnosticAction::CheckModelService,
+                    ),
+                },
+                unresolved: test_non_empty(
+                    expected
+                        .iter()
+                        .map(|output| unresolved(output, TranslationUnitRejectionReason::Missing))
                         .collect(),
                 ),
             },

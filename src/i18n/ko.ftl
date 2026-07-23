@@ -50,21 +50,6 @@ cli-argument-conflict = { $argument }은(는) 함께 제공된 다른 인수와 
 cli-wrong-number-of-values = { $argument }에 제공된 값의 개수가 올바르지 않습니다.
 cli-invalid-utf8 = 명령줄 인수가 올바른 Unicode가 아닙니다.
 cli-parse-failure = 명령줄을 해석할 수 없습니다.
-error-configuration-or-input-generic = 구성 또는 명령 입력이 잘못되어 아무것도 변경하지 않았습니다. 안내된 옵션과 구성 필드를 확인한 뒤 다시 시도하세요.
-error-config-current-directory-not-absolute = 현재 작업 디렉터리 { $path }이 절대 경로가 아니어서 ATT가 --config를 확인할 수 없습니다. 올바른 디렉터리에서 ATT를 시작하거나 절대 구성 경로를 지정하세요.
-error-config-empty-path = --config는 비워 둘 수 없습니다. ATT 구성 파일 경로를 지정하세요.
-error-config-open = 구성 파일 { $path }을 열 수 없습니다. 파일이 있고 읽기 권한이 있는지 확인하세요.
-error-config-not-a-file = 구성 경로 { $path }은 일반 파일이 아닙니다. 디렉터리나 특수 파일 대신 구성 파일을 지정하세요.
-error-config-too-large = 구성 파일 { $path }의 크기는 { $observed }바이트이며 제한은 { $maximum }바이트입니다. 파일을 줄인 뒤 다시 시도하세요.
-error-config-read = 구성 파일 { $path }을 읽을 수 없습니다. 권한과 저장소 상태를 확인한 뒤 다시 시도하세요.
-error-config-invalid-utf8-known-length = 구성 파일 { $path }은 올바른 UTF-8이 아닙니다. 유효한 접두부는 { $valid }바이트이고 잘못된 시퀀스는 { $length }바이트입니다. UTF-8로 저장한 뒤 다시 시도하세요.
-error-config-invalid-utf8-unknown-length = 구성 파일 { $path }은 { $valid }바이트 뒤부터 올바른 UTF-8이 아닙니다. UTF-8로 저장한 뒤 다시 시도하세요.
-error-config-invalid-toml-at = 구성 파일 { $path }의 { $line }행 { $column }열에 있는 { $resource }의 TOML이 잘못되었습니다. 현재 구성 계약에 맞게 고친 뒤 다시 시도하세요.
-error-config-invalid-toml = 구성 파일 { $path }의 { $resource }에 잘못된 TOML이 있습니다. 현재 구성 계약에 맞게 고친 뒤 다시 시도하세요.
-error-config-invalid-value = 구성 필드 { $field }의 값이 잘못되었습니다. 현재 구성 문서에서 해당 필드를 확인한 뒤 다시 시도하세요.
-error-config-invalid-value-at-path = 구성 파일 { $path }의 필드 { $field } 값이 잘못되었습니다. 현재 구성 문서에서 해당 필드를 확인한 뒤 다시 시도하세요.
-error-config-profile-not-found = 구성 파일 { $path }에 { $profile }이라는 번역 Profile이 없습니다. 추가하거나 기존 Profile의 ID를 지정하세요.
-error-config-profile-conflict = 구성 파일 { $path }은 Profile { $requested }을 요청했지만 명령에서 이미 { $explicit }을 선택했습니다. 두 위치에서 같은 Profile을 사용하거나 한 선택을 제거하세요.
 log-label-phase-check-project = 프로젝트 확인
 log-label-phase-scan-source = 원본 검색
 log-label-phase-prepare-candidate = 후보 준비
@@ -84,19 +69,7 @@ log-label-task-complete = 완료
 log-label-task-partial = 일부 사용 가능
 log-label-task-unavailable = 사용 불가
 log-label-task-failed = 실패
-error-project-unavailable = 프로젝트가 없거나 사용 중입니다. 이름을 확인하고 다른 실행이 끝난 뒤 다시 시도하세요.
-error-project-state = 프로젝트 상태가 손상되었거나 추출이 오래되었습니다. 관련 Init 또는 Extract 명령을 다시 실행하세요.
-error-external-model = 모델 서비스를 사용할 수 없습니다. Profile과 네트워크를 확인한 뒤 다시 시도하세요.
 error-state-applied-finalization = 결과는 적용되었지만 마무리에 실패했습니다. 재시도 전에 프로젝트 상태를 확인하세요.
-error-outcome-unknown = 최종 결과를 확인할 수 없습니다. 작업 공간을 보존하고 복구 정보를 확인한 뒤 다시 시도하세요.
-error-internal = ATT 내부 오류가 발생했습니다. 비밀 정보나 모델 내용은 출력되지 않았습니다.
-error-shutdown = 필수 런타임 마무리에 실패했습니다.
-error-no-reusable-extract-plan = 이 프로젝트에는 저장된 Extract 계획이 없습니다. --builtin, --rules 또는 --lua 중 하나를 제공하세요.
-error-init-path-required = 이 프로젝트에는 저장된 Init 원본 경로가 없습니다. --path <DIR>을 제공하세요.
-error-profile-required = 이 프로젝트에는 저장된 Translate Profile이 없습니다. PROFILE_ID를 제공하세요.
-error-saved-profile-unavailable = 저장된 Profile { $profile }이 현재 구성에 없습니다. 유효한 Profile을 명시하세요.
-error-rpg-maker-prompt-unavailable = 선택한 locale { $locale }의 RPG Maker 프롬프트 구성 요소 { $component }({ $path })을(를) 사용할 수 없어 번역을 시작하지 않았습니다. 경로가 일반 파일을 가리키고, 내용이 비어 있지 않은 UTF-8 텍스트이며, 템플릿이 유효한지 확인하세요.
-error-rpg-maker-language-module-unavailable = { $source } → { $target }에 필요한 원문 언어 모듈이 없어 번역을 시작하지 않았습니다. 현재 구성에 모듈을 추가한 뒤 다시 시도하세요.
 error-no-executable-extract-owner = 지운 뒤 실행 가능한 Extract owner가 없어 계획을 저장하지 않았습니다.
 error-plan-save-failed-applied = 명령 결과는 적용되었지만 새 실행 계획을 저장하지 못했습니다. 다음 실행에서는 의도한 옵션을 명시하세요.
 error-plan-save-outcome-unknown = 명령 결과는 적용되었지만 실행 계획 커밋 결과를 확인할 수 없습니다. 다음 실행에서는 의도한 옵션을 명시하세요.
@@ -157,14 +130,56 @@ result-translate-plan-sources = 이번에 성공한 실행 계획을 저장했�
 log-run-started = 명령 { $command }이 시작되었습니다.
 log-run-succeeded = 명령 { $command }이 성공적으로 완료되었습니다.
 log-run-failed = 명령 { $command }이 실패했습니다.
+log-run-outcome-unknown = 명령 { $command }이 종료되었지만 최종 결과를 알 수 없습니다. 오류에 표시된 복구 위치를 따르십시오.
 log-run-cancelled = 명령 { $command }이 취소되었습니다.
+log-performance-counters = 성능 카운터: SQLite 트랜잭션 제어 시도 { $sqlite_control_attempted_total }회, 전체 후보 트리 검증 시작 { $candidate_validation_started }회, 완료 { $candidate_validation_completed }회.
 log-plan-resolved = 명령 { $command }의 계획 출처: { $source }.
-log-translate-plan-resolved = Translate 실행 계획을 확정했습니다. Profile 출처: { $profile_source }, Lua 출처: { $lua_source }.
 log-phase-started = 단계 시작: { $phase }.
 log-phase-finished = 단계 완료: { $phase }.
 log-retry-summary = { $count }회 재시도했습니다.
 log-no-work = 작업이 필요하지 않았습니다: { $reason }.
+log-no-work-translation-up-to-date = 번역이 현재 원본 및 프로필과 일치합니다
 log-partial-result = 주의가 필요한 부분 결과가 { $count }개 있습니다.
-log-publish-finished = 출력 게시 완료: { $path }.
 log-translation-task-started = 번역 작업 { $index }/{ $total } 시작.
 log-translation-task-finished = 번역 작업 { $index }이 결과 { $outcome }으로 종료되었습니다.
+log-translation-task-diagnostic = 번역 작업 { $index }이 { $attempts }회 시도 후 진단을 보고했습니다: { $diagnostic }
+diagnostic-title = 오류 [{ $code }]
+diagnostic-stage = 단계: { $stage }
+diagnostic-subject = 위치: { $subject }
+diagnostic-subject-value = { $kind ->
+    [command] 명령 { $value }
+    [field] 필드 { $value }
+    [project] 프로젝트 { $value }
+    [profile] 프로필 { $value }
+    [component] 구성 요소 { $value }
+   *[other] { $value }
+}
+diagnostic-reason = 원인: { $reason }
+diagnostic-impact = 영향: { $impact }
+diagnostic-action = 조치: { $action }
+diagnostic-recovery = 복구 위치: { $recovery }
+diagnostic-recovery-value = { $kind ->
+    [component] 구성 요소 { $value }
+    [transaction] 트랜잭션 { $value }
+   *[other] { $value }
+}
+diagnostic-related = 관련 오류 { $index }:
+diagnostic-stage-value = { $code ->
+    [process_output] 프로세스 출력
+   *[other] { $fallback }
+}
+diagnostic-impact-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-action-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-failure-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-io-kind-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-configuration-rule-value = { $code ->
+   *[other] { $fallback }{ $facts }
+}

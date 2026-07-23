@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::diagnostic::RecoveryFact;
 use crate::fingerprint::Sha256Fingerprint;
-use crate::rpg_maker::extract::rules::validate_rules_canonical_json;
+use crate::rpg_maker::extract::rules::{RulesProgramError, validate_rules_canonical_json};
 use crate::storage::sqlite::{
     ExecuteFinalTransactionError, QueryExistingDatabaseError, SqliteCommand,
     SqliteFinalTransactionExecutor, SqliteQuery, SqliteQueryExecutor, SqliteRow,
@@ -150,6 +151,53 @@ impl LuaProgramPhase {
     }
 }
 
+/// 运行方案中允许持久化为 Windows 路径的闭集对象。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunPlanPathPurpose {
+    InitSource,
+    LuaProgram,
+}
+
+impl RunPlanPathPurpose {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitSource => "Init 来源",
+            Self::LuaProgram => "Lua 主程序",
+        }
+    }
+}
+
+/// `serde_json` 的稳定错误类别；不保存可能含 Rules 正文的错误文本。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunPlanJsonErrorCategory {
+    Io,
+    Syntax,
+    Data,
+    Eof,
+}
+
+impl RunPlanJsonErrorCategory {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::Syntax => "syntax",
+            Self::Data => "data",
+            Self::Eof => "eof",
+        }
+    }
+}
+
+impl From<serde_json::error::Category> for RunPlanJsonErrorCategory {
+    fn from(value: serde_json::error::Category) -> Self {
+        match value {
+            serde_json::error::Category::Io => Self::Io,
+            serde_json::error::Category::Syntax => Self::Syntax,
+            serde_json::error::Category::Data => Self::Data,
+            serde_json::error::Category::Eof => Self::Eof,
+        }
+    }
+}
+
 /// 一个非空、内容身份已经固定的可信 Lua 主程序。
 ///
 /// `resolved_path` 使用 Windows 原始 UTF-16 单元保存。路径仅用于 chunk 名、模块搜索
@@ -180,7 +228,7 @@ impl LuaProgramSnapshot {
         resolved_path: PathBuf,
         source: Vec<u8>,
     ) -> Result<Self, InvalidRunPlanValue> {
-        validate_resolved_path(&resolved_path, "Lua 主程序")?;
+        validate_resolved_path(&resolved_path, RunPlanPathPurpose::LuaProgram)?;
         if source.is_empty() {
             return Err(InvalidRunPlanValue::EmptyLuaProgram);
         }
@@ -224,7 +272,7 @@ impl InitRunPlan {
     ///
     /// 调用方负责传入 Init 文件系统边界确认过的真实解析路径；此处不重新访问磁盘。
     pub(crate) fn new(source_path: PathBuf) -> Result<Self, InvalidRunPlanValue> {
-        validate_resolved_path(&source_path, "Init 来源")?;
+        validate_resolved_path(&source_path, RunPlanPathPurpose::InitSource)?;
         Ok(Self { source_path })
     }
 
@@ -296,22 +344,32 @@ impl fmt::Debug for ExtractRulesCanonicalJson {
 
 impl ExtractRulesCanonicalJson {
     pub(crate) fn new(canonical_json: String) -> Result<Self, InvalidRunPlanValue> {
-        let value: serde_json::Value = serde_json::from_str(&canonical_json)
-            .map_err(|_| InvalidRunPlanValue::InvalidRulesCanonicalJson)?;
+        let value: serde_json::Value = serde_json::from_str(&canonical_json).map_err(|source| {
+            InvalidRunPlanValue::InvalidRulesCanonicalJson {
+                line: usize_to_u64(source.line()),
+                column: usize_to_u64(source.column()),
+                category: source.classify().into(),
+            }
+        })?;
         let serde_json::Value::Array(rules) = &value else {
-            return Err(InvalidRunPlanValue::InvalidRulesCanonicalJson);
+            return Err(InvalidRunPlanValue::RulesCanonicalJsonNotArray);
         };
         if rules.is_empty() {
             return Err(InvalidRunPlanValue::EmptyRulesDefinition);
         }
-        let encoded = serde_json::to_string(&value)
-            .map_err(|_| InvalidRunPlanValue::InvalidRulesCanonicalJson)?;
+        let encoded = serde_json::to_string(&value).map_err(|source| {
+            InvalidRunPlanValue::RulesCanonicalJsonEncodingFailed {
+                line: usize_to_u64(source.line()),
+                column: usize_to_u64(source.column()),
+                category: source.classify().into(),
+            }
+        })?;
         if encoded != canonical_json {
             return Err(InvalidRunPlanValue::NonCanonicalRulesJson);
         }
         validate_rules_canonical_json(&canonical_json).map_err(|source| {
             InvalidRunPlanValue::InvalidRulesSemantics {
-                reason: source.to_string(),
+                fact: rules_program_recovery_fact(&source),
             }
         })?;
         Ok(Self(canonical_json))
@@ -320,6 +378,18 @@ impl ExtractRulesCanonicalJson {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn rules_program_recovery_fact(source: &RulesProgramError) -> Option<RecoveryFact> {
+    source
+        .safe_diagnostic(Path::new("extract_rules_definition.canonical_json"))
+        .recovery
+        .into_iter()
+        .next()
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 /// Translate 上次成功使用的 Profile 与该阶段当前 Lua 主程序。
@@ -420,63 +490,141 @@ pub(crate) enum ProjectRunPlanReplacement {
 /// 受信运行方案值无法建立。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InvalidRunPlanValue {
-    EmptyPath { purpose: &'static str },
-    RelativePath { purpose: &'static str },
-    PathContainsNul { purpose: &'static str },
-    InvalidWindowsPathEncoding { purpose: &'static str },
+    EmptyPath {
+        purpose: RunPlanPathPurpose,
+    },
+    RelativePath {
+        purpose: RunPlanPathPurpose,
+    },
+    PathContainsNul {
+        purpose: RunPlanPathPurpose,
+    },
+    InvalidWindowsPathEncoding {
+        purpose: RunPlanPathPurpose,
+    },
     EmptyLuaProgram,
+    LuaProgramHashLength {
+        actual: u64,
+    },
     LuaProgramHashMismatch,
     EmptyExtractOwners,
-    InvalidRulesCanonicalJson,
-    InvalidRulesSemantics { reason: String },
+    InvalidRulesCanonicalJson {
+        line: u64,
+        column: u64,
+        category: RunPlanJsonErrorCategory,
+    },
+    RulesCanonicalJsonNotArray,
+    RulesCanonicalJsonEncodingFailed {
+        line: u64,
+        column: u64,
+        category: RunPlanJsonErrorCategory,
+    },
+    InvalidRulesSemantics {
+        fact: Option<RecoveryFact>,
+    },
     NonCanonicalRulesJson,
     EmptyRulesDefinition,
     EmptyProfileId,
     ProfileIdHasOuterWhitespace,
 }
 
-impl fmt::Display for InvalidRunPlanValue {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl InvalidRunPlanValue {
+    /// 可供命令边界直接作为结构化诊断对象使用的闭集标签。
+    pub(crate) const fn safe_subject(&self) -> &'static str {
         match self {
-            Self::EmptyPath { purpose } => write!(formatter, "{purpose}路径不能为空"),
-            Self::RelativePath { purpose } => write!(formatter, "{purpose}路径必须是绝对路径"),
-            Self::PathContainsNul { purpose } => {
-                write!(formatter, "{purpose}路径不能包含 NUL")
+            Self::EmptyPath { purpose }
+            | Self::RelativePath { purpose }
+            | Self::PathContainsNul { purpose }
+            | Self::InvalidWindowsPathEncoding { purpose } => purpose.as_str(),
+            Self::EmptyLuaProgram => "lua_program.source",
+            Self::LuaProgramHashLength { .. } | Self::LuaProgramHashMismatch => {
+                "lua_program.source_sha256"
             }
-            Self::InvalidWindowsPathEncoding { purpose } => {
-                write!(
-                    formatter,
-                    "{purpose}路径不是完整的 Windows UTF-16LE 字节序列"
-                )
-            }
-            Self::EmptyLuaProgram => formatter.write_str("Lua 主程序正文不能为空"),
-            Self::LuaProgramHashMismatch => formatter.write_str("Lua 主程序正文与 SHA-256 不匹配"),
-            Self::EmptyExtractOwners => {
-                formatter.write_str("Extract 运行方案必须至少包含一个 owner")
-            }
-            Self::InvalidRulesCanonicalJson => {
-                formatter.write_str("Extract Rules 定义必须是 JSON 数组")
-            }
-            Self::InvalidRulesSemantics { reason } => {
-                write!(formatter, "Extract Rules 定义语义无效：{reason}")
-            }
-            Self::NonCanonicalRulesJson => {
-                formatter.write_str("Extract Rules 定义必须使用 canonical JSON")
-            }
-            Self::EmptyRulesDefinition => {
-                formatter.write_str("空 Extract Rules 定义表示停用，不能持久化为 active 方案")
-            }
-            Self::EmptyProfileId => formatter.write_str("Translate Profile ID 不能为空白"),
-            Self::ProfileIdHasOuterWhitespace => {
-                formatter.write_str("Translate Profile ID 不能包含首尾空白")
+            Self::EmptyExtractOwners => "extract_run_plan.owners",
+            Self::InvalidRulesCanonicalJson { .. }
+            | Self::RulesCanonicalJsonNotArray
+            | Self::RulesCanonicalJsonEncodingFailed { .. }
+            | Self::InvalidRulesSemantics { .. }
+            | Self::NonCanonicalRulesJson
+            | Self::EmptyRulesDefinition => "extract_rules_definition.canonical_json",
+            Self::EmptyProfileId | Self::ProfileIdHasOuterWhitespace => {
+                "translate_run_plan.profile_id"
             }
         }
+    }
+
+    /// 只由枚举字段重建的安全详情；不会读取任意错误文本或业务正文。
+    pub(crate) fn safe_detail(&self) -> String {
+        match self {
+            Self::EmptyPath { purpose } => format!("{}路径不能为空", purpose.as_str()),
+            Self::RelativePath { purpose } => {
+                format!("{}路径必须是绝对路径", purpose.as_str())
+            }
+            Self::PathContainsNul { purpose } => {
+                format!("{}路径不能包含 NUL", purpose.as_str())
+            }
+            Self::InvalidWindowsPathEncoding { purpose } => format!(
+                "{}路径不是完整的 Windows UTF-16LE 字节序列",
+                purpose.as_str()
+            ),
+            Self::EmptyLuaProgram => "Lua 主程序正文不能为空".to_owned(),
+            Self::LuaProgramHashLength { actual } => {
+                format!("Lua source_sha256 应为 32 字节，实际为 {actual} 字节")
+            }
+            Self::LuaProgramHashMismatch => "Lua 主程序正文与 SHA-256 不匹配".to_owned(),
+            Self::EmptyExtractOwners => "Extract 运行方案必须至少包含一个 owner".to_owned(),
+            Self::InvalidRulesCanonicalJson {
+                line,
+                column,
+                category,
+            } => format!(
+                "Extract Rules canonical JSON 无效：类别 {}，第 {line} 行第 {column} 列",
+                category.as_str()
+            ),
+            Self::RulesCanonicalJsonNotArray => {
+                "Extract Rules canonical JSON 根值必须是数组".to_owned()
+            }
+            Self::RulesCanonicalJsonEncodingFailed {
+                line,
+                column,
+                category,
+            } => format!(
+                "无法编码 Extract Rules canonical JSON：类别 {}，第 {line} 行第 {column} 列",
+                category.as_str()
+            ),
+            Self::InvalidRulesSemantics { .. } => {
+                "Extract Rules canonical JSON 语义无效".to_owned()
+            }
+            Self::NonCanonicalRulesJson => "Extract Rules 定义必须使用 canonical JSON".to_owned(),
+            Self::EmptyRulesDefinition => {
+                "空 Extract Rules 定义表示停用，不能持久化为 active 方案".to_owned()
+            }
+            Self::EmptyProfileId => "Translate Profile ID 不能为空白".to_owned(),
+            Self::ProfileIdHasOuterWhitespace => "Translate Profile ID 不能包含首尾空白".to_owned(),
+        }
+    }
+
+    /// Rules 语义所有者已经筛选并清理的附加事实，例如规则自然编号与字段名。
+    pub(crate) const fn recovery_fact(&self) -> Option<&RecoveryFact> {
+        match self {
+            Self::InvalidRulesSemantics { fact } => fact.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for InvalidRunPlanValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.safe_detail())
     }
 }
 
 impl Error for InvalidRunPlanValue {}
 
-fn validate_resolved_path(path: &Path, purpose: &'static str) -> Result<(), InvalidRunPlanValue> {
+fn validate_resolved_path(
+    path: &Path,
+    purpose: RunPlanPathPurpose,
+) -> Result<(), InvalidRunPlanValue> {
     if path.as_os_str().is_empty() {
         return Err(InvalidRunPlanValue::EmptyPath { purpose });
     }
@@ -498,7 +646,7 @@ fn encode_windows_path(path: &Path) -> Vec<u8> {
 
 fn decode_windows_path(
     bytes: Vec<u8>,
-    purpose: &'static str,
+    purpose: RunPlanPathPurpose,
 ) -> Result<PathBuf, InvalidRunPlanValue> {
     if bytes.is_empty() {
         return Err(InvalidRunPlanValue::EmptyPath { purpose });
@@ -516,23 +664,336 @@ fn decode_windows_path(
     Ok(path)
 }
 
-/// 数据库行无法恢复为当前唯一运行方案模型。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InvalidProjectRunPlans {
-    reason: String,
+/// 运行方案快照中的查询身份。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunPlanQuery {
+    Snapshot,
+    Singletons,
+    LuaPrograms,
 }
 
-impl InvalidProjectRunPlans {
-    pub(super) fn new(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
+impl RunPlanQuery {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Snapshot => "run_plan.snapshot",
+            Self::Singletons => "run_plan.singletons",
+            Self::LuaPrograms => "run_plan.lua_programs",
         }
     }
 }
 
+/// SQLite 值的稳定存储类型；不携带 TEXT/BLOB 正文。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunPlanSqliteType {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+impl RunPlanSqliteType {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "NULL",
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+        }
+    }
+}
+
+impl From<&SqliteValue> for RunPlanSqliteType {
+    fn from(value: &SqliteValue) -> Self {
+        match value {
+            SqliteValue::Null => Self::Null,
+            SqliteValue::Integer(_) => Self::Integer,
+            SqliteValue::Real(_) => Self::Real,
+            SqliteValue::Text(_) => Self::Text,
+            SqliteValue::Blob(_) => Self::Blob,
+        }
+    }
+}
+
+/// 一个字段允许的 SQLite 存储类型集合。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunPlanExpectedSqliteType {
+    Integer,
+    Text,
+    Blob,
+    TextOrNull,
+    BlobOrNull,
+}
+
+impl RunPlanExpectedSqliteType {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Integer => "INTEGER",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+            Self::TextOrNull => "TEXT 或 NULL",
+            Self::BlobOrNull => "BLOB 或 NULL",
+        }
+    }
+}
+
+/// 运行方案表中的闭集字段身份。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunPlanStorageField {
+    InitSourcePath,
+    ExtractBuiltinEnabled,
+    ExtractRulesEnabled,
+    ExtractLuaEnabled,
+    ExtractRulesCanonicalJson,
+    TranslateProfileId,
+    WriteBackLuaEnabled,
+    LuaPhase,
+    LuaSource,
+    LuaSourceSha256,
+    LuaResolvedPath,
+}
+
+impl RunPlanStorageField {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitSourcePath => "init_run_plan.source_path_utf16",
+            Self::ExtractBuiltinEnabled => "extract_run_plan.builtin_enabled",
+            Self::ExtractRulesEnabled => "extract_run_plan.rules_enabled",
+            Self::ExtractLuaEnabled => "extract_run_plan.lua_enabled",
+            Self::ExtractRulesCanonicalJson => "extract_rules_definition.canonical_json",
+            Self::TranslateProfileId => "translate_run_plan.profile_id",
+            Self::WriteBackLuaEnabled => "write_back_run_plan.lua_enabled",
+            Self::LuaPhase => "lua_program.phase",
+            Self::LuaSource => "lua_program.source",
+            Self::LuaSourceSha256 => "lua_program.source_sha256",
+            Self::LuaResolvedPath => "lua_program.resolved_path_utf16",
+        }
+    }
+}
+
+/// 运行方案与其旁表内容之间的闭集关联对象。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunPlanComponent {
+    ExtractPlan,
+    ExtractRulesDefinition,
+    ExtractLuaProgram,
+    TranslatePlan,
+    TranslateLuaProgram,
+    WriteBackPlan,
+    WriteBackLuaProgram,
+}
+
+impl RunPlanComponent {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExtractPlan => "extract_run_plan",
+            Self::ExtractRulesDefinition => "extract_rules_definition",
+            Self::ExtractLuaProgram => "lua_program[phase=extract]",
+            Self::TranslatePlan => "translate_run_plan",
+            Self::TranslateLuaProgram => "lua_program[phase=translate]",
+            Self::WriteBackPlan => "write_back_run_plan",
+            Self::WriteBackLuaProgram => "lua_program[phase=write_back]",
+        }
+    }
+}
+
+/// 数据库行无法恢复为当前唯一运行方案模型的闭集原因。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidProjectRunPlanReason {
+    UnexpectedResultSetCount {
+        query: RunPlanQuery,
+        expected: u64,
+        actual: u64,
+    },
+    UnexpectedRowCount {
+        query: RunPlanQuery,
+        expected: u64,
+        actual: u64,
+    },
+    UnexpectedColumnCount {
+        query: RunPlanQuery,
+        row: Option<u64>,
+        expected: u64,
+        actual: u64,
+    },
+    UnexpectedSqliteType {
+        field: RunPlanStorageField,
+        row: Option<u64>,
+        expected: RunPlanExpectedSqliteType,
+        actual: RunPlanSqliteType,
+    },
+    InvalidBoolean {
+        field: RunPlanStorageField,
+        actual: i64,
+    },
+    UnknownLuaPhase {
+        row: u64,
+        actual_utf8_bytes: u64,
+    },
+    DuplicateLuaPhase {
+        row: u64,
+        phase: LuaProgramPhase,
+    },
+    OrphanedComponent {
+        missing: RunPlanComponent,
+        present: RunPlanComponent,
+    },
+    IncompleteExtractOwnerFields {
+        builtin_present: bool,
+        rules_present: bool,
+        lua_present: bool,
+    },
+    PresenceMismatch {
+        flag: RunPlanStorageField,
+        component: RunPlanComponent,
+        enabled: bool,
+        present: bool,
+    },
+    InvalidValue {
+        field: RunPlanStorageField,
+        row: Option<u64>,
+        reason: InvalidRunPlanValue,
+    },
+}
+
+/// 数据库行无法恢复为当前唯一运行方案模型。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InvalidProjectRunPlans {
+    reason: InvalidProjectRunPlanReason,
+}
+
+impl InvalidProjectRunPlans {
+    fn from_reason(reason: InvalidProjectRunPlanReason) -> Self {
+        Self { reason }
+    }
+
+    pub(super) fn unexpected_snapshot_result_sets(actual: usize) -> Self {
+        Self::from_reason(InvalidProjectRunPlanReason::UnexpectedResultSetCount {
+            query: RunPlanQuery::Snapshot,
+            expected: 2,
+            actual: usize_to_u64(actual),
+        })
+    }
+
+    pub(crate) const fn safe_subject(&self) -> &'static str {
+        match &self.reason {
+            InvalidProjectRunPlanReason::UnexpectedResultSetCount { query, .. }
+            | InvalidProjectRunPlanReason::UnexpectedRowCount { query, .. }
+            | InvalidProjectRunPlanReason::UnexpectedColumnCount { query, .. } => query.as_str(),
+            InvalidProjectRunPlanReason::UnexpectedSqliteType { field, .. }
+            | InvalidProjectRunPlanReason::InvalidBoolean { field, .. }
+            | InvalidProjectRunPlanReason::InvalidValue { field, .. } => field.as_str(),
+            InvalidProjectRunPlanReason::UnknownLuaPhase { .. }
+            | InvalidProjectRunPlanReason::DuplicateLuaPhase { .. } => {
+                RunPlanStorageField::LuaPhase.as_str()
+            }
+            InvalidProjectRunPlanReason::OrphanedComponent { missing, .. } => missing.as_str(),
+            InvalidProjectRunPlanReason::IncompleteExtractOwnerFields { .. } => {
+                RunPlanComponent::ExtractPlan.as_str()
+            }
+            InvalidProjectRunPlanReason::PresenceMismatch { flag, .. } => flag.as_str(),
+        }
+    }
+
+    /// 只由闭集原因的数值、类型和静态标签重建；不会读取数据库正文。
+    pub(crate) fn safe_detail(&self) -> String {
+        match &self.reason {
+            InvalidProjectRunPlanReason::UnexpectedResultSetCount {
+                query,
+                expected,
+                actual,
+            } => format!(
+                "{} 应返回 {expected} 组结果，实际为 {actual} 组",
+                query.as_str()
+            ),
+            InvalidProjectRunPlanReason::UnexpectedRowCount {
+                query,
+                expected,
+                actual,
+            } => format!(
+                "{} 应返回 {expected} 行，实际为 {actual} 行",
+                query.as_str()
+            ),
+            InvalidProjectRunPlanReason::UnexpectedColumnCount {
+                query,
+                row,
+                expected,
+                actual,
+            } => format!(
+                "{}{}应返回 {expected} 列，实际为 {actual} 列",
+                query.as_str(),
+                render_row(*row)
+            ),
+            InvalidProjectRunPlanReason::UnexpectedSqliteType {
+                field,
+                row,
+                expected,
+                actual,
+            } => format!(
+                "{}{}应为 {}，实际为 {}",
+                field.as_str(),
+                render_row(*row),
+                expected.as_str(),
+                actual.as_str()
+            ),
+            InvalidProjectRunPlanReason::InvalidBoolean { field, actual } => {
+                format!("{} 只能是枚举值 0 或 1，实际为 {actual}", field.as_str())
+            }
+            InvalidProjectRunPlanReason::UnknownLuaPhase {
+                row,
+                actual_utf8_bytes,
+            } => format!(
+                "lua_program 第 {row} 行 phase 不在枚举 extract/translate/write_back 中；实际 TEXT 为 {actual_utf8_bytes} 字节，内容已隐藏"
+            ),
+            InvalidProjectRunPlanReason::DuplicateLuaPhase { row, phase } => format!(
+                "lua_program 第 {row} 行重复 phase 枚举值 {}",
+                phase.storage_name()
+            ),
+            InvalidProjectRunPlanReason::OrphanedComponent { missing, present } => {
+                format!("缺少 {}，但存在 {}", missing.as_str(), present.as_str())
+            }
+            InvalidProjectRunPlanReason::IncompleteExtractOwnerFields {
+                builtin_present,
+                rules_present,
+                lua_present,
+            } => format!(
+                "extract_run_plan 三个 owner 字段必须同时存在；builtin_enabled 存在={builtin_present}，rules_enabled 存在={rules_present}，lua_enabled 存在={lua_present}"
+            ),
+            InvalidProjectRunPlanReason::PresenceMismatch {
+                flag,
+                component,
+                enabled,
+                present,
+            } => format!(
+                "{}={enabled} 与 {} 存在={present} 不一致",
+                flag.as_str(),
+                component.as_str()
+            ),
+            InvalidProjectRunPlanReason::InvalidValue { field, row, reason } => format!(
+                "{}{}无效：{}",
+                field.as_str(),
+                render_row(*row),
+                reason.safe_detail()
+            ),
+        }
+    }
+
+    pub(crate) const fn recovery_fact(&self) -> Option<&RecoveryFact> {
+        match &self.reason {
+            InvalidProjectRunPlanReason::InvalidValue { reason, .. } => reason.recovery_fact(),
+            _ => None,
+        }
+    }
+}
+
+fn render_row(row: Option<u64>) -> String {
+    row.map_or_else(String::new, |row| format!(" 第 {row} 行 "))
+}
+
 impl fmt::Display for InvalidProjectRunPlans {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.reason)
+        formatter.write_str(&self.safe_detail())
     }
 }
 
@@ -543,10 +1004,11 @@ pub(super) fn decode_project_run_plans(
     lua_rows: Vec<SqliteRow>,
 ) -> Result<ProjectRunPlans, InvalidProjectRunPlans> {
     let [singleton_row] = <[SqliteRow; 1]>::try_from(singleton_rows).map_err(|rows| {
-        InvalidProjectRunPlans::new(format!(
-            "运行方案 singleton 查询应返回一行，实际为 {} 行",
-            rows.len()
-        ))
+        InvalidProjectRunPlans::from_reason(InvalidProjectRunPlanReason::UnexpectedRowCount {
+            query: RunPlanQuery::Singletons,
+            expected: 1,
+            actual: usize_to_u64(rows.len()),
+        })
     })?;
     let values = singleton_row.into_values();
     let [
@@ -558,10 +1020,12 @@ pub(super) fn decode_project_run_plans(
         translate_profile,
         write_back_lua,
     ] = <[SqliteValue; 7]>::try_from(values).map_err(|values| {
-        InvalidProjectRunPlans::new(format!(
-            "运行方案 singleton 查询应返回七列，实际为 {} 列",
-            values.len()
-        ))
+        InvalidProjectRunPlans::from_reason(InvalidProjectRunPlanReason::UnexpectedColumnCount {
+            query: RunPlanQuery::Singletons,
+            row: Some(1),
+            expected: 7,
+            actual: usize_to_u64(values.len()),
+        })
     })?;
 
     let mut lua_programs = decode_lua_programs(lua_rows)?;
@@ -569,16 +1033,21 @@ pub(super) fn decode_project_run_plans(
         SqliteValue::Null => None,
         SqliteValue::Blob(bytes) => Some(
             InitRunPlan::new(
-                decode_windows_path(bytes, "Init 来源")
-                    .map_err(|source| InvalidProjectRunPlans::new(source.to_string()))?,
+                decode_windows_path(bytes, RunPlanPathPurpose::InitSource).map_err(|reason| {
+                    invalid_project_value(RunPlanStorageField::InitSourcePath, None, reason)
+                })?,
             )
-            .map_err(|source| InvalidProjectRunPlans::new(source.to_string()))?,
+            .map_err(|reason| {
+                invalid_project_value(RunPlanStorageField::InitSourcePath, None, reason)
+            })?,
         ),
         value => {
-            return Err(InvalidProjectRunPlans::new(format!(
-                "Init 来源路径应为 BLOB 或 NULL，实际为 {}",
-                value.kind_name()
-            )));
+            return Err(unexpected_sqlite_type(
+                RunPlanStorageField::InitSourcePath,
+                None,
+                RunPlanExpectedSqliteType::BlobOrNull,
+                &value,
+            ));
         }
     };
 
@@ -588,13 +1057,19 @@ pub(super) fn decode_project_run_plans(
         .all(|value| matches!(value, SqliteValue::Null))
     {
         if lua_programs.contains_key(&LuaProgramPhase::Extract) {
-            return Err(InvalidProjectRunPlans::new(
-                "缺少 Extract 方案但存在 Extract Lua 主程序",
+            return Err(InvalidProjectRunPlans::from_reason(
+                InvalidProjectRunPlanReason::OrphanedComponent {
+                    missing: RunPlanComponent::ExtractPlan,
+                    present: RunPlanComponent::ExtractLuaProgram,
+                },
             ));
         }
         if !matches!(extract_rules_definition, SqliteValue::Null) {
-            return Err(InvalidProjectRunPlans::new(
-                "缺少 Extract 方案但存在 Extract Rules 定义",
+            return Err(InvalidProjectRunPlans::from_reason(
+                InvalidProjectRunPlanReason::OrphanedComponent {
+                    missing: RunPlanComponent::ExtractPlan,
+                    present: RunPlanComponent::ExtractRulesDefinition,
+                },
             ));
         }
         None
@@ -602,40 +1077,71 @@ pub(super) fn decode_project_run_plans(
         .iter()
         .any(|value| matches!(value, SqliteValue::Null))
     {
-        return Err(InvalidProjectRunPlans::new(
-            "Extract 方案三个 owner 字段必须同时存在",
+        return Err(InvalidProjectRunPlans::from_reason(
+            InvalidProjectRunPlanReason::IncompleteExtractOwnerFields {
+                builtin_present: !matches!(extract_values[0], SqliteValue::Null),
+                rules_present: !matches!(extract_values[1], SqliteValue::Null),
+                lua_present: !matches!(extract_values[2], SqliteValue::Null),
+            },
         ));
     } else {
-        let builtin = decode_boolean(extract_values[0].clone(), "Extract builtin_enabled")?;
-        let rules = decode_boolean(extract_values[1].clone(), "Extract rules_enabled")?;
-        let lua_enabled = decode_boolean(extract_values[2].clone(), "Extract lua_enabled")?;
+        let builtin = decode_boolean(
+            extract_values[0].clone(),
+            RunPlanStorageField::ExtractBuiltinEnabled,
+        )?;
+        let rules = decode_boolean(
+            extract_values[1].clone(),
+            RunPlanStorageField::ExtractRulesEnabled,
+        )?;
+        let lua_enabled = decode_boolean(
+            extract_values[2].clone(),
+            RunPlanStorageField::ExtractLuaEnabled,
+        )?;
         let rules_definition = match extract_rules_definition {
             SqliteValue::Null => None,
-            SqliteValue::Text(value) => Some(
-                ExtractRulesCanonicalJson::new(value)
-                    .map_err(|source| InvalidProjectRunPlans::new(source.to_string()))?,
-            ),
+            SqliteValue::Text(value) => {
+                Some(ExtractRulesCanonicalJson::new(value).map_err(|reason| {
+                    invalid_project_value(
+                        RunPlanStorageField::ExtractRulesCanonicalJson,
+                        None,
+                        reason,
+                    )
+                })?)
+            }
             value => {
-                return Err(InvalidProjectRunPlans::new(format!(
-                    "Extract Rules canonical_json 应为 TEXT 或 NULL，实际为 {}",
-                    value.kind_name()
-                )));
+                return Err(unexpected_sqlite_type(
+                    RunPlanStorageField::ExtractRulesCanonicalJson,
+                    None,
+                    RunPlanExpectedSqliteType::TextOrNull,
+                    &value,
+                ));
             }
         };
         if rules != rules_definition.is_some() {
-            return Err(InvalidProjectRunPlans::new(
-                "Extract rules_enabled 与 canonical Rules 定义不一致",
+            return Err(InvalidProjectRunPlans::from_reason(
+                InvalidProjectRunPlanReason::PresenceMismatch {
+                    flag: RunPlanStorageField::ExtractRulesEnabled,
+                    component: RunPlanComponent::ExtractRulesDefinition,
+                    enabled: rules,
+                    present: rules_definition.is_some(),
+                },
             ));
         }
         let lua_program = lua_programs.remove(&LuaProgramPhase::Extract);
         if lua_enabled != lua_program.is_some() {
-            return Err(InvalidProjectRunPlans::new(
-                "Extract lua_enabled 与 Extract Lua 主程序不一致",
+            return Err(InvalidProjectRunPlans::from_reason(
+                InvalidProjectRunPlanReason::PresenceMismatch {
+                    flag: RunPlanStorageField::ExtractLuaEnabled,
+                    component: RunPlanComponent::ExtractLuaProgram,
+                    enabled: lua_enabled,
+                    present: lua_program.is_some(),
+                },
             ));
         }
         Some(
-            ExtractRunPlan::new(builtin, rules_definition, lua_program)
-                .map_err(|source| InvalidProjectRunPlans::new(source.to_string()))?,
+            ExtractRunPlan::new(builtin, rules_definition, lua_program).map_err(|reason| {
+                invalid_project_value(RunPlanStorageField::ExtractBuiltinEnabled, None, reason)
+            })?,
         )
     };
 
@@ -643,21 +1149,27 @@ pub(super) fn decode_project_run_plans(
     let translate = match translate_profile {
         SqliteValue::Null => {
             if translate_lua.is_some() {
-                return Err(InvalidProjectRunPlans::new(
-                    "缺少 Translate 方案但存在 Translate Lua 主程序",
+                return Err(InvalidProjectRunPlans::from_reason(
+                    InvalidProjectRunPlanReason::OrphanedComponent {
+                        missing: RunPlanComponent::TranslatePlan,
+                        present: RunPlanComponent::TranslateLuaProgram,
+                    },
                 ));
             }
             None
         }
         SqliteValue::Text(profile_id) => Some(
-            TranslateRunPlan::new(profile_id, translate_lua)
-                .map_err(|source| InvalidProjectRunPlans::new(source.to_string()))?,
+            TranslateRunPlan::new(profile_id, translate_lua).map_err(|reason| {
+                invalid_project_value(RunPlanStorageField::TranslateProfileId, None, reason)
+            })?,
         ),
         value => {
-            return Err(InvalidProjectRunPlans::new(format!(
-                "Translate profile_id 应为 TEXT 或 NULL，实际为 {}",
-                value.kind_name()
-            )));
+            return Err(unexpected_sqlite_type(
+                RunPlanStorageField::TranslateProfileId,
+                None,
+                RunPlanExpectedSqliteType::TextOrNull,
+                &value,
+            ));
         }
     };
 
@@ -665,17 +1177,25 @@ pub(super) fn decode_project_run_plans(
     let write_back = match write_back_lua {
         SqliteValue::Null => {
             if write_back_lua_program.is_some() {
-                return Err(InvalidProjectRunPlans::new(
-                    "缺少 WriteBack 方案但存在 WriteBack Lua 主程序",
+                return Err(InvalidProjectRunPlans::from_reason(
+                    InvalidProjectRunPlanReason::OrphanedComponent {
+                        missing: RunPlanComponent::WriteBackPlan,
+                        present: RunPlanComponent::WriteBackLuaProgram,
+                    },
                 ));
             }
             None
         }
         value => {
-            let enabled = decode_boolean(value, "WriteBack lua_enabled")?;
+            let enabled = decode_boolean(value, RunPlanStorageField::WriteBackLuaEnabled)?;
             if enabled != write_back_lua_program.is_some() {
-                return Err(InvalidProjectRunPlans::new(
-                    "WriteBack lua_enabled 与 WriteBack Lua 主程序不一致",
+                return Err(InvalidProjectRunPlans::from_reason(
+                    InvalidProjectRunPlanReason::PresenceMismatch {
+                        flag: RunPlanStorageField::WriteBackLuaEnabled,
+                        component: RunPlanComponent::WriteBackLuaProgram,
+                        enabled,
+                        present: write_back_lua_program.is_some(),
+                    },
                 ));
             }
             Some(
@@ -694,17 +1214,48 @@ pub(super) fn decode_project_run_plans(
     })
 }
 
-fn decode_boolean(value: SqliteValue, field: &str) -> Result<bool, InvalidProjectRunPlans> {
+fn invalid_project_value(
+    field: RunPlanStorageField,
+    row: Option<u64>,
+    reason: InvalidRunPlanValue,
+) -> InvalidProjectRunPlans {
+    InvalidProjectRunPlans::from_reason(InvalidProjectRunPlanReason::InvalidValue {
+        field,
+        row,
+        reason,
+    })
+}
+
+fn unexpected_sqlite_type(
+    field: RunPlanStorageField,
+    row: Option<u64>,
+    expected: RunPlanExpectedSqliteType,
+    actual: &SqliteValue,
+) -> InvalidProjectRunPlans {
+    InvalidProjectRunPlans::from_reason(InvalidProjectRunPlanReason::UnexpectedSqliteType {
+        field,
+        row,
+        expected,
+        actual: actual.into(),
+    })
+}
+
+fn decode_boolean(
+    value: SqliteValue,
+    field: RunPlanStorageField,
+) -> Result<bool, InvalidProjectRunPlans> {
     match value {
         SqliteValue::Integer(0) => Ok(false),
         SqliteValue::Integer(1) => Ok(true),
-        SqliteValue::Integer(value) => Err(InvalidProjectRunPlans::new(format!(
-            "{field} 只能是 0 或 1，实际为 {value}"
-        ))),
-        value => Err(InvalidProjectRunPlans::new(format!(
-            "{field} 应为 INTEGER，实际为 {}",
-            value.kind_name()
-        ))),
+        SqliteValue::Integer(actual) => Err(InvalidProjectRunPlans::from_reason(
+            InvalidProjectRunPlanReason::InvalidBoolean { field, actual },
+        )),
+        value => Err(unexpected_sqlite_type(
+            field,
+            None,
+            RunPlanExpectedSqliteType::Integer,
+            &value,
+        )),
     }
 }
 
@@ -712,61 +1263,103 @@ fn decode_lua_programs(
     rows: Vec<SqliteRow>,
 ) -> Result<BTreeMap<LuaProgramPhase, LuaProgramSnapshot>, InvalidProjectRunPlans> {
     let mut programs = BTreeMap::new();
-    for row in rows {
+    for (index, row) in rows.into_iter().enumerate() {
+        let row_number = usize_to_u64(index).saturating_add(1);
         let values = row.into_values();
         let [phase, source, source_sha256, resolved_path] = <[SqliteValue; 4]>::try_from(values)
             .map_err(|values| {
-                InvalidProjectRunPlans::new(format!(
-                    "Lua 主程序查询应返回四列，实际为 {} 列",
-                    values.len()
-                ))
+                InvalidProjectRunPlans::from_reason(
+                    InvalidProjectRunPlanReason::UnexpectedColumnCount {
+                        query: RunPlanQuery::LuaPrograms,
+                        row: Some(row_number),
+                        expected: 4,
+                        actual: usize_to_u64(values.len()),
+                    },
+                )
             })?;
         let phase = match phase {
-            SqliteValue::Text(value) => LuaProgramPhase::from_storage_name(&value)
-                .ok_or_else(|| InvalidProjectRunPlans::new(format!("未知 Lua phase {value:?}")))?,
+            SqliteValue::Text(value) => {
+                LuaProgramPhase::from_storage_name(&value).ok_or_else(|| {
+                    InvalidProjectRunPlans::from_reason(
+                        InvalidProjectRunPlanReason::UnknownLuaPhase {
+                            row: row_number,
+                            actual_utf8_bytes: usize_to_u64(value.len()),
+                        },
+                    )
+                })?
+            }
             value => {
-                return Err(InvalidProjectRunPlans::new(format!(
-                    "Lua phase 应为 TEXT，实际为 {}",
-                    value.kind_name()
-                )));
+                return Err(unexpected_sqlite_type(
+                    RunPlanStorageField::LuaPhase,
+                    Some(row_number),
+                    RunPlanExpectedSqliteType::Text,
+                    &value,
+                ));
             }
         };
         let source = match source {
             SqliteValue::Blob(value) => value,
             value => {
-                return Err(InvalidProjectRunPlans::new(format!(
-                    "Lua source 应为 BLOB，实际为 {}",
-                    value.kind_name()
-                )));
+                return Err(unexpected_sqlite_type(
+                    RunPlanStorageField::LuaSource,
+                    Some(row_number),
+                    RunPlanExpectedSqliteType::Blob,
+                    &value,
+                ));
             }
         };
         let source_sha256 = match source_sha256 {
-            SqliteValue::Blob(value) => Sha256Fingerprint::from_slice(&value)
-                .map_err(|error| InvalidProjectRunPlans::new(error.to_string()))?,
+            SqliteValue::Blob(value) => Sha256Fingerprint::from_slice(&value).map_err(|error| {
+                invalid_project_value(
+                    RunPlanStorageField::LuaSourceSha256,
+                    Some(row_number),
+                    InvalidRunPlanValue::LuaProgramHashLength {
+                        actual: usize_to_u64(error.actual()),
+                    },
+                )
+            })?,
             value => {
-                return Err(InvalidProjectRunPlans::new(format!(
-                    "Lua source_sha256 应为 BLOB，实际为 {}",
-                    value.kind_name()
-                )));
+                return Err(unexpected_sqlite_type(
+                    RunPlanStorageField::LuaSourceSha256,
+                    Some(row_number),
+                    RunPlanExpectedSqliteType::Blob,
+                    &value,
+                ));
             }
         };
         let resolved_path = match resolved_path {
-            SqliteValue::Blob(value) => decode_windows_path(value, "Lua 主程序")
-                .map_err(|error| InvalidProjectRunPlans::new(error.to_string()))?,
+            SqliteValue::Blob(value) => decode_windows_path(value, RunPlanPathPurpose::LuaProgram)
+                .map_err(|reason| {
+                    invalid_project_value(
+                        RunPlanStorageField::LuaResolvedPath,
+                        Some(row_number),
+                        reason,
+                    )
+                })?,
             value => {
-                return Err(InvalidProjectRunPlans::new(format!(
-                    "Lua resolved_path_utf16 应为 BLOB，实际为 {}",
-                    value.kind_name()
-                )));
+                return Err(unexpected_sqlite_type(
+                    RunPlanStorageField::LuaResolvedPath,
+                    Some(row_number),
+                    RunPlanExpectedSqliteType::Blob,
+                    &value,
+                ));
             }
         };
         let snapshot = LuaProgramSnapshot::from_stored_parts(resolved_path, source, source_sha256)
-            .map_err(|error| InvalidProjectRunPlans::new(error.to_string()))?;
+            .map_err(|reason| {
+                invalid_project_value(
+                    RunPlanStorageField::LuaSourceSha256,
+                    Some(row_number),
+                    reason,
+                )
+            })?;
         if programs.insert(phase, snapshot).is_some() {
-            return Err(InvalidProjectRunPlans::new(format!(
-                "Lua phase {:?} 重复",
-                phase.storage_name()
-            )));
+            return Err(InvalidProjectRunPlans::from_reason(
+                InvalidProjectRunPlanReason::DuplicateLuaPhase {
+                    row: row_number,
+                    phase,
+                },
+            ));
         }
     }
     Ok(programs)
@@ -857,8 +1450,10 @@ where
             .query_existing_database_snapshot(
                 database_path.clone(),
                 vec![
-                    SqliteQuery::new(SELECT_RUN_PLAN_SINGLETONS, Vec::new()),
-                    SqliteQuery::new(SELECT_LUA_PROGRAMS, Vec::new()),
+                    SqliteQuery::new(SELECT_RUN_PLAN_SINGLETONS, Vec::new())
+                        .with_id("run_plan.singletons"),
+                    SqliteQuery::new(SELECT_LUA_PROGRAMS, Vec::new())
+                        .with_id("run_plan.lua_programs"),
                 ],
             )
             .await
@@ -868,10 +1463,7 @@ where
         if results.len() != 2 {
             return Err(ProjectRunPlanReadError::InvalidState {
                 path: database_path,
-                reason: InvalidProjectRunPlans::new(format!(
-                    "运行方案读取应返回两组结果，实际为 {} 组",
-                    results.len()
-                )),
+                reason: InvalidProjectRunPlans::unexpected_snapshot_result_sets(results.len()),
             });
         }
         let lua_rows = results.pop().expect("已确认有两组运行方案查询结果");
@@ -954,7 +1546,23 @@ impl<E> ProjectRunPlanReplaceError<E> {
     fn from_final_executor(path: PathBuf, error: ExecuteFinalTransactionError<E>) -> Self {
         match error {
             ExecuteFinalTransactionError::NotFound => Self::DatabaseNotFound { path },
-            ExecuteFinalTransactionError::RequirementFailed => Self::RequirementFailed { path },
+            ExecuteFinalTransactionError::RequirementFailed
+            | ExecuteFinalTransactionError::RequirementFailedWithRow { .. } => {
+                Self::RequirementFailed { path }
+            }
+            ExecuteFinalTransactionError::RequirementFailedWithRowOutcomeUnknown {
+                source, ..
+            } => Self::OutcomeUnknown {
+                path,
+                source: *source,
+            },
+            ExecuteFinalTransactionError::RequirementFailedWithRowAndFinalizationFailed {
+                source,
+                ..
+            } => Self::RollbackConfirmed {
+                path,
+                source: *source,
+            },
             ExecuteFinalTransactionError::NotCommitted(source) => {
                 Self::RollbackConfirmed { path, source }
             }
@@ -1113,16 +1721,12 @@ mod tests {
     use std::error::Error;
     use std::fmt;
     use std::num::NonZeroUsize;
-    use std::time::Duration;
 
     use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::runtime::sqlite::{
-        RusqliteFinalTransactionExecutor, RusqliteStorageConfiguration, SqliteJournalMode,
-        SqliteSynchronous,
-    };
+    use crate::runtime::sqlite::{RusqliteFinalTransactionExecutor, RusqliteStorageConfiguration};
 
     #[derive(Debug)]
     struct TestDriverError;
@@ -1140,20 +1744,7 @@ mod tests {
     }
 
     fn final_transaction_configuration() -> RusqliteStorageConfiguration {
-        RusqliteStorageConfiguration::new(
-            nonzero(1),
-            nonzero(1),
-            nonzero(1),
-            nonzero(1024 * 1024),
-            nonzero(64 * 1024),
-            nonzero(64 * 1024),
-            nonzero(100),
-            nonzero(1024 * 1024),
-            Duration::from_secs(2),
-            SqliteJournalMode::Delete,
-            SqliteSynchronous::Full,
-        )
-        .expect("测试 SQLite 配置应合法")
+        RusqliteStorageConfiguration::new(nonzero(1), nonzero(1024 * 1024))
     }
 
     struct OutcomeUnknownFinalExecutor;
@@ -1208,7 +1799,8 @@ mod tests {
 
         let encoded = encode_windows_path(&path);
         assert_eq!(
-            decode_windows_path(encoded, "测试路径").expect("任意非 NUL UTF-16 路径应无损恢复"),
+            decode_windows_path(encoded, RunPlanPathPurpose::LuaProgram)
+                .expect("任意非 NUL UTF-16 路径应无损恢复"),
             path
         );
     }
@@ -1481,7 +2073,8 @@ mod tests {
         assert_eq!(profile_id, "old-profile");
         assert_eq!(source, old_source);
         assert_eq!(
-            decode_windows_path(resolved_path, "测试旧 Lua 路径").expect("旧 Lua 路径应保持合法"),
+            decode_windows_path(resolved_path, RunPlanPathPurpose::LuaProgram)
+                .expect("旧 Lua 路径应保持合法"),
             old_path
         );
         connection.close().expect("测试读取连接应可关闭");

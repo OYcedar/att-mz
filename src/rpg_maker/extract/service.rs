@@ -767,13 +767,6 @@ mod tests {
                 source: FakeError("rules")
             } if rules_path == &PathBuf::from("custom/rules.toml")
         ));
-        assert_eq!(
-            rules_error
-                .source()
-                .and_then(|source| source.downcast_ref()),
-            Some(&FakeError("rules"))
-        );
-
         let lua_error = service(
             Arc::new(Mutex::new(Vec::new())),
             Some("lua"),

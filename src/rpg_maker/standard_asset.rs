@@ -4,7 +4,6 @@
 
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroUsize;
 
 use super::text::{RpgMakerLocation, RpgMakerSource, StandardDataFile, TextGroupKind};
 
@@ -202,24 +201,6 @@ fn location_kind(location: &RpgMakerLocation) -> &'static str {
         RpgMakerLocation::Value { .. } => "Value",
         RpgMakerLocation::NoteTag { .. } => "NoteTag",
         RpgMakerLocation::CommentTag { .. } => "CommentTag",
-    }
-}
-
-/// 标准资产读取时每个 CPU 解码作业的语义单元上限。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RpgMakerStandardAssetReadingConfig {
-    units_per_decode_job: NonZeroUsize,
-}
-
-impl RpgMakerStandardAssetReadingConfig {
-    pub(crate) const fn new(units_per_decode_job: NonZeroUsize) -> Self {
-        Self {
-            units_per_decode_job,
-        }
-    }
-
-    pub(crate) const fn units_per_decode_job(self) -> NonZeroUsize {
-        self.units_per_decode_job
     }
 }
 

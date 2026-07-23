@@ -50,21 +50,6 @@ cli-argument-conflict = { $argument } 不能与当前其他参数同时使用。
 cli-wrong-number-of-values = { $argument } 的值数量不正确。
 cli-invalid-utf8 = 命令行参数不是有效 Unicode。
 cli-parse-failure = 无法解析命令行。
-error-configuration-or-input-generic = 配置或命令输入无效，本次未作任何更改。请检查提示中的选项和配置字段后重试。
-error-config-current-directory-not-absolute = 当前工作目录 { $path } 不是绝对路径，因此无法解析 --config。请从有效目录启动 ATT，或传入配置文件的绝对路径。
-error-config-empty-path = --config 不能为空。请传入 ATT 配置文件路径。
-error-config-open = 无法打开配置文件 { $path }。请确认文件存在且当前用户拥有读取权限。
-error-config-not-a-file = 配置路径 { $path } 不是普通文件。请传入配置文件，而不是目录或特殊文件。
-error-config-too-large = 配置文件 { $path } 大小为 { $observed } 字节，超过 { $maximum } 字节上限。请缩小文件后重试。
-error-config-read = 无法读取配置文件 { $path }。请检查文件权限和存储状态后重试。
-error-config-invalid-utf8-known-length = 配置文件 { $path } 不是有效的 UTF-8；有效前缀为 { $valid } 字节，非法序列长度为 { $length } 字节。请将文件保存为 UTF-8 后重试。
-error-config-invalid-utf8-unknown-length = 配置文件 { $path } 从第 { $valid } 字节后不是有效的 UTF-8。请将文件保存为 UTF-8 后重试。
-error-config-invalid-toml-at = 配置文件 { $path } 第 { $line } 行第 { $column } 列的 { $resource } 包含无效 TOML。请按当前配置契约修正该处后重试。
-error-config-invalid-toml = 配置文件 { $path } 的 { $resource } 包含无效 TOML。请按当前配置契约修正该处后重试。
-error-config-invalid-value = 配置字段 { $field } 的值无效。请对照当前配置文档修正该字段后重试。
-error-config-invalid-value-at-path = 配置文件 { $path } 中字段 { $field } 的值无效。请对照当前配置文档修正该字段后重试。
-error-config-profile-not-found = 配置文件 { $path } 中不存在名为 { $profile } 的翻译 Profile。请添加该 Profile，或传入已有 Profile 的 ID。
-error-config-profile-conflict = 配置文件 { $path } 请求使用 Profile { $requested }，但命令已选择 { $explicit }。请统一两处 Profile，或移除其中一处选择。
 log-label-phase-check-project = 检查项目
 log-label-phase-scan-source = 扫描来源
 log-label-phase-prepare-candidate = 准备候选目录
@@ -84,19 +69,7 @@ log-label-task-complete = 完整
 log-label-task-partial = 部分可用
 log-label-task-unavailable = 不可用
 log-label-task-failed = 失败
-error-project-unavailable = 项目不存在或正忙。请检查项目名称，并在其他运行结束后重试。
-error-project-state = 项目状态损坏或提取已过期。请重新运行相关 Init 或 Extract 命令。
-error-external-model = 模型服务不可用。请检查 Profile 和网络后重试。
 error-state-applied-finalization = 结果已经生效，但收尾失败。重试前请先检查项目状态。
-error-outcome-unknown = 无法确认最终结果。请保留工作现场并检查恢复信息后再重试。
-error-internal = ATT 遇到内部故障；终端没有输出密钥或模型内容。
-error-shutdown = 必要运行时收尾失败。
-error-no-reusable-extract-plan = 该项目尚未保存过 Extract 方案。请至少提供 --builtin、--rules 或 --lua 之一。
-error-init-path-required = 该项目尚未保存 Init 来源路径。请提供 --path <DIR>。
-error-profile-required = 该项目尚未保存 Translate Profile。请提供 PROFILE_ID。
-error-saved-profile-unavailable = 当前配置中不存在已保存的 Profile { $profile }。请显式传入有效 Profile。
-error-rpg-maker-prompt-unavailable = 无法使用所选 locale { $locale } 的 RPG Maker 提示词组件 { $component }（{ $path }），翻译尚未开始。请确认该路径是普通文件，内容为非空 UTF-8 文本，且模板有效。
-error-rpg-maker-language-module-unavailable = 缺少 { $source } → { $target } 所需的源语言模块，翻译尚未开始。请在当前配置中补充该模块后重试。
 error-no-executable-extract-owner = 清除后没有可执行的 Extract owner，因此未保存方案。
 error-plan-save-failed-applied = 命令结果已生效，但新运行方案未保存。下次请显式传入预期选项。
 error-plan-save-outcome-unknown = 命令结果已生效，但无法确认运行方案提交结果。下次请显式传入预期选项。
@@ -157,14 +130,237 @@ result-translate-plan-sources = 已保存本次成功运行方案。Profile 来�
 log-run-started = 命令 { $command } 已开始。
 log-run-succeeded = 命令 { $command } 已成功完成。
 log-run-failed = 命令 { $command } 失败。
+log-run-outcome-unknown = 命令 { $command } 结束，但最终结果未知；请按错误中的恢复位置处理。
 log-run-cancelled = 命令 { $command } 已取消。
+log-performance-counters = 性能计数：SQLite 事务控制尝试 { $sqlite_control_attempted_total } 次；完整候选树校验开始 { $candidate_validation_started } 次，完成 { $candidate_validation_completed } 次。
 log-plan-resolved = 命令 { $command } 的方案来自{ $source }。
-log-translate-plan-resolved = 已解析 Translate 运行方案：Profile 来源 { $profile_source }，Lua 来源 { $lua_source }。
 log-phase-started = 阶段开始：{ $phase }。
 log-phase-finished = 阶段完成：{ $phase }。
 log-retry-summary = 共执行 { $count } 次重试。
 log-no-work = 无需执行工作：{ $reason }。
+log-no-work-translation-up-to-date = 译文已经与当前来源和配置档一致
 log-partial-result = 有 { $count } 个部分结果需要关注。
-log-publish-finished = 输出发布完成：{ $path }。
 log-translation-task-started = 翻译任务 { $index }/{ $total } 已开始。
 log-translation-task-finished = 翻译任务 { $index } 已结束，结果为 { $outcome }。
+log-translation-task-diagnostic = 翻译任务 { $index } 在尝试 { $attempts } 次后报告诊断：{ $diagnostic }
+diagnostic-title = 错误 [{ $code }]
+diagnostic-stage = 阶段：{ $stage }
+diagnostic-subject = 位置：{ $subject }
+diagnostic-subject-value = { $kind ->
+    [command] 命令 { $value }
+    [field] 字段 { $value }
+    [project] 项目 { $value }
+    [profile] 配置档 { $value }
+    [component] 组件 { $value }
+   *[other] { $value }
+}
+diagnostic-reason = 原因：{ $reason }
+diagnostic-impact = 影响：{ $impact }
+diagnostic-action = 处理办法：{ $action }
+diagnostic-recovery = 恢复位置：{ $recovery }
+diagnostic-recovery-value = { $kind ->
+    [component] 组件 { $value }
+    [transaction] 事务 { $value }
+   *[other] { $value }
+}
+diagnostic-related = 相关错误 { $index }：
+diagnostic-stage-value = { $code ->
+    [process_startup] 进程启动
+    [process_output] 进程输出
+    [configuration] 配置加载
+    [command_preparation] 命令准备
+    [project_opening] 项目打开
+    [init] 初始化
+    [extract] 提取
+    [translate] 翻译
+    [write_back] 写回
+    [model_request] 模型请求
+    [run_plan_finalization] 运行方案收尾
+    [publication] 发布
+    [shutdown] 关闭
+    [logging] 项目日志
+   *[other] { $fallback }
+}
+diagnostic-impact-value = { $code ->
+    [unchanged] 状态未改变
+    [valid_progress_preserved] 已保留有效进度
+    [result_applied_but_run_plan_not_saved] 结果已生效，但运行方案未保存
+    [state_applied_but_finalization_failed] 状态已生效，但收尾未完成
+    [recovery_required] 必须先恢复，才能信任当前状态
+    [outcome_unknown] 最终状态未知
+   *[other] { $fallback }
+}
+diagnostic-action-value = { $code ->
+    [fix_configuration] 修正指出的配置字段后重试
+    [fix_input] 修正指出的输入后重试
+    [check_path_and_permissions] 检查路径、文件系统状态和权限
+    [check_project_state] 检查并修正项目状态后重试
+    [retry_after_resolving_contention] 等待冲突操作结束后重试
+    [check_model_service] 检查模型服务响应和账户配额
+    [preserve_recovery_artifacts] 不要删除列出的恢复产物；先恢复输出，再重试
+    [retry] 重试该操作
+    [report_bug] 携带错误码和日志路径报告 ATT 缺陷
+   *[other] { $fallback }
+}
+diagnostic-failure-value = { $code ->
+    [missing_required_value] 缺少必填值
+    [extract_plan_required] 项目没有可复用的 Extract 方案；必须提供 --builtin、--rules 或 --lua 中的至少一项
+    [conflicting_values] 提供的值互相冲突
+    [invalid_syntax] 值的语法无效
+    [invalid_encoding] 文本编码无效
+    [invalid_value] 值不符合要求的契约
+    [not_found] 所需对象不存在
+    [busy] 资源正被另一项操作占用
+    [state_mismatch] 已保存的项目状态不满足本次操作
+    [requirement_failed] 必要前置条件未满足
+    [transaction_rolled_back] 事务失败，改动已回滚
+    [transaction_outcome_unknown] 事务结束时无法确认提交或回滚结果
+    [finalization_failed] 操作结果已经产生，但收尾失败
+    [rollback_failed] 主操作失败，并且回滚也失败
+    [external_service_rejected] 外部服务拒绝了请求
+    [external_service_unavailable] 外部服务当前不可用
+    [executor_closed] 执行服务正在关闭或已经关闭
+    [concurrent_shutdown] 另一个调用方正在关闭执行器
+    [executor_state_poisoned] 执行器生命周期状态已经损坏
+    [worker_spawn_failed] 操作系统无法创建工作线程
+    [worker_channel_closed] 工作线程命令通道在收尾完成前关闭
+    [worker_panicked] 工作线程异常终止
+    [reparse_point_forbidden] 路径包含不能信任的重解析点
+    [non_local_volume] 路径不在本地固定磁盘上
+    [non_ntfs_volume] 路径不在 NTFS 卷上
+    [case_sensitive_directory] 目录启用了区分大小写的名称语义
+    [lock_cancelled] 等待所需锁时操作被取消
+    [target_already_exists] 目标已经存在
+    [file_identity_changed] 操作期间文件物理身份发生变化
+    [allocation_failed] 无法分配所需内存
+    [invalid_path] 路径不是该操作的有效目标
+    [wrong_publisher_instance] 发布令牌属于另一个发布器实例
+    [journal_corrupt] 发布恢复日志损坏或不完整
+    [unexpected_artifact] 意外的文件系统产物阻塞了操作
+    [interactive_session_already_open] 已有 SQLite 交互会话处于活动状态
+    [backup_incomplete] SQLite 备份没有完成
+    [request_serialization_failed] 无法序列化模型请求
+    [response_parsing_failed] 模型响应不是有效 JSON
+    [invalid_response_contract] 模型响应不符合所需响应契约
+    [transport_failed] 收到有效响应前 HTTP 传输失败
+    [lua_database_open_failed] Lua Host 无法打开项目数据库会话
+    [lua_context_creation_failed] Lua 运行时无法建立 VM 上下文
+    [lua_compilation_failed] Lua 主程序编译失败
+    [lua_execution_failed] Lua 主程序运行失败
+    [lua_host_call_failed] Lua Host 能力调用失败
+    [lua_finalization_failed] Lua Host 无法完成所有绑定资源的收尾
+    [lua_unclosed_transaction] Lua 程序结束时事务仍未关闭；该事务已回滚
+    [lua_snapshot_store_failed] 无法提交已验证的 Lua 提取快照
+    [rules_definition_invalid] Rules 程序不符合 Rules 定义契约
+    [rules_document_read_failed] 无法读取 Rules 程序需要的来源文档
+    [rules_no_non_blank_match] Rules 条目没有产生任何非空白语义单元
+    [rules_invalid_target] Rules 条目选中的值不能作为文本目标
+    [rules_pattern_match_failed] 无法执行 Rules 的 PCRE2 模式
+    [rules_zero_width_match] Rules 模式产生了零宽匹配
+    [rules_overlapping_capture] Rules 模式产生了相互重叠的文本捕获
+    [rules_missing_text_capture] 必需的命名文本捕获没有参与匹配
+    [rules_invalid_capture_range] Rules 匹配或捕获范围不在有效 UTF-8 字符边界上
+    [rules_duplicate_target] 两个 Rules 条目声明了同一个物理文本目标
+    [rules_invalid_materialization] Rules 投影配方无法重建来源值
+    [rules_snapshot_invalid] 提取出的 Rules 组无法组成有效资产快照
+    [rules_snapshot_store_failed] 无法提交已验证的 Rules 提取快照
+    [write_back_extraction_out_of_date] 已提取资产不再匹配当前项目来源
+    [write_back_asset_snapshot_invalid] 已保存的 Standard 资产无法组成有效写回快照
+    [write_back_document_invalid] RPG Maker 来源文档不符合所需文档格式
+    [write_back_mutation_invalid] 已验证的译文修改无法应用到冻结来源位置
+    [write_back_output_path_invalid] 改写文件位于允许的 RPG Maker 输出树之外
+    [write_back_output_path_duplicate] 多个改写文件指向同一输出路径
+    [write_back_candidate_project_mismatch] 写回候选属于另一个项目
+    [write_back_candidate_invalid] 写回候选不符合所需的 data/js 目录结构
+    [write_back_unexpected_lua_outcome] Lua 写回程序返回了其他 Lua 阶段的结果
+    [write_back_not_published] 写回候选没有替换当前输出目录
+    [write_back_published_with_residuals] 输出已发布，但部分恢复产物无法删除
+    [write_back_recovery_required] 必须先恢复输出目录，才能信任其中内容
+    [internal_invariant] 内部不变量被破坏；这是 ATT 缺陷
+   *[other] { $fallback }
+}
+diagnostic-io-kind-value = { $code ->
+    [not_found] 对象不存在
+    [permission_denied] 权限不足
+    [connection_refused] 连接被拒绝
+    [connection_reset] 连接被重置
+    [host_unreachable] 主机不可达
+    [network_unreachable] 网络不可达
+    [connection_aborted] 连接被中止
+    [not_connected] 尚未连接
+    [address_in_use] 地址已被占用
+    [address_not_available] 地址不可用
+    [network_down] 网络已断开
+    [broken_pipe] 管道已断开
+    [already_exists] 对象已存在
+    [would_block] 操作会阻塞
+    [not_a_directory] 对象不是目录
+    [is_a_directory] 对象是目录
+    [directory_not_empty] 目录不为空
+    [read_only_filesystem] 文件系统为只读
+    [stale_network_file_handle] 网络文件句柄已经失效
+    [invalid_input] 操作输入无效
+    [invalid_data] 数据无效
+    [timed_out] 操作超时
+    [write_zero] 写入没有取得进展
+    [storage_full] 存储空间已满
+    [not_seekable] 对象不支持定位
+    [quota_exceeded] 存储配额已用尽
+    [file_too_large] 文件超过底层系统可表示范围
+    [resource_busy] 资源正忙
+    [executable_file_busy] 可执行文件正被占用
+    [deadlock] 操作会造成死锁
+    [crosses_devices] 操作跨越文件系统设备
+    [too_many_links] 文件系统链接过多
+    [invalid_filename] 文件名无效
+    [argument_list_too_long] 操作系统参数列表过长
+    [interrupted] 操作被中断
+    [unsupported] 不支持该操作
+    [unexpected_eof] 文件意外结束
+    [out_of_memory] 操作系统无法分配内存
+    [other] 其他操作系统错误
+   *[unknown] { $fallback }
+}
+diagnostic-configuration-rule-value = { $code ->
+    [runtime_configuration_invalid] 运行时配置无效{ $facts }
+    [unsupported_prompt_locale] 必须是小写 auto 或受支持的 BCP 47 界面语言{ $facts }
+    [language_policy_term_blank] 语言策略术语不能为空{ $facts }
+    [language_policy_term_surrounding_whitespace] 语言策略术语不能带首尾空白{ $facts }
+    [language_policy_term_duplicate] 语言策略术语不能重复{ $facts }
+    [quote_repair_candidates_empty] 引号修复候选不能为空{ $facts }
+    [quote_repair_delimiter_invalid] 引号分隔符必须是单个非空白字符{ $facts }
+    [quote_repair_pair_duplicate] 引号修复对不能重复{ $facts }
+    [quote_repair_delimiter_ambiguous] 同一引号分隔符不能同时承担冲突角色{ $facts }
+    [language_id_blank] 语言 ID 不能为空{ $facts }
+    [language_id_surrounding_whitespace] 语言 ID 不能带首尾空白{ $facts }
+    [language_id_uses_underscore] 语言 ID 必须使用连字符，不能使用下划线{ $facts }
+    [language_id_invalid_syntax] 语言 ID 不是有效 BCP 47 标签{ $facts }
+    [language_id_invalid_registry_tag] 语言 ID 不是 IANA 注册标签{ $facts }
+    [language_id_canonicalization_failed] 语言 ID 无法规范化{ $facts }
+    [language_id_undefined_primary_language] 语言 ID 的主语言未定义{ $facts }
+    [language_id_duplicate] 语言 ID 不能重复{ $facts }
+    [language_catalog_empty] 语言目录必须至少包含一种语言{ $facts }
+    [url_invalid] URL 无效{ $facts }
+    [url_credentials_forbidden] URL 不能包含用户名或密码{ $facts }
+    [url_fragment_forbidden] URL 不能包含片段{ $facts }
+    [url_scheme_unsupported] URL 必须使用 http 或 https{ $facts }
+    [secret_blank] 密钥不能为空{ $facts }
+    [secret_surrounding_whitespace] 密钥不能带首尾空白{ $facts }
+    [secret_invalid_header] 密钥不是有效 HTTP Header 值{ $facts }
+    [strict_json_invalid] JSON 必须严格有效{ $facts }
+    [json_object_required] JSON 顶层必须是对象{ $facts }
+    [reserved_request_field] JSON 包含 ATT 保留的请求字段{ $facts }
+    [proxy_must_be_false_or_url] proxy 必须是 false 或有效代理 URL{ $facts }
+    [pem_path_duplicate] PEM 路径不能重复{ $facts }
+    [runtime_maximum_exceeded] 该值超过底层运行时可表示范围{ $facts }
+    [value_surrounding_whitespace] 值不能带首尾空白{ $facts }
+    [value_blank] 值不能为空{ $facts }
+    [path_blank] 路径不能为空{ $facts }
+    [positive_required] 值必须大于零{ $facts }
+    [usize_range_exceeded] 值超过当前平台的 usize 范围{ $facts }
+    [u32_range_exceeded] 值超过 u32 范围{ $facts }
+    [duplicate_profile_id] 翻译 Profile ID 必须唯一{ $facts }
+    [selected_profile_invalid] 所选翻译 Profile 的结构或字段类型无效{ $facts }
+    [referenced_client_not_found] 引用的 LLM Client 不存在{ $facts }
+   *[other] { $fallback }
+}

@@ -1,15 +1,20 @@
 //! RPG Maker 标准翻译任务规划：自然排序、语义范围、虚原文、术语和占位符。
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguagePair};
-use crate::llm::{ChatMessage, ChatMessageRole, LlmClientSemanticIdentity};
+use crate::llm::{ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity};
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
 use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
@@ -18,13 +23,20 @@ use crate::rpg_maker::text::{DataFileName, MapId};
 use crate::rpg_maker::text::{
     RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
 };
+use crate::storage::file_system::ReadFileError;
 
 use super::deduplication::{
     TranslationDeduplicationCandidate, TranslationDeduplicationError,
     TranslationDeduplicationOutcome, deduplicate_translation_candidates,
 };
-use super::placeholder::{Pcre2PlaceholderService, PlaceholderRuleCompilationError};
-use super::planning_resource::{CompiledTerminology, TranslationPlanningResourceReader};
+use super::language_projection::LanguageTextProjectionError;
+use super::placeholder::{
+    Pcre2PlaceholderService, PlaceholderProtectionError, PlaceholderRuleCompilationError,
+};
+use super::planning_resource::{
+    CompiledTerminology, PlaceholderDefinitionError, TerminologyDefinitionError,
+    TranslationPlanningResourceReader, TranslationPlanningResourceReadingError,
+};
 use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
 use super::semantics::{
     PreparedTranslationStatus, ResolvedTranslationSemanticError, ResolvedTranslationSemantics,
@@ -70,7 +82,7 @@ impl<R, C, L> StandardTranslationTaskPlanner
 where
     R: TranslationPlanningResourceReader,
     C: CpuTaskExecutor,
-    L: LlmClientSemanticIdentity + 'static,
+    L: LlmClientConcurrency + LlmClientSemanticIdentity + 'static,
 {
     type Profile = Arc<RpgMakerTranslationProfile<L>>;
     type Error = RpgMakerStandardTranslationTaskPlanningError<R::Error, C::Error>;
@@ -238,7 +250,10 @@ where
                 }
             })?;
 
-        let scope_terminology = Arc::clone(&terminology);
+        // 术语提示词行只渲染一次。后续每个 Scope/Task 只按实际命中的稀疏下标取用，
+        // 不能再为了少数命中反复扫描整份术语表。
+        let terminology_prompt = Arc::new(TerminologyPromptIndex::new(&terminology));
+        let scope_terminology_prompt = Arc::clone(&terminology_prompt);
         let scope_system_markdown = Arc::new(system_markdown.clone());
         let planned_scopes = self
             .cpu
@@ -248,7 +263,7 @@ where
                     scope_name,
                     build_scope_tasks(
                         scope,
-                        Arc::clone(&scope_terminology),
+                        Arc::clone(&scope_terminology_prompt),
                         scope_system_markdown.as_str(),
                         max_characters,
                     ),
@@ -567,17 +582,69 @@ fn planning_failure_reason(
     match source {
         ResolvedTranslationSemanticError::ProtectPlaceholder(source) => {
             TranslationPlanningFailureReason::PlaceholderProtection {
-                message: source.to_string(),
+                message: placeholder_protection_failure_detail(&source),
             }
         }
         ResolvedTranslationSemanticError::ProjectLanguageText(source) => {
             TranslationPlanningFailureReason::PlaceholderProjection {
-                message: source.to_string(),
+                message: placeholder_projection_failure_detail(&source),
             }
         }
         ResolvedTranslationSemanticError::AcceptCandidate(_) => {
             unreachable!("译前准备不会执行候选译文验收")
         }
+    }
+}
+
+fn placeholder_protection_failure_detail(source: &PlaceholderProtectionError) -> String {
+    match source {
+        PlaceholderProtectionError::Match(source) => format!(
+            "pcre2_match_failed; kind={}; code={}; offset={:?}",
+            pcre2_error_kind(source),
+            source.code(),
+            source.offset()
+        ),
+        PlaceholderProtectionError::EmptyMatch { .. } => "placeholder_empty_match".to_owned(),
+        PlaceholderProtectionError::MissingTextCapture { rule_number } => {
+            format!("placeholder_text_capture_missing; rule={rule_number}")
+        }
+        PlaceholderProtectionError::InvalidMatchRange { rule_number } => {
+            format!("placeholder_match_range_invalid; rule={rule_number}")
+        }
+        PlaceholderProtectionError::OverlappingMatches { .. } => {
+            "placeholder_matches_overlap".to_owned()
+        }
+        PlaceholderProtectionError::ReservedTokenNamespace => {
+            "source_uses_reserved_token_namespace".to_owned()
+        }
+    }
+}
+
+fn placeholder_projection_failure_detail(source: &LanguageTextProjectionError) -> String {
+    match source {
+        LanguageTextProjectionError::TokenIndexConstruction => {
+            "placeholder_token_index_construction_failed".to_owned()
+        }
+        LanguageTextProjectionError::EmptyToken => "empty_placeholder_token".to_owned(),
+        LanguageTextProjectionError::MissingToken { .. } => {
+            "protected_text_missing_placeholder_token".to_owned()
+        }
+        LanguageTextProjectionError::RepeatedToken { .. } => {
+            "protected_text_repeats_placeholder_token".to_owned()
+        }
+        LanguageTextProjectionError::OverlappingToken { .. } => {
+            "placeholder_tokens_overlap".to_owned()
+        }
+        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
+            format!("segment_count_changed; expected={expected}; actual={actual}")
+        }
+        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
+            format!("segment_kind_changed; segment={segment_index}")
+        }
+        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
+            format!("ordered_token_missing; segment={segment_index}")
+        }
+        LanguageTextProjectionError::UnusedOrderedToken => "ordered_token_unused".to_owned(),
     }
 }
 
@@ -759,7 +826,7 @@ struct PreparedUnit {
 
 fn build_scope_tasks(
     scope: PreprocessedScope,
-    terminology: Arc<CompiledTerminology>,
+    terminology: Arc<TerminologyPromptIndex>,
     system_markdown: &str,
     max_characters: usize,
 ) -> Result<Vec<UnindexedTask>, ScopePlanningError> {
@@ -780,43 +847,60 @@ fn build_scope_tasks(
                 responsibility: unit.responsibility,
             })
             .collect::<Vec<_>>();
-        let mut triggered_term_flags = vec![false; terminology.entries().len()];
+        let mut triggered_terms = BTreeSet::new();
         for unit in units.iter().filter(|unit| {
             matches!(
                 unit.responsibility,
                 PreparedUnitResponsibility::Active { .. }
             )
         }) {
-            for &index in &unit.triggered_terms {
-                triggered_term_flags[index] = true;
-            }
+            triggered_terms.extend(unit.triggered_terms.iter().copied());
         }
-        let triggered_terms = triggered_term_flags
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, triggered)| triggered.then_some(index))
-            .collect();
         prepared_groups.push(PreparedTaskGroup {
             kind: group.kind,
             units,
-            triggered_terms,
+            triggered_terms: triggered_terms.into_iter().collect(),
         });
     }
 
     pack_scope(
         prepared_groups,
-        terminology.as_ref(),
+        &terminology,
         system_markdown,
         max_characters,
     )
 }
 
-struct RenderedGroup {
+/// 已经完成语义筛选、但尚未分配任务内 ID 的组。
+///
+/// Markdown 中只保存 ID 插入位置，切块阶段据此精确计算字符数；最终任务确定后才渲染
+/// 一次，从而避免任务边界上的整组克隆和重复字符串构造。
+struct PackedGroup {
     kind: TextGroupKind,
+    markdown_template: String,
+    task_id_offsets: Vec<usize>,
+    markdown_characters_without_ids: usize,
+    expected: Vec<ExpectedBase>,
+    triggered_terms: Vec<usize>,
+}
+
+impl PackedGroup {
+    fn active_count(&self) -> usize {
+        self.task_id_offsets.len()
+    }
+
+    fn markdown_characters(&self, first_active_id: usize) -> usize {
+        let id_characters = (0..self.active_count()).fold(0usize, |characters, offset| {
+            characters.saturating_add(decimal_characters(first_active_id.saturating_add(offset)))
+        });
+        self.markdown_characters_without_ids
+            .saturating_add(id_characters)
+    }
+}
+
+struct RenderedGroup {
     markdown: String,
     expected: Vec<ExpectedBase>,
-    active_count: usize,
-    triggered_terms: Vec<usize>,
 }
 
 struct ExpectedBase {
@@ -830,8 +914,7 @@ struct ExpectedBase {
     state_context: TranslationStateContext,
 }
 
-fn render_group(seed: PreparedTaskGroup, first_active_id: usize) -> RenderedGroup {
-    let mut active_id = first_active_id;
+fn prepare_group(seed: PreparedTaskGroup) -> PackedGroup {
     let mut expected = Vec::new();
     let active_count = seed
         .units
@@ -839,16 +922,18 @@ fn render_group(seed: PreparedTaskGroup, first_active_id: usize) -> RenderedGrou
         .filter(|unit| is_active_unit(unit))
         .count();
     if active_count == 0 {
-        return RenderedGroup {
+        return PackedGroup {
             kind: seed.kind,
-            markdown: String::new(),
+            markdown_template: String::new(),
+            task_id_offsets: Vec::new(),
+            markdown_characters_without_ids: 0,
             expected,
-            active_count,
             triggered_terms: seed.triggered_terms,
         };
     }
 
     let mut markdown = format!("## {}\n", human_group_kind(seed.kind));
+    let mut task_id_offsets = Vec::with_capacity(active_count);
     let active_dialogue_body = seed.units.iter().any(|unit| {
         is_active_unit(unit) && matches!(unit.identity.role(), TextUnitRole::DialogueBody)
     });
@@ -873,7 +958,7 @@ fn render_group(seed: PreparedTaskGroup, first_active_id: usize) -> RenderedGrou
     for unit in seed.units {
         if is_active_unit(&unit) {
             markdown.push('\n');
-            render_active_unit(&mut markdown, active_id, &unit);
+            render_active_unit_template(&mut markdown, &mut task_id_offsets, &unit);
             let line_shape = expected_line_shape(&unit.identity);
             let PreparedUnitResponsibility::Active {
                 propagation_targets,
@@ -882,7 +967,7 @@ fn render_group(seed: PreparedTaskGroup, first_active_id: usize) -> RenderedGrou
                 unreachable!("已确认的活跃单元必须携带传播目标")
             };
             expected.push(ExpectedBase {
-                id: active_id,
+                id: 0,
                 line_shape,
                 identity: unit.identity,
                 propagation_targets,
@@ -891,7 +976,6 @@ fn render_group(seed: PreparedTaskGroup, first_active_id: usize) -> RenderedGrou
                 language_analysis: unit.language_analysis,
                 state_context: unit.state_context,
             });
-            active_id += 1;
         } else if matches!(
             unit.responsibility,
             PreparedUnitResponsibility::AwaitingDeduplication
@@ -900,13 +984,50 @@ fn render_group(seed: PreparedTaskGroup, first_active_id: usize) -> RenderedGrou
         }
     }
 
-    RenderedGroup {
+    let markdown_characters_without_ids = markdown.chars().count();
+    PackedGroup {
         kind: seed.kind,
-        markdown,
+        markdown_template: markdown,
+        task_id_offsets,
+        markdown_characters_without_ids,
         expected,
-        active_count,
         triggered_terms: seed.triggered_terms,
     }
+}
+
+fn render_group(group: PackedGroup, first_active_id: usize) -> RenderedGroup {
+    let final_characters = group.markdown_characters(first_active_id);
+    let mut markdown =
+        String::with_capacity(group.markdown_template.len().saturating_add(
+            final_characters.saturating_sub(group.markdown_characters_without_ids),
+        ));
+    let mut template_offset = 0usize;
+    for (task_offset, id_offset) in group.task_id_offsets.into_iter().enumerate() {
+        markdown.push_str(&group.markdown_template[template_offset..id_offset]);
+        markdown.push_str(&first_active_id.saturating_add(task_offset).to_string());
+        template_offset = id_offset;
+    }
+    markdown.push_str(&group.markdown_template[template_offset..]);
+
+    let expected = group
+        .expected
+        .into_iter()
+        .enumerate()
+        .map(|(offset, mut expected)| {
+            expected.id = first_active_id.saturating_add(offset);
+            expected
+        })
+        .collect();
+    RenderedGroup { markdown, expected }
+}
+
+fn decimal_characters(mut value: usize) -> usize {
+    let mut characters = 1usize;
+    while value >= 10 {
+        value /= 10;
+        characters += 1;
+    }
+    characters
 }
 
 fn is_active_unit(unit: &PreparedUnit) -> bool {
@@ -969,47 +1090,59 @@ fn human_context_label(role: &TextUnitRole) -> &'static str {
     }
 }
 
-fn render_active_unit(markdown: &mut String, id: usize, unit: &PreparedUnit) {
+fn render_active_unit_template(
+    markdown: &mut String,
+    task_id_offsets: &mut Vec<usize>,
+    unit: &PreparedUnit,
+) {
     match unit.identity.role() {
         TextUnitRole::DialogueSpeaker => {
-            markdown.push_str(&format!(
-                "Speaker [{id}] (single line):{}\n",
-                unit.protected_text
-            ));
+            markdown.push_str("Speaker [");
+            task_id_offsets.push(markdown.len());
+            markdown.push_str("] (single line):");
+            markdown.push_str(&unit.protected_text);
+            markdown.push('\n');
         }
         TextUnitRole::DialogueBody => {
-            markdown.push_str(&format!("Body [{id}] (free line breaking):\n\n"));
+            markdown.push_str("Body [");
+            task_id_offsets.push(markdown.len());
+            markdown.push_str("] (free line breaking):\n\n");
             push_blockquote(markdown, &unit.protected_text);
         }
         TextUnitRole::Choices => {
             let count = source_line_count(&unit.identity);
-            markdown.push_str(&format!(
-                "Choices [{id}] ({count} items, corresponding item by item):\n\n"
-            ));
+            markdown.push_str("Choices [");
+            task_id_offsets.push(markdown.len());
+            markdown.push_str("] (");
+            markdown.push_str(&count.to_string());
+            markdown.push_str(" items, corresponding item by item):\n\n");
             push_blockquote(markdown, &unit.protected_text);
         }
         TextUnitRole::ScrollingText => {
             let count = source_line_count(&unit.identity);
-            markdown.push_str(&format!(
-                "Scrolling Text [{id}] ({count} lines, corresponding line by line):\n\n"
-            ));
+            markdown.push_str("Scrolling Text [");
+            task_id_offsets.push(markdown.len());
+            markdown.push_str("] (");
+            markdown.push_str(&count.to_string());
+            markdown.push_str(" lines, corresponding line by line):\n\n");
             push_blockquote(markdown, &unit.protected_text);
         }
         TextUnitRole::Scalar(_)
             if expected_line_shape(&unit.identity) == ExpectedLineShape::Reflow =>
         {
-            markdown.push_str(&format!(
-                "{} [{id}] (free line breaking):\n\n",
-                human_scalar_label(&unit.field_name)
-            ));
+            markdown.push_str(human_scalar_label(&unit.field_name));
+            markdown.push_str(" [");
+            task_id_offsets.push(markdown.len());
+            markdown.push_str("] (free line breaking):\n\n");
             push_blockquote(markdown, &unit.protected_text);
         }
         TextUnitRole::Scalar(_) => {
-            markdown.push_str(&format!(
-                "{} [{id}] (single line):{}\n",
-                human_scalar_label(&unit.field_name),
-                unit.protected_text
-            ));
+            markdown.push_str(human_scalar_label(&unit.field_name));
+            markdown.push_str(" [");
+            task_id_offsets.push(markdown.len());
+            markdown.push_str("] (single line):");
+            markdown.push_str(&unit.protected_text);
+            markdown.push('\n');
         }
     }
 }
@@ -1076,39 +1209,89 @@ fn push_blockquote(markdown: &mut String, text: &str) {
     }
 }
 
+/// 一次规划运行共享的术语提示词索引。
+///
+/// `lines` 严格沿用术语文件自然顺序。每一行只做一次 Markdown 转义，Scope 和 Task
+/// 随后只根据已经由 Aho-Corasick 得到的命中下标访问实际需要的行。
+struct TerminologyPromptIndex {
+    lines: Vec<TerminologyPromptLine>,
+}
+
+struct TerminologyPromptLine {
+    markdown: String,
+    characters: usize,
+}
+
+impl TerminologyPromptIndex {
+    fn new(terminology: &CompiledTerminology) -> Self {
+        let lines = terminology
+            .entries()
+            .iter()
+            .map(|entry| {
+                let mut markdown = String::new();
+                markdown.push_str("- ");
+                push_markdown_literal(&mut markdown, entry.term());
+                markdown.push_str(" → ");
+                push_markdown_literal(&mut markdown, entry.translation());
+                markdown.push('\n');
+                let characters = markdown.chars().count();
+                TerminologyPromptLine {
+                    markdown,
+                    characters,
+                }
+            })
+            .collect();
+        Self { lines }
+    }
+
+    fn line_characters(&self, index: usize) -> usize {
+        self.lines[index].characters
+    }
+
+    /// 追加自然有序的稀疏命中，并返回实际访问的术语行数供复杂度测试观察。
+    fn append_selected(&self, markdown: &mut String, selected: &BTreeSet<usize>) -> usize {
+        for &index in selected {
+            markdown.push_str(&self.lines[index].markdown);
+        }
+        selected.len()
+    }
+}
+
 fn pack_scope(
     groups: Vec<PreparedTaskGroup>,
-    terminology: &CompiledTerminology,
+    terminology: &TerminologyPromptIndex,
     system_markdown: &str,
     max_characters: usize,
 ) -> Result<Vec<UnindexedTask>, ScopePlanningError> {
     let mut tasks = Vec::new();
-    let mut current_groups = Vec::<RenderedGroup>::new();
+    let mut current_groups = Vec::<PackedGroup>::new();
     let mut current_active = 0usize;
-    let mut current_terms = Vec::<bool>::new();
+    let mut current_terms = BTreeSet::new();
+    let mut current_user_characters = 0usize;
+    let system_characters = system_markdown.chars().count();
 
     for seed in groups {
-        let rendered = render_group(seed.clone(), current_active + 1);
-        if rendered.active_count == 0 {
+        let packed = prepare_group(seed);
+        if packed.active_count() == 0 {
             continue;
         }
-        let candidate_terms = merged_term_flags(
-            &current_terms,
-            &rendered.triggered_terms,
-            terminology.entries().len(),
+        let (additional_term_count, additional_term_characters) =
+            additional_terminology_size(&packed.triggered_terms, &current_terms, terminology);
+        let candidate_user_characters = candidate_user_character_count(
+            current_user_characters,
+            !current_groups.is_empty(),
+            current_terms.len(),
+            additional_term_count,
+            additional_term_characters,
+            packed.markdown_characters(current_active + 1),
         );
-        let candidate_size = message_character_count(
-            system_markdown,
-            &current_groups,
-            Some(&rendered),
-            terminology,
-            &candidate_terms,
-        );
+        let candidate_size = system_characters.saturating_add(candidate_user_characters);
 
         if candidate_size <= max_characters {
-            current_active += rendered.active_count;
-            current_terms = candidate_terms;
-            current_groups.push(rendered);
+            current_active += packed.active_count();
+            current_terms.extend(packed.triggered_terms.iter().copied());
+            current_user_characters = candidate_user_characters;
+            current_groups.push(packed);
             continue;
         }
 
@@ -1124,24 +1307,33 @@ fn pack_scope(
         }
         current_active = 0;
         current_terms.clear();
+        current_user_characters = 0;
 
-        let rendered = render_group(seed, 1);
-        let terms = merged_term_flags(&[], &rendered.triggered_terms, terminology.entries().len());
-        let group_size =
-            message_character_count(system_markdown, &[], Some(&rendered), terminology, &terms);
+        let (term_count, term_characters) =
+            additional_terminology_size(&packed.triggered_terms, &current_terms, terminology);
+        let group_user_characters = candidate_user_character_count(
+            0,
+            false,
+            0,
+            term_count,
+            term_characters,
+            packed.markdown_characters(1),
+        );
+        let group_size = system_characters.saturating_add(group_user_characters);
         if group_size > max_characters {
-            if rendered.active_count > 0 {
+            if packed.active_count() > 0 {
                 return Err(ScopePlanningError::GroupExceedsCapacity {
-                    group_kind: human_group_kind(rendered.kind),
+                    group_kind: human_group_kind(packed.kind),
                     actual_characters: group_size,
                     maximum_characters: max_characters,
                 });
             }
             continue;
         }
-        current_active = rendered.active_count;
-        current_terms = terms;
-        current_groups.push(rendered);
+        current_active = packed.active_count();
+        current_terms.extend(packed.triggered_terms.iter().copied());
+        current_user_characters = group_user_characters;
+        current_groups.push(packed);
     }
 
     if current_active > 0 {
@@ -1155,54 +1347,74 @@ fn pack_scope(
     Ok(tasks)
 }
 
-fn merged_term_flags(current: &[bool], additional: &[usize], total: usize) -> Vec<bool> {
-    let mut result = if current.is_empty() {
-        vec![false; total]
-    } else {
-        current.to_vec()
-    };
-    for &index in additional {
-        result[index] = true;
+fn additional_terminology_size(
+    triggered_terms: &[usize],
+    current_terms: &BTreeSet<usize>,
+    terminology: &TerminologyPromptIndex,
+) -> (usize, usize) {
+    let mut count = 0usize;
+    let mut characters = 0usize;
+    for &index in triggered_terms {
+        if !current_terms.contains(&index) {
+            count += 1;
+            characters = characters.saturating_add(terminology.line_characters(index));
+        }
     }
-    result
+    (count, characters)
 }
 
-fn message_character_count(
-    system_markdown: &str,
-    current_groups: &[RenderedGroup],
-    additional_group: Option<&RenderedGroup>,
-    terminology: &CompiledTerminology,
-    term_flags: &[bool],
+fn candidate_user_character_count(
+    current_characters: usize,
+    has_groups: bool,
+    current_term_count: usize,
+    additional_term_count: usize,
+    additional_term_characters: usize,
+    group_characters: usize,
 ) -> usize {
-    system_markdown.chars().count()
-        + render_user_markdown(current_groups, additional_group, terminology, term_flags)
-            .chars()
-            .count()
+    let mut characters = current_characters;
+    if additional_term_count > 0 {
+        if current_term_count == 0 {
+            characters = characters.saturating_add("Terminology:\n\n".chars().count());
+            if has_groups {
+                // 术语区位于既有组之前，首次加入时会多出一个区段分隔换行。
+                characters = characters.saturating_add(1);
+            }
+        }
+        characters = characters.saturating_add(additional_term_characters);
+    }
+    if characters > 0 {
+        characters = characters.saturating_add(1);
+    }
+    characters.saturating_add(group_characters)
+}
+
+#[cfg(test)]
+fn terminology_line_character_count(entry: &super::planning_resource::TerminologyEntry) -> usize {
+    "- ".chars().count()
+        + markdown_literal_character_count(entry.term())
+        + " → ".chars().count()
+        + markdown_literal_character_count(entry.translation())
+        + 1
+}
+
+#[cfg(test)]
+fn markdown_literal_character_count(value: &str) -> usize {
+    value
+        .chars()
+        .map(|character| usize::from(character.is_ascii_punctuation()) + 1)
+        .sum()
 }
 
 fn render_user_markdown(
     groups: &[RenderedGroup],
     additional_group: Option<&RenderedGroup>,
-    terminology: &CompiledTerminology,
-    term_flags: &[bool],
+    terminology: &TerminologyPromptIndex,
+    selected_terms: &BTreeSet<usize>,
 ) -> String {
     let mut markdown = String::new();
-    let terms = terminology
-        .entries()
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| term_flags.get(*index).copied().unwrap_or(false))
-        .map(|(_, entry)| entry)
-        .collect::<Vec<_>>();
-    if !terms.is_empty() {
+    if !selected_terms.is_empty() {
         markdown.push_str("Terminology:\n\n");
-        for entry in terms {
-            markdown.push_str("- ");
-            push_markdown_literal(&mut markdown, entry.term());
-            markdown.push_str(" → ");
-            push_markdown_literal(&mut markdown, entry.translation());
-            markdown.push('\n');
-        }
+        terminology.append_selected(&mut markdown, selected_terms);
     }
     for group in groups {
         if !markdown.is_empty() {
@@ -1229,12 +1441,22 @@ fn push_markdown_literal(markdown: &mut String, value: &str) {
 }
 
 fn finalize_task(
-    groups: Vec<RenderedGroup>,
-    terminology: &CompiledTerminology,
-    term_flags: &[bool],
+    groups: Vec<PackedGroup>,
+    terminology: &TerminologyPromptIndex,
+    selected_terms: &BTreeSet<usize>,
     system_markdown: &str,
 ) -> UnindexedTask {
-    let user_markdown = render_user_markdown(&groups, None, terminology, term_flags);
+    let mut next_active_id = 1usize;
+    let groups = groups
+        .into_iter()
+        .map(|group| {
+            let active_count = group.active_count();
+            let rendered = render_group(group, next_active_id);
+            next_active_id = next_active_id.saturating_add(active_count);
+            rendered
+        })
+        .collect::<Vec<_>>();
+    let user_markdown = render_user_markdown(&groups, None, terminology, selected_terms);
     let mut expected_outputs = Vec::new();
     for group in groups {
         expected_outputs.extend(group.expected.into_iter().map(|expected| {
@@ -1419,6 +1641,638 @@ impl<R: Error + 'static, C: Error + 'static> Error
     }
 }
 
+impl<R, C> SafeDiagnosticSource for RpgMakerStandardTranslationTaskPlanningError<R, C>
+where
+    R: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::ResolvedLanguagePairMismatch {
+                project_source,
+                project_target,
+                resolved_source,
+                resolved_target,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationInvalidValue,
+                stage,
+                DiagnosticSubject::field("rpg_maker.translation.language_pair"),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::ConflictingValues,
+                    format!(
+                        "project={project_source}->{project_target}; resolved={resolved_source}->{resolved_target}"
+                    ),
+                ),
+                impact,
+                DiagnosticAction::FixConfiguration,
+            ),
+            Self::ReadResources(source) => {
+                source.safe_diagnostic_source(stage, impact, DiagnosticAction::FixInput)
+            }
+            Self::CompilePlaceholdersCompute(source) => {
+                planning_cpu_diagnostic(source, stage, impact, "compile_placeholder_rules", None)
+            }
+            Self::InvalidPlaceholderRules(source) => {
+                placeholder_compilation_diagnostic(source, stage, impact)
+            }
+            Self::PrepareCorpusCompute(source) => {
+                planning_cpu_diagnostic(source, stage, impact, "prepare_translation_corpus", None)
+            }
+            Self::InvalidCorpus(CorpusPlanningError::MissingSemanticIndex { location }) => {
+                SafeDiagnostic::new(
+                    DiagnosticCode::ProjectState,
+                    stage,
+                    DiagnosticSubject::operation("standard_translation_corpus"),
+                    DiagnosticReason::failure_with_detail(
+                        DiagnosticFailureKind::StateMismatch,
+                        format!("missing_semantic_index; location={location}"),
+                    ),
+                    impact,
+                    DiagnosticAction::CheckProjectState,
+                )
+            }
+            Self::PreprocessScopesCompute(source) => planning_cpu_diagnostic(
+                source,
+                stage,
+                impact,
+                "preprocess_translation_scopes",
+                None,
+            ),
+            Self::InvalidScopePreprocessing { scope, source } => SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                stage,
+                DiagnosticSubject::operation("translation_scope_preprocessing"),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InternalInvariant,
+                    scope_preprocessing_detail(source),
+                ),
+                impact,
+                DiagnosticAction::ReportBug,
+            )
+            .with_recovery(RecoveryFact::component(format!(
+                "scope={}",
+                safe_scope_label(scope)
+            ))),
+            Self::DeduplicateCompute(source) => planning_cpu_diagnostic(
+                source,
+                stage,
+                impact,
+                "deduplicate_translation_corpus",
+                None,
+            ),
+            Self::InvalidDeduplication(
+                TranslationDeduplicationError::ConflictingReusableTranslations {
+                    conflicts, ..
+                },
+            ) => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                stage,
+                DiagnosticSubject::operation("global_translation_deduplication"),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::ConflictingValues,
+                    format!("conflicting_reusable_translations={}", conflicts.len()),
+                ),
+                impact,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::PlanScopesCompute(source) => {
+                planning_cpu_diagnostic(source, stage, impact, "plan_translation_scopes", None)
+            }
+            Self::InvalidScope {
+                scope,
+                source:
+                    ScopePlanningError::GroupExceedsCapacity {
+                        group_kind,
+                        actual_characters,
+                        maximum_characters,
+                    },
+            } => SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationInvalidValue,
+                stage,
+                DiagnosticSubject::field(
+                    "rpg_maker.translation_profiles.max_task_message_characters",
+                ),
+                DiagnosticReason::Resource {
+                    resource: format!(
+                        "indivisible_group_message_characters; scope={}; group_kind={group_kind}",
+                        safe_scope_label(scope)
+                    ),
+                    actual: usize_as_u64(*actual_characters),
+                    maximum: Some(usize_as_u64(*maximum_characters)),
+                },
+                impact,
+                DiagnosticAction::FixConfiguration,
+            ),
+            Self::FinalizePlanCompute(source) => planning_cpu_diagnostic(
+                source,
+                stage,
+                impact,
+                "finalize_translation_task_order",
+                None,
+            ),
+        }
+    }
+}
+
+impl<F, C> SafeDiagnosticSource for TranslationPlanningResourceReadingError<F, C>
+where
+    F: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::ReadTerminology { source, .. } => {
+                read_planning_resource_diagnostic(source, stage, impact, "terminology")
+            }
+            Self::ReadPlaceholderRules { source, .. } => {
+                read_planning_resource_diagnostic(source, stage, impact, "placeholder_rules")
+            }
+            Self::ParseTerminologyCompute { path, source } => planning_resource_cpu_diagnostic(
+                source,
+                path.as_deref(),
+                stage,
+                impact,
+                "parse_terminology",
+            ),
+            Self::InvalidTerminology { path, source } => {
+                terminology_definition_diagnostic(path.as_deref(), source, stage, impact)
+            }
+            Self::ParsePlaceholderRulesCompute { path, source } => {
+                planning_resource_cpu_diagnostic(
+                    source,
+                    path.as_deref(),
+                    stage,
+                    impact,
+                    "parse_placeholder_rules",
+                )
+            }
+            Self::InvalidPlaceholderRules { path, source } => {
+                placeholder_definition_diagnostic(path.as_deref(), source, stage, impact)
+            }
+        }
+    }
+}
+
+fn planning_cpu_diagnostic<C>(
+    source: &CpuTaskExecutionError<C>,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+    operation: &'static str,
+    scope: Option<&SemanticScopeKey>,
+) -> SafeDiagnostic
+where
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    let mut diagnostic = source
+        .safe_diagnostic_source(stage, impact, DiagnosticAction::Retry)
+        .with_recovery(RecoveryFact::component(operation));
+    if let Some(scope) = scope {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
+            "scope={}",
+            safe_scope_label(scope)
+        )));
+    }
+    diagnostic
+}
+
+fn planning_resource_cpu_diagnostic<C>(
+    source: &CpuTaskExecutionError<C>,
+    path: Option<&std::path::Path>,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+    operation: &'static str,
+) -> SafeDiagnostic
+where
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    let mut diagnostic = planning_cpu_diagnostic(source, stage, impact, operation, None);
+    if let Some(path) = path {
+        diagnostic.subject = DiagnosticSubject::path(path);
+    } else {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::component("project_resource_snapshot"));
+    }
+    diagnostic
+}
+
+fn read_planning_resource_diagnostic<F>(
+    source: &ReadFileError<F>,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+    resource: &'static str,
+) -> SafeDiagnostic
+where
+    F: SafeDiagnosticSource,
+{
+    match source {
+        ReadFileError::NotFound { path } => SafeDiagnostic::new(
+            DiagnosticCode::CommandInput,
+            stage,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+            impact,
+            DiagnosticAction::CheckPathAndPermissions,
+        )
+        .with_recovery(RecoveryFact::component(resource)),
+        ReadFileError::NotFile { path } => SafeDiagnostic::new(
+            DiagnosticCode::CommandInput,
+            stage,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InvalidValue,
+                "path_is_not_a_regular_file",
+            ),
+            impact,
+            DiagnosticAction::CheckPathAndPermissions,
+        )
+        .with_recovery(RecoveryFact::component(resource)),
+        ReadFileError::Io { path, source } => {
+            let mut diagnostic = source.safe_diagnostic_source(
+                stage,
+                impact,
+                DiagnosticAction::CheckPathAndPermissions,
+            );
+            diagnostic.subject = DiagnosticSubject::path(path);
+            diagnostic.with_recovery(RecoveryFact::component(resource))
+        }
+    }
+}
+
+fn terminology_definition_diagnostic(
+    path: Option<&std::path::Path>,
+    source: &TerminologyDefinitionError,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic {
+    match source {
+        TerminologyDefinitionError::InvalidUtf8(source) => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::InvalidUtf8 {
+                valid_up_to: usize_as_u64(source.valid_up_to()),
+                error_len: source.error_len().map(usize_as_u64),
+            },
+            stage,
+            impact,
+            false,
+        ),
+        TerminologyDefinitionError::InvalidToml(source) => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InvalidSyntax,
+                toml_error_detail(source),
+            ),
+            stage,
+            impact,
+            false,
+        ),
+        TerminologyDefinitionError::InvalidSnapshot(source) => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::StateMismatch,
+                format!("invalid_snapshot_json; {}", serde_json_error_detail(source)),
+            ),
+            stage,
+            impact,
+            false,
+        ),
+        TerminologyDefinitionError::EncodeSnapshot(source) => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InternalInvariant,
+                format!(
+                    "encode_snapshot_failed; {}",
+                    serde_json_error_detail(source)
+                ),
+            ),
+            stage,
+            impact,
+            true,
+        ),
+        TerminologyDefinitionError::BlankField {
+            entry_number,
+            field,
+        } => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InvalidValue,
+                format!("blank_field; entry={entry_number}; field={field}"),
+            ),
+            stage,
+            impact,
+            false,
+        ),
+        TerminologyDefinitionError::SurroundingWhitespace {
+            entry_number,
+            field,
+        } => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InvalidValue,
+                format!("surrounding_whitespace; entry={entry_number}; field={field}"),
+            ),
+            stage,
+            impact,
+            false,
+        ),
+        TerminologyDefinitionError::ControlCharacter {
+            entry_number,
+            field,
+            character,
+        } => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InvalidValue,
+                format!(
+                    "control_character; entry={entry_number}; field={field}; codepoint=U+{:04X}",
+                    u32::from(*character)
+                ),
+            ),
+            stage,
+            impact,
+            false,
+        ),
+        TerminologyDefinitionError::EmptyTriggers { entry_number } => {
+            resource_definition_diagnostic(
+                path,
+                "terminology",
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InvalidValue,
+                    format!("empty_triggers; entry={entry_number}"),
+                ),
+                stage,
+                impact,
+                false,
+            )
+        }
+        TerminologyDefinitionError::DuplicateTerm { .. } => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::ConflictingValues,
+                "duplicate_term",
+            ),
+            stage,
+            impact,
+            false,
+        ),
+        TerminologyDefinitionError::DuplicateTrigger { .. } => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::ConflictingValues,
+                "duplicate_trigger",
+            ),
+            stage,
+            impact,
+            false,
+        ),
+        TerminologyDefinitionError::CompileMatcher(_) => resource_definition_diagnostic(
+            path,
+            "terminology",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InvalidValue,
+                "terminology_matcher_build_failed",
+            ),
+            stage,
+            impact,
+            false,
+        ),
+    }
+}
+
+fn placeholder_definition_diagnostic(
+    path: Option<&std::path::Path>,
+    source: &PlaceholderDefinitionError,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic {
+    match source {
+        PlaceholderDefinitionError::InvalidUtf8(source) => resource_definition_diagnostic(
+            path,
+            "placeholder_rules",
+            DiagnosticReason::InvalidUtf8 {
+                valid_up_to: usize_as_u64(source.valid_up_to()),
+                error_len: source.error_len().map(usize_as_u64),
+            },
+            stage,
+            impact,
+            false,
+        ),
+        PlaceholderDefinitionError::InvalidToml(source) => resource_definition_diagnostic(
+            path,
+            "placeholder_rules",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InvalidSyntax,
+                toml_error_detail(source),
+            ),
+            stage,
+            impact,
+            false,
+        ),
+        PlaceholderDefinitionError::InvalidSnapshot(source) => resource_definition_diagnostic(
+            path,
+            "placeholder_rules",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::StateMismatch,
+                format!("invalid_snapshot_json; {}", serde_json_error_detail(source)),
+            ),
+            stage,
+            impact,
+            false,
+        ),
+        PlaceholderDefinitionError::EncodeSnapshot(source) => resource_definition_diagnostic(
+            path,
+            "placeholder_rules",
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InternalInvariant,
+                format!(
+                    "encode_snapshot_failed; {}",
+                    serde_json_error_detail(source)
+                ),
+            ),
+            stage,
+            impact,
+            true,
+        ),
+    }
+}
+
+fn resource_definition_diagnostic(
+    path: Option<&std::path::Path>,
+    resource: &'static str,
+    reason: DiagnosticReason,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+    internal: bool,
+) -> SafeDiagnostic {
+    let external = path.is_some();
+    let code = if internal {
+        DiagnosticCode::InternalOperation
+    } else if external {
+        DiagnosticCode::CommandInput
+    } else {
+        DiagnosticCode::ProjectState
+    };
+    let action = if internal {
+        DiagnosticAction::ReportBug
+    } else if external {
+        DiagnosticAction::FixInput
+    } else {
+        DiagnosticAction::CheckProjectState
+    };
+    let subject = path.map_or_else(
+        || DiagnosticSubject::component(format!("project_{resource}_snapshot")),
+        DiagnosticSubject::path,
+    );
+    SafeDiagnostic::new(code, stage, subject, reason, impact, action)
+}
+
+fn placeholder_compilation_diagnostic(
+    source: &PlaceholderRuleCompilationError,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic {
+    let (rule_number, detail) = match source {
+        PlaceholderRuleCompilationError::EmptyScopes { rule_number } => {
+            (*rule_number, "empty_scopes".to_owned())
+        }
+        PlaceholderRuleCompilationError::UnknownScope { rule_number, .. } => {
+            (*rule_number, "unknown_scope".to_owned())
+        }
+        PlaceholderRuleCompilationError::DuplicateScope { rule_number, .. } => {
+            (*rule_number, "duplicate_scope".to_owned())
+        }
+        PlaceholderRuleCompilationError::EmptyPattern { rule_number } => {
+            (*rule_number, "empty_pattern".to_owned())
+        }
+        PlaceholderRuleCompilationError::InvalidPattern {
+            rule_number,
+            source,
+        } => (
+            *rule_number,
+            format!(
+                "invalid_pcre2_pattern; kind={}; code={}; offset={:?}",
+                pcre2_error_kind(source),
+                source.code(),
+                source.offset()
+            ),
+        ),
+        PlaceholderRuleCompilationError::InvalidNamedCaptures {
+            rule_number,
+            captures,
+        } => (
+            *rule_number,
+            format!("invalid_named_capture_set; actual_count={}", captures.len()),
+        ),
+    };
+    SafeDiagnostic::new(
+        DiagnosticCode::CommandInput,
+        stage,
+        DiagnosticSubject::operation(format!("placeholder_rule_{rule_number}")),
+        DiagnosticReason::failure_with_detail(DiagnosticFailureKind::InvalidValue, detail),
+        impact,
+        DiagnosticAction::FixInput,
+    )
+}
+
+fn scope_preprocessing_detail(source: &ScopePreprocessingError) -> String {
+    match source {
+        ScopePreprocessingError::EncodeStateLocation(source) => {
+            format!(
+                "encode_translation_state_location: {}",
+                location_codec_detail(source)
+            )
+        }
+        ScopePreprocessingError::EncodeStateRole(source) => format!(
+            "encode_translation_state_role: {}",
+            projection_codec_detail(source)
+        ),
+    }
+}
+
+fn location_codec_detail(
+    source: &crate::rpg_maker::location_codec::RpgMakerLocationCodecError,
+) -> String {
+    source.safe_diagnostic_detail()
+}
+
+fn projection_codec_detail(
+    source: &crate::rpg_maker::location_codec::RpgMakerProjectionCodecError,
+) -> String {
+    source.safe_diagnostic_detail()
+}
+
+fn toml_error_detail(source: &toml::de::Error) -> String {
+    source.span().map_or_else(
+        || "invalid_toml".to_owned(),
+        |span| {
+            format!(
+                "invalid_toml; byte_start={}; byte_end={}",
+                span.start, span.end
+            )
+        },
+    )
+}
+
+fn serde_json_error_detail(source: &serde_json::Error) -> String {
+    let category = match source.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!(
+        "category={category}; line={}; column={}",
+        source.line(),
+        source.column()
+    )
+}
+
+fn pcre2_error_kind(source: &pcre2::Error) -> &'static str {
+    match source.kind() {
+        pcre2::ErrorKind::Compile => "compile",
+        pcre2::ErrorKind::JIT => "jit",
+        pcre2::ErrorKind::Match => "match",
+        pcre2::ErrorKind::Info => "info",
+        pcre2::ErrorKind::Option => "option",
+        _ => "unknown",
+    }
+}
+
+fn safe_scope_label(scope: &SemanticScopeKey) -> String {
+    match scope {
+        SemanticScopeKey::StandardDatabase(file) => format!("data/{}", file.file_name()),
+        SemanticScopeKey::DataFile(file) => format!("data/{file}"),
+        SemanticScopeKey::System => "data/System.json".to_owned(),
+        SemanticScopeKey::Map(map_id) => format!("Map{:03}", map_id.get()),
+        SemanticScopeKey::CommonEvent(event_id) => format!("CommonEvent[{event_id}]"),
+        SemanticScopeKey::Troop(troop_id) => format!("Troop[{troop_id}]"),
+        SemanticScopeKey::Plugin { plugin_index, .. } => {
+            format!("Plugin[index={plugin_index}]")
+        }
+    }
+}
+
+fn usize_as_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("当前目标平台的 usize 必须可表示为 u64")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CorpusPlanningError {
     MissingSemanticIndex { location: String },
@@ -1503,6 +2357,8 @@ mod tests {
 
     use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep};
+    use crate::runtime::cpu::CpuExecutorUnavailable;
+    use crate::runtime::filesystem::SystemFileSystemError;
     use crate::storage::file_system::{FileReader, ReadFile, ReadFileError};
 
     use super::*;
@@ -1545,6 +2401,129 @@ mod tests {
     }
 
     impl Error for FakeError {}
+
+    type ProductionResourceError =
+        TranslationPlanningResourceReadingError<SystemFileSystemError, CpuExecutorUnavailable>;
+    type ProductionPlanningError = RpgMakerStandardTranslationTaskPlanningError<
+        ProductionResourceError,
+        CpuExecutorUnavailable,
+    >;
+
+    #[test]
+    fn planning_diagnostic_preserves_resource_path_and_utf8_offset() {
+        let invalid_bytes = vec![0xff];
+        let invalid_utf8 = std::str::from_utf8(&invalid_bytes).expect_err("测试字节必须不是 UTF-8");
+        let error: ProductionPlanningError =
+            RpgMakerStandardTranslationTaskPlanningError::ReadResources(
+                TranslationPlanningResourceReadingError::InvalidTerminology {
+                    path: Some(PathBuf::from("C:/game/terms.toml")),
+                    source: TerminologyDefinitionError::InvalidUtf8(invalid_utf8),
+                },
+            );
+
+        let diagnostic = error.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixInput,
+        );
+
+        assert!(matches!(
+            diagnostic.subject,
+            DiagnosticSubject::Path { ref path } if path.ends_with("terms.toml")
+        ));
+        assert_eq!(
+            diagnostic.reason,
+            DiagnosticReason::InvalidUtf8 {
+                valid_up_to: 0,
+                error_len: Some(1),
+            }
+        );
+        assert_eq!(diagnostic.action, DiagnosticAction::FixInput);
+    }
+
+    #[test]
+    fn planning_diagnostic_hides_resource_values_and_preserves_rule_number() {
+        let sentinel = "TRANSLATION_RESOURCE_SECRET_SENTINEL";
+        let terminology: ProductionPlanningError =
+            RpgMakerStandardTranslationTaskPlanningError::ReadResources(
+                TranslationPlanningResourceReadingError::InvalidTerminology {
+                    path: Some(PathBuf::from("C:/game/terms.toml")),
+                    source: TerminologyDefinitionError::DuplicateTerm {
+                        term: sentinel.to_owned(),
+                    },
+                },
+            );
+        let terminology = terminology.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixInput,
+        );
+        assert!(!terminology.reason.render().contains(sentinel));
+        assert!(terminology.reason.render().contains("duplicate_term"));
+
+        let placeholder: ProductionPlanningError =
+            RpgMakerStandardTranslationTaskPlanningError::InvalidPlaceholderRules(
+                PlaceholderRuleCompilationError::UnknownScope {
+                    rule_number: 7,
+                    scope: sentinel.to_owned(),
+                },
+            );
+        let placeholder = placeholder.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixInput,
+        );
+        assert!(matches!(
+            placeholder.subject,
+            DiagnosticSubject::Operation { ref name } if name == "placeholder_rule_7"
+        ));
+        assert!(!placeholder.reason.render().contains(sentinel));
+        assert!(placeholder.reason.render().contains("unknown_scope"));
+    }
+
+    #[test]
+    fn planning_diagnostic_distinguishes_cpu_cancellation_and_group_capacity() {
+        let cancelled: ProductionPlanningError =
+            RpgMakerStandardTranslationTaskPlanningError::PrepareCorpusCompute(
+                CpuTaskExecutionError::Cancelled,
+            );
+        let cancelled = cancelled.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        assert!(matches!(
+            cancelled.reason,
+            DiagnosticReason::Failure {
+                failure: DiagnosticFailureKind::LockCancelled
+            }
+        ));
+
+        let capacity: ProductionPlanningError =
+            RpgMakerStandardTranslationTaskPlanningError::InvalidScope {
+                scope: SemanticScopeKey::Map(MapId::new(12).expect("map id 应有效")),
+                source: ScopePlanningError::GroupExceedsCapacity {
+                    group_kind: "Dialogue",
+                    actual_characters: 24_001,
+                    maximum_characters: 24_000,
+                },
+            };
+        let capacity = capacity.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixConfiguration,
+        );
+        assert_eq!(
+            capacity.reason,
+            DiagnosticReason::Resource {
+                resource: "indivisible_group_message_characters; scope=Map012; group_kind=Dialogue"
+                    .to_owned(),
+                actual: 24_001,
+                maximum: Some(24_000),
+            }
+        );
+        assert_eq!(capacity.action, DiagnosticAction::FixConfiguration);
+    }
 
     #[test]
     fn prompt_protocol_uses_canonical_english_labels() {
@@ -1595,6 +2574,12 @@ mod tests {
     impl LlmClientSemanticIdentity for () {
         fn semantic_fingerprint(&self) -> Sha256Fingerprint {
             Sha256Fingerprint::from_bytes([0x33; 32])
+        }
+    }
+
+    impl LlmClientConcurrency for () {
+        fn max_concurrent_requests(&self) -> NonZeroUsize {
+            NonZeroUsize::new(2).expect("测试并发数必须非零")
         }
     }
 
@@ -1672,7 +2657,6 @@ mod tests {
         );
         Arc::new(RpgMakerTranslationProfile::new(
             "test",
-            NonZeroUsize::new(2).expect("常量非零"),
             planning,
             RpgMakerTranslationRequestConfiguration::new(Vec::new(), std::time::Duration::ZERO),
             Arc::new(()),
@@ -2999,6 +3983,87 @@ mod tests {
         assert_eq!(split.len(), 2);
         assert_eq!(split[0].expected_outputs()[0].id(), 1);
         assert_eq!(split[1].expected_outputs()[0].id(), 1);
+    }
+
+    #[test]
+    fn incremental_task_size_matches_the_exact_rendered_markdown() {
+        let first_term = crate::rpg_maker::translate::planning_resource::TerminologyEntry::new(
+            "术语.一",
+            "翻译(一)",
+            Vec::new(),
+        );
+        let second_term = crate::rpg_maker::translate::planning_resource::TerminologyEntry::new(
+            "术语二",
+            "翻译二",
+            Vec::new(),
+        );
+        let first_line = terminology_line_character_count(&first_term);
+        let second_line = terminology_line_character_count(&second_term);
+        let first_group = "## Database Text\n\nName [1] (single line):一\n";
+        let second_group = "## Database Text\n\nName [2] (single line):二\n";
+
+        let first_size =
+            candidate_user_character_count(0, false, 0, 1, first_line, first_group.chars().count());
+        let expected_first = format!("Terminology:\n\n- 术语\\.一 → 翻译\\(一\\)\n\n{first_group}");
+        assert_eq!(first_size, expected_first.chars().count());
+
+        let second_size = candidate_user_character_count(
+            first_size,
+            true,
+            1,
+            1,
+            second_line,
+            second_group.chars().count(),
+        );
+        let expected_second = format!(
+            "Terminology:\n\n- 术语\\.一 → 翻译\\(一\\)\n- 术语二 → 翻译二\n\n{first_group}\n{second_group}"
+        );
+        assert_eq!(second_size, expected_second.chars().count());
+
+        let inserted_size = candidate_user_character_count(
+            first_group.chars().count(),
+            true,
+            0,
+            1,
+            first_line,
+            second_group.chars().count(),
+        );
+        let expected_inserted =
+            format!("Terminology:\n\n- 术语\\.一 → 翻译\\(一\\)\n\n{first_group}\n{second_group}");
+        assert_eq!(inserted_size, expected_inserted.chars().count());
+    }
+
+    #[test]
+    fn sparse_terminology_prompt_visits_only_matches_and_preserves_natural_order() {
+        let entries = (0..4_096)
+            .map(|index| {
+                crate::rpg_maker::translate::planning_resource::TerminologyEntry::new(
+                    format!("术语-{index:04}-末"),
+                    format!("译文-{index:04}-末"),
+                    vec![format!("触发-{index:04}-末")],
+                )
+            })
+            .collect();
+        let terminology =
+            super::super::planning_resource::compile_terminology(entries).expect("术语索引应建立");
+        let prompt = TerminologyPromptIndex::new(&terminology);
+        let selected = [4_095, 1, 2_048].into_iter().collect::<BTreeSet<_>>();
+
+        let mut sparse_lines = String::new();
+        let visited = prompt.append_selected(&mut sparse_lines, &selected);
+        assert_eq!(visited, 3, "渲染工作量必须只随实际命中数增长");
+        assert_eq!(
+            sparse_lines,
+            concat!(
+                "- 术语\\-0001\\-末 → 译文\\-0001\\-末\n",
+                "- 术语\\-2048\\-末 → 译文\\-2048\\-末\n",
+                "- 术语\\-4095\\-末 → 译文\\-4095\\-末\n",
+            ),
+            "稀疏索引不得改变术语文件自然顺序或 Markdown 转义"
+        );
+
+        let rendered = render_user_markdown(&[], None, &prompt, &selected);
+        assert_eq!(rendered, format!("Terminology:\n\n{sparse_lines}"));
     }
 
     #[tokio::test]

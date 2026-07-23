@@ -1,13 +1,13 @@
 //! RPG Maker 固定提取、规则提取与 Lua 提取共用的语义文本快照。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 
 use crate::rpg_maker::model::{
-    DirectTextPart, DirectTextRecipe, LogicalTextLocation, MutationClaim, MutationClaimSet,
-    MutationResource, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe, TextUnitContent,
-    TextUnitRole, mutation_claims_for_group,
+    DirectTextPart, DirectTextRecipe, LogicalTextLocation, MutationClaim, MutationClaimIndex,
+    MutationClaimSet, MutationResource, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe,
+    TextUnitContent, TextUnitRole, mutation_claims_for_group,
 };
 pub(crate) use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind,
@@ -368,55 +368,112 @@ impl LuaSnapshot {
 fn normalize_groups(
     groups: Vec<ExtractedTextGroup>,
 ) -> Result<Vec<ExtractedTextGroup>, SnapshotModelError> {
-    let mut merged = Vec::<(
-        (RpgMakerLocation, TextGroupKind),
-        (Vec<ExtractedTextUnit>, Vec<TextProjectionRecipe>),
-    )>::new();
-    let mut indexes = BTreeMap::<(RpgMakerLocation, TextGroupKind), usize>::new();
-    for group in groups {
-        let key = (group.group_location, group.kind);
-        let index = if let Some(index) = indexes.get(&key).copied() {
-            index
+    normalize_groups_with_rebuild_observer(groups, || {})
+}
+
+enum NormalizedGroupSlot {
+    Complete(Option<ExtractedTextGroup>),
+    Merged {
+        group_location: RpgMakerLocation,
+        kind: TextGroupKind,
+        units: Vec<ExtractedTextUnit>,
+        recipes: Vec<TextProjectionRecipe>,
+    },
+}
+
+fn normalize_groups_with_rebuild_observer(
+    input: Vec<ExtractedTextGroup>,
+    mut observe_rebuild: impl FnMut(),
+) -> Result<Vec<ExtractedTextGroup>, SnapshotModelError> {
+    let mut merged = Vec::<NormalizedGroupSlot>::with_capacity(input.len());
+    let mut indexes = HashMap::<RpgMakerLocation, usize>::new();
+    for group in input {
+        if let Some(index) = indexes.get(&group.group_location).copied() {
+            let slot = &mut merged[index];
+            match slot {
+                NormalizedGroupSlot::Complete(existing) => {
+                    let existing_kind = existing
+                        .as_ref()
+                        .expect("尚未归并的完整文本组必须存在")
+                        .kind;
+                    if existing_kind != group.kind {
+                        return Err(SnapshotModelError::ConflictingGroupKind {
+                            group_location: Box::new(group.group_location),
+                            first: existing_kind,
+                            second: group.kind,
+                        });
+                    }
+                    let ExtractedTextGroup {
+                        kind,
+                        group_location,
+                        mut units,
+                        mutation_claims: _,
+                        mut recipes,
+                    } = existing.take().expect("完整文本组只会在首次重复时拆解");
+                    units.extend(group.units);
+                    recipes.extend(group.recipes);
+                    *slot = NormalizedGroupSlot::Merged {
+                        group_location,
+                        kind,
+                        units,
+                        recipes,
+                    };
+                }
+                NormalizedGroupSlot::Merged {
+                    group_location,
+                    kind,
+                    units,
+                    recipes,
+                } => {
+                    if *kind != group.kind {
+                        return Err(SnapshotModelError::ConflictingGroupKind {
+                            group_location: Box::new(group.group_location),
+                            first: *kind,
+                            second: group.kind,
+                        });
+                    }
+                    debug_assert_eq!(*group_location, group.group_location);
+                    units.extend(group.units);
+                    recipes.extend(group.recipes);
+                }
+            }
         } else {
             let index = merged.len();
-            indexes.insert(key.clone(), index);
-            merged.push((key, (Vec::new(), Vec::new())));
-            index
-        };
-        let entry = &mut merged[index].1;
-        entry.0.extend(group.units);
-        entry.1.extend(group.recipes);
+            indexes.insert(group.group_location.clone(), index);
+            merged.push(NormalizedGroupSlot::Complete(Some(group)));
+        }
     }
 
     let mut groups = Vec::with_capacity(merged.len());
-    for ((group_location, kind), (units, recipes)) in merged {
-        groups.push(ExtractedTextGroup::projected(
-            kind,
-            group_location,
-            units,
-            recipes,
-        )?);
+    let mut total_claim_locks = 0usize;
+    for slot in merged {
+        let group = match slot {
+            NormalizedGroupSlot::Complete(group) => group.expect("未重复文本组必须保持完整"),
+            NormalizedGroupSlot::Merged {
+                group_location,
+                kind,
+                units,
+                recipes,
+            } => {
+                observe_rebuild();
+                ExtractedTextGroup::projected(kind, group_location, units, recipes)?
+            }
+        };
+        total_claim_locks = total_claim_locks
+            .checked_add(group.mutation_claims.locks().len())
+            .expect("内存中的 Mutation Claim 锁总数必须可用 usize 表达");
+        groups.push(group);
     }
 
-    let mut logical_locations = BTreeSet::new();
-    let mut claim_sets = Vec::<&MutationClaimSet>::new();
+    let mut claim_index = MutationClaimIndex::with_capacity(total_claim_locks);
     for group in &groups {
-        for unit in &group.units {
-            let logical_location = unit.logical_location(&group.group_location);
-            if !logical_locations.insert(logical_location.clone()) {
-                return Err(SnapshotModelError::DuplicateLogicalLocation {
-                    logical_location: Box::new(logical_location),
-                });
-            }
-        }
-        for existing in &claim_sets {
-            if let Some(conflict) = existing.conflict_with(&group.mutation_claims) {
-                return Err(SnapshotModelError::MutationClaimConflict {
-                    resource: Box::new(conflict.resource().clone()),
-                });
-            }
-        }
-        claim_sets.push(&group.mutation_claims);
+        // group_location 已在上面的唯一索引中归并；每个完整或重建 Group 又由
+        // `ExtractedTextGroup::projected` 验证角色唯一，因此跨组逻辑位置不可能重复。
+        claim_index
+            .insert(&group.mutation_claims)
+            .map_err(|conflict| SnapshotModelError::MutationClaimConflict {
+                resource: Box::new(conflict.resource().clone()),
+            })?;
     }
     Ok(groups)
 }
@@ -446,6 +503,11 @@ pub(crate) enum SnapshotModelError {
     },
     DuplicateLogicalLocation {
         logical_location: Box<LogicalTextLocation>,
+    },
+    ConflictingGroupKind {
+        group_location: Box<RpgMakerLocation>,
+        first: TextGroupKind,
+        second: TextGroupKind,
     },
     MutationClaimConflict {
         resource: Box<MutationResource>,
@@ -506,6 +568,14 @@ impl fmt::Display for SnapshotModelError {
             Self::DuplicateLogicalLocation { logical_location } => {
                 write!(formatter, "快照包含重复逻辑文本地址：{logical_location:?}")
             }
+            Self::ConflictingGroupKind {
+                group_location,
+                first,
+                second,
+            } => write!(
+                formatter,
+                "同一文本组位置 {group_location} 声明了不同类型：{first:?} 与 {second:?}"
+            ),
             Self::MutationClaimConflict { resource } => {
                 write!(formatter, "快照包含冲突的物理修改声明：{resource:?}")
             }
@@ -649,6 +719,100 @@ mod tests {
         .expect("decoded right 组应合法");
         RulesSnapshot::new(vec![decoded_left_group, decoded_right_group])
             .expect("decoded siblings 只能共享 Intent，必须允许同 owner 共存");
+    }
+
+    #[test]
+    fn group_location_is_the_unique_identity_even_when_kinds_differ() {
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let group_location =
+            RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(1)]);
+        let unit = |field: &str, key: &str| {
+            ExtractedTextUnit::new(
+                field,
+                RpgMakerLocation::value(
+                    source.clone(),
+                    vec![
+                        RpgMakerLocationStep::index(1),
+                        RpgMakerLocationStep::key(key),
+                    ],
+                ),
+                "原文",
+            )
+            .expect("测试单元应合法")
+        };
+        let first = ExtractedTextGroup::new(
+            TextGroupKind::DatabaseEntry,
+            group_location.clone(),
+            vec![unit("name", "name")],
+        )
+        .expect("首组应合法");
+        let second = ExtractedTextGroup::new(
+            TextGroupKind::System,
+            group_location.clone(),
+            vec![unit("description", "description")],
+        )
+        .expect("第二组应合法");
+
+        assert_eq!(
+            RulesSnapshot::new(vec![first, second]),
+            Err(SnapshotModelError::ConflictingGroupKind {
+                group_location: Box::new(group_location),
+                first: TextGroupKind::DatabaseEntry,
+                second: TextGroupKind::System,
+            })
+        );
+    }
+
+    #[test]
+    fn normalization_rebuilds_only_truly_duplicated_locations_in_a_large_snapshot() {
+        const UNIQUE_GROUPS: usize = 20_000;
+
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let make_group = |index: usize, field: &str| {
+            let group_location =
+                RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(index)]);
+            let unit = ExtractedTextUnit::new(
+                field,
+                RpgMakerLocation::value(
+                    source.clone(),
+                    vec![
+                        RpgMakerLocationStep::index(index),
+                        RpgMakerLocationStep::key(field),
+                    ],
+                ),
+                "文本",
+            )
+            .expect("测试单元应合法");
+            ExtractedTextGroup::new(TextGroupKind::DatabaseEntry, group_location, vec![unit])
+                .expect("测试组应合法")
+        };
+
+        let groups = (0..UNIQUE_GROUPS)
+            .map(|index| make_group(index, "name"))
+            .collect::<Vec<_>>();
+        let first_units = groups[0].units.as_ptr();
+        let first_recipes = groups[0].recipes.as_ptr();
+        let mut rebuilds = 0;
+        let normalized = normalize_groups_with_rebuild_observer(groups, || rebuilds += 1)
+            .expect("大量唯一位置应可直接规范化");
+
+        assert_eq!(normalized.len(), UNIQUE_GROUPS);
+        assert_eq!(rebuilds, 0, "唯一位置不得再次运行完整投影构造");
+        assert_eq!(normalized[0].units.as_ptr(), first_units);
+        assert_eq!(normalized[0].recipes.as_ptr(), first_recipes);
+
+        let mut rebuilds = 0;
+        let normalized = normalize_groups_with_rebuild_observer(
+            vec![
+                make_group(UNIQUE_GROUPS, "name"),
+                make_group(UNIQUE_GROUPS, "description"),
+            ],
+            || rebuilds += 1,
+        )
+        .expect("同位置的互补字段应归并");
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].units.len(), 2);
+        assert_eq!(rebuilds, 1, "只有真实重复位置的桶需要重建一次");
     }
 
     #[test]

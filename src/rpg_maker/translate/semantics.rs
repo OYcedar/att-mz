@@ -405,6 +405,59 @@ pub(crate) enum ResolvedTranslationSemanticError {
     AcceptCandidate(super::executor::TranslationCandidateTechnicalError),
 }
 
+impl ResolvedTranslationSemanticError {
+    /// 只公开闭集错误类型中的稳定机制事实；原文、译文和生成的 token 均不进入诊断。
+    pub(crate) fn safe_detail(&self) -> String {
+        match self {
+            Self::ProtectPlaceholder(source) => placeholder_protection_detail(source),
+            Self::ProjectLanguageText(source) => format!(
+                "semantic=language_projection; {}",
+                super::executor::language_projection_detail(source)
+            ),
+            Self::AcceptCandidate(source) => {
+                format!("semantic=candidate_validation; {}", source.safe_detail())
+            }
+        }
+    }
+}
+
+fn placeholder_protection_detail(source: &PlaceholderProtectionError) -> String {
+    match source {
+        PlaceholderProtectionError::Match(source) => {
+            let kind = match source.kind() {
+                pcre2::ErrorKind::Compile => "compile",
+                pcre2::ErrorKind::JIT => "jit",
+                pcre2::ErrorKind::Match => "match",
+                pcre2::ErrorKind::Info => "info",
+                pcre2::ErrorKind::Option => "option",
+                _ => "unknown",
+            };
+            let offset = source
+                .offset()
+                .map_or_else(|| "none".to_owned(), |offset| offset.to_string());
+            format!(
+                "semantic=placeholder_protection; failure=match; engine=pcre2; kind={kind}; code={}; offset={offset}",
+                source.code()
+            )
+        }
+        PlaceholderProtectionError::EmptyMatch { .. } => {
+            "semantic=placeholder_protection; failure=empty_match".to_owned()
+        }
+        PlaceholderProtectionError::MissingTextCapture { rule_number } => format!(
+            "semantic=placeholder_protection; failure=missing_text_capture; rule={rule_number}"
+        ),
+        PlaceholderProtectionError::InvalidMatchRange { rule_number } => format!(
+            "semantic=placeholder_protection; failure=invalid_match_range; rule={rule_number}"
+        ),
+        PlaceholderProtectionError::OverlappingMatches { .. } => {
+            "semantic=placeholder_protection; failure=overlapping_matches".to_owned()
+        }
+        PlaceholderProtectionError::ReservedTokenNamespace => {
+            "semantic=placeholder_protection; failure=reserved_token_namespace".to_owned()
+        }
+    }
+}
+
 impl fmt::Display for ResolvedTranslationSemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

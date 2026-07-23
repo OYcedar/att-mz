@@ -1,9 +1,9 @@
 //! 严格 TOML 配置边界。
 //!
-//! 原始 TOML 只在本模块存在。结构和字段类型全部通过后，本模块继续建立非零资源
-//! 上限、路径基准、语言模块与 Profile 唯一性；业务和根适配器只接收受信配置。
+//! 原始 TOML 只在本模块存在。结构和字段类型全部通过后，本模块继续建立路径基准、
+//! 语言模块、LLM Client 外部约束与 Profile 唯一性；业务和根适配器只接收受信配置。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -25,35 +25,26 @@ use super::arguments::{
     WriteBackArguments,
 };
 
+use crate::diagnostic::ConfigurationValueRule;
 use crate::i18n::UiLocale;
 use crate::language::{
     EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
-    JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageId,
-    LanguageModule, LanguageModuleCatalog, QuotePair,
+    JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseQuoteRepairPolicyError,
+    JapaneseResidualPolicy, LanguageId, LanguageIdError, LanguageModule, LanguageModuleCatalog,
+    LanguageModuleCatalogBuildError, LanguagePolicyConfigurationError, QuotePair,
 };
 use crate::rpg_maker::ProjectName;
 use crate::rpg_maker::extract::document::RpgMakerDocumentReadingConfig;
-use crate::rpg_maker::extract::store::asset_store::RpgMakerExtractionAssetStoreConfig;
-use crate::rpg_maker::lua::json::HostValueBudget;
 use crate::rpg_maker::lua::lua54::TrustedLua54RuntimeConfiguration;
-use crate::rpg_maker::standard_asset::RpgMakerStandardAssetReadingConfig;
 use crate::rpg_maker::translate::profile::RpgMakerTranslationRequestConfiguration;
-use crate::rpg_maker::translate::result_store::RpgMakerStandardTranslationResultStorageConfig;
 use crate::rpg_maker::{RpgMakerEngine, RpgMakerLayout};
-use crate::runtime::cpu::{CpuExecutorConfig, CpuWorkerThreads};
-use crate::runtime::filesystem::{
-    DirectoryPublisherConfig, ExclusiveFileLeaseConfig, SystemFileSystemConfig, TreeBudget,
-};
+use crate::runtime::cpu::CpuExecutorConfig;
+use crate::runtime::filesystem::{DirectoryPublisherConfig, SystemFileSystemConfig};
 use crate::runtime::llm::{
     LlmProxyConfiguration, OpenAiChatCompletionClient, OpenAiExecutorConfiguration,
 };
-use crate::runtime::project_log::{ProjectLogConfig, ProjectLogConfigInput, ProjectLogLevel};
-use crate::runtime::sqlite::{
-    RusqliteStorageConfiguration, SqliteJournalMode as RuntimeSqliteJournalMode,
-    SqliteSynchronous as RuntimeSqliteSynchronous,
-};
+use crate::runtime::sqlite::RusqliteStorageConfiguration;
 
-const MAX_CONFIGURATION_BYTES: u64 = 4 * 1024 * 1024;
 const RESERVED_REQUEST_BODY_FIELDS: [&str; 3] = ["model", "messages", "stream"];
 
 /// 根据命令行显式路径选择配置文件位置。
@@ -101,29 +92,13 @@ pub(crate) fn load_product_configuration(
             path: configuration_path,
         });
     }
-    if metadata.len() > MAX_CONFIGURATION_BYTES {
-        return Err(ConfigurationLoadError::TooLarge {
-            path: configuration_path,
-            observed_bytes: metadata.len(),
-            maximum_bytes: MAX_CONFIGURATION_BYTES,
-        });
-    }
-
-    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    let mut bytes = Zeroizing::new(Vec::new());
     file.by_ref()
-        .take(MAX_CONFIGURATION_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|source| ConfigurationLoadError::Read {
             path: configuration_path.clone(),
             source,
         })?;
-    if bytes.len() as u64 > MAX_CONFIGURATION_BYTES {
-        return Err(ConfigurationLoadError::TooLarge {
-            path: configuration_path,
-            observed_bytes: bytes.len() as u64,
-            maximum_bytes: MAX_CONFIGURATION_BYTES,
-        });
-    }
 
     let source = std::str::from_utf8(bytes.as_slice()).map_err(|source| {
         ConfigurationLoadError::InvalidUtf8 {
@@ -132,7 +107,7 @@ pub(crate) fn load_product_configuration(
             error_len: source.error_len(),
         }
     })?;
-    validate_top_level(source, &configuration_path)?;
+    validate_configuration_field_names(source, &configuration_path)?;
     let configuration_directory = configuration_path
         .parent()
         .expect("规范绝对文件路径必须拥有父目录")
@@ -165,10 +140,6 @@ pub(crate) struct ConfiguredProductCommand {
 }
 
 impl ConfiguredProductCommand {
-    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
-        self.command.common()
-    }
-
     pub(crate) fn into_parts(self) -> (RpgMakerLayout, ConfiguredRpgMakerCommand) {
         (self.layout, self.command)
     }
@@ -249,29 +220,15 @@ impl ConfiguredRpgMakerCommand {
         dialogue_rules_path: Option<PathBuf>,
     ) -> Result<Self, ConfigurationLoadError> {
         let raw_common: RawCommonConfiguration = parse_selected(source, configuration_path)?;
-        let requires_two_sqlite_connections = match &command {
-            RpgMakerCommandArguments::Init(_) => true,
-            RpgMakerCommandArguments::Extract(arguments) => arguments.lua.is_some(),
-            RpgMakerCommandArguments::Translate(arguments) => arguments.lua.is_some(),
-            RpgMakerCommandArguments::WriteBack(arguments) => arguments.lua.is_some(),
-        };
-        if requires_two_sqlite_connections && raw_common.runtime.sqlite.max_open_connections < 2 {
-            return Err(ConfigurationLoadError::InvalidValue(invalid(
-                "runtime.sqlite.max_open_connections",
-                "Init 的数据库快照或本次所选 Lua 会话需要至少两个连接",
-            )));
-        }
-        let supports_lua_session = raw_common.runtime.sqlite.max_open_connections >= 2;
         let common = CommonCommandConfiguration::build(configuration_directory, raw_common)
             .map_err(ConfigurationLoadError::InvalidValue)?;
 
         match command {
             RpgMakerCommandArguments::Init(arguments) => {
-                let raw: RawInitSelection = parse_selected(source, configuration_path)?;
+                let _: RawInitSelection = parse_selected(source, configuration_path)?;
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
                     layout.engine(),
-                    raw.runtime.filesystem.publisher,
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
                 Ok(Self::Init(ConfiguredInitCommand {
@@ -283,13 +240,10 @@ impl ConfiguredRpgMakerCommand {
             RpgMakerCommandArguments::Extract(arguments) => {
                 let deferred_source =
                     Arc::new(DeferredConfigurationSource::new(configuration_path, source));
-                let deferred_lua = DeferredLuaRuntimeConfiguration::new(
-                    Arc::clone(&deferred_source),
-                    supports_lua_session,
-                );
-                let raw: RawExtractSelection = parse_selected(source, configuration_path)?;
-                let cpu = build_cpu_configuration(raw.runtime.cpu)
-                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                let deferred_lua =
+                    DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source));
+                let _: RawExtractSelection = parse_selected(source, configuration_path)?;
+                let cpu = build_cpu_configuration();
                 let ExtractArguments {
                     project,
                     builtin,
@@ -303,8 +257,7 @@ impl ConfiguredRpgMakerCommand {
                             .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
                     })
                     .transpose()?;
-                let rpg_maker = ExtractConfiguration::build(raw.rpg_maker, builtin, rules)
-                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                let rpg_maker = ExtractConfiguration::build(builtin, rules);
                 Ok(Self::Extract(ConfiguredExtractCommand {
                     project_name: project.name,
                     common,
@@ -318,18 +271,10 @@ impl ConfiguredRpgMakerCommand {
             RpgMakerCommandArguments::Translate(arguments) => {
                 let deferred_source =
                     Arc::new(DeferredConfigurationSource::new(configuration_path, source));
-                let deferred_lua = DeferredLuaRuntimeConfiguration::new(
-                    Arc::clone(&deferred_source),
-                    supports_lua_session,
-                );
+                let deferred_lua =
+                    DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source));
                 let raw: RawTranslateSelection = parse_selected(source, configuration_path)?;
-                let cpu = build_cpu_configuration(raw.runtime.cpu)
-                    .map_err(ConfigurationLoadError::InvalidValue)?;
-                let llm = SelectedLlmExecutorConfiguration::build(
-                    configuration_directory,
-                    raw.runtime.llm,
-                )
-                .map_err(ConfigurationLoadError::InvalidValue)?;
+                let cpu = build_cpu_configuration();
                 let TranslateArguments {
                     project,
                     profile_id,
@@ -357,7 +302,6 @@ impl ConfiguredRpgMakerCommand {
                     placeholder_rules_path: placeholders,
                     common,
                     cpu,
-                    llm,
                     lua,
                     deferred_lua,
                     profile: ConfiguredTranslateProfile::Deferred {
@@ -374,15 +318,12 @@ impl ConfiguredRpgMakerCommand {
             RpgMakerCommandArguments::WriteBack(arguments) => {
                 let deferred_source =
                     Arc::new(DeferredConfigurationSource::new(configuration_path, source));
-                let deferred_lua =
-                    DeferredLuaRuntimeConfiguration::new(deferred_source, supports_lua_session);
-                let raw: RawWriteBackSelection = parse_selected(source, configuration_path)?;
-                let cpu = build_cpu_configuration(raw.runtime.cpu)
-                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                let deferred_lua = DeferredLuaRuntimeConfiguration::new(deferred_source);
+                let _: RawWriteBackSelection = parse_selected(source, configuration_path)?;
+                let cpu = build_cpu_configuration();
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
                     layout.engine(),
-                    raw.runtime.filesystem.publisher,
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
                 let WriteBackArguments { project, lua } = arguments;
@@ -393,8 +334,7 @@ impl ConfiguredRpgMakerCommand {
                             .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
                     })
                     .transpose()?;
-                let rpg_maker = WriteBackConfiguration::build(raw.rpg_maker)
-                    .map_err(ConfigurationLoadError::InvalidValue)?;
+                let rpg_maker = WriteBackConfiguration::build();
                 Ok(Self::WriteBack(ConfiguredWriteBackCommand {
                     project_name: project.name,
                     common,
@@ -407,24 +347,12 @@ impl ConfiguredRpgMakerCommand {
             }
         }
     }
-
-    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
-        match self {
-            Self::Init(command) => &command.common,
-            Self::Extract(command) => &command.common,
-            Self::Translate(command) => &command.common,
-            Self::WriteBack(command) => &command.common,
-        }
-    }
 }
 
 pub(crate) struct CommonCommandConfiguration {
     projects_root: PathBuf,
-    async_runtime: AsyncRuntimeConfiguration,
     filesystem: SystemFileSystemConfig,
     sqlite: RusqliteStorageConfiguration,
-    observability_root: PathBuf,
-    project_log: ProjectLogConfig,
 }
 
 impl CommonCommandConfiguration {
@@ -436,24 +364,13 @@ impl CommonCommandConfiguration {
             checked_path("projects.root", configuration_directory, raw.projects.root)?;
         Ok(Self {
             projects_root,
-            async_runtime: AsyncRuntimeConfiguration::build(raw.runtime.async_runtime)?,
-            filesystem: build_file_system_configuration(raw.runtime.filesystem)?,
-            sqlite: build_sqlite_configuration(raw.runtime.sqlite)?,
-            observability_root: checked_path(
-                "observability.root",
-                configuration_directory,
-                raw.observability.root,
-            )?,
-            project_log: build_project_log_configuration(raw.observability.log)?,
+            filesystem: build_file_system_configuration(),
+            sqlite: build_sqlite_configuration(),
         })
     }
 
     pub(crate) fn projects_root(&self) -> &Path {
         &self.projects_root
-    }
-
-    pub(crate) const fn async_runtime(&self) -> AsyncRuntimeConfiguration {
-        self.async_runtime
     }
 
     pub(crate) const fn filesystem(&self) -> &SystemFileSystemConfig {
@@ -462,14 +379,6 @@ impl CommonCommandConfiguration {
 
     pub(crate) const fn sqlite(&self) -> &RusqliteStorageConfiguration {
         &self.sqlite
-    }
-
-    pub(crate) fn observability_root(&self) -> &Path {
-        &self.observability_root
-    }
-
-    pub(crate) const fn project_log(&self) -> ProjectLogConfig {
-        self.project_log
     }
 }
 
@@ -538,7 +447,6 @@ pub(crate) struct ConfiguredTranslateCommand {
     placeholder_rules_path: Option<PathBuf>,
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
-    llm: SelectedLlmExecutorConfiguration,
     lua: Option<SelectedLuaConfiguration>,
     deferred_lua: DeferredLuaRuntimeConfiguration,
     profile: ConfiguredTranslateProfile,
@@ -549,7 +457,7 @@ enum ConfiguredTranslateProfile {
         source: Arc<DeferredConfigurationSource>,
         configuration: PendingTranslateConfiguration,
     },
-    Resolved(TranslateConfiguration),
+    Resolved(Box<TranslateConfiguration>),
 }
 
 impl ConfiguredTranslateCommand {
@@ -573,8 +481,8 @@ impl ConfiguredTranslateCommand {
         self.cpu
     }
 
-    pub(crate) const fn llm(&self) -> &SelectedLlmExecutorConfiguration {
-        &self.llm
+    pub(crate) fn llm(&self) -> &SelectedLlmExecutorConfiguration {
+        self.rpg_maker().llm()
     }
 
     pub(crate) const fn lua(&self) -> Option<&SelectedLuaConfiguration> {
@@ -617,7 +525,6 @@ impl ConfiguredTranslateCommand {
             placeholder_rules_path,
             common,
             cpu,
-            llm,
             lua,
             deferred_lua,
             profile,
@@ -626,11 +533,9 @@ impl ConfiguredTranslateCommand {
             ConfiguredTranslateProfile::Deferred {
                 source,
                 configuration,
-            } => ConfiguredTranslateProfile::Resolved(configuration.resolve(
-                source.as_ref(),
-                profile_id,
-                llm.total_capacity(),
-            )?),
+            } => ConfiguredTranslateProfile::Resolved(Box::new(
+                configuration.resolve(source.as_ref(), profile_id)?,
+            )),
             ConfiguredTranslateProfile::Resolved(configuration)
                 if configuration.profile().id() == profile_id =>
             {
@@ -651,7 +556,6 @@ impl ConfiguredTranslateCommand {
             placeholder_rules_path,
             common,
             cpu,
-            llm,
             lua,
             deferred_lua,
             profile,
@@ -720,198 +624,34 @@ impl ConfiguredWriteBackCommand {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct AsyncRuntimeConfiguration {
-    worker_threads: NonZeroUsize,
-    max_blocking_threads: NonZeroUsize,
-    blocking_thread_keep_alive: Duration,
+fn build_cpu_configuration() -> CpuExecutorConfig {
+    CpuExecutorConfig::production()
 }
 
-impl AsyncRuntimeConfiguration {
-    fn build(raw: RawAsyncRuntimeConfiguration) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
-            worker_threads: non_zero_usize("runtime.async.worker_threads", raw.worker_threads)?,
-            max_blocking_threads: non_zero_usize(
-                "runtime.async.max_blocking_threads",
-                raw.max_blocking_threads,
-            )?,
-            blocking_thread_keep_alive: positive_duration(
-                "runtime.async.blocking_thread_keep_alive_ms",
-                raw.blocking_thread_keep_alive_ms,
-            )?,
-        })
-    }
-
-    pub(crate) const fn worker_threads(self) -> NonZeroUsize {
-        self.worker_threads
-    }
-
-    pub(crate) const fn max_blocking_threads(self) -> NonZeroUsize {
-        self.max_blocking_threads
-    }
-
-    pub(crate) const fn blocking_thread_keep_alive(self) -> Duration {
-        self.blocking_thread_keep_alive
-    }
-}
-
-fn build_cpu_configuration(
-    raw: RawCpuRuntimeConfiguration,
-) -> Result<CpuExecutorConfig, ConfigurationValueError> {
-    let worker_threads = match raw.worker_threads {
-        RawCpuWorkerThreads::Auto(value) if value == "auto" => CpuWorkerThreads::Auto,
-        RawCpuWorkerThreads::Auto(_) => {
-            return Err(invalid(
-                "runtime.cpu.worker_threads",
-                "字符串只接受精确小写 auto",
-            ));
-        }
-        RawCpuWorkerThreads::Fixed(value) => {
-            CpuWorkerThreads::Fixed(non_zero_usize("runtime.cpu.worker_threads", value)?)
-        }
-    };
-    CpuExecutorConfig::new(
-        worker_threads,
-        usize_value("runtime.cpu.queue_capacity", raw.queue_capacity)?,
-    )
-    .map_err(|source| invalid("runtime.cpu", source.to_string()))
-}
-
-fn build_file_system_configuration(
-    raw: RawCommonFilesystemRuntimeConfiguration,
-) -> Result<SystemFileSystemConfig, ConfigurationValueError> {
-    let tree = TreeBudget::new(
-        usize_value("runtime.filesystem.tree.max_entries", raw.tree.max_entries)?,
-        usize_value("runtime.filesystem.tree.max_depth", raw.tree.max_depth)?,
-        raw.tree.max_bytes,
-        raw.tree.max_single_file_bytes,
-    )
-    .map_err(|source| invalid("runtime.filesystem.tree", source.to_string()))?;
-    let project_lease = ExclusiveFileLeaseConfig::new(positive_duration(
-        "runtime.filesystem.project_lock.timeout_ms",
-        raw.project_lock.timeout_ms,
-    )?)
-    .map_err(|source| invalid("runtime.filesystem.project_lock", source.to_string()))?;
-
-    SystemFileSystemConfig::new(
-        usize_value("runtime.filesystem.worker_threads", raw.worker_threads)?,
-        usize_value("runtime.filesystem.queue_capacity", raw.queue_capacity)?,
-        raw.max_read_bytes,
-        usize_value(
-            "runtime.filesystem.max_directory_entries",
-            raw.max_directory_entries,
-        )?,
-        tree,
-        project_lease,
-    )
-    .map_err(|source| invalid("runtime.filesystem", source.to_string()))
+fn build_file_system_configuration() -> SystemFileSystemConfig {
+    SystemFileSystemConfig::production()
 }
 
 fn build_directory_publisher_configuration(
     projects_root: &Path,
     engine: RpgMakerEngine,
-    raw: RawDirectoryPublisherConfiguration,
 ) -> Result<DirectoryPublisherConfig, ConfigurationValueError> {
-    DirectoryPublisherConfig::new(
+    DirectoryPublisherConfig::production(
         projects_root
             .join(".att-locks")
             .join("directory-publish")
             .join(engine.storage_name()),
-        usize_value(
-            "runtime.filesystem.publisher.max_recovery_artifacts_per_target",
-            raw.max_recovery_artifacts_per_target,
-        )?,
-        positive_duration(
-            "runtime.filesystem.publisher.target_lock_timeout_ms",
-            raw.target_lock_timeout_ms,
-        )?,
     )
-    .map_err(|source| invalid("runtime.filesystem.publisher", source.to_string()))
-}
-
-fn build_sqlite_configuration(
-    raw: RawSqliteRuntimeConfiguration,
-) -> Result<RusqliteStorageConfiguration, ConfigurationValueError> {
-    let journal_mode = match raw.journal_mode {
-        RawSqliteJournalMode::Delete => RuntimeSqliteJournalMode::Delete,
-        RawSqliteJournalMode::Truncate => RuntimeSqliteJournalMode::Truncate,
-        RawSqliteJournalMode::Persist => RuntimeSqliteJournalMode::Persist,
-        RawSqliteJournalMode::Wal => RuntimeSqliteJournalMode::Wal,
-    };
-    let synchronous = match raw.synchronous {
-        RawSqliteSynchronous::Normal => RuntimeSqliteSynchronous::Normal,
-        RawSqliteSynchronous::Full => RuntimeSqliteSynchronous::Full,
-        RawSqliteSynchronous::Extra => RuntimeSqliteSynchronous::Extra,
-    };
-
-    RusqliteStorageConfiguration::new(
-        non_zero_usize(
-            "runtime.sqlite.short_worker_threads",
-            raw.short_worker_threads,
-        )?,
-        non_zero_usize(
-            "runtime.sqlite.short_queue_capacity",
-            raw.short_queue_capacity,
-        )?,
-        non_zero_usize(
-            "runtime.sqlite.max_open_connections",
-            raw.max_open_connections,
-        )?,
-        non_zero_usize("runtime.sqlite.worker_stack_bytes", raw.worker_stack_bytes)?,
-        non_zero_usize(
-            "runtime.sqlite.max_statement_bytes",
-            raw.max_statement_bytes,
-        )?,
-        non_zero_usize(
-            "runtime.sqlite.max_parameter_bytes",
-            raw.max_parameter_bytes,
-        )?,
-        non_zero_usize("runtime.sqlite.max_rows_per_query", raw.max_rows_per_query)?,
-        non_zero_usize(
-            "runtime.sqlite.max_result_bytes_per_query",
-            raw.max_result_bytes_per_query,
-        )?,
-        positive_duration("runtime.sqlite.busy_timeout_ms", raw.busy_timeout_ms)?,
-        journal_mode,
-        synchronous,
-    )
-    .map_err(|source| invalid("runtime.sqlite", source.to_string()))
-}
-
-fn build_project_log_configuration(
-    raw: RawProjectLogConfiguration,
-) -> Result<ProjectLogConfig, ConfigurationValueError> {
-    let level = match raw.level {
-        RawProjectLogLevel::Error => ProjectLogLevel::Error,
-        RawProjectLogLevel::Warn => ProjectLogLevel::Warn,
-        RawProjectLogLevel::Info => ProjectLogLevel::Info,
-        RawProjectLogLevel::Debug => ProjectLogLevel::Debug,
-    };
-    ProjectLogConfig::try_from(ProjectLogConfigInput {
-        level,
-        queue_capacity: usize_value("observability.log.queue_capacity", raw.queue_capacity)?,
-        batch_max_records: usize_value(
-            "observability.log.batch_max_records",
-            raw.batch_max_records,
-        )?,
-        batch_max_bytes: usize_value("observability.log.batch_max_bytes", raw.batch_max_bytes)?,
-        flush_interval: positive_duration(
-            "observability.log.flush_interval_ms",
-            raw.flush_interval_ms,
-        )?,
-        shutdown_timeout: positive_duration(
-            "observability.log.shutdown_timeout_ms",
-            raw.shutdown_timeout_ms,
-        )?,
-        lock_timeout: positive_duration("observability.log.lock_timeout_ms", raw.lock_timeout_ms)?,
-        max_record_bytes: usize_value("observability.log.max_record_bytes", raw.max_record_bytes)?,
-        max_file_bytes: raw.max_file_bytes,
-        retained_rotated_files: usize_value(
-            "observability.log.retained_rotated_files",
-            raw.retained_rotated_files,
-        )?,
+    .map_err(|_| {
+        invalid(
+            "projects.root",
+            ConfigurationValueRule::RuntimeConfigurationInvalid,
+        )
     })
-    .map_err(|source| invalid("observability.log", source.to_string()))
+}
+
+fn build_sqlite_configuration() -> RusqliteStorageConfiguration {
+    RusqliteStorageConfiguration::production()
 }
 
 /// 保留仅能在项目运行方案解析后按需消费的配置原文。
@@ -941,29 +681,15 @@ impl DeferredConfigurationSource {
 
 struct DeferredLuaRuntimeConfiguration {
     source: Arc<DeferredConfigurationSource>,
-    has_sqlite_session_capacity: bool,
 }
 
 impl DeferredLuaRuntimeConfiguration {
-    fn new(source: Arc<DeferredConfigurationSource>, has_sqlite_session_capacity: bool) -> Self {
-        Self {
-            source,
-            has_sqlite_session_capacity,
-        }
+    fn new(source: Arc<DeferredConfigurationSource>) -> Self {
+        Self { source }
     }
 
     fn resolve(&self) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
-        if !self.has_sqlite_session_capacity {
-            return Err(ConfigurationLoadError::InvalidValueAtPath {
-                path: self.source.path().to_path_buf(),
-                source: invalid(
-                    "runtime.sqlite.max_open_connections",
-                    "项目状态所选 Lua 会话与命令短操作共享连接预算，必须拥有第二个连接",
-                ),
-            });
-        }
-        parse_lua_configuration(self.source.source(), self.source.path())
-            .map_err(|error| error.with_configuration_path(self.source.path()))
+        Ok(TrustedLua54RuntimeConfiguration::production())
     }
 }
 
@@ -992,93 +718,12 @@ impl SelectedLuaConfiguration {
 #[derive(Clone)]
 pub(crate) struct SelectedLlmExecutorConfiguration {
     runtime: OpenAiExecutorConfiguration,
-    total_capacity: NonZeroUsize,
     additional_pem_files: Vec<PathBuf>,
 }
 
 impl SelectedLlmExecutorConfiguration {
-    fn build(
-        configuration_directory: &Path,
-        raw: RawLlmRuntimeConfiguration,
-    ) -> Result<Self, ConfigurationValueError> {
-        let proxy = match raw.proxy {
-            RawProxyConfiguration::Disabled(false) => LlmProxyConfiguration::Disabled,
-            RawProxyConfiguration::Disabled(true) => {
-                return Err(invalid(
-                    "runtime.llm.proxy",
-                    "代理只能用 false 关闭，或提供完整 URL",
-                ));
-            }
-            RawProxyConfiguration::Url(value) => {
-                let url = Url::parse(&value)
-                    .map_err(|_| invalid("runtime.llm.proxy", "代理 URL 无效"))?;
-                if !matches!(url.scheme(), "http" | "https") {
-                    return Err(invalid(
-                        "runtime.llm.proxy",
-                        "代理 URL 只接受 http 或 https",
-                    ));
-                }
-                if !url.username().is_empty() || url.password().is_some() {
-                    return Err(invalid("runtime.llm.proxy", "代理 URL 不得内嵌凭据"));
-                }
-                LlmProxyConfiguration::Explicit(url)
-            }
-        };
-
-        let mut additional_pem_files = Vec::with_capacity(raw.tls.additional_pem_files.len());
-        let mut seen_pem_files = BTreeSet::new();
-        for (index, path) in raw.tls.additional_pem_files.into_iter().enumerate() {
-            let field = format!("runtime.llm.tls.additional_pem_files[{index}]");
-            let path = checked_path(&field, configuration_directory, path)?;
-            if !seen_pem_files.insert(path.clone()) {
-                return Err(invalid(&field, "PEM 路径重复"));
-            }
-            additional_pem_files.push(path);
-        }
-
-        let max_active_requests =
-            non_zero_usize("runtime.llm.max_active_requests", raw.max_active_requests)?;
-        let queue_capacity = usize_value("runtime.llm.queue_capacity", raw.queue_capacity)?;
-        let total_capacity = max_active_requests
-            .get()
-            .checked_add(queue_capacity)
-            .and_then(NonZeroUsize::new)
-            .ok_or_else(|| invalid("runtime.llm.queue_capacity", "活动与排队总容量溢出"))?;
-        if total_capacity.get() > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(invalid(
-                "runtime.llm.queue_capacity",
-                format!(
-                    "活动与排队总容量超过调度器支持上限 {}",
-                    tokio::sync::Semaphore::MAX_PERMITS
-                ),
-            ));
-        }
-        let runtime = OpenAiExecutorConfiguration::new(
-            max_active_requests,
-            total_capacity,
-            positive_duration("runtime.llm.admission_timeout_ms", raw.admission_timeout_ms)?,
-            positive_duration("runtime.llm.connect_timeout_ms", raw.connect_timeout_ms)?,
-            positive_duration("runtime.llm.read_timeout_ms", raw.read_timeout_ms)?,
-            positive_duration("runtime.llm.pool_idle_timeout_ms", raw.pool_idle_timeout_ms)?,
-            usize_value(
-                "runtime.llm.pool_max_idle_per_host",
-                raw.pool_max_idle_per_host,
-            )?,
-            proxy,
-        );
-        Ok(Self {
-            runtime,
-            total_capacity,
-            additional_pem_files,
-        })
-    }
-
     pub(crate) fn additional_pem_files(&self) -> &[PathBuf] {
         &self.additional_pem_files
-    }
-
-    pub(crate) const fn total_capacity(&self) -> NonZeroUsize {
-        self.total_capacity
     }
 
     pub(crate) fn with_pem_roots(&self, roots: Vec<Vec<u8>>) -> OpenAiExecutorConfiguration {
@@ -1100,22 +745,16 @@ pub(crate) struct ExtractConfiguration {
     document: RpgMakerDocumentReadingConfig,
     builtin: bool,
     rules: Option<SelectedRulesConfiguration>,
-    extract_store: RpgMakerExtractionAssetStoreConfig,
 }
 
 impl ExtractConfiguration {
-    fn build(
-        raw: RawExtractRpgMakerSelection,
-        select_builtin: bool,
-        rules_path: Option<PathBuf>,
-    ) -> Result<Self, ConfigurationValueError> {
+    fn build(select_builtin: bool, rules_path: Option<PathBuf>) -> Self {
         let rules = rules_path.map(|rules_path| SelectedRulesConfiguration { rules_path });
-        Ok(Self {
-            document: build_document_configuration(raw.document)?,
+        Self {
+            document: build_document_configuration(),
             builtin: select_builtin,
             rules,
-            extract_store: build_extraction_store_configuration(raw.extract.store)?,
-        })
+        }
     }
 
     pub(crate) const fn document(&self) -> RpgMakerDocumentReadingConfig {
@@ -1129,26 +768,19 @@ impl ExtractConfiguration {
     pub(crate) const fn rules(&self) -> Option<&SelectedRulesConfiguration> {
         self.rules.as_ref()
     }
-
-    pub(crate) const fn extract_store(&self) -> RpgMakerExtractionAssetStoreConfig {
-        self.extract_store
-    }
 }
 
 pub(crate) struct TranslateConfiguration {
-    standard_asset: RpgMakerStandardAssetReadingConfig,
-    translate_store: RpgMakerStandardTranslationResultStorageConfig,
     prompt_root: PathBuf,
     prompt_locale: PromptLocaleSelection,
     thinking_output: bool,
     language_modules: LanguageModuleCatalog,
     profile: TranslationProfileConfiguration,
     client: Arc<OpenAiChatCompletionClient>,
+    llm: SelectedLlmExecutorConfiguration,
 }
 
 struct PendingTranslateConfiguration {
-    standard_asset: RpgMakerStandardAssetReadingConfig,
-    translate_store: RpgMakerStandardTranslationResultStorageConfig,
     prompt_root: PathBuf,
     prompt_locale: PromptLocaleSelection,
     thinking_output: bool,
@@ -1176,7 +808,7 @@ impl PendingTranslateConfiguration {
         configuration_directory: &Path,
         raw_prompts: RawPromptsConfiguration,
         raw_languages: Vec<RawLanguageConfiguration>,
-        raw: RawTranslateRpgMakerSelection,
+        _raw: RawTranslateRpgMakerSelection,
     ) -> Result<Self, ConfigurationValueError> {
         let prompt_locale = if raw_prompts.locale == "auto" {
             PromptLocaleSelection::Auto
@@ -1185,14 +817,12 @@ impl PendingTranslateConfiguration {
                 UiLocale::match_automatic(&raw_prompts.locale).ok_or_else(|| {
                     invalid(
                         "prompts.locale",
-                        "必须是精确小写 auto 或受支持的 BCP 47 UI locale",
+                        ConfigurationValueRule::UnsupportedPromptLocale,
                     )
                 })?,
             )
         };
         Ok(Self {
-            standard_asset: build_standard_asset_configuration(raw.standard_asset)?,
-            translate_store: build_translation_store_configuration(raw.translate.store)?,
             prompt_root: checked_path("prompts.root", configuration_directory, raw_prompts.root)?,
             prompt_locale,
             thinking_output: raw_prompts.thinking_output,
@@ -1204,68 +834,38 @@ impl PendingTranslateConfiguration {
         self,
         source: &DeferredConfigurationSource,
         profile_id: &str,
-        llm_capacity: NonZeroUsize,
     ) -> Result<TranslateConfiguration, ConfigurationLoadError> {
         let selected_profile =
             parse_selected_translation_profile(source.source(), source.path(), profile_id)?;
         let llm_client_id = selected_profile.llm_client.clone();
         let raw_client = parse_selected_llm_client(source.source(), source.path(), &llm_client_id)?;
-        let client = Arc::new(
-            build_llm_client(format!("llm.clients.{llm_client_id}").as_str(), raw_client)
-                .map_err(ConfigurationLoadError::InvalidValue)
-                .map_err(|error| error.with_configuration_path(source.path()))?,
-        );
-        let profile =
-            build_selected_translation_profile("rpg_maker.translation_profiles", selected_profile)
-                .map_err(ConfigurationLoadError::InvalidValue)
-                .map_err(|error| error.with_configuration_path(source.path()))?;
-        if profile.max_in_flight_tasks() > llm_capacity {
-            return Err(ConfigurationLoadError::InvalidValueAtPath {
-                path: source.path().to_path_buf(),
-                source: invalid(
-                    "rpg_maker.translation_profiles.max_in_flight_tasks",
-                    format!(
-                        "任务并发数 {} 超过 runtime.llm 的活动与排队总容量 {}",
-                        profile.max_in_flight_tasks(),
-                        llm_capacity
-                    ),
-                ),
-            });
-        }
-        if profile.max_in_flight_tasks().get() > tokio::sync::Semaphore::MAX_PERMITS / 2 {
-            return Err(ConfigurationLoadError::InvalidValueAtPath {
-                path: source.path().to_path_buf(),
-                source: invalid(
-                    "rpg_maker.translation_profiles.max_in_flight_tasks",
-                    format!(
-                        "任务并发数超过顺序最终化窗口支持上限 {}",
-                        tokio::sync::Semaphore::MAX_PERMITS / 2
-                    ),
-                ),
-            });
-        }
+        let built_client = build_llm_client(
+            format!("llm.clients.{llm_client_id}").as_str(),
+            source.path().parent().expect("配置文件必须拥有父目录"),
+            raw_client,
+        )
+        .map_err(ConfigurationLoadError::InvalidValue)
+        .map_err(|error| error.with_configuration_path(source.path()))?;
+        let profile = build_selected_translation_profile(
+            "rpg_maker.translation_profiles",
+            selected_profile,
+            built_client.request,
+        )
+        .map_err(ConfigurationLoadError::InvalidValue)
+        .map_err(|error| error.with_configuration_path(source.path()))?;
         Ok(TranslateConfiguration {
-            standard_asset: self.standard_asset,
-            translate_store: self.translate_store,
             prompt_root: self.prompt_root,
             prompt_locale: self.prompt_locale,
             thinking_output: self.thinking_output,
             language_modules: self.language_modules,
             profile,
-            client,
+            client: Arc::new(built_client.client),
+            llm: built_client.executor,
         })
     }
 }
 
 impl TranslateConfiguration {
-    pub(crate) const fn standard_asset(&self) -> RpgMakerStandardAssetReadingConfig {
-        self.standard_asset
-    }
-
-    pub(crate) const fn translate_store(&self) -> RpgMakerStandardTranslationResultStorageConfig {
-        self.translate_store
-    }
-
     pub(crate) const fn profile(&self) -> &TranslationProfileConfiguration {
         &self.profile
     }
@@ -1289,84 +889,36 @@ impl TranslateConfiguration {
     pub(crate) const fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
         &self.client
     }
+
+    pub(crate) const fn llm(&self) -> &SelectedLlmExecutorConfiguration {
+        &self.llm
+    }
 }
 
 pub(crate) struct WriteBackConfiguration {
     document: RpgMakerDocumentReadingConfig,
-    standard_asset: RpgMakerStandardAssetReadingConfig,
 }
 
 impl WriteBackConfiguration {
-    fn build(raw: RawWriteBackRpgMakerSelection) -> Result<Self, ConfigurationValueError> {
-        Ok(Self {
-            document: build_document_configuration(raw.document)?,
-            standard_asset: build_standard_asset_configuration(raw.standard_asset)?,
-        })
+    fn build() -> Self {
+        Self {
+            document: build_document_configuration(),
+        }
     }
 
     pub(crate) const fn document(&self) -> RpgMakerDocumentReadingConfig {
         self.document
     }
-
-    pub(crate) const fn standard_asset(&self) -> RpgMakerStandardAssetReadingConfig {
-        self.standard_asset
-    }
 }
 
-fn build_document_configuration(
-    raw: RawRpgMakerDocumentConfiguration,
-) -> Result<RpgMakerDocumentReadingConfig, ConfigurationValueError> {
-    Ok(RpgMakerDocumentReadingConfig::new(non_zero_usize(
-        "rpg_maker.document.read_concurrency",
-        raw.read_concurrency,
-    )?))
-}
-
-fn build_standard_asset_configuration(
-    raw: RawRpgMakerStandardAssetConfiguration,
-) -> Result<RpgMakerStandardAssetReadingConfig, ConfigurationValueError> {
-    Ok(RpgMakerStandardAssetReadingConfig::new(non_zero_usize(
-        "rpg_maker.standard_asset.units_per_decode_job",
-        raw.units_per_decode_job,
-    )?))
-}
-
-fn build_extraction_store_configuration(
-    raw: RawRpgMakerExtractStoreConfiguration,
-) -> Result<RpgMakerExtractionAssetStoreConfig, ConfigurationValueError> {
-    Ok(RpgMakerExtractionAssetStoreConfig::new(non_zero_usize(
-        "rpg_maker.extract.store.groups_per_encode_job",
-        raw.groups_per_encode_job,
-    )?))
-}
-
-fn build_translation_store_configuration(
-    raw: RawRpgMakerTranslateStoreConfiguration,
-) -> Result<RpgMakerStandardTranslationResultStorageConfig, ConfigurationValueError> {
-    Ok(RpgMakerStandardTranslationResultStorageConfig::new(
-        non_zero_usize(
-            "rpg_maker.translate.store.units_per_encode_job",
-            raw.units_per_encode_job,
-        )?,
-    ))
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct TranslationPlanningConfiguration {
-    max_message_characters: NonZeroUsize,
-}
-
-impl TranslationPlanningConfiguration {
-    pub(crate) const fn max_message_characters(&self) -> NonZeroUsize {
-        self.max_message_characters
-    }
+fn build_document_configuration() -> RpgMakerDocumentReadingConfig {
+    RpgMakerDocumentReadingConfig::new(NonZeroUsize::new(8).expect("产品并发值必须非零"))
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct TranslationProfileConfiguration {
     id: String,
-    max_in_flight_tasks: NonZeroUsize,
-    planning: TranslationPlanningConfiguration,
+    max_task_message_characters: NonZeroUsize,
     request: RpgMakerTranslationRequestConfiguration,
 }
 
@@ -1375,12 +927,8 @@ impl TranslationProfileConfiguration {
         &self.id
     }
 
-    pub(crate) const fn max_in_flight_tasks(&self) -> NonZeroUsize {
-        self.max_in_flight_tasks
-    }
-
-    pub(crate) const fn planning(&self) -> &TranslationPlanningConfiguration {
-        &self.planning
+    pub(crate) const fn max_task_message_characters(&self) -> NonZeroUsize {
+        self.max_task_message_characters
     }
 
     pub(crate) const fn request(&self) -> &RpgMakerTranslationRequestConfiguration {
@@ -1409,7 +957,7 @@ fn build_language_modules(
                     )?,
                     allowed_terms,
                 )
-                .map_err(|source| invalid(field.as_str(), source.to_string()))?;
+                .map_err(|source| invalid(field.as_str(), language_policy_rule(&source)))?;
                 let quote_repair = (!quote_repair_pairs.is_empty())
                     .then(|| {
                         JapaneseQuoteRepairPolicy::new(
@@ -1420,7 +968,7 @@ fn build_language_modules(
                         )
                     })
                     .transpose()
-                    .map_err(|source| invalid(field.as_str(), source.to_string()))?;
+                    .map_err(|source| invalid(field.as_str(), quote_repair_rule(&source)))?;
                 (
                     id,
                     Arc::new(JapaneseLanguageModule::new(residual, quote_repair)),
@@ -1446,7 +994,7 @@ fn build_language_modules(
                     )?,
                     ignored_terms,
                 )
-                .map_err(|source| invalid(field.as_str(), source.to_string()))?;
+                .map_err(|source| invalid(field.as_str(), language_policy_rule(&source)))?;
                 let residual = EnglishResidualPolicy::new(
                     non_zero_usize(
                         format!("{field}.minimum_copied_word_count").as_str(),
@@ -1458,7 +1006,7 @@ fn build_language_modules(
                     )?,
                     allowed_terms,
                 )
-                .map_err(|source| invalid(field.as_str(), source.to_string()))?;
+                .map_err(|source| invalid(field.as_str(), language_policy_rule(&source)))?;
                 (
                     id,
                     Arc::new(EnglishLanguageModule::new(detection, residual)),
@@ -1466,53 +1014,117 @@ fn build_language_modules(
             }
         };
         let id = LanguageId::parse(&id)
-            .map_err(|source| invalid(format!("{field}.id").as_str(), source.to_string()))?;
+            .map_err(|source| invalid(format!("{field}.id").as_str(), language_id_rule(&source)))?;
         if !language_ids.insert(id.as_str().to_owned()) {
-            return Err(invalid(field.as_str(), format!("源语言 ID 重复：{id}")));
+            return Err(invalid(
+                field.as_str(),
+                ConfigurationValueRule::LanguageIdDuplicate,
+            ));
         }
         bindings.push((id, module));
     }
 
     let catalog = LanguageModuleCatalog::new(bindings)
-        .map_err(|source| invalid("languages", source.to_string()))?;
+        .map_err(|source| invalid("languages", language_catalog_rule(&source)))?;
     Ok(catalog)
+}
+
+const fn language_policy_rule(source: &LanguagePolicyConfigurationError) -> ConfigurationValueRule {
+    match source {
+        LanguagePolicyConfigurationError::BlankTerm => {
+            ConfigurationValueRule::LanguagePolicyTermBlank
+        }
+        LanguagePolicyConfigurationError::SurroundingWhitespace { .. } => {
+            ConfigurationValueRule::LanguagePolicyTermSurroundingWhitespace
+        }
+        LanguagePolicyConfigurationError::DuplicateTerm { .. } => {
+            ConfigurationValueRule::LanguagePolicyTermDuplicate
+        }
+    }
+}
+
+const fn quote_repair_rule(source: &JapaneseQuoteRepairPolicyError) -> ConfigurationValueRule {
+    match source {
+        JapaneseQuoteRepairPolicyError::EmptyCandidatePairs => {
+            ConfigurationValueRule::QuoteRepairCandidatesEmpty
+        }
+        JapaneseQuoteRepairPolicyError::InvalidDelimiterCharacter { .. } => {
+            ConfigurationValueRule::QuoteRepairDelimiterInvalid
+        }
+        JapaneseQuoteRepairPolicyError::DuplicatePair { .. } => {
+            ConfigurationValueRule::QuoteRepairPairDuplicate
+        }
+        JapaneseQuoteRepairPolicyError::AmbiguousCharacter { .. } => {
+            ConfigurationValueRule::QuoteRepairDelimiterAmbiguous
+        }
+    }
+}
+
+const fn language_id_rule(source: &LanguageIdError) -> ConfigurationValueRule {
+    match source {
+        LanguageIdError::Blank => ConfigurationValueRule::LanguageIdBlank,
+        LanguageIdError::SurroundingWhitespace { .. } => {
+            ConfigurationValueRule::LanguageIdSurroundingWhitespace
+        }
+        LanguageIdError::Underscore { .. } => ConfigurationValueRule::LanguageIdUsesUnderscore,
+        LanguageIdError::InvalidSyntax { .. } => ConfigurationValueRule::LanguageIdInvalidSyntax,
+        LanguageIdError::InvalidRegistryTag { .. } => {
+            ConfigurationValueRule::LanguageIdInvalidRegistryTag
+        }
+        LanguageIdError::CanonicalizationFailed { .. } => {
+            ConfigurationValueRule::LanguageIdCanonicalizationFailed
+        }
+        LanguageIdError::UndefinedPrimaryLanguage { .. } => {
+            ConfigurationValueRule::LanguageIdUndefinedPrimaryLanguage
+        }
+    }
+}
+
+const fn language_catalog_rule(source: &LanguageModuleCatalogBuildError) -> ConfigurationValueRule {
+    match source {
+        LanguageModuleCatalogBuildError::MissingLanguageModule => {
+            ConfigurationValueRule::LanguageCatalogEmpty
+        }
+        LanguageModuleCatalogBuildError::DuplicateLanguageId { .. } => {
+            ConfigurationValueRule::LanguageIdDuplicate
+        }
+    }
 }
 
 fn build_selected_translation_profile(
     field: &str,
     raw: RawSelectedTranslationProfileConfiguration,
+    request: RpgMakerTranslationRequestConfiguration,
 ) -> Result<TranslationProfileConfiguration, ConfigurationValueError> {
     validate_exact_identifier(format!("{field}.id").as_str(), &raw.id)?;
     validate_exact_identifier(format!("{field}.llm_client").as_str(), &raw.llm_client)?;
     Ok(TranslationProfileConfiguration {
         id: raw.id,
-        max_in_flight_tasks: non_zero_usize(
-            format!("{field}.max_in_flight_tasks").as_str(),
-            raw.max_in_flight_tasks,
+        max_task_message_characters: non_zero_usize(
+            format!("{field}.max_task_message_characters").as_str(),
+            raw.max_task_message_characters,
         )?,
-        planning: TranslationPlanningConfiguration {
-            max_message_characters: non_zero_usize(
-                format!("{field}.planning.max_message_characters").as_str(),
-                raw.planning.max_message_characters,
-            )?,
-        },
-        request: RpgMakerTranslationRequestConfiguration::new(
-            raw.execution
-                .network_retry_delays_ms
-                .into_iter()
-                .map(Duration::from_millis)
-                .collect(),
-            Duration::from_millis(raw.execution.max_network_retry_after_ms),
-        ),
+        request,
     })
+}
+
+struct BuiltLlmClient {
+    executor: SelectedLlmExecutorConfiguration,
+    client: OpenAiChatCompletionClient,
+    request: RpgMakerTranslationRequestConfiguration,
 }
 
 fn build_llm_client(
     field: &str,
+    configuration_directory: &Path,
     raw: RawLlmClientConfiguration,
-) -> Result<OpenAiChatCompletionClient, ConfigurationValueError> {
-    let url =
-        Url::parse(&raw.url).map_err(|_| invalid(format!("{field}.url").as_str(), "URL 无效"))?;
+) -> Result<BuiltLlmClient, ConfigurationValueError> {
+    let url = Url::parse(&raw.url).map_err(|_| {
+        invalid(
+            format!("{field}.url").as_str(),
+            ConfigurationValueRule::UrlInvalid,
+        )
+    })?;
     validate_llm_url(format!("{field}.url").as_str(), &url)?;
     validate_exact_identifier(format!("{field}.model").as_str(), &raw.model)?;
 
@@ -1520,19 +1132,19 @@ fn build_llm_client(
     if exposed_api_key.trim().is_empty() {
         return Err(invalid(
             format!("{field}.api_key").as_str(),
-            "API key 不能为空白",
+            ConfigurationValueRule::SecretBlank,
         ));
     }
     if exposed_api_key.trim() != exposed_api_key {
         return Err(invalid(
             format!("{field}.api_key").as_str(),
-            "API key 不能包含首尾空白",
+            ConfigurationValueRule::SecretSurroundingWhitespace,
         ));
     }
     if reqwest::header::HeaderValue::from_bytes(exposed_api_key.as_bytes()).is_err() {
         return Err(invalid(
             format!("{field}.api_key").as_str(),
-            "API key 不能安全写入 HTTP Header",
+            ConfigurationValueRule::SecretInvalidHeader,
         ));
     }
 
@@ -1542,11 +1154,10 @@ fn build_llm_client(
     serde_json::from_str::<StrictJsonValue>(&raw.parameters).map_err(|error| {
         invalid(
             format!("{field}.parameters").as_str(),
-            format!(
-                "不是有效的严格 JSON（第 {} 行，第 {} 列）",
-                error.line(),
-                error.column()
-            ),
+            ConfigurationValueRule::StrictJsonInvalid {
+                line: u64::try_from(error.line()).unwrap_or(u64::MAX),
+                column: u64::try_from(error.column()).unwrap_or(u64::MAX),
+            },
         )
     })?;
     let parameter_value = serde_json::from_str::<JsonValue>(&raw.parameters)
@@ -1554,53 +1165,159 @@ fn build_llm_client(
     let JsonValue::Object(parameters) = parameter_value else {
         return Err(invalid(
             format!("{field}.parameters").as_str(),
-            "必须是 JSON 对象",
+            ConfigurationValueRule::JsonObjectRequired,
         ));
     };
     for reserved in RESERVED_REQUEST_BODY_FIELDS {
         if parameters.contains_key(reserved) {
             return Err(invalid(
                 format!("{field}.parameters.{reserved}").as_str(),
-                "该顶层字段由请求协议固定拥有，不能通过 parameters 覆盖",
+                ConfigurationValueRule::ReservedRequestField,
             ));
         }
     }
 
-    Ok(OpenAiChatCompletionClient::new(
+    let proxy = match raw.proxy {
+        RawProxyConfiguration::Disabled(false) => LlmProxyConfiguration::Disabled,
+        RawProxyConfiguration::Disabled(true) => {
+            return Err(invalid(
+                format!("{field}.proxy").as_str(),
+                ConfigurationValueRule::ProxyMustBeFalseOrUrl,
+            ));
+        }
+        RawProxyConfiguration::Url(value) => {
+            let url = Url::parse(&value).map_err(|_| {
+                invalid(
+                    format!("{field}.proxy").as_str(),
+                    ConfigurationValueRule::UrlInvalid,
+                )
+            })?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(invalid(
+                    format!("{field}.proxy").as_str(),
+                    ConfigurationValueRule::UrlSchemeUnsupported,
+                ));
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                return Err(invalid(
+                    format!("{field}.proxy").as_str(),
+                    ConfigurationValueRule::UrlCredentialsForbidden,
+                ));
+            }
+            LlmProxyConfiguration::Explicit(url)
+        }
+    };
+    let mut additional_pem_files = Vec::with_capacity(raw.additional_pem_files.len());
+    let mut seen_pem_files = BTreeSet::new();
+    for (index, path) in raw.additional_pem_files.into_iter().enumerate() {
+        let pem_field = format!("{field}.additional_pem_files[{index}]");
+        let path = checked_path(&pem_field, configuration_directory, path)?;
+        if !seen_pem_files.insert(path.clone()) {
+            return Err(invalid(
+                &pem_field,
+                ConfigurationValueRule::PemPathDuplicate,
+            ));
+        }
+        additional_pem_files.push(path);
+    }
+    let max_concurrent_requests = non_zero_usize(
+        format!("{field}.max_concurrent_requests").as_str(),
+        raw.max_concurrent_requests,
+    )?;
+    if max_concurrent_requests.get() > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(invalid(
+            format!("{field}.max_concurrent_requests").as_str(),
+            ConfigurationValueRule::RuntimeMaximumExceeded {
+                actual: u64::try_from(max_concurrent_requests.get()).unwrap_or(u64::MAX),
+                maximum: u64::try_from(tokio::sync::Semaphore::MAX_PERMITS).unwrap_or(u64::MAX),
+            },
+        ));
+    }
+    let connect_timeout = positive_duration(
+        format!("{field}.connect_timeout_ms").as_str(),
+        raw.connect_timeout_ms,
+    )?;
+    let read_timeout = positive_duration(
+        format!("{field}.read_timeout_ms").as_str(),
+        raw.read_timeout_ms,
+    )?;
+    let request_timeout = positive_duration(
+        format!("{field}.request_timeout_ms").as_str(),
+        raw.request_timeout_ms,
+    )?;
+    let rate_limit = raw
+        .rate_limit
+        .map(|rate| {
+            Ok((
+                non_zero_u32(
+                    format!("{field}.rate_limit.requests_per_minute").as_str(),
+                    rate.requests_per_minute,
+                )?,
+                non_zero_u32(format!("{field}.rate_limit.burst").as_str(), rate.burst)?,
+            ))
+        })
+        .transpose()?;
+    let request = RpgMakerTranslationRequestConfiguration::new(
+        raw.retry_delays_ms
+            .into_iter()
+            .map(Duration::from_millis)
+            .collect(),
+        Duration::from_millis(raw.max_retry_after_ms),
+    );
+    let client = OpenAiChatCompletionClient::new(
         url,
         raw.api_key,
         raw.model,
-        positive_duration(format!("{field}.timeout_ms").as_str(), raw.timeout_ms)?,
-        non_zero_u32(format!("{field}.rpm").as_str(), raw.rpm)?,
-        non_zero_u32(format!("{field}.burst").as_str(), raw.burst)?,
+        max_concurrent_requests,
+        request_timeout,
+        rate_limit,
         parameters,
-    ))
+    );
+    Ok(BuiltLlmClient {
+        executor: SelectedLlmExecutorConfiguration {
+            runtime: OpenAiExecutorConfiguration::new(
+                max_concurrent_requests,
+                connect_timeout,
+                read_timeout,
+                proxy,
+            ),
+            additional_pem_files,
+        },
+        client,
+        request,
+    })
 }
 
 fn validate_llm_url(field: &str, url: &Url) -> Result<(), ConfigurationValueError> {
     if url.username() != "" || url.password().is_some() {
-        return Err(invalid(field, "URL 不得内嵌凭据"));
+        return Err(invalid(
+            field,
+            ConfigurationValueRule::UrlCredentialsForbidden,
+        ));
     }
     if url.fragment().is_some() {
-        return Err(invalid(field, "URL 不得包含 fragment"));
+        return Err(invalid(field, ConfigurationValueRule::UrlFragmentForbidden));
     }
     match url.scheme() {
         "http" | "https" => Ok(()),
-        _ => Err(invalid(field, "URL 只接受 http 或 https")),
+        _ => Err(invalid(field, ConfigurationValueRule::UrlSchemeUnsupported)),
     }
 }
 
 fn validate_exact_identifier(field: &str, value: &str) -> Result<(), ConfigurationValueError> {
     validate_non_blank(field, value)?;
     if value.trim() != value {
-        return Err(invalid(field, "值含首尾空白"));
+        return Err(invalid(
+            field,
+            ConfigurationValueRule::ValueSurroundingWhitespace,
+        ));
     }
     Ok(())
 }
 
 fn validate_non_blank(field: &str, value: &str) -> Result<(), ConfigurationValueError> {
     if value.trim().is_empty() {
-        Err(invalid(field, "值不能为空白"))
+        Err(invalid(field, ConfigurationValueRule::ValueBlank))
     } else {
         Ok(())
     }
@@ -1612,7 +1329,7 @@ fn checked_path(
     value: PathBuf,
 ) -> Result<PathBuf, ConfigurationValueError> {
     if value.as_os_str().is_empty() {
-        return Err(invalid(field, "路径不能为空"));
+        return Err(invalid(field, ConfigurationValueRule::PathBlank));
     }
     Ok(resolve_path(configuration_directory, &value))
 }
@@ -1758,29 +1475,52 @@ where
 
 fn non_zero_usize(field: &str, value: u64) -> Result<NonZeroUsize, ConfigurationValueError> {
     let value = usize_value(field, value)?;
-    NonZeroUsize::new(value).ok_or_else(|| invalid(field, "值必须大于零"))
+    NonZeroUsize::new(value).ok_or_else(|| {
+        invalid(
+            field,
+            ConfigurationValueRule::PositiveRequired { actual: 0 },
+        )
+    })
 }
 
 fn usize_value(field: &str, value: u64) -> Result<usize, ConfigurationValueError> {
-    usize::try_from(value).map_err(|_| invalid(field, "值超出本平台 usize 范围"))
+    usize::try_from(value).map_err(|_| {
+        invalid(
+            field,
+            ConfigurationValueRule::UsizeRangeExceeded { actual: value },
+        )
+    })
 }
 
 fn non_zero_u32(field: &str, value: u64) -> Result<NonZeroU32, ConfigurationValueError> {
-    let value = u32::try_from(value).map_err(|_| invalid(field, "值超出 u32 范围"))?;
-    NonZeroU32::new(value).ok_or_else(|| invalid(field, "值必须大于零"))
+    let value = u32::try_from(value).map_err(|_| {
+        invalid(
+            field,
+            ConfigurationValueRule::U32RangeExceeded { actual: value },
+        )
+    })?;
+    NonZeroU32::new(value).ok_or_else(|| {
+        invalid(
+            field,
+            ConfigurationValueRule::PositiveRequired { actual: 0 },
+        )
+    })
 }
 
 fn positive_duration(field: &str, milliseconds: u64) -> Result<Duration, ConfigurationValueError> {
     if milliseconds == 0 {
-        return Err(invalid(field, "时长必须大于零"));
+        return Err(invalid(
+            field,
+            ConfigurationValueRule::PositiveRequired { actual: 0 },
+        ));
     }
     Ok(Duration::from_millis(milliseconds))
 }
 
-pub(super) fn invalid(field: &str, message: impl Into<String>) -> ConfigurationValueError {
+pub(super) fn invalid(field: &str, rule: ConfigurationValueRule) -> ConfigurationValueError {
     ConfigurationValueError {
         field: field.to_owned(),
-        message: message.into(),
+        rule,
     }
 }
 
@@ -1811,11 +1551,6 @@ pub(crate) enum ConfigurationLoadError {
     },
     NotAFile {
         path: PathBuf,
-    },
-    TooLarge {
-        path: PathBuf,
-        observed_bytes: u64,
-        maximum_bytes: u64,
     },
     Read {
         path: PathBuf,
@@ -1869,15 +1604,6 @@ impl fmt::Display for ConfigurationLoadError {
             Self::NotAFile { path } => {
                 write!(formatter, "配置路径不是普通文件：{}", path.display())
             }
-            Self::TooLarge {
-                path,
-                observed_bytes,
-                maximum_bytes,
-            } => write!(
-                formatter,
-                "配置文件 {} 大小为 {observed_bytes} 字节，超过 {maximum_bytes} 字节上限",
-                path.display()
-            ),
             Self::Read { path, source } => {
                 write!(formatter, "无法读取配置文件 {}：{source}", path.display())
             }
@@ -1937,7 +1663,6 @@ impl Error for ConfigurationLoadError {
             Self::Open { source, .. } | Self::Read { source, .. } => Some(source),
             Self::InvalidValue(source) | Self::InvalidValueAtPath { source, .. } => Some(source),
             Self::NotAFile { .. }
-            | Self::TooLarge { .. }
             | Self::InvalidUtf8 { .. }
             | Self::InvalidToml { .. }
             | Self::TranslationProfileNotFound { .. }
@@ -1970,44 +1695,38 @@ impl SourceLocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConfigurationValueError {
     field: String,
-    message: String,
+    rule: ConfigurationValueRule,
 }
 
 impl ConfigurationValueError {
-    /// 返回配置契约中的稳定字段身份；面向用户的原因由 i18n 闭集负责呈现。
+    /// 返回配置契约中的稳定字段身份。
     pub(crate) fn field(&self) -> &str {
         &self.field
+    }
+
+    /// 返回生产校验器在仍持有具体规则时保存的闭集安全原因。
+    pub(crate) const fn reason(&self) -> &ConfigurationValueRule {
+        &self.rule
     }
 }
 
 impl fmt::Display for ConfigurationValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}：{}", self.field, self.message)
+        write!(formatter, "{}：{}", self.field, self.rule.render())
     }
 }
 
 impl Error for ConfigurationValueError {}
 
-fn validate_top_level(source: &str, path: &Path) -> Result<(), ConfigurationLoadError> {
-    let raw: RawTopLevelSyntax = parse_selected(source, path)?;
-    let RawTopLevelSyntax {
-        _projects,
-        _runtime,
-        _observability,
-        _llm,
-        _prompts,
-        _languages,
-        _rpg_maker,
-    } = raw;
-    let _ = (
-        _projects,
-        _runtime,
-        _observability,
-        _llm,
-        _prompts,
-        _languages,
-        _rpg_maker,
-    );
+/// 先验证整份配置的字段集合，再按命令选择性解析实际值。
+///
+/// 这里的叶子统一使用 `IgnoredAny`：未知字段在任何分区都会失败，但未被本次命令
+/// 选择的密钥、Prompt 和业务值不会被物化，也不会在这里触发类型或语义校验。
+fn validate_configuration_field_names(
+    source: &str,
+    path: &Path,
+) -> Result<(), ConfigurationLoadError> {
+    let _: RawConfigurationFieldNames = parse_selected(source, path)?;
     Ok(())
 }
 
@@ -2130,45 +1849,6 @@ fn safe_toml_key_path(value: &str) -> bool {
         })
 }
 
-fn parse_lua_configuration(
-    source: &str,
-    path: &Path,
-) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
-    let raw: RawLuaSelection = parse_selected(source, path)?;
-    build_lua_configuration(raw.runtime.lua).map_err(ConfigurationLoadError::InvalidValue)
-}
-
-fn build_lua_configuration(
-    raw: RawLuaRuntimeConfiguration,
-) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationValueError> {
-    Ok(TrustedLua54RuntimeConfiguration::new(
-        non_zero_usize("runtime.lua.worker_stack_bytes", raw.worker_stack_bytes)?,
-        non_zero_usize(
-            "runtime.lua.memory_limit_bytes_per_vm",
-            raw.memory_limit_bytes_per_vm,
-        )?,
-        non_zero_u32(
-            "runtime.lua.cancel_check_instruction_interval",
-            raw.cancel_check_instruction_interval,
-        )?,
-        non_zero_usize("runtime.lua.max_error_bytes", raw.max_error_bytes)?,
-        HostValueBudget::new(
-            non_zero_usize(
-                "runtime.lua.host_values.max_bytes",
-                raw.host_values.max_bytes,
-            )?,
-            non_zero_usize(
-                "runtime.lua.host_values.max_nodes",
-                raw.host_values.max_nodes,
-            )?,
-            non_zero_usize(
-                "runtime.lua.host_values.max_depth",
-                raw.host_values.max_depth,
-            )?,
-        ),
-    ))
-}
-
 fn parse_selected_translation_profile(
     source: &str,
     path: &Path,
@@ -2183,7 +1863,7 @@ fn parse_selected_translation_profile(
     if selection.duplicate {
         return Err(ConfigurationLoadError::InvalidValue(invalid(
             "rpg_maker.translation_profiles",
-            format!("ID 重复：{requested_id}"),
+            ConfigurationValueRule::DuplicateProfileId,
         )));
     }
     let selected_index = selection.selected_index.ok_or_else(|| {
@@ -2201,7 +1881,7 @@ fn parse_selected_translation_profile(
         .ok_or_else(|| {
             ConfigurationLoadError::InvalidValue(invalid(
                 "rpg_maker.translation_profiles",
-                "所选 Profile 结构或字段类型无效",
+                ConfigurationValueRule::SelectedProfileInvalid,
             ))
         })
 }
@@ -2659,7 +2339,7 @@ fn parse_selected_llm_client(
     selected.ok_or_else(|| {
         ConfigurationLoadError::InvalidValue(invalid(
             "llm.clients",
-            format!("没有 ID 为 {requested_id} 的客户端"),
+            ConfigurationValueRule::ReferencedClientNotFound,
         ))
     })
 }
@@ -2812,29 +2492,133 @@ impl<'de> Visitor<'de> for SelectedLlmClientMapVisitor<'_> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTopLevelSyntax {
+struct RawConfigurationFieldNames {
     #[serde(default, rename = "projects")]
-    _projects: Option<IgnoredAny>,
-    #[serde(default, rename = "runtime")]
-    _runtime: Option<IgnoredAny>,
-    #[serde(default, rename = "observability")]
-    _observability: Option<IgnoredAny>,
+    _projects: Option<RawProjectsFieldNames>,
     #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
+    _llm: Option<RawLlmFieldNames>,
     #[serde(default, rename = "prompts")]
-    _prompts: Option<IgnoredAny>,
+    _prompts: Option<RawPromptsFieldNames>,
     #[serde(default, rename = "languages")]
-    _languages: Option<IgnoredAny>,
+    _languages: Option<Vec<RawLanguageFieldNames>>,
     #[serde(default, rename = "rpg_maker")]
-    _rpg_maker: Option<IgnoredAny>,
+    _rpg_maker: Option<RawRpgMakerFieldNames>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProjectsFieldNames {
+    #[serde(default, rename = "root")]
+    _root: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptsFieldNames {
+    #[serde(default, rename = "root")]
+    _root: Option<IgnoredAny>,
+    #[serde(default, rename = "locale")]
+    _locale: Option<IgnoredAny>,
+    #[serde(default, rename = "thinking_output")]
+    _thinking_output: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlmFieldNames {
+    #[serde(default, rename = "clients")]
+    _clients: Option<BTreeMap<String, RawLlmClientFieldNames>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlmClientFieldNames {
+    #[serde(default, rename = "url")]
+    _url: Option<IgnoredAny>,
+    #[serde(default, rename = "api_key")]
+    _api_key: Option<IgnoredAny>,
+    #[serde(default, rename = "model")]
+    _model: Option<IgnoredAny>,
+    #[serde(default, rename = "max_concurrent_requests")]
+    _max_concurrent_requests: Option<IgnoredAny>,
+    #[serde(default, rename = "connect_timeout_ms")]
+    _connect_timeout_ms: Option<IgnoredAny>,
+    #[serde(default, rename = "read_timeout_ms")]
+    _read_timeout_ms: Option<IgnoredAny>,
+    #[serde(default, rename = "request_timeout_ms")]
+    _request_timeout_ms: Option<IgnoredAny>,
+    #[serde(default, rename = "proxy")]
+    _proxy: Option<IgnoredAny>,
+    #[serde(default, rename = "additional_pem_files")]
+    _additional_pem_files: Option<IgnoredAny>,
+    #[serde(default, rename = "retry_delays_ms")]
+    _retry_delays_ms: Option<IgnoredAny>,
+    #[serde(default, rename = "max_retry_after_ms")]
+    _max_retry_after_ms: Option<IgnoredAny>,
+    #[serde(default, rename = "parameters")]
+    _parameters: Option<IgnoredAny>,
+    #[serde(default, rename = "rate_limit")]
+    _rate_limit: Option<RawLlmRateLimitFieldNames>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlmRateLimitFieldNames {
+    #[serde(default, rename = "requests_per_minute")]
+    _requests_per_minute: Option<IgnoredAny>,
+    #[serde(default, rename = "burst")]
+    _burst: Option<IgnoredAny>,
+}
+
+/// 字段名层只验证所有现行语言模块允许出现的字段集合；具体 `type` 对应哪些字段，
+/// 仍由 Translate 的第二遍解析负责，因此非 Translate 命令不会消费语言策略值。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLanguageFieldNames {
+    #[serde(default, rename = "type")]
+    _language_type: Option<IgnoredAny>,
+    #[serde(default, rename = "id")]
+    _id: Option<IgnoredAny>,
+    #[serde(default, rename = "minimum_kana_characters")]
+    _minimum_kana_characters: Option<IgnoredAny>,
+    #[serde(default, rename = "minimum_word_count")]
+    _minimum_word_count: Option<IgnoredAny>,
+    #[serde(default, rename = "minimum_letter_count")]
+    _minimum_letter_count: Option<IgnoredAny>,
+    #[serde(default, rename = "ignored_terms")]
+    _ignored_terms: Option<IgnoredAny>,
+    #[serde(default, rename = "minimum_copied_word_count")]
+    _minimum_copied_word_count: Option<IgnoredAny>,
+    #[serde(default, rename = "minimum_copied_letter_count")]
+    _minimum_copied_letter_count: Option<IgnoredAny>,
+    #[serde(default, rename = "allowed_terms")]
+    _allowed_terms: Option<IgnoredAny>,
+    #[serde(default, rename = "quote_repair_pairs")]
+    _quote_repair_pairs: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRpgMakerFieldNames {
+    #[serde(default, rename = "translation_profiles")]
+    _translation_profiles: Option<Vec<RawTranslationProfileFieldNames>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTranslationProfileFieldNames {
+    #[serde(default, rename = "id")]
+    _id: Option<IgnoredAny>,
+    #[serde(default, rename = "llm_client")]
+    _llm_client: Option<IgnoredAny>,
+    #[serde(default, rename = "max_task_message_characters")]
+    _max_task_message_characters: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCommonConfiguration {
     projects: RawProjectsConfiguration,
-    runtime: RawCommonRuntimeConfiguration,
-    observability: RawObservabilityConfiguration,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
     #[serde(default, rename = "prompts")]
@@ -2848,11 +2632,8 @@ struct RawCommonConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawInitSelection {
-    runtime: RawPublisherRuntimeSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
-    #[serde(default, rename = "observability")]
-    _observability: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
     #[serde(default, rename = "prompts")]
@@ -2866,60 +2647,8 @@ struct RawInitSelection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawExtractSelection {
-    runtime: RawCpuRuntimeSelection,
-    rpg_maker: RawExtractRpgMakerSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
-    #[serde(default, rename = "observability")]
-    _observability: Option<IgnoredAny>,
-    #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
-    #[serde(default, rename = "prompts")]
-    _prompts: Option<IgnoredAny>,
-    #[serde(default, rename = "languages")]
-    _languages: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTranslateSelection {
-    runtime: RawTranslateRuntimeSelection,
-    prompts: RawPromptsConfiguration,
-    languages: Vec<RawLanguageConfiguration>,
-    rpg_maker: RawTranslateRpgMakerSelection,
-    #[serde(default, rename = "projects")]
-    _projects: Option<IgnoredAny>,
-    #[serde(default, rename = "observability")]
-    _observability: Option<IgnoredAny>,
-    #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawWriteBackSelection {
-    runtime: RawWriteBackRuntimeSelection,
-    rpg_maker: RawWriteBackRpgMakerSelection,
-    #[serde(default, rename = "projects")]
-    _projects: Option<IgnoredAny>,
-    #[serde(default, rename = "observability")]
-    _observability: Option<IgnoredAny>,
-    #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
-    #[serde(default, rename = "prompts")]
-    _prompts: Option<IgnoredAny>,
-    #[serde(default, rename = "languages")]
-    _languages: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLuaSelection {
-    runtime: RawLuaRuntimeSelection,
-    #[serde(default, rename = "projects")]
-    _projects: Option<IgnoredAny>,
-    #[serde(default, rename = "observability")]
-    _observability: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
     #[serde(default, rename = "prompts")]
@@ -2932,137 +2661,36 @@ struct RawLuaSelection {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCpuRuntimeSelection {
-    cpu: RawCpuRuntimeConfiguration,
-    #[serde(rename = "async", default)]
-    _async_runtime: Option<IgnoredAny>,
-    #[serde(default, rename = "filesystem")]
-    _filesystem: Option<IgnoredAny>,
-    #[serde(default, rename = "sqlite")]
-    _sqlite: Option<IgnoredAny>,
-    #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
-    #[serde(default, rename = "lua")]
-    _lua: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTranslateRuntimeSelection {
-    cpu: RawCpuRuntimeConfiguration,
-    llm: RawLlmRuntimeConfiguration,
-    #[serde(rename = "async", default)]
-    _async_runtime: Option<IgnoredAny>,
-    #[serde(default, rename = "filesystem")]
-    _filesystem: Option<IgnoredAny>,
-    #[serde(default, rename = "sqlite")]
-    _sqlite: Option<IgnoredAny>,
-    #[serde(default, rename = "lua")]
-    _lua: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPublisherRuntimeSelection {
-    filesystem: RawPublisherFilesystemSelection,
-    #[serde(rename = "async", default)]
-    _async_runtime: Option<IgnoredAny>,
-    #[serde(default, rename = "cpu")]
-    _cpu: Option<IgnoredAny>,
-    #[serde(default, rename = "sqlite")]
-    _sqlite: Option<IgnoredAny>,
-    #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
-    #[serde(default, rename = "lua")]
-    _lua: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawWriteBackRuntimeSelection {
-    cpu: RawCpuRuntimeConfiguration,
-    filesystem: RawPublisherFilesystemSelection,
-    #[serde(rename = "async", default)]
-    _async_runtime: Option<IgnoredAny>,
-    #[serde(default, rename = "sqlite")]
-    _sqlite: Option<IgnoredAny>,
-    #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
-    #[serde(default, rename = "lua")]
-    _lua: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLuaRuntimeSelection {
-    lua: RawLuaRuntimeConfiguration,
-    #[serde(rename = "async", default)]
-    _async_runtime: Option<IgnoredAny>,
-    #[serde(default, rename = "cpu")]
-    _cpu: Option<IgnoredAny>,
-    #[serde(default, rename = "filesystem")]
-    _filesystem: Option<IgnoredAny>,
-    #[serde(default, rename = "sqlite")]
-    _sqlite: Option<IgnoredAny>,
+struct RawTranslateSelection {
+    prompts: RawPromptsConfiguration,
+    languages: Vec<RawLanguageConfiguration>,
+    rpg_maker: RawTranslateRpgMakerSelection,
+    #[serde(default, rename = "projects")]
+    _projects: Option<IgnoredAny>,
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawPublisherFilesystemSelection {
-    publisher: RawDirectoryPublisherConfiguration,
-    #[serde(default, rename = "worker_threads")]
-    _worker_threads: Option<IgnoredAny>,
-    #[serde(default, rename = "queue_capacity")]
-    _queue_capacity: Option<IgnoredAny>,
-    #[serde(default, rename = "max_read_bytes")]
-    _max_read_bytes: Option<IgnoredAny>,
-    #[serde(default, rename = "max_directory_entries")]
-    _max_directory_entries: Option<IgnoredAny>,
-    #[serde(default, rename = "tree")]
-    _tree: Option<IgnoredAny>,
-    #[serde(default, rename = "project_lock")]
-    _project_lock: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawExtractRpgMakerSelection {
-    document: RawRpgMakerDocumentConfiguration,
-    extract: RawSelectedRpgMakerExtractConfiguration,
-    #[serde(default, rename = "standard_asset")]
-    _standard_asset: Option<IgnoredAny>,
-    #[serde(default, rename = "translate")]
-    _translate: Option<IgnoredAny>,
-    #[serde(default, rename = "translation_profiles")]
-    _translation_profiles: Option<IgnoredAny>,
+struct RawWriteBackSelection {
+    #[serde(default, rename = "projects")]
+    _projects: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
+    #[serde(default, rename = "prompts")]
+    _prompts: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
+    #[serde(default, rename = "rpg_maker")]
+    _rpg_maker: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTranslateRpgMakerSelection {
-    standard_asset: RawRpgMakerStandardAssetConfiguration,
-    translate: RawRpgMakerTranslateConfiguration,
     #[serde(rename = "translation_profiles")]
     _translation_profiles: IgnoredAny,
-    #[serde(default, rename = "document")]
-    _document: Option<IgnoredAny>,
-    #[serde(default, rename = "extract")]
-    _extract: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawWriteBackRpgMakerSelection {
-    document: RawRpgMakerDocumentConfiguration,
-    standard_asset: RawRpgMakerStandardAssetConfiguration,
-    #[serde(default, rename = "extract")]
-    _extract: Option<IgnoredAny>,
-    #[serde(default, rename = "translate")]
-    _translate: Option<IgnoredAny>,
-    #[serde(default, rename = "translation_profiles")]
-    _translation_profiles: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -3080,220 +2708,10 @@ struct RawProjectsConfiguration {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCommonRuntimeConfiguration {
-    #[serde(rename = "async")]
-    async_runtime: RawAsyncRuntimeConfiguration,
-    filesystem: RawCommonFilesystemRuntimeConfiguration,
-    sqlite: RawSqliteRuntimeConfiguration,
-    #[serde(default, rename = "cpu")]
-    _cpu: Option<IgnoredAny>,
-    #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
-    #[serde(default, rename = "lua")]
-    _lua: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawAsyncRuntimeConfiguration {
-    worker_threads: u64,
-    max_blocking_threads: u64,
-    blocking_thread_keep_alive_ms: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCpuRuntimeConfiguration {
-    worker_threads: RawCpuWorkerThreads,
-    queue_capacity: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawCpuWorkerThreads {
-    Fixed(u64),
-    Auto(String),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCommonFilesystemRuntimeConfiguration {
-    worker_threads: u64,
-    queue_capacity: u64,
-    max_read_bytes: u64,
-    max_directory_entries: u64,
-    tree: RawDirectoryTreeConfiguration,
-    project_lock: RawProjectLockConfiguration,
-    #[serde(default, rename = "publisher")]
-    _publisher: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawDirectoryPublisherConfiguration {
-    max_recovery_artifacts_per_target: u64,
-    target_lock_timeout_ms: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawDirectoryTreeConfiguration {
-    max_entries: u64,
-    max_depth: u64,
-    max_bytes: u64,
-    max_single_file_bytes: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProjectLockConfiguration {
-    timeout_ms: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSqliteRuntimeConfiguration {
-    short_worker_threads: u64,
-    short_queue_capacity: u64,
-    max_open_connections: u64,
-    worker_stack_bytes: u64,
-    max_statement_bytes: u64,
-    max_parameter_bytes: u64,
-    max_rows_per_query: u64,
-    max_result_bytes_per_query: u64,
-    busy_timeout_ms: u64,
-    journal_mode: RawSqliteJournalMode,
-    synchronous: RawSqliteSynchronous,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RawSqliteJournalMode {
-    Delete,
-    Truncate,
-    Persist,
-    Wal,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RawSqliteSynchronous {
-    Normal,
-    Full,
-    Extra,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLlmRuntimeConfiguration {
-    max_active_requests: u64,
-    queue_capacity: u64,
-    admission_timeout_ms: u64,
-    connect_timeout_ms: u64,
-    read_timeout_ms: u64,
-    pool_idle_timeout_ms: u64,
-    pool_max_idle_per_host: u64,
-    proxy: RawProxyConfiguration,
-    tls: RawLlmTlsConfiguration,
-}
-
-#[derive(Deserialize)]
 #[serde(untagged)]
 enum RawProxyConfiguration {
     Disabled(bool),
     Url(String),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLlmTlsConfiguration {
-    additional_pem_files: Vec<PathBuf>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLuaRuntimeConfiguration {
-    worker_stack_bytes: u64,
-    memory_limit_bytes_per_vm: u64,
-    cancel_check_instruction_interval: u64,
-    max_error_bytes: u64,
-    host_values: RawLuaHostValueConfiguration,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLuaHostValueConfiguration {
-    max_bytes: u64,
-    max_nodes: u64,
-    max_depth: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawObservabilityConfiguration {
-    root: PathBuf,
-    log: RawProjectLogConfiguration,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProjectLogConfiguration {
-    level: RawProjectLogLevel,
-    queue_capacity: u64,
-    batch_max_records: u64,
-    batch_max_bytes: u64,
-    flush_interval_ms: u64,
-    shutdown_timeout_ms: u64,
-    lock_timeout_ms: u64,
-    max_record_bytes: u64,
-    max_file_bytes: u64,
-    retained_rotated_files: u64,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum RawProjectLogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRpgMakerDocumentConfiguration {
-    read_concurrency: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRpgMakerStandardAssetConfiguration {
-    units_per_decode_job: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSelectedRpgMakerExtractConfiguration {
-    store: RawRpgMakerExtractStoreConfiguration,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRpgMakerExtractStoreConfiguration {
-    groups_per_encode_job: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRpgMakerTranslateConfiguration {
-    store: RawRpgMakerTranslateStoreConfiguration,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRpgMakerTranslateStoreConfiguration {
-    units_per_encode_job: u64,
 }
 
 #[derive(Deserialize)]
@@ -3321,22 +2739,7 @@ enum RawLanguageConfiguration {
 struct RawSelectedTranslationProfileConfiguration {
     id: String,
     llm_client: String,
-    max_in_flight_tasks: u64,
-    planning: RawSelectedTranslationPlanningConfiguration,
-    execution: RawTranslationExecutionConfiguration,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSelectedTranslationPlanningConfiguration {
-    max_message_characters: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTranslationExecutionConfiguration {
-    network_retry_delays_ms: Vec<u64>,
-    max_network_retry_after_ms: u64,
+    max_task_message_characters: u64,
 }
 
 #[derive(Deserialize)]
@@ -3346,11 +2749,25 @@ struct RawLlmClientConfiguration {
     #[serde(deserialize_with = "deserialize_secret_string")]
     api_key: SecretString,
     model: String,
-    timeout_ms: u64,
-    rpm: u64,
-    burst: u64,
+    max_concurrent_requests: u64,
+    connect_timeout_ms: u64,
+    read_timeout_ms: u64,
+    request_timeout_ms: u64,
+    proxy: RawProxyConfiguration,
+    additional_pem_files: Vec<PathBuf>,
+    retry_delays_ms: Vec<u64>,
+    max_retry_after_ms: u64,
     #[serde(deserialize_with = "deserialize_zeroizing_string")]
     parameters: Zeroizing<String>,
+    #[serde(default)]
+    rate_limit: Option<RawLlmRateLimitConfiguration>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlmRateLimitConfiguration {
+    requests_per_minute: u64,
+    burst: u64,
 }
 
 #[cfg(test)]
@@ -3379,118 +2796,6 @@ mod tests {
     }
 
     #[test]
-    fn cpu_worker_threads_accepts_auto_or_a_positive_integer() {
-        let directory = TestDirectory::new();
-        let auto_path = directory.write("cpu-auto.toml", include_str!("../../config.example.toml"));
-        let ConfiguredRpgMakerCommand::Extract(auto) =
-            load_configuration(&auto_path, extract_command(false)).expect("auto 应为合法选择")
-        else {
-            panic!("应建立 Extract 配置");
-        };
-        assert_eq!(auto.cpu().worker_threads(), CpuWorkerThreads::Auto);
-
-        let fixed_source = include_str!("../../config.example.toml")
-            .replace("worker_threads = \"auto\"", "worker_threads = 2");
-        let fixed_path = directory.write("cpu-fixed.toml", &fixed_source);
-        let ConfiguredRpgMakerCommand::Extract(fixed) =
-            load_configuration(&fixed_path, extract_command(false)).expect("正整数应为合法选择")
-        else {
-            panic!("应建立 Extract 配置");
-        };
-        assert_eq!(
-            fixed.cpu().worker_threads(),
-            CpuWorkerThreads::Fixed(NonZeroUsize::new(2).expect("测试值非零"))
-        );
-    }
-
-    #[test]
-    fn cpu_worker_threads_rejects_invalid_choices() {
-        let directory = TestDirectory::new();
-        for (name, value) in [
-            ("misspelled", "\"atuo\""),
-            ("uppercase", "\"AUTO\""),
-            ("zero", "0"),
-        ] {
-            let source = include_str!("../../config.example.toml").replace(
-                "worker_threads = \"auto\"",
-                format!("worker_threads = {value}").as_str(),
-            );
-            let path = directory.write(format!("cpu-{name}.toml").as_str(), &source);
-            assert!(
-                load_configuration(&path, extract_command(false)).is_err(),
-                "无效 CPU 线程选择 {name} 必须被拒绝"
-            );
-        }
-    }
-
-    #[test]
-    fn selected_profile_cannot_exceed_http_admission_capacity() {
-        let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml")
-            .replace("max_active_requests = 8", "max_active_requests = 1")
-            .replace("queue_capacity = 64", "queue_capacity = 1");
-        let path = directory.write("profile-over-http-capacity.toml", &source);
-
-        assert!(
-            load_configuration(&path, translate_command(false, "primary")).is_err(),
-            "Profile 并发超过 HTTP 活动与排队总容量时必须在启动前失败"
-        );
-    }
-
-    #[test]
-    fn http_admission_capacity_cannot_exceed_the_runtime_semaphore_limit() {
-        let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml")
-            .replace("\r\n", "\n")
-            .replace(
-                "max_active_requests = 8\nqueue_capacity = 64",
-                format!(
-                    "max_active_requests = {}\nqueue_capacity = 1",
-                    tokio::sync::Semaphore::MAX_PERMITS
-                )
-                .as_str(),
-            );
-        let path = directory.write("http-capacity-overflow.toml", &source);
-
-        let error = match load_configuration(&path, translate_command(false, "primary")) {
-            Ok(_) => panic!("HTTP 总准入量不得在生产构造 Semaphore 时 panic"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("活动与排队总容量超过调度器支持上限")
-        );
-    }
-
-    #[test]
-    fn profile_concurrency_cannot_overflow_the_ordered_finalization_window() {
-        let directory = TestDirectory::new();
-        let task_limit = tokio::sync::Semaphore::MAX_PERMITS / 2 + 1;
-        let source = include_str!("../../config.example.toml")
-            .replace("\r\n", "\n")
-            .replace(
-                "max_active_requests = 8\nqueue_capacity = 64",
-                format!("max_active_requests = {task_limit}\nqueue_capacity = 0").as_str(),
-            )
-            .replace(
-                "max_in_flight_tasks = 4",
-                format!("max_in_flight_tasks = {task_limit}").as_str(),
-            );
-        let path = directory.write("profile-window-overflow.toml", &source);
-
-        let error = match load_configuration(&path, translate_command(false, "primary")) {
-            Ok(_) => panic!("2N 顺序最终化窗口超过 Semaphore 上限时必须在启动前失败"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("任务并发数超过顺序最终化窗口支持上限")
-        );
-    }
-
-    #[test]
     fn explicit_configuration_path_uses_current_directory_as_its_base() {
         let current = absolute_test_path("cwd");
         assert_eq!(
@@ -3508,29 +2813,17 @@ mod tests {
     #[test]
     fn directory_publisher_lock_root_is_namespaced_by_engine() {
         let projects_root = absolute_test_path("projects");
-        let configured = build_directory_publisher_configuration(
-            &projects_root,
-            RpgMakerEngine::Mz,
-            RawDirectoryPublisherConfiguration {
-                max_recovery_artifacts_per_target: 1,
-                target_lock_timeout_ms: 1,
-            },
-        )
-        .expect("目录发布配置应合法");
+        let configured =
+            build_directory_publisher_configuration(&projects_root, RpgMakerEngine::Mz)
+                .expect("目录发布配置应合法");
         assert_eq!(
             configured.lock_directory(),
             projects_root.join(".att-locks/directory-publish/mz")
         );
 
-        let configured = build_directory_publisher_configuration(
-            &projects_root,
-            RpgMakerEngine::Mv,
-            RawDirectoryPublisherConfiguration {
-                max_recovery_artifacts_per_target: 1,
-                target_lock_timeout_ms: 1,
-            },
-        )
-        .expect("MV 目录发布配置应合法");
+        let configured =
+            build_directory_publisher_configuration(&projects_root, RpgMakerEngine::Mv)
+                .expect("MV 目录发布配置应合法");
         assert_eq!(
             configured.lock_directory(),
             projects_root.join(".att-locks/directory-publish/mv")
@@ -3541,151 +2834,27 @@ mod tests {
     fn init_does_not_parse_unselected_product_sections() {
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml")
-            .replace("api_key = \"replace-with-api-key\"", "api_key = []")
-            .replace(
-                "worker_stack_bytes = 8388608",
-                "worker_stack_bytes = \"invalid\"",
-            )
-            .replace("read_concurrency = 8", "read_concurrency = \"invalid\"");
+            .replace("api_key = \"replace-with-api-key\"", "api_key = []");
         let path = directory.write("init.toml", &source);
 
-        let configured = load_configuration(&path, init_command())
-            .expect("Init 不应解析未选择的 LLM、Lua 或 RPG Maker 执行配置");
+        let configured =
+            load_configuration(&path, init_command()).expect("Init 不应解析未选择的 LLM 配置");
         assert!(matches!(configured, ConfiguredRpgMakerCommand::Init(_)));
     }
 
     #[test]
-    fn init_allows_known_unselected_sections_to_be_absent() {
+    fn non_translate_commands_load_their_minimal_configuration() {
         let directory = TestDirectory::new();
-        let path = directory.write("minimal-init.toml", minimal_init_configuration());
+        let path = directory.write("minimal.toml", minimal_init_configuration());
 
-        let configured = load_configuration(&path, init_command())
-            .expect("Init 不应要求未选择的 CPU、LLM、Lua 或 RPG Maker 执行配置存在");
-        assert!(matches!(configured, ConfiguredRpgMakerCommand::Init(_)));
-    }
-
-    #[test]
-    fn sqlite_connection_capacity_is_checked_only_for_the_selected_command() {
-        let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml")
-            .replace("max_open_connections = 16", "max_open_connections = 1");
-        let path = directory.write("single-sqlite-connection.toml", &source);
-
-        assert!(
-            load_configuration(&path, init_command()).is_err(),
-            "Init 的数据库快照固定需要两个连接"
-        );
         for command in [
+            init_command(),
             extract_command(false),
-            translate_command(false, "primary"),
             write_back_command(false),
         ] {
             load_configuration(&path, command)
-                .expect("没有 Lua 的命令不应为未使用的第二个 SQLite 连接失败");
+                .expect("非 Translate 命令不应要求无现实消费的配置存在");
         }
-        for command in [
-            parse_command([
-                "att",
-                "mz",
-                "extract",
-                "--name",
-                "demo",
-                "--rules",
-                "rules.toml",
-                "--lua",
-                "script.lua",
-            ]),
-            translate_command(true, "primary"),
-            write_back_command(true),
-        ] {
-            assert!(
-                load_configuration(&path, command).is_err(),
-                "显式 Lua 会话与命令短操作共享连接预算，必须拥有第二个连接"
-            );
-        }
-    }
-
-    #[test]
-    fn extract_only_parses_lua_when_selected() {
-        let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml").replace(
-            "worker_stack_bytes = 8388608",
-            "worker_stack_bytes = \"invalid\"",
-        );
-        let path = directory.write("extract.toml", &source);
-
-        load_configuration(&path, extract_command(false)).expect("没有 Lua 时不应解析 Lua 配置");
-        assert!(
-            load_configuration(
-                &path,
-                parse_command([
-                    "att",
-                    "mz",
-                    "extract",
-                    "--name",
-                    "demo",
-                    "--rules",
-                    "rules.toml",
-                    "--lua",
-                    "script.lua",
-                ]),
-            )
-            .is_err(),
-            "显式选择 Lua 时必须严格校验 Lua 配置"
-        );
-    }
-
-    #[test]
-    fn project_state_lua_runtime_is_validated_only_when_consumed() {
-        let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml").replace(
-            "worker_stack_bytes = 8388608",
-            "worker_stack_bytes = \"invalid\"",
-        );
-        let path = directory.write("deferred-lua.toml", &source);
-
-        let ConfiguredRpgMakerCommand::Extract(extract) =
-            load_configuration(&path, extract_command(false))
-                .expect("未复用 Lua 时 Extract 不应解析 Lua 配置")
-        else {
-            panic!("应建立 Extract 配置");
-        };
-        assert!(extract.resolve_lua_runtime().is_err());
-
-        let ConfiguredRpgMakerCommand::Translate(translate) =
-            load_configuration(&path, translate_command_without_profile())
-                .expect("未复用 Lua 时 Translate 不应解析 Lua 配置")
-        else {
-            panic!("应建立 Translate 配置");
-        };
-        assert!(translate.resolve_lua_runtime().is_err());
-
-        let ConfiguredRpgMakerCommand::WriteBack(write_back) =
-            load_configuration(&path, write_back_command(false))
-                .expect("未复用 Lua 时 WriteBack 不应解析 Lua 配置")
-        else {
-            panic!("应建立 WriteBack 配置");
-        };
-        assert!(write_back.resolve_lua_runtime().is_err());
-    }
-
-    #[test]
-    fn project_state_lua_runtime_checks_sqlite_session_capacity_on_demand() {
-        let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml")
-            .replace("max_open_connections = 16", "max_open_connections = 1");
-        let path = directory.write("deferred-lua-capacity.toml", &source);
-        let ConfiguredRpgMakerCommand::WriteBack(configured) =
-            load_configuration(&path, write_back_command(false))
-                .expect("没有实际 Lua 消费时单连接配置应合法")
-        else {
-            panic!("应建立 WriteBack 配置");
-        };
-
-        let error = configured
-            .resolve_lua_runtime()
-            .expect_err("复用项目 Lua 时必须检查第二个 SQLite 连接");
-        assert!(error.to_string().contains("必须拥有第二个连接"));
     }
 
     #[test]
@@ -3741,8 +2910,8 @@ mod tests {
     fn explicit_translate_profile_is_still_validated_during_load() {
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml").replace(
-            "max_message_characters = 24000",
-            "max_message_characters = 0",
+            "max_task_message_characters = 24000",
+            "max_task_message_characters = 0",
         );
         let path = directory.write("invalid-explicit-profile.toml", &source);
 
@@ -3759,17 +2928,19 @@ mod tests {
 url = []
 api_key = []
 model = []
-timeout_ms = []
-rpm = []
-burst = []
+max_concurrent_requests = []
+connect_timeout_ms = []
+read_timeout_ms = []
+request_timeout_ms = []
+proxy = []
+additional_pem_files = []
+retry_delays_ms = []
+max_retry_after_ms = []
 parameters = []
 
 [[rpg_maker.translation_profiles]]
 llm_client = ["{sentinel}"]
-max_in_flight_tasks = {{ secret = "{sentinel}" }}
-planning = ["{sentinel}"]
-execution = ["{sentinel}"]
-private_secret = "{sentinel}"
+max_task_message_characters = {{ secret = "{sentinel}" }}
 id = "unused"
 "#,
             include_str!("../../config.example.toml")
@@ -3971,16 +3142,12 @@ id = "unused"
     }
 
     #[test]
-    fn commands_other_than_translate_do_not_consume_prompt_fields() {
+    fn commands_other_than_translate_do_not_consume_prompt_values() {
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml")
             .replace("root = \"prompts\"", "root = []")
             .replace("locale = \"auto\"", "locale = []")
-            .replace("thinking_output = false", "thinking_output = []")
-            .replace(
-                "[prompts]",
-                "[prompts]\nunexpected_prompt_field = [\"ignored\"]",
-            );
+            .replace("thinking_output = false", "thinking_output = []");
         let path = directory.write("unselected-prompts.toml", &source);
 
         for command in [
@@ -3989,21 +3156,21 @@ id = "unused"
             write_back_command(false),
         ] {
             load_configuration(&path, command)
-                .expect("非 Translate 命令不得消费 prompts 的字段、类型或未知项");
+                .expect("非 Translate 命令不得物化或校验 prompts 的字段值");
         }
     }
 
     #[test]
-    fn selected_profile_rejects_unknown_planning_fields() {
+    fn selected_profile_rejects_unknown_fields() {
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml").replace(
-            "max_message_characters = 24000",
-            "max_message_characters = 24000\nunexpected_field = []",
+            "max_task_message_characters = 24000",
+            "max_task_message_characters = 24000\nunexpected_field = []",
         );
-        let path = directory.write("unknown-planning-field.toml", &source);
+        let path = directory.write("unknown-profile-field.toml", &source);
         assert!(
             load_configuration(&path, translate_command(false, "primary")).is_err(),
-            "所选 Profile 的 planning 表必须严格拒绝未知字段"
+            "所选 Profile 必须严格拒绝未知字段"
         );
     }
 
@@ -4038,20 +3205,16 @@ id = "unused"
                 source.replacen("llm_client = \"primary\"\n", "", 1),
             ),
             (
-                "profile-max-in-flight",
-                source.replacen("max_in_flight_tasks = 4\n", "", 1),
+                "profile-max-task-message-characters",
+                source.replacen("max_task_message_characters = 24000\n", "", 1),
             ),
             (
-                "planning-max-message-characters",
-                source.replacen("max_message_characters = 24000\n", "", 1),
+                "client-retry-delays",
+                source.replacen("retry_delays_ms = [500, 1500, 5000]\n", "", 1),
             ),
             (
-                "execution-network-retry-delays",
-                source.replacen("network_retry_delays_ms = [500, 1500, 5000]\n", "", 1),
-            ),
-            (
-                "execution-max-network-retry-after",
-                source.replacen("max_network_retry_after_ms = 30000\n", "", 1),
+                "client-max-retry-after",
+                source.replacen("max_retry_after_ms = 30000\n", "", 1),
             ),
         ];
 
@@ -4130,11 +3293,11 @@ id = "unused"
             (
                 "type",
                 source.replacen(
-                    "max_active_requests = 8",
-                    "max_active_requests = \"TYPE_VALUE_SENTINEL\"",
+                    "max_concurrent_requests = 8",
+                    "max_concurrent_requests = \"TYPE_VALUE_SENTINEL\"",
                     1,
                 ),
-                "runtime.llm.max_active_requests",
+                "llm.clients.primary.max_concurrent_requests",
                 "字段类型不符合当前配置契约",
                 Some("TYPE_VALUE_SENTINEL"),
             ),
@@ -4204,32 +3367,68 @@ id = "unused"
             .replace("model = \"replace-with-model-id\"", "model = []");
         let path = directory.write("client.toml", &invalid_client);
         assert!(load_configuration(&path, translate_command(false, "primary")).is_err());
-
-        let invalid_project_log = include_str!("../../config.example.toml")
-            .replace("queue_capacity = 1024", "queue_capacity = 0");
-        let path = directory.write("project-log.toml", &invalid_project_log);
-        assert!(load_configuration(&path, init_command()).is_err());
     }
 
     #[test]
-    fn unknown_top_level_and_runtime_fields_are_rejected() {
+    fn unknown_fields_are_rejected_across_selected_and_unselected_sections() {
         let directory = TestDirectory::new();
-        for (name, source) in [
+        let example = include_str!("../../config.example.toml");
+        let cases = [
+            ("top", format!("{example}\n[unknown]\nvalue = 1\n")),
             (
-                "top.toml",
-                format!(
-                    "{}\n[unknown]\nvalue = 1\n",
-                    include_str!("../../config.example.toml")
+                "projects",
+                example.replace("root = \"projects\"", "root = \"projects\"\nunexpected = 1"),
+            ),
+            (
+                "prompts",
+                example.replace(
+                    "thinking_output = false",
+                    "thinking_output = false\nunexpected = 1",
                 ),
             ),
             (
-                "runtime.toml",
-                include_str!("../../config.example.toml")
-                    .replace("[runtime.cpu]", "unexpected = 1\n\n[runtime.cpu]"),
+                "client",
+                example.replace(
+                    "model = \"replace-with-model-id\"",
+                    "model = \"replace-with-model-id\"\nunexpected = 1",
+                ),
             ),
-        ] {
-            let path = directory.write(name, &source);
-            assert!(load_configuration(&path, init_command()).is_err());
+            (
+                "rate-limit",
+                format!(
+                    "{example}\n[llm.clients.primary.rate_limit]\nrequests_per_minute = 60\nburst = 8\nunexpected = 1\n"
+                ),
+            ),
+            (
+                "language",
+                example.replacen(
+                    "allowed_terms = []",
+                    "allowed_terms = []\nunexpected = 1",
+                    1,
+                ),
+            ),
+            (
+                "profile",
+                example.replace(
+                    "max_task_message_characters = 24000",
+                    "max_task_message_characters = 24000\nunexpected = 1",
+                ),
+            ),
+            (
+                "rpg-maker",
+                example.replace(
+                    "[[rpg_maker.translation_profiles]]",
+                    "[rpg_maker]\nunexpected = 1\n\n[[rpg_maker.translation_profiles]]",
+                ),
+            ),
+        ];
+
+        for (name, source) in cases {
+            let path = directory.write(format!("unknown-{name}.toml").as_str(), &source);
+            assert!(
+                load_configuration(&path, init_command()).is_err(),
+                "Init 未选择的分区也必须拒绝未知字段：{name}"
+            );
         }
     }
 
@@ -4279,13 +3478,13 @@ id = "unused"
     fn unselected_client_secret_never_enters_configuration_diagnostics() {
         let directory = TestDirectory::new();
         let source = format!(
-            "{}\n[llm.clients.unused]\nurl = []\napi_key = \"UNSELECTED_SECRET_SENTINEL\"\nmodel = []\ntimeout_ms = []\nrpm = []\nburst = []\nparameters = []\n",
+            "{}\n[llm.clients.unused]\nurl = []\napi_key = \"UNSELECTED_SECRET_SENTINEL\"\nmodel = []\nmax_concurrent_requests = []\nconnect_timeout_ms = []\nread_timeout_ms = []\nrequest_timeout_ms = []\nproxy = []\nadditional_pem_files = []\nretry_delays_ms = []\nmax_retry_after_ms = []\nparameters = []\n",
             include_str!("../../config.example.toml")
         )
-        .replace("queue_capacity = 1024", "queue_capacity = 0");
+        .replace("thinking_output = false", "thinking_output = []");
         let path = directory.write("unselected-secret.toml", &source);
         let error = match load_configuration(&path, translate_command(false, "primary")) {
-            Ok(_) => panic!("无效项目日志配置必须拒绝"),
+            Ok(_) => panic!("无效 Prompt 配置必须拒绝"),
             Err(error) => error,
         };
         let mut diagnostics = format!("{error:?}\n{error}");
@@ -4298,14 +3497,14 @@ id = "unused"
     }
 
     #[test]
-    fn configuration_file_has_fixed_bootstrap_size_limit() {
+    fn large_configuration_file_is_loaded_without_an_att_size_limit() {
         let directory = TestDirectory::new();
         let path = directory.path().join("large.toml");
-        fs::write(&path, vec![b'x'; MAX_CONFIGURATION_BYTES as usize + 1]).expect("应写入超限配置");
-        assert!(matches!(
-            load_configuration(&path, init_command()),
-            Err(ConfigurationLoadError::TooLarge { .. })
-        ));
+        let mut source = minimal_init_configuration().to_owned();
+        source.push_str("\n#");
+        source.push_str(&"x".repeat(5 * 1024 * 1024));
+        fs::write(&path, source).expect("应写入大配置");
+        load_configuration(&path, init_command()).expect("配置大小不得触发 ATT 自行规定的拒绝");
     }
 
     fn init_command() -> MzCommand {
@@ -4384,58 +3583,6 @@ id = "unused"
         r#"
 [projects]
 root = "projects"
-
-[runtime.async]
-worker_threads = 1
-max_blocking_threads = 1
-blocking_thread_keep_alive_ms = 1
-
-[runtime.filesystem]
-worker_threads = 1
-queue_capacity = 1
-max_read_bytes = 1
-max_directory_entries = 1
-
-[runtime.filesystem.tree]
-max_entries = 1
-max_depth = 1
-max_bytes = 1
-max_single_file_bytes = 1
-
-[runtime.filesystem.project_lock]
-timeout_ms = 1
-
-[runtime.filesystem.publisher]
-max_recovery_artifacts_per_target = 1
-target_lock_timeout_ms = 1
-
-[runtime.sqlite]
-short_worker_threads = 1
-short_queue_capacity = 1
-max_open_connections = 2
-worker_stack_bytes = 1
-max_statement_bytes = 1
-max_parameter_bytes = 1
-max_rows_per_query = 1
-max_result_bytes_per_query = 1
-busy_timeout_ms = 1
-journal_mode = "delete"
-synchronous = "full"
-
-[observability]
-root = "logs"
-
-[observability.log]
-level = "info"
-queue_capacity = 1
-batch_max_records = 1
-batch_max_bytes = 1
-flush_interval_ms = 1
-shutdown_timeout_ms = 1
-lock_timeout_ms = 1
-max_record_bytes = 1
-max_file_bytes = 1
-retained_rotated_files = 0
 "#
     }
 

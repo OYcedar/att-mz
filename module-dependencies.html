@@ -336,15 +336,15 @@
     <p class="kicker">生产根与边界适配器</p>
     <h2 id="roots-title">业务能力直接依赖所需机制</h2>
     <div class="root-grid">
-      <article class="root-card"><h3>文件、指纹与可恢复发布</h3><p>有界读取、稳定对象身份、项目锁、候选编辑与 Windows 目录发布。</p><span class="path">src/runtime/filesystem.rs</span></article>
-      <article class="root-card"><h3>SQLite</h3><p>通用存储契约承载建库、短事务和交互会话；rusqlite 根负责预算、线程与 shutdown，不拥有 RPG Maker 语义。</p><span class="path">src/storage/sqlite.rs · src/storage/sqlite_session.rs · src/runtime/sqlite.rs</span></article>
+      <article class="root-card"><h3>文件、指纹与可恢复发布</h3><p>完整文件读取、有界并发执行、稳定对象身份、项目锁、候选编辑与 Windows 目录发布；不对项目规模设置人工上限。</p><span class="path">src/runtime/filesystem.rs</span></article>
+      <article class="root-card"><h3>SQLite</h3><p>通用存储契约承载任意查询组的一致内存快照、短事务、交互会话与长寿命事务会话；rusqlite 根负责连接、线程、背压与 shutdown，不拥有 RPG Maker 语义。</p><span class="path">src/storage/sqlite.rs · src/storage/sqlite_session.rs · src/storage/sqlite_transaction_session.rs · src/runtime/sqlite.rs</span></article>
       <article class="root-card"><h3>CPU 与 Tokio</h3><p>PCRE2、JSON、规划与写回进入有界 CPU/文件资源；并发不改变自然顺序。</p><span class="path">src/runtime/cpu.rs · src/runtime/mod.rs</span></article>
       <article class="root-card"><h3>LLM 与 Delay</h3><p>公共非流式 Chat Completion 根负责连接池、限流与 shutdown；生产组合根直接提供 RPG Maker 重试等待。</p><span class="path">src/runtime/llm.rs · src/application/command.rs</span></article>
-      <article class="root-card"><h3>RPG Maker Lua 5.4 适配器</h3><p>直接实现当前可信 Host 协议，负责每脚本专用线程、Host 值预算、合作取消和唯一 finalizer。</p><span class="path">src/rpg_maker/lua/lua54.rs</span></article>
+      <article class="root-card"><h3>RPG Maker Lua 5.4 适配器</h3><p>直接实现当前可信 Host 协议，负责每脚本专用线程、无深度上限的 Host 值转换、合作取消和唯一 finalizer。</p><span class="path">src/rpg_maker/lua/lua54.rs · src/rpg_maker/lua/json.rs · src/rpg_maker/json.rs</span></article>
       <article class="root-card"><h3>运行方案与项目租约</h3><p>租约覆盖方案读取、业务执行和最终替换；只有业务成功且必要的非日志根完成收尾，才用最终短事务整体替换本命令方案。Lua 主程序以正文、SHA-256 和无损 Windows 路径分阶段保存。</p><span class="path">src/rpg_maker/project_lease.rs · src/rpg_maker/project_database/run_plan.rs · src/application/command.rs</span></article>
-      <article class="root-card"><h3>终端 i18n</h3><p>类型化 UiMessage 统一渲染 Help、诊断、进度与结果；十个嵌入式 Fluent catalog 共用同一消息结构。locale 按命令行、环境变量、Windows 用户首选语言、英文依次解析；终端与日志复用同一用户文本净化能力。</p><span class="path">src/i18n.rs · src/i18n/*.ftl · src/user_text.rs · src/application/arguments.rs · src/application/process.rs</span></article>
+      <article class="root-card"><h3>安全诊断与终端 i18n</h3><p>具体错误在持有阶段、路径和底层代码时建立 SafeDiagnostic；CLI 与 JSONL 消费同一 FailureReport。类型化 UiMessage 和十个 Fluent catalog 负责最终呈现，用户文本在边界统一净化。</p><span class="path">src/diagnostic.rs · src/i18n.rs · src/i18n/*.ftl · src/user_text.rs · src/application/arguments.rs · src/application/process.rs</span></article>
       <article class="root-card"><h3>实时进度</h3><p>各纵向切片拥有自己的 phase enum，共享层只传递不可失败的绝对快照。生产观察器把同一快照分别交给终端和项目日志；终端按 auto/plain/off 独立渲染，翻译计数只在任务必要提交成功后推进。</p><span class="path">src/progress.rs · src/application/command.rs · src/rpg_maker/init.rs · src/rpg_maker/extract/service.rs · src/rpg_maker/write_back.rs</span></article>
-      <article class="root-card"><h3>普通项目日志</h3><p>类型化事件通过有界 try_send 进入批处理 JSONL、跨进程锁与安全轮转；序列化边界统一净化允许记录的用户文本。启动、排队、写入、轮转和关闭故障只累计健康状态并降级，不改变业务结果、发布或退出码。</p><span class="path">src/runtime/project_log.rs · src/user_text.rs · src/application/command.rs</span></article>
+      <article class="root-card"><h3>普通项目日志</h3><p>每个 RunId 独占一个不轮转的 JSONL；闭集事件通过单 writer 的有界缓冲自然背压，最终失败与 run.finished 使用独立终态槽。启动、写入、flush、sync 和关闭故障明确降级，不改变业务结果、发布或退出码。</p><span class="path">src/runtime/project_log.rs · src/diagnostic.rs · src/user_text.rs · src/application/command.rs</span></article>
     </div>
     <div class="stopline">
       <strong>当前停止线：</strong>跨命令 Speaker 状态、ChoiceHelp 等块协议和 JS 字符串语义由 <code>ctx.rpg_maker</code> Lua 处理。共享层不包含 TOML 状态机、JSONPath、规则优先级、版本字段或面向其他引擎的框架。

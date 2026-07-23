@@ -824,10 +824,14 @@ impl Error for PlaceholderDefinitionError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::io::Write as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::runtime::cpu::{CpuExecutorConfig, RayonCpuExecutor};
+    use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
 
     #[derive(Clone, Copy, Debug)]
     struct FakeError;
@@ -1129,5 +1133,62 @@ mod tests {
             resources.placeholder_rules_json,
             r#"[{"scopes":["event_dialogue"],"pattern":"\\\\SE\\[[^]]+\\]"}]"#
         );
+    }
+
+    #[tokio::test]
+    async fn terminology_larger_than_nine_mibibytes_crosses_production_read_and_prepare() {
+        const TRANSLATION_BYTES: usize = 9 * 1024 * 1024 + 1;
+
+        let directory = tempfile::tempdir().expect("应建立临时目录");
+        let path = directory.path().join("large-terminology.toml");
+        let mut file = File::create(&path).expect("应建立大术语文件");
+        file.write_all(b"[[term]]\nterm = \"large-term\"\ntranslation = \"")
+            .expect("应写入术语前缀");
+        let chunk = vec![b'x'; 1024 * 1024];
+        let mut remaining = TRANSLATION_BYTES;
+        while remaining != 0 {
+            let count = remaining.min(chunk.len());
+            file.write_all(&chunk[..count]).expect("应写入术语正文");
+            remaining -= count;
+        }
+        file.write_all(b"\"\n").expect("应写入术语后缀");
+        file.sync_all().expect("应完整落盘测试输入");
+        drop(file);
+        assert!(std::fs::metadata(&path).expect("应读取文件元数据").len() > 9 * 1024 * 1024);
+
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("生产文件系统应启动");
+        let cpu = RayonCpuExecutor::start(CpuExecutorConfig::production())
+            .expect("生产 CPU 执行器应启动");
+        let service =
+            TranslationPlanningResourceReadingService::new(file_system.clone(), cpu.clone());
+        let resources = service
+            .read(Some(path), None, "[]".to_owned(), "[]".to_owned())
+            .await
+            .expect("9 MiB 以上术语应通过生产读取、TOML 解析、规范编码和索引编译");
+
+        assert_eq!(resources.terminology().entries().len(), 1);
+        assert_eq!(
+            resources.terminology().entries()[0].translation().len(),
+            TRANSLATION_BYTES
+        );
+        assert!(resources.terminology_json.len() > 9 * 1024 * 1024);
+
+        let canonical_snapshot = resources.terminology_json.clone();
+        drop(resources);
+        let restored = service
+            .read(None, None, canonical_snapshot, "[]".to_owned())
+            .await
+            .expect("9 MiB 以上 canonical 术语应能从项目持久状态重新准备");
+        assert_eq!(restored.terminology().entries().len(), 1);
+        assert_eq!(
+            restored.terminology().entries()[0].translation().len(),
+            TRANSLATION_BYTES
+        );
+        assert!(restored.terminology_json.len() > 9 * 1024 * 1024);
+
+        drop(service);
+        file_system.shutdown().await.expect("文件系统应关闭");
+        cpu.shutdown().expect("CPU 执行器应关闭");
     }
 }

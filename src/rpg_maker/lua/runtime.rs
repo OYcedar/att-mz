@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 
 use tokio::sync::oneshot;
 
+use crate::diagnostic::SafeDiagnostic;
 use crate::fingerprint::Sha256Fingerprint;
 use crate::llm::{ChatMessage, LlmResponse};
 use crate::rpg_maker::extract::store::LuaSnapshot;
@@ -81,8 +82,10 @@ impl TrustedLuaBindingFinalization {
 pub(crate) struct TrustedLuaHostCallError {
     domain: &'static str,
     kind: &'static str,
+    operation: Option<&'static str>,
     message: String,
     retry_after_ms: Option<u64>,
+    safe_diagnostic: Option<Box<SafeDiagnostic>>,
     source: Option<Arc<dyn Error + Send + Sync>>,
 }
 
@@ -97,10 +100,24 @@ impl TrustedLuaHostCallError {
         Self {
             domain,
             kind,
+            operation: None,
             message: message.into(),
             retry_after_ms,
+            safe_diagnostic: None,
             source,
         }
+    }
+
+    /// 补充 Lua Host 公开 API 的稳定操作名；不得放入 SQL、参数或用户正文。
+    pub(crate) fn with_operation(mut self, operation: &'static str) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    /// 保存错误根在仍持有类型化事实时生成的安全公开投影。
+    pub(crate) fn with_safe_diagnostic(mut self, diagnostic: SafeDiagnostic) -> Self {
+        self.safe_diagnostic = Some(Box::new(diagnostic));
+        self
     }
 
     pub(crate) const fn domain(&self) -> &'static str {
@@ -111,12 +128,20 @@ impl TrustedLuaHostCallError {
         self.kind
     }
 
+    pub(crate) const fn operation(&self) -> Option<&'static str> {
+        self.operation
+    }
+
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
 
     pub(crate) const fn retry_after_ms(&self) -> Option<u64> {
         self.retry_after_ms
+    }
+
+    pub(crate) fn safe_diagnostic(&self) -> Option<&SafeDiagnostic> {
+        self.safe_diagnostic.as_deref()
     }
 }
 
@@ -138,6 +163,7 @@ impl Error for TrustedLuaHostCallError {
 #[derive(Clone, Debug)]
 pub(crate) struct TrustedLuaBindingFinalizationError {
     message: String,
+    safe_diagnostics: Vec<SafeDiagnostic>,
     source: Option<Arc<dyn Error + Send + Sync>>,
 }
 
@@ -148,8 +174,19 @@ impl TrustedLuaBindingFinalizationError {
     ) -> Self {
         Self {
             message: message.into(),
+            safe_diagnostics: Vec::new(),
             source,
         }
+    }
+
+    /// 保存 SQLite 收尾的主失败与相关失败，顺序与底层终态一致。
+    pub(crate) fn with_safe_diagnostics(mut self, diagnostics: Vec<SafeDiagnostic>) -> Self {
+        self.safe_diagnostics = diagnostics;
+        self
+    }
+
+    pub(crate) fn safe_diagnostics(&self) -> &[SafeDiagnostic] {
+        &self.safe_diagnostics
     }
 
     fn supervisor_lost() -> Self {

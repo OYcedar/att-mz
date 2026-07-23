@@ -1,11 +1,11 @@
 //! 文件系统能力契约。
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
 use crate::fingerprint::Sha256Fingerprint;
 
@@ -157,7 +157,8 @@ impl DirectoryEntry {
 ///
 /// 成功结果包含目录直接子项的规范化绝对路径和普通文件/目录类别。实现不递归、
 /// 不排序，也不按名称筛选；reparse point、非普通对象和硬链接文件不形成受信结果。
-/// 生产实现负责通过外部配置的全局资源预算隔离阻塞式系统调用。
+/// 生产实现负责用程序拥有的有界执行资源隔离阻塞式系统调用；调用方只会自然背压或取消，
+/// 不承担 worker、队列或准入窗口配置。
 pub(crate) trait DirectoryLister: Send + Sync {
     /// 底层文件系统错误。
     type Error: Error + Send + Sync + 'static;
@@ -314,24 +315,12 @@ impl<T> ExclusiveFileLease<T> {
 
 #[derive(Debug)]
 pub(crate) enum ExclusiveFileLeaseError<E> {
-    Busy {
-        identity: OsString,
-        timeout: Duration,
-    },
-    Unavailable {
-        identity: OsString,
-        source: E,
-    },
+    Unavailable { identity: OsString, source: E },
 }
 
 impl<E: fmt::Display> fmt::Display for ExclusiveFileLeaseError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Busy { identity, timeout } => write!(
-                formatter,
-                "等待 {timeout:?} 后仍未取得排他文件租约：{}",
-                identity.to_string_lossy()
-            ),
             Self::Unavailable { identity, source } => write!(
                 formatter,
                 "无法取得排他文件租约 {}：{source}",
@@ -345,7 +334,6 @@ impl<E: Error + 'static> Error for ExclusiveFileLeaseError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Unavailable { source, .. } => Some(source),
-            Self::Busy { .. } => None,
         }
     }
 }
@@ -407,17 +395,21 @@ impl DirectoryTreeFingerprintRequest {
         if roots.is_empty() {
             return Err(DirectoryTreeFingerprintRequestError::EmptyRoots);
         }
-        for (index, root) in roots.iter().enumerate() {
-            for other in roots.iter().skip(index + 1) {
-                if paths_overlap(root.logical_root(), other.logical_root()) {
-                    return Err(
-                        DirectoryTreeFingerprintRequestError::OverlappingLogicalRoots {
-                            first: root.logical_root().to_path_buf(),
-                            second: other.logical_root().to_path_buf(),
-                        },
-                    );
-                }
-            }
+        let logical_roots = roots
+            .iter()
+            .map(DirectoryTreeRoot::logical_root)
+            .collect::<Vec<_>>();
+        if let Some((first, second)) = overlapping_later_paths(&logical_roots)
+            .iter()
+            .enumerate()
+            .find_map(|(first, second)| second.map(|second| (first, second)))
+        {
+            return Err(
+                DirectoryTreeFingerprintRequestError::OverlappingLogicalRoots {
+                    first: roots[first].logical_root().to_path_buf(),
+                    second: roots[second].logical_root().to_path_buf(),
+                },
+            );
         }
         Ok(Self { roots })
     }
@@ -618,65 +610,72 @@ impl DirectoryStageRequest {
             return Err(DirectoryStageRequestError::EmptySourceMappings);
         }
 
-        for (index, mapping) in source_mappings.iter().enumerate() {
-            for other in source_mappings.iter().skip(index + 1) {
-                if paths_overlap(mapping.relative_target(), other.relative_target()) {
-                    return Err(DirectoryStageRequestError::OverlappingSourceTargets {
-                        first: mapping.relative_target().to_path_buf(),
-                        second: other.relative_target().to_path_buf(),
-                    });
-                }
-            }
+        let source_paths = source_mappings
+            .iter()
+            .map(DirectorySourceMapping::relative_target)
+            .collect::<Vec<_>>();
+        let source_overlaps = overlapping_later_paths(&source_paths);
+        if let Some((first, second)) = source_overlaps
+            .iter()
+            .enumerate()
+            .find_map(|(first, second)| second.map(|second| (first, second)))
+        {
+            return Err(DirectoryStageRequestError::OverlappingSourceTargets {
+                first: source_paths[first].to_path_buf(),
+                second: source_paths[second].to_path_buf(),
+            });
         }
+        let source_index = RelativePathIndex::from_paths(&source_paths);
 
+        let overlay_paths = overlays
+            .iter()
+            .map(DirectoryFileOverlay::relative_file)
+            .collect::<Vec<_>>();
+        let overlay_overlaps = overlapping_later_paths(&overlay_paths);
         for (index, overlay) in overlays.iter().enumerate() {
-            for other in overlays.iter().skip(index + 1) {
-                if paths_overlap(overlay.relative_file(), other.relative_file()) {
-                    return Err(DirectoryStageRequestError::OverlappingOverlays {
-                        first: overlay.relative_file().to_path_buf(),
-                        second: other.relative_file().to_path_buf(),
-                    });
-                }
+            if let Some(other) = overlay_overlaps[index] {
+                return Err(DirectoryStageRequestError::OverlappingOverlays {
+                    first: overlay.relative_file().to_path_buf(),
+                    second: overlays[other].relative_file().to_path_buf(),
+                });
             }
-            if !source_mappings.iter().any(|mapping| {
-                overlay
-                    .relative_file()
-                    .starts_with(mapping.relative_target())
-                    && overlay.relative_file() != mapping.relative_target()
-            }) {
+            if source_index
+                .first_strict_ancestor(overlay.relative_file())
+                .is_none()
+            {
                 return Err(DirectoryStageRequestError::OverlayOutsideSourceMappings {
                     relative_file: overlay.relative_file().to_path_buf(),
                 });
             }
         }
+        let overlay_index = RelativePathIndex::from_paths(&overlay_paths);
 
-        for (index, directory) in empty_directories.iter().enumerate() {
+        for directory in &empty_directories {
             validate_stage_relative_path(directory)?;
-            for other in empty_directories.iter().skip(index + 1) {
-                if paths_overlap(directory, other) {
-                    return Err(DirectoryStageRequestError::OverlappingEmptyDirectories {
-                        first: directory.to_path_buf(),
-                        second: other.to_path_buf(),
-                    });
-                }
-            }
-            if let Some(overlay) = overlays
-                .iter()
-                .find(|overlay| paths_overlap(directory, overlay.relative_file()))
-            {
-                return Err(DirectoryStageRequestError::EmptyDirectoryOverlapsOverlay {
-                    empty_directory: directory.to_path_buf(),
-                    overlay: overlay.relative_file().to_path_buf(),
+        }
+        let empty_paths = empty_directories
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
+        let empty_overlaps = overlapping_later_paths(&empty_paths);
+        for (index, directory) in empty_directories.iter().enumerate() {
+            if let Some(other) = empty_overlaps[index] {
+                return Err(DirectoryStageRequestError::OverlappingEmptyDirectories {
+                    first: directory.to_path_buf(),
+                    second: empty_directories[other].to_path_buf(),
                 });
             }
-            if let Some(mapping) = source_mappings
-                .iter()
-                .find(|mapping| paths_overlap(directory, mapping.relative_target()))
-            {
+            if let Some(overlay) = overlay_index.first_overlapping(directory) {
+                return Err(DirectoryStageRequestError::EmptyDirectoryOverlapsOverlay {
+                    empty_directory: directory.to_path_buf(),
+                    overlay: overlays[overlay].relative_file().to_path_buf(),
+                });
+            }
+            if let Some(mapping) = source_index.first_overlapping(directory) {
                 return Err(
                     DirectoryStageRequestError::EmptyDirectoryOverlapsSourceTarget {
                         empty_directory: directory.to_path_buf(),
-                        source_target: mapping.relative_target().to_path_buf(),
+                        source_target: source_mappings[mapping].relative_target().to_path_buf(),
                     },
                 );
             }
@@ -736,8 +735,115 @@ fn validate_stage_relative_path(path: &Path) -> Result<(), DirectoryStageRequest
     Ok(())
 }
 
-fn paths_overlap(first: &Path, second: &Path) -> bool {
-    first == second || first.starts_with(second) || second.starts_with(first)
+#[derive(Default)]
+struct RelativePathIndex {
+    root: RelativePathIndexNode,
+}
+
+#[derive(Default)]
+struct RelativePathIndexNode {
+    children: HashMap<OsString, Self>,
+    terminal_min_ordinal: Option<usize>,
+    subtree_min_ordinal: Option<usize>,
+}
+
+impl Drop for RelativePathIndex {
+    fn drop(&mut self) {
+        // 路径深度只受真实文件系统约束；显式排空堆上节点，避免深声明在析构时递归
+        // 穿过 HashMap 子节点并耗尽 Rust 调用栈。
+        let mut pending = self
+            .root
+            .children
+            .drain()
+            .map(|(_, child)| child)
+            .collect::<Vec<_>>();
+        while let Some(mut node) = pending.pop() {
+            pending.extend(node.children.drain().map(|(_, child)| child));
+        }
+    }
+}
+
+impl RelativePathIndex {
+    fn from_paths(paths: &[&Path]) -> Self {
+        let mut index = Self::default();
+        for (ordinal, path) in paths.iter().enumerate() {
+            index.insert(path, ordinal);
+        }
+        index
+    }
+
+    fn insert(&mut self, path: &Path, ordinal: usize) {
+        let mut node = &mut self.root;
+        node.subtree_min_ordinal = min_ordinal(node.subtree_min_ordinal, ordinal);
+        for component in path.components() {
+            let Component::Normal(component) = component else {
+                unreachable!("候选相对路径已经过结构校验")
+            };
+            node = node.children.entry(component.to_os_string()).or_default();
+            node.subtree_min_ordinal = min_ordinal(node.subtree_min_ordinal, ordinal);
+        }
+        node.terminal_min_ordinal = min_ordinal(node.terminal_min_ordinal, ordinal);
+    }
+
+    /// 返回输入顺序最早、与 `path` 相同或互为祖先的声明。
+    fn first_overlapping(&self, path: &Path) -> Option<usize> {
+        let mut node = &self.root;
+        let mut candidate = node.terminal_min_ordinal;
+        for component in path.components() {
+            candidate = min_optional_ordinal(candidate, node.terminal_min_ordinal);
+            let Component::Normal(component) = component else {
+                unreachable!("候选相对路径已经过结构校验")
+            };
+            let Some(child) = node.children.get(component) else {
+                return candidate;
+            };
+            node = child;
+        }
+        min_optional_ordinal(candidate, node.subtree_min_ordinal)
+    }
+
+    /// 返回输入顺序最早、且是 `path` 严格祖先的声明。
+    fn first_strict_ancestor(&self, path: &Path) -> Option<usize> {
+        let mut node = &self.root;
+        let mut candidate = node.terminal_min_ordinal;
+        for component in path.components() {
+            candidate = min_optional_ordinal(candidate, node.terminal_min_ordinal);
+            let Component::Normal(component) = component else {
+                unreachable!("候选相对路径已经过结构校验")
+            };
+            let Some(child) = node.children.get(component) else {
+                return candidate;
+            };
+            node = child;
+        }
+        candidate
+    }
+}
+
+fn min_ordinal(current: Option<usize>, ordinal: usize) -> Option<usize> {
+    Some(current.map_or(ordinal, |current| current.min(ordinal)))
+}
+
+fn min_optional_ordinal(first: Option<usize>, second: Option<usize>) -> Option<usize> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(ordinal), None) | (None, Some(ordinal)) => Some(ordinal),
+        (None, None) => None,
+    }
+}
+
+/// 为每条路径找到输入顺序更晚、且最早与它重叠的路径。
+///
+/// 反向建立后缀索引，既保持旧契约“先比较较早输入”的错误选择，又把两两互扫
+/// 降为与路径组件总数近似线性的工作量。
+fn overlapping_later_paths(paths: &[&Path]) -> Vec<Option<usize>> {
+    let mut suffix = RelativePathIndex::default();
+    let mut overlaps = vec![None; paths.len()];
+    for ordinal in (0..paths.len()).rev() {
+        overlaps[ordinal] = suffix.first_overlapping(paths[ordinal]);
+        suffix.insert(paths[ordinal], ordinal);
+    }
+    overlaps
 }
 
 /// 目录候选请求尚未到达根实现前发现的契约错误。
@@ -936,8 +1042,8 @@ impl ScopedDirectoryScope {
 
     pub(crate) fn contains(&self, path: &ScopedDirectoryPath) -> bool {
         self.roots
-            .iter()
-            .any(|root| root.as_os_str() == path.first_component())
+            .binary_search_by(|root| root.as_os_str().cmp(path.first_component()))
+            .is_ok()
     }
 
     pub(crate) fn is_scope_root(&self, path: &ScopedDirectoryPath) -> bool {
@@ -1127,9 +1233,9 @@ impl<E: Error + 'static> Error for ScopedDirectoryEditError<E> {
 
 /// 在一个未发布目录候选的调用方声明子树中执行受限文件操作。
 ///
-/// `bind_scoped_directory` 必须先把令牌绑定到候选根的物理身份。所有操作必须拒绝
-/// reparse point 与硬链接，并经有界根资源接管；调用返回前该次操作已经终结。发布根
-/// 仍负责在整体交换前重新验证完整候选树。
+/// `bind_scoped_directory` 只绑定候选根物理身份并验证声明范围根，不得为绑定重复枚举
+/// 完整候选树。后续操作只重验当前目标、祖先和根身份，必须拒绝 reparse point 与
+/// 硬链接；调用返回前该次操作已经终结。完整候选树只由发布根在整体交换前验证一次。
 pub(crate) trait ScopedDirectoryEditor: Send + Sync {
     type CandidateState: Send + 'static;
     type ScopeState: Send + Sync + 'static;
@@ -1146,12 +1252,6 @@ pub(crate) trait ScopedDirectoryEditor: Send + Sync {
         >,
     > + Send
     + use<Self>;
-
-    /// 在候选交回发布根前重验物理身份、整树预算与声明范围根。
-    fn validate_scoped_directory(
-        &self,
-        scope: &BoundScopedDirectory<Self::ScopeState>,
-    ) -> impl Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send + use<Self>;
 
     fn read_scoped_file(
         &self,
@@ -1215,9 +1315,12 @@ impl<E> StagingCleanupFailure<E> {
         &self.residual_path
     }
 
-    #[cfg(test)]
     pub(crate) fn source(&self) -> &E {
         &self.source
+    }
+
+    pub(crate) fn into_parts(self) -> (PathBuf, E) {
+        (self.residual_path, self.source)
     }
 }
 
@@ -1486,14 +1589,16 @@ impl<E> DirectoryDiscardError<E> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn staging_root(&self) -> &Path {
         &self.staging_root
     }
 
-    #[cfg(test)]
     pub(crate) fn source(&self) -> &E {
         &self.source
+    }
+
+    pub(crate) fn into_parts(self) -> (PathBuf, E) {
+        (self.staging_root, self.source)
     }
 }
 
@@ -1522,9 +1627,10 @@ where
 
 /// 在目标同级准备并可恢复地发布完整目录的环境根能力。
 ///
-/// `prepare` 必须限制递归复制资源，拒绝符号链接与 reparse point，并且不改变
-/// 最终目标。`publish` 必须对同一目标线性化，并将交换、恢复与清理收敛为一个
-/// 明确终态。所有操作一旦开始产生副作用，调用方必须等待 future 完成。
+/// `prepare` 必须拒绝符号链接与 reparse point，并且不改变最终目标。`publish` 是
+/// 完整候选树的唯一全量验证入口；验证后必须对同一目标线性化，并将一次目录交换、
+/// 恢复与清理收敛为一个明确终态。所有操作一旦开始产生副作用，调用方必须等待
+/// future 完成。
 pub(crate) trait RecoverableDirectoryPublisher: Send + Sync {
     type Error: Error + Send + Sync + 'static;
     type StagingState: Send + 'static;
@@ -1788,6 +1894,110 @@ mod directory_stage_tests {
             ),
             Err(DirectoryStageRequestError::OverlayOutsideSourceMappings { .. })
         ));
+    }
+
+    #[test]
+    fn stage_request_prefix_index_preserves_input_order_error_selection() {
+        let error = DirectoryStageRequest::new(
+            PathBuf::from("out"),
+            DirectoryPublishIntent::CreateNew,
+            vec![
+                mapping("source/z", "z"),
+                mapping("source/a", "a"),
+                mapping("source/a-child", "a/child"),
+                mapping("source/z-child", "z/child"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect_err("输入顺序最早的重叠声明必须失败");
+        assert_eq!(
+            error,
+            DirectoryStageRequestError::OverlappingSourceTargets {
+                first: PathBuf::from("z"),
+                second: PathBuf::from("z/child"),
+            }
+        );
+
+        let error = DirectoryStageRequest::new(
+            PathBuf::from("out"),
+            DirectoryPublishIntent::CreateNew,
+            vec![mapping("source/assets", "assets")],
+            vec![
+                overlay("scripts/outside.js"),
+                overlay("assets/catalog.json"),
+                overlay("assets/catalog.json/child"),
+            ],
+            Vec::new(),
+        )
+        .expect_err("较早覆盖的来源范围错误必须先于较晚覆盖间冲突");
+        assert_eq!(
+            error,
+            DirectoryStageRequestError::OverlayOutsideSourceMappings {
+                relative_file: PathBuf::from("scripts/outside.js"),
+            }
+        );
+    }
+
+    #[test]
+    fn stage_request_accepts_many_disjoint_overlays_without_pairwise_scanning() {
+        let overlays = (0..10_000)
+            .map(|ordinal| overlay(&format!("assets/file-{ordinal:05}.json")))
+            .collect();
+        let request = DirectoryStageRequest::new(
+            PathBuf::from("out"),
+            DirectoryPublishIntent::CreateNew,
+            vec![mapping("source/assets", "assets")],
+            overlays,
+            Vec::new(),
+        )
+        .expect("互不重叠的大型覆盖 manifest 应通过前缀索引一次校验");
+        assert_eq!(request.overlays().len(), 10_000);
+    }
+
+    #[test]
+    fn path_index_drops_deep_declarations_without_recursive_rust_stack_use() {
+        let mut deep = PathBuf::new();
+        for _ in 0..20_000 {
+            deep.push("d");
+        }
+        let mut descendant = deep.clone();
+        descendant.push("file.json");
+
+        let index = RelativePathIndex::from_paths(&[deep.as_path()]);
+        assert_eq!(index.first_strict_ancestor(&descendant), Some(0));
+        drop(index);
+    }
+
+    #[test]
+    fn suffix_path_index_matches_pairwise_overlap_and_earliest_ordinal_semantics() {
+        let paths = [
+            "z",
+            "a/first",
+            "other/value",
+            "a",
+            "z/last",
+            "other/value",
+            "independent",
+        ]
+        .map(PathBuf::from);
+        let path_refs = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+        let expected = path_refs
+            .iter()
+            .enumerate()
+            .map(|(first, path)| {
+                path_refs
+                    .iter()
+                    .enumerate()
+                    .skip(first + 1)
+                    .find_map(|(second, other)| {
+                        (path == other || path.starts_with(other) || other.starts_with(path))
+                            .then_some(second)
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(overlapping_later_paths(&path_refs), expected);
     }
 
     #[test]

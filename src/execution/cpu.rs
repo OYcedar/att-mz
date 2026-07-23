@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 /// CPU 任务未能产生结果的原因。
 #[derive(Debug)]
 pub(crate) enum CpuTaskExecutionError<E> {
+    /// 命令取消了尚未取得执行许可的等待；闭包从未交给 worker。
+    Cancelled,
     /// 执行器已经关闭或当前无法再接收任务。
     Unavailable(E),
     /// 工作线程捕获到任务 panic。
@@ -20,6 +22,7 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("CPU 任务在等待执行许可时被取消"),
             Self::Unavailable(source) => write!(formatter, "CPU 执行器不可用：{source}"),
             Self::TaskPanicked => formatter.write_str("CPU 任务执行时发生 panic"),
         }
@@ -32,16 +35,18 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled => None,
             Self::Unavailable(source) => Some(source),
             Self::TaskPanicked => None,
         }
     }
 }
 
-/// 在外部配置的有界工作线程与队列中执行纯 CPU 计算。
+/// 在程序根据当前机器并行度建立的执行资源中运行纯 CPU 计算。
 ///
-/// 实现必须保证闭包不在异步 I/O 执行器线程上运行。队列满时应异步背压而不是
-/// 无界堆积；已经开始的任务即使调用 Future 被丢弃，也必须安全运行至结束。
+/// 实现必须保证闭包不在异步 I/O 执行器线程上运行。执行资源饱和时自然背压，
+/// 不建立用户可配置的队列容量或准入超时；已经开始的任务即使调用 Future 被丢弃，
+/// 也必须安全运行至结束。
 /// 闭包不得执行文件、数据库、Lua、网络等副作用，也不得启动脱离闭包生命周期的
 /// 后台计算任务。
 pub(crate) trait CpuTaskExecutor: Send + Sync {

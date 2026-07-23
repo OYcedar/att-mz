@@ -15,7 +15,12 @@ use std::sync::Arc;
 use futures_util::stream::{self, StreamExt};
 use serde_json::{Map, Value};
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::rpg_maker::json::{StackSafeJsonError, StackSafeJsonValue, from_str as parse_json};
 use crate::rpg_maker::project::OpenedProject;
 pub(crate) use crate::rpg_maker::text::StandardDataFile;
 use crate::rpg_maker::text::{DataFileName, MapId, RpgMakerSource};
@@ -134,12 +139,15 @@ impl RpgMakerDocumentSelection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PluginConfiguration {
     index: usize,
-    fields: Map<String, Value>,
+    fields: StackSafeJsonValue,
 }
 
 impl PluginConfiguration {
     pub(crate) fn new(index: usize, fields: Map<String, Value>) -> Self {
-        Self { index, fields }
+        Self {
+            index,
+            fields: StackSafeJsonValue::new(Value::Object(fields)),
+        }
     }
 
     pub(crate) fn index(&self) -> usize {
@@ -148,10 +156,12 @@ impl PluginConfiguration {
 
     #[cfg(test)]
     pub(crate) fn fields(&self) -> &Map<String, Value> {
-        &self.fields
+        self.fields
+            .as_object()
+            .expect("插件记录在解析边界已保证是对象")
     }
 
-    pub(crate) fn into_parts(self) -> (usize, Map<String, Value>) {
+    pub(crate) fn into_parts(self) -> (usize, StackSafeJsonValue) {
         (self.index, self.fields)
     }
 }
@@ -159,13 +169,41 @@ impl PluginConfiguration {
 /// 一次读取所得的完整、无损 RPG Maker 文档集合。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerProjectDocuments {
-    documents: BTreeMap<RpgMakerDocumentId, Value>,
+    documents: BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
     plugins: Vec<PluginConfiguration>,
 }
 
 impl RpgMakerProjectDocuments {
     pub(crate) fn new(
         documents: BTreeMap<RpgMakerDocumentId, Value>,
+        mut plugins: Vec<PluginConfiguration>,
+    ) -> Self {
+        plugins.sort_by_key(PluginConfiguration::index);
+        Self {
+            documents: documents
+                .into_iter()
+                .map(|(id, value)| (id, Arc::new(StackSafeJsonValue::new(value))))
+                .collect(),
+            plugins,
+        }
+    }
+
+    pub(crate) fn from_stack_safe_parts(
+        documents: BTreeMap<RpgMakerDocumentId, StackSafeJsonValue>,
+        mut plugins: Vec<PluginConfiguration>,
+    ) -> Self {
+        plugins.sort_by_key(PluginConfiguration::index);
+        Self {
+            documents: documents
+                .into_iter()
+                .map(|(id, value)| (id, Arc::new(value)))
+                .collect(),
+            plugins,
+        }
+    }
+
+    pub(crate) fn from_shared_parts(
+        documents: BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
         mut plugins: Vec<PluginConfiguration>,
     ) -> Self {
         plugins.sort_by_key(PluginConfiguration::index);
@@ -177,19 +215,18 @@ impl RpgMakerProjectDocuments {
     }
 
     pub(crate) fn document(&self, id: RpgMakerDocumentId) -> Option<&Value> {
-        self.documents.get(&id)
+        self.documents.get(&id).map(|value| value.as_ref().as_ref())
     }
 
     #[cfg(test)]
-    pub(crate) fn insert_document(
-        &mut self,
-        id: RpgMakerDocumentId,
-        value: Value,
-    ) -> Option<Value> {
-        self.documents.insert(id, value)
+    pub(crate) fn insert_document(&mut self, id: RpgMakerDocumentId, value: Value) {
+        drop(
+            self.documents
+                .insert(id, Arc::new(StackSafeJsonValue::new(value))),
+        );
     }
 
-    pub(crate) fn documents(&self) -> &BTreeMap<RpgMakerDocumentId, Value> {
+    pub(crate) fn documents(&self) -> &BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>> {
         &self.documents
     }
 
@@ -202,7 +239,25 @@ impl RpgMakerProjectDocuments {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        BTreeMap<RpgMakerDocumentId, Value>,
+        BTreeMap<RpgMakerDocumentId, StackSafeJsonValue>,
+        Vec<PluginConfiguration>,
+    ) {
+        let documents = self
+            .documents
+            .into_iter()
+            .map(|(id, value)| {
+                let value = Arc::try_unwrap(value).unwrap_or_else(|shared| shared.as_ref().clone());
+                (id, value)
+            })
+            .collect();
+        (documents, self.plugins)
+    }
+
+    /// 将共享解析根拆成可移动到并行 CPU 工作单元的轻量引用。
+    pub(crate) fn into_shared_parts(
+        self,
+    ) -> (
+        BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
         Vec<PluginConfiguration>,
     ) {
         (self.documents, self.plugins)
@@ -236,6 +291,186 @@ pub(crate) trait RpgMakerProjectDocumentReader: Send + Sync {
     }
 }
 
+/// 在一次 Extract 命令内让多个 owner 复用已经成功解析的文档。
+///
+/// 包装器只缓存成功结果；失败读取不会污染后续状态。Builtin 与 Rules 仍由上层
+/// 串行调度，因此 owner 的提交和错误顺序不变；若内部调用方并发请求，则缓存锁
+/// 会让第二个请求在第一个成功后只补读缺失文档。
+pub(crate) struct CommandScopedRpgMakerDocumentReader<R> {
+    reader: Arc<R>,
+    cache: Arc<tokio::sync::Mutex<CommandDocumentCache>>,
+}
+
+impl<R> CommandScopedRpgMakerDocumentReader<R> {
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            reader: Arc::new(reader),
+            cache: Arc::new(tokio::sync::Mutex::new(CommandDocumentCache::default())),
+        }
+    }
+}
+
+impl<R> Clone for CommandScopedRpgMakerDocumentReader<R> {
+    fn clone(&self) -> Self {
+        Self {
+            reader: Arc::clone(&self.reader),
+            cache: Arc::clone(&self.cache),
+        }
+    }
+}
+
+impl<R> RpgMakerProjectDocumentReader for CommandScopedRpgMakerDocumentReader<R>
+where
+    R: RpgMakerProjectDocumentReader,
+{
+    type Error = R::Error;
+
+    async fn read(
+        &self,
+        project: &OpenedProject,
+        selection: RpgMakerDocumentSelection,
+    ) -> Result<RpgMakerProjectDocuments, Self::Error> {
+        self.read_with_progress(project, selection, DocumentReadProgress::default())
+            .await
+    }
+
+    async fn read_with_progress(
+        &self,
+        project: &OpenedProject,
+        selection: RpgMakerDocumentSelection,
+        progress: DocumentReadProgress,
+    ) -> Result<RpgMakerProjectDocuments, Self::Error> {
+        if selection.is_empty() {
+            return Ok(RpgMakerProjectDocuments::empty());
+        }
+
+        let mut cache = self.cache.lock().await;
+        let cached_documents = cache.select_documents(&selection, cache.all_maps_loaded);
+        let cached_count =
+            u64::try_from(cached_documents.len()).expect("命中文档数必须能表示为 u64");
+        let missing = cache.missing_selection(&selection);
+        if missing.is_empty() {
+            progress.observe(0, cached_count);
+            progress.observe(cached_count, cached_count);
+            return Ok(RpgMakerProjectDocuments::from_shared_parts(
+                cached_documents,
+                Vec::new(),
+            ));
+        }
+
+        let saw_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fresh = self
+            .reader
+            .read_with_progress(
+                project,
+                missing.clone(),
+                DocumentReadProgress::new({
+                    let progress = progress.clone();
+                    let saw_progress = Arc::clone(&saw_progress);
+                    move |completed, total| {
+                        let combined_total = cached_count.saturating_add(total);
+                        if cached_count > 0
+                            && !saw_progress.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            progress.observe(0, combined_total);
+                        } else {
+                            saw_progress.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        progress.observe(cached_count.saturating_add(completed), combined_total);
+                    }
+                }),
+            )
+            .await?;
+        if cached_count > 0 && !saw_progress.load(std::sync::atomic::Ordering::Relaxed) {
+            progress.observe(0, cached_count);
+            progress.observe(cached_count, cached_count);
+        }
+
+        let loaded_all_maps = missing.includes_all_maps();
+        let (documents, plugins) = fresh.into_shared_parts();
+        cache.documents.extend(documents);
+        cache.all_maps_loaded |= loaded_all_maps;
+        Ok(RpgMakerProjectDocuments::from_shared_parts(
+            cache.select_documents(&selection, true),
+            plugins,
+        ))
+    }
+}
+
+#[derive(Default)]
+struct CommandDocumentCache {
+    documents: BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
+    all_maps_loaded: bool,
+}
+
+impl CommandDocumentCache {
+    fn missing_selection(
+        &self,
+        selection: &RpgMakerDocumentSelection,
+    ) -> RpgMakerDocumentSelection {
+        let mut missing = selection.clone();
+        missing.standard_files.retain(|file| {
+            !self
+                .documents
+                .contains_key(&RpgMakerDocumentId::Data(*file))
+        });
+        missing.data_files.retain(|file| {
+            !self
+                .documents
+                .contains_key(&RpgMakerDocumentId::DataFile(file.clone()))
+        });
+        missing.map_ids.retain(|map_id| {
+            !self
+                .documents
+                .contains_key(&RpgMakerDocumentId::Map(*map_id))
+        });
+        if self.all_maps_loaded {
+            missing.all_maps = false;
+        }
+        // plugins.js 只由 Rules 消费，不为没有第二个消费者的值建立深克隆缓存。
+        missing
+    }
+
+    fn select_documents(
+        &self,
+        selection: &RpgMakerDocumentSelection,
+        include_all_cached_maps: bool,
+    ) -> BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>> {
+        let mut selected = BTreeMap::new();
+        for file in selection.standard_files() {
+            self.insert_if_cached(&mut selected, RpgMakerDocumentId::Data(*file));
+        }
+        for file in selection.data_files() {
+            self.insert_if_cached(&mut selected, RpgMakerDocumentId::DataFile(file.clone()));
+        }
+        if !selection.includes_all_maps() || include_all_cached_maps {
+            for map_id in selection.map_ids() {
+                self.insert_if_cached(&mut selected, RpgMakerDocumentId::Map(*map_id));
+            }
+        }
+        if selection.includes_all_maps() && include_all_cached_maps && self.all_maps_loaded {
+            selected.extend(self.documents.iter().filter_map(|(id, document)| {
+                if matches!(id, RpgMakerDocumentId::Map(_)) {
+                    Some((id.clone(), Arc::clone(document)))
+                } else {
+                    None
+                }
+            }));
+        }
+        selected
+    }
+
+    fn insert_if_cached(
+        &self,
+        selected: &mut BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
+        id: RpgMakerDocumentId,
+    ) {
+        if let Some(document) = self.documents.get(&id) {
+            selected.insert(id, Arc::clone(document));
+        }
+    }
+}
+
 /// 文档读取的同步、不可失败绝对进度入口。
 #[derive(Clone)]
 pub(crate) struct DocumentReadProgress {
@@ -263,21 +498,22 @@ impl Default for DocumentReadProgress {
     }
 }
 
-/// RPG Maker 文档读取阶段的外部配置。
+/// RPG Maker 文档读取阶段的内部执行策略。
 ///
-/// 读取上限必须由组合根显式提供；CPU 解析并行度统一由 CPU 根执行器管理。
+/// 在途读取宽度由产品基准选择，不是用户配置或项目总量上限；CPU 解析并行度统一由 CPU
+/// 根执行器管理。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerDocumentReadingConfig {
-    read_concurrency: NonZeroUsize,
+    max_active_reads: NonZeroUsize,
 }
 
 impl RpgMakerDocumentReadingConfig {
-    pub(crate) const fn new(read_concurrency: NonZeroUsize) -> Self {
-        Self { read_concurrency }
+    pub(crate) const fn new(max_active_reads: NonZeroUsize) -> Self {
+        Self { max_active_reads }
     }
 
-    pub(crate) const fn read_concurrency(self) -> NonZeroUsize {
-        self.read_concurrency
+    pub(crate) const fn max_active_reads(self) -> NonZeroUsize {
+        self.max_active_reads
     }
 }
 
@@ -355,7 +591,7 @@ where
         if total > 0 {
             progress.observe(0, total);
         }
-        let read_concurrency = self.config.read_concurrency().get();
+        let max_active_reads = self.config.max_active_reads().get();
         // 第二层只覆盖本次有限请求集合，使读取完成后立即进入 CPU 根的准入等待；
         // 实际执行与已接管队列仍由 CPU 根的统一预算约束。
         let parse_submission_capacity = request_count.max(1);
@@ -374,7 +610,7 @@ where
                 (request_index, result)
             },
         ))
-        .buffer_unordered(read_concurrency);
+        .buffer_unordered(max_active_reads);
 
         let work = reads
             .map(|(request_index, read_result)| async move {
@@ -422,7 +658,9 @@ where
             }
         }
 
-        Ok(RpgMakerProjectDocuments::new(documents, plugins))
+        Ok(RpgMakerProjectDocuments::from_stack_safe_parts(
+            documents, plugins,
+        ))
     }
 }
 
@@ -546,7 +784,7 @@ pub(crate) enum RpgMakerProjectDocumentReadingError<F, L, C> {
     },
     InvalidJson {
         path: PathBuf,
-        source: serde_json::Error,
+        source: StackSafeJsonError,
     },
     InvalidPluginsEnvelope {
         path: PathBuf,
@@ -568,6 +806,159 @@ impl<F, L, C> RpgMakerProjectDocumentReadingError<F, L, C> {
             }
         }
     }
+}
+
+impl<F, L, C> RpgMakerProjectDocumentReadingError<F, L, C>
+where
+    F: SafeDiagnosticSource,
+    L: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    /// 在仍持有文档路径、解析位置和具体根错误时建立公开投影。
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        match self {
+            Self::ListData(source) | Self::ListJs(source) => list_directory_diagnostic(source),
+            Self::FileNameCaseMismatch(source) => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackDocumentRead,
+                DiagnosticStage::WriteBack,
+                DiagnosticSubject::path(source.requested()),
+                DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            )
+            .with_recovery(RecoveryFact::path(source.actual())),
+            Self::ReadDocument { source, .. } => read_document_diagnostic(source),
+            Self::ScheduleParse { path, source } => source
+                .safe_diagnostic_source(
+                    DiagnosticStage::WriteBack,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                )
+                .with_recovery(RecoveryFact::path(path)),
+            Self::InvalidUtf8 { path, source } => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackDocumentRead,
+                DiagnosticStage::WriteBack,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::InvalidUtf8 {
+                    valid_up_to: u64::try_from(source.valid_up_to()).unwrap_or(u64::MAX),
+                    error_len: source
+                        .error_len()
+                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+                },
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            ),
+            Self::InvalidJson { path, source } => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackDocumentRead,
+                DiagnosticStage::WriteBack,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackDocumentInvalid),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            )
+            .with_recovery(RecoveryFact::component(format!(
+                "json_line={}; json_column={}",
+                source.line(),
+                source.column()
+            ))),
+            Self::InvalidPluginsEnvelope { path } => write_back_document_invalid(path, None),
+            Self::InvalidPluginRecord { path, index } => {
+                write_back_document_invalid(path, Some(*index))
+            }
+        }
+    }
+}
+
+impl<F, L, C> SafeDiagnosticSource for RpgMakerProjectDocumentReadingError<F, L, C>
+where
+    F: SafeDiagnosticSource,
+    L: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    fn safe_diagnostic_source(
+        &self,
+        _stage: DiagnosticStage,
+        _impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        self.safe_diagnostic()
+    }
+}
+
+fn list_directory_diagnostic<E>(source: &ListDirectoryError<E>) -> SafeDiagnostic
+where
+    E: SafeDiagnosticSource,
+{
+    match source {
+        ListDirectoryError::NotFound { path } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackDocumentRead,
+            DiagnosticStage::WriteBack,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixInput,
+        ),
+        ListDirectoryError::NotDirectory { path } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackDocumentRead,
+            DiagnosticStage::WriteBack,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixInput,
+        ),
+        ListDirectoryError::Io { path, source } => source
+            .safe_diagnostic_source(
+                DiagnosticStage::WriteBack,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            )
+            .with_recovery(RecoveryFact::path(path)),
+    }
+}
+
+fn read_document_diagnostic<E>(source: &ReadFileError<E>) -> SafeDiagnostic
+where
+    E: SafeDiagnosticSource,
+{
+    match source {
+        ReadFileError::NotFound { path } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackDocumentRead,
+            DiagnosticStage::WriteBack,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixInput,
+        ),
+        ReadFileError::NotFile { path } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackDocumentRead,
+            DiagnosticStage::WriteBack,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixInput,
+        ),
+        ReadFileError::Io { path, source } => source
+            .safe_diagnostic_source(
+                DiagnosticStage::WriteBack,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            )
+            .with_recovery(RecoveryFact::path(path)),
+    }
+}
+
+fn write_back_document_invalid(path: &Path, plugin_index: Option<usize>) -> SafeDiagnostic {
+    let diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::WriteBackDocumentRead,
+        DiagnosticStage::WriteBack,
+        DiagnosticSubject::path(path),
+        DiagnosticReason::failure(DiagnosticFailureKind::WriteBackDocumentInvalid),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::FixInput,
+    );
+    plugin_index.map_or(diagnostic.clone(), |index| {
+        diagnostic.with_recovery(RecoveryFact::component(format!("plugin_index={index}")))
+    })
 }
 
 impl<F, L, C> fmt::Display for RpgMakerProjectDocumentReadingError<F, L, C>
@@ -654,11 +1045,12 @@ enum DocumentRequestKind {
 enum ParsedDocument {
     Json {
         id: RpgMakerDocumentId,
-        value: Value,
+        value: StackSafeJsonValue,
     },
     Plugins(Vec<PluginConfiguration>),
 }
 
+#[derive(Debug)]
 enum ParseFailure {
     InvalidUtf8 {
         path: PathBuf,
@@ -666,7 +1058,7 @@ enum ParseFailure {
     },
     InvalidJson {
         path: PathBuf,
-        source: serde_json::Error,
+        source: StackSafeJsonError,
     },
     InvalidPluginsEnvelope {
         path: PathBuf,
@@ -689,8 +1081,8 @@ fn parse_document(
 
     match kind {
         DocumentRequestKind::Json(id) => {
-            let value = serde_json::from_str(text)
-                .map_err(|source| ParseFailure::InvalidJson { path, source })?;
+            let value =
+                parse_json(text).map_err(|source| ParseFailure::InvalidJson { path, source })?;
             Ok(ParsedDocument::Json { id, value })
         }
         DocumentRequestKind::Plugins => parse_plugins(path, text),
@@ -714,19 +1106,60 @@ fn parse_plugins(path: PathBuf, text: &str) -> Result<ParsedDocument, ParseFailu
         return Err(ParseFailure::InvalidPluginsEnvelope { path });
     };
 
-    let values: Vec<Value> =
-        serde_json::from_str(json.trim()).map_err(|source| ParseFailure::InvalidJson {
-            path: path.clone(),
-            source,
-        })?;
+    let values = parse_json(json.trim()).map_err(|source| ParseFailure::InvalidJson {
+        path: path.clone(),
+        source,
+    })?;
+    if !values.is_array() {
+        return Err(ParseFailure::InvalidPluginsEnvelope { path });
+    }
+    let Value::Array(values) = values.into_inner() else {
+        unreachable!("已检查 plugins.js 赋值是 array")
+    };
+    let values = values
+        .into_iter()
+        .map(StackSafeJsonValue::new)
+        .collect::<Vec<_>>();
     let mut plugins = Vec::with_capacity(values.len());
     for (index, value) in values.into_iter().enumerate() {
-        let Value::Object(fields) = value else {
+        if !value.is_object() {
             return Err(ParseFailure::InvalidPluginRecord { path, index });
+        }
+        let Value::Object(fields) = value.into_inner() else {
+            unreachable!("已检查插件记录是对象")
         };
         plugins.push(PluginConfiguration::new(index, fields));
     }
     Ok(ParsedDocument::Plugins(plugins))
+}
+
+#[cfg(test)]
+pub(crate) fn parse_json_document_for_test(
+    id: RpgMakerDocumentId,
+    text: &str,
+) -> RpgMakerProjectDocuments {
+    let ParsedDocument::Json { id, value } = parse_document(
+        DocumentRequestKind::Json(id),
+        PathBuf::from("data/Test.json"),
+        text.as_bytes().to_vec(),
+    )
+    .expect("测试 Standard JSON 必须有效") else {
+        unreachable!("JSON 测试请求必须返回 JSON 文档")
+    };
+    RpgMakerProjectDocuments::from_stack_safe_parts(BTreeMap::from([(id, value)]), Vec::new())
+}
+
+#[cfg(test)]
+pub(crate) fn parse_plugins_document_for_test(text: &str) -> RpgMakerProjectDocuments {
+    let ParsedDocument::Plugins(plugins) = parse_document(
+        DocumentRequestKind::Plugins,
+        PathBuf::from("js/plugins.js"),
+        text.as_bytes().to_vec(),
+    )
+    .expect("测试 plugins.js 必须有效") else {
+        unreachable!("plugins 测试请求必须返回插件记录")
+    };
+    RpgMakerProjectDocuments::from_stack_safe_parts(BTreeMap::new(), plugins)
 }
 
 #[cfg(test)]
@@ -921,6 +1354,94 @@ var $plugins =
         assert_eq!(
             *progress.lock().expect("进度记录锁不应中毒"),
             [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_and_rules_share_overlapping_parsed_documents_within_one_command() {
+        let root = project().source_root().to_path_buf();
+        let actors = root.join("data").join("Actors.json");
+        let items = root.join("data").join("Items.json");
+        let map = root.join("data").join("Map001.json");
+        let harness = Harness::new(
+            HashMap::from([
+                (
+                    actors,
+                    r#"[null,{"name":"勇者","profile":"共同内容"}]"#.as_bytes().to_vec(),
+                ),
+                (
+                    items,
+                    r#"[null,{"name":"药水","description":"恢复"}]"#.as_bytes().to_vec(),
+                ),
+                (
+                    map,
+                    r#"{"displayName":"共同地图","events":[]}"#.as_bytes().to_vec(),
+                ),
+            ]),
+            Vec::new(),
+            2,
+        );
+        let reader = CommandScopedRpgMakerDocumentReader::new(harness.service());
+
+        let builtin_documents = reader
+            .read(
+                &project(),
+                RpgMakerDocumentSelection::new([StandardDataFile::Actors], true, false),
+            )
+            .await
+            .expect("Builtin 文档应读取成功");
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let rules_documents = reader
+            .read_with_progress(
+                &project(),
+                RpgMakerDocumentSelection::new(
+                    [StandardDataFile::Actors, StandardDataFile::Items],
+                    true,
+                    false,
+                ),
+                DocumentReadProgress::new({
+                    let progress = Arc::clone(&progress);
+                    move |completed, total| {
+                        progress
+                            .lock()
+                            .expect("进度记录锁不应中毒")
+                            .push((completed, total));
+                    }
+                }),
+            )
+            .await
+            .expect("Rules 应只补读缺失文档");
+
+        let builtin_actors = builtin_documents
+            .documents()
+            .get(&RpgMakerDocumentId::Data(StandardDataFile::Actors))
+            .expect("Builtin 应取得 Actors");
+        let rules_actors = rules_documents
+            .documents()
+            .get(&RpgMakerDocumentId::Data(StandardDataFile::Actors))
+            .expect("Rules 应取得同一 Actors");
+        assert!(Arc::ptr_eq(builtin_actors, rules_actors));
+        assert_eq!(builtin_actors[1]["profile"], "共同内容");
+        assert_eq!(rules_actors[1]["profile"], "共同内容");
+        let builtin_map = builtin_documents
+            .documents()
+            .get(&RpgMakerDocumentId::Map(map_id(1)))
+            .expect("Builtin 应取得 Map001");
+        let rules_map = rules_documents
+            .documents()
+            .get(&RpgMakerDocumentId::Map(map_id(1)))
+            .expect("Rules 应取得同一 Map001");
+        assert!(Arc::ptr_eq(builtin_map, rules_map));
+        assert!(
+            rules_documents
+                .document(RpgMakerDocumentId::Data(StandardDataFile::Items))
+                .is_some()
+        );
+        assert_eq!(harness.file_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(harness.cpu_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            *progress.lock().expect("进度记录锁不应中毒"),
+            [(0, 3), (2, 3), (3, 3)]
         );
     }
 
@@ -1241,14 +1762,14 @@ var $plugins =
         max_file_active: Arc<AtomicUsize>,
         cpu_active: Arc<AtomicUsize>,
         max_cpu_active: Arc<AtomicUsize>,
-        read_concurrency: NonZeroUsize,
+        max_active_reads: NonZeroUsize,
     }
 
     impl Harness {
         fn new(
             files: HashMap<PathBuf, Vec<u8>>,
             mut entries: Vec<PathBuf>,
-            read_concurrency: usize,
+            max_active_reads: usize,
         ) -> Self {
             entries.extend(files.keys().cloned());
             entries.sort();
@@ -1263,7 +1784,7 @@ var $plugins =
                 max_file_active: Arc::new(AtomicUsize::new(0)),
                 cpu_active: Arc::new(AtomicUsize::new(0)),
                 max_cpu_active: Arc::new(AtomicUsize::new(0)),
-                read_concurrency: NonZeroUsize::new(read_concurrency)
+                max_active_reads: NonZeroUsize::new(max_active_reads)
                     .expect("测试读取并发必须非零"),
             }
         }
@@ -1291,7 +1812,7 @@ var $plugins =
                     active: Arc::clone(&self.cpu_active),
                     max_active: Arc::clone(&self.max_cpu_active),
                 },
-                RpgMakerDocumentReadingConfig::new(self.read_concurrency),
+                RpgMakerDocumentReadingConfig::new(self.max_active_reads),
             )
         }
     }

@@ -1,4 +1,4 @@
-//! 有界文件工作池与 Windows 可恢复目录发布根。
+//! 自然背压的文件工作池与 Windows 可恢复目录发布根。
 
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -9,26 +9,35 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+#[cfg(test)]
 use std::time::Duration;
 
-use std::collections::{BTreeMap, HashSet};
 #[cfg(test)]
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::OnceLock;
 
 use async_channel::{Receiver, Sender};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 use windows_sys::Win32::Globalization::{LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
+    SafeDiagnostic, SafeDiagnosticSource, SafeIoKind,
+};
 use crate::fingerprint::Sha256Fingerprint;
+use crate::runtime::performance::RunPerformanceCounters;
 use crate::storage::file_system::{
     BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
     DirectoryEntryKind, DirectoryFileOverlay, DirectoryLister, DirectoryPrepareError,
@@ -54,7 +63,6 @@ use super::windows::{
 
 const RESERVED_PREFIX: &str = ".directory-publish-";
 const DIRECTORY_TREE_FINGERPRINT_DOMAIN: &[u8] = b"directory-tree-fingerprint";
-const JOURNAL_MAX_BYTES: usize = 1024 * 1024;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +93,31 @@ type TestPublishFaultQueue = VecDeque<(TestPublishFaultPoint, TestPublishFaultAc
 static TEST_PUBLISH_FAULTS: OnceLock<Mutex<HashMap<PathBuf, TestPublishFaultQueue>>> =
     OnceLock::new();
 
+#[cfg(test)]
+static TEST_CANCEL_CANDIDATE_COPY_AFTER_CHUNK: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[cfg(test)]
+fn register_test_candidate_copy_cancellation(source: PathBuf) {
+    TEST_CANCEL_CANDIDATE_COPY_AFTER_CHUNK
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(source);
+}
+
+#[cfg(test)]
+fn cancel_test_candidate_copy_after_chunk(source: &Path, cancellation: &AtomicBool) {
+    let Some(sources) = TEST_CANCEL_CANDIDATE_COPY_AFTER_CHUNK.get() else {
+        return;
+    };
+    if sources
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(source)
+    {
+        cancellation.store(false, Ordering::Release);
+    }
+}
 #[cfg(test)]
 fn register_test_publish_faults(
     target_root: PathBuf,
@@ -129,139 +162,43 @@ fn injected_publish_error(operation: &'static str, path: &Path) -> SystemFileSys
     io_error(operation, path, io::Error::other("测试注入的目录发布故障"))
 }
 
-/// 通用文件读取、目录观察和独占文件租约使用的资源预算。
+/// 文件执行资源的产品配置。
 #[derive(Clone, Debug)]
 pub(crate) struct SystemFileSystemConfig {
-    worker_threads: usize,
-    queue_capacity: usize,
-    max_read_bytes: u64,
-    max_directory_entries: usize,
-    tree: TreeBudget,
-    exclusive_file_lease: ExclusiveFileLeaseConfig,
+    #[cfg(test)]
+    fixed_worker_threads: Option<usize>,
 }
 
 impl SystemFileSystemConfig {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        worker_threads: usize,
-        queue_capacity: usize,
-        max_read_bytes: u64,
-        max_directory_entries: usize,
-        tree: TreeBudget,
-        exclusive_file_lease: ExclusiveFileLeaseConfig,
-    ) -> Result<Self, SystemFileSystemBuildError> {
-        if worker_threads == 0 {
-            return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "runtime.filesystem.worker_threads 必须大于零",
-            ));
+    pub(crate) const fn production() -> Self {
+        Self {
+            #[cfg(test)]
+            fixed_worker_threads: None,
         }
-        if queue_capacity == 0 {
-            return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "runtime.filesystem.queue_capacity 必须大于零",
-            ));
+    }
+
+    #[cfg(test)]
+    const fn fixed(worker_threads: usize) -> Self {
+        Self {
+            fixed_worker_threads: Some(worker_threads),
         }
-        if max_read_bytes == 0 {
-            return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "runtime.filesystem.max_read_bytes 必须大于零",
-            ));
-        }
-        if max_directory_entries == 0 {
-            return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "runtime.filesystem.max_directory_entries 必须大于零",
-            ));
-        }
-        Ok(Self {
-            worker_threads,
-            queue_capacity,
-            max_read_bytes,
-            max_directory_entries,
-            tree,
-            exclusive_file_lease,
-        })
     }
 }
 
-/// 指纹与发布候选共同使用的唯一递归目录树预算。
-#[derive(Clone, Debug)]
-pub(crate) struct TreeBudget {
-    max_entries: usize,
-    max_depth: usize,
-    max_bytes: u64,
-    max_single_file_bytes: u64,
-}
-
-impl TreeBudget {
-    pub(crate) fn new(
-        max_entries: usize,
-        max_depth: usize,
-        max_bytes: u64,
-        max_single_file_bytes: u64,
-    ) -> Result<Self, SystemFileSystemBuildError> {
-        if max_entries == 0 || max_depth == 0 || max_bytes == 0 || max_single_file_bytes == 0 {
-            return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "目录树的数量、深度与字节预算必须全部大于零",
-            ));
-        }
-        if max_single_file_bytes > max_bytes {
-            return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "目录树单文件上限不得大于总字节上限",
-            ));
-        }
-        Ok(Self {
-            max_entries,
-            max_depth,
-            max_bytes,
-            max_single_file_bytes,
-        })
-    }
-}
-
-/// 通用跨进程独占文件租约的等待策略。
-#[derive(Clone, Debug)]
-pub(crate) struct ExclusiveFileLeaseConfig {
-    timeout: Duration,
-}
-
-impl ExclusiveFileLeaseConfig {
-    pub(crate) fn new(timeout: Duration) -> Result<Self, SystemFileSystemBuildError> {
-        if timeout.is_zero() {
-            return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "独占文件租约超时必须大于零",
-            ));
-        }
-        Ok(Self { timeout })
-    }
-}
-
-/// 目录发布的恢复产物预算与目标锁等待策略。
+/// 目录发布锁位置。
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryPublisherConfig {
     lock_directory: PathBuf,
-    max_recovery_artifacts_per_target: usize,
-    target_lock_timeout: Duration,
 }
 
 impl DirectoryPublisherConfig {
-    pub(crate) fn new(
-        lock_directory: PathBuf,
-        max_recovery_artifacts_per_target: usize,
-        target_lock_timeout: Duration,
-    ) -> Result<Self, SystemFileSystemBuildError> {
+    pub(crate) fn production(lock_directory: PathBuf) -> Result<Self, SystemFileSystemBuildError> {
         if lock_directory.as_os_str().is_empty() {
             return Err(SystemFileSystemBuildError::InvalidConfiguration(
                 "目录发布锁目录不能为空",
             ));
         }
-        if max_recovery_artifacts_per_target == 0 {
-            return Err(SystemFileSystemBuildError::InvalidConfiguration(
-                "目录发布恢复产物预算必须大于零",
-            ));
-        }
-        Ok(Self {
-            lock_directory,
-            max_recovery_artifacts_per_target,
-            target_lock_timeout,
-        })
+        Ok(Self { lock_directory })
     }
 
     #[cfg(test)]
@@ -273,6 +210,7 @@ impl DirectoryPublisherConfig {
 #[derive(Debug)]
 pub(crate) enum SystemFileSystemBuildError {
     InvalidConfiguration(&'static str),
+    AvailableParallelism(io::Error),
     WorkerSpawn(io::Error),
 }
 
@@ -280,6 +218,9 @@ impl fmt::Display for SystemFileSystemBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfiguration(message) => formatter.write_str(message),
+            Self::AvailableParallelism(source) => {
+                write!(formatter, "无法取得本机可用文件并行度：{source}")
+            }
             Self::WorkerSpawn(source) => write!(formatter, "无法建立文件工作线程：{source}"),
         }
     }
@@ -288,8 +229,41 @@ impl fmt::Display for SystemFileSystemBuildError {
 impl Error for SystemFileSystemBuildError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::WorkerSpawn(source) => Some(source),
+            Self::AvailableParallelism(source) | Self::WorkerSpawn(source) => Some(source),
             Self::InvalidConfiguration(_) => None,
+        }
+    }
+}
+
+impl SystemFileSystemBuildError {
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        match self {
+            Self::InvalidConfiguration(_) => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemBuild,
+                DiagnosticStage::ProcessStartup,
+                DiagnosticSubject::component("filesystem"),
+                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::ReportBug,
+            ),
+            Self::AvailableParallelism(source) => SafeDiagnostic::io(
+                DiagnosticCode::FileSystemBuild,
+                DiagnosticStage::ProcessStartup,
+                DiagnosticSubject::component("filesystem workers"),
+                "detect_available_parallelism",
+                source,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            ),
+            Self::WorkerSpawn(source) => SafeDiagnostic::io(
+                DiagnosticCode::FileSystemBuild,
+                DiagnosticStage::ProcessStartup,
+                DiagnosticSubject::component("filesystem workers"),
+                "spawn_worker",
+                source,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            ),
         }
     }
 }
@@ -305,18 +279,18 @@ pub(crate) enum SystemFileSystemError {
     Windows(WindowsFsError),
     Closed,
     WorkerPanicked,
-    ResourceLimit {
-        resource: &'static str,
-        limit: u64,
+    WindowsApiValueTooLarge {
+        subject: &'static str,
+        maximum: u64,
         observed: u64,
-    },
-    AllocationFailed {
-        resource: &'static str,
-        bytes: u64,
     },
     InvalidPath {
         path: PathBuf,
         reason: &'static str,
+    },
+    Cancelled {
+        operation: &'static str,
+        path: PathBuf,
     },
     WrongPublisherInstance,
     InvalidStagedIdentity {
@@ -359,19 +333,19 @@ impl fmt::Display for SystemFileSystemError {
             Self::Windows(source) => source.fmt(formatter),
             Self::Closed => formatter.write_str("文件系统根已经停止接收工作"),
             Self::WorkerPanicked => formatter.write_str("文件系统工作线程中的任务发生 panic"),
-            Self::ResourceLimit {
-                resource,
-                limit,
+            Self::WindowsApiValueTooLarge {
+                subject,
+                maximum,
                 observed,
             } => write!(
                 formatter,
-                "{resource} 超过资源上限（上限 {limit}，观测到 {observed}）"
+                "{subject} 无法由 Windows API 参数表达（最大 {maximum}，实际 {observed}）"
             ),
-            Self::AllocationFailed { resource, bytes } => {
-                write!(formatter, "无法为{resource}分配 {bytes} 字节内存")
-            }
             Self::InvalidPath { path, reason } => {
                 write!(formatter, "文件系统路径无效 {}：{reason}", path.display())
+            }
+            Self::Cancelled { operation, path } => {
+                write!(formatter, "{operation}已取消：{}", path.display())
             }
             Self::WrongPublisherInstance => formatter.write_str("目录候选被交给了另一个发布根实例"),
             Self::InvalidStagedIdentity { path } => write!(
@@ -435,14 +409,277 @@ impl Error for SystemFileSystemError {
             | Self::ScopedEditRollbackFailed { operation, .. } => Some(operation),
             Self::Closed
             | Self::WorkerPanicked
-            | Self::ResourceLimit { .. }
-            | Self::AllocationFailed { .. }
+            | Self::WindowsApiValueTooLarge { .. }
             | Self::InvalidPath { .. }
+            | Self::Cancelled { .. }
             | Self::WrongPublisherInstance
             | Self::InvalidStagedIdentity { .. }
             | Self::JournalCorrupt { .. }
             | Self::RecoveryRequired { .. }
             | Self::OutcomeUnknown { .. } => None,
+        }
+    }
+}
+
+impl SystemFileSystemError {
+    /// 将文件/发布根的类型化机制事实投影为 CLI 与 JSONL 共用诊断。
+    pub(crate) fn safe_diagnostic(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => SafeDiagnostic::io(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::path(path),
+                operation,
+                source,
+                impact,
+                DiagnosticAction::CheckPathAndPermissions,
+            ),
+            Self::Windows(source) => source.safe_diagnostic(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                impact,
+                fallback_action,
+            ),
+            Self::Closed => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::component("filesystem"),
+                DiagnosticReason::failure(DiagnosticFailureKind::ExecutorClosed),
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::WorkerPanicked => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::component("filesystem worker"),
+                DiagnosticReason::failure(DiagnosticFailureKind::WorkerPanicked),
+                impact,
+                DiagnosticAction::ReportBug,
+            ),
+            Self::WindowsApiValueTooLarge {
+                subject,
+                maximum,
+                observed,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::component(subject),
+                DiagnosticReason::Resource {
+                    resource: (*subject).to_owned(),
+                    actual: *observed,
+                    maximum: Some(*maximum),
+                },
+                impact,
+                fallback_action,
+            ),
+            Self::InvalidPath { path, reason } => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure_with_detail(DiagnosticFailureKind::InvalidPath, reason),
+                impact,
+                fallback_action,
+            ),
+            Self::Cancelled { operation, path } => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LockCancelled,
+                    format!("operation={operation}"),
+                ),
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::WrongPublisherInstance => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::component("directory publisher"),
+                DiagnosticReason::failure(DiagnosticFailureKind::WrongPublisherInstance),
+                impact,
+                DiagnosticAction::ReportBug,
+            ),
+            Self::InvalidStagedIdentity { path } => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::FileIdentityChanged),
+                impact,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            ),
+            Self::DirectChildRollbackFailed { path, .. }
+            | Self::ScopedEditRollbackFailed { path, .. } => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::RollbackFailed),
+                DiagnosticImpact::RecoveryRequired,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            )
+            .with_recovery(RecoveryFact::path(path)),
+            Self::JournalCorrupt { path, reason } => SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::JournalCorrupt,
+                    reason,
+                ),
+                DiagnosticImpact::RecoveryRequired,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            )
+            .with_recovery(RecoveryFact::path(path)),
+            Self::RecoveryRequired {
+                target_root,
+                artifacts,
+                reason,
+            } => recovery_diagnostic(
+                stage,
+                target_root,
+                artifacts,
+                reason,
+                DiagnosticImpact::RecoveryRequired,
+            ),
+            Self::OutcomeUnknown {
+                target_root,
+                artifacts,
+                reason,
+            } => recovery_diagnostic(
+                stage,
+                target_root,
+                artifacts,
+                reason,
+                DiagnosticImpact::OutcomeUnknown,
+            ),
+        }
+    }
+}
+
+impl SafeDiagnosticSource for SystemFileSystemError {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        self.safe_diagnostic(stage, impact, fallback_action)
+    }
+
+    fn into_failure_report(
+        self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        fallback_action: DiagnosticAction,
+    ) -> FailureReport {
+        match self {
+            Self::DirectChildRollbackFailed {
+                path,
+                operation,
+                rollback,
+            }
+            | Self::ScopedEditRollbackFailed {
+                path,
+                operation,
+                rollback,
+            } => {
+                let primary = (*operation)
+                    .into_failure_report(
+                        stage,
+                        DiagnosticImpact::RecoveryRequired,
+                        DiagnosticAction::PreserveRecoveryArtifacts,
+                    )
+                    .with_primary_recovery(RecoveryFact::path(&path))
+                    .with_primary_recovery(RecoveryFact::component("rollback_failed"));
+                let related = (*rollback)
+                    .into_failure_report(
+                        stage,
+                        DiagnosticImpact::RecoveryRequired,
+                        DiagnosticAction::PreserveRecoveryArtifacts,
+                    )
+                    .with_primary_recovery(RecoveryFact::path(path));
+                primary.with_related_report(related)
+            }
+            source => {
+                let public = source.safe_diagnostic(stage, impact, fallback_action);
+                FailureReport::new(ReportedFailure::new(public, source))
+            }
+        }
+    }
+}
+
+fn recovery_diagnostic(
+    stage: DiagnosticStage,
+    target_root: &Path,
+    artifacts: &[PathBuf],
+    reason: &str,
+    impact: DiagnosticImpact,
+) -> SafeDiagnostic {
+    let mut diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::FileSystemOperation,
+        stage,
+        DiagnosticSubject::path(target_root),
+        DiagnosticReason::failure_with_detail(
+            match impact {
+                DiagnosticImpact::OutcomeUnknown => {
+                    DiagnosticFailureKind::TransactionOutcomeUnknown
+                }
+                _ => DiagnosticFailureKind::FinalizationFailed,
+            },
+            reason,
+        ),
+        impact,
+        DiagnosticAction::PreserveRecoveryArtifacts,
+    );
+    for artifact in artifacts {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::path(artifact));
+    }
+    diagnostic
+}
+
+fn windows_fs_error_detail(source: &WindowsFsError) -> String {
+    match source {
+        WindowsFsError::Io {
+            operation,
+            path,
+            source,
+        } => format!(
+            "operation={operation}, path={}, kind={}, os_code={:?}",
+            path.display(),
+            SafeIoKind::from(source.kind()).as_str(),
+            source.raw_os_error()
+        ),
+        WindowsFsError::ReparsePoint { path } => {
+            format!("path={}, reason=reparse_point", path.display())
+        }
+        WindowsFsError::NonLocalVolume { path } => {
+            format!("path={}, reason=non_local_volume", path.display())
+        }
+        WindowsFsError::NonNtfsVolume { path, actual } => {
+            format!("path={}, filesystem={actual}", path.display())
+        }
+        WindowsFsError::CaseSensitiveDirectory { path } => {
+            format!("path={}, reason=case_sensitive_directory", path.display())
+        }
+        WindowsFsError::LockCancelled { path } => {
+            format!("path={}, reason=lock_cancelled", path.display())
+        }
+        WindowsFsError::RenameTargetExists { path } => {
+            format!("path={}, reason=target_exists", path.display())
+        }
+        WindowsFsError::FileIdentityChanged { path } => {
+            format!("path={}, reason=file_identity_changed", path.display())
+        }
+        WindowsFsError::Cryptography { operation, status } => {
+            format!("operation={operation}, ntstatus={status:#010x}")
         }
     }
 }
@@ -469,19 +706,35 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> SystemFi
     }
 }
 
+fn ensure_operation_active(
+    cancellation: &AtomicBool,
+    operation: &'static str,
+    path: &Path,
+) -> Result<(), SystemFileSystemError> {
+    if cancellation.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(SystemFileSystemError::Cancelled {
+            operation,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
 type FileJob = Box<dyn FnOnce() + Send + 'static>;
 
 struct FileWorkPool {
     sender: Sender<FileJob>,
     workers: Mutex<Option<Vec<JoinHandle<()>>>>,
+    admission: Arc<Semaphore>,
+    waits_active: Arc<AtomicBool>,
+    waits_cancelled: Arc<Notify>,
+    width: usize,
 }
 
 impl FileWorkPool {
-    fn new(
-        worker_threads: usize,
-        queue_capacity: usize,
-    ) -> Result<Self, SystemFileSystemBuildError> {
-        let (sender, receiver) = async_channel::bounded(queue_capacity);
+    fn new(worker_threads: usize) -> Result<Self, SystemFileSystemBuildError> {
+        let (sender, receiver) = async_channel::unbounded();
         let mut workers: Vec<JoinHandle<()>> = Vec::with_capacity(worker_threads);
         for index in 0..worker_threads {
             let receiver = receiver.clone();
@@ -503,17 +756,49 @@ impl FileWorkPool {
         Ok(Self {
             sender,
             workers: Mutex::new(Some(workers)),
+            admission: Arc::new(Semaphore::new(worker_threads)),
+            waits_active: Arc::new(AtomicBool::new(true)),
+            waits_cancelled: Arc::new(Notify::new()),
+            width: worker_threads,
         })
     }
 
-    async fn execute<T, F>(&self, work: F) -> Result<T, SystemFileSystemError>
+    async fn acquire_admission(
+        &self,
+        operation: &'static str,
+        path: &Path,
+    ) -> Result<OwnedSemaphorePermit, SystemFileSystemError> {
+        let cancelled = self.waits_cancelled.notified();
+        tokio::pin!(cancelled);
+        cancelled.as_mut().enable();
+        ensure_operation_active(&self.waits_active, operation, path)?;
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => Err(SystemFileSystemError::Cancelled {
+                operation,
+                path: path.to_path_buf(),
+            }),
+            permit = Arc::clone(&self.admission).acquire_owned() => {
+                permit.map_err(|_| SystemFileSystemError::Closed)
+            }
+        }
+    }
+
+    async fn execute<T, F>(
+        &self,
+        operation: &'static str,
+        path: &Path,
+        work: F,
+    ) -> Result<T, SystemFileSystemError>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        let admission = self.acquire_admission(operation, path).await?;
         let (response_sender, response_receiver) = async_channel::bounded(1);
         self.sender
             .send(Box::new(move || {
+                let _admission = admission;
                 let result = work();
                 let _ = response_sender.send_blocking(result);
             }))
@@ -527,6 +812,8 @@ impl FileWorkPool {
 
     async fn execute_with_abandon<T, F, A>(
         &self,
+        operation: &'static str,
+        path: &Path,
         work: F,
         abandon: A,
     ) -> Result<T, SystemFileSystemError>
@@ -535,9 +822,11 @@ impl FileWorkPool {
         F: FnOnce() -> T + Send + 'static,
         A: FnOnce(&mut T) + Send + 'static,
     {
+        let admission = self.acquire_admission(operation, path).await?;
         let (response_sender, response_receiver) = async_channel::bounded(1);
         self.sender
             .send(Box::new(move || {
+                let _admission = admission;
                 let result = work();
                 match response_sender.send_blocking(result) {
                     Ok(()) => {}
@@ -556,6 +845,7 @@ impl FileWorkPool {
     }
 
     async fn shutdown(&self) -> Result<(), SystemFileSystemError> {
+        self.cancel_waits();
         self.sender.close();
         let workers = self
             .workers
@@ -578,6 +868,26 @@ impl FileWorkPool {
         } else {
             Err(SystemFileSystemError::WorkerPanicked)
         }
+    }
+
+    fn cancellation(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.waits_active)
+    }
+
+    fn cancel_waits(&self) {
+        self.waits_active.store(false, Ordering::Release);
+        self.waits_cancelled.notify_waiters();
+    }
+
+    const fn width(&self) -> usize {
+        self.width
+    }
+}
+
+impl Drop for FileWorkPool {
+    fn drop(&mut self) {
+        self.cancel_waits();
+        self.sender.close();
     }
 }
 
@@ -631,7 +941,7 @@ impl Drop for StageCleanupGuard {
     }
 }
 
-/// 递归删除一个已知身份的目录树。
+/// 使用显式堆栈删除一个已知身份的目录树。
 ///
 /// 根目录在整个枚举期间由无删除共享句柄固定；叶子删除也使用 file ID
 /// 复核后的 handle disposition。因此路径在检查与删除之间被替换时，会显式失败而不会
@@ -640,48 +950,54 @@ fn remove_directory_tree_if_identity(
     path: &Path,
     expected_identity: FileIdentity,
 ) -> Result<(), SystemFileSystemError> {
-    let pinned = match pin_directory_without_reparse(path) {
-        Ok(pinned) => pinned,
-        Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(());
+    let mut pending = vec![(path.to_path_buf(), expected_identity, false)];
+    while let Some((directory, identity, children_visited)) = pending.pop() {
+        if children_visited {
+            delete_empty_directory_if_identity(&directory, identity)?;
+            continue;
         }
-        Err(source) => return Err(source.into()),
-    };
-    if FileIdentity::of(pinned.file(), path)? != expected_identity {
-        return Err(SystemFileSystemError::InvalidStagedIdentity {
-            path: path.to_path_buf(),
-        });
-    }
-
-    let entries = fs::read_dir(path)
-        .map_err(|source| io_error("枚举待清理目录", path, source))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| io_error("读取待清理目录项", path, source))?;
-    for entry in entries {
-        let child_path = entry.path();
-        let child = match pin_path_without_reparse(&child_path) {
-            Ok(child) => child,
+        let pinned = match pin_directory_without_reparse(&directory) {
+            Ok(pinned) => pinned,
             Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 continue;
             }
             Err(source) => return Err(source.into()),
         };
-        let metadata = child.metadata()?;
-        let identity = FileIdentity::of(child.file(), &child_path)?;
-        drop(child);
-        if metadata.is_dir() {
-            remove_directory_tree_if_identity(&child_path, identity)?;
-        } else if metadata.is_file() {
-            delete_regular_file_if_identity(&child_path, identity)?;
-        } else {
-            return Err(SystemFileSystemError::InvalidPath {
-                path: child_path,
-                reason: "待清理目录中存在非普通文件系统对象",
-            });
+        if FileIdentity::of(pinned.file(), &directory)? != identity {
+            return Err(SystemFileSystemError::InvalidStagedIdentity { path: directory });
+        }
+        pending.push((directory.clone(), identity, true));
+        let entries = fs::read_dir(&directory)
+            .map_err(|source| io_error("枚举待清理目录", &directory, source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| io_error("读取待清理目录项", &directory, source))?;
+        for entry in entries {
+            let child_path = entry.path();
+            let child = match pin_path_without_reparse(&child_path) {
+                Ok(child) => child,
+                Err(WindowsFsError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(source) => return Err(source.into()),
+            };
+            let metadata = child.metadata()?;
+            let child_identity = FileIdentity::of(child.file(), &child_path)?;
+            drop(child);
+            if metadata.is_dir() {
+                pending.push((child_path, child_identity, false));
+            } else if metadata.is_file() {
+                delete_regular_file_if_identity(&child_path, child_identity)?;
+            } else {
+                return Err(SystemFileSystemError::InvalidPath {
+                    path: child_path,
+                    reason: "待清理目录中存在非普通文件系统对象",
+                });
+            }
         }
     }
-    drop(pinned);
-    delete_empty_directory_if_identity(path, expected_identity).map_err(Into::into)
+    Ok(())
 }
 
 pub(crate) struct SystemStagingState {
@@ -731,14 +1047,38 @@ pub(crate) struct SystemFileSystem {
 
 struct SystemFileSystemInner {
     pool: FileWorkPool,
-    config: SystemFileSystemConfig,
+    performance: Arc<RunPerformanceCounters>,
 }
 
 impl SystemFileSystem {
+    #[cfg(test)]
     pub(crate) fn new(config: SystemFileSystemConfig) -> Result<Self, SystemFileSystemBuildError> {
-        let pool = FileWorkPool::new(config.worker_threads, config.queue_capacity)?;
+        Self::new_with_performance(config, Arc::new(RunPerformanceCounters::default()))
+    }
+
+    pub(crate) fn new_with_performance(
+        config: SystemFileSystemConfig,
+        performance: Arc<RunPerformanceCounters>,
+    ) -> Result<Self, SystemFileSystemBuildError> {
+        #[cfg(test)]
+        let worker_threads = match config.fixed_worker_threads {
+            Some(worker_threads) => worker_threads,
+            None => std::thread::available_parallelism()
+                .map_err(SystemFileSystemBuildError::AvailableParallelism)?
+                .get()
+                .min(4),
+        };
+        #[cfg(not(test))]
+        let worker_threads = {
+            let _ = config;
+            std::thread::available_parallelism()
+                .map_err(SystemFileSystemBuildError::AvailableParallelism)?
+                .get()
+                .min(4)
+        };
+        let pool = FileWorkPool::new(worker_threads)?;
         Ok(Self {
-            inner: Arc::new(SystemFileSystemInner { pool, config }),
+            inner: Arc::new(SystemFileSystemInner { pool, performance }),
         })
     }
 
@@ -752,6 +1092,11 @@ impl SystemFileSystem {
             config,
             publisher_identity: Arc::new(()),
         }
+    }
+
+    /// 同步唤醒项目租约与目录发布锁等待；已接管的清理和业务文件任务继续完成。
+    pub(crate) fn cancel_waits(&self) {
+        self.inner.pool.cancel_waits();
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), SystemFileSystemError> {
@@ -787,7 +1132,9 @@ impl ExistingDirectoryResolver for SystemFileSystem {
             let error_path = requested.clone();
             inner
                 .pool
-                .execute(move || resolve_directory_sync(requested))
+                .execute("resolve_existing_directory", &error_path, move || {
+                    resolve_directory_sync(requested)
+                })
                 .await
                 .map_err(|source| ResolveDirectoryError::Io {
                     path: error_path,
@@ -809,9 +1156,12 @@ impl DirectChildDirectoryEnsurer for SystemFileSystem {
         let inner = Arc::clone(&self.inner);
         async move {
             let parent = parent?;
+            let error_path = parent.clone();
             inner
                 .pool
-                .execute(move || ensure_direct_child_directory_sync(parent, child))
+                .execute("ensure_direct_child_directory", &error_path, move || {
+                    ensure_direct_child_directory_sync(parent, child)
+                })
                 .await?
         }
     }
@@ -828,7 +1178,6 @@ impl DirectoryLister for SystemFileSystem {
     > + Send {
         let requested = absolutize(path);
         let inner = Arc::clone(&self.inner);
-        let limit = self.inner.config.max_directory_entries;
         async move {
             let requested = requested.map_err(|source| ListDirectoryError::Io {
                 path: PathBuf::from("."),
@@ -837,7 +1186,9 @@ impl DirectoryLister for SystemFileSystem {
             let error_path = requested.clone();
             inner
                 .pool
-                .execute(move || list_directory_sync(requested, limit))
+                .execute("list_directory", &error_path, move || {
+                    list_directory_sync(requested)
+                })
                 .await
                 .map_err(|source| ListDirectoryError::Io {
                     path: error_path,
@@ -857,7 +1208,6 @@ impl FileReader for SystemFileSystem {
     {
         let requested = absolutize(path);
         let inner = Arc::clone(&self.inner);
-        let max_bytes = self.inner.config.max_read_bytes;
         async move {
             let requested = requested.map_err(|source| ReadFileError::Io {
                 path: PathBuf::from("."),
@@ -866,7 +1216,7 @@ impl FileReader for SystemFileSystem {
             let error_path = requested.clone();
             inner
                 .pool
-                .execute(move || read_file_sync(requested, max_bytes))
+                .execute("read_file", &error_path, move || read_file_sync(requested))
                 .await
                 .map_err(|source| ReadFileError::Io {
                     path: error_path,
@@ -901,7 +1251,6 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
         let finalized = candidate_state.finalized;
         let expected_identity = candidate_state.stage_identity;
         let editor_identity = Arc::clone(&self.publisher_identity);
-        let config = self.inner.config.clone();
         let inner = Arc::clone(&self.inner);
         let verified_scope = scope.clone();
         async move {
@@ -915,13 +1264,8 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
             let verified_root = root.clone();
             inner
                 .pool
-                .execute(move || {
-                    bind_scoped_directory_sync(
-                        &verified_root,
-                        expected_identity,
-                        &verified_scope,
-                        &config,
-                    )
+                .execute("bind_scoped_directory", &error_root, move || {
+                    bind_scoped_directory_sync(&verified_root, expected_identity, &verified_scope)
                 })
                 .await
                 .map_err(|source| ScopedDirectoryBindError::Failed {
@@ -950,41 +1294,6 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
         }
     }
 
-    fn validate_scoped_directory(
-        &self,
-        scope: &BoundScopedDirectory<Self::ScopeState>,
-    ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>>
-    + Send
-    + use<> {
-        let context = scoped_root_context(self, scope);
-        let declared_scope = scope.scope().clone();
-        async move {
-            let (inner, root, root_identity) = context?;
-            let config = inner.config.clone();
-            let error_path = PathBuf::from(".");
-            let error_root = root.clone();
-            inner
-                .pool
-                .execute(move || {
-                    validate_scoped_directory_sync(&root, root_identity, &declared_scope, &config)
-                })
-                .await
-                .map_err(|source| ScopedDirectoryEditError::Failed {
-                    path: error_path.clone(),
-                    source: Box::new(source),
-                })?
-                .map_err(|source| match source {
-                    SystemFileSystemError::InvalidStagedIdentity { .. } => {
-                        ScopedDirectoryEditError::CandidateIdentityChanged { root: error_root }
-                    }
-                    source => ScopedDirectoryEditError::Failed {
-                        path: error_path,
-                        source: Box::new(source),
-                    },
-                })
-        }
-    }
-
     fn read_scoped_file(
         &self,
         scope: &BoundScopedDirectory<Self::ScopeState>,
@@ -995,14 +1304,10 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
         async move {
             let (inner, root, root_identity, relative, absolute) = context?;
             let error_path = relative.as_path().to_path_buf();
-            let max_bytes = inner
-                .config
-                .max_read_bytes
-                .min(inner.config.tree.max_single_file_bytes);
             inner
                 .pool
-                .execute(move || {
-                    read_scoped_file_sync(&root, root_identity, &relative, &absolute, max_bytes)
+                .execute("read_scoped_file", &error_path, move || {
+                    read_scoped_file_sync(&root, root_identity, &relative, &absolute)
                 })
                 .await
                 .map_err(|source| ScopedDirectoryEditError::Failed {
@@ -1023,11 +1328,10 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
         async move {
             let (inner, root, root_identity, relative, absolute) = context?;
             let error_path = relative.as_path().to_path_buf();
-            let limit = inner.config.max_directory_entries;
             inner
                 .pool
-                .execute(move || {
-                    list_scoped_directory_sync(&root, root_identity, &relative, &absolute, limit)
+                .execute("list_scoped_directory", &error_path, move || {
+                    list_scoped_directory_sync(&root, root_identity, &relative, &absolute)
                 })
                 .await
                 .map_err(|source| ScopedDirectoryEditError::Failed {
@@ -1046,10 +1350,12 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
         let context = scoped_root_context(self, scope);
         async move {
             let (inner, root, root_identity) = context?;
-            let limit = inner.config.max_directory_entries;
+            let error_root = root.clone();
             inner
                 .pool
-                .execute(move || list_scoped_root_sync(&root, root_identity, limit))
+                .execute("list_scoped_root", &error_root, move || {
+                    list_scoped_root_sync(&root, root_identity)
+                })
                 .await
                 .map_err(|source| ScopedDirectoryEditError::Failed {
                     path: PathBuf::from("."),
@@ -1074,17 +1380,10 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
                 });
             }
             let error_path = relative.as_path().to_path_buf();
-            let config = inner.config.clone();
             inner
                 .pool
-                .execute(move || {
-                    create_scoped_directory_sync(
-                        &root,
-                        root_identity,
-                        &relative,
-                        &absolute,
-                        &config,
-                    )
+                .execute("create_scoped_directory", &error_path, move || {
+                    create_scoped_directory_sync(&root, root_identity, &relative, &absolute)
                 })
                 .await
                 .map_err(|source| ScopedDirectoryEditError::Failed {
@@ -1111,18 +1410,10 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
                 });
             }
             let error_path = relative.as_path().to_path_buf();
-            let config = inner.config.clone();
             inner
                 .pool
-                .execute(move || {
-                    write_scoped_file_sync(
-                        &root,
-                        root_identity,
-                        &relative,
-                        &absolute,
-                        bytes,
-                        &config,
-                    )
+                .execute("write_scoped_file", &error_path, move || {
+                    write_scoped_file_sync(&root, root_identity, &relative, &absolute, bytes)
                 })
                 .await
                 .map_err(|source| ScopedDirectoryEditError::Failed {
@@ -1150,7 +1441,7 @@ impl ScopedDirectoryEditor for SystemDirectoryPublisher {
             let error_path = relative.as_path().to_path_buf();
             inner
                 .pool
-                .execute(move || {
+                .execute("remove_scoped_path", &error_path, move || {
                     remove_scoped_path_sync(&root, root_identity, &relative, &absolute)
                 })
                 .await
@@ -1215,13 +1506,16 @@ impl ExclusiveFileLeaseProvider for SystemFileSystem {
         Output = Result<ExclusiveFileLease<Self::LeaseState>, ExclusiveFileLeaseError<Self::Error>>,
     > + Send {
         let inner = Arc::clone(&self.inner);
-        let timeout = self.inner.config.exclusive_file_lease.timeout;
+        let cancellation = inner.pool.cancellation();
         let identity = request.identity().to_os_string();
+        let lock_directory = request.lock_directory().to_path_buf();
         async move {
             let failure_identity = identity.clone();
             inner
                 .pool
-                .execute(move || acquire_exclusive_file_lease_sync(request, timeout))
+                .execute("acquire_exclusive_file_lease", &lock_directory, move || {
+                    acquire_exclusive_file_lease_sync(request, &cancellation)
+                })
                 .await
                 .map_err(|source| ExclusiveFileLeaseError::Unavailable {
                     identity: failure_identity,
@@ -1241,7 +1535,6 @@ impl DirectoryTreeFingerprinter for SystemFileSystem {
         Output = Result<Sha256Fingerprint, DirectoryTreeFingerprintError<Self::Error>>,
     > + Send {
         let inner = Arc::clone(&self.inner);
-        let config = self.inner.config.clone();
         let error_path = request
             .roots()
             .first()
@@ -1251,7 +1544,9 @@ impl DirectoryTreeFingerprinter for SystemFileSystem {
         async move {
             inner
                 .pool
-                .execute(move || fingerprint_directory_tree_sync(request, &config))
+                .execute("fingerprint_directory_tree", &error_path, move || {
+                    fingerprint_directory_tree_sync(request)
+                })
                 .await
                 .map_err(|source| DirectoryTreeFingerprintError::Failed {
                     path: error_path,
@@ -1270,19 +1565,23 @@ impl RecoverableDirectoryPublisher for SystemDirectoryPublisher {
         request: DirectoryStageRequest,
     ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>> {
         let target_root = request.target_root().to_path_buf();
-        let system_config = self.inner.config.clone();
         let publisher_config = self.config.clone();
         let publisher_identity = Arc::clone(&self.publisher_identity);
+        let cancellation = self.inner.pool.cancellation();
+        let materialization_width = self.inner.pool.width();
         let error_target = target_root.clone();
         self.inner
             .pool
             .execute_with_abandon(
+                "prepare_directory_candidate",
+                &error_target,
                 move || {
                     prepare_directory_sync(
                         request,
-                        system_config,
                         publisher_config,
                         publisher_identity,
+                        &cancellation,
+                        materialization_width,
                     )
                 },
                 |result| {
@@ -1304,11 +1603,13 @@ impl RecoverableDirectoryPublisher for SystemDirectoryPublisher {
         staged: StagedDirectory<Self::StagingState>,
     ) -> Result<(), DirectoryPublishError<Self::Error>> {
         let expected_identity = Arc::clone(&self.publisher_identity);
-        let system_config = self.inner.config.clone();
+        let performance = Arc::clone(&self.inner.performance);
         let target_root = staged.target_root().to_path_buf();
         self.inner
             .pool
-            .execute(move || publish_directory_sync(staged, &expected_identity, &system_config))
+            .execute("publish_directory", &target_root, move || {
+                publish_directory_sync(staged, &expected_identity, &performance)
+            })
             .await
             .map_err(|source| DirectoryPublishError::OutcomeUnknown {
                 target_root,
@@ -1325,7 +1626,9 @@ impl RecoverableDirectoryPublisher for SystemDirectoryPublisher {
         let staging_root = staged.staging_root().to_path_buf();
         self.inner
             .pool
-            .execute(move || discard_directory_sync(staged, &expected_identity))
+            .execute("discard_directory", &staging_root, move || {
+                discard_directory_sync(staged, &expected_identity)
+            })
             .await
             .map_err(|source| DirectoryDiscardError::new(staging_root.clone(), Box::new(source)))?
             .map_err(|source| DirectoryDiscardError::new(staging_root, Box::new(source)))
@@ -1429,7 +1732,6 @@ fn ensure_direct_child_directory_sync(
 
 fn list_directory_sync(
     path: PathBuf,
-    limit: usize,
 ) -> Result<Vec<DirectoryEntry>, ListDirectoryError<SystemFileSystemError>> {
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -1472,16 +1774,6 @@ fn list_directory_sync(
             path: path.clone(),
             source: io_error("读取目录项", &path, source),
         })?;
-        if result.len() == limit {
-            return Err(ListDirectoryError::Io {
-                path: path.clone(),
-                source: SystemFileSystemError::ResourceLimit {
-                    resource: "单目录条目数",
-                    limit: limit as u64,
-                    observed: limit as u64 + 1,
-                },
-            });
-        }
         let child = entry.path();
         let pinned_child =
             pin_path_without_reparse(&child).map_err(|source| ListDirectoryError::Io {
@@ -1530,10 +1822,7 @@ fn list_directory_sync(
     Ok(result)
 }
 
-fn read_file_sync(
-    path: PathBuf,
-    max_bytes: u64,
-) -> Result<ReadFile, ReadFileError<SystemFileSystemError>> {
+fn read_file_sync(path: PathBuf) -> Result<ReadFile, ReadFileError<SystemFileSystemError>> {
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -1566,84 +1855,37 @@ fn read_file_sync(
     if !metadata.is_file() {
         return Err(ReadFileError::NotFile { path });
     }
-    if metadata.len() > max_bytes {
-        return Err(ReadFileError::Io {
-            path,
-            source: SystemFileSystemError::ResourceLimit {
-                resource: "完整文件字节数",
-                limit: max_bytes,
-                observed: metadata.len(),
-            },
-        });
-    }
     let mut file = pinned.file();
     let resolved_path = pinned.resolved_path().to_path_buf();
-    let capacity = usize::try_from(metadata.len()).map_err(|_| ReadFileError::Io {
+    let bytes = read_all_bytes(&mut file).map_err(|source| ReadFileError::Io {
         path: path.clone(),
-        source: SystemFileSystemError::AllocationFailed {
-            resource: "完整文件读取",
-            bytes: metadata.len(),
-        },
+        source: io_error("读取文件", &path, source),
     })?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|_| ReadFileError::Io {
-            path: path.clone(),
-            source: SystemFileSystemError::AllocationFailed {
-                resource: "完整文件读取",
-                bytes: metadata.len(),
-            },
-        })?;
-    Read::by_ref(&mut file)
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|source| ReadFileError::Io {
-            path: path.clone(),
-            source: io_error("读取文件", &path, source),
-        })?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(ReadFileError::Io {
-            path,
-            source: SystemFileSystemError::ResourceLimit {
-                resource: "完整文件字节数",
-                limit: max_bytes,
-                observed: bytes.len() as u64,
-            },
-        });
-    }
     Ok(ReadFile::new(resolved_path, bytes))
+}
+
+/// 只依据底层 `Read` 的实际产出来增长缓冲区；调用方不得把文件元数据长度作为容量门槛。
+fn read_all_bytes(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn bind_scoped_directory_sync(
     root: &Path,
     expected_identity: FileIdentity,
     scope: &ScopedDirectoryScope,
-    config: &SystemFileSystemConfig,
 ) -> Result<(), SystemFileSystemError> {
-    validate_scoped_directory_sync(root, expected_identity, scope, config)
-}
-
-fn validate_scoped_directory_sync(
-    root: &Path,
-    expected_identity: FileIdentity,
-    scope: &ScopedDirectoryScope,
-    config: &SystemFileSystemConfig,
-) -> Result<(), SystemFileSystemError> {
-    validate_complete_candidate(root, expected_identity, config)?;
     let pinned_root = pin_directory_without_reparse(root)?;
     if FileIdentity::of(pinned_root.file(), root)? != expected_identity {
         return Err(SystemFileSystemError::InvalidStagedIdentity {
             path: root.to_path_buf(),
         });
     }
-    for (index, declared) in scope.roots().iter().enumerate() {
-        if scope.roots().iter().skip(index + 1).any(|other| {
-            windows_names_equal(
-                &declared.encode_wide().collect::<Vec<_>>(),
-                &other.encode_wide().collect::<Vec<_>>(),
-            )
-        }) {
+    let mut declared_roots = HashMap::<Vec<u16>, OsString>::with_capacity(scope.roots().len());
+    for declared in scope.roots() {
+        let key = invariant_uppercase_utf16(declared)?;
+        if declared_roots.insert(key, declared.clone()).is_some() {
             return Err(SystemFileSystemError::InvalidPath {
                 path: root.to_path_buf(),
                 reason: "候选编辑范围包含 Windows 非大小写语义下重复的顶层目录",
@@ -1699,7 +1941,6 @@ fn read_scoped_file_sync(
     root_identity: FileIdentity,
     relative: &ScopedDirectoryPath,
     absolute: &Path,
-    max_bytes: u64,
 ) -> Result<Vec<u8>, ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     let _root = pin_scoped_root(root, root_identity)?;
     let metadata = match fs::symlink_metadata(absolute) {
@@ -1742,52 +1983,9 @@ fn read_scoped_file_sync(
             },
         ));
     }
-    if metadata.len() > max_bytes {
-        return Err(scoped_failed(
-            relative,
-            SystemFileSystemError::ResourceLimit {
-                resource: "候选编辑单文件读取字节数",
-                limit: max_bytes,
-                observed: metadata.len(),
-            },
-        ));
-    }
-    let capacity = usize::try_from(metadata.len()).map_err(|_| {
-        scoped_failed(
-            relative,
-            SystemFileSystemError::AllocationFailed {
-                resource: "候选编辑文件读取",
-                bytes: metadata.len(),
-            },
-        )
+    let bytes = read_all_bytes(pinned.file_mut()).map_err(|source| {
+        scoped_failed(relative, io_error("读取候选编辑文件", absolute, source))
     })?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(capacity).map_err(|_| {
-        scoped_failed(
-            relative,
-            SystemFileSystemError::AllocationFailed {
-                resource: "候选编辑文件读取",
-                bytes: metadata.len(),
-            },
-        )
-    })?;
-    pinned
-        .file_mut()
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|source| {
-            scoped_failed(relative, io_error("读取候选编辑文件", absolute, source))
-        })?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(scoped_failed(
-            relative,
-            SystemFileSystemError::ResourceLimit {
-                resource: "候选编辑单文件读取字节数",
-                limit: max_bytes,
-                observed: bytes.len() as u64,
-            },
-        ));
-    }
     Ok(bytes)
 }
 
@@ -1796,7 +1994,6 @@ fn list_scoped_directory_sync(
     root_identity: FileIdentity,
     relative: &ScopedDirectoryPath,
     absolute: &Path,
-    limit: usize,
 ) -> Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     let _root = pin_scoped_root(root, root_identity)?;
     let metadata = match fs::symlink_metadata(absolute) {
@@ -1822,19 +2019,10 @@ fn list_scoped_directory_sync(
         .map_err(|source| scoped_failed(relative, source))?;
     let resolved = pinned.resolved_path();
     let mut entries = Vec::new();
+    let mut windows_names = HashSet::new();
     for entry in fs::read_dir(resolved)
         .map_err(|source| scoped_failed(relative, io_error("列举候选编辑目录", resolved, source)))?
     {
-        if entries.len() == limit {
-            return Err(scoped_failed(
-                relative,
-                SystemFileSystemError::ResourceLimit {
-                    resource: "候选编辑单目录条目数",
-                    limit: limit as u64,
-                    observed: limit as u64 + 1,
-                },
-            ));
-        }
         let entry = entry.map_err(|source| {
             scoped_failed(relative, io_error("读取候选编辑目录项", resolved, source))
         })?;
@@ -1842,6 +2030,17 @@ fn list_scoped_directory_sync(
         let child_path = entry.path();
         validate_windows_name(&name, &child_path)
             .map_err(|source| scoped_failed(relative, source))?;
+        let windows_key =
+            invariant_uppercase_utf16(&name).map_err(|source| scoped_failed(relative, source))?;
+        if !windows_names.insert(windows_key) {
+            return Err(scoped_failed(
+                relative,
+                SystemFileSystemError::InvalidPath {
+                    path: child_path,
+                    reason: "候选编辑目录包含 Windows 大小写等价名称",
+                },
+            ));
+        }
         let child = pin_path_without_reparse(&child_path)
             .map_err(|source| scoped_failed(relative, source))?;
         let metadata = child
@@ -1881,25 +2080,15 @@ fn list_scoped_directory_sync(
 fn list_scoped_root_sync(
     root: &Path,
     root_identity: FileIdentity,
-    limit: usize,
 ) -> Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     let pinned = pin_scoped_root(root, root_identity)?;
     let resolved = pinned.resolved_path();
     let mut entries = Vec::new();
+    let mut windows_names = HashSet::new();
     for entry in fs::read_dir(resolved).map_err(|source| ScopedDirectoryEditError::Failed {
         path: PathBuf::from("."),
         source: Box::new(io_error("列举候选根", resolved, source)),
     })? {
-        if entries.len() == limit {
-            return Err(ScopedDirectoryEditError::Failed {
-                path: PathBuf::from("."),
-                source: Box::new(SystemFileSystemError::ResourceLimit {
-                    resource: "候选根直接条目数",
-                    limit: limit as u64,
-                    observed: limit as u64 + 1,
-                }),
-            });
-        }
         let entry = entry.map_err(|source| ScopedDirectoryEditError::Failed {
             path: PathBuf::from("."),
             source: Box::new(io_error("读取候选根目录项", resolved, source)),
@@ -1912,6 +2101,21 @@ fn list_scoped_root_sync(
                 source: Box::new(source),
             }
         })?;
+        let windows_key = invariant_uppercase_utf16(&name).map_err(|source| {
+            ScopedDirectoryEditError::Failed {
+                path: PathBuf::from("."),
+                source: Box::new(source),
+            }
+        })?;
+        if !windows_names.insert(windows_key) {
+            return Err(ScopedDirectoryEditError::Failed {
+                path: PathBuf::from("."),
+                source: Box::new(SystemFileSystemError::InvalidPath {
+                    path: child_path,
+                    reason: "候选根包含 Windows 大小写等价名称",
+                }),
+            });
+        }
         let child = pin_path_without_reparse(&child_path).map_err(|source| {
             ScopedDirectoryEditError::Failed {
                 path: PathBuf::from("."),
@@ -1963,17 +2167,13 @@ fn create_scoped_directory_sync(
     root_identity: FileIdentity,
     relative: &ScopedDirectoryPath,
     absolute: &Path,
-    config: &SystemFileSystemConfig,
 ) -> Result<(), ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
-    let root_pin = pin_scoped_root(root, root_identity)?;
+    let _root_pin = pin_scoped_root(root, root_identity)?;
     validate_relative_windows_path(relative.as_path())
-        .map_err(|source| scoped_failed(relative, source))?;
-    validate_complete_candidate(root, root_identity, config)
         .map_err(|source| scoped_failed(relative, source))?;
 
     let mut current = root.to_path_buf();
     let mut pins = Vec::new();
-    let mut created = Vec::new();
     for component in relative.as_path().components() {
         let Component::Normal(name) = component else {
             unreachable!("ScopedDirectoryPath 已建立普通相对段不变量")
@@ -1987,43 +2187,14 @@ fn create_scoped_directory_sync(
                 })?;
                 let pin = pin_directory_without_reparse(&current)
                     .map_err(|source| scoped_failed(relative, source))?;
-                let identity = FileIdentity::of(pin.file(), &current)
-                    .map_err(|source| scoped_failed(relative, source))?;
-                created.push((current.clone(), identity));
                 pins.push(pin);
             }
             Err(source) => return Err(scoped_failed(relative, source)),
         }
     }
 
-    let validation = validate_complete_candidate(root, root_identity, config);
-    drop(pins);
-    drop(root_pin);
-    if let Err(operation) = validation {
-        return rollback_created_directories(relative, created, operation);
-    }
     debug_assert_eq!(current, absolute);
     Ok(())
-}
-
-fn rollback_created_directories(
-    relative: &ScopedDirectoryPath,
-    mut created: Vec<(PathBuf, FileIdentity)>,
-    operation: SystemFileSystemError,
-) -> Result<(), ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
-    while let Some((path, identity)) = created.pop() {
-        if let Err(rollback) = delete_empty_directory_if_identity(&path, identity) {
-            return Err(scoped_failed(
-                relative,
-                SystemFileSystemError::ScopedEditRollbackFailed {
-                    path,
-                    operation: Box::new(operation),
-                    rollback: Box::new(rollback.into()),
-                },
-            ));
-        }
-    }
-    Err(scoped_failed(relative, operation))
 }
 
 fn write_scoped_file_sync(
@@ -2032,36 +2203,21 @@ fn write_scoped_file_sync(
     relative: &ScopedDirectoryPath,
     absolute: &Path,
     bytes: Vec<u8>,
-    config: &SystemFileSystemConfig,
 ) -> Result<(), ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     let _root = pin_scoped_root(root, root_identity)?;
     validate_relative_windows_path(relative.as_path())
         .map_err(|source| scoped_failed(relative, source))?;
-    validate_complete_candidate(root, root_identity, config)
-        .map_err(|source| scoped_failed(relative, source))?;
-    if bytes.len() as u64 > config.tree.max_single_file_bytes {
-        return Err(scoped_failed(
-            relative,
-            SystemFileSystemError::ResourceLimit {
-                resource: "候选编辑单文件字节数",
-                limit: config.tree.max_single_file_bytes,
-                observed: bytes.len() as u64,
-            },
-        ));
-    }
     let parent = absolute.parent().expect("受检候选文件路径必须包含父目录");
     let _parent =
         pin_directory_without_reparse(parent).map_err(|source| scoped_failed(relative, source))?;
 
     match fs::symlink_metadata(absolute) {
-        Ok(metadata) if metadata.is_file() => {
-            write_existing_scoped_file(root, root_identity, relative, absolute, bytes, config)
-        }
+        Ok(metadata) if metadata.is_file() => write_existing_scoped_file(relative, absolute, bytes),
         Ok(_) => Err(ScopedDirectoryEditError::NotFile {
             path: relative.as_path().to_path_buf(),
         }),
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            write_new_scoped_file(root, root_identity, relative, absolute, bytes, config)
+            write_new_scoped_file(relative, absolute, bytes)
         }
         Err(source) => Err(scoped_failed(
             relative,
@@ -2071,12 +2227,9 @@ fn write_scoped_file_sync(
 }
 
 fn write_existing_scoped_file(
-    root: &Path,
-    root_identity: FileIdentity,
     relative: &ScopedDirectoryPath,
     absolute: &Path,
     bytes: Vec<u8>,
-    config: &SystemFileSystemConfig,
 ) -> Result<(), ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     let mut pinned = open_read_write_file_without_reparse(absolute, false)
         .map_err(|source| scoped_failed(relative, source))?;
@@ -2091,53 +2244,26 @@ fn write_existing_scoped_file(
             },
         ));
     }
-    let old_len = pinned
-        .metadata()
-        .map_err(|source| scoped_failed(relative, source))?
-        .len();
-    let capacity = usize::try_from(old_len).map_err(|_| {
-        scoped_failed(
-            relative,
-            SystemFileSystemError::AllocationFailed {
-                resource: "候选编辑回滚副本",
-                bytes: old_len,
-            },
-        )
-    })?;
-    let mut original = Vec::new();
-    original.try_reserve_exact(capacity).map_err(|_| {
-        scoped_failed(
-            relative,
-            SystemFileSystemError::AllocationFailed {
-                resource: "候选编辑回滚副本",
-                bytes: old_len,
-            },
-        )
-    })?;
     pinned
         .file_mut()
         .seek(SeekFrom::Start(0))
-        .and_then(|_| pinned.file_mut().read_to_end(&mut original))
         .map_err(|source| {
-            scoped_failed(relative, io_error("读取候选文件回滚副本", absolute, source))
+            scoped_failed(relative, io_error("定位候选文件回滚副本", absolute, source))
         })?;
+    let original = read_all_bytes(pinned.file_mut()).map_err(|source| {
+        scoped_failed(relative, io_error("读取候选文件回滚副本", absolute, source))
+    })?;
 
     if let Err(operation) = replace_pinned_file_contents(&mut pinned, absolute, &bytes) {
-        return restore_scoped_file_after_failure(relative, absolute, pinned, original, operation);
-    }
-    if let Err(operation) = validate_complete_candidate(root, root_identity, config) {
         return restore_scoped_file_after_failure(relative, absolute, pinned, original, operation);
     }
     Ok(())
 }
 
 fn write_new_scoped_file(
-    root: &Path,
-    root_identity: FileIdentity,
     relative: &ScopedDirectoryPath,
     absolute: &Path,
     bytes: Vec<u8>,
-    config: &SystemFileSystemConfig,
 ) -> Result<(), ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -2154,8 +2280,7 @@ fn write_new_scoped_file(
     let operation = file
         .write_all(&bytes)
         .and_then(|()| file.sync_data())
-        .map_err(|source| io_error("写入候选编辑文件", absolute, source))
-        .and_then(|()| validate_complete_candidate(root, root_identity, config));
+        .map_err(|source| io_error("写入候选编辑文件", absolute, source));
     drop(file);
     if let Err(operation) = operation {
         return match delete_regular_file_if_identity(absolute, identity) {
@@ -2272,7 +2397,7 @@ fn remove_scoped_path_sync(
 
 fn acquire_exclusive_file_lease_sync(
     request: ExclusiveFileLeaseRequest,
-    timeout: Duration,
+    cancellation: &AtomicBool,
 ) -> Result<
     ExclusiveFileLease<ExclusiveFileLock>,
     ExclusiveFileLeaseError<Box<SystemFileSystemError>>,
@@ -2281,15 +2406,12 @@ fn acquire_exclusive_file_lease_sync(
     let result: Result<_, SystemFileSystemError> = (|| {
         let lock_directory = trusted_lock_directory(request.lock_directory())?;
         let lock_path = stable_lock_path(&lock_directory, request.identity())?;
-        ExclusiveFileLock::acquire(&lock_path, timeout)
+        ExclusiveFileLock::acquire(&lock_path, cancellation)
             .map(ExclusiveFileLease::new)
             .map_err(Into::into)
     })();
     match result {
         Ok(lease) => Ok(lease),
-        Err(SystemFileSystemError::Windows(WindowsFsError::LockTimeout { .. })) => {
-            Err(ExclusiveFileLeaseError::Busy { identity, timeout })
-        }
         Err(source) => Err(ExclusiveFileLeaseError::Unavailable {
             identity,
             source: Box::new(source),
@@ -2317,11 +2439,9 @@ struct FingerprintObservation {
     identities: Vec<FingerprintIdentityObservation>,
 }
 
-struct FingerprintPass<'a> {
-    budget: TreeBudgetUsage,
+struct FingerprintPass {
     file_identities: HashSet<FileIdentity>,
     identities: Vec<FingerprintIdentityObservation>,
-    system_config: &'a SystemFileSystemConfig,
     hasher: Sha256,
 }
 
@@ -2333,14 +2453,12 @@ struct ExpectedFingerprintFile {
 
 fn fingerprint_directory_tree_sync(
     request: DirectoryTreeFingerprintRequest,
-    system_config: &SystemFileSystemConfig,
 ) -> Result<Sha256Fingerprint, DirectoryTreeFingerprintError<Box<SystemFileSystemError>>> {
-    fingerprint_directory_tree_sync_with_between(request, system_config, || {})
+    fingerprint_directory_tree_sync_with_between(request, || {})
 }
 
 fn fingerprint_directory_tree_sync_with_between<F>(
     request: DirectoryTreeFingerprintRequest,
-    system_config: &SystemFileSystemConfig,
     between_observations: F,
 ) -> Result<Sha256Fingerprint, DirectoryTreeFingerprintError<Box<SystemFileSystemError>>>
 where
@@ -2372,9 +2490,9 @@ where
         .expect("受检目录树指纹请求至少包含一个根")
         .physical_root
         .clone();
-    let first = fingerprint_directory_tree_once(&roots, system_config)?;
+    let first = fingerprint_directory_tree_once(&roots)?;
     between_observations();
-    let second = fingerprint_directory_tree_once(&roots, system_config)?;
+    let second = fingerprint_directory_tree_once(&roots)?;
     if first.fingerprint != second.fingerprint || first.identities != second.identities {
         let path = first
             .identities
@@ -2401,18 +2519,15 @@ where
 
 fn fingerprint_directory_tree_once(
     roots: &[FingerprintRoot],
-    system_config: &SystemFileSystemConfig,
 ) -> Result<FingerprintObservation, DirectoryTreeFingerprintError<Box<SystemFileSystemError>>> {
     let mut pass = FingerprintPass {
-        budget: TreeBudgetUsage::default(),
         file_identities: HashSet::new(),
         identities: Vec::new(),
-        system_config,
         hasher: Sha256::new(),
     };
     hash_frame(&mut pass.hasher, 0, DIRECTORY_TREE_FINGERPRINT_DOMAIN);
     for root in roots {
-        fingerprint_directory(&root.physical_root, &root.logical_root, None, 1, &mut pass)?;
+        fingerprint_directory(&root.physical_root, &root.logical_root, None, &mut pass)?;
     }
     Ok(FingerprintObservation {
         fingerprint: Sha256Fingerprint::from_bytes(pass.hasher.finalize().into()),
@@ -2424,164 +2539,186 @@ fn fingerprint_directory(
     physical_path: &Path,
     logical_path: &Path,
     expected_identity: Option<FileIdentity>,
-    depth: usize,
-    pass: &mut FingerprintPass<'_>,
+    pass: &mut FingerprintPass,
 ) -> Result<(), DirectoryTreeFingerprintError<Box<SystemFileSystemError>>> {
-    if depth > pass.system_config.tree.max_depth {
-        return Err(fingerprint_failed(
-            physical_path,
-            SystemFileSystemError::ResourceLimit {
-                resource: "目录树深度",
-                limit: pass.system_config.tree.max_depth as u64,
-                observed: depth as u64,
-            },
-        ));
+    enum Work {
+        Directory {
+            physical_path: PathBuf,
+            logical_path: PathBuf,
+            expected_identity: Option<FileIdentity>,
+        },
+        File {
+            physical_path: PathBuf,
+            logical_path: PathBuf,
+            expected: ExpectedFingerprintFile,
+        },
+        FinishDirectory {
+            physical_path: PathBuf,
+            identity: FileIdentity,
+            held: PinnedPath,
+        },
     }
-    let metadata = match fs::symlink_metadata(physical_path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(DirectoryTreeFingerprintError::NotFound {
-                path: physical_path.to_path_buf(),
-            });
-        }
-        Err(source) => {
-            return Err(fingerprint_failed(
-                physical_path,
-                io_error("读取目录树根元数据", physical_path, source),
-            ));
-        }
-    };
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(fingerprint_failed(
-            physical_path,
-            WindowsFsError::ReparsePoint {
-                path: physical_path.to_path_buf(),
-            }
-            .into(),
-        ));
-    }
-    if !metadata.is_dir() {
-        return Err(DirectoryTreeFingerprintError::NotDirectory {
-            path: physical_path.to_path_buf(),
-        });
-    }
-    let pinned = pin_directory_without_reparse(physical_path)
-        .map_err(|source| fingerprint_failed(physical_path, source.into()))?;
-    let identity = FileIdentity::of(pinned.file(), physical_path)
-        .map_err(|source| fingerprint_failed(physical_path, source.into()))?;
-    if expected_identity.is_some_and(|expected| expected != identity) {
-        return Err(DirectoryTreeFingerprintError::ChangedDuringObservation {
-            path: physical_path.to_path_buf(),
-        });
-    }
-    pass.budget
-        .add_entry(&pass.system_config.tree)
-        .map_err(|source| fingerprint_failed(physical_path, source))?;
-    hash_tree_path(&mut pass.hasher, 1, logical_path);
-    pass.identities.push(FingerprintIdentityObservation {
-        entry_type: 1,
-        logical_key: path_utf16_key(logical_path),
-        physical_path: physical_path.to_path_buf(),
-        identity,
-    });
 
-    let resolved = pinned.resolved_path();
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(resolved)
-        .map_err(|source| fingerprint_failed(resolved, io_error("列举目录树", resolved, source)))?
-    {
-        if entries.len() == pass.system_config.max_directory_entries {
-            return Err(fingerprint_failed(
-                resolved,
-                SystemFileSystemError::ResourceLimit {
-                    resource: "目录树单目录条目数",
-                    limit: pass.system_config.max_directory_entries as u64,
-                    observed: pass.system_config.max_directory_entries as u64 + 1,
-                },
-            ));
-        }
-        let entry = entry.map_err(|source| {
-            fingerprint_failed(resolved, io_error("读取目录树目录项", resolved, source))
-        })?;
-        let name = entry.file_name();
-        let path = entry.path();
-        validate_windows_name(&name, &path).map_err(|source| fingerprint_failed(&path, source))?;
-        let wide = name.encode_wide().collect::<Vec<_>>();
-        if entries
-            .iter()
-            .any(|existing: &FingerprintEntry| windows_names_equal(&existing.wide_name, &wide))
-        {
-            return Err(fingerprint_failed(
-                &path,
-                SystemFileSystemError::InvalidPath {
-                    path: path.clone(),
-                    reason: "目录树包含 Windows 大小写等价名称",
-                },
-            ));
-        }
-        let pinned_entry = pin_path_without_reparse(&path)
-            .map_err(|source| fingerprint_failed(&path, source.into()))?;
-        let metadata = pinned_entry
-            .metadata()
-            .map_err(|source| fingerprint_failed(&path, source.into()))?;
-        let identity = FileIdentity::of(pinned_entry.file(), &path)
-            .map_err(|source| fingerprint_failed(&path, source.into()))?;
-        let kind = if metadata.is_dir() {
-            FingerprintEntryKind::Directory
-        } else if metadata.is_file() {
-            FingerprintEntryKind::File {
-                size: metadata.len(),
+    let mut pending = vec![Work::Directory {
+        physical_path: physical_path.to_path_buf(),
+        logical_path: logical_path.to_path_buf(),
+        expected_identity,
+    }];
+    while let Some(work) = pending.pop() {
+        match work {
+            Work::File {
+                physical_path,
+                logical_path,
+                expected,
+            } => fingerprint_file(&physical_path, &logical_path, expected, pass)?,
+            Work::FinishDirectory {
+                physical_path,
+                identity,
+                held,
+            } => {
+                let after = pin_directory_without_reparse(&physical_path)
+                    .map_err(|source| fingerprint_failed(&physical_path, source.into()))?;
+                let after_identity = FileIdentity::of(after.file(), &physical_path)
+                    .map_err(|source| fingerprint_failed(&physical_path, source.into()))?;
+                let held_identity = FileIdentity::of(held.file(), &physical_path)
+                    .map_err(|source| fingerprint_failed(&physical_path, source.into()))?;
+                if after_identity != identity || held_identity != identity {
+                    return Err(DirectoryTreeFingerprintError::ChangedDuringObservation {
+                        path: physical_path,
+                    });
+                }
             }
-        } else {
-            return Err(fingerprint_failed(
-                &path,
-                SystemFileSystemError::InvalidPath {
-                    path: path.clone(),
-                    reason: "目录树包含非普通文件系统对象",
-                },
-            ));
-        };
-        entries.push(FingerprintEntry {
-            name,
-            wide_name: wide,
-            physical_path: entry.path(),
-            identity,
-            kind,
-        });
-    }
-    entries.sort_by(|first, second| first.wide_name.cmp(&second.wide_name));
-    for entry in entries {
-        let logical_child = logical_path.join(&entry.name);
-        match entry.kind {
-            FingerprintEntryKind::Directory => fingerprint_directory(
-                &entry.physical_path,
-                &logical_child,
-                Some(entry.identity),
-                depth + 1,
-                pass,
-            )?,
-            FingerprintEntryKind::File { size } => fingerprint_file(
-                &entry.physical_path,
-                &logical_child,
-                ExpectedFingerprintFile {
-                    identity: entry.identity,
-                    size,
-                },
-                depth + 1,
-                pass,
-            )?,
+            Work::Directory {
+                physical_path,
+                logical_path,
+                expected_identity,
+            } => {
+                let metadata = match fs::symlink_metadata(&physical_path) {
+                    Ok(metadata) => metadata,
+                    Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                        return Err(DirectoryTreeFingerprintError::NotFound {
+                            path: physical_path,
+                        });
+                    }
+                    Err(source) => {
+                        return Err(fingerprint_failed(
+                            &physical_path,
+                            io_error("读取目录树根元数据", &physical_path, source),
+                        ));
+                    }
+                };
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(fingerprint_failed(
+                        &physical_path,
+                        WindowsFsError::ReparsePoint {
+                            path: physical_path.clone(),
+                        }
+                        .into(),
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(DirectoryTreeFingerprintError::NotDirectory {
+                        path: physical_path,
+                    });
+                }
+                let held = pin_directory_without_reparse(&physical_path)
+                    .map_err(|source| fingerprint_failed(&physical_path, source.into()))?;
+                let identity = FileIdentity::of(held.file(), &physical_path)
+                    .map_err(|source| fingerprint_failed(&physical_path, source.into()))?;
+                if expected_identity.is_some_and(|expected| expected != identity) {
+                    return Err(DirectoryTreeFingerprintError::ChangedDuringObservation {
+                        path: physical_path,
+                    });
+                }
+                hash_tree_path(&mut pass.hasher, 1, &logical_path);
+                pass.identities.push(FingerprintIdentityObservation {
+                    entry_type: 1,
+                    logical_key: path_utf16_key(&logical_path),
+                    physical_path: physical_path.clone(),
+                    identity,
+                });
+
+                let resolved = held.resolved_path();
+                let mut entries = Vec::new();
+                let mut windows_names = HashSet::new();
+                for entry in fs::read_dir(resolved).map_err(|source| {
+                    fingerprint_failed(resolved, io_error("列举目录树", resolved, source))
+                })? {
+                    let entry = entry.map_err(|source| {
+                        fingerprint_failed(resolved, io_error("读取目录树目录项", resolved, source))
+                    })?;
+                    let name = entry.file_name();
+                    let path = entry.path();
+                    validate_windows_name(&name, &path)
+                        .map_err(|source| fingerprint_failed(&path, source))?;
+                    let wide = name.encode_wide().collect::<Vec<_>>();
+                    let windows_key = invariant_uppercase_utf16(&name)
+                        .map_err(|source| fingerprint_failed(&path, source))?;
+                    if !windows_names.insert(windows_key) {
+                        return Err(fingerprint_failed(
+                            &path,
+                            SystemFileSystemError::InvalidPath {
+                                path: path.clone(),
+                                reason: "目录树包含 Windows 大小写等价名称",
+                            },
+                        ));
+                    }
+                    let pinned_entry = pin_path_without_reparse(&path)
+                        .map_err(|source| fingerprint_failed(&path, source.into()))?;
+                    let metadata = pinned_entry
+                        .metadata()
+                        .map_err(|source| fingerprint_failed(&path, source.into()))?;
+                    let identity = FileIdentity::of(pinned_entry.file(), &path)
+                        .map_err(|source| fingerprint_failed(&path, source.into()))?;
+                    let kind = if metadata.is_dir() {
+                        FingerprintEntryKind::Directory
+                    } else if metadata.is_file() {
+                        FingerprintEntryKind::File {
+                            size: metadata.len(),
+                        }
+                    } else {
+                        return Err(fingerprint_failed(
+                            &path,
+                            SystemFileSystemError::InvalidPath {
+                                path: path.clone(),
+                                reason: "目录树包含非普通文件系统对象",
+                            },
+                        ));
+                    };
+                    entries.push(FingerprintEntry {
+                        name,
+                        wide_name: wide,
+                        physical_path: path,
+                        identity,
+                        kind,
+                    });
+                }
+                entries.sort_by(|first, second| first.wide_name.cmp(&second.wide_name));
+                pending.push(Work::FinishDirectory {
+                    physical_path,
+                    identity,
+                    held,
+                });
+                for entry in entries.into_iter().rev() {
+                    let logical_child = logical_path.join(&entry.name);
+                    pending.push(match entry.kind {
+                        FingerprintEntryKind::Directory => Work::Directory {
+                            physical_path: entry.physical_path,
+                            logical_path: logical_child,
+                            expected_identity: Some(entry.identity),
+                        },
+                        FingerprintEntryKind::File { size } => Work::File {
+                            physical_path: entry.physical_path,
+                            logical_path: logical_child,
+                            expected: ExpectedFingerprintFile {
+                                identity: entry.identity,
+                                size,
+                            },
+                        },
+                    });
+                }
+            }
         }
-    }
-    let after = pin_directory_without_reparse(physical_path)
-        .map_err(|source| fingerprint_failed(physical_path, source.into()))?;
-    let after_identity = FileIdentity::of(after.file(), physical_path)
-        .map_err(|source| fingerprint_failed(physical_path, source.into()))?;
-    let held_identity = FileIdentity::of(pinned.file(), physical_path)
-        .map_err(|source| fingerprint_failed(physical_path, source.into()))?;
-    if after_identity != identity || held_identity != identity {
-        return Err(DirectoryTreeFingerprintError::ChangedDuringObservation {
-            path: physical_path.to_path_buf(),
-        });
     }
     Ok(())
 }
@@ -2603,19 +2740,8 @@ fn fingerprint_file(
     physical_path: &Path,
     logical_path: &Path,
     expected: ExpectedFingerprintFile,
-    depth: usize,
-    pass: &mut FingerprintPass<'_>,
+    pass: &mut FingerprintPass,
 ) -> Result<(), DirectoryTreeFingerprintError<Box<SystemFileSystemError>>> {
-    if depth > pass.system_config.tree.max_depth {
-        return Err(fingerprint_failed(
-            physical_path,
-            SystemFileSystemError::ResourceLimit {
-                resource: "目录树深度",
-                limit: pass.system_config.tree.max_depth as u64,
-                observed: depth as u64,
-            },
-        ));
-    }
     let mut pinned = pin_regular_file_for_snapshot_read(physical_path)
         .map_err(|source| fingerprint_failed(physical_path, source.into()))?;
     let before = pinned
@@ -2642,16 +2768,6 @@ fn fingerprint_file(
             },
         ));
     }
-    if before.len() > pass.system_config.tree.max_single_file_bytes {
-        return Err(fingerprint_failed(
-            physical_path,
-            SystemFileSystemError::ResourceLimit {
-                resource: "目录树单文件字节数",
-                limit: pass.system_config.tree.max_single_file_bytes,
-                observed: before.len(),
-            },
-        ));
-    }
     let identity = FileIdentity::of(pinned.file(), physical_path)
         .map_err(|source| fingerprint_failed(physical_path, source.into()))?;
     if identity != expected.identity || before.len() != expected.size {
@@ -2668,12 +2784,6 @@ fn fingerprint_file(
             },
         ));
     }
-    pass.budget
-        .add_entry(&pass.system_config.tree)
-        .map_err(|source| fingerprint_failed(physical_path, source))?;
-    pass.budget
-        .add_bytes(before.len(), &pass.system_config.tree)
-        .map_err(|source| fingerprint_failed(physical_path, source))?;
     hash_tree_path(&mut pass.hasher, 2, logical_path);
     hash_frame(&mut pass.hasher, 4, &before.len().to_be_bytes());
     hash_frame_prefix(&mut pass.hasher, 5, before.len());
@@ -2765,60 +2875,12 @@ fn hash_frame_prefix(hasher: &mut Sha256, tag: u8, length: u64) {
     hasher.update(length.to_be_bytes());
 }
 
-#[derive(Default)]
-struct TreeBudgetUsage {
-    entries: usize,
-    bytes: u64,
-}
-
-impl TreeBudgetUsage {
-    fn add_entry(&mut self, config: &TreeBudget) -> Result<(), SystemFileSystemError> {
-        self.entries += 1;
-        if self.entries > config.max_entries {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "目录树条目数",
-                limit: config.max_entries as u64,
-                observed: self.entries as u64,
-            });
-        }
-        Ok(())
-    }
-
-    fn add_bytes(&mut self, bytes: u64, config: &TreeBudget) -> Result<(), SystemFileSystemError> {
-        self.bytes = self
-            .bytes
-            .checked_add(bytes)
-            .ok_or(SystemFileSystemError::ResourceLimit {
-                resource: "目录树总字节数",
-                limit: config.max_bytes,
-                observed: u64::MAX,
-            })?;
-        if self.bytes > config.max_bytes {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "目录树总字节数",
-                limit: config.max_bytes,
-                observed: self.bytes,
-            });
-        }
-        Ok(())
-    }
-
-    fn replace_bytes(
-        &mut self,
-        old: u64,
-        new: u64,
-        config: &TreeBudget,
-    ) -> Result<(), SystemFileSystemError> {
-        self.bytes = self.bytes.saturating_sub(old);
-        self.add_bytes(new, config)
-    }
-}
-
 fn prepare_directory_sync(
     request: DirectoryStageRequest,
-    system_config: SystemFileSystemConfig,
     publisher_config: DirectoryPublisherConfig,
     publisher_identity: Arc<()>,
+    cancellation: &AtomicBool,
+    materialization_width: usize,
 ) -> Result<StagedDirectory<SystemStagingState>, DirectoryPrepareError<Box<SystemFileSystemError>>>
 {
     let target_root = request.target_root().to_path_buf();
@@ -2849,8 +2911,7 @@ fn prepare_directory_sync(
         validate_windows_name(target_name, &target_root)?;
         let target_root = parent_root.join(target_name);
         let lock_path = target_lock_path(&publisher_config.lock_directory, &target_root)?;
-        let target_lock =
-            ExclusiveFileLock::acquire(&lock_path, publisher_config.target_lock_timeout)?;
+        let target_lock = ExclusiveFileLock::acquire(&lock_path, cancellation)?;
         let target_artifact_key = target_lock.identity(&lock_path)?.stable_hex();
         recover_target(&target_root, &target_artifact_key, &publisher_config)?;
 
@@ -2892,7 +2953,8 @@ fn prepare_directory_sync(
             request.source_mappings(),
             request.overlays(),
             request.empty_directories(),
-            &system_config,
+            cancellation,
+            materialization_width,
         );
         if let Err(source) = build_result {
             return Err(prepare_terminal_failure(
@@ -2974,15 +3036,12 @@ fn build_candidate(
     source_mappings: &[DirectorySourceMapping],
     overlays: &[DirectoryFileOverlay],
     empty_directories: &[PathBuf],
-    system_config: &SystemFileSystemConfig,
+    cancellation: &AtomicBool,
+    materialization_width: usize,
 ) -> Result<(), SystemFileSystemError> {
-    validate_declared_windows_paths(
-        source_mappings,
-        overlays,
-        empty_directories,
-        &system_config.tree,
-    )?;
-    // 先冻结确定性来源 manifest 和完整预算，再创建候选内容；覆盖文件只在物化时
+    ensure_operation_active(cancellation, "建立目录候选", stage_root)?;
+    validate_declared_windows_paths(source_mappings, overlays, empty_directories)?;
+    // 先冻结确定性来源 manifest，再创建候选内容；覆盖文件只在物化时
     // 写入最终字节一次，但仍与普通文件一样接受来源身份、类型和大小复核。
     let manifest = build_candidate_manifest(
         stage_root,
@@ -2990,9 +3049,15 @@ fn build_candidate(
         source_mappings,
         overlays,
         empty_directories,
-        system_config,
+        cancellation,
     )?;
-    materialize_candidate_manifest(stage_root, &manifest, overlays, system_config)
+    materialize_candidate_manifest(
+        stage_root,
+        &manifest,
+        overlays,
+        cancellation,
+        materialization_width,
+    )
 }
 
 #[derive(Debug)]
@@ -3005,8 +3070,15 @@ enum CandidateManifestOperation {
     EnsureDirectory(PathBuf),
     CopySource {
         relative_target: PathBuf,
-        directory: CandidateManifestDirectory,
+        source_tree: CandidateManifestSourceTree,
     },
+}
+
+#[derive(Debug)]
+struct CandidateManifestSourceTree {
+    root_directory: usize,
+    directories: Vec<CandidateManifestDirectory>,
+    files: Vec<CandidateManifestFile>,
 }
 
 #[derive(Debug)]
@@ -3022,10 +3094,10 @@ struct CandidateManifestEntry {
     kind: CandidateManifestEntryKind,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum CandidateManifestEntryKind {
-    Directory(CandidateManifestDirectory),
-    File(CandidateManifestFile),
+    Directory(usize),
+    File(usize),
 }
 
 #[derive(Debug)]
@@ -3042,36 +3114,29 @@ struct CandidateSourceEntry {
     physical_path: PathBuf,
 }
 
-struct CandidateOverlayLookup<'a> {
-    exact: BTreeMap<PathBuf, usize>,
-    overlays: &'a [DirectoryFileOverlay],
+struct CandidateOverlayLookup {
+    windows_paths: HashMap<Vec<Vec<u16>>, usize>,
 }
 
-struct CandidateManifestObservation<'a> {
-    overlay_lookup: CandidateOverlayLookup<'a>,
+struct CandidateManifestObservation {
+    overlay_lookup: CandidateOverlayLookup,
     matched_overlay_sizes: Vec<Option<u64>>,
-    budget: TreeBudgetUsage,
-    system_config: &'a SystemFileSystemConfig,
 }
 
-impl<'a> CandidateOverlayLookup<'a> {
-    fn new(overlays: &'a [DirectoryFileOverlay]) -> Self {
-        Self {
-            exact: overlays
-                .iter()
-                .enumerate()
-                .map(|(index, overlay)| (overlay.relative_file().to_path_buf(), index))
-                .collect(),
-            overlays,
+impl CandidateOverlayLookup {
+    fn new(overlays: &[DirectoryFileOverlay]) -> Result<Self, SystemFileSystemError> {
+        let mut windows_paths = HashMap::with_capacity(overlays.len());
+        for (index, overlay) in overlays.iter().enumerate() {
+            windows_paths.insert(windows_relative_path_key(overlay.relative_file())?, index);
         }
+        Ok(Self { windows_paths })
     }
 
-    fn find(&self, relative_file: &Path) -> Option<usize> {
-        self.exact.get(relative_file).copied().or_else(|| {
-            self.overlays.iter().position(|overlay| {
-                windows_relative_paths_equal(relative_file, overlay.relative_file())
-            })
-        })
+    fn find(&self, relative_file: &Path) -> Result<Option<usize>, SystemFileSystemError> {
+        Ok(self
+            .windows_paths
+            .get(&windows_relative_path_key(relative_file)?)
+            .copied())
     }
 }
 
@@ -3081,17 +3146,16 @@ fn build_candidate_manifest(
     source_mappings: &[DirectorySourceMapping],
     overlays: &[DirectoryFileOverlay],
     empty_directories: &[PathBuf],
-    system_config: &SystemFileSystemConfig,
+    cancellation: &AtomicBool,
 ) -> Result<CandidateManifest, SystemFileSystemError> {
     let mut operations = Vec::new();
     let mut declared_directories = HashSet::new();
     let mut observation = CandidateManifestObservation {
-        overlay_lookup: CandidateOverlayLookup::new(overlays),
+        overlay_lookup: CandidateOverlayLookup::new(overlays)?,
         matched_overlay_sizes: vec![None; overlays.len()],
-        budget: TreeBudgetUsage::default(),
-        system_config,
     };
     for mapping in source_mappings {
+        ensure_operation_active(cancellation, "观察候选来源", mapping.source_directory())?;
         validate_relative_windows_path(mapping.relative_target())?;
         ensure_source_is_physically_disjoint(mapping.source_directory(), stage_root, target_root)?;
         if let Some(relative_parent) = mapping.relative_target().parent() {
@@ -3099,39 +3163,23 @@ fn build_candidate_manifest(
                 relative_parent,
                 &mut declared_directories,
                 &mut operations,
-                &mut observation.budget,
-                &system_config.tree,
             )?;
         }
-        let directory = observe_candidate_directory(
+        let source_tree = observe_candidate_source_tree(
             mapping.source_directory(),
             mapping.relative_target(),
             None,
-            mapping.relative_target().components().count(),
             &mut observation,
+            cancellation,
         )?;
         operations.push(CandidateManifestOperation::CopySource {
             relative_target: mapping.relative_target().to_path_buf(),
-            directory,
+            source_tree,
         });
     }
     for (index, overlay) in overlays.iter().enumerate() {
+        ensure_operation_active(cancellation, "观察候选覆盖", overlay.relative_file())?;
         validate_relative_windows_path(overlay.relative_file())?;
-        let depth = overlay.relative_file().components().count();
-        if depth > system_config.tree.max_depth {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "目录候选深度",
-                limit: system_config.tree.max_depth as u64,
-                observed: depth as u64,
-            });
-        }
-        if overlay.bytes().len() as u64 > system_config.tree.max_single_file_bytes {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "目录候选单文件字节数",
-                limit: system_config.tree.max_single_file_bytes,
-                observed: overlay.bytes().len() as u64,
-            });
-        }
         let Some(original_size) = observation.matched_overlay_sizes[index] else {
             let source_path = source_mappings
                 .iter()
@@ -3153,29 +3201,12 @@ fn build_candidate_manifest(
                 }
             }
         };
-        observation.budget.replace_bytes(
-            original_size,
-            overlay.bytes().len() as u64,
-            &system_config.tree,
-        )?;
+        let _ = original_size;
     }
     for directory in empty_directories {
+        ensure_operation_active(cancellation, "观察候选空目录", directory)?;
         validate_relative_windows_path(directory)?;
-        let depth = directory.components().count();
-        if depth > system_config.tree.max_depth {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "目录候选深度",
-                limit: system_config.tree.max_depth as u64,
-                observed: depth as u64,
-            });
-        }
-        reserve_manifest_directories(
-            directory,
-            &mut declared_directories,
-            &mut operations,
-            &mut observation.budget,
-            &system_config.tree,
-        )?;
+        reserve_manifest_directories(directory, &mut declared_directories, &mut operations)?;
     }
     Ok(CandidateManifest { operations })
 }
@@ -3184,8 +3215,6 @@ fn reserve_manifest_directories(
     relative: &Path,
     declared_directories: &mut HashSet<PathBuf>,
     operations: &mut Vec<CandidateManifestOperation>,
-    budget: &mut TreeBudgetUsage,
-    config: &TreeBudget,
 ) -> Result<(), SystemFileSystemError> {
     let mut current = PathBuf::new();
     for component in relative.components() {
@@ -3194,28 +3223,29 @@ fn reserve_manifest_directories(
         };
         current.push(name);
         if declared_directories.insert(current.clone()) {
-            budget.add_entry(config)?;
             operations.push(CandidateManifestOperation::EnsureDirectory(current.clone()));
         }
     }
     Ok(())
 }
 
-fn observe_candidate_directory(
+struct CandidateDirectoryObservation {
+    directory_index: usize,
+    source: PathBuf,
+    relative: PathBuf,
+    source_path: PinnedPath,
+    source_identity: FileIdentity,
+    entries: std::vec::IntoIter<CandidateSourceEntry>,
+}
+
+fn begin_candidate_directory_observation(
     source: &Path,
     relative: &Path,
     expected_identity: Option<FileIdentity>,
-    depth: usize,
-    observation: &mut CandidateManifestObservation<'_>,
-) -> Result<CandidateManifestDirectory, SystemFileSystemError> {
-    let system_config = observation.system_config;
-    if depth > system_config.tree.max_depth {
-        return Err(SystemFileSystemError::ResourceLimit {
-            resource: "目录候选深度",
-            limit: system_config.tree.max_depth as u64,
-            observed: depth as u64,
-        });
-    }
+    directories: &mut Vec<CandidateManifestDirectory>,
+    cancellation: &AtomicBool,
+) -> Result<CandidateDirectoryObservation, SystemFileSystemError> {
+    ensure_operation_active(cancellation, "观察候选来源", source)?;
     let source_path = pin_directory_without_reparse(source)?;
     let source_resolved = source_path.resolved_path().to_path_buf();
     let source_identity = FileIdentity::of(source_path.file(), source)?;
@@ -3225,44 +3255,90 @@ fn observe_candidate_directory(
             reason: "复制来源目录在枚举后物理身份发生变化",
         });
     }
-    observation.budget.add_entry(&system_config.tree)?;
+    let source_entries = read_candidate_source_entries(&source_resolved, cancellation)?;
+    let directory_index = directories.len();
+    directories.push(CandidateManifestDirectory {
+        source: source.to_path_buf(),
+        expected_identity: source_identity,
+        entries: Vec::with_capacity(source_entries.len()),
+    });
+    Ok(CandidateDirectoryObservation {
+        directory_index,
+        source: source.to_path_buf(),
+        relative: relative.to_path_buf(),
+        source_path,
+        source_identity,
+        entries: source_entries.into_iter(),
+    })
+}
 
-    let source_entries = read_candidate_source_entries(&source_resolved, system_config)?;
-    let mut entries = Vec::with_capacity(source_entries.len());
-    for entry in source_entries {
+fn observe_candidate_source_tree(
+    source: &Path,
+    relative: &Path,
+    expected_identity: Option<FileIdentity>,
+    observation: &mut CandidateManifestObservation,
+    cancellation: &AtomicBool,
+) -> Result<CandidateManifestSourceTree, SystemFileSystemError> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    let root = begin_candidate_directory_observation(
+        source,
+        relative,
+        expected_identity,
+        &mut directories,
+        cancellation,
+    )?;
+    let root_directory = root.directory_index;
+    let mut pending = vec![root];
+    while !pending.is_empty() {
+        let current_source = &pending.last().expect("候选来源观察栈必须非空").source;
+        ensure_operation_active(cancellation, "观察候选来源", current_source)?;
+        let next_entry = pending
+            .last_mut()
+            .expect("候选来源观察栈必须非空")
+            .entries
+            .next();
+        let Some(entry) = next_entry else {
+            let frame = pending.pop().expect("候选来源观察栈必须非空");
+            let after = pin_directory_without_reparse(&frame.source)?;
+            let after_identity = FileIdentity::of(after.file(), &frame.source)?;
+            let held_identity = FileIdentity::of(frame.source_path.file(), &frame.source)?;
+            if after_identity != frame.source_identity || held_identity != frame.source_identity {
+                return Err(SystemFileSystemError::InvalidPath {
+                    path: frame.source,
+                    reason: "复制来源目录在枚举期间物理身份发生变化",
+                });
+            }
+            continue;
+        };
+
+        let frame = pending.last().expect("候选来源观察栈必须非空");
+        let parent_directory = frame.directory_index;
         let child_source = entry.physical_path;
-        let child_relative = relative.join(&entry.name);
+        let child_relative = frame.relative.join(&entry.name);
         let pinned_child = pin_path_without_reparse(&child_source)?;
         let metadata = pinned_child.metadata()?;
         let child_identity = FileIdentity::of(pinned_child.file(), &child_source)?;
         let kind = if metadata.is_dir() {
-            CandidateManifestEntryKind::Directory(observe_candidate_directory(
+            let child = begin_candidate_directory_observation(
                 &child_source,
                 &child_relative,
                 Some(child_identity),
-                depth + 1,
-                observation,
-            )?)
+                &mut directories,
+                cancellation,
+            )?;
+            let child_directory = child.directory_index;
+            pending.push(child);
+            CandidateManifestEntryKind::Directory(child_directory)
         } else if metadata.is_file() {
             let observed_size = metadata.len();
-            if observed_size > system_config.tree.max_single_file_bytes {
-                return Err(SystemFileSystemError::ResourceLimit {
-                    resource: "目录候选单文件字节数",
-                    limit: system_config.tree.max_single_file_bytes,
-                    observed: observed_size,
-                });
-            }
-            observation.budget.add_entry(&system_config.tree)?;
             if number_of_links(pinned_child.file(), &child_source)? != 1 {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: child_source,
                     reason: "复制来源包含硬链接文件",
                 });
             }
-            observation
-                .budget
-                .add_bytes(observed_size, &system_config.tree)?;
-            let overlay_index = observation.overlay_lookup.find(&child_relative);
+            let overlay_index = observation.overlay_lookup.find(&child_relative)?;
             if let Some(index) = overlay_index
                 && observation.matched_overlay_sizes[index]
                     .replace(observed_size)
@@ -3273,54 +3349,44 @@ fn observe_candidate_directory(
                     reason: "同一候选覆盖匹配了多个来源文件",
                 });
             }
-            CandidateManifestEntryKind::File(CandidateManifestFile {
+            let file = files.len();
+            files.push(CandidateManifestFile {
                 source: child_source,
                 expected_identity: child_identity,
                 observed_size,
                 overlay_index,
-            })
+            });
+            CandidateManifestEntryKind::File(file)
         } else {
             return Err(SystemFileSystemError::InvalidPath {
                 path: child_source,
                 reason: "复制来源包含非普通文件对象",
             });
         };
-        entries.push(CandidateManifestEntry {
-            name: entry.name,
-            kind,
-        });
+        directories[parent_directory]
+            .entries
+            .push(CandidateManifestEntry {
+                name: entry.name,
+                kind,
+            });
     }
-    let after = pin_directory_without_reparse(source)?;
-    let after_identity = FileIdentity::of(after.file(), source)?;
-    let held_identity = FileIdentity::of(source_path.file(), source)?;
-    if after_identity != source_identity || held_identity != source_identity {
-        return Err(SystemFileSystemError::InvalidPath {
-            path: source.to_path_buf(),
-            reason: "复制来源目录在枚举期间物理身份发生变化",
-        });
-    }
-    Ok(CandidateManifestDirectory {
-        source: source.to_path_buf(),
-        expected_identity: source_identity,
-        entries,
+    Ok(CandidateManifestSourceTree {
+        root_directory,
+        directories,
+        files,
     })
 }
 
 fn read_candidate_source_entries(
     directory: &Path,
-    system_config: &SystemFileSystemConfig,
+    cancellation: &AtomicBool,
 ) -> Result<Vec<CandidateSourceEntry>, SystemFileSystemError> {
+    ensure_operation_active(cancellation, "列举候选来源", directory)?;
     let mut entries = Vec::new();
     for entry in
         fs::read_dir(directory).map_err(|source| io_error("列举复制来源", directory, source))?
     {
-        if entries.len() == system_config.max_directory_entries {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "复制来源单目录条目数",
-                limit: system_config.max_directory_entries as u64,
-                observed: system_config.max_directory_entries as u64 + 1,
-            });
-        }
+        ensure_operation_active(cancellation, "列举候选来源", directory)?;
         let entry = entry.map_err(|source| io_error("读取复制来源目录项", directory, source))?;
         let name = entry.file_name();
         entries.push(CandidateSourceEntry {
@@ -3330,19 +3396,15 @@ fn read_candidate_source_entries(
         });
     }
     entries.sort_by(|first, second| first.wide_name.cmp(&second.wide_name));
-    let mut names: Vec<&[u16]> = Vec::with_capacity(entries.len());
+    let mut names = HashSet::with_capacity(entries.len());
     for entry in &entries {
         validate_windows_name(&entry.name, &entry.physical_path)?;
-        if names
-            .iter()
-            .any(|existing| windows_names_equal(existing, &entry.wide_name))
-        {
+        if !names.insert(invariant_uppercase_utf16(&entry.name)?) {
             return Err(SystemFileSystemError::InvalidPath {
                 path: entry.physical_path.clone(),
                 reason: "同一目录包含 Windows 大小写等价名称",
             });
         }
-        names.push(&entry.wide_name);
     }
     Ok(entries)
 }
@@ -3351,9 +3413,12 @@ fn materialize_candidate_manifest(
     stage_root: &Path,
     manifest: &CandidateManifest,
     overlays: &[DirectoryFileOverlay],
-    system_config: &SystemFileSystemConfig,
+    cancellation: &AtomicBool,
+    worker_width: usize,
 ) -> Result<(), SystemFileSystemError> {
+    let mut files = Vec::new();
     for operation in &manifest.operations {
+        ensure_operation_active(cancellation, "物化目录候选", stage_root)?;
         match operation {
             CandidateManifestOperation::EnsureDirectory(relative) => {
                 let path = stage_root.join(relative);
@@ -3366,64 +3431,191 @@ fn materialize_candidate_manifest(
             }
             CandidateManifestOperation::CopySource {
                 relative_target,
-                directory,
-            } => materialize_candidate_directory(
-                directory,
+                source_tree,
+            } => prepare_candidate_source_tree(
+                source_tree,
                 &stage_root.join(relative_target),
-                overlays,
-                system_config,
+                &mut files,
+                cancellation,
             )?,
+        }
+    }
+    materialize_candidate_files(&files, overlays, cancellation, worker_width)?;
+    for operation in &manifest.operations {
+        ensure_operation_active(cancellation, "验证候选来源", stage_root)?;
+        if let CandidateManifestOperation::CopySource { source_tree, .. } = operation {
+            validate_materialized_source_tree(source_tree, cancellation)?;
         }
     }
     Ok(())
 }
 
-fn materialize_candidate_directory(
-    manifest: &CandidateManifestDirectory,
-    destination: &Path,
-    overlays: &[DirectoryFileOverlay],
-    system_config: &SystemFileSystemConfig,
-) -> Result<(), SystemFileSystemError> {
-    let source_path = pin_directory_without_reparse(&manifest.source)?;
-    let source_identity = FileIdentity::of(source_path.file(), &manifest.source)?;
-    if source_identity != manifest.expected_identity {
-        return Err(SystemFileSystemError::InvalidPath {
-            path: manifest.source.clone(),
-            reason: "复制来源目录在 manifest 后物理身份发生变化",
-        });
-    }
-    validate_manifest_directory_entries(manifest, source_path.resolved_path(), system_config)?;
-    fs::create_dir(destination).map_err(|source| io_error("建立候选目录", destination, source))?;
-    let destination_path = pin_directory_without_reparse(destination)?;
-    let destination_resolved = destination_path.resolved_path().to_path_buf();
+struct CandidateFileTask<'a> {
+    ordinal: usize,
+    manifest: &'a CandidateManifestFile,
+    destination: PathBuf,
+}
 
-    for entry in &manifest.entries {
-        let child_destination = destination_resolved.join(&entry.name);
-        match &entry.kind {
-            CandidateManifestEntryKind::Directory(directory) => {
-                materialize_candidate_directory(
-                    directory,
-                    &child_destination,
-                    overlays,
-                    system_config,
-                )?;
-            }
-            CandidateManifestEntryKind::File(file) => match file.overlay_index {
-                Some(index) => write_candidate_overlay(file, &child_destination, &overlays[index])?,
-                None => {
-                    copy_manifest_regular_file(file, &child_destination, &system_config.tree)?;
+fn prepare_candidate_source_tree<'a>(
+    source_tree: &'a CandidateManifestSourceTree,
+    destination: &Path,
+    files: &mut Vec<CandidateFileTask<'a>>,
+    cancellation: &AtomicBool,
+) -> Result<(), SystemFileSystemError> {
+    enum Work {
+        Directory {
+            directory: usize,
+            destination: PathBuf,
+        },
+        File {
+            file: usize,
+            destination: PathBuf,
+        },
+    }
+
+    let mut pending = vec![Work::Directory {
+        directory: source_tree.root_directory,
+        destination: destination.to_path_buf(),
+    }];
+    while let Some(work) = pending.pop() {
+        ensure_operation_active(cancellation, "准备候选来源", destination)?;
+        match work {
+            Work::File { file, destination } => files.push(CandidateFileTask {
+                ordinal: files.len(),
+                manifest: &source_tree.files[file],
+                destination,
+            }),
+            Work::Directory {
+                directory,
+                destination,
+            } => {
+                let manifest = &source_tree.directories[directory];
+                let source_path = pin_directory_without_reparse(&manifest.source)?;
+                let source_identity = FileIdentity::of(source_path.file(), &manifest.source)?;
+                if source_identity != manifest.expected_identity {
+                    return Err(SystemFileSystemError::InvalidPath {
+                        path: manifest.source.clone(),
+                        reason: "复制来源目录在 manifest 后物理身份发生变化",
+                    });
                 }
-            },
+                validate_manifest_directory_entries(
+                    manifest,
+                    source_path.resolved_path(),
+                    cancellation,
+                )?;
+                fs::create_dir(&destination)
+                    .map_err(|source| io_error("建立候选目录", &destination, source))?;
+                let destination_path = pin_directory_without_reparse(&destination)?;
+                let destination_resolved = destination_path.resolved_path().to_path_buf();
+
+                for entry in manifest.entries.iter().rev() {
+                    let child_destination = destination_resolved.join(&entry.name);
+                    pending.push(match entry.kind {
+                        CandidateManifestEntryKind::Directory(directory) => Work::Directory {
+                            directory,
+                            destination: child_destination,
+                        },
+                        CandidateManifestEntryKind::File(file) => Work::File {
+                            file,
+                            destination: child_destination,
+                        },
+                    });
+                }
+            }
         }
     }
-    let after = pin_directory_without_reparse(&manifest.source)?;
-    let after_identity = FileIdentity::of(after.file(), &manifest.source)?;
-    let held_identity = FileIdentity::of(source_path.file(), &manifest.source)?;
-    if after_identity != manifest.expected_identity || held_identity != manifest.expected_identity {
-        return Err(SystemFileSystemError::InvalidPath {
-            path: manifest.source.clone(),
-            reason: "复制来源目录在物化期间物理身份发生变化",
-        });
+    Ok(())
+}
+
+fn materialize_candidate_files(
+    files: &[CandidateFileTask<'_>],
+    overlays: &[DirectoryFileOverlay],
+    cancellation: &AtomicBool,
+    worker_width: usize,
+) -> Result<(), SystemFileSystemError> {
+    if files.is_empty() {
+        return ensure_operation_active(cancellation, "物化候选文件", Path::new("<candidate>"));
+    }
+    ensure_operation_active(cancellation, "物化候选文件", &files[0].destination)?;
+    let next = AtomicUsize::new(0);
+    let errors = Mutex::new(Vec::<(usize, SystemFileSystemError)>::new());
+    let width = worker_width.max(1).min(files.len());
+    thread::scope(|scope| {
+        for _ in 1..width {
+            scope.spawn(|| {
+                materialize_candidate_file_worker(files, overlays, cancellation, &next, &errors)
+            });
+        }
+        materialize_candidate_file_worker(files, overlays, cancellation, &next, &errors);
+    });
+    let mut errors = errors
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    errors.sort_by_key(|(ordinal, _)| *ordinal);
+    match errors.into_iter().next() {
+        Some((_, error)) => Err(error),
+        None => ensure_operation_active(cancellation, "物化候选文件", &files[0].destination),
+    }
+}
+
+fn materialize_candidate_file_worker(
+    files: &[CandidateFileTask<'_>],
+    overlays: &[DirectoryFileOverlay],
+    cancellation: &AtomicBool,
+    next: &AtomicUsize,
+    errors: &Mutex<Vec<(usize, SystemFileSystemError)>>,
+) {
+    loop {
+        let index = next.fetch_add(1, Ordering::Relaxed);
+        let Some(task) = files.get(index) else {
+            return;
+        };
+        let result = ensure_operation_active(cancellation, "物化候选文件", &task.destination)
+            .and_then(|()| match task.manifest.overlay_index {
+                Some(overlay) => write_candidate_overlay(
+                    task.manifest,
+                    &task.destination,
+                    &overlays[overlay],
+                    cancellation,
+                ),
+                None => copy_manifest_regular_file(task.manifest, &task.destination, cancellation)
+                    .map(|_| ()),
+            });
+        let cancelled = matches!(result, Err(SystemFileSystemError::Cancelled { .. }));
+        if let Err(error) = result {
+            errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((task.ordinal, error));
+        }
+        if cancelled {
+            return;
+        };
+    }
+}
+
+fn validate_materialized_source_tree(
+    source_tree: &CandidateManifestSourceTree,
+    cancellation: &AtomicBool,
+) -> Result<(), SystemFileSystemError> {
+    let mut pending = vec![source_tree.root_directory];
+    while let Some(directory) = pending.pop() {
+        let manifest = &source_tree.directories[directory];
+        ensure_operation_active(cancellation, "验证候选来源", &manifest.source)?;
+        let after = pin_directory_without_reparse(&manifest.source)?;
+        let after_identity = FileIdentity::of(after.file(), &manifest.source)?;
+        if after_identity != manifest.expected_identity {
+            return Err(SystemFileSystemError::InvalidPath {
+                path: manifest.source.clone(),
+                reason: "复制来源目录在物化期间物理身份发生变化",
+            });
+        }
+        validate_manifest_directory_entries(manifest, after.resolved_path(), cancellation)?;
+        for entry in manifest.entries.iter().rev() {
+            if let CandidateManifestEntryKind::Directory(directory) = entry.kind {
+                pending.push(directory);
+            }
+        }
     }
     Ok(())
 }
@@ -3431,9 +3623,9 @@ fn materialize_candidate_directory(
 fn validate_manifest_directory_entries(
     manifest: &CandidateManifestDirectory,
     source_resolved: &Path,
-    system_config: &SystemFileSystemConfig,
+    cancellation: &AtomicBool,
 ) -> Result<(), SystemFileSystemError> {
-    let current = read_candidate_source_entries(source_resolved, system_config)?;
+    let current = read_candidate_source_entries(source_resolved, cancellation)?;
     if current.len() != manifest.entries.len()
         || current
             .iter()
@@ -3448,38 +3640,26 @@ fn validate_manifest_directory_entries(
     Ok(())
 }
 
-fn windows_relative_paths_equal(first: &Path, second: &Path) -> bool {
-    let mut first = first.components();
-    let mut second = second.components();
-    loop {
-        match (first.next(), second.next()) {
-            (None, None) => return true,
-            (Some(Component::Normal(first)), Some(Component::Normal(second)))
-                if windows_names_equal(
-                    &first.encode_wide().collect::<Vec<_>>(),
-                    &second.encode_wide().collect::<Vec<_>>(),
-                ) => {}
-            _ => return false,
-        }
-    }
+fn windows_relative_path_key(path: &Path) -> Result<Vec<Vec<u16>>, SystemFileSystemError> {
+    path.components()
+        .map(|component| {
+            let Component::Normal(name) = component else {
+                unreachable!("候选相对路径已经过结构校验")
+            };
+            invariant_uppercase_utf16(name)
+        })
+        .collect()
 }
 
 fn validate_declared_windows_paths(
     source_mappings: &[DirectorySourceMapping],
     overlays: &[DirectoryFileOverlay],
     empty_directories: &[PathBuf],
-    config: &TreeBudget,
 ) -> Result<(), SystemFileSystemError> {
-    let declared_count = source_mappings
-        .len()
-        .saturating_add(overlays.len())
-        .saturating_add(empty_directories.len());
-    if declared_count > config.max_entries {
-        return Err(SystemFileSystemError::ResourceLimit {
-            resource: "目录候选声明路径数",
-            limit: config.max_entries as u64,
-            observed: declared_count as u64,
-        });
+    #[derive(Default)]
+    struct TrieNode {
+        spelling: Option<OsString>,
+        children: HashMap<Vec<u16>, usize>,
     }
 
     let declared_paths = source_mappings
@@ -3487,41 +3667,38 @@ fn validate_declared_windows_paths(
         .map(DirectorySourceMapping::relative_target)
         .chain(overlays.iter().map(DirectoryFileOverlay::relative_file))
         .chain(empty_directories.iter().map(PathBuf::as_path));
-    let mut seen_prefixes: Vec<Vec<OsString>> = Vec::new();
+    let mut trie = vec![TrieNode::default()];
     for path in declared_paths {
         validate_relative_windows_path(path)?;
-        let depth = path.components().count();
-        if depth > config.max_depth {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "目录候选深度",
-                limit: config.max_depth as u64,
-                observed: depth as u64,
-            });
-        }
-        let mut prefix = Vec::new();
+        let mut node_index = 0;
         for component in path.components() {
             let Component::Normal(name) = component else {
                 unreachable!("候选声明路径已经过结构校验");
             };
-            prefix.push(name.to_os_string());
-            if let Some(existing) = seen_prefixes.iter().find(|existing| {
-                existing.len() == prefix.len()
-                    && existing.iter().zip(&prefix).all(|(first, second)| {
-                        windows_names_equal(
-                            &first.encode_wide().collect::<Vec<_>>(),
-                            &second.encode_wide().collect::<Vec<_>>(),
-                        )
-                    })
-            }) {
-                if existing != &prefix {
-                    return Err(SystemFileSystemError::InvalidPath {
-                        path: path.to_path_buf(),
-                        reason: "候选声明对同一 Windows 路径使用了冲突的大小写拼写",
+            let key = invariant_uppercase_utf16(name)?;
+            let child_index = match trie[node_index].children.get(&key).copied() {
+                Some(index) => index,
+                None => {
+                    let index = trie.len();
+                    trie.push(TrieNode {
+                        spelling: Some(name.to_os_string()),
+                        children: HashMap::new(),
                     });
+                    trie[node_index].children.insert(key, index);
+                    index
                 }
-            } else {
-                seen_prefixes.push(prefix.clone());
+            };
+            if trie[child_index]
+                .spelling
+                .as_deref()
+                .is_some_and(|spelling| spelling != name)
+            {
+                return Err(SystemFileSystemError::InvalidPath {
+                    path: path.to_path_buf(),
+                    reason: "候选声明对同一 Windows 路径使用了冲突的大小写拼写",
+                });
             }
+            node_index = child_index;
         }
     }
     Ok(())
@@ -3532,124 +3709,62 @@ fn validate_declared_windows_paths(
 fn validate_complete_candidate(
     stage_root: &Path,
     expected_identity: FileIdentity,
-    system_config: &SystemFileSystemConfig,
+    performance: &RunPerformanceCounters,
 ) -> Result<(), SystemFileSystemError> {
+    performance.candidate_validation_started();
     let pinned_root = pin_directory_without_reparse(stage_root)?;
     if FileIdentity::of(pinned_root.file(), stage_root)? != expected_identity {
         return Err(SystemFileSystemError::InvalidStagedIdentity {
             path: stage_root.to_path_buf(),
         });
     }
-    let mut budget = TreeBudgetUsage::default();
     let mut file_identities = HashSet::new();
-    validate_candidate_directory(
-        stage_root,
-        0,
-        false,
-        &mut budget,
-        &mut file_identities,
-        system_config,
-    )
-}
-
-fn validate_candidate_directory(
-    directory: &Path,
-    depth: usize,
-    count_directory: bool,
-    budget: &mut TreeBudgetUsage,
-    file_identities: &mut HashSet<FileIdentity>,
-    system_config: &SystemFileSystemConfig,
-) -> Result<(), SystemFileSystemError> {
-    if depth > system_config.tree.max_depth {
-        return Err(SystemFileSystemError::ResourceLimit {
-            resource: "目录候选深度",
-            limit: system_config.tree.max_depth as u64,
-            observed: depth as u64,
-        });
-    }
-    let pinned_directory = pin_directory_without_reparse(directory)?;
-    if count_directory {
-        budget.add_entry(&system_config.tree)?;
-    }
-    let resolved = pinned_directory.resolved_path().to_path_buf();
-    let mut names: Vec<Vec<u16>> = Vec::new();
-    let mut direct_entries = 0_usize;
-    for entry in fs::read_dir(&resolved)
-        .map_err(|source| io_error("发布前枚举完整候选", &resolved, source))?
-    {
-        direct_entries += 1;
-        if direct_entries > system_config.max_directory_entries {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "候选单目录条目数",
-                limit: system_config.max_directory_entries as u64,
-                observed: direct_entries as u64,
-            });
-        }
-        let entry = entry.map_err(|source| io_error("发布前读取候选目录项", &resolved, source))?;
-        let name = entry.file_name();
-        let child_path = entry.path();
-        validate_windows_name(&name, &child_path)?;
-        let wide = name.encode_wide().collect::<Vec<_>>();
-        if names
-            .iter()
-            .any(|existing| windows_names_equal(existing, &wide))
+    let mut pending_directories = vec![stage_root.to_path_buf()];
+    while let Some(directory) = pending_directories.pop() {
+        let pinned_directory = pin_directory_without_reparse(&directory)?;
+        let resolved = pinned_directory.resolved_path().to_path_buf();
+        let mut names = HashSet::new();
+        for entry in fs::read_dir(&resolved)
+            .map_err(|source| io_error("发布前枚举完整候选", &resolved, source))?
         {
-            return Err(SystemFileSystemError::InvalidPath {
-                path: child_path,
-                reason: "发布候选的同一目录包含 Windows 大小写等价名称",
-            });
-        }
-        names.push(wide);
-
-        let child = pin_path_without_reparse(&child_path)?;
-        let metadata = child.metadata()?;
-        let child_depth = depth + 1;
-        if metadata.is_dir() {
-            validate_candidate_directory(
-                &child_path,
-                child_depth,
-                true,
-                budget,
-                file_identities,
-                system_config,
-            )?;
-        } else if metadata.is_file() {
-            if child_depth > system_config.tree.max_depth {
-                return Err(SystemFileSystemError::ResourceLimit {
-                    resource: "目录候选深度",
-                    limit: system_config.tree.max_depth as u64,
-                    observed: child_depth as u64,
-                });
-            }
-            if metadata.len() > system_config.tree.max_single_file_bytes {
-                return Err(SystemFileSystemError::ResourceLimit {
-                    resource: "目录候选单文件字节数",
-                    limit: system_config.tree.max_single_file_bytes,
-                    observed: metadata.len(),
-                });
-            }
-            if number_of_links(child.file(), &child_path)? != 1 {
+            let entry =
+                entry.map_err(|source| io_error("发布前读取候选目录项", &resolved, source))?;
+            let name = entry.file_name();
+            let child_path = entry.path();
+            validate_windows_name(&name, &child_path)?;
+            if !names.insert(invariant_uppercase_utf16(&name)?) {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: child_path,
-                    reason: "发布候选包含硬链接文件",
+                    reason: "发布候选的同一目录包含 Windows 大小写等价名称",
                 });
             }
-            let identity = FileIdentity::of(child.file(), &child_path)?;
-            if !file_identities.insert(identity) {
+            let child = pin_path_without_reparse(&child_path)?;
+            let metadata = child.metadata()?;
+            if metadata.is_dir() {
+                pending_directories.push(child_path);
+            } else if metadata.is_file() {
+                if number_of_links(child.file(), &child_path)? != 1 {
+                    return Err(SystemFileSystemError::InvalidPath {
+                        path: child_path,
+                        reason: "发布候选包含硬链接文件",
+                    });
+                }
+                let identity = FileIdentity::of(child.file(), &child_path)?;
+                if !file_identities.insert(identity) {
+                    return Err(SystemFileSystemError::InvalidPath {
+                        path: child_path,
+                        reason: "发布候选包含共享同一物理文件身份的硬链接",
+                    });
+                }
+            } else {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: child_path,
-                    reason: "发布候选包含共享同一物理文件身份的硬链接",
+                    reason: "发布候选包含非普通文件系统对象",
                 });
             }
-            budget.add_entry(&system_config.tree)?;
-            budget.add_bytes(metadata.len(), &system_config.tree)?;
-        } else {
-            return Err(SystemFileSystemError::InvalidPath {
-                path: child_path,
-                reason: "发布候选包含非普通文件系统对象",
-            });
         }
     }
+    performance.candidate_validation_completed();
     Ok(())
 }
 
@@ -3763,8 +3878,9 @@ fn validate_materialized_source_file(
 fn copy_manifest_regular_file(
     manifest: &CandidateManifestFile,
     destination: &Path,
-    config: &TreeBudget,
+    cancellation: &AtomicBool,
 ) -> Result<u64, SystemFileSystemError> {
+    ensure_operation_active(cancellation, "复制候选文件", destination)?;
     let mut input = pin_manifest_regular_file(manifest)?;
     let mut output = OpenOptions::new()
         .write(true)
@@ -3774,6 +3890,7 @@ fn copy_manifest_regular_file(
     let mut buffer = [0_u8; 64 * 1024];
     let mut copied = 0_u64;
     loop {
+        ensure_operation_active(cancellation, "复制候选文件", destination)?;
         let read = input
             .file_mut()
             .read(&mut buffer)
@@ -3782,17 +3899,13 @@ fn copy_manifest_regular_file(
             break;
         }
         copied = copied.saturating_add(read as u64);
-        if copied > config.max_single_file_bytes {
-            return Err(SystemFileSystemError::ResourceLimit {
-                resource: "目录候选单文件字节数",
-                limit: config.max_single_file_bytes,
-                observed: copied,
-            });
-        }
         output
             .write_all(&buffer[..read])
             .map_err(|source| io_error("写入候选文件", destination, source))?;
+        #[cfg(test)]
+        cancel_test_candidate_copy_after_chunk(&manifest.source, cancellation);
     }
+    ensure_operation_active(cancellation, "复制候选文件", destination)?;
     validate_materialized_source_file(&input, manifest)?;
     if copied != manifest.observed_size {
         return Err(SystemFileSystemError::InvalidPath {
@@ -3803,6 +3916,7 @@ fn copy_manifest_regular_file(
     output
         .sync_data()
         .map_err(|source| io_error("同步候选文件", destination, source))?;
+    ensure_operation_active(cancellation, "复制候选文件", destination)?;
     Ok(copied)
 }
 
@@ -3810,19 +3924,26 @@ fn write_candidate_overlay(
     manifest: &CandidateManifestFile,
     destination: &Path,
     overlay: &DirectoryFileOverlay,
+    cancellation: &AtomicBool,
 ) -> Result<(), SystemFileSystemError> {
+    ensure_operation_active(cancellation, "写入候选覆盖", destination)?;
     let input = pin_manifest_regular_file(manifest)?;
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)
         .map_err(|source| io_error("建立候选覆盖", destination, source))?;
-    output
-        .write_all(overlay.bytes())
-        .map_err(|source| io_error("写入候选覆盖", destination, source))?;
+    for chunk in overlay.bytes().chunks(64 * 1024) {
+        ensure_operation_active(cancellation, "写入候选覆盖", destination)?;
+        output
+            .write_all(chunk)
+            .map_err(|source| io_error("写入候选覆盖", destination, source))?;
+    }
+    ensure_operation_active(cancellation, "写入候选覆盖", destination)?;
     output
         .sync_data()
         .map_err(|source| io_error("同步候选覆盖", destination, source))?;
+    ensure_operation_active(cancellation, "写入候选覆盖", destination)?;
     validate_materialized_source_file(&input, manifest)
 }
 
@@ -3832,26 +3953,15 @@ fn copy_regular_file(
     destination: &Path,
     expected_identity: FileIdentity,
     observed_size: u64,
-    budget: &mut TreeBudgetUsage,
-    config: &TreeBudget,
 ) -> Result<(), SystemFileSystemError> {
-    if observed_size > config.max_single_file_bytes {
-        return Err(SystemFileSystemError::ResourceLimit {
-            resource: "目录候选单文件字节数",
-            limit: config.max_single_file_bytes,
-            observed: observed_size,
-        });
-    }
-    budget.add_entry(config)?;
     let manifest = CandidateManifestFile {
         source: source.to_path_buf(),
         expected_identity,
         observed_size,
         overlay_index: None,
     };
-    let copied = copy_manifest_regular_file(&manifest, destination, config)?;
-    budget.add_bytes(copied, config)?;
-    Ok(())
+    let cancellation = AtomicBool::new(true);
+    copy_manifest_regular_file(&manifest, destination, &cancellation).map(|_| ())
 }
 
 fn validate_relative_windows_path(path: &Path) -> Result<(), SystemFileSystemError> {
@@ -3969,9 +4079,9 @@ fn stable_lock_path(
 fn invariant_uppercase_utf16(value: &OsStr) -> Result<Vec<u16>, SystemFileSystemError> {
     let input = value.encode_wide().collect::<Vec<_>>();
     let input_len =
-        i32::try_from(input.len()).map_err(|_| SystemFileSystemError::ResourceLimit {
-            resource: "文件租约身份 UTF-16 单元数",
-            limit: i32::MAX as u64,
+        i32::try_from(input.len()).map_err(|_| SystemFileSystemError::WindowsApiValueTooLarge {
+            subject: "文件租约身份 UTF-16 单元数",
+            maximum: i32::MAX as u64,
             observed: input.len() as u64,
         })?;
     // SAFETY: 输入切片在调用期间有效；第一次调用只查询所需长度，不写入目标缓冲区。
@@ -4039,6 +4149,20 @@ struct JournalRecord {
     phase: JournalPhase,
 }
 
+fn journal_json_error_reason(prefix: &str, source: &serde_json::Error) -> String {
+    let category = match source.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!(
+        "{prefix}（category={category}, line={}, column={}）",
+        source.line(),
+        source.column()
+    )
+}
+
 fn append_journal(
     path: &Path,
     record: &JournalRecord,
@@ -4047,15 +4171,13 @@ fn append_journal(
     let payload =
         serde_json::to_vec(record).map_err(|source| SystemFileSystemError::JournalCorrupt {
             path: path.to_path_buf(),
-            reason: source.to_string(),
+            reason: journal_json_error_reason("journal 帧无法序列化", &source),
         })?;
-    if payload.len() > JOURNAL_MAX_BYTES {
-        return Err(SystemFileSystemError::ResourceLimit {
-            resource: "目录发布 journal 单帧字节数",
-            limit: JOURNAL_MAX_BYTES as u64,
-            observed: payload.len() as u64,
-        });
-    }
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| SystemFileSystemError::JournalCorrupt {
+            path: path.to_path_buf(),
+            reason: "journal 单帧无法用现行 u32 长度字段表达".to_owned(),
+        })?;
     let mut hasher = Hasher::new();
     hasher.update(&payload);
     let crc = hasher.finalize();
@@ -4084,7 +4206,7 @@ fn append_journal(
             reason: "journal 路径不是普通文件".to_owned(),
         });
     }
-    file.write_all(&(payload.len() as u32).to_le_bytes())
+    file.write_all(&payload_len.to_le_bytes())
         .and_then(|()| file.write_all(&payload))
         .and_then(|()| file.write_all(&crc.to_le_bytes()))
         .map_err(|source| io_error("写入目录发布 journal", path, source))?;
@@ -4101,31 +4223,8 @@ fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, SystemFileSystemError
             reason: "journal 不是普通文件".to_owned(),
         });
     }
-    if metadata.len() > JOURNAL_MAX_BYTES as u64 {
-        return Err(SystemFileSystemError::ResourceLimit {
-            resource: "目录发布 journal 字节数",
-            limit: JOURNAL_MAX_BYTES as u64,
-            observed: metadata.len(),
-        });
-    }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(metadata.len() as usize)
-        .map_err(|_| SystemFileSystemError::AllocationFailed {
-            resource: "目录发布 journal",
-            bytes: metadata.len(),
-        })?;
-    Read::by_ref(pinned.file_mut())
-        .take(JOURNAL_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
+    let bytes = read_all_bytes(pinned.file_mut())
         .map_err(|source| io_error("读取目录发布 journal", path, source))?;
-    if bytes.len() > JOURNAL_MAX_BYTES {
-        return Err(SystemFileSystemError::ResourceLimit {
-            resource: "目录发布 journal 字节数",
-            limit: JOURNAL_MAX_BYTES as u64,
-            observed: bytes.len() as u64,
-        });
-    }
     let mut offset = 0_usize;
     let mut records: Vec<JournalRecord> = Vec::new();
     while offset < bytes.len() {
@@ -4137,12 +4236,6 @@ fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, SystemFileSystemError
                 .try_into()
                 .expect("已确认 journal 长度头完整"),
         ) as usize;
-        if length > JOURNAL_MAX_BYTES {
-            return Err(SystemFileSystemError::JournalCorrupt {
-                path: path.to_path_buf(),
-                reason: "帧长度超过 journal 上限".to_owned(),
-            });
-        }
         let frame_end = offset + 4 + length + 4;
         if frame_end > bytes.len() {
             break;
@@ -4164,13 +4257,13 @@ fn read_journal(path: &Path) -> Result<Vec<JournalRecord>, SystemFileSystemError
         let record: JournalRecord = serde_json::from_slice(payload).map_err(|source| {
             SystemFileSystemError::JournalCorrupt {
                 path: path.to_path_buf(),
-                reason: format!("完整帧 JSON 无效：{source}"),
+                reason: journal_json_error_reason("完整帧 JSON 无效", &source),
             }
         })?;
-        let parsed_operation = Uuid::parse_str(&record.operation_id).map_err(|source| {
+        let parsed_operation = Uuid::parse_str(&record.operation_id).map_err(|_| {
             SystemFileSystemError::JournalCorrupt {
                 path: path.to_path_buf(),
-                reason: format!("operation_id 无效：{source}"),
+                reason: "operation_id 不符合 UUID 语法".to_owned(),
             }
         })?;
         if parsed_operation.get_version_num() != 4
@@ -4224,7 +4317,7 @@ const fn size_of_u32() -> usize {
 fn publish_directory_sync(
     staged: StagedDirectory<SystemStagingState>,
     expected_identity: &Arc<()>,
-    config: &SystemFileSystemConfig,
+    performance: &RunPerformanceCounters,
 ) -> Result<(), DirectoryPublishError<Box<SystemFileSystemError>>> {
     let (target_root, stage_root, intent, mut state) = staged.into_parts();
     state.finalized = true;
@@ -4255,7 +4348,8 @@ fn publish_directory_sync(
             source: Box::new(source),
         });
     }
-    if let Err(source) = validate_complete_candidate(&stage_root, state.stage_identity, config) {
+    if let Err(source) = validate_complete_candidate(&stage_root, state.stage_identity, performance)
+    {
         if matches!(&source, SystemFileSystemError::InvalidStagedIdentity { .. }) {
             state.cleanup.disarm();
             return Err(DirectoryPublishError::OutcomeUnknown {
@@ -4837,7 +4931,7 @@ fn identity_at(path: &Path) -> Result<Option<FileIdentity>, SystemFileSystemErro
 fn recover_target(
     target_root: &Path,
     target_artifact_key: &str,
-    config: &DirectoryPublisherConfig,
+    _config: &DirectoryPublisherConfig,
 ) -> Result<(), SystemFileSystemError> {
     let parent = target_root.parent().expect("受信发布目标必有父目录");
     let prefix = format!("{RESERVED_PREFIX}{target_artifact_key}-");
@@ -4854,13 +4948,6 @@ fn recover_target(
             && (name.ends_with(".journal") || name.ends_with(".stage") || name.ends_with(".backup"))
         {
             artifacts.push(entry.path());
-            if artifacts.len() > config.max_recovery_artifacts_per_target {
-                return Err(SystemFileSystemError::ResourceLimit {
-                    resource: "单目标目录恢复产物数",
-                    limit: config.max_recovery_artifacts_per_target as u64,
-                    observed: artifacts.len() as u64,
-                });
-            }
         }
     }
     let journals = artifacts
@@ -5006,7 +5093,10 @@ fn recover_journal(target_root: &Path, journal: &Path) -> Result<(), SystemFileS
             return Err(SystemFileSystemError::OutcomeUnknown {
                 target_root: target_root.to_path_buf(),
                 artifacts: vec![stage, backup, journal.to_path_buf()],
-                reason: format!("恢复旧目标时备份身份或重命名状态变化：{source}"),
+                reason: format!(
+                    "恢复旧目标时备份身份或重命名状态变化：{}",
+                    windows_fs_error_detail(&source)
+                ),
             });
         }
         if identity_at(target_root)? != Some(record.original_identity) {
@@ -5064,19 +5154,113 @@ mod tests {
     use super::*;
     use std::ops::Deref;
 
+    struct HugeMetadataReader {
+        reported_length: u64,
+        content: io::Cursor<Vec<u8>>,
+        read_calls: usize,
+    }
+
+    impl Read for HugeMetadataReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.read_calls += 1;
+            self.content.read(buffer)
+        }
+    }
+
+    #[test]
+    fn complete_reads_ignore_declared_file_length_and_attempt_the_real_reader() {
+        const TWO_PEBIBYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024 * 1024;
+
+        let mut reader = HugeMetadataReader {
+            reported_length: TWO_PEBIBYTES,
+            content: io::Cursor::new(b"actual bytes".to_vec()),
+            read_calls: 0,
+        };
+        assert_eq!(reader.reported_length, TWO_PEBIBYTES);
+
+        let bytes = read_all_bytes(&mut reader).expect("声明为 2 PiB 不得在真实读取前触发容量拒绝");
+
+        assert_eq!(bytes, b"actual bytes");
+        assert!(reader.read_calls > 0, "读取路径必须实际调用底层 Read");
+    }
+
+    #[tokio::test]
+    async fn saturated_file_pool_cancels_admission_without_queueing_extra_work() {
+        let pool = Arc::new(FileWorkPool::new(1).expect("单 worker 文件池应可建立"));
+        let (started_sender, started_receiver) = async_channel::bounded(1);
+        let (release_sender, release_receiver) = async_channel::bounded(1);
+        let active_pool = Arc::clone(&pool);
+        let active = tokio::spawn(async move {
+            active_pool
+                .execute("active_test_work", Path::new("C:/active"), move || {
+                    started_sender
+                        .send_blocking(())
+                        .expect("测试应能通知 active 工作已开始");
+                    release_receiver
+                        .recv_blocking()
+                        .expect("测试应能释放 active 工作");
+                    7_u8
+                })
+                .await
+        });
+        started_receiver
+            .recv()
+            .await
+            .expect("active 工作必须占用唯一执行许可");
+
+        let waiting_pool = Arc::clone(&pool);
+        let waiting = tokio::spawn(async move {
+            waiting_pool
+                .execute("waiting_test_work", Path::new("C:/waiting"), || 9_u8)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "饱和时必须等待实际执行许可");
+
+        pool.cancel_waits();
+        let error = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("取消必须立即唤醒 admission 等待")
+            .expect("等待任务不应 panic")
+            .expect_err("取消必须唤醒尚未取得许可的任务");
+        assert!(matches!(
+            error,
+            SystemFileSystemError::Cancelled { operation, path }
+                if operation == "waiting_test_work" && path == Path::new("C:/waiting")
+        ));
+
+        release_sender
+            .send(())
+            .await
+            .expect("已接管的 active 工作必须能继续完成");
+        assert_eq!(
+            active
+                .await
+                .expect("active 任务不应 panic")
+                .expect("已接管的 active 工作不应被 admission 取消"),
+            7
+        );
+        pool.shutdown().await.expect("文件池应干净关闭");
+    }
+
     #[derive(Clone)]
     struct TestDirectoryPublisher {
         file_system: SystemFileSystem,
         publisher: SystemDirectoryPublisher,
+        performance: Arc<RunPerformanceCounters>,
     }
 
     impl TestDirectoryPublisher {
         fn new(config: SystemFileSystemConfig) -> Self {
-            let file_system = SystemFileSystem::new(config).expect("应该可建立文件系统根");
+            let performance = Arc::new(RunPerformanceCounters::default());
+            let file_system =
+                SystemFileSystem::new_with_performance(config, Arc::clone(&performance))
+                    .expect("应该可建立文件系统根");
             let publisher = file_system.directory_publisher(publisher_config());
             Self {
                 file_system,
                 publisher,
+                performance,
             }
         }
 
@@ -5084,12 +5268,21 @@ mod tests {
             config: SystemFileSystemConfig,
             publisher_config: DirectoryPublisherConfig,
         ) -> Self {
-            let file_system = SystemFileSystem::new(config).expect("应该可建立文件系统根");
+            let performance = Arc::new(RunPerformanceCounters::default());
+            let file_system =
+                SystemFileSystem::new_with_performance(config, Arc::clone(&performance))
+                    .expect("应该可建立文件系统根");
             let publisher = file_system.directory_publisher(publisher_config);
             Self {
                 file_system,
                 publisher,
+                performance,
             }
+        }
+
+        fn candidate_validation_counts(&self) -> (u64, u64) {
+            let count = self.performance.snapshot().candidate_validations;
+            (count.started, count.completed)
         }
 
         async fn shutdown(&self) -> Result<(), SystemFileSystemError> {
@@ -5119,32 +5312,11 @@ mod tests {
     }
 
     fn publisher_config_for_lock_directory(lock_directory: PathBuf) -> DirectoryPublisherConfig {
-        DirectoryPublisherConfig::new(lock_directory, 8, Duration::from_secs(1))
-            .expect("测试发布配置应该合法")
-    }
-
-    fn tree_budget() -> TreeBudget {
-        TreeBudget::new(128, 16, 1024 * 1024, 512 * 1024).expect("测试目录树预算应该合法")
-    }
-
-    fn exclusive_file_lease_config() -> ExclusiveFileLeaseConfig {
-        ExclusiveFileLeaseConfig::new(Duration::from_secs(1)).expect("测试租约配置应该合法")
+        DirectoryPublisherConfig::production(lock_directory).expect("测试发布配置应该合法")
     }
 
     fn file_system_config() -> SystemFileSystemConfig {
-        file_system_config_with_lease_timeout(Duration::from_secs(1))
-    }
-
-    fn file_system_config_with_lease_timeout(timeout: Duration) -> SystemFileSystemConfig {
-        SystemFileSystemConfig::new(
-            2,
-            8,
-            1024,
-            16,
-            tree_budget(),
-            ExclusiveFileLeaseConfig::new(timeout).expect("测试租约配置应该合法"),
-        )
-        .expect("测试文件系统配置应该合法")
+        SystemFileSystemConfig::fixed(2)
     }
 
     fn tree_fingerprint_request(assets: &Path, scripts: &Path) -> DirectoryTreeFingerprintRequest {
@@ -5264,7 +5436,7 @@ mod tests {
                 .expect("大小写不同的原始声明尚未进入 Windows 边界"),
         ];
         assert!(matches!(
-            validate_declared_windows_paths(&mappings, &[], &[], &tree_budget()),
+            validate_declared_windows_paths(&mappings, &[], &[]),
             Err(SystemFileSystemError::InvalidPath { reason, .. })
                 if reason.contains("大小写")
         ));
@@ -5297,11 +5469,8 @@ mod tests {
     }
 
     #[test]
-    fn publisher_configuration_rejects_zero_resource_budget() {
-        assert!(DirectoryPublisherConfig::new(PathBuf::from("locks"), 0, Duration::ZERO).is_err());
-        assert!(DirectoryPublisherConfig::new(PathBuf::new(), 1, Duration::ZERO).is_err());
-        assert!(TreeBudget::new(0, 1, 1, 1).is_err());
-        assert!(ExclusiveFileLeaseConfig::new(Duration::ZERO).is_err());
+    fn publisher_configuration_rejects_empty_lock_directory() {
+        assert!(DirectoryPublisherConfig::production(PathBuf::new()).is_err());
         let _ = publisher_config();
     }
 
@@ -5396,10 +5565,7 @@ mod tests {
     async fn exclusive_file_lease_serializes_same_windows_identity_and_allows_other_identities() {
         let temporary = tempfile::tempdir().expect("应该可创建临时项目集合根");
         let owner = SystemFileSystem::new(file_system_config()).expect("应该可建立锁所有者根");
-        let contender = SystemFileSystem::new(file_system_config_with_lease_timeout(
-            Duration::from_millis(25),
-        ))
-        .expect("应该可建立锁竞争者根");
+        let contender = SystemFileSystem::new(file_system_config()).expect("应该可建立锁竞争者根");
         let lock_directory = temporary.path().join("locks/leases");
         let request = |name: &str| {
             ExclusiveFileLeaseRequest::new(lock_directory.clone(), OsString::from(name))
@@ -5414,13 +5580,16 @@ mod tests {
             .acquire_exclusive_file_lease(request("游戏Two"))
             .await
             .expect("不同身份应该可以并行");
-        assert!(matches!(
-            contender
-                .acquire_exclusive_file_lease(request("游戏one"))
-                .await,
-            Err(ExclusiveFileLeaseError::Busy { identity, .. })
-                if identity == OsStr::new("游戏one")
-        ));
+        let waiting = tokio::spawn({
+            let contender = contender.clone();
+            let request = request("游戏one");
+            async move { contender.acquire_exclusive_file_lease(request).await }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !waiting.is_finished(),
+            "同身份竞争者应自然等待而不是容量拒绝"
+        );
         assert!(lock_directory.is_dir());
         assert_eq!(
             fs::read_dir(&lock_directory)
@@ -5432,13 +5601,94 @@ mod tests {
 
         drop(other_lease);
         drop(lease);
-        let reacquired = contender
-            .acquire_exclusive_file_lease(request("游戏one"))
+        let reacquired = tokio::time::timeout(Duration::from_secs(1), waiting)
             .await
-            .expect("所有者释放后应该可重新取得同身份租约");
+            .expect("所有者释放后等待者应取得租约")
+            .expect("等待任务不应 panic")
+            .expect("等待者应取得同身份租约");
         drop(reacquired);
         contender.shutdown().await.expect("竞争者根应该可终结");
         owner.shutdown().await.expect("所有者根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_file_lease_wait_without_an_arbitrary_deadline() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let request = |identity: &str| {
+            ExclusiveFileLeaseRequest::new(temporary.path().join("locks"), OsString::from(identity))
+                .expect("测试租约请求应合法")
+        };
+        let owner = SystemFileSystem::new(file_system_config()).expect("所有者根应建立");
+        let contender = SystemFileSystem::new(file_system_config()).expect("竞争根应建立");
+        let lease = owner
+            .acquire_exclusive_file_lease(request("Game"))
+            .await
+            .expect("所有者应取得租约");
+        let waiting = tokio::spawn({
+            let contender = contender.clone();
+            let request = request("game");
+            async move { contender.acquire_exclusive_file_lease(request).await }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished(), "竞争者应等待真实文件锁");
+
+        contender.shutdown().await.expect("shutdown 应中断锁等待");
+        let error = match waiting.await.expect("等待任务不应 panic") {
+            Ok(_) => panic!("被 shutdown 取消后不得伪造取得租约"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ExclusiveFileLeaseError::Unavailable { source, .. }
+                if matches!(*source, SystemFileSystemError::Windows(
+                    WindowsFsError::LockCancelled { .. }
+                ))
+        ));
+        drop(lease);
+        owner.shutdown().await.expect("所有者根应终结");
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_interrupts_a_file_lease_without_closing_the_worker_pool() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let request = |identity: &str| {
+            ExclusiveFileLeaseRequest::new(temporary.path().join("locks"), OsString::from(identity))
+                .expect("测试租约请求应合法")
+        };
+        let owner = SystemFileSystem::new(file_system_config()).expect("所有者根应建立");
+        let contender = SystemFileSystem::new(file_system_config()).expect("竞争根应建立");
+        let lease = owner
+            .acquire_exclusive_file_lease(request("Game"))
+            .await
+            .expect("所有者应取得租约");
+        let waiting = tokio::spawn({
+            let contender = contender.clone();
+            let request = request("game");
+            async move { contender.acquire_exclusive_file_lease(request).await }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished(), "竞争者应等待真实文件锁");
+
+        contender.cancel_waits();
+        let error = match tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("取消应及时唤醒文件租约等待")
+            .expect("等待任务不应 panic")
+        {
+            Ok(_) => panic!("取消等待后不得伪造取得租约"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ExclusiveFileLeaseError::Unavailable { source, .. }
+                if matches!(*source, SystemFileSystemError::Windows(
+                    WindowsFsError::LockCancelled { .. }
+                ))
+        ));
+
+        drop(lease);
+        contender.shutdown().await.expect("竞争者根应可终结");
+        owner.shutdown().await.expect("所有者根应终结");
     }
 
     #[tokio::test]
@@ -5538,6 +5788,78 @@ mod tests {
         root.shutdown().await.expect("文件系统根应该可终结");
     }
 
+    #[test]
+    fn relative_directory_walk_keeps_deterministic_depth_first_identity_order() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        for root in [&first, &second] {
+            fs::create_dir_all(root.join("a/deep")).expect("应该可建立深层目录");
+            fs::create_dir_all(root.join("z")).expect("应该可建立末尾目录");
+        }
+        fs::write(first.join("z/last.json"), b"last").expect("应该可写入末尾文件");
+        fs::write(first.join("a/deep/first.json"), b"first").expect("应该可写入深层文件");
+        // 反转物理创建顺序，避免把 NTFS 枚举顺序误当成确定性来源。
+        fs::write(second.join("a/deep/first.json"), b"first").expect("应该可写入深层文件");
+        fs::write(second.join("z/last.json"), b"last").expect("应该可写入末尾文件");
+
+        let root = |physical_root: &Path| FingerprintRoot {
+            physical_root: physical_root.to_path_buf(),
+            logical_root: PathBuf::from("assets"),
+            logical_key: path_utf16_key(Path::new("assets")),
+        };
+        let first =
+            fingerprint_directory_tree_once(&[root(&first)]).expect("第一份树应该可完成单轮观察");
+        let second =
+            fingerprint_directory_tree_once(&[root(&second)]).expect("第二份树应该可完成单轮观察");
+        let order = |observation: &FingerprintObservation| {
+            observation
+                .identities
+                .iter()
+                .map(|entry| (entry.entry_type, entry.logical_key.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(order(&first), order(&second));
+    }
+
+    #[tokio::test]
+    async fn directory_tree_fingerprint_rejects_a_reparse_child_without_following_it() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let assets = temporary.path().join("assets");
+        let scripts = temporary.path().join("scripts");
+        let outside = temporary.path().join("outside.json");
+        fs::create_dir(&assets).expect("应该可建立资源目录");
+        fs::create_dir(&scripts).expect("应该可建立脚本目录");
+        fs::write(&outside, b"outside").expect("应该可建立树外目标");
+        let link = assets.join("linked.json");
+        if let Err(error) = std::os::windows::fs::symlink_file(&outside, &link) {
+            if symlink_unavailable(&error) {
+                return;
+            }
+            panic!("应该可建立文件符号链接：{error}");
+        }
+        let root = SystemFileSystem::new(file_system_config()).expect("应该可建立文件系统根");
+
+        let error = root
+            .fingerprint_directory_tree(tree_fingerprint_request(&assets, &scripts))
+            .await
+            .expect_err("目录树指纹必须拒绝最终分量 reparse point");
+        assert!(matches!(
+            error,
+            DirectoryTreeFingerprintError::Failed { source, .. }
+                if matches!(
+                    source.as_ref(),
+                    SystemFileSystemError::Windows(WindowsFsError::ReparsePoint { path })
+                        if path == &link
+                )
+        ));
+        assert_eq!(fs::read(&outside).expect("树外目标仍应可读取"), b"outside");
+
+        root.shutdown().await.expect("文件系统根应该可终结");
+    }
+
     #[tokio::test]
     async fn directory_tree_fingerprint_rejects_hardlinks() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
@@ -5583,7 +5905,6 @@ mod tests {
 
         let error = fingerprint_directory_tree_sync_with_between(
             tree_fingerprint_request(&assets, &scripts),
-            &file_system_config(),
             || {
                 fs::remove_file(&observed).expect("第一轮结束后应该可移除原对象");
                 fs::rename(&replacement, &observed).expect("应该可换入相同内容的新身份对象");
@@ -5613,12 +5934,9 @@ mod tests {
         fs::remove_file(&observed).expect("应该可移除已枚举对象");
         fs::rename(&replacement, &observed).expect("应该可换入同内容的新对象");
 
-        let config = file_system_config();
         let mut pass = FingerprintPass {
-            budget: TreeBudgetUsage::default(),
             file_identities: HashSet::new(),
             identities: Vec::new(),
-            system_config: &config,
             hasher: Sha256::new(),
         };
         let error = fingerprint_file(
@@ -5628,7 +5946,6 @@ mod tests {
                 identity: expected_identity,
                 size: expected_size,
             },
-            2,
             &mut pass,
         )
         .expect_err("目录项在枚举窗口被替换后必须失败");
@@ -5688,16 +6005,8 @@ mod tests {
         fs::remove_file(&source).expect("应该可移除枚举时来源");
         fs::rename(&replacement, &source).expect("应该可换入相同大小和内容的新身份来源");
 
-        let mut budget = TreeBudgetUsage::default();
-        let error = copy_regular_file(
-            &source,
-            &destination,
-            expected_identity,
-            expected_size,
-            &mut budget,
-            &tree_budget(),
-        )
-        .expect_err("来源在枚举与复制之间替换必须失败");
+        let error = copy_regular_file(&source, &destination, expected_identity, expected_size)
+            .expect_err("来源在枚举与复制之间替换必须失败");
         assert!(matches!(
             error,
             SystemFileSystemError::InvalidPath {
@@ -5729,19 +6038,19 @@ mod tests {
             )
             .expect("测试覆盖应合法"),
         ];
-        let config = file_system_config();
-
+        let cancellation = AtomicBool::new(true);
         let manifest =
-            build_candidate_manifest(&stage, &target, &mappings, &overlays, &[], &config)
+            build_candidate_manifest(&stage, &target, &mappings, &overlays, &[], &cancellation)
                 .expect("覆盖感知 manifest 应可建立");
-        let directory = manifest
+        let source_tree = manifest
             .operations
             .iter()
             .find_map(|operation| match operation {
-                CandidateManifestOperation::CopySource { directory, .. } => Some(directory),
+                CandidateManifestOperation::CopySource { source_tree, .. } => Some(source_tree),
                 CandidateManifestOperation::EnsureDirectory(_) => None,
             })
             .expect("manifest 应包含来源树");
+        let directory = &source_tree.directories[source_tree.root_directory];
         assert_eq!(
             directory
                 .entries
@@ -5750,16 +6059,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [OsString::from("catalog.json"), OsString::from("z.json")]
         );
-        let CandidateManifestEntryKind::File(catalog) = &directory.entries[0].kind else {
+        let CandidateManifestEntryKind::File(catalog) = directory.entries[0].kind else {
             panic!("catalog 应为普通文件")
         };
-        let CandidateManifestEntryKind::File(untouched) = &directory.entries[1].kind else {
+        let CandidateManifestEntryKind::File(untouched) = directory.entries[1].kind else {
             panic!("z.json 应为普通文件")
         };
-        assert_eq!(catalog.overlay_index, Some(0));
-        assert_eq!(untouched.overlay_index, None);
+        assert_eq!(source_tree.files[catalog].overlay_index, Some(0));
+        assert_eq!(source_tree.files[untouched].overlay_index, None);
 
-        materialize_candidate_manifest(&stage, &manifest, &overlays, &config)
+        materialize_candidate_manifest(&stage, &manifest, &overlays, &cancellation, 4)
             .expect("manifest 应可物化");
         assert_eq!(
             fs::read(stage.join("snapshot/content/catalog.json")).expect("应该可读取最终覆盖"),
@@ -5794,14 +6103,14 @@ mod tests {
             )
             .expect("测试覆盖应合法"),
         ];
-        let config = file_system_config();
+        let cancellation = AtomicBool::new(true);
         let manifest =
-            build_candidate_manifest(&stage, &target, &mappings, &overlays, &[], &config)
+            build_candidate_manifest(&stage, &target, &mappings, &overlays, &[], &cancellation)
                 .expect("manifest 应冻结枚举身份");
         fs::remove_file(&observed).expect("应该可移除已枚举来源");
         fs::rename(&replacement, &observed).expect("应该可换入同大小来源");
 
-        let error = materialize_candidate_manifest(&stage, &manifest, &overlays, &config)
+        let error = materialize_candidate_manifest(&stage, &manifest, &overlays, &cancellation, 4)
             .expect_err("覆盖来源身份变化必须阻止写入");
         assert!(matches!(
             error,
@@ -5814,7 +6123,50 @@ mod tests {
     }
 
     #[test]
-    fn overlay_source_still_obeys_source_file_limits_and_hardlink_rules() {
+    fn candidate_file_copy_observes_cancellation_between_bounded_chunks() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        let stage = temporary.path().join("stage");
+        let target = temporary.path().join("target");
+        fs::create_dir(&source).expect("应该可建立来源目录");
+        fs::create_dir(&stage).expect("应该可建立候选目录");
+        let source_file = source.join("large.bin");
+        fs::write(&source_file, vec![7_u8; 3 * 64 * 1024]).expect("应该可建立多块来源文件");
+        let mappings = vec![
+            DirectorySourceMapping::new(source, PathBuf::from("content"))
+                .expect("测试来源映射应合法"),
+        ];
+        let cancellation = AtomicBool::new(true);
+        let manifest =
+            build_candidate_manifest(&stage, &target, &mappings, &[], &[], &cancellation)
+                .expect("manifest 应可建立");
+        let registered_source = pin_regular_file_for_snapshot_read(&source_file)
+            .expect("应该可固定测试来源")
+            .resolved_path()
+            .to_path_buf();
+        register_test_candidate_copy_cancellation(registered_source);
+
+        let error = materialize_candidate_manifest(&stage, &manifest, &[], &cancellation, 1)
+            .expect_err("复制必须在分块边界观察取消");
+
+        assert!(matches!(
+            error,
+            SystemFileSystemError::Cancelled {
+                operation: "复制候选文件",
+                path,
+            } if path.ends_with("content/large.bin")
+        ));
+        assert_eq!(
+            fs::metadata(stage.join("content/large.bin"))
+                .expect("取消前写入的第一块应仍位于不可见候选中")
+                .len(),
+            64 * 1024,
+            "取消后不得继续复制剩余块"
+        );
+    }
+
+    #[test]
+    fn overlay_source_has_no_att_size_cap_and_still_rejects_hardlinks() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let oversized_source = temporary.path().join("oversized-source");
         let oversized_stage = temporary.path().join("oversized-stage");
@@ -5833,23 +6185,16 @@ mod tests {
             DirectoryFileOverlay::new(PathBuf::from("content/catalog.json"), vec![1])
                 .expect("测试覆盖应合法"),
         ];
-        let config = file_system_config();
-        let error = build_candidate_manifest(
+        let cancellation = AtomicBool::new(true);
+        build_candidate_manifest(
             &oversized_stage,
             &temporary.path().join("oversized-target"),
             &oversized_mappings,
             &overlays,
             &[],
-            &config,
+            &cancellation,
         )
-        .expect_err("覆盖不能绕过来源单文件大小上限");
-        assert!(matches!(
-            error,
-            SystemFileSystemError::ResourceLimit {
-                resource: "目录候选单文件字节数",
-                ..
-            }
-        ));
+        .expect("ATT 不应按来源文件大小提前拒绝覆盖 manifest");
 
         let hardlink_source = temporary.path().join("hardlink-source");
         let hardlink_stage = temporary.path().join("hardlink-stage");
@@ -5869,7 +6214,7 @@ mod tests {
             &hardlink_mappings,
             &overlays,
             &[],
-            &config,
+            &cancellation,
         )
         .expect_err("覆盖不能绕过来源硬链接拒绝");
         assert!(matches!(
@@ -5882,7 +6227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_file_capabilities_use_real_unicode_paths_and_enforce_limits() {
+    async fn ordinary_file_capabilities_use_real_unicode_paths_without_att_size_caps() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let directory = temporary.path().join("剧情 数据");
         fs::create_dir(&directory).expect("应该可创建 Unicode 目录");
@@ -5913,13 +6258,14 @@ mod tests {
         );
 
         fs::write(&file, vec![0_u8; 1025]).expect("应该可扩大测试文件");
-        assert!(matches!(
-            root.read_file(file).await,
-            Err(ReadFileError::Io {
-                source: SystemFileSystemError::ResourceLimit { .. },
-                ..
-            })
-        ));
+        assert_eq!(
+            root.read_file(file)
+                .await
+                .expect("扩大后的文件仍应实际读取")
+                .into_bytes()
+                .len(),
+            1025
+        );
         root.shutdown().await.expect("文件系统根应该可终结");
     }
 
@@ -6040,14 +6386,21 @@ mod tests {
         fn assert_send<T: Send>(_: T) {}
         assert_send(root.read_scoped_file(&scope, scoped_path("scripts/main.lua")));
         assert_send(root.list_scoped_directory(&scope, scoped_path("scripts")));
-        root.validate_scoped_directory(&scope)
-            .await
-            .expect("编辑后候选应仍满足完整写回结构");
         drop(scope);
 
+        assert_eq!(
+            root.candidate_validation_counts(),
+            (0, 0),
+            "候选构建和受限编辑中的树遍历不得冒充最终完整校验"
+        );
         root.publish(staged)
             .await
             .expect("发布根应该重新验证并整体发布编辑后候选");
+        assert_eq!(
+            root.candidate_validation_counts(),
+            (1, 1),
+            "完整 candidate 全树校验必须且只能发生一次"
+        );
         assert!(!target.join("assets/catalog.json").exists());
         assert_eq!(
             fs::read(target.join("assets/generated/nested/result.json"))
@@ -6062,7 +6415,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_root_validation_is_generic_and_reports_all_top_level_entries() {
+    async fn complete_candidate_validation_counters_are_isolated_between_parallel_roots() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let first_source = temporary.path().join("first-source");
+        let second_source = temporary.path().join("second-source");
+        fs::create_dir(&first_source).expect("应该可创建第一来源");
+        fs::create_dir(&second_source).expect("应该可创建第二来源");
+        fs::write(first_source.join("value.txt"), b"first").expect("应该可写入第一来源");
+        fs::write(second_source.join("value.txt"), b"second").expect("应该可写入第二来源");
+
+        let first = TestDirectoryPublisher::new(file_system_config());
+        let second = TestDirectoryPublisher::new(file_system_config());
+        let first_staged = first
+            .prepare(stage_request(
+                temporary.path().join("first-output"),
+                first_source,
+                DirectoryPublishIntent::CreateNew,
+            ))
+            .await
+            .expect("第一候选应该可准备");
+        let second_staged = second
+            .prepare(stage_request(
+                temporary.path().join("second-output"),
+                second_source,
+                DirectoryPublishIntent::CreateNew,
+            ))
+            .await
+            .expect("第二候选应该可准备");
+        assert_eq!(first.candidate_validation_counts(), (0, 0));
+        assert_eq!(second.candidate_validation_counts(), (0, 0));
+
+        let (first_result, second_result) =
+            tokio::join!(first.publish(first_staged), second.publish(second_staged));
+        first_result.expect("第一候选应该可发布");
+        second_result.expect("第二候选应该可发布");
+        assert_eq!(first.candidate_validation_counts(), (1, 1));
+        assert_eq!(second.candidate_validation_counts(), (1, 1));
+
+        first.shutdown().await.expect("第一文件系统根应该可终结");
+        second.shutdown().await.expect("第二文件系统根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn scoped_root_listing_is_generic_and_reports_all_top_level_entries() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         scoped_source(&source);
@@ -6082,9 +6477,6 @@ mod tests {
             .expect("应该可绑定候选");
 
         fs::create_dir(candidate_root.join("evil")).expect("测试应可模拟可信 Lua 绕过门面写入");
-        root.validate_scoped_directory(&scope)
-            .await
-            .expect("通用文件根不应猜测调用方的顶层目录语义");
         assert_eq!(
             root.list_scoped_root(&scope)
                 .await
@@ -6099,9 +6491,6 @@ mod tests {
             ]
         );
         fs::remove_dir(candidate_root.join("evil")).expect("应该可清理测试目录");
-        root.validate_scoped_directory(&scope)
-            .await
-            .expect("清理后候选应重新合法");
 
         drop(scope);
         root.discard(staged).await.expect("应该可丢弃候选");
@@ -6249,23 +6638,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_write_rolls_back_when_the_complete_tree_exceeds_its_budget() {
+    async fn scoped_write_accepts_growth_without_an_att_tree_budget() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         fs::create_dir_all(source.join("assets")).expect("应该可建立资源来源");
         fs::create_dir_all(source.join("scripts")).expect("应该可建立脚本来源");
         fs::write(source.join("assets/a.json"), b"1234").expect("应该可写入资源来源");
         fs::write(source.join("scripts/a.lua"), b"12").expect("应该可写入脚本来源");
-        let constrained = SystemFileSystemConfig::new(
-            2,
-            8,
-            1024,
-            16,
-            TreeBudget::new(16, 8, 6, 6).expect("受限目录树预算应该合法"),
-            exclusive_file_lease_config(),
-        )
-        .expect("受限文件系统配置应该合法");
-        let root = TestDirectoryPublisher::new(constrained);
+        let root = TestDirectoryPublisher::new(file_system_config());
         let staged = root
             .prepare(scoped_stage_request(
                 temporary.path().join("output"),
@@ -6273,25 +6653,25 @@ mod tests {
                 DirectoryPublishIntent::CreateNew,
             ))
             .await
-            .expect("恰好用尽字节预算的候选应可准备");
+            .expect("候选应可准备");
         let candidate_root = staged.staging_root().to_path_buf();
         let scope = root
             .bind_scoped_directory(&staged, scoped_scope())
             .await
             .expect("应该可绑定候选");
 
-        assert!(matches!(
-            root.write_scoped_file(&scope, scoped_path("assets/overflow.json"), vec![1])
-                .await,
-            Err(ScopedDirectoryEditError::Failed { source, .. })
-                if matches!(*source, SystemFileSystemError::ResourceLimit {
-                    resource: "目录树总字节数",
-                    ..
-                })
-        ));
-        assert!(
-            !candidate_root.join("assets/overflow.json").exists(),
-            "超出预算的新文件必须回滚"
+        root.write_scoped_file(
+            &scope,
+            scoped_path("assets/additional.json"),
+            vec![1; 1024 * 1024],
+        )
+        .await
+        .expect("候选增长不应触发 ATT 人工总字节拒绝");
+        assert_eq!(
+            fs::metadata(candidate_root.join("assets/additional.json"))
+                .expect("新增文件应存在")
+                .len(),
+            1024 * 1024
         );
 
         drop(scope);
@@ -6356,7 +6736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_revalidates_files_added_after_prepare_against_candidate_budgets() {
+    async fn publish_revalidates_and_accepts_large_files_added_after_prepare() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         fs::create_dir(&source).expect("应该可创建来源目录");
@@ -6378,16 +6758,16 @@ mod tests {
         )
         .expect("非根服务应可在候选中新增文件");
 
-        assert!(matches!(
-            root.publish(staged).await,
-            Err(DirectoryPublishError::NotAttempted { source, .. })
-                if matches!(*source, SystemFileSystemError::ResourceLimit {
-                    resource: "目录候选单文件字节数",
-                    ..
-                })
-        ));
-        assert!(!target.exists());
-        assert!(!staging_root.exists());
+        root.publish(staged)
+            .await
+            .expect("完整复核不应按文件大小提前拒绝候选");
+        assert_eq!(
+            fs::metadata(target.join("oversized.db"))
+                .expect("大文件应随候选发布")
+                .len(),
+            512 * 1024 + 1
+        );
+        assert!(!staging_root.exists(), "发布后候选路径应被目录交换移走");
         root.shutdown().await.expect("文件系统根应可终结");
     }
 
@@ -6420,6 +6800,11 @@ mod tests {
                 if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
                     if reason.contains("硬链接"))
         ));
+        assert_eq!(
+            root.candidate_validation_counts(),
+            (1, 0),
+            "失败的完整候选校验只能记录开始，不能记录完成"
+        );
         assert!(!target.exists());
         assert!(!staging_root.exists());
         root.shutdown().await.expect("文件系统根应可终结");
@@ -6619,7 +7004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_lock_timeout_is_a_precise_prepare_failure() {
+    async fn target_lock_contention_waits_until_the_owner_releases() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         fs::create_dir(&source).expect("应该可创建来源目录");
@@ -6637,37 +7022,96 @@ mod tests {
             ))
             .await
             .expect("所有者应可持有目标锁");
-        let zero_timeout = DirectoryPublisherConfig::new(lock_directory, 8, Duration::ZERO)
-            .expect("零等待只表示立即尝试");
         let contender = TestDirectoryPublisher::with_publisher_config(
-            SystemFileSystemConfig::new(
-                1,
-                2,
-                1024,
-                16,
-                tree_budget(),
-                exclusive_file_lease_config(),
-            )
-            .expect("竞争根配置应合法"),
-            zero_timeout,
+            SystemFileSystemConfig::fixed(1),
+            publisher_config_for_lock_directory(lock_directory),
         );
-
-        assert!(matches!(
-            contender
-                .prepare(stage_request(
-                    target,
-                    source,
-                    DirectoryPublishIntent::CreateNew,
-                ))
-                .await,
-            Err(DirectoryPrepareError::NotPrepared { source, .. })
-                if matches!(*source, SystemFileSystemError::Windows(
-                    WindowsFsError::LockTimeout { .. }
-                ))
-        ));
+        let waiting = tokio::spawn({
+            let contender = contender.clone();
+            async move {
+                contender
+                    .prepare(stage_request(
+                        target,
+                        source,
+                        DirectoryPublishIntent::CreateNew,
+                    ))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished(), "目标锁竞争应自然等待而不是超时拒绝");
         owner.discard(staged).await.expect("应该可丢弃所有者候选");
+        let contender_stage = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("所有者释放后竞争者应继续")
+            .expect("竞争任务不应 panic")
+            .expect("竞争者应准备候选");
+        contender
+            .discard(contender_stage)
+            .await
+            .expect("应丢弃竞争者候选");
         owner.shutdown().await.expect("所有者根应可终结");
         contender.shutdown().await.expect("竞争根应可终结");
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_interrupts_a_directory_publish_lock_before_shutdown() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).expect("应该可创建来源目录");
+        let target = temporary.path().join("target");
+        let lock_directory = temporary.path().join("locks");
+        let owner = TestDirectoryPublisher::with_publisher_config(
+            file_system_config(),
+            publisher_config_for_lock_directory(lock_directory.clone()),
+        );
+        let staged = owner
+            .prepare(stage_request(
+                target.clone(),
+                source.clone(),
+                DirectoryPublishIntent::CreateNew,
+            ))
+            .await
+            .expect("所有者应可持有目标锁");
+        let contender = TestDirectoryPublisher::with_publisher_config(
+            SystemFileSystemConfig::fixed(1),
+            publisher_config_for_lock_directory(lock_directory),
+        );
+        let waiting = tokio::spawn({
+            let contender = contender.clone();
+            async move {
+                contender
+                    .prepare(stage_request(
+                        target,
+                        source,
+                        DirectoryPublishIntent::CreateNew,
+                    ))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished(), "目标锁竞争应持续等待");
+
+        contender.file_system.cancel_waits();
+        let error = match tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("取消应及时唤醒目录发布锁等待")
+            .expect("竞争任务不应 panic")
+        {
+            Ok(_) => panic!("取消等待后不得伪造候选已准备"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DirectoryPrepareError::NotPrepared { source, .. }
+                if matches!(*source, SystemFileSystemError::Windows(
+                    WindowsFsError::LockCancelled { .. }
+                ))
+        ));
+
+        owner.discard(staged).await.expect("应该可丢弃所有者候选");
+        contender.shutdown().await.expect("竞争根应可终结");
+        owner.shutdown().await.expect("所有者根应可终结");
     }
 
     #[tokio::test]

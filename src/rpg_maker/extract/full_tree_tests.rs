@@ -14,7 +14,7 @@ use super::lua::{
 };
 use super::rules::RulesExtractionService;
 use super::service::ExtractService;
-use super::store::asset_store::{RpgMakerExtractionAssetStore, RpgMakerExtractionAssetStoreConfig};
+use super::store::asset_store::RpgMakerExtractionAssetStore;
 use super::{ExtractInput, SelectedRules};
 use crate::execution::OperationCompletion;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -394,7 +394,6 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
     };
 
     let document_config = RpgMakerDocumentReadingConfig::new(non_zero(2));
-    let store_config = RpgMakerExtractionAssetStoreConfig::new(non_zero(2));
 
     let opener = ExistingProjectOpeningService::new(
         ProjectDatabaseRecordReadingService::new(
@@ -414,7 +413,7 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
             cpu.clone(),
             document_config,
         ),
-        RpgMakerExtractionAssetStore::new(sqlite_transactions.clone(), cpu.clone(), store_config),
+        RpgMakerExtractionAssetStore::new(sqlite_transactions.clone(), cpu.clone()),
         cpu.clone(),
     );
     let rules = RulesExtractionService::new(
@@ -424,7 +423,7 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
             cpu.clone(),
             document_config,
         ),
-        RpgMakerExtractionAssetStore::new(sqlite_transactions.clone(), cpu.clone(), store_config),
+        RpgMakerExtractionAssetStore::new(sqlite_transactions.clone(), cpu.clone()),
         cpu.clone(),
     );
     let lua = LuaExtractionService::new(
@@ -432,7 +431,7 @@ async fn eight_root_fakes_drive_the_complete_non_root_extract_tree() {
             events: Arc::clone(&events),
             invocations: Arc::clone(&lua_invocations),
         },
-        RpgMakerExtractionAssetStore::new(sqlite_transactions, cpu.clone(), store_config),
+        RpgMakerExtractionAssetStore::new(sqlite_transactions, cpu.clone()),
     );
     let extract = ExtractService::new(
         opener,

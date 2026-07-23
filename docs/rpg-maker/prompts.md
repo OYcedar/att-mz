@@ -60,8 +60,8 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 
 `system.md` 始终读取。`thinking_output = false` 时不读取也不校验 `thinking.md`；开启时才
 读取同一 locale 的 `thinking.md`。所选文件必须存在、是普通文件、为 UTF-8，且去除首尾
-空白后非空。没有父语言、中文、英文、目录首项、大小写变体或旧语言对文件回退。未选择
-locale 的损坏资源，以及关闭模式下损坏的 `thinking.md`，不影响本轮运行。
+空白后非空。资源只按所选 locale 的上述精确路径读取。未选择 locale 的损坏资源，以及
+关闭模式下损坏的 `thinking.md`，不影响本轮运行。
 
 资源错误在首次 LLM 请求前失败。用户诊断只报告安全的规范 locale、组件名和路径，并给出
 不包含资源正文的统一检查方向；它不会回显 system Prompt、思考正文、模型消息或其他

@@ -3,9 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::rpg_maker::lua::json::{
-    HostValueBudget, LosslessJsonError, LosslessJsonValue, decode as decode_json,
-};
+use crate::rpg_maker::lua::json::{LosslessJsonError, LosslessJsonValue, decode as decode_json};
 use crate::rpg_maker::model::MutationClaim;
 use crate::rpg_maker::tag::simple_tag_spans;
 use crate::rpg_maker::text::{
@@ -20,40 +18,28 @@ use super::LuaSourcePath;
 pub(crate) struct OpenedRpgMakerDocument {
     source: RpgMakerSource,
     root: LosslessJsonValue,
-    budget: HostValueBudget,
 }
 
 impl OpenedRpgMakerDocument {
     pub(crate) fn open(
         source: RpgMakerSource,
         bytes: &[u8],
-        budget: HostValueBudget,
     ) -> Result<Self, RpgMakerDocumentError> {
-        if bytes.len() > budget.max_bytes().get() {
-            return Err(RpgMakerDocumentError::InputTooLarge {
-                actual: bytes.len(),
-                maximum: budget.max_bytes().get(),
-            });
-        }
         let text = std::str::from_utf8(bytes).map_err(|_| RpgMakerDocumentError::InvalidUtf8)?;
         let root = match &source {
             RpgMakerSource::Data(_) | RpgMakerSource::DataFile(_) | RpgMakerSource::Map(_) => {
-                decode_json(text, budget).map_err(RpgMakerDocumentError::InvalidJson)?
+                decode_json(text).map_err(RpgMakerDocumentError::InvalidJson)?
             }
             RpgMakerSource::PluginParameter {
                 plugin_index,
                 plugin_name,
                 parameter_name,
             } => {
-                let plugins = decode_plugins_envelope(text, budget)?;
+                let plugins = decode_plugins_envelope(text)?;
                 select_plugin_parameter(&plugins, *plugin_index, plugin_name, parameter_name)?
             }
         };
-        Ok(Self {
-            source,
-            root,
-            budget,
-        })
+        Ok(Self { source, root })
     }
 
     pub(crate) fn source(&self) -> &RpgMakerSource {
@@ -64,7 +50,7 @@ impl OpenedRpgMakerDocument {
         &self,
         steps: &[RpgMakerLocationStep],
     ) -> Result<LosslessJsonValue, RpgMakerDocumentError> {
-        resolve_value(&self.root, steps, self.budget)
+        resolve_value(&self.root, steps)
     }
 
     pub(crate) fn location(
@@ -80,11 +66,11 @@ impl OpenedRpgMakerDocument {
         steps: &[RpgMakerLocationStep],
     ) -> Result<RpgMakerTextReference, RpgMakerDocumentError> {
         let value = self.value(steps)?;
-        let LosslessJsonValue::String(original) = value else {
+        let LosslessJsonValue::String(original) = &value else {
             return Err(RpgMakerDocumentError::ExpectedString);
         };
         Ok(RpgMakerTextReference::new(
-            original,
+            original.clone(),
             RpgMakerLocation::value(self.source.clone(), steps.to_vec()),
         ))
     }
@@ -97,10 +83,10 @@ impl OpenedRpgMakerDocument {
     ) -> Result<RpgMakerTextReference, RpgMakerDocumentError> {
         validate_tag_name(tag_name)?;
         let container = self.value(container_steps)?;
-        let LosslessJsonValue::Object(fields) = container else {
+        let LosslessJsonValue::Object(fields) = &container else {
             return Err(RpgMakerDocumentError::ExpectedObject);
         };
-        let Some(LosslessJsonValue::String(note)) = object_get(&fields, "note") else {
+        let Some(LosslessJsonValue::String(note)) = object_get(fields, "note") else {
             return Err(RpgMakerDocumentError::ExpectedNoteString);
         };
         let value = find_tag(note, tag_name, occurrence)?;
@@ -129,7 +115,7 @@ impl OpenedRpgMakerDocument {
             return Err(RpgMakerDocumentError::ExpectedCommandPath);
         };
         let list = self.value(list_steps)?;
-        let LosslessJsonValue::Array(commands) = list else {
+        let LosslessJsonValue::Array(commands) = &list else {
             return Err(RpgMakerDocumentError::ExpectedCommandList);
         };
         let mut lines = Vec::new();
@@ -288,7 +274,6 @@ pub(crate) fn plugin_parameter_source(
 fn resolve_value(
     root: &LosslessJsonValue,
     steps: &[RpgMakerLocationStep],
-    budget: HostValueBudget,
 ) -> Result<LosslessJsonValue, RpgMakerDocumentError> {
     let mut current = ResolvedValue::Borrowed(root);
     for step in steps {
@@ -299,15 +284,16 @@ fn resolve_value(
             ) => ResolvedValue::Borrowed(
                 object_get(entries, key).ok_or(RpgMakerDocumentError::MissingObjectKey)?,
             ),
-            (
-                ResolvedValue::Owned(LosslessJsonValue::Object(entries)),
-                RpgMakerLocationStep::ObjectKey(key),
-            ) => ResolvedValue::Owned(
-                entries
-                    .into_iter()
-                    .find_map(|(candidate, value)| (candidate == *key).then_some(value))
-                    .ok_or(RpgMakerDocumentError::MissingObjectKey)?,
-            ),
+            (ResolvedValue::Owned(mut value), RpgMakerLocationStep::ObjectKey(key)) => {
+                if !matches!(&value, LosslessJsonValue::Object(_)) {
+                    return Err(RpgMakerDocumentError::ExpectedObject);
+                }
+                ResolvedValue::Owned(
+                    value
+                        .take_object_value(key)
+                        .ok_or(RpgMakerDocumentError::MissingObjectKey)?,
+                )
+            }
             (
                 ResolvedValue::Borrowed(LosslessJsonValue::Array(values)),
                 RpgMakerLocationStep::ArrayIndex(index),
@@ -316,27 +302,30 @@ fn resolve_value(
                     .get(*index)
                     .ok_or(RpgMakerDocumentError::MissingArrayIndex)?,
             ),
-            (
-                ResolvedValue::Owned(LosslessJsonValue::Array(values)),
-                RpgMakerLocationStep::ArrayIndex(index),
-            ) => ResolvedValue::Owned(
-                values
-                    .into_iter()
-                    .nth(*index)
-                    .ok_or(RpgMakerDocumentError::MissingArrayIndex)?,
-            ),
+            (ResolvedValue::Owned(mut value), RpgMakerLocationStep::ArrayIndex(index)) => {
+                if !matches!(&value, LosslessJsonValue::Array(_)) {
+                    return Err(RpgMakerDocumentError::ExpectedArray);
+                }
+                ResolvedValue::Owned(
+                    value
+                        .take_array_value(*index)
+                        .ok_or(RpgMakerDocumentError::MissingArrayIndex)?,
+                )
+            }
             (
                 ResolvedValue::Borrowed(LosslessJsonValue::String(source)),
                 RpgMakerLocationStep::DecodeJsonString,
             ) => ResolvedValue::Owned(
-                decode_json(source, budget).map_err(RpgMakerDocumentError::InvalidNestedJson)?,
+                decode_json(source).map_err(RpgMakerDocumentError::InvalidNestedJson)?,
             ),
-            (
-                ResolvedValue::Owned(LosslessJsonValue::String(source)),
-                RpgMakerLocationStep::DecodeJsonString,
-            ) => ResolvedValue::Owned(
-                decode_json(&source, budget).map_err(RpgMakerDocumentError::InvalidNestedJson)?,
-            ),
+            (ResolvedValue::Owned(value), RpgMakerLocationStep::DecodeJsonString) => {
+                let LosslessJsonValue::String(source) = &value else {
+                    return Err(RpgMakerDocumentError::ExpectedEncodedJsonString);
+                };
+                ResolvedValue::Owned(
+                    decode_json(source).map_err(RpgMakerDocumentError::InvalidNestedJson)?,
+                )
+            }
             (_, RpgMakerLocationStep::DecodeJsonString) => {
                 return Err(RpgMakerDocumentError::ExpectedEncodedJsonString);
             }
@@ -365,10 +354,7 @@ impl ResolvedValue<'_> {
     }
 }
 
-fn decode_plugins_envelope(
-    text: &str,
-    budget: HostValueBudget,
-) -> Result<LosslessJsonValue, RpgMakerDocumentError> {
+fn decode_plugins_envelope(text: &str) -> Result<LosslessJsonValue, RpgMakerDocumentError> {
     let Some((prefix, assignment)) = text.split_once("var $plugins") else {
         return Err(RpgMakerDocumentError::InvalidPluginsEnvelope);
     };
@@ -384,7 +370,7 @@ fn decode_plugins_envelope(
     let Some(json) = json_with_terminator.trim().strip_suffix(';') else {
         return Err(RpgMakerDocumentError::InvalidPluginsEnvelope);
     };
-    let value = decode_json(json.trim(), budget).map_err(RpgMakerDocumentError::InvalidJson)?;
+    let value = decode_json(json.trim()).map_err(RpgMakerDocumentError::InvalidJson)?;
     if !matches!(value, LosslessJsonValue::Array(_)) {
         return Err(RpgMakerDocumentError::InvalidPluginsEnvelope);
     }
@@ -465,7 +451,6 @@ pub(crate) enum RpgMakerDocumentError {
     InvalidDataFileName(DataFileNameError),
     InvalidMapId,
     InvalidPluginParameterSource,
-    InputTooLarge { actual: usize, maximum: usize },
     InvalidUtf8,
     InvalidJson(LosslessJsonError),
     InvalidNestedJson(LosslessJsonError),
@@ -505,7 +490,6 @@ impl RpgMakerDocumentError {
             | Self::PluginNameMismatch
             | Self::PluginParametersMissing
             | Self::PluginParameterMissing => "invalid_plugin_parameter_source",
-            Self::InputTooLarge { .. } => "resource_limit",
             Self::InvalidUtf8 => "invalid_utf8",
             Self::InvalidJson(_) | Self::InvalidNestedJson(_) => "invalid_json",
             Self::InvalidPluginsEnvelope => "invalid_plugins_envelope",
@@ -537,12 +521,6 @@ impl fmt::Display for RpgMakerDocumentError {
             Self::InvalidMapId => formatter.write_str("RPG Maker map ID 必须是正 u32 整数"),
             Self::InvalidPluginParameterSource => {
                 formatter.write_str("RPG Maker 插件参数来源的索引或名称无效")
-            }
-            Self::InputTooLarge { actual, maximum } => {
-                write!(
-                    formatter,
-                    "RPG Maker 文档为 {actual} 字节，超过上限 {maximum}"
-                )
             }
             Self::InvalidUtf8 => formatter.write_str("RPG Maker 文档不是有效 UTF-8"),
             Self::InvalidJson(error) => write!(formatter, "RPG Maker 文档不是有效 JSON：{error}"),
@@ -605,24 +583,13 @@ impl Error for RpgMakerDocumentError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
     use super::*;
-
-    fn budget() -> HostValueBudget {
-        HostValueBudget::new(
-            NonZeroUsize::new(4096).unwrap(),
-            NonZeroUsize::new(256).unwrap(),
-            NonZeroUsize::new(16).unwrap(),
-        )
-    }
 
     #[test]
     fn resolves_zero_based_paths_nested_json_and_text_identity() {
         let document = OpenedRpgMakerDocument::open(
             RpgMakerSource::data(StandardDataFile::Items),
             r#"[null,{"note":"<Help:说明>","nested":"[{\"name\":\"值\"}]"}]"#.as_bytes(),
-            budget(),
         )
         .unwrap();
         let steps = vec![
@@ -652,7 +619,6 @@ mod tests {
         let document = OpenedRpgMakerDocument::open(
             RpgMakerSource::map(1),
             r#"{"list":[{"code":108,"parameters":["<Quest:第一"]},{"code":408,"parameters":["行>"]},{"code":0,"parameters":[]}] }"#.as_bytes(),
-            budget(),
         )
         .unwrap();
         let reference = document
@@ -675,7 +641,6 @@ mod tests {
             source,
             r#"// generated
 var $plugins = [{"name":"Other","parameters":{}},{"name":"Quest","parameters":{"Entries":"[{\"Title\":\"任务\"}]"}}];"#.as_bytes(),
-            budget(),
         )
         .unwrap();
         let text = document
@@ -686,6 +651,22 @@ var $plugins = [{"name":"Other","parameters":{}},{"name":"Quest","parameters":{"
             ])
             .unwrap();
         assert_eq!(text.original(), "任务");
+    }
+
+    #[test]
+    fn opens_and_resolves_deep_documents() {
+        const DEPTH: usize = 10_000;
+        let mut source = "[".repeat(DEPTH);
+        source.push_str(r#"{"text":"值"}"#);
+        source.push_str(&"]".repeat(DEPTH));
+        let document = OpenedRpgMakerDocument::open(
+            RpgMakerSource::data(StandardDataFile::Items),
+            source.as_bytes(),
+        )
+        .unwrap();
+        let mut steps = vec![RpgMakerLocationStep::index(0); DEPTH];
+        steps.push(RpgMakerLocationStep::key("text"));
+        assert_eq!(document.text(&steps).unwrap().original(), "值");
     }
 
     #[test]

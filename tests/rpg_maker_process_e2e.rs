@@ -70,15 +70,89 @@ const LOG_DEGRADED_WARNING: &str = "项目日志不可用或已降级；命令�
 const SAFE_STOPPING_PROGRESS: &str = "正在安全停止；保留最后确认进度";
 
 #[test]
+fn broken_stdout_changes_successful_command_terminal_log_to_failure() {
+    let temporary = tempfile::tempdir().expect("应可建立端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    let projects_root = root.join("projects");
+    let prompt_root = root.join("prompts");
+    fs::create_dir(&projects_root).expect("项目根应可建立");
+    fs::create_dir_all(prompt_root.join("rpg_maker")).expect("RPG Maker 提示词目录应可建立");
+    write_minimal_mz_game(&game_root);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), EMPTY_PARAMETERS);
+
+    let mut command = att_command(root, mz_init_arguments(&game_root));
+    let mut child = command.spawn().expect("att.exe 应可启动");
+    drop(
+        child
+            .stdout
+            .take()
+            .expect("测试必须取得并关闭子进程 stdout 读取端"),
+    );
+    let output = wait_for_att(child);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = without_fluent_isolation(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        stderr.contains("错误 [state.finalization_failed]"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("write_stdout"), "{stderr}");
+    assert!(
+        stderr.contains("影响：状态已生效，但收尾未完成"),
+        "{stderr}"
+    );
+
+    let workspace = projects_root.join("mz").join(PROJECT);
+    assert!(
+        workspace.join("project.db").is_file(),
+        "stdout 失败不得回滚或二次执行已经完成的 Init"
+    );
+    let (_, records) = read_project_logs(&workspace.join("logs"));
+    let failure = records
+        .iter()
+        .find(|record| record["code"] == "failure.reported")
+        .expect("stdout 失败必须写入 failure.reported");
+    assert_eq!(failure["payload"]["relation"], "primary");
+    assert_eq!(
+        failure["payload"]["diagnostic"]["code"],
+        "state.finalization_failed"
+    );
+    assert_eq!(failure["payload"]["diagnostic"]["stage"], "process_output");
+    assert_eq!(
+        failure["payload"]["diagnostic"]["impact"],
+        "state_applied_finalization_failed"
+    );
+    assert_eq!(
+        failure["payload"]["diagnostic"]["subject"]["name"],
+        "write_stdout"
+    );
+
+    let run_id = &failure["run_id"];
+    let terminal = records
+        .iter()
+        .find(|record| record["run_id"] == *run_id && record["code"] == "run.finished")
+        .expect("stdout 失败必须写入同一 run 的 run.finished");
+    assert_eq!(terminal["payload"]["outcome"], "failed");
+    assert!(!records.iter().any(|record| {
+        record["run_id"] == *run_id
+            && record["code"] == "run.finished"
+            && record["payload"]["outcome"] == "succeeded"
+    }));
+}
+
+#[test]
 fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     let temporary = tempfile::tempdir().expect("应可建立端到端测试目录");
     let root = temporary.path();
     let game_root = root.join("game");
     let projects_root = root.join("projects");
-    let logs_root = root.join("logs");
+    let logs_root = projects_root.join("mz").join(PROJECT).join("logs");
     let prompt_root = root.join("prompts");
     fs::create_dir(&projects_root).expect("项目根应可建立");
-    fs::create_dir(&logs_root).expect("日志根应可建立");
     fs::create_dir(&prompt_root).expect("提示词目录应可建立");
     fs::create_dir(prompt_root.join("rpg_maker")).expect("RPG Maker 提示词目录应可建立");
     write_minimal_mz_game(&game_root);
@@ -233,7 +307,10 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
 
     let unchanged_init = run_att(root, arguments(&["mz", "init", "--name", PROJECT]));
     let unchanged_init_stdout = assert_success("repeated init", &unchanged_init);
-    assert!(unchanged_init_stdout.starts_with("初始化完成：e2e\n项目状态：无变化\n"));
+    assert!(
+        unchanged_init_stdout.starts_with("初始化完成：e2e\n项目状态：无变化\n"),
+        "重复 Init 必须保持无变化语义，实际输出：\n{unchanged_init_stdout}"
+    );
     assert_plan_source(&unchanged_init_stdout, "项目状态");
     assert!(
         output_root.join("js/lua-probe.txt").is_file(),
@@ -341,10 +418,26 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert!(stale_requests.finish().is_empty());
     assert_eq!(stale_translate.status.code(), Some(1));
     assert!(stale_translate.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&stale_translate.stderr),
-        "项目状态损坏或提取已过期。请重新运行相关 Init 或 Extract 命令。\n",
-        "来源变化后必须先刷新 active owner，并提供可操作建议"
+    let stale_stderr = without_fluent_isolation(&String::from_utf8_lossy(&stale_translate.stderr));
+    assert!(
+        stale_stderr.contains("错误 [project.state]"),
+        "{stale_stderr}"
+    );
+    assert!(stale_stderr.contains("阶段：翻译"), "{stale_stderr}");
+    let visible_stale_stderr = stale_stderr.replace(r"\\?\", "");
+    let expected_database_path = database.to_string_lossy().replace('/', r"\");
+    assert!(
+        visible_stale_stderr.contains(&format!("位置：{expected_database_path}")),
+        "{stale_stderr}"
+    );
+    assert!(
+        stale_stderr.contains("原因：已保存的项目状态不满足本次操作"),
+        "{stale_stderr}"
+    );
+    assert!(stale_stderr.contains("影响：状态未改变"), "{stale_stderr}");
+    assert!(
+        stale_stderr.contains("处理办法：检查并修正项目状态后重试"),
+        "{stale_stderr}"
     );
 
     let refreshed_extract = run_att(
@@ -553,11 +646,16 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert_eq!(failed.status.code(), Some(1));
     assert!(failed.stdout.is_empty(), "命令失败不得打印成功文案");
     let failed_stderr = without_fluent_isolation(&String::from_utf8_lossy(&failed.stderr));
-    assert!(failed_stderr.starts_with("无法使用"));
-    assert!(failed_stderr.contains("zh-Hans"));
+    assert!(failed_stderr.contains("错误 [prompt.unavailable]"));
+    assert!(failed_stderr.contains("阶段：命令准备"));
     assert!(failed_stderr.contains("system.md"));
-    assert!(failed_stderr.contains("翻译尚未开始"));
-    assert!(failed_stderr.contains("非空 UTF-8") && failed_stderr.contains("模板有效"));
+    assert!(
+        failed_stderr.contains("原因：所需对象不存在"),
+        "{failed_stderr}"
+    );
+    assert!(failed_stderr.contains("影响：状态未改变"));
+    assert!(failed_stderr.contains("处理办法：修正指出的配置字段后重试"));
+    assert!(failed_stderr.contains("locale=zh-Hans; component=system.md"));
     assert_process_output_does_not_contain_client_secrets("missing prompt", &failed);
     for (phase, output) in [
         ("init", &init),
@@ -597,7 +695,6 @@ fn project_log_startup_failure_never_changes_success_or_cancellation_outcome() {
     let game_root = root.join("game");
     fs::create_dir(root.join("projects")).expect("项目根应可建立");
     fs::create_dir_all(root.join("prompts/rpg_maker")).expect("提示词根应可建立");
-    fs::write(root.join("logs"), b"not-a-directory").expect("普通文件应可稳定触发项目日志启动降级");
     write_minimal_mz_game(&game_root);
 
     let cancellation_server = BoundCancellationChatServer::bind();
@@ -612,10 +709,15 @@ fn project_log_startup_failure_never_changes_success_or_cancellation_outcome() {
     assert_eq!(init.status.code(), Some(0), "Init 不得被日志故障阻断");
     assert!(
         init_stdout.starts_with("初始化完成：e2e\n项目状态：已创建\n"),
-        "日志降级时业务结果不得改变：{init_stdout}"
+        "初始化结果应成立：{init_stdout}"
     );
     assert_plan_source(&init_stdout, "显式输入");
-    assert_only_log_degraded_warning(&init.stderr);
+    assert!(init.stderr.is_empty(), "首次 Init 的项目日志应正常建立");
+
+    let workspace = root.join("projects/mz").join(PROJECT);
+    let log_root = workspace.join("logs");
+    fs::remove_dir_all(&log_root).expect("应删除 Init 日志目录以注入后续日志故障");
+    fs::write(&log_root, b"not-a-directory").expect("普通文件应可稳定触发项目日志启动降级");
 
     let extract = run_att(
         root,
@@ -630,9 +732,9 @@ fn project_log_startup_failure_never_changes_success_or_cancellation_outcome() {
     assert_eq!(extract.status.code(), Some(0), "Extract 不得被日志故障阻断");
     assert!(extract_stdout.starts_with("提取完成：e2e\n"));
     assert_plan_source(&extract_stdout, "显式输入");
-    assert_only_log_degraded_warning(&extract.stderr);
+    assert_log_degraded_diagnostic(&extract.stderr, &log_root);
 
-    let database = root.join("projects/mz").join(PROJECT).join("project.db");
+    let database = workspace.join("project.db");
     assert_extracted_database(&database);
     write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
     let mut running_server = cancellation_server.start();
@@ -652,7 +754,7 @@ fn project_log_startup_failure_never_changes_success_or_cancellation_outcome() {
     assert_eq!(cancelled.status.code(), Some(130));
     assert!(cancelled.stdout.is_empty());
     let cancelled_stderr = std::str::from_utf8(&cancelled.stderr).expect("取消诊断必须是 UTF-8");
-    assert_eq!(cancelled_stderr.matches(LOG_DEGRADED_WARNING).count(), 1);
+    assert_log_degraded_diagnostic(&cancelled.stderr, &log_root);
     assert_eq!(cancelled_stderr.matches(SAFE_STOPPING_PROGRESS).count(), 1);
     assert!(
         cancelled_stderr.ends_with("命令已在安全收尾后取消。\n"),
@@ -669,7 +771,6 @@ fn omitted_translate_profile_rejects_saved_profile_removed_from_configuration() 
     let root = temporary.path();
     let game_root = root.join("game");
     fs::create_dir(root.join("projects")).expect("项目根应可建立");
-    fs::create_dir(root.join("logs")).expect("日志根应可建立");
     fs::create_dir_all(root.join("prompts/rpg_maker")).expect("提示词根应可建立");
     write_minimal_mz_game(&game_root);
     write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
@@ -710,14 +811,17 @@ fn omitted_translate_profile_rejects_saved_profile_removed_from_configuration() 
 
     assert_eq!(omitted.status.code(), Some(1));
     assert!(omitted.stdout.is_empty());
-    let stderr = String::from_utf8(omitted.stderr).expect("Profile 错误必须是 UTF-8");
-    let visible_stderr: String = stderr
-        .chars()
-        .filter(|character| !matches!(character, '\u{2068}' | '\u{2069}'))
-        .collect();
-    assert_eq!(
-        visible_stderr,
-        "当前配置中不存在已保存的 Profile local。请显式传入有效 Profile。\n"
+    let stderr = without_fluent_isolation(
+        &String::from_utf8(omitted.stderr).expect("Profile 错误必须是 UTF-8"),
+    );
+    assert!(stderr.contains("错误 [command.run_plan]"), "{stderr}");
+    assert!(stderr.contains("阶段：命令准备"), "{stderr}");
+    assert!(stderr.contains("位置：配置档 local"), "{stderr}");
+    assert!(stderr.contains("原因：所需对象不存在"), "{stderr}");
+    assert!(stderr.contains("影响：状态未改变"), "{stderr}");
+    assert!(
+        stderr.contains("处理办法：修正指出的输入后重试"),
+        "{stderr}"
     );
     assert_translate_run_plan(&database, PROFILE, false);
 }
@@ -728,7 +832,6 @@ fn mz_map_mixes_five_semantic_unit_types_in_one_translation_task() {
     let root = temporary.path();
     let game_root = root.join("game");
     fs::create_dir(root.join("projects")).expect("项目根应可建立");
-    fs::create_dir(root.join("logs")).expect("日志根应可建立");
     fs::create_dir_all(root.join("prompts/rpg_maker")).expect("提示词根应可建立");
     write_mixed_semantic_mz_game(&game_root);
 
@@ -781,7 +884,7 @@ fn mz_map_mixes_five_semantic_unit_types_in_one_translation_task() {
     );
     let output_root = workspace.join("write_back");
     assert_mixed_semantic_game_written(&output_root);
-    assert_mixed_semantic_project_log(&root.join("logs/att.log.jsonl"));
+    assert_mixed_semantic_project_log(&workspace.join("logs"));
 }
 
 #[test]
@@ -791,10 +894,8 @@ fn mv_four_stages_preserve_www_layout_and_coexist_with_same_named_mz_project() {
     let mz_game_root = root.join("mz-game");
     let mv_game_root = root.join("mv-game");
     let projects_root = root.join("projects");
-    let logs_root = root.join("logs");
     let prompt_root = root.join("prompts/rpg_maker");
     fs::create_dir(&projects_root).expect("项目根应可建立");
-    fs::create_dir(&logs_root).expect("日志根应可建立");
     fs::create_dir_all(&prompt_root).expect("RPG Maker 提示词根应可建立");
     write_minimal_mz_game(&mz_game_root);
     write_minimal_mv_game(&mv_game_root);
@@ -869,7 +970,9 @@ fn mv_four_stages_preserve_www_layout_and_coexist_with_same_named_mz_project() {
         "MV 写回不得把 www 内容提升到输出根"
     );
 
-    let (_, records) = read_json_lines(&logs_root.join("att.log.jsonl"));
+    let (_, mut records) = read_project_logs(&mz_workspace.join("logs"));
+    let (_, mv_records) = read_project_logs(&mv_workspace.join("logs"));
+    records.extend(mv_records);
     assert!(records.iter().any(|record| {
         record["engine"] == "mz"
             && record["project"] == SHARED_PROJECT
@@ -937,14 +1040,23 @@ api_key = "{LEAK_SENTINEL}" "invalid"
         "配置语法错误必须包含配置路径：{stderr}"
     );
     assert!(
-        stderr.contains("第 3 行第 ") && stderr.contains("列"),
+        stderr.contains("错误 [configuration.invalid_toml]"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("阶段：配置加载"), "{stderr}");
+    assert!(
+        stderr.contains("原因：TOML 第 3 行、第 ") && stderr.contains("列无效"),
         "配置语法错误必须包含 1-based 行列：{stderr}"
     );
     assert!(
         stderr.contains("llm.clients.leak-probe.api_key"),
         "配置语法错误必须标明安全字段路径：{stderr}"
     );
-    assert!(stderr.contains("包含无效 TOML"), "{stderr}");
+    assert!(stderr.contains("影响：状态未改变"), "{stderr}");
+    assert!(
+        stderr.contains("处理办法：修正指出的配置字段后重试"),
+        "{stderr}"
+    );
     assert!(
         !stderr.contains(LEAK_SENTINEL),
         "配置语法错误不得回显 API key：{stderr}"
@@ -988,7 +1100,6 @@ fn prompt_locale_routing_renders_language_pairs_and_fails_before_llm_without_fal
     let root = temporary.path();
     let prompt_rpg_maker = root.join("prompts/rpg_maker");
     fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
-    fs::create_dir_all(root.join("logs")).expect("日志根应可建立");
     fs::create_dir_all(&prompt_rpg_maker).expect("RPG Maker Prompt 根应可建立");
 
     let ja_game = root.join("game-ja");
@@ -1038,7 +1149,14 @@ fn prompt_locale_routing_renders_language_pairs_and_fails_before_llm_without_fal
         "en",
         "UNSELECTED EN {{source_language}} {{target_language}}",
     );
-    assert_prompt_failure_before_llm(root, JA_PROJECT, "fr", false, "system.md");
+    assert_prompt_failure_before_llm(
+        root,
+        JA_PROJECT,
+        "fr",
+        false,
+        "system.md",
+        &["所需对象不存在"],
+    );
 
     write_system_prompt(root, "fr", FR_TEMPLATE);
     let fr_server = BoundChatServer::bind();
@@ -1103,24 +1221,62 @@ fn prompt_locale_routing_renders_language_pairs_and_fails_before_llm_without_fal
     );
     assert_success("canonical en-US project extract", &canonical_extract);
     let ko_system = prompt_rpg_maker.join("ko/system.md");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
+    assert_prompt_failure_before_llm(
+        root,
+        CANONICAL_EN_US_PROJECT,
+        "ko",
+        false,
+        "system.md",
+        &["所需对象不存在"],
+    );
 
     fs::create_dir_all(&ko_system).expect("system.md 同名目录探针应可建立");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
+    assert_prompt_failure_before_llm(
+        root,
+        CANONICAL_EN_US_PROJECT,
+        "ko",
+        false,
+        "system.md",
+        &["expected=file", "actual=not_file"],
+    );
     fs::remove_dir(&ko_system).expect("system.md 同名目录探针应可删除");
 
     fs::write(&ko_system, [0xff, 0xfe]).expect("非法 UTF-8 system Prompt 应可写入");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
+    assert_prompt_failure_before_llm(
+        root,
+        CANONICAL_EN_US_PROJECT,
+        "ko",
+        false,
+        "system.md",
+        &["第 0 字节后的 UTF-8 无效", "错误长度为 1 字节"],
+    );
 
     fs::write(&ko_system, " \r\n\t").expect("空白 system Prompt 应可写入");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
+    assert_prompt_failure_before_llm(
+        root,
+        CANONICAL_EN_US_PROJECT,
+        "ko",
+        false,
+        "system.md",
+        &["resource=prompt", "content=blank"],
+    );
 
     fs::write(
         &ko_system,
         format!("{INVALID_PROMPT_BODY_SENTINEL} {{{{source_language}}}}"),
     )
     .expect("无效模板 Prompt 应可写入");
-    assert_prompt_failure_before_llm(root, CANONICAL_EN_US_PROJECT, "ko", false, "system.md");
+    assert_prompt_failure_before_llm(
+        root,
+        CANONICAL_EN_US_PROJECT,
+        "ko",
+        false,
+        "system.md",
+        &[
+            "template_error=missing_variable",
+            "variable=target_language",
+        ],
+    );
 
     fs::write(prompt_rpg_maker.join("fr/system.md"), [0xff, 0xfe])
         .expect("未选 locale 的损坏 system Prompt 应可写入");
@@ -1153,6 +1309,7 @@ fn prompt_locale_routing_renders_language_pairs_and_fails_before_llm_without_fal
         "zh-Hans",
         true,
         "thinking.md",
+        &["第 0 字节后的 UTF-8 无效", "错误长度为 1 字节"],
     );
 }
 
@@ -1165,7 +1322,6 @@ fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
     let root = temporary.path();
     let game_root = root.join("game");
     fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
-    fs::create_dir_all(root.join("logs")).expect("日志根应可建立");
     write_minimal_mz_game(&game_root);
     initialize_and_extract_prompt_project(root, SUCCESS_PROJECT, &game_root, "ja", "zh-Hans");
     initialize_and_extract_prompt_project(root, RAW_JSON_PROJECT, &game_root, "ja", "zh-Hans");
@@ -1220,8 +1376,8 @@ fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
         .join("project.db");
     assert_translation_committed(&success_database);
     assert_output_does_not_contain("thinking success", &success, THINKING_SENTINEL);
-    assert_file_does_not_contain(
-        &root.join("logs/att.log.jsonl"),
+    assert_project_logs_do_not_contain(
+        &root.join("projects/mz").join(SUCCESS_PROJECT).join("logs"),
         THINKING_SENTINEL,
         "项目日志",
     );
@@ -1260,8 +1416,8 @@ fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
         .join("project.db");
     assert_translation_absent(&raw_json_database);
     assert_output_does_not_contain("thinking raw JSON", &raw_json, THINKING_SENTINEL);
-    assert_file_does_not_contain(
-        &root.join("logs/att.log.jsonl"),
+    assert_project_logs_do_not_contain(
+        &root.join("projects/mz").join(RAW_JSON_PROJECT).join("logs"),
         THINKING_SENTINEL,
         "项目日志",
     );
@@ -1338,6 +1494,7 @@ fn assert_prompt_failure_before_llm(
     locale: &str,
     thinking_output: bool,
     component: &str,
+    expected_reason_fragments: &[&str],
 ) {
     let server = BoundChatServer::bind();
     write_configuration_with_prompt_options(
@@ -1358,9 +1515,8 @@ fn assert_prompt_failure_before_llm(
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = without_fluent_isolation(&String::from_utf8_lossy(&output.stderr));
-    assert!(stderr.starts_with("无法使用"), "{stderr}");
-    assert!(stderr.contains(locale), "{stderr}");
-    assert!(stderr.contains(component), "{stderr}");
+    assert!(stderr.contains("错误 [prompt.unavailable]"), "{stderr}");
+    assert!(stderr.contains("阶段：命令准备"), "{stderr}");
     assert!(
         stderr.contains(
             &prompt_locale_root(root, locale)
@@ -1370,9 +1526,20 @@ fn assert_prompt_failure_before_llm(
         ),
         "{stderr}"
     );
-    assert!(stderr.contains("翻译尚未开始"), "{stderr}");
+    assert!(stderr.contains("原因："), "{stderr}");
+    for fragment in expected_reason_fragments {
+        assert!(
+            stderr.contains(fragment),
+            "缺少原因事实 {fragment:?}：{stderr}"
+        );
+    }
+    assert!(stderr.contains("影响：状态未改变"), "{stderr}");
     assert!(
-        stderr.contains("普通文件") && stderr.contains("非空 UTF-8") && stderr.contains("模板有效"),
+        stderr.contains("处理办法：修正指出的配置字段后重试"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("locale={locale}; component={component}")),
         "{stderr}"
     );
     assert!(!stderr.contains(INVALID_PROMPT_BODY_SENTINEL), "{stderr}");
@@ -1733,10 +1900,20 @@ fn assert_success(stage: &str, output: &Output) -> String {
         .collect()
 }
 
-fn assert_only_log_degraded_warning(stderr: &[u8]) {
+fn assert_log_degraded_diagnostic(stderr: &[u8], log_root: &Path) {
     let stderr = String::from_utf8(stderr.to_vec()).expect("日志降级警告必须是 UTF-8");
-    assert_eq!(stderr.matches(LOG_DEGRADED_WARNING).count(), 1);
-    assert_eq!(stderr, format!("{LOG_DEGRADED_WARNING}\n"));
+    let visible = without_fluent_isolation(&stderr);
+    assert_eq!(visible.matches(LOG_DEGRADED_WARNING).count(), 1);
+    assert!(visible.contains("错误 [log.start]"), "{visible}");
+    assert!(visible.contains("阶段：项目日志"), "{visible}");
+    let visible_path = visible.replace(r"\\?\", "");
+    let expected_path = log_root.to_string_lossy().replace('/', r"\");
+    assert!(
+        visible_path.contains(&expected_path),
+        "日志故障必须显示安全路径：{visible}"
+    );
+    assert!(visible.contains("原因："), "{visible}");
+    assert!(visible.contains("处理办法："), "{visible}");
 }
 
 fn assert_plan_source(stdout: &str, source: &str) {
@@ -2122,106 +2299,23 @@ root = "prompts"
 locale = "{prompt_locale}"
 thinking_output = {thinking_output}
 
-[runtime.async]
-worker_threads = 2
-max_blocking_threads = 4
-blocking_thread_keep_alive_ms = 100
-
-[runtime.cpu]
-worker_threads = 2
-queue_capacity = 16
-
-[runtime.filesystem]
-worker_threads = 2
-queue_capacity = 32
-max_read_bytes = 8388608
-max_directory_entries = 1000
-
-[runtime.filesystem.tree]
-max_entries = 1000
-max_depth = 32
-max_bytes = 67108864
-max_single_file_bytes = 8388608
-
-[runtime.filesystem.project_lock]
-timeout_ms = 5000
-
-[runtime.filesystem.publisher]
-max_recovery_artifacts_per_target = 8
-target_lock_timeout_ms = 5000
-
-[runtime.sqlite]
-short_worker_threads = 2
-short_queue_capacity = 32
-max_open_connections = 8
-worker_stack_bytes = 2097152
-max_statement_bytes = 262144
-max_parameter_bytes = 1048576
-max_rows_per_query = 10000
-max_result_bytes_per_query = 8388608
-busy_timeout_ms = 5000
-journal_mode = "wal"
-synchronous = "full"
-
-[runtime.llm]
-max_active_requests = 2
-queue_capacity = 8
-admission_timeout_ms = 5000
-connect_timeout_ms = 5000
-read_timeout_ms = 10000
-pool_idle_timeout_ms = 1000
-pool_max_idle_per_host = 2
-proxy = false
-
-[runtime.llm.tls]
-additional_pem_files = []
-
 [llm.clients.primary]
 url = "{url}"
 api_key = "{API_KEY}"
 model = "e2e-model"
-timeout_ms = 10000
-rpm = 60
-burst = 4
+max_concurrent_requests = 2
+connect_timeout_ms = 5000
+read_timeout_ms = 10000
+request_timeout_ms = 10000
+proxy = false
+additional_pem_files = []
+retry_delays_ms = [10]
+max_retry_after_ms = 1000
 parameters = '''{parameters}'''
 
-[runtime.lua]
-worker_stack_bytes = 4194304
-memory_limit_bytes_per_vm = 33554432
-cancel_check_instruction_interval = 1000
-max_error_bytes = 16384
-
-[runtime.lua.host_values]
-max_bytes = 8388608
-max_nodes = 100000
-max_depth = 64
-
-[observability]
-root = "logs"
-
-[observability.log]
-level = "info"
-queue_capacity = 1024
-batch_max_records = 64
-batch_max_bytes = 1048576
-flush_interval_ms = 100
-shutdown_timeout_ms = 2000
-lock_timeout_ms = 1000
-max_record_bytes = 262144
-max_file_bytes = 67108864
-retained_rotated_files = 4
-
-[rpg_maker.document]
-read_concurrency = 2
-
-[rpg_maker.standard_asset]
-units_per_decode_job = 32
-
-[rpg_maker.extract.store]
-groups_per_encode_job = 32
-
-[rpg_maker.translate.store]
-units_per_encode_job = 32
+[llm.clients.primary.rate_limit]
+requests_per_minute = 60000
+burst = 4
 
 [[languages]]
 type = "japanese"
@@ -2253,26 +2347,12 @@ allowed_terms = []
 [[rpg_maker.translation_profiles]]
 id = "local"
 llm_client = "primary"
-max_in_flight_tasks = 1
-
-[rpg_maker.translation_profiles.planning]
-max_message_characters = 10000
-
-[rpg_maker.translation_profiles.execution]
-network_retry_delays_ms = [10]
-max_network_retry_after_ms = 1000
+max_task_message_characters = 10000
 
 [[rpg_maker.translation_profiles]]
 id = "unselected"
 llm_client = "primary"
-max_in_flight_tasks = 1
-
-[rpg_maker.translation_profiles.planning]
-max_message_characters = 10000
-
-[rpg_maker.translation_profiles.execution]
-network_retry_delays_ms = []
-max_network_retry_after_ms = 1000
+max_task_message_characters = 10000
 "#
     );
     fs::write(root.join("config.toml"), configuration).expect("完整配置应可写入");
@@ -2390,9 +2470,15 @@ fn assert_missing_extract_plan(root: &Path, stage: &str) {
         "{stage} 后省略 owner 必须失败"
     );
     assert!(output.stdout.is_empty());
+    let stderr = without_fluent_isolation(&String::from_utf8_lossy(&output.stderr));
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "该项目尚未保存过 Extract 方案。请至少提供 --builtin、--rules 或 --lua 之一。\n"
+        stderr,
+        "错误 [command.run_plan]\n\
+         阶段：命令准备\n\
+         位置：extract_selection\n\
+         原因：项目没有可复用的 Extract 方案；必须提供 --builtin、--rules 或 --lua 中的至少一项\n\
+         影响：状态未改变\n\
+         处理办法：修正指出的输入后重试\n"
     );
 }
 
@@ -2436,7 +2522,7 @@ fn assert_extracted_database(database: &Path) {
     assert_eq!(row.1, "database_entry");
     assert_eq!(
         serde_json::from_str::<Value>(&row.2).expect("逻辑角色应为规范 JSON"),
-        json!({ "kind": "scalar", "key": "description" })
+        json!({ "f": "description" })
     );
     assert_eq!(
         serde_json::from_str::<Value>(&row.3).expect("源内容应为规范 JSON"),
@@ -2485,30 +2571,18 @@ fn assert_mixed_semantic_units_extracted(database: &Path) {
         .collect::<Vec<_>>();
     for expected in [
         (
-            json!({ "kind": "scalar", "key": "displayName" }),
+            json!({ "f": "displayName" }),
             json!(MIXED_MAP_NAME),
             json!({}),
         ),
+        (json!("p"), json!(MIXED_SPEAKER), json!({})),
         (
-            json!({ "kind": "dialogue_speaker" }),
-            json!(MIXED_SPEAKER),
-            json!({}),
-        ),
-        (
-            json!({ "kind": "dialogue_body" }),
+            json!("b"),
             json!(MIXED_DIALOGUE_SOURCE),
             json!({ "source_speaker": MIXED_SPEAKER }),
         ),
-        (
-            json!({ "kind": "choices" }),
-            json!(MIXED_CHOICES_SOURCE),
-            json!({}),
-        ),
-        (
-            json!({ "kind": "scrolling_text" }),
-            json!(MIXED_SCROLLING_SOURCE),
-            json!({}),
-        ),
+        (json!("c"), json!(MIXED_CHOICES_SOURCE), json!({})),
+        (json!("r"), json!(MIXED_SCROLLING_SOURCE), json!({})),
     ] {
         assert!(decoded.contains(&expected), "缺少语义单元：{expected:?}");
     }
@@ -2539,25 +2613,13 @@ fn assert_mixed_semantic_translations(database: &Path) {
     assert_eq!(translations.len(), 5);
     for expected in [
         (
-            json!({ "kind": "scalar", "key": "displayName" }),
+            json!({ "f": "displayName" }),
             json!(MIXED_MAP_NAME_TRANSLATION),
         ),
-        (
-            json!({ "kind": "dialogue_body" }),
-            json!(MIXED_DIALOGUE_TRANSLATION),
-        ),
-        (
-            json!({ "kind": "dialogue_speaker" }),
-            json!(MIXED_SPEAKER_TRANSLATION),
-        ),
-        (
-            json!({ "kind": "choices" }),
-            json!(MIXED_CHOICES_TRANSLATION),
-        ),
-        (
-            json!({ "kind": "scrolling_text" }),
-            json!(MIXED_SCROLLING_TRANSLATION),
-        ),
+        (json!("b"), json!(MIXED_DIALOGUE_TRANSLATION)),
+        (json!("p"), json!(MIXED_SPEAKER_TRANSLATION)),
+        (json!("c"), json!(MIXED_CHOICES_TRANSLATION)),
+        (json!("r"), json!(MIXED_SCROLLING_TRANSLATION)),
     ] {
         assert!(
             translations.contains(&expected),
@@ -2599,12 +2661,8 @@ fn assert_mv_dialogue_extracted(database: &Path) {
             )
         })
         .collect::<Vec<_>>();
-    assert!(logical.contains(&(
-        json!({ "kind": "dialogue_speaker" }),
-        json!(MV_SPEAKER),
-        None,
-    )));
-    assert!(logical.contains(&(json!({ "kind": "dialogue_body" }), json!([MV_BODY]), None,)));
+    assert!(logical.contains(&(json!("p"), json!(MV_SPEAKER), None,)));
+    assert!(logical.contains(&(json!("b"), json!([MV_BODY]), None,)));
 
     let (groups, claims): (i64, i64) = connection
         .query_row(
@@ -2729,14 +2787,30 @@ fn assert_mixed_semantic_game_written(output_root: &Path) {
     );
 }
 
-fn assert_mixed_semantic_project_log(log_path: &Path) {
-    let (_, records) = read_json_lines(log_path);
+fn assert_mixed_semantic_project_log(log_root: &Path) {
+    let (_, records) = read_project_logs(log_root);
+    let task_records = records
+        .iter()
+        .filter(|record| {
+            record["project"] == MIXED_PROJECT
+                && matches!(
+                    record["code"].as_str(),
+                    Some("task.started" | "task.finished")
+                )
+        })
+        .collect::<Vec<_>>();
     assert!(
-        records.iter().all(|record| {
-            record["project"] != MIXED_PROJECT
-                || (record["code"] != "task.started" && record["code"] != "task.finished")
-        }),
-        "Info 项目日志不应记录逐任务 Debug 事件"
+        task_records.iter().all(|record| record["level"] == "debug"),
+        "逐任务事实应以紧凑 Debug 事件完整持久化"
+    );
+    assert!(
+        task_records
+            .iter()
+            .any(|record| record["code"] == "task.started")
+            && task_records
+                .iter()
+                .any(|record| record["code"] == "task.finished"),
+        "逐任务开始和终态都不得被固定级别过滤"
     );
     let write_back = records
         .iter()
@@ -2850,10 +2924,7 @@ fn assert_rules_unit(database: &Path, field_name: &str, source_text: &str) {
         .expect("Rules 当前唯一语义单元应可读取");
     assert_eq!(
         serde_json::from_str::<Value>(&row.0).expect("Rules 逻辑角色应为规范 JSON"),
-        json!({
-            "kind": "scalar",
-            "key": format!(r#"["{field_name}"].text[0]"#)
-        })
+        json!({ "f": format!(r#"["{field_name}"].text[0]"#) })
     );
     assert_eq!(
         serde_json::from_str::<Value>(&row.1).expect("Rules 源内容应为规范 JSON"),
@@ -3053,7 +3124,7 @@ fn assert_updated_written_game(workspace: &Path, output_root: &Path) {
 }
 
 fn assert_project_log(log_root: &Path) {
-    let (raw, records) = read_json_lines(&log_root.join("att.log.jsonl"));
+    let (raw, records) = read_project_logs(log_root);
     assert!(
         records.len() >= 20,
         "跨进程主流程应形成普通项目日志生命周期记录"
@@ -3104,10 +3175,13 @@ fn assert_project_log(log_root: &Path) {
     }
 
     assert!(
-        records.iter().all(|record| {
-            record["code"] != "task.started" && record["code"] != "task.finished"
-        }),
-        "Info 默认级别不应落盘逐任务 Debug 事件"
+        records
+            .iter()
+            .any(|record| record["code"] == "task.started")
+            && records
+                .iter()
+                .any(|record| record["code"] == "task.finished"),
+        "固定项目日志不得过滤逐任务 Debug 事实"
     );
     let translate_plan = records
         .iter()
@@ -3168,6 +3242,8 @@ fn assert_typed_project_log_payload(record: &Value) {
     let kind = payload["kind"].as_str().expect("payload.kind 应为字符串");
     let expected_kind = match code {
         "run.started" | "run.finished" => "run",
+        "performance.counters" => "performance",
+        "failure.reported" => "failure",
         "run.cancel_requested" | "run.safe_stop_finished" => "cancellation",
         "run_plan.resolved" => "run_plan",
         "run_plan.saved"
@@ -3204,6 +3280,8 @@ fn assert_typed_project_log_payload(record: &Value) {
         "publication" => &["kind", "outcome", "published_items"],
         "task" => &["kind", "ordinal", "total", "outcome", "attempts"],
         "cancellation" => &["kind", "confirmed", "total"],
+        "failure" => &["kind", "relation", "diagnostic"],
+        "performance" => &["kind", "snapshot"],
         _ => unreachable!("上方已确认 payload kind"),
     };
     let actual_keys = payload.keys().map(String::as_str).collect::<BTreeSet<_>>();
@@ -3212,6 +3290,80 @@ fn assert_typed_project_log_payload(record: &Value) {
         expected_keys.iter().copied().collect::<BTreeSet<_>>(),
         "typed payload 不得退化为任意 wire"
     );
+
+    if kind == "performance" {
+        assert_performance_snapshot(&payload["snapshot"]);
+    }
+}
+
+fn assert_performance_snapshot(snapshot: &Value) {
+    let snapshot = snapshot
+        .as_object()
+        .expect("performance snapshot 应为类型化 JSON object");
+    assert_eq!(
+        snapshot.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        ["sqlite_transactions", "candidate_validations"]
+            .into_iter()
+            .collect(),
+        "performance snapshot 不得增加任意字段"
+    );
+
+    let sqlite = snapshot["sqlite_transactions"]
+        .as_object()
+        .expect("SQLite 事务计数应为类型化 JSON object");
+    assert_eq!(
+        sqlite.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        [
+            "read_snapshot",
+            "write_plan",
+            "database_initialization",
+            "interactive",
+        ]
+        .into_iter()
+        .collect(),
+        "SQLite 计数必须覆盖全部闭集职责范围"
+    );
+    for scope_name in [
+        "read_snapshot",
+        "write_plan",
+        "database_initialization",
+        "interactive",
+    ] {
+        let scope = sqlite[scope_name]
+            .as_object()
+            .unwrap_or_else(|| panic!("SQLite 计数范围 {scope_name} 应为 object"));
+        assert_eq!(
+            scope.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            ["begin", "commit", "rollback"].into_iter().collect(),
+            "SQLite 计数范围 {scope_name} 必须保留三类控制语句"
+        );
+        for control_name in ["begin", "commit", "rollback"] {
+            let control = scope[control_name]
+                .as_object()
+                .unwrap_or_else(|| panic!("SQLite {scope_name}.{control_name} 计数应为 object"));
+            assert_eq!(
+                control.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                ["attempted", "succeeded"].into_iter().collect(),
+                "SQLite {scope_name}.{control_name} 必须保留尝试与成功计数"
+            );
+            assert!(control["attempted"].is_u64());
+            assert!(control["succeeded"].is_u64());
+        }
+    }
+
+    let candidate = snapshot["candidate_validations"]
+        .as_object()
+        .expect("candidate 校验计数应为类型化 JSON object");
+    assert_eq!(
+        candidate
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        ["started", "completed"].into_iter().collect(),
+        "candidate 校验必须保留开始与完成计数"
+    );
+    assert!(candidate["started"].is_u64());
+    assert!(candidate["completed"].is_u64());
 }
 
 fn read_json_lines(path: &Path) -> (String, Vec<Value>) {
@@ -3226,33 +3378,74 @@ fn read_json_lines(path: &Path) -> (String, Vec<Value>) {
     (raw, lines)
 }
 
+fn read_project_logs(log_root: &Path) -> (String, Vec<Value>) {
+    let mut paths = fs::read_dir(log_root)
+        .unwrap_or_else(|error| panic!("应可列举项目日志目录 {}：{error}", log_root.display()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("项目日志目录条目应可读取")
+        .into_iter()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert!(!paths.is_empty(), "每次命令都应建立独立 RunId 日志文件");
+
+    let mut raw = String::new();
+    let mut records = Vec::new();
+    for path in paths {
+        assert_eq!(
+            path.extension(),
+            Some(OsStr::new("jsonl")),
+            "项目日志目录只能包含 RunId JSONL：{}",
+            path.display()
+        );
+        let run_id = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .expect("日志文件名必须是 UTF-8 RunId");
+        assert_uuid_v4(run_id);
+        let (file_raw, file_records) = read_json_lines(&path);
+        assert!(
+            file_records.iter().all(|record| record["run_id"] == run_id),
+            "文件名 RunId 必须与每条记录一致：{}",
+            path.display()
+        );
+        raw.push_str(&file_raw);
+        records.extend(file_records);
+    }
+    (raw, records)
+}
+
+fn assert_project_logs_do_not_contain(log_root: &Path, needle: &str, label: &str) {
+    let (raw, _) = read_project_logs(log_root);
+    assert!(!raw.contains(needle), "{label}不得包含 {needle:?}");
+}
+
 fn assert_last_write_back_log(log_root: &Path, lua_executed: bool) {
-    let (_, records) = read_json_lines(&log_root.join("att.log.jsonl"));
-    let publication = records
+    let (_, records) = read_project_logs(log_root);
+    let plan = records
         .iter()
-        .rev()
         .find(|record| {
             record["command"] == "write-back"
+                && record["code"] == "run_plan.resolved"
+                && record["payload"]["kind"] == "run_plan"
+                && record["payload"]["lua_enabled"] == lua_executed
+        })
+        .expect("WriteBack 发布运行应记录准确的 Lua 方案来源");
+    let run_id = &plan["run_id"];
+    let publication = records
+        .iter()
+        .find(|record| {
+            record["run_id"] == *run_id
                 && record["code"] == "publication.finished"
                 && record["payload"]["kind"] == "publication"
                 && record["payload"]["outcome"] == "published"
         })
-        .expect("至少应有一条已确认发布的 WriteBack 项目日志");
+        .expect("同一 WriteBack RunId 应记录已确认发布终态");
     assert_eq!(publication["payload"]["published_items"], 1);
-    let run_id = &publication["run_id"];
-    let plan = records
-        .iter()
-        .find(|record| {
-            record["run_id"] == *run_id
-                && record["code"] == "run_plan.resolved"
-                && record["payload"]["kind"] == "run_plan"
-        })
-        .expect("WriteBack 发布运行应记录方案来源");
-    assert_eq!(plan["payload"]["lua_enabled"], lua_executed);
 }
 
 fn assert_translate_mixed_source_log(log_root: &Path) {
-    let (_, records) = read_json_lines(&log_root.join("att.log.jsonl"));
+    let (_, records) = read_project_logs(log_root);
     assert!(
         records.iter().any(|record| {
             record["command"] == "translate"

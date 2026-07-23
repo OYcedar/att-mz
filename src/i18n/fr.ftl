@@ -50,21 +50,6 @@ cli-argument-conflict = { $argument } ne peut pas être utilisé avec les autres
 cli-wrong-number-of-values = Le nombre de valeurs fourni pour { $argument } est incorrect.
 cli-invalid-utf8 = Un argument de ligne de commande n’est pas un Unicode valide.
 cli-parse-failure = La ligne de commande n’a pas pu être analysée.
-error-configuration-or-input-generic = La configuration ou l’entrée de commande est invalide ; aucune modification n’a été effectuée. Vérifiez les options et champs indiqués, puis réessayez.
-error-config-current-directory-not-absolute = ATT ne peut pas résoudre --config, car le répertoire de travail actuel { $path } n’est pas absolu. Lancez ATT depuis un répertoire valide ou indiquez un chemin de configuration absolu.
-error-config-empty-path = --config ne peut pas être vide. Indiquez le chemin du fichier de configuration ATT.
-error-config-open = ATT ne peut pas ouvrir le fichier de configuration { $path }. Vérifiez que le fichier existe et que vous avez le droit de le lire.
-error-config-not-a-file = Le chemin de configuration { $path } n’est pas un fichier ordinaire. Indiquez un fichier de configuration, et non un répertoire ou un fichier spécial.
-error-config-too-large = Le fichier de configuration { $path } fait { $observed } octets ; la limite est de { $maximum } octets. Réduisez-le puis réessayez.
-error-config-read = ATT ne peut pas lire le fichier de configuration { $path }. Vérifiez les droits et l’état du stockage, puis réessayez.
-error-config-invalid-utf8-known-length = Le fichier de configuration { $path } n’est pas un UTF-8 valide. Le préfixe valide fait { $valid } octets et la séquence invalide { $length } octets. Enregistrez le fichier en UTF-8 puis réessayez.
-error-config-invalid-utf8-unknown-length = Le fichier de configuration { $path } n’est plus un UTF-8 valide après l’octet { $valid }. Enregistrez le fichier en UTF-8 puis réessayez.
-error-config-invalid-toml-at = Le fichier de configuration { $path }, ligne { $line }, colonne { $column }, contient du TOML invalide à { $resource }. Corrigez cette section selon le contrat actuel puis réessayez.
-error-config-invalid-toml = Le fichier de configuration { $path } contient du TOML invalide à { $resource }. Corrigez cette section selon le contrat actuel puis réessayez.
-error-config-invalid-value = La valeur du champ de configuration { $field } est invalide. Vérifiez ce champ dans la documentation actuelle puis réessayez.
-error-config-invalid-value-at-path = La valeur du champ de configuration { $field } dans { $path } est invalide. Vérifiez ce champ dans la documentation actuelle puis réessayez.
-error-config-profile-not-found = Le fichier de configuration { $path } ne contient aucun Profile de traduction nommé { $profile }. Ajoutez-le ou indiquez l’ID d’un Profile existant.
-error-config-profile-conflict = Le fichier de configuration { $path } demande le Profile { $requested }, mais la commande a déjà sélectionné { $explicit }. Utilisez le même Profile aux deux endroits ou supprimez une sélection.
 log-label-phase-check-project = vérification du projet
 log-label-phase-scan-source = analyse de la source
 log-label-phase-prepare-candidate = préparation du candidat
@@ -84,19 +69,7 @@ log-label-task-complete = complet
 log-label-task-partial = partiel
 log-label-task-unavailable = indisponible
 log-label-task-failed = échec
-error-project-unavailable = Le projet n’existe pas ou est occupé. Vérifiez son nom et réessayez après la fin de l’autre exécution.
-error-project-state = L’état du projet est endommagé ou l’extraction est périmée. Relancez la commande Init ou Extract concernée.
-error-external-model = Le service de modèle est indisponible. Vérifiez le Profile et le réseau, puis réessayez.
 error-state-applied-finalization = Le résultat a pris effet, mais la finalisation a échoué. Vérifiez l’état du projet avant de réessayer.
-error-outcome-unknown = Le résultat final ne peut pas être confirmé. Conservez l’espace de travail et consultez les informations de récupération avant de réessayer.
-error-internal = ATT a rencontré une défaillance interne. Aucun secret ni contenu du modèle n’a été affiché.
-error-shutdown = La finalisation obligatoire du runtime a échoué.
-error-no-reusable-extract-plan = Ce projet n’a aucun plan Extract enregistré. Indiquez au moins --builtin, --rules ou --lua.
-error-init-path-required = Ce projet n’a aucun chemin source Init enregistré. Indiquez --path <DIR>.
-error-profile-required = Ce projet n’a aucun Profile Translate enregistré. Indiquez PROFILE_ID.
-error-saved-profile-unavailable = Le Profile enregistré { $profile } n’existe pas dans la configuration actuelle. Indiquez explicitement un Profile valide.
-error-rpg-maker-prompt-unavailable = Le composant de prompt RPG Maker { $component } pour la locale sélectionnée { $locale }, situé à { $path }, ne peut pas être utilisé ; la traduction n’a donc pas commencé. Vérifiez que le chemin désigne un fichier ordinaire contenant un texte UTF-8 non vide et que le modèle est valide.
-error-rpg-maker-language-module-unavailable = Le module de langue source requis pour { $source } → { $target } est absent ; la traduction n’a donc pas commencé. Ajoutez ce module à la configuration actuelle, puis réessayez.
 error-no-executable-extract-owner = Après l’effacement, aucun owner Extract n’est exécutable ; le plan n’a donc pas été enregistré.
 error-plan-save-failed-applied = Le résultat a pris effet, mais le nouveau plan d’exécution n’a pas été enregistré. Indiquez explicitement les options voulues la prochaine fois.
 error-plan-save-outcome-unknown = Le résultat a pris effet, mais le commit du plan ne peut pas être confirmé. Indiquez explicitement les options voulues la prochaine fois.
@@ -160,9 +133,10 @@ result-translate-plan-sources = Le plan de cette exécution réussie a été enr
 log-run-started = La commande { $command } a démarré.
 log-run-succeeded = La commande { $command } s’est terminée avec succès.
 log-run-failed = La commande { $command } a échoué.
+log-run-outcome-unknown = La commande { $command } s’est terminée avec un résultat final inconnu ; suivez les emplacements de récupération indiqués dans l’erreur.
 log-run-cancelled = La commande { $command } a été annulée.
+log-performance-counters = Compteurs de performances : { $sqlite_control_attempted_total } tentatives de contrôle de transaction SQLite ; validations complètes de l’arborescence candidate démarrées { $candidate_validation_started }, terminées { $candidate_validation_completed }.
 log-plan-resolved = Le plan de { $command } provient de { $source }.
-log-translate-plan-resolved = Plan d’exécution Translate résolu : source du Profile { $profile_source }, source Lua { $lua_source }.
 log-phase-started = Phase démarrée : { $phase }.
 log-phase-finished = Phase terminée : { $phase }.
 log-retry-summary = { $count ->
@@ -170,10 +144,51 @@ log-retry-summary = { $count ->
    *[other] { $count } nouvelles tentatives ont été effectuées.
 }
 log-no-work = Aucun travail requis : { $reason }.
+log-no-work-translation-up-to-date = les traductions correspondent déjà à la source et au profil actuels
 log-partial-result = { $count ->
     [one] 1 résultat partiel nécessite une attention.
    *[other] { $count } résultats partiels nécessitent une attention.
 }
-log-publish-finished = Publication de la sortie terminée : { $path }.
 log-translation-task-started = Tâche de traduction { $index }/{ $total } démarrée.
 log-translation-task-finished = Tâche de traduction { $index } terminée avec le résultat { $outcome }.
+log-translation-task-diagnostic = La tâche de traduction { $index } a signalé un diagnostic après { $attempts } tentatives : { $diagnostic }
+diagnostic-title = Erreur [{ $code }]
+diagnostic-stage = Étape : { $stage }
+diagnostic-subject = Emplacement : { $subject }
+diagnostic-subject-value = { $kind ->
+    [command] commande { $value }
+    [field] champ { $value }
+    [project] projet { $value }
+    [profile] profil { $value }
+    [component] composant { $value }
+   *[other] { $value }
+}
+diagnostic-reason = Cause : { $reason }
+diagnostic-impact = Impact : { $impact }
+diagnostic-action = Action : { $action }
+diagnostic-recovery = Récupération : { $recovery }
+diagnostic-recovery-value = { $kind ->
+    [component] composant { $value }
+    [transaction] transaction { $value }
+   *[other] { $value }
+}
+diagnostic-related = Erreur associée { $index } :
+diagnostic-stage-value = { $code ->
+    [process_output] Sortie du processus
+   *[other] { $fallback }
+}
+diagnostic-impact-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-action-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-failure-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-io-kind-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-configuration-rule-value = { $code ->
+   *[other] { $fallback }{ $facts }
+}

@@ -4,109 +4,48 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 
-/// CPU 工作线程数的受信选择。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CpuWorkerThreads {
-    /// 启动时读取当前进程可使用的并行度。
-    Auto,
-    /// 使用外部配置指定的固定线程数。
-    Fixed(NonZeroUsize),
-}
-
-/// CPU 工作池的受信配置。
+/// CPU 工作池的产品配置。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CpuExecutorConfig {
-    worker_threads: CpuWorkerThreads,
-    queue_capacity: usize,
+    #[cfg(test)]
+    fixed_worker_threads: Option<NonZeroUsize>,
 }
 
 impl CpuExecutorConfig {
-    /// 从已经解析的线程数选择构造配置。
-    pub(crate) fn new(
-        worker_threads: CpuWorkerThreads,
-        queue_capacity: usize,
-    ) -> Result<Self, CpuExecutorConfigError> {
-        if queue_capacity == 0 {
-            return Err(CpuExecutorConfigError::ZeroQueueCapacity);
+    /// 生产运行始终使用操作系统报告的当前可用并行度。
+    pub(crate) const fn production() -> Self {
+        Self {
+            #[cfg(test)]
+            fixed_worker_threads: None,
         }
-        if let CpuWorkerThreads::Fixed(worker_threads) = worker_threads {
-            validate_supported_worker_threads(worker_threads.get()).map_err(
-                |(requested, maximum)| CpuExecutorConfigError::TooManyWorkerThreads {
-                    requested,
-                    maximum,
-                },
-            )?;
-            admission_capacity(worker_threads.get(), queue_capacity).map_err(
-                |source| match source {
-                    AdmissionCapacityError::Overflow => {
-                        CpuExecutorConfigError::AdmissionCapacityOverflow
-                    }
-                    AdmissionCapacityError::TooLarge { requested, maximum } => {
-                        CpuExecutorConfigError::AdmissionCapacityTooLarge { requested, maximum }
-                    }
-                },
-            )?;
-        }
-        Ok(Self {
-            worker_threads,
-            queue_capacity,
-        })
     }
 
-    pub(crate) const fn worker_threads(self) -> CpuWorkerThreads {
-        self.worker_threads
-    }
-
-    pub(crate) const fn queue_capacity(self) -> usize {
-        self.queue_capacity
-    }
-}
-
-/// CPU 工作池配置错误。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CpuExecutorConfigError {
-    TooManyWorkerThreads { requested: usize, maximum: usize },
-    ZeroQueueCapacity,
-    AdmissionCapacityOverflow,
-    AdmissionCapacityTooLarge { requested: usize, maximum: usize },
-}
-
-impl fmt::Display for CpuExecutorConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooManyWorkerThreads { requested, maximum } => write!(
-                formatter,
-                "CPU 工作线程数 {requested} 超过 Rayon 支持上限 {maximum}"
-            ),
-            Self::ZeroQueueCapacity => formatter.write_str("CPU 工作队列容量必须大于零"),
-            Self::AdmissionCapacityOverflow => {
-                formatter.write_str("CPU 工作线程数与队列容量之和超出平台范围")
-            }
-            Self::AdmissionCapacityTooLarge { requested, maximum } => write!(
-                formatter,
-                "CPU 准入容量 {requested} 超过调度器支持上限 {maximum}"
-            ),
+    #[cfg(test)]
+    fn fixed(worker_threads: NonZeroUsize) -> Self {
+        Self {
+            fixed_worker_threads: Some(worker_threads),
         }
     }
 }
-
-impl Error for CpuExecutorConfigError {}
 
 /// CPU 工作池启动失败。
 #[derive(Debug)]
 pub(crate) enum CpuExecutorStartError {
     AvailableParallelism(std::io::Error),
     TooManyWorkerThreads { requested: usize, maximum: usize },
-    AdmissionCapacityOverflow,
-    AdmissionCapacityTooLarge { requested: usize, maximum: usize },
     Build(rayon::ThreadPoolBuildError),
 }
 
@@ -120,13 +59,6 @@ impl fmt::Display for CpuExecutorStartError {
                 formatter,
                 "CPU 工作线程数 {requested} 超过 Rayon 支持上限 {maximum}"
             ),
-            Self::AdmissionCapacityOverflow => {
-                formatter.write_str("CPU 工作线程数与队列容量之和超出平台范围")
-            }
-            Self::AdmissionCapacityTooLarge { requested, maximum } => write!(
-                formatter,
-                "CPU 准入容量 {requested} 超过调度器支持上限 {maximum}"
-            ),
             Self::Build(source) => write!(formatter, "无法启动 Rayon CPU 工作池：{source}"),
         }
     }
@@ -137,9 +69,7 @@ impl Error for CpuExecutorStartError {
         match self {
             Self::AvailableParallelism(source) => Some(source),
             Self::Build(source) => Some(source),
-            Self::TooManyWorkerThreads { .. }
-            | Self::AdmissionCapacityOverflow
-            | Self::AdmissionCapacityTooLarge { .. } => None,
+            Self::TooManyWorkerThreads { .. } => None,
         }
     }
 }
@@ -162,6 +92,38 @@ impl fmt::Display for CpuExecutorUnavailable {
 
 impl Error for CpuExecutorUnavailable {}
 
+impl SafeDiagnosticSource for CpuTaskExecutionError<CpuExecutorUnavailable> {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        let (failure, action) = match self {
+            Self::Cancelled => (
+                DiagnosticFailureKind::LockCancelled,
+                DiagnosticAction::Retry,
+            ),
+            Self::Unavailable(CpuExecutorUnavailable::ShuttingDown) => (
+                DiagnosticFailureKind::ExecutorClosed,
+                DiagnosticAction::Retry,
+            ),
+            Self::Unavailable(CpuExecutorUnavailable::StatePoisoned) | Self::TaskPanicked => (
+                DiagnosticFailureKind::WorkerPanicked,
+                DiagnosticAction::ReportBug,
+            ),
+        };
+        SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            stage,
+            DiagnosticSubject::component("CPU worker"),
+            DiagnosticReason::failure(failure),
+            impact,
+            action,
+        )
+    }
+}
+
 /// CPU 工作池关闭失败。
 #[derive(Debug)]
 pub(crate) enum CpuExecutorShutdownError {
@@ -179,6 +141,34 @@ impl fmt::Display for CpuExecutorShutdownError {
 }
 
 impl Error for CpuExecutorShutdownError {}
+
+impl SafeDiagnosticSource for CpuExecutorShutdownError {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        let (reason, action) = match self {
+            Self::ConcurrentShutdown => (
+                DiagnosticReason::failure(DiagnosticFailureKind::ConcurrentShutdown),
+                DiagnosticAction::Retry,
+            ),
+            Self::StatePoisoned => (
+                DiagnosticReason::failure(DiagnosticFailureKind::ExecutorStatePoisoned),
+                DiagnosticAction::ReportBug,
+            ),
+        };
+        SafeDiagnostic::new(
+            DiagnosticCode::ShutdownComponent,
+            stage,
+            DiagnosticSubject::component("CPU executor"),
+            reason,
+            impact,
+            action,
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LifecycleState {
@@ -328,11 +318,12 @@ struct TestWorkerExitGate {
 struct CpuExecutorInner {
     lifecycle: Mutex<Lifecycle>,
     admission: Arc<Semaphore>,
+    waits_cancelled: AtomicBool,
     active_tasks: Arc<ActiveTasks>,
     worker_exits: Arc<WorkerExits>,
 }
 
-/// 命令生命周期内唯一、固定线程数且有界准入的生产 CPU 执行器。
+/// 命令生命周期内唯一、按本机并行度运行并自然背压的 CPU 执行器。
 #[derive(Clone)]
 pub(crate) struct RayonCpuExecutor {
     inner: Arc<CpuExecutorInner>,
@@ -350,24 +341,23 @@ impl RayonCpuExecutor {
     where
         F: FnOnce() -> Result<NonZeroUsize, std::io::Error>,
     {
-        let worker_threads = match config.worker_threads() {
-            CpuWorkerThreads::Auto => available_parallelism()
+        #[cfg(test)]
+        let worker_threads = match config.fixed_worker_threads {
+            Some(worker_threads) => worker_threads.get(),
+            None => available_parallelism()
                 .map_err(CpuExecutorStartError::AvailableParallelism)?
                 .get(),
-            CpuWorkerThreads::Fixed(worker_threads) => worker_threads.get(),
+        };
+        #[cfg(not(test))]
+        let worker_threads = {
+            let _ = config;
+            available_parallelism()
+                .map_err(CpuExecutorStartError::AvailableParallelism)?
+                .get()
         };
         validate_supported_worker_threads(worker_threads).map_err(|(requested, maximum)| {
             CpuExecutorStartError::TooManyWorkerThreads { requested, maximum }
         })?;
-        let admission_capacity = admission_capacity(worker_threads, config.queue_capacity())
-            .map_err(|source| match source {
-                AdmissionCapacityError::Overflow => {
-                    CpuExecutorStartError::AdmissionCapacityOverflow
-                }
-                AdmissionCapacityError::TooLarge { requested, maximum } => {
-                    CpuExecutorStartError::AdmissionCapacityTooLarge { requested, maximum }
-                }
-            })?;
         let worker_exits = Arc::new(WorkerExits::new(worker_threads));
         let exit_handler_state = Arc::clone(&worker_exits);
         let pool = ThreadPoolBuilder::new()
@@ -383,7 +373,10 @@ impl RayonCpuExecutor {
                     state: LifecycleState::Running,
                     pool: Some(pool),
                 }),
-                admission: Arc::new(Semaphore::new(admission_capacity)),
+                // 许可与 Rayon worker 一一对应：饱和调用在提交前自然背压，
+                // 不再另造可配置等待队列。
+                admission: Arc::new(Semaphore::new(worker_threads)),
+                waits_cancelled: AtomicBool::new(false),
                 active_tasks: Arc::new(ActiveTasks::default()),
                 worker_exits,
             }),
@@ -432,6 +425,14 @@ impl RayonCpuExecutor {
             .state = LifecycleState::Stopped;
         Ok(())
     }
+
+    /// 取消尚未取得 CPU 执行许可的工作；已经交给 Rayon 的闭包仍安全运行到结束。
+    ///
+    /// ATT 每个进程只执行一条命令，因此收到终止信号后不需要重新开放准入。
+    pub(crate) fn cancel_waits(&self) {
+        self.inner.waits_cancelled.store(true, Ordering::Release);
+        self.inner.admission.close();
+    }
 }
 
 fn validate_supported_worker_threads(worker_threads: usize) -> Result<(), (usize, usize)> {
@@ -440,28 +441,6 @@ fn validate_supported_worker_threads(worker_threads: usize) -> Result<(), (usize
         Err((worker_threads, maximum))
     } else {
         Ok(())
-    }
-}
-
-enum AdmissionCapacityError {
-    Overflow,
-    TooLarge { requested: usize, maximum: usize },
-}
-
-fn admission_capacity(
-    worker_threads: usize,
-    queue_capacity: usize,
-) -> Result<usize, AdmissionCapacityError> {
-    let requested = worker_threads
-        .checked_add(queue_capacity)
-        .ok_or(AdmissionCapacityError::Overflow)?;
-    if requested > Semaphore::MAX_PERMITS {
-        Err(AdmissionCapacityError::TooLarge {
-            requested,
-            maximum: Semaphore::MAX_PERMITS,
-        })
-    } else {
-        Ok(requested)
     }
 }
 
@@ -495,7 +474,11 @@ impl CpuTaskExecutor for RayonCpuExecutor {
             .acquire_owned()
             .await
             .map_err(|_| {
-                CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown)
+                if self.inner.waits_cancelled.load(Ordering::Acquire) {
+                    CpuTaskExecutionError::Cancelled
+                } else {
+                    CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown)
+                }
             })?;
         let (result_sender, result_receiver) = oneshot::channel();
 
@@ -554,50 +537,15 @@ mod tests {
 
     fn assert_send<T: Send>(_: T) {}
 
-    fn fixed_config(
-        worker_threads: usize,
-        queue_capacity: usize,
-    ) -> Result<CpuExecutorConfig, CpuExecutorConfigError> {
-        CpuExecutorConfig::new(
-            CpuWorkerThreads::Fixed(NonZeroUsize::new(worker_threads).unwrap()),
-            queue_capacity,
-        )
-    }
-
-    #[test]
-    fn config_rejects_unsupported_resource_choices() {
-        assert_eq!(
-            fixed_config(1, 0),
-            Err(CpuExecutorConfigError::ZeroQueueCapacity)
-        );
-        assert_eq!(
-            CpuExecutorConfig::new(CpuWorkerThreads::Auto, 0),
-            Err(CpuExecutorConfigError::ZeroQueueCapacity)
-        );
-        let requested = rayon::max_num_threads() + 1;
-        assert_eq!(
-            fixed_config(requested, 1),
-            Err(CpuExecutorConfigError::TooManyWorkerThreads {
-                requested,
-                maximum: rayon::max_num_threads(),
-            })
-        );
-        assert_eq!(
-            fixed_config(1, usize::MAX),
-            Err(CpuExecutorConfigError::AdmissionCapacityOverflow)
-        );
-        assert_eq!(
-            fixed_config(1, Semaphore::MAX_PERMITS),
-            Err(CpuExecutorConfigError::AdmissionCapacityTooLarge {
-                requested: Semaphore::MAX_PERMITS + 1,
-                maximum: Semaphore::MAX_PERMITS,
-            })
-        );
+    fn fixed_config(worker_threads: usize) -> Result<CpuExecutorConfig, std::convert::Infallible> {
+        Ok(CpuExecutorConfig::fixed(
+            NonZeroUsize::new(worker_threads).expect("测试 worker 数必须非零"),
+        ))
     }
 
     #[test]
     fn auto_parallelism_probe_failure_is_explicit() {
-        let config = CpuExecutorConfig::new(CpuWorkerThreads::Auto, 1).unwrap();
+        let config = CpuExecutorConfig::production();
         let result = RayonCpuExecutor::start_with_available_parallelism(config, || {
             Err(std::io::Error::other("probe failed"))
         });
@@ -607,36 +555,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn auto_admission_capacity_overflow_is_explicit() {
-        let config = CpuExecutorConfig::new(CpuWorkerThreads::Auto, usize::MAX).unwrap();
-        let result =
-            RayonCpuExecutor::start_with_available_parallelism(config, || Ok(NonZeroUsize::MIN));
-        assert!(matches!(
-            result,
-            Err(CpuExecutorStartError::AdmissionCapacityOverflow)
-        ));
-    }
-
-    #[test]
-    fn auto_admission_capacity_above_semaphore_limit_is_explicit() {
-        let config =
-            CpuExecutorConfig::new(CpuWorkerThreads::Auto, Semaphore::MAX_PERMITS).unwrap();
-        let result =
-            RayonCpuExecutor::start_with_available_parallelism(config, || Ok(NonZeroUsize::MIN));
-        assert!(matches!(
-            result,
-            Err(CpuExecutorStartError::AdmissionCapacityTooLarge {
-                requested,
-                maximum,
-            }) if requested == Semaphore::MAX_PERMITS + 1 && maximum == Semaphore::MAX_PERMITS
-        ));
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn auto_parallelism_is_explicitly_applied_to_private_pool() {
         let executor = RayonCpuExecutor::start_with_available_parallelism(
-            CpuExecutorConfig::new(CpuWorkerThreads::Auto, 2).unwrap(),
+            CpuExecutorConfig::production(),
             || Ok(NonZeroUsize::new(2).unwrap()),
         )
         .unwrap();
@@ -649,7 +571,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn panic_isolated_pool_continues_and_future_is_send() {
-        let executor = RayonCpuExecutor::start(fixed_config(1, 2).unwrap()).unwrap();
+        let executor = RayonCpuExecutor::start(fixed_config(1).unwrap()).unwrap();
         assert_send(executor.execute(|| 1usize));
         assert!(matches!(
             executor.execute(|| panic!("boom")).await,
@@ -661,7 +583,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn accepted_task_finishes_after_its_waiter_is_dropped() {
-        let executor = RayonCpuExecutor::start(fixed_config(1, 1).unwrap()).unwrap();
+        let executor = RayonCpuExecutor::start(fixed_config(1).unwrap()).unwrap();
         let barrier = Arc::new(Barrier::new(2));
         let completed = Arc::new(AtomicUsize::new(0));
         let mut future = Box::pin(executor.execute({
@@ -690,7 +612,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_drains_accepted_job_and_rejects_new_admission() {
-        let executor = RayonCpuExecutor::start(fixed_config(1, 1).unwrap()).unwrap();
+        let executor = RayonCpuExecutor::start(fixed_config(1).unwrap()).unwrap();
         let gate = Arc::new(Barrier::new(2));
         let completed = Arc::new(AtomicUsize::new(0));
         let mut accepted = Box::pin(executor.execute({
@@ -725,7 +647,7 @@ mod tests {
     #[test]
     fn shutdown_waits_until_every_rayon_exit_handler_finishes() {
         let worker_threads = 2;
-        let executor = RayonCpuExecutor::start(fixed_config(worker_threads, 1).unwrap()).unwrap();
+        let executor = RayonCpuExecutor::start(fixed_config(worker_threads).unwrap()).unwrap();
         let entered = Arc::new(Barrier::new(worker_threads + 1));
         let release = Arc::new(Barrier::new(worker_threads + 1));
         executor
@@ -760,7 +682,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_count_is_the_hard_parallelism_limit() {
-        let executor = RayonCpuExecutor::start(fixed_config(2, 4).unwrap()).unwrap();
+        let executor = RayonCpuExecutor::start(fixed_config(2).unwrap()).unwrap();
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
@@ -813,7 +735,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelling_before_admission_never_executes_the_task() {
-        let executor = RayonCpuExecutor::start(fixed_config(1, 1).unwrap()).unwrap();
+        let executor = RayonCpuExecutor::start(fixed_config(1).unwrap()).unwrap();
         let first_gate = Arc::new(Barrier::new(2));
         let (first_started, first_started_receiver) = oneshot::channel();
         let mut first = Box::pin(executor.execute({
@@ -864,9 +786,51 @@ mod tests {
         executor.shutdown().unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_admission_is_released_by_cancellation_without_running_waiting_work() {
+        let executor = RayonCpuExecutor::start(fixed_config(1).unwrap()).unwrap();
+        let first_gate = Arc::new(Barrier::new(2));
+        let (first_started, first_started_receiver) = oneshot::channel();
+        let mut first = Box::pin(executor.execute({
+            let first_gate = Arc::clone(&first_gate);
+            move || {
+                let _ = first_started.send(());
+                first_gate.wait();
+            }
+        }));
+        assert!(matches!(
+            futures_util::poll!(first.as_mut()),
+            std::task::Poll::Pending
+        ));
+        first_started_receiver
+            .await
+            .expect("第一个任务应已占用唯一 CPU 许可");
+
+        let waiting_ran = Arc::new(AtomicUsize::new(0));
+        let mut waiting = Box::pin(executor.execute({
+            let waiting_ran = Arc::clone(&waiting_ran);
+            move || waiting_ran.fetch_add(1, Ordering::AcqRel)
+        }));
+        assert!(matches!(
+            futures_util::poll!(waiting.as_mut()),
+            std::task::Poll::Pending
+        ));
+
+        executor.cancel_waits();
+        assert!(matches!(
+            waiting.await,
+            Err(CpuTaskExecutionError::Cancelled)
+        ));
+        assert_eq!(waiting_ran.load(Ordering::Acquire), 0);
+
+        first_gate.wait();
+        first.await.expect("已开始的任务应安全完成");
+        executor.shutdown().unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ordered_map_parallelizes_but_preserves_input_order() {
-        let executor = RayonCpuExecutor::start(fixed_config(2, 2).unwrap()).unwrap();
+        let executor = RayonCpuExecutor::start(fixed_config(2).unwrap()).unwrap();
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let output = executor

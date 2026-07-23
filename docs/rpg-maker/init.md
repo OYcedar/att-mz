@@ -73,14 +73,17 @@ reparse point、hardlink、名称碰撞、读取中对象身份变化和资源�
 
 ## 3. 当前项目数据库
 
-项目数据库严格使用当前单一 schema，不迁移、探测或兼容旧 schema。当前核心结构为：
+项目数据库使用单一 schema，当前核心结构为：
 
 - `metadata`：项目名、规范源/目标 `LanguageId`、三个布局宽度和来源指纹；
 - `standard_asset_owner_state`：`builtin | rules | lua` 的来源指纹与资产快照指纹；
-- `standard_text_group`：逻辑组、owner 内连续 `group_order`、组角色和完整投影/写回 recipe；
-- `standard_text_unit`：组内连续 `unit_order`、`unit_role`、源内容 JSON、源上下文、译文内容
-  JSON 与状态；
-- `standard_mutation_claim`：每组派生的物理资源键及 `intent | exclusive` 访问声明；
+- `standard_text_group`：逻辑组、owner 内连续 `group_order`、组角色、compact canonical
+  `group_location` 和完整投影/写回 recipe；
+- `standard_text_unit`：组内连续 `unit_order`、compact canonical `unit_role`、源内容 JSON、
+  源上下文、译文内容 JSON 与状态；
+- `standard_mutation_claim`：每个 `(owner, resource)` 至多一行的确定性跨 owner 冲突摘要；
+  `resource_key` 使用 compact canonical JSON，`exclusive` 保留唯一声明，多个 `intent`
+  保留自然顺序最早的 group 代表；
 - `standard_translation_resource`：术语与自定义占位符的 canonical JSON；
 - `standard_project_definition`：活动 MV 对话定义的 canonical JSON。MZ 使用同一结构，
   但不消费 MV 姓名投影。
@@ -92,12 +95,27 @@ reparse point、hardlink、名称碰撞、读取中对象身份变化和资源�
 - `lua_program`：按 `extract | translate | write_back` 分开的非空 Lua 主程序正文、
   SHA-256 与无损 Windows 解析路径。
 
-语义译文身份是 `owner + group_location + unit_role`，不等于物理 JSON 地址；顺序字段也
-不进入身份。删除 owner 状态会级联删除该 owner 的组、单元和 Claim。owner 状态同时绑定来源与完整资产快照，翻译
-和写回均据此拒绝提取后发生的项目或资产变化。
+完整逻辑 Mutation Claim 不等于 `standard_mutation_claim` 的行集合。它由 group kind、
+location 和 recipe 确定，参与组内、owner 内、跨 owner 冲突验证和 owner 资产指纹；
+`standard_mutation_claim` 只持久化足以执行跨 owner 检查的确定性摘要。WriteBack 会从
+recipe 重建完整逻辑 Claim、重算原 owner 指纹，并把重建出的摘要与表中内容逐行比对。
+摘要因此是受检验的持久状态，不是可省略的缓存或跳过 recipe 验证的捷径。
 
-旧项目需要在项目根外备份后重新 Init/Extract/Translate。不符合当前 schema 的数据库按
-普通无效项目数据库处理；ATT 不识别它可能属于哪个历史格式，也不提供迁移入口。
+位置、Mutation resource、unit role 和 recipe 的持久表示只接受当前 compact canonical
+JSON 字节。语义等价但含额外空白、替代转义或其他非规范表示的值按普通无效项目状态处理。
+
+语义译文身份是 `owner + group_location + unit_role`，不等于物理 JSON 地址；顺序字段也
+不进入身份。删除 owner 状态会级联删除该 owner 的组、单元和 Claim 摘要。owner 状态同时
+绑定来源与完整资产快照，翻译和写回均据此拒绝提取后发生的项目或资产变化。
+
+数据库有效性只由上述当前结构、约束和领域不变量决定；不符合时按具体 schema、状态或
+完整性错误处理。
+
+检查现存项目数据库时，schema version、受管 schema、metadata、owner state、翻译资源、
+项目定义、运行方案、Lua 程序、`quick_check` 与 `foreign_key_check` 全部在同一个
+READ_ONLY 连接和同一个显式只读事务中按上述自然顺序读取。快照开始后即使其他连接向
+WAL 提交，检查也不会拼接不同时点的项目事实；后续对账仍以快照中的精确 schema version
+和领域事实执行 CAS。
 
 来源变化保留既有 owner 快照与译文，直到下一次对应 Extract 用当前来源原子替换；语言
 对变化清除所有标准译文与 state，并把术语表重置为空，保留占位符定义。布局宽度变化
@@ -120,7 +138,7 @@ Init 不直接修改可见工作区。创建、更新或修复都在候选中完
 `<projects.root>/.att-locks/directory-publish/<engine>/`。业务成功且候选终结及全部必要的
 非日志根 shutdown 完成后，最后一个短 SQLite 事务才替换 `init_run_plan`。确认提交失败
 时旧方案保持；提交终态无法确认时命令明确报告结果已生效但方案状态未知，并要求下次
-显式传参。普通项目日志的启动、写入、轮转或关闭失败不参与这个完成边界，也不改变
+显式传参。普通项目日志的建立、写入、flush、sync 或关闭失败不参与这个完成边界，也不改变
 退出码。
 
 实时进度只显示“检查项目、扫描来源、构建候选、数据库收敛、发布、保存运行方案”等

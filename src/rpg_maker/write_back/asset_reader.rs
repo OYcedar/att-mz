@@ -1,11 +1,15 @@
 //! 从 RPG Maker 标准文本资产表建立写回快照。
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256FramedHasher;
 use crate::rpg_maker::dialogue::MvDialogueDefinitionError;
@@ -13,15 +17,18 @@ use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
 };
+#[cfg(test)]
+use crate::rpg_maker::model::mutation_claims_for_group;
 use crate::rpg_maker::model::{
-    MutationResourceAccess, MutationResourceLock, TextProjectionRecipe, TextUnitContent,
+    MutationClaim, MutationResource, MutationResourceAccess, TextProjectionRecipe, TextUnitContent,
     TextUnitRole,
+};
+use crate::rpg_maker::mutation_claim_summary::{
+    EncodedMutationClaim, MutationClaimSummaryError, collision_summary, sort_logical_claims,
 };
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
-use crate::rpg_maker::standard_asset::{
-    RpgMakerStandardAssetOwner, RpgMakerStandardAssetReadingConfig,
-};
+use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
@@ -39,17 +46,17 @@ const READ_STANDARD_WRITE_BACK_OWNER_STATES: &str = r#"SELECT
 FROM standard_asset_owner_state
 ORDER BY CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 WHEN 'lua' THEN 2 END"#;
 
-const READ_STANDARD_WRITE_BACK_GROUPS: &str = r#"SELECT
+const READ_STANDARD_WRITE_BACK_OWNER_GROUPS: &str = r#"SELECT
     owner,
     group_location,
     group_order,
     group_kind,
     projection_recipe_json
 FROM standard_text_group
-ORDER BY CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 WHEN 'lua' THEN 2 END,
-         group_order"#;
+WHERE owner = ?
+ORDER BY group_order"#;
 
-const READ_STANDARD_WRITE_BACK_UNITS: &str = r#"SELECT
+const READ_STANDARD_WRITE_BACK_OWNER_UNITS: &str = r#"SELECT
     unit.owner,
     unit.group_location,
     unit.unit_role,
@@ -57,38 +64,107 @@ const READ_STANDARD_WRITE_BACK_UNITS: &str = r#"SELECT
     unit.source_content_json,
     unit.source_context_json,
     unit.translation_content_json
-FROM standard_text_unit AS unit
-JOIN standard_text_group AS text_group
-  ON text_group.owner = unit.owner
+FROM standard_text_group AS text_group
+CROSS JOIN standard_text_unit AS unit
+  ON unit.owner = text_group.owner
  AND text_group.group_location = unit.group_location
-ORDER BY CASE unit.owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 WHEN 'lua' THEN 2 END,
-         text_group.group_order,
+WHERE text_group.owner = ?
+ORDER BY text_group.group_order,
          unit.unit_order"#;
 
-const READ_STANDARD_WRITE_BACK_CLAIMS: &str = r#"SELECT
+const READ_STANDARD_WRITE_BACK_OWNER_CLAIMS: &str = r#"SELECT
     owner,
     group_location,
     resource_key,
     access
-FROM standard_mutation_claim
+FROM standard_mutation_claim INDEXED BY standard_mutation_claim_owner_resource_idx
+WHERE owner = ?
 ORDER BY resource_key COLLATE BINARY,
          access COLLATE BINARY,
-         CASE owner WHEN 'builtin' THEN 0 WHEN 'rules' THEN 1 WHEN 'lua' THEN 2 END,
          group_location COLLATE BINARY"#;
+
+const STANDARD_WRITE_BACK_OWNER_ORDER: [RpgMakerStandardAssetOwner; 3] = [
+    RpgMakerStandardAssetOwner::Builtin,
+    RpgMakerStandardAssetOwner::Rules,
+    RpgMakerStandardAssetOwner::Lua,
+];
+const STANDARD_WRITE_BACK_QUERY_RESULT_COUNT: usize = 1 + STANDARD_WRITE_BACK_OWNER_ORDER.len() * 3;
+
+fn standard_write_back_snapshot_queries() -> Vec<SqliteQuery> {
+    let mut queries = Vec::with_capacity(STANDARD_WRITE_BACK_QUERY_RESULT_COUNT);
+    queries.push(
+        SqliteQuery::new(READ_STANDARD_WRITE_BACK_OWNER_STATES, Vec::new())
+            .with_id("write_back.owner_states"),
+    );
+    for (kind, statement) in [
+        ("groups", READ_STANDARD_WRITE_BACK_OWNER_GROUPS),
+        ("units", READ_STANDARD_WRITE_BACK_OWNER_UNITS),
+        ("claims", READ_STANDARD_WRITE_BACK_OWNER_CLAIMS),
+    ] {
+        queries.extend(STANDARD_WRITE_BACK_OWNER_ORDER.map(|owner| {
+            SqliteQuery::new(
+                statement,
+                vec![SqliteValue::Text(owner.storage_name().to_owned())],
+            )
+            .with_id(format!("write_back.{}.{kind}", owner.storage_name()))
+        }));
+    }
+    queries
+}
+
+fn merge_owner_partitions(partitions: [Vec<SqliteRow>; 3]) -> Vec<SqliteRow> {
+    let capacity = partitions.iter().map(Vec::len).sum();
+    let mut merged = Vec::with_capacity(capacity);
+    for mut partition in partitions {
+        merged.append(&mut partition);
+    }
+    merged
+}
+
+fn unpack_snapshot_query_results(
+    query_results: Vec<Vec<SqliteRow>>,
+) -> Result<SnapshotRows, InvalidStandardWriteBackAssetSnapshot> {
+    let actual = query_results.len();
+    if actual != STANDARD_WRITE_BACK_QUERY_RESULT_COUNT {
+        return Err(
+            InvalidStandardWriteBackAssetSnapshot::WrongQueryResultCount {
+                expected: STANDARD_WRITE_BACK_QUERY_RESULT_COUNT,
+                actual,
+            },
+        );
+    }
+    let mut query_results = query_results.into_iter();
+    let owners = query_results.next().expect("已验证快照查询结果数量");
+    let mut next_owner_partitions = || {
+        merge_owner_partitions([
+            query_results.next().expect("已验证 Builtin 查询结果存在"),
+            query_results.next().expect("已验证 Rules 查询结果存在"),
+            query_results.next().expect("已验证 Lua 查询结果存在"),
+        ])
+    };
+    let groups = next_owner_partitions();
+    let units = next_owner_partitions();
+    let claims = next_owner_partitions();
+    debug_assert!(query_results.next().is_none());
+    Ok(SnapshotRows {
+        owners,
+        groups,
+        units,
+        claims,
+    })
+}
 
 /// 先验证 active owner 与资产指纹，再用受控 CPU 解码建立写回快照。
 pub(crate) struct RpgMakerStandardWriteBackAssetReadingService<Q, C> {
     sqlite: Arc<Q>,
     cpu: Arc<C>,
-    config: RpgMakerStandardAssetReadingConfig,
 }
 
 impl<Q, C> RpgMakerStandardWriteBackAssetReadingService<Q, C> {
-    pub(crate) fn new(sqlite: Q, cpu: C, config: RpgMakerStandardAssetReadingConfig) -> Self {
+    pub(crate) fn new(sqlite: Q, cpu: C) -> Self {
         Self {
             sqlite: Arc::new(sqlite),
             cpu: Arc::new(cpu),
-            config,
         }
     }
 }
@@ -111,53 +187,30 @@ where
         let dialogue_definition = project.mv_dialogue_definition().clone();
         let sqlite = Arc::clone(&self.sqlite);
         let cpu = Arc::clone(&self.cpu);
-        let records_per_job = self.config.units_per_decode_job().get();
 
         async move {
             let dialogue_definition_json =
                 dialogue_definition.to_canonical_json().map_err(|source| {
                     RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot(
-                        InvalidStandardWriteBackAssetSnapshot::InvalidDialogueDefinition(source),
+                        InvalidStandardWriteBackAssetSnapshot::InvalidDialogueDefinition(Box::new(
+                            source,
+                        )),
                     )
                 })?;
             let query_results = sqlite
                 .query_existing_database_snapshot(
                     database_path.clone(),
-                    vec![
-                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_OWNER_STATES, Vec::new()),
-                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_GROUPS, Vec::new()),
-                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_UNITS, Vec::new()),
-                        SqliteQuery::new(READ_STANDARD_WRITE_BACK_CLAIMS, Vec::new()),
-                    ],
+                    standard_write_back_snapshot_queries(),
                 )
                 .await
                 .map_err(|error| map_query_error(database_path, error))?;
-            let actual = query_results.len();
-            let [owner_rows, group_rows, unit_rows, claim_rows] =
-                query_results.try_into().map_err(|_| {
-                    RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot(
-                        InvalidStandardWriteBackAssetSnapshot::WrongQueryResultCount {
-                            expected: 4,
-                            actual,
-                        },
-                    )
-                })?;
+            let rows = unpack_snapshot_query_results(query_results)
+                .map_err(RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot)?;
 
             let prepared = cpu
-                .execute(move || {
-                    prepare_rows(
-                        SnapshotRows {
-                            owners: owner_rows,
-                            groups: group_rows,
-                            units: unit_rows,
-                            claims: claim_rows,
-                        },
-                        current_source,
-                        records_per_job,
-                    )
-                })
+                .execute(move || prepare_rows(rows, current_source))
                 .await
-                .map_err(RpgMakerStandardWriteBackAssetReadingError::SchedulePartition)?
+                .map_err(RpgMakerStandardWriteBackAssetReadingError::SchedulePreparation)?
                 .map_err(RpgMakerStandardWriteBackAssetReadingError::InvalidSnapshot)?;
             if !prepared.stale_owners.is_empty() {
                 return Err(
@@ -167,19 +220,15 @@ where
                 );
             }
 
-            let decoded_batches = cpu
-                .execute_ordered_map(prepared.batches, decode_batch)
+            let decoded_records = cpu
+                .execute_ordered_map(prepared.records, decode_record)
                 .await
                 .map_err(RpgMakerStandardWriteBackAssetReadingError::ScheduleDecode)?;
 
             let owner_states = prepared.owner_states;
             cpu.execute(move || {
-                let decoded = decoded_batches.into_iter().collect::<Result<Vec<_>, _>>()?;
-                assemble_snapshot(
-                    owner_states,
-                    decoded.into_iter().flatten(),
-                    &dialogue_definition_json,
-                )
+                let decoded = decoded_records.into_iter().collect::<Result<Vec<_>, _>>()?;
+                assemble_snapshot(owner_states, decoded, &dialogue_definition_json)
             })
             .await
             .map_err(RpgMakerStandardWriteBackAssetReadingError::ScheduleAssembly)?
@@ -200,7 +249,7 @@ pub(crate) enum RpgMakerStandardWriteBackAssetReadingError<Q, C> {
     ExtractionOutOfDate {
         owners: Vec<RpgMakerStandardAssetOwner>,
     },
-    SchedulePartition(CpuTaskExecutionError<C>),
+    SchedulePreparation(CpuTaskExecutionError<C>),
     ScheduleDecode(CpuTaskExecutionError<C>),
     ScheduleAssembly(CpuTaskExecutionError<C>),
     InvalidSnapshot(InvalidStandardWriteBackAssetSnapshot),
@@ -231,8 +280,8 @@ impl<Q: fmt::Display, C: fmt::Display> fmt::Display
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Self::SchedulePartition(source) => {
-                write!(formatter, "写回资产解码分批任务执行失败：{source}")
+            Self::SchedulePreparation(source) => {
+                write!(formatter, "写回资产快照准备任务执行失败：{source}")
             }
             Self::ScheduleDecode(source) => {
                 write!(formatter, "写回资产解码任务执行失败：{source}")
@@ -251,13 +300,96 @@ impl<Q: Error + 'static, C: Error + 'static> Error
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Query { source, .. } => Some(source),
-            Self::SchedulePartition(source)
+            Self::SchedulePreparation(source)
             | Self::ScheduleDecode(source)
             | Self::ScheduleAssembly(source) => Some(source),
             Self::InvalidSnapshot(source) => Some(source),
             Self::DatabaseNotFound { .. } | Self::ExtractionOutOfDate { .. } => None,
         }
     }
+}
+
+impl<Q, C> RpgMakerStandardWriteBackAssetReadingError<Q, C>
+where
+    Q: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    /// 投影项目数据库路径、SQLite/CPU 稳定原因和损坏快照的精确结构位置。
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        match self {
+            Self::DatabaseNotFound { database_path } => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackAssetRead,
+                DiagnosticStage::WriteBack,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::Query {
+                database_path,
+                source,
+            } => source
+                .safe_diagnostic_source(
+                    DiagnosticStage::WriteBack,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                )
+                .with_recovery(RecoveryFact::path(database_path)),
+            Self::ExtractionOutOfDate { owners } => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackAssetRead,
+                DiagnosticStage::WriteBack,
+                DiagnosticSubject::operation("Standard asset owner state"),
+                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackExtractionOutOfDate),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            )
+            .with_recovery(RecoveryFact::component(format!(
+                "stale_owners={}",
+                owners
+                    .iter()
+                    .map(|owner| owner.storage_name())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))),
+            Self::SchedulePreparation(source) => cpu_asset_diagnostic(source, "prepare_snapshot"),
+            Self::ScheduleDecode(source) => cpu_asset_diagnostic(source, "decode_snapshot"),
+            Self::ScheduleAssembly(source) => cpu_asset_diagnostic(source, "assemble_snapshot"),
+            Self::InvalidSnapshot(source) => source.safe_diagnostic(),
+        }
+    }
+}
+
+impl<Q, C> SafeDiagnosticSource for RpgMakerStandardWriteBackAssetReadingError<Q, C>
+where
+    Q: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    fn safe_diagnostic_source(
+        &self,
+        _stage: DiagnosticStage,
+        _impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        self.safe_diagnostic()
+    }
+}
+
+fn cpu_asset_diagnostic<C>(
+    source: &CpuTaskExecutionError<C>,
+    operation: &'static str,
+) -> SafeDiagnostic
+where
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    source
+        .safe_diagnostic_source(
+            DiagnosticStage::WriteBack,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        )
+        .with_recovery(RecoveryFact::component(format!(
+            "write_back_asset_operation={operation}"
+        )))
 }
 
 #[derive(Debug)]
@@ -308,10 +440,22 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
         actual: i64,
     },
     UnknownMutationAccess(String),
+    NonCanonicalMutationResource {
+        owner: String,
+        group_location: String,
+    },
+    InvalidClaimSummary {
+        owner: String,
+        row_index: usize,
+        kind: ClaimSummaryMismatchKind,
+        expected_rows: usize,
+        actual_rows: usize,
+        details: Box<ClaimSummaryMismatchDetails>,
+    },
     AssetFingerprintMismatch {
         owner: String,
     },
-    InvalidDialogueDefinition(MvDialogueDefinitionError),
+    InvalidDialogueDefinition(Box<MvDialogueDefinitionError>),
     InvalidLocation(RpgMakerLocationCodecError),
     InvalidProjection(RpgMakerProjectionCodecError),
     InvalidUnitContent {
@@ -319,6 +463,441 @@ pub(crate) enum InvalidStandardWriteBackAssetSnapshot {
         source: serde_json::Error,
     },
     InvalidModel(StandardWriteBackSnapshotError),
+}
+
+impl InvalidStandardWriteBackAssetSnapshot {
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        let (subject, fact) = match self {
+            Self::WrongQueryResultCount { expected, actual } => (
+                DiagnosticSubject::operation("Standard asset query result sets"),
+                format!("expected={expected}; actual={actual}"),
+            ),
+            Self::WrongColumnCount { expected, actual } => (
+                DiagnosticSubject::operation("Standard asset row columns"),
+                format!("expected={expected}; actual={actual}"),
+            ),
+            Self::WrongColumnType {
+                column,
+                expected,
+                actual,
+            } => (
+                DiagnosticSubject::field(column),
+                format!("expected_type={expected}; actual_type={actual}"),
+            ),
+            Self::InvalidOrderValue { column, actual } => (
+                DiagnosticSubject::field(column),
+                format!("expected=non_negative_order; actual={actual}"),
+            ),
+            Self::UnknownOwner(owner) => (
+                DiagnosticSubject::field("owner"),
+                format!("unknown_owner={owner}"),
+            ),
+            Self::DuplicateOwner(owner) => (
+                DiagnosticSubject::field("owner"),
+                format!("duplicate_owner={owner}"),
+            ),
+            Self::InvalidFingerprintLength {
+                owner,
+                column,
+                actual,
+            } => (
+                DiagnosticSubject::field(column),
+                format!("owner={owner}; expected_bytes=32; actual_bytes={actual}"),
+            ),
+            Self::AssetWithoutOwner(owner) => (
+                DiagnosticSubject::field("owner"),
+                format!("asset_without_active_owner={owner}"),
+            ),
+            Self::UnknownGroupKind(kind) => (
+                DiagnosticSubject::field("group_kind"),
+                format!("unknown_group_kind={kind}"),
+            ),
+            Self::DuplicateGroup {
+                owner,
+                group_location,
+            } => (
+                DiagnosticSubject::field("group_location"),
+                format!("owner={owner}; duplicate_group={group_location}"),
+            ),
+            Self::MissingGroup {
+                owner,
+                group_location,
+            } => (
+                DiagnosticSubject::field("group_location"),
+                format!("owner={owner}; missing_group={group_location}"),
+            ),
+            Self::InvalidGroupOrder {
+                owner,
+                expected,
+                actual,
+            } => (
+                DiagnosticSubject::field("group_order"),
+                format!("owner={owner}; expected={expected}; actual={actual}"),
+            ),
+            Self::InvalidUnitOrder {
+                owner,
+                group_location,
+                expected,
+                actual,
+            } => (
+                DiagnosticSubject::field("unit_order"),
+                format!(
+                    "owner={owner}; group={group_location}; expected={expected}; actual={actual}"
+                ),
+            ),
+            Self::UnknownMutationAccess(access) => (
+                DiagnosticSubject::field("access"),
+                format!("unknown_mutation_access={access}"),
+            ),
+            Self::NonCanonicalMutationResource {
+                owner,
+                group_location,
+            } => (
+                DiagnosticSubject::field("resource_key"),
+                format!("owner={owner}; group={group_location}; mutation_resource_non_canonical"),
+            ),
+            Self::InvalidClaimSummary {
+                owner,
+                row_index,
+                kind,
+                expected_rows,
+                actual_rows,
+                details,
+            } => {
+                let mut facts = format!(
+                    "owner={owner}; summary_mismatch={}; row_index={row_index}; expected_rows={expected_rows}; actual_rows={actual_rows}",
+                    kind.as_str()
+                );
+                if let Some(group) = &details.expected_group {
+                    facts.push_str(&format!("; expected_group={group}"));
+                }
+                if let Some(group) = &details.actual_group {
+                    facts.push_str(&format!("; actual_group={group}"));
+                }
+                if let Some(resource) = &details.expected_resource {
+                    facts.push_str(&format!("; expected_resource={resource}"));
+                }
+                if let Some(resource) = &details.actual_resource {
+                    facts.push_str(&format!("; actual_resource={resource}"));
+                }
+                if let Some(access) = &details.expected_access {
+                    facts.push_str(&format!("; expected_access={}", access.storage_name()));
+                }
+                if let Some(access) = &details.actual_access {
+                    facts.push_str(&format!("; actual_access={}", access.storage_name()));
+                }
+                (
+                    DiagnosticSubject::operation("standard_mutation_claim collision summary"),
+                    facts,
+                )
+            }
+            Self::AssetFingerprintMismatch { owner } => (
+                DiagnosticSubject::field("asset_snapshot_fingerprint"),
+                format!("owner={owner}; stored_fingerprint_does_not_match_rows"),
+            ),
+            Self::InvalidDialogueDefinition(source) => {
+                return invalid_dialogue_definition_diagnostic(source);
+            }
+            Self::InvalidLocation(source) => {
+                return invalid_snapshot_detail_diagnostic(
+                    DiagnosticSubject::field("group_location"),
+                    source.safe_diagnostic_detail(),
+                );
+            }
+            Self::InvalidProjection(source) => {
+                return invalid_snapshot_detail_diagnostic(
+                    DiagnosticSubject::field("projection_recipe_json"),
+                    source.safe_diagnostic_detail(),
+                );
+            }
+            Self::InvalidUnitContent { column, source } => (
+                DiagnosticSubject::field(column),
+                format!(
+                    "unit_content_json_invalid; {}",
+                    write_back_json_error_detail(source)
+                ),
+            ),
+            Self::InvalidModel(source) => return invalid_write_back_model_diagnostic(source),
+        };
+        SafeDiagnostic::new(
+            DiagnosticCode::WriteBackAssetRead,
+            DiagnosticStage::WriteBack,
+            subject,
+            DiagnosticReason::failure(DiagnosticFailureKind::WriteBackAssetSnapshotInvalid),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        )
+        .with_recovery(RecoveryFact::component(fact))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ClaimSummaryMismatchDetails {
+    expected_group: Option<RpgMakerLocation>,
+    actual_group: Option<RpgMakerLocation>,
+    expected_resource: Option<MutationResource>,
+    actual_resource: Option<MutationResource>,
+    expected_access: Option<MutationResourceAccess>,
+    actual_access: Option<MutationResourceAccess>,
+}
+
+fn invalid_dialogue_definition_diagnostic(source: &MvDialogueDefinitionError) -> SafeDiagnostic {
+    let mut diagnostic = source.safe_diagnostic(
+        DiagnosticStage::WriteBack,
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::CheckProjectState,
+    );
+    diagnostic.code = DiagnosticCode::WriteBackAssetRead;
+    diagnostic.stage = DiagnosticStage::WriteBack;
+    diagnostic.impact = DiagnosticImpact::Unchanged;
+    diagnostic.action = DiagnosticAction::CheckProjectState;
+    diagnostic.with_recovery(RecoveryFact::component(
+        "snapshot_field=mv_dialogue_definition",
+    ))
+}
+
+fn invalid_snapshot_detail_diagnostic(
+    subject: DiagnosticSubject,
+    detail: String,
+) -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        DiagnosticCode::WriteBackAssetRead,
+        DiagnosticStage::WriteBack,
+        subject,
+        DiagnosticReason::failure_with_detail(
+            DiagnosticFailureKind::WriteBackAssetSnapshotInvalid,
+            detail,
+        ),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::CheckProjectState,
+    )
+}
+
+fn write_back_json_error_detail(source: &serde_json::Error) -> String {
+    let category = match source.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!(
+        "json_category={category}; json_line={}; json_column={}",
+        source.line(),
+        source.column()
+    )
+}
+
+fn invalid_write_back_model_diagnostic(source: &StandardWriteBackSnapshotError) -> SafeDiagnostic {
+    let (subject, detail) = match source {
+        StandardWriteBackSnapshotError::BlankSourceContent { role } => (
+            DiagnosticSubject::field("source_content"),
+            format!(
+                "model_error=blank_source_content; {}",
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::BlankTranslationContent { role } => (
+            DiagnosticSubject::field("translation_content"),
+            format!(
+                "model_error=blank_translation_content; {}",
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::ContentShapeMismatch { role } => (
+            DiagnosticSubject::field("content_shape"),
+            format!(
+                "model_error=content_shape_mismatch; {}",
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::EmptyLineContent { role, column } => (
+            DiagnosticSubject::field(column),
+            format!(
+                "model_error=empty_line_content; {}",
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::InvalidContentLine {
+            role,
+            column,
+            line_index,
+        } => (
+            DiagnosticSubject::field(column),
+            format!(
+                "model_error=invalid_content_line; {}; line_index={line_index}",
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::AlignedLineCountMismatch {
+            role,
+            expected,
+            actual,
+        } => (
+            DiagnosticSubject::field("translation_content"),
+            format!(
+                "model_error=aligned_line_count_mismatch; {}; expected={expected}; actual={actual}",
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::AlignedBlankLineMismatch { role, line_index } => (
+            DiagnosticSubject::field("translation_content"),
+            format!(
+                "model_error=aligned_blank_line_mismatch; {}; line_index={line_index}",
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::EmptyProjection { group_location } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            "model_error=empty_projection".to_owned(),
+        ),
+        StandardWriteBackSnapshotError::InvalidRole { kind, role } => (
+            DiagnosticSubject::field("unit_role"),
+            format!(
+                "model_error=invalid_role; group_kind={}; {}",
+                write_back_group_kind(*kind),
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::DuplicateRole {
+            group_location,
+            role,
+        } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            format!(
+                "model_error=duplicate_role; {}",
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::RecipeRoleMismatch {
+            group_location,
+            units,
+            recipes,
+        } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            format!(
+                "model_error=recipe_role_mismatch; unit_roles={}; recipe_roles={}",
+                write_back_role_set_detail(units),
+                write_back_role_set_detail(recipes)
+            ),
+        ),
+        StandardWriteBackSnapshotError::RecipeLineMismatch {
+            group_location,
+            role,
+        } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            format!(
+                "model_error=recipe_line_mismatch; {}",
+                write_back_role_detail(role)
+            ),
+        ),
+        StandardWriteBackSnapshotError::RecipeClaimMismatch { group_location } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            "model_error=recipe_claim_mismatch".to_owned(),
+        ),
+        StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+            group_location,
+            target,
+        } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            format!("model_error=recipe_does_not_rebuild_original; target={target}"),
+        ),
+        StandardWriteBackSnapshotError::MutationClaimConflict { resource } => (
+            DiagnosticSubject::operation("standard_mutation_claim"),
+            format!("model_error=mutation_claim_conflict; resource={resource}"),
+        ),
+        StandardWriteBackSnapshotError::MismatchedClaimSource {
+            group_location,
+            claim,
+        } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            format!(
+                "model_error=mismatched_claim_source; {}",
+                write_back_claim_detail(claim)
+            ),
+        ),
+        StandardWriteBackSnapshotError::MismatchedClaimResourceSource {
+            group_location,
+            resource,
+        } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            format!("model_error=mismatched_claim_resource_source; resource={resource}"),
+        ),
+        StandardWriteBackSnapshotError::InvalidDialogueProjection { group_location } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            "model_error=invalid_dialogue_projection".to_owned(),
+        ),
+        StandardWriteBackSnapshotError::InvalidScrollingProjection { group_location } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            "model_error=invalid_scrolling_projection".to_owned(),
+        ),
+        StandardWriteBackSnapshotError::InvalidScrollingRecipe { group_location } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            "model_error=invalid_scrolling_recipe".to_owned(),
+        ),
+        StandardWriteBackSnapshotError::InvalidChoicesProjection { group_location } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            "model_error=invalid_choices_projection".to_owned(),
+        ),
+        StandardWriteBackSnapshotError::InvalidDirectProjection { group_location } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            "model_error=invalid_direct_projection".to_owned(),
+        ),
+        StandardWriteBackSnapshotError::MismatchedDialogueGroup {
+            group_location,
+            recipe_location,
+        } => (
+            DiagnosticSubject::operation(format!("group_location={group_location}")),
+            format!("model_error=mismatched_dialogue_group; recipe_location={recipe_location}"),
+        ),
+    };
+    invalid_snapshot_detail_diagnostic(subject, detail)
+}
+
+fn write_back_role_detail(role: &TextUnitRole) -> &'static str {
+    match role {
+        TextUnitRole::Scalar(_) => "role=scalar",
+        TextUnitRole::DialogueSpeaker => "role=dialogue_speaker",
+        TextUnitRole::DialogueBody => "role=dialogue_body",
+        TextUnitRole::Choices => "role=choices",
+        TextUnitRole::ScrollingText => "role=scrolling_text",
+    }
+}
+
+fn write_back_role_set_detail(roles: &std::collections::BTreeSet<TextUnitRole>) -> String {
+    roles
+        .iter()
+        .map(write_back_role_detail)
+        .map(|role| role.strip_prefix("role=").unwrap_or(role))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn write_back_group_kind(kind: TextGroupKind) -> &'static str {
+    match kind {
+        TextGroupKind::DatabaseEntry => "database_entry",
+        TextGroupKind::System => "system",
+        TextGroupKind::Map => "map",
+        TextGroupKind::EventDialogue => "event_dialogue",
+        TextGroupKind::EventChoices => "event_choices",
+        TextGroupKind::EventScrollingText => "event_scrolling_text",
+        TextGroupKind::EventCommand => "event_command",
+        TextGroupKind::PluginParameter => "plugin_parameter",
+    }
+}
+
+fn write_back_claim_detail(claim: &MutationClaim) -> String {
+    match claim {
+        MutationClaim::Value(location) => format!("claim_kind=value; claim_location={location}"),
+        MutationClaim::NoteTag(location) => {
+            format!("claim_kind=note_tag; claim_location={location}")
+        }
+        MutationClaim::CommentTag { location, .. } => {
+            format!("claim_kind=comment_tag; claim_location={location}")
+        }
+        MutationClaim::EventBlock { header, .. } => {
+            format!("claim_kind=event_block; claim_location={header}")
+        }
+    }
 }
 
 impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
@@ -390,6 +969,25 @@ impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
             Self::UnknownMutationAccess(access) => {
                 write!(formatter, "未知物理修改访问方式：{access}")
             }
+            Self::NonCanonicalMutationResource {
+                owner,
+                group_location,
+            } => write!(
+                formatter,
+                "owner {owner} 的组 {group_location} 使用了非规范 resource_key 编码"
+            ),
+            Self::InvalidClaimSummary {
+                owner,
+                row_index,
+                kind,
+                expected_rows,
+                actual_rows,
+                ..
+            } => write!(
+                formatter,
+                "owner {owner} 的 Claim 冲突摘要损坏：{}，第 {row_index} 行，期待 {expected_rows} 行，实际 {actual_rows} 行",
+                kind.as_str()
+            ),
             Self::AssetFingerprintMismatch { owner } => {
                 write!(formatter, "资产所有者 {owner} 的快照指纹与三表内容不一致")
             }
@@ -406,6 +1004,29 @@ impl fmt::Display for InvalidStandardWriteBackAssetSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClaimSummaryMismatchKind {
+    DuplicateResource,
+    MissingRow,
+    UnexpectedRow,
+    Resource,
+    Access,
+    Representative,
+}
+
+impl ClaimSummaryMismatchKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DuplicateResource => "duplicate_resource",
+            Self::MissingRow => "missing_row",
+            Self::UnexpectedRow => "unexpected_row",
+            Self::Resource => "resource_mismatch",
+            Self::Access => "access_mismatch",
+            Self::Representative => "representative_mismatch",
+        }
+    }
+}
+
 impl Error for InvalidStandardWriteBackAssetSnapshot {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -413,7 +1034,7 @@ impl Error for InvalidStandardWriteBackAssetSnapshot {
             Self::InvalidProjection(source) => Some(source),
             Self::InvalidUnitContent { source, .. } => Some(source),
             Self::InvalidModel(source) => Some(source),
-            Self::InvalidDialogueDefinition(source) => Some(source),
+            Self::InvalidDialogueDefinition(source) => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -421,7 +1042,6 @@ impl Error for InvalidStandardWriteBackAssetSnapshot {
 
 #[derive(Clone, Copy)]
 struct OwnerState {
-    owner: RpgMakerStandardAssetOwner,
     asset_fingerprint: AssetSnapshotFingerprint,
 }
 
@@ -440,25 +1060,15 @@ enum SnapshotAssetRow {
 
 struct PreparedRows {
     stale_owners: Vec<RpgMakerStandardAssetOwner>,
-    owner_states: BTreeMap<String, OwnerState>,
-    batches: Vec<Vec<SnapshotAssetRow>>,
+    owner_states: HashMap<RpgMakerStandardAssetOwner, OwnerState>,
+    records: Vec<SnapshotAssetRow>,
 }
 
 fn prepare_rows(
     rows: SnapshotRows,
     current_source: SourceSnapshotFingerprint,
-    records_per_job: usize,
 ) -> Result<PreparedRows, InvalidStandardWriteBackAssetSnapshot> {
-    assert!(records_per_job > 0, "写回资产解码批大小必须非零");
-    let asset_row_count = rows
-        .groups
-        .len()
-        .saturating_add(rows.units.len())
-        .saturating_add(rows.claims.len());
-    let initial_batch_capacity = records_per_job.min(asset_row_count);
-    let mut owner_states = BTreeMap::new();
-    let mut batches = Vec::new();
-    let mut asset_rows = Vec::with_capacity(initial_batch_capacity);
+    let mut owner_states = HashMap::new();
     let mut stale_owners = Vec::new();
     for row in rows.owners {
         let values = row.into_values();
@@ -487,9 +1097,8 @@ fn prepare_rows(
         )?;
         if owner_states
             .insert(
-                owner_name.clone(),
+                owner,
                 OwnerState {
-                    owner,
                     asset_fingerprint: AssetSnapshotFingerprint::from_bytes(asset),
                 },
             )
@@ -505,34 +1114,23 @@ fn prepare_rows(
     }
     stale_owners.sort_by_key(owner_order);
 
-    let ordered_asset_rows = rows
+    let records = rows
         .groups
         .into_iter()
         .map(SnapshotAssetRow::Group)
         .chain(rows.units.into_iter().map(SnapshotAssetRow::Unit))
-        .chain(rows.claims.into_iter().map(SnapshotAssetRow::Claim));
-    for row in ordered_asset_rows {
-        asset_rows.push(row);
-        if asset_rows.len() == records_per_job {
-            batches.push(std::mem::replace(
-                &mut asset_rows,
-                Vec::with_capacity(records_per_job),
-            ));
-        }
-    }
-    if !asset_rows.is_empty() {
-        batches.push(asset_rows);
-    }
+        .chain(rows.claims.into_iter().map(SnapshotAssetRow::Claim))
+        .collect();
     Ok(PreparedRows {
         stale_owners,
         owner_states,
-        batches,
+        records,
     })
 }
 
 enum DecodedRecord {
     Group {
-        owner: String,
+        owner: RpgMakerStandardAssetOwner,
         group_location_raw: String,
         group_location: RpgMakerLocation,
         group_order: usize,
@@ -542,7 +1140,7 @@ enum DecodedRecord {
         recipes_raw: String,
     },
     Unit {
-        owner: String,
+        owner: RpgMakerStandardAssetOwner,
         group_location_raw: String,
         role: TextUnitRole,
         role_raw: String,
@@ -553,24 +1151,21 @@ enum DecodedRecord {
         translation_content: Option<TextUnitContent>,
     },
     Claim {
-        owner: String,
+        owner: RpgMakerStandardAssetOwner,
         group_location_raw: String,
-        lock: MutationResourceLock,
+        access: MutationResourceAccess,
         resource_key_raw: String,
-        access_raw: String,
     },
 }
 
-fn decode_batch(
-    rows: Vec<SnapshotAssetRow>,
-) -> Result<Vec<DecodedRecord>, InvalidStandardWriteBackAssetSnapshot> {
-    rows.into_iter()
-        .map(|row| match row {
-            SnapshotAssetRow::Group(row) => decode_group(row),
-            SnapshotAssetRow::Unit(row) => decode_unit(row),
-            SnapshotAssetRow::Claim(row) => decode_claim(row),
-        })
-        .collect()
+fn decode_record(
+    row: SnapshotAssetRow,
+) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
+    match row {
+        SnapshotAssetRow::Group(row) => decode_group(row),
+        SnapshotAssetRow::Unit(row) => decode_unit(row),
+        SnapshotAssetRow::Claim(row) => decode_claim(row),
+    }
 }
 
 fn decode_group(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBackAssetSnapshot> {
@@ -588,8 +1183,7 @@ fn decode_group(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBac
             actual,
         },
     )?;
-    let owner = owned_text(owner, "owner")?;
-    parse_owner(&owner)?;
+    let owner = parse_owner(&owned_text(owner, "owner")?)?;
     let group_location_raw = owned_text(group_location, "group_location")?;
     let group_kind_raw = owned_text(group_kind, "group_kind")?;
     let recipes_raw = owned_text(projection_recipe_json, "projection_recipe_json")?;
@@ -624,8 +1218,7 @@ fn decode_unit(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBack
             actual,
         },
     )?;
-    let owner = owned_text(owner, "owner")?;
-    parse_owner(&owner)?;
+    let owner = parse_owner(&owned_text(owner, "owner")?)?;
     let group_location_raw = owned_text(group_location, "group_location")?;
     let role_raw = owned_text(unit_role, "unit_role")?;
     let source_content_json = owned_text(source_content_json, "source_content_json")?;
@@ -672,8 +1265,7 @@ fn decode_claim(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBac
                 actual,
             },
         )?;
-    let owner = owned_text(owner, "owner")?;
-    parse_owner(&owner)?;
+    let owner = parse_owner(&owned_text(owner, "owner")?)?;
     let group_location_raw = owned_text(group_location, "group_location")?;
     let resource_key_raw = owned_text(resource_key, "resource_key")?;
     let access_raw = owned_text(access, "access")?;
@@ -683,22 +1275,19 @@ fn decode_claim(row: SqliteRow) -> Result<DecodedRecord, InvalidStandardWriteBac
     Ok(DecodedRecord::Claim {
         owner,
         group_location_raw,
-        lock: MutationResourceLock::new(
-            RpgMakerProjectionCodec::decode_mutation_resource(&resource_key_raw)
-                .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
-            access,
-        ),
+        access,
         resource_key_raw,
-        access_raw,
     })
 }
 
 struct GroupBuilder {
+    owner: RpgMakerStandardAssetOwner,
+    group_location_raw: String,
+    group_order: usize,
     kind: TextGroupKind,
     location: RpgMakerLocation,
     recipes: Vec<TextProjectionRecipe>,
     units: Vec<StandardWriteBackUnit>,
-    claims: Vec<MutationResourceLock>,
 }
 
 struct SnapshotFingerprintAccumulator {
@@ -759,22 +1348,24 @@ impl SnapshotFingerprintAccumulator {
 }
 
 fn assemble_snapshot(
-    owner_states: BTreeMap<String, OwnerState>,
+    owner_states: HashMap<RpgMakerStandardAssetOwner, OwnerState>,
     records: impl IntoIterator<Item = DecodedRecord>,
     dialogue_definition_json: &str,
 ) -> Result<StandardWriteBackSnapshot, InvalidStandardWriteBackAssetSnapshot> {
     let mut groups = Vec::<GroupBuilder>::new();
-    let mut group_indexes = BTreeMap::<(String, String), usize>::new();
-    let mut next_group_orders = BTreeMap::<String, usize>::new();
+    let mut group_indexes = HashMap::<RpgMakerStandardAssetOwner, HashMap<String, usize>>::new();
+    let mut next_group_orders = HashMap::<RpgMakerStandardAssetOwner, usize>::new();
+    let mut stored_claim_summaries =
+        HashMap::<RpgMakerStandardAssetOwner, Vec<EncodedMutationClaim>>::new();
     let mut fingerprint_accumulators = owner_states
-        .iter()
-        .map(|(owner_name, state)| {
+        .keys()
+        .map(|owner| {
             (
-                owner_name.clone(),
-                SnapshotFingerprintAccumulator::new(state.owner, dialogue_definition_json),
+                *owner,
+                SnapshotFingerprintAccumulator::new(*owner, dialogue_definition_json),
             )
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<HashMap<_, _>>();
 
     for record in records {
         let owner = match &record {
@@ -782,9 +1373,10 @@ fn assemble_snapshot(
             | DecodedRecord::Unit { owner, .. }
             | DecodedRecord::Claim { owner, .. } => owner,
         };
-        if !owner_states.contains_key(owner) {
+        let owner = *owner;
+        if !owner_states.contains_key(&owner) {
             return Err(InvalidStandardWriteBackAssetSnapshot::AssetWithoutOwner(
-                owner.clone(),
+                owner.storage_name().to_owned(),
             ));
         }
         match record {
@@ -807,17 +1399,17 @@ fn assemble_snapshot(
                         &group_kind_raw,
                         &recipes_raw,
                     );
-                let key = (owner.clone(), group_location_raw.clone());
-                if group_indexes.contains_key(&key) {
+                let owner_group_indexes = group_indexes.entry(owner).or_default();
+                if owner_group_indexes.contains_key(&group_location_raw) {
                     return Err(InvalidStandardWriteBackAssetSnapshot::DuplicateGroup {
-                        owner,
+                        owner: owner.storage_name().to_owned(),
                         group_location: group_location_raw,
                     });
                 }
-                let expected = *next_group_orders.entry(owner.clone()).or_default();
+                let expected = *next_group_orders.entry(owner).or_default();
                 if group_order != expected {
                     return Err(InvalidStandardWriteBackAssetSnapshot::InvalidGroupOrder {
-                        owner,
+                        owner: owner.storage_name().to_owned(),
                         expected,
                         actual: i64::try_from(group_order).unwrap_or(i64::MAX),
                     });
@@ -826,13 +1418,15 @@ fn assemble_snapshot(
                     .get_mut(&owner)
                     .expect("owner group_order 计数已建立") += 1;
                 let index = groups.len();
-                group_indexes.insert(key, index);
+                owner_group_indexes.insert(group_location_raw.clone(), index);
                 groups.push(GroupBuilder {
+                    owner,
+                    group_location_raw,
+                    group_order,
                     kind,
                     location: group_location,
                     recipes,
                     units: Vec::new(),
-                    claims: Vec::new(),
                 });
             }
             DecodedRecord::Unit {
@@ -857,17 +1451,18 @@ fn assemble_snapshot(
                         &source_context_json,
                     );
                 let index = group_indexes
-                    .get(&(owner.clone(), group_location_raw.clone()))
+                    .get(&owner)
+                    .and_then(|indexes| indexes.get(&group_location_raw))
                     .copied()
                     .ok_or(InvalidStandardWriteBackAssetSnapshot::MissingGroup {
-                        owner: owner.clone(),
+                        owner: owner.storage_name().to_owned(),
                         group_location: group_location_raw.clone(),
                     })?;
                 let group = &mut groups[index];
                 let expected = group.units.len();
                 if unit_order != expected {
                     return Err(InvalidStandardWriteBackAssetSnapshot::InvalidUnitOrder {
-                        owner,
+                        owner: owner.storage_name().to_owned(),
                         group_location: group_location_raw,
                         expected,
                         actual: i64::try_from(unit_order).unwrap_or(i64::MAX),
@@ -881,55 +1476,266 @@ fn assemble_snapshot(
             DecodedRecord::Claim {
                 owner,
                 group_location_raw,
-                lock,
+                access,
                 resource_key_raw,
-                access_raw,
             } => {
-                fingerprint_accumulators
-                    .get_mut(&owner)
-                    .expect("active owner 已在循环入口确认")
-                    .claim(&resource_key_raw, &access_raw, &group_location_raw);
                 let index = group_indexes
-                    .get(&(owner.clone(), group_location_raw.clone()))
+                    .get(&owner)
+                    .and_then(|indexes| indexes.get(&group_location_raw))
                     .copied()
-                    .ok_or(InvalidStandardWriteBackAssetSnapshot::MissingGroup {
-                        owner,
-                        group_location: group_location_raw,
+                    .ok_or_else(|| InvalidStandardWriteBackAssetSnapshot::MissingGroup {
+                        owner: owner.storage_name().to_owned(),
+                        group_location: group_location_raw.clone(),
                     })?;
-                groups[index].claims.push(lock);
+                let group = &groups[index];
+                stored_claim_summaries
+                    .entry(owner)
+                    .or_default()
+                    .push(EncodedMutationClaim::new(
+                        resource_key_raw,
+                        access,
+                        group_location_raw,
+                        group.group_order,
+                    ));
             }
         }
     }
 
-    for (owner_name, state) in &owner_states {
+    let mut logical_claims =
+        HashMap::<RpgMakerStandardAssetOwner, Vec<EncodedMutationClaim>>::new();
+    let mut validated_groups = Vec::with_capacity(groups.len());
+    for group in groups {
+        let group_location_raw = group.group_location_raw;
+        let group_order = group.group_order;
+        let owner = group.owner;
+        let group = StandardWriteBackGroup::from_recipes(
+            group.kind,
+            group.location,
+            group.units,
+            group.recipes,
+        )
+        .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidModel)?;
+        let owner_claims = logical_claims.entry(owner).or_default();
+        for lock in group.mutation_claims().locks() {
+            owner_claims.push(EncodedMutationClaim::new(
+                RpgMakerProjectionCodec::encode_mutation_resource(lock.resource())
+                    .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection)?,
+                lock.access(),
+                group_location_raw.clone(),
+                group_order,
+            ));
+        }
+        validated_groups.push(group);
+    }
+
+    let snapshot = StandardWriteBackSnapshot::new(validated_groups)
+        .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidModel)?;
+
+    for owner in STANDARD_WRITE_BACK_OWNER_ORDER {
+        let Some(state) = owner_states.get(&owner) else {
+            continue;
+        };
+        let owner_logical_claims = logical_claims.entry(owner).or_default();
+        sort_logical_claims(owner_logical_claims);
+        let stored_summary = stored_claim_summaries.entry(owner).or_default();
+        validate_claim_summary(owner, owner_logical_claims, stored_summary)?;
+
+        let accumulator = fingerprint_accumulators
+            .get_mut(&owner)
+            .expect("每个 active owner 都应建立指纹累加器");
+        for claim in owner_logical_claims.iter() {
+            accumulator.claim(
+                &claim.resource_key,
+                claim.access.storage_name(),
+                &claim.group_location,
+            );
+        }
         let actual = fingerprint_accumulators
-            .remove(owner_name)
+            .remove(&owner)
             .expect("每个 active owner 都应建立指纹累加器")
             .finish();
         if actual != state.asset_fingerprint {
             return Err(
                 InvalidStandardWriteBackAssetSnapshot::AssetFingerprintMismatch {
-                    owner: owner_name.clone(),
+                    owner: owner.storage_name().to_owned(),
                 },
             );
         }
     }
 
-    let groups = groups
-        .into_iter()
-        .map(|group| {
-            StandardWriteBackGroup::new(
-                group.kind,
-                group.location,
-                group.units,
-                group.recipes,
-                group.claims,
-            )
-            .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidModel)
+    Ok(snapshot)
+}
+
+fn validate_claim_summary(
+    owner: RpgMakerStandardAssetOwner,
+    logical_claims: &[EncodedMutationClaim],
+    actual: &[EncodedMutationClaim],
+) -> Result<(), InvalidStandardWriteBackAssetSnapshot> {
+    let mut expected = borrowed_collision_summary(logical_claims);
+    let mut row_index = 0;
+    loop {
+        let expected_row = expected
+            .next()
+            .transpose()
+            .expect("StandardWriteBackSnapshot 已验证 owner 内 Claim 不冲突");
+        let actual_row = actual.get(row_index);
+        let kind = if row_index > 0
+            && actual_row.is_some_and(|row| row.resource_key == actual[row_index - 1].resource_key)
+        {
+            ClaimSummaryMismatchKind::DuplicateResource
+        } else {
+            match (expected_row, actual_row) {
+                (Some(_), None) => ClaimSummaryMismatchKind::MissingRow,
+                (None, Some(_)) => ClaimSummaryMismatchKind::UnexpectedRow,
+                (Some(expected), Some(actual)) if expected.resource_key != actual.resource_key => {
+                    ClaimSummaryMismatchKind::Resource
+                }
+                (Some(expected), Some(actual)) if expected.access != actual.access => {
+                    ClaimSummaryMismatchKind::Access
+                }
+                (Some(expected), Some(actual))
+                    if expected.group_location != actual.group_location
+                        || expected.group_order != actual.group_order =>
+                {
+                    ClaimSummaryMismatchKind::Representative
+                }
+                (Some(_), Some(_)) => {
+                    row_index += 1;
+                    continue;
+                }
+                (None, None) => return Ok(()),
+            }
+        };
+        let expected_rows = collision_summary(logical_claims)
+            .expect("StandardWriteBackSnapshot 已验证 owner 内 Claim 不冲突")
+            .len();
+        let actual_resource = decode_actual_summary_resource(owner, actual_row)?;
+        return Err(claim_summary_mismatch(
+            owner,
+            row_index,
+            kind,
+            expected_rows,
+            actual,
+            ComparedClaimSummaryRows {
+                expected: expected_row,
+                actual: actual_row,
+            },
+            actual_resource,
+        ));
+    }
+}
+
+fn borrowed_collision_summary(
+    logical_claims: &[EncodedMutationClaim],
+) -> impl Iterator<Item = Result<&EncodedMutationClaim, MutationClaimSummaryError>> {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= logical_claims.len() {
+            return None;
+        }
+        let resource_key = logical_claims[start].resource_key.as_str();
+        let mut end = start + 1;
+        while end < logical_claims.len()
+            && logical_claims[end].resource_key.as_str() == resource_key
+        {
+            end += 1;
+        }
+        let claims = &logical_claims[start..end];
+        start = end;
+
+        let access = claims[0].access;
+        if claims.iter().any(|claim| claim.access != access) {
+            return Some(Err(MutationClaimSummaryError::MixedAccess {
+                resource_key: resource_key.to_owned(),
+            }));
+        }
+        let representative = match access {
+            MutationResourceAccess::Intent => claims
+                .iter()
+                .min_by(|left, right| {
+                    left.group_order
+                        .cmp(&right.group_order)
+                        .then_with(|| left.group_location.cmp(&right.group_location))
+                })
+                .expect("非空资源分组必须存在代表"),
+            MutationResourceAccess::Exclusive => {
+                if claims.len() != 1 {
+                    return Some(Err(MutationClaimSummaryError::MultipleExclusive {
+                        resource_key: resource_key.to_owned(),
+                    }));
+                }
+                &claims[0]
+            }
+        };
+        Some(Ok(representative))
+    })
+}
+
+struct ComparedClaimSummaryRows<'a> {
+    expected: Option<&'a EncodedMutationClaim>,
+    actual: Option<&'a EncodedMutationClaim>,
+}
+
+fn claim_summary_mismatch(
+    owner: RpgMakerStandardAssetOwner,
+    row_index: usize,
+    kind: ClaimSummaryMismatchKind,
+    expected_rows: usize,
+    actual_rows: &[EncodedMutationClaim],
+    compared: ComparedClaimSummaryRows<'_>,
+    actual_resource: Option<MutationResource>,
+) -> InvalidStandardWriteBackAssetSnapshot {
+    let decode_group = |claim: Option<&EncodedMutationClaim>| {
+        claim.map(|claim| {
+            RpgMakerLocationCodec::decode(&claim.group_location)
+                .expect("摘要 group_location 已在同一读取边界完成规范解码")
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    StandardWriteBackSnapshot::new(groups)
-        .map_err(InvalidStandardWriteBackAssetSnapshot::InvalidModel)
+    };
+    InvalidStandardWriteBackAssetSnapshot::InvalidClaimSummary {
+        owner: owner.storage_name().to_owned(),
+        row_index,
+        kind,
+        expected_rows,
+        actual_rows: actual_rows.len(),
+        details: Box::new(ClaimSummaryMismatchDetails {
+            expected_group: decode_group(compared.expected),
+            actual_group: decode_group(compared.actual),
+            expected_resource: decode_expected_summary_resource(compared.expected),
+            actual_resource,
+            expected_access: compared.expected.map(|claim| claim.access),
+            actual_access: compared.actual.map(|claim| claim.access),
+        }),
+    }
+}
+
+fn decode_expected_summary_resource(
+    claim: Option<&EncodedMutationClaim>,
+) -> Option<MutationResource> {
+    claim.map(|claim| {
+        RpgMakerProjectionCodec::decode_mutation_resource(&claim.resource_key)
+            .expect("重建的摘要 resource_key 必须是规范编码")
+    })
+}
+
+fn decode_actual_summary_resource(
+    owner: RpgMakerStandardAssetOwner,
+    claim: Option<&EncodedMutationClaim>,
+) -> Result<Option<MutationResource>, InvalidStandardWriteBackAssetSnapshot> {
+    let Some(claim) = claim else {
+        return Ok(None);
+    };
+    match RpgMakerProjectionCodec::decode_mutation_resource(&claim.resource_key) {
+        Ok(resource) => Ok(Some(resource)),
+        Err(RpgMakerProjectionCodecError::NonCanonical) => Err(
+            InvalidStandardWriteBackAssetSnapshot::NonCanonicalMutationResource {
+                owner: owner.storage_name().to_owned(),
+                group_location: claim.group_location.clone(),
+            },
+        ),
+        Err(source) => Err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection(
+            source,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1082,8 +1888,345 @@ fn map_query_error<Q, C>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
-    use crate::rpg_maker::model::ScalarFieldKey;
+    use crate::diagnostic::render_safe_diagnostic;
+    use crate::i18n::{UiLocale, UiLocalizer};
+    use crate::rpg_maker::model::{DirectTextPart, DirectTextRecipe, ScalarFieldKey};
+    use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource, StandardDataFile};
+    use rusqlite::params_from_iter;
+
+    fn diagnostic_surfaces(diagnostic: &SafeDiagnostic) -> (String, String) {
+        let json = serde_json::to_string(diagnostic).expect("安全诊断应可序列化");
+        let mut cli = Vec::new();
+        render_safe_diagnostic(
+            diagnostic,
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+            &mut cli,
+        )
+        .expect("安全诊断应可渲染");
+        (json, String::from_utf8(cli).expect("CLI 诊断应为 UTF-8"))
+    }
+
+    #[test]
+    fn write_back_snapshot_model_variants_keep_typed_facts_on_cli_and_jsonl() {
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let group_location =
+            RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(1)]);
+        let target = RpgMakerLocation::value(
+            source.clone(),
+            vec![
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("name"),
+            ],
+        );
+        let recipe_location = RpgMakerLocation::value(RpgMakerSource::map(2), Vec::new());
+        let scalar =
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("测试标量字段键应有效"));
+        let resource = MutationResource::Value {
+            source: source.clone(),
+            steps: vec![
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("name"),
+            ],
+        };
+        let cases = vec![
+            (
+                StandardWriteBackSnapshotError::BlankSourceContent {
+                    role: TextUnitRole::DialogueBody,
+                },
+                vec!["model_error=blank_source_content", "role=dialogue_body"],
+            ),
+            (
+                StandardWriteBackSnapshotError::BlankTranslationContent {
+                    role: scalar.clone(),
+                },
+                vec!["model_error=blank_translation_content", "role=scalar"],
+            ),
+            (
+                StandardWriteBackSnapshotError::ContentShapeMismatch {
+                    role: TextUnitRole::Choices,
+                },
+                vec!["model_error=content_shape_mismatch", "role=choices"],
+            ),
+            (
+                StandardWriteBackSnapshotError::EmptyLineContent {
+                    role: TextUnitRole::ScrollingText,
+                    column: "source_content",
+                },
+                vec![
+                    "model_error=empty_line_content",
+                    "role=scrolling_text",
+                    "source_content",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::InvalidContentLine {
+                    role: TextUnitRole::DialogueBody,
+                    column: "translation_content",
+                    line_index: 3,
+                },
+                vec![
+                    "model_error=invalid_content_line",
+                    "role=dialogue_body",
+                    "line_index=3",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::AlignedLineCountMismatch {
+                    role: TextUnitRole::DialogueBody,
+                    expected: 2,
+                    actual: 5,
+                },
+                vec![
+                    "model_error=aligned_line_count_mismatch",
+                    "expected=2",
+                    "actual=5",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::AlignedBlankLineMismatch {
+                    role: TextUnitRole::Choices,
+                    line_index: 4,
+                },
+                vec![
+                    "model_error=aligned_blank_line_mismatch",
+                    "role=choices",
+                    "line_index=4",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::EmptyProjection {
+                    group_location: Box::new(group_location.clone()),
+                },
+                vec!["model_error=empty_projection", "data/Items.json[1]"],
+            ),
+            (
+                StandardWriteBackSnapshotError::InvalidRole {
+                    kind: TextGroupKind::EventDialogue,
+                    role: scalar.clone(),
+                },
+                vec![
+                    "model_error=invalid_role",
+                    "group_kind=event_dialogue",
+                    "role=scalar",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::DuplicateRole {
+                    group_location: Box::new(group_location.clone()),
+                    role: TextUnitRole::DialogueSpeaker,
+                },
+                vec![
+                    "model_error=duplicate_role",
+                    "role=dialogue_speaker",
+                    "data/Items.json[1]",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::RecipeRoleMismatch {
+                    group_location: Box::new(group_location.clone()),
+                    units: BTreeSet::from([TextUnitRole::DialogueBody]),
+                    recipes: BTreeSet::from([TextUnitRole::DialogueSpeaker]),
+                },
+                vec![
+                    "model_error=recipe_role_mismatch",
+                    "unit_roles=dialogue_body",
+                    "recipe_roles=dialogue_speaker",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::RecipeLineMismatch {
+                    group_location: Box::new(group_location.clone()),
+                    role: TextUnitRole::ScrollingText,
+                },
+                vec!["model_error=recipe_line_mismatch", "role=scrolling_text"],
+            ),
+            (
+                StandardWriteBackSnapshotError::RecipeClaimMismatch {
+                    group_location: Box::new(group_location.clone()),
+                },
+                vec!["model_error=recipe_claim_mismatch", "data/Items.json[1]"],
+            ),
+            (
+                StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                    group_location: Box::new(group_location.clone()),
+                    target: Box::new(target.clone()),
+                },
+                vec![
+                    "model_error=recipe_does_not_rebuild_original",
+                    "target=data/Items.json[1].name",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::MutationClaimConflict {
+                    resource: Box::new(resource.clone()),
+                },
+                vec![
+                    "model_error=mutation_claim_conflict",
+                    "resource=data/Items.json[1].name",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::MismatchedClaimSource {
+                    group_location: Box::new(group_location.clone()),
+                    claim: Box::new(MutationClaim::Value(target.clone())),
+                },
+                vec![
+                    "model_error=mismatched_claim_source",
+                    "claim_kind=value",
+                    "claim_location=data/Items.json[1].name",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::MismatchedClaimResourceSource {
+                    group_location: Box::new(group_location.clone()),
+                    resource: Box::new(resource),
+                },
+                vec![
+                    "model_error=mismatched_claim_resource_source",
+                    "resource=data/Items.json[1].name",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::InvalidDialogueProjection {
+                    group_location: Box::new(group_location.clone()),
+                },
+                vec![
+                    "model_error=invalid_dialogue_projection",
+                    "data/Items.json[1]",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::InvalidScrollingProjection {
+                    group_location: Box::new(group_location.clone()),
+                },
+                vec![
+                    "model_error=invalid_scrolling_projection",
+                    "data/Items.json[1]",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::InvalidScrollingRecipe {
+                    group_location: Box::new(group_location.clone()),
+                },
+                vec!["model_error=invalid_scrolling_recipe", "data/Items.json[1]"],
+            ),
+            (
+                StandardWriteBackSnapshotError::InvalidChoicesProjection {
+                    group_location: Box::new(group_location.clone()),
+                },
+                vec![
+                    "model_error=invalid_choices_projection",
+                    "data/Items.json[1]",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::InvalidDirectProjection {
+                    group_location: Box::new(group_location.clone()),
+                },
+                vec![
+                    "model_error=invalid_direct_projection",
+                    "data/Items.json[1]",
+                ],
+            ),
+            (
+                StandardWriteBackSnapshotError::MismatchedDialogueGroup {
+                    group_location: Box::new(group_location),
+                    recipe_location: Box::new(recipe_location),
+                },
+                vec![
+                    "model_error=mismatched_dialogue_group",
+                    "recipe_location=data/Map002.json",
+                ],
+            ),
+        ];
+
+        for (source, expected_facts) in cases {
+            let diagnostic =
+                InvalidStandardWriteBackAssetSnapshot::InvalidModel(source).safe_diagnostic();
+            assert_eq!(diagnostic.code, DiagnosticCode::WriteBackAssetRead);
+            assert_eq!(diagnostic.stage, DiagnosticStage::WriteBack);
+            assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
+            assert_eq!(diagnostic.action, DiagnosticAction::CheckProjectState);
+            let (json, cli) = diagnostic_surfaces(&diagnostic);
+            for fact in expected_facts {
+                assert!(json.contains(fact), "JSONL 缺少 {fact}: {json}");
+                assert!(cli.contains(fact), "CLI 缺少 {fact}: {cli}");
+            }
+        }
+    }
+
+    #[test]
+    fn write_back_snapshot_typed_sources_keep_safe_facts_without_leaking_body_text() {
+        const SECRET: &str = "SENTINEL_WRITE_BACK_SNAPSHOT_BODY_329c";
+
+        let pcre_source = pcre2::bytes::RegexBuilder::new()
+            .build(&format!("(?<{SECRET}"))
+            .expect_err("测试 PCRE2 应无效");
+        let dialogue = InvalidStandardWriteBackAssetSnapshot::InvalidDialogueDefinition(Box::new(
+            MvDialogueDefinitionError::InvalidPattern {
+                rule_number: 7,
+                source: pcre_source,
+            },
+        ))
+        .safe_diagnostic();
+        let location = InvalidStandardWriteBackAssetSnapshot::InvalidLocation(
+            RpgMakerLocationCodecError::InvalidDataFile(SECRET.to_owned()),
+        )
+        .safe_diagnostic();
+        let projection = InvalidStandardWriteBackAssetSnapshot::InvalidProjection(
+            RpgMakerProjectionCodecError::Projection(
+                crate::rpg_maker::model::ProjectionModelError::NonContiguousDialogueBodyLines {
+                    expected: 2,
+                    actual: 5,
+                },
+            ),
+        )
+        .safe_diagnostic();
+        let invalid_json = format!("{{\"{SECRET}\":");
+        let unit_content = InvalidStandardWriteBackAssetSnapshot::InvalidUnitContent {
+            column: "translation_content_json",
+            source: serde_json::from_str::<serde_json::Value>(&invalid_json)
+                .expect_err("测试 JSON 应不完整"),
+        }
+        .safe_diagnostic();
+
+        for (diagnostic, expected_facts) in [
+            (
+                dialogue,
+                &["rule_number=7", "engine=pcre2", "code=", "offset="][..],
+            ),
+            (location, &["codec=location", "kind=invalid_data_file"][..]),
+            (
+                projection,
+                &[
+                    "codec=projection",
+                    "structure=non_contiguous_dialogue_body_lines",
+                    "expected=2",
+                    "actual=5",
+                ][..],
+            ),
+            (
+                unit_content,
+                &[
+                    "unit_content_json_invalid",
+                    "json_category=eof",
+                    "json_line=1",
+                    "json_column=",
+                ][..],
+            ),
+        ] {
+            let (json, cli) = diagnostic_surfaces(&diagnostic);
+            assert!(!json.contains(SECRET), "JSONL 泄漏了正文：{json}");
+            assert!(!cli.contains(SECRET), "CLI 泄漏了正文：{cli}");
+            for fact in expected_facts {
+                assert!(json.contains(fact), "JSONL 缺少 {fact}: {json}");
+                assert!(cli.contains(fact), "CLI 缺少 {fact}: {cli}");
+            }
+        }
+    }
 
     fn owner_row(source: [u8; 32], asset: [u8; 32]) -> SqliteRow {
         SqliteRow::new(vec![
@@ -1100,6 +2243,130 @@ mod tests {
             units: Vec::new(),
             claims: Vec::new(),
         }
+    }
+
+    fn scalar_snapshot_rows(indices: &[usize]) -> SnapshotRows {
+        const OWNER: RpgMakerStandardAssetOwner = RpgMakerStandardAssetOwner::Builtin;
+        const SOURCE_TEXT: &str = "原文";
+        const DIALOGUE_DEFINITION: &str = "{\"rules\":[]}";
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let role = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法"));
+        let role_raw = RpgMakerProjectionCodec::encode_role(&role).expect("角色应可编码");
+        let source_content_json =
+            serde_json::to_string(&TextUnitContent::Value(SOURCE_TEXT.to_owned()))
+                .expect("源内容应可编码");
+        let mut groups = Vec::new();
+        let mut units = Vec::new();
+        let mut logical_claims = Vec::new();
+        let mut fingerprint_rows = FingerprintRows::default();
+
+        for (group_order, index) in indices.iter().copied().enumerate() {
+            let group_location =
+                RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(index)]);
+            let target = RpgMakerLocation::value(
+                source.clone(),
+                vec![
+                    RpgMakerLocationStep::index(index),
+                    RpgMakerLocationStep::key("name"),
+                ],
+            );
+            let recipes = vec![TextProjectionRecipe::Direct(
+                DirectTextRecipe::new(
+                    target,
+                    SOURCE_TEXT,
+                    vec![DirectTextPart::TextSlot { role: role.clone() }],
+                )
+                .expect("直接配方应合法"),
+            )];
+            let group_location_raw =
+                RpgMakerLocationCodec::encode(&group_location).expect("组位置应可编码");
+            let recipes_raw =
+                RpgMakerProjectionCodec::encode_recipes(&recipes).expect("配方应可编码");
+            groups.push(SqliteRow::new(vec![
+                SqliteValue::Text(OWNER.storage_name().to_owned()),
+                SqliteValue::Text(group_location_raw.clone()),
+                SqliteValue::Integer(i64::try_from(group_order).expect("顺序应可编码")),
+                SqliteValue::Text("database_entry".to_owned()),
+                SqliteValue::Text(recipes_raw.clone()),
+            ]));
+            units.push(SqliteRow::new(vec![
+                SqliteValue::Text(OWNER.storage_name().to_owned()),
+                SqliteValue::Text(group_location_raw.clone()),
+                SqliteValue::Text(role_raw.clone()),
+                SqliteValue::Integer(0),
+                SqliteValue::Text(source_content_json.clone()),
+                SqliteValue::Text("{}".to_owned()),
+                SqliteValue::Null,
+            ]));
+            fingerprint_rows.groups.push((
+                group_location_raw.clone(),
+                group_order,
+                "database_entry".to_owned(),
+                recipes_raw,
+            ));
+            fingerprint_rows.units.push((
+                group_location_raw.clone(),
+                role_raw.clone(),
+                0,
+                source_content_json.clone(),
+                "{}".to_owned(),
+            ));
+            let claims =
+                mutation_claims_for_group(TextGroupKind::DatabaseEntry, &group_location, &recipes)
+                    .expect("测试组 Claim 应合法");
+            for lock in claims.locks() {
+                logical_claims.push(EncodedMutationClaim::new(
+                    RpgMakerProjectionCodec::encode_mutation_resource(lock.resource())
+                        .expect("资源应可编码"),
+                    lock.access(),
+                    group_location_raw.clone(),
+                    group_order,
+                ));
+            }
+        }
+
+        sort_logical_claims(&mut logical_claims);
+        fingerprint_rows.claims = logical_claims
+            .iter()
+            .map(|claim| {
+                (
+                    claim.resource_key.clone(),
+                    claim.access.storage_name().to_owned(),
+                    claim.group_location.clone(),
+                )
+            })
+            .collect();
+        let claims = collision_summary(&logical_claims)
+            .expect("测试 Claim 应可建立摘要")
+            .into_iter()
+            .map(|claim| {
+                SqliteRow::new(vec![
+                    SqliteValue::Text(OWNER.storage_name().to_owned()),
+                    SqliteValue::Text(claim.group_location),
+                    SqliteValue::Text(claim.resource_key),
+                    SqliteValue::Text(claim.access.storage_name().to_owned()),
+                ])
+            })
+            .collect();
+        let fingerprint = snapshot_fingerprint(OWNER, fingerprint_rows, DIALOGUE_DEFINITION);
+        SnapshotRows {
+            owners: vec![owner_row([1; 32], *fingerprint.as_bytes())],
+            groups,
+            units,
+            claims,
+        }
+    }
+
+    fn assemble_test_rows(
+        rows: SnapshotRows,
+    ) -> Result<StandardWriteBackSnapshot, InvalidStandardWriteBackAssetSnapshot> {
+        let prepared = prepare_rows(rows, SourceSnapshotFingerprint::from_bytes([1; 32]))?;
+        let records = prepared
+            .records
+            .into_iter()
+            .map(decode_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        assemble_snapshot(prepared.owner_states, records, "{\"rules\":[]}")
     }
 
     #[test]
@@ -1141,7 +2408,10 @@ mod tests {
                     access TEXT NOT NULL,
                     PRIMARY KEY (owner, group_location, resource_key)
                 );
+                CREATE INDEX standard_mutation_claim_owner_resource_idx
+                    ON standard_mutation_claim(owner, resource_key, access, group_location);
 
+                INSERT INTO standard_asset_owner_state VALUES ('lua', zeroblob(32), zeroblob(32));
                 INSERT INTO standard_asset_owner_state VALUES ('rules', zeroblob(32), zeroblob(32));
                 INSERT INTO standard_asset_owner_state VALUES ('builtin', zeroblob(32), zeroblob(32));
                 INSERT INTO standard_text_group VALUES ('builtin', 'group-b', 1, 'map', '[]');
@@ -1162,32 +2432,32 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("owner 行应可读取");
         let groups = connection
-            .prepare(READ_STANDARD_WRITE_BACK_GROUPS)
+            .prepare(READ_STANDARD_WRITE_BACK_OWNER_GROUPS)
             .expect("group 查询应可建立")
-            .query_map([], |row| row.get::<_, String>(1))
+            .query_map(["builtin"], |row| row.get::<_, String>(1))
             .expect("group 查询应可执行")
             .collect::<Result<Vec<_>, _>>()
             .expect("group 行应可读取");
         let units = connection
-            .prepare(READ_STANDARD_WRITE_BACK_UNITS)
+            .prepare(READ_STANDARD_WRITE_BACK_OWNER_UNITS)
             .expect("unit 查询应可建立")
-            .query_map([], |row| {
+            .query_map(["builtin"], |row| {
                 Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
             })
             .expect("unit 查询应可执行")
             .collect::<Result<Vec<_>, _>>()
             .expect("unit 行应可读取");
         let claims = connection
-            .prepare(READ_STANDARD_WRITE_BACK_CLAIMS)
+            .prepare(READ_STANDARD_WRITE_BACK_OWNER_CLAIMS)
             .expect("Claim 查询应可建立")
-            .query_map([], |row| {
+            .query_map(["builtin"], |row| {
                 Ok((row.get::<_, String>(2)?, row.get::<_, String>(3)?))
             })
             .expect("Claim 查询应可执行")
             .collect::<Result<Vec<_>, _>>()
             .expect("Claim 行应可读取");
 
-        assert_eq!(owners, ["builtin", "rules"]);
+        assert_eq!(owners, ["builtin", "rules", "lua"]);
         assert_eq!(groups, ["group-a", "group-b"]);
         assert_eq!(
             units,
@@ -1203,10 +2473,44 @@ mod tests {
                 ("resource-z".to_owned(), "exclusive".to_owned()),
             ]
         );
+
+        let queries = standard_write_back_snapshot_queries();
+        assert_eq!(queries.len(), STANDARD_WRITE_BACK_QUERY_RESULT_COUNT);
+        let (owner_query, partition_queries) = queries
+            .split_first()
+            .expect("写回快照查询至少包含 owner 状态");
+        assert!(
+            owner_query.statement().contains("CASE owner"),
+            "至多三行的 owner 状态查询必须恢复 Builtin、Rules、Lua 规范顺序"
+        );
+        assert!(
+            partition_queries
+                .iter()
+                .all(|query| !query.statement().contains("CASE owner"))
+        );
+        for query in partition_queries {
+            let explain = format!("EXPLAIN QUERY PLAN {}", query.statement());
+            let mut statement = connection.prepare(&explain).expect("查询计划应可建立");
+            let details = statement
+                .query_map(
+                    params_from_iter(query.parameters().iter().map(|parameter| match parameter {
+                        SqliteValue::Text(value) => value.as_str(),
+                        _ => unreachable!("窄查询只携带 owner 文本参数"),
+                    })),
+                    |row| row.get::<_, String>(3),
+                )
+                .expect("查询计划应可执行")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("查询计划应可读取");
+            assert!(
+                details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+                "owner 窄查询不得建立全表临时排序：{details:?}"
+            );
+        }
     }
 
     #[test]
-    fn prepare_rows_moves_asset_rows_into_natural_order_batches() {
+    fn prepare_rows_moves_asset_rows_into_indexed_natural_order_work() {
         let mut pointers = Vec::new();
         let mut make_row = |label: &str, columns: usize| {
             let owner = label.to_owned();
@@ -1223,18 +2527,14 @@ mod tests {
             claims: vec![make_row("claim-0", 4)],
         };
 
-        let prepared = prepare_rows(rows, SourceSnapshotFingerprint::from_bytes([1; 32]), 2)
-            .expect("非 owner 行只应按所有权分批");
+        let prepared = prepare_rows(rows, SourceSnapshotFingerprint::from_bytes([1; 32]))
+            .expect("非 owner 行应保留自然顺序并进入 indexed CPU 工作集");
 
-        assert_eq!(
-            prepared.batches.iter().map(Vec::len).collect::<Vec<_>>(),
-            [2, 2, 1]
-        );
+        assert_eq!(prepared.records.len(), 5);
         assert_eq!(
             prepared
-                .batches
+                .records
                 .iter()
-                .flatten()
                 .map(|row| match row {
                     SnapshotAssetRow::Group(row)
                     | SnapshotAssetRow::Unit(row)
@@ -1249,9 +2549,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_record_moves_owned_text_out_of_sqlite_values() {
+    fn decode_record_compacts_owner_and_moves_large_payload_text_out_of_sqlite_values() {
         let owner = "builtin".to_owned();
-        let owner_pointer = owner.as_ptr();
         let group_location = RpgMakerLocationCodec::encode(&RpgMakerLocation::value(
             crate::rpg_maker::text::RpgMakerSource::map(1),
             vec![crate::rpg_maker::text::RpgMakerLocationStep::key("name")],
@@ -1292,7 +2591,7 @@ mod tests {
             panic!("测试行应解码为 unit")
         };
 
-        assert_eq!(owner.as_ptr(), owner_pointer);
+        assert_eq!(owner, RpgMakerStandardAssetOwner::Builtin);
         assert_eq!(group_location_raw.as_ptr(), group_location_pointer);
         assert_eq!(role_raw.as_ptr(), role_pointer);
         assert_eq!(source_content_json.as_ptr(), source_content_json_pointer);
@@ -1307,7 +2606,6 @@ mod tests {
         let stale = prepare_rows(
             snapshot_rows(vec![owner_row([1; 32], [2; 32])]),
             SourceSnapshotFingerprint::from_bytes([9; 32]),
-            16,
         )
         .expect("owner 行应可解码");
         assert_eq!(stale.stale_owners, [RpgMakerStandardAssetOwner::Builtin]);
@@ -1315,7 +2613,6 @@ mod tests {
         let prepared = prepare_rows(
             snapshot_rows(vec![owner_row([1; 32], [2; 32])]),
             SourceSnapshotFingerprint::from_bytes([1; 32]),
-            16,
         )
         .expect("owner 行应可解码");
         assert!(matches!(
@@ -1337,7 +2634,6 @@ mod tests {
         let prepared = prepare_rows(
             snapshot_rows(vec![owner_row([1; 32], *valid_fingerprint.as_bytes())]),
             SourceSnapshotFingerprint::from_bytes([1; 32]),
-            16,
         )
         .expect("owner 行应可解码");
         assemble_snapshot(prepared.owner_states, Vec::new(), DIALOGUE_DEFINITION)
@@ -1359,6 +2655,225 @@ mod tests {
         ]);
         assert!(matches!(
             decode_group(row),
+            Err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection(_))
+        ));
+    }
+
+    #[test]
+    fn write_back_rebuilds_full_claims_and_accepts_the_earliest_intent_summary() {
+        let rows = scalar_snapshot_rows(&[9, 1]);
+        assert!(
+            rows.claims.len() < 6,
+            "共享来源根 Intent 必须在持久层折叠，而不是保存两组的完整 locks"
+        );
+
+        assemble_test_rows(rows).expect("合法冲突摘要应可重建完整写回快照");
+    }
+
+    #[test]
+    fn damaged_claim_summary_reports_the_exact_mismatch_kind() {
+        let mut missing = scalar_snapshot_rows(&[9, 1]);
+        missing.claims.pop();
+        assert!(matches!(
+            assemble_test_rows(missing),
+            Err(InvalidStandardWriteBackAssetSnapshot::InvalidClaimSummary {
+                kind: ClaimSummaryMismatchKind::MissingRow,
+                ..
+            })
+        ));
+
+        let mut duplicate = scalar_snapshot_rows(&[9, 1]);
+        let duplicated = duplicate.claims[0].clone();
+        duplicate.claims.insert(1, duplicated);
+        assert!(matches!(
+            assemble_test_rows(duplicate),
+            Err(InvalidStandardWriteBackAssetSnapshot::InvalidClaimSummary {
+                kind: ClaimSummaryMismatchKind::DuplicateResource,
+                ..
+            })
+        ));
+
+        let mut wrong_access = scalar_snapshot_rows(&[9, 1]);
+        let row_index = wrong_access
+            .claims
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.values(),
+                    [_, _, _, SqliteValue::Text(access)] if access == "intent"
+                )
+            })
+            .expect("测试摘要应包含 Intent");
+        let mut values = wrong_access.claims[row_index].clone().into_values();
+        values[3] = SqliteValue::Text("exclusive".to_owned());
+        wrong_access.claims[row_index] = SqliteRow::new(values);
+        assert!(matches!(
+            assemble_test_rows(wrong_access),
+            Err(InvalidStandardWriteBackAssetSnapshot::InvalidClaimSummary {
+                kind: ClaimSummaryMismatchKind::Access,
+                ..
+            })
+        ));
+
+        let mut wrong_representative = scalar_snapshot_rows(&[9, 1]);
+        let second_group = match &wrong_representative.groups[1].values()[1] {
+            SqliteValue::Text(value) => value.clone(),
+            _ => unreachable!("group_location 必须为 TEXT"),
+        };
+        let root_resource =
+            RpgMakerProjectionCodec::encode_mutation_resource(&MutationResource::Value {
+                source: RpgMakerSource::data(StandardDataFile::Items),
+                steps: Vec::new(),
+            })
+            .expect("根资源应可编码");
+        let row_index = wrong_representative
+            .claims
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.values(),
+                    [_, _, SqliteValue::Text(resource), _] if resource == &root_resource
+                )
+            })
+            .expect("测试摘要应包含共享根 Intent");
+        let mut values = wrong_representative.claims[row_index].clone().into_values();
+        values[1] = SqliteValue::Text(second_group);
+        wrong_representative.claims[row_index] = SqliteRow::new(values);
+        assert!(matches!(
+            assemble_test_rows(wrong_representative),
+            Err(InvalidStandardWriteBackAssetSnapshot::InvalidClaimSummary {
+                kind: ClaimSummaryMismatchKind::Representative,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn claim_summary_diagnostic_exposes_human_resources_without_compact_json() {
+        let mut rows = scalar_snapshot_rows(&[9, 1]);
+        rows.claims.pop();
+        let error = assemble_test_rows(rows).expect_err("缺少摘要行必须失败");
+        let diagnostic =
+            serde_json::to_string(&error.safe_diagnostic()).expect("安全诊断应可序列化");
+
+        assert!(diagnostic.contains("expected_resource=data/Items.json"));
+        assert!(!diagnostic.contains("[\\\"v\\\""));
+    }
+
+    #[test]
+    fn collision_summary_validation_borrows_the_earliest_representative() {
+        let mut claims = vec![
+            EncodedMutationClaim::new(
+                "resource".to_owned(),
+                MutationResourceAccess::Intent,
+                "group-a".to_owned(),
+                8,
+            ),
+            EncodedMutationClaim::new(
+                "resource".to_owned(),
+                MutationResourceAccess::Intent,
+                "group-z".to_owned(),
+                2,
+            ),
+        ];
+        sort_logical_claims(&mut claims);
+        let earliest = claims
+            .iter()
+            .find(|claim| claim.group_order == 2)
+            .expect("测试 Claim 应包含最早自然组");
+
+        let representative = borrowed_collision_summary(&claims)
+            .next()
+            .expect("测试摘要应包含一行")
+            .expect("测试 Claim 不应冲突");
+
+        assert!(std::ptr::eq(representative, earliest));
+    }
+
+    #[test]
+    fn claim_summary_validation_consumes_sql_order_without_resorting() {
+        let mut rows = scalar_snapshot_rows(&[9, 1]);
+        assert!(rows.claims.len() >= 2, "测试摘要至少需要两行");
+        rows.claims.swap(0, 1);
+
+        assert!(matches!(
+            assemble_test_rows(rows),
+            Err(InvalidStandardWriteBackAssetSnapshot::InvalidClaimSummary {
+                kind: ClaimSummaryMismatchKind::Resource,
+                row_index: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn later_duplicate_claim_does_not_hide_an_earlier_access_mismatch() {
+        let mut rows = scalar_snapshot_rows(&[9, 1]);
+        assert!(rows.claims.len() >= 2, "测试摘要至少需要两行");
+        let duplicated = rows.claims.last().expect("测试摘要必须有末行").clone();
+        rows.claims.push(duplicated);
+
+        let mut first = rows.claims[0].clone().into_values();
+        let SqliteValue::Text(access) = &mut first[3] else {
+            unreachable!("access 必须为 TEXT")
+        };
+        *access = match access.as_str() {
+            "intent" => "exclusive".to_owned(),
+            "exclusive" => "intent".to_owned(),
+            other => unreachable!("测试 access 无效：{other}"),
+        };
+        rows.claims[0] = SqliteRow::new(first);
+
+        assert!(matches!(
+            assemble_test_rows(rows),
+            Err(InvalidStandardWriteBackAssetSnapshot::InvalidClaimSummary {
+                kind: ClaimSummaryMismatchKind::Access,
+                row_index: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn claim_resource_decode_is_deferred_until_the_first_summary_mismatch() {
+        let mut rows = scalar_snapshot_rows(&[1]);
+        let mut values = rows.claims[0].clone().into_values();
+        let SqliteValue::Text(resource) = &mut values[2] else {
+            unreachable!("resource_key 必须为 TEXT")
+        };
+        *resource = format!(" {resource} ");
+        rows.claims[0] = SqliteRow::new(values);
+
+        assert!(matches!(
+            decode_claim(rows.claims[0].clone()),
+            Ok(DecodedRecord::Claim {
+                resource_key_raw,
+                ..
+            }) if resource_key_raw.starts_with(' ')
+        ));
+        match assemble_test_rows(rows) {
+            Err(InvalidStandardWriteBackAssetSnapshot::NonCanonicalMutationResource { .. }) => {}
+            Err(error) => panic!("实际错误：{error:?}"),
+            Ok(_) => panic!("非规范 resource_key 不得成功"),
+        }
+    }
+
+    #[test]
+    fn invalid_claim_resource_keeps_projection_error_after_lazy_decode() {
+        let mut rows = scalar_snapshot_rows(&[1]);
+        let mut values = rows.claims[0].clone().into_values();
+        values[2] = SqliteValue::Text("!".to_owned());
+        rows.claims[0] = SqliteRow::new(values);
+
+        assert!(matches!(
+            decode_claim(rows.claims[0].clone()),
+            Ok(DecodedRecord::Claim {
+                resource_key_raw,
+                ..
+            }) if resource_key_raw == "!"
+        ));
+        assert!(matches!(
+            assemble_test_rows(rows),
             Err(InvalidStandardWriteBackAssetSnapshot::InvalidProjection(_))
         ));
     }

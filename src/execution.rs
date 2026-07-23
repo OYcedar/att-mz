@@ -5,22 +5,56 @@ pub(crate) mod cpu;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tokio::sync::watch;
+
 /// 由进程边界发出、由业务阶段边界观察的单向取消事实。
 ///
 /// 取消一旦请求便不会恢复。它只阻止尚未派生的工作；已经被根接管的副作用仍由
 /// 相应根能力运行到明确终态。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct CooperativeCancellation {
-    requested: Arc<AtomicBool>,
+    state: Arc<CooperativeCancellationState>,
+}
+
+struct CooperativeCancellationState {
+    requested: AtomicBool,
+    notification: watch::Sender<bool>,
+}
+
+impl Default for CooperativeCancellation {
+    fn default() -> Self {
+        let (notification, _) = watch::channel(false);
+        Self {
+            state: Arc::new(CooperativeCancellationState {
+                requested: AtomicBool::new(false),
+                notification,
+            }),
+        }
+    }
 }
 
 impl CooperativeCancellation {
     pub(crate) fn request(&self) {
-        self.requested.store(true, Ordering::Release);
+        if !self.state.requested.swap(true, Ordering::AcqRel) {
+            self.state.notification.send_replace(true);
+        }
     }
 
     pub(crate) fn is_requested(&self) -> bool {
-        self.requested.load(Ordering::Acquire)
+        self.state.requested.load(Ordering::Acquire)
+    }
+
+    /// 等待首次取消请求；订阅发生在检查之前，不会丢失并发通知。
+    pub(crate) async fn cancelled(&self) {
+        let mut notification = self.state.notification.subscribe();
+        loop {
+            if *notification.borrow_and_update() {
+                return;
+            }
+            if notification.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -45,6 +79,23 @@ mod tests {
 
         assert!(first.is_requested());
         assert!(second.is_requested());
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_existing_and_late_waiters() {
+        let cancellation = CooperativeCancellation::default();
+        let waiting = cancellation.clone();
+        let waiter = tokio::spawn(async move { waiting.cancelled().await });
+
+        tokio::task::yield_now().await;
+        cancellation.request();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("取消应立即唤醒既有等待者")
+            .expect("取消等待任务不应 panic");
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancellation.cancelled())
+            .await
+            .expect("取消后的等待者应立即返回");
     }
 
     #[test]

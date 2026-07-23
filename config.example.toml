@@ -6,108 +6,21 @@ root = "prompts"
 locale = "auto"
 thinking_output = false
 
-[runtime.async]
-worker_threads = 4
-max_blocking_threads = 8
-blocking_thread_keep_alive_ms = 1000
-
-[runtime.cpu]
-worker_threads = "auto"
-queue_capacity = 64
-
-[runtime.filesystem]
-worker_threads = 4
-queue_capacity = 64
-max_read_bytes = 67108864
-max_directory_entries = 100000
-
-[runtime.filesystem.tree]
-max_entries = 500000
-max_depth = 128
-max_bytes = 8589934592
-max_single_file_bytes = 1073741824
-
-[runtime.filesystem.project_lock]
-timeout_ms = 30000
-
-[runtime.filesystem.publisher]
-max_recovery_artifacts_per_target = 16
-target_lock_timeout_ms = 30000
-
-[runtime.sqlite]
-short_worker_threads = 4
-short_queue_capacity = 128
-max_open_connections = 16
-worker_stack_bytes = 4194304
-max_statement_bytes = 1048576
-max_parameter_bytes = 16777216
-max_rows_per_query = 200000
-max_result_bytes_per_query = 134217728
-busy_timeout_ms = 10000
-journal_mode = "wal"
-synchronous = "full"
-
-[runtime.llm]
-max_active_requests = 8
-queue_capacity = 64
-admission_timeout_ms = 30000
-connect_timeout_ms = 15000
-read_timeout_ms = 120000
-pool_idle_timeout_ms = 30000
-pool_max_idle_per_host = 8
-proxy = false
-
-[runtime.llm.tls]
-additional_pem_files = []
-
-[runtime.lua]
-worker_stack_bytes = 8388608
-memory_limit_bytes_per_vm = 134217728
-cancel_check_instruction_interval = 10000
-max_error_bytes = 65536
-
-[runtime.lua.host_values]
-max_bytes = 67108864
-max_nodes = 1000000
-max_depth = 128
-
-[observability]
-root = "logs"
-
-[observability.log]
-level = "info"
-queue_capacity = 1024
-batch_max_records = 64
-batch_max_bytes = 1048576
-flush_interval_ms = 100
-shutdown_timeout_ms = 2000
-lock_timeout_ms = 1000
-max_record_bytes = 262144
-max_file_bytes = 67108864
-retained_rotated_files = 4
-
 [llm.clients.primary]
 url = "https://api.example.com/v1/chat/completions"
 api_key = "replace-with-api-key"
 model = "replace-with-model-id"
-timeout_ms = 120000
-rpm = 60
-burst = 8
+max_concurrent_requests = 8
+connect_timeout_ms = 15000
+read_timeout_ms = 120000
+request_timeout_ms = 120000
+proxy = false
+additional_pem_files = []
+retry_delays_ms = [500, 1500, 5000]
+max_retry_after_ms = 30000
 parameters = '''
 {}
 '''
-
-[rpg_maker.document]
-read_concurrency = 8
-
-[rpg_maker.standard_asset]
-units_per_decode_job = 512
-
-[rpg_maker.extract.store]
-groups_per_encode_job = 256
-
-[rpg_maker.translate.store]
-units_per_encode_job = 512
 
 [[languages]]
 type = "japanese"
@@ -129,11 +42,4 @@ allowed_terms = []
 [[rpg_maker.translation_profiles]]
 id = "primary"
 llm_client = "primary"
-max_in_flight_tasks = 4
-
-[rpg_maker.translation_profiles.planning]
-max_message_characters = 24000
-
-[rpg_maker.translation_profiles.execution]
-network_retry_delays_ms = [500, 1500, 5000]
-max_network_retry_after_ms = 30000
+max_task_message_characters = 24000

@@ -11,16 +11,19 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Client, Proxy, StatusCode, redirect};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::{Semaphore, watch};
-use tokio::time::{Instant, timeout_at};
 use url::Url;
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic,
+};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::llm::{
-    ChatMessage, ChatMessageRole, LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError,
-    LlmRequestExecutor, LlmResponse, LlmUsage,
+    ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
+    LlmRequestError, LlmRequestExecutor, LlmResponse, LlmUsage,
 };
 
 /// 一个可被不同引擎及 Lua 共享的受信 LLM Client。
@@ -28,9 +31,10 @@ pub(crate) struct OpenAiChatCompletionClient {
     url: Url,
     api_key: SecretString,
     model: String,
-    timeout: Duration,
+    max_concurrent_requests: NonZeroUsize,
+    request_timeout: Duration,
     parameters: Map<String, Value>,
-    rate_limiter: Arc<DefaultDirectRateLimiter>,
+    rate_limiter: Option<Arc<DefaultDirectRateLimiter>>,
 }
 
 impl OpenAiChatCompletionClient {
@@ -38,19 +42,24 @@ impl OpenAiChatCompletionClient {
         url: Url,
         api_key: SecretString,
         model: impl Into<String>,
-        timeout: Duration,
-        rpm: NonZeroU32,
-        burst: NonZeroU32,
+        max_concurrent_requests: NonZeroUsize,
+        request_timeout: Duration,
+        rate_limit: Option<(NonZeroU32, NonZeroU32)>,
         parameters: Map<String, Value>,
     ) -> Self {
-        let quota = Quota::per_minute(rpm).allow_burst(burst);
+        let rate_limiter = rate_limit.map(|(rpm, burst)| {
+            Arc::new(RateLimiter::direct(
+                Quota::per_minute(rpm).allow_burst(burst),
+            ))
+        });
         Self {
             url,
             api_key,
             model: model.into(),
-            timeout,
+            max_concurrent_requests,
+            request_timeout,
             parameters,
-            rate_limiter: Arc::new(RateLimiter::direct(quota)),
+            rate_limiter,
         }
     }
 
@@ -323,7 +332,9 @@ impl fmt::Debug for OpenAiChatCompletionClient {
             .field("url_host", &self.url.host_str())
             .field("api_key", &"[REDACTED]")
             .field("model", &self.model)
-            .field("timeout", &self.timeout)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("request_timeout", &self.request_timeout)
+            .field("rate_limited", &self.rate_limiter.is_some())
             .field("parameter_fields", &parameter_fields)
             .finish_non_exhaustive()
     }
@@ -373,12 +384,8 @@ impl LlmTlsConfiguration {
 #[derive(Clone, Debug)]
 pub(crate) struct OpenAiExecutorConfiguration {
     max_active_requests: NonZeroUsize,
-    total_capacity: NonZeroUsize,
-    admission_timeout: Duration,
     connect_timeout: Duration,
     read_timeout: Duration,
-    pool_idle_timeout: Duration,
-    pool_max_idle_per_host: usize,
     proxy: LlmProxyConfiguration,
     tls: LlmTlsConfiguration,
 }
@@ -387,22 +394,14 @@ impl OpenAiExecutorConfiguration {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         max_active_requests: NonZeroUsize,
-        total_capacity: NonZeroUsize,
-        admission_timeout: Duration,
         connect_timeout: Duration,
         read_timeout: Duration,
-        pool_idle_timeout: Duration,
-        pool_max_idle_per_host: usize,
         proxy: LlmProxyConfiguration,
     ) -> Self {
         Self {
             max_active_requests,
-            total_capacity,
-            admission_timeout,
             connect_timeout,
             read_timeout,
-            pool_idle_timeout,
-            pool_max_idle_per_host,
             proxy,
             tls: LlmTlsConfiguration::default(),
         }
@@ -421,6 +420,36 @@ pub(crate) enum OpenAiExecutorBuildError {
     InvalidProxy(reqwest::Error),
     InvalidCertificate(reqwest::Error),
     BuildClient(reqwest::Error),
+}
+
+impl OpenAiExecutorBuildError {
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        let (subject, reason, action) = match self {
+            Self::InvalidProxy(_) => (
+                DiagnosticSubject::field("llm.proxy"),
+                DiagnosticFailureKind::InvalidValue,
+                DiagnosticAction::FixConfiguration,
+            ),
+            Self::InvalidCertificate(_) => (
+                DiagnosticSubject::field("llm.additional_pem_files"),
+                DiagnosticFailureKind::InvalidEncoding,
+                DiagnosticAction::FixConfiguration,
+            ),
+            Self::BuildClient(_) => (
+                DiagnosticSubject::component("LLM HTTP client"),
+                DiagnosticFailureKind::TransportFailed,
+                DiagnosticAction::Retry,
+            ),
+        };
+        SafeDiagnostic::new(
+            DiagnosticCode::HttpClientBuild,
+            DiagnosticStage::CommandPreparation,
+            subject,
+            DiagnosticReason::failure(reason),
+            DiagnosticImpact::Unchanged,
+            action,
+        )
+    }
 }
 
 impl fmt::Display for OpenAiExecutorBuildError {
@@ -446,9 +475,7 @@ impl Error for OpenAiExecutorBuildError {
 #[derive(Clone)]
 pub(crate) struct OpenAiChatCompletionExecutor {
     client: Client,
-    total_capacity: Arc<Semaphore>,
     active_capacity: Arc<Semaphore>,
-    admission_timeout: Duration,
     lifecycle: Arc<LlmLifecycle>,
 }
 
@@ -460,9 +487,7 @@ impl OpenAiChatCompletionExecutor {
             .redirect(redirect::Policy::none())
             .no_proxy()
             .connect_timeout(configuration.connect_timeout)
-            .read_timeout(configuration.read_timeout)
-            .pool_idle_timeout(configuration.pool_idle_timeout)
-            .pool_max_idle_per_host(configuration.pool_max_idle_per_host);
+            .read_timeout(configuration.read_timeout);
         if let LlmProxyConfiguration::Explicit(url) = configuration.proxy {
             let proxy = Proxy::all(url.as_str()).map_err(OpenAiExecutorBuildError::InvalidProxy)?;
             builder = builder.proxy(proxy.no_proxy(None));
@@ -480,16 +505,19 @@ impl OpenAiChatCompletionExecutor {
 
         Ok(Self {
             client,
-            total_capacity: Arc::new(Semaphore::new(configuration.total_capacity.get())),
             active_capacity: Arc::new(Semaphore::new(configuration.max_active_requests.get())),
-            admission_timeout: configuration.admission_timeout,
             lifecycle: Arc::new(LlmLifecycle::new()),
         })
     }
 
+    /// 停止新请求并立即唤醒正在等待供应商速率或活动许可的请求。
+    pub(crate) fn cancel_waits(&self) {
+        self.lifecycle.stop_accepting();
+    }
+
     /// 停止新请求并等待已准入请求归还所有许可。
     pub(crate) async fn shutdown(&self) {
-        self.lifecycle.stop_accepting();
+        self.cancel_waits();
         self.lifecycle.wait_until_idle().await;
     }
 
@@ -500,24 +528,20 @@ impl OpenAiChatCompletionExecutor {
     ) -> Result<LlmResponse, LlmRequestError<OpenAiChatCompletionError>> {
         let request_body = serialize_request(client, messages).map_err(LlmRequestError::Fatal)?;
 
-        let total_permit = Arc::clone(&self.total_capacity)
-            .try_acquire_owned()
-            .map_err(|_| retryable(OpenAiChatCompletionError::QueueFull))?;
         let job = self
             .lifecycle
             .register()
-            .ok_or_else(|| LlmRequestError::Fatal(OpenAiChatCompletionError::ShuttingDown))?;
-        let deadline = Instant::now() + self.admission_timeout;
+            .ok_or_else(|| LlmRequestError::Fatal(OpenAiChatCompletionError::ExecutorClosed))?;
 
-        wait_for_rate(client, &self.lifecycle, deadline).await?;
+        wait_for_rate(client, &self.lifecycle).await?;
         let active_permit =
-            wait_for_active(Arc::clone(&self.active_capacity), &self.lifecycle, deadline).await?;
+            wait_for_active(Arc::clone(&self.active_capacity), &self.lifecycle).await?;
 
         let request = self
             .client
             .post(client.url.clone())
             .header(CONTENT_TYPE, "application/json")
-            .timeout(client.timeout)
+            .timeout(client.request_timeout)
             .bearer_auth(client.api_key.expose_secret())
             .body(request_body);
 
@@ -525,12 +549,18 @@ impl OpenAiChatCompletionExecutor {
         let status = response.status();
         let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
         if status != StatusCode::OK {
+            let provider_body = response.bytes().await;
+            drop(active_permit);
+            drop(job);
+            let (provider_code, provider_type) = provider_body
+                .ok()
+                .and_then(|body| parse_provider_error_identifiers(&body))
+                .unwrap_or((None, None));
             let error = OpenAiChatCompletionError::HttpStatus {
                 status: status.as_u16(),
+                provider_code,
+                provider_type,
             };
-            drop(active_permit);
-            drop(total_permit);
-            drop(job);
             return if is_retryable_status(status) {
                 Err(LlmRequestError::Retryable {
                     source: error,
@@ -546,13 +576,17 @@ impl OpenAiChatCompletionExecutor {
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let response_body = response.bytes().await.map_err(classify_transport_error)?;
-        let parsed = parse_success_response(&response_body, provider_request_id)?;
-
+        let response_body = match response.bytes().await {
+            Ok(body) => body,
+            Err(source) => {
+                drop(active_permit);
+                drop(job);
+                return Err(classify_transport_error(source));
+            }
+        };
         drop(active_permit);
-        drop(total_permit);
         drop(job);
-        Ok(parsed)
+        parse_success_response(&response_body, provider_request_id)
     }
 }
 
@@ -560,7 +594,6 @@ impl fmt::Debug for OpenAiChatCompletionExecutor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OpenAiChatCompletionExecutor")
-            .field("admission_timeout", &self.admission_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -580,25 +613,29 @@ impl LlmRequestExecutor for OpenAiChatCompletionExecutor {
 
 #[derive(Debug)]
 pub(crate) enum OpenAiChatCompletionError {
-    ShuttingDown,
-    QueueFull,
-    AdmissionTimeout { stage: AdmissionStage },
+    WaitCancelled,
+    ExecutorClosed,
     SerializeRequest(serde_json::Error),
     Transport(reqwest::Error),
-    HttpStatus { status: u16 },
+    HttpStatus {
+        status: u16,
+        provider_code: Option<String>,
+        provider_type: Option<String>,
+    },
     ParseResponse(serde_json::Error),
-    InvalidResponseWire { reason: &'static str },
+    InvalidResponseWire {
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for OpenAiChatCompletionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ShuttingDown => formatter.write_str("LLM 根正在关闭"),
-            Self::QueueFull => formatter.write_str("LLM 请求队列已满"),
-            Self::AdmissionTimeout { stage } => write!(formatter, "LLM {stage} 准入超时"),
+            Self::WaitCancelled => formatter.write_str("LLM 请求在等待本地许可时被取消"),
+            Self::ExecutorClosed => formatter.write_str("LLM 根已关闭"),
             Self::SerializeRequest(_) => formatter.write_str("无法序列化 LLM 请求"),
             Self::Transport(_) => formatter.write_str("LLM HTTP 传输失败"),
-            Self::HttpStatus { status } => write!(formatter, "LLM HTTP 状态 {status}"),
+            Self::HttpStatus { status, .. } => write!(formatter, "LLM HTTP 状态 {status}"),
             Self::ParseResponse(_) => formatter.write_str("LLM 成功响应不是有效 JSON"),
             Self::InvalidResponseWire { reason } => {
                 write!(
@@ -621,19 +658,173 @@ impl Error for OpenAiChatCompletionError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdmissionStage {
-    Rate,
-    Active,
-}
-
-impl fmt::Display for AdmissionStage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl OpenAiChatCompletionError {
+    /// 只公开 HTTP/传输与 JSON 解析器的稳定事实；请求、响应正文和
+    /// serde/reqwest 原始文本始终留在 source。
+    pub(crate) fn safe_diagnostic(
+        &self,
+        retry_after: Option<Duration>,
+        impact: DiagnosticImpact,
+    ) -> SafeDiagnostic {
         match self {
-            Self::Rate => formatter.write_str("速率"),
-            Self::Active => formatter.write_str("活动容量"),
+            Self::WaitCancelled => model_failure(
+                DiagnosticFailureKind::LockCancelled,
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::ExecutorClosed => model_failure(
+                DiagnosticFailureKind::ExecutorClosed,
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::SerializeRequest(source) => json_model_failure(
+                DiagnosticFailureKind::RequestSerializationFailed,
+                impact,
+                DiagnosticAction::ReportBug,
+                source,
+            ),
+            Self::Transport(source) => model_failure(
+                DiagnosticFailureKind::TransportFailed,
+                impact,
+                DiagnosticAction::CheckModelService,
+            )
+            .with_recovery(RecoveryFact::component(transport_classification(source))),
+            Self::HttpStatus {
+                status,
+                provider_code,
+                provider_type,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::ModelRequest,
+                DiagnosticStage::ModelRequest,
+                DiagnosticSubject::component("LLM provider"),
+                DiagnosticReason::Http {
+                    status: Some(*status),
+                    retry_after_seconds: retry_after.map(|value| value.as_secs()),
+                    provider_code: provider_code.clone(),
+                    provider_type: provider_type.clone(),
+                },
+                impact,
+                if *status == 401 || *status == 403 {
+                    DiagnosticAction::FixConfiguration
+                } else {
+                    DiagnosticAction::CheckModelService
+                },
+            ),
+            Self::ParseResponse(source) => json_model_failure(
+                DiagnosticFailureKind::ResponseParsingFailed,
+                impact,
+                DiagnosticAction::CheckModelService,
+                source,
+            ),
+            Self::InvalidResponseWire { reason } => model_failure(
+                DiagnosticFailureKind::InvalidResponseContract,
+                impact,
+                DiagnosticAction::CheckModelService,
+            )
+            .with_recovery(RecoveryFact::component(format!("contract={reason}"))),
         }
     }
+}
+
+impl crate::llm::LlmRequestDiagnosticSource for OpenAiChatCompletionError {
+    fn request_diagnostic(
+        &self,
+        retry_after: Option<Duration>,
+        impact: DiagnosticImpact,
+    ) -> SafeDiagnostic {
+        self.safe_diagnostic(retry_after, impact)
+    }
+}
+
+fn model_failure(
+    failure: DiagnosticFailureKind,
+    impact: DiagnosticImpact,
+    action: DiagnosticAction,
+) -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        DiagnosticCode::ModelRequest,
+        DiagnosticStage::ModelRequest,
+        DiagnosticSubject::component("LLM request"),
+        DiagnosticReason::failure(failure),
+        impact,
+        action,
+    )
+}
+
+fn json_model_failure(
+    failure: DiagnosticFailureKind,
+    impact: DiagnosticImpact,
+    action: DiagnosticAction,
+    source: &serde_json::Error,
+) -> SafeDiagnostic {
+    let category = match source.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    SafeDiagnostic::new(
+        DiagnosticCode::ModelRequest,
+        DiagnosticStage::ModelRequest,
+        DiagnosticSubject::component("LLM request"),
+        DiagnosticReason::failure_with_detail(
+            failure,
+            format!(
+                "json_category={category}; line={}; column={}",
+                source.line(),
+                source.column()
+            ),
+        ),
+        impact,
+        action,
+    )
+}
+
+fn transport_classification(source: &reqwest::Error) -> &'static str {
+    if source.is_timeout() {
+        "transport=timeout"
+    } else if source.is_connect() {
+        "transport=connect"
+    } else if source.is_request() {
+        "transport=request"
+    } else if source.is_body() {
+        "transport=body"
+    } else if source.is_decode() {
+        "transport=decode"
+    } else if source.is_redirect() {
+        "transport=redirect"
+    } else {
+        "transport=other"
+    }
+}
+
+#[derive(Deserialize)]
+struct ProviderErrorEnvelope {
+    error: ProviderErrorIdentifiers,
+}
+
+#[derive(Deserialize)]
+struct ProviderErrorIdentifiers {
+    code: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+fn parse_provider_error_identifiers(body: &[u8]) -> Option<(Option<String>, Option<String>)> {
+    let envelope = serde_json::from_slice::<ProviderErrorEnvelope>(body).ok()?;
+    Some((
+        envelope.error.code.and_then(provider_identifier),
+        envelope.error.kind.and_then(provider_identifier),
+    ))
+}
+
+fn provider_identifier(value: String) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
+        }))
+    .then_some(value)
 }
 
 #[derive(Serialize)]
@@ -678,34 +869,35 @@ fn serialize_request(
 async fn wait_for_rate(
     client: &OpenAiChatCompletionClient,
     lifecycle: &LlmLifecycle,
-    deadline: Instant,
 ) -> Result<(), LlmRequestError<OpenAiChatCompletionError>> {
     if !lifecycle.is_accepting() {
         return Err(LlmRequestError::Fatal(
-            OpenAiChatCompletionError::ShuttingDown,
+            OpenAiChatCompletionError::WaitCancelled,
         ));
     }
+    let Some(rate_limiter) = &client.rate_limiter else {
+        return if lifecycle.is_accepting() {
+            Ok(())
+        } else {
+            Err(LlmRequestError::Fatal(
+                OpenAiChatCompletionError::WaitCancelled,
+            ))
+        };
+    };
     let stopped = lifecycle.wait_for_stop();
     tokio::pin!(stopped);
-    let ready = client.rate_limiter.until_ready();
+    let ready = rate_limiter.until_ready();
     tokio::pin!(ready);
-    let admitted = timeout_at(deadline, async {
-        tokio::select! {
-            () = &mut ready => true,
-            () = &mut stopped => false,
-        }
-    })
-    .await
-    .map_err(|_| {
-        retryable(OpenAiChatCompletionError::AdmissionTimeout {
-            stage: AdmissionStage::Rate,
-        })
-    })?;
-    if admitted {
+    let admitted = tokio::select! {
+        biased;
+        () = &mut stopped => false,
+        () = &mut ready => true,
+    };
+    if admitted && lifecycle.is_accepting() {
         Ok(())
     } else {
         Err(LlmRequestError::Fatal(
-            OpenAiChatCompletionError::ShuttingDown,
+            OpenAiChatCompletionError::WaitCancelled,
         ))
     }
 }
@@ -713,28 +905,38 @@ async fn wait_for_rate(
 async fn wait_for_active(
     semaphore: Arc<Semaphore>,
     lifecycle: &LlmLifecycle,
-    deadline: Instant,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, LlmRequestError<OpenAiChatCompletionError>> {
     if !lifecycle.is_accepting() {
         return Err(LlmRequestError::Fatal(
-            OpenAiChatCompletionError::ShuttingDown,
+            OpenAiChatCompletionError::WaitCancelled,
         ));
     }
     let stopped = lifecycle.wait_for_stop();
     tokio::pin!(stopped);
     let permit = semaphore.acquire_owned();
     tokio::pin!(permit);
-    timeout_at(deadline, async {
-        tokio::select! {
-            result = &mut permit => result
-                .map_err(|_| LlmRequestError::Fatal(OpenAiChatCompletionError::ShuttingDown)),
-            () = &mut stopped => Err(LlmRequestError::Fatal(OpenAiChatCompletionError::ShuttingDown)),
+    let permit = tokio::select! {
+        biased;
+        () = &mut stopped => {
+            return Err(LlmRequestError::Fatal(OpenAiChatCompletionError::WaitCancelled));
         }
-    })
-    .await
-    .map_err(|_| retryable(OpenAiChatCompletionError::AdmissionTimeout {
-        stage: AdmissionStage::Active,
-    }))?
+        result = &mut permit => result
+            .map_err(|_| LlmRequestError::Fatal(OpenAiChatCompletionError::ExecutorClosed)),
+    }?;
+    if lifecycle.is_accepting() {
+        Ok(permit)
+    } else {
+        drop(permit);
+        Err(LlmRequestError::Fatal(
+            OpenAiChatCompletionError::WaitCancelled,
+        ))
+    }
+}
+
+impl LlmClientConcurrency for OpenAiChatCompletionClient {
+    fn max_concurrent_requests(&self) -> NonZeroUsize {
+        self.max_concurrent_requests
+    }
 }
 
 fn retryable(source: OpenAiChatCompletionError) -> LlmRequestError<OpenAiChatCompletionError> {
@@ -980,30 +1182,18 @@ mod tests {
             Url::parse(url).expect("测试 URL 有效"),
             SecretString::from("test-secret"),
             "test-model",
+            non_zero_usize(8),
             Duration::from_secs(2),
-            non_zero_u32(rpm),
-            non_zero_u32(burst),
+            Some((non_zero_u32(rpm), non_zero_u32(burst))),
             parameters,
         )
     }
 
-    fn executor(max_active_requests: usize, queue_capacity: usize) -> OpenAiChatCompletionExecutor {
-        executor_with_admission_timeout(max_active_requests, queue_capacity, Duration::from_secs(2))
-    }
-
-    fn executor_with_admission_timeout(
-        max_active_requests: usize,
-        queue_capacity: usize,
-        admission_timeout: Duration,
-    ) -> OpenAiChatCompletionExecutor {
+    fn executor(max_active_requests: usize) -> OpenAiChatCompletionExecutor {
         OpenAiChatCompletionExecutor::new(OpenAiExecutorConfiguration::new(
             non_zero_usize(max_active_requests),
-            non_zero_usize(max_active_requests + queue_capacity),
-            admission_timeout,
             Duration::from_secs(2),
             Duration::from_secs(2),
-            Duration::from_secs(30),
-            2,
             LlmProxyConfiguration::Disabled,
         ))
         .expect("测试 LLM 根应构造成功")
@@ -1160,9 +1350,9 @@ mod tests {
             Url::parse("https://example.com/v1/chat/completions").expect("测试 URL 有效"),
             SecretString::from("api-secret"),
             "test-model",
+            non_zero_usize(8),
             Duration::from_secs(2),
-            non_zero_u32(60),
-            non_zero_u32(2),
+            Some((non_zero_u32(60), non_zero_u32(2))),
             parameters,
         );
         let debug = format!("{client:?}");
@@ -1183,18 +1373,18 @@ mod tests {
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
             SecretString::from("first-secret"),
             "model-a",
+            non_zero_usize(8),
             Duration::from_secs(2),
-            non_zero_u32(60),
-            non_zero_u32(2),
+            Some((non_zero_u32(60), non_zero_u32(2))),
             extra.clone(),
         );
         let operationally_different = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
             SecretString::from("different-secret"),
             "model-a",
+            non_zero_usize(1),
             Duration::from_secs(90),
-            non_zero_u32(1),
-            non_zero_u32(1),
+            Some((non_zero_u32(1), non_zero_u32(1))),
             extra.clone(),
         );
         let mut nested_reordered = Map::new();
@@ -1210,9 +1400,9 @@ mod tests {
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
             SecretString::from("first-secret"),
             "model-a",
+            non_zero_usize(8),
             Duration::from_secs(2),
-            non_zero_u32(60),
-            non_zero_u32(2),
+            Some((non_zero_u32(60), non_zero_u32(2))),
             extra_reordered.clone(),
         );
         let mut numerically_equivalent_extra = extra_reordered;
@@ -1224,18 +1414,18 @@ mod tests {
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
             SecretString::from("first-secret"),
             "model-a",
+            non_zero_usize(8),
             Duration::from_secs(2),
-            non_zero_u32(60),
-            non_zero_u32(2),
+            Some((non_zero_u32(60), non_zero_u32(2))),
             numerically_equivalent_extra,
         );
         let different_model = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").unwrap(),
             SecretString::from("first-secret"),
             "model-b",
+            non_zero_usize(8),
             Duration::from_secs(2),
-            non_zero_u32(60),
-            non_zero_u32(2),
+            Some((non_zero_u32(60), non_zero_u32(2))),
             extra,
         );
 
@@ -1430,6 +1620,94 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_projection_keeps_only_stable_identifiers() {
+        let (code, kind) = parse_provider_error_identifiers(
+            br#"{"error":{"code":"rate_limit_exceeded","type":"requests/rate-limit","message":"MODEL_BODY_SECRET"}}"#,
+        )
+        .expect("供应商错误信封应可解析");
+        assert_eq!(code.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(kind.as_deref(), Some("requests/rate-limit"));
+
+        let (code, kind) = parse_provider_error_identifiers(
+            br#"{"error":{"code":"API_KEY_SECRET\r\nforged","type":"MODEL_BODY_SECRET!","message":"MODEL_BODY_SECRET"}}"#,
+        )
+        .expect("无效供应商标识不应使信封解析失败");
+        assert_eq!(code, None);
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn http_diagnostic_never_exposes_provider_body_or_invalid_identifier() {
+        let source = OpenAiChatCompletionError::HttpStatus {
+            status: 429,
+            provider_code: Some("API_KEY_SECRET\r\nforged".to_owned()),
+            provider_type: Some("rate_limit".to_owned()),
+        };
+        let diagnostic = source.safe_diagnostic(
+            Some(Duration::from_secs(3)),
+            DiagnosticImpact::ProgressPreserved,
+        );
+        let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
+        assert!(!serialized.contains("API_KEY_SECRET"));
+        assert!(!serialized.contains("forged"));
+        assert!(serialized.contains("\"status\":429"));
+        assert!(serialized.contains("\"retry_after_seconds\":3"));
+        assert!(serialized.contains("\"provider_type\":\"rate_limit\""));
+        assert!(serialized.contains("\"provider_code\":null"));
+    }
+
+    struct SerializationFailureSentinel;
+
+    impl Serialize for SerializationFailureSentinel {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "REQUEST_AND_PARAMETER_BODY_SENTINEL",
+            ))
+        }
+    }
+
+    #[test]
+    fn json_diagnostics_keep_category_and_coordinates_without_request_or_response_text() {
+        let serialization_source =
+            serde_json::to_vec(&SerializationFailureSentinel).expect_err("测试序列化器必须失败");
+        let serialization = OpenAiChatCompletionError::SerializeRequest(serialization_source)
+            .safe_diagnostic(None, DiagnosticImpact::Unchanged);
+        let serialization = serde_json::to_string(&serialization).expect("序列化诊断应可序列化");
+        assert!(serialization.contains("request_serialization_failed"));
+        assert!(serialization.contains("json_category=data; line=0; column=0"));
+        assert!(!serialization.contains("REQUEST_AND_PARAMETER_BODY_SENTINEL"));
+
+        let response_body = br#"{"secret":"RESPONSE_MODEL_BODY_SENTINEL",]"#;
+        let parsing_source =
+            serde_json::from_slice::<Value>(response_body).expect_err("测试响应必须是无效 JSON");
+        let line = parsing_source.line();
+        let column = parsing_source.column();
+        let parsing = OpenAiChatCompletionError::ParseResponse(parsing_source)
+            .safe_diagnostic(None, DiagnosticImpact::ProgressPreserved);
+        let parsing = serde_json::to_string(&parsing).expect("解析诊断应可序列化");
+        assert!(parsing.contains("response_parsing_failed"));
+        assert!(parsing.contains(&format!(
+            "json_category=syntax; line={line}; column={column}"
+        )));
+        assert!(!parsing.contains("RESPONSE_MODEL_BODY_SENTINEL"));
+    }
+
+    #[test]
+    fn cancelled_local_admission_is_distinct_from_a_closed_executor() {
+        let cancelled = OpenAiChatCompletionError::WaitCancelled
+            .safe_diagnostic(None, DiagnosticImpact::ProgressPreserved);
+        assert!(cancelled.reason.is_wait_cancelled());
+
+        let closed = OpenAiChatCompletionError::ExecutorClosed
+            .safe_diagnostic(None, DiagnosticImpact::ProgressPreserved);
+        assert!(!closed.reason.is_wait_cancelled());
+        assert_ne!(cancelled.reason, closed.reason);
+    }
+
+    #[test]
     fn retry_after_supports_seconds_and_http_date() {
         let seconds = reqwest::header::HeaderValue::from_static("7");
         assert_eq!(
@@ -1452,7 +1730,7 @@ mod tests {
             false,
         );
         let client = client(&server.endpoint, Map::new());
-        let executor = executor(1, 1);
+        let executor = executor(1);
 
         let response = executor
             .request(
@@ -1506,7 +1784,7 @@ mod tests {
             false,
         );
         let client = client(&server.endpoint, Map::new());
-        let executor = executor(1, 2);
+        let executor = executor(1);
 
         for _ in 0..3 {
             let response = executor
@@ -1530,7 +1808,7 @@ mod tests {
         );
         let mut client = client(&server.endpoint, Map::new());
         client.api_key = SecretString::from("exact-secret");
-        let executor = executor(1, 0);
+        let executor = executor(1);
 
         executor
             .request(
@@ -1559,7 +1837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_and_queue_capacity_apply_before_a_third_request() {
+    async fn active_capacity_backpressures_without_rejecting_waiters() {
         let mut server = spawn_test_server(
             vec![
                 success_response("response-1", "request-1", "[]"),
@@ -1568,7 +1846,7 @@ mod tests {
             true,
         );
         let client = Arc::new(client_with_rate(&server.endpoint, Map::new(), 60_000, 3));
-        let executor = executor(1, 1);
+        let executor = executor(1);
         let first_executor = executor.clone();
         let first_client = Arc::clone(&client);
         let first = tokio::spawn(async move {
@@ -1592,6 +1870,7 @@ mod tests {
         })
         .await
         .expect("首个活动请求应到达服务器");
+        server.requests.recv().expect("应记录首个请求");
 
         let second_executor = executor.clone();
         let second_client = Arc::clone(&client);
@@ -1603,27 +1882,11 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while executor.total_capacity.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("第二个请求应占用排队容量");
-
-        let third = executor
-            .request(
-                client.as_ref(),
-                &[ChatMessage::new(ChatMessageRole::User, "third")],
-            )
-            .await;
-        assert!(matches!(
-            third,
-            Err(LlmRequestError::Retryable {
-                source: OpenAiChatCompletionError::QueueFull,
-                retry_after: None,
-            })
-        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            matches!(server.requests.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "第二个请求必须在活动许可前自然等待，而不是提前发送或失败"
+        );
 
         server
             .release_first
@@ -1639,59 +1902,183 @@ mod tests {
             .await
             .expect("第二个任务不应 panic")
             .expect("第二个请求应成功");
+        server.requests.recv().expect("许可释放后应发送第二个请求");
         executor.shutdown().await;
         server.worker.join().expect("测试服务器应正常退出");
     }
 
     #[tokio::test]
-    async fn rate_burst_and_admission_deadlines_are_enforced() {
+    async fn rate_and_active_waits_have_no_local_deadline() {
         let client = client_with_rate("http://127.0.0.1:1/v1/chat/completions", Map::new(), 60, 2);
         let lifecycle = LlmLifecycle::new();
 
-        wait_for_rate(
-            &client,
-            &lifecycle,
-            Instant::now() + Duration::from_millis(50),
-        )
-        .await
-        .expect("burst 内第一个请求应立即准入");
-        wait_for_rate(
-            &client,
-            &lifecycle,
-            Instant::now() + Duration::from_millis(50),
-        )
-        .await
-        .expect("burst 内第二个请求应立即准入");
-        assert!(matches!(
-            wait_for_rate(
-                &client,
-                &lifecycle,
-                Instant::now() + Duration::from_millis(10)
+        wait_for_rate(&client, &lifecycle)
+            .await
+            .expect("burst 内第一个请求应立即准入");
+        wait_for_rate(&client, &lifecycle)
+            .await
+            .expect("burst 内第二个请求应立即准入");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                wait_for_rate(&client, &lifecycle)
             )
-            .await,
-            Err(LlmRequestError::Retryable {
-                source: OpenAiChatCompletionError::AdmissionTimeout {
-                    stage: AdmissionStage::Rate,
-                },
-                retry_after: None,
-            })
-        ));
+            .await
+            .is_err(),
+            "burst 用尽后必须继续等待供应商速率，不得产生本地超时"
+        );
 
         let unavailable = Arc::new(Semaphore::new(0));
-        assert!(matches!(
-            wait_for_active(
-                unavailable,
-                &lifecycle,
-                Instant::now() + Duration::from_millis(10)
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                wait_for_active(Arc::clone(&unavailable), &lifecycle),
             )
-            .await,
-            Err(LlmRequestError::Retryable {
-                source: OpenAiChatCompletionError::AdmissionTimeout {
-                    stage: AdmissionStage::Active,
-                },
-                retry_after: None,
-            })
+            .await
+            .is_err(),
+            "活动许可耗尽后必须继续等待，不得产生本地超时"
+        );
+        lifecycle.stop_accepting();
+        assert!(matches!(
+            wait_for_active(unavailable, &lifecycle).await,
+            Err(LlmRequestError::Fatal(
+                OpenAiChatCompletionError::WaitCancelled
+            ))
         ));
+    }
+
+    #[tokio::test]
+    async fn business_cancellation_wakes_a_request_waiting_for_rate() {
+        let client = Arc::new(client_with_rate(
+            "http://127.0.0.1:1/v1/chat/completions",
+            Map::new(),
+            60,
+            1,
+        ));
+        let executor = executor(1);
+        wait_for_rate(client.as_ref(), &executor.lifecycle)
+            .await
+            .expect("burst 内第一个请求应立即准入");
+
+        let waiting_executor = executor.clone();
+        let waiting_client = Arc::clone(&client);
+        let mut waiting = tokio::spawn(async move {
+            wait_for_rate(waiting_client.as_ref(), &waiting_executor.lifecycle).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err(),
+            "第二个请求必须正在等待低 RPM，而不是提前完成"
+        );
+
+        executor.cancel_waits();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("业务取消必须立即唤醒 RPM 等待")
+            .expect("RPM 等待任务不应 panic");
+        assert!(matches!(
+            result,
+            Err(LlmRequestError::Fatal(
+                OpenAiChatCompletionError::WaitCancelled
+            ))
+        ));
+        executor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn business_cancellation_wakes_a_request_waiting_for_active_capacity() {
+        let executor = executor(1);
+        let held = Arc::clone(&executor.active_capacity)
+            .acquire_owned()
+            .await
+            .expect("测试应取得唯一活动许可");
+        let waiting_executor = executor.clone();
+        let mut waiting = tokio::spawn(async move {
+            wait_for_active(
+                Arc::clone(&waiting_executor.active_capacity),
+                &waiting_executor.lifecycle,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err(),
+            "第二个请求必须正在等待活动许可，而不是提前完成"
+        );
+
+        executor.cancel_waits();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("业务取消必须立即唤醒活动许可等待")
+            .expect("活动许可等待任务不应 panic");
+        assert!(matches!(
+            result,
+            Err(LlmRequestError::Fatal(
+                OpenAiChatCompletionError::WaitCancelled
+            ))
+        ));
+        drop(held);
+        executor.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_wins_when_rate_admission_becomes_ready_at_the_same_time() {
+        let client = Arc::new(client_with_rate(
+            "http://127.0.0.1:1/v1/chat/completions",
+            Map::new(),
+            6_000,
+            1,
+        ));
+        let lifecycle = Arc::new(LlmLifecycle::new());
+        wait_for_rate(client.as_ref(), lifecycle.as_ref())
+            .await
+            .expect("首个 burst 令牌应立即可用");
+
+        let waiting_client = Arc::clone(&client);
+        let waiting_lifecycle = Arc::clone(&lifecycle);
+        let waiting = tokio::spawn(async move {
+            wait_for_rate(waiting_client.as_ref(), waiting_lifecycle.as_ref()).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "第二次准入应先等待速率令牌");
+
+        // current-thread runtime 在这里不会轮询等待任务；恢复轮询前令牌和停止信号
+        // 已同时就绪，固定验证停止优先，而不是依赖 select 的随机分支。
+        std::thread::sleep(Duration::from_millis(15));
+        lifecycle.stop_accepting();
+        let result = waiting.await.expect("速率等待任务不应 panic");
+        assert!(matches!(
+            result,
+            Err(LlmRequestError::Fatal(
+                OpenAiChatCompletionError::WaitCancelled
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_wins_and_releases_permit_when_active_admission_is_simultaneously_ready() {
+        let lifecycle = Arc::new(LlmLifecycle::new());
+        let capacity = Arc::new(Semaphore::new(0));
+        let waiting_lifecycle = Arc::clone(&lifecycle);
+        let waiting_capacity = Arc::clone(&capacity);
+        let waiting = tokio::spawn(async move {
+            wait_for_active(waiting_capacity, waiting_lifecycle.as_ref()).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "活动许可应仍在等待");
+
+        lifecycle.stop_accepting();
+        capacity.add_permits(1);
+        let result = waiting.await.expect("活动许可等待任务不应 panic");
+        assert!(matches!(
+            result,
+            Err(LlmRequestError::Fatal(
+                OpenAiChatCompletionError::WaitCancelled
+            ))
+        ));
+        assert_eq!(capacity.available_permits(), 1, "取消必须归还并发许可");
     }
 
     #[tokio::test]
@@ -1713,7 +2100,7 @@ mod tests {
 
         let endpoint = format!("http://{address}/v1/chat/completions");
         let client = Arc::new(client_with_rate(&endpoint, Map::new(), 60, 1));
-        let executor = executor_with_admission_timeout(1, 0, Duration::from_secs(1));
+        let executor = executor(1);
         let request_executor = executor.clone();
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move {
@@ -1732,16 +2119,13 @@ mod tests {
         })
         .await
         .expect("等待线程不应 panic");
-        assert_eq!(executor.total_capacity.available_permits(), 0);
         assert_eq!(executor.active_capacity.available_permits(), 0);
 
         request.abort();
         let _ = request.await;
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if executor.total_capacity.available_permits() == 1
-                    && executor.active_capacity.available_permits() == 1
-                {
+                if executor.active_capacity.available_permits() == 1 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1769,7 +2153,7 @@ mod tests {
             false,
         );
         let client = client_with_rate(&server.endpoint, Map::new(), 60, 1);
-        let executor = executor(1, 0);
+        let executor = executor(1);
 
         assert!(matches!(
             executor
@@ -1779,7 +2163,7 @@ mod tests {
                 )
                 .await,
             Err(LlmRequestError::Retryable {
-                source: OpenAiChatCompletionError::HttpStatus { status: 429 },
+                source: OpenAiChatCompletionError::HttpStatus { status: 429, .. },
                 retry_after: Some(duration),
             }) if duration == Duration::from_secs(3)
         ));
@@ -1801,7 +2185,7 @@ mod tests {
         );
         drop(listener);
         let client = client(&endpoint, Map::new());
-        let executor = executor(1, 0);
+        let executor = executor(1);
 
         assert!(matches!(
             executor

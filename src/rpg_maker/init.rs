@@ -586,6 +586,7 @@ where
                 &children,
                 &expected_children,
                 &[
+                    ("logs", DirectoryEntryKind::Directory),
                     ("project.db-journal", DirectoryEntryKind::RegularFile),
                     ("project.db-wal", DirectoryEntryKind::RegularFile),
                     ("project.db-shm", DirectoryEntryKind::RegularFile),
@@ -805,6 +806,7 @@ pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
 }
 
 /// 工作区收敛失败已经造成的最高层用户影响。
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectWorkspaceConvergenceFailureImpact {
     ConfigurationOrInput,
@@ -814,6 +816,7 @@ pub(crate) enum ProjectWorkspaceConvergenceFailureImpact {
     Internal,
 }
 
+#[cfg(test)]
 impl<D, S, I, R, E, P, A> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     /// 将工作区内部阶段和目录发布终态归并为命令边界可以准确呈现的用户影响。
     pub(crate) fn failure_impact(&self) -> ProjectWorkspaceConvergenceFailureImpact {
@@ -946,6 +949,23 @@ where
             Self::CreateDatabase(error) => write!(formatter, "无法创建候选数据库：{error}"),
             Self::SnapshotDatabase(error) => write!(formatter, "无法复制现存数据库：{error}"),
             Self::ReconcileDatabase(error) => write!(formatter, "无法对账候选数据库：{error}"),
+        }
+    }
+}
+
+impl<D, S, R, P> Error for ProjectWorkspaceCandidateFailure<D, S, R, P>
+where
+    D: Error + 'static,
+    S: Error + 'static,
+    R: Error + 'static,
+    P: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::FingerprintCandidate(source) => Some(source),
+            Self::CreateDatabase(source) => Some(source),
+            Self::SnapshotDatabase(source) => Some(source),
+            Self::ReconcileDatabase(source) => Some(source),
         }
     }
 }
@@ -1152,6 +1172,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum WorkspaceStructureObservation {
         Complete,
+        ProjectLogs,
         SqliteSidecars,
         SqliteSidecarNotFile,
         DatabaseNotFile,
@@ -1282,6 +1303,15 @@ mod tests {
                     children.push(DirectoryEntry::new(
                         path.join("unexpected"),
                         DirectoryEntryKind::RegularFile,
+                    ));
+                }
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::ProjectLogs
+                ) {
+                    children.push(DirectoryEntry::new(
+                        path.join("logs"),
+                        DirectoryEntryKind::Directory,
                     ));
                 }
                 if matches!(
@@ -2065,6 +2095,32 @@ mod tests {
             .converge(request())
             .await
             .expect("SQLite sidecar 属于已检查数据库的存储语义");
+
+        assert_eq!(
+            outcome,
+            OperationCompletion::Completed(ProjectWorkspaceConvergence::Unchanged)
+        );
+        assert!(!observations.events().contains(&"prepare"));
+        assert!(!observations.events().contains(&"publish"));
+    }
+
+    #[tokio::test]
+    async fn project_logs_do_not_make_an_identical_workspace_look_changed() {
+        let current = database_state(0x33, Vec::new());
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::ProjectLogs,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x33,
+            Ok(current.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(current)),
+            Ok(()),
+        );
+
+        let outcome = service
+            .converge(request())
+            .await
+            .expect("项目日志目录属于合法的项目工作区设施");
 
         assert_eq!(
             outcome,

@@ -545,6 +545,15 @@ impl LanguageModuleError {
             actual: analysis.kind(),
         }
     }
+
+    /// 返回闭集语言模块身份，不公开被分析文本。
+    pub(crate) fn safe_diagnostic_detail(&self) -> String {
+        format!(
+            "language_analysis_module_mismatch; expected={}; actual={}",
+            self.expected.name(),
+            self.actual.name()
+        )
+    }
 }
 
 impl fmt::Display for LanguageModuleError {

@@ -1,6 +1,6 @@
 //! 语义文本单元身份、物理修改目标与物化写回配方。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 
@@ -163,6 +163,37 @@ impl MutationResource {
             | Self::NoteTag { source, .. }
             | Self::CommentTag { source, .. } => source,
         }
+    }
+}
+
+impl fmt::Display for MutationResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let location = match self {
+            Self::Value { source, steps } => RpgMakerLocation::value(source.clone(), steps.clone()),
+            Self::NoteTag {
+                source,
+                container_steps,
+                tag_name,
+                occurrence,
+            } => RpgMakerLocation::note_tag(
+                source.clone(),
+                container_steps.clone(),
+                tag_name.clone(),
+                *occurrence,
+            ),
+            Self::CommentTag {
+                source,
+                command_steps,
+                tag_name,
+                occurrence,
+            } => RpgMakerLocation::comment_tag(
+                source.clone(),
+                command_steps.clone(),
+                tag_name.clone(),
+                *occurrence,
+            ),
+        };
+        location.fmt(formatter)
     }
 }
 
@@ -351,6 +382,7 @@ impl MutationClaimSet {
         &self.locks
     }
 
+    #[cfg(test)]
     pub(crate) fn conflict_with(&self, other: &Self) -> Option<MutationConflict> {
         let mut left = self.locks.iter().peekable();
         let mut right = other.locks.iter().peekable();
@@ -374,6 +406,95 @@ impl MutationClaimSet {
             }
         }
         None
+    }
+}
+
+/// 按文本组声明顺序增量验证 Mutation Claim 的 owner 级索引。
+///
+/// 索引只遍历当前组的规范锁，并直接查找此前最早占用同一资源的组，避免把每个新组
+/// 与全部旧组两两比较。冲突选择仍与原有顺序一致：优先最早的旧组；同一旧组内优先
+/// 规范资源顺序最小的冲突。
+#[derive(Default)]
+pub(crate) struct MutationClaimIndex<'a> {
+    // Claim 集合在 owner 级校验结束前始终存活；索引只借用规范资源，避免为大型
+    // 游戏的每个唯一 Value/事件块深拷贝 source、steps 和路径字符串。只有真的
+    // 发现冲突时才克隆最终要进入错误值的那一个资源。
+    resources: HashMap<&'a MutationResource, IndexedMutationResource>,
+    next_group_index: usize,
+    #[cfg(test)]
+    resource_lookups: usize,
+}
+
+#[derive(Clone, Copy)]
+struct IndexedMutationResource {
+    first_group: usize,
+    first_exclusive_group: Option<usize>,
+}
+
+impl<'a> MutationClaimIndex<'a> {
+    pub(crate) fn with_capacity(resource_capacity: usize) -> Self {
+        Self {
+            resources: HashMap::with_capacity(resource_capacity),
+            next_group_index: 0,
+            #[cfg(test)]
+            resource_lookups: 0,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, claims: &'a MutationClaimSet) -> Result<(), MutationConflict> {
+        let group_index = self.next_group_index;
+        let next_group_index = self
+            .next_group_index
+            .checked_add(1)
+            .expect("内存中的文本组数量必须可用 usize 表达");
+        let mut inserted_resources = Vec::new();
+        let mut selected = None::<(usize, &'a MutationResource)>;
+        for lock in claims.locks() {
+            #[cfg(test)]
+            {
+                self.resource_lookups += 1;
+            }
+            match self.resources.entry(lock.resource()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    inserted_resources.push(lock.resource());
+                    entry.insert(IndexedMutationResource {
+                        first_group: group_index,
+                        first_exclusive_group: (lock.access() == MutationResourceAccess::Exclusive)
+                            .then_some(group_index),
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let indexed = entry.get();
+                    let conflicting_group = match lock.access() {
+                        MutationResourceAccess::Intent => indexed.first_exclusive_group,
+                        MutationResourceAccess::Exclusive => Some(indexed.first_group),
+                    };
+                    if let Some(conflicting_group) = conflicting_group {
+                        let candidate = (conflicting_group, lock.resource());
+                        if selected.is_none_or(|current| candidate < current) {
+                            selected = Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((_, resource)) = selected {
+            // `insert` 的错误路径同样保持原子；调用方即使选择继续使用索引，也不会
+            // 看见当前失败 Group 在此前空闲资源上留下的部分占用。
+            for resource in inserted_resources {
+                self.resources.remove(resource);
+            }
+            return Err(MutationConflict {
+                resource: resource.clone(),
+            });
+        }
+        self.next_group_index = next_group_index;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn resource_lookups(&self) -> usize {
+        self.resource_lookups
     }
 }
 
@@ -648,10 +769,14 @@ pub(crate) fn mutation_claims_for_group(
                 .filter(|claim| !matches!(claim, MutationClaim::EventBlock { .. }))
             {
                 for required in claim.locks() {
-                    if !event_claims.locks().iter().any(|actual| {
-                        actual.resource() == required.resource()
-                            && (actual.access() == required.access()
-                                || actual.access() == MutationResourceAccess::Exclusive)
+                    let actual = event_claims
+                        .locks()
+                        .binary_search_by(|actual| actual.resource().cmp(required.resource()))
+                        .ok()
+                        .map(|index| &event_claims.locks()[index]);
+                    if !actual.is_some_and(|actual| {
+                        actual.access() == required.access()
+                            || actual.access() == MutationResourceAccess::Exclusive
                     }) {
                         return Err(MutationConflict {
                             resource: required.resource,
@@ -663,7 +788,7 @@ pub(crate) fn mutation_claims_for_group(
         }
     }
     // 先以每个配方目标为原子项验证，排除同一组内的 raw/decoded、重复标签等冲突。
-    MutationClaimSet::new(direct_claims.clone())?;
+    let direct_claims = MutationClaimSet::new(direct_claims)?;
 
     if matches!(
         kind,
@@ -672,7 +797,7 @@ pub(crate) fn mutation_claims_for_group(
             | TextGroupKind::EventScrollingText
     ) {
         let mut covered_values = vec![group_location.clone()];
-        covered_values.extend(direct_claims.into_iter().map(|claim| {
+        covered_values.extend(direct_claims.claims().iter().map(|claim| {
             let location = claim.representative_location();
             event_command_steps(location).map_or_else(
                 || location.clone(),
@@ -683,7 +808,7 @@ pub(crate) fn mutation_claims_for_group(
             .expect("自动事件块 Claim 必须由同一来源的非空 Value 地址组成");
         MutationClaimSet::new(vec![event_claim])
     } else {
-        MutationClaimSet::new(direct_claims)
+        Ok(direct_claims)
     }
 }
 
@@ -1028,6 +1153,119 @@ mod tests {
 
     fn claim_set(claims: Vec<MutationClaim>) -> MutationClaimSet {
         MutationClaimSet::new(claims).expect("测试 Claim 应互不冲突")
+    }
+
+    #[test]
+    fn claim_index_preserves_earliest_group_conflict_order() {
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let location = |key: &str| {
+            RpgMakerLocation::value(
+                source.clone(),
+                vec![
+                    RpgMakerLocationStep::index(1),
+                    RpgMakerLocationStep::key(key),
+                ],
+            )
+        };
+        let first = claim_set(vec![MutationClaim::Value(location("z"))]);
+        let second = claim_set(vec![MutationClaim::Value(location("a"))]);
+        let current = claim_set(vec![
+            MutationClaim::Value(location("a")),
+            MutationClaim::Value(location("z")),
+        ]);
+
+        let expected = MutationResource::Value {
+            source,
+            steps: vec![
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("z"),
+            ],
+        };
+        for mut index in [
+            MutationClaimIndex::default(),
+            MutationClaimIndex::with_capacity(
+                first.locks().len() + second.locks().len() + current.locks().len(),
+            ),
+        ] {
+            index.insert(&first).expect("首组应可登记");
+            index.insert(&second).expect("第二组应可登记");
+            let conflict = index.insert(&current).expect_err("当前组应同时冲突");
+
+            assert_eq!(
+                conflict.resource(),
+                &expected,
+                "预分配与否都必须先报告最早旧组的冲突，而不是全局字典序最小资源"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_index_work_grows_with_claim_locks_instead_of_group_pairs() {
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let group_count = 2_000;
+        let claims = (0..group_count)
+            .map(|group_index| {
+                claim_set(vec![MutationClaim::Value(RpgMakerLocation::value(
+                    source.clone(),
+                    vec![
+                        RpgMakerLocationStep::index(group_index),
+                        RpgMakerLocationStep::key("name"),
+                    ],
+                ))])
+            })
+            .collect::<Vec<_>>();
+        let expected_lookups = claims.iter().map(|claims| claims.locks().len()).sum();
+        let mut index = MutationClaimIndex::with_capacity(expected_lookups);
+
+        for claims in &claims {
+            index.insert(claims).expect("不同数组元素不得冲突");
+        }
+
+        assert_eq!(index.resource_lookups(), expected_lookups);
+        assert_eq!(expected_lookups, group_count * 3);
+    }
+
+    #[test]
+    fn failed_claim_index_insert_rolls_back_all_new_resources_and_preserves_sequence() {
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let resource = |key: &str| MutationResource::Value {
+            source: source.clone(),
+            steps: vec![RpgMakerLocationStep::key(key)],
+        };
+        let existing = MutationClaimSet::from_locks(vec![MutationResourceLock::new(
+            resource("b"),
+            MutationResourceAccess::Exclusive,
+        )])
+        .expect("现存 Claim 应合法");
+        let failing = MutationClaimSet::from_locks(vec![
+            MutationResourceLock::new(resource("a"), MutationResourceAccess::Intent),
+            MutationResourceLock::new(resource("b"), MutationResourceAccess::Intent),
+            MutationResourceLock::new(resource("c"), MutationResourceAccess::Intent),
+        ])
+        .expect("当前组自身应合法");
+        let after_failure_left = MutationClaimSet::from_locks(vec![MutationResourceLock::new(
+            resource("a"),
+            MutationResourceAccess::Exclusive,
+        )])
+        .expect("冲突点前的后续 Claim 应合法");
+        let after_failure_right = MutationClaimSet::from_locks(vec![MutationResourceLock::new(
+            resource("c"),
+            MutationResourceAccess::Exclusive,
+        )])
+        .expect("冲突点后的后续 Claim 应合法");
+        let mut index = MutationClaimIndex::default();
+
+        index.insert(&existing).expect("首组应可登记");
+        assert_eq!(index.next_group_index, 1);
+        index.insert(&failing).expect_err("第二组必须冲突");
+        assert_eq!(index.next_group_index, 1, "失败插入不得消耗文本组声明序号");
+        index
+            .insert(&after_failure_left)
+            .expect("失败组在冲突点前登记的空闲资源必须回滚");
+        index
+            .insert(&after_failure_right)
+            .expect("失败组在冲突点后登记的空闲资源也必须回滚");
+        assert_eq!(index.next_group_index, 3);
     }
 
     #[test]

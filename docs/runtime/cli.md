@@ -158,11 +158,13 @@ Extract、Translate、WriteBack 的非空 Lua 主程序按阶段分别保存在�
 ```text
 解析 UI locale、进度模式、CLI 意图和必填 --config
   ↓
-受限读取一次 TOML，检查完整语法与未知顶层分区
+完整读取一次 TOML，检查 UTF-8、完整语法与未知顶层分区
   ↓
-建立通用受信配置并尝试启动普通项目日志（失败时使用 no-op）
+建立通用受信配置
   ↓
 取得对应版本的项目租约，读取项目事实和保存方案
+  ↓ 工作区合法建立后
+启动本 RunId 独占的项目 JSONL（失败时明确警告并降级）
   ↓
 把显式输入、项目状态或产品行为解析为本次完整方案
   ↓
@@ -176,13 +178,14 @@ Extract、Translate、WriteBack 的非空 Lua 主程序按阶段分别保存在�
 Translate 在选定显式或保存的 Profile 后，精确选择当前配置中的 Profile 及其 Client；
 项目开启后取得 metadata 的规范 `LanguagePair`，再按 `[prompts].locale` 选择
 `<prompts.root>/rpg_maker/<locale>/system.md`，用两个项目 `LanguageId` 渲染模板。仅当
-`thinking_output = true` 时读取并追加同 locale 的 `thinking.md`。没有父语言、中文、
-英文、目录首项或旧语言对文件回退。只有最终方案启用某阶段 Lua 时才构造 Lua Runtime；
-配置中存在 `runtime.lua` 本身不会启用程序。
+`thinking_output = true` 时读取并追加同 locale 的 `thinking.md`。Prompt 只按所选 locale
+的精确路径读取。只有最终方案启用某阶段 Lua 时才构造程序固定策略的 Lua Runtime；配置
+不包含 Lua Runtime 分区。
 
 Extract、Translate 与 WriteBack 各自在命令生命周期内构造一个私有 Rayon CPU 池。
-文档解析、规则扫描、资产编解码、规划准备与写回计算共享同一线程和准入预算。等待 CPU
-准入时取消则任务不执行；已经准入的任务会完成，shutdown 停止新准入并排空已接管作业。
+文档解析、规则扫描、资产编解码、规划准备与写回计算共享操作系统可用并行度。饱和只会
+自然背压；等待时取消则任务不执行，已经准入的任务会完成，shutdown 停止新准入并排空
+已接管作业。
 
 ## 5. 进度与输出通道
 
@@ -223,8 +226,9 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 <projects.root>/.att-locks/directory-publish/<engine>/
 ```
 
-同一版本同一项目的四个命令互斥；不同版本的同名项目独立。锁顺序固定为“项目租约 →
-目录发布锁 → SQLite/session”。超时返回稳定的“项目不存在或正忙”结果，不继续副作用。
+同一引擎版本、同一项目的四个命令互斥；不同引擎版本的同名项目独立。锁顺序固定为
+“项目租约 → 目录发布锁 → SQLite/session”。等待项目租约、目录发布锁或 SQLite busy
+不设置任意截止时间；等待过程响应 Ctrl-C/shutdown，取消后不开始后续副作用。
 
 第一次 Ctrl-C 后停止派生新阶段；SQLite、发布、CPU 和 HTTP 已接管的工作继续到明确终态。
 候选尚未发布时 discard；publish 已开始时等待终态。运行方案不在取消路径保存。普通项目
@@ -232,9 +236,16 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 
 ## 7. 日志、退出码与安全诊断
 
-项目日志是不可失败的可观测性旁路，不是网络请求、数据库提交、目录发布、恢复、取消或
-成功退出的门禁。启动、排队、写入、轮转、保留和关闭故障最多产生一次本地化警告，不
-改变原本的成功、失败或取消退出码。详细契约见[普通项目日志](project-log.md)。
+项目日志是可降级的可观测性旁路，不是网络请求、数据库提交、目录发布、恢复、取消或
+成功退出的门禁。工作区合法建立后，每个 RunId 独占一个 JSONL 文件；日志不共享活动
+文件、不轮转，也不按大小丢弃事实。建立、写入、flush、sync 或关闭失败时，stderr 必须
+显示日志路径、具体操作和清理后的底层原因，但不改变原本的成功、失败或取消退出码。
+详细契约见[普通项目日志](project-log.md)。
+
+项目日志建立后的命令 panic 由命令边界转换成 `internal.operation` 安全诊断：CLI 与
+JSONL 都显示实际命令阶段、项目工作区、日志路径和 `outcome_unknown` 影响，绝不显示
+panic payload；JSONL 以未知终态完成，CLI 退出 `1`。只有日志建立前或日志无法建立时的
+panic 才由最外层进程兜底直接写 stderr。
 
 | 退出码 | 含义 |
 |---|---|
@@ -243,6 +254,8 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 | `1` | 配置、输入、业务或技术错误；非日志 shutdown 失败；运行方案保存失败或终态未知 |
 | `130` | Ctrl-C 后完成受控收尾；日志故障仍保持 `130` |
 
-错误统一说明“发生了什么、影响是什么、如何处理”。用户可修复错误只呈现清理后的路径、
-行列、字段、稳定原因和建议，不输出任意 `Debug`、内部来源链、配置原文、API key、Header、
-Client parameters、Prompt、完整模型消息、模型正文、原文或译文。
+错误统一说明错误码、阶段、对象或路径、具体原因、稳定底层代码、状态影响、处理办法和
+恢复位置。OS 系统消息、SQLite primary/extended code、HTTP 状态与允许公开的供应商
+code/type 在清理控制字符后明示；不得用责任域类别替代具体原因。输出不读取任意 `Debug`
+或内部来源链，也不泄露配置原文、API key、Header 值、Client parameters 值、Prompt、
+完整模型消息、模型正文、原文或译文。

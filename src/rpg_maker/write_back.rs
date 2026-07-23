@@ -11,6 +11,7 @@ use super::ProjectName;
 use super::SelectedLua;
 use super::project::{ExistingProjectOpener, OpenedProject, RpgMakerWriteBackLayoutProfile};
 use super::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
+use crate::diagnostic::{DiagnosticImpact, DiagnosticStage, FailureReport};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::RpgMakerLayout;
@@ -229,6 +230,20 @@ where
         &self,
         candidate: Self::Candidate,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// 命令边界只消费 Publisher 主动提供的安全投影，不解析任意错误链。
+pub(crate) trait WriteBackPublishingDiagnostic: Sized {
+    fn into_write_back_failure_report(
+        self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+    ) -> FailureReport;
+}
+
+/// Lua 写回实现保留脚本、候选与 Host 子阶段后提供的安全投影。
+pub(crate) trait WriteBackLuaDiagnostic: Sized {
+    fn into_write_back_failure_report(self) -> FailureReport;
 }
 
 /// 在尚未发布的完整候选上运行一个可信 Lua 写回程序。
@@ -528,6 +543,7 @@ pub(crate) enum WriteBackServiceError<OE, SE, PE, LE, KE> {
 }
 
 /// 写回失败已经造成的最高层用户影响。
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WriteBackFailureImpact {
     ProjectUnavailable,
@@ -537,6 +553,7 @@ pub(crate) enum WriteBackFailureImpact {
     Internal,
 }
 
+#[cfg(test)]
 impl<OE, SE, PE, LE, KE> WriteBackServiceError<OE, SE, PE, LE, KE> {
     /// 将候选与目录发布终态归并为命令边界可以准确呈现的用户影响。
     pub(crate) fn failure_impact(&self) -> WriteBackFailureImpact {

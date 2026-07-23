@@ -3,154 +3,9 @@
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroUsize;
-
-/// 单次 Lua Host 值转换能够占用的资源上限。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HostValueBudget {
-    max_bytes: NonZeroUsize,
-    max_nodes: NonZeroUsize,
-    max_depth: NonZeroUsize,
-}
-
-impl HostValueBudget {
-    pub(crate) const fn new(
-        max_bytes: NonZeroUsize,
-        max_nodes: NonZeroUsize,
-        max_depth: NonZeroUsize,
-    ) -> Self {
-        Self {
-            max_bytes,
-            max_nodes,
-            max_depth,
-        }
-    }
-
-    pub(crate) const fn max_bytes(self) -> NonZeroUsize {
-        self.max_bytes
-    }
-
-    pub(crate) const fn max_nodes(self) -> NonZeroUsize {
-        self.max_nodes
-    }
-
-    pub(crate) const fn max_depth(self) -> NonZeroUsize {
-        self.max_depth
-    }
-}
-
-/// 一次 Lua/Host 值转换使用的统一预算计数器。
-///
-/// 根值深度为 1；容器和标量各计一个节点；字符串与二进制叶子的原始字节共同计入
-/// `max_bytes`。协议固定字段名不属于调用值，动态键和值才计入字节预算。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HostValueBudgetTracker {
-    budget: HostValueBudget,
-    bytes: usize,
-    nodes: usize,
-}
-
-impl HostValueBudgetTracker {
-    pub(crate) const fn new(budget: HostValueBudget) -> Self {
-        Self {
-            budget,
-            bytes: 0,
-            nodes: 0,
-        }
-    }
-
-    pub(crate) fn container(&mut self, depth: usize) -> Result<(), HostValueBudgetExceeded> {
-        self.node(depth)
-    }
-
-    pub(crate) fn scalar(&mut self, depth: usize) -> Result<(), HostValueBudgetExceeded> {
-        self.node(depth)
-    }
-
-    pub(crate) fn string(
-        &mut self,
-        depth: usize,
-        value: &str,
-    ) -> Result<(), HostValueBudgetExceeded> {
-        self.node(depth)?;
-        self.bytes(value.len())
-    }
-
-    pub(crate) fn binary(
-        &mut self,
-        depth: usize,
-        value: &[u8],
-    ) -> Result<(), HostValueBudgetExceeded> {
-        self.binary_len(depth, value.len())
-    }
-
-    pub(crate) fn binary_len(
-        &mut self,
-        depth: usize,
-        length: usize,
-    ) -> Result<(), HostValueBudgetExceeded> {
-        self.node(depth)?;
-        self.bytes(length)
-    }
-
-    fn node(&mut self, depth: usize) -> Result<(), HostValueBudgetExceeded> {
-        if depth > self.budget.max_depth.get() {
-            return Err(HostValueBudgetExceeded::Depth {
-                maximum: self.budget.max_depth.get(),
-            });
-        }
-        self.nodes = self
-            .nodes
-            .checked_add(1)
-            .ok_or(HostValueBudgetExceeded::Nodes {
-                maximum: self.budget.max_nodes.get(),
-            })?;
-        if self.nodes > self.budget.max_nodes.get() {
-            return Err(HostValueBudgetExceeded::Nodes {
-                maximum: self.budget.max_nodes.get(),
-            });
-        }
-        Ok(())
-    }
-
-    fn bytes(&mut self, additional: usize) -> Result<(), HostValueBudgetExceeded> {
-        self.bytes = self
-            .bytes
-            .checked_add(additional)
-            .ok_or(HostValueBudgetExceeded::Bytes {
-                maximum: self.budget.max_bytes.get(),
-            })?;
-        if self.bytes > self.budget.max_bytes.get() {
-            return Err(HostValueBudgetExceeded::Bytes {
-                maximum: self.budget.max_bytes.get(),
-            });
-        }
-        Ok(())
-    }
-}
-
-/// Lua/Host 值转换超过统一资源预算。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HostValueBudgetExceeded {
-    Bytes { maximum: usize },
-    Nodes { maximum: usize },
-    Depth { maximum: usize },
-}
-
-impl fmt::Display for HostValueBudgetExceeded {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Bytes { maximum } => write!(formatter, "Host 值字节数超过上限 {maximum}"),
-            Self::Nodes { maximum } => write!(formatter, "Host 值节点数超过上限 {maximum}"),
-            Self::Depth { maximum } => write!(formatter, "Host 值嵌套深度超过上限 {maximum}"),
-        }
-    }
-}
-
-impl Error for HostValueBudgetExceeded {}
 
 /// 保留 JSON number 原文的中间值。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum LosslessJsonValue {
     Null,
     Boolean(bool),
@@ -160,19 +15,124 @@ pub(crate) enum LosslessJsonValue {
     Object(Vec<(String, Self)>),
 }
 
-/// 严格 JSON 解析或资源预算失败。
+impl LosslessJsonValue {
+    pub(crate) fn take_object_value(&mut self, key: &str) -> Option<Self> {
+        let Self::Object(entries) = self else {
+            return None;
+        };
+        entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| std::mem::replace(value, Self::Null))
+    }
+
+    pub(crate) fn take_array_value(&mut self, index: usize) -> Option<Self> {
+        let Self::Array(values) = self else {
+            return None;
+        };
+        values
+            .get_mut(index)
+            .map(|value| std::mem::replace(value, Self::Null))
+    }
+}
+
+impl Clone for LosslessJsonValue {
+    fn clone(&self) -> Self {
+        enum Work<'a> {
+            Value(&'a LosslessJsonValue),
+            Array(usize),
+            Object(Vec<String>),
+        }
+
+        let mut work = vec![Work::Value(self)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Value(Self::Null) => values.push(Self::Null),
+                Work::Value(Self::Boolean(value)) => values.push(Self::Boolean(*value)),
+                Work::Value(Self::String(value)) => values.push(Self::String(value.clone())),
+                Work::Value(Self::Number(value)) => values.push(Self::Number(value.clone())),
+                Work::Value(Self::Array(items)) => {
+                    work.push(Work::Array(items.len()));
+                    work.extend(items.iter().rev().map(Work::Value));
+                }
+                Work::Value(Self::Object(entries)) => {
+                    work.push(Work::Object(
+                        entries.iter().map(|(key, _)| key.clone()).collect(),
+                    ));
+                    work.extend(entries.iter().rev().map(|(_, value)| Work::Value(value)));
+                }
+                Work::Array(length) => {
+                    let start = values.len() - length;
+                    let children = values.split_off(start);
+                    values.push(Self::Array(children));
+                }
+                Work::Object(keys) => {
+                    let start = values.len() - keys.len();
+                    let children = values.split_off(start);
+                    values.push(Self::Object(keys.into_iter().zip(children).collect()));
+                }
+            }
+        }
+        values.pop().expect("根 JSON 值必须产生一个克隆")
+    }
+}
+
+impl PartialEq for LosslessJsonValue {
+    fn eq(&self, other: &Self) -> bool {
+        let mut work = vec![(self, other)];
+        while let Some((left, right)) = work.pop() {
+            match (left, right) {
+                (Self::Null, Self::Null) => {}
+                (Self::Boolean(left), Self::Boolean(right)) if left == right => {}
+                (Self::String(left), Self::String(right)) if left == right => {}
+                (Self::Number(left), Self::Number(right)) if left == right => {}
+                (Self::Array(left), Self::Array(right)) if left.len() == right.len() => {
+                    work.extend(left.iter().zip(right).rev());
+                }
+                (Self::Object(left), Self::Object(right)) if left.len() == right.len() => {
+                    for ((left_key, left_value), (right_key, right_value)) in
+                        left.iter().zip(right).rev()
+                    {
+                        if left_key != right_key {
+                            return false;
+                        }
+                        work.push((left_value, right_value));
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Drop for LosslessJsonValue {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        take_children(self, &mut pending);
+        while let Some(mut value) = pending.pop() {
+            take_children(&mut value, &mut pending);
+        }
+    }
+}
+
+fn take_children(value: &mut LosslessJsonValue, pending: &mut Vec<LosslessJsonValue>) {
+    match value {
+        LosslessJsonValue::Array(values) => pending.append(values),
+        LosslessJsonValue::Object(entries) => {
+            pending.extend(entries.drain(..).map(|(_, value)| value));
+        }
+        LosslessJsonValue::Null
+        | LosslessJsonValue::Boolean(_)
+        | LosslessJsonValue::String(_)
+        | LosslessJsonValue::Number(_) => {}
+    }
+}
+
+/// 严格 JSON 解析失败。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LosslessJsonError {
-    InputTooLarge {
-        actual: usize,
-        maximum: usize,
-    },
-    NodeLimitExceeded {
-        maximum: usize,
-    },
-    DepthLimitExceeded {
-        maximum: usize,
-    },
     Syntax {
         byte_offset: usize,
         reason: &'static str,
@@ -185,15 +145,6 @@ pub(crate) enum LosslessJsonError {
 impl fmt::Display for LosslessJsonError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InputTooLarge { actual, maximum } => {
-                write!(formatter, "JSON 输入为 {actual} 字节，超过上限 {maximum}")
-            }
-            Self::NodeLimitExceeded { maximum } => {
-                write!(formatter, "JSON 节点数超过上限 {maximum}")
-            }
-            Self::DepthLimitExceeded { maximum } => {
-                write!(formatter, "JSON 嵌套深度超过上限 {maximum}")
-            }
             Self::Syntax {
                 byte_offset,
                 reason,
@@ -207,25 +158,14 @@ impl fmt::Display for LosslessJsonError {
 
 impl Error for LosslessJsonError {}
 
-/// 解析一个完整、严格且受预算约束的 JSON 值。
-pub(crate) fn decode(
-    source: &str,
-    budget: HostValueBudget,
-) -> Result<LosslessJsonValue, LosslessJsonError> {
-    if source.len() > budget.max_bytes.get() {
-        return Err(LosslessJsonError::InputTooLarge {
-            actual: source.len(),
-            maximum: budget.max_bytes.get(),
-        });
-    }
+/// 解析一个完整且严格的 JSON 值。
+pub(crate) fn decode(source: &str) -> Result<LosslessJsonValue, LosslessJsonError> {
     let mut parser = Parser {
         source,
         position: 0,
-        nodes: 0,
-        budget,
     };
     parser.skip_whitespace();
-    let value = parser.parse_value(1)?;
+    let value = parser.parse_value()?;
     parser.skip_whitespace();
     if parser.position != source.len() {
         return Err(parser.syntax("顶层值之后存在额外内容"));
@@ -248,118 +188,145 @@ pub(crate) fn validate_number(source: &str) -> Result<(), LosslessJsonError> {
 struct Parser<'a> {
     source: &'a str,
     position: usize,
-    nodes: usize,
-    budget: HostValueBudget,
 }
 
 impl Parser<'_> {
-    fn parse_value(&mut self, depth: usize) -> Result<LosslessJsonValue, LosslessJsonError> {
-        if depth > self.budget.max_depth.get() {
-            return Err(LosslessJsonError::DepthLimitExceeded {
-                maximum: self.budget.max_depth.get(),
-            });
-        }
-        self.nodes = self
-            .nodes
-            .checked_add(1)
-            .ok_or(LosslessJsonError::NodeLimitExceeded {
-                maximum: self.budget.max_nodes.get(),
-            })?;
-        if self.nodes > self.budget.max_nodes.get() {
-            return Err(LosslessJsonError::NodeLimitExceeded {
-                maximum: self.budget.max_nodes.get(),
-            });
+    fn parse_value(&mut self) -> Result<LosslessJsonValue, LosslessJsonError> {
+        enum Frame {
+            Array(Vec<LosslessJsonValue>),
+            Object {
+                entries: Vec<(String, LosslessJsonValue)>,
+                keys: HashSet<String>,
+                pending_key: String,
+            },
         }
 
-        match self.peek_byte() {
-            Some(b'n') => {
-                self.consume_literal(b"null")?;
-                Ok(LosslessJsonValue::Null)
+        let mut frames = Vec::new();
+        let mut completed = None;
+        loop {
+            if let Some(value) = completed.take() {
+                let Some(frame) = frames.last_mut() else {
+                    return Ok(value);
+                };
+                match frame {
+                    Frame::Array(values) => values.push(value),
+                    Frame::Object {
+                        entries,
+                        pending_key,
+                        ..
+                    } => entries.push((std::mem::take(pending_key), value)),
+                }
+                self.skip_whitespace();
+
+                let closing = match frame {
+                    Frame::Array(_) if self.consume_if(b']') => true,
+                    Frame::Object { .. } if self.consume_if(b'}') => true,
+                    Frame::Array(_) => {
+                        if !self.consume_if(b',') {
+                            return Err(self.syntax("JSON array 项之间缺少逗号或结束括号"));
+                        }
+                        self.skip_whitespace();
+                        if self.peek_byte() == Some(b']') {
+                            return Err(self.syntax("JSON array 不允许尾逗号"));
+                        }
+                        false
+                    }
+                    Frame::Object {
+                        keys, pending_key, ..
+                    } => {
+                        if !self.consume_if(b',') {
+                            return Err(self.syntax("JSON object 项之间缺少逗号或结束括号"));
+                        }
+                        self.skip_whitespace();
+                        if self.peek_byte() == Some(b'}') {
+                            return Err(self.syntax("JSON object 不允许尾逗号"));
+                        }
+                        *pending_key = self.parse_object_key(keys)?;
+                        false
+                    }
+                };
+                if closing {
+                    completed = Some(match frames.pop().expect("已检查 frame 存在") {
+                        Frame::Array(values) => LosslessJsonValue::Array(values),
+                        Frame::Object { entries, .. } => LosslessJsonValue::Object(entries),
+                    });
+                }
+                continue;
             }
-            Some(b't') => {
-                self.consume_literal(b"true")?;
-                Ok(LosslessJsonValue::Boolean(true))
-            }
-            Some(b'f') => {
-                self.consume_literal(b"false")?;
-                Ok(LosslessJsonValue::Boolean(false))
-            }
-            Some(b'"') => self.parse_string().map(LosslessJsonValue::String),
-            Some(b'[') => self.parse_array(depth),
-            Some(b'{') => self.parse_object(depth),
-            Some(b'-' | b'0'..=b'9') => {
-                let start = self.position;
-                self.position = scan_number(self.source.as_bytes(), start)?;
-                Ok(LosslessJsonValue::Number(
-                    self.source[start..self.position].to_owned(),
-                ))
-            }
-            Some(_) => Err(self.syntax("期望 JSON value")),
-            None => Err(self.syntax("缺少 JSON value")),
+
+            completed = match self.peek_byte() {
+                Some(b'n') => {
+                    self.consume_literal(b"null")?;
+                    Some(LosslessJsonValue::Null)
+                }
+                Some(b't') => {
+                    self.consume_literal(b"true")?;
+                    Some(LosslessJsonValue::Boolean(true))
+                }
+                Some(b'f') => {
+                    self.consume_literal(b"false")?;
+                    Some(LosslessJsonValue::Boolean(false))
+                }
+                Some(b'"') => Some(LosslessJsonValue::String(self.parse_string()?)),
+                Some(b'[') => {
+                    self.position += 1;
+                    self.skip_whitespace();
+                    if self.consume_if(b']') {
+                        Some(LosslessJsonValue::Array(Vec::new()))
+                    } else {
+                        frames.push(Frame::Array(Vec::new()));
+                        None
+                    }
+                }
+                Some(b'{') => {
+                    self.position += 1;
+                    self.skip_whitespace();
+                    if self.consume_if(b'}') {
+                        Some(LosslessJsonValue::Object(Vec::new()))
+                    } else {
+                        let mut keys = HashSet::new();
+                        let pending_key = self.parse_object_key(&mut keys)?;
+                        frames.push(Frame::Object {
+                            entries: Vec::new(),
+                            keys,
+                            pending_key,
+                        });
+                        None
+                    }
+                }
+                Some(b'-' | b'0'..=b'9') => {
+                    let start = self.position;
+                    self.position = scan_number(self.source.as_bytes(), start)?;
+                    Some(LosslessJsonValue::Number(
+                        self.source[start..self.position].to_owned(),
+                    ))
+                }
+                Some(_) => return Err(self.syntax("期望 JSON value")),
+                None => return Err(self.syntax("缺少 JSON value")),
+            };
         }
     }
 
-    fn parse_array(&mut self, depth: usize) -> Result<LosslessJsonValue, LosslessJsonError> {
-        self.position += 1;
+    fn parse_object_key(
+        &mut self,
+        keys: &mut HashSet<String>,
+    ) -> Result<String, LosslessJsonError> {
+        if self.peek_byte() != Some(b'"') {
+            return Err(self.syntax("JSON object 键必须是字符串"));
+        }
+        let key_offset = self.position;
+        let key = self.parse_string()?;
+        if !keys.insert(key.clone()) {
+            return Err(LosslessJsonError::DuplicateObjectKey {
+                byte_offset: key_offset,
+            });
+        }
         self.skip_whitespace();
-        let mut values = Vec::new();
-        if self.consume_if(b']') {
-            return Ok(LosslessJsonValue::Array(values));
+        if !self.consume_if(b':') {
+            return Err(self.syntax("JSON object 键后缺少冒号"));
         }
-        loop {
-            values.push(self.parse_value(depth + 1)?);
-            self.skip_whitespace();
-            if self.consume_if(b']') {
-                return Ok(LosslessJsonValue::Array(values));
-            }
-            if !self.consume_if(b',') {
-                return Err(self.syntax("JSON array 项之间缺少逗号或结束括号"));
-            }
-            self.skip_whitespace();
-            if self.peek_byte() == Some(b']') {
-                return Err(self.syntax("JSON array 不允许尾逗号"));
-            }
-        }
-    }
-
-    fn parse_object(&mut self, depth: usize) -> Result<LosslessJsonValue, LosslessJsonError> {
-        self.position += 1;
         self.skip_whitespace();
-        let mut entries = Vec::new();
-        let mut keys = HashSet::new();
-        if self.consume_if(b'}') {
-            return Ok(LosslessJsonValue::Object(entries));
-        }
-        loop {
-            if self.peek_byte() != Some(b'"') {
-                return Err(self.syntax("JSON object 键必须是字符串"));
-            }
-            let key_offset = self.position;
-            let key = self.parse_string()?;
-            if !keys.insert(key.clone()) {
-                return Err(LosslessJsonError::DuplicateObjectKey {
-                    byte_offset: key_offset,
-                });
-            }
-            self.skip_whitespace();
-            if !self.consume_if(b':') {
-                return Err(self.syntax("JSON object 键后缺少冒号"));
-            }
-            self.skip_whitespace();
-            let value = self.parse_value(depth + 1)?;
-            entries.push((key, value));
-            self.skip_whitespace();
-            if self.consume_if(b'}') {
-                return Ok(LosslessJsonValue::Object(entries));
-            }
-            if !self.consume_if(b',') {
-                return Err(self.syntax("JSON object 项之间缺少逗号或结束括号"));
-            }
-            self.skip_whitespace();
-            if self.peek_byte() == Some(b'}') {
-                return Err(self.syntax("JSON object 不允许尾逗号"));
-            }
-        }
+        Ok(key)
     }
 
     fn parse_string(&mut self) -> Result<String, LosslessJsonError> {
@@ -551,21 +518,11 @@ const fn number_syntax(byte_offset: usize, reason: &'static str) -> LosslessJson
 mod tests {
     use super::*;
 
-    fn budget(bytes: usize, nodes: usize, depth: usize) -> HostValueBudget {
-        HostValueBudget::new(
-            NonZeroUsize::new(bytes).unwrap(),
-            NonZeroUsize::new(nodes).unwrap(),
-            NonZeroUsize::new(depth).unwrap(),
-        )
-    }
-
     #[test]
     fn decodes_unicode_escapes_and_preserves_number_text() {
-        let value = decode(
-            r#"{"文本":"\uD83D\uDE00","numbers":[0,-0,1.25,1e999,9223372036854775808]}"#,
-            budget(1024, 16, 4),
-        )
-        .unwrap();
+        let value =
+            decode(r#"{"文本":"\uD83D\uDE00","numbers":[0,-0,1.25,1e999,9223372036854775808]}"#)
+                .unwrap();
         assert_eq!(
             value,
             LosslessJsonValue::Object(vec![
@@ -590,7 +547,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_keys_after_escape_decoding() {
         assert!(matches!(
-            decode(r#"{"a":1,"\u0061":2}"#, budget(64, 8, 3)),
+            decode(r#"{"a":1,"\u0061":2}"#),
             Err(LosslessJsonError::DuplicateObjectKey { .. })
         ));
     }
@@ -619,54 +576,43 @@ mod tests {
             r#""\uDC00""#,
             r#""unterminated"#,
         ] {
-            assert!(
-                decode(invalid, budget(1024, 32, 8)).is_err(),
-                "{invalid:?} 应被拒绝"
-            );
+            assert!(decode(invalid).is_err(), "{invalid:?} 应被拒绝");
         }
     }
 
     #[test]
-    fn enforces_bytes_nodes_and_root_based_depth() {
-        assert!(matches!(
-            decode("   null", budget(6, 2, 2)),
-            Err(LosslessJsonError::InputTooLarge { .. })
-        ));
-        assert!(matches!(
-            decode("[1,2]", budget(32, 2, 2)),
-            Err(LosslessJsonError::NodeLimitExceeded { maximum: 2 })
-        ));
-        assert!(matches!(
-            decode("[[1]]", budget(32, 3, 2)),
-            Err(LosslessJsonError::DepthLimitExceeded { maximum: 2 })
-        ));
-        decode("[1,2]", budget(32, 3, 2)).unwrap();
+    fn deeply_nested_values_parse_clone_compare_and_drop_without_using_the_rust_stack() {
+        const DEPTH: usize = 20_000;
+        let mut source = "[".repeat(DEPTH);
+        source.push_str("null");
+        source.push_str(&"]".repeat(DEPTH));
+
+        let value = decode(&source).unwrap();
+        let cloned = value.clone();
+        assert_eq!(value, cloned);
+
+        let mut current = &value;
+        for _ in 0..DEPTH {
+            let LosslessJsonValue::Array(values) = current else {
+                panic!("每一层都应是 JSON array");
+            };
+            assert_eq!(values.len(), 1);
+            current = &values[0];
+        }
+        assert!(matches!(current, LosslessJsonValue::Null));
     }
 
     #[test]
-    fn host_value_tracker_applies_one_root_based_model_to_all_dimensions() {
-        let mut bytes = HostValueBudgetTracker::new(budget(3, 8, 4));
-        bytes.container(1).unwrap();
-        assert!(matches!(bytes.string(2, "四"), Ok(())));
-        assert!(matches!(bytes.scalar(2), Ok(())));
-        assert!(matches!(
-            bytes.string(2, "x"),
-            Err(HostValueBudgetExceeded::Bytes { maximum: 3 })
-        ));
-
-        let mut nodes = HostValueBudgetTracker::new(budget(64, 2, 4));
-        nodes.container(1).unwrap();
-        nodes.scalar(2).unwrap();
-        assert!(matches!(
-            nodes.scalar(2),
-            Err(HostValueBudgetExceeded::Nodes { maximum: 2 })
-        ));
-
-        let mut depth = HostValueBudgetTracker::new(budget(64, 8, 2));
-        depth.container(1).unwrap();
-        assert!(matches!(
-            depth.scalar(3),
-            Err(HostValueBudgetExceeded::Depth { maximum: 2 })
-        ));
+    fn parses_a_seventeen_mibibyte_string_without_an_att_size_check() {
+        const PAYLOAD_BYTES: usize = 17 * 1024 * 1024;
+        let mut source = String::with_capacity(PAYLOAD_BYTES + 2);
+        source.push('"');
+        source.extend(std::iter::repeat_n('x', PAYLOAD_BYTES));
+        source.push('"');
+        let value = decode(&source).unwrap();
+        let LosslessJsonValue::String(value) = &value else {
+            panic!("顶层值应是字符串")
+        };
+        assert_eq!(value.len(), PAYLOAD_BYTES);
     }
 }

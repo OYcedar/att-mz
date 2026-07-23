@@ -50,21 +50,6 @@ cli-argument-conflict = { $argument } нельзя использовать с �
 cli-wrong-number-of-values = Для { $argument } указано неверное количество значений.
 cli-invalid-utf8 = Аргумент командной строки не является допустимым Unicode.
 cli-parse-failure = Не удалось разобрать командную строку.
-error-configuration-or-input-generic = Конфигурация или параметры команды недопустимы, поэтому ничего не изменено. Проверьте указанные параметры и поля конфигурации, затем повторите.
-error-config-current-directory-not-absolute = ATT не может разрешить --config: текущий рабочий каталог { $path } не является абсолютным. Запустите ATT из допустимого каталога или укажите абсолютный путь конфигурации.
-error-config-empty-path = --config не может быть пустым. Укажите путь к файлу конфигурации ATT.
-error-config-open = ATT не может открыть файл конфигурации { $path }. Проверьте, что файл существует и доступен для чтения.
-error-config-not-a-file = Путь конфигурации { $path } не указывает на обычный файл. Укажите файл конфигурации, а не каталог или специальный файл.
-error-config-too-large = Размер файла конфигурации { $path } — { $observed } байт; предел — { $maximum } байт. Уменьшите файл и повторите.
-error-config-read = ATT не может прочитать файл конфигурации { $path }. Проверьте права и состояние хранилища, затем повторите.
-error-config-invalid-utf8-known-length = Файл конфигурации { $path } не является допустимым UTF-8. Допустимый префикс — { $valid } байт, недопустимая последовательность — { $length } байт. Сохраните файл в UTF-8 и повторите.
-error-config-invalid-utf8-unknown-length = Файл конфигурации { $path } не является допустимым UTF-8 после байта { $valid }. Сохраните файл в UTF-8 и повторите.
-error-config-invalid-toml-at = Файл конфигурации { $path }, строка { $line }, столбец { $column }, содержит недопустимый TOML в { $resource }. Исправьте раздел по текущему контракту конфигурации и повторите.
-error-config-invalid-toml = Файл конфигурации { $path } содержит недопустимый TOML в { $resource }. Исправьте раздел по текущему контракту конфигурации и повторите.
-error-config-invalid-value = Значение поля конфигурации { $field } недопустимо. Сверьте поле с текущей документацией и повторите.
-error-config-invalid-value-at-path = Значение поля конфигурации { $field } в { $path } недопустимо. Сверьте поле с текущей документацией и повторите.
-error-config-profile-not-found = В файле конфигурации { $path } нет Profile перевода с именем { $profile }. Добавьте его или укажите ID существующего Profile.
-error-config-profile-conflict = Файл конфигурации { $path } запрашивает Profile { $requested }, но команда уже выбрала { $explicit }. Используйте один Profile в обоих местах или удалите один выбор.
 log-label-phase-check-project = проверка проекта
 log-label-phase-scan-source = сканирование источника
 log-label-phase-prepare-candidate = подготовка кандидата
@@ -84,19 +69,7 @@ log-label-task-complete = полностью
 log-label-task-partial = частично
 log-label-task-unavailable = недоступно
 log-label-task-failed = ошибка
-error-project-unavailable = Проект не существует или занят. Проверьте имя и повторите после завершения другого запуска.
-error-project-state = Состояние проекта повреждено или извлечение устарело. Повторите соответствующую команду Init или Extract.
-error-external-model = Сервис модели недоступен. Проверьте Profile и сеть, затем повторите.
 error-state-applied-finalization = Результат применён, но завершение не удалось. Перед повтором проверьте состояние проекта.
-error-outcome-unknown = Итоговый результат нельзя подтвердить. Сохраните рабочую область и проверьте сведения о восстановлении перед повтором.
-error-internal = В ATT произошёл внутренний сбой. Секреты и содержимое модели не выводились.
-error-shutdown = Обязательное завершение runtime не удалось.
-error-no-reusable-extract-plan = У проекта нет сохранённого плана Extract. Укажите хотя бы --builtin, --rules или --lua.
-error-init-path-required = У проекта нет сохранённого исходного пути Init. Укажите --path <DIR>.
-error-profile-required = У проекта нет сохранённого Profile Translate. Укажите PROFILE_ID.
-error-saved-profile-unavailable = Сохранённый Profile { $profile } отсутствует в текущей конфигурации. Явно укажите допустимый Profile.
-error-rpg-maker-prompt-unavailable = Компонент промпта RPG Maker { $component } для выбранной локали { $locale } по пути { $path } нельзя использовать, поэтому перевод не начат. Убедитесь, что путь указывает на обычный файл с непустым текстом UTF-8 и что шаблон допустим.
-error-rpg-maker-language-module-unavailable = Отсутствует модуль исходного языка, необходимый для { $source } → { $target }, поэтому перевод не начат. Добавьте модуль в текущую конфигурацию и повторите попытку.
 error-no-executable-extract-owner = После очистки не осталось исполняемых owner Extract, поэтому план не сохранён.
 error-plan-save-failed-applied = Результат команды применён, но новый план запуска не сохранён. В следующий раз явно укажите нужные параметры.
 error-plan-save-outcome-unknown = Результат команды применён, но commit плана запуска нельзя подтвердить. В следующий раз явно укажите нужные параметры.
@@ -162,9 +135,10 @@ result-translate-plan-sources = План этого успешного запу�
 log-run-started = Команда { $command } запущена.
 log-run-succeeded = Команда { $command } успешно завершена.
 log-run-failed = Команда { $command } завершилась ошибкой.
+log-run-outcome-unknown = Команда { $command } завершилась, но итоговое состояние неизвестно; используйте пути восстановления из ошибки.
 log-run-cancelled = Команда { $command } отменена.
+log-performance-counters = Счётчики производительности: попыток управления транзакциями SQLite — { $sqlite_control_attempted_total }; полных проверок дерева-кандидата начато — { $candidate_validation_started }, завершено — { $candidate_validation_completed }.
 log-plan-resolved = План команды { $command } получен из { $source }.
-log-translate-plan-resolved = План запуска Translate определён: источник Profile — { $profile_source }, источник Lua — { $lua_source }.
 log-phase-started = Этап начат: { $phase }.
 log-phase-finished = Этап завершён: { $phase }.
 log-retry-summary = { $count ->
@@ -174,12 +148,53 @@ log-retry-summary = { $count ->
    *[other] Выполнено { $count } повтора.
 }
 log-no-work = Работа не потребовалась: { $reason }.
+log-no-work-translation-up-to-date = переводы уже соответствуют текущему источнику и профилю
 log-partial-result = { $count ->
     [one] { $count } частичный результат требует внимания.
     [few] { $count } частичных результата требуют внимания.
     [many] { $count } частичных результатов требуют внимания.
    *[other] { $count } частичного результата требуют внимания.
 }
-log-publish-finished = Публикация вывода завершена: { $path }.
 log-translation-task-started = Задача перевода { $index }/{ $total } запущена.
 log-translation-task-finished = Задача перевода { $index } завершена с результатом { $outcome }.
+log-translation-task-diagnostic = Задача перевода { $index } сообщила диагностику после { $attempts } попыток: { $diagnostic }
+diagnostic-title = Ошибка [{ $code }]
+diagnostic-stage = Этап: { $stage }
+diagnostic-subject = Место: { $subject }
+diagnostic-subject-value = { $kind ->
+    [command] команда { $value }
+    [field] поле { $value }
+    [project] проект { $value }
+    [profile] профиль { $value }
+    [component] компонент { $value }
+   *[other] { $value }
+}
+diagnostic-reason = Причина: { $reason }
+diagnostic-impact = Последствия: { $impact }
+diagnostic-action = Действие: { $action }
+diagnostic-recovery = Восстановление: { $recovery }
+diagnostic-recovery-value = { $kind ->
+    [component] компонент { $value }
+    [transaction] транзакция { $value }
+   *[other] { $value }
+}
+diagnostic-related = Связанная ошибка { $index }:
+diagnostic-stage-value = { $code ->
+    [process_output] Вывод процесса
+   *[other] { $fallback }
+}
+diagnostic-impact-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-action-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-failure-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-io-kind-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-configuration-rule-value = { $code ->
+   *[other] { $fallback }{ $facts }
+}

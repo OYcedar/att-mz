@@ -7,6 +7,10 @@ use std::sync::Arc;
 use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::placeholder_token;
 use crate::rpg_maker::text::TextGroupKind;
@@ -177,14 +181,21 @@ impl Pcre2PlaceholderService {
             .flat_map(|matched| matched.protected)
             .collect::<Vec<_>>();
         selected.sort_by_key(|span| (span.start, span.end));
+        let mut max_end_span = None;
         for (index, current) in selected.iter().enumerate() {
-            for previous in &selected[..index] {
-                if current.start < previous.end && previous.start < current.end {
+            if let Some(previous_index) = max_end_span {
+                let previous: &SelectedSpan = &selected[previous_index];
+                if current.start < previous.end {
                     return Err(PlaceholderProtectionError::OverlappingMatches {
                         first: previous.diagnostic_label.clone(),
                         second: current.diagnostic_label.clone(),
                     });
                 }
+                if current.end > previous.end {
+                    max_end_span = Some(index);
+                }
+            } else {
+                max_end_span = Some(index);
             }
         }
 
@@ -452,6 +463,40 @@ impl ProtectedText {
 #[derive(Debug)]
 pub(crate) struct Pcre2PlaceholderConstructionError(pcre2::Error);
 
+impl Pcre2PlaceholderConstructionError {
+    /// 只公开 PCRE2 的稳定分类、数值代码和偏移；内置 pattern 与底层错误文本不进入投影。
+    pub(crate) fn safe_diagnostic(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+    ) -> SafeDiagnostic {
+        SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            stage,
+            DiagnosticSubject::operation("builtin_placeholder_compile"),
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InternalInvariant,
+                format!(
+                    "engine=pcre2; kind={}; code={}; offset={}",
+                    pcre2_error_kind(&self.0),
+                    self.0.code(),
+                    optional_offset(self.0.offset())
+                ),
+            ),
+            impact,
+            DiagnosticAction::ReportBug,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(pattern: &str) -> Self {
+        match compile_regex(pattern) {
+            Ok(_) => panic!("测试 pattern 必须触发 PCRE2 编译失败"),
+            Err(source) => Self(source),
+        }
+    }
+}
+
 impl fmt::Display for Pcre2PlaceholderConstructionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "无法编译内置 RPG Maker 控制符规格：{}", self.0)
@@ -462,6 +507,32 @@ impl Error for Pcre2PlaceholderConstructionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.0)
     }
+}
+
+impl SafeDiagnosticSource for Pcre2PlaceholderConstructionError {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        self.safe_diagnostic(stage, impact)
+    }
+}
+
+fn pcre2_error_kind(source: &pcre2::Error) -> &'static str {
+    match source.kind() {
+        pcre2::ErrorKind::Compile => "compile",
+        pcre2::ErrorKind::JIT => "jit",
+        pcre2::ErrorKind::Match => "match",
+        pcre2::ErrorKind::Info => "info",
+        pcre2::ErrorKind::Option => "option",
+        _ => "unknown",
+    }
+}
+
+fn optional_offset(offset: Option<usize>) -> String {
+    offset.map_or_else(|| "none".to_owned(), |value| value.to_string())
 }
 
 #[derive(Debug)]

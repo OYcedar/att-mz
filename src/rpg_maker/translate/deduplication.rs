@@ -3,7 +3,7 @@
 //! 本模块只拥有“一个翻译决策对应哪些具体位置”的领域规则。它不执行 I/O、
 //! 不切分任务，也不持久化关系；调用方必须先按 RPG Maker 自然顺序提供候选项。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
@@ -182,8 +182,8 @@ struct Family {
 pub(crate) fn deduplicate_translation_candidates(
     candidates: Vec<TranslationDeduplicationCandidate>,
 ) -> Result<TranslationDeduplicationResult, TranslationDeduplicationError> {
-    let mut family_index = HashMap::<DeduplicationKey, usize>::new();
-    let mut families = Vec::<Family>::new();
+    let mut family_index = HashMap::<DeduplicationKey, usize>::with_capacity(candidates.len());
+    let mut families = Vec::<Family>::with_capacity(candidates.len());
     for (candidate_index, candidate) in candidates.iter().enumerate() {
         let key = DeduplicationKey::from_candidate(candidate);
         let index = *family_index.entry(key).or_insert_with(|| {
@@ -226,20 +226,22 @@ fn plan_family(
     invalidations: &mut Vec<TranslationInvalidation>,
     reuses: &mut Vec<TranslationReuse>,
 ) -> Result<(), TranslationDeduplicationError> {
-    let mut valid_translations = BTreeMap::<&TextUnitContent, Vec<usize>>::new();
+    let mut seed_index = None;
+    let mut conflicting = false;
     for &index in &family.member_indices {
         let candidate = &candidates[index];
         if !candidate.invalidated
             && let Some(translation) = candidate.translation.as_ref()
         {
-            valid_translations
-                .entry(translation)
-                .or_default()
-                .push(index);
+            match seed_index {
+                None => seed_index = Some(index),
+                Some(seed) if candidates[seed].translation.as_ref() == Some(translation) => {}
+                Some(_) => conflicting = true,
+            }
         }
     }
 
-    if valid_translations.len() > 1 {
+    if conflicting {
         let conflicts = family
             .member_indices
             .iter()
@@ -263,12 +265,7 @@ fn plan_family(
         );
     }
 
-    if let Some(seed_index) = valid_translations
-        .values()
-        .next()
-        .and_then(|indices| indices.first())
-        .copied()
-    {
+    if let Some(seed_index) = seed_index {
         plan_reuse_family(family, candidates, seed_index, outcomes, reuses);
     } else {
         plan_active_family(family, candidates, outcomes, invalidations);

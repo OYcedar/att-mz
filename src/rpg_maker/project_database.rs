@@ -12,7 +12,7 @@ use crate::fingerprint::{InvalidSha256FingerprintLength, Sha256Fingerprint};
 use crate::language::{LanguageId, LanguageIdError, LanguagePair};
 use crate::rpg_maker::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
-use crate::rpg_maker::dialogue::MvDialogueDefinition;
+use crate::rpg_maker::dialogue::{MvDialogueDefinition, MvDialogueDefinitionError};
 use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
 use crate::storage::sqlite::{
     CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand,
@@ -129,8 +129,12 @@ const CREATE_STANDARD_MUTATION_CLAIM_TABLE: &str = r#"CREATE TABLE standard_muta
         REFERENCES standard_text_group(owner, group_location) ON DELETE CASCADE
 )"#;
 
-const CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX: &str = "CREATE INDEX standard_mutation_claim_resource_idx ON standard_mutation_claim(resource_key, access, owner, group_location)";
-const CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str = "CREATE INDEX standard_mutation_claim_owner_resource_idx ON standard_mutation_claim(owner, resource_key, access, group_location)";
+pub(crate) const CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX: &str = "CREATE INDEX standard_mutation_claim_resource_idx ON standard_mutation_claim(resource_key, access, owner, group_location)";
+pub(crate) const CREATE_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str = "CREATE INDEX standard_mutation_claim_owner_resource_idx ON standard_mutation_claim(owner, resource_key, access, group_location)";
+pub(crate) const DROP_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX: &str =
+    "DROP INDEX standard_mutation_claim_resource_idx";
+pub(crate) const DROP_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX: &str =
+    "DROP INDEX standard_mutation_claim_owner_resource_idx";
 
 pub(crate) const STANDARD_TRANSLATION_RESOURCE_TABLE_NAME: &str = "standard_translation_resource";
 pub(crate) const TERMINOLOGY_RESOURCE_KIND: &str = "terminology";
@@ -227,6 +231,9 @@ FROM standard_project_definition
 ORDER BY definition_kind"#;
 const SELECT_QUICK_CHECK: &str = "PRAGMA quick_check";
 const SELECT_FOREIGN_KEY_CHECK: &str = "PRAGMA foreign_key_check";
+
+const PROJECT_RECORD_QUERY_ID: &str = "project_database.project_record";
+const PROJECT_RECORD_READ_STAGE: &str = "read_project_record";
 
 const UPDATE_METADATA: &str = r#"UPDATE metadata
 SET source_language = ?1,
@@ -602,15 +609,20 @@ where
             requested_name,
         );
         let database_path = layout.database_path().to_path_buf();
+        let query =
+            SqliteQuery::new(SELECT_PROJECT_RECORD, Vec::new()).with_id(PROJECT_RECORD_QUERY_ID);
+        let query_id = query.id().to_owned();
         let rows = self
             .sqlite
-            .query_existing_database(
-                database_path.clone(),
-                SqliteQuery::new(SELECT_PROJECT_RECORD, Vec::new()),
-            )
+            .query_existing_database(database_path.clone(), query)
             .await
             .map_err(|error| {
-                ProjectDatabaseReadError::from_executor(database_path.clone(), error)
+                ProjectDatabaseReadError::from_executor(
+                    database_path.clone(),
+                    PROJECT_RECORD_READ_STAGE,
+                    query_id,
+                    error,
+                )
             })?;
 
         record_from_rows(requested_name, layout, rows)
@@ -641,6 +653,7 @@ fn record_from_rows<E>(
         return Err(ProjectDatabaseReadError::InvalidMetadata {
             path: database_path,
             reason: InvalidProjectMetadata::WrongColumnCount {
+                expected: 8,
                 actual: values.len(),
             },
         });
@@ -657,7 +670,8 @@ fn record_from_rows<E>(
         .map_err(|source| ProjectDatabaseReadError::InvalidMetadata {
             path: database_path.clone(),
             reason: InvalidProjectMetadata::InvalidDialogueDefinition {
-                message: source.to_string(),
+                stage: ProjectDefinitionStage::Decode,
+                failure: project_definition_failure(source),
             },
         })?;
     let metadata = metadata_facts_from_rows(requested_name, vec![SqliteRow::new(values)]).map_err(
@@ -699,6 +713,7 @@ fn metadata_facts_from_rows(
     let values = row.into_values();
     if values.len() != 7 {
         return Err(InvalidProjectMetadata::WrongColumnCount {
+            expected: 7,
             actual: values.len(),
         });
     }
@@ -825,6 +840,8 @@ pub(crate) enum ProjectDatabaseReadError<E> {
     },
     ReadDatabase {
         path: PathBuf,
+        stage: &'static str,
+        query_id: String,
         source: E,
     },
     InvalidMetadata {
@@ -834,10 +851,20 @@ pub(crate) enum ProjectDatabaseReadError<E> {
 }
 
 impl<E> ProjectDatabaseReadError<E> {
-    fn from_executor(path: PathBuf, error: QueryExistingDatabaseError<E>) -> Self {
+    fn from_executor(
+        path: PathBuf,
+        stage: &'static str,
+        query_id: String,
+        error: QueryExistingDatabaseError<E>,
+    ) -> Self {
         match error {
             QueryExistingDatabaseError::NotFound => Self::DatabaseNotFound { path },
-            QueryExistingDatabaseError::QueryFailed(source) => Self::ReadDatabase { path, source },
+            QueryExistingDatabaseError::QueryFailed(source) => Self::ReadDatabase {
+                path,
+                stage,
+                query_id,
+                source,
+            },
         }
     }
 
@@ -857,9 +884,16 @@ impl<E: fmt::Display> fmt::Display for ProjectDatabaseReadError<E> {
             Self::DatabaseNotFound { path } => {
                 write!(formatter, "项目数据库不存在：{}", path.display())
             }
-            Self::ReadDatabase { path, source } => {
-                write!(formatter, "无法读取项目数据库 {}：{source}", path.display())
-            }
+            Self::ReadDatabase {
+                path,
+                stage,
+                query_id,
+                source,
+            } => write!(
+                formatter,
+                "无法读取项目数据库 {}（阶段 {stage}，查询 {query_id}）：{source}",
+                path.display()
+            ),
             Self::InvalidMetadata { path, reason } => {
                 write!(
                     formatter,
@@ -886,6 +920,7 @@ pub(crate) enum InvalidProjectMetadata {
     MissingRow,
     MultipleRows,
     WrongColumnCount {
+        expected: usize,
         actual: usize,
     },
     WrongColumnType {
@@ -917,8 +952,68 @@ pub(crate) enum InvalidProjectMetadata {
         actual: usize,
     },
     InvalidDialogueDefinition {
-        message: String,
+        stage: ProjectDefinitionStage,
+        failure: ProjectDefinitionFailure,
     },
+}
+
+impl InvalidProjectMetadata {
+    /// 只从 metadata 错误仍持有的类型化字段建立公开事实。
+    ///
+    /// 数据库中的定义正文、源文本以及底层错误 `Display` 均不会进入结果。
+    pub(crate) fn safe_fact(&self) -> String {
+        match self {
+            Self::MissingRow => "metadata=missing_row".to_owned(),
+            Self::MultipleRows => "metadata=multiple_rows".to_owned(),
+            Self::WrongColumnCount { expected, actual } => {
+                format!("metadata=wrong_column_count; expected={expected}; actual={actual}")
+            }
+            Self::WrongColumnType {
+                column,
+                expected,
+                actual,
+            } => format!(
+                "metadata=wrong_column_type; column={column}; expected={expected}; actual={actual}"
+            ),
+            // ProjectName 当前只提供面向人的 String 错误；在它改为闭集类型前不能把该
+            // 任意文本误当作结构化诊断。字段身份仍保留，内部 Display 继续用于因果链。
+            Self::InvalidProjectName { .. } => {
+                "metadata=invalid_project_name; field=name".to_owned()
+            }
+            Self::NameMismatch { requested, stored } => format!(
+                "metadata=name_mismatch; requested={}; stored={}",
+                crate::user_text::sanitize_user_text(requested),
+                crate::user_text::sanitize_user_text(stored)
+            ),
+            Self::InvalidLanguage { column, source } => format!(
+                "metadata=invalid_language; column={column}; {}",
+                language_id_failure_safe_fact(source)
+            ),
+            Self::NonCanonicalLanguage {
+                column,
+                stored,
+                canonical,
+            } => format!(
+                "metadata=noncanonical_language; column={column}; stored={}; canonical={}",
+                crate::user_text::sanitize_user_text(stored),
+                crate::user_text::sanitize_user_text(canonical)
+            ),
+            Self::InvalidLineWidth { column, actual } => {
+                format!(
+                    "metadata=invalid_line_width; column={column}; expected=positive_u32; actual={actual}"
+                )
+            }
+            Self::InvalidSourceSnapshotFingerprintLength { actual } => format!(
+                "metadata=invalid_source_fingerprint_length; field=source_snapshot_fingerprint; expected=32; actual={actual}"
+            ),
+            Self::InvalidDialogueDefinition { stage, failure } => format!(
+                "metadata=invalid_dialogue_definition; definition={}; stage={}; {}",
+                ProjectDefinitionKind::MvDialogueRules.storage_name(),
+                stage.as_str(),
+                project_definition_failure_safe_fact(failure)
+            ),
+        }
+    }
 }
 
 impl fmt::Display for InvalidProjectMetadata {
@@ -926,8 +1021,11 @@ impl fmt::Display for InvalidProjectMetadata {
         match self {
             Self::MissingRow => formatter.write_str("缺少项目记录"),
             Self::MultipleRows => formatter.write_str("包含多条项目记录"),
-            Self::WrongColumnCount { actual } => {
-                write!(formatter, "查询结果列数不符合当前契约，实际为 {actual} 列")
+            Self::WrongColumnCount { expected, actual } => {
+                write!(
+                    formatter,
+                    "查询结果列数不符合当前契约，应为 {expected} 列，实际为 {actual} 列"
+                )
             }
             Self::WrongColumnType {
                 column,
@@ -964,8 +1062,13 @@ impl fmt::Display for InvalidProjectMetadata {
                 formatter,
                 "source_snapshot_fingerprint 必须是 32 字节 BLOB，实际为 {actual} 字节"
             ),
-            Self::InvalidDialogueDefinition { message } => {
-                write!(formatter, "MV 对话定义无效：{message}")
+            Self::InvalidDialogueDefinition { stage, failure } => {
+                write!(
+                    formatter,
+                    "MV 对话定义在 {} 阶段无效：{}",
+                    stage.as_str(),
+                    project_definition_failure_safe_fact(failure)
+                )
             }
         }
     }
@@ -1103,35 +1206,710 @@ fn owner_sort_key(owner: RpgMakerStandardAssetOwner) -> u8 {
 /// 项目数据库无法按当前唯一 schema 重建为受信事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InvalidCurrentProjectDatabase {
-    ManagedSchema { reason: String },
-    SchemaChangedDuringInspection { before: i64, after: i64 },
+    ManagedSchema(InvalidManagedSchema),
     Metadata(InvalidProjectMetadata),
-    OwnerState { reason: String },
-    TranslationResources { reason: String },
-    ProjectDefinitions { reason: String },
+    OwnerState(InvalidOwnerState),
+    TranslationResources(InvalidTranslationResources),
+    ProjectDefinitions(InvalidProjectDefinitions),
     RunPlans(InvalidProjectRunPlans),
-    Integrity { reason: String },
+    Integrity(InvalidProjectDatabaseIntegrity),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectDatabaseValueKind {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+impl ProjectDatabaseValueKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "NULL",
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+        }
+    }
+}
+
+impl From<&SqliteValue> for ProjectDatabaseValueKind {
+    fn from(value: &SqliteValue) -> Self {
+        match value {
+            SqliteValue::Null => Self::Null,
+            SqliteValue::Integer(_) => Self::Integer,
+            SqliteValue::Real(_) => Self::Real,
+            SqliteValue::Text(_) => Self::Text,
+            SqliteValue::Blob(_) => Self::Blob,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectDatabaseField {
+    SchemaType,
+    SchemaName,
+    SchemaTableName,
+    SchemaSql,
+    SchemaVersion,
+    Owner,
+    SourceSnapshotFingerprint,
+    AssetSnapshotFingerprint,
+    ResourceKind,
+    CanonicalJson,
+    DefinitionKind,
+}
+
+impl ProjectDatabaseField {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SchemaType => "sqlite_schema.type",
+            Self::SchemaName => "sqlite_schema.name",
+            Self::SchemaTableName => "sqlite_schema.tbl_name",
+            Self::SchemaSql => "sqlite_schema.sql",
+            Self::SchemaVersion => "schema_version",
+            Self::Owner => "owner",
+            Self::SourceSnapshotFingerprint => "source_snapshot_fingerprint",
+            Self::AssetSnapshotFingerprint => "asset_snapshot_fingerprint",
+            Self::ResourceKind => "resource_kind",
+            Self::CanonicalJson => "canonical_json",
+            Self::DefinitionKind => "definition_kind",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedSchemaObject {
+    Metadata,
+    InitRunPlan,
+    ExtractRunPlan,
+    ExtractRulesDefinition,
+    TranslateRunPlan,
+    WriteBackRunPlan,
+    LuaProgram,
+    StandardAssetOwnerState,
+    StandardTextGroup,
+    StandardTextUnit,
+    StandardMutationClaim,
+    StandardTranslationResource,
+    StandardProjectDefinition,
+    StandardMutationClaimOwnerResourceIndex,
+    StandardMutationClaimResourceIndex,
+}
+
+impl ManagedSchemaObject {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => "table:metadata",
+            Self::InitRunPlan => "table:init_run_plan",
+            Self::ExtractRunPlan => "table:extract_run_plan",
+            Self::ExtractRulesDefinition => "table:extract_rules_definition",
+            Self::TranslateRunPlan => "table:translate_run_plan",
+            Self::WriteBackRunPlan => "table:write_back_run_plan",
+            Self::LuaProgram => "table:lua_program",
+            Self::StandardAssetOwnerState => "table:standard_asset_owner_state",
+            Self::StandardTextGroup => "table:standard_text_group",
+            Self::StandardTextUnit => "table:standard_text_unit",
+            Self::StandardMutationClaim => "table:standard_mutation_claim",
+            Self::StandardTranslationResource => "table:standard_translation_resource",
+            Self::StandardProjectDefinition => "table:standard_project_definition",
+            Self::StandardMutationClaimOwnerResourceIndex => {
+                "index:standard_mutation_claim_owner_resource_idx"
+            }
+            Self::StandardMutationClaimResourceIndex => {
+                "index:standard_mutation_claim_resource_idx"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidManagedSchema {
+    WrongColumnCount {
+        query: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    WrongRowCount {
+        query: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    WrongColumnType {
+        field: ProjectDatabaseField,
+        expected: ProjectDatabaseValueKind,
+        actual: ProjectDatabaseValueKind,
+    },
+    NegativeSchemaVersion {
+        actual: i64,
+    },
+    ObjectMismatch {
+        expected_count: usize,
+        actual_count: usize,
+        missing: Vec<ManagedSchemaObject>,
+        definition_mismatches: Vec<ManagedSchemaObject>,
+        unexpected_count: usize,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidOwnerState {
+    WrongColumnCount {
+        expected: usize,
+        actual: usize,
+    },
+    WrongColumnType {
+        field: ProjectDatabaseField,
+        expected: ProjectDatabaseValueKind,
+        actual: ProjectDatabaseValueKind,
+    },
+    UnknownOwner,
+    InvalidFingerprintLength {
+        owner: RpgMakerStandardAssetOwner,
+        field: ProjectDatabaseField,
+        expected: usize,
+        actual: usize,
+    },
+    DuplicateOwner {
+        owner: RpgMakerStandardAssetOwner,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum TranslationResourceKind {
+    Terminology,
+    PlaceholderRules,
+}
+
+impl TranslationResourceKind {
+    fn from_storage_name(value: &str) -> Option<Self> {
+        if value == TERMINOLOGY_RESOURCE_KIND {
+            Some(Self::Terminology)
+        } else if value == PLACEHOLDER_RULES_RESOURCE_KIND {
+            Some(Self::PlaceholderRules)
+        } else {
+            None
+        }
+    }
+
+    const fn storage_name(self) -> &'static str {
+        match self {
+            Self::Terminology => TERMINOLOGY_RESOURCE_KIND,
+            Self::PlaceholderRules => PLACEHOLDER_RULES_RESOURCE_KIND,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SafeJsonErrorCategory {
+    Io,
+    Syntax,
+    Data,
+    Eof,
+}
+
+impl SafeJsonErrorCategory {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::Syntax => "syntax",
+            Self::Data => "data",
+            Self::Eof => "eof",
+        }
+    }
+}
+
+impl From<&serde_json::Error> for SafeJsonErrorCategory {
+    fn from(source: &serde_json::Error) -> Self {
+        match source.classify() {
+            serde_json::error::Category::Io => Self::Io,
+            serde_json::error::Category::Syntax => Self::Syntax,
+            serde_json::error::Category::Data => Self::Data,
+            serde_json::error::Category::Eof => Self::Eof,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidTranslationResources {
+    WrongColumnCount {
+        expected: usize,
+        actual: usize,
+    },
+    WrongColumnType {
+        field: ProjectDatabaseField,
+        expected: ProjectDatabaseValueKind,
+        actual: ProjectDatabaseValueKind,
+    },
+    UnknownResourceKind,
+    InvalidJson {
+        resource: TranslationResourceKind,
+        category: SafeJsonErrorCategory,
+        line: usize,
+        column: usize,
+    },
+    JsonMustBeArray {
+        resource: TranslationResourceKind,
+    },
+    DuplicateResource {
+        resource: TranslationResourceKind,
+    },
+    WrongResourceCount {
+        expected: usize,
+        actual: usize,
+    },
+    MissingResource {
+        resource: TranslationResourceKind,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectDefinitionKind {
+    MvDialogueRules,
+}
+
+impl ProjectDefinitionKind {
+    const fn storage_name(self) -> &'static str {
+        match self {
+            Self::MvDialogueRules => MV_DIALOGUE_RULES_DEFINITION_KIND,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectDefinitionStage {
+    Decode,
+    Compile,
+    Encode,
+}
+
+impl ProjectDefinitionStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Compile => "compile",
+            Self::Encode => "encode",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Pcre2FailureKind {
+    Compile,
+    Jit,
+    Match,
+    Info,
+    Option,
+    Unknown,
+}
+
+impl Pcre2FailureKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compile => "compile",
+            Self::Jit => "jit",
+            Self::Match => "match",
+            Self::Info => "info",
+            Self::Option => "option",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectDefinitionFailure {
+    EmptyDocument,
+    MissingRuleArray,
+    InvalidToml {
+        byte_start: Option<usize>,
+        byte_end: Option<usize>,
+    },
+    InvalidJson {
+        category: SafeJsonErrorCategory,
+        line: usize,
+        column: usize,
+    },
+    EncodeJson {
+        category: SafeJsonErrorCategory,
+        line: usize,
+        column: usize,
+    },
+    EmptyPattern {
+        rule_number: usize,
+    },
+    InvalidPattern {
+        rule_number: usize,
+        kind: Pcre2FailureKind,
+        code: i32,
+        offset: Option<usize>,
+    },
+    InvalidNamedCaptures {
+        rule_number: usize,
+        actual_count: usize,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidProjectDefinitions {
+    WrongRowCount {
+        expected: usize,
+        actual: usize,
+    },
+    WrongColumnCount {
+        expected: usize,
+        actual: usize,
+    },
+    WrongColumnType {
+        field: ProjectDatabaseField,
+        expected: ProjectDatabaseValueKind,
+        actual: ProjectDatabaseValueKind,
+    },
+    UnknownDefinitionKind,
+    InvalidDefinition {
+        definition: ProjectDefinitionKind,
+        stage: ProjectDefinitionStage,
+        failure: ProjectDefinitionFailure,
+    },
+    NonCanonicalJson {
+        definition: ProjectDefinitionKind,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidProjectDatabaseIntegrity {
+    QuickCheckWrongRowCount {
+        expected: usize,
+        actual: usize,
+    },
+    QuickCheckWrongColumnCount {
+        expected: usize,
+        actual: usize,
+    },
+    QuickCheckWrongColumnType {
+        expected: ProjectDatabaseValueKind,
+        actual: ProjectDatabaseValueKind,
+    },
+    QuickCheckFailed,
+    ForeignKeyViolations {
+        actual: usize,
+    },
 }
 
 impl fmt::Display for InvalidCurrentProjectDatabase {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.safe_fact())
+    }
+}
+
+impl InvalidCurrentProjectDatabase {
+    /// 只从闭集 reason 的类型化字段建立可公开事实，不读取任意错误文本或持久正文。
+    pub(crate) fn safe_fact(&self) -> String {
         match self {
-            Self::ManagedSchema { reason } => write!(formatter, "受管 schema 无效：{reason}"),
-            Self::SchemaChangedDuringInspection { before, after } => {
-                write!(formatter, "检查期间 schema 发生变化：{before} -> {after}")
+            Self::ManagedSchema(reason) => {
+                format!("database_component=managed_schema; {}", reason.safe_fact())
             }
-            Self::Metadata(reason) => write!(formatter, "metadata 无效：{reason}"),
-            Self::OwnerState { reason } => write!(formatter, "owner state 无效：{reason}"),
-            Self::TranslationResources { reason } => {
-                write!(formatter, "翻译资源状态无效：{reason}")
+            Self::Metadata(reason) => {
+                format!("database_component=metadata; {}", reason.safe_fact())
             }
-            Self::ProjectDefinitions { reason } => {
-                write!(formatter, "项目定义状态无效：{reason}")
+            Self::OwnerState(reason) => {
+                format!("database_component=owner_state; {}", reason.safe_fact())
             }
-            Self::RunPlans(reason) => write!(formatter, "运行方案状态无效：{reason}"),
-            Self::Integrity { reason } => write!(formatter, "数据库完整性无效：{reason}"),
+            Self::TranslationResources(reason) => format!(
+                "database_component=translation_resources; {}",
+                reason.safe_fact()
+            ),
+            Self::ProjectDefinitions(reason) => format!(
+                "database_component=project_definitions; {}",
+                reason.safe_fact()
+            ),
+            Self::RunPlans(reason) => format!(
+                "database_component=run_plans; subject={}; detail={}",
+                reason.safe_subject(),
+                reason.safe_detail()
+            ),
+            Self::Integrity(reason) => {
+                format!("database_component=integrity; {}", reason.safe_fact())
+            }
         }
     }
+
+    /// 返回领域错误已经筛选过的恢复事实；其他数据库状态错误没有额外恢复位置。
+    pub(crate) const fn recovery_fact(&self) -> Option<&crate::diagnostic::RecoveryFact> {
+        match self {
+            Self::RunPlans(reason) => reason.recovery_fact(),
+            _ => None,
+        }
+    }
+}
+
+impl InvalidManagedSchema {
+    fn safe_fact(&self) -> String {
+        match self {
+            Self::WrongColumnCount {
+                query,
+                expected,
+                actual,
+            } => format!(
+                "violation=wrong_column_count; query={query}; expected={expected}; actual={actual}"
+            ),
+            Self::WrongRowCount {
+                query,
+                expected,
+                actual,
+            } => format!(
+                "violation=wrong_row_count; query={query}; expected={expected}; actual={actual}"
+            ),
+            Self::WrongColumnType {
+                field,
+                expected,
+                actual,
+            } => format!(
+                "violation=wrong_column_type; field={}; expected={}; actual={}",
+                field.as_str(),
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::NegativeSchemaVersion { actual } => {
+                format!("violation=negative_schema_version; actual={actual}")
+            }
+            Self::ObjectMismatch {
+                expected_count,
+                actual_count,
+                missing,
+                definition_mismatches,
+                unexpected_count,
+            } => format!(
+                "violation=managed_object_mismatch; expected_count={expected_count}; actual_count={actual_count}; missing={}; definition_mismatches={}; unexpected_count={unexpected_count}",
+                managed_schema_object_list(missing),
+                managed_schema_object_list(definition_mismatches)
+            ),
+        }
+    }
+}
+
+impl InvalidOwnerState {
+    fn safe_fact(&self) -> String {
+        match self {
+            Self::WrongColumnCount { expected, actual } => {
+                format!("violation=wrong_column_count; expected={expected}; actual={actual}")
+            }
+            Self::WrongColumnType {
+                field,
+                expected,
+                actual,
+            } => format!(
+                "violation=wrong_column_type; field={}; expected={}; actual={}",
+                field.as_str(),
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::UnknownOwner => "violation=unknown_owner".to_owned(),
+            Self::InvalidFingerprintLength {
+                owner,
+                field,
+                expected,
+                actual,
+            } => format!(
+                "violation=invalid_fingerprint_length; owner={}; field={}; expected={expected}; actual={actual}",
+                owner.storage_name(),
+                field.as_str()
+            ),
+            Self::DuplicateOwner { owner } => {
+                format!("violation=duplicate_owner; owner={}", owner.storage_name())
+            }
+        }
+    }
+}
+
+impl InvalidTranslationResources {
+    fn safe_fact(&self) -> String {
+        match self {
+            Self::WrongColumnCount { expected, actual } => {
+                format!("violation=wrong_column_count; expected={expected}; actual={actual}")
+            }
+            Self::WrongColumnType {
+                field,
+                expected,
+                actual,
+            } => format!(
+                "violation=wrong_column_type; field={}; expected={}; actual={}",
+                field.as_str(),
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::UnknownResourceKind => "violation=unknown_resource_kind".to_owned(),
+            Self::InvalidJson {
+                resource,
+                category,
+                line,
+                column,
+            } => format!(
+                "violation=invalid_json; resource={}; category={}; line={line}; column={column}",
+                resource.storage_name(),
+                category.as_str()
+            ),
+            Self::JsonMustBeArray { resource } => format!(
+                "violation=json_shape; resource={}; expected=array",
+                resource.storage_name()
+            ),
+            Self::DuplicateResource { resource } => format!(
+                "violation=duplicate_resource; resource={}",
+                resource.storage_name()
+            ),
+            Self::WrongResourceCount { expected, actual } => {
+                format!("violation=wrong_resource_count; expected={expected}; actual={actual}")
+            }
+            Self::MissingResource { resource } => format!(
+                "violation=missing_resource; resource={}",
+                resource.storage_name()
+            ),
+        }
+    }
+}
+
+impl InvalidProjectDefinitions {
+    fn safe_fact(&self) -> String {
+        match self {
+            Self::WrongRowCount { expected, actual } => {
+                format!("violation=wrong_row_count; expected={expected}; actual={actual}")
+            }
+            Self::WrongColumnCount { expected, actual } => {
+                format!("violation=wrong_column_count; expected={expected}; actual={actual}")
+            }
+            Self::WrongColumnType {
+                field,
+                expected,
+                actual,
+            } => format!(
+                "violation=wrong_column_type; field={}; expected={}; actual={}",
+                field.as_str(),
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::UnknownDefinitionKind => "violation=unknown_definition_kind".to_owned(),
+            Self::InvalidDefinition {
+                definition,
+                stage,
+                failure,
+            } => format!(
+                "violation=invalid_definition; definition={}; stage={}; {}",
+                definition.storage_name(),
+                stage.as_str(),
+                project_definition_failure_safe_fact(failure)
+            ),
+            Self::NonCanonicalJson { definition } => format!(
+                "violation=noncanonical_json; definition={}",
+                definition.storage_name()
+            ),
+        }
+    }
+}
+
+impl InvalidProjectDatabaseIntegrity {
+    fn safe_fact(&self) -> String {
+        match self {
+            Self::QuickCheckWrongRowCount { expected, actual } => format!(
+                "violation=quick_check_wrong_row_count; expected={expected}; actual={actual}"
+            ),
+            Self::QuickCheckWrongColumnCount { expected, actual } => format!(
+                "violation=quick_check_wrong_column_count; expected={expected}; actual={actual}"
+            ),
+            Self::QuickCheckWrongColumnType { expected, actual } => format!(
+                "violation=quick_check_wrong_column_type; expected={}; actual={}",
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::QuickCheckFailed => "violation=quick_check_failed".to_owned(),
+            Self::ForeignKeyViolations { actual } => {
+                format!("violation=foreign_key_check; actual={actual}")
+            }
+        }
+    }
+}
+
+fn project_definition_failure_safe_fact(failure: &ProjectDefinitionFailure) -> String {
+    match failure {
+        ProjectDefinitionFailure::EmptyDocument => "failure=empty_document".to_owned(),
+        ProjectDefinitionFailure::MissingRuleArray => "failure=missing_rule_array".to_owned(),
+        ProjectDefinitionFailure::InvalidToml {
+            byte_start,
+            byte_end,
+        } => format!(
+            "failure=invalid_toml; byte_start={}; byte_end={}",
+            optional_usize(*byte_start),
+            optional_usize(*byte_end)
+        ),
+        ProjectDefinitionFailure::InvalidJson {
+            category,
+            line,
+            column,
+        } => format!(
+            "failure=invalid_json; category={}; line={line}; column={column}",
+            category.as_str()
+        ),
+        ProjectDefinitionFailure::EncodeJson {
+            category,
+            line,
+            column,
+        } => format!(
+            "failure=encode_json; category={}; line={line}; column={column}",
+            category.as_str()
+        ),
+        ProjectDefinitionFailure::EmptyPattern { rule_number } => {
+            format!("failure=empty_pattern; rule_number={rule_number}")
+        }
+        ProjectDefinitionFailure::InvalidPattern {
+            rule_number,
+            kind,
+            code,
+            offset,
+        } => format!(
+            "failure=invalid_pattern; rule_number={rule_number}; engine=pcre2; kind={}; code={code}; offset={}",
+            kind.as_str(),
+            optional_usize(*offset)
+        ),
+        ProjectDefinitionFailure::InvalidNamedCaptures {
+            rule_number,
+            actual_count,
+        } => format!(
+            "failure=invalid_named_captures; rule_number={rule_number}; actual_count={actual_count}"
+        ),
+    }
+}
+
+fn language_id_failure_safe_fact(source: &LanguageIdError) -> &'static str {
+    match source {
+        LanguageIdError::Blank => "language_failure=blank",
+        LanguageIdError::SurroundingWhitespace { .. } => "language_failure=surrounding_whitespace",
+        LanguageIdError::Underscore { .. } => "language_failure=underscore_separator",
+        LanguageIdError::InvalidSyntax { .. } => "language_failure=invalid_rfc5646_syntax",
+        LanguageIdError::InvalidRegistryTag { .. } => "language_failure=invalid_iana_registry_tag",
+        LanguageIdError::CanonicalizationFailed { .. } => {
+            "language_failure=canonicalization_failed"
+        }
+        LanguageIdError::UndefinedPrimaryLanguage { .. } => {
+            "language_failure=undefined_primary_language"
+        }
+    }
+}
+
+fn managed_schema_object_list(objects: &[ManagedSchemaObject]) -> String {
+    if objects.is_empty() {
+        "none".to_owned()
+    } else {
+        objects
+            .iter()
+            .map(|object| object.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn optional_usize(value: Option<usize>) -> String {
+    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
 }
 
 impl Error for InvalidCurrentProjectDatabase {
@@ -1139,12 +1917,11 @@ impl Error for InvalidCurrentProjectDatabase {
         match self {
             Self::Metadata(source) => Some(source),
             Self::RunPlans(source) => Some(source),
-            Self::ManagedSchema { .. }
-            | Self::SchemaChangedDuringInspection { .. }
-            | Self::OwnerState { .. }
-            | Self::TranslationResources { .. }
-            | Self::ProjectDefinitions { .. }
-            | Self::Integrity { .. } => None,
+            Self::ManagedSchema(_)
+            | Self::OwnerState(_)
+            | Self::TranslationResources(_)
+            | Self::ProjectDefinitions(_)
+            | Self::Integrity(_) => None,
         }
     }
 }
@@ -1244,78 +2021,160 @@ fn validate_managed_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentPro
     for row in rows {
         let values = row.into_values();
         if values.len() != 4 {
-            return Err(InvalidCurrentProjectDatabase::ManagedSchema {
-                reason: format!("sqlite_schema 查询应返回 4 列，实际为 {}", values.len()),
-            });
+            return Err(InvalidCurrentProjectDatabase::ManagedSchema(
+                InvalidManagedSchema::WrongColumnCount {
+                    query: "managed_schema",
+                    expected: 4,
+                    actual: values.len(),
+                },
+            ));
         }
         let mut values = values.into_iter();
-        let kind = schema_text(values.next().expect("已确认有四列"), "type")?;
-        let name = schema_text(values.next().expect("已确认有四列"), "name")?;
-        let table = schema_text(values.next().expect("已确认有四列"), "tbl_name")?;
-        let sql = schema_text(values.next().expect("已确认有四列"), "sql")?;
+        let kind = schema_text(
+            values.next().expect("已确认有四列"),
+            ProjectDatabaseField::SchemaType,
+        )?;
+        let name = schema_text(
+            values.next().expect("已确认有四列"),
+            ProjectDatabaseField::SchemaName,
+        )?;
+        let table = schema_text(
+            values.next().expect("已确认有四列"),
+            ProjectDatabaseField::SchemaTableName,
+        )?;
+        let sql = schema_text(
+            values.next().expect("已确认有四列"),
+            ProjectDatabaseField::SchemaSql,
+        )?;
         actual.push((kind, name, table, sql));
     }
-    actual.sort();
-    let mut expected = expected_managed_schema()
-        .into_iter()
-        .map(|(kind, name, table, sql)| {
-            (
-                kind.to_owned(),
-                name.to_owned(),
-                table.to_owned(),
-                sql.to_owned(),
-            )
+    let expected = expected_managed_schema();
+    let missing = expected
+        .iter()
+        .filter_map(|(kind, name, _, _)| {
+            (!actual
+                .iter()
+                .any(|(actual_kind, actual_name, _, _)| actual_kind == kind && actual_name == name))
+            .then(|| managed_schema_object(kind, name))
+            .flatten()
         })
         .collect::<Vec<_>>();
-    expected.sort();
-    if actual == expected {
+    let definition_mismatches = expected
+        .iter()
+        .filter_map(|(kind, name, table, sql)| {
+            actual
+                .iter()
+                .find(|(actual_kind, actual_name, _, _)| actual_kind == kind && actual_name == name)
+                .and_then(|(_, _, actual_table, actual_sql)| {
+                    (actual_table != table || actual_sql != sql)
+                        .then(|| managed_schema_object(kind, name))
+                        .flatten()
+                })
+        })
+        .collect::<Vec<_>>();
+    let unexpected_count = actual
+        .iter()
+        .filter(|(actual_kind, actual_name, _, _)| {
+            !expected
+                .iter()
+                .any(|(kind, name, _, _)| actual_kind == kind && actual_name == name)
+        })
+        .count();
+    if actual.len() == expected.len()
+        && missing.is_empty()
+        && definition_mismatches.is_empty()
+        && unexpected_count == 0
+    {
         Ok(())
     } else {
-        let actual_names = actual
-            .iter()
-            .map(|(kind, name, _, _)| format!("{kind}:{name}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(InvalidCurrentProjectDatabase::ManagedSchema {
-            reason: format!("受管对象定义或集合不匹配，实际对象为 [{actual_names}]"),
-        })
+        Err(InvalidCurrentProjectDatabase::ManagedSchema(
+            InvalidManagedSchema::ObjectMismatch {
+                expected_count: expected.len(),
+                actual_count: actual.len(),
+                missing,
+                definition_mismatches,
+                unexpected_count,
+            },
+        ))
     }
 }
 
 fn schema_text(
     value: SqliteValue,
-    column: &'static str,
+    field: ProjectDatabaseField,
 ) -> Result<String, InvalidCurrentProjectDatabase> {
     match value {
         SqliteValue::Text(value) => Ok(value),
-        value => Err(InvalidCurrentProjectDatabase::ManagedSchema {
-            reason: format!(
-                "sqlite_schema.{column} 应为 TEXT，实际为 {}",
-                value.kind_name()
-            ),
-        }),
+        value => Err(InvalidCurrentProjectDatabase::ManagedSchema(
+            InvalidManagedSchema::WrongColumnType {
+                field,
+                expected: ProjectDatabaseValueKind::Text,
+                actual: ProjectDatabaseValueKind::from(&value),
+            },
+        )),
+    }
+}
+
+fn managed_schema_object(kind: &str, name: &str) -> Option<ManagedSchemaObject> {
+    match (kind, name) {
+        ("table", "metadata") => Some(ManagedSchemaObject::Metadata),
+        ("table", "init_run_plan") => Some(ManagedSchemaObject::InitRunPlan),
+        ("table", "extract_run_plan") => Some(ManagedSchemaObject::ExtractRunPlan),
+        ("table", "extract_rules_definition") => Some(ManagedSchemaObject::ExtractRulesDefinition),
+        ("table", "translate_run_plan") => Some(ManagedSchemaObject::TranslateRunPlan),
+        ("table", "write_back_run_plan") => Some(ManagedSchemaObject::WriteBackRunPlan),
+        ("table", "lua_program") => Some(ManagedSchemaObject::LuaProgram),
+        ("table", "standard_asset_owner_state") => {
+            Some(ManagedSchemaObject::StandardAssetOwnerState)
+        }
+        ("table", STANDARD_TEXT_GROUP_TABLE_NAME) => Some(ManagedSchemaObject::StandardTextGroup),
+        ("table", STANDARD_TEXT_UNIT_TABLE_NAME) => Some(ManagedSchemaObject::StandardTextUnit),
+        ("table", STANDARD_MUTATION_CLAIM_TABLE_NAME) => {
+            Some(ManagedSchemaObject::StandardMutationClaim)
+        }
+        ("table", STANDARD_TRANSLATION_RESOURCE_TABLE_NAME) => {
+            Some(ManagedSchemaObject::StandardTranslationResource)
+        }
+        ("table", STANDARD_PROJECT_DEFINITION_TABLE_NAME) => {
+            Some(ManagedSchemaObject::StandardProjectDefinition)
+        }
+        ("index", "standard_mutation_claim_owner_resource_idx") => {
+            Some(ManagedSchemaObject::StandardMutationClaimOwnerResourceIndex)
+        }
+        ("index", "standard_mutation_claim_resource_idx") => {
+            Some(ManagedSchemaObject::StandardMutationClaimResourceIndex)
+        }
+        _ => None,
     }
 }
 
 fn decode_schema_version(rows: Vec<SqliteRow>) -> Result<i64, InvalidCurrentProjectDatabase> {
     let [row] = <[SqliteRow; 1]>::try_from(rows).map_err(|rows| {
-        InvalidCurrentProjectDatabase::ManagedSchema {
-            reason: format!("schema_version 应返回一行，实际为 {} 行", rows.len()),
-        }
+        InvalidCurrentProjectDatabase::ManagedSchema(InvalidManagedSchema::WrongRowCount {
+            query: "schema_version",
+            expected: 1,
+            actual: rows.len(),
+        })
     })?;
     let [value] = <[SqliteValue; 1]>::try_from(row.into_values()).map_err(|values| {
-        InvalidCurrentProjectDatabase::ManagedSchema {
-            reason: format!("schema_version 应返回一列，实际为 {} 列", values.len()),
-        }
+        InvalidCurrentProjectDatabase::ManagedSchema(InvalidManagedSchema::WrongColumnCount {
+            query: "schema_version",
+            expected: 1,
+            actual: values.len(),
+        })
     })?;
     match value {
         SqliteValue::Integer(value) if value >= 0 => Ok(value),
-        value => Err(InvalidCurrentProjectDatabase::ManagedSchema {
-            reason: format!(
-                "schema_version 应为非负 INTEGER，实际为 {}",
-                value.kind_name()
-            ),
-        }),
+        SqliteValue::Integer(actual) => Err(InvalidCurrentProjectDatabase::ManagedSchema(
+            InvalidManagedSchema::NegativeSchemaVersion { actual },
+        )),
+        value => Err(InvalidCurrentProjectDatabase::ManagedSchema(
+            InvalidManagedSchema::WrongColumnType {
+                field: ProjectDatabaseField::SchemaVersion,
+                expected: ProjectDatabaseValueKind::Integer,
+                actual: ProjectDatabaseValueKind::from(&value),
+            },
+        )),
     }
 }
 
@@ -1326,63 +2185,82 @@ fn decode_owner_states(
     for row in rows {
         let values = row.into_values();
         if values.len() != 3 {
-            return Err(InvalidCurrentProjectDatabase::OwnerState {
-                reason: format!("owner state 应有 3 列，实际为 {}", values.len()),
-            });
+            return Err(InvalidCurrentProjectDatabase::OwnerState(
+                InvalidOwnerState::WrongColumnCount {
+                    expected: 3,
+                    actual: values.len(),
+                },
+            ));
         }
         let mut values = values.into_iter();
         let owner = match values.next().expect("已确认有三列") {
             SqliteValue::Text(value) => RpgMakerStandardAssetOwner::from_storage_name(&value)
-                .ok_or(InvalidCurrentProjectDatabase::OwnerState {
-                    reason: format!("未知 owner {value:?}"),
-                })?,
+                .ok_or(InvalidCurrentProjectDatabase::OwnerState(
+                    InvalidOwnerState::UnknownOwner,
+                ))?,
             value => {
-                return Err(InvalidCurrentProjectDatabase::OwnerState {
-                    reason: format!("owner 应为 TEXT，实际为 {}", value.kind_name()),
-                });
+                return Err(InvalidCurrentProjectDatabase::OwnerState(
+                    InvalidOwnerState::WrongColumnType {
+                        field: ProjectDatabaseField::Owner,
+                        expected: ProjectDatabaseValueKind::Text,
+                        actual: ProjectDatabaseValueKind::from(&value),
+                    },
+                ));
             }
         };
         let fingerprint = match values.next().expect("已确认有三列") {
             SqliteValue::Blob(value) => {
-                SourceSnapshotFingerprint::from_slice(&value).map_err(|source| {
-                    InvalidCurrentProjectDatabase::OwnerState {
-                        reason: source.to_string(),
-                    }
+                SourceSnapshotFingerprint::from_slice(&value).map_err(|_| {
+                    InvalidCurrentProjectDatabase::OwnerState(
+                        InvalidOwnerState::InvalidFingerprintLength {
+                            owner,
+                            field: ProjectDatabaseField::SourceSnapshotFingerprint,
+                            expected: 32,
+                            actual: value.len(),
+                        },
+                    )
                 })?
             }
             value => {
-                return Err(InvalidCurrentProjectDatabase::OwnerState {
-                    reason: format!(
-                        "source_snapshot_fingerprint 应为 BLOB，实际为 {}",
-                        value.kind_name()
-                    ),
-                });
+                return Err(InvalidCurrentProjectDatabase::OwnerState(
+                    InvalidOwnerState::WrongColumnType {
+                        field: ProjectDatabaseField::SourceSnapshotFingerprint,
+                        expected: ProjectDatabaseValueKind::Blob,
+                        actual: ProjectDatabaseValueKind::from(&value),
+                    },
+                ));
             }
         };
         let asset_snapshot_fingerprint = match values.next().expect("已确认有三列") {
             SqliteValue::Blob(value) => {
-                AssetSnapshotFingerprint::from_slice(&value).map_err(|source| {
-                    InvalidCurrentProjectDatabase::OwnerState {
-                        reason: format!("asset_snapshot_fingerprint 无效：{source}"),
-                    }
+                AssetSnapshotFingerprint::from_slice(&value).map_err(|_| {
+                    InvalidCurrentProjectDatabase::OwnerState(
+                        InvalidOwnerState::InvalidFingerprintLength {
+                            owner,
+                            field: ProjectDatabaseField::AssetSnapshotFingerprint,
+                            expected: 32,
+                            actual: value.len(),
+                        },
+                    )
                 })?
             }
             value => {
-                return Err(InvalidCurrentProjectDatabase::OwnerState {
-                    reason: format!(
-                        "asset_snapshot_fingerprint 应为 BLOB，实际为 {}",
-                        value.kind_name()
-                    ),
-                });
+                return Err(InvalidCurrentProjectDatabase::OwnerState(
+                    InvalidOwnerState::WrongColumnType {
+                        field: ProjectDatabaseField::AssetSnapshotFingerprint,
+                        expected: ProjectDatabaseValueKind::Blob,
+                        actual: ProjectDatabaseValueKind::from(&value),
+                    },
+                ));
             }
         };
         if owners
             .iter()
             .any(|state: &ActiveOwnerState| state.owner == owner)
         {
-            return Err(InvalidCurrentProjectDatabase::OwnerState {
-                reason: format!("owner {:?} 重复", owner.storage_name()),
-            });
+            return Err(InvalidCurrentProjectDatabase::OwnerState(
+                InvalidOwnerState::DuplicateOwner { owner },
+            ));
         }
         owners.push(ActiveOwnerState {
             owner,
@@ -1401,44 +2279,70 @@ fn decode_translation_resources(
     for row in rows {
         let values = row.into_values();
         if values.len() != 2 {
-            return Err(InvalidCurrentProjectDatabase::TranslationResources {
-                reason: format!("翻译资源应有 2 列，实际为 {}", values.len()),
-            });
+            return Err(InvalidCurrentProjectDatabase::TranslationResources(
+                InvalidTranslationResources::WrongColumnCount {
+                    expected: 2,
+                    actual: values.len(),
+                },
+            ));
         }
         let mut values = values.into_iter();
-        let kind = resource_text(values.next().expect("已确认有两列"), "resource_kind")?;
-        let canonical_json = resource_text(values.next().expect("已确认有两列"), "canonical_json")?;
+        let raw_kind = resource_text(
+            values.next().expect("已确认有两列"),
+            ProjectDatabaseField::ResourceKind,
+        )?;
+        let kind = TranslationResourceKind::from_storage_name(&raw_kind).ok_or(
+            InvalidCurrentProjectDatabase::TranslationResources(
+                InvalidTranslationResources::UnknownResourceKind,
+            ),
+        )?;
+        let canonical_json = resource_text(
+            values.next().expect("已确认有两列"),
+            ProjectDatabaseField::CanonicalJson,
+        )?;
         let json: serde_json::Value = serde_json::from_str(&canonical_json).map_err(|source| {
-            InvalidCurrentProjectDatabase::TranslationResources {
-                reason: format!("{kind} 不是有效 JSON：{source}"),
-            }
+            InvalidCurrentProjectDatabase::TranslationResources(
+                InvalidTranslationResources::InvalidJson {
+                    resource: kind,
+                    category: SafeJsonErrorCategory::from(&source),
+                    line: source.line(),
+                    column: source.column(),
+                },
+            )
         })?;
         if !json.is_array() {
-            return Err(InvalidCurrentProjectDatabase::TranslationResources {
-                reason: format!("{kind} 必须是 JSON 数组"),
-            });
+            return Err(InvalidCurrentProjectDatabase::TranslationResources(
+                InvalidTranslationResources::JsonMustBeArray { resource: kind },
+            ));
         }
-        if resources.insert(kind.clone(), canonical_json).is_some() {
-            return Err(InvalidCurrentProjectDatabase::TranslationResources {
-                reason: format!("资源 {kind:?} 重复"),
-            });
+        if resources.insert(kind, canonical_json).is_some() {
+            return Err(InvalidCurrentProjectDatabase::TranslationResources(
+                InvalidTranslationResources::DuplicateResource { resource: kind },
+            ));
         }
     }
     if resources.len() != 2 {
-        return Err(InvalidCurrentProjectDatabase::TranslationResources {
-            reason: format!("必须且只能保存两份资源，实际为 {}", resources.len()),
-        });
+        return Err(InvalidCurrentProjectDatabase::TranslationResources(
+            InvalidTranslationResources::WrongResourceCount {
+                expected: 2,
+                actual: resources.len(),
+            },
+        ));
     }
-    let terminology = resources.remove(TERMINOLOGY_RESOURCE_KIND).ok_or_else(|| {
-        InvalidCurrentProjectDatabase::TranslationResources {
-            reason: format!("缺少 {TERMINOLOGY_RESOURCE_KIND}"),
-        }
-    })?;
+    let terminology = resources
+        .remove(&TranslationResourceKind::Terminology)
+        .ok_or(InvalidCurrentProjectDatabase::TranslationResources(
+            InvalidTranslationResources::MissingResource {
+                resource: TranslationResourceKind::Terminology,
+            },
+        ))?;
     let placeholders = resources
-        .remove(PLACEHOLDER_RULES_RESOURCE_KIND)
-        .ok_or_else(|| InvalidCurrentProjectDatabase::TranslationResources {
-            reason: format!("缺少 {PLACEHOLDER_RULES_RESOURCE_KIND}"),
-        })?;
+        .remove(&TranslationResourceKind::PlaceholderRules)
+        .ok_or(InvalidCurrentProjectDatabase::TranslationResources(
+            InvalidTranslationResources::MissingResource {
+                resource: TranslationResourceKind::PlaceholderRules,
+            },
+        ))?;
     Ok((terminology, placeholders))
 }
 
@@ -1446,71 +2350,156 @@ fn decode_project_definitions(
     rows: Vec<SqliteRow>,
 ) -> Result<String, InvalidCurrentProjectDatabase> {
     let [row] = <[SqliteRow; 1]>::try_from(rows).map_err(|rows| {
-        InvalidCurrentProjectDatabase::ProjectDefinitions {
-            reason: format!("必须且只能保存一份项目定义，实际为 {}", rows.len()),
-        }
+        InvalidCurrentProjectDatabase::ProjectDefinitions(
+            InvalidProjectDefinitions::WrongRowCount {
+                expected: 1,
+                actual: rows.len(),
+            },
+        )
     })?;
     let values = row.into_values();
     if values.len() != 2 {
-        return Err(InvalidCurrentProjectDatabase::ProjectDefinitions {
-            reason: format!("项目定义应有 2 列，实际为 {}", values.len()),
-        });
+        return Err(InvalidCurrentProjectDatabase::ProjectDefinitions(
+            InvalidProjectDefinitions::WrongColumnCount {
+                expected: 2,
+                actual: values.len(),
+            },
+        ));
     }
     let mut values = values.into_iter();
-    let definition_kind =
-        project_definition_text(values.next().expect("已确认有两列"), "definition_kind")?;
-    if definition_kind != MV_DIALOGUE_RULES_DEFINITION_KIND {
-        return Err(InvalidCurrentProjectDatabase::ProjectDefinitions {
-            reason: format!("未知项目定义 {definition_kind:?}"),
-        });
-    }
-    let canonical_json =
-        project_definition_text(values.next().expect("已确认有两列"), "canonical_json")?;
+    let raw_definition_kind = project_definition_text(
+        values.next().expect("已确认有两列"),
+        ProjectDatabaseField::DefinitionKind,
+    )?;
+    let definition_kind = if raw_definition_kind == MV_DIALOGUE_RULES_DEFINITION_KIND {
+        ProjectDefinitionKind::MvDialogueRules
+    } else {
+        return Err(InvalidCurrentProjectDatabase::ProjectDefinitions(
+            InvalidProjectDefinitions::UnknownDefinitionKind,
+        ));
+    };
+    let canonical_json = project_definition_text(
+        values.next().expect("已确认有两列"),
+        ProjectDatabaseField::CanonicalJson,
+    )?;
     let definition =
         MvDialogueDefinition::from_canonical_json(&canonical_json).map_err(|source| {
-            InvalidCurrentProjectDatabase::ProjectDefinitions {
-                reason: format!("{definition_kind} 无效：{source}"),
-            }
+            invalid_project_definition(definition_kind, ProjectDefinitionStage::Decode, source)
         })?;
-    definition
-        .compile()
-        .map_err(|source| InvalidCurrentProjectDatabase::ProjectDefinitions {
-            reason: format!("{definition_kind} 无效：{source}"),
-        })?;
+    definition.compile().map_err(|source| {
+        invalid_project_definition(definition_kind, ProjectDefinitionStage::Compile, source)
+    })?;
     let encoded = definition.to_canonical_json().map_err(|source| {
-        InvalidCurrentProjectDatabase::ProjectDefinitions {
-            reason: format!("{definition_kind} 无法规范编码：{source}"),
-        }
+        invalid_project_definition(definition_kind, ProjectDefinitionStage::Encode, source)
     })?;
     if encoded != canonical_json {
-        return Err(InvalidCurrentProjectDatabase::ProjectDefinitions {
-            reason: format!("{definition_kind} 不是 canonical JSON"),
-        });
+        return Err(InvalidCurrentProjectDatabase::ProjectDefinitions(
+            InvalidProjectDefinitions::NonCanonicalJson {
+                definition: definition_kind,
+            },
+        ));
     }
     Ok(canonical_json)
 }
 
 fn resource_text(
     value: SqliteValue,
-    column: &'static str,
+    field: ProjectDatabaseField,
 ) -> Result<String, InvalidCurrentProjectDatabase> {
     match value {
         SqliteValue::Text(value) => Ok(value),
-        value => Err(InvalidCurrentProjectDatabase::TranslationResources {
-            reason: format!("{column} 应为 TEXT，实际为 {}", value.kind_name()),
-        }),
+        value => Err(InvalidCurrentProjectDatabase::TranslationResources(
+            InvalidTranslationResources::WrongColumnType {
+                field,
+                expected: ProjectDatabaseValueKind::Text,
+                actual: ProjectDatabaseValueKind::from(&value),
+            },
+        )),
     }
 }
 
 fn project_definition_text(
     value: SqliteValue,
-    column: &'static str,
+    field: ProjectDatabaseField,
 ) -> Result<String, InvalidCurrentProjectDatabase> {
     match value {
         SqliteValue::Text(value) => Ok(value),
-        value => Err(InvalidCurrentProjectDatabase::ProjectDefinitions {
-            reason: format!("{column} 应为 TEXT，实际为 {}", value.kind_name()),
-        }),
+        value => Err(InvalidCurrentProjectDatabase::ProjectDefinitions(
+            InvalidProjectDefinitions::WrongColumnType {
+                field,
+                expected: ProjectDatabaseValueKind::Text,
+                actual: ProjectDatabaseValueKind::from(&value),
+            },
+        )),
+    }
+}
+
+fn invalid_project_definition(
+    definition: ProjectDefinitionKind,
+    stage: ProjectDefinitionStage,
+    source: MvDialogueDefinitionError,
+) -> InvalidCurrentProjectDatabase {
+    InvalidCurrentProjectDatabase::ProjectDefinitions(
+        InvalidProjectDefinitions::InvalidDefinition {
+            definition,
+            stage,
+            failure: project_definition_failure(source),
+        },
+    )
+}
+
+fn project_definition_failure(source: MvDialogueDefinitionError) -> ProjectDefinitionFailure {
+    match source {
+        MvDialogueDefinitionError::EmptyDocument => ProjectDefinitionFailure::EmptyDocument,
+        MvDialogueDefinitionError::MissingRuleArray => ProjectDefinitionFailure::MissingRuleArray,
+        MvDialogueDefinitionError::InvalidToml(_) => ProjectDefinitionFailure::InvalidToml {
+            byte_start: None,
+            byte_end: None,
+        },
+        MvDialogueDefinitionError::InvalidCanonicalJson(source) => {
+            ProjectDefinitionFailure::InvalidJson {
+                category: SafeJsonErrorCategory::from(&source),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        MvDialogueDefinitionError::EncodeCanonicalJson(source) => {
+            ProjectDefinitionFailure::EncodeJson {
+                category: SafeJsonErrorCategory::from(&source),
+                line: source.line(),
+                column: source.column(),
+            }
+        }
+        MvDialogueDefinitionError::EmptyPattern { rule_number } => {
+            ProjectDefinitionFailure::EmptyPattern { rule_number }
+        }
+        MvDialogueDefinitionError::InvalidPattern {
+            rule_number,
+            source,
+        } => ProjectDefinitionFailure::InvalidPattern {
+            rule_number,
+            kind: pcre2_failure_kind(&source),
+            code: source.code(),
+            offset: source.offset(),
+        },
+        MvDialogueDefinitionError::InvalidNamedCaptures {
+            rule_number,
+            captures,
+        } => ProjectDefinitionFailure::InvalidNamedCaptures {
+            rule_number,
+            actual_count: captures.len(),
+        },
+    }
+}
+
+fn pcre2_failure_kind(source: &pcre2::Error) -> Pcre2FailureKind {
+    match source.kind() {
+        pcre2::ErrorKind::Compile => Pcre2FailureKind::Compile,
+        pcre2::ErrorKind::JIT => Pcre2FailureKind::Jit,
+        pcre2::ErrorKind::Match => Pcre2FailureKind::Match,
+        pcre2::ErrorKind::Info => Pcre2FailureKind::Info,
+        pcre2::ErrorKind::Option => Pcre2FailureKind::Option,
+        _ => Pcre2FailureKind::Unknown,
     }
 }
 
@@ -1518,18 +2507,45 @@ fn validate_integrity(
     quick_check: Vec<SqliteRow>,
     foreign_key_check: Vec<SqliteRow>,
 ) -> Result<(), InvalidCurrentProjectDatabase> {
-    if quick_check != vec![SqliteRow::new(vec![SqliteValue::Text("ok".to_owned())])] {
-        return Err(InvalidCurrentProjectDatabase::Integrity {
-            reason: "PRAGMA quick_check 未返回唯一 ok".to_owned(),
-        });
+    let [quick_check_row] = <[SqliteRow; 1]>::try_from(quick_check).map_err(|rows| {
+        InvalidCurrentProjectDatabase::Integrity(
+            InvalidProjectDatabaseIntegrity::QuickCheckWrongRowCount {
+                expected: 1,
+                actual: rows.len(),
+            },
+        )
+    })?;
+    let [quick_check_value] =
+        <[SqliteValue; 1]>::try_from(quick_check_row.into_values()).map_err(|values| {
+            InvalidCurrentProjectDatabase::Integrity(
+                InvalidProjectDatabaseIntegrity::QuickCheckWrongColumnCount {
+                    expected: 1,
+                    actual: values.len(),
+                },
+            )
+        })?;
+    match quick_check_value {
+        SqliteValue::Text(value) if value == "ok" => {}
+        SqliteValue::Text(_) => {
+            return Err(InvalidCurrentProjectDatabase::Integrity(
+                InvalidProjectDatabaseIntegrity::QuickCheckFailed,
+            ));
+        }
+        value => {
+            return Err(InvalidCurrentProjectDatabase::Integrity(
+                InvalidProjectDatabaseIntegrity::QuickCheckWrongColumnType {
+                    expected: ProjectDatabaseValueKind::Text,
+                    actual: ProjectDatabaseValueKind::from(&value),
+                },
+            ));
+        }
     }
     if !foreign_key_check.is_empty() {
-        return Err(InvalidCurrentProjectDatabase::Integrity {
-            reason: format!(
-                "PRAGMA foreign_key_check 返回 {} 条违规",
-                foreign_key_check.len()
-            ),
-        });
+        return Err(InvalidCurrentProjectDatabase::Integrity(
+            InvalidProjectDatabaseIntegrity::ForeignKeyViolations {
+                actual: foreign_key_check.len(),
+            },
+        ));
     }
     Ok(())
 }
@@ -1611,6 +2627,7 @@ pub(crate) enum ProjectDatabaseInspectionError<E> {
     ReadDatabase {
         path: PathBuf,
         stage: &'static str,
+        query_ids: Vec<String>,
         source: E,
     },
     InvalidDatabase {
@@ -1628,11 +2645,13 @@ impl<E: fmt::Display> fmt::Display for ProjectDatabaseInspectionError<E> {
             Self::ReadDatabase {
                 path,
                 stage,
+                query_ids,
                 source,
             } => write!(
                 formatter,
-                "检查项目数据库 {} 的{stage}失败：{source}",
-                path.display()
+                "检查项目数据库 {} 的{stage}失败（查询 {}）：{source}",
+                path.display(),
+                query_ids.join(",")
             ),
             Self::InvalidDatabase { path, reason } => {
                 write!(formatter, "项目数据库 {} 无效：{reason}", path.display())
@@ -1777,34 +2796,6 @@ where
     }
 }
 
-async fn read_inspection_rows<Q>(
-    queries: &Q,
-    database_path: &Path,
-    stage: &'static str,
-    query: SqliteQuery,
-) -> Result<Vec<SqliteRow>, ProjectDatabaseInspectionError<Q::Error>>
-where
-    Q: SqliteQueryExecutor,
-{
-    queries
-        .query_existing_database(database_path.to_path_buf(), query)
-        .await
-        .map_err(|error| match error {
-            QueryExistingDatabaseError::NotFound => {
-                ProjectDatabaseInspectionError::DatabaseNotFound {
-                    path: database_path.to_path_buf(),
-                }
-            }
-            QueryExistingDatabaseError::QueryFailed(source) => {
-                ProjectDatabaseInspectionError::ReadDatabase {
-                    path: database_path.to_path_buf(),
-                    stage,
-                    source,
-                }
-            }
-        })
-}
-
 async fn read_inspection_snapshot<Q>(
     queries: &Q,
     database_path: &Path,
@@ -1814,6 +2805,10 @@ async fn read_inspection_snapshot<Q>(
 where
     Q: SqliteQueryExecutor,
 {
+    let query_ids = requested
+        .iter()
+        .map(|query| query.id().to_owned())
+        .collect();
     queries
         .query_existing_database_snapshot(database_path.to_path_buf(), requested)
         .await
@@ -1827,6 +2822,7 @@ where
                 ProjectDatabaseInspectionError::ReadDatabase {
                     path: database_path.to_path_buf(),
                     stage,
+                    query_ids,
                     source,
                 }
             }
@@ -1841,27 +2837,65 @@ async fn inspect_project_database<Q>(
 where
     Q: SqliteQueryExecutor,
 {
-    let schema_version_before = decode_schema_version(
-        read_inspection_rows(
-            queries,
-            &database_path,
-            "读取初始 schema version",
-            SqliteQuery::new(SELECT_SCHEMA_VERSION, Vec::new()),
-        )
-        .await?,
-    )
-    .map_err(|reason| ProjectDatabaseInspectionError::InvalidDatabase {
-        path: database_path.clone(),
-        reason,
-    })?;
-
-    let schema = read_inspection_rows(
+    let snapshot = read_inspection_snapshot(
         queries,
         &database_path,
-        "读取受管 schema",
-        SqliteQuery::new(SELECT_MANAGED_SCHEMA, Vec::new()),
+        "读取项目数据库一致快照",
+        vec![
+            SqliteQuery::new(SELECT_SCHEMA_VERSION, Vec::new())
+                .with_id("project_database.inspect.schema_version"),
+            SqliteQuery::new(SELECT_MANAGED_SCHEMA, Vec::new())
+                .with_id("project_database.inspect.managed_schema"),
+            SqliteQuery::new(SELECT_METADATA, Vec::new())
+                .with_id("project_database.inspect.metadata"),
+            SqliteQuery::new(SELECT_OWNER_STATES, Vec::new())
+                .with_id("project_database.inspect.owner_states"),
+            SqliteQuery::new(SELECT_TRANSLATION_RESOURCES, Vec::new())
+                .with_id("project_database.inspect.translation_resources"),
+            SqliteQuery::new(SELECT_PROJECT_DEFINITIONS, Vec::new())
+                .with_id("project_database.inspect.project_definitions"),
+            SqliteQuery::new(SELECT_RUN_PLAN_SINGLETONS, Vec::new())
+                .with_id("project_database.inspect.run_plan_singletons"),
+            SqliteQuery::new(SELECT_LUA_PROGRAMS, Vec::new())
+                .with_id("project_database.inspect.lua_programs"),
+            SqliteQuery::new(SELECT_QUICK_CHECK, Vec::new())
+                .with_id("project_database.inspect.quick_check"),
+            SqliteQuery::new(SELECT_FOREIGN_KEY_CHECK, Vec::new())
+                .with_id("project_database.inspect.foreign_key_check"),
+        ],
     )
     .await?;
+
+    let [
+        schema_version_rows,
+        schema,
+        metadata_rows,
+        owner_rows,
+        translation_resource_rows,
+        project_definition_rows,
+        run_plan_singletons,
+        lua_programs,
+        quick_check,
+        foreign_key_check,
+    ] = <[Vec<SqliteRow>; 10]>::try_from(snapshot).map_err(|results| {
+        ProjectDatabaseInspectionError::InvalidDatabase {
+            path: database_path.clone(),
+            reason: InvalidCurrentProjectDatabase::ManagedSchema(
+                InvalidManagedSchema::WrongRowCount {
+                    query: "inspection_snapshot_result_sets",
+                    expected: 10,
+                    actual: results.len(),
+                },
+            ),
+        }
+    })?;
+
+    let schema_version = decode_schema_version(schema_version_rows).map_err(|reason| {
+        ProjectDatabaseInspectionError::InvalidDatabase {
+            path: database_path.clone(),
+            reason,
+        }
+    })?;
     validate_managed_schema(schema).map_err(|reason| {
         ProjectDatabaseInspectionError::InvalidDatabase {
             path: database_path.clone(),
@@ -1869,76 +2903,31 @@ where
         }
     })?;
 
-    let metadata = metadata_facts_from_rows(
-        expected_name,
-        read_inspection_rows(
-            queries,
-            &database_path,
-            "读取 metadata",
-            SqliteQuery::new(SELECT_METADATA, Vec::new()),
-        )
-        .await?,
-    )
-    .map_err(|reason| ProjectDatabaseInspectionError::InvalidDatabase {
-        path: database_path.clone(),
-        reason: InvalidCurrentProjectDatabase::Metadata(reason),
-    })?;
-    let owners = decode_owner_states(
-        read_inspection_rows(
-            queries,
-            &database_path,
-            "读取 owner state",
-            SqliteQuery::new(SELECT_OWNER_STATES, Vec::new()),
-        )
-        .await?,
-    )
-    .map_err(|reason| ProjectDatabaseInspectionError::InvalidDatabase {
-        path: database_path.clone(),
-        reason,
-    })?;
-    let (terminology_json, placeholder_rules_json) = decode_translation_resources(
-        read_inspection_rows(
-            queries,
-            &database_path,
-            "读取翻译资源",
-            SqliteQuery::new(SELECT_TRANSLATION_RESOURCES, Vec::new()),
-        )
-        .await?,
-    )
-    .map_err(|reason| ProjectDatabaseInspectionError::InvalidDatabase {
-        path: database_path.clone(),
-        reason,
-    })?;
-    let mv_dialogue_rules_json = decode_project_definitions(
-        read_inspection_rows(
-            queries,
-            &database_path,
-            "读取项目定义",
-            SqliteQuery::new(SELECT_PROJECT_DEFINITIONS, Vec::new()),
-        )
-        .await?,
-    )
-    .map_err(|reason| ProjectDatabaseInspectionError::InvalidDatabase {
-        path: database_path.clone(),
-        reason,
-    })?;
-    let run_plan_results = read_inspection_snapshot(
-        queries,
-        &database_path,
-        "读取运行方案与 Lua 主程序快照",
-        vec![
-            SqliteQuery::new(SELECT_RUN_PLAN_SINGLETONS, Vec::new()),
-            SqliteQuery::new(SELECT_LUA_PROGRAMS, Vec::new()),
-        ],
-    )
-    .await?;
-    let [run_plan_singletons, lua_programs] = <[Vec<SqliteRow>; 2]>::try_from(run_plan_results)
-        .map_err(|results| ProjectDatabaseInspectionError::InvalidDatabase {
+    let metadata = metadata_facts_from_rows(expected_name, metadata_rows).map_err(|reason| {
+        ProjectDatabaseInspectionError::InvalidDatabase {
             path: database_path.clone(),
-            reason: InvalidCurrentProjectDatabase::RunPlans(InvalidProjectRunPlans::new(format!(
-                "运行方案快照应返回两组结果，实际为 {} 组",
-                results.len()
-            ))),
+            reason: InvalidCurrentProjectDatabase::Metadata(reason),
+        }
+    })?;
+    let owners = decode_owner_states(owner_rows).map_err(|reason| {
+        ProjectDatabaseInspectionError::InvalidDatabase {
+            path: database_path.clone(),
+            reason,
+        }
+    })?;
+    let (terminology_json, placeholder_rules_json) =
+        decode_translation_resources(translation_resource_rows).map_err(|reason| {
+            ProjectDatabaseInspectionError::InvalidDatabase {
+                path: database_path.clone(),
+                reason,
+            }
+        })?;
+    let mv_dialogue_rules_json =
+        decode_project_definitions(project_definition_rows).map_err(|reason| {
+            ProjectDatabaseInspectionError::InvalidDatabase {
+                path: database_path.clone(),
+                reason,
+            }
         })?;
     let run_plans =
         decode_project_run_plans(run_plan_singletons, lua_programs).map_err(|reason| {
@@ -1948,49 +2937,12 @@ where
             }
         })?;
 
-    let quick_check = read_inspection_rows(
-        queries,
-        &database_path,
-        "执行 quick_check",
-        SqliteQuery::new(SELECT_QUICK_CHECK, Vec::new()),
-    )
-    .await?;
-    let foreign_key_check = read_inspection_rows(
-        queries,
-        &database_path,
-        "执行 foreign_key_check",
-        SqliteQuery::new(SELECT_FOREIGN_KEY_CHECK, Vec::new()),
-    )
-    .await?;
     validate_integrity(quick_check, foreign_key_check).map_err(|reason| {
         ProjectDatabaseInspectionError::InvalidDatabase {
             path: database_path.clone(),
             reason,
         }
     })?;
-
-    let schema_version_after = decode_schema_version(
-        read_inspection_rows(
-            queries,
-            &database_path,
-            "复核 schema version",
-            SqliteQuery::new(SELECT_SCHEMA_VERSION, Vec::new()),
-        )
-        .await?,
-    )
-    .map_err(|reason| ProjectDatabaseInspectionError::InvalidDatabase {
-        path: database_path.clone(),
-        reason,
-    })?;
-    if schema_version_before != schema_version_after {
-        return Err(ProjectDatabaseInspectionError::InvalidDatabase {
-            path: database_path,
-            reason: InvalidCurrentProjectDatabase::SchemaChangedDuringInspection {
-                before: schema_version_before,
-                after: schema_version_after,
-            },
-        });
-    }
 
     Ok(ProjectDatabaseState {
         metadata,
@@ -1999,7 +2951,7 @@ where
         placeholder_rules_json,
         mv_dialogue_rules_json,
         run_plans,
-        schema_version: schema_version_after,
+        schema_version,
     })
 }
 
@@ -2165,9 +3117,16 @@ where
                     path: database_path.clone(),
                 }
             }
-            ExecuteTransactionError::RequirementFailed => {
+            ExecuteTransactionError::RequirementFailed
+            | ExecuteTransactionError::RequirementFailedWithRow { .. } => {
                 ProjectDatabaseReconciliationError::ConcurrentModification {
                     path: database_path.clone(),
+                }
+            }
+            ExecuteTransactionError::RequirementFailedWithRowOutcomeUnknown { source, .. } => {
+                ProjectDatabaseReconciliationError::OutcomeUnknown {
+                    path: database_path.clone(),
+                    source: *source,
                 }
             }
             ExecuteTransactionError::NotCommitted(source) => {
@@ -2728,7 +3687,7 @@ mod tests {
             .expect("测试触发器应可创建");
         assert!(matches!(
             validate_managed_schema(read_managed_schema(&connection)),
-            Err(InvalidCurrentProjectDatabase::ManagedSchema { .. })
+            Err(InvalidCurrentProjectDatabase::ManagedSchema(_))
         ));
 
         connection
@@ -2886,7 +3845,7 @@ mod tests {
                 SqliteValue::Blob(vec![0x11; 32]),
                 SqliteValue::Blob(vec![0x22; 31]),
             ])]),
-            Err(InvalidCurrentProjectDatabase::OwnerState { .. })
+            Err(InvalidCurrentProjectDatabase::OwnerState(_))
         ));
     }
 
@@ -2911,7 +3870,7 @@ mod tests {
         ] {
             assert!(matches!(
                 decode_project_definitions(row(invalid)),
-                Err(InvalidCurrentProjectDatabase::ProjectDefinitions { .. })
+                Err(InvalidCurrentProjectDatabase::ProjectDefinitions(_))
             ));
         }
     }
@@ -3231,7 +4190,6 @@ mod tests {
                 "ok".to_owned(),
             )])]),
             Ok(Vec::new()),
-            Ok(vec![SqliteRow::new(vec![SqliteValue::Integer(13)])]),
         ]
     }
 
@@ -3293,7 +4251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_inspection_returns_active_owner_freshness_in_domain_order() {
+    async fn strict_inspection_reads_all_project_facts_in_one_snapshot_and_domain_order() {
         let queries = RecordingQueryExecutor::responding_with_many(valid_inspection_responses());
         let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
         let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
@@ -3326,9 +4284,7 @@ mod tests {
             .lock()
             .expect("query invocations mutex should not be poisoned");
         assert_eq!(state.mv_dialogue_rules_json(), r#"{"rules":[]}"#);
-        assert_eq!(invocations.len(), 11);
-        assert_eq!(invocations[0].query.statement(), SELECT_SCHEMA_VERSION);
-        assert_eq!(invocations[10].query.statement(), SELECT_SCHEMA_VERSION);
+        assert_eq!(invocations.len(), 10);
         let snapshots = service
             .queries
             .snapshots
@@ -3336,9 +4292,146 @@ mod tests {
             .expect("query snapshots mutex should not be poisoned");
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].0, PathBuf::from("C:/projects/demo/project.db"));
-        assert_eq!(snapshots[0].1.len(), 2);
-        assert_eq!(snapshots[0].1[0].statement(), SELECT_RUN_PLAN_SINGLETONS);
-        assert_eq!(snapshots[0].1[1].statement(), SELECT_LUA_PROGRAMS);
+        assert_eq!(snapshots[0].1.len(), 10);
+        assert_eq!(
+            snapshots[0]
+                .1
+                .iter()
+                .map(SqliteQuery::statement)
+                .collect::<Vec<_>>(),
+            vec![
+                SELECT_SCHEMA_VERSION,
+                SELECT_MANAGED_SCHEMA,
+                SELECT_METADATA,
+                SELECT_OWNER_STATES,
+                SELECT_TRANSLATION_RESOURCES,
+                SELECT_PROJECT_DEFINITIONS,
+                SELECT_RUN_PLAN_SINGLETONS,
+                SELECT_LUA_PROGRAMS,
+                SELECT_QUICK_CHECK,
+                SELECT_FOREIGN_KEY_CHECK,
+            ]
+        );
+        assert_eq!(
+            snapshots[0]
+                .1
+                .iter()
+                .map(SqliteQuery::id)
+                .collect::<Vec<_>>(),
+            vec![
+                "project_database.inspect.schema_version",
+                "project_database.inspect.managed_schema",
+                "project_database.inspect.metadata",
+                "project_database.inspect.owner_states",
+                "project_database.inspect.translation_resources",
+                "project_database.inspect.project_definitions",
+                "project_database.inspect.run_plan_singletons",
+                "project_database.inspect.lua_programs",
+                "project_database.inspect.quick_check",
+                "project_database.inspect.foreign_key_check",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_read_failure_preserves_database_path_stage_and_query_identity() {
+        let queries = RecordingQueryExecutor::responding_with(Err(
+            QueryExistingDatabaseError::QueryFailed(FakeDriverError("SQL_PARAMETER_SENTINEL")),
+        ));
+        let transactions = RecordingTransactionExecutor::responding_with(Ok(()));
+        let service = ProjectDatabaseStateReconciliationService::new(queries, transactions);
+
+        let error = service
+            .inspect(
+                PathBuf::from("C:/projects/demo/project.db"),
+                "demo".parse().expect("项目名应合法"),
+            )
+            .await
+            .expect_err("一致快照读取失败必须保留完整查询上下文");
+
+        let ProjectDatabaseInspectionError::ReadDatabase {
+            path,
+            stage,
+            query_ids,
+            source,
+        } = error
+        else {
+            panic!("应报告带上下文的数据库读取失败")
+        };
+        assert_eq!(path, PathBuf::from("C:/projects/demo/project.db"));
+        assert_eq!(stage, "读取项目数据库一致快照");
+        assert_eq!(
+            query_ids,
+            vec![
+                "project_database.inspect.schema_version",
+                "project_database.inspect.managed_schema",
+                "project_database.inspect.metadata",
+                "project_database.inspect.owner_states",
+                "project_database.inspect.translation_resources",
+                "project_database.inspect.project_definitions",
+                "project_database.inspect.run_plan_singletons",
+                "project_database.inspect.lua_programs",
+                "project_database.inspect.quick_check",
+                "project_database.inspect.foreign_key_check",
+            ]
+        );
+        assert_eq!(source.0, "SQL_PARAMETER_SENTINEL");
+    }
+
+    #[tokio::test]
+    async fn inspection_maps_quick_check_and_foreign_key_sets_in_snapshot_order() {
+        let mut quick_check_responses = valid_inspection_responses();
+        quick_check_responses[8] = Ok(vec![SqliteRow::new(vec![SqliteValue::Text(
+            "corrupt".to_owned(),
+        )])]);
+        let service = ProjectDatabaseStateReconciliationService::new(
+            RecordingQueryExecutor::responding_with_many(quick_check_responses),
+            RecordingTransactionExecutor::responding_with(Ok(())),
+        );
+        let error = service
+            .inspect(
+                PathBuf::from("C:/projects/demo/project.db"),
+                "测试 游戏".parse().expect("项目名应合法"),
+            )
+            .await
+            .expect_err("quick_check 非 ok 必须按第九组结果报告");
+        assert!(matches!(
+            error,
+            ProjectDatabaseInspectionError::InvalidDatabase {
+                reason: InvalidCurrentProjectDatabase::Integrity(
+                    InvalidProjectDatabaseIntegrity::QuickCheckFailed
+                ),
+                ..
+            }
+        ));
+
+        let mut foreign_key_responses = valid_inspection_responses();
+        foreign_key_responses[9] = Ok(vec![SqliteRow::new(vec![
+            SqliteValue::Text("standard_text_unit".to_owned()),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("standard_text_group".to_owned()),
+            SqliteValue::Integer(0),
+        ])]);
+        let service = ProjectDatabaseStateReconciliationService::new(
+            RecordingQueryExecutor::responding_with_many(foreign_key_responses),
+            RecordingTransactionExecutor::responding_with(Ok(())),
+        );
+        let error = service
+            .inspect(
+                PathBuf::from("C:/projects/demo/project.db"),
+                "测试 游戏".parse().expect("项目名应合法"),
+            )
+            .await
+            .expect_err("foreign_key_check 非空必须按第十组结果报告");
+        assert!(matches!(
+            error,
+            ProjectDatabaseInspectionError::InvalidDatabase {
+                reason: InvalidCurrentProjectDatabase::Integrity(
+                    InvalidProjectDatabaseIntegrity::ForeignKeyViolations { actual: 1 }
+                ),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -3393,7 +4486,7 @@ mod tests {
                 .lock()
                 .expect("查询记录锁不应中毒")
                 .len(),
-            3
+            10
         );
         assert!(
             service
@@ -3493,6 +4586,13 @@ mod tests {
             .expect("transaction plans mutex should not be poisoned");
         assert_eq!(plans.len(), 1);
         let steps = plans[0].1.steps();
+        let SqliteTransactionStep::RequireNoRows(schema_version_guard) = &steps[0] else {
+            panic!("首个 CAS 必须复核一致快照读取到的 schema version")
+        };
+        assert_eq!(
+            schema_version_guard.parameters(),
+            &[SqliteValue::Integer(13)]
+        );
         let check_count = steps
             .iter()
             .filter(|step| matches!(step, SqliteTransactionStep::RequireNoRows(_)))
@@ -3590,6 +4690,7 @@ mod tests {
             PathBuf::from("C:/att/projects/mz/测试 游戏/project.db")
         );
         assert_eq!(invocations[0].query.statement(), SELECT_PROJECT_RECORD);
+        assert_eq!(invocations[0].query.id(), PROJECT_RECORD_QUERY_ID);
         assert!(invocations[0].query.parameters().is_empty());
     }
 
@@ -3619,14 +4720,68 @@ mod tests {
             read_failure.path(),
             Path::new("C:/att/projects/mz/demo/project.db")
         );
-        assert!(matches!(
-            read_failure,
-            ProjectDatabaseReadError::ReadDatabase { .. }
-        ));
+        let ProjectDatabaseReadError::ReadDatabase {
+            stage,
+            query_id,
+            source,
+            ..
+        } = &read_failure
+        else {
+            panic!("query failure should preserve read context")
+        };
+        assert_eq!(*stage, PROJECT_RECORD_READ_STAGE);
+        assert_eq!(query_id, PROJECT_RECORD_QUERY_ID);
+        assert_eq!(source.0, "query failed");
         assert_eq!(
             read_failure.source().map(ToString::to_string).as_deref(),
             Some("query failed")
         );
+    }
+
+    #[tokio::test]
+    async fn dialogue_definition_failure_keeps_typed_position_without_definition_body() {
+        const DEFINITION_BODY_SENTINEL: &str = "SECRET_DIALOGUE_DEFINITION_BODY";
+        let mut values = valid_metadata_row().into_values();
+        values.push(SqliteValue::Text(format!(
+            "{{\n\"rules\": \"{DEFINITION_BODY_SENTINEL}\"\n}}"
+        )));
+
+        let error = record_reading_service(Ok(vec![SqliteRow::new(values)]))
+            .read(&"测试 游戏".parse().expect("test name should be valid"))
+            .await
+            .expect_err("无效的对话定义必须被拒绝");
+
+        let ProjectDatabaseReadError::InvalidMetadata { path, reason } = error else {
+            panic!("应报告 metadata 中的定义错误")
+        };
+        assert_eq!(
+            path,
+            PathBuf::from("C:/att/projects/mz/测试 游戏/project.db")
+        );
+        let InvalidProjectMetadata::InvalidDialogueDefinition { stage, failure } = &reason else {
+            panic!("应保留类型化的对话定义失败")
+        };
+        assert_eq!(*stage, ProjectDefinitionStage::Decode);
+        let ProjectDefinitionFailure::InvalidJson {
+            category,
+            line,
+            column,
+        } = failure
+        else {
+            panic!("应保留 JSON 分类与行列")
+        };
+        assert_eq!(*category, SafeJsonErrorCategory::Data);
+        assert_eq!(*line, 2);
+        assert!(*column > 0);
+
+        let fact = reason.safe_fact();
+        assert!(fact.contains("metadata=invalid_dialogue_definition"));
+        assert!(fact.contains("definition=mv_dialogue_rules"));
+        assert!(fact.contains("stage=decode"));
+        assert!(fact.contains("failure=invalid_json"));
+        assert!(fact.contains("category=data"));
+        assert!(fact.contains("line=2"));
+        assert!(!fact.contains(DEFINITION_BODY_SENTINEL));
     }
 
     #[tokio::test]

@@ -8,21 +8,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{StandardWriteBack, StandardWriteBackSummary, WriteBackProgressPhase};
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticImpact, DiagnosticStage, DiagnosticSubject,
+    RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, LogicalTextLocation,
-    MutationClaim, MutationClaimSet, MutationResource, MutationResourceLock, TextProjectionRecipe,
-    TextUnitContent, TextUnitRole, mutation_claims_for_group,
+    MutationClaim, MutationClaimIndex, MutationClaimSet, MutationResource, MutationResourceLock,
+    TextProjectionRecipe, TextUnitContent, TextUnitRole, mutation_claims_for_group,
 };
 use crate::rpg_maker::project::{MaxFullwidthChars, OpenedProject, RpgMakerWriteBackLayoutProfile};
 use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
 };
+
+const MAX_PLANNING_PROGRESS_UPDATES: u64 = 1_024;
 
 /// 一个可独立拥有译文、验收并原子写回的语义文本单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,12 +187,34 @@ pub(crate) struct StandardWriteBackGroup {
 }
 
 impl StandardWriteBackGroup {
+    #[cfg(test)]
     pub(crate) fn new(
         kind: TextGroupKind,
         group_location: RpgMakerLocation,
         units: Vec<StandardWriteBackUnit>,
         recipes: Vec<TextProjectionRecipe>,
         mutation_locks: Vec<MutationResourceLock>,
+    ) -> Result<Self, StandardWriteBackSnapshotError> {
+        Self::build(kind, group_location, units, recipes, Some(mutation_locks))
+    }
+
+    /// 直接复用配方重建出的唯一 Claim 集合，避免读取边界先深拷贝全部 locks，
+    /// 随后又从同一配方重建并排序一次。
+    pub(crate) fn from_recipes(
+        kind: TextGroupKind,
+        group_location: RpgMakerLocation,
+        units: Vec<StandardWriteBackUnit>,
+        recipes: Vec<TextProjectionRecipe>,
+    ) -> Result<Self, StandardWriteBackSnapshotError> {
+        Self::build(kind, group_location, units, recipes, None)
+    }
+
+    fn build(
+        kind: TextGroupKind,
+        group_location: RpgMakerLocation,
+        units: Vec<StandardWriteBackUnit>,
+        recipes: Vec<TextProjectionRecipe>,
+        mutation_locks: Option<Vec<MutationResourceLock>>,
     ) -> Result<Self, StandardWriteBackSnapshotError> {
         if recipes.is_empty() {
             return Err(StandardWriteBackSnapshotError::EmptyProjection {
@@ -234,17 +263,24 @@ impl StandardWriteBackGroup {
                     resource: Box::new(conflict.resource().clone()),
                 }
             })?;
-        let mutation_claims = MutationClaimSet::from_locks(mutation_locks).map_err(|conflict| {
-            StandardWriteBackSnapshotError::MutationClaimConflict {
-                resource: Box::new(conflict.resource().clone()),
-            }
-        })?;
-        if expected_claims.locks() != mutation_claims.locks() {
+        let mutation_claims = mutation_locks
+            .map(MutationClaimSet::from_locks)
+            .transpose()
+            .map_err(
+                |conflict| StandardWriteBackSnapshotError::MutationClaimConflict {
+                    resource: Box::new(conflict.resource().clone()),
+                },
+            )?;
+        if mutation_claims
+            .as_ref()
+            .is_some_and(|mutation_claims| expected_claims.locks() != mutation_claims.locks())
+        {
             return Err(StandardWriteBackSnapshotError::RecipeClaimMismatch {
                 group_location: Box::new(group_location),
             });
         }
-        if let Some(lock) = mutation_claims
+        let validated_claims = mutation_claims.as_ref().unwrap_or(&expected_claims);
+        if let Some(lock) = validated_claims
             .locks()
             .iter()
             .find(|lock| lock.resource().source() != group_location.source())
@@ -265,6 +301,7 @@ impl StandardWriteBackGroup {
                 });
             }
         }
+        let mutation_claims = mutation_claims.unwrap_or(expected_claims);
 
         match kind {
             TextGroupKind::EventDialogue => {
@@ -349,6 +386,10 @@ impl StandardWriteBackGroup {
             self.mutation_claims,
         )
     }
+
+    pub(crate) fn mutation_claims(&self) -> &MutationClaimSet {
+        &self.mutation_claims
+    }
 }
 
 fn validate_line_references(
@@ -396,6 +437,56 @@ fn validate_line_references(
     Ok(())
 }
 
+/// 以借用的冻结原文字节和固定大小游标逐段校验，不物化完整重建文本。
+struct ExpectedRawCursor<'a> {
+    expected_raw: &'a [u8],
+    offset: Option<usize>,
+    #[cfg(test)]
+    visited_segments: usize,
+    #[cfg(test)]
+    visited_segment_bytes: usize,
+}
+
+impl<'a> ExpectedRawCursor<'a> {
+    fn new(expected_raw: &'a str) -> Self {
+        Self {
+            expected_raw: expected_raw.as_bytes(),
+            offset: Some(0),
+            #[cfg(test)]
+            visited_segments: 0,
+            #[cfg(test)]
+            visited_segment_bytes: 0,
+        }
+    }
+
+    fn consume(&mut self, segment: &str) {
+        #[cfg(test)]
+        {
+            self.visited_segments += 1;
+            self.visited_segment_bytes += segment.len();
+        }
+
+        let Some(offset) = self.offset else {
+            return;
+        };
+        let segment = segment.as_bytes();
+        if self.expected_raw[offset..].starts_with(segment) {
+            self.offset = Some(offset + segment.len());
+        } else {
+            self.offset = None;
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.offset == Some(self.expected_raw.len())
+    }
+
+    #[cfg(test)]
+    fn work(&self) -> (usize, usize) {
+        (self.visited_segments, self.visited_segment_bytes)
+    }
+}
+
 fn validate_projection_round_trip(
     group_location: &RpgMakerLocation,
     units: &[StandardWriteBackUnit],
@@ -408,40 +499,37 @@ fn validate_projection_round_trip(
     for recipe in recipes {
         match recipe {
             TextProjectionRecipe::Direct(recipe) => {
-                let mut rebuilt = String::new();
+                let mut expected = ExpectedRawCursor::new(recipe.expected_raw());
                 for part in recipe.parts() {
-                    match part {
-                        DirectTextPart::Literal(value) => rebuilt.push_str(value),
-                        DirectTextPart::TextSlot { role } => rebuilt.push_str(
-                            units
-                                .get(role)
-                                .and_then(|unit| unit.source_content.as_value())
-                                .ok_or_else(|| {
-                                    StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
-                                        group_location: Box::new(group_location.clone()),
-                                        target: Box::new(recipe.target().clone()),
-                                    }
-                                })?,
-                        ),
+                    let segment = match part {
+                        DirectTextPart::Literal(value) => value.as_str(),
+                        DirectTextPart::TextSlot { role } => units
+                            .get(role)
+                            .and_then(|unit| unit.source_content.as_value())
+                            .ok_or_else(|| {
+                                StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                    group_location: Box::new(group_location.clone()),
+                                    target: Box::new(recipe.target().clone()),
+                                }
+                            })?,
                         DirectTextPart::LineSlot {
                             role,
                             source_line_index,
-                        } => {
-                            let line = units
-                                .get(role)
-                                .and_then(|unit| unit.source_content.as_lines())
-                                .and_then(|lines| lines.get(*source_line_index))
-                                .ok_or_else(|| {
-                                    StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
-                                        group_location: Box::new(group_location.clone()),
-                                        target: Box::new(recipe.target().clone()),
-                                    }
-                                })?;
-                            rebuilt.push_str(line);
-                        }
-                    }
+                        } => units
+                            .get(role)
+                            .and_then(|unit| unit.source_content.as_lines())
+                            .and_then(|lines| lines.get(*source_line_index))
+                            .map(String::as_str)
+                            .ok_or_else(|| {
+                                StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                    group_location: Box::new(group_location.clone()),
+                                    target: Box::new(recipe.target().clone()),
+                                }
+                            })?,
+                    };
+                    expected.consume(segment);
                 }
-                if rebuilt != recipe.expected_raw() {
+                if !expected.is_complete() {
                     return Err(
                         StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
                             group_location: Box::new(group_location.clone()),
@@ -465,14 +553,12 @@ fn validate_projection_round_trip(
                     );
                 }
                 for line in recipe.lines() {
-                    let mut rebuilt = String::new();
+                    let mut expected = ExpectedRawCursor::new(line.expected_raw());
                     for (part_index, part) in line.parts().iter().enumerate() {
-                        match part {
-                            DialogueLinePart::Literal(value) => rebuilt.push_str(value),
-                            DialogueLinePart::SpeakerSlot => rebuilt
-                                .push_str(speaker.expect(
-                                    "调用前已经确认内嵌 SpeakerSlot 对应逻辑 Speaker 单元",
-                                )),
+                        let segment = match part {
+                            DialogueLinePart::Literal(value) => value.as_str(),
+                            DialogueLinePart::SpeakerSlot => speaker
+                                .expect("调用前已经确认内嵌 SpeakerSlot 对应逻辑 Speaker 单元"),
                             DialogueLinePart::BodyLine { source_line_index } => {
                                 if part_index + 1 != line.parts().len() {
                                     return Err(
@@ -482,20 +568,20 @@ fn validate_projection_round_trip(
                                         },
                                     );
                                 }
-                                rebuilt.push_str(
-                                    units
-                                        .get(&TextUnitRole::DialogueBody)
-                                        .and_then(|unit| unit.source_content.as_lines())
-                                        .and_then(|lines| lines.get(*source_line_index))
-                                        .ok_or_else(|| StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                units
+                                    .get(&TextUnitRole::DialogueBody)
+                                    .and_then(|unit| unit.source_content.as_lines())
+                                    .and_then(|lines| lines.get(*source_line_index))
+                                    .map(String::as_str)
+                                    .ok_or_else(|| StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
                                             group_location: Box::new(group_location.clone()),
                                             target: Box::new(line.physical_location().clone()),
-                                        })?,
-                                );
+                                        })?
                             }
-                        }
+                        };
+                        expected.consume(segment);
                     }
-                    if rebuilt != line.expected_raw() {
+                    if !expected.is_complete() {
                         return Err(
                             StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
                                 group_location: Box::new(group_location.clone()),
@@ -555,16 +641,19 @@ impl StandardWriteBackSnapshot {
     pub(crate) fn new(
         groups: Vec<StandardWriteBackGroup>,
     ) -> Result<Self, StandardWriteBackSnapshotError> {
-        let mut claim_sets = Vec::<&MutationClaimSet>::new();
+        let claim_count = groups
+            .iter()
+            .map(|group| group.mutation_claims.locks().len())
+            .sum();
+        let mut claim_index = MutationClaimIndex::with_capacity(claim_count);
         for group in &groups {
-            for existing in &claim_sets {
-                if let Some(conflict) = existing.conflict_with(&group.mutation_claims) {
-                    return Err(StandardWriteBackSnapshotError::MutationClaimConflict {
+            claim_index
+                .insert(&group.mutation_claims)
+                .map_err(
+                    |conflict| StandardWriteBackSnapshotError::MutationClaimConflict {
                         resource: Box::new(conflict.resource().clone()),
-                    });
-                }
-            }
-            claim_sets.push(&group.mutation_claims);
+                    },
+                )?;
         }
         Ok(Self { groups })
     }
@@ -1693,7 +1782,7 @@ impl StandardWriteBackMutationPlan {
     pub(crate) fn new(
         mutations: Vec<StandardWriteBackMutation>,
     ) -> Result<Self, StandardWriteBackMutationPlanError> {
-        let mut claim_sets = Vec::<&MutationClaimSet>::new();
+        let mut claim_index = MutationClaimIndex::default();
         for mutation in &mutations {
             let claims = match mutation {
                 StandardWriteBackMutation::SetText(mutation) => mutation.mutation_claims(),
@@ -1701,14 +1790,11 @@ impl StandardWriteBackMutationPlan {
                 StandardWriteBackMutation::ReplaceChoices(mutation) => mutation.mutation_claims(),
                 StandardWriteBackMutation::ReplaceEventBody(mutation) => mutation.mutation_claims(),
             };
-            for existing in &claim_sets {
-                if let Some(conflict) = existing.conflict_with(claims) {
-                    return Err(StandardWriteBackMutationPlanError::MutationClaimConflict {
-                        resource: Box::new(conflict.resource().clone()),
-                    });
+            claim_index.insert(claims).map_err(|conflict| {
+                StandardWriteBackMutationPlanError::MutationClaimConflict {
+                    resource: Box::new(conflict.resource().clone()),
                 }
-            }
-            claim_sets.push(claims);
+            })?;
         }
         Ok(Self { mutations })
     }
@@ -1973,16 +2059,17 @@ where
             total_groups,
         ));
         let profile = *layout_profile;
-        let completed_groups = Arc::new(Mutex::new(0_u64));
+        let planning_progress = Arc::new(PlanningProgress::new(
+            Arc::clone(&self.progress),
+            total_groups,
+        ));
         let groups = groups
             .into_iter()
             .map(|group| ProgressTrackedPlanningJob {
                 group,
                 profile,
                 layouter: Arc::clone(&self.text_layouter),
-                progress: Arc::clone(&self.progress),
-                completed_groups: Arc::clone(&completed_groups),
-                total_groups,
+                progress: Arc::clone(&planning_progress),
             })
             .collect();
         let planned_groups = self
@@ -2035,9 +2122,53 @@ struct ProgressTrackedPlanningJob<L> {
     group: StandardWriteBackGroup,
     profile: RpgMakerWriteBackLayoutProfile,
     layouter: Arc<L>,
-    progress: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
-    completed_groups: Arc<Mutex<u64>>,
-    total_groups: u64,
+    progress: Arc<PlanningProgress>,
+}
+
+struct PlanningProgress {
+    observer: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
+    completed: AtomicU64,
+    last_reported: Mutex<u64>,
+    total: u64,
+    report_stride: u64,
+}
+
+impl PlanningProgress {
+    fn new(observer: Arc<dyn ProgressObserver<WriteBackProgressPhase>>, total: u64) -> Self {
+        Self {
+            observer,
+            completed: AtomicU64::new(0),
+            last_reported: Mutex::new(0),
+            total,
+            report_stride: total.div_ceil(MAX_PLANNING_PROGRESS_UPDATES).max(1),
+        }
+    }
+
+    fn complete(&self) {
+        let completed = self
+            .completed
+            .fetch_add(1, Ordering::AcqRel)
+            .checked_add(1)
+            .expect("写回已规划组数量必须可表示为 u64");
+        if completed < self.total && !completed.is_multiple_of(self.report_stride) {
+            return;
+        }
+
+        let mut last_reported = self
+            .last_reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let observed = self.completed.load(Ordering::Acquire).min(self.total);
+        if observed <= *last_reported {
+            return;
+        }
+        *last_reported = observed;
+        self.observer.observe(ProgressSnapshot::determinate(
+            WriteBackProgressPhase::PlanningStandard,
+            observed,
+            self.total,
+        ));
+    }
 }
 
 fn plan_standard_write_back_group_with_progress<L>(
@@ -2047,16 +2178,7 @@ where
     L: RpgMakerWriteBackTextLayouter,
 {
     let planned = plan_standard_write_back_group(job.group, &job.profile, job.layouter.as_ref());
-    let mut completed = job
-        .completed_groups
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *completed += 1;
-    job.progress.observe(ProgressSnapshot::determinate(
-        WriteBackProgressPhase::PlanningStandard,
-        *completed,
-        job.total_groups,
-    ));
+    job.progress.complete();
     planned
 }
 
@@ -2626,14 +2748,125 @@ where
     }
 }
 
+impl<R, D, C> StandardWriteBackServiceError<R, D, C>
+where
+    R: SafeDiagnosticSource,
+    D: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        match self {
+            Self::ReadAssets(source) => source.safe_diagnostic_source(
+                DiagnosticStage::WriteBack,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::SchedulePlanning(source) => {
+                let mut diagnostic = source.safe_diagnostic_source(
+                    DiagnosticStage::WriteBack,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                );
+                diagnostic.code = DiagnosticCode::WriteBackPlan;
+                diagnostic.subject = DiagnosticSubject::operation("Standard write-back planning");
+                diagnostic.with_recovery(RecoveryFact::component(
+                    "write_back_operation=plan_standard_mutations",
+                ))
+            }
+            Self::RewriteDocuments(source) => source.safe_diagnostic_source(
+                DiagnosticStage::WriteBack,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            ),
+        }
+    }
+}
+
+impl<R, D, C> SafeDiagnosticSource for StandardWriteBackServiceError<R, D, C>
+where
+    R: SafeDiagnosticSource,
+    D: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    fn safe_diagnostic_source(
+        &self,
+        _stage: DiagnosticStage,
+        _impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        self.safe_diagnostic()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::ProgressAmount;
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
         ScalarFieldKey,
     };
     use crate::rpg_maker::project::MaxFullwidthChars;
+
+    #[derive(Clone, Default)]
+    struct RecordingPlanningProgress(Arc<Mutex<Vec<ProgressSnapshot<WriteBackProgressPhase>>>>);
+
+    impl ProgressObserver<WriteBackProgressPhase> for RecordingPlanningProgress {
+        fn observe(&self, snapshot: ProgressSnapshot<WriteBackProgressPhase>) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(snapshot);
+        }
+    }
+
+    #[test]
+    fn large_parallel_planning_coalesces_progress_and_keeps_the_exact_final_count() {
+        const TOTAL: u64 = 217_000;
+        const WORKERS: usize = 8;
+
+        let observer = RecordingPlanningProgress::default();
+        let progress = Arc::new(PlanningProgress::new(Arc::new(observer.clone()), TOTAL));
+        let next = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let progress = Arc::clone(&progress);
+                let next = &next;
+                scope.spawn(move || {
+                    loop {
+                        if next.fetch_add(1, Ordering::Relaxed) >= TOTAL {
+                            break;
+                        }
+                        progress.complete();
+                    }
+                });
+            }
+        });
+
+        let snapshots = observer
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            snapshots.len() <= MAX_PLANNING_PROGRESS_UPDATES as usize,
+            "大量 Group 不得退化为逐组锁和逐组进度事件：{}",
+            snapshots.len()
+        );
+        let counts = snapshots
+            .iter()
+            .map(|snapshot| match snapshot.amount {
+                ProgressAmount::Determinate { completed, total }
+                    if snapshot.phase == WriteBackProgressPhase::PlanningStandard =>
+                {
+                    assert_eq!(total, TOTAL);
+                    completed
+                }
+                _ => panic!("规划计数只能发布确定型 PlanningStandard 快照"),
+            })
+            .collect::<Vec<_>>();
+        assert!(counts.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(counts.last(), Some(&TOTAL));
+    }
 
     fn location(command_index: usize, parameter_index: Option<usize>) -> RpgMakerLocation {
         let mut steps = vec![
@@ -2663,6 +2896,309 @@ mod tests {
             .expect("测试配方应形成无冲突 Claim")
             .locks()
             .to_vec()
+    }
+
+    /// 测试专用的旧式完整字符串重建，用来锁定游标实现的现行语义。
+    fn reference_validate_projection_round_trip(
+        group_location: &RpgMakerLocation,
+        units: &[StandardWriteBackUnit],
+        recipes: &[TextProjectionRecipe],
+    ) -> Result<(), StandardWriteBackSnapshotError> {
+        let units = units
+            .iter()
+            .map(|unit| (unit.role.clone(), unit))
+            .collect::<BTreeMap<_, _>>();
+        for recipe in recipes {
+            match recipe {
+                TextProjectionRecipe::Direct(recipe) => {
+                    let mut rebuilt = String::new();
+                    for part in recipe.parts() {
+                        match part {
+                            DirectTextPart::Literal(value) => rebuilt.push_str(value),
+                            DirectTextPart::TextSlot { role } => rebuilt.push_str(
+                                units
+                                    .get(role)
+                                    .and_then(|unit| unit.source_content.as_value())
+                                    .ok_or_else(|| {
+                                        StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                            group_location: Box::new(group_location.clone()),
+                                            target: Box::new(recipe.target().clone()),
+                                        }
+                                    })?,
+                            ),
+                            DirectTextPart::LineSlot {
+                                role,
+                                source_line_index,
+                            } => {
+                                let line = units
+                                    .get(role)
+                                    .and_then(|unit| unit.source_content.as_lines())
+                                    .and_then(|lines| lines.get(*source_line_index))
+                                    .ok_or_else(|| {
+                                        StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                            group_location: Box::new(group_location.clone()),
+                                            target: Box::new(recipe.target().clone()),
+                                        }
+                                    })?;
+                                rebuilt.push_str(line);
+                            }
+                        }
+                    }
+                    if rebuilt != recipe.expected_raw() {
+                        return Err(
+                            StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                group_location: Box::new(group_location.clone()),
+                                target: Box::new(recipe.target().clone()),
+                            },
+                        );
+                    }
+                }
+                TextProjectionRecipe::Dialogue(recipe) => {
+                    let speaker = units
+                        .get(&TextUnitRole::DialogueSpeaker)
+                        .and_then(|unit| unit.source_content.as_value());
+                    if let Some(target) = recipe.direct_speaker()
+                        && speaker != Some(target.expected_raw())
+                    {
+                        return Err(
+                            StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                group_location: Box::new(group_location.clone()),
+                                target: Box::new(target.physical_location().clone()),
+                            },
+                        );
+                    }
+                    for line in recipe.lines() {
+                        let mut rebuilt = String::new();
+                        for (part_index, part) in line.parts().iter().enumerate() {
+                            match part {
+                                DialogueLinePart::Literal(value) => rebuilt.push_str(value),
+                                DialogueLinePart::SpeakerSlot => rebuilt.push_str(speaker.expect(
+                                    "调用前已经确认内嵌 SpeakerSlot 对应逻辑 Speaker 单元",
+                                )),
+                                DialogueLinePart::BodyLine { source_line_index } => {
+                                    if part_index + 1 != line.parts().len() {
+                                        return Err(
+                                            StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                                group_location: Box::new(group_location.clone()),
+                                                target: Box::new(line.physical_location().clone()),
+                                            },
+                                        );
+                                    }
+                                    rebuilt.push_str(
+                                        units
+                                            .get(&TextUnitRole::DialogueBody)
+                                            .and_then(|unit| unit.source_content.as_lines())
+                                            .and_then(|lines| lines.get(*source_line_index))
+                                            .ok_or_else(|| StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                                group_location: Box::new(group_location.clone()),
+                                                target: Box::new(line.physical_location().clone()),
+                                            })?,
+                                    );
+                                }
+                            }
+                        }
+                        if rebuilt != line.expected_raw() {
+                            return Err(
+                                StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                                    group_location: Box::new(group_location.clone()),
+                                    target: Box::new(line.physical_location().clone()),
+                                },
+                            );
+                        }
+                    }
+                }
+                TextProjectionRecipe::Claim(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn projection_round_trip_cursor_matches_the_rebuilding_reference() {
+        let group_location = location(100, None);
+        let scalar_role =
+            TextUnitRole::Scalar(ScalarFieldKey::new("unicode_scalar").expect("测试标量键应合法"));
+        let line_role = TextUnitRole::Choices;
+        let units = vec![
+            StandardWriteBackUnit::new(
+                scalar_role.clone(),
+                TextUnitContent::Value("甲🙂".to_owned()),
+                None,
+            )
+            .expect("测试标量单元应合法"),
+            StandardWriteBackUnit::new(
+                line_role.clone(),
+                TextUnitContent::Lines(vec!["第一行".to_owned(), "第二行🌏".to_owned()]),
+                None,
+            )
+            .expect("测试行单元应合法"),
+            StandardWriteBackUnit::new(
+                TextUnitRole::DialogueSpeaker,
+                TextUnitContent::Value("爱丽丝🙂".to_owned()),
+                None,
+            )
+            .expect("测试 Speaker 单元应合法"),
+            StandardWriteBackUnit::new(
+                TextUnitRole::DialogueBody,
+                TextUnitContent::Lines(vec!["你好🌏".to_owned(), "再见".to_owned()]),
+                None,
+            )
+            .expect("测试 Body 单元应合法"),
+        ];
+
+        let direct = |target: RpgMakerLocation, expected_raw: &str, line_index: usize| {
+            TextProjectionRecipe::Direct(
+                DirectTextRecipe::new(
+                    target,
+                    expected_raw,
+                    vec![
+                        DirectTextPart::Literal("前缀【".to_owned()),
+                        DirectTextPart::TextSlot {
+                            role: scalar_role.clone(),
+                        },
+                        DirectTextPart::Literal("】中段".to_owned()),
+                        DirectTextPart::LineSlot {
+                            role: line_role.clone(),
+                            source_line_index: line_index,
+                        },
+                        DirectTextPart::Literal("尾🙂".to_owned()),
+                    ],
+                )
+                .expect("测试直接配方形状应合法"),
+            )
+        };
+        let valid_direct = direct(location(101, Some(0)), "前缀【甲🙂】中段第二行🌏尾🙂", 1);
+        let first_bad_target = location(102, Some(0));
+        let mismatched_direct = direct(first_bad_target.clone(), "前缀【甲🙃】中段第二行🌏尾🙂", 1);
+        let missing_line_direct = direct(location(103, Some(0)), "任意冻结原文", 9);
+
+        let valid_dialogue = TextProjectionRecipe::Dialogue(
+            DialogueWriteRecipe::new(
+                group_location.clone(),
+                None,
+                vec![
+                    DialogueLineRecipe::new(
+                        location(104, Some(0)),
+                        "\\n<爱丽丝🙂>你好🌏",
+                        vec![
+                            DialogueLinePart::Literal("\\n<".to_owned()),
+                            DialogueLinePart::SpeakerSlot,
+                            DialogueLinePart::Literal(">".to_owned()),
+                            DialogueLinePart::BodyLine {
+                                source_line_index: 0,
+                            },
+                        ],
+                    )
+                    .expect("测试首行对话配方应合法"),
+                    DialogueLineRecipe::new(
+                        location(105, Some(0)),
+                        "再见",
+                        vec![DialogueLinePart::BodyLine {
+                            source_line_index: 1,
+                        }],
+                    )
+                    .expect("测试次行对话配方应合法"),
+                ],
+            )
+            .expect("测试对话配方应合法"),
+        );
+        let bad_body_position_target = location(106, Some(0));
+        let bad_body_position = TextProjectionRecipe::Dialogue(
+            DialogueWriteRecipe::new(
+                group_location.clone(),
+                None,
+                vec![
+                    DialogueLineRecipe::new(
+                        bad_body_position_target,
+                        "你好🌏!",
+                        vec![
+                            DialogueLinePart::BodyLine {
+                                source_line_index: 0,
+                            },
+                            DialogueLinePart::Literal("!".to_owned()),
+                        ],
+                    )
+                    .expect("测试模型允许快照边界拒绝 Body 后缀"),
+                ],
+            )
+            .expect("测试对话配方形状应合法"),
+        );
+        let direct_speaker_target = location(107, Some(4));
+        let bad_direct_speaker = TextProjectionRecipe::Dialogue(
+            DialogueWriteRecipe::new(
+                group_location.clone(),
+                Some(DirectSpeakerTarget::new(
+                    direct_speaker_target,
+                    "错误 Speaker",
+                )),
+                vec![
+                    DialogueLineRecipe::new(
+                        location(108, Some(0)),
+                        "错误正文",
+                        vec![DialogueLinePart::BodyLine {
+                            source_line_index: 0,
+                        }],
+                    )
+                    .expect("测试直接 Speaker 对话行应合法"),
+                ],
+            )
+            .expect("测试直接 Speaker 对话配方应合法"),
+        );
+
+        let cases = [
+            vec![valid_direct.clone()],
+            vec![mismatched_direct.clone()],
+            vec![missing_line_direct],
+            vec![valid_dialogue],
+            vec![bad_body_position],
+            vec![bad_direct_speaker],
+            vec![
+                valid_direct,
+                mismatched_direct,
+                direct(location(109, Some(0)), "同样错误", 1),
+            ],
+        ];
+        for (case_index, recipes) in cases.iter().enumerate() {
+            assert_eq!(
+                validate_projection_round_trip(&group_location, &units, recipes),
+                reference_validate_projection_round_trip(&group_location, &units, recipes),
+                "第 {case_index} 个 Direct/Dialogue 等价性样本不一致"
+            );
+        }
+
+        let first_error = validate_projection_round_trip(
+            &group_location,
+            &units,
+            cases.last().expect("必须包含首错顺序样本"),
+        );
+        assert_eq!(
+            first_error,
+            Err(
+                StandardWriteBackSnapshotError::RecipeDoesNotRebuildOriginal {
+                    group_location: Box::new(group_location),
+                    target: Box::new(first_bad_target),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn large_expected_raw_cursor_has_linear_borrowed_segment_work() {
+        const SEGMENTS: usize = 262_144;
+        const SEGMENT: &str = "片段🙂世界🌏";
+
+        let expected_raw = SEGMENT.repeat(SEGMENTS);
+        let mut cursor = ExpectedRawCursor::new(&expected_raw);
+        for _ in 0..SEGMENTS {
+            cursor.consume(SEGMENT);
+        }
+
+        assert!(cursor.is_complete());
+        assert_eq!(cursor.work(), (SEGMENTS, expected_raw.len()));
+        assert!(
+            std::mem::size_of_val(&cursor) <= 6 * std::mem::size_of::<usize>(),
+            "校验游标只能保留借用、偏移和固定工作计数，不能按冻结原文大小持有重建缓冲"
+        );
     }
 
     fn dialogue_snapshot(

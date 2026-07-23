@@ -68,15 +68,18 @@ translation state 必须成对存在或成对为空。Lua 私有表使用的 64 
 - `standard_asset_owner_state`：owner 的来源与资产快照指纹；
 - `standard_text_group`：含 `group_order` 的组与完整 recipe；
 - `standard_text_unit`：含 `unit_order` 的语义单元、译文和 state；
-- `standard_mutation_claim`：`owner + group_location + resource_key + access`；
+- `standard_mutation_claim`：每个 `(owner, resource)` 至多一行的确定性跨 owner 冲突摘要；
 - `standard_translation_resource`：术语与自定义占位符 canonical 资源；
 - `standard_project_definition`：MV 姓名投影定义。
 - `extract_run_plan`：上次成功 Extract 的非空完整 owner 集合；
 - `extract_rules_definition`：可自动复用的非空 Rules canonical 语义；
 - `lua_program` 中的 `extract` 行：可自动复用的非空 Lua 主程序快照。
 
-当前 schema 一次性替换旧 schema，不提供迁移、识别或兼容读取。旧项目应在项目根外备份
-后重新 Init/Extract/Translate；不符合当前 schema 的数据库只作为普通无效项目数据库。
+其中位置、Mutation resource、unit role 和 recipe 只使用当前 compact canonical JSON
+字节；含额外空白、替代转义或其他语义等价但非规范的表示时，按普通无效项目状态处理。
+
+数据库只按当前 schema、约束和领域不变量读取；不符合时按具体 schema、状态或完整性
+错误处理。
 
 ## 3. Builtin 覆盖矩阵
 
@@ -141,7 +144,8 @@ Builtin 数据库对象以对象条目为组，System 各逻辑数组/对象、�
 按语义分组。Rules 沿路径展开后，以最终 string 的稳定父容器建立组；同一 string 中
 同一规则的多次 `text` 捕获合并为一个组，并按捕获起始字节形成 sibling fields。Lua
 严格使用 `groups`/`fields` 无洞数组声明顺序；同一次 `replace_standard` 中的
-`(group.location, group.kind)` 必须唯一，重复项直接失败，不会交给共享归一化自动合并。
+`group.location` 本身必须唯一，同位置同 kind 或不同 kind 都直接失败，不会交给共享归一化
+自动合并。
 
 自然顺序为：
 
@@ -165,6 +169,12 @@ Builtin 数据库对象以对象条目为组，System 各逻辑数组/对象、�
 Exclusive 资源锁。同一资源只允许 Intent+Intent；任一 Exclusive 即冲突。组内、同 owner、
 跨 owner Store 与 WriteBack 发布前共用这一验证。
 
+这里的 Claim 是完整逻辑集合，由 group kind、location 和 recipe 唯一确定，并全部进入
+owner 资产指纹。SQLite 不逐条复制这个集合：`standard_mutation_claim` 对每个
+`(owner, resource)` 只保存跨 owner 冲突所需的确定性摘要。Exclusive 在 owner 内本来就
+只能唯一，直接保留；多个合法 Intent 共享同一 resource 时，保留自然顺序最早的 group
+作为代表。摘要不减少组内或 owner 内验证，也不改变完整逻辑 Claim 的指纹顺序。
+
 完整冲突矩阵见[规则文件第 5 节](rules.md#5-自然顺序与-mutation-claim)。关键结果是：
 raw JSON string 与 decoded descendant 冲突，不同 decoded sibling 允许；raw note 与
 NoteTag 冲突而不同 occurrence 允许；raw 108/408 与 CommentTag 冲突；Dialogue、Choices、
@@ -180,8 +190,19 @@ Extract Lua 获得公共 `ctx.project/json/source/rpg_maker/db` 和 `ctx.extract
 
 ## 8. 提交、继承与完成语义
 
-每个 owner 的来源指纹、group、unit、claim 和资产快照指纹在一个事务中验证并替换。
-失败不暴露半快照。相同快照经完整读取复核后返回 `Unchanged`；真实替换返回更新摘要。
+每个 owner 的来源指纹、group、unit、由 recipe 确定的完整逻辑 Claim、冲突摘要和资产
+快照指纹在一个事务中验证并替换。事务直接批量写正式 Group、Unit 与 Claim 摘要表；
+未提交行对其他连接不可见，不复制 TEMP B-tree。非空 incoming 摘要不少于其他两个
+owner 的摘要总量时，按最大真实游戏消融结果在同一替换事务内暂时删除两个 Claim
+二级索引，直接写正式摘要表后用项目数据库的权威 DDL 恢复索引，再执行精确跨 owner
+冲突检查；较小 owner 继续在线维护索引。这只是内部写入算法选择，不限制任一 owner
+或项目的完整逻辑 Claim 总量，也不改变最终 schema。
+指纹、无变化判断和译文继承完成后，事务参数可以按当前 B-tree 的物理键重排；持久化的
+`group_order`、`unit_order` 与预先计算的指纹仍是自然语义，读取结果不随写入顺序改变。
+跨 owner 检查以 `incoming_summary_count + 1` 为上限采样另一侧，再由实际较小的一侧驱动
+精确资源索引探测。冲突、SQLite 错误或取消会把旧资产行和索引 DDL 一并回滚，不暴露
+半快照；只有 SQLite 已确认回滚时才报告普通 Claim 冲突。相同快照经 group、unit 和摘要
+的完整读取复核后返回 `Unchanged`；真实替换返回更新摘要。
 
 替换时，只有逻辑身份、unit role、完整源内容与源上下文逐字相同才继承译文/state；
 `group_order`/`unit_order` 的单独变化不破坏继承，但会改变资产快照指纹。跨 owner 的 Claim

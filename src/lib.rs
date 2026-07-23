@@ -4,6 +4,7 @@
 compile_error!("ATT 仅支持 x86_64-pc-windows-msvc");
 
 mod application;
+mod diagnostic;
 mod execution;
 mod fingerprint;
 mod i18n;

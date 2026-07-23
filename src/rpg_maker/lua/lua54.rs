@@ -26,6 +26,11 @@ use tokio::sync::{Notify, oneshot};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+};
+
 // 标准快照及其数据库存储分类仍由当前资产适配器提供；Lua VM 与宿主协议本身
 // 已位于共享 RPG Maker 边界，不依赖具体引擎的命令编排。
 use crate::fingerprint::{SHA256_FINGERPRINT_BYTES, Sha256Fingerprint};
@@ -37,19 +42,16 @@ use crate::rpg_maker::lua::document::{
     OpenedRpgMakerDocument, RpgMakerDocumentError, RpgMakerTextReference, data_file_source,
     data_source, map_source, plugin_parameter_source, source_path,
 };
-use crate::rpg_maker::lua::json::{
-    HostValueBudget, HostValueBudgetExceeded, HostValueBudgetTracker, LosslessJsonValue,
-    decode as decode_json, validate_number,
-};
+use crate::rpg_maker::lua::json::{LosslessJsonValue, decode as decode_json, validate_number};
 use crate::rpg_maker::lua::runtime::{
     OwnedLuaProgram, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
     TrustedLuaCommonBindings, TrustedLuaCommonHostCalls, TrustedLuaExecutionHandle,
-    TrustedLuaExtractHostCalls, TrustedLuaHostCallError, TrustedLuaOutputEntry,
-    TrustedLuaPhaseBindings, TrustedLuaPreparedTranslation,
-    TrustedLuaPreparedTranslationAcceptance, TrustedLuaRuntimeBindings,
-    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
-    TrustedLuaTranslateHostCalls, TrustedLuaWriteBackHostCalls, TrustedLuaWriteBackLayoutPair,
-    TrustedLuaWriteBackLayoutRegion, TrustedLuaWriteBackLayoutResult,
+    TrustedLuaExtractHostCalls, TrustedLuaHostCallError, TrustedLuaPhaseBindings,
+    TrustedLuaPreparedTranslation, TrustedLuaPreparedTranslationAcceptance,
+    TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport,
+    TrustedLuaRuntimeExecutor, TrustedLuaTranslateHostCalls, TrustedLuaWriteBackHostCalls,
+    TrustedLuaWriteBackLayoutPair, TrustedLuaWriteBackLayoutRegion,
+    TrustedLuaWriteBackLayoutResult,
 };
 use crate::rpg_maker::lua::{LuaPhase, LuaProjectContext, LuaSourcePath};
 use crate::rpg_maker::standard_asset::validate_standard_text_locations;
@@ -59,30 +61,28 @@ use crate::rpg_maker::text::{
 use crate::storage::file_system::ScopedDirectoryPath;
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow, SqliteValue};
 
-/// 已由配置边界建立的单次 Lua 执行资源上限。
+/// Lua worker 的内部执行策略。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TrustedLua54RuntimeConfiguration {
     worker_stack_bytes: NonZeroUsize,
-    memory_limit_bytes_per_vm: NonZeroUsize,
     cancel_check_instruction_interval: NonZeroU32,
-    max_error_bytes: NonZeroUsize,
-    host_value_budget: HostValueBudget,
 }
 
 impl TrustedLua54RuntimeConfiguration {
+    pub(crate) fn production() -> Self {
+        Self::new(
+            NonZeroUsize::new(8 * 1024 * 1024).expect("产品 worker 栈必须非零"),
+            NonZeroU32::new(10_000).expect("取消检查间隔必须非零"),
+        )
+    }
+
     pub(crate) const fn new(
         worker_stack_bytes: NonZeroUsize,
-        memory_limit_bytes_per_vm: NonZeroUsize,
         cancel_check_instruction_interval: NonZeroU32,
-        max_error_bytes: NonZeroUsize,
-        host_value_budget: HostValueBudget,
     ) -> Self {
         Self {
             worker_stack_bytes,
-            memory_limit_bytes_per_vm,
             cancel_check_instruction_interval,
-            max_error_bytes,
-            host_value_budget,
         }
     }
 }
@@ -90,24 +90,94 @@ impl TrustedLua54RuntimeConfiguration {
 /// Lua 生产根的线程启动、生命周期或 VM 失败。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TrustedLua54RuntimeError {
-    WorkerSpawn(String),
+    WorkerSpawn {
+        raw_os_code: Option<i32>,
+    },
     ShuttingDown,
     WorkerChannelClosed,
-    Vm(String),
+    Vm {
+        operation: &'static str,
+        message: String,
+    },
 }
 
 impl fmt::Display for TrustedLua54RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WorkerSpawn(message) => write!(formatter, "无法创建 Lua worker：{message}"),
+            Self::WorkerSpawn { raw_os_code } => match raw_os_code {
+                Some(code) => write!(
+                    formatter,
+                    "无法创建 Lua worker：{}",
+                    io::Error::from_raw_os_error(*code)
+                ),
+                None => formatter.write_str("无法创建 Lua worker"),
+            },
             Self::ShuttingDown => formatter.write_str("Lua Runtime 正在关闭"),
             Self::WorkerChannelClosed => formatter.write_str("Lua worker 通道已关闭"),
-            Self::Vm(message) => formatter.write_str(message),
+            Self::Vm { message, .. } => formatter.write_str(message),
         }
     }
 }
 
 impl Error for TrustedLua54RuntimeError {}
+
+impl SafeDiagnosticSource for TrustedLua54RuntimeError {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::WorkerSpawn {
+                raw_os_code: Some(code),
+            } => SafeDiagnostic::io(
+                DiagnosticCode::ShutdownComponent,
+                stage,
+                DiagnosticSubject::component("Lua worker"),
+                "spawn_worker",
+                &io::Error::from_raw_os_error(*code),
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::WorkerSpawn { raw_os_code: None } => SafeDiagnostic::new(
+                DiagnosticCode::ShutdownComponent,
+                stage,
+                DiagnosticSubject::component("Lua worker"),
+                DiagnosticReason::failure(DiagnosticFailureKind::WorkerSpawnFailed),
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::ShuttingDown => SafeDiagnostic::new(
+                DiagnosticCode::ShutdownComponent,
+                stage,
+                DiagnosticSubject::component("Lua runtime"),
+                DiagnosticReason::failure(DiagnosticFailureKind::ExecutorClosed),
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::WorkerChannelClosed => SafeDiagnostic::new(
+                DiagnosticCode::ShutdownComponent,
+                stage,
+                DiagnosticSubject::component("Lua worker channel"),
+                DiagnosticReason::failure(DiagnosticFailureKind::WorkerChannelClosed),
+                impact,
+                DiagnosticAction::ReportBug,
+            ),
+            Self::Vm { operation, .. } => SafeDiagnostic::new(
+                DiagnosticCode::LuaExecution,
+                stage,
+                DiagnosticSubject::component("Lua VM"),
+                DiagnosticReason::failure(DiagnosticFailureKind::LuaExecutionFailed),
+                impact,
+                DiagnosticAction::CheckProjectState,
+            )
+            .with_recovery(RecoveryFact::component(format!(
+                "lua_vm_operation={operation}"
+            ))),
+        }
+    }
+}
 
 struct RuntimeInner {
     lifecycle: Mutex<RuntimeLifecycle>,
@@ -116,10 +186,7 @@ struct RuntimeInner {
     jobs_finished: Notify,
     tokio: Handle,
     worker_stack_bytes: usize,
-    memory_limit_bytes_per_vm: usize,
     cancel_check_instruction_interval: u32,
-    max_error_bytes: usize,
-    host_value_budget: HostValueBudget,
 }
 
 struct RuntimeLifecycle {
@@ -150,12 +217,9 @@ impl TrustedLua54Runtime {
                 jobs_finished: Notify::new(),
                 tokio,
                 worker_stack_bytes: configuration.worker_stack_bytes.get(),
-                memory_limit_bytes_per_vm: configuration.memory_limit_bytes_per_vm.get(),
                 cancel_check_instruction_interval: configuration
                     .cancel_check_instruction_interval
                     .get(),
-                max_error_bytes: configuration.max_error_bytes.get(),
-                host_value_budget: configuration.host_value_budget,
             }),
         }
     }
@@ -251,11 +315,8 @@ impl TrustedLuaRuntimeExecutor for TrustedLua54Runtime {
         let (report_sender, report_receiver) = oneshot::channel();
         let accepted = self.inner.accept_job();
         let tokio = self.inner.tokio.clone();
-        let limits = LuaExecutionLimits {
-            memory_limit_bytes_per_vm: self.inner.memory_limit_bytes_per_vm,
+        let policy = LuaExecutionPolicy {
             cancel_check_instruction_interval: self.inner.cancel_check_instruction_interval,
-            max_error_bytes: self.inner.max_error_bytes,
-            host_value_budget: self.inner.host_value_budget,
         };
 
         let worker = if accepted {
@@ -266,7 +327,7 @@ impl TrustedLuaRuntimeExecutor for TrustedLua54Runtime {
                 .stack_size(self.inner.worker_stack_bytes)
                 .spawn(move || {
                     let outcome = catch_unwind(AssertUnwindSafe(|| {
-                        execute_program(&program, common, phase, &tokio, &cancellation, limits)
+                        execute_program(&program, common, phase, &tokio, &cancellation, policy)
                     }))
                     .unwrap_or(WorkerOutcome::Panicked);
                     if let Some(sender) = worker_sender
@@ -283,7 +344,9 @@ impl TrustedLuaRuntimeExecutor for TrustedLua54Runtime {
                     if let Some(sender) = sender.lock().expect("Lua worker 结果锁不应中毒").take()
                     {
                         let _ = sender.send(WorkerOutcome::Unavailable(
-                            TrustedLua54RuntimeError::WorkerSpawn(error.to_string()),
+                            TrustedLua54RuntimeError::WorkerSpawn {
+                                raw_os_code: error.raw_os_error(),
+                            },
                         ));
                     }
                     None
@@ -361,11 +424,8 @@ struct RuntimeCancellation {
 }
 
 #[derive(Clone, Copy)]
-struct LuaExecutionLimits {
-    memory_limit_bytes_per_vm: usize,
+struct LuaExecutionPolicy {
     cancel_check_instruction_interval: u32,
-    max_error_bytes: usize,
-    host_value_budget: HostValueBudget,
 }
 
 impl RuntimeCancellation {
@@ -408,14 +468,11 @@ fn execute_program(
     phase: TrustedLuaPhaseBindings,
     tokio: &Handle,
     cancellation: &RuntimeCancellation,
-    limits: LuaExecutionLimits,
+    policy: LuaExecutionPolicy,
 ) -> WorkerOutcome {
-    let LuaExecutionLimits {
-        memory_limit_bytes_per_vm,
+    let LuaExecutionPolicy {
         cancel_check_instruction_interval,
-        max_error_bytes,
-        host_value_budget,
-    } = limits;
+    } = policy;
     if cancellation.is_cancelled() {
         return WorkerOutcome::Cancelled;
     }
@@ -428,20 +485,13 @@ fn execute_program(
     // require 与本地 C 模块。VM 只在当前专用 worker 线程中创建、使用和销毁。
     // native_modules 在 lua 之前声明，因此所有动态库一定晚于 VM 和其中的 C Function 释放。
     let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
-    if let Err(error) = lua.set_memory_limit(memory_limit_bytes_per_vm) {
-        return WorkerOutcome::Context(vm_error(
-            "无法设置 Lua VM 内存上限",
-            error,
-            max_error_bytes,
-        ));
-    }
 
     if let Err(error) = configure_module_paths(&lua, &script_directory, Rc::clone(&native_modules))
     {
         return WorkerOutcome::Context(vm_error(
+            "configure_module_paths",
             "无法配置 Lua package 路径",
             error,
-            max_error_bytes,
         ));
     }
     let hook_cancellation = cancellation.clone();
@@ -455,33 +505,34 @@ fn execute_program(
             }
         },
     ) {
-        return WorkerOutcome::Context(vm_error("无法安装 Lua 取消 hook", error, max_error_bytes));
+        return WorkerOutcome::Context(vm_error(
+            "install_cancellation_hook",
+            "无法安装 Lua 取消 hook",
+            error,
+        ));
     }
     if cancellation.is_cancelled() {
         return WorkerOutcome::Cancelled;
     }
 
-    let context = match build_context(
-        &lua,
-        common,
-        phase,
-        tokio.clone(),
-        cancellation.clone(),
-        host_value_budget,
-    ) {
+    let context = match build_context(&lua, common, phase, tokio.clone(), cancellation.clone()) {
         Ok(context) => context,
         Err(error) => {
             if cancellation.is_cancelled() {
                 return WorkerOutcome::Cancelled;
             }
-            return WorkerOutcome::Context(vm_error("无法构造 Lua ctx", error, max_error_bytes));
+            return WorkerOutcome::Context(vm_error(
+                "build_host_context",
+                "无法构造 Lua ctx",
+                error,
+            ));
         }
     };
     if let Err(error) = lua.globals().set("ctx", context) {
         if cancellation.is_cancelled() {
             return WorkerOutcome::Cancelled;
         }
-        return WorkerOutcome::Context(vm_error("无法注入 Lua ctx", error, max_error_bytes));
+        return WorkerOutcome::Context(vm_error("inject_host_context", "无法注入 Lua ctx", error));
     }
 
     let function = match lua
@@ -494,7 +545,11 @@ fn execute_program(
             if cancellation.is_cancelled() {
                 return WorkerOutcome::Cancelled;
             }
-            return WorkerOutcome::Compile(vm_error("Lua 主程序编译失败", error, max_error_bytes));
+            return WorkerOutcome::Compile(vm_error(
+                "compile_main_program",
+                "Lua 主程序编译失败",
+                error,
+            ));
         }
     };
 
@@ -510,9 +565,9 @@ fn execute_program(
                 return WorkerOutcome::Cancelled;
             }
             return WorkerOutcome::Context(vm_error(
+                "build_execution_boundary",
                 "无法构造 Lua 执行边界",
                 error,
-                max_error_bytes,
             ));
         }
     };
@@ -523,7 +578,11 @@ fn execute_program(
             if cancellation.is_cancelled() {
                 return WorkerOutcome::Cancelled;
             }
-            return WorkerOutcome::Execute(vm_error("Lua 主程序运行失败", error, max_error_bytes));
+            return WorkerOutcome::Execute(vm_error(
+                "execute_main_program",
+                "Lua 主程序运行失败",
+                error,
+            ));
         }
     };
     if cancellation.is_cancelled() {
@@ -537,10 +596,10 @@ fn execute_program(
     {
         return WorkerOutcome::Binding(host_error.0.clone());
     }
-    WorkerOutcome::Execute(TrustedLua54RuntimeError::Vm(truncate_utf8(
-        format!("Lua 主程序运行失败：{}", lua_value_description(&error)),
-        max_error_bytes,
-    )))
+    WorkerOutcome::Execute(TrustedLua54RuntimeError::Vm {
+        operation: "execute_main_program",
+        message: format!("Lua 主程序运行失败：{}", lua_value_description(&error)),
+    })
 }
 
 /// 把 Windows 原始路径逐 UTF-16 code unit 编码成 Lua 可安全展示的无控制字符身份。
@@ -847,7 +906,6 @@ fn build_context(
     phase: TrustedLuaPhaseBindings,
     tokio: Handle,
     cancellation: RuntimeCancellation,
-    host_value_budget: HostValueBudget,
 ) -> mlua::Result<Table> {
     let phase_name = phase_name(phase.phase());
     let calls = Arc::clone(common.calls());
@@ -855,10 +913,7 @@ fn build_context(
     let json_markers = lua.create_table()?;
     context.set("phase", phase_name)?;
     context.set("project", build_project_table(lua, calls.project())?)?;
-    context.set(
-        "json",
-        build_json_table(lua, host_value_budget, &json_markers)?,
-    )?;
+    context.set("json", build_json_table(lua, &json_markers)?)?;
     context.set(
         "source",
         build_source_table(
@@ -866,7 +921,6 @@ fn build_context(
             Arc::clone(&calls),
             tokio.clone(),
             cancellation.clone(),
-            host_value_budget,
             &json_markers,
         )?,
     )?;
@@ -877,33 +931,19 @@ fn build_context(
             Arc::clone(&calls),
             tokio.clone(),
             cancellation.clone(),
-            host_value_budget,
             &json_markers,
         )?,
     )?;
     context.set(
         "db",
-        build_database_table(
-            lua,
-            Arc::clone(&calls),
-            tokio.clone(),
-            cancellation.clone(),
-            host_value_budget,
-        )?,
+        build_database_table(lua, Arc::clone(&calls), tokio.clone(), cancellation.clone())?,
     )?;
     match phase {
         TrustedLuaPhaseBindings::Extract(extract) => {
-            install_extract_context(lua, &context, extract, host_value_budget)?;
+            install_extract_context(lua, &context, extract)?;
         }
         TrustedLuaPhaseBindings::Translate(translate) => {
-            install_translate_context(
-                lua,
-                &context,
-                translate,
-                tokio,
-                cancellation,
-                host_value_budget,
-            )?;
+            install_translate_context(lua, &context, translate, tokio, cancellation)?;
         }
         TrustedLuaPhaseBindings::WriteBack(write_back) => {
             install_write_back_context(
@@ -912,7 +952,6 @@ fn build_context(
                 write_back,
                 tokio,
                 cancellation,
-                host_value_budget,
                 &json_markers,
             )?;
         }
@@ -924,23 +963,26 @@ fn install_extract_context(
     lua: &Lua,
     context: &Table,
     calls: Arc<dyn TrustedLuaExtractHostCalls>,
-    budget: HostValueBudget,
 ) -> mlua::Result<()> {
     let extract = lua.create_table()?;
     let declared = Arc::new(AtomicBool::new(false));
     let replace_calls = Arc::clone(&calls);
     let replace_declared = Arc::clone(&declared);
     let replace = lua.create_function(move |lua, groups: Value| {
-        let result = parse_lua_standard_snapshot(groups, budget).and_then(|snapshot| {
-            claim_extract_intent(&replace_declared)?;
-            replace_calls.replace_standard(snapshot)
-        });
+        let result = parse_lua_standard_snapshot(groups)
+            .and_then(|snapshot| {
+                claim_extract_intent(&replace_declared)?;
+                replace_calls.replace_standard(snapshot)
+            })
+            .map_err(|error| error.with_operation("extract.replace_standard"));
         host_result_to_lua(lua, result, |_, ()| Ok(Value::Nil))
     })?;
     extract.set("replace_standard", checked_host_function(lua, replace)?)?;
 
     let clear = lua.create_function(move |lua, ()| {
-        let result = claim_extract_intent(&declared).and_then(|()| calls.clear_standard());
+        let result = claim_extract_intent(&declared)
+            .and_then(|()| calls.clear_standard())
+            .map_err(|error| error.with_operation("extract.clear_standard"));
         host_result_to_lua(lua, result, |_, ()| Ok(Value::Nil))
     })?;
     extract.set("clear_standard", checked_host_function(lua, clear)?)?;
@@ -963,26 +1005,17 @@ fn claim_extract_intent(declared: &AtomicBool) -> Result<(), TrustedLuaHostCallE
         })
 }
 
-fn parse_lua_standard_snapshot(
-    value: Value,
-    budget: HostValueBudget,
-) -> Result<LuaSnapshot, TrustedLuaHostCallError> {
+fn parse_lua_standard_snapshot(value: Value) -> Result<LuaSnapshot, TrustedLuaHostCallError> {
     let Value::Table(groups) = value else {
         return Err(extract_argument_error(format!(
             "extract.replace_standard groups 必须是无洞数组，实际为 {}",
             value.type_name()
         )));
     };
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .container(1)
-        .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
-    let groups = dense_values_bounded(groups, budget, "Extract 标准快照", |error| {
-        extract_argument_error(error.to_string())
-    })?
-    .into_iter()
-    .map(|value| parse_lua_standard_group(value, &mut tracker, 2, budget))
-    .collect::<Result<Vec<_>, _>>()?;
+    let groups = dense_values(groups, |error| extract_argument_error(error.to_string()))?
+        .into_iter()
+        .map(parse_lua_standard_group)
+        .collect::<Result<Vec<_>, _>>()?;
     validate_unique_lua_standard_groups(&groups)?;
     LuaSnapshot::new(groups).map_err(snapshot_model_error)
 }
@@ -992,39 +1025,17 @@ fn validate_unique_lua_standard_groups(
 ) -> Result<(), TrustedLuaHostCallError> {
     let mut identities = HashSet::with_capacity(groups.len());
     for group in groups {
-        if !identities.insert((group.group_location(), group.kind())) {
+        if !identities.insert(group.group_location()) {
             return Err(extract_argument_error(format!(
-                "extract.replace_standard groups 不允许重复的 group.location + kind：{} + {}",
-                group.group_location(),
-                standard_group_kind_name(group.kind())
+                "extract.replace_standard groups 不允许重复的 group.location：{}",
+                group.group_location()
             )));
         }
     }
     Ok(())
 }
 
-const fn standard_group_kind_name(kind: TextGroupKind) -> &'static str {
-    match kind {
-        TextGroupKind::DatabaseEntry => "database_entry",
-        TextGroupKind::System => "system",
-        TextGroupKind::Map => "map",
-        TextGroupKind::EventDialogue => "dialogue",
-        TextGroupKind::EventChoices => "choices",
-        TextGroupKind::EventScrollingText => "scrolling_text",
-        TextGroupKind::EventCommand => "event_command",
-        TextGroupKind::PluginParameter => "plugin_parameter",
-    }
-}
-
-fn parse_lua_standard_group(
-    value: Value,
-    tracker: &mut HostValueBudgetTracker,
-    depth: usize,
-    budget: HostValueBudget,
-) -> Result<ExtractedTextGroup, TrustedLuaHostCallError> {
-    tracker
-        .container(depth)
-        .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
+fn parse_lua_standard_group(value: Value) -> Result<ExtractedTextGroup, TrustedLuaHostCallError> {
     let Value::Table(group) = value else {
         return Err(extract_argument_error(format!(
             "extract.replace_standard 的每个 group 必须是 table，实际为 {}",
@@ -1037,8 +1048,6 @@ fn parse_lua_standard_group(
         group
             .get("kind")
             .map_err(|error| extract_argument_error(error.to_string()))?,
-        tracker,
-        depth + 1,
     )?;
     let group_location = parse_lua_rpg_maker_location(
         group
@@ -1046,8 +1055,6 @@ fn parse_lua_standard_group(
             .map_err(|error| extract_argument_error(error.to_string()))?,
         "group.location",
     )?;
-    track_rpg_maker_location(tracker, depth + 1, &group_location)
-        .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
     if !matches!(group_location, RpgMakerLocation::Value { .. }) {
         return Err(extract_argument_error(
             "extract group.location 必须是 document:location 建立的 Value 地址".to_owned(),
@@ -1062,15 +1069,10 @@ fn parse_lua_standard_group(
             fields.type_name()
         )));
     };
-    tracker
-        .container(depth + 1)
-        .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
-    let fields = dense_values_bounded(fields, budget, "Extract 标准快照", |error| {
-        extract_argument_error(error.to_string())
-    })?
-    .into_iter()
-    .map(|value| parse_lua_standard_field(value, kind, &group_location, tracker, depth + 2))
-    .collect::<Result<Vec<_>, _>>()?;
+    let fields = dense_values(fields, |error| extract_argument_error(error.to_string()))?
+        .into_iter()
+        .map(|value| parse_lua_standard_field(value, kind, &group_location))
+        .collect::<Result<Vec<_>, _>>()?;
     ExtractedTextGroup::new(kind, group_location, fields).map_err(snapshot_model_error)
 }
 
@@ -1078,12 +1080,7 @@ fn parse_lua_standard_field(
     value: Value,
     kind: TextGroupKind,
     group_location: &RpgMakerLocation,
-    tracker: &mut HostValueBudgetTracker,
-    depth: usize,
 ) -> Result<ExtractedTextUnit, TrustedLuaHostCallError> {
-    tracker
-        .container(depth)
-        .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
     let Value::Table(field) = value else {
         return Err(extract_argument_error(format!(
             "extract group.fields 的每一项必须是 table，实际为 {}",
@@ -1099,9 +1096,6 @@ fn parse_lua_standard_field(
         "extract field.name",
     )
     .map_err(|error| extract_argument_error(error.to_string()))?;
-    tracker
-        .string(depth + 1, &name)
-        .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
     let text: Value = field
         .get("text")
         .map_err(|error| extract_argument_error(error.to_string()))?;
@@ -1121,8 +1115,6 @@ fn parse_lua_standard_field(
         .map_err(|error| extract_argument_error(error.to_string()))?
         .0
         .clone();
-    track_rpg_maker_text_reference(tracker, depth + 1, &text)
-        .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
     validate_standard_text_locations(kind, text.location(), group_location)
         .map_err(|error| extract_argument_error(error.to_string()))?;
     ExtractedTextUnit::new_with_claim(
@@ -1155,16 +1147,9 @@ fn parse_lua_rpg_maker_location(
         .map_err(|error| extract_argument_error(error.to_string()))
 }
 
-fn parse_standard_group_kind(
-    value: Value,
-    tracker: &mut HostValueBudgetTracker,
-    depth: usize,
-) -> Result<TextGroupKind, TrustedLuaHostCallError> {
+fn parse_standard_group_kind(value: Value) -> Result<TextGroupKind, TrustedLuaHostCallError> {
     let kind = parse_rpg_maker_string(value, "extract group.kind")
         .map_err(|error| extract_argument_error(error.to_string()))?;
-    tracker
-        .string(depth, &kind)
-        .map_err(|error| host_value_budget_error("Extract 标准快照", error))?;
     match kind.as_str() {
         "database_entry" => Ok(TextGroupKind::DatabaseEntry),
         "system" => Ok(TextGroupKind::System),
@@ -1198,22 +1183,17 @@ fn install_translate_context(
     calls: Arc<dyn TrustedLuaTranslateHostCalls>,
     tokio: Handle,
     cancellation: RuntimeCancellation,
-    budget: HostValueBudget,
 ) -> mlua::Result<()> {
     context.set(
         "translation",
-        build_translation_table(lua, Arc::clone(&calls), budget)?,
+        build_translation_table(lua, Arc::clone(&calls))?,
     )?;
-    context.set(
-        "llm",
-        build_llm_function(lua, calls, tokio, cancellation, budget)?,
-    )
+    context.set("llm", build_llm_function(lua, calls, tokio, cancellation)?)
 }
 
 fn build_translation_table(
     lua: &Lua,
     calls: Arc<dyn TrustedLuaTranslateHostCalls>,
-    budget: HostValueBudget,
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("system_prompt", calls.system_prompt())?;
@@ -1224,16 +1204,13 @@ fn build_translation_table(
 
     let native = lua.create_function(
         move |lua, (kind, original, semantic_context): (Value, Value, Value)| {
-            let result = parse_translation_prepare(kind, original, semantic_context, budget)
+            let result = parse_translation_prepare(kind, original, semantic_context)
                 .and_then(|(kind, original, semantic_context)| {
                     calls.prepare_translation(kind, original, semantic_context)
                 })
-                .and_then(|prepared| {
-                    validate_prepared_translation_budget(prepared.as_ref(), budget)?;
-                    Ok(prepared)
-                });
+                .map_err(|error| error.with_operation("translation.prepare"));
             host_result_to_lua(lua, result, |lua, prepared| {
-                prepared_translation_to_lua(lua, prepared, budget)
+                prepared_translation_to_lua(lua, prepared)
             })
         },
     )?;
@@ -1245,7 +1222,6 @@ fn parse_translation_prepare(
     kind: Value,
     original: Value,
     semantic_context: Value,
-    budget: HostValueBudget,
 ) -> Result<(TextGroupKind, String, String), TrustedLuaHostCallError> {
     let Value::String(kind) = kind else {
         return Err(binding_error(mlua::Error::runtime(format!(
@@ -1286,20 +1262,12 @@ fn parse_translation_prepare(
     let semantic_context =
         lua_string_to_text(&semantic_context, "translation.prepare semantic_context")
             .map_err(binding_error)?;
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .container(1)
-        .and_then(|()| tracker.string(2, &kind_name))
-        .and_then(|()| tracker.string(2, &original))
-        .and_then(|()| tracker.string(2, &semantic_context))
-        .map_err(|error| host_value_budget_error("Translate prepare 参数", error))?;
     Ok((kind, original, semantic_context))
 }
 
 fn prepared_translation_to_lua(
     lua: &Lua,
     prepared: Arc<dyn TrustedLuaPreparedTranslation>,
-    budget: HostValueBudget,
 ) -> mlua::Result<Value> {
     let table = lua.create_table()?;
     table.set("status", prepared.status().as_str())?;
@@ -1316,15 +1284,15 @@ fn prepared_translation_to_lua(
     let current_prepared = Arc::clone(&prepared);
     let current = lua.create_function(
         move |lua, (_self, translation, state): (Value, Value, Value)| {
-            let result = parse_prepared_translation_text(
-                translation,
-                budget,
-                "PreparedText:is_current translation",
-            )
-            .and_then(|translation| {
-                parse_translation_state(state).map(|state| (translation, state))
-            })
-            .and_then(|(translation, state)| current_prepared.is_current(translation, state));
+            let result =
+                parse_prepared_translation_text(translation, "PreparedText:is_current translation")
+                    .and_then(|translation| {
+                        parse_translation_state(state).map(|state| (translation, state))
+                    })
+                    .and_then(|(translation, state)| {
+                        current_prepared.is_current(translation, state)
+                    })
+                    .map_err(|error| error.with_operation("translation.is_current"));
             host_result_to_lua(lua, result, |_, current| Ok(Value::Boolean(current)))
         },
     )?;
@@ -1332,28 +1300,21 @@ fn prepared_translation_to_lua(
 
     let native_prepared = Arc::clone(&prepared);
     let native = lua.create_function(move |lua, (_self, candidate): (Value, Value)| {
-        let result = parse_translation_candidate(candidate, budget)
+        let result = parse_translation_candidate(candidate)
             .and_then(|candidate| native_prepared.accept(candidate))
-            .and_then(|acceptance| {
-                validate_prepared_acceptance_budget(&acceptance, budget)?;
-                Ok(acceptance)
-            });
+            .map_err(|error| error.with_operation("translation.accept"));
         host_result_to_lua(lua, result, prepared_acceptance_to_lua)
     })?;
     table.set("accept", checked_host_function(lua, native)?)?;
     Ok(Value::Table(table))
 }
 
-fn parse_translation_candidate(
-    candidate: Value,
-    budget: HostValueBudget,
-) -> Result<String, TrustedLuaHostCallError> {
-    parse_prepared_translation_text(candidate, budget, "PreparedText:accept candidate")
+fn parse_translation_candidate(candidate: Value) -> Result<String, TrustedLuaHostCallError> {
+    parse_prepared_translation_text(candidate, "PreparedText:accept candidate")
 }
 
 fn parse_prepared_translation_text(
     value: Value,
-    budget: HostValueBudget,
     role: &str,
 ) -> Result<String, TrustedLuaHostCallError> {
     let Value::String(value) = value else {
@@ -1363,7 +1324,6 @@ fn parse_prepared_translation_text(
         ))));
     };
     let value = lua_string_to_text(&value, role).map_err(binding_error)?;
-    validate_host_string(&value, budget, role)?;
     Ok(value)
 }
 
@@ -1432,75 +1392,24 @@ fn prepared_acceptance_to_lua(
     Ok(Value::Table(table))
 }
 
-fn validate_prepared_translation_budget(
-    prepared: &dyn TrustedLuaPreparedTranslation,
-    budget: HostValueBudget,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    let result = tracker
-        .container(1)
-        .and_then(|()| tracker.string(2, prepared.status().as_str()))
-        .and_then(|()| tracker.string(2, prepared.model_text()))
-        .and_then(|()| tracker.container(2))
-        .and_then(|()| {
-            prepared.terms().iter().try_for_each(|term| {
-                tracker.container(3)?;
-                tracker.string(4, term.term())?;
-                tracker.string(4, term.translation())
-            })
-        });
-    result.map_err(|error| host_value_budget_error("PreparedText", error))
-}
-
-fn validate_prepared_acceptance_budget(
-    acceptance: &TrustedLuaPreparedTranslationAcceptance,
-    budget: HostValueBudget,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    let result = tracker.container(1).and_then(|()| {
-        tracker.scalar(2)?;
-        match acceptance {
-            TrustedLuaPreparedTranslationAcceptance::Accepted { translation, state } => {
-                tracker.string(2, translation)?;
-                tracker.string(2, &translation_state_text(*state))
-            }
-            TrustedLuaPreparedTranslationAcceptance::Rejected { reason } => {
-                tracker.string(2, reason)
-            }
-        }
-    });
-    result.map_err(|error| host_value_budget_error("PreparedText 验收结果", error))
-}
-
 fn install_write_back_context(
     lua: &Lua,
     context: &Table,
     calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
     tokio: Handle,
     cancellation: RuntimeCancellation,
-    budget: HostValueBudget,
     markers: &Table,
 ) -> mlua::Result<()> {
     context.set(
         "output",
-        build_output_table(
-            lua,
-            Arc::clone(&calls),
-            tokio,
-            cancellation,
-            budget,
-            markers,
-        )?,
+        build_output_table(lua, Arc::clone(&calls), tokio, cancellation, markers)?,
     )?;
 
     let write_back = lua.create_table()?;
     let layout = lua.create_function(move |lua, (region, pairs): (Value, Value)| {
-        let result = parse_write_back_layout(region, pairs, budget)
+        let result = parse_write_back_layout(region, pairs)
             .and_then(|(region, pairs)| calls.layout(region, pairs))
-            .and_then(|layout| {
-                validate_write_back_layout_result_budget(&layout, budget)?;
-                Ok(layout)
-            });
+            .map_err(|error| error.with_operation("write_back.layout"));
         host_result_to_lua(lua, result, write_back_layout_result_to_lua)
     })?;
     write_back.set("layout", checked_host_function(lua, layout)?)?;
@@ -1513,7 +1422,6 @@ fn build_output_table(
     calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
     tokio: Handle,
     cancellation: RuntimeCancellation,
-    budget: HostValueBudget,
     markers: &Table,
 ) -> mlua::Result<Table> {
     let native = lua.create_table()?;
@@ -1524,7 +1432,7 @@ fn build_output_table(
     native.set(
         "read",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_output_path(path, budget)
+            let result = parse_output_path(path)
                 .and_then(|path| {
                     wait_for_output_terminal(
                         &read_tokio,
@@ -1532,10 +1440,7 @@ fn build_output_table(
                         read_calls.read_output(path),
                     )
                 })
-                .and_then(|bytes| {
-                    validate_host_bytes(bytes.len(), budget, "写回候选文件")?;
-                    Ok(bytes)
-                });
+                .map_err(|error| error.with_operation("output.read"));
             host_result_to_lua(lua, result, |lua, bytes| {
                 lua.create_string(bytes).map(Value::String)
             })
@@ -1548,7 +1453,7 @@ fn build_output_table(
     native.set(
         "read_text",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_output_path(path, budget)
+            let result = parse_output_path(path)
                 .and_then(|path| {
                     wait_for_output_terminal(
                         &text_tokio,
@@ -1556,10 +1461,7 @@ fn build_output_table(
                         text_calls.read_output(path),
                     )
                 })
-                .and_then(|bytes| {
-                    validate_host_bytes(bytes.len(), budget, "写回候选文本文件")?;
-                    Ok(bytes)
-                });
+                .map_err(|error| error.with_operation("output.read_text"));
             host_result_to_lua(lua, result, |lua, bytes| {
                 let text = std::str::from_utf8(&bytes)
                     .map_err(|_| mlua::Error::runtime("写回候选文件不是有效 UTF-8"))?;
@@ -1575,17 +1477,19 @@ fn build_output_table(
     native.set(
         "read_json",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_output_path(path, budget).and_then(|path| {
-                wait_for_output_terminal(
-                    &json_tokio,
-                    &json_cancellation,
-                    json_calls.read_output(path),
-                )
-            });
+            let result = parse_output_path(path)
+                .and_then(|path| {
+                    wait_for_output_terminal(
+                        &json_tokio,
+                        &json_cancellation,
+                        json_calls.read_output(path),
+                    )
+                })
+                .map_err(|error| error.with_operation("output.read_json"));
             host_result_to_lua(lua, result, |lua, bytes| {
                 let text = std::str::from_utf8(&bytes)
                     .map_err(|_| mlua::Error::runtime("写回候选 JSON 文件不是有效 UTF-8"))?;
-                let value = decode_json(text, budget).map_err(|error| {
+                let value = decode_json(text).map_err(|error| {
                     mlua::Error::runtime(format!("写回候选 JSON 无效：{error}"))
                 })?;
                 lossless_json_to_lua(lua, value, &read_json_markers)
@@ -1600,7 +1504,7 @@ fn build_output_table(
     native.set(
         "list",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_output_path(path, budget)
+            let result = parse_output_path(path)
                 .and_then(|path| {
                     wait_for_output_terminal(
                         &list_tokio,
@@ -1608,10 +1512,7 @@ fn build_output_table(
                         list_calls.list_output(path),
                     )
                 })
-                .and_then(|entries| {
-                    validate_output_entries_budget(&entries, budget)?;
-                    Ok(entries)
-                });
+                .map_err(|error| error.with_operation("output.list"));
             host_result_to_lua(lua, result, |lua, entries| {
                 let entries = entries
                     .into_iter()
@@ -1639,13 +1540,15 @@ fn build_output_table(
     native.set(
         "create_directory",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_output_path(path, budget).and_then(|path| {
-                wait_for_output_terminal(
-                    &create_tokio,
-                    &create_cancellation,
-                    create_calls.create_output_directory(path),
-                )
-            });
+            let result = parse_output_path(path)
+                .and_then(|path| {
+                    wait_for_output_terminal(
+                        &create_tokio,
+                        &create_cancellation,
+                        create_calls.create_output_directory(path),
+                    )
+                })
+                .map_err(|error| error.with_operation("output.create_directory"));
             host_result_to_lua(lua, result, |_, ()| Ok(Value::Nil))
         })?,
     )?;
@@ -1656,20 +1559,21 @@ fn build_output_table(
     native.set(
         "write",
         lua.create_function(move |lua, (path, bytes): (Value, Value)| {
-            let result = parse_output_path(path, budget).and_then(|path| {
-                let Value::String(bytes) = bytes else {
-                    return Err(binding_error(mlua::Error::runtime(format!(
-                        "ctx.output.write bytes 必须是字符串，实际为 {}",
-                        bytes.type_name()
-                    ))));
-                };
-                validate_host_bytes(bytes.as_bytes().len(), budget, "写回候选二进制内容")?;
-                wait_for_output_terminal(
-                    &write_tokio,
-                    &write_cancellation,
-                    write_calls.write_output(path, bytes.as_bytes().to_vec()),
-                )
-            });
+            let result = parse_output_path(path)
+                .and_then(|path| {
+                    let Value::String(bytes) = bytes else {
+                        return Err(binding_error(mlua::Error::runtime(format!(
+                            "ctx.output.write bytes 必须是字符串，实际为 {}",
+                            bytes.type_name()
+                        ))));
+                    };
+                    wait_for_output_terminal(
+                        &write_tokio,
+                        &write_cancellation,
+                        write_calls.write_output(path, bytes.as_bytes().to_vec()),
+                    )
+                })
+                .map_err(|error| error.with_operation("output.write"));
             host_result_to_lua(lua, result, |_, ()| Ok(Value::Nil))
         })?,
     )?;
@@ -1680,22 +1584,23 @@ fn build_output_table(
     native.set(
         "write_text",
         lua.create_function(move |lua, (path, text): (Value, Value)| {
-            let result = parse_output_path(path, budget).and_then(|path| {
-                let Value::String(text) = text else {
-                    return Err(binding_error(mlua::Error::runtime(format!(
-                        "ctx.output.write_text text 必须是 UTF-8 字符串，实际为 {}",
-                        text.type_name()
-                    ))));
-                };
-                let text = lua_string_to_text(&text, "ctx.output.write_text text")
-                    .map_err(binding_error)?;
-                validate_host_bytes(text.len(), budget, "写回候选文本内容")?;
-                wait_for_output_terminal(
-                    &write_text_tokio,
-                    &write_text_cancellation,
-                    write_text_calls.write_output(path, text.into_bytes()),
-                )
-            });
+            let result = parse_output_path(path)
+                .and_then(|path| {
+                    let Value::String(text) = text else {
+                        return Err(binding_error(mlua::Error::runtime(format!(
+                            "ctx.output.write_text text 必须是 UTF-8 字符串，实际为 {}",
+                            text.type_name()
+                        ))));
+                    };
+                    let text = lua_string_to_text(&text, "ctx.output.write_text text")
+                        .map_err(binding_error)?;
+                    wait_for_output_terminal(
+                        &write_text_tokio,
+                        &write_text_cancellation,
+                        write_text_calls.write_output(path, text.into_bytes()),
+                    )
+                })
+                .map_err(|error| error.with_operation("output.write_text"));
             host_result_to_lua(lua, result, |_, ()| Ok(Value::Nil))
         })?,
     )?;
@@ -1707,16 +1612,18 @@ fn build_output_table(
     native.set(
         "write_json",
         lua.create_function(move |lua, (path, value): (Value, Value)| {
-            let result = parse_output_path(path, budget).and_then(|path| {
-                let encoded = JsonEncoder::new(&write_json_markers, budget)
-                    .encode(value)
-                    .map_err(binding_error)?;
-                wait_for_output_terminal(
-                    &write_json_tokio,
-                    &write_json_cancellation,
-                    write_json_calls.write_output(path, encoded.into_bytes()),
-                )
-            });
+            let result = parse_output_path(path)
+                .and_then(|path| {
+                    let encoded = JsonEncoder::new(&write_json_markers)
+                        .encode(value)
+                        .map_err(binding_error)?;
+                    wait_for_output_terminal(
+                        &write_json_tokio,
+                        &write_json_cancellation,
+                        write_json_calls.write_output(path, encoded.into_bytes()),
+                    )
+                })
+                .map_err(|error| error.with_operation("output.write_json"));
             host_result_to_lua(lua, result, |_, ()| Ok(Value::Nil))
         })?,
     )?;
@@ -1725,9 +1632,15 @@ fn build_output_table(
     native.set(
         "remove",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_output_path(path, budget).and_then(|path| {
-                wait_for_output_terminal(&tokio, &cancellation, remove_calls.remove_output(path))
-            });
+            let result = parse_output_path(path)
+                .and_then(|path| {
+                    wait_for_output_terminal(
+                        &tokio,
+                        &cancellation,
+                        remove_calls.remove_output(path),
+                    )
+                })
+                .map_err(|error| error.with_operation("output.remove"));
             host_result_to_lua(lua, result, |_, ()| Ok(Value::Nil))
         })?,
     )?;
@@ -1749,10 +1662,7 @@ fn build_output_table(
     )
 }
 
-fn parse_output_path(
-    value: Value,
-    budget: HostValueBudget,
-) -> Result<ScopedDirectoryPath, TrustedLuaHostCallError> {
+fn parse_output_path(value: Value) -> Result<ScopedDirectoryPath, TrustedLuaHostCallError> {
     let Value::String(value) = value else {
         return Err(binding_error(mlua::Error::runtime(format!(
             "候选路径必须是 UTF-8 字符串，实际为 {}",
@@ -1760,7 +1670,6 @@ fn parse_output_path(
         ))));
     };
     let value = lua_string_to_text(&value, "候选路径").map_err(binding_error)?;
-    validate_host_string(&value, budget, "候选路径")?;
     ScopedDirectoryPath::new(PathBuf::from(value)).map_err(|error| {
         TrustedLuaHostCallError::new(
             "binding",
@@ -1772,25 +1681,9 @@ fn parse_output_path(
     })
 }
 
-fn validate_output_entries_budget(
-    entries: &[TrustedLuaOutputEntry],
-    budget: HostValueBudget,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    let result = tracker.container(1).and_then(|()| {
-        entries.iter().try_for_each(|entry| {
-            tracker.container(2)?;
-            tracker.string(3, entry.name())?;
-            tracker.string(3, entry.kind().as_str())
-        })
-    });
-    result.map_err(|error| host_value_budget_error("候选目录列表", error))
-}
-
 fn parse_write_back_layout(
     region: Value,
     pairs: Value,
-    budget: HostValueBudget,
 ) -> Result<
     (
         TrustedLuaWriteBackLayoutRegion,
@@ -1822,16 +1715,10 @@ fn parse_write_back_layout(
             pairs.type_name()
         ))));
     };
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .container(1)
-        .and_then(|()| tracker.string(2, &region_name))
-        .and_then(|()| tracker.container(2))
-        .map_err(|error| host_value_budget_error("写回布局参数", error))?;
-    let pairs = dense_values_bounded(pairs, budget, "写回布局参数", binding_error)?
+    let pairs = dense_values(pairs, binding_error)?
         .into_iter()
         .enumerate()
-        .map(|(index, pair)| parse_write_back_layout_pair(index, pair, &mut tracker, 3))
+        .map(|(index, pair)| parse_write_back_layout_pair(index, pair))
         .collect::<Result<Vec<_>, _>>()?;
     Ok((region, pairs))
 }
@@ -1839,12 +1726,7 @@ fn parse_write_back_layout(
 fn parse_write_back_layout_pair(
     index: usize,
     pair: Value,
-    tracker: &mut HostValueBudgetTracker,
-    depth: usize,
 ) -> Result<TrustedLuaWriteBackLayoutPair, TrustedLuaHostCallError> {
-    tracker
-        .container(depth)
-        .map_err(|error| host_value_budget_error("写回布局参数", error))?;
     let Value::Table(pair) = pair else {
         return Err(binding_error(mlua::Error::runtime(format!(
             "ctx.write_back.layout pairs[{}] 必须是 table，实际为 {}",
@@ -1882,9 +1764,6 @@ fn parse_write_back_layout_pair(
             ))));
         }
     };
-    tracker
-        .string(depth + 1, &original)
-        .map_err(|error| host_value_budget_error("写回布局参数", error))?;
     let translation = match pair
         .raw_get::<Value>("translation")
         .map_err(binding_error)?
@@ -1901,11 +1780,6 @@ fn parse_write_back_layout_pair(
             ))));
         }
     };
-    match &translation {
-        Some(translation) => tracker.string(depth + 1, translation),
-        None => tracker.scalar(depth + 1),
-    }
-    .map_err(|error| host_value_budget_error("写回布局参数", error))?;
     Ok(TrustedLuaWriteBackLayoutPair::new(original, translation))
 }
 
@@ -1931,26 +1805,6 @@ fn write_back_layout_result_to_lua(
             .map_err(|_| mlua::Error::runtime("布局新增全角缩进数超出 Lua integer"))?,
     )?;
     Ok(Value::Table(table))
-}
-
-fn validate_write_back_layout_result_budget(
-    result: &TrustedLuaWriteBackLayoutResult,
-    budget: HostValueBudget,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    let checked = tracker
-        .container(1)
-        .and_then(|()| tracker.string(2, result.status().as_str()))
-        .and_then(|()| tracker.container(2))
-        .and_then(|()| {
-            result
-                .texts()
-                .iter()
-                .try_for_each(|text| tracker.string(3, text))
-        })
-        .and_then(|()| tracker.scalar(2))
-        .and_then(|()| tracker.scalar(2));
-    checked.map_err(|error| host_value_budget_error("写回布局结果", error))
 }
 
 fn phase_name(phase: LuaPhase) -> &'static str {
@@ -1983,7 +1837,7 @@ impl JsonContainerKind {
     }
 }
 
-fn build_json_table(lua: &Lua, budget: HostValueBudget, markers: &Table) -> mlua::Result<Table> {
+fn build_json_table(lua: &Lua, markers: &Table) -> mlua::Result<Table> {
     let native = lua.create_table()?;
 
     for (name, kind) in [
@@ -2009,7 +1863,7 @@ fn build_json_table(lua: &Lua, budget: HostValueBudget, markers: &Table) -> mlua
                     mark_json_table(&markers, &table, kind)?;
                     Ok(Value::Table(table))
                 })();
-                json_result_to_lua(lua, result)
+                json_result_to_lua(lua, kind.name(), result)
             })?,
         )?;
     }
@@ -2026,14 +1880,11 @@ fn build_json_table(lua: &Lua, budget: HostValueBudget, markers: &Table) -> mlua
                 let value = value.to_str().map_err(|_| {
                     mlua::Error::runtime("ctx.json.number 的参数必须是 UTF-8 字符串")
                 })?;
-                if value.len() > budget.max_bytes().get() {
-                    return Err(json_budget_error("number 文本", "max_bytes"));
-                }
                 validate_number(value.as_ref())
                     .map_err(|error| mlua::Error::runtime(format!("ctx.json.number：{error}")))?;
                 json_number_to_lua(lua, value.to_owned())
             })();
-            json_result_to_lua(lua, result)
+            json_result_to_lua(lua, "number", result)
         })?,
     )?;
 
@@ -2050,11 +1901,11 @@ fn build_json_table(lua: &Lua, budget: HostValueBudget, markers: &Table) -> mlua
                 let source = source.to_str().map_err(|_| {
                     mlua::Error::runtime("ctx.json.decode 的参数必须是 UTF-8 字符串")
                 })?;
-                let value = decode_json(source.as_ref(), budget)
+                let value = decode_json(source.as_ref())
                     .map_err(|error| mlua::Error::runtime(format!("ctx.json.decode：{error}")))?;
                 lossless_json_to_lua(lua, value, &decode_markers)
             })();
-            json_result_to_lua(lua, result)
+            json_result_to_lua(lua, "decode", result)
         })?,
     )?;
 
@@ -2062,10 +1913,10 @@ fn build_json_table(lua: &Lua, budget: HostValueBudget, markers: &Table) -> mlua
     native.set(
         "encode",
         lua.create_function(move |lua, value: Value| {
-            let result = JsonEncoder::new(&encode_markers, budget)
+            let result = JsonEncoder::new(&encode_markers)
                 .encode(value)
                 .and_then(|encoded| lua.create_string(encoded).map(Value::String));
-            json_result_to_lua(lua, result)
+            json_result_to_lua(lua, "encode", result)
         })?,
     )?;
 
@@ -2077,7 +1928,7 @@ fn build_json_table(lua: &Lua, budget: HostValueBudget, markers: &Table) -> mlua
                 Some(kind) => lua.create_string(kind).map(Value::String),
                 None => Ok(Value::Nil),
             });
-            json_result_to_lua(lua, result)
+            json_result_to_lua(lua, "kind", result)
         })?,
     )?;
     native.set(
@@ -2085,7 +1936,7 @@ fn build_json_table(lua: &Lua, budget: HostValueBudget, markers: &Table) -> mlua
         lua.create_function(move |lua, value: Value| {
             let result = json_number_text(&value)
                 .and_then(|text| lua.create_string(text).map(Value::String));
-            json_result_to_lua(lua, result)
+            json_result_to_lua(lua, "number_text", result)
         })?,
     )?;
     let json = checked_function_table(
@@ -2105,12 +1956,37 @@ fn build_json_table(lua: &Lua, budget: HostValueBudget, markers: &Table) -> mlua
     Ok(json)
 }
 
-fn json_result_to_lua(lua: &Lua, result: mlua::Result<Value>) -> mlua::Result<MultiValue> {
-    host_result_to_lua(lua, result.map_err(json_host_error), |_, value| Ok(value))
+fn json_result_to_lua(
+    lua: &Lua,
+    operation: &'static str,
+    result: mlua::Result<Value>,
+) -> mlua::Result<MultiValue> {
+    host_result_to_lua(
+        lua,
+        result.map_err(json_host_error).map_err(|error| {
+            error.with_operation(match operation {
+                "array" => "json.array",
+                "object" => "json.object",
+                "number" => "json.number",
+                "decode" => "json.decode",
+                "encode" => "json.encode",
+                "kind" => "json.kind",
+                "number_text" => "json.number_text",
+                _ => "json.unknown",
+            })
+        }),
+        |_, value| Ok(value),
+    )
 }
 
-fn json_host_error(error: mlua::Error) -> TrustedLuaHostCallError {
-    TrustedLuaHostCallError::new("json", "invalid_value", error.to_string(), None, None)
+fn json_host_error(_error: mlua::Error) -> TrustedLuaHostCallError {
+    TrustedLuaHostCallError::new(
+        "json",
+        "invalid_value",
+        "Lua Host JSON 值不符合协议",
+        None,
+        None,
+    )
 }
 
 fn mark_json_table(markers: &Table, table: &Table, kind: JsonContainerKind) -> mlua::Result<()> {
@@ -2139,28 +2015,46 @@ fn lossless_json_to_lua(
     value: LosslessJsonValue,
     markers: &Table,
 ) -> mlua::Result<Value> {
-    match value {
-        LosslessJsonValue::Null => Ok(Value::UserData(lua.create_userdata(LuaJsonNull)?)),
-        LosslessJsonValue::Boolean(value) => Ok(Value::Boolean(value)),
-        LosslessJsonValue::String(value) => Ok(Value::String(lua.create_string(value)?)),
-        LosslessJsonValue::Number(value) => json_number_to_lua(lua, value),
-        LosslessJsonValue::Array(values) => {
-            let table = lua.create_table_with_capacity(values.len(), 0)?;
-            mark_json_table(markers, &table, JsonContainerKind::Array)?;
-            for (index, value) in values.into_iter().enumerate() {
-                table.raw_set(index + 1, lossless_json_to_lua(lua, value, markers)?)?;
+    enum Key {
+        Index(usize),
+        String(String),
+    }
+
+    let root = lua.create_table_with_capacity(1, 0)?;
+    let mut work = vec![(root.clone(), Key::Index(1), value)];
+    while let Some((destination, key, mut value)) = work.pop() {
+        let converted = match &mut value {
+            LosslessJsonValue::Null => Value::UserData(lua.create_userdata(LuaJsonNull)?),
+            LosslessJsonValue::Boolean(value) => Value::Boolean(*value),
+            LosslessJsonValue::String(value) => {
+                Value::String(lua.create_string(std::mem::take(value))?)
             }
-            Ok(Value::Table(table))
-        }
-        LosslessJsonValue::Object(entries) => {
-            let table = lua.create_table_with_capacity(0, entries.len())?;
-            mark_json_table(markers, &table, JsonContainerKind::Object)?;
-            for (key, value) in entries {
-                table.raw_set(key, lossless_json_to_lua(lua, value, markers)?)?;
+            LosslessJsonValue::Number(value) => json_number_to_lua(lua, std::mem::take(value))?,
+            LosslessJsonValue::Array(values) => {
+                let values = std::mem::take(values);
+                let table = lua.create_table_with_capacity(values.len(), 0)?;
+                mark_json_table(markers, &table, JsonContainerKind::Array)?;
+                for (index, value) in values.into_iter().enumerate().rev() {
+                    work.push((table.clone(), Key::Index(index + 1), value));
+                }
+                Value::Table(table)
             }
-            Ok(Value::Table(table))
+            LosslessJsonValue::Object(entries) => {
+                let entries = std::mem::take(entries);
+                let table = lua.create_table_with_capacity(0, entries.len())?;
+                mark_json_table(markers, &table, JsonContainerKind::Object)?;
+                for (key, value) in entries.into_iter().rev() {
+                    work.push((table.clone(), Key::String(key), value));
+                }
+                Value::Table(table)
+            }
+        };
+        match key {
+            Key::Index(index) => destination.raw_set(index, converted)?,
+            Key::String(key) => destination.raw_set(key, converted)?,
         }
     }
+    root.raw_get(1)
 }
 
 fn json_number_to_lua(lua: &Lua, value: String) -> mlua::Result<Value> {
@@ -2202,92 +2096,89 @@ fn json_number_text(value: &Value) -> mlua::Result<String> {
     }
 }
 
-fn json_budget_error(subject: &str, limit: &str) -> mlua::Error {
-    mlua::Error::runtime(format!("JSON {subject} 超过 HostValueBudget.{limit}"))
-}
-
 struct JsonEncoder<'a> {
     markers: &'a Table,
-    budget: HostValueBudget,
     output: String,
-    nodes: usize,
     active_tables: HashSet<usize>,
 }
 
 impl<'a> JsonEncoder<'a> {
-    fn new(markers: &'a Table, budget: HostValueBudget) -> Self {
+    fn new(markers: &'a Table) -> Self {
         Self {
             markers,
-            budget,
             output: String::new(),
-            nodes: 0,
             active_tables: HashSet::new(),
         }
     }
 
     fn encode(mut self, value: Value) -> mlua::Result<String> {
-        self.encode_value(value, 1)?;
+        let mut work = vec![JsonEncodeAction::Value(value)];
+        while let Some(action) = work.pop() {
+            match action {
+                JsonEncodeAction::StaticText(text) => self.output.push_str(text),
+                JsonEncodeAction::OwnedText(text) => self.output.push_str(&text),
+                JsonEncodeAction::FinishTable(identity) => {
+                    self.active_tables.remove(&identity);
+                }
+                JsonEncodeAction::Value(Value::Boolean(value)) => {
+                    self.output.push_str(if value { "true" } else { "false" });
+                }
+                JsonEncodeAction::Value(Value::Integer(value)) => {
+                    self.output.push_str(&value.to_string());
+                }
+                JsonEncodeAction::Value(Value::Number(value)) => {
+                    let value = serde_json::Number::from_f64(value).ok_or_else(|| {
+                        mlua::Error::runtime("JSON number 不能是 NaN 或 Infinity")
+                    })?;
+                    self.output.push_str(&value.to_string());
+                }
+                JsonEncodeAction::Value(Value::String(value)) => {
+                    let value = value
+                        .to_str()
+                        .map_err(|_| mlua::Error::runtime("JSON string 必须是 UTF-8"))?;
+                    self.push_json_string(value.as_ref());
+                }
+                JsonEncodeAction::Value(Value::Table(table)) => {
+                    let identity = table.to_pointer() as usize;
+                    if !self.active_tables.insert(identity) {
+                        return Err(mlua::Error::runtime("ctx.json.encode 不接受循环 table"));
+                    }
+                    let mut actions = match json_table_kind(self.markers, &table)? {
+                        Some(JsonContainerKind::Array) => self.array_actions(table)?,
+                        Some(JsonContainerKind::Object) => self.object_actions(table)?,
+                        None => {
+                            return Err(mlua::Error::runtime(
+                                "ctx.json.encode 的 table 必须先由 ctx.json.array 或 ctx.json.object 显式标记",
+                            ));
+                        }
+                    };
+                    actions.push(JsonEncodeAction::FinishTable(identity));
+                    work.extend(actions.into_iter().rev());
+                }
+                JsonEncodeAction::Value(Value::UserData(value)) if value.is::<LuaJsonNull>() => {
+                    self.output.push_str("null");
+                }
+                JsonEncodeAction::Value(Value::UserData(value)) if value.is::<LuaJsonNumber>() => {
+                    self.output
+                        .push_str(value.borrow::<LuaJsonNumber>()?.0.as_str());
+                }
+                JsonEncodeAction::Value(Value::UserData(_)) => {
+                    return Err(mlua::Error::runtime(
+                        "ctx.json.encode 不接受非 JSON userdata",
+                    ));
+                }
+                JsonEncodeAction::Value(value) => {
+                    return Err(mlua::Error::runtime(format!(
+                        "ctx.json.encode 不接受 {}",
+                        value.type_name()
+                    )));
+                }
+            }
+        }
         Ok(self.output)
     }
 
-    fn encode_value(&mut self, value: Value, depth: usize) -> mlua::Result<()> {
-        if depth > self.budget.max_depth().get() {
-            return Err(json_budget_error("嵌套深度", "max_depth"));
-        }
-        self.nodes = self
-            .nodes
-            .checked_add(1)
-            .ok_or_else(|| json_budget_error("节点数", "max_nodes"))?;
-        if self.nodes > self.budget.max_nodes().get() {
-            return Err(json_budget_error("节点数", "max_nodes"));
-        }
-
-        match value {
-            Value::Boolean(value) => self.push(if value { "true" } else { "false" }),
-            Value::Integer(value) => self.push(value.to_string().as_str()),
-            Value::Number(value) => {
-                let value = serde_json::Number::from_f64(value)
-                    .ok_or_else(|| mlua::Error::runtime("JSON number 不能是 NaN 或 Infinity"))?;
-                self.push(value.to_string().as_str())
-            }
-            Value::String(value) => {
-                let value = value
-                    .to_str()
-                    .map_err(|_| mlua::Error::runtime("JSON string 必须是 UTF-8"))?;
-                self.push_json_string(value.as_ref())
-            }
-            Value::Table(table) => self.encode_table(table, depth),
-            Value::UserData(value) if value.is::<LuaJsonNull>() => self.push("null"),
-            Value::UserData(value) if value.is::<LuaJsonNumber>() => {
-                self.push(value.borrow::<LuaJsonNumber>()?.0.as_str())
-            }
-            Value::UserData(_) => Err(mlua::Error::runtime(
-                "ctx.json.encode 不接受非 JSON userdata",
-            )),
-            value => Err(mlua::Error::runtime(format!(
-                "ctx.json.encode 不接受 {}",
-                value.type_name()
-            ))),
-        }
-    }
-
-    fn encode_table(&mut self, table: Table, depth: usize) -> mlua::Result<()> {
-        let identity = table.to_pointer() as usize;
-        if !self.active_tables.insert(identity) {
-            return Err(mlua::Error::runtime("ctx.json.encode 不接受循环 table"));
-        }
-        let result = match json_table_kind(self.markers, &table)? {
-            Some(JsonContainerKind::Array) => self.encode_array(table, depth),
-            Some(JsonContainerKind::Object) => self.encode_object(table, depth),
-            None => Err(mlua::Error::runtime(
-                "ctx.json.encode 的 table 必须先由 ctx.json.array 或 ctx.json.object 显式标记",
-            )),
-        };
-        self.active_tables.remove(&identity);
-        result
-    }
-
-    fn encode_array(&mut self, table: Table, depth: usize) -> mlua::Result<()> {
+    fn array_actions(&self, table: Table) -> mlua::Result<Vec<JsonEncodeAction>> {
         let mut maximum = 0_usize;
         let mut count = 0_usize;
         for pair in table.clone().pairs::<Value, Value>() {
@@ -2304,29 +2195,26 @@ impl<'a> JsonEncoder<'a> {
                     "JSON array 只允许从 1 开始的连续整数键",
                 ));
             }
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| json_budget_error("节点数", "max_nodes"))?;
-            if count >= self.budget.max_nodes().get() {
-                return Err(json_budget_error("节点数", "max_nodes"));
-            }
+            count += 1;
             maximum = maximum.max(key);
         }
         if count != maximum {
             return Err(mlua::Error::runtime("JSON array 不允许洞"));
         }
 
-        self.push("[")?;
+        let mut actions = Vec::with_capacity(maximum.saturating_mul(2).saturating_add(1));
+        actions.push(JsonEncodeAction::StaticText("["));
         for index in 1..=maximum {
             if index != 1 {
-                self.push(",")?;
+                actions.push(JsonEncodeAction::StaticText(","));
             }
-            self.encode_value(table.raw_get::<Value>(index)?, depth + 1)?;
+            actions.push(JsonEncodeAction::Value(table.raw_get::<Value>(index)?));
         }
-        self.push("]")
+        actions.push(JsonEncodeAction::StaticText("]"));
+        Ok(actions)
     }
 
-    fn encode_object(&mut self, table: Table, depth: usize) -> mlua::Result<()> {
+    fn object_actions(&self, table: Table) -> mlua::Result<Vec<JsonEncodeAction>> {
         let mut entries = Vec::new();
         for pair in table.pairs::<Value, Value>() {
             let (key, value) = pair?;
@@ -2337,43 +2225,38 @@ impl<'a> JsonEncoder<'a> {
                 .to_str()
                 .map_err(|_| mlua::Error::runtime("JSON object 只允许 UTF-8 字符串键"))?
                 .to_owned();
-            if entries.len() >= self.budget.max_nodes().get() {
-                return Err(json_budget_error("节点数", "max_nodes"));
-            }
             entries.push((key, value));
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-        self.push("{")?;
+        let mut actions = Vec::with_capacity(entries.len().saturating_mul(4).saturating_add(1));
+        actions.push(JsonEncodeAction::StaticText("{"));
         for (index, (key, value)) in entries.into_iter().enumerate() {
             if index != 0 {
-                self.push(",")?;
+                actions.push(JsonEncodeAction::StaticText(","));
             }
-            self.push_json_string(&key)?;
-            self.push(":")?;
-            self.encode_value(value, depth + 1)?;
+            actions.push(JsonEncodeAction::OwnedText(
+                serde_json::to_string(&key).expect("有效 UTF-8 字符串必须可以序列化为 JSON string"),
+            ));
+            actions.push(JsonEncodeAction::StaticText(":"));
+            actions.push(JsonEncodeAction::Value(value));
         }
-        self.push("}")
+        actions.push(JsonEncodeAction::StaticText("}"));
+        Ok(actions)
     }
 
-    fn push_json_string(&mut self, value: &str) -> mlua::Result<()> {
+    fn push_json_string(&mut self, value: &str) {
         let encoded =
             serde_json::to_string(value).expect("有效 UTF-8 字符串必须可以序列化为 JSON string");
-        self.push(&encoded)
+        self.output.push_str(&encoded);
     }
+}
 
-    fn push(&mut self, value: &str) -> mlua::Result<()> {
-        let length = self
-            .output
-            .len()
-            .checked_add(value.len())
-            .ok_or_else(|| json_budget_error("输出", "max_bytes"))?;
-        if length > self.budget.max_bytes().get() {
-            return Err(json_budget_error("输出", "max_bytes"));
-        }
-        self.output.push_str(value);
-        Ok(())
-    }
+enum JsonEncodeAction {
+    Value(Value),
+    StaticText(&'static str),
+    OwnedText(String),
+    FinishTable(usize),
 }
 
 fn build_source_table(
@@ -2381,7 +2264,6 @@ fn build_source_table(
     calls: Arc<dyn TrustedLuaCommonHostCalls>,
     tokio: Handle,
     cancellation: RuntimeCancellation,
-    budget: HostValueBudget,
     markers: &Table,
 ) -> mlua::Result<Table> {
     let native = lua.create_table()?;
@@ -2392,7 +2274,7 @@ fn build_source_table(
     native.set(
         "read",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_source_path(path, budget)
+            let result = parse_source_path(path)
                 .and_then(|path| {
                     wait_for_host(
                         &read_tokio,
@@ -2400,10 +2282,7 @@ fn build_source_table(
                         read_calls.read_source(path),
                     )
                 })
-                .and_then(|bytes| {
-                    validate_host_bytes(bytes.len(), budget, "来源文件")?;
-                    Ok(bytes)
-                });
+                .map_err(|error| error.with_operation("source.read"));
             host_result_to_lua(lua, result, |lua, bytes| {
                 lua.create_string(bytes).map(Value::String)
             })
@@ -2416,7 +2295,7 @@ fn build_source_table(
     native.set(
         "read_text",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_source_path(path, budget)
+            let result = parse_source_path(path)
                 .and_then(|path| {
                     wait_for_host(
                         &text_tokio,
@@ -2424,10 +2303,7 @@ fn build_source_table(
                         text_calls.read_source(path),
                     )
                 })
-                .and_then(|bytes| {
-                    validate_host_bytes(bytes.len(), budget, "来源文本文件")?;
-                    Ok(bytes)
-                });
+                .map_err(|error| error.with_operation("source.read_text"));
             host_result_to_lua(lua, result, |lua, bytes| {
                 let text = std::str::from_utf8(&bytes)
                     .map_err(|_| mlua::Error::runtime("来源文件不是有效 UTF-8"))?;
@@ -2443,17 +2319,19 @@ fn build_source_table(
     native.set(
         "read_json",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_source_path(path, budget).and_then(|path| {
-                wait_for_host(
-                    &json_tokio,
-                    &json_cancellation,
-                    json_calls.read_source(path),
-                )
-            });
+            let result = parse_source_path(path)
+                .and_then(|path| {
+                    wait_for_host(
+                        &json_tokio,
+                        &json_cancellation,
+                        json_calls.read_source(path),
+                    )
+                })
+                .map_err(|error| error.with_operation("source.read_json"));
             host_result_to_lua(lua, result, |lua, bytes| {
                 let text = std::str::from_utf8(&bytes)
                     .map_err(|_| mlua::Error::runtime("来源 JSON 文件不是有效 UTF-8"))?;
-                let value = decode_json(text, budget)
+                let value = decode_json(text)
                     .map_err(|error| mlua::Error::runtime(format!("来源 JSON 无效：{error}")))?;
                 lossless_json_to_lua(lua, value, &json_markers)
             })
@@ -2465,12 +2343,9 @@ fn build_source_table(
     native.set(
         "list",
         lua.create_function(move |lua, path: Value| {
-            let result = parse_source_path(path, budget)
+            let result = parse_source_path(path)
                 .and_then(|path| wait_for_host(&tokio, &cancellation, list_calls.list_source(path)))
-                .and_then(|entries| {
-                    validate_string_array_budget(&entries, budget, "来源目录列表")?;
-                    Ok(entries)
-                });
+                .map_err(|error| error.with_operation("source.list"));
             host_result_to_lua(lua, result, |lua, entries| {
                 let values = entries.into_iter().map(LosslessJsonValue::String).collect();
                 lossless_json_to_lua(lua, LosslessJsonValue::Array(values), &list_markers)
@@ -2486,7 +2361,6 @@ fn build_rpg_maker_table(
     calls: Arc<dyn TrustedLuaCommonHostCalls>,
     tokio: Handle,
     cancellation: RuntimeCancellation,
-    budget: HostValueBudget,
     markers: &Table,
 ) -> mlua::Result<Table> {
     let native = lua.create_table()?;
@@ -2494,11 +2368,8 @@ fn build_rpg_maker_table(
         "data",
         lua.create_function(move |lua, file_name: Value| {
             let result = parse_rpg_maker_string(file_name, "RPG Maker Data 文件名")
-                .and_then(|file_name| {
-                    validate_host_string(&file_name, budget, "RPG Maker Data 文件名")?;
-                    Ok(file_name)
-                })
-                .and_then(|file_name| data_source(&file_name).map_err(rpg_maker_host_error));
+                .and_then(|file_name| data_source(&file_name).map_err(rpg_maker_host_error))
+                .map_err(|error| error.with_operation("rpg_maker.data"));
             host_result_to_lua(lua, result, |lua, source| {
                 lua.create_userdata(LuaRpgMakerSource(source))
                     .map(Value::UserData)
@@ -2509,11 +2380,8 @@ fn build_rpg_maker_table(
         "data_file",
         lua.create_function(move |lua, file_name: Value| {
             let result = parse_rpg_maker_string(file_name, "RPG Maker DataFile 文件名")
-                .and_then(|file_name| {
-                    validate_host_string(&file_name, budget, "RPG Maker DataFile 文件名")?;
-                    Ok(file_name)
-                })
-                .and_then(|file_name| data_file_source(&file_name).map_err(rpg_maker_host_error));
+                .and_then(|file_name| data_file_source(&file_name).map_err(rpg_maker_host_error))
+                .map_err(|error| error.with_operation("rpg_maker.data_file"));
             host_result_to_lua(lua, result, |lua, source| {
                 lua.create_userdata(LuaRpgMakerSource(source))
                     .map(Value::UserData)
@@ -2524,7 +2392,8 @@ fn build_rpg_maker_table(
         "map",
         lua.create_function(|lua, map_id: Value| {
             let result = parse_rpg_maker_integer(map_id, "RPG Maker map ID")
-                .and_then(|map_id| map_source(map_id).map_err(rpg_maker_host_error));
+                .and_then(|map_id| map_source(map_id).map_err(rpg_maker_host_error))
+                .map_err(|error| error.with_operation("rpg_maker.map"));
             host_result_to_lua(lua, result, |lua, source| {
                 lua.create_userdata(LuaRpgMakerSource(source))
                     .map(Value::UserData)
@@ -2535,17 +2404,11 @@ fn build_rpg_maker_table(
         "plugin_parameter",
         lua.create_function(
             move |lua, (plugin_index, plugin_name, parameter_name): (Value, Value, Value)| {
-                let result =
-                    parse_rpg_maker_integer(plugin_index, "插件索引").and_then(|plugin_index| {
+                let result = parse_rpg_maker_integer(plugin_index, "插件索引")
+                    .and_then(|plugin_index| {
                         parse_rpg_maker_string(plugin_name, "插件名").and_then(|plugin_name| {
                             parse_rpg_maker_string(parameter_name, "插件参数名").and_then(
                                 |parameter_name| {
-                                    validate_rpg_maker_plugin_source_budget(
-                                        plugin_index,
-                                        &plugin_name,
-                                        &parameter_name,
-                                        budget,
-                                    )?;
                                     plugin_parameter_source(
                                         plugin_index,
                                         &plugin_name,
@@ -2555,7 +2418,8 @@ fn build_rpg_maker_table(
                                 },
                             )
                         })
-                    });
+                    })
+                    .map_err(|error| error.with_operation("rpg_maker.plugin_parameter"));
                 host_result_to_lua(lua, result, |lua, source| {
                     lua.create_userdata(LuaRpgMakerSource(source))
                         .map(Value::UserData)
@@ -2575,14 +2439,13 @@ fn build_rpg_maker_table(
                         .map(|bytes| (source, bytes))
                 })
                 .and_then(|(source, bytes)| {
-                    OpenedRpgMakerDocument::open(source, &bytes, budget)
-                        .map_err(rpg_maker_host_error)
-                });
+                    OpenedRpgMakerDocument::open(source, &bytes).map_err(rpg_maker_host_error)
+                })
+                .map_err(|error| error.with_operation("rpg_maker.open"));
             host_result_to_lua(lua, result, |lua, document| {
                 lua.create_userdata(LuaRpgMakerDocument {
                     document,
                     markers: open_markers.clone(),
-                    budget,
                 })
                 .map(Value::UserData)
             })
@@ -2615,10 +2478,7 @@ fn checked_host_function(lua: &Lua, native: Function) -> mlua::Result<Function> 
     factory.call(native)
 }
 
-fn parse_source_path(
-    value: Value,
-    budget: HostValueBudget,
-) -> Result<LuaSourcePath, TrustedLuaHostCallError> {
+fn parse_source_path(value: Value) -> Result<LuaSourcePath, TrustedLuaHostCallError> {
     let Value::String(value) = value else {
         return Err(binding_error(mlua::Error::runtime(format!(
             "来源路径必须是 UTF-8 字符串，实际为 {}",
@@ -2626,7 +2486,6 @@ fn parse_source_path(
         ))));
     };
     let value = lua_string_to_text(&value, "来源路径").map_err(binding_error)?;
-    validate_host_string(&value, budget, "来源路径")?;
     LuaSourcePath::parse(&value).map_err(|error| {
         TrustedLuaHostCallError::new(
             "binding",
@@ -2636,102 +2495,6 @@ fn parse_source_path(
             Some(Arc::new(error)),
         )
     })
-}
-
-fn validate_string_array_budget(
-    entries: &[String],
-    budget: HostValueBudget,
-    subject: &str,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .container(1)
-        .and_then(|()| {
-            entries
-                .iter()
-                .try_for_each(|entry| tracker.string(2, entry))
-        })
-        .map_err(|error| host_value_budget_error(subject, error))
-}
-
-fn validate_host_bytes(
-    actual: usize,
-    budget: HostValueBudget,
-    subject: &str,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .binary_len(1, actual)
-        .map_err(|error| host_value_budget_error(subject, error))
-}
-
-fn validate_host_string(
-    value: &str,
-    budget: HostValueBudget,
-    subject: &str,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .string(1, value)
-        .map_err(|error| host_value_budget_error(subject, error))
-}
-
-fn track_rpg_maker_text_reference(
-    tracker: &mut HostValueBudgetTracker,
-    depth: usize,
-    reference: &RpgMakerTextReference,
-) -> Result<(), HostValueBudgetExceeded> {
-    tracker.container(depth)?;
-    tracker.string(depth + 1, reference.original())?;
-    track_rpg_maker_location(tracker, depth + 1, reference.location())
-}
-
-fn track_rpg_maker_location(
-    tracker: &mut HostValueBudgetTracker,
-    depth: usize,
-    location: &RpgMakerLocation,
-) -> Result<(), HostValueBudgetExceeded> {
-    tracker.container(depth)?;
-    track_rpg_maker_source(tracker, depth + 1, location.source())?;
-    tracker.container(depth + 1)?;
-    for step in location.steps() {
-        match step {
-            RpgMakerLocationStep::ObjectKey(key) => tracker.string(depth + 2, key)?,
-            RpgMakerLocationStep::ArrayIndex(_) | RpgMakerLocationStep::DecodeJsonString => {
-                tracker.scalar(depth + 2)?;
-            }
-        }
-    }
-    match location {
-        RpgMakerLocation::Value { .. } => Ok(()),
-        RpgMakerLocation::NoteTag { tag_name, .. }
-        | RpgMakerLocation::CommentTag { tag_name, .. } => {
-            tracker.string(depth + 1, tag_name)?;
-            tracker.scalar(depth + 1)
-        }
-    }
-}
-
-fn track_rpg_maker_source(
-    tracker: &mut HostValueBudgetTracker,
-    depth: usize,
-    source: &RpgMakerSource,
-) -> Result<(), HostValueBudgetExceeded> {
-    match source {
-        RpgMakerSource::Data(_) | RpgMakerSource::DataFile(_) | RpgMakerSource::Map(_) => {
-            tracker.scalar(depth)
-        }
-        RpgMakerSource::PluginParameter {
-            plugin_name,
-            parameter_name,
-            ..
-        } => {
-            tracker.container(depth)?;
-            tracker.scalar(depth + 1)?;
-            tracker.string(depth + 1, plugin_name)?;
-            tracker.string(depth + 1, parameter_name)
-        }
-    }
 }
 
 fn parse_rpg_maker_string(value: Value, role: &str) -> Result<String, TrustedLuaHostCallError> {
@@ -2782,21 +2545,6 @@ fn rpg_maker_host_error(error: RpgMakerDocumentError) -> TrustedLuaHostCallError
     TrustedLuaHostCallError::new("rpg_maker", kind, message, None, Some(Arc::new(error)))
 }
 
-fn validate_rpg_maker_plugin_source_budget(
-    _plugin_index: i64,
-    plugin_name: &str,
-    parameter_name: &str,
-    budget: HostValueBudget,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .container(1)
-        .and_then(|()| tracker.scalar(2))
-        .and_then(|()| tracker.string(2, plugin_name))
-        .and_then(|()| tracker.string(2, parameter_name))
-        .map_err(|error| host_value_budget_error("RPG Maker 插件参数来源", error))
-}
-
 fn build_project_table(lua: &Lua, project: &LuaProjectContext) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("name", project.name())?;
@@ -2822,7 +2570,6 @@ fn build_database_table(
     calls: Arc<dyn TrustedLuaCommonHostCalls>,
     tokio: Handle,
     cancellation: RuntimeCancellation,
-    budget: HostValueBudget,
 ) -> mlua::Result<Table> {
     let native = lua.create_table()?;
     let null = lua.create_userdata(LuaSqliteNull)?;
@@ -2833,7 +2580,7 @@ fn build_database_table(
     native.set(
         "query",
         lua.create_function(move |lua, (statement, parameters): (Value, Value)| {
-            let result = parse_sql_call(statement, parameters, budget)
+            let result = parse_sql_call(statement, parameters)
                 .and_then(|(statement, parameters)| {
                     wait_for_host(
                         &query_tokio,
@@ -2841,10 +2588,7 @@ fn build_database_table(
                         query_calls.query(SqliteQuery::new(statement, parameters)),
                     )
                 })
-                .and_then(|rows| {
-                    validate_sqlite_rows_budget(&rows, budget)?;
-                    Ok(rows)
-                });
+                .map_err(|error| error.with_operation("db.query"));
             host_result_to_lua(lua, result, rows_to_lua)
         })?,
     )?;
@@ -2855,15 +2599,15 @@ fn build_database_table(
     native.set(
         "execute",
         lua.create_function(move |lua, (statement, parameters): (Value, Value)| {
-            let result = parse_sql_call(statement, parameters, budget).and_then(
-                |(statement, parameters)| {
+            let result = parse_sql_call(statement, parameters)
+                .and_then(|(statement, parameters)| {
                     wait_for_host(
                         &execute_tokio,
                         &execute_cancellation,
                         execute_calls.execute(SqliteCommand::new(statement, parameters)),
                     )
-                },
-            );
+                })
+                .map_err(|error| error.with_operation("db.execute"));
             host_result_to_lua(lua, result, |_, changed| {
                 i64::try_from(changed)
                     .map(Value::Integer)
@@ -2890,7 +2634,13 @@ fn build_database_table(
                 };
                 host_result_to_lua(
                     lua,
-                    wait_for_host(&tokio, &cancellation, future),
+                    wait_for_host(&tokio, &cancellation, future).map_err(|error| {
+                        error.with_operation(match operation {
+                            DatabaseOperation::Begin => "db.begin",
+                            DatabaseOperation::Commit => "db.commit",
+                            DatabaseOperation::Rollback => "db.rollback",
+                        })
+                    }),
                     |_, ()| Ok(Value::Nil),
                 )
             })?,
@@ -2899,10 +2649,7 @@ fn build_database_table(
 
     let blob = lua.create_function(move |lua, bytes: Value| {
         let result = match bytes {
-            Value::String(bytes) => {
-                validate_host_bytes(bytes.as_bytes().len(), budget, "SQLite BLOB")
-                    .map(|()| bytes.as_bytes().to_vec())
-            }
+            Value::String(bytes) => Ok(bytes.as_bytes().to_vec()),
             value => Err(binding_error(mlua::Error::runtime(format!(
                 "ctx.db.blob 的参数必须是字符串，实际为 {}",
                 value.type_name()
@@ -2951,15 +2698,11 @@ fn build_llm_function(
     calls: Arc<dyn TrustedLuaTranslateHostCalls>,
     tokio: Handle,
     cancellation: RuntimeCancellation,
-    budget: HostValueBudget,
 ) -> mlua::Result<Function> {
     let native = lua.create_function(move |lua, messages: Value| {
-        let result = parse_message_array(messages, budget)
+        let result = parse_message_array(messages)
             .and_then(|messages| wait_for_host(&tokio, &cancellation, calls.request_llm(messages)))
-            .and_then(|response| {
-                validate_llm_response_budget(&response, budget)?;
-                Ok(response)
-            });
+            .map_err(|error| error.with_operation("llm.request"));
         host_result_to_lua(lua, result, llm_response_to_lua)
     })?;
     let factory: Function = lua
@@ -3083,26 +2826,19 @@ fn host_error_to_lua(lua: &Lua, error: TrustedLuaHostCallError) -> mlua::Result<
 }
 
 fn binding_error(error: mlua::Error) -> TrustedLuaHostCallError {
-    TrustedLuaHostCallError::new("binding", "invalid_value", error.to_string(), None, None)
-}
-
-fn host_value_budget_error(
-    subject: &str,
-    error: HostValueBudgetExceeded,
-) -> TrustedLuaHostCallError {
+    let _ = error;
     TrustedLuaHostCallError::new(
         "binding",
-        "host_value_budget_exceeded",
-        format!("{subject}：{error}"),
+        "invalid_value",
+        "Lua Host 参数或返回值不符合绑定协议",
         None,
-        Some(Arc::new(error)),
+        None,
     )
 }
 
 fn parse_sql_call(
     statement: Value,
     parameters: Value,
-    budget: HostValueBudget,
 ) -> Result<(String, Vec<SqliteValue>), TrustedLuaHostCallError> {
     let statement = match statement {
         Value::String(statement) => lua_string_to_text(&statement, "SQL").map_err(binding_error)?,
@@ -3113,42 +2849,17 @@ fn parse_sql_call(
             ))));
         }
     };
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .container(1)
-        .and_then(|()| tracker.string(2, &statement))
-        .map_err(|error| host_value_budget_error("SQLite 调用参数", error))?;
-    let parameters = parse_parameters(parameters, &mut tracker, 2, budget)?;
+    let parameters = parse_parameters(parameters)?;
     Ok((statement, parameters))
 }
 
-fn parse_parameters(
-    value: Value,
-    tracker: &mut HostValueBudgetTracker,
-    depth: usize,
-    budget: HostValueBudget,
-) -> Result<Vec<SqliteValue>, TrustedLuaHostCallError> {
+fn parse_parameters(value: Value) -> Result<Vec<SqliteValue>, TrustedLuaHostCallError> {
     match value {
-        Value::Nil => {
-            tracker
-                .scalar(depth)
-                .map_err(|error| host_value_budget_error("SQLite 调用参数", error))?;
-            Ok(Vec::new())
-        }
-        Value::Table(table) => {
-            tracker
-                .container(depth)
-                .map_err(|error| host_value_budget_error("SQLite 调用参数", error))?;
-            dense_values_bounded(table, budget, "SQLite 调用参数", binding_error)?
-                .into_iter()
-                .map(|value| {
-                    let value = lua_to_sqlite_value(value).map_err(binding_error)?;
-                    track_sqlite_value(tracker, depth + 1, &value)
-                        .map_err(|error| host_value_budget_error("SQLite 调用参数", error))?;
-                    Ok(value)
-                })
-                .collect()
-        }
+        Value::Nil => Ok(Vec::new()),
+        Value::Table(table) => dense_values(table, binding_error)?
+            .into_iter()
+            .map(|value| lua_to_sqlite_value(value).map_err(binding_error))
+            .collect(),
         other => Err(binding_error(mlua::Error::runtime(format!(
             "SQLite parameters 必须是无洞数组或 nil，实际为 {}",
             other.type_name()
@@ -3156,7 +2867,7 @@ fn parse_parameters(
     }
 }
 
-fn dense_values(table: Table) -> mlua::Result<Vec<Value>> {
+fn dense_table_values(table: Table) -> mlua::Result<Vec<Value>> {
     let mut indexed = Vec::new();
     for pair in table.pairs::<Value, Value>() {
         let (key, value) = pair?;
@@ -3178,26 +2889,11 @@ fn dense_values(table: Table) -> mlua::Result<Vec<Value>> {
     Ok(indexed.into_iter().map(|(_, value)| value).collect())
 }
 
-fn dense_values_bounded<F>(
-    table: Table,
-    budget: HostValueBudget,
-    subject: &str,
-    invalid: F,
-) -> Result<Vec<Value>, TrustedLuaHostCallError>
+fn dense_values<F>(table: Table, invalid: F) -> Result<Vec<Value>, TrustedLuaHostCallError>
 where
     F: FnOnce(mlua::Error) -> TrustedLuaHostCallError,
 {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .container(1)
-        .map_err(|error| host_value_budget_error(subject, error))?;
-    for pair in table.clone().pairs::<Value, Value>() {
-        let _ = pair.map_err(binding_error)?;
-        tracker
-            .scalar(2)
-            .map_err(|error| host_value_budget_error(subject, error))?;
-    }
-    dense_values(table).map_err(invalid)
+    dense_table_values(table).map_err(invalid)
 }
 
 fn lua_to_sqlite_value(value: Value) -> mlua::Result<SqliteValue> {
@@ -3214,34 +2910,6 @@ fn lua_to_sqlite_value(value: Value) -> mlua::Result<SqliteValue> {
             "SQLite 参数不支持 {}",
             other.type_name()
         ))),
-    }
-}
-
-fn validate_sqlite_rows_budget(
-    rows: &[SqliteRow],
-    budget: HostValueBudget,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    let result = tracker.container(1).and_then(|()| {
-        rows.iter().try_for_each(|row| {
-            tracker.container(2)?;
-            row.values()
-                .iter()
-                .try_for_each(|value| track_sqlite_value(&mut tracker, 3, value))
-        })
-    });
-    result.map_err(|error| host_value_budget_error("SQLite 查询结果", error))
-}
-
-fn track_sqlite_value(
-    tracker: &mut HostValueBudgetTracker,
-    depth: usize,
-    value: &SqliteValue,
-) -> Result<(), HostValueBudgetExceeded> {
-    match value {
-        SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Real(_) => tracker.scalar(depth),
-        SqliteValue::Text(value) => tracker.string(depth, value),
-        SqliteValue::Blob(value) => tracker.binary(depth, value),
     }
 }
 
@@ -3269,17 +2937,10 @@ fn sqlite_to_lua_value(lua: &Lua, value: SqliteValue) -> mlua::Result<Value> {
     }
 }
 
-fn parse_messages(
-    table: Table,
-    tracker: &mut HostValueBudgetTracker,
-    budget: HostValueBudget,
-) -> Result<Vec<ChatMessage>, TrustedLuaHostCallError> {
-    dense_values_bounded(table, budget, "LLM messages", binding_error)?
+fn parse_messages(table: Table) -> Result<Vec<ChatMessage>, TrustedLuaHostCallError> {
+    dense_values(table, binding_error)?
         .into_iter()
         .map(|value| {
-            tracker
-                .container(2)
-                .map_err(|error| host_value_budget_error("LLM messages", error))?;
             let Value::Table(message) = value else {
                 return Err(binding_error(mlua::Error::runtime(
                     "LLM messages 的每一项必须是 table",
@@ -3290,10 +2951,6 @@ fn parse_messages(
             let content: mlua::LuaString = message.get("content").map_err(binding_error)?;
             let role = lua_string_to_text(&role, "message.role").map_err(binding_error)?;
             let content = lua_string_to_text(&content, "message.content").map_err(binding_error)?;
-            tracker
-                .string(3, &role)
-                .and_then(|()| tracker.string(3, &content))
-                .map_err(|error| host_value_budget_error("LLM messages", error))?;
             let role = match role.as_str() {
                 "system" => ChatMessageRole::System,
                 "user" => ChatMessageRole::User,
@@ -3305,21 +2962,14 @@ fn parse_messages(
         .collect()
 }
 
-fn parse_message_array(
-    value: Value,
-    budget: HostValueBudget,
-) -> Result<Vec<ChatMessage>, TrustedLuaHostCallError> {
+fn parse_message_array(value: Value) -> Result<Vec<ChatMessage>, TrustedLuaHostCallError> {
     let Value::Table(messages) = value else {
         return Err(binding_error(mlua::Error::runtime(format!(
             "LLM messages 必须是无洞数组，实际为 {}",
             value.type_name()
         ))));
     };
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .container(1)
-        .map_err(|error| host_value_budget_error("LLM messages", error))?;
-    parse_messages(messages, &mut tracker, budget)
+    parse_messages(messages)
 }
 
 fn ensure_exact_string_keys(table: &Table, expected: &[&str]) -> mlua::Result<()> {
@@ -3360,35 +3010,6 @@ fn llm_response_to_lua(lua: &Lua, response: LlmResponse) -> mlua::Result<Value> 
         None => table.set("usage", Value::Nil)?,
     }
     Ok(Value::Table(table))
-}
-
-fn validate_llm_response_budget(
-    response: &LlmResponse,
-    budget: HostValueBudget,
-) -> Result<(), TrustedLuaHostCallError> {
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    let result = tracker
-        .container(1)
-        .and_then(|()| tracker.string(2, response.content()))
-        .and_then(|()| tracker.string(2, &response.finish_reason().to_string()))
-        .and_then(|()| match response.provider_request_id() {
-            Some(request_id) => tracker.string(2, request_id),
-            None => tracker.scalar(2),
-        })
-        .and_then(|()| match response.provider_response_id() {
-            Some(response_id) => tracker.string(2, response_id),
-            None => tracker.scalar(2),
-        })
-        .and_then(|()| match response.usage() {
-            Some(_) => {
-                tracker.container(2)?;
-                tracker.scalar(3)?;
-                tracker.scalar(3)?;
-                tracker.scalar(3)
-            }
-            None => tracker.scalar(2),
-        });
-    result.map_err(|error| host_value_budget_error("LLM 响应", error))
 }
 
 fn usage_to_lua(lua: &Lua, usage: LlmUsage) -> mlua::Result<Table> {
@@ -3446,7 +3067,6 @@ impl UserData for LuaDecodeJsonString {
 struct LuaRpgMakerDocument {
     document: OpenedRpgMakerDocument,
     markers: Table,
-    budget: HostValueBudget,
 }
 
 impl UserData for LuaRpgMakerDocument {
@@ -3454,10 +3074,10 @@ impl UserData for LuaRpgMakerDocument {
         fields.add_field_method_get("value", |lua, this| {
             let document = this.document.clone();
             let markers = this.markers.clone();
-            let budget = this.budget;
             let native = lua.create_function(move |lua, (_document, path): (Value, Value)| {
-                let result = parse_rpg_maker_path(path, budget)
-                    .and_then(|steps| document.value(&steps).map_err(rpg_maker_host_error));
+                let result = parse_rpg_maker_path(path)
+                    .and_then(|steps| document.value(&steps).map_err(rpg_maker_host_error))
+                    .map_err(|error| error.with_operation("rpg_maker.document.value"));
                 host_result_to_lua(lua, result, |lua, value| {
                     lossless_json_to_lua(lua, value, &markers)
                 })
@@ -3466,10 +3086,10 @@ impl UserData for LuaRpgMakerDocument {
         });
         fields.add_field_method_get("location", |lua, this| {
             let document = this.document.clone();
-            let budget = this.budget;
             let native = lua.create_function(move |lua, (_document, path): (Value, Value)| {
-                let result = parse_rpg_maker_path(path, budget)
-                    .and_then(|steps| document.location(&steps).map_err(rpg_maker_host_error));
+                let result = parse_rpg_maker_path(path)
+                    .and_then(|steps| document.location(&steps).map_err(rpg_maker_host_error))
+                    .map_err(|error| error.with_operation("rpg_maker.document.location"));
                 host_result_to_lua(lua, result, |lua, location| {
                     lua.create_userdata(LuaRpgMakerLocation(location))
                         .map(Value::UserData)
@@ -3479,10 +3099,10 @@ impl UserData for LuaRpgMakerDocument {
         });
         fields.add_field_method_get("text", |lua, this| {
             let document = this.document.clone();
-            let budget = this.budget;
             let native = lua.create_function(move |lua, (_document, path): (Value, Value)| {
-                let result = parse_rpg_maker_path(path, budget)
-                    .and_then(|steps| document.text(&steps).map_err(rpg_maker_host_error));
+                let result = parse_rpg_maker_path(path)
+                    .and_then(|steps| document.text(&steps).map_err(rpg_maker_host_error))
+                    .map_err(|error| error.with_operation("rpg_maker.document.text"));
                 host_result_to_lua(lua, result, |lua, reference| {
                     lua.create_userdata(LuaRpgMakerTextReference(reference))
                         .map(Value::UserData)
@@ -3492,7 +3112,6 @@ impl UserData for LuaRpgMakerDocument {
         });
         fields.add_field_method_get("note_tag", |lua, this| {
             let document = this.document.clone();
-            let budget = this.budget;
             let native = lua.create_function(
                 move |lua,
                       (_document, path, tag_name, occurrence): (
@@ -3501,16 +3120,16 @@ impl UserData for LuaRpgMakerDocument {
                     Value,
                     Value,
                 )| {
-                    let result = parse_rpg_maker_path(path, budget).and_then(|steps| {
+                    let result = parse_rpg_maker_path(path).and_then(|steps| {
                         parse_rpg_maker_string(tag_name, "Note 标签名").and_then(|tag_name| {
-                            validate_host_string(&tag_name, budget, "Note 标签名")?;
                             parse_rpg_maker_occurrence(occurrence).and_then(|occurrence| {
                                 document
                                     .note_tag(&steps, &tag_name, occurrence)
                                     .map_err(rpg_maker_host_error)
                             })
                         })
-                    });
+                    })
+                    .map_err(|error| error.with_operation("rpg_maker.document.note_tag"));
                     host_result_to_lua(lua, result, |lua, reference| {
                         lua.create_userdata(LuaRpgMakerTextReference(reference))
                             .map(Value::UserData)
@@ -3521,7 +3140,6 @@ impl UserData for LuaRpgMakerDocument {
         });
         fields.add_field_method_get("comment_tag", |lua, this| {
             let document = this.document.clone();
-            let budget = this.budget;
             let native = lua.create_function(
                 move |lua,
                       (_document, path, tag_name, occurrence): (
@@ -3530,16 +3148,16 @@ impl UserData for LuaRpgMakerDocument {
                     Value,
                     Value,
                 )| {
-                    let result = parse_rpg_maker_path(path, budget).and_then(|steps| {
+                    let result = parse_rpg_maker_path(path).and_then(|steps| {
                         parse_rpg_maker_string(tag_name, "Comment 标签名").and_then(|tag_name| {
-                            validate_host_string(&tag_name, budget, "Comment 标签名")?;
                             parse_rpg_maker_occurrence(occurrence).and_then(|occurrence| {
                                 document
                                     .comment_tag(&steps, &tag_name, occurrence)
                                     .map_err(rpg_maker_host_error)
                             })
                         })
-                    });
+                    })
+                    .map_err(|error| error.with_operation("rpg_maker.document.comment_tag"));
                     host_result_to_lua(lua, result, |lua, reference| {
                         lua.create_userdata(LuaRpgMakerTextReference(reference))
                             .map(Value::UserData)
@@ -3592,57 +3210,37 @@ impl UserData for LuaRpgMakerTextReference {
     }
 }
 
-fn parse_rpg_maker_path(
-    path: Value,
-    budget: HostValueBudget,
-) -> Result<Vec<RpgMakerLocationStep>, TrustedLuaHostCallError> {
+fn parse_rpg_maker_path(path: Value) -> Result<Vec<RpgMakerLocationStep>, TrustedLuaHostCallError> {
     let Value::Table(path) = path else {
         return Err(rpg_maker_argument_error(format!(
             "RPG Maker path 必须是无洞数组，实际为 {}",
             path.type_name()
         )));
     };
-    let mut tracker = HostValueBudgetTracker::new(budget);
-    tracker
-        .container(1)
-        .map_err(|error| host_value_budget_error("RPG Maker path", error))?;
-    dense_values_bounded(path, budget, "RPG Maker path", |error| {
-        rpg_maker_argument_error(error.to_string())
-    })?
-    .into_iter()
-    .map(|value| match value {
-        Value::String(key) => {
-            let key = lua_string_to_text(&key, "RPG Maker object key")
-                .map_err(|error| rpg_maker_argument_error(error.to_string()))?;
-            tracker
-                .string(2, &key)
-                .map_err(|error| host_value_budget_error("RPG Maker path", error))?;
-            Ok(RpgMakerLocationStep::key(key))
-        }
-        Value::Integer(index) => {
-            tracker
-                .scalar(2)
-                .map_err(|error| host_value_budget_error("RPG Maker path", error))?;
-            usize::try_from(index)
+    dense_values(path, |error| rpg_maker_argument_error(error.to_string()))?
+        .into_iter()
+        .map(|value| match value {
+            Value::String(key) => {
+                let key = lua_string_to_text(&key, "RPG Maker object key")
+                    .map_err(|error| rpg_maker_argument_error(error.to_string()))?;
+                Ok(RpgMakerLocationStep::key(key))
+            }
+            Value::Integer(index) => usize::try_from(index)
                 .map(RpgMakerLocationStep::index)
                 .map_err(|_| {
                     rpg_maker_argument_error(
                         "RPG Maker array index 必须是非负 Lua integer".to_owned(),
                     )
-                })
-        }
-        Value::UserData(value) if value.is::<LuaDecodeJsonString>() => {
-            tracker
-                .scalar(2)
-                .map_err(|error| host_value_budget_error("RPG Maker path", error))?;
-            Ok(RpgMakerLocationStep::DecodeJsonString)
-        }
-        value => Err(rpg_maker_argument_error(format!(
-            "RPG Maker path 只接受字符串、非负整数或 ctx.rpg_maker.DECODE_JSON，实际为 {}",
-            value.type_name()
-        ))),
-    })
-    .collect()
+                }),
+            Value::UserData(value) if value.is::<LuaDecodeJsonString>() => {
+                Ok(RpgMakerLocationStep::DecodeJsonString)
+            }
+            value => Err(rpg_maker_argument_error(format!(
+                "RPG Maker path 只接受字符串、非负整数或 ctx.rpg_maker.DECODE_JSON，实际为 {}",
+                value.type_name()
+            ))),
+        })
+        .collect()
 }
 
 fn parse_rpg_maker_occurrence(value: Value) -> Result<usize, TrustedLuaHostCallError> {
@@ -3705,6 +3303,7 @@ impl UserData for LuaHostErrorUserData {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("domain", |_lua, this| Ok(this.0.domain()));
         fields.add_field_method_get("kind", |_lua, this| Ok(this.0.kind()));
+        fields.add_field_method_get("operation", |_lua, this| Ok(this.0.operation()));
         fields.add_field_method_get("message", |_lua, this| Ok(this.0.message().to_owned()));
         fields.add_field_method_get("retry_after_ms", |_lua, this| {
             this.0
@@ -3716,11 +3315,15 @@ impl UserData for LuaHostErrorUserData {
     }
 }
 
-fn vm_error(context: &str, error: mlua::Error, max_error_bytes: usize) -> TrustedLua54RuntimeError {
-    TrustedLua54RuntimeError::Vm(truncate_utf8(
-        format!("{context}：{error}"),
-        max_error_bytes,
-    ))
+fn vm_error(
+    operation: &'static str,
+    context: &str,
+    error: mlua::Error,
+) -> TrustedLua54RuntimeError {
+    TrustedLua54RuntimeError::Vm {
+        operation,
+        message: format!("{context}：{error}"),
+    }
 }
 
 fn lua_value_description(value: &Value) -> String {
@@ -3731,18 +3334,6 @@ fn lua_value_description(value: &Value) -> String {
             .unwrap_or_else(|_| "<non-UTF-8 Lua error>".to_owned()),
         other => format!("Lua {} 错误值", other.type_name()),
     }
-}
-
-fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut boundary = max_bytes;
-    while boundary > 0 && !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
-    value
 }
 
 #[cfg(test)]
@@ -3757,13 +3348,13 @@ mod tests {
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::lua::runtime::{
         TrustedLuaBindingFinalization, TrustedLuaBindingFinalizer, TrustedLuaExtractIntent,
-        TrustedLuaPreparedTranslationStatus, TrustedLuaRuntimeBindings,
+        TrustedLuaOutputEntry, TrustedLuaPreparedTranslationStatus, TrustedLuaRuntimeBindings,
         TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
     };
     use crate::rpg_maker::project::OpenedProject;
     use crate::runtime::sqlite::{
         RusqliteInteractiveSessionFinalizer, RusqliteInteractiveSessionOperations, RusqliteStorage,
-        RusqliteStorageConfiguration, SqliteJournalMode, SqliteSynchronous,
+        RusqliteStorageConfiguration,
     };
     use crate::storage::sqlite_session::{
         SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
@@ -4293,32 +3884,10 @@ mod tests {
     }
 
     fn test_configuration() -> TrustedLua54RuntimeConfiguration {
-        test_configuration_with_budget(HostValueBudget::new(
-            NonZeroUsize::new(1024 * 1024).unwrap(),
-            NonZeroUsize::new(10_000).unwrap(),
-            NonZeroUsize::new(64).unwrap(),
-        ))
-    }
-
-    fn test_configuration_with_budget(
-        host_value_budget: HostValueBudget,
-    ) -> TrustedLua54RuntimeConfiguration {
         TrustedLua54RuntimeConfiguration::new(
             NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
-            NonZeroUsize::new(16 * 1024 * 1024).unwrap(),
             NonZeroU32::new(100).unwrap(),
-            NonZeroUsize::new(4096).unwrap(),
-            host_value_budget,
         )
-    }
-
-    fn assert_host_budget_error<T>(result: Result<T, TrustedLuaHostCallError>) {
-        let error = match result {
-            Ok(_) => panic!("值应超过统一 HostValueBudget"),
-            Err(error) => error,
-        };
-        assert_eq!(error.domain(), "binding");
-        assert_eq!(error.kind(), "host_value_budget_exceeded");
     }
 
     fn test_project() -> LuaProjectContext {
@@ -4437,9 +4006,9 @@ mod tests {
     fn dense_arrays_reject_holes_and_map_keys() {
         let lua = Lua::new();
         let hole: Table = lua.load("return {[1] = 'a', [3] = 'c'}").eval().unwrap();
-        assert!(dense_values(hole).is_err());
+        assert!(dense_table_values(hole).is_err());
         let map: Table = lua.load("return {name = 'alice'}").eval().unwrap();
-        assert!(dense_values(map).is_err());
+        assert!(dense_table_values(map).is_err());
     }
 
     #[test]
@@ -4453,14 +4022,8 @@ mod tests {
         values
             .raw_set(3, lua.create_userdata(LuaSqliteNull).unwrap())
             .unwrap();
-        let budget = HostValueBudget::new(
-            NonZeroUsize::new(1024).unwrap(),
-            NonZeroUsize::new(32).unwrap(),
-            NonZeroUsize::new(4).unwrap(),
-        );
-        let mut tracker = HostValueBudgetTracker::new(budget);
         assert_eq!(
-            parse_parameters(Value::Table(values), &mut tracker, 1, budget).unwrap(),
+            parse_parameters(Value::Table(values)).unwrap(),
             vec![
                 SqliteValue::Text("text".to_owned()),
                 SqliteValue::Blob(vec![0, 255]),
@@ -4470,91 +4033,26 @@ mod tests {
     }
 
     #[test]
-    fn every_core_value_boundary_uses_the_same_host_value_budget() {
+    fn large_sqlite_and_llm_values_are_accepted() {
         let lua = Lua::new();
-        let budget = HostValueBudget::new(
-            NonZeroUsize::new(8).unwrap(),
-            NonZeroUsize::new(64).unwrap(),
-            NonZeroUsize::new(8).unwrap(),
-        );
+        let payload = "字".repeat(1024 * 1024);
 
-        let groups: Table = lua
-            .load("return {{kind = '123456789', location = {}, fields = {}}}")
-            .eval()
-            .unwrap();
-        assert_host_budget_error(parse_lua_standard_snapshot(Value::Table(groups), budget));
-
-        let empty = lua.create_table().unwrap();
-        assert_host_budget_error(parse_write_back_layout(
-            Value::String(lua.create_string("dialogue_body").unwrap()),
-            Value::Table(empty),
-            budget,
-        ));
-        assert_host_budget_error(parse_source_path(
-            Value::String(lua.create_string("data/123456789").unwrap()),
-            budget,
-        ));
-        assert_host_budget_error(parse_output_path(
-            Value::String(lua.create_string("data/123456789").unwrap()),
-            budget,
-        ));
-
-        let messages: Table = lua
-            .load("return {{role = 'user', content = '12345'}}")
-            .eval()
-            .unwrap();
-        assert_host_budget_error(parse_message_array(Value::Table(messages), budget));
-
-        let parameters = lua.create_table().unwrap();
-        parameters.raw_set(1, "12345678").unwrap();
-        assert_host_budget_error(parse_sql_call(
+        let parameters = lua.create_table_with_capacity(1, 0).unwrap();
+        parameters.raw_set(1, payload.as_str()).unwrap();
+        let (_, parsed) = parse_sql_call(
             Value::String(lua.create_string("q").unwrap()),
             Value::Table(parameters),
-            budget,
-        ));
-        assert_host_budget_error(validate_sqlite_rows_budget(
-            &[SqliteRow::new(vec![SqliteValue::Text(
-                "123456789".to_owned(),
-            )])],
-            budget,
-        ));
+        )
+        .unwrap();
+        assert_eq!(parsed, [SqliteValue::Text(payload.clone())]);
 
-        let response = LlmResponse::new(
-            "123456789",
-            crate::llm::LlmFinishReason::Stop,
-            None,
-            Some("r".to_owned()),
-            None,
-        );
-        assert_host_budget_error(validate_llm_response_budget(&response, budget));
-
-        let path: Table = lua.load("return {'123456789'}").eval().unwrap();
-        assert_host_budget_error(parse_rpg_maker_path(Value::Table(path), budget));
-
-        assert_host_budget_error(validate_write_back_layout_result_budget(
-            &TrustedLuaWriteBackLayoutResult::new(
-                crate::rpg_maker::lua::runtime::TrustedLuaWriteBackLayoutStatus::Applied,
-                vec!["123456789".to_owned()],
-                0,
-                0,
-            ),
-            budget,
-        ));
-        assert_host_budget_error(validate_prepared_translation_budget(
-            &TestPreparedTranslation {
-                status: TrustedLuaPreparedTranslationStatus::Active,
-                model_text: "123456789".to_owned(),
-                terms: Vec::new(),
-            },
-            budget,
-        ));
-        assert_host_budget_error(validate_prepared_acceptance_budget(
-            &TrustedLuaPreparedTranslationAcceptance::accepted(
-                "123456789",
-                Sha256Fingerprint::from_bytes([0x33; SHA256_FINGERPRINT_BYTES]),
-            ),
-            budget,
-        ));
+        let message = lua.create_table().unwrap();
+        message.set("role", "user").unwrap();
+        message.set("content", payload.as_str()).unwrap();
+        let messages = lua.create_table_with_capacity(1, 0).unwrap();
+        messages.raw_set(1, message).unwrap();
+        let parsed = parse_message_array(Value::Table(messages)).unwrap();
+        assert_eq!(parsed[0].content(), payload);
     }
 
     #[test]
@@ -4581,8 +4079,27 @@ mod tests {
     }
 
     #[test]
-    fn error_truncation_preserves_utf8() {
-        assert_eq!(truncate_utf8("中文abc".to_owned(), 4), "中");
+    fn vm_errors_keep_private_text_but_only_publish_the_stable_operation() {
+        let sentinel = "底层原因".repeat(10_000);
+        let error = vm_error(
+            "execute_main_program",
+            "Lua 失败",
+            mlua::Error::runtime(sentinel.clone()),
+        );
+        let TrustedLua54RuntimeError::Vm { message, .. } = &error else {
+            panic!("VM 错误必须保留文本")
+        };
+        assert!(message.ends_with(&sentinel));
+
+        let public = error.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::FixInput,
+        );
+        let serialized = serde_json::to_string(&public).expect("VM 安全诊断应可序列化");
+        assert!(serialized.contains("lua_vm_operation=execute_main_program"));
+        assert!(serialized.contains("translate"));
+        assert!(!serialized.contains(&sentinel));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4642,7 +4159,7 @@ ctx.extract.replace_standard({
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn extract_replace_standard_rejects_duplicate_group_location_and_kind() {
+    async fn extract_replace_standard_rejects_duplicate_group_location_across_kinds() {
         let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let observations = Arc::new(Mutex::new(TestObservations::default()));
         let error = run_extract_program(
@@ -4653,7 +4170,7 @@ local items = ctx.rpg_maker.open(ctx.rpg_maker.data("Items.json"))
 local location = items:location({1})
 ctx.extract.replace_standard({
   {
-    kind = "database_entry",
+    kind = "event_command",
     location = location,
     fields = {{ name = "name", text = items:text({1, "name"}) }},
   },
@@ -4666,14 +4183,14 @@ ctx.extract.replace_standard({
 "#,
         )
         .await
-        .expect_err("Lua 边界不得把重复 group.location + kind 静默合并");
+        .expect_err("Lua 边界不得把重复 group.location 静默合并");
 
         let TrustedLuaRuntimeExecutionError::Binding(binding) = &error else {
             panic!("重复组必须映射成普通 Host 参数错误，实际为 {error}")
         };
         assert_eq!(binding.domain(), "extract");
         assert_eq!(binding.kind(), "invalid_standard_snapshot");
-        assert!(binding.to_string().contains("group.location + kind"));
+        assert!(binding.to_string().contains("group.location"));
         assert!(
             observations
                 .lock()
@@ -5137,35 +4654,21 @@ assert(not ok and error.domain == "binding" and error.kind == "invalid_value")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn json_context_enforces_every_host_value_budget_dimension() {
-        let runtime = TrustedLua54Runtime::new(
-            test_configuration_with_budget(HostValueBudget::new(
-                NonZeroUsize::new(32).unwrap(),
-                NonZeroUsize::new(3).unwrap(),
-                NonZeroUsize::new(2).unwrap(),
-            )),
-            Handle::current(),
-        );
+    async fn json_context_handles_deep_and_large_values() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let script = r#"
 local json = ctx.json
 assert(json.encode(json.decode("[1,2]")) == "[1,2]")
-local failures = {
-  function() return json.decode(string.rep(" ", 32) .. "0") end,
-  function() return json.decode("[1,2,3]") end,
-  function() return json.decode("[[1]]") end,
-  function() return json.encode(string.rep("x", 40)) end,
-  function() return json.encode(json.array({1, 2, 3})) end,
-  function() return json.encode(json.array({json.array({1})})) end,
-}
-for _, failure in ipairs(failures) do
-  local ok, error = pcall(failure)
-  assert(not ok and error.domain == "json" and error.kind == "invalid_value")
-end
+local depth = 10000
+local source = string.rep("[", depth) .. "0" .. string.rep("]", depth)
+assert(json.encode(json.decode(source)) == source)
+local large = string.rep("值", 1024 * 1024)
+assert(json.decode(json.encode(large)) == large)
 "#;
         let report = runtime
             .start(
                 OwnedLuaProgram::new(
-                    PathBuf::from("C:/scripts/json-budget.lua"),
+                    PathBuf::from("C:/scripts/json-unbounded.lua"),
                     script.as_bytes().to_vec(),
                 ),
                 test_bindings(
@@ -5944,7 +5447,7 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn configured_vm_memory_limit_rejects_excessive_allocation() {
+    async fn lua_vm_allows_large_allocation() {
         let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let report = runtime
             .start(
@@ -5960,10 +5463,7 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
                 ),
             )
             .await;
-        assert!(matches!(
-            report.into_parts().0,
-            Err(TrustedLuaRuntimeExecutionError::Execute(_))
-        ));
+        report.into_parts().0.unwrap();
         runtime.shutdown().await.unwrap();
     }
 
@@ -6390,20 +5890,7 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
 
     fn documented_example_sqlite_storage() -> RusqliteStorage {
         let nonzero = |value| NonZeroUsize::new(value).expect("测试资源配置必须非零");
-        let configuration = RusqliteStorageConfiguration::new(
-            nonzero(1),
-            nonzero(8),
-            nonzero(4),
-            nonzero(1024 * 1024),
-            nonzero(256 * 1024),
-            nonzero(256 * 1024),
-            nonzero(1_000),
-            nonzero(4 * 1024 * 1024),
-            Duration::from_secs(2),
-            SqliteJournalMode::Delete,
-            SqliteSynchronous::Full,
-        )
-        .expect("文档示例 SQLite 配置应合法");
+        let configuration = RusqliteStorageConfiguration::new(nonzero(1), nonzero(1024 * 1024));
         RusqliteStorage::start(configuration).expect("文档示例 SQLite 根应启动")
     }
 

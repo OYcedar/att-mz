@@ -21,15 +21,17 @@ use super::profile::{
     RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
     RpgMakerTranslationRequestConfiguration, TranslationResponseEnvelope,
 };
-use super::result_store::{
-    RpgMakerStandardTranslationResultStorageConfig, RpgMakerStandardTranslationResultStorageService,
-};
+use super::result_store::RpgMakerStandardTranslationResultStorageService;
 use super::service::{
     SelectedTranslationExecution, SelectedTranslationExecutionBuilder, TranslateService,
 };
 use super::standard::{
     StandardTranslation, StandardTranslationLog, StandardTranslationLogEvent,
     StandardTranslationLogTaskOutcome, StandardTranslationService,
+};
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::OperationCompletion;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -38,8 +40,8 @@ use crate::language::{
     JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageModule, LanguagePair,
 };
 use crate::llm::{
-    ChatMessage, ChatMessageRole, LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError,
-    LlmRequestExecutor, LlmResponse,
+    ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
+    LlmRequestDiagnosticSource, LlmRequestError, LlmRequestExecutor, LlmResponse,
 };
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
@@ -55,7 +57,6 @@ use crate::rpg_maker::project_database::ProjectDatabaseRecordReadingService;
 use crate::rpg_maker::project_lease::{
     ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
 };
-use crate::rpg_maker::standard_asset::RpgMakerStandardAssetReadingConfig;
 use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
 };
@@ -66,14 +67,17 @@ use crate::storage::file_system::{
 };
 use crate::storage::sqlite::{
     ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand, SqliteQuery,
-    SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor, SqliteTransactionPlan,
-    SqliteTransactionStep, SqliteValue,
+    SqliteQueryExecutor, SqliteRow, SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
 };
 use crate::storage::sqlite_session::{
     OpenSqliteInteractiveSessionError, OpenedSqliteInteractiveSession,
     SqliteInteractiveSessionError, SqliteInteractiveSessionFactory,
     SqliteInteractiveSessionFinalization, SqliteInteractiveSessionFinalizationError,
     SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
+};
+use crate::storage::sqlite_transaction_session::{
+    OpenSqliteTransactionSessionError, OpenedSqliteTransactionSession,
+    SqliteTransactionSessionFactory, SqliteTransactionSessionOperations,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +90,46 @@ impl fmt::Display for FakeRootError {
 }
 
 impl Error for FakeRootError {}
+
+impl SafeDiagnosticSource for FakeRootError {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            stage,
+            DiagnosticSubject::component("translate full-tree test root"),
+            DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+            impact,
+            action,
+        )
+    }
+}
+
+impl LlmRequestDiagnosticSource for FakeRootError {
+    fn request_diagnostic(
+        &self,
+        retry_after: Option<Duration>,
+        impact: crate::diagnostic::DiagnosticImpact,
+    ) -> crate::diagnostic::SafeDiagnostic {
+        crate::diagnostic::SafeDiagnostic::new(
+            crate::diagnostic::DiagnosticCode::ModelRequest,
+            crate::diagnostic::DiagnosticStage::ModelRequest,
+            crate::diagnostic::DiagnosticSubject::component("fake LLM provider"),
+            crate::diagnostic::DiagnosticReason::Http {
+                status: Some(503),
+                retry_after_seconds: retry_after.map(|value| value.as_secs()),
+                provider_code: Some("temporarily_unavailable".to_owned()),
+                provider_type: Some("service_error".to_owned()),
+            },
+            impact,
+            crate::diagnostic::DiagnosticAction::CheckModelService,
+        )
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Event {
@@ -201,19 +245,7 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
             ])]);
         }
 
-        assert!(query.statement().contains("UNION ALL"));
-        assert!(query.statement().contains("standard_translation_resource"));
-        record(&self.events, Event::QueryAssets);
-        Ok(vec![
-            metadata_snapshot_row(),
-            owner_snapshot_row(),
-            resource_snapshot_row("placeholder_rules"),
-            resource_snapshot_row("terminology"),
-            standard_group_row(1, 0),
-            standard_group_row(2, 1),
-            standard_asset_row(1, 0),
-            standard_asset_row(2, 1),
-        ])
+        panic!("标准翻译资产必须使用同一快照中的窄查询")
     }
 
     async fn query_existing_database_snapshot(
@@ -221,11 +253,82 @@ impl SqliteQueryExecutor for FakeSqliteQueryExecutor {
         path: PathBuf,
         queries: Vec<SqliteQuery>,
     ) -> Result<Vec<Vec<SqliteRow>>, QueryExistingDatabaseError<Self::Error>> {
-        let mut results = Vec::with_capacity(queries.len());
-        for query in queries {
-            results.push(self.query_existing_database(path.clone(), query).await?);
-        }
-        Ok(results)
+        assert_eq!(
+            path,
+            PathBuf::from("C:/projects")
+                .join("mz")
+                .join("demo")
+                .join("project.db")
+        );
+        assert_eq!(queries.len(), 9);
+        assert_eq!(
+            queries.iter().map(SqliteQuery::id).collect::<Vec<_>>(),
+            [
+                "translation.metadata",
+                "translation.owners",
+                "translation.resources",
+                "translation.builtin.groups",
+                "translation.rules.groups",
+                "translation.lua.groups",
+                "translation.builtin.units",
+                "translation.rules.units",
+                "translation.lua.units",
+            ]
+        );
+        assert!(
+            queries[..3]
+                .iter()
+                .all(|query| query.parameters().is_empty())
+        );
+        assert_eq!(
+            queries[3..]
+                .iter()
+                .map(|query| match query.parameters() {
+                    [SqliteValue::Text(owner)] => owner.as_str(),
+                    parameters => panic!("owner 分区查询参数无效：{parameters:?}"),
+                })
+                .collect::<Vec<_>>(),
+            ["builtin", "rules", "lua", "builtin", "rules", "lua"]
+        );
+        assert!(
+            queries
+                .iter()
+                .all(|query| !query.statement().contains("UNION ALL"))
+        );
+        assert!(queries[0].statement().contains("FROM metadata"));
+        assert!(
+            queries[1]
+                .statement()
+                .contains("standard_asset_owner_state")
+        );
+        assert!(
+            queries[2]
+                .statement()
+                .contains("standard_translation_resource")
+        );
+        assert!(queries[3..6].iter().all(|query| {
+            query.statement().contains("FROM standard_text_group")
+                && !query.statement().contains("standard_text_unit")
+        }));
+        assert!(queries[6..].iter().all(|query| {
+            query.statement().contains("standard_text_unit")
+                && query.statement().contains("WHERE text_group.owner = ?")
+        }));
+        record(&self.events, Event::QueryAssets);
+        Ok(vec![
+            vec![metadata_snapshot_row()],
+            vec![owner_snapshot_row()],
+            vec![
+                resource_snapshot_row("placeholder_rules"),
+                resource_snapshot_row("terminology"),
+            ],
+            vec![standard_group_row(1, 0), standard_group_row(2, 1)],
+            Vec::new(),
+            Vec::new(),
+            vec![standard_asset_row(1, 0), standard_asset_row(2, 1)],
+            Vec::new(),
+            Vec::new(),
+        ])
     }
 }
 
@@ -259,56 +362,22 @@ impl DirectoryTreeFingerprinter for FakeDirectoryTreeFingerprinter {
 }
 
 fn metadata_snapshot_row() -> SqliteRow {
-    snapshot_prefix_row(
-        "0_metadata",
-        SqliteValue::Null,
-        SqliteValue::Blob(vec![0xa5; 32]),
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-    )
+    SqliteRow::new(vec![SqliteValue::Blob(vec![0xa5; 32])])
 }
 
 fn owner_snapshot_row() -> SqliteRow {
-    snapshot_prefix_row(
-        "1_owner",
+    SqliteRow::new(vec![
         SqliteValue::Text("builtin".to_owned()),
         SqliteValue::Blob(vec![0xa5; 32]),
         SqliteValue::Blob(vec![0xb4; 32]),
-        SqliteValue::Null,
-        SqliteValue::Null,
-    )
+    ])
 }
 
 fn resource_snapshot_row(kind: &str) -> SqliteRow {
-    snapshot_prefix_row(
-        "2_resource",
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
+    SqliteRow::new(vec![
         SqliteValue::Text(kind.to_owned()),
         SqliteValue::Text("[]".to_owned()),
-    )
-}
-
-fn snapshot_prefix_row(
-    row_kind: &str,
-    owner: SqliteValue,
-    source_fingerprint: SqliteValue,
-    asset_fingerprint: SqliteValue,
-    resource_kind: SqliteValue,
-    canonical_json: SqliteValue,
-) -> SqliteRow {
-    let mut values = vec![
-        SqliteValue::Text(row_kind.to_owned()),
-        owner,
-        source_fingerprint,
-        asset_fingerprint,
-        resource_kind,
-        canonical_json,
-    ];
-    values.extend(std::iter::repeat_n(SqliteValue::Null, 9));
-    SqliteRow::new(values)
+    ])
 }
 
 fn standard_group_row(index: usize, group_order: i64) -> SqliteRow {
@@ -317,23 +386,11 @@ fn standard_group_row(index: usize, group_order: i64) -> SqliteRow {
         vec![RpgMakerLocationStep::index(index)],
     );
     SqliteRow::new(vec![
-        SqliteValue::Text("3_group".to_owned()),
-        SqliteValue::Text("builtin".to_owned()),
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
         SqliteValue::Text(
             RpgMakerLocationCodec::encode(&group_location).expect("测试位置应可编码"),
         ),
         SqliteValue::Text("database_entry".to_owned()),
         SqliteValue::Integer(group_order),
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
     ])
 }
 
@@ -348,12 +405,6 @@ fn standard_asset_row(index: usize, group_order: i64) -> SqliteRow {
     .expect("字段角色应可编码");
 
     SqliteRow::new(vec![
-        SqliteValue::Text("4_unit".to_owned()),
-        SqliteValue::Text("builtin".to_owned()),
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Null,
         SqliteValue::Text(
             RpgMakerLocationCodec::encode(&group_location).expect("测试位置应可编码"),
         ),
@@ -374,21 +425,13 @@ struct FakeSqliteTransactionExecutor {
     calls: Arc<AtomicUsize>,
 }
 
-impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
+impl SqliteTransactionSessionOperations for FakeSqliteTransactionExecutor {
     type Error = FakeRootError;
 
     async fn execute_transaction(
         &self,
-        path: PathBuf,
         plan: SqliteTransactionPlan,
     ) -> Result<(), ExecuteTransactionError<Self::Error>> {
-        assert_eq!(
-            path,
-            PathBuf::from("C:/projects")
-                .join("mz")
-                .join("demo")
-                .join("project.db")
-        );
         let translated_unit_count = plan
             .steps()
             .iter()
@@ -399,23 +442,27 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
                         .contains(&SqliteValue::Text(r#""魔法剑""#.to_owned())),
                 ),
                 SqliteTransactionStep::ExecuteMany(batch)
-                | SqliteTransactionStep::ExecuteManyExactlyOne(batch) => batch
-                    .parameter_sets()
-                    .iter()
-                    .filter(|parameters| {
-                        parameters.contains(&SqliteValue::Text(r#""魔法剑""#.to_owned()))
-                    })
-                    .count(),
+                | SqliteTransactionStep::ExecuteManyExactlyOne(batch) => {
+                    let translation = SqliteValue::Text(r#""魔法剑""#.to_owned());
+                    if batch.shared_parameters().contains(&translation) {
+                        batch.parameter_set_count()
+                    } else {
+                        batch
+                            .parameter_rows()
+                            .filter(|parameters| parameters.contains(&translation))
+                            .count()
+                    }
+                }
                 SqliteTransactionStep::RequireNoRows(_)
+                | SqliteTransactionStep::RequireNoRowsReturningFirstRow(_)
                 | SqliteTransactionStep::RequireNoRowsMany(_) => 0,
             })
             .sum::<usize>();
         let event = if translated_unit_count == 0 {
-            assert!(plan.steps().iter().any(|step| matches!(
-                step,
-                SqliteTransactionStep::Execute(command)
-                    if command.statement().contains("standard_translation_resource")
-            )));
+            assert!(
+                !plan.steps().is_empty(),
+                "准备事务至少必须携带 baseline CAS 或必要的状态更新"
+            );
             Event::PreparationTransaction
         } else {
             assert_eq!(
@@ -430,6 +477,47 @@ impl SqliteTransactionExecutor for FakeSqliteTransactionExecutor {
     }
 }
 
+struct FakeSqliteTransactionFinalizer;
+
+impl SqliteInteractiveSessionFinalizer for FakeSqliteTransactionFinalizer {
+    type Error = FakeRootError;
+
+    async fn finalize(
+        self,
+    ) -> Result<
+        SqliteInteractiveSessionFinalization,
+        SqliteInteractiveSessionFinalizationError<Self::Error>,
+    > {
+        Ok(SqliteInteractiveSessionFinalization::new(false))
+    }
+}
+
+impl SqliteTransactionSessionFactory for FakeSqliteTransactionExecutor {
+    type Operations = FakeSqliteTransactionExecutor;
+    type Finalizer = FakeSqliteTransactionFinalizer;
+    type Error = FakeRootError;
+
+    async fn open_existing_transaction_session(
+        &self,
+        path: PathBuf,
+    ) -> Result<
+        OpenedSqliteTransactionSession<Self::Operations, Self::Finalizer>,
+        OpenSqliteTransactionSessionError<Self::Error>,
+    > {
+        assert_eq!(
+            path,
+            PathBuf::from("C:/projects")
+                .join("mz")
+                .join("demo")
+                .join("project.db")
+        );
+        Ok(OpenedSqliteTransactionSession::new(
+            Arc::new(self.clone()),
+            FakeSqliteTransactionFinalizer,
+        ))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct FakeLlmClient {
     name: &'static str,
@@ -438,6 +526,12 @@ struct FakeLlmClient {
 impl LlmClientSemanticIdentity for FakeLlmClient {
     fn semantic_fingerprint(&self) -> Sha256Fingerprint {
         Sha256Fingerprint::from_bytes([0x4c; 32])
+    }
+}
+
+impl LlmClientConcurrency for FakeLlmClient {
+    fn max_concurrent_requests(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
     }
 }
 
@@ -882,7 +976,6 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     let planning = RpgMakerTranslationPlanningConfiguration::new(non_zero(10_000));
     let profile = Arc::new(RpgMakerTranslationProfile::new(
         "quality",
-        non_zero(1),
         planning,
         RpgMakerTranslationRequestConfiguration::new(
             vec![Duration::from_millis(7)],
@@ -902,11 +995,8 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
         FakeDirectoryResolver,
         FakeDirectoryTreeFingerprinter,
     );
-    let asset_reader = RpgMakerStandardTranslationAssetReadingService::new(
-        sqlite_query,
-        cpu.clone(),
-        RpgMakerStandardAssetReadingConfig::new(non_zero(1)),
-    );
+    let asset_reader =
+        RpgMakerStandardTranslationAssetReadingService::new(sqlite_query, cpu.clone());
     let languages = translation_resources();
     let resources =
         TranslationPlanningResourceReadingService::new(file_reader.clone(), cpu.clone());
@@ -918,16 +1008,15 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
     );
     let response_processor = TranslationTaskResponseProcessingService::new(cpu.clone(), languages);
     type SelectedProfile = Arc<RpgMakerTranslationProfile<FakeLlmClient>>;
+    let cancellation = crate::execution::CooperativeCancellation::default();
     let executor = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, SelectedProfile>::new(
         llm.clone(),
         delay,
         response_processor,
+        cancellation.clone(),
     );
-    let result_store = RpgMakerStandardTranslationResultStorageService::new(
-        sqlite_transaction,
-        cpu,
-        RpgMakerStandardTranslationResultStorageConfig::new(non_zero(1)),
-    );
+    let result_store =
+        RpgMakerStandardTranslationResultStorageService::new(sqlite_transaction, cpu);
     let standard = StandardTranslationService::new(
         asset_reader,
         planner,
@@ -937,7 +1026,7 @@ async fn all_non_root_translation_services_reach_the_selected_root_fakes() {
             events: Arc::clone(&events),
             calls: Arc::clone(&persistent_log_calls),
         },
-        crate::execution::CooperativeCancellation::default(),
+        cancellation,
     );
 
     let lua_host =

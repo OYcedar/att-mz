@@ -172,7 +172,6 @@ impl RuleDefinition {
             .map(|path| {
                 CompiledPath::parse(&path).map_err(|reason| RulesDefinitionError::InvalidPath {
                     rule_number,
-                    path,
                     reason,
                 })
             })
@@ -300,7 +299,7 @@ fn parse_file_source(
     }
 
     if DataFileName::parse(file.clone()).is_err() {
-        return Err(RulesDefinitionError::InvalidFile { rule_number, file });
+        return Err(RulesDefinitionError::InvalidFile { rule_number });
     }
 
     Ok(FileRuleSource::Exact(file))
@@ -322,12 +321,12 @@ pub(super) struct CompiledPath {
 }
 
 impl CompiledPath {
-    fn parse(path: &str) -> Result<Self, String> {
+    fn parse(path: &str) -> Result<Self, InvalidPathReason> {
         if path.is_empty() {
-            return Err("路径不能为空".to_owned());
+            return Err(InvalidPathReason::Empty);
         }
         if path.starts_with('$') {
-            return Err("不支持 $ 或通用 JSONPath".to_owned());
+            return Err(InvalidPathReason::UnsupportedJsonPath { offset: 0 });
         }
 
         let bytes = path.as_bytes();
@@ -338,14 +337,14 @@ impl CompiledPath {
             match bytes[cursor] {
                 b'.' => {
                     if expect_segment {
-                        return Err("点号两侧必须是字段名或数组步骤".to_owned());
+                        return Err(InvalidPathReason::UnexpectedDot { offset: cursor });
                     }
                     cursor += 1;
                     expect_segment = true;
                 }
                 b'[' => {
                     if cursor > 0 && bytes[cursor - 1] == b'.' {
-                        return Err("方括号步骤前不能有点号".to_owned());
+                        return Err(InvalidPathReason::DotBeforeBracket { offset: cursor - 1 });
                     }
                     let (segment, next) = parse_bracket_segment(path, cursor)?;
                     segments.push(segment);
@@ -354,7 +353,7 @@ impl CompiledPath {
                 }
                 _ => {
                     if !expect_segment {
-                        return Err("字段之间需要点号".to_owned());
+                        return Err(InvalidPathReason::MissingDot { offset: cursor });
                     }
                     let start = cursor;
                     while cursor < bytes.len() && !matches!(bytes[cursor], b'.' | b'[' | b']') {
@@ -370,10 +369,7 @@ impl CompiledPath {
                             .next()
                             .is_some_and(|character| character.is_ascii_digit())
                     {
-                        return Err(
-                            "普通字段名只支持字母、数字和下划线且不能以数字开头；其他键请使用 [\"...\"]"
-                                .to_owned(),
-                        );
+                        return Err(InvalidPathReason::InvalidBareKey { offset: start });
                     }
                     segments.push(PathSegment::Key(key.to_owned()));
                     expect_segment = false;
@@ -381,7 +377,9 @@ impl CompiledPath {
             }
         }
         if expect_segment || segments.is_empty() {
-            return Err("路径不能以点号结束".to_owned());
+            return Err(InvalidPathReason::TrailingDot {
+                offset: path.len().saturating_sub(1),
+            });
         }
 
         Ok(Self {
@@ -400,11 +398,14 @@ impl CompiledPath {
     }
 }
 
-fn parse_bracket_segment(path: &str, start: usize) -> Result<(PathSegment, usize), String> {
+fn parse_bracket_segment(
+    path: &str,
+    start: usize,
+) -> Result<(PathSegment, usize), InvalidPathReason> {
     let bytes = path.as_bytes();
     let mut cursor = start + 1;
     if cursor >= bytes.len() {
-        return Err("方括号没有闭合".to_owned());
+        return Err(InvalidPathReason::UnclosedBracket { offset: start });
     }
     if bytes[cursor] == b']' {
         return Ok((PathSegment::AnyIndex, cursor + 1));
@@ -415,11 +416,18 @@ fn parse_bracket_segment(path: &str, start: usize) -> Result<(PathSegment, usize
             serde_json::Deserializer::from_str(&path[string_start..]).into_iter::<String>();
         let key = strings
             .next()
-            .ok_or_else(|| "键字符串无效：缺少 JSON 字符串".to_owned())?
-            .map_err(|error| format!("键字符串无效：{error}"))?;
+            .ok_or(InvalidPathReason::MissingQuotedKey {
+                offset: string_start,
+            })?
+            .map_err(|error| InvalidPathReason::InvalidQuotedKey {
+                offset: string_start,
+                classification: json_error_classification(&error),
+                line: error.line(),
+                column: error.column(),
+            })?;
         cursor = string_start + strings.byte_offset();
         if bytes.get(cursor) != Some(&b']') {
-            return Err("带引号的键必须紧邻 ] 结束".to_owned());
+            return Err(InvalidPathReason::QuotedKeyMissingClose { offset: cursor });
         }
         return Ok((PathSegment::Key(key), cursor + 1));
     }
@@ -429,12 +437,122 @@ fn parse_bracket_segment(path: &str, start: usize) -> Result<(PathSegment, usize
         cursor += 1;
     }
     if cursor == digits_start || cursor >= bytes.len() || bytes[cursor] != b']' {
-        return Err("方括号只支持 []、[数字] 或 [\"键\"]".to_owned());
+        return Err(InvalidPathReason::InvalidBracket { offset: start });
     }
-    let index = path[digits_start..cursor]
-        .parse::<usize>()
-        .map_err(|_| "数组下标超出范围".to_owned())?;
+    let index = path[digits_start..cursor].parse::<usize>().map_err(|_| {
+        InvalidPathReason::IndexOutOfRange {
+            offset: digits_start,
+        }
+    })?;
     Ok((PathSegment::Index(index), cursor + 1))
+}
+
+/// 路径语法错误只保存稳定的语法类别与字节位置，不保存解析器自由文本。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidPathReason {
+    Empty,
+    UnsupportedJsonPath {
+        offset: usize,
+    },
+    UnexpectedDot {
+        offset: usize,
+    },
+    DotBeforeBracket {
+        offset: usize,
+    },
+    MissingDot {
+        offset: usize,
+    },
+    InvalidBareKey {
+        offset: usize,
+    },
+    TrailingDot {
+        offset: usize,
+    },
+    UnclosedBracket {
+        offset: usize,
+    },
+    MissingQuotedKey {
+        offset: usize,
+    },
+    InvalidQuotedKey {
+        offset: usize,
+        classification: &'static str,
+        line: usize,
+        column: usize,
+    },
+    QuotedKeyMissingClose {
+        offset: usize,
+    },
+    InvalidBracket {
+        offset: usize,
+    },
+    IndexOutOfRange {
+        offset: usize,
+    },
+}
+
+impl InvalidPathReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::UnsupportedJsonPath { .. } => "unsupported_json_path",
+            Self::UnexpectedDot { .. } => "unexpected_dot",
+            Self::DotBeforeBracket { .. } => "dot_before_bracket",
+            Self::MissingDot { .. } => "missing_dot",
+            Self::InvalidBareKey { .. } => "invalid_bare_key",
+            Self::TrailingDot { .. } => "trailing_dot",
+            Self::UnclosedBracket { .. } => "unclosed_bracket",
+            Self::MissingQuotedKey { .. } => "missing_quoted_key",
+            Self::InvalidQuotedKey { .. } => "invalid_quoted_key_json",
+            Self::QuotedKeyMissingClose { .. } => "quoted_key_missing_close",
+            Self::InvalidBracket { .. } => "invalid_bracket",
+            Self::IndexOutOfRange { .. } => "index_out_of_range",
+        }
+    }
+
+    fn offset(self) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::UnsupportedJsonPath { offset }
+            | Self::UnexpectedDot { offset }
+            | Self::DotBeforeBracket { offset }
+            | Self::MissingDot { offset }
+            | Self::InvalidBareKey { offset }
+            | Self::TrailingDot { offset }
+            | Self::UnclosedBracket { offset }
+            | Self::MissingQuotedKey { offset }
+            | Self::InvalidQuotedKey { offset, .. }
+            | Self::QuotedKeyMissingClose { offset }
+            | Self::InvalidBracket { offset }
+            | Self::IndexOutOfRange { offset } => Some(offset),
+        }
+    }
+
+    fn safe_detail(self) -> String {
+        let mut detail = format!("path_error={}", self.code());
+        if let Some(offset) = self.offset() {
+            detail.push_str(&format!("; byte_offset={offset}"));
+        }
+        if let Self::InvalidQuotedKey {
+            classification,
+            line,
+            column,
+            ..
+        } = self
+        {
+            detail.push_str(&format!(
+                "; json_class={classification}; json_line={line}; json_column={column}"
+            ));
+        }
+        detail
+    }
+}
+
+impl fmt::Display for InvalidPathReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
 }
 
 /// 已编译且满足单一 `text` 命名捕获 ABI 的 PCRE2。
@@ -456,7 +574,6 @@ impl CompiledPattern {
             .build(&source)
             .map_err(|error| RulesDefinitionError::InvalidPattern {
                 rule_number,
-                pattern: source.clone(),
                 source: error,
             })?;
         let captures = regex
@@ -468,7 +585,7 @@ impl CompiledPattern {
         if captures.as_slice() != ["text"].as_slice() {
             return Err(RulesDefinitionError::InvalidNamedCaptures {
                 rule_number,
-                captures,
+                actual_count: captures.len(),
             });
         }
 
@@ -527,101 +644,142 @@ pub(crate) enum RulesDefinitionError {
     },
     InvalidFile {
         rule_number: usize,
-        file: String,
     },
     InvalidPath {
         rule_number: usize,
-        path: String,
-        reason: String,
+        reason: InvalidPathReason,
     },
     EmptyPattern {
         rule_number: usize,
     },
     InvalidPattern {
         rule_number: usize,
-        pattern: String,
         source: pcre2::Error,
     },
     InvalidNamedCaptures {
         rule_number: usize,
-        captures: Vec<String>,
+        actual_count: usize,
     },
 }
 
-impl fmt::Display for RulesDefinitionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl RulesDefinitionError {
+    /// 从仍持有解析器类型的位置投影可公开事实；不读取任意错误文本或规则正文。
+    pub(super) fn safe_detail(&self) -> String {
         match self {
-            Self::InvalidToml(error) => write!(formatter, "Rules TOML 无效：{error}"),
-            Self::InvalidCanonicalJson(error) => {
-                write!(formatter, "保存的 Rules canonical JSON 无效：{error}")
+            Self::InvalidToml(source) => {
+                let mut detail = "format=toml; error=syntax_or_schema".to_owned();
+                if let Some(span) = source.span() {
+                    detail.push_str(&format!(
+                        "; byte_start={}; byte_end={}",
+                        span.start, span.end
+                    ));
+                }
+                detail
             }
-            Self::EncodeCanonicalJson(error) => {
-                write!(formatter, "无法编码 Rules canonical JSON：{error}")
+            Self::InvalidCanonicalJson(source) => format!(
+                "format=canonical_json; json_class={}; json_line={}; json_column={}",
+                json_error_classification(source),
+                source.line(),
+                source.column()
+            ),
+            Self::EncodeCanonicalJson(source) => format!(
+                "operation=encode_canonical_json; json_class={}; json_line={}; json_column={}",
+                json_error_classification(source),
+                source.line(),
+                source.column()
+            ),
+            Self::NonCanonicalJson => {
+                "format=canonical_json; error=non_canonical_encoding".to_owned()
             }
-            Self::NonCanonicalJson => formatter.write_str("保存的 Rules 定义不是 canonical JSON"),
-            Self::MissingSource { rule_number } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条规则必须指定 file、plugin 或 code + parameter 来源"
+            Self::MissingSource { rule_number } => {
+                format!("rule={rule_number}; field=source; error=missing")
+            }
+            Self::ConflictingSources { rule_number } => format!(
+                "rule={rule_number}; field=source; error=conflicting_file_plugin_or_command"
             ),
-            Self::ConflictingSources { rule_number } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条规则只能选择 file、plugin 或 code + parameter 中的一种来源"
+            Self::ParameterWithoutCode { rule_number } => format!(
+                "rule={rule_number}; source=non_command; field=parameter; error=requires_code"
             ),
-            Self::ParameterWithoutCode { rule_number } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条规则的 parameter 只能与 code 一起使用"
-            ),
-            Self::MissingParameter { rule_number } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条 code 来源缺少 parameter"
-            ),
-            Self::InvalidCode { rule_number, code } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条规则的事件 code 必须为非负整数，实际为 {code}"
+            Self::MissingParameter { rule_number } => {
+                format!("rule={rule_number}; source=command; field=parameter; error=missing")
+            }
+            Self::InvalidCode { rule_number, code } => format!(
+                "rule={rule_number}; source=command; field=code; actual={code}; expected=non_negative_integer"
             ),
             Self::MissingPath {
                 rule_number,
                 source,
-            } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条 {source} 来源必须指定 path"
+            } => format!(
+                "rule={rule_number}; source={source}; target=path; field=path; error=missing"
             ),
-            Self::EmptyField { rule_number, field } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条规则的 {field} 不能为空"
-            ),
-            Self::InvalidFile { rule_number, file } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条规则的 file 不是安全的精确 .json 基名或 Map*.json：{file}"
+            Self::EmptyField { rule_number, field } => {
+                format!("rule={rule_number}; field={field}; error=empty")
+            }
+            Self::InvalidFile { rule_number, .. } => format!(
+                "rule={rule_number}; source=file; field=file; error=unsafe_data_file_name; expected=exact_json_basename_or_map_wildcard"
             ),
             Self::InvalidPath {
                 rule_number,
-                path,
                 reason,
-            } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条规则的路径 {path} 无效：{reason}"
+                ..
+            } => format!(
+                "rule={rule_number}; target=path; field=path; {}",
+                reason.safe_detail()
             ),
-            Self::EmptyPattern { rule_number } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条规则的 pattern 不能是空字符串"
-            ),
+            Self::EmptyPattern { rule_number } => {
+                format!("rule={rule_number}; field=pattern; error=empty")
+            }
             Self::InvalidPattern {
                 rule_number,
-                pattern,
                 source,
-            } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条规则的 PCRE2 pattern 无效 {pattern:?}：{source}"
+                ..
+            } => format!(
+                "rule={rule_number}; field=pattern; error=invalid_pcre2; {}",
+                pcre2_error_detail(source)
             ),
             Self::InvalidNamedCaptures {
                 rule_number,
-                captures,
-            } => write!(
-                formatter,
-                "Rules 第 {rule_number} 条 pattern 必须有且只有一个 text 命名捕获，实际为 {captures:?}"
+                actual_count,
+            } => format!(
+                "rule={rule_number}; field=pattern.named_captures; error=expected_only_text; actual_count={}",
+                actual_count
             ),
         }
+    }
+}
+
+pub(super) fn pcre2_error_detail(source: &pcre2::Error) -> String {
+    let kind = match source.kind() {
+        pcre2::ErrorKind::Compile => "compile",
+        pcre2::ErrorKind::JIT => "jit",
+        pcre2::ErrorKind::Match => "match",
+        pcre2::ErrorKind::Info => "info",
+        pcre2::ErrorKind::Option => "option",
+        _ => "unknown",
+    };
+    let mut detail = format!("pcre2_kind={kind}; pcre2_code={}", source.code());
+    if let Some(offset) = source.offset() {
+        detail.push_str(&format!("; pcre2_offset={offset}"));
+    }
+    detail
+}
+
+fn json_error_classification(source: &serde_json::Error) -> &'static str {
+    match source.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    }
+}
+
+impl fmt::Display for RulesDefinitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Rules definition invalid: {}",
+            self.safe_detail()
+        )
     }
 }
 

@@ -50,6 +50,63 @@ const LUA_EXAMPLES: [(&str, &[&str]); 4] = [
     ),
 ];
 
+const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 9] = [
+    (
+        "config.example.toml",
+        "src/application/config.rs",
+        "include_str!(\"../../config.example.toml\")",
+        "fn repository_example_is_valid_for_every_command()",
+    ),
+    (
+        "mv-dialogue.toml",
+        "src/rpg_maker/dialogue.rs",
+        "include_str!(\"../../docs/rpg-maker/examples/mv-dialogue.toml\")",
+        "fn documented_mv_dialogue_definition_uses_the_production_parser_and_compiler()",
+    ),
+    (
+        "extract-rules.toml",
+        "src/rpg_maker/extract/rules/definition.rs",
+        "include_str!(\"../../../../docs/rpg-maker/examples/extract-rules.toml\")",
+        "fn documented_extract_rules_use_the_production_parser_and_compiler()",
+    ),
+    (
+        "placeholders.toml",
+        "src/rpg_maker/translate/planning_resource.rs",
+        "include_bytes!(\"../../../docs/rpg-maker/examples/placeholders.toml\")",
+        "fn documented_placeholder_rules_use_the_production_parser_and_compiler()",
+    ),
+    (
+        "terminology.toml",
+        "src/rpg_maker/translate/planning_resource.rs",
+        "include_bytes!(\"../../../docs/rpg-maker/examples/terminology.toml\")",
+        "fn documented_terminology_uses_the_production_parser_and_compiler()",
+    ),
+    (
+        "lua-standard-data-file.lua",
+        "src/rpg_maker/lua/lua54.rs",
+        "include_str!(\"../../../docs/rpg-maker/examples/lua-standard-data-file.lua\")",
+        "async fn documented_custom_data_file_example_executes_in_the_real_vm()",
+    ),
+    (
+        "lua-translate-state.lua",
+        "src/rpg_maker/lua/lua54.rs",
+        "include_str!(\"../../../docs/rpg-maker/examples/lua-translate-state.lua\")",
+        "async fn documented_translate_state_and_idempotent_write_back_examples_execute()",
+    ),
+    (
+        "lua-idempotent-write-back.lua",
+        "src/rpg_maker/lua/lua54.rs",
+        "include_str!(\"../../../docs/rpg-maker/examples/lua-idempotent-write-back.lua\")",
+        "async fn documented_translate_state_and_idempotent_write_back_examples_execute()",
+    ),
+    (
+        "lua-complex-protocol.lua",
+        "src/rpg_maker/lua/lua54.rs",
+        "include_str!(\"../../../docs/rpg-maker/examples/lua-complex-protocol.lua\")",
+        "async fn documented_complex_protocol_executes_all_three_phases_with_private_sqlite_state()",
+    ),
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExampleKind {
     Valid,
@@ -76,24 +133,49 @@ struct FencedExample {
     opening_line: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigurationExampleKind {
+    ProductionMinimalInit,
+    Fragment,
+}
+
+impl ConfigurationExampleKind {
+    fn parse(line: &str) -> Option<Self> {
+        match line.trim() {
+            "<!-- att-config-example: production-minimal-init -->" => {
+                Some(Self::ProductionMinimalInit)
+            }
+            "<!-- att-config-example: fragment -->" => Some(Self::Fragment),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConfigurationExample {
+    kind: ConfigurationExampleKind,
+    body: String,
+    opening_line: usize,
+}
+
 #[test]
-fn rpg_maker_markdown_local_links_resolve_to_existing_files() {
-    let documentation_root = documentation_root();
-    let markdown_files = collect_files_with_extension(&documentation_root, "md");
+fn current_markdown_local_links_resolve_to_existing_files_and_anchors() {
+    let markdown_files = current_markdown_files();
     assert!(
         !markdown_files.is_empty(),
-        "RPG Maker 文档目录至少应包含一个 Markdown 文件"
+        "当前文档范围至少应包含一个 Markdown 文件"
     );
 
     let mut failures = Vec::new();
     for markdown_path in markdown_files {
         let source = read_utf8(&markdown_path);
         for (line_number, target) in local_markdown_links(&source) {
-            let file_target = target.split('#').next().unwrap_or_default();
-            if file_target.is_empty() {
-                continue;
-            }
-            if file_target.contains('%') {
+            let (file_target, anchor) = target
+                .split_once('#')
+                .map_or((target.as_str(), None), |(file, anchor)| {
+                    (file, Some(anchor))
+                });
+            if target.contains('%') {
                 failures.push(format!(
                     "{}:{line_number}: 本地链接必须直接使用 UTF-8 路径，不能依赖百分号解码：{target}",
                     display_relative(&markdown_path)
@@ -101,10 +183,14 @@ fn rpg_maker_markdown_local_links_resolve_to_existing_files() {
                 continue;
             }
 
-            let linked_path = markdown_path
-                .parent()
-                .expect("Markdown 文件始终有父目录")
-                .join(file_target);
+            let linked_path = if file_target.is_empty() {
+                markdown_path.clone()
+            } else {
+                markdown_path
+                    .parent()
+                    .expect("Markdown 文件始终有父目录")
+                    .join(file_target)
+            };
             if is_absolute_or_escaping(&linked_path, workspace_root()) {
                 failures.push(format!(
                     "{}:{line_number}: 本地链接不得逃出项目工作区：{target}",
@@ -115,13 +201,34 @@ fn rpg_maker_markdown_local_links_resolve_to_existing_files() {
                     "{}:{line_number}: 本地链接目标不存在：{target}",
                     display_relative(&markdown_path)
                 ));
+            } else if let Some(anchor) = anchor {
+                if anchor.is_empty() {
+                    failures.push(format!(
+                        "{}:{line_number}: Markdown 锚点不能为空：{target}",
+                        display_relative(&markdown_path)
+                    ));
+                } else if linked_path.extension().and_then(|value| value.to_str()) != Some("md") {
+                    failures.push(format!(
+                        "{}:{line_number}: 只有 Markdown 目标支持锚点校验：{target}",
+                        display_relative(&markdown_path)
+                    ));
+                } else {
+                    let linked_source = read_utf8(&linked_path);
+                    let anchors = markdown_heading_anchors(&linked_source);
+                    if !anchors.contains(anchor) {
+                        failures.push(format!(
+                            "{}:{line_number}: Markdown 锚点不存在：{target}",
+                            display_relative(&markdown_path)
+                        ));
+                    }
+                }
             }
         }
     }
 
     assert!(
         failures.is_empty(),
-        "RPG Maker 文档包含无效本地链接：\n{}",
+        "当前文档包含无效本地链接：\n{}",
         failures.join("\n")
     );
 }
@@ -221,6 +328,78 @@ fn complete_toml_examples_are_utf8_parseable_and_listed_in_the_manifest() {
             )
         });
     }
+}
+
+#[test]
+fn repository_examples_remain_wired_into_production_contract_tests() {
+    // 这里只固定“示例仍由真实边界消费”。字段语义继续由各生产解析器和真实 Lua VM
+    // 测试负责，避免在文档测试里复制第二套解析规则。
+    for (example, source_path, include_expression, contract_test) in PRODUCTION_EXAMPLE_BINDINGS {
+        let source_path = workspace_root().join(source_path);
+        let source = read_utf8(&source_path).replace("\r\n", "\n");
+        assert!(
+            source.contains(include_expression),
+            "{example} 必须继续由 {} 直接 include",
+            display_relative(&source_path)
+        );
+        assert!(
+            source.contains(contract_test),
+            "{example} 必须继续由 {} 的生产契约测试消费",
+            display_relative(&source_path)
+        );
+    }
+}
+
+#[test]
+fn runtime_toml_examples_are_explicitly_classified() {
+    let runtime_root = workspace_root().join("docs/runtime");
+    let markdown_files = collect_files_with_extension(&runtime_root, "md");
+    let production_configuration_source =
+        read_utf8(&workspace_root().join("src/application/config.rs")).replace("\r\n", "\n");
+    let mut production_examples = 0_usize;
+    let mut fragments = 0_usize;
+
+    for markdown_path in markdown_files {
+        let source = read_utf8(&markdown_path);
+        for example in parse_configuration_examples(&markdown_path, &source) {
+            toml::from_str::<TomlValue>(&example.body).unwrap_or_else(|error| {
+                panic!(
+                    "{}:{} 的配置示例必须至少是完整 TOML 语法：{error}",
+                    display_relative(&markdown_path),
+                    example.opening_line
+                )
+            });
+
+            match example.kind {
+                ConfigurationExampleKind::ProductionMinimalInit => {
+                    production_examples += 1;
+                    let production_fixture = format!("r#\"\n{}\"#", example.body);
+                    assert!(
+                        production_configuration_source.contains(&production_fixture),
+                        "{}:{} 的 production-minimal-init 必须与生产配置测试的输入完全一致",
+                        display_relative(&markdown_path),
+                        example.opening_line
+                    );
+                    assert!(
+                        production_configuration_source.contains(
+                            "fn non_translate_commands_load_their_minimal_configuration()"
+                        ),
+                        "生产配置测试必须继续用当前 schema 验证最小 Init 配置"
+                    );
+                }
+                ConfigurationExampleKind::Fragment => fragments += 1,
+            }
+        }
+    }
+
+    assert_ne!(
+        production_examples, 0,
+        "runtime 文档至少应保留一个由生产配置 schema 覆盖的完整示例"
+    );
+    assert_ne!(
+        fragments, 0,
+        "runtime 文档中的组合片段必须通过 fragment 标记明确跳过生产 schema 校验"
+    );
 }
 
 #[test]
@@ -442,6 +621,62 @@ fn parse_classified_fences(path: &Path, source: &str) -> Vec<FencedExample> {
     examples
 }
 
+fn parse_configuration_examples(path: &Path, source: &str) -> Vec<ConfigurationExample> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut examples = Vec::new();
+    let mut index = 0_usize;
+    while index < lines.len() {
+        let line = lines[index];
+        if ConfigurationExampleKind::parse(line).is_some() {
+            assert!(
+                lines
+                    .get(index + 1)
+                    .is_some_and(|line| line.starts_with("```toml")),
+                "{}:{} 的 att-config-example 标记必须紧邻 TOML fenced code block",
+                display_relative(path),
+                index + 1
+            );
+        }
+        if !line.starts_with("```") || line == "```" {
+            index += 1;
+            continue;
+        }
+
+        let opening_line = index + 1;
+        let language = line.trim_start_matches('`').trim();
+        index += 1;
+        let body_start = index;
+        while index < lines.len() && lines[index] != "```" {
+            index += 1;
+        }
+        assert!(
+            index < lines.len(),
+            "{}:{opening_line} 的代码块没有闭合",
+            display_relative(path)
+        );
+        if language == "toml" {
+            let kind = body_start
+                .checked_sub(2)
+                .and_then(|marker| ConfigurationExampleKind::parse(lines[marker]))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}:{opening_line} 的 runtime TOML 缺少紧邻的 att-config-example 分类",
+                        display_relative(path)
+                    )
+                });
+            let mut body = lines[body_start..index].join("\n");
+            body.push('\n');
+            examples.push(ConfigurationExample {
+                kind,
+                body,
+                opening_line,
+            });
+        }
+        index += 1;
+    }
+    examples
+}
+
 fn local_markdown_links(source: &str) -> Vec<(usize, String)> {
     let mut links = Vec::new();
     let mut in_fence = false;
@@ -471,7 +706,6 @@ fn local_markdown_links(source: &str) -> Vec<(usize, String)> {
                         .unwrap_or_default()
                 });
             if !target.is_empty()
-                && !target.starts_with('#')
                 && !target.starts_with("http://")
                 && !target.starts_with("https://")
                 && !target.starts_with("mailto:")
@@ -482,6 +716,76 @@ fn local_markdown_links(source: &str) -> Vec<(usize, String)> {
         }
     }
     links
+}
+
+fn markdown_heading_anchors(source: &str) -> BTreeSet<String> {
+    let mut anchors = BTreeSet::new();
+    let mut occurrences = BTreeMap::<String, usize>::new();
+    let mut in_fence = false;
+
+    for line in source.lines() {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        let trimmed = line.trim_start();
+        let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+        if !(1..=6).contains(&level)
+            || !trimmed
+                .as_bytes()
+                .get(level)
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            continue;
+        }
+        let heading = trimmed[level..].trim().trim_end_matches('#').trim_end();
+        let base = markdown_heading_slug(heading);
+        if base.is_empty() {
+            continue;
+        }
+        let occurrence = occurrences.entry(base.clone()).or_default();
+        let anchor = if *occurrence == 0 {
+            base
+        } else {
+            format!("{base}-{occurrence}")
+        };
+        *occurrence += 1;
+        anchors.insert(anchor);
+    }
+
+    anchors
+}
+
+fn markdown_heading_slug(heading: &str) -> String {
+    let mut slug = String::new();
+    for character in heading.chars() {
+        if character.is_alphanumeric() || matches!(character, '-' | '_') {
+            slug.extend(character.to_lowercase());
+        } else if character.is_whitespace() {
+            slug.push('-');
+        }
+    }
+    slug
+}
+
+fn current_markdown_files() -> Vec<PathBuf> {
+    let root = workspace_root();
+    let mut files = vec![root.join("README.md")];
+    files.extend(collect_files_with_extension(
+        &root.join("docs/runtime"),
+        "md",
+    ));
+    files.extend(collect_files_with_extension(
+        &root.join("docs/rpg-maker"),
+        "md",
+    ));
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn collect_files_with_extension(root: &Path, extension: &str) -> Vec<PathBuf> {

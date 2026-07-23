@@ -6,7 +6,13 @@ use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
+    SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::OperationCompletion;
+use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingError;
 use crate::rpg_maker::lua::runtime::{
     OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaOutputEntry, TrustedLuaOutputEntryKind,
     TrustedLuaWriteBackHostCalls, TrustedLuaWriteBackLayoutPair, TrustedLuaWriteBackLayoutRegion,
@@ -26,7 +32,7 @@ use crate::storage::scoped_path::{ExactPathCaseMismatch, resolve_exact_directory
 use super::standard::{
     RpgMakerLayoutTextPair, RpgMakerTextLayoutOutcome, RpgMakerWriteBackLayoutRegion,
 };
-use super::{LuaWriteBack, PreparedWriteBackCandidate};
+use super::{LuaWriteBack, PreparedWriteBackCandidate, WriteBackLuaDiagnostic};
 
 /// 允许 Lua scope 绑定到候选、但不交出 Publisher 终结权的窄交接面。
 pub(crate) trait ScopedPreparedWriteBackCandidate<S>: PreparedWriteBackCandidate
@@ -538,6 +544,127 @@ where
     }
 }
 
+impl<O, R, E> LuaWriteBackServiceError<TrustedLuaExecutionHostingError<O, R>, E>
+where
+    O: SafeDiagnosticSource,
+    R: SafeDiagnosticSource,
+    E: SafeDiagnosticSource,
+{
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        match self {
+            Self::CandidateProjectMismatch {
+                project_root,
+                candidate_root,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackCandidate,
+                DiagnosticStage::WriteBack,
+                DiagnosticSubject::path(candidate_root),
+                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackCandidateProjectMismatch),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::ReportBug,
+            )
+            .with_recovery(RecoveryFact::path(project_root)),
+            Self::ExecuteHost {
+                script_path,
+                candidate_root,
+                source,
+            } => source
+                .safe_diagnostic(
+                    DiagnosticStage::WriteBack,
+                    script_path,
+                    DiagnosticImpact::Unchanged,
+                )
+                .with_recovery(RecoveryFact::path(candidate_root)),
+            Self::BindCandidate {
+                candidate_root,
+                source,
+            } => scoped_bind_diagnostic(source, candidate_root),
+            Self::UnexpectedOutcome {
+                script_path,
+                candidate_root,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::WriteBackCandidate,
+                DiagnosticStage::WriteBack,
+                DiagnosticSubject::path(script_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackUnexpectedLuaOutcome),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::ReportBug,
+            )
+            .with_recovery(RecoveryFact::path(candidate_root)),
+        }
+    }
+}
+
+impl<O, R, E> WriteBackLuaDiagnostic
+    for LuaWriteBackServiceError<TrustedLuaExecutionHostingError<O, R>, E>
+where
+    O: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    R: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    E: Error + SafeDiagnosticSource + Send + Sync + 'static,
+{
+    fn into_write_back_failure_report(self) -> FailureReport {
+        match self {
+            Self::ExecuteHost {
+                script_path,
+                candidate_root,
+                source,
+            } => source
+                .into_failure_report(
+                    DiagnosticStage::WriteBack,
+                    &script_path,
+                    DiagnosticImpact::Unchanged,
+                )
+                .with_primary_recovery(RecoveryFact::path(candidate_root)),
+            source => {
+                let diagnostic = source.safe_diagnostic();
+                FailureReport::new(ReportedFailure::new(diagnostic, source))
+            }
+        }
+    }
+}
+
+fn scoped_bind_diagnostic<E>(
+    source: &ScopedDirectoryBindError<E>,
+    candidate_root: &Path,
+) -> SafeDiagnostic
+where
+    E: SafeDiagnosticSource,
+{
+    match source {
+        ScopedDirectoryBindError::WrongEditorInstance => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackCandidate,
+            DiagnosticStage::WriteBack,
+            DiagnosticSubject::path(candidate_root),
+            DiagnosticReason::failure(DiagnosticFailureKind::WrongPublisherInstance),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::ReportBug,
+        ),
+        ScopedDirectoryBindError::CandidateFinalized { root } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackCandidate,
+            DiagnosticStage::WriteBack,
+            DiagnosticSubject::path(root),
+            DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::ReportBug,
+        ),
+        ScopedDirectoryBindError::CandidateIdentityChanged { root } => SafeDiagnostic::new(
+            DiagnosticCode::WriteBackCandidate,
+            DiagnosticStage::WriteBack,
+            DiagnosticSubject::path(root),
+            DiagnosticReason::failure(DiagnosticFailureKind::FileIdentityChanged),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        ),
+        ScopedDirectoryBindError::Failed { root, source } => source
+            .safe_diagnostic_source(
+                DiagnosticStage::WriteBack,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            )
+            .with_recovery(RecoveryFact::path(root)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -772,17 +899,14 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windows_candidate_does_not_overwrite_a_case_aliased_output_file() {
-        use std::fs;
-        use std::time::Duration;
-
         use crate::runtime::filesystem::{
-            DirectoryPublisherConfig, ExclusiveFileLeaseConfig, SystemFileSystem,
-            SystemFileSystemConfig, TreeBudget,
+            DirectoryPublisherConfig, SystemFileSystem, SystemFileSystemConfig,
         };
         use crate::storage::file_system::{
             DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
             RecoverableDirectoryPublisher,
         };
+        use std::fs;
 
         let workspace = tempfile::tempdir().expect("应建立 Windows 候选测试目录");
         let source = workspace.path().join("source");
@@ -792,25 +916,11 @@ mod tests {
         fs::create_dir_all(&source_js).expect("应建立来源 js");
         fs::write(source_data.join("Items.json"), b"original").expect("应建立大小写精确的来源文件");
 
-        let file_system = SystemFileSystem::new(
-            SystemFileSystemConfig::new(
-                2,
-                8,
-                1024 * 1024,
-                128,
-                TreeBudget::new(128, 16, 1024 * 1024, 512 * 1024).expect("测试目录预算应合法"),
-                ExclusiveFileLeaseConfig::new(Duration::from_secs(1)).expect("测试租约应合法"),
-            )
-            .expect("测试文件系统配置应合法"),
-        )
-        .expect("应建立生产文件系统根");
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("应建立生产文件系统根");
         let publisher = file_system.directory_publisher(
-            DirectoryPublisherConfig::new(
-                workspace.path().join("locks"),
-                8,
-                Duration::from_secs(1),
-            )
-            .expect("测试发布配置应合法"),
+            DirectoryPublisherConfig::production(workspace.path().join("locks"))
+                .expect("测试发布配置应合法"),
         );
         let request = DirectoryStageRequest::new(
             workspace.path().join("write_back"),
@@ -875,17 +985,14 @@ mod tests {
 
     #[cfg(windows)]
     async fn assert_real_candidate_roots_are_read_only(layout: crate::rpg_maker::RpgMakerLayout) {
-        use std::fs;
-        use std::time::Duration;
-
         use crate::runtime::filesystem::{
-            DirectoryPublisherConfig, ExclusiveFileLeaseConfig, SystemFileSystem,
-            SystemFileSystemConfig, TreeBudget,
+            DirectoryPublisherConfig, SystemFileSystem, SystemFileSystemConfig,
         };
         use crate::storage::file_system::{
             DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
             RecoverableDirectoryPublisher,
         };
+        use std::fs;
 
         let workspace = tempfile::tempdir().expect("应建立候选根修改测试目录");
         let source_data = workspace.path().join("source-data");
@@ -895,25 +1002,11 @@ mod tests {
         fs::write(source_data.join("Items.json"), b"{}").expect("应建立来源 data 文件");
         fs::write(source_js.join("plugins.js"), b"var $plugins = [];").expect("应建立来源 js 文件");
 
-        let file_system = SystemFileSystem::new(
-            SystemFileSystemConfig::new(
-                2,
-                8,
-                1024 * 1024,
-                128,
-                TreeBudget::new(128, 16, 1024 * 1024, 512 * 1024).expect("测试目录预算应合法"),
-                ExclusiveFileLeaseConfig::new(Duration::from_secs(1)).expect("测试租约应合法"),
-            )
-            .expect("测试文件系统配置应合法"),
-        )
-        .expect("应建立生产文件系统根");
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("应建立生产文件系统根");
         let publisher = file_system.directory_publisher(
-            DirectoryPublisherConfig::new(
-                workspace.path().join("locks"),
-                8,
-                Duration::from_secs(1),
-            )
-            .expect("测试发布配置应合法"),
+            DirectoryPublisherConfig::production(workspace.path().join("locks"))
+                .expect("测试发布配置应合法"),
         );
         let request = DirectoryStageRequest::new(
             workspace.path().join("write_back"),
@@ -1049,6 +1142,24 @@ mod tests {
 
     impl Error for FakeError {}
 
+    impl SafeDiagnosticSource for FakeError {
+        fn safe_diagnostic_source(
+            &self,
+            stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+            action: DiagnosticAction,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                stage,
+                DiagnosticSubject::component("fake Lua root"),
+                DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+                impact,
+                action,
+            )
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeEditorError;
 
@@ -1059,6 +1170,24 @@ mod tests {
     }
 
     impl Error for FakeEditorError {}
+
+    impl SafeDiagnosticSource for FakeEditorError {
+        fn safe_diagnostic_source(
+            &self,
+            stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+            action: DiagnosticAction,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                stage,
+                DiagnosticSubject::component("fake candidate editor"),
+                DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+                impact,
+                action,
+            )
+        }
+    }
 
     #[derive(Clone, Default)]
     struct FakeEditor {
@@ -1127,15 +1256,6 @@ mod tests {
             } else {
                 Ok(BoundScopedDirectory::new(root, scope, ()))
             })
-        }
-
-        fn validate_scoped_directory(
-            &self,
-            _scope: &BoundScopedDirectory<Self::ScopeState>,
-        ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>>
-        + Send
-        + use<> {
-            std::future::ready(Ok(()))
         }
 
         fn read_scoped_file(

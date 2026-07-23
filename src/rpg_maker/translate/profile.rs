@@ -174,7 +174,6 @@ impl RpgMakerTranslationRequestConfiguration {
 /// 展示 LLM Client，避免其中的凭据进入诊断。
 pub(crate) struct RpgMakerTranslationProfile<L> {
     id: String,
-    max_in_flight_tasks: NonZeroUsize,
     planning: RpgMakerTranslationPlanningConfiguration,
     request: RpgMakerTranslationRequestConfiguration,
     llm_client: Arc<L>,
@@ -183,14 +182,12 @@ pub(crate) struct RpgMakerTranslationProfile<L> {
 impl<L> RpgMakerTranslationProfile<L> {
     pub(crate) fn new(
         id: impl Into<String>,
-        max_in_flight_tasks: NonZeroUsize,
         planning: RpgMakerTranslationPlanningConfiguration,
         request: RpgMakerTranslationRequestConfiguration,
         llm_client: Arc<L>,
     ) -> Self {
         Self {
             id: id.into(),
-            max_in_flight_tasks,
             planning,
             request,
             llm_client,
@@ -199,10 +196,6 @@ impl<L> RpgMakerTranslationProfile<L> {
 
     pub(crate) fn id(&self) -> &str {
         &self.id
-    }
-
-    pub(crate) const fn max_in_flight_tasks(&self) -> NonZeroUsize {
-        self.max_in_flight_tasks
     }
 
     pub(crate) fn planning(&self) -> &RpgMakerTranslationPlanningConfiguration {
@@ -227,7 +220,6 @@ impl<L> fmt::Debug for RpgMakerTranslationProfile<L> {
         formatter
             .debug_struct("RpgMakerTranslationProfile")
             .field("id", &self.id)
-            .field("max_in_flight_tasks", &self.max_in_flight_tasks)
             .field("planning", &self.planning)
             .field("request", &self.request)
             .field("llm_client", &"[REDACTED]")
@@ -260,7 +252,6 @@ mod tests {
     fn profile(secret: &'static str) -> RpgMakerTranslationProfile<SensitiveClient> {
         RpgMakerTranslationProfile::new(
             "primary",
-            non_zero(3),
             RpgMakerTranslationPlanningConfiguration::new(non_zero(24_000)),
             RpgMakerTranslationRequestConfiguration::new(
                 vec![Duration::from_millis(250), Duration::from_secs(2)],
@@ -303,7 +294,6 @@ mod tests {
     fn profile_keeps_every_external_strategy_without_owning_prompt() {
         let profile = profile("secret");
         assert_eq!(profile.id(), "primary");
-        assert_eq!(profile.max_in_flight_tasks(), non_zero(3));
         assert_eq!(
             profile.planning().max_message_characters(),
             non_zero(24_000)

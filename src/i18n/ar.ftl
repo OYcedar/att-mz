@@ -50,21 +50,6 @@ cli-argument-conflict = لا يمكن استخدام { $argument } مع الوس
 cli-wrong-number-of-values = تم توفير عدد غير صحيح من القيم لـ { $argument }.
 cli-invalid-utf8 = أحد وسائط سطر الأوامر ليس Unicode صالحًا.
 cli-parse-failure = تعذر تحليل سطر الأوامر.
-error-configuration-or-input-generic = الإعداد أو إدخال الأمر غير صالح، لذلك لم يتغير شيء. تحقق من الخيارات وحقول الإعداد المشار إليها ثم أعد المحاولة.
-error-config-current-directory-not-absolute = لا يستطيع ATT تحديد --config لأن دليل العمل الحالي { $path } ليس مسارًا مطلقًا. شغّل ATT من دليل صالح أو مرّر مسار إعداد مطلقًا.
-error-config-empty-path = لا يجوز أن يكون --config فارغًا. مرّر مسار ملف إعداد ATT.
-error-config-open = لا يستطيع ATT فتح ملف الإعداد { $path }. تحقق من وجود الملف ومن صلاحية قراءته.
-error-config-not-a-file = مسار الإعداد { $path } ليس ملفًا عاديًا. مرّر ملف إعداد بدلًا من دليل أو ملف خاص.
-error-config-too-large = حجم ملف الإعداد { $path } هو { $observed } بايت، والحد { $maximum } بايت. صغّر الملف ثم أعد المحاولة.
-error-config-read = لا يستطيع ATT قراءة ملف الإعداد { $path }. تحقق من الصلاحيات وحالة التخزين ثم أعد المحاولة.
-error-config-invalid-utf8-known-length = ملف الإعداد { $path } ليس UTF-8 صالحًا. طول البادئة الصالحة { $valid } بايت وطول التسلسل غير الصالح { $length } بايت. احفظ الملف بترميز UTF-8 ثم أعد المحاولة.
-error-config-invalid-utf8-unknown-length = ملف الإعداد { $path } ليس UTF-8 صالحًا بعد البايت { $valid }. احفظ الملف بترميز UTF-8 ثم أعد المحاولة.
-error-config-invalid-toml-at = يحتوي ملف الإعداد { $path } عند السطر { $line } والعمود { $column } على TOML غير صالح في { $resource }. صحح ذلك القسم وفق عقد الإعداد الحالي ثم أعد المحاولة.
-error-config-invalid-toml = يحتوي ملف الإعداد { $path } على TOML غير صالح في { $resource }. صحح ذلك القسم وفق عقد الإعداد الحالي ثم أعد المحاولة.
-error-config-invalid-value = قيمة حقل الإعداد { $field } غير صالحة. راجع الحقل في وثائق الإعداد الحالية ثم أعد المحاولة.
-error-config-invalid-value-at-path = قيمة حقل الإعداد { $field } في { $path } غير صالحة. راجع الحقل في وثائق الإعداد الحالية ثم أعد المحاولة.
-error-config-profile-not-found = لا يحتوي ملف الإعداد { $path } على Profile ترجمة باسم { $profile }. أضفه أو مرّر معرّف Profile موجود.
-error-config-profile-conflict = طلب ملف الإعداد { $path } Profile { $requested }، لكن الأمر اختار { $explicit }. وحّد الاختيارين أو أزل أحدهما.
 log-label-phase-check-project = فحص المشروع
 log-label-phase-scan-source = فحص المصدر
 log-label-phase-prepare-candidate = إعداد المرشح
@@ -84,19 +69,7 @@ log-label-task-complete = مكتمل
 log-label-task-partial = جزئي
 log-label-task-unavailable = غير متاح
 log-label-task-failed = فشل
-error-project-unavailable = المشروع غير موجود أو مشغول. تحقق من الاسم وأعد المحاولة بعد انتهاء التشغيل الآخر.
-error-project-state = حالة المشروع تالفة أو الاستخراج قديم. أعد تشغيل أمر Init أو Extract المعني.
-error-external-model = خدمة النموذج غير متاحة. تحقق من Profile والشبكة ثم أعد المحاولة.
 error-state-applied-finalization = طُبقت النتيجة لكن الإنهاء فشل. افحص حالة المشروع قبل إعادة المحاولة.
-error-outcome-unknown = تعذر تأكيد النتيجة النهائية. احتفظ بمساحة العمل وافحص معلومات الاسترداد قبل إعادة المحاولة.
-error-internal = واجه ATT عطلًا داخليًا. لم تُعرض أسرار أو محتويات للنموذج.
-error-shutdown = فشل الإنهاء الإلزامي لبيئة التشغيل.
-error-no-reusable-extract-plan = لا توجد للمشروع خطة Extract محفوظة. قدّم واحدًا على الأقل من --builtin أو --rules أو --lua.
-error-init-path-required = لا يوجد للمشروع مسار مصدر Init محفوظ. قدّم --path <DIR>.
-error-profile-required = لا يوجد للمشروع Profile Translate محفوظ. قدّم PROFILE_ID.
-error-saved-profile-unavailable = Profile المحفوظ { $profile } غير موجود في الإعداد الحالي. مرّر Profile صالحًا صراحةً.
-error-rpg-maker-prompt-unavailable = تعذر استخدام مكوّن موجه RPG Maker { $component } للإعداد المحلي المحدد { $locale } في { $path }، لذلك لم تبدأ الترجمة. تأكد من أن المسار يشير إلى ملف عادي يحتوي على نص UTF-8 غير فارغ، وأن القالب صالح.
-error-rpg-maker-language-module-unavailable = وحدة اللغة المصدر المطلوبة للزوج اللغوي { $source } → { $target } مفقودة، لذلك لم تبدأ الترجمة. أضف الوحدة إلى الإعداد الحالي ثم أعد المحاولة.
 error-no-executable-extract-owner = لم يبقَ بعد المسح أي owner Extract قابل للتنفيذ، لذلك لم تُحفظ الخطة.
 error-plan-save-failed-applied = طُبقت نتيجة الأمر لكن خطة التشغيل الجديدة لم تُحفظ. مرّر الخيارات المطلوبة صراحةً في المرة القادمة.
 error-plan-save-outcome-unknown = طُبقت نتيجة الأمر لكن تعذر تأكيد commit خطة التشغيل. مرّر الخيارات المطلوبة صراحةً في المرة القادمة.
@@ -164,9 +137,10 @@ result-translate-plan-sources = حُفظت خطة التشغيل الناجحة 
 log-run-started = بدأ الأمر { $command }.
 log-run-succeeded = اكتمل الأمر { $command } بنجاح.
 log-run-failed = فشل الأمر { $command }.
+log-run-outcome-unknown = انتهى الأمر { $command } لكن النتيجة النهائية غير معروفة؛ اتبع مواقع الاسترداد الواردة في الخطأ.
 log-run-cancelled = أُلغي الأمر { $command }.
+log-performance-counters = عدادات الأداء: محاولات التحكم في معاملات SQLite‏ { $sqlite_control_attempted_total }؛ بدء التحقق الكامل من شجرة المرشح { $candidate_validation_started }، واكتماله { $candidate_validation_completed }.
 log-plan-resolved = حُلّت خطة الأمر { $command } من { $source }.
-log-translate-plan-resolved = حُلّت خطة تشغيل Translate: مصدر Profile هو { $profile_source }، ومصدر Lua هو { $lua_source }.
 log-phase-started = بدأت المرحلة: { $phase }.
 log-phase-finished = اكتملت المرحلة: { $phase }.
 log-retry-summary = { $count ->
@@ -178,6 +152,7 @@ log-retry-summary = { $count ->
    *[other] نُفذت { $count } محاولة.
 }
 log-no-work = لم يلزم أي عمل: { $reason }.
+log-no-work-translation-up-to-date = الترجمات مطابقة بالفعل للمصدر والملف الشخصي الحاليين
 log-partial-result = { $count ->
     [zero] لا توجد نتائج جزئية تحتاج إلى انتباه.
     [one] توجد نتيجة جزئية واحدة تحتاج إلى انتباه.
@@ -186,6 +161,46 @@ log-partial-result = { $count ->
     [many] توجد { $count } نتيجة جزئية تحتاج إلى انتباه.
    *[other] توجد { $count } نتيجة جزئية تحتاج إلى انتباه.
 }
-log-publish-finished = اكتمل نشر الإخراج: { $path }.
 log-translation-task-started = بدأت مهمة الترجمة { $index }/{ $total }.
 log-translation-task-finished = انتهت مهمة الترجمة { $index } بالنتيجة { $outcome }.
+log-translation-task-diagnostic = أبلغت مهمة الترجمة { $index } عن تشخيص بعد { $attempts } محاولات: { $diagnostic }
+diagnostic-title = خطأ [{ $code }]
+diagnostic-stage = المرحلة: { $stage }
+diagnostic-subject = الموقع: { $subject }
+diagnostic-subject-value = { $kind ->
+    [command] الأمر { $value }
+    [field] الحقل { $value }
+    [project] المشروع { $value }
+    [profile] الملف الشخصي { $value }
+    [component] المكوّن { $value }
+   *[other] { $value }
+}
+diagnostic-reason = السبب: { $reason }
+diagnostic-impact = التأثير: { $impact }
+diagnostic-action = الإجراء: { $action }
+diagnostic-recovery = الاسترداد: { $recovery }
+diagnostic-recovery-value = { $kind ->
+    [component] المكوّن { $value }
+    [transaction] المعاملة { $value }
+   *[other] { $value }
+}
+diagnostic-related = الخطأ المرتبط { $index }:
+diagnostic-stage-value = { $code ->
+    [process_output] إخراج العملية
+   *[other] { $fallback }
+}
+diagnostic-impact-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-action-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-failure-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-io-kind-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-configuration-rule-value = { $code ->
+   *[other] { $fallback }{ $facts }
+}

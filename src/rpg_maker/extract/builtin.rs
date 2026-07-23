@@ -4,14 +4,20 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::rpg_maker::dialogue::{
     DialoguePhysicalLine, MvDialogueDefinition, MvDialogueDefinitionError,
-    MvDialogueProjectionError, MvDialogueProjector,
+    MvDialogueProjectionError, MvDialogueProjector, projection_model_detail,
 };
+use crate::rpg_maker::json::StackSafeJsonValue;
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
     DirectTextRecipe, MutationClaim, TextProjectionRecipe, TextUnitContent, TextUnitRole,
@@ -304,18 +310,64 @@ where
     }
 }
 
+impl<RE, SE, CE> BuiltInExtractionError<RE, SE, CE>
+where
+    RE: SafeDiagnosticSource,
+    SE: SafeDiagnosticSource,
+    CpuTaskExecutionError<CE>: SafeDiagnosticSource,
+{
+    /// 在仍持有 Builtin 阶段错误类型时建立唯一公开投影。
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        match self {
+            Self::CompileDialogueDefinition(source) => source.safe_diagnostic_source(
+                DiagnosticStage::Extract,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::ReadDocuments(source) => source.safe_diagnostic_source(
+                DiagnosticStage::Extract,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::ScheduleCompute(source) => source.safe_diagnostic_source(
+                DiagnosticStage::Extract,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            ),
+            Self::MalformedDocument(source) => source.safe_diagnostic_source(
+                DiagnosticStage::Extract,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::BuildSnapshot(source) => snapshot_model_safe_diagnostic(source),
+            Self::ProjectDialogue(source) => source.safe_diagnostic_source(
+                DiagnosticStage::Extract,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::Persist(source) => source
+                .safe_diagnostic_source(
+                    DiagnosticStage::Extract,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckProjectState,
+                )
+                .with_recovery(RecoveryFact::component("owner=builtin")),
+        }
+    }
+}
+
 /// 一个所选标准 RPG Maker 文档不符合固定结构。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BuiltinDocumentError {
     location: String,
-    message: String,
+    reason: BuiltinDocumentFailure,
 }
 
 impl BuiltinDocumentError {
-    fn new(location: impl Into<String>, message: impl Into<String>) -> Self {
+    fn new(location: impl Into<String>, reason: BuiltinDocumentFailure) -> Self {
         Self {
             location: location.into(),
-            message: message.into(),
+            reason,
         }
     }
 
@@ -323,15 +375,338 @@ impl BuiltinDocumentError {
     pub(crate) fn location(&self) -> &str {
         &self.location
     }
+
+    fn reason_detail(&self) -> (DiagnosticFailureKind, String) {
+        match &self.reason {
+            BuiltinDocumentFailure::MissingDocument => (
+                DiagnosticFailureKind::NotFound,
+                "structure=document_missing".to_owned(),
+            ),
+            BuiltinDocumentFailure::ExpectedObject => (
+                DiagnosticFailureKind::InvalidValue,
+                "structure=expected_object".to_owned(),
+            ),
+            BuiltinDocumentFailure::ExpectedArray => (
+                DiagnosticFailureKind::InvalidValue,
+                "structure=expected_array".to_owned(),
+            ),
+            BuiltinDocumentFailure::ExpectedString => (
+                DiagnosticFailureKind::InvalidValue,
+                "structure=expected_string".to_owned(),
+            ),
+            BuiltinDocumentFailure::MissingValue => (
+                DiagnosticFailureKind::MissingRequiredValue,
+                "structure=field_or_element_missing".to_owned(),
+            ),
+            BuiltinDocumentFailure::EventCodeMustBeInteger => (
+                DiagnosticFailureKind::InvalidValue,
+                "structure=event_command; field=code; expected=integer".to_owned(),
+            ),
+            BuiltinDocumentFailure::EventParametersMissing => (
+                DiagnosticFailureKind::MissingRequiredValue,
+                "structure=event_command; field=parameters".to_owned(),
+            ),
+            BuiltinDocumentFailure::EventIndentMustBeInteger => (
+                DiagnosticFailureKind::InvalidValue,
+                "structure=event_command; field=indent; expected=integer".to_owned(),
+            ),
+            BuiltinDocumentFailure::ContinuationWithoutStart { command_code } => (
+                DiagnosticFailureKind::RequirementFailed,
+                format!(
+                    "structure=event_command; command_code={command_code}; required_start_command=missing"
+                ),
+            ),
+            BuiltinDocumentFailure::ChoiceIndexInvalid {
+                actual,
+                option_count,
+            } => (
+                DiagnosticFailureKind::InvalidValue,
+                format!(
+                    "structure=choice_branch; command_code=402; choice_index={}; option_count={option_count}",
+                    actual.map_or_else(|| "not_integer".to_owned(), |value| value.to_string())
+                ),
+            ),
+            BuiltinDocumentFailure::DuplicateChoiceBranch { choice_index } => (
+                DiagnosticFailureKind::ConflictingValues,
+                format!(
+                    "structure=choice_branch; command_code=402; duplicate_choice_index={choice_index}"
+                ),
+            ),
+            BuiltinDocumentFailure::ChoiceBranchTextMismatch { choice_index } => (
+                DiagnosticFailureKind::ConflictingValues,
+                format!(
+                    "structure=choice_branch; command_code=402; choice_index={choice_index}; branch_text=does_not_match_command_102"
+                ),
+            ),
+            BuiltinDocumentFailure::ChoiceEndMissing => (
+                DiagnosticFailureKind::RequirementFailed,
+                "structure=choice_block; start_command=102; end_command=404; state=missing"
+                    .to_owned(),
+            ),
+            BuiltinDocumentFailure::ChoiceBranchesIncomplete { expected, actual } => (
+                DiagnosticFailureKind::RequirementFailed,
+                format!(
+                    "structure=choice_block; start_command=102; branch_command=402; expected_branches={expected}; actual_branches={actual}"
+                ),
+            ),
+        }
+    }
+
+    pub(crate) fn safe_diagnostic(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        let (failure, detail) = self.reason_detail();
+        SafeDiagnostic::new(
+            DiagnosticCode::ExtractBuiltin,
+            stage,
+            DiagnosticSubject::field(&self.location),
+            DiagnosticReason::failure_with_detail(failure, detail),
+            impact,
+            action,
+        )
+    }
 }
 
 impl fmt::Display for BuiltinDocumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}：{}", self.location, self.message)
+        write!(formatter, "{}：{}", self.location, self.reason)
     }
 }
 
 impl Error for BuiltinDocumentError {}
+
+impl SafeDiagnosticSource for BuiltinDocumentError {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        self.safe_diagnostic(stage, impact, fallback_action)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BuiltinDocumentFailure {
+    MissingDocument,
+    ExpectedObject,
+    ExpectedArray,
+    ExpectedString,
+    MissingValue,
+    EventCodeMustBeInteger,
+    EventParametersMissing,
+    EventIndentMustBeInteger,
+    ContinuationWithoutStart {
+        command_code: i64,
+    },
+    ChoiceIndexInvalid {
+        actual: Option<i64>,
+        option_count: usize,
+    },
+    DuplicateChoiceBranch {
+        choice_index: usize,
+    },
+    ChoiceBranchTextMismatch {
+        choice_index: usize,
+    },
+    ChoiceEndMissing,
+    ChoiceBranchesIncomplete {
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl fmt::Display for BuiltinDocumentFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingDocument => formatter.write_str("文档缺失"),
+            Self::ExpectedObject => formatter.write_str("必须是对象"),
+            Self::ExpectedArray => formatter.write_str("必须是数组"),
+            Self::ExpectedString => formatter.write_str("必须是字符串"),
+            Self::MissingValue => formatter.write_str("字段或元素缺失"),
+            Self::EventCodeMustBeInteger => formatter.write_str("code 必须是整数"),
+            Self::EventParametersMissing => formatter.write_str("缺少 parameters"),
+            Self::EventIndentMustBeInteger => formatter.write_str("indent 必须是整数"),
+            Self::ContinuationWithoutStart { command_code } => {
+                write!(formatter, "事件指令 {command_code} 缺少对应的起始指令")
+            }
+            Self::ChoiceIndexInvalid { .. } => {
+                formatter.write_str("402 选项索引必须指向当前 102 的一个选项")
+            }
+            Self::DuplicateChoiceBranch { choice_index } => {
+                write!(formatter, "当前 102 重复包含选项分支 {choice_index}")
+            }
+            Self::ChoiceBranchTextMismatch { choice_index } => {
+                write!(formatter, "402 分支文本与 102 选项 {choice_index} 不一致")
+            }
+            Self::ChoiceEndMissing | Self::ChoiceBranchesIncomplete { .. } => {
+                formatter.write_str("102 必须包含完整且唯一的同层 402 分支以及 404 结束指令")
+            }
+        }
+    }
+}
+
+fn snapshot_model_safe_diagnostic(source: &SnapshotModelError) -> SafeDiagnostic {
+    let (subject, failure, detail) = match source {
+        SnapshotModelError::BlankSourceContent { exact_location } => (
+            DiagnosticSubject::field(exact_location.to_string()),
+            DiagnosticFailureKind::InvalidValue,
+            "structure=text_unit; source_content=blank".to_owned(),
+        ),
+        SnapshotModelError::ContentShapeMismatch {
+            role,
+            exact_location,
+        } => (
+            DiagnosticSubject::field(exact_location.to_string()),
+            DiagnosticFailureKind::InvalidValue,
+            format!(
+                "structure=text_unit; role={}; content_shape=mismatch",
+                builtin_role_name(role)
+            ),
+        ),
+        SnapshotModelError::DirectGroupRequiresValue {
+            role,
+            exact_location,
+        } => (
+            DiagnosticSubject::field(exact_location.to_string()),
+            DiagnosticFailureKind::InvalidValue,
+            format!(
+                "structure=direct_group; role={}; required_content_shape=value",
+                builtin_role_name(role)
+            ),
+        ),
+        SnapshotModelError::InvalidSourceLine {
+            source_line_index,
+            exact_location,
+        } => (
+            DiagnosticSubject::field(exact_location.to_string()),
+            DiagnosticFailureKind::InvalidValue,
+            format!(
+                "structure=text_unit; source_line_index={source_line_index}; forbidden_character=cr_lf_or_nul"
+            ),
+        ),
+        SnapshotModelError::EmptyGroup { group_location } => (
+            DiagnosticSubject::field(group_location.to_string()),
+            DiagnosticFailureKind::MissingRequiredValue,
+            "structure=text_group; units=empty".to_owned(),
+        ),
+        SnapshotModelError::EmptyProjection { group_location } => (
+            DiagnosticSubject::field(group_location.to_string()),
+            DiagnosticFailureKind::MissingRequiredValue,
+            "structure=text_group; projection_recipes=empty".to_owned(),
+        ),
+        SnapshotModelError::DuplicateLogicalLocation { logical_location } => (
+            DiagnosticSubject::field(logical_location.group_location().to_string()),
+            DiagnosticFailureKind::ConflictingValues,
+            format!(
+                "structure=snapshot; duplicate_logical_location=true; role={}",
+                builtin_role_name(logical_location.role())
+            ),
+        ),
+        SnapshotModelError::ConflictingGroupKind {
+            group_location,
+            first,
+            second,
+        } => (
+            DiagnosticSubject::field(group_location.to_string()),
+            DiagnosticFailureKind::ConflictingValues,
+            format!(
+                "structure=text_group; first_kind={}; second_kind={}",
+                builtin_group_kind_name(*first),
+                builtin_group_kind_name(*second)
+            ),
+        ),
+        SnapshotModelError::MutationClaimConflict { resource } => (
+            DiagnosticSubject::operation("build_builtin_snapshot_claim_index"),
+            DiagnosticFailureKind::ConflictingValues,
+            format!(
+                "structure=mutation_claim; resource_kind={}; access=conflicting",
+                mutation_resource_kind(resource)
+            ),
+        ),
+        SnapshotModelError::RecipeRoleMismatch {
+            group_location,
+            units,
+            referenced,
+        } => (
+            DiagnosticSubject::field(group_location.to_string()),
+            DiagnosticFailureKind::InvalidValue,
+            format!(
+                "structure=projection_recipe; role_set=mismatch; unit_role_count={}; referenced_role_count={}",
+                units.len(),
+                referenced.len()
+            ),
+        ),
+        SnapshotModelError::RecipeLineMismatch {
+            group_location,
+            role,
+            expected,
+            referenced,
+        } => (
+            DiagnosticSubject::field(group_location.to_string()),
+            DiagnosticFailureKind::InvalidValue,
+            format!(
+                "structure=projection_recipe; role={}; line_set=mismatch; expected_count={}; referenced_count={}; first_missing={}; first_unexpected={}",
+                builtin_role_name(role),
+                expected.len(),
+                referenced.len(),
+                optional_usize(expected.difference(referenced).next().copied()),
+                optional_usize(referenced.difference(expected).next().copied())
+            ),
+        ),
+        SnapshotModelError::Projection(source) => (
+            DiagnosticSubject::operation("build_builtin_projection"),
+            DiagnosticFailureKind::InternalInvariant,
+            projection_model_detail(source),
+        ),
+    };
+    SafeDiagnostic::new(
+        DiagnosticCode::ExtractBuiltin,
+        DiagnosticStage::Extract,
+        subject,
+        DiagnosticReason::failure_with_detail(failure, detail),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::ReportBug,
+    )
+}
+
+fn builtin_role_name(role: &TextUnitRole) -> &'static str {
+    match role {
+        TextUnitRole::Scalar(_) => "scalar",
+        TextUnitRole::DialogueSpeaker => "dialogue_speaker",
+        TextUnitRole::DialogueBody => "dialogue_body",
+        TextUnitRole::Choices => "choices",
+        TextUnitRole::ScrollingText => "scrolling_text",
+    }
+}
+
+fn builtin_group_kind_name(kind: TextGroupKind) -> &'static str {
+    match kind {
+        TextGroupKind::DatabaseEntry => "database_entry",
+        TextGroupKind::System => "system",
+        TextGroupKind::Map => "map",
+        TextGroupKind::EventDialogue => "event_dialogue",
+        TextGroupKind::EventChoices => "event_choices",
+        TextGroupKind::EventScrollingText => "event_scrolling_text",
+        TextGroupKind::EventCommand => "event_command",
+        TextGroupKind::PluginParameter => "plugin_parameter",
+    }
+}
+
+fn mutation_resource_kind(resource: &crate::rpg_maker::model::MutationResource) -> &'static str {
+    match resource {
+        crate::rpg_maker::model::MutationResource::Value { .. } => "value",
+        crate::rpg_maker::model::MutationResource::NoteTag { .. } => "note_tag",
+        crate::rpg_maker::model::MutationResource::CommentTag { .. } => "comment_tag",
+    }
+}
+
+fn optional_usize(value: Option<usize>) -> String {
+    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
+}
 
 #[derive(Debug)]
 enum BuildBuiltinSnapshotError {
@@ -441,20 +816,20 @@ enum BuiltinWorkUnit {
     Database {
         file: StandardDataFile,
         field_names: &'static [&'static str],
-        document: Value,
+        document: Arc<StackSafeJsonValue>,
     },
-    System(Value),
+    System(Arc<StackSafeJsonValue>),
     Map {
         map_id: MapId,
-        document: Value,
+        document: Arc<StackSafeJsonValue>,
         dialogue_projection: BuiltinDialogueProjection,
     },
     CommonEvents {
-        document: Value,
+        document: Arc<StackSafeJsonValue>,
         dialogue_projection: BuiltinDialogueProjection,
     },
     Troops {
-        document: Value,
+        document: Arc<StackSafeJsonValue>,
         dialogue_projection: BuiltinDialogueProjection,
     },
 }
@@ -520,15 +895,18 @@ impl BuiltinWorkUnit {
     }
 }
 
-fn single_document(id: RpgMakerDocumentId, document: Value) -> RpgMakerProjectDocuments {
-    RpgMakerProjectDocuments::new([(id, document)].into_iter().collect(), Vec::new())
+fn single_document(
+    id: RpgMakerDocumentId,
+    document: Arc<StackSafeJsonValue>,
+) -> RpgMakerProjectDocuments {
+    RpgMakerProjectDocuments::from_shared_parts([(id, document)].into_iter().collect(), Vec::new())
 }
 
 fn builtin_work_units(
     documents: RpgMakerProjectDocuments,
     dialogue_projection: &BuiltinDialogueProjection,
 ) -> Result<Vec<BuiltinWorkUnit>, BuiltinDocumentError> {
-    let (mut documents, _plugins) = documents.into_parts();
+    let (mut documents, _plugins) = documents.into_shared_parts();
     let mut work_units = Vec::new();
 
     for (file, field_names) in database_specs() {
@@ -576,12 +954,17 @@ fn builtin_work_units(
 }
 
 fn take_data_document(
-    documents: &mut std::collections::BTreeMap<RpgMakerDocumentId, Value>,
+    documents: &mut std::collections::BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
     file: StandardDataFile,
-) -> Result<Value, BuiltinDocumentError> {
+) -> Result<Arc<StackSafeJsonValue>, BuiltinDocumentError> {
     documents
         .remove(&RpgMakerDocumentId::Data(file))
-        .ok_or_else(|| BuiltinDocumentError::new(format!("data/{}", file.file_name()), "文档缺失"))
+        .ok_or_else(|| {
+            BuiltinDocumentError::new(
+                format!("data/{}", file.file_name()),
+                BuiltinDocumentFailure::MissingDocument,
+            )
+        })
 }
 
 fn database_specs() -> [(StandardDataFile, &'static [&'static str]); 8] {
@@ -996,7 +1379,9 @@ fn extract_event_list(
             401 | 405 => {
                 return Err(BuiltinDocumentError::new(
                     command.location.to_string(),
-                    format!("事件指令 {} 缺少对应的起始指令", command.code),
+                    BuiltinDocumentFailure::ContinuationWithoutStart {
+                        command_code: command.code,
+                    },
                 )
                 .into());
             }
@@ -1023,13 +1408,18 @@ fn command_at<'a>(
     command_steps.push(RpgMakerLocationStep::index(command_index));
     let location = RpgMakerLocation::value(source.clone(), command_steps);
     let command = expect_object(&list[command_index], location.to_string())?;
-    let code = command
-        .get("code")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| BuiltinDocumentError::new(location.to_string(), "code 必须是整数"))?;
-    let parameters = command
-        .get("parameters")
-        .ok_or_else(|| BuiltinDocumentError::new(location.to_string(), "缺少 parameters"))?;
+    let code = command.get("code").and_then(Value::as_i64).ok_or_else(|| {
+        BuiltinDocumentError::new(
+            location.to_string(),
+            BuiltinDocumentFailure::EventCodeMustBeInteger,
+        )
+    })?;
+    let parameters = command.get("parameters").ok_or_else(|| {
+        BuiltinDocumentError::new(
+            location.to_string(),
+            BuiltinDocumentFailure::EventParametersMissing,
+        )
+    })?;
     let parameters = expect_array(parameters, format!("{location}.parameters"))?;
     Ok(EventCommand {
         code,
@@ -1046,7 +1436,12 @@ fn command_indent(
     expect_object(&list[command_index], location.to_string())?
         .get("indent")
         .and_then(Value::as_i64)
-        .ok_or_else(|| BuiltinDocumentError::new(location.to_string(), "indent 必须是整数"))
+        .ok_or_else(|| {
+            BuiltinDocumentError::new(
+                location.to_string(),
+                BuiltinDocumentFailure::EventIndentMustBeInteger,
+            )
+        })
 }
 
 fn extract_dialogue(
@@ -1273,22 +1668,23 @@ fn extract_choices(
             command_field_location(source, list_steps, branch_command_index, "indent"),
         ]);
         let index_location = parameter_location(source, list_steps, branch_command_index, 0);
-        let choice_index = command
-            .parameters
-            .first()
-            .and_then(Value::as_i64)
+        let raw_choice_index = command.parameters.first().and_then(Value::as_i64);
+        let choice_index = raw_choice_index
             .and_then(|index| usize::try_from(index).ok())
             .filter(|index| *index < choice_texts.len())
             .ok_or_else(|| {
                 BuiltinDocumentError::new(
                     index_location.to_string(),
-                    "402 选项索引必须指向当前 102 的一个选项",
+                    BuiltinDocumentFailure::ChoiceIndexInvalid {
+                        actual: raw_choice_index,
+                        option_count: choice_texts.len(),
+                    },
                 )
             })?;
         if !branch_indexes.insert(choice_index) {
             return Err(BuiltinDocumentError::new(
                 index_location.to_string(),
-                format!("当前 102 重复包含选项分支 {choice_index}"),
+                BuiltinDocumentFailure::DuplicateChoiceBranch { choice_index },
             )
             .into());
         }
@@ -1297,7 +1693,7 @@ fn extract_choices(
         if branch_text != choice_texts[choice_index] {
             return Err(BuiltinDocumentError::new(
                 text_location.to_string(),
-                format!("402 分支文本与 102 选项 {choice_index} 不一致"),
+                BuiltinDocumentFailure::ChoiceBranchTextMismatch { choice_index },
             )
             .into());
         }
@@ -1318,14 +1714,17 @@ fn extract_choices(
     let Some(_) = end_location else {
         return Err(BuiltinDocumentError::new(
             command_location(source, list_steps, command_index).to_string(),
-            "102 必须包含完整且唯一的同层 402 分支以及 404 结束指令",
+            BuiltinDocumentFailure::ChoiceEndMissing,
         )
         .into());
     };
     if branch_indexes.len() != choice_texts.len() {
         return Err(BuiltinDocumentError::new(
             command_location(source, list_steps, command_index).to_string(),
-            "102 必须包含完整且唯一的同层 402 分支以及 404 结束指令",
+            BuiltinDocumentFailure::ChoiceBranchesIncomplete {
+                expected: choice_texts.len(),
+                actual: branch_indexes.len(),
+            },
         )
         .into());
     }
@@ -1520,7 +1919,12 @@ fn required_data_document(
 ) -> Result<&Value, BuiltinDocumentError> {
     documents
         .document(RpgMakerDocumentId::Data(file))
-        .ok_or_else(|| BuiltinDocumentError::new(format!("data/{}", file.file_name()), "文档缺失"))
+        .ok_or_else(|| {
+            BuiltinDocumentError::new(
+                format!("data/{}", file.file_name()),
+                BuiltinDocumentFailure::MissingDocument,
+            )
+        })
 }
 
 fn expect_object(
@@ -1529,7 +1933,7 @@ fn expect_object(
 ) -> Result<&Map<String, Value>, BuiltinDocumentError> {
     value
         .as_object()
-        .ok_or_else(|| BuiltinDocumentError::new(location, "必须是对象"))
+        .ok_or_else(|| BuiltinDocumentError::new(location, BuiltinDocumentFailure::ExpectedObject))
 }
 
 fn expect_array(
@@ -1539,16 +1943,16 @@ fn expect_array(
     value
         .as_array()
         .map(Vec::as_slice)
-        .ok_or_else(|| BuiltinDocumentError::new(location, "必须是数组"))
+        .ok_or_else(|| BuiltinDocumentError::new(location, BuiltinDocumentFailure::ExpectedArray))
 }
 
 fn expect_string<'a>(
     value: &'a Value,
     location: &RpgMakerLocation,
 ) -> Result<&'a str, BuiltinDocumentError> {
-    value
-        .as_str()
-        .ok_or_else(|| BuiltinDocumentError::new(location.to_string(), "必须是字符串"))
+    value.as_str().ok_or_else(|| {
+        BuiltinDocumentError::new(location.to_string(), BuiltinDocumentFailure::ExpectedString)
+    })
 }
 
 fn expect_string_field<'a>(
@@ -1563,7 +1967,7 @@ fn expect_string_field<'a>(
 }
 
 fn missing_value(location: &RpgMakerLocation) -> BuiltinDocumentError {
-    BuiltinDocumentError::new(location.to_string(), "字段或元素缺失")
+    BuiltinDocumentError::new(location.to_string(), BuiltinDocumentFailure::MissingValue)
 }
 
 #[cfg(test)]
@@ -1655,6 +2059,27 @@ mod tests {
     }
 
     impl Error for FakeError {}
+
+    impl SafeDiagnosticSource for FakeError {
+        fn safe_diagnostic_source(
+            &self,
+            stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+            fallback_action: DiagnosticAction,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                stage,
+                DiagnosticSubject::component("typed_fake_root"),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InvalidValue,
+                    "source=fake_root",
+                ),
+                impact,
+                fallback_action,
+            )
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct FakeCpu;
@@ -2179,6 +2604,68 @@ mod tests {
                 .lock()
                 .expect("快照记录锁不应中毒")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn builtin_diagnostics_keep_document_location_snapshot_variant_and_typed_root_details() {
+        type DiagnosticExtractionError = BuiltInExtractionError<
+            FakeError,
+            FakeError,
+            crate::runtime::cpu::CpuExecutorUnavailable,
+        >;
+
+        let document_error = BuiltinDocumentError::new(
+            "data/Items.json[1].name",
+            BuiltinDocumentFailure::ExpectedString,
+        );
+        let error = DiagnosticExtractionError::MalformedDocument(document_error);
+        let diagnostic = error.safe_diagnostic();
+        assert_eq!(
+            diagnostic.subject,
+            DiagnosticSubject::field("data/Items.json[1].name")
+        );
+        let DiagnosticReason::FailureWithDetail { failure, detail } = diagnostic.reason else {
+            panic!("Builtin 文档错误应公开具体结构原因")
+        };
+        assert_eq!(failure, DiagnosticFailureKind::InvalidValue);
+        assert_eq!(detail, "structure=expected_string");
+
+        let group_location = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let error =
+            DiagnosticExtractionError::BuildSnapshot(SnapshotModelError::ConflictingGroupKind {
+                group_location: Box::new(group_location.clone()),
+                first: TextGroupKind::DatabaseEntry,
+                second: TextGroupKind::EventCommand,
+            });
+        let diagnostic = error.safe_diagnostic();
+        assert_eq!(
+            diagnostic.subject,
+            DiagnosticSubject::field(group_location.to_string())
+        );
+        let DiagnosticReason::FailureWithDetail { failure, detail } = diagnostic.reason else {
+            panic!("SnapshotModelError 应按具体变体投影")
+        };
+        assert_eq!(failure, DiagnosticFailureKind::ConflictingValues);
+        assert!(detail.contains("first_kind=database_entry"));
+        assert!(detail.contains("second_kind=event_command"));
+
+        const SOURCE_SENTINEL: &str = "SECRET_ROOT_SOURCE_TEXT";
+        let error = DiagnosticExtractionError::Persist(FakeError(SOURCE_SENTINEL));
+        let diagnostic = error.safe_diagnostic();
+        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+        assert!(matches!(
+            diagnostic.recovery.as_slice(),
+            [RecoveryFact::Component { name }] if name == "owner=builtin"
+        ));
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .expect("Builtin 根诊断应可序列化")
+                .contains(SOURCE_SENTINEL),
+            "根错误任意 Display 文本不得进入公开投影"
         );
     }
 

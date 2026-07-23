@@ -2,26 +2,65 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::ExitCode;
+use std::sync::Once;
 
 use super::arguments::AttArguments;
 use super::arguments::ProgressArgument;
 use super::command::{
-    CommandResultRenderer, CommandRunResult, ProductionRpgMakerCommandRunner, TerminationSignals,
+    CommandPanicBoundary, CommandResultRenderer, CommandRunResult, PendingProjectLog,
+    ProductionCommandError, ProductionRpgMakerCommandRunner, TerminationSignals,
 };
 use super::config::{
     ConfigurationLoadError, ConfigurationPathError, load_product_configuration,
     resolve_configuration_path,
 };
-use crate::i18n::{UiLocalizer, UiMessage};
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, SafeDiagnostic, render_safe_diagnostic,
+};
+use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::progress::ProgressMode;
+use crate::runtime::project_log::ProjectLogWarning;
 
 /// 运行真实进程入口。
 pub(crate) fn run() -> ExitCode {
+    install_safe_panic_hook();
+    match catch_unwind(AssertUnwindSafe(run_guarded)) {
+        Ok(exit_code) => exit_code,
+        Err(_) => render_uncaught_panic(),
+    }
+}
+
+fn install_safe_panic_hook() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // panic payload 可能包含模型、Lua、SQL 或用户正文。进程边界只输出下方的
+        // 固定结构化诊断，因此全局 hook 不读取也不打印 PanicHookInfo。
+        std::panic::set_hook(Box::new(|_| {}));
+    });
+}
+
+fn run_guarded() -> ExitCode {
     // 实时进度由独立线程短暂取得 stderr 锁；进程主线程不能在整个命令期间持有锁。
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     run_from(std::env::args_os(), &mut stdout, &mut stderr)
+}
+
+fn render_uncaught_panic() -> ExitCode {
+    let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+    let diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::InternalOperation,
+        DiagnosticStage::ProcessStartup,
+        DiagnosticSubject::Process,
+        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+        DiagnosticImpact::OutcomeUnknown,
+        DiagnosticAction::ReportBug,
+    );
+    let mut stderr = io::stderr();
+    render_diagnostic_fatal(&localizer, &diagnostic, &mut stderr)
 }
 
 fn run_from<A, S>(args: A, stdout: &mut dyn Write, stderr: &mut dyn Write) -> ExitCode
@@ -49,7 +88,18 @@ where
     };
     let current_directory = match std::env::current_dir() {
         Ok(path) => path,
-        Err(error) => return render_fatal(&localizer, &error, stderr),
+        Err(error) => {
+            let diagnostic = SafeDiagnostic::io(
+                DiagnosticCode::ProcessCurrentDirectory,
+                DiagnosticStage::ProcessStartup,
+                DiagnosticSubject::Process,
+                "resolve_current_directory",
+                &error,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            );
+            return render_diagnostic_fatal(&localizer, &diagnostic, stderr);
+        }
     };
     let configuration_path = match resolve_configuration_path(&arguments.config, &current_directory)
     {
@@ -60,81 +110,201 @@ where
         Ok(configuration) => configuration,
         Err(error) => return render_configuration_load_error(&localizer, &error, stderr),
     };
-    let async_runtime = configuration.common().async_runtime();
+    let runtime_parallelism = match std::thread::available_parallelism() {
+        Ok(parallelism) => parallelism,
+        Err(error) => {
+            let diagnostic = SafeDiagnostic::io(
+                DiagnosticCode::ProcessRuntimeStart,
+                DiagnosticStage::ProcessStartup,
+                DiagnosticSubject::component("Tokio"),
+                "detect_available_parallelism",
+                &error,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            );
+            return render_diagnostic_fatal(&localizer, &diagnostic, stderr);
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(async_runtime.worker_threads().get())
-        .max_blocking_threads(async_runtime.max_blocking_threads().get())
-        .thread_keep_alive(async_runtime.blocking_thread_keep_alive())
+        .worker_threads(runtime_parallelism.get())
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => return render_fatal(&localizer, &error, stderr),
+        Err(error) => {
+            let diagnostic = SafeDiagnostic::io(
+                DiagnosticCode::ProcessRuntimeStart,
+                DiagnosticStage::ProcessStartup,
+                DiagnosticSubject::component("Tokio"),
+                "build_runtime",
+                &error,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            );
+            return render_diagnostic_fatal(&localizer, &diagnostic, stderr);
+        }
     };
 
     let (layout, command) = configuration.into_parts();
-    let (report, _termination_signals) = runtime.block_on(async {
+    // Translate 的生产纵向切片包含完整计划、错误与收尾状态，其 async 状态机明显大于
+    // Windows 主线程的默认栈。先把顶层 future 固定在堆上，避免 block_on 将整棵
+    // 状态机钉在主线程栈中；这不改变 Tokio 内部任务的调度和并发关系。
+    let command_run = Box::pin(async move {
         let mut termination_signals = TerminationSignals::new();
         let report = ProductionRpgMakerCommandRunner::new(layout, locale, progress_mode)
             .run(command, &mut termination_signals)
             .await;
         (report, termination_signals)
     });
+    let (report, _termination_signals) = runtime.block_on(command_run);
     // 信号订阅与 Runtime 保持到最终结果输出结束；各业务根已经在 report 返回前显式 shutdown。
 
-    if report.log_warning.is_some() {
-        let _ = writeln!(stderr, "{}", localizer.format(UiMessage::NoticeLogDegraded));
-    }
+    let mut pending_project_log = report.pending_project_log;
+    let panic_boundary = pending_project_log
+        .as_mut()
+        .map(PendingProjectLog::arm_presentation_panic);
+    catch_logged_presentation(panic_boundary, &localizer, stderr, |stderr| {
+        render_command_report(
+            report.result,
+            report.shutdown_error,
+            pending_project_log,
+            &localizer,
+            stdout,
+            stderr,
+        )
+    })
+}
 
-    match (report.result, report.shutdown_error) {
+fn render_command_report(
+    result: CommandRunResult,
+    shutdown_error: Option<super::command::ShutdownFailures>,
+    pending_project_log: Option<PendingProjectLog>,
+    localizer: &UiLocalizer,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    match (result, shutdown_error) {
         (CommandRunResult::Succeeded(output), None) => {
-            if let Err(error) = CommandResultRenderer::render_success(output, &localizer, stdout) {
-                render_fatal(&localizer, &error, stderr)
+            if let Err(error) = CommandResultRenderer::render_success(output, localizer, stdout) {
+                let command_error = ProductionCommandError::stdout_write(error);
+                let warning = pending_project_log
+                    .and_then(|project_log| project_log.finish_with_failure(&command_error));
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+                let _ = CommandResultRenderer::render_failure(
+                    Some(&command_error),
+                    None,
+                    localizer,
+                    stderr,
+                );
+                ExitCode::FAILURE
             } else {
+                let warning = pending_project_log.and_then(PendingProjectLog::finish);
+                render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
                 ExitCode::SUCCESS
             }
         }
         (CommandRunResult::Failed(command_error), shutdown) => {
-            if CommandResultRenderer::render_failure(
+            let warning = pending_project_log.and_then(PendingProjectLog::finish);
+            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+            let _ = CommandResultRenderer::render_failure(
                 Some(&command_error),
-                shutdown
-                    .as_ref()
-                    .map(|error| error as &dyn std::fmt::Display),
-                &localizer,
+                shutdown.as_ref(),
+                localizer,
                 stderr,
-            )
-            .is_err()
-            {
-                return ExitCode::FAILURE;
-            }
+            );
             ExitCode::FAILURE
         }
         (CommandRunResult::Interrupted, None) => {
+            let warning = pending_project_log.and_then(PendingProjectLog::finish);
+            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
             let _ = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
             ExitCode::from(130)
         }
         (CommandRunResult::Interrupted, Some(shutdown)) => {
-            let _ =
-                CommandResultRenderer::render_failure(None, Some(&shutdown), &localizer, stderr);
+            let warning = pending_project_log.and_then(PendingProjectLog::finish);
+            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+            let _ = CommandResultRenderer::render_failure(None, Some(&shutdown), localizer, stderr);
             ExitCode::FAILURE
         }
         (CommandRunResult::Succeeded(_), Some(shutdown)) => {
+            let warning = pending_project_log.and_then(PendingProjectLog::finish);
+            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
             let _ = CommandResultRenderer::render_applied_finalization_failure(
-                &shutdown, &localizer, stderr,
+                &shutdown, localizer, stderr,
             );
             ExitCode::FAILURE
         }
     }
 }
 
-fn render_fatal(
+fn catch_logged_presentation(
+    panic_boundary: Option<CommandPanicBoundary>,
     localizer: &UiLocalizer,
-    error: &dyn std::fmt::Display,
+    stderr: &mut dyn Write,
+    presentation: impl FnOnce(&mut dyn Write) -> ExitCode,
+) -> ExitCode {
+    let result = catch_unwind(AssertUnwindSafe(|| presentation(stderr)));
+    match result {
+        Ok(exit_code) => exit_code,
+        Err(payload) => {
+            let Some(panic_boundary) = panic_boundary else {
+                std::panic::resume_unwind(payload);
+            };
+            // 与命令边界相同，payload 只负责触发控制流，绝不读取或格式化。
+            drop(payload);
+            let error = panic_boundary.panic_error();
+            let _ = CommandResultRenderer::render_failure(Some(&error), None, localizer, stderr);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn render_diagnostic_fatal(
+    localizer: &UiLocalizer,
+    diagnostic: &SafeDiagnostic,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    let _ = error;
-    let _ = writeln!(stderr, "{}", localizer.format(UiMessage::ErrorInternal));
+    let _ = render_safe_diagnostic(diagnostic, localizer, stderr);
     ExitCode::FAILURE
+}
+
+fn render_project_log_warning(
+    localizer: &UiLocalizer,
+    warning: &ProjectLogWarning,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    writeln!(stderr, "{}", localizer.format(UiMessage::NoticeLogDegraded))?;
+    if let Some(diagnostic) = &warning.diagnostic {
+        render_safe_diagnostic(diagnostic, localizer, stderr)?;
+    }
+    Ok(())
+}
+
+fn render_project_log_warning_if_present(
+    localizer: &UiLocalizer,
+    warning: Option<&ProjectLogWarning>,
+    stderr: &mut dyn Write,
+) {
+    if let Some(warning) = warning {
+        let _ = render_project_log_warning(localizer, warning, stderr);
+    }
+}
+
+#[cfg(test)]
+fn render_fatal(
+    localizer: &UiLocalizer,
+    _error: &dyn std::fmt::Display,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    let diagnostic = SafeDiagnostic::new(
+        DiagnosticCode::InternalOperation,
+        DiagnosticStage::ProcessStartup,
+        DiagnosticSubject::Process,
+        DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::ReportBug,
+    );
+    render_diagnostic_fatal(localizer, &diagnostic, stderr)
 }
 
 fn render_configuration_path_error(
@@ -142,17 +312,25 @@ fn render_configuration_path_error(
     error: &ConfigurationPathError,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    let rendered = match error {
-        ConfigurationPathError::CurrentDirectoryNotAbsolute(path) => {
-            let path = path.to_string_lossy();
-            localizer.format(UiMessage::ErrorConfigCurrentDirectoryNotAbsolute { path: &path })
-        }
-        ConfigurationPathError::EmptyExplicitPath => {
-            localizer.format(UiMessage::ErrorConfigEmptyPath)
-        }
+    let diagnostic = match error {
+        ConfigurationPathError::CurrentDirectoryNotAbsolute(path) => SafeDiagnostic::new(
+            DiagnosticCode::ConfigurationPath,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixConfiguration,
+        ),
+        ConfigurationPathError::EmptyExplicitPath => SafeDiagnostic::new(
+            DiagnosticCode::ConfigurationPath,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::field("--config"),
+            DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixConfiguration,
+        ),
     };
-    let _ = writeln!(stderr, "{rendered}");
-    ExitCode::FAILURE
+    render_diagnostic_fatal(localizer, &diagnostic, stderr)
 }
 
 fn render_configuration_load_error(
@@ -160,105 +338,117 @@ fn render_configuration_load_error(
     error: &ConfigurationLoadError,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    let rendered = match error {
-        ConfigurationLoadError::Open { path, .. } => {
-            let path = path.to_string_lossy();
-            localizer.format(UiMessage::ErrorConfigOpen { path: &path })
-        }
-        ConfigurationLoadError::NotAFile { path } => {
-            let path = path.to_string_lossy();
-            localizer.format(UiMessage::ErrorConfigNotAFile { path: &path })
-        }
-        ConfigurationLoadError::TooLarge {
-            path,
-            observed_bytes,
-            maximum_bytes,
-        } => {
-            let path = path.to_string_lossy();
-            localizer.format(UiMessage::ErrorConfigTooLarge {
-                path: &path,
-                observed_bytes: *observed_bytes,
-                maximum_bytes: *maximum_bytes,
-            })
-        }
-        ConfigurationLoadError::Read { path, .. } => {
-            let path = path.to_string_lossy();
-            localizer.format(UiMessage::ErrorConfigRead { path: &path })
-        }
+    let diagnostic = match error {
+        ConfigurationLoadError::Open { path, source } => SafeDiagnostic::io(
+            DiagnosticCode::ConfigurationOpen,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::path(path),
+            "open_configuration",
+            source,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        ),
+        ConfigurationLoadError::NotAFile { path } => SafeDiagnostic::new(
+            DiagnosticCode::ConfigurationNotFile,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixConfiguration,
+        ),
+        ConfigurationLoadError::Read { path, source } => SafeDiagnostic::io(
+            DiagnosticCode::ConfigurationRead,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::path(path),
+            "read_configuration",
+            source,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        ),
         ConfigurationLoadError::InvalidUtf8 {
             path,
             valid_up_to,
             error_len,
-        } => {
-            let path = path.to_string_lossy();
-            if let Some(error_len) = error_len {
-                localizer.format(UiMessage::ErrorConfigInvalidUtf8KnownLength {
-                    path: &path,
-                    valid_up_to: usize_as_u64(*valid_up_to),
-                    error_len: usize_as_u64(*error_len),
-                })
-            } else {
-                localizer.format(UiMessage::ErrorConfigInvalidUtf8UnknownLength {
-                    path: &path,
-                    valid_up_to: usize_as_u64(*valid_up_to),
-                })
-            }
-        }
+        } => SafeDiagnostic::new(
+            DiagnosticCode::ConfigurationInvalidUtf8,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::InvalidUtf8 {
+                valid_up_to: usize_as_u64(*valid_up_to),
+                error_len: error_len.map(usize_as_u64),
+            },
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixConfiguration,
+        ),
         ConfigurationLoadError::InvalidToml {
             path,
             location,
             resource,
-            ..
-        } => {
-            let path = path.to_string_lossy();
-            if let Some(location) = location {
-                localizer.format(UiMessage::ErrorConfigInvalidTomlAt {
-                    path: &path,
-                    line: usize_as_u64(location.line()),
-                    column: usize_as_u64(location.column()),
-                    resource,
-                })
-            } else {
-                localizer.format(UiMessage::ErrorConfigInvalidToml {
-                    path: &path,
-                    resource,
-                })
-            }
-        }
-        ConfigurationLoadError::InvalidValue(source) => {
-            localizer.format(UiMessage::ErrorConfigInvalidValue {
-                field: source.field(),
-            })
-        }
-        ConfigurationLoadError::InvalidValueAtPath { path, source } => {
-            let path = path.to_string_lossy();
-            localizer.format(UiMessage::ErrorConfigInvalidValueAtPath {
-                path: &path,
-                field: source.field(),
-            })
-        }
+            reason,
+        } => SafeDiagnostic::new(
+            DiagnosticCode::ConfigurationInvalidToml,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::InvalidToml {
+                line: location.map(|value| usize_as_u64(value.line())),
+                column: location.map(|value| usize_as_u64(value.column())),
+                resource: crate::user_text::sanitize_user_text(resource),
+                classification: crate::user_text::sanitize_user_text(reason),
+            },
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixConfiguration,
+        ),
+        ConfigurationLoadError::InvalidValue(source) => SafeDiagnostic::new(
+            DiagnosticCode::ConfigurationInvalidValue,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::field(source.field()),
+            DiagnosticReason::InvalidConfigurationValue {
+                rule: source.reason().clone(),
+            },
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixConfiguration,
+        ),
+        ConfigurationLoadError::InvalidValueAtPath { path, source } => SafeDiagnostic::new(
+            DiagnosticCode::ConfigurationInvalidValue,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::field(source.field()),
+            DiagnosticReason::InvalidConfigurationValue {
+                rule: source.reason().clone(),
+            },
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixConfiguration,
+        )
+        .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
         ConfigurationLoadError::TranslationProfileNotFound { path, profile_id } => {
-            let path = path.to_string_lossy();
-            localizer.format(UiMessage::ErrorConfigProfileNotFound {
-                path: &path,
-                profile: profile_id,
-            })
+            SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationProfileNotFound,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::profile(profile_id),
+                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixConfiguration,
+            )
+            .with_recovery(crate::diagnostic::RecoveryFact::path(path))
         }
         ConfigurationLoadError::ProfileSelectionConflict {
             path,
             explicit_profile,
             requested_profile,
-        } => {
-            let path = path.to_string_lossy();
-            localizer.format(UiMessage::ErrorConfigProfileConflict {
-                path: &path,
-                explicit_profile,
-                requested_profile,
-            })
-        }
+        } => SafeDiagnostic::new(
+            DiagnosticCode::ConfigurationProfileConflict,
+            DiagnosticStage::Configuration,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(DiagnosticFailureKind::ConflictingValues),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixConfiguration,
+        )
+        .with_recovery(crate::diagnostic::RecoveryFact::component(format!(
+            "explicit_profile={}; requested_profile={}",
+            crate::user_text::sanitize_user_text(explicit_profile),
+            crate::user_text::sanitize_user_text(requested_profile)
+        ))),
     };
-    let _ = writeln!(stderr, "{rendered}");
-    ExitCode::FAILURE
+    render_diagnostic_fatal(localizer, &diagnostic, stderr)
 }
 
 fn usize_as_u64(value: usize) -> u64 {
@@ -267,7 +457,149 @@ fn usize_as_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
+
+    struct PanickingOutput;
+
+    impl Write for PanickingOutput {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            std::panic::panic_any(Box::new("PRESENTATION_PANIC_PRIVATE_SENTINEL"));
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn logged_presentation_panic_reports_the_same_safe_projection_to_cli_and_jsonl() {
+        use crate::diagnostic::RecoveryFact;
+        use crate::runtime::performance::RunPerformanceCounters;
+        use crate::runtime::project_log::{
+            ProjectLog, ProjectLogCode, ProjectLogContext, ProjectLogEvent, ProjectLogLevel,
+            ProjectLogPayload, start_project_log,
+        };
+        use std::sync::Arc;
+
+        const PRIVATE_PANIC_PAYLOAD: &str = "PRESENTATION_PANIC_PRIVATE_SENTINEL";
+        let directory = tempfile::tempdir().expect("临时日志目录应可建立");
+        let project_workspace = directory.path().join("rpg_maker_mz").join("project");
+        let logs_root = project_workspace.join("logs");
+        let run_id = "550e8400-e29b-41d4-a716-446655440098";
+        let mut runtime = start_project_log(logs_root, run_id.to_owned());
+        let log_path = runtime.path().expect("真实日志应有路径").to_path_buf();
+        let logger = runtime.logger();
+        let context = ProjectLogContext::new("zh-Hans")
+            .with_engine("rpg_maker_mz")
+            .with_project("project")
+            .with_command("write-back");
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::ProcessOutput,
+            DiagnosticSubject::command("write-back"),
+            DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+            DiagnosticImpact::OutcomeUnknown,
+            DiagnosticAction::ReportBug,
+        )
+        .with_recovery(RecoveryFact::path(&project_workspace))
+        .with_recovery(RecoveryFact::path(&log_path));
+        runtime.arm_unfinished_terminal(
+            context.clone(),
+            vec![diagnostic.clone()],
+            Arc::new(RunPerformanceCounters::default()),
+        );
+        logger.emit(ProjectLogEvent::new(
+            ProjectLogLevel::Info,
+            ProjectLogCode::RunStarted,
+            context,
+            ProjectLogPayload::Run { outcome: None },
+        ));
+        let panic_boundary = CommandPanicBoundary::from_logged(vec![diagnostic.clone()], logger);
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let mut stderr = Vec::new();
+        let mut stdout = PanickingOutput;
+
+        let exit = catch_logged_presentation(
+            Some(panic_boundary),
+            &localizer,
+            &mut stderr,
+            move |_stderr| {
+                let _runtime = runtime;
+                let _ = stdout.write_all(b"result");
+                ExitCode::SUCCESS
+            },
+        );
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        let stderr = String::from_utf8(stderr).expect("panic 诊断应为 UTF-8");
+        let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(plain.contains("internal.operation"));
+        assert!(plain.contains("进程输出"));
+        assert!(plain.contains("write-back"));
+        assert!(plain.contains(&project_workspace.to_string_lossy().to_string()));
+        assert!(plain.contains(&log_path.to_string_lossy().to_string()));
+        assert!(!stderr.contains(PRIVATE_PANIC_PAYLOAD));
+
+        let raw = std::fs::read_to_string(&log_path).expect("panic 项目日志应可读取");
+        assert!(!raw.contains(PRIVATE_PANIC_PAYLOAD));
+        let records = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("日志行应为 JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["code"].as_str().expect("日志 code 应为文本"))
+                .collect::<Vec<_>>(),
+            [
+                "run.started",
+                "performance.counters",
+                "failure.reported",
+                "run.finished",
+            ]
+        );
+        assert_eq!(
+            records[2]["payload"]["diagnostic"],
+            serde_json::to_value(diagnostic).expect("安全诊断应可序列化")
+        );
+        assert_eq!(records[3]["payload"]["outcome"], "outcome_unknown");
+    }
+
+    #[test]
+    fn process_panic_hook_is_installed_once_without_exposing_payload() {
+        const CHILD_ENV: &str = "ATT_SAFE_PANIC_HOOK_TEST_CHILD";
+        const CHILD_MARKER: &str = "ATT_SAFE_PANIC_HOOK_CHILD_COMPLETED";
+        const SECRET: &str = "PANIC_SECRET_SENTINEL";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            install_safe_panic_hook();
+            install_safe_panic_hook();
+            let outcome = catch_unwind(AssertUnwindSafe(|| panic!("{SECRET}")));
+            assert!(outcome.is_err());
+            println!("{CHILD_MARKER}");
+            return;
+        }
+
+        // 全局 panic hook 无法在同一测试进程中隔离；子进程验证避免污染并行测试。
+        let output = Command::new(std::env::current_exe().expect("测试进程路径应可读取"))
+            .args([
+                "--exact",
+                "application::process::tests::process_panic_hook_is_installed_once_without_exposing_payload",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("panic hook 子进程应可启动");
+        assert!(output.status.success(), "panic hook 子进程必须成功");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(CHILD_MARKER),
+            "panic hook 子测试必须实际执行"
+        );
+        assert!(!stdout.contains(SECRET));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET));
+    }
 
     #[test]
     fn help_and_parse_errors_do_not_require_configuration() {
@@ -307,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn configuration_errors_are_localized_without_display_text_leaking() {
+    fn configuration_errors_render_the_typed_safe_reason_without_using_display() {
         let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
         let mut stderr = Vec::new();
         let exit = render_configuration_load_error(
@@ -315,27 +647,30 @@ mod tests {
             &ConfigurationLoadError::InvalidToml {
                 path: "settings.toml".into(),
                 location: Some(super::super::config::SourceLocation::new(3, 7)),
-                resource: "runtime.sqlite".to_owned(),
+                resource: "llm.clients.primary".to_owned(),
                 reason: "不应呈现的内部分类",
             },
             &mut stderr,
         );
         assert_eq!(exit, ExitCode::FAILURE);
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
-        assert!(stderr.starts_with("配置文件"));
-        assert!(stderr.contains("settings.toml"));
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
-        assert!(plain.contains("第 3 行第 7 列"));
-        assert!(stderr.contains("runtime.sqlite"));
-        assert!(!stderr.contains("不应呈现的内部分类"));
+        assert!(plain.starts_with("错误 [configuration.invalid_toml]"));
+        assert!(stderr.contains("settings.toml"));
+        assert!(plain.contains("TOML 第 3 行、第 7 列无效"));
+        assert!(stderr.contains("llm.clients.primary"));
+        assert!(stderr.contains("不应呈现的内部分类"));
     }
 
     #[test]
     fn english_configuration_value_error_uses_typed_localization() {
         let localizer = UiLocalizer::new(crate::i18n::UiLocale::English);
         let error = super::super::config::invalid(
-            "runtime.sqlite.max_open_connections",
-            "不应注入英语消息的中文原因",
+            "llm.clients.primary.max_concurrent_requests",
+            crate::diagnostic::ConfigurationValueRule::RuntimeMaximumExceeded {
+                actual: 2_000_000,
+                maximum: 1_000_000,
+            },
         );
         let mut stderr = Vec::new();
         let exit = render_configuration_load_error(
@@ -348,11 +683,13 @@ mod tests {
         );
         assert_eq!(exit, ExitCode::FAILURE);
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
-        assert!(stderr.starts_with("Invalid value for configuration field"));
-        assert!(stderr.contains("runtime.sqlite.max_open_connections"));
+        let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(plain.starts_with("Error [configuration.invalid_value]"));
+        assert!(stderr.contains("llm.clients.primary.max_concurrent_requests"));
         assert!(stderr.contains("C:\\ATT\\att.toml"));
         assert!(stderr.contains('\u{2068}') && stderr.contains('\u{2069}'));
-        assert!(!stderr.contains("不应注入英语消息的中文原因"));
+        assert!(stderr.contains("actual=2000000"));
+        assert!(stderr.contains("maximum=1000000"));
     }
 
     #[test]
@@ -361,10 +698,8 @@ mod tests {
         let mut stderr = Vec::new();
         let exit = render_configuration_load_error(
             &localizer,
-            &ConfigurationLoadError::TooLarge {
+            &ConfigurationLoadError::NotAFile {
                 path: "C:\\Games\\att\u{202e}\u{2068}\u{1b}[31m.toml".into(),
-                observed_bytes: 8_000_000,
-                maximum_bytes: 4_194_304,
             },
             &mut stderr,
         );
@@ -383,5 +718,30 @@ mod tests {
                 .expect("诊断应为 UTF-8")
                 .contains("SECRET_SENTINEL")
         );
+    }
+
+    #[test]
+    fn log_degradation_renders_the_safe_operation_path_and_os_code() {
+        let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
+        let source = io::Error::from_raw_os_error(5);
+        let warning = ProjectLogWarning {
+            diagnostic: Some(SafeDiagnostic::io(
+                DiagnosticCode::LogWrite,
+                DiagnosticStage::Logging,
+                DiagnosticSubject::path("C:\\project\\logs\\run.jsonl"),
+                "write_all",
+                &source,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            )),
+        };
+        let mut stderr = Vec::new();
+
+        render_project_log_warning(&localizer, &warning, &mut stderr).expect("诊断应可写入");
+        let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
+        assert!(stderr.contains("log.write"));
+        assert!(stderr.contains("C:\\project\\logs\\run.jsonl"));
+        assert!(stderr.contains("write_all"));
+        assert!(stderr.contains("OS 5"));
     }
 }

@@ -50,21 +50,6 @@ cli-argument-conflict = { $argument } cannot be used with the other provided arg
 cli-wrong-number-of-values = The wrong number of values was provided for { $argument }.
 cli-invalid-utf8 = A command-line argument is not valid Unicode.
 cli-parse-failure = The command line could not be parsed.
-error-configuration-or-input-generic = The configuration or command input is invalid, so nothing was changed. Check the indicated options and configuration fields, then retry.
-error-config-current-directory-not-absolute = ATT cannot resolve --config because the current working directory { $path } is not absolute. Start ATT from a valid directory or pass an absolute configuration path.
-error-config-empty-path = --config cannot be empty. Pass the path of the ATT configuration file.
-error-config-open = ATT cannot open configuration file { $path }. Check that the file exists and that you have permission to read it.
-error-config-not-a-file = Configuration path { $path } is not a regular file. Pass a configuration file instead of a directory or special file.
-error-config-too-large = Configuration file { $path } is { $observed } bytes; the limit is { $maximum } bytes. Reduce the file and retry.
-error-config-read = ATT cannot read configuration file { $path }. Check file permissions and storage health, then retry.
-error-config-invalid-utf8-known-length = Configuration file { $path } is not valid UTF-8. The valid prefix is { $valid } bytes and the invalid sequence is { $length } bytes. Save the file as UTF-8 and retry.
-error-config-invalid-utf8-unknown-length = Configuration file { $path } is not valid UTF-8 after byte { $valid }. Save the file as UTF-8 and retry.
-error-config-invalid-toml-at = Configuration file { $path }, line { $line }, column { $column }, has invalid TOML at { $resource }. Correct that section using the current configuration contract and retry.
-error-config-invalid-toml = Configuration file { $path } has invalid TOML at { $resource }. Correct that section using the current configuration contract and retry.
-error-config-invalid-value = Invalid value for configuration field { $field }. Check that field against the current configuration documentation and retry.
-error-config-invalid-value-at-path = Invalid value for configuration field { $field } in { $path }. Check that field against the current configuration documentation and retry.
-error-config-profile-not-found = Configuration file { $path } has no translation Profile named { $profile }. Add it or pass the ID of an existing Profile.
-error-config-profile-conflict = Configuration file { $path } requested Profile { $requested }, but the command already selected { $explicit }. Use the same Profile in both places or remove one selection.
 log-label-phase-check-project = checking project
 log-label-phase-scan-source = scanning source
 log-label-phase-prepare-candidate = preparing candidate
@@ -84,19 +69,7 @@ log-label-task-complete = complete
 log-label-task-partial = partial
 log-label-task-unavailable = unavailable
 log-label-task-failed = failed
-error-project-unavailable = The project does not exist or is busy. Check the project name and retry after the other run finishes.
-error-project-state = The project state is damaged or extraction is stale. Re-run the relevant init or extract command.
-error-external-model = The model service is unavailable. Check the profile and network, then retry.
 error-state-applied-finalization = The result took effect, but finalization failed. Inspect the project state before retrying.
-error-outcome-unknown = The final outcome cannot be confirmed. Preserve the workspace and inspect recovery information before retrying.
-error-internal = ATT encountered an internal failure. No secret or model content was printed.
-error-shutdown = Required runtime finalization failed.
-error-no-reusable-extract-plan = This project has no saved Extract plan. Provide at least one of --builtin, --rules, or --lua.
-error-init-path-required = This project has no saved Init source path. Provide --path <DIR>.
-error-profile-required = This project has no saved Translate profile. Provide PROFILE_ID.
-error-saved-profile-unavailable = Saved profile { $profile } is not present in the current configuration. Pass a valid profile explicitly.
-error-rpg-maker-prompt-unavailable = The RPG Maker prompt component { $component } for the selected locale { $locale } at { $path } cannot be used, so translation has not started. Confirm that the path is a regular file containing non-empty UTF-8 text and that the template is valid.
-error-rpg-maker-language-module-unavailable = The source-language module required for { $source } → { $target } is missing, so translation has not started. Add the module to the current configuration and retry.
 error-no-executable-extract-owner = Clearing these owners leaves no executable Extract owner, so no plan was saved.
 error-plan-save-failed-applied = The command result took effect, but the new run plan was not saved. Pass the intended options explicitly next time.
 error-plan-save-outcome-unknown = The command result took effect, but the run-plan commit outcome is unknown. Pass the intended options explicitly next time.
@@ -160,9 +133,10 @@ result-translate-plan-sources = This successful run plan was saved. Profile sour
 log-run-started = Command { $command } started.
 log-run-succeeded = Command { $command } completed successfully.
 log-run-failed = Command { $command } failed.
+log-run-outcome-unknown = Command { $command } ended with an unknown final outcome; follow the recovery locations in the error.
 log-run-cancelled = Command { $command } was cancelled.
+log-performance-counters = Performance counters: SQLite transaction-control attempts { $sqlite_control_attempted_total }; full candidate-tree validations started { $candidate_validation_started }, completed { $candidate_validation_completed }.
 log-plan-resolved = Command { $command } resolved its plan from { $source }.
-log-translate-plan-resolved = Translate run plan resolved: profile source { $profile_source }, Lua source { $lua_source }.
 log-phase-started = Phase started: { $phase }.
 log-phase-finished = Phase finished: { $phase }.
 log-retry-summary = { $count ->
@@ -170,10 +144,51 @@ log-retry-summary = { $count ->
    *[other] { $count } retries were performed.
 }
 log-no-work = No work was required: { $reason }.
+log-no-work-translation-up-to-date = translations already match the current source and profile
 log-partial-result = { $count ->
     [one] 1 partial result requires attention.
    *[other] { $count } partial results require attention.
 }
-log-publish-finished = Output publication finished: { $path }.
 log-translation-task-started = Translation task { $index }/{ $total } started.
 log-translation-task-finished = Translation task { $index } finished with outcome { $outcome }.
+log-translation-task-diagnostic = Translation task { $index } reported a diagnostic after { $attempts } attempts: { $diagnostic }
+diagnostic-title = Error [{ $code }]
+diagnostic-stage = Stage: { $stage }
+diagnostic-subject = Location: { $subject }
+diagnostic-subject-value = { $kind ->
+    [command] command { $value }
+    [field] field { $value }
+    [project] project { $value }
+    [profile] profile { $value }
+    [component] component { $value }
+   *[other] { $value }
+}
+diagnostic-reason = Reason: { $reason }
+diagnostic-impact = Impact: { $impact }
+diagnostic-action = Action: { $action }
+diagnostic-recovery = Recovery: { $recovery }
+diagnostic-recovery-value = { $kind ->
+    [component] component { $value }
+    [transaction] transaction { $value }
+   *[other] { $value }
+}
+diagnostic-related = Related error { $index }:
+diagnostic-stage-value = { $code ->
+    [process_output] Process output
+   *[other] { $fallback }
+}
+diagnostic-impact-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-action-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-failure-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-io-kind-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-configuration-rule-value = { $code ->
+   *[other] { $fallback }{ $facts }
+}

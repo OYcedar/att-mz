@@ -6,8 +6,10 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use crate::diagnostic::{DiagnosticImpact, SafeDiagnostic};
 use crate::fingerprint::Sha256Fingerprint;
 
 /// 发送给 LLM 的消息角色。
@@ -206,4 +208,22 @@ pub(crate) trait LlmRequestExecutor: Send + Sync {
 /// Client 对会消费已接受译文的上层提供的能力，不携带 MZ 特有规则。
 pub(crate) trait LlmClientSemanticIdentity: Send + Sync {
     fn semantic_fingerprint(&self) -> Sha256Fingerprint;
+}
+
+/// LLM 根错误能够公开的唯一结构化投影。
+///
+/// 实现必须直接读取具体根错误的类型化字段；不得返回请求、响应正文、Header 值，
+/// 也不得通过 `Display` 或 source 链补猜事实。`retry_after` 来自同一次请求的响应头，
+/// 因而由仍同时持有根错误与请求包装事实的位置传入。
+pub(crate) trait LlmRequestDiagnosticSource {
+    fn request_diagnostic(
+        &self,
+        retry_after: Option<Duration>,
+        impact: DiagnosticImpact,
+    ) -> SafeDiagnostic;
+}
+
+/// 一个 LLM Client 对供应商活动请求数的真实外部约束。
+pub(crate) trait LlmClientConcurrency: Send + Sync {
+    fn max_concurrent_requests(&self) -> NonZeroUsize;
 }

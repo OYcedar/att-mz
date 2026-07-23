@@ -39,7 +39,7 @@ rule = []
 ```
 
 零字节文件、只有注释的文件、缺少 `rule`、未知字段、重复字段或错误类型都属于普通
-无效输入，不等于空定义。没有格式版本、旧字段别名或兼容解析。
+无效输入，不等于空定义。文件只接受本规格列出的根、字段和值。
 
 <!-- att-example: invalid -->
 ```toml
@@ -470,6 +470,12 @@ Rules 的跨来源顺序是稳定契约，不读取也不继承 OS 目录枚举�
 派生资源锁：`Intent` 表示将穿过或局部使用资源，`Exclusive` 表示拥有该精确可变资源。
 同一资源只有 `Intent + Intent` 可以共存；存在任一 `Exclusive` 就冲突。验证在组内、
 owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
+
+完整逻辑 Claim 由 group kind、location 和 recipe 决定并进入 owner 指纹。项目表
+`standard_mutation_claim` 不是这份完整清单，而是跨 owner 冲突摘要：每个
+`(owner, resource)` 至多一行；唯一 Exclusive 原样保留，共享 resource 的多个合法 Intent
+只保留自然顺序最早的 group 代表。WriteBack 会从 recipe 重建完整集合并严格验证该摘要，
+因此摘要不会放宽本节任何冲突规则。
 
 | 两个声明的关系 | 结果 |
 |---|---|

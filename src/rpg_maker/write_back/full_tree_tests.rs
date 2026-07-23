@@ -21,10 +21,17 @@ use super::{
     WriteBackInput, WriteBackLog, WriteBackLogEvent, WriteBackLogPublicationOutcome,
     WriteBackOutput, WriteBackProgressPhase, WriteBackService,
 };
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, SafeDiagnostic, SafeDiagnosticSource,
+};
 use crate::execution::OperationCompletion;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
-use crate::llm::{ChatMessage, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse};
+use crate::llm::{
+    ChatMessage, LlmFinishReason, LlmRequestDiagnosticSource, LlmRequestError, LlmRequestExecutor,
+    LlmResponse,
+};
 use crate::progress::{ProgressAmount, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::extract::document::{
@@ -42,7 +49,6 @@ use crate::rpg_maker::project_database::ProjectDatabaseRecordReadingService;
 use crate::rpg_maker::project_lease::{
     ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
 };
-use crate::rpg_maker::standard_asset::RpgMakerStandardAssetReadingConfig;
 use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
 };
@@ -93,6 +99,46 @@ impl fmt::Display for TestError {
 
 impl Error for TestError {}
 
+impl SafeDiagnosticSource for TestError {
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            stage,
+            DiagnosticSubject::component("write-back full-tree test root"),
+            DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+            impact,
+            action,
+        )
+    }
+}
+
+impl LlmRequestDiagnosticSource for TestError {
+    fn request_diagnostic(
+        &self,
+        retry_after: Option<std::time::Duration>,
+        impact: DiagnosticImpact,
+    ) -> SafeDiagnostic {
+        SafeDiagnostic::new(
+            DiagnosticCode::ModelRequest,
+            DiagnosticStage::ModelRequest,
+            DiagnosticSubject::component("write-back full-tree test LLM"),
+            DiagnosticReason::Http {
+                status: Some(503),
+                retry_after_seconds: retry_after.map(|value| value.as_secs()),
+                provider_code: Some("unavailable".to_owned()),
+                provider_type: Some("test".to_owned()),
+            },
+            impact,
+            DiagnosticAction::CheckModelService,
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FakeProjectLease;
 
@@ -133,13 +179,13 @@ impl SqliteQueryExecutor for RecordingSqliteQuery {
                 .statement()
                 .contains("FROM standard_asset_owner_state")
             {
-                Ok(rows.owners)
+                Ok(rows_for_requested_owner(rows.owners, &query))
+            } else if query.statement().contains("standard_text_unit AS unit") {
+                Ok(rows_for_requested_owner(rows.units, &query))
             } else if query.statement().contains("FROM standard_text_group") {
-                Ok(rows.groups)
-            } else if query.statement().contains("FROM standard_text_unit") {
-                Ok(rows.units)
+                Ok(rows_for_requested_owner(rows.groups, &query))
             } else if query.statement().contains("FROM standard_mutation_claim") {
-                Ok(rows.claims)
+                Ok(rows_for_requested_owner(rows.claims, &query))
             } else {
                 Err(QueryExistingDatabaseError::QueryFailed(TestError(
                     "意外的全树测试查询",
@@ -256,7 +302,6 @@ impl CpuTaskExecutor for InlineCpuExecutor {
 #[derive(Clone, Default)]
 struct RecordingRecoverablePublisher {
     requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
-    validation_calls: Arc<Mutex<Vec<PathBuf>>>,
     publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishIntent)>>>,
     discard_calls: Arc<Mutex<Vec<PathBuf>>>,
     publish_error: Arc<Mutex<Option<DirectoryPublishError<TestError>>>>,
@@ -339,17 +384,6 @@ impl ScopedDirectoryEditor for RecordingRecoverablePublisher {
     + use<> {
         let root = candidate.staging_root().to_path_buf();
         std::future::ready(Ok(BoundScopedDirectory::new(root, scope, ())))
-    }
-
-    fn validate_scoped_directory(
-        &self,
-        scope: &BoundScopedDirectory<Self::ScopeState>,
-    ) -> impl Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send + use<>
-    {
-        let calls = Arc::clone(&self.validation_calls);
-        let root = scope.root().to_path_buf();
-        calls.lock().expect("候选校验记录锁不应中毒").push(root);
-        std::future::ready(Ok(()))
     }
 
     fn read_scoped_file(
@@ -659,7 +693,6 @@ struct FullTreeObservations {
     file_calls: Arc<Mutex<Vec<PathBuf>>>,
     cpu_calls: Arc<AtomicUsize>,
     publish_requests: Arc<Mutex<Vec<DirectoryStageRequest>>>,
-    validation_calls: Arc<Mutex<Vec<PathBuf>>>,
     publish_calls: Arc<Mutex<Vec<(PathBuf, PathBuf, DirectoryPublishIntent)>>>,
     discard_calls: Arc<Mutex<Vec<PathBuf>>>,
     log_events: Arc<Mutex<Vec<WriteBackLogEvent>>>,
@@ -733,11 +766,8 @@ fn build_full_tree_with_publish_error(
         resolver.clone(),
         MatchingDirectoryTreeFingerprinter,
     );
-    let asset_reader = RpgMakerStandardWriteBackAssetReadingService::new(
-        sqlite.clone(),
-        cpu.clone(),
-        RpgMakerStandardAssetReadingConfig::new(non_zero(2)),
-    );
+    let asset_reader =
+        RpgMakerStandardWriteBackAssetReadingService::new(sqlite.clone(), cpu.clone());
     let document_reader = RpgMakerProjectDocumentReadingService::new(
         file_reader.clone(),
         file_reader.clone(),
@@ -797,7 +827,6 @@ fn build_full_tree_with_publish_error(
         file_calls: file_reader.calls,
         cpu_calls: cpu.calls,
         publish_requests: directory_publisher.requests,
-        validation_calls: directory_publisher.validation_calls,
         publish_calls: directory_publisher.publish_calls,
         discard_calls: directory_publisher.discard_calls,
         log_events: project_log.events,
@@ -1033,7 +1062,7 @@ fn assert_project_open_and_asset_queries(observations: &FullTreeObservations) {
         .sqlite_calls
         .lock()
         .expect("SQLite 记录锁不应中毒");
-    assert_eq!(calls.len(), 5);
+    assert_eq!(calls.len(), 11);
     assert!(calls[0].1.statement().contains("FROM metadata"));
     assert!(
         calls[1]
@@ -1041,20 +1070,27 @@ fn assert_project_open_and_asset_queries(observations: &FullTreeObservations) {
             .statement()
             .contains("FROM standard_asset_owner_state")
     );
-    assert!(calls[2].1.statement().contains("FROM standard_text_group"));
-    assert!(calls[3].1.statement().contains("FROM standard_text_unit"));
-    assert!(
-        calls[4]
-            .1
-            .statement()
-            .contains("FROM standard_mutation_claim")
-    );
+    for (offset, statement_fragment) in [
+        (2, "FROM standard_text_group"),
+        (5, "standard_text_unit AS unit"),
+        (8, "FROM standard_mutation_claim"),
+    ] {
+        for (owner_offset, owner) in ["builtin", "rules", "lua"].into_iter().enumerate() {
+            let query = &calls[offset + owner_offset].1;
+            assert!(query.statement().contains(statement_fragment));
+            assert_eq!(query.parameters(), &[SqliteValue::Text(owner.to_owned())]);
+        }
+    }
     assert!(
         calls
             .iter()
             .all(|(_, query)| !query.statement().contains("UNION ALL"))
     );
-    assert!(calls.iter().all(|(_, query)| query.parameters().is_empty()));
+    assert!(
+        calls[..2]
+            .iter()
+            .all(|(_, query)| query.parameters().is_empty())
+    );
     assert!(calls.iter().all(|(path, _)| path == &database_path()));
     drop(calls);
 
@@ -1120,14 +1156,6 @@ fn assert_published_documents(
     assert_eq!(publish_calls[0].0, workspace_root().join("write_back"));
     assert_eq!(publish_calls[0].2, DirectoryPublishIntent::ReplaceExisting);
     drop(publish_calls);
-    assert_eq!(
-        observations
-            .validation_calls
-            .lock()
-            .expect("候选校验记录锁不应中毒")
-            .as_slice(),
-        [workspace_root().join("write_back.att-stage")]
-    );
     assert!(
         observations
             .discard_calls
@@ -1459,6 +1487,16 @@ fn snapshot_row_text(row: &SqliteRow, index: usize) -> &str {
             value.kind_name()
         ),
     }
+}
+
+fn rows_for_requested_owner(rows: Vec<SqliteRow>, query: &SqliteQuery) -> Vec<SqliteRow> {
+    let requested_owner = query.parameters().first().and_then(|value| match value {
+        SqliteValue::Text(owner) => Some(owner.as_str()),
+        _ => None,
+    });
+    rows.into_iter()
+        .filter(|row| requested_owner.is_none_or(|owner| snapshot_row_text(row, 0) == owner))
+        .collect()
 }
 
 struct FixtureGroup {

@@ -1,6 +1,6 @@
 //! RPG Maker 写回文本的保守显示布局。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -360,8 +360,15 @@ struct BreakCandidate {
 fn wrap_line(tokens: &[DisplayToken<'_>], max_cells: u64) -> Option<Vec<String>> {
     let candidates = collect_break_candidates(tokens);
     let min_tail_cells = MAX_TAIL_CELLS.min(max_cells.div_ceil(4));
-    let mut memo = BTreeMap::new();
-    let ranges = find_wrapped_ranges(tokens, &candidates, 0, max_cells, min_tail_cells, &mut memo)?;
+    let mut observation = WrapSearchObservation::default();
+    let index = WrapLineIndex::new(tokens, &mut observation);
+    let ranges = find_wrapped_ranges(
+        &index,
+        &candidates,
+        max_cells,
+        min_tail_cells,
+        &mut observation,
+    )?;
     Some(
         ranges
             .into_iter()
@@ -370,65 +377,232 @@ fn wrap_line(tokens: &[DisplayToken<'_>], max_cells: u64) -> Option<Vec<String>>
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WrapDecision {
+    Final,
+    Break(BreakCandidate),
+}
+
+/// 为一条显示行预计算可重复使用的宽度与可见字符索引。
+///
+/// 宽度前缀使用 `u128`，最后再饱和收窄到 `u64`，因此与原先对任意子区间逐项
+/// `saturating_add` 的结果一致，同时避免搜索每个断点时重新扫描同一批 token。
+struct WrapLineIndex<'tokens, 'text> {
+    tokens: &'tokens [DisplayToken<'text>],
+    width_prefix: Vec<u128>,
+    next_visible: Vec<usize>,
+    previous_visible: Vec<usize>,
+}
+
+impl<'tokens, 'text> WrapLineIndex<'tokens, 'text> {
+    fn new(
+        tokens: &'tokens [DisplayToken<'text>],
+        observation: &mut WrapSearchObservation,
+    ) -> Self {
+        let mut width_prefix: Vec<u128> = Vec::with_capacity(tokens.len() + 1);
+        width_prefix.push(0);
+        for token in tokens {
+            observation.observe_prefix_token();
+            let accumulated = width_prefix
+                .last()
+                .copied()
+                .expect("宽度前缀必须包含零起点")
+                .checked_add(u128::from(token.width_cells))
+                .expect("单行 token 总宽度不可能超过 u128");
+            width_prefix.push(accumulated);
+        }
+
+        let sentinel = tokens.len();
+        let mut next_visible = vec![sentinel; tokens.len() + 1];
+        for index in (0..tokens.len()).rev() {
+            next_visible[index] = if tokens[index].kind == DisplayTokenKind::Visible {
+                index
+            } else {
+                next_visible[index + 1]
+            };
+        }
+
+        let mut previous_visible = vec![sentinel; tokens.len() + 1];
+        for end in 1..=tokens.len() {
+            previous_visible[end] = if tokens[end - 1].kind == DisplayTokenKind::Visible {
+                end - 1
+            } else {
+                previous_visible[end - 1]
+            };
+        }
+
+        Self {
+            tokens,
+            width_prefix,
+            next_visible,
+            previous_visible,
+        }
+    }
+
+    fn range_width(
+        &self,
+        start: usize,
+        end: usize,
+        observation: &mut WrapSearchObservation,
+    ) -> u64 {
+        observation.observe_width_query();
+        let width = self.width_prefix[end] - self.width_prefix[start];
+        u64::try_from(width).unwrap_or(u64::MAX)
+    }
+
+    fn valid_output_range(
+        &self,
+        start: usize,
+        end: usize,
+        observation: &mut WrapSearchObservation,
+    ) -> bool {
+        observation.observe_range_validation();
+        let first = self.next_visible[start];
+        if first >= end {
+            return false;
+        }
+        let last = self.previous_visible[end];
+        debug_assert!(last >= first && last < end);
+        !is_line_start_prohibited(self.tokens[first].text)
+            && !is_pair_opener(self.tokens[last].text)
+    }
+}
+
+#[derive(Default)]
+struct WrapSearchObservation {
+    #[cfg(test)]
+    prefix_tokens: usize,
+    #[cfg(test)]
+    states: usize,
+    #[cfg(test)]
+    width_queries: usize,
+    #[cfg(test)]
+    candidate_checks: usize,
+    #[cfg(test)]
+    range_validations: usize,
+}
+
+impl WrapSearchObservation {
+    #[inline]
+    fn observe_prefix_token(&mut self) {
+        #[cfg(test)]
+        {
+            self.prefix_tokens += 1;
+        }
+    }
+
+    #[inline]
+    fn observe_state(&mut self) {
+        #[cfg(test)]
+        {
+            self.states += 1;
+        }
+    }
+
+    #[inline]
+    fn observe_width_query(&mut self) {
+        #[cfg(test)]
+        {
+            self.width_queries += 1;
+        }
+    }
+
+    #[inline]
+    fn observe_candidate_check(&mut self) {
+        #[cfg(test)]
+        {
+            self.candidate_checks += 1;
+        }
+    }
+
+    #[inline]
+    fn observe_range_validation(&mut self) {
+        #[cfg(test)]
+        {
+            self.range_validations += 1;
+        }
+    }
+}
+
 fn find_wrapped_ranges(
-    tokens: &[DisplayToken<'_>],
+    index: &WrapLineIndex<'_, '_>,
     candidates: &[BreakCandidate],
-    start: usize,
     max_cells: u64,
     min_tail_cells: u64,
-    memo: &mut BTreeMap<usize, Option<Vec<(usize, usize)>>>,
+    observation: &mut WrapSearchObservation,
 ) -> Option<Vec<(usize, usize)>> {
-    if let Some(cached) = memo.get(&start) {
-        return cached.clone();
-    }
+    let token_count = index.tokens.len();
+    let mut starts = Vec::with_capacity(candidates.len() + 1);
+    starts.push(0);
+    starts.extend(candidates.iter().map(|candidate| candidate.tail_start));
+    starts.sort_unstable();
+    starts.dedup();
 
-    let remaining_width = range_width(tokens, start, tokens.len());
-    if remaining_width <= max_cells {
-        let result = (remaining_width >= min_tail_cells
-            && valid_output_range(tokens, start, tokens.len()))
-        .then_some(vec![(start, tokens.len())]);
-        memo.insert(start, result.clone());
-        return result;
-    }
-
-    let mut viable = candidates
-        .iter()
-        .copied()
-        .filter(|candidate| candidate.head_end > start && candidate.tail_start > start)
-        .filter_map(|candidate| {
-            let width = range_width(tokens, start, candidate.head_end);
-            (width <= max_cells
-                && width.saturating_mul(100) >= max_cells.saturating_mul(45)
-                && valid_output_range(tokens, start, candidate.head_end))
-            .then_some((candidate, width))
-        })
-        .collect::<Vec<_>>();
-    viable.sort_by(|(left, left_width), (right, right_width)| {
-        right_width
-            .cmp(left_width)
-            .then_with(|| right.head_end.cmp(&left.head_end))
-    });
-
-    for (candidate, _) in viable {
-        let Some(mut tail) = find_wrapped_ranges(
-            tokens,
-            candidates,
-            candidate.tail_start,
-            max_cells,
-            min_tail_cells,
-            memo,
-        ) else {
+    // 每个断点只会前进，因此从后向前计算即可替代递归和整条结果链克隆。
+    let mut decisions = vec![None; token_count + 1];
+    for &start in starts.iter().rev() {
+        observation.observe_state();
+        let remaining_width = index.range_width(start, token_count, observation);
+        if remaining_width <= max_cells {
+            if remaining_width >= min_tail_cells
+                && index.valid_output_range(start, token_count, observation)
+            {
+                decisions[start] = Some(WrapDecision::Final);
+            }
             continue;
-        };
-        let mut ranges = Vec::with_capacity(tail.len() + 1);
-        ranges.push((start, candidate.head_end));
-        ranges.append(&mut tail);
-        memo.insert(start, Some(ranges.clone()));
-        return Some(ranges);
+        }
+
+        let first_after_start = candidates.partition_point(|candidate| candidate.head_end <= start);
+        let fits_end = first_after_start
+            + candidates[first_after_start..].partition_point(|candidate| {
+                index.range_width(start, candidate.head_end, observation) <= max_cells
+            });
+        let minimum_width_end = max_cells.saturating_mul(45);
+        let viable_start = first_after_start
+            + candidates[first_after_start..fits_end].partition_point(|candidate| {
+                index
+                    .range_width(start, candidate.head_end, observation)
+                    .saturating_mul(100)
+                    < minimum_width_end
+            });
+
+        // 原实现按「宽度降序、head_end 降序」稳定排序。宽度随 head_end 单调，
+        // 因此倒序访问 head_end 分组、组内仍按原始 tail_start 顺序访问即可完全复现。
+        let mut group_end = fits_end;
+        'candidate_groups: while group_end > viable_start {
+            let head_end = candidates[group_end - 1].head_end;
+            let group_start = viable_start
+                + candidates[viable_start..group_end]
+                    .partition_point(|candidate| candidate.head_end < head_end);
+            for &candidate in &candidates[group_start..group_end] {
+                observation.observe_candidate_check();
+                if candidate.tail_start <= start
+                    || !index.valid_output_range(start, candidate.head_end, observation)
+                    || decisions[candidate.tail_start].is_none()
+                {
+                    continue;
+                }
+                decisions[start] = Some(WrapDecision::Break(candidate));
+                break 'candidate_groups;
+            }
+            group_end = group_start;
+        }
     }
 
-    memo.insert(start, None);
-    None
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    loop {
+        match decisions.get(start).copied().flatten()? {
+            WrapDecision::Final => {
+                ranges.push((start, token_count));
+                return Some(ranges);
+            }
+            WrapDecision::Break(candidate) => {
+                ranges.push((start, candidate.head_end));
+                start = candidate.tail_start;
+            }
+        }
+    }
 }
 
 fn collect_break_candidates(tokens: &[DisplayToken<'_>]) -> Vec<BreakCandidate> {
@@ -486,17 +660,6 @@ fn is_break_punctuation(tokens: &[DisplayToken<'_>], index: usize) -> bool {
         .is_none_or(|next| next.kind == DisplayTokenKind::Whitespace || is_pair_closer(next.text))
 }
 
-fn valid_output_range(tokens: &[DisplayToken<'_>], start: usize, end: usize) -> bool {
-    let mut significant = tokens[start..end]
-        .iter()
-        .filter(|token| token.kind == DisplayTokenKind::Visible);
-    let Some(first) = significant.next() else {
-        return false;
-    };
-    let last = significant.next_back().unwrap_or(first);
-    !is_line_start_prohibited(first.text) && !is_pair_opener(last.text)
-}
-
 fn is_line_start_prohibited(text: &str) -> bool {
     is_pair_closer(text)
         || matches!(
@@ -526,10 +689,6 @@ fn is_pair_closer(text: &str) -> bool {
         text,
         "」" | "』" | "”" | "）" | "】" | "》" | "〉" | "〕" | "］" | "｝"
     )
-}
-
-fn range_width(tokens: &[DisplayToken<'_>], start: usize, end: usize) -> u64 {
-    line_width(&tokens[start..end])
 }
 
 fn join_tokens(tokens: &[DisplayToken<'_>]) -> String {
@@ -714,6 +873,122 @@ mod tests {
         RpgMakerWriteBackLayoutProfile::new(width(dialogue), width(scrolling), width(help))
     }
 
+    fn reference_wrap_line(tokens: &[DisplayToken<'_>], max_cells: u64) -> Option<Vec<String>> {
+        let candidates = collect_break_candidates(tokens);
+        let min_tail_cells = MAX_TAIL_CELLS.min(max_cells.div_ceil(4));
+        let mut memo = std::collections::BTreeMap::new();
+        let ranges = reference_find_wrapped_ranges(
+            tokens,
+            &candidates,
+            0,
+            max_cells,
+            min_tail_cells,
+            &mut memo,
+        )?;
+        Some(
+            ranges
+                .into_iter()
+                .map(|(start, end)| join_tokens(&tokens[start..end]))
+                .collect(),
+        )
+    }
+
+    fn reference_find_wrapped_ranges(
+        tokens: &[DisplayToken<'_>],
+        candidates: &[BreakCandidate],
+        start: usize,
+        max_cells: u64,
+        min_tail_cells: u64,
+        memo: &mut std::collections::BTreeMap<usize, Option<Vec<(usize, usize)>>>,
+    ) -> Option<Vec<(usize, usize)>> {
+        if let Some(cached) = memo.get(&start) {
+            return cached.clone();
+        }
+
+        let remaining_width = line_width(&tokens[start..]);
+        if remaining_width <= max_cells {
+            let result = (remaining_width >= min_tail_cells
+                && reference_valid_output_range(tokens, start, tokens.len()))
+            .then_some(vec![(start, tokens.len())]);
+            memo.insert(start, result.clone());
+            return result;
+        }
+
+        let mut viable = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.head_end > start && candidate.tail_start > start)
+            .filter_map(|candidate| {
+                let width = line_width(&tokens[start..candidate.head_end]);
+                (width <= max_cells
+                    && width.saturating_mul(100) >= max_cells.saturating_mul(45)
+                    && reference_valid_output_range(tokens, start, candidate.head_end))
+                .then_some((candidate, width))
+            })
+            .collect::<Vec<_>>();
+        viable.sort_by(|(left, left_width), (right, right_width)| {
+            right_width
+                .cmp(left_width)
+                .then_with(|| right.head_end.cmp(&left.head_end))
+        });
+
+        for (candidate, _) in viable {
+            let Some(mut tail) = reference_find_wrapped_ranges(
+                tokens,
+                candidates,
+                candidate.tail_start,
+                max_cells,
+                min_tail_cells,
+                memo,
+            ) else {
+                continue;
+            };
+            let mut ranges = Vec::with_capacity(tail.len() + 1);
+            ranges.push((start, candidate.head_end));
+            ranges.append(&mut tail);
+            memo.insert(start, Some(ranges.clone()));
+            return Some(ranges);
+        }
+
+        memo.insert(start, None);
+        None
+    }
+
+    fn reference_valid_output_range(tokens: &[DisplayToken<'_>], start: usize, end: usize) -> bool {
+        let mut significant = tokens[start..end]
+            .iter()
+            .filter(|token| token.kind == DisplayTokenKind::Visible);
+        let Some(first) = significant.next() else {
+            return false;
+        };
+        let last = significant.next_back().unwrap_or(first);
+        !is_line_start_prohibited(first.text) && !is_pair_opener(last.text)
+    }
+
+    fn observed_wrap_line(
+        tokens: &[DisplayToken<'_>],
+        max_cells: u64,
+    ) -> (Option<Vec<String>>, WrapSearchObservation) {
+        let candidates = collect_break_candidates(tokens);
+        let min_tail_cells = MAX_TAIL_CELLS.min(max_cells.div_ceil(4));
+        let mut observation = WrapSearchObservation::default();
+        let index = WrapLineIndex::new(tokens, &mut observation);
+        let wrapped = find_wrapped_ranges(
+            &index,
+            &candidates,
+            max_cells,
+            min_tail_cells,
+            &mut observation,
+        )
+        .map(|ranges| {
+            ranges
+                .into_iter()
+                .map(|(start, end)| join_tokens(&tokens[start..end]))
+                .collect()
+        });
+        (wrapped, observation)
+    }
+
     #[test]
     fn shared_layout_uses_the_selected_region_from_the_actual_profile() {
         let pairs = vec![RpgMakerLayoutTextPair::new(
@@ -838,6 +1113,69 @@ mod tests {
         let tokens = scan_line(r"\C[1]甲\.\G\SE[11-nb]乙").expect("控制符应可扫描");
 
         assert_eq!(line_width(&tokens), 4);
+    }
+
+    #[test]
+    fn indexed_wrap_search_matches_the_previous_selection_semantics() {
+        const FRAGMENTS: &[&str] = &[
+            "甲", "乙", "A", "，", "。", " ", "  ", "「", "」", "（", "）", "…", r"\C[1]", "\u{a0}",
+        ];
+        let mut state = 0x7a31_49d2_u32;
+        for case_index in 0..64usize {
+            let fragment_count = 8 + case_index % 25;
+            let mut line = String::new();
+            for _ in 0..fragment_count {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                line.push_str(FRAGMENTS[(state as usize) % FRAGMENTS.len()]);
+            }
+            let tokens = scan_line(&line).expect("固定片段生成的文本必须可扫描");
+            for max_cells in 1..=24 {
+                assert_eq!(
+                    wrap_line(&tokens, max_cells),
+                    reference_wrap_line(&tokens, max_cells),
+                    "索引搜索必须保持旧选择，case={case_index}, max_cells={max_cells}, line={line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_search_precomputes_width_once_and_has_at_most_quadratic_candidate_work() {
+        let mut line = "甲乙，".repeat(512);
+        line.push_str("丙丁。");
+        let tokens = scan_line(&line).expect("复杂度样本必须可扫描");
+        let candidates = collect_break_candidates(&tokens);
+
+        let (wrapped, observation) = observed_wrap_line(&tokens, 12);
+
+        assert!(wrapped.is_some(), "复杂度样本必须存在安全换行方案");
+        assert_eq!(
+            observation.prefix_tokens,
+            tokens.len(),
+            "token 宽度只能在线性前缀构建时读取一次"
+        );
+        assert!(
+            observation.states <= candidates.len() + 1,
+            "搜索状态只能来自起点和断点 tail_start"
+        );
+        assert!(
+            observation.candidate_checks <= observation.states.saturating_mul(candidates.len()),
+            "每个状态不得重复检查同一个断点候选"
+        );
+        assert!(
+            observation.width_queries
+                <= observation
+                    .states
+                    .saturating_mul(1 + 2 * usize::BITS as usize),
+            "宽度查找应通过两次二分保持在每状态 O(log candidate)"
+        );
+        assert!(
+            observation.range_validations
+                <= observation
+                    .candidate_checks
+                    .saturating_add(observation.states),
+            "可见字符边界只能按候选或最终尾段做 O(1) 查询"
+        );
     }
 
     #[test]

@@ -50,21 +50,6 @@ cli-argument-conflict = Không thể dùng { $argument } cùng các đối số 
 cli-wrong-number-of-values = Số lượng giá trị cho { $argument } không đúng.
 cli-invalid-utf8 = Một đối số dòng lệnh không phải Unicode hợp lệ.
 cli-parse-failure = Không thể phân tích dòng lệnh.
-error-configuration-or-input-generic = Cấu hình hoặc đầu vào lệnh không hợp lệ nên không có gì thay đổi. Hãy kiểm tra các tùy chọn và trường cấu hình được chỉ ra rồi thử lại.
-error-config-current-directory-not-absolute = ATT không thể phân giải --config vì thư mục làm việc hiện tại { $path } không phải đường dẫn tuyệt đối. Hãy chạy ATT từ thư mục hợp lệ hoặc truyền đường dẫn cấu hình tuyệt đối.
-error-config-empty-path = --config không được để trống. Hãy truyền đường dẫn tệp cấu hình ATT.
-error-config-open = ATT không thể mở tệp cấu hình { $path }. Hãy kiểm tra tệp tồn tại và bạn có quyền đọc.
-error-config-not-a-file = Đường dẫn cấu hình { $path } không phải tệp thông thường. Hãy truyền tệp cấu hình thay vì thư mục hoặc tệp đặc biệt.
-error-config-too-large = Tệp cấu hình { $path } có kích thước { $observed } byte; giới hạn là { $maximum } byte. Hãy giảm kích thước tệp rồi thử lại.
-error-config-read = ATT không thể đọc tệp cấu hình { $path }. Hãy kiểm tra quyền và tình trạng lưu trữ rồi thử lại.
-error-config-invalid-utf8-known-length = Tệp cấu hình { $path } không phải UTF-8 hợp lệ. Tiền tố hợp lệ dài { $valid } byte và chuỗi không hợp lệ dài { $length } byte. Hãy lưu tệp dưới dạng UTF-8 rồi thử lại.
-error-config-invalid-utf8-unknown-length = Tệp cấu hình { $path } không phải UTF-8 hợp lệ sau byte { $valid }. Hãy lưu tệp dưới dạng UTF-8 rồi thử lại.
-error-config-invalid-toml-at = Tệp cấu hình { $path }, dòng { $line }, cột { $column }, có TOML không hợp lệ tại { $resource }. Hãy sửa phần đó theo hợp đồng cấu hình hiện tại rồi thử lại.
-error-config-invalid-toml = Tệp cấu hình { $path } có TOML không hợp lệ tại { $resource }. Hãy sửa phần đó theo hợp đồng cấu hình hiện tại rồi thử lại.
-error-config-invalid-value = Giá trị của trường cấu hình { $field } không hợp lệ. Hãy đối chiếu trường này với tài liệu cấu hình hiện tại rồi thử lại.
-error-config-invalid-value-at-path = Giá trị của trường cấu hình { $field } trong { $path } không hợp lệ. Hãy đối chiếu trường này với tài liệu cấu hình hiện tại rồi thử lại.
-error-config-profile-not-found = Tệp cấu hình { $path } không có Profile dịch tên { $profile }. Hãy thêm nó hoặc truyền ID của một Profile hiện có.
-error-config-profile-conflict = Tệp cấu hình { $path } yêu cầu Profile { $requested }, nhưng lệnh đã chọn { $explicit }. Hãy dùng cùng một Profile ở cả hai nơi hoặc bỏ một lựa chọn.
 log-label-phase-check-project = kiểm tra dự án
 log-label-phase-scan-source = quét nguồn
 log-label-phase-prepare-candidate = chuẩn bị bản ứng viên
@@ -84,19 +69,7 @@ log-label-task-complete = hoàn tất
 log-label-task-partial = một phần
 log-label-task-unavailable = không khả dụng
 log-label-task-failed = thất bại
-error-project-unavailable = Dự án không tồn tại hoặc đang bận. Hãy kiểm tra tên và thử lại sau khi lần chạy khác kết thúc.
-error-project-state = Trạng thái dự án bị hỏng hoặc dữ liệu trích xuất đã cũ. Hãy chạy lại lệnh Init hoặc Extract liên quan.
-error-external-model = Dịch vụ mô hình không khả dụng. Hãy kiểm tra Profile và mạng rồi thử lại.
 error-state-applied-finalization = Kết quả đã có hiệu lực nhưng bước hoàn tất thất bại. Hãy kiểm tra trạng thái dự án trước khi thử lại.
-error-outcome-unknown = Không thể xác nhận kết quả cuối. Hãy giữ nguyên không gian làm việc và kiểm tra thông tin phục hồi trước khi thử lại.
-error-internal = ATT gặp lỗi nội bộ. Không có bí mật hoặc nội dung mô hình nào được in ra.
-error-shutdown = Bước hoàn tất runtime bắt buộc thất bại.
-error-no-reusable-extract-plan = Dự án chưa có kế hoạch Extract đã lưu. Hãy cung cấp ít nhất một trong --builtin, --rules hoặc --lua.
-error-init-path-required = Dự án chưa có đường dẫn nguồn Init đã lưu. Hãy cung cấp --path <DIR>.
-error-profile-required = Dự án chưa có Profile Translate đã lưu. Hãy cung cấp PROFILE_ID.
-error-saved-profile-unavailable = Profile đã lưu { $profile } không có trong cấu hình hiện tại. Hãy chỉ định một Profile hợp lệ.
-error-rpg-maker-prompt-unavailable = Không thể sử dụng thành phần prompt RPG Maker { $component } cho locale đã chọn { $locale } tại { $path }, vì vậy quá trình dịch chưa bắt đầu. Hãy xác nhận đường dẫn trỏ đến một tệp thông thường chứa văn bản UTF-8 không rỗng và mẫu hợp lệ.
-error-rpg-maker-language-module-unavailable = Thiếu mô-đun ngôn ngữ nguồn cần thiết cho { $source } → { $target }, vì vậy quá trình dịch chưa bắt đầu. Hãy thêm mô-đun vào cấu hình hiện tại rồi thử lại.
 error-no-executable-extract-owner = Sau khi xóa không còn owner Extract có thể chạy, vì vậy kế hoạch không được lưu.
 error-plan-save-failed-applied = Kết quả lệnh đã có hiệu lực nhưng kế hoạch chạy mới không được lưu. Lần tới hãy chỉ định rõ các tùy chọn mong muốn.
 error-plan-save-outcome-unknown = Kết quả lệnh đã có hiệu lực nhưng không thể xác nhận commit kế hoạch chạy. Lần tới hãy chỉ định rõ các tùy chọn mong muốn.
@@ -157,14 +130,56 @@ result-translate-plan-sources = Đã lưu kế hoạch của lần chạy thành
 log-run-started = Lệnh { $command } đã bắt đầu.
 log-run-succeeded = Lệnh { $command } đã hoàn tất thành công.
 log-run-failed = Lệnh { $command } thất bại.
+log-run-outcome-unknown = Lệnh { $command } đã kết thúc nhưng kết quả cuối cùng chưa xác định; hãy làm theo các vị trí khôi phục trong lỗi.
 log-run-cancelled = Lệnh { $command } đã bị hủy.
+log-performance-counters = Bộ đếm hiệu năng: số lần thử điều khiển giao dịch SQLite { $sqlite_control_attempted_total }; xác thực toàn bộ cây ứng viên đã bắt đầu { $candidate_validation_started }, đã hoàn tất { $candidate_validation_completed }.
 log-plan-resolved = Lệnh { $command } lấy kế hoạch từ { $source }.
-log-translate-plan-resolved = Đã phân giải kế hoạch chạy Translate: nguồn Profile { $profile_source }, nguồn Lua { $lua_source }.
 log-phase-started = Bắt đầu giai đoạn: { $phase }.
 log-phase-finished = Hoàn tất giai đoạn: { $phase }.
 log-retry-summary = Đã thực hiện { $count } lần thử lại.
 log-no-work = Không cần công việc: { $reason }.
+log-no-work-translation-up-to-date = bản dịch đã khớp với nguồn và hồ sơ hiện tại
 log-partial-result = Có { $count } kết quả một phần cần chú ý.
-log-publish-finished = Xuất bản đầu ra hoàn tất: { $path }.
 log-translation-task-started = Tác vụ dịch { $index }/{ $total } đã bắt đầu.
 log-translation-task-finished = Tác vụ dịch { $index } kết thúc với kết quả { $outcome }.
+log-translation-task-diagnostic = Tác vụ dịch { $index } báo chẩn đoán sau { $attempts } lần thử: { $diagnostic }
+diagnostic-title = Lỗi [{ $code }]
+diagnostic-stage = Giai đoạn: { $stage }
+diagnostic-subject = Vị trí: { $subject }
+diagnostic-subject-value = { $kind ->
+    [command] lệnh { $value }
+    [field] trường { $value }
+    [project] dự án { $value }
+    [profile] hồ sơ { $value }
+    [component] thành phần { $value }
+   *[other] { $value }
+}
+diagnostic-reason = Nguyên nhân: { $reason }
+diagnostic-impact = Ảnh hưởng: { $impact }
+diagnostic-action = Cách xử lý: { $action }
+diagnostic-recovery = Khôi phục: { $recovery }
+diagnostic-recovery-value = { $kind ->
+    [component] thành phần { $value }
+    [transaction] giao dịch { $value }
+   *[other] { $value }
+}
+diagnostic-related = Lỗi liên quan { $index }:
+diagnostic-stage-value = { $code ->
+    [process_output] Đầu ra tiến trình
+   *[other] { $fallback }
+}
+diagnostic-impact-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-action-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-failure-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-io-kind-value = { $code ->
+   *[other] { $fallback }
+}
+diagnostic-configuration-rule-value = { $code ->
+   *[other] { $fallback }{ $facts }
+}

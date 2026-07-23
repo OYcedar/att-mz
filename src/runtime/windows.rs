@@ -10,8 +10,9 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -32,6 +33,11 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+
+use crate::diagnostic::{
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic,
+};
 
 /// Win32 文件系统边界保留的精确失败。
 #[derive(Debug)]
@@ -54,9 +60,8 @@ pub(crate) enum WindowsFsError {
     CaseSensitiveDirectory {
         path: PathBuf,
     },
-    LockTimeout {
+    LockCancelled {
         path: PathBuf,
-        timeout: Duration,
     },
     RenameTargetExists {
         path: PathBuf,
@@ -68,6 +73,101 @@ pub(crate) enum WindowsFsError {
         operation: &'static str,
         status: i32,
     },
+}
+
+impl WindowsFsError {
+    /// 在仍持有 Win32/NTSTATUS 类型化事实的位置建立公开诊断，不读取 `Display`。
+    pub(crate) fn safe_diagnostic(
+        &self,
+        code: DiagnosticCode,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => SafeDiagnostic::io(
+                code,
+                stage,
+                DiagnosticSubject::path(path),
+                operation,
+                source,
+                impact,
+                DiagnosticAction::CheckPathAndPermissions,
+            ),
+            Self::ReparsePoint { path } => SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::ReparsePointForbidden),
+                impact,
+                fallback_action,
+            ),
+            Self::NonLocalVolume { path } => SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::NonLocalVolume),
+                impact,
+                fallback_action,
+            ),
+            Self::NonNtfsVolume { path, actual } => SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::NonNtfsVolume),
+                impact,
+                fallback_action,
+            )
+            .with_recovery(RecoveryFact::component(format!("filesystem={actual}"))),
+            Self::CaseSensitiveDirectory { path } => SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::CaseSensitiveDirectory),
+                impact,
+                fallback_action,
+            ),
+            Self::LockCancelled { path } => SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::LockCancelled),
+                impact,
+                DiagnosticAction::Retry,
+            ),
+            Self::RenameTargetExists { path } => SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
+                impact,
+                fallback_action,
+            ),
+            Self::FileIdentityChanged { path } => SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::FileIdentityChanged),
+                impact,
+                fallback_action,
+            ),
+            Self::Cryptography { operation, status } => SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::operation(operation),
+                DiagnosticReason::WindowsStatus {
+                    operation: (*operation).to_owned(),
+                    status: *status,
+                },
+                impact,
+                DiagnosticAction::Retry,
+            ),
+        }
+    }
 }
 
 impl fmt::Display for WindowsFsError {
@@ -96,12 +196,9 @@ impl fmt::Display for WindowsFsError {
             Self::CaseSensitiveDirectory { path } => {
                 write!(formatter, "目录启用了大小写敏感语义：{}", path.display())
             }
-            Self::LockTimeout { path, timeout } => write!(
-                formatter,
-                "在 {} 毫秒内无法取得文件锁：{}",
-                timeout.as_millis(),
-                path.display()
-            ),
+            Self::LockCancelled { path } => {
+                write!(formatter, "等待文件锁已取消：{}", path.display())
+            }
             Self::RenameTargetExists { path } => {
                 write!(formatter, "无覆盖重命名的目标已经存在：{}", path.display())
             }
@@ -127,7 +224,7 @@ impl std::error::Error for WindowsFsError {
             | Self::NonLocalVolume { .. }
             | Self::NonNtfsVolume { .. }
             | Self::CaseSensitiveDirectory { .. }
-            | Self::LockTimeout { .. }
+            | Self::LockCancelled { .. }
             | Self::RenameTargetExists { .. }
             | Self::FileIdentityChanged { .. }
             | Self::Cryptography { .. } => None,
@@ -656,7 +753,10 @@ pub(crate) struct ExclusiveFileLock {
 unsafe impl Send for ExclusiveFileLock {}
 
 impl ExclusiveFileLock {
-    pub(crate) fn acquire(path: &Path, timeout: Duration) -> Result<Self, WindowsFsError> {
+    pub(crate) fn acquire(
+        path: &Path,
+        continue_waiting: &AtomicBool,
+    ) -> Result<Self, WindowsFsError> {
         let parent_path = path.parent().ok_or_else(|| {
             io_error(
                 "打开锁文件",
@@ -675,8 +775,12 @@ impl ExclusiveFileLock {
             .map_err(|source| io_error("打开锁文件", path, source))?;
         reject_reparse(&file, path)?;
         let mut overlapped = OVERLAPPED::default();
-        let started_at = Instant::now();
         loop {
+            if !continue_waiting.load(Ordering::Acquire) {
+                return Err(WindowsFsError::LockCancelled {
+                    path: path.to_path_buf(),
+                });
+            }
             // SAFETY: 文件句柄与 `overlapped` 在锁的整个生命周期内有效；同步调用不保留指针。
             let locked = unsafe {
                 LockFileEx(
@@ -702,14 +806,7 @@ impl ExclusiveFileLock {
             ) {
                 return Err(io_error("取得文件锁", path, source));
             }
-            let elapsed = started_at.elapsed();
-            if elapsed >= timeout {
-                return Err(WindowsFsError::LockTimeout {
-                    path: path.to_path_buf(),
-                    timeout,
-                });
-            }
-            thread::sleep((timeout - elapsed).min(Duration::from_millis(5)));
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -725,107 +822,6 @@ impl Drop for ExclusiveFileLock {
             UnlockFileEx(handle(&self.file), 0, 1, 0, &raw mut self.overlapped);
         }
     }
-}
-
-/// 可在同一 worker 生命周期内重复加锁的跨进程 Win32 文件句柄。
-///
-/// 打开句柄本身不代表持有锁；每次 `lock` 返回的 guard 独立覆盖一个事件的临界区，
-/// guard 释放时立即解锁。`&mut self` 保证同一句柄不会同时建立两个本进程 guard。
-pub(crate) struct ReusableExclusiveFileLock {
-    _parent: PinnedPath,
-    file: File,
-}
-
-// 句柄只由拥有它的 worker 顺序使用，不在多个线程间并发加锁。
-// SAFETY: 文件句柄和固定父路径都可以在线程之间移动，且类型不暴露并发共享入口。
-unsafe impl Send for ReusableExclusiveFileLock {}
-
-impl ReusableExclusiveFileLock {
-    pub(crate) fn open(path: &Path) -> Result<Self, WindowsFsError> {
-        let parent_path = path.parent().ok_or_else(|| {
-            io_error(
-                "打开锁文件",
-                path,
-                io::Error::new(io::ErrorKind::InvalidInput, "锁文件路径没有父目录"),
-            )
-        })?;
-        let parent = pin_directory_without_reparse(parent_path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-            .map_err(|source| io_error("打开锁文件", path, source))?;
-        reject_reparse(&file, path)?;
-        Ok(Self {
-            _parent: parent,
-            file,
-        })
-    }
-
-    pub(crate) fn lock(
-        &mut self,
-        path: &Path,
-        timeout: Duration,
-    ) -> Result<ReusableExclusiveFileLockGuard<'_>, WindowsFsError> {
-        let mut overlapped = OVERLAPPED::default();
-        let started_at = Instant::now();
-        loop {
-            // SAFETY: 文件句柄与 `overlapped` 在同步调用期间有效；调用不保留指针。
-            let locked = unsafe {
-                LockFileEx(
-                    handle(&self.file),
-                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                    0,
-                    1,
-                    0,
-                    &raw mut overlapped,
-                )
-            };
-            if locked != 0 {
-                return Ok(ReusableExclusiveFileLockGuard {
-                    file: &self.file,
-                    overlapped,
-                });
-            }
-            let source = io::Error::last_os_error();
-            if !matches!(
-                source.raw_os_error().map(|code| code as u32),
-                Some(ERROR_LOCK_VIOLATION) | Some(ERROR_SHARING_VIOLATION)
-            ) {
-                return Err(io_error("取得文件锁", path, source));
-            }
-            let elapsed = started_at.elapsed();
-            if elapsed >= timeout {
-                return Err(WindowsFsError::LockTimeout {
-                    path: path.to_path_buf(),
-                    timeout,
-                });
-            }
-            thread::sleep((timeout - elapsed).min(Duration::from_millis(5)));
-        }
-    }
-}
-
-pub(crate) struct ReusableExclusiveFileLockGuard<'a> {
-    file: &'a File,
-    overlapped: OVERLAPPED,
-}
-
-impl Drop for ReusableExclusiveFileLockGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: 该有效句柄与字节范围正是本 guard 同步加锁时使用且唯一拥有的对象。
-        unsafe {
-            UnlockFileEx(handle(self.file), 0, 1, 0, &raw mut self.overlapped);
-        }
-    }
-}
-
-/// 把已经打开的来源对象重命名到目标路径，且绝不覆盖已有目标。
-pub(crate) fn rename_without_replace(source: &Path, target: &Path) -> Result<(), WindowsFsError> {
-    rename_without_replace_inner(source, target, None)
 }
 
 /// 仅当来源仍是调用方确认的 file ID 时执行无覆盖重命名。
@@ -998,6 +994,29 @@ fn delete_if_identity(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn io_diagnostic_keeps_path_and_stable_os_facts_without_wrapped_text() {
+        let error = WindowsFsError::Io {
+            operation: "open_file",
+            path: PathBuf::from("C:\\game\r\nforged\\Data.json"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "API_KEY_SECRET"),
+        };
+        let diagnostic = error.safe_diagnostic(
+            DiagnosticCode::FileSystemOperation,
+            DiagnosticStage::Extract,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckPathAndPermissions,
+        );
+        let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
+
+        assert!(!serialized.contains("API_KEY_SECRET"));
+        assert!(!serialized.contains("\\r"));
+        assert!(!serialized.contains("\\n"));
+        assert!(serialized.contains("C:\\\\game forged\\\\Data.json"));
+        assert!(serialized.contains("permission_denied"));
+        assert!(serialized.contains("open_file"));
+    }
 
     fn symlink_unavailable(error: &io::Error) -> bool {
         matches!(

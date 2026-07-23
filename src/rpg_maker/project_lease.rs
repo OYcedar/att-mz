@@ -110,10 +110,6 @@ where
             .acquire_exclusive_file_lease(request)
             .await
             .map_err(|source| match source {
-                ExclusiveFileLeaseError::Busy { timeout, .. } => ProjectCommandLeaseError::Busy {
-                    project: project.clone(),
-                    timeout,
-                },
                 ExclusiveFileLeaseError::Unavailable { source, .. } => {
                     ProjectCommandLeaseError::Unavailable {
                         project: project.clone(),
@@ -129,23 +125,12 @@ where
 
 #[derive(Debug)]
 pub(crate) enum ProjectCommandLeaseError<E> {
-    Busy {
-        project: ProjectName,
-        timeout: std::time::Duration,
-    },
-    Unavailable {
-        project: ProjectName,
-        source: E,
-    },
+    Unavailable { project: ProjectName, source: E },
 }
 
 impl<E: fmt::Display> fmt::Display for ProjectCommandLeaseError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Busy { project, timeout } => write!(
-                formatter,
-                "项目 {project} 正由另一条命令处理，等待 {timeout:?} 后仍未取得租约"
-            ),
             Self::Unavailable { project, source } => {
                 write!(formatter, "无法取得项目 {project} 的命令租约：{source}")
             }
@@ -156,7 +141,6 @@ impl<E: fmt::Display> fmt::Display for ProjectCommandLeaseError<E> {
 impl<E: Error + 'static> Error for ProjectCommandLeaseError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Busy { .. } => None,
             Self::Unavailable { source, .. } => Some(source),
         }
     }
@@ -165,14 +149,12 @@ impl<E: Error + 'static> Error for ProjectCommandLeaseError<E> {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use super::*;
 
     #[derive(Clone)]
     struct RecordingLeaseProvider {
         requests: Arc<Mutex<Vec<ExclusiveFileLeaseRequest>>>,
-        busy: bool,
     }
 
     impl ExclusiveFileLeaseProvider for RecordingLeaseProvider {
@@ -188,14 +170,7 @@ mod tests {
                 .lock()
                 .expect("租约请求记录锁不应中毒")
                 .push(request.clone());
-            if self.busy {
-                Err(ExclusiveFileLeaseError::Busy {
-                    identity: request.identity().to_os_string(),
-                    timeout: Duration::from_millis(25),
-                })
-            } else {
-                Ok(ExclusiveFileLease::new(()))
-            }
+            Ok(ExclusiveFileLease::new(()))
         }
     }
 
@@ -218,7 +193,6 @@ mod tests {
             RpgMakerEngine::Mz,
             RecordingLeaseProvider {
                 requests: Arc::clone(&requests),
-                busy: false,
             },
         );
         let project = "游戏 One".parse().expect("测试项目名应该合法");
@@ -233,26 +207,5 @@ mod tests {
         );
         assert_eq!(requests[0].identity(), std::ffi::OsStr::new("游戏 One"));
         drop(lease);
-    }
-
-    #[tokio::test]
-    async fn translates_generic_busy_state_to_project_semantics() {
-        let service = ProjectCommandLeaseService::new(
-            PathBuf::from("C:/att/projects"),
-            RpgMakerEngine::Mv,
-            RecordingLeaseProvider {
-                requests: Arc::new(Mutex::new(Vec::new())),
-                busy: true,
-            },
-        );
-        let project = "Game".parse().expect("测试项目名应该合法");
-
-        assert!(matches!(
-            service.acquire(&project).await,
-            Err(ProjectCommandLeaseError::Busy {
-                project: busy_project,
-                timeout,
-            }) if busy_project == project && timeout == Duration::from_millis(25)
-        ));
     }
 }
