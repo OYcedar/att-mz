@@ -47,6 +47,9 @@ impl TextUnitRole {
 
 /// 一个语义单元的完整文本内容。
 ///
+/// `Value` 是单个标量，内部 LF 属于值本身；`Lines` 的每个元素是独立语义槽，元素之间
+/// 不存在可由 Placeholder 吞并的内容字符。
+///
 /// 无标签序列化使 SQLite 中的权威内容直接表现为 JSON string 或 string array，
 /// 不把内部类型包装泄漏到持久化数据中。
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

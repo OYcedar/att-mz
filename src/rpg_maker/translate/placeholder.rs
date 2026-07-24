@@ -153,11 +153,24 @@ impl Pcre2PlaceholderService {
     }
 
     /// 验证所有规则区间互不重叠后，生成可逆 Rust 绑定。
+    #[cfg(test)]
     pub(crate) fn protect(
         &self,
         engine: RpgMakerEngine,
         kind: TextGroupKind,
         original: &str,
+        custom: &CompiledPlaceholderRules,
+    ) -> Result<ProtectedText, PlaceholderProtectionError> {
+        self.protect_with_line_boundaries(engine, kind, original, &[], custom)
+    }
+
+    /// 保护原文，同时保证 `Lines` 拼接产生的槽分隔 LF 不进入任何不透明跨度。
+    pub(crate) fn protect_with_line_boundaries(
+        &self,
+        engine: RpgMakerEngine,
+        kind: TextGroupKind,
+        original: &str,
+        line_separator_offsets: &[usize],
         custom: &CompiledPlaceholderRules,
     ) -> Result<ProtectedText, PlaceholderProtectionError> {
         if placeholder_token::contains_reserved_prefix(original) {
@@ -196,6 +209,24 @@ impl Pcre2PlaceholderService {
                 }
             } else {
                 max_end_span = Some(index);
+            }
+        }
+        let mut source_line_index = 0;
+        for span in &selected {
+            while line_separator_offsets
+                .get(source_line_index)
+                .is_some_and(|separator| *separator < span.start)
+            {
+                source_line_index += 1;
+            }
+            if line_separator_offsets
+                .get(source_line_index)
+                .is_some_and(|separator| *separator < span.end)
+            {
+                return Err(PlaceholderProtectionError::CrossesLineBoundary {
+                    rule_number: span.rule_number,
+                    source_line_index,
+                });
             }
         }
 
@@ -249,6 +280,7 @@ impl Pcre2PlaceholderService {
                     origin: PlaceholderRuleOrigin::BuiltIn,
                     semantic_label: BUILTIN_SEMANTIC_LABEL,
                     diagnostic_label: BUILTIN_SEMANTIC_LABEL.to_owned(),
+                    rule_number: None,
                     scope,
                     segment: PlaceholderSegment::Whole,
                 }],
@@ -312,6 +344,7 @@ fn custom_matches(
                     origin: PlaceholderRuleOrigin::Custom,
                     semantic_label: CUSTOM_SEMANTIC_LABEL,
                     diagnostic_label: diagnostic_label.clone(),
+                    rule_number: Some(rule.rule_number),
                     scope,
                     segment: PlaceholderSegment::Begin,
                 });
@@ -323,6 +356,7 @@ fn custom_matches(
                     origin: PlaceholderRuleOrigin::Custom,
                     semantic_label: CUSTOM_SEMANTIC_LABEL,
                     diagnostic_label: diagnostic_label.clone(),
+                    rule_number: Some(rule.rule_number),
                     scope,
                     segment: PlaceholderSegment::End,
                 });
@@ -335,6 +369,7 @@ fn custom_matches(
                 origin: PlaceholderRuleOrigin::Custom,
                 semantic_label: CUSTOM_SEMANTIC_LABEL,
                 diagnostic_label: diagnostic_label.clone(),
+                rule_number: Some(rule.rule_number),
                 scope,
                 segment: PlaceholderSegment::Whole,
             }]
@@ -434,6 +469,7 @@ struct SelectedSpan {
     origin: PlaceholderRuleOrigin,
     semantic_label: &'static str,
     diagnostic_label: String,
+    rule_number: Option<usize>,
     scope: PlaceholderScope,
     segment: PlaceholderSegment,
 }
@@ -607,10 +643,23 @@ impl Error for PlaceholderRuleCompilationError {
 #[derive(Debug)]
 pub(crate) enum PlaceholderProtectionError {
     Match(pcre2::Error),
-    EmptyMatch { label: String },
-    MissingTextCapture { rule_number: usize },
-    InvalidMatchRange { rule_number: usize },
-    OverlappingMatches { first: String, second: String },
+    EmptyMatch {
+        label: String,
+    },
+    MissingTextCapture {
+        rule_number: usize,
+    },
+    InvalidMatchRange {
+        rule_number: usize,
+    },
+    OverlappingMatches {
+        first: String,
+        second: String,
+    },
+    CrossesLineBoundary {
+        rule_number: Option<usize>,
+        source_line_index: usize,
+    },
     ReservedTokenNamespace,
 }
 
@@ -630,6 +679,21 @@ impl fmt::Display for PlaceholderProtectionError {
             Self::OverlappingMatches { first, second } => {
                 write!(formatter, "占位符匹配区间重叠：{first} 与 {second}")
             }
+            Self::CrossesLineBoundary {
+                rule_number,
+                source_line_index,
+            } => match rule_number {
+                Some(rule_number) => write!(
+                    formatter,
+                    "占位符规则 {rule_number} 的不透明保护跨度跨越第 {} 个 Lines 元素之后的槽边界",
+                    source_line_index + 1
+                ),
+                None => write!(
+                    formatter,
+                    "内置占位符的不透明保护跨度跨越第 {} 个 Lines 元素之后的槽边界",
+                    source_line_index + 1
+                ),
+            },
             Self::ReservedTokenNamespace => write!(
                 formatter,
                 "原文包含保留的 ATT token 前缀 {:?}",

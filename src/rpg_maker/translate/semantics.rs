@@ -130,8 +130,8 @@ impl ResolvedTranslationSemantics {
         self.prepare_text(kind, original, &[])
     }
 
-    /// Standard 的 `Lines` 保持完整原文参与 Placeholder 与语言分析，但术语不能跨越
-    /// 两个物理数组元素。`Value` 没有这层边界，其中的 LF 仍是普通自然文本。
+    /// Standard 的 `Lines` 保持完整原文参与 Placeholder 与语言分析，但 opaque 保护和
+    /// 术语都不能跨越两个物理数组元素。`Value` 没有这层边界，其中的 LF 仍是普通内容。
     pub(crate) fn prepare_content(
         &self,
         kind: TextGroupKind,
@@ -155,7 +155,13 @@ impl ResolvedTranslationSemantics {
     ) -> Result<PreparedTranslationText, ResolvedTranslationSemanticError> {
         let (model_text, placeholders) = self
             .placeholder_service
-            .protect(self.engine, kind, original, &self.custom_placeholders)
+            .protect_with_line_boundaries(
+                self.engine,
+                kind,
+                original,
+                line_separators,
+                &self.custom_placeholders,
+            )
             .map_err(ResolvedTranslationSemanticError::ProtectPlaceholder)?
             .into_parts();
         let language_text = project_protected_text(&model_text, &placeholders)
@@ -231,9 +237,9 @@ fn line_separator_offsets(lines: &[String]) -> Vec<usize> {
     offsets
 }
 
-/// 把没有被 Placeholder 吞入 opaque span 的 Lines 分隔 LF 映射到模型文本，并据此
-/// 切开术语扫描域。若分隔 LF 位于 opaque span 内，现有 OpaqueBoundary 已经阻止跨界，
-/// 无需再制造一个模型侧位置。
+/// 把 Lines 分隔 LF 映射到 Placeholder 投影后的模型文本，并据此切开术语扫描域。
+///
+/// 译前保护边界已经保证不透明跨度不会吞掉这些分隔符。
 fn terminology_line_domains<'a>(
     original: &str,
     model_text: &'a str,
@@ -272,13 +278,12 @@ fn terminology_line_domains<'a>(
             mapped.push(model_cursor + separator - source_cursor);
             separator_index += 1;
         }
-        while line_separators
-            .get(separator_index)
-            .is_some_and(|separator| *separator < source_span_end)
-        {
-            debug_assert!(line_separators[separator_index] >= source_span_start);
-            separator_index += 1;
-        }
+        debug_assert!(
+            line_separators
+                .get(separator_index)
+                .is_none_or(|separator| *separator >= source_span_end),
+            "不透明 Placeholder 跨越 Lines 槽边界必须在保护阶段被拒绝"
+        );
 
         source_cursor = source_span_end;
         model_cursor = token_start + placeholder.token().len();
@@ -452,6 +457,15 @@ fn placeholder_protection_detail(source: &PlaceholderProtectionError) -> String 
         PlaceholderProtectionError::OverlappingMatches { .. } => {
             "semantic=placeholder_protection; failure=overlapping_matches".to_owned()
         }
+        PlaceholderProtectionError::CrossesLineBoundary {
+            rule_number,
+            source_line_index,
+        } => {
+            let rule = rule_number.map_or_else(|| "builtin".to_owned(), |value| value.to_string());
+            format!(
+                "semantic=placeholder_protection; failure=crosses_line_boundary; rule={rule}; source_line_index={source_line_index}"
+            )
+        }
         PlaceholderProtectionError::ReservedTokenNamespace => {
             "semantic=placeholder_protection; failure=reserved_token_namespace".to_owned()
         }
@@ -583,6 +597,78 @@ mod tests {
             ["标量换行"]
         );
         assert_eq!(value.term_indices(), [1]);
+    }
+
+    #[test]
+    fn opaque_placeholder_cannot_consume_a_lines_slot_separator() {
+        let semantics = semantics_with(
+            RpgMakerEngine::Mz,
+            Vec::new(),
+            vec![PlaceholderRuleDefinition::new(
+                None,
+                r"(?s)<opaque>.*?</opaque>",
+            )],
+        );
+        let content = TextUnitContent::Lines(vec![
+            "翻訳<opaque>前半".to_owned(),
+            "後半</opaque>続き".to_owned(),
+        ]);
+
+        for kind in [
+            TextGroupKind::EventDialogue,
+            TextGroupKind::EventChoices,
+            TextGroupKind::EventScrollingText,
+        ] {
+            let error = match semantics.prepare_content(kind, &content) {
+                Ok(_) => panic!("不透明保护跨度不得吞掉两个 Lines 槽之间的 LF"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                ResolvedTranslationSemanticError::ProtectPlaceholder(
+                    PlaceholderProtectionError::CrossesLineBoundary {
+                        rule_number: Some(1),
+                        source_line_index: 0,
+                    }
+                )
+            ));
+        }
+        assert!(
+            semantics
+                .prepare(
+                    TextGroupKind::EventChoices,
+                    "翻訳<opaque>前半\n後半</opaque>続き"
+                )
+                .is_ok(),
+            "Value 内的 LF 不是槽边界，允许同一规则保护"
+        );
+    }
+
+    #[test]
+    fn structured_placeholder_can_wrap_lines_when_the_separator_stays_natural_text() {
+        let semantics = semantics_with(
+            RpgMakerEngine::Mz,
+            Vec::new(),
+            vec![PlaceholderRuleDefinition::new(
+                Some(vec!["event_choices".to_owned()]),
+                r"(?s)<msg>(?<text>.*?)</msg>",
+            )],
+        );
+        let content = TextUnitContent::Lines(vec!["<msg>翻訳".to_owned(), "続き</msg>".to_owned()]);
+
+        let prepared = semantics
+            .prepare_content(TextGroupKind::EventChoices, &content)
+            .expect("LF 位于 text 捕获中时，结构化外壳本身没有跨越槽边界");
+
+        assert!(prepared.model_text().contains("翻訳\n続き"));
+        assert_eq!(
+            prepared
+                .placeholders()
+                .iter()
+                .map(AppliedPlaceholder::original)
+                .collect::<Vec<_>>(),
+            ["<msg>", "</msg>"]
+        );
     }
 
     #[test]

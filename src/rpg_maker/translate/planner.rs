@@ -614,6 +614,15 @@ fn placeholder_protection_failure_detail(source: &PlaceholderProtectionError) ->
         PlaceholderProtectionError::OverlappingMatches { .. } => {
             "placeholder_matches_overlap".to_owned()
         }
+        PlaceholderProtectionError::CrossesLineBoundary {
+            rule_number,
+            source_line_index,
+        } => {
+            let rule = rule_number.map_or_else(|| "builtin".to_owned(), |value| value.to_string());
+            format!(
+                "placeholder_crosses_line_boundary; rule={rule}; source_line_index={source_line_index}"
+            )
+        }
         PlaceholderProtectionError::ReservedTokenNamespace => {
             "source_uses_reserved_token_namespace".to_owned()
         }
@@ -1182,6 +1191,13 @@ fn source_line_count(identity: &TranslationUnitIdentity) -> usize {
 }
 
 fn scalar_allows_reflow(identity: &TranslationUnitIdentity, field_name: &str) -> bool {
+    if identity
+        .source_content()
+        .as_value()
+        .is_some_and(|value| value.contains('\n'))
+    {
+        return true;
+    }
     matches!(
         (identity.group_location().source(), field_name),
         (RpgMakerSource::Data(StandardDataFile::Actors), "profile")
@@ -3040,6 +3056,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiline_rules_scalar_uses_reflow_instead_of_a_single_line_contract() {
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            EmptyResources,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let corpus = StandardTranslationCorpus::new(
+            [
+                (
+                    "GamepadIsNotConnected",
+                    "ゲームパッドが接続されていません\nボタンを押して再度試してください",
+                ),
+                (
+                    "needButtonDetouch",
+                    "コンフィグを終了するためには\nボタンから手を放してください。",
+                ),
+            ]
+            .into_iter()
+            .map(|(parameter_name, value)| {
+                let source =
+                    RpgMakerSource::plugin_parameter(7, "Mano_InputConfig", parameter_name);
+                let group_location = RpgMakerLocation::value(source, Vec::new());
+                let identity = TranslationUnitIdentity::new(
+                    RpgMakerStandardAssetOwner::Rules,
+                    TextGroupKind::PluginParameter,
+                    group_location.clone(),
+                    TextUnitRole::Scalar(
+                        ScalarFieldKey::new("<json>.text[0]").expect("字段键应合法"),
+                    ),
+                    TextUnitContent::Value(value.to_owned()),
+                    "{}",
+                );
+                StandardTranslationGroup::new(
+                    TextGroupKind::PluginParameter,
+                    group_location,
+                    vec![StandardTranslationAsset::new(identity, None, None)],
+                )
+            })
+            .collect(),
+        );
+
+        let (_, _, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                corpus,
+                StandardTranslationInput::new(None, None),
+            )
+            .await
+            .expect("多行 Rules Scalar 应形成可执行翻译任务")
+            .into_parts();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0]
+                .expected_outputs()
+                .iter()
+                .map(ExpectedTranslationOutput::line_shape)
+                .collect::<Vec<_>>(),
+            [ExpectedLineShape::Reflow, ExpectedLineShape::Reflow]
+        );
+        let prompt = tasks[0].messages()[1].content();
+        for expected in [
+            concat!(
+                "<json>.text[0] [1] (free line breaking):\n",
+                "\n",
+                "> ゲームパッドが接続されていません\n",
+                "> ボタンを押して再度試してください\n",
+            ),
+            concat!(
+                "<json>.text[0] [2] (free line breaking):\n",
+                "\n",
+                "> コンフィグを終了するためには\n",
+                "> ボタンから手を放してください。\n",
+            ),
+        ] {
+            assert!(prompt.contains(expected), "多行标量应使用自由断行契约");
+        }
+        assert!(!prompt.contains("(single line)"));
+    }
+
+    #[tokio::test]
     async fn one_minimal_message_can_mix_all_five_semantic_unit_roles() {
         let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
@@ -3886,6 +3985,74 @@ mod tests {
         assert_eq!(tasks[0].expected_outputs().len(), 1);
         assert!(tasks[0].messages()[1].content().contains("正常な翻訳"));
         assert!(!tasks[0].messages()[1].content().contains("翻訳<BAD>"));
+    }
+
+    #[tokio::test]
+    async fn line_crossing_placeholder_failure_isolated_to_its_lines_unit() {
+        let placeholder_path = PathBuf::from("C:/input/placeholders.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    placeholder_path.clone(),
+                    br#"
+                        [[rule]]
+                        scopes = ["event_choices"]
+                        pattern = '(?s)<opaque>.*?</opaque>'
+                    "#
+                    .to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let bad = map_unit_group(
+            TextGroupKind::EventChoices,
+            0,
+            vec![(
+                TextUnitRole::Choices,
+                TextUnitContent::Lines(vec![
+                    "翻訳<opaque>前半".to_owned(),
+                    "後半</opaque>続き".to_owned(),
+                ]),
+                "{}",
+            )],
+        );
+        let good = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            1,
+            "正常な翻訳",
+            None,
+            Vec::new(),
+        );
+
+        let (_, preparation, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                StandardTranslationCorpus::new(vec![bad, good]),
+                StandardTranslationInput::new(None, Some(placeholder_path)),
+            )
+            .await
+            .expect("一个 Lines 单元的 Placeholder 边界失败不应阻断其他单元")
+            .into_parts();
+
+        assert_eq!(preparation.planning_failures().len(), 1);
+        assert_eq!(
+            preparation.planning_failures()[0].reason(),
+            &TranslationPlanningFailureReason::PlaceholderProtection {
+                message: "placeholder_crosses_line_boundary; rule=1; source_line_index=0"
+                    .to_owned(),
+            }
+        );
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].expected_outputs().len(), 1);
+        assert!(tasks[0].messages()[1].content().contains("正常な翻訳"));
+        assert!(!tasks[0].messages()[1].content().contains("翻訳<opaque>"));
     }
 
     #[tokio::test]

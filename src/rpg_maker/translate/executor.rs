@@ -221,6 +221,11 @@ pub(crate) enum TranslationInternalInvariant {
         unit_id: usize,
         kind: PlaceholderMultisetErrorKind,
     },
+    ProtectedPlaceholderCrossesLineBoundary {
+        task_index: StandardTranslationTaskIndex,
+        unit_id: usize,
+        placeholder_index: usize,
+    },
     ProtectedLineCountMismatch {
         task_index: StandardTranslationTaskIndex,
         unit_id: usize,
@@ -335,6 +340,14 @@ impl TranslationInternalInvariant {
                 task_index.get(),
                 kind.as_str()
             ),
+            Self::ProtectedPlaceholderCrossesLineBoundary {
+                task_index,
+                unit_id,
+                placeholder_index,
+            } => format!(
+                "protected_placeholder_crosses_line_boundary; task={}; unit={unit_id}; placeholder_index={placeholder_index}",
+                task_index.get()
+            ),
             Self::ProtectedLineCountMismatch {
                 task_index,
                 unit_id,
@@ -413,6 +426,11 @@ impl TranslationInternalInvariant {
                 ..
             }
             | Self::ProtectedPlaceholderMultisetMismatch {
+                task_index,
+                unit_id,
+                ..
+            }
+            | Self::ProtectedPlaceholderCrossesLineBoundary {
                 task_index,
                 unit_id,
                 ..
@@ -1219,6 +1237,23 @@ fn validate_expected_output_contract(
             },
         )?;
     let protected_scan = placeholder_bindings.scan(expected.protected_text());
+    if matches!(
+        expected.identity().source_content(),
+        TextUnitContent::Lines(_)
+    ) && let Some((placeholder_index, _)) = expected
+        .applied_placeholders()
+        .iter()
+        .enumerate()
+        .find(|(_, placeholder)| placeholder.original().contains('\n'))
+    {
+        return Err(TranslationResponseTechnicalError::InternalInvariant {
+            invariant: TranslationInternalInvariant::ProtectedPlaceholderCrossesLineBoundary {
+                task_index,
+                unit_id: expected.id(),
+                placeholder_index,
+            },
+        });
+    }
     if let Err(reason) = placeholder_bindings.validate_multiset(
         std::slice::from_ref(&protected_scan),
         placeholder_bindings.all_binding_indices(),
@@ -3041,6 +3076,84 @@ mod tests {
         assert!(matches!(
             outcome.unresolved()[0].reason(),
             TranslationUnitRejectionReason::PlaceholderMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_processor_rejects_a_planner_contract_with_a_line_crossing_placeholder() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let group =
+            RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(5)]);
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventChoices,
+            group,
+            TextUnitRole::Choices,
+            TextUnitContent::Lines(vec![
+                "翻訳<opaque>前半".to_owned(),
+                "後半</opaque>続き".to_owned(),
+            ]),
+            "{}",
+        );
+        let task_index = StandardTranslationTaskIndex::new(8);
+        let task = TranslationTaskBlock::new(
+            task_index,
+            LanguagePair::new(
+                LanguageId::parse("ja").expect("测试源语言合法"),
+                LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
+            ),
+            vec![
+                ChatMessage::new(ChatMessageRole::System, "# Contract"),
+                ChatMessage::new(ChatMessageRole::User, "# Task"),
+            ],
+            vec![ExpectedTranslationOutput::new(
+                1,
+                identity,
+                Vec::new(),
+                ExpectedTranslationValidation::new(
+                    ExpectedLineShape::Aligned(NonZeroUsize::new(2).expect("选项数必须非零")),
+                    "翻訳⟦ATT_CUSTOM_WHOLE_0000⟧続き",
+                    vec![AppliedPlaceholder::new(
+                        "⟦ATT_CUSTOM_WHOLE_0000⟧",
+                        "<opaque>前半\n後半</opaque>",
+                        PlaceholderRuleOrigin::Custom,
+                        "CUSTOM",
+                        "event_choices",
+                        PlaceholderSegment::Whole,
+                    )],
+                    line_content_analysis(&["翻訳前半", "後半続き"]),
+                ),
+                state_context(8),
+                Vec::new(),
+            )],
+        );
+
+        let error = processor
+            .process(
+                &task,
+                LlmResponse::new(
+                    r#"{"1":["译文","继续"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect_err("Executor 必须防御已被污染的 Planner Lines 契约");
+
+        assert!(matches!(
+            error,
+            TranslationTaskResponseProcessingError::InternalInvariant {
+                invariant:
+                    TranslationInternalInvariant::ProtectedPlaceholderCrossesLineBoundary {
+                        task_index: actual_task_index,
+                        unit_id: 1,
+                        placeholder_index: 0,
+                    },
+            } if actual_task_index == task_index
         ));
     }
 

@@ -63,7 +63,9 @@ rule = []
 三类规则的正则均使用 PCRE2，开启 UTF 与 UCP。它不是 JavaScript `RegExp`：不要使用
 JavaScript 正则字面量 `/.../flags`；标志应写在模式内（如 `(?i)`），Unicode 属性、
 命名捕获、锚点和替换语义以 PCRE2 为准。`.` 默认不匹配 LF；确实需要让单次匹配跨越
-多行时，必须在模式中显式启用 DOTALL，例如 `(?s)`。
+多行时，必须在模式中显式启用 DOTALL，例如 `(?s)`。DOTALL 只决定 PCRE2 是否能看到
+LF，不会取消 Placeholder 的 `Lines` 槽边界：匹配可以跨 `Value` 内部 LF，但实际 opaque
+保护跨度不得吞入两个 `Lines` 元素之间的拼接 LF。
 
 推荐使用 TOML 单引号字面字符串，让反斜杠原样传给 PCRE2：
 
@@ -536,8 +538,8 @@ pattern = '<name>(?<text>.*?)</name>'
 
 定义成功后，规则只对 scope 相符的标准单元执行。单条自定义规则零命中是正常结果；一旦
 命中，完整匹配必须非零宽并位于 UTF-8 边界，`text` 必须参与、位于完整匹配内并对齐。
-实际保护跨度冲突、原文占用保留前缀 `⟦ATT_`，或最终 token 无法安全投影时，只使当前
-翻译单元规划失败，不把未命中的其他单元判为失败。
+实际保护跨度冲突、跨越 `Lines` 元素的语义槽边界、原文占用保留前缀 `⟦ATT_`，或最终
+token 无法安全投影时，只使当前翻译单元规划失败，不把未命中的其他单元判为失败。
 
 ### 6.5 原子失败范围
 
@@ -587,6 +589,11 @@ MV 行为依据 RPG Maker MV 的
 wrapper 的 NaturalText 捕获中可以继续出现 Builtin 控制符，Builtin 会在 NaturalText
 内部保护它，不会因为两个完整正则范围包含彼此就误判。
 
+`Value` 是一个完整标量，规则可以按 PCRE2 设置跨其中的 LF 匹配。`Lines` 则保留元素槽
+边界：无 `text` 捕获的完整 opaque 匹配不得跨元素；有 `text` 捕获时，完整 wrapper 匹配
+可以跨元素，但 `<msg>`、`</msg>` 这类实际 opaque 前后壳必须各自位于单个元素，拼接 LF
+只能留在 NaturalText 捕获中。
+
 <!-- att-example: valid -->
 ```toml
 [[rule]]
@@ -596,6 +603,9 @@ pattern = '<msg>(?<text>.*?)</msg>'
 
 对于 `<msg>勇者\C[2]</msg>`，`<msg>`/`</msg>` 是自定义 opaque wrapper，`勇者` 是
 NaturalText，`\C[2]` 是 NaturalText 内的 Builtin 保护段。三者可以自然组合。
+
+例如源 `Lines` 为 `["<msg>第一行", "第二行</msg>"]` 时，若模式启用 DOTALL，元素边界
+位于 `text` 捕获中，因此合法；无 `text` 捕获并把两行整体保护的模式则使该单元规划失败。
 
 Custom/Custom 或 Custom/Builtin 的实际保护跨度相交时，本单元规划失败；没有规则优先级、
 最长匹配或静默覆盖。

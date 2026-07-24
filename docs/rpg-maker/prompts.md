@@ -149,6 +149,9 @@ Choices [2] (3 items, corresponding item by item):
 
 ID 只在当前 TaskBlock 中有效，从 `1` 连续编号；下一个 TaskBlock 会重新从 `1` 开始。
 字段标签不是封闭枚举，模型应以“是否带 `[ID]`”和括号中的形状标记判断输出责任。
+字段名也不决定输出形状：Planner 会把源 `Value` 含 LF 的 Scalar 标成
+`free line breaking`，部分可自然扩展的 profile/description 即使当前只有一行也使用该
+形状；模型始终只服从条目上实际给出的形状标记。
 
 多行、逐项严格对齐及允许重排换行的内容使用 `> ` 作为 Markdown blockquote 前缀；前缀
 不属于原文，只有 `> ` 的行表示空槽。`single line` 内容直接出现在冒号后。输出不得复制标题、标签、

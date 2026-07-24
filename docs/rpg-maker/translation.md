@@ -72,7 +72,10 @@ MV 与 MZ 共享翻译流程，但 engine 是语义事实：两者 Builtin 控�
 
 每个原文先执行 engine 对应的 Builtin Placeholder 和当前 Custom Placeholder，得到有序
 opaque 段及 NaturalText 段。术语只逐段扫描 NaturalText，不扫描 opaque 外壳，不跨
-OpaqueBoundary 或 Lines 元素拼接。
+OpaqueBoundary 或 Lines 元素拼接。`Value` 中的 LF 是该值本身的内容，Placeholder 可以
+按规则跨 LF 匹配；`Lines` 元素之间的拼接 LF 是语义槽边界，任何实际 opaque 保护跨度
+都不得包含该边界。带 `text` 捕获的完整 wrapper 匹配可以横跨多个元素，但前后实际
+opaque wrapper 必须各自留在单个元素内，元素边界只能位于仍可翻译的 `text` 中。
 
 自定义 Placeholder 文件的解析或编译错误在任何单元规划前拒绝整份资源；规则已经成功
 编译后，某个单元发生保护跨度冲突、占用 `⟦ATT_` 保留前缀或无法安全投影，只形成该单元
@@ -117,6 +120,11 @@ Prompt。活动单元从 1 连续编号。
 user message 是最小 Markdown 载荷，只包含实际命中术语、活动 ID、自然语言角色、必要
 形状约束和直接有用的无编号上下文。owner、路径、内部 kind、传播目标、去重原因和空区
 不发送。已有/复用译文作上下文时优先目标文，没有时用源文。
+
+输出形状由语义角色和源内容共同决定，不由字段标签猜测。任何源 Scalar `Value` 只要
+包含 LF，就使用 `free line breaking`，避免把多行值误声明成单行；Actor `profile` 以及
+Skills、Items、Weapons、Armors 的 `description` 即使源值当前只有一行，也继续允许自由
+断行。其余单行 Scalar 使用 `single line`。
 
 <!-- att-example: illustrative -->
 ```markdown
@@ -167,7 +175,8 @@ Standard 响应必须提供当前 TaskBlock 的每个 ID 恰好一次，不能�
 Value/Lines 形状必须符合角色：
 
 - Speaker 和形状为 `single line` 的严格字段是一条非空候选；
-- `free line breaking` Value 可由多模型行组成，最终以 LF 连接；
+- `free line breaking` Scalar `Value` 可由多模型行组成，最终以 LF 连接；源值含 LF 时
+  必须采用该形状；
 - Choices 和严格 ScrollingText 必须与源 Lines 按槽对齐并保持空槽；
 - 每个结构行拒绝 CR、LF、NUL 和非法空白形状。
 
