@@ -113,9 +113,10 @@ Reader 只接受 Extract 已验证的顺序：owner 固定 Builtin、Rules、Lua
 
 ## 5. 任务规划与模型消息
 
-Planner 先保持最大相关组，再按 Profile 的最终 messages 字符预算切 TaskBlock。单组超过
-预算时明确失败，不切碎。这里的预算包含按 locale 渲染并按思考模式装配后的完整 system
-Prompt。活动单元从 1 连续编号。
+Planner 先保持最大相关组，再按 Profile 的最终 user message Unicode 字符预算切
+TaskBlock。预算计算实际命中术语、活动 ID、标签、上下文、正文、Markdown 转义与换行；
+system Prompt 随每个任务完整发送，但其字符数不计入预算。单组生成的最终 user message
+超过预算时明确失败，不切碎。活动单元从 1 连续编号。
 
 user message 是最小 Markdown 载荷，只包含实际命中术语、活动 ID、自然语言角色、必要
 形状约束和直接有用的无编号上下文。owner、路径、内部 kind、传播目标、去重原因和空区

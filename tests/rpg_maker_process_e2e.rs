@@ -2347,12 +2347,12 @@ allowed_terms = []
 [[rpg_maker.translation_profiles]]
 id = "local"
 llm_client = "primary"
-max_task_message_characters = 10000
+max_task_user_message_characters = 10000
 
 [[rpg_maker.translation_profiles]]
 id = "unselected"
 llm_client = "primary"
-max_task_message_characters = 10000
+max_task_user_message_characters = 10000
 "#
     );
     fs::write(root.join("config.toml"), configuration).expect("完整配置应可写入");

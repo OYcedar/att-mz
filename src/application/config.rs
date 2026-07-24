@@ -918,7 +918,7 @@ fn build_document_configuration() -> RpgMakerDocumentReadingConfig {
 #[derive(Clone, Debug)]
 pub(crate) struct TranslationProfileConfiguration {
     id: String,
-    max_task_message_characters: NonZeroUsize,
+    max_task_user_message_characters: NonZeroUsize,
     request: RpgMakerTranslationRequestConfiguration,
 }
 
@@ -927,8 +927,8 @@ impl TranslationProfileConfiguration {
         &self.id
     }
 
-    pub(crate) const fn max_task_message_characters(&self) -> NonZeroUsize {
-        self.max_task_message_characters
+    pub(crate) const fn max_task_user_message_characters(&self) -> NonZeroUsize {
+        self.max_task_user_message_characters
     }
 
     pub(crate) const fn request(&self) -> &RpgMakerTranslationRequestConfiguration {
@@ -1100,9 +1100,9 @@ fn build_selected_translation_profile(
     validate_exact_identifier(format!("{field}.llm_client").as_str(), &raw.llm_client)?;
     Ok(TranslationProfileConfiguration {
         id: raw.id,
-        max_task_message_characters: non_zero_usize(
-            format!("{field}.max_task_message_characters").as_str(),
-            raw.max_task_message_characters,
+        max_task_user_message_characters: non_zero_usize(
+            format!("{field}.max_task_user_message_characters").as_str(),
+            raw.max_task_user_message_characters,
         )?,
         request,
     })
@@ -2611,8 +2611,8 @@ struct RawTranslationProfileFieldNames {
     _id: Option<IgnoredAny>,
     #[serde(default, rename = "llm_client")]
     _llm_client: Option<IgnoredAny>,
-    #[serde(default, rename = "max_task_message_characters")]
-    _max_task_message_characters: Option<IgnoredAny>,
+    #[serde(default, rename = "max_task_user_message_characters")]
+    _max_task_user_message_characters: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2739,7 +2739,7 @@ enum RawLanguageConfiguration {
 struct RawSelectedTranslationProfileConfiguration {
     id: String,
     llm_client: String,
-    max_task_message_characters: u64,
+    max_task_user_message_characters: u64,
 }
 
 #[derive(Deserialize)]
@@ -2910,14 +2910,21 @@ mod tests {
     fn explicit_translate_profile_is_still_validated_during_load() {
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml").replace(
-            "max_task_message_characters = 24000",
-            "max_task_message_characters = 0",
+            "max_task_user_message_characters = 24000",
+            "max_task_user_message_characters = 0",
         );
         let path = directory.write("invalid-explicit-profile.toml", &source);
 
-        assert!(
-            load_configuration(&path, translate_command(false, "primary")).is_err(),
-            "显式 Profile 的无效字段必须在配置加载阶段被拒绝"
+        let error = match load_configuration(&path, translate_command(false, "primary")) {
+            Ok(_) => panic!("显式 Profile 的无效字段必须在配置加载阶段被拒绝"),
+            Err(error) => error,
+        };
+        let ConfigurationLoadError::InvalidValueAtPath { source: error, .. } = error else {
+            panic!("user message 字符上限为零时必须返回配置值错误");
+        };
+        assert_eq!(
+            error.field(),
+            "rpg_maker.translation_profiles.max_task_user_message_characters"
         );
     }
 
@@ -2940,7 +2947,7 @@ parameters = []
 
 [[rpg_maker.translation_profiles]]
 llm_client = ["{sentinel}"]
-max_task_message_characters = {{ secret = "{sentinel}" }}
+max_task_user_message_characters = {{ secret = "{sentinel}" }}
 id = "unused"
 "#,
             include_str!("../../config.example.toml")
@@ -3164,8 +3171,8 @@ id = "unused"
     fn selected_profile_rejects_unknown_fields() {
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml").replace(
-            "max_task_message_characters = 24000",
-            "max_task_message_characters = 24000\nunexpected_field = []",
+            "max_task_user_message_characters = 24000",
+            "max_task_user_message_characters = 24000\nunexpected_field = []",
         );
         let path = directory.write("unknown-profile-field.toml", &source);
         assert!(
@@ -3205,8 +3212,8 @@ id = "unused"
                 source.replacen("llm_client = \"primary\"\n", "", 1),
             ),
             (
-                "profile-max-task-message-characters",
-                source.replacen("max_task_message_characters = 24000\n", "", 1),
+                "profile-max-task-user-message-characters",
+                source.replacen("max_task_user_message_characters = 24000\n", "", 1),
             ),
             (
                 "client-retry-delays",
@@ -3410,8 +3417,8 @@ id = "unused"
             (
                 "profile",
                 example.replace(
-                    "max_task_message_characters = 24000",
-                    "max_task_message_characters = 24000\nunexpected = 1",
+                    "max_task_user_message_characters = 24000",
+                    "max_task_user_message_characters = 24000\nunexpected = 1",
                 ),
             ),
             (

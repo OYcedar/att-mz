@@ -34,8 +34,8 @@ Help 与 Version 之外的命令必须显式传入 `--config FILE`。配置中�
 - 重试延迟与可接受的最大 `Retry-After`；
 - 代理和额外 PEM 根证书。
 
-Profile 只配置所用 Client 和单任务消息字符上限。Prompt、语言策略、项目根与业务规则
-继续按各自规格配置。
+Profile 只配置所用 Client 和单任务最终 user message 字符上限。Prompt、语言策略、项目根
+与业务规则继续按各自规格配置。
 
 ## 哪些值不能配置
 

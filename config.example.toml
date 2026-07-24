@@ -42,4 +42,4 @@ allowed_terms = []
 [[rpg_maker.translation_profiles]]
 id = "primary"
 llm_client = "primary"
-max_task_message_characters = 24000
+max_task_user_message_characters = 24000
