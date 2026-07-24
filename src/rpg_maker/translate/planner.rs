@@ -1191,11 +1191,11 @@ fn source_line_count(identity: &TranslationUnitIdentity) -> usize {
 }
 
 fn scalar_allows_reflow(identity: &TranslationUnitIdentity, field_name: &str) -> bool {
-    if identity
+    let value = identity
         .source_content()
         .as_value()
-        .is_some_and(|value| value.contains('\n'))
-    {
+        .expect("Scalar 角色必须保存单个 Value");
+    if value.contains('\n') {
         return true;
     }
     matches!(
@@ -3053,6 +3053,54 @@ mod tests {
                 .applied_placeholders()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn scalar_line_shape_uses_multiline_content_before_canonical_field_policy() {
+        let identity = |source: RpgMakerSource, field_name: &str, value: &str| {
+            let group_location = RpgMakerLocation::value(source, Vec::new());
+            TranslationUnitIdentity::new(
+                RpgMakerStandardAssetOwner::Builtin,
+                TextGroupKind::DatabaseEntry,
+                group_location,
+                TextUnitRole::Scalar(ScalarFieldKey::new(field_name).expect("测试字段键应合法")),
+                TextUnitContent::Value(value.to_owned()),
+                "{}",
+            )
+        };
+
+        assert_eq!(
+            expected_line_shape(&identity(
+                RpgMakerSource::data(StandardDataFile::Items),
+                "name",
+                "任意字段第一行\n任意字段第二行",
+            )),
+            ExpectedLineShape::Reflow
+        );
+        assert_eq!(
+            expected_line_shape(&identity(
+                RpgMakerSource::data(StandardDataFile::Items),
+                "name",
+                "任意字段单行",
+            )),
+            ExpectedLineShape::Aligned(NonZeroUsize::MIN)
+        );
+        for (source, field_name) in [
+            (StandardDataFile::Actors, "profile"),
+            (StandardDataFile::Skills, "description"),
+            (StandardDataFile::Items, "description"),
+            (StandardDataFile::Weapons, "description"),
+            (StandardDataFile::Armors, "description"),
+        ] {
+            assert_eq!(
+                expected_line_shape(&identity(
+                    RpgMakerSource::data(source),
+                    field_name,
+                    "规范字段单行",
+                )),
+                ExpectedLineShape::Reflow
+            );
+        }
     }
 
     #[tokio::test]

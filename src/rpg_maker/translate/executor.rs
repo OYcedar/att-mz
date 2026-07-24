@@ -2480,8 +2480,8 @@ mod tests {
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group,
-            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段键应合法")),
-            TextUnitContent::Value("炎の剣。装備すると攻撃力が上がる。".to_owned()),
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+            TextUnitContent::Value("炎の剣。\n装備すると攻撃力が上がる。".to_owned()),
             "{}",
         )
     }
@@ -2883,7 +2883,9 @@ mod tests {
         let task = line_task(
             reflow_value_identity(),
             ExpectedLineShape::Reflow,
-            line_content_analysis(&["炎の剣。装備すると攻撃力が上がる。"]),
+            japanese_module().analyze_source(&LanguageText::natural(
+                "炎の剣。\n装備すると攻撃力が上がる。",
+            )),
         );
         let outcome = processor
             .process(
@@ -3087,9 +3089,9 @@ mod tests {
             RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(5)]);
         let identity = TranslationUnitIdentity::new(
             RpgMakerStandardAssetOwner::Builtin,
-            TextGroupKind::EventChoices,
+            TextGroupKind::EventDialogue,
             group,
-            TextUnitRole::Choices,
+            TextUnitRole::DialogueBody,
             TextUnitContent::Lines(vec![
                 "翻訳<opaque>前半".to_owned(),
                 "後半</opaque>続き".to_owned(),
@@ -3112,14 +3114,14 @@ mod tests {
                 identity,
                 Vec::new(),
                 ExpectedTranslationValidation::new(
-                    ExpectedLineShape::Aligned(NonZeroUsize::new(2).expect("选项数必须非零")),
+                    ExpectedLineShape::Reflow,
                     "翻訳⟦ATT_CUSTOM_WHOLE_0000⟧続き",
                     vec![AppliedPlaceholder::new(
                         "⟦ATT_CUSTOM_WHOLE_0000⟧",
                         "<opaque>前半\n後半</opaque>",
                         PlaceholderRuleOrigin::Custom,
                         "CUSTOM",
-                        "event_choices",
+                        "event_dialogue",
                         PlaceholderSegment::Whole,
                     )],
                     line_content_analysis(&["翻訳前半", "後半続き"]),
