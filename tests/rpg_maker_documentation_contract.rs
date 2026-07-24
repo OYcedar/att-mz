@@ -9,6 +9,100 @@ use toml::Value as TomlValue;
 
 const CONTRACT_DOCUMENTS: [&str; 4] = ["rules.md", "terminology.md", "lua.md", "lua-cookbook.md"];
 
+const RPG_MAKER_SKILL_NAME: &str = "translate-rpg-maker-with-att";
+
+const RPG_MAKER_SKILL_DESCRIPTION: &str = "使用 ATT 调查、初始化、提取、翻译、审核、写回、续作和诊断 RPG Maker MV/MZ 汉化项目。用于创建、继续、修复、检查或验证 ATT 项目，编写 Extract Rules、术语、Placeholder、Prompt 或可信 Lua，以及把试玩反馈追溯到责任阶段；不用于开发 ATT Rust 源码或不经过 ATT 的普通翻译。";
+
+const RPG_MAKER_SKILL_FLOWS: [(&str, &[&str]); 8] = [
+    (
+        "## 流程 0：入口与续作路由",
+        &[
+            "docs/README.md",
+            "docs/runtime/README.md",
+            "docs/runtime/cli.md",
+        ],
+    ),
+    (
+        "## 流程 1：调查与初始化",
+        &[
+            "docs/rpg-maker/README.md",
+            "docs/rpg-maker/init.md",
+            "docs/runtime/configuration.md",
+        ],
+    ),
+    (
+        "## 流程 2：提取与覆盖证明",
+        &[
+            "docs/rpg-maker/README.md",
+            "docs/rpg-maker/extraction.md",
+            "docs/rpg-maker/rules.md",
+            "docs/runtime/sqlite.md",
+        ],
+    ),
+    (
+        "## 流程 3：翻译资源准备",
+        &[
+            "docs/rpg-maker/terminology.md",
+            "docs/rpg-maker/prompts.md",
+            "docs/runtime/configuration.md",
+            "docs/rpg-maker/rules.md",
+            "docs/rpg-maker/translation.md",
+        ],
+    ),
+    (
+        "## 流程 4：翻译与质量审核",
+        &[
+            "docs/rpg-maker/translation.md",
+            "docs/rpg-maker/terminology.md",
+            "docs/rpg-maker/prompts.md",
+            "docs/rpg-maker/rules.md",
+            "docs/runtime/chat-completions.md",
+        ],
+    ),
+    (
+        "## 流程 5：写回与隔离试玩",
+        &[
+            "docs/rpg-maker/write-back.md",
+            "docs/runtime/directory-publishing.md",
+        ],
+    ),
+    (
+        "## 流程 6：诊断、恢复与安全续作",
+        &[
+            "docs/runtime/cli.md",
+            "docs/runtime/project-log.md",
+            "docs/runtime/sqlite.md",
+            "docs/runtime/directory-publishing.md",
+            "docs/runtime/chat-completions.md",
+        ],
+    ),
+    (
+        "## 条件子流程：可信 Lua",
+        &["docs/rpg-maker/lua.md", "docs/rpg-maker/lua-cookbook.md"],
+    ),
+];
+
+const RPG_MAKER_SKILL_DOCUMENTS: [&str; 18] = [
+    "docs/README.md",
+    "docs/runtime/README.md",
+    "docs/runtime/cli.md",
+    "docs/runtime/configuration.md",
+    "docs/runtime/project-log.md",
+    "docs/runtime/directory-publishing.md",
+    "docs/runtime/sqlite.md",
+    "docs/runtime/chat-completions.md",
+    "docs/rpg-maker/README.md",
+    "docs/rpg-maker/init.md",
+    "docs/rpg-maker/extraction.md",
+    "docs/rpg-maker/rules.md",
+    "docs/rpg-maker/terminology.md",
+    "docs/rpg-maker/prompts.md",
+    "docs/rpg-maker/translation.md",
+    "docs/rpg-maker/write-back.md",
+    "docs/rpg-maker/lua.md",
+    "docs/rpg-maker/lua-cookbook.md",
+];
+
 const PROMPT_LOCALES: [&str; 10] = [
     "ar", "zh-Hans", "zh-Hant", "en", "fr", "ru", "es", "ja", "ko", "vi",
 ];
@@ -231,6 +325,128 @@ fn current_markdown_local_links_resolve_to_existing_files_and_anchors() {
         "当前文档包含无效本地链接：\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn rpg_maker_skill_has_the_minimal_portable_package_contract() {
+    let skill_root = rpg_maker_skill_root();
+    assert_eq!(
+        directory_shape(&skill_root),
+        BTreeSet::from([
+            ("SKILL.md".to_owned(), "file"),
+            ("agents".to_owned(), "directory"),
+        ]),
+        "RPG Maker Skill 根目录只能包含 SKILL.md 和 agents 目录"
+    );
+    assert_eq!(
+        directory_shape(&skill_root.join("agents")),
+        BTreeSet::from([("openai.yaml".to_owned(), "file")]),
+        "RPG Maker Skill 的 agents 目录只能包含 openai.yaml"
+    );
+
+    let skill_path = skill_root.join("SKILL.md");
+    let skill_source = read_utf8(&skill_path).replace("\r\n", "\n");
+    let (frontmatter, body) = parse_skill_frontmatter(&skill_path, &skill_source);
+    assert_eq!(
+        frontmatter
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["description", "name"]),
+        "SKILL.md frontmatter 必须且只能包含 name 与 description"
+    );
+    assert_eq!(
+        frontmatter.get("name").map(String::as_str),
+        Some(RPG_MAKER_SKILL_NAME),
+        "SKILL.md frontmatter name 必须等于 Skill 目录名"
+    );
+    assert_eq!(
+        frontmatter.get("description").map(String::as_str),
+        Some(RPG_MAKER_SKILL_DESCRIPTION),
+        "SKILL.md frontmatter description 必须保持已确认的触发边界"
+    );
+    assert_eq!(
+        skill_root.file_name().and_then(|name| name.to_str()),
+        frontmatter.get("name").map(String::as_str),
+        "Skill 目录名必须等于 SKILL.md frontmatter name"
+    );
+    assert!(
+        !body.lines().any(is_markdown_fence),
+        "SKILL.md 正文不得包含 fenced code block"
+    );
+    for (flow_heading, required_documents) in RPG_MAKER_SKILL_FLOWS {
+        let flow = markdown_level_two_section(body, flow_heading).unwrap_or_else(|| {
+            panic!("SKILL.md 缺少流程章节 {flow_heading}");
+        });
+        for required_heading in [
+            "### 进入条件",
+            "### 必读文档",
+            "### 任务清单",
+            "### 完成证据",
+            "### 返回位置",
+        ] {
+            assert!(
+                flow.contains(required_heading),
+                "{flow_heading} 缺少统一章节 {required_heading}"
+            );
+        }
+        let linked_documents = directly_linked_local_files(&skill_path, flow);
+        for relative_path in required_documents {
+            let expected_path = canonicalize_for_contract(&workspace_root().join(relative_path));
+            assert!(
+                linked_documents.contains(&expected_path),
+                "{flow_heading} 必须直接链接权威文档 {relative_path}"
+            );
+        }
+    }
+
+    let interface_path = skill_root.join("agents/openai.yaml");
+    let interface = parse_openai_interface(&interface_path, &read_utf8(&interface_path));
+    assert_eq!(
+        interface,
+        BTreeMap::from([
+            (
+                "default_prompt".to_owned(),
+                "\"使用 $translate-rpg-maker-with-att，根据当前游戏和项目状态推进这项 RPG Maker 汉化任务。\""
+                    .to_owned(),
+            ),
+            (
+                "display_name".to_owned(),
+                "\"使用 ATT 汉化 RPG Maker\"".to_owned(),
+            ),
+            (
+                "short_description".to_owned(),
+                "\"根据项目状态执行、诊断并验证 RPG Maker 汉化流程\"".to_owned(),
+            ),
+        ]),
+        "agents/openai.yaml 必须且只能包含已确认的三个 interface 字段"
+    );
+}
+
+#[test]
+fn rpg_maker_skill_is_directly_reachable_and_links_every_authoritative_document() {
+    let skill_path = rpg_maker_skill_root().join("SKILL.md");
+    let expected_skill_path = canonicalize_for_contract(&skill_path);
+    for entry_path in [
+        workspace_root().join("README.md"),
+        workspace_root().join("docs/README.md"),
+    ] {
+        let linked_files = directly_linked_local_files(&entry_path, &read_utf8(&entry_path));
+        assert!(
+            linked_files.contains(&expected_skill_path),
+            "{} 必须直接链接 RPG Maker Skill",
+            display_relative(&entry_path)
+        );
+    }
+
+    let linked_documents = directly_linked_local_files(&skill_path, &read_utf8(&skill_path));
+    for relative_path in RPG_MAKER_SKILL_DOCUMENTS {
+        let expected_path = canonicalize_for_contract(&workspace_root().join(relative_path));
+        assert!(
+            linked_documents.contains(&expected_path),
+            "SKILL.md 必须直接链接权威文档 {relative_path}"
+        );
+    }
 }
 
 #[test]
@@ -774,7 +990,11 @@ fn markdown_heading_slug(heading: &str) -> String {
 
 fn current_markdown_files() -> Vec<PathBuf> {
     let root = workspace_root();
-    let mut files = vec![root.join("README.md")];
+    let mut files = vec![
+        root.join("AGENTS.md"),
+        root.join("README.md"),
+        root.join("docs/README.md"),
+    ];
     files.extend(collect_files_with_extension(
         &root.join("docs/runtime"),
         "md",
@@ -783,9 +1003,178 @@ fn current_markdown_files() -> Vec<PathBuf> {
         &root.join("docs/rpg-maker"),
         "md",
     ));
+    files.extend(collect_files_with_extension(&root.join("skills"), "md"));
     files.sort();
     files.dedup();
     files
+}
+
+fn parse_skill_frontmatter<'a>(
+    path: &Path,
+    source: &'a str,
+) -> (BTreeMap<String, String>, &'a str) {
+    let remainder = source
+        .strip_prefix("---\n")
+        .unwrap_or_else(|| panic!("{} 必须以 YAML frontmatter 开始", display_relative(path)));
+    let (frontmatter_source, body) = remainder.split_once("\n---\n").unwrap_or_else(|| {
+        panic!(
+            "{} 的 YAML frontmatter 必须以独立的 --- 闭合",
+            display_relative(path)
+        )
+    });
+    let mut frontmatter = BTreeMap::new();
+    for (line_index, line) in frontmatter_source.lines().enumerate() {
+        assert!(
+            !line.is_empty() && !line.starts_with(char::is_whitespace),
+            "{}:{} 的 frontmatter 只能包含顶层字段",
+            display_relative(path),
+            line_index + 2
+        );
+        let (key, value) = line.split_once(':').unwrap_or_else(|| {
+            panic!(
+                "{}:{} 的 frontmatter 字段缺少冒号",
+                display_relative(path),
+                line_index + 2
+            )
+        });
+        assert!(
+            !key.is_empty() && !value.trim().is_empty(),
+            "{}:{} 的 frontmatter 字段名和值均不能为空",
+            display_relative(path),
+            line_index + 2
+        );
+        assert!(
+            frontmatter
+                .insert(key.to_owned(), value.trim().to_owned())
+                .is_none(),
+            "{}:{} 的 frontmatter 字段 {key:?} 重复",
+            display_relative(path),
+            line_index + 2
+        );
+    }
+    (frontmatter, body)
+}
+
+fn parse_openai_interface(path: &Path, source: &str) -> BTreeMap<String, String> {
+    let normalized = source.replace("\r\n", "\n");
+    let mut lines = normalized
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.is_empty());
+    let (root_line_index, root_line) = lines.next().unwrap_or_else(|| {
+        panic!("{} 不能为空", display_relative(path));
+    });
+    assert_eq!(
+        root_line,
+        "interface:",
+        "{}:{} 必须以唯一顶层字段 interface 开始",
+        display_relative(path),
+        root_line_index + 1
+    );
+
+    let mut interface = BTreeMap::new();
+    for (line_index, line) in lines {
+        let field = line.strip_prefix("  ").unwrap_or_else(|| {
+            panic!(
+                "{}:{} 只能包含 interface 下的两空格缩进字段",
+                display_relative(path),
+                line_index + 1
+            )
+        });
+        assert!(
+            !field.starts_with(char::is_whitespace),
+            "{}:{} 不得在 interface 字段下继续嵌套",
+            display_relative(path),
+            line_index + 1
+        );
+        let (key, value) = field.split_once(':').unwrap_or_else(|| {
+            panic!(
+                "{}:{} 的 interface 字段缺少冒号",
+                display_relative(path),
+                line_index + 1
+            )
+        });
+        assert!(
+            !key.is_empty() && !value.trim().is_empty(),
+            "{}:{} 的 interface 字段名和值均不能为空",
+            display_relative(path),
+            line_index + 1
+        );
+        assert!(
+            interface
+                .insert(key.to_owned(), value.trim().to_owned())
+                .is_none(),
+            "{}:{} 的 interface 字段 {key:?} 重复",
+            display_relative(path),
+            line_index + 1
+        );
+    }
+    interface
+}
+
+fn is_markdown_fence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn markdown_level_two_section<'a>(source: &'a str, heading: &str) -> Option<&'a str> {
+    let start = source.find(heading)?;
+    let remainder = &source[start + heading.len()..];
+    let end = remainder.find("\n## ").unwrap_or(remainder.len());
+    Some(&remainder[..end])
+}
+
+fn directly_linked_local_files(path: &Path, source: &str) -> BTreeSet<PathBuf> {
+    local_markdown_links(source)
+        .into_iter()
+        .filter_map(|(_, target)| {
+            let file_target = target
+                .split_once('#')
+                .map_or(target.as_str(), |(file, _)| file);
+            if file_target.is_empty() {
+                return None;
+            }
+            let linked_path = path
+                .parent()
+                .expect("Markdown 文件始终有父目录")
+                .join(file_target);
+            Some(canonicalize_for_contract(&linked_path))
+        })
+        .collect()
+}
+
+fn canonicalize_for_contract(path: &Path) -> PathBuf {
+    fs::canonicalize(path)
+        .unwrap_or_else(|error| panic!("无法解析 {}：{error}", display_relative(path)))
+}
+
+fn directory_shape(path: &Path) -> BTreeSet<(String, &'static str)> {
+    fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("无法读取 {}：{error}", display_relative(path)))
+        .map(|entry| {
+            let entry = entry.expect("Skill 目录项应可枚举");
+            let file_type = entry.file_type().unwrap_or_else(|error| {
+                panic!(
+                    "无法读取 {} 的文件类型：{error}",
+                    display_relative(&entry.path())
+                )
+            });
+            let kind = if file_type.is_file() {
+                "file"
+            } else if file_type.is_dir() {
+                "directory"
+            } else {
+                "other"
+            };
+            (
+                entry
+                    .file_name()
+                    .into_string()
+                    .expect("Skill 目录项名称必须是 Unicode"),
+                kind,
+            )
+        })
+        .collect()
 }
 
 fn collect_files_with_extension(root: &Path, extension: &str) -> Vec<PathBuf> {
@@ -843,6 +1232,10 @@ fn read_utf8(path: &Path) -> String {
 
 fn documentation_root() -> PathBuf {
     workspace_root().join("docs/rpg-maker")
+}
+
+fn rpg_maker_skill_root() -> PathBuf {
+    workspace_root().join("skills").join(RPG_MAKER_SKILL_NAME)
 }
 
 fn workspace_root() -> &'static Path {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "使用 ATT 汉化 RPG Maker"
+  short_description: "根据项目状态执行、诊断并验证 RPG Maker 汉化流程"
+  default_prompt: "使用 $translate-rpg-maker-with-att，根据当前游戏和项目状态推进这项 RPG Maker 汉化任务。"
