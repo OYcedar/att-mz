@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -42,6 +43,21 @@ impl ChatMessage {
     pub(crate) fn content(&self) -> &str {
         &self.content
     }
+}
+
+/// 一次 LLM HTTP 尝试在当前命令运行内的受信归属。
+///
+/// 调用方只提交已经建立的一开始序号；文件路径与呈现形式由审阅档案边界拥有，
+/// HTTP 根不得从消息或其他不可信文本推断归属。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum LlmCallSite {
+    Standard {
+        task_ordinal: NonZeroU64,
+        attempt: NonZeroU64,
+    },
+    Lua {
+        call: NonZeroU64,
+    },
 }
 
 /// 单次非流式 LLM 请求的结束原因。
@@ -197,6 +213,7 @@ pub(crate) trait LlmRequestExecutor: Send + Sync {
     fn request<'a>(
         &'a self,
         client: &'a Self::Client,
+        call_site: LlmCallSite,
         messages: &'a [ChatMessage],
     ) -> impl Future<Output = Result<LlmResponse, LlmRequestError<Self::Error>>> + Send + 'a;
 }
@@ -221,6 +238,18 @@ pub(crate) trait LlmRequestDiagnosticSource {
         retry_after: Option<Duration>,
         impact: DiagnosticImpact,
     ) -> SafeDiagnostic;
+
+    /// 返回同一次请求中必须与主诊断并列保留的其他安全终态。
+    ///
+    /// 默认没有相关终态；组合错误在仍持有具体类型时覆盖本方法，不能让调用方
+    /// downcast 或遍历任意 source 链补猜。
+    fn related_request_diagnostics(
+        &self,
+        _retry_after: Option<Duration>,
+        _impact: DiagnosticImpact,
+    ) -> Vec<SafeDiagnostic> {
+        Vec::new()
+    }
 }
 
 /// 一个 LLM Client 对供应商活动请求数的真实外部约束。

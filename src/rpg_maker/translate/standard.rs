@@ -24,12 +24,13 @@ use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguagePair};
 #[cfg(test)]
 use crate::llm::LlmUsage;
-use crate::llm::{ChatMessage, LlmClientConcurrency};
+use crate::llm::{ChatMessage, LlmCallSite, LlmClientConcurrency};
 use crate::rpg_maker::model::{LogicalTextLocation, TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
 use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
+use crate::runtime::llm_call_review::LlmCallRecorder;
 
 use super::executor::FinalLlmResponseMetadata;
 use super::profile::RpgMakerTranslationProfile;
@@ -58,6 +59,24 @@ fn local_in_flight_window_count(task_count: usize, max_concurrent_requests: usiz
             .saturating_mul(EXECUTION_WINDOW_MULTIPLIER.saturating_add(1))
             .max(1),
     )
+}
+
+fn review_failure_belongs_to_standard_task(
+    recorder: &LlmCallRecorder,
+    task_index: StandardTranslationTaskIndex,
+) -> Option<bool> {
+    recorder.failure().map(|failure| match failure.site() {
+        Some(LlmCallSite::Standard { task_ordinal, .. }) => {
+            task_ordinal
+                .get()
+                .checked_sub(1)
+                .and_then(|index| usize::try_from(index).ok())
+                == Some(task_index.get())
+        }
+        // Run 根在进入 Standard 前已经建立；运行期故障都应有调用归属。
+        // 若内部不变量遭破坏，仍传播失败，不能让所有 worker 互相等待。
+        Some(LlmCallSite::Lua { .. }) | None => true,
+    })
 }
 
 /// 一次标准资产翻译需要的可选外部资料。
@@ -1169,7 +1188,6 @@ impl AcceptedTranslationDecision {
         Self { id, patch }
     }
 
-    #[cfg(test)]
     pub(crate) const fn id(&self) -> usize {
         self.id
     }
@@ -1248,12 +1266,10 @@ impl UnresolvedTranslationUnit {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn id(&self) -> usize {
         self.id
     }
 
-    #[cfg(test)]
     pub(crate) fn reason(&self) -> &TranslationUnitRejectionReason {
         &self.reason
     }
@@ -1375,7 +1391,7 @@ impl TranslationTaskOutcome {
     }
 
     #[cfg(test)]
-    fn final_response(&self) -> Option<&FinalLlmResponseMetadata> {
+    pub(crate) fn final_response(&self) -> Option<&FinalLlmResponseMetadata> {
         match self {
             Self::Complete { final_response, .. } | Self::Partial { final_response, .. } => {
                 Some(final_response)
@@ -1779,6 +1795,7 @@ impl<E, S, C> PreparedScheduledTaskCompletion<E, S, C> {
                 ..
             } => outcome.task_index() != self.task_index || matches!(prepared_commit, Some(Err(_))),
             PreparedTaskExecutionCompletion::Failed { .. } => true,
+            PreparedTaskExecutionCompletion::Discarded { .. } => true,
         }
     }
 }
@@ -1791,6 +1808,9 @@ enum PreparedTaskExecutionCompletion<E, S, C> {
     Failed {
         task_index: StandardTranslationTaskIndex,
         source: E,
+    },
+    Discarded {
+        task_index: StandardTranslationTaskIndex,
     },
 }
 
@@ -1823,6 +1843,9 @@ enum TaskExecutionCompletion<E> {
         task_index: StandardTranslationTaskIndex,
         source: E,
     },
+    Discarded {
+        task_index: StandardTranslationTaskIndex,
+    },
 }
 
 /// 使用四个业务能力和不可失败观察入口编排一次标准资产翻译。
@@ -1833,6 +1856,7 @@ pub(crate) struct StandardTranslationService<R, P, E, S, J> {
     result_store: S,
     event_log: J,
     cancellation: CooperativeCancellation,
+    call_recorder: LlmCallRecorder,
     #[cfg(test)]
     stop_admission_notify: Option<Arc<tokio::sync::Notify>>,
 }
@@ -1853,9 +1877,15 @@ impl<R, P, E, S, J> StandardTranslationService<R, P, E, S, J> {
             result_store,
             event_log,
             cancellation,
+            call_recorder: LlmCallRecorder::disabled(),
             #[cfg(test)]
             stop_admission_notify: None,
         }
+    }
+
+    pub(crate) fn with_call_recorder(mut self, call_recorder: LlmCallRecorder) -> Self {
+        self.call_recorder = call_recorder;
+        self
     }
 }
 
@@ -1912,6 +1942,9 @@ where
             }
             TaskExecutionCompletion::Failed { task_index, source } => {
                 PreparedTaskExecutionCompletion::Failed { task_index, source }
+            }
+            TaskExecutionCompletion::Discarded { task_index } => {
+                PreparedTaskExecutionCompletion::Discarded { task_index }
             }
         };
         PreparedScheduledTaskCompletion {
@@ -2046,12 +2079,64 @@ where
                             let task_index = task.index();
                             let execution =
                                 self.execute_planned_task(profile, task, task_count).await;
-                            if self.cancellation.is_requested() {
+
+                            if review_failure_belongs_to_standard_task(
+                                &self.call_recorder,
+                                task_index,
+                            ) == Some(false)
+                            {
+                                // 这是另一任务首个档案故障的观察者。真正的归属任务必须
+                                // 先把包含 Provider/处理器关联错误的完整终态送入
+                                // finalizer；随后它会请求取消并唤醒这里。观察者不伪造
+                                // 自己的 task/attempt，也不抢占自然顺序中的主错误。
+                                self.cancellation.cancelled().await;
+                                let _ = execution_sender.send(ScheduledTaskCompletion {
+                                    task_index,
+                                    execution: TaskExecutionCompletion::Discarded { task_index },
+                                    in_flight_permit,
+                                });
                                 break;
                             }
-                            if matches!(&execution, TaskExecutionCompletion::Failed { .. }) {
+
+                            let failed = matches!(
+                                &execution,
+                                TaskExecutionCompletion::Failed { .. }
+                            );
+                            let must_propagate_review_failure =
+                                failed
+                                    && review_failure_belongs_to_standard_task(
+                                        &self.call_recorder,
+                                        task_index,
+                                    ) == Some(true);
+                            let should_propagate_failure = failed
+                                && (must_propagate_review_failure
+                                    || !self.cancellation.is_requested());
+
+                            if should_propagate_failure {
                                 stop_admission.store(true, Ordering::Release);
+                                if execution_sender
+                                    .send(ScheduledTaskCompletion {
+                                        task_index,
+                                        execution,
+                                        in_flight_permit,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if must_propagate_review_failure {
+                                    // 先把档案 Fatal 失败送进确定性 finalizer，再用业务
+                                    // 取消信号唤醒尚未发送、仍在准入或 retry delay 的
+                                    // 兄弟任务。普通任务失败继续沿用自然顺序归并语义。
+                                    self.cancellation.request();
+                                }
+                                break;
                             }
+
+                            if failed || self.cancellation.is_requested() {
+                                break;
+                            }
+
                             if execution_sender
                                 .send(ScheduledTaskCompletion {
                                     task_index,
@@ -2143,6 +2228,16 @@ where
                         } = completion;
 
                         match execution {
+                            PreparedTaskExecutionCompletion::Discarded { task_index } => {
+                                self.event_log
+                                    .emit(StandardTranslationLogEvent::TaskFinished {
+                                        task_index,
+                                        outcome: StandardTranslationLogTaskOutcome::NotCommitted,
+                                        attempts: None,
+                                        retry_exhausted: false,
+                                        diagnostic: None,
+                                    });
+                            }
                             PreparedTaskExecutionCompletion::Failed { task_index, source } => {
                                 stop_admission.store(true, Ordering::Release);
                                 self.event_log
@@ -3519,6 +3614,81 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 3],
             "执行失败终态也必须按计划顺序写入"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_failure_owner_wins_over_an_earlier_plan_observer() {
+        let temporary = tempfile::tempdir().expect("测试目录应建立");
+        let recorder = LlmCallRecorder::start(
+            temporary.path().to_path_buf(),
+            crate::observability::RunId::from_uuid(
+                uuid::Uuid::parse_str("12121212-1212-4212-8212-121212121212")
+                    .expect("测试 RunId 必须有效"),
+            ),
+            crate::i18n::UiLocale::SimplifiedChinese,
+            crate::runtime::llm_call_review::LlmCallReviewContext::new(
+                "mz",
+                "review-race",
+                "quality",
+                "primary",
+            ),
+        )
+        .await
+        .expect("测试档案根应建立");
+        std::fs::create_dir_all(
+            recorder
+                .run_root()
+                .expect("启用时应有 Run 根")
+                .join("standard"),
+        )
+        .expect("Standard 根应建立");
+        std::fs::write(
+            recorder
+                .run_root()
+                .expect("启用时应有 Run 根")
+                .join("standard")
+                .join("task-000002"),
+            b"directory-conflict",
+        )
+        .expect("应建立高序任务的档案故障");
+        recorder
+            .record_request(
+                LlmCallSite::Standard {
+                    task_ordinal: std::num::NonZeroU64::new(2).expect("任务序号非零"),
+                    attempt: std::num::NonZeroU64::MIN,
+                },
+                crate::runtime::llm_call_review::LlmCallRequestRecord::new(
+                    url::Url::parse("https://example.invalid/v1/chat/completions")
+                        .expect("测试 URL 必须有效"),
+                    b"{}".to_vec(),
+                ),
+            )
+            .await
+            .expect_err("高序任务的首个档案失败必须锁存真实归属");
+
+        let mut harness = harness(2, vec![1, 5], false, false, false, Some(1), None);
+        harness.service = harness.service.with_call_recorder(recorder);
+        let error = harness
+            .service
+            .run(&project(), &profile(2), input())
+            .await
+            .expect_err("档案故障观察者不得抢占真实归属任务");
+
+        assert!(matches!(
+            error,
+            StandardTranslationServiceError::ExecuteTask {
+                task_index,
+                source: FakeError("execute")
+            } if task_index == StandardTranslationTaskIndex::new(1)
+        ));
+        assert!(
+            harness.cancellation.is_requested(),
+            "真实归属错误安全进入 finalizer 后必须唤醒所有档案故障观察者"
+        );
+        assert!(
+            committed(&events(&harness.events)).is_empty(),
+            "较低计划序号观察到全局档案故障后不得提交自己的正常结果"
         );
     }
 

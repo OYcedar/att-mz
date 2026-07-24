@@ -3,8 +3,10 @@
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::diagnostic::{
@@ -13,8 +15,13 @@ use crate::diagnostic::{
     SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::OperationCompletion;
+#[cfg(test)]
+use crate::llm::LlmResponse;
 use crate::llm::{
-    ChatMessage, LlmRequestDiagnosticSource, LlmRequestError, LlmRequestExecutor, LlmResponse,
+    ChatMessage, LlmCallSite, LlmRequestDiagnosticSource, LlmRequestError, LlmRequestExecutor,
+};
+use crate::runtime::llm_call_review::{
+    LlmCallDisposition, LlmCallRecorder, LlmCallReviewError, LlmParsedResponseMetadata,
 };
 use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
 use crate::storage::scoped_path::{ExactPathCaseMismatch, resolve_exact_directory_entry};
@@ -30,9 +37,10 @@ use super::runtime::OwnedLuaProgram;
 use super::runtime::{
     TrustedLuaBindingFinalization, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
     TrustedLuaCommonBindings, TrustedLuaCommonHostCalls, TrustedLuaExtractHostCalls,
-    TrustedLuaExtractIntent, TrustedLuaHostCallError, TrustedLuaRuntimeBindings,
-    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor, TrustedLuaTranslateHostCalls,
-    TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
+    TrustedLuaExtractIntent, TrustedLuaHostCallError, TrustedLuaLlmDeliveryDisposition,
+    TrustedLuaPendingLlmResponse, TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError,
+    TrustedLuaRuntimeExecutor, TrustedLuaTranslateHostCalls, TrustedLuaTranslationSemantics,
+    TrustedLuaWriteBackHostCalls,
 };
 use super::{
     LuaInvocation, LuaProjectContext, LuaSourcePath, TrustedLuaExecutionHost,
@@ -43,6 +51,9 @@ use super::{
 pub(crate) struct TrustedLuaExecutionHostingService<F, L, R, S> {
     file_system: Arc<F>,
     llm: LuaLlmCapability<L>,
+    llm_calls: Arc<AtomicU64>,
+    call_recorder: LlmCallRecorder,
+    call_review_related: Arc<Mutex<Vec<LuaCallReviewRelatedFailure>>>,
     runtime: R,
     session_factory: S,
 }
@@ -52,6 +63,9 @@ impl<F, L, R, S> TrustedLuaExecutionHostingService<F, L, R, S> {
         Self {
             file_system: Arc::new(file_reader),
             llm: LuaLlmCapability::Enabled(Arc::new(llm)),
+            llm_calls: Arc::new(AtomicU64::new(0)),
+            call_recorder: LlmCallRecorder::disabled(),
+            call_review_related: Arc::new(Mutex::new(Vec::new())),
             runtime,
             session_factory,
         }
@@ -61,9 +75,17 @@ impl<F, L, R, S> TrustedLuaExecutionHostingService<F, L, R, S> {
         Self {
             file_system: Arc::new(file_reader),
             llm: LuaLlmCapability::Disabled(PhantomData),
+            llm_calls: Arc::new(AtomicU64::new(0)),
+            call_recorder: LlmCallRecorder::disabled(),
+            call_review_related: Arc::new(Mutex::new(Vec::new())),
             runtime,
             session_factory,
         }
+    }
+
+    pub(crate) fn with_call_recorder(mut self, call_recorder: LlmCallRecorder) -> Self {
+        self.call_recorder = call_recorder;
+        self
     }
 }
 
@@ -159,6 +181,9 @@ where
                     llm_client,
                     semantics,
                     llm: self.llm.clone(),
+                    llm_calls: Arc::clone(&self.llm_calls),
+                    call_recorder: self.call_recorder.clone(),
+                    call_review_related: Arc::clone(&self.call_review_related),
                 }),
                 finalizer,
             ),
@@ -169,7 +194,7 @@ where
         let handle = self.runtime.start(program, bindings);
         let (runtime, finalization) = handle.await.into_parts();
 
-        match (runtime, finalization) {
+        let result = match (runtime, finalization) {
             (Err(TrustedLuaRuntimeExecutionError::Cancelled), Ok(_)) => {
                 Ok(OperationCompletion::Cancelled)
             }
@@ -188,6 +213,18 @@ where
             (Err(runtime), Err(cleanup)) => {
                 Err(TrustedLuaExecutionHostingError::RuntimeAndCleanup { runtime, cleanup })
             }
+        };
+        match self.call_recorder.failure() {
+            Some(source) => Err(TrustedLuaExecutionHostingError::CallReview {
+                source,
+                related: result.err().map(Box::new),
+                related_llm_failures: self
+                    .call_review_related
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            }),
+            None => result,
         }
     }
 }
@@ -437,6 +474,9 @@ where
     llm_client: Arc<L::Client>,
     semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     llm: LuaLlmCapability<L>,
+    llm_calls: Arc<AtomicU64>,
+    call_recorder: LlmCallRecorder,
+    call_review_related: Arc<Mutex<Vec<LuaCallReviewRelatedFailure>>>,
 }
 
 impl<L> TrustedLuaTranslateHostCalls for LuaTranslationHostCalls<L>
@@ -470,8 +510,13 @@ where
     fn request_llm(
         &self,
         messages: Vec<ChatMessage>,
-    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, TrustedLuaHostCallError>> + Send + 'static>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<TrustedLuaPendingLlmResponse, TrustedLuaHostCallError>>
+                + Send
+                + 'static,
+        >,
+    > {
         let llm_client = Arc::clone(&self.llm_client);
         let LuaLlmCapability::Enabled(llm) = &self.llm else {
             return Box::pin(async {
@@ -485,13 +530,79 @@ where
             });
         };
         let llm = Arc::clone(llm);
+        let call = self
+            .llm_calls
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .expect("单次命令运行不可能完成 u64::MAX 次 Lua LLM 调用")
+            + 1;
+        let call_site = LlmCallSite::Lua {
+            call: NonZeroU64::new(call).expect("一开始的 Lua 调用序号必须非零"),
+        };
+        let call_recorder = self.call_recorder.clone();
+        let call_review_related = Arc::clone(&self.call_review_related);
         Box::pin(async move {
-            llm.request(llm_client.as_ref(), &messages)
-                .await
-                .map_err(llm_call_error)
-                .map_err(|error| error.with_operation("llm.request"))
+            let response = match llm.request(llm_client.as_ref(), call_site, &messages).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let failure = llm_call_error(error);
+                    if let Some(related) = failure.related {
+                        call_review_related
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(related);
+                    }
+                    return Err(failure.host.with_operation("llm.request"));
+                }
+            };
+            let response_metadata = LlmParsedResponseMetadata::from(&response);
+            Ok(TrustedLuaPendingLlmResponse::new(
+                response,
+                move |disposition| {
+                    Box::pin(async move {
+                        if call_recorder.is_enabled() {
+                            let disposition = match disposition {
+                                TrustedLuaLlmDeliveryDisposition::Delivered => {
+                                    LlmCallDisposition::lua_delivered(response_metadata)
+                                }
+                                TrustedLuaLlmDeliveryDisposition::BindingRejected => {
+                                    LlmCallDisposition::rejected(
+                                        "lua_binding_failed",
+                                        Some(response_metadata),
+                                    )
+                                }
+                            };
+                            call_recorder
+                                .record_disposition(call_site, disposition)
+                                .await
+                                .map_err(llm_call_review_host_error)?;
+                        }
+                        if let Some(source) = call_recorder.failure() {
+                            return Err(llm_call_review_host_error(source));
+                        }
+                        Ok(())
+                    })
+                },
+            ))
         })
     }
+}
+
+fn llm_call_review_host_error(source: LlmCallReviewError) -> TrustedLuaHostCallError {
+    let diagnostic = source.safe_diagnostic(
+        DiagnosticStage::ModelRequest,
+        DiagnosticImpact::ProgressPreserved,
+    );
+    TrustedLuaHostCallError::new(
+        "llm_call_review",
+        "persistence_failed",
+        "LLM 调用审阅档案无法完成持久化",
+        None,
+        Some(Arc::new(source)),
+    )
+    .with_operation("llm.call_review")
+    .with_safe_diagnostic(diagnostic)
 }
 
 fn database_call_error<E>(
@@ -683,11 +794,45 @@ fn source_case_mismatch(
     .with_safe_diagnostic(diagnostic)
 }
 
-fn llm_call_error<E>(error: LlmRequestError<E>) -> TrustedLuaHostCallError
+struct LuaLlmCallFailure {
+    host: TrustedLuaHostCallError,
+    related: Option<LuaCallReviewRelatedFailure>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LuaCallReviewRelatedFailure {
+    diagnostics: Vec<SafeDiagnostic>,
+    source: Arc<dyn Error + Send + Sync>,
+}
+
+#[derive(Clone)]
+struct PreservedLuaLlmRelatedError(Arc<dyn Error + Send + Sync>);
+
+impl fmt::Debug for PreservedLuaLlmRelatedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreservedLuaLlmRelatedError")
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for PreservedLuaLlmRelatedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a related LLM request failure was preserved")
+    }
+}
+
+impl Error for PreservedLuaLlmRelatedError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn llm_call_error<E>(error: LlmRequestError<E>) -> LuaLlmCallFailure
 where
     E: Error + LlmRequestDiagnosticSource + Send + Sync + 'static,
 {
-    let (kind, retry_after_ms, diagnostic) = match &error {
+    let (kind, retry_after_ms, diagnostic, related_diagnostics) = match &error {
         LlmRequestError::Retryable {
             source,
             retry_after,
@@ -695,21 +840,30 @@ where
             "retryable",
             retry_after.map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
             source.request_diagnostic(*retry_after, DiagnosticImpact::Unchanged),
+            source.related_request_diagnostics(*retry_after, DiagnosticImpact::Unchanged),
         ),
         LlmRequestError::Fatal(source) => (
             "fatal",
             None,
             source.request_diagnostic(None, DiagnosticImpact::Unchanged),
+            source.related_request_diagnostics(None, DiagnosticImpact::Unchanged),
         ),
     };
-    TrustedLuaHostCallError::new(
-        "llm",
-        kind,
-        "Lua Host 模型请求失败",
-        retry_after_ms,
-        Some(Arc::new(error)),
-    )
-    .with_safe_diagnostic(diagnostic)
+    let source: Arc<dyn Error + Send + Sync> = Arc::new(error);
+    LuaLlmCallFailure {
+        host: TrustedLuaHostCallError::new(
+            "llm",
+            kind,
+            "Lua Host 模型请求失败",
+            retry_after_ms,
+            Some(Arc::clone(&source)),
+        )
+        .with_safe_diagnostic(diagnostic),
+        related: (!related_diagnostics.is_empty()).then_some(LuaCallReviewRelatedFailure {
+            diagnostics: related_diagnostics,
+            source,
+        }),
+    }
 }
 
 struct LuaSessionFinalizer<F> {
@@ -786,6 +940,11 @@ pub(crate) enum TrustedLuaExecutionHostingError<O, R> {
         runtime: TrustedLuaRuntimeExecutionError<R>,
         cleanup: TrustedLuaBindingFinalizationError,
     },
+    CallReview {
+        source: LlmCallReviewError,
+        related: Option<Box<TrustedLuaExecutionHostingError<O, R>>>,
+        related_llm_failures: Vec<LuaCallReviewRelatedFailure>,
+    },
 }
 
 impl<O, R> TrustedLuaExecutionHostingError<O, R>
@@ -848,6 +1007,7 @@ where
                 DiagnosticImpact::RecoveryRequired,
             )
             .with_recovery(RecoveryFact::component("lua_binding_finalization=failed")),
+            Self::CallReview { source, .. } => source.safe_diagnostic(stage, impact),
         }
     }
 
@@ -877,6 +1037,30 @@ where
                 let mut report = FailureReport::new(ReportedFailure::new(primary, cleanup.clone()));
                 for public in diagnostics {
                     report = report.with_related(ReportedFailure::new(public, cleanup.clone()));
+                }
+                report
+            }
+            Self::CallReview {
+                source,
+                related,
+                related_llm_failures,
+            } => {
+                let primary = source.safe_diagnostic(stage, impact);
+                let mut report = FailureReport::new(ReportedFailure::new(primary, source));
+                if let Some(related) = related {
+                    report = report.with_related_report(related.into_failure_report(
+                        stage,
+                        script_path,
+                        impact,
+                    ));
+                }
+                for failure in related_llm_failures {
+                    for diagnostic in failure.diagnostics {
+                        report = report.with_related(ReportedFailure::new(
+                            diagnostic,
+                            PreservedLuaLlmRelatedError(Arc::clone(&failure.source)),
+                        ));
+                    }
                 }
                 report
             }
@@ -1107,6 +1291,19 @@ where
             Self::RuntimeAndCleanup { runtime, cleanup } => {
                 write!(formatter, "{runtime}；随后清理失败：{cleanup}")
             }
+            Self::CallReview {
+                source,
+                related: Some(related),
+                ..
+            } => write!(
+                formatter,
+                "LLM 调用审阅档案失败：{source}；同时发生 Lua Host 错误：{related}"
+            ),
+            Self::CallReview {
+                source,
+                related: None,
+                ..
+            } => write!(formatter, "LLM 调用审阅档案失败：{source}"),
         }
     }
 }
@@ -1123,6 +1320,7 @@ where
             Self::Cleanup(source) => Some(source),
             Self::UnclosedTransaction => None,
             Self::RuntimeAndCleanup { runtime, .. } => Some(runtime),
+            Self::CallReview { source, .. } => Some(source),
         }
     }
 }
@@ -1136,13 +1334,19 @@ mod tests {
 
     use super::*;
     use crate::llm::{LlmFinishReason, LlmUsage};
+    use crate::observability::RunId;
     use crate::rpg_maker::ProjectName;
+    use crate::rpg_maker::lua::lua54::{TrustedLua54Runtime, TrustedLua54RuntimeConfiguration};
     use crate::rpg_maker::lua::runtime::{
         TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeExecutionReport,
     };
     use crate::rpg_maker::project::OpenedProject;
     use crate::runtime::filesystem::{
         SystemFileSystem, SystemFileSystemConfig, SystemFileSystemError,
+    };
+    use crate::runtime::llm::OpenAiChatCompletionError;
+    use crate::runtime::llm_call_review::{
+        LlmCallRequestRecord, LlmCallReviewContext, LlmProviderHeaders, LlmProviderRecord,
     };
     use crate::runtime::sqlite::SqliteRuntimeError;
     use crate::storage::file_system::{
@@ -1504,6 +1708,7 @@ mod tests {
         async fn request<'a>(
             &'a self,
             _client: &'a Self::Client,
+            _call_site: crate::llm::LlmCallSite,
             _messages: &'a [ChatMessage],
         ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
             Ok(LlmResponse::new(
@@ -1512,6 +1717,88 @@ mod tests {
                 None,
                 Some("response-id".to_owned()),
                 Some(LlmUsage::new(1, 1, 2)),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct OverflowUsageLlm;
+
+    impl LlmRequestExecutor for OverflowUsageLlm {
+        type Client = ();
+        type Error = FakeError;
+
+        async fn request<'a>(
+            &'a self,
+            _client: &'a Self::Client,
+            _call_site: LlmCallSite,
+            _messages: &'a [ChatMessage],
+        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+            Ok(LlmResponse::new(
+                "response",
+                LlmFinishReason::Stop,
+                None,
+                Some("overflow-response-id".to_owned()),
+                Some(LlmUsage::new(u64::MAX, 1, u64::MAX)),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct RelatedFailureLlm {
+        error: Arc<Mutex<Option<OpenAiChatCompletionError>>>,
+    }
+
+    impl LlmRequestExecutor for RelatedFailureLlm {
+        type Client = ();
+        type Error = OpenAiChatCompletionError;
+
+        async fn request<'a>(
+            &'a self,
+            _client: &'a Self::Client,
+            _call_site: LlmCallSite,
+            _messages: &'a [ChatMessage],
+        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+            Err(LlmRequestError::Fatal(
+                self.error
+                    .lock()
+                    .expect("关联错误锁不应中毒")
+                    .take()
+                    .expect("测试只应发送一次 LLM 请求"),
+            ))
+        }
+    }
+
+    struct FakeTranslationSemantics;
+
+    impl TrustedLuaTranslationSemantics for FakeTranslationSemantics {
+        fn system_prompt(&self) -> &str {
+            "system"
+        }
+
+        fn source_language(&self) -> &str {
+            "ja"
+        }
+
+        fn target_language(&self) -> &str {
+            "zh-Hans"
+        }
+
+        fn prepare_translation(
+            &self,
+            _kind: crate::rpg_maker::text::TextGroupKind,
+            _original: String,
+            _semantic_context: String,
+        ) -> Result<
+            Arc<dyn crate::rpg_maker::lua::runtime::TrustedLuaPreparedTranslation>,
+            TrustedLuaHostCallError,
+        > {
+            Err(TrustedLuaHostCallError::new(
+                "test",
+                "unused",
+                "测试不应准备翻译",
+                None,
+                None,
             ))
         }
     }
@@ -1625,10 +1912,14 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Eq, PartialEq)]
     enum RuntimeBehavior {
         Complete,
         DeclareDeactivate,
+        CallLlm,
+        CallLlmTwice,
+        CatchLlmError,
+        RejectLlmBinding,
         Fail,
         Unavailable,
         Cancelled,
@@ -1650,27 +1941,80 @@ mod tests {
         ) -> TrustedLuaExecutionHandle<Self::Error> {
             record(&self.events, "start");
             let behavior = self.behavior;
+            let events = Arc::clone(&self.events);
             let (_common, phase, finalizer) = bindings.into_parts();
-            let TrustedLuaPhaseBindings::Extract(extract) = phase else {
-                panic!("Hosting Extract 测试只应接收 Extract bindings")
-            };
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
             tokio::spawn(async move {
-                let runtime = match behavior {
-                    RuntimeBehavior::Complete => Ok(()),
-                    RuntimeBehavior::DeclareDeactivate => extract
+                let runtime = match (behavior, phase) {
+                    (RuntimeBehavior::Complete, TrustedLuaPhaseBindings::Extract(_)) => Ok(()),
+                    (
+                        RuntimeBehavior::DeclareDeactivate,
+                        TrustedLuaPhaseBindings::Extract(extract),
+                    ) => extract
                         .clear_standard()
                         .map_err(TrustedLuaRuntimeExecutionError::Binding),
-                    RuntimeBehavior::Fail => Err(TrustedLuaRuntimeExecutionError::Execute(
-                        FakeError::Private("vm"),
-                    )),
-                    RuntimeBehavior::Unavailable => {
+                    (
+                        RuntimeBehavior::CallLlm
+                        | RuntimeBehavior::CallLlmTwice
+                        | RuntimeBehavior::CatchLlmError
+                        | RuntimeBehavior::RejectLlmBinding,
+                        TrustedLuaPhaseBindings::Translate(translate),
+                    ) => {
+                        let calls = if behavior == RuntimeBehavior::CallLlmTwice {
+                            2
+                        } else {
+                            1
+                        };
+                        let mut result = Ok(());
+                        for _ in 0..calls {
+                            result = match translate
+                                .request_llm(vec![ChatMessage::new(
+                                    crate::llm::ChatMessageRole::User,
+                                    "lua request",
+                                )])
+                                .await
+                            {
+                                Ok(pending) => pending
+                                    .finish(if behavior == RuntimeBehavior::RejectLlmBinding {
+                                        TrustedLuaLlmDeliveryDisposition::BindingRejected
+                                    } else {
+                                        TrustedLuaLlmDeliveryDisposition::Delivered
+                                    })
+                                    .await
+                                    .map_err(TrustedLuaRuntimeExecutionError::Binding),
+                                Err(error) => Err(TrustedLuaRuntimeExecutionError::Binding(error)),
+                            };
+                            if result.is_err() {
+                                break;
+                            }
+                        }
+                        if behavior == RuntimeBehavior::CatchLlmError {
+                            record(
+                                &events,
+                                if result.is_err() {
+                                    "llm-error-caught"
+                                } else {
+                                    "llm-response-delivered"
+                                },
+                            );
+                            Ok(())
+                        } else {
+                            result
+                        }
+                    }
+                    (RuntimeBehavior::Fail, TrustedLuaPhaseBindings::Extract(_)) => Err(
+                        TrustedLuaRuntimeExecutionError::Execute(FakeError::Private("vm")),
+                    ),
+                    (RuntimeBehavior::Unavailable, TrustedLuaPhaseBindings::Extract(_)) => {
                         Err(TrustedLuaRuntimeExecutionError::Unavailable(
                             FakeError::Private("unavailable"),
                         ))
                     }
-                    RuntimeBehavior::Cancelled => Err(TrustedLuaRuntimeExecutionError::Cancelled),
+                    (RuntimeBehavior::Cancelled, TrustedLuaPhaseBindings::Extract(_)) => {
+                        Err(TrustedLuaRuntimeExecutionError::Cancelled)
+                    }
+                    _ => panic!("测试 RuntimeBehavior 与 Lua phase 不匹配"),
                 };
                 let finalization = finalizer.finalize().await;
                 let _ = sender.send(TrustedLuaRuntimeExecutionReport::new(runtime, finalization));
@@ -1704,6 +2048,29 @@ mod tests {
         )
     }
 
+    fn translation_service(
+        events: Events,
+        runtime: RuntimeBehavior,
+        call_recorder: LlmCallRecorder,
+    ) -> Service {
+        TrustedLuaExecutionHostingService::with_llm(
+            FakeFileReader {
+                events: Arc::clone(&events),
+            },
+            FakeLlm,
+            FakeRuntime {
+                events: Arc::clone(&events),
+                behavior: runtime,
+            },
+            FakeSessionFactory {
+                events,
+                fail: false,
+                finalization: FinalizationBehavior::Idle,
+            },
+        )
+        .with_call_recorder(call_recorder)
+    }
+
     fn invocation() -> LuaInvocation<()> {
         let project = OpenedProject::new(
             "demo".parse::<ProjectName>().unwrap(),
@@ -1725,6 +2092,84 @@ mod tests {
         )
     }
 
+    fn translation_invocation() -> LuaInvocation<()> {
+        translation_invocation_with_program(b"return nil")
+    }
+
+    fn translation_invocation_with_program(program: &[u8]) -> LuaInvocation<()> {
+        let project = OpenedProject::new(
+            "demo".parse::<ProjectName>().unwrap(),
+            PathBuf::from("C:/projects/demo"),
+            PathBuf::from("C:/projects/demo/project.db"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+            crate::rpg_maker::project::test_layout_profile(),
+        );
+        LuaInvocation::translate(
+            OwnedLuaProgram::new(PathBuf::from("main.lua"), program.to_vec()),
+            LuaProjectContext::for_frozen_source(
+                project.name().as_str(),
+                crate::rpg_maker::RpgMakerEngine::Mz,
+                project.source_root().to_path_buf(),
+                project.database_path().to_path_buf(),
+                project.language_pair().clone(),
+            ),
+            Arc::new(()),
+            Arc::new(FakeTranslationSemantics),
+        )
+    }
+
+    async fn lua_call_recorder(
+        workspace: &Path,
+        run_id: &str,
+        provider_calls: u64,
+    ) -> LlmCallRecorder {
+        let recorder = LlmCallRecorder::start(
+            workspace.to_path_buf(),
+            RunId::from_uuid(uuid::Uuid::parse_str(run_id).expect("测试 RunId 必须有效")),
+            crate::i18n::UiLocale::SimplifiedChinese,
+            LlmCallReviewContext::new("mz", "lua-project", "quality", "primary"),
+        )
+        .await
+        .expect("Lua 测试档案应建立");
+        for call in 1..=provider_calls {
+            let site = LlmCallSite::Lua {
+                call: NonZeroU64::new(call).expect("Lua 调用序号必须非零"),
+            };
+            recorder
+                .record_request(
+                    site,
+                    LlmCallRequestRecord::new(
+                        url::Url::parse("https://example.invalid/v1/chat/completions")
+                            .expect("测试 URL 必须有效"),
+                        br#"{"model":"test","messages":[],"stream":false}"#.to_vec(),
+                    ),
+                )
+                .await
+                .expect("Lua 请求阶段应同步");
+            recorder
+                .authorize_send(site)
+                .expect("Lua 测试调用应取得发送准入");
+            recorder
+                .record_provider(
+                    site,
+                    LlmProviderRecord::response(
+                        std::time::Duration::from_millis(8),
+                        200,
+                        LlmProviderHeaders::new(
+                            Some("application/json".to_owned()),
+                            Some("lua-request".to_owned()),
+                            None,
+                        ),
+                        br#"{"id":"lua-response","choices":[]}"#.to_vec(),
+                    ),
+                )
+                .await
+                .expect("Lua Provider 阶段应同步");
+        }
+        recorder
+    }
+
     #[tokio::test]
     async fn opens_the_session_before_synchronously_handing_it_to_the_runtime() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1744,6 +2189,299 @@ mod tests {
         );
 
         assert_eq!(*events.lock().unwrap(), ["open", "start", "finalize"]);
+    }
+
+    #[tokio::test]
+    async fn lua_response_is_recorded_before_it_is_delivered_to_the_runtime() {
+        let temporary = tempfile::tempdir().expect("测试目录应建立");
+        let recorder =
+            lua_call_recorder(temporary.path(), "ffffffff-ffff-4fff-8fff-ffffffffffff", 1).await;
+        let outcome = translation_service(
+            Arc::new(Mutex::new(Vec::new())),
+            RuntimeBehavior::CallLlm,
+            recorder.clone(),
+        )
+        .execute(translation_invocation())
+        .await
+        .expect("Lua 交付终态同步成功后运行才能完成");
+        assert_eq!(
+            outcome,
+            OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty)
+        );
+
+        let archive = fs::read_to_string(
+            recorder
+                .run_root()
+                .expect("启用时应有 Run 根")
+                .join("lua")
+                .join("call-000001.md"),
+        )
+        .expect("Lua 调用档案应可读");
+        for expected in ["delivered_to_lua", "response-id", "disposition_complete"] {
+            assert!(archive.contains(expected), "Lua 档案缺少 {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn consecutive_lua_calls_use_distinct_one_based_archive_files() {
+        let temporary = tempfile::tempdir().expect("测试目录应建立");
+        let recorder =
+            lua_call_recorder(temporary.path(), "78787878-7878-4878-8878-787878787878", 2).await;
+        translation_service(
+            Arc::new(Mutex::new(Vec::new())),
+            RuntimeBehavior::CallLlmTwice,
+            recorder.clone(),
+        )
+        .execute(translation_invocation())
+        .await
+        .expect("两次 Lua 调用都必须在交付前完成档案");
+
+        let lua_root = recorder.run_root().expect("启用时应有 Run 根").join("lua");
+        for name in ["call-000001.md", "call-000002.md"] {
+            let archive = fs::read_to_string(lua_root.join(name))
+                .unwrap_or_else(|error| panic!("{name} 应可读：{error}"));
+            assert!(archive.contains("delivered_to_lua"));
+            assert!(archive.contains("disposition_complete"));
+        }
+    }
+
+    #[tokio::test]
+    async fn lua_binding_rejection_is_recorded_as_not_delivered() {
+        let temporary = tempfile::tempdir().expect("测试目录应建立");
+        let recorder =
+            lua_call_recorder(temporary.path(), "56565656-5656-4656-8656-565656565656", 1).await;
+        translation_service(
+            Arc::new(Mutex::new(Vec::new())),
+            RuntimeBehavior::RejectLlmBinding,
+            recorder.clone(),
+        )
+        .execute(translation_invocation())
+        .await
+        .expect("Lua 返回值物化失败的处置应可完成持久化");
+
+        let archive = fs::read_to_string(
+            recorder
+                .run_root()
+                .expect("启用时应有 Run 根")
+                .join("lua")
+                .join("call-000001.md"),
+        )
+        .expect("Lua 调用档案应可读");
+        for expected in [
+            "provider_complete",
+            "disposition = \"rejected\"",
+            "reason_code = \"lua_binding_failed\"",
+            "disposition_complete",
+        ] {
+            assert!(archive.contains(expected), "Lua 档案缺少 {expected}");
+        }
+        assert!(
+            !archive.contains("delivered_to_lua"),
+            "返回值未物化时不得声称脚本已经收到响应"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_lua_binding_failure_and_archive_agree_that_response_was_not_delivered() {
+        let temporary = tempfile::tempdir().expect("测试目录应建立");
+        let recorder =
+            lua_call_recorder(temporary.path(), "45454545-4545-4454-8454-454545454545", 1).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runtime = TrustedLua54Runtime::new(
+            TrustedLua54RuntimeConfiguration::production(),
+            tokio::runtime::Handle::current(),
+        );
+        let service = TrustedLuaExecutionHostingService::with_llm(
+            FakeFileReader {
+                events: Arc::clone(&events),
+            },
+            OverflowUsageLlm,
+            runtime.clone(),
+            FakeSessionFactory {
+                events,
+                fail: false,
+                finalization: FinalizationBehavior::Idle,
+            },
+        )
+        .with_call_recorder(recorder.clone());
+        let outcome = service
+            .execute(translation_invocation_with_program(
+                br#"
+local ok = pcall(function()
+  ctx.llm({{ role = "user", content = "hello" }})
+end)
+assert(not ok, "overflowing usage must produce a binding error")
+"#,
+            ))
+            .await
+            .expect("Lua 捕获绑定错误后，运行与档案终态都应一致完成");
+        assert_eq!(
+            outcome,
+            OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty)
+        );
+        runtime.shutdown().await.expect("Lua Runtime 应可关闭");
+
+        let archive = fs::read_to_string(
+            recorder
+                .run_root()
+                .expect("启用时应有 Run 根")
+                .join("lua")
+                .join("call-000001.md"),
+        )
+        .expect("Lua 调用档案应可读");
+        for expected in [
+            "provider_complete",
+            "disposition = \"rejected\"",
+            "reason_code = \"lua_binding_failed\"",
+            "overflow-response-id",
+            "disposition_complete",
+        ] {
+            assert!(archive.contains(expected), "Lua 档案缺少 {expected}");
+        }
+        assert!(
+            !archive.contains("delivered_to_lua"),
+            "脚本得到绑定错误时档案不得声称响应已经交付"
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_pcall_cannot_swallow_archive_or_related_provider_failure() {
+        let temporary = tempfile::tempdir().expect("测试目录应建立");
+        let recorder =
+            lua_call_recorder(temporary.path(), "99999999-9999-4999-8999-999999999999", 0).await;
+        fs::write(
+            recorder.run_root().expect("启用时应有 Run 根").join("lua"),
+            b"directory-conflict",
+        )
+        .expect("应建立发送前档案故障");
+        let review = recorder
+            .record_request(
+                LlmCallSite::Lua {
+                    call: NonZeroU64::MIN,
+                },
+                LlmCallRequestRecord::new(
+                    url::Url::parse("https://example.invalid/v1/chat/completions")
+                        .expect("测试 URL 必须有效"),
+                    b"{}".to_vec(),
+                ),
+            )
+            .await
+            .expect_err("请求档案创建失败必须锁存");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let service = TrustedLuaExecutionHostingService::with_llm(
+            FakeFileReader {
+                events: Arc::clone(&events),
+            },
+            RelatedFailureLlm {
+                error: Arc::new(Mutex::new(Some(OpenAiChatCompletionError::CallReview {
+                    source: review,
+                    related: Some(Box::new(OpenAiChatCompletionError::HttpStatus {
+                        status: 503,
+                        provider_code: Some("provider_failed".to_owned()),
+                        provider_type: None,
+                    })),
+                }))),
+            },
+            FakeRuntime {
+                events: Arc::clone(&events),
+                behavior: RuntimeBehavior::CatchLlmError,
+            },
+            FakeSessionFactory {
+                events,
+                fail: false,
+                finalization: FinalizationBehavior::Idle,
+            },
+        )
+        .with_call_recorder(recorder);
+        let error = service
+            .execute(translation_invocation())
+            .await
+            .expect_err("Lua 捕获局部 Host 错误后，全局档案故障仍必须使命令失败");
+
+        let report = error.into_failure_report(
+            DiagnosticStage::Translate,
+            Path::new("main.lua"),
+            DiagnosticImpact::ProgressPreserved,
+        );
+        assert_eq!(
+            report.primary.public().code,
+            DiagnosticCode::FileSystemOperation
+        );
+        assert!(
+            report.related.iter().any(|failure| {
+                failure.public().reason
+                    == DiagnosticReason::Http {
+                        status: Some(503),
+                        retry_after_seconds: None,
+                        provider_code: Some("provider_failed".to_owned()),
+                        provider_type: None,
+                    }
+            }),
+            "Lua pcall 吞掉 Host 错误后仍必须保留同次调用的 Provider 相关诊断"
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_pcall_cannot_swallow_disposition_sync_failure_or_receive_response() {
+        let temporary = tempfile::tempdir().expect("测试目录应建立");
+        let recorder =
+            lua_call_recorder(temporary.path(), "67676767-6767-4767-8767-676767676767", 1).await;
+        recorder.inject_test_failure("sync_disposition");
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let error = translation_service(
+            Arc::clone(&events),
+            RuntimeBehavior::CatchLlmError,
+            recorder.clone(),
+        )
+        .execute(translation_invocation())
+        .await
+        .expect_err("Lua pcall 捕获处置同步错误后，全局档案门禁仍必须使命令失败");
+
+        let recorded_events = events.lock().expect("事件锁不应中毒");
+        assert!(
+            recorded_events.contains(&"llm-error-caught"),
+            "Lua 必须接收到档案持久化 Host 错误"
+        );
+        assert!(
+            !recorded_events.contains(&"llm-response-delivered"),
+            "处置同步失败的响应不得作为成功结果交付给 Lua"
+        );
+        drop(recorded_events);
+
+        match error {
+            TrustedLuaExecutionHostingError::CallReview {
+                source,
+                related,
+                related_llm_failures,
+            } => {
+                assert_eq!(source.operation(), "sync_disposition");
+                assert_eq!(
+                    source.site(),
+                    Some(LlmCallSite::Lua {
+                        call: NonZeroU64::MIN
+                    })
+                );
+                assert!(
+                    related.is_none(),
+                    "Lua 已局部捕获 Host 错误，不应伪造成未处理的 Runtime 错误"
+                );
+                assert!(related_llm_failures.is_empty());
+            }
+            other => panic!("预期全局调用档案失败，实际为 {other:?}"),
+        }
+
+        let archive = fs::read_to_string(
+            recorder
+                .run_root()
+                .expect("启用时应有 Run 根")
+                .join("lua")
+                .join("call-000001.md"),
+        )
+        .expect("Lua 调用档案应可读");
+        assert!(archive.contains("provider_complete"));
+        assert!(!archive.contains("delivered_to_lua"));
+        assert!(!archive.contains("disposition_complete"));
     }
 
     #[tokio::test]

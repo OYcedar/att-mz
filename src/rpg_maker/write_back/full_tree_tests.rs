@@ -465,6 +465,7 @@ impl LlmRequestExecutor for RecordingLlm {
     fn request<'a>(
         &'a self,
         _client: &'a Self::Client,
+        _call_site: crate::llm::LlmCallSite,
         _messages: &'a [ChatMessage],
     ) -> impl Future<Output = Result<LlmResponse, LlmRequestError<Self::Error>>> + Send + 'a {
         self.calls.fetch_add(1, Ordering::SeqCst);

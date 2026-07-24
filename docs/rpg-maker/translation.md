@@ -44,6 +44,9 @@ Profile 由显式或项目状态解析出的 ID 在 `[[rpg_maker.translation_pro
 `[prompts].locale` 独立选择。Translate 要求配置完整提供：
 
 ```toml
+[llm]
+record_calls = false
+
 [prompts]
 root = "prompts"
 locale = "auto"
@@ -60,6 +63,10 @@ system Prompt。
 请求前失败。资源只按所选 locale 的精确路径读取。每次 Translate 都重新读取所选资源；
 关闭模式不读取 `thinking.md`。完整契约见
 [系统提示词编写指南](prompts.md)。
+
+`llm.record_calls` 必须显式选择，控制本轮 Standard 与 Lua 是否保存完整 LLM 请求、
+响应和 ATT 处理结果。该选择不进入 state、Current 或保存运行方案；完整路径、耐久顺序
+和敏感边界见[LLM 调用审阅档案](../runtime/llm-call-review.md)。
 
 Standard 与 Translate Lua 复用本轮解析出的 engine、语言对、语言模块、已装配 Prompt、
 Client、实际 Placeholder 和实际有序术语命中。Lua 不继承 Standard 的 planning、request、
@@ -159,6 +166,10 @@ wire、ID、行形状、空槽、ATT token 和响应信封约束。Planner 与 E
 公共 LLM 根提交 `model`、`messages`、`stream=false` 并透传 Client 的受信 parameters。
 网络重试仅按所选 Client 的明确策略；协议失败不伪装成网络错误。
 
+开启调用审阅档案时，每个 Standard task attempt 在 HTTP 发送前先同步最终请求，在解析
+前同步完整 Provider 响应。网络重试的每个 attempt 都有独立文件，现有 task/attempt
+顺序与重试判断不因记录改变。
+
 ## 6. 响应结构与候选验收
 
 `JsonOnly` 要求 assistant content 直接提供 JSON，任何 `<why>` 都非法。
@@ -166,6 +177,8 @@ wire、ID、行形状、空槽、ATT token 和响应信封约束。Planner 与 E
 `<why>非空任意内容</why>`，随后只允许空白再接 JSON。标签必须精确小写且无属性；缺失、
 空、未闭合、嵌套、重复、大小写变体、属性或前置说明都会拒绝。ATT 验证非空后立即丢弃
 思考正文，不将其放入结果、数据库、普通项目日志、终端或诊断，也不判断分析质量。
+开启 LLM 调用审阅档案时，未加工的完整 Provider 正文属于审阅证据，因此其中的
+`<why>` 仍会出现在该敏感 Markdown 中。
 
 响应整体允许首尾空白和最开头的单个 BOM；BOM 必须位于裸 JSON 或 `<why>` 之前，不能
 放在 `</why>` 与 JSON 之间。剥离信封后的部分继续进入唯一的既有 JSON parser，并保留
@@ -225,6 +238,10 @@ SSPV 的 Release/MSVC 消融与慢首任务压力测试共同选定 2N 完成窗
 后续工作；已经提交任务保持。取消停止新请求，等待已接管工作到明确终态，不猜测外部
 请求是否未发生。
 
+开启调用审阅档案时，Standard 必须在数据库提交前把本 task 的验收结果同步到对应
+attempt 文件。档案只说明接受或拒绝，不声明 SQLite 已提交；档案持久化失败时当前响应
+不得提交，并停止新调用，已经确认提交的前缀仍保持。
+
 最终：全部需要翻译的单元 Current 为 `Complete`；仍有可解释 unresolved 为 `Partial`；
 没有可执行产出为 `Unavailable`。三者是业务结果，退出成功不等于 `Complete`。技术错误、
 状态不一致或提交结果未知使用更强失败语义。
@@ -243,3 +260,4 @@ SSPV 的 Release/MSVC 消融与慢首任务压力测试共同选定 2N 完成窗
 `translate_run_plan` 及 Translate Lua 程序。确认提交失败时旧方案保持；终态无法确认时
 命令说明翻译结果已生效但方案状态无法确认，并建议下次显式传入 Profile 与 Lua 选择。
 项目日志的启动、写入或关闭故障不停止模型任务、不丢弃合法候选，也不改变退出码。
+这条降级语义只适用于普通 JSONL；显式开启的 LLM 调用审阅档案是请求与验收硬门禁。

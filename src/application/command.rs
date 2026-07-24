@@ -27,6 +27,7 @@ use crate::diagnostic::{
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_label};
 use crate::language::LanguageModuleCatalogError;
+use crate::observability::RunId;
 use crate::progress::{
     ProgressAmount, ProgressMode, ProgressObserver, ProgressSnapshot, TerminalProgress,
     TerminalProgressObserver,
@@ -125,6 +126,7 @@ use crate::runtime::llm::{
     OpenAiChatCompletionClient, OpenAiChatCompletionError, OpenAiChatCompletionExecutor,
     OpenAiExecutorBuildError,
 };
+use crate::runtime::llm_call_review::{LlmCallRecorder, LlmCallReviewContext, LlmCallReviewError};
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
     ProjectLog, ProjectLogAmount, ProjectLogCode, ProjectLogContext, ProjectLogEvent,
@@ -1594,10 +1596,9 @@ impl ProductionRpgMakerCommandRunner {
             }
         };
         let project_name = command.project_name().clone();
-        let database_path =
-            ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name)
-                .database_path()
-                .to_path_buf();
+        let project_workspace =
+            ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name);
+        let database_path = project_workspace.database_path().to_path_buf();
         let lease_provider = ProjectCommandLeaseService::new(
             projects_root.clone(),
             self.layout.engine(),
@@ -1833,6 +1834,40 @@ impl ProductionRpgMakerCommandRunner {
             }
         };
         project_log.set_profile(&profile_id);
+        let call_review_context = LlmCallReviewContext::new(
+            self.layout.engine().storage_name(),
+            project_name.as_str(),
+            profile_id.as_str(),
+            command.rpg_maker().client_id(),
+        );
+        let call_recorder = match Box::pin(start_translate_call_recorder(
+            command.rpg_maker().record_calls(),
+            project_workspace.workspace_root().to_path_buf(),
+            project_log.run_id(),
+            self.locale,
+            call_review_context,
+        ))
+        .await
+        {
+            Ok(recorder) => recorder,
+            Err(error) => {
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(source) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", source);
+                }
+                if let Err(source) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", source);
+                }
+                drop(project_lease_guard);
+                progress.finish();
+                return observed_construction_failure(
+                    project_log,
+                    ProductionCommandError::llm_call_review_start(error),
+                    shutdown,
+                )
+                .await;
+            }
+        };
         let progress_observer = ProductionProgressObserver::new(
             progress.observer(),
             &project_log,
@@ -1976,6 +2011,7 @@ impl ProductionRpgMakerCommandRunner {
             };
         let llm = match OpenAiChatCompletionExecutor::new(
             command.llm().with_pem_roots(additional_pem_roots),
+            call_recorder.clone(),
         )
         .map_err(ProductionCommandError::http_client_build)
         {
@@ -2029,6 +2065,7 @@ impl ProductionRpgMakerCommandRunner {
             cpu: cpu.clone(),
             sqlite: sqlite.clone(),
             llm: llm.clone(),
+            call_recorder: call_recorder.clone(),
             lua: lua.clone(),
             log: business_log.clone(),
             cancellation: cancellation.clone(),
@@ -2984,6 +3021,7 @@ async fn catch_command_panic(
 }
 
 struct ActiveProjectLog {
+    run_id: RunId,
     runtime: ProjectLogRuntime,
     logger: ProjectLogger,
     context: ProjectLogContext,
@@ -3271,6 +3309,10 @@ const fn write_back_phase_code(phase: WriteBackProgressPhase) -> ProjectLogPhase
 }
 
 impl ActiveProjectLog {
+    const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
     fn set_profile(&mut self, profile: &str) {
         self.context = self.context.clone().with_profile(profile);
     }
@@ -3358,6 +3400,19 @@ struct CommandLogStart<'a> {
     panic_boundary: &'a CommandPanicBoundary,
 }
 
+async fn start_translate_call_recorder(
+    enabled: bool,
+    workspace: PathBuf,
+    run_id: RunId,
+    locale: UiLocale,
+    context: LlmCallReviewContext,
+) -> Result<LlmCallRecorder, LlmCallReviewError> {
+    if !enabled {
+        return Ok(LlmCallRecorder::disabled());
+    }
+    LlmCallRecorder::start(workspace, run_id, locale, context).await
+}
+
 fn start_command_log(
     input: CommandLogStart<'_>,
 ) -> Result<ActiveProjectLog, ProductionCommandError> {
@@ -3406,6 +3461,7 @@ fn start_command_log(
         ProjectLogPayload::Run { outcome: None },
     ));
     Ok(ActiveProjectLog {
+        run_id,
         runtime,
         logger,
         context,
@@ -4475,6 +4531,7 @@ struct ProductionSelectedTranslationExecutionBuilder<'a> {
     cpu: RayonCpuExecutor,
     sqlite: RusqliteStorage,
     llm: OpenAiChatCompletionExecutor,
+    call_recorder: LlmCallRecorder,
     lua: Option<ProductionLuaSelection>,
     log: ProductionBusinessLog,
     cancellation: CooperativeCancellation,
@@ -4608,7 +4665,8 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             TokioAsyncDelay,
             processor,
             self.cancellation.clone(),
-        );
+        )
+        .with_call_recorder(self.call_recorder.clone());
         let result_store = RpgMakerStandardTranslationResultStorageService::new(
             self.sqlite.clone(),
             self.cpu.clone(),
@@ -4620,14 +4678,16 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             result_store,
             self.log.clone(),
             self.cancellation.clone(),
-        );
+        )
+        .with_call_recorder(self.call_recorder.clone());
         let lua = self.lua.as_ref().map(|selected| {
             let host = TrustedLuaExecutionHostingService::with_llm(
                 self.file_system.clone(),
                 self.llm.clone(),
                 selected.runtime.clone(),
                 self.sqlite.clone(),
-            );
+            )
+            .with_call_recorder(self.call_recorder.clone());
             SelectedLua::new(selected.program.clone(), LuaTranslationService::new(host))
         });
         Ok(SelectedTranslationExecution::new(profile, standard, lua))
@@ -6065,6 +6125,22 @@ where
                 map_project_failure_report(source.into_result_storage_failure_report())
             }
             StandardError::ExecuteTask { task_index, source } => match source {
+                RpgMakerStandardTranslationTaskExecutionError::FatalRequest {
+                    attempt: _,
+                    source: OpenAiChatCompletionError::CallReview { source, related },
+                } => {
+                    let diagnostic = source.safe_diagnostic(
+                        DiagnosticStage::ModelRequest,
+                        DiagnosticImpact::ProgressPreserved,
+                    );
+                    let mut report = ProductionCommandError::report_diagnostic(source, diagnostic);
+                    if let Some(related) = related {
+                        let diagnostic =
+                            related.safe_diagnostic(None, DiagnosticImpact::ProgressPreserved);
+                        report = report.with_related(ReportedFailure::new(diagnostic, *related));
+                    }
+                    ProductionCommandError::ProjectState(Box::new(report))
+                }
                 RpgMakerStandardTranslationTaskExecutionError::FatalRequest { attempt, source } => {
                     let diagnostic = source
                         .safe_diagnostic(None, DiagnosticImpact::ProgressPreserved)
@@ -6096,6 +6172,26 @@ where
                         source,
                     };
                     map_project_diagnostic(execution_error, diagnostic)
+                }
+                RpgMakerStandardTranslationTaskExecutionError::CallReview {
+                    attempt: _,
+                    source,
+                    related,
+                } => {
+                    let diagnostic = source.safe_diagnostic(
+                        DiagnosticStage::ModelRequest,
+                        DiagnosticImpact::ProgressPreserved,
+                    );
+                    let mut report = ProductionCommandError::report_diagnostic(source, diagnostic);
+                    if let Some(related) = related {
+                        let diagnostic = related.safe_diagnostic_source(
+                            DiagnosticStage::ModelRequest,
+                            DiagnosticImpact::ProgressPreserved,
+                            DiagnosticAction::CheckModelService,
+                        );
+                        report = report.with_related(ReportedFailure::new(diagnostic, related));
+                    }
+                    ProductionCommandError::ProjectState(Box::new(report))
                 }
                 source @ RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled {
                     attempt,
@@ -7085,6 +7181,12 @@ impl ProductionCommandError {
         }
     }
 
+    fn llm_call_review_start(source: LlmCallReviewError) -> Self {
+        let diagnostic =
+            source.safe_diagnostic(DiagnosticStage::Translate, DiagnosticImpact::Unchanged);
+        Self::ProjectState(Box::new(Self::report_diagnostic(source, diagnostic)))
+    }
+
     fn cpu_start(source: CpuExecutorStartError) -> Self {
         let diagnostic = match &source {
             CpuExecutorStartError::AvailableParallelism(error) => SafeDiagnostic::io(
@@ -7699,6 +7801,10 @@ mod command_error_rendering_tests {
 
     use super::*;
 
+    fn test_run_id(value: &str) -> RunId {
+        RunId::from_uuid(uuid::Uuid::parse_str(value).expect("测试 RunId 必须是 UUID"))
+    }
+
     #[derive(Debug)]
     struct TestError(&'static str);
 
@@ -7746,6 +7852,7 @@ mod command_error_rendering_tests {
             ProjectLogPayload::Run { outcome: None },
         ));
         let active = ActiveProjectLog {
+            run_id: test_run_id(run_id),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),
@@ -8518,6 +8625,7 @@ mod command_error_rendering_tests {
         let logger = runtime.logger();
         let context = ProjectLogContext::new("zh-Hans").with_command("write-back");
         let active = ActiveProjectLog {
+            run_id: test_run_id(run_id),
             runtime,
             logger,
             context,
@@ -8558,6 +8666,7 @@ mod command_error_rendering_tests {
         performance.candidate_validation_started();
         performance.candidate_validation_completed();
         let active = ActiveProjectLog {
+            run_id: test_run_id(run_id),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("write-back"),
@@ -8612,6 +8721,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
+            run_id: test_run_id(run_id),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("init"),
@@ -8958,6 +9068,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
+            run_id: test_run_id(run_id),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),
@@ -9035,6 +9146,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
+            run_id: test_run_id(run_id),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),

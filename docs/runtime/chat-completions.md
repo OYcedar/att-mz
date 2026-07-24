@@ -26,6 +26,10 @@ Standard 与 Translate Lua 共享同一 Client 约束。
 Client 的严格 JSON `parameters` 随后合并；`model`、`messages`、`stream` 不得覆盖。程序
 不解释供应商私有字段。API key 只作为 Bearer Header 发送。
 
+Translate 开启调用审阅档案时，最终请求必须在活动请求与 RPM 许可取得后、HTTP 发送前
+持久化并同步。该证据来自同一个最终请求值，不从 Prompt 模板重建。完整耐久和隐私边界见
+[LLM 调用审阅档案](llm-call-review.md)。
+
 `connect_timeout_ms` 限制建立连接，`read_timeout_ms` 限制连续读取，
 `request_timeout_ms` 限制完整 HTTP 请求。它们不限制本地许可或限速等待。
 
@@ -50,11 +54,19 @@ Standard 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗
 Fatal 包含请求构造、TLS/证书、其他 HTTP 状态，以及 200 响应不满足成功信封。安全诊断
 公开 HTTP 状态、`Retry-After` 和允许公开的供应商 code/type，但不保存任意错误正文。
 
+开启调用审阅档案时，成功、非 200、畸形响应、发送失败和正文读取失败都先形成当前调用
+文件的 Provider 阶段；完整响应正文必须持久化并同步后才允许解析。档案持久化失败不是
+模型失败，不能消耗重试或再次请求 Provider。
+
 ## 5. 生命周期与隐私
 
 shutdown 停止新请求并唤醒尚未进入 HTTP 的等待者；已进入 HTTP 的请求继续到明确终态。
 所有路径通过 RAII 归还活动许可。
 
-Debug、CLI 和 JSONL 不包含 API key、Header 值、完整 Client parameters、Prompt/messages、
-完整请求/响应、模型正文、原文或译文。它们仍必须显示安全的 Client ID、阶段、URL 对象、
-HTTP 状态、超时种类和状态影响。
+Debug、CLI 和普通 JSONL 不包含 API key、Header 值、完整 Client parameters、
+Prompt/messages、完整请求/响应、模型正文、原文或译文。它们仍必须显示安全的 Client
+ID、阶段、URL 对象、HTTP 状态、超时种类和状态影响。
+
+只有操作者显式开启的独立 LLM 调用审阅档案记录完整 parameters、messages 和响应正文；
+它仍永不记录 API key、Authorization、完整 Header、代理/TLS 凭据或 URL 查询参数。该
+敏感资产不是 Debug、CLI 或 JSONL 的扩展。

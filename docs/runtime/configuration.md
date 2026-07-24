@@ -29,6 +29,10 @@
 配置错误展示配置路径、一基行列、字段和具体原因；不得回显 API key、Client
 `parameters` 值或完整配置正文。
 
+Translate 还会严格读取 `[llm].record_calls`。它是本轮是否保存完整模型输入输出的敏感
+审阅选择；没有默认值，也不属于任何 Client。其他命令不物化、不校验该值，也不要求
+该字段；统一未知字段检查仍然生效。
+
 ## 2. 最小配置与路径
 
 Init 的最小配置是：
@@ -60,6 +64,9 @@ root = "projects"
 
 <!-- att-config-example: fragment -->
 ```toml
+[llm]
+record_calls = false
+
 [llm.clients.primary]
 url = "https://api.example.com/v1/chat/completions"
 api_key = "replace-with-api-key"
@@ -84,6 +91,11 @@ burst = 8
 `rate_limit` 整表可省略，表示供应商没有已知的本地限速要求。存在时两个值都必须为正。
 等待活动许可或 RPM 只形成背压并响应取消，不产生本地队列满或准入超时错误，也不计为
 模型失败或重试。
+
+`record_calls` 必须是布尔值。`false` 不创建调用档案；`true` 为本轮全部 Standard 与
+Translate Lua 调用创建独立 Markdown，完整语义见
+[LLM 调用审阅档案](llm-call-review.md)。它不写入项目数据库或运行方案，切换它不改变
+translation state，也不使 Current 译文失效。
 
 `proxy` 只能是 `false` 或不含凭据的代理 URL。附加 PEM 文件在配置加载后读取并交给
 HTTP Client。`parameters` 必须是完整 JSON 对象，递归拒绝重复键，并且顶层不得包含
@@ -144,6 +156,7 @@ LanguagePair 精确选择源语言模块。
 - SQLite 固定使用 WAL + FULL；
 - 项目锁、发布锁和 SQLite busy 不设置任意截止时间；
 - 日志固定写入项目工作区的 `logs/<run-id>.jsonl`；
+- 开启的 LLM 调用审阅档案固定写入项目工作区的 `llm-calls/<run-id>/`；
 - 文档、规则、Group、任务和不同物理文件在不破坏确定性的前提下并行；
 - 自然顺序、代表选择、提交顺序和最终主错误不受完成顺序影响。
 

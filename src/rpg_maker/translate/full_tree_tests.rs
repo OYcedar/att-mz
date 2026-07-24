@@ -48,8 +48,9 @@ use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjection
 use crate::rpg_maker::lua::LuaPhase;
 use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingService;
 use crate::rpg_maker::lua::runtime::{
-    OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaPhaseBindings, TrustedLuaRuntimeBindings,
-    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
+    OwnedLuaProgram, TrustedLuaExecutionHandle, TrustedLuaLlmDeliveryDisposition,
+    TrustedLuaPhaseBindings, TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError,
+    TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
 };
 use crate::rpg_maker::model::{ScalarFieldKey, TextUnitRole};
 use crate::rpg_maker::project::ExistingProjectOpeningService;
@@ -548,6 +549,7 @@ impl LlmRequestExecutor for FakeLlmRequestExecutor {
     async fn request<'a>(
         &'a self,
         client: &'a Self::Client,
+        _call_site: crate::llm::LlmCallSite,
         messages: &'a [ChatMessage],
     ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
         assert_eq!(client.name, "shared-llm-config");
@@ -821,14 +823,18 @@ impl TrustedLuaRuntimeExecutor for FakeTrustedLuaRuntimeExecutor {
                     ))
                     .await
                     .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
-                let response = translate
+                let pending = translate
                     .request_llm(vec![ChatMessage::new(
                         ChatMessageRole::User,
                         "# Lua full messages",
                     )])
                     .await
                     .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
-                assert_eq!(response.content(), "lua raw response");
+                assert_eq!(pending.response().content(), "lua raw response");
+                pending
+                    .finish(TrustedLuaLlmDeliveryDisposition::Delivered)
+                    .await
+                    .map_err(TrustedLuaRuntimeExecutionError::Binding)?;
                 calls
                     .commit()
                     .await

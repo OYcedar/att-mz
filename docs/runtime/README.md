@@ -10,7 +10,7 @@ ATT 的生产配置只包含真实外部选择；完整字段见
 |---|---|
 | Init | `projects.root` |
 | Extract | `projects.root`；Builtin、Rules、Lua 来自 CLI 或保存方案 |
-| Translate | `projects.root`、`prompts`、全部 `languages`、所选 Profile 和它引用的 Client |
+| Translate | `projects.root`、`prompts`、`llm.record_calls`、全部 `languages`、所选 Profile 和它引用的 Client |
 | WriteBack | `projects.root`；Lua 选择来自 CLI 或保存方案 |
 
 Help 与 Version 之外的命令必须显式传入 `--config FILE`。配置中的相对路径以配置文件
@@ -37,6 +37,10 @@ Help 与 Version 之外的命令必须显式传入 `--config FILE`。配置中�
 Profile 只配置所用 Client 和单任务最终 user message 字符上限。Prompt、语言策略、项目根
 与业务规则继续按各自规格配置。
 
+Translate 还要求操作者通过 `llm.record_calls` 显式决定是否持久化包含完整模型输入与
+输出的敏感审阅档案。它不是资源治理参数，不属于 Client，完整契约见
+[LLM 调用审阅档案](llm-call-review.md)。
+
 ## 哪些值不能配置
 
 Tokio/Rayon/file/SQLite worker、内部在途窗口、队列、批次、缓存、日志刷新与同步策略由
@@ -62,4 +66,5 @@ Release/MSVC 配对基准。每轮使用全新来源、项目数据库和输出�
 - [SQLite](sqlite.md)
 - [目录发布](directory-publishing.md)
 - [项目日志](project-log.md)
+- [LLM 调用审阅档案](llm-call-review.md)
 - [RPG Maker 文档](../rpg-maker/README.md)

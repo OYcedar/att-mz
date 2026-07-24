@@ -147,8 +147,8 @@ where
 
     let (layout, command) = configuration.into_parts();
     // Translate 的生产纵向切片包含完整计划、错误与收尾状态，其 async 状态机明显大于
-    // Windows 主线程的默认栈。先把顶层 future 固定在堆上，避免 block_on 将整棵
-    // 状态机钉在主线程栈中；这不改变 Tokio 内部任务的调度和并发关系。
+    // Windows 主线程的默认栈。把顶层 future 固定在堆上并交给既有 Tokio worker
+    // 执行，主线程只等待终态；这不改变业务内部的调度和并发关系。
     let command_run = Box::pin(async move {
         let mut termination_signals = TerminationSignals::new();
         let report = ProductionRpgMakerCommandRunner::new(layout, locale, progress_mode)
@@ -156,7 +156,28 @@ where
             .await;
         (report, termination_signals)
     });
-    let (report, _termination_signals) = runtime.block_on(command_run);
+    let command_task = runtime.spawn(command_run);
+    let (report, _termination_signals) = match runtime.block_on(command_task) {
+        Ok(completion) => completion,
+        Err(error) => {
+            let failure = if error.is_panic() {
+                DiagnosticFailureKind::WorkerPanicked
+            } else {
+                DiagnosticFailureKind::InternalInvariant
+            };
+            // JoinError 可能持有任意 panic payload；只消费稳定状态，不读取或显示正文。
+            drop(error);
+            let diagnostic = SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                DiagnosticStage::CommandPreparation,
+                DiagnosticSubject::component("Tokio command task"),
+                DiagnosticReason::failure(failure),
+                DiagnosticImpact::OutcomeUnknown,
+                DiagnosticAction::ReportBug,
+            );
+            return render_diagnostic_fatal(&localizer, &diagnostic, stderr);
+        }
+    };
     // 信号订阅与 Runtime 保持到最终结果输出结束；各业务根已经在 report 返回前显式 shutdown。
 
     let mut pending_project_log = report.pending_project_log;

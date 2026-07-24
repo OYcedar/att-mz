@@ -145,6 +145,250 @@ fn broken_stdout_changes_successful_command_terminal_log_to_failure() {
 }
 
 #[test]
+fn translate_call_review_shares_run_id_and_does_not_change_translation_state() {
+    let temporary = tempfile::tempdir().expect("应可建立端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    let projects_root = root.join("projects");
+    fs::create_dir(&projects_root).expect("项目根应可建立");
+    write_minimal_mz_game(&game_root);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), E2E_PARAMETERS);
+    set_record_calls(root, true);
+    assert_success("review init", &run_att(root, mz_init_arguments(&game_root)));
+    assert_success(
+        "review extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+
+    let running_server = server.start_with_responses(vec![
+        ChatResponseFixture::RateLimited,
+        ChatResponseFixture::Standard,
+    ]);
+    let first_translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", PROJECT, PROFILE]),
+    );
+    assert_success("review translate", &first_translate);
+    assert_process_output_does_not_contain_client_secrets("review translate", &first_translate);
+    assert_eq!(running_server.finish().len(), 2);
+
+    let workspace = projects_root.join("mz").join(PROJECT);
+    let database = workspace.join("project.db");
+    assert_translation_committed(&database);
+    let logs_root = workspace.join("logs");
+    let (ordinary_logs, records) = read_project_logs(&logs_root);
+    let translate_run_id = records
+        .iter()
+        .find(|record| {
+            record["command"] == "translate"
+                && record["code"] == "run.finished"
+                && record["payload"]["outcome"] == "succeeded"
+        })
+        .and_then(|record| record["run_id"].as_str())
+        .expect("Translate 普通日志应保留成功 RunId");
+    let calls_root = workspace.join("llm-calls");
+    let run_root = calls_root.join(translate_run_id);
+    assert!(
+        run_root.is_dir(),
+        "调用档案必须复用普通日志 RunId：{}",
+        run_root.display()
+    );
+    let first_attempt_path = run_root
+        .join("standard")
+        .join("task-000001")
+        .join("attempt-001.md");
+    let first_attempt = fs::read_to_string(&first_attempt_path).unwrap_or_else(|error| {
+        panic!("调用档案 {} 应可读：{error}", first_attempt_path.display())
+    });
+    for expected in [
+        "http_status = 429",
+        "request-rate-limited-e2e",
+        "RATE_LIMITED_E2E_SENTINEL",
+        "http_status_rejected",
+        "provider_complete",
+        "disposition_complete",
+    ] {
+        assert!(
+            first_attempt.contains(expected),
+            "首次重试档案缺少 {expected:?}"
+        );
+    }
+
+    let archive_path = run_root
+        .join("standard")
+        .join("task-000001")
+        .join("attempt-002.md");
+    let archive = fs::read_to_string(&archive_path)
+        .unwrap_or_else(|error| panic!("调用档案 {} 应可读：{error}", archive_path.display()));
+    for expected in [
+        SYSTEM_PROMPT,
+        SOURCE_TEXT,
+        TRANSLATION,
+        E2E_EXTRA_SECRET,
+        "request-e2e-1",
+        "response-e2e-1",
+        "validation_outcome = \"complete\"",
+        "request_complete",
+        "provider_complete",
+        "disposition_complete",
+    ] {
+        assert!(archive.contains(expected), "调用档案缺少 {expected:?}");
+    }
+    for forbidden in [API_KEY, "Authorization", "Bearer e2e-secret"] {
+        assert!(
+            !archive.contains(forbidden),
+            "调用档案不得包含凭据 {forbidden:?}"
+        );
+    }
+    for forbidden in [SYSTEM_PROMPT, SOURCE_TEXT, TRANSLATION, E2E_EXTRA_SECRET] {
+        assert!(
+            !ordinary_logs.contains(forbidden),
+            "普通 JSONL 不得吸收调用档案正文 {forbidden:?}"
+        );
+    }
+
+    let converged_enabled = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", PROJECT, PROFILE]),
+    );
+    let converged_enabled_stdout = assert_success("enabled no-work translate", &converged_enabled);
+    assert!(converged_enabled_stdout.contains("标准翻译：任务 0"));
+    let mut run_directories = fs::read_dir(&calls_root)
+        .expect("调用档案根应可列举")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("调用档案 Run 目录应可读");
+    run_directories.sort_by_key(|entry| entry.file_name());
+    assert_eq!(
+        run_directories.len(),
+        2,
+        "开启档案的零调用 Translate 仍应建立独立空 Run 根"
+    );
+    let empty_run = run_directories
+        .iter()
+        .find(|entry| entry.file_name() != OsStr::new(translate_run_id))
+        .expect("第二个 Run 根应存在");
+    assert!(
+        fs::read_dir(empty_run.path())
+            .expect("零调用 Run 根应可列举")
+            .next()
+            .is_none(),
+        "零调用 Run 根不得伪造调用文件"
+    );
+
+    set_record_calls(root, false);
+    let converged_disabled = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", PROJECT, PROFILE]),
+    );
+    let converged_disabled_stdout =
+        assert_success("disabled no-work translate", &converged_disabled);
+    assert!(converged_disabled_stdout.contains("标准翻译：任务 0"));
+    assert_eq!(
+        fs::read_dir(&calls_root)
+            .expect("调用档案根应可再次列举")
+            .count(),
+        2,
+        "关闭档案不得创建新的 Run 根"
+    );
+    assert_translation_committed(&database);
+}
+
+#[test]
+fn record_calls_switch_preserves_fresh_translation_and_candidate_results() {
+    const ENABLED_PROJECT: &str = "review-enabled-equivalence";
+    const DISABLED_PROJECT: &str = "review-disabled-equivalence";
+
+    let temporary = tempfile::tempdir().expect("应可建立档案开关等价测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
+    write_minimal_mz_game(&game_root);
+    initialize_and_extract_prompt_project(root, ENABLED_PROJECT, &game_root, "ja", "zh-Hans");
+    initialize_and_extract_prompt_project(root, DISABLED_PROJECT, &game_root, "ja", "zh-Hans");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), E2E_PARAMETERS);
+    let requests = server.start_with_responses(vec![
+        ChatResponseFixture::Standard,
+        ChatResponseFixture::Standard,
+    ]);
+    set_record_calls(root, true);
+    let enabled = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", ENABLED_PROJECT, PROFILE]),
+    );
+    assert_success("enabled equivalence translate", &enabled);
+
+    set_record_calls(root, false);
+    let disabled = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", DISABLED_PROJECT, PROFILE]),
+    );
+    assert_success("disabled equivalence translate", &disabled);
+    assert_eq!(requests.finish().len(), 2);
+
+    let enabled_workspace = root.join("projects/mz").join(ENABLED_PROJECT);
+    let disabled_workspace = root.join("projects/mz").join(DISABLED_PROJECT);
+    let enabled_database = enabled_workspace.join("project.db");
+    let disabled_database = disabled_workspace.join("project.db");
+    let enabled_unit = read_translation_unit(&enabled_database);
+    let disabled_unit = read_translation_unit(&disabled_database);
+    assert_eq!(
+        (&enabled_unit.0, &enabled_unit.1),
+        (&disabled_unit.0, &disabled_unit.1),
+        "档案开关不得改变来源或译文内容"
+    );
+    assert_eq!(enabled_unit.2.len(), disabled_unit.2.len());
+    assert_builtin_owner_is_fresh(&enabled_database);
+    assert_builtin_owner_is_fresh(&disabled_database);
+    assert!(enabled_workspace.join("llm-calls").is_dir());
+    assert!(
+        !disabled_workspace.join("llm-calls").exists(),
+        "关闭档案的全新 Translate 不得创建调用目录"
+    );
+
+    set_record_calls(root, true);
+    let enabled_current = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", ENABLED_PROJECT, PROFILE]),
+    );
+    assert!(
+        assert_success("enabled equivalence current", &enabled_current)
+            .contains("标准翻译：任务 0"),
+        "开启档案时已提交译文应保持 Current"
+    );
+    set_record_calls(root, false);
+    let disabled_current = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", DISABLED_PROJECT, PROFILE]),
+    );
+    assert!(
+        assert_success("disabled equivalence current", &disabled_current)
+            .contains("标准翻译：任务 0"),
+        "关闭档案时已提交译文应保持 Current"
+    );
+
+    for project in [ENABLED_PROJECT, DISABLED_PROJECT] {
+        let write_back = run_att(root, arguments(&["mz", "write-back", "--name", project]));
+        assert_success("equivalence write-back", &write_back);
+    }
+    assert_eq!(
+        fs::read(enabled_workspace.join("write_back/data/Items.json"))
+            .expect("开启档案项目的候选应可读取"),
+        fs::read(disabled_workspace.join("write_back/data/Items.json"))
+            .expect("关闭档案项目的候选应可读取"),
+        "档案开关不得改变 WriteBack 候选"
+    );
+}
+
+#[test]
 fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     let temporary = tempfile::tempdir().expect("应可建立端到端测试目录");
     let root = temporary.path();
@@ -1347,6 +1591,7 @@ fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
         "zh-Hans",
         true,
     );
+    set_record_calls(root, true);
     let success_requests =
         success_server.start_with_responses(vec![ChatResponseFixture::ThinkingStandard]);
     let success = run_att(
@@ -1382,6 +1627,27 @@ fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
         "项目日志",
     );
     assert_database_does_not_contain(&success_database, THINKING_SENTINEL);
+    let calls_root = root
+        .join("projects/mz")
+        .join(SUCCESS_PROJECT)
+        .join("llm-calls");
+    let call_runs = fs::read_dir(&calls_root)
+        .expect("思考输出调用档案根应可列举")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("思考输出调用档案 Run 目录应可读取");
+    assert_eq!(call_runs.len(), 1, "本场景只应产生一个启用档案的 Translate");
+    let thinking_archive = fs::read_to_string(
+        call_runs[0]
+            .path()
+            .join("standard")
+            .join("task-000001")
+            .join("attempt-001.md"),
+    )
+    .expect("思考输出的原始 Provider 正文应可审阅");
+    assert!(
+        thinking_archive.contains(THINKING_SENTINEL),
+        "thinking 正文只应在启用的敏感调用档案中完整保留"
+    );
 
     let raw_json_server = BoundChatServer::bind();
     write_configuration_with_prompt_options(
@@ -2299,6 +2565,9 @@ root = "prompts"
 locale = "{prompt_locale}"
 thinking_output = {thinking_output}
 
+[llm]
+record_calls = false
+
 [llm.clients.primary]
 url = "{url}"
 api_key = "{API_KEY}"
@@ -2356,6 +2625,23 @@ max_task_user_message_characters = 10000
 "#
     );
     fs::write(root.join("config.toml"), configuration).expect("完整配置应可写入");
+}
+
+fn set_record_calls(root: &Path, enabled: bool) {
+    let path = root.join("config.toml");
+    let configuration = fs::read_to_string(&path).expect("完整配置应可读取");
+    let current = if enabled {
+        "record_calls = false"
+    } else {
+        "record_calls = true"
+    };
+    assert_eq!(
+        configuration.matches(current).count(),
+        1,
+        "配置应恰好包含一个待切换的调用档案开关"
+    );
+    let configuration = configuration.replace(current, &format!("record_calls = {enabled}"));
+    fs::write(path, configuration).expect("调用档案开关应可更新");
 }
 
 fn remove_translation_profile_from_configuration(root: &Path, profile: &str) {
@@ -3721,6 +4007,7 @@ impl BoundChatServer {
 
 #[derive(Clone, Copy)]
 enum ChatResponseFixture {
+    RateLimited,
     Standard,
     ThinkingStandard,
     Lua,
@@ -3788,8 +4075,23 @@ fn serve_chat_completion(
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|error| error.to_string())?;
     let request = read_http_request(&mut stream)?;
+    if let ChatResponseFixture::RateLimited = fixture {
+        let body =
+            r#"{"error":{"code":"rate_limited","type":"quota"},"raw":"RATE_LIMITED_E2E_SENTINEL"}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/problem+json\r\nx-request-id: request-rate-limited-e2e\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .map_err(|error| error.to_string())?;
+        stream.flush().map_err(|error| error.to_string())?;
+        let _ = stream.shutdown(Shutdown::Both);
+        return Ok(request);
+    }
     let (request_id, response_id, content, prompt_tokens, completion_tokens, total_tokens) =
         match fixture {
+            ChatResponseFixture::RateLimited => unreachable!("429 已在上方返回"),
             ChatResponseFixture::Standard => (
                 if request_index == 0 {
                     "request-e2e".to_owned()

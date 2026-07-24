@@ -120,9 +120,11 @@ canonical `rule = []` 清空该 definition。它不是独立 owner。
 Translate 阶段程序；省略时自动复用该阶段保存的程序；零字节文件清除该程序且本次不执行
 Lua。清除不会猜测或删除 Lua 私有数据库状态。
 
-Translate 还会严格消费 `[prompts]` 的 `root`、`locale` 和 `thinking_output`，每次运行
-重新读取规范 locale 下的 `system.md`；只有开启思考输出时才读取同目录 `thinking.md`。
-所选资源或模板无效时在任何 LLM 请求前失败。关闭模式要求 JSON-only 响应，开启模式
+Translate 还会严格消费 `[llm].record_calls` 和 `[prompts]` 的 `root`、`locale` 与
+`thinking_output`。`record_calls` 没有默认值，决定是否为本轮全部 Standard 与 Lua
+调用建立独立敏感 Markdown；它没有 CLI 覆盖，也不保存为运行方案。每次运行重新读取
+规范 locale 下的 `system.md`；只有开启思考输出时才读取同目录 `thinking.md`。所选资源
+或模板无效时在任何 LLM 请求前失败。关闭思考模式要求 JSON-only 响应，开启思考模式
 要求精确的一组非空 `<why>...</why>` 后接同一 JSON wire；信封或 JSON 解析失败形成
 `ModelResponseUnusable`，不会作为网络错误重试。
 
@@ -164,7 +166,9 @@ Extract、Translate、WriteBack 的非空 Lua 主程序按阶段分别保存在�
   ↓
 取得对应版本的项目租约，读取项目事实和保存方案
   ↓ 工作区合法建立后
-启动本 RunId 独占的项目 JSONL（失败时明确警告并降级）
+生成本命令唯一 RunId，并独立启动对应项目 JSONL（失败时明确警告并降级）
+  ↓ Translate 且 record_calls = true
+独占创建同一 RunId 的 LLM 调用审阅根（失败时停止，不发送模型请求）
   ↓
 把显式输入、项目状态或产品行为解析为本次完整方案
   ↓
@@ -234,13 +238,21 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 候选尚未发布时 discard；publish 已开始时等待终态。运行方案不在取消路径保存。普通项目
 日志故障不会改变取消与收尾次序。
 
-## 7. 日志、退出码与安全诊断
+## 7. 日志、LLM 调用档案、退出码与安全诊断
 
 项目日志是可降级的可观测性旁路，不是网络请求、数据库提交、目录发布、恢复、取消或
 成功退出的门禁。工作区合法建立后，每个 RunId 独占一个 JSONL 文件；日志不共享活动
 文件、不轮转，也不按大小丢弃事实。建立、写入、flush、sync 或关闭失败时，stderr 必须
 显示日志路径、具体操作和清理后的底层原因，但不改变原本的成功、失败或取消退出码。
 详细契约见[普通项目日志](project-log.md)。
+
+`llm.record_calls = true` 时，Translate 还在
+`<project-workspace>/llm-calls/<run-id>/` 建立独立敏感档案，每次实际 Standard attempt
+或 `ctx.llm` 调用对应一个 Markdown。它与普通 JSONL 使用相同 RunId，但不依赖 JSONL
+成功；完整请求、响应和 ATT 验收只进入该档案，绝不进入 CLI 或普通 JSONL。档案创建、
+写入或同步失败是技术错误：发送前失败保证没有请求发出，响应后的失败阻止解析、验收和
+提交，命令退出 `1`。详细契约见
+[LLM 调用审阅档案](llm-call-review.md)。
 
 项目日志建立后的命令 panic 由命令边界转换成 `internal.operation` 安全诊断：CLI 与
 JSONL 都显示实际命令阶段、项目工作区、日志路径和 `outcome_unknown` 影响，绝不显示

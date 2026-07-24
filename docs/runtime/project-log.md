@@ -29,6 +29,11 @@ panic 兜底只写 stderr。
 日志建立、写入或关闭失败不改变业务结果、项目状态或退出码，也不递归记录自身；stderr
 必须明确显示日志路径、失败操作和安全的底层原因。
 
+Translate 可在同一个 RunId 下另行建立
+[`llm-calls/<run-id>/`](llm-call-review.md)。它是独立的敏感审阅资产，不在 `logs/`
+目录中，也不依赖本 JSONL 成功。普通日志故障继续降级；启用后的调用档案故障是发送和
+验收硬门禁，必须按其自身规格使 Translate 失败。两者不得混用失败语义。
+
 ## 2. 闭集事件
 
 业务代码只能提交闭集事件 code 与对应的类型化 payload，不接受任意 `message: String`。
@@ -87,3 +92,7 @@ CLI 与 JSONL 消费同一份 `SafeDiagnostic`。每个 primary 和 related fail
 
 项目数据库和目录发布 journal 分别拥有业务状态与恢复语义；JSONL 只用于观察和排障，
 不能用于补写、回滚或重放业务操作。
+
+普通 JSONL 可以用 RunId、Standard task/attempt 或 Lua call 等安全身份关联
+[LLM 调用审阅档案](llm-call-review.md)，但不得复制其中的 Prompt、parameters、原文、
+译文或模型正文。调用档案同样不能替代 `project.db` 的业务权威或 JSONL 的命令终态。
