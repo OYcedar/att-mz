@@ -219,9 +219,10 @@ where
             P::Error,
         >,
     > {
-        execution
-            .standard
-            .run(project, &execution.profile, input)
+        // Standard 的并发最终化状态机包含任务证据与提交终态。把这个现实的大型直接
+        // 依赖 future 固定在堆上，避免 Translate 外层状态机在 Windows 主线程轮询时
+        // 临时复制完整状态；业务顺序、取消和所有权不变。
+        Box::pin(execution.standard.run(project, &execution.profile, input))
             .await
             .map_err(|source| TranslateServiceError::Standard { source })
     }

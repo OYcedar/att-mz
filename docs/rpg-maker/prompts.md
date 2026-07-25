@@ -63,9 +63,9 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 空白后非空。资源只按所选 locale 的上述精确路径读取。未选择 locale 的损坏资源，以及
 关闭模式下损坏的 `thinking.md`，不影响本轮运行。
 
-资源错误在首次 LLM 请求前失败。用户诊断只报告安全的规范 locale、组件名和路径，并给出
-不包含资源正文的统一检查方向；它不会回显 system Prompt、思考正文、模型消息或其他
-资源内容。
+资源错误在首次 LLM 请求前失败。用户诊断报告规范 locale、组件名、路径和统一检查方向，
+不复制资源正文；这是配置诊断的职责与可读体积边界，不表示 Prompt 或其他资源内容属于
+敏感信息。
 
 ## 3. `system.md` 模板与装配
 
@@ -216,9 +216,10 @@ JSON
 - `</why>` 与 JSON 之间只允许空白；JSON 不能放在 `<why>` 内；
 - JSON 之后除解析器允许的首尾空白外永远不得追加总结、解释或其他内容。
 
-ATT 验证信封后立即丢弃思考正文，只把剥离后的 JSON 交给唯一的现有 JSON parser 和逐 ID
-验收。它不判断分析是否正确，也不会把思考正文放入结果、数据库、普通项目日志、终端或
-诊断。裸 JSON 在该模式下同样非法。
+ATT 验证信封后把剥离的 JSON 交给唯一的现有 JSON parser 和逐 ID 验收。它不判断分析
+是否正确，也不会把思考正文放入权威结果、数据库、state、普通项目日志、终端或诊断；
+启用 Standard 任务记录时，合法 Thinking 作为非权威正文按原生 Markdown 呈现。裸 JSON
+在该模式下同样非法。
 
 信封错误与 JSON 根错误都形成 `ModelResponseUnusable`，不会伪装成网络错误，也不会触发
 只为网络故障配置的重试。信封解析不会从自然语言中猜测、截取或修复 JSON。
@@ -344,5 +345,8 @@ reasoning/thinking 参数；这些参数仍完全属于所选 Client 的受信 `
 任务输入的规划事实和结果状态见[翻译现行规格](translation.md#5-任务规划与模型消息)，
 ATT token 的来源与恢复规则见[规则编写指南](rules.md#6-placeholder-rules)，术语资源见
 [术语表制作指南](terminology.md)，HTTP 外层响应与 assistant content 的关系见
-[Chat Completions 运行根](../runtime/chat-completions.md)。出于隐私与密钥边界，ATT 不把
-完整 Prompt、messages、思考正文、原文、译文或模型正文写入普通项目日志、终端或诊断。
+[Chat Completions 运行根](../runtime/chat-completions.md)。普通项目日志、终端和通用
+诊断保持运行级结构化摘要，不复制完整 Prompt、messages、思考正文、原文、译文或模型
+正文；这是各自职责、稳定 schema 和体积边界，不是敏感性定义。开启高级记录后，这些
+Standard 任务正文按可读 Markdown 写入，并精确替换其中出现的 API key 实际值，见
+[Standard 翻译任务记录现行规格](task-records.md)。

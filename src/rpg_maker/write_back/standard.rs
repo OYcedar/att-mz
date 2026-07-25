@@ -1873,7 +1873,7 @@ impl Error for StandardWriteBackMutationPlanError {}
 /// `expected_original` 核对每个目标仍与快照一致。每项 Mutation 必须恰好应用一次；
 /// 目标缺失、重复或原文不匹配都是技术错误。`ReplaceDialogue` 必须同时核对并替换
 /// Speaker 与完整 `101 + 401*` 块；`ReplaceEventBody` 仅用于 `105 + 405*` 滚动正文。
-/// 本能力只产生候选，不发布文件，也不把领域计划泄漏成 JSON 或字节覆盖集合。
+/// 本能力只产生候选，不发布文件，也不把领域计划改写成 JSON 或字节覆盖集合。
 pub(crate) trait RpgMakerWriteBackDocumentRewriter: Send + Sync {
     type RewrittenDocuments: Send + 'static;
     type Error: Error + Send + Sync + 'static;

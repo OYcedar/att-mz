@@ -277,6 +277,9 @@ fn render_project_log_warning(
     if let Some(diagnostic) = &warning.diagnostic {
         render_safe_diagnostic(diagnostic, localizer, stderr)?;
     }
+    for diagnostic in &warning.related_diagnostics {
+        render_safe_diagnostic(diagnostic, localizer, stderr)?;
+    }
     Ok(())
 }
 
@@ -465,7 +468,7 @@ mod tests {
 
     impl Write for PanickingOutput {
         fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            std::panic::panic_any(Box::new("PRESENTATION_PANIC_PRIVATE_SENTINEL"));
+            std::panic::panic_any(Box::new("PRESENTATION_PANIC_BODY_SENTINEL"));
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -483,7 +486,7 @@ mod tests {
         };
         use std::sync::Arc;
 
-        const PRIVATE_PANIC_PAYLOAD: &str = "PRESENTATION_PANIC_PRIVATE_SENTINEL";
+        const PANIC_BODY: &str = "PRESENTATION_PANIC_BODY_SENTINEL";
         let directory = tempfile::tempdir().expect("临时日志目录应可建立");
         let project_workspace = directory.path().join("rpg_maker_mz").join("project");
         let logs_root = project_workspace.join("logs");
@@ -540,10 +543,10 @@ mod tests {
         assert!(plain.contains("write-back"));
         assert!(plain.contains(&project_workspace.to_string_lossy().to_string()));
         assert!(plain.contains(&log_path.to_string_lossy().to_string()));
-        assert!(!stderr.contains(PRIVATE_PANIC_PAYLOAD));
+        assert!(!stderr.contains(PANIC_BODY));
 
         let raw = std::fs::read_to_string(&log_path).expect("panic 项目日志应可读取");
-        assert!(!raw.contains(PRIVATE_PANIC_PAYLOAD));
+        assert!(!raw.contains(PANIC_BODY));
         let records = raw
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("日志行应为 JSON"))
@@ -571,11 +574,11 @@ mod tests {
     fn process_panic_hook_is_installed_once_without_exposing_payload() {
         const CHILD_ENV: &str = "ATT_SAFE_PANIC_HOOK_TEST_CHILD";
         const CHILD_MARKER: &str = "ATT_SAFE_PANIC_HOOK_CHILD_COMPLETED";
-        const SECRET: &str = "PANIC_SECRET_SENTINEL";
+        const PANIC_BODY: &str = "PANIC_BODY_SENTINEL";
         if std::env::var_os(CHILD_ENV).is_some() {
             install_safe_panic_hook();
             install_safe_panic_hook();
-            let outcome = catch_unwind(AssertUnwindSafe(|| panic!("{SECRET}")));
+            let outcome = catch_unwind(AssertUnwindSafe(|| panic!("{PANIC_BODY}")));
             assert!(outcome.is_err());
             println!("{CHILD_MARKER}");
             return;
@@ -597,8 +600,8 @@ mod tests {
             stdout.contains(CHILD_MARKER),
             "panic hook 子测试必须实际执行"
         );
-        assert!(!stdout.contains(SECRET));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET));
+        assert!(!stdout.contains(PANIC_BODY));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(PANIC_BODY));
     }
 
     #[test]
@@ -711,12 +714,12 @@ mod tests {
         assert!(!stderr.contains('\u{1b}'));
 
         let mut stderr = Vec::new();
-        let exit = render_fatal(&localizer, &"SECRET_SENTINEL", &mut stderr);
+        let exit = render_fatal(&localizer, &"UNTYPED_FATAL_SOURCE_SENTINEL", &mut stderr);
         assert_eq!(exit, ExitCode::FAILURE);
         assert!(
             !String::from_utf8(stderr)
                 .expect("诊断应为 UTF-8")
-                .contains("SECRET_SENTINEL")
+                .contains("UNTYPED_FATAL_SOURCE_SENTINEL")
         );
     }
 
@@ -734,6 +737,15 @@ mod tests {
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::CheckPathAndPermissions,
             )),
+            related_diagnostics: vec![SafeDiagnostic::io(
+                DiagnosticCode::FileSystemOperation,
+                DiagnosticStage::Logging,
+                DiagnosticSubject::path("C:\\project\\task-records\\run\\task-000001.md"),
+                "cleanup_temporary_file",
+                &source,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            )],
         };
         let mut stderr = Vec::new();
 
@@ -742,6 +754,8 @@ mod tests {
         assert!(stderr.contains("log.write"));
         assert!(stderr.contains("C:\\project\\logs\\run.jsonl"));
         assert!(stderr.contains("write_all"));
+        assert!(stderr.contains("C:\\project\\task-records\\run\\task-000001.md"));
+        assert!(stderr.contains("cleanup_temporary_file"));
         assert!(stderr.contains("OS 5"));
     }
 }

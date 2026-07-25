@@ -183,3 +183,112 @@ diagnostic-io-kind-value = { $code ->
 diagnostic-configuration-rule-value = { $code ->
    *[other] { $fallback }{ $facts }
 }
+task-record-title = 翻譯任務 { $ordinal } · { $state }
+task-record-state-label = { $state ->
+    [complete] 完成
+    [partial] 部分完成
+    [unavailable] 不可用
+    [execution_failed] 執行失敗
+    [commit_preparation_failed] 提交準備失敗
+    [commit_not_applied] 提交未套用
+    [commit_outcome_unknown] 提交結果未知
+    [not_committed_after_earlier_failure] 因先前失敗未提交
+    [invalid_result] 執行結果序列無效
+    [cancelled] 已取消
+   *[other] { $state }
+}
+task-record-summary-with-written = `任務 { $ordinal }/{ $total }` · `嘗試 { $attempts } 次` · `驗收 { $accepted }/{ $expected }` · `寫入 { $written } 處`
+task-record-summary-without-written = `任務 { $ordinal }/{ $total }` · `嘗試 { $attempts } 次` · `驗收 { $accepted }/{ $expected }`
+task-record-run-id-label = Run ID：
+task-record-started-at-label = 開始時間：
+task-record-duration-label = 總耗時：
+task-record-endpoint-label = Endpoint：
+task-record-model-label = Model：
+task-record-custom-parameters-heading = 自訂參數
+task-record-attempts-heading = 請求過程
+task-record-final-result-heading = 最終結果
+task-record-no-request = 沒有形成可傳送的模型請求。
+task-record-empty-assistant = 模型傳回了空物件。
+task-record-parse-error = 解析錯誤：{ $kind ->
+    [json] 模型回應 JSON 無效（類別 `{ $category }`），第 { $line } 行、第 { $column } 欄
+    [thinking_not_allowed] 目前回應模式不接受思考輸出，第 { $line } 行、第 { $column } 欄
+    [thinking_envelope_missing] 模型回應缺少規定的思考信封，第 { $line } 行、第 { $column } 欄
+    [thinking_envelope_unclosed] 模型回應的思考信封未閉合，第 { $line } 行、第 { $column } 欄
+    [thinking_empty] 模型回應的思考內容為空，第 { $line } 行、第 { $column } 欄
+    [thinking_nested] 模型回應包含巢狀思考信封，第 { $line } 行、第 { $column } 欄
+    [thinking_repeated] 模型回應包含重複思考信封，第 { $line } 行、第 { $column } 欄
+    [markdown_fence_no_body] Markdown 圍欄沒有正文，第 { $line } 行、第 { $column } 欄
+    [markdown_fence_unsupported] 只接受無語言標記或 json 標記的單層 Markdown 圍欄，第 { $line } 行、第 { $column } 欄
+    [markdown_fence_unclosed] Markdown 圍欄未閉合，第 { $line } 行、第 { $column } 欄
+   *[markdown_fence_invalid_closing] Markdown 圍欄必須在最後一個獨立行閉合，第 { $line } 行、第 { $column } 欄
+}
+task-record-attempt-succeeded = 嘗試 { $number }：成功；finish reason { $finish_reason }
+task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`
+task-record-attempt-duration = ；耗時 `{ $duration }`
+task-record-attempt-request-id = ；request ID { $request_id }
+task-record-attempt-response-id = ；response ID { $response_id }
+task-record-attempt-retryable = 嘗試 { $number }：可重試請求失敗；診斷 `{ $code }`；耗時 `{ $duration }`
+task-record-attempt-retry-after = ；Retry-After `{ $duration }`
+task-record-attempt-wait-retry = ；等待 `{ $duration }` 後重試
+task-record-attempt-wait-completed = ；等待 `{ $duration }` 已完成，下一次嘗試未開始
+task-record-attempt-wait-cancelled = ；計畫等待 `{ $duration }`，等待期間取消
+task-record-attempt-failed = 嘗試 { $number }：請求或回應處理失敗；診斷 `{ $code }`；耗時 `{ $duration }`
+task-record-attempt-cancelled = 嘗試 { $number }：已取消；耗時 `{ $duration }`
+task-record-structured-reason = 原因：{ $reason }
+task-record-final-status = 狀態：{ $state ->
+    [complete] 完成，已確認提交
+    [partial] 部分完成，已確認提交
+    [unavailable] 不可用，專案未變更
+    [execution_failed] 執行失敗，未提交
+    [commit_preparation_failed] 提交準備失敗，確定未套用
+    [commit_not_applied] 交易確定未套用
+    [commit_outcome_unknown] 提交結果未知
+    [not_committed_after_earlier_failure] 因先前任務失敗而未提交
+    [invalid_result] Executor 結果序列無效，未提交
+    [cancelled] 已取消，未提交
+   *[other] { $state }
+}
+task-record-accepted-written = 已接受：{ $accepted } 項，寫入 { $written } 個實際位置
+task-record-accepted-outcome-unknown = 已驗收：{ $accepted } 項；無法確認資料庫提交終態
+task-record-rejected-heading = 未接受：
+task-record-rejected-item = { $id }：{ $reason }
+task-record-protocol-diagnostic = 協定診斷：{ $diagnostic }
+task-record-unavailable-reason = 不可用原因：{ $reason }
+task-record-task-diagnostic = 任務診斷：`{ $code }`；原因 { $reason }
+task-record-rejection-reason = { $code ->
+    [missing] 缺少模型輸出
+    [duplicate] 重複模型輸出
+    [invalid_shape] { $detail }
+    [invalid_shape_array] 譯文必須是字串陣列
+    [invalid_shape_item] 譯文陣列第 { $line } 項必須是字串
+    [line_count_mismatch] 行數不符（預期 { $expected }，實際 { $actual }）
+    [invalid_line_text] 第 { $line } 行包含無效控制字元
+    [blank_line_mismatch] 第 { $line } 行空白狀態不符（預期{ $expected_blank ->
+        [blank] 空白
+       *[other] 非空白
+    }）
+    [blank_translation] 譯文為空
+    [no_natural_language_text] 譯文沒有自然語言文字
+    [contains_byte_order_mark] 譯文包含 BOM
+    [placeholder_mismatch] 預留位置不符：{ $detail }
+    [unexpected_placeholder] 出現未知預留位置：{ $detail }
+    [placeholder_normalization_ambiguous] 預留位置正規化有歧義：{ $detail }
+    [source_residual] 偵測到來源語言殘留：{ $detail }
+   *[other] { $detail }
+}
+task-record-protocol-detail = { $code ->
+    [non_stop_finish] finish reason 不是 stop：{ $detail }
+    [invalid_response] { $detail }
+    [invalid_id] 模型第 { $index } 個項目的 ID 無效
+    [unknown_id] 模型第 { $index } 個項目傳回未知 ID { $detail }
+   *[other] { $detail }
+}
+task-record-unavailable-detail = { $code ->
+    [model_response_unusable] 無法解析模型回應
+    [all_outputs_rejected] 所有模型輸出均未通過驗收
+    [recoverable_request_exhausted] 可復原請求的重試額度已用盡
+    [retry_after_exceeds_maximum] Retry-After 超過已設定的最長等待時間
+   *[other] { $code }
+}
+task-record-duration-seconds = { $value } 秒
+task-record-duration-milliseconds = { $value } 毫秒

@@ -1379,9 +1379,9 @@ pattern = '\\n<(?<speaker>[^>]+)>'
 
     #[test]
     fn definition_diagnostics_publish_typed_positions_without_document_or_pattern_text() {
-        const TOML_SENTINEL: &str = "SECRET_TOML_DOCUMENT";
+        const TOML_BODY: &str = "TOML_DOCUMENT_BODY_SENTINEL";
         let toml_error =
-            MvDialogueDefinition::parse_toml(&format!("[[rule]\npattern = '{TOML_SENTINEL}'\n"))
+            MvDialogueDefinition::parse_toml(&format!("[[rule]\npattern = '{TOML_BODY}'\n"))
                 .expect_err("缺少右方括号的 TOML 应拒绝");
         let diagnostic = toml_error.safe_diagnostic(
             DiagnosticStage::CommandPreparation,
@@ -1403,11 +1403,11 @@ pattern = '\\n<(?<speaker>[^>]+)>'
         assert_eq!(resource, "mv_dialogue_definition");
         assert_eq!(classification, "syntax");
         let serialized = serde_json::to_string(&diagnostic).expect("安全 TOML 诊断应可序列化");
-        assert!(!serialized.contains(TOML_SENTINEL));
+        assert!(!serialized.contains(TOML_BODY));
 
-        const TOML_DATA_SENTINEL: &str = "SECRET_TOML_DATA_VALUE";
+        const TOML_DATA_VALUE: &str = "TOML_DATA_VALUE_SENTINEL";
         let toml_data_error =
-            MvDialogueDefinition::parse_toml(&format!("other = '{TOML_DATA_SENTINEL}'\n"))
+            MvDialogueDefinition::parse_toml(&format!("other = '{TOML_DATA_VALUE}'\n"))
                 .expect_err("未知 TOML 字段应作为 data 分类拒绝");
         let diagnostic = toml_data_error.safe_diagnostic(
             DiagnosticStage::CommandPreparation,
@@ -1429,12 +1429,12 @@ pattern = '\\n<(?<speaker>[^>]+)>'
         assert!(
             !serde_json::to_string(&diagnostic)
                 .expect("安全 TOML data 诊断应可序列化")
-                .contains(TOML_DATA_SENTINEL)
+                .contains(TOML_DATA_VALUE)
         );
 
-        const JSON_SENTINEL: &str = "SECRET_JSON_VALUE";
+        const JSON_VALUE: &str = "JSON_VALUE_SENTINEL";
         let json_error = MvDialogueDefinition::from_canonical_json(&format!(
-            "{{\n\"rules\": \"{JSON_SENTINEL}\"\n}}"
+            "{{\n\"rules\": \"{JSON_VALUE}\"\n}}"
         ))
         .expect_err("rules 类型错误的 JSON 应拒绝");
         let diagnostic = json_error.safe_diagnostic(
@@ -1448,16 +1448,16 @@ pattern = '\\n<(?<speaker>[^>]+)>'
         assert!(detail.contains("format=canonical_json"));
         assert!(detail.contains("classification=data"));
         assert!(detail.contains("line=2"));
-        assert!(!detail.contains(JSON_SENTINEL));
+        assert!(!detail.contains(JSON_VALUE));
         assert!(
             !serde_json::to_string(&diagnostic)
                 .expect("安全 JSON 诊断应可序列化")
-                .contains(JSON_SENTINEL)
+                .contains(JSON_VALUE)
         );
 
-        const PATTERN_SENTINEL: &str = "SECRET_PATTERN_BODY";
+        const PATTERN_BODY: &str = "PATTERN_BODY_SENTINEL";
         let definition = MvDialogueDefinition::parse_toml(&format!(
-            "[[rule]]\npattern = '(?<speaker>{PATTERN_SENTINEL}'\n"
+            "[[rule]]\npattern = '(?<speaker>{PATTERN_BODY}'\n"
         ))
         .expect("TOML 本身应合法");
         let pattern_error = match definition.compile() {
@@ -1475,18 +1475,18 @@ pattern = '\\n<(?<speaker>[^>]+)>'
         assert!(detail.contains("engine=pcre2"));
         assert!(detail.contains("code="));
         assert!(detail.contains("offset="));
-        assert!(!detail.contains(PATTERN_SENTINEL));
+        assert!(!detail.contains(PATTERN_BODY));
     }
 
     #[test]
     fn named_capture_diagnostic_only_exposes_safe_identifiers() {
-        const UNSAFE_CAPTURE: &str = "SECRET_CAPTURE\nVALUE";
+        const CONTROL_CAPTURE: &str = "CAPTURE_WITH_CONTROL\nVALUE";
         let error = MvDialogueDefinitionError::InvalidNamedCaptures {
             rule_number: 7,
             captures: vec![
                 "speaker".to_owned(),
                 "safe_capture_2".to_owned(),
-                UNSAFE_CAPTURE.to_owned(),
+                CONTROL_CAPTURE.to_owned(),
             ],
         };
         let diagnostic = error.safe_diagnostic(
@@ -1499,7 +1499,7 @@ pattern = '\\n<(?<speaker>[^>]+)>'
         };
         assert!(detail.contains("safe_actual_captures=[speaker,safe_capture_2]"));
         assert!(detail.contains("hidden_capture_count=1"));
-        assert!(!detail.contains(UNSAFE_CAPTURE));
+        assert!(!detail.contains(CONTROL_CAPTURE));
     }
 
     #[test]

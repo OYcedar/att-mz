@@ -2362,8 +2362,8 @@ mod tests {
     }
 
     #[test]
-    fn planning_diagnostic_hides_resource_values_and_preserves_rule_number() {
-        let sentinel = "TRANSLATION_RESOURCE_SECRET_SENTINEL";
+    fn planning_diagnostic_uses_stable_resource_facts_and_preserves_rule_number() {
+        let sentinel = "TRANSLATION_RESOURCE_VALUE_SENTINEL";
         let terminology: ProductionPlanningError =
             RpgMakerStandardTranslationTaskPlanningError::ReadResources(
                 TranslationPlanningResourceReadingError::InvalidTerminology {

@@ -316,6 +316,37 @@ impl DiagnosticSubject {
             Self::Operation { name } => Self::operation(name),
         }
     }
+
+    fn map_dynamic_text<F>(self, map: &mut F) -> Self
+    where
+        F: FnMut(&str) -> String,
+    {
+        let map_text = |value: String, map: &mut F| sanitize_user_text(&map(&value));
+        match self {
+            Self::Process => Self::Process,
+            Self::Command { name } => Self::Command {
+                name: map_text(name, map),
+            },
+            Self::Path { path } => Self::Path {
+                path: map_text(path, map),
+            },
+            Self::Field { field } => Self::Field {
+                field: map_text(field, map),
+            },
+            Self::Project { name } => Self::Project {
+                name: map_text(name, map),
+            },
+            Self::Profile { id } => Self::Profile {
+                id: map_text(id, map),
+            },
+            Self::Component { name } => Self::Component {
+                name: map_text(name, map),
+            },
+            Self::Operation { name } => Self::Operation {
+                name: map_text(name, map),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -863,9 +894,9 @@ pub(crate) enum ConfigurationValueRule {
     UrlCredentialsForbidden,
     UrlFragmentForbidden,
     UrlSchemeUnsupported,
-    SecretBlank,
-    SecretSurroundingWhitespace,
-    SecretInvalidHeader,
+    ApiKeyBlank,
+    ApiKeySurroundingWhitespace,
+    ApiKeyInvalidHeader,
     StrictJsonInvalid { line: u64, column: u64 },
     JsonObjectRequired,
     ReservedRequestField,
@@ -910,9 +941,9 @@ impl ConfigurationValueRule {
             Self::UrlCredentialsForbidden => "url_credentials_forbidden",
             Self::UrlFragmentForbidden => "url_fragment_forbidden",
             Self::UrlSchemeUnsupported => "url_scheme_unsupported",
-            Self::SecretBlank => "secret_blank",
-            Self::SecretSurroundingWhitespace => "secret_surrounding_whitespace",
-            Self::SecretInvalidHeader => "secret_invalid_header",
+            Self::ApiKeyBlank => "api_key_blank",
+            Self::ApiKeySurroundingWhitespace => "api_key_surrounding_whitespace",
+            Self::ApiKeyInvalidHeader => "api_key_invalid_header",
             Self::StrictJsonInvalid { .. } => "strict_json_invalid",
             Self::JsonObjectRequired => "json_object_required",
             Self::ReservedRequestField => "reserved_request_field",
@@ -994,12 +1025,12 @@ impl ConfigurationValueRule {
             Self::UrlCredentialsForbidden => "URL must not contain credentials".to_owned(),
             Self::UrlFragmentForbidden => "URL must not contain a fragment".to_owned(),
             Self::UrlSchemeUnsupported => "URL scheme must be http or https".to_owned(),
-            Self::SecretBlank => "secret must not be blank".to_owned(),
-            Self::SecretSurroundingWhitespace => {
-                "secret must not contain surrounding whitespace".to_owned()
+            Self::ApiKeyBlank => "API key must not be blank".to_owned(),
+            Self::ApiKeySurroundingWhitespace => {
+                "API key must not contain surrounding whitespace".to_owned()
             }
-            Self::SecretInvalidHeader => {
-                "secret cannot be represented as an HTTP header value".to_owned()
+            Self::ApiKeyInvalidHeader => {
+                "API key cannot be represented as an HTTP header value".to_owned()
             }
             Self::StrictJsonInvalid { line, column } => {
                 format!("value must be strict JSON (line={line}, column={column})")
@@ -1093,7 +1124,7 @@ impl DiagnosticReason {
     pub(crate) fn io(operation: impl AsRef<str>, source: &io::Error) -> Self {
         let raw_os_code = source.raw_os_error();
         let system_message = raw_os_code.map(|code| {
-            // 只从稳定 OS code 重新生成系统消息；不读取可能包装了敏感上下文的 source 文本。
+            // 只从稳定 OS code 重新生成系统消息；不读取任意、未结构化的 source 文本。
             sanitize_user_text(&io::Error::from_raw_os_error(code).to_string())
         });
         Self::Io {
@@ -1122,7 +1153,7 @@ impl DiagnosticReason {
 
     /// 追加已经由类型化根判定可公开的机制详情。
     ///
-    /// 调用方不得传入 Prompt、模型/Lua 正文、SQL、参数或任意错误链文本。
+    /// 调用方只能传入有界、类型化的机制事实，不得复制任意业务载荷或错误链文本。
     pub(crate) fn failure_with_detail(
         failure: DiagnosticFailureKind,
         detail: impl AsRef<str>,
@@ -1186,6 +1217,81 @@ impl DiagnosticReason {
                 detail: sanitize_user_text(&detail),
             },
             reason => reason,
+        }
+    }
+
+    fn map_dynamic_text<F>(self, map: &mut F) -> Self
+    where
+        F: FnMut(&str) -> String,
+    {
+        let map_text = |value: String, map: &mut F| sanitize_user_text(&map(&value));
+        match self {
+            Self::Io {
+                operation,
+                error_kind,
+                raw_os_code,
+                system_message,
+            } => Self::Io {
+                operation: map_text(operation, map),
+                error_kind,
+                raw_os_code,
+                system_message: system_message.map(|message| map_text(message, map)),
+            },
+            Self::Failure { failure } => Self::Failure { failure },
+            Self::FailureWithDetail { failure, detail } => Self::FailureWithDetail {
+                failure,
+                detail: map_text(detail, map),
+            },
+            Self::InvalidUtf8 {
+                valid_up_to,
+                error_len,
+            } => Self::InvalidUtf8 {
+                valid_up_to,
+                error_len,
+            },
+            Self::InvalidToml {
+                line,
+                column,
+                resource,
+                classification,
+            } => Self::InvalidToml {
+                line,
+                column,
+                resource: map_text(resource, map),
+                classification: map_text(classification, map),
+            },
+            Self::InvalidConfigurationValue { rule } => Self::InvalidConfigurationValue { rule },
+            Self::Http {
+                status,
+                retry_after_seconds,
+                provider_code,
+                provider_type,
+            } => Self::Http {
+                status,
+                retry_after_seconds,
+                provider_code: provider_code.map(|value| map_text(value, map)),
+                provider_type: provider_type.map(|value| map_text(value, map)),
+            },
+            Self::Sqlite {
+                primary_code,
+                extended_code,
+            } => Self::Sqlite {
+                primary_code,
+                extended_code,
+            },
+            Self::WindowsStatus { operation, status } => Self::WindowsStatus {
+                operation: map_text(operation, map),
+                status,
+            },
+            Self::Resource {
+                resource,
+                actual,
+                maximum,
+            } => Self::Resource {
+                resource: map_text(resource, map),
+                actual,
+                maximum,
+            },
         }
     }
 
@@ -1260,7 +1366,7 @@ impl DiagnosticReason {
         }
     }
 
-    fn render_localized(&self, localizer: &UiLocalizer) -> String {
+    pub(crate) fn render_localized(&self, localizer: &UiLocalizer) -> String {
         let zh_hans = localizer.locale() == UiLocale::SimplifiedChinese;
         match self {
             Self::Io {
@@ -1514,6 +1620,24 @@ impl RecoveryFact {
             Self::Transaction { state } => Self::transaction(state),
         }
     }
+
+    fn map_dynamic_text<F>(self, map: &mut F) -> Self
+    where
+        F: FnMut(&str) -> String,
+    {
+        let map_text = |value: String, map: &mut F| sanitize_user_text(&map(&value));
+        match self {
+            Self::Path { path } => Self::Path {
+                path: map_text(path, map),
+            },
+            Self::Component { name } => Self::Component {
+                name: map_text(name, map),
+            },
+            Self::Transaction { state } => Self::Transaction {
+                state: map_text(state, map),
+            },
+        }
+    }
 }
 
 /// CLI 与 JSONL 共享的唯一公开诊断事实。
@@ -1573,6 +1697,23 @@ impl SafeDiagnostic {
         self
     }
 
+    /// 只改写公开诊断中的动态文本，同时保留 code、stage、终态和其他结构化事实。
+    ///
+    /// 映射结果重新清理控制字符；调用方无需把诊断序列化后再猜测其字段语义。
+    pub(crate) fn map_dynamic_text<F>(mut self, mut map: F) -> Self
+    where
+        F: FnMut(&str) -> String,
+    {
+        self.subject = self.subject.map_dynamic_text(&mut map);
+        self.reason = self.reason.map_dynamic_text(&mut map);
+        self.recovery = self
+            .recovery
+            .into_iter()
+            .map(|fact| fact.map_dynamic_text(&mut map))
+            .collect();
+        self
+    }
+
     /// 重建公开不变量；日志边界也调用它，防止未来反序列化或直接枚举构造绕过清理。
     pub(crate) fn sanitized(mut self) -> Self {
         self.subject = self.subject.sanitized();
@@ -1624,7 +1765,7 @@ impl fmt::Debug for ReportedFailure {
         formatter
             .debug_struct("ReportedFailure")
             .field("public", &self.public)
-            .field("source", &"<private>")
+            .field("source", &"<omitted typed source>")
             .finish()
     }
 }
@@ -1778,7 +1919,10 @@ mod tests {
 
     #[test]
     fn io_projection_uses_stable_os_fact_without_wrapped_source_text() {
-        let wrapped = io::Error::new(io::ErrorKind::PermissionDenied, "SECRET_SENTINEL");
+        let wrapped = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "UNSTRUCTURED_SOURCE_SENTINEL",
+        );
         let diagnostic = SafeDiagnostic::io(
             DiagnosticCode::ConfigurationRead,
             DiagnosticStage::Configuration,
@@ -1789,7 +1933,7 @@ mod tests {
             DiagnosticAction::CheckPathAndPermissions,
         );
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
-        assert!(!serialized.contains("SECRET_SENTINEL"));
+        assert!(!serialized.contains("UNSTRUCTURED_SOURCE_SENTINEL"));
         assert!(serialized.contains("permission_denied"));
     }
 
@@ -1809,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_and_display_never_expose_private_source() {
+    fn debug_and_display_use_only_the_stable_public_projection() {
         let reported = ReportedFailure::new(
             SafeDiagnostic::new(
                 DiagnosticCode::InternalOperation,
@@ -1819,10 +1963,10 @@ mod tests {
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::ReportBug,
             ),
-            io::Error::other("SECRET_SENTINEL"),
+            io::Error::other("UNSTRUCTURED_SOURCE_SENTINEL"),
         );
-        assert!(!format!("{reported}").contains("SECRET_SENTINEL"));
-        assert!(!format!("{reported:?}").contains("SECRET_SENTINEL"));
+        assert!(!format!("{reported}").contains("UNSTRUCTURED_SOURCE_SENTINEL"));
+        assert!(!format!("{reported:?}").contains("UNSTRUCTURED_SOURCE_SENTINEL"));
     }
 
     #[test]
@@ -1857,7 +2001,37 @@ mod tests {
     }
 
     #[test]
-    fn renderer_never_reads_private_source_or_prints_control_characters() {
+    fn dynamic_text_mapping_preserves_diagnostic_structure_and_each_text_field() {
+        const API_KEY: &str = "actual-api-key";
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::ModelRequest,
+            DiagnosticStage::ModelRequest,
+            DiagnosticSubject::path(format!("C:/projects/{API_KEY}/task.md")),
+            DiagnosticReason::Http {
+                status: Some(429),
+                retry_after_seconds: Some(7),
+                provider_code: Some(format!("before-{API_KEY}-after")),
+                provider_type: Some(format!("type-{API_KEY}")),
+            },
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::CheckModelService,
+        )
+        .with_recovery(RecoveryFact::path(format!(
+            "C:/projects/{API_KEY}/temporary.md"
+        )))
+        .map_dynamic_text(|value| value.replace(API_KEY, "[REDACTED API KEY]"));
+
+        let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
+        assert!(!serialized.contains(API_KEY));
+        assert_eq!(serialized.matches("[REDACTED API KEY]").count(), 4);
+        assert!(serialized.contains("\"code\":\"model.request\""));
+        assert!(serialized.contains("\"stage\":\"model_request\""));
+        assert!(serialized.contains("\"status\":429"));
+        assert!(serialized.contains("\"impact\":\"progress_preserved\""));
+    }
+
+    #[test]
+    fn renderer_uses_the_stable_projection_and_sanitizes_control_characters() {
         let report = FailureReport::new(ReportedFailure::new(
             SafeDiagnostic::new(
                 DiagnosticCode::FileSystemOperation,
@@ -1957,5 +2131,34 @@ mod tests {
         assert_eq!(sqlite, "SQLite 主错误码 5，扩展错误码 517");
         assert_eq!(resource, "请求字符数：实际值 25000，上限 24000");
         assert!(!http.contains("Some("));
+    }
+
+    #[test]
+    fn api_key_configuration_rules_have_specific_wire_and_ui_names() {
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let cases = [
+            (
+                ConfigurationValueRule::ApiKeyBlank,
+                "api_key_blank",
+                "API key 不能为空",
+            ),
+            (
+                ConfigurationValueRule::ApiKeySurroundingWhitespace,
+                "api_key_surrounding_whitespace",
+                "API key 不能带首尾空白",
+            ),
+            (
+                ConfigurationValueRule::ApiKeyInvalidHeader,
+                "api_key_invalid_header",
+                "API key 不是有效 HTTP Header 值",
+            ),
+        ];
+
+        for (rule, wire_name, localized) in cases {
+            assert_eq!(rule.as_str(), wire_name);
+            let rendered =
+                DiagnosticReason::InvalidConfigurationValue { rule }.render_localized(&localizer);
+            assert_eq!(rendered.replace(['\u{2068}', '\u{2069}'], ""), localized);
+        }
     }
 }

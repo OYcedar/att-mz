@@ -1155,9 +1155,9 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FakeError {
-        Private(&'static str),
+        Untyped(&'static str),
         Operation {
-            private_message: &'static str,
+            source_detail: &'static str,
             operation: &'static str,
         },
     }
@@ -1165,9 +1165,9 @@ mod tests {
     impl fmt::Display for FakeError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::Private(message)
+                Self::Untyped(message)
                 | Self::Operation {
-                    private_message: message,
+                    source_detail: message,
                     ..
                 } => formatter.write_str(message),
             }
@@ -1184,7 +1184,7 @@ mod tests {
             action: DiagnosticAction,
         ) -> SafeDiagnostic {
             let subject = match self {
-                Self::Private(_) => DiagnosticSubject::component("fake Lua root"),
+                Self::Untyped(_) => DiagnosticSubject::component("fake Lua root"),
                 Self::Operation { operation, .. } => DiagnosticSubject::operation(operation),
             };
             SafeDiagnostic::new(
@@ -1254,13 +1254,13 @@ mod tests {
     }
 
     #[test]
-    fn host_call_diagnostic_keeps_stable_codes_and_hides_lua_message() {
+    fn host_call_diagnostic_keeps_stable_codes_without_copying_lua_message() {
         let error: TrustedLuaExecutionHostingError<FakeError, FakeError> =
             TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Binding(
                 TrustedLuaHostCallError::new(
                     "filesystem",
                     "permission_denied",
-                    "LUA_VM_AND_SOURCE_SECRET",
+                    "LUA_VM_AND_SOURCE_BODY_SENTINEL",
                     None,
                     None,
                 ),
@@ -1272,7 +1272,7 @@ mod tests {
         );
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
 
-        assert!(!serialized.contains("LUA_VM_AND_SOURCE_SECRET"));
+        assert!(!serialized.contains("LUA_VM_AND_SOURCE_BODY_SENTINEL"));
         assert!(serialized.contains("lua_host_call_failed"));
         assert!(serialized.contains("scripts/write-back.lua"));
         assert!(serialized.contains("host_domain=filesystem; host_kind=permission_denied"));
@@ -1424,12 +1424,12 @@ mod tests {
     fn runtime_and_cleanup_become_primary_and_related_safe_failures() {
         let error: TrustedLuaExecutionHostingError<FakeError, FakeError> =
             TrustedLuaExecutionHostingError::RuntimeAndCleanup {
-                runtime: TrustedLuaRuntimeExecutionError::Execute(FakeError::Private(
+                runtime: TrustedLuaRuntimeExecutionError::Execute(FakeError::Untyped(
                     "LUA_VM_BODY_SENTINEL",
                 )),
                 cleanup: TrustedLuaBindingFinalizationError::new(
                     "SQL_AND_PARAMETER_SENTINEL",
-                    Some(Arc::new(FakeError::Private("CLEANUP_SOURCE_SENTINEL"))),
+                    Some(Arc::new(FakeError::Untyped("CLEANUP_SOURCE_SENTINEL"))),
                 ),
             };
         let report = error.into_failure_report(
@@ -1456,7 +1456,10 @@ mod tests {
             "SQL_AND_PARAMETER_SENTINEL",
             "CLEANUP_SOURCE_SENTINEL",
         ] {
-            assert!(!serialized.contains(sentinel), "泄露了 {sentinel}");
+            assert!(
+                !serialized.contains(sentinel),
+                "公开投影不应包含 {sentinel}"
+            );
         }
     }
 
@@ -1578,7 +1581,7 @@ mod tests {
                     Err(SqliteInteractiveSessionFinalizationError::new(
                         SqliteInteractiveSessionFinalizationFailure::CleanupFailed(
                             FakeError::Operation {
-                                private_message: "SESSION_CLOSE_SOURCE_SENTINEL",
+                                source_detail: "SESSION_CLOSE_SOURCE_SENTINEL",
                                 operation: "close_connection",
                             },
                         ),
@@ -1611,7 +1614,7 @@ mod tests {
             record(&self.events, "open");
             if self.fail {
                 Err(OpenSqliteInteractiveSessionError::OpenFailed(
-                    FakeError::Private("open"),
+                    FakeError::Untyped("open"),
                 ))
             } else {
                 Ok(OpenedSqliteInteractiveSession::new(
@@ -1663,11 +1666,11 @@ mod tests {
                         .clear_standard()
                         .map_err(TrustedLuaRuntimeExecutionError::Binding),
                     RuntimeBehavior::Fail => Err(TrustedLuaRuntimeExecutionError::Execute(
-                        FakeError::Private("vm"),
+                        FakeError::Untyped("vm"),
                     )),
                     RuntimeBehavior::Unavailable => {
                         Err(TrustedLuaRuntimeExecutionError::Unavailable(
-                            FakeError::Private("unavailable"),
+                            FakeError::Untyped("unavailable"),
                         ))
                     }
                     RuntimeBehavior::Cancelled => Err(TrustedLuaRuntimeExecutionError::Cancelled),
@@ -1815,7 +1818,7 @@ mod tests {
         assert!(matches!(
             error,
             TrustedLuaExecutionHostingError::Runtime(TrustedLuaRuntimeExecutionError::Unavailable(
-                FakeError::Private("unavailable")
+                FakeError::Untyped("unavailable")
             ))
         ));
         assert_eq!(*events.lock().unwrap(), ["open", "start", "finalize"]);
@@ -1916,7 +1919,10 @@ mod tests {
         assert!(serialized.contains("lua_runtime_phase=finalization"));
         assert!(serialized.contains("C:/project/scripts/extract.lua"));
         for sentinel in ["vm", "SESSION_CLOSE_SOURCE_SENTINEL"] {
-            assert!(!serialized.contains(sentinel), "泄露了 {sentinel}");
+            assert!(
+                !serialized.contains(sentinel),
+                "公开投影不应包含 {sentinel}"
+            );
         }
     }
 

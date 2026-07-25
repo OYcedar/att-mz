@@ -51,7 +51,7 @@ impl TextUnitRole {
 /// 不存在可由 Placeholder 吞并的内容字符。
 ///
 /// 无标签序列化使 SQLite 中的权威内容直接表现为 JSON string 或 string array，
-/// 不把内部类型包装泄漏到持久化数据中。
+/// 不把内部类型包装写入持久化数据。
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(untagged)]
 pub(crate) enum TextUnitContent {

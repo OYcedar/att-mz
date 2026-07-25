@@ -166,13 +166,18 @@ wire、ID、行形状、空槽、ATT token 和响应信封约束。Planner 与 E
 `JsonOnly` 要求 assistant content 直接提供 JSON，任何 `<why>` 都非法。
 `ThinkingThenJson` 要求整个 TaskBlock 精确输出一组
 `<why>非空任意内容</why>`，随后只允许空白再接 JSON。标签必须精确小写且无属性；缺失、
-空、未闭合、嵌套、重复、大小写变体、属性或前置说明都会拒绝。ATT 验证非空后立即丢弃
-思考正文，不将其放入结果、数据库、普通项目日志、终端或诊断，也不判断分析质量。
+空、未闭合、嵌套、重复、大小写变体、属性或前置说明都会拒绝。ATT 不赋予思考正文业务
+权威性，不将其放入 `TranslationTaskOutcome`、数据库、state、普通项目日志、终端或
+诊断，也不判断分析质量。启用 Standard 任务记录时，合法正文进入该任务的非权威可读
+投影。
 
 响应整体允许首尾空白和最开头的单个 BOM；BOM 必须位于裸 JSON 或 `<why>` 之前，不能
 放在 `</why>` 与 JSON 之间。剥离信封后的部分继续进入唯一的既有 JSON parser，并保留
 唯一一层独占行 JSON 围栏容错；Prompt 仍必须要求裸 JSON。信封或 JSON 根失败使整个任务
 因 `ModelResponseUnusable` 不可用，不作为网络错误重试；逐 ID 规则没有任何变化。
+
+响应信封在责任边界只解析一次，形成 Thinking、Assistant JSON 和有序条目投影；业务
+验收与任务记录共享该结果。记录 renderer 不重新猜测 `<why>`，也不重新解释逐 ID 规则。
 
 Standard 响应必须提供当前 TaskBlock 的每个 ID 恰好一次，不能缺失、重复或增加 ID。
 Value/Lines 形状必须符合角色：
@@ -224,8 +229,9 @@ SSPV 的 Release/MSVC 消融与慢首任务压力测试共同选定 2N 完成窗
 3N 个已经入场但尚未顺序最终化的任务；该内部值固化在代码中，不进入 Profile 配置。
 
 每个有写入的任务使用独立 SQLite 事务，验收通过的重复集合在同事务传播。技术失败停止
-后续工作；已经提交任务保持。取消停止新请求，等待已接管工作到明确终态，不猜测外部
-请求是否未发生。
+后续工作；已经提交任务保持。取消停止启动新任务；每个已经发出 `TaskStarted` 的任务
+仍回到顺序 finalizer 并取得明确的已提交、未提交或取消终态，尚未启动的任务不产生
+任务记录。ATT 不猜测外部请求是否未发生。
 
 最终：全部需要翻译的单元 Current 为 `Complete`；仍有可解释 unresolved 为 `Partial`；
 没有可执行产出为 `Unavailable`。三者是业务结果，退出成功不等于 `Complete`。技术错误、
@@ -245,3 +251,15 @@ SSPV 的 Release/MSVC 消融与慢首任务压力测试共同选定 2N 完成窗
 `translate_run_plan` 及 Translate Lua 程序。确认提交失败时旧方案保持；终态无法确认时
 命令说明翻译结果已生效但方案状态无法确认，并建议下次显式传入 Profile 与 Lua 选择。
 项目日志的启动、写入或关闭故障不停止模型任务、不丢弃合法候选，也不改变退出码。
+
+## 9. Standard 任务记录
+
+`[rpg_maker].record_translation_tasks = true` 时，顺序 finalizer 在真实验收和提交判断后，
+为每个已启动 TaskBlock 构造一份完整不可变 Markdown。文件 ordinal 来自计划顺序，同一
+任务的全部重试归入同一文件；System/User 按原生 Markdown 呈现，合法 Thinking 去除
+信封标签，合法 Assistant JSON 按原始 ID 顺序展开，最终结果明确区分验收与提交终态。
+
+任务记录是非权威旁路。它的渲染、建立、写入或清理失败只产生可见诊断，不改变任务
+Outcome、数据库、退出码、后续任务或保存方案。Translate Lua 没有核心拥有的逐 ID
+验收终态，因此不生成该文件。路径、完整模板、API-key 精确替换、互斥终态和原子落盘
+规则见[Standard 翻译任务记录现行规格](task-records.md)。

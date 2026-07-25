@@ -789,8 +789,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn owned_program_debug_never_exposes_source_bytes() {
-        const SENTINEL: &str = "ATT_SECRET_LUA_BODY_SENTINEL";
+    fn owned_program_debug_uses_a_compact_source_projection() {
+        const SENTINEL: &str = "ATT_LUA_BODY_SENTINEL";
         let program = OwnedLuaProgram::new(
             PathBuf::from("C:/scripts/main.lua"),
             SENTINEL.as_bytes().to_vec(),
@@ -802,7 +802,7 @@ mod tests {
         assert!(debug.contains("source_bytes"));
         assert!(
             !debug.contains(SENTINEL),
-            "Debug 不得泄露 Lua 正文：{debug}"
+            "Debug 不应复制 Lua 正文：{debug}"
         );
     }
 }

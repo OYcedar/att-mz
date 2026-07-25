@@ -344,9 +344,9 @@ diagnostic-configuration-rule-value = { $code ->
     [url_credentials_forbidden] URL 不能包含用户名或密码{ $facts }
     [url_fragment_forbidden] URL 不能包含片段{ $facts }
     [url_scheme_unsupported] URL 必须使用 http 或 https{ $facts }
-    [secret_blank] 密钥不能为空{ $facts }
-    [secret_surrounding_whitespace] 密钥不能带首尾空白{ $facts }
-    [secret_invalid_header] 密钥不是有效 HTTP Header 值{ $facts }
+    [api_key_blank] API key 不能为空{ $facts }
+    [api_key_surrounding_whitespace] API key 不能带首尾空白{ $facts }
+    [api_key_invalid_header] API key 不是有效 HTTP Header 值{ $facts }
     [strict_json_invalid] JSON 必须严格有效{ $facts }
     [json_object_required] JSON 顶层必须是对象{ $facts }
     [reserved_request_field] JSON 包含 ATT 保留的请求字段{ $facts }
@@ -364,3 +364,112 @@ diagnostic-configuration-rule-value = { $code ->
     [referenced_client_not_found] 引用的 LLM Client 不存在{ $facts }
    *[other] { $fallback }
 }
+task-record-title = 翻译任务 { $ordinal } · { $state }
+task-record-state-label = { $state ->
+    [complete] 完成
+    [partial] 部分完成
+    [unavailable] 不可用
+    [execution_failed] 执行失败
+    [commit_preparation_failed] 提交准备失败
+    [commit_not_applied] 提交未应用
+    [commit_outcome_unknown] 提交结果未知
+    [not_committed_after_earlier_failure] 因前序失败未提交
+    [invalid_result] 执行结果序列无效
+    [cancelled] 已取消
+   *[other] { $state }
+}
+task-record-summary-with-written = `任务 { $ordinal }/{ $total }` · `尝试 { $attempts } 次` · `验收 { $accepted }/{ $expected }` · `写入 { $written } 处`
+task-record-summary-without-written = `任务 { $ordinal }/{ $total }` · `尝试 { $attempts } 次` · `验收 { $accepted }/{ $expected }`
+task-record-run-id-label = Run ID：
+task-record-started-at-label = 开始时间：
+task-record-duration-label = 总耗时：
+task-record-endpoint-label = Endpoint：
+task-record-model-label = Model：
+task-record-custom-parameters-heading = 自定义参数
+task-record-attempts-heading = 请求过程
+task-record-final-result-heading = 最终结果
+task-record-no-request = 没有形成可发送的模型请求。
+task-record-empty-assistant = 模型返回了空对象。
+task-record-parse-error = 解析错误：{ $kind ->
+    [json] 模型响应 JSON 无效（类别 `{ $category }`），第 { $line } 行、第 { $column } 列
+    [thinking_not_allowed] 当前响应模式不接受思考输出，第 { $line } 行、第 { $column } 列
+    [thinking_envelope_missing] 模型响应缺少规定的思考信封，第 { $line } 行、第 { $column } 列
+    [thinking_envelope_unclosed] 模型响应的思考信封没有闭合，第 { $line } 行、第 { $column } 列
+    [thinking_empty] 模型响应的思考内容为空，第 { $line } 行、第 { $column } 列
+    [thinking_nested] 模型响应包含嵌套的思考信封，第 { $line } 行、第 { $column } 列
+    [thinking_repeated] 模型响应包含重复的思考信封，第 { $line } 行、第 { $column } 列
+    [markdown_fence_no_body] Markdown 围栏没有正文，第 { $line } 行、第 { $column } 列
+    [markdown_fence_unsupported] 只接受无语言标记或 json 标记的单层 Markdown 围栏，第 { $line } 行、第 { $column } 列
+    [markdown_fence_unclosed] Markdown 围栏没有闭合，第 { $line } 行、第 { $column } 列
+   *[markdown_fence_invalid_closing] Markdown 围栏必须以最终独立行闭合，第 { $line } 行、第 { $column } 列
+}
+task-record-attempt-succeeded = 尝试 { $number }：成功；finish reason { $finish_reason }
+task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`
+task-record-attempt-duration = ；耗时 `{ $duration }`
+task-record-attempt-request-id = ；request ID { $request_id }
+task-record-attempt-response-id = ；response ID { $response_id }
+task-record-attempt-retryable = 尝试 { $number }：可重试请求失败；诊断 `{ $code }`；耗时 `{ $duration }`
+task-record-attempt-retry-after = ；Retry-After `{ $duration }`
+task-record-attempt-wait-retry = ；等待 `{ $duration }` 后重试
+task-record-attempt-wait-completed = ；等待 `{ $duration }` 已完成，下一次尝试未开始
+task-record-attempt-wait-cancelled = ；计划等待 `{ $duration }`，等待期间取消
+task-record-attempt-failed = 尝试 { $number }：请求或响应处理失败；诊断 `{ $code }`；耗时 `{ $duration }`
+task-record-attempt-cancelled = 尝试 { $number }：已取消；耗时 `{ $duration }`
+task-record-structured-reason = 原因：{ $reason }
+task-record-final-status = 状态：{ $state ->
+    [complete] 完成，已确认提交
+    [partial] 部分完成，已确认提交
+    [unavailable] 不可用，项目未改变
+    [execution_failed] 执行失败，未提交
+    [commit_preparation_failed] 提交准备失败，确定未应用
+    [commit_not_applied] 事务确定未应用
+    [commit_outcome_unknown] 提交结果未知
+    [not_committed_after_earlier_failure] 因前序任务失败而未提交
+    [invalid_result] Executor 结果序列无效，未提交
+    [cancelled] 已取消，未提交
+   *[other] { $state }
+}
+task-record-accepted-written = 已接受：{ $accepted } 项，写入 { $written } 个实际位置
+task-record-accepted-outcome-unknown = 已验收：{ $accepted } 项；数据库提交终态无法确认
+task-record-rejected-heading = 未接受：
+task-record-rejected-item = { $id }：{ $reason }
+task-record-protocol-diagnostic = 协议诊断：{ $diagnostic }
+task-record-unavailable-reason = 不可用原因：{ $reason }
+task-record-task-diagnostic = 任务诊断：`{ $code }`；原因 { $reason }
+task-record-rejection-reason = { $code ->
+    [missing] 缺少模型输出
+    [duplicate] 重复模型输出
+    [invalid_shape] { $detail }
+    [invalid_shape_array] 译文必须是字符串数组
+    [invalid_shape_item] 译文数组第 { $line } 项必须是字符串
+    [line_count_mismatch] 行数不匹配（预期 { $expected }，实际 { $actual }）
+    [invalid_line_text] 第 { $line } 行包含无效控制字符
+    [blank_line_mismatch] 第 { $line } 行空白状态不匹配（预期{ $expected_blank ->
+        [blank] 空白
+       *[other] 非空白
+    }）
+    [blank_translation] 译文为空
+    [no_natural_language_text] 译文没有自然语言文本
+    [contains_byte_order_mark] 译文包含 BOM
+    [placeholder_mismatch] 占位符不匹配：{ $detail }
+    [unexpected_placeholder] 出现未知占位符：{ $detail }
+    [placeholder_normalization_ambiguous] 占位符规范化存在歧义：{ $detail }
+    [source_residual] 检测到源语言残留：{ $detail }
+   *[other] { $detail }
+}
+task-record-protocol-detail = { $code ->
+    [non_stop_finish] finish reason 不是 stop：{ $detail }
+    [invalid_response] { $detail }
+    [invalid_id] 模型第 { $index } 个条目的 ID 非法
+    [unknown_id] 模型第 { $index } 个条目返回了未知 ID { $detail }
+   *[other] { $detail }
+}
+task-record-unavailable-detail = { $code ->
+    [model_response_unusable] 模型响应无法解析
+    [all_outputs_rejected] 所有模型输出均未通过验收
+    [recoverable_request_exhausted] 可恢复请求重试预算耗尽
+    [retry_after_exceeds_maximum] Retry-After 超过已配置最大等待时间
+   *[other] { $code }
+}
+task-record-duration-seconds = { $value } 秒
+task-record-duration-milliseconds = { $value } 毫秒

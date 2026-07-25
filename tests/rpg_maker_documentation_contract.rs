@@ -197,7 +197,7 @@ const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 9] = [
         "lua-complex-protocol.lua",
         "src/rpg_maker/lua/lua54.rs",
         "include_str!(\"../../../docs/rpg-maker/examples/lua-complex-protocol.lua\")",
-        "async fn documented_complex_protocol_executes_all_three_phases_with_private_sqlite_state()",
+        "async fn documented_complex_protocol_executes_all_three_phases_with_persisted_sqlite_state()",
     ),
 ];
 

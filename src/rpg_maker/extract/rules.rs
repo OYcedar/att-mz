@@ -1563,7 +1563,7 @@ path = '[].name'
 
     #[test]
     fn rules_projection_keeps_rule_and_path_without_matcher_free_text() {
-        let sensitive_parameter = json!("ORIGINAL_TEXT_AND_JSON_SECRET");
+        let ordinary_parameter = json!("ORIGINAL_TEXT_AND_JSON_BODY_SENTINEL");
         let error: RulesExtractionError<FakeError, FakeError, FakeError> =
             RulesExtractionError::InvalidTarget {
                 rules_path: PathBuf::from("rules/main.toml"),
@@ -1573,13 +1573,13 @@ path = '[].name'
                     "QuestPlugin".to_owned(),
                     "parameters",
                     "object",
-                    Some(&sensitive_parameter),
+                    Some(&ordinary_parameter),
                 ),
             };
         let diagnostic = error.safe_diagnostic();
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
 
-        assert!(!serialized.contains("ORIGINAL_TEXT_AND_JSON_SECRET"));
+        assert!(!serialized.contains("ORIGINAL_TEXT_AND_JSON_BODY_SENTINEL"));
         assert!(serialized.contains("extract.rules"));
         assert!(serialized.contains("rules/main.toml"));
         assert!(serialized.contains("rules_invalid_target"));
@@ -1655,7 +1655,7 @@ path = '[].name'
         assert!(build_cpu.contains("lock_cancelled"));
         assert!(build_cpu.contains("rules_operation=build_snapshot"));
 
-        let sensitive_parameter = json!("ORIGINAL_AND_JSON_SENTINEL");
+        let ordinary_parameter = json!("ORIGINAL_AND_JSON_BODY_SENTINEL");
         let target_error: TypedRulesError = RulesExtractionError::InvalidTarget {
             rules_path: rules_path.clone(),
             source: RulesMatchError::invalid_plugin_field(
@@ -1664,7 +1664,7 @@ path = '[].name'
                 "QuestPlugin".to_owned(),
                 "parameters",
                 "object",
-                Some(&sensitive_parameter),
+                Some(&ordinary_parameter),
             ),
         };
         let report = target_error.into_failure_report();
@@ -1672,7 +1672,7 @@ path = '[].name'
         let target = serde_json::to_string(report.primary.public()).expect("匹配诊断应可序列化");
         assert!(target.contains("rules_invalid_target"));
         assert!(target.contains("rule=7"));
-        assert!(!target.contains("ORIGINAL_AND_JSON_SENTINEL"));
+        assert!(!target.contains("ORIGINAL_AND_JSON_BODY_SENTINEL"));
 
         let snapshot_error: TypedRulesError = RulesExtractionError::InvalidSnapshot {
             rules_path,

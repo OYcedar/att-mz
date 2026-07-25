@@ -105,6 +105,9 @@ use crate::rpg_maker::translate::standard::{
     StandardTranslationLog, StandardTranslationLogEvent, StandardTranslationLogTaskOutcome,
     StandardTranslationService,
 };
+use crate::rpg_maker::translate::task_record::{
+    ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
+};
 use crate::rpg_maker::write_back::asset_reader::RpgMakerStandardWriteBackAssetReadingService;
 use crate::rpg_maker::write_back::lua::LuaWriteBackService;
 use crate::rpg_maker::write_back::publisher::StandardWriteBackPublishingService;
@@ -125,7 +128,6 @@ use crate::runtime::llm::{
     OpenAiChatCompletionClient, OpenAiChatCompletionError, OpenAiChatCompletionExecutor,
     OpenAiExecutorBuildError,
 };
-use crate::runtime::llm_call_log::LlmCallRecorder;
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
     ProjectLog, ProjectLogAmount, ProjectLogCode, ProjectLogContext, ProjectLogEvent,
@@ -433,15 +435,19 @@ impl CommandPanicBoundary {
                 RelatedFailurePreservedDuringPanic,
             ));
         }
-        if let Some(diagnostic) = context
-            .logger
-            .and_then(|logger| logger.take_warning())
-            .and_then(|warning| warning.diagnostic)
-        {
-            report = report.with_related(ReportedFailure::new(
-                diagnostic,
-                ProjectLogDegradedWhileReportingPanic,
-            ));
+        if let Some(warning) = context.logger.and_then(|logger| logger.take_warning()) {
+            if let Some(diagnostic) = warning.diagnostic {
+                report = report.with_related(ReportedFailure::new(
+                    diagnostic,
+                    ProjectLogDegradedWhileReportingPanic,
+                ));
+            }
+            for diagnostic in warning.related_diagnostics {
+                report = report.with_related(ReportedFailure::new(
+                    diagnostic,
+                    ProjectLogDegradedWhileReportingPanic,
+                ));
+            }
         }
         ProductionCommandError::Internal(Box::new(report))
     }
@@ -1568,8 +1574,9 @@ impl ProductionRpgMakerCommandRunner {
         let cancellation = CooperativeCancellation::default();
         let projects_root = command.common().projects_root().to_path_buf();
         let sqlite_configuration = command.common().sqlite().clone();
+        let file_system_configuration = command.common().filesystem().clone();
         let file_system = match SystemFileSystem::new_with_performance(
-            command.common().filesystem().clone(),
+            file_system_configuration.clone(),
             Arc::clone(&performance),
         )
         .map_err(ProductionCommandError::file_system_build)
@@ -1974,29 +1981,12 @@ impl ProductionRpgMakerCommandRunner {
                     return observed_construction_failure(project_log, error, shutdown).await;
                 }
             };
-        let call_recorder = command.record_calls().then(|| {
-            LlmCallRecorder::new(
-                project_workspace
-                    .workspace_root()
-                    .join("llm-calls")
-                    .join(project_log.run_id()),
-                project_log.run_id().to_owned(),
-                file_system.clone(),
-                project_log.logger.clone(),
-            )
-        });
         let llm = match OpenAiChatCompletionExecutor::new(
             command.llm().with_pem_roots(additional_pem_roots),
         )
         .map_err(ProductionCommandError::http_client_build)
         {
-            Ok(value) => {
-                if let Some(recorder) = call_recorder {
-                    value.with_call_recorder(recorder)
-                } else {
-                    value
-                }
-            }
+            Ok(value) => value,
             Err(error) => {
                 let mut shutdown = ShutdownFailures::default();
                 if let Some(selected) = lua.as_ref()
@@ -2039,6 +2029,37 @@ impl ProductionRpgMakerCommandRunner {
         let opener = PreopenedProject::new(opened_project);
         let business_log =
             ProductionBusinessLog::for_translation(&project_log, progress_observer.clone());
+        let (task_records, record_translation_tasks) = if command.record_translation_tasks() {
+            match SystemFileSystem::new_with_performance(
+                file_system_configuration,
+                Arc::clone(&performance),
+            ) {
+                Ok(observation_file_system) => (
+                    ConfiguredTranslationTaskRecordSink::Markdown(Box::new(
+                        MarkdownTranslationTaskRecordSink::new(
+                            project_workspace
+                                .workspace_root()
+                                .join("task-records")
+                                .join(project_log.run_id()),
+                            project_log.run_id().to_owned(),
+                            command.rpg_maker().client().record_metadata(),
+                            self.locale,
+                            observation_file_system,
+                            project_log.logger.clone(),
+                        ),
+                    )),
+                    true,
+                ),
+                Err(error) => {
+                    project_log
+                        .logger
+                        .record_observability_failure(error.safe_diagnostic());
+                    (ConfiguredTranslationTaskRecordSink::disabled(), false)
+                }
+            }
+        } else {
+            (ConfiguredTranslationTaskRecordSink::disabled(), false)
+        };
         let builder = ProductionSelectedTranslationExecutionBuilder {
             configuration: command.rpg_maker(),
             ui_locale: self.locale,
@@ -2048,6 +2069,8 @@ impl ProductionRpgMakerCommandRunner {
             llm: llm.clone(),
             lua: lua.clone(),
             log: business_log.clone(),
+            task_records: task_records.clone(),
+            record_translation_tasks,
             cancellation: cancellation.clone(),
         };
         let service = TranslateService::new(
@@ -2164,6 +2187,9 @@ impl ProductionRpgMakerCommandRunner {
         )
         .await;
         drop(project_lease_guard);
+        // 任务记录拥有独立的终态观察文件根；运行方案终态固定后才渲染、写入并关闭该根。
+        // 因此旁路慢写、故障或此时到达的信号都不能改变业务、取消或运行方案语义。
+        task_records.finish().await;
         progress.finish();
         let log_outcome = project_log_outcome(&execution, &shutdown);
         let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
@@ -4041,6 +4067,7 @@ type ProductionStandardTranslation = StandardTranslationService<
     ProductionTranslationExecutor,
     ProductionTranslationStore,
     ProductionBusinessLog,
+    ConfiguredTranslationTaskRecordSink,
 >;
 type ProductionLuaHost = TrustedLuaExecutionHostingService<
     SystemFileSystem,
@@ -4502,6 +4529,8 @@ struct ProductionSelectedTranslationExecutionBuilder<'a> {
     llm: OpenAiChatCompletionExecutor,
     lua: Option<ProductionLuaSelection>,
     log: ProductionBusinessLog,
+    task_records: ConfiguredTranslationTaskRecordSink,
+    record_translation_tasks: bool,
     cancellation: CooperativeCancellation,
 }
 
@@ -4633,7 +4662,8 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             TokioAsyncDelay,
             processor,
             self.cancellation.clone(),
-        );
+        )
+        .with_task_recording(self.record_translation_tasks);
         let result_store = RpgMakerStandardTranslationResultStorageService::new(
             self.sqlite.clone(),
             self.cpu.clone(),
@@ -4645,7 +4675,8 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             result_store,
             self.log.clone(),
             self.cancellation.clone(),
-        );
+        )
+        .with_task_record_sink(self.task_records.clone());
         let lua = self.lua.as_ref().map(|selected| {
             let host = TrustedLuaExecutionHostingService::with_llm(
                 self.file_system.clone(),
@@ -7737,7 +7768,7 @@ mod command_error_rendering_tests {
 
     #[tokio::test]
     async fn command_scope_panic_uses_the_same_safe_projection_for_cli_and_jsonl() {
-        const PRIVATE_PANIC_PAYLOAD: &str = "COMMAND_PANIC_PRIVATE_SENTINEL";
+        const PANIC_BODY: &str = "COMMAND_PANIC_BODY_SENTINEL";
         let directory = tempfile::tempdir().expect("临时日志目录应可建立");
         let project_workspace = directory.path().join("rpg_maker_mz").join("project");
         let logs_root = project_workspace.join("logs");
@@ -7780,7 +7811,7 @@ mod command_error_rendering_tests {
 
         let report = catch_command_panic(panic_boundary, async move {
             let _active = active;
-            std::panic::panic_any(Box::new(PRIVATE_PANIC_PAYLOAD));
+            std::panic::panic_any(Box::new(PANIC_BODY));
         })
         .await;
 
@@ -7807,10 +7838,10 @@ mod command_error_rendering_tests {
         assert!(plain.contains("extract"));
         assert!(plain.contains(&project_workspace.to_string_lossy().to_string()));
         assert!(plain.contains(&log_path.to_string_lossy().to_string()));
-        assert!(!stderr.contains(PRIVATE_PANIC_PAYLOAD));
+        assert!(!stderr.contains(PANIC_BODY));
 
         let raw = std::fs::read_to_string(&log_path).expect("panic 项目日志应可读取");
-        assert!(!raw.contains(PRIVATE_PANIC_PAYLOAD));
+        assert!(!raw.contains(PANIC_BODY));
         let records = raw
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("日志行应为 JSON"))
@@ -8068,10 +8099,10 @@ mod command_error_rendering_tests {
 
     #[test]
     fn project_database_sqlite_diagnostic_keeps_codes_path_stage_and_query_without_driver_text() {
-        const SQL_PARAMETER_SENTINEL: &str = "SECRET_SQL_AND_PARAMETER_TEXT";
+        const SQL_PARAMETER_BODY: &str = "SQL_AND_PARAMETER_BODY_SENTINEL";
         let driver = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
-            Some(SQL_PARAMETER_SENTINEL.to_owned()),
+            Some(SQL_PARAMETER_BODY.to_owned()),
         );
         let source = ProjectDatabaseReadError::ReadDatabase {
             path: PathBuf::from("C:/projects/demo/project.db"),
@@ -8105,8 +8136,8 @@ mod command_error_rendering_tests {
         assert!(serialized.contains("database_query_id=project_database.project_record"));
         assert!(rendered.contains("SQLite 主错误码 19"));
         assert!(rendered.contains("扩展错误码 2067"));
-        assert!(!serialized.contains(SQL_PARAMETER_SENTINEL));
-        assert!(!rendered.contains(SQL_PARAMETER_SENTINEL));
+        assert!(!serialized.contains(SQL_PARAMETER_BODY));
+        assert!(!rendered.contains(SQL_PARAMETER_BODY));
     }
 
     #[test]
@@ -8412,7 +8443,7 @@ mod command_error_rendering_tests {
                 assert!(output.contains("system.md"), "{name}: {output}");
                 assert!(
                     !output.contains("PROMPT_CONTENT_SENTINEL"),
-                    "{name} 泄露了 Prompt/source 正文：{output}"
+                    "{name} 不应复制 Prompt/source 正文：{output}"
                 );
             }
         }
@@ -8500,7 +8531,7 @@ mod command_error_rendering_tests {
     #[test]
     fn signal_failure_preserves_nested_user_repairable_category() {
         let error = ProductionCommandError::signal(
-            io::Error::other("SIGNAL_SECRET_SENTINEL"),
+            io::Error::other("SIGNAL_SOURCE_SENTINEL"),
             SignalOutcomeSource::CommandFailed(ProductionCommandError::configuration_or_input(
                 TestError("locale zh-Hans 的 system.md Prompt 资源缺失"),
             )),
@@ -8526,7 +8557,7 @@ mod command_error_rendering_tests {
         assert!(plain.contains("相关错误 1"));
         assert!(plain.contains("相关错误 2"));
         assert!(!stderr.contains("locale zh-Hans 的 system.md Prompt 资源缺失"));
-        assert!(!stderr.contains("SIGNAL_SECRET_SENTINEL"));
+        assert!(!stderr.contains("SIGNAL_SOURCE_SENTINEL"));
         assert!(!stderr.contains("SQL_PARAMETER_SENTINEL"));
     }
 
@@ -9047,7 +9078,7 @@ mod command_error_rendering_tests {
         assert!(plain.contains("相关错误 1"));
         assert!(rendered.contains("Lua Host 无法完成所有绑定资源的收尾"));
         for sentinel in ["LUA_VM_SENTINEL", "SQL_SENTINEL", "CLEANUP_SENTINEL"] {
-            assert!(!rendered.contains(sentinel), "泄露了 {sentinel}");
+            assert!(!rendered.contains(sentinel), "公开投影不应包含 {sentinel}");
         }
 
         let mapped = map_project_failure_report(report);
@@ -9142,7 +9173,7 @@ mod command_error_rendering_tests {
             "TRANSLATE_SQL_SENTINEL",
             "TRANSLATE_CLEANUP_SENTINEL",
         ] {
-            assert!(!rendered.contains(sentinel), "泄露了 {sentinel}");
+            assert!(!rendered.contains(sentinel), "公开投影不应包含 {sentinel}");
         }
     }
 
@@ -9215,7 +9246,7 @@ mod command_error_rendering_tests {
             "SQL_TEXT_SENTINEL",
             "PANIC_PAYLOAD_SENTINEL",
         ] {
-            assert!(!stderr.contains(sentinel), "泄露了 {sentinel}");
+            assert!(!stderr.contains(sentinel), "公开投影不应包含 {sentinel}");
         }
     }
 

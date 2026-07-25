@@ -944,7 +944,7 @@ impl InvalidProjectRunPlans {
                 row,
                 actual_utf8_bytes,
             } => format!(
-                "lua_program 第 {row} 行 phase 不在枚举 extract/translate/write_back 中；实际 TEXT 为 {actual_utf8_bytes} 字节，内容已隐藏"
+                "lua_program 第 {row} 行 phase 不在枚举 extract/translate/write_back 中；实际 TEXT 为 {actual_utf8_bytes} 字节，仅报告长度以保持诊断 schema 稳定并控制体积"
             ),
             InvalidProjectRunPlanReason::DuplicateLuaPhase { row, phase } => format!(
                 "lua_program 第 {row} 行重复 phase 枚举值 {}",

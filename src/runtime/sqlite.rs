@@ -4339,7 +4339,7 @@ mod tests {
     fn driver_diagnostic_exposes_primary_and_extended_codes_but_not_driver_text() {
         let source = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
-            Some("SQL_AND_PARAMETER_SECRET".to_owned()),
+            Some("SQL_AND_PARAMETER_BODY_SENTINEL".to_owned()),
         );
         let diagnostic = SqliteRuntimeError::Driver {
             operation: "execute_transaction",
@@ -4352,7 +4352,7 @@ mod tests {
         );
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
 
-        assert!(!serialized.contains("SQL_AND_PARAMETER_SECRET"));
+        assert!(!serialized.contains("SQL_AND_PARAMETER_BODY_SENTINEL"));
         assert!(serialized.contains("\"primary_code\":19"));
         assert!(serialized.contains("\"extended_code\":2067"));
         assert!(serialized.contains("execute_transaction"));

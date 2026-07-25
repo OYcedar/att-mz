@@ -198,3 +198,112 @@ diagnostic-io-kind-value = { $code ->
 diagnostic-configuration-rule-value = { $code ->
    *[other] { $fallback }{ $facts }
 }
+task-record-title = Задача перевода { $ordinal } · { $state }
+task-record-state-label = { $state ->
+    [complete] Завершена
+    [partial] Частично завершена
+    [unavailable] Недоступна
+    [execution_failed] Ошибка выполнения
+    [commit_preparation_failed] Ошибка подготовки фиксации
+    [commit_not_applied] Фиксация не применена
+    [commit_outcome_unknown] Результат фиксации неизвестен
+    [not_committed_after_earlier_failure] Не зафиксирована после предыдущей ошибки
+    [invalid_result] Недопустимая последовательность результатов Executor
+    [cancelled] Отменена
+   *[other] { $state }
+}
+task-record-summary-with-written = `Задача { $ordinal }/{ $total }` · `Попыток: { $attempts }` · `Принято { $accepted }/{ $expected }` · `Записано в { $written } позиций`
+task-record-summary-without-written = `Задача { $ordinal }/{ $total }` · `Попыток: { $attempts }` · `Принято { $accepted }/{ $expected }`
+task-record-run-id-label = ID запуска:
+task-record-started-at-label = Начало:
+task-record-duration-label = Общая длительность:
+task-record-endpoint-label = Endpoint:
+task-record-model-label = Модель:
+task-record-custom-parameters-heading = Пользовательские параметры
+task-record-attempts-heading = Попытки запроса
+task-record-final-result-heading = Итоговый результат
+task-record-no-request = Не сформирован запрос к модели, готовый к отправке.
+task-record-empty-assistant = Модель вернула пустой объект.
+task-record-parse-error = Ошибка разбора: { $kind ->
+    [json] недопустимый JSON ответа модели (категория `{ $category }`), строка { $line }, столбец { $column }
+    [thinking_not_allowed] этот режим ответа не принимает рассуждение, строка { $line }, столбец { $column }
+    [thinking_envelope_missing] отсутствует обязательная оболочка рассуждения, строка { $line }, столбец { $column }
+    [thinking_envelope_unclosed] оболочка рассуждения не закрыта, строка { $line }, столбец { $column }
+    [thinking_empty] содержимое рассуждения пусто, строка { $line }, столбец { $column }
+    [thinking_nested] обнаружена вложенная оболочка рассуждения, строка { $line }, столбец { $column }
+    [thinking_repeated] обнаружена повторная оболочка рассуждения, строка { $line }, столбец { $column }
+    [markdown_fence_no_body] блок Markdown не содержит тела, строка { $line }, столбец { $column }
+    [markdown_fence_unsupported] допускается только один блок Markdown без метки языка или с меткой json, строка { $line }, столбец { $column }
+    [markdown_fence_unclosed] блок Markdown не закрыт, строка { $line }, столбец { $column }
+   *[markdown_fence_invalid_closing] блок Markdown должен закрываться последней отдельной строкой, строка { $line }, столбец { $column }
+}
+task-record-attempt-succeeded = Попытка { $number }: успешно; finish reason { $finish_reason }
+task-record-attempt-token-usage = ; токены `{ $prompt } / { $completion } / { $total }`
+task-record-attempt-duration = ; длительность `{ $duration }`
+task-record-attempt-request-id = ; request ID { $request_id }
+task-record-attempt-response-id = ; response ID { $response_id }
+task-record-attempt-retryable = Попытка { $number }: повторяемая ошибка запроса; диагностика `{ $code }`; длительность `{ $duration }`
+task-record-attempt-retry-after = ; Retry-After `{ $duration }`
+task-record-attempt-wait-retry = ; повтор через `{ $duration }`
+task-record-attempt-wait-completed = ; ожидание `{ $duration }` завершено; следующая попытка не началась
+task-record-attempt-wait-cancelled = ; запланировано ожидание `{ $duration }`; отменено во время ожидания
+task-record-attempt-failed = Попытка { $number }: ошибка обработки запроса или ответа; диагностика `{ $code }`; длительность `{ $duration }`
+task-record-attempt-cancelled = Попытка { $number }: отменена; длительность `{ $duration }`
+task-record-structured-reason = Причина: { $reason }
+task-record-final-status = Состояние: { $state ->
+    [complete] завершена, фиксация подтверждена
+    [partial] частично завершена, фиксация подтверждена
+    [unavailable] недоступна, проект не изменён
+    [execution_failed] ошибка выполнения, без фиксации
+    [commit_preparation_failed] ошибка подготовки фиксации, точно не применена
+    [commit_not_applied] транзакция точно не применена
+    [commit_outcome_unknown] результат фиксации неизвестен
+    [not_committed_after_earlier_failure] не зафиксирована из-за ошибки предыдущей задачи
+    [invalid_result] недопустимая последовательность результатов Executor, без фиксации
+    [cancelled] отменена, без фиксации
+   *[other] { $state }
+}
+task-record-accepted-written = Принято: { $accepted } элементов, записано в { $written } фактических позиций
+task-record-accepted-outcome-unknown = Проверено: { $accepted } элементов; результат фиксации базы данных невозможно подтвердить
+task-record-rejected-heading = Не принято:
+task-record-rejected-item = { $id }: { $reason }
+task-record-protocol-diagnostic = Диагностика протокола: { $diagnostic }
+task-record-unavailable-reason = Причина недоступности: { $reason }
+task-record-task-diagnostic = Диагностика задачи: `{ $code }`; причина { $reason }
+task-record-rejection-reason = { $code ->
+    [missing] Отсутствует вывод модели
+    [duplicate] Повторяющийся вывод модели
+    [invalid_shape] { $detail }
+    [invalid_shape_array] Перевод должен быть массивом строк
+    [invalid_shape_item] Элемент { $line } массива перевода должен быть строкой
+    [line_count_mismatch] Число строк не совпадает (ожидалось { $expected }, получено { $actual })
+    [invalid_line_text] Строка { $line } содержит недопустимые управляющие символы
+    [blank_line_mismatch] Состояние пустоты строки { $line } не совпадает (ожидалось: { $expected_blank ->
+        [blank] пустая
+       *[other] непустая
+    })
+    [blank_translation] Перевод пуст
+    [no_natural_language_text] В переводе нет текста на естественном языке
+    [contains_byte_order_mark] Перевод содержит BOM
+    [placeholder_mismatch] Несовпадение заполнителя: { $detail }
+    [unexpected_placeholder] Неожиданный заполнитель: { $detail }
+    [placeholder_normalization_ambiguous] Неоднозначная нормализация заполнителя: { $detail }
+    [source_residual] Обнаружен остаток исходного языка: { $detail }
+   *[other] { $detail }
+}
+task-record-protocol-detail = { $code ->
+    [non_stop_finish] finish reason отличается от stop: { $detail }
+    [invalid_response] { $detail }
+    [invalid_id] Элемент модели { $index } имеет недопустимый ID
+    [unknown_id] Элемент модели { $index } вернул неизвестный ID { $detail }
+   *[other] { $detail }
+}
+task-record-unavailable-detail = { $code ->
+    [model_response_unusable] Ответ модели невозможно разобрать
+    [all_outputs_rejected] Все результаты модели отклонены при проверке
+    [recoverable_request_exhausted] Исчерпан бюджет повторов восстанавливаемых запросов
+    [retry_after_exceeds_maximum] Retry-After превышает настроенное максимальное ожидание
+   *[other] { $code }
+}
+task-record-duration-seconds = { $value } с
+task-record-duration-milliseconds = { $value } мс

@@ -97,6 +97,47 @@ static TEST_PUBLISH_FAULTS: OnceLock<Mutex<HashMap<PathBuf, TestPublishFaultQueu
 static TEST_CANCEL_CANDIDATE_COPY_AFTER_CHUNK: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TestObservationFaultPoint {
+    AfterPartialWrite,
+    BeforeRename,
+    BeforeCleanup,
+}
+
+#[cfg(test)]
+static TEST_OBSERVATION_FAULTS: OnceLock<
+    Mutex<HashMap<PathBuf, HashSet<TestObservationFaultPoint>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn register_test_observation_faults(
+    path: PathBuf,
+    faults: impl IntoIterator<Item = TestObservationFaultPoint>,
+) {
+    TEST_OBSERVATION_FAULTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("可观测性故障测试锁不应中毒")
+        .insert(path, faults.into_iter().collect());
+}
+
+#[cfg(test)]
+fn hit_test_observation_fault(path: &Path, point: TestObservationFaultPoint) -> bool {
+    let Some(faults) = TEST_OBSERVATION_FAULTS.get() else {
+        return false;
+    };
+    let mut faults = faults.lock().expect("可观测性故障测试锁不应中毒");
+    let Some(points) = faults.get_mut(path) else {
+        return false;
+    };
+    let hit = points.remove(&point);
+    if points.is_empty() {
+        faults.remove(path);
+    }
+    hit
+}
+
+#[cfg(test)]
 fn register_test_candidate_copy_cancellation(source: PathBuf) {
     TEST_CANCEL_CANDIDATE_COPY_AFTER_CHUNK
         .get_or_init(|| Mutex::new(HashSet::new()))
@@ -306,6 +347,11 @@ pub(crate) enum SystemFileSystemError {
         operation: Box<SystemFileSystemError>,
         rollback: Box<SystemFileSystemError>,
     },
+    ObservationCleanupFailed {
+        temporary_path: PathBuf,
+        operation: Box<SystemFileSystemError>,
+        cleanup: Box<SystemFileSystemError>,
+    },
     JournalCorrupt {
         path: PathBuf,
         reason: String,
@@ -371,6 +417,15 @@ impl fmt::Display for SystemFileSystemError {
                 "候选编辑 {} 失败（{operation}），且无法恢复原内容：{rollback}",
                 path.display()
             ),
+            Self::ObservationCleanupFailed {
+                temporary_path,
+                operation,
+                cleanup,
+            } => write!(
+                formatter,
+                "可观测性文件写入失败（{operation}），且无法清理临时文件 {}：{cleanup}",
+                temporary_path.display()
+            ),
             Self::JournalCorrupt { path, reason } => write!(
                 formatter,
                 "目录恢复 journal 损坏 {}：{reason}",
@@ -406,7 +461,8 @@ impl Error for SystemFileSystemError {
             Self::Io { source, .. } => Some(source),
             Self::Windows(source) => Some(source),
             Self::DirectChildRollbackFailed { operation, .. }
-            | Self::ScopedEditRollbackFailed { operation, .. } => Some(operation),
+            | Self::ScopedEditRollbackFailed { operation, .. }
+            | Self::ObservationCleanupFailed { operation, .. } => Some(operation),
             Self::Closed
             | Self::WorkerPanicked
             | Self::WindowsApiValueTooLarge { .. }
@@ -526,6 +582,13 @@ impl SystemFileSystemError {
                 DiagnosticAction::PreserveRecoveryArtifacts,
             )
             .with_recovery(RecoveryFact::path(path)),
+            Self::ObservationCleanupFailed {
+                temporary_path,
+                operation,
+                ..
+            } => operation
+                .safe_diagnostic(stage, impact, fallback_action)
+                .with_recovery(RecoveryFact::path(temporary_path)),
             Self::JournalCorrupt { path, reason } => SafeDiagnostic::new(
                 DiagnosticCode::FileSystemOperation,
                 stage,
@@ -606,6 +669,23 @@ impl SafeDiagnosticSource for SystemFileSystemError {
                         DiagnosticAction::PreserveRecoveryArtifacts,
                     )
                     .with_primary_recovery(RecoveryFact::path(path));
+                primary.with_related_report(related)
+            }
+            Self::ObservationCleanupFailed {
+                temporary_path,
+                operation,
+                cleanup,
+            } => {
+                let primary = (*operation)
+                    .into_failure_report(stage, impact, fallback_action)
+                    .with_primary_recovery(RecoveryFact::path(&temporary_path));
+                let related = (*cleanup)
+                    .into_failure_report(
+                        stage,
+                        DiagnosticImpact::Unchanged,
+                        DiagnosticAction::CheckPathAndPermissions,
+                    )
+                    .with_primary_recovery(RecoveryFact::path(temporary_path));
                 primary.with_related_report(related)
             }
             source => {
@@ -795,6 +875,33 @@ impl FileWorkPool {
         F: FnOnce() -> T + Send + 'static,
     {
         let admission = self.acquire_admission(operation, path).await?;
+        let (response_sender, response_receiver) = async_channel::bounded(1);
+        self.sender
+            .send(Box::new(move || {
+                let _admission = admission;
+                let result = work();
+                let _ = response_sender.send_blocking(result);
+            }))
+            .await
+            .map_err(|_| SystemFileSystemError::Closed)?;
+        response_receiver
+            .recv()
+            .await
+            .map_err(|_| SystemFileSystemError::WorkerPanicked)
+    }
+
+    /// 接收业务取消后仍需完成的终态可观测性工作。
+    ///
+    /// 该入口只绕过 `cancel_waits`，仍受同一个执行许可和 `shutdown` 的关闭边界约束。
+    async fn execute_terminal<T, F>(&self, work: F) -> Result<T, SystemFileSystemError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let admission = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| SystemFileSystemError::Closed)?;
         let (response_sender, response_receiver) = async_channel::bounded(1);
         self.sender
             .send(Box::new(move || {
@@ -1099,21 +1206,19 @@ impl SystemFileSystem {
         self.inner.pool.cancel_waits();
     }
 
-    /// 在既有文件 worker 上建立并一次性写入非权威可观测性文件。
+    /// 原子提交一份终态非权威可观测性文件。
     ///
-    /// 调用方负责提供不会被外部内容影响的文件名。目标已存在时失败，且本能力
-    /// 不执行耐久同步；失败语义由可观测性所有者决定。
-    pub(crate) async fn write_new_observation_file(
+    /// 内容先写入同目录临时文件，完成 `write_all`、`flush` 和关闭后再执行无覆盖
+    /// 重命名。该入口在业务取消后仍可接收工作；调用方必须在文件系统根
+    /// `shutdown` 前等待其完成。
+    pub(crate) async fn write_new_terminal_observation_file(
         &self,
         path: PathBuf,
         bytes: Vec<u8>,
     ) -> Result<(), SystemFileSystemError> {
-        let error_path = path.clone();
         self.inner
             .pool
-            .execute("write_new_observation_file", &error_path, move || {
-                write_new_observation_file_sync(&path, &bytes)
-            })
+            .execute_terminal(move || write_new_terminal_observation_file_sync(&path, &bytes))
             .await?
     }
 
@@ -1122,29 +1227,153 @@ impl SystemFileSystem {
     }
 }
 
-fn write_new_observation_file_sync(path: &Path, bytes: &[u8]) -> Result<(), SystemFileSystemError> {
+fn write_new_terminal_observation_file_sync(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), SystemFileSystemError> {
     let parent = path
         .parent()
         .ok_or_else(|| SystemFileSystemError::InvalidPath {
             path: path.to_path_buf(),
-            reason: "可观测性文件必须包含父目录",
+            reason: "终态可观测性文件必须包含父目录",
         })?;
     let file_name = path
         .file_name()
         .ok_or_else(|| SystemFileSystemError::InvalidPath {
             path: path.to_path_buf(),
-            reason: "可观测性文件必须包含文件名",
+            reason: "终态可观测性文件必须包含文件名",
         })?;
     let pinned_parent = create_directories_without_reparse(parent)?;
     let resolved_path = pinned_parent.resolved_path().join(file_name);
+    let temporary_id = secure_uuid_v4("生成可观测性临时文件名")?;
+    let mut temporary_name = OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(".");
+    temporary_name.push(temporary_id.as_hyphenated().to_string());
+    temporary_name.push(".tmp");
+    let temporary_path = pinned_parent.resolved_path().join(temporary_name);
+
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&resolved_path)
-        .map_err(|source| io_error("建立可观测性文件", &resolved_path, source))?;
-    file.write_all(bytes)
-        .and_then(|()| file.flush())
-        .map_err(|source| io_error("写入可观测性文件", &resolved_path, source))
+        .open(&temporary_path)
+        .map_err(|source| io_error("建立可观测性临时文件", &temporary_path, source))?;
+    let temporary_identity = match FileIdentity::of(&file, &temporary_path) {
+        Ok(identity) => identity,
+        Err(source) => {
+            drop(file);
+            let operation = SystemFileSystemError::from(source);
+            return match fs::remove_file(&temporary_path) {
+                Ok(()) => Err(operation),
+                Err(cleanup_source) => Err(SystemFileSystemError::ObservationCleanupFailed {
+                    temporary_path: temporary_path.clone(),
+                    operation: Box::new(operation),
+                    cleanup: Box::new(io_error(
+                        "清理可观测性临时文件",
+                        &temporary_path,
+                        cleanup_source,
+                    )),
+                }),
+            };
+        }
+    };
+
+    #[cfg(test)]
+    if hit_test_observation_fault(path, TestObservationFaultPoint::AfterPartialWrite) {
+        let partial_length = bytes.len().min(1);
+        if partial_length > 0
+            && let Err(source) = file.write_all(&bytes[..partial_length])
+        {
+            drop(file);
+            let operation = io_error("写入可观测性临时文件", &temporary_path, source);
+            return cleanup_failed_terminal_observation(
+                path,
+                &temporary_path,
+                temporary_identity,
+                operation,
+            );
+        }
+        drop(file);
+        let operation = io_error(
+            "写入可观测性临时文件",
+            &temporary_path,
+            io::Error::other("测试注入的部分写入故障"),
+        );
+        return cleanup_failed_terminal_observation(
+            path,
+            &temporary_path,
+            temporary_identity,
+            operation,
+        );
+    }
+
+    if let Err(source) = file.write_all(bytes).and_then(|()| file.flush()) {
+        drop(file);
+        let operation = io_error("写入可观测性临时文件", &temporary_path, source);
+        return cleanup_failed_terminal_observation(
+            path,
+            &temporary_path,
+            temporary_identity,
+            operation,
+        );
+    }
+    drop(file);
+
+    #[cfg(test)]
+    if hit_test_observation_fault(path, TestObservationFaultPoint::BeforeRename) {
+        let operation = io_error(
+            "提交可观测性文件",
+            &resolved_path,
+            io::Error::other("测试注入的重命名故障"),
+        );
+        return cleanup_failed_terminal_observation(
+            path,
+            &temporary_path,
+            temporary_identity,
+            operation,
+        );
+    }
+
+    match rename_without_replace_if_identity(&temporary_path, &resolved_path, temporary_identity) {
+        Ok(()) => Ok(()),
+        Err(source) => cleanup_failed_terminal_observation(
+            path,
+            &temporary_path,
+            temporary_identity,
+            source.into(),
+        ),
+    }
+}
+
+fn cleanup_failed_terminal_observation(
+    _requested_path: &Path,
+    temporary_path: &Path,
+    temporary_identity: FileIdentity,
+    operation: SystemFileSystemError,
+) -> Result<(), SystemFileSystemError> {
+    #[cfg(test)]
+    let cleanup =
+        if hit_test_observation_fault(_requested_path, TestObservationFaultPoint::BeforeCleanup) {
+            Err(io_error(
+                "清理可观测性临时文件",
+                temporary_path,
+                io::Error::other("测试注入的临时文件清理故障"),
+            ))
+        } else {
+            delete_regular_file_if_identity(temporary_path, temporary_identity).map_err(Into::into)
+        };
+    #[cfg(not(test))]
+    let cleanup =
+        delete_regular_file_if_identity(temporary_path, temporary_identity).map_err(Into::into);
+
+    match cleanup {
+        Ok(()) => Err(operation),
+        Err(cleanup) => Err(SystemFileSystemError::ObservationCleanupFailed {
+            temporary_path: temporary_path.to_path_buf(),
+            operation: Box::new(operation),
+            cleanup: Box::new(cleanup),
+        }),
+    }
 }
 
 /// 目录候选、受限编辑和可恢复发布组成的单一能力实例。
@@ -5286,6 +5515,165 @@ mod tests {
         pool.shutdown().await.expect("文件池应干净关闭");
     }
 
+    #[tokio::test]
+    async fn terminal_observation_commits_complete_content_without_overwrite() {
+        let directory = tempfile::tempdir().expect("应该可建立测试目录");
+        let target = directory.path().join("task-000001.md");
+        let file_system =
+            SystemFileSystem::new(SystemFileSystemConfig::fixed(1)).expect("应该可建立文件系统根");
+
+        file_system
+            .write_new_terminal_observation_file(target.clone(), b"complete document".to_vec())
+            .await
+            .expect("完整终态文档应该可原子提交");
+        assert_eq!(
+            fs::read(&target).expect("应该可读取终态文档"),
+            b"complete document"
+        );
+
+        let error = file_system
+            .write_new_terminal_observation_file(target.clone(), b"replacement".to_vec())
+            .await
+            .expect_err("终态文档不得覆盖既有目标");
+        assert!(matches!(
+            error,
+            SystemFileSystemError::Windows(WindowsFsError::RenameTargetExists { .. })
+        ));
+        assert_eq!(
+            fs::read(&target).expect("目标冲突后应该仍可读取原文档"),
+            b"complete document"
+        );
+        assert!(
+            observation_temporary_files(directory.path()).is_empty(),
+            "目标冲突后的临时文件必须清理"
+        );
+
+        file_system.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn terminal_observation_is_admitted_after_business_cancellation() {
+        let directory = tempfile::tempdir().expect("应该可建立测试目录");
+        let target = directory.path().join("task-000001.md");
+        let file_system =
+            SystemFileSystem::new(SystemFileSystemConfig::fixed(1)).expect("应该可建立文件系统根");
+
+        file_system.cancel_waits();
+        file_system
+            .write_new_terminal_observation_file(target.clone(), b"cancelled outcome".to_vec())
+            .await
+            .expect("业务取消后仍应接收已启动任务的终态文档");
+        assert_eq!(
+            fs::read(target).expect("应该可读取取消终态文档"),
+            b"cancelled outcome"
+        );
+
+        file_system.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn terminal_observation_partial_write_never_exposes_a_final_file() {
+        let directory = tempfile::tempdir().expect("应该可建立测试目录");
+        let target = directory.path().join("task-000001.md");
+        register_test_observation_faults(
+            target.clone(),
+            [TestObservationFaultPoint::AfterPartialWrite],
+        );
+        let file_system =
+            SystemFileSystem::new(SystemFileSystemConfig::fixed(1)).expect("应该可建立文件系统根");
+
+        let error = file_system
+            .write_new_terminal_observation_file(target.clone(), b"complete document".to_vec())
+            .await
+            .expect_err("部分写入故障必须可见");
+        assert!(matches!(error, SystemFileSystemError::Io { .. }));
+        assert!(!target.exists(), "部分内容不得出现在最终路径");
+        assert!(
+            observation_temporary_files(directory.path()).is_empty(),
+            "部分写入故障后的临时文件必须清理"
+        );
+
+        file_system.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn terminal_observation_rename_failure_removes_the_temporary_file() {
+        let directory = tempfile::tempdir().expect("应该可建立测试目录");
+        let target = directory.path().join("task-000001.md");
+        register_test_observation_faults(target.clone(), [TestObservationFaultPoint::BeforeRename]);
+        let file_system =
+            SystemFileSystem::new(SystemFileSystemConfig::fixed(1)).expect("应该可建立文件系统根");
+
+        let error = file_system
+            .write_new_terminal_observation_file(target.clone(), b"complete document".to_vec())
+            .await
+            .expect_err("重命名故障必须可见");
+        assert!(
+            error.to_string().contains("测试注入的重命名故障"),
+            "必须保留重命名主错误"
+        );
+        assert!(!target.exists(), "提交失败不得出现最终文件");
+        assert!(
+            observation_temporary_files(directory.path()).is_empty(),
+            "重命名失败后的临时文件必须清理"
+        );
+
+        file_system.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn terminal_observation_preserves_primary_and_cleanup_failures() {
+        let directory = tempfile::tempdir().expect("应该可建立测试目录");
+        let target = directory.path().join("task-000001.md");
+        register_test_observation_faults(
+            target.clone(),
+            [
+                TestObservationFaultPoint::BeforeRename,
+                TestObservationFaultPoint::BeforeCleanup,
+            ],
+        );
+        let file_system =
+            SystemFileSystem::new(SystemFileSystemConfig::fixed(1)).expect("应该可建立文件系统根");
+
+        let error = file_system
+            .write_new_terminal_observation_file(target.clone(), b"complete document".to_vec())
+            .await
+            .expect_err("提交与清理的组合故障必须可见");
+        let SystemFileSystemError::ObservationCleanupFailed {
+            temporary_path,
+            operation,
+            cleanup,
+        } = error
+        else {
+            panic!("应该同时保留主错误与清理错误");
+        };
+        assert!(
+            operation.to_string().contains("测试注入的重命名故障"),
+            "主错误必须保留"
+        );
+        assert!(
+            cleanup.to_string().contains("测试注入的临时文件清理故障"),
+            "清理错误必须保留"
+        );
+        assert!(!target.exists(), "提交失败不得出现最终文件");
+        assert!(temporary_path.exists(), "清理失败的临时产物必须可定位");
+        fs::remove_file(temporary_path).expect("测试应该可清理注入故障留下的临时文件");
+
+        file_system.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    fn observation_temporary_files(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .expect("应该可列举测试目录")
+            .map(|entry| entry.expect("测试目录项应该可读取").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(".task-") && name.ends_with(".tmp"))
+            })
+            .collect()
+    }
+
     #[derive(Clone)]
     struct TestDirectoryPublisher {
         file_system: SystemFileSystem,
@@ -6578,7 +6966,7 @@ mod tests {
             b"image"
         );
         assert!(matches!(
-            root.read_scoped_file(&scope, scoped_path("private/catalog.json"))
+            root.read_scoped_file(&scope, scoped_path("other/catalog.json"))
                 .await,
             Err(ScopedDirectoryEditError::OutsideScope { .. })
         ));

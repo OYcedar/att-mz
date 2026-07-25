@@ -6,9 +6,6 @@ root = "prompts"
 locale = "auto"
 thinking_output = false
 
-[llm]
-record_calls = false
-
 [llm.clients.primary]
 url = "https://api.example.com/v1/chat/completions"
 api_key = "replace-with-api-key"
@@ -41,6 +38,9 @@ ignored_terms = []
 minimum_copied_word_count = 2
 minimum_copied_letter_count = 4
 allowed_terms = []
+
+[rpg_maker]
+record_translation_tasks = false
 
 [[rpg_maker.translation_profiles]]
 id = "primary"

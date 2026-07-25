@@ -357,8 +357,8 @@ mod tests {
         }
     }
 
-    const STORE_SECRET_SENTINEL: &str =
-        "api-key=store-secret; prompt=private; lua=return-private; sql=DELETE-private";
+    const STORE_SOURCE_SENTINEL: &str =
+        "store-source; prompt=ordinary; lua=return-ordinary; sql=DELETE-ordinary";
 
     #[derive(Clone, Debug)]
     struct TypedStoreError {
@@ -367,7 +367,7 @@ mod tests {
 
     impl fmt::Display for TypedStoreError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str(STORE_SECRET_SENTINEL)
+            formatter.write_str(STORE_SOURCE_SENTINEL)
         }
     }
 
@@ -430,7 +430,7 @@ mod tests {
 
     impl fmt::Display for TypedClaimConflictEvidence {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str(STORE_SECRET_SENTINEL)
+            formatter.write_str(STORE_SOURCE_SENTINEL)
         }
     }
 
@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn store_snapshot_forwards_typed_report_and_never_renders_sensitive_source_text() {
+    fn store_snapshot_forwards_typed_report_without_copying_untyped_source_text() {
         type Error = LuaExtractionError<
             TrustedLuaExecutionHostingError<FakeError, FakeError>,
             TypedStoreError,
@@ -574,7 +574,7 @@ mod tests {
         assert!(serialized.contains("\"stage\":\"extract\""));
         assert!(serialized.contains("outcome_unknown"));
         assert!(serialized.contains("owner=lua"));
-        assert!(!serialized.contains(STORE_SECRET_SENTINEL));
+        assert!(!serialized.contains(STORE_SOURCE_SENTINEL));
 
         let report = Error::StoreSnapshot(TypedStoreError { database_path }).into_failure_report();
         let public = report
@@ -588,7 +588,7 @@ mod tests {
         assert!(public.contains("current_owner=builtin"));
         assert!(public.contains("owner=lua"));
         assert!(public.contains("outcome_unknown"));
-        assert!(!public.contains(STORE_SECRET_SENTINEL));
+        assert!(!public.contains(STORE_SOURCE_SENTINEL));
     }
 
     #[tokio::test]

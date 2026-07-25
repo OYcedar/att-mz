@@ -11,10 +11,11 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use time::OffsetDateTime;
 
 use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
@@ -46,6 +47,13 @@ use super::standard::{
     StandardTranslationTaskIndex, TranslationPatch, TranslationProtocolDiagnostic,
     TranslationTaskBlock, TranslationTaskOutcome, TranslationTaskOutcomeContext,
     TranslationTaskUnavailableReason, TranslationUnitRejectionReason, UnresolvedTranslationUnit,
+};
+use super::task_record::{
+    TranslationAssistantEntry, TranslationAssistantValueError, TranslationTaskAttemptRecord,
+    TranslationTaskExecution, TranslationTaskExecutionEvidence, TranslationTaskExecutionFailure,
+    TranslationTaskResponseJsonErrorCategory, TranslationTaskResponseParseError,
+    TranslationTaskResponseParseErrorKind, TranslationTaskResponseRecord,
+    TranslationTaskRetryWaitRecord,
 };
 
 /// 一次最终成功 HTTP 响应中可安全进入任务结果与持久日志的元数据。
@@ -535,6 +543,66 @@ pub(crate) trait TranslationTaskResponseProcessor: Send + Sync {
         response: LlmResponse,
         attempt: usize,
     ) -> impl Future<Output = Result<TranslationTaskOutcome, Self::Error>> + Send;
+
+    fn process_recorded(
+        &self,
+        task: &TranslationTaskBlock,
+        response: LlmResponse,
+        attempt: usize,
+    ) -> impl Future<
+        Output = Result<
+            ProcessedTranslationTaskResponse,
+            RecordedTranslationTaskResponseFailure<Self::Error>,
+        >,
+    > + Send;
+
+    fn task_record_diagnostic(&self, _error: &Self::Error) -> Option<SafeDiagnostic> {
+        None
+    }
+
+    /// 错误是否明确来自响应处理等待 CPU 入场时的合作取消。
+    ///
+    /// Executor 还会同时检查本次翻译的取消令牌，避免把独立 CPU 根关闭误报为取消。
+    fn is_cancelled_wait(&self, _error: &Self::Error) -> bool {
+        false
+    }
+}
+
+/// 业务验收与任务记录共同消费的单次解析结果。
+#[derive(Debug)]
+pub(crate) struct ProcessedTranslationTaskResponse {
+    outcome: TranslationTaskOutcome,
+    record: Option<TranslationTaskResponseRecord>,
+}
+
+impl ProcessedTranslationTaskResponse {
+    fn new(outcome: TranslationTaskOutcome, record: Option<TranslationTaskResponseRecord>) -> Self {
+        Self { outcome, record }
+    }
+
+    fn into_parts(self) -> (TranslationTaskOutcome, TranslationTaskResponseRecord) {
+        (
+            self.outcome,
+            self.record.expect("recorded 响应处理必须建立任务记录投影"),
+        )
+    }
+}
+
+/// 已开启任务记录时，响应处理技术失败及其已建立的 Assistant 投影。
+#[derive(Debug)]
+pub(crate) struct RecordedTranslationTaskResponseFailure<E> {
+    source: E,
+    response: TranslationTaskResponseRecord,
+}
+
+impl<E> RecordedTranslationTaskResponseFailure<E> {
+    fn new(source: E, response: TranslationTaskResponseRecord) -> Self {
+        Self { source, response }
+    }
+
+    fn into_parts(self) -> (E, TranslationTaskResponseRecord) {
+        (self.source, self.response)
+    }
 }
 
 /// 使用 CPU 根完成有限 JSON 清洗、严格协议校验与译后处理。
@@ -549,18 +617,17 @@ impl<C> TranslationTaskResponseProcessingService<C> {
     }
 }
 
-impl<C> TranslationTaskResponseProcessor for TranslationTaskResponseProcessingService<C>
+impl<C> TranslationTaskResponseProcessingService<C>
 where
     C: CpuTaskExecutor,
 {
-    type Error = TranslationTaskResponseProcessingError<C::Error>;
-
-    async fn process(
+    async fn process_with_recording(
         &self,
         task: &TranslationTaskBlock,
         response: LlmResponse,
         attempt: usize,
-    ) -> Result<TranslationTaskOutcome, Self::Error> {
+    ) -> Result<ProcessedTranslationTaskResponse, TranslationTaskResponseProcessingError<C::Error>>
+    {
         let Some(attempt) = NonZeroUsize::new(attempt) else {
             return Err(TranslationTaskResponseProcessingError::InternalInvariant {
                 invariant: TranslationInternalInvariant::ResponseAttemptZero {
@@ -577,23 +644,168 @@ where
         let resources = Arc::clone(&self.resources);
         let outcome = self
             .cpu
-            .execute(move || process_response(input, response, resources.as_ref()))
+            .execute(move || process_response(input, response, resources.as_ref(), false))
             .await
             .map_err(TranslationTaskResponseProcessingError::ScheduleCompute)?;
-        outcome.map_err(|error| match error {
-            TranslationResponseTechnicalError::LanguageModule(source) => {
-                TranslationTaskResponseProcessingError::LanguageModule(source)
-            }
-            TranslationResponseTechnicalError::LanguageProjection(source) => {
-                TranslationTaskResponseProcessingError::LanguageProjection(source)
-            }
-            TranslationResponseTechnicalError::LanguageRepair(source) => {
-                TranslationTaskResponseProcessingError::LanguageRepair(source)
-            }
-            TranslationResponseTechnicalError::InternalInvariant { invariant } => {
-                TranslationTaskResponseProcessingError::InternalInvariant { invariant }
-            }
+        outcome.map_err(|failure| {
+            let (source, _) = failure.into_parts();
+            map_response_processing_error(source)
         })
+    }
+}
+
+impl<C> TranslationTaskResponseProcessor for TranslationTaskResponseProcessingService<C>
+where
+    C: CpuTaskExecutor,
+{
+    type Error = TranslationTaskResponseProcessingError<C::Error>;
+
+    async fn process(
+        &self,
+        task: &TranslationTaskBlock,
+        response: LlmResponse,
+        attempt: usize,
+    ) -> Result<TranslationTaskOutcome, Self::Error> {
+        self.process_with_recording(task, response, attempt)
+            .await
+            .map(|processed| processed.outcome)
+    }
+
+    async fn process_recorded(
+        &self,
+        task: &TranslationTaskBlock,
+        response: LlmResponse,
+        attempt: usize,
+    ) -> Result<ProcessedTranslationTaskResponse, RecordedTranslationTaskResponseFailure<Self::Error>>
+    {
+        let raw_assistant = response.content().to_owned();
+        let Some(attempt) = NonZeroUsize::new(attempt) else {
+            return Err(RecordedTranslationTaskResponseFailure::new(
+                TranslationTaskResponseProcessingError::InternalInvariant {
+                    invariant: TranslationInternalInvariant::ResponseAttemptZero {
+                        task_index: task.index(),
+                    },
+                },
+                TranslationTaskResponseRecord::unprocessed(raw_assistant),
+            ));
+        };
+        let input = ResponseProcessingInput {
+            task_index: task.index(),
+            language_pair: task.language_pair().clone(),
+            expected_outputs: task.expected_outputs().to_vec(),
+            attempt,
+        };
+        let resources = Arc::clone(&self.resources);
+        match self
+            .cpu
+            .execute(move || process_response(input, response, resources.as_ref(), true))
+            .await
+        {
+            Err(source) => Err(RecordedTranslationTaskResponseFailure::new(
+                TranslationTaskResponseProcessingError::ScheduleCompute(source),
+                TranslationTaskResponseRecord::unprocessed(raw_assistant),
+            )),
+            Ok(Err(failure)) => {
+                let (source, response) = failure.into_parts();
+                Err(RecordedTranslationTaskResponseFailure::new(
+                    map_response_processing_error(source),
+                    response.expect("recorded 响应闭包的技术失败必须保留 Assistant 投影"),
+                ))
+            }
+            Ok(Ok(processed)) => Ok(processed),
+        }
+    }
+
+    fn task_record_diagnostic(&self, error: &Self::Error) -> Option<SafeDiagnostic> {
+        Some(response_processing_task_record_diagnostic(error))
+    }
+
+    fn is_cancelled_wait(&self, error: &Self::Error) -> bool {
+        matches!(
+            error,
+            TranslationTaskResponseProcessingError::ScheduleCompute(
+                CpuTaskExecutionError::Cancelled
+            )
+        )
+    }
+}
+
+fn response_processing_task_record_diagnostic<C>(
+    error: &TranslationTaskResponseProcessingError<C>,
+) -> SafeDiagnostic {
+    match error {
+        TranslationTaskResponseProcessingError::ScheduleCompute(source) => {
+            let failure = match source {
+                CpuTaskExecutionError::Cancelled => DiagnosticFailureKind::LockCancelled,
+                CpuTaskExecutionError::Unavailable(_) => DiagnosticFailureKind::ExecutorClosed,
+                CpuTaskExecutionError::TaskPanicked => DiagnosticFailureKind::WorkerPanicked,
+            };
+            SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                DiagnosticStage::Translate,
+                DiagnosticSubject::component("translation_response_cpu_task"),
+                DiagnosticReason::failure(failure),
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::ReportBug,
+            )
+        }
+        TranslationTaskResponseProcessingError::LanguageProjection(source) => SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::Translate,
+            DiagnosticSubject::component("translation_response_placeholder_projection"),
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InternalInvariant,
+                language_projection_detail(source),
+            ),
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::ReportBug,
+        ),
+        TranslationTaskResponseProcessingError::LanguageModule(source) => SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::Translate,
+            DiagnosticSubject::component("translation_response_language_analysis"),
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InternalInvariant,
+                source.safe_diagnostic_detail(),
+            ),
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::ReportBug,
+        ),
+        TranslationTaskResponseProcessingError::LanguageRepair(source) => SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::Translate,
+            DiagnosticSubject::component("translation_response_language_repair"),
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InternalInvariant,
+                language_repair_detail(source),
+            ),
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::ReportBug,
+        ),
+        TranslationTaskResponseProcessingError::InternalInvariant { invariant } => invariant
+            .safe_diagnostic(
+                DiagnosticStage::Translate,
+                DiagnosticImpact::ProgressPreserved,
+            ),
+    }
+}
+
+fn map_response_processing_error<C>(
+    error: TranslationResponseTechnicalError,
+) -> TranslationTaskResponseProcessingError<C> {
+    match error {
+        TranslationResponseTechnicalError::LanguageModule(source) => {
+            TranslationTaskResponseProcessingError::LanguageModule(source)
+        }
+        TranslationResponseTechnicalError::LanguageProjection(source) => {
+            TranslationTaskResponseProcessingError::LanguageProjection(source)
+        }
+        TranslationResponseTechnicalError::LanguageRepair(source) => {
+            TranslationTaskResponseProcessingError::LanguageRepair(source)
+        }
+        TranslationResponseTechnicalError::InternalInvariant { invariant } => {
+            TranslationTaskResponseProcessingError::InternalInvariant { invariant }
+        }
     }
 }
 
@@ -777,12 +989,98 @@ enum TranslationResponseTechnicalError {
     },
 }
 
+struct TranslationResponseTechnicalFailure {
+    source: Box<TranslationResponseTechnicalError>,
+    response: Option<Box<TranslationTaskResponseRecord>>,
+}
+
+impl TranslationResponseTechnicalFailure {
+    fn new(
+        source: TranslationResponseTechnicalError,
+        response: Option<TranslationTaskResponseRecord>,
+    ) -> Self {
+        Self {
+            source: Box::new(source),
+            response: response.map(Box::new),
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        TranslationResponseTechnicalError,
+        Option<TranslationTaskResponseRecord>,
+    ) {
+        (*self.source, self.response.map(|response| *response))
+    }
+}
+
+struct TranslationTaskEvidenceBuilder {
+    started_at: Option<OffsetDateTime>,
+    task_started: Option<Instant>,
+    attempt_count: usize,
+    attempts: Vec<TranslationTaskAttemptRecord>,
+}
+
+impl TranslationTaskEvidenceBuilder {
+    fn new(recording: bool) -> Self {
+        Self {
+            started_at: recording.then(OffsetDateTime::now_utc),
+            task_started: recording.then(Instant::now),
+            attempt_count: 0,
+            attempts: Vec::new(),
+        }
+    }
+
+    const fn recording(&self) -> bool {
+        self.task_started.is_some()
+    }
+
+    fn begin_attempt(&mut self, attempt: NonZeroUsize) {
+        self.attempt_count = self.attempt_count.max(attempt.get());
+    }
+
+    fn record(&mut self, build: impl FnOnce() -> TranslationTaskAttemptRecord) {
+        if self.recording() {
+            self.attempts.push(build());
+        }
+    }
+
+    fn push(&mut self, record: Option<TranslationTaskAttemptRecord>) {
+        if let Some(record) = record {
+            self.attempts.push(record);
+        }
+    }
+
+    fn attempt_started(&self) -> Option<Instant> {
+        self.recording().then(Instant::now)
+    }
+
+    fn attempt_duration(started: Option<Instant>) -> Duration {
+        started.map_or(Duration::ZERO, |started| started.elapsed())
+    }
+
+    fn finish(
+        self,
+        response: Option<TranslationTaskResponseRecord>,
+    ) -> TranslationTaskExecutionEvidence {
+        TranslationTaskExecutionEvidence::from_execution(
+            self.started_at,
+            self.task_started,
+            self.attempt_count,
+            self.attempts,
+            response,
+        )
+    }
+}
+
 /// 使用根 LLM、根 Delay 和真实 ResponseProcessor 执行一个 TaskBlock。
 pub(crate) struct RpgMakerStandardTranslationTaskExecutionService<L, D, R, P> {
     llm: L,
     delay: D,
     response_processor: R,
     cancellation: CooperativeCancellation,
+    record_task_response: bool,
     profile: PhantomData<fn() -> P>,
 }
 
@@ -798,8 +1096,15 @@ impl<L, D, R, P> RpgMakerStandardTranslationTaskExecutionService<L, D, R, P> {
             delay,
             response_processor,
             cancellation,
+            record_task_response: true,
             profile: PhantomData,
         }
+    }
+
+    /// 关闭高级任务记录时跳过原始 Assistant 与逐条 JSON 的旁路复制。
+    pub(crate) fn with_task_recording(mut self, enabled: bool) -> Self {
+        self.record_task_response = enabled;
+        self
     }
 }
 
@@ -818,28 +1123,51 @@ where
     async fn execute(
         &self,
         profile: &Self::Profile,
-        task: TranslationTaskBlock,
-    ) -> Result<TranslationTaskOutcome, Self::Error> {
+        task: &TranslationTaskBlock,
+    ) -> Result<TranslationTaskExecution, TranslationTaskExecutionFailure<Self::Error>> {
+        let mut evidence = TranslationTaskEvidenceBuilder::new(self.record_task_response);
         if task.expected_outputs().is_empty() {
-            return Err(
-                RpgMakerStandardTranslationTaskExecutionError::InternalInvariant {
-                    invariant: TranslationInternalInvariant::ExpectedOutputsEmpty {
-                        task_index: task.index(),
-                    },
-                },
-            );
+            let invariant = TranslationInternalInvariant::ExpectedOutputsEmpty {
+                task_index: task.index(),
+            };
+            let diagnostic =
+                invariant.safe_diagnostic(DiagnosticStage::Translate, DiagnosticImpact::Unchanged);
+            return Err(TranslationTaskExecutionFailure::new(
+                RpgMakerStandardTranslationTaskExecutionError::InternalInvariant { invariant },
+                evidence.finish(None),
+                Some(diagnostic),
+                false,
+            ));
         }
         let mut attempt = NonZeroUsize::MIN;
         let mut retry_delays = profile.network_retry_delays().iter().copied();
+        let mut completed_retry_wait = None;
 
         loop {
             if self.cancellation.is_requested() {
-                return Err(
+                if completed_retry_wait.is_some() {
+                    evidence.push(completed_retry_wait.take());
+                } else {
+                    evidence.begin_attempt(attempt);
+                    evidence.record(|| {
+                        TranslationTaskAttemptRecord::cancelled(attempt, Duration::ZERO)
+                    });
+                }
+                return Err(TranslationTaskExecutionFailure::new(
                     RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled {
                         attempt: attempt.get(),
                     },
-                );
+                    evidence.finish(None),
+                    None,
+                    true,
+                ));
             }
+            if let Some(mut completed_retry_wait) = completed_retry_wait.take() {
+                completed_retry_wait.mark_retry_started();
+                evidence.push(Some(completed_retry_wait));
+            }
+            evidence.begin_attempt(attempt);
+            let attempt_started = evidence.attempt_started();
             let response = match self
                 .llm
                 .request(profile.llm_client(), task.messages())
@@ -847,24 +1175,73 @@ where
             {
                 Ok(response) => response,
                 Err(LlmRequestError::Fatal(source)) => {
-                    return Err(
+                    let cancelled = self.cancellation.is_requested() && source.is_cancelled_wait();
+                    let diagnostic = (!cancelled).then(|| {
+                        source.request_diagnostic(None, DiagnosticImpact::ProgressPreserved)
+                    });
+                    if let Some(diagnostic) = &diagnostic {
+                        evidence.record(|| {
+                            TranslationTaskAttemptRecord::failed(
+                                attempt,
+                                TranslationTaskEvidenceBuilder::attempt_duration(attempt_started),
+                                diagnostic.clone(),
+                            )
+                        });
+                    } else {
+                        evidence.record(|| {
+                            TranslationTaskAttemptRecord::cancelled(
+                                attempt,
+                                TranslationTaskEvidenceBuilder::attempt_duration(attempt_started),
+                            )
+                        });
+                    }
+                    return Err(TranslationTaskExecutionFailure::new(
                         RpgMakerStandardTranslationTaskExecutionError::FatalRequest {
                             attempt: attempt.get(),
                             source,
                         },
-                    );
+                        evidence.finish(None),
+                        diagnostic,
+                        cancelled,
+                    ));
                 }
                 Err(LlmRequestError::Retryable {
                     source,
                     retry_after,
                 }) => {
+                    if self.cancellation.is_requested() && source.is_cancelled_wait() {
+                        evidence.record(|| {
+                            TranslationTaskAttemptRecord::cancelled(
+                                attempt,
+                                TranslationTaskEvidenceBuilder::attempt_duration(attempt_started),
+                            )
+                        });
+                        return Err(TranslationTaskExecutionFailure::new(
+                            RpgMakerStandardTranslationTaskExecutionError::FatalRequest {
+                                attempt: attempt.get(),
+                                source,
+                            },
+                            evidence.finish(None),
+                            None,
+                            true,
+                        ));
+                    }
                     let diagnostic =
                         source.request_diagnostic(retry_after, DiagnosticImpact::ProgressPreserved);
                     if let Some(retry_after) = retry_after
                         && retry_after > profile.max_network_retry_after()
                     {
-                        return Ok(unavailable_after_request_failure(
-                            &task,
+                        evidence.record(|| {
+                            TranslationTaskAttemptRecord::retryable(
+                                attempt,
+                                TranslationTaskEvidenceBuilder::attempt_duration(attempt_started),
+                                diagnostic.clone(),
+                                Some(retry_after),
+                                None,
+                            )
+                        });
+                        let outcome = unavailable_after_request_failure(
+                            task,
                             attempt,
                             TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
                                 retry_after,
@@ -876,18 +1253,38 @@ where
                                     ),
                                 )),
                             },
+                        );
+                        return Ok(TranslationTaskExecution::new(
+                            outcome,
+                            evidence.finish(None),
                         ));
                     }
                     let Some(configured_delay) = retry_delays.next() else {
-                        return Ok(unavailable_after_request_failure(
-                            &task,
+                        evidence.record(|| {
+                            TranslationTaskAttemptRecord::retryable(
+                                attempt,
+                                TranslationTaskEvidenceBuilder::attempt_duration(attempt_started),
+                                diagnostic.clone(),
+                                retry_after,
+                                None,
+                            )
+                        });
+                        let outcome = unavailable_after_request_failure(
+                            task,
                             attempt,
                             TranslationTaskUnavailableReason::RecoverableRequestExhausted {
                                 diagnostic,
                             },
+                        );
+                        return Ok(TranslationTaskExecution::new(
+                            outcome,
+                            evidence.finish(None),
                         ));
                     };
                     let delay = configured_delay.max(retry_after.unwrap_or_default());
+                    let attempt_duration =
+                        TranslationTaskEvidenceBuilder::attempt_duration(attempt_started);
+                    let mut diagnostic = Some(diagnostic);
                     let waiting = self.delay.wait(delay);
                     tokio::pin!(waiting);
                     let cancelled = self.cancellation.cancelled();
@@ -895,36 +1292,153 @@ where
                     tokio::select! {
                         biased;
                         () = &mut cancelled => {
-                            return Err(
+                            evidence.record(|| {
+                                TranslationTaskAttemptRecord::retryable(
+                                    attempt,
+                                    attempt_duration,
+                                    diagnostic.take().expect("可重试诊断必须只移动一次"),
+                                    retry_after,
+                                    Some(TranslationTaskRetryWaitRecord::CancelledWhileWaiting {
+                                        planned_duration: delay,
+                                    }),
+                                )
+                            });
+                            return Err(TranslationTaskExecutionFailure::new(
                                 RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled {
                                     attempt: attempt.get(),
                                 },
-                            );
+                                evidence.finish(None),
+                                None,
+                                true,
+                            ));
                         }
-                        () = &mut waiting => {}
+                        () = &mut waiting => {
+                            completed_retry_wait = evidence.recording().then(|| {
+                                TranslationTaskAttemptRecord::retryable(
+                                    attempt,
+                                    attempt_duration,
+                                    diagnostic.take().expect("可重试诊断必须只移动一次"),
+                                    retry_after,
+                                    Some(
+                                        TranslationTaskRetryWaitRecord::CompletedBeforeNextAttempt {
+                                            duration: delay,
+                                        },
+                                    ),
+                                )
+                            });
+                        }
                     }
                     if self.cancellation.is_requested() {
-                        return Err(
+                        evidence.push(completed_retry_wait.take());
+                        return Err(TranslationTaskExecutionFailure::new(
                             RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled {
                                 attempt: attempt.get(),
                             },
-                        );
+                            evidence.finish(None),
+                            None,
+                            true,
+                        ));
                     }
                     attempt = attempt.saturating_add(1);
                     continue;
                 }
             };
 
-            return self
-                .response_processor
-                .process(&task, response, attempt.get())
-                .await
-                .map_err(|source| {
-                    RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
-                        attempt: attempt.get(),
-                        source,
+            evidence.record(|| {
+                TranslationTaskAttemptRecord::succeeded(
+                    attempt,
+                    TranslationTaskEvidenceBuilder::attempt_duration(attempt_started),
+                    &response,
+                )
+            });
+            if !self.record_task_response {
+                let processed = self
+                    .response_processor
+                    .process(task, response, attempt.get())
+                    .await;
+                return match processed {
+                    Ok(outcome) => Ok(TranslationTaskExecution::new(
+                        outcome,
+                        evidence.finish(None),
+                    )),
+                    Err(source) => {
+                        let cancelled = self.cancellation.is_requested()
+                            && self.response_processor.is_cancelled_wait(&source);
+                        let diagnostic = (!cancelled)
+                            .then(|| self.response_processor.task_record_diagnostic(&source))
+                            .flatten();
+                        Err(TranslationTaskExecutionFailure::new(
+                            RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
+                                attempt: attempt.get(),
+                                source,
+                            },
+                            evidence.finish(None),
+                            diagnostic,
+                            cancelled,
+                        ))
                     }
-                });
+                };
+            }
+
+            let processed = self
+                .response_processor
+                .process_recorded(task, response, attempt.get())
+                .await;
+            /*
+             * 下面的显式 match 让 attempt 证据只移动到唯一分支，避免为了旁路记录
+             * 克隆完整模型正文。
+             */
+            return match processed {
+                Ok(processed) => {
+                    let (outcome, response) = processed.into_parts();
+                    Ok(TranslationTaskExecution::new(
+                        outcome,
+                        evidence.finish(Some(response)),
+                    ))
+                }
+                Err(failure) => {
+                    let (source, response) = failure.into_parts();
+                    let cancelled = self.cancellation.is_requested()
+                        && self.response_processor.is_cancelled_wait(&source);
+                    let diagnostic = (!cancelled)
+                        .then(|| self.response_processor.task_record_diagnostic(&source))
+                        .flatten();
+                    Err(TranslationTaskExecutionFailure::new(
+                        RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
+                            attempt: attempt.get(),
+                            source,
+                        },
+                        evidence.finish(Some(response)),
+                        diagnostic,
+                        cancelled,
+                    ))
+                }
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+impl<L, D, R, P> RpgMakerStandardTranslationTaskExecutionService<L, D, R, P>
+where
+    L: LlmRequestExecutor,
+    L::Error: LlmRequestDiagnosticSource,
+    D: AsyncDelay,
+    R: TranslationTaskResponseProcessor,
+    P: TranslationTaskExecutionProfile<LlmClient = L::Client>,
+{
+    /// 既有 Executor 单元测试只关心权威业务结果；任务记录证据由专门测试覆盖。
+    async fn execute(
+        &self,
+        profile: &P,
+        task: TranslationTaskBlock,
+    ) -> Result<
+        TranslationTaskOutcome,
+        RpgMakerStandardTranslationTaskExecutionError<L::Error, R::Error>,
+    > {
+        match <Self as StandardTranslationTaskExecutor>::execute(self, profile, &task).await {
+            Ok(execution) => Ok(execution.into_parts().0),
+            Err(failure) => Err(failure.into_parts().0),
         }
     }
 }
@@ -1015,26 +1529,8 @@ fn process_response(
     input: ResponseProcessingInput,
     response: LlmResponse,
     resources: &ResolvedRpgMakerTranslationResources,
-) -> Result<TranslationTaskOutcome, TranslationResponseTechnicalError> {
-    if input.expected_outputs.is_empty() {
-        return Err(TranslationResponseTechnicalError::InternalInvariant {
-            invariant: TranslationInternalInvariant::ExpectedOutputsEmpty {
-                task_index: input.task_index,
-            },
-        });
-    }
-    let resolved_pair = resources.language_pair();
-    if &input.language_pair != resolved_pair {
-        return Err(TranslationResponseTechnicalError::InternalInvariant {
-            invariant: TranslationInternalInvariant::LanguagePairMismatch {
-                task_index: input.task_index,
-                task_source: input.language_pair.source().clone(),
-                task_target: input.language_pair.target().clone(),
-                resolved_source: resolved_pair.source().clone(),
-                resolved_target: resolved_pair.target().clone(),
-            },
-        });
-    }
+    record_response: bool,
+) -> Result<ProcessedTranslationTaskResponse, TranslationResponseTechnicalFailure> {
     let language_module = resources.source_language();
 
     let final_response = FinalLlmResponseMetadata::from_response(&response);
@@ -1046,16 +1542,65 @@ fn process_response(
         });
     }
 
-    let outputs = match parse_model_output_batch(
+    let raw_assistant = record_response.then(|| response.content().to_owned());
+    let parsed = parse_model_response(
         response.content(),
         resources.system_prompt().response_envelope(),
-    ) {
-        Ok(outputs) => outputs,
-        Err(message) => {
+    );
+    let response_record = raw_assistant.map(|raw_assistant| match &parsed {
+        Ok(parsed) => TranslationTaskResponseRecord::parsed(
+            raw_assistant,
+            parsed.thinking.clone(),
+            parsed
+                .outputs
+                .iter()
+                .map(|output| {
+                    TranslationAssistantEntry::projected(
+                        output.id.clone(),
+                        output.value.clone(),
+                        output.canonical_id,
+                        output.translation.as_ref().err().copied(),
+                    )
+                })
+                .collect(),
+        ),
+        Err(parse_error) => TranslationTaskResponseRecord::invalid(raw_assistant, *parse_error),
+    });
+
+    if input.expected_outputs.is_empty() {
+        return Err(TranslationResponseTechnicalFailure::new(
+            TranslationResponseTechnicalError::InternalInvariant {
+                invariant: TranslationInternalInvariant::ExpectedOutputsEmpty {
+                    task_index: input.task_index,
+                },
+            },
+            response_record,
+        ));
+    }
+    let resolved_pair = resources.language_pair();
+    if &input.language_pair != resolved_pair {
+        return Err(TranslationResponseTechnicalFailure::new(
+            TranslationResponseTechnicalError::InternalInvariant {
+                invariant: TranslationInternalInvariant::LanguagePairMismatch {
+                    task_index: input.task_index,
+                    task_source: input.language_pair.source().clone(),
+                    task_target: input.language_pair.target().clone(),
+                    resolved_source: resolved_pair.source().clone(),
+                    resolved_target: resolved_pair.target().clone(),
+                },
+            },
+            response_record,
+        ));
+    }
+
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(parse_error) => {
+            let message = parse_error.business_message();
             diagnostics.push(TranslationProtocolDiagnostic::InvalidResponse {
                 message: message.clone(),
             });
-            return Ok(TranslationTaskOutcome::Unavailable {
+            let outcome = TranslationTaskOutcome::Unavailable {
                 context: TranslationTaskOutcomeContext::new(
                     input.task_index,
                     input.attempt,
@@ -1066,13 +1611,20 @@ fn process_response(
                 unresolved: non_empty_known(
                     unresolved_all(
                         &input.expected_outputs,
-                        TranslationUnitRejectionReason::InvalidShape { message },
+                        TranslationUnitRejectionReason::InvalidShape {
+                            message: message.clone(),
+                        },
                     ),
                     "Executor 已确认任务含有预期输出",
                 ),
-            });
+            };
+            return Ok(ProcessedTranslationTaskResponse::new(
+                outcome,
+                response_record,
+            ));
         }
     };
+    let outputs = parsed.outputs;
 
     let expected_by_id = input
         .expected_outputs
@@ -1084,7 +1636,12 @@ fn process_response(
     let mut accepted = Vec::with_capacity(expected_by_id.len());
     let mut unresolved = Vec::new();
     for expected in &input.expected_outputs {
-        validate_expected_output_contract(input.task_index, expected)?;
+        if let Err(source) = validate_expected_output_contract(input.task_index, expected) {
+            return Err(TranslationResponseTechnicalFailure::new(
+                source,
+                response_record,
+            ));
+        }
         let Some(candidates) = actual_by_id.get(&expected.id()) else {
             unresolved.push(unresolved_unit(
                 expected,
@@ -1133,18 +1690,28 @@ fn process_response(
                 continue;
             }
             Err(TranslationCandidateValidationError::LanguageModule(source)) => {
-                return Err(TranslationResponseTechnicalError::LanguageModule(source));
+                return Err(TranslationResponseTechnicalFailure::new(
+                    TranslationResponseTechnicalError::LanguageModule(source),
+                    response_record,
+                ));
             }
             Err(TranslationCandidateValidationError::LanguageProjection(source)) => {
-                return Err(TranslationResponseTechnicalError::LanguageProjection(
-                    source,
+                return Err(TranslationResponseTechnicalFailure::new(
+                    TranslationResponseTechnicalError::LanguageProjection(source),
+                    response_record,
                 ));
             }
             Err(TranslationCandidateValidationError::LanguageRepair(source)) => {
-                return Err(TranslationResponseTechnicalError::LanguageRepair(source));
+                return Err(TranslationResponseTechnicalFailure::new(
+                    TranslationResponseTechnicalError::LanguageRepair(source),
+                    response_record,
+                ));
             }
             Err(TranslationCandidateValidationError::InternalInvariant { invariant }) => {
-                return Err(TranslationResponseTechnicalError::InternalInvariant { invariant });
+                return Err(TranslationResponseTechnicalFailure::new(
+                    TranslationResponseTechnicalError::InternalInvariant { invariant },
+                    response_record,
+                ));
             }
         };
         let translation = translation_content(expected, translation_lines);
@@ -1169,8 +1736,8 @@ fn process_response(
         ));
     }
 
-    if unresolved.is_empty() {
-        Ok(TranslationTaskOutcome::Complete {
+    let outcome = if unresolved.is_empty() {
+        TranslationTaskOutcome::Complete {
             context: TranslationTaskOutcomeContext::new(
                 input.task_index,
                 input.attempt,
@@ -1178,9 +1745,9 @@ fn process_response(
             ),
             final_response,
             accepted: non_empty_known(accepted, "所有预期输出已验收"),
-        })
+        }
     } else if accepted.is_empty() {
-        Ok(TranslationTaskOutcome::Unavailable {
+        TranslationTaskOutcome::Unavailable {
             context: TranslationTaskOutcomeContext::new(
                 input.task_index,
                 input.attempt,
@@ -1189,9 +1756,9 @@ fn process_response(
             final_response: Some(final_response),
             reason: TranslationTaskUnavailableReason::AllOutputsRejected,
             unresolved: non_empty_known(unresolved, "没有输出通过验收"),
-        })
+        }
     } else {
-        Ok(TranslationTaskOutcome::Partial {
+        TranslationTaskOutcome::Partial {
             context: TranslationTaskOutcomeContext::new(
                 input.task_index,
                 input.attempt,
@@ -1200,8 +1767,12 @@ fn process_response(
             final_response,
             accepted: non_empty_known(accepted, "部分输出已验收"),
             unresolved: non_empty_known(unresolved, "部分输出未完成"),
-        })
-    }
+        }
+    };
+    Ok(ProcessedTranslationTaskResponse::new(
+        outcome,
+        response_record,
+    ))
 }
 
 fn non_empty_known<T>(items: Vec<T>, established_by: &'static str) -> NonEmptyTaskItems<T> {
@@ -1373,10 +1944,18 @@ fn translation_content(
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ModelOutputWire {
     id: String,
     value: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct ParsedModelOutput {
+    id: String,
+    value: serde_json::Value,
+    canonical_id: Option<usize>,
+    translation: Result<Vec<String>, TranslationAssistantValueError>,
 }
 
 #[derive(Debug)]
@@ -1413,13 +1992,13 @@ impl<'de> Visitor<'de> for ModelOutputBatchVisitor {
 }
 
 fn collect_model_outputs(
-    outputs: Vec<ModelOutputWire>,
+    outputs: Vec<ParsedModelOutput>,
     expected_by_id: &BTreeMap<usize, &ExpectedTranslationOutput>,
     diagnostics: &mut Vec<TranslationProtocolDiagnostic>,
 ) -> BTreeMap<usize, Vec<Result<Vec<String>, String>>> {
     let mut by_id = BTreeMap::<usize, Vec<Result<Vec<String>, String>>>::new();
     for (item_index, output) in outputs.into_iter().enumerate() {
-        let Some(id) = parse_model_output_id(&output.id) else {
+        let Some(id) = output.canonical_id else {
             diagnostics.push(TranslationProtocolDiagnostic::InvalidId { item_index });
             continue;
         };
@@ -1427,10 +2006,11 @@ fn collect_model_outputs(
             diagnostics.push(TranslationProtocolDiagnostic::UnknownId { item_index, id });
             continue;
         }
-        by_id
-            .entry(id)
-            .or_default()
-            .push(parse_translation_lines(output.value));
+        by_id.entry(id).or_default().push(
+            output
+                .translation
+                .map_err(TranslationAssistantValueError::business_message),
+        );
     }
     by_id
 }
@@ -1445,42 +2025,90 @@ fn parse_model_output_id(value: &str) -> Option<usize> {
     value.parse().ok()
 }
 
-fn parse_translation_lines(value: serde_json::Value) -> Result<Vec<String>, String> {
+fn parse_translation_lines(
+    value: &serde_json::Value,
+) -> Result<Vec<String>, TranslationAssistantValueError> {
     let serde_json::Value::Array(values) = value else {
-        return Err("译文必须是字符串数组".to_owned());
+        return Err(TranslationAssistantValueError::NotStringArray);
     };
     values
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(line_index, value)| match value {
-            serde_json::Value::String(line) => Ok(line),
-            _ => Err(format!("译文数组第 {line_index} 项必须是字符串")),
+            serde_json::Value::String(line) => Ok(line.clone()),
+            _ => Err(TranslationAssistantValueError::NonStringItem {
+                item: NonZeroUsize::new(line_index + 1).expect("一基数组项编号不可能为零"),
+            }),
         })
         .collect()
 }
 
+fn parse_model_response(
+    value: &str,
+    response_envelope: TranslationResponseEnvelope,
+) -> Result<ParsedModelOutputBatch, TranslationTaskResponseParseError> {
+    let value = trim_model_response(value);
+    let envelope = parse_translation_response_envelope(value, response_envelope)?;
+    let value = strip_single_markdown_fence(envelope.assistant_json.trim())?;
+    serde_json::from_str::<ModelOutputBatch>(value.value)
+        .map(|batch| ParsedModelOutputBatch {
+            thinking: envelope.thinking.map(str::to_owned),
+            outputs: batch
+                .0
+                .into_iter()
+                .map(|output| {
+                    let canonical_id = parse_model_output_id(&output.id);
+                    let translation = parse_translation_lines(&output.value);
+                    ParsedModelOutput {
+                        id: output.id,
+                        value: output.value,
+                        canonical_id,
+                        translation,
+                    }
+                })
+                .collect(),
+        })
+        .map_err(|source| {
+            let category = match source.classify() {
+                serde_json::error::Category::Io => TranslationTaskResponseJsonErrorCategory::Io,
+                serde_json::error::Category::Syntax => {
+                    TranslationTaskResponseJsonErrorCategory::Syntax
+                }
+                serde_json::error::Category::Data => {
+                    TranslationTaskResponseJsonErrorCategory::Shape
+                }
+                serde_json::error::Category::Eof => {
+                    TranslationTaskResponseJsonErrorCategory::UnexpectedEof
+                }
+            };
+            let (line, column) = if matches!(
+                category,
+                TranslationTaskResponseJsonErrorCategory::UnexpectedEof
+            ) {
+                value.location_at(value.value.len())
+            } else {
+                value.location_for_local(source.line(), source.column())
+            };
+            TranslationTaskResponseParseError::new(
+                TranslationTaskResponseParseErrorKind::Json(category),
+                line,
+                column,
+            )
+        })
+}
+
+#[derive(Debug)]
+struct ParsedModelOutputBatch {
+    thinking: Option<String>,
+    outputs: Vec<ParsedModelOutput>,
+}
+
+#[cfg(test)]
 fn parse_model_output_batch(
     value: &str,
     response_envelope: TranslationResponseEnvelope,
-) -> Result<Vec<ModelOutputWire>, String> {
-    let value = trim_model_response(value);
-    let value = strip_translation_response_envelope(value, response_envelope)?;
-    let value = strip_single_markdown_fence(value.trim())?;
-    serde_json::from_str::<ModelOutputBatch>(value)
-        .map(|batch| batch.0)
-        .map_err(|source| {
-            let category = match source.classify() {
-                serde_json::error::Category::Io => "io",
-                serde_json::error::Category::Syntax => "syntax",
-                serde_json::error::Category::Data => "shape",
-                serde_json::error::Category::Eof => "unexpected_eof",
-            };
-            format!(
-                "模型响应 JSON 无效：类别 {category}，第 {} 行、第 {} 列",
-                source.line(),
-                source.column()
-            )
-        })
+) -> Result<Vec<ParsedModelOutput>, TranslationTaskResponseParseError> {
+    parse_model_response(value, response_envelope).map(|parsed| parsed.outputs)
 }
 
 fn unresolved_unit(
@@ -1505,75 +2133,238 @@ fn unresolved_all(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct LocatedModelResponse<'a> {
+    raw: &'a str,
+    value: &'a str,
+    start: usize,
+}
+
+impl<'a> LocatedModelResponse<'a> {
+    fn new(raw: &'a str) -> Self {
+        Self {
+            raw,
+            value: raw,
+            start: 0,
+        }
+    }
+
+    fn advance(self, bytes: usize) -> Self {
+        Self {
+            raw: self.raw,
+            value: &self.value[bytes..],
+            start: self.start + bytes,
+        }
+    }
+
+    fn prefix(self, bytes: usize) -> Self {
+        Self {
+            raw: self.raw,
+            value: &self.value[..bytes],
+            start: self.start,
+        }
+    }
+
+    fn trim(self) -> Self {
+        let leading = self.value.len() - self.value.trim_start().len();
+        self.advance(leading).prefix(self.value.trim().len())
+    }
+
+    fn trim_start(self) -> Self {
+        let leading = self.value.len() - self.value.trim_start().len();
+        self.advance(leading)
+    }
+
+    fn location_at(self, local_byte_offset: usize) -> (NonZeroUsize, NonZeroUsize) {
+        response_location(self.raw, self.start + local_byte_offset)
+    }
+
+    fn location_for_local(
+        self,
+        local_line: usize,
+        local_column: usize,
+    ) -> (NonZeroUsize, NonZeroUsize) {
+        let (start_line, start_column) = response_location(self.raw, self.start);
+        let local_line = local_line.max(1);
+        let local_column = local_column.max(1);
+        if local_line == 1 {
+            (
+                start_line,
+                NonZeroUsize::new(start_column.get() + local_column - 1)
+                    .expect("一基列号相加后仍非零"),
+            )
+        } else {
+            (
+                NonZeroUsize::new(start_line.get() + local_line - 1).expect("一基行号相加后仍非零"),
+                NonZeroUsize::new(local_column).expect("局部列号已收窄为至少一"),
+            )
+        }
+    }
+
+    fn error_at(
+        self,
+        kind: TranslationTaskResponseParseErrorKind,
+        local_byte_offset: usize,
+    ) -> TranslationTaskResponseParseError {
+        let (line, column) = self.location_at(local_byte_offset);
+        TranslationTaskResponseParseError::new(kind, line, column)
+    }
+
+    fn error_at_raw_eof(
+        self,
+        kind: TranslationTaskResponseParseErrorKind,
+    ) -> TranslationTaskResponseParseError {
+        let (line, column) = response_location(self.raw, self.raw.len());
+        TranslationTaskResponseParseError::new(kind, line, column)
+    }
+}
+
+fn response_location(raw: &str, byte_offset: usize) -> (NonZeroUsize, NonZeroUsize) {
+    let byte_offset = byte_offset.min(raw.len());
+    let preceding = &raw[..byte_offset];
+    let line = preceding.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = preceding
+        .rsplit_once('\n')
+        .map_or(preceding.len(), |(_, tail)| tail.len())
+        + 1;
+    (
+        NonZeroUsize::new(line).expect("一基行号不可能为零"),
+        NonZeroUsize::new(column).expect("一基列号不可能为零"),
+    )
+}
+
 /// 清理响应两端，并兼容供应商可能放在正文开头的单个 BOM。
-fn trim_model_response(value: &str) -> &str {
-    let value = value.trim();
-    value.strip_prefix('\u{feff}').unwrap_or(value).trim()
+fn trim_model_response(value: &str) -> LocatedModelResponse<'_> {
+    let value = LocatedModelResponse::new(value).trim();
+    let value = if value.value.starts_with('\u{feff}') {
+        value.advance('\u{feff}'.len_utf8())
+    } else {
+        value
+    };
+    value.trim()
 }
 
 /// 按受信 Prompt 声明剥离唯一响应信封，不修复或提取 JSON 内容。
-fn strip_translation_response_envelope(
-    value: &str,
+fn parse_translation_response_envelope(
+    value: LocatedModelResponse<'_>,
     response_envelope: TranslationResponseEnvelope,
-) -> Result<&str, String> {
+) -> Result<TranslationResponseEnvelopeParts<'_>, TranslationTaskResponseParseError> {
     match response_envelope {
         TranslationResponseEnvelope::JsonOnly => {
-            if value.contains("<why>") || value.contains("</why>") {
-                return Err("当前响应模式不接受思考输出".to_owned());
+            if starts_with_thinking_tag(value.value) {
+                return Err(
+                    value.error_at(TranslationTaskResponseParseErrorKind::ThinkingNotAllowed, 0)
+                );
             }
-            Ok(value)
+            Ok(TranslationResponseEnvelopeParts {
+                thinking: None,
+                assistant_json: value,
+            })
         }
-        TranslationResponseEnvelope::ThinkingThenJson => strip_thinking_then_json(value),
+        TranslationResponseEnvelope::ThinkingThenJson => parse_thinking_then_json(value),
     }
 }
 
-fn strip_thinking_then_json(value: &str) -> Result<&str, String> {
-    let Some(after_opening) = value.strip_prefix("<why>") else {
-        return Err("模型响应缺少规定的思考信封".to_owned());
-    };
-    let Some(closing_start) = after_opening.find("</why>") else {
-        return Err("模型响应的思考信封没有闭合".to_owned());
-    };
-    let thinking = &after_opening[..closing_start];
-    if thinking.trim().is_empty() {
-        return Err("模型响应的思考内容为空".to_owned());
-    }
-    if thinking.contains("<why>") || thinking.contains("</why>") {
-        return Err("模型响应包含嵌套的思考信封".to_owned());
-    }
-
-    let json = &after_opening[closing_start + "</why>".len()..];
-    if json.contains("<why>") || json.contains("</why>") {
-        return Err("模型响应包含重复的思考信封".to_owned());
-    }
-    Ok(json.trim_start())
+struct TranslationResponseEnvelopeParts<'a> {
+    thinking: Option<&'a str>,
+    assistant_json: LocatedModelResponse<'a>,
 }
 
-fn strip_single_markdown_fence(value: &str) -> Result<&str, String> {
-    if !value.starts_with("```") {
+fn parse_thinking_then_json(
+    value: LocatedModelResponse<'_>,
+) -> Result<TranslationResponseEnvelopeParts<'_>, TranslationTaskResponseParseError> {
+    let Some(after_opening) = value.value.strip_prefix("<why>") else {
+        return Err(value.error_at(
+            TranslationTaskResponseParseErrorKind::ThinkingEnvelopeMissing,
+            0,
+        ));
+    };
+    let after_opening = value.advance(value.value.len() - after_opening.len());
+    let Some(closing_start) = after_opening.value.find("</why>") else {
+        return Err(
+            value.error_at_raw_eof(TranslationTaskResponseParseErrorKind::ThinkingEnvelopeUnclosed)
+        );
+    };
+    let thinking = after_opening.prefix(closing_start);
+    if thinking.value.trim().is_empty() {
+        return Err(after_opening.error_at(
+            TranslationTaskResponseParseErrorKind::ThinkingEmpty,
+            closing_start,
+        ));
+    }
+    if let Some(offending) = first_thinking_tag(thinking.value) {
+        return Err(thinking.error_at(
+            TranslationTaskResponseParseErrorKind::ThinkingNested,
+            offending,
+        ));
+    }
+
+    let json = after_opening
+        .advance(closing_start + "</why>".len())
+        .trim_start();
+    if starts_with_thinking_tag(json.value) {
+        return Err(json.error_at(TranslationTaskResponseParseErrorKind::ThinkingRepeated, 0));
+    }
+    Ok(TranslationResponseEnvelopeParts {
+        thinking: Some(thinking.value),
+        assistant_json: json,
+    })
+}
+
+fn starts_with_thinking_tag(value: &str) -> bool {
+    value.starts_with("<why>") || value.starts_with("</why>")
+}
+
+fn first_thinking_tag(value: &str) -> Option<usize> {
+    ["<why>", "</why>"]
+        .into_iter()
+        .filter_map(|tag| value.find(tag))
+        .min()
+}
+
+fn strip_single_markdown_fence(
+    value: LocatedModelResponse<'_>,
+) -> Result<LocatedModelResponse<'_>, TranslationTaskResponseParseError> {
+    if !value.value.starts_with("```") {
         return Ok(value);
     }
-    let Some(first_line_end) = value.find('\n') else {
-        return Err("Markdown 围栏没有正文".to_owned());
+    let Some(first_line_end) = value.value.find('\n') else {
+        return Err(
+            value.error_at_raw_eof(TranslationTaskResponseParseErrorKind::MarkdownFenceNoBody)
+        );
     };
-    let opening = value[..first_line_end].trim_end_matches('\r');
+    let opening = value.value[..first_line_end].trim_end_matches('\r');
     if opening != "```" && opening != "```json" && opening != "```JSON" {
-        return Err("只接受无语言标记或 json 标记的单层 Markdown 围栏".to_owned());
+        return Err(value.error_at(
+            TranslationTaskResponseParseErrorKind::MarkdownFenceUnsupported,
+            0,
+        ));
     }
-    let body_and_closing = &value[first_line_end + 1..];
-    let Some(closing_line_start) = body_and_closing.rfind('\n') else {
-        if body_and_closing.trim_end_matches('\r') == "```" {
-            return Err("Markdown 围栏没有正文".to_owned());
+    let body_and_closing = value.advance(first_line_end + 1);
+    let Some(closing_line_start) = body_and_closing.value.rfind('\n') else {
+        if body_and_closing.value.trim_end_matches('\r') == "```" {
+            return Err(body_and_closing.error_at(
+                TranslationTaskResponseParseErrorKind::MarkdownFenceNoBody,
+                0,
+            ));
         }
-        return Err("Markdown 围栏没有闭合".to_owned());
+        return Err(
+            value.error_at_raw_eof(TranslationTaskResponseParseErrorKind::MarkdownFenceUnclosed)
+        );
     };
-    let closing = body_and_closing[closing_line_start + 1..].trim_end_matches('\r');
+    let closing = body_and_closing.value[closing_line_start + 1..].trim_end_matches('\r');
     if closing != "```" {
-        return Err("Markdown 围栏必须以最终独立行闭合".to_owned());
+        return Err(body_and_closing.error_at(
+            TranslationTaskResponseParseErrorKind::MarkdownFenceInvalidClosing,
+            closing_line_start + 1,
+        ));
     }
-    let body = body_and_closing[..closing_line_start].trim();
-    if body.is_empty() {
-        return Err("Markdown 围栏没有正文".to_owned());
+    let body = body_and_closing.prefix(closing_line_start).trim();
+    if body.value.is_empty() {
+        return Err(body_and_closing.error_at(
+            TranslationTaskResponseParseErrorKind::MarkdownFenceNoBody,
+            closing_line_start + 1,
+        ));
     }
     Ok(body)
 }
@@ -2142,6 +2933,10 @@ mod tests {
                 crate::diagnostic::DiagnosticAction::CheckModelService,
             )
         }
+
+        fn is_cancelled_wait(&self) -> bool {
+            self.0 == "cancelled-wait"
+        }
     }
 
     impl LlmClientConcurrency for &'static str {
@@ -2162,6 +2957,24 @@ mod tests {
             F: FnOnce() -> T + Send + 'static,
         {
             Ok(task())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CancellingCpu {
+        cancellation: CooperativeCancellation,
+    }
+
+    impl CpuTaskExecutor for CancellingCpu {
+        type Error = FakeError;
+
+        async fn execute<T, F>(&self, _task: F) -> Result<T, CpuTaskExecutionError<Self::Error>>
+        where
+            T: Send + 'static,
+            F: FnOnce() -> T + Send + 'static,
+        {
+            self.cancellation.request();
+            Err(CpuTaskExecutionError::Cancelled)
         }
     }
 
@@ -2222,8 +3035,8 @@ mod tests {
     }
 
     #[test]
-    fn response_diagnostic_treats_projection_and_repair_as_internal_without_leaking_text() {
-        let sentinel = "MODEL_OR_TOKEN_SECRET_SENTINEL";
+    fn response_diagnostic_treats_projection_and_repair_as_internal_without_copying_text() {
+        let sentinel = "MODEL_OR_TOKEN_BODY_SENTINEL";
         let projection: ProductionResponseError =
             TranslationTaskResponseProcessingError::LanguageProjection(
                 LanguageTextProjectionError::MissingToken {
@@ -2310,7 +3123,7 @@ mod tests {
 
     #[test]
     fn protected_placeholder_invariant_discards_token_text_before_cli_and_jsonl_projection() {
-        let sentinel = "PROTECTED_SOURCE_TOKEN_SECRET_SENTINEL";
+        let sentinel = "PROTECTED_SOURCE_TOKEN_BODY_SENTINEL";
         let source = PlaceholderMultisetError::Unexpected {
             token: sentinel.to_owned(),
         };
@@ -2671,6 +3484,8 @@ mod tests {
             "```\n{}\n```",
             "```json\r\n{}\r\n```",
             "```JSON\n{\"0\":[\"括号 [ ]、逗号 ,} 与反引号 ```\"]}\n```",
+            r#"{"1":["业务文本可以包含 <why> 与 </why> 标签"]}"#,
+            "```json\n{\"1\":[\"<why>围栏内仍是普通业务文本</why>\"]}\n```",
         ] {
             assert!(
                 parse_model_output_batch(value, TranslationResponseEnvelope::JsonOnly).is_ok(),
@@ -2681,7 +3496,7 @@ mod tests {
         for value in [
             "说明：{}",
             "<why>不应输出思考</why>{}",
-            r#"{"1":["</why>"]}"#,
+            "</why>{}",
             "{} 后记",
             "{}\n{}",
             "{\"0\":[\"译文\",]}",
@@ -2709,6 +3524,8 @@ mod tests {
             "<why>逐项分析。</why>{}",
             "<why>第一行\n第二行</why>\n{}",
             " \r\n\u{feff}<why>\n　逐项分析\t\n</why>\r\n```json\r\n{}\r\n``` \n",
+            r#"<why>逐项分析。</why>{"1":["业务文本可以包含 <why> 与 </why> 标签"]}"#,
+            "<why>逐项分析。</why>\n```json\n{\"1\":[\"<why>围栏内仍是普通业务文本</why>\"]}\n```",
         ] {
             assert!(
                 parse_model_output_batch(value, TranslationResponseEnvelope::ThinkingThenJson)
@@ -2742,6 +3559,85 @@ mod tests {
                     .is_err(),
                 "协议外思考信封必须拒绝：{value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn response_parse_errors_use_complete_raw_assistant_coordinates() {
+        let cases = [
+            (
+                " \r\n\u{feff}<why>\n分析\n</why>\r\n```json\r\n{\r\n  \"1\": [\"ok\"],\r\n  \"2\": ]\r\n}\r\n``` \n",
+                TranslationResponseEnvelope::ThinkingThenJson,
+                TranslationTaskResponseParseErrorKind::Json(
+                    TranslationTaskResponseJsonErrorCategory::Syntax,
+                ),
+                8,
+                8,
+            ),
+            (
+                " \n<why>分析\n",
+                TranslationResponseEnvelope::ThinkingThenJson,
+                TranslationTaskResponseParseErrorKind::ThinkingEnvelopeUnclosed,
+                3,
+                1,
+            ),
+            (
+                "\n<why>外层\n  <why>内层</why></why>{}",
+                TranslationResponseEnvelope::ThinkingThenJson,
+                TranslationTaskResponseParseErrorKind::ThinkingNested,
+                3,
+                3,
+            ),
+            (
+                "<why>第一组</why>\n  </why>{}",
+                TranslationResponseEnvelope::ThinkingThenJson,
+                TranslationTaskResponseParseErrorKind::ThinkingRepeated,
+                2,
+                3,
+            ),
+            (
+                " \n```yaml\n{}\n```",
+                TranslationResponseEnvelope::JsonOnly,
+                TranslationTaskResponseParseErrorKind::MarkdownFenceUnsupported,
+                2,
+                1,
+            ),
+            (
+                "\n```json\n{}\n",
+                TranslationResponseEnvelope::JsonOnly,
+                TranslationTaskResponseParseErrorKind::MarkdownFenceUnclosed,
+                4,
+                1,
+            ),
+            (
+                "```json\n{}\n``` trailing",
+                TranslationResponseEnvelope::JsonOnly,
+                TranslationTaskResponseParseErrorKind::MarkdownFenceInvalidClosing,
+                3,
+                1,
+            ),
+            (
+                "\n  </why>{}",
+                TranslationResponseEnvelope::JsonOnly,
+                TranslationTaskResponseParseErrorKind::ThinkingNotAllowed,
+                2,
+                3,
+            ),
+        ];
+
+        for (raw, envelope, kind, line, column) in cases {
+            let error = parse_model_response(raw, envelope).expect_err("测试响应必须解析失败");
+            assert_eq!(
+                error,
+                TranslationTaskResponseParseError::new(
+                    kind,
+                    NonZeroUsize::new(line).expect("测试行号非零"),
+                    NonZeroUsize::new(column).expect("测试列号非零"),
+                ),
+                "原始 Assistant 坐标错误：{raw:?}"
+            );
+            let message = error.business_message();
+            assert!(message.contains(&format!("第 {line} 行、第 {column} 列")));
         }
     }
 
@@ -3595,7 +4491,8 @@ mod tests {
         assert_eq!(result.unresolved()[0].id(), 2);
         assert!(matches!(
             result.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::InvalidShape { .. }
+            TranslationUnitRejectionReason::InvalidShape { message }
+                if message == "译文数组第 1 项必须是字符串"
         ));
         assert!(result.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic,
@@ -3762,7 +4659,7 @@ mod tests {
 
     #[tokio::test]
     async fn thinking_content_is_discarded_before_results_and_diagnostics() {
-        const THINKING_SENTINEL: &str = "ATT_PRIVATE_THINKING_SENTINEL_7C4E";
+        const THINKING_SENTINEL: &str = "ATT_THINKING_BODY_SENTINEL_7C4E";
 
         let processor = TranslationTaskResponseProcessingService::new(
             InlineCpu,
@@ -3974,6 +4871,25 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct CancellingLlm {
+        cancellation: CooperativeCancellation,
+    }
+
+    impl LlmRequestExecutor for CancellingLlm {
+        type Client = &'static str;
+        type Error = FakeError;
+
+        async fn request<'a>(
+            &'a self,
+            _client: &'a Self::Client,
+            _messages: &'a [ChatMessage],
+        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+            self.cancellation.request();
+            Err(LlmRequestError::Fatal(FakeError("cancelled-wait")))
+        }
+    }
+
+    #[derive(Clone)]
     struct FakeDelay {
         waits: Arc<Mutex<Vec<Duration>>>,
     }
@@ -4053,6 +4969,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_task_recording_keeps_only_the_logical_attempt_count() {
+        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+            FakeLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
+                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-without-record".to_owned()),
+                    None,
+                ))]))),
+                messages: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeDelay {
+                waits: Arc::new(Mutex::new(Vec::new())),
+            },
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
+            CooperativeCancellation::default(),
+        )
+        .with_task_recording(false);
+        let task = task();
+        let execution =
+            <RpgMakerStandardTranslationTaskExecutionService<_, _, _, _> as StandardTranslationTaskExecutor>::execute(
+                &service,
+                &profile(),
+                &task,
+            )
+            .await
+            .expect("关闭任务记录不应改变业务结果");
+        let (outcome, evidence) = execution.into_parts();
+
+        assert_eq!(evidence.attempt_count(), outcome.attempts().get());
+        assert!(
+            !evidence.has_recorded_payload(),
+            "关闭记录时不得保留时钟、attempt 文档或原始 Assistant 旁路"
+        );
+    }
+
+    #[tokio::test]
     async fn business_cancellation_interrupts_retry_after_without_another_request() {
         let messages = Arc::new(Mutex::new(Vec::new()));
         let delay_started = Arc::new(tokio::sync::Semaphore::new(0));
@@ -4080,7 +5034,16 @@ mod tests {
             TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
             cancellation.clone(),
         );
-        let execution = tokio::spawn(async move { service.execute(&profile(), task()).await });
+        let execution = tokio::spawn(async move {
+            let profile = profile();
+            let task = task();
+            <RpgMakerStandardTranslationTaskExecutionService<_, _, _, _> as StandardTranslationTaskExecutor>::execute(
+                &service,
+                &profile,
+                &task,
+            )
+            .await
+        });
 
         delay_started
             .acquire()
@@ -4092,14 +5055,167 @@ mod tests {
             .await
             .expect("取消必须立即打断 Retry-After 等待")
             .expect("Executor 任务不应 panic");
+        let failure = result.expect_err("等待期间取消必须返回已取消执行证据");
+        let (source, evidence, diagnostic, cancelled) = failure.into_parts();
         assert!(matches!(
-            result,
-            Err(RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled { attempt: 1 })
+            source,
+            RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled { attempt: 1 }
         ));
+        assert!(cancelled);
+        assert!(diagnostic.is_none());
+        assert!(
+            evidence.has_cancelled_retry_wait(),
+            "证据必须区分等待期间取消，不能声称已经等待后重试"
+        );
         assert_eq!(
             messages.lock().expect("消息锁不应中毒").len(),
             1,
             "取消后不得再调用模型"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_admission_cancellation_is_returned_as_a_cancelled_started_task() {
+        let cancellation = CooperativeCancellation::default();
+        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+            CancellingLlm {
+                cancellation: cancellation.clone(),
+            },
+            FakeDelay {
+                waits: Arc::new(Mutex::new(Vec::new())),
+            },
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
+            cancellation,
+        );
+        let task = task();
+        let profile = profile();
+
+        let failure = StandardTranslationTaskExecutor::execute(&service, &profile, &task)
+            .await
+            .expect_err("等待 LLM 本地入场时的合作取消必须返回取消终态");
+        let (source, evidence, diagnostic, cancelled) = failure.into_parts();
+
+        assert!(matches!(
+            source,
+            RpgMakerStandardTranslationTaskExecutionError::FatalRequest {
+                attempt: 1,
+                source: FakeError("cancelled-wait"),
+            }
+        ));
+        assert_eq!(evidence.attempt_count(), 1);
+        assert!(diagnostic.is_none());
+        assert!(cancelled);
+    }
+
+    #[tokio::test]
+    async fn response_cpu_admission_cancellation_is_returned_as_a_cancelled_started_task() {
+        let cancellation = CooperativeCancellation::default();
+        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+            FakeLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
+                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-cancelled".to_owned()),
+                    None,
+                ))]))),
+                messages: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeDelay {
+                waits: Arc::new(Mutex::new(Vec::new())),
+            },
+            TranslationTaskResponseProcessingService::new(
+                CancellingCpu {
+                    cancellation: cancellation.clone(),
+                },
+                translation_resources(),
+            ),
+            cancellation,
+        );
+        let task = task();
+        let profile = profile();
+
+        let failure = StandardTranslationTaskExecutor::execute(&service, &profile, &task)
+            .await
+            .expect_err("等待响应 CPU 入场时的合作取消必须返回取消终态");
+        let (source, evidence, diagnostic, cancelled) = failure.into_parts();
+
+        assert!(matches!(
+            source,
+            RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
+                attempt: 1,
+                source: TranslationTaskResponseProcessingError::ScheduleCompute(
+                    CpuTaskExecutionError::Cancelled
+                ),
+            }
+        ));
+        assert_eq!(evidence.attempt_count(), 1);
+        assert_eq!(
+            evidence.response(),
+            Some(&TranslationTaskResponseRecord::unprocessed(
+                r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#.to_owned()
+            )),
+            "CPU 闭包入场前取消时只能保留未处理的原始 Assistant"
+        );
+        assert!(diagnostic.is_none());
+        assert!(cancelled);
+    }
+
+    #[tokio::test]
+    async fn executor_keeps_parsed_thinking_record_when_later_validation_fails() {
+        let raw_assistant =
+            "<why>已建立解析证据。</why>\n{\"1\":[\"炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧\"]}";
+        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
+            FakeLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
+                    raw_assistant,
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-parsed-before-failure".to_owned()),
+                    None,
+                ))]))),
+                messages: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeDelay {
+                waits: Arc::new(Mutex::new(Vec::new())),
+            },
+            TranslationTaskResponseProcessingService::new(
+                InlineCpu,
+                thinking_translation_resources(),
+            ),
+            CooperativeCancellation::default(),
+        );
+        let task = task_with_language_pair("en", "zh-Hant", 1);
+        let profile = profile();
+
+        let failure = StandardTranslationTaskExecutor::execute(&service, &profile, &task)
+            .await
+            .expect_err("解析后的任务语言对不一致必须返回技术失败");
+        let (source, evidence, _diagnostic, cancelled) = failure.into_parts();
+
+        assert!(matches!(
+            source,
+            RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
+                attempt: 1,
+                source: TranslationTaskResponseProcessingError::InternalInvariant {
+                    invariant: TranslationInternalInvariant::LanguagePairMismatch { .. },
+                },
+            }
+        ));
+        assert!(!cancelled);
+        assert_eq!(
+            evidence.response(),
+            Some(&TranslationTaskResponseRecord::parsed(
+                raw_assistant.to_owned(),
+                Some("已建立解析证据。".to_owned()),
+                vec![TranslationAssistantEntry::projected(
+                    "1".to_owned(),
+                    serde_json::json!(["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]),
+                    Some(1),
+                    None,
+                )],
+            )),
+            "解析成功后建立的 Thinking 与有序条目必须随技术失败进入 Executor evidence"
         );
     }
 

@@ -35,7 +35,9 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 
 对静态可枚举的候选范围全量核对命中、未命中和误命中；无法枚举的部分明确保留为未证实。命令成功和命中数量只证明规则被消费，不证明覆盖完成。
 
-当自定义翻译资源、漏翻或说话人问题已经进入 Translate 调查时，若本轮启用了敏感 LLM 调用记录，先在 `llm-calls/<run-id>/` 核对最终请求中是否真实包含预期规则和上下文，再核对 Provider 的实际响应；随后使用普通 JSONL 和项目数据库判断 ATT 如何分类、验收和持久化结果。调用记录不表达 ATT 验收或提交事实。文件缺失不能证明没有调用，必须结合配置、零任务状态和 stderr 日志健康警告，区分关闭记录、尚未调用、调用前失败和记录失败。
+当自定义翻译资源、漏翻或说话人问题已经进入 Standard Translate 调查时，若本轮启用了任务记录，优先读取对应的单个 `task-records/<run-id>/task-000001.md`。在同一文件中核对最终 System/User、合法 Thinking、Assistant、全部重试、逐 ID 验收和真实数据库提交终态；不要从 Provider 外层信封或原始 wire body 猜测这些事实。普通 JSONL 只用于运行级摘要。文件缺失不能证明没有请求，必须结合配置、零任务状态和 stderr 记录健康警告，区分关闭记录、任务未启动和记录失败。
+
+现行敏感信息闭集只有本轮实际选中 LLM Client 的 API key 实际值。Prompt、原文、译文、自定义参数、Thinking、Assistant 和 Provider 正文不因内容类别成为敏感信息；任务记录会精确替换其中出现的 API key 值，不应再隐藏整段正文。
 
 任务产生新的可复用经验时，按知识责任同步：改变触发、状态路由、必读材料、采证方法或停止与完成判断的经验更新本 Skill；规则语义和工件验证方法更新对应现行文档；单个游戏的 marker、字段路径、正则和一次性结论留在项目工件。不要把个案堆成通用清单。
 
@@ -150,7 +152,7 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 - 每项资源都有真实语料、协议约束或外部选择作为依据。
 - 可静态枚举的 Placeholder 协议没有未解释的未保护或误保护跨度；无法枚举的部分和验证入口明确。
 - 工件通过其责任文档规定的验证。
-- Prompt、Profile、供应商配置和秘密的边界清楚，秘密未写入受版本控制材料。
+- Prompt、Profile 和供应商配置边界清楚；实际选中 Client 的 API key 值未写入受版本控制材料。
 
 ### 返回位置
 
@@ -167,13 +169,13 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 - 先读[Translate 规格](../../docs/rpg-maker/translation.md)。
 - 根据具体问题再读[术语规格](../../docs/rpg-maker/terminology.md)、[Prompt 规格](../../docs/rpg-maker/prompts.md)或[Rules 规格中的 Placeholder 契约](../../docs/rpg-maker/rules.md)。
 - 网络与模型响应外层故障再读[Chat Completions 运行时规格](../../docs/runtime/chat-completions.md)。
-- 调查最终模型输入、Provider 原始结果或调用记录健康状态时再读[项目日志规格](../../docs/runtime/project-log.md)。
+- 调查 Standard 最终输入输出、重试、验收、提交终态或记录健康状态时再读[任务记录规格](../../docs/rpg-maker/task-records.md)；调查运行级摘要时再读[项目日志规格](../../docs/runtime/project-log.md)。
 
 ### 任务清单
 
 - 确认本轮显式提供或复用的翻译资源及其当前性。
 - 执行 Translate，保留已经合法提交的部分进度。
-- 调查自定义资源是否生效时，先用敏感调用记录确认最终请求与 Provider 响应，再用普通 JSONL 和项目数据库确认 ATT 验收与提交结果。
+- 调查自定义资源是否生效时，先在对应 Standard 任务记录中核对最终 System/User、Thinking、Assistant、重试、验收和提交终态；普通 JSONL 只核对运行摘要，必要时再用项目数据库复核权威状态。
 - 同时检查 `Complete`、`Partial`、`Unavailable`，以及任务状态、unit state 和代表性译文。
 - 区分机器协议验收、状态传播和语言质量，只修正真正拥有问题的资源或阶段。
 
@@ -226,12 +228,12 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 ### 必读文档
 
 - 先读[命令行规格](../../docs/runtime/cli.md)、[项目日志规格](../../docs/runtime/project-log.md)和失败阶段的现行规格。
-- 按实际原因再读[SQLite 运行时规格](../../docs/runtime/sqlite.md)、[目录发布规格](../../docs/runtime/directory-publishing.md)、[Chat Completions 运行时规格](../../docs/runtime/chat-completions.md)或可信 Lua 文档。
+- Standard 任务失败、部分完成或取消时再读[任务记录规格](../../docs/rpg-maker/task-records.md)；按实际原因再读[SQLite 运行时规格](../../docs/runtime/sqlite.md)、[目录发布规格](../../docs/runtime/directory-publishing.md)、[Chat Completions 运行时规格](../../docs/runtime/chat-completions.md)或可信 Lua 文档。
 
 ### 任务清单
 
 - 区分正常部分结果、暂时不可用、技术错误和内部不变量破坏。
-- 收集安全的命令终态、运行标识、日志、项目状态和相关底层原因。
+- 收集命令终态、运行标识、运行级 JSONL 摘要、项目状态和相关底层原因；Standard 调查优先读取对应单任务记录。
 - 分别确认事务、候选发布和保存运行方案的终态。
 - 定位唯一责任阶段，复用已经合法提交的进度并确定恢复入口。
 
@@ -260,6 +262,7 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 - 明确协议所有者和真正需要 Lua 的阶段。
 - 设计最小脚本边界、稳定身份、事务、私有状态和幂等交接。
 - 复用 Standard 能力，不在 Lua 中重建已有机制。
+- 调查 Translate Lua 时读取脚本语义、普通 JSONL 和项目数据库；Lua 不生成 Standard 任务记录，不从一次 `ctx.llm` 响应猜测脚本验收或提交终态。
 - 验证重复运行、失败、取消、候选丢弃和恢复行为。
 
 ### 完成证据

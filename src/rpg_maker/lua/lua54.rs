@@ -4079,7 +4079,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_errors_keep_private_text_but_only_publish_the_stable_operation() {
+    fn vm_errors_keep_source_text_but_only_publish_the_stable_operation() {
         let sentinel = "底层原因".repeat(10_000);
         let error = vm_error(
             "execute_main_program",
@@ -6266,7 +6266,7 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn documented_complex_protocol_executes_all_three_phases_with_private_sqlite_state() {
+    async fn documented_complex_protocol_executes_all_three_phases_with_persisted_sqlite_state() {
         let directory = tempfile::tempdir().expect("应建立文档示例临时目录");
         let database_path = directory.path().join("project.db");
         drop(rusqlite::Connection::open(&database_path).expect("应建立文档示例数据库"));
@@ -6325,7 +6325,7 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("复杂协议应保存私有翻译状态");
+            .expect("复杂协议应保存翻译状态");
         assert_eq!(translation, "星港");
         assert_eq!(state.len(), 64);
         let target_count: i64 = connection

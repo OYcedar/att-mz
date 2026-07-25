@@ -183,3 +183,112 @@ diagnostic-io-kind-value = { $code ->
 diagnostic-configuration-rule-value = { $code ->
    *[other] { $fallback }{ $facts }
 }
+task-record-title = 翻訳タスク { $ordinal } · { $state }
+task-record-state-label = { $state ->
+    [complete] 完了
+    [partial] 一部完了
+    [unavailable] 利用不可
+    [execution_failed] 実行失敗
+    [commit_preparation_failed] コミット準備失敗
+    [commit_not_applied] コミット未適用
+    [commit_outcome_unknown] コミット結果不明
+    [not_committed_after_earlier_failure] 先行失敗により未コミット
+    [invalid_result] Executor 結果列が無効
+    [cancelled] キャンセル済み
+   *[other] { $state }
+}
+task-record-summary-with-written = `タスク { $ordinal }/{ $total }` · `試行 { $attempts } 回` · `検収 { $accepted }/{ $expected }` · `書き込み { $written } 箇所`
+task-record-summary-without-written = `タスク { $ordinal }/{ $total }` · `試行 { $attempts } 回` · `検収 { $accepted }/{ $expected }`
+task-record-run-id-label = Run ID：
+task-record-started-at-label = 開始時刻：
+task-record-duration-label = 合計時間：
+task-record-endpoint-label = Endpoint：
+task-record-model-label = Model：
+task-record-custom-parameters-heading = カスタムパラメーター
+task-record-attempts-heading = リクエスト経過
+task-record-final-result-heading = 最終結果
+task-record-no-request = 送信可能なモデルリクエストは作成されませんでした。
+task-record-empty-assistant = モデルは空のオブジェクトを返しました。
+task-record-parse-error = 解析エラー：{ $kind ->
+    [json] モデル応答の JSON が無効です（カテゴリ `{ $category }`、{ $line } 行 { $column } 列）
+    [thinking_not_allowed] 現在の応答モードでは思考出力を受け付けません（{ $line } 行 { $column } 列）
+    [thinking_envelope_missing] 必須の思考エンベロープがありません（{ $line } 行 { $column } 列）
+    [thinking_envelope_unclosed] 思考エンベロープが閉じられていません（{ $line } 行 { $column } 列）
+    [thinking_empty] 思考内容が空です（{ $line } 行 { $column } 列）
+    [thinking_nested] 入れ子の思考エンベロープがあります（{ $line } 行 { $column } 列）
+    [thinking_repeated] 思考エンベロープが重複しています（{ $line } 行 { $column } 列）
+    [markdown_fence_no_body] Markdown フェンスに本文がありません（{ $line } 行 { $column } 列）
+    [markdown_fence_unsupported] 言語指定なし、または json 指定の単一 Markdown フェンスだけを受け付けます（{ $line } 行 { $column } 列）
+    [markdown_fence_unclosed] Markdown フェンスが閉じられていません（{ $line } 行 { $column } 列）
+   *[markdown_fence_invalid_closing] Markdown フェンスは末尾の独立行で閉じる必要があります（{ $line } 行 { $column } 列）
+}
+task-record-attempt-succeeded = 試行 { $number }：成功；finish reason { $finish_reason }
+task-record-attempt-token-usage = ；token `{ $prompt } / { $completion } / { $total }`
+task-record-attempt-duration = ；所要時間 `{ $duration }`
+task-record-attempt-request-id = ；request ID { $request_id }
+task-record-attempt-response-id = ；response ID { $response_id }
+task-record-attempt-retryable = 試行 { $number }：再試行可能なリクエスト失敗；診断 `{ $code }`；所要時間 `{ $duration }`
+task-record-attempt-retry-after = ；Retry-After `{ $duration }`
+task-record-attempt-wait-retry = ；`{ $duration }` 後に再試行
+task-record-attempt-wait-completed = ；`{ $duration }` の待機は完了しましたが、次の試行は開始されませんでした
+task-record-attempt-wait-cancelled = ；`{ $duration }` の待機中にキャンセル
+task-record-attempt-failed = 試行 { $number }：リクエストまたはレスポンス処理失敗；診断 `{ $code }`；所要時間 `{ $duration }`
+task-record-attempt-cancelled = 試行 { $number }：キャンセル済み；所要時間 `{ $duration }`
+task-record-structured-reason = 理由：{ $reason }
+task-record-final-status = 状態：{ $state ->
+    [complete] 完了、コミット確認済み
+    [partial] 一部完了、コミット確認済み
+    [unavailable] 利用不可、プロジェクト変更なし
+    [execution_failed] 実行失敗、未コミット
+    [commit_preparation_failed] コミット準備失敗、未適用を確認
+    [commit_not_applied] トランザクション未適用を確認
+    [commit_outcome_unknown] コミット結果不明
+    [not_committed_after_earlier_failure] 先行タスク失敗により未コミット
+    [invalid_result] Executor 結果列が無効、未コミット
+    [cancelled] キャンセル済み、未コミット
+   *[other] { $state }
+}
+task-record-accepted-written = 受理：{ $accepted } 項目、実位置 { $written } 箇所へ書き込み
+task-record-accepted-outcome-unknown = 検収済み：{ $accepted } 項目；データベースのコミット結果を確認できません
+task-record-rejected-heading = 未受理：
+task-record-rejected-item = { $id }：{ $reason }
+task-record-protocol-diagnostic = プロトコル診断：{ $diagnostic }
+task-record-unavailable-reason = 利用不可の理由：{ $reason }
+task-record-task-diagnostic = タスク診断：`{ $code }`；理由 { $reason }
+task-record-rejection-reason = { $code ->
+    [missing] モデル出力がありません
+    [duplicate] モデル出力が重複しています
+    [invalid_shape] { $detail }
+    [invalid_shape_array] 翻訳は文字列配列である必要があります
+    [invalid_shape_item] 翻訳配列の { $line } 番目の項目は文字列である必要があります
+    [line_count_mismatch] 行数不一致（期待 { $expected }、実際 { $actual }）
+    [invalid_line_text] { $line } 行目に無効な制御文字があります
+    [blank_line_mismatch] { $line } 行目の空白状態不一致（期待：{ $expected_blank ->
+        [blank] 空白
+       *[other] 非空白
+    }）
+    [blank_translation] 翻訳が空です
+    [no_natural_language_text] 翻訳に自然言語テキストがありません
+    [contains_byte_order_mark] 翻訳に BOM が含まれます
+    [placeholder_mismatch] プレースホルダー不一致：{ $detail }
+    [unexpected_placeholder] 未知のプレースホルダー：{ $detail }
+    [placeholder_normalization_ambiguous] プレースホルダーの正規化が曖昧です：{ $detail }
+    [source_residual] 原文言語の残留を検出：{ $detail }
+   *[other] { $detail }
+}
+task-record-protocol-detail = { $code ->
+    [non_stop_finish] finish reason が stop ではありません：{ $detail }
+    [invalid_response] { $detail }
+    [invalid_id] モデルの { $index } 番目の項目の ID が無効です
+    [unknown_id] モデルの { $index } 番目の項目が未知の ID { $detail } を返しました
+   *[other] { $detail }
+}
+task-record-unavailable-detail = { $code ->
+    [model_response_unusable] モデルレスポンスを解析できません
+    [all_outputs_rejected] すべてのモデル出力が検収で拒否されました
+    [recoverable_request_exhausted] 回復可能なリクエストの再試行回数を使い切りました
+    [retry_after_exceeds_maximum] Retry-After が設定済み最大待機時間を超えています
+   *[other] { $code }
+}
+task-record-duration-seconds = { $value } 秒
+task-record-duration-milliseconds = { $value } ミリ秒

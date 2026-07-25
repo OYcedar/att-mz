@@ -183,3 +183,112 @@ diagnostic-io-kind-value = { $code ->
 diagnostic-configuration-rule-value = { $code ->
    *[other] { $fallback }{ $facts }
 }
+task-record-title = Tác vụ dịch { $ordinal } · { $state }
+task-record-state-label = { $state ->
+    [complete] Hoàn tất
+    [partial] Hoàn tất một phần
+    [unavailable] Không khả dụng
+    [execution_failed] Thực thi thất bại
+    [commit_preparation_failed] Chuẩn bị commit thất bại
+    [commit_not_applied] Commit chưa được áp dụng
+    [commit_outcome_unknown] Không rõ kết quả commit
+    [not_committed_after_earlier_failure] Chưa commit do lỗi trước đó
+    [invalid_result] Chuỗi kết quả Executor không hợp lệ
+    [cancelled] Đã hủy
+   *[other] { $state }
+}
+task-record-summary-with-written = `Tác vụ { $ordinal }/{ $total }` · `{ $attempts } lần thử` · `Đã nhận { $accepted }/{ $expected }` · `Ghi vào { $written } vị trí`
+task-record-summary-without-written = `Tác vụ { $ordinal }/{ $total }` · `{ $attempts } lần thử` · `Đã nhận { $accepted }/{ $expected }`
+task-record-run-id-label = ID lượt chạy:
+task-record-started-at-label = Bắt đầu:
+task-record-duration-label = Tổng thời gian:
+task-record-endpoint-label = Endpoint:
+task-record-model-label = Mô hình:
+task-record-custom-parameters-heading = Tham số tùy chỉnh
+task-record-attempts-heading = Các lần gửi yêu cầu
+task-record-final-result-heading = Kết quả cuối
+task-record-no-request = Không tạo được yêu cầu mô hình sẵn sàng để gửi.
+task-record-empty-assistant = Mô hình trả về một đối tượng rỗng.
+task-record-parse-error = Lỗi phân tích: { $kind ->
+    [json] JSON phản hồi của mô hình không hợp lệ (loại `{ $category }`), dòng { $line }, cột { $column }
+    [thinking_not_allowed] chế độ phản hồi hiện tại không chấp nhận phần suy luận, dòng { $line }, cột { $column }
+    [thinking_envelope_missing] thiếu phong bì suy luận bắt buộc, dòng { $line }, cột { $column }
+    [thinking_envelope_unclosed] phong bì suy luận chưa được đóng, dòng { $line }, cột { $column }
+    [thinking_empty] nội dung suy luận trống, dòng { $line }, cột { $column }
+    [thinking_nested] có phong bì suy luận lồng nhau, dòng { $line }, cột { $column }
+    [thinking_repeated] có phong bì suy luận lặp lại, dòng { $line }, cột { $column }
+    [markdown_fence_no_body] hàng rào Markdown không có nội dung, dòng { $line }, cột { $column }
+    [markdown_fence_unsupported] chỉ chấp nhận một hàng rào Markdown không có nhãn ngôn ngữ hoặc có nhãn json, dòng { $line }, cột { $column }
+    [markdown_fence_unclosed] hàng rào Markdown chưa được đóng, dòng { $line }, cột { $column }
+   *[markdown_fence_invalid_closing] hàng rào Markdown phải đóng ở dòng độc lập cuối cùng, dòng { $line }, cột { $column }
+}
+task-record-attempt-succeeded = Lần thử { $number }: thành công; finish reason { $finish_reason }
+task-record-attempt-token-usage = ; token `{ $prompt } / { $completion } / { $total }`
+task-record-attempt-duration = ; thời gian `{ $duration }`
+task-record-attempt-request-id = ; request ID { $request_id }
+task-record-attempt-response-id = ; response ID { $response_id }
+task-record-attempt-retryable = Lần thử { $number }: yêu cầu lỗi có thể thử lại; chẩn đoán `{ $code }`; thời gian `{ $duration }`
+task-record-attempt-retry-after = ; Retry-After `{ $duration }`
+task-record-attempt-wait-retry = ; thử lại sau `{ $duration }`
+task-record-attempt-wait-completed = ; đã chờ xong `{ $duration }`; lần thử tiếp theo chưa bắt đầu
+task-record-attempt-wait-cancelled = ; dự kiến chờ `{ $duration }`; đã hủy trong lúc chờ
+task-record-attempt-failed = Lần thử { $number }: xử lý yêu cầu hoặc phản hồi thất bại; chẩn đoán `{ $code }`; thời gian `{ $duration }`
+task-record-attempt-cancelled = Lần thử { $number }: đã hủy; thời gian `{ $duration }`
+task-record-structured-reason = Lý do: { $reason }
+task-record-final-status = Trạng thái: { $state ->
+    [complete] hoàn tất, đã xác nhận commit
+    [partial] hoàn tất một phần, đã xác nhận commit
+    [unavailable] không khả dụng, dự án không thay đổi
+    [execution_failed] thực thi thất bại, chưa commit
+    [commit_preparation_failed] chuẩn bị commit thất bại, chắc chắn chưa áp dụng
+    [commit_not_applied] giao dịch chắc chắn chưa áp dụng
+    [commit_outcome_unknown] không rõ kết quả commit
+    [not_committed_after_earlier_failure] chưa commit do tác vụ trước thất bại
+    [invalid_result] chuỗi kết quả Executor không hợp lệ, chưa commit
+    [cancelled] đã hủy, chưa commit
+   *[other] { $state }
+}
+task-record-accepted-written = Đã nhận: { $accepted } mục, ghi vào { $written } vị trí thực tế
+task-record-accepted-outcome-unknown = Đã kiểm tra: { $accepted } mục; không thể xác nhận kết quả commit cơ sở dữ liệu
+task-record-rejected-heading = Không được nhận:
+task-record-rejected-item = { $id }: { $reason }
+task-record-protocol-diagnostic = Chẩn đoán giao thức: { $diagnostic }
+task-record-unavailable-reason = Lý do không khả dụng: { $reason }
+task-record-task-diagnostic = Chẩn đoán tác vụ: `{ $code }`; lý do { $reason }
+task-record-rejection-reason = { $code ->
+    [missing] Thiếu đầu ra mô hình
+    [duplicate] Đầu ra mô hình bị lặp
+    [invalid_shape] { $detail }
+    [invalid_shape_array] Bản dịch phải là một mảng chuỗi
+    [invalid_shape_item] Mục { $line } của mảng bản dịch phải là chuỗi
+    [line_count_mismatch] Số dòng không khớp (mong đợi { $expected }, thực tế { $actual })
+    [invalid_line_text] Dòng { $line } chứa ký tự điều khiển không hợp lệ
+    [blank_line_mismatch] Trạng thái trống ở dòng { $line } không khớp (mong đợi: { $expected_blank ->
+        [blank] trống
+       *[other] không trống
+    })
+    [blank_translation] Bản dịch trống
+    [no_natural_language_text] Bản dịch không có văn bản ngôn ngữ tự nhiên
+    [contains_byte_order_mark] Bản dịch chứa BOM
+    [placeholder_mismatch] Placeholder không khớp: { $detail }
+    [unexpected_placeholder] Placeholder không mong đợi: { $detail }
+    [placeholder_normalization_ambiguous] Chuẩn hóa placeholder không rõ ràng: { $detail }
+    [source_residual] Phát hiện phần còn lại của ngôn ngữ nguồn: { $detail }
+   *[other] { $detail }
+}
+task-record-protocol-detail = { $code ->
+    [non_stop_finish] finish reason không phải stop: { $detail }
+    [invalid_response] { $detail }
+    [invalid_id] Mục mô hình thứ { $index } có ID không hợp lệ
+    [unknown_id] Mục mô hình thứ { $index } trả về ID lạ { $detail }
+   *[other] { $detail }
+}
+task-record-unavailable-detail = { $code ->
+    [model_response_unusable] Không thể phân tích phản hồi mô hình
+    [all_outputs_rejected] Mọi đầu ra mô hình đều không vượt qua kiểm tra
+    [recoverable_request_exhausted] Đã hết ngân sách thử lại cho yêu cầu có thể phục hồi
+    [retry_after_exceeds_maximum] Retry-After vượt quá thời gian chờ tối đa đã cấu hình
+   *[other] { $code }
+}
+task-record-duration-seconds = { $value } giây
+task-record-duration-milliseconds = { $value } mili giây

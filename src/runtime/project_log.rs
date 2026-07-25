@@ -439,9 +439,17 @@ impl ProjectLogger {
 
     /// 将同一运行中的其他可观测性产物故障并入既有非致命日志降级提示。
     pub(crate) fn record_observability_failure(&self, diagnostic: SafeDiagnostic) {
-        self.inner
-            .health
-            .record_failure(&self.inner.health.write_failures, diagnostic);
+        self.inner.health.record_observability_failure(diagnostic);
+    }
+
+    /// 同一可观测性操作的主错误与相关清理错误必须全部保留，不能互相覆盖。
+    pub(crate) fn record_observability_failures(
+        &self,
+        diagnostics: impl IntoIterator<Item = SafeDiagnostic>,
+    ) {
+        for diagnostic in diagnostics {
+            self.record_observability_failure(diagnostic);
+        }
     }
 }
 
@@ -495,6 +503,7 @@ impl ProjectLogHealthSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectLogWarning {
     pub(crate) diagnostic: Option<SafeDiagnostic>,
+    pub(crate) related_diagnostics: Vec<SafeDiagnostic>,
 }
 
 #[derive(Default)]
@@ -511,6 +520,7 @@ struct ProjectLogHealth {
     worker_panics: AtomicU64,
     warning_claimed: AtomicBool,
     first_failure: Mutex<Option<SafeDiagnostic>>,
+    observation_failures: Mutex<Vec<SafeDiagnostic>>,
 }
 
 impl ProjectLogHealth {
@@ -547,6 +557,14 @@ impl ProjectLogHealth {
         }
     }
 
+    fn record_observability_failure(&self, diagnostic: SafeDiagnostic) {
+        self.record_failure(&self.write_failures, diagnostic.clone());
+        self.observation_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(diagnostic);
+    }
+
     fn snapshot(&self) -> ProjectLogHealthSnapshot {
         ProjectLogHealthSnapshot {
             accepted_records: self.accepted_records.load(Ordering::Relaxed),
@@ -572,12 +590,26 @@ impl ProjectLogHealth {
         {
             return None;
         }
+        let diagnostic = self
+            .first_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut related_diagnostics = self
+            .observation_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(primary) = &diagnostic
+            && let Some(position) = related_diagnostics
+                .iter()
+                .position(|candidate| candidate == primary)
+        {
+            related_diagnostics.remove(position);
+        }
         Some(ProjectLogWarning {
-            diagnostic: self
-                .first_failure
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
+            diagnostic,
+            related_diagnostics,
         })
     }
 }
@@ -1353,6 +1385,60 @@ mod tests {
     }
 
     #[test]
+    fn observability_failures_remain_visible_after_an_earlier_project_log_failure() {
+        let health = Arc::new(ProjectLogHealth::default());
+        let logger = ProjectLogger::no_op(Arc::clone(&health));
+        let diagnostic = |path: &str| {
+            SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                DiagnosticStage::Logging,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::TargetAlreadyExists),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            )
+        };
+        health.record_failure(
+            &health.startup_failures,
+            SafeDiagnostic::new(
+                DiagnosticCode::LogStart,
+                DiagnosticStage::Logging,
+                DiagnosticSubject::path("C:/project/logs/run.jsonl"),
+                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            ),
+        );
+        logger.record_observability_failures([
+            diagnostic("C:/project/task-records/run/task-000001.md"),
+            diagnostic("C:/project/task-records/run/.task-000001.tmp"),
+        ]);
+
+        let warning = logger
+            .take_warning()
+            .expect("项目日志与任务记录故障必须形成非致命警告");
+        assert_eq!(
+            warning
+                .diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.code),
+            Some(DiagnosticCode::LogStart)
+        );
+        assert_eq!(
+            warning
+                .related_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.subject.clone())
+                .collect::<Vec<_>>(),
+            [
+                DiagnosticSubject::path("C:/project/task-records/run/task-000001.md"),
+                DiagnosticSubject::path("C:/project/task-records/run/.task-000001.tmp"),
+            ],
+            "较早的 JSONL 故障不得覆盖任务记录主错误或清理错误"
+        );
+    }
+
+    #[test]
     fn dropping_an_unfinished_runtime_writes_an_outcome_unknown_terminal_record() {
         let directory = tempdir().expect("临时目录应可建立");
         let run_id = "550e8400-e29b-41d4-a716-446655449998";
@@ -1393,7 +1479,7 @@ mod tests {
 
     #[test]
     fn armed_unfinished_terminal_uses_only_the_registered_safe_projection() {
-        const PRIVATE_PANIC_PAYLOAD: &str = "PANIC_PRIVATE_SENTINEL";
+        const PANIC_BODY: &str = "PANIC_BODY_SENTINEL";
         let directory = tempdir().expect("临时目录应可建立");
         let run_id = "550e8400-e29b-41d4-a716-446655449999";
         let mut runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
@@ -1415,13 +1501,13 @@ mod tests {
 
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _runtime = runtime;
-            std::panic::panic_any(Box::new(PRIVATE_PANIC_PAYLOAD));
+            std::panic::panic_any(Box::new(PANIC_BODY));
         }));
         assert!(caught.is_err());
         drop(caught);
 
         let raw = std::fs::read_to_string(&path).expect("日志应可读取");
-        assert!(!raw.contains(PRIVATE_PANIC_PAYLOAD));
+        assert!(!raw.contains(PANIC_BODY));
         let records = records(&path);
         assert_eq!(records[0]["code"], "performance.counters");
         assert_eq!(records[1]["code"], "failure.reported");
@@ -1497,11 +1583,14 @@ mod tests {
     }
 
     #[test]
-    fn failure_payload_cannot_leak_private_source_text() {
+    fn failure_payload_uses_only_the_stable_source_projection() {
         let directory = tempdir().expect("临时目录应可建立");
         let run_id = "550e8400-e29b-41d4-a716-446655440002";
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
-        let wrapped = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "SECRET_SENTINEL");
+        let wrapped = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "UNTYPED_SOURCE_SENTINEL",
+        );
         let failure = SafeDiagnostic::io(
             DiagnosticCode::ProjectUnavailable,
             DiagnosticStage::ProjectOpening,
@@ -1515,7 +1604,7 @@ mod tests {
         let _ = runtime.finish(ProjectLogRunOutcome::Failed, context(), vec![failure]);
         let path = directory.path().join(format!("{run_id}.jsonl"));
         let raw = std::fs::read_to_string(&path).expect("日志应可读取");
-        assert!(!raw.contains("SECRET_SENTINEL"));
+        assert!(!raw.contains("UNTYPED_SOURCE_SENTINEL"));
         assert!(!raw.contains('\u{1b}'));
         assert!(raw.contains("project.unavailable"));
         assert!(raw.contains("permission_denied"));

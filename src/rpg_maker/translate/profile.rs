@@ -26,10 +26,11 @@ pub(crate) struct RpgMakerSystemPrompt {
 
 impl fmt::Debug for RpgMakerSystemPrompt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Debug 只保留字符数以控制常规诊断体积；Prompt 正文是普通内容，并非敏感信息。
         formatter
             .debug_struct("RpgMakerSystemPrompt")
             .field("language_pair", &self.language_pair)
-            .field("markdown", &"[REDACTED]")
+            .field("markdown_characters", &self.markdown.chars().count())
             .field("response_envelope", &self.response_envelope)
             .finish()
     }
@@ -117,7 +118,7 @@ impl fmt::Debug for ResolvedRpgMakerTranslationResources {
         formatter
             .debug_struct("ResolvedRpgMakerTranslationResources")
             .field("language_pair", self.language_pair())
-            .field("system_prompt", &"[REDACTED]")
+            .field("system_prompt", &self.system_prompt)
             .field("source_language", &"dyn LanguageModule")
             .finish()
     }
@@ -170,8 +171,8 @@ impl RpgMakerTranslationRequestConfiguration {
 
 /// 一次 RPG Maker 翻译运行共享的不可变执行 Profile。
 ///
-/// Prompt 与语言模块属于项目语言对解析结果，不属于 Profile。Debug 输出不会访问或
-/// 展示 LLM Client，避免其中的凭据进入诊断。
+/// Prompt 与语言模块属于项目语言对解析结果，不属于 Profile。Profile Debug 使用
+/// 客户端类型名作为简洁投影，不调用任意客户端的 Debug 实现。
 pub(crate) struct RpgMakerTranslationProfile<L> {
     id: String,
     planning: RpgMakerTranslationPlanningConfiguration,
@@ -222,7 +223,7 @@ impl<L> fmt::Debug for RpgMakerTranslationProfile<L> {
             .field("id", &self.id)
             .field("planning", &self.planning)
             .field("request", &self.request)
-            .field("llm_client", &"[REDACTED]")
+            .field("llm_client_type", &std::any::type_name::<L>())
             .finish()
     }
 }
@@ -236,7 +237,7 @@ mod tests {
     use super::*;
 
     #[derive(Debug, Eq, PartialEq)]
-    struct SensitiveClient(&'static str);
+    struct TestClient(&'static str);
 
     fn non_zero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("测试配置必须非零")
@@ -249,7 +250,7 @@ mod tests {
         )
     }
 
-    fn profile(secret: &'static str) -> RpgMakerTranslationProfile<SensitiveClient> {
+    fn profile(marker: &'static str) -> RpgMakerTranslationProfile<TestClient> {
         RpgMakerTranslationProfile::new(
             "primary",
             RpgMakerTranslationPlanningConfiguration::new(non_zero(24_000)),
@@ -257,7 +258,7 @@ mod tests {
                 vec![Duration::from_millis(250), Duration::from_secs(2)],
                 Duration::from_secs(30),
             ),
-            Arc::new(SensitiveClient(secret)),
+            Arc::new(TestClient(marker)),
         )
     }
 
@@ -277,7 +278,8 @@ mod tests {
         );
         let debug = format!("{prompt:?}");
         assert!(debug.contains("ThinkingThenJson"));
-        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("markdown_characters: 7"));
+        assert!(!debug.contains("[REDACTED]"));
         assert!(!debug.contains("# 完整提示词"));
 
         let error = RpgMakerSystemPrompt::new(
@@ -292,7 +294,7 @@ mod tests {
 
     #[test]
     fn profile_keeps_every_external_strategy_without_owning_prompt() {
-        let profile = profile("secret");
+        let profile = profile("ordinary-client-state");
         assert_eq!(profile.id(), "primary");
         assert_eq!(
             profile.planning().target_user_message_characters(),
@@ -306,15 +308,16 @@ mod tests {
             profile.request().max_network_retry_after(),
             Duration::from_secs(30)
         );
-        assert!(profile.llm_client() == &SensitiveClient("secret"));
+        assert!(profile.llm_client() == &TestClient("ordinary-client-state"));
     }
 
     #[test]
-    fn debug_output_redacts_llm_client() {
-        let debug = format!("{:?}", profile("never-print-this-secret"));
+    fn debug_output_uses_a_compact_client_type_projection() {
+        let debug = format!("{:?}", profile("ordinary-client-state"));
         assert!(debug.contains("primary"));
-        assert!(debug.contains("[REDACTED]"));
-        assert!(!debug.contains("never-print-this-secret"));
+        assert!(debug.contains("TestClient"));
+        assert!(!debug.contains("[REDACTED]"));
+        assert!(!debug.contains("ordinary-client-state"));
     }
 
     #[test]
@@ -338,5 +341,8 @@ mod tests {
             TranslationResponseEnvelope::JsonOnly
         );
         assert!(Arc::ptr_eq(&resources.source_language(), &module));
+        let debug = format!("{resources:?}");
+        assert!(debug.contains("markdown_characters: 6"));
+        assert!(!debug.contains("[REDACTED]"));
     }
 }

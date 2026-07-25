@@ -22,11 +22,10 @@ use crate::diagnostic::{
 };
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::llm::{
-    ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
-    LlmRequestError, LlmRequestExecutor, LlmResponse, LlmUsage,
+    ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientRecordMetadata,
+    LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
+    LlmUsage,
 };
-
-use super::llm_call_log::{LlmCallOutcome, LlmCallRecorder, PendingLlmCall};
 
 /// 一个可被不同引擎及 Lua 共享的受信 LLM Client。
 pub(crate) struct OpenAiChatCompletionClient {
@@ -73,6 +72,15 @@ impl OpenAiChatCompletionClient {
     #[cfg(test)]
     pub(crate) const fn api_key(&self) -> &SecretString {
         &self.api_key
+    }
+
+    pub(crate) fn record_metadata(&self) -> LlmClientRecordMetadata {
+        LlmClientRecordMetadata::new(
+            self.url.to_string(),
+            self.model.clone(),
+            self.parameters.clone(),
+            ApiKeyRedactor::new(self.api_key.clone()),
+        )
     }
 }
 
@@ -327,17 +335,20 @@ fn canonical_json_number(value: &str) -> (bool, String, bool, String) {
 
 impl fmt::Debug for OpenAiChatCompletionClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let parameter_fields = self.parameters.keys().collect::<Vec<_>>();
+        let redactor = ApiKeyRedactor::new(self.api_key.clone());
+        let endpoint = redactor.redact_url(self.url.as_str());
+        let model = redactor.redact(&self.model);
+        let parameters = redactor
+            .redact_json(&self.parameters)
+            .expect("已验证的 LLM 自定义参数必须能够序列化");
         formatter
             .debug_struct("OpenAiChatCompletionClient")
-            .field("url_scheme", &self.url.scheme())
-            .field("url_host", &self.url.host_str())
-            .field("api_key", &"[REDACTED]")
-            .field("model", &self.model)
+            .field("endpoint", &endpoint)
+            .field("model", &model)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("request_timeout", &self.request_timeout)
             .field("rate_limited", &self.rate_limiter.is_some())
-            .field("parameter_fields", &parameter_fields)
+            .field("parameters", &parameters)
             .finish_non_exhaustive()
     }
 }
@@ -352,7 +363,7 @@ impl fmt::Debug for LlmProxyConfiguration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Disabled => formatter.write_str("Disabled"),
-            Self::Explicit(_) => formatter.write_str("Explicit([REDACTED])"),
+            Self::Explicit(url) => formatter.debug_tuple("Explicit").field(url).finish(),
         }
     }
 }
@@ -479,7 +490,6 @@ pub(crate) struct OpenAiChatCompletionExecutor {
     client: Client,
     active_capacity: Arc<Semaphore>,
     lifecycle: Arc<LlmLifecycle>,
-    call_recorder: Option<LlmCallRecorder>,
 }
 
 impl OpenAiChatCompletionExecutor {
@@ -510,13 +520,7 @@ impl OpenAiChatCompletionExecutor {
             client,
             active_capacity: Arc::new(Semaphore::new(configuration.max_active_requests.get())),
             lifecycle: Arc::new(LlmLifecycle::new()),
-            call_recorder: None,
         })
-    }
-
-    pub(crate) fn with_call_recorder(mut self, recorder: LlmCallRecorder) -> Self {
-        self.call_recorder = Some(recorder);
-        self
     }
 
     /// 停止新请求并立即唤醒正在等待供应商速率或活动许可的请求。
@@ -528,12 +532,6 @@ impl OpenAiChatCompletionExecutor {
     pub(crate) async fn shutdown(&self) {
         self.cancel_waits();
         self.lifecycle.wait_until_idle().await;
-    }
-
-    async fn record_call(&self, call: Option<PendingLlmCall>, outcome: LlmCallOutcome<'_>) {
-        if let (Some(recorder), Some(call)) = (&self.call_recorder, call) {
-            recorder.record(call, outcome).await;
-        }
     }
 
     async fn execute_request(
@@ -552,10 +550,6 @@ impl OpenAiChatCompletionExecutor {
         let active_permit =
             wait_for_active(Arc::clone(&self.active_capacity), &self.lifecycle).await?;
 
-        let call = self
-            .call_recorder
-            .as_ref()
-            .map(|recorder| recorder.begin(&client.url, &request_body));
         let request = self
             .client
             .post(client.url.clone())
@@ -569,10 +563,7 @@ impl OpenAiChatCompletionExecutor {
             Err(source) => {
                 drop(active_permit);
                 drop(job);
-                let result = Err(classify_transport_error(source));
-                self.record_call(call, LlmCallOutcome::ResponseNotReceived)
-                    .await;
-                return result;
+                return Err(classify_transport_error(source));
             }
         };
         let status = response.status();
@@ -586,6 +577,9 @@ impl OpenAiChatCompletionExecutor {
                 .ok()
                 .and_then(|body| parse_provider_error_identifiers(body))
                 .unwrap_or((None, None));
+            let redactor = ApiKeyRedactor::new(client.api_key.clone());
+            let provider_code = provider_code.map(|value| redactor.redact(&value));
+            let provider_type = provider_type.map(|value| redactor.redact(&value));
             let error = OpenAiChatCompletionError::HttpStatus {
                 status: status.as_u16(),
                 provider_code,
@@ -599,27 +593,6 @@ impl OpenAiChatCompletionExecutor {
             } else {
                 Err(LlmRequestError::Fatal(error))
             };
-            match &provider_body {
-                Ok(body) => {
-                    self.record_call(
-                        call,
-                        LlmCallOutcome::HttpError {
-                            status: status.as_u16(),
-                            body,
-                        },
-                    )
-                    .await;
-                }
-                Err(_) => {
-                    self.record_call(
-                        call,
-                        LlmCallOutcome::BodyReadFailed {
-                            status: status.as_u16(),
-                        },
-                    )
-                    .await;
-                }
-            }
             return result;
         }
 
@@ -633,33 +606,12 @@ impl OpenAiChatCompletionExecutor {
             Err(source) => {
                 drop(active_permit);
                 drop(job);
-                let result = Err(classify_transport_error(source));
-                self.record_call(
-                    call,
-                    LlmCallOutcome::BodyReadFailed {
-                        status: status.as_u16(),
-                    },
-                )
-                .await;
-                return result;
+                return Err(classify_transport_error(source));
             }
         };
         drop(active_permit);
         drop(job);
-        let result = parse_success_response(&response_body, provider_request_id);
-        let outcome = if result.is_ok() {
-            LlmCallOutcome::ResponseParsed {
-                status: status.as_u16(),
-                body: &response_body,
-            }
-        } else {
-            LlmCallOutcome::ResponseParseFailed {
-                status: status.as_u16(),
-                body: &response_body,
-            }
-        };
-        self.record_call(call, outcome).await;
-        result
+        parse_success_response(&response_body, provider_request_id)
     }
 }
 
@@ -806,6 +758,10 @@ impl crate::llm::LlmRequestDiagnosticSource for OpenAiChatCompletionError {
         impact: DiagnosticImpact,
     ) -> SafeDiagnostic {
         self.safe_diagnostic(retry_after, impact)
+    }
+
+    fn is_cancelled_wait(&self) -> bool {
+        matches!(self, Self::WaitCancelled)
     }
 }
 
@@ -1226,21 +1182,12 @@ impl Drop for LlmJobGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::thread;
 
     use super::*;
-    use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
-    use crate::runtime::project_log::{
-        ProjectLogContext, ProjectLogRunOutcome, ProjectLogRuntime, ProjectLogger,
-        start_project_log,
-    };
-
-    const RECORDED_RUN_ID: &str = "550e8400-e29b-41d4-a716-446655440010";
 
     fn non_zero_usize(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("测试值必须非零")
@@ -1279,60 +1226,6 @@ mod tests {
             LlmProxyConfiguration::Disabled,
         ))
         .expect("测试 LLM 根应构造成功")
-    }
-
-    struct RecordingHarness {
-        executor: OpenAiChatCompletionExecutor,
-        file_system: SystemFileSystem,
-        project_log: ProjectLogRuntime,
-        logger: ProjectLogger,
-        call_directory: PathBuf,
-    }
-
-    impl RecordingHarness {
-        fn new(root: &Path, max_active_requests: usize) -> Self {
-            let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
-                .expect("测试文件系统根应构造成功");
-            let project_log = start_project_log(root.join("logs"), RECORDED_RUN_ID.to_owned());
-            let logger = project_log.logger();
-            let call_directory = root.join("llm-calls").join(RECORDED_RUN_ID);
-            let recorder = LlmCallRecorder::new(
-                call_directory.clone(),
-                RECORDED_RUN_ID.to_owned(),
-                file_system.clone(),
-                logger.clone(),
-            );
-            let executor = executor(max_active_requests).with_call_recorder(recorder);
-            Self {
-                executor,
-                file_system,
-                project_log,
-                logger,
-                call_directory,
-            }
-        }
-
-        async fn shutdown(self) {
-            let Self {
-                executor,
-                file_system,
-                project_log,
-                logger,
-                ..
-            } = self;
-            executor.shutdown().await;
-            drop(executor);
-            file_system
-                .shutdown()
-                .await
-                .expect("测试文件系统根应正常关闭");
-            project_log.finish(
-                ProjectLogRunOutcome::Succeeded,
-                ProjectLogContext::new("en"),
-                Vec::new(),
-            );
-            drop(logger);
-        }
     }
 
     struct TestServer {
@@ -1476,11 +1369,11 @@ mod tests {
     }
 
     #[test]
-    fn debug_redacts_api_key_and_parameter_values() {
+    fn debug_shows_ordinary_parameters_and_replaces_api_key() {
         let mut parameters = Map::new();
         parameters.insert(
-            "vendor_secret".to_owned(),
-            Value::String("must-not-appear".to_owned()),
+            "vendor_option".to_owned(),
+            Value::String("ordinary-value/api-secret".to_owned()),
         );
         let client = OpenAiChatCompletionClient::new(
             Url::parse("https://example.com/v1/chat/completions").expect("测试 URL 有效"),
@@ -1492,8 +1385,9 @@ mod tests {
             parameters,
         );
         let debug = format!("{client:?}");
-        assert!(debug.contains("vendor_secret"));
-        assert!(!debug.contains("must-not-appear"));
+        assert!(debug.contains("vendor_option"));
+        assert!(debug.contains("ordinary-value"));
+        assert!(debug.contains("[REDACTED API KEY]"));
         assert!(!debug.contains("api-secret"));
     }
 
@@ -1758,14 +1652,14 @@ mod tests {
     #[test]
     fn provider_error_projection_keeps_only_stable_identifiers() {
         let (code, kind) = parse_provider_error_identifiers(
-            br#"{"error":{"code":"rate_limit_exceeded","type":"requests/rate-limit","message":"MODEL_BODY_SECRET"}}"#,
+            br#"{"error":{"code":"rate_limit_exceeded","type":"requests/rate-limit","message":"MODEL_BODY_SENTINEL"}}"#,
         )
         .expect("供应商错误信封应可解析");
         assert_eq!(code.as_deref(), Some("rate_limit_exceeded"));
         assert_eq!(kind.as_deref(), Some("requests/rate-limit"));
 
         let (code, kind) = parse_provider_error_identifiers(
-            br#"{"error":{"code":"API_KEY_SECRET\r\nforged","type":"MODEL_BODY_SECRET!","message":"MODEL_BODY_SECRET"}}"#,
+            br#"{"error":{"code":"PROVIDER_CODE_WITH_CONTROL\r\nforged","type":"MODEL_BODY_SENTINEL!","message":"MODEL_BODY_SENTINEL"}}"#,
         )
         .expect("无效供应商标识不应使信封解析失败");
         assert_eq!(code, None);
@@ -1773,10 +1667,10 @@ mod tests {
     }
 
     #[test]
-    fn http_diagnostic_never_exposes_provider_body_or_invalid_identifier() {
+    fn http_diagnostic_uses_only_stable_provider_identifiers() {
         let source = OpenAiChatCompletionError::HttpStatus {
             status: 429,
-            provider_code: Some("API_KEY_SECRET\r\nforged".to_owned()),
+            provider_code: Some("PROVIDER_CODE_WITH_CONTROL\r\nforged".to_owned()),
             provider_type: Some("rate_limit".to_owned()),
         };
         let diagnostic = source.safe_diagnostic(
@@ -1784,7 +1678,7 @@ mod tests {
             DiagnosticImpact::ProgressPreserved,
         );
         let serialized = serde_json::to_string(&diagnostic).expect("诊断应可序列化");
-        assert!(!serialized.contains("API_KEY_SECRET"));
+        assert!(!serialized.contains("PROVIDER_CODE_WITH_CONTROL"));
         assert!(!serialized.contains("forged"));
         assert!(serialized.contains("\"status\":429"));
         assert!(serialized.contains("\"retry_after_seconds\":3"));
@@ -1816,7 +1710,7 @@ mod tests {
         assert!(serialization.contains("json_category=data; line=0; column=0"));
         assert!(!serialization.contains("REQUEST_AND_PARAMETER_BODY_SENTINEL"));
 
-        let response_body = br#"{"secret":"RESPONSE_MODEL_BODY_SENTINEL",]"#;
+        let response_body = br#"{"payload":"RESPONSE_MODEL_BODY_SENTINEL",]"#;
         let parsing_source =
             serde_json::from_slice::<Value>(response_body).expect_err("测试响应必须是无效 JSON");
         let line = parsing_source.line();
@@ -1970,241 +1864,6 @@ mod tests {
 
         executor.shutdown().await;
         server.worker.join().expect("测试服务器应正常退出");
-    }
-
-    #[tokio::test]
-    async fn call_recording_keeps_final_request_and_raw_success_without_credentials() {
-        const API_KEY_SENTINEL: &str = "recording-api-key-secret";
-        const QUERY_SENTINEL: &str = "recording-query-secret";
-        let directory = tempfile::tempdir().expect("调用记录测试目录应建立");
-        let server = spawn_test_server(
-            vec![success_response(
-                "recorded-response-id",
-                "recorded-request-id",
-                "provider-response-content",
-            )],
-            false,
-        );
-        let clean_endpoint = server.endpoint.clone();
-        let endpoint = format!("{clean_endpoint}?token={QUERY_SENTINEL}");
-        let parameters = serde_json::from_value::<Map<String, Value>>(serde_json::json!({
-            "temperature": 0.25,
-            "provider_extension": { "mode": "recorded" }
-        }))
-        .expect("测试参数应为对象");
-        let mut client = client(&endpoint, parameters);
-        client.api_key = SecretString::from(API_KEY_SENTINEL);
-        let harness = RecordingHarness::new(directory.path(), 1);
-        let call_path = harness.call_directory.join("call-000001.md");
-
-        let response = harness
-            .executor
-            .request(
-                &client,
-                &[
-                    ChatMessage::new(ChatMessageRole::System, "recorded system contract"),
-                    ChatMessage::new(ChatMessageRole::User, "recorded user content"),
-                ],
-            )
-            .await
-            .expect("带调用记录的成功响应应原样返回");
-        let sent_request = server
-            .requests
-            .recv_timeout(Duration::from_secs(1))
-            .expect("测试服务器应收到请求");
-        server.worker.join().expect("测试服务器应正常退出");
-        let markdown = fs::read_to_string(call_path).expect("成功调用记录应可读取");
-        harness.shutdown().await;
-
-        assert_eq!(response.content(), "provider-response-content");
-        assert!(
-            request_headers(&sent_request).contains(&format!("Bearer {API_KEY_SENTINEL}")),
-            "测试请求本身必须带有用于验证脱敏的凭据"
-        );
-        assert!(markdown.contains(&format!("- Endpoint: `{clean_endpoint}`")));
-        assert!(markdown.contains("\"model\": \"test-model\""));
-        assert!(markdown.contains("\"content\": \"recorded system contract\""));
-        assert!(markdown.contains("\"content\": \"recorded user content\""));
-        assert!(markdown.contains("\"temperature\": 0.25"));
-        assert!(markdown.contains("\"mode\": \"recorded\""));
-        assert!(markdown.contains("\"id\":\"recorded-response-id\""));
-        assert!(markdown.contains("\"content\":\"provider-response-content\""));
-        assert!(markdown.contains("- Result: `response_parsed`"));
-        assert!(!markdown.contains(API_KEY_SENTINEL));
-        assert!(!markdown.contains(QUERY_SENTINEL));
-        assert!(!markdown.to_ascii_lowercase().contains("authorization"));
-    }
-
-    #[tokio::test]
-    async fn call_recording_preserves_non_200_classification_and_body() {
-        let directory = tempfile::tempdir().expect("调用记录测试目录应建立");
-        let provider_body = r#"{"error":{"code":"rate_limit_exceeded","type":"requests","message":"provider-visible-detail"}}"#;
-        let server = spawn_test_server(
-            vec![status_response(
-                "429 Too Many Requests",
-                "Retry-After: 3\r\nContent-Type: application/json\r\n",
-                provider_body,
-            )],
-            false,
-        );
-        let client = client_with_rate(&server.endpoint, Map::new(), 60, 1);
-        let harness = RecordingHarness::new(directory.path(), 1);
-        let call_path = harness.call_directory.join("call-000001.md");
-
-        let result = harness
-            .executor
-            .request(
-                &client,
-                &[ChatMessage::new(ChatMessageRole::User, "content")],
-            )
-            .await;
-        let remained_retryable = matches!(
-            result,
-            Err(LlmRequestError::Retryable {
-                source: OpenAiChatCompletionError::HttpStatus { status: 429, .. },
-                retry_after: Some(duration),
-            }) if duration == Duration::from_secs(3)
-        );
-        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
-        server.worker.join().expect("测试服务器应正常退出");
-        let markdown = fs::read_to_string(call_path).expect("非 200 调用记录应可读取");
-        harness.shutdown().await;
-
-        assert!(remained_retryable, "调用记录不得改变原有 429 分类");
-        assert!(markdown.contains("- Result: `http_error`"));
-        assert!(markdown.contains("- HTTP status: `429`"));
-        assert!(markdown.contains(provider_body));
-    }
-
-    #[tokio::test]
-    async fn call_recording_marks_connection_failure_without_changing_classification() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("测试端口应可占用");
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().expect("测试地址应可读")
-        );
-        drop(listener);
-        let directory = tempfile::tempdir().expect("调用记录测试目录应建立");
-        let client = client(&endpoint, Map::new());
-        let harness = RecordingHarness::new(directory.path(), 1);
-        let call_path = harness.call_directory.join("call-000001.md");
-
-        let result = harness
-            .executor
-            .request(
-                &client,
-                &[ChatMessage::new(ChatMessageRole::User, "content")],
-            )
-            .await;
-        let remained_retryable = matches!(
-            result,
-            Err(LlmRequestError::Retryable {
-                source: OpenAiChatCompletionError::Transport(_),
-                retry_after: None,
-            })
-        );
-        let markdown = fs::read_to_string(call_path).expect("连接失败调用记录应可读取");
-        harness.shutdown().await;
-
-        assert!(remained_retryable, "调用记录不得改变连接失败分类");
-        assert!(markdown.contains("- Result: `response_not_received`"));
-        assert!(markdown.contains("_No response body was received._"));
-        assert!(!markdown.contains("- HTTP status:"));
-    }
-
-    #[tokio::test]
-    async fn concurrent_call_recording_creates_unique_continuous_files() {
-        const CALL_COUNT: usize = 8;
-        let directory = tempfile::tempdir().expect("调用记录测试目录应建立");
-        let response = success_response("response", "request", "[]");
-        let server = spawn_test_server(vec![response; CALL_COUNT], false);
-        let client = Arc::new(client_with_rate(
-            &server.endpoint,
-            Map::new(),
-            60_000,
-            u32::try_from(CALL_COUNT).expect("测试调用数应可表示为 u32"),
-        ));
-        let harness = RecordingHarness::new(directory.path(), CALL_COUNT);
-        let mut requests = Vec::with_capacity(CALL_COUNT);
-        for index in 0..CALL_COUNT {
-            let executor = harness.executor.clone();
-            let client = Arc::clone(&client);
-            requests.push(tokio::spawn(async move {
-                let messages = [ChatMessage::new(
-                    ChatMessageRole::User,
-                    format!("content-{index}"),
-                )];
-                executor.request(client.as_ref(), &messages).await
-            }));
-        }
-
-        for request in requests {
-            request
-                .await
-                .expect("并发请求任务不应 panic")
-                .expect("并发请求应成功");
-        }
-        server.worker.join().expect("测试服务器应正常退出");
-        let mut file_names = fs::read_dir(&harness.call_directory)
-            .expect("调用记录目录应可列举")
-            .map(|entry| {
-                entry
-                    .expect("调用记录目录项应可读取")
-                    .file_name()
-                    .into_string()
-                    .expect("调用记录文件名应为 UTF-8")
-            })
-            .collect::<Vec<_>>();
-        file_names.sort();
-        harness.shutdown().await;
-
-        let expected = (1..=CALL_COUNT)
-            .map(|number| format!("call-{number:06}.md"))
-            .collect::<Vec<_>>();
-        assert_eq!(file_names, expected);
-    }
-
-    #[tokio::test]
-    async fn call_recording_failure_is_non_fatal_and_visible_as_log_degradation() {
-        let directory = tempfile::tempdir().expect("调用记录测试目录应建立");
-        fs::write(directory.path().join("llm-calls"), b"not-a-directory")
-            .expect("普通文件应稳定阻止调用记录目录建立");
-        let server = spawn_test_server(
-            vec![success_response(
-                "response-body",
-                "request-header",
-                "successful-content",
-            )],
-            false,
-        );
-        let client = client(&server.endpoint, Map::new());
-        let harness = RecordingHarness::new(directory.path(), 1);
-
-        let response = harness
-            .executor
-            .request(
-                &client,
-                &[ChatMessage::new(ChatMessageRole::User, "content")],
-            )
-            .await
-            .expect("调用记录失败不得否定成功 HTTP 响应");
-        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
-        server.worker.join().expect("测试服务器应正常退出");
-        let warning = harness
-            .logger
-            .take_warning()
-            .expect("调用记录故障必须进入既有日志降级提示");
-        let diagnostic = warning
-            .diagnostic
-            .as_ref()
-            .expect("调用记录故障应保留首个安全诊断");
-        let diagnostic = serde_json::to_string(diagnostic).expect("安全诊断应可序列化");
-        let call_file_exists = harness.call_directory.join("call-000001.md").exists();
-        harness.shutdown().await;
-
-        assert_eq!(response.content(), "successful-content");
-        assert!(diagnostic.contains("llm-calls"));
-        assert!(!call_file_exists);
     }
 
     #[tokio::test]

@@ -2809,8 +2809,8 @@ mod tests {
     }
 
     #[test]
-    fn nested_json_diagnostics_distinguish_operations_and_hide_json_body() {
-        const SECRET: &str = "SENTINEL_REWRITER_JSON_BODY_6e92";
+    fn nested_json_diagnostics_distinguish_operations_without_copying_json_body() {
+        const JSON_BODY: &str = "SENTINEL_REWRITER_JSON_BODY_6e92";
 
         let location = RpgMakerLocation::value(
             crate::rpg_maker::text::RpgMakerSource::map(3),
@@ -2819,7 +2819,7 @@ mod tests {
             )],
         );
         let backend_error = || {
-            let source = format!("{{\"{SECRET}\":");
+            let source = format!("{{\"{JSON_BODY}\":");
             StackSafeJsonError::Backend(
                 serde_json::from_str::<serde_json::Value>(&source).expect_err("测试 JSON 应不完整"),
             )
@@ -2884,8 +2884,11 @@ mod tests {
             )
             .expect("安全诊断应可渲染");
             let cli = String::from_utf8(cli).expect("CLI 诊断应为 UTF-8");
-            assert!(!json.contains(SECRET), "JSONL 泄漏了 JSON 正文：{json}");
-            assert!(!cli.contains(SECRET), "CLI 泄漏了 JSON 正文：{cli}");
+            assert!(
+                !json.contains(JSON_BODY),
+                "JSONL 不应复制 JSON 正文：{json}"
+            );
+            assert!(!cli.contains(JSON_BODY), "CLI 不应复制 JSON 正文：{cli}");
             for fact in expected_facts {
                 assert!(json.contains(fact), "JSONL 缺少 {fact}: {json}");
                 assert!(cli.contains(fact), "CLI 缺少 {fact}: {cli}");

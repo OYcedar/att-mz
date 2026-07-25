@@ -74,7 +74,7 @@ impl SqliteQuery {
 
     /// 为领域快照中的查询指定可公开的稳定身份。
     ///
-    /// 身份只用于安全诊断；SQL 与参数始终留在私有错误源中。
+    /// 身份只用于稳定诊断；SQL 与参数仍由存储边界持有，不复制到公开投影。
     pub(crate) fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = id.into();
         self
@@ -341,7 +341,7 @@ pub(crate) enum SqliteTransactionStep {
     RequireNoRows(SqliteQuery),
     /// 查询必须不返回任何行；命中时在确认回滚后把第一行作为领域诊断事实返回。
     ///
-    /// SQL 与参数仍由存储实现私有持有，调用方只能消费自己声明的固定列投影。
+    /// SQL 与参数仍由存储实现持有，调用方只能消费自己声明的固定列投影。
     RequireNoRowsReturningFirstRow(SqliteQuery),
     /// 只准备一次查询，按顺序校验全部参数组均不返回任何行。
     RequireNoRowsMany(SqliteBatch),
@@ -642,7 +642,7 @@ pub(crate) trait SqliteDatabaseSnapshotter: Send + Sync {
 /// 只读查询一个必须已经存在的 SQLite 数据库。
 ///
 /// 实现不得因数据库缺失而创建主文件；多查询快照必须在同一个连接和只读事务中按
-/// 输入顺序执行。查询完成后不向调用方泄漏连接、statement 或行游标。返回的 Future
+/// 输入顺序执行。查询完成后不向调用方返回连接、statement 或行游标。返回的 Future
 /// 必须为 `Send`，且不得阻塞异步执行器线程。
 pub(crate) trait SqliteQueryExecutor: Send + Sync {
     type Error: Error + Send + Sync + 'static;

@@ -15,6 +15,7 @@ pub(crate) mod result_store;
 pub(crate) mod semantics;
 pub(crate) mod service;
 pub(crate) mod standard;
+pub(crate) mod task_record;
 
 #[cfg(test)]
 mod full_tree_tests;

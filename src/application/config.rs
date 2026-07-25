@@ -275,7 +275,7 @@ impl ConfiguredRpgMakerCommand {
                     DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source));
                 let raw: RawTranslateSelection = parse_selected(source, configuration_path)?;
                 let cpu = build_cpu_configuration();
-                let record_calls = raw.llm.record_calls;
+                let record_translation_tasks = raw.rpg_maker.record_translation_tasks;
                 let TranslateArguments {
                     project,
                     profile_id,
@@ -305,7 +305,7 @@ impl ConfiguredRpgMakerCommand {
                     cpu,
                     lua,
                     deferred_lua,
-                    record_calls,
+                    record_translation_tasks,
                     profile: ConfiguredTranslateProfile::Deferred {
                         source: deferred_source,
                         configuration: rpg_maker,
@@ -451,7 +451,7 @@ pub(crate) struct ConfiguredTranslateCommand {
     cpu: CpuExecutorConfig,
     lua: Option<SelectedLuaConfiguration>,
     deferred_lua: DeferredLuaRuntimeConfiguration,
-    record_calls: bool,
+    record_translation_tasks: bool,
     profile: ConfiguredTranslateProfile,
 }
 
@@ -492,8 +492,8 @@ impl ConfiguredTranslateCommand {
         self.lua.as_ref()
     }
 
-    pub(crate) const fn record_calls(&self) -> bool {
-        self.record_calls
+    pub(crate) const fn record_translation_tasks(&self) -> bool {
+        self.record_translation_tasks
     }
 
     /// 仅在项目状态要求复用 Lua 程序时解析并校验 Lua 运行时配置。
@@ -534,7 +534,7 @@ impl ConfiguredTranslateCommand {
             cpu,
             lua,
             deferred_lua,
-            record_calls,
+            record_translation_tasks,
             profile,
         } = self;
         let profile = match profile {
@@ -566,7 +566,7 @@ impl ConfiguredTranslateCommand {
             cpu,
             lua,
             deferred_lua,
-            record_calls,
+            record_translation_tasks,
             profile,
         })
     }
@@ -1141,25 +1141,25 @@ fn build_llm_client(
     if exposed_api_key.trim().is_empty() {
         return Err(invalid(
             format!("{field}.api_key").as_str(),
-            ConfigurationValueRule::SecretBlank,
+            ConfigurationValueRule::ApiKeyBlank,
         ));
     }
     if exposed_api_key.trim() != exposed_api_key {
         return Err(invalid(
             format!("{field}.api_key").as_str(),
-            ConfigurationValueRule::SecretSurroundingWhitespace,
+            ConfigurationValueRule::ApiKeySurroundingWhitespace,
         ));
     }
     if reqwest::header::HeaderValue::from_bytes(exposed_api_key.as_bytes()).is_err() {
         return Err(invalid(
             format!("{field}.api_key").as_str(),
-            ConfigurationValueRule::SecretInvalidHeader,
+            ConfigurationValueRule::ApiKeyInvalidHeader,
         ));
     }
 
-    // 任意精度数字会在 Serde 访问器内使用一个私有 map 信封传递原始十进制
+    // 任意精度数字会在 Serde 访问器内使用一个内部 map 信封传递原始十进制
     // 文本。第一遍自定义访问器只负责递归拒绝重复键；第二遍由
-    // `serde_json::Value` 自身还原真正的 Number，避免把内部信封泄漏到请求正文。
+    // `serde_json::Value` 自身还原真正的 Number，避免把内部信封写入请求正文。
     serde_json::from_str::<StrictJsonValue>(&raw.parameters).map_err(|error| {
         invalid(
             format!("{field}.parameters").as_str(),
@@ -1468,18 +1468,11 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     }
 }
 
-fn deserialize_secret_string<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
+fn deserialize_api_key<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
 where
     D: Deserializer<'de>,
 {
     String::deserialize(deserializer).map(SecretString::from)
-}
-
-fn deserialize_zeroizing_string<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    String::deserialize(deserializer).map(Zeroizing::new)
 }
 
 fn non_zero_usize(field: &str, value: u64) -> Result<NonZeroUsize, ConfigurationValueError> {
@@ -2437,9 +2430,6 @@ impl<'de> Visitor<'de> for SelectedLlmClientSectionVisitor<'_> {
         let mut selected = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
-                "record_calls" => {
-                    map.next_value::<IgnoredAny>()?;
-                }
                 "clients" => {
                     if selected.is_some() {
                         return Err(de::Error::duplicate_field("clients"));
@@ -2448,7 +2438,7 @@ impl<'de> Visitor<'de> for SelectedLlmClientSectionVisitor<'_> {
                         requested_id: self.requested_id,
                     })?;
                 }
-                _ => return Err(de::Error::unknown_field(&key, &["record_calls", "clients"])),
+                _ => return Err(de::Error::unknown_field(&key, &["clients"])),
             }
         }
         Ok(selected)
@@ -2538,8 +2528,6 @@ struct RawPromptsFieldNames {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLlmFieldNames {
-    #[serde(default, rename = "record_calls")]
-    _record_calls: Option<IgnoredAny>,
     #[serde(default, rename = "clients")]
     _clients: Option<BTreeMap<String, RawLlmClientFieldNames>>,
 }
@@ -2614,6 +2602,8 @@ struct RawLanguageFieldNames {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRpgMakerFieldNames {
+    #[serde(default, rename = "record_translation_tasks")]
+    _record_translation_tasks: Option<IgnoredAny>,
     #[serde(default, rename = "translation_profiles")]
     _translation_profiles: Option<Vec<RawTranslationProfileFieldNames>>,
 }
@@ -2681,8 +2671,8 @@ struct RawTranslateSelection {
     rpg_maker: RawTranslateRpgMakerSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
-    #[serde(default)]
-    llm: RawTranslateLlmConfiguration,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2703,6 +2693,8 @@ struct RawWriteBackSelection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTranslateRpgMakerSelection {
+    #[serde(default)]
+    record_translation_tasks: bool,
     #[serde(rename = "translation_profiles")]
     _translation_profiles: IgnoredAny,
 }
@@ -2713,15 +2705,6 @@ struct RawPromptsConfiguration {
     root: PathBuf,
     locale: String,
     thinking_output: bool,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTranslateLlmConfiguration {
-    #[serde(default)]
-    record_calls: bool,
-    #[serde(default, rename = "clients")]
-    _clients: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2769,7 +2752,7 @@ struct RawSelectedTranslationProfileConfiguration {
 #[serde(deny_unknown_fields)]
 struct RawLlmClientConfiguration {
     url: String,
-    #[serde(deserialize_with = "deserialize_secret_string")]
+    #[serde(deserialize_with = "deserialize_api_key")]
     api_key: SecretString,
     model: String,
     max_concurrent_requests: u64,
@@ -2780,8 +2763,7 @@ struct RawLlmClientConfiguration {
     additional_pem_files: Vec<PathBuf>,
     retry_delays_ms: Vec<u64>,
     max_retry_after_ms: u64,
-    #[serde(deserialize_with = "deserialize_zeroizing_string")]
-    parameters: Zeroizing<String>,
+    parameters: String,
     #[serde(default)]
     rate_limit: Option<RawLlmRateLimitConfiguration>,
 }
@@ -2971,7 +2953,7 @@ parameters = []
 
 [[rpg_maker.translation_profiles]]
 llm_client = ["{sentinel}"]
-target_task_user_message_characters = {{ secret = "{sentinel}" }}
+target_task_user_message_characters = {{ marker = "{sentinel}" }}
 id = "unused"
 "#,
             include_str!("../../config.example.toml")
@@ -2980,7 +2962,7 @@ id = "unused"
 
     #[test]
     fn translate_streams_past_unselected_client_and_profile_without_materializing_values() {
-        const SENTINEL: &str = "UNSELECTED_PROFILE_SECRET_SENTINEL";
+        const SENTINEL: &str = "UNSELECTED_PROFILE_DATA_SENTINEL";
         let directory = TestDirectory::new();
         let source = configuration_with_unselected_profile_sentinel(SENTINEL);
         let path = directory.write("translate.toml", &source);
@@ -3011,7 +2993,7 @@ id = "unused"
     }
 
     #[test]
-    fn unselected_profile_secret_never_enters_configuration_diagnostics() {
+    fn unselected_profile_data_never_enters_configuration_diagnostics() {
         const SENTINEL: &str = "UNSELECTED_PROFILE_DIAGNOSTIC_SENTINEL";
         let directory = TestDirectory::new();
         let source = configuration_with_unselected_profile_sentinel(SENTINEL).replacen(
@@ -3192,34 +3174,40 @@ id = "unused"
     }
 
     #[test]
-    fn translate_defaults_and_preserves_llm_call_recording_selection() {
+    fn translate_defaults_and_preserves_task_recording_selection() {
         let directory = TestDirectory::new();
         let example = include_str!("../../config.example.toml");
         let cases = [
             (
                 "omitted",
-                example.replace("record_calls = false", ""),
+                example.replace("record_translation_tasks = false", ""),
                 false,
             ),
             ("false", example.to_owned(), false),
             (
                 "true",
-                example.replace("record_calls = false", "record_calls = true"),
+                example.replace(
+                    "record_translation_tasks = false",
+                    "record_translation_tasks = true",
+                ),
                 true,
             ),
         ];
 
         let mut semantic_fingerprints = Vec::new();
         for (name, source, expected) in cases {
-            let path = directory.write(format!("record-calls-{name}.toml").as_str(), &source);
+            let path = directory.write(
+                format!("record-translation-tasks-{name}.toml").as_str(),
+                &source,
+            );
             let ConfiguredRpgMakerCommand::Translate(configured) =
                 load_configuration(&path, translate_command(false, "primary"))
-                    .expect("调用记录开关应建立受信 Translate 配置")
+                    .expect("任务记录开关应建立受信 Translate 配置")
             else {
                 panic!("应建立 Translate 配置");
             };
 
-            assert_eq!(configured.record_calls(), expected);
+            assert_eq!(configured.record_translation_tasks(), expected);
             semantic_fingerprints.push(configured.client().semantic_fingerprint());
         }
         assert!(
@@ -3230,14 +3218,14 @@ id = "unused"
     }
 
     #[test]
-    fn only_translate_consumes_the_llm_call_recording_value() {
-        const SENTINEL: &str = "RECORD_CALLS_TYPE_SENTINEL";
+    fn only_translate_consumes_the_task_recording_value() {
+        const SENTINEL: &str = "RECORD_TRANSLATION_TASKS_TYPE_SENTINEL";
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml").replace(
-            "record_calls = false",
-            format!("record_calls = [\"{SENTINEL}\"]").as_str(),
+            "record_translation_tasks = false",
+            format!("record_translation_tasks = [\"{SENTINEL}\"]").as_str(),
         );
-        let path = directory.write("record-calls-type.toml", &source);
+        let path = directory.write("record-translation-tasks-type.toml", &source);
 
         for command in [
             init_command(),
@@ -3245,15 +3233,15 @@ id = "unused"
             write_back_command(false),
         ] {
             load_configuration(&path, command)
-                .expect("非 Translate 命令不得物化或校验调用记录开关");
+                .expect("非 Translate 命令不得物化或校验任务记录开关");
         }
 
         let error = match load_configuration(&path, translate_command(false, "primary")) {
-            Ok(_) => panic!("Translate 必须拒绝非布尔调用记录开关"),
+            Ok(_) => panic!("Translate 必须拒绝非布尔任务记录开关"),
             Err(error) => error,
         };
         let diagnostics = format!("{error:?}\n{error}");
-        assert!(diagnostics.contains("llm.record_calls"));
+        assert!(diagnostics.contains("rpg_maker.record_translation_tasks"));
         assert!(!diagnostics.contains(SENTINEL));
     }
 
@@ -3398,7 +3386,7 @@ id = "unused"
                 Some("TYPE_VALUE_SENTINEL"),
             ),
             (
-                "secret-type",
+                "api-key-type",
                 source.replacen(
                     "api_key = \"replace-with-api-key\"",
                     "api_key = [\"API_KEY_TYPE_SENTINEL\"]",
@@ -3482,8 +3470,8 @@ id = "unused"
             (
                 "llm",
                 example.replace(
-                    "record_calls = false",
-                    "record_calls = false\nunexpected = 1",
+                    "[llm.clients.primary]",
+                    "[llm]\nunexpected = 1\n\n[llm.clients.primary]",
                 ),
             ),
             (
@@ -3517,8 +3505,8 @@ id = "unused"
             (
                 "rpg-maker",
                 example.replace(
-                    "[[rpg_maker.translation_profiles]]",
-                    "[rpg_maker]\nunexpected = 1\n\n[[rpg_maker.translation_profiles]]",
+                    "record_translation_tasks = false",
+                    "record_translation_tasks = false\nunexpected = 1",
                 ),
             ),
         ];
@@ -3548,21 +3536,21 @@ id = "unused"
     }
 
     #[test]
-    fn selected_llm_client_debug_redacts_secret_and_parameters() {
+    fn selected_llm_client_debug_hides_only_api_key() {
         let directory = TestDirectory::new();
         let example = include_str!("../../config.example.toml").replace("\r\n", "\n");
         const EMPTY_PARAMETERS: &str = "parameters = '''\n{}\n'''";
-        const PRIVATE_PARAMETERS: &str =
-            "parameters = '''\n{\"private_vendor_value\":\"PRIVATE_SENTINEL\"}\n'''";
+        const CUSTOM_PARAMETERS: &str =
+            "parameters = '''\n{\"vendor_value\":\"PARAMETER_SENTINEL\"}\n'''";
         assert!(
             example.contains(EMPTY_PARAMETERS),
-            "示例配置必须默认使用空 parameters，测试再显式注入脱敏探针"
+            "示例配置必须默认使用空 parameters，测试再显式注入普通参数"
         );
         let source = example
-            .replace("replace-with-api-key", "SECRET_SENTINEL")
-            .replace(EMPTY_PARAMETERS, PRIVATE_PARAMETERS);
-        assert!(source.contains("PRIVATE_SENTINEL"));
-        let path = directory.write("secret.toml", &source);
+            .replace("replace-with-api-key", "API_KEY_SENTINEL")
+            .replace(EMPTY_PARAMETERS, CUSTOM_PARAMETERS);
+        assert!(source.contains("PARAMETER_SENTINEL"));
+        let path = directory.write("api-key.toml", &source);
         let ConfiguredRpgMakerCommand::Translate(configured) =
             load_configuration(&path, translate_command(false, "primary"))
                 .expect("所选客户端应合法")
@@ -3570,19 +3558,19 @@ id = "unused"
             panic!("应建立 Translate 配置");
         };
         let debug = format!("{:?}", configured.client());
-        assert!(!debug.contains("SECRET_SENTINEL"));
-        assert!(!debug.contains("PRIVATE_SENTINEL"));
+        assert!(!debug.contains("API_KEY_SENTINEL"));
+        assert!(debug.contains("PARAMETER_SENTINEL"));
     }
 
     #[test]
-    fn unselected_client_secret_never_enters_configuration_diagnostics() {
+    fn unselected_client_api_key_never_enters_configuration_diagnostics() {
         let directory = TestDirectory::new();
         let source = format!(
-            "{}\n[llm.clients.unused]\nurl = []\napi_key = \"UNSELECTED_SECRET_SENTINEL\"\nmodel = []\nmax_concurrent_requests = []\nconnect_timeout_ms = []\nread_timeout_ms = []\nrequest_timeout_ms = []\nproxy = []\nadditional_pem_files = []\nretry_delays_ms = []\nmax_retry_after_ms = []\nparameters = []\n",
+            "{}\n[llm.clients.unused]\nurl = []\napi_key = \"UNSELECTED_API_KEY_SENTINEL\"\nmodel = []\nmax_concurrent_requests = []\nconnect_timeout_ms = []\nread_timeout_ms = []\nrequest_timeout_ms = []\nproxy = []\nadditional_pem_files = []\nretry_delays_ms = []\nmax_retry_after_ms = []\nparameters = []\n",
             include_str!("../../config.example.toml")
         );
         let source = replace_thinking_output(&source, "thinking_output = []");
-        let path = directory.write("unselected-secret.toml", &source);
+        let path = directory.write("unselected-api-key.toml", &source);
         let error = match load_configuration(&path, translate_command(false, "primary")) {
             Ok(_) => panic!("无效 Prompt 配置必须拒绝"),
             Err(error) => error,
@@ -3593,7 +3581,7 @@ id = "unused"
             diagnostics.push_str(format!("\n{error:?}\n{error}").as_str());
             source = error.source();
         }
-        assert!(!diagnostics.contains("UNSELECTED_SECRET_SENTINEL"));
+        assert!(!diagnostics.contains("UNSELECTED_API_KEY_SENTINEL"));
     }
 
     #[test]

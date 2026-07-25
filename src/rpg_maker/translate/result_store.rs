@@ -39,6 +39,7 @@ use super::standard::{
     StandardTranslationResultStore, TranslationPlanPreparation, TranslationSnapshotBaseline,
     TranslationTaskOutcome, TranslationUnitIdentity,
 };
+use super::task_record::{TranslationTaskCommitFailure, TranslationTaskCommitFailureImpact};
 
 pub(crate) struct RpgMakerStandardTranslationResultStorageService<S, C>
 where
@@ -93,18 +94,26 @@ where
     async fn prepare_commit(
         &self,
         outcome: Arc<TranslationTaskOutcome>,
-    ) -> Result<Self::PreparedCommit, Self::Error> {
-        self.encode_commit_plan(outcome).await
+    ) -> Result<Self::PreparedCommit, TranslationTaskCommitFailure<Self::Error>> {
+        self.encode_commit_plan(outcome).await.map_err(|source| {
+            let diagnostic = source.task_commit_safe_diagnostic();
+            TranslationTaskCommitFailure::not_applied(source, Some(diagnostic))
+        })
     }
 
     async fn commit_prepared(
         &self,
         project: &OpenedProject,
         prepared: Self::PreparedCommit,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), TranslationTaskCommitFailure<Self::Error>> {
         let RpgMakerPreparedTranslationCommit { plan } = prepared;
         self.execute(project.database_path().to_path_buf(), plan)
             .await
+            .map_err(|source| {
+                let impact = source.commit_failure_impact();
+                let diagnostic = source.task_commit_safe_diagnostic();
+                TranslationTaskCommitFailure::new(source, impact, Some(diagnostic))
+            })
     }
 
     async fn finalize(&self) -> Result<(), Self::Error> {
@@ -310,19 +319,21 @@ pub(crate) enum RpgMakerStandardTranslationResultStorageError<S, C> {
     },
 }
 
-impl<S, C> RpgMakerStandardTranslationResultStorageError<S, C>
-where
-    S: SafeDiagnosticSource,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    /// 在结果存储仍持有数据库路径、事务终态和具体根错误时建立公开投影。
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+impl<S, C> RpgMakerStandardTranslationResultStorageError<S, C> {
+    fn commit_failure_impact(&self) -> TranslationTaskCommitFailureImpact {
+        if matches!(self, Self::OutcomeUnknown { .. }) {
+            TranslationTaskCommitFailureImpact::OutcomeUnknown
+        } else {
+            TranslationTaskCommitFailureImpact::NotApplied
+        }
+    }
+}
+
+impl<S, C> RpgMakerStandardTranslationResultStorageError<S, C> {
+    /// 在任务提交边界仍持有数据库路径和事务终态时建立窄小公开投影。
+    fn task_commit_safe_diagnostic(&self) -> SafeDiagnostic {
         match self {
-            Self::ScheduleEncoding(source) => source.safe_diagnostic_source(
-                DiagnosticStage::Translate,
-                DiagnosticImpact::ProgressPreserved,
-                DiagnosticAction::ReportBug,
-            ),
+            Self::ScheduleEncoding(source) => translation_storage_cpu_task_diagnostic(source),
             Self::InvalidPlan(source) => source.safe_diagnostic(),
             Self::DatabaseNotFound { database_path } => SafeDiagnostic::new(
                 DiagnosticCode::ProjectState,
@@ -340,22 +351,20 @@ where
                 DiagnosticImpact::ProgressPreserved,
                 DiagnosticAction::Retry,
             ),
-            Self::NotCommitted {
-                database_path,
-                source,
-            } => translation_storage_source_diagnostic(
-                source,
-                database_path,
+            Self::NotCommitted { database_path, .. } => SafeDiagnostic::new(
+                DiagnosticCode::SqliteOperation,
+                DiagnosticStage::Translate,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::TransactionRolledBack),
                 DiagnosticImpact::ProgressPreserved,
                 DiagnosticAction::Retry,
             )
             .with_recovery(RecoveryFact::transaction("rolled_back")),
-            Self::OutcomeUnknown {
-                database_path,
-                source,
-            } => translation_storage_source_diagnostic(
-                source,
-                database_path,
+            Self::OutcomeUnknown { database_path, .. } => SafeDiagnostic::new(
+                DiagnosticCode::SqliteOperation,
+                DiagnosticStage::Translate,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::TransactionOutcomeUnknown),
                 DiagnosticImpact::OutcomeUnknown,
                 DiagnosticAction::PreserveRecoveryArtifacts,
             )
@@ -399,6 +408,76 @@ where
                 database_path,
                 source: finalization,
             } => {
+                let (reason, impact, action, transaction) = match finalization.primary() {
+                    SqliteInteractiveSessionFinalizationFailure::CleanupFailed(_) => (
+                        DiagnosticFailureKind::FinalizationFailed,
+                        DiagnosticImpact::StateAppliedFinalizationFailed,
+                        DiagnosticAction::Retry,
+                        "cleanup_failed",
+                    ),
+                    SqliteInteractiveSessionFinalizationFailure::OutcomeUnknown(_) => (
+                        DiagnosticFailureKind::TransactionOutcomeUnknown,
+                        DiagnosticImpact::OutcomeUnknown,
+                        DiagnosticAction::PreserveRecoveryArtifacts,
+                        "outcome_unknown",
+                    ),
+                };
+                let mut diagnostic = SafeDiagnostic::new(
+                    DiagnosticCode::StateFinalizationFailed,
+                    DiagnosticStage::Translate,
+                    DiagnosticSubject::path(database_path),
+                    DiagnosticReason::failure(reason),
+                    impact,
+                    action,
+                )
+                .with_recovery(RecoveryFact::transaction(transaction));
+                if finalization.connection_close().is_some() {
+                    diagnostic = diagnostic
+                        .with_recovery(RecoveryFact::component("sqlite_connection_close=failed"));
+                }
+                diagnostic
+            }
+        }
+    }
+}
+
+impl<S, C> RpgMakerStandardTranslationResultStorageError<S, C>
+where
+    S: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    /// 在结果存储仍持有数据库路径、事务终态和具体根错误时建立公开投影。
+    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+        match self {
+            Self::ScheduleEncoding(source) => source.safe_diagnostic_source(
+                DiagnosticStage::Translate,
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::ReportBug,
+            ),
+            Self::NotCommitted {
+                database_path,
+                source,
+            } => translation_storage_source_diagnostic(
+                source,
+                database_path,
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::Retry,
+            )
+            .with_recovery(RecoveryFact::transaction("rolled_back")),
+            Self::OutcomeUnknown {
+                database_path,
+                source,
+            } => translation_storage_source_diagnostic(
+                source,
+                database_path,
+                DiagnosticImpact::OutcomeUnknown,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            )
+            .with_recovery(RecoveryFact::transaction("outcome_unknown")),
+            Self::FinalizationFailed {
+                database_path,
+                source: finalization,
+            } => {
                 let mut diagnostic = translation_storage_finalization_diagnostic(
                     finalization.primary(),
                     database_path,
@@ -409,6 +488,7 @@ where
                 }
                 diagnostic
             }
+            _ => self.task_commit_safe_diagnostic(),
         }
     }
 }
@@ -453,6 +533,31 @@ where
             }
         }
     }
+}
+
+fn translation_storage_cpu_task_diagnostic<C>(source: &CpuTaskExecutionError<C>) -> SafeDiagnostic {
+    let (failure, action) = match source {
+        CpuTaskExecutionError::Cancelled => (
+            DiagnosticFailureKind::LockCancelled,
+            DiagnosticAction::Retry,
+        ),
+        CpuTaskExecutionError::Unavailable(_) => (
+            DiagnosticFailureKind::ExecutorClosed,
+            DiagnosticAction::Retry,
+        ),
+        CpuTaskExecutionError::TaskPanicked => (
+            DiagnosticFailureKind::WorkerPanicked,
+            DiagnosticAction::ReportBug,
+        ),
+    };
+    SafeDiagnostic::new(
+        DiagnosticCode::InternalOperation,
+        DiagnosticStage::Translate,
+        DiagnosticSubject::component("CPU worker"),
+        DiagnosticReason::failure(failure),
+        DiagnosticImpact::ProgressPreserved,
+        action,
+    )
 }
 
 fn translation_storage_finalization_diagnostic<S>(
@@ -1525,27 +1630,27 @@ mod tests {
     }
 
     #[test]
-    fn result_storage_plan_codecs_keep_typed_facts_without_leaking_source_text() {
-        const SECRET: &str = "SENTINEL_RESULT_STORAGE_BODY_8ebfa3";
+    fn result_storage_plan_codecs_keep_typed_facts_without_copying_source_text() {
+        const SOURCE_BODY: &str = "SENTINEL_RESULT_STORAGE_BODY_8ebfa3";
 
-        let invalid_json = format!("{{\"{SECRET}\":");
+        let invalid_json = format!("{{\"{SOURCE_BODY}\":");
         let json_error =
             serde_json::from_str::<serde_json::Value>(&invalid_json).expect_err("JSON 应不完整");
         let content_diagnostic = ResultStoragePlanError::Content(json_error).safe_diagnostic();
         let content_json = serde_json::to_string(&content_diagnostic).expect("公开诊断应可序列化");
-        assert!(!content_json.contains(SECRET));
+        assert!(!content_json.contains(SOURCE_BODY));
         assert!(content_json.contains("operation=content_encode"));
         assert!(content_json.contains("json_category=eof"));
         assert!(content_json.contains("json_line=1"));
         assert!(content_json.contains("json_column="));
 
         let location_diagnostic = ResultStoragePlanError::Location(
-            RpgMakerLocationCodecError::InvalidDataFile(SECRET.to_owned()),
+            RpgMakerLocationCodecError::InvalidDataFile(SOURCE_BODY.to_owned()),
         )
         .safe_diagnostic();
         let location_json =
             serde_json::to_string(&location_diagnostic).expect("公开诊断应可序列化");
-        assert!(!location_json.contains(SECRET));
+        assert!(!location_json.contains(SOURCE_BODY));
         assert!(location_json.contains("kind=invalid_data_file"));
 
         let projection_diagnostic =
@@ -1595,11 +1700,21 @@ mod tests {
         plans: Arc<Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>>,
         opens: Arc<AtomicUsize>,
         finalizations: Arc<AtomicUsize>,
+        transaction_result: RecordingTransactionResult,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum RecordingTransactionResult {
+        #[default]
+        Committed,
+        NotApplied,
+        OutcomeUnknown,
     }
 
     struct RecordingOperations {
         path: PathBuf,
         plans: Arc<Mutex<Vec<(PathBuf, SqliteTransactionPlan)>>>,
+        transaction_result: RecordingTransactionResult,
     }
 
     impl SqliteTransactionSessionOperations for RecordingOperations {
@@ -1613,7 +1728,15 @@ mod tests {
                 .lock()
                 .expect("事务锁")
                 .push((self.path.clone(), plan));
-            ready(Ok(()))
+            ready(match self.transaction_result {
+                RecordingTransactionResult::Committed => Ok(()),
+                RecordingTransactionResult::NotApplied => {
+                    Err(ExecuteTransactionError::NotCommitted(FakeError))
+                }
+                RecordingTransactionResult::OutcomeUnknown => {
+                    Err(ExecuteTransactionError::OutcomeUnknown(FakeError))
+                }
+            })
         }
     }
 
@@ -1656,6 +1779,7 @@ mod tests {
                 Arc::new(RecordingOperations {
                     path,
                     plans: Arc::clone(&self.plans),
+                    transaction_result: self.transaction_result,
                 }),
                 RecordingFinalizer {
                     finalizations: Arc::clone(&self.finalizations),
@@ -1798,6 +1922,159 @@ mod tests {
         );
         assert_eq!(parameters[4], SqliteValue::Text(r#""原文""#.to_owned()));
         assert_eq!(parameters[5], SqliteValue::Text("{}".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn commit_preparation_failure_keeps_its_typed_diagnostic() {
+        let service = RpgMakerStandardTranslationResultStorageService::new(
+            RecordingSqlite::default(),
+            InlineCpu,
+        );
+        let identity = scalar_identity(1, "name", "原文", "{}");
+        let context = state_context(0x31);
+        let translation = value("译文");
+        let patch = TranslationPatch::new(
+            identity,
+            Vec::new(),
+            translation.clone(),
+            context.finish(&translation),
+        );
+
+        let failure = match service
+            .prepare_commit(complete_outcome(vec![patch.clone(), patch]))
+            .await
+        {
+            Ok(_) => panic!("重复逻辑单元必须在提交准备阶段失败"),
+            Err(failure) => failure,
+        };
+        let (source, impact, diagnostic) = failure.into_parts();
+
+        assert!(matches!(
+            source,
+            RpgMakerStandardTranslationResultStorageError::InvalidPlan(
+                ResultStoragePlanError::DuplicateUnit
+            )
+        ));
+        assert_eq!(impact, TranslationTaskCommitFailureImpact::NotApplied);
+        let diagnostic = diagnostic.expect("提交准备失败必须携带既有结构化诊断");
+        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+        assert_eq!(diagnostic.stage, DiagnosticStage::Translate);
+        assert_eq!(
+            diagnostic.subject,
+            DiagnosticSubject::component("translation_commit_units")
+        );
+        assert_eq!(
+            diagnostic.reason,
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::InternalInvariant,
+                "plan_error=duplicate_unit",
+            )
+        );
+        assert_eq!(diagnostic.impact, DiagnosticImpact::ProgressPreserved);
+    }
+
+    #[tokio::test]
+    async fn definitely_not_applied_commit_keeps_database_diagnostic() {
+        let sqlite = RecordingSqlite {
+            transaction_result: RecordingTransactionResult::NotApplied,
+            ..RecordingSqlite::default()
+        };
+        let service = RpgMakerStandardTranslationResultStorageService::new(sqlite, InlineCpu);
+        let expected_project = project();
+        let prepared = service
+            .prepare_commit(complete_outcome(vec![translation_patch(
+                scalar_identity(1, "name", "原文", "{}"),
+                "译文",
+                0x41,
+            )]))
+            .await
+            .expect("提交计划应可编码");
+
+        let failure = service
+            .commit_prepared(&expected_project, prepared)
+            .await
+            .expect_err("测试事务必须明确报告未应用");
+        let (source, impact, diagnostic) = failure.into_parts();
+
+        assert!(matches!(
+            source,
+            RpgMakerStandardTranslationResultStorageError::NotCommitted { .. }
+        ));
+        assert_eq!(impact, TranslationTaskCommitFailureImpact::NotApplied);
+        let diagnostic = diagnostic.expect("确定未应用必须携带数据库结构化诊断");
+        assert_eq!(diagnostic.code, DiagnosticCode::SqliteOperation);
+        assert_eq!(diagnostic.stage, DiagnosticStage::Translate);
+        assert_eq!(
+            diagnostic.subject,
+            DiagnosticSubject::path(expected_project.database_path())
+        );
+        assert_eq!(
+            diagnostic.reason,
+            DiagnosticReason::failure(DiagnosticFailureKind::TransactionRolledBack)
+        );
+        assert_eq!(diagnostic.impact, DiagnosticImpact::ProgressPreserved);
+        assert_eq!(
+            diagnostic.recovery,
+            vec![RecoveryFact::transaction("rolled_back")]
+        );
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .expect("提交诊断应可序列化")
+                .contains("fake"),
+            "任务提交诊断不得解析或复制底层 Display 文本"
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_commit_keeps_database_diagnostic() {
+        let sqlite = RecordingSqlite {
+            transaction_result: RecordingTransactionResult::OutcomeUnknown,
+            ..RecordingSqlite::default()
+        };
+        let service = RpgMakerStandardTranslationResultStorageService::new(sqlite, InlineCpu);
+        let expected_project = project();
+        let prepared = service
+            .prepare_commit(complete_outcome(vec![translation_patch(
+                scalar_identity(1, "name", "原文", "{}"),
+                "译文",
+                0x51,
+            )]))
+            .await
+            .expect("提交计划应可编码");
+
+        let failure = service
+            .commit_prepared(&expected_project, prepared)
+            .await
+            .expect_err("测试事务必须报告终态未知");
+        let (source, impact, diagnostic) = failure.into_parts();
+
+        assert!(matches!(
+            source,
+            RpgMakerStandardTranslationResultStorageError::OutcomeUnknown { .. }
+        ));
+        assert_eq!(impact, TranslationTaskCommitFailureImpact::OutcomeUnknown);
+        let diagnostic = diagnostic.expect("终态未知必须携带数据库结构化诊断");
+        assert_eq!(diagnostic.code, DiagnosticCode::SqliteOperation);
+        assert_eq!(diagnostic.stage, DiagnosticStage::Translate);
+        assert_eq!(
+            diagnostic.subject,
+            DiagnosticSubject::path(expected_project.database_path())
+        );
+        assert_eq!(
+            diagnostic.reason,
+            DiagnosticReason::failure(DiagnosticFailureKind::TransactionOutcomeUnknown)
+        );
+        assert_eq!(diagnostic.impact, DiagnosticImpact::OutcomeUnknown);
+        assert_eq!(
+            diagnostic.recovery,
+            vec![RecoveryFact::transaction("outcome_unknown")]
+        );
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .expect("提交诊断应可序列化")
+                .contains("fake"),
+            "任务提交诊断不得解析或复制底层 Display 文本"
+        );
     }
 
     #[test]
@@ -2125,7 +2402,7 @@ mod tests {
                 .await
                 .expect_err("过时快照必须拒绝");
             assert!(matches!(
-                error,
+                error.source(),
                 RpgMakerStandardTranslationResultStorageError::StalePlan { .. }
             ));
             assert_eq!(
@@ -2168,7 +2445,7 @@ mod tests {
             .await
             .expect_err("后序单元过时必须回滚整笔任务");
         assert!(matches!(
-            error,
+            error.source(),
             RpgMakerStandardTranslationResultStorageError::StalePlan { .. }
         ));
         assert_eq!(stored_translation(&database_path, 1), (None, None));
@@ -2205,7 +2482,7 @@ mod tests {
             .await
             .expect_err("修改多行必须视为快照失效");
         assert!(matches!(
-            error,
+            error.source(),
             RpgMakerStandardTranslationResultStorageError::StalePlan { .. }
         ));
         let connection = Connection::open(&database_path).expect("数据库应可重开");

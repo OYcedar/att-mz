@@ -192,3 +192,112 @@ diagnostic-io-kind-value = { $code ->
 diagnostic-configuration-rule-value = { $code ->
    *[other] { $fallback }{ $facts }
 }
+task-record-title = Translation task { $ordinal } · { $state }
+task-record-state-label = { $state ->
+    [complete] Complete
+    [partial] Partially complete
+    [unavailable] Unavailable
+    [execution_failed] Execution failed
+    [commit_preparation_failed] Commit preparation failed
+    [commit_not_applied] Commit not applied
+    [commit_outcome_unknown] Commit outcome unknown
+    [not_committed_after_earlier_failure] Not committed after an earlier failure
+    [invalid_result] Invalid executor result sequence
+    [cancelled] Cancelled
+   *[other] { $state }
+}
+task-record-summary-with-written = `Task { $ordinal }/{ $total }` · `{ $attempts } attempts` · `Accepted { $accepted }/{ $expected }` · `Written to { $written } locations`
+task-record-summary-without-written = `Task { $ordinal }/{ $total }` · `{ $attempts } attempts` · `Accepted { $accepted }/{ $expected }`
+task-record-run-id-label = Run ID:
+task-record-started-at-label = Started at:
+task-record-duration-label = Total duration:
+task-record-endpoint-label = Endpoint:
+task-record-model-label = Model:
+task-record-custom-parameters-heading = Custom parameters
+task-record-attempts-heading = Request attempts
+task-record-final-result-heading = Final result
+task-record-no-request = No model request was ready to send.
+task-record-empty-assistant = The model returned an empty object.
+task-record-parse-error = Parse error: { $kind ->
+    [json] invalid model response JSON (category `{ $category }`) at line { $line }, column { $column }
+    [thinking_not_allowed] thinking output is not accepted in the current response mode at line { $line }, column { $column }
+    [thinking_envelope_missing] the required thinking envelope is missing at line { $line }, column { $column }
+    [thinking_envelope_unclosed] the thinking envelope is not closed at line { $line }, column { $column }
+    [thinking_empty] the thinking content is empty at line { $line }, column { $column }
+    [thinking_nested] a nested thinking envelope starts at line { $line }, column { $column }
+    [thinking_repeated] a repeated thinking envelope starts at line { $line }, column { $column }
+    [markdown_fence_no_body] the Markdown fence has no body at line { $line }, column { $column }
+    [markdown_fence_unsupported] only a single Markdown fence with no language tag or a json tag is accepted at line { $line }, column { $column }
+    [markdown_fence_unclosed] the Markdown fence is not closed at line { $line }, column { $column }
+   *[markdown_fence_invalid_closing] the Markdown fence must close on the final standalone line at line { $line }, column { $column }
+}
+task-record-attempt-succeeded = Attempt { $number }: succeeded; finish reason { $finish_reason }
+task-record-attempt-token-usage = ; tokens `{ $prompt } / { $completion } / { $total }`
+task-record-attempt-duration = ; duration `{ $duration }`
+task-record-attempt-request-id = ; request ID { $request_id }
+task-record-attempt-response-id = ; response ID { $response_id }
+task-record-attempt-retryable = Attempt { $number }: retryable request failure; diagnostic `{ $code }`; duration `{ $duration }`
+task-record-attempt-retry-after = ; Retry-After `{ $duration }`
+task-record-attempt-wait-retry = ; retrying after `{ $duration }`
+task-record-attempt-wait-completed = ; wait of `{ $duration }` completed; the next attempt did not start
+task-record-attempt-wait-cancelled = ; planned wait `{ $duration }`; cancelled while waiting
+task-record-attempt-failed = Attempt { $number }: request or response processing failed; diagnostic `{ $code }`; duration `{ $duration }`
+task-record-attempt-cancelled = Attempt { $number }: cancelled; duration `{ $duration }`
+task-record-structured-reason = Reason: { $reason }
+task-record-final-status = Status: { $state ->
+    [complete] complete and commit confirmed
+    [partial] partially complete and commit confirmed
+    [unavailable] unavailable; project unchanged
+    [execution_failed] execution failed; not committed
+    [commit_preparation_failed] commit preparation failed; definitely not applied
+    [commit_not_applied] transaction definitely not applied
+    [commit_outcome_unknown] commit outcome unknown
+    [not_committed_after_earlier_failure] not committed because an earlier task failed
+    [invalid_result] invalid executor result sequence; not committed
+    [cancelled] cancelled; not committed
+   *[other] { $state }
+}
+task-record-accepted-written = Accepted: { $accepted } items; written to { $written } actual locations
+task-record-accepted-outcome-unknown = Validated: { $accepted } items; database commit outcome cannot be confirmed
+task-record-rejected-heading = Not accepted:
+task-record-rejected-item = { $id }: { $reason }
+task-record-protocol-diagnostic = Protocol diagnostic: { $diagnostic }
+task-record-unavailable-reason = Unavailable reason: { $reason }
+task-record-task-diagnostic = Task diagnostic: `{ $code }`; reason { $reason }
+task-record-rejection-reason = { $code ->
+    [missing] Missing model output
+    [duplicate] Duplicate model output
+    [invalid_shape] { $detail }
+    [invalid_shape_array] The translation must be a string array
+    [invalid_shape_item] Translation array item { $line } must be a string
+    [line_count_mismatch] Line count mismatch (expected { $expected }, actual { $actual })
+    [invalid_line_text] Line { $line } contains invalid control characters
+    [blank_line_mismatch] Blank state mismatch on line { $line } (expected { $expected_blank ->
+        [blank] blank
+       *[other] non-blank
+    })
+    [blank_translation] Translation is blank
+    [no_natural_language_text] Translation contains no natural-language text
+    [contains_byte_order_mark] Translation contains a BOM
+    [placeholder_mismatch] Placeholder mismatch: { $detail }
+    [unexpected_placeholder] Unexpected placeholder: { $detail }
+    [placeholder_normalization_ambiguous] Placeholder normalization is ambiguous: { $detail }
+    [source_residual] Source-language residue detected: { $detail }
+   *[other] { $detail }
+}
+task-record-protocol-detail = { $code ->
+    [non_stop_finish] finish reason is not stop: { $detail }
+    [invalid_response] { $detail }
+    [invalid_id] Model item { $index } has an invalid ID
+    [unknown_id] Model item { $index } returned unknown ID { $detail }
+   *[other] { $detail }
+}
+task-record-unavailable-detail = { $code ->
+    [model_response_unusable] Model response could not be parsed
+    [all_outputs_rejected] All model outputs failed validation
+    [recoverable_request_exhausted] Retry budget for recoverable requests was exhausted
+    [retry_after_exceeds_maximum] Retry-After exceeds the configured maximum wait
+   *[other] { $code }
+}
+task-record-duration-seconds = { $value } seconds
+task-record-duration-milliseconds = { $value } ms

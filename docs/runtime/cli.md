@@ -126,9 +126,10 @@ Translate 还会严格消费 `[prompts]` 的 `root`、`locale` 和 `thinking_out
 要求精确的一组非空 `<why>...</why>` 后接同一 JSON wire；信封或 JSON 解析失败形成
 `ModelResponseUnusable`，不会作为网络错误重试。
 
-Translate 同时消费 `[llm]` 中可省略的 `record_calls`，默认 `false`。启用时，Standard 与
-Translate Lua 的实际 HTTP 尝试会在同一 RunId 下生成敏感的人类可读调用文件；该开关
-不进入保存方案或项目数据库。
+Translate 同时消费 `[rpg_maker]` 中可省略的 `record_translation_tasks`，默认 `false`。
+启用时，每个已启动的 Standard TaskBlock 在同一 RunId 下生成一份人类可读任务记录，
+同一任务的全部重试、输入输出、验收和提交终态归入该文件。Translate Lua 不生成任务
+记录；该开关不进入翻译 state、保存方案或项目数据库。
 
 ### 3.4 WriteBack
 
@@ -236,7 +237,9 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 
 第一次 Ctrl-C 后停止派生新阶段；SQLite、发布、CPU 和 HTTP 已接管的工作继续到明确终态。
 候选尚未发布时 discard；publish 已开始时等待终态。运行方案不在取消路径保存。普通项目
-日志故障不会改变取消与收尾次序。
+日志故障不会改变取消与收尾次序。Translate 停止启动新的 Standard 任务；每个已发出
+`TaskStarted` 的任务仍返回顺序最终化边界，并在文件系统 shutdown 前形成已提交、未提交
+或已取消的明确任务记录终态。没有启动的任务不生成记录。
 
 ## 7. 日志、退出码与安全诊断
 
@@ -246,9 +249,11 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 显示日志路径、具体操作和清理后的底层原因，但不改变原本的成功、失败或取消退出码。
 详细契约见[普通项目日志](project-log.md)。
 
-启用 `llm.record_calls` 时，敏感调用记录写入
-`llm-calls/<run-id>/call-N.md`。它与普通 JSONL 一样是可降级、非权威的可观测性旁路；
-缺失记录不证明没有调用，记录故障也不改变原业务结果、项目状态或退出码。
+启用 `rpg_maker.record_translation_tasks` 时，Standard 任务记录写入
+`task-records/<run-id>/task-000001.md`。它与普通 JSONL 一样是可降级、非权威的
+可观测性旁路，但提供单任务的完整可读上下文；缺失记录不证明没有调用，记录故障也不
+改变原业务结果、项目状态、后续任务或退出码。完整契约见
+[Standard 翻译任务记录现行规格](../rpg-maker/task-records.md)。
 
 项目日志建立后的命令 panic 由命令边界转换成 `internal.operation` 安全诊断：CLI 与
 JSONL 都显示实际命令阶段、项目工作区、日志路径和 `outcome_unknown` 影响，绝不显示
@@ -265,5 +270,7 @@ panic 才由最外层进程兜底直接写 stderr。
 错误统一说明错误码、阶段、对象或路径、具体原因、稳定底层代码、状态影响、处理办法和
 恢复位置。OS 系统消息、SQLite primary/extended code、HTTP 状态与允许公开的供应商
 code/type 在清理控制字符后明示；不得用责任域类别替代具体原因。输出不读取任意 `Debug`
-或内部来源链，也不泄露配置原文、API key、Header 值、Client parameters 值、Prompt、
-完整模型消息、模型正文、原文或译文。
+或内部来源链，也不泄露 API key 实际值。CLI 与普通 JSONL 不复制配置原文、Header、
+完整 Client parameters、Prompt、完整模型消息、模型正文、原文或译文，是为了维持职责、
+稳定 schema、可读体积和控制字符边界，不表示这些内容属于敏感信息。任务记录可以呈现
+上述任务正文，并对其中出现的 API key 实际值作精确替换。

@@ -183,3 +183,112 @@ diagnostic-io-kind-value = { $code ->
 diagnostic-configuration-rule-value = { $code ->
    *[other] { $fallback }{ $facts }
 }
+task-record-title = 번역 작업 { $ordinal } · { $state }
+task-record-state-label = { $state ->
+    [complete] 완료
+    [partial] 부분 완료
+    [unavailable] 사용 불가
+    [execution_failed] 실행 실패
+    [commit_preparation_failed] 커밋 준비 실패
+    [commit_not_applied] 커밋 미적용
+    [commit_outcome_unknown] 커밋 결과 알 수 없음
+    [not_committed_after_earlier_failure] 이전 실패로 미커밋
+    [invalid_result] 잘못된 Executor 결과 순서
+    [cancelled] 취소됨
+   *[other] { $state }
+}
+task-record-summary-with-written = `작업 { $ordinal }/{ $total }` · `시도 { $attempts }회` · `검수 { $accepted }/{ $expected }` · `{ $written }곳에 기록`
+task-record-summary-without-written = `작업 { $ordinal }/{ $total }` · `시도 { $attempts }회` · `검수 { $accepted }/{ $expected }`
+task-record-run-id-label = Run ID:
+task-record-started-at-label = 시작 시간:
+task-record-duration-label = 총 소요 시간:
+task-record-endpoint-label = Endpoint:
+task-record-model-label = Model:
+task-record-custom-parameters-heading = 사용자 지정 매개변수
+task-record-attempts-heading = 요청 과정
+task-record-final-result-heading = 최종 결과
+task-record-no-request = 전송 가능한 모델 요청이 만들어지지 않았습니다.
+task-record-empty-assistant = 모델이 빈 객체를 반환했습니다.
+task-record-parse-error = 구문 분석 오류: { $kind ->
+    [json] 모델 응답 JSON이 올바르지 않습니다(범주 `{ $category }`, { $line }행 { $column }열)
+    [thinking_not_allowed] 현재 응답 모드에서는 사고 출력을 허용하지 않습니다({ $line }행 { $column }열)
+    [thinking_envelope_missing] 필수 사고 봉투가 없습니다({ $line }행 { $column }열)
+    [thinking_envelope_unclosed] 사고 봉투가 닫히지 않았습니다({ $line }행 { $column }열)
+    [thinking_empty] 사고 내용이 비어 있습니다({ $line }행 { $column }열)
+    [thinking_nested] 중첩된 사고 봉투가 있습니다({ $line }행 { $column }열)
+    [thinking_repeated] 사고 봉투가 반복되었습니다({ $line }행 { $column }열)
+    [markdown_fence_no_body] Markdown 펜스에 본문이 없습니다({ $line }행 { $column }열)
+    [markdown_fence_unsupported] 언어 표시가 없거나 json 표시인 단일 Markdown 펜스만 허용됩니다({ $line }행 { $column }열)
+    [markdown_fence_unclosed] Markdown 펜스가 닫히지 않았습니다({ $line }행 { $column }열)
+   *[markdown_fence_invalid_closing] Markdown 펜스는 마지막 독립 행에서 닫혀야 합니다({ $line }행 { $column }열)
+}
+task-record-attempt-succeeded = 시도 { $number }: 성공; finish reason { $finish_reason }
+task-record-attempt-token-usage = ; token `{ $prompt } / { $completion } / { $total }`
+task-record-attempt-duration = ; 소요 시간 `{ $duration }`
+task-record-attempt-request-id = ; request ID { $request_id }
+task-record-attempt-response-id = ; response ID { $response_id }
+task-record-attempt-retryable = 시도 { $number }: 재시도 가능한 요청 실패; 진단 `{ $code }`; 소요 시간 `{ $duration }`
+task-record-attempt-retry-after = ; Retry-After `{ $duration }`
+task-record-attempt-wait-retry = ; `{ $duration }` 후 재시도
+task-record-attempt-wait-completed = ; `{ $duration }` 대기는 완료되었지만 다음 시도는 시작되지 않음
+task-record-attempt-wait-cancelled = ; `{ $duration }` 대기 중 취소됨
+task-record-attempt-failed = 시도 { $number }: 요청 또는 응답 처리 실패; 진단 `{ $code }`; 소요 시간 `{ $duration }`
+task-record-attempt-cancelled = 시도 { $number }: 취소됨; 소요 시간 `{ $duration }`
+task-record-structured-reason = 원인: { $reason }
+task-record-final-status = 상태: { $state ->
+    [complete] 완료, 커밋 확인됨
+    [partial] 부분 완료, 커밋 확인됨
+    [unavailable] 사용 불가, 프로젝트 변경 없음
+    [execution_failed] 실행 실패, 미커밋
+    [commit_preparation_failed] 커밋 준비 실패, 미적용 확인
+    [commit_not_applied] 트랜잭션 미적용 확인
+    [commit_outcome_unknown] 커밋 결과 알 수 없음
+    [not_committed_after_earlier_failure] 이전 작업 실패로 미커밋
+    [invalid_result] 잘못된 Executor 결과 순서, 미커밋
+    [cancelled] 취소됨, 미커밋
+   *[other] { $state }
+}
+task-record-accepted-written = 수락: { $accepted }개 항목, 실제 위치 { $written }곳에 기록
+task-record-accepted-outcome-unknown = 검수 완료: { $accepted }개 항목; 데이터베이스 커밋 결과를 확인할 수 없음
+task-record-rejected-heading = 수락되지 않음:
+task-record-rejected-item = { $id }: { $reason }
+task-record-protocol-diagnostic = 프로토콜 진단: { $diagnostic }
+task-record-unavailable-reason = 사용 불가 원인: { $reason }
+task-record-task-diagnostic = 작업 진단: `{ $code }`; 원인 { $reason }
+task-record-rejection-reason = { $code ->
+    [missing] 모델 출력 누락
+    [duplicate] 모델 출력 중복
+    [invalid_shape] { $detail }
+    [invalid_shape_array] 번역은 문자열 배열이어야 합니다
+    [invalid_shape_item] 번역 배열의 { $line }번째 항목은 문자열이어야 합니다
+    [line_count_mismatch] 줄 수 불일치(예상 { $expected }, 실제 { $actual })
+    [invalid_line_text] { $line }번째 줄에 잘못된 제어 문자가 있음
+    [blank_line_mismatch] { $line }번째 줄의 공백 상태 불일치(예상: { $expected_blank ->
+        [blank] 공백
+       *[other] 공백 아님
+    })
+    [blank_translation] 번역문이 비어 있음
+    [no_natural_language_text] 번역문에 자연어 텍스트가 없음
+    [contains_byte_order_mark] 번역문에 BOM이 포함됨
+    [placeholder_mismatch] 자리표시자 불일치: { $detail }
+    [unexpected_placeholder] 알 수 없는 자리표시자: { $detail }
+    [placeholder_normalization_ambiguous] 자리표시자 정규화가 모호함: { $detail }
+    [source_residual] 원문 언어 잔류 감지: { $detail }
+   *[other] { $detail }
+}
+task-record-protocol-detail = { $code ->
+    [non_stop_finish] finish reason이 stop이 아님: { $detail }
+    [invalid_response] { $detail }
+    [invalid_id] 모델의 { $index }번째 항목 ID가 잘못됨
+    [unknown_id] 모델의 { $index }번째 항목이 알 수 없는 ID { $detail }을 반환함
+   *[other] { $detail }
+}
+task-record-unavailable-detail = { $code ->
+    [model_response_unusable] 모델 응답을 구문 분석할 수 없음
+    [all_outputs_rejected] 모든 모델 출력이 검수에서 거부됨
+    [recoverable_request_exhausted] 복구 가능한 요청의 재시도 예산 소진
+    [retry_after_exceeds_maximum] Retry-After가 설정된 최대 대기 시간을 초과함
+   *[other] { $code }
+}
+task-record-duration-seconds = { $value }초
+task-record-duration-milliseconds = { $value }밀리초

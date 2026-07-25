@@ -50,8 +50,9 @@ MZ                              MV
 <project>/write_back/js         <project>/write_back/www/js
 ```
 
-工作区根还可以包含非权威的 `logs/` 与 `llm-calls/` 可观测性目录；它们不参与来源指纹，
-也不会使内容相同的后续 Init 被误判为项目变化。
+工作区根还可以包含非权威的 `logs/` 与 `task-records/` 可观测性目录；它们不参与来源
+指纹，也不会使内容相同的后续 Init 被误判为项目变化。Init 只按当前工作区契约认可这
+两个可选目录，不识别、迁移或清理其他历史目录。
 
 原游戏路径不进入 metadata，也不供 Extract、Translate 或 WriteBack 读取；它以无损
 Windows 原始路径保存于 `init_run_plan`，只供后续 Init 复用。其他命令始终读取工作区内

@@ -1708,7 +1708,7 @@ mod directory_stage_tests {
                 .expect("两个普通顶层目录应该可建立编辑范围");
         let assets = ScopedDirectoryPath::new(PathBuf::from("assets/image.png"))
             .expect("范围内路径应该合法");
-        let outside = ScopedDirectoryPath::new(PathBuf::from("private/catalog.json"))
+        let outside = ScopedDirectoryPath::new(PathBuf::from("other/catalog.json"))
             .expect("通用安全路径不负责业务范围");
         assert!(scope.contains(&assets));
         assert!(!scope.contains(&outside));

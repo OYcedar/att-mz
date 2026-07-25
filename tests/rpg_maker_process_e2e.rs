@@ -50,7 +50,7 @@ const UPDATED_SYSTEM_PROMPT_TEMPLATE: &str =
     "E2E SYSTEM CONTRACT UPDATED: {{source_language}} -> {{target_language}}";
 const UPDATED_SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT UPDATED: ja -> zh-Hans";
 const THINKING_PROMPT: &str = "E2E THINKING OUTPUT CONTRACT";
-const THINKING_SENTINEL: &str = "e2e-private-thinking-sentinel";
+const THINKING_SENTINEL: &str = "e2e-thinking-record-sentinel";
 const JS_MARKER: &str = "/* ATT MZ process e2e */";
 const EXPECTED_USER_MESSAGE: &str =
     "## Database Text\n\nDescription [1] (free line breaking):\n\n> 薬草です\n";
@@ -61,11 +61,11 @@ const RULES_TOML: &str = "rules.toml";
 const TERMS_TOML: &str = "terms.toml";
 const PLACEHOLDERS_TOML: &str = "placeholders.toml";
 const API_KEY: &str = "e2e-secret";
-const E2E_EXTRA_SECRET: &str = "e2e-extra-secret";
-const LEAK_SENTINEL: &str = "e2e-secret-must-not-leak";
+const E2E_PARAMETER_MARKER: &str = "e2e-parameter-marker";
+const MALFORMED_API_KEY_SENTINEL: &str = "e2e-api-key-must-not-appear";
 const INVALID_PROMPT_BODY_SENTINEL: &str = "e2e-invalid-prompt-body-sentinel";
 const EMPTY_PARAMETERS: &str = "{}";
-const E2E_PARAMETERS: &str = r#"{"temperature":0.0,"provider_extension":{"mode":"e2e","private_marker":"e2e-extra-secret"}}"#;
+const E2E_PARAMETERS: &str = r#"{"temperature":0.0,"provider_extension":{"mode":"e2e","diagnostic_marker":"e2e-parameter-marker"}}"#;
 const LOG_DEGRADED_WARNING: &str = "项目日志不可用或已降级；命令会继续，退出状态不受影响。";
 const SAFE_STOPPING_PROGRESS: &str = "正在安全停止；保留最后确认进度";
 
@@ -240,6 +240,10 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert!(!cancelled_stderr.contains('\r'));
     assert!(!cancelled_stderr.contains('\u{001b}'));
     assert_translation_absent(&database);
+    assert!(
+        !workspace.join("task-records").exists(),
+        "默认关闭时即使 Standard 任务已经开始也不得建立空记录目录"
+    );
 
     let server = BoundChatServer::bind();
     write_configuration(root, server.endpoint(), E2E_PARAMETERS);
@@ -247,9 +251,12 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     let configuration = fs::read_to_string(&configuration_path).expect("Translate 配置应可读取");
     fs::write(
         &configuration_path,
-        configuration.replace("record_calls = false", "record_calls = true"),
+        configuration.replace(
+            "record_translation_tasks = false",
+            "record_translation_tasks = true",
+        ),
     )
-    .expect("应可启用 LLM 调用记录");
+    .expect("应可启用 Standard 翻译任务记录");
     write_placeholders(root);
     let running_server = server.start_with_responses(vec![
         ChatResponseFixture::Standard,
@@ -278,7 +285,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     );
     assert_translation_committed(&database);
     assert_lua_probes(&database, &["extract"]);
-    assert_llm_call_records_share_translate_run_id(&workspace, &logs_root);
+    assert_standard_task_record_shares_translate_run_id(&workspace, &logs_root);
 
     let initial_standard_write_back =
         run_att(root, arguments(&["mz", "write-back", "--name", PROJECT]));
@@ -664,7 +671,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     assert!(failed_stderr.contains("影响：状态未改变"));
     assert!(failed_stderr.contains("处理办法：修正指出的配置字段后重试"));
     assert!(failed_stderr.contains("locale=zh-Hans; component=system.md"));
-    assert_process_output_does_not_contain_client_secrets("missing prompt", &failed);
+    assert_process_summary_omits_client_payloads("missing prompt", &failed);
     for (phase, output) in [
         ("init", &init),
         ("extract", &extract),
@@ -692,7 +699,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
         ("cleared Lua extract", &cleared_lua_extract),
         ("failed translate", &failed),
     ] {
-        assert_process_output_does_not_contain_client_secrets(phase, output);
+        assert_process_summary_omits_client_payloads(phase, output);
     }
 }
 
@@ -1087,9 +1094,9 @@ fn malformed_configuration_does_not_echo_api_key() {
     fs::write(
         root.join("config.toml"),
         format!(
-            r#"[llm.clients.leak-probe]
+            r#"[llm.clients.invalid-api-key]
 url = "https://example.invalid/v1/chat/completions"
-api_key = "{LEAK_SENTINEL}" "invalid"
+api_key = "{MALFORMED_API_KEY_SENTINEL}" "invalid"
 "#
         ),
     )
@@ -1118,7 +1125,7 @@ api_key = "{LEAK_SENTINEL}" "invalid"
         "配置语法错误必须包含 1-based 行列：{stderr}"
     );
     assert!(
-        stderr.contains("llm.clients.leak-probe.api_key"),
+        stderr.contains("llm.clients.invalid-api-key.api_key"),
         "配置语法错误必须标明安全字段路径：{stderr}"
     );
     assert!(stderr.contains("影响：状态未改变"), "{stderr}");
@@ -1127,7 +1134,7 @@ api_key = "{LEAK_SENTINEL}" "invalid"
         "{stderr}"
     );
     assert!(
-        !stderr.contains(LEAK_SENTINEL),
+        !stderr.contains(MALFORMED_API_KEY_SENTINEL),
         "配置语法错误不得回显 API key：{stderr}"
     );
 }
@@ -1383,7 +1390,42 @@ fn prompt_locale_routing_renders_language_pairs_and_fails_before_llm_without_fal
 }
 
 #[test]
-fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
+fn enabled_task_recording_with_zero_standard_tasks_creates_no_directory() {
+    const EMPTY_PROJECT: &str = "task-records-empty";
+
+    let temporary = tempfile::tempdir().expect("应可建立零任务记录端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
+    write_minimal_mz_game(&game_root);
+    initialize_prompt_project(root, EMPTY_PROJECT, &game_root, "ja", "zh-Hans");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), E2E_PARAMETERS);
+    enable_translation_task_records(root);
+    let requests = server.start_observing_requests();
+    let translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", EMPTY_PROJECT, PROFILE]),
+    );
+    assert_success("zero Standard task translate", &translate);
+    assert!(
+        requests.finish().is_empty(),
+        "没有 Standard TaskBlock 时不得发出模型请求"
+    );
+    assert!(
+        !root
+            .join("projects/mz")
+            .join(EMPTY_PROJECT)
+            .join("task-records")
+            .exists(),
+        "记录开启但没有 Standard TaskBlock 时不得创建空目录"
+    );
+}
+
+#[test]
+fn thinking_output_keeps_reasoning_only_in_the_readable_task_record() {
     const SUCCESS_PROJECT: &str = "thinking-success";
     const RAW_JSON_PROJECT: &str = "thinking-raw-json";
 
@@ -1416,6 +1458,7 @@ fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
         "zh-Hans",
         true,
     );
+    enable_translation_task_records(root);
     let success_requests =
         success_server.start_with_responses(vec![ChatResponseFixture::ThinkingStandard]);
     let success = run_att(
@@ -1451,6 +1494,16 @@ fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
         "项目日志",
     );
     assert_database_does_not_contain(&success_database, THINKING_SENTINEL);
+    let success_record = read_single_task_record(
+        &root
+            .join("projects/mz")
+            .join(SUCCESS_PROJECT)
+            .join("task-records"),
+    );
+    assert!(success_record.contains("## Thinking\n"));
+    assert!(success_record.contains(THINKING_SENTINEL));
+    assert!(success_record.contains("## Assistant\n\n### ID 1\n"));
+    assert!(success_record.contains("- 状态：完成，已确认提交"));
 
     let raw_json_server = BoundChatServer::bind();
     write_configuration_with_prompt_options(
@@ -1460,6 +1513,7 @@ fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
         "zh-Hans",
         true,
     );
+    enable_translation_task_records(root);
     let raw_json_requests =
         raw_json_server.start_with_responses(vec![ChatResponseFixture::Standard]);
     let raw_json = run_att(
@@ -1491,6 +1545,37 @@ fn thinking_output_assembles_one_envelope_and_discards_private_reasoning() {
         "项目日志",
     );
     assert_database_does_not_contain(&raw_json_database, THINKING_SENTINEL);
+    let invalid_record = read_single_task_record(
+        &root
+            .join("projects/mz")
+            .join(RAW_JSON_PROJECT)
+            .join("task-records"),
+    );
+    assert!(!invalid_record.contains("## Thinking\n"));
+    assert!(invalid_record.contains("> 解析错误：模型响应缺少规定的思考信封"));
+    assert!(invalid_record.contains(&format!("```text\n{{\"1\":[\"{TRANSLATION}\"]}}")));
+}
+
+fn enable_translation_task_records(root: &Path) {
+    let path = root.join("config.toml");
+    let configuration = fs::read_to_string(&path).expect("Translate 配置应可读取");
+    fs::write(
+        &path,
+        configuration.replace(
+            "record_translation_tasks = false",
+            "record_translation_tasks = true",
+        ),
+    )
+    .expect("应可启用 Standard 任务记录");
+}
+
+fn read_single_task_record(task_records_root: &Path) -> String {
+    let run_directories = fs::read_dir(task_records_root)
+        .expect("任务记录根应存在")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("任务记录运行目录应可读取");
+    assert_eq!(run_directories.len(), 1, "测试项目应只有一个记录运行");
+    fs::read_to_string(run_directories[0].path().join("task-000001.md")).expect("任务记录应可读取")
 }
 
 fn initialize_and_extract_prompt_project(
@@ -1612,7 +1697,7 @@ fn assert_prompt_failure_before_llm(
         "{stderr}"
     );
     assert!(!stderr.contains(INVALID_PROMPT_BODY_SENTINEL), "{stderr}");
-    assert_process_output_does_not_contain_client_secrets("prompt failure", &output);
+    assert_process_summary_omits_client_payloads("prompt failure", &output);
 }
 
 fn arguments(values: &[&str]) -> Vec<OsString> {
@@ -1693,7 +1778,7 @@ fn run_att_with_ui_locale(root: &Path, arguments: Vec<OsString>, ui_locale: &str
     wait_for_att(child)
 }
 
-fn assert_process_output_does_not_contain_client_secrets(phase: &str, output: &Output) {
+fn assert_process_summary_omits_client_payloads(phase: &str, output: &Output) {
     for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
         let text = String::from_utf8_lossy(bytes);
         assert!(
@@ -1701,8 +1786,8 @@ fn assert_process_output_does_not_contain_client_secrets(phase: &str, output: &O
             "{phase} 的 {stream} 不得包含配置内 API key：{text}"
         );
         assert!(
-            !text.contains(E2E_EXTRA_SECRET),
-            "{phase} 的 {stream} 不得包含 parameters 敏感值：{text}"
+            !text.contains(E2E_PARAMETER_MARKER),
+            "{phase} 的 {stream} 只承担摘要职责，不应复制完整 parameters：{text}"
         );
     }
 }
@@ -1712,7 +1797,7 @@ fn assert_output_does_not_contain(phase: &str, output: &Output, sentinel: &str) 
         let text = String::from_utf8_lossy(bytes);
         assert!(
             !text.contains(sentinel),
-            "{phase} 的 {stream} 不得包含已丢弃的思考正文：{text}"
+            "{phase} 的 {stream} 只承担摘要职责，不应复制 Thinking 正文：{text}"
         );
     }
 }
@@ -2425,9 +2510,6 @@ root = "prompts"
 locale = "{prompt_locale}"
 thinking_output = {thinking_output}
 
-[llm]
-record_calls = false
-
 [llm.clients.primary]
 url = "{url}"
 api_key = "{API_KEY}"
@@ -2472,6 +2554,9 @@ ignored_terms = []
 minimum_copied_word_count = 2
 minimum_copied_letter_count = 4
 allowed_terms = []
+
+[rpg_maker]
+record_translation_tasks = false
 
 [[rpg_maker.translation_profiles]]
 id = "local"
@@ -3345,7 +3430,7 @@ fn assert_project_log(log_root: &Path) {
             && record["payload"]["kind"] == "publication"
     }));
 
-    for secret in [
+    for omitted_payload in [
         SOURCE_TEXT,
         UPDATED_SOURCE_TEXT,
         TRANSLATION,
@@ -3357,9 +3442,12 @@ fn assert_project_log(log_root: &Path) {
         "messages",
         "authorization",
         API_KEY,
-        E2E_EXTRA_SECRET,
+        E2E_PARAMETER_MARKER,
     ] {
-        assert!(!raw.contains(secret), "项目日志不得包含敏感载荷 {secret:?}");
+        assert!(
+            !raw.contains(omitted_payload),
+            "摘要型项目日志不应复制完整载荷 {omitted_payload:?}"
+        );
     }
 }
 
@@ -3385,6 +3473,7 @@ fn assert_typed_project_log_payload(record: &Value) {
         "result.partial" => "result_summary",
         "publication.started" | "publication.finished" => "publication",
         "task.started" | "task.finished" => "task",
+        "task.diagnostic" => "task_diagnostic",
         other => panic!("未知项目日志 code：{other}"),
     };
     assert_eq!(
@@ -3408,6 +3497,7 @@ fn assert_typed_project_log_payload(record: &Value) {
         ],
         "publication" => &["kind", "outcome", "published_items"],
         "task" => &["kind", "ordinal", "total", "outcome", "attempts"],
+        "task_diagnostic" => &["kind", "ordinal", "total", "attempts", "diagnostic"],
         "cancellation" => &["kind", "confirmed", "total"],
         "failure" => &["kind", "relation", "diagnostic"],
         "performance" => &["kind", "snapshot"],
@@ -3586,7 +3676,7 @@ fn assert_translate_mixed_source_log(log_root: &Path) {
     );
 }
 
-fn assert_llm_call_records_share_translate_run_id(workspace: &Path, log_root: &Path) {
+fn assert_standard_task_record_shares_translate_run_id(workspace: &Path, log_root: &Path) {
     let (_, records) = read_project_logs(log_root);
     let run_id = records
         .iter()
@@ -3598,23 +3688,34 @@ fn assert_llm_call_records_share_translate_run_id(workspace: &Path, log_root: &P
         })
         .and_then(|record| record["run_id"].as_str())
         .expect("显式 Standard+Lua Translate 应拥有 RunId");
-    let call_directory = workspace.join("llm-calls").join(run_id);
-    let mut calls = fs::read_dir(&call_directory)
-        .expect("调用记录应使用同一 Translate RunId")
+    let task_directory = workspace.join("task-records").join(run_id);
+    let mut task_files = fs::read_dir(&task_directory)
+        .expect("任务记录应使用同一 Translate RunId")
         .collect::<Result<Vec<_>, _>>()
-        .expect("调用记录目录应可读取")
+        .expect("任务记录目录应可读取")
         .into_iter()
         .map(|entry| entry.file_name())
         .collect::<Vec<_>>();
-    calls.sort();
+    task_files.sort();
     assert_eq!(
-        calls,
-        [
-            OsString::from("call-000001.md"),
-            OsString::from("call-000002.md")
-        ],
-        "首次 Standard+Lua Translate 应各记录一次实际 HTTP 调用"
+        task_files,
+        [OsString::from("task-000001.md")],
+        "Standard+Lua Translate 只能为一个 Standard TaskBlock 生成一份任务记录"
     );
+    let markdown = fs::read_to_string(task_directory.join("task-000001.md"))
+        .expect("Standard 任务记录应可读取");
+    assert!(markdown.starts_with("# 翻译任务 000001 · 完成\n"));
+    assert!(markdown.contains("- Endpoint：`"));
+    assert!(markdown.contains("- Model：`e2e-model`"));
+    assert!(markdown.contains("## 自定义参数\n"));
+    assert!(markdown.contains("## System\n"));
+    assert!(markdown.contains("## User\n"));
+    assert!(markdown.contains("## 请求过程\n"));
+    assert!(markdown.contains("## Assistant\n"));
+    assert!(markdown.contains("### ID 1\n"));
+    assert!(markdown.contains("## 最终结果\n"));
+    assert!(markdown.contains("- 状态：完成，已确认提交"));
+    assert!(!markdown.contains(API_KEY));
 }
 
 fn assert_uuid_v4(value: &str) {
@@ -4154,7 +4255,7 @@ fn assert_exact_standard_chat_request(request: &CapturedRequest) {
         "temperature": 0.0,
         "provider_extension": {
             "mode": "e2e",
-            "private_marker": E2E_EXTRA_SECRET
+            "diagnostic_marker": E2E_PARAMETER_MARKER
         }
     });
     assert_eq!(actual, expected, "Chat Completions 请求 wire 必须精确匹配");
@@ -4220,7 +4321,7 @@ fn assert_mixed_semantic_request(request: &CapturedRequest) {
     ] {
         assert!(
             !user.contains(forbidden),
-            "最小 user message 不得泄漏内部字段 {forbidden:?}：{user}"
+            "最小 user message 不得携带内部字段 {forbidden:?}：{user}"
         );
     }
 }
@@ -4238,7 +4339,7 @@ fn assert_exact_lua_chat_request(request: &CapturedRequest) {
         "temperature": 0.0,
         "provider_extension": {
             "mode": "e2e",
-            "private_marker": E2E_EXTRA_SECRET
+            "diagnostic_marker": E2E_PARAMETER_MARKER
         }
     });
     assert_eq!(

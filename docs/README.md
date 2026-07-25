@@ -42,6 +42,7 @@ ATT 当前实现的游戏领域只有 **RPG Maker**，该领域目前只包含 *
 - [初始化现行规格](rpg-maker/init.md)
 - [文本提取现行规格](rpg-maker/extraction.md)
 - [翻译现行规格](rpg-maker/translation.md)
+- [Standard 翻译任务记录现行规格](rpg-maker/task-records.md)
 - [写回现行规格](rpg-maker/write-back.md)
 - [可信 Lua 现行规格](rpg-maker/lua.md)
 - [Lua Cookbook](rpg-maker/lua-cookbook.md)

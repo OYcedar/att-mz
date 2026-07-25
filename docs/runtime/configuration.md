@@ -1,8 +1,8 @@
 # ATT 生产配置现行规格
 
 仓库根目录的 [`config.example.toml`](../../config.example.toml) 是当前版本唯一示例。
-配置只表达操作者真正能够选择的路径、Prompt、语言、模型服务、业务 Profile 和敏感
-调用记录开关；线程、队列、批次、SQLite 持久策略、日志缓冲以及文件、Lua、SQLite、
+配置只表达操作者真正能够选择的路径、Prompt、语言、模型服务、业务 Profile 和可读
+Standard 任务记录开关；线程、队列、批次、SQLite 持久策略、日志缓冲以及文件、Lua、SQLite、
 Claim、Unit、Group、Task 总量都不是配置项。
 
 ## 1. 读取与严格边界
@@ -23,12 +23,14 @@ Claim、Unit、Group、Task 总量都不是配置项。
 只有上述当前分区有效。未知字段严格拒绝，诊断只说明当前字段要求和具体无效原因。
 
 配置只解析本次命令真正消费的已知子树。例如 Init 只需要 `projects.root`；Translate
-才解析 Prompt、`llm.record_calls`、全部语言、所选 Profile 和该 Profile 引用的 Client。
+才解析 Prompt、`rpg_maker.record_translation_tasks`、全部语言、所选 Profile 和该
+Profile 引用的 Client。
 未选 Client 的密钥不会物化。选中的表严格拒绝缺失、未知、错误类型、空白 ID 和规范化
 后的重复 ID。
 
-配置错误展示配置路径、一基行列、字段和具体原因；不得回显 API key、Client
-`parameters` 值或完整配置正文。
+配置错误展示配置路径、一基行列、字段和具体原因；不得回显 API key 实际值。稳定配置
+诊断不复制完整 `parameters` 或配置正文，以维持结构化 schema 与可读体积；这不表示这些
+普通数据属于敏感内容。
 
 ## 2. 最小配置与路径
 
@@ -56,19 +58,6 @@ root = "projects"
 | 其他 CLI 文件或目录参数 | 进程当前工作目录 |
 
 ## 3. LLM 与 Client
-
-`[llm]` 可以选择是否为 Translate 保留敏感的逐次 HTTP 调用记录：
-
-<!-- att-config-example: fragment -->
-```toml
-[llm]
-record_calls = false
-```
-
-`record_calls` 是可省略的布尔值，默认 `false`；只有 Translate 消费它。它对本轮
-Standard 和 Translate Lua 的全部 LLM 调用生效，不属于某个 Client，不进入翻译指纹、
-保存的运行方案或项目数据库。启用后的固定位置、敏感性和非阻断失败语义见
-[项目日志规格](project-log.md)。
 
 模型服务的真实外部约束全部属于 Client：
 
@@ -117,6 +106,9 @@ root = "prompts"
 locale = "auto"
 thinking_output = false
 
+[rpg_maker]
+record_translation_tasks = false
+
 [[languages]]
 type = "japanese"
 id = "ja"
@@ -129,6 +121,12 @@ id = "primary"
 llm_client = "primary"
 target_task_user_message_characters = 24000
 ```
+
+`record_translation_tasks` 是可省略的布尔值，默认 `false`，只有 Translate 消费。开启后
+只为本轮已启动的 Standard TaskBlock 写入可读 Markdown；Translate Lua 不生成任务记录。
+它不属于某个 Client，不进入翻译 state、保存的运行方案或项目数据库。固定路径、内容
+模板、API-key 精确替换和非阻断写入语义见
+[Standard 翻译任务记录现行规格](../rpg-maker/task-records.md)。
 
 Profile 只拥有普通 TaskBlock 最终 user message 的 Unicode 字符装箱目标和 Client 引用。
 Planner 按实际渲染结果计数；加入下一个完整文本组会超过目标时，只在组边界开始下一
@@ -163,7 +161,8 @@ LanguagePair 精确选择源语言模块。
 - SQLite 固定使用 WAL + FULL；
 - 项目锁、发布锁和 SQLite busy 不设置任意截止时间；
 - 日志固定写入项目工作区的 `logs/<run-id>.jsonl`；
-- 启用敏感调用记录时固定写入同一 RunId 的 `llm-calls/<run-id>/call-N.md`；
+- 启用 Standard 任务记录时固定写入同一 RunId 的
+  `task-records/<run-id>/task-000001.md`，稳定 ordinal 与完整格式由任务记录规格规定；
 - 文档、规则、Group、任务和不同物理文件在不破坏确定性的前提下并行；
 - 自然顺序、代表选择、提交顺序和最终主错误不受完成顺序影响。
 

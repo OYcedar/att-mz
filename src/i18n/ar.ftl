@@ -204,3 +204,112 @@ diagnostic-io-kind-value = { $code ->
 diagnostic-configuration-rule-value = { $code ->
    *[other] { $fallback }{ $facts }
 }
+task-record-title = مهمة الترجمة { $ordinal } · { $state }
+task-record-state-label = { $state ->
+    [complete] مكتملة
+    [partial] مكتملة جزئيًا
+    [unavailable] غير متاحة
+    [execution_failed] فشل التنفيذ
+    [commit_preparation_failed] فشل إعداد التثبيت
+    [commit_not_applied] لم يُطبَّق التثبيت
+    [commit_outcome_unknown] نتيجة التثبيت غير معروفة
+    [not_committed_after_earlier_failure] لم تُثبَّت بعد فشل سابق
+    [invalid_result] تسلسل نتائج Executor غير صالح
+    [cancelled] ملغاة
+   *[other] { $state }
+}
+task-record-summary-with-written = `المهمة { $ordinal }/{ $total }` · `{ $attempts } محاولات` · `مقبول { $accepted }/{ $expected }` · `كُتب في { $written } مواضع`
+task-record-summary-without-written = `المهمة { $ordinal }/{ $total }` · `{ $attempts } محاولات` · `مقبول { $accepted }/{ $expected }`
+task-record-run-id-label = معرّف التشغيل:
+task-record-started-at-label = وقت البدء:
+task-record-duration-label = المدة الإجمالية:
+task-record-endpoint-label = نقطة النهاية:
+task-record-model-label = النموذج:
+task-record-custom-parameters-heading = المعلمات المخصصة
+task-record-attempts-heading = محاولات الطلب
+task-record-final-result-heading = النتيجة النهائية
+task-record-no-request = لم يتكوّن طلب نموذج جاهز للإرسال.
+task-record-empty-assistant = أعاد النموذج كائنًا فارغًا.
+task-record-parse-error = خطأ في التحليل: { $kind ->
+    [json] JSON استجابة النموذج غير صالح (الفئة `{ $category }`)، السطر { $line }، العمود { $column }
+    [thinking_not_allowed] وضع الاستجابة الحالي لا يقبل مخرجات التفكير، السطر { $line }، العمود { $column }
+    [thinking_envelope_missing] غلاف التفكير المطلوب مفقود، السطر { $line }، العمود { $column }
+    [thinking_envelope_unclosed] غلاف التفكير غير مغلق، السطر { $line }، العمود { $column }
+    [thinking_empty] محتوى التفكير فارغ، السطر { $line }، العمود { $column }
+    [thinking_nested] يوجد غلاف تفكير متداخل، السطر { $line }، العمود { $column }
+    [thinking_repeated] يوجد غلاف تفكير متكرر، السطر { $line }، العمود { $column }
+    [markdown_fence_no_body] سياج Markdown بلا محتوى، السطر { $line }، العمود { $column }
+    [markdown_fence_unsupported] لا يُقبل إلا سياج Markdown واحد بلا وسم لغة أو بوسم json، السطر { $line }، العمود { $column }
+    [markdown_fence_unclosed] سياج Markdown غير مغلق، السطر { $line }، العمود { $column }
+   *[markdown_fence_invalid_closing] يجب إغلاق سياج Markdown في السطر المستقل الأخير، السطر { $line }، العمود { $column }
+}
+task-record-attempt-succeeded = المحاولة { $number }: نجحت؛ finish reason { $finish_reason }
+task-record-attempt-token-usage = ؛ الرموز `{ $prompt } / { $completion } / { $total }`
+task-record-attempt-duration = ؛ المدة `{ $duration }`
+task-record-attempt-request-id = ؛ request ID { $request_id }
+task-record-attempt-response-id = ؛ response ID { $response_id }
+task-record-attempt-retryable = المحاولة { $number }: فشل طلب قابل للإعادة؛ التشخيص `{ $code }`؛ المدة `{ $duration }`
+task-record-attempt-retry-after = ؛ Retry-After `{ $duration }`
+task-record-attempt-wait-retry = ؛ إعادة المحاولة بعد `{ $duration }`
+task-record-attempt-wait-completed = ؛ اكتمل الانتظار لمدة `{ $duration }`؛ لم تبدأ المحاولة التالية
+task-record-attempt-wait-cancelled = ؛ كان الانتظار المخطط `{ $duration }`؛ أُلغي أثناء الانتظار
+task-record-attempt-failed = المحاولة { $number }: فشل معالجة الطلب أو الاستجابة؛ التشخيص `{ $code }`؛ المدة `{ $duration }`
+task-record-attempt-cancelled = المحاولة { $number }: أُلغيت؛ المدة `{ $duration }`
+task-record-structured-reason = السبب: { $reason }
+task-record-final-status = الحالة: { $state ->
+    [complete] مكتملة والتثبيت مؤكّد
+    [partial] مكتملة جزئيًا والتثبيت مؤكّد
+    [unavailable] غير متاحة؛ المشروع لم يتغير
+    [execution_failed] فشل التنفيذ؛ لم تُثبَّت
+    [commit_preparation_failed] فشل إعداد التثبيت؛ لم يُطبَّق يقينًا
+    [commit_not_applied] المعاملة لم تُطبَّق يقينًا
+    [commit_outcome_unknown] نتيجة التثبيت غير معروفة
+    [not_committed_after_earlier_failure] لم تُثبَّت بسبب فشل مهمة سابقة
+    [invalid_result] تسلسل نتائج Executor غير صالح؛ لم تُثبَّت
+    [cancelled] ملغاة؛ لم تُثبَّت
+   *[other] { $state }
+}
+task-record-accepted-written = المقبول: { $accepted } عناصر، كُتبت في { $written } مواضع فعلية
+task-record-accepted-outcome-unknown = تم التحقق من { $accepted } عناصر؛ تعذّر تأكيد نتيجة تثبيت قاعدة البيانات
+task-record-rejected-heading = غير المقبول:
+task-record-rejected-item = { $id }: { $reason }
+task-record-protocol-diagnostic = تشخيص البروتوكول: { $diagnostic }
+task-record-unavailable-reason = سبب عدم الإتاحة: { $reason }
+task-record-task-diagnostic = تشخيص المهمة: `{ $code }`؛ السبب { $reason }
+task-record-rejection-reason = { $code ->
+    [missing] خرج النموذج مفقود
+    [duplicate] خرج النموذج مكرر
+    [invalid_shape] { $detail }
+    [invalid_shape_array] يجب أن تكون الترجمة مصفوفة من السلاسل
+    [invalid_shape_item] يجب أن يكون العنصر { $line } في مصفوفة الترجمة سلسلة
+    [line_count_mismatch] عدد الأسطر غير متطابق (المتوقع { $expected }، الفعلي { $actual })
+    [invalid_line_text] يحتوي السطر { $line } على محارف تحكم غير صالحة
+    [blank_line_mismatch] حالة الفراغ في السطر { $line } غير متطابقة (المتوقع: { $expected_blank ->
+        [blank] فارغ
+       *[other] غير فارغ
+    })
+    [blank_translation] الترجمة فارغة
+    [no_natural_language_text] لا تحتوي الترجمة على نص بلغة طبيعية
+    [contains_byte_order_mark] تحتوي الترجمة على BOM
+    [placeholder_mismatch] العنصر النائب غير متطابق: { $detail }
+    [unexpected_placeholder] عنصر نائب غير متوقع: { $detail }
+    [placeholder_normalization_ambiguous] تطبيع العنصر النائب ملتبس: { $detail }
+    [source_residual] اكتُشف نص متبقٍ من لغة المصدر: { $detail }
+   *[other] { $detail }
+}
+task-record-protocol-detail = { $code ->
+    [non_stop_finish] finish reason ليست stop: { $detail }
+    [invalid_response] { $detail }
+    [invalid_id] معرّف عنصر النموذج { $index } غير صالح
+    [unknown_id] أعاد عنصر النموذج { $index } المعرّف المجهول { $detail }
+   *[other] { $detail }
+}
+task-record-unavailable-detail = { $code ->
+    [model_response_unusable] تعذّر تحليل استجابة النموذج
+    [all_outputs_rejected] رُفضت كل مخرجات النموذج عند التحقق
+    [recoverable_request_exhausted] استُنفدت ميزانية إعادة الطلبات القابلة للاسترداد
+    [retry_after_exceeds_maximum] تتجاوز Retry-After أقصى مدة انتظار مضبوطة
+   *[other] { $code }
+}
+task-record-duration-seconds = { $value } ثانية
+task-record-duration-milliseconds = { $value } مللي ثانية

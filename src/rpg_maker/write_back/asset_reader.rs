@@ -2159,11 +2159,11 @@ mod tests {
     }
 
     #[test]
-    fn write_back_snapshot_typed_sources_keep_safe_facts_without_leaking_body_text() {
-        const SECRET: &str = "SENTINEL_WRITE_BACK_SNAPSHOT_BODY_329c";
+    fn write_back_snapshot_typed_sources_keep_stable_facts_without_copying_body_text() {
+        const SOURCE_BODY: &str = "SENTINEL_WRITE_BACK_SNAPSHOT_BODY_329c";
 
         let pcre_source = pcre2::bytes::RegexBuilder::new()
-            .build(&format!("(?<{SECRET}"))
+            .build(&format!("(?<{SOURCE_BODY}"))
             .expect_err("测试 PCRE2 应无效");
         let dialogue = InvalidStandardWriteBackAssetSnapshot::InvalidDialogueDefinition(Box::new(
             MvDialogueDefinitionError::InvalidPattern {
@@ -2173,7 +2173,7 @@ mod tests {
         ))
         .safe_diagnostic();
         let location = InvalidStandardWriteBackAssetSnapshot::InvalidLocation(
-            RpgMakerLocationCodecError::InvalidDataFile(SECRET.to_owned()),
+            RpgMakerLocationCodecError::InvalidDataFile(SOURCE_BODY.to_owned()),
         )
         .safe_diagnostic();
         let projection = InvalidStandardWriteBackAssetSnapshot::InvalidProjection(
@@ -2185,7 +2185,7 @@ mod tests {
             ),
         )
         .safe_diagnostic();
-        let invalid_json = format!("{{\"{SECRET}\":");
+        let invalid_json = format!("{{\"{SOURCE_BODY}\":");
         let unit_content = InvalidStandardWriteBackAssetSnapshot::InvalidUnitContent {
             column: "translation_content_json",
             source: serde_json::from_str::<serde_json::Value>(&invalid_json)
@@ -2219,8 +2219,8 @@ mod tests {
             ),
         ] {
             let (json, cli) = diagnostic_surfaces(&diagnostic);
-            assert!(!json.contains(SECRET), "JSONL 泄漏了正文：{json}");
-            assert!(!cli.contains(SECRET), "CLI 泄漏了正文：{cli}");
+            assert!(!json.contains(SOURCE_BODY), "JSONL 不应复制正文：{json}");
+            assert!(!cli.contains(SOURCE_BODY), "CLI 不应复制正文：{cli}");
             for fact in expected_facts {
                 assert!(json.contains(fact), "JSONL 缺少 {fact}: {json}");
                 assert!(cli.contains(fact), "CLI 缺少 {fact}: {cli}");

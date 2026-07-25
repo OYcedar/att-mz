@@ -192,3 +192,112 @@ diagnostic-io-kind-value = { $code ->
 diagnostic-configuration-rule-value = { $code ->
    *[other] { $fallback }{ $facts }
 }
+task-record-title = Tarea de traducción { $ordinal } · { $state }
+task-record-state-label = { $state ->
+    [complete] Completada
+    [partial] Parcialmente completada
+    [unavailable] No disponible
+    [execution_failed] Error de ejecución
+    [commit_preparation_failed] Error al preparar el commit
+    [commit_not_applied] Commit no aplicado
+    [commit_outcome_unknown] Resultado del commit desconocido
+    [not_committed_after_earlier_failure] Sin commit tras un error anterior
+    [invalid_result] Secuencia de resultados de Executor no válida
+    [cancelled] Cancelada
+   *[other] { $state }
+}
+task-record-summary-with-written = `Tarea { $ordinal }/{ $total }` · `{ $attempts } intentos` · `Aceptadas { $accepted }/{ $expected }` · `Escritas en { $written } ubicaciones`
+task-record-summary-without-written = `Tarea { $ordinal }/{ $total }` · `{ $attempts } intentos` · `Aceptadas { $accepted }/{ $expected }`
+task-record-run-id-label = ID de ejecución:
+task-record-started-at-label = Inicio:
+task-record-duration-label = Duración total:
+task-record-endpoint-label = Endpoint:
+task-record-model-label = Modelo:
+task-record-custom-parameters-heading = Parámetros personalizados
+task-record-attempts-heading = Intentos de solicitud
+task-record-final-result-heading = Resultado final
+task-record-no-request = No se generó una solicitud de modelo lista para enviar.
+task-record-empty-assistant = El modelo devolvió un objeto vacío.
+task-record-parse-error = Error de análisis: { $kind ->
+    [json] JSON de respuesta del modelo no válido (categoría `{ $category }`), línea { $line }, columna { $column }
+    [thinking_not_allowed] este modo de respuesta no acepta razonamiento, línea { $line }, columna { $column }
+    [thinking_envelope_missing] falta el sobre de razonamiento obligatorio, línea { $line }, columna { $column }
+    [thinking_envelope_unclosed] el sobre de razonamiento no está cerrado, línea { $line }, columna { $column }
+    [thinking_empty] el contenido del razonamiento está vacío, línea { $line }, columna { $column }
+    [thinking_nested] hay un sobre de razonamiento anidado, línea { $line }, columna { $column }
+    [thinking_repeated] hay un sobre de razonamiento repetido, línea { $line }, columna { $column }
+    [markdown_fence_no_body] el bloque Markdown no tiene contenido, línea { $line }, columna { $column }
+    [markdown_fence_unsupported] solo se acepta un bloque Markdown sin etiqueta de idioma o con etiqueta json, línea { $line }, columna { $column }
+    [markdown_fence_unclosed] el bloque Markdown no está cerrado, línea { $line }, columna { $column }
+   *[markdown_fence_invalid_closing] el bloque Markdown debe cerrarse en la última línea independiente, línea { $line }, columna { $column }
+}
+task-record-attempt-succeeded = Intento { $number }: correcto; finish reason { $finish_reason }
+task-record-attempt-token-usage = ; tokens `{ $prompt } / { $completion } / { $total }`
+task-record-attempt-duration = ; duración `{ $duration }`
+task-record-attempt-request-id = ; request ID { $request_id }
+task-record-attempt-response-id = ; response ID { $response_id }
+task-record-attempt-retryable = Intento { $number }: error reintentable; diagnóstico `{ $code }`; duración `{ $duration }`
+task-record-attempt-retry-after = ; Retry-After `{ $duration }`
+task-record-attempt-wait-retry = ; reintento tras `{ $duration }`
+task-record-attempt-wait-completed = ; espera de `{ $duration }` completada; el siguiente intento no comenzó
+task-record-attempt-wait-cancelled = ; espera prevista de `{ $duration }`; cancelado durante la espera
+task-record-attempt-failed = Intento { $number }: error al procesar la solicitud o respuesta; diagnóstico `{ $code }`; duración `{ $duration }`
+task-record-attempt-cancelled = Intento { $number }: cancelado; duración `{ $duration }`
+task-record-structured-reason = Motivo: { $reason }
+task-record-final-status = Estado: { $state ->
+    [complete] completada y commit confirmado
+    [partial] parcialmente completada y commit confirmado
+    [unavailable] no disponible; proyecto sin cambios
+    [execution_failed] error de ejecución; sin commit
+    [commit_preparation_failed] error al preparar el commit; no aplicado con certeza
+    [commit_not_applied] transacción no aplicada con certeza
+    [commit_outcome_unknown] resultado del commit desconocido
+    [not_committed_after_earlier_failure] sin commit porque falló una tarea anterior
+    [invalid_result] secuencia de resultados de Executor no válida; sin commit
+    [cancelled] cancelada; sin commit
+   *[other] { $state }
+}
+task-record-accepted-written = Aceptadas: { $accepted } entradas, escritas en { $written } ubicaciones reales
+task-record-accepted-outcome-unknown = Validadas: { $accepted } entradas; no se puede confirmar el resultado del commit de la base de datos
+task-record-rejected-heading = No aceptadas:
+task-record-rejected-item = { $id }: { $reason }
+task-record-protocol-diagnostic = Diagnóstico de protocolo: { $diagnostic }
+task-record-unavailable-reason = Motivo de indisponibilidad: { $reason }
+task-record-task-diagnostic = Diagnóstico de tarea: `{ $code }`; motivo { $reason }
+task-record-rejection-reason = { $code ->
+    [missing] Falta la salida del modelo
+    [duplicate] Salida del modelo duplicada
+    [invalid_shape] { $detail }
+    [invalid_shape_array] La traducción debe ser una matriz de cadenas
+    [invalid_shape_item] El elemento { $line } de la matriz de traducción debe ser una cadena
+    [line_count_mismatch] El número de líneas no coincide (esperado { $expected }, real { $actual })
+    [invalid_line_text] La línea { $line } contiene caracteres de control no válidos
+    [blank_line_mismatch] El estado en blanco no coincide en la línea { $line } (esperado: { $expected_blank ->
+        [blank] en blanco
+       *[other] no en blanco
+    })
+    [blank_translation] La traducción está en blanco
+    [no_natural_language_text] La traducción no contiene texto en lenguaje natural
+    [contains_byte_order_mark] La traducción contiene un BOM
+    [placeholder_mismatch] Marcador de posición no coincidente: { $detail }
+    [unexpected_placeholder] Marcador de posición inesperado: { $detail }
+    [placeholder_normalization_ambiguous] Normalización ambigua del marcador: { $detail }
+    [source_residual] Se detectó texto residual del idioma de origen: { $detail }
+   *[other] { $detail }
+}
+task-record-protocol-detail = { $code ->
+    [non_stop_finish] finish reason no es stop: { $detail }
+    [invalid_response] { $detail }
+    [invalid_id] El elemento { $index } del modelo tiene un ID no válido
+    [unknown_id] El elemento { $index } del modelo devolvió el ID desconocido { $detail }
+   *[other] { $detail }
+}
+task-record-unavailable-detail = { $code ->
+    [model_response_unusable] No se pudo analizar la respuesta del modelo
+    [all_outputs_rejected] Todas las salidas del modelo fueron rechazadas
+    [recoverable_request_exhausted] Se agotó el presupuesto de reintentos recuperables
+    [retry_after_exceeds_maximum] Retry-After supera la espera máxima configurada
+   *[other] { $code }
+}
+task-record-duration-seconds = { $value } segundos
+task-record-duration-milliseconds = { $value } ms

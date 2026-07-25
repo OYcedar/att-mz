@@ -2653,8 +2653,8 @@ mod tests {
         assert!(detail.contains("first_kind=database_entry"));
         assert!(detail.contains("second_kind=event_command"));
 
-        const SOURCE_SENTINEL: &str = "SECRET_ROOT_SOURCE_TEXT";
-        let error = DiagnosticExtractionError::Persist(FakeError(SOURCE_SENTINEL));
+        const SOURCE_BODY: &str = "ROOT_SOURCE_BODY_SENTINEL";
+        let error = DiagnosticExtractionError::Persist(FakeError(SOURCE_BODY));
         let diagnostic = error.safe_diagnostic();
         assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
         assert!(matches!(
@@ -2664,7 +2664,7 @@ mod tests {
         assert!(
             !serde_json::to_string(&diagnostic)
                 .expect("Builtin 根诊断应可序列化")
-                .contains(SOURCE_SENTINEL),
+                .contains(SOURCE_BODY),
             "根错误任意 Display 文本不得进入公开投影"
         );
     }

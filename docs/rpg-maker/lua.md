@@ -363,6 +363,11 @@ Profile 的 Client，但不会自动插入 system prompt；脚本应显式发送
 返回供应商响应即成功；`finish_reason ~= "stop"` 不自动报错。LLM 根不自动重试；
 `llm/retryable` 可带 `retry_after_ms`，`llm/fatal` 不可恢复。请求失败也可能已被服务接收。
 
+`ctx.llm` 不生成 Standard 任务记录。Lua 拥有任意私有消息协议、验收、身份和数据库
+事务，核心无法从一次 Provider 响应推导脚本的逐 ID 结果或最终提交终态，因此不会把
+Lua 调用伪装成 Standard TaskBlock。Lua 排障使用运行级 JSONL 摘要、脚本自己的稳定诊断
+和私有状态证据。
+
 ## 9. SQLite：私有协议与事务
 
 <!-- att-example: illustrative -->

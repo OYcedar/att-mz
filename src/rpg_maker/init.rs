@@ -587,7 +587,7 @@ where
                 &expected_children,
                 &[
                     ("logs", DirectoryEntryKind::Directory),
-                    ("llm-calls", DirectoryEntryKind::Directory),
+                    ("task-records", DirectoryEntryKind::Directory),
                     ("project.db-journal", DirectoryEntryKind::RegularFile),
                     ("project.db-wal", DirectoryEntryKind::RegularFile),
                     ("project.db-shm", DirectoryEntryKind::RegularFile),
@@ -1312,7 +1312,10 @@ mod tests {
                 ) {
                     children.extend([
                         DirectoryEntry::new(path.join("logs"), DirectoryEntryKind::Directory),
-                        DirectoryEntry::new(path.join("llm-calls"), DirectoryEntryKind::Directory),
+                        DirectoryEntry::new(
+                            path.join("task-records"),
+                            DirectoryEntryKind::Directory,
+                        ),
                     ]);
                 }
                 if matches!(

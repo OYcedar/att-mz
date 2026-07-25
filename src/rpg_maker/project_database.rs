@@ -4740,7 +4740,7 @@ mod tests {
 
     #[tokio::test]
     async fn dialogue_definition_failure_keeps_typed_position_without_definition_body() {
-        const DEFINITION_BODY_SENTINEL: &str = "SECRET_DIALOGUE_DEFINITION_BODY";
+        const DEFINITION_BODY_SENTINEL: &str = "DIALOGUE_DEFINITION_BODY_SENTINEL";
         let mut values = valid_metadata_row().into_values();
         values.push(SqliteValue::Text(format!(
             "{{\n\"rules\": \"{DEFINITION_BODY_SENTINEL}\"\n}}"
