@@ -255,61 +255,6 @@ pub(crate) trait TrustedLuaExtractHostCalls: Send + Sync + 'static {
     fn clear_standard(&self) -> Result<(), TrustedLuaHostCallError>;
 }
 
-/// 已解析但尚未越过 Lua native 返回边界的模型响应。
-///
-/// 处置回调随值一起移动，确保 Runtime 只能为这次响应记录一次最终交付事实，且不需要
-/// 理解调用编号或审阅档案路径。
-pub(crate) struct TrustedLuaPendingLlmResponse {
-    response: LlmResponse,
-    finish: Box<
-        dyn FnOnce(
-                TrustedLuaLlmDeliveryDisposition,
-            ) -> HostFuture<Result<(), TrustedLuaHostCallError>>
-            + Send,
-    >,
-}
-
-impl TrustedLuaPendingLlmResponse {
-    pub(crate) fn new<F>(response: LlmResponse, finish: F) -> Self
-    where
-        F: FnOnce(
-                TrustedLuaLlmDeliveryDisposition,
-            ) -> HostFuture<Result<(), TrustedLuaHostCallError>>
-            + Send
-            + 'static,
-    {
-        Self {
-            response,
-            finish: Box::new(finish),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(response: LlmResponse) -> Self {
-        Self::new(response, |_| Box::pin(async { Ok(()) }))
-    }
-
-    pub(crate) const fn response(&self) -> &LlmResponse {
-        &self.response
-    }
-
-    pub(crate) fn finish(
-        self,
-        disposition: TrustedLuaLlmDeliveryDisposition,
-    ) -> HostFuture<Result<(), TrustedLuaHostCallError>> {
-        (self.finish)(disposition)
-    }
-}
-
-/// Lua native 返回值的实际物化结果。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TrustedLuaLlmDeliveryDisposition {
-    /// 返回值已经完整物化；审阅档案同步后即可返回脚本。
-    Delivered,
-    /// Provider 响应有效，但无法物化为 Lua 绑定值，未交付脚本。
-    BindingRejected,
-}
-
 /// Translate 阶段专属 Host 能力。
 pub(crate) trait TrustedLuaTranslateHostCalls: Send + Sync + 'static {
     fn system_prompt(&self) -> &str;
@@ -323,14 +268,10 @@ pub(crate) trait TrustedLuaTranslateHostCalls: Send + Sync + 'static {
         semantic_context: String,
     ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError>;
 
-    /// 成功返回一个尚未交付的响应与其一次性处置门禁。
-    ///
-    /// Runtime 必须先物化 Lua 返回值，再以实际物化结果完成处置；处置同步成功后才可
-    /// 让值穿过 native 返回边界。
     fn request_llm(
         &self,
         messages: Vec<ChatMessage>,
-    ) -> HostFuture<Result<TrustedLuaPendingLlmResponse, TrustedLuaHostCallError>>;
+    ) -> HostFuture<Result<LlmResponse, TrustedLuaHostCallError>>;
 }
 
 /// Standard 已解析并冻结、Lua 只借用其结果的一轮翻译语义。

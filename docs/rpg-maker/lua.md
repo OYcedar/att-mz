@@ -363,17 +363,6 @@ Profile 的 Client，但不会自动插入 system prompt；脚本应显式发送
 返回供应商响应即成功；`finish_reason ~= "stop"` 不自动报错。LLM 根不自动重试；
 `llm/retryable` 可带 `retry_after_ms`，`llm/fatal` 不可恢复。请求失败也可能已被服务接收。
 
-`llm.record_calls = true` 时，每次 `ctx.llm` 调用按运行内一基顺序写入独立
-`lua/call-*.md`。最终请求在发送前同步，完整 Provider 响应在解析前同步；随后完整物化
-Lua 返回值、同步 `delivered_to_lua`，最后才返回脚本。若响应无法物化，则以
-`lua_binding_failed` 记录未交付，不能声称脚本已经收到。档案只证明响应已经交给脚本，
-不替脚本解释响应、调用 `prepared:accept` 或确认私有事务。完整契约见
-[LLM 调用审阅档案](../runtime/llm-call-review.md)。
-
-调用档案创建、写入或同步失败是本轮 Translate 的不可恢复错误。发送前失败保证请求
-没有发出；响应后的失败不会把内容返回脚本。即使 Lua 用 `pcall` 捕获局部
-`ctx.llm` 错误，Host 仍必须使本轮命令失败，不能把证据缺失伪装成脚本成功。
-
 ## 9. SQLite：私有协议与事务
 
 <!-- att-example: illustrative -->

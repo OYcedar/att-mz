@@ -165,14 +165,12 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 - 先读[Translate 规格](../../docs/rpg-maker/translation.md)。
 - 根据具体问题再读[术语规格](../../docs/rpg-maker/terminology.md)、[Prompt 规格](../../docs/rpg-maker/prompts.md)或[Rules 规格中的 Placeholder 契约](../../docs/rpg-maker/rules.md)。
 - 网络与模型响应外层故障再读[Chat Completions 运行时规格](../../docs/runtime/chat-completions.md)。
-- 调查规则是否真实进入模型、模型原始响应或 ATT 验收时，再读[LLM 调用审阅档案规格](../../docs/runtime/llm-call-review.md)。
 
 ### 任务清单
 
 - 确认本轮显式提供或复用的翻译资源及其当前性。
 - 执行 Translate，保留已经合法提交的部分进度。
 - 同时检查 `Complete`、`Partial`、`Unavailable`，以及任务状态、unit state 和代表性译文。
-- 档案已启用时，按 task/attempt 或 Lua call 核对最终请求、原始响应和 ATT 处理结果；不要从规则文件或最终译文反推模型实际看见了什么。
 - 区分机器协议验收、状态传播和语言质量，只修正真正拥有问题的资源或阶段。
 
 ### 完成证据
@@ -224,13 +222,12 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 ### 必读文档
 
 - 先读[命令行规格](../../docs/runtime/cli.md)、[项目日志规格](../../docs/runtime/project-log.md)和失败阶段的现行规格。
-- 按实际原因再读[SQLite 运行时规格](../../docs/runtime/sqlite.md)、[目录发布规格](../../docs/runtime/directory-publishing.md)、[Chat Completions 运行时规格](../../docs/runtime/chat-completions.md)、[LLM 调用审阅档案规格](../../docs/runtime/llm-call-review.md)或可信 Lua 文档。
+- 按实际原因再读[SQLite 运行时规格](../../docs/runtime/sqlite.md)、[目录发布规格](../../docs/runtime/directory-publishing.md)、[Chat Completions 运行时规格](../../docs/runtime/chat-completions.md)或可信 Lua 文档。
 
 ### 任务清单
 
 - 区分正常部分结果、暂时不可用、技术错误和内部不变量破坏。
 - 收集安全的命令终态、运行标识、日志、项目状态和相关底层原因。
-- 追查模型调用时先确认本轮是否开启档案：关闭表示没有该类证据；开启但没有调用文件表示尚未形成实际调用，仍需结合 Current、FullyProtected、planning-unresolved 和安全诊断定位原因；安全诊断显示请求文件 create/write/sync 失败，或文件没有 `request_complete` 标记，表示发送前失败并保证未发送；已有 `request_complete` 却没有 Provider 终态则表示调用结果未知。
 - 分别确认事务、候选发布和保存运行方案的终态。
 - 定位唯一责任阶段，复用已经合法提交的进度并确定恢复入口。
 

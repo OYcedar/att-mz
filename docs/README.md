@@ -53,7 +53,6 @@ ATT 当前实现的游戏领域只有 **RPG Maker**，该领域目前只包含 *
 - [生产配置现行规格](runtime/configuration.md)
 - [运行时与 CLI 现行规格](runtime/cli.md)
 - [普通项目日志现行规格](runtime/project-log.md)
-- [LLM 调用审阅档案现行规格](runtime/llm-call-review.md)
 - [Chat Completions 运行根现行规格](runtime/chat-completions.md)
 - [SQLite 运行时现行规格](runtime/sqlite.md)
 - [Windows 文件能力与可恢复目录发布现行规格](runtime/directory-publishing.md)

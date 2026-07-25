@@ -292,7 +292,6 @@ impl ConfiguredRpgMakerCommand {
                 let rpg_maker = PendingTranslateConfiguration::build(
                     configuration_directory,
                     raw.prompts,
-                    raw.llm,
                     raw.languages,
                     raw.rpg_maker,
                 )
@@ -775,10 +774,8 @@ pub(crate) struct TranslateConfiguration {
     prompt_root: PathBuf,
     prompt_locale: PromptLocaleSelection,
     thinking_output: bool,
-    record_calls: bool,
     language_modules: LanguageModuleCatalog,
     profile: TranslationProfileConfiguration,
-    client_id: String,
     client: Arc<OpenAiChatCompletionClient>,
     llm: SelectedLlmExecutorConfiguration,
 }
@@ -787,7 +784,6 @@ struct PendingTranslateConfiguration {
     prompt_root: PathBuf,
     prompt_locale: PromptLocaleSelection,
     thinking_output: bool,
-    record_calls: bool,
     language_modules: LanguageModuleCatalog,
 }
 
@@ -811,7 +807,6 @@ impl PendingTranslateConfiguration {
     fn build(
         configuration_directory: &Path,
         raw_prompts: RawPromptsConfiguration,
-        raw_llm: RawTranslateLlmConfiguration,
         raw_languages: Vec<RawLanguageConfiguration>,
         _raw: RawTranslateRpgMakerSelection,
     ) -> Result<Self, ConfigurationValueError> {
@@ -831,7 +826,6 @@ impl PendingTranslateConfiguration {
             prompt_root: checked_path("prompts.root", configuration_directory, raw_prompts.root)?,
             prompt_locale,
             thinking_output: raw_prompts.thinking_output,
-            record_calls: raw_llm.record_calls,
             language_modules: build_language_modules(raw_languages)?,
         })
     }
@@ -863,10 +857,8 @@ impl PendingTranslateConfiguration {
             prompt_root: self.prompt_root,
             prompt_locale: self.prompt_locale,
             thinking_output: self.thinking_output,
-            record_calls: self.record_calls,
             language_modules: self.language_modules,
             profile,
-            client_id: llm_client_id,
             client: Arc::new(built_client.client),
             llm: built_client.executor,
         })
@@ -890,16 +882,8 @@ impl TranslateConfiguration {
         self.thinking_output
     }
 
-    pub(crate) const fn record_calls(&self) -> bool {
-        self.record_calls
-    }
-
     pub(crate) const fn language_modules(&self) -> &LanguageModuleCatalog {
         &self.language_modules
-    }
-
-    pub(crate) fn client_id(&self) -> &str {
-        &self.client_id
     }
 
     pub(crate) const fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
@@ -2434,7 +2418,7 @@ impl<'de> Visitor<'de> for SelectedLlmClientSectionVisitor<'_> {
     type Value = Option<RawLlmClientConfiguration>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("包含 record_calls 与 clients 的 LLM 配置")
+        formatter.write_str("只包含 clients 的 LLM 配置")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -2444,9 +2428,6 @@ impl<'de> Visitor<'de> for SelectedLlmClientSectionVisitor<'_> {
         let mut selected = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
-                "record_calls" => {
-                    map.next_value::<IgnoredAny>()?;
-                }
                 "clients" => {
                     if selected.is_some() {
                         return Err(de::Error::duplicate_field("clients"));
@@ -2455,9 +2436,7 @@ impl<'de> Visitor<'de> for SelectedLlmClientSectionVisitor<'_> {
                         requested_id: self.requested_id,
                     })?;
                 }
-                _ => {
-                    return Err(de::Error::unknown_field(&key, &["record_calls", "clients"]));
-                }
+                _ => return Err(de::Error::unknown_field(&key, &["clients"])),
             }
         }
         Ok(selected)
@@ -2547,8 +2526,6 @@ struct RawPromptsFieldNames {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLlmFieldNames {
-    #[serde(default, rename = "record_calls")]
-    _record_calls: Option<IgnoredAny>,
     #[serde(default, rename = "clients")]
     _clients: Option<BTreeMap<String, RawLlmClientFieldNames>>,
 }
@@ -2686,11 +2663,12 @@ struct RawExtractSelection {
 #[serde(deny_unknown_fields)]
 struct RawTranslateSelection {
     prompts: RawPromptsConfiguration,
-    llm: RawTranslateLlmConfiguration,
     languages: Vec<RawLanguageConfiguration>,
     rpg_maker: RawTranslateRpgMakerSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
+    #[serde(default, rename = "llm")]
+    _llm: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2721,14 +2699,6 @@ struct RawPromptsConfiguration {
     root: PathBuf,
     locale: String,
     thinking_output: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTranslateLlmConfiguration {
-    record_calls: bool,
-    #[serde(default, rename = "clients")]
-    _clients: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -3007,7 +2977,6 @@ id = "unused"
             .resolve(&LanguageId::parse("en").expect("测试语言应合法"))
             .expect("应建立英语模块");
         assert_eq!(configured.client().model(), "replace-with-model-id");
-        assert_eq!(configured.rpg_maker().client_id(), "primary");
         assert_eq!(
             configured.client().api_key().expose_secret(),
             "replace-with-api-key"
@@ -3078,10 +3047,10 @@ id = "unused"
     fn prompt_locale_auto_and_thinking_output_are_preserved_for_the_composition_root() {
         let directory = TestDirectory::new();
         for (thinking_output, expected) in [("false", false), ("true", true)] {
-            let replacement = format!("thinking_output = {thinking_output}");
-            let source = include_str!("../../config.example.toml")
-                .replace("thinking_output = false", &replacement)
-                .replace("thinking_output = true", &replacement);
+            let source = include_str!("../../config.example.toml").replace(
+                "thinking_output = false",
+                format!("thinking_output = {thinking_output}").as_str(),
+            );
             let path = directory.write(
                 format!("prompt-auto-thinking-{thinking_output}.toml").as_str(),
                 &source,
@@ -3106,29 +3075,6 @@ id = "unused"
                 "auto 必须复用组合根提供的已解析 UI locale"
             );
             assert_eq!(configured.rpg_maker().thinking_output(), expected);
-        }
-    }
-
-    #[test]
-    fn record_calls_is_preserved_for_the_composition_root() {
-        let directory = TestDirectory::new();
-        for (record_calls, expected) in [("false", false), ("true", true)] {
-            let source = include_str!("../../config.example.toml").replace(
-                "record_calls = false",
-                format!("record_calls = {record_calls}").as_str(),
-            );
-            let path = directory.write(
-                format!("record-llm-calls-{record_calls}.toml").as_str(),
-                &source,
-            );
-            let ConfiguredRpgMakerCommand::Translate(configured) =
-                load_configuration(&path, translate_command(false, "primary"))
-                    .expect("布尔 LLM 调用记录开关应建立受信配置")
-            else {
-                panic!("应建立 Translate 配置");
-            };
-
-            assert_eq!(configured.rpg_maker().record_calls(), expected);
         }
     }
 
@@ -3208,8 +3154,7 @@ id = "unused"
         let source = include_str!("../../config.example.toml")
             .replace("root = \"prompts\"", "root = []")
             .replace("locale = \"auto\"", "locale = []")
-            .replace("thinking_output = false", "thinking_output = []")
-            .replace("thinking_output = true", "thinking_output = []");
+            .replace("thinking_output = false", "thinking_output = []");
         let path = directory.write("unselected-prompts.toml", &source);
 
         for command in [
@@ -3219,23 +3164,6 @@ id = "unused"
         ] {
             load_configuration(&path, command)
                 .expect("非 Translate 命令不得物化或校验 prompts 的字段值");
-        }
-    }
-
-    #[test]
-    fn commands_other_than_translate_do_not_consume_record_calls() {
-        let directory = TestDirectory::new();
-        let source = include_str!("../../config.example.toml")
-            .replace("record_calls = false", "record_calls = []");
-        let path = directory.write("unselected-record-calls.toml", &source);
-
-        for command in [
-            init_command(),
-            extract_command(false),
-            write_back_command(false),
-        ] {
-            load_configuration(&path, command)
-                .expect("非 Translate 命令不得物化或校验 llm.record_calls");
         }
     }
 
@@ -3268,13 +3196,7 @@ id = "unused"
             ),
             (
                 "prompts-thinking-output",
-                source
-                    .replacen("thinking_output = false\n", "", 1)
-                    .replacen("thinking_output = true\n", "", 1),
-            ),
-            (
-                "llm-record-calls",
-                source.replacen("record_calls = false\n", "", 1),
+                source.replacen("thinking_output = false\n", "", 1),
             ),
             (
                 "languages",
@@ -3366,31 +3288,14 @@ id = "unused"
             ),
             (
                 "prompt-thinking-output-type",
-                source
-                    .replacen(
-                        "thinking_output = false",
-                        "thinking_output = [\"PROMPT_THINKING_TYPE_SENTINEL\"]",
-                        1,
-                    )
-                    .replacen(
-                        "thinking_output = true",
-                        "thinking_output = [\"PROMPT_THINKING_TYPE_SENTINEL\"]",
-                        1,
-                    ),
+                source.replacen(
+                    "thinking_output = false",
+                    "thinking_output = [\"PROMPT_THINKING_TYPE_SENTINEL\"]",
+                    1,
+                ),
                 "prompts.thinking_output",
                 "字段类型不符合当前配置契约",
                 Some("PROMPT_THINKING_TYPE_SENTINEL"),
-            ),
-            (
-                "llm-record-calls-type",
-                source.replacen(
-                    "record_calls = false",
-                    "record_calls = [\"LLM_RECORD_CALLS_TYPE_SENTINEL\"]",
-                    1,
-                ),
-                "llm.record_calls",
-                "字段类型不符合当前配置契约",
-                Some("LLM_RECORD_CALLS_TYPE_SENTINEL"),
             ),
             (
                 "type",
@@ -3483,21 +3388,9 @@ id = "unused"
             ),
             (
                 "prompts",
-                example
-                    .replace(
-                        "thinking_output = false",
-                        "thinking_output = false\nunexpected = 1",
-                    )
-                    .replace(
-                        "thinking_output = true",
-                        "thinking_output = true\nunexpected = 1",
-                    ),
-            ),
-            (
-                "llm",
                 example.replace(
-                    "record_calls = false",
-                    "record_calls = false\nunexpected = 1",
+                    "thinking_output = false",
+                    "thinking_output = false\nunexpected = 1",
                 ),
             ),
             (
@@ -3595,8 +3488,7 @@ id = "unused"
             "{}\n[llm.clients.unused]\nurl = []\napi_key = \"UNSELECTED_SECRET_SENTINEL\"\nmodel = []\nmax_concurrent_requests = []\nconnect_timeout_ms = []\nread_timeout_ms = []\nrequest_timeout_ms = []\nproxy = []\nadditional_pem_files = []\nretry_delays_ms = []\nmax_retry_after_ms = []\nparameters = []\n",
             include_str!("../../config.example.toml")
         )
-        .replace("thinking_output = false", "thinking_output = []")
-        .replace("thinking_output = true", "thinking_output = []");
+        .replace("thinking_output = false", "thinking_output = []");
         let path = directory.write("unselected-secret.toml", &source);
         let error = match load_configuration(&path, translate_command(false, "primary")) {
             Ok(_) => panic!("无效 Prompt 配置必须拒绝"),

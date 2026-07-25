@@ -57,7 +57,6 @@ const RPG_MAKER_SKILL_FLOWS: [(&str, &[&str]); 8] = [
             "docs/rpg-maker/prompts.md",
             "docs/rpg-maker/rules.md",
             "docs/runtime/chat-completions.md",
-            "docs/runtime/llm-call-review.md",
         ],
     ),
     (
@@ -75,7 +74,6 @@ const RPG_MAKER_SKILL_FLOWS: [(&str, &[&str]); 8] = [
             "docs/runtime/sqlite.md",
             "docs/runtime/directory-publishing.md",
             "docs/runtime/chat-completions.md",
-            "docs/runtime/llm-call-review.md",
         ],
     ),
     (
@@ -84,7 +82,7 @@ const RPG_MAKER_SKILL_FLOWS: [(&str, &[&str]); 8] = [
     ),
 ];
 
-const RPG_MAKER_SKILL_DOCUMENTS: [&str; 19] = [
+const RPG_MAKER_SKILL_DOCUMENTS: [&str; 18] = [
     "docs/README.md",
     "docs/runtime/README.md",
     "docs/runtime/cli.md",
@@ -93,7 +91,6 @@ const RPG_MAKER_SKILL_DOCUMENTS: [&str; 19] = [
     "docs/runtime/directory-publishing.md",
     "docs/runtime/sqlite.md",
     "docs/runtime/chat-completions.md",
-    "docs/runtime/llm-call-review.md",
     "docs/rpg-maker/README.md",
     "docs/rpg-maker/init.md",
     "docs/rpg-maker/extraction.md",

@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,15 +27,11 @@ use crate::language::{
     LanguageText, LanguageTextSegment,
 };
 use crate::llm::{
-    LlmCallSite, LlmClientConcurrency, LlmFinishReason, LlmRequestDiagnosticSource,
-    LlmRequestError, LlmRequestExecutor, LlmResponse, LlmUsage,
+    LlmClientConcurrency, LlmFinishReason, LlmRequestDiagnosticSource, LlmRequestError,
+    LlmRequestExecutor, LlmResponse, LlmUsage,
 };
 use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::placeholder_token;
-use crate::runtime::llm_call_review::{
-    LlmCallDisposition, LlmCallRecorder, LlmCallReviewError, LlmParsedResponseMetadata,
-    LlmRejectedOutput, LlmStandardDisposition, LlmStandardDispositionOutcome,
-};
 
 use super::language_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
@@ -787,7 +783,6 @@ pub(crate) struct RpgMakerStandardTranslationTaskExecutionService<L, D, R, P> {
     delay: D,
     response_processor: R,
     cancellation: CooperativeCancellation,
-    call_recorder: LlmCallRecorder,
     profile: PhantomData<fn() -> P>,
 }
 
@@ -803,14 +798,8 @@ impl<L, D, R, P> RpgMakerStandardTranslationTaskExecutionService<L, D, R, P> {
             delay,
             response_processor,
             cancellation,
-            call_recorder: LlmCallRecorder::disabled(),
             profile: PhantomData,
         }
-    }
-
-    pub(crate) fn with_call_recorder(mut self, call_recorder: LlmCallRecorder) -> Self {
-        self.call_recorder = call_recorder;
-        self
     }
 }
 
@@ -853,11 +842,7 @@ where
             }
             let response = match self
                 .llm
-                .request(
-                    profile.llm_client(),
-                    standard_call_site(task.index(), attempt),
-                    task.messages(),
-                )
+                .request(profile.llm_client(), task.messages())
                 .await
             {
                 Ok(response) => response,
@@ -907,22 +892,9 @@ where
                     tokio::pin!(waiting);
                     let cancelled = self.cancellation.cancelled();
                     tokio::pin!(cancelled);
-                    let review_failed = self.call_recorder.wait_for_failure();
-                    tokio::pin!(review_failed);
                     tokio::select! {
                         biased;
                         () = &mut cancelled => {
-                            return Err(
-                                RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled {
-                                    attempt: attempt.get(),
-                                },
-                            );
-                        }
-                        _ = &mut review_failed => {
-                            // 首错所属任务会先把完整档案/Provider 组合错误交给
-                            // Standard finalizer，再请求业务取消。这里只是并发观察者，
-                            // 等待该取消以免抢占主错误或伪造当前 task/attempt。
-                            self.cancellation.cancelled().await;
                             return Err(
                                 RpgMakerStandardTranslationTaskExecutionError::RetryWaitCancelled {
                                     attempt: attempt.get(),
@@ -943,174 +915,17 @@ where
                 }
             };
 
-            let call_site = standard_call_site(task.index(), attempt);
-            let response_metadata = self
-                .call_recorder
-                .is_enabled()
-                .then(|| LlmParsedResponseMetadata::from(&response));
-            // 档案故障必须作为 Fatal 结果交给 Standard。这里不能请求业务取消：
-            // Standard 会有意丢弃因取消而被唤醒的任务错误；新请求由 recorder latch
-            // 阻断，执行 lane 则根据本任务的 Err 停止继续准入。
-            let outcome = self
+            return self
                 .response_processor
                 .process(&task, response, attempt.get())
-                .await;
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(source) => {
-                    if let Some(response_metadata) = response_metadata
-                        && let Err(review) = self
-                            .call_recorder
-                            .record_disposition(
-                                call_site,
-                                LlmCallDisposition::rejected(
-                                    "response_processing_failed",
-                                    Some(response_metadata),
-                                ),
-                            )
-                            .await
-                    {
-                        return Err(RpgMakerStandardTranslationTaskExecutionError::CallReview {
-                            attempt: attempt.get(),
-                            source: review,
-                            related: Some(source),
-                        });
+                .await
+                .map_err(|source| {
+                    RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
+                        attempt: attempt.get(),
+                        source,
                     }
-                    if let Some(review) = self.call_recorder.failure() {
-                        return Err(RpgMakerStandardTranslationTaskExecutionError::CallReview {
-                            attempt: attempt.get(),
-                            source: review,
-                            related: Some(source),
-                        });
-                    }
-                    return Err(
-                        RpgMakerStandardTranslationTaskExecutionError::ProcessResponse {
-                            attempt: attempt.get(),
-                            source,
-                        },
-                    );
-                }
-            };
-            if let Some(response_metadata) = response_metadata
-                && let Err(source) = self
-                    .call_recorder
-                    .record_disposition(
-                        call_site,
-                        standard_call_disposition(&outcome, response_metadata),
-                    )
-                    .await
-            {
-                return Err(RpgMakerStandardTranslationTaskExecutionError::CallReview {
-                    attempt: attempt.get(),
-                    source,
-                    related: None,
                 });
-            }
-            if let Some(source) = self.call_recorder.failure() {
-                return Err(RpgMakerStandardTranslationTaskExecutionError::CallReview {
-                    attempt: attempt.get(),
-                    source,
-                    related: None,
-                });
-            }
-            return Ok(outcome);
         }
-    }
-}
-
-fn standard_call_disposition(
-    outcome: &TranslationTaskOutcome,
-    response: LlmParsedResponseMetadata,
-) -> LlmCallDisposition {
-    let outcome_code = match outcome {
-        TranslationTaskOutcome::Complete { .. } => LlmStandardDispositionOutcome::Complete,
-        TranslationTaskOutcome::Partial { .. } => LlmStandardDispositionOutcome::Partial,
-        TranslationTaskOutcome::Unavailable { .. } => LlmStandardDispositionOutcome::Unavailable,
-    };
-    let accepted_ids = outcome
-        .accepted()
-        .iter()
-        .map(AcceptedTranslationDecision::id)
-        .collect();
-    let rejected = outcome
-        .unresolved()
-        .iter()
-        .map(|unit| {
-            let (code, detail) = standard_rejection_reason(unit.reason());
-            LlmRejectedOutput::new(unit.id(), code, detail)
-        })
-        .collect();
-    LlmCallDisposition::Standard(LlmStandardDisposition::new(
-        outcome_code,
-        response,
-        accepted_ids,
-        rejected,
-    ))
-}
-
-fn standard_rejection_reason(
-    reason: &TranslationUnitRejectionReason,
-) -> (&'static str, Option<String>) {
-    match reason {
-        TranslationUnitRejectionReason::Missing => ("missing", None),
-        TranslationUnitRejectionReason::Duplicate => ("duplicate", None),
-        TranslationUnitRejectionReason::InvalidShape { message } => {
-            ("invalid_shape", Some(format!("message={message:?}")))
-        }
-        TranslationUnitRejectionReason::LineCountMismatch { expected, actual } => (
-            "line_count_mismatch",
-            Some(format!("expected={expected}; actual={actual}")),
-        ),
-        TranslationUnitRejectionReason::InvalidLineText { line_index } => (
-            "invalid_line_text",
-            Some(format!("line_index={line_index}")),
-        ),
-        TranslationUnitRejectionReason::BlankLineMismatch {
-            line_index,
-            expected_blank,
-        } => (
-            "blank_line_mismatch",
-            Some(format!(
-                "line_index={line_index}; expected_blank={expected_blank}"
-            )),
-        ),
-        TranslationUnitRejectionReason::BlankTranslation => ("blank_translation", None),
-        TranslationUnitRejectionReason::NoNaturalLanguageText => ("no_natural_language_text", None),
-        TranslationUnitRejectionReason::ContainsByteOrderMark => ("contains_byte_order_mark", None),
-        TranslationUnitRejectionReason::PlaceholderMismatch { token } => {
-            ("placeholder_mismatch", Some(format!("token={token:?}")))
-        }
-        TranslationUnitRejectionReason::UnexpectedPlaceholderToken { token } => (
-            "unexpected_placeholder_token",
-            Some(format!("token={token:?}")),
-        ),
-        TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { original } => (
-            "placeholder_normalization_ambiguous",
-            Some(format!("original={original:?}")),
-        ),
-        TranslationUnitRejectionReason::SourceResidual { fragment } => {
-            ("source_residual", Some(format!("fragment={fragment:?}")))
-        }
-    }
-}
-
-fn standard_call_site(
-    task_index: StandardTranslationTaskIndex,
-    attempt: NonZeroUsize,
-) -> LlmCallSite {
-    let task_ordinal = task_index
-        .get()
-        .checked_add(1)
-        .and_then(|value| u64::try_from(value).ok())
-        .and_then(NonZeroU64::new)
-        .expect("已经存在的标准任务索引必须能够转换为一开始的 u64 序号");
-    let attempt = u64::try_from(attempt.get())
-        .ok()
-        .and_then(NonZeroU64::new)
-        .expect("已经存在的请求 attempt 必须能够转换为非零 u64");
-    LlmCallSite::Standard {
-        task_ordinal,
-        attempt,
     }
 }
 
@@ -1144,11 +959,6 @@ pub(crate) enum RpgMakerStandardTranslationTaskExecutionError<L, R> {
         attempt: usize,
         source: R,
     },
-    CallReview {
-        attempt: usize,
-        source: LlmCallReviewError,
-        related: Option<R>,
-    },
     RetryWaitCancelled {
         attempt: usize,
     },
@@ -1170,19 +980,6 @@ where
             Self::ProcessResponse { attempt, source } => {
                 write!(formatter, "第 {attempt} 次模型响应无法处理：{source}")
             }
-            Self::CallReview {
-                attempt,
-                source,
-                related: Some(related),
-            } => write!(
-                formatter,
-                "第 {attempt} 次 LLM 调用审阅档案失败：{source}；同时响应处理失败：{related}"
-            ),
-            Self::CallReview {
-                attempt,
-                source,
-                related: None,
-            } => write!(formatter, "第 {attempt} 次 LLM 调用审阅档案失败：{source}"),
             Self::RetryWaitCancelled { attempt } => {
                 write!(formatter, "第 {attempt} 次 LLM 请求后的重试等待已取消")
             }
@@ -1202,7 +999,6 @@ where
         match self {
             Self::FatalRequest { source, .. } => Some(source),
             Self::ProcessResponse { source, .. } => Some(source),
-            Self::CallReview { source, .. } => Some(source),
             Self::RetryWaitCancelled { .. } | Self::InternalInvariant { .. } => None,
         }
     }
@@ -2298,7 +2094,6 @@ mod tests {
         LanguageModule, LanguagePair, LanguageText, QuotePair,
     };
     use crate::llm::{ChatMessage, ChatMessageRole};
-    use crate::observability::RunId;
     use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
     use crate::rpg_maker::text::{
@@ -2315,9 +2110,6 @@ mod tests {
         StandardTranslationTaskIndex, TranslationStateContext, TranslationUnitIdentity,
     };
     use crate::runtime::cpu::CpuExecutorUnavailable;
-    use crate::runtime::llm_call_review::{
-        LlmCallRequestRecord, LlmCallReviewContext, LlmProviderHeaders, LlmProviderRecord,
-    };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -4167,7 +3959,6 @@ mod tests {
         async fn request<'a>(
             &'a self,
             _client: &'a Self::Client,
-            _call_site: crate::llm::LlmCallSite,
             messages: &'a [ChatMessage],
         ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
             self.messages
@@ -4219,52 +4010,6 @@ mod tests {
         )
     }
 
-    async fn standard_call_recorder(
-        workspace: &std::path::Path,
-        run_id: &str,
-        site: LlmCallSite,
-    ) -> LlmCallRecorder {
-        let recorder = LlmCallRecorder::start(
-            workspace.to_path_buf(),
-            RunId::from_uuid(uuid::Uuid::parse_str(run_id).expect("测试 RunId 必须有效")),
-            UiLocale::SimplifiedChinese,
-            LlmCallReviewContext::new("mz", "standard-project", "quality", "primary"),
-        )
-        .await
-        .expect("Standard 测试档案应建立");
-        recorder
-            .record_request(
-                site,
-                LlmCallRequestRecord::new(
-                    url::Url::parse("https://example.invalid/v1/chat/completions")
-                        .expect("测试 URL 必须有效"),
-                    br#"{"model":"test","messages":[],"stream":false}"#.to_vec(),
-                ),
-            )
-            .await
-            .expect("测试请求阶段应同步");
-        recorder
-            .authorize_send(site)
-            .expect("Standard 测试调用应取得发送准入");
-        recorder
-            .record_provider(
-                site,
-                LlmProviderRecord::response(
-                    Duration::from_millis(12),
-                    200,
-                    LlmProviderHeaders::new(
-                        Some("application/json".to_owned()),
-                        Some("request-standard".to_owned()),
-                        None,
-                    ),
-                    br#"{"id":"response-standard","choices":[]}"#.to_vec(),
-                ),
-            )
-            .await
-            .expect("测试 Provider 阶段应同步");
-        recorder
-    }
-
     #[tokio::test]
     async fn executor_retries_identical_messages_and_uses_larger_retry_after() {
         let messages = Arc::new(Mutex::new(Vec::new()));
@@ -4305,198 +4050,6 @@ mod tests {
             waits.lock().expect("等待锁不应中毒").as_slice(),
             &[Duration::from_millis(50)]
         );
-    }
-
-    #[tokio::test]
-    async fn executor_syncs_standard_disposition_before_returning_the_outcome() {
-        let temporary = tempfile::tempdir().expect("测试目录应建立");
-        let task = task();
-        let site = standard_call_site(task.index(), NonZeroUsize::MIN);
-        let recorder = standard_call_recorder(
-            temporary.path(),
-            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-            site,
-        )
-        .await;
-        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
-            FakeLlm {
-                responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
-                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
-                    LlmFinishReason::Stop,
-                    Some("request-standard".to_owned()),
-                    Some("response-standard".to_owned()),
-                    Some(LlmUsage::new(10, 5, 15)),
-                ))]))),
-                messages: Arc::new(Mutex::new(Vec::new())),
-            },
-            FakeDelay {
-                waits: Arc::new(Mutex::new(Vec::new())),
-            },
-            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
-            CooperativeCancellation::default(),
-        )
-        .with_call_recorder(recorder.clone());
-
-        let outcome = service
-            .execute(&profile(), task)
-            .await
-            .expect("档案同步成功后才可返回 Standard 结果");
-        assert!(matches!(outcome, TranslationTaskOutcome::Complete { .. }));
-
-        let archive = std::fs::read_to_string(
-            recorder
-                .run_root()
-                .expect("启用时应有 Run 根")
-                .join("standard")
-                .join("task-000003")
-                .join("attempt-001.md"),
-        )
-        .expect("Standard 调用档案应可读");
-        for expected in [
-            "validation_outcome = \"complete\"",
-            "1",
-            "request-standard",
-            "response-standard",
-            "disposition_complete",
-        ] {
-            assert!(
-                archive.contains(expected),
-                "Standard 档案缺少验收事实：{expected}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn standard_disposition_sync_failure_blocks_the_accepted_outcome() {
-        let temporary = tempfile::tempdir().expect("测试目录应建立");
-        let task = task();
-        let site = standard_call_site(task.index(), NonZeroUsize::MIN);
-        let recorder = standard_call_recorder(
-            temporary.path(),
-            "abababab-abab-4aba-8aba-abababababab",
-            site,
-        )
-        .await;
-        recorder.inject_test_failure("sync_disposition");
-        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
-            FakeLlm {
-                responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
-                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
-                    LlmFinishReason::Stop,
-                    Some("request-standard".to_owned()),
-                    Some("response-standard".to_owned()),
-                    Some(LlmUsage::new(10, 5, 15)),
-                ))]))),
-                messages: Arc::new(Mutex::new(Vec::new())),
-            },
-            FakeDelay {
-                waits: Arc::new(Mutex::new(Vec::new())),
-            },
-            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
-            CooperativeCancellation::default(),
-        )
-        .with_call_recorder(recorder.clone());
-
-        let error = service
-            .execute(&profile(), task)
-            .await
-            .expect_err("验收终态没有同步时，已接受结果不得返回给提交边界");
-        assert!(matches!(
-            error,
-            RpgMakerStandardTranslationTaskExecutionError::CallReview {
-                source,
-                related: None,
-                ..
-            } if source.operation() == "sync_disposition"
-        ));
-        let archive = std::fs::read_to_string(
-            recorder
-                .run_root()
-                .expect("启用时应有 Run 根")
-                .join("standard")
-                .join("task-000003")
-                .join("attempt-001.md"),
-        )
-        .expect("Provider 阶段档案应可读");
-        assert!(archive.contains("provider_complete"));
-        assert!(!archive.contains("disposition_complete"));
-    }
-
-    #[tokio::test]
-    async fn latched_review_failure_blocks_an_already_sent_standard_result() {
-        let temporary = tempfile::tempdir().expect("测试目录应建立");
-        let task = task();
-        let site = standard_call_site(task.index(), NonZeroUsize::MIN);
-        let recorder = standard_call_recorder(
-            temporary.path(),
-            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-            site,
-        )
-        .await;
-        std::fs::write(
-            recorder.run_root().expect("启用时应有 Run 根").join("lua"),
-            b"directory-conflict",
-        )
-        .expect("应建立故障注入文件");
-        let latched = recorder
-            .record_request(
-                LlmCallSite::Lua {
-                    call: NonZeroU64::MIN,
-                },
-                LlmCallRequestRecord::new(
-                    url::Url::parse("https://example.invalid/v1/chat/completions")
-                        .expect("测试 URL 必须有效"),
-                    b"{}".to_vec(),
-                ),
-            )
-            .await
-            .expect_err("另一调用的档案故障应被锁存");
-        let cancellation = CooperativeCancellation::default();
-        let service = RpgMakerStandardTranslationTaskExecutionService::<_, _, _, _>::new(
-            FakeLlm {
-                responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
-                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                ))]))),
-                messages: Arc::new(Mutex::new(Vec::new())),
-            },
-            FakeDelay {
-                waits: Arc::new(Mutex::new(Vec::new())),
-            },
-            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
-            cancellation.clone(),
-        )
-        .with_call_recorder(recorder.clone());
-
-        let error = service
-            .execute(&profile(), task)
-            .await
-            .expect_err("全局档案故障后响应不得进入后续提交");
-        assert!(matches!(
-            error,
-            RpgMakerStandardTranslationTaskExecutionError::CallReview {
-                source,
-                related: None,
-                ..
-            } if source.path() == latched.path()
-        ));
-        assert!(
-            !cancellation.is_requested(),
-            "档案故障必须作为 Fatal 失败传播，不能伪装成业务取消"
-        );
-        let archive = std::fs::read_to_string(
-            recorder
-                .run_root()
-                .expect("启用时应有 Run 根")
-                .join("standard")
-                .join("task-000003")
-                .join("attempt-001.md"),
-        )
-        .expect("已发调用仍应完成记录生命周期");
-        assert!(archive.contains("disposition_complete"));
     }
 
     #[tokio::test]

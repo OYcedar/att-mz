@@ -6,9 +6,6 @@ root = "prompts"
 locale = "auto"
 thinking_output = false
 
-[llm]
-record_calls = false
-
 [llm.clients.primary]
 url = "https://api.example.com/v1/chat/completions"
 api_key = "replace-with-api-key"

@@ -43,17 +43,15 @@ use crate::rpg_maker::lua::document::{
     data_source, map_source, plugin_parameter_source, source_path,
 };
 use crate::rpg_maker::lua::json::{LosslessJsonValue, decode as decode_json, validate_number};
-#[cfg(test)]
-use crate::rpg_maker::lua::runtime::TrustedLuaPendingLlmResponse;
 use crate::rpg_maker::lua::runtime::{
     OwnedLuaProgram, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
     TrustedLuaCommonBindings, TrustedLuaCommonHostCalls, TrustedLuaExecutionHandle,
-    TrustedLuaExtractHostCalls, TrustedLuaHostCallError, TrustedLuaLlmDeliveryDisposition,
-    TrustedLuaPhaseBindings, TrustedLuaPreparedTranslation,
-    TrustedLuaPreparedTranslationAcceptance, TrustedLuaRuntimeBindings,
-    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
-    TrustedLuaTranslateHostCalls, TrustedLuaWriteBackHostCalls, TrustedLuaWriteBackLayoutPair,
-    TrustedLuaWriteBackLayoutRegion, TrustedLuaWriteBackLayoutResult,
+    TrustedLuaExtractHostCalls, TrustedLuaHostCallError, TrustedLuaPhaseBindings,
+    TrustedLuaPreparedTranslation, TrustedLuaPreparedTranslationAcceptance,
+    TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport,
+    TrustedLuaRuntimeExecutor, TrustedLuaTranslateHostCalls, TrustedLuaWriteBackHostCalls,
+    TrustedLuaWriteBackLayoutPair, TrustedLuaWriteBackLayoutRegion,
+    TrustedLuaWriteBackLayoutResult,
 };
 use crate::rpg_maker::lua::{LuaPhase, LuaProjectContext, LuaSourcePath};
 use crate::rpg_maker::standard_asset::validate_standard_text_locations;
@@ -2702,42 +2700,10 @@ fn build_llm_function(
     cancellation: RuntimeCancellation,
 ) -> mlua::Result<Function> {
     let native = lua.create_function(move |lua, messages: Value| {
-        let pending = parse_message_array(messages)
-            .and_then(|messages| {
-                wait_for_llm_terminal(&tokio, &cancellation, calls.request_llm(messages))
-            })
+        let result = parse_message_array(messages)
+            .and_then(|messages| wait_for_host(&tokio, &cancellation, calls.request_llm(messages)))
             .map_err(|error| error.with_operation("llm.request"));
-        let pending = match pending {
-            Ok(pending) => pending,
-            Err(error) => return host_error_to_lua(lua, error),
-        };
-
-        match llm_response_to_lua(lua, pending.response()) {
-            Ok(value) => {
-                let delivery = wait_for_llm_terminal(
-                    &tokio,
-                    &cancellation,
-                    pending.finish(TrustedLuaLlmDeliveryDisposition::Delivered),
-                )
-                .map_err(|error| error.with_operation("llm.delivery"));
-                match delivery {
-                    Ok(()) => Ok(MultiValue::from_vec(vec![Value::Boolean(true), value])),
-                    Err(error) => host_error_to_lua(lua, error),
-                }
-            }
-            Err(binding) => {
-                let delivery = wait_for_llm_terminal(
-                    &tokio,
-                    &cancellation,
-                    pending.finish(TrustedLuaLlmDeliveryDisposition::BindingRejected),
-                )
-                .map_err(|error| error.with_operation("llm.delivery"));
-                match delivery {
-                    Ok(()) => host_error_to_lua(lua, binding_error(binding)),
-                    Err(error) => host_error_to_lua(lua, error),
-                }
-            }
-        }
+        host_result_to_lua(lua, result, llm_response_to_lua)
     })?;
     let factory: Function = lua
         .load(
@@ -2802,60 +2768,6 @@ fn wait_for_output_terminal<T>(
 where
     T: Send + 'static,
 {
-    wait_for_terminal(
-        tokio,
-        cancellation,
-        future,
-        TerminalCancellationPolicy::CancellationWins,
-        "Lua 候选目录调用已在到达明确终态后取消",
-        "Lua 候选目录响应桥在返回明确终态前关闭",
-    )
-}
-
-/// 一次实际 LLM 调用的请求与处置一旦交给 Host，都必须等到各自下一耐久终态。
-///
-/// 请求阶段的成功结果必须继续进入 Lua 值物化与处置门禁；处置阶段的成功结果则表示
-/// `delivered_to_lua` 已同步完成。即使取消同时发生，这两类成功终态都不能在桥内丢弃；
-/// 随后由 VM 的取消钩子结束脚本。失败终态仍由取消覆盖。
-fn wait_for_llm_terminal<T>(
-    tokio: &Handle,
-    cancellation: &RuntimeCancellation,
-    future: std::pin::Pin<
-        Box<dyn Future<Output = Result<T, TrustedLuaHostCallError>> + Send + 'static>,
-    >,
-) -> Result<T, TrustedLuaHostCallError>
-where
-    T: Send + 'static,
-{
-    wait_for_terminal(
-        tokio,
-        cancellation,
-        future,
-        TerminalCancellationPolicy::SuccessfulResultWins,
-        "Lua LLM 调用已在到达明确终态后取消",
-        "Lua LLM 响应桥在返回明确终态前关闭",
-    )
-}
-
-#[derive(Clone, Copy)]
-enum TerminalCancellationPolicy {
-    CancellationWins,
-    SuccessfulResultWins,
-}
-
-fn wait_for_terminal<T>(
-    tokio: &Handle,
-    cancellation: &RuntimeCancellation,
-    future: std::pin::Pin<
-        Box<dyn Future<Output = Result<T, TrustedLuaHostCallError>> + Send + 'static>,
-    >,
-    cancellation_policy: TerminalCancellationPolicy,
-    cancelled_message: &'static str,
-    bridge_closed_message: &'static str,
-) -> Result<T, TrustedLuaHostCallError>
-where
-    T: Send + 'static,
-{
     let (sender, receiver) = mpsc::sync_channel(1);
     let _task = tokio.spawn(async move {
         let _ = sender.send(future.await);
@@ -2863,23 +2775,16 @@ where
     let mut cancelled = cancellation.is_cancelled();
     loop {
         match receiver.recv_timeout(std::time::Duration::from_millis(10)) {
-            Ok(result) => {
-                if cancelled
-                    && !(matches!(
-                        cancellation_policy,
-                        TerminalCancellationPolicy::SuccessfulResultWins
-                    ) && result.is_ok())
-                {
-                    return Err(TrustedLuaHostCallError::new(
-                        "runtime",
-                        "cancelled",
-                        cancelled_message,
-                        None,
-                        None,
-                    ));
-                }
-                return result;
+            Ok(_result) if cancelled => {
+                return Err(TrustedLuaHostCallError::new(
+                    "runtime",
+                    "cancelled",
+                    "Lua 候选目录调用已在到达明确终态后取消",
+                    None,
+                    None,
+                ));
             }
+            Ok(result) => return result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 cancelled |= cancellation.is_cancelled();
             }
@@ -2887,7 +2792,7 @@ where
                 return Err(TrustedLuaHostCallError::new(
                     "runtime",
                     "host_bridge_closed",
-                    bridge_closed_message,
+                    "Lua 候选目录响应桥在返回明确终态前关闭",
                     None,
                     None,
                 ));
@@ -3088,7 +2993,7 @@ fn ensure_exact_string_keys(table: &Table, expected: &[&str]) -> mlua::Result<()
     Ok(())
 }
 
-fn llm_response_to_lua(lua: &Lua, response: &LlmResponse) -> mlua::Result<Value> {
+fn llm_response_to_lua(lua: &Lua, response: LlmResponse) -> mlua::Result<Value> {
     let table = lua.create_table()?;
     table.set("content", response.content())?;
     table.set("finish_reason", response.finish_reason().to_string())?;
@@ -3460,7 +3365,6 @@ mod tests {
     struct TestObservations {
         executed_parameters: Vec<SqliteValue>,
         messages: Vec<ChatMessage>,
-        completed_llm_calls: usize,
         prepared: Vec<(TextGroupKind, String, String)>,
         extract_intents: Vec<TrustedLuaExtractIntent>,
         output_operations: Vec<String>,
@@ -3478,66 +3382,6 @@ mod tests {
         begin_error: Option<TrustedLuaHostCallError>,
         begin_started: Option<Arc<Notify>>,
         begin_gate: Option<Arc<Notify>>,
-    }
-
-    struct OverflowUsageCalls {
-        dispositions: Arc<Mutex<Vec<TrustedLuaLlmDeliveryDisposition>>>,
-    }
-
-    impl TrustedLuaTranslateHostCalls for OverflowUsageCalls {
-        fn system_prompt(&self) -> &str {
-            "system"
-        }
-
-        fn source_language(&self) -> &str {
-            "ja"
-        }
-
-        fn target_language(&self) -> &str {
-            "zh-Hans"
-        }
-
-        fn prepare_translation(
-            &self,
-            _kind: TextGroupKind,
-            _original: String,
-            _semantic_context: String,
-        ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
-            unreachable!("此测试不应准备翻译")
-        }
-
-        fn request_llm(
-            &self,
-            _messages: Vec<ChatMessage>,
-        ) -> std::pin::Pin<
-            Box<
-                dyn Future<Output = Result<TrustedLuaPendingLlmResponse, TrustedLuaHostCallError>>
-                    + Send
-                    + 'static,
-            >,
-        > {
-            let dispositions = Arc::clone(&self.dispositions);
-            Box::pin(async move {
-                Ok(TrustedLuaPendingLlmResponse::new(
-                    LlmResponse::new(
-                        "raw response",
-                        crate::llm::LlmFinishReason::Stop,
-                        Some("request-overflow".to_owned()),
-                        Some("response-overflow".to_owned()),
-                        Some(LlmUsage::new(u64::MAX, 1, u64::MAX)),
-                    ),
-                    move |disposition| {
-                        Box::pin(async move {
-                            dispositions
-                                .lock()
-                                .expect("交付处置锁不应中毒")
-                                .push(disposition);
-                            Ok(())
-                        })
-                    },
-                ))
-            })
-        }
     }
 
     impl TrustedLuaCommonHostCalls for TestCalls {
@@ -3752,37 +3596,20 @@ mod tests {
             &self,
             messages: Vec<ChatMessage>,
         ) -> std::pin::Pin<
-            Box<
-                dyn Future<Output = Result<TrustedLuaPendingLlmResponse, TrustedLuaHostCallError>>
-                    + Send
-                    + 'static,
-            >,
+            Box<dyn Future<Output = Result<LlmResponse, TrustedLuaHostCallError>> + Send + 'static>,
         > {
             self.observations
                 .lock()
                 .expect("测试记录锁不应中毒")
                 .messages = messages;
-            let observations = Arc::clone(&self.observations);
-            let started = self.begin_started.as_ref().map(Arc::clone);
-            let gate = self.begin_gate.as_ref().map(Arc::clone);
-            Box::pin(async move {
-                if let Some(started) = started {
-                    started.notify_one();
-                }
-                if let Some(gate) = gate {
-                    gate.notified().await;
-                }
-                observations
-                    .lock()
-                    .expect("测试记录锁不应中毒")
-                    .completed_llm_calls += 1;
-                Ok(TrustedLuaPendingLlmResponse::for_test(LlmResponse::new(
+            Box::pin(async {
+                Ok(LlmResponse::new(
                     "raw response",
                     crate::llm::LlmFinishReason::Stop,
                     Some("request-1".to_owned()),
                     Some("response-1".to_owned()),
                     Some(LlmUsage::new(3, 5, 8)),
-                )))
+                ))
             })
         }
     }
@@ -4238,7 +4065,7 @@ mod tests {
             None,
             None,
         );
-        let Value::Table(table) = llm_response_to_lua(&lua, &response).unwrap() else {
+        let Value::Table(table) = llm_response_to_lua(&lua, response).unwrap() else {
             panic!("LLM 响应必须映射成 Lua table");
         };
         assert!(matches!(
@@ -5230,154 +5057,6 @@ assert(error.kind == "invalid_value")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancellation_waits_for_an_accepted_llm_call_before_finalizing() {
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
-        let started = Arc::new(Notify::new());
-        let gate = Arc::new(Notify::new());
-        let observations = Arc::new(Mutex::new(TestObservations::default()));
-        let (completion, mut finalized) = oneshot::channel();
-        let calls = Arc::new(TestCalls {
-            panic_on_project: false,
-            project: test_project(),
-            observations: Arc::clone(&observations),
-            begin_error: None,
-            begin_started: Some(Arc::clone(&started)),
-            begin_gate: Some(Arc::clone(&gate)),
-        });
-        let handle = runtime.start(
-            OwnedLuaProgram::new(
-                PathBuf::from("C:/scripts/gated-llm.lua"),
-                b"ctx.llm({{role = 'user', content = 'hello'}})".to_vec(),
-            ),
-            translate_bindings(
-                calls,
-                Box::new(TestFinalizer {
-                    finalizations: Arc::new(Mutex::new(Vec::new())),
-                    completion: Some(completion),
-                }),
-            ),
-        );
-        tokio::time::timeout(Duration::from_secs(5), started.notified())
-            .await
-            .expect("Lua 应已把 LLM 调用交给 Host");
-
-        drop(handle);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut finalized)
-                .await
-                .is_err(),
-            "已经交给 Host 的 LLM 调用未到明确终态时不得运行 finalizer"
-        );
-        assert_eq!(
-            observations
-                .lock()
-                .expect("测试观察锁不应中毒")
-                .completed_llm_calls,
-            0,
-            "取消不得伪造 LLM 调用已经完成"
-        );
-
-        gate.notify_one();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), finalized)
-                .await
-                .expect("LLM 调用终结后应完成 finalization")
-                .expect("finalizer 应交还终态"),
-            ()
-        );
-        assert_eq!(
-            observations
-                .lock()
-                .expect("测试观察锁不应中毒")
-                .completed_llm_calls,
-            1,
-            "取消后仍必须等待已接管的 LLM future 完成其持久化生命周期"
-        );
-        runtime.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn successful_llm_result_crosses_the_native_boundary_after_cancellation() {
-        let tokio = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("测试 Tokio runtime 应可创建");
-        let observations = Arc::new(Mutex::new(TestObservations::default()));
-        let calls = Arc::new(TestCalls {
-            panic_on_project: false,
-            project: test_project(),
-            observations: Arc::clone(&observations),
-            begin_error: None,
-            begin_started: None,
-            begin_gate: None,
-        });
-        let cancellation = RuntimeCancellation {
-            local: Arc::new(AtomicBool::new(true)),
-            shutdown: Arc::new(AtomicBool::new(false)),
-        };
-        let lua = Lua::new();
-        lua.globals()
-            .set(
-                "llm",
-                build_llm_function(&lua, calls, tokio.handle().clone(), cancellation)
-                    .expect("LLM native 函数应可构造"),
-            )
-            .expect("LLM native 函数应可注入");
-
-        let response: Table = lua
-            .load("return llm({{ role = 'user', content = 'hello' }})")
-            .eval()
-            .expect("Host 的成功终态必须穿过 Lua native 返回边界");
-
-        assert_eq!(response.get::<String>("content").unwrap(), "raw response");
-        assert_eq!(response.get::<String>("request_id").unwrap(), "request-1");
-        assert_eq!(
-            observations
-                .lock()
-                .expect("测试观察锁不应中毒")
-                .completed_llm_calls,
-            1
-        );
-    }
-
-    #[test]
-    fn lua_value_materialization_failure_is_recorded_as_not_delivered() {
-        let tokio = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("测试 Tokio runtime 应可创建");
-        let dispositions = Arc::new(Mutex::new(Vec::new()));
-        let calls = Arc::new(OverflowUsageCalls {
-            dispositions: Arc::clone(&dispositions),
-        });
-        let cancellation = RuntimeCancellation {
-            local: Arc::new(AtomicBool::new(false)),
-            shutdown: Arc::new(AtomicBool::new(false)),
-        };
-        let lua = Lua::new();
-        lua.globals()
-            .set(
-                "llm",
-                build_llm_function(&lua, calls, tokio.handle().clone(), cancellation)
-                    .expect("LLM native 函数应可构造"),
-            )
-            .expect("LLM native 函数应可注入");
-
-        let delivered: bool = lua
-            .load("local ok = pcall(llm, {{ role = 'user', content = 'hello' }}); return ok")
-            .eval()
-            .expect("Lua 应能观察绑定错误");
-
-        assert!(!delivered, "超出 Lua integer 的 usage 不得作为响应交付");
-        assert_eq!(
-            *dispositions.lock().expect("交付处置锁不应中毒"),
-            [TrustedLuaLlmDeliveryDisposition::BindingRejected]
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_vm_only_exposes_llm_in_translate_and_output_in_write_back() {
         let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let finalizations = Arc::new(Mutex::new(Vec::new()));
@@ -6051,11 +5730,7 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
             &self,
             _messages: Vec<ChatMessage>,
         ) -> std::pin::Pin<
-            Box<
-                dyn Future<Output = Result<TrustedLuaPendingLlmResponse, TrustedLuaHostCallError>>
-                    + Send
-                    + 'static,
-            >,
+            Box<dyn Future<Output = Result<LlmResponse, TrustedLuaHostCallError>> + Send + 'static>,
         > {
             let observations = Arc::clone(&self.observations);
             Box::pin(async move {
@@ -6063,13 +5738,13 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
                     .lock()
                     .expect("文档示例观察锁不应中毒")
                     .llm_requests += 1;
-                Ok(TrustedLuaPendingLlmResponse::for_test(LlmResponse::new(
+                Ok(LlmResponse::new(
                     "星港",
                     crate::llm::LlmFinishReason::Stop,
                     Some("documented-request".to_owned()),
                     Some("documented-response".to_owned()),
                     Some(LlmUsage::new(4, 2, 6)),
-                )))
+                ))
             })
         }
     }
