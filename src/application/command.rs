@@ -125,6 +125,7 @@ use crate::runtime::llm::{
     OpenAiChatCompletionClient, OpenAiChatCompletionError, OpenAiChatCompletionExecutor,
     OpenAiExecutorBuildError,
 };
+use crate::runtime::llm_call_log::LlmCallRecorder;
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
     ProjectLog, ProjectLogAmount, ProjectLogCode, ProjectLogContext, ProjectLogEvent,
@@ -1594,10 +1595,9 @@ impl ProductionRpgMakerCommandRunner {
             }
         };
         let project_name = command.project_name().clone();
-        let database_path =
-            ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name)
-                .database_path()
-                .to_path_buf();
+        let project_workspace =
+            ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name);
+        let database_path = project_workspace.database_path().to_path_buf();
         let lease_provider = ProjectCommandLeaseService::new(
             projects_root.clone(),
             self.layout.engine(),
@@ -1974,12 +1974,29 @@ impl ProductionRpgMakerCommandRunner {
                     return observed_construction_failure(project_log, error, shutdown).await;
                 }
             };
+        let call_recorder = command.record_calls().then(|| {
+            LlmCallRecorder::new(
+                project_workspace
+                    .workspace_root()
+                    .join("llm-calls")
+                    .join(project_log.run_id()),
+                project_log.run_id().to_owned(),
+                file_system.clone(),
+                project_log.logger.clone(),
+            )
+        });
         let llm = match OpenAiChatCompletionExecutor::new(
             command.llm().with_pem_roots(additional_pem_roots),
         )
         .map_err(ProductionCommandError::http_client_build)
         {
-            Ok(value) => value,
+            Ok(value) => {
+                if let Some(recorder) = call_recorder {
+                    value.with_call_recorder(recorder)
+                } else {
+                    value
+                }
+            }
             Err(error) => {
                 let mut shutdown = ShutdownFailures::default();
                 if let Some(selected) = lua.as_ref()
@@ -2984,6 +3001,7 @@ async fn catch_command_panic(
 }
 
 struct ActiveProjectLog {
+    run_id: String,
     runtime: ProjectLogRuntime,
     logger: ProjectLogger,
     context: ProjectLogContext,
@@ -3271,6 +3289,10 @@ const fn write_back_phase_code(phase: WriteBackProgressPhase) -> ProjectLogPhase
 }
 
 impl ActiveProjectLog {
+    fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
     fn set_profile(&mut self, profile: &str) {
         self.context = self.context.clone().with_profile(profile);
     }
@@ -3372,7 +3394,9 @@ fn start_command_log(
         performance,
         panic_boundary,
     } = input;
-    let run_id = generate_run_id().map_err(ProductionCommandError::run_id)?;
+    let run_id = generate_run_id()
+        .map_err(ProductionCommandError::run_id)?
+        .to_string();
     let logs_root = common
         .projects_root()
         .join(layout.engine().storage_name())
@@ -3382,7 +3406,7 @@ fn start_command_log(
         .parent()
         .expect("logs 路径必须位于项目工作区内")
         .to_path_buf();
-    let mut runtime = start_project_log(logs_root, run_id.to_string());
+    let mut runtime = start_project_log(logs_root, run_id.clone());
     let logger = runtime.logger();
     let mut context = ProjectLogContext::new(locale.as_str())
         .with_engine(layout.engine().storage_name())
@@ -3406,6 +3430,7 @@ fn start_command_log(
         ProjectLogPayload::Run { outcome: None },
     ));
     Ok(ActiveProjectLog {
+        run_id,
         runtime,
         logger,
         context,
@@ -7746,6 +7771,7 @@ mod command_error_rendering_tests {
             ProjectLogPayload::Run { outcome: None },
         ));
         let active = ActiveProjectLog {
+            run_id: run_id.to_owned(),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),
@@ -8518,6 +8544,7 @@ mod command_error_rendering_tests {
         let logger = runtime.logger();
         let context = ProjectLogContext::new("zh-Hans").with_command("write-back");
         let active = ActiveProjectLog {
+            run_id: run_id.to_owned(),
             runtime,
             logger,
             context,
@@ -8558,6 +8585,7 @@ mod command_error_rendering_tests {
         performance.candidate_validation_started();
         performance.candidate_validation_completed();
         let active = ActiveProjectLog {
+            run_id: run_id.to_owned(),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("write-back"),
@@ -8612,6 +8640,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
+            run_id: run_id.to_owned(),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("init"),
@@ -8958,6 +8987,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
+            run_id: run_id.to_owned(),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),
@@ -9035,6 +9065,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
+            run_id: run_id.to_owned(),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),

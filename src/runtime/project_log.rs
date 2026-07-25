@@ -436,6 +436,13 @@ impl ProjectLogger {
     pub(crate) fn take_warning(&self) -> Option<ProjectLogWarning> {
         self.inner.health.take_warning()
     }
+
+    /// 将同一运行中的其他可观测性产物故障并入既有非致命日志降级提示。
+    pub(crate) fn record_observability_failure(&self, diagnostic: SafeDiagnostic) {
+        self.inner
+            .health
+            .record_failure(&self.inner.health.write_failures, diagnostic);
+    }
 }
 
 impl ProjectLog for ProjectLogger {

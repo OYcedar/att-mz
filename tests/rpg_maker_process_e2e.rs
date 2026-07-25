@@ -243,6 +243,13 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
 
     let server = BoundChatServer::bind();
     write_configuration(root, server.endpoint(), E2E_PARAMETERS);
+    let configuration_path = root.join("config.toml");
+    let configuration = fs::read_to_string(&configuration_path).expect("Translate 配置应可读取");
+    fs::write(
+        &configuration_path,
+        configuration.replace("record_calls = false", "record_calls = true"),
+    )
+    .expect("应可启用 LLM 调用记录");
     write_placeholders(root);
     let running_server = server.start_with_responses(vec![
         ChatResponseFixture::Standard,
@@ -271,6 +278,7 @@ fn init_extract_translate_and_write_back_cross_process_with_real_roots() {
     );
     assert_translation_committed(&database);
     assert_lua_probes(&database, &["extract"]);
+    assert_llm_call_records_share_translate_run_id(&workspace, &logs_root);
 
     let initial_standard_write_back =
         run_att(root, arguments(&["mz", "write-back", "--name", PROJECT]));
@@ -2299,6 +2307,9 @@ root = "prompts"
 locale = "{prompt_locale}"
 thinking_output = {thinking_output}
 
+[llm]
+record_calls = false
+
 [llm.clients.primary]
 url = "{url}"
 api_key = "{API_KEY}"
@@ -3454,6 +3465,37 @@ fn assert_translate_mixed_source_log(log_root: &Path) {
                 && record["payload"]["lua_source"] == "project_state"
         }),
         "Translate 混合来源必须分别记录 Profile 与 Lua 来源"
+    );
+}
+
+fn assert_llm_call_records_share_translate_run_id(workspace: &Path, log_root: &Path) {
+    let (_, records) = read_project_logs(log_root);
+    let run_id = records
+        .iter()
+        .find(|record| {
+            record["command"] == "translate"
+                && record["code"] == "run_plan.resolved"
+                && record["payload"]["lua_source"] == "explicit"
+                && record["payload"]["lua_enabled"] == true
+        })
+        .and_then(|record| record["run_id"].as_str())
+        .expect("显式 Standard+Lua Translate 应拥有 RunId");
+    let call_directory = workspace.join("llm-calls").join(run_id);
+    let mut calls = fs::read_dir(&call_directory)
+        .expect("调用记录应使用同一 Translate RunId")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("调用记录目录应可读取")
+        .into_iter()
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    calls.sort();
+    assert_eq!(
+        calls,
+        [
+            OsString::from("call-000001.md"),
+            OsString::from("call-000002.md")
+        ],
+        "首次 Standard+Lua Translate 应各记录一次实际 HTTP 调用"
     );
 }
 

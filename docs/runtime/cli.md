@@ -126,6 +126,10 @@ Translate 还会严格消费 `[prompts]` 的 `root`、`locale` 和 `thinking_out
 要求精确的一组非空 `<why>...</why>` 后接同一 JSON wire；信封或 JSON 解析失败形成
 `ModelResponseUnusable`，不会作为网络错误重试。
 
+Translate 同时消费 `[llm]` 中可省略的 `record_calls`，默认 `false`。启用时，Standard 与
+Translate Lua 的实际 HTTP 尝试会在同一 RunId 下生成敏感的人类可读调用文件；该开关
+不进入保存方案或项目数据库。
+
 ### 3.4 WriteBack
 
 项目从未保存 WriteBack Lua 选择时，省略 `--lua` 使用固定产品行为 Standard-only。
@@ -241,6 +245,10 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 文件、不轮转，也不按大小丢弃事实。建立、写入、flush、sync 或关闭失败时，stderr 必须
 显示日志路径、具体操作和清理后的底层原因，但不改变原本的成功、失败或取消退出码。
 详细契约见[普通项目日志](project-log.md)。
+
+启用 `llm.record_calls` 时，敏感调用记录写入
+`llm-calls/<run-id>/call-N.md`。它与普通 JSONL 一样是可降级、非权威的可观测性旁路；
+缺失记录不证明没有调用，记录故障也不改变原业务结果、项目状态或退出码。
 
 项目日志建立后的命令 panic 由命令边界转换成 `internal.operation` 安全诊断：CLI 与
 JSONL 都显示实际命令阶段、项目工作区、日志路径和 `outcome_unknown` 影响，绝不显示

@@ -10,7 +10,7 @@ ATT 的生产配置只包含真实外部选择；完整字段见
 |---|---|
 | Init | `projects.root` |
 | Extract | `projects.root`；Builtin、Rules、Lua 来自 CLI 或保存方案 |
-| Translate | `projects.root`、`prompts`、全部 `languages`、所选 Profile 和它引用的 Client |
+| Translate | `projects.root`、`prompts`、`llm.record_calls`、全部 `languages`、所选 Profile 和它引用的 Client |
 | WriteBack | `projects.root`；Lua 选择来自 CLI 或保存方案 |
 
 Help 与 Version 之外的命令必须显式传入 `--config FILE`。配置中的相对路径以配置文件
@@ -26,8 +26,9 @@ Help 与 Version 之外的命令必须显式传入 `--config FILE`。配置中�
 
 ## 哪些值由用户配置
 
-用户配置的资源相关值只限模型供应商真实约束：
+用户可配置的 LLM 相关值包括显式可观测性选择和模型供应商真实约束：
 
+- 可选的敏感 LLM 调用记录开关；
 - Client 最大并发请求数；
 - 可选 RPM 与 burst；
 - 连接、连续读取和完整请求超时；

@@ -1,9 +1,9 @@
 # ATT 生产配置现行规格
 
 仓库根目录的 [`config.example.toml`](../../config.example.toml) 是当前版本唯一示例。
-配置只表达操作者真正能够选择的路径、Prompt、语言、模型服务和业务 Profile；线程、
-队列、批次、SQLite 持久策略、日志缓冲以及文件、Lua、SQLite、Claim、Unit、Group、Task
-总量都不是配置项。
+配置只表达操作者真正能够选择的路径、Prompt、语言、模型服务、业务 Profile 和敏感
+调用记录开关；线程、队列、批次、SQLite 持久策略、日志缓冲以及文件、Lua、SQLite、
+Claim、Unit、Group、Task 总量都不是配置项。
 
 ## 1. 读取与严格边界
 
@@ -23,8 +23,9 @@
 只有上述当前分区有效。未知字段严格拒绝，诊断只说明当前字段要求和具体无效原因。
 
 配置只解析本次命令真正消费的已知子树。例如 Init 只需要 `projects.root`；Translate
-才解析 Prompt、全部语言、所选 Profile 和该 Profile 引用的 Client。未选 Client 的
-密钥不会物化。选中的表严格拒绝缺失、未知、错误类型、空白 ID 和规范化后的重复 ID。
+才解析 Prompt、`llm.record_calls`、全部语言、所选 Profile 和该 Profile 引用的 Client。
+未选 Client 的密钥不会物化。选中的表严格拒绝缺失、未知、错误类型、空白 ID 和规范化
+后的重复 ID。
 
 配置错误展示配置路径、一基行列、字段和具体原因；不得回显 API key、Client
 `parameters` 值或完整配置正文。
@@ -54,7 +55,20 @@ root = "projects"
 | `projects.root`、`prompts.root`、`additional_pem_files` | 配置文件所在目录 |
 | 其他 CLI 文件或目录参数 | 进程当前工作目录 |
 
-## 3. LLM Client
+## 3. LLM 与 Client
+
+`[llm]` 可以选择是否为 Translate 保留敏感的逐次 HTTP 调用记录：
+
+<!-- att-config-example: fragment -->
+```toml
+[llm]
+record_calls = false
+```
+
+`record_calls` 是可省略的布尔值，默认 `false`；只有 Translate 消费它。它对本轮
+Standard 和 Translate Lua 的全部 LLM 调用生效，不属于某个 Client，不进入翻译指纹、
+保存的运行方案或项目数据库。启用后的固定位置、敏感性和非阻断失败语义见
+[项目日志规格](project-log.md)。
 
 模型服务的真实外部约束全部属于 Client：
 
@@ -144,6 +158,7 @@ LanguagePair 精确选择源语言模块。
 - SQLite 固定使用 WAL + FULL；
 - 项目锁、发布锁和 SQLite busy 不设置任意截止时间；
 - 日志固定写入项目工作区的 `logs/<run-id>.jsonl`；
+- 启用敏感调用记录时固定写入同一 RunId 的 `llm-calls/<run-id>/call-N.md`；
 - 文档、规则、Group、任务和不同物理文件在不破坏确定性的前提下并行；
 - 自然顺序、代表选择、提交顺序和最终主错误不受完成顺序影响。
 

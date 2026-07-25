@@ -587,6 +587,7 @@ where
                 &expected_children,
                 &[
                     ("logs", DirectoryEntryKind::Directory),
+                    ("llm-calls", DirectoryEntryKind::Directory),
                     ("project.db-journal", DirectoryEntryKind::RegularFile),
                     ("project.db-wal", DirectoryEntryKind::RegularFile),
                     ("project.db-shm", DirectoryEntryKind::RegularFile),
@@ -1172,7 +1173,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum WorkspaceStructureObservation {
         Complete,
-        ProjectLogs,
+        ObservabilityDirectories,
         SqliteSidecars,
         SqliteSidecarNotFile,
         DatabaseNotFile,
@@ -1307,12 +1308,12 @@ mod tests {
                 }
                 if matches!(
                     self.workspace_structure,
-                    WorkspaceStructureObservation::ProjectLogs
+                    WorkspaceStructureObservation::ObservabilityDirectories
                 ) {
-                    children.push(DirectoryEntry::new(
-                        path.join("logs"),
-                        DirectoryEntryKind::Directory,
-                    ));
+                    children.extend([
+                        DirectoryEntry::new(path.join("logs"), DirectoryEntryKind::Directory),
+                        DirectoryEntry::new(path.join("llm-calls"), DirectoryEntryKind::Directory),
+                    ]);
                 }
                 if matches!(
                     self.workspace_structure,
@@ -2105,11 +2106,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_logs_do_not_make_an_identical_workspace_look_changed() {
+    async fn observability_directories_do_not_make_an_identical_workspace_look_changed() {
         let current = database_state(0x33, Vec::new());
         let (service, observations) = service(
             true,
-            WorkspaceStructureObservation::ProjectLogs,
+            WorkspaceStructureObservation::ObservabilityDirectories,
             ExistingSourceObservation::Fingerprint([0x33; 32]),
             0x33,
             Ok(current.clone()),
@@ -2120,7 +2121,7 @@ mod tests {
         let outcome = service
             .converge(request())
             .await
-            .expect("项目日志目录属于合法的项目工作区设施");
+            .expect("可观测性目录属于合法的项目工作区设施");
 
         assert_eq!(
             outcome,

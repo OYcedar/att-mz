@@ -54,10 +54,10 @@ use sha2::{Digest, Sha256};
 
 use super::windows::{
     ExclusiveFileLock, FileIdentity, PinnedPath, WindowsFsError,
-    delete_empty_directory_if_identity, delete_regular_file_if_identity, number_of_links,
-    open_directory, open_read_write_file_without_reparse, pin_directory_without_reparse,
-    pin_path_without_reparse, pin_regular_file_for_snapshot_read,
-    rename_without_replace_if_identity, secure_uuid_v4,
+    create_directories_without_reparse, delete_empty_directory_if_identity,
+    delete_regular_file_if_identity, number_of_links, open_directory,
+    open_read_write_file_without_reparse, pin_directory_without_reparse, pin_path_without_reparse,
+    pin_regular_file_for_snapshot_read, rename_without_replace_if_identity, secure_uuid_v4,
     validate_local_case_insensitive_ntfs_directory, windows_names_equal,
 };
 
@@ -1099,9 +1099,52 @@ impl SystemFileSystem {
         self.inner.pool.cancel_waits();
     }
 
+    /// 在既有文件 worker 上建立并一次性写入非权威可观测性文件。
+    ///
+    /// 调用方负责提供不会被外部内容影响的文件名。目标已存在时失败，且本能力
+    /// 不执行耐久同步；失败语义由可观测性所有者决定。
+    pub(crate) async fn write_new_observation_file(
+        &self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    ) -> Result<(), SystemFileSystemError> {
+        let error_path = path.clone();
+        self.inner
+            .pool
+            .execute("write_new_observation_file", &error_path, move || {
+                write_new_observation_file_sync(&path, &bytes)
+            })
+            .await?
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<(), SystemFileSystemError> {
         self.inner.pool.shutdown().await
     }
+}
+
+fn write_new_observation_file_sync(path: &Path, bytes: &[u8]) -> Result<(), SystemFileSystemError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| SystemFileSystemError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "可观测性文件必须包含父目录",
+        })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| SystemFileSystemError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "可观测性文件必须包含文件名",
+        })?;
+    let pinned_parent = create_directories_without_reparse(parent)?;
+    let resolved_path = pinned_parent.resolved_path().join(file_name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&resolved_path)
+        .map_err(|source| io_error("建立可观测性文件", &resolved_path, source))?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .map_err(|source| io_error("写入可观测性文件", &resolved_path, source))
 }
 
 /// 目录候选、受限编辑和可恢复发布组成的单一能力实例。

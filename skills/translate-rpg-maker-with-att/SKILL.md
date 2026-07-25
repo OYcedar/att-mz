@@ -35,6 +35,8 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 
 对静态可枚举的候选范围全量核对命中、未命中和误命中；无法枚举的部分明确保留为未证实。命令成功和命中数量只证明规则被消费，不证明覆盖完成。
 
+当自定义翻译资源、漏翻或说话人问题已经进入 Translate 调查时，若本轮启用了敏感 LLM 调用记录，先在 `llm-calls/<run-id>/` 核对最终请求中是否真实包含预期规则和上下文，再核对 Provider 的实际响应；随后使用普通 JSONL 和项目数据库判断 ATT 如何分类、验收和持久化结果。调用记录不表达 ATT 验收或提交事实。文件缺失不能证明没有调用，必须结合配置、零任务状态和 stderr 日志健康警告，区分关闭记录、尚未调用、调用前失败和记录失败。
+
 任务产生新的可复用经验时，按知识责任同步：改变触发、状态路由、必读材料、采证方法或停止与完成判断的经验更新本 Skill；规则语义和工件验证方法更新对应现行文档；单个游戏的 marker、字段路径、正则和一次性结论留在项目工件。不要把个案堆成通用清单。
 
 ## 流程 0：入口与续作路由
@@ -165,11 +167,13 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 - 先读[Translate 规格](../../docs/rpg-maker/translation.md)。
 - 根据具体问题再读[术语规格](../../docs/rpg-maker/terminology.md)、[Prompt 规格](../../docs/rpg-maker/prompts.md)或[Rules 规格中的 Placeholder 契约](../../docs/rpg-maker/rules.md)。
 - 网络与模型响应外层故障再读[Chat Completions 运行时规格](../../docs/runtime/chat-completions.md)。
+- 调查最终模型输入、Provider 原始结果或调用记录健康状态时再读[项目日志规格](../../docs/runtime/project-log.md)。
 
 ### 任务清单
 
 - 确认本轮显式提供或复用的翻译资源及其当前性。
 - 执行 Translate，保留已经合法提交的部分进度。
+- 调查自定义资源是否生效时，先用敏感调用记录确认最终请求与 Provider 响应，再用普通 JSONL 和项目数据库确认 ATT 验收与提交结果。
 - 同时检查 `Complete`、`Partial`、`Unavailable`，以及任务状态、unit state 和代表性译文。
 - 区分机器协议验收、状态传播和语言质量，只修正真正拥有问题的资源或阶段。
 

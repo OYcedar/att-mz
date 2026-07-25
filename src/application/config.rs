@@ -275,6 +275,7 @@ impl ConfiguredRpgMakerCommand {
                     DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source));
                 let raw: RawTranslateSelection = parse_selected(source, configuration_path)?;
                 let cpu = build_cpu_configuration();
+                let record_calls = raw.llm.record_calls;
                 let TranslateArguments {
                     project,
                     profile_id,
@@ -304,6 +305,7 @@ impl ConfiguredRpgMakerCommand {
                     cpu,
                     lua,
                     deferred_lua,
+                    record_calls,
                     profile: ConfiguredTranslateProfile::Deferred {
                         source: deferred_source,
                         configuration: rpg_maker,
@@ -449,6 +451,7 @@ pub(crate) struct ConfiguredTranslateCommand {
     cpu: CpuExecutorConfig,
     lua: Option<SelectedLuaConfiguration>,
     deferred_lua: DeferredLuaRuntimeConfiguration,
+    record_calls: bool,
     profile: ConfiguredTranslateProfile,
 }
 
@@ -489,6 +492,10 @@ impl ConfiguredTranslateCommand {
         self.lua.as_ref()
     }
 
+    pub(crate) const fn record_calls(&self) -> bool {
+        self.record_calls
+    }
+
     /// 仅在项目状态要求复用 Lua 程序时解析并校验 Lua 运行时配置。
     pub(crate) fn resolve_lua_runtime(
         &self,
@@ -527,6 +534,7 @@ impl ConfiguredTranslateCommand {
             cpu,
             lua,
             deferred_lua,
+            record_calls,
             profile,
         } = self;
         let profile = match profile {
@@ -558,6 +566,7 @@ impl ConfiguredTranslateCommand {
             cpu,
             lua,
             deferred_lua,
+            record_calls,
             profile,
         })
     }
@@ -2428,6 +2437,9 @@ impl<'de> Visitor<'de> for SelectedLlmClientSectionVisitor<'_> {
         let mut selected = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
+                "record_calls" => {
+                    map.next_value::<IgnoredAny>()?;
+                }
                 "clients" => {
                     if selected.is_some() {
                         return Err(de::Error::duplicate_field("clients"));
@@ -2436,7 +2448,7 @@ impl<'de> Visitor<'de> for SelectedLlmClientSectionVisitor<'_> {
                         requested_id: self.requested_id,
                     })?;
                 }
-                _ => return Err(de::Error::unknown_field(&key, &["clients"])),
+                _ => return Err(de::Error::unknown_field(&key, &["record_calls", "clients"])),
             }
         }
         Ok(selected)
@@ -2526,6 +2538,8 @@ struct RawPromptsFieldNames {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLlmFieldNames {
+    #[serde(default, rename = "record_calls")]
+    _record_calls: Option<IgnoredAny>,
     #[serde(default, rename = "clients")]
     _clients: Option<BTreeMap<String, RawLlmClientFieldNames>>,
 }
@@ -2667,8 +2681,8 @@ struct RawTranslateSelection {
     rpg_maker: RawTranslateRpgMakerSelection,
     #[serde(default, rename = "projects")]
     _projects: Option<IgnoredAny>,
-    #[serde(default, rename = "llm")]
-    _llm: Option<IgnoredAny>,
+    #[serde(default)]
+    llm: RawTranslateLlmConfiguration,
 }
 
 #[derive(Deserialize)]
@@ -2699,6 +2713,15 @@ struct RawPromptsConfiguration {
     root: PathBuf,
     locale: String,
     thinking_output: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTranslateLlmConfiguration {
+    #[serde(default)]
+    record_calls: bool,
+    #[serde(default, rename = "clients")]
+    _clients: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -2779,6 +2802,7 @@ mod tests {
 
     use super::*;
     use crate::application::arguments::{AttArguments, ProductCommand};
+    use crate::llm::LlmClientSemanticIdentity;
 
     #[test]
     fn repository_example_is_valid_for_every_command() {
@@ -3047,8 +3071,8 @@ id = "unused"
     fn prompt_locale_auto_and_thinking_output_are_preserved_for_the_composition_root() {
         let directory = TestDirectory::new();
         for (thinking_output, expected) in [("false", false), ("true", true)] {
-            let source = include_str!("../../config.example.toml").replace(
-                "thinking_output = false",
+            let source = replace_thinking_output(
+                include_str!("../../config.example.toml"),
                 format!("thinking_output = {thinking_output}").as_str(),
             );
             let path = directory.write(
@@ -3153,8 +3177,8 @@ id = "unused"
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml")
             .replace("root = \"prompts\"", "root = []")
-            .replace("locale = \"auto\"", "locale = []")
-            .replace("thinking_output = false", "thinking_output = []");
+            .replace("locale = \"auto\"", "locale = []");
+        let source = replace_thinking_output(&source, "thinking_output = []");
         let path = directory.write("unselected-prompts.toml", &source);
 
         for command in [
@@ -3165,6 +3189,72 @@ id = "unused"
             load_configuration(&path, command)
                 .expect("非 Translate 命令不得物化或校验 prompts 的字段值");
         }
+    }
+
+    #[test]
+    fn translate_defaults_and_preserves_llm_call_recording_selection() {
+        let directory = TestDirectory::new();
+        let example = include_str!("../../config.example.toml");
+        let cases = [
+            (
+                "omitted",
+                example.replace("record_calls = false", ""),
+                false,
+            ),
+            ("false", example.to_owned(), false),
+            (
+                "true",
+                example.replace("record_calls = false", "record_calls = true"),
+                true,
+            ),
+        ];
+
+        let mut semantic_fingerprints = Vec::new();
+        for (name, source, expected) in cases {
+            let path = directory.write(format!("record-calls-{name}.toml").as_str(), &source);
+            let ConfiguredRpgMakerCommand::Translate(configured) =
+                load_configuration(&path, translate_command(false, "primary"))
+                    .expect("调用记录开关应建立受信 Translate 配置")
+            else {
+                panic!("应建立 Translate 配置");
+            };
+
+            assert_eq!(configured.record_calls(), expected);
+            semantic_fingerprints.push(configured.client().semantic_fingerprint());
+        }
+        assert!(
+            semantic_fingerprints
+                .windows(2)
+                .all(|pair| pair[0] == pair[1])
+        );
+    }
+
+    #[test]
+    fn only_translate_consumes_the_llm_call_recording_value() {
+        const SENTINEL: &str = "RECORD_CALLS_TYPE_SENTINEL";
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml").replace(
+            "record_calls = false",
+            format!("record_calls = [\"{SENTINEL}\"]").as_str(),
+        );
+        let path = directory.write("record-calls-type.toml", &source);
+
+        for command in [
+            init_command(),
+            extract_command(false),
+            write_back_command(false),
+        ] {
+            load_configuration(&path, command)
+                .expect("非 Translate 命令不得物化或校验调用记录开关");
+        }
+
+        let error = match load_configuration(&path, translate_command(false, "primary")) {
+            Ok(_) => panic!("Translate 必须拒绝非布尔调用记录开关"),
+            Err(error) => error,
+        };
+        let diagnostics = format!("{error:?}\n{error}");
+        assert!(diagnostics.contains("llm.record_calls"));
+        assert!(!diagnostics.contains(SENTINEL));
     }
 
     #[test]
@@ -3196,7 +3286,7 @@ id = "unused"
             ),
             (
                 "prompts-thinking-output",
-                source.replacen("thinking_output = false\n", "", 1),
+                replace_thinking_output(&source, ""),
             ),
             (
                 "languages",
@@ -3288,10 +3378,9 @@ id = "unused"
             ),
             (
                 "prompt-thinking-output-type",
-                source.replacen(
-                    "thinking_output = false",
+                replace_thinking_output(
+                    &source,
                     "thinking_output = [\"PROMPT_THINKING_TYPE_SENTINEL\"]",
-                    1,
                 ),
                 "prompts.thinking_output",
                 "字段类型不符合当前配置契约",
@@ -3388,9 +3477,13 @@ id = "unused"
             ),
             (
                 "prompts",
+                replace_thinking_output(example, "thinking_output = false\nunexpected = 1"),
+            ),
+            (
+                "llm",
                 example.replace(
-                    "thinking_output = false",
-                    "thinking_output = false\nunexpected = 1",
+                    "record_calls = false",
+                    "record_calls = false\nunexpected = 1",
                 ),
             ),
             (
@@ -3487,8 +3580,8 @@ id = "unused"
         let source = format!(
             "{}\n[llm.clients.unused]\nurl = []\napi_key = \"UNSELECTED_SECRET_SENTINEL\"\nmodel = []\nmax_concurrent_requests = []\nconnect_timeout_ms = []\nread_timeout_ms = []\nrequest_timeout_ms = []\nproxy = []\nadditional_pem_files = []\nretry_delays_ms = []\nmax_retry_after_ms = []\nparameters = []\n",
             include_str!("../../config.example.toml")
-        )
-        .replace("thinking_output = false", "thinking_output = []");
+        );
+        let source = replace_thinking_output(&source, "thinking_output = []");
         let path = directory.write("unselected-secret.toml", &source);
         let error = match load_configuration(&path, translate_command(false, "primary")) {
             Ok(_) => panic!("无效 Prompt 配置必须拒绝"),
@@ -3600,6 +3693,15 @@ root = "projects"
             .expect("测试配置应包含结束标记");
         let end_offset = start_offset + relative_end;
         format!("{}{}", &source[..start_offset], &source[end_offset..])
+    }
+
+    fn replace_thinking_output(source: &str, replacement: &str) -> String {
+        for current in ["thinking_output = false", "thinking_output = true"] {
+            if source.contains(current) {
+                return source.replacen(current, replacement, 1);
+            }
+        }
+        panic!("测试配置应包含 thinking_output 布尔字段");
     }
 
     struct TestDirectory {

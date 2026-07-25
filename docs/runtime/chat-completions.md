@@ -6,6 +6,9 @@
 Client 活动请求许可、可选 RPM limiter、连接/读取/完整请求超时和实际 HTTP 协议。
 Standard 与 Translate Lua 共享同一 Client 约束。
 
+Translate 的可选 `llm.record_calls` 也作用于这两个调用方。记录点只观察运行根实际发送
+的最终 HTTP 请求和 Provider 结果，不解释 Standard 任务、Lua 业务或 ATT 验收状态。
+
 只有 Client 的 `max_concurrent_requests` 和可选 `rate_limit` 控制请求。没有第二层用户队列、
 总容量或本地准入截止时间；等待活动许可或 RPM 时只响应取消/shutdown，不算模型失败或
 重试。响应完成后立即释放 Client 的 HTTP 许可；Translate 自己的确定性顺序提交窗口是
@@ -46,6 +49,8 @@ HTTP 200 后要求：
 Retryable 包含 DNS/连接/发送/读取/完整请求超时或中断，以及 HTTP 408、429、500、502、
 503、504。`Retry-After` 支持秒数和 HTTP-date，并受 Client `max_retry_after_ms` 约束。
 Standard 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。
+启用敏感调用记录时，每个实际 HTTP 尝试独立生成一个调用文件；记录失败不消耗重试
+次数，也不改变原请求的分类和后续处理。
 
 Fatal 包含请求构造、TLS/证书、其他 HTTP 状态，以及 200 响应不满足成功信封。安全诊断
 公开 HTTP 状态、`Retry-After` 和允许公开的供应商 code/type，但不保存任意错误正文。
@@ -55,6 +60,12 @@ Fatal 包含请求构造、TLS/证书、其他 HTTP 状态，以及 200 响应�
 shutdown 停止新请求并唤醒尚未进入 HTTP 的等待者；已进入 HTTP 的请求继续到明确终态。
 所有路径通过 RAII 归还活动许可。
 
-Debug、CLI 和 JSONL 不包含 API key、Header 值、完整 Client parameters、Prompt/messages、
-完整请求/响应、模型正文、原文或译文。它们仍必须显示安全的 Client ID、阶段、URL 对象、
-HTTP 状态、超时种类和状态影响。
+Debug、CLI 和普通 JSONL 不包含 API key、Header 值、完整 Client parameters、
+Prompt/messages、完整请求/响应、模型正文、原文或译文。它们仍必须显示安全的 Client
+ID、阶段、URL 对象、HTTP 状态、超时种类和状态影响。
+
+启用 `llm.record_calls` 后，敏感 Markdown 会包含最终请求 JSON 和 Provider 响应正文。
+记录器不读取 API key、Authorization、完整请求 Header、代理或 TLS 凭据；调用内容自身
+若包含相同文本则不会额外删改。调用文件与普通 JSONL 共用 RunId，但不是业务状态、恢复
+格式或调用证明；文件缺失不能证明 Provider 没有收到请求。位置与完整失败语义见
+[项目日志规格](project-log.md)。
