@@ -123,21 +123,21 @@ impl fmt::Debug for ResolvedRpgMakerTranslationResources {
     }
 }
 
-/// Profile 为 RPG Maker Planner 提供的单任务 user message 字符上限。
+/// Profile 为 RPG Maker Planner 提供的普通任务 user message 字符装箱目标。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerTranslationPlanningConfiguration {
-    max_user_message_characters: NonZeroUsize,
+    target_user_message_characters: NonZeroUsize,
 }
 
 impl RpgMakerTranslationPlanningConfiguration {
-    pub(crate) const fn new(max_user_message_characters: NonZeroUsize) -> Self {
+    pub(crate) const fn new(target_user_message_characters: NonZeroUsize) -> Self {
         Self {
-            max_user_message_characters,
+            target_user_message_characters,
         }
     }
 
-    pub(crate) const fn max_user_message_characters(&self) -> NonZeroUsize {
-        self.max_user_message_characters
+    pub(crate) const fn target_user_message_characters(&self) -> NonZeroUsize {
+        self.target_user_message_characters
     }
 }
 
@@ -295,7 +295,7 @@ mod tests {
         let profile = profile("secret");
         assert_eq!(profile.id(), "primary");
         assert_eq!(
-            profile.planning().max_user_message_characters(),
+            profile.planning().target_user_message_characters(),
             non_zero(24_000)
         );
         assert_eq!(

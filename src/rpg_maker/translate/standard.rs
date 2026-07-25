@@ -1620,10 +1620,11 @@ pub(crate) trait StandardTranslationAssetReader: Send + Sync {
 /// 不跨过 Planner 重新解释这些规则。
 ///
 /// Planner 必须先在最大仍有关联的 RPG Maker 结构范围内组织复合 Group，再按外部 Profile
-/// 提供的 user message 字符容量切割；不得为了填满容量拼接无关范围。每个 TaskBlock 内
-/// 待翻译单元的 ID 从 1 连续递增，虚原文只保留原文且没有 ID。省略外部资源时复用项目
-/// 当前快照；显式资源在全部解析成功后成为新快照。Planner 按每个语义单元实际触发的
-/// 术语和占位符语义对账，并把资源更新、失效清理与可复用传播一并写入 Preparation。
+/// 提供的 user message 字符装箱目标切割；不得为了接近目标拼接无关范围。单个完整 Group
+/// 超过目标时独立成块，不能拆组或拒绝规范内容，后续任务继续使用原目标。每个 TaskBlock
+/// 内待翻译单元的 ID 从 1 连续递增，虚原文只保留原文且没有 ID。省略外部资源时复用项目
+/// 当前快照；显式资源在全部解析成功后成为新快照。Planner 按每个语义单元实际触发的术语
+/// 和占位符语义对账，并把资源更新、失效清理与可复用传播一并写入 Preparation。
 pub(crate) trait StandardTranslationTaskPlanner: Send + Sync {
     type Profile: StandardTranslationProfile;
     type Error: Error + Send + Sync + 'static;

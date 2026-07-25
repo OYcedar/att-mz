@@ -896,6 +896,67 @@ fn mz_map_mixes_five_semantic_unit_types_in_one_translation_task() {
 }
 
 #[test]
+fn oversized_system_group_exceeds_task_target_and_still_reaches_the_model() {
+    const OVERSIZED_PROJECT: &str = "oversized-system";
+    const TASK_TARGET: usize = 2_048;
+
+    let temporary = tempfile::tempdir().expect("应可建立超目标 System 端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir(root.join("projects")).expect("项目根应可建立");
+    fs::create_dir_all(root.join("prompts/rpg_maker")).expect("提示词根应可建立");
+    write_minimal_mz_game(&game_root);
+    write_items_source(&game_root, "");
+    let original = "あ".repeat(4_330);
+    write_oversized_system_source(&game_root, &original);
+
+    let server = BoundChatServer::bind();
+    write_configuration_with_task_target(root, server.endpoint(), E2E_PARAMETERS, TASK_TARGET);
+    let init = run_att(
+        root,
+        mz_init_arguments_for(&game_root, OVERSIZED_PROJECT, "ja", "zh-Hans", 24, 30, 40),
+    );
+    assert_success("超目标 System init", &init);
+    let extract = run_att(
+        root,
+        arguments(&["mz", "extract", "--name", OVERSIZED_PROJECT, "--builtin"]),
+    );
+    assert_success("超目标 System extract", &extract);
+
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+    let running_server = server.start_with_responses(vec![ChatResponseFixture::Standard]);
+    let translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", OVERSIZED_PROJECT, PROFILE]),
+    );
+    let stdout = assert_success("超目标 System translate", &translate);
+    assert!(
+        stdout.contains("任务 1，完整 1，部分 0，不可用 0"),
+        "超目标 System 组应作为独立任务完成：{stdout}"
+    );
+    assert!(
+        stdout.contains("写入 1 处，剩余 0 处"),
+        "超目标 System 译文应正常提交：{stdout}"
+    );
+
+    let requests = running_server.finish();
+    assert_eq!(requests.len(), 1);
+    assert_standard_request_semantics(&requests[0], SYSTEM_PROMPT, &[&original]);
+    let request: Value =
+        serde_json::from_slice(&requests[0].body).expect("超目标模型请求必须是 JSON");
+    let user_message = request["messages"][1]["content"]
+        .as_str()
+        .expect("超目标 user message 必须是字符串");
+    assert!(user_message.chars().count() > TASK_TARGET);
+
+    let database = root
+        .join("projects/mz")
+        .join(OVERSIZED_PROJECT)
+        .join("project.db");
+    assert_translation_for_original(&database, &original, Some(TRANSLATION));
+}
+
+#[test]
 fn mv_four_stages_preserve_www_layout_and_coexist_with_same_named_mz_project() {
     let temporary = tempfile::tempdir().expect("应可建立 MV 端到端测试目录");
     let root = temporary.path();
@@ -1985,6 +2046,29 @@ fn write_minimal_mz_game(game_root: &Path) {
     fs::write(js.join("rmmz_core.js"), "/* MZ core */").expect("MZ core 标记应可写入");
 }
 
+fn write_oversized_system_source(game_root: &Path, source_text: &str) {
+    fs::write(
+        game_root.join("data/System.json"),
+        serde_json::to_vec(&json!({
+            "gameTitle": "",
+            "currencyUnit": "",
+            "terms": {
+                "basic": [],
+                "commands": [],
+                "params": [],
+                "messages": { "oversized": source_text }
+            },
+            "elements": [],
+            "skillTypes": [],
+            "weaponTypes": [],
+            "armorTypes": [],
+            "equipTypes": []
+        }))
+        .expect("超目标 System 夹具应可序列化"),
+    )
+    .expect("超目标 System 夹具应可写入");
+}
+
 fn write_mixed_semantic_mz_game(game_root: &Path) {
     write_minimal_mz_game(game_root);
     let data = game_root.join("data");
@@ -2291,12 +2375,46 @@ fn write_configuration(root: &Path, url: &str, parameters: &str) {
     write_configuration_with_prompt_options(root, url, parameters, "zh-Hans", false);
 }
 
+fn write_configuration_with_task_target(
+    root: &Path,
+    url: &str,
+    parameters: &str,
+    target_task_user_message_characters: usize,
+) {
+    write_configuration_with_profile_options(
+        root,
+        url,
+        parameters,
+        "zh-Hans",
+        false,
+        target_task_user_message_characters,
+    );
+}
+
 fn write_configuration_with_prompt_options(
     root: &Path,
     url: &str,
     parameters: &str,
     prompt_locale: &str,
     thinking_output: bool,
+) {
+    write_configuration_with_profile_options(
+        root,
+        url,
+        parameters,
+        prompt_locale,
+        thinking_output,
+        10_000,
+    );
+}
+
+fn write_configuration_with_profile_options(
+    root: &Path,
+    url: &str,
+    parameters: &str,
+    prompt_locale: &str,
+    thinking_output: bool,
+    target_task_user_message_characters: usize,
 ) {
     let configuration = format!(
         r#"[projects]
@@ -2358,12 +2476,12 @@ allowed_terms = []
 [[rpg_maker.translation_profiles]]
 id = "local"
 llm_client = "primary"
-max_task_user_message_characters = 10000
+target_task_user_message_characters = {target_task_user_message_characters}
 
 [[rpg_maker.translation_profiles]]
 id = "unselected"
 llm_client = "primary"
-max_task_user_message_characters = 10000
+target_task_user_message_characters = {target_task_user_message_characters}
 "#
     );
     fs::write(root.join("config.toml"), configuration).expect("完整配置应可写入");

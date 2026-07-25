@@ -127,14 +127,19 @@ quote_repair_pairs = [["“", "”"], ["‘", "’"]]
 [[rpg_maker.translation_profiles]]
 id = "primary"
 llm_client = "primary"
-max_task_user_message_characters = 24000
+target_task_user_message_characters = 24000
 ```
 
-Profile 只拥有单任务最终 user message 的 Unicode 字符上限和 Client 引用。该上限计算
-Planner 实际生成的完整 user message，不包含 system message、请求外壳或模型输出。Profile
-不拥有 worker、任务在途数、planning/execution 包装或重试副本。活动 HTTP 宽度来自所选
-Client 的 `max_concurrent_requests`（N）；内部完成重排窗口由最大真实样本消融与慢首任务
-压力测试确定为 2N，因此总在途宽度为 3N。这些内部执行策略由程序拥有，不进入配置。
+Profile 只拥有普通 TaskBlock 最终 user message 的 Unicode 字符装箱目标和 Client 引用。
+Planner 按实际渲染结果计数；加入下一个完整文本组会超过目标时，只在组边界开始下一
+任务。单个不可拆分文本组本身超过目标时，该组独立成为一个任务，实际字符数允许超过
+目标，翻译继续；这不会拆组、拒绝规范内容或抬高后续任务的装箱目标。
+
+该目标不包含 system message、请求外壳或模型输出，也不是 Provider 上下文或请求容量
+上限。Profile 不拥有 worker、任务在途数、planning/execution 包装或重试副本。活动 HTTP
+宽度来自所选 Client 的 `max_concurrent_requests`（N）；内部完成重排窗口由最大真实样本
+消融与慢首任务压力测试确定为 2N，因此总在途宽度为 3N。这些内部执行策略由程序拥有，
+不进入配置。
 
 `prompts.locale = "auto"` 复用本进程已经解析的 UI locale；显式值按现有 UI i18n 规则
 规范化。资源路径固定为：

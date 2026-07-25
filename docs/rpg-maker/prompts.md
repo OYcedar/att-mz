@@ -92,10 +92,11 @@ rendered system.md + "\n\n" + thinking.md
 ```
 
 即只追加一份同 locale 的思考要求，并固定使用两个 LF。装配后的完整 system message 参与
-translation state，并随每个 TaskBlock 完整发送；Profile 的字符预算只约束最终 user
-message。切换 locale、切换 `thinking_output`，或修改本轮实际读取的任一资源，都会使依赖
-旧 Prompt 的受影响译文不再 Current，但 system message 的字符数不计入任务切块预算。
-关闭时没有读取 `thinking.md`，因此它的变化不会影响该模式的 system message 或 state。
+translation state，并随每个 TaskBlock 完整发送；Profile 的字符装箱目标只参与最终 user
+message 中完整文本组的 TaskBlock 分组。切换 locale、切换 `thinking_output`，或修改本轮
+实际读取的任一资源，都会使依赖旧 Prompt 的受影响译文不再 Current，但 system message
+的字符数不参与该目标计算。关闭时没有读取 `thinking.md`，因此它的变化不会影响该模式的
+system message 或 state。
 
 所有 `system.md` 都必须把裸 JSON 规定为默认响应；只有 system message 末尾实际存在
 `thinking.md` 的“思考输出要求”时，才允许先输出该片段规定的内容。无论使用哪种模式，

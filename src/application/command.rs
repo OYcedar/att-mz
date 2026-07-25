@@ -4593,7 +4593,7 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             source_language,
         ));
         let planning = RpgMakerTranslationPlanningConfiguration::new(
-            profile_configuration.max_task_user_message_characters(),
+            profile_configuration.target_task_user_message_characters(),
         );
         let profile = Arc::new(RpgMakerTranslationProfile::new(
             profile_configuration.id(),

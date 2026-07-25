@@ -113,10 +113,12 @@ Reader 只接受 Extract 已验证的顺序：owner 固定 Builtin、Rules、Lua
 
 ## 5. 任务规划与模型消息
 
-Planner 先保持最大相关组，再按 Profile 的最终 user message Unicode 字符预算切
-TaskBlock。预算计算实际命中术语、活动 ID、标签、上下文、正文、Markdown 转义与换行；
-system Prompt 随每个任务完整发送，但其字符数不计入预算。单组生成的最终 user message
-超过预算时明确失败，不切碎。活动单元从 1 连续编号。
+Planner 先保持最大相关组，再按 Profile 的最终 user message Unicode 字符装箱目标切
+TaskBlock。目标计算实际命中术语、活动 ID、标签、上下文、正文、Markdown 转义与换行；
+system Prompt 随每个任务完整发送，但其字符数不参与装箱。加入下一个完整组会超过目标
+时，只在组边界开始下一任务；单组生成的最终 user message 本身超过目标时，该组独立
+成为一个任务，实际字符数允许超过目标，翻译继续。后续任务仍使用原目标，不拆组、不
+拒绝规范内容，也不把该目标解释为 Provider 容量上限。活动单元从 1 连续编号。
 
 user message 是最小 Markdown 载荷，只包含实际命中术语、活动 ID、自然语言角色、必要
 形状约束和直接有用的无编号上下文。owner、路径、内部 kind、传播目标、去重原因和空区

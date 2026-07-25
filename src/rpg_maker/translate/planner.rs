@@ -169,7 +169,7 @@ where
             source_language,
             global_semantics,
         ));
-        let max_user_message_characters = planning.max_user_message_characters().get();
+        let target_user_message_characters = planning.target_user_message_characters().get();
         let scope_semantics = Arc::clone(&semantics);
         let preprocessed_scopes = self
             .cpu
@@ -258,15 +258,11 @@ where
         let planned_scopes = self
             .cpu
             .execute_ordered_map(scopes, move |scope| {
-                let scope_name = scope.key.clone();
-                (
-                    scope_name,
-                    build_scope_tasks(
-                        scope,
-                        Arc::clone(&scope_terminology_prompt),
-                        scope_system_markdown.as_str(),
-                        max_user_message_characters,
-                    ),
+                build_scope_tasks(
+                    scope,
+                    Arc::clone(&scope_terminology_prompt),
+                    scope_system_markdown.as_str(),
+                    target_user_message_characters,
                 )
             })
             .await
@@ -275,14 +271,9 @@ where
         let tasks = self
             .cpu
             .execute(move || {
-                let mut unindexed_tasks = Vec::new();
-                for (scope, result) in planned_scopes {
-                    unindexed_tasks.extend(
-                        result.map_err(|source| ScopeTaskFinalizationFailure { scope, source })?,
-                    );
-                }
-                let tasks = unindexed_tasks
+                planned_scopes
                     .into_iter()
+                    .flatten()
                     .enumerate()
                     .map(|(index, task)| {
                         task.with_index(
@@ -290,17 +281,10 @@ where
                             task_language_pair.clone(),
                         )
                     })
-                    .collect::<Vec<_>>();
-                Ok::<_, ScopeTaskFinalizationFailure>(tasks)
+                    .collect::<Vec<_>>()
             })
             .await
-            .map_err(RpgMakerStandardTranslationTaskPlanningError::FinalizePlanCompute)?
-            .map_err(
-                |failure| RpgMakerStandardTranslationTaskPlanningError::InvalidScope {
-                    scope: failure.scope,
-                    source: failure.source,
-                },
-            )?;
+            .map_err(RpgMakerStandardTranslationTaskPlanningError::FinalizePlanCompute)?;
 
         Ok(StandardTranslationPlan::new(
             Arc::clone(&semantics),
@@ -438,7 +422,6 @@ fn first_array_index(group: &StandardTranslationGroup) -> Result<usize, CorpusPl
 }
 
 struct PreprocessedScope {
-    key: SemanticScopeKey,
     groups: Vec<PreprocessedGroup>,
 }
 
@@ -566,10 +549,7 @@ fn preprocess_scope(
         });
     }
     Ok(PreprocessedScopeResult {
-        scope: PreprocessedScope {
-            key: scope.key,
-            groups,
-        },
+        scope: PreprocessedScope { groups },
         planning_failures,
         invalidations,
         invalidated,
@@ -837,8 +817,8 @@ fn build_scope_tasks(
     scope: PreprocessedScope,
     terminology: Arc<TerminologyPromptIndex>,
     system_markdown: &str,
-    max_user_message_characters: usize,
-) -> Result<Vec<UnindexedTask>, ScopePlanningError> {
+    target_user_message_characters: usize,
+) -> Vec<UnindexedTask> {
     let mut prepared_groups = Vec::with_capacity(scope.groups.len());
     for group in scope.groups {
         let units = group
@@ -876,7 +856,7 @@ fn build_scope_tasks(
         prepared_groups,
         &terminology,
         system_markdown,
-        max_user_message_characters,
+        target_user_message_characters,
     )
 }
 
@@ -885,7 +865,6 @@ fn build_scope_tasks(
 /// Markdown 中只保存 ID 插入位置，切块阶段据此精确计算最终 user message 字符数；
 /// 最终任务确定后才渲染一次，从而避免任务边界上的整组克隆和重复字符串构造。
 struct PackedGroup {
-    kind: TextGroupKind,
     markdown_template: String,
     task_id_offsets: Vec<usize>,
     markdown_characters_without_ids: usize,
@@ -932,7 +911,6 @@ fn prepare_group(seed: PreparedTaskGroup) -> PackedGroup {
         .count();
     if active_count == 0 {
         return PackedGroup {
-            kind: seed.kind,
             markdown_template: String::new(),
             task_id_offsets: Vec::new(),
             markdown_characters_without_ids: 0,
@@ -995,7 +973,6 @@ fn prepare_group(seed: PreparedTaskGroup) -> PackedGroup {
 
     let markdown_characters_without_ids = markdown.chars().count();
     PackedGroup {
-        kind: seed.kind,
         markdown_template: markdown,
         task_id_offsets,
         markdown_characters_without_ids,
@@ -1277,8 +1254,8 @@ fn pack_scope(
     groups: Vec<PreparedTaskGroup>,
     terminology: &TerminologyPromptIndex,
     system_markdown: &str,
-    max_user_message_characters: usize,
-) -> Result<Vec<UnindexedTask>, ScopePlanningError> {
+    target_user_message_characters: usize,
+) -> Vec<UnindexedTask> {
     let mut tasks = Vec::new();
     let mut current_groups = Vec::<PackedGroup>::new();
     let mut current_active = 0usize;
@@ -1300,7 +1277,7 @@ fn pack_scope(
             additional_term_characters,
             packed.markdown_characters(current_active + 1),
         );
-        if candidate_user_message_characters <= max_user_message_characters {
+        if candidate_user_message_characters <= target_user_message_characters {
             current_active += packed.active_count();
             current_terms.extend(packed.triggered_terms.iter().copied());
             current_user_message_characters = candidate_user_message_characters;
@@ -1318,9 +1295,7 @@ fn pack_scope(
         } else {
             current_groups.clear();
         }
-        current_active = 0;
         current_terms.clear();
-        current_user_message_characters = 0;
 
         let (term_count, term_characters) =
             additional_terminology_size(&packed.triggered_terms, &current_terms, terminology);
@@ -1332,20 +1307,23 @@ fn pack_scope(
             term_characters,
             packed.markdown_characters(1),
         );
-        if group_user_message_characters > max_user_message_characters {
-            if packed.active_count() > 0 {
-                return Err(ScopePlanningError::GroupExceedsUserMessageCapacity {
-                    group_kind: human_group_kind(packed.kind),
-                    actual_user_message_characters: group_user_message_characters,
-                    maximum_user_message_characters: max_user_message_characters,
-                });
-            }
-            continue;
-        }
         current_active = packed.active_count();
         current_terms.extend(packed.triggered_terms.iter().copied());
         current_user_message_characters = group_user_message_characters;
         current_groups.push(packed);
+        if current_user_message_characters > target_user_message_characters {
+            // 完整语义组可以自然超过装箱目标。立即完成可确保它独占任务，并让下一组
+            // 继续使用原目标；不能把本次实际长度反向提升为后续任务的新目标。
+            tasks.push(finalize_task(
+                std::mem::take(&mut current_groups),
+                terminology,
+                &current_terms,
+                system_markdown,
+            ));
+            current_active = 0;
+            current_terms.clear();
+            current_user_message_characters = 0;
+        }
     }
 
     if current_active > 0 {
@@ -1356,7 +1334,7 @@ fn pack_scope(
             system_markdown,
         ));
     }
-    Ok(tasks)
+    tasks
 }
 
 fn additional_terminology_size(
@@ -1550,11 +1528,6 @@ enum GlobalPreparationFailure {
     InvalidDeduplication(TranslationDeduplicationError),
 }
 
-struct ScopeTaskFinalizationFailure {
-    scope: SemanticScopeKey,
-    source: ScopePlanningError,
-}
-
 #[derive(Debug)]
 pub(crate) enum RpgMakerStandardTranslationTaskPlanningError<R, C> {
     ResolvedLanguagePairMismatch {
@@ -1576,10 +1549,6 @@ pub(crate) enum RpgMakerStandardTranslationTaskPlanningError<R, C> {
     DeduplicateCompute(CpuTaskExecutionError<C>),
     InvalidDeduplication(TranslationDeduplicationError),
     PlanScopesCompute(CpuTaskExecutionError<C>),
-    InvalidScope {
-        scope: SemanticScopeKey,
-        source: ScopePlanningError,
-    },
     FinalizePlanCompute(CpuTaskExecutionError<C>),
 }
 
@@ -1621,9 +1590,6 @@ impl<R: fmt::Display, C: fmt::Display> fmt::Display
             Self::PlanScopesCompute(source) => {
                 write!(formatter, "无法调度语义范围的并行任务规划：{source}")
             }
-            Self::InvalidScope { scope, source } => {
-                write!(formatter, "语义范围 {scope} 无法建立任务：{source}")
-            }
             Self::FinalizePlanCompute(source) => {
                 write!(formatter, "无法调度翻译任务最终编号：{source}")
             }
@@ -1646,7 +1612,6 @@ impl<R: Error + 'static, C: Error + 'static> Error
             Self::DeduplicateCompute(source) => Some(source),
             Self::InvalidDeduplication(source) => Some(source),
             Self::PlanScopesCompute(source) => Some(source),
-            Self::InvalidScope { source, .. } => Some(source),
             Self::FinalizePlanCompute(source) => Some(source),
             Self::ResolvedLanguagePairMismatch { .. } => None,
         }
@@ -1755,31 +1720,6 @@ where
             Self::PlanScopesCompute(source) => {
                 planning_cpu_diagnostic(source, stage, impact, "plan_translation_scopes", None)
             }
-            Self::InvalidScope {
-                scope,
-                source:
-                    ScopePlanningError::GroupExceedsUserMessageCapacity {
-                        group_kind,
-                        actual_user_message_characters,
-                        maximum_user_message_characters,
-                    },
-            } => SafeDiagnostic::new(
-                DiagnosticCode::ConfigurationInvalidValue,
-                stage,
-                DiagnosticSubject::field(
-                    "rpg_maker.translation_profiles.max_task_user_message_characters",
-                ),
-                DiagnosticReason::Resource {
-                    resource: format!(
-                        "indivisible_group_user_message_characters; scope={}; group_kind={group_kind}",
-                        safe_scope_label(scope)
-                    ),
-                    actual: usize_as_u64(*actual_user_message_characters),
-                    maximum: Some(usize_as_u64(*maximum_user_message_characters)),
-                },
-                impact,
-                DiagnosticAction::FixConfiguration,
-            ),
             Self::FinalizePlanCompute(source) => planning_cpu_diagnostic(
                 source,
                 stage,
@@ -2328,38 +2268,6 @@ impl Error for ScopePreprocessingError {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum ScopePlanningError {
-    GroupExceedsUserMessageCapacity {
-        group_kind: &'static str,
-        actual_user_message_characters: usize,
-        maximum_user_message_characters: usize,
-    },
-}
-
-impl fmt::Display for ScopePlanningError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::GroupExceedsUserMessageCapacity {
-                group_kind,
-                actual_user_message_characters,
-                maximum_user_message_characters,
-            } => write!(
-                formatter,
-                "不可拆的 {group_kind} 生成的 user message 包含 {actual_user_message_characters} 个 Unicode 字符，超过配置上限 {maximum_user_message_characters}"
-            ),
-        }
-    }
-}
-
-impl Error for ScopePlanningError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::GroupExceedsUserMessageCapacity { .. } => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2494,7 +2402,7 @@ mod tests {
     }
 
     #[test]
-    fn planning_diagnostic_distinguishes_cpu_cancellation_and_group_user_message_capacity() {
+    fn planning_diagnostic_preserves_cpu_cancellation() {
         let cancelled: ProductionPlanningError =
             RpgMakerStandardTranslationTaskPlanningError::PrepareCorpusCompute(
                 CpuTaskExecutionError::Cancelled,
@@ -2510,32 +2418,6 @@ mod tests {
                 failure: DiagnosticFailureKind::LockCancelled
             }
         ));
-
-        let capacity: ProductionPlanningError =
-            RpgMakerStandardTranslationTaskPlanningError::InvalidScope {
-                scope: SemanticScopeKey::Map(MapId::new(12).expect("map id 应有效")),
-                source: ScopePlanningError::GroupExceedsUserMessageCapacity {
-                    group_kind: "Dialogue",
-                    actual_user_message_characters: 24_001,
-                    maximum_user_message_characters: 24_000,
-                },
-            };
-        let capacity = capacity.safe_diagnostic_source(
-            DiagnosticStage::Translate,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixConfiguration,
-        );
-        assert_eq!(
-            capacity.reason,
-            DiagnosticReason::Resource {
-                resource:
-                    "indivisible_group_user_message_characters; scope=Map012; group_kind=Dialogue"
-                        .to_owned(),
-                actual: 24_001,
-                maximum: Some(24_000),
-            }
-        );
-        assert_eq!(capacity.action, DiagnosticAction::FixConfiguration);
     }
 
     #[test]
@@ -2673,9 +2555,9 @@ mod tests {
         translation_resources_for("ja", "zh-Hans")
     }
 
-    fn profile(max_user_message_characters: usize) -> Arc<RpgMakerTranslationProfile<()>> {
+    fn profile(target_user_message_characters: usize) -> Arc<RpgMakerTranslationProfile<()>> {
         let planning = RpgMakerTranslationPlanningConfiguration::new(
-            NonZeroUsize::new(max_user_message_characters).expect("测试容量必须非零"),
+            NonZeroUsize::new(target_user_message_characters).expect("测试目标必须非零"),
         );
         Arc::new(RpgMakerTranslationProfile::new(
             "test",
@@ -3513,7 +3395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_maps_are_independent_semantic_scopes_even_with_large_capacity() {
+    async fn whole_maps_are_independent_semantic_scopes_even_with_large_target() {
         let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
             translation_resources(),
@@ -4161,7 +4043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_message_capacity_splits_only_between_groups_inside_the_same_scope() {
+    async fn user_message_target_splits_only_between_groups_inside_the_same_scope() {
         let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
             translation_resources(),
@@ -4211,7 +4093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_prompt_is_independent_from_exact_user_message_capacity() {
+    async fn system_prompt_is_independent_from_exact_user_message_target() {
         let system_markdown = format!("# System\n{}", "固定规则。".repeat(200));
         let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
             EmptyResources,
@@ -4234,7 +4116,7 @@ mod tests {
                 StandardTranslationInput::new(None, None),
             )
             .await
-            .expect("宽松 user message 预算应该规划成功")
+            .expect("宽松 user message 目标应该规划成功")
             .into_parts();
         let exact_user_message_characters = user_message(&planned[0]).chars().count();
         assert!(system_markdown.chars().count() > exact_user_message_characters);
@@ -4247,7 +4129,7 @@ mod tests {
                 StandardTranslationInput::new(None, None),
             )
             .await
-            .expect("system Prompt 不应占用 user message 预算")
+            .expect("system Prompt 不应占用 user message 目标")
             .into_parts();
         assert_eq!(bounded.len(), 1);
         assert_eq!(
@@ -4255,7 +4137,7 @@ mod tests {
             exact_user_message_characters
         );
 
-        let error = planner
+        let (_, _, oversized) = planner
             .plan(
                 &project(),
                 &profile(exact_user_message_characters - 1),
@@ -4263,20 +4145,91 @@ mod tests {
                 StandardTranslationInput::new(None, None),
             )
             .await
-            .expect_err("单组最终 user message 超过预算时必须失败");
-        assert!(matches!(
-            error,
-            RpgMakerStandardTranslationTaskPlanningError::InvalidScope {
-                source:
-                    ScopePlanningError::GroupExceedsUserMessageCapacity {
-                        actual_user_message_characters,
-                        maximum_user_message_characters,
-                        ..
-                    },
-                ..
-            } if actual_user_message_characters == exact_user_message_characters
-                && maximum_user_message_characters == exact_user_message_characters - 1
-        ));
+            .expect("单组最终 user message 超过目标时仍应完整规划")
+            .into_parts();
+        assert_eq!(oversized.len(), 1);
+        assert_eq!(
+            user_message(&oversized[0]).chars().count(),
+            exact_user_message_characters
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_group_is_isolated_and_later_groups_return_to_target() {
+        const TARGET_USER_MESSAGE_CHARACTERS: usize = 2_048;
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            EmptyResources,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let first_original = "あ".repeat(1_100);
+        let oversized_original = "い".repeat(4_330);
+        let third_original = "う".repeat(1_100);
+        let fourth_original = "え".repeat(1_100);
+        let first = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            1,
+            first_original.clone(),
+            None,
+            Vec::new(),
+        );
+        let oversized = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            2,
+            oversized_original.clone(),
+            None,
+            Vec::new(),
+        );
+        let third = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            3,
+            third_original.clone(),
+            None,
+            Vec::new(),
+        );
+        let fourth = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            4,
+            fourth_original.clone(),
+            None,
+            Vec::new(),
+        );
+        let (_, _, planned) = planner
+            .plan(
+                &project(),
+                &profile(TARGET_USER_MESSAGE_CHARACTERS),
+                StandardTranslationCorpus::new(vec![first, oversized, third, fourth]),
+                StandardTranslationInput::new(None, None),
+            )
+            .await
+            .expect("超目标组应该独立成块，不得阻断规划")
+            .into_parts();
+
+        assert_eq!(planned.len(), 4);
+        let user_messages = planned.iter().map(user_message).collect::<Vec<_>>();
+        assert!(user_messages[0].chars().count() <= TARGET_USER_MESSAGE_CHARACTERS);
+        assert!(user_messages[1].chars().count() > TARGET_USER_MESSAGE_CHARACTERS);
+        assert!(user_messages[2].chars().count() <= TARGET_USER_MESSAGE_CHARACTERS);
+        assert!(user_messages[3].chars().count() <= TARGET_USER_MESSAGE_CHARACTERS);
+        let expected = planned
+            .iter()
+            .map(|task| {
+                let outputs = task.expected_outputs();
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].id(), 1);
+                outputs[0].protected_text()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected,
+            [
+                first_original.as_str(),
+                oversized_original.as_str(),
+                third_original.as_str(),
+                fourth_original.as_str(),
+            ]
+        );
     }
 
     #[test]
