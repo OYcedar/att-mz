@@ -313,6 +313,9 @@ pub(crate) enum MzCommand {
     /// 把已验收译文写回游戏。
     #[command(name = "write-back")]
     WriteBack(WriteBackArguments),
+    /// 在项目上下文中执行一次可信 Lua 程序。
+    #[command(name = "lua")]
+    Lua(ProjectLuaArguments),
 }
 
 /// `att mv` 当前支持的用户意图。
@@ -330,6 +333,9 @@ pub(crate) enum MvCommand {
     /// 把已验收译文写回游戏。
     #[command(name = "write-back")]
     WriteBack(WriteBackArguments),
+    /// 在项目上下文中执行一次可信 Lua 程序。
+    #[command(name = "lua")]
+    Lua(ProjectLuaArguments),
 }
 
 #[derive(Debug, Args)]
@@ -422,6 +428,21 @@ pub(crate) struct WriteBackArguments {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct ProjectLuaArguments {
+    #[command(flatten)]
+    pub(crate) project: ProjectArguments,
+    /// 本次 Standard 人工译文验收使用的翻译 Profile ID。
+    #[arg(long, value_name = "PROFILE_ID", value_parser = parse_non_blank)]
+    pub(crate) profile: Option<String>,
+    /// 本次执行的可信 Lua 程序。
+    #[arg(value_name = "SCRIPT_LUA", value_parser = parse_non_blank_path)]
+    pub(crate) script: PathBuf,
+    /// `--` 后原样传给 Lua 全局 `arg[1..]` 的 UTF-8 参数。
+    #[arg(value_name = "ARG", last = true)]
+    pub(crate) arguments: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct ProjectArguments {
     /// RPG Maker 游戏的稳定项目名称。
     #[arg(long, value_name = "NAME")]
@@ -491,7 +512,7 @@ fn localize_command_tree(
         .disable_help_subcommand(true)
         .disable_version_flag(true);
 
-    const ARGUMENT_IDENTIFIERS: [&str; 17] = [
+    const ARGUMENT_IDENTIFIERS: [&str; 20] = [
         "config",
         "ui_language",
         "progress",
@@ -509,6 +530,9 @@ fn localize_command_tree(
         "profile_id",
         "terms",
         "placeholders",
+        "profile",
+        "script",
+        "arguments",
     ];
     for identifier in ARGUMENT_IDENTIFIERS {
         let Some(takes_values) = command
@@ -568,6 +592,9 @@ fn localized_usage_syntax(
         "translate" => {
             format!("{command_path} --config <FILE> --name <NAME> [PROFILE_ID] [{options}]")
         }
+        "lua" => format!(
+            "{command_path} --config <FILE> --name <NAME> [{options}] <SCRIPT_LUA> [-- <ARG>...]"
+        ),
         "init" | "extract" | "write-back" => {
             format!("{command_path} --config <FILE> --name <NAME> [{options}]")
         }
@@ -608,6 +635,7 @@ fn command_about(name: &str) -> UiMessage<'static> {
         "extract" => UiMessage::CliExtractAbout,
         "translate" => UiMessage::CliTranslateAbout,
         "write-back" => UiMessage::CliWriteBackAbout,
+        "lua" => UiMessage::CliProjectLuaAbout,
         _ => UiMessage::AppAbout,
     }
 }
@@ -631,6 +659,9 @@ fn argument_help(identifier: &str) -> Option<UiMessage<'static>> {
         "profile_id" => Some(UiMessage::CliProfileHelp),
         "terms" => Some(UiMessage::CliTermsHelp),
         "placeholders" => Some(UiMessage::CliPlaceholdersHelp),
+        "profile" => Some(UiMessage::CliProjectLuaProfileHelp),
+        "script" => Some(UiMessage::CliProjectLuaScriptHelp),
+        "arguments" => Some(UiMessage::CliProjectLuaArgumentsHelp),
         _ => None,
     }
 }
@@ -771,6 +802,8 @@ mod tests {
 
     use super::*;
     use crate::i18n::UiLocale;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStringExt;
 
     #[test]
     fn command_schema_is_self_consistent() {
@@ -868,6 +901,85 @@ mod tests {
             arguments.lua.as_deref(),
             Some(Path::new("scripts/translate.lua"))
         );
+    }
+
+    #[test]
+    fn project_lua_preserves_script_profile_and_delimited_arguments() {
+        let parsed = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "mz",
+            "lua",
+            "--name",
+            "demo",
+            "--profile",
+            "Profile-A",
+            "scripts/manual.lua",
+            "--",
+            "--replace",
+            "值",
+        ])
+        .expect("项目 Lua 参数应合法");
+
+        let MzCommand::Lua(arguments) = expect_mz(parsed.product) else {
+            panic!("应解析为项目 Lua 命令");
+        };
+        assert_eq!(arguments.project.name.as_str(), "demo");
+        assert_eq!(arguments.profile.as_deref(), Some("Profile-A"));
+        assert_eq!(arguments.script.as_path(), Path::new("scripts/manual.lua"));
+        assert_eq!(arguments.arguments, ["--replace", "值"]);
+    }
+
+    #[test]
+    fn project_lua_requires_a_script_and_delimits_script_arguments() {
+        let missing_script = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "mv",
+            "lua",
+            "--name",
+            "demo",
+        ])
+        .expect_err("项目 Lua 必须提供脚本");
+        assert_eq!(missing_script.kind(), ErrorKind::MissingRequiredArgument);
+
+        let unexpected_argument = AttArguments::try_parse_from([
+            "att",
+            "--config",
+            "config.toml",
+            "mv",
+            "lua",
+            "--name",
+            "demo",
+            "script.lua",
+            "argument-without-delimiter",
+        ])
+        .expect_err("脚本参数必须位于 -- 之后");
+        assert_eq!(unexpected_argument.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_lua_rejects_non_utf8_delimited_arguments_before_execution() {
+        let invalid_argument = OsString::from_wide(&[0xD800]);
+        let arguments = [
+            OsString::from("att"),
+            OsString::from("--config"),
+            OsString::from("config.toml"),
+            OsString::from("mz"),
+            OsString::from("lua"),
+            OsString::from("--name"),
+            OsString::from("demo"),
+            OsString::from("script.lua"),
+            OsString::from("--"),
+            invalid_argument,
+        ];
+
+        let error = AttArguments::try_parse_localized_from(arguments)
+            .expect_err("项目 Lua 参数不能无损表示为 UTF-8 时必须在执行前失败");
+        assert_eq!(error.kind(), ErrorKind::InvalidUtf8);
     }
 
     #[test]
@@ -1149,8 +1261,8 @@ mod tests {
     }
 
     #[test]
-    fn mv_exposes_the_four_stage_command_domain() {
-        for command in ["init", "extract", "translate", "write-back"] {
+    fn mv_exposes_all_project_command_domains() {
+        for command in ["init", "extract", "translate", "write-back", "lua"] {
             let mut arguments = vec![
                 "att",
                 "--config",
@@ -1165,9 +1277,10 @@ mod tests {
                 "extract" => arguments.push("--builtin"),
                 "translate" => arguments.push("profile"),
                 "write-back" => {}
+                "lua" => arguments.push("script.lua"),
                 _ => unreachable!(),
             }
-            let parsed = AttArguments::try_parse_from(arguments).expect("MV 四阶段参数应合法");
+            let parsed = AttArguments::try_parse_from(arguments).expect("MV 项目命令参数应合法");
             assert!(matches!(parsed.product, ProductCommand::Mv { .. }));
         }
     }

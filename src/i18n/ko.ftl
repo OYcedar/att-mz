@@ -8,6 +8,7 @@ cli-init-about = 이름이 지정된 게임 프로젝트 초기화 또는 업데
 cli-extract-about = 명시적 또는 저장된 owner 계획으로 원문 추출
 cli-translate-about = 명시적 또는 저장된 Profile로 추출된 원문 번역
 cli-write-back-about = 승인된 번역을 게임에 다시 쓰기
+cli-project-lua-about = 프로젝트 컨텍스트에서 신뢰할 수 있는 Lua 프로그램을 한 번 실행
 cli-project-name-help = 안정적인 프로젝트 이름
 cli-init-path-help = RPG Maker 게임 루트. 기존 프로젝트는 마지막 성공 경로를 재사용할 수 있습니다
 cli-source-language-help = 원문 언어 ID
@@ -22,6 +23,9 @@ cli-lua-help = 현재 단계 Lua 프로그램 교체. 0바이트 파일은 프�
 cli-profile-help = 번역 Profile ID. 생략하면 마지막 성공 Profile을 재사용합니다
 cli-terms-help = 프로젝트 용어 리소스 교체
 cli-placeholders-help = 프로젝트 Placeholder 리소스 교체
+cli-project-lua-profile-help = Standard 수동 승인용 Profile. 생략하면 Standard를 열 때 마지막으로 성공한 Translate Profile을 재사용합니다
+cli-project-lua-script-help = 한 번 실행할 신뢰할 수 있는 Lua 프로그램
+cli-project-lua-arguments-help = -- 뒤에서 Lua arg[1..]에 전달할 UTF-8 인수
 cli-usage-heading = 사용법:
 cli-commands-heading = 명령:
 cli-options-heading = 옵션:
@@ -102,6 +106,7 @@ progress-extract-commit = 추출 자산 커밋 중
 progress-translate-planning = 번역 작업 계획 중
 progress-translate-confirmed = 확인된 번역 작업
 progress-translate-no-work = 모델 요청이 필요하지 않음
+progress-project-lua = 프로젝트 Lua 프로그램 실행 중
 progress-write-back-read-assets = 승인된 자산 읽는 중
 progress-write-back-planning = 문서 다시 쓰기 계획 중
 progress-write-back-documents = 문서 다시 쓰기
@@ -120,6 +125,7 @@ result-translate-completed = 번역 완료: { $project }(Profile: { $profile })
 result-translate-standard = 표준 번역: 작업 { $total }, 완료 { $complete }, 부분 { $partial }, 사용 불가 { $unavailable }; { $written }개 위치 기록, { $remaining }개 남음
 result-translate-convergence = 상태 수렴: 유지 { $retained }, 무효화 { $invalidated }, 해당 없음 { $not_applicable }, 재사용 { $reused }
 result-write-back-completed = 쓰기 완료: { $project }
+result-project-lua-completed = 프로젝트 Lua 실행 완료: { $project }
 result-output-directory = 출력 디렉터리: { $path }
 result-write-back-standard = 표준 쓰기: 번역 { $translated }단위, 원문 { $original }단위; 자동 줄바꿈 { $auto_wrapped }, 줄바꿈 추가 { $breaks }, 전각 들여쓰기 추가 { $indents }; 수동 배치 { $manual }
 result-lua-executed = Lua: 실행됨
@@ -166,6 +172,7 @@ diagnostic-recovery-value = { $kind ->
 diagnostic-related = 관련 오류 { $index }:
 diagnostic-stage-value = { $code ->
     [process_output] 프로세스 출력
+    [lua] 프로젝트 Lua 실행
    *[other] { $fallback }
 }
 diagnostic-impact-value = { $code ->

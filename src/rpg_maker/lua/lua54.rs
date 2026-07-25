@@ -49,12 +49,17 @@ use crate::rpg_maker::lua::runtime::{
     TrustedLuaExtractHostCalls, TrustedLuaHostCallError, TrustedLuaPhaseBindings,
     TrustedLuaPreparedTranslation, TrustedLuaPreparedTranslationAcceptance,
     TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport,
-    TrustedLuaRuntimeExecutor, TrustedLuaTranslateHostCalls, TrustedLuaWriteBackHostCalls,
+    TrustedLuaRuntimeExecutor, TrustedLuaStandardAcceptance, TrustedLuaStandardCandidate,
+    TrustedLuaStandardHostCalls, TrustedLuaStandardRejectionValue, TrustedLuaStandardSession,
+    TrustedLuaStandardUnit, TrustedLuaTranslateHostCalls, TrustedLuaWriteBackHostCalls,
     TrustedLuaWriteBackLayoutPair, TrustedLuaWriteBackLayoutRegion,
     TrustedLuaWriteBackLayoutResult,
 };
 use crate::rpg_maker::lua::{LuaPhase, LuaProjectContext, LuaSourcePath};
-use crate::rpg_maker::standard_asset::validate_standard_text_locations;
+use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
+use crate::rpg_maker::standard_asset::{
+    RpgMakerStandardAssetOwner, validate_standard_text_locations,
+};
 use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind,
 };
@@ -222,6 +227,14 @@ impl TrustedLua54Runtime {
                     .get(),
             }),
         }
+    }
+
+    /// 同步停止新任务并请求所有活动脚本合作取消。
+    ///
+    /// 该方法只发布取消事实，不等待 worker 或终结器；命令在取消等待闭包中调用后，
+    /// 仍须调用 `shutdown` 回收所有资源。
+    pub(crate) fn request_cancellation(&self) {
+        self.inner.request_shutdown();
     }
 
     /// 停止新启动，取消正在执行的脚本，并等待 worker 与唯一终结器退出。
@@ -515,7 +528,14 @@ fn execute_program(
         return WorkerOutcome::Cancelled;
     }
 
-    let context = match build_context(&lua, common, phase, tokio.clone(), cancellation.clone()) {
+    let context = match build_context(
+        &lua,
+        common,
+        phase,
+        program.main_script_path(),
+        tokio.clone(),
+        cancellation.clone(),
+    ) {
         Ok(context) => context,
         Err(error) => {
             if cancellation.is_cancelled() {
@@ -904,6 +924,7 @@ fn build_context(
     lua: &Lua,
     common: TrustedLuaCommonBindings,
     phase: TrustedLuaPhaseBindings,
+    main_script_path: &Path,
     tokio: Handle,
     cancellation: RuntimeCancellation,
 ) -> mlua::Result<Table> {
@@ -954,6 +975,13 @@ fn build_context(
                 cancellation,
                 &json_markers,
             )?;
+        }
+        TrustedLuaPhaseBindings::Project {
+            arguments,
+            standard,
+        } => {
+            install_project_context(lua, &context, standard, tokio, cancellation, &json_markers)?;
+            install_project_arguments(lua, main_script_path, arguments)?;
         }
     }
     Ok(context)
@@ -1189,6 +1217,597 @@ fn install_translate_context(
         build_translation_table(lua, Arc::clone(&calls))?,
     )?;
     context.set("llm", build_llm_function(lua, calls, tokio, cancellation)?)
+}
+
+fn install_project_context(
+    lua: &Lua,
+    context: &Table,
+    calls: Arc<dyn TrustedLuaStandardHostCalls>,
+    tokio: Handle,
+    cancellation: RuntimeCancellation,
+    json_markers: &Table,
+) -> mlua::Result<()> {
+    let standard = lua.create_table()?;
+    let markers = json_markers.clone();
+    let native = lua.create_function(move |lua, ()| {
+        let result = wait_for_host(&tokio, &cancellation, calls.open())
+            .map_err(|error| error.with_operation("standard.open"));
+        host_result_to_lua(lua, result, |lua, session| {
+            lua.create_userdata(LuaStandardSession {
+                identity: Arc::new(()),
+                session,
+                tokio: tokio.clone(),
+                cancellation: cancellation.clone(),
+                markers: markers.clone(),
+            })
+            .map(Value::UserData)
+        })
+    })?;
+    standard.set("open", checked_host_function(lua, native)?)?;
+    context.set("standard", standard)
+}
+
+fn install_project_arguments(
+    lua: &Lua,
+    main_script_path: &Path,
+    arguments: Vec<String>,
+) -> mlua::Result<()> {
+    let values = lua.create_table()?;
+    values.raw_set(0, strict_path(main_script_path)?)?;
+    for (index, value) in arguments.into_iter().enumerate() {
+        values.raw_set(index + 1, value)?;
+    }
+    lua.globals().set("arg", values)
+}
+
+struct LuaStandardSession {
+    identity: Arc<()>,
+    session: Arc<dyn TrustedLuaStandardSession>,
+    tokio: Handle,
+    cancellation: RuntimeCancellation,
+    markers: Table,
+}
+
+impl UserData for LuaStandardSession {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("units", |lua, this| {
+            let identity = Arc::clone(&this.identity);
+            let markers = this.markers.clone();
+            let session = Arc::clone(&this.session);
+            let native = lua.create_function(move |lua, _session: Value| {
+                let identity = Arc::clone(&identity);
+                let markers = markers.clone();
+                let mut units = session.units().into_iter();
+                let iterator = lua.create_function_mut(move |lua, _arguments: MultiValue| {
+                    let Some(unit) = units.next() else {
+                        return Ok(Value::Nil);
+                    };
+                    lua.create_userdata(LuaStandardUnit {
+                        identity: Arc::clone(&identity),
+                        unit,
+                        markers: markers.clone(),
+                    })
+                    .map(Value::UserData)
+                })?;
+                Ok(MultiValue::from_vec(vec![
+                    Value::Boolean(true),
+                    Value::Function(iterator),
+                ]))
+            })?;
+            checked_host_function(lua, native)
+        });
+
+        fields.add_field_method_get("get", |lua, this| {
+            let identity = Arc::clone(&this.identity);
+            let session = Arc::clone(&this.session);
+            let markers = this.markers.clone();
+            let native = lua.create_function(
+                move |lua,
+                      (_session, owner, location, role): (Value, Value, Value, Value)| {
+                    let result = parse_standard_owner(owner)
+                        .and_then(|owner| {
+                            let Value::UserData(location) = location else {
+                                return Err(standard_argument_error(format!(
+                                    "Standard group_location 必须是 RpgMakerLocation userdata，实际为 {}",
+                                    location.type_name()
+                                )));
+                            };
+                            if !location.is::<LuaRpgMakerLocation>() {
+                                return Err(standard_argument_error(
+                                    "Standard group_location 只接受 Rust 建立的 RpgMakerLocation"
+                                        .to_owned(),
+                                ));
+                            }
+                            let location = location
+                                .borrow::<LuaRpgMakerLocation>()
+                                .map(|location| location.0.clone())
+                                .map_err(binding_error)?;
+                            let role = parse_standard_role(role)?;
+                            Ok(session.get(owner, location, role))
+                        })
+                        .map_err(|error| error.with_operation("standard.get"));
+                    host_result_to_lua(lua, result, |lua, unit| match unit {
+                        Some(unit) => lua
+                            .create_userdata(LuaStandardUnit {
+                                identity: Arc::clone(&identity),
+                                unit,
+                                markers: markers.clone(),
+                            })
+                            .map(Value::UserData),
+                        None => Ok(Value::Nil),
+                    })
+                },
+            )?;
+            checked_host_function(lua, native)
+        });
+
+        fields.add_field_method_get("accept", |lua, this| {
+            let identity = Arc::clone(&this.identity);
+            let session = Arc::clone(&this.session);
+            let tokio = this.tokio.clone();
+            let cancellation = this.cancellation.clone();
+            let markers = this.markers.clone();
+            let native = lua.create_function(move |lua, (_session, batch): (Value, Value)| {
+                let candidates = parse_standard_candidate_batch(batch, &identity)
+                    .map_err(|error| error.with_operation("standard.accept"));
+                let result = match candidates {
+                    Ok(candidates) => {
+                        let expected_results = candidates.len();
+                        wait_for_output_terminal(&tokio, &cancellation, session.accept(candidates))
+                            .and_then(|results| {
+                                if results.len() == expected_results {
+                                    Ok(results)
+                                } else {
+                                    Err(TrustedLuaHostCallError::new(
+                                        "standard",
+                                        "invalid_result",
+                                        "Standard 核心返回的验收结果数量与候选数量不一致",
+                                        None,
+                                        None,
+                                    )
+                                    .with_operation("standard.accept"))
+                                }
+                            })
+                    }
+                    Err(error) => Err(error),
+                };
+                host_result_to_lua(lua, result, |lua, results| {
+                    standard_acceptances_to_lua(lua, results, &markers)
+                })
+            })?;
+            checked_host_function(lua, native)
+        });
+    }
+
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method(MetaMethod::ToString, |_lua, _this, ()| {
+            Ok("StandardSession")
+        });
+    }
+}
+
+#[derive(Clone)]
+struct LuaStandardUnit {
+    identity: Arc<()>,
+    unit: TrustedLuaStandardUnit,
+    markers: Table,
+}
+
+impl UserData for LuaStandardUnit {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("owner", |_lua, this| Ok(this.unit.owner().storage_name()));
+        fields.add_field_method_get("group_kind", |_lua, this| {
+            Ok(standard_group_kind_name(this.unit.group_kind()))
+        });
+        fields.add_field_method_get("group_location", |lua, this| {
+            lua.create_userdata(LuaRpgMakerLocation(this.unit.group_location().clone()))
+        });
+        fields.add_field_method_get("role", |lua, this| {
+            standard_role_to_lua(lua, this.unit.role(), &this.markers)
+        });
+        fields.add_field_method_get("original", |lua, this| {
+            standard_content_to_lua(lua, this.unit.original(), &this.markers)
+        });
+        fields.add_field_method_get("source_context", |lua, this| {
+            let context = decode_json(this.unit.source_context_json()).map_err(|error| {
+                mlua::Error::runtime(format!(
+                    "Standard 核心返回了无效 source_context JSON：{error}"
+                ))
+            })?;
+            lossless_json_to_lua(lua, context, &this.markers)
+        });
+        fields.add_field_method_get("translation", |lua, this| match this.unit.translation() {
+            Some(translation) => standard_content_to_lua(lua, translation, &this.markers),
+            None => Ok(Value::Nil),
+        });
+        fields.add_field_method_get("model_text", |lua, this| {
+            standard_content_to_lua(lua, this.unit.model_text(), &this.markers)
+        });
+        fields.add_field_method_get("terms", |lua, this| {
+            let terms = lua.create_table()?;
+            for (index, term) in this.unit.terms().iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set("term", term.term())?;
+                entry.set("translation", term.translation())?;
+                mark_json_table(&this.markers, &entry, JsonContainerKind::Object)?;
+                terms.raw_set(index + 1, entry)?;
+            }
+            mark_json_table(&this.markers, &terms, JsonContainerKind::Array)?;
+            Ok(terms)
+        });
+        fields.add_field_method_get("content_kind", |_lua, this| {
+            Ok(this.unit.content_kind().as_str())
+        });
+        fields.add_field_method_get("line_policy", |_lua, this| {
+            Ok(this.unit.line_policy().as_str())
+        });
+        fields.add_field_method_get("expected_line_count", |_lua, this| {
+            this.unit
+                .line_policy()
+                .expected_line_count()
+                .map(usize_to_lua_integer)
+                .transpose()
+        });
+        fields.add_field_method_get("status", |_lua, this| Ok(this.unit.status().as_str()));
+        fields.add_field_method_get("family_size", |_lua, this| {
+            usize_to_lua_integer(this.unit.family_size())
+        });
+    }
+
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method(MetaMethod::ToString, |_lua, this, ()| {
+            Ok(format!(
+                "StandardUnit({}/{}/{})",
+                this.unit.owner().storage_name(),
+                this.unit.group_location(),
+                standard_role_name(this.unit.role())
+            ))
+        });
+    }
+}
+
+fn parse_standard_owner(
+    value: Value,
+) -> Result<RpgMakerStandardAssetOwner, TrustedLuaHostCallError> {
+    let Value::String(value) = value else {
+        return Err(standard_argument_error(format!(
+            "Standard owner 必须是字符串，实际为 {}",
+            value.type_name()
+        )));
+    };
+    let value = lua_string_to_text(&value, "Standard owner").map_err(binding_error)?;
+    RpgMakerStandardAssetOwner::from_storage_name(&value).ok_or_else(|| {
+        standard_argument_error(format!(
+            "Standard owner 无效：{value}，只接受 builtin、rules 或 lua"
+        ))
+    })
+}
+
+fn parse_standard_role(value: Value) -> Result<TextUnitRole, TrustedLuaHostCallError> {
+    let Value::Table(role) = value else {
+        return Err(standard_argument_error(format!(
+            "Standard role 必须是 table，实际为 {}",
+            value.type_name()
+        )));
+    };
+    let kind = role
+        .raw_get::<Value>("kind")
+        .map_err(binding_error)
+        .and_then(|kind| match kind {
+            Value::String(kind) => {
+                lua_string_to_text(&kind, "Standard role.kind").map_err(binding_error)
+            }
+            kind => Err(standard_argument_error(format!(
+                "Standard role.kind 必须是字符串，实际为 {}",
+                kind.type_name()
+            ))),
+        })?;
+    match kind.as_str() {
+        "scalar" => {
+            ensure_exact_string_keys(&role, &["kind", "field"]).map_err(binding_error)?;
+            let field = role
+                .raw_get::<Value>("field")
+                .map_err(binding_error)
+                .and_then(|field| match field {
+                    Value::String(field) => {
+                        lua_string_to_text(&field, "Standard role.field").map_err(binding_error)
+                    }
+                    field => Err(standard_argument_error(format!(
+                        "Standard role.field 必须是字符串，实际为 {}",
+                        field.type_name()
+                    ))),
+                })?;
+            ScalarFieldKey::new(field)
+                .map(TextUnitRole::Scalar)
+                .map_err(|error| {
+                    TrustedLuaHostCallError::new(
+                        "standard",
+                        "invalid_role",
+                        error.to_string(),
+                        None,
+                        Some(Arc::new(error)),
+                    )
+                })
+        }
+        "dialogue_speaker" | "dialogue_body" | "choices" | "scrolling_text" => {
+            ensure_exact_string_keys(&role, &["kind"]).map_err(binding_error)?;
+            Ok(match kind.as_str() {
+                "dialogue_speaker" => TextUnitRole::DialogueSpeaker,
+                "dialogue_body" => TextUnitRole::DialogueBody,
+                "choices" => TextUnitRole::Choices,
+                "scrolling_text" => TextUnitRole::ScrollingText,
+                _ => unreachable!("外层 match 已限制 role kind"),
+            })
+        }
+        _ => Err(standard_argument_error(format!(
+            "Standard role.kind 无效：{kind}"
+        ))),
+    }
+}
+
+fn parse_standard_candidate_batch(
+    value: Value,
+    identity: &Arc<()>,
+) -> Result<Vec<TrustedLuaStandardCandidate>, TrustedLuaHostCallError> {
+    let Value::Table(batch) = value else {
+        return Err(standard_argument_error(format!(
+            "Standard accept batch 必须是无洞数组，实际为 {}",
+            value.type_name()
+        )));
+    };
+    let items = dense_values(batch, |_| {
+        standard_argument_error("Standard accept batch 必须是无洞数组".to_owned())
+    })?;
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| parse_standard_candidate(index, value, identity))
+        .collect()
+}
+
+fn parse_standard_candidate(
+    index: usize,
+    value: Value,
+    identity: &Arc<()>,
+) -> Result<TrustedLuaStandardCandidate, TrustedLuaHostCallError> {
+    let Value::Table(entry) = value else {
+        return Err(standard_argument_error(format!(
+            "Standard accept batch[{}] 必须是 table，实际为 {}",
+            index + 1,
+            value.type_name()
+        )));
+    };
+    ensure_standard_candidate_keys(&entry)?;
+    let unit = entry
+        .raw_get::<AnyUserData>("unit")
+        .map_err(binding_error)?;
+    let unit = unit.borrow::<LuaStandardUnit>().map_err(binding_error)?;
+    if !Arc::ptr_eq(identity, &unit.identity) {
+        return Err(TrustedLuaHostCallError::new(
+            "standard",
+            "foreign_unit",
+            format!("Standard accept batch[{}].unit 不属于当前会话", index + 1),
+            None,
+            None,
+        ));
+    }
+    let candidate = entry.raw_get::<Value>("candidate").map_err(binding_error)?;
+    let candidate = parse_standard_candidate_content(candidate, &unit.unit)?;
+    let replace_current = match entry
+        .raw_get::<Value>("replace_current")
+        .map_err(binding_error)?
+    {
+        Value::Nil => false,
+        Value::Boolean(value) => value,
+        value => {
+            return Err(standard_argument_error(format!(
+                "Standard accept batch[{}].replace_current 必须是 boolean 或 nil，实际为 {}",
+                index + 1,
+                value.type_name()
+            )));
+        }
+    };
+    Ok(TrustedLuaStandardCandidate::new(
+        unit.unit.handle(),
+        candidate,
+        replace_current,
+    ))
+}
+
+fn ensure_standard_candidate_keys(entry: &Table) -> Result<(), TrustedLuaHostCallError> {
+    let mut has_unit = false;
+    let mut has_candidate = false;
+    for pair in entry.clone().pairs::<Value, Value>() {
+        let (key, _) = pair.map_err(binding_error)?;
+        let Value::String(key) = key else {
+            return Err(standard_argument_error(
+                "Standard accept 候选字段名必须是字符串".to_owned(),
+            ));
+        };
+        let key = lua_string_to_text(&key, "Standard accept 候选字段名").map_err(binding_error)?;
+        match key.as_str() {
+            "unit" => has_unit = true,
+            "candidate" => has_candidate = true,
+            "replace_current" => {}
+            _ => {
+                return Err(standard_argument_error(format!(
+                    "Standard accept 候选包含未知字段：{key}"
+                )));
+            }
+        }
+    }
+    if !has_unit {
+        return Err(standard_argument_error(
+            "Standard accept 候选缺少字段 unit".to_owned(),
+        ));
+    }
+    if !has_candidate {
+        return Err(standard_argument_error(
+            "Standard accept 候选缺少字段 candidate".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_standard_candidate_content(
+    value: Value,
+    unit: &TrustedLuaStandardUnit,
+) -> Result<TextUnitContent, TrustedLuaHostCallError> {
+    match unit.content_kind() {
+        super::runtime::TrustedLuaStandardContentKind::Value => {
+            let Value::String(value) = value else {
+                return Err(standard_argument_error(format!(
+                    "Value 单元的 candidate 必须是 UTF-8 字符串，实际为 {}",
+                    value.type_name()
+                )));
+            };
+            lua_string_to_text(&value, "Standard Value candidate")
+                .map(TextUnitContent::Value)
+                .map_err(binding_error)
+        }
+        super::runtime::TrustedLuaStandardContentKind::Lines => {
+            let Value::Table(lines) = value else {
+                return Err(standard_argument_error(format!(
+                    "Lines 单元的 candidate 必须是无洞字符串数组，实际为 {}",
+                    value.type_name()
+                )));
+            };
+            let values = dense_values(lines, |_| {
+                standard_argument_error("Lines 单元的 candidate 必须是无洞字符串数组".to_owned())
+            })?;
+            let lines = values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| match value {
+                    Value::String(value) => lua_string_to_text(
+                        &value,
+                        &format!("Standard Lines candidate[{}]", index + 1),
+                    )
+                    .map_err(binding_error),
+                    value => Err(standard_argument_error(format!(
+                        "Standard Lines candidate[{}] 必须是 UTF-8 字符串，实际为 {}",
+                        index + 1,
+                        value.type_name()
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(TextUnitContent::Lines(lines))
+        }
+    }
+}
+
+fn standard_acceptances_to_lua(
+    lua: &Lua,
+    results: Vec<TrustedLuaStandardAcceptance>,
+    markers: &Table,
+) -> mlua::Result<Value> {
+    let output = lua.create_table()?;
+    for (index, result) in results.into_iter().enumerate() {
+        let entry = lua.create_table()?;
+        match result {
+            TrustedLuaStandardAcceptance::Accepted {
+                translation,
+                changed_locations,
+            } => {
+                entry.set("accepted", true)?;
+                entry.set(
+                    "translation",
+                    standard_content_to_lua(lua, &translation, markers)?,
+                )?;
+                entry.set(
+                    "changed_locations",
+                    usize_to_lua_integer(changed_locations)?,
+                )?;
+            }
+            TrustedLuaStandardAcceptance::Rejected { reason, details } => {
+                entry.set("accepted", false)?;
+                entry.set("reason", reason)?;
+                for detail in details {
+                    if matches!(
+                        detail.name(),
+                        "accepted" | "reason" | "translation" | "changed_locations"
+                    ) {
+                        return Err(mlua::Error::runtime(
+                            "Standard 核心返回了保留名称的拒绝详情字段",
+                        ));
+                    }
+                    let value = match detail.value() {
+                        TrustedLuaStandardRejectionValue::String(value) => {
+                            Value::String(lua.create_string(value)?)
+                        }
+                        TrustedLuaStandardRejectionValue::Integer(value) => {
+                            Value::Integer(usize_to_lua_integer(*value)?)
+                        }
+                        TrustedLuaStandardRejectionValue::Boolean(value) => Value::Boolean(*value),
+                    };
+                    entry.set(detail.name(), value)?;
+                }
+            }
+        }
+        mark_json_table(markers, &entry, JsonContainerKind::Object)?;
+        output.raw_set(index + 1, entry)?;
+    }
+    mark_json_table(markers, &output, JsonContainerKind::Array)?;
+    Ok(Value::Table(output))
+}
+
+fn standard_content_to_lua(
+    lua: &Lua,
+    content: &TextUnitContent,
+    markers: &Table,
+) -> mlua::Result<Value> {
+    match content {
+        TextUnitContent::Value(value) => Ok(Value::String(lua.create_string(value)?)),
+        TextUnitContent::Lines(lines) => {
+            let output = lua.create_table()?;
+            for (index, line) in lines.iter().enumerate() {
+                output.raw_set(index + 1, line.as_str())?;
+            }
+            mark_json_table(markers, &output, JsonContainerKind::Array)?;
+            Ok(Value::Table(output))
+        }
+    }
+}
+
+fn standard_role_to_lua(lua: &Lua, role: &TextUnitRole, markers: &Table) -> mlua::Result<Table> {
+    let output = lua.create_table()?;
+    output.set("kind", standard_role_name(role))?;
+    if let TextUnitRole::Scalar(field) = role {
+        output.set("field", field.as_str())?;
+    }
+    mark_json_table(markers, &output, JsonContainerKind::Object)?;
+    Ok(output)
+}
+
+fn standard_role_name(role: &TextUnitRole) -> &'static str {
+    match role {
+        TextUnitRole::Scalar(_) => "scalar",
+        TextUnitRole::DialogueSpeaker => "dialogue_speaker",
+        TextUnitRole::DialogueBody => "dialogue_body",
+        TextUnitRole::Choices => "choices",
+        TextUnitRole::ScrollingText => "scrolling_text",
+    }
+}
+
+fn standard_group_kind_name(kind: TextGroupKind) -> &'static str {
+    match kind {
+        TextGroupKind::DatabaseEntry => "database_entry",
+        TextGroupKind::System => "system",
+        TextGroupKind::Map => "map",
+        TextGroupKind::EventDialogue => "event_dialogue",
+        TextGroupKind::EventChoices => "event_choices",
+        TextGroupKind::EventScrollingText => "event_scrolling_text",
+        TextGroupKind::EventCommand => "event_command",
+        TextGroupKind::PluginParameter => "plugin_parameter",
+    }
+}
+
+fn usize_to_lua_integer(value: usize) -> mlua::Result<i64> {
+    i64::try_from(value).map_err(|_| mlua::Error::runtime("Standard 数量无法表示为 Lua integer"))
+}
+
+fn standard_argument_error(message: String) -> TrustedLuaHostCallError {
+    TrustedLuaHostCallError::new("standard", "invalid_argument", message, None, None)
 }
 
 fn build_translation_table(
@@ -1812,6 +2431,7 @@ fn phase_name(phase: LuaPhase) -> &'static str {
         LuaPhase::Extract => "extract",
         LuaPhase::Translate => "translate",
         LuaPhase::WriteBack => "write_back",
+        LuaPhase::Project => "lua",
     }
 }
 
@@ -3349,7 +3969,8 @@ mod tests {
     use crate::rpg_maker::lua::runtime::{
         TrustedLuaBindingFinalization, TrustedLuaBindingFinalizer, TrustedLuaExtractIntent,
         TrustedLuaOutputEntry, TrustedLuaPreparedTranslationStatus, TrustedLuaRuntimeBindings,
-        TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
+        TrustedLuaStandardLinePolicy, TrustedLuaStandardRejectionDetail,
+        TrustedLuaStandardUnitStatus, TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
     };
     use crate::rpg_maker::project::OpenedProject;
     use crate::runtime::sqlite::{
@@ -3369,6 +3990,7 @@ mod tests {
         extract_intents: Vec<TrustedLuaExtractIntent>,
         output_operations: Vec<String>,
         output_writes: Vec<(String, Vec<u8>)>,
+        standard_candidates: Vec<TrustedLuaStandardCandidate>,
         layouts: Vec<(
             TrustedLuaWriteBackLayoutRegion,
             Vec<TrustedLuaWriteBackLayoutPair>,
@@ -3532,6 +4154,14 @@ mod tests {
             Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>,
         > {
             Box::pin(async { Ok(()) })
+        }
+
+        fn transaction_active(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<bool, TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            Box::pin(async { Ok(false) })
         }
     }
 
@@ -3830,6 +4460,91 @@ mod tests {
         }
     }
 
+    struct TestStandardCalls {
+        session: Arc<TestStandardSession>,
+    }
+
+    impl TrustedLuaStandardHostCalls for TestStandardCalls {
+        fn open(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Arc<dyn TrustedLuaStandardSession>,
+                            TrustedLuaHostCallError,
+                        >,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            let session: Arc<dyn TrustedLuaStandardSession> = self.session.clone();
+            Box::pin(async move { Ok(session) })
+        }
+    }
+
+    struct TestStandardSession {
+        units: Vec<TrustedLuaStandardUnit>,
+        observations: Arc<Mutex<TestObservations>>,
+    }
+
+    impl TrustedLuaStandardSession for TestStandardSession {
+        fn units(&self) -> Vec<TrustedLuaStandardUnit> {
+            self.units.clone()
+        }
+
+        fn get(
+            &self,
+            owner: RpgMakerStandardAssetOwner,
+            group_location: RpgMakerLocation,
+            role: TextUnitRole,
+        ) -> Option<TrustedLuaStandardUnit> {
+            self.units
+                .iter()
+                .find(|unit| {
+                    unit.owner() == owner
+                        && unit.group_location() == &group_location
+                        && unit.role() == &role
+                })
+                .cloned()
+        }
+
+        fn accept(
+            &self,
+            candidates: Vec<TrustedLuaStandardCandidate>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<Vec<TrustedLuaStandardAcceptance>, TrustedLuaHostCallError>,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            self.observations
+                .lock()
+                .expect("测试观察锁不应中毒")
+                .standard_candidates = candidates.clone();
+            Box::pin(async move {
+                Ok(candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        if candidate.handle() == 0 {
+                            TrustedLuaStandardAcceptance::accepted(candidate.candidate().clone(), 2)
+                        } else {
+                            TrustedLuaStandardAcceptance::rejected(
+                                "source_residual",
+                                vec![TrustedLuaStandardRejectionDetail::new(
+                                    "line",
+                                    TrustedLuaStandardRejectionValue::Integer(2),
+                                )],
+                            )
+                        }
+                    })
+                    .collect())
+            })
+        }
+    }
+
     struct TestFinalizer {
         finalizations: Arc<Mutex<Vec<()>>>,
         completion: Option<oneshot::Sender<()>>,
@@ -4000,6 +4715,76 @@ mod tests {
         let common = common_bindings(&calls);
         let write_back: Arc<dyn TrustedLuaWriteBackHostCalls> = calls;
         TrustedLuaRuntimeBindings::write_back(common, write_back, finalizer)
+    }
+
+    fn project_bindings(
+        observations: Arc<Mutex<TestObservations>>,
+        arguments: Vec<String>,
+    ) -> TrustedLuaRuntimeBindings {
+        let calls = Arc::new(TestCalls {
+            panic_on_project: false,
+            project: test_project(),
+            observations: Arc::clone(&observations),
+            begin_error: None,
+            begin_started: None,
+            begin_gate: None,
+        });
+        let location = RpgMakerLocation::value(
+            RpgMakerSource::data(crate::rpg_maker::text::StandardDataFile::Items),
+            vec![RpgMakerLocationStep::ArrayIndex(1)],
+        );
+        let scalar_role =
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("测试字段应合法"));
+        let units = vec![
+            TrustedLuaStandardUnit::new(
+                0,
+                RpgMakerStandardAssetOwner::Builtin,
+                TextGroupKind::DatabaseEntry,
+                location,
+                scalar_role,
+                TextUnitContent::Value("药水".to_owned()),
+                "{}".to_owned(),
+                None,
+                TextUnitContent::Value("⟦PH_1⟧".to_owned()),
+                vec![TrustedLuaTranslationTerm::new("药水", "Potion")],
+                TrustedLuaStandardLinePolicy::Single,
+                TrustedLuaStandardUnitStatus::Missing,
+                2,
+            ),
+            TrustedLuaStandardUnit::new(
+                1,
+                RpgMakerStandardAssetOwner::Rules,
+                TextGroupKind::EventDialogue,
+                RpgMakerLocation::value(
+                    RpgMakerSource::map(1),
+                    vec![RpgMakerLocationStep::ObjectKey("list".to_owned())],
+                ),
+                TextUnitRole::DialogueBody,
+                TextUnitContent::Lines(vec!["第一行".to_owned(), "第二行".to_owned()]),
+                r#"{"source_speaker":"莉莉"}"#.to_owned(),
+                Some(TextUnitContent::Lines(vec!["旧译文".to_owned()])),
+                TextUnitContent::Lines(vec!["第一行".to_owned(), "第二行".to_owned()]),
+                Vec::new(),
+                TrustedLuaStandardLinePolicy::Reflow,
+                TrustedLuaStandardUnitStatus::Stale,
+                1,
+            ),
+        ];
+        let standard: Arc<dyn TrustedLuaStandardHostCalls> = Arc::new(TestStandardCalls {
+            session: Arc::new(TestStandardSession {
+                units,
+                observations,
+            }),
+        });
+        TrustedLuaRuntimeBindings::project(
+            common_bindings(&calls),
+            arguments,
+            standard,
+            Box::new(TestFinalizer {
+                finalizations: Arc::new(Mutex::new(Vec::new())),
+                completion: None,
+            }),
+        )
     }
 
     #[test]
@@ -4349,6 +5134,7 @@ assert(ctx.project.source_language == "ja")
 assert(ctx.project.target_language == "zh-Hans")
 assert(ctx.project.output_root == nil)
 assert(ctx.output == nil and ctx.write_back == nil and ctx.extract == nil)
+assert(ctx.standard == nil)
 assert(ctx.translation.system_prompt == "只输出译文")
 assert(ctx.translation.language_pair.source == "ja")
 assert(ctx.translation.language_pair.target == "zh-Hans")
@@ -4771,6 +5557,146 @@ assert(not ok and error.domain == "rpg_maker" and error.kind == "invalid_locatio
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_lua_exposes_arguments_and_standard_session_without_phase_capabilities() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let observations = Arc::new(Mutex::new(TestObservations::default()));
+        let script = r#"
+assert(ctx.phase == "lua")
+assert(ctx.extract == nil and ctx.translation == nil and ctx.llm == nil)
+assert(ctx.output == nil and ctx.write_back == nil)
+assert(type(ctx.project) == "table")
+assert(type(ctx.json) == "table")
+assert(type(ctx.source) == "table")
+assert(type(ctx.rpg_maker) == "table")
+assert(type(ctx.db) == "table")
+assert(type(ctx.standard) == "table")
+assert(arg[0] == "C:/scripts/project.lua")
+assert(arg[1] == "第一" and arg[2] == "--literal")
+
+local standard = ctx.standard.open()
+local units = {}
+for unit in standard:units() do
+  units[#units + 1] = unit
+end
+assert(#units == 2)
+
+local scalar = units[1]
+assert(scalar.owner == "builtin")
+assert(scalar.group_kind == "database_entry")
+assert(tostring(scalar.group_location) == "data/Items.json[1]")
+assert(scalar.role.kind == "scalar" and scalar.role.field == "description")
+assert(scalar.original == "药水")
+assert(ctx.json.kind(scalar.source_context) == "object")
+assert(scalar.translation == nil)
+assert(scalar.model_text == "⟦PH_1⟧")
+assert(ctx.json.kind(scalar.terms) == "array")
+assert(scalar.terms[1].term == "药水" and scalar.terms[1].translation == "Potion")
+assert(scalar.content_kind == "value")
+assert(scalar.line_policy == "single" and scalar.expected_line_count == 1)
+assert(scalar.status == "missing" and scalar.family_size == 2)
+
+local body = units[2]
+assert(body.content_kind == "lines")
+assert(body.line_policy == "reflow" and body.expected_line_count == nil)
+assert(body.status == "stale")
+assert(#body.original == 2 and body.original[2] == "第二行")
+assert(body.translation[1] == "旧译文")
+assert(body.source_context.source_speaker == "莉莉")
+
+local items = ctx.rpg_maker.open(ctx.rpg_maker.data("Items.json"))
+local selected = standard:get("builtin", items:location({1}), {
+  kind = "scalar",
+  field = "description",
+})
+assert(selected ~= nil and selected.original == "药水")
+assert(standard:get("rules", items:location({1}), {kind = "dialogue_body"}) == nil)
+
+local results = standard:accept({
+  {unit = scalar, candidate = "人工译文", replace_current = false},
+  {unit = body, candidate = {"译文一", "译文二"}, replace_current = true},
+})
+assert(#results == 2)
+assert(results[1].accepted == true)
+assert(results[1].translation == "人工译文")
+assert(results[1].changed_locations == 2)
+assert(results[2].accepted == false)
+assert(results[2].reason == "source_residual")
+assert(results[2].line == 2)
+
+local another = ctx.standard.open()
+local ok, error = pcall(another.accept, another, {
+  {unit = scalar, candidate = "不能跨会话"},
+})
+assert(not ok)
+assert(error.domain == "standard" and error.kind == "foreign_unit")
+
+ok, error = pcall(standard.accept, standard, {
+  {unit = scalar, candidate = {"不是标量"}},
+})
+assert(not ok and error.domain == "standard" and error.kind == "invalid_argument")
+ok, error = pcall(standard.accept, standard, {
+  {unit = body, candidate = "不是 Lines"},
+})
+assert(not ok and error.domain == "standard" and error.kind == "invalid_argument")
+ok, error = pcall(standard.accept, standard, {
+  {unit = body, candidate = {[1] = "第一行", [3] = "第三行"}},
+})
+assert(not ok and error.domain == "standard" and error.kind == "invalid_argument")
+
+return "ignored"
+"#;
+        let report = runtime
+            .start(
+                OwnedLuaProgram::new(
+                    PathBuf::from("C:/scripts/project.lua"),
+                    script.as_bytes().to_vec(),
+                ),
+                project_bindings(
+                    Arc::clone(&observations),
+                    vec!["第一".to_owned(), "--literal".to_owned()],
+                ),
+            )
+            .await;
+        let (execution, finalization) = report.into_parts();
+        execution.expect("独立项目 Lua 应执行成功");
+        finalization.expect("独立项目 Lua 应完成唯一终结");
+        {
+            let observation_guard = observations.lock().expect("测试观察锁不应中毒");
+            let candidates = &observation_guard.standard_candidates;
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(
+                candidates[0].candidate(),
+                &TextUnitContent::Value("人工译文".to_owned())
+            );
+            assert!(!candidates[0].replace_current());
+            assert_eq!(
+                candidates[1].candidate(),
+                &TextUnitContent::Lines(vec!["译文一".to_owned(), "译文二".to_owned()])
+            );
+            assert!(candidates[1].replace_current());
+        }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_project_lua_program_succeeds() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let report = runtime
+            .start(
+                OwnedLuaProgram::new(PathBuf::from("C:/scripts/empty.lua"), Vec::new()),
+                project_bindings(
+                    Arc::new(Mutex::new(TestObservations::default())),
+                    Vec::new(),
+                ),
+            )
+            .await;
+        let (execution, finalization) = report.into_parts();
+        execution.expect("零字节 Lua 是合法空程序");
+        finalization.expect("零字节 Lua 也必须完成唯一终结");
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pcall_receives_typed_host_error_and_unhandled_error_is_binding_failure() {
         let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
         let host_error =
@@ -5071,7 +5997,7 @@ assert(error.kind == "invalid_value")
         let extract = runtime.start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/extract.lua"),
-                    b"assert(ctx.phase == 'extract'); assert(ctx.llm == nil); assert(ctx.translation == nil); assert(ctx.output == nil); assert(ctx.write_back == nil); assert(ctx.project.output_root == nil); assert(type(ctx.source) == 'table'); assert(type(ctx.rpg_maker) == 'table')".to_vec(),
+                    b"assert(ctx.phase == 'extract'); assert(ctx.llm == nil); assert(ctx.translation == nil); assert(ctx.output == nil); assert(ctx.write_back == nil); assert(ctx.standard == nil); assert(ctx.project.output_root == nil); assert(type(ctx.source) == 'table'); assert(type(ctx.rpg_maker) == 'table')".to_vec(),
                 ),
                 extract_bindings(
                     extract_calls,
@@ -5115,6 +6041,7 @@ assert(error.kind == "invalid_value")
                     r#"
 assert(ctx.phase == 'write_back')
 assert(ctx.llm == nil and ctx.translation == nil and ctx.extract == nil)
+assert(ctx.standard == nil)
 assert(ctx.project.output_root == 'C:/projects/demo/write_back')
 assert(type(ctx.source) == 'table' and type(ctx.rpg_maker) == 'table')
 assert(type(ctx.output) == 'table' and type(ctx.write_back) == 'table')
@@ -5663,6 +6590,20 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
                     .map_err(documented_example_database_error)
             })
         }
+
+        fn transaction_active(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<bool, TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            let operations = Arc::clone(&self.operations);
+            Box::pin(async move {
+                operations
+                    .transaction_active()
+                    .await
+                    .map_err(documented_example_database_error)
+            })
+        }
     }
 
     fn documented_example_database_error<E>(
@@ -5975,6 +6916,9 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
             "lua-complex-protocol.lua" => {
                 include_str!("../../../docs/rpg-maker/examples/lua-complex-protocol.lua")
             }
+            "lua-accept-standard.lua" => {
+                include_str!("../../../docs/rpg-maker/examples/lua-accept-standard.lua")
+            }
             other => panic!("未知文档 Lua 示例：{other}"),
         }
     }
@@ -5993,13 +6937,15 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
             crate::rpg_maker::project::test_layout_profile(),
         );
         match phase {
-            LuaPhase::Extract | LuaPhase::Translate => LuaProjectContext::for_frozen_source(
-                opened.name().as_str(),
-                opened.layout().rpg_maker_layout().engine(),
-                opened.source_root().to_path_buf(),
-                opened.database_path().to_path_buf(),
-                opened.language_pair().clone(),
-            ),
+            LuaPhase::Extract | LuaPhase::Translate | LuaPhase::Project => {
+                LuaProjectContext::for_frozen_source(
+                    opened.name().as_str(),
+                    opened.layout().rpg_maker_layout().engine(),
+                    opened.source_root().to_path_buf(),
+                    opened.database_path().to_path_buf(),
+                    opened.language_pair().clone(),
+                )
+            }
             LuaPhase::WriteBack => LuaProjectContext::for_write_back_candidate(
                 opened.name().as_str(),
                 opened.layout().rpg_maker_layout().engine(),
@@ -6057,6 +7003,9 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
                 let phase_calls: Arc<dyn TrustedLuaWriteBackHostCalls> = calls;
                 TrustedLuaRuntimeBindings::write_back(common, phase_calls, finalizer)
             }
+            LuaPhase::Project => {
+                panic!("独立项目 Lua 文档示例使用专门的 Standard fixture")
+            }
         };
         let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("docs/rpg-maker/examples")
@@ -6087,6 +7036,37 @@ pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> 
 
     fn empty_documented_outputs() -> Arc<Mutex<HashMap<String, Vec<u8>>>> {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn documented_standard_candidate_example_executes_in_the_real_vm() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let observations = Arc::new(Mutex::new(TestObservations::default()));
+        let script_name = "lua-accept-standard.lua";
+        let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/rpg-maker/examples")
+            .join(script_name);
+        let report = runtime
+            .start(
+                OwnedLuaProgram::new(
+                    script_path,
+                    documented_example_source(script_name).as_bytes().to_vec(),
+                ),
+                project_bindings(Arc::clone(&observations), Vec::new()),
+            )
+            .await;
+        let (execution, finalization) = report.into_parts();
+        execution.expect("Standard 人工验收文档示例应由真实 Lua VM 执行成功");
+        finalization.expect("Standard 人工验收文档示例应完成唯一终结");
+        {
+            let observations = observations.lock().expect("测试观察锁不应中毒");
+            assert_eq!(observations.standard_candidates.len(), 1);
+            assert_eq!(
+                observations.standard_candidates[0].candidate(),
+                &TextUnitContent::Value("人工译文".to_owned())
+            );
+        }
+        runtime.shutdown().await.expect("Lua Runtime 应关闭");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -77,23 +77,33 @@ impl<R, C, L> RpgMakerStandardTranslationTaskPlanningService<R, C, L> {
     }
 }
 
-impl<R, C, L> StandardTranslationTaskPlanner
-    for RpgMakerStandardTranslationTaskPlanningService<R, C, L>
+struct ResolvedCorpusSemantics {
+    groups: Vec<StandardTranslationGroup>,
+    snapshot_baseline: super::standard::TranslationSnapshotBaseline,
+    terminology: Arc<CompiledTerminology>,
+    terminology_json: String,
+    placeholder_rules_json: String,
+    semantics: Arc<ResolvedTranslationSemantics>,
+    system_markdown: String,
+    task_language_pair: LanguagePair,
+}
+
+impl<R, C, L> RpgMakerStandardTranslationTaskPlanningService<R, C, L>
 where
     R: TranslationPlanningResourceReader,
     C: CpuTaskExecutor,
     L: LlmClientConcurrency + LlmClientSemanticIdentity + 'static,
 {
-    type Profile = Arc<RpgMakerTranslationProfile<L>>;
-    type Error = RpgMakerStandardTranslationTaskPlanningError<R::Error, C::Error>;
-
-    async fn plan(
+    async fn resolve_corpus_semantics(
         &self,
         project: &OpenedProject,
-        profile: &Self::Profile,
+        profile: &Arc<RpgMakerTranslationProfile<L>>,
         corpus: StandardTranslationCorpus,
         input: StandardTranslationInput,
-    ) -> Result<StandardTranslationPlan, Self::Error> {
+    ) -> Result<
+        ResolvedCorpusSemantics,
+        RpgMakerStandardTranslationTaskPlanningError<R::Error, C::Error>,
+    > {
         let resolved_pair = self.translation_resources.language_pair();
         if project.source_language() != resolved_pair.source()
             || project.target_language() != resolved_pair.target()
@@ -107,14 +117,12 @@ where
                 },
             );
         }
-        let planning = profile.planning();
         let system_markdown = self
             .translation_resources
             .system_prompt()
             .markdown()
             .to_owned();
         let source_language = self.translation_resources.source_language();
-
         let (groups, snapshot_baseline) = corpus.into_parts();
         let current_terminology_json = snapshot_baseline.terminology_json().to_owned();
         let current_placeholder_rules_json = snapshot_baseline.placeholder_rules_json().to_owned();
@@ -139,14 +147,6 @@ where
             .await
             .map_err(RpgMakerStandardTranslationTaskPlanningError::CompilePlaceholdersCompute)?
             .map_err(RpgMakerStandardTranslationTaskPlanningError::InvalidPlaceholderRules)?;
-
-        let prepared = self
-            .cpu
-            .execute(move || prepare_corpus(groups))
-            .await
-            .map_err(RpgMakerStandardTranslationTaskPlanningError::PrepareCorpusCompute)?
-            .map_err(RpgMakerStandardTranslationTaskPlanningError::InvalidCorpus)?;
-
         let source_language_id = project.source_language().to_owned();
         let target_language_id = project.target_language().to_owned();
         let engine = project.layout().rpg_maker_layout().engine();
@@ -169,6 +169,124 @@ where
             source_language,
             global_semantics,
         ));
+        Ok(ResolvedCorpusSemantics {
+            groups,
+            snapshot_baseline,
+            terminology,
+            terminology_json,
+            placeholder_rules_json,
+            semantics,
+            system_markdown,
+            task_language_pair,
+        })
+    }
+
+    /// 使用项目当前 canonical 资源打开无副作用的人工候选语义会话。
+    pub(crate) async fn open_candidate_session(
+        &self,
+        project: &OpenedProject,
+        profile: &Arc<RpgMakerTranslationProfile<L>>,
+        corpus: StandardTranslationCorpus,
+    ) -> Result<
+        super::candidate::StandardCandidateSession,
+        OpenStandardCandidateSessionError<R::Error, C::Error>,
+    > {
+        let resolved = self
+            .resolve_corpus_semantics(
+                project,
+                profile,
+                corpus,
+                StandardTranslationInput::new(None, None),
+            )
+            .await
+            .map_err(OpenStandardCandidateSessionError::Planning)?;
+        let ResolvedCorpusSemantics {
+            groups,
+            snapshot_baseline,
+            terminology_json,
+            placeholder_rules_json,
+            semantics,
+            ..
+        } = resolved;
+        let baseline = super::standard::TranslationSnapshotBaseline::new(
+            snapshot_baseline.source_snapshot_fingerprint(),
+            snapshot_baseline.owner_snapshots().to_vec(),
+            terminology_json,
+            placeholder_rules_json,
+        );
+        let prepared = self
+            .cpu
+            .execute(move || prepare_corpus(groups))
+            .await
+            .map_err(OpenStandardCandidateSessionError::ScheduleBuild)?
+            .map_err(|source| {
+                OpenStandardCandidateSessionError::Build(
+                    super::candidate::StandardCandidateSessionBuildError::Corpus(source),
+                )
+            })?;
+        let scope_semantics = semantics;
+        let prepared_scopes = self
+            .cpu
+            .execute_ordered_map(prepared.into_scopes(), move |scope| {
+                super::candidate::prepare_candidate_scope(Arc::clone(&scope_semantics), scope)
+            })
+            .await
+            .map_err(OpenStandardCandidateSessionError::ScheduleBuild)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(OpenStandardCandidateSessionError::Build)?;
+        let session = self
+            .cpu
+            .execute(move || {
+                super::candidate::StandardCandidateSession::from_prepared_scopes(
+                    baseline,
+                    prepared_scopes,
+                )
+            })
+            .await
+            .map_err(OpenStandardCandidateSessionError::ScheduleBuild)?;
+        Ok(session)
+    }
+}
+
+impl<R, C, L> StandardTranslationTaskPlanner
+    for RpgMakerStandardTranslationTaskPlanningService<R, C, L>
+where
+    R: TranslationPlanningResourceReader,
+    C: CpuTaskExecutor,
+    L: LlmClientConcurrency + LlmClientSemanticIdentity + 'static,
+{
+    type Profile = Arc<RpgMakerTranslationProfile<L>>;
+    type Error = RpgMakerStandardTranslationTaskPlanningError<R::Error, C::Error>;
+
+    async fn plan(
+        &self,
+        project: &OpenedProject,
+        profile: &Self::Profile,
+        corpus: StandardTranslationCorpus,
+        input: StandardTranslationInput,
+    ) -> Result<StandardTranslationPlan, Self::Error> {
+        let planning = profile.planning();
+        let ResolvedCorpusSemantics {
+            groups,
+            snapshot_baseline,
+            terminology,
+            terminology_json,
+            placeholder_rules_json,
+            semantics,
+            system_markdown,
+            task_language_pair,
+        } = self
+            .resolve_corpus_semantics(project, profile, corpus, input)
+            .await?;
+
+        let prepared = self
+            .cpu
+            .execute(move || prepare_corpus(groups))
+            .await
+            .map_err(RpgMakerStandardTranslationTaskPlanningError::PrepareCorpusCompute)?
+            .map_err(RpgMakerStandardTranslationTaskPlanningError::InvalidCorpus)?;
+
         let target_user_message_characters = planning.target_user_message_characters().get();
         let scope_semantics = Arc::clone(&semantics);
         let preprocessed_scopes = self
@@ -302,27 +420,57 @@ where
     }
 }
 
-struct PreparedCorpus {
+pub(super) struct PreparedCorpus {
     scopes: Vec<PreparedScope>,
 }
 
-struct PreparedScope {
+impl PreparedCorpus {
+    pub(super) fn into_scopes(self) -> Vec<PreparedScope> {
+        self.scopes
+    }
+}
+
+pub(super) struct PreparedScope {
     key: SemanticScopeKey,
     groups: Vec<PreparedGroup>,
 }
 
-struct PreparedGroup {
+impl PreparedScope {
+    pub(super) fn into_groups(self) -> Vec<PreparedGroup> {
+        self.groups
+    }
+}
+
+pub(super) struct PreparedGroup {
     kind: TextGroupKind,
     assets: Vec<PreparedAsset>,
 }
 
-struct PreparedAsset {
+impl PreparedGroup {
+    pub(super) fn into_parts(self) -> (TextGroupKind, Vec<PreparedAsset>) {
+        (self.kind, self.assets)
+    }
+}
+
+pub(super) struct PreparedAsset {
     identity: TranslationUnitIdentity,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
 }
 
-fn prepare_corpus(
+impl PreparedAsset {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        TranslationUnitIdentity,
+        Option<TextUnitContent>,
+        Option<Sha256Fingerprint>,
+    ) {
+        (self.identity, self.translation, self.translation_state)
+    }
+}
+
+pub(super) fn prepare_corpus(
     groups: Vec<StandardTranslationGroup>,
 ) -> Result<PreparedCorpus, CorpusPlanningError> {
     let mut scopes = Vec::<PreparedScope>::new();
@@ -644,7 +792,7 @@ fn semantic_text(content: &TextUnitContent) -> String {
     }
 }
 
-fn global_translation_semantics(
+pub(crate) fn global_translation_semantics(
     engine: RpgMakerEngine,
     source_language: &str,
     target_language: &str,
@@ -663,7 +811,7 @@ fn global_translation_semantics(
     hasher.finish()
 }
 
-fn translation_state_context(
+pub(crate) fn translation_state_context(
     global_semantics: Sha256Fingerprint,
     identity: &TranslationUnitIdentity,
     protected_text: &str,
@@ -1144,7 +1292,7 @@ fn human_scalar_label(field_name: &str) -> &str {
     }
 }
 
-fn expected_line_shape(identity: &TranslationUnitIdentity) -> ExpectedLineShape {
+pub(crate) fn expected_line_shape(identity: &TranslationUnitIdentity) -> ExpectedLineShape {
     match identity.role() {
         TextUnitRole::DialogueBody => ExpectedLineShape::Reflow,
         TextUnitRole::Choices | TextUnitRole::ScrollingText => ExpectedLineShape::Aligned(
@@ -1526,6 +1674,68 @@ enum GlobalPreparationFailure {
         source: ScopePreprocessingError,
     },
     InvalidDeduplication(TranslationDeduplicationError),
+}
+
+#[derive(Debug)]
+pub(crate) enum OpenStandardCandidateSessionError<R, C> {
+    Planning(RpgMakerStandardTranslationTaskPlanningError<R, C>),
+    ScheduleBuild(CpuTaskExecutionError<C>),
+    Build(super::candidate::StandardCandidateSessionBuildError),
+}
+
+impl<R: fmt::Display, C: fmt::Display> fmt::Display for OpenStandardCandidateSessionError<R, C> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Planning(source) => write!(formatter, "无法解析 Standard 人工候选语义：{source}"),
+            Self::ScheduleBuild(source) => {
+                write!(formatter, "无法调度 Standard 人工候选会话构建：{source}")
+            }
+            Self::Build(source) => write!(formatter, "无法建立 Standard 人工候选会话：{source}"),
+        }
+    }
+}
+
+impl<R: Error + 'static, C: Error + 'static> Error for OpenStandardCandidateSessionError<R, C> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Planning(source) => Some(source),
+            Self::ScheduleBuild(source) => Some(source),
+            Self::Build(source) => Some(source),
+        }
+    }
+}
+
+impl<R, C> SafeDiagnosticSource for OpenStandardCandidateSessionError<R, C>
+where
+    R: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::Planning(source) => {
+                source.safe_diagnostic_source(stage, impact, DiagnosticAction::FixInput)
+            }
+            Self::ScheduleBuild(source) => {
+                source.safe_diagnostic_source(stage, impact, DiagnosticAction::Retry)
+            }
+            Self::Build(source) => SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                stage,
+                DiagnosticSubject::component("standard_candidate_session"),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InternalInvariant,
+                    source.safe_detail(),
+                ),
+                impact,
+                DiagnosticAction::ReportBug,
+            ),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2143,7 +2353,7 @@ fn placeholder_compilation_diagnostic(
     )
 }
 
-fn scope_preprocessing_detail(source: &ScopePreprocessingError) -> String {
+pub(crate) fn scope_preprocessing_detail(source: &ScopePreprocessingError) -> String {
     match source {
         ScopePreprocessingError::EncodeStateLocation(source) => {
             format!(
@@ -3717,6 +3927,76 @@ mod tests {
         assert_eq!(user.matches("保存しますか？").count(), 1);
         assert!(!user.contains("仅上下文"));
         assert_eq!(tasks[0].expected_outputs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_states_match_the_same_profile_standard_plan_at_every_location() {
+        use crate::rpg_maker::translate::candidate::{
+            StandardCandidateRequest, StandardCandidateUnitIndex,
+        };
+
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            EmptyResources,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let corpus = StandardTranslationCorpus::new(vec![
+            group(
+                RpgMakerSource::data(StandardDataFile::Items),
+                1,
+                "保存しますか？",
+                None,
+                Vec::new(),
+            ),
+            group(
+                RpgMakerSource::data(StandardDataFile::Items),
+                2,
+                "保存しますか？",
+                None,
+                Vec::new(),
+            ),
+        ]);
+        let profile = profile(10_000);
+        let (_, _, tasks) = planner
+            .plan(
+                &project(),
+                &profile,
+                corpus.clone(),
+                StandardTranslationInput::new(None, None),
+            )
+            .await
+            .expect("普通 Standard 应建立去重计划")
+            .into_parts();
+        let expected = &tasks[0].expected_outputs()[0];
+        let translation = TextUnitContent::Value("是否保存？".to_owned());
+        let expected_states = std::iter::once(expected.state_context().finish(&translation))
+            .chain(
+                expected
+                    .propagation_state_contexts()
+                    .iter()
+                    .map(|context| context.finish(&translation)),
+            )
+            .collect::<Vec<_>>();
+
+        let session = planner
+            .open_candidate_session(&project(), &profile, corpus)
+            .await
+            .expect("人工 Standard 应复用同一 Profile 语义");
+        let prepared = session
+            .prepare_acceptance(vec![StandardCandidateRequest::new(
+                StandardCandidateUnitIndex::new(0),
+                translation,
+                false,
+            )])
+            .expect("人工候选应可验收");
+        let actual_states = prepared.commits()[0]
+            .writes()
+            .iter()
+            .map(|write| write.replacement_translation_state())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual_states, expected_states);
     }
 
     #[tokio::test]

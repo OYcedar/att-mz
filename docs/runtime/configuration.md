@@ -175,6 +175,8 @@ Lua 值大小或复杂度、SQLite 查询组/行/结果字节以及 Claim、Unit
 
 运行方案不写入生产配置：Init 来源、Extract owner 集合、Translate Profile 和 WriteBack
 Lua 选择属于项目数据库。Rules 保存 canonical 语义；Lua 保存阶段正文快照、指纹和无损
-路径。保存的 Profile 在当前配置中不存在时明确失败，不选择其他 Profile。
+路径。保存的 Profile 在当前配置中不存在时明确失败，不选择其他 Profile。独立项目
+`lua` 命令每次读取显式脚本，Profile 只服务本次 Standard 会话，因此两者都不增加配置
+分区或运行方案。
 
 解析器只实现本规格列出的当前字段和语义；其他内容按普通无效输入处理。

@@ -8,6 +8,7 @@ cli-init-about = 初始化或更新一个命名游戏项目
 cli-extract-about = 使用显式或已保存的 owner 方案提取原文
 cli-translate-about = 使用显式或已保存的 Profile 翻译已提取原文
 cli-write-back-about = 将已验收译文写回游戏
+cli-project-lua-about = 在项目上下文中一次性运行可信 Lua 程序
 cli-project-name-help = 稳定项目名称
 cli-init-path-help = RPG Maker 游戏根目录；已有项目可复用上次成功路径
 cli-source-language-help = 原文语言 ID
@@ -22,6 +23,9 @@ cli-lua-help = 替换当前阶段的 Lua 程序；零字节文件会清除它
 cli-profile-help = 翻译 Profile ID；省略时复用上次成功 Profile
 cli-terms-help = 替换项目术语资源
 cli-placeholders-help = 替换项目 Placeholder 资源
+cli-project-lua-profile-help = Standard 人工验收使用的 Profile；省略时在打开 Standard 能力时复用上次成功的 Translate Profile
+cli-project-lua-script-help = 本次一次性运行的可信 Lua 程序
+cli-project-lua-arguments-help = 在 -- 后传给 Lua arg[1..] 的 UTF-8 参数
 cli-usage-heading = 用法：
 cli-commands-heading = 命令：
 cli-options-heading = 选项：
@@ -102,6 +106,7 @@ progress-extract-commit = 正在提交提取资产
 progress-translate-planning = 正在规划翻译任务
 progress-translate-confirmed = 已确认翻译任务
 progress-translate-no-work = 无需调用模型
+progress-project-lua = 正在运行项目 Lua 程序
 progress-write-back-read-assets = 正在读取已验收资产
 progress-write-back-planning = 正在规划文档改写
 progress-write-back-documents = 已改写文档
@@ -120,6 +125,7 @@ result-translate-completed = 翻译执行完成：{ $project }（Profile：{ $pr
 result-translate-standard = 标准翻译：任务 { $total }，完整 { $complete }，部分 { $partial }，不可用 { $unavailable }；写入 { $written } 处，剩余 { $remaining } 处
 result-translate-convergence = 状态收敛：保留 { $retained }，失效 { $invalidated }，不适用 { $not_applicable }，复用 { $reused }
 result-write-back-completed = 写回完成：{ $project }
+result-project-lua-completed = 项目 Lua 执行完成：{ $project }
 result-output-directory = 输出目录：{ $path }
 result-write-back-standard = 标准写回：应用译文 { $translated } 个单元，保留原文 { $original } 个单元；自动换行 { $auto_wrapped } 段，新增换行 { $breaks } 处；续行全角缩进 { $indents } 处；需人工换行 { $manual } 段
 result-lua-executed = Lua：已执行
@@ -174,6 +180,7 @@ diagnostic-stage-value = { $code ->
     [extract] 提取
     [translate] 翻译
     [write_back] 写回
+    [lua] 项目 Lua 执行
     [model_request] 模型请求
     [run_plan_finalization] 运行方案收尾
     [publication] 发布

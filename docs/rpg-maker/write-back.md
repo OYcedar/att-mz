@@ -135,8 +135,8 @@ Lua 使用严格逻辑 `data/...` 与 `js/...` 访问候选；只接受 `/`，�
 每次 WriteBack 使用新 Lua VM 和新 SQLite 连接；globals、TEMP 表和连接状态不从 Extract
 或 Translate 继承。没有发布后回调。脚本必须以冻结来源、当前候选和持久私有状态重建
 幂等结果，不能在 Lua 返回前把私有表标记为“已经发布”。完整 output 操作矩阵与范例见
-[Lua 技术参考](lua.md#10-writeback-候选与布局)和
-[Lua Cookbook](lua-cookbook.md#3-幂等-writeback)。
+[Lua 技术参考](lua.md#11-writeback-候选与布局)和
+[Lua Cookbook](lua-cookbook.md#4-幂等-writeback)。
 
 ## 6. 顶层验证、发布与完成边界
 

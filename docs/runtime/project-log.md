@@ -39,8 +39,10 @@ Thinking、Assistant、逐 ID 验收和数据库提交终态放在同一份 Mark
 <project-workspace>/task-records/<run-id>/task-000001.md
 ```
 
-该能力默认关闭；零 Standard 任务或没有启动任务时不建立空目录。Translate Lua 不生成
-任务记录。完整模板、稳定编号、互斥终态、取消、API-key 精确替换与原子落盘规则由
+该能力默认关闭；零 Standard 任务或没有启动任务时不建立空目录。Translate Lua 和独立
+`lua` 命令都不生成任务记录；后者没有 LLM TaskBlock，人工候选的权威验收与提交结果由
+每次 `ctx.standard.accept` 返回值和项目数据库承担。完整模板、稳定编号、互斥终态、取消、
+API-key 精确替换与原子落盘规则由
 [Standard 翻译任务记录现行规格](../rpg-maker/task-records.md)唯一规定。
 
 任务记录与本节项目 JSONL 都是非权威可观测性旁路，但承担不同阅读任务：JSONL 保持

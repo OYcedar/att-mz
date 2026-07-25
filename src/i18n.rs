@@ -425,6 +425,7 @@ pub(crate) enum UiMessage<'a> {
     CliExtractAbout,
     CliTranslateAbout,
     CliWriteBackAbout,
+    CliProjectLuaAbout,
     CliProjectNameHelp,
     CliInitPathHelp,
     CliSourceLanguageHelp,
@@ -439,6 +440,9 @@ pub(crate) enum UiMessage<'a> {
     CliProfileHelp,
     CliTermsHelp,
     CliPlaceholdersHelp,
+    CliProjectLuaProfileHelp,
+    CliProjectLuaScriptHelp,
+    CliProjectLuaArgumentsHelp,
     CliUsageHeading,
     CliCommandsHeading,
     CliOptionsHeading,
@@ -613,6 +617,7 @@ pub(crate) enum UiMessage<'a> {
     ProgressTranslatePlanning,
     ProgressTranslateConfirmed,
     ProgressTranslateNoWork,
+    ProgressProjectLua,
     ProgressWriteBackReadAssets,
     ProgressWriteBackPlanning,
     ProgressWriteBackDocuments,
@@ -652,6 +657,9 @@ pub(crate) enum UiMessage<'a> {
         reused: u64,
     },
     ResultWriteBackCompleted {
+        project: &'a str,
+    },
+    ResultProjectLuaCompleted {
         project: &'a str,
     },
     ResultOutputDirectory {
@@ -873,6 +881,7 @@ impl UiMessage<'_> {
             Self::CliExtractAbout => "cli-extract-about",
             Self::CliTranslateAbout => "cli-translate-about",
             Self::CliWriteBackAbout => "cli-write-back-about",
+            Self::CliProjectLuaAbout => "cli-project-lua-about",
             Self::CliProjectNameHelp => "cli-project-name-help",
             Self::CliInitPathHelp => "cli-init-path-help",
             Self::CliSourceLanguageHelp => "cli-source-language-help",
@@ -887,6 +896,9 @@ impl UiMessage<'_> {
             Self::CliProfileHelp => "cli-profile-help",
             Self::CliTermsHelp => "cli-terms-help",
             Self::CliPlaceholdersHelp => "cli-placeholders-help",
+            Self::CliProjectLuaProfileHelp => "cli-project-lua-profile-help",
+            Self::CliProjectLuaScriptHelp => "cli-project-lua-script-help",
+            Self::CliProjectLuaArgumentsHelp => "cli-project-lua-arguments-help",
             Self::CliUsageHeading => "cli-usage-heading",
             Self::CliCommandsHeading => "cli-commands-heading",
             Self::CliOptionsHeading => "cli-options-heading",
@@ -985,6 +997,7 @@ impl UiMessage<'_> {
             Self::ProgressTranslatePlanning => "progress-translate-planning",
             Self::ProgressTranslateConfirmed => "progress-translate-confirmed",
             Self::ProgressTranslateNoWork => "progress-translate-no-work",
+            Self::ProgressProjectLua => "progress-project-lua",
             Self::ProgressWriteBackReadAssets => "progress-write-back-read-assets",
             Self::ProgressWriteBackPlanning => "progress-write-back-planning",
             Self::ProgressWriteBackDocuments => "progress-write-back-documents",
@@ -1003,6 +1016,7 @@ impl UiMessage<'_> {
             Self::ResultTranslateStandard { .. } => "result-translate-standard",
             Self::ResultTranslateConvergence { .. } => "result-translate-convergence",
             Self::ResultWriteBackCompleted { .. } => "result-write-back-completed",
+            Self::ResultProjectLuaCompleted { .. } => "result-project-lua-completed",
             Self::ResultOutputDirectory { .. } => "result-output-directory",
             Self::ResultWriteBackStandard { .. } => "result-write-back-standard",
             Self::ResultLuaExecuted => "result-lua-executed",
@@ -1117,7 +1131,8 @@ impl UiMessage<'_> {
             }
             Self::ResultInitCompleted { project }
             | Self::ResultExtractCompleted { project }
-            | Self::ResultWriteBackCompleted { project } => {
+            | Self::ResultWriteBackCompleted { project }
+            | Self::ResultProjectLuaCompleted { project } => {
                 set_text(&mut arguments, "project", project);
             }
             Self::ResultTranslateCompleted { project, profile } => {
@@ -1411,6 +1426,7 @@ impl UiMessage<'_> {
             | Self::CliExtractAbout
             | Self::CliTranslateAbout
             | Self::CliWriteBackAbout
+            | Self::CliProjectLuaAbout
             | Self::CliProjectNameHelp
             | Self::CliInitPathHelp
             | Self::CliSourceLanguageHelp
@@ -1425,6 +1441,9 @@ impl UiMessage<'_> {
             | Self::CliProfileHelp
             | Self::CliTermsHelp
             | Self::CliPlaceholdersHelp
+            | Self::CliProjectLuaProfileHelp
+            | Self::CliProjectLuaScriptHelp
+            | Self::CliProjectLuaArgumentsHelp
             | Self::CliUsageHeading
             | Self::CliCommandsHeading
             | Self::CliOptionsHeading
@@ -1488,6 +1507,7 @@ impl UiMessage<'_> {
             | Self::ProgressTranslatePlanning
             | Self::ProgressTranslateConfirmed
             | Self::ProgressTranslateNoWork
+            | Self::ProgressProjectLua
             | Self::ProgressWriteBackReadAssets
             | Self::ProgressWriteBackPlanning
             | Self::ProgressWriteBackDocuments
@@ -1885,6 +1905,7 @@ mod tests {
             UiMessage::CliExtractAbout,
             UiMessage::CliTranslateAbout,
             UiMessage::CliWriteBackAbout,
+            UiMessage::CliProjectLuaAbout,
             UiMessage::CliProjectNameHelp,
             UiMessage::CliInitPathHelp,
             UiMessage::CliSourceLanguageHelp,
@@ -1899,6 +1920,9 @@ mod tests {
             UiMessage::CliProfileHelp,
             UiMessage::CliTermsHelp,
             UiMessage::CliPlaceholdersHelp,
+            UiMessage::CliProjectLuaProfileHelp,
+            UiMessage::CliProjectLuaScriptHelp,
+            UiMessage::CliProjectLuaArgumentsHelp,
             UiMessage::CliUsageHeading,
             UiMessage::CliCommandsHeading,
             UiMessage::CliOptionsHeading,
@@ -2037,6 +2061,7 @@ mod tests {
             UiMessage::ProgressTranslatePlanning,
             UiMessage::ProgressTranslateConfirmed,
             UiMessage::ProgressTranslateNoWork,
+            UiMessage::ProgressProjectLua,
             UiMessage::ProgressWriteBackReadAssets,
             UiMessage::ProgressWriteBackPlanning,
             UiMessage::ProgressWriteBackDocuments,
@@ -2070,6 +2095,7 @@ mod tests {
                 reused: 1,
             },
             UiMessage::ResultWriteBackCompleted { project: "demo" },
+            UiMessage::ResultProjectLuaCompleted { project: "demo" },
             UiMessage::ResultOutputDirectory { path: "output" },
             UiMessage::ResultWriteBackStandard {
                 translated: 1,

@@ -10,13 +10,19 @@ use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::text::TextGroupKind;
 
-use super::executor::accept_prepared_translation_candidate;
+use super::executor::{
+    TranslationContentAcceptance, accept_prepared_translation_candidate,
+    accept_translation_content_candidate,
+};
 use super::language_projection::{LanguageTextProjectionError, project_protected_text};
 use super::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderProtectionError,
 };
 use super::planning_resource::CompiledTerminology;
-use super::standard::{AppliedPlaceholder, TerminologyDependency, TranslationUnitRejectionReason};
+use super::standard::{
+    AppliedPlaceholder, ExpectedLineShape, TerminologyDependency, TranslationUnitIdentity,
+    TranslationUnitRejectionReason,
+};
 
 /// 一轮 Standard 与 Lua 共享且不可变的当前翻译语义。
 pub(crate) struct ResolvedTranslationSemantics {
@@ -373,6 +379,38 @@ impl PreparedTranslationText {
             &self.placeholders,
             &self.language_analysis,
             self.source_language.as_ref(),
+        )
+        .map_err(ResolvedTranslationSemanticError::AcceptCandidate)
+    }
+
+    /// 验收保持 `Value` / `Lines` 物理边界的 Standard 候选。
+    ///
+    /// 普通模型响应和人工提交都必须经过 executor 拥有的同一条 line shape、
+    /// Placeholder、语言残留与修复规则。
+    pub(crate) fn accept_content(
+        &self,
+        identity: &TranslationUnitIdentity,
+        line_shape: ExpectedLineShape,
+        candidate: TextUnitContent,
+    ) -> Result<TranslationContentAcceptance, ResolvedTranslationSemanticError> {
+        if self.status != PreparedTranslationStatus::Active {
+            return Ok(TranslationContentAcceptance::Rejected(
+                TranslationUnitRejectionReason::InvalidShape {
+                    message: format!(
+                        "prepared_status={}; expected=active",
+                        self.status.storage_name()
+                    ),
+                },
+            ));
+        }
+        accept_translation_content_candidate(
+            identity,
+            &self.model_text,
+            line_shape,
+            &self.placeholders,
+            &self.language_analysis,
+            self.source_language.as_ref(),
+            candidate,
         )
         .map_err(ResolvedTranslationSemanticError::AcceptCandidate)
     }

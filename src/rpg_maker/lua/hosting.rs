@@ -31,8 +31,9 @@ use super::runtime::{
     TrustedLuaBindingFinalization, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
     TrustedLuaCommonBindings, TrustedLuaCommonHostCalls, TrustedLuaExtractHostCalls,
     TrustedLuaExtractIntent, TrustedLuaHostCallError, TrustedLuaRuntimeBindings,
-    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor, TrustedLuaTranslateHostCalls,
-    TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
+    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor, TrustedLuaStandardAcceptance,
+    TrustedLuaStandardCandidate, TrustedLuaStandardHostCalls, TrustedLuaStandardSession,
+    TrustedLuaTranslateHostCalls, TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
 };
 use super::{
     LuaInvocation, LuaProjectContext, LuaSourcePath, TrustedLuaExecutionHost,
@@ -122,6 +123,19 @@ where
                 project,
                 calls,
             } => (HostingPhase::WriteBack(calls), program, project),
+            LuaInvocation::Project {
+                program,
+                project,
+                arguments,
+                standard,
+            } => (
+                HostingPhase::Project {
+                    arguments,
+                    standard,
+                },
+                program,
+                project,
+            ),
         };
 
         let database_path = project.database_path().to_path_buf();
@@ -140,6 +154,7 @@ where
             operations,
             file_system: Arc::clone(&self.file_system),
         });
+        let transaction_state = Arc::clone(&common);
         let finalizer: Box<dyn TrustedLuaBindingFinalizer> =
             Box::new(LuaSessionFinalizer { finalizer });
         let common = TrustedLuaCommonBindings::new(common);
@@ -165,6 +180,18 @@ where
             HostingPhase::WriteBack(calls) => {
                 TrustedLuaRuntimeBindings::write_back(common, calls, finalizer)
             }
+            HostingPhase::Project {
+                arguments,
+                standard,
+            } => TrustedLuaRuntimeBindings::project(
+                common,
+                arguments,
+                Arc::new(TransactionAwareLuaStandardHostCalls {
+                    inner: standard,
+                    transaction_state,
+                }),
+                finalizer,
+            ),
         };
         let handle = self.runtime.start(program, bindings);
         let (runtime, finalization) = handle.await.into_parts();
@@ -199,6 +226,10 @@ enum HostingPhase<P> {
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     },
     WriteBack(Arc<dyn TrustedLuaWriteBackHostCalls>),
+    Project {
+        arguments: Vec<String>,
+        standard: Arc<dyn TrustedLuaStandardHostCalls>,
+    },
 }
 
 struct LuaCommonHostCalls<F, S>
@@ -347,6 +378,92 @@ where
                 .rollback()
                 .await
                 .map_err(|error| database_call_error("db.rollback", error))
+        })
+    }
+
+    fn transaction_active(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TrustedLuaHostCallError>> + Send + 'static>> {
+        let operations = Arc::clone(&self.operations);
+        Box::pin(async move {
+            operations
+                .transaction_active()
+                .await
+                .map_err(|error| database_call_error("db.transaction_active", error))
+        })
+    }
+}
+
+struct TransactionAwareLuaStandardHostCalls {
+    inner: Arc<dyn TrustedLuaStandardHostCalls>,
+    transaction_state: Arc<dyn TrustedLuaCommonHostCalls>,
+}
+
+impl TrustedLuaStandardHostCalls for TransactionAwareLuaStandardHostCalls {
+    fn open(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Arc<dyn TrustedLuaStandardSession>, TrustedLuaHostCallError>>
+                + Send
+                + 'static,
+        >,
+    > {
+        let inner = Arc::clone(&self.inner);
+        let transaction_state = Arc::clone(&self.transaction_state);
+        Box::pin(async move {
+            let session = inner.open().await?;
+            Ok(Arc::new(TransactionAwareLuaStandardSession {
+                inner: session,
+                transaction_state,
+            }) as Arc<dyn TrustedLuaStandardSession>)
+        })
+    }
+}
+
+struct TransactionAwareLuaStandardSession {
+    inner: Arc<dyn TrustedLuaStandardSession>,
+    transaction_state: Arc<dyn TrustedLuaCommonHostCalls>,
+}
+
+impl TrustedLuaStandardSession for TransactionAwareLuaStandardSession {
+    fn units(&self) -> Vec<super::runtime::TrustedLuaStandardUnit> {
+        self.inner.units()
+    }
+
+    fn get(
+        &self,
+        owner: crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner,
+        group_location: crate::rpg_maker::text::RpgMakerLocation,
+        role: crate::rpg_maker::model::TextUnitRole,
+    ) -> Option<super::runtime::TrustedLuaStandardUnit> {
+        self.inner.get(owner, group_location, role)
+    }
+
+    fn accept(
+        &self,
+        candidates: Vec<TrustedLuaStandardCandidate>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<TrustedLuaStandardAcceptance>, TrustedLuaHostCallError>>
+                + Send
+                + 'static,
+        >,
+    > {
+        let transaction_state = Arc::clone(&self.transaction_state);
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            if transaction_state.transaction_active().await? {
+                return Err(TrustedLuaHostCallError::new(
+                    "standard",
+                    "transaction_conflict",
+                    "活动 ctx.db 事务中不能提交 Standard 人工译文",
+                    None,
+                    None,
+                )
+                .with_operation("standard.accept"));
+            }
+            inner.accept(candidates).await
         })
     }
 }
@@ -1550,6 +1667,12 @@ mod tests {
         async fn rollback(&self) -> Result<(), SqliteInteractiveSessionError<Self::Error>> {
             Ok(())
         }
+
+        async fn transaction_active(
+            &self,
+        ) -> Result<bool, SqliteInteractiveSessionError<Self::Error>> {
+            Ok(false)
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -2165,5 +2288,169 @@ mod tests {
             .shutdown()
             .await
             .expect("文件系统 worker 应正常关闭");
+    }
+
+    struct TransactionObservationCalls {
+        result: Result<bool, TrustedLuaHostCallError>,
+    }
+
+    impl TrustedLuaCommonHostCalls for TransactionObservationCalls {
+        fn project(&self) -> &LuaProjectContext {
+            panic!("事务观察测试不读取项目上下文")
+        }
+
+        fn read_source(
+            &self,
+            _path: LuaSourcePath,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TrustedLuaHostCallError>> + Send + 'static>>
+        {
+            Box::pin(async { panic!("事务观察测试不读取来源") })
+        }
+
+        fn list_source(
+            &self,
+            _path: LuaSourcePath,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<String>, TrustedLuaHostCallError>> + Send + 'static>,
+        > {
+            Box::pin(async { panic!("事务观察测试不列举来源") })
+        }
+
+        fn query(
+            &self,
+            _query: SqliteQuery,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Vec<SqliteRow>, TrustedLuaHostCallError>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(async { panic!("事务观察测试不执行查询") })
+        }
+
+        fn execute(
+            &self,
+            _command: SqliteCommand,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, TrustedLuaHostCallError>> + Send + 'static>>
+        {
+            Box::pin(async { panic!("事务观察测试不执行命令") })
+        }
+
+        fn begin(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>>
+        {
+            Box::pin(async { panic!("事务观察测试不开始事务") })
+        }
+
+        fn commit(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>>
+        {
+            Box::pin(async { panic!("事务观察测试不提交事务") })
+        }
+
+        fn rollback(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>>
+        {
+            Box::pin(async { panic!("事务观察测试不回滚事务") })
+        }
+
+        fn transaction_active(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, TrustedLuaHostCallError>> + Send + 'static>>
+        {
+            let result = self.result.clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    struct RecordingStandardSession {
+        called: Arc<AtomicBool>,
+    }
+
+    impl TrustedLuaStandardSession for RecordingStandardSession {
+        fn units(&self) -> Vec<super::super::runtime::TrustedLuaStandardUnit> {
+            Vec::new()
+        }
+
+        fn get(
+            &self,
+            _owner: crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner,
+            _group_location: crate::rpg_maker::text::RpgMakerLocation,
+            _role: crate::rpg_maker::model::TextUnitRole,
+        ) -> Option<super::super::runtime::TrustedLuaStandardUnit> {
+            None
+        }
+
+        fn accept(
+            &self,
+            _candidates: Vec<TrustedLuaStandardCandidate>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<Vec<TrustedLuaStandardAcceptance>, TrustedLuaHostCallError>,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            self.called
+                .store(true, std::sync::atomic::Ordering::Release);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_accept_uses_authoritative_transaction_state() {
+        let called = Arc::new(AtomicBool::new(false));
+        let inner: Arc<dyn TrustedLuaStandardSession> = Arc::new(RecordingStandardSession {
+            called: Arc::clone(&called),
+        });
+        let active: Arc<dyn TrustedLuaCommonHostCalls> =
+            Arc::new(TransactionObservationCalls { result: Ok(true) });
+        let session = TransactionAwareLuaStandardSession {
+            inner: Arc::clone(&inner),
+            transaction_state: active,
+        };
+        let error = session
+            .accept(Vec::new())
+            .await
+            .expect_err("活动事务必须阻止 Standard 提交");
+        assert_eq!(error.domain(), "standard");
+        assert_eq!(error.kind(), "transaction_conflict");
+        assert!(!called.load(std::sync::atomic::Ordering::Acquire));
+
+        let indeterminate: Arc<dyn TrustedLuaCommonHostCalls> =
+            Arc::new(TransactionObservationCalls {
+                result: Err(TrustedLuaHostCallError::new(
+                    "sqlite",
+                    "indeterminate",
+                    "事务终态未知",
+                    None,
+                    None,
+                )),
+            });
+        let session = TransactionAwareLuaStandardSession {
+            inner: Arc::clone(&inner),
+            transaction_state: indeterminate,
+        };
+        let error = session
+            .accept(Vec::new())
+            .await
+            .expect_err("终态未知必须保留 SQLite 失败");
+        assert_eq!(error.domain(), "sqlite");
+        assert_eq!(error.kind(), "indeterminate");
+        assert!(!called.load(std::sync::atomic::Ordering::Acquire));
+
+        let idle: Arc<dyn TrustedLuaCommonHostCalls> =
+            Arc::new(TransactionObservationCalls { result: Ok(false) });
+        let session = TransactionAwareLuaStandardSession {
+            inner,
+            transaction_state: idle,
+        };
+        assert!(session.accept(Vec::new()).await.is_ok());
+        assert!(called.load(std::sync::atomic::Ordering::Acquire));
     }
 }

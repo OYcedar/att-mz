@@ -44,6 +44,11 @@ const MIXED_CHOICES_SOURCE: [&str; 2] = ["はい", "いいえ"];
 const MIXED_CHOICES_TRANSLATION: [&str; 2] = ["是", "否"];
 const MIXED_SCROLLING_SOURCE: [&str; 3] = ["スタッフ", "", "終わり"];
 const MIXED_SCROLLING_TRANSLATION: [&str; 3] = ["制作人员", "", "结束"];
+const MANUAL_STANDARD_PROJECT: &str = "manual-standard";
+const MANUAL_STANDARD_ITEM_SOURCE: &str = "回復薬です";
+const MANUAL_STANDARD_ITEM_TRANSLATION: &str = "恢复药剂";
+const MANUAL_STANDARD_DIALOGUE_SOURCE: [&str; 2] = ["今日は晴れです。", "散歩しましょう。"];
+const MANUAL_STANDARD_DIALOGUE_TRANSLATION: &str = "今天天气晴朗，一起散步吧。";
 const SYSTEM_PROMPT_TEMPLATE: &str = "E2E SYSTEM CONTRACT: {{source_language}} -> {{target_language}}; repeat {{source_language}} -> {{target_language}}";
 const SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT: ja -> zh-Hans; repeat ja -> zh-Hans";
 const UPDATED_SYSTEM_PROMPT_TEMPLATE: &str =
@@ -900,6 +905,307 @@ fn mz_map_mixes_five_semantic_unit_types_in_one_translation_task() {
     let output_root = workspace.join("write_back");
     assert_mixed_semantic_game_written(&output_root);
     assert_mixed_semantic_project_log(&workspace.join("logs"));
+}
+
+#[test]
+fn independent_project_lua_accepts_standard_candidates_and_write_back_uses_them() {
+    let temporary = tempfile::tempdir().expect("应可建立人工补译端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir(root.join("projects")).expect("项目根应可建立");
+    fs::create_dir_all(root.join("prompts/rpg_maker")).expect("提示词根应可建立");
+    write_manual_standard_mz_game(&game_root);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), EMPTY_PARAMETERS);
+    enable_translation_task_records(root);
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+
+    let init = run_att(
+        root,
+        mz_init_arguments_for(
+            &game_root,
+            MANUAL_STANDARD_PROJECT,
+            "ja",
+            "zh-Hans",
+            24,
+            30,
+            40,
+        ),
+    );
+    assert_success("人工补译 init", &init);
+
+    let extract = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "extract",
+            "--name",
+            MANUAL_STANDARD_PROJECT,
+            "--builtin",
+        ]),
+    );
+    assert_success("人工补译 extract", &extract);
+
+    let workspace = root.join("projects/mz").join(MANUAL_STANDARD_PROJECT);
+    let database = workspace.join("project.db");
+    assert_manual_standard_units_extracted(&database);
+    let saved_plans_before = read_saved_phase_plan_snapshot(&database);
+    assert!(
+        saved_plans_before.translate_profile.is_none(),
+        "项目尚未成功运行 Translate，必须没有可复用 Profile"
+    );
+
+    let script_relative = Path::new("scripts/manual-standard.lua");
+    fs::create_dir(root.join("scripts")).expect("人工补译 Lua 目录应可建立");
+    let plain_script = Path::new("scripts/plain-project.lua");
+    fs::write(
+        root.join(plain_script),
+        r#"
+assert(ctx.phase == "lua")
+assert(type(ctx.standard) == "table")
+local ok, error = pcall(ctx.standard.open)
+assert(not ok)
+assert(error.domain == "standard" and error.kind == "profile_required")
+"#,
+    )
+    .expect("普通项目 Lua 应可写入");
+    let no_requests = server.start_observing_requests();
+    let mut plain_arguments = arguments(&["mz", "lua", "--name", MANUAL_STANDARD_PROJECT]);
+    plain_arguments.push(plain_script.as_os_str().to_owned());
+    let plain_lua = run_att(root, plain_arguments);
+    assert_success("无 Profile 的普通项目 Lua", &plain_lua);
+    assert_eq!(
+        read_saved_phase_plan_snapshot(&database),
+        saved_plans_before,
+        "捕获 ctx.standard.open() 的延迟 Profile 错误后不得保存运行方案"
+    );
+
+    fs::write(
+        root.join(script_relative),
+        r#"
+assert(ctx.phase == "lua")
+assert(ctx.extract == nil and ctx.translation == nil and ctx.llm == nil)
+assert(ctx.output == nil and ctx.write_back == nil)
+assert(type(ctx.standard) == "table")
+assert(string.sub(arg[0], -19) == "manual-standard.lua")
+assert(arg[1] == "人工参数" and arg[2] == "--literal")
+
+local standard = ctx.standard.open()
+local scalar = nil
+local scalar_count = 0
+local body = nil
+local unit_iterator = standard:units()
+for unit in unit_iterator do
+  if unit.owner == "builtin"
+     and unit.group_kind == "database_entry"
+     and unit.role.kind == "scalar"
+     and unit.role.field == "name"
+     and unit.original == "回復薬です" then
+    scalar_count = scalar_count + 1
+    scalar = scalar or unit
+    assert(unit.content_kind == "value")
+    assert(unit.line_policy == "single")
+    assert(unit.status == "missing")
+    assert(unit.family_size == 2)
+  elseif unit.owner == "builtin"
+     and unit.group_kind == "event_dialogue"
+     and unit.role.kind == "dialogue_body" then
+    assert(body == nil)
+    body = unit
+    assert(unit.content_kind == "lines")
+    assert(unit.line_policy == "reflow")
+    assert(unit.expected_line_count == nil)
+    assert(unit.status == "missing")
+    assert(#unit.original == 2)
+    assert(unit.original[1] == "今日は晴れです。")
+    assert(unit.original[2] == "散歩しましょう。")
+  end
+end
+
+assert(scalar_count == 2)
+assert(scalar ~= nil and body ~= nil)
+local results = standard:accept({
+  {
+    unit = scalar,
+    candidate = "恢复药剂",
+    replace_current = false,
+  },
+  {
+    unit = body,
+    candidate = {"今天天气晴朗，一起散步吧。"},
+    replace_current = false,
+  },
+})
+assert(#results == 2)
+assert(results[1].accepted and results[1].translation == "恢复药剂")
+assert(results[1].changed_locations == 2)
+assert(results[2].accepted)
+assert(#results[2].translation == 1)
+assert(results[2].translation[1] == "今天天气晴朗，一起散步吧。")
+assert(results[2].changed_locations == 1)
+"#,
+    )
+    .expect("人工补译 Lua 应可写入");
+
+    let mut lua_arguments = arguments(&[
+        "mz",
+        "lua",
+        "--name",
+        MANUAL_STANDARD_PROJECT,
+        "--profile",
+        PROFILE,
+    ]);
+    lua_arguments.push(script_relative.as_os_str().to_owned());
+    lua_arguments.extend(arguments(&["--", "人工参数", "--literal"]));
+
+    let project_lua = run_att(root, lua_arguments);
+    let lua_stdout = assert_success("独立项目 Lua", &project_lua);
+    assert!(
+        lua_stdout.starts_with("项目 Lua 执行完成：manual-standard\n"),
+        "独立项目 Lua 应报告自己的命令终态：{lua_stdout}"
+    );
+    assert_eq!(
+        read_saved_phase_plan_snapshot(&database),
+        saved_plans_before,
+        "一次性脚本、显式 Profile 和 -- 后参数不得写入任何阶段运行方案"
+    );
+    assert!(
+        !workspace.join("task-records").exists(),
+        "人工 Standard 提交不得伪造 LLM TaskBlock"
+    );
+    assert_manual_standard_candidates_committed(&database);
+
+    let translate = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "translate",
+            "--name",
+            MANUAL_STANDARD_PROJECT,
+            PROFILE,
+        ]),
+    );
+    let translate_stdout = assert_success("人工补译后的 Translate", &translate);
+    assert!(
+        translate_stdout
+            .contains("标准翻译：任务 0，完整 0，部分 0，不可用 0；写入 0 处，剩余 0 处"),
+        "同 Profile 应把人工提交识别为 Current：{translate_stdout}"
+    );
+    assert!(
+        translate_stdout.contains("全部标准翻译单元均为最新状态，Standard 本次未请求模型。"),
+        "同 Profile 不得再次请求已人工补齐的族：{translate_stdout}"
+    );
+    assert!(
+        no_requests.finish().is_empty(),
+        "独立项目 Lua 和收敛后的 Translate 都不得发送 LLM 请求"
+    );
+    assert!(
+        !workspace.join("task-records").exists(),
+        "零 Standard 任务不得建立虚假的任务记录目录"
+    );
+    assert_manual_standard_candidates_committed(&database);
+
+    let saved_plans_after_translate = read_saved_phase_plan_snapshot(&database);
+    assert_eq!(
+        saved_plans_after_translate.translate_profile.as_deref(),
+        Some(PROFILE),
+        "成功 Translate 应保存可供独立项目 Lua 复用的 Profile"
+    );
+    fs::write(
+        root.join(plain_script),
+        r#"
+assert(ctx.phase == "lua")
+local standard = ctx.standard.open()
+local count = 0
+for _ in standard:units() do
+  count = count + 1
+end
+assert(count == 3)
+"#,
+    )
+    .expect("Profile 复用 Lua 应可写入");
+    let mut reuse_arguments = arguments(&["mz", "lua", "--name", MANUAL_STANDARD_PROJECT]);
+    reuse_arguments.push(plain_script.as_os_str().to_owned());
+    assert_success(
+        "省略 --profile 的独立项目 Lua",
+        &run_att(root, reuse_arguments),
+    );
+    assert_eq!(
+        read_saved_phase_plan_snapshot(&database),
+        saved_plans_after_translate,
+        "复用已保存 Profile 的独立项目 Lua 不得重写阶段运行方案"
+    );
+
+    let write_back = run_att(
+        root,
+        arguments(&["mz", "write-back", "--name", MANUAL_STANDARD_PROJECT]),
+    );
+    let write_back_stdout = assert_success("人工补译 write-back", &write_back);
+    assert!(
+        write_back_stdout.contains("标准写回：应用译文 3 个单元，保留原文 0 个单元"),
+        "写回应消费两个传播位置和一个 Lines 单元：{write_back_stdout}"
+    );
+    assert_manual_standard_game_written(&workspace.join("write_back"));
+    let saved_plans_after_write_back = read_saved_phase_plan_snapshot(&database);
+
+    let (_, records) = read_project_logs(&workspace.join("logs"));
+    let lua_runs = records
+        .iter()
+        .filter(|record| record["command"] == "lua" && record["code"] == "run.finished")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lua_runs.len(),
+        3,
+        "三个独立项目 Lua 都必须写入项目级终态日志"
+    );
+    for lua_run in lua_runs {
+        assert_eq!(lua_run["payload"]["outcome"], "succeeded");
+        let lua_run_id = &lua_run["run_id"];
+        assert!(
+            !records.iter().any(|record| {
+                record["run_id"] == *lua_run_id
+                    && record["code"]
+                        .as_str()
+                        .is_some_and(|code| code.starts_with("run_plan."))
+            }),
+            "独立项目 Lua 不得生成运行方案解析或保存事件"
+        );
+        assert!(
+            !records.iter().any(|record| {
+                record["run_id"] == *lua_run_id
+                    && matches!(
+                        record["code"].as_str(),
+                        Some("task.started" | "task.finished")
+                    )
+            }),
+            "独立项目 Lua 不得把执行或人工候选伪装成 LLM TaskBlock"
+        );
+    }
+
+    remove_translation_profile_from_configuration(root, PROFILE);
+    fs::write(
+        root.join(plain_script),
+        r#"
+assert(ctx.phase == "lua")
+local ok, error = pcall(ctx.standard.open)
+assert(not ok)
+assert(error.domain == "standard" and error.kind == "saved_profile_unavailable")
+"#,
+    )
+    .expect("失效 Profile 的延迟失败 Lua 应可写入");
+    let mut removed_profile_arguments =
+        arguments(&["mz", "lua", "--name", MANUAL_STANDARD_PROJECT]);
+    removed_profile_arguments.push(plain_script.as_os_str().to_owned());
+    assert_success(
+        "已保存 Profile 从配置删除后的普通项目 Lua",
+        &run_att(root, removed_profile_arguments),
+    );
+    assert_eq!(
+        read_saved_phase_plan_snapshot(&database),
+        saved_plans_after_write_back,
+        "捕获 Standard open 的延迟 Profile 错误后不得改变阶段运行方案"
+    );
 }
 
 #[test]
@@ -2238,6 +2544,68 @@ fn write_mixed_semantic_mz_game(game_root: &Path) {
     .expect("混合 Map 夹具应可写入");
 }
 
+fn write_manual_standard_mz_game(game_root: &Path) {
+    write_minimal_mz_game(game_root);
+    let data = game_root.join("data");
+    fs::write(
+        data.join("Items.json"),
+        serde_json::to_vec(&json!([
+            null,
+            {
+                "id": 1,
+                "name": MANUAL_STANDARD_ITEM_SOURCE,
+                "description": ""
+            },
+            {
+                "id": 2,
+                "name": MANUAL_STANDARD_ITEM_SOURCE,
+                "description": ""
+            }
+        ]))
+        .expect("人工补译 Items 夹具应可序列化"),
+    )
+    .expect("人工补译 Items 夹具应可写入");
+    fs::write(
+        data.join("Map001.json"),
+        serde_json::to_vec(&json!({
+            "displayName": "",
+            "events": [
+                null,
+                {
+                    "id": 1,
+                    "name": "Manual Standard",
+                    "note": "",
+                    "pages": [{
+                        "conditions": {},
+                        "image": {},
+                        "moveRoute": { "list": [{ "code": 0, "parameters": [] }] },
+                        "list": [
+                            {
+                                "code": 101,
+                                "indent": 0,
+                                "parameters": ["", 0, 0, 2, ""]
+                            },
+                            {
+                                "code": 401,
+                                "indent": 0,
+                                "parameters": [MANUAL_STANDARD_DIALOGUE_SOURCE[0]]
+                            },
+                            {
+                                "code": 401,
+                                "indent": 0,
+                                "parameters": [MANUAL_STANDARD_DIALOGUE_SOURCE[1]]
+                            },
+                            { "code": 0, "indent": 0, "parameters": [] }
+                        ]
+                    }]
+                }
+            ]
+        }))
+        .expect("人工补译 Map 夹具应可序列化"),
+    )
+    .expect("人工补译 Map 夹具应可写入");
+}
+
 fn write_minimal_mv_game(game_root: &Path) {
     let content_root = game_root.join("www");
     write_minimal_mz_game(&content_root);
@@ -2676,6 +3044,62 @@ fn assert_write_back_run_plan(database: &Path, lua_enabled: bool) {
     assert_eq!(actual, (lua_enabled, lua_enabled));
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SavedPhasePlanSnapshot {
+    init_source_path_utf16: Option<Vec<u8>>,
+    extract: Option<(bool, bool, bool)>,
+    translate_profile: Option<String>,
+    write_back_lua: Option<bool>,
+    lua_programs: i64,
+}
+
+fn read_saved_phase_plan_snapshot(database: &Path) -> SavedPhasePlanSnapshot {
+    let connection = open_read_only(database);
+    let init = connection
+        .query_row(
+            "SELECT source_path_utf16 FROM init_run_plan WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("Init 运行方案快照应可读取");
+    let extract = connection
+        .query_row(
+            "SELECT builtin_enabled, rules_enabled, lua_enabled \
+             FROM extract_run_plan WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .expect("Extract 运行方案快照应可读取");
+    let translate = connection
+        .query_row(
+            "SELECT profile_id FROM translate_run_plan WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("Translate 运行方案快照应可读取");
+    let write_back = connection
+        .query_row(
+            "SELECT lua_enabled FROM write_back_run_plan WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("WriteBack 运行方案快照应可读取");
+    let lua_programs = connection
+        .query_row("SELECT COUNT(*) FROM lua_program", [], |row| row.get(0))
+        .expect("阶段 Lua 快照数量应可读取");
+    SavedPhasePlanSnapshot {
+        init_source_path_utf16: init,
+        extract,
+        translate_profile: translate,
+        write_back_lua: write_back,
+        lua_programs,
+    }
+}
+
 fn assert_missing_extract_plan(root: &Path, stage: &str) {
     let output = run_att(root, arguments(&["mz", "extract", "--name", PROJECT]));
     assert_eq!(
@@ -2842,6 +3266,102 @@ fn assert_mixed_semantic_translations(database: &Path) {
     }
 }
 
+fn assert_manual_standard_units_extracted(database: &Path) {
+    let connection = open_read_only(database);
+    let (units, translated, states): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COUNT(translation_content_json), COUNT(translation_state) \
+             FROM standard_text_unit WHERE owner = 'builtin'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("人工补译单元数量应可读取");
+    assert_eq!((units, translated, states), (3, 0, 0));
+
+    let duplicate_items: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM standard_text_unit \
+             WHERE owner = 'builtin' \
+               AND unit_role = '{\"f\":\"name\"}' \
+               AND source_content_json = ?1",
+            [json!(MANUAL_STANDARD_ITEM_SOURCE).to_string()],
+            |row| row.get(0),
+        )
+        .expect("人工补译同源 Items 单元应可读取");
+    assert_eq!(duplicate_items, 2, "两个相同描述必须物化为两个物理单元");
+
+    let dialogue: String = connection
+        .query_row(
+            "SELECT source_content_json FROM standard_text_unit \
+             WHERE owner = 'builtin' AND unit_role = '\"b\"'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("人工补译 Lines 单元应可读取");
+    assert_eq!(
+        serde_json::from_str::<Value>(&dialogue).expect("对话正文应为规范 JSON"),
+        json!(MANUAL_STANDARD_DIALOGUE_SOURCE)
+    );
+}
+
+fn assert_manual_standard_candidates_committed(database: &Path) {
+    let connection = open_read_only(database);
+    let pairing_anomalies: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM standard_text_unit \
+             WHERE (translation_content_json IS NULL) <> (translation_state IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("translation/state 配对异常应可查询");
+    assert_eq!(pairing_anomalies, 0, "translation/state 必须始终成对");
+
+    let mut item_statement = connection
+        .prepare(
+            "SELECT translation_content_json, translation_state \
+             FROM standard_text_unit \
+             WHERE owner = 'builtin' \
+               AND unit_role = '{\"f\":\"name\"}' \
+               AND source_content_json = ?1 \
+             ORDER BY group_location",
+        )
+        .expect("人工补译 Items 译文查询应可准备");
+    let item_rows = item_statement
+        .query_map([json!(MANUAL_STANDARD_ITEM_SOURCE).to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .expect("人工补译 Items 译文查询应可执行")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("人工补译 Items 译文应可读取");
+    assert_eq!(item_rows.len(), 2, "一次验收必须传播到完整标量族");
+    for (translation, state) in &item_rows {
+        assert_eq!(
+            serde_json::from_str::<Value>(translation).expect("Items 译文应为规范 JSON"),
+            json!(MANUAL_STANDARD_ITEM_TRANSLATION)
+        );
+        assert_eq!(state.len(), 32, "Standard state 必须是 SHA-256");
+    }
+    assert_ne!(
+        item_rows[0].1, item_rows[1].1,
+        "同族传播位置必须按各自完整身份生成独立 state"
+    );
+
+    let (dialogue_translation, dialogue_state): (String, Vec<u8>) = connection
+        .query_row(
+            "SELECT translation_content_json, translation_state \
+             FROM standard_text_unit \
+             WHERE owner = 'builtin' AND unit_role = '\"b\"'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("人工补译 Lines 译文应可读取");
+    assert_eq!(
+        serde_json::from_str::<Value>(&dialogue_translation).expect("Lines 译文应为规范 JSON"),
+        json!([MANUAL_STANDARD_DIALOGUE_TRANSLATION])
+    );
+    assert_eq!(dialogue_state.len(), 32);
+}
+
 fn assert_mv_dialogue_extracted(database: &Path) {
     let connection = open_read_only(database);
     let mut statement = connection
@@ -2998,6 +3518,35 @@ fn assert_mixed_semantic_game_written(output_root: &Path) {
     assert_eq!(
         commands[12]["parameters"],
         json!([MIXED_SCROLLING_TRANSLATION[2]])
+    );
+}
+
+fn assert_manual_standard_game_written(output_root: &Path) {
+    let items: Value = serde_json::from_slice(
+        &fs::read(output_root.join("data/Items.json")).expect("人工补译 Items 写回文件应存在"),
+    )
+    .expect("人工补译 Items 写回文件应为 JSON");
+    assert_eq!(items[1]["name"], MANUAL_STANDARD_ITEM_TRANSLATION);
+    assert_eq!(items[2]["name"], MANUAL_STANDARD_ITEM_TRANSLATION);
+
+    let map: Value = serde_json::from_slice(
+        &fs::read(output_root.join("data/Map001.json")).expect("人工补译 Map 写回文件应存在"),
+    )
+    .expect("人工补译 Map 写回文件应为 JSON");
+    let commands = map["events"][1]["pages"][0]["list"]
+        .as_array()
+        .expect("人工补译 Map 事件命令应为数组");
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command["code"].as_i64().expect("事件 code 应为整数"))
+            .collect::<Vec<_>>(),
+        vec![101, 401, 0],
+        "两条原文正文必须按人工 Lines 候选整体重排为一条 401"
+    );
+    assert_eq!(
+        commands[1]["parameters"],
+        json!([MANUAL_STANDARD_DIALOGUE_TRANSLATION])
     );
 }
 

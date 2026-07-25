@@ -273,6 +273,9 @@ mod tests {
                 LuaInvocation::WriteBack { .. } => {
                     panic!("提取服务不应提交 WriteBack 调用")
                 }
+                LuaInvocation::Project { .. } => {
+                    panic!("提取服务不应提交独立项目 Lua 调用")
+                }
             };
             *self.invocation.lock().expect("调用记录锁不应中毒") = Some(recorded);
 

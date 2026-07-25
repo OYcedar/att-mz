@@ -1,6 +1,6 @@
 # RPG Maker Lua Cookbook
 
-本页从“外部作者一次写对”出发，给出四种完整模式。所有可执行主程序位于
+本页从“外部作者一次写对”出发，给出五种完整模式。所有可执行主程序位于
 [`examples/`](examples/README.md)，测试会原样交给真实 Lua VM、临时 SQLite、冻结夹具
 和假 LLM；本页的短代码只解释关键不变量。
 
@@ -17,7 +17,7 @@
 
 适用条件：每个语义字段只写回一个 Value/NoteTag/CommentTag，且 source×kind×location
 满足 [replace_standard 矩阵](lua.md#6-extractreplace_standard)。跨文档、多目标不要硬塞进
-这个接口，直接跳到第 4 节。
+这个接口，直接跳到第 5 节。
 
 完整脚本：[lua-standard-data-file.lua](examples/lua-standard-data-file.lua)。它：
 
@@ -121,7 +121,66 @@ translation/state，并保持二者为 NULL：这两种状态不需要也不能�
 后续每次 Translate 仍会重新 `prepare`，但不会请求 LLM。若脚本希望记录“已观察过”，应
 在另一张私有表保存独立诊断事实，不能制造虚假的 translation/state pair。
 
-## 3. 幂等 WriteBack
+## 3. 已有人工作品交给 Standard 验收
+
+适用条件：目标已经是 Extract 建立的 Standard 物理单元，候选由人完成，需要沿用普通
+Standard 的 Placeholder、line shape、语言验收、去重传播和 Current state。不要为这种
+情况使用 Translate Lua 标量 `prepare/accept`，也不要直接 SQL 修改受管表。
+
+完整脚本：[lua-accept-standard.lua](examples/lua-accept-standard.lua)。它每次由独立项目
+Lua 命令显式读取，不进入任何阶段脚本快照：
+
+<!-- att-example: illustrative -->
+```text
+att --config att.toml mv lua --name my-game \
+  --profile default docs/rpg-maker/examples/lua-accept-standard.lua
+```
+
+脚本通过 `standard:units()` 和完整只读身份定位唯一目标，并在提交前复核原文、形状和
+状态。复制到真实项目时必须把这些断言与候选同时替换，不能只按遍历序号取“第一个缺失
+单元”：
+
+<!-- att-example: valid -->
+```lua
+local standard = ctx.standard.open()
+local target = nil
+for unit in standard:units() do
+  if unit.owner == "builtin"
+     and unit.group_kind == "database_entry"
+     and unit.role.kind == "scalar"
+     and unit.role.field == "description"
+     and unit.original == "药水" then
+    assert(target == nil, "目标身份不唯一")
+    target = unit
+  end
+end
+assert(target ~= nil, "没有找到待补译单元")
+
+local results = standard:accept({
+  {
+    unit = target,
+    candidate = "人工译文",
+    replace_current = false,
+  },
+})
+assert(results[1].accepted, results[1].reason)
+```
+
+候选必须使用 `target.model_text` 中的 ATT token，不能照抄原始控制符。Value 和 Lines 也
+不能互换：DialogueBody 的 reflow 候选仍是字符串数组；Choices 和 ScrollingText 必须
+保持槽数与空槽；严格单行 Value 拒绝 LF。
+
+一次 batch 中，普通拒绝项保持零写入，全部合法去重族在同一事务提交。若候选会改变族中
+任一 Current 译文，先人工确认影响，再显式改为 `replace_current=true`；`family_size`
+可以提示传播范围，但不能替代对实际单元的审核。成功返回后该次提交已经生效，脚本后续
+失败不会撤销它。
+
+省略 `--profile` 时，只有 `ctx.standard.open()` 会尝试复用上次成功 Translate 的 Profile；
+普通项目 Lua 可在没有 Profile 时运行。相同 Profile 的下一次 Translate 会跳过仍 Current
+的人工族，WriteBack 直接消费它；改变 Prompt、Client、语言、术语、Placeholder、原文或
+源上下文后仍会按普通规则失效。
+
+## 4. 幂等 WriteBack
 
 完整脚本：[lua-idempotent-write-back.lua](examples/lua-idempotent-write-back.lua)。WriteBack
 每次从冻结 source 建新候选，脚本从候选原文和私有表重建结果，不读取旧 `write_back`，
@@ -151,7 +210,7 @@ ctx.output.write_json(path, entries)
 需要布局时，在写 JSON 前调用 `ctx.write_back.layout`，并同时处理 `applied` 与正常的
 `manual` 结果；不要自行猜测 Standard 的窗口宽度。
 
-## 4. 跨文档、多目标三阶段私有协议
+## 5. 跨文档、多目标三阶段私有协议
 
 完整脚本：[lua-complex-protocol.lua](examples/lua-complex-protocol.lua)。示例把
 `QuestGraph.json[i].title` 与 `QuestIndex.json[id].label` 视为同一个语义事实，并读取
@@ -194,11 +253,12 @@ Prompt、Client、语言模块、engine、original 或脚本 context 发生变�
 5. WriteBack 重复执行是否确定，部分目标失败时是否在写文件前停止；
 6. 发布后没有回调时，协议是否仍能从权威输入恢复。
 
-## 5. SQLite 与阶段交接检查
+## 6. SQLite 与阶段交接检查
 
-官方示例全部使用 `lua_example_*` 或 `lua_complex_*` 私有表。可信脚本虽然能执行任意单条
-SQLite statement，但直接修改 ATT 受管表意味着自行承担不公开稳定的 schema 和全部
-不变量，不应从示例复制。
+需要私有状态的阶段示例只使用 `lua_example_*` 或 `lua_complex_*` 表；人工 Standard
+示例只调用 `ctx.standard`。可信脚本虽然能执行任意单条 SQLite statement，但直接修改
+ATT 受管表意味着自行承担不公开稳定的 schema 和全部不变量，也无法正确构造 Standard
+state，不应从示例复制。
 
 三个阶段分别有新 VM 和新连接。以下做法无效：
 
@@ -211,13 +271,14 @@ ctx.db.execute("CREATE TEMP TABLE handoff(value TEXT)")
 跨阶段只使用持久私有表或 ATT 已明确拥有的标准资产。每个阶段正常返回前必须 commit 或
 rollback；活动事务不会被隐式提交。
 
-## 6. 交付前盲测
+## 7. 交付前盲测
 
 让未参与脚本编写的人只阅读 [Lua 技术参考](lua.md)、本页和目标游戏协议材料，然后用
 隔离夹具验证：
 
 - Extract 首次建立、重复收敛、删除来源、原文/context 改变；
 - Translate 首跑、二跑零 LLM、有效语义变化后重译、accept 拒绝路径；
+- 独立 Lua 的 Value/Lines 形状、同族冲突、Current 覆盖、原子回滚和相同 Profile 零 LLM；
 - WriteBack 两次字节结果一致、任一目标漂移时不留下半修改；
 - MV/MZ 都只使用 `data/js` 逻辑路径；
 - 数据库事务关闭，TEMP/globals 未被误作阶段交接；

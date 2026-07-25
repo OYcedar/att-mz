@@ -15,11 +15,13 @@ use crate::diagnostic::SafeDiagnostic;
 use crate::fingerprint::Sha256Fingerprint;
 use crate::llm::{ChatMessage, LlmResponse};
 use crate::rpg_maker::extract::store::LuaSnapshot;
+use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
+use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
+use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::file_system::ScopedDirectoryPath;
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
 
 use super::{LuaPhase, LuaProjectContext, LuaSourcePath};
-use crate::rpg_maker::text::TextGroupKind;
 
 type HostFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
@@ -208,7 +210,7 @@ impl Error for TrustedLuaBindingFinalizationError {
     }
 }
 
-/// Lua 三阶段共同拥有的冻结来源、项目与数据库 Host 能力。
+/// Lua 各阶段与独立项目入口共同拥有的冻结来源、项目与数据库 Host 能力。
 ///
 /// 这一调用面不包含任何阶段专属操作，也不拥有会话终结权。VM worker 只能将请求
 /// 交回主 Tokio runtime 执行，不得在 Lua worker 内直接操作 SQLite 连接。
@@ -235,6 +237,7 @@ pub(crate) trait TrustedLuaCommonHostCalls: Send + Sync + 'static {
     fn begin(&self) -> HostFuture<Result<(), TrustedLuaHostCallError>>;
     fn commit(&self) -> HostFuture<Result<(), TrustedLuaHostCallError>>;
     fn rollback(&self) -> HostFuture<Result<(), TrustedLuaHostCallError>>;
+    fn transaction_active(&self) -> HostFuture<Result<bool, TrustedLuaHostCallError>>;
 }
 
 /// Lua Extract 主程序在内存中声明的唯一标准快照意图。
@@ -382,6 +385,316 @@ pub(crate) trait TrustedLuaPreparedTranslation: Send + Sync + 'static {
         &self,
         candidate: String,
     ) -> Result<TrustedLuaPreparedTranslationAcceptance, TrustedLuaHostCallError>;
+}
+
+/// 独立项目 Lua 打开 Standard 人工验收会话的 Host 能力。
+///
+/// Profile、资源和数据库快照如何解析完全由 Standard 核心拥有。Lua Host 只负责把
+/// 已冻结的只读单元投影为 userdata，并把候选批次原样交还给该会话。
+pub(crate) trait TrustedLuaStandardHostCalls: Send + Sync + 'static {
+    fn open(
+        &self,
+    ) -> HostFuture<Result<Arc<dyn TrustedLuaStandardSession>, TrustedLuaHostCallError>>;
+}
+
+/// 一轮只读 Standard 快照及其人工候选提交边界。
+///
+/// `units` 与 `get` 只读取 `open` 已冻结的内存事实；`accept` 才能产生副作用。每次
+/// `accept` 对所有合法去重族使用同一个核心事务，并在返回前到达明确提交终态。
+pub(crate) trait TrustedLuaStandardSession: Send + Sync + 'static {
+    fn units(&self) -> Vec<TrustedLuaStandardUnit>;
+
+    fn get(
+        &self,
+        owner: RpgMakerStandardAssetOwner,
+        group_location: RpgMakerLocation,
+        role: TextUnitRole,
+    ) -> Option<TrustedLuaStandardUnit>;
+
+    fn accept(
+        &self,
+        candidates: Vec<TrustedLuaStandardCandidate>,
+    ) -> HostFuture<Result<Vec<TrustedLuaStandardAcceptance>, TrustedLuaHostCallError>>;
+}
+
+/// Standard 核心会话中的一个不可由 Lua 构造的物理单元。
+///
+/// `handle` 只在当前核心会话内有意义；Lua Runtime 另加会话身份令牌，防止同一 VM
+/// 中不同 `open()` 会话的 userdata 被混用。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedLuaStandardUnit {
+    handle: usize,
+    owner: RpgMakerStandardAssetOwner,
+    group_kind: TextGroupKind,
+    group_location: RpgMakerLocation,
+    role: TextUnitRole,
+    original: TextUnitContent,
+    source_context_json: String,
+    translation: Option<TextUnitContent>,
+    model_text: TextUnitContent,
+    terms: Vec<TrustedLuaTranslationTerm>,
+    line_policy: TrustedLuaStandardLinePolicy,
+    status: TrustedLuaStandardUnitStatus,
+    family_size: usize,
+}
+
+impl TrustedLuaStandardUnit {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        handle: usize,
+        owner: RpgMakerStandardAssetOwner,
+        group_kind: TextGroupKind,
+        group_location: RpgMakerLocation,
+        role: TextUnitRole,
+        original: TextUnitContent,
+        source_context_json: String,
+        translation: Option<TextUnitContent>,
+        model_text: TextUnitContent,
+        terms: Vec<TrustedLuaTranslationTerm>,
+        line_policy: TrustedLuaStandardLinePolicy,
+        status: TrustedLuaStandardUnitStatus,
+        family_size: usize,
+    ) -> Self {
+        Self {
+            handle,
+            owner,
+            group_kind,
+            group_location,
+            role,
+            original,
+            source_context_json,
+            translation,
+            model_text,
+            terms,
+            line_policy,
+            status,
+            family_size,
+        }
+    }
+
+    pub(crate) const fn handle(&self) -> usize {
+        self.handle
+    }
+
+    pub(crate) const fn owner(&self) -> RpgMakerStandardAssetOwner {
+        self.owner
+    }
+
+    pub(crate) const fn group_kind(&self) -> TextGroupKind {
+        self.group_kind
+    }
+
+    pub(crate) fn group_location(&self) -> &RpgMakerLocation {
+        &self.group_location
+    }
+
+    pub(crate) fn role(&self) -> &TextUnitRole {
+        &self.role
+    }
+
+    pub(crate) fn original(&self) -> &TextUnitContent {
+        &self.original
+    }
+
+    pub(crate) fn source_context_json(&self) -> &str {
+        &self.source_context_json
+    }
+
+    pub(crate) fn translation(&self) -> Option<&TextUnitContent> {
+        self.translation.as_ref()
+    }
+
+    pub(crate) fn model_text(&self) -> &TextUnitContent {
+        &self.model_text
+    }
+
+    pub(crate) fn terms(&self) -> &[TrustedLuaTranslationTerm] {
+        &self.terms
+    }
+
+    pub(crate) const fn content_kind(&self) -> TrustedLuaStandardContentKind {
+        match self.original {
+            TextUnitContent::Value(_) => TrustedLuaStandardContentKind::Value,
+            TextUnitContent::Lines(_) => TrustedLuaStandardContentKind::Lines,
+        }
+    }
+
+    pub(crate) const fn line_policy(&self) -> TrustedLuaStandardLinePolicy {
+        self.line_policy
+    }
+
+    pub(crate) const fn status(&self) -> TrustedLuaStandardUnitStatus {
+        self.status
+    }
+
+    pub(crate) const fn family_size(&self) -> usize {
+        self.family_size
+    }
+}
+
+/// Standard 单元保留的是标量值还是独立行槽。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrustedLuaStandardContentKind {
+    Value,
+    Lines,
+}
+
+impl TrustedLuaStandardContentKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Value => "value",
+            Self::Lines => "lines",
+        }
+    }
+}
+
+/// Standard 对候选行边界的验收策略。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrustedLuaStandardLinePolicy {
+    Single,
+    Aligned(usize),
+    Reflow,
+}
+
+impl TrustedLuaStandardLinePolicy {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Aligned(_) => "aligned",
+            Self::Reflow => "reflow",
+        }
+    }
+
+    pub(crate) const fn expected_line_count(self) -> Option<usize> {
+        match self {
+            Self::Single => Some(1),
+            Self::Aligned(count) => Some(count),
+            Self::Reflow => None,
+        }
+    }
+}
+
+/// Standard 对当前译文/state 配对的只读判断。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrustedLuaStandardUnitStatus {
+    Current,
+    Missing,
+    Stale,
+    NotApplicable,
+    Unavailable,
+}
+
+impl TrustedLuaStandardUnitStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Missing => "missing",
+            Self::Stale => "stale",
+            Self::NotApplicable => "not_applicable",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Lua 已按 Value/Lines 边界解析的一项人工候选。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedLuaStandardCandidate {
+    handle: usize,
+    candidate: TextUnitContent,
+    replace_current: bool,
+}
+
+impl TrustedLuaStandardCandidate {
+    pub(crate) fn new(handle: usize, candidate: TextUnitContent, replace_current: bool) -> Self {
+        Self {
+            handle,
+            candidate,
+            replace_current,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn handle(&self) -> usize {
+        self.handle
+    }
+
+    #[cfg(test)]
+    pub(crate) fn candidate(&self) -> &TextUnitContent {
+        &self.candidate
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn replace_current(&self) -> bool {
+        self.replace_current
+    }
+
+    pub(crate) fn into_parts(self) -> (usize, TextUnitContent, bool) {
+        (self.handle, self.candidate, self.replace_current)
+    }
+}
+
+/// Standard 正常处理一项人工候选后的逐项结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TrustedLuaStandardAcceptance {
+    Accepted {
+        translation: TextUnitContent,
+        changed_locations: usize,
+    },
+    Rejected {
+        reason: String,
+        details: Vec<TrustedLuaStandardRejectionDetail>,
+    },
+}
+
+impl TrustedLuaStandardAcceptance {
+    pub(crate) fn accepted(translation: TextUnitContent, changed_locations: usize) -> Self {
+        Self::Accepted {
+            translation,
+            changed_locations,
+        }
+    }
+
+    pub(crate) fn rejected(
+        reason: impl Into<String>,
+        details: Vec<TrustedLuaStandardRejectionDetail>,
+    ) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+            details,
+        }
+    }
+}
+
+/// 一个稳定命名的候选拒绝详情字段。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedLuaStandardRejectionDetail {
+    name: String,
+    value: TrustedLuaStandardRejectionValue,
+}
+
+impl TrustedLuaStandardRejectionDetail {
+    pub(crate) fn new(name: impl Into<String>, value: TrustedLuaStandardRejectionValue) -> Self {
+        Self {
+            name: name.into(),
+            value,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn value(&self) -> &TrustedLuaStandardRejectionValue {
+        &self.value
+    }
+}
+
+/// Lua 拒绝结果可以无损表达的安全标量。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TrustedLuaStandardRejectionValue {
+    String(String),
+    Integer(usize),
+    Boolean(bool),
 }
 
 /// WriteBack 候选目录中的一个直接子项。
@@ -548,7 +861,7 @@ pub(crate) trait TrustedLuaWriteBackHostCalls: Send + Sync + 'static {
     ) -> Result<TrustedLuaWriteBackLayoutResult, TrustedLuaHostCallError>;
 }
 
-/// 三阶段共享调用面的明确所有权包装。
+/// 全部可信 Lua 调用共享面的明确所有权包装。
 pub(crate) struct TrustedLuaCommonBindings {
     calls: Arc<dyn TrustedLuaCommonHostCalls>,
 }
@@ -568,6 +881,10 @@ pub(crate) enum TrustedLuaPhaseBindings {
     Extract(Arc<dyn TrustedLuaExtractHostCalls>),
     Translate(Arc<dyn TrustedLuaTranslateHostCalls>),
     WriteBack(Arc<dyn TrustedLuaWriteBackHostCalls>),
+    Project {
+        arguments: Vec<String>,
+        standard: Arc<dyn TrustedLuaStandardHostCalls>,
+    },
 }
 
 impl TrustedLuaPhaseBindings {
@@ -576,6 +893,7 @@ impl TrustedLuaPhaseBindings {
             Self::Extract(_) => LuaPhase::Extract,
             Self::Translate(_) => LuaPhase::Translate,
             Self::WriteBack(_) => LuaPhase::WriteBack,
+            Self::Project { .. } => LuaPhase::Project,
         }
     }
 }
@@ -630,6 +948,22 @@ impl TrustedLuaRuntimeBindings {
         Self {
             common,
             phase: TrustedLuaPhaseBindings::WriteBack(write_back),
+            finalizer,
+        }
+    }
+
+    pub(crate) fn project(
+        common: TrustedLuaCommonBindings,
+        arguments: Vec<String>,
+        standard: Arc<dyn TrustedLuaStandardHostCalls>,
+        finalizer: Box<dyn TrustedLuaBindingFinalizer>,
+    ) -> Self {
+        Self {
+            common,
+            phase: TrustedLuaPhaseBindings::Project {
+                arguments,
+                standard,
+            },
             finalizer,
         }
     }

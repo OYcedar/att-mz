@@ -7,6 +7,7 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,8 +16,9 @@ use futures_util::FutureExt;
 
 use crate::application::config::{
     ConfigurationLoadError, ConfiguredExtractCommand, ConfiguredInitCommand,
-    ConfiguredRpgMakerCommand, ConfiguredTranslateCommand, ConfiguredWriteBackCommand,
-    SelectedLuaConfiguration, TranslateConfiguration,
+    ConfiguredProjectLuaCommand, ConfiguredProjectLuaStandardProfile, ConfiguredRpgMakerCommand,
+    ConfiguredTranslateCommand, ConfiguredWriteBackCommand, SelectedLuaConfiguration,
+    TranslateConfiguration,
 };
 use crate::diagnostic::{
     BoxedError, DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact,
@@ -58,6 +60,16 @@ use crate::rpg_maker::init::{
 use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingService;
 use crate::rpg_maker::lua::lua54::TrustedLua54Runtime;
 use crate::rpg_maker::lua::runtime::OwnedLuaProgram;
+use crate::rpg_maker::lua::runtime::{
+    TrustedLuaHostCallError, TrustedLuaStandardAcceptance, TrustedLuaStandardCandidate,
+    TrustedLuaStandardHostCalls, TrustedLuaStandardLinePolicy, TrustedLuaStandardRejectionDetail,
+    TrustedLuaStandardRejectionValue, TrustedLuaStandardSession, TrustedLuaStandardUnit,
+    TrustedLuaStandardUnitStatus, TrustedLuaTranslationTerm,
+};
+use crate::rpg_maker::lua::{
+    LuaInvocation, LuaProjectContext, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
+};
+use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::{
     ExistingProjectOpener, ExistingProjectOpeningError, ExistingProjectOpeningService,
     OpenedProject,
@@ -76,9 +88,16 @@ use crate::rpg_maker::project_lease::{
     AlreadyHeldProjectCommandLeaseProvider, ProjectCommandLease, ProjectCommandLeaseError,
     ProjectCommandLeaseProvider, ProjectCommandLeaseService,
 };
+use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
+use crate::rpg_maker::text::RpgMakerLocation;
 use crate::rpg_maker::translate::TranslateInput;
 use crate::rpg_maker::translate::TranslateOutput;
 use crate::rpg_maker::translate::asset_reader::RpgMakerStandardTranslationAssetReadingService;
+use crate::rpg_maker::translate::candidate::{
+    StandardCandidateAcceptance, StandardCandidateRejectionReason, StandardCandidateRequest,
+    StandardCandidateSession, StandardCandidateUnit, StandardCandidateUnitIndex,
+    StandardCandidateUnitStatus,
+};
 use crate::rpg_maker::translate::executor::{
     AsyncDelay, RpgMakerStandardTranslationTaskExecutionError,
     RpgMakerStandardTranslationTaskExecutionService, TranslationTaskResponseProcessingService,
@@ -95,6 +114,7 @@ use crate::rpg_maker::translate::profile::{
     TranslationResponseEnvelope,
 };
 use crate::rpg_maker::translate::result_store::{
+    RpgMakerStandardCandidateAcceptanceError, RpgMakerStandardCandidateAcceptanceService,
     RpgMakerStandardTranslationResultStorageError, RpgMakerStandardTranslationResultStorageService,
 };
 use crate::rpg_maker::translate::service::{
@@ -102,8 +122,9 @@ use crate::rpg_maker::translate::service::{
     TranslateServiceError,
 };
 use crate::rpg_maker::translate::standard::{
-    StandardTranslationLog, StandardTranslationLogEvent, StandardTranslationLogTaskOutcome,
-    StandardTranslationService,
+    ExpectedLineShape, StandardTranslationAssetReader, StandardTranslationLog,
+    StandardTranslationLogEvent, StandardTranslationLogTaskOutcome, StandardTranslationService,
+    TranslationUnitRejectionReason,
 };
 use crate::rpg_maker::translate::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
@@ -162,6 +183,11 @@ enum TranslateProgressPhase {
     Planning,
     ConfirmedTasks,
     NoWork,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectLuaProgressPhase {
+    Running,
 }
 
 impl AsyncDelay for TokioAsyncDelay {
@@ -254,6 +280,9 @@ pub(crate) enum RpgMakerCommandOutput {
         plan_source: ProjectLogValueSource,
         lua_cleared: bool,
     },
+    Lua {
+        project: crate::rpg_maker::ProjectName,
+    },
 }
 
 fn init_terminal_progress(
@@ -319,6 +348,14 @@ fn translate_terminal_progress(
         TranslateProgressPhase::ConfirmedTasks => confirmed.clone(),
         TranslateProgressPhase::NoWork => no_work.clone(),
     })
+}
+
+fn project_lua_terminal_progress(
+    mode: ProgressMode,
+    locale: UiLocale,
+) -> TerminalProgress<ProjectLuaProgressPhase> {
+    let running = UiLocalizer::new(locale).format(UiMessage::ProgressProjectLua);
+    TerminalProgress::stderr(mode, move |_| running.clone())
 }
 
 fn write_back_terminal_progress(
@@ -486,6 +523,17 @@ impl fmt::Display for ProjectLogDegradedWhileReportingPanic {
 
 impl Error for ProjectLogDegradedWhileReportingPanic {}
 
+#[derive(Debug)]
+struct UnexpectedProjectLuaOutcome;
+
+impl fmt::Display for UnexpectedProjectLuaOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("project Lua returned an Extract-only managed outcome")
+    }
+}
+
+impl Error for UnexpectedProjectLuaOutcome {}
+
 /// 按本次命令只构造实际需要的 RPG Maker 生产纵向切片。
 pub(crate) struct ProductionRpgMakerCommandRunner {
     layout: RpgMakerLayout,
@@ -530,6 +578,9 @@ impl ProductionRpgMakerCommandRunner {
                 }
                 ConfiguredRpgMakerCommand::WriteBack(command) => {
                     self.run_write_back(command, termination_signals).await
+                }
+                ConfiguredRpgMakerCommand::Lua(command) => {
+                    self.run_project_lua(command, termination_signals).await
                 }
             }
         })
@@ -2695,6 +2746,349 @@ impl ProductionRpgMakerCommandRunner {
             Some(pending_project_log),
         )
     }
+
+    async fn run_project_lua(
+        self,
+        command: ConfiguredProjectLuaCommand,
+        termination_signals: &mut TerminationSignals,
+    ) -> ProductionCommandRunReport {
+        let performance = Arc::new(RunPerformanceCounters::default());
+        let progress = project_lua_terminal_progress(self.progress_mode, self.locale);
+        let cancellation = CooperativeCancellation::default();
+        let projects_root = command.common().projects_root().to_path_buf();
+        let sqlite = match RusqliteStorage::start_with_performance(
+            command.common().sqlite().clone(),
+            Arc::clone(&performance),
+        )
+        .map_err(ProductionCommandError::sqlite_start)
+        {
+            Ok(value) => value,
+            Err(error) => return ProductionCommandRunReport::failed_before_logging(error),
+        };
+        let file_system = match SystemFileSystem::new_with_performance(
+            command.common().filesystem().clone(),
+            Arc::clone(&performance),
+        )
+        .map_err(ProductionCommandError::file_system_build)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(source) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", source);
+                }
+                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                    error, shutdown,
+                );
+            }
+        };
+        let project_name = command.project_name().clone();
+        let lease_provider = ProjectCommandLeaseService::new(
+            projects_root.clone(),
+            self.layout.engine(),
+            file_system.clone(),
+        );
+        let project_lease = drive_project_lease(
+            &lease_provider,
+            &project_name,
+            &file_system,
+            &sqlite,
+            &cancellation,
+            termination_signals,
+            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+        )
+        .await;
+        let project_lease_guard = match project_lease {
+            DrivenCommand::Finished(Ok(lease)) => lease,
+            DrivenCommand::Finished(Err(error)) => {
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(source) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", source);
+                }
+                if let Err(source) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", source);
+                }
+                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                    error, shutdown,
+                );
+            }
+            DrivenCommand::Interrupted(result) => {
+                drop(result);
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(source) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", source);
+                }
+                if let Err(source) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", source);
+                }
+                progress.finish();
+                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+            }
+            DrivenCommand::SignalFailed { source, result } => {
+                let outcome = match result {
+                    Ok(lease) => {
+                        drop(lease);
+                        SignalOutcomeSource::Cancelled
+                    }
+                    Err(error) => SignalOutcomeSource::CommandFailed(error),
+                };
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(error) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", error);
+                }
+                if let Err(error) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", error);
+                }
+                progress.finish();
+                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                    ProductionCommandError::signal(source, outcome),
+                    shutdown,
+                );
+            }
+        };
+        let project_opening = drive_existing_project_opening(
+            ProjectOpeningLocation {
+                projects_root,
+                layout: self.layout,
+            },
+            &project_name,
+            &file_system,
+            &sqlite,
+            &cancellation,
+            termination_signals,
+            || progress.safe_stopping(progress_safe_stopping(self.locale)),
+        )
+        .await;
+        let opened_project = match project_opening {
+            DrivenCommand::Finished(Ok(project)) => project,
+            DrivenCommand::Finished(Err(error)) => {
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(source) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", source);
+                }
+                if let Err(source) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", source);
+                }
+                drop(project_lease_guard);
+                progress.finish();
+                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                    error, shutdown,
+                );
+            }
+            DrivenCommand::Interrupted(result) => {
+                drop(result);
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(source) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", source);
+                }
+                if let Err(source) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", source);
+                }
+                drop(project_lease_guard);
+                progress.finish();
+                return ProductionCommandRunReport::interrupted_before_logging(shutdown);
+            }
+            DrivenCommand::SignalFailed { source, result } => {
+                let outcome = match result {
+                    Ok(project) => {
+                        drop(project);
+                        SignalOutcomeSource::Cancelled
+                    }
+                    Err(error) => SignalOutcomeSource::CommandFailed(error),
+                };
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(error) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", error);
+                }
+                if let Err(error) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", error);
+                }
+                drop(project_lease_guard);
+                progress.finish();
+                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                    ProductionCommandError::signal(source, outcome),
+                    shutdown,
+                );
+            }
+        };
+        let mut project_log = match start_command_log(CommandLogStart {
+            common: command.common(),
+            locale: self.locale,
+            layout: self.layout,
+            project: command.project_name().as_str(),
+            command: "lua",
+            stage: DiagnosticStage::Lua,
+            profile: None,
+            performance: Arc::clone(&performance),
+            panic_boundary: &self.panic_boundary,
+        }) {
+            Ok(log) => log,
+            Err(error) => {
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(source) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", source);
+                }
+                if let Err(source) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", source);
+                }
+                drop(project_lease_guard);
+                progress.finish();
+                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                    error, shutdown,
+                );
+            }
+        };
+        let lua = match load_lua_selection(&file_system, command.lua()).await {
+            Ok(lua) => lua,
+            Err(source) => {
+                let diagnostic = source.safe_diagnostic();
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(error) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", error);
+                }
+                if let Err(error) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", error);
+                }
+                drop(project_lease_guard);
+                return observed_construction_failure(
+                    project_log,
+                    ProductionCommandError::ConfigurationOrInput(Box::new(
+                        ProductionCommandError::report_diagnostic(source, diagnostic),
+                    )),
+                    shutdown,
+                )
+                .await;
+            }
+        };
+        let cpu = match RayonCpuExecutor::start(command.cpu())
+            .map_err(ProductionCommandError::cpu_start)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let mut shutdown = ShutdownFailures::default();
+                if let Err(source) = lua.runtime.shutdown().await {
+                    shutdown.push("Lua", source);
+                }
+                if let Err(source) = sqlite.shutdown().await {
+                    shutdown.push("SQLite", source);
+                }
+                if let Err(source) = file_system.shutdown().await {
+                    shutdown.push("FileSystem", source);
+                }
+                drop(project_lease_guard);
+                return observed_construction_failure(project_log, error, shutdown).await;
+            }
+        };
+        let arguments = command.arguments().to_vec();
+        let standard = Arc::new(ProductionProjectLuaStandardHostCalls::new(
+            command.into_standard_profile(),
+            opened_project.clone(),
+            self.locale,
+            file_system.clone(),
+            sqlite.clone(),
+            cpu.clone(),
+        ));
+        let host =
+            TrustedLuaExecutionHostingService::<_, OpenAiChatCompletionExecutor, _, _>::without_llm(
+                file_system.clone(),
+                lua.runtime.clone(),
+                sqlite.clone(),
+            );
+        let invocation = LuaInvocation::project(
+            lua.program.clone(),
+            LuaProjectContext::for_frozen_source(
+                opened_project.name().as_str(),
+                opened_project.layout().rpg_maker_layout().engine(),
+                opened_project.source_content_root(),
+                opened_project.database_path().to_path_buf(),
+                opened_project.language_pair().clone(),
+            ),
+            arguments,
+            standard.clone(),
+        );
+        let progress_observer = ProductionProgressObserver::new(
+            progress.observer(),
+            &project_log,
+            project_lua_phase_code,
+        );
+        progress_observer.observe(ProgressSnapshot::indeterminate(
+            ProjectLuaProgressPhase::Running,
+        ));
+        let script_path = lua.program.main_script_path().to_path_buf();
+        let runtime_for_cancellation = lua.runtime.clone();
+        let safe_stopping = progress_safe_stopping(self.locale);
+        let execution = drive_command(
+            host.execute(invocation),
+            termination_signals,
+            || {
+                cancellation.request();
+                runtime_for_cancellation.request_cancellation();
+                cpu.cancel_waits();
+                file_system.cancel_waits();
+                sqlite.cancel_waits();
+            },
+            || {
+                progress.safe_stopping(safe_stopping);
+                let (confirmed, total) = progress_observer.confirmed_amount();
+                project_log.emit_cancellation(
+                    ProjectLogCode::CancellationRequested,
+                    confirmed,
+                    total,
+                );
+            },
+        )
+        .await
+        .map(|result| {
+            result
+                .map_err(|source| map_project_lua_host_error(source, &script_path))
+                .and_then(|completion| match completion {
+                    OperationCompletion::Cancelled => Ok(OperationCompletion::Cancelled),
+                    OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty) => {
+                        Ok(OperationCompletion::Completed(RpgMakerCommandOutput::Lua {
+                            project: project_name,
+                        }))
+                    }
+                    OperationCompletion::Completed(TrustedLuaExecutionOutcome::ExtractIntent(
+                        _,
+                    )) => Err(ProductionCommandError::unexpected_project_lua_outcome(
+                        &script_path,
+                    )),
+                })
+        });
+        if matches!(&execution, DrivenCommand::Interrupted(_)) {
+            let (confirmed, total) = progress_observer.confirmed_amount();
+            project_log.emit_cancellation(ProjectLogCode::SafeStopFinished, confirmed, total);
+        }
+        progress_observer.finish();
+        drop(progress_observer);
+        if let Some(profile_id) = standard.opened_profile_id() {
+            project_log.set_profile(profile_id);
+        }
+        let mut shutdown = ShutdownFailures::default();
+        if let Err(source) = lua.runtime.shutdown().await {
+            shutdown.push("Lua", source);
+        }
+        if let Err(source) = sqlite.shutdown().await {
+            shutdown.push("SQLite", source);
+        }
+        if let Err(source) = file_system.shutdown().await {
+            shutdown.push("FileSystem", source);
+        }
+        if let Err(source) = cpu.shutdown() {
+            shutdown.push("CPU", source);
+        }
+        drop(project_lease_guard);
+        progress.finish();
+        let log_outcome = project_log_outcome(&execution, &shutdown);
+        let failure_diagnostics = project_log_failure_diagnostics(&execution, &shutdown);
+        let pending_project_log =
+            PendingProjectLog::new(project_log, log_outcome, failure_diagnostics);
+        ProductionCommandRunReport::from_completion_with_project_log(
+            execution,
+            shutdown,
+            Some(pending_project_log),
+        )
+    }
 }
 
 async fn load_rules_program(
@@ -2805,6 +3199,7 @@ enum RunPlanResolutionError {
     InitPathRequired,
     NoReusableExtractPlan,
     ProfileRequired,
+    ProjectLuaProfileRequired,
     SavedProfileUnavailable { profile_id: String },
 }
 
@@ -2820,6 +3215,8 @@ impl fmt::Display for RunPlanResolutionError {
             Self::ProfileRequired => {
                 formatter.write_str("该项目尚未保存过 Translate Profile，请提供 PROFILE_ID")
             }
+            Self::ProjectLuaProfileRequired => formatter
+                .write_str("该项目尚未保存过 Translate Profile，请提供 --profile PROFILE_ID"),
             Self::SavedProfileUnavailable { profile_id } => write!(
                 formatter,
                 "上次成功使用的 Profile {profile_id} 已不在当前配置中，请显式指定可用 Profile",
@@ -3302,6 +3699,10 @@ const fn translate_phase_code(phase: TranslateProgressPhase) -> ProjectLogPhase 
     }
 }
 
+const fn project_lua_phase_code(_: ProjectLuaProgressPhase) -> ProjectLogPhase {
+    ProjectLogPhase::Lua
+}
+
 const fn write_back_phase_code(phase: WriteBackProgressPhase) -> ProjectLogPhase {
     match phase {
         WriteBackProgressPhase::ReadingAssets => ProjectLogPhase::ReadAssets,
@@ -3359,6 +3760,12 @@ fn command_panic_context(
         ConfiguredRpgMakerCommand::WriteBack(command) => (
             "write-back",
             DiagnosticStage::WriteBack,
+            command.common(),
+            command.project_name().as_str(),
+        ),
+        ConfiguredRpgMakerCommand::Lua(command) => (
+            "lua",
+            DiagnosticStage::Lua,
             command.common(),
             command.project_name().as_str(),
         ),
@@ -4061,6 +4468,8 @@ type ProductionTranslationExecutor = RpgMakerStandardTranslationTaskExecutionSer
 >;
 type ProductionTranslationStore =
     RpgMakerStandardTranslationResultStorageService<RusqliteStorage, RayonCpuExecutor>;
+type ProductionStandardCandidateAcceptance =
+    RpgMakerStandardCandidateAcceptanceService<RusqliteStorage, RayonCpuExecutor>;
 type ProductionStandardTranslation = StandardTranslationService<
     ProductionTranslationAssetReader,
     ProductionTranslationPlanner,
@@ -4076,6 +4485,528 @@ type ProductionLuaHost = TrustedLuaExecutionHostingService<
     RusqliteStorage,
 >;
 type ProductionLuaTranslation = LuaTranslationService<ProductionLuaHost>;
+
+/// 独立项目 Lua 到 Standard 人工候选核心之间的生产组合根。
+///
+/// Profile 只在 `ctx.standard.open()` 时解析；普通项目 Lua 因而不依赖任何 Translate
+/// 配置或已保存运行方案。每次 `open()` 都重新读取项目权威快照，配置源本身则保持为
+/// 本次 CLI 已读取的当前配置。
+struct ProductionProjectLuaStandardHostCalls {
+    selection: ConfiguredProjectLuaStandardProfile,
+    resolved: Arc<tokio::sync::OnceCell<ResolvedProjectLuaStandardConfiguration>>,
+    opened_profile: Arc<tokio::sync::OnceCell<String>>,
+    project: OpenedProject,
+    ui_locale: UiLocale,
+    file_system: SystemFileSystem,
+    sqlite: RusqliteStorage,
+    cpu: RayonCpuExecutor,
+}
+
+impl ProductionProjectLuaStandardHostCalls {
+    fn new(
+        selection: ConfiguredProjectLuaStandardProfile,
+        project: OpenedProject,
+        ui_locale: UiLocale,
+        file_system: SystemFileSystem,
+        sqlite: RusqliteStorage,
+        cpu: RayonCpuExecutor,
+    ) -> Self {
+        Self {
+            selection,
+            resolved: Arc::new(tokio::sync::OnceCell::new()),
+            opened_profile: Arc::new(tokio::sync::OnceCell::new()),
+            project,
+            ui_locale,
+            file_system,
+            sqlite,
+            cpu,
+        }
+    }
+
+    async fn resolve_configuration(
+        &self,
+    ) -> Result<Arc<TranslateConfiguration>, TrustedLuaHostCallError> {
+        let resolved = self
+            .resolved
+            .get_or_try_init(|| async {
+                let explicit_profile_id = self.selection.explicit_profile_id().map(str::to_owned);
+                let selected_from_project_state = explicit_profile_id.is_none();
+                let profile_id = match explicit_profile_id {
+                    Some(profile_id) => profile_id,
+                    None => {
+                        let repository = ProjectRunPlanPersistenceService::new(self.sqlite.clone());
+                        let plans = repository
+                            .read(self.project.database_path().to_path_buf())
+                            .await
+                            .map_err(|source| {
+                                project_lua_standard_command_error(
+                                    "profile_state_unavailable",
+                                    "standard.open",
+                                    ProductionCommandError::project_run_plan_read(source),
+                                )
+                            })?;
+                        plans
+                            .translate()
+                            .map(|plan| plan.profile_id().to_owned())
+                            .ok_or_else(|| {
+                                project_lua_standard_command_error(
+                                    "profile_required",
+                                    "standard.open",
+                                    ProductionCommandError::run_plan_resolution(
+                                        RunPlanResolutionError::ProjectLuaProfileRequired,
+                                    ),
+                                )
+                            })?
+                    }
+                };
+                let configuration = self.selection.resolve(&profile_id).map_err(|source| {
+                    if selected_from_project_state
+                        && matches!(
+                            source,
+                            ConfigurationLoadError::TranslationProfileNotFound { .. }
+                        )
+                    {
+                        project_lua_standard_command_error(
+                            "saved_profile_unavailable",
+                            "standard.open",
+                            ProductionCommandError::run_plan_resolution(
+                                RunPlanResolutionError::SavedProfileUnavailable {
+                                    profile_id: profile_id.clone(),
+                                },
+                            ),
+                        )
+                    } else {
+                        project_lua_standard_command_error(
+                            "profile_invalid",
+                            "standard.open",
+                            ProductionCommandError::configuration_load(source),
+                        )
+                    }
+                })?;
+                Ok(ResolvedProjectLuaStandardConfiguration {
+                    profile_id,
+                    configuration,
+                })
+            })
+            .await?;
+        Ok(Arc::clone(&resolved.configuration))
+    }
+
+    fn opened_profile_id(&self) -> Option<&str> {
+        self.opened_profile.get().map(String::as_str)
+    }
+
+    async fn open_session(
+        &self,
+    ) -> Result<Arc<dyn TrustedLuaStandardSession>, TrustedLuaHostCallError> {
+        let configuration = self.resolve_configuration().await?;
+        let (profile, translation_resources) = build_production_translation_profile(
+            configuration.as_ref(),
+            self.ui_locale,
+            &self.file_system,
+            &self.project,
+        )
+        .await
+        .map_err(project_lua_standard_translation_build_error)?;
+        let placeholders = Pcre2PlaceholderService::new()
+            .map_err(ProductionTranslationExecutionBuildError::builtin_placeholder_compile)
+            .map_err(project_lua_standard_translation_build_error)?;
+        let corpus = RpgMakerStandardTranslationAssetReadingService::new(
+            self.sqlite.clone(),
+            self.cpu.clone(),
+        )
+        .read(&self.project)
+        .await
+        .map_err(|source| {
+            let diagnostic = source.safe_diagnostic_source(
+                DiagnosticStage::Lua,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            );
+            project_lua_standard_host_error(
+                "snapshot_unavailable",
+                "standard.open",
+                source,
+                diagnostic,
+            )
+        })?;
+        let resources = TranslationPlanningResourceReadingService::new(
+            self.file_system.clone(),
+            self.cpu.clone(),
+        );
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<
+            _,
+            _,
+            OpenAiChatCompletionClient,
+        >::new(
+            resources,
+            translation_resources,
+            placeholders,
+            self.cpu.clone(),
+        );
+        let session = planner
+            .open_candidate_session(&self.project, &profile, corpus)
+            .await
+            .map_err(|source| {
+                let diagnostic = source.safe_diagnostic_source(
+                    DiagnosticStage::Lua,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::FixInput,
+                );
+                project_lua_standard_host_error("open_failed", "standard.open", source, diagnostic)
+            })?;
+        let resolved = self
+            .resolved
+            .get()
+            .expect("成功打开 Standard 会话前必须已经冻结 Profile");
+        let _ = self.opened_profile.set(resolved.profile_id.clone());
+        let session: Arc<dyn TrustedLuaStandardSession> =
+            Arc::new(ProductionProjectLuaStandardSession {
+                project: self.project.clone(),
+                session: Arc::new(session),
+                acceptance: Arc::new(RpgMakerStandardCandidateAcceptanceService::new(
+                    self.sqlite.clone(),
+                    self.cpu.clone(),
+                )),
+            });
+        Ok(session)
+    }
+}
+
+impl TrustedLuaStandardHostCalls for ProductionProjectLuaStandardHostCalls {
+    fn open(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Arc<dyn TrustedLuaStandardSession>, TrustedLuaHostCallError>>
+                + Send
+                + 'static,
+        >,
+    > {
+        let calls = Self {
+            selection: self.selection.clone(),
+            resolved: Arc::clone(&self.resolved),
+            opened_profile: Arc::clone(&self.opened_profile),
+            project: self.project.clone(),
+            ui_locale: self.ui_locale,
+            file_system: self.file_system.clone(),
+            sqlite: self.sqlite.clone(),
+            cpu: self.cpu.clone(),
+        };
+        Box::pin(async move { calls.open_session().await })
+    }
+}
+
+struct ResolvedProjectLuaStandardConfiguration {
+    profile_id: String,
+    configuration: Arc<TranslateConfiguration>,
+}
+
+struct ProductionProjectLuaStandardSession {
+    project: OpenedProject,
+    session: Arc<StandardCandidateSession>,
+    acceptance: Arc<ProductionStandardCandidateAcceptance>,
+}
+
+impl TrustedLuaStandardSession for ProductionProjectLuaStandardSession {
+    fn units(&self) -> Vec<TrustedLuaStandardUnit> {
+        self.session
+            .units()
+            .into_iter()
+            .map(project_lua_standard_unit)
+            .collect()
+    }
+
+    fn get(
+        &self,
+        owner: RpgMakerStandardAssetOwner,
+        group_location: RpgMakerLocation,
+        role: TextUnitRole,
+    ) -> Option<TrustedLuaStandardUnit> {
+        self.session
+            .get(owner, &group_location, &role)
+            .map(project_lua_standard_unit)
+    }
+
+    fn accept(
+        &self,
+        candidates: Vec<TrustedLuaStandardCandidate>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<TrustedLuaStandardAcceptance>, TrustedLuaHostCallError>>
+                + Send
+                + 'static,
+        >,
+    > {
+        let project = self.project.clone();
+        let session = Arc::clone(&self.session);
+        let acceptance = Arc::clone(&self.acceptance);
+        Box::pin(async move {
+            let requests = candidates
+                .into_iter()
+                .map(|candidate| {
+                    let (handle, candidate, replace_current) = candidate.into_parts();
+                    StandardCandidateRequest::new(
+                        StandardCandidateUnitIndex::new(handle),
+                        candidate,
+                        replace_current,
+                    )
+                })
+                .collect();
+            acceptance
+                .accept(&project, session, requests)
+                .await
+                .map_err(project_lua_standard_acceptance_error)
+                .and_then(|results| {
+                    results
+                        .into_iter()
+                        .map(project_lua_standard_acceptance)
+                        .collect()
+                })
+        })
+    }
+}
+
+fn project_lua_standard_unit(unit: StandardCandidateUnit) -> TrustedLuaStandardUnit {
+    let identity = unit.identity();
+    let line_policy = match unit.line_shape() {
+        ExpectedLineShape::Reflow => TrustedLuaStandardLinePolicy::Reflow,
+        ExpectedLineShape::Aligned(_count)
+            if matches!(identity.source_content(), TextUnitContent::Value(_)) =>
+        {
+            TrustedLuaStandardLinePolicy::Single
+        }
+        ExpectedLineShape::Aligned(count) => TrustedLuaStandardLinePolicy::Aligned(count.get()),
+    };
+    let status = match unit.status() {
+        StandardCandidateUnitStatus::Current => TrustedLuaStandardUnitStatus::Current,
+        StandardCandidateUnitStatus::Missing => TrustedLuaStandardUnitStatus::Missing,
+        StandardCandidateUnitStatus::Stale => TrustedLuaStandardUnitStatus::Stale,
+        StandardCandidateUnitStatus::NotApplicable => TrustedLuaStandardUnitStatus::NotApplicable,
+        StandardCandidateUnitStatus::Unavailable => TrustedLuaStandardUnitStatus::Unavailable,
+    };
+    TrustedLuaStandardUnit::new(
+        unit.index().get(),
+        identity.owner(),
+        identity.kind(),
+        identity.group_location().clone(),
+        identity.role().clone(),
+        identity.source_content().clone(),
+        identity.source_context_json().to_owned(),
+        unit.translation().cloned(),
+        unit.model_text().clone(),
+        unit.terms()
+            .iter()
+            .map(|term| TrustedLuaTranslationTerm::new(term.term(), term.translation()))
+            .collect(),
+        line_policy,
+        status,
+        unit.family_size(),
+    )
+}
+
+fn project_lua_standard_acceptance(
+    result: StandardCandidateAcceptance,
+) -> Result<TrustedLuaStandardAcceptance, TrustedLuaHostCallError> {
+    match result {
+        StandardCandidateAcceptance::Accepted {
+            translation,
+            changed_locations,
+        } => Ok(TrustedLuaStandardAcceptance::accepted(
+            translation,
+            changed_locations,
+        )),
+        StandardCandidateAcceptance::Rejected { reason } => {
+            let (reason, details) = project_lua_standard_rejection(reason)?;
+            Ok(TrustedLuaStandardAcceptance::rejected(reason, details))
+        }
+    }
+}
+
+fn project_lua_standard_rejection(
+    reason: StandardCandidateRejectionReason,
+) -> Result<(&'static str, Vec<TrustedLuaStandardRejectionDetail>), TrustedLuaHostCallError> {
+    use TrustedLuaStandardRejectionValue::{Boolean, Integer, String as Text};
+
+    let string = |name, value: String| TrustedLuaStandardRejectionDetail::new(name, Text(value));
+    let integer = |name, value: usize| {
+        i64::try_from(value)
+            .map(|_| TrustedLuaStandardRejectionDetail::new(name, Integer(value)))
+            .map_err(|_| project_lua_standard_projection_error(name, value))
+    };
+    Ok(match reason {
+        StandardCandidateRejectionReason::NotApplicable => ("not_applicable", Vec::new()),
+        StandardCandidateRejectionReason::Unavailable { detail } => {
+            ("unavailable", vec![string("detail", detail)])
+        }
+        StandardCandidateRejectionReason::ConflictingCandidate => {
+            ("conflicting_candidate", Vec::new())
+        }
+        StandardCandidateRejectionReason::CurrentReplacementRequired => {
+            ("current_replacement_required", Vec::new())
+        }
+        StandardCandidateRejectionReason::Candidate(reason) => match reason {
+            TranslationUnitRejectionReason::Missing => ("missing", Vec::new()),
+            TranslationUnitRejectionReason::Duplicate => ("duplicate", Vec::new()),
+            TranslationUnitRejectionReason::InvalidShape { message } => {
+                ("invalid_shape", vec![string("message", message)])
+            }
+            TranslationUnitRejectionReason::LineCountMismatch { expected, actual } => (
+                "line_count_mismatch",
+                vec![integer("expected", expected)?, integer("actual", actual)?],
+            ),
+            TranslationUnitRejectionReason::InvalidLineText { line_index } => {
+                let line = line_index
+                    .checked_add(1)
+                    .ok_or_else(|| project_lua_standard_projection_error("line", line_index))?;
+                ("invalid_line_text", vec![integer("line", line)?])
+            }
+            TranslationUnitRejectionReason::BlankLineMismatch {
+                line_index,
+                expected_blank,
+            } => {
+                let line = line_index
+                    .checked_add(1)
+                    .ok_or_else(|| project_lua_standard_projection_error("line", line_index))?;
+                (
+                    "blank_line_mismatch",
+                    vec![
+                        integer("line", line)?,
+                        TrustedLuaStandardRejectionDetail::new(
+                            "expected_blank",
+                            Boolean(expected_blank),
+                        ),
+                    ],
+                )
+            }
+            TranslationUnitRejectionReason::BlankTranslation => ("blank_translation", Vec::new()),
+            TranslationUnitRejectionReason::NoNaturalLanguageText => {
+                ("no_natural_language_text", Vec::new())
+            }
+            TranslationUnitRejectionReason::ContainsByteOrderMark => {
+                ("contains_byte_order_mark", Vec::new())
+            }
+            TranslationUnitRejectionReason::PlaceholderMismatch { token } => {
+                ("placeholder_mismatch", vec![string("token", token)])
+            }
+            TranslationUnitRejectionReason::UnexpectedPlaceholderToken { token } => {
+                ("unexpected_placeholder_token", vec![string("token", token)])
+            }
+            TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { original } => (
+                "placeholder_normalization_ambiguous",
+                vec![string("original", original)],
+            ),
+            TranslationUnitRejectionReason::SourceResidual { fragment } => {
+                ("source_residual", vec![string("fragment", fragment)])
+            }
+        },
+    })
+}
+
+fn project_lua_standard_projection_error(
+    field: &'static str,
+    value: usize,
+) -> TrustedLuaHostCallError {
+    let detail = format!("field={field}; value={value}; expected=lua_integer");
+    TrustedLuaHostCallError::new(
+        "standard",
+        "internal_invariant",
+        "Standard 候选结果无法无损投影为 Lua 整数",
+        None,
+        None,
+    )
+    .with_operation("standard.accept")
+    .with_safe_diagnostic(SafeDiagnostic::new(
+        DiagnosticCode::InternalOperation,
+        DiagnosticStage::Lua,
+        DiagnosticSubject::component("standard_candidate_projection"),
+        DiagnosticReason::failure_with_detail(DiagnosticFailureKind::InternalInvariant, detail),
+        DiagnosticImpact::ProgressPreserved,
+        DiagnosticAction::ReportBug,
+    ))
+}
+
+fn project_lua_standard_command_error(
+    kind: &'static str,
+    operation: &'static str,
+    source: ProductionCommandError,
+) -> TrustedLuaHostCallError {
+    let mut diagnostic = source.failure_report().primary.public().clone();
+    diagnostic.stage = DiagnosticStage::Lua;
+    project_lua_standard_host_error(kind, operation, source, diagnostic)
+}
+
+fn project_lua_standard_translation_build_error(
+    source: ProductionTranslationExecutionBuildError,
+) -> TrustedLuaHostCallError {
+    let mut diagnostic = source.diagnostic().clone();
+    diagnostic.stage = DiagnosticStage::Lua;
+    project_lua_standard_host_error(
+        "profile_resources_invalid",
+        "standard.open",
+        source,
+        diagnostic,
+    )
+}
+
+fn project_lua_standard_acceptance_error(
+    source: RpgMakerStandardCandidateAcceptanceError<
+        SqliteRuntimeError,
+        crate::runtime::cpu::CpuExecutorUnavailable,
+    >,
+) -> TrustedLuaHostCallError {
+    let (domain, kind) = match &source {
+        RpgMakerStandardCandidateAcceptanceError::StaleSnapshot { .. } => {
+            ("standard", "stale_snapshot")
+        }
+        RpgMakerStandardCandidateAcceptanceError::NotCommitted { .. } => {
+            ("sqlite", "operation_failed")
+        }
+        RpgMakerStandardCandidateAcceptanceError::OutcomeUnknown { .. } => {
+            ("sqlite", "outcome_unknown")
+        }
+        RpgMakerStandardCandidateAcceptanceError::DatabaseNotFound { .. } => {
+            ("sqlite", "operation_failed")
+        }
+        RpgMakerStandardCandidateAcceptanceError::SchedulePreparation(_)
+        | RpgMakerStandardCandidateAcceptanceError::InvalidCandidate(_)
+        | RpgMakerStandardCandidateAcceptanceError::ScheduleEncoding(_)
+        | RpgMakerStandardCandidateAcceptanceError::InvalidPlan(_)
+        | RpgMakerStandardCandidateAcceptanceError::SessionUpdate(_) => {
+            ("standard", "acceptance_failed")
+        }
+    };
+    let diagnostic = source.safe_diagnostic(DiagnosticStage::Lua);
+    TrustedLuaHostCallError::new(
+        domain,
+        kind,
+        source.to_string(),
+        None,
+        Some(Arc::new(source)),
+    )
+    .with_operation("standard.accept")
+    .with_safe_diagnostic(diagnostic)
+}
+
+fn project_lua_standard_host_error<E>(
+    kind: &'static str,
+    operation: &'static str,
+    source: E,
+    diagnostic: SafeDiagnostic,
+) -> TrustedLuaHostCallError
+where
+    E: Error + Send + Sync + 'static,
+{
+    TrustedLuaHostCallError::new(
+        "standard",
+        kind,
+        source.to_string(),
+        None,
+        Some(Arc::new(source)),
+    )
+    .with_operation(operation)
+    .with_safe_diagnostic(diagnostic)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PromptResourceComponent {
@@ -4534,6 +5465,104 @@ struct ProductionSelectedTranslationExecutionBuilder<'a> {
     cancellation: CooperativeCancellation,
 }
 
+async fn build_production_translation_profile(
+    configuration: &TranslateConfiguration,
+    ui_locale: UiLocale,
+    file_system: &SystemFileSystem,
+    project: &OpenedProject,
+) -> Result<
+    (
+        ProductionTranslationProfile,
+        Arc<ResolvedRpgMakerTranslationResources>,
+    ),
+    ProductionTranslationExecutionBuildError,
+> {
+    let profile_configuration = configuration.profile();
+    let language_pair = project.language_pair().clone();
+    let prompt_locale = configuration.prompt_locale().resolve(ui_locale);
+    let prompt_directory = configuration
+        .prompt_root()
+        .join(RPG_MAKER_PROMPT_DIRECTORY_NAME)
+        .join(prompt_locale.as_str());
+    let system_path = prompt_directory.join(SYSTEM_PROMPT_FILE_NAME);
+    let system_template = read_prompt_resource(file_system, &system_path)
+        .await
+        .map_err(|source| {
+            ProductionTranslationExecutionBuildError::prompt_resource(
+                prompt_locale,
+                PromptResourceComponent::System,
+                &system_path,
+                source,
+            )
+        })?;
+    let mut markdown =
+        render_system_prompt_template(&system_template, &language_pair).map_err(|source| {
+            ProductionTranslationExecutionBuildError::prompt_template(
+                prompt_locale,
+                PromptResourceComponent::System,
+                &system_path,
+                source,
+            )
+        })?;
+    let response_envelope = if configuration.thinking_output() {
+        let thinking_path = prompt_directory.join(THINKING_PROMPT_FILE_NAME);
+        let thinking = read_prompt_resource(file_system, &thinking_path)
+            .await
+            .map_err(|source| {
+                ProductionTranslationExecutionBuildError::prompt_resource(
+                    prompt_locale,
+                    PromptResourceComponent::Thinking,
+                    &thinking_path,
+                    source,
+                )
+            })?;
+        ensure_no_prompt_template_variables(&thinking).map_err(|source| {
+            ProductionTranslationExecutionBuildError::prompt_template(
+                prompt_locale,
+                PromptResourceComponent::Thinking,
+                &thinking_path,
+                source,
+            )
+        })?;
+        markdown.push_str("\n\n");
+        markdown.push_str(&thinking);
+        TranslationResponseEnvelope::ThinkingThenJson
+    } else {
+        TranslationResponseEnvelope::JsonOnly
+    };
+    let system_prompt =
+        RpgMakerSystemPrompt::new(language_pair.clone(), markdown, response_envelope).map_err(
+            |source| {
+                ProductionTranslationExecutionBuildError::system_prompt(
+                    prompt_locale,
+                    PromptResourceComponent::System,
+                    &system_path,
+                    source,
+                )
+            },
+        )?;
+    let source_language = configuration
+        .language_modules()
+        .resolve(language_pair.source())
+        .map_err(|source| {
+            ProductionTranslationExecutionBuildError::language_module(&language_pair, source)
+        })?;
+    let translation_resources = Arc::new(ResolvedRpgMakerTranslationResources::new(
+        system_prompt,
+        source_language,
+    ));
+    let planning = RpgMakerTranslationPlanningConfiguration::new(
+        profile_configuration.target_task_user_message_characters(),
+    );
+    let profile = Arc::new(RpgMakerTranslationProfile::new(
+        profile_configuration.id(),
+        planning,
+        profile_configuration.request().clone(),
+        Arc::clone(configuration.client()),
+    ));
+    Ok((profile, translation_resources))
+}
+
 impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecutionBuilder<'_> {
     type Client = OpenAiChatCompletionClient;
     type Standard = ProductionStandardTranslation;
@@ -4545,91 +5574,13 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
         project: &crate::rpg_maker::project::OpenedProject,
     ) -> Result<SelectedTranslationExecution<Self::Client, Self::Standard, Self::Lua>, Self::Error>
     {
-        let profile_configuration = self.configuration.profile();
-        let language_pair = project.language_pair().clone();
-        let prompt_locale = self.configuration.prompt_locale().resolve(self.ui_locale);
-        let prompt_directory = self
-            .configuration
-            .prompt_root()
-            .join(RPG_MAKER_PROMPT_DIRECTORY_NAME)
-            .join(prompt_locale.as_str());
-        let system_path = prompt_directory.join(SYSTEM_PROMPT_FILE_NAME);
-        let system_template = read_prompt_resource(&self.file_system, &system_path)
-            .await
-            .map_err(|source| {
-                ProductionTranslationExecutionBuildError::prompt_resource(
-                    prompt_locale,
-                    PromptResourceComponent::System,
-                    &system_path,
-                    source,
-                )
-            })?;
-        let mut markdown = render_system_prompt_template(&system_template, &language_pair)
-            .map_err(|source| {
-                ProductionTranslationExecutionBuildError::prompt_template(
-                    prompt_locale,
-                    PromptResourceComponent::System,
-                    &system_path,
-                    source,
-                )
-            })?;
-        let response_envelope = if self.configuration.thinking_output() {
-            let thinking_path = prompt_directory.join(THINKING_PROMPT_FILE_NAME);
-            let thinking = read_prompt_resource(&self.file_system, &thinking_path)
-                .await
-                .map_err(|source| {
-                    ProductionTranslationExecutionBuildError::prompt_resource(
-                        prompt_locale,
-                        PromptResourceComponent::Thinking,
-                        &thinking_path,
-                        source,
-                    )
-                })?;
-            ensure_no_prompt_template_variables(&thinking).map_err(|source| {
-                ProductionTranslationExecutionBuildError::prompt_template(
-                    prompt_locale,
-                    PromptResourceComponent::Thinking,
-                    &thinking_path,
-                    source,
-                )
-            })?;
-            markdown.push_str("\n\n");
-            markdown.push_str(&thinking);
-            TranslationResponseEnvelope::ThinkingThenJson
-        } else {
-            TranslationResponseEnvelope::JsonOnly
-        };
-        let system_prompt =
-            RpgMakerSystemPrompt::new(language_pair.clone(), markdown, response_envelope).map_err(
-                |source| {
-                    ProductionTranslationExecutionBuildError::system_prompt(
-                        prompt_locale,
-                        PromptResourceComponent::System,
-                        &system_path,
-                        source,
-                    )
-                },
-            )?;
-        let source_language = self
-            .configuration
-            .language_modules()
-            .resolve(language_pair.source())
-            .map_err(|source| {
-                ProductionTranslationExecutionBuildError::language_module(&language_pair, source)
-            })?;
-        let translation_resources = Arc::new(ResolvedRpgMakerTranslationResources::new(
-            system_prompt,
-            source_language,
-        ));
-        let planning = RpgMakerTranslationPlanningConfiguration::new(
-            profile_configuration.target_task_user_message_characters(),
-        );
-        let profile = Arc::new(RpgMakerTranslationProfile::new(
-            profile_configuration.id(),
-            planning,
-            profile_configuration.request().clone(),
-            Arc::clone(self.configuration.client()),
-        ));
+        let (profile, translation_resources) = build_production_translation_profile(
+            self.configuration,
+            self.ui_locale,
+            &self.file_system,
+            project,
+        )
+        .await?;
         let placeholders = Pcre2PlaceholderService::new()
             .map_err(ProductionTranslationExecutionBuildError::builtin_placeholder_compile)?;
         let asset_reader = RpgMakerStandardTranslationAssetReadingService::new(
@@ -6352,6 +7303,21 @@ where
     }
 }
 
+fn map_project_lua_host_error<O, R>(
+    source: crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingError<O, R>,
+    script_path: &Path,
+) -> ProductionCommandError
+where
+    O: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    R: Error + SafeDiagnosticSource + Send + Sync + 'static,
+{
+    map_project_failure_report(source.into_failure_report(
+        DiagnosticStage::Lua,
+        script_path,
+        DiagnosticImpact::ProgressPreserved,
+    ))
+}
+
 fn map_write_back_error<OE, SE, PE, LE, KE>(
     error: WriteBackServiceError<OE, SE, PE, LE, KE>,
 ) -> ProductionCommandError
@@ -6737,6 +7703,19 @@ impl ProductionCommandError {
         )))
     }
 
+    fn unexpected_project_lua_outcome(script_path: &Path) -> Self {
+        let source = UnexpectedProjectLuaOutcome;
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::LuaExecution,
+            DiagnosticStage::Lua,
+            DiagnosticSubject::path(script_path),
+            DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::ReportBug,
+        );
+        Self::Internal(Box::new(Self::report_diagnostic(source, diagnostic)))
+    }
+
     fn into_failure_report(self) -> FailureReport {
         match self {
             Self::ConfigurationOrInput(report)
@@ -6936,6 +7915,10 @@ impl ProductionCommandError {
             ),
             RunPlanResolutionError::ProfileRequired => (
                 DiagnosticSubject::field("PROFILE_ID"),
+                DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
+            ),
+            RunPlanResolutionError::ProjectLuaProfileRequired => (
+                DiagnosticSubject::field("--profile"),
                 DiagnosticReason::failure(DiagnosticFailureKind::MissingRequiredValue),
             ),
             RunPlanResolutionError::SavedProfileUnavailable { profile_id } => (
@@ -7645,6 +8628,13 @@ impl CommandResultRenderer {
                 }
                 render_saved_plan_source(localizer, plan_source, stdout)
             }
+            RpgMakerCommandOutput::Lua { project } => writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultProjectLuaCompleted {
+                    project: project.as_str(),
+                })
+            ),
         }
     }
 
@@ -7765,6 +8755,67 @@ mod command_error_rendering_tests {
     }
 
     impl Error for TestError {}
+
+    #[test]
+    fn project_lua_standard_rejection_uses_one_based_lua_lines() {
+        let (reason, details) =
+            project_lua_standard_rejection(StandardCandidateRejectionReason::Candidate(
+                TranslationUnitRejectionReason::BlankLineMismatch {
+                    line_index: 2,
+                    expected_blank: true,
+                },
+            ))
+            .expect("可表示的拒绝详情应能投影");
+
+        assert_eq!(reason, "blank_line_mismatch");
+        assert_eq!(
+            details,
+            [
+                TrustedLuaStandardRejectionDetail::new(
+                    "line",
+                    TrustedLuaStandardRejectionValue::Integer(3),
+                ),
+                TrustedLuaStandardRejectionDetail::new(
+                    "expected_blank",
+                    TrustedLuaStandardRejectionValue::Boolean(true),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_lua_standard_rejection_refuses_unrepresentable_lua_integers() {
+        let error = project_lua_standard_rejection(StandardCandidateRejectionReason::Candidate(
+            TranslationUnitRejectionReason::InvalidLineText {
+                line_index: usize::MAX,
+            },
+        ))
+        .expect_err("无法建立一基行号时不得饱和截断");
+
+        assert_eq!(error.domain(), "standard");
+        assert_eq!(error.kind(), "internal_invariant");
+        assert_eq!(error.operation(), Some("standard.accept"));
+    }
+
+    #[test]
+    fn project_lua_standard_database_failure_uses_existing_sqlite_kind() {
+        let source: RpgMakerStandardCandidateAcceptanceError<
+            SqliteRuntimeError,
+            crate::runtime::cpu::CpuExecutorUnavailable,
+        > = RpgMakerStandardCandidateAcceptanceError::DatabaseNotFound {
+            database_path: PathBuf::from("projects/demo/project.db"),
+        };
+
+        let error = project_lua_standard_acceptance_error(source);
+
+        assert_eq!(error.domain(), "sqlite");
+        assert_eq!(error.kind(), "operation_failed");
+        assert_eq!(error.operation(), Some("standard.accept"));
+        assert_eq!(
+            error.safe_diagnostic().map(|diagnostic| diagnostic.stage),
+            Some(DiagnosticStage::Lua)
+        );
+    }
 
     #[tokio::test]
     async fn command_scope_panic_uses_the_same_safe_projection_for_cli_and_jsonl() {

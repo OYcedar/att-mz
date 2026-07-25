@@ -12,6 +12,7 @@ ATT 的生产配置只包含真实外部选择；完整字段见
 | Extract | `projects.root`；Builtin、Rules、Lua 来自 CLI 或保存方案 |
 | Translate | `projects.root`、`prompts`、`rpg_maker.record_translation_tasks`、全部 `languages`、所选 Profile 和它引用的 Client |
 | WriteBack | `projects.root`；Lua 选择来自 CLI 或保存方案 |
+| Lua | `projects.root`；脚本始终来自本次 CLI；只有调用 `ctx.standard.open()` 时才需要显式或已保存的 Translate Profile |
 
 Help 与 Version 之外的命令必须显式传入 `--config FILE`。配置中的相对路径以配置文件
 目录为基准；其他 CLI 路径以当前工作目录为基准。项目工作区固定是
@@ -23,6 +24,10 @@ Help 与 Version 之外的命令必须显式传入 `--config FILE`。配置中�
 - Extract 可复用完整 owner 集合；
 - Translate 可复用 Profile、canonical 术语/Placeholder 和 Lua 阶段快照；
 - WriteBack 可复用 Lua 选择。
+
+独立 `lua` 命令不保存运行方案或程序快照。它每次读取显式脚本，可选地通过
+`ctx.standard` 使用项目 canonical 术语、Placeholder 和 Standard 核心完成已有人工作品的
+验收与原子提交；它不请求 LLM，也不改变以后 Translate 复用的 Profile。
 
 ## 哪些值由用户配置
 

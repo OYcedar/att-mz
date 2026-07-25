@@ -175,6 +175,9 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 
 - 确认本轮显式提供或复用的翻译资源及其当前性。
 - 执行 Translate，保留已经合法提交的部分进度。
+- 已有有限、经过人工确认的候选需要补入现存 Standard 单元时，进入可信 Lua 子流程，使用
+  独立项目 `lua` 命令的 `ctx.standard` 验收与提交；按完整身份、原文、形状和去重族影响
+  审核候选，不用直接 SQL 写受管表，也不用 Translate Lua 标量 state 冒充 Standard state。
 - 调查自定义资源是否生效时，先在对应 Standard 任务记录中核对最终 System/User、Thinking、Assistant、重试、验收和提交终态；普通 JSONL 只核对运行摘要，必要时再用项目数据库复核权威状态。
 - 同时检查 `Complete`、`Partial`、`Unavailable`，以及任务状态、unit state 和代表性译文。
 - 区分机器协议验收、状态传播和语言质量，只修正真正拥有问题的资源或阶段。
@@ -251,7 +254,12 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 
 ### 进入条件
 
-只有真实样本证明 Builtin、Rules 或 Placeholder 无法表达动态枚举、跨节点关系、多目标同步、私有状态或恢复协议时进入。
+满足以下任一条件时进入：
+
+- 真实样本证明 Builtin、Rules 或 Placeholder 无法表达动态枚举、跨节点关系、多目标同步、
+  私有状态或恢复协议；
+- 已有人工作品需要按 Standard 的完整 Lines、上下文、Placeholder、去重和 Current 语义
+  验收并提交到现存 Standard 单元。
 
 ### 必读文档
 
@@ -259,21 +267,31 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 
 ### 任务清单
 
-- 明确协议所有者和真正需要 Lua 的阶段。
-- 设计最小脚本边界、稳定身份、事务、私有状态和幂等交接。
-- 复用 Standard 能力，不在 Lua 中重建已有机制。
+- 先区分阶段扩展与一次性项目程序：现存 Standard 单元的人工补译使用独立 `lua` 和
+  `ctx.standard`；只有扩展自己拥有身份、状态或写回协议时才进入 Extract/Translate/
+  WriteBack 阶段 Lua。
+- 人工补译脚本按完整只读身份定位唯一单元，复核 original、content kind、line policy、
+  status 与 family size；候选按 model text 中的 ATT token 编写，只有确需替换 Current 时
+  才显式设置 `replace_current=true`。
+- 设计最小脚本边界、稳定身份、事务、私有状态和幂等交接；Standard 人工提交的 state 和
+  事务由核心拥有，不在 Lua 中读取、构造或复制。
+- 复用 Standard 能力，不在 Lua 中重建已有机制，也不直接修改 ATT 受管翻译表。
 - 调查 Translate Lua 时读取脚本语义、普通 JSONL 和项目数据库；Lua 不生成 Standard 任务记录，不从一次 `ctx.llm` 响应猜测脚本验收或提交终态。
-- 验证重复运行、失败、取消、候选丢弃和恢复行为。
+- 独立项目 Lua 不生成 LLM TaskBlock；以每次 `standard:accept` 的结构化结果和项目数据库
+  作为权威提交证据。
+- 验证重复运行、正常拒绝、同族冲突、Current 覆盖、失败、取消、候选丢弃和恢复行为。
 
 ### 完成证据
 
-- 只有必要阶段启用 Lua。
+- 只有必要阶段启用阶段 Lua；一次性项目脚本未被保存进任何运行方案。
 - 私有状态、事务边界和副作用责任明确。
-- 重复执行收敛，失败不会伪造成功或污染发布语义。
+- Standard 人工提交的 translation/state 配对、传播位置和相同 Profile 的 Current 结果
+  一致；重复执行收敛，失败不会伪造成功或污染发布语义。
 
 ### 返回位置
 
-静态确定路径足够时返回 Rules；只需保护协议跨度时返回 Placeholder；只涉及用词时返回术语或 Prompt；Lua 运行失败进入流程 6。
+静态确定路径足够时返回 Rules；只需保护协议跨度时返回 Placeholder；只涉及用词时返回
+术语或 Prompt；人工候选验收完成后返回流程 4；Lua 运行失败进入流程 6。
 
 ## 固定回退原则
 

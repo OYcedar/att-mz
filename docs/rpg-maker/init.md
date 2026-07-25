@@ -54,9 +54,9 @@ MZ                              MV
 指纹，也不会使内容相同的后续 Init 被误判为项目变化。Init 只按当前工作区契约认可这
 两个可选目录，不识别、迁移或清理其他历史目录。
 
-原游戏路径不进入 metadata，也不供 Extract、Translate 或 WriteBack 读取；它以无损
-Windows 原始路径保存于 `init_run_plan`，只供后续 Init 复用。其他命令始终读取工作区内
-的冻结来源。
+原游戏路径不进入 metadata，也不供 Init 之外的后续项目命令读取；它以无损 Windows
+原始路径保存于 `init_run_plan`，只供后续 Init 复用。其他命令始终读取工作区内的冻结
+来源。
 
 ## 2. 收敛、租约与来源指纹
 
@@ -68,8 +68,8 @@ schema，否则作为无效项目数据库失败。项目租约覆盖方案读�
 `source_snapshot_fingerprint` 是冻结内容树的 SHA-256。MZ 覆盖 `data/js`，MV 覆盖
 `www/data/js`；哈希按稳定 Windows 名称顺序覆盖目录、文件长度与原始字节，并拒绝
 reparse point、hardlink、名称碰撞、读取中对象身份变化和资源超限。Init 对传入游戏计算
-期望指纹；Extract、Translate 和 WriteBack 每次开启项目时重新确认冻结来源仍与 metadata
-一致。只有 Init 可以替换来源和权威指纹。
+期望指纹；Extract、Translate、WriteBack 和独立 Lua 每次开启项目时重新确认冻结来源仍
+与 metadata 一致。只有 Init 可以替换来源和权威指纹。
 
 若现有工作区、来源、语言与布局全部一致，Init 直接返回 `Unchanged`，不建立候选，
 也不清空既有输出。任何真实变化或可判定结构修复都在一个未发布候选内完成，并把

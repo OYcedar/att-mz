@@ -21,8 +21,8 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::arguments::{
-    ExtractArguments, InitArguments, MvCommand, MzCommand, ProductCommand, TranslateArguments,
-    WriteBackArguments,
+    ExtractArguments, InitArguments, MvCommand, MzCommand, ProductCommand, ProjectLuaArguments,
+    TranslateArguments, WriteBackArguments,
 };
 
 use crate::diagnostic::ConfigurationValueRule;
@@ -180,6 +180,11 @@ fn normalize_product_command(
                 RpgMakerCommandArguments::WriteBack(arguments),
                 None,
             ),
+            MvCommand::Lua(arguments) => (
+                RpgMakerLayout::MV,
+                RpgMakerCommandArguments::Lua(arguments),
+                None,
+            ),
         },
     }
 }
@@ -189,6 +194,7 @@ enum RpgMakerCommandArguments {
     Extract(ExtractArguments),
     Translate(TranslateArguments),
     WriteBack(WriteBackArguments),
+    Lua(ProjectLuaArguments),
 }
 
 impl From<MzCommand> for RpgMakerCommandArguments {
@@ -198,16 +204,18 @@ impl From<MzCommand> for RpgMakerCommandArguments {
             MzCommand::Extract(arguments) => Self::Extract(arguments),
             MzCommand::Translate(arguments) => Self::Translate(arguments),
             MzCommand::WriteBack(arguments) => Self::WriteBack(arguments),
+            MzCommand::Lua(arguments) => Self::Lua(arguments),
         }
     }
 }
 
-/// 四个互斥命令各自拥有且只拥有现实消费的配置。
+/// 五个互斥命令各自拥有且只拥有现实消费的配置。
 pub(crate) enum ConfiguredRpgMakerCommand {
     Init(ConfiguredInitCommand),
     Extract(ConfiguredExtractCommand),
     Translate(Box<ConfiguredTranslateCommand>),
     WriteBack(ConfiguredWriteBackCommand),
+    Lua(ConfiguredProjectLuaCommand),
 }
 
 impl ConfiguredRpgMakerCommand {
@@ -345,6 +353,28 @@ impl ConfiguredRpgMakerCommand {
                     lua,
                     deferred_lua,
                     rpg_maker,
+                }))
+            }
+            RpgMakerCommandArguments::Lua(arguments) => {
+                let deferred_source =
+                    Arc::new(DeferredConfigurationSource::new(configuration_path, source));
+                let runtime =
+                    DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source)).resolve()?;
+                let ProjectLuaArguments {
+                    project,
+                    profile,
+                    script,
+                    arguments,
+                } = arguments;
+                let standard_profile =
+                    ConfiguredProjectLuaStandardProfile::new(deferred_source, profile.as_deref())?;
+                Ok(Self::Lua(ConfiguredProjectLuaCommand {
+                    project_name: project.name,
+                    common,
+                    cpu: build_cpu_configuration(),
+                    lua: SelectedLuaConfiguration::new(script, runtime),
+                    arguments,
+                    standard_profile,
                 }))
             }
         }
@@ -590,6 +620,123 @@ impl ConfiguredTranslateCommand {
     }
 }
 
+/// 一次性项目 Lua 命令已经建立的进程级配置。
+pub(crate) struct ConfiguredProjectLuaCommand {
+    project_name: ProjectName,
+    common: CommonCommandConfiguration,
+    cpu: CpuExecutorConfig,
+    lua: SelectedLuaConfiguration,
+    arguments: Vec<String>,
+    standard_profile: ConfiguredProjectLuaStandardProfile,
+}
+
+impl ConfiguredProjectLuaCommand {
+    pub(crate) const fn common(&self) -> &CommonCommandConfiguration {
+        &self.common
+    }
+
+    pub(crate) const fn project_name(&self) -> &ProjectName {
+        &self.project_name
+    }
+
+    pub(crate) const fn cpu(&self) -> CpuExecutorConfig {
+        self.cpu
+    }
+
+    pub(crate) const fn lua(&self) -> &SelectedLuaConfiguration {
+        &self.lua
+    }
+
+    pub(crate) fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub(crate) fn into_standard_profile(self) -> ConfiguredProjectLuaStandardProfile {
+        self.standard_profile
+    }
+}
+
+/// 项目 Lua 的 Standard Profile 选择；省略 Profile 时保留到 `ctx.standard.open()`。
+#[derive(Clone)]
+pub(crate) enum ConfiguredProjectLuaStandardProfile {
+    Deferred {
+        source: Arc<DeferredConfigurationSource>,
+    },
+    Resolved {
+        configuration_path: PathBuf,
+        configuration: Arc<TranslateConfiguration>,
+    },
+}
+
+impl ConfiguredProjectLuaStandardProfile {
+    fn new(
+        source: Arc<DeferredConfigurationSource>,
+        explicit_profile_id: Option<&str>,
+    ) -> Result<Self, ConfigurationLoadError> {
+        match explicit_profile_id {
+            Some(profile_id) => {
+                let configuration_path = source.path().to_path_buf();
+                resolve_project_lua_standard_profile(&source, profile_id).map(|configuration| {
+                    Self::Resolved {
+                        configuration_path,
+                        configuration: Arc::new(configuration),
+                    }
+                })
+            }
+            None => Ok(Self::Deferred { source }),
+        }
+    }
+
+    pub(crate) fn explicit_profile_id(&self) -> Option<&str> {
+        match self {
+            Self::Deferred { .. } => None,
+            Self::Resolved { configuration, .. } => Some(configuration.profile().id()),
+        }
+    }
+
+    /// 在 Standard 能力真正打开时精确解析显式或项目状态给出的 Profile。
+    pub(crate) fn resolve(
+        &self,
+        profile_id: &str,
+    ) -> Result<Arc<TranslateConfiguration>, ConfigurationLoadError> {
+        match self {
+            Self::Deferred { source } => {
+                resolve_project_lua_standard_profile(source.as_ref(), profile_id).map(Arc::new)
+            }
+            Self::Resolved { configuration, .. } if configuration.profile().id() == profile_id => {
+                Ok(Arc::clone(configuration))
+            }
+            Self::Resolved {
+                configuration_path,
+                configuration,
+            } => Err(ConfigurationLoadError::ProfileSelectionConflict {
+                path: configuration_path.clone(),
+                explicit_profile: configuration.profile().id().to_owned(),
+                requested_profile: profile_id.to_owned(),
+            }),
+        }
+    }
+}
+
+fn resolve_project_lua_standard_profile(
+    source: &DeferredConfigurationSource,
+    profile_id: &str,
+) -> Result<TranslateConfiguration, ConfigurationLoadError> {
+    validate_exact_identifier("Profile ID", profile_id)
+        .map_err(ConfigurationLoadError::InvalidValue)
+        .map_err(|error| error.with_configuration_path(source.path()))?;
+    let raw: RawTranslateSelection = parse_selected(source.source(), source.path())?;
+    PendingTranslateConfiguration::build(
+        source.path().parent().expect("配置文件必须拥有父目录"),
+        raw.prompts,
+        raw.languages,
+        raw.rpg_maker,
+    )
+    .map_err(ConfigurationLoadError::InvalidValue)
+    .map_err(|error| error.with_configuration_path(source.path()))?
+    .resolve(source, profile_id)
+}
+
 pub(crate) struct ConfiguredWriteBackCommand {
     project_name: ProjectName,
     common: CommonCommandConfiguration,
@@ -666,7 +813,7 @@ fn build_sqlite_configuration() -> RusqliteStorageConfiguration {
 /// 保留仅能在项目运行方案解析后按需消费的配置原文。
 ///
 /// 配置可能包含凭据，因此不实现 `Debug`，并在最后一个引用释放时清零正文。
-struct DeferredConfigurationSource {
+pub(crate) struct DeferredConfigurationSource {
     path: PathBuf,
     source: Zeroizing<String>,
 }
@@ -2796,6 +2943,7 @@ mod tests {
             extract_command(false),
             translate_command(false, "primary"),
             write_back_command(false),
+            project_lua_command(Some("primary")),
         ] {
             load_configuration(&path, command).expect("仓库示例必须满足每个命令的当前契约");
         }
@@ -2883,6 +3031,44 @@ mod tests {
             .expect("项目状态中的现行 Profile 应可精确解析");
         assert_eq!(configured.resolved_profile_id(), Some("primary"));
         assert_eq!(configured.rpg_maker().profile().id(), "primary");
+    }
+
+    #[test]
+    fn omitted_project_lua_profile_remains_deferred_until_standard_is_opened() {
+        let directory = TestDirectory::new();
+        let source = include_str!("../../config.example.toml")
+            .replace("locale = \"auto\"", "locale = \"unsupported-locale\"");
+        let path = directory.write("deferred-project-lua-profile.toml", &source);
+
+        let configured = load_configuration(&path, project_lua_command(None))
+            .expect("普通 Lua 不应提前解析翻译配置");
+        let ConfiguredRpgMakerCommand::Lua(configured) = configured else {
+            panic!("应建立项目 Lua 配置");
+        };
+        let standard_profile = configured.into_standard_profile();
+        assert_eq!(standard_profile.explicit_profile_id(), None);
+        assert!(matches!(
+            standard_profile.resolve("primary"),
+            Err(ConfigurationLoadError::InvalidValueAtPath { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_project_lua_profile_is_validated_during_configuration_load() {
+        let directory = TestDirectory::new();
+        let path = directory.write(
+            "explicit-project-lua-profile.toml",
+            include_str!("../../config.example.toml"),
+        );
+
+        let error = load_configuration(&path, project_lua_command(Some("missing")))
+            .err()
+            .expect("显式 Profile 必须精确校验");
+        assert!(matches!(
+            error,
+            ConfigurationLoadError::TranslationProfileNotFound { profile_id, .. }
+                if profile_id == "missing"
+        ));
     }
 
     #[test]
@@ -3652,7 +3838,19 @@ id = "unused"
         }
     }
 
+    fn project_lua_command(profile: Option<&str>) -> MzCommand {
+        let mut arguments = vec!["att", "mz", "lua", "--name", "demo", "script.lua"];
+        if let Some(profile) = profile {
+            arguments.splice(5..5, ["--profile", profile]);
+        }
+        parse_command_vec(arguments)
+    }
+
     fn parse_command<const N: usize>(arguments: [&str; N]) -> MzCommand {
+        parse_command_vec(arguments.into_iter().collect())
+    }
+
+    fn parse_command_vec(arguments: Vec<&str>) -> MzCommand {
         let arguments = ["att", "--config", "config.toml"]
             .into_iter()
             .chain(arguments.into_iter().skip(1));

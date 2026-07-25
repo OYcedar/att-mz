@@ -624,6 +624,14 @@ impl SqliteInteractiveSessionOperations for RecordingSession {
         facts.state = SessionTransactionState::Idle;
         Ok(())
     }
+
+    async fn transaction_active(&self) -> Result<bool, SqliteInteractiveSessionError<Self::Error>> {
+        let facts = self.facts.lock().expect("Session 记录锁不应中毒");
+        if facts.closed {
+            return Err(SqliteInteractiveSessionError::Closed);
+        }
+        Ok(facts.state == SessionTransactionState::Active)
+    }
 }
 
 struct RecordingSessionFinalizer {

@@ -706,6 +706,14 @@ impl SqliteInteractiveSessionOperations for FakeSqliteInteractiveSession {
         state.transaction_active = false;
         Ok(())
     }
+
+    async fn transaction_active(&self) -> Result<bool, SqliteInteractiveSessionError<Self::Error>> {
+        let state = self.state.lock().expect("会话状态锁不应中毒");
+        if state.closed {
+            return Err(SqliteInteractiveSessionError::Closed);
+        }
+        Ok(state.transaction_active)
+    }
 }
 
 struct FakeSqliteInteractiveSessionFinalizer {

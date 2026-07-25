@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use self::runtime::OwnedLuaProgram;
 use self::runtime::TrustedLuaExtractIntent;
+use self::runtime::TrustedLuaStandardHostCalls;
 use self::runtime::TrustedLuaTranslationSemantics;
 use self::runtime::TrustedLuaWriteBackHostCalls;
 use crate::execution::OperationCompletion;
@@ -123,7 +124,7 @@ impl Error for LuaSourcePathError {}
 /// 可信 Lua 在当前阶段能够访问的项目文件边界。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LuaProjectFileAccess {
-    /// Extract 与 Translate 只接收 Init 按当前引擎布局冻结的 `data`、`js`。
+    /// Extract、Translate 与独立项目 Lua 只接收 Init 冻结的 `data`、`js`。
     FrozenSource { source_root: PathBuf },
     /// WriteBack 同时接收冻结来源和本次尚未发布的候选目录。
     CandidateWriteBack {
@@ -152,7 +153,7 @@ impl LuaProjectFileAccess {
 /// 交给可信 Lua 程序的项目事实快照。
 ///
 /// 冻结来源始终来自 Init 项目工作区；原游戏目录不是后续阶段的权威事实。只有
-/// WriteBack 变体能够看到本次待修改的候选 `output_root`，Extract/Translate 不携带它。
+/// WriteBack 变体能够看到本次待修改的候选 `output_root`，其他调用不携带它。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LuaProjectContext {
     name: String,
@@ -234,12 +235,14 @@ pub(crate) enum LuaPhase {
     Extract,
     Translate,
     WriteBack,
+    Project,
 }
 
 /// 一次可信 Lua Host 成功执行后可交给阶段服务消费的结果。
 ///
 /// 只有 Extract 可以产生托管标准快照意图；未声明意图的 Extract 以及
-/// Translate/WriteBack 都产生 `Empty`，避免把 Extract 状态伪装成全阶段可选字段。
+/// Translate、WriteBack 与独立项目 Lua 都产生 `Empty`，避免把 Extract 状态伪装成
+/// 全调用面可选字段。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TrustedLuaExecutionOutcome {
     Empty,
@@ -248,9 +251,9 @@ pub(crate) enum TrustedLuaExecutionOutcome {
 
 /// 交给可信 Lua Host 的一次完整调用。
 ///
-/// 枚举变体从类型上保证 Extract 不携带无关 LLM Client，而 Translate 一定拥有配置
-/// 边界已经选择的 Client。调用拥有全部事实，便于专用 worker 在调用 Future 被取消
-/// 后继续完成受控清理。
+/// 枚举变体从类型上保证 Extract 不携带无关 LLM Client，Translate 一定拥有配置
+/// 边界已经选择的 Client，而独立项目入口只携带本次参数与 Standard 能力。调用拥有
+/// 全部事实，便于专用 worker 在调用 Future 被取消后继续完成受控清理。
 pub(crate) enum LuaInvocation<C> {
     Extract {
         program: OwnedLuaProgram,
@@ -266,6 +269,12 @@ pub(crate) enum LuaInvocation<C> {
         program: OwnedLuaProgram,
         project: LuaProjectContext,
         calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
+    },
+    Project {
+        program: OwnedLuaProgram,
+        project: LuaProjectContext,
+        arguments: Vec<String>,
+        standard: Arc<dyn TrustedLuaStandardHostCalls>,
     },
 }
 
@@ -299,16 +308,29 @@ impl<C> LuaInvocation<C> {
             calls,
         }
     }
+
+    pub(crate) fn project(
+        program: OwnedLuaProgram,
+        project: LuaProjectContext,
+        arguments: Vec<String>,
+        standard: Arc<dyn TrustedLuaStandardHostCalls>,
+    ) -> Self {
+        Self::Project {
+            program,
+            project,
+            arguments,
+            standard,
+        }
+    }
 }
 
 /// 完整拥有可信 Lua 程序生命周期与项目能力桥接的 Host。
 ///
 /// Lua 是用户明确选择并完全信任的本机程序，不建立安全沙箱。Host 接收已经冻结的
 /// 主程序快照、建立 VM、打开同一项目数据库，向全部阶段注入冻结来源 `ctx.source`、
-/// RPG Maker 结构化只读门面 `ctx.rpg_maker` 与 `ctx.db`，在 Translate 阶段根据拥有的 Client
-/// 注入 `ctx.llm`，
-/// 以及执行和关闭全部资源。Host 不把原始数据库连接或凭据暴露
-/// 给脚本。
+/// RPG Maker 结构化只读门面 `ctx.rpg_maker` 与 `ctx.db`；Translate 根据拥有的
+/// Client 注入 `ctx.llm`，独立项目入口注入由 Standard 核心拥有的 `ctx.standard`。
+/// Host 同时负责执行和关闭全部资源，不把原始数据库连接或凭据暴露给脚本。
 ///
 /// Lua 通过 `ctx.extract` 明确采用标准资产契约时，Host 只收集已校验的完整意图，
 /// 并在 VM 与数据库会话都干净结束后交给 Extract 服务提交；Lua 通过开放 SQL 建立的

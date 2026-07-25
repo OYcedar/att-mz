@@ -8,6 +8,7 @@ cli-init-about = 名前付きゲームプロジェクトを初期化または更
 cli-extract-about = 明示または保存済み owner プランで原文を抽出します
 cli-translate-about = 明示または保存済み Profile で抽出済み原文を翻訳します
 cli-write-back-about = 承認済み訳文をゲームへ書き戻します
+cli-project-lua-about = プロジェクトコンテキストで信頼済み Lua プログラムを一度実行します
 cli-project-name-help = 安定したプロジェクト名
 cli-init-path-help = RPG Maker ゲームのルート。既存プロジェクトでは前回成功時のパスを再利用できます
 cli-source-language-help = 原文の言語 ID
@@ -22,6 +23,9 @@ cli-lua-help = このフェーズの Lua プログラムを置換します。0 �
 cli-profile-help = 翻訳 Profile ID。省略すると前回成功した Profile を再利用します
 cli-terms-help = プロジェクトの用語リソースを置換します
 cli-placeholders-help = プロジェクトの Placeholder リソースを置換します
+cli-project-lua-profile-help = Standard 手動承認用 Profile。省略すると Standard を開く際に直近の成功した Translate Profile を再利用します
+cli-project-lua-script-help = 一度だけ実行する信頼済み Lua プログラム
+cli-project-lua-arguments-help = -- の後で Lua arg[1..] に渡す UTF-8 引数
 cli-usage-heading = 使用法:
 cli-commands-heading = コマンド:
 cli-options-heading = オプション:
@@ -102,6 +106,7 @@ progress-extract-commit = 抽出資産をコミットしています
 progress-translate-planning = 翻訳タスクを計画しています
 progress-translate-confirmed = 確認済みの翻訳タスク
 progress-translate-no-work = モデル呼び出しは不要です
+progress-project-lua = プロジェクト Lua プログラムを実行しています
 progress-write-back-read-assets = 承認済み資産を読み込んでいます
 progress-write-back-planning = 文書書き換えを計画しています
 progress-write-back-documents = 文書を書き換えました
@@ -120,6 +125,7 @@ result-translate-completed = 翻訳完了: { $project }（Profile: { $profile }�
 result-translate-standard = 標準翻訳: タスク { $total }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }。{ $written } 箇所を書き込み、残り { $remaining } 箇所
 result-translate-convergence = 状態収束: 保持 { $retained }、無効化 { $invalidated }、非該当 { $not_applicable }、再利用 { $reused }
 result-write-back-completed = 書き戻し完了: { $project }
+result-project-lua-completed = プロジェクト Lua 実行完了: { $project }
 result-output-directory = 出力ディレクトリ: { $path }
 result-write-back-standard = 標準書き戻し: 訳文 { $translated } 単位、原文 { $original } 単位。自動折返し { $auto_wrapped }、改行追加 { $breaks }、全角インデント追加 { $indents }。手動配置 { $manual }
 result-lua-executed = Lua: 実行済み
@@ -166,6 +172,7 @@ diagnostic-recovery-value = { $kind ->
 diagnostic-related = 関連エラー { $index }：
 diagnostic-stage-value = { $code ->
     [process_output] プロセス出力
+    [lua] プロジェクト Lua 実行
    *[other] { $fallback }
 }
 diagnostic-impact-value = { $code ->

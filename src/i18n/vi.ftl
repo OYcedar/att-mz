@@ -8,6 +8,7 @@ cli-init-about = Khởi tạo hoặc cập nhật dự án trò chơi có tên
 cli-extract-about = Trích xuất văn bản bằng kế hoạch owner đã chỉ định hoặc đã lưu
 cli-translate-about = Dịch văn bản đã trích xuất bằng Profile đã chỉ định hoặc đã lưu
 cli-write-back-about = Ghi bản dịch đã duyệt trở lại trò chơi
+cli-project-lua-about = Chạy một lần chương trình Lua tin cậy trong ngữ cảnh dự án
 cli-project-name-help = Tên dự án ổn định
 cli-init-path-help = Thư mục gốc trò chơi RPG Maker; dự án hiện có có thể dùng lại đường dẫn thành công gần nhất
 cli-source-language-help = ID ngôn ngữ nguồn
@@ -22,6 +23,9 @@ cli-lua-help = Thay chương trình Lua của giai đoạn; tệp 0 byte sẽ x�
 cli-profile-help = ID Profile dịch; bỏ qua để dùng lại Profile thành công gần nhất
 cli-terms-help = Thay tài nguyên thuật ngữ của dự án
 cli-placeholders-help = Thay tài nguyên Placeholder của dự án
+cli-project-lua-profile-help = Profile dùng để duyệt thủ công Standard; nếu bỏ qua, Profile Translate thành công gần nhất được dùng khi mở Standard
+cli-project-lua-script-help = Chương trình Lua tin cậy sẽ chạy một lần
+cli-project-lua-arguments-help = Đối số UTF-8 truyền cho Lua arg[1..] sau --
 cli-usage-heading = Cách dùng:
 cli-commands-heading = Lệnh:
 cli-options-heading = Tùy chọn:
@@ -102,6 +106,7 @@ progress-extract-commit = Đang commit tài sản đã trích xuất
 progress-translate-planning = Đang lập kế hoạch tác vụ dịch
 progress-translate-confirmed = Tác vụ dịch đã xác nhận
 progress-translate-no-work = Không cần gọi mô hình
+progress-project-lua = Đang chạy chương trình Lua của dự án
 progress-write-back-read-assets = Đang đọc tài sản đã duyệt
 progress-write-back-planning = Đang lập kế hoạch viết lại tài liệu
 progress-write-back-documents = Đã viết lại tài liệu
@@ -120,6 +125,7 @@ result-translate-completed = Dịch hoàn tất: { $project } (Profile: { $profi
 result-translate-standard = Dịch chuẩn: { $total } tác vụ; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng; đã ghi { $written } vị trí, còn { $remaining }
 result-translate-convergence = Hội tụ trạng thái: giữ { $retained }, vô hiệu { $invalidated }, không áp dụng { $not_applicable }, tái dùng { $reused }
 result-write-back-completed = Ghi lại hoàn tất: { $project }
+result-project-lua-completed = Thực thi Lua dự án hoàn tất: { $project }
 result-output-directory = Thư mục đầu ra: { $path }
 result-write-back-standard = Ghi lại chuẩn: { $translated } đơn vị dịch, { $original } đơn vị nguồn; tự ngắt { $auto_wrapped }, thêm { $breaks } ngắt dòng và { $indents } thụt đầu dòng toàn chiều rộng; { $manual } cần bố cục thủ công
 result-lua-executed = Lua: đã chạy
@@ -166,6 +172,7 @@ diagnostic-recovery-value = { $kind ->
 diagnostic-related = Lỗi liên quan { $index }:
 diagnostic-stage-value = { $code ->
     [process_output] Đầu ra tiến trình
+    [lua] Thực thi Lua dự án
    *[other] { $fallback }
 }
 diagnostic-impact-value = { $code ->

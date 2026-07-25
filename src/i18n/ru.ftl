@@ -8,6 +8,7 @@ cli-init-about = Инициализировать или обновить име
 cli-extract-about = Извлечь текст по явному или сохранённому плану owner
 cli-translate-about = Перевести извлечённый текст с явным или сохранённым Profile
 cli-write-back-about = Записать принятые переводы обратно в игру
+cli-project-lua-about = Однократно выполнить доверенную программу Lua в контексте проекта
 cli-project-name-help = Стабильное имя проекта
 cli-init-path-help = Корень игры RPG Maker; существующий проект может повторно использовать последний успешный путь
 cli-source-language-help = ID исходного языка
@@ -22,6 +23,9 @@ cli-lua-help = Заменить программу Lua этапа; файл ну
 cli-profile-help = ID Profile перевода; при отсутствии используется последний успешный Profile
 cli-terms-help = Заменить терминологический ресурс проекта
 cli-placeholders-help = Заменить ресурс Placeholder проекта
+cli-project-lua-profile-help = Profile для ручной приёмки Standard; если он не указан, при открытии Standard используется последний успешный Translate Profile
+cli-project-lua-script-help = Доверенная программа Lua для однократного выполнения
+cli-project-lua-arguments-help = Аргумент UTF-8 для Lua arg[1..] после --
 cli-usage-heading = Использование:
 cli-commands-heading = Команды:
 cli-options-heading = Параметры:
@@ -107,6 +111,7 @@ progress-extract-commit = Commit извлечённых ресурсов
 progress-translate-planning = Планирование задач перевода
 progress-translate-confirmed = Подтверждено задач перевода
 progress-translate-no-work = Запрос к модели не нужен
+progress-project-lua = Выполнение программы Lua проекта
 progress-write-back-read-assets = Чтение принятых ресурсов
 progress-write-back-planning = Планирование перезаписи документов
 progress-write-back-documents = Перезаписано документов
@@ -125,6 +130,7 @@ result-translate-completed = Перевод завершён: { $project } (Prof
 result-translate-standard = Стандартный перевод: { $total } задач; завершено { $complete }, частично { $partial }, недоступно { $unavailable }; записано { $written } позиций, осталось { $remaining }
 result-translate-convergence = Сведение состояния: сохранено { $retained }, аннулировано { $invalidated }, неприменимо { $not_applicable }, переиспользовано { $reused }
 result-write-back-completed = Запись завершена: { $project }
+result-project-lua-completed = Выполнение Lua проекта завершено: { $project }
 result-output-directory = Каталог вывода: { $path }
 result-write-back-standard = Стандартная запись: { $translated } переведённых единиц, { $original } исходных; автоперенос { $auto_wrapped }, добавлено переносов { $breaks } и полноширинных отступов { $indents }; ручная раскладка { $manual }
 result-lua-executed = Lua: выполнено
@@ -181,6 +187,7 @@ diagnostic-recovery-value = { $kind ->
 diagnostic-related = Связанная ошибка { $index }:
 diagnostic-stage-value = { $code ->
     [process_output] Вывод процесса
+    [lua] Выполнение Lua проекта
    *[other] { $fallback }
 }
 diagnostic-impact-value = { $code ->

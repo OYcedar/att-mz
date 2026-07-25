@@ -8,6 +8,7 @@ cli-init-about = 初始化或更新一個命名遊戲專案
 cli-extract-about = 使用明確或已儲存的 owner 方案擷取原文
 cli-translate-about = 使用明確或已儲存的 Profile 翻譯已擷取原文
 cli-write-back-about = 將已驗收譯文寫回遊戲
+cli-project-lua-about = 在專案上下文中一次性執行可信 Lua 程式
 cli-project-name-help = 穩定專案名稱
 cli-init-path-help = RPG Maker 遊戲根目錄；既有專案可重用上次成功路徑
 cli-source-language-help = 原文語言 ID
@@ -22,6 +23,9 @@ cli-lua-help = 取代目前階段的 Lua 程式；零位元組檔案會清除它
 cli-profile-help = 翻譯 Profile ID；省略時重用上次成功 Profile
 cli-terms-help = 取代專案術語資源
 cli-placeholders-help = 取代專案 Placeholder 資源
+cli-project-lua-profile-help = Standard 人工驗收使用的 Profile；省略時在開啟 Standard 能力時重用上次成功的 Translate Profile
+cli-project-lua-script-help = 本次一次性執行的可信 Lua 程式
+cli-project-lua-arguments-help = 在 -- 後傳給 Lua arg[1..] 的 UTF-8 參數
 cli-usage-heading = 用法：
 cli-commands-heading = 命令：
 cli-options-heading = 選項：
@@ -102,6 +106,7 @@ progress-extract-commit = 正在提交擷取資產
 progress-translate-planning = 正在規劃翻譯工作
 progress-translate-confirmed = 已確認翻譯工作
 progress-translate-no-work = 不需要呼叫模型
+progress-project-lua = 正在執行專案 Lua 程式
 progress-write-back-read-assets = 正在讀取已驗收資產
 progress-write-back-planning = 正在規劃文件改寫
 progress-write-back-documents = 已改寫文件
@@ -120,6 +125,7 @@ result-translate-completed = 翻譯執行完成：{ $project }（Profile：{ $pr
 result-translate-standard = 標準翻譯：工作 { $total }，完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }；寫入 { $written } 處，剩餘 { $remaining } 處
 result-translate-convergence = 狀態收斂：保留 { $retained }，失效 { $invalidated }，不適用 { $not_applicable }，重用 { $reused }
 result-write-back-completed = 寫回完成：{ $project }
+result-project-lua-completed = 專案 Lua 執行完成：{ $project }
 result-output-directory = 輸出目錄：{ $path }
 result-write-back-standard = 標準寫回：套用譯文 { $translated } 個單元，保留原文 { $original } 個單元；自動換行 { $auto_wrapped } 段，新增換行 { $breaks } 處；續行全形縮排 { $indents } 處；需人工換行 { $manual } 段
 result-lua-executed = Lua：已執行
@@ -166,6 +172,7 @@ diagnostic-recovery-value = { $kind ->
 diagnostic-related = 相關錯誤 { $index }：
 diagnostic-stage-value = { $code ->
     [process_output] 處理程序輸出
+    [lua] 專案 Lua 執行
    *[other] { $fallback }
 }
 diagnostic-impact-value = { $code ->

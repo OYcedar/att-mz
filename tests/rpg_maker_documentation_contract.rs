@@ -114,7 +114,7 @@ const TOML_EXAMPLES: [&str; 4] = [
     "terminology.toml",
 ];
 
-const LUA_EXAMPLES: [(&str, &[&str]); 4] = [
+const LUA_EXAMPLES: [(&str, &[&str]); 5] = [
     (
         "lua-standard-data-file.lua",
         &["ctx.rpg_maker.data_file", "ctx.extract.replace_standard"],
@@ -127,6 +127,15 @@ const LUA_EXAMPLES: [(&str, &[&str]); 4] = [
             ":accept(",
             "ctx.db.begin(",
             "ctx.db.commit(",
+        ],
+    ),
+    (
+        "lua-accept-standard.lua",
+        &[
+            "ctx.standard.open",
+            "standard:units(",
+            "standard:accept(",
+            "replace_current",
         ],
     ),
     (
@@ -144,7 +153,7 @@ const LUA_EXAMPLES: [(&str, &[&str]); 4] = [
     ),
 ];
 
-const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 9] = [
+const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 10] = [
     (
         "config.example.toml",
         "src/application/config.rs",
@@ -186,6 +195,12 @@ const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 9] = [
         "src/rpg_maker/lua/lua54.rs",
         "include_str!(\"../../../docs/rpg-maker/examples/lua-translate-state.lua\")",
         "async fn documented_translate_state_and_idempotent_write_back_examples_execute()",
+    ),
+    (
+        "lua-accept-standard.lua",
+        "src/rpg_maker/lua/lua54.rs",
+        "include_str!(\"../../../docs/rpg-maker/examples/lua-accept-standard.lua\")",
+        "async fn documented_standard_candidate_example_executes_in_the_real_vm()",
     ),
     (
         "lua-idempotent-write-back.lua",

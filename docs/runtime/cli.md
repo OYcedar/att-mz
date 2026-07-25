@@ -38,6 +38,8 @@ att mz|mv translate --name NAME [PROFILE_ID]
   [--lua SCRIPT_LUA]
 
 att mz|mv write-back --name NAME [--lua SCRIPT_LUA]
+
+att mz|mv lua --name NAME [--profile PROFILE_ID] SCRIPT_LUA [-- ARG...]
 ```
 
 省略可选参数不等于使用模糊的“默认值”。命令会把每项选择解析成类型化来源：本次显式
@@ -79,8 +81,10 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 
 ## 3. 运行方案解析与持久化
 
-项目数据库为四个命令分别保存上次成功运行方案。项目租约覆盖方案读取、业务执行、
-必要收尾和最终方案替换，防止两个并发命令把不同选择拼成同一方案。
+项目数据库为 Init、Extract、Translate、WriteBack 四个阶段命令分别保存上次成功运行
+方案。项目租约覆盖方案读取、业务执行、必要收尾和最终方案替换，防止两个并发命令把
+不同选择拼成同一方案。独立 `lua` 命令也持有同一项目租约，但不读取或写入自己的运行
+方案。
 
 ### 3.1 Init
 
@@ -137,7 +141,29 @@ Translate 同时消费 `[rpg_maker]` 中可省略的 `record_translation_tasks`�
 以后省略时复用上次成功选择。非空 Lua 文件替换并启用 WriteBack 阶段程序；零字节文件
 清除程序，本轮只执行 Standard，并且不处理 Lua 私有数据库状态。
 
-### 3.5 Lua 快照
+### 3.5 独立项目 Lua
+
+`lua` 是一次性项目程序入口。`SCRIPT_LUA` 每次必填，ATT 从本次解析后的路径重新读取
+完整文件；零字节文件是合法空程序，主 chunk 返回值忽略。脚本、参数和 Profile 选择都
+不写入任何阶段运行方案，也不改变 Extract、Translate 或 WriteBack 已保存的 Lua 快照。
+`--` 后的参数保持顺序放入
+全局 `arg[1..]`，`arg[0]` 是解析后的脚本路径；任一参数不能表示为 UTF-8 时在运行脚本前
+明确失败。
+
+独立程序拥有完整可信 Lua 5.4 和公共项目接口。它可通过 `ctx.standard.open()` 打开由
+Standard 核心拥有的人工候选会话，但不会发送 LLM 请求：
+
+- 显式 `--profile` 在当前配置中精确选择，ID 不存在时失败；
+- 未显式选择时，`open()` 才读取上次成功 Translate 保存的 Profile；项目没有可复用 ID，
+  或保存 ID 已不在当前配置中时，只让 `open()` 失败，不妨碍不使用 Standard 的普通脚本；
+- 显式或复用的 Profile 只服务本次会话，不替换 Translate 保存方案；
+- 术语和 Placeholder 始终读取项目当前 canonical 资源，不接受本命令临时覆盖。
+
+一次成功的 `ctx.standard.accept` 已经完成独立短事务提交。脚本之后失败或取消不会回滚
+更早已经确认的调用；原游戏目录不被该接口修改。可信脚本通过标准库或 `ctx.db` 自行产生
+的其他副作用仍由脚本作者负责。
+
+### 3.6 Lua 快照
 
 Extract、Translate、WriteBack 的非空 Lua 主程序按阶段分别保存在项目数据库中，包括
 程序正文 BLOB、SHA-256 和无损 Windows 规范解析路径。自动复用执行保存的正文，不重新
@@ -145,7 +171,9 @@ Extract、Translate、WriteBack 的非空 Lua 主程序按阶段分别保存在�
 不会改变保存方案。脚本主动加载的模块、文件和进程仍是可信 Lua 的外部动态依赖，不
 纳入快照。
 
-### 3.6 成功替换边界
+独立 `lua` 命令不属于本节快照：它没有复用、清除或保存语义。
+
+### 3.7 成功替换边界
 
 运行方案不是尽力而为的日志，而是后续命令会消费的项目状态。只有业务成功且所有必要
 非日志根完成收尾后，ATT 才在最后一个短 SQLite 事务中原子替换本命令的整套方案：
@@ -173,9 +201,9 @@ Extract、Translate、WriteBack 的非空 Lua 主程序按阶段分别保存在�
   ↓
 把显式输入、项目状态或产品行为解析为本次完整方案
   ↓
-只构造本方案消费的 Profile、Client、Lua 和纵向根能力
+只构造本次命令消费的 Profile、Client、Lua 和纵向根能力
   ↓
-执行命令，完成必要非日志收尾，原子保存运行方案
+执行命令，完成必要非日志收尾；阶段命令原子保存运行方案
   ↓
 呈现最终结果；项目日志独立尝试排空，不参与业务终态
 ```
@@ -187,10 +215,14 @@ Translate 在选定显式或保存的 Profile 后，精确选择当前配置中�
 的精确路径读取。只有最终方案启用某阶段 Lua 时才构造程序固定策略的 Lua Runtime；配置
 不包含 Lua Runtime 分区。
 
-Extract、Translate 与 WriteBack 各自在命令生命周期内构造一个私有 Rayon CPU 池。
-文档解析、规则扫描、资产编解码、规划准备与写回计算共享操作系统可用并行度。饱和只会
-自然背压；等待时取消则任务不执行，已经准入的任务会完成，shutdown 停止新准入并排空
-已接管作业。
+独立 `lua` 每次从显式路径构造程序。未显式提供 Profile 时，公共 Lua 能力先运行；
+`ctx.standard.open()` 才解析保存的 Translate Profile 并装配 Standard 语义。该入口不构造
+LLM 请求执行器，不建立虚假的 Standard TaskBlock。
+
+Extract、Translate、WriteBack 与独立 Lua 各自在命令生命周期内构造一个私有 Rayon CPU
+池。文档解析、规则扫描、资产编解码、规划准备、人工 Standard 准备与写回计算共享操作
+系统可用并行度。饱和只会自然背压；等待时取消则任务不执行，已经准入的任务会完成，
+shutdown 停止新准入并排空已接管作业。
 
 ## 5. 进度与输出通道
 
@@ -204,6 +236,7 @@ Extract、Translate 与 WriteBack 各自在命令生命周期内构造一个私�
   Complete、Partial、Unavailable 都计入，零任务提示“无需调用模型”且不显示 `0/0`；
 - WriteBack：资产读取、规划和文档改写使用可取得的真实计数；Lua、候选验证和发布使用
   spinner；
+- Lua：程序执行和每次 Standard 人工提交使用 spinner，不制造 LLM 任务进度；
 - 达到 `N/N` 后进入“正在收尾/保存运行方案”，所有必要业务操作完成后才显示成功；
 - Ctrl-C 立即显示“正在安全停止”，并保留最后一个已确认计数。
 
@@ -231,7 +264,7 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 <projects.root>/.att-locks/directory-publish/<engine>/
 ```
 
-同一引擎版本、同一项目的四个命令互斥；不同引擎版本的同名项目独立。锁顺序固定为
+同一引擎版本、同一项目的五个命令互斥；不同引擎版本的同名项目独立。锁顺序固定为
 “项目租约 → 目录发布锁 → SQLite/session”。等待项目租约、目录发布锁或 SQLite busy
 不设置任意截止时间；等待过程响应 Ctrl-C/shutdown，取消后不开始后续副作用。
 

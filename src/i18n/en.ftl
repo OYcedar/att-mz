@@ -8,6 +8,7 @@ cli-init-about = Initialize or update a named game project
 cli-extract-about = Extract source text using an explicit or saved owner plan
 cli-translate-about = Translate extracted text with an explicit or saved profile
 cli-write-back-about = Write accepted translations back to the game
+cli-project-lua-about = Run a trusted Lua program once in a project context
 cli-project-name-help = Stable project name
 cli-init-path-help = RPG Maker game root; an existing project can reuse its last successful path
 cli-source-language-help = Source language ID
@@ -22,6 +23,9 @@ cli-lua-help = Replace the phase Lua program; a zero-byte file clears it
 cli-profile-help = Translation profile ID; omit it to reuse the last successful profile
 cli-terms-help = Replace the project's terminology resource
 cli-placeholders-help = Replace the project's placeholder resource
+cli-project-lua-profile-help = Profile for Standard manual acceptance; omit it to resolve the last successful Translate profile when Standard is opened
+cli-project-lua-script-help = Trusted Lua program to run once
+cli-project-lua-arguments-help = UTF-8 argument passed to Lua arg[1..] after --
 cli-usage-heading = Usage:
 cli-commands-heading = Commands:
 cli-options-heading = Options:
@@ -105,6 +109,7 @@ progress-extract-commit = Committing extracted assets
 progress-translate-planning = Planning translation tasks
 progress-translate-confirmed = Confirmed translation tasks
 progress-translate-no-work = No model request is needed
+progress-project-lua = Running the project Lua program
 progress-write-back-read-assets = Reading accepted assets
 progress-write-back-planning = Planning document rewrites
 progress-write-back-documents = Rewritten documents
@@ -123,6 +128,7 @@ result-translate-completed = Translation complete: { $project } (Profile: { $pro
 result-translate-standard = Standard translation: { $total } tasks; { $complete } complete, { $partial } partial, { $unavailable } unavailable; wrote { $written } locations, { $remaining } remaining
 result-translate-convergence = State convergence: { $retained } retained, { $invalidated } invalidated, { $not_applicable } not applicable, { $reused } reused
 result-write-back-completed = Write-back complete: { $project }
+result-project-lua-completed = Project Lua execution complete: { $project }
 result-output-directory = Output directory: { $path }
 result-write-back-standard = Standard write-back: { $translated } translated units, { $original } source units; auto-wrapped { $auto_wrapped }, inserted { $breaks } line breaks and { $indents } full-width indents; { $manual } need manual layout
 result-lua-executed = Lua: executed
@@ -175,6 +181,7 @@ diagnostic-recovery-value = { $kind ->
 diagnostic-related = Related error { $index }:
 diagnostic-stage-value = { $code ->
     [process_output] Process output
+    [lua] Project Lua execution
    *[other] { $fallback }
 }
 diagnostic-impact-value = { $code ->

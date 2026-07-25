@@ -23,8 +23,8 @@ use crate::rpg_maker::project_database::{
     PLACEHOLDER_RULES_RESOURCE_KIND, TERMINOLOGY_RESOURCE_KIND,
 };
 use crate::storage::sqlite::{
-    ExecuteTransactionError, SqliteBatch, SqliteCommand, SqliteQuery, SqliteTransactionPlan,
-    SqliteTransactionStep, SqliteValue,
+    ExecuteTransactionError, SqliteBatch, SqliteCommand, SqliteQuery, SqliteTransactionExecutor,
+    SqliteTransactionPlan, SqliteTransactionStep, SqliteValue,
 };
 use crate::storage::sqlite_session::{
     SqliteInteractiveSessionFinalizationError, SqliteInteractiveSessionFinalizationFailure,
@@ -35,6 +35,10 @@ use crate::storage::sqlite_transaction_session::{
     SqliteTransactionSessionOperations,
 };
 
+use super::candidate::{
+    PreparedStandardCandidateAcceptance, StandardCandidateAcceptance,
+    StandardCandidatePreparationError, StandardCandidateRequest, StandardCandidateSession,
+};
 use super::standard::{
     StandardTranslationResultStore, TranslationPlanPreparation, TranslationSnapshotBaseline,
     TranslationTaskOutcome, TranslationUnitIdentity,
@@ -118,6 +122,342 @@ where
 
     async fn finalize(&self) -> Result<(), Self::Error> {
         self.finalize_session().await
+    }
+}
+
+/// Standard 人工候选的一次批量短事务提交服务。
+///
+/// 每次调用先在 CPU 根完成全部候选验收和 CAS 计划编码，再用同一个事务提交所有
+/// 合法去重族；普通拒绝项不进入写入计划。
+pub(crate) struct RpgMakerStandardCandidateAcceptanceService<T, C> {
+    sqlite: T,
+    cpu: C,
+}
+
+impl<T, C> RpgMakerStandardCandidateAcceptanceService<T, C> {
+    pub(crate) fn new(sqlite: T, cpu: C) -> Self {
+        Self { sqlite, cpu }
+    }
+}
+
+impl<T, C> RpgMakerStandardCandidateAcceptanceService<T, C>
+where
+    T: SqliteTransactionExecutor,
+    C: CpuTaskExecutor,
+{
+    pub(crate) async fn accept(
+        &self,
+        project: &OpenedProject,
+        session: Arc<StandardCandidateSession>,
+        requests: Vec<StandardCandidateRequest>,
+    ) -> Result<
+        Vec<StandardCandidateAcceptance>,
+        RpgMakerStandardCandidateAcceptanceError<T::Error, C::Error>,
+    > {
+        let _acceptance_guard = session.lock_acceptance().await;
+        let preparing_session = Arc::clone(&session);
+        let prepared = Arc::new(
+            self.cpu
+                .execute(move || preparing_session.prepare_acceptance(requests))
+                .await
+                .map_err(RpgMakerStandardCandidateAcceptanceError::SchedulePreparation)?
+                .map_err(RpgMakerStandardCandidateAcceptanceError::InvalidCandidate)?,
+        );
+        if prepared.commits().is_empty() {
+            return Ok(prepared.results().to_vec());
+        }
+
+        let encoding = Arc::clone(&prepared);
+        let plan = self
+            .cpu
+            .execute(move || encode_standard_candidate_plan(encoding.as_ref()))
+            .await
+            .map_err(RpgMakerStandardCandidateAcceptanceError::ScheduleEncoding)?
+            .map_err(RpgMakerStandardCandidateAcceptanceError::InvalidPlan)?;
+        self.sqlite
+            .execute_transaction(project.database_path().to_path_buf(), plan)
+            .await
+            .map_err(|source| {
+                map_standard_candidate_transaction_error(
+                    project.database_path().to_path_buf(),
+                    source,
+                )
+            })?;
+        session
+            .apply_committed(prepared.as_ref())
+            .map_err(RpgMakerStandardCandidateAcceptanceError::SessionUpdate)?;
+        Ok(prepared.results().to_vec())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RpgMakerStandardCandidateAcceptanceError<S, C> {
+    SchedulePreparation(CpuTaskExecutionError<C>),
+    InvalidCandidate(StandardCandidatePreparationError),
+    ScheduleEncoding(CpuTaskExecutionError<C>),
+    InvalidPlan(ResultStoragePlanError),
+    DatabaseNotFound { database_path: PathBuf },
+    StaleSnapshot { database_path: PathBuf },
+    NotCommitted { database_path: PathBuf, source: S },
+    OutcomeUnknown { database_path: PathBuf, source: S },
+    SessionUpdate(StandardCandidatePreparationError),
+}
+
+impl<S: fmt::Display, C: fmt::Display> fmt::Display
+    for RpgMakerStandardCandidateAcceptanceError<S, C>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SchedulePreparation(source) => {
+                write!(formatter, "无法调度 Standard 人工候选验收：{source}")
+            }
+            Self::InvalidCandidate(source) => {
+                write!(formatter, "Standard 人工候选无法验收：{source}")
+            }
+            Self::ScheduleEncoding(source) => {
+                write!(formatter, "无法调度 Standard 人工候选写入编码：{source}")
+            }
+            Self::InvalidPlan(source) => {
+                write!(formatter, "Standard 人工候选写入计划无效：{source}")
+            }
+            Self::DatabaseNotFound { database_path } => {
+                write!(formatter, "项目数据库不存在：{}", database_path.display())
+            }
+            Self::StaleSnapshot { database_path } => write!(
+                formatter,
+                "Standard 人工候选会话建立后项目状态已变化：{}",
+                database_path.display()
+            ),
+            Self::NotCommitted {
+                database_path,
+                source,
+            } => write!(
+                formatter,
+                "Standard 人工候选事务未提交（{}）：{source}",
+                database_path.display()
+            ),
+            Self::OutcomeUnknown {
+                database_path,
+                source,
+            } => write!(
+                formatter,
+                "Standard 人工候选事务提交终态未知（{}）：{source}",
+                database_path.display()
+            ),
+            Self::SessionUpdate(source) => write!(
+                formatter,
+                "Standard 人工候选已提交，但无法更新内存会话：{source}"
+            ),
+        }
+    }
+}
+
+impl<S: Error + 'static, C: Error + 'static> Error
+    for RpgMakerStandardCandidateAcceptanceError<S, C>
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SchedulePreparation(source) | Self::ScheduleEncoding(source) => Some(source),
+            Self::InvalidCandidate(source) | Self::SessionUpdate(source) => Some(source),
+            Self::InvalidPlan(source) => Some(source),
+            Self::NotCommitted { source, .. } | Self::OutcomeUnknown { source, .. } => Some(source),
+            Self::DatabaseNotFound { .. } | Self::StaleSnapshot { .. } => None,
+        }
+    }
+}
+
+impl<S, C> RpgMakerStandardCandidateAcceptanceError<S, C>
+where
+    S: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    pub(crate) fn safe_diagnostic(&self, stage: DiagnosticStage) -> SafeDiagnostic {
+        self.safe_diagnostic_source(
+            stage,
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticAction::Retry,
+        )
+    }
+}
+
+impl<S, C> SafeDiagnosticSource for RpgMakerStandardCandidateAcceptanceError<S, C>
+where
+    S: SafeDiagnosticSource,
+    CpuTaskExecutionError<C>: SafeDiagnosticSource,
+{
+    fn safe_diagnostic_source(
+        &self,
+        stage: DiagnosticStage,
+        _impact: DiagnosticImpact,
+        _fallback_action: DiagnosticAction,
+    ) -> SafeDiagnostic {
+        match self {
+            Self::SchedulePreparation(source) | Self::ScheduleEncoding(source) => source
+                .safe_diagnostic_source(
+                    stage,
+                    DiagnosticImpact::ProgressPreserved,
+                    DiagnosticAction::Retry,
+                ),
+            Self::InvalidCandidate(source) => SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                stage,
+                DiagnosticSubject::component("standard_candidate_acceptance"),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InternalInvariant,
+                    source.safe_detail(),
+                ),
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::ReportBug,
+            ),
+            Self::InvalidPlan(source) => {
+                let mut diagnostic = source.safe_diagnostic();
+                diagnostic.stage = stage;
+                diagnostic
+            }
+            Self::DatabaseNotFound { database_path } => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                stage,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::CheckProjectState,
+            ),
+            Self::StaleSnapshot { database_path } => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                stage,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::StateMismatch,
+                    "reason=standard_candidate_stale_snapshot",
+                ),
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::Retry,
+            ),
+            Self::NotCommitted {
+                database_path,
+                source,
+            } => standard_candidate_storage_source_diagnostic(
+                source,
+                database_path,
+                stage,
+                DiagnosticImpact::ProgressPreserved,
+                DiagnosticAction::Retry,
+            )
+            .with_recovery(RecoveryFact::transaction("rolled_back")),
+            Self::OutcomeUnknown {
+                database_path,
+                source,
+            } => standard_candidate_storage_source_diagnostic(
+                source,
+                database_path,
+                stage,
+                DiagnosticImpact::OutcomeUnknown,
+                DiagnosticAction::PreserveRecoveryArtifacts,
+            )
+            .with_recovery(RecoveryFact::transaction("outcome_unknown")),
+            Self::SessionUpdate(source) => SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                stage,
+                DiagnosticSubject::component("standard_candidate_session"),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::FinalizationFailed,
+                    source.safe_detail(),
+                ),
+                DiagnosticImpact::StateAppliedFinalizationFailed,
+                DiagnosticAction::ReportBug,
+            )
+            .with_recovery(RecoveryFact::component("reopen_standard_candidate_session")),
+        }
+    }
+}
+
+fn standard_candidate_storage_source_diagnostic<S>(
+    source: &S,
+    database_path: &std::path::Path,
+    stage: DiagnosticStage,
+    impact: DiagnosticImpact,
+    action: DiagnosticAction,
+) -> SafeDiagnostic
+where
+    S: SafeDiagnosticSource,
+{
+    let mut diagnostic = source.safe_diagnostic_source(stage, impact, action);
+    diagnostic.stage = stage;
+    diagnostic.subject = DiagnosticSubject::path(database_path);
+    diagnostic.impact = impact;
+    diagnostic.action = action;
+    diagnostic
+}
+
+fn encode_standard_candidate_plan(
+    prepared: &PreparedStandardCandidateAcceptance,
+) -> Result<SqliteTransactionPlan, ResultStoragePlanError> {
+    let write_count = prepared
+        .commits()
+        .iter()
+        .map(|commit| commit.writes().len())
+        .sum();
+    let mut seen = HashSet::with_capacity(write_count);
+    let mut parameter_sets = Vec::with_capacity(write_count);
+    for commit in prepared.commits() {
+        if commit.writes().is_empty() {
+            return Err(ResultStoragePlanError::MissingCommitDecisionUnit);
+        }
+        for write in commit.writes() {
+            ensure_nonblank(write.replacement_translation())?;
+            let identity = encode_identity(write.identity())?;
+            ensure_unique(&mut seen, &identity)?;
+            parameter_sets.push(write_translation_from_snapshot_parameters(
+                identity,
+                encode_content(write.replacement_translation())?,
+                write.replacement_translation_state(),
+                write
+                    .expected_translation()
+                    .map(encode_content)
+                    .transpose()?,
+                write.expected_translation_state(),
+            ));
+        }
+    }
+    Ok(SqliteTransactionPlan::new(vec![
+        require_snapshot_baseline(prepared.baseline()),
+        SqliteTransactionStep::ExecuteManyExactlyOne(SqliteBatch::new(
+            WRITE_TRANSLATION_FROM_SNAPSHOT,
+            parameter_sets,
+        )),
+    ]))
+}
+
+fn map_standard_candidate_transaction_error<S, C>(
+    database_path: PathBuf,
+    source: ExecuteTransactionError<S>,
+) -> RpgMakerStandardCandidateAcceptanceError<S, C> {
+    match source {
+        ExecuteTransactionError::NotFound => {
+            RpgMakerStandardCandidateAcceptanceError::DatabaseNotFound { database_path }
+        }
+        ExecuteTransactionError::RequirementFailed
+        | ExecuteTransactionError::RequirementFailedWithRow { .. } => {
+            RpgMakerStandardCandidateAcceptanceError::StaleSnapshot { database_path }
+        }
+        ExecuteTransactionError::RequirementFailedWithRowOutcomeUnknown { source, .. } => {
+            RpgMakerStandardCandidateAcceptanceError::OutcomeUnknown {
+                database_path,
+                source: *source,
+            }
+        }
+        ExecuteTransactionError::NotCommitted(source) => {
+            RpgMakerStandardCandidateAcceptanceError::NotCommitted {
+                database_path,
+                source,
+            }
+        }
+        ExecuteTransactionError::OutcomeUnknown(source) => {
+            RpgMakerStandardCandidateAcceptanceError::OutcomeUnknown {
+                database_path,
+                source,
+            }
+        }
     }
 }
 
@@ -1358,7 +1698,7 @@ const REQUIRE_SNAPSHOT: &str = "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM standar
 
 const CLEAR_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE standard_text_unit SET translation_content_json = NULL, translation_state = NULL WHERE owner = ?1 AND group_location = ?2 AND unit_role = ?3 AND source_content_json = ?4 AND source_context_json = ?5 AND translation_content_json = ?6 AND translation_state = ?7";
 
-const WRITE_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE standard_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_location = ?4 AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND ((?8 IS NULL AND ?9 IS NULL AND translation_content_json IS NULL AND translation_state IS NULL) OR (translation_content_json = ?8 AND translation_state = ?9))";
+const WRITE_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE standard_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_location = ?4 AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND (translation_content_json = ?8 OR (translation_content_json IS NULL AND ?8 IS NULL)) AND (translation_state = ?9 OR (translation_state IS NULL AND ?9 IS NULL))";
 
 const COMMIT_TRANSLATION: &str = "UPDATE standard_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_location = ?4 AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND translation_content_json IS NULL AND translation_state IS NULL";
 
@@ -1532,9 +1872,14 @@ mod tests {
     use rusqlite::{Connection, params};
 
     use super::*;
+    use crate::rpg_maker::translate::candidate::{
+        StandardCandidateRequest, StandardCandidateUnitIndex, StandardCandidateUnitStatus,
+    };
     use crate::rpg_maker::translate::executor::FinalLlmResponseMetadata;
+    use crate::rpg_maker::translate::semantics::ResolvedTranslationSemantics;
     use crate::rpg_maker::translate::standard::{
-        AcceptedTranslationDecision, NonEmptyTaskItems, StandardTranslationTaskIndex,
+        AcceptedTranslationDecision, NonEmptyTaskItems, StandardTranslationAsset,
+        StandardTranslationCorpus, StandardTranslationGroup, StandardTranslationTaskIndex,
         TranslationInvalidation, TranslationOwnerSnapshot, TranslationPatch,
         TranslationPropagationTarget, TranslationReuse, TranslationReuseSeed,
         TranslationReuseTarget, TranslationSnapshotBaseline, TranslationStateContext,
@@ -1707,6 +2052,7 @@ mod tests {
     enum RecordingTransactionResult {
         #[default]
         Committed,
+        Stale,
         NotApplied,
         OutcomeUnknown,
     }
@@ -1730,6 +2076,9 @@ mod tests {
                 .push((self.path.clone(), plan));
             ready(match self.transaction_result {
                 RecordingTransactionResult::Committed => Ok(()),
+                RecordingTransactionResult::Stale => {
+                    Err(ExecuteTransactionError::RequirementFailed)
+                }
                 RecordingTransactionResult::NotApplied => {
                     Err(ExecuteTransactionError::NotCommitted(FakeError))
                 }
@@ -1738,6 +2087,206 @@ mod tests {
                 }
             })
         }
+    }
+
+    impl SqliteTransactionExecutor for RecordingSqlite {
+        type Error = FakeError;
+
+        fn execute_transaction(
+            &self,
+            path: PathBuf,
+            plan: SqliteTransactionPlan,
+        ) -> impl Future<Output = Result<(), ExecuteTransactionError<Self::Error>>> + Send {
+            self.plans.lock().expect("事务锁").push((path, plan));
+            ready(match self.transaction_result {
+                RecordingTransactionResult::Committed => Ok(()),
+                RecordingTransactionResult::Stale => {
+                    Err(ExecuteTransactionError::RequirementFailed)
+                }
+                RecordingTransactionResult::NotApplied => {
+                    Err(ExecuteTransactionError::NotCommitted(FakeError))
+                }
+                RecordingTransactionResult::OutcomeUnknown => {
+                    Err(ExecuteTransactionError::OutcomeUnknown(FakeError))
+                }
+            })
+        }
+    }
+
+    fn missing_candidate_session() -> Arc<StandardCandidateSession> {
+        candidate_session_with_sources(&["テスト"])
+    }
+
+    fn candidate_session_with_sources(sources: &[&str]) -> Arc<StandardCandidateSession> {
+        let semantics = Arc::new(ResolvedTranslationSemantics::for_test());
+        let groups = sources
+            .iter()
+            .enumerate()
+            .map(|(offset, source)| {
+                let identity = scalar_identity(offset + 1, "name", source, "{}");
+                let group_location = identity.group_location().clone();
+                StandardTranslationGroup::new(
+                    TextGroupKind::DatabaseEntry,
+                    group_location,
+                    vec![StandardTranslationAsset::new(identity, None, None)],
+                )
+            })
+            .collect();
+        Arc::new(
+            StandardCandidateSession::from_corpus(
+                semantics,
+                StandardTranslationCorpus::new(groups),
+            )
+            .expect("测试人工候选会话应可建立"),
+        )
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_uses_one_baseline_guarded_cas_transaction() {
+        let sqlite = RecordingSqlite::default();
+        let recorded = sqlite.clone();
+        let service = RpgMakerStandardCandidateAcceptanceService::new(sqlite, InlineCpu);
+        let session = missing_candidate_session();
+        let results = service
+            .accept(
+                &project(),
+                Arc::clone(&session),
+                vec![StandardCandidateRequest::new(
+                    StandardCandidateUnitIndex::new(0),
+                    value("人工译文"),
+                    false,
+                )],
+            )
+            .await
+            .expect("合法人工候选应提交");
+
+        assert_eq!(
+            results,
+            vec![StandardCandidateAcceptance::Accepted {
+                translation: value("人工译文"),
+                changed_locations: 1,
+            }]
+        );
+        assert_eq!(
+            session.units()[0].status(),
+            StandardCandidateUnitStatus::Current
+        );
+        let plans = recorded.plans.lock().expect("事务记录锁");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].0, project().database_path());
+        assert_eq!(plans[0].1.steps().len(), 2);
+        assert!(matches!(
+            plans[0].1.steps()[0],
+            SqliteTransactionStep::RequireNoRows(_)
+        ));
+        let SqliteTransactionStep::ExecuteManyExactlyOne(writes) = &plans[0].1.steps()[1] else {
+            panic!("人工候选必须使用精确单行 CAS 批量写入")
+        };
+        assert_eq!(writes.statement(), WRITE_TRANSLATION_FROM_SNAPSHOT);
+        assert_eq!(writes.parameter_set_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_manual_candidate_rolls_back_and_keeps_session_snapshot() {
+        let sqlite = RecordingSqlite {
+            transaction_result: RecordingTransactionResult::Stale,
+            ..RecordingSqlite::default()
+        };
+        let service = RpgMakerStandardCandidateAcceptanceService::new(sqlite, InlineCpu);
+        let session = missing_candidate_session();
+        let error = service
+            .accept(
+                &project(),
+                Arc::clone(&session),
+                vec![StandardCandidateRequest::new(
+                    StandardCandidateUnitIndex::new(0),
+                    value("人工译文"),
+                    false,
+                )],
+            )
+            .await
+            .expect_err("CAS 失效必须显式失败");
+
+        assert!(matches!(
+            error,
+            RpgMakerStandardCandidateAcceptanceError::StaleSnapshot { .. }
+        ));
+        assert_eq!(
+            session.units()[0].status(),
+            StandardCandidateUnitStatus::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_batch_commits_all_valid_families_and_excludes_normal_rejections() {
+        let sqlite = RecordingSqlite::default();
+        let recorded = sqlite.clone();
+        let service = RpgMakerStandardCandidateAcceptanceService::new(sqlite, InlineCpu);
+        let session = candidate_session_with_sources(&["テスト一", "テスト二", "テスト三"]);
+        let results = service
+            .accept(
+                &project(),
+                Arc::clone(&session),
+                vec![
+                    StandardCandidateRequest::new(
+                        StandardCandidateUnitIndex::new(0),
+                        value("译文一"),
+                        false,
+                    ),
+                    StandardCandidateRequest::new(
+                        StandardCandidateUnitIndex::new(1),
+                        value("译文二"),
+                        false,
+                    ),
+                    StandardCandidateRequest::new(
+                        StandardCandidateUnitIndex::new(2),
+                        value(""),
+                        false,
+                    ),
+                ],
+            )
+            .await
+            .expect("普通拒绝不应阻止其他合法族提交");
+
+        assert!(matches!(
+            &results[0],
+            StandardCandidateAcceptance::Accepted {
+                changed_locations: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &results[1],
+            StandardCandidateAcceptance::Accepted {
+                changed_locations: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &results[2],
+            StandardCandidateAcceptance::Rejected {
+                reason: super::super::candidate::StandardCandidateRejectionReason::Candidate(_)
+            }
+        ));
+        let statuses = session
+            .units()
+            .into_iter()
+            .map(|unit| unit.status())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                StandardCandidateUnitStatus::Current,
+                StandardCandidateUnitStatus::Current,
+                StandardCandidateUnitStatus::Missing,
+            ]
+        );
+        let plans = recorded.plans.lock().expect("事务记录锁");
+        assert_eq!(plans.len(), 1);
+        let SqliteTransactionStep::ExecuteManyExactlyOne(writes) = &plans[0].1.steps()[1] else {
+            panic!("合法人工候选族必须合并到同一个 CAS 批次")
+        };
+        assert_eq!(writes.parameter_set_count(), 2);
     }
 
     struct RecordingFinalizer {
@@ -2359,6 +2908,307 @@ mod tests {
         assert!(matches!(error, ResultStoragePlanError::DuplicateUnit));
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum CandidateStaleMutation {
+        ProjectSource,
+        OwnerSource,
+        OwnerAsset,
+        Terminology,
+        PlaceholderRules,
+        UnitContext,
+    }
+
+    #[tokio::test]
+    async fn real_manual_batch_rejects_every_global_or_unit_snapshot_change_atomically() {
+        let directory = tempfile::tempdir().expect("临时目录应可创建");
+        let storage = runtime_storage();
+        for mutation in [
+            CandidateStaleMutation::ProjectSource,
+            CandidateStaleMutation::OwnerSource,
+            CandidateStaleMutation::OwnerAsset,
+            CandidateStaleMutation::Terminology,
+            CandidateStaleMutation::PlaceholderRules,
+            CandidateStaleMutation::UnitContext,
+        ] {
+            let database_path = directory
+                .path()
+                .join(format!("{mutation:?}"))
+                .join("project.db");
+            let identities = vec![
+                scalar_identity(1, "name", "テスト一", "{}"),
+                scalar_identity(2, "name", "テスト二", "{}"),
+            ];
+            create_candidate_database(&database_path, &identities);
+            let session = candidate_session_with_baseline(&identities);
+            mutate_candidate_database(&database_path, mutation);
+            let service =
+                RpgMakerStandardCandidateAcceptanceService::new(storage.clone(), InlineCpu);
+
+            let error = service
+                .accept(
+                    &project_at(database_path.clone()),
+                    Arc::clone(&session),
+                    vec![
+                        StandardCandidateRequest::new(
+                            StandardCandidateUnitIndex::new(0),
+                            value("译文一"),
+                            false,
+                        ),
+                        StandardCandidateRequest::new(
+                            StandardCandidateUnitIndex::new(1),
+                            value("译文二"),
+                            false,
+                        ),
+                    ],
+                )
+                .await
+                .expect_err("任一快照变化都必须拒绝整批人工提交");
+            assert!(
+                matches!(
+                    error,
+                    RpgMakerStandardCandidateAcceptanceError::StaleSnapshot { .. }
+                ),
+                "mutation={mutation:?}"
+            );
+            assert_eq!(
+                stored_translation(&database_path, 1),
+                (None, None),
+                "mutation={mutation:?}"
+            );
+            assert_eq!(
+                stored_translation(&database_path, 2),
+                (None, None),
+                "mutation={mutation:?}"
+            );
+            assert!(
+                session
+                    .units()
+                    .iter()
+                    .all(|unit| unit.status() == StandardCandidateUnitStatus::Missing),
+                "mutation={mutation:?}"
+            );
+        }
+        storage.shutdown().await.expect("SQLite 根应正常关闭");
+    }
+
+    #[tokio::test]
+    async fn real_manual_replace_repairs_conflicting_current_family_with_per_location_states() {
+        let directory = tempfile::tempdir().expect("临时目录应可创建");
+        let database_path = directory
+            .path()
+            .join("replace-conflicting-current")
+            .join("project.db");
+        let identities = vec![
+            scalar_identity(1, "name", "同じ原文", "{}"),
+            scalar_identity(2, "name", "同じ原文", "{}"),
+        ];
+        let semantics = Arc::new(ResolvedTranslationSemantics::for_test());
+        let current_translations = [value("旧译文一"), value("旧译文二")];
+        let current_states = identities
+            .iter()
+            .zip(&current_translations)
+            .map(|(identity, translation)| {
+                candidate_state_for(semantics.as_ref(), identity, translation)
+            })
+            .collect::<Vec<_>>();
+        let groups = identities
+            .iter()
+            .zip(&current_translations)
+            .zip(&current_states)
+            .map(|((identity, translation), state)| {
+                StandardTranslationGroup::new(
+                    identity.kind(),
+                    identity.group_location().clone(),
+                    vec![StandardTranslationAsset::new(
+                        identity.clone(),
+                        Some(translation.clone()),
+                        Some(*state),
+                    )],
+                )
+            })
+            .collect();
+        let session = Arc::new(
+            StandardCandidateSession::from_corpus(
+                Arc::clone(&semantics),
+                StandardTranslationCorpus::with_snapshot(
+                    groups,
+                    SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
+                    vec![TranslationOwnerSnapshot::new(
+                        RpgMakerStandardAssetOwner::Builtin,
+                        SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
+                        AssetSnapshotFingerprint::from_bytes([0xb4; 32]),
+                    )],
+                    "[]".to_owned(),
+                    "[]".to_owned(),
+                ),
+            )
+            .expect("冲突 Current 不应阻止人工会话建立"),
+        );
+        create_candidate_database(&database_path, &identities);
+        {
+            let connection = Connection::open(&database_path).expect("测试数据库应可重开");
+            for (offset, (translation, state)) in
+                current_translations.iter().zip(&current_states).enumerate()
+            {
+                connection
+                    .execute(
+                        "UPDATE standard_text_unit
+                         SET translation_content_json = ?, translation_state = ?
+                         WHERE rowid = ?",
+                        params![
+                            encode_content(translation).expect("当前译文应可编码"),
+                            state.as_bytes().to_vec(),
+                            i64::try_from(offset + 1).expect("rowid 应可表示"),
+                        ],
+                    )
+                    .expect("冲突 Current 应可写入测试数据库");
+            }
+        }
+        let replacement = value("统一译文");
+        let expected_states = identities
+            .iter()
+            .map(|identity| candidate_state_for(semantics.as_ref(), identity, &replacement))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            expected_states[0], expected_states[1],
+            "不同物理位置必须拥有独立 state"
+        );
+        let storage = runtime_storage();
+        let service = RpgMakerStandardCandidateAcceptanceService::new(storage.clone(), InlineCpu);
+        let results = service
+            .accept(
+                &project_at(database_path.clone()),
+                Arc::clone(&session),
+                vec![StandardCandidateRequest::new(
+                    StandardCandidateUnitIndex::new(0),
+                    replacement.clone(),
+                    true,
+                )],
+            )
+            .await
+            .expect("显式覆盖应原子修复冲突 Current");
+        assert_eq!(
+            results,
+            vec![StandardCandidateAcceptance::Accepted {
+                translation: replacement.clone(),
+                changed_locations: 2,
+            }]
+        );
+        for (rowid, expected_state) in expected_states.into_iter().enumerate() {
+            assert_eq!(
+                stored_translation(&database_path, rowid + 1),
+                (
+                    Some(replacement.clone()),
+                    Some(expected_state.as_bytes().to_vec()),
+                )
+            );
+        }
+        storage.shutdown().await.expect("SQLite 根应正常关闭");
+    }
+
+    #[tokio::test]
+    async fn real_manual_accept_repairs_each_one_sided_translation_state_pair() {
+        let directory = tempfile::tempdir().expect("临时目录应可创建");
+        let storage = runtime_storage();
+        let semantics = Arc::new(ResolvedTranslationSemantics::for_test());
+        for (name, old_translation, old_state) in [
+            ("translation-only", Some(value("残缺译文")), None),
+            (
+                "state-only",
+                None,
+                Some(Sha256Fingerprint::from_bytes([0xd2; 32])),
+            ),
+        ] {
+            let database_path = directory.path().join(name).join("project.db");
+            let identity = scalar_identity(1, "name", "テスト", "{}");
+            create_candidate_database(&database_path, std::slice::from_ref(&identity));
+            {
+                let connection = Connection::open(&database_path).expect("测试数据库应可重开");
+                let old_translation_json = old_translation
+                    .as_ref()
+                    .map(encode_content)
+                    .transpose()
+                    .expect("旧译文应可编码");
+                let old_state_bytes = old_state.map(|state| state.as_bytes().to_vec());
+                connection
+                    .execute(
+                        "UPDATE standard_text_unit
+                         SET translation_content_json = ?, translation_state = ?
+                         WHERE rowid = 1",
+                        params![old_translation_json, old_state_bytes],
+                    )
+                    .expect("单边 translation/state 配对应可写入测试数据库");
+            }
+            let session = Arc::new(
+                StandardCandidateSession::from_corpus(
+                    Arc::clone(&semantics),
+                    StandardTranslationCorpus::with_snapshot(
+                        vec![StandardTranslationGroup::new(
+                            identity.kind(),
+                            identity.group_location().clone(),
+                            vec![StandardTranslationAsset::new(
+                                identity.clone(),
+                                old_translation,
+                                old_state,
+                            )],
+                        )],
+                        SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
+                        vec![TranslationOwnerSnapshot::new(
+                            RpgMakerStandardAssetOwner::Builtin,
+                            SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
+                            AssetSnapshotFingerprint::from_bytes([0xb4; 32]),
+                        )],
+                        "[]".to_owned(),
+                        "[]".to_owned(),
+                    ),
+                )
+                .expect("单边 translation/state 配对必须可以打开人工修复会话"),
+            );
+            assert_eq!(
+                session.units()[0].status(),
+                StandardCandidateUnitStatus::Stale,
+                "name={name}"
+            );
+
+            let replacement = value("修复译文");
+            let expected_state = candidate_state_for(semantics.as_ref(), &identity, &replacement);
+            let service =
+                RpgMakerStandardCandidateAcceptanceService::new(storage.clone(), InlineCpu);
+            let results = service
+                .accept(
+                    &project_at(database_path.clone()),
+                    Arc::clone(&session),
+                    vec![StandardCandidateRequest::new(
+                        StandardCandidateUnitIndex::new(0),
+                        replacement.clone(),
+                        false,
+                    )],
+                )
+                .await
+                .expect("人工候选应以 NULL-safe CAS 原子修复单边配对");
+
+            assert_eq!(
+                results,
+                vec![StandardCandidateAcceptance::Accepted {
+                    translation: replacement.clone(),
+                    changed_locations: 1,
+                }],
+                "name={name}"
+            );
+            assert_eq!(
+                stored_translation(&database_path, 1),
+                (Some(replacement), Some(expected_state.as_bytes().to_vec()),),
+                "name={name}"
+            );
+            assert_eq!(
+                session.units()[0].status(),
+                StandardCandidateUnitStatus::Current,
+                "name={name}"
+            );
+        }
+        storage.shutdown().await.expect("SQLite 根应正常关闭");
+    }
+
     #[tokio::test]
     async fn real_sqlite_rejects_stale_source_context_and_translation_state() {
         let directory = tempfile::tempdir().expect("临时目录应可创建");
@@ -2623,6 +3473,195 @@ mod tests {
                 )
                 .expect("测试单元应可写入");
         }
+    }
+
+    fn candidate_session_with_baseline(
+        identities: &[TranslationUnitIdentity],
+    ) -> Arc<StandardCandidateSession> {
+        let groups = identities
+            .iter()
+            .map(|identity| {
+                StandardTranslationGroup::new(
+                    identity.kind(),
+                    identity.group_location().clone(),
+                    vec![StandardTranslationAsset::new(identity.clone(), None, None)],
+                )
+            })
+            .collect();
+        Arc::new(
+            StandardCandidateSession::from_corpus(
+                Arc::new(ResolvedTranslationSemantics::for_test()),
+                StandardTranslationCorpus::with_snapshot(
+                    groups,
+                    SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
+                    vec![TranslationOwnerSnapshot::new(
+                        RpgMakerStandardAssetOwner::Builtin,
+                        SourceSnapshotFingerprint::from_bytes([0xa5; 32]),
+                        AssetSnapshotFingerprint::from_bytes([0xb4; 32]),
+                    )],
+                    "[]".to_owned(),
+                    "[]".to_owned(),
+                ),
+            )
+            .expect("完整 baseline 的人工候选会话应可建立"),
+        )
+    }
+
+    fn create_candidate_database(path: &std::path::Path, identities: &[TranslationUnitIdentity]) {
+        std::fs::create_dir_all(path.parent().expect("测试数据库必须有父目录"))
+            .expect("测试数据库目录应可创建");
+        let connection = Connection::open(path).expect("测试数据库应可创建");
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (source_snapshot_fingerprint BLOB NOT NULL);
+                 CREATE TABLE standard_asset_owner_state (
+                    owner TEXT NOT NULL,
+                    source_snapshot_fingerprint BLOB NOT NULL,
+                    asset_snapshot_fingerprint BLOB NOT NULL
+                 );
+                 CREATE TABLE standard_translation_resource (
+                    resource_kind TEXT NOT NULL,
+                    canonical_json TEXT NOT NULL
+                 );
+                 CREATE TABLE standard_text_unit (
+                    owner TEXT NOT NULL,
+                    group_location TEXT NOT NULL,
+                    unit_role TEXT NOT NULL,
+                    source_content_json TEXT NOT NULL,
+                    source_context_json TEXT NOT NULL,
+                    translation_content_json TEXT,
+                    translation_state BLOB
+                 );",
+            )
+            .expect("测试候选表应可创建");
+        connection
+            .execute(
+                "INSERT INTO metadata (source_snapshot_fingerprint) VALUES (?)",
+                [vec![0xa5_u8; 32]],
+            )
+            .expect("metadata 应可写入");
+        connection
+            .execute(
+                "INSERT INTO standard_asset_owner_state (
+                    owner, source_snapshot_fingerprint, asset_snapshot_fingerprint
+                 ) VALUES (?, ?, ?)",
+                params![
+                    RpgMakerStandardAssetOwner::Builtin.storage_name(),
+                    vec![0xa5_u8; 32],
+                    vec![0xb4_u8; 32],
+                ],
+            )
+            .expect("owner baseline 应可写入");
+        for kind in [TERMINOLOGY_RESOURCE_KIND, PLACEHOLDER_RULES_RESOURCE_KIND] {
+            connection
+                .execute(
+                    "INSERT INTO standard_translation_resource (
+                        resource_kind, canonical_json
+                     ) VALUES (?, ?)",
+                    params![kind, "[]"],
+                )
+                .expect("翻译资源 baseline 应可写入");
+        }
+        for identity in identities {
+            connection
+                .execute(
+                    "INSERT INTO standard_text_unit (
+                        owner, group_location, unit_role, source_content_json,
+                        source_context_json, translation_content_json, translation_state
+                     ) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+                    params![
+                        identity.owner().storage_name(),
+                        RpgMakerLocationCodec::encode(identity.group_location())
+                            .expect("组位置应可编码"),
+                        RpgMakerProjectionCodec::encode_role(identity.role())
+                            .expect("单元角色应可编码"),
+                        encode_content(identity.source_content()).expect("源内容应可编码"),
+                        identity.source_context_json(),
+                    ],
+                )
+                .expect("Standard 单元应可写入");
+        }
+    }
+
+    fn mutate_candidate_database(path: &std::path::Path, mutation: CandidateStaleMutation) {
+        let connection = Connection::open(path).expect("测试数据库应可重开");
+        match mutation {
+            CandidateStaleMutation::ProjectSource => {
+                connection
+                    .execute(
+                        "UPDATE metadata SET source_snapshot_fingerprint = ?",
+                        [vec![0xc1_u8; 32]],
+                    )
+                    .expect("metadata 应可变更");
+            }
+            CandidateStaleMutation::OwnerSource => {
+                connection
+                    .execute(
+                        "UPDATE standard_asset_owner_state
+                         SET source_snapshot_fingerprint = ?",
+                        [vec![0xc2_u8; 32]],
+                    )
+                    .expect("owner source 应可变更");
+            }
+            CandidateStaleMutation::OwnerAsset => {
+                connection
+                    .execute(
+                        "UPDATE standard_asset_owner_state
+                         SET asset_snapshot_fingerprint = ?",
+                        [vec![0xc3_u8; 32]],
+                    )
+                    .expect("owner asset 应可变更");
+            }
+            CandidateStaleMutation::Terminology => {
+                connection
+                    .execute(
+                        "UPDATE standard_translation_resource
+                         SET canonical_json = '[{\"term\":\"changed\",\"translation\":\"changed\"}]'
+                         WHERE resource_kind = ?",
+                        [TERMINOLOGY_RESOURCE_KIND],
+                    )
+                    .expect("术语资源应可变更");
+            }
+            CandidateStaleMutation::PlaceholderRules => {
+                connection
+                    .execute(
+                        "UPDATE standard_translation_resource
+                         SET canonical_json = '[{\"changed\":true}]'
+                         WHERE resource_kind = ?",
+                        [PLACEHOLDER_RULES_RESOURCE_KIND],
+                    )
+                    .expect("Placeholder 资源应可变更");
+            }
+            CandidateStaleMutation::UnitContext => {
+                connection
+                    .execute(
+                        "UPDATE standard_text_unit
+                         SET source_context_json = '{\"changed\":true}'
+                         WHERE rowid = 2",
+                        [],
+                    )
+                    .expect("单元上下文应可变更");
+            }
+        }
+    }
+
+    fn candidate_state_for(
+        semantics: &ResolvedTranslationSemantics,
+        identity: &TranslationUnitIdentity,
+        translation: &TextUnitContent,
+    ) -> Sha256Fingerprint {
+        let prepared = semantics
+            .prepare_content(identity.kind(), identity.source_content())
+            .expect("测试 Standard 原文应可准备");
+        super::super::planner::translation_state_context(
+            semantics.global_fingerprint(),
+            identity,
+            prepared.model_text(),
+            prepared.placeholders(),
+            prepared.terms(),
+        )
+        .expect("测试 state 上下文应可建立")
+        .finish(translation)
     }
 
     fn stored_translation(

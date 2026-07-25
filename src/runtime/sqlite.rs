@@ -2403,6 +2403,8 @@ type InteractiveQueryResult =
     Result<Vec<SqliteRow>, SqliteInteractiveSessionError<SqliteRuntimeError>>;
 type InteractiveExecuteResult = Result<u64, SqliteInteractiveSessionError<SqliteRuntimeError>>;
 type InteractiveUnitResult = Result<(), SqliteInteractiveSessionError<SqliteRuntimeError>>;
+type InteractiveTransactionStateResult =
+    Result<bool, SqliteInteractiveSessionError<SqliteRuntimeError>>;
 type InteractiveTransactionResult = Result<(), ExecuteTransactionError<SqliteRuntimeError>>;
 
 enum InteractiveCommand {
@@ -2426,6 +2428,9 @@ enum InteractiveCommand {
     },
     Rollback {
         response: oneshot::Sender<InteractiveUnitResult>,
+    },
+    TransactionActive {
+        response: oneshot::Sender<InteractiveTransactionStateResult>,
     },
     #[cfg(test)]
     ExecuteAfterGate {
@@ -2521,6 +2526,9 @@ fn process_interactive_command(
             InteractiveCommand::Begin { response }
             | InteractiveCommand::Commit { response }
             | InteractiveCommand::Rollback { response } => {
+                let _ = response.send(Err(SqliteInteractiveSessionError::Indeterminate));
+            }
+            InteractiveCommand::TransactionActive { response } => {
                 let _ = response.send(Err(SqliteInteractiveSessionError::Indeterminate));
             }
         }
@@ -2674,6 +2682,12 @@ fn process_interactive_command(
                 )
             };
             let _ = response.send(result);
+        }
+        InteractiveCommand::TransactionActive { response } => {
+            let _ = response.send(Ok(matches!(
+                transaction,
+                InteractiveTransactionState::Active
+            )));
         }
         #[cfg(test)]
         InteractiveCommand::ExecuteAfterGate {
@@ -3011,6 +3025,22 @@ impl RusqliteInteractiveSessionOperations {
             ))
         })
     }
+
+    async fn await_transaction_active(&self) -> InteractiveTransactionStateResult {
+        if let Some(result) = session_unavailable(&self.lifecycle) {
+            return result;
+        }
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(InteractiveCommand::TransactionActive { response })
+            .await
+            .map_err(|_| SqliteInteractiveSessionError::Closed)?;
+        receiver.await.unwrap_or_else(|_| {
+            Err(SqliteInteractiveSessionError::OperationFailed(
+                SqliteRuntimeError::WorkerPanicked("交互式 actor"),
+            ))
+        })
+    }
 }
 
 impl SqliteInteractiveSessionOperations for RusqliteInteractiveSessionOperations {
@@ -3037,6 +3067,10 @@ impl SqliteInteractiveSessionOperations for RusqliteInteractiveSessionOperations
 
     fn rollback(&self) -> impl Future<Output = InteractiveUnitResult> + Send {
         self.await_unit(|response| InteractiveCommand::Rollback { response })
+    }
+
+    fn transaction_active(&self) -> impl Future<Output = InteractiveTransactionStateResult> + Send {
+        self.await_transaction_active()
     }
 }
 
@@ -5829,6 +5863,50 @@ mod tests {
         storage.shutdown().await.expect("根应可关闭");
     }
 
+    #[tokio::test]
+    async fn transaction_state_observes_raw_execute_and_query_controls() {
+        let directory = TestDirectory::new();
+        let database = directory.database("interactive-state.db");
+        let storage = RusqliteStorage::start(configuration()).expect("根应可启动");
+        storage
+            .create_new_database(database.clone(), schema_commands())
+            .await
+            .expect("数据库应可创建");
+
+        let opened = storage
+            .open_existing(database)
+            .await
+            .expect("交互会话应可打开");
+        let (operations, finalizer) = opened.into_parts();
+        assert!(!operations.transaction_active().await.unwrap());
+
+        operations
+            .execute(SqliteCommand::new("BEGIN DEFERRED", Vec::new()))
+            .await
+            .expect("raw execute 应可开始事务");
+        assert!(operations.transaction_active().await.unwrap());
+        operations
+            .execute(SqliteCommand::new("COMMIT", Vec::new()))
+            .await
+            .expect("raw execute 应可提交事务");
+        assert!(!operations.transaction_active().await.unwrap());
+
+        operations
+            .query(SqliteQuery::new("BEGIN DEFERRED", Vec::new()))
+            .await
+            .expect("raw query 应可开始事务");
+        assert!(operations.transaction_active().await.unwrap());
+        operations
+            .query(SqliteQuery::new("ROLLBACK", Vec::new()))
+            .await
+            .expect("raw query 应可回滚事务");
+        assert!(!operations.transaction_active().await.unwrap());
+
+        let report = finalizer.finalize().await.expect("会话应可终结");
+        assert!(!report.had_unclosed_transaction());
+        storage.shutdown().await.expect("根应可关闭");
+    }
+
     #[test]
     fn failed_operation_that_crosses_autocommit_boundary_poisons_the_session() {
         let connection = Connection::open_in_memory().expect("内存数据库应可打开");
@@ -5859,6 +5937,10 @@ mod tests {
         assert_eq!(lifecycle.load(Ordering::Acquire), SESSION_INDETERMINATE);
         assert!(matches!(
             session_unavailable::<()>(&lifecycle),
+            Some(Err(SqliteInteractiveSessionError::Indeterminate))
+        ));
+        assert!(matches!(
+            session_unavailable::<bool>(&lifecycle),
             Some(Err(SqliteInteractiveSessionError::Indeterminate))
         ));
         connection

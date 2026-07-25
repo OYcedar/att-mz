@@ -178,23 +178,41 @@ struct Family {
     member_indices: Vec<usize>,
 }
 
+/// 按与 Standard 去重完全相同的键建立稳定自然顺序的成员族。
+///
+/// 人工候选验收只需要知道传播边界，不应触发普通 Translate 对现有 Current
+/// 译文的唯一种子选择、失效清理或自动复用。两条路径因此共享这里建立的族，
+/// 再分别拥有各自的后续行为。
+pub(crate) fn translation_deduplication_families(
+    candidates: &[TranslationDeduplicationCandidate],
+) -> Vec<Vec<usize>> {
+    let mut family_index = HashMap::<DeduplicationKey, usize>::with_capacity(candidates.len());
+    let mut families = Vec::<Vec<usize>>::with_capacity(candidates.len());
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let key = DeduplicationKey::from_candidate(candidate);
+        let index = *family_index.entry(key).or_insert_with(|| {
+            families.push(Vec::new());
+            families.len() - 1
+        });
+        families[index].push(candidate_index);
+    }
+    families
+}
+
 /// 按调用方给出的稳定自然顺序建立全局去重族。
 pub(crate) fn deduplicate_translation_candidates(
     candidates: Vec<TranslationDeduplicationCandidate>,
 ) -> Result<TranslationDeduplicationResult, TranslationDeduplicationError> {
-    let mut family_index = HashMap::<DeduplicationKey, usize>::with_capacity(candidates.len());
-    let mut families = Vec::<Family>::with_capacity(candidates.len());
-    for (candidate_index, candidate) in candidates.iter().enumerate() {
-        let key = DeduplicationKey::from_candidate(candidate);
-        let index = *family_index.entry(key).or_insert_with(|| {
-            families.push(Family {
-                source_content: candidate.identity.source_content().clone(),
-                member_indices: Vec::new(),
-            });
-            families.len() - 1
-        });
-        families[index].member_indices.push(candidate_index);
-    }
+    let families = translation_deduplication_families(&candidates)
+        .into_iter()
+        .map(|member_indices| Family {
+            source_content: candidates[member_indices[0]]
+                .identity
+                .source_content()
+                .clone(),
+            member_indices,
+        })
+        .collect::<Vec<_>>();
 
     let mut outcomes = vec![None; candidates.len()];
     let mut invalidations = Vec::new();

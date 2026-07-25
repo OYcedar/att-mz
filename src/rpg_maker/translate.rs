@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use super::ProjectName;
 
 pub(crate) mod asset_reader;
+pub(crate) mod candidate;
 mod deduplication;
 pub(crate) mod executor;
 mod language_projection;

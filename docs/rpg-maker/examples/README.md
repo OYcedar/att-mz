@@ -2,7 +2,7 @@
 
 本目录同时保存生产解析器直接读取的完整 TOML，以及当前 Lua API 的完整主程序。测试可
 把 TOML 原样交给对应生产解析/编译边界，并把 Lua 交给真实 VM、临时 `project.db`、冻结
-JSON 夹具和假 LLM。
+JSON 夹具，以及需要模型的示例所用假 LLM。
 
 | TOML | 生产边界 | 覆盖 |
 |---|---|---|
@@ -15,22 +15,27 @@ JSON 夹具和假 LLM。
 |---|---|---|
 | [`lua-standard-data-file.lua`](lua-standard-data-file.lua) | Extract | 自定义 DataFile 标量接入 Standard |
 | [`lua-translate-state.lua`](lua-translate-state.lua) | Translate | 首跑请求、二跑 Current、语义变化失效、译文/state 同事务 |
+| [`lua-accept-standard.lua`](lua-accept-standard.lua) | 独立 Lua | Standard 人工候选验收、去重传播与原子提交 |
 | [`lua-idempotent-write-back.lua`](lua-idempotent-write-back.lua) | WriteBack | 从权威候选重建相同输出，不依赖 post-publish |
 | [`lua-complex-protocol.lua`](lua-complex-protocol.lua) | 三阶段 | 跨 Actors/Map/两个私有文档的多目标私有协议 |
 
-示例只创建 `lua_example_*` / `lua_complex_*` 私有表，不修改 ATT 受管表。文件名和夹具
-字段是可替换的示范协议；复制到真实游戏时，必须把来源、身份、上下文和物理断言改成
-该游戏的已验证事实。
+三阶段私有协议示例只创建 `lua_example_*` / `lua_complex_*` 私有表。人工候选示例不
+直接修改 ATT 受管表，而是只通过 `ctx.standard` 交给核心。文件名和夹具字段是可替换的
+示范协议；复制到真实游戏时，必须把来源、身份、上下文和物理断言改成该游戏的已验证
+事实。
 
 所需最小夹具形状：
 
 <!-- att-example: illustrative -->
 ```json
-// data/QuestEntries.json（用于前三个示例；实际 JSON 不含本注释）
+// data/QuestEntries.json（用于三个阶段私有表的简单示例；实际 JSON 不含本注释）
 [
   {"id":"arrival","title":"星港へ","description":"港へ向かう。"}
 ]
 ```
+
+`lua-accept-standard.lua` 另假定 Builtin 已从 `data/Items.json[1]` 提取
+`description = "药水"`；真实项目必须把完整身份、原文断言和候选一起替换。
 
 <!-- att-example: illustrative -->
 ```json

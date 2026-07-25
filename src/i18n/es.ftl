@@ -8,6 +8,7 @@ cli-init-about = Inicializa o actualiza un proyecto de juego con nombre
 cli-extract-about = Extrae texto con un plan owner explícito o guardado
 cli-translate-about = Traduce el texto extraído con un Profile explícito o guardado
 cli-write-back-about = Escribe las traducciones aceptadas en el juego
+cli-project-lua-about = Ejecuta una vez un programa Lua de confianza en el contexto del proyecto
 cli-project-name-help = Nombre estable del proyecto
 cli-init-path-help = Raíz del juego RPG Maker; un proyecto existente puede reutilizar su última ruta correcta
 cli-source-language-help = ID del idioma de origen
@@ -22,6 +23,9 @@ cli-lua-help = Sustituye el programa Lua de la fase; un archivo de cero bytes lo
 cli-profile-help = ID del Profile de traducción; omítelo para reutilizar el último Profile correcto
 cli-terms-help = Sustituye el recurso terminológico del proyecto
 cli-placeholders-help = Sustituye el recurso Placeholder del proyecto
+cli-project-lua-profile-help = Profile para la validación manual Standard; si se omite, el último Profile Translate correcto se resuelve al abrir Standard
+cli-project-lua-script-help = Programa Lua de confianza que se ejecutará una vez
+cli-project-lua-arguments-help = Argumento UTF-8 pasado a Lua arg[1..] después de --
 cli-usage-heading = Uso:
 cli-commands-heading = Comandos:
 cli-options-heading = Opciones:
@@ -105,6 +109,7 @@ progress-extract-commit = Confirmando los recursos extraídos
 progress-translate-planning = Planificando tareas de traducción
 progress-translate-confirmed = Tareas de traducción confirmadas
 progress-translate-no-work = No hace falta solicitar el modelo
+progress-project-lua = Ejecutando el programa Lua del proyecto
 progress-write-back-read-assets = Leyendo recursos aceptados
 progress-write-back-planning = Planificando la reescritura de documentos
 progress-write-back-documents = Documentos reescritos
@@ -123,6 +128,7 @@ result-translate-completed = Traducción completa: { $project } (Profile: { $pro
 result-translate-standard = Traducción estándar: { $total } tareas; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles; { $written } ubicaciones escritas, { $remaining } restantes
 result-translate-convergence = Convergencia: { $retained } conservadas, { $invalidated } invalidadas, { $not_applicable } no aplicables, { $reused } reutilizadas
 result-write-back-completed = Escritura completa: { $project }
+result-project-lua-completed = Ejecución Lua del proyecto completada: { $project }
 result-output-directory = Directorio de salida: { $path }
 result-write-back-standard = Escritura estándar: { $translated } unidades traducidas, { $original } unidades de origen; { $auto_wrapped } ajustes automáticos, { $breaks } saltos y { $indents } sangrías de ancho completo añadidos; { $manual } diseños manuales
 result-lua-executed = Lua: ejecutado
@@ -175,6 +181,7 @@ diagnostic-recovery-value = { $kind ->
 diagnostic-related = Error relacionado { $index }:
 diagnostic-stage-value = { $code ->
     [process_output] Salida del proceso
+    [lua] Ejecución Lua del proyecto
    *[other] { $fallback }
 }
 diagnostic-impact-value = { $code ->

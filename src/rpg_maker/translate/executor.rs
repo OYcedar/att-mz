@@ -1668,53 +1668,49 @@ fn process_response(
                 continue;
             }
         };
-        if let Err(reason) = validate_translation_lines(expected, &translation_lines) {
-            unresolved.push(unresolved_unit(expected, reason));
-            continue;
-        }
-        let translation_lines = match validate_and_restore_translation_lines_at(
-            translation_lines,
+        let translation = match accept_translation_lines_candidate_at(
+            expected.identity(),
             expected.protected_text(),
             expected.line_shape(),
             expected.applied_placeholders(),
             expected.language_analysis(),
             language_module.as_ref(),
+            translation_lines,
             TranslationCandidateInvariantLocation::TaskUnit {
                 task_index: input.task_index,
                 unit_id: expected.id(),
             },
         ) {
-            Ok(translation) => translation,
-            Err(TranslationCandidateValidationError::Rejected(reason)) => {
+            Ok(TranslationContentAcceptance::Accepted(translation)) => translation,
+            Ok(TranslationContentAcceptance::Rejected(reason)) => {
                 unresolved.push(unresolved_unit(expected, reason));
                 continue;
             }
-            Err(TranslationCandidateValidationError::LanguageModule(source)) => {
+            Err(TranslationCandidateTechnicalError::LanguageModule(source)) => {
                 return Err(TranslationResponseTechnicalFailure::new(
                     TranslationResponseTechnicalError::LanguageModule(source),
                     response_record,
                 ));
             }
-            Err(TranslationCandidateValidationError::LanguageProjection(source)) => {
+            Err(TranslationCandidateTechnicalError::LanguageProjection(source)) => {
                 return Err(TranslationResponseTechnicalFailure::new(
                     TranslationResponseTechnicalError::LanguageProjection(source),
                     response_record,
                 ));
             }
-            Err(TranslationCandidateValidationError::LanguageRepair(source)) => {
+            Err(TranslationCandidateTechnicalError::LanguageRepair(source)) => {
                 return Err(TranslationResponseTechnicalFailure::new(
                     TranslationResponseTechnicalError::LanguageRepair(source),
                     response_record,
                 ));
             }
-            Err(TranslationCandidateValidationError::InternalInvariant { invariant }) => {
+            Err(TranslationCandidateTechnicalError::InternalInvariant { invariant }) => {
                 return Err(TranslationResponseTechnicalFailure::new(
                     TranslationResponseTechnicalError::InternalInvariant { invariant },
                     response_record,
                 ));
             }
         };
-        let translation = translation_content(expected, translation_lines);
         let translation_state = expected.state_context().finish(&translation);
         let propagation_targets = expected
             .propagation_targets()
@@ -1882,10 +1878,10 @@ fn validate_expected_output_contract(
 }
 
 fn validate_translation_lines(
-    expected_output: &ExpectedTranslationOutput,
+    identity: &super::standard::TranslationUnitIdentity,
+    shape: ExpectedLineShape,
     lines: &[String],
 ) -> Result<(), TranslationUnitRejectionReason> {
-    let shape = expected_output.line_shape();
     if let ExpectedLineShape::Aligned(expected) = shape
         && lines.len() != expected.get()
     {
@@ -1907,7 +1903,7 @@ fn validate_translation_lines(
             }
         }
         ExpectedLineShape::Aligned(_) => {
-            let source_lines = match expected_output.identity().source_content() {
+            let source_lines = match identity.source_content() {
                 TextUnitContent::Value(value) => std::slice::from_ref(value),
                 TextUnitContent::Lines(lines) => lines.as_slice(),
             };
@@ -1935,12 +1931,130 @@ fn validate_translation_lines(
 }
 
 fn translation_content(
-    expected: &ExpectedTranslationOutput,
+    identity: &super::standard::TranslationUnitIdentity,
     lines: Vec<String>,
 ) -> TextUnitContent {
-    match expected.identity().source_content() {
+    match identity.source_content() {
         TextUnitContent::Value(_) => TextUnitContent::Value(lines.join("\n")),
         TextUnitContent::Lines(_) => TextUnitContent::Lines(lines),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranslationContentAcceptance {
+    Accepted(TextUnitContent),
+    Rejected(TranslationUnitRejectionReason),
+}
+
+/// 按 Standard 模型响应使用的同一条完整规则验收一个结构化候选译文。
+///
+/// `Value` 与 `Lines` 的物理边界由调用方提交的 `TextUnitContent` 明确表达；
+/// 本函数不会用 LF 猜测或转换两种形状。
+pub(crate) fn accept_translation_content_candidate(
+    identity: &super::standard::TranslationUnitIdentity,
+    protected_text: &str,
+    line_shape: ExpectedLineShape,
+    placeholders: &[AppliedPlaceholder],
+    language_analysis: &crate::language::LanguageAnalysis,
+    language_module: &dyn LanguageModule,
+    candidate: TextUnitContent,
+) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
+    accept_translation_content_candidate_at(
+        identity,
+        protected_text,
+        line_shape,
+        placeholders,
+        language_analysis,
+        language_module,
+        candidate,
+        TranslationCandidateInvariantLocation::PreparedCandidate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_translation_content_candidate_at(
+    identity: &super::standard::TranslationUnitIdentity,
+    protected_text: &str,
+    line_shape: ExpectedLineShape,
+    placeholders: &[AppliedPlaceholder],
+    language_analysis: &crate::language::LanguageAnalysis,
+    language_module: &dyn LanguageModule,
+    candidate: TextUnitContent,
+    invariant_location: TranslationCandidateInvariantLocation,
+) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
+    let lines = match (identity.source_content(), candidate) {
+        (TextUnitContent::Value(_), TextUnitContent::Value(value)) => {
+            value.split('\n').map(str::to_owned).collect::<Vec<_>>()
+        }
+        (TextUnitContent::Lines(_), TextUnitContent::Lines(lines)) => lines,
+        (TextUnitContent::Value(_), TextUnitContent::Lines(_)) => {
+            return Ok(TranslationContentAcceptance::Rejected(
+                TranslationUnitRejectionReason::InvalidShape {
+                    message: "expected=value; actual=lines".to_owned(),
+                },
+            ));
+        }
+        (TextUnitContent::Lines(_), TextUnitContent::Value(_)) => {
+            return Ok(TranslationContentAcceptance::Rejected(
+                TranslationUnitRejectionReason::InvalidShape {
+                    message: "expected=lines; actual=value".to_owned(),
+                },
+            ));
+        }
+    };
+    accept_translation_lines_candidate_at(
+        identity,
+        protected_text,
+        line_shape,
+        placeholders,
+        language_analysis,
+        language_module,
+        lines,
+        invariant_location,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_translation_lines_candidate_at(
+    identity: &super::standard::TranslationUnitIdentity,
+    protected_text: &str,
+    line_shape: ExpectedLineShape,
+    placeholders: &[AppliedPlaceholder],
+    language_analysis: &crate::language::LanguageAnalysis,
+    language_module: &dyn LanguageModule,
+    lines: Vec<String>,
+    invariant_location: TranslationCandidateInvariantLocation,
+) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
+    if let Err(reason) = validate_translation_lines(identity, line_shape, &lines) {
+        return Ok(TranslationContentAcceptance::Rejected(reason));
+    }
+    match validate_and_restore_translation_lines_at(
+        lines,
+        protected_text,
+        line_shape,
+        placeholders,
+        language_analysis,
+        language_module,
+        invariant_location,
+    ) {
+        Ok(lines) => Ok(TranslationContentAcceptance::Accepted(translation_content(
+            identity, lines,
+        ))),
+        Err(TranslationCandidateValidationError::Rejected(reason)) => {
+            Ok(TranslationContentAcceptance::Rejected(reason))
+        }
+        Err(TranslationCandidateValidationError::LanguageModule(source)) => {
+            Err(TranslationCandidateTechnicalError::LanguageModule(source))
+        }
+        Err(TranslationCandidateValidationError::LanguageProjection(source)) => Err(
+            TranslationCandidateTechnicalError::LanguageProjection(source),
+        ),
+        Err(TranslationCandidateValidationError::LanguageRepair(source)) => {
+            Err(TranslationCandidateTechnicalError::LanguageRepair(source))
+        }
+        Err(TranslationCandidateValidationError::InternalInvariant { invariant }) => {
+            Err(TranslationCandidateTechnicalError::InternalInvariant { invariant })
+        }
     }
 }
 

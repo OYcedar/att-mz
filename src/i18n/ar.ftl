@@ -8,6 +8,7 @@ cli-init-about = تهيئة مشروع لعبة مسمى أو تحديثه
 cli-extract-about = استخراج النص بخطة owner صريحة أو محفوظة
 cli-translate-about = ترجمة النص المستخرج باستخدام Profile صريح أو محفوظ
 cli-write-back-about = كتابة الترجمات المقبولة إلى اللعبة
+cli-project-lua-about = تشغيل برنامج Lua موثوق مرة واحدة ضمن سياق المشروع
 cli-project-name-help = اسم المشروع الثابت
 cli-init-path-help = جذر لعبة RPG Maker؛ يمكن للمشروع الموجود إعادة استخدام آخر مسار ناجح
 cli-source-language-help = معرّف لغة المصدر
@@ -22,6 +23,9 @@ cli-lua-help = استبدال برنامج Lua للمرحلة؛ ملف حجمه 
 cli-profile-help = معرّف Profile للترجمة؛ يؤدي حذفه إلى إعادة استخدام آخر Profile ناجح
 cli-terms-help = استبدال مورد مصطلحات المشروع
 cli-placeholders-help = استبدال مورد Placeholder للمشروع
+cli-project-lua-profile-help = Profile للقبول اليدوي في Standard؛ عند حذفه يُستخدم آخر Translate Profile ناجح عند فتح Standard
+cli-project-lua-script-help = برنامج Lua الموثوق المطلوب تشغيله مرة واحدة
+cli-project-lua-arguments-help = وسيطة UTF-8 تمرر إلى Lua arg[1..] بعد --
 cli-usage-heading = الاستخدام:
 cli-commands-heading = الأوامر:
 cli-options-heading = الخيارات:
@@ -109,6 +113,7 @@ progress-extract-commit = جارٍ تنفيذ commit للأصول المستخر
 progress-translate-planning = جارٍ تخطيط مهام الترجمة
 progress-translate-confirmed = مهام الترجمة المؤكدة
 progress-translate-no-work = لا حاجة إلى طلب النموذج
+progress-project-lua = جارٍ تشغيل برنامج Lua للمشروع
 progress-write-back-read-assets = جارٍ قراءة الأصول المقبولة
 progress-write-back-planning = جارٍ تخطيط إعادة كتابة المستندات
 progress-write-back-documents = المستندات المعاد كتابتها
@@ -127,6 +132,7 @@ result-translate-completed = اكتملت الترجمة: { $project } (Profile:
 result-translate-standard = الترجمة القياسية: { $total } مهمة؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }؛ كُتب { $written } موضعًا وتبقى { $remaining }
 result-translate-convergence = تقارب الحالة: أُبقي { $retained }، أُبطل { $invalidated }، غير منطبق { $not_applicable }، أُعيد استخدام { $reused }
 result-write-back-completed = اكتملت الكتابة: { $project }
+result-project-lua-completed = اكتمل تنفيذ Lua للمشروع: { $project }
 result-output-directory = مجلد الإخراج: { $path }
 result-write-back-standard = الكتابة القياسية: { $translated } وحدة مترجمة و{ $original } وحدة مصدر؛ التفاف تلقائي { $auto_wrapped }، أضيف { $breaks } فاصل أسطر و{ $indents } إزاحة كاملة العرض؛ يحتاج { $manual } إلى تخطيط يدوي
 result-lua-executed = Lua: نُفذ
@@ -187,6 +193,7 @@ diagnostic-recovery-value = { $kind ->
 diagnostic-related = الخطأ المرتبط { $index }:
 diagnostic-stage-value = { $code ->
     [process_output] إخراج العملية
+    [lua] تنفيذ Lua للمشروع
    *[other] { $fallback }
 }
 diagnostic-impact-value = { $code ->

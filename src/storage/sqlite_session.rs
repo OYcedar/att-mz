@@ -200,6 +200,14 @@ pub(crate) trait SqliteInteractiveSessionOperations: Send + Sync + 'static {
     fn rollback(
         &self,
     ) -> impl Future<Output = Result<(), SqliteInteractiveSessionError<Self::Error>>> + Send;
+
+    /// 返回同一连接在此前全部已入队操作之后的权威事务状态。
+    ///
+    /// 该观察必须覆盖通过 `query`/`execute` 直接执行的事务控制语句，而不能只跟踪
+    /// `begin`/`commit`/`rollback` 便利方法。
+    fn transaction_active(
+        &self,
+    ) -> impl Future<Output = Result<bool, SqliteInteractiveSessionError<Self::Error>>> + Send;
 }
 
 /// 一次性终结交互式 SQLite 会话的唯一令牌。

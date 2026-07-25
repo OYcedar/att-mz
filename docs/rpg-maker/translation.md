@@ -1,9 +1,11 @@
 # RPG Maker 翻译现行规格
 
-本文定义 MV/MZ Standard Translate 的资源生命周期、规划、模型协议、验收、state 与提交。
+本文定义 MV/MZ Standard Translate 的资源生命周期、规划、模型协议、验收、state 与提交，
+以及独立项目 Lua 复用同一语义验收人工候选的边界。
 术语字段由[术语现行规格](terminology.md)唯一规定，Placeholder 字段由
 [规则文件](rules.md#6-placeholder-rules)唯一规定，Lua Translate API 见
-[Lua 技术参考](lua.md#7-translatepreparecurrent-与-accept)。
+[Lua 技术参考](lua.md#7-translatepreparecurrent-与-accept)，Standard 人工提交 API 见
+[独立项目 Lua](lua.md#8-独立项目-luastandard-人工译文验收与提交)。
 
 ## 1. 命令与阶段顺序
 
@@ -220,7 +222,36 @@ state 是当前译文成立所依赖语义的 SHA-256 摘要。它绑定：
 Lua 暴露相同语义的 64 字符小写十六进制 state，但私有身份和成对事务由脚本负责，见
 [Lua Translate API](lua.md#7-translatepreparecurrent-与-accept)。
 
-## 8. 并发、提交与任务结果
+## 8. 独立项目 Lua 的人工候选
+
+独立 `mv|mz lua` 命令可在不请求 LLM 的情况下，通过 `ctx.standard.open()` 打开一次
+Standard Candidate Acceptance 会话。会话使用显式 `--profile`，或者在未显式指定时延迟
+复用项目上次成功 Translate 保存的 Profile；两种选择都只作用于本次程序，不替换保存
+方案。术语和 Placeholder 固定来自项目当前 canonical 资源，不接受临时文件覆盖。
+
+打开会话时，核心从一致数据库快照读取完整物理单元、Value/Lines 边界、源上下文、当前
+译文/state 和全部潜在去重成员，并用普通 Standard Planner 的全局语义指纹建立只读单元。
+打开和枚举本身没有副作用：不会全局清除失效译文，也不会自动传播已有 Current。
+
+人工候选继续经过普通 Standard 共用的 Placeholder 恢复、line shape、自然语言、源语
+残留、语言修复和精确去重规则。Lua 只提交候选和是否允许替换 Current 的明确意图；它
+不能读取、构造或写入 state。人工提交也没有永久特权：Profile、Prompt、Client、语言
+模块、术语、Placeholder、原文或源上下文改变后，下一次 Planner 会按同一规则把旧结果
+判为非 Current。
+
+每次 `standard:accept(batch)` 先验收全部候选。普通候选拒绝逐项返回且不写库；合法去重
+族在一个短 SQLite 事务中以 CAS 提交。事务内重新检查项目 source snapshot、owner/resource
+指纹，以及每个传播位置的完整身份、原文、源上下文和读取时 translation/state pair；
+任一目标陈旧则整批合法族回滚并抛出 `standard/stale_snapshot`。每个传播位置分别计算
+自己的正确 state，translation/state 始终成对。成功返回后该次提交已经生效，脚本后续
+失败或取消不会回滚它。
+
+同一 Profile 再运行普通 Translate 时，人工提交且仍 Current 的族不产生 LLM 任务；
+WriteBack 按普通 Standard 规则消费它们。独立命令不生成 Standard TaskBlock 或任务记录，
+也不修改原游戏目录。完整 Lua 表面和冲突规则见
+[Lua 技术参考](lua.md#8-独立项目-luastandard-人工译文验收与提交)。
+
+## 9. 并发、提交与任务结果
 
 所选 Client 的 `max_concurrent_requests`（记为 N）决定活动 HTTP 数。完整 Corpus、Plan、
 Task 和传播目标可以保存在内存；调度器区分 HTTP 许可与顺序提交窗口，响应完成后立即
@@ -252,7 +283,7 @@ SSPV 的 Release/MSVC 消融与慢首任务压力测试共同选定 2N 完成窗
 命令说明翻译结果已生效但方案状态无法确认，并建议下次显式传入 Profile 与 Lua 选择。
 项目日志的启动、写入或关闭故障不停止模型任务、不丢弃合法候选，也不改变退出码。
 
-## 9. Standard 任务记录
+## 10. Standard 任务记录
 
 `[rpg_maker].record_translation_tasks = true` 时，顺序 finalizer 在真实验收和提交判断后，
 为每个已启动 TaskBlock 构造一份完整不可变 Markdown。文件 ordinal 来自计划顺序，同一

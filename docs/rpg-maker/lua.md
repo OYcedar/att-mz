@@ -1,8 +1,8 @@
 # RPG Maker Lua 技术参考
 
 本文定义 MV/MZ 向可信 Lua 5.4 主程序公开的当前接口。Lua 用于 Extract、Translate、
-WriteBack 的阶段扩展；Init 没有 Lua。可复制的完整协议见 [Lua Cookbook](lua-cookbook.md)
-和 [`examples/`](examples/README.md)。
+WriteBack 的阶段扩展，也可由独立的一次性项目命令执行；Init 没有 Lua。可复制的完整
+协议见 [Lua Cookbook](lua-cookbook.md)和 [`examples/`](examples/README.md)。
 
 “可信”不是沙箱：脚本拥有完整 Lua 标准库，并按 ATT 进程的操作系统权限运行。`ctx`
 提供的是与冻结来源、翻译语义、SQLite 和未发布候选相连的受管门面，不是唯一访问路径。
@@ -10,7 +10,7 @@ WriteBack 的阶段扩展；Init 没有 Lua。可复制的完整协议见 [Lua C
 本文所有代码块前使用 `<!-- att-example: valid|invalid|illustrative -->`：valid 是当前 API
 可用代码，invalid 是必须失败的反例，illustrative 只展示形状或数据。
 
-## 1. 三阶段位置与停止线
+## 1. 阶段位置、独立入口与停止线
 
 | 命令 | Lua 位置 | 失败边界 |
 |---|---|---|
@@ -18,10 +18,12 @@ WriteBack 的阶段扩展；Init 没有 Lua。可复制的完整协议见 [Lua C
 | Extract | Builtin → Rules → Lua | 已提交前序 owner 不组合回滚；Lua 意图仅在脚本干净终结后提交 |
 | Translate | Standard → Lua | Standard 已提交译文不因 Lua 失败回滚 |
 | WriteBack | Standard 候选 → Lua → 验证 → 发布 | Lua 失败丢弃候选；没有发布后回调 |
+| Lua | 独立项目程序 | 每次 `standard:accept` 独立提交；后续脚本失败不回滚已成功调用 |
 
-三个入口独立。简单标量可在 Extract 用 `replace_standard` 接入 Standard Translate 和
+三个阶段入口彼此独立。简单标量可在 Extract 用 `replace_standard` 接入 Standard Translate 和
 WriteBack；复杂跨文档/多目标插件由 Lua 自己拥有三阶段身份、私有表、state、事务和幂等
-写回。核心不增加通用多目标投影 DSL、自动发布状态或 post-publish hook。
+写回。已有可靠人工译文则可从独立 `lua` 命令交给 Standard 核心验收与提交，不必伪造
+受管数据库 state。核心不增加通用多目标投影 DSL、自动发布状态或 post-publish hook。
 
 每个阶段独立保存自己的 Lua 主程序快照：非空主程序正文、SHA-256 和无损 Windows 解析
 路径。显式提供非空 `--lua` 时精确替换该阶段快照；省略 `--lua` 时，仅在上次成功运行
@@ -33,9 +35,21 @@ WriteBack；复杂跨文档/多目标插件由 Lua 自己拥有三阶段身份�
 移除 Lua；Translate 与 WriteBack 只清除各自主程序，不猜测或删除 Lua 私有数据库状态。
 三个阶段即使最初来自同一个文件，也仍是彼此独立的快照和运行方案。
 
+独立命令形状为：
+
+<!-- att-example: illustrative -->
+```text
+att --config FILE mv lua --name NAME [--profile PROFILE_ID] SCRIPT_LUA [-- ARG...]
+att --config FILE mz lua --name NAME [--profile PROFILE_ID] SCRIPT_LUA [-- ARG...]
+```
+
+它不保存或复用脚本，每次从显式路径重新读取；零字节脚本是合法空程序，主 chunk 返回值
+会被忽略。Profile、脚本和参数都不改变任何阶段运行方案。
+
 ## 2. VM、连接与 `ctx`
 
-每次阶段调用都创建新的 OS worker、Lua VM 和 SQLite 连接，主程序结束后销毁。因此：
+每次阶段调用或独立项目调用都创建新的 OS worker、Lua VM 和 SQLite 连接，主程序结束后
+销毁。因此：
 
 - Lua globals、`package.loaded`、闭包、userdata 不跨阶段；
 - SQLite TEMP 表、临时 pragma 和连接状态不跨阶段；
@@ -49,7 +63,7 @@ WriteBack；复杂跨文档/多目标插件由 Lua 自己拥有三阶段身份�
 <!-- att-example: illustrative -->
 ```lua
 ctx = {
-  phase = "extract" | "translate" | "write_back",
+  phase = "extract" | "translate" | "write_back" | "lua",
   project = {
     name = string,
     engine = "mv" | "mz",
@@ -68,6 +82,7 @@ ctx = {
   llm = function | nil,
   output = OutputApi | nil,
   write_back = WriteBackApi | nil,
+  standard = StandardApi | nil,
 }
 ```
 
@@ -76,10 +91,15 @@ ctx = {
 | Extract | `ctx.extract` |
 | Translate | `ctx.translation`、`ctx.llm` |
 | WriteBack | `ctx.output`、`ctx.write_back` |
+| Lua | `ctx.standard` |
 
-`json/source/rpg_maker/db` 三阶段都有。`source_root` 是冻结内容物理根：MZ 对应 `source/`，
+`json/source/rpg_maker/db` 四种调用都有。`source_root` 是冻结内容物理根：MZ 对应 `source/`，
 MV 对应 `source/www/`。`output_root` 仅 WriteBack 存在且是未发布候选物理路径。这些物理
 路径只供可信脚本诊断或显式直接 I/O；受管 API 一律使用下一节逻辑路径。
+
+独立命令中 `ctx.extract/translation/llm/output/write_back` 都是 nil。全局 `arg[0]` 是
+解析后的主脚本路径，`arg[1..]` 是 `--` 后按顺序传入的 UTF-8 参数；不能表示为 UTF-8 的
+参数在脚本运行前显式失败。阶段 Lua 不建立这份独立命令参数契约。
 
 ## 3. 跨平台逻辑路径
 
@@ -339,7 +359,145 @@ LLM。Lua 私有 Current 也只在 Translate 脚本实际调用 `is_current` 时
 变化后，都必须先重新运行同一 Translate 脚本，再进入 WriteBack；核心不会替私有协议
 读取或刷新其表。
 
-## 8. `ctx.llm`
+## 8. 独立项目 Lua：Standard 人工译文验收与提交
+
+`ctx.standard` 只在独立 `lua` 命令中存在。它把已经由人或其他受信来源准备好的候选交给
+Standard 核心，不发送 LLM 请求，也不暴露内部 state：
+
+<!-- att-example: valid -->
+```lua
+assert(ctx.phase == "lua")
+assert(ctx.extract == nil and ctx.translation == nil and ctx.llm == nil)
+assert(ctx.output == nil and ctx.write_back == nil)
+
+local standard = ctx.standard.open()
+for unit in standard:units() do
+  print(unit.owner, unit.group_kind, unit.role.kind, unit.status)
+end
+```
+
+显式 `--profile` 精确选择当前配置中的 Profile。未显式指定时，`open()` 才复用项目上次
+成功 Translate 保存的 Profile；没有保存 ID，或该 ID 已不在当前配置中时，只有 `open()`
+失败，不使用 Standard 的普通项目 Lua 仍可执行。选择只作用于当前程序，不替换 Translate
+方案。会话固定读取项目当前 canonical 术语和 Placeholder，不接受临时资源覆盖。
+
+### 8.1 会话与只读 `StandardUnit`
+
+`standard:units()` 按 Standard 持久自然顺序遍历全部物理单元。会话打开和枚举都是只读
+操作，不清除 stale 译文，也不自动传播已有 Current。
+
+已持有真实 `RpgMakerLocation` userdata 时，可以按完整身份精确查找：
+
+<!-- att-example: valid -->
+```lua
+local item = ctx.rpg_maker.open(ctx.rpg_maker.data("Items.json"))
+local unit = standard:get("builtin", item:location({ 1 }), {
+  kind = "scalar",
+  field = "description",
+})
+```
+
+owner 只接受 `builtin`、`rules`、`lua`。role 的结构化形状是
+`{kind="scalar", field=FIELD}`，或只有 kind 的 `dialogue_speaker`、
+`dialogue_body`、`choices`、`scrolling_text`。位置、owner 或 role 没有精确命中时返回
+nil；不接受数据库位置 JSON、展示字符串或自造 userdata。
+
+每个 `StandardUnit` 是当前会话创建的只读 userdata。它不能在 Lua 中构造，来自其他会话
+的句柄不能传给本会话 `accept`。字段为：
+
+| 字段 | 形状与含义 |
+|---|---|
+| `owner` | `builtin`、`rules` 或 `lua` |
+| `group_kind` | Standard 组 kind |
+| `group_location` | 只读 `RpgMakerLocation` userdata |
+| `role` | 上述结构化 role table |
+| `original` | Value 为 string；Lines 为无洞字符串数组 |
+| `source_context` | Standard 完整源上下文的无损 JSON→Lua 投影 |
+| `translation` | 当前保存译文，形状同 original；不存在时 nil |
+| `model_text` | Placeholder 处理后的候选输入，形状同 original |
+| `terms` | 有序 `{term=..., translation=...}` 数组 |
+| `content_kind` | `value` 或 `lines` |
+| `line_policy` | `single`、`aligned` 或 `reflow` |
+| `expected_line_count` | `single` 为 1，`aligned` 为严格槽数，`reflow` 为 nil |
+| `status` | `current`、`missing`、`stale`、`not_applicable` 或 `unavailable` |
+| `family_size` | 本次验收可能传播的物理位置数 |
+
+`unavailable` 表示该物理单元无法建立完整 Standard 准备语义；它仍可用于调查，但候选只会
+正常拒绝。`not_applicable` 表示原文不是源语言或全部被 Placeholder 保护。
+
+### 8.2 候选形状与正常拒绝
+
+<!-- att-example: valid -->
+```lua
+local results = standard:accept({
+  {
+    unit = unit,
+    candidate = "人工译文",
+    replace_current = false,
+  },
+})
+
+if results[1].accepted then
+  print(results[1].translation, results[1].changed_locations)
+else
+  print(results[1].reason)
+end
+```
+
+batch 必须是无洞候选数组，结果与输入等长。每项只接受 `unit`、`candidate` 和可省略的
+`replace_current`；省略等于 false。Value 候选必须是 UTF-8 string，Lines 候选必须是无洞
+UTF-8 字符串数组，不能把含 LF 的标量冒充 Lines。
+
+`single` 拒绝换行；`aligned` 要求与原 Lines 保持槽数及每个空槽；`reflow` 用于
+DialogueBody，候选仍是 Lines 数组，但允许数组长度改变。候选按 `model_text` 中的
+Standard ATT token 编写；核心验收后恢复真实控制符并返回规范译文。
+
+成功项为：
+
+<!-- att-example: illustrative -->
+```lua
+{ accepted = true, translation = "规范译文", changed_locations = 2 }
+```
+
+正常候选拒绝不抛异常、不写库，返回
+`{accepted=false, reason=STABLE_CODE, ...结构化详情}`。除普通 Standard 候选拒绝代码外，
+人工入口增加：
+
+| reason | 含义 |
+|---|---|
+| `not_applicable` | 单元不需要翻译 |
+| `unavailable` | 该单元无法建立验收语义；详情说明原因 |
+| `conflicting_candidate` | 同批同一去重族的候选或覆盖选项不一致 |
+| `current_replacement_required` | 候选会改变至少一个 Current 成员，但未明确允许覆盖 |
+
+逐行拒绝详情中的 `line` 使用 Lua 1-based 行号；`expected`、`actual`、token、fragment 等
+详情只在对应事实存在时返回，不应通过解析 message 补猜。
+
+同批同一去重族的完全相同候选和 `replace_current` 选项只验收、提交一次，每个输入位置仍
+得到自己的等长结果；二者任一不同则该族在本批出现的全部项都以
+`conflicting_candidate` 拒绝。已有 Current 与候选规范译文相同时按幂等成功处理，并可补齐
+同族 missing/stale 位置。候选会改变任一 Current 成员时，必须为该族明确设置
+`replace_current=true`；通过后整个族同步替换。
+
+### 8.3 原子性、并发与恢复
+
+每次 `standard:accept(batch)` 先完成所有普通验收。被正常拒绝的项排除，全部合法族进入
+同一个短 SQLite 事务。事务内核心重新检查项目 source snapshot、全部 owner/resource
+fingerprint，以及每个传播位置的完整身份、原文、源上下文和打开会话时的
+translation/state pair；代表项和每个传播位置分别计算正确 state，并用 CAS 成对写入。
+
+任一目标已经变化时，全部合法族回滚并抛 `standard/stale_snapshot`；重新
+`ctx.standard.open()` 取得新会话后再重新判断候选。明确 SQLite 失败和提交终态未知继续
+使用结构化 SQLite 错误，不能当成普通拒绝。成功返回时该批已经提交，脚本之后失败、取消
+或另一次 accept 失败都不会回滚此前成功调用；同一会话后续重新枚举或 `get` 得到的投影
+会同步为新 Current，已经交给 Lua 的旧 userdata 仍是调用前的只读快照。
+
+活动 `ctx.db` 事务中调用 `accept` 会抛 `standard/transaction_conflict`。会话打开后，脚本
+若通过 SQL 修改相关权威状态，后续 accept 会由 CAS 判为 `standard/stale_snapshot`。脚本
+退出时未关闭的 `ctx.db` 事务仍按公共终结协议回滚。不要直接 SQL 修改 ATT 受管翻译表：
+schema 不是 Lua 契约，绕过核心会破坏 translation/state 配对与 Current 含义。
+
+## 9. `ctx.llm`
 
 <!-- att-example: illustrative -->
 ```lua
@@ -368,7 +526,7 @@ Profile 的 Client，但不会自动插入 system prompt；脚本应显式发送
 Lua 调用伪装成 Standard TaskBlock。Lua 排障使用运行级 JSONL 摘要、脚本自己的稳定诊断
 和私有状态证据。
 
-## 9. SQLite：私有协议与事务
+## 10. SQLite：私有协议与事务
 
 <!-- att-example: illustrative -->
 ```text
@@ -400,9 +558,9 @@ schema 是稳定扩展 API。不要在官方范例中这样做。
 因为每阶段是新连接，TEMP 表和未持久化连接状态不能作为跨阶段协议。持久私有表是推荐
 交接位置。
 
-## 10. WriteBack 候选与布局
+## 11. WriteBack 候选与布局
 
-### 10.1 `ctx.output`
+### 11.1 `ctx.output`
 
 <!-- att-example: illustrative -->
 ```text
@@ -433,7 +591,7 @@ ctx.output.remove(path)
 门面绑定当前候选身份并执行目标、祖先和回滚条件检查；它不是文件系统沙箱。直接修改
 `ctx.project.output_root` 会绕过门面，但仍面对最终全量候选验证。
 
-### 10.2 `ctx.write_back.layout`
+### 11.2 `ctx.write_back.layout`
 
 <!-- att-example: illustrative -->
 ```lua
@@ -456,7 +614,7 @@ WriteBack 没有 validate/discard/publish 或 post-publish 回调。脚本应只
 发布；Lua 无法在成功发布后再把私有表标记成“已发布”。需要跨运行恢复时，以权威输入和
 候选可重建性设计协议，而不是猜测发布结果。
 
-## 11. 错误、取消与副作用
+## 12. 错误、取消与副作用
 
 Host 错误以 userdata 抛出，可由 `pcall` 读取：
 
@@ -470,8 +628,8 @@ error.retry_after_ms = integer | nil
 
 只按 domain/kind 分支；message 仅诊断。JSON、普通 Host 值、RPG Maker 整文档、Extract
 快照、来源和输出转换各自保留不同错误域。常见域包括 `json`、`binding`、
-`rpg_maker`、`extract`、`filesystem`、`output`、`sqlite`、`translation`、`llm`、
-`runtime`。
+`rpg_maker`、`extract`、`filesystem`、`output`、`sqlite`、`translation`、`standard`、
+`llm`、`runtime`。
 
 当前稳定的常用 kind：
 
@@ -485,6 +643,7 @@ error.retry_after_ms = integer | nil
 | `output` | `outside_content_roots`、`invalid_path`、`outside_scope`、`scope_root_mutation`、`not_found`、`not_file`、`not_directory`、`directory_not_empty`、`candidate_identity_changed`、`wrong_editor_instance`、`invalid_utf8_name`、`io` |
 | `sqlite` | `closed`、`indeterminate`、`transaction_already_active`、`no_active_transaction`、`operation_failed`、`outcome_unknown` |
 | `translation` | `prepare`、`accept`、`invalid_state` |
+| `standard` | `invalid_argument`、`invalid_role`、`foreign_unit`、`transaction_conflict`、`stale_snapshot`、`invalid_result`、`profile_required`、`saved_profile_unavailable`、`profile_invalid`、`profile_state_unavailable`、`profile_resources_invalid`、`snapshot_unavailable`、`open_failed`、`acceptance_failed`、`internal_invariant` |
 | `llm` | `retryable`、`fatal` |
 | `runtime` | `cancelled`、`host_bridge_closed` |
 
@@ -497,4 +656,5 @@ kind。ATT 不按 Lua VM 内存、Host 值字节、节点、深度、错误文�
 
 失败后的现实状态必须按副作用判断：活动 SQLite 事务由终结器尝试回滚；已提交 SQL 和
 已发送 LLM 请求保持；Extract 内存意图只在干净终结后提交；WriteBack 受管修改随候选
-丢弃；标准库和外部进程副作用不属于 ATT 自动恢复。
+丢弃；已经成功返回的 Standard 人工提交保持；标准库和外部进程副作用不属于 ATT 自动
+恢复。
