@@ -24,7 +24,7 @@ use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::ProjectName;
 use crate::rpg_maker::extract::document::{
     RpgMakerDocumentId, RpgMakerDocumentSelection, RpgMakerProjectDocumentReader,
-    RpgMakerProjectDocuments,
+    RpgMakerProjectDocumentReadingDiagnostic, RpgMakerProjectDocuments,
 };
 use crate::rpg_maker::json::{
     StackSafeJsonError, StackSafeJsonValue, clone_value, drop_value, from_str as parse_json,
@@ -2524,15 +2524,14 @@ where
 
 impl<R, C> RpgMakerWriteBackDocumentRewritingError<R, C>
 where
-    R: SafeDiagnosticSource,
+    R: RpgMakerProjectDocumentReadingDiagnostic,
     CpuTaskExecutionError<C>: SafeDiagnosticSource,
 {
     pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
         match self {
-            Self::ReadDocuments(source) => source.safe_diagnostic_source(
+            Self::ReadDocuments(source) => source.safe_document_reading_diagnostic(
+                DiagnosticCode::WriteBackDocumentRead,
                 DiagnosticStage::WriteBack,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::FixInput,
             ),
             Self::ScheduleRewrite(source) => source
                 .safe_diagnostic_source(
@@ -2550,7 +2549,7 @@ where
 
 impl<R, C> SafeDiagnosticSource for RpgMakerWriteBackDocumentRewritingError<R, C>
 where
-    R: SafeDiagnosticSource,
+    R: RpgMakerProjectDocumentReadingDiagnostic,
     CpuTaskExecutionError<C>: SafeDiagnosticSource,
 {
     fn safe_diagnostic_source(
@@ -2931,6 +2930,23 @@ mod tests {
 
     impl Error for FakeError {}
 
+    impl RpgMakerProjectDocumentReadingDiagnostic for FakeError {
+        fn safe_document_reading_diagnostic(
+            &self,
+            code: DiagnosticCode,
+            stage: DiagnosticStage,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::component("fake_write_back_document_reader"),
+                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            )
+        }
+    }
+
     struct PanickingReader;
 
     impl RpgMakerProjectDocumentReader for PanickingReader {
@@ -3013,6 +3029,23 @@ mod tests {
         {
             Ok(task())
         }
+    }
+
+    #[test]
+    fn document_read_failure_uses_explicit_write_back_responsibility() {
+        let error: RpgMakerWriteBackDocumentRewritingError<
+            FakeError,
+            crate::runtime::cpu::CpuExecutorUnavailable,
+        > = RpgMakerWriteBackDocumentRewritingError::ReadDocuments(FakeError);
+
+        let diagnostic = error.safe_diagnostic();
+
+        assert_eq!(diagnostic.code, DiagnosticCode::WriteBackDocumentRead);
+        assert_eq!(diagnostic.stage, DiagnosticStage::WriteBack);
+        assert_eq!(
+            diagnostic.subject,
+            DiagnosticSubject::component("fake_write_back_document_reader")
+        );
     }
 
     #[tokio::test]
