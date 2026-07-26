@@ -58,10 +58,16 @@ Owner
 - `Value(String)`：Scalar 和 DialogueSpeaker；
 - `Lines(Vec<String>)`：DialogueBody、Choices、ScrollingText。
 
-Lines 的元素边界属于翻译事实；元素不得含 CR、LF 或 NUL。`source_context` 当前由
-DialogueBody 保存源 Speaker，其余为空对象。译文内容必须与原文形状相同，译文与
-translation state 必须成对存在或成对为空。Lua 私有表使用的 64 字符十六进制表示见
-[Lua Translate](lua.md#7-translatepreparecurrent-与-accept)。
+组类型、角色和内容形状作为同一个领域结构一次验证：`event_dialogue` 只接受
+DialogueSpeaker/DialogueBody，`event_choices` 只接受 Choices，
+`event_scrolling_text` 只接受 ScrollingText，其余组类型只接受 Scalar。Scalar Value
+保留内部 LF；DialogueSpeaker Value 拒绝 CR/LF；所有 Value 拒绝 NUL。Lines 的元素边界
+属于翻译事实，每个元素都拒绝 CR、LF 或 NUL。纯空白、Lines 数量对齐和空槽对应关系仍由
+实际消费这些语义的 Extract、Translate 或 WriteBack 边界分别判断，不复制结构规则。
+
+`source_context` 当前由 DialogueBody 保存源 Speaker，其余为空对象。译文内容必须与原文
+形状相同，译文与 translation state 必须成对存在或成对为空。Lua 私有表使用的 64 字符
+十六进制表示见 [Lua Translate](lua.md#7-translatepreparecurrent-与-accept)。
 
 当前数据库相关表为：
 

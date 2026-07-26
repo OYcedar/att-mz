@@ -182,13 +182,18 @@ wire、ID、行形状、空槽、ATT token 和响应信封约束。Planner 与 E
 验收与任务记录共享该结果。记录 renderer 不重新猜测 `<why>`，也不重新解释逐 ID 规则。
 
 Standard 响应必须提供当前 TaskBlock 的每个 ID 恰好一次，不能缺失、重复或增加 ID。
-Value/Lines 形状必须符合角色：
+Reader 在建立受信身份时，以 Extract 相同的唯一结构契约同时验证 group kind、role 和
+Value/Lines：对话组只接受 Speaker/Body，选项组只接受 Choices，滚动文本组只接受
+ScrollingText，其余组只接受 Scalar。Executor 验收候选时继续消费同一契约；受信身份的
+kind/role 若不一致属于内部不变量，候选自身的形状或字符不合规则只拒绝对应 ID。
 
 - Speaker 和形状为 `single line` 的严格字段是一条非空候选；
 - `free line breaking` Scalar `Value` 可由多模型行组成，最终以 LF 连接；源值含 LF 时
   必须采用该形状；
 - Choices 和严格 ScrollingText 必须与源 Lines 按槽对齐并保持空槽；
-- 每个结构行拒绝 CR、LF、NUL 和非法空白形状；
+- DialogueSpeaker Value 拒绝 CR/LF，所有 Value 拒绝 NUL；每个 Lines 元素拒绝
+  CR、LF、NUL；
+- 纯空白、严格对齐数量和空槽一致性仍由响应验收规则负责，不进入共享结构校验；
 - 写回目标为 note/comment `<name:value>` 标签值的单元额外拒绝含 `>` 的译文
   （`tag_value_contains_closing_delimiter`）：标签值按字节区间逐字写回，`>` 会提前
   闭合标签并把余文泄漏为容器正文。原文由提取协议保证不含 `>`，该规则不拒绝任何

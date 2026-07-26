@@ -33,10 +33,11 @@ use crate::llm::{
     LlmRequestExecutor, LlmResponse, LlmUsage,
 };
 use crate::rpg_maker::model::{
-    TextUnitContent, TextUnitContentStructureError, TextUnitContentView,
+    TextUnitContent, TextUnitContentStructureError, TextUnitContentView, TextUnitRole,
     validate_text_unit_content_structure, validate_text_unit_lines,
 };
 use crate::rpg_maker::placeholder_token;
+use crate::rpg_maker::text::TextGroupKind;
 
 use super::language_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
@@ -194,6 +195,11 @@ pub(crate) enum TranslationInternalInvariant {
         resolved_source: LanguageId,
         resolved_target: LanguageId,
     },
+    TextUnitKindRoleMismatch {
+        location: TranslationCandidateInvariantLocation,
+        kind: TextGroupKind,
+        role: TextUnitRole,
+    },
     RepairSegmentRangeMissing {
         location: TranslationCandidateInvariantLocation,
         line_index: usize,
@@ -264,6 +270,16 @@ impl TranslationInternalInvariant {
                 resolved_source.as_str(),
                 resolved_target.as_str()
             ),
+            Self::TextUnitKindRoleMismatch {
+                location,
+                kind,
+                role,
+            } => format!(
+                "text_unit_kind_role_mismatch; {}; group_kind={}; role={}",
+                candidate_location_detail(*location),
+                kind.storage_name(),
+                text_unit_role_kind(role)
+            ),
             Self::RepairSegmentRangeMissing {
                 location,
                 line_index,
@@ -305,7 +321,8 @@ impl TranslationInternalInvariant {
             | Self::LanguagePairMismatch { task_index, .. } => {
                 translation_task_subject(*task_index)
             }
-            Self::RepairSegmentRangeMissing { location, .. }
+            Self::TextUnitKindRoleMismatch { location, .. }
+            | Self::RepairSegmentRangeMissing { location, .. }
             | Self::RepairLineBoundaryMissing { location, .. }
             | Self::RepairUnassignedSegments { location, .. }
             | Self::ReservedTokenAfterRestore { location } => candidate_location_subject(*location),
@@ -371,6 +388,16 @@ fn candidate_location_detail(location: TranslationCandidateInvariantLocation) ->
         TranslationCandidateInvariantLocation::PreparedCandidate => {
             "scope=prepared_candidate".to_owned()
         }
+    }
+}
+
+const fn text_unit_role_kind(role: &TextUnitRole) -> &'static str {
+    match role {
+        TextUnitRole::Scalar(_) => "scalar",
+        TextUnitRole::DialogueSpeaker => "dialogue_speaker",
+        TextUnitRole::DialogueBody => "dialogue_body",
+        TextUnitRole::Choices => "choices",
+        TextUnitRole::ScrollingText => "scrolling_text",
     }
 }
 
@@ -1739,10 +1766,21 @@ fn accept_translation_content_candidate_at(
     candidate: TextUnitContent,
     invariant_location: TranslationCandidateInvariantLocation,
 ) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
-    if let Err(error) =
-        validate_text_unit_content_structure(identity.role(), TextUnitContentView::from(&candidate))
-    {
-        return Ok(TranslationContentAcceptance::Rejected(match error {
+    if let Err(error) = validate_text_unit_content_structure(
+        identity.kind(),
+        identity.role(),
+        TextUnitContentView::from(&candidate),
+    ) {
+        let rejection = match error {
+            TextUnitContentStructureError::KindRoleMismatch => {
+                return Err(TranslationCandidateTechnicalError::InternalInvariant {
+                    invariant: TranslationInternalInvariant::TextUnitKindRoleMismatch {
+                        location: invariant_location,
+                        kind: identity.kind(),
+                        role: identity.role().clone(),
+                    },
+                });
+            }
             TextUnitContentStructureError::ShapeMismatch => {
                 TranslationUnitRejectionReason::InvalidShape {
                     message: match candidate {
@@ -1754,7 +1792,8 @@ fn accept_translation_content_candidate_at(
             TextUnitContentStructureError::InvalidText { line_index } => {
                 TranslationUnitRejectionReason::InvalidLineText { line_index }
             }
-        }));
+        };
+        return Ok(TranslationContentAcceptance::Rejected(rejection));
     }
     let lines = match (identity.source_content(), candidate) {
         (TextUnitContent::Value(_), TextUnitContent::Value(value)) => {
@@ -4040,6 +4079,43 @@ mod tests {
                 TranslationUnitRejectionReason::InvalidLineText { line_index: 0 }
             ));
         }
+    }
+
+    #[test]
+    fn candidate_acceptance_reports_kind_role_mismatch_as_an_internal_invariant() {
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::EventChoices,
+            RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(9)]),
+            TextUnitRole::DialogueSpeaker,
+            TextUnitContent::Value("炎の剣".to_owned()),
+            "{}",
+        );
+        let constraints = TranslationTargetConstraints::from_identities([&identity]);
+        let module = japanese_module();
+
+        let error = accept_translation_content_candidate(
+            &identity,
+            constraints,
+            "炎の剣",
+            ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+            &[],
+            &japanese_analysis(),
+            module.as_ref(),
+            TextUnitContent::Value("炎之剑".to_owned()),
+        )
+        .expect_err("受信身份的 kind/role 不一致必须是技术不变量，而不是模型候选拒绝");
+
+        assert!(matches!(
+            error,
+            TranslationCandidateTechnicalError::InternalInvariant {
+                invariant: TranslationInternalInvariant::TextUnitKindRoleMismatch {
+                    kind: TextGroupKind::EventChoices,
+                    role: TextUnitRole::DialogueSpeaker,
+                    ..
+                }
+            }
+        ));
     }
 
     #[tokio::test]
