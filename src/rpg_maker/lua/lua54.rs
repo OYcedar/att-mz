@@ -931,7 +931,12 @@ fn build_context(
     let phase_name = phase_name(phase.phase());
     let calls = Arc::clone(common.calls());
     let context = lua.create_table()?;
+    // markers 以 JSON 容器 table 本身为键;弱键让脚本丢弃引用后的容器可被 GC
+    // 回收,VM 峰值内存不随已处理文档数单调累积。仍被引用的容器键保持可达。
     let json_markers = lua.create_table()?;
+    let markers_metatable = lua.create_table()?;
+    markers_metatable.set("__mode", "k")?;
+    json_markers.set_metatable(Some(markers_metatable))?;
     context.set("phase", phase_name)?;
     context.set("project", build_project_table(lua, calls.project())?)?;
     context.set("json", build_json_table(lua, &json_markers)?)?;
@@ -5455,6 +5460,49 @@ assert(json.decode(json.encode(large)) == large)
             .start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/json-unbounded.lua"),
+                    script.as_bytes().to_vec(),
+                ),
+                test_bindings(
+                    None,
+                    Arc::new(Mutex::new(TestObservations::default())),
+                    Arc::new(Mutex::new(Vec::new())),
+                    None,
+                ),
+            )
+            .await;
+        report.into_parts().0.unwrap();
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn json_markers_do_not_pin_discarded_containers_against_gc() {
+        // markers 表以弱键登记 JSON 容器:脚本丢弃引用后 GC 必须能回收容器,
+        // 逐文档处理的 VM 峰值内存不随已解码文档数单调累积;
+        // 仍被引用的容器保持标记语义(encode round-trip 不受 GC 影响)。
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let script = r#"
+local json = ctx.json
+collectgarbage("collect")
+collectgarbage("collect")
+local baseline = collectgarbage("count")
+for _ = 1, 64 do
+    local document = json.decode('{"items":[' .. string.rep('{"v":"数据"},', 511) .. '{"v":"数据"}]}')
+    assert(document.items[1].v == "数据")
+end
+collectgarbage("collect")
+collectgarbage("collect")
+local grown = collectgarbage("count") - baseline
+-- 64 份文档各含 512 个对象;若 markers 钉住全部容器,增长在数十 MiB 量级。
+assert(grown < 4096, "丢弃的 JSON 容器必须可被 GC 回收，泄漏 KiB=" .. tostring(grown))
+
+local kept = json.decode('[{"v":1}]')
+collectgarbage("collect")
+assert(json.encode(kept) == '[{"v":1}]', "仍被引用的容器必须保留数组/对象标记")
+"#;
+        let report = runtime
+            .start(
+                OwnedLuaProgram::new(
+                    PathBuf::from("C:/scripts/json-markers-gc.lua"),
                     script.as_bytes().to_vec(),
                 ),
                 test_bindings(

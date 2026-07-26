@@ -6361,6 +6361,18 @@ fn init_workspace_diagnostic(
         ProjectWorkspaceConvergenceError::Prepare(source) => {
             (Class::ProjectState, init_prepare_diagnostic(source))
         }
+        ProjectWorkspaceConvergenceError::ObservePreservedDirectory(source) => (
+            Class::ProjectState,
+            init_directory_diagnostic(
+                source,
+                DiagnosticCode::ProjectState,
+                DiagnosticAction::CheckProjectState,
+            ),
+        ),
+        ProjectWorkspaceConvergenceError::PreserveObservability { failure, .. } => (
+            Class::ProjectState,
+            init_preserve_observability_diagnostic(failure),
+        ),
         ProjectWorkspaceConvergenceError::CandidateFailure { failure, .. } => {
             (Class::ProjectState, init_candidate_diagnostic(failure))
         }
@@ -6732,6 +6744,111 @@ fn init_candidate_diagnostic(
         ProjectWorkspaceCandidateFailure::ReconcileDatabase(source) => {
             init_database_reconciliation_diagnostic(source)
         }
+    }
+}
+
+fn init_preserve_observability_diagnostic(
+    source: &crate::rpg_maker::init::PreserveObservabilityFailure<
+        SystemFileSystemError,
+        Box<SystemFileSystemError>,
+    >,
+) -> SafeDiagnostic {
+    use crate::rpg_maker::init::PreserveObservabilityFailure;
+    use crate::storage::file_system::{ScopedDirectoryBindError, ScopedDirectoryEditError};
+
+    let invalid_path = |path: &PathBuf, kind: DiagnosticFailureKind| {
+        SafeDiagnostic::new(
+            DiagnosticCode::ProjectState,
+            DiagnosticStage::Init,
+            DiagnosticSubject::path(path),
+            DiagnosticReason::failure(kind),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        )
+    };
+    match source {
+        PreserveObservabilityFailure::Bind(source) => match source {
+            ScopedDirectoryBindError::WrongEditorInstance => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                DiagnosticStage::Init,
+                DiagnosticSubject::component("preserved observability candidate"),
+                DiagnosticReason::failure(DiagnosticFailureKind::WrongPublisherInstance),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::ReportBug,
+            ),
+            ScopedDirectoryBindError::CandidateFinalized { root } => {
+                invalid_path(root, DiagnosticFailureKind::StateMismatch)
+            }
+            ScopedDirectoryBindError::CandidateIdentityChanged { root } => {
+                invalid_path(root, DiagnosticFailureKind::FileIdentityChanged)
+            }
+            ScopedDirectoryBindError::Failed { root, source } => source
+                .safe_diagnostic(
+                    DiagnosticStage::Init,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckPathAndPermissions,
+                )
+                .with_recovery(crate::diagnostic::RecoveryFact::path(root)),
+        },
+        PreserveObservabilityFailure::List { path, source } => {
+            init_directory_listing_diagnostic(
+                source,
+                DiagnosticCode::ProjectState,
+                DiagnosticAction::CheckProjectState,
+            )
+            .with_recovery(crate::diagnostic::RecoveryFact::path(path))
+        }
+        PreserveObservabilityFailure::Read { path, source } => match source {
+            ReadFileError::NotFound { path } => {
+                invalid_path(path, DiagnosticFailureKind::NotFound)
+            }
+            ReadFileError::NotFile { path } => {
+                invalid_path(path, DiagnosticFailureKind::InvalidPath)
+            }
+            ReadFileError::Io { path, source } => source
+                .safe_diagnostic(
+                    DiagnosticStage::Init,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckPathAndPermissions,
+                )
+                .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
+        }
+        .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
+        PreserveObservabilityFailure::InvalidEntryName { path }
+        | PreserveObservabilityFailure::InvalidCandidatePath { path, .. } => {
+            invalid_path(path, DiagnosticFailureKind::InvalidPath)
+        }
+        PreserveObservabilityFailure::Edit { path, source } => match source {
+            ScopedDirectoryEditError::Failed { path, source } => source
+                .safe_diagnostic(
+                    DiagnosticStage::Init,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckPathAndPermissions,
+                )
+                .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
+            ScopedDirectoryEditError::WrongEditorInstance => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                DiagnosticStage::Init,
+                DiagnosticSubject::component("preserved observability candidate"),
+                DiagnosticReason::failure(DiagnosticFailureKind::WrongPublisherInstance),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::ReportBug,
+            ),
+            ScopedDirectoryEditError::OutsideScope { path }
+            | ScopedDirectoryEditError::ScopeRootMutation { path }
+            | ScopedDirectoryEditError::NotFile { path }
+            | ScopedDirectoryEditError::NotDirectory { path }
+            | ScopedDirectoryEditError::DirectoryNotEmpty { path } => {
+                invalid_path(path, DiagnosticFailureKind::InvalidPath)
+            }
+            ScopedDirectoryEditError::NotFound { path } => {
+                invalid_path(path, DiagnosticFailureKind::NotFound)
+            }
+            ScopedDirectoryEditError::CandidateIdentityChanged { root } => {
+                invalid_path(root, DiagnosticFailureKind::FileIdentityChanged)
+            }
+        }
+        .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
     }
 }
 

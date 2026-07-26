@@ -3,7 +3,7 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::ProjectName;
@@ -23,9 +23,12 @@ use crate::storage::file_system::{
     DirectoryLister, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
     DirectorySourceMapping, DirectoryStageRequest, DirectoryStageRequestError,
     DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
-    DirectoryTreeRoot, ExistingDirectoryResolver, ListDirectoryError,
-    RecoverableDirectoryPublisher, ResolveDirectoryError, StagedDirectory,
+    BoundScopedDirectory, DirectoryTreeRoot, ExistingDirectoryResolver, FileReader,
+    ListDirectoryError, ReadFileError, RecoverableDirectoryPublisher, ResolveDirectoryError,
+    ScopedDirectoryBindError, ScopedDirectoryEditError, ScopedDirectoryEditor,
+    ScopedDirectoryPath, ScopedDirectoryScope, StagedDirectory,
 };
+use crate::storage::scoped_path::ScopedDirectoryPathError;
 use crate::storage::sqlite::{SnapshotDatabaseError, SqliteDatabaseSnapshotter};
 
 /// 初始化 RPG Maker 游戏所需的输入。
@@ -220,8 +223,13 @@ where
     F: ExistingDirectoryResolver
         + DirectChildDirectoryEnsurer<Error = <F as ExistingDirectoryResolver>::Error>
         + DirectoryLister<Error = <F as ExistingDirectoryResolver>::Error>
+        + FileReader<Error = <F as ExistingDirectoryResolver>::Error>
         + DirectoryTreeFingerprinter,
-    A: RecoverableDirectoryPublisher,
+    A: RecoverableDirectoryPublisher
+        + ScopedDirectoryEditor<
+            CandidateState = <A as RecoverableDirectoryPublisher>::StagingState,
+            Error = <A as RecoverableDirectoryPublisher>::Error,
+        >,
 {
     type Error = ProjectWorkspaceConvergenceError<
         D::Error,
@@ -230,7 +238,7 @@ where
         R::ReconciliationError,
         <F as ExistingDirectoryResolver>::Error,
         <F as DirectoryTreeFingerprinter>::Error,
-        A::Error,
+        <A as RecoverableDirectoryPublisher>::Error,
     >;
 
     async fn converge(
@@ -351,6 +359,34 @@ where
         } else {
             DirectoryPublishIntent::CreateNew
         };
+        // 现存工作区的 logs/ 与 task-records/ 是既有运行历史与人工补译审计材料，
+        // 重建发布必须原样带入候选；不存在或不是目录的条目不进入保留集合。
+        let mut preserved_directories = Vec::new();
+        if target_exists {
+            for name in PRESERVED_OBSERVABILITY_DIRECTORIES {
+                match self
+                    .file_system
+                    .resolve_existing_directory(final_layout.workspace_root().join(name))
+                    .await
+                {
+                    Ok(_) => preserved_directories.push(name),
+                    Err(
+                        ResolveDirectoryError::NotFound { .. }
+                        | ResolveDirectoryError::NotDirectory { .. },
+                    ) => {}
+                    Err(error) => {
+                        return Err(ProjectWorkspaceConvergenceError::ObservePreservedDirectory(
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+        let mut empty_directories = vec![
+            self.rpg_maker_layout.write_back_data_relative(),
+            self.rpg_maker_layout.write_back_js_relative(),
+        ];
+        empty_directories.extend(preserved_directories.iter().map(PathBuf::from));
         let stage_request = DirectoryStageRequest::new(
             final_layout.workspace_root().to_path_buf(),
             publish_intent,
@@ -365,10 +401,7 @@ where
                 )?,
             ],
             Vec::new(),
-            vec![
-                self.rpg_maker_layout.write_back_data_relative(),
-                self.rpg_maker_layout.write_back_js_relative(),
-            ],
+            empty_directories,
         )?;
         let staged = self
             .directories
@@ -382,6 +415,39 @@ where
 
         if self.cancellation.is_requested() {
             return discard_cancelled_candidate(&self.directories, staged).await;
+        }
+        if !preserved_directories.is_empty() {
+            // bind 只借用 candidate 建立范围令牌;后续复制只携带 BoundScopedDirectory,
+            // 不跨 await 持有 StagingState 借用。
+            let scope = ScopedDirectoryScope::new(
+                preserved_directories.iter().map(OsString::from),
+            )
+            .expect("保留目录名是固定的合法范围根");
+            let bound = match self.directories.bind_scoped_directory(&staged, scope).await {
+                Ok(bound) => bound,
+                Err(source) => {
+                    let discard = self.directories.discard(staged).await.err();
+                    return Err(ProjectWorkspaceConvergenceError::PreserveObservability {
+                        failure: PreserveObservabilityFailure::Bind(source),
+                        discard,
+                    });
+                }
+            };
+            if let Err(failure) = preserve_observability_directories(
+                &self.file_system,
+                &self.directories,
+                final_layout.workspace_root(),
+                &bound,
+                &preserved_directories,
+            )
+            .await
+            {
+                let discard = self.directories.discard(staged).await.err();
+                return Err(ProjectWorkspaceConvergenceError::PreserveObservability {
+                    failure,
+                    discard,
+                });
+            }
         }
         let candidate_fingerprint =
             match fingerprint_source(&self.file_system, &staged_layout, false).await {
@@ -740,6 +806,93 @@ where
         .map(|value| SourceSnapshotFingerprint::from_bytes(value.into_bytes()))
 }
 
+/// 工作区重建时按当前契约保留的非权威可观测性目录。
+const PRESERVED_OBSERVABILITY_DIRECTORIES: [&str; 2] = ["logs", "task-records"];
+
+/// 把旧工作区的可观测性目录逐文件搬入已准备的候选。
+///
+/// 来源树在项目租约下不会并发变化;显式栈遍历不建立深度上限。
+async fn preserve_observability_directories<F, A>(
+    file_system: &F,
+    directories: &A,
+    workspace_root: &Path,
+    bound: &BoundScopedDirectory<<A as ScopedDirectoryEditor>::ScopeState>,
+    preserved: &[&'static str],
+) -> Result<
+    (),
+    PreserveObservabilityFailure<
+        <F as ExistingDirectoryResolver>::Error,
+        <A as ScopedDirectoryEditor>::Error,
+    >,
+>
+where
+    F: ExistingDirectoryResolver
+        + DirectoryLister<Error = <F as ExistingDirectoryResolver>::Error>
+        + FileReader<Error = <F as ExistingDirectoryResolver>::Error>,
+    A: ScopedDirectoryEditor,
+{
+    let mut pending = preserved
+        .iter()
+        .map(|name| (workspace_root.join(name), (*name).to_owned()))
+        .collect::<Vec<_>>();
+    while let Some((absolute, relative)) = pending.pop() {
+        let entries = file_system
+            .list_directory(absolute.clone())
+            .await
+            .map_err(|source| PreserveObservabilityFailure::List {
+                path: absolute,
+                source,
+            })?;
+        for entry in entries {
+            let Some(name) = entry
+                .resolved_path()
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+            else {
+                return Err(PreserveObservabilityFailure::InvalidEntryName {
+                    path: entry.resolved_path().to_path_buf(),
+                });
+            };
+            let child_relative = format!("{relative}/{name}");
+            let scoped = ScopedDirectoryPath::new(PathBuf::from(&child_relative)).map_err(
+                |source| PreserveObservabilityFailure::InvalidCandidatePath {
+                    path: entry.resolved_path().to_path_buf(),
+                    source,
+                },
+            )?;
+            match entry.kind() {
+                DirectoryEntryKind::Directory => {
+                    directories
+                        .create_scoped_directory(bound, scoped)
+                        .await
+                        .map_err(|source| PreserveObservabilityFailure::Edit {
+                            path: PathBuf::from(&child_relative),
+                            source,
+                        })?;
+                    pending.push((entry.resolved_path().to_path_buf(), child_relative));
+                }
+                DirectoryEntryKind::RegularFile => {
+                    let file = file_system
+                        .read_file(entry.resolved_path().to_path_buf())
+                        .await
+                        .map_err(|source| PreserveObservabilityFailure::Read {
+                            path: entry.resolved_path().to_path_buf(),
+                            source,
+                        })?;
+                    directories
+                        .write_scoped_file(bound, scoped, file.into_bytes())
+                        .await
+                        .map_err(|source| PreserveObservabilityFailure::Edit {
+                            path: PathBuf::from(&child_relative),
+                            source,
+                        })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn discard_candidate_failure<A, D, S, I, R, E, P>(
     directories: &A,
     staged: StagedDirectory<A::StagingState>,
@@ -778,6 +931,82 @@ pub(crate) enum ProjectWorkspaceCandidateFailure<D, S, R, P> {
     ReconcileDatabase(R),
 }
 
+/// 工作区重建时无法把现存 `logs/`、`task-records/` 搬入候选。
+///
+/// 这些目录是既有运行历史与人工补译审计材料;重建路径必须原样保留它们,
+/// 不得随 ReplaceExisting 静默丢弃。
+#[derive(Debug)]
+pub(crate) enum PreserveObservabilityFailure<E, A> {
+    Bind(ScopedDirectoryBindError<A>),
+    List {
+        path: PathBuf,
+        source: ListDirectoryError<E>,
+    },
+    Read {
+        path: PathBuf,
+        source: ReadFileError<E>,
+    },
+    InvalidEntryName {
+        path: PathBuf,
+    },
+    InvalidCandidatePath {
+        path: PathBuf,
+        source: ScopedDirectoryPathError,
+    },
+    Edit {
+        path: PathBuf,
+        source: ScopedDirectoryEditError<A>,
+    },
+}
+
+impl<E, A> fmt::Display for PreserveObservabilityFailure<E, A>
+where
+    E: fmt::Display,
+    A: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bind(error) => write!(formatter, "无法绑定候选保留范围：{error}"),
+            Self::List { path, source } => {
+                write!(formatter, "无法列举保留目录 {}：{source}", path.display())
+            }
+            Self::Read { path, source } => {
+                write!(formatter, "无法读取保留文件 {}：{source}", path.display())
+            }
+            Self::InvalidEntryName { path } => write!(
+                formatter,
+                "保留目录条目 {} 的名称无法作为候选相对路径",
+                path.display()
+            ),
+            Self::InvalidCandidatePath { path, source } => write!(
+                formatter,
+                "保留条目 {} 无法映射为候选路径：{source}",
+                path.display()
+            ),
+            Self::Edit { path, source } => {
+                write!(formatter, "无法写入候选保留条目 {}：{source}", path.display())
+            }
+        }
+    }
+}
+
+impl<E, A> Error for PreserveObservabilityFailure<E, A>
+where
+    E: Error + 'static,
+    A: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Bind(source) => Some(source),
+            Self::List { source, .. } => Some(source),
+            Self::Read { source, .. } => Some(source),
+            Self::InvalidEntryName { .. } => None,
+            Self::InvalidCandidatePath { source, .. } => Some(source),
+            Self::Edit { source, .. } => Some(source),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     SourceGameRoot(ResolveDirectoryError<E>),
@@ -798,6 +1027,11 @@ pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     ObserveInputSource(DirectoryTreeFingerprintError<P>),
     InvalidStageRequest(DirectoryStageRequestError),
     Prepare(DirectoryPrepareError<A>),
+    ObservePreservedDirectory(ResolveDirectoryError<E>),
+    PreserveObservability {
+        failure: PreserveObservabilityFailure<E, A>,
+        discard: Option<DirectoryDiscardError<A>>,
+    },
     CandidateFailure {
         failure: ProjectWorkspaceCandidateFailure<D, S, R, P>,
         discard: Option<DirectoryDiscardError<A>>,
@@ -835,7 +1069,9 @@ impl<D, S, I, R, E, P, A> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> 
             | Self::InspectExistingDatabase(_)
             | Self::ObserveWorkspaceStructure(_)
             | Self::ObserveExistingSource(_)
+            | Self::ObservePreservedDirectory(_)
             | Self::Prepare(_)
+            | Self::PreserveObservability { .. }
             | Self::CandidateFailure { .. }
             | Self::CancellationCleanup(_) => Impact::ProjectState,
             Self::Publish(error) => match error {
@@ -920,6 +1156,16 @@ where
             }
             Self::InvalidStageRequest(error) => write!(formatter, "工作区候选请求无效：{error}"),
             Self::Prepare(error) => write!(formatter, "无法准备工作区候选：{error}"),
+            Self::ObservePreservedDirectory(error) => {
+                write!(formatter, "无法检查现存可观测性目录：{error}")
+            }
+            Self::PreserveObservability { failure, discard } => {
+                write!(formatter, "无法保留现存可观测性目录：{failure}")?;
+                if let Some(discard) = discard {
+                    write!(formatter, "；且候选清理失败：{discard}")?;
+                }
+                Ok(())
+            }
             Self::CandidateFailure { failure, discard } => {
                 write!(formatter, "工作区候选处理失败：{failure}")?;
                 if let Some(discard) = discard {
@@ -1239,6 +1485,19 @@ mod tests {
                 }
                 return Err(ResolveDirectoryError::NotFound { path });
             }
+            if path == Path::new("C:/projects/mz/game/logs")
+                || path == Path::new("C:/projects/mz/game/task-records")
+            {
+                // 只有声明了可观测性目录的工作区场景才存在这两个目录。
+                if matches!(
+                    self.workspace_structure,
+                    WorkspaceStructureObservation::ObservabilityDirectories
+                ) {
+                    self.observations.event("probe_preserved");
+                    return Ok(path);
+                }
+                return Err(ResolveDirectoryError::NotFound { path });
+            }
             Ok(path)
         }
     }
@@ -1379,6 +1638,14 @@ mod tests {
                     ));
                 }
                 return Ok(children);
+            }
+            if path == Path::new("C:/projects/mz/game/logs")
+                || path == Path::new("C:/projects/mz/game/task-records")
+            {
+                // 保留复制走显式栈遍历;默认夹具的可观测性目录为空即可
+                // 证明"保留步骤被执行且不失败"。
+                self.observations.event("list_preserved");
+                return Ok(Vec::new());
             }
             if path == Path::new("C:/projects/mz/game/write_back") {
                 self.observations.event("list_write_back");
@@ -1552,6 +1819,106 @@ mod tests {
     struct FakePublisher {
         observations: Observations,
         discard_error: Arc<Mutex<Option<FakeError>>>,
+    }
+
+    impl FileReader for FakeWorkspaceFileSystem {
+        type Error = FakeError;
+
+        async fn read_file(
+            &self,
+            path: PathBuf,
+        ) -> Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>> {
+            // 保留复制场景由专用夹具覆盖;默认夹具不含可保留文件。
+            Err(ReadFileError::NotFound { path })
+        }
+    }
+
+    impl ScopedDirectoryEditor for FakePublisher {
+        type CandidateState = usize;
+        type ScopeState = ();
+        type Error = FakeError;
+
+        fn bind_scoped_directory(
+            &self,
+            candidate: &StagedDirectory<Self::CandidateState>,
+            _scope: ScopedDirectoryScope,
+        ) -> impl std::future::Future<
+            Output = Result<
+                crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
+                ScopedDirectoryBindError<Self::Error>,
+            >,
+        > + Send
+        + use<> {
+            self.observations.event("bind_preserved_scope");
+            let root = candidate.staging_root().to_path_buf();
+            async move {
+                Ok(crate::storage::file_system::BoundScopedDirectory::new(
+                    root,
+                    ScopedDirectoryScope::new([OsString::from("logs")]).expect("测试范围应合法"),
+                    (),
+                ))
+            }
+        }
+
+        async fn read_scoped_file(
+            &self,
+            _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
+            path: ScopedDirectoryPath,
+        ) -> Result<Vec<u8>, ScopedDirectoryEditError<Self::Error>> {
+            Err(ScopedDirectoryEditError::NotFound {
+                path: path.as_path().to_path_buf(),
+            })
+        }
+
+        async fn list_scoped_directory(
+            &self,
+            _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
+            _path: ScopedDirectoryPath,
+        ) -> Result<
+            Vec<crate::storage::file_system::ScopedDirectoryEntry>,
+            ScopedDirectoryEditError<Self::Error>,
+        > {
+            Ok(Vec::new())
+        }
+
+        async fn list_scoped_root(
+            &self,
+            _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
+        ) -> Result<
+            Vec<crate::storage::file_system::ScopedDirectoryEntry>,
+            ScopedDirectoryEditError<Self::Error>,
+        > {
+            Ok(Vec::new())
+        }
+
+        async fn create_scoped_directory(
+            &self,
+            _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
+            _path: ScopedDirectoryPath,
+        ) -> Result<(), ScopedDirectoryEditError<Self::Error>> {
+            self.observations.event("preserve_dir");
+            Ok(())
+        }
+
+        async fn write_scoped_file(
+            &self,
+            _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
+            _path: ScopedDirectoryPath,
+            _bytes: Vec<u8>,
+        ) -> Result<(), ScopedDirectoryEditError<Self::Error>> {
+            self.observations.event("preserve_file");
+            Ok(())
+        }
+
+        async fn remove_scoped_path(
+            &self,
+            _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
+            path: ScopedDirectoryPath,
+        ) -> Result<(), ScopedDirectoryEditError<Self::Error>> {
+            Err(ScopedDirectoryEditError::NotFound {
+                path: path.as_path().to_path_buf(),
+            })
+        }
     }
 
     impl RecoverableDirectoryPublisher for FakePublisher {
@@ -2168,6 +2535,53 @@ mod tests {
         assert!(observations.events().contains(&"snapshot_database"));
         assert!(observations.events().contains(&"publish"));
         assert!(!observations.events().contains(&"discard"));
+    }
+
+    #[tokio::test]
+    async fn workspace_rebuild_preserves_existing_observability_directories() {
+        // 来源变化触发整树重建时,logs/ 与 task-records/ 是既有运行历史与
+        // 人工补译审计材料,必须进入候选而不是随 ReplaceExisting 静默消失。
+        let current = database_state(0x33, Vec::new());
+        let updated = database_state(0x44, Vec::new());
+        let (service, observations) = service(
+            true,
+            WorkspaceStructureObservation::ObservabilityDirectories,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x44,
+            Ok(current),
+            Ok(ProjectDatabaseReconciliation::for_test(updated)),
+            Ok(()),
+        );
+
+        let outcome = service
+            .converge(request())
+            .await
+            .expect("带可观测性目录的来源变化应发布更新");
+
+        assert!(matches!(
+            outcome,
+            OperationCompletion::Completed(ProjectWorkspaceConvergence::Updated { .. })
+        ));
+        let events = observations.events();
+        assert!(events.contains(&"probe_preserved"));
+        assert!(events.contains(&"bind_preserved_scope"));
+        assert!(events.contains(&"list_preserved"));
+        assert!(events.contains(&"publish"));
+        assert!(!events.contains(&"discard"));
+        let stage_requests = observations
+            .stage_requests
+            .lock()
+            .expect("stage requests mutex should not be poisoned");
+        let request = stage_requests.last().expect("重建应产生候选请求");
+        for preserved in PRESERVED_OBSERVABILITY_DIRECTORIES {
+            assert!(
+                request
+                    .empty_directories()
+                    .iter()
+                    .any(|path| path == Path::new(preserved)),
+                "候选必须为保留目录 {preserved} 建立空目录根"
+            );
+        }
     }
 
     #[tokio::test]

@@ -750,4 +750,26 @@ mod tests {
             ))
         ));
     }
+
+    #[test]
+    fn new_candidate_rejects_extra_original_copies_even_when_all_tokens_are_present() {
+        // 重复 original 的 token 全部在场时，多抄的一份原始控制片段同样无法
+        // 唯一归位；混排必须与单绑定分支一致拒绝，不得作为字面文本混入译文。
+        let prepared = ResolvedTranslationSemantics::for_test()
+            .prepare(TextGroupKind::EventDialogue, r"\C[2]翻訳\C[2]")
+            .expect("重复控制符原文应可准备");
+        let tokens = prepared
+            .placeholders()
+            .iter()
+            .map(AppliedPlaceholder::token)
+            .collect::<Vec<_>>();
+        let candidate = format!(r"{}译文{}\C[2]", tokens[0], tokens[1]);
+
+        assert!(matches!(
+            prepared.accept(candidate).expect("混排应是普通拒绝"),
+            PreparedTranslationAcceptance::Rejected(PreparedTranslationRejection::Candidate(
+                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { .. }
+            ))
+        ));
+    }
 }
