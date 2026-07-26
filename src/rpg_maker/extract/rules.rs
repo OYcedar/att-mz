@@ -517,16 +517,15 @@ where
     /// source 以及 Store 已经拆出的相关错误。
     pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
         match self {
+            // 共享文档读取器按传入阶段建立正确 stage 与文档读取原因；
+            // Rules 拥有本阶段失败的责任 code，在此声明自己的责任域。
             Self::ReadDocuments { rules_path, source } => {
                 let mut diagnostic = source.safe_diagnostic_source(
                     DiagnosticStage::Extract,
                     DiagnosticImpact::Unchanged,
                     DiagnosticAction::CheckProjectState,
                 );
-                // 当前共享文档读取器也服务 WriteBack，其自身投影仍携带 WriteBack 阶段；
-                // Rules 在仍知道真实调用意图时纠正阶段和责任 code，同时保留具体原因。
                 diagnostic.code = DiagnosticCode::ExtractRules;
-                diagnostic.stage = DiagnosticStage::Extract;
                 with_rules_context(diagnostic, rules_path, "read_documents")
             }
             Self::InvalidTarget { rules_path, source } => source.safe_diagnostic(rules_path),

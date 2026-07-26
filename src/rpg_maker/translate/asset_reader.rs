@@ -1478,15 +1478,7 @@ fn validate_role(
     role: &TextUnitRole,
     kind: TextGroupKind,
 ) -> Result<(), InvalidStandardTranslationAssetSnapshot> {
-    let valid = match role {
-        TextUnitRole::DialogueSpeaker | TextUnitRole::DialogueBody => {
-            kind == TextGroupKind::EventDialogue
-        }
-        TextUnitRole::Choices => kind == TextGroupKind::EventChoices,
-        TextUnitRole::ScrollingText => kind == TextGroupKind::EventScrollingText,
-        TextUnitRole::Scalar(_) => true,
-    };
-    if valid {
+    if role.matches_kind(kind) {
         Ok(())
     } else {
         Err(

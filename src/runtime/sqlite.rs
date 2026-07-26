@@ -2603,8 +2603,12 @@ fn process_interactive_command(
                     .and_then(|()| run_transaction_on_connection(connection, &plan, performance))
             };
             match &result {
+                // RequirementFailedWithRow 与 RequirementFailed 同为“整个事务已确认
+                // 回滚”的确定终态(见 storage 契约与 rollback_requirement_failure_with_row),
+                // 携带诊断行不改变回滚事实,会话保持可用。
                 Ok(())
                 | Err(ExecuteTransactionError::RequirementFailed)
+                | Err(ExecuteTransactionError::RequirementFailedWithRow { .. })
                 | Err(ExecuteTransactionError::NotCommitted(_))
                     if connection.is_autocommit() =>
                 {
@@ -6437,6 +6441,24 @@ mod tests {
         assert!(matches!(
             rejected,
             Err(ExecuteTransactionError::RequirementFailed)
+        ));
+
+        // 带诊断行的条件失败同为“已确认回滚”终态,不得把会话毒化为结果未知。
+        let rejected_with_row = operations
+            .execute_transaction(SqliteTransactionPlan::new(vec![
+                SqliteTransactionStep::Execute(SqliteCommand::new(
+                    "INSERT INTO run_state (value) VALUES (?1)",
+                    vec![SqliteValue::Integer(3)],
+                )),
+                SqliteTransactionStep::RequireNoRowsReturningFirstRow(SqliteQuery::new(
+                    "SELECT 41, 'diagnostic'",
+                    Vec::new(),
+                )),
+            ]))
+            .await;
+        assert!(matches!(
+            rejected_with_row,
+            Err(ExecuteTransactionError::RequirementFailedWithRow { .. })
         ));
 
         operations

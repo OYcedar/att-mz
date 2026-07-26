@@ -222,7 +222,7 @@ impl StandardWriteBackGroup {
             });
         }
         for unit in &units {
-            if !role_matches_kind(kind, &unit.role) {
+            if !unit.role.matches_kind(kind) {
                 return Err(StandardWriteBackSnapshotError::InvalidRole {
                     kind,
                     role: unit.role.clone(),
@@ -663,19 +663,6 @@ impl StandardWriteBackSnapshot {
     }
 }
 
-fn role_matches_kind(kind: TextGroupKind, role: &TextUnitRole) -> bool {
-    match kind {
-        TextGroupKind::EventDialogue => matches!(
-            role,
-            TextUnitRole::DialogueSpeaker | TextUnitRole::DialogueBody
-        ),
-        TextGroupKind::EventScrollingText => {
-            matches!(role, TextUnitRole::ScrollingText)
-        }
-        TextGroupKind::EventChoices => matches!(role, TextUnitRole::Choices),
-        _ => matches!(role, TextUnitRole::Scalar(_)),
-    }
-}
 
 /// Reader 交回受信快照前必须排除的数据损坏。
 #[derive(Clone, Debug, Eq, PartialEq)]

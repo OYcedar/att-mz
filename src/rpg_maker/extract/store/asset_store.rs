@@ -16,7 +16,6 @@ use crate::diagnostic::{
     SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
-use crate::fingerprint::Sha256FramedHasher;
 use crate::rpg_maker::dialogue::{MvDialogueDefinition, MvDialogueDefinitionError};
 use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
@@ -37,7 +36,9 @@ use crate::rpg_maker::project_database::{
     DROP_STANDARD_MUTATION_CLAIM_OWNER_RESOURCE_INDEX, DROP_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
     MV_DIALOGUE_RULES_DEFINITION_KIND,
 };
-use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
+use crate::rpg_maker::standard_asset::{
+    RpgMakerStandardAssetOwner, StandardTextSnapshotFingerprintBuilder,
+};
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::sqlite::{
     ExecuteTransactionError, QueryExistingDatabaseError, SqliteBatch, SqliteCommand, SqliteQuery,
@@ -2071,42 +2072,33 @@ fn asset_snapshot_fingerprint(
     units: &[EncodedUnit],
     claims: &[EncodedClaim],
 ) -> AssetSnapshotFingerprint {
-    let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.standard_text_snapshot");
-    hasher.frame(1, owner.storage_name().as_bytes());
-    if let Some(project_definition_json) = project_definition_json {
-        hasher
-            .frame(14, b"project_definition")
-            .frame(15, project_definition_json.as_bytes());
-    }
+    let mut builder =
+        StandardTextSnapshotFingerprintBuilder::new(owner, project_definition_json);
     for group in groups {
-        let group_order =
-            u64::try_from(group.group_order).expect("内存中的 group_order 必须可编码为 u64");
-        hasher
-            .frame(2, b"group")
-            .frame(3, group.group_location.as_bytes())
-            .frame(16, &group_order.to_le_bytes())
-            .frame(4, group.group_kind.as_bytes())
-            .frame(5, group.projection_recipe_json.as_bytes());
+        builder.group(
+            &group.group_location,
+            group.group_order,
+            group.group_kind,
+            &group.projection_recipe_json,
+        );
     }
     for unit in units {
-        let unit_order =
-            u64::try_from(unit.unit_order).expect("内存中的 unit_order 必须可编码为 u64");
-        hasher
-            .frame(6, b"unit")
-            .frame(7, unit.group_location.as_bytes())
-            .frame(8, unit.unit_role.as_bytes())
-            .frame(17, &unit_order.to_le_bytes())
-            .frame(9, unit.source_content_json.as_bytes())
-            .frame(10, unit.source_context_json.as_bytes());
+        builder.unit(
+            &unit.group_location,
+            &unit.unit_role,
+            unit.unit_order,
+            &unit.source_content_json,
+            &unit.source_context_json,
+        );
     }
     for claim in claims {
-        hasher
-            .frame(11, b"claim")
-            .frame(12, claim.resource_key.as_bytes())
-            .frame(18, claim.access.storage_name().as_bytes())
-            .frame(13, claim.group_location.as_bytes());
+        builder.claim(
+            &claim.resource_key,
+            claim.access.storage_name(),
+            &claim.group_location,
+        );
     }
-    AssetSnapshotFingerprint::from_bytes(hasher.finish().into_bytes())
+    AssetSnapshotFingerprint::from_bytes(builder.finish().into_bytes())
 }
 
 fn build_transaction_plan(
@@ -4819,11 +4811,10 @@ mod tests {
         assert_eq!(sample.claims[0].group_location, sample_location);
 
         let owner = RpgMakerStandardAssetOwner::Builtin;
-        let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.standard_text_snapshot");
-        hasher
-            .frame(1, owner.storage_name().as_bytes())
-            .frame(14, b"project_definition")
-            .frame(15, LARGE_GROUP_UNIT_DIALOGUE_DEFINITION_JSON.as_bytes());
+        let mut fingerprint_builder = StandardTextSnapshotFingerprintBuilder::new(
+            owner,
+            Some(LARGE_GROUP_UNIT_DIALOGUE_DEFINITION_JSON),
+        );
 
         let transaction = connection
             .transaction()
@@ -4844,14 +4835,7 @@ mod tests {
                 let recipe = large_data_root_recipe(&location);
                 let persisted_order =
                     i64::try_from(group_order).expect("大 Group 自然顺序应可编码为 i64");
-                let fingerprint_order =
-                    u64::try_from(group_order).expect("大 Group 自然顺序应可编码为 u64");
-                hasher
-                    .frame(2, b"group")
-                    .frame(3, location.as_bytes())
-                    .frame(16, &fingerprint_order.to_le_bytes())
-                    .frame(4, b"database_entry")
-                    .frame(5, recipe.as_bytes());
+                fingerprint_builder.group(&location, group_order, "database_entry", &recipe);
                 statement
                     .execute(rusqlite::params![
                         owner.storage_name(),
@@ -4872,13 +4856,13 @@ mod tests {
                 .expect("大 Unit 写入语句应准备一次");
             for ordinal in 1..=total {
                 let location = large_data_root_location(ordinal);
-                hasher
-                    .frame(6, b"unit")
-                    .frame(7, location.as_bytes())
-                    .frame(8, LARGE_GROUP_UNIT_ROLE_JSON.as_bytes())
-                    .frame(17, &0_u64.to_le_bytes())
-                    .frame(9, LARGE_GROUP_UNIT_SOURCE_CONTENT_JSON.as_bytes())
-                    .frame(10, LARGE_GROUP_UNIT_SOURCE_CONTEXT_JSON.as_bytes());
+                fingerprint_builder.unit(
+                    &location,
+                    LARGE_GROUP_UNIT_ROLE_JSON,
+                    0,
+                    LARGE_GROUP_UNIT_SOURCE_CONTENT_JSON,
+                    LARGE_GROUP_UNIT_SOURCE_CONTEXT_JSON,
+                );
                 statement
                     .execute(rusqlite::params![
                         owner.storage_name(),
@@ -4898,11 +4882,7 @@ mod tests {
                 .expect("大 Claim 写入语句应准备一次");
             for ordinal in 1..=total {
                 let location = large_data_root_location(ordinal);
-                hasher
-                    .frame(11, b"claim")
-                    .frame(12, location.as_bytes())
-                    .frame(18, b"exclusive")
-                    .frame(13, location.as_bytes());
+                fingerprint_builder.claim(&location, "exclusive", &location);
                 statement
                     .execute(rusqlite::params![
                         owner.storage_name(),
@@ -4913,7 +4893,8 @@ mod tests {
             }
         }
 
-        let fingerprint = AssetSnapshotFingerprint::from_bytes(hasher.finish().into_bytes());
+        let fingerprint =
+            AssetSnapshotFingerprint::from_bytes(fingerprint_builder.finish().into_bytes());
         transaction
             .execute(
                 "UPDATE standard_asset_owner_state SET asset_snapshot_fingerprint = ?1 WHERE owner = ?2",

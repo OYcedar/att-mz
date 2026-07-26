@@ -11,7 +11,6 @@ use crate::diagnostic::{
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
-use crate::fingerprint::Sha256FramedHasher;
 use crate::rpg_maker::dialogue::MvDialogueDefinitionError;
 use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
@@ -28,7 +27,9 @@ use crate::rpg_maker::mutation_claim_summary::{
 };
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{AssetSnapshotFingerprint, SourceSnapshotFingerprint};
-use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
+use crate::rpg_maker::standard_asset::{
+    RpgMakerStandardAssetOwner, StandardTextSnapshotFingerprintBuilder,
+};
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
@@ -1290,30 +1291,28 @@ struct GroupBuilder {
     units: Vec<StandardWriteBackUnit>,
 }
 
+/// 校验侧对 `standard_asset` 唯一 framing 定义的薄包装。
+///
+/// project_definition 帧只属于 Builtin owner:该 owner 的对话定义是快照语义的一
+/// 部分,Rules/Lua 快照不携带项目定义。这一 owner 判断与写入侧"提供即掺入"的
+/// 调用约定共同构成同一事实,framing 本身由 `StandardTextSnapshotFingerprintBuilder`
+/// 唯一拥有。
 struct SnapshotFingerprintAccumulator {
-    hasher: Sha256FramedHasher,
+    builder: StandardTextSnapshotFingerprintBuilder,
 }
 
 impl SnapshotFingerprintAccumulator {
     fn new(owner: RpgMakerStandardAssetOwner, dialogue_definition_json: &str) -> Self {
-        let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.standard_text_snapshot");
-        hasher.frame(1, owner.storage_name().as_bytes());
-        if owner == RpgMakerStandardAssetOwner::Builtin {
-            hasher
-                .frame(14, b"project_definition")
-                .frame(15, dialogue_definition_json.as_bytes());
+        let project_definition_json = (owner == RpgMakerStandardAssetOwner::Builtin)
+            .then_some(dialogue_definition_json);
+        Self {
+            builder: StandardTextSnapshotFingerprintBuilder::new(owner, project_definition_json),
         }
-        Self { hasher }
     }
 
     fn group(&mut self, group_location: &str, group_order: usize, group_kind: &str, recipes: &str) {
-        let group_order = u64::try_from(group_order).expect("group_order 必须可编码为 u64");
-        self.hasher
-            .frame(2, b"group")
-            .frame(3, group_location.as_bytes())
-            .frame(16, &group_order.to_le_bytes())
-            .frame(4, group_kind.as_bytes())
-            .frame(5, recipes.as_bytes());
+        self.builder
+            .group(group_location, group_order, group_kind, recipes);
     }
 
     fn unit(
@@ -1324,26 +1323,16 @@ impl SnapshotFingerprintAccumulator {
         source: &str,
         context: &str,
     ) {
-        let unit_order = u64::try_from(unit_order).expect("unit_order 必须可编码为 u64");
-        self.hasher
-            .frame(6, b"unit")
-            .frame(7, group_location.as_bytes())
-            .frame(8, role.as_bytes())
-            .frame(17, &unit_order.to_le_bytes())
-            .frame(9, source.as_bytes())
-            .frame(10, context.as_bytes());
+        self.builder
+            .unit(group_location, role, unit_order, source, context);
     }
 
     fn claim(&mut self, resource_key: &str, access: &str, group_location: &str) {
-        self.hasher
-            .frame(11, b"claim")
-            .frame(12, resource_key.as_bytes())
-            .frame(18, access.as_bytes())
-            .frame(13, group_location.as_bytes());
+        self.builder.claim(resource_key, access, group_location);
     }
 
     fn finish(self) -> AssetSnapshotFingerprint {
-        AssetSnapshotFingerprint::from_bytes(self.hasher.finish().into_bytes())
+        AssetSnapshotFingerprint::from_bytes(self.builder.finish().into_bytes())
     }
 }
 

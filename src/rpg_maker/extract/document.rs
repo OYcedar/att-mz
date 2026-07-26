@@ -815,29 +815,38 @@ where
     CpuTaskExecutionError<C>: SafeDiagnosticSource,
 {
     /// 在仍持有文档路径、解析位置和具体根错误时建立公开投影。
-    pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
+    ///
+    /// 共享文档读取器同时服务 Extract(Builtin/Rules)与 WriteBack;责任 code 与
+    /// 阶段属于调用域,由调用方传入,本类型不得替调用方猜测阶段。
+    pub(crate) fn safe_diagnostic_at(
+        &self,
+        code: DiagnosticCode,
+        stage: DiagnosticStage,
+    ) -> SafeDiagnostic {
         match self {
-            Self::ListData(source) | Self::ListJs(source) => list_directory_diagnostic(source),
+            Self::ListData(source) | Self::ListJs(source) => {
+                list_directory_diagnostic(source, code, stage)
+            }
             Self::FileNameCaseMismatch(source) => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackDocumentRead,
-                DiagnosticStage::WriteBack,
+                code,
+                stage,
                 DiagnosticSubject::path(source.requested()),
                 DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::FixInput,
             )
             .with_recovery(RecoveryFact::path(source.actual())),
-            Self::ReadDocument { source, .. } => read_document_diagnostic(source),
+            Self::ReadDocument { source, .. } => read_document_diagnostic(source, code, stage),
             Self::ScheduleParse { path, source } => source
                 .safe_diagnostic_source(
-                    DiagnosticStage::WriteBack,
+                    stage,
                     DiagnosticImpact::Unchanged,
                     DiagnosticAction::Retry,
                 )
                 .with_recovery(RecoveryFact::path(path)),
             Self::InvalidUtf8 { path, source } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackDocumentRead,
-                DiagnosticStage::WriteBack,
+                code,
+                stage,
                 DiagnosticSubject::path(path),
                 DiagnosticReason::InvalidUtf8 {
                     valid_up_to: u64::try_from(source.valid_up_to()).unwrap_or(u64::MAX),
@@ -849,10 +858,10 @@ where
                 DiagnosticAction::FixInput,
             ),
             Self::InvalidJson { path, source } => SafeDiagnostic::new(
-                DiagnosticCode::WriteBackDocumentRead,
-                DiagnosticStage::WriteBack,
+                code,
+                stage,
                 DiagnosticSubject::path(path),
-                DiagnosticReason::failure(DiagnosticFailureKind::WriteBackDocumentInvalid),
+                DiagnosticReason::failure(DiagnosticFailureKind::SourceDocumentInvalid),
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::FixInput,
             )
@@ -861,9 +870,11 @@ where
                 source.line(),
                 source.column()
             ))),
-            Self::InvalidPluginsEnvelope { path } => write_back_document_invalid(path, None),
+            Self::InvalidPluginsEnvelope { path } => {
+                source_document_invalid(path, None, code, stage)
+            }
             Self::InvalidPluginRecord { path, index } => {
-                write_back_document_invalid(path, Some(*index))
+                source_document_invalid(path, Some(*index), code, stage)
             }
         }
     }
@@ -875,32 +886,42 @@ where
     L: SafeDiagnosticSource,
     CpuTaskExecutionError<C>: SafeDiagnosticSource,
 {
+    /// 共享文档读取器只有 Extract 与 WriteBack 两个真实调用域;调用方传入的
+    /// stage 决定责任 code,本类型不再替调用方把一切失败归到 WriteBack。
     fn safe_diagnostic_source(
         &self,
-        _stage: DiagnosticStage,
+        stage: DiagnosticStage,
         _impact: DiagnosticImpact,
         _fallback_action: DiagnosticAction,
     ) -> SafeDiagnostic {
-        self.safe_diagnostic()
+        let code = match stage {
+            DiagnosticStage::WriteBack => DiagnosticCode::WriteBackDocumentRead,
+            _ => DiagnosticCode::ExtractDocumentRead,
+        };
+        self.safe_diagnostic_at(code, stage)
     }
 }
 
-fn list_directory_diagnostic<E>(source: &ListDirectoryError<E>) -> SafeDiagnostic
+fn list_directory_diagnostic<E>(
+    source: &ListDirectoryError<E>,
+    code: DiagnosticCode,
+    stage: DiagnosticStage,
+) -> SafeDiagnostic
 where
     E: SafeDiagnosticSource,
 {
     match source {
         ListDirectoryError::NotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::WriteBackDocumentRead,
-            DiagnosticStage::WriteBack,
+            code,
+            stage,
             DiagnosticSubject::path(path),
             DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
             DiagnosticImpact::Unchanged,
             DiagnosticAction::FixInput,
         ),
         ListDirectoryError::NotDirectory { path } => SafeDiagnostic::new(
-            DiagnosticCode::WriteBackDocumentRead,
-            DiagnosticStage::WriteBack,
+            code,
+            stage,
             DiagnosticSubject::path(path),
             DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
             DiagnosticImpact::Unchanged,
@@ -908,7 +929,7 @@ where
         ),
         ListDirectoryError::Io { path, source } => source
             .safe_diagnostic_source(
-                DiagnosticStage::WriteBack,
+                stage,
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::CheckPathAndPermissions,
             )
@@ -916,22 +937,26 @@ where
     }
 }
 
-fn read_document_diagnostic<E>(source: &ReadFileError<E>) -> SafeDiagnostic
+fn read_document_diagnostic<E>(
+    source: &ReadFileError<E>,
+    code: DiagnosticCode,
+    stage: DiagnosticStage,
+) -> SafeDiagnostic
 where
     E: SafeDiagnosticSource,
 {
     match source {
         ReadFileError::NotFound { path } => SafeDiagnostic::new(
-            DiagnosticCode::WriteBackDocumentRead,
-            DiagnosticStage::WriteBack,
+            code,
+            stage,
             DiagnosticSubject::path(path),
             DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
             DiagnosticImpact::Unchanged,
             DiagnosticAction::FixInput,
         ),
         ReadFileError::NotFile { path } => SafeDiagnostic::new(
-            DiagnosticCode::WriteBackDocumentRead,
-            DiagnosticStage::WriteBack,
+            code,
+            stage,
             DiagnosticSubject::path(path),
             DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
             DiagnosticImpact::Unchanged,
@@ -939,7 +964,7 @@ where
         ),
         ReadFileError::Io { path, source } => source
             .safe_diagnostic_source(
-                DiagnosticStage::WriteBack,
+                stage,
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::CheckPathAndPermissions,
             )
@@ -947,12 +972,17 @@ where
     }
 }
 
-fn write_back_document_invalid(path: &Path, plugin_index: Option<usize>) -> SafeDiagnostic {
+fn source_document_invalid(
+    path: &Path,
+    plugin_index: Option<usize>,
+    code: DiagnosticCode,
+    stage: DiagnosticStage,
+) -> SafeDiagnostic {
     let diagnostic = SafeDiagnostic::new(
-        DiagnosticCode::WriteBackDocumentRead,
-        DiagnosticStage::WriteBack,
+        code,
+        stage,
         DiagnosticSubject::path(path),
-        DiagnosticReason::failure(DiagnosticFailureKind::WriteBackDocumentInvalid),
+        DiagnosticReason::failure(DiagnosticFailureKind::SourceDocumentInvalid),
         DiagnosticImpact::Unchanged,
         DiagnosticAction::FixInput,
     );
@@ -1548,6 +1578,43 @@ var $plugins =
             RpgMakerProjectDocumentReadingError::InvalidPluginRecord { path, index: 0 }
                 if path == plugins
         ));
+    }
+
+    // 测试需要一个真实的 Utf8Error 值；字面量非法正是本函数的目的。
+    #[allow(invalid_from_utf8)]
+    fn invalid_utf8_error() -> Utf8Error {
+        let bytes = [0xffu8];
+        std::str::from_utf8(&bytes).expect_err("单字节 0xff 不是合法 UTF-8")
+    }
+
+    #[test]
+    fn document_read_diagnostics_carry_the_calling_stage_not_a_hardcoded_write_back() {
+        // 共享读取器同时服务 Extract 与 WriteBack;失败的责任 code 与阶段
+        // 必须来自真实调用域,不得把 Extract 失败标成 write_back。
+        let error: RpgMakerProjectDocumentReadingError<
+            crate::runtime::filesystem::SystemFileSystemError,
+            crate::runtime::filesystem::SystemFileSystemError,
+            crate::runtime::cpu::CpuExecutorUnavailable,
+        > = RpgMakerProjectDocumentReadingError::InvalidUtf8 {
+            path: PathBuf::from(r"C:\games\demo\data\Actors.json"),
+            source: invalid_utf8_error(),
+        };
+
+        let extract = error.safe_diagnostic_source(
+            DiagnosticStage::Extract,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::CheckProjectState,
+        );
+        assert_eq!(extract.code, DiagnosticCode::ExtractDocumentRead);
+        assert_eq!(extract.stage, DiagnosticStage::Extract);
+
+        let write_back = error.safe_diagnostic_source(
+            DiagnosticStage::WriteBack,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::FixInput,
+        );
+        assert_eq!(write_back.code, DiagnosticCode::WriteBackDocumentRead);
+        assert_eq!(write_back.stage, DiagnosticStage::WriteBack);
     }
 
     #[tokio::test]

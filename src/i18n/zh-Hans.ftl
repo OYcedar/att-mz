@@ -273,7 +273,7 @@ diagnostic-failure-value = { $code ->
     [rules_snapshot_store_failed] 无法提交已验证的 Rules 提取快照
     [write_back_extraction_out_of_date] 已提取资产不再匹配当前项目来源
     [write_back_asset_snapshot_invalid] 已保存的 Standard 资产无法组成有效写回快照
-    [write_back_document_invalid] RPG Maker 来源文档不符合所需文档格式
+    [source_document_invalid] RPG Maker 来源文档不符合所需文档格式
     [write_back_mutation_invalid] 已验证的译文修改无法应用到冻结来源位置
     [write_back_output_path_invalid] 改写文件位于允许的 RPG Maker 输出树之外
     [write_back_output_path_duplicate] 多个改写文件指向同一输出路径

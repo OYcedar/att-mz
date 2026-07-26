@@ -2701,7 +2701,7 @@ impl RpgMakerWriteBackDocumentRewriteFailure {
                 DiagnosticStage::WriteBack,
                 DiagnosticSubject::path(path),
                 DiagnosticReason::failure_with_detail(
-                    DiagnosticFailureKind::WriteBackDocumentInvalid,
+                    DiagnosticFailureKind::SourceDocumentInvalid,
                     format!(
                         "rewrite_error=serialize_document; {}",
                         source.safe_diagnostic_detail()

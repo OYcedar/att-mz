@@ -1562,7 +1562,9 @@ fn fixture_group(
 }
 
 fn fixture_asset_fingerprint(owner: &str, groups: &[FixtureGroup]) -> [u8; 32] {
-    use crate::fingerprint::Sha256FramedHasher;
+    use crate::rpg_maker::standard_asset::{
+        RpgMakerStandardAssetOwner, StandardTextSnapshotFingerprintBuilder,
+    };
 
     let mut owner_groups = groups
         .iter()
@@ -1582,40 +1584,32 @@ fn fixture_asset_fingerprint(owner: &str, groups: &[FixtureGroup]) -> [u8; 32] {
         .collect::<Vec<_>>();
     claims.sort();
 
-    let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.standard_text_snapshot");
-    hasher.frame(1, owner.as_bytes());
-    if owner == "builtin" {
-        hasher
-            .frame(14, b"project_definition")
-            .frame(15, DIALOGUE_DEFINITION_JSON.as_bytes());
-    }
+    let owner = RpgMakerStandardAssetOwner::from_storage_name(owner)
+        .expect("测试夹具 owner 应为合法 storage 名称");
+    let project_definition = (owner == RpgMakerStandardAssetOwner::Builtin)
+        .then_some(DIALOGUE_DEFINITION_JSON);
+    let mut builder = StandardTextSnapshotFingerprintBuilder::new(owner, project_definition);
     for group in owner_groups {
-        let group_order = u64::try_from(group.group_order).expect("测试顺序应可编码");
-        hasher
-            .frame(2, b"group")
-            .frame(3, group.group_location.as_bytes())
-            .frame(16, &group_order.to_le_bytes())
-            .frame(4, group.kind.as_bytes())
-            .frame(5, group.recipes.as_bytes());
+        builder.group(
+            &group.group_location,
+            group.group_order,
+            group.kind,
+            &group.recipes,
+        );
     }
     for unit in units {
-        let unit_order = 0_u64;
-        hasher
-            .frame(6, b"unit")
-            .frame(7, unit.group_location.as_bytes())
-            .frame(8, unit.role.as_bytes())
-            .frame(17, &unit_order.to_le_bytes())
-            .frame(9, unit.source_content_json.as_bytes())
-            .frame(10, b"{}");
+        builder.unit(
+            &unit.group_location,
+            &unit.role,
+            0,
+            &unit.source_content_json,
+            "{}",
+        );
     }
     for (resource, access, group_location) in claims {
-        hasher
-            .frame(11, b"claim")
-            .frame(12, resource.as_bytes())
-            .frame(18, access.as_bytes())
-            .frame(13, group_location.as_bytes());
+        builder.claim(resource, access, group_location);
     }
-    hasher.finish().into_bytes()
+    builder.finish().into_bytes()
 }
 
 const fn fixture_group_kind(kind: TextGroupKind) -> &'static str {

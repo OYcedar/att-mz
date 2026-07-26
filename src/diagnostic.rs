@@ -60,6 +60,8 @@ pub(crate) enum DiagnosticCode {
     ExtractBuiltin,
     #[serde(rename = "extract.rules")]
     ExtractRules,
+    #[serde(rename = "extract.document_read")]
+    ExtractDocumentRead,
     #[serde(rename = "lua.execution")]
     LuaExecution,
     #[serde(rename = "lua.snapshot_store")]
@@ -139,6 +141,7 @@ impl DiagnosticCode {
             Self::ModelRequest => "model.request",
             Self::ExtractBuiltin => "extract.builtin",
             Self::ExtractRules => "extract.rules",
+            Self::ExtractDocumentRead => "extract.document_read",
             Self::LuaExecution => "lua.execution",
             Self::LuaSnapshotStore => "lua.snapshot_store",
             Self::WriteBackAssetRead => "write_back.asset_read",
@@ -597,7 +600,7 @@ pub(crate) enum DiagnosticFailureKind {
     RulesSnapshotStoreFailed,
     WriteBackExtractionOutOfDate,
     WriteBackAssetSnapshotInvalid,
-    WriteBackDocumentInvalid,
+    SourceDocumentInvalid,
     WriteBackMutationInvalid,
     WriteBackOutputPathInvalid,
     WriteBackOutputPathDuplicate,
@@ -675,7 +678,7 @@ impl DiagnosticFailureKind {
             Self::RulesSnapshotStoreFailed => "rules_snapshot_store_failed",
             Self::WriteBackExtractionOutOfDate => "write_back_extraction_out_of_date",
             Self::WriteBackAssetSnapshotInvalid => "write_back_asset_snapshot_invalid",
-            Self::WriteBackDocumentInvalid => "write_back_document_invalid",
+            Self::SourceDocumentInvalid => "source_document_invalid",
             Self::WriteBackMutationInvalid => "write_back_mutation_invalid",
             Self::WriteBackOutputPathInvalid => "write_back_output_path_invalid",
             Self::WriteBackOutputPathDuplicate => "write_back_output_path_duplicate",
@@ -795,7 +798,7 @@ impl DiagnosticFailureKind {
             Self::WriteBackAssetSnapshotInvalid => {
                 "the stored Standard assets do not form a valid write-back snapshot"
             }
-            Self::WriteBackDocumentInvalid => {
+            Self::SourceDocumentInvalid => {
                 "an RPG Maker source document does not satisfy the required document format"
             }
             Self::WriteBackMutationInvalid => {
