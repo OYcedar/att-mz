@@ -4189,15 +4189,18 @@ fn assert_project_logs_do_not_contain(log_root: &Path, needle: &str, label: &str
 }
 
 fn assert_last_write_back_log(log_root: &Path, lua_executed: bool) {
+    // Init 更新重建保留既有 logs/,项目日志跨多次运行累积;文件名是无序 UUID,
+    // “最后一次”按记录时间戳选取。
     let (_, records) = read_project_logs(log_root);
     let plan = records
         .iter()
-        .find(|record| {
+        .filter(|record| {
             record["command"] == "write-back"
                 && record["code"] == "run_plan.resolved"
                 && record["payload"]["kind"] == "run_plan"
                 && record["payload"]["lua_enabled"] == lua_executed
         })
+        .max_by_key(|record| record["time"].as_str().map(str::to_owned))
         .expect("WriteBack 发布运行应记录准确的 Lua 方案来源");
     let run_id = &plan["run_id"];
     let publication = records

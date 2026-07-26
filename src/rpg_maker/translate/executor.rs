@@ -2916,11 +2916,10 @@ fn normalize_original_controls_in_lines(
     let mut changed = false;
     for (original, bindings) in originals {
         if bindings.len() != 1 {
-            if lines.iter().any(|line| line.contains(original))
-                && bindings
-                    .iter()
-                    .any(|&binding_index| token_counts[placeholders[binding_index].token()] == 0)
-            {
+            // 同一 original 对应多个 token 时任何字面出现都无法唯一归位：
+            // 无论对应 token 是缺失还是全部在场(多抄了一份原始片段)，都属于
+            // 无法无歧义恢复的混排，与单绑定分支的拒绝语义一致。
+            if lines.iter().any(|line| line.contains(original)) {
                 return Err(
                     TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
                         original: original.to_owned(),

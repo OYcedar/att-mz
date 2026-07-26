@@ -294,42 +294,60 @@ impl ApiKeyRedactor {
         self.redact_json_string_tokens(value, false)
     }
 
-    /// 按 URL query 的解码后 key/value 内容替换 API key，并逐字保留其余 endpoint。
+    /// 替换整个 endpoint 中出现的 API key 实际值，逐字保留其余内容。
+    ///
+    /// URL 的原始分隔符(RFC 3986 gen/sub-delims)是结构而非内容:path 与
+    /// fragment 按分隔符切段后只在段内容(percent-decode 后)中匹配;query 的
+    /// key/value 按既有 `+`→空格 语义逐 pair 匹配。部分代理网关把 key 编入
+    /// path,闭集替换不允许该位置成为漏洞。
     pub(crate) fn redact_url(&self, value: &str) -> String {
         let api_key = self.api_key.expose_secret();
         if api_key.is_empty() {
             return value.to_owned();
         }
-        let query_end = value.find('#').unwrap_or(value.len());
-        let Some(query_delimiter) = value[..query_end].find('?') else {
-            return value.to_owned();
-        };
-        let query_start = query_delimiter + 1;
-        let mut replacements = Vec::new();
-        let mut pair_start = query_start;
-        while pair_start <= query_end {
-            let pair_end = value[pair_start..query_end]
-                .find('&')
-                .map_or(query_end, |delimiter| pair_start + delimiter);
-            let value_delimiter = value[pair_start..pair_end]
-                .find('=')
-                .map(|delimiter| pair_start + delimiter);
-            let key_end = value_delimiter.unwrap_or(pair_end);
-            replacements.extend(
-                decode_query_component(value, pair_start, key_end).api_key_source_ranges(api_key),
-            );
-            if let Some(value_delimiter) = value_delimiter {
+        let fragment_delimiter = value.find('#');
+        let query_end = fragment_delimiter.unwrap_or(value.len());
+        let query_delimiter = value[..query_end].find('?');
+        let path_end = query_delimiter.unwrap_or(query_end);
+
+        let mut replacements = scan_delimited_url_region(value, 0, path_end, api_key);
+        if let Some(fragment_delimiter) = fragment_delimiter {
+            replacements.extend(scan_delimited_url_region(
+                value,
+                fragment_delimiter + 1,
+                value.len(),
+                api_key,
+            ));
+        }
+        if let Some(query_delimiter) = query_delimiter {
+            let query_start = query_delimiter + 1;
+            let mut pair_start = query_start;
+            while pair_start <= query_end {
+                let pair_end = value[pair_start..query_end]
+                    .find('&')
+                    .map_or(query_end, |delimiter| pair_start + delimiter);
+                let value_delimiter = value[pair_start..pair_end]
+                    .find('=')
+                    .map(|delimiter| pair_start + delimiter);
+                let key_end = value_delimiter.unwrap_or(pair_end);
                 replacements.extend(
-                    decode_query_component(value, value_delimiter + 1, pair_end)
+                    decode_url_component(value, pair_start, key_end, true)
                         .api_key_source_ranges(api_key),
                 );
+                if let Some(value_delimiter) = value_delimiter {
+                    replacements.extend(
+                        decode_url_component(value, value_delimiter + 1, pair_end, true)
+                            .api_key_source_ranges(api_key),
+                    );
+                }
+                if pair_end == query_end {
+                    break;
+                }
+                pair_start = pair_end + 1;
             }
-            if pair_end == query_end {
-                break;
-            }
-            pair_start = pair_end + 1;
         }
 
+        replacements.sort_by_key(|source| (source.start, source.end));
         let mut output = String::with_capacity(value.len());
         let mut copied_until = 0usize;
         for source in replacements {
@@ -488,13 +506,49 @@ impl DecodedQueryComponent {
     }
 }
 
-fn decode_query_component(value: &str, start: usize, end: usize) -> DecodedQueryComponent {
+/// 在 path 或 fragment 区间内按原始分隔符切段并对段内容做解码感知匹配。
+///
+/// 原始 `/`、`;`、`,`、`:`、`@` 是结构分隔符,只有 percent-encoded 形式才属于
+/// 段内容;因此含分隔符字符的 key 不会与结构本身误匹配。
+fn scan_delimited_url_region(
+    value: &str,
+    start: usize,
+    end: usize,
+    api_key: &str,
+) -> Vec<DecodedSourceRange> {
+    let bytes = value.as_bytes();
+    let mut replacements = Vec::new();
+    let mut segment_start = start;
+    let mut index = start;
+    while index <= end {
+        let at_delimiter =
+            index < end && matches!(bytes[index], b'/' | b';' | b',' | b':' | b'@');
+        if index == end || at_delimiter {
+            if segment_start < index {
+                replacements.extend(
+                    decode_url_component(value, segment_start, index, false)
+                        .api_key_source_ranges(api_key),
+                );
+            }
+            segment_start = index + 1;
+        }
+        index += 1;
+    }
+    replacements
+}
+
+fn decode_url_component(
+    value: &str,
+    start: usize,
+    end: usize,
+    plus_is_space: bool,
+) -> DecodedQueryComponent {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(end - start);
     let mut source_by_decoded_byte = Vec::with_capacity(end - start);
     let mut index = start;
     while index < end {
-        if bytes[index] == b'+' {
+        if plus_is_space && bytes[index] == b'+' {
             decoded.push(b' ');
             source_by_decoded_byte.push(DecodedSourceRange {
                 start: index,
@@ -819,6 +873,51 @@ mod tests {
                 "query 语法字符 {api_key:?} 只能匹配 component 解码后的实际内容"
             );
         }
+    }
+
+    #[test]
+    fn url_redaction_covers_path_and_fragment_occurrences() {
+        // 部分代理网关把 API key 编入 path;闭集替换必须覆盖整个 endpoint,
+        // 不因 URL 没有 query 而早退。
+        const API_KEY: &str = "sk-proxy-key-123";
+        let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
+
+        assert_eq!(
+            redactor.redact_url(&format!(
+                "https://gateway.test/{API_KEY}/v1/chat/completions"
+            )),
+            format!(
+                "https://gateway.test/{}/v1/chat/completions",
+                ApiKeyRedactor::REPLACEMENT
+            ),
+        );
+        assert_eq!(
+            redactor.redact_url("https://gateway.test/sk%2Dproxy%2Dkey%2D123/v1"),
+            format!("https://gateway.test/{}/v1", ApiKeyRedactor::REPLACEMENT),
+        );
+        assert_eq!(
+            redactor.redact_url(&format!("https://gateway.test/v1#{API_KEY}")),
+            format!("https://gateway.test/v1#{}", ApiKeyRedactor::REPLACEMENT),
+        );
+        assert_eq!(
+            redactor.redact_url(&format!(
+                "https://gateway.test/{API_KEY}/v1?token={API_KEY}#{API_KEY}"
+            )),
+            format!(
+                "https://gateway.test/{0}/v1?token={0}#{0}",
+                ApiKeyRedactor::REPLACEMENT
+            ),
+        );
+        // path 分隔符是结构而非内容:含 '/' 的 key 不与结构误匹配,
+        // percent-encoded 形式才是段内容。
+        let slash_redactor = ApiKeyRedactor::new(SecretString::from("a/b"));
+        assert_eq!(
+            slash_redactor.redact_url("https://gateway.test/a/b/v1?x=a%2Fb"),
+            format!(
+                "https://gateway.test/a/b/v1?x={}",
+                ApiKeyRedactor::REPLACEMENT
+            ),
+        );
     }
 
     #[test]
