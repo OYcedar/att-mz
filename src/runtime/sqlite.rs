@@ -2466,7 +2466,7 @@ fn observe_operation<T>(
     transaction: &mut InteractiveTransactionState,
     lifecycle: &AtomicU8,
     before_autocommit: bool,
-    may_have_autocommit_side_effects: bool,
+    before_total_changes: u64,
     result: Result<T, SqliteRuntimeError>,
 ) -> Result<T, SqliteInteractiveSessionError<SqliteRuntimeError>> {
     let after_autocommit = connection.is_autocommit();
@@ -2481,7 +2481,9 @@ fn observe_operation<T>(
         }
         Err(source)
             if before_autocommit != after_autocommit
-                || (before_autocommit && after_autocommit && may_have_autocommit_side_effects) =>
+                || (before_autocommit
+                    && after_autocommit
+                    && connection.total_changes() != before_total_changes) =>
         {
             *transaction = InteractiveTransactionState::Indeterminate;
             lifecycle.store(SESSION_INDETERMINATE, Ordering::Release);
@@ -2536,16 +2538,15 @@ fn process_interactive_command(
     }
 
     let before_autocommit = connection.is_autocommit();
+    let before_total_changes = connection.total_changes();
     match command {
         InteractiveCommand::Query { query, response } => {
-            let (may_have_autocommit_side_effects, result) = match validate_query(&query, config) {
-                Err(source) => (false, Err(source)),
+            let result = match validate_query(&query, config) {
+                Err(source) => Err(source),
                 Ok(()) => match connection.prepare(query.statement()) {
-                    Err(source) => (false, Err(SqliteRuntimeError::driver("准备查询", source))),
+                    Err(source) => Err(SqliteRuntimeError::driver("准备查询", source)),
                     Ok(mut statement) => {
-                        let may_write = !statement.readonly();
-                        let result = read_prepared_query_rows(&mut statement, query.parameters());
-                        (may_write, result)
+                        read_prepared_query_rows(&mut statement, query.parameters())
                     }
                 },
             };
@@ -2554,41 +2555,31 @@ fn process_interactive_command(
                 transaction,
                 lifecycle,
                 before_autocommit,
-                may_have_autocommit_side_effects,
+                before_total_changes,
                 result,
             ));
         }
         InteractiveCommand::Execute { command, response } => {
-            let (may_have_autocommit_side_effects, result) =
-                match validate_command(&command, config) {
-                    Err(source) => (false, Err(source)),
-                    Ok(()) => match connection.prepare(command.statement()) {
-                        Err(source) => (
-                            false,
-                            Err(SqliteRuntimeError::driver("准备交互式命令", source)),
-                        ),
-                        Ok(mut statement) => {
-                            let may_write = !statement.readonly();
-                            let result = statement
-                                .execute(params_from_iter(command.parameters().iter()))
-                                .map_err(|source| {
-                                    SqliteRuntimeError::driver("执行交互式命令", source)
-                                })
-                                .and_then(|affected| {
-                                    u64::try_from(affected).map_err(|_| {
-                                        SqliteRuntimeError::Internal("受影响行数无法表示为 u64")
-                                    })
-                                });
-                            (may_write, result)
-                        }
-                    },
-                };
+            let result = match validate_command(&command, config) {
+                Err(source) => Err(source),
+                Ok(()) => match connection.prepare(command.statement()) {
+                    Err(source) => Err(SqliteRuntimeError::driver("准备交互式命令", source)),
+                    Ok(mut statement) => statement
+                        .execute(params_from_iter(command.parameters().iter()))
+                        .map_err(|source| SqliteRuntimeError::driver("执行交互式命令", source))
+                        .and_then(|affected| {
+                            u64::try_from(affected).map_err(|_| {
+                                SqliteRuntimeError::Internal("受影响行数无法表示为 u64")
+                            })
+                        }),
+                },
+            };
             let _ = response.send(observe_operation(
                 connection,
                 transaction,
                 lifecycle,
                 before_autocommit,
-                may_have_autocommit_side_effects,
+                before_total_changes,
                 result,
             ));
         }
@@ -2630,7 +2621,7 @@ fn process_interactive_command(
                     transaction,
                     lifecycle,
                     before_autocommit,
-                    false,
+                    before_total_changes,
                     execute_transaction_control(
                         connection,
                         performance,
@@ -2652,7 +2643,7 @@ fn process_interactive_command(
                     transaction,
                     lifecycle,
                     before_autocommit,
-                    false,
+                    before_total_changes,
                     execute_transaction_control(
                         connection,
                         performance,
@@ -2674,7 +2665,7 @@ fn process_interactive_command(
                     transaction,
                     lifecycle,
                     before_autocommit,
-                    false,
+                    before_total_changes,
                     execute_transaction_control(
                         connection,
                         performance,
@@ -5917,6 +5908,7 @@ mod tests {
         let lifecycle = AtomicU8::new(SESSION_OPEN);
         let mut transaction = InteractiveTransactionState::Idle;
         let before_autocommit = connection.is_autocommit();
+        let before_total_changes = connection.total_changes();
         connection
             .execute_batch("BEGIN DEFERRED")
             .expect("测试事务应可开始");
@@ -5926,7 +5918,7 @@ mod tests {
             &mut transaction,
             &lifecycle,
             before_autocommit,
-            false,
+            before_total_changes,
             Err(SqliteRuntimeError::Internal("测试不确定结果")),
         );
 
@@ -5953,6 +5945,51 @@ mod tests {
     }
 
     #[test]
+    fn failed_autocommit_write_without_changes_keeps_the_session_idle() {
+        let connection = Connection::open_in_memory().expect("内存数据库应可打开");
+        connection
+            .execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY); INSERT INTO items VALUES (1);",
+            )
+            .expect("测试表应可建立");
+        let lifecycle = AtomicU8::new(SESSION_OPEN);
+        let mut transaction = InteractiveTransactionState::Idle;
+        let before_autocommit = connection.is_autocommit();
+        let before_total_changes = connection.total_changes();
+        let result = connection
+            .execute("INSERT INTO items VALUES (1)", [])
+            .map(|_| ())
+            .map_err(|source| SqliteRuntimeError::driver("执行测试无变化写入", source));
+
+        let observed = observe_operation(
+            &connection,
+            &mut transaction,
+            &lifecycle,
+            before_autocommit,
+            before_total_changes,
+            result,
+        );
+
+        assert!(matches!(
+            observed,
+            Err(SqliteInteractiveSessionError::OperationFailed(
+                SqliteRuntimeError::Driver {
+                    operation: "执行测试无变化写入",
+                    ref source,
+                }
+            )) if source.sqlite_error_code() == Some(ErrorCode::ConstraintViolation)
+        ));
+        assert_eq!(
+            connection.total_changes(),
+            before_total_changes,
+            "失败语句没有修改任何行"
+        );
+        assert!(matches!(transaction, InteractiveTransactionState::Idle));
+        assert_eq!(lifecycle.load(Ordering::Acquire), SESSION_OPEN);
+        assert!(session_unavailable::<()>(&lifecycle).is_none());
+    }
+
+    #[test]
     fn failed_autocommit_write_with_partial_changes_is_outcome_unknown() {
         let connection = Connection::open_in_memory().expect("内存数据库应可打开");
         connection
@@ -5963,6 +6000,7 @@ mod tests {
         let lifecycle = AtomicU8::new(SESSION_OPEN);
         let mut transaction = InteractiveTransactionState::Idle;
         let before_autocommit = connection.is_autocommit();
+        let before_total_changes = connection.total_changes();
         let mut statement = connection
             .prepare("INSERT OR FAIL INTO items VALUES (2), (1), (3)")
             .expect("测试写语句应可准备");
@@ -5978,7 +6016,7 @@ mod tests {
             &mut transaction,
             &lifecycle,
             before_autocommit,
-            true,
+            before_total_changes,
             result,
         );
 
@@ -5986,6 +6024,11 @@ mod tests {
             observed,
             Err(SqliteInteractiveSessionError::OutcomeUnknown(_))
         ));
+        assert_ne!(
+            connection.total_changes(),
+            before_total_changes,
+            "OR FAIL 在失败前已经产生可观测修改"
+        );
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM items", [], |row| row.get::<_, i64>(0))

@@ -81,6 +81,13 @@ statements，避免每任务重新打开连接和重复执行相同 PRAGMA。
 Lua/SQL 正文和参数永不进入 CLI 或 JSONL；诊断仍必须公开 query ID、阶段、数据库路径、
 SQLite primary/extended code 和确认的事务终态。
 
+交互会话中的单条 `query` 或 `execute` 失败时，以操作前后的 `total_changes()` 与
+autocommit 状态判定终态。操作前后均处于 autocommit 且 `total_changes()` 没有变化，
+表示已确认没有写入副作用：返回原有具体操作失败，会话保持 `Idle` 并可继续使用。
+`total_changes()` 已变化或操作跨越 autocommit 边界时，才返回 `OutcomeUnknown` 并把
+会话置为 `Indeterminate`。这项终态判断不得覆盖 SQLite primary/extended code、操作
+名称或其他既有错误事实。
+
 ## 5. 项目数据库
 
 项目数据库不包含业务 revision/version 字段。有效性只由当前表结构、约束和领域不变量
