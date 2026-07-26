@@ -27,7 +27,8 @@ use crate::rpg_maker::text::MapId;
 
 use super::document::{
     DocumentReadProgress, RpgMakerDocumentId, RpgMakerDocumentSelection,
-    RpgMakerProjectDocumentReader, RpgMakerProjectDocuments, StandardDataFile,
+    RpgMakerProjectDocumentReader, RpgMakerProjectDocumentReadingDiagnostic,
+    RpgMakerProjectDocuments, StandardDataFile,
 };
 use super::model::{
     BuiltinSnapshot, ExtractedTextGroup, ExtractedTextUnit, RpgMakerLocation, RpgMakerLocationStep,
@@ -312,7 +313,7 @@ where
 
 impl<RE, SE, CE> BuiltInExtractionError<RE, SE, CE>
 where
-    RE: SafeDiagnosticSource,
+    RE: RpgMakerProjectDocumentReadingDiagnostic,
     SE: SafeDiagnosticSource,
     CpuTaskExecutionError<CE>: SafeDiagnosticSource,
 {
@@ -324,10 +325,9 @@ where
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::CheckProjectState,
             ),
-            Self::ReadDocuments(source) => source.safe_diagnostic_source(
+            Self::ReadDocuments(source) => source.safe_document_reading_diagnostic(
+                DiagnosticCode::ExtractDocumentRead,
                 DiagnosticStage::Extract,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckProjectState,
             ),
             Self::ScheduleCompute(source) => source.safe_diagnostic_source(
                 DiagnosticStage::Extract,
@@ -2081,6 +2081,23 @@ mod tests {
         }
     }
 
+    impl RpgMakerProjectDocumentReadingDiagnostic for FakeError {
+        fn safe_document_reading_diagnostic(
+            &self,
+            code: DiagnosticCode,
+            stage: DiagnosticStage,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::component("fake_builtin_document_reader"),
+                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            )
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct FakeCpu;
 
@@ -2614,6 +2631,15 @@ mod tests {
             FakeError,
             crate::runtime::cpu::CpuExecutorUnavailable,
         >;
+
+        let read_error = DiagnosticExtractionError::ReadDocuments(FakeError("read"));
+        let diagnostic = read_error.safe_diagnostic();
+        assert_eq!(diagnostic.code, DiagnosticCode::ExtractDocumentRead);
+        assert_eq!(diagnostic.stage, DiagnosticStage::Extract);
+        assert_eq!(
+            diagnostic.subject,
+            DiagnosticSubject::component("fake_builtin_document_reader")
+        );
 
         let document_error = BuiltinDocumentError::new(
             "data/Items.json[1].name",

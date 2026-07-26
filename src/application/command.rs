@@ -42,7 +42,8 @@ use crate::rpg_maker::extract::builtin::{
     BuiltInExtractionError, BuiltInExtractionService, MvDialogueDefinitionSelection,
 };
 use crate::rpg_maker::extract::document::{
-    CommandScopedRpgMakerDocumentReader, RpgMakerProjectDocumentReadingService,
+    CommandScopedRpgMakerDocumentReader, RpgMakerProjectDocumentReadingDiagnostic,
+    RpgMakerProjectDocumentReadingService,
 };
 use crate::rpg_maker::extract::lua::{LuaExtractionError, LuaExtractionService};
 use crate::rpg_maker::extract::rules::{
@@ -7046,7 +7047,7 @@ trait ExtractFailureReport: Error + Send + Sync + Sized + 'static {
 
 impl<RE, SE, CE> ExtractSafeDiagnostic for BuiltInExtractionError<RE, SE, CE>
 where
-    RE: SafeDiagnosticSource,
+    RE: RpgMakerProjectDocumentReadingDiagnostic,
     SE: SafeDiagnosticSource,
     crate::execution::cpu::CpuTaskExecutionError<CE>: SafeDiagnosticSource,
 {
@@ -7069,7 +7070,7 @@ where
 
 impl<RE, SE, CE> ExtractFailureReport for BuiltInExtractionError<RE, SE, CE>
 where
-    RE: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    RE: Error + RpgMakerProjectDocumentReadingDiagnostic + Send + Sync + 'static,
     SE: Error + SafeDiagnosticSource + Send + Sync + 'static,
     CE: Error + Send + Sync + 'static,
     crate::execution::cpu::CpuTaskExecutionError<CE>: SafeDiagnosticSource,
@@ -7091,7 +7092,7 @@ where
 
 impl<DE, SE, CE> ExtractFailureReport for RulesExtractionError<DE, SE, CE>
 where
-    DE: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    DE: Error + RpgMakerProjectDocumentReadingDiagnostic + Send + Sync + 'static,
     SE: Error + SafeDiagnosticSource + Send + Sync + 'static,
     CE: Error + Send + Sync + 'static,
     crate::execution::cpu::CpuTaskExecutionError<CE>: SafeDiagnosticSource,
@@ -9008,6 +9009,23 @@ mod command_error_rendering_tests {
                 DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
                 impact,
                 fallback_action,
+            )
+        }
+    }
+
+    impl RpgMakerProjectDocumentReadingDiagnostic for TestError {
+        fn safe_document_reading_diagnostic(
+            &self,
+            code: DiagnosticCode,
+            stage: DiagnosticStage,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::component("test document reader"),
+                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
             )
         }
     }

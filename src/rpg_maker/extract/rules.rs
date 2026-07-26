@@ -30,7 +30,8 @@ use self::matcher::{
 };
 use super::document::{
     DocumentReadProgress, PluginConfiguration, RpgMakerDocumentId, RpgMakerDocumentSelection,
-    RpgMakerProjectDocumentReader, RpgMakerProjectDocuments,
+    RpgMakerProjectDocumentReader, RpgMakerProjectDocumentReadingDiagnostic,
+    RpgMakerProjectDocuments,
 };
 use super::model::{ExtractedTextGroup, ExtractedTextUnit, RulesSnapshot, SnapshotModelError};
 use super::store::RulesSnapshotStore;
@@ -506,7 +507,7 @@ pub(crate) enum RulesExtractionError<DE, SE, CE> {
 
 impl<DE, SE, CE> RulesExtractionError<DE, SE, CE>
 where
-    DE: Error + SafeDiagnosticSource + Send + Sync + 'static,
+    DE: Error + RpgMakerProjectDocumentReadingDiagnostic + Send + Sync + 'static,
     SE: Error + SafeDiagnosticSource + Send + Sync + 'static,
     CE: Error + Send + Sync + 'static,
     CpuTaskExecutionError<CE>: SafeDiagnosticSource,
@@ -517,17 +518,14 @@ where
     /// source 以及 Store 已经拆出的相关错误。
     pub(crate) fn safe_diagnostic(&self) -> SafeDiagnostic {
         match self {
-            // 共享文档读取器按传入阶段建立正确 stage 与文档读取原因；
-            // Rules 拥有本阶段失败的责任 code，在此声明自己的责任域。
-            Self::ReadDocuments { rules_path, source } => {
-                let mut diagnostic = source.safe_diagnostic_source(
+            Self::ReadDocuments { rules_path, source } => with_rules_context(
+                source.safe_document_reading_diagnostic(
+                    DiagnosticCode::ExtractRules,
                     DiagnosticStage::Extract,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::CheckProjectState,
-                );
-                diagnostic.code = DiagnosticCode::ExtractRules;
-                with_rules_context(diagnostic, rules_path, "read_documents")
-            }
+                ),
+                rules_path,
+                "read_documents",
+            ),
             Self::InvalidTarget { rules_path, source } => source.safe_diagnostic(rules_path),
             Self::InvalidSnapshot { rules_path, source } => {
                 snapshot_model_diagnostic(source, rules_path)
@@ -770,6 +768,7 @@ mod tests {
     use crate::execution::cpu::CpuTaskExecutionError;
     use crate::progress::{ProgressObserver, ProgressSnapshot};
     use crate::rpg_maker::ProjectName;
+    use crate::rpg_maker::extract::document::RpgMakerProjectDocumentReadingError;
     use crate::rpg_maker::model::{
         DirectTextPart, DirectTextRecipe, TextProjectionRecipe, TextUnitRole,
     };
@@ -1529,6 +1528,23 @@ path = '[].name'
         }
     }
 
+    impl RpgMakerProjectDocumentReadingDiagnostic for FakeError {
+        fn safe_document_reading_diagnostic(
+            &self,
+            code: DiagnosticCode,
+            stage: DiagnosticStage,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                code,
+                stage,
+                DiagnosticSubject::component("fake_rules_document_reader"),
+                DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckProjectState,
+            )
+        }
+    }
+
     impl SafeDiagnosticSource for CpuTaskExecutionError<FakeError> {
         fn safe_diagnostic_source(
             &self,
@@ -1591,8 +1607,13 @@ path = '[].name'
 
     #[test]
     fn rules_failure_report_keeps_typed_document_cpu_match_and_snapshot_diagnostics() {
-        type TypedRulesError = RulesExtractionError<
+        type TypedDocumentError = RpgMakerProjectDocumentReadingError<
             crate::runtime::filesystem::SystemFileSystemError,
+            crate::runtime::filesystem::SystemFileSystemError,
+            crate::runtime::cpu::CpuExecutorUnavailable,
+        >;
+        type TypedRulesError = RulesExtractionError<
+            TypedDocumentError,
             crate::runtime::sqlite::SqliteRuntimeError,
             crate::runtime::cpu::CpuExecutorUnavailable,
         >;
@@ -1601,22 +1622,23 @@ path = '[].name'
         let document_path = PathBuf::from(r"C:\games\demo\data\Items.json");
         let read_error: TypedRulesError = RulesExtractionError::ReadDocuments {
             rules_path: rules_path.clone(),
-            source: crate::runtime::filesystem::SystemFileSystemError::Io {
-                operation: "read_rules_document",
+            source: RpgMakerProjectDocumentReadingError::ReadDocument {
                 path: document_path.clone(),
-                source: std::io::Error::from_raw_os_error(5),
+                source: crate::storage::file_system::ReadFileError::Io {
+                    path: document_path.clone(),
+                    source: crate::runtime::filesystem::SystemFileSystemError::Io {
+                        operation: "read_rules_document",
+                        path: document_path.clone(),
+                        source: std::io::Error::from_raw_os_error(5),
+                    },
+                },
             },
         };
         let borrowed = read_error.safe_diagnostic();
         assert_eq!(borrowed.code, DiagnosticCode::ExtractRules);
         assert_eq!(borrowed.stage, DiagnosticStage::Extract);
         let report = read_error.into_failure_report();
-        assert!(
-            report
-                .primary
-                .source_error()
-                .is::<crate::runtime::filesystem::SystemFileSystemError>()
-        );
+        assert!(report.primary.source_error().is::<TypedDocumentError>());
         let read = serde_json::to_string(report.primary.public()).expect("文档诊断应可序列化");
         assert_eq!(
             report.primary.public().subject,
@@ -1691,7 +1713,7 @@ path = '[].name'
             crate::runtime::sqlite::SqliteRuntimeError,
         >;
         type TypedRulesError = RulesExtractionError<
-            crate::runtime::filesystem::SystemFileSystemError,
+            FakeError,
             StoreError,
             crate::runtime::cpu::CpuExecutorUnavailable,
         >;

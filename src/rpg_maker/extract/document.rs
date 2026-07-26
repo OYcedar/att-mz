@@ -795,6 +795,18 @@ pub(crate) enum RpgMakerProjectDocumentReadingError<F, L, C> {
     },
 }
 
+/// 共享文档读取失败只提供读取事实，责任 code 与阶段由真实消费域明确给出。
+///
+/// Builtin、Rules 与 WriteBack 共享同一个读取器，但分别拥有不同的用户操作。
+/// 使用专用契约可阻止共享错误根据通用 stage 猜测责任域。
+pub(crate) trait RpgMakerProjectDocumentReadingDiagnostic {
+    fn safe_document_reading_diagnostic(
+        &self,
+        code: DiagnosticCode,
+        stage: DiagnosticStage,
+    ) -> SafeDiagnostic;
+}
+
 impl<F, L, C> RpgMakerProjectDocumentReadingError<F, L, C> {
     fn from_parse_failure(error: ParseFailure) -> Self {
         match error {
@@ -808,17 +820,14 @@ impl<F, L, C> RpgMakerProjectDocumentReadingError<F, L, C> {
     }
 }
 
-impl<F, L, C> RpgMakerProjectDocumentReadingError<F, L, C>
+impl<F, L, C> RpgMakerProjectDocumentReadingDiagnostic
+    for RpgMakerProjectDocumentReadingError<F, L, C>
 where
     F: SafeDiagnosticSource,
     L: SafeDiagnosticSource,
     CpuTaskExecutionError<C>: SafeDiagnosticSource,
 {
-    /// 在仍持有文档路径、解析位置和具体根错误时建立公开投影。
-    ///
-    /// 共享文档读取器同时服务 Extract(Builtin/Rules)与 WriteBack;责任 code 与
-    /// 阶段属于调用域,由调用方传入,本类型不得替调用方猜测阶段。
-    pub(crate) fn safe_diagnostic_at(
+    fn safe_document_reading_diagnostic(
         &self,
         code: DiagnosticCode,
         stage: DiagnosticStage,
@@ -837,9 +846,15 @@ where
             )
             .with_recovery(RecoveryFact::path(source.actual())),
             Self::ReadDocument { source, .. } => read_document_diagnostic(source, code, stage),
-            Self::ScheduleParse { path, source } => source
-                .safe_diagnostic_source(stage, DiagnosticImpact::Unchanged, DiagnosticAction::Retry)
-                .with_recovery(RecoveryFact::path(path)),
+            Self::ScheduleParse { path, source } => {
+                let mut diagnostic = source.safe_diagnostic_source(
+                    stage,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                );
+                diagnostic.code = code;
+                diagnostic.with_recovery(RecoveryFact::path(path))
+            }
             Self::InvalidUtf8 { path, source } => SafeDiagnostic::new(
                 code,
                 stage,
@@ -876,28 +891,6 @@ where
     }
 }
 
-impl<F, L, C> SafeDiagnosticSource for RpgMakerProjectDocumentReadingError<F, L, C>
-where
-    F: SafeDiagnosticSource,
-    L: SafeDiagnosticSource,
-    CpuTaskExecutionError<C>: SafeDiagnosticSource,
-{
-    /// 共享文档读取器只有 Extract 与 WriteBack 两个真实调用域;调用方传入的
-    /// stage 决定责任 code,本类型不再替调用方把一切失败归到 WriteBack。
-    fn safe_diagnostic_source(
-        &self,
-        stage: DiagnosticStage,
-        _impact: DiagnosticImpact,
-        _fallback_action: DiagnosticAction,
-    ) -> SafeDiagnostic {
-        let code = match stage {
-            DiagnosticStage::WriteBack => DiagnosticCode::WriteBackDocumentRead,
-            _ => DiagnosticCode::ExtractDocumentRead,
-        };
-        self.safe_diagnostic_at(code, stage)
-    }
-}
-
 fn list_directory_diagnostic<E>(
     source: &ListDirectoryError<E>,
     code: DiagnosticCode,
@@ -923,13 +916,15 @@ where
             DiagnosticImpact::Unchanged,
             DiagnosticAction::FixInput,
         ),
-        ListDirectoryError::Io { path, source } => source
-            .safe_diagnostic_source(
+        ListDirectoryError::Io { path, source } => {
+            let mut diagnostic = source.safe_diagnostic_source(
                 stage,
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::CheckPathAndPermissions,
-            )
-            .with_recovery(RecoveryFact::path(path)),
+            );
+            diagnostic.code = code;
+            diagnostic.with_recovery(RecoveryFact::path(path))
+        }
     }
 }
 
@@ -958,13 +953,15 @@ where
             DiagnosticImpact::Unchanged,
             DiagnosticAction::FixInput,
         ),
-        ReadFileError::Io { path, source } => source
-            .safe_diagnostic_source(
+        ReadFileError::Io { path, source } => {
+            let mut diagnostic = source.safe_diagnostic_source(
                 stage,
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::CheckPathAndPermissions,
-            )
-            .with_recovery(RecoveryFact::path(path)),
+            );
+            diagnostic.code = code;
+            diagnostic.with_recovery(RecoveryFact::path(path))
+        }
     }
 }
 
@@ -1584,9 +1581,9 @@ var $plugins =
     }
 
     #[test]
-    fn document_read_diagnostics_carry_the_calling_stage_not_a_hardcoded_write_back() {
-        // 共享读取器同时服务 Extract 与 WriteBack;失败的责任 code 与阶段
-        // 必须来自真实调用域,不得把 Extract 失败标成 write_back。
+    fn document_read_diagnostics_require_explicit_calling_code_and_stage() {
+        // 共享读取器同时服务 Builtin、Rules 与 WriteBack；责任 code 和阶段
+        // 必须由真实调用域成对给出，读取错误不再按 stage 猜测。
         let error: RpgMakerProjectDocumentReadingError<
             crate::runtime::filesystem::SystemFileSystemError,
             crate::runtime::filesystem::SystemFileSystemError,
@@ -1596,18 +1593,23 @@ var $plugins =
             source: invalid_utf8_error(),
         };
 
-        let extract = error.safe_diagnostic_source(
+        let builtin = error.safe_document_reading_diagnostic(
+            DiagnosticCode::ExtractDocumentRead,
             DiagnosticStage::Extract,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::CheckProjectState,
         );
-        assert_eq!(extract.code, DiagnosticCode::ExtractDocumentRead);
-        assert_eq!(extract.stage, DiagnosticStage::Extract);
+        assert_eq!(builtin.code, DiagnosticCode::ExtractDocumentRead);
+        assert_eq!(builtin.stage, DiagnosticStage::Extract);
 
-        let write_back = error.safe_diagnostic_source(
+        let rules = error.safe_document_reading_diagnostic(
+            DiagnosticCode::ExtractRules,
+            DiagnosticStage::Extract,
+        );
+        assert_eq!(rules.code, DiagnosticCode::ExtractRules);
+        assert_eq!(rules.stage, DiagnosticStage::Extract);
+
+        let write_back = error.safe_document_reading_diagnostic(
+            DiagnosticCode::WriteBackDocumentRead,
             DiagnosticStage::WriteBack,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::FixInput,
         );
         assert_eq!(write_back.code, DiagnosticCode::WriteBackDocumentRead);
         assert_eq!(write_back.stage, DiagnosticStage::WriteBack);
