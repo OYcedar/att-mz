@@ -352,9 +352,81 @@ fn render_configuration_load_error(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::application::command::{RpgMakerCommandOutput, ShutdownFailures};
+    use crate::diagnostic::SafeDiagnosticSource;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ObservedStream {
+        Stdout,
+        Stderr,
+    }
+
+    struct OrderedOutput {
+        stream: ObservedStream,
+        order: Arc<Mutex<Vec<ObservedStream>>>,
+        bytes: Vec<u8>,
+    }
+
+    impl OrderedOutput {
+        fn new(stream: ObservedStream, order: Arc<Mutex<Vec<ObservedStream>>>) -> Self {
+            Self {
+                stream,
+                order,
+                bytes: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for OrderedOutput {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if !buffer.is_empty() {
+                self.order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(self.stream);
+                self.bytes.extend_from_slice(buffer);
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestShutdownError;
+
+    impl fmt::Display for TestShutdownError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("测试关闭失败")
+        }
+    }
+
+    impl std::error::Error for TestShutdownError {}
+
+    impl SafeDiagnosticSource for TestShutdownError {
+        fn safe_diagnostic_source(
+            &self,
+            stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+            fallback_action: DiagnosticAction,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                DiagnosticCode::ShutdownComponent,
+                stage,
+                DiagnosticSubject::component("test shutdown root"),
+                DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
+                impact,
+                fallback_action,
+            )
+        }
+    }
 
     struct PanickingOutput;
 
@@ -366,6 +438,58 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn completed_output_is_fully_rendered_before_shutdown_failure() {
+        let mut shutdown = ShutdownFailures::default();
+        shutdown.push_for_test("test shutdown root", TestShutdownError);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut stdout = OrderedOutput::new(ObservedStream::Stdout, Arc::clone(&order));
+        let mut stderr = OrderedOutput::new(ObservedStream::Stderr, Arc::clone(&order));
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let output = RpgMakerCommandOutput::Lua {
+            project: "project".parse().expect("测试项目名应合法"),
+        };
+
+        let exit = render_command_report(
+            CommandRunResult::Succeeded(output),
+            Some(shutdown),
+            None,
+            &localizer,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert!(
+            String::from_utf8(stdout.bytes)
+                .expect("stdout 应为 UTF-8")
+                .contains("project")
+        );
+        assert!(
+            String::from_utf8(stderr.bytes)
+                .expect("stderr 应为 UTF-8")
+                .contains("shutdown.component")
+        );
+        let order = order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_stderr = order
+            .iter()
+            .position(|stream| *stream == ObservedStream::Stderr)
+            .expect("清理失败必须写入 stderr");
+        assert!(
+            order[..first_stderr]
+                .iter()
+                .all(|stream| *stream == ObservedStream::Stdout)
+        );
+        assert!(
+            order[first_stderr..]
+                .iter()
+                .all(|stream| *stream == ObservedStream::Stderr),
+            "成功输出必须完整写完后才开始呈现清理失败"
+        );
     }
 
     #[test]
