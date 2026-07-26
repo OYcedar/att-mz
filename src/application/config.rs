@@ -41,7 +41,6 @@ use crate::language::{
 };
 use crate::rpg_maker::ProjectName;
 use crate::rpg_maker::extract::document::RpgMakerDocumentReadingConfig;
-use crate::rpg_maker::lua::lua54::TrustedLua54RuntimeConfiguration;
 use crate::rpg_maker::translate::profile::RpgMakerTranslationRequestConfiguration;
 use crate::rpg_maker::{RpgMakerEngine, RpgMakerLayout};
 use crate::runtime::cpu::CpuExecutorConfig;
@@ -265,13 +264,6 @@ impl ConfiguredRpgMakerCommand {
                 }))
             }
             RpgMakerCommandArguments::Extract(arguments) => {
-                let deferred_source = Arc::new(DeferredConfigurationSource::new(
-                    configuration_path,
-                    source,
-                    Arc::clone(&toml_index),
-                ));
-                let deferred_lua =
-                    DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source));
                 let _: RawExtractSelection = parse_selected(
                     source,
                     configuration_path,
@@ -285,20 +277,13 @@ impl ConfiguredRpgMakerCommand {
                     rules,
                     lua,
                 } = arguments;
-                let lua = lua
-                    .map(|script_path| {
-                        deferred_lua
-                            .resolve()
-                            .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
-                    })
-                    .transpose()?;
+                let lua = lua.map(SelectedLuaConfiguration::new);
                 let rpg_maker = ExtractConfiguration::build(builtin, rules);
                 Ok(Self::Extract(ConfiguredExtractCommand {
                     project_name: project.name,
                     common,
                     cpu,
                     lua,
-                    deferred_lua,
                     rpg_maker,
                     dialogue_rules_path,
                 }))
@@ -309,8 +294,6 @@ impl ConfiguredRpgMakerCommand {
                     source,
                     Arc::clone(&toml_index),
                 ));
-                let deferred_lua =
-                    DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source));
                 let raw: RawTranslateSelection = parse_selected(
                     source,
                     configuration_path,
@@ -326,13 +309,7 @@ impl ConfiguredRpgMakerCommand {
                     placeholders,
                     lua,
                 } = arguments;
-                let lua = lua
-                    .map(|script_path| {
-                        deferred_lua
-                            .resolve()
-                            .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
-                    })
-                    .transpose()?;
+                let lua = lua.map(SelectedLuaConfiguration::new);
                 let rpg_maker = PendingTranslateConfiguration::build(
                     configuration_directory,
                     raw.prompts,
@@ -342,12 +319,12 @@ impl ConfiguredRpgMakerCommand {
                 .map_err(ConfigurationLoadError::InvalidValue)?;
                 let configured = ConfiguredTranslateCommand {
                     project_name: project.name,
+                    configuration_path: configuration_path.to_path_buf(),
                     terminology_path: terms,
                     placeholder_rules_path: placeholders,
                     common,
                     cpu,
                     lua,
-                    deferred_lua,
                     record_translation_tasks,
                     profile: ConfiguredTranslateProfile::Deferred {
                         source: deferred_source,
@@ -361,12 +338,6 @@ impl ConfiguredRpgMakerCommand {
                 Ok(Self::Translate(Box::new(configured)))
             }
             RpgMakerCommandArguments::WriteBack(arguments) => {
-                let deferred_source = Arc::new(DeferredConfigurationSource::new(
-                    configuration_path,
-                    source,
-                    Arc::clone(&toml_index),
-                ));
-                let deferred_lua = DeferredLuaRuntimeConfiguration::new(deferred_source);
                 let _: RawWriteBackSelection = parse_selected(
                     source,
                     configuration_path,
@@ -380,13 +351,7 @@ impl ConfiguredRpgMakerCommand {
                 )
                 .map_err(ConfigurationLoadError::InvalidValue)?;
                 let WriteBackArguments { project, lua } = arguments;
-                let lua = lua
-                    .map(|script_path| {
-                        deferred_lua
-                            .resolve()
-                            .map(|runtime| SelectedLuaConfiguration::new(script_path, runtime))
-                    })
-                    .transpose()?;
+                let lua = lua.map(SelectedLuaConfiguration::new);
                 let rpg_maker = WriteBackConfiguration::build();
                 Ok(Self::WriteBack(ConfiguredWriteBackCommand {
                     project_name: project.name,
@@ -394,7 +359,6 @@ impl ConfiguredRpgMakerCommand {
                     cpu,
                     publisher,
                     lua,
-                    deferred_lua,
                     rpg_maker,
                 }))
             }
@@ -404,8 +368,6 @@ impl ConfiguredRpgMakerCommand {
                     source,
                     Arc::clone(&toml_index),
                 ));
-                let runtime =
-                    DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source)).resolve()?;
                 let ProjectLuaArguments {
                     project,
                     profile,
@@ -418,7 +380,7 @@ impl ConfiguredRpgMakerCommand {
                     project_name: project.name,
                     common,
                     cpu: build_cpu_configuration(),
-                    lua: SelectedLuaConfiguration::new(script, runtime),
+                    lua: SelectedLuaConfiguration::new(script),
                     arguments,
                     standard_profile,
                 }))
@@ -481,7 +443,6 @@ pub(crate) struct ConfiguredExtractCommand {
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     lua: Option<SelectedLuaConfiguration>,
-    deferred_lua: DeferredLuaRuntimeConfiguration,
     rpg_maker: ExtractConfiguration,
     dialogue_rules_path: Option<PathBuf>,
 }
@@ -503,13 +464,6 @@ impl ConfiguredExtractCommand {
         self.lua.as_ref()
     }
 
-    /// 仅在项目状态要求复用 Lua 程序时解析并校验 Lua 运行时配置。
-    pub(crate) fn resolve_lua_runtime(
-        &self,
-    ) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
-        self.deferred_lua.resolve()
-    }
-
     pub(crate) const fn rpg_maker(&self) -> &ExtractConfiguration {
         &self.rpg_maker
     }
@@ -521,12 +475,12 @@ impl ConfiguredExtractCommand {
 
 pub(crate) struct ConfiguredTranslateCommand {
     project_name: ProjectName,
+    configuration_path: PathBuf,
     terminology_path: Option<PathBuf>,
     placeholder_rules_path: Option<PathBuf>,
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     lua: Option<SelectedLuaConfiguration>,
-    deferred_lua: DeferredLuaRuntimeConfiguration,
     record_translation_tasks: bool,
     profile: ConfiguredTranslateProfile,
 }
@@ -572,13 +526,6 @@ impl ConfiguredTranslateCommand {
         self.record_translation_tasks
     }
 
-    /// 仅在项目状态要求复用 Lua 程序时解析并校验 Lua 运行时配置。
-    pub(crate) fn resolve_lua_runtime(
-        &self,
-    ) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
-        self.deferred_lua.resolve()
-    }
-
     /// 返回已经在命令行显式选择并于加载阶段完成校验的 Profile。
     ///
     /// `None` 表示调用方必须从项目运行方案取得 Profile，并调用
@@ -604,12 +551,12 @@ impl ConfiguredTranslateCommand {
 
         let Self {
             project_name,
+            configuration_path,
             terminology_path,
             placeholder_rules_path,
             common,
             cpu,
             lua,
-            deferred_lua,
             record_translation_tasks,
             profile,
         } = self;
@@ -636,19 +583,19 @@ impl ConfiguredTranslateCommand {
         };
         Ok(Self {
             project_name,
+            configuration_path,
             terminology_path,
             placeholder_rules_path,
             common,
             cpu,
             lua,
-            deferred_lua,
             record_translation_tasks,
             profile,
         })
     }
 
     fn configuration_path(&self) -> &Path {
-        self.deferred_lua.source.path()
+        &self.configuration_path
     }
 
     #[cfg(test)]
@@ -794,7 +741,6 @@ pub(crate) struct ConfiguredWriteBackCommand {
     cpu: CpuExecutorConfig,
     publisher: DirectoryPublisherConfig,
     lua: Option<SelectedLuaConfiguration>,
-    deferred_lua: DeferredLuaRuntimeConfiguration,
     rpg_maker: WriteBackConfiguration,
 }
 
@@ -817,13 +763,6 @@ impl ConfiguredWriteBackCommand {
 
     pub(crate) const fn lua(&self) -> Option<&SelectedLuaConfiguration> {
         self.lua.as_ref()
-    }
-
-    /// 仅在项目状态要求复用 Lua 程序时解析并校验 Lua 运行时配置。
-    pub(crate) fn resolve_lua_runtime(
-        &self,
-    ) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
-        self.deferred_lua.resolve()
     }
 
     pub(crate) const fn rpg_maker(&self) -> &WriteBackConfiguration {
@@ -892,39 +831,17 @@ impl DeferredConfigurationSource {
     }
 }
 
-struct DeferredLuaRuntimeConfiguration {
-    source: Arc<DeferredConfigurationSource>,
-}
-
-impl DeferredLuaRuntimeConfiguration {
-    fn new(source: Arc<DeferredConfigurationSource>) -> Self {
-        Self { source }
-    }
-
-    fn resolve(&self) -> Result<TrustedLua54RuntimeConfiguration, ConfigurationLoadError> {
-        Ok(TrustedLua54RuntimeConfiguration::production())
-    }
-}
-
 pub(crate) struct SelectedLuaConfiguration {
     script_path: PathBuf,
-    runtime: TrustedLua54RuntimeConfiguration,
 }
 
 impl SelectedLuaConfiguration {
-    fn new(script_path: PathBuf, runtime: TrustedLua54RuntimeConfiguration) -> Self {
-        Self {
-            script_path,
-            runtime,
-        }
+    fn new(script_path: PathBuf) -> Self {
+        Self { script_path }
     }
 
     pub(crate) fn script_path(&self) -> &Path {
         &self.script_path
-    }
-
-    pub(crate) const fn runtime(&self) -> TrustedLua54RuntimeConfiguration {
-        self.runtime
     }
 }
 

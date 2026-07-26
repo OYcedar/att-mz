@@ -33,13 +33,23 @@ pub(crate) trait LuaExtraction: Send + Sync {
 
 /// 把 Extract 阶段已经建立的项目事实交给可信 Lua Host。
 pub(crate) struct LuaExtractionService<H, S> {
-    host: H,
+    host: Option<H>,
     store: S,
 }
 
 impl<H, S> LuaExtractionService<H, S> {
     pub(crate) fn new(host: H, store: S) -> Self {
-        Self { host, store }
+        Self {
+            host: Some(host),
+            store,
+        }
+    }
+
+    /// 建立只负责显式停用 Lua owner 的执行器，不构造 Lua Runtime 或 Host。
+    ///
+    /// 组合根只会把零字节程序交给此形态；非空程序必须使用 [`Self::new`]。
+    pub(crate) fn deactivation_only(store: S) -> Self {
+        Self { host: None, store }
     }
 }
 
@@ -65,6 +75,10 @@ where
                 .map(|_| OperationCompletion::Completed(()))
                 .map_err(LuaExtractionError::StoreSnapshot);
         }
+        let host = self
+            .host
+            .as_ref()
+            .expect("非空 Extract Lua 程序必须由组合根建立 Runtime Host");
         let error_path = program.main_script_path().to_path_buf();
         let invocation = LuaInvocation::extract(
             program,
@@ -78,12 +92,13 @@ where
         );
 
         progress.indeterminate(ExtractProgressPhase::LuaExecution);
-        let completion = self.host.execute(invocation).await.map_err(|source| {
-            LuaExtractionError::ExecuteHost {
-                script_path: error_path,
-                source,
-            }
-        })?;
+        let completion =
+            host.execute(invocation)
+                .await
+                .map_err(|source| LuaExtractionError::ExecuteHost {
+                    script_path: error_path,
+                    source,
+                })?;
         let OperationCompletion::Completed(outcome) = completion else {
             return Ok(OperationCompletion::Cancelled);
         };
@@ -452,6 +467,35 @@ mod tests {
 
     fn program(path: &str) -> OwnedLuaProgram {
         OwnedLuaProgram::new(PathBuf::from(path), b"return nil".to_vec())
+    }
+
+    #[tokio::test]
+    async fn zero_byte_program_deactivates_without_a_lua_host() {
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
+        let progress = RecordingProgress::default();
+        let service = LuaExtractionService::<FakeHost, _>::deactivation_only(store);
+
+        let completion = service
+            .run(
+                &opened_project(),
+                OwnedLuaProgram::new(PathBuf::from("scripts/disabled.lua"), Vec::new()),
+                ExtractProgress::new(progress.clone()),
+            )
+            .await
+            .expect("零字节程序应直接停用 Lua owner");
+
+        assert_eq!(completion, OperationCompletion::Completed(()));
+        assert_eq!(
+            calls.lock().expect("Store 调用锁不应中毒").as_slice(),
+            &[StoreCall::Deactivate]
+        );
+        assert_eq!(
+            progress.snapshots(),
+            [ProgressSnapshot::indeterminate(
+                ExtractProgressPhase::LuaCommit
+            )]
+        );
     }
 
     #[tokio::test]
