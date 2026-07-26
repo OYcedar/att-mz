@@ -46,42 +46,16 @@ impl StandardWriteBackUnit {
         source_content: TextUnitContent,
         translation_content: Option<TextUnitContent>,
     ) -> Result<Self, StandardWriteBackSnapshotError> {
-        validate_content_structure(&role, &source_content, "原文")?;
+        validate_content_presence(&role, &source_content, "原文")?;
         if source_content.is_blank() {
-            return Err(StandardWriteBackSnapshotError::BlankSourceContent { role });
+            return Err(StandardWriteBackSnapshotError::BlankSourceContent { role: role.clone() });
         }
         if let Some(translation) = &translation_content {
-            validate_content_structure(&role, translation, "译文")?;
+            validate_content_presence(&role, translation, "译文")?;
             if translation.is_blank() {
-                return Err(StandardWriteBackSnapshotError::BlankTranslationContent { role });
-            }
-            if matches!(role, TextUnitRole::Choices | TextUnitRole::ScrollingText) {
-                let source_lines = source_content
-                    .as_lines()
-                    .expect("严格对齐角色的原文必须是行序列");
-                let translated_lines = translation
-                    .as_lines()
-                    .expect("严格对齐角色的译文必须是行序列");
-                if source_lines.len() != translated_lines.len() {
-                    return Err(StandardWriteBackSnapshotError::AlignedLineCountMismatch {
-                        role,
-                        expected: source_lines.len(),
-                        actual: translated_lines.len(),
-                    });
-                }
-                for (line_index, (source, translated)) in
-                    source_lines.iter().zip(translated_lines).enumerate()
-                {
-                    let source_is_blank = source.trim().is_empty();
-                    if (source_is_blank && !translated.is_empty())
-                        || (!source_is_blank && translated.trim().is_empty())
-                    {
-                        return Err(StandardWriteBackSnapshotError::AlignedBlankLineMismatch {
-                            role,
-                            line_index,
-                        });
-                    }
-                }
+                return Err(StandardWriteBackSnapshotError::BlankTranslationContent {
+                    role: role.clone(),
+                });
             }
         }
         Ok(Self {
@@ -119,13 +93,35 @@ fn aligned_replacement_lines(unit: &StandardWriteBackUnit) -> Option<Vec<String>
     )
 }
 
-fn validate_content_structure(
+fn validate_content_presence(
     role: &TextUnitRole,
     content: &TextUnitContent,
     column: &'static str,
 ) -> Result<(), StandardWriteBackSnapshotError> {
-    validate_text_unit_content_structure(role, TextUnitContentView::from(content)).map_err(
+    if matches!(content, TextUnitContent::Lines(lines) if lines.is_empty()) {
+        Err(StandardWriteBackSnapshotError::EmptyLineContent {
+            role: role.clone(),
+            column,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_content_structure(
+    kind: TextGroupKind,
+    role: &TextUnitRole,
+    content: &TextUnitContent,
+    column: &'static str,
+) -> Result<(), StandardWriteBackSnapshotError> {
+    validate_text_unit_content_structure(kind, role, TextUnitContentView::from(content)).map_err(
         |error| match error {
+            TextUnitContentStructureError::KindRoleMismatch => {
+                StandardWriteBackSnapshotError::InvalidRole {
+                    kind,
+                    role: role.clone(),
+                }
+            }
             TextUnitContentStructureError::ShapeMismatch => {
                 StandardWriteBackSnapshotError::ContentShapeMismatch { role: role.clone() }
             }
@@ -137,12 +133,46 @@ fn validate_content_structure(
                 }
             }
         },
-    )?;
-    if matches!(content, TextUnitContent::Lines(lines) if lines.is_empty()) {
-        return Err(StandardWriteBackSnapshotError::EmptyLineContent {
-            role: role.clone(),
-            column,
+    )
+}
+
+fn validate_aligned_content(
+    unit: &StandardWriteBackUnit,
+) -> Result<(), StandardWriteBackSnapshotError> {
+    if !matches!(
+        unit.role,
+        TextUnitRole::Choices | TextUnitRole::ScrollingText
+    ) {
+        return Ok(());
+    }
+    let Some(translation) = &unit.translation_content else {
+        return Ok(());
+    };
+    let source_lines = unit
+        .source_content
+        .as_lines()
+        .expect("严格对齐角色的原文结构已由唯一校验器验证");
+    let translated_lines = translation
+        .as_lines()
+        .expect("严格对齐角色的译文结构已由唯一校验器验证");
+    if source_lines.len() != translated_lines.len() {
+        return Err(StandardWriteBackSnapshotError::AlignedLineCountMismatch {
+            role: unit.role.clone(),
+            expected: source_lines.len(),
+            actual: translated_lines.len(),
         });
+    }
+    for (line_index, (source, translated)) in source_lines.iter().zip(translated_lines).enumerate()
+    {
+        let source_is_blank = source.trim().is_empty();
+        if (source_is_blank && !translated.is_empty())
+            || (!source_is_blank && translated.trim().is_empty())
+        {
+            return Err(StandardWriteBackSnapshotError::AlignedBlankLineMismatch {
+                role: unit.role.clone(),
+                line_index,
+            });
+        }
     }
     Ok(())
 }
@@ -193,12 +223,11 @@ impl StandardWriteBackGroup {
             });
         }
         for unit in &units {
-            if !unit.role.matches_kind(kind) {
-                return Err(StandardWriteBackSnapshotError::InvalidRole {
-                    kind,
-                    role: unit.role.clone(),
-                });
+            validate_content_structure(kind, &unit.role, &unit.source_content, "原文")?;
+            if let Some(translation) = &unit.translation_content {
+                validate_content_structure(kind, &unit.role, translation, "译文")?;
             }
+            validate_aligned_content(unit)?;
         }
         let mut seen_roles = BTreeSet::new();
         for unit in &units {
@@ -3514,24 +3543,95 @@ mod tests {
 
     #[test]
     fn aligned_units_reject_line_count_and_blank_slot_changes() {
+        let invalid_group = |kind: TextGroupKind,
+                             role: TextUnitRole,
+                             source: TextUnitContent,
+                             translation: TextUnitContent| {
+            let group_location = location(40, None);
+            let target = location(41, Some(0));
+            let recipe = TextProjectionRecipe::Direct(
+                DirectTextRecipe::new(
+                    target,
+                    "原文",
+                    vec![DirectTextPart::LineSlot {
+                        role: role.clone(),
+                        source_line_index: 0,
+                    }],
+                )
+                .expect("测试配方应合法"),
+            );
+            let mutation_locks = recipe_locks(kind, &group_location, std::slice::from_ref(&recipe));
+            StandardWriteBackGroup::new(
+                kind,
+                group_location,
+                vec![
+                    StandardWriteBackUnit::new(role, source, Some(translation))
+                        .expect("非空内容应先建立待验证单元"),
+                ],
+                vec![recipe],
+                mutation_locks,
+            )
+        };
+
         assert!(matches!(
-            StandardWriteBackUnit::new(
+            invalid_group(
+                TextGroupKind::EventScrollingText,
                 TextUnitRole::ScrollingText,
                 TextUnitContent::Lines(vec!["甲".to_owned(), "乙".to_owned()]),
-                Some(TextUnitContent::Lines(vec!["译文".to_owned()])),
+                TextUnitContent::Lines(vec!["译文".to_owned()]),
             ),
             Err(StandardWriteBackSnapshotError::AlignedLineCountMismatch { .. })
         ));
         assert!(matches!(
-            StandardWriteBackUnit::new(
+            invalid_group(
+                TextGroupKind::EventChoices,
                 TextUnitRole::Choices,
                 TextUnitContent::Lines(vec!["是".to_owned(), "   ".to_owned()]),
-                Some(TextUnitContent::Lines(vec![
-                    "はい".to_owned(),
-                    "填充".to_owned()
-                ])),
+                TextUnitContent::Lines(vec!["はい".to_owned(), "填充".to_owned()]),
             ),
             Err(StandardWriteBackSnapshotError::AlignedBlankLineMismatch { line_index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn write_back_group_rejects_kind_role_mismatch_through_the_shared_validator() {
+        let group_location = location(42, None);
+        let target = location(42, Some(0));
+        let recipe = TextProjectionRecipe::Direct(
+            DirectTextRecipe::new(
+                target,
+                "Alice",
+                vec![DirectTextPart::TextSlot {
+                    role: TextUnitRole::DialogueSpeaker,
+                }],
+            )
+            .expect("测试配方应合法"),
+        );
+        let mutation_locks = recipe_locks(
+            TextGroupKind::DatabaseEntry,
+            &group_location,
+            std::slice::from_ref(&recipe),
+        );
+
+        assert!(matches!(
+            StandardWriteBackGroup::new(
+                TextGroupKind::DatabaseEntry,
+                group_location,
+                vec![
+                    StandardWriteBackUnit::new(
+                        TextUnitRole::DialogueSpeaker,
+                        TextUnitContent::Value("Alice".to_owned()),
+                        None,
+                    )
+                    .expect("非空内容应先建立待验证单元"),
+                ],
+                vec![recipe],
+                mutation_locks,
+            ),
+            Err(StandardWriteBackSnapshotError::InvalidRole {
+                kind: TextGroupKind::DatabaseEntry,
+                role: TextUnitRole::DialogueSpeaker,
+            })
         ));
     }
 

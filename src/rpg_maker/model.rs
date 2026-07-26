@@ -49,7 +49,7 @@ impl TextUnitRole {
     /// 事件专属组只接受对应专属角色,其余组只接受 Scalar。该不变量由提取协议
     /// 建立;Translate 与 WriteBack 的资产读取边界都消费这同一份定义,不得各自
     /// 另写宽严不同的版本。
-    pub(crate) fn matches_kind(&self, kind: TextGroupKind) -> bool {
+    fn matches_kind(&self, kind: TextGroupKind) -> bool {
         match kind {
             TextGroupKind::EventDialogue => {
                 matches!(self, Self::DialogueSpeaker | Self::DialogueBody)
@@ -95,22 +95,28 @@ impl<'a> From<&'a TextUnitContent> for TextUnitContentView<'a> {
     }
 }
 
-/// 角色与内容物理结构不一致，或内容含有不能进入语义单元的控制字符。
+/// 组类型、角色、内容物理结构不一致，或内容含有不能进入语义单元的控制字符。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TextUnitContentStructureError {
+    KindRoleMismatch,
     ShapeMismatch,
     InvalidText { line_index: usize },
 }
 
 /// 验证一个完整语义单元内容的唯一结构规则。
 ///
-/// `Scalar` 的单值可以包含 LF；Dialogue speaker 的单值不能包含 CR/LF；任何单值
-/// 都不能包含 NUL。行序列中的每个槽都不能包含 CR、LF 或 NUL。纯空白、空行序列、
-/// 对齐数量和空槽对应关系属于各业务边界的额外规则，不在这里判断。
+/// 组类型必须接受该语义角色；`Scalar` 的单值可以包含 LF；Dialogue speaker 的单值
+/// 不能包含 CR/LF；任何单值都不能包含 NUL。行序列中的每个槽都不能包含 CR、LF 或
+/// NUL。纯空白、空行序列、对齐数量和空槽对应关系属于各业务边界的额外规则，不在这里
+/// 判断。
 pub(crate) fn validate_text_unit_content_structure(
+    kind: TextGroupKind,
     role: &TextUnitRole,
     content: TextUnitContentView<'_>,
 ) -> Result<(), TextUnitContentStructureError> {
+    if !role.matches_kind(kind) {
+        return Err(TextUnitContentStructureError::KindRoleMismatch);
+    }
     match content {
         TextUnitContentView::Value(_) if role.expects_lines() => {
             Err(TextUnitContentStructureError::ShapeMismatch)
@@ -1654,42 +1660,140 @@ mod tests {
     }
 
     #[test]
-    fn content_structure_validation_is_role_aware_and_keeps_scalar_lf() {
+    fn content_structure_validation_rejects_kind_role_mismatches() {
+        let scalar = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法"));
+        let speaker = TextUnitRole::DialogueSpeaker;
+        let body = TextUnitRole::DialogueBody;
+        let choices = TextUnitRole::Choices;
+        let scrolling = TextUnitRole::ScrollingText;
+
+        for kind in [
+            TextGroupKind::DatabaseEntry,
+            TextGroupKind::System,
+            TextGroupKind::Map,
+            TextGroupKind::EventCommand,
+            TextGroupKind::PluginParameter,
+        ] {
+            assert_eq!(
+                validate_text_unit_content_structure(
+                    kind,
+                    &scalar,
+                    TextUnitContentView::Value("值")
+                ),
+                Ok(())
+            );
+        }
+        for (kind, role, content) in [
+            (
+                TextGroupKind::EventDialogue,
+                &speaker,
+                TextUnitContentView::Value("姓名"),
+            ),
+            (
+                TextGroupKind::EventDialogue,
+                &body,
+                TextUnitContentView::Lines(&[]),
+            ),
+            (
+                TextGroupKind::EventChoices,
+                &choices,
+                TextUnitContentView::Lines(&[]),
+            ),
+            (
+                TextGroupKind::EventScrollingText,
+                &scrolling,
+                TextUnitContentView::Lines(&[]),
+            ),
+        ] {
+            assert_eq!(
+                validate_text_unit_content_structure(kind, role, content),
+                Ok(())
+            );
+        }
+        for (kind, role, content) in [
+            (
+                TextGroupKind::EventDialogue,
+                &scalar,
+                TextUnitContentView::Value("值"),
+            ),
+            (
+                TextGroupKind::DatabaseEntry,
+                &speaker,
+                TextUnitContentView::Value("姓名"),
+            ),
+            (
+                TextGroupKind::EventChoices,
+                &body,
+                TextUnitContentView::Lines(&[]),
+            ),
+            (
+                TextGroupKind::EventScrollingText,
+                &choices,
+                TextUnitContentView::Lines(&[]),
+            ),
+        ] {
+            assert_eq!(
+                validate_text_unit_content_structure(kind, role, content),
+                Err(TextUnitContentStructureError::KindRoleMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn content_structure_validation_preserves_the_value_and_line_control_contract() {
         let scalar = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法"));
         let speaker = TextUnitRole::DialogueSpeaker;
         let body = TextUnitRole::DialogueBody;
 
         assert_eq!(
             validate_text_unit_content_structure(
+                TextGroupKind::DatabaseEntry,
                 &scalar,
-                TextUnitContentView::Value("第一行\n第二行")
+                TextUnitContentView::Value("第一行\r第二行\n第三行")
             ),
             Ok(())
         );
-        assert_eq!(
-            validate_text_unit_content_structure(&scalar, TextUnitContentView::Value("值\0")),
-            Err(TextUnitContentStructureError::InvalidText { line_index: 0 })
-        );
+        for invalid in ["值\0", "\0值"] {
+            assert_eq!(
+                validate_text_unit_content_structure(
+                    TextGroupKind::DatabaseEntry,
+                    &scalar,
+                    TextUnitContentView::Value(invalid)
+                ),
+                Err(TextUnitContentStructureError::InvalidText { line_index: 0 })
+            );
+        }
+        for invalid in ["姓名\r别名", "姓名\n别名", "姓名\0别名"] {
+            assert_eq!(
+                validate_text_unit_content_structure(
+                    TextGroupKind::EventDialogue,
+                    &speaker,
+                    TextUnitContentView::Value(invalid)
+                ),
+                Err(TextUnitContentStructureError::InvalidText { line_index: 0 })
+            );
+        }
+        for invalid in ["第二\r行", "第二\n行", "第二\0行"] {
+            assert_eq!(
+                validate_text_unit_content_structure(
+                    TextGroupKind::EventDialogue,
+                    &body,
+                    TextUnitContentView::Lines(&["第一行".to_owned(), invalid.to_owned()])
+                ),
+                Err(TextUnitContentStructureError::InvalidText { line_index: 1 })
+            );
+        }
         assert_eq!(
             validate_text_unit_content_structure(
-                &speaker,
-                TextUnitContentView::Value("姓名\n别名")
-            ),
-            Err(TextUnitContentStructureError::InvalidText { line_index: 0 })
-        );
-        assert_eq!(
-            validate_text_unit_content_structure(
+                TextGroupKind::EventDialogue,
                 &body,
-                TextUnitContentView::Lines(&["第一行".to_owned(), "第二\r行".to_owned()])
+                TextUnitContentView::Value("错误形状")
             ),
-            Err(TextUnitContentStructureError::InvalidText { line_index: 1 })
-        );
-        assert_eq!(
-            validate_text_unit_content_structure(&body, TextUnitContentView::Value("错误形状")),
             Err(TextUnitContentStructureError::ShapeMismatch)
         );
         assert_eq!(
             validate_text_unit_content_structure(
+                TextGroupKind::DatabaseEntry,
                 &scalar,
                 TextUnitContentView::Lines(&["错误形状".to_owned()])
             ),

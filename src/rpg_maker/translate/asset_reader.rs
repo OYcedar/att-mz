@@ -1243,9 +1243,9 @@ fn decode_unit(
         .map_err(map_storage_row_error)?;
     let identity = StandardTextUnitIdentityStorageRow::decode_after_location(&mut row, location)
         .map_err(map_storage_row_error)?;
-    validate_role(&identity.role, kind)?;
     let storage = StandardTextUnitStorageRow::decode_after_identity(&mut row, identity)
         .map_err(map_storage_row_error)?;
+    validate_persisted_source_content(kind, &storage.role, &storage.source_content)?;
     if storage.source_content.is_blank() {
         return Err(InvalidStandardTranslationAssetSnapshot::BlankSourceContent);
     }
@@ -1257,10 +1257,13 @@ fn decode_unit(
     let translation = storage
         .decode_translation_content()
         .map_err(map_storage_row_error)?;
+    if let Some(translation) = &translation {
+        validate_persisted_translation_content(kind, &storage.role, translation)?;
+    }
     if translation.as_ref().is_some_and(TextUnitContent::is_blank) {
         return Err(InvalidStandardTranslationAssetSnapshot::BlankTranslationContent);
     }
-    validate_persisted_content(&storage.role, &storage.source_content, translation.as_ref())?;
+    validate_persisted_alignment(&storage.role, &storage.source_content, translation.as_ref())?;
     let translation_state = row
         .optional_blob("translation_state")
         .map_err(map_storage_row_error)?;
@@ -1295,13 +1298,19 @@ fn decode_unit(
     })
 }
 
-fn validate_persisted_content(
+fn validate_persisted_source_content(
+    kind: TextGroupKind,
     role: &TextUnitRole,
     source: &TextUnitContent,
-    translation: Option<&TextUnitContent>,
 ) -> Result<(), InvalidStandardTranslationAssetSnapshot> {
-    validate_text_unit_content_structure(role, TextUnitContentView::from(source)).map_err(
+    validate_text_unit_content_structure(kind, role, TextUnitContentView::from(source)).map_err(
         |error| match error {
+            TextUnitContentStructureError::KindRoleMismatch => {
+                InvalidStandardTranslationAssetSnapshot::RoleDoesNotBelongToGroup {
+                    role: role.clone(),
+                    kind,
+                }
+            }
             TextUnitContentStructureError::ShapeMismatch => {
                 InvalidStandardTranslationAssetSnapshot::SourceContentShapeMismatch {
                     role: role.clone(),
@@ -1311,13 +1320,22 @@ fn validate_persisted_content(
                 InvalidStandardTranslationAssetSnapshot::InvalidSourceLineText { index: line_index }
             }
         },
-    )?;
+    )
+}
 
-    let Some(translation) = translation else {
-        return Ok(());
-    };
-    validate_text_unit_content_structure(role, TextUnitContentView::from(translation)).map_err(
-        |error| match error {
+fn validate_persisted_translation_content(
+    kind: TextGroupKind,
+    role: &TextUnitRole,
+    translation: &TextUnitContent,
+) -> Result<(), InvalidStandardTranslationAssetSnapshot> {
+    validate_text_unit_content_structure(kind, role, TextUnitContentView::from(translation))
+        .map_err(|error| match error {
+            TextUnitContentStructureError::KindRoleMismatch => {
+                InvalidStandardTranslationAssetSnapshot::RoleDoesNotBelongToGroup {
+                    role: role.clone(),
+                    kind,
+                }
+            }
             TextUnitContentStructureError::ShapeMismatch => {
                 InvalidStandardTranslationAssetSnapshot::TranslationContentShapeMismatch {
                     role: role.clone(),
@@ -1328,9 +1346,17 @@ fn validate_persisted_content(
                     index: line_index,
                 }
             }
-        },
-    )?;
+        })
+}
 
+fn validate_persisted_alignment(
+    role: &TextUnitRole,
+    source: &TextUnitContent,
+    translation: Option<&TextUnitContent>,
+) -> Result<(), InvalidStandardTranslationAssetSnapshot> {
+    let Some(translation) = translation else {
+        return Ok(());
+    };
     if matches!(role, TextUnitRole::Choices | TextUnitRole::ScrollingText) {
         let source_lines = source.as_lines().expect("严格对齐角色的源内容形状已验证");
         let translation_lines = translation
@@ -1397,22 +1423,6 @@ fn map_storage_row_error(
         StandardAssetStorageRowError::InvalidTranslationContent(source) => {
             InvalidStandardTranslationAssetSnapshot::InvalidTranslationContent(source)
         }
-    }
-}
-
-fn validate_role(
-    role: &TextUnitRole,
-    kind: TextGroupKind,
-) -> Result<(), InvalidStandardTranslationAssetSnapshot> {
-    if role.matches_kind(kind) {
-        Ok(())
-    } else {
-        Err(
-            InvalidStandardTranslationAssetSnapshot::RoleDoesNotBelongToGroup {
-                role: role.clone(),
-                kind,
-            },
-        )
     }
 }
 
@@ -2108,6 +2118,87 @@ mod tests {
                 role: TextUnitRole::DialogueBody
             }
         ));
+    }
+
+    #[test]
+    fn persisted_unit_rejects_kind_role_mismatch_before_content_rules() {
+        let body_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueBody)
+            .expect("角色应可编码");
+        let error = decode_unit(
+            OwnerSqliteRow {
+                owner: RpgMakerStandardAssetOwner::Builtin,
+                row: unit_payload_row(
+                    &dialogue_group(),
+                    "event_choices",
+                    &body_role,
+                    r#"["正文"]"#,
+                    "{}",
+                ),
+            },
+            active_builtin(),
+        )
+        .expect_err("DialogueBody 不得进入 Choices 组");
+
+        assert!(matches!(
+            error,
+            InvalidStandardTranslationAssetSnapshot::RoleDoesNotBelongToGroup {
+                role: TextUnitRole::DialogueBody,
+                kind: TextGroupKind::EventChoices,
+            }
+        ));
+    }
+
+    #[test]
+    fn persisted_source_and_translation_lines_reject_cr_lf_and_nul() {
+        let body_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueBody)
+            .expect("角色应可编码");
+        for escaped in [
+            r#"["正文\r续行"]"#,
+            r#"["正文\n续行"]"#,
+            r#"["正文\u0000续行"]"#,
+        ] {
+            let source_error = decode_unit(
+                OwnerSqliteRow {
+                    owner: RpgMakerStandardAssetOwner::Builtin,
+                    row: unit_payload_row(
+                        &dialogue_group(),
+                        "event_dialogue",
+                        &body_role,
+                        escaped,
+                        "{}",
+                    ),
+                },
+                active_builtin(),
+            )
+            .expect_err("持久化源 Lines 的元素不得包含 CR、LF 或 NUL");
+            assert!(matches!(
+                source_error,
+                InvalidStandardTranslationAssetSnapshot::InvalidSourceLineText { index: 0 }
+            ));
+
+            let mut values = unit_payload_row(
+                &dialogue_group(),
+                "event_dialogue",
+                &body_role,
+                r#"["正文"]"#,
+                "{}",
+            )
+            .into_values();
+            values[7] = text(escaped);
+            values[8] = SqliteValue::Blob(vec![0x44; 32]);
+            let translation_error = decode_unit(
+                OwnerSqliteRow {
+                    owner: RpgMakerStandardAssetOwner::Builtin,
+                    row: SqliteRow::new(values),
+                },
+                active_builtin(),
+            )
+            .expect_err("持久化译文 Lines 的元素不得包含 CR、LF 或 NUL");
+            assert!(matches!(
+                translation_error,
+                InvalidStandardTranslationAssetSnapshot::InvalidTranslationLineText { index: 0 }
+            ));
+        }
     }
 
     fn snapshot_rows(group: &RpgMakerLocation, units: Vec<SqliteRow>) -> Vec<Vec<SqliteRow>> {

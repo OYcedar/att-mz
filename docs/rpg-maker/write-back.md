@@ -63,6 +63,12 @@ owner 的资产快照指纹，并验证：
 `standard_mutation_claim` 是必须与 recipe 相符的跨 owner 冲突摘要，不是缓存，也不能
 代替完整逻辑 Claim 重建、旧指纹复算或发布前冲突验证。
 
+WriteBack Reader 与 Extract、Translate 共用同一个 group kind / role / content 结构校验：
+对话、选项、滚动文本专属组只接受各自角色，其余组只接受 Scalar；Scalar Value 保留
+内部 LF，DialogueSpeaker Value 拒绝 CR/LF，所有 Value 拒绝 NUL，Lines 每个元素拒绝
+CR/LF/NUL。WriteBack 自己继续负责纯空白、空 Lines、Choices/ScrollingText 行数和空槽
+一致性以及 recipe 引用完整性；这些写回规则不反向进入共享结构校验器。
+
 ## 3. 普通值与结构化 recipe
 
 Scalar recipe 选择译文或原文，按记录的解码边界反向编码，并只修改对应物理目标。

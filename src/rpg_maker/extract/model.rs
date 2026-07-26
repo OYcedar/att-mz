@@ -79,24 +79,6 @@ impl ExtractedTextUnit {
                 ProjectionModelError::MutationClaimTargetMismatch,
             ));
         }
-        if let Err(error) =
-            validate_text_unit_content_structure(&role, TextUnitContentView::from(&source_content))
-        {
-            return Err(match error {
-                TextUnitContentStructureError::ShapeMismatch => {
-                    SnapshotModelError::ContentShapeMismatch {
-                        role,
-                        exact_location: Box::new(projection_location),
-                    }
-                }
-                TextUnitContentStructureError::InvalidText { line_index } => {
-                    SnapshotModelError::InvalidSourceLine {
-                        source_line_index: line_index,
-                        exact_location: Box::new(projection_location),
-                    }
-                }
-            });
-        }
         if source_content.is_blank() {
             return Err(SnapshotModelError::BlankSourceContent {
                 exact_location: Box::new(projection_location),
@@ -188,6 +170,33 @@ impl ExtractedTextGroup {
             return Err(SnapshotModelError::EmptyProjection {
                 group_location: Box::new(group_location),
             });
+        }
+        for unit in &units {
+            validate_text_unit_content_structure(
+                kind,
+                &unit.role,
+                TextUnitContentView::from(&unit.source_content),
+            )
+            .map_err(|error| match error {
+                TextUnitContentStructureError::KindRoleMismatch => {
+                    SnapshotModelError::ContentShapeMismatch {
+                        role: unit.role.clone(),
+                        exact_location: Box::new(unit.projection_location.clone()),
+                    }
+                }
+                TextUnitContentStructureError::ShapeMismatch => {
+                    SnapshotModelError::ContentShapeMismatch {
+                        role: unit.role.clone(),
+                        exact_location: Box::new(unit.projection_location.clone()),
+                    }
+                }
+                TextUnitContentStructureError::InvalidText { line_index } => {
+                    SnapshotModelError::InvalidSourceLine {
+                        source_line_index: line_index,
+                        exact_location: Box::new(unit.projection_location.clone()),
+                    }
+                }
+            })?;
         }
         let mut roles = BTreeSet::new();
         for unit in &units {
@@ -906,14 +915,63 @@ mod tests {
     }
 
     #[test]
+    fn group_rejects_a_role_that_does_not_belong_to_its_kind() {
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let group_location =
+            RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(1)]);
+        let unit_location = RpgMakerLocation::value(
+            source,
+            vec![
+                RpgMakerLocationStep::index(1),
+                RpgMakerLocationStep::key("name"),
+            ],
+        );
+        let unit = ExtractedTextUnit::projected(
+            TextUnitRole::DialogueSpeaker,
+            unit_location,
+            TextUnitContent::Value("角色".to_owned()),
+        )
+        .expect("完整单元必须等到所属组建立 kind/role 不变量");
+
+        assert!(matches!(
+            ExtractedTextGroup::new(TextGroupKind::DatabaseEntry, group_location, vec![unit],),
+            Err(SnapshotModelError::ContentShapeMismatch {
+                role: TextUnitRole::DialogueSpeaker,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn line_content_rejects_embedded_line_breaks_and_nul() {
-        let location = RpgMakerLocation::value(RpgMakerSource::map(1), Vec::new());
+        let source = RpgMakerSource::map(1);
+        let group_location =
+            RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(0)]);
+        let target = RpgMakerLocation::value(source, vec![RpgMakerLocationStep::index(1)]);
         for invalid in ["一\n二", "一\r二", "一\0二"] {
+            let unit = ExtractedTextUnit::projected(
+                TextUnitRole::ScrollingText,
+                target.clone(),
+                TextUnitContent::Lines(vec![invalid.to_owned()]),
+            )
+            .expect("完整单元必须等到所属组建立内容结构不变量");
+            let recipe = TextProjectionRecipe::Direct(
+                DirectTextRecipe::new(
+                    target.clone(),
+                    invalid,
+                    vec![DirectTextPart::LineSlot {
+                        role: TextUnitRole::ScrollingText,
+                        source_line_index: 0,
+                    }],
+                )
+                .expect("测试配方应合法"),
+            );
             assert!(matches!(
-                ExtractedTextUnit::projected(
-                    TextUnitRole::DialogueBody,
-                    location.clone(),
-                    TextUnitContent::Lines(vec![invalid.to_owned()]),
+                ExtractedTextGroup::projected(
+                    TextGroupKind::EventScrollingText,
+                    group_location.clone(),
+                    vec![unit],
+                    vec![recipe],
                 ),
                 Err(SnapshotModelError::InvalidSourceLine {
                     source_line_index: 0,
