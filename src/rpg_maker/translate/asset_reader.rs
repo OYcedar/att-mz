@@ -15,7 +15,10 @@ use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
 };
-use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
+use crate::rpg_maker::model::{
+    TextUnitContent, TextUnitContentStructureError, TextUnitContentView, TextUnitRole,
+    validate_text_unit_content_structure,
+};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project_database::{
     AssetSnapshotFingerprint, PLACEHOLDER_RULES_RESOURCE_KIND, SourceSnapshotFingerprint,
@@ -1331,13 +1334,6 @@ fn decode_unit(
     if source_content.is_blank() {
         return Err(InvalidStandardTranslationAssetSnapshot::BlankSourceContent);
     }
-    if role.expects_lines() != source_content.as_lines().is_some() {
-        return Err(
-            InvalidStandardTranslationAssetSnapshot::SourceContentShapeMismatch {
-                role: role.clone(),
-            },
-        );
-    }
     let source_context_json = required_text(next(&mut values), "source_context_json")?;
     let context: serde_json::Value = serde_json::from_str(&source_context_json)
         .map_err(InvalidStandardTranslationAssetSnapshot::InvalidSourceContext)?;
@@ -1353,16 +1349,6 @@ fn decode_unit(
         .transpose()?;
     if translation.as_ref().is_some_and(TextUnitContent::is_blank) {
         return Err(InvalidStandardTranslationAssetSnapshot::BlankTranslationContent);
-    }
-    if translation
-        .as_ref()
-        .is_some_and(|translation| translation.as_lines().is_some() != role.expects_lines())
-    {
-        return Err(
-            InvalidStandardTranslationAssetSnapshot::TranslationContentShapeMismatch {
-                role: role.clone(),
-            },
-        );
     }
     validate_persisted_content(&role, &source_content, translation.as_ref())?;
     let translation_state = optional_blob(next(&mut values), "translation_state")?;
@@ -1394,32 +1380,36 @@ fn validate_persisted_content(
     source: &TextUnitContent,
     translation: Option<&TextUnitContent>,
 ) -> Result<(), InvalidStandardTranslationAssetSnapshot> {
-    if let Some(lines) = source.as_lines() {
-        if let Some(index) = lines.iter().position(|line| contains_line_separator(line)) {
-            return Err(InvalidStandardTranslationAssetSnapshot::InvalidSourceLineText { index });
-        }
-    } else if matches!(role, TextUnitRole::DialogueSpeaker)
-        && source.as_value().is_some_and(contains_line_separator)
-    {
-        return Err(InvalidStandardTranslationAssetSnapshot::InvalidSourceLineText { index: 0 });
-    }
+    validate_text_unit_content_structure(role, TextUnitContentView::from(source)).map_err(
+        |error| match error {
+            TextUnitContentStructureError::ShapeMismatch => {
+                InvalidStandardTranslationAssetSnapshot::SourceContentShapeMismatch {
+                    role: role.clone(),
+                }
+            }
+            TextUnitContentStructureError::InvalidText { line_index } => {
+                InvalidStandardTranslationAssetSnapshot::InvalidSourceLineText { index: line_index }
+            }
+        },
+    )?;
 
     let Some(translation) = translation else {
         return Ok(());
     };
-    if let Some(lines) = translation.as_lines() {
-        if let Some(index) = lines.iter().position(|line| contains_line_separator(line)) {
-            return Err(
-                InvalidStandardTranslationAssetSnapshot::InvalidTranslationLineText { index },
-            );
-        }
-    } else if matches!(role, TextUnitRole::DialogueSpeaker)
-        && translation.as_value().is_some_and(contains_line_separator)
-    {
-        return Err(
-            InvalidStandardTranslationAssetSnapshot::InvalidTranslationLineText { index: 0 },
-        );
-    }
+    validate_text_unit_content_structure(role, TextUnitContentView::from(translation)).map_err(
+        |error| match error {
+            TextUnitContentStructureError::ShapeMismatch => {
+                InvalidStandardTranslationAssetSnapshot::TranslationContentShapeMismatch {
+                    role: role.clone(),
+                }
+            }
+            TextUnitContentStructureError::InvalidText { line_index } => {
+                InvalidStandardTranslationAssetSnapshot::InvalidTranslationLineText {
+                    index: line_index,
+                }
+            }
+        },
+    )?;
 
     if matches!(role, TextUnitRole::Choices | TextUnitRole::ScrollingText) {
         let source_lines = source.as_lines().expect("严格对齐角色的源内容形状已验证");
@@ -1448,12 +1438,6 @@ fn validate_persisted_content(
         }
     }
     Ok(())
-}
-
-fn contains_line_separator(value: &str) -> bool {
-    value
-        .chars()
-        .any(|character| matches!(character, '\r' | '\n' | '\0'))
 }
 
 fn decode_group_kind(

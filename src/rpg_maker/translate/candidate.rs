@@ -29,7 +29,7 @@ use super::semantics::{
 use super::standard::StandardTranslationCorpus;
 use super::standard::{
     ExpectedLineShape, TerminologyDependency, TranslationSnapshotBaseline, TranslationStateContext,
-    TranslationUnitIdentity, TranslationUnitRejectionReason,
+    TranslationTargetConstraints, TranslationUnitIdentity, TranslationUnitRejectionReason,
 };
 
 /// 当前人工候选会话中的稳定物理单元下标。
@@ -386,6 +386,15 @@ impl StandardCandidateSession {
                 continue;
             }
 
+            let members = self
+                .families
+                .get(family_index)
+                .ok_or(StandardCandidatePreparationError::InvalidFamilyIndex { family_index })?;
+            let target_constraints = TranslationTargetConstraints::from_identities(
+                members
+                    .iter()
+                    .map(|&member_index| state.units[member_index].view.identity()),
+            );
             let unit = &state.units[first.unit_index.get()];
             let prepared = unit.prepared.as_ref().ok_or(
                 StandardCandidatePreparationError::ActiveUnitMissingPreparedSemantics {
@@ -395,6 +404,7 @@ impl StandardCandidateSession {
             let accepted = prepared
                 .accept_content(
                     unit.view.identity(),
+                    target_constraints,
                     unit.view.line_shape(),
                     first.candidate.clone(),
                 )
@@ -410,11 +420,6 @@ impl StandardCandidateSession {
                     continue;
                 }
             };
-
-            let members = self
-                .families
-                .get(family_index)
-                .ok_or(StandardCandidatePreparationError::InvalidFamilyIndex { family_index })?;
             let changes_current = members.iter().any(|&member_index| {
                 let member = &state.units[member_index];
                 member.view.status == StandardCandidateUnitStatus::Current
@@ -754,6 +759,22 @@ mod tests {
         )
     }
 
+    fn tag_identity(index: usize, source: TextUnitContent) -> TranslationUnitIdentity {
+        TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            RpgMakerLocation::note_tag(
+                RpgMakerSource::data(StandardDataFile::Items),
+                vec![RpgMakerLocationStep::index(index)],
+                "Help",
+                0,
+            ),
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("测试字段键应合法")),
+            source,
+            "{}",
+        )
+    }
+
     fn corpus_with_duplicate_family(
         semantics: &ResolvedTranslationSemantics,
         current_translation: Option<&str>,
@@ -829,6 +850,24 @@ mod tests {
             })
             .collect();
         StandardTranslationCorpus::new(assets)
+    }
+
+    fn corpus_with_tag_family_member() -> StandardTranslationCorpus {
+        let source = TextUnitContent::Value("魔法剣".to_owned());
+        let ordinary = identity(1, source.clone());
+        let tag = tag_identity(2, source);
+        StandardTranslationCorpus::new(vec![
+            StandardTranslationGroup::new(
+                TextGroupKind::DatabaseEntry,
+                ordinary.group_location().clone(),
+                vec![StandardTranslationAsset::new(ordinary, None, None)],
+            ),
+            StandardTranslationGroup::new(
+                TextGroupKind::DatabaseEntry,
+                tag.group_location().clone(),
+                vec![StandardTranslationAsset::new(tag, None, None)],
+            ),
+        ])
     }
 
     #[test]
@@ -1031,6 +1070,35 @@ mod tests {
                     reason: StandardCandidateRejectionReason::ConflictingCandidate,
                 },
             ]
+        );
+        assert!(prepared.commits().is_empty());
+    }
+
+    #[test]
+    fn manual_candidate_applies_tag_constraint_from_every_family_member() {
+        let session = StandardCandidateSession::from_corpus(
+            Arc::new(ResolvedTranslationSemantics::for_test()),
+            corpus_with_tag_family_member(),
+        )
+        .expect("普通位置与标签位置应形成同一人工候选族");
+
+        let prepared = session
+            .prepare_acceptance(vec![StandardCandidateRequest::new(
+                StandardCandidateUnitIndex::new(0),
+                TextUnitContent::Value("魔法剑>强化".to_owned()),
+                false,
+            )])
+            .expect("标签闭合符属于正常候选拒绝");
+
+        assert_eq!(
+            prepared.results(),
+            &[StandardCandidateAcceptance::Rejected {
+                reason: StandardCandidateRejectionReason::Candidate(
+                    TranslationUnitRejectionReason::TagValueContainsClosingDelimiter {
+                        line_index: 0
+                    }
+                ),
+            }]
         );
         assert!(prepared.commits().is_empty());
     }

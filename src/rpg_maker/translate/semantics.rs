@@ -20,8 +20,8 @@ use super::placeholder::{
 };
 use super::planning_resource::CompiledTerminology;
 use super::standard::{
-    AppliedPlaceholder, ExpectedLineShape, TerminologyDependency, TranslationUnitIdentity,
-    TranslationUnitRejectionReason,
+    AppliedPlaceholder, ExpectedLineShape, TerminologyDependency, TranslationTargetConstraints,
+    TranslationUnitIdentity, TranslationUnitRejectionReason,
 };
 
 /// 一轮 Standard 与 Lua 共享且不可变的当前翻译语义。
@@ -390,6 +390,7 @@ impl PreparedTranslationText {
     pub(crate) fn accept_content(
         &self,
         identity: &TranslationUnitIdentity,
+        target_constraints: TranslationTargetConstraints,
         line_shape: ExpectedLineShape,
         candidate: TextUnitContent,
     ) -> Result<TranslationContentAcceptance, ResolvedTranslationSemanticError> {
@@ -405,6 +406,7 @@ impl PreparedTranslationText {
         }
         accept_translation_content_candidate(
             identity,
+            target_constraints,
             &self.model_text,
             line_shape,
             &self.placeholders,
@@ -718,6 +720,12 @@ mod tests {
         assert_eq!(
             prepared.accept("译文\n第二行").expect("LF 候选应可验收"),
             PreparedTranslationAcceptance::Accepted("译文\n第二行".to_owned())
+        );
+        assert_eq!(
+            prepared
+                .accept("译文>仍是普通标量")
+                .expect("通用准备接口不应猜测写回目标"),
+            PreparedTranslationAcceptance::Accepted("译文>仍是普通标量".to_owned())
         );
         for invalid in ["译文\r第二行", "译文\0第二行"] {
             assert!(matches!(

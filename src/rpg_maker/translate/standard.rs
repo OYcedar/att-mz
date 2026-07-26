@@ -196,6 +196,31 @@ impl TranslationUnitIdentity {
     }
 }
 
+/// 一个候选译文最终会写入的完整目标集合所建立的约束。
+///
+/// 去重代表的物理位置不一定拥有最严格的写回协议，因此约束必须由主目标与全部
+/// 传播/家族成员共同建立，不能只观察代表 identity。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TranslationTargetConstraints {
+    targets_tag_value: bool,
+}
+
+impl TranslationTargetConstraints {
+    pub(crate) fn from_identities<'a>(
+        identities: impl IntoIterator<Item = &'a TranslationUnitIdentity>,
+    ) -> Self {
+        Self {
+            targets_tag_value: identities
+                .into_iter()
+                .any(TranslationUnitIdentity::targets_tag_value),
+        }
+    }
+
+    pub(crate) const fn targets_tag_value(self) -> bool {
+        self.targets_tag_value
+    }
+}
+
 /// 一条已经实际影响某个译文的术语事实。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TerminologyDependency {

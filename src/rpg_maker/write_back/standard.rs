@@ -22,7 +22,8 @@ use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, LogicalTextLocation,
     MutationClaim, MutationClaimIndex, MutationClaimSet, MutationResource, MutationResourceLock,
-    TextProjectionRecipe, TextUnitContent, TextUnitRole, mutation_claims_for_group,
+    TextProjectionRecipe, TextUnitContent, TextUnitContentStructureError, TextUnitContentView,
+    TextUnitRole, mutation_claims_for_group, validate_text_unit_content_structure,
 };
 use crate::rpg_maker::project::{MaxFullwidthChars, OpenedProject, RpgMakerWriteBackLayoutProfile};
 use crate::rpg_maker::text::{
@@ -45,14 +46,12 @@ impl StandardWriteBackUnit {
         source_content: TextUnitContent,
         translation_content: Option<TextUnitContent>,
     ) -> Result<Self, StandardWriteBackSnapshotError> {
-        validate_content_shape(&role, &source_content)?;
-        validate_content_lines(&role, &source_content, "原文")?;
+        validate_content_structure(&role, &source_content, "原文")?;
         if source_content.is_blank() {
             return Err(StandardWriteBackSnapshotError::BlankSourceContent { role });
         }
         if let Some(translation) = &translation_content {
-            validate_content_shape(&role, translation)?;
-            validate_content_lines(&role, translation, "译文")?;
+            validate_content_structure(&role, translation, "译文")?;
             if translation.is_blank() {
                 return Err(StandardWriteBackSnapshotError::BlankTranslationContent { role });
             }
@@ -120,58 +119,30 @@ fn aligned_replacement_lines(unit: &StandardWriteBackUnit) -> Option<Vec<String>
     )
 }
 
-fn validate_content_shape(
-    role: &TextUnitRole,
-    content: &TextUnitContent,
-) -> Result<(), StandardWriteBackSnapshotError> {
-    if role.expects_lines() != matches!(content, TextUnitContent::Lines(_)) {
-        return Err(StandardWriteBackSnapshotError::ContentShapeMismatch { role: role.clone() });
-    }
-    Ok(())
-}
-
-fn validate_content_lines(
+fn validate_content_structure(
     role: &TextUnitRole,
     content: &TextUnitContent,
     column: &'static str,
 ) -> Result<(), StandardWriteBackSnapshotError> {
-    match content {
-        TextUnitContent::Value(value) => {
-            if value.contains('\0') {
-                return Err(StandardWriteBackSnapshotError::InvalidContentLine {
-                    role: role.clone(),
-                    column,
-                    line_index: 0,
-                });
+    validate_text_unit_content_structure(role, TextUnitContentView::from(content)).map_err(
+        |error| match error {
+            TextUnitContentStructureError::ShapeMismatch => {
+                StandardWriteBackSnapshotError::ContentShapeMismatch { role: role.clone() }
             }
-            if matches!(role, TextUnitRole::DialogueSpeaker)
-                && (value.contains('\r') || value.contains('\n'))
-            {
-                return Err(StandardWriteBackSnapshotError::InvalidContentLine {
-                    role: role.clone(),
-                    column,
-                    line_index: 0,
-                });
-            }
-        }
-        TextUnitContent::Lines(lines) => {
-            if lines.is_empty() {
-                return Err(StandardWriteBackSnapshotError::EmptyLineContent {
-                    role: role.clone(),
-                    column,
-                });
-            }
-            if let Some(line_index) = lines.iter().position(|line| {
-                line.chars()
-                    .any(|value| matches!(value, '\r' | '\n' | '\0'))
-            }) {
-                return Err(StandardWriteBackSnapshotError::InvalidContentLine {
+            TextUnitContentStructureError::InvalidText { line_index } => {
+                StandardWriteBackSnapshotError::InvalidContentLine {
                     role: role.clone(),
                     column,
                     line_index,
-                });
+                }
             }
-        }
+        },
+    )?;
+    if matches!(content, TextUnitContent::Lines(lines) if lines.is_empty()) {
+        return Err(StandardWriteBackSnapshotError::EmptyLineContent {
+            role: role.clone(),
+            column,
+        });
     }
     Ok(())
 }
