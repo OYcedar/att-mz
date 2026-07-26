@@ -1586,8 +1586,8 @@ fn fixture_asset_fingerprint(owner: &str, groups: &[FixtureGroup]) -> [u8; 32] {
 
     let owner = RpgMakerStandardAssetOwner::from_storage_name(owner)
         .expect("测试夹具 owner 应为合法 storage 名称");
-    let project_definition = (owner == RpgMakerStandardAssetOwner::Builtin)
-        .then_some(DIALOGUE_DEFINITION_JSON);
+    let project_definition =
+        (owner == RpgMakerStandardAssetOwner::Builtin).then_some(DIALOGUE_DEFINITION_JSON);
     let mut builder = StandardTextSnapshotFingerprintBuilder::new(owner, project_definition);
     for group in owner_groups {
         builder.group(

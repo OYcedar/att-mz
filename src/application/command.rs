@@ -6790,18 +6790,14 @@ fn init_preserve_observability_diagnostic(
                 )
                 .with_recovery(crate::diagnostic::RecoveryFact::path(root)),
         },
-        PreserveObservabilityFailure::List { path, source } => {
-            init_directory_listing_diagnostic(
-                source,
-                DiagnosticCode::ProjectState,
-                DiagnosticAction::CheckProjectState,
-            )
-            .with_recovery(crate::diagnostic::RecoveryFact::path(path))
-        }
+        PreserveObservabilityFailure::List { path, source } => init_directory_listing_diagnostic(
+            source,
+            DiagnosticCode::ProjectState,
+            DiagnosticAction::CheckProjectState,
+        )
+        .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
         PreserveObservabilityFailure::Read { path, source } => match source {
-            ReadFileError::NotFound { path } => {
-                invalid_path(path, DiagnosticFailureKind::NotFound)
-            }
+            ReadFileError::NotFound { path } => invalid_path(path, DiagnosticFailureKind::NotFound),
             ReadFileError::NotFile { path } => {
                 invalid_path(path, DiagnosticFailureKind::InvalidPath)
             }
