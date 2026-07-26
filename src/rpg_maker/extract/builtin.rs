@@ -1,6 +1,6 @@
 //! RPG Maker 固定位置文本与标准事件块的完整 Builtin 快照提取。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -1316,11 +1316,18 @@ fn extract_event_list(
     dialogue_projection: &mut BuiltinDialogueProjection,
     groups: &mut Vec<ExtractedTextGroup>,
 ) -> Result<(), BuildBuiltinSnapshotError> {
+    // 主索引严格单调前进；Choices 按 indent 直接定位未闭合帧。因而规范事件列表的
+    // 结构扫描成本是 O(command_count + projected_choice_branches)，不会再乘以嵌套深度。
+    // 输出槽在 102 处预留，使延迟到 404 才完整的组仍保持原始前序位置。
+    let mut groups_in_natural_order = Vec::<Option<ExtractedTextGroup>>::new();
+    let mut choice_frames = Vec::<Option<PendingChoiceExtraction>>::new();
+    let mut choice_frames_by_indent = HashMap::<i64, Vec<usize>>::new();
     let mut command_index = 0;
     while command_index < list.len() {
         let command = command_at(&source, &list_steps, list, command_index)?;
         match command.code {
             101 => {
+                let mut extracted = Vec::new();
                 command_index = extract_dialogue(
                     &source,
                     &list_steps,
@@ -1328,45 +1335,91 @@ fn extract_event_list(
                     command_index,
                     command.parameters,
                     dialogue_projection,
-                    groups,
+                    &mut extracted,
                 )?;
+                groups_in_natural_order.extend(extracted.into_iter().map(Some));
             }
-            102 => extract_choices(
-                &source,
-                &list_steps,
-                list,
-                command_index,
-                command.parameters,
-                groups,
-            )?,
+            102 => {
+                let output_slot = groups_in_natural_order.len();
+                if let Some(frame) = begin_choices(
+                    &source,
+                    &list_steps,
+                    list,
+                    command_index,
+                    command.parameters,
+                    output_slot,
+                )? {
+                    groups_in_natural_order.push(None);
+                    let indent = frame.indent();
+                    let frame_index = choice_frames.len();
+                    choice_frames.push(Some(frame));
+                    choice_frames_by_indent
+                        .entry(indent)
+                        .or_default()
+                        .push(frame_index);
+                }
+            }
             105 => {
-                command_index =
-                    extract_scrolling_text(&source, &list_steps, list, command_index, groups)?;
+                let mut extracted = Vec::new();
+                command_index = extract_scrolling_text(
+                    &source,
+                    &list_steps,
+                    list,
+                    command_index,
+                    &mut extracted,
+                )?;
+                groups_in_natural_order.extend(extracted.into_iter().map(Some));
             }
-            320 => extract_actor_change(
-                &source,
-                &list_steps,
-                command_index,
-                command.parameters,
-                "name",
-                groups,
-            )?,
-            324 => extract_actor_change(
-                &source,
-                &list_steps,
-                command_index,
-                command.parameters,
-                "nickname",
-                groups,
-            )?,
-            325 => extract_actor_change(
-                &source,
-                &list_steps,
-                command_index,
-                command.parameters,
-                "profile",
-                groups,
-            )?,
+            320 | 324 | 325 => {
+                let field = match command.code {
+                    320 => "name",
+                    324 => "nickname",
+                    325 => "profile",
+                    _ => unreachable!("match 已收窄角色字段变更命令"),
+                };
+                let mut extracted = Vec::new();
+                extract_actor_change(
+                    &source,
+                    &list_steps,
+                    command_index,
+                    command.parameters,
+                    field,
+                    &mut extracted,
+                )?;
+                groups_in_natural_order.extend(extracted.into_iter().map(Some));
+            }
+            402 | 404 if !choice_frames_by_indent.is_empty() => {
+                // 旧的每-102 向后扫描会检查其区间内每条 402/404 的 indent，即使它
+                // 最终属于另一层。主循环只在确有未闭合的非空 Choices 时保持该语义。
+                let indent = command_indent(list, command_index, &command.location)?;
+                if command.code == 402 {
+                    if let Some(frame_indexes) = choice_frames_by_indent.get(&indent) {
+                        for &frame_index in frame_indexes {
+                            choice_frames[frame_index]
+                                .as_mut()
+                                .expect("indent 索引只能指向未闭合 Choices")
+                                .observe_branch(
+                                    &source,
+                                    &list_steps,
+                                    command_index,
+                                    command.parameters,
+                                )?;
+                        }
+                    }
+                } else if let Some(frame_indexes) = choice_frames_by_indent.remove(&indent) {
+                    for frame_index in frame_indexes {
+                        let frame = choice_frames[frame_index]
+                            .take()
+                            .expect("同一 Choices 只能由第一条同层 404 闭合");
+                        let output_slot = frame.output_slot();
+                        let group = frame.finish(&source, &list_steps, command_index)?;
+                        let slot = groups_in_natural_order
+                            .get_mut(output_slot)
+                            .expect("Choices 输出槽必须在 102 扫描时建立");
+                        assert!(slot.replace(group).is_none(), "Choices 输出槽只能填充一次");
+                    }
+                }
+            }
             401 | 405 => {
                 return Err(BuiltinDocumentError::new(
                     command.location.to_string(),
@@ -1380,6 +1433,19 @@ fn extract_event_list(
         }
         command_index += 1;
     }
+
+    if let Some(frame) = choice_frames.into_iter().flatten().next() {
+        return Err(BuiltinDocumentError::new(
+            frame.group_location().to_string(),
+            BuiltinDocumentFailure::ChoiceEndMissing,
+        )
+        .into());
+    }
+    groups.extend(
+        groups_in_natural_order
+            .into_iter()
+            .map(|group| group.expect("成功事件扫描不得留下未闭合 Choices 输出槽")),
+    );
     Ok(())
 }
 
@@ -1577,14 +1643,135 @@ fn project_mv_dialogue(
     .map_err(Into::into)
 }
 
-fn extract_choices(
+struct PendingChoiceExtraction {
+    output_slot: usize,
+    indent: i64,
+    choices_location: RpgMakerLocation,
+    group_location: RpgMakerLocation,
+    choice_texts: Vec<String>,
+    branch_indexes: BTreeSet<usize>,
+    recipes: Vec<TextProjectionRecipe>,
+    covered_values: Vec<RpgMakerLocation>,
+}
+
+impl PendingChoiceExtraction {
+    fn output_slot(&self) -> usize {
+        self.output_slot
+    }
+
+    fn indent(&self) -> i64 {
+        self.indent
+    }
+
+    fn group_location(&self) -> &RpgMakerLocation {
+        &self.group_location
+    }
+
+    fn observe_branch(
+        &mut self,
+        source: &RpgMakerSource,
+        list_steps: &[RpgMakerLocationStep],
+        command_index: usize,
+        parameters: &[Value],
+    ) -> Result<(), BuildBuiltinSnapshotError> {
+        self.covered_values.extend([
+            command_field_location(source, list_steps, command_index, "code"),
+            command_field_location(source, list_steps, command_index, "indent"),
+        ]);
+        let index_location = parameter_location(source, list_steps, command_index, 0);
+        let raw_choice_index = parameters.first().and_then(Value::as_i64);
+        let choice_index = raw_choice_index
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < self.choice_texts.len())
+            .ok_or_else(|| {
+                BuiltinDocumentError::new(
+                    index_location.to_string(),
+                    BuiltinDocumentFailure::ChoiceIndexInvalid {
+                        actual: raw_choice_index,
+                        option_count: self.choice_texts.len(),
+                    },
+                )
+            })?;
+        if !self.branch_indexes.insert(choice_index) {
+            return Err(BuiltinDocumentError::new(
+                index_location.to_string(),
+                BuiltinDocumentFailure::DuplicateChoiceBranch { choice_index },
+            )
+            .into());
+        }
+        let text_location = parameter_location(source, list_steps, command_index, 1);
+        let branch_text = parameter_string(parameters, 1, &text_location)?;
+        if branch_text != self.choice_texts[choice_index] {
+            return Err(BuiltinDocumentError::new(
+                text_location.to_string(),
+                BuiltinDocumentFailure::ChoiceBranchTextMismatch { choice_index },
+            )
+            .into());
+        }
+        self.covered_values.push(index_location);
+        self.covered_values.push(text_location.clone());
+        self.recipes.push(TextProjectionRecipe::Direct(
+            DirectTextRecipe::new(
+                text_location,
+                branch_text,
+                vec![DirectTextPart::LineSlot {
+                    role: TextUnitRole::Choices,
+                    source_line_index: choice_index,
+                }],
+            )
+            .map_err(SnapshotModelError::Projection)?,
+        ));
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        source: &RpgMakerSource,
+        list_steps: &[RpgMakerLocationStep],
+        end_index: usize,
+    ) -> Result<ExtractedTextGroup, BuildBuiltinSnapshotError> {
+        self.covered_values.extend([
+            command_field_location(source, list_steps, end_index, "code"),
+            command_field_location(source, list_steps, end_index, "indent"),
+        ]);
+        if self.branch_indexes.len() != self.choice_texts.len() {
+            return Err(BuiltinDocumentError::new(
+                self.group_location.to_string(),
+                BuiltinDocumentFailure::ChoiceBranchesIncomplete {
+                    expected: self.choice_texts.len(),
+                    actual: self.branch_indexes.len(),
+                },
+            )
+            .into());
+        }
+
+        self.recipes.push(TextProjectionRecipe::Claim(
+            MutationClaim::event_block(self.group_location.clone(), self.covered_values)
+                .map_err(SnapshotModelError::Projection)?,
+        ));
+        let unit = ExtractedTextUnit::projected(
+            TextUnitRole::Choices,
+            self.choices_location,
+            TextUnitContent::Lines(self.choice_texts),
+        )?;
+        ExtractedTextGroup::projected(
+            TextGroupKind::EventChoices,
+            self.group_location,
+            vec![unit],
+            self.recipes,
+        )
+        .map_err(Into::into)
+    }
+}
+
+fn begin_choices(
     source: &RpgMakerSource,
     list_steps: &[RpgMakerLocationStep],
     list: &[Value],
     command_index: usize,
     parameters: &[Value],
-    groups: &mut Vec<ExtractedTextGroup>,
-) -> Result<(), BuildBuiltinSnapshotError> {
+    output_slot: usize,
+) -> Result<Option<PendingChoiceExtraction>, BuildBuiltinSnapshotError> {
     let choices_location = parameter_location(source, list_steps, command_index, 0);
     let group_location = command_location(source, list_steps, command_index);
     let choices = parameters
@@ -1602,7 +1789,7 @@ fn extract_choices(
         })
         .collect::<Result<Vec<_>, _>>()?;
     if choice_texts.iter().all(|choice| choice.trim().is_empty()) {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut recipes = Vec::new();
@@ -1611,11 +1798,10 @@ fn extract_choices(
         command_field_location(source, list_steps, command_index, "code"),
         command_field_location(source, list_steps, command_index, "indent"),
     ];
-    for (choice_index, choice) in choices.iter().enumerate() {
+    for (choice_index, text) in choice_texts.iter().enumerate() {
         let mut steps = value_steps(&choices_location);
         steps.push(RpgMakerLocationStep::index(choice_index));
         let exact_location = RpgMakerLocation::value(source.clone(), steps);
-        let text = expect_string(choice, &exact_location)?;
         covered_values.push(exact_location.clone());
         recipes.push(TextProjectionRecipe::Direct(
             DirectTextRecipe::new(
@@ -1630,113 +1816,21 @@ fn extract_choices(
         ));
     }
 
-    let choice_indent = command_indent(
+    let indent = command_indent(
         list,
         command_index,
         &command_location(source, list_steps, command_index),
     )?;
-    let mut branch_indexes = BTreeSet::new();
-    let mut end_location = None;
-    for branch_command_index in command_index + 1..list.len() {
-        let command = command_at(source, list_steps, list, branch_command_index)?;
-        if !matches!(command.code, 402 | 404) {
-            continue;
-        }
-        let indent = command_indent(list, branch_command_index, &command.location)?;
-        if command.code == 404 && indent == choice_indent {
-            covered_values.extend([
-                command_field_location(source, list_steps, branch_command_index, "code"),
-                command_field_location(source, list_steps, branch_command_index, "indent"),
-            ]);
-            end_location = Some(command.location.clone());
-            break;
-        }
-        if command.code != 402 || indent != choice_indent {
-            continue;
-        }
-        covered_values.extend([
-            command_field_location(source, list_steps, branch_command_index, "code"),
-            command_field_location(source, list_steps, branch_command_index, "indent"),
-        ]);
-        let index_location = parameter_location(source, list_steps, branch_command_index, 0);
-        let raw_choice_index = command.parameters.first().and_then(Value::as_i64);
-        let choice_index = raw_choice_index
-            .and_then(|index| usize::try_from(index).ok())
-            .filter(|index| *index < choice_texts.len())
-            .ok_or_else(|| {
-                BuiltinDocumentError::new(
-                    index_location.to_string(),
-                    BuiltinDocumentFailure::ChoiceIndexInvalid {
-                        actual: raw_choice_index,
-                        option_count: choice_texts.len(),
-                    },
-                )
-            })?;
-        if !branch_indexes.insert(choice_index) {
-            return Err(BuiltinDocumentError::new(
-                index_location.to_string(),
-                BuiltinDocumentFailure::DuplicateChoiceBranch { choice_index },
-            )
-            .into());
-        }
-        let text_location = parameter_location(source, list_steps, branch_command_index, 1);
-        let branch_text = parameter_string(command.parameters, 1, &text_location)?;
-        if branch_text != choice_texts[choice_index] {
-            return Err(BuiltinDocumentError::new(
-                text_location.to_string(),
-                BuiltinDocumentFailure::ChoiceBranchTextMismatch { choice_index },
-            )
-            .into());
-        }
-        covered_values.push(index_location);
-        covered_values.push(text_location.clone());
-        recipes.push(TextProjectionRecipe::Direct(
-            DirectTextRecipe::new(
-                text_location,
-                branch_text,
-                vec![DirectTextPart::LineSlot {
-                    role: TextUnitRole::Choices,
-                    source_line_index: choice_index,
-                }],
-            )
-            .map_err(SnapshotModelError::Projection)?,
-        ));
-    }
-    let Some(_) = end_location else {
-        return Err(BuiltinDocumentError::new(
-            command_location(source, list_steps, command_index).to_string(),
-            BuiltinDocumentFailure::ChoiceEndMissing,
-        )
-        .into());
-    };
-    if branch_indexes.len() != choice_texts.len() {
-        return Err(BuiltinDocumentError::new(
-            command_location(source, list_steps, command_index).to_string(),
-            BuiltinDocumentFailure::ChoiceBranchesIncomplete {
-                expected: choice_texts.len(),
-                actual: branch_indexes.len(),
-            },
-        )
-        .into());
-    }
-
-    recipes.push(TextProjectionRecipe::Claim(
-        MutationClaim::event_block(group_location.clone(), covered_values)
-            .map_err(SnapshotModelError::Projection)?,
-    ));
-
-    let unit = ExtractedTextUnit::projected(
-        TextUnitRole::Choices,
+    Ok(Some(PendingChoiceExtraction {
+        output_slot,
+        indent,
         choices_location,
-        TextUnitContent::Lines(choice_texts),
-    )?;
-    groups.push(ExtractedTextGroup::projected(
-        TextGroupKind::EventChoices,
         group_location,
-        vec![unit],
+        choice_texts,
+        branch_indexes: BTreeSet::new(),
         recipes,
-    )?);
-    Ok(())
+        covered_values,
+    }))
 }
 
 fn extract_scrolling_text(
@@ -2938,6 +3032,19 @@ mod tests {
         let mut kinds = common_event_groups
             .map(ExtractedTextGroup::kind)
             .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                TextGroupKind::EventChoices,
+                TextGroupKind::EventDialogue,
+                TextGroupKind::EventScrollingText,
+                TextGroupKind::EventCommand,
+                TextGroupKind::EventCommand,
+                TextGroupKind::EventCommand,
+                TextGroupKind::EventChoices,
+            ],
+            "延迟到 404 完成的外层 Choices 仍必须按 102 起始位置排在分支正文之前"
+        );
         kinds.sort();
 
         assert_eq!(
@@ -2970,6 +3077,162 @@ mod tests {
             3,
             "320、324、325 必须能与外层选项共存"
         );
+    }
+
+    #[test]
+    fn deeply_nested_choices_keep_preorder_without_rescanning_parent_intervals() {
+        const DEPTH: usize = 512;
+
+        let mut list = Vec::with_capacity(DEPTH * 3 + 1);
+        for depth in 0..DEPTH {
+            let indent = i64::try_from(depth).expect("测试深度必须适合 i64");
+            let text = format!("层{depth}");
+            list.push(json!({
+                "code": 102,
+                "indent": indent,
+                "parameters": [[text.clone()]],
+            }));
+            list.push(json!({
+                "code": 402,
+                "indent": indent,
+                "parameters": [0, text],
+            }));
+        }
+        for depth in (0..DEPTH).rev() {
+            list.push(json!({
+                "code": 404,
+                "indent": i64::try_from(depth).expect("测试深度必须适合 i64"),
+                "parameters": [],
+            }));
+        }
+        list.push(json!({"code": 0, "indent": 0, "parameters": []}));
+
+        let mut documents = complete_documents();
+        documents.insert_document(
+            RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+            json!([null, {"list": list}]),
+        );
+
+        let snapshot =
+            build_builtin_snapshot(&documents).expect("深层 Choices 应由一个前向主扫描完成");
+        let choices = snapshot
+            .groups()
+            .iter()
+            .filter(|group| {
+                group.kind() == TextGroupKind::EventChoices
+                    && group
+                        .group_location()
+                        .to_string()
+                        .starts_with("data/CommonEvents.json")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(choices.len(), DEPTH);
+        for (depth, group) in choices.into_iter().enumerate() {
+            assert_eq!(
+                group.group_location().to_string(),
+                format!("data/CommonEvents.json[1].list[{}]", depth * 2)
+            );
+            assert_eq!(
+                unit_lines(group, TextUnitRole::Choices),
+                [format!("层{depth}")]
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_and_empty_choice_intervals_keep_skip_and_slot_semantics() {
+        let mut documents = complete_documents();
+        documents.insert_document(
+            RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+            json!([null, {"list": [
+                {"code": 102, "parameters": [[]]},
+                {"code": 102, "parameters": [["   ", ""]]},
+                {"code": 102, "indent": 0, "parameters": [["第一", ""]]},
+                {"code": 402, "indent": 0, "parameters": [0, "第一"]},
+                {"code": 402, "indent": 0, "parameters": [1, ""]},
+                {"code": 404, "indent": 0, "parameters": []},
+                {"code": 102, "indent": 0, "parameters": [["第二"]]},
+                {"code": 402, "indent": 0, "parameters": [0, "第二"]},
+                {"code": 404, "indent": 0, "parameters": []},
+                {"code": 0, "indent": 0, "parameters": []}
+            ]}]),
+        );
+
+        let snapshot =
+            build_builtin_snapshot(&documents).expect("空 Choices 应跳过，相邻非空块应独立提取");
+        let choices = snapshot
+            .groups()
+            .iter()
+            .filter(|group| {
+                group.kind() == TextGroupKind::EventChoices
+                    && group
+                        .group_location()
+                        .to_string()
+                        .starts_with("data/CommonEvents.json")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(choices.len(), 2);
+        assert_eq!(
+            choices[0].group_location().to_string(),
+            "data/CommonEvents.json[1].list[2]"
+        );
+        assert_eq!(unit_lines(choices[0], TextUnitRole::Choices), ["第一", ""]);
+        assert_eq!(
+            choices[1].group_location().to_string(),
+            "data/CommonEvents.json[1].list[6]"
+        );
+        assert_eq!(unit_lines(choices[1], TextUnitRole::Choices), ["第二"]);
+    }
+
+    #[test]
+    fn abnormal_choice_intervals_keep_existing_failure_kinds() {
+        let cases = [
+            (
+                json!([
+                    {"code": 102, "indent": 0, "parameters": [["外层"]]},
+                    {"code": 402, "indent": 0, "parameters": [0, "外层"]},
+                    {"code": 102, "indent": 1, "parameters": [["内层"]]},
+                    {"code": 402, "indent": 1, "parameters": [0, "内层"]},
+                    {"code": 404, "indent": 1, "parameters": []}
+                ]),
+                BuiltinDocumentFailure::ChoiceEndMissing,
+            ),
+            (
+                json!([
+                    {"code": 102, "indent": 0, "parameters": [["一", "二"]]},
+                    {"code": 402, "indent": 0, "parameters": [0, "一"]},
+                    {"code": 404, "indent": 0, "parameters": []}
+                ]),
+                BuiltinDocumentFailure::ChoiceBranchesIncomplete {
+                    expected: 2,
+                    actual: 1,
+                },
+            ),
+            (
+                json!([
+                    {"code": 102, "indent": 0, "parameters": [["一"]]},
+                    {"code": 402, "indent": "bad", "parameters": [0, "一"]},
+                    {"code": 404, "indent": 0, "parameters": []}
+                ]),
+                BuiltinDocumentFailure::EventIndentMustBeInteger,
+            ),
+        ];
+
+        for (list, expected) in cases {
+            let mut documents = complete_documents();
+            documents.insert_document(
+                RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+                json!([null, {"list": list}]),
+            );
+
+            let error = build_builtin_snapshot(&documents).expect_err("异常 Choices 区间必须失败");
+            let BuildBuiltinSnapshotError::Malformed(error) = error else {
+                panic!("Choices 区间异常必须保持文档结构错误语义");
+            };
+            assert_eq!(error.reason, expected);
+        }
     }
 
     #[test]
