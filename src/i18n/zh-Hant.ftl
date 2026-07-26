@@ -171,25 +171,245 @@ diagnostic-recovery-value = { $kind ->
 }
 diagnostic-related = 相關錯誤 { $index }：
 diagnostic-stage-value = { $code ->
+    [process_startup] 處理程序啟動
     [process_output] 處理程序輸出
+    [configuration] 設定載入
+    [command_preparation] 指令準備
+    [project_opening] 開啟專案
+    [init] 初始化
+    [extract] 擷取
+    [translate] 翻譯
+    [write_back] 寫回
     [lua] 專案 Lua 執行
-   *[other] { $fallback }
+    [model_request] 模型請求
+    [run_plan_finalization] 執行計畫收尾
+    [publication] 發佈
+    [shutdown] 關閉
+    [logging] 專案記錄
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-impact-value = { $code ->
-   *[other] { $fallback }
+    [unchanged] 狀態未變更
+    [valid_progress_preserved] 已保留有效進度
+    [result_applied_but_run_plan_not_saved] 結果已套用，但執行計畫未儲存
+    [state_applied_but_finalization_failed] 狀態已套用，但收尾未完成
+    [recovery_required] 必須先復原，才能信任目前狀態
+    [outcome_unknown] 最終狀態未知
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-action-value = { $code ->
-   *[other] { $fallback }
+    [fix_configuration] 修正指出的設定欄位後重試
+    [fix_input] 修正指出的輸入後重試
+    [check_path_and_permissions] 檢查路徑、檔案系統狀態與權限
+    [check_project_state] 檢查並修正專案狀態後重試
+    [retry_after_resolving_contention] 等待衝突作業結束後重試
+    [check_model_service] 檢查模型服務回應與帳戶配額
+    [preserve_recovery_artifacts] 請勿刪除列出的復原產物；先復原輸出，再重試
+    [retry] 重試此作業
+    [report_bug] 附上錯誤碼與記錄路徑，回報此 ATT 缺陷
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
-   *[other] { $fallback }
+    [missing_required_value] 缺少必填值
+    [extract_plan_required] 專案沒有可重用的 Extract 計畫；請提供 --builtin、--rules 或 --lua 中的至少一項
+    [conflicting_values] 提供的值互相衝突
+    [invalid_syntax] 值的語法無效
+    [invalid_encoding] 文字編碼無效
+    [invalid_value] 值不符合必要契約
+    [not_found] 必要物件不存在
+    [busy] 資源正由其他作業持有
+    [state_mismatch] 已儲存的專案狀態不符合此作業需求
+    [requirement_failed] 必要前置條件未滿足
+    [transaction_rolled_back] 交易失敗，變更已回復
+    [transaction_outcome_unknown] 無法確認交易已提交或回復
+    [finalization_failed] 作業結果已產生，但收尾失敗
+    [rollback_failed] 主要作業失敗，且回復也失敗
+    [external_service_rejected] 外部服務拒絕了請求
+    [external_service_unavailable] 外部服務目前不可用
+    [executor_closed] 執行服務正在關閉或已經關閉
+    [concurrent_shutdown] 另一個呼叫端正在關閉執行器
+    [executor_state_poisoned] 執行器生命週期狀態已損壞
+    [worker_spawn_failed] 作業系統無法建立工作執行緒
+    [worker_channel_closed] 工作執行緒命令通道在收尾完成前關閉
+    [worker_panicked] 工作執行緒意外終止
+    [reparse_point_forbidden] 路徑包含不可信任的重新解析點
+    [non_local_volume] 路徑不在本機固定磁碟區上
+    [non_ntfs_volume] 路徑不在 NTFS 磁碟區上
+    [case_sensitive_directory] 目錄啟用了區分大小寫的名稱語意
+    [lock_cancelled] 等待必要鎖定時作業被取消
+    [target_already_exists] 目的地已存在
+    [file_identity_changed] 作業期間檔案識別已變更
+    [invalid_path] 路徑不是此作業的有效目標
+    [wrong_publisher_instance] 發佈權杖屬於另一個發佈器執行個體
+    [journal_corrupt] 發佈復原日誌無效或不完整
+    [unexpected_artifact] 非預期的檔案系統產物阻擋了作業
+    [interactive_session_already_open] 另一個互動式 SQLite 工作階段已在執行
+    [backup_incomplete] SQLite 備份未達到完成狀態
+    [request_serialization_failed] 無法序列化模型請求
+    [response_parsing_failed] 模型回應不是有效的 JSON
+    [invalid_response_contract] 模型回應不符合必要的回應契約
+    [transport_failed] 收到有效回應前 HTTP 傳輸失敗
+    [lua_database_open_failed] Lua 主機無法開啟專案資料庫工作階段
+    [lua_context_creation_failed] Lua 執行階段無法建立 VM 內容
+    [lua_compilation_failed] 無法編譯 Lua 主程式
+    [lua_execution_failed] Lua 主程式執行時失敗
+    [lua_host_call_failed] Lua 主機功能呼叫失敗
+    [lua_finalization_failed] Lua 主機無法完成所有已繫結資源的收尾
+    [lua_unclosed_transaction] Lua 程式結束時交易仍開啟；該交易已回復
+    [lua_snapshot_store_failed] 無法提交已驗證的 Lua 擷取快照
+    [rules_definition_invalid] Rules 程式不符合 Rules 定義契約
+    [rules_document_read_failed] 無法讀取 Rules 程式需要的來源文件
+    [rules_no_non_blank_match] Rules 項目未產生任何非空白語意單元
+    [rules_invalid_target] Rules 項目選取了不能作為文字目標的值
+    [rules_pattern_match_failed] 無法評估 Rules 的 PCRE2 模式
+    [rules_zero_width_match] Rules 模式產生了零寬度相符項目
+    [rules_overlapping_capture] Rules 模式產生了重疊的文字擷取
+    [rules_missing_text_capture] 必要的具名文字擷取未參與比對
+    [rules_invalid_capture_range] Rules 相符項目或擷取範圍超出有效 UTF-8 字元邊界
+    [rules_duplicate_target] 兩個 Rules 項目宣告了相同的實體文字目標
+    [rules_invalid_materialization] Rules 投影配方無法重建來源值
+    [rules_snapshot_invalid] 擷取出的 Rules 群組無法組成有效的資產快照
+    [rules_snapshot_store_failed] 無法提交已驗證的 Rules 擷取快照
+    [write_back_extraction_out_of_date] 已擷取資產不再符合目前專案來源
+    [write_back_asset_snapshot_invalid] 已儲存的 Standard 資產無法組成有效的寫回快照
+    [source_document_invalid] RPG Maker 來源文件不符合必要的文件格式
+    [write_back_mutation_invalid] 已驗證的翻譯變更無法套用到凍結的來源位置
+    [write_back_output_path_invalid] 重寫檔案位於允許的 RPG Maker 輸出樹之外
+    [write_back_output_path_duplicate] 多個重寫檔案指向相同輸出路徑
+    [write_back_candidate_project_mismatch] 已準備的寫回候選屬於另一個專案
+    [write_back_candidate_invalid] 寫回候選不符合必要的 data/js 樹狀結構
+    [write_back_unexpected_lua_outcome] Lua 寫回程式傳回了其他 Lua 階段的結果
+    [write_back_not_published] 寫回候選未取代目前的輸出目錄
+    [write_back_published_with_residuals] 輸出已發佈，但部分復原產物無法移除
+    [write_back_recovery_required] 必須先復原輸出目錄，才能信任其中內容
+    [internal_invariant] 內部不變條件遭破壞；這是 ATT 缺陷
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-io-kind-value = { $code ->
-   *[other] { $fallback }
+    [not_found] 找不到物件
+    [permission_denied] 權限不足
+    [connection_refused] 連線遭拒
+    [connection_reset] 連線已重設
+    [host_unreachable] 無法連線到主機
+    [network_unreachable] 無法連線到網路
+    [connection_aborted] 連線已中止
+    [not_connected] 尚未連線
+    [address_in_use] 位址已在使用中
+    [address_not_available] 位址不可用
+    [network_down] 網路已中斷
+    [broken_pipe] 管道已中斷
+    [already_exists] 物件已存在
+    [would_block] 作業會封鎖
+    [not_a_directory] 物件不是目錄
+    [is_a_directory] 物件是目錄
+    [directory_not_empty] 目錄不是空的
+    [read_only_filesystem] 檔案系統是唯讀的
+    [stale_network_file_handle] 網路檔案控制代碼已失效
+    [invalid_input] 作業輸入無效
+    [invalid_data] 資料無效
+    [timed_out] 作業逾時
+    [write_zero] 寫入沒有進展
+    [storage_full] 儲存空間已滿
+    [not_seekable] 物件不支援搜尋位置
+    [quota_exceeded] 儲存配額已用盡
+    [file_too_large] 檔案超過底層系統可處理的大小
+    [resource_busy] 資源忙碌中
+    [executable_file_busy] 可執行檔正在使用中
+    [deadlock] 作業會造成死結
+    [crosses_devices] 作業跨越檔案系統裝置
+    [too_many_links] 檔案系統連結過多
+    [invalid_filename] 檔名無效
+    [argument_list_too_long] 作業系統引數清單太長
+    [interrupted] 作業已中斷
+    [unsupported] 不支援此作業
+    [unexpected_eof] 檔案意外結束
+    [out_of_memory] 作業系統無法配置記憶體
+    [other] 其他作業系統錯誤
+   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-   *[other] { $fallback }{ $facts }
+    [runtime_configuration_invalid] 執行階段設定無效
+    [unsupported_prompt_locale] 必須是全小寫 auto 或支援的 BCP 47 介面語言
+    [language_policy_term_blank] 語言原則詞彙不能為空白
+    [language_policy_term_surrounding_whitespace] 語言原則詞彙不能包含前後空白
+    [language_policy_term_duplicate] 語言原則詞彙不能重複
+    [quote_repair_candidates_empty] 引號修復候選清單不能為空
+    [quote_repair_delimiter_invalid] 引號修復分隔符號不能是英數字元、空白或控制字元
+    [quote_repair_pair_duplicate] 引號修復配對不能重複
+    [quote_repair_delimiter_ambiguous] 引號修復分隔符號必須只屬於一個配對
+    [language_id_blank] 語言 ID 不能為空白
+    [language_id_surrounding_whitespace] 語言 ID 不能包含前後空白
+    [language_id_uses_underscore] 語言 ID 的子標籤間必須使用連字號
+    [language_id_invalid_syntax] 語言 ID 必須符合 RFC 5646 語法
+    [language_id_invalid_registry_tag] 語言 ID 包含無效的登錄子標籤
+    [language_id_canonicalization_failed] 無法正規化語言 ID
+    [language_id_undefined_primary_language] 語言 ID 必須定義主要語言
+    [language_id_duplicate] 語言 ID 必須唯一
+    [language_catalog_empty] 至少需要一個來源語言模組
+    [url_invalid] 值必須是有效的 URL
+    [url_credentials_forbidden] URL 不能包含認證資訊
+    [url_fragment_forbidden] URL 不能包含片段
+    [url_scheme_unsupported] URL 配置必須是 http 或 https
+    [api_key_blank] API key 不能為空白
+    [api_key_surrounding_whitespace] API key 不能包含前後空白
+    [api_key_invalid_header] API key 無法表示為 HTTP Header 值
+    [strict_json_invalid] 值必須是嚴格 JSON（列={ $line }，欄={ $column }）
+    [json_object_required] 值必須是 JSON 物件
+    [reserved_request_field] 此欄位由請求協定擁有，不能覆寫
+    [proxy_must_be_false_or_url] proxy 必須是 false 或完整的 http/https URL
+    [pem_path_duplicate] PEM 路徑必須唯一
+    [runtime_maximum_exceeded] 值超過執行階段上限（實際值={ $actual }，上限={ $maximum }）
+    [value_surrounding_whitespace] 值不能包含前後空白
+    [value_blank] 值不能為空白
+    [path_blank] 路徑不能為空
+    [positive_required] 值必須大於零（實際值={ $actual }）
+    [usize_range_exceeded] 值超過此平台的 usize 範圍（實際值={ $actual }）
+    [u32_range_exceeded] 值超過 u32 範圍（實際值={ $actual }）
+    [duplicate_profile_id] 翻譯設定檔 ID 必須唯一
+    [selected_profile_invalid] 所選翻譯設定檔的結構或欄位類型無效
+    [referenced_client_not_found] 參照的 LLM 用戶端不存在
+   *[other] __ATT_FALLBACK__
 }
+diagnostic-io-reason = 作業 { $operation }：{ $kind }
+diagnostic-io-reason-with-os-code = 作業 { $operation }：{ $kind }（OS { $os_code }）
+diagnostic-io-reason-with-system-message = 作業 { $operation }：{ $kind }：{ $system_message }
+diagnostic-io-reason-with-os-code-and-system-message = 作業 { $operation }：{ $kind }（OS { $os_code }）：{ $system_message }
+diagnostic-failure-with-detail = { $failure }：{ $detail }
+diagnostic-invalid-utf8 = 第 { $valid_up_to } 位元組的 UTF-8 無效，無效長度為 { $error_len } 位元組
+diagnostic-incomplete-utf8 = 第 { $valid_up_to } 位元組後是未完成的 UTF-8 序列
+diagnostic-toml-failure-value = { $code ->
+    [syntax] TOML 語法無效
+    [missing_field] 缺少必填設定欄位
+    [unknown_field] 設定包含未知欄位
+    [duplicate_field] 設定欄位被重複宣告
+    [type_mismatch] 應為{ $expected }
+    [invalid_value] 設定值不符合欄位契約
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-toml-expected-kind-value = { $code ->
+    [string] 字串
+    [integer] 整數
+    [boolean] 布林值
+    [string_or_boolean] 字串或布林值
+    [string_array] 字串陣列
+    [integer_array] 整數陣列
+    [string_pair_array] 字串配對陣列
+    [table] 表格
+    [table_array] 表格陣列
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-invalid-toml = TOML 無效（{ $resource }）：{ $failure }
+diagnostic-invalid-toml-at = TOML 第 { $line } 列、第 { $column } 欄無效（{ $resource }）：{ $failure }
+diagnostic-http-no-details = 模型服務請求失敗，但未傳回可公開的 HTTP 狀態詳細資料
+diagnostic-http-status = HTTP 狀態碼 { $status }
+diagnostic-http-retry-after = Retry-After { $seconds } 秒
+diagnostic-http-provider-code = 供應商錯誤碼 { $code }
+diagnostic-http-provider-type = 供應商錯誤類型 { $kind }
+diagnostic-http-fact-separator = ；
+diagnostic-sqlite = SQLite 主要錯誤碼 { $primary_code }，延伸錯誤碼 { $extended_code }
+diagnostic-windows-status = Windows 作業 { $operation } 失敗，NTSTATUS { $status }
+diagnostic-resource = { $resource }：實際值 { $actual }
+diagnostic-resource-with-maximum = { $resource }：實際值 { $actual }，上限 { $maximum }
 task-record-title = 翻譯任務 { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] 完成

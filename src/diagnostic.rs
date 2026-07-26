@@ -219,26 +219,6 @@ impl DiagnosticStage {
             Self::Logging => "logging",
         }
     }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::ProcessStartup => "process startup",
-            Self::ProcessOutput => "process output",
-            Self::Configuration => "configuration loading",
-            Self::CommandPreparation => "command preparation",
-            Self::ProjectOpening => "project opening",
-            Self::Init => "initialization",
-            Self::Extract => "extraction",
-            Self::Translate => "translation",
-            Self::WriteBack => "write-back",
-            Self::Lua => "project Lua execution",
-            Self::ModelRequest => "model request",
-            Self::RunPlanFinalization => "run-plan finalization",
-            Self::Publication => "publication",
-            Self::Shutdown => "shutdown",
-            Self::Logging => "project logging",
-        }
-    }
 }
 
 /// 可公开的失败对象。所有动态文本在构造时清理控制字符。
@@ -489,50 +469,6 @@ impl SafeIoKind {
             Self::Other => "other",
         }
     }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::NotFound => "not found",
-            Self::PermissionDenied => "permission denied",
-            Self::ConnectionRefused => "connection refused",
-            Self::ConnectionReset => "connection reset",
-            Self::HostUnreachable => "host unreachable",
-            Self::NetworkUnreachable => "network unreachable",
-            Self::ConnectionAborted => "connection aborted",
-            Self::NotConnected => "not connected",
-            Self::AddressInUse => "address already in use",
-            Self::AddressNotAvailable => "address unavailable",
-            Self::NetworkDown => "network down",
-            Self::BrokenPipe => "broken pipe",
-            Self::AlreadyExists => "already exists",
-            Self::WouldBlock => "operation would block",
-            Self::NotADirectory => "not a directory",
-            Self::IsADirectory => "is a directory",
-            Self::DirectoryNotEmpty => "directory not empty",
-            Self::ReadOnlyFilesystem => "read-only filesystem",
-            Self::StaleNetworkFileHandle => "stale network file handle",
-            Self::InvalidInput => "invalid operation input",
-            Self::InvalidData => "invalid data",
-            Self::TimedOut => "operation timed out",
-            Self::WriteZero => "write made no progress",
-            Self::StorageFull => "storage is full",
-            Self::NotSeekable => "object is not seekable",
-            Self::QuotaExceeded => "storage quota exceeded",
-            Self::FileTooLarge => "file is too large for the underlying system",
-            Self::ResourceBusy => "resource is busy",
-            Self::ExecutableFileBusy => "executable file is busy",
-            Self::Deadlock => "operation would deadlock",
-            Self::CrossesDevices => "operation crosses filesystem devices",
-            Self::TooManyLinks => "too many filesystem links",
-            Self::InvalidFilename => "invalid filename",
-            Self::ArgumentListTooLong => "operating-system argument list is too long",
-            Self::Interrupted => "operation was interrupted",
-            Self::Unsupported => "operation is unsupported",
-            Self::UnexpectedEof => "unexpected end of file",
-            Self::OutOfMemory => "operating system could not allocate memory",
-            Self::Other => "other operating-system error",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -691,146 +627,6 @@ impl DiagnosticFailureKind {
             Self::InternalInvariant => "internal_invariant",
         }
     }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::MissingRequiredValue => "a required value is missing",
-            Self::ExtractPlanRequired => {
-                "no reusable Extract plan is saved; provide at least one of --builtin, --rules, or --lua"
-            }
-            Self::ConflictingValues => "the supplied values conflict",
-            Self::InvalidSyntax => "the value has invalid syntax",
-            Self::InvalidEncoding => "the value has invalid text encoding",
-            Self::InvalidValue => "the value violates the required contract",
-            Self::NotFound => "the required object does not exist",
-            Self::Busy => "the resource is held by another operation",
-            Self::StateMismatch => "the stored project state does not satisfy this operation",
-            Self::RequirementFailed => "a required precondition is not satisfied",
-            Self::TransactionRolledBack => {
-                "the transaction failed and its changes were rolled back"
-            }
-            Self::TransactionOutcomeUnknown => {
-                "the transaction ended without a confirmed commit or rollback result"
-            }
-            Self::FinalizationFailed => "the operation result exists but finalization failed",
-            Self::RollbackFailed => "the primary operation failed and rollback also failed",
-            Self::ExternalServiceRejected => "the external service rejected the request",
-            Self::ExternalServiceUnavailable => "the external service is unavailable",
-            Self::ExecutorClosed => "the execution service is shutting down or already closed",
-            Self::ConcurrentShutdown => "another caller is already shutting down the executor",
-            Self::ExecutorStatePoisoned => "the executor lifecycle state is poisoned",
-            Self::WorkerSpawnFailed => "the operating system could not create the worker thread",
-            Self::WorkerChannelClosed => {
-                "the worker command channel closed before finalization completed"
-            }
-            Self::WorkerPanicked => "a worker terminated unexpectedly",
-            Self::ReparsePointForbidden => {
-                "the path contains a reparse point that cannot be trusted"
-            }
-            Self::NonLocalVolume => "the path is not on a local fixed volume",
-            Self::NonNtfsVolume => "the path is not on an NTFS volume",
-            Self::CaseSensitiveDirectory => "the directory has case-sensitive name semantics",
-            Self::LockCancelled => "waiting for the required lock was cancelled",
-            Self::TargetAlreadyExists => "the destination already exists",
-            Self::FileIdentityChanged => "the file identity changed during the operation",
-            Self::InvalidPath => "the path is not a valid target for this operation",
-            Self::WrongPublisherInstance => {
-                "the publication token belongs to a different publisher instance"
-            }
-            Self::JournalCorrupt => "the publication recovery journal is invalid or incomplete",
-            Self::UnexpectedArtifact => "an unexpected filesystem artifact blocks the operation",
-            Self::InteractiveSessionAlreadyOpen => {
-                "another interactive SQLite session is already active"
-            }
-            Self::BackupIncomplete => "the SQLite backup did not reach a completed state",
-            Self::RequestSerializationFailed => "the model request could not be serialized",
-            Self::ResponseParsingFailed => "the model response is not valid JSON",
-            Self::InvalidResponseContract => {
-                "the model response does not satisfy the required response contract"
-            }
-            Self::TransportFailed => "the HTTP transport failed before a valid response arrived",
-            Self::LuaDatabaseOpenFailed => {
-                "the Lua host could not open the project database session"
-            }
-            Self::LuaContextCreationFailed => "the Lua runtime could not create the VM context",
-            Self::LuaCompilationFailed => "the Lua main program could not be compiled",
-            Self::LuaExecutionFailed => "the Lua main program failed while it was running",
-            Self::LuaHostCallFailed => "a Lua host capability call failed",
-            Self::LuaFinalizationFailed => "the Lua host could not finalize all bound resources",
-            Self::LuaUnclosedTransaction => {
-                "the Lua program ended with an open transaction; the transaction was rolled back"
-            }
-            Self::LuaSnapshotStoreFailed => {
-                "the validated Lua extraction snapshot could not be committed"
-            }
-            Self::RulesDefinitionInvalid => {
-                "the Rules program does not satisfy the Rules definition contract"
-            }
-            Self::RulesDocumentReadFailed => {
-                "a source document required by the Rules program could not be read"
-            }
-            Self::RulesNoNonBlankMatch => "the Rules entry produced no non-blank semantic unit",
-            Self::RulesInvalidTarget => {
-                "the Rules entry selected a value that cannot be used as a text target"
-            }
-            Self::RulesPatternMatchFailed => "the Rules PCRE2 pattern could not be evaluated",
-            Self::RulesZeroWidthMatch => "the Rules pattern produced a zero-width match",
-            Self::RulesOverlappingCapture => "the Rules pattern produced overlapping text captures",
-            Self::RulesMissingTextCapture => {
-                "the required named text capture did not participate in the match"
-            }
-            Self::RulesInvalidCaptureRange => {
-                "the Rules match or text capture is outside valid UTF-8 character boundaries"
-            }
-            Self::RulesDuplicateTarget => "two Rules entries claim the same physical text target",
-            Self::RulesInvalidMaterialization => {
-                "the Rules projection recipe cannot reconstruct the source value"
-            }
-            Self::RulesSnapshotInvalid => {
-                "the extracted Rules groups do not form a valid asset snapshot"
-            }
-            Self::RulesSnapshotStoreFailed => {
-                "the validated Rules extraction snapshot could not be committed"
-            }
-            Self::WriteBackExtractionOutOfDate => {
-                "the extracted assets no longer match the current project source"
-            }
-            Self::WriteBackAssetSnapshotInvalid => {
-                "the stored Standard assets do not form a valid write-back snapshot"
-            }
-            Self::SourceDocumentInvalid => {
-                "an RPG Maker source document does not satisfy the required document format"
-            }
-            Self::WriteBackMutationInvalid => {
-                "a validated translation mutation cannot be applied to its frozen source location"
-            }
-            Self::WriteBackOutputPathInvalid => {
-                "a rewritten file is outside the permitted RPG Maker output tree"
-            }
-            Self::WriteBackOutputPathDuplicate => {
-                "more than one rewritten file targets the same output path"
-            }
-            Self::WriteBackCandidateProjectMismatch => {
-                "the prepared write-back candidate belongs to a different project"
-            }
-            Self::WriteBackCandidateInvalid => {
-                "the write-back candidate does not satisfy the required data/js tree structure"
-            }
-            Self::WriteBackUnexpectedLuaOutcome => {
-                "the Lua write-back program returned an outcome for a different Lua phase"
-            }
-            Self::WriteBackNotPublished => {
-                "the write-back candidate did not replace the current output directory"
-            }
-            Self::WriteBackPublishedWithResiduals => {
-                "the output was published, but one or more recovery artifacts could not be removed"
-            }
-            Self::WriteBackRecoveryRequired => {
-                "the output directory requires recovery before its contents can be trusted"
-            }
-            Self::InternalInvariant => "an internal invariant was violated; this is an ATT defect",
-        }
-    }
 }
 
 /// 允许拥有具体底层错误类型的根把稳定事实交给领域包装错误。
@@ -968,110 +764,105 @@ impl ConfigurationValueRule {
         }
     }
 
-    fn facts(&self) -> String {
+    const fn fluent_facts(&self) -> (u64, u64, u64, u64) {
         match self {
-            Self::StrictJsonInvalid { line, column } => {
-                format!(" (line={line}, column={column})")
-            }
-            Self::RuntimeMaximumExceeded { actual, maximum } => {
-                format!(" (actual={actual}, maximum={maximum})")
-            }
+            Self::StrictJsonInvalid { line, column } => (*line, *column, 0, 0),
+            Self::RuntimeMaximumExceeded { actual, maximum } => (0, 0, *actual, *maximum),
             Self::PositiveRequired { actual }
             | Self::UsizeRangeExceeded { actual }
-            | Self::U32RangeExceeded { actual } => format!(" (actual={actual})"),
-            _ => String::new(),
+            | Self::U32RangeExceeded { actual } => (0, 0, *actual, 0),
+            _ => (0, 0, 0, 0),
         }
     }
 
     pub(crate) fn render(&self) -> String {
+        self.render_localized(&UiLocalizer::new(UiLocale::English))
+    }
+
+    fn render_localized(&self, localizer: &UiLocalizer) -> String {
+        let (line, column, actual, maximum) = self.fluent_facts();
+        localizer.format(UiMessage::DiagnosticConfigurationRuleValue {
+            code: self.as_str(),
+            line,
+            column,
+            actual,
+            maximum,
+        })
+    }
+}
+
+/// TOML 字段契约允许的值形态；该闭集只用于安全诊断，不包含配置正文。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigurationTomlValueKind {
+    String,
+    Integer,
+    Boolean,
+    StringOrBoolean,
+    StringArray,
+    IntegerArray,
+    StringPairArray,
+    Table,
+    TableArray,
+}
+
+impl ConfigurationTomlValueKind {
+    const fn as_str(self) -> &'static str {
         match self {
-            Self::RuntimeConfigurationInvalid => "runtime configuration is invalid".to_owned(),
-            Self::UnsupportedPromptLocale => {
-                "must be exact lowercase auto or a supported BCP 47 UI locale".to_owned()
-            }
-            Self::LanguagePolicyTermBlank => "language policy term must not be blank".to_owned(),
-            Self::LanguagePolicyTermSurroundingWhitespace => {
-                "language policy term must not contain surrounding whitespace".to_owned()
-            }
-            Self::LanguagePolicyTermDuplicate => {
-                "language policy term must not be duplicated".to_owned()
-            }
-            Self::QuoteRepairCandidatesEmpty => {
-                "quote repair candidate list must not be empty".to_owned()
-            }
-            Self::QuoteRepairDelimiterInvalid => {
-                "quote repair delimiter must not be alphanumeric, whitespace, or control".to_owned()
-            }
-            Self::QuoteRepairPairDuplicate => "quote repair pair must not be duplicated".to_owned(),
-            Self::QuoteRepairDelimiterAmbiguous => {
-                "quote repair delimiter must belong to exactly one pair".to_owned()
-            }
-            Self::LanguageIdBlank => "language id must not be blank".to_owned(),
-            Self::LanguageIdSurroundingWhitespace => {
-                "language id must not contain surrounding whitespace".to_owned()
-            }
-            Self::LanguageIdUsesUnderscore => {
-                "language id must use hyphens between subtags".to_owned()
-            }
-            Self::LanguageIdInvalidSyntax => "language id must satisfy RFC 5646 syntax".to_owned(),
-            Self::LanguageIdInvalidRegistryTag => {
-                "language id contains an invalid registry subtag".to_owned()
-            }
-            Self::LanguageIdCanonicalizationFailed => {
-                "language id cannot be canonicalized".to_owned()
-            }
-            Self::LanguageIdUndefinedPrimaryLanguage => {
-                "language id must define a primary language".to_owned()
-            }
-            Self::LanguageIdDuplicate => "language id must be unique".to_owned(),
-            Self::LanguageCatalogEmpty => {
-                "at least one source language module is required".to_owned()
-            }
-            Self::UrlInvalid => "value must be a valid URL".to_owned(),
-            Self::UrlCredentialsForbidden => "URL must not contain credentials".to_owned(),
-            Self::UrlFragmentForbidden => "URL must not contain a fragment".to_owned(),
-            Self::UrlSchemeUnsupported => "URL scheme must be http or https".to_owned(),
-            Self::ApiKeyBlank => "API key must not be blank".to_owned(),
-            Self::ApiKeySurroundingWhitespace => {
-                "API key must not contain surrounding whitespace".to_owned()
-            }
-            Self::ApiKeyInvalidHeader => {
-                "API key cannot be represented as an HTTP header value".to_owned()
-            }
-            Self::StrictJsonInvalid { line, column } => {
-                format!("value must be strict JSON (line={line}, column={column})")
-            }
-            Self::JsonObjectRequired => "value must be a JSON object".to_owned(),
-            Self::ReservedRequestField => {
-                "field is owned by the request protocol and cannot be overridden".to_owned()
-            }
-            Self::ProxyMustBeFalseOrUrl => {
-                "proxy must be false or a complete http/https URL".to_owned()
-            }
-            Self::PemPathDuplicate => "PEM path must be unique".to_owned(),
-            Self::RuntimeMaximumExceeded { actual, maximum } => {
-                format!("value exceeds runtime maximum (actual={actual}, maximum={maximum})")
-            }
-            Self::ValueSurroundingWhitespace => {
-                "value must not contain surrounding whitespace".to_owned()
-            }
-            Self::ValueBlank => "value must not be blank".to_owned(),
-            Self::PathBlank => "path must not be empty".to_owned(),
-            Self::PositiveRequired { actual } => {
-                format!("value must be greater than zero (actual={actual})")
-            }
-            Self::UsizeRangeExceeded { actual } => {
-                format!("value exceeds this platform's usize range (actual={actual})")
-            }
-            Self::U32RangeExceeded { actual } => {
-                format!("value exceeds u32 range (actual={actual})")
-            }
-            Self::DuplicateProfileId => "translation profile id must be unique".to_owned(),
-            Self::SelectedProfileInvalid => {
-                "selected translation profile has invalid structure or field types".to_owned()
-            }
-            Self::ReferencedClientNotFound => "referenced LLM client does not exist".to_owned(),
+            Self::String => "string",
+            Self::Integer => "integer",
+            Self::Boolean => "boolean",
+            Self::StringOrBoolean => "string_or_boolean",
+            Self::StringArray => "string_array",
+            Self::IntegerArray => "integer_array",
+            Self::StringPairArray => "string_pair_array",
+            Self::Table => "table",
+            Self::TableArray => "table_array",
         }
+    }
+
+    fn render_localized(self, localizer: &UiLocalizer) -> String {
+        localizer.format(UiMessage::DiagnosticTomlExpectedKindValue {
+            code: self.as_str(),
+        })
+    }
+}
+
+/// TOML 解析与字段契约失败的稳定闭集。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum ConfigurationTomlFailureKind {
+    Syntax,
+    MissingField,
+    UnknownField,
+    DuplicateField,
+    TypeMismatch {
+        expected: ConfigurationTomlValueKind,
+    },
+    InvalidValue,
+}
+
+impl ConfigurationTomlFailureKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Syntax => "syntax",
+            Self::MissingField => "missing_field",
+            Self::UnknownField => "unknown_field",
+            Self::DuplicateField => "duplicate_field",
+            Self::TypeMismatch { .. } => "type_mismatch",
+            Self::InvalidValue => "invalid_value",
+        }
+    }
+
+    fn render_localized(self, localizer: &UiLocalizer) -> String {
+        let expected = match self {
+            Self::TypeMismatch { expected } => expected.render_localized(localizer),
+            _ => String::new(),
+        };
+        localizer.format(UiMessage::DiagnosticTomlFailureValue {
+            code: self.as_str(),
+            expected: &expected,
+        })
     }
 }
 
@@ -1100,7 +891,7 @@ pub(crate) enum DiagnosticReason {
         line: Option<u64>,
         column: Option<u64>,
         resource: String,
-        classification: String,
+        failure: ConfigurationTomlFailureKind,
     },
     InvalidConfigurationValue {
         rule: ConfigurationValueRule,
@@ -1187,12 +978,12 @@ impl DiagnosticReason {
                 line,
                 column,
                 resource,
-                classification,
+                failure,
             } => Self::InvalidToml {
                 line,
                 column,
                 resource: sanitize_user_text(&resource),
-                classification: sanitize_user_text(&classification),
+                failure,
             },
             Self::Http {
                 status,
@@ -1259,12 +1050,12 @@ impl DiagnosticReason {
                 line,
                 column,
                 resource,
-                classification,
+                failure,
             } => Self::InvalidToml {
                 line,
                 column,
                 resource: map_text(resource, map),
-                classification: map_text(classification, map),
+                failure,
             },
             Self::InvalidConfigurationValue { rule } => Self::InvalidConfigurationValue { rule },
             Self::Http {
@@ -1301,7 +1092,12 @@ impl DiagnosticReason {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn render(&self) -> String {
+        self.render_localized(&UiLocalizer::new(UiLocale::English))
+    }
+
+    pub(crate) fn render_localized(&self, localizer: &UiLocalizer) -> String {
         match self {
             Self::Io {
                 operation,
@@ -1309,184 +1105,149 @@ impl DiagnosticReason {
                 raw_os_code,
                 system_message,
             } => {
-                let mut rendered = format!("{operation}: {}", error_kind.description());
-                if let Some(code) = raw_os_code {
-                    rendered.push_str(&format!(" (OS {code})"));
+                let kind = localizer.format(UiMessage::DiagnosticIoKindValue {
+                    code: error_kind.as_str(),
+                });
+                match (raw_os_code, system_message) {
+                    (Some(os_code), Some(system_message)) => {
+                        let os_code = os_code.to_string();
+                        localizer.format(UiMessage::DiagnosticIoReasonWithOsCodeAndSystemMessage {
+                            operation,
+                            kind: &kind,
+                            os_code: &os_code,
+                            system_message,
+                        })
+                    }
+                    (Some(os_code), None) => {
+                        let os_code = os_code.to_string();
+                        localizer.format(UiMessage::DiagnosticIoReasonWithOsCode {
+                            operation,
+                            kind: &kind,
+                            os_code: &os_code,
+                        })
+                    }
+                    (None, Some(system_message)) => {
+                        localizer.format(UiMessage::DiagnosticIoReasonWithSystemMessage {
+                            operation,
+                            kind: &kind,
+                            system_message,
+                        })
+                    }
+                    (None, None) => localizer.format(UiMessage::DiagnosticIoReason {
+                        operation,
+                        kind: &kind,
+                    }),
                 }
-                if let Some(message) = system_message {
-                    rendered.push_str(": ");
-                    rendered.push_str(message);
-                }
-                rendered
             }
-            Self::Failure { failure } => failure.description().to_owned(),
+            Self::Failure { failure } => localizer.format(UiMessage::DiagnosticFailureValue {
+                code: failure.as_str(),
+            }),
             Self::FailureWithDetail { failure, detail } => {
-                format!("{}: {detail}", failure.description())
+                let summary = localizer.format(UiMessage::DiagnosticFailureValue {
+                    code: failure.as_str(),
+                });
+                localizer.format(UiMessage::DiagnosticFailureWithDetail {
+                    failure: &summary,
+                    detail,
+                })
             }
             Self::InvalidUtf8 {
                 valid_up_to,
                 error_len,
             } => match error_len {
-                Some(error_len) => {
-                    format!("invalid UTF-8 at byte {valid_up_to}, invalid length {error_len}")
-                }
-                None => format!("incomplete UTF-8 sequence after byte {valid_up_to}"),
+                Some(error_len) => localizer.format(UiMessage::DiagnosticInvalidUtf8 {
+                    valid_up_to: *valid_up_to,
+                    error_len: *error_len,
+                }),
+                None => localizer.format(UiMessage::DiagnosticIncompleteUtf8 {
+                    valid_up_to: *valid_up_to,
+                }),
             },
             Self::InvalidToml {
                 line,
                 column,
                 resource,
-                classification,
-            } => match (line, column) {
-                (Some(line), Some(column)) => {
-                    format!(
-                        "invalid TOML at line {line}, column {column} ({resource}): {classification}"
-                    )
+                failure,
+            } => {
+                let failure = failure.render_localized(localizer);
+                match (line, column) {
+                    (Some(line), Some(column)) => {
+                        localizer.format(UiMessage::DiagnosticInvalidTomlAt {
+                            line: *line,
+                            column: *column,
+                            resource,
+                            failure: &failure,
+                        })
+                    }
+                    _ => localizer.format(UiMessage::DiagnosticInvalidToml {
+                        resource,
+                        failure: &failure,
+                    }),
                 }
-                _ => format!("invalid TOML ({resource}): {classification}"),
-            },
-            Self::InvalidConfigurationValue { rule } => rule.render(),
+            }
+            Self::InvalidConfigurationValue { rule } => rule.render_localized(localizer),
             Self::Http {
                 status,
                 retry_after_seconds,
                 provider_code,
                 provider_type,
-            } => format!(
-                "HTTP status={status:?}, retry_after_seconds={retry_after_seconds:?}, provider_code={provider_code:?}, provider_type={provider_type:?}"
-            ),
+            } => {
+                let mut facts = Vec::new();
+                if let Some(status) = status {
+                    facts.push(localizer.format(UiMessage::DiagnosticHttpStatus {
+                        status: u64::from(*status),
+                    }));
+                }
+                if let Some(seconds) = retry_after_seconds {
+                    facts.push(
+                        localizer.format(UiMessage::DiagnosticHttpRetryAfter { seconds: *seconds }),
+                    );
+                }
+                if let Some(code) = provider_code {
+                    facts.push(localizer.format(UiMessage::DiagnosticHttpProviderCode { code }));
+                }
+                if let Some(kind) = provider_type {
+                    facts.push(localizer.format(UiMessage::DiagnosticHttpProviderType { kind }));
+                }
+                if facts.is_empty() {
+                    localizer.format(UiMessage::DiagnosticHttpNoDetails)
+                } else {
+                    facts.join(&localizer.format(UiMessage::DiagnosticHttpFactSeparator))
+                }
+            }
             Self::Sqlite {
                 primary_code,
                 extended_code,
-            } => format!("SQLite primary={primary_code}, extended={extended_code}"),
+            } => {
+                let primary_code = primary_code.to_string();
+                let extended_code = extended_code.to_string();
+                localizer.format(UiMessage::DiagnosticSqlite {
+                    primary_code: &primary_code,
+                    extended_code: &extended_code,
+                })
+            }
             Self::WindowsStatus { operation, status } => {
-                format!("{operation}: NTSTATUS {status:#010x}")
+                let status = format!("{status:#010x}");
+                localizer.format(UiMessage::DiagnosticWindowsStatus {
+                    operation,
+                    status: &status,
+                })
             }
             Self::Resource {
                 resource,
                 actual,
                 maximum,
             } => match maximum {
-                Some(maximum) => format!("{resource}: actual={actual}, maximum={maximum}"),
-                None => format!("{resource}: actual={actual}"),
+                Some(maximum) => localizer.format(UiMessage::DiagnosticResourceWithMaximum {
+                    resource,
+                    actual: *actual,
+                    maximum: *maximum,
+                }),
+                None => localizer.format(UiMessage::DiagnosticResource {
+                    resource,
+                    actual: *actual,
+                }),
             },
-        }
-    }
-
-    pub(crate) fn render_localized(&self, localizer: &UiLocalizer) -> String {
-        let zh_hans = localizer.locale() == UiLocale::SimplifiedChinese;
-        match self {
-            Self::Io {
-                operation,
-                error_kind,
-                raw_os_code,
-                system_message,
-            } => {
-                let fallback = error_kind.description();
-                let kind = localizer.format(UiMessage::DiagnosticIoKindValue {
-                    code: error_kind.as_str(),
-                    fallback,
-                });
-                let mut rendered = if zh_hans {
-                    format!("操作 {operation}：{kind}")
-                } else {
-                    format!("{operation}: {kind}")
-                };
-                if let Some(code) = raw_os_code {
-                    rendered.push_str(&format!(" (OS {code})"));
-                }
-                if let Some(message) = system_message {
-                    rendered.push_str(": ");
-                    rendered.push_str(message);
-                }
-                rendered
-            }
-            Self::Failure { failure } => localizer.format(UiMessage::DiagnosticFailureValue {
-                code: failure.as_str(),
-                fallback: failure.description(),
-            }),
-            Self::FailureWithDetail { failure, detail } => {
-                let summary = localizer.format(UiMessage::DiagnosticFailureValue {
-                    code: failure.as_str(),
-                    fallback: failure.description(),
-                });
-                format!("{summary}: {detail}")
-            }
-            Self::InvalidConfigurationValue { rule } => {
-                let facts = rule.facts();
-                let rendered = rule.render();
-                let fallback = rendered
-                    .strip_suffix(&facts)
-                    .unwrap_or(&rendered)
-                    .to_owned();
-                localizer.format(UiMessage::DiagnosticConfigurationRuleValue {
-                    code: rule.as_str(),
-                    fallback: &fallback,
-                    facts: &facts,
-                })
-            }
-            Self::InvalidUtf8 {
-                valid_up_to,
-                error_len,
-            } if zh_hans => match error_len {
-                Some(error_len) => {
-                    format!("第 {valid_up_to} 字节后的 UTF-8 无效，错误长度为 {error_len} 字节")
-                }
-                None => format!("第 {valid_up_to} 字节后是未完成的 UTF-8 序列"),
-            },
-            Self::InvalidToml {
-                line,
-                column,
-                resource,
-                classification,
-            } if zh_hans => match (line, column) {
-                (Some(line), Some(column)) => {
-                    format!("TOML 第 {line} 行、第 {column} 列无效（{resource}）：{classification}")
-                }
-                _ => format!("TOML 无效（{resource}）：{classification}"),
-            },
-            Self::Http {
-                status,
-                retry_after_seconds,
-                provider_code,
-                provider_type,
-            } if zh_hans => {
-                let mut facts = Vec::new();
-                if let Some(status) = status {
-                    facts.push(format!("HTTP 状态码 {status}"));
-                }
-                if let Some(seconds) = retry_after_seconds {
-                    facts.push(format!("Retry-After {seconds} 秒"));
-                }
-                if let Some(code) = provider_code {
-                    facts.push(format!("供应商错误码 {code}"));
-                }
-                if let Some(kind) = provider_type {
-                    facts.push(format!("供应商错误类型 {kind}"));
-                }
-                if facts.is_empty() {
-                    "模型服务请求失败，但没有返回可公开的 HTTP 状态详情".to_owned()
-                } else {
-                    facts.join("；")
-                }
-            }
-            Self::Sqlite {
-                primary_code,
-                extended_code,
-            } if zh_hans => {
-                format!("SQLite 主错误码 {primary_code}，扩展错误码 {extended_code}")
-            }
-            Self::WindowsStatus { operation, status } if zh_hans => {
-                format!("Windows 操作 {operation} 失败，NTSTATUS {status:#010x}")
-            }
-            Self::Resource {
-                resource,
-                actual,
-                maximum,
-            } if zh_hans => match maximum {
-                Some(maximum) => format!("{resource}：实际值 {actual}，上限 {maximum}"),
-                None => format!("{resource}：实际值 {actual}"),
-            },
-            _ => self.render(),
         }
     }
 }
@@ -1511,19 +1272,6 @@ impl DiagnosticImpact {
             Self::StateAppliedFinalizationFailed => "state_applied_but_finalization_failed",
             Self::RecoveryRequired => "recovery_required",
             Self::OutcomeUnknown => "outcome_unknown",
-        }
-    }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::Unchanged => "state was not changed",
-            Self::ProgressPreserved => "valid progress was preserved",
-            Self::ResultAppliedPlanNotSaved => "result was applied, but the run plan was not saved",
-            Self::StateAppliedFinalizationFailed => {
-                "state was applied, but finalization did not complete"
-            }
-            Self::RecoveryRequired => "recovery is required before the state can be trusted",
-            Self::OutcomeUnknown => "the final state is unknown",
         }
     }
 }
@@ -1554,24 +1302,6 @@ impl DiagnosticAction {
             Self::PreserveRecoveryArtifacts => "preserve_recovery_artifacts",
             Self::Retry => "retry",
             Self::ReportBug => "report_bug",
-        }
-    }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::FixConfiguration => "correct the named configuration field and retry",
-            Self::FixInput => "correct the named input and retry",
-            Self::CheckPathAndPermissions => "check the path, filesystem state, and permissions",
-            Self::CheckProjectState => "inspect the project state, correct it, and retry",
-            Self::RetryAfterResolvingContention => {
-                "wait for the competing operation to finish, then retry"
-            }
-            Self::CheckModelService => "check the model service response and account limits",
-            Self::PreserveRecoveryArtifacts => {
-                "do not delete the listed recovery artifacts; recover the output before retrying"
-            }
-            Self::Retry => "retry the operation",
-            Self::ReportBug => "report this ATT defect with the error code and log path",
         }
     }
 }
@@ -1845,7 +1575,6 @@ pub(crate) fn render_safe_diagnostic(
     writeln!(output, "{}", {
         let stage = localizer.format(UiMessage::DiagnosticStageValue {
             code: diagnostic.stage.as_str(),
-            fallback: diagnostic.stage.description(),
         });
         localizer.format(UiMessage::DiagnosticStage { stage: &stage })
     })?;
@@ -1864,14 +1593,12 @@ pub(crate) fn render_safe_diagnostic(
     writeln!(output, "{}", {
         let impact = localizer.format(UiMessage::DiagnosticImpactValue {
             code: diagnostic.impact.as_str(),
-            fallback: diagnostic.impact.description(),
         });
         localizer.format(UiMessage::DiagnosticImpact { impact: &impact })
     })?;
     writeln!(output, "{}", {
         let action = localizer.format(UiMessage::DiagnosticActionValue {
             code: diagnostic.action.as_str(),
-            fallback: diagnostic.action.description(),
         });
         localizer.format(UiMessage::DiagnosticAction { action: &action })
     })?;
@@ -2129,13 +1856,16 @@ mod tests {
             maximum: Some(24_000),
         }
         .render_localized(&localizer);
+        let http_plain = http.replace(['\u{2068}', '\u{2069}'], "");
+        let sqlite_plain = sqlite.replace(['\u{2068}', '\u{2069}'], "");
+        let resource_plain = resource.replace(['\u{2068}', '\u{2069}'], "");
 
         assert_eq!(
-            http,
+            http_plain,
             "HTTP 状态码 429；Retry-After 17 秒；供应商错误码 rate_limit；供应商错误类型 quota"
         );
-        assert_eq!(sqlite, "SQLite 主错误码 5，扩展错误码 517");
-        assert_eq!(resource, "请求字符数：实际值 25000，上限 24000");
+        assert_eq!(sqlite_plain, "SQLite 主错误码 5，扩展错误码 517");
+        assert_eq!(resource_plain, "请求字符数：实际值 25000，上限 24000");
         assert!(!http.contains("Some("));
     }
 
@@ -2166,5 +1896,422 @@ mod tests {
                 DiagnosticReason::InvalidConfigurationValue { rule }.render_localized(&localizer);
             assert_eq!(rendered.replace(['\u{2068}', '\u{2069}'], ""), localized);
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_structured_diagnostic_value_is_localized_without_fallback_or_debug_syntax() {
+        let codes = [
+            DiagnosticCode::ProcessCurrentDirectory,
+            DiagnosticCode::ProcessRuntimeStart,
+            DiagnosticCode::ConfigurationPath,
+            DiagnosticCode::ConfigurationOpen,
+            DiagnosticCode::ConfigurationRead,
+            DiagnosticCode::ConfigurationNotFile,
+            DiagnosticCode::ConfigurationInvalidUtf8,
+            DiagnosticCode::ConfigurationInvalidToml,
+            DiagnosticCode::ConfigurationInvalidValue,
+            DiagnosticCode::ConfigurationProfileNotFound,
+            DiagnosticCode::ConfigurationProfileConflict,
+            DiagnosticCode::CommandInput,
+            DiagnosticCode::CommandRunPlan,
+            DiagnosticCode::ProjectUnavailable,
+            DiagnosticCode::ProjectState,
+            DiagnosticCode::PromptUnavailable,
+            DiagnosticCode::LanguageModuleUnavailable,
+            DiagnosticCode::ModelRequest,
+            DiagnosticCode::ExtractBuiltin,
+            DiagnosticCode::ExtractRules,
+            DiagnosticCode::ExtractDocumentRead,
+            DiagnosticCode::LuaExecution,
+            DiagnosticCode::LuaSnapshotStore,
+            DiagnosticCode::WriteBackAssetRead,
+            DiagnosticCode::WriteBackPlan,
+            DiagnosticCode::WriteBackDocumentRead,
+            DiagnosticCode::WriteBackRewrite,
+            DiagnosticCode::WriteBackCandidate,
+            DiagnosticCode::WriteBackValidate,
+            DiagnosticCode::WriteBackPublish,
+            DiagnosticCode::WriteBackDiscard,
+            DiagnosticCode::RunPlanSaveFailed,
+            DiagnosticCode::RunPlanOutcomeUnknown,
+            DiagnosticCode::StateFinalizationFailed,
+            DiagnosticCode::OperationOutcomeUnknown,
+            DiagnosticCode::SignalRegistration,
+            DiagnosticCode::ShutdownComponent,
+            DiagnosticCode::InternalOperation,
+            DiagnosticCode::FileSystemBuild,
+            DiagnosticCode::FileSystemOperation,
+            DiagnosticCode::SqliteOperation,
+            DiagnosticCode::HttpClientBuild,
+            DiagnosticCode::LogStart,
+            DiagnosticCode::LogSerialize,
+            DiagnosticCode::LogWrite,
+            DiagnosticCode::LogFlush,
+            DiagnosticCode::LogSync,
+            DiagnosticCode::LogWorker,
+        ];
+        let stages = [
+            DiagnosticStage::ProcessStartup,
+            DiagnosticStage::ProcessOutput,
+            DiagnosticStage::Configuration,
+            DiagnosticStage::CommandPreparation,
+            DiagnosticStage::ProjectOpening,
+            DiagnosticStage::Init,
+            DiagnosticStage::Extract,
+            DiagnosticStage::Translate,
+            DiagnosticStage::WriteBack,
+            DiagnosticStage::Lua,
+            DiagnosticStage::ModelRequest,
+            DiagnosticStage::RunPlanFinalization,
+            DiagnosticStage::Publication,
+            DiagnosticStage::Shutdown,
+            DiagnosticStage::Logging,
+        ];
+        let impacts = [
+            DiagnosticImpact::Unchanged,
+            DiagnosticImpact::ProgressPreserved,
+            DiagnosticImpact::ResultAppliedPlanNotSaved,
+            DiagnosticImpact::StateAppliedFinalizationFailed,
+            DiagnosticImpact::RecoveryRequired,
+            DiagnosticImpact::OutcomeUnknown,
+        ];
+        let actions = [
+            DiagnosticAction::FixConfiguration,
+            DiagnosticAction::FixInput,
+            DiagnosticAction::CheckPathAndPermissions,
+            DiagnosticAction::CheckProjectState,
+            DiagnosticAction::RetryAfterResolvingContention,
+            DiagnosticAction::CheckModelService,
+            DiagnosticAction::PreserveRecoveryArtifacts,
+            DiagnosticAction::Retry,
+            DiagnosticAction::ReportBug,
+        ];
+        let io_kinds = [
+            SafeIoKind::NotFound,
+            SafeIoKind::PermissionDenied,
+            SafeIoKind::ConnectionRefused,
+            SafeIoKind::ConnectionReset,
+            SafeIoKind::HostUnreachable,
+            SafeIoKind::NetworkUnreachable,
+            SafeIoKind::ConnectionAborted,
+            SafeIoKind::NotConnected,
+            SafeIoKind::AddressInUse,
+            SafeIoKind::AddressNotAvailable,
+            SafeIoKind::NetworkDown,
+            SafeIoKind::BrokenPipe,
+            SafeIoKind::AlreadyExists,
+            SafeIoKind::WouldBlock,
+            SafeIoKind::NotADirectory,
+            SafeIoKind::IsADirectory,
+            SafeIoKind::DirectoryNotEmpty,
+            SafeIoKind::ReadOnlyFilesystem,
+            SafeIoKind::StaleNetworkFileHandle,
+            SafeIoKind::InvalidInput,
+            SafeIoKind::InvalidData,
+            SafeIoKind::TimedOut,
+            SafeIoKind::WriteZero,
+            SafeIoKind::StorageFull,
+            SafeIoKind::NotSeekable,
+            SafeIoKind::QuotaExceeded,
+            SafeIoKind::FileTooLarge,
+            SafeIoKind::ResourceBusy,
+            SafeIoKind::ExecutableFileBusy,
+            SafeIoKind::Deadlock,
+            SafeIoKind::CrossesDevices,
+            SafeIoKind::TooManyLinks,
+            SafeIoKind::InvalidFilename,
+            SafeIoKind::ArgumentListTooLong,
+            SafeIoKind::Interrupted,
+            SafeIoKind::Unsupported,
+            SafeIoKind::UnexpectedEof,
+            SafeIoKind::OutOfMemory,
+            SafeIoKind::Other,
+        ];
+        let failures = [
+            DiagnosticFailureKind::MissingRequiredValue,
+            DiagnosticFailureKind::ExtractPlanRequired,
+            DiagnosticFailureKind::ConflictingValues,
+            DiagnosticFailureKind::InvalidSyntax,
+            DiagnosticFailureKind::InvalidEncoding,
+            DiagnosticFailureKind::InvalidValue,
+            DiagnosticFailureKind::NotFound,
+            DiagnosticFailureKind::Busy,
+            DiagnosticFailureKind::StateMismatch,
+            DiagnosticFailureKind::RequirementFailed,
+            DiagnosticFailureKind::TransactionRolledBack,
+            DiagnosticFailureKind::TransactionOutcomeUnknown,
+            DiagnosticFailureKind::FinalizationFailed,
+            DiagnosticFailureKind::RollbackFailed,
+            DiagnosticFailureKind::ExternalServiceRejected,
+            DiagnosticFailureKind::ExternalServiceUnavailable,
+            DiagnosticFailureKind::ExecutorClosed,
+            DiagnosticFailureKind::ConcurrentShutdown,
+            DiagnosticFailureKind::ExecutorStatePoisoned,
+            DiagnosticFailureKind::WorkerSpawnFailed,
+            DiagnosticFailureKind::WorkerChannelClosed,
+            DiagnosticFailureKind::WorkerPanicked,
+            DiagnosticFailureKind::ReparsePointForbidden,
+            DiagnosticFailureKind::NonLocalVolume,
+            DiagnosticFailureKind::NonNtfsVolume,
+            DiagnosticFailureKind::CaseSensitiveDirectory,
+            DiagnosticFailureKind::LockCancelled,
+            DiagnosticFailureKind::TargetAlreadyExists,
+            DiagnosticFailureKind::FileIdentityChanged,
+            DiagnosticFailureKind::InvalidPath,
+            DiagnosticFailureKind::WrongPublisherInstance,
+            DiagnosticFailureKind::JournalCorrupt,
+            DiagnosticFailureKind::UnexpectedArtifact,
+            DiagnosticFailureKind::InteractiveSessionAlreadyOpen,
+            DiagnosticFailureKind::BackupIncomplete,
+            DiagnosticFailureKind::RequestSerializationFailed,
+            DiagnosticFailureKind::ResponseParsingFailed,
+            DiagnosticFailureKind::InvalidResponseContract,
+            DiagnosticFailureKind::TransportFailed,
+            DiagnosticFailureKind::LuaDatabaseOpenFailed,
+            DiagnosticFailureKind::LuaContextCreationFailed,
+            DiagnosticFailureKind::LuaCompilationFailed,
+            DiagnosticFailureKind::LuaExecutionFailed,
+            DiagnosticFailureKind::LuaHostCallFailed,
+            DiagnosticFailureKind::LuaFinalizationFailed,
+            DiagnosticFailureKind::LuaUnclosedTransaction,
+            DiagnosticFailureKind::LuaSnapshotStoreFailed,
+            DiagnosticFailureKind::RulesDefinitionInvalid,
+            DiagnosticFailureKind::RulesDocumentReadFailed,
+            DiagnosticFailureKind::RulesNoNonBlankMatch,
+            DiagnosticFailureKind::RulesInvalidTarget,
+            DiagnosticFailureKind::RulesPatternMatchFailed,
+            DiagnosticFailureKind::RulesZeroWidthMatch,
+            DiagnosticFailureKind::RulesOverlappingCapture,
+            DiagnosticFailureKind::RulesMissingTextCapture,
+            DiagnosticFailureKind::RulesInvalidCaptureRange,
+            DiagnosticFailureKind::RulesDuplicateTarget,
+            DiagnosticFailureKind::RulesInvalidMaterialization,
+            DiagnosticFailureKind::RulesSnapshotInvalid,
+            DiagnosticFailureKind::RulesSnapshotStoreFailed,
+            DiagnosticFailureKind::WriteBackExtractionOutOfDate,
+            DiagnosticFailureKind::WriteBackAssetSnapshotInvalid,
+            DiagnosticFailureKind::SourceDocumentInvalid,
+            DiagnosticFailureKind::WriteBackMutationInvalid,
+            DiagnosticFailureKind::WriteBackOutputPathInvalid,
+            DiagnosticFailureKind::WriteBackOutputPathDuplicate,
+            DiagnosticFailureKind::WriteBackCandidateProjectMismatch,
+            DiagnosticFailureKind::WriteBackCandidateInvalid,
+            DiagnosticFailureKind::WriteBackUnexpectedLuaOutcome,
+            DiagnosticFailureKind::WriteBackNotPublished,
+            DiagnosticFailureKind::WriteBackPublishedWithResiduals,
+            DiagnosticFailureKind::WriteBackRecoveryRequired,
+            DiagnosticFailureKind::InternalInvariant,
+        ];
+        let toml_value_kinds = [
+            ConfigurationTomlValueKind::String,
+            ConfigurationTomlValueKind::Integer,
+            ConfigurationTomlValueKind::Boolean,
+            ConfigurationTomlValueKind::StringOrBoolean,
+            ConfigurationTomlValueKind::StringArray,
+            ConfigurationTomlValueKind::IntegerArray,
+            ConfigurationTomlValueKind::StringPairArray,
+            ConfigurationTomlValueKind::Table,
+            ConfigurationTomlValueKind::TableArray,
+        ];
+        let toml_failures = [
+            ConfigurationTomlFailureKind::Syntax,
+            ConfigurationTomlFailureKind::MissingField,
+            ConfigurationTomlFailureKind::UnknownField,
+            ConfigurationTomlFailureKind::DuplicateField,
+            ConfigurationTomlFailureKind::TypeMismatch {
+                expected: ConfigurationTomlValueKind::String,
+            },
+            ConfigurationTomlFailureKind::InvalidValue,
+        ];
+
+        for locale in UiLocale::ALL {
+            let localizer = UiLocalizer::new(locale);
+            for code in codes {
+                assert_localized_value(
+                    locale,
+                    code.as_str(),
+                    localizer.format(UiMessage::DiagnosticTitle {
+                        code: code.as_str(),
+                    }),
+                );
+            }
+            for stage in stages {
+                assert_localized_value(
+                    locale,
+                    stage.as_str(),
+                    localizer.format(UiMessage::DiagnosticStageValue {
+                        code: stage.as_str(),
+                    }),
+                );
+            }
+            for impact in impacts {
+                assert_localized_value(
+                    locale,
+                    impact.as_str(),
+                    localizer.format(UiMessage::DiagnosticImpactValue {
+                        code: impact.as_str(),
+                    }),
+                );
+            }
+            for action in actions {
+                assert_localized_value(
+                    locale,
+                    action.as_str(),
+                    localizer.format(UiMessage::DiagnosticActionValue {
+                        code: action.as_str(),
+                    }),
+                );
+            }
+            for io_kind in io_kinds {
+                assert_localized_value(
+                    locale,
+                    io_kind.as_str(),
+                    localizer.format(UiMessage::DiagnosticIoKindValue {
+                        code: io_kind.as_str(),
+                    }),
+                );
+            }
+            for failure in failures {
+                assert_localized_value(
+                    locale,
+                    failure.as_str(),
+                    DiagnosticReason::failure(failure).render_localized(&localizer),
+                );
+            }
+            for rule in all_configuration_value_rules() {
+                assert_localized_value(
+                    locale,
+                    rule.as_str(),
+                    DiagnosticReason::InvalidConfigurationValue { rule }
+                        .render_localized(&localizer),
+                );
+            }
+            for kind in toml_value_kinds {
+                assert_localized_value(locale, kind.as_str(), kind.render_localized(&localizer));
+            }
+            for failure in toml_failures {
+                assert_localized_value(
+                    locale,
+                    failure.as_str(),
+                    failure.render_localized(&localizer),
+                );
+            }
+
+            let structured_reasons = [
+                DiagnosticReason::Io {
+                    operation: "read".to_owned(),
+                    error_kind: SafeIoKind::NotFound,
+                    raw_os_code: Some(2),
+                    system_message: Some("system message".to_owned()),
+                },
+                DiagnosticReason::InvalidUtf8 {
+                    valid_up_to: 7,
+                    error_len: None,
+                },
+                DiagnosticReason::InvalidToml {
+                    line: Some(3),
+                    column: Some(5),
+                    resource: "configuration".to_owned(),
+                    failure: ConfigurationTomlFailureKind::TypeMismatch {
+                        expected: ConfigurationTomlValueKind::StringArray,
+                    },
+                },
+                DiagnosticReason::Http {
+                    status: Some(429),
+                    retry_after_seconds: Some(17),
+                    provider_code: Some("rate_limit".to_owned()),
+                    provider_type: Some("quota".to_owned()),
+                },
+                DiagnosticReason::Http {
+                    status: None,
+                    retry_after_seconds: None,
+                    provider_code: None,
+                    provider_type: None,
+                },
+                DiagnosticReason::Sqlite {
+                    primary_code: 5,
+                    extended_code: 517,
+                },
+                DiagnosticReason::WindowsStatus {
+                    operation: "rename".to_owned(),
+                    status: -1_073_741_823,
+                },
+                DiagnosticReason::Resource {
+                    resource: "request bytes".to_owned(),
+                    actual: 25_000,
+                    maximum: Some(24_000),
+                },
+            ];
+            for (index, reason) in structured_reasons.into_iter().enumerate() {
+                assert_localized_value(
+                    locale,
+                    &format!("structured_reason_{index}"),
+                    reason.render_localized(&localizer),
+                );
+            }
+        }
+    }
+
+    fn assert_localized_value(locale: UiLocale, code: &str, rendered: String) {
+        let rendered = rendered.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(
+            !rendered.contains("__ATT_FALLBACK__"),
+            "{locale} 的 {code} 命中了 fallback：{rendered}"
+        );
+        for debug_marker in ["Some(", "None", "\\\"", "\"rate_limit\"", "\"quota\""] {
+            assert!(
+                !rendered.contains(debug_marker),
+                "{locale} 的 {code} 泄漏 Debug 语法 {debug_marker}：{rendered}"
+            );
+        }
+    }
+
+    fn all_configuration_value_rules() -> Vec<ConfigurationValueRule> {
+        vec![
+            ConfigurationValueRule::RuntimeConfigurationInvalid,
+            ConfigurationValueRule::UnsupportedPromptLocale,
+            ConfigurationValueRule::LanguagePolicyTermBlank,
+            ConfigurationValueRule::LanguagePolicyTermSurroundingWhitespace,
+            ConfigurationValueRule::LanguagePolicyTermDuplicate,
+            ConfigurationValueRule::QuoteRepairCandidatesEmpty,
+            ConfigurationValueRule::QuoteRepairDelimiterInvalid,
+            ConfigurationValueRule::QuoteRepairPairDuplicate,
+            ConfigurationValueRule::QuoteRepairDelimiterAmbiguous,
+            ConfigurationValueRule::LanguageIdBlank,
+            ConfigurationValueRule::LanguageIdSurroundingWhitespace,
+            ConfigurationValueRule::LanguageIdUsesUnderscore,
+            ConfigurationValueRule::LanguageIdInvalidSyntax,
+            ConfigurationValueRule::LanguageIdInvalidRegistryTag,
+            ConfigurationValueRule::LanguageIdCanonicalizationFailed,
+            ConfigurationValueRule::LanguageIdUndefinedPrimaryLanguage,
+            ConfigurationValueRule::LanguageIdDuplicate,
+            ConfigurationValueRule::LanguageCatalogEmpty,
+            ConfigurationValueRule::UrlInvalid,
+            ConfigurationValueRule::UrlCredentialsForbidden,
+            ConfigurationValueRule::UrlFragmentForbidden,
+            ConfigurationValueRule::UrlSchemeUnsupported,
+            ConfigurationValueRule::ApiKeyBlank,
+            ConfigurationValueRule::ApiKeySurroundingWhitespace,
+            ConfigurationValueRule::ApiKeyInvalidHeader,
+            ConfigurationValueRule::StrictJsonInvalid { line: 3, column: 5 },
+            ConfigurationValueRule::JsonObjectRequired,
+            ConfigurationValueRule::ReservedRequestField,
+            ConfigurationValueRule::ProxyMustBeFalseOrUrl,
+            ConfigurationValueRule::PemPathDuplicate,
+            ConfigurationValueRule::RuntimeMaximumExceeded {
+                actual: 25,
+                maximum: 24,
+            },
+            ConfigurationValueRule::ValueSurroundingWhitespace,
+            ConfigurationValueRule::ValueBlank,
+            ConfigurationValueRule::PathBlank,
+            ConfigurationValueRule::PositiveRequired { actual: 0 },
+            ConfigurationValueRule::UsizeRangeExceeded { actual: u64::MAX },
+            ConfigurationValueRule::U32RangeExceeded { actual: u64::MAX },
+            ConfigurationValueRule::DuplicateProfileId,
+            ConfigurationValueRule::SelectedProfileInvalid,
+            ConfigurationValueRule::ReferencedClientNotFound,
+        ]
     }
 }

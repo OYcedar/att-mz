@@ -3,12 +3,13 @@
 //! 原始 TOML 只在本模块存在。结构和字段类型全部通过后，本模块继续建立路径基准、
 //! 语言模块、LLM Client 外部约束与 Profile 唯一性；业务和根适配器只接收受信配置。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +18,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+use toml_parser::decoder::ScalarKind;
+use toml_parser::parser::{Event, EventKind, ValidateWhitespace, parse_document};
+use toml_parser::{ParseError, Source, Span};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -25,7 +29,9 @@ use super::arguments::{
     TranslateArguments, WriteBackArguments,
 };
 
-use crate::diagnostic::ConfigurationValueRule;
+use crate::diagnostic::{
+    ConfigurationTomlFailureKind, ConfigurationTomlValueKind, ConfigurationValueRule,
+};
 use crate::i18n::UiLocale;
 use crate::language::{
     EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
@@ -107,7 +113,8 @@ pub(crate) fn load_product_configuration(
             error_len: source.error_len(),
         }
     })?;
-    validate_configuration_field_names(source, &configuration_path)?;
+    let toml_index = Arc::new(ConfigurationTomlIndex::build(source, &configuration_path)?);
+    toml_index.validate_complete_field_set(source, &configuration_path)?;
     let configuration_directory = configuration_path
         .parent()
         .expect("规范绝对文件路径必须拥有父目录")
@@ -117,6 +124,7 @@ pub(crate) fn load_product_configuration(
         &configuration_path,
         &configuration_directory,
         source,
+        toml_index,
         layout,
         command,
         dialogue_rules_path,
@@ -223,17 +231,28 @@ impl ConfiguredRpgMakerCommand {
         configuration_path: &Path,
         configuration_directory: &Path,
         source: &str,
+        toml_index: Arc<ConfigurationTomlIndex>,
         layout: RpgMakerLayout,
         command: RpgMakerCommandArguments,
         dialogue_rules_path: Option<PathBuf>,
     ) -> Result<Self, ConfigurationLoadError> {
-        let raw_common: RawCommonConfiguration = parse_selected(source, configuration_path)?;
+        let raw_common: RawCommonConfiguration = parse_selected(
+            source,
+            configuration_path,
+            toml_index.as_ref(),
+            ConfigurationSelection::Common,
+        )?;
         let common = CommonCommandConfiguration::build(configuration_directory, raw_common)
             .map_err(ConfigurationLoadError::InvalidValue)?;
 
         match command {
             RpgMakerCommandArguments::Init(arguments) => {
-                let _: RawInitSelection = parse_selected(source, configuration_path)?;
+                let _: RawInitSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::NoAdditionalFields,
+                )?;
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
                     layout.engine(),
@@ -246,11 +265,19 @@ impl ConfiguredRpgMakerCommand {
                 }))
             }
             RpgMakerCommandArguments::Extract(arguments) => {
-                let deferred_source =
-                    Arc::new(DeferredConfigurationSource::new(configuration_path, source));
+                let deferred_source = Arc::new(DeferredConfigurationSource::new(
+                    configuration_path,
+                    source,
+                    Arc::clone(&toml_index),
+                ));
                 let deferred_lua =
                     DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source));
-                let _: RawExtractSelection = parse_selected(source, configuration_path)?;
+                let _: RawExtractSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::NoAdditionalFields,
+                )?;
                 let cpu = build_cpu_configuration();
                 let ExtractArguments {
                     project,
@@ -277,11 +304,19 @@ impl ConfiguredRpgMakerCommand {
                 }))
             }
             RpgMakerCommandArguments::Translate(arguments) => {
-                let deferred_source =
-                    Arc::new(DeferredConfigurationSource::new(configuration_path, source));
+                let deferred_source = Arc::new(DeferredConfigurationSource::new(
+                    configuration_path,
+                    source,
+                    Arc::clone(&toml_index),
+                ));
                 let deferred_lua =
                     DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source));
-                let raw: RawTranslateSelection = parse_selected(source, configuration_path)?;
+                let raw: RawTranslateSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::Translate,
+                )?;
                 let cpu = build_cpu_configuration();
                 let record_translation_tasks = raw.rpg_maker.record_translation_tasks;
                 let TranslateArguments {
@@ -326,10 +361,18 @@ impl ConfiguredRpgMakerCommand {
                 Ok(Self::Translate(Box::new(configured)))
             }
             RpgMakerCommandArguments::WriteBack(arguments) => {
-                let deferred_source =
-                    Arc::new(DeferredConfigurationSource::new(configuration_path, source));
+                let deferred_source = Arc::new(DeferredConfigurationSource::new(
+                    configuration_path,
+                    source,
+                    Arc::clone(&toml_index),
+                ));
                 let deferred_lua = DeferredLuaRuntimeConfiguration::new(deferred_source);
-                let _: RawWriteBackSelection = parse_selected(source, configuration_path)?;
+                let _: RawWriteBackSelection = parse_selected(
+                    source,
+                    configuration_path,
+                    toml_index.as_ref(),
+                    ConfigurationSelection::NoAdditionalFields,
+                )?;
                 let cpu = build_cpu_configuration();
                 let publisher = build_directory_publisher_configuration(
                     common.projects_root(),
@@ -356,8 +399,11 @@ impl ConfiguredRpgMakerCommand {
                 }))
             }
             RpgMakerCommandArguments::Lua(arguments) => {
-                let deferred_source =
-                    Arc::new(DeferredConfigurationSource::new(configuration_path, source));
+                let deferred_source = Arc::new(DeferredConfigurationSource::new(
+                    configuration_path,
+                    source,
+                    Arc::clone(&toml_index),
+                ));
                 let runtime =
                     DeferredLuaRuntimeConfiguration::new(Arc::clone(&deferred_source)).resolve()?;
                 let ProjectLuaArguments {
@@ -725,7 +771,12 @@ fn resolve_project_lua_standard_profile(
     validate_exact_identifier("Profile ID", profile_id)
         .map_err(ConfigurationLoadError::InvalidValue)
         .map_err(|error| error.with_configuration_path(source.path()))?;
-    let raw: RawTranslateSelection = parse_selected(source.source(), source.path())?;
+    let raw: RawTranslateSelection = parse_selected(
+        source.source(),
+        source.path(),
+        source.toml_index(),
+        ConfigurationSelection::Translate,
+    )?;
     PendingTranslateConfiguration::build(
         source.path().parent().expect("配置文件必须拥有父目录"),
         raw.prompts,
@@ -816,13 +867,15 @@ fn build_sqlite_configuration() -> RusqliteStorageConfiguration {
 pub(crate) struct DeferredConfigurationSource {
     path: PathBuf,
     source: Zeroizing<String>,
+    toml_index: Arc<ConfigurationTomlIndex>,
 }
 
 impl DeferredConfigurationSource {
-    fn new(path: &Path, source: &str) -> Self {
+    fn new(path: &Path, source: &str, toml_index: Arc<ConfigurationTomlIndex>) -> Self {
         Self {
             path: path.to_path_buf(),
             source: Zeroizing::new(source.to_owned()),
+            toml_index,
         }
     }
 
@@ -832,6 +885,10 @@ impl DeferredConfigurationSource {
 
     fn source(&self) -> &str {
         self.source.as_str()
+    }
+
+    fn toml_index(&self) -> &ConfigurationTomlIndex {
+        self.toml_index.as_ref()
     }
 }
 
@@ -991,10 +1048,19 @@ impl PendingTranslateConfiguration {
         source: &DeferredConfigurationSource,
         profile_id: &str,
     ) -> Result<TranslateConfiguration, ConfigurationLoadError> {
-        let selected_profile =
-            parse_selected_translation_profile(source.source(), source.path(), profile_id)?;
+        let selected_profile = parse_selected_translation_profile(
+            source.source(),
+            source.path(),
+            source.toml_index(),
+            profile_id,
+        )?;
         let llm_client_id = selected_profile.llm_client.clone();
-        let raw_client = parse_selected_llm_client(source.source(), source.path(), &llm_client_id)?;
+        let raw_client = parse_selected_llm_client(
+            source.source(),
+            source.path(),
+            source.toml_index(),
+            &llm_client_id,
+        )?;
         let built_client = build_llm_client(
             format!("llm.clients.{llm_client_id}").as_str(),
             source.path().parent().expect("配置文件必须拥有父目录"),
@@ -1714,7 +1780,7 @@ pub(crate) enum ConfigurationLoadError {
         path: PathBuf,
         location: Option<SourceLocation>,
         resource: String,
-        reason: &'static str,
+        failure: ConfigurationTomlFailureKind,
     },
     InvalidValue(ConfigurationValueError),
     InvalidValueAtPath {
@@ -1803,7 +1869,7 @@ impl ConfigurationLoadError {
                 path,
                 location,
                 resource,
-                reason,
+                failure,
             } => SafeDiagnostic::new(
                 DiagnosticCode::ConfigurationInvalidToml,
                 DiagnosticStage::Configuration,
@@ -1812,7 +1878,7 @@ impl ConfigurationLoadError {
                     line: location.map(|value| as_u64(value.line())),
                     column: location.map(|value| as_u64(value.column())),
                     resource: crate::user_text::sanitize_user_text(resource),
-                    classification: crate::user_text::sanitize_user_text(reason),
+                    failure: *failure,
                 },
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::FixConfiguration,
@@ -1896,13 +1962,17 @@ impl fmt::Display for ConfigurationLoadError {
                 path,
                 location,
                 resource,
-                reason,
+                failure,
             } => {
                 write!(formatter, "{}", path.display())?;
                 if let Some(location) = location {
                     write!(formatter, ":{}:{}", location.line, location.column)?;
                 }
-                write!(formatter, "：{resource}：{reason}")
+                write!(
+                    formatter,
+                    "：{resource}：{}",
+                    configuration_toml_failure_description(*failure)
+                )
             }
             Self::InvalidValue(source) => write!(formatter, "配置值无效：{source}"),
             Self::InvalidValueAtPath { path, source } => {
@@ -1991,147 +2061,1277 @@ impl fmt::Display for ConfigurationValueError {
 
 impl Error for ConfigurationValueError {}
 
-/// 先验证整份配置的字段集合，再按命令选择性解析实际值。
+/// 按现实消费范围选择需要建立的配置值不变量。
+#[derive(Clone, Copy)]
+enum ConfigurationSelection {
+    Common,
+    NoAdditionalFields,
+    Translate,
+    SelectedProfile(usize),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum IndexedTableKind {
+    Table,
+    TableArray,
+}
+
+impl IndexedTableKind {
+    const fn expected(self) -> ConfigurationTomlValueKind {
+        match self {
+            Self::Table => ConfigurationTomlValueKind::Table,
+            Self::TableArray => ConfigurationTomlValueKind::TableArray,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum IndexedScalarKind {
+    String,
+    Integer,
+    Boolean,
+    Other,
+}
+
+#[derive(Clone)]
+enum IndexedValueShape {
+    Scalar {
+        kind: IndexedScalarKind,
+        span: Range<usize>,
+    },
+    Array {
+        items: Vec<IndexedValueShape>,
+        span: Range<usize>,
+    },
+    InlineTable {
+        fields: Vec<IndexedInlineField>,
+        span: Range<usize>,
+    },
+}
+
+impl IndexedValueShape {
+    fn span(&self) -> &Range<usize> {
+        match self {
+            Self::Scalar { span, .. }
+            | Self::Array { span, .. }
+            | Self::InlineTable { span, .. } => span,
+        }
+    }
+
+    fn matches(&self, expected: ConfigurationTomlValueKind) -> bool {
+        match expected {
+            ConfigurationTomlValueKind::String => matches!(
+                self,
+                Self::Scalar {
+                    kind: IndexedScalarKind::String,
+                    ..
+                }
+            ),
+            ConfigurationTomlValueKind::Integer => matches!(
+                self,
+                Self::Scalar {
+                    kind: IndexedScalarKind::Integer,
+                    ..
+                }
+            ),
+            ConfigurationTomlValueKind::Boolean => matches!(
+                self,
+                Self::Scalar {
+                    kind: IndexedScalarKind::Boolean,
+                    ..
+                }
+            ),
+            ConfigurationTomlValueKind::StringOrBoolean => matches!(
+                self,
+                Self::Scalar {
+                    kind: IndexedScalarKind::String | IndexedScalarKind::Boolean,
+                    ..
+                }
+            ),
+            ConfigurationTomlValueKind::StringArray => {
+                self.array_items_match(|item| item.matches(ConfigurationTomlValueKind::String))
+            }
+            ConfigurationTomlValueKind::IntegerArray => {
+                self.array_items_match(|item| item.matches(ConfigurationTomlValueKind::Integer))
+            }
+            ConfigurationTomlValueKind::StringPairArray => self.array_items_match(|item| {
+                matches!(
+                    item,
+                    Self::Array { items, .. }
+                        if items.len() == 2
+                            && items
+                                .iter()
+                                .all(|part| part.matches(ConfigurationTomlValueKind::String))
+                )
+            }),
+            ConfigurationTomlValueKind::Table => {
+                matches!(self, Self::InlineTable { .. })
+            }
+            ConfigurationTomlValueKind::TableArray => false,
+        }
+    }
+
+    fn array_items_match(&self, predicate: impl Fn(&IndexedValueShape) -> bool) -> bool {
+        let Self::Array { items, .. } = self else {
+            return false;
+        };
+        items.iter().all(predicate)
+    }
+}
+
+#[derive(Clone)]
+struct IndexedInlineField {
+    path: Vec<String>,
+    shape: IndexedValueShape,
+    key_span: Range<usize>,
+}
+
+#[derive(Clone)]
+struct IndexedTable {
+    path: Vec<String>,
+    kind: IndexedTableKind,
+    occurrence: Option<usize>,
+    span: Range<usize>,
+}
+
+#[derive(Clone)]
+struct IndexedField {
+    path: Vec<String>,
+    table_occurrence: Option<usize>,
+    shape: IndexedValueShape,
+    key_span: Range<usize>,
+}
+
+/// TOML 原文的结构与 span 索引。
 ///
-/// 这里的叶子统一使用 `IgnoredAny`：未知字段在任何分区都会失败，但未被本次命令
-/// 选择的密钥、Prompt 和业务值不会被物化，也不会在这里触发类型或语义校验。
-fn validate_configuration_field_names(
-    source: &str,
+/// 索引只解码字段名；值正文交给 `()` 作为 decoder sink，仅取得标量/数组/表形态并完成
+/// TOML 语法校验。API key、Prompt、parameters 和其他正文不会进入索引或错误对象。
+#[derive(Clone)]
+struct ConfigurationTomlIndex {
+    tables: Vec<IndexedTable>,
+    fields: Vec<IndexedField>,
+}
+
+impl ConfigurationTomlIndex {
+    fn build(source: &str, path: &Path) -> Result<Self, ConfigurationLoadError> {
+        let source_view = Source::new(source);
+        let tokens = source_view.lex().into_vec();
+        let mut events = Vec::<Event>::new();
+        let mut errors = Vec::<ParseError>::new();
+        {
+            let mut validating = ValidateWhitespace::new(&mut events, source_view);
+            parse_document(&tokens, &mut validating, &mut errors);
+        }
+
+        for event in &events {
+            let raw = source_view
+                .get(event)
+                .expect("toml_parser 事件 span 必须来自同一原文");
+            match event.kind() {
+                EventKind::SimpleKey => {
+                    let mut decoded = String::new();
+                    raw.decode_key(&mut decoded, &mut errors);
+                }
+                EventKind::Scalar => {
+                    let _ = raw.decode_scalar(&mut (), &mut errors);
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(offset) = earliest_parse_error_offset(&errors) {
+            return Err(configuration_toml_failure(
+                path,
+                source,
+                Some(offset..offset),
+                "TOML 文档".to_owned(),
+                ConfigurationTomlFailureKind::Syntax,
+            ));
+        }
+
+        ConfigurationTomlIndexParser::new(source_view, &events)
+            .parse()
+            .map_err(|failure| {
+                configuration_toml_failure(
+                    path,
+                    source,
+                    Some(failure.span),
+                    failure.resource,
+                    failure.failure,
+                )
+            })
+    }
+
+    fn validate_complete_field_set(
+        &self,
+        source: &str,
+        path: &Path,
+    ) -> Result<(), ConfigurationLoadError> {
+        for table in &self.tables {
+            if let Some((value_path, expected)) =
+                ConfigurationFieldContract::owning_value_field(&table.path)
+            {
+                return Err(self.failure_at(
+                    source,
+                    path,
+                    &table.span,
+                    value_path,
+                    ConfigurationTomlFailureKind::TypeMismatch { expected },
+                ));
+            }
+            let Some(expected) = ConfigurationFieldContract::table_kind(&table.path) else {
+                return Err(self.failure_at(
+                    source,
+                    path,
+                    &table.span,
+                    &table.path,
+                    ConfigurationTomlFailureKind::UnknownField,
+                ));
+            };
+            if table.kind != expected {
+                return Err(self.failure_at(
+                    source,
+                    path,
+                    &table.span,
+                    &table.path,
+                    ConfigurationTomlFailureKind::TypeMismatch {
+                        expected: expected.expected(),
+                    },
+                ));
+            }
+        }
+
+        for field in &self.fields {
+            // 一个本应为标量或数组的字段即使实际写成内联表，内联表成员也不成为
+            // 独立配置字段。所选消费范围会在校验该字段时报告其 shape 不符；未选择
+            // 的动态 client/profile 仍保持不读取、不校验正文的既有契约。
+            if ConfigurationFieldContract::is_descendant_of_value_field(&field.path) {
+                continue;
+            }
+            let expected = ConfigurationFieldContract::field_kind(&field.path)
+                .or_else(|| ConfigurationFieldContract::structural_kind(&field.path));
+            let Some(expected) = expected else {
+                return Err(self.failure_at(
+                    source,
+                    path,
+                    &field.key_span,
+                    &field.path,
+                    ConfigurationTomlFailureKind::UnknownField,
+                ));
+            };
+            if ConfigurationFieldContract::structural_kind(&field.path).is_some()
+                && !field.shape.matches(expected)
+            {
+                return Err(self.failure_at(
+                    source,
+                    path,
+                    field.shape.span(),
+                    &field.path,
+                    ConfigurationTomlFailureKind::TypeMismatch { expected },
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_selection(
+        &self,
+        source: &str,
+        path: &Path,
+        selection: ConfigurationSelection,
+    ) -> Result<(), ConfigurationLoadError> {
+        match selection {
+            ConfigurationSelection::Common => {
+                for field_path in ConfigurationFieldContract::COMMON_REQUIRED_FIELDS {
+                    self.require_contract_field(source, path, field_path, None)?;
+                }
+            }
+            ConfigurationSelection::NoAdditionalFields => {}
+            ConfigurationSelection::Translate => self.validate_translate(source, path)?,
+            ConfigurationSelection::SelectedProfile(occurrence) => {
+                for field in ConfigurationFieldContract::PROFILE_REQUIRED_FIELDS {
+                    self.require_contract_field(
+                        source,
+                        path,
+                        &["rpg_maker", "translation_profiles", field],
+                        Some(occurrence),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_selected_client(
+        &self,
+        source: &str,
+        path: &Path,
+        client_id: &str,
+    ) -> Result<(), ConfigurationLoadError> {
+        let mut field_path = vec!["llm", "clients", client_id, ""];
+        for field in ConfigurationFieldContract::CLIENT_REQUIRED_FIELDS {
+            field_path[3] = field;
+            self.require_contract_field(source, path, &field_path, None)?;
+        }
+
+        let rate_limit_path = ["llm", "clients", client_id, "rate_limit"];
+        if self.has_table(&rate_limit_path, None) {
+            for field in ConfigurationFieldContract::RATE_LIMIT_REQUIRED_FIELDS {
+                self.require_contract_field(
+                    source,
+                    path,
+                    &["llm", "clients", client_id, "rate_limit", field],
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_translate(&self, source: &str, path: &Path) -> Result<(), ConfigurationLoadError> {
+        for field_path in ConfigurationFieldContract::TRANSLATE_REQUIRED_FIELDS {
+            self.require_contract_field(source, path, field_path, None)?;
+        }
+        if self
+            .field(&["rpg_maker", "record_translation_tasks"], None)
+            .is_some()
+        {
+            self.require_contract_field(
+                source,
+                path,
+                &["rpg_maker", "record_translation_tasks"],
+                None,
+            )?;
+        }
+
+        let language_tables = self.table_occurrences(&["languages"]);
+        if language_tables.is_empty() {
+            return Err(self.missing_field(
+                source,
+                path,
+                &["languages"],
+                None,
+                ConfigurationTomlValueKind::TableArray,
+            ));
+        }
+        for occurrence in language_tables {
+            for field in ConfigurationFieldContract::LANGUAGE_BASE_REQUIRED_FIELDS {
+                self.require_contract_field(source, path, &["languages", field], Some(occurrence))?;
+            }
+            for field in ConfigurationFieldContract::LANGUAGE_OPTIONAL_FIELDS {
+                self.validate_optional_contract_field(
+                    source,
+                    path,
+                    &["languages", field],
+                    Some(occurrence),
+                )?;
+            }
+        }
+
+        let profile_tables = self.table_occurrences(&["rpg_maker", "translation_profiles"]);
+        if profile_tables.is_empty() {
+            return Err(self.missing_field(
+                source,
+                path,
+                &["rpg_maker", "translation_profiles"],
+                None,
+                ConfigurationTomlValueKind::TableArray,
+            ));
+        }
+        for occurrence in profile_tables {
+            self.require_contract_field(
+                source,
+                path,
+                &["rpg_maker", "translation_profiles", "id"],
+                Some(occurrence),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_language_variants(
+        &self,
+        source: &str,
+        path: &Path,
+        language_types: &[String],
+    ) -> Result<(), ConfigurationLoadError> {
+        for (occurrence, language_type) in language_types.iter().enumerate() {
+            let required =
+                match ConfigurationFieldContract::language_variant_required_fields(language_type) {
+                    Some(required) => required,
+                    _ => {
+                        let field = self
+                            .field(&["languages", "type"], Some(occurrence))
+                            .expect("Translate 基础 contract 已建立每个语言 type 字段");
+                        return Err(self.failure_at(
+                            source,
+                            path,
+                            field.shape.span(),
+                            &field.path,
+                            ConfigurationTomlFailureKind::InvalidValue,
+                        ));
+                    }
+                };
+            for field in required {
+                self.require_contract_field(source, path, &["languages", field], Some(occurrence))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn require_contract_field(
+        &self,
+        source: &str,
+        path: &Path,
+        field_path: &[&str],
+        occurrence: Option<usize>,
+    ) -> Result<(), ConfigurationLoadError> {
+        let expected = ConfigurationFieldContract::expected_field_kind(field_path);
+        self.require_field(source, path, field_path, occurrence, expected)
+    }
+
+    fn require_field(
+        &self,
+        source: &str,
+        path: &Path,
+        field_path: &[&str],
+        occurrence: Option<usize>,
+        expected: ConfigurationTomlValueKind,
+    ) -> Result<(), ConfigurationLoadError> {
+        let Some(field) = self.field(field_path, occurrence) else {
+            if let Some(descendant) = self.fields.iter().find(|candidate| {
+                candidate.table_occurrence == occurrence
+                    && field_path.len() < candidate.path.len()
+                    && candidate
+                        .path
+                        .iter()
+                        .zip(field_path)
+                        .all(|(actual, expected)| actual == expected)
+            }) {
+                return Err(configuration_toml_failure(
+                    path,
+                    source,
+                    Some(descendant.key_span.clone()),
+                    field_path.join("."),
+                    ConfigurationTomlFailureKind::TypeMismatch { expected },
+                ));
+            }
+            return Err(self.missing_field(source, path, field_path, occurrence, expected));
+        };
+        if !field.shape.matches(expected) {
+            return Err(self.failure_at(
+                source,
+                path,
+                field.shape.span(),
+                &field.path,
+                ConfigurationTomlFailureKind::TypeMismatch { expected },
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_optional_contract_field(
+        &self,
+        source: &str,
+        path: &Path,
+        field_path: &[&str],
+        occurrence: Option<usize>,
+    ) -> Result<(), ConfigurationLoadError> {
+        if self.field(field_path, occurrence).is_some() {
+            self.require_contract_field(source, path, field_path, occurrence)?;
+        }
+        Ok(())
+    }
+
+    fn field(&self, path: &[&str], occurrence: Option<usize>) -> Option<&IndexedField> {
+        self.fields.iter().find(|field| {
+            field.table_occurrence == occurrence
+                && field.path.len() == path.len()
+                && field
+                    .path
+                    .iter()
+                    .zip(path)
+                    .all(|(actual, expected)| actual == expected)
+        })
+    }
+
+    fn has_table(&self, path: &[&str], occurrence: Option<usize>) -> bool {
+        self.tables.iter().any(|table| {
+            table.occurrence == occurrence
+                && table.path.len() == path.len()
+                && table
+                    .path
+                    .iter()
+                    .zip(path)
+                    .all(|(actual, expected)| actual == expected)
+        }) || self
+            .field(path, occurrence)
+            .is_some_and(|field| field.shape.matches(ConfigurationTomlValueKind::Table))
+    }
+
+    fn table_occurrences(&self, path: &[&str]) -> Vec<usize> {
+        self.tables
+            .iter()
+            .filter(|table| {
+                table.kind == IndexedTableKind::TableArray
+                    && table.path.len() == path.len()
+                    && table
+                        .path
+                        .iter()
+                        .zip(path)
+                        .all(|(actual, expected)| actual == expected)
+            })
+            .filter_map(|table| table.occurrence)
+            .collect()
+    }
+
+    fn missing_field(
+        &self,
+        source: &str,
+        path: &Path,
+        field_path: &[&str],
+        occurrence: Option<usize>,
+        _expected: ConfigurationTomlValueKind,
+    ) -> ConfigurationLoadError {
+        let owner = &field_path[..field_path.len().saturating_sub(1)];
+        let span = self
+            .tables
+            .iter()
+            .find(|table| {
+                table.occurrence == occurrence
+                    && table.path.len() == owner.len()
+                    && table
+                        .path
+                        .iter()
+                        .zip(owner)
+                        .all(|(actual, expected)| actual == expected)
+            })
+            .map(|table| table.span.clone());
+        configuration_toml_failure(
+            path,
+            source,
+            span,
+            field_path.join("."),
+            ConfigurationTomlFailureKind::MissingField,
+        )
+    }
+
+    fn failure_at(
+        &self,
+        source: &str,
+        path: &Path,
+        span: &Range<usize>,
+        resource: &[String],
+        failure: ConfigurationTomlFailureKind,
+    ) -> ConfigurationLoadError {
+        configuration_toml_failure(
+            path,
+            source,
+            Some(span.clone()),
+            resource.join("."),
+            failure,
+        )
+    }
+
+    fn resource_at(&self, offset: usize) -> String {
+        self.fields
+            .iter()
+            .filter(|field| field.key_span.start <= offset || field.shape.span().start <= offset)
+            .max_by_key(|field| field.key_span.start.max(field.shape.span().start))
+            .map_or_else(|| "TOML 文档".to_owned(), |field| field.path.join("."))
+    }
+}
+
+struct ConfigurationFieldContract;
+
+impl ConfigurationFieldContract {
+    const COMMON_REQUIRED_FIELDS: &'static [&'static [&'static str]] = &[&["projects", "root"]];
+    const TRANSLATE_REQUIRED_FIELDS: &'static [&'static [&'static str]] = &[
+        &["prompts", "root"],
+        &["prompts", "locale"],
+        &["prompts", "thinking_output"],
+    ];
+    const LANGUAGE_BASE_REQUIRED_FIELDS: &'static [&'static str] = &["type", "id"];
+    const LANGUAGE_OPTIONAL_FIELDS: &'static [&'static str] = &[
+        "minimum_kana_characters",
+        "minimum_word_count",
+        "minimum_letter_count",
+        "minimum_copied_word_count",
+        "minimum_copied_letter_count",
+        "allowed_terms",
+        "ignored_terms",
+        "quote_repair_pairs",
+    ];
+    const JAPANESE_REQUIRED_FIELDS: &'static [&'static str] = &[
+        "minimum_kana_characters",
+        "allowed_terms",
+        "quote_repair_pairs",
+    ];
+    const ENGLISH_REQUIRED_FIELDS: &'static [&'static str] = &[
+        "minimum_word_count",
+        "minimum_letter_count",
+        "ignored_terms",
+        "minimum_copied_word_count",
+        "minimum_copied_letter_count",
+        "allowed_terms",
+    ];
+    const PROFILE_REQUIRED_FIELDS: &'static [&'static str] =
+        &["id", "llm_client", "target_task_user_message_characters"];
+    const CLIENT_REQUIRED_FIELDS: &'static [&'static str] = &[
+        "url",
+        "api_key",
+        "model",
+        "max_concurrent_requests",
+        "connect_timeout_ms",
+        "read_timeout_ms",
+        "request_timeout_ms",
+        "proxy",
+        "additional_pem_files",
+        "retry_delays_ms",
+        "max_retry_after_ms",
+        "parameters",
+    ];
+    const RATE_LIMIT_REQUIRED_FIELDS: &'static [&'static str] = &["requests_per_minute", "burst"];
+
+    fn language_variant_required_fields(language_type: &str) -> Option<&'static [&'static str]> {
+        match language_type {
+            "japanese" => Some(Self::JAPANESE_REQUIRED_FIELDS),
+            "english" => Some(Self::ENGLISH_REQUIRED_FIELDS),
+            _ => None,
+        }
+    }
+
+    fn expected_field_kind(path: &[&str]) -> ConfigurationTomlValueKind {
+        let path = path
+            .iter()
+            .map(|part| (*part).to_owned())
+            .collect::<Vec<_>>();
+        Self::field_kind(&path).expect("必填或可选字段必须由唯一配置字段契约声明")
+    }
+
+    fn owning_value_field(path: &[String]) -> Option<(&[String], ConfigurationTomlValueKind)> {
+        (1..=path.len()).find_map(|prefix_len| {
+            let prefix = &path[..prefix_len];
+            Self::field_kind(prefix).map(|expected| (prefix, expected))
+        })
+    }
+
+    fn is_descendant_of_value_field(path: &[String]) -> bool {
+        path.len() > 1 && Self::owning_value_field(&path[..path.len() - 1]).is_some()
+    }
+
+    fn table_kind(path: &[String]) -> Option<IndexedTableKind> {
+        match path {
+            [first] if matches!(first.as_str(), "projects" | "prompts" | "llm" | "rpg_maker") => {
+                Some(IndexedTableKind::Table)
+            }
+            [llm, clients] if llm == "llm" && clients == "clients" => Some(IndexedTableKind::Table),
+            [llm, clients, _] if llm == "llm" && clients == "clients" => {
+                Some(IndexedTableKind::Table)
+            }
+            [llm, clients, _, rate_limit]
+                if llm == "llm" && clients == "clients" && rate_limit == "rate_limit" =>
+            {
+                Some(IndexedTableKind::Table)
+            }
+            [languages] if languages == "languages" => Some(IndexedTableKind::TableArray),
+            [rpg_maker, profiles]
+                if rpg_maker == "rpg_maker" && profiles == "translation_profiles" =>
+            {
+                Some(IndexedTableKind::TableArray)
+            }
+            _ => None,
+        }
+    }
+
+    fn structural_kind(path: &[String]) -> Option<ConfigurationTomlValueKind> {
+        Self::table_kind(path).map(IndexedTableKind::expected)
+    }
+
+    fn field_kind(path: &[String]) -> Option<ConfigurationTomlValueKind> {
+        let kind = match path {
+            [projects, root] if projects == "projects" && root == "root" => {
+                ConfigurationTomlValueKind::String
+            }
+            [prompts, field]
+                if prompts == "prompts" && matches!(field.as_str(), "root" | "locale") =>
+            {
+                ConfigurationTomlValueKind::String
+            }
+            [prompts, thinking] if prompts == "prompts" && thinking == "thinking_output" => {
+                ConfigurationTomlValueKind::Boolean
+            }
+            [llm, clients, _, field]
+                if llm == "llm"
+                    && clients == "clients"
+                    && matches!(field.as_str(), "url" | "api_key" | "model" | "parameters") =>
+            {
+                ConfigurationTomlValueKind::String
+            }
+            [llm, clients, _, field]
+                if llm == "llm"
+                    && clients == "clients"
+                    && matches!(
+                        field.as_str(),
+                        "max_concurrent_requests"
+                            | "connect_timeout_ms"
+                            | "read_timeout_ms"
+                            | "request_timeout_ms"
+                            | "max_retry_after_ms"
+                    ) =>
+            {
+                ConfigurationTomlValueKind::Integer
+            }
+            [llm, clients, _, proxy]
+                if llm == "llm" && clients == "clients" && proxy == "proxy" =>
+            {
+                ConfigurationTomlValueKind::StringOrBoolean
+            }
+            [llm, clients, _, pem]
+                if llm == "llm" && clients == "clients" && pem == "additional_pem_files" =>
+            {
+                ConfigurationTomlValueKind::StringArray
+            }
+            [llm, clients, _, delays]
+                if llm == "llm" && clients == "clients" && delays == "retry_delays_ms" =>
+            {
+                ConfigurationTomlValueKind::IntegerArray
+            }
+            [llm, clients, _, rate_limit, field]
+                if llm == "llm"
+                    && clients == "clients"
+                    && rate_limit == "rate_limit"
+                    && matches!(field.as_str(), "requests_per_minute" | "burst") =>
+            {
+                ConfigurationTomlValueKind::Integer
+            }
+            [languages, field]
+                if languages == "languages" && matches!(field.as_str(), "type" | "id") =>
+            {
+                ConfigurationTomlValueKind::String
+            }
+            [languages, field]
+                if languages == "languages"
+                    && matches!(
+                        field.as_str(),
+                        "minimum_kana_characters"
+                            | "minimum_word_count"
+                            | "minimum_letter_count"
+                            | "minimum_copied_word_count"
+                            | "minimum_copied_letter_count"
+                    ) =>
+            {
+                ConfigurationTomlValueKind::Integer
+            }
+            [languages, field]
+                if languages == "languages"
+                    && matches!(field.as_str(), "allowed_terms" | "ignored_terms") =>
+            {
+                ConfigurationTomlValueKind::StringArray
+            }
+            [languages, pairs] if languages == "languages" && pairs == "quote_repair_pairs" => {
+                ConfigurationTomlValueKind::StringPairArray
+            }
+            [rpg_maker, record]
+                if rpg_maker == "rpg_maker" && record == "record_translation_tasks" =>
+            {
+                ConfigurationTomlValueKind::Boolean
+            }
+            [rpg_maker, profiles, field]
+                if rpg_maker == "rpg_maker"
+                    && profiles == "translation_profiles"
+                    && matches!(field.as_str(), "id" | "llm_client") =>
+            {
+                ConfigurationTomlValueKind::String
+            }
+            [rpg_maker, profiles, target]
+                if rpg_maker == "rpg_maker"
+                    && profiles == "translation_profiles"
+                    && target == "target_task_user_message_characters" =>
+            {
+                ConfigurationTomlValueKind::Integer
+            }
+            _ => return None,
+        };
+        Some(kind)
+    }
+}
+
+struct IndexedBuildFailure {
+    span: Range<usize>,
+    resource: String,
+    failure: ConfigurationTomlFailureKind,
+}
+
+struct ConfigurationTomlIndexParser<'a> {
+    source: Source<'a>,
+    events: &'a [Event],
+    cursor: usize,
+    current_table: Vec<String>,
+    current_occurrence: Option<usize>,
+    table_occurrences: HashMap<Vec<String>, usize>,
+    declared_tables: BTreeSet<Vec<String>>,
+    assigned_fields: BTreeSet<(Vec<String>, Option<usize>)>,
+    tables: Vec<IndexedTable>,
+    fields: Vec<IndexedField>,
+}
+
+impl<'a> ConfigurationTomlIndexParser<'a> {
+    fn new(source: Source<'a>, events: &'a [Event]) -> Self {
+        Self {
+            source,
+            events,
+            cursor: 0,
+            current_table: Vec::new(),
+            current_occurrence: None,
+            table_occurrences: HashMap::new(),
+            declared_tables: BTreeSet::new(),
+            assigned_fields: BTreeSet::new(),
+            tables: Vec::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    fn parse(mut self) -> Result<ConfigurationTomlIndex, IndexedBuildFailure> {
+        while self.skip_trivia() {
+            match self.peek_kind() {
+                Some(EventKind::StdTableOpen | EventKind::ArrayTableOpen) => {
+                    self.parse_table_header()?;
+                }
+                Some(EventKind::SimpleKey) => self.parse_assignment()?,
+                Some(_) => return Err(self.syntax_failure(self.current_span())),
+                None => break,
+            }
+        }
+        Ok(ConfigurationTomlIndex {
+            tables: self.tables,
+            fields: self.fields,
+        })
+    }
+
+    fn parse_table_header(&mut self) -> Result<(), IndexedBuildFailure> {
+        let open = self.next().expect("已确认存在表头开始事件");
+        let (kind, close_kind) = match open.kind() {
+            EventKind::StdTableOpen => (IndexedTableKind::Table, EventKind::StdTableClose),
+            EventKind::ArrayTableOpen => (IndexedTableKind::TableArray, EventKind::ArrayTableClose),
+            _ => unreachable!("调用方只在表头事件调用"),
+        };
+        let (table_path, key_span) = self.parse_key_path_until(close_kind)?;
+        if table_path.is_empty() {
+            return Err(self.syntax_failure(span_range(open.span())));
+        }
+        let close = self.next().expect("键路径解析必须停在表头结束事件");
+        let span = open.span().start()..close.span().end();
+
+        let conflicts_with_value =
+            self.assigned_fields
+                .iter()
+                .any(|(assigned_path, assigned_occurrence)| {
+                    !(kind == IndexedTableKind::TableArray && assigned_occurrence.is_some())
+                        && value_paths_conflict(assigned_path, &table_path)
+                });
+        let conflicts_with_table = self.tables.iter().any(|declared| {
+            if declared.path == table_path {
+                kind != IndexedTableKind::TableArray
+                    || declared.kind != IndexedTableKind::TableArray
+            } else {
+                path_is_prefix(&table_path, &declared.path)
+            }
+        });
+        if conflicts_with_value || conflicts_with_table {
+            return Err(IndexedBuildFailure {
+                span: key_span,
+                resource: table_path.join("."),
+                failure: ConfigurationTomlFailureKind::DuplicateField,
+            });
+        }
+
+        let occurrence = if kind == IndexedTableKind::TableArray {
+            let next = self
+                .table_occurrences
+                .entry(table_path.clone())
+                .or_default();
+            let occurrence = *next;
+            *next += 1;
+            Some(occurrence)
+        } else {
+            let inserted = self.declared_tables.insert(table_path.clone());
+            debug_assert!(inserted, "重复显式表必须已由结构冲突检查拒绝");
+            None
+        };
+        self.current_table.clone_from(&table_path);
+        self.current_occurrence = occurrence;
+        self.tables.push(IndexedTable {
+            path: table_path,
+            kind,
+            occurrence,
+            span,
+        });
+        Ok(())
+    }
+
+    fn parse_assignment(&mut self) -> Result<(), IndexedBuildFailure> {
+        let (local_path, key_span) = self.parse_key_path_until(EventKind::KeyValSep)?;
+        if local_path.is_empty() {
+            return Err(self.syntax_failure(key_span));
+        }
+        let _separator = self.next().expect("键路径解析必须停在等号事件");
+        let shape = self.parse_value()?;
+        let mut path = self.current_table.clone();
+        path.extend(local_path);
+        let identity = (path.clone(), self.current_occurrence);
+        let conflicts_with_value =
+            self.assigned_fields
+                .iter()
+                .any(|(assigned_path, assigned_occurrence)| {
+                    *assigned_occurrence == self.current_occurrence
+                        && value_paths_conflict(assigned_path, &path)
+                });
+        let conflicts_with_table = self
+            .tables
+            .iter()
+            .any(|table| path_is_prefix(&path, &table.path));
+        if conflicts_with_value || conflicts_with_table {
+            return Err(IndexedBuildFailure {
+                span: key_span,
+                resource: path.join("."),
+                failure: ConfigurationTomlFailureKind::DuplicateField,
+            });
+        }
+        let inserted = self.assigned_fields.insert(identity);
+        debug_assert!(inserted, "重复赋值必须已由结构冲突检查拒绝");
+        self.fields.push(IndexedField {
+            path: path.clone(),
+            table_occurrence: self.current_occurrence,
+            shape: shape.clone(),
+            key_span: key_span.clone(),
+        });
+        self.flatten_inline_fields(&path, self.current_occurrence, &shape)?;
+        Ok(())
+    }
+
+    fn flatten_inline_fields(
+        &mut self,
+        prefix: &[String],
+        occurrence: Option<usize>,
+        shape: &IndexedValueShape,
+    ) -> Result<(), IndexedBuildFailure> {
+        let IndexedValueShape::InlineTable { fields, .. } = shape else {
+            return Ok(());
+        };
+        for inline in fields {
+            let mut path = prefix.to_vec();
+            path.extend(inline.path.iter().cloned());
+            if !self.assigned_fields.insert((path.clone(), occurrence)) {
+                return Err(IndexedBuildFailure {
+                    span: inline.key_span.clone(),
+                    resource: path.join("."),
+                    failure: ConfigurationTomlFailureKind::DuplicateField,
+                });
+            }
+            self.fields.push(IndexedField {
+                path: path.clone(),
+                table_occurrence: occurrence,
+                shape: inline.shape.clone(),
+                key_span: inline.key_span.clone(),
+            });
+            self.flatten_inline_fields(&path, occurrence, &inline.shape)?;
+        }
+        Ok(())
+    }
+
+    fn parse_key_path_until(
+        &mut self,
+        terminator: EventKind,
+    ) -> Result<(Vec<String>, Range<usize>), IndexedBuildFailure> {
+        let mut path = Vec::new();
+        let mut start = None;
+        let mut end = None;
+        loop {
+            self.skip_trivia();
+            if self.peek_kind() == Some(terminator) {
+                let point = start.unwrap_or_else(|| self.current_span().start);
+                return Ok((path, point..end.unwrap_or(point)));
+            }
+            let Some(event) = self.next() else {
+                return Err(self.syntax_failure(self.current_span()));
+            };
+            if event.kind() != EventKind::SimpleKey {
+                return Err(self.syntax_failure(span_range(event.span())));
+            }
+            let raw = self
+                .source
+                .get(event)
+                .expect("键事件 span 必须来自同一原文");
+            let mut key = String::new();
+            let mut errors = Vec::new();
+            raw.decode_key(&mut key, &mut errors);
+            if !errors.is_empty() {
+                return Err(self.syntax_failure(span_range(event.span())));
+            }
+            start.get_or_insert(event.span().start());
+            end = Some(event.span().end());
+            path.push(key);
+            self.skip_trivia();
+            if self.peek_kind() == Some(EventKind::KeySep) {
+                let _ = self.next();
+                continue;
+            }
+            if self.peek_kind() != Some(terminator) {
+                return Err(self.syntax_failure(self.current_span()));
+            }
+        }
+    }
+
+    fn parse_value(&mut self) -> Result<IndexedValueShape, IndexedBuildFailure> {
+        self.skip_trivia();
+        let Some(event) = self.next() else {
+            return Err(self.syntax_failure(self.current_span()));
+        };
+        match event.kind() {
+            EventKind::Scalar => {
+                let raw = self
+                    .source
+                    .get(event)
+                    .expect("值事件 span 必须来自同一原文");
+                let mut errors = Vec::new();
+                let kind = match raw.decode_scalar(&mut (), &mut errors) {
+                    ScalarKind::String => IndexedScalarKind::String,
+                    ScalarKind::Integer(_) => IndexedScalarKind::Integer,
+                    ScalarKind::Boolean(_) => IndexedScalarKind::Boolean,
+                    ScalarKind::DateTime | ScalarKind::Float => IndexedScalarKind::Other,
+                };
+                if !errors.is_empty() {
+                    return Err(self.syntax_failure(span_range(event.span())));
+                }
+                Ok(IndexedValueShape::Scalar {
+                    kind,
+                    span: span_range(event.span()),
+                })
+            }
+            EventKind::ArrayOpen => self.parse_array(event.span()),
+            EventKind::InlineTableOpen => self.parse_inline_table(event.span()),
+            _ => Err(self.syntax_failure(span_range(event.span()))),
+        }
+    }
+
+    fn parse_array(&mut self, open: Span) -> Result<IndexedValueShape, IndexedBuildFailure> {
+        let mut items = Vec::new();
+        loop {
+            self.skip_trivia();
+            if self.peek_kind() == Some(EventKind::ArrayClose) {
+                let close = self.next().expect("已确认数组结束事件存在");
+                return Ok(IndexedValueShape::Array {
+                    items,
+                    span: open.start()..close.span().end(),
+                });
+            }
+            items.push(self.parse_value()?);
+            self.skip_trivia();
+            if self.peek_kind() == Some(EventKind::ValueSep) {
+                let _ = self.next();
+                continue;
+            }
+            if self.peek_kind() != Some(EventKind::ArrayClose) {
+                return Err(self.syntax_failure(self.current_span()));
+            }
+        }
+    }
+
+    fn parse_inline_table(&mut self, open: Span) -> Result<IndexedValueShape, IndexedBuildFailure> {
+        let mut fields = Vec::new();
+        let mut seen = BTreeSet::<Vec<String>>::new();
+        loop {
+            self.skip_trivia();
+            if self.peek_kind() == Some(EventKind::InlineTableClose) {
+                let close = self.next().expect("已确认内联表结束事件存在");
+                return Ok(IndexedValueShape::InlineTable {
+                    fields,
+                    span: open.start()..close.span().end(),
+                });
+            }
+            let (path, key_span) = self.parse_key_path_until(EventKind::KeyValSep)?;
+            let _separator = self.next().expect("内联表字段必须拥有等号");
+            let shape = self.parse_value()?;
+            if seen
+                .iter()
+                .any(|existing| value_paths_conflict(existing, &path))
+            {
+                return Err(IndexedBuildFailure {
+                    span: key_span,
+                    resource: path.join("."),
+                    failure: ConfigurationTomlFailureKind::DuplicateField,
+                });
+            }
+            let inserted = seen.insert(path.clone());
+            debug_assert!(inserted, "重复内联字段必须已由结构冲突检查拒绝");
+            fields.push(IndexedInlineField {
+                path,
+                shape,
+                key_span,
+            });
+            self.skip_trivia();
+            if self.peek_kind() == Some(EventKind::ValueSep) {
+                let _ = self.next();
+                continue;
+            }
+            if self.peek_kind() != Some(EventKind::InlineTableClose) {
+                return Err(self.syntax_failure(self.current_span()));
+            }
+        }
+    }
+
+    fn skip_trivia(&mut self) -> bool {
+        while matches!(
+            self.peek_kind(),
+            Some(EventKind::Whitespace | EventKind::Comment | EventKind::Newline)
+        ) {
+            self.cursor += 1;
+        }
+        self.cursor < self.events.len()
+    }
+
+    fn peek_kind(&self) -> Option<EventKind> {
+        self.events.get(self.cursor).map(Event::kind)
+    }
+
+    fn next(&mut self) -> Option<Event> {
+        let event = self.events.get(self.cursor).copied()?;
+        self.cursor += 1;
+        Some(event)
+    }
+
+    fn current_span(&self) -> Range<usize> {
+        self.events
+            .get(self.cursor)
+            .map(|event| span_range(event.span()))
+            .unwrap_or_else(|| {
+                let end = self.source.input().len();
+                end..end
+            })
+    }
+
+    fn syntax_failure(&self, span: Range<usize>) -> IndexedBuildFailure {
+        IndexedBuildFailure {
+            span,
+            resource: if self.current_table.is_empty() {
+                "TOML 文档".to_owned()
+            } else {
+                self.current_table.join(".")
+            },
+            failure: ConfigurationTomlFailureKind::Syntax,
+        }
+    }
+}
+
+fn path_is_prefix(prefix: &[String], path: &[String]) -> bool {
+    prefix.len() <= path.len()
+        && prefix
+            .iter()
+            .zip(path)
+            .all(|(expected, actual)| expected == actual)
+}
+
+fn value_paths_conflict(left: &[String], right: &[String]) -> bool {
+    path_is_prefix(left, right) || path_is_prefix(right, left)
+}
+
+fn earliest_parse_error_offset(errors: &[ParseError]) -> Option<usize> {
+    errors
+        .iter()
+        .filter_map(|error| error.unexpected().or_else(|| error.context()))
+        .map(|span| span.start())
+        .min()
+        .or_else(|| (!errors.is_empty()).then_some(0))
+}
+
+fn span_range(span: Span) -> Range<usize> {
+    span.start()..span.end()
+}
+
+fn configuration_toml_failure(
     path: &Path,
-) -> Result<(), ConfigurationLoadError> {
-    let _: RawConfigurationFieldNames = parse_selected(source, path)?;
-    Ok(())
-}
-
-fn parse_selected<T>(source: &str, path: &Path) -> Result<T, ConfigurationLoadError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    toml::from_str(source).map_err(|error| invalid_toml(path, source, &error))
-}
-
-fn invalid_toml(path: &Path, source: &str, error: &toml::de::Error) -> ConfigurationLoadError {
-    let span = error.span();
+    source: &str,
+    span: Option<Range<usize>>,
+    resource: String,
+    failure: ConfigurationTomlFailureKind,
+) -> ConfigurationLoadError {
     let location = span
         .as_ref()
         .map(|span| source_location(source, span.start));
-    let (resource, reason) = safe_toml_diagnostic(source, span.as_ref(), error.message());
     ConfigurationLoadError::InvalidToml {
         path: path.to_path_buf(),
         location,
         resource,
-        reason,
+        failure,
     }
 }
 
-/// 从 TOML/Serde 错误中只提取字段身份和失败类别。
-///
-/// 不保留原始错误文本，因为 `invalid type` 等 Serde 诊断可能嵌入实际字符串值。
-/// 资源名只由 TOML 表头、赋值左侧或 Serde 报告的字段名组成。
-fn safe_toml_diagnostic(
+fn invalid_toml(
+    path: &Path,
     source: &str,
-    span: Option<&std::ops::Range<usize>>,
-    message: &str,
-) -> (String, &'static str) {
-    let (reported_field, reason) = if message.starts_with("missing field ") {
-        (
-            backticked_field_after(message, "missing field "),
-            "缺少必填字段",
-        )
-    } else if message.starts_with("unknown field ") {
-        (
-            backticked_field_after(message, "unknown field "),
-            "当前配置契约不接受该字段",
-        )
-    } else if message.starts_with("duplicate field ") {
-        (
-            backticked_field_after(message, "duplicate field "),
-            "字段重复",
-        )
-    } else if message.starts_with("invalid type:") {
-        (None, "字段类型不符合当前配置契约")
-    } else if message.starts_with("invalid value:") || message.starts_with("unknown variant ") {
-        (None, "字段值不符合当前配置契约")
-    } else if message.contains("duplicate key") {
-        (None, "TOML 字段或表重复")
-    } else {
-        (None, "TOML 语法无效")
-    };
-
-    let offset = span.map_or(source.len(), |span| span.start.min(source.len()));
-    let assignment_field = assignment_field_at(source, offset);
-    let field = reported_field.or(assignment_field.as_deref());
-    let table = table_path_at(source, offset);
-    let resource = match (table.as_deref(), field) {
-        (Some(table), Some(field)) if table == field || table.ends_with(&format!(".{field}")) => {
-            table.to_owned()
-        }
-        (Some(table), Some(field)) => format!("{table}.{field}"),
-        (None, Some(field)) => field.to_owned(),
-        (Some(table), None) => table.to_owned(),
-        (None, None) => "TOML 文档".to_owned(),
-    };
-    (resource, reason)
+    index: &ConfigurationTomlIndex,
+    error: &toml::de::Error,
+) -> ConfigurationLoadError {
+    let span = error.span();
+    let resource = span.as_ref().map_or_else(
+        || "TOML 文档".to_owned(),
+        |span| index.resource_at(span.start),
+    );
+    configuration_toml_failure(
+        path,
+        source,
+        span,
+        resource,
+        ConfigurationTomlFailureKind::InvalidValue,
+    )
 }
 
-fn backticked_field_after<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
-    let remainder = message.strip_prefix(prefix)?;
-    let field = remainder.strip_prefix('`')?.split_once('`')?.0;
-    safe_toml_key_path(field).then_some(field)
+fn parse_selected<T>(
+    source: &str,
+    path: &Path,
+    index: &ConfigurationTomlIndex,
+    selection: ConfigurationSelection,
+) -> Result<T, ConfigurationLoadError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    index.validate_selection(source, path, selection)?;
+    if matches!(selection, ConfigurationSelection::Translate) {
+        let discriminators: RawLanguageDiscriminatorSelection =
+            toml::from_str(source).map_err(|error| invalid_toml(path, source, index, &error))?;
+        let language_types = discriminators
+            .languages
+            .into_iter()
+            .map(|language| language.language_type)
+            .collect::<Vec<_>>();
+        index.validate_language_variants(source, path, &language_types)?;
+    }
+    toml::from_str(source).map_err(|error| invalid_toml(path, source, index, &error))
 }
 
-fn assignment_field_at(source: &str, offset: usize) -> Option<String> {
-    let offset = offset.min(source.len());
-    let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
-    let line_end = source[offset..]
-        .find('\n')
-        .map_or(source.len(), |index| offset + index);
-    let line = source.get(line_start..line_end)?.trim();
-    let field = line.split_once('=')?.0.trim();
-    safe_toml_key_path(field).then(|| field.to_owned())
-}
-
-fn table_path_at(source: &str, offset: usize) -> Option<String> {
-    let offset = offset.min(source.len());
-    let line_end = source[offset..]
-        .find('\n')
-        .map_or(source.len(), |index| offset + index);
-    source[..line_end].lines().rev().find_map(|line| {
-        let line = line.trim();
-        let table = line
-            .strip_prefix("[[")
-            .and_then(|value| value.strip_suffix("]]"))
-            .or_else(|| {
-                line.strip_prefix('[')
-                    .and_then(|value| value.strip_suffix(']'))
-            })?
-            .trim();
-        safe_toml_key_path(table).then(|| table.to_owned())
-    })
-}
-
-fn safe_toml_key_path(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 256
-        && value.split('.').all(|part| {
-            !part.is_empty()
-                && part.len() <= 128
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        })
+fn configuration_toml_failure_description(failure: ConfigurationTomlFailureKind) -> &'static str {
+    match failure {
+        ConfigurationTomlFailureKind::Syntax => "TOML 语法无效",
+        ConfigurationTomlFailureKind::MissingField => "缺少必填字段",
+        ConfigurationTomlFailureKind::UnknownField => "当前配置契约不接受该字段",
+        ConfigurationTomlFailureKind::DuplicateField => "字段重复",
+        ConfigurationTomlFailureKind::TypeMismatch { .. } => "字段类型不符合当前配置契约",
+        ConfigurationTomlFailureKind::InvalidValue => "字段值不符合当前配置契约",
+    }
 }
 
 fn parse_selected_translation_profile(
     source: &str,
     path: &Path,
+    index: &ConfigurationTomlIndex,
     requested_id: &str,
 ) -> Result<RawSelectedTranslationProfileConfiguration, ConfigurationLoadError> {
     let index_deserializer = toml::de::Deserializer::parse(source)
-        .map_err(|error| invalid_toml(path, source, &error))?;
+        .map_err(|error| invalid_toml(path, source, index, &error))?;
     let selection = TranslationProfileIndexTopSeed { requested_id }
         .deserialize(index_deserializer)
-        .map_err(|error| invalid_toml(path, source, &error))?
+        .map_err(|error| invalid_toml(path, source, index, &error))?
         .unwrap_or_default();
     if selection.duplicate {
         return Err(ConfigurationLoadError::InvalidValue(invalid(
@@ -2145,12 +3345,17 @@ fn parse_selected_translation_profile(
             profile_id: requested_id.to_owned(),
         }
     })?;
+    index.validate_selection(
+        source,
+        path,
+        ConfigurationSelection::SelectedProfile(selected_index),
+    )?;
 
     let profile_deserializer = toml::de::Deserializer::parse(source)
-        .map_err(|error| invalid_toml(path, source, &error))?;
+        .map_err(|error| invalid_toml(path, source, index, &error))?;
     SelectedTranslationProfileTopSeed { selected_index }
         .deserialize(profile_deserializer)
-        .map_err(|error| invalid_toml(path, source, &error))?
+        .map_err(|error| invalid_toml(path, source, index, &error))?
         .ok_or_else(|| {
             ConfigurationLoadError::InvalidValue(invalid(
                 "rpg_maker.translation_profiles",
@@ -2599,16 +3804,24 @@ impl<'de> DeserializeSeed<'de> for SelectedTranslationProfileCandidateSeed {
 fn parse_selected_llm_client(
     source: &str,
     path: &Path,
+    index: &ConfigurationTomlIndex,
     requested_id: &str,
 ) -> Result<RawLlmClientConfiguration, ConfigurationLoadError> {
     validate_exact_identifier("llm client id", requested_id)
         .map_err(ConfigurationLoadError::InvalidValue)?;
+    if !index.has_table(&["llm", "clients", requested_id], None) {
+        return Err(ConfigurationLoadError::InvalidValue(invalid(
+            "llm.clients",
+            ConfigurationValueRule::ReferencedClientNotFound,
+        )));
+    }
+    index.validate_selected_client(source, path, requested_id)?;
     let seed = SelectedLlmClientTopSeed { requested_id };
     let deserializer = toml::de::Deserializer::parse(source)
-        .map_err(|error| invalid_toml(path, source, &error))?;
+        .map_err(|error| invalid_toml(path, source, index, &error))?;
     let selected = seed
         .deserialize(deserializer)
-        .map_err(|error| invalid_toml(path, source, &error))?;
+        .map_err(|error| invalid_toml(path, source, index, &error))?;
     selected.ok_or_else(|| {
         ConfigurationLoadError::InvalidValue(invalid(
             "llm.clients",
@@ -2765,133 +3978,6 @@ impl<'de> Visitor<'de> for SelectedLlmClientMapVisitor<'_> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawConfigurationFieldNames {
-    #[serde(default, rename = "projects")]
-    _projects: Option<RawProjectsFieldNames>,
-    #[serde(default, rename = "llm")]
-    _llm: Option<RawLlmFieldNames>,
-    #[serde(default, rename = "prompts")]
-    _prompts: Option<RawPromptsFieldNames>,
-    #[serde(default, rename = "languages")]
-    _languages: Option<Vec<RawLanguageFieldNames>>,
-    #[serde(default, rename = "rpg_maker")]
-    _rpg_maker: Option<RawRpgMakerFieldNames>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProjectsFieldNames {
-    #[serde(default, rename = "root")]
-    _root: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPromptsFieldNames {
-    #[serde(default, rename = "root")]
-    _root: Option<IgnoredAny>,
-    #[serde(default, rename = "locale")]
-    _locale: Option<IgnoredAny>,
-    #[serde(default, rename = "thinking_output")]
-    _thinking_output: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLlmFieldNames {
-    #[serde(default, rename = "clients")]
-    _clients: Option<BTreeMap<String, RawLlmClientFieldNames>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLlmClientFieldNames {
-    #[serde(default, rename = "url")]
-    _url: Option<IgnoredAny>,
-    #[serde(default, rename = "api_key")]
-    _api_key: Option<IgnoredAny>,
-    #[serde(default, rename = "model")]
-    _model: Option<IgnoredAny>,
-    #[serde(default, rename = "max_concurrent_requests")]
-    _max_concurrent_requests: Option<IgnoredAny>,
-    #[serde(default, rename = "connect_timeout_ms")]
-    _connect_timeout_ms: Option<IgnoredAny>,
-    #[serde(default, rename = "read_timeout_ms")]
-    _read_timeout_ms: Option<IgnoredAny>,
-    #[serde(default, rename = "request_timeout_ms")]
-    _request_timeout_ms: Option<IgnoredAny>,
-    #[serde(default, rename = "proxy")]
-    _proxy: Option<IgnoredAny>,
-    #[serde(default, rename = "additional_pem_files")]
-    _additional_pem_files: Option<IgnoredAny>,
-    #[serde(default, rename = "retry_delays_ms")]
-    _retry_delays_ms: Option<IgnoredAny>,
-    #[serde(default, rename = "max_retry_after_ms")]
-    _max_retry_after_ms: Option<IgnoredAny>,
-    #[serde(default, rename = "parameters")]
-    _parameters: Option<IgnoredAny>,
-    #[serde(default, rename = "rate_limit")]
-    _rate_limit: Option<RawLlmRateLimitFieldNames>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLlmRateLimitFieldNames {
-    #[serde(default, rename = "requests_per_minute")]
-    _requests_per_minute: Option<IgnoredAny>,
-    #[serde(default, rename = "burst")]
-    _burst: Option<IgnoredAny>,
-}
-
-/// 字段名层只验证所有现行语言模块允许出现的字段集合；具体 `type` 对应哪些字段，
-/// 仍由 Translate 的第二遍解析负责，因此非 Translate 命令不会消费语言策略值。
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLanguageFieldNames {
-    #[serde(default, rename = "type")]
-    _language_type: Option<IgnoredAny>,
-    #[serde(default, rename = "id")]
-    _id: Option<IgnoredAny>,
-    #[serde(default, rename = "minimum_kana_characters")]
-    _minimum_kana_characters: Option<IgnoredAny>,
-    #[serde(default, rename = "minimum_word_count")]
-    _minimum_word_count: Option<IgnoredAny>,
-    #[serde(default, rename = "minimum_letter_count")]
-    _minimum_letter_count: Option<IgnoredAny>,
-    #[serde(default, rename = "ignored_terms")]
-    _ignored_terms: Option<IgnoredAny>,
-    #[serde(default, rename = "minimum_copied_word_count")]
-    _minimum_copied_word_count: Option<IgnoredAny>,
-    #[serde(default, rename = "minimum_copied_letter_count")]
-    _minimum_copied_letter_count: Option<IgnoredAny>,
-    #[serde(default, rename = "allowed_terms")]
-    _allowed_terms: Option<IgnoredAny>,
-    #[serde(default, rename = "quote_repair_pairs")]
-    _quote_repair_pairs: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRpgMakerFieldNames {
-    #[serde(default, rename = "record_translation_tasks")]
-    _record_translation_tasks: Option<IgnoredAny>,
-    #[serde(default, rename = "translation_profiles")]
-    _translation_profiles: Option<Vec<RawTranslationProfileFieldNames>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTranslationProfileFieldNames {
-    #[serde(default, rename = "id")]
-    _id: Option<IgnoredAny>,
-    #[serde(default, rename = "llm_client")]
-    _llm_client: Option<IgnoredAny>,
-    #[serde(default, rename = "target_task_user_message_characters")]
-    _target_task_user_message_characters: Option<IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawCommonConfiguration {
     projects: RawProjectsConfiguration,
     #[serde(default, rename = "llm")]
@@ -2932,6 +4018,21 @@ struct RawExtractSelection {
     _languages: Option<IgnoredAny>,
     #[serde(default, rename = "rpg_maker")]
     _rpg_maker: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct RawLanguageDiscriminatorSelection {
+    languages: Vec<RawLanguageDiscriminator>,
+    #[serde(flatten)]
+    _other: HashMap<String, IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct RawLanguageDiscriminator {
+    #[serde(rename = "type")]
+    language_type: String,
+    #[serde(flatten)]
+    _other: HashMap<String, IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -3632,6 +4733,7 @@ id = "unused"
                 source.replacen("llm_client = \"primary\"\n", "", 1),
                 "rpg_maker.translation_profiles.llm_client",
                 "缺少必填字段",
+                ConfigurationTomlFailureKind::MissingField,
                 None,
             ),
             (
@@ -3639,6 +4741,7 @@ id = "unused"
                 source.replacen("root = \"prompts\"\n", "", 1),
                 "prompts.root",
                 "缺少必填字段",
+                ConfigurationTomlFailureKind::MissingField,
                 None,
             ),
             (
@@ -3650,6 +4753,7 @@ id = "unused"
                 ),
                 "prompts.unexpected_prompt_field",
                 "当前配置契约不接受该字段",
+                ConfigurationTomlFailureKind::UnknownField,
                 Some("UNKNOWN_VALUE_SENTINEL"),
             ),
             (
@@ -3661,6 +4765,9 @@ id = "unused"
                 ),
                 "prompts.root",
                 "字段类型不符合当前配置契约",
+                ConfigurationTomlFailureKind::TypeMismatch {
+                    expected: ConfigurationTomlValueKind::String,
+                },
                 Some("PROMPT_ROOT_TYPE_SENTINEL"),
             ),
             (
@@ -3672,6 +4779,9 @@ id = "unused"
                 ),
                 "prompts.locale",
                 "字段类型不符合当前配置契约",
+                ConfigurationTomlFailureKind::TypeMismatch {
+                    expected: ConfigurationTomlValueKind::String,
+                },
                 Some("PROMPT_LOCALE_TYPE_SENTINEL"),
             ),
             (
@@ -3682,6 +4792,9 @@ id = "unused"
                 ),
                 "prompts.thinking_output",
                 "字段类型不符合当前配置契约",
+                ConfigurationTomlFailureKind::TypeMismatch {
+                    expected: ConfigurationTomlValueKind::Boolean,
+                },
                 Some("PROMPT_THINKING_TYPE_SENTINEL"),
             ),
             (
@@ -3693,6 +4806,9 @@ id = "unused"
                 ),
                 "llm.clients.primary.max_concurrent_requests",
                 "字段类型不符合当前配置契约",
+                ConfigurationTomlFailureKind::TypeMismatch {
+                    expected: ConfigurationTomlValueKind::Integer,
+                },
                 Some("TYPE_VALUE_SENTINEL"),
             ),
             (
@@ -3704,11 +4820,16 @@ id = "unused"
                 ),
                 "llm.clients.primary.api_key",
                 "字段类型不符合当前配置契约",
+                ConfigurationTomlFailureKind::TypeMismatch {
+                    expected: ConfigurationTomlValueKind::String,
+                },
                 Some("API_KEY_TYPE_SENTINEL"),
             ),
         ];
 
-        for (name, source, expected_resource, expected_reason, forbidden_value) in cases {
+        for (name, source, expected_resource, expected_reason, expected_failure, forbidden_value) in
+            cases
+        {
             let path = directory.write(format!("diagnostic-{name}.toml").as_str(), &source);
             let error = match load_configuration(&path, translate_command(false, "primary")) {
                 Ok(_) => panic!("无效配置必须失败"),
@@ -3716,11 +4837,24 @@ id = "unused"
             };
             let diagnostic = error.to_string();
             let canonical_path = path.canonicalize().expect("测试配置应可规范化");
+            let ConfigurationLoadError::InvalidToml {
+                path: error_path,
+                location,
+                resource,
+                failure,
+            } = &error
+            else {
+                panic!("结构、字段和类型失败必须保留 typed TOML 诊断：{error:?}");
+            };
 
             assert!(
                 diagnostic.starts_with(canonical_path.display().to_string().as_str()),
                 "诊断必须以配置路径开始：{diagnostic}"
             );
+            assert_eq!(error_path, &canonical_path);
+            assert!(location.is_some(), "已定位的配置失败必须携带一基行列");
+            assert_eq!(resource, expected_resource);
+            assert_eq!(*failure, expected_failure);
             assert!(diagnostic.contains(expected_resource), "{diagnostic}");
             assert!(diagnostic.contains(expected_reason), "{diagnostic}");
             if let Some(value) = forbidden_value {
@@ -3839,10 +4973,168 @@ id = "unused"
         );
         let path = directory.write("duplicate-unselected-key.toml", &source);
 
-        assert!(
-            load_configuration(&path, init_command()).is_err(),
-            "完整 TOML 的重复键属于语法错误，不得因分区未选中而忽略"
+        let error = match load_configuration(&path, init_command()) {
+            Ok(_) => panic!("完整 TOML 的重复键不得因分区未选中而忽略"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigurationLoadError::InvalidToml {
+                ref resource,
+                failure: ConfigurationTomlFailureKind::DuplicateField,
+                ..
+            } if resource == "llm.clients.unused.api_key"
+        ));
+    }
+
+    #[test]
+    fn selected_scalar_shape_conflicts_are_typed_without_value_echo() {
+        const SENTINEL: &str = "SCALAR_SHAPE_VALUE_SENTINEL";
+        const PARAMETERS: &str = "parameters = '''\n{}\n'''";
+        let directory = TestDirectory::new();
+        let example = include_str!("../../config.example.toml").replace("\r\n", "\n");
+        assert!(example.contains(PARAMETERS));
+
+        for (name, replacement) in [
+            (
+                "table-header",
+                format!("[llm.clients.primary.parameters]\nvendor = \"{SENTINEL}\""),
+            ),
+            ("dotted-key", format!("parameters.vendor = \"{SENTINEL}\"")),
+            (
+                "inline-table",
+                format!("parameters = {{ vendor = \"{SENTINEL}\" }}"),
+            ),
+        ] {
+            let source = example.replacen(PARAMETERS, &replacement, 1);
+            let path = directory.write(format!("scalar-shape-{name}.toml").as_str(), &source);
+            let error = match load_configuration(&path, translate_command(false, "primary")) {
+                Ok(_) => panic!("所选字符串字段的表形态必须拒绝：{name}"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                &error,
+                ConfigurationLoadError::InvalidToml {
+                    resource,
+                    failure: ConfigurationTomlFailureKind::TypeMismatch {
+                        expected: ConfigurationTomlValueKind::String,
+                    },
+                    ..
+                } if resource == "llm.clients.primary.parameters"
+            ));
+            assert!(
+                !format!("{error:?}\n{error}").contains(SENTINEL),
+                "shape 诊断不得回显字段正文：{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_pair_array_shape_requires_exact_pairs() {
+        const SENTINEL: &str = "PAIR_SHAPE_VALUE_SENTINEL";
+        let directory = TestDirectory::new();
+        let example = include_str!("../../config.example.toml");
+        let original = "quote_repair_pairs = [[\"“\", \"”\"], [\"‘\", \"’\"]]";
+
+        for (name, replacement) in [
+            ("one", format!("quote_repair_pairs = [[\"{SENTINEL}\"]]")),
+            (
+                "three",
+                format!("quote_repair_pairs = [[\"a\", \"b\", \"{SENTINEL}\"]]"),
+            ),
+        ] {
+            let source = example.replacen(original, &replacement, 1);
+            let path = directory.write(format!("pair-shape-{name}.toml").as_str(), &source);
+            let error = match load_configuration(&path, translate_command(false, "primary")) {
+                Ok(_) => panic!("一项必须恰好包含两个字符串：{name}"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                &error,
+                ConfigurationLoadError::InvalidToml {
+                    resource,
+                    failure: ConfigurationTomlFailureKind::TypeMismatch {
+                        expected: ConfigurationTomlValueKind::StringPairArray,
+                    },
+                    ..
+                } if resource == "languages.quote_repair_pairs"
+            ));
+            assert!(!format!("{error:?}\n{error}").contains(SENTINEL));
+        }
+    }
+
+    #[test]
+    fn toml_value_table_structure_conflicts_are_duplicate_fields() {
+        let directory = TestDirectory::new();
+        for (name, conflict) in [
+            ("value-then-table", "a = 1\n[a]\n"),
+            ("table-value-then-table", "[a]\nb = 1\n[a.b]\n"),
+            (
+                "inline-value-then-dotted",
+                "a = { value = 1, value.child = 2 }\n",
+            ),
+            ("value-then-dotted", "a = 1\na.child = 2\n"),
+        ] {
+            let source = format!("{conflict}\n{}", minimal_init_configuration());
+            let path =
+                directory.write(format!("duplicate-structure-{name}.toml").as_str(), &source);
+            let error = match load_configuration(&path, init_command()) {
+                Ok(_) => panic!("标量与表结构占用冲突必须拒绝：{name}"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error,
+                    ConfigurationLoadError::InvalidToml {
+                        failure: ConfigurationTomlFailureKind::DuplicateField,
+                        ..
+                    }
+                ),
+                "结构占用冲突必须稳定分类为 DuplicateField：{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn syntax_and_discriminator_value_failures_are_typed_without_value_echo() {
+        let directory = TestDirectory::new();
+        let syntax_path = directory.write(
+            "syntax.toml",
+            "[projects]\nroot = \"UNTERMINATED_VALUE_SENTINEL\n",
         );
+        let syntax = match load_configuration(&syntax_path, init_command()) {
+            Ok(_) => panic!("无效 TOML 语法必须拒绝"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &syntax,
+            ConfigurationLoadError::InvalidToml {
+                failure: ConfigurationTomlFailureKind::Syntax,
+                ..
+            }
+        ));
+        assert!(!format!("{syntax:?}\n{syntax}").contains("UNTERMINATED_VALUE_SENTINEL"));
+
+        const INVALID_TYPE: &str = "INVALID_LANGUAGE_TYPE_VALUE_SENTINEL";
+        let source = include_str!("../../config.example.toml").replacen(
+            "type = \"japanese\"",
+            format!("type = \"{INVALID_TYPE}\"").as_str(),
+            1,
+        );
+        let value_path = directory.write("language-type.toml", &source);
+        let value = match load_configuration(&value_path, translate_command(false, "primary")) {
+            Ok(_) => panic!("未知语言类型必须拒绝"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &value,
+            ConfigurationLoadError::InvalidToml {
+                resource,
+                failure: ConfigurationTomlFailureKind::InvalidValue,
+                ..
+            } if resource == "languages.type"
+        ));
+        assert!(!format!("{value:?}\n{value}").contains(INVALID_TYPE));
     }
 
     #[test]

@@ -28,6 +28,7 @@ sha2 = "0.10.9"
 time = { version = "0.3.53", features = ["formatting", "macros"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "time", "sync", "net", "signal", "macros"] }
 toml = "1.1.3"
+toml_parser = "=1.1.2"
 unicode-segmentation = "1.12.0"
 unic-langid = "=0.9.6"
 unicode-width = "0.2.1"

@@ -171,25 +171,245 @@ diagnostic-recovery-value = { $kind ->
 }
 diagnostic-related = 関連エラー { $index }：
 diagnostic-stage-value = { $code ->
+    [process_startup] プロセス起動
     [process_output] プロセス出力
+    [configuration] 設定の読み込み
+    [command_preparation] コマンドの準備
+    [project_opening] プロジェクトを開く処理
+    [init] 初期化
+    [extract] 抽出
+    [translate] 翻訳
+    [write_back] 書き戻し
     [lua] プロジェクト Lua 実行
-   *[other] { $fallback }
+    [model_request] モデルへのリクエスト
+    [run_plan_finalization] 実行プランの確定
+    [publication] 公開
+    [shutdown] 終了処理
+    [logging] プロジェクトログ
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-impact-value = { $code ->
-   *[other] { $fallback }
+    [unchanged] 状態は変更されていません
+    [valid_progress_preserved] 有効な進捗は保存されました
+    [result_applied_but_run_plan_not_saved] 結果は適用されましたが、実行プランは保存されませんでした
+    [state_applied_but_finalization_failed] 状態は適用されましたが、確定処理は完了しませんでした
+    [recovery_required] 状態を信頼する前に復旧が必要です
+    [outcome_unknown] 最終状態は不明です
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-action-value = { $code ->
-   *[other] { $fallback }
+    [fix_configuration] 指定された設定項目を修正して再試行してください
+    [fix_input] 指定された入力を修正して再試行してください
+    [check_path_and_permissions] パス、ファイルシステムの状態、権限を確認してください
+    [check_project_state] プロジェクトの状態を確認・修正して再試行してください
+    [retry_after_resolving_contention] 競合する操作の完了を待ってから再試行してください
+    [check_model_service] モデルサービスの応答とアカウント制限を確認してください
+    [preserve_recovery_artifacts] 記載された復旧用ファイルを削除せず、出力を復旧してから再試行してください
+    [retry] 操作を再試行してください
+    [report_bug] エラーコードとログパスを添えて ATT の不具合を報告してください
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
-   *[other] { $fallback }
+    [missing_required_value] 必須値がありません
+    [extract_plan_required] 再利用可能な Extract プランが保存されていません。--builtin、--rules、--lua のいずれかを指定してください
+    [conflicting_values] 指定された値が競合しています
+    [invalid_syntax] 値の構文が無効です
+    [invalid_encoding] テキストのエンコーディングが無効です
+    [invalid_value] 値が必要な契約に違反しています
+    [not_found] 必要な対象が存在しません
+    [busy] リソースは別の操作によって使用中です
+    [state_mismatch] 保存されたプロジェクト状態がこの操作の要件を満たしていません
+    [requirement_failed] 必要な前提条件が満たされていません
+    [transaction_rolled_back] トランザクションが失敗し、変更はロールバックされました
+    [transaction_outcome_unknown] トランザクションのコミットまたはロールバックを確認できませんでした
+    [finalization_failed] 操作結果は存在しますが、確定処理に失敗しました
+    [rollback_failed] 主操作に失敗し、ロールバックにも失敗しました
+    [external_service_rejected] 外部サービスがリクエストを拒否しました
+    [external_service_unavailable] 外部サービスを利用できません
+    [executor_closed] 実行サービスは終了中、またはすでに終了しています
+    [concurrent_shutdown] 別の呼び出し元が実行器を終了しています
+    [executor_state_poisoned] 実行器のライフサイクル状態が破損しています
+    [worker_spawn_failed] オペレーティングシステムがワーカースレッドを作成できませんでした
+    [worker_channel_closed] 確定処理の完了前にワーカーのコマンドチャネルが閉じました
+    [worker_panicked] ワーカーが予期せず終了しました
+    [reparse_point_forbidden] パスに信頼できない再解析ポイントが含まれています
+    [non_local_volume] パスがローカル固定ボリューム上にありません
+    [non_ntfs_volume] パスが NTFS ボリューム上にありません
+    [case_sensitive_directory] ディレクトリで大文字と小文字を区別する名前規則が有効です
+    [lock_cancelled] 必要なロックの待機がキャンセルされました
+    [target_already_exists] 出力先がすでに存在します
+    [file_identity_changed] 操作中にファイルの識別情報が変化しました
+    [invalid_path] パスはこの操作の有効な対象ではありません
+    [wrong_publisher_instance] 公開トークンは別の公開器インスタンスに属しています
+    [journal_corrupt] 公開復旧ジャーナルが無効または不完全です
+    [unexpected_artifact] 予期しないファイルシステム成果物が操作を妨げています
+    [interactive_session_already_open] 別の対話型 SQLite セッションがすでに実行中です
+    [backup_incomplete] SQLite バックアップが完了状態に達しませんでした
+    [request_serialization_failed] モデルリクエストをシリアル化できませんでした
+    [response_parsing_failed] モデル応答が有効な JSON ではありません
+    [invalid_response_contract] モデル応答が必要な応答契約を満たしていません
+    [transport_failed] 有効な応答を受け取る前に HTTP 転送が失敗しました
+    [lua_database_open_failed] Lua ホストがプロジェクトデータベースのセッションを開けませんでした
+    [lua_context_creation_failed] Lua ランタイムが VM コンテキストを作成できませんでした
+    [lua_compilation_failed] Lua メインプログラムをコンパイルできませんでした
+    [lua_execution_failed] Lua メインプログラムの実行中に失敗しました
+    [lua_host_call_failed] Lua ホスト機能の呼び出しに失敗しました
+    [lua_finalization_failed] Lua ホストがすべてのバインド済みリソースを確定できませんでした
+    [lua_unclosed_transaction] Lua プログラム終了時にトランザクションが開いたままだったため、ロールバックされました
+    [lua_snapshot_store_failed] 検証済み Lua 抽出スナップショットをコミットできませんでした
+    [rules_definition_invalid] Rules プログラムが Rules 定義契約を満たしていません
+    [rules_document_read_failed] Rules プログラムに必要なソース文書を読み取れませんでした
+    [rules_no_non_blank_match] Rules エントリから空白以外の意味単位が生成されませんでした
+    [rules_invalid_target] Rules エントリがテキスト対象として使用できない値を選択しました
+    [rules_pattern_match_failed] Rules の PCRE2 パターンを評価できませんでした
+    [rules_zero_width_match] Rules パターンがゼロ幅一致を生成しました
+    [rules_overlapping_capture] Rules パターンが重複するテキストキャプチャを生成しました
+    [rules_missing_text_capture] 必須の名前付きテキストキャプチャが一致に参加しませんでした
+    [rules_invalid_capture_range] Rules の一致またはキャプチャ範囲が有効な UTF-8 文字境界外です
+    [rules_duplicate_target] 2 つの Rules エントリが同じ物理テキスト対象を要求しています
+    [rules_invalid_materialization] Rules の投影レシピでソース値を再構築できません
+    [rules_snapshot_invalid] 抽出された Rules グループが有効なアセットスナップショットを形成しません
+    [rules_snapshot_store_failed] 検証済み Rules 抽出スナップショットをコミットできませんでした
+    [write_back_extraction_out_of_date] 抽出済みアセットが現在のプロジェクトソースと一致しません
+    [write_back_asset_snapshot_invalid] 保存された Standard アセットが有効な書き戻しスナップショットを形成しません
+    [source_document_invalid] RPG Maker のソース文書が必要な文書形式を満たしていません
+    [write_back_mutation_invalid] 検証済み翻訳変更を固定されたソース位置に適用できません
+    [write_back_output_path_invalid] 書き換えたファイルが許可された RPG Maker 出力ツリー外にあります
+    [write_back_output_path_duplicate] 複数の書き換えファイルが同じ出力パスを対象にしています
+    [write_back_candidate_project_mismatch] 準備済み書き戻し候補は別のプロジェクトに属しています
+    [write_back_candidate_invalid] 書き戻し候補が必要な data/js ツリー構造を満たしていません
+    [write_back_unexpected_lua_outcome] Lua 書き戻しプログラムが別の Lua フェーズの結果を返しました
+    [write_back_not_published] 書き戻し候補が現在の出力ディレクトリを置き換えませんでした
+    [write_back_published_with_residuals] 出力は公開されましたが、一部の復旧成果物を削除できませんでした
+    [write_back_recovery_required] 内容を信頼する前に出力ディレクトリの復旧が必要です
+    [internal_invariant] 内部不変条件に違反しました。ATT の不具合です
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-io-kind-value = { $code ->
-   *[other] { $fallback }
+    [not_found] 見つかりません
+    [permission_denied] 権限がありません
+    [connection_refused] 接続が拒否されました
+    [connection_reset] 接続がリセットされました
+    [host_unreachable] ホストに到達できません
+    [network_unreachable] ネットワークに到達できません
+    [connection_aborted] 接続が中止されました
+    [not_connected] 接続されていません
+    [address_in_use] アドレスは使用中です
+    [address_not_available] アドレスを使用できません
+    [network_down] ネットワークが停止しています
+    [broken_pipe] パイプが切断されています
+    [already_exists] すでに存在します
+    [would_block] 操作はブロックされます
+    [not_a_directory] ディレクトリではありません
+    [is_a_directory] ディレクトリです
+    [directory_not_empty] ディレクトリが空ではありません
+    [read_only_filesystem] 読み取り専用ファイルシステムです
+    [stale_network_file_handle] ネットワークファイルハンドルが失効しています
+    [invalid_input] 操作入力が無効です
+    [invalid_data] データが無効です
+    [timed_out] 操作がタイムアウトしました
+    [write_zero] 書き込みが進行しませんでした
+    [storage_full] ストレージがいっぱいです
+    [not_seekable] 対象をシークできません
+    [quota_exceeded] ストレージ割り当てを超過しました
+    [file_too_large] ファイルが基盤システムで扱えるサイズを超えています
+    [resource_busy] リソースは使用中です
+    [executable_file_busy] 実行可能ファイルは使用中です
+    [deadlock] 操作がデッドロックを引き起こします
+    [crosses_devices] 操作がファイルシステムデバイスをまたいでいます
+    [too_many_links] ファイルシステムリンクが多すぎます
+    [invalid_filename] ファイル名が無効です
+    [argument_list_too_long] OS の引数リストが長すぎます
+    [interrupted] 操作が中断されました
+    [unsupported] 操作はサポートされていません
+    [unexpected_eof] 予期しないファイル終端です
+    [out_of_memory] OS がメモリを割り当てられませんでした
+    [other] その他の OS エラー
+   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-   *[other] { $fallback }{ $facts }
+    [runtime_configuration_invalid] ランタイム設定が無効です
+    [unsupported_prompt_locale] 小文字の auto またはサポートされている BCP 47 UI ロケールでなければなりません
+    [language_policy_term_blank] 言語ポリシー用語を空白にできません
+    [language_policy_term_surrounding_whitespace] 言語ポリシー用語の前後に空白を含められません
+    [language_policy_term_duplicate] 言語ポリシー用語を重複させられません
+    [quote_repair_candidates_empty] 引用符修復候補リストを空にできません
+    [quote_repair_delimiter_invalid] 引用符修復の区切り文字に英数字、空白、制御文字は使用できません
+    [quote_repair_pair_duplicate] 引用符修復ペアを重複させられません
+    [quote_repair_delimiter_ambiguous] 引用符修復の区切り文字は 1 つのペアだけに属する必要があります
+    [language_id_blank] 言語 ID を空白にできません
+    [language_id_surrounding_whitespace] 言語 ID の前後に空白を含められません
+    [language_id_uses_underscore] 言語 ID のサブタグ間にはハイフンを使用してください
+    [language_id_invalid_syntax] 言語 ID は RFC 5646 構文を満たす必要があります
+    [language_id_invalid_registry_tag] 言語 ID に無効な登録済みサブタグが含まれています
+    [language_id_canonicalization_failed] 言語 ID を正規化できません
+    [language_id_undefined_primary_language] 言語 ID に第一言語が必要です
+    [language_id_duplicate] 言語 ID は一意でなければなりません
+    [language_catalog_empty] ソース言語モジュールが 1 つ以上必要です
+    [url_invalid] 値は有効な URL でなければなりません
+    [url_credentials_forbidden] URL に認証情報を含められません
+    [url_fragment_forbidden] URL にフラグメントを含められません
+    [url_scheme_unsupported] URL スキームは http または https でなければなりません
+    [api_key_blank] API key を空白にできません
+    [api_key_surrounding_whitespace] API key の前後に空白を含められません
+    [api_key_invalid_header] API key を HTTP Header 値として表現できません
+    [strict_json_invalid] 値は厳密な JSON でなければなりません（行={ $line }、列={ $column }）
+    [json_object_required] 値は JSON オブジェクトでなければなりません
+    [reserved_request_field] このフィールドはリクエストプロトコルが所有しているため上書きできません
+    [proxy_must_be_false_or_url] proxy は false または完全な http/https URL でなければなりません
+    [pem_path_duplicate] PEM パスは一意でなければなりません
+    [runtime_maximum_exceeded] 値がランタイム上限を超えています（実際={ $actual }、上限={ $maximum }）
+    [value_surrounding_whitespace] 値の前後に空白を含められません
+    [value_blank] 値を空白にできません
+    [path_blank] パスを空にできません
+    [positive_required] 値は 0 より大きい必要があります（実際={ $actual }）
+    [usize_range_exceeded] 値がこのプラットフォームの usize 範囲を超えています（実際={ $actual }）
+    [u32_range_exceeded] 値が u32 範囲を超えています（実際={ $actual }）
+    [duplicate_profile_id] 翻訳プロファイル ID は一意でなければなりません
+    [selected_profile_invalid] 選択した翻訳プロファイルの構造またはフィールド型が無効です
+    [referenced_client_not_found] 参照された LLM クライアントが存在しません
+   *[other] __ATT_FALLBACK__
 }
+diagnostic-io-reason = 操作 { $operation }：{ $kind }
+diagnostic-io-reason-with-os-code = 操作 { $operation }：{ $kind }（OS { $os_code }）
+diagnostic-io-reason-with-system-message = 操作 { $operation }：{ $kind }：{ $system_message }
+diagnostic-io-reason-with-os-code-and-system-message = 操作 { $operation }：{ $kind }（OS { $os_code }）：{ $system_message }
+diagnostic-failure-with-detail = { $failure }：{ $detail }
+diagnostic-invalid-utf8 = バイト { $valid_up_to } の UTF-8 が無効です。無効な長さは { $error_len } バイトです
+diagnostic-incomplete-utf8 = バイト { $valid_up_to } の後に未完了の UTF-8 シーケンスがあります
+diagnostic-toml-failure-value = { $code ->
+    [syntax] TOML 構文が無効です
+    [missing_field] 必須の設定フィールドがありません
+    [unknown_field] 設定に不明なフィールドがあります
+    [duplicate_field] 設定フィールドが複数回宣言されています
+    [type_mismatch] { $expected }が必要です
+    [invalid_value] 設定値がフィールド契約に違反しています
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-toml-expected-kind-value = { $code ->
+    [string] 文字列
+    [integer] 整数
+    [boolean] 真偽値
+    [string_or_boolean] 文字列または真偽値
+    [string_array] 文字列の配列
+    [integer_array] 整数の配列
+    [string_pair_array] 文字列ペアの配列
+    [table] テーブル
+    [table_array] テーブルの配列
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-invalid-toml = TOML が無効です（{ $resource }）：{ $failure }
+diagnostic-invalid-toml-at = { $line } 行 { $column } 列の TOML が無効です（{ $resource }）：{ $failure }
+diagnostic-http-no-details = モデルサービスへのリクエストは失敗しましたが、公開可能な HTTP 状態の詳細はありません
+diagnostic-http-status = HTTP ステータス { $status }
+diagnostic-http-retry-after = Retry-After { $seconds } 秒
+diagnostic-http-provider-code = プロバイダーエラーコード { $code }
+diagnostic-http-provider-type = プロバイダーエラー種別 { $kind }
+diagnostic-http-fact-separator = ；
+diagnostic-sqlite = SQLite 主エラーコード { $primary_code }、拡張エラーコード { $extended_code }
+diagnostic-windows-status = Windows 操作 { $operation } が失敗しました。NTSTATUS { $status }
+diagnostic-resource = { $resource }：実際値 { $actual }
+diagnostic-resource-with-maximum = { $resource }：実際値 { $actual }、上限 { $maximum }
 task-record-title = 翻訳タスク { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] 完了
