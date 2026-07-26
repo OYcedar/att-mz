@@ -43,6 +43,26 @@ impl TextUnitRole {
             Self::DialogueBody | Self::Choices | Self::ScrollingText
         )
     }
+
+    /// 角色与文本组语义的唯一匹配规则。
+    ///
+    /// 事件专属组只接受对应专属角色,其余组只接受 Scalar。该不变量由提取协议
+    /// 建立;Translate 与 WriteBack 的资产读取边界都消费这同一份定义,不得各自
+    /// 另写宽严不同的版本。
+    pub(crate) fn matches_kind(&self, kind: TextGroupKind) -> bool {
+        match kind {
+            TextGroupKind::EventDialogue => {
+                matches!(self, Self::DialogueSpeaker | Self::DialogueBody)
+            }
+            TextGroupKind::EventChoices => matches!(self, Self::Choices),
+            TextGroupKind::EventScrollingText => matches!(self, Self::ScrollingText),
+            TextGroupKind::DatabaseEntry
+            | TextGroupKind::System
+            | TextGroupKind::Map
+            | TextGroupKind::EventCommand
+            | TextGroupKind::PluginParameter => matches!(self, Self::Scalar(_)),
+        }
+    }
 }
 
 /// 一个语义单元的完整文本内容。

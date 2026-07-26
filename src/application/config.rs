@@ -1742,6 +1742,130 @@ impl ConfigurationLoadError {
             other => other,
         }
     }
+
+    /// 配置加载失败的唯一安全结构化投影。
+    ///
+    /// 进程启动路径与命令内延迟配置解析路径都消费这一份映射,同一失败在
+    /// 不同触发时机呈现完全相同的 code、reason 与恢复事实。
+    pub(crate) fn safe_diagnostic(&self) -> crate::diagnostic::SafeDiagnostic {
+        use crate::diagnostic::{
+            DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact,
+            DiagnosticReason, DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic,
+        };
+
+        fn as_u64(value: usize) -> u64 {
+            u64::try_from(value).unwrap_or(u64::MAX)
+        }
+
+        match self {
+            Self::Open { path, source } => SafeDiagnostic::io(
+                DiagnosticCode::ConfigurationOpen,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::path(path),
+                "open_configuration",
+                source,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            ),
+            Self::NotAFile { path } => SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationNotFile,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::InvalidPath),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixConfiguration,
+            ),
+            Self::Read { path, source } => SafeDiagnostic::io(
+                DiagnosticCode::ConfigurationRead,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::path(path),
+                "read_configuration",
+                source,
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::CheckPathAndPermissions,
+            ),
+            Self::InvalidUtf8 {
+                path,
+                valid_up_to,
+                error_len,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationInvalidUtf8,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::InvalidUtf8 {
+                    valid_up_to: as_u64(*valid_up_to),
+                    error_len: error_len.map(as_u64),
+                },
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixConfiguration,
+            ),
+            Self::InvalidToml {
+                path,
+                location,
+                resource,
+                reason,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationInvalidToml,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::InvalidToml {
+                    line: location.map(|value| as_u64(value.line())),
+                    column: location.map(|value| as_u64(value.column())),
+                    resource: crate::user_text::sanitize_user_text(resource),
+                    classification: crate::user_text::sanitize_user_text(reason),
+                },
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixConfiguration,
+            ),
+            Self::InvalidValue(source) => SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationInvalidValue,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::field(source.field()),
+                DiagnosticReason::InvalidConfigurationValue {
+                    rule: source.reason().clone(),
+                },
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixConfiguration,
+            ),
+            Self::InvalidValueAtPath { path, source } => SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationInvalidValue,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::field(source.field()),
+                DiagnosticReason::InvalidConfigurationValue {
+                    rule: source.reason().clone(),
+                },
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixConfiguration,
+            )
+            .with_recovery(RecoveryFact::path(path)),
+            Self::TranslationProfileNotFound { path, profile_id } => SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationProfileNotFound,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::profile(profile_id),
+                DiagnosticReason::failure(DiagnosticFailureKind::NotFound),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixConfiguration,
+            )
+            .with_recovery(RecoveryFact::path(path)),
+            Self::ProfileSelectionConflict {
+                path,
+                explicit_profile,
+                requested_profile,
+            } => SafeDiagnostic::new(
+                DiagnosticCode::ConfigurationProfileConflict,
+                DiagnosticStage::Configuration,
+                DiagnosticSubject::path(path),
+                DiagnosticReason::failure(DiagnosticFailureKind::ConflictingValues),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixConfiguration,
+            )
+            .with_recovery(RecoveryFact::component(format!(
+                "explicit_profile={}; requested_profile={}",
+                crate::user_text::sanitize_user_text(explicit_profile),
+                crate::user_text::sanitize_user_text(requested_profile)
+            ))),
+        }
+    }
 }
 
 impl fmt::Display for ConfigurationLoadError {
