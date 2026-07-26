@@ -296,6 +296,8 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 
 第一次 Ctrl-C 后停止派生新阶段；SQLite、发布、CPU 和 HTTP 已接管的工作继续到明确终态。
 候选尚未发布时 discard；publish 已开始时等待终态。业务最终取消时不保存运行方案；
+Extract 或 WriteBack 正在执行 Lua 时同时请求该阶段 Lua Runtime 合作取消，Host 先回滚未闭合
+的交互事务，WriteBack 再 discard 尚未发布的完整候选。
 若信号到达后业务仍自然完整完成，则归入成功路径，必要收尾后照常保存方案并完整呈现
 结果。普通项目日志故障不会改变取消与收尾次序。Translate 停止启动新的 Standard 任务；
 每个已发出 `TaskStarted` 的任务仍返回顺序最终化边界，并在文件系统 shutdown 前形成
@@ -335,7 +337,8 @@ panic 才由进程启动边界直接写 stderr。完整 Clap 解析已经确认 
 恢复位置。OS 系统消息、SQLite primary/extended code、HTTP 状态与允许公开的供应商
 code/type 在清理控制字符后按实际存在的字段明示；缺失字段不打印占位文字。不得用责任域
 类别替代具体原因。输出不读取任意 `Debug`
-或内部来源链，也不泄露 API key 实际值。CLI 与普通 JSONL 不复制配置原文、Header、
-完整 Client parameters、Prompt、完整模型消息、模型正文、原文或译文，是为了维持职责、
-稳定 schema、可读体积和控制字符边界，不表示这些内容属于敏感信息。任务记录可以呈现
-上述任务正文，并对其中出现的 API key 实际值作精确替换。
+或内部来源链，并采用
+[Chat Completions 运行根规格规定的敏感信息边界](chat-completions.md#6-敏感信息闭集唯一权威)。
+CLI 与普通 JSONL 不复制配置原文、Header、完整 Client parameters 或完整模型任务正文，
+是为了维持职责、稳定 schema、可读体积和控制字符边界，不构成敏感性分类。任务记录的
+可读正文和精确替换同样以该权威契约为准。

@@ -64,8 +64,9 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 关闭模式下损坏的 `thinking.md`，不影响本轮运行。
 
 资源错误在首次 LLM 请求前失败。用户诊断报告规范 locale、组件名、路径和统一检查方向，
-不复制资源正文；这是配置诊断的职责与可读体积边界，不表示 Prompt 或其他资源内容属于
-敏感信息。
+不复制资源正文；这是配置诊断的职责与可读体积边界，不构成敏感性分类。敏感信息边界由
+[Chat Completions 运行根规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)
+唯一规定。
 
 ## 3. `system.md` 模板与装配
 
@@ -347,6 +348,8 @@ ATT token 的来源与恢复规则见[规则编写指南](rules.md#6-placeholder
 [术语表制作指南](terminology.md)，HTTP 外层响应与 assistant content 的关系见
 [Chat Completions 运行根](../runtime/chat-completions.md)。普通项目日志、终端和通用
 诊断保持运行级结构化摘要，不复制完整 Prompt、messages、思考正文、原文、译文或模型
-正文；这是各自职责、稳定 schema 和体积边界，不是敏感性定义。开启高级记录后，这些
-Standard 任务正文按可读 Markdown 写入，并精确替换其中出现的 API key 实际值，见
+正文；这是各自职责、稳定 schema 和体积边界，不构成敏感性分类。敏感信息边界与替换
+契约由
+[Chat Completions 运行根规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)
+唯一规定；高级记录的呈现方式见
 [Standard 翻译任务记录现行规格](task-records.md)。
