@@ -2239,27 +2239,33 @@ impl ConfigurationTomlIndex {
             }
         }
 
+        let indexed = ConfigurationTomlIndexParser::new(source_view, &events).parse();
         if let Some(offset) = earliest_parse_error_offset(&errors) {
+            let resource = match &indexed {
+                Ok(index) => index.resource_at(offset),
+                Err(failure) if failure.failure == ConfigurationTomlFailureKind::Syntax => {
+                    failure.resource.clone()
+                }
+                Err(_) => "TOML 文档".to_owned(),
+            };
             return Err(configuration_toml_failure(
                 path,
                 source,
                 Some(offset..offset),
-                "TOML 文档".to_owned(),
+                resource,
                 ConfigurationTomlFailureKind::Syntax,
             ));
         }
 
-        ConfigurationTomlIndexParser::new(source_view, &events)
-            .parse()
-            .map_err(|failure| {
-                configuration_toml_failure(
-                    path,
-                    source,
-                    Some(failure.span),
-                    failure.resource,
-                    failure.failure,
-                )
-            })
+        indexed.map_err(|failure| {
+            configuration_toml_failure(
+                path,
+                source,
+                Some(failure.span),
+                failure.resource,
+                failure.failure,
+            )
+        })
     }
 
     fn validate_complete_field_set(
@@ -2869,6 +2875,7 @@ struct ConfigurationTomlIndexParser<'a> {
     cursor: usize,
     current_table: Vec<String>,
     current_occurrence: Option<usize>,
+    current_assignment: Option<Vec<String>>,
     table_occurrences: HashMap<Vec<String>, usize>,
     declared_tables: BTreeSet<Vec<String>>,
     assigned_fields: BTreeSet<(Vec<String>, Option<usize>)>,
@@ -2884,6 +2891,7 @@ impl<'a> ConfigurationTomlIndexParser<'a> {
             cursor: 0,
             current_table: Vec::new(),
             current_occurrence: None,
+            current_assignment: None,
             table_occurrences: HashMap::new(),
             declared_tables: BTreeSet::new(),
             assigned_fields: BTreeSet::new(),
@@ -2893,7 +2901,7 @@ impl<'a> ConfigurationTomlIndexParser<'a> {
     }
 
     fn parse(mut self) -> Result<ConfigurationTomlIndex, IndexedBuildFailure> {
-        while self.skip_trivia() {
+        while self.skip_document_trivia() {
             match self.peek_kind() {
                 Some(EventKind::StdTableOpen | EventKind::ArrayTableOpen) => {
                     self.parse_table_header()?;
@@ -2976,9 +2984,10 @@ impl<'a> ConfigurationTomlIndexParser<'a> {
             return Err(self.syntax_failure(key_span));
         }
         let _separator = self.next().expect("键路径解析必须停在等号事件");
-        let shape = self.parse_value()?;
         let mut path = self.current_table.clone();
         path.extend(local_path);
+        self.current_assignment = Some(path.clone());
+        let shape = self.parse_value()?;
         let identity = (path.clone(), self.current_occurrence);
         let conflicts_with_value =
             self.assigned_fields
@@ -3191,6 +3200,19 @@ impl<'a> ConfigurationTomlIndexParser<'a> {
         self.cursor < self.events.len()
     }
 
+    fn skip_document_trivia(&mut self) -> bool {
+        while matches!(
+            self.peek_kind(),
+            Some(EventKind::Whitespace | EventKind::Comment | EventKind::Newline)
+        ) {
+            if self.peek_kind() == Some(EventKind::Newline) {
+                self.current_assignment = None;
+            }
+            self.cursor += 1;
+        }
+        self.cursor < self.events.len()
+    }
+
     fn peek_kind(&self) -> Option<EventKind> {
         self.events.get(self.cursor).map(Event::kind)
     }
@@ -3214,11 +3236,16 @@ impl<'a> ConfigurationTomlIndexParser<'a> {
     fn syntax_failure(&self, span: Range<usize>) -> IndexedBuildFailure {
         IndexedBuildFailure {
             span,
-            resource: if self.current_table.is_empty() {
-                "TOML 文档".to_owned()
-            } else {
-                self.current_table.join(".")
-            },
+            resource: self.current_assignment.as_ref().map_or_else(
+                || {
+                    if self.current_table.is_empty() {
+                        "TOML 文档".to_owned()
+                    } else {
+                        self.current_table.join(".")
+                    }
+                },
+                |path| path.join("."),
+            ),
             failure: ConfigurationTomlFailureKind::Syntax,
         }
     }
@@ -5135,6 +5162,36 @@ id = "unused"
             } if resource == "languages.type"
         ));
         assert!(!format!("{value:?}\n{value}").contains(INVALID_TYPE));
+    }
+
+    #[test]
+    fn syntax_failure_after_value_uses_safe_current_field_path() {
+        const API_KEY: &str = "MALFORMED_API_KEY_UNIT_SENTINEL";
+        let directory = TestDirectory::new();
+        let source = format!(
+            r#"[llm.clients.invalid-api-key]
+url = "https://example.invalid/v1/chat/completions"
+api_key = "{API_KEY}" "invalid"
+"#
+        );
+        let path = directory.write("malformed-api-key.toml", &source);
+
+        let error = match load_configuration(&path, init_command()) {
+            Ok(_) => panic!("值后出现同一行尾随内容时必须拒绝"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            ConfigurationLoadError::InvalidToml {
+                resource,
+                failure: ConfigurationTomlFailureKind::Syntax,
+                ..
+            } if resource == "llm.clients.invalid-api-key.api_key"
+        ));
+        assert!(
+            !format!("{error:?}\n{error}").contains(API_KEY),
+            "语法诊断不得保存或回显值正文"
+        );
     }
 
     #[test]
