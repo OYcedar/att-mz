@@ -684,16 +684,7 @@ fn builtin_role_name(role: &TextUnitRole) -> &'static str {
 }
 
 fn builtin_group_kind_name(kind: TextGroupKind) -> &'static str {
-    match kind {
-        TextGroupKind::DatabaseEntry => "database_entry",
-        TextGroupKind::System => "system",
-        TextGroupKind::Map => "map",
-        TextGroupKind::EventDialogue => "event_dialogue",
-        TextGroupKind::EventChoices => "event_choices",
-        TextGroupKind::EventScrollingText => "event_scrolling_text",
-        TextGroupKind::EventCommand => "event_command",
-        TextGroupKind::PluginParameter => "plugin_parameter",
-    }
+    kind.storage_name()
 }
 
 fn mutation_resource_kind(resource: &crate::rpg_maker::model::MutationResource) -> &'static str {

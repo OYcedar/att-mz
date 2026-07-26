@@ -37,6 +37,7 @@ use crate::diagnostic::{
     SafeDiagnostic, SafeDiagnosticSource, SafeIoKind,
 };
 use crate::fingerprint::Sha256Fingerprint;
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::storage::file_system::{
     BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
@@ -4425,14 +4426,9 @@ struct JournalRecord {
 }
 
 fn journal_json_error_reason(prefix: &str, source: &serde_json::Error) -> String {
-    let category = match source.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    };
+    let category = JsonErrorCategory::from(source);
     format!(
-        "{prefix}（category={category}, line={}, column={}）",
+        "{prefix}（json_category={category}, line={}, column={}）",
         source.line(),
         source.column()
     )

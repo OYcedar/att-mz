@@ -11,10 +11,10 @@ use crate::diagnostic::{
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
-use crate::rpg_maker::location_codec::{
-    RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
-    RpgMakerProjectionCodecError,
-};
+use crate::json_diagnostic::JsonErrorCategory;
+#[cfg(test)]
+use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
+use crate::rpg_maker::location_codec::{RpgMakerLocationCodecError, RpgMakerProjectionCodecError};
 use crate::rpg_maker::model::{
     TextUnitContent, TextUnitContentStructureError, TextUnitContentView, TextUnitRole,
     validate_text_unit_content_structure,
@@ -25,6 +25,16 @@ use crate::rpg_maker::project_database::{
     TERMINOLOGY_RESOURCE_KIND,
 };
 use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
+use crate::rpg_maker::standard_asset_storage::{
+    OwnerPartitionedSqliteRow as OwnerSqliteRow,
+    STANDARD_ASSET_OWNER_ORDER as TRANSLATION_OWNER_ORDER, STANDARD_ASSET_OWNER_STATE_PROJECTION,
+    STANDARD_TEXT_GROUP_CORE_PROJECTION, STANDARD_TEXT_UNIT_CONTENT_PROJECTION,
+    STANDARD_TEXT_UNIT_LOCATION_PROJECTION, StandardAssetOwnerStateStorageRow,
+    StandardAssetStorageRowDecoder, StandardAssetStorageRowError, StandardTextGroupStorageRow,
+    StandardTextUnitIdentityStorageRow, StandardTextUnitLocationStorageRow,
+    StandardTextUnitStorageRow, merge_owner_partitions, sort_owner_state_rows,
+    standard_asset_owner_order as owner_order,
+};
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 use crate::storage::sqlite::{
     QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteValue,
@@ -37,64 +47,59 @@ use super::standard::{
 
 const READ_TRANSLATION_METADATA: &str = "SELECT source_snapshot_fingerprint FROM metadata";
 
-const READ_TRANSLATION_OWNERS: &str = r#"SELECT
-    owner,
-    source_snapshot_fingerprint,
-    asset_snapshot_fingerprint
-FROM standard_asset_owner_state
-ORDER BY owner COLLATE BINARY"#;
-
 const READ_TRANSLATION_RESOURCES: &str = r#"SELECT resource_kind, canonical_json
 FROM standard_translation_resource
 ORDER BY resource_kind"#;
 
-const READ_TRANSLATION_OWNER_GROUPS: &str = r#"SELECT
-    group_location,
-    group_kind,
-    group_order
-FROM standard_text_group
-WHERE owner = ?
-ORDER BY group_order"#;
-
-const READ_TRANSLATION_OWNER_UNITS: &str = r#"SELECT
-    unit.group_location,
-    text_group.group_kind,
-    text_group.group_order,
-    unit.unit_role,
-    unit.unit_order,
-    unit.source_content_json,
-    unit.source_context_json,
-    unit.translation_content_json,
-    unit.translation_state
-FROM standard_text_group AS text_group
-CROSS JOIN standard_text_unit AS unit
-  ON unit.owner = text_group.owner
- AND text_group.group_location = unit.group_location
-WHERE text_group.owner = ?
-ORDER BY text_group.group_order,
-         unit.unit_order"#;
-
-const TRANSLATION_OWNER_ORDER: [RpgMakerStandardAssetOwner; 3] = [
-    RpgMakerStandardAssetOwner::Builtin,
-    RpgMakerStandardAssetOwner::Rules,
-    RpgMakerStandardAssetOwner::Lua,
-];
 const TRANSLATION_SNAPSHOT_QUERY_RESULT_COUNT: usize = 3 + TRANSLATION_OWNER_ORDER.len() * 2;
+
+fn read_translation_owners() -> String {
+    format!(
+        "SELECT\n    {STANDARD_ASSET_OWNER_STATE_PROJECTION}\n\
+         FROM standard_asset_owner_state"
+    )
+}
+
+fn read_translation_owner_groups() -> String {
+    format!(
+        "SELECT\n    {STANDARD_TEXT_GROUP_CORE_PROJECTION}\n\
+         FROM standard_text_group\n\
+         WHERE owner = ?\n\
+         ORDER BY group_order"
+    )
+}
+
+fn read_translation_owner_units() -> String {
+    format!(
+        "SELECT\n    {STANDARD_TEXT_UNIT_LOCATION_PROJECTION},\n    \
+         text_group.group_kind,\n    \
+         text_group.group_order,\n    \
+         {STANDARD_TEXT_UNIT_CONTENT_PROJECTION},\n    \
+         unit.translation_state\n\
+         FROM standard_text_group AS text_group\n\
+         CROSS JOIN standard_text_unit AS unit\n  \
+           ON unit.owner = text_group.owner\n \
+          AND text_group.group_location = unit.group_location\n\
+         WHERE text_group.owner = ?\n\
+         ORDER BY text_group.group_order,\n         \
+          unit.unit_order"
+    )
+}
 
 fn translation_snapshot_queries() -> Vec<SqliteQuery> {
     let mut queries = Vec::with_capacity(TRANSLATION_SNAPSHOT_QUERY_RESULT_COUNT);
     queries.extend([
         SqliteQuery::new(READ_TRANSLATION_METADATA, Vec::new()).with_id("translation.metadata"),
-        SqliteQuery::new(READ_TRANSLATION_OWNERS, Vec::new()).with_id("translation.owners"),
+        SqliteQuery::new(read_translation_owners(), Vec::new()).with_id("translation.owners"),
         SqliteQuery::new(READ_TRANSLATION_RESOURCES, Vec::new()).with_id("translation.resources"),
     ]);
     for (kind, statement) in [
-        ("groups", READ_TRANSLATION_OWNER_GROUPS),
-        ("units", READ_TRANSLATION_OWNER_UNITS),
+        ("groups", read_translation_owner_groups()),
+        ("units", read_translation_owner_units()),
     ] {
         queries.extend(TRANSLATION_OWNER_ORDER.map(|owner| {
             SqliteQuery::new(
-                statement,
+                statement.clone(),
                 vec![SqliteValue::Text(owner.storage_name().to_owned())],
             )
             .with_id(format!("translation.{}.{kind}", owner.storage_name()))
@@ -362,8 +367,8 @@ where
                     DiagnosticFailureKind::StateMismatch,
                     format!(
                         "expected_source_fingerprint={}; actual_source_fingerprint={}",
-                        fingerprint_hex(expected.as_bytes()),
-                        fingerprint_hex(actual.as_bytes())
+                        expected.hex(),
+                        actual.hex()
                     ),
                 ),
                 impact,
@@ -441,16 +446,6 @@ fn diagnostic_at_database_path(
 ) -> SafeDiagnostic {
     diagnostic.subject = DiagnosticSubject::path(database_path);
     diagnostic.with_recovery(RecoveryFact::component(operation))
-}
-
-fn fingerprint_hex(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-
-    let mut value = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut value, "{byte:02x}").expect("写入 String 不会失败");
-    }
-    value
 }
 
 #[derive(Debug)]
@@ -879,14 +874,9 @@ impl InvalidStandardTranslationAssetSnapshot {
 }
 
 fn json_error_detail(source: &serde_json::Error) -> String {
-    let category = match source.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    };
+    let category = JsonErrorCategory::from(source);
     format!(
-        "category={category}; line={}; column={}",
+        "json_category={category}; line={}; column={}",
         source.line(),
         source.column()
     )
@@ -911,16 +901,7 @@ const fn unit_role_kind(role: &TextUnitRole) -> &'static str {
 }
 
 const fn text_group_kind(kind: TextGroupKind) -> &'static str {
-    match kind {
-        TextGroupKind::DatabaseEntry => "database_entry",
-        TextGroupKind::System => "system",
-        TextGroupKind::Map => "map",
-        TextGroupKind::EventDialogue => "event_dialogue",
-        TextGroupKind::EventChoices => "event_choices",
-        TextGroupKind::EventScrollingText => "event_scrolling_text",
-        TextGroupKind::EventCommand => "event_command",
-        TextGroupKind::PluginParameter => "plugin_parameter",
-    }
+    kind.storage_name()
 }
 
 fn map_query_error<Q, C>(
@@ -938,24 +919,6 @@ fn map_query_error<Q, C>(
             }
         }
     }
-}
-
-struct OwnerSqliteRow {
-    owner: RpgMakerStandardAssetOwner,
-    row: SqliteRow,
-}
-
-fn merge_owner_partitions(partitions: [Vec<SqliteRow>; 3]) -> Vec<OwnerSqliteRow> {
-    let capacity = partitions.iter().map(Vec::len).sum();
-    let mut merged = Vec::with_capacity(capacity);
-    for (owner, partition) in TRANSLATION_OWNER_ORDER.into_iter().zip(partitions) {
-        merged.extend(
-            partition
-                .into_iter()
-                .map(|row| OwnerSqliteRow { owner, row }),
-        );
-    }
-    merged
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1096,21 +1059,12 @@ fn decode_metadata(
             InvalidStandardTranslationAssetSnapshot::InvalidMetadataRowCount { actual: rows.len() },
         );
     }
-    let mut values = rows.into_iter().next().expect("已确认有一行").into_values();
-    if values.len() != 1 {
-        return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
-            expected: 1,
-            actual: values.len(),
-        });
-    }
-    let value = values.pop().expect("已确认有一列");
-    let SqliteValue::Blob(bytes) = value else {
-        return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnType {
-            column: "metadata.source_snapshot_fingerprint",
-            expected: "BLOB",
-            actual: value.kind_name(),
-        });
-    };
+    let mut row =
+        StandardAssetStorageRowDecoder::new(rows.into_iter().next().expect("已确认有一行"), 1)
+            .map_err(map_storage_row_error)?;
+    let bytes = row
+        .required_blob("metadata.source_snapshot_fingerprint")
+        .map_err(map_storage_row_error)?;
     SourceSnapshotFingerprint::from_slice(&bytes).map_err(|error| {
         InvalidStandardTranslationAssetSnapshot::InvalidMetadataFingerprintLength {
             actual: error.actual(),
@@ -1128,37 +1082,28 @@ fn decode_owner_states(
     mut rows: Vec<SqliteRow>,
     current: SourceSnapshotFingerprint,
 ) -> Result<DecodedOwnerStates, InvalidStandardTranslationAssetSnapshot> {
-    rows.sort_by_key(owner_row_order);
+    sort_owner_state_rows(rows.as_mut_slice());
     let mut active = ActiveOwners::default();
     let mut stale = Vec::new();
     let mut snapshots = Vec::new();
     for row in rows {
-        let values = row.into_values();
-        if values.len() != 3 {
-            return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
-                expected: 3,
-                actual: values.len(),
-            });
-        }
-        let mut values = values.into_iter();
-        let owner_name = required_text(next(&mut values), "owner")?;
-        let owner =
-            RpgMakerStandardAssetOwner::from_storage_name(&owner_name).ok_or_else(|| {
-                InvalidStandardTranslationAssetSnapshot::UnknownOwner(owner_name.clone())
-            })?;
+        let StandardAssetOwnerStateStorageRow {
+            owner_name,
+            owner,
+            source_snapshot_fingerprint: source_bytes,
+            asset_snapshot_fingerprint: asset_bytes,
+        } = StandardAssetOwnerStateStorageRow::decode(row).map_err(map_storage_row_error)?;
         if !active.insert(owner) {
             return Err(InvalidStandardTranslationAssetSnapshot::DuplicateOwner(
                 owner_name,
             ));
         }
-        let source_bytes = required_blob(next(&mut values), "source_snapshot_fingerprint")?;
         let source = SourceSnapshotFingerprint::from_slice(&source_bytes).map_err(|error| {
             InvalidStandardTranslationAssetSnapshot::InvalidOwnerSourceFingerprintLength {
                 owner: owner.storage_name().to_owned(),
                 actual: error.actual(),
             }
         })?;
-        let asset_bytes = required_blob(next(&mut values), "asset_snapshot_fingerprint")?;
         let asset = AssetSnapshotFingerprint::from_slice(&asset_bytes).map_err(|error| {
             InvalidStandardTranslationAssetSnapshot::InvalidOwnerAssetFingerprintLength {
                 owner: owner.storage_name().to_owned(),
@@ -1179,39 +1124,16 @@ fn decode_owner_states(
     })
 }
 
-fn owner_row_order(row: &SqliteRow) -> usize {
-    row.values()
-        .first()
-        .and_then(|value| match value {
-            SqliteValue::Text(owner) => RpgMakerStandardAssetOwner::from_storage_name(owner),
-            _ => None,
-        })
-        .map_or(TRANSLATION_OWNER_ORDER.len(), owner_order)
-}
-
-const fn owner_order(owner: RpgMakerStandardAssetOwner) -> usize {
-    match owner {
-        RpgMakerStandardAssetOwner::Builtin => 0,
-        RpgMakerStandardAssetOwner::Rules => 1,
-        RpgMakerStandardAssetOwner::Lua => 2,
-    }
-}
-
 fn decode_resources(
     rows: Vec<SqliteRow>,
 ) -> Result<(String, String), InvalidStandardTranslationAssetSnapshot> {
     let mut terminology = None;
     let mut placeholders = None;
     for row in rows {
-        let values = row.into_values();
-        if values.len() != 2 {
-            return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
-                expected: 2,
-                actual: values.len(),
-            });
-        }
-        let mut values = values.into_iter();
-        let kind = required_text(next(&mut values), "resource_kind")?;
+        let mut row = StandardAssetStorageRowDecoder::new(row, 2).map_err(map_storage_row_error)?;
+        let kind = row
+            .required_text("resource_kind")
+            .map_err(map_storage_row_error)?;
         let resource = match kind.as_str() {
             TERMINOLOGY_RESOURCE_KIND => &mut terminology,
             PLACEHOLDER_RULES_RESOURCE_KIND => &mut placeholders,
@@ -1221,7 +1143,9 @@ fn decode_resources(
                 );
             }
         };
-        let canonical_json = required_text(next(&mut values), "canonical_json")?;
+        let canonical_json = row
+            .required_text("canonical_json")
+            .map_err(map_storage_row_error)?;
         if canonical_json.is_empty() {
             return Err(InvalidStandardTranslationAssetSnapshot::BlankTranslationResource(kind));
         }
@@ -1259,24 +1183,19 @@ fn decode_groups(
 ) -> Result<Vec<DecodedGroup>, InvalidStandardTranslationAssetSnapshot> {
     rows.into_iter()
         .map(|OwnerSqliteRow { owner, row }| {
-            let values = row.into_values();
-            if values.len() != 3 {
-                return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
-                    expected: 3,
-                    actual: values.len(),
-                });
-            }
-            let mut values = values.into_iter();
             if !active_owners.contains(owner) {
                 return Err(InvalidStandardTranslationAssetSnapshot::InactiveOwner(
                     owner.storage_name().to_owned(),
                 ));
             }
-            let group_location_raw = required_text(next(&mut values), "group_location")?;
-            let group_location = RpgMakerLocationCodec::decode(&group_location_raw)
-                .map_err(InvalidStandardTranslationAssetSnapshot::InvalidLocation)?;
-            let kind = decode_group_kind(&required_text(next(&mut values), "group_kind")?)?;
-            let group_order = required_non_negative_order(next(&mut values), "group_order")?;
+            let mut row =
+                StandardAssetStorageRowDecoder::new(row, 3).map_err(map_storage_row_error)?;
+            let StandardTextGroupStorageRow {
+                group_location,
+                kind,
+                group_order,
+                ..
+            } = StandardTextGroupStorageRow::decode(&mut row).map_err(map_storage_row_error)?;
             Ok(DecodedGroup {
                 owner,
                 kind,
@@ -1305,53 +1224,46 @@ fn decode_unit(
     OwnerSqliteRow { owner, row }: OwnerSqliteRow,
     active_owners: ActiveOwners,
 ) -> Result<DecodedUnit, InvalidStandardTranslationAssetSnapshot> {
-    let values = row.into_values();
-    if values.len() != 9 {
-        return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnCount {
-            expected: 9,
-            actual: values.len(),
-        });
-    }
-    let mut values = values.into_iter();
     if !active_owners.contains(owner) {
         return Err(InvalidStandardTranslationAssetSnapshot::InactiveOwner(
             owner.storage_name().to_owned(),
         ));
     }
-    let group_location_raw = required_text(next(&mut values), "group_location")?;
-    let group_location = RpgMakerLocationCodec::decode(&group_location_raw)
-        .map_err(InvalidStandardTranslationAssetSnapshot::InvalidLocation)?;
-    let kind = decode_group_kind(&required_text(next(&mut values), "group_kind")?)?;
-    let group_order = required_non_negative_order(next(&mut values), "group_order")?;
-    let role_raw = required_text(next(&mut values), "unit_role")?;
-    let role = RpgMakerProjectionCodec::decode_role(&role_raw)
-        .map_err(InvalidStandardTranslationAssetSnapshot::InvalidRole)?;
-    let unit_order = required_non_negative_order(next(&mut values), "unit_order")?;
-    validate_role(&role, kind)?;
-    let source_content_json = required_text(next(&mut values), "source_content_json")?;
-    let source_content: TextUnitContent = serde_json::from_str(&source_content_json)
-        .map_err(InvalidStandardTranslationAssetSnapshot::InvalidSourceContent)?;
-    if source_content.is_blank() {
+    let mut row = StandardAssetStorageRowDecoder::new(row, 9).map_err(map_storage_row_error)?;
+    let location =
+        StandardTextUnitLocationStorageRow::decode(&mut row).map_err(map_storage_row_error)?;
+    let group_kind_raw = row
+        .required_text("group_kind")
+        .map_err(map_storage_row_error)?;
+    let kind = TextGroupKind::from_storage_name(group_kind_raw.as_str()).ok_or(
+        InvalidStandardTranslationAssetSnapshot::UnknownGroupKind(group_kind_raw),
+    )?;
+    let group_order = row
+        .non_negative_order("group_order")
+        .map_err(map_storage_row_error)?;
+    let identity = StandardTextUnitIdentityStorageRow::decode_after_location(&mut row, location)
+        .map_err(map_storage_row_error)?;
+    validate_role(&identity.role, kind)?;
+    let storage = StandardTextUnitStorageRow::decode_after_identity(&mut row, identity)
+        .map_err(map_storage_row_error)?;
+    if storage.source_content.is_blank() {
         return Err(InvalidStandardTranslationAssetSnapshot::BlankSourceContent);
     }
-    let source_context_json = required_text(next(&mut values), "source_context_json")?;
-    let context: serde_json::Value = serde_json::from_str(&source_context_json)
+    let context: serde_json::Value = serde_json::from_str(storage.source_context_json.as_str())
         .map_err(InvalidStandardTranslationAssetSnapshot::InvalidSourceContext)?;
     if !context.is_object() {
         return Err(InvalidStandardTranslationAssetSnapshot::SourceContextMustBeObject);
     }
-    let translation_content_json = optional_text(next(&mut values), "translation_content_json")?;
-    let translation = translation_content_json
-        .map(|translation| {
-            serde_json::from_str::<TextUnitContent>(&translation)
-                .map_err(InvalidStandardTranslationAssetSnapshot::InvalidTranslationContent)
-        })
-        .transpose()?;
+    let translation = storage
+        .decode_translation_content()
+        .map_err(map_storage_row_error)?;
     if translation.as_ref().is_some_and(TextUnitContent::is_blank) {
         return Err(InvalidStandardTranslationAssetSnapshot::BlankTranslationContent);
     }
-    validate_persisted_content(&role, &source_content, translation.as_ref())?;
-    let translation_state = optional_blob(next(&mut values), "translation_state")?;
+    validate_persisted_content(&storage.role, &storage.source_content, translation.as_ref())?;
+    let translation_state = row
+        .optional_blob("translation_state")
+        .map_err(map_storage_row_error)?;
     let translation_state = match (translation.as_ref(), translation_state) {
         (None, None) => None,
         (Some(_), Some(bytes)) => Some(Sha256Fingerprint::from_slice(&bytes).map_err(|error| {
@@ -1361,6 +1273,14 @@ fn decode_unit(
         })?),
         _ => return Err(InvalidStandardTranslationAssetSnapshot::InvalidTranslationStatePair),
     };
+    let StandardTextUnitStorageRow {
+        group_location,
+        role,
+        unit_order,
+        source_content,
+        source_context_json,
+        ..
+    } = storage;
     Ok(DecodedUnit {
         owner,
         kind,
@@ -1440,21 +1360,43 @@ fn validate_persisted_content(
     Ok(())
 }
 
-fn decode_group_kind(
-    value: &str,
-) -> Result<TextGroupKind, InvalidStandardTranslationAssetSnapshot> {
-    match value {
-        "database_entry" => Ok(TextGroupKind::DatabaseEntry),
-        "system" => Ok(TextGroupKind::System),
-        "map" => Ok(TextGroupKind::Map),
-        "event_dialogue" => Ok(TextGroupKind::EventDialogue),
-        "event_choices" => Ok(TextGroupKind::EventChoices),
-        "event_scrolling_text" => Ok(TextGroupKind::EventScrollingText),
-        "event_command" => Ok(TextGroupKind::EventCommand),
-        "plugin_parameter" => Ok(TextGroupKind::PluginParameter),
-        unknown => Err(InvalidStandardTranslationAssetSnapshot::UnknownGroupKind(
-            unknown.to_owned(),
-        )),
+fn map_storage_row_error(
+    error: StandardAssetStorageRowError,
+) -> InvalidStandardTranslationAssetSnapshot {
+    match error {
+        StandardAssetStorageRowError::WrongColumnCount { expected, actual } => {
+            InvalidStandardTranslationAssetSnapshot::WrongColumnCount { expected, actual }
+        }
+        StandardAssetStorageRowError::WrongColumnType {
+            column,
+            expected,
+            actual,
+        } => InvalidStandardTranslationAssetSnapshot::WrongColumnType {
+            column,
+            expected,
+            actual,
+        },
+        StandardAssetStorageRowError::InvalidOrderValue { column, actual } => {
+            InvalidStandardTranslationAssetSnapshot::InvalidOrderValue { column, actual }
+        }
+        StandardAssetStorageRowError::UnknownOwner(owner) => {
+            InvalidStandardTranslationAssetSnapshot::UnknownOwner(owner)
+        }
+        StandardAssetStorageRowError::UnknownGroupKind(kind) => {
+            InvalidStandardTranslationAssetSnapshot::UnknownGroupKind(kind)
+        }
+        StandardAssetStorageRowError::InvalidLocation(source) => {
+            InvalidStandardTranslationAssetSnapshot::InvalidLocation(source)
+        }
+        StandardAssetStorageRowError::InvalidRole(source) => {
+            InvalidStandardTranslationAssetSnapshot::InvalidRole(source)
+        }
+        StandardAssetStorageRowError::InvalidSourceContent(source) => {
+            InvalidStandardTranslationAssetSnapshot::InvalidSourceContent(source)
+        }
+        StandardAssetStorageRowError::InvalidTranslationContent(source) => {
+            InvalidStandardTranslationAssetSnapshot::InvalidTranslationContent(source)
+        }
     }
 }
 
@@ -1596,89 +1538,6 @@ fn assemble_corpus(
         .into_iter()
         .map(|group| StandardTranslationGroup::new(group.kind, group.group_location, group.assets))
         .collect())
-}
-
-fn next(values: &mut impl Iterator<Item = SqliteValue>) -> SqliteValue {
-    values
-        .next()
-        .expect("列数已验证，标准文本查询行必须具有完整投影")
-}
-
-fn required_text(
-    value: SqliteValue,
-    column: &'static str,
-) -> Result<String, InvalidStandardTranslationAssetSnapshot> {
-    match value {
-        SqliteValue::Text(value) => Ok(value),
-        actual => Err(InvalidStandardTranslationAssetSnapshot::WrongColumnType {
-            column,
-            expected: "TEXT",
-            actual: actual.kind_name(),
-        }),
-    }
-}
-
-fn required_blob(
-    value: SqliteValue,
-    column: &'static str,
-) -> Result<Vec<u8>, InvalidStandardTranslationAssetSnapshot> {
-    match value {
-        SqliteValue::Blob(value) => Ok(value),
-        actual => Err(InvalidStandardTranslationAssetSnapshot::WrongColumnType {
-            column,
-            expected: "BLOB",
-            actual: actual.kind_name(),
-        }),
-    }
-}
-
-fn required_non_negative_order(
-    value: SqliteValue,
-    column: &'static str,
-) -> Result<usize, InvalidStandardTranslationAssetSnapshot> {
-    let SqliteValue::Integer(value) = value else {
-        return Err(InvalidStandardTranslationAssetSnapshot::WrongColumnType {
-            column,
-            expected: "INTEGER",
-            actual: value.kind_name(),
-        });
-    };
-    usize::try_from(value).map_err(
-        |_| InvalidStandardTranslationAssetSnapshot::InvalidOrderValue {
-            column,
-            actual: value,
-        },
-    )
-}
-
-fn optional_text(
-    value: SqliteValue,
-    column: &'static str,
-) -> Result<Option<String>, InvalidStandardTranslationAssetSnapshot> {
-    match value {
-        SqliteValue::Null => Ok(None),
-        SqliteValue::Text(value) => Ok(Some(value)),
-        actual => Err(InvalidStandardTranslationAssetSnapshot::WrongColumnType {
-            column,
-            expected: "TEXT 或 NULL",
-            actual: actual.kind_name(),
-        }),
-    }
-}
-
-fn optional_blob(
-    value: SqliteValue,
-    column: &'static str,
-) -> Result<Option<Vec<u8>>, InvalidStandardTranslationAssetSnapshot> {
-    match value {
-        SqliteValue::Null => Ok(None),
-        SqliteValue::Blob(value) => Ok(Some(value)),
-        actual => Err(InvalidStandardTranslationAssetSnapshot::WrongColumnType {
-            column,
-            expected: "BLOB 或 NULL",
-            actual: actual.kind_name(),
-        }),
-    }
 }
 
 #[cfg(test)]
@@ -2060,14 +1919,14 @@ mod tests {
             .expect("测试快照表与行应可建立");
 
         let groups = connection
-            .prepare(READ_TRANSLATION_OWNER_GROUPS)
+            .prepare(&read_translation_owner_groups())
             .expect("owner group 查询应可建立")
             .query_map(["builtin"], |row| row.get::<_, String>(0))
             .expect("owner group 查询应可执行")
             .collect::<Result<Vec<_>, _>>()
             .expect("owner group 行应可读取");
         let units = connection
-            .prepare(READ_TRANSLATION_OWNER_UNITS)
+            .prepare(&read_translation_owner_units())
             .expect("owner unit 查询应可建立")
             .query_map(["builtin"], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(3)?))
@@ -2173,6 +2032,50 @@ mod tests {
         assert!(matches!(
             error,
             InvalidStandardTranslationAssetSnapshot::SourceContextMustBeObject
+        ));
+    }
+
+    #[test]
+    fn group_columns_keep_first_error_before_corrupt_role_and_source_json() {
+        let role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::DialogueBody)
+            .expect("角色应可编码");
+        let corrupt_tail = |kind: &str, group_order: i64| {
+            let mut values =
+                unit_payload_row(&dialogue_group(), kind, &role, r#"["正文"]"#, "{}").into_values();
+            values[2] = SqliteValue::Integer(group_order);
+            values[3] = text("{");
+            values[5] = text("{");
+            SqliteRow::new(values)
+        };
+
+        let unknown_kind = decode_unit(
+            OwnerSqliteRow {
+                owner: RpgMakerStandardAssetOwner::Builtin,
+                row: corrupt_tail("unknown_kind", 0),
+            },
+            active_builtin(),
+        )
+        .expect_err("未知 group_kind 必须先于损坏的 role 和 source JSON 报告");
+        assert!(matches!(
+            unknown_kind,
+            InvalidStandardTranslationAssetSnapshot::UnknownGroupKind(ref kind)
+                if kind == "unknown_kind"
+        ));
+
+        let invalid_group_order = decode_unit(
+            OwnerSqliteRow {
+                owner: RpgMakerStandardAssetOwner::Builtin,
+                row: corrupt_tail("event_dialogue", -1),
+            },
+            active_builtin(),
+        )
+        .expect_err("非法 group_order 必须先于损坏的 role 和 source JSON 报告");
+        assert!(matches!(
+            invalid_group_order,
+            InvalidStandardTranslationAssetSnapshot::InvalidOrderValue {
+                column: "group_order",
+                actual: -1
+            }
         ));
     }
 

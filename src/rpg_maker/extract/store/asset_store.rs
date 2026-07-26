@@ -16,6 +16,7 @@ use crate::diagnostic::{
     SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::dialogue::{MvDialogueDefinition, MvDialogueDefinitionError};
 use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
@@ -1582,12 +1583,7 @@ fn json_encoding_failure_reason(field: &str, source: &serde_json::Error) -> Diag
 }
 
 fn json_error_coordinates(source: &serde_json::Error) -> String {
-    let category = match source.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    };
+    let category = JsonErrorCategory::from(source);
     format!(
         "json_category={category}; json_line={}; json_column={}",
         source.line(),
@@ -2053,16 +2049,7 @@ fn encode_batch(
 }
 
 const fn group_kind_name(kind: TextGroupKind) -> &'static str {
-    match kind {
-        TextGroupKind::DatabaseEntry => "database_entry",
-        TextGroupKind::System => "system",
-        TextGroupKind::Map => "map",
-        TextGroupKind::EventDialogue => "event_dialogue",
-        TextGroupKind::EventChoices => "event_choices",
-        TextGroupKind::EventScrollingText => "event_scrolling_text",
-        TextGroupKind::EventCommand => "event_command",
-        TextGroupKind::PluginParameter => "plugin_parameter",
-    }
+    kind.storage_name()
 }
 
 fn asset_snapshot_fingerprint(

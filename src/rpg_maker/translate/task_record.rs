@@ -19,6 +19,7 @@ use crate::diagnostic::{
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::llm::{
     ApiKeyRedactor, ChatMessageRole, LlmClientRecordMetadata, LlmFinishReason, LlmResponse,
     LlmUsage,
@@ -844,12 +845,7 @@ impl MarkdownTranslationTaskRecordSink {
                     .client
                     .api_key_redactor()
                     .redact(&path.to_string_lossy());
-                let category = match error.classify() {
-                    serde_json::error::Category::Io => "io",
-                    serde_json::error::Category::Syntax => "syntax",
-                    serde_json::error::Category::Data => "data",
-                    serde_json::error::Category::Eof => "eof",
-                };
+                let category = JsonErrorCategory::from(&error);
                 self.warnings.record_observability_failure(
                     SafeDiagnostic::new(
                         DiagnosticCode::LogSerialize,

@@ -23,6 +23,7 @@ use crate::diagnostic::{
 };
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::language::{
     LanguageId, LanguageModule, LanguageModuleError, LanguagePair, LanguageRepairApplicationError,
     LanguageText, LanguageTextSegment,
@@ -2224,17 +2225,13 @@ fn parse_model_response(
                 .collect(),
         })
         .map_err(|source| {
-            let category = match source.classify() {
-                serde_json::error::Category::Io => TranslationTaskResponseJsonErrorCategory::Io,
-                serde_json::error::Category::Syntax => {
+            let category = match JsonErrorCategory::from(&source) {
+                JsonErrorCategory::Io => TranslationTaskResponseJsonErrorCategory::Io,
+                JsonErrorCategory::Syntax | JsonErrorCategory::DuplicateObjectKey => {
                     TranslationTaskResponseJsonErrorCategory::Syntax
                 }
-                serde_json::error::Category::Data => {
-                    TranslationTaskResponseJsonErrorCategory::Shape
-                }
-                serde_json::error::Category::Eof => {
-                    TranslationTaskResponseJsonErrorCategory::UnexpectedEof
-                }
+                JsonErrorCategory::Data => TranslationTaskResponseJsonErrorCategory::Shape,
+                JsonErrorCategory::Eof => TranslationTaskResponseJsonErrorCategory::UnexpectedEof,
             };
             let (line, column) = if matches!(
                 category,

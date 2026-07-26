@@ -7,9 +7,11 @@ use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
-    DiagnosticStage, DiagnosticSubject, SafeDiagnostic, SafeDiagnosticSource,
+    ConfigurationTomlFailureKind, DiagnosticAction, DiagnosticCode, DiagnosticFailureKind,
+    DiagnosticImpact, DiagnosticReason, DiagnosticStage, DiagnosticSubject, SafeDiagnostic,
+    SafeDiagnosticSource,
 };
+use crate::json_diagnostic::JsonErrorCategory;
 
 use super::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, ProjectionModelError,
@@ -609,6 +611,13 @@ impl MvDialogueTomlClassification {
             Self::Data => "data",
         }
     }
+
+    const fn diagnostic_failure(self) -> ConfigurationTomlFailureKind {
+        match self {
+            Self::Syntax => ConfigurationTomlFailureKind::Syntax,
+            Self::Data => ConfigurationTomlFailureKind::InvalidValue,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -721,7 +730,7 @@ impl MvDialogueDefinitionError {
                     line: source.line,
                     column: source.column,
                     resource: "mv_dialogue_definition".to_owned(),
-                    classification: source.classification.as_str().to_owned(),
+                    failure: source.classification.diagnostic_failure(),
                 },
                 fallback_action,
             ),
@@ -1052,28 +1061,21 @@ fn source_line_column(source: &str, byte_offset: usize) -> (u64, u64) {
 }
 
 fn json_error_classification(source: &serde_json::Error) -> &'static str {
-    match source.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    }
+    JsonErrorCategory::from(source).storage_name()
 }
 
 fn json_failure_kind(source: &serde_json::Error) -> DiagnosticFailureKind {
-    match source.classify() {
-        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-            DiagnosticFailureKind::InvalidSyntax
-        }
-        serde_json::error::Category::Io | serde_json::error::Category::Data => {
-            DiagnosticFailureKind::InvalidValue
-        }
+    match JsonErrorCategory::from(source) {
+        JsonErrorCategory::Syntax
+        | JsonErrorCategory::Eof
+        | JsonErrorCategory::DuplicateObjectKey => DiagnosticFailureKind::InvalidSyntax,
+        JsonErrorCategory::Io | JsonErrorCategory::Data => DiagnosticFailureKind::InvalidValue,
     }
 }
 
 fn json_error_detail(format: &str, source: &serde_json::Error) -> String {
     format!(
-        "format={format}; classification={}; line={}; column={}",
+        "format={format}; json_category={}; line={}; column={}",
         json_error_classification(source),
         source.line(),
         source.column()
@@ -1393,7 +1395,7 @@ pattern = '\\n<(?<speaker>[^>]+)>'
             line,
             column,
             resource,
-            classification,
+            failure,
         } = &diagnostic.reason
         else {
             panic!("TOML 失败应提供分类与行列")
@@ -1401,7 +1403,7 @@ pattern = '\\n<(?<speaker>[^>]+)>'
         assert_eq!(*line, Some(1));
         assert!(column.is_some());
         assert_eq!(resource, "mv_dialogue_definition");
-        assert_eq!(classification, "syntax");
+        assert_eq!(*failure, ConfigurationTomlFailureKind::Syntax);
         let serialized = serde_json::to_string(&diagnostic).expect("安全 TOML 诊断应可序列化");
         assert!(!serialized.contains(TOML_BODY));
 
@@ -1417,7 +1419,7 @@ pattern = '\\n<(?<speaker>[^>]+)>'
         let DiagnosticReason::InvalidToml {
             line,
             column,
-            classification,
+            failure,
             ..
         } = &diagnostic.reason
         else {
@@ -1425,7 +1427,7 @@ pattern = '\\n<(?<speaker>[^>]+)>'
         };
         assert!(line.is_some());
         assert!(column.is_some());
-        assert_eq!(classification, "data");
+        assert_eq!(*failure, ConfigurationTomlFailureKind::InvalidValue);
         assert!(
             !serde_json::to_string(&diagnostic)
                 .expect("安全 TOML data 诊断应可序列化")
@@ -1446,7 +1448,7 @@ pattern = '\\n<(?<speaker>[^>]+)>'
             panic!("JSON 失败应提供闭集分类与行列")
         };
         assert!(detail.contains("format=canonical_json"));
-        assert!(detail.contains("classification=data"));
+        assert!(detail.contains("json_category=data"));
         assert!(detail.contains("line=2"));
         assert!(!detail.contains(JSON_VALUE));
         assert!(

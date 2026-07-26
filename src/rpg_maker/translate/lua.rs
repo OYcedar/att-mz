@@ -319,14 +319,10 @@ fn lua_translation_state_context(
 
 const fn group_kind_name(kind: TextGroupKind) -> &'static [u8] {
     match kind {
-        TextGroupKind::DatabaseEntry => b"database_entry",
-        TextGroupKind::System => b"system",
-        TextGroupKind::Map => b"map",
         TextGroupKind::EventDialogue => b"dialogue",
         TextGroupKind::EventChoices => b"choices",
         TextGroupKind::EventScrollingText => b"scrolling_text",
-        TextGroupKind::EventCommand => b"event_command",
-        TextGroupKind::PluginParameter => b"plugin_parameter",
+        _ => kind.storage_name().as_bytes(),
     }
 }
 

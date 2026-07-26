@@ -393,6 +393,39 @@ pub(crate) enum TextGroupKind {
     PluginParameter,
 }
 
+impl TextGroupKind {
+    pub(crate) const ALL: [Self; 8] = [
+        Self::DatabaseEntry,
+        Self::System,
+        Self::Map,
+        Self::EventDialogue,
+        Self::EventChoices,
+        Self::EventScrollingText,
+        Self::EventCommand,
+        Self::PluginParameter,
+    ];
+
+    /// 标准资产持久化和受信协议共用的唯一名称。
+    pub(crate) const fn storage_name(self) -> &'static str {
+        match self {
+            Self::DatabaseEntry => "database_entry",
+            Self::System => "system",
+            Self::Map => "map",
+            Self::EventDialogue => "event_dialogue",
+            Self::EventChoices => "event_choices",
+            Self::EventScrollingText => "event_scrolling_text",
+            Self::EventCommand => "event_command",
+            Self::PluginParameter => "plugin_parameter",
+        }
+    }
+
+    pub(crate) fn from_storage_name(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.storage_name() == value)
+    }
+}
+
 fn write_path(
     formatter: &mut fmt::Formatter<'_>,
     source: &RpgMakerSource,
@@ -508,5 +541,17 @@ mod tests {
                 RpgMakerSource::DataFile(file) if file.as_str() == file_name
             ));
         }
+    }
+
+    #[test]
+    fn every_text_group_kind_round_trips_its_unique_storage_name() {
+        for kind in TextGroupKind::ALL {
+            assert_eq!(
+                TextGroupKind::from_storage_name(kind.storage_name()),
+                Some(kind)
+            );
+        }
+        assert_eq!(TextGroupKind::from_storage_name("dialogue"), None);
+        assert_eq!(TextGroupKind::from_storage_name("DatabaseEntry"), None);
     }
 }

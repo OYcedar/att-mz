@@ -1380,7 +1380,7 @@ path = 'entries[0].right.Name'
         let canonical = serde_json::to_string(&canonical_error.safe_diagnostic(&path))
             .expect("canonical 诊断应可序列化");
         assert!(canonical.contains("format=canonical_json"));
-        assert!(canonical.contains("json_class=data"));
+        assert!(canonical.contains("json_category=data"));
         assert!(canonical.contains("json_line=1"));
         assert!(canonical.contains("json_column="));
         assert!(!canonical.contains("CANONICAL_VALUE_SENTINEL"));

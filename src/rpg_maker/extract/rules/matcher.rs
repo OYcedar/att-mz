@@ -20,7 +20,6 @@ use crate::diagnostic::{
     DiagnosticStage, DiagnosticSubject, SafeDiagnostic,
 };
 use crate::rpg_maker::json::{StackSafeJsonError, StackSafeJsonValue, from_str as parse_json};
-use crate::rpg_maker::lua::json::LosslessJsonError;
 use crate::rpg_maker::model::{
     DirectTextPart, DirectTextRecipe, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe,
     TextUnitRole,
@@ -2363,7 +2362,7 @@ impl RulesInvalidTargetReason {
                 json_string(actual_parameter)
             ),
             Self::NestedJsonDecode { phase, at, source } => format!(
-                "target={phase}; actual_path={}; error=invalid_nested_json; json_class={}; json_line={}; json_column={}",
+                "target={phase}; actual_path={}; error=invalid_nested_json; json_category={}; json_line={}; json_column={}",
                 render_value_steps(at),
                 json_error_classification(source),
                 source.line(),
@@ -2496,22 +2495,7 @@ fn projection_error_code(source: &ProjectionModelError) -> &'static str {
 }
 
 fn json_error_classification(source: &StackSafeJsonError) -> &'static str {
-    match source {
-        StackSafeJsonError::Syntax {
-            source: LosslessJsonError::Syntax { .. },
-            ..
-        } => "syntax",
-        StackSafeJsonError::Syntax {
-            source: LosslessJsonError::DuplicateObjectKey { .. },
-            ..
-        } => "duplicate_object_key",
-        StackSafeJsonError::Backend(source) => match source.classify() {
-            serde_json::error::Category::Io => "io",
-            serde_json::error::Category::Syntax => "syntax",
-            serde_json::error::Category::Data => "data",
-            serde_json::error::Category::Eof => "eof",
-        },
-    }
+    source.diagnostic_category().storage_name()
 }
 
 impl RulesMatchError {
@@ -2924,7 +2908,7 @@ path = 'Payload.Message'
         assert!(serialized.contains("Custom.json"));
         assert!(serialized.contains("target=path"));
         assert!(serialized.contains("actual_path="));
-        assert!(serialized.contains("json_class=syntax"));
+        assert!(serialized.contains("json_category=syntax"));
         assert!(serialized.contains("json_line=1"));
         assert!(serialized.contains("json_column="));
         assert!(!serialized.contains("SOURCE_JSON_VALUE_SENTINEL"));

@@ -6,6 +6,7 @@ use std::fmt;
 use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::text::DataFileName;
 
 /// 已完成来源、路径和 PCRE2 ABI 校验的 Rules 定义。
@@ -421,7 +422,7 @@ fn parse_bracket_segment(
             })?
             .map_err(|error| InvalidPathReason::InvalidQuotedKey {
                 offset: string_start,
-                classification: json_error_classification(&error),
+                json_category: JsonErrorCategory::from(&error),
                 line: error.line(),
                 column: error.column(),
             })?;
@@ -477,7 +478,7 @@ pub(crate) enum InvalidPathReason {
     },
     InvalidQuotedKey {
         offset: usize,
-        classification: &'static str,
+        json_category: JsonErrorCategory,
         line: usize,
         column: usize,
     },
@@ -535,14 +536,14 @@ impl InvalidPathReason {
             detail.push_str(&format!("; byte_offset={offset}"));
         }
         if let Self::InvalidQuotedKey {
-            classification,
+            json_category,
             line,
             column,
             ..
         } = self
         {
             detail.push_str(&format!(
-                "; json_class={classification}; json_line={line}; json_column={column}"
+                "; json_category={json_category}; json_line={line}; json_column={column}"
             ));
         }
         detail
@@ -677,13 +678,13 @@ impl RulesDefinitionError {
                 detail
             }
             Self::InvalidCanonicalJson(source) => format!(
-                "format=canonical_json; json_class={}; json_line={}; json_column={}",
+                "format=canonical_json; json_category={}; json_line={}; json_column={}",
                 json_error_classification(source),
                 source.line(),
                 source.column()
             ),
             Self::EncodeCanonicalJson(source) => format!(
-                "operation=encode_canonical_json; json_class={}; json_line={}; json_column={}",
+                "operation=encode_canonical_json; json_category={}; json_line={}; json_column={}",
                 json_error_classification(source),
                 source.line(),
                 source.column()
@@ -765,12 +766,7 @@ pub(super) fn pcre2_error_detail(source: &pcre2::Error) -> String {
 }
 
 fn json_error_classification(source: &serde_json::Error) -> &'static str {
-    match source.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    }
+    JsonErrorCategory::from(source).storage_name()
 }
 
 impl fmt::Display for RulesDefinitionError {

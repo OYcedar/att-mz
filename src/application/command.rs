@@ -9458,7 +9458,7 @@ mod command_error_rendering_tests {
         assert!(serialized.contains("definition=mv_dialogue_rules"));
         assert!(serialized.contains("stage=decode"));
         assert!(serialized.contains("failure=invalid_json"));
-        assert!(serialized.contains("category=data"));
+        assert!(serialized.contains("json_category=data"));
         assert!(serialized.contains("line=7"));
         assert!(serialized.contains("column=19"));
     }
