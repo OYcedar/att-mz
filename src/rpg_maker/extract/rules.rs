@@ -358,7 +358,7 @@ fn build_match_input(
                 rules
             },
         );
-    let (documents, plugins) = documents.into_shared_parts();
+    let (documents, plugins, _plugins_prefix) = documents.into_shared_parts();
     let files = documents
         .into_iter()
         .map(|(id, value)| (document_file_name(id), value))

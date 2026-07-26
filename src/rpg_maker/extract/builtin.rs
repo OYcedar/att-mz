@@ -897,7 +897,7 @@ fn builtin_work_units(
     documents: RpgMakerProjectDocuments,
     dialogue_projection: &BuiltinDialogueProjection,
 ) -> Result<Vec<BuiltinWorkUnit>, BuiltinDocumentError> {
-    let (mut documents, _plugins) = documents.into_shared_parts();
+    let (mut documents, _plugins, _plugins_prefix) = documents.into_shared_parts();
     let mut work_units = Vec::new();
 
     for (file, field_names) in database_specs() {

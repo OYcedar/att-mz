@@ -26,7 +26,6 @@ use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
-use windows_sys::Win32::Globalization::{LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
@@ -51,6 +50,7 @@ use crate::storage::file_system::{
     ScopedDirectoryEntryKind, ScopedDirectoryPath, ScopedDirectoryScope, StagedDirectory,
     StagingCleanupFailure,
 };
+use crate::windows_path::{WindowsOrdinalCaseKey, WindowsOrdinalCaseKeyError};
 use sha2::{Digest, Sha256};
 
 use super::windows::{
@@ -59,7 +59,7 @@ use super::windows::{
     delete_regular_file_if_identity, number_of_links, open_directory,
     open_read_write_file_without_reparse, pin_directory_without_reparse, pin_path_without_reparse,
     pin_regular_file_for_snapshot_read, rename_without_replace_if_identity, secure_uuid_v4,
-    validate_local_case_insensitive_ntfs_directory, windows_names_equal,
+    validate_local_case_insensitive_ntfs_directory,
 };
 
 const RESERVED_PREFIX: &str = ".directory-publish-";
@@ -321,10 +321,9 @@ pub(crate) enum SystemFileSystemError {
     Windows(WindowsFsError),
     Closed,
     WorkerPanicked,
-    WindowsApiValueTooLarge {
-        subject: &'static str,
-        maximum: u64,
-        observed: u64,
+    WindowsOrdinalCaseKey {
+        path: PathBuf,
+        source: WindowsOrdinalCaseKeyError,
     },
     InvalidPath {
         path: PathBuf,
@@ -380,13 +379,10 @@ impl fmt::Display for SystemFileSystemError {
             Self::Windows(source) => source.fmt(formatter),
             Self::Closed => formatter.write_str("文件系统根已经停止接收工作"),
             Self::WorkerPanicked => formatter.write_str("文件系统工作线程中的任务发生 panic"),
-            Self::WindowsApiValueTooLarge {
-                subject,
-                maximum,
-                observed,
-            } => write!(
+            Self::WindowsOrdinalCaseKey { path, source } => write!(
                 formatter,
-                "{subject} 无法由 Windows API 参数表达（最大 {maximum}，实际 {observed}）"
+                "无法建立路径 {} 的 Windows ordinal 非大小写身份：{source}",
+                path.display()
             ),
             Self::InvalidPath { path, reason } => {
                 write!(formatter, "文件系统路径无效 {}：{reason}", path.display())
@@ -461,12 +457,12 @@ impl Error for SystemFileSystemError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Windows(source) => Some(source),
+            Self::WindowsOrdinalCaseKey { source, .. } => Some(source),
             Self::DirectChildRollbackFailed { operation, .. }
             | Self::ScopedEditRollbackFailed { operation, .. }
             | Self::ObservationCleanupFailed { operation, .. } => Some(operation),
             Self::Closed
             | Self::WorkerPanicked
-            | Self::WindowsApiValueTooLarge { .. }
             | Self::InvalidPath { .. }
             | Self::Cancelled { .. }
             | Self::WrongPublisherInstance
@@ -522,22 +518,35 @@ impl SystemFileSystemError {
                 impact,
                 DiagnosticAction::ReportBug,
             ),
-            Self::WindowsApiValueTooLarge {
-                subject,
-                maximum,
-                observed,
-            } => SafeDiagnostic::new(
-                DiagnosticCode::FileSystemOperation,
-                stage,
-                DiagnosticSubject::component(subject),
-                DiagnosticReason::Resource {
-                    resource: (*subject).to_owned(),
-                    actual: *observed,
-                    maximum: Some(*maximum),
-                },
-                impact,
-                fallback_action,
-            ),
+            Self::WindowsOrdinalCaseKey { path, source } => match source {
+                WindowsOrdinalCaseKeyError::InputTooLarge { maximum, observed } => {
+                    SafeDiagnostic::new(
+                        DiagnosticCode::FileSystemOperation,
+                        stage,
+                        DiagnosticSubject::path(path),
+                        DiagnosticReason::Resource {
+                            resource: "Windows 文件名 UTF-16 单元数".to_owned(),
+                            actual: *observed,
+                            maximum: Some(*maximum),
+                        },
+                        impact,
+                        fallback_action,
+                    )
+                }
+                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => SafeDiagnostic::io(
+                    DiagnosticCode::FileSystemOperation,
+                    stage,
+                    DiagnosticSubject::path(path),
+                    "windows_ordinal_case_key",
+                    source,
+                    impact,
+                    DiagnosticAction::CheckPathAndPermissions,
+                )
+                .with_recovery(RecoveryFact::component(format!(
+                    "windows_ordinal_case_key_phase={}",
+                    phase.as_str()
+                ))),
+            },
             Self::InvalidPath { path, reason } => SafeDiagnostic::new(
                 DiagnosticCode::FileSystemOperation,
                 stage,
@@ -2158,16 +2167,17 @@ fn bind_scoped_directory_sync(
             path: root.to_path_buf(),
         });
     }
-    let mut declared_roots = HashMap::<Vec<u16>, OsString>::with_capacity(scope.roots().len());
+    let mut declared_roots =
+        HashMap::<WindowsOrdinalCaseKey, OsString>::with_capacity(scope.roots().len());
     for declared in scope.roots() {
-        let key = invariant_uppercase_utf16(declared)?;
+        let path = pinned_root.resolved_path().join(declared);
+        let key = windows_ordinal_case_key(declared, &path)?;
         if declared_roots.insert(key, declared.clone()).is_some() {
             return Err(SystemFileSystemError::InvalidPath {
                 path: root.to_path_buf(),
                 reason: "候选编辑范围包含 Windows 非大小写语义下重复的顶层目录",
             });
         }
-        let path = pinned_root.resolved_path().join(declared);
         let child = pin_directory_without_reparse(&path)?;
         if !child.metadata()?.is_dir() {
             return Err(SystemFileSystemError::InvalidPath {
@@ -2219,6 +2229,8 @@ fn read_scoped_file_sync(
     absolute: &Path,
 ) -> Result<Vec<u8>, ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     let _root = pin_scoped_root(root, root_identity)?;
+    validate_relative_windows_path(relative.as_path())
+        .map_err(|source| scoped_failed(relative, source))?;
     let metadata = match fs::symlink_metadata(absolute) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -2272,6 +2284,8 @@ fn list_scoped_directory_sync(
     absolute: &Path,
 ) -> Result<Vec<ScopedDirectoryEntry>, ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     let _root = pin_scoped_root(root, root_identity)?;
+    validate_relative_windows_path(relative.as_path())
+        .map_err(|source| scoped_failed(relative, source))?;
     let metadata = match fs::symlink_metadata(absolute) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -2306,8 +2320,8 @@ fn list_scoped_directory_sync(
         let child_path = entry.path();
         validate_windows_name(&name, &child_path)
             .map_err(|source| scoped_failed(relative, source))?;
-        let windows_key =
-            invariant_uppercase_utf16(&name).map_err(|source| scoped_failed(relative, source))?;
+        let windows_key = windows_ordinal_case_key(&name, &child_path)
+            .map_err(|source| scoped_failed(relative, source))?;
         if !windows_names.insert(windows_key) {
             return Err(scoped_failed(
                 relative,
@@ -2377,7 +2391,7 @@ fn list_scoped_root_sync(
                 source: Box::new(source),
             }
         })?;
-        let windows_key = invariant_uppercase_utf16(&name).map_err(|source| {
+        let windows_key = windows_ordinal_case_key(&name, &child_path).map_err(|source| {
             ScopedDirectoryEditError::Failed {
                 path: PathBuf::from("."),
                 source: Box::new(source),
@@ -2615,6 +2629,8 @@ fn remove_scoped_path_sync(
     absolute: &Path,
 ) -> Result<(), ScopedDirectoryEditError<Box<SystemFileSystemError>>> {
     let _root = pin_scoped_root(root, root_identity)?;
+    validate_relative_windows_path(relative.as_path())
+        .map_err(|source| scoped_failed(relative, source))?;
     let pinned = match pin_path_without_reparse(absolute) {
         Ok(pinned) => pinned,
         Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
@@ -2928,7 +2944,7 @@ fn fingerprint_directory(
                     validate_windows_name(&name, &path)
                         .map_err(|source| fingerprint_failed(&path, source))?;
                     let wide = name.encode_wide().collect::<Vec<_>>();
-                    let windows_key = invariant_uppercase_utf16(&name)
+                    let windows_key = windows_ordinal_case_key(&name, &path)
                         .map_err(|source| fingerprint_failed(&path, source))?;
                     if !windows_names.insert(windows_key) {
                         return Err(fingerprint_failed(
@@ -3391,7 +3407,7 @@ struct CandidateSourceEntry {
 }
 
 struct CandidateOverlayLookup {
-    windows_paths: HashMap<Vec<Vec<u16>>, usize>,
+    windows_paths: HashMap<Vec<WindowsOrdinalCaseKey>, usize>,
 }
 
 struct CandidateManifestObservation {
@@ -3675,7 +3691,7 @@ fn read_candidate_source_entries(
     let mut names = HashSet::with_capacity(entries.len());
     for entry in &entries {
         validate_windows_name(&entry.name, &entry.physical_path)?;
-        if !names.insert(invariant_uppercase_utf16(&entry.name)?) {
+        if !names.insert(windows_ordinal_case_key(&entry.name, &entry.physical_path)?) {
             return Err(SystemFileSystemError::InvalidPath {
                 path: entry.physical_path.clone(),
                 reason: "同一目录包含 Windows 大小写等价名称",
@@ -3916,13 +3932,15 @@ fn validate_manifest_directory_entries(
     Ok(())
 }
 
-fn windows_relative_path_key(path: &Path) -> Result<Vec<Vec<u16>>, SystemFileSystemError> {
+fn windows_relative_path_key(
+    path: &Path,
+) -> Result<Vec<WindowsOrdinalCaseKey>, SystemFileSystemError> {
     path.components()
         .map(|component| {
             let Component::Normal(name) = component else {
                 unreachable!("候选相对路径已经过结构校验")
             };
-            invariant_uppercase_utf16(name)
+            windows_ordinal_case_key(name, path)
         })
         .collect()
 }
@@ -3935,7 +3953,7 @@ fn validate_declared_windows_paths(
     #[derive(Default)]
     struct TrieNode {
         spelling: Option<OsString>,
-        children: HashMap<Vec<u16>, usize>,
+        children: HashMap<WindowsOrdinalCaseKey, usize>,
     }
 
     let declared_paths = source_mappings
@@ -3951,7 +3969,7 @@ fn validate_declared_windows_paths(
             let Component::Normal(name) = component else {
                 unreachable!("候选声明路径已经过结构校验");
             };
-            let key = invariant_uppercase_utf16(name)?;
+            let key = windows_ordinal_case_key(name, path)?;
             let child_index = match trie[node_index].children.get(&key).copied() {
                 Some(index) => index,
                 None => {
@@ -4008,7 +4026,7 @@ fn validate_complete_candidate(
             let name = entry.file_name();
             let child_path = entry.path();
             validate_windows_name(&name, &child_path)?;
-            if !names.insert(invariant_uppercase_utf16(&name)?) {
+            if !names.insert(windows_ordinal_case_key(&name, &child_path)?) {
                 return Err(SystemFileSystemError::InvalidPath {
                     path: child_path,
                     reason: "发布候选的同一目录包含 Windows 大小写等价名称",
@@ -4335,11 +4353,11 @@ fn stable_lock_path(
     lock_directory: &Path,
     identity: &OsStr,
 ) -> Result<PathBuf, SystemFileSystemError> {
-    let key = invariant_uppercase_utf16(identity)?;
+    let key = windows_ordinal_case_key(identity, Path::new(identity))?;
     let mut hasher = Sha256::new();
     hasher.update(b"exclusive-file-lease");
-    hasher.update((key.len() as u64).to_le_bytes());
-    for unit in key {
+    hasher.update((key.units().len() as u64).to_le_bytes());
+    for unit in key.units() {
         hasher.update(unit.to_le_bytes());
     }
     let digest = hasher.finalize();
@@ -4352,58 +4370,28 @@ fn stable_lock_path(
     Ok(lock_directory.join(file_name))
 }
 
-fn invariant_uppercase_utf16(value: &OsStr) -> Result<Vec<u16>, SystemFileSystemError> {
-    let input = value.encode_wide().collect::<Vec<_>>();
-    let input_len =
-        i32::try_from(input.len()).map_err(|_| SystemFileSystemError::WindowsApiValueTooLarge {
-            subject: "文件租约身份 UTF-16 单元数",
-            maximum: i32::MAX as u64,
-            observed: input.len() as u64,
-        })?;
-    // SAFETY: 输入切片在调用期间有效；第一次调用只查询所需长度，不写入目标缓冲区。
-    let required = unsafe {
-        LCMapStringEx(
-            LOCALE_NAME_INVARIANT,
-            LCMAP_UPPERCASE,
-            input.as_ptr(),
-            input_len,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        )
-    };
-    if required == 0 {
-        return Err(io_error(
-            "建立 Windows 非大小写敏感租约键",
-            Path::new("<lock-identity>"),
-            io::Error::last_os_error(),
-        ));
-    }
-    let mut output = vec![0_u16; required as usize];
-    // SAFETY: 目标缓冲区使用上一次系统调用给出的精确长度；输入与输出在调用期间有效。
-    let written = unsafe {
-        LCMapStringEx(
-            LOCALE_NAME_INVARIANT,
-            LCMAP_UPPERCASE,
-            input.as_ptr(),
-            input_len,
-            output.as_mut_ptr(),
-            required,
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        )
-    };
-    if written != required {
-        return Err(io_error(
-            "建立 Windows 非大小写敏感租约键",
-            Path::new("<lock-identity>"),
-            io::Error::last_os_error(),
-        ));
-    }
-    Ok(output)
+fn windows_ordinal_case_key(
+    value: &OsStr,
+    path: &Path,
+) -> Result<WindowsOrdinalCaseKey, SystemFileSystemError> {
+    WindowsOrdinalCaseKey::from_os_str(value).map_err(|source| {
+        SystemFileSystemError::WindowsOrdinalCaseKey {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+fn windows_ordinal_case_key_from_utf16(
+    value: &[u16],
+    path: &Path,
+) -> Result<WindowsOrdinalCaseKey, SystemFileSystemError> {
+    WindowsOrdinalCaseKey::from_utf16(value).map_err(|source| {
+        SystemFileSystemError::WindowsOrdinalCaseKey {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -5298,7 +5286,9 @@ fn recover_journal(target_root: &Path, journal: &Path) -> Result<(), SystemFileS
         .expect("受信发布目标必有名称")
         .encode_wide()
         .collect();
-    if !windows_names_equal(&record.target_name, &target_name) {
+    let recorded_target_key = windows_ordinal_case_key_from_utf16(&record.target_name, journal)?;
+    let requested_target_key = windows_ordinal_case_key_from_utf16(&target_name, target_root)?;
+    if recorded_target_key != requested_target_key {
         return Err(SystemFileSystemError::OutcomeUnknown {
             target_root: target_root.to_path_buf(),
             artifacts: vec![journal.to_path_buf()],
@@ -7041,6 +7031,36 @@ mod tests {
                 if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
                     if reason.contains("硬链接"))
         ));
+        assert!(matches!(
+            root.list_scoped_directory(&scope, scoped_path("assets"))
+                .await,
+            Err(ScopedDirectoryEditError::Failed { source, .. })
+                if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
+                    if reason.contains("硬链接"))
+        ));
+        assert!(matches!(
+            root.write_scoped_file(
+                &scope,
+                scoped_path("assets/hardlink.json"),
+                b"changed".to_vec(),
+            )
+            .await,
+            Err(ScopedDirectoryEditError::Failed { source, .. })
+                if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
+                    if reason.contains("硬链接"))
+        ));
+        assert!(matches!(
+            root.remove_scoped_path(&scope, scoped_path("assets/hardlink.json"))
+                .await,
+            Err(ScopedDirectoryEditError::Failed { source, .. })
+                if matches!(*source, SystemFileSystemError::InvalidPath { reason, .. }
+                    if reason.contains("硬链接"))
+        ));
+        assert_eq!(
+            fs::read(staging_root.join("assets/catalog.json")).unwrap(),
+            b"items",
+            "硬链接写入失败不得改变共享物理文件"
+        );
         fs::remove_file(&hardlink).expect("应该可移除硬链接测试入口");
 
         let external = temporary.path().join("external.txt");
@@ -7061,6 +7081,65 @@ mod tests {
             Err(error) if symlink_unavailable(&error) => {}
             Err(error) => panic!("应该可创建文件符号链接：{error}"),
         }
+
+        drop(scope);
+        root.discard(staged).await.expect("应该可丢弃候选");
+        root.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[tokio::test]
+    async fn every_scoped_operation_applies_the_same_windows_path_validation() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        scoped_source(&source);
+        let root = TestDirectoryPublisher::new(file_system_config());
+        let staged = root
+            .prepare(scoped_stage_request(
+                temporary.path().join("output"),
+                &source,
+                DirectoryPublishIntent::CreateNew,
+            ))
+            .await
+            .expect("候选应该可准备");
+        let staging_root = staged.staging_root().to_path_buf();
+        let scope = root
+            .bind_scoped_directory(&staged, scoped_scope())
+            .await
+            .expect("应该可绑定候选");
+        let invalid = || scoped_path("assets/CON");
+
+        assert!(matches!(
+            root.read_scoped_file(&scope, invalid()).await,
+            Err(ScopedDirectoryEditError::Failed { source, .. })
+                if matches!(*source, SystemFileSystemError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            root.list_scoped_directory(&scope, invalid()).await,
+            Err(ScopedDirectoryEditError::Failed { source, .. })
+                if matches!(*source, SystemFileSystemError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            root.create_scoped_directory(&scope, invalid()).await,
+            Err(ScopedDirectoryEditError::Failed { source, .. })
+                if matches!(*source, SystemFileSystemError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            root.write_scoped_file(&scope, invalid(), b"forbidden".to_vec())
+                .await,
+            Err(ScopedDirectoryEditError::Failed { source, .. })
+                if matches!(*source, SystemFileSystemError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            root.remove_scoped_path(&scope, invalid()).await,
+            Err(ScopedDirectoryEditError::Failed { source, .. })
+                if matches!(*source, SystemFileSystemError::InvalidPath { .. })
+        ));
+        assert!(
+            fs::read_dir(staging_root.join("assets"))
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() != OsStr::new("CON")),
+            "非法设备名操作不得建立目录项"
+        );
 
         drop(scope);
         root.discard(staged).await.expect("应该可丢弃候选");

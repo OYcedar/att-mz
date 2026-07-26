@@ -113,8 +113,9 @@ Builtin **不**翻译 `Animations.json`、`MapInfos.json`、`Tilesets.json`、`j
 
 ### 3.1 对话、选项和滚动文本
 
-标准消息块是 `101 + 连续 401*`。MZ 从可选 `101.parameters[4]` 建立原生 Speaker；缺失、
-空或全空白表示没有 Speaker。MV 按项目当前姓名投影处理第一条 `401`，精确语义见
+标准消息块是 `101 + 连续 401*`。MZ 从可选 `101.parameters[4]` 建立原生 Speaker；参数
+缺失、空 string 或全空白 string 表示没有 Speaker，显式 `null` 或其他非 string 值是无效
+源文档，不按“没有 Speaker”跳过。MV 按项目当前姓名投影处理第一条 `401`，精确语义见
 [规则文件](rules.md#3-mv-对话姓名投影)。全部正文形成一个 DialogueBody，正文中的空白
 `401` 作为 Lines 空元素保留；全空正文不建立 Body。
 

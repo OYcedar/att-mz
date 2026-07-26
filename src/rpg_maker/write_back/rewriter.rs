@@ -35,6 +35,7 @@ use crate::rpg_maker::model::DialogueLinePart;
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::tag::simple_tag_spans;
 use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
+use crate::windows_path::{WindowsOrdinalCaseKey, WindowsOrdinalCaseKeyError};
 
 /// 一个已经完成安全相对路径校验的完整文件替换。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,11 +86,13 @@ impl RpgMakerRewrittenDocuments {
         mut files: Vec<RpgMakerRewrittenFile>,
     ) -> Result<Self, RpgMakerWriteBackDocumentRewriteFailure> {
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        for pair in files.windows(2) {
-            if pair[0].relative_path == pair[1].relative_path {
+        let mut seen_paths = HashMap::with_capacity(files.len());
+        for file in &files {
+            let key = windows_output_path_key(&file.relative_path)?;
+            if let Some(first_path) = seen_paths.insert(key, file.relative_path.clone()) {
                 return Err(
                     RpgMakerWriteBackDocumentRewriteFailure::DuplicateOutputPath {
-                        path: pair[0].relative_path.clone(),
+                        path: first_path,
                     },
                 );
             }
@@ -125,6 +128,24 @@ impl RpgMakerRewrittenDocuments {
     pub(crate) fn into_files(self) -> Vec<RpgMakerRewrittenFile> {
         self.files
     }
+}
+
+fn windows_output_path_key(
+    path: &Path,
+) -> Result<Vec<WindowsOrdinalCaseKey>, RpgMakerWriteBackDocumentRewriteFailure> {
+    path.components()
+        .map(|component| {
+            let Component::Normal(name) = component else {
+                unreachable!("候选输出路径已经过结构校验")
+            };
+            WindowsOrdinalCaseKey::from_os_str(name).map_err(|source| {
+                RpgMakerWriteBackDocumentRewriteFailure::OutputPathCaseKey {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })
+        })
+        .collect()
 }
 
 fn validate_relative_output_path(
@@ -307,6 +328,7 @@ fn select_source(selection: &mut RpgMakerDocumentSelection, source: &RpgMakerSou
 struct MutableDocuments {
     documents: BTreeMap<RpgMakerDocumentId, StackSafeJsonValue>,
     plugins: Vec<(usize, StackSafeJsonValue)>,
+    plugins_prefix: String,
     changed_documents: BTreeSet<RpgMakerDocumentId>,
     plugins_changed: bool,
 }
@@ -316,15 +338,17 @@ impl MutableDocuments {
         Self {
             documents: BTreeMap::from([(id, value)]),
             plugins: Vec::new(),
+            plugins_prefix: String::new(),
             changed_documents: BTreeSet::new(),
             plugins_changed: false,
         }
     }
 
-    fn from_plugins(plugins: Vec<(usize, StackSafeJsonValue)>) -> Self {
+    fn from_plugins(plugins: Vec<(usize, StackSafeJsonValue)>, plugins_prefix: String) -> Self {
         Self {
             documents: BTreeMap::new(),
             plugins,
+            plugins_prefix,
             changed_documents: BTreeSet::new(),
             plugins_changed: false,
         }
@@ -463,7 +487,7 @@ fn prepare_rewrite_jobs(
         partitions.entry(key).or_default().push(mutation);
     }
 
-    let (mut json_documents, plugins) = documents.into_parts();
+    let (mut json_documents, plugins, plugins_prefix) = documents.into_parts();
     let mut plugins = Some(
         plugins
             .into_iter()
@@ -486,6 +510,7 @@ fn prepare_rewrite_jobs(
             }
             PhysicalDocumentKey::Plugins => MutableDocuments::from_plugins(
                 plugins.take().expect("plugins.js 只能形成一个物理文档分区"),
+                plugins_prefix.clone(),
             ),
         };
         jobs.push(DocumentRewriteJob {
@@ -1713,10 +1738,14 @@ fn comment_block_end(
     if command_code(first, location)? != 108 {
         return Err(mutation_failure(location, "CommentTag 起始命令不是 108"));
     }
+    let first_indent = command_indent(first, location)?;
     command_text(first, 108, 408, location)?;
     let mut end = start + 1;
     while let Some(command) = list.get(end) {
         if command_code(command, location)? != 408 {
+            break;
+        }
+        if command_indent(command, location)? != first_indent {
             break;
         }
         command_text(command, 108, 408, location)?;
@@ -2455,7 +2484,10 @@ fn serialize_rewritten_files(
                 source,
             }
         })?;
-        let mut bytes = Vec::with_capacity("var $plugins = ;\n".len() + json.len());
+        let mut bytes = Vec::with_capacity(
+            documents.plugins_prefix.len() + "var $plugins = ;\n".len() + json.len(),
+        );
+        bytes.extend_from_slice(documents.plugins_prefix.as_bytes());
         bytes.extend_from_slice(b"var $plugins = ");
         bytes.extend_from_slice(json.as_bytes());
         bytes.extend_from_slice(b";\n");
@@ -2587,6 +2619,10 @@ pub(crate) enum RpgMakerWriteBackDocumentRewriteFailure {
     DuplicateOutputPath {
         path: PathBuf,
     },
+    OutputPathCaseKey {
+        path: PathBuf,
+        source: WindowsOrdinalCaseKeyError,
+    },
     MissingChangedDocument {
         id: RpgMakerDocumentId,
     },
@@ -2627,6 +2663,11 @@ impl fmt::Display for RpgMakerWriteBackDocumentRewriteFailure {
             Self::DuplicateOutputPath { path } => {
                 write!(formatter, "候选文件路径重复：{}", path.display())
             }
+            Self::OutputPathCaseKey { path, source } => write!(
+                formatter,
+                "无法建立候选文件路径 {} 的 Windows 非大小写身份：{source}",
+                path.display()
+            ),
             Self::MissingChangedDocument { id } => {
                 write!(formatter, "已修改文档在序列化前丢失：{id:?}")
             }
@@ -2647,6 +2688,7 @@ impl Error for RpgMakerWriteBackDocumentRewriteFailure {
             Self::DecodeNestedJson { source, .. }
             | Self::EncodeNestedJson { source, .. }
             | Self::SerializeDocument { source, .. } => Some(source),
+            Self::OutputPathCaseKey { source, .. } => Some(source),
             Self::InvalidMutation { .. }
             | Self::InvalidOutputPath { .. }
             | Self::DuplicateOutputPath { .. }
@@ -2725,6 +2767,35 @@ impl RpgMakerWriteBackDocumentRewriteFailure {
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::ReportBug,
             ),
+            Self::OutputPathCaseKey { path, source } => match source {
+                WindowsOrdinalCaseKeyError::InputTooLarge { maximum, observed } => {
+                    SafeDiagnostic::new(
+                        DiagnosticCode::WriteBackRewrite,
+                        DiagnosticStage::WriteBack,
+                        DiagnosticSubject::path(path),
+                        DiagnosticReason::Resource {
+                            resource: "Windows 文件名 UTF-16 单元数".to_owned(),
+                            actual: *observed,
+                            maximum: Some(*maximum),
+                        },
+                        DiagnosticImpact::Unchanged,
+                        DiagnosticAction::ReportBug,
+                    )
+                }
+                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => SafeDiagnostic::io(
+                    DiagnosticCode::WriteBackRewrite,
+                    DiagnosticStage::WriteBack,
+                    DiagnosticSubject::path(path),
+                    "windows_ordinal_case_key",
+                    source,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                )
+                .with_recovery(RecoveryFact::component(format!(
+                    "windows_ordinal_case_key_phase={}",
+                    phase.as_str()
+                ))),
+            },
             Self::MissingChangedDocument { id } => SafeDiagnostic::new(
                 DiagnosticCode::WriteBackRewrite,
                 DiagnosticStage::WriteBack,
@@ -3801,6 +3872,32 @@ mod tests {
     }
 
     #[test]
+    fn comment_block_stops_before_a_408_with_a_different_indent() {
+        let list = json!([
+            {"code":108,"indent":3,"parameters":["<Tag:第一>"]},
+            {"code":408,"indent":4,"parameters":["<Tag:不属于当前块>"]},
+            {"code":408,"indent":3,"parameters":["<Tag:也不能跨越边界>"]},
+            {"code":0,"indent":3,"parameters":[]}
+        ]);
+        let list = list.as_array().expect("测试事件命令应为数组");
+        let location = RpgMakerLocation::comment_tag(
+            RpgMakerSource::map(7),
+            vec![
+                RpgMakerLocationStep::key("list"),
+                RpgMakerLocationStep::index(0),
+            ],
+            "Tag",
+            0,
+        );
+
+        assert_eq!(
+            comment_block_end(list, 0, &location).expect("首条 108 应形成有效注释块"),
+            1,
+            "不同 indent 的 408 必须立即终止当前 108 注释块"
+        );
+    }
+
+    #[test]
     fn applies_structural_mutations_in_descending_frozen_index_order() {
         let source = RpgMakerSource::map(7);
         let list_steps = vec![RpgMakerLocationStep::key("list")];
@@ -3810,7 +3907,7 @@ mod tests {
                 {"code":401,"indent":1,"parameters":["甲"],"lineUnknown":"A"},
                 {"code":401,"indent":2,"parameters":["乙"],"lineUnknown":"B"},
                 {"code":108,"indent":3,"parameters":["<Tag:旧"],"commentUnknown":"first"},
-                {"code":408,"indent":4,"parameters":["值><Tag:二>"],"commentUnknown":"continued"},
+                {"code":408,"indent":3,"parameters":["值><Tag:二>"],"commentUnknown":"continued"},
                 {"code":0,"indent":0,"parameters":[]}
             ],
             "unknown": {"kept": true}
@@ -4765,6 +4862,42 @@ mod tests {
     }
 
     #[test]
+    fn candidate_paths_reject_non_adjacent_windows_case_equivalent_duplicates() {
+        let files = ["data/Actors.json", "data/[.json", "data/actors.json"]
+            .into_iter()
+            .map(|path| RpgMakerRewrittenFile::new(path.into(), Vec::new()).unwrap())
+            .collect();
+
+        let error = RpgMakerRewrittenDocuments::new(project_name(), workspace_root(), files)
+            .expect_err("原始排序中不相邻的 Windows 等价路径也必须在领域边界失败");
+
+        assert!(matches!(
+            error,
+            RpgMakerWriteBackDocumentRewriteFailure::DuplicateOutputPath { path }
+                if path == Path::new("data/Actors.json")
+        ));
+    }
+
+    #[test]
+    fn candidate_path_identity_uses_windows_ordinal_kelvin_matrix() {
+        let distinct = ["data/K.json", "data/\u{212a}.json"]
+            .into_iter()
+            .map(|path| RpgMakerRewrittenFile::new(path.into(), Vec::new()).unwrap())
+            .collect();
+        RpgMakerRewrittenDocuments::new(project_name(), workspace_root(), distinct)
+            .expect("Kelvin 符号与 ASCII K 在 Windows ordinal 语义下可并存");
+
+        let duplicates = ["data/K.json", "data/k.json"]
+            .into_iter()
+            .map(|path| RpgMakerRewrittenFile::new(path.into(), Vec::new()).unwrap())
+            .collect();
+        assert!(matches!(
+            RpgMakerRewrittenDocuments::new(project_name(), workspace_root(), duplicates),
+            Err(RpgMakerWriteBackDocumentRewriteFailure::DuplicateOutputPath { .. })
+        ));
+    }
+
+    #[test]
     fn standard_data_at_4096_levels_parses_rewrites_serializes_and_drops_without_recursion() {
         const DEPTH: usize = 4_096;
         let mut source_text = "[".repeat(DEPTH);
@@ -4805,8 +4938,9 @@ mod tests {
         nested.push_str(&"]".repeat(DEPTH));
         let encoded_parameter =
             serde_json::to_string(&nested).expect("嵌套参数字符串应可编码为 JSON scalar");
+        let prefix = "// Generated by RPG Maker.\r\n// 原样保留  \r\n\r\n";
         let plugins_text = format!(
-            "var $plugins = [{{\"name\":\"Deep\",\"status\":true,\"parameters\":{{\"Config\":{encoded_parameter}}}}}];"
+            "{prefix}var $plugins = [{{\"name\":\"Deep\",\"status\":true,\"parameters\":{{\"Config\":{encoded_parameter}}}}}];"
         );
         let documents = parse_plugins_document_for_test(&plugins_text);
         let mut steps = Vec::with_capacity(DEPTH + 1);
@@ -4825,9 +4959,10 @@ mod tests {
 
         let plugin_file = file_text(&candidate, Path::new("js/plugins.js"));
         let plugin_json = plugin_file
-            .strip_prefix("var $plugins = ")
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_prefix("var $plugins = "))
             .and_then(|value| value.strip_suffix(";\n"))
-            .expect("插件候选应使用规范 assignment 外壳");
+            .expect("插件候选应逐字保留合法前缀并使用规范 assignment 外壳");
         let plugins = parse_json(plugin_json).expect("插件候选主体应是有效 JSON");
         let nested = plugins[0]["parameters"]["Config"]
             .as_str()

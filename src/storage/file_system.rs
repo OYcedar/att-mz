@@ -1693,6 +1693,10 @@ mod directory_stage_tests {
             "assets//catalog.json",
             "assets/catalog.json/",
             "assets/./catalog.json",
+            "assets/catalog.json.",
+            "assets/catalog.json ",
+            "assets/cache./catalog.json",
+            "assets/cache /catalog.json",
         ] {
             assert!(
                 ScopedDirectoryPath::new(PathBuf::from(path)).is_err(),

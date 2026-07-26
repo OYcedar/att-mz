@@ -115,10 +115,10 @@ segment      = one or more UTF-8 characters other than "/", "\\", ":" or control
 ```
 
 根必须小写。拒绝空字符串、绝对路径、反斜杠、空段、`.`、`..`、重复或尾随 `/`、冒号、
-控制字符和非 UTF-8。Host 从 `data`/`js` 根开始逐段解析，每个中间目录和最终文件/目录
-都必须与实际目录项逐字同大小写；请求 `data/items.json` 而实际为 `data/Items.json` 时
-抛出 `filesystem/case_mismatch`，不借助 Windows 大小写别名。真实不存在仍按具体操作
-返回既有 `filesystem/not_found`。
+控制字符、非 UTF-8，以及任一路径段末尾的点或空格。Host 从 `data`/`js` 根开始逐段解析，
+每个中间目录和最终文件/目录都必须与实际目录项逐字同大小写；请求
+`data/items.json` 而实际为 `data/Items.json` 时抛出 `filesystem/case_mismatch`，不借助
+Windows 大小写别名。真实不存在仍按具体操作返回既有 `filesystem/not_found`。
 
 <!-- att-example: valid -->
 ```lua
@@ -228,8 +228,9 @@ NoteTag 与 CommentTag 只识别简单 `<name:value>`：第一个冒号分隔名
 参数不能为空，不能含 `<`、`>`、`:`。
 
 `note_tag` 的 container 指向含 string `note` 的 object。`comment_tag` 的 command path
-必须指向一条 code 108；Host 将它与紧随的连续 code 408 的 `parameters[0]` 用 LF 拼接，
-再定位标签。WriteBack 使用同一 108+408 recipe 和 occurrence。
+必须指向一条带整数 indent 的 code 108；Host 只把紧随、code 408 且 indent 与起始 108
+相同的命令纳入当前注释块，并将其 `parameters[0]` 用 LF 拼接后定位标签。不同 indent
+立即结束当前块；WriteBack 使用同一 108+408 边界、recipe 和 occurrence。
 
 两种路径都可以包含一个或多个 `DECODE_JSON`。WriteBack 会沿相同路径逐层解码，完成全部
 类型、occurrence 和冻结原文验收后，再从内向外编码为紧凑 JSON string；任一层失败都不会

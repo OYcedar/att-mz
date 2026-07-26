@@ -13,6 +13,7 @@ pub(crate) mod lua;
 pub(crate) mod model;
 pub(crate) mod mutation_claim_summary;
 pub(crate) mod placeholder_token;
+pub(crate) mod plugin_document;
 pub(crate) mod project;
 pub(crate) mod project_database;
 pub(crate) mod project_lease;

@@ -17,6 +17,7 @@ mod rpg_maker;
 mod runtime;
 mod storage;
 mod user_text;
+mod windows_path;
 
 /// 运行 ATT 的生产进程入口。
 pub fn run_process() -> std::process::ExitCode {

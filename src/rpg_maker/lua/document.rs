@@ -5,6 +5,9 @@ use std::fmt;
 
 use crate::rpg_maker::lua::json::{LosslessJsonError, LosslessJsonValue, decode as decode_json};
 use crate::rpg_maker::model::MutationClaim;
+use crate::rpg_maker::plugin_document::{
+    PluginsEnvelopeFailure, parse_plugins_envelope, validate_plugins_root_is_array,
+};
 use crate::rpg_maker::tag::simple_tag_spans;
 use crate::rpg_maker::text::{
     DataFileName, DataFileNameError, MapId, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
@@ -120,6 +123,7 @@ impl OpenedRpgMakerDocument {
         };
         let mut lines = Vec::new();
         let mut backing_values = Vec::new();
+        let mut start_indent = None;
         for (relative, command) in commands.iter().skip(*start_index).enumerate() {
             let LosslessJsonValue::Object(fields) = command else {
                 if relative == 0 {
@@ -139,6 +143,16 @@ impl OpenedRpgMakerDocument {
                     return Err(RpgMakerDocumentError::ExpectedCommentStart);
                 }
                 break;
+            }
+            let Some(indent) = object_get(fields, "indent").and_then(json_integer) else {
+                return Err(RpgMakerDocumentError::ExpectedCommandIndent);
+            };
+            if let Some(start_indent) = start_indent {
+                if indent != start_indent {
+                    break;
+                }
+            } else {
+                start_indent = Some(indent);
             }
             let Some(LosslessJsonValue::Array(parameters)) = object_get(fields, "parameters")
             else {
@@ -355,25 +369,11 @@ impl ResolvedValue<'_> {
 }
 
 fn decode_plugins_envelope(text: &str) -> Result<LosslessJsonValue, RpgMakerDocumentError> {
-    let Some((prefix, assignment)) = text.split_once("var $plugins") else {
-        return Err(RpgMakerDocumentError::InvalidPluginsEnvelope);
-    };
-    if !prefix
-        .lines()
-        .all(|line| line.trim().is_empty() || line.trim_start().starts_with("//"))
-    {
-        return Err(RpgMakerDocumentError::InvalidPluginsEnvelope);
-    }
-    let Some(json_with_terminator) = assignment.trim_start().strip_prefix('=') else {
-        return Err(RpgMakerDocumentError::InvalidPluginsEnvelope);
-    };
-    let Some(json) = json_with_terminator.trim().strip_suffix(';') else {
-        return Err(RpgMakerDocumentError::InvalidPluginsEnvelope);
-    };
-    let value = decode_json(json.trim()).map_err(RpgMakerDocumentError::InvalidJson)?;
-    if !matches!(value, LosslessJsonValue::Array(_)) {
-        return Err(RpgMakerDocumentError::InvalidPluginsEnvelope);
-    }
+    let envelope = parse_plugins_envelope(text)
+        .map_err(|failure| RpgMakerDocumentError::InvalidPluginsEnvelope { failure })?;
+    let value = decode_json(envelope.json()).map_err(RpgMakerDocumentError::InvalidJson)?;
+    validate_plugins_root_is_array(matches!(value, LosslessJsonValue::Array(_)))
+        .map_err(|failure| RpgMakerDocumentError::InvalidPluginsEnvelope { failure })?;
     Ok(value)
 }
 
@@ -384,7 +384,9 @@ fn select_plugin_parameter(
     parameter_name: &str,
 ) -> Result<LosslessJsonValue, RpgMakerDocumentError> {
     let LosslessJsonValue::Array(plugins) = plugins else {
-        return Err(RpgMakerDocumentError::InvalidPluginsEnvelope);
+        return Err(RpgMakerDocumentError::InvalidPluginsEnvelope {
+            failure: PluginsEnvelopeFailure::RootType,
+        });
     };
     let Some(LosslessJsonValue::Object(plugin)) = plugins.get(plugin_index) else {
         return Err(RpgMakerDocumentError::PluginIndexMissing);
@@ -454,7 +456,7 @@ pub(crate) enum RpgMakerDocumentError {
     InvalidUtf8,
     InvalidJson(LosslessJsonError),
     InvalidNestedJson(LosslessJsonError),
-    InvalidPluginsEnvelope,
+    InvalidPluginsEnvelope { failure: PluginsEnvelopeFailure },
     PluginIndexMissing,
     PluginNameMissing,
     PluginNameMismatch,
@@ -471,6 +473,7 @@ pub(crate) enum RpgMakerDocumentError {
     ExpectedCommandList,
     ExpectedCommandObject,
     ExpectedCommandCode,
+    ExpectedCommandIndent,
     ExpectedCommentStart,
     ExpectedCommandParameters,
     ExpectedCommentLine,
@@ -492,7 +495,7 @@ impl RpgMakerDocumentError {
             | Self::PluginParameterMissing => "invalid_plugin_parameter_source",
             Self::InvalidUtf8 => "invalid_utf8",
             Self::InvalidJson(_) | Self::InvalidNestedJson(_) => "invalid_json",
-            Self::InvalidPluginsEnvelope => "invalid_plugins_envelope",
+            Self::InvalidPluginsEnvelope { .. } => "invalid_plugins_envelope",
             Self::ExpectedObject
             | Self::ExpectedArray
             | Self::MissingObjectKey
@@ -504,6 +507,7 @@ impl RpgMakerDocumentError {
             | Self::ExpectedCommandList
             | Self::ExpectedCommandObject
             | Self::ExpectedCommandCode
+            | Self::ExpectedCommandIndent
             | Self::ExpectedCommentStart
             | Self::ExpectedCommandParameters
             | Self::ExpectedCommentLine => "invalid_location",
@@ -527,9 +531,10 @@ impl fmt::Display for RpgMakerDocumentError {
             Self::InvalidNestedJson(error) => {
                 write!(formatter, "RPG Maker JSON 字符串不是有效 JSON：{error}")
             }
-            Self::InvalidPluginsEnvelope => {
-                formatter.write_str("文档不是 RPG Maker 生成的 plugins.js 格式")
-            }
+            Self::InvalidPluginsEnvelope { failure } => write!(
+                formatter,
+                "文档不是 RPG Maker 生成的 plugins.js 格式：{failure}"
+            ),
             Self::PluginIndexMissing => formatter.write_str("plugins.js 中不存在指定插件索引"),
             Self::PluginNameMissing => formatter.write_str("plugins.js 插件记录缺少字符串 name"),
             Self::PluginNameMismatch => formatter.write_str("plugins.js 指定索引的插件名称不匹配"),
@@ -556,6 +561,9 @@ impl fmt::Display for RpgMakerDocumentError {
             }
             Self::ExpectedCommandObject => formatter.write_str("RPG Maker 事件指令不是对象"),
             Self::ExpectedCommandCode => formatter.write_str("RPG Maker 事件指令 code 不是整数"),
+            Self::ExpectedCommandIndent => {
+                formatter.write_str("RPG Maker 注释指令 indent 不是整数")
+            }
             Self::ExpectedCommentStart => {
                 formatter.write_str("RPG Maker 注释起始指令 code 不是 108")
             }
@@ -618,7 +626,7 @@ mod tests {
     fn resolves_contiguous_108_408_comment_tags() {
         let document = OpenedRpgMakerDocument::open(
             RpgMakerSource::map(1),
-            r#"{"list":[{"code":108,"parameters":["<Quest:第一"]},{"code":408,"parameters":["行>"]},{"code":0,"parameters":[]}] }"#.as_bytes(),
+            r#"{"list":[{"code":108,"indent":2,"parameters":["<Quest:第一"]},{"code":408,"indent":2,"parameters":["行>"]},{"code":0,"indent":2,"parameters":[]}] }"#.as_bytes(),
         )
         .unwrap();
         let reference = document
@@ -632,6 +640,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reference.original(), "第一\n行");
+    }
+
+    #[test]
+    fn comment_tag_stops_before_a_408_with_a_different_indent() {
+        let document = OpenedRpgMakerDocument::open(
+            RpgMakerSource::map(1),
+            r#"{"list":[{"code":108,"indent":1,"parameters":["<Quest:第一>"]},{"code":408,"indent":2,"parameters":["<Quest:错误续行>"]},{"code":0,"indent":1,"parameters":[]}] }"#.as_bytes(),
+        )
+        .unwrap();
+
+        let first = document
+            .comment_tag(
+                &[
+                    RpgMakerLocationStep::key("list"),
+                    RpgMakerLocationStep::index(0),
+                ],
+                "Quest",
+                0,
+            )
+            .expect("108 自身的标签应可读取");
+        assert_eq!(first.original(), "第一");
+        let MutationClaim::CommentTag { backing_values, .. } = first.mutation_claim() else {
+            panic!("CommentTag 引用必须携带完整 backing");
+        };
+        assert_eq!(backing_values.len(), 1);
+        assert_eq!(
+            document.comment_tag(
+                &[
+                    RpgMakerLocationStep::key("list"),
+                    RpgMakerLocationStep::index(0),
+                ],
+                "Quest",
+                1,
+            ),
+            Err(RpgMakerDocumentError::TagNotFound),
+            "不同 indent 的 408 不属于当前 108 注释块"
+        );
     }
 
     #[test]
@@ -651,6 +696,26 @@ var $plugins = [{"name":"Other","parameters":{}},{"name":"Quest","parameters":{"
             ])
             .unwrap();
         assert_eq!(text.original(), "任务");
+    }
+
+    #[test]
+    fn plugin_open_reports_the_shared_envelope_failure_fact() {
+        let source = || RpgMakerSource::plugin_parameter(0, "Quest", "Entries");
+        for (text, expected) in [
+            ("const plugins = [];", PluginsEnvelopeFailure::Declaration),
+            (
+                "/* unsupported */\nvar $plugins = [];",
+                PluginsEnvelopeFailure::Prefix,
+            ),
+            ("var $plugins [];", PluginsEnvelopeFailure::Assignment),
+            ("var $plugins = []", PluginsEnvelopeFailure::Terminator),
+            ("var $plugins = {};", PluginsEnvelopeFailure::RootType),
+        ] {
+            assert_eq!(
+                OpenedRpgMakerDocument::open(source(), text.as_bytes()),
+                Err(RpgMakerDocumentError::InvalidPluginsEnvelope { failure: expected })
+            );
+        }
     }
 
     #[test]
