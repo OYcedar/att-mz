@@ -302,6 +302,7 @@ task-record-rejection-reason = { $code ->
     [unexpected_placeholder] عنصر نائب غير متوقع: { $detail }
     [placeholder_normalization_ambiguous] تطبيع العنصر النائب ملتبس: { $detail }
     [source_residual] اكتُشف نص متبقٍ من لغة المصدر: { $detail }
+    [tag_value_contains_closing_delimiter] يحتوي السطر { $line } على '>' الذي سيغلق قيمة الوسم مبكرًا
    *[other] { $detail }
 }
 task-record-protocol-detail = { $code ->

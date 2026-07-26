@@ -223,12 +223,17 @@ fn render_command_report(
         (CommandRunResult::Interrupted, Some(shutdown)) => {
             let warning = pending_project_log.and_then(PendingProjectLog::finish);
             render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+            // 取消事实与清理失败并列呈现，清理错误不吞掉“已取消”这一终态。
+            let _ = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
             let _ = CommandResultRenderer::render_failure(None, Some(&shutdown), localizer, stderr);
             ExitCode::FAILURE
         }
-        (CommandRunResult::Succeeded(_), Some(shutdown)) => {
+        (CommandRunResult::Succeeded(output), Some(shutdown)) => {
             let warning = pending_project_log.and_then(PendingProjectLog::finish);
             render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
+            // 业务结果已生效：先完整呈现成功输出，再报告收尾失败，
+            // 清理错误不得覆盖业务成功事实。
+            let _ = CommandResultRenderer::render_success(output, localizer, stdout);
             let _ = CommandResultRenderer::render_applied_finalization_failure(
                 &shutdown, localizer, stderr,
             );

@@ -188,7 +188,11 @@ Value/Lines 形状必须符合角色：
 - `free line breaking` Scalar `Value` 可由多模型行组成，最终以 LF 连接；源值含 LF 时
   必须采用该形状；
 - Choices 和严格 ScrollingText 必须与源 Lines 按槽对齐并保持空槽；
-- 每个结构行拒绝 CR、LF、NUL 和非法空白形状。
+- 每个结构行拒绝 CR、LF、NUL 和非法空白形状；
+- 写回目标为 note/comment `<name:value>` 标签值的单元额外拒绝含 `>` 的译文
+  （`tag_value_contains_closing_delimiter`）：标签值按字节区间逐字写回，`>` 会提前
+  闭合标签并把余文泄漏为容器正文。原文由提取协议保证不含 `>`，该规则不拒绝任何
+  可往返的合法译文。
 
 候选随后执行：BOM/全空白检查、ATT token 数量与对齐检查、占位符无歧义恢复、目标自然
 语言检查、源语残留分析及当前语言模块允许的修复。失败仅拒绝相应候选并形成结构化

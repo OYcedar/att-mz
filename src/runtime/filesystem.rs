@@ -890,7 +890,9 @@ impl FileWorkPool {
             .map_err(|_| SystemFileSystemError::WorkerPanicked)
     }
 
-    /// 接收业务取消后仍需完成的终态可观测性工作。
+    /// 接收业务取消后仍需运行至终态的工作：终态可观测性提交，以及按值接管已准备
+    /// 目录 token 的 publish/discard——token 一旦交付就必须由本次执行走到终态，
+    /// 否则取消窗口内的正常清理会以“token 未经 publish/discard 丢弃”告终。
     ///
     /// 该入口只绕过 `cancel_waits`，仍受同一个执行许可和 `shutdown` 的关闭边界约束。
     async fn execute_terminal<T, F>(&self, work: F) -> Result<T, SystemFileSystemError>
@@ -1877,9 +1879,11 @@ impl RecoverableDirectoryPublisher for SystemDirectoryPublisher {
         let expected_identity = Arc::clone(&self.publisher_identity);
         let performance = Arc::clone(&self.inner.performance);
         let target_root = staged.target_root().to_path_buf();
+        // publish 按值接管已准备目录 token，必须运行至终态；取消只阻止新工作进入，
+        // 不阻止已交付 token 的收尾，否则取消窗口内的发布会以 token 弃置断言告终。
         self.inner
             .pool
-            .execute("publish_directory", &target_root, move || {
+            .execute_terminal(move || {
                 publish_directory_sync(staged, &expected_identity, &performance)
             })
             .await
@@ -1896,11 +1900,10 @@ impl RecoverableDirectoryPublisher for SystemDirectoryPublisher {
     ) -> Result<(), DirectoryDiscardError<Self::Error>> {
         let expected_identity = Arc::clone(&self.publisher_identity);
         let staging_root = staged.staging_root().to_path_buf();
+        // discard 与 publish 同理：token 已交付，取消后仍必须完成候选清理。
         self.inner
             .pool
-            .execute("discard_directory", &staging_root, move || {
-                discard_directory_sync(staged, &expected_identity)
-            })
+            .execute_terminal(move || discard_directory_sync(staged, &expected_identity))
             .await
             .map_err(|source| DirectoryDiscardError::new(staging_root.clone(), Box::new(source)))?
             .map_err(|source| DirectoryDiscardError::new(staging_root, Box::new(source)))
@@ -7543,6 +7546,68 @@ mod tests {
         owner.discard(staged).await.expect("应该可丢弃所有者候选");
         contender.shutdown().await.expect("竞争根应可终结");
         owner.shutdown().await.expect("所有者根应可终结");
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_does_not_reject_discard_of_a_prepared_candidate() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).expect("应该可创建来源目录");
+        fs::write(source.join("value.txt"), b"content").expect("应该可写入来源文件");
+        let target = temporary.path().join("target");
+        let root = TestDirectoryPublisher::new(file_system_config());
+
+        let staged = root
+            .prepare(stage_request(
+                target,
+                source,
+                DirectoryPublishIntent::CreateNew,
+            ))
+            .await
+            .expect("候选应可准备");
+        let staging_root = staged.staging_root().to_path_buf();
+
+        // 业务取消后，已交付 token 的 discard 必须仍运行至终态并清理候选，
+        // 而不是被取消门拒绝后弃置 token。
+        root.file_system.cancel_waits();
+        root.discard(staged)
+            .await
+            .expect("取消后 discard 仍应完成候选清理");
+        assert!(
+            !staging_root.exists(),
+            "取消后 discard 应删除已准备的候选目录"
+        );
+        root.shutdown().await.expect("根应可终结");
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_does_not_reject_publish_of_a_prepared_candidate() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).expect("应该可创建来源目录");
+        fs::write(source.join("value.txt"), b"content").expect("应该可写入来源文件");
+        let target = temporary.path().join("target");
+        let root = TestDirectoryPublisher::new(file_system_config());
+
+        let staged = root
+            .prepare(stage_request(
+                target.clone(),
+                source,
+                DirectoryPublishIntent::CreateNew,
+            ))
+            .await
+            .expect("候选应可准备");
+
+        // publish 与 discard 同理：取消只阻止新工作进入，不阻止已交付 token 的收尾。
+        root.file_system.cancel_waits();
+        root.publish(staged)
+            .await
+            .expect("取消后 publish 仍应运行至终态");
+        assert_eq!(
+            fs::read(target.join("snapshot/content/value.txt")).expect("发布结果应可读取"),
+            b"content"
+        );
+        root.shutdown().await.expect("根应可终结");
     }
 
     #[tokio::test]

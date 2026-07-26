@@ -1896,6 +1896,13 @@ fn validate_translation_lines(
     }) {
         return Err(TranslationUnitRejectionReason::InvalidLineText { line_index });
     }
+    if identity.targets_tag_value()
+        && let Some(line_index) = lines.iter().position(|line| line.contains('>'))
+    {
+        return Err(
+            TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index },
+        );
+    }
     match shape {
         ExpectedLineShape::Reflow => {
             if lines.iter().all(|line| line.trim().is_empty()) {
@@ -4318,6 +4325,76 @@ mod tests {
                 TranslationUnitRejectionReason::InvalidLineText { line_index: 0 }
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn response_processor_rejects_closing_delimiter_in_tag_value_translations() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+
+        let rejected = processor
+            .process(
+                &line_task(
+                    tag_value_identity(),
+                    ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                    line_content_analysis(&["炎の剣の説明"]),
+                ),
+                LlmResponse::new(
+                    r#"{"1":["炎之剑<强化>说明"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-tag-value".to_owned()),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("标签值译文含 '>' 属于当前 ID 的正常拒绝");
+        assert!(matches!(
+            rejected.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index: 0 }
+        ));
+
+        // 普通 Value 单元不受标签值约束：同样含 '>' 的译文照常进入语言验收流程。
+        let accepted = processor
+            .process(
+                &line_task(
+                    reflow_value_identity(),
+                    ExpectedLineShape::Reflow,
+                    line_content_analysis(&["炎の剣。", "装備すると攻撃力が上がる。"]),
+                ),
+                LlmResponse::new(
+                    r#"{"1":["炎之剑>装备后攻击力上升。"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-plain-value".to_owned()),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("普通 Value 译文应正常处理");
+        assert!(!matches!(
+            &accepted,
+            TranslationTaskOutcome::Unavailable { .. }
+        ));
+    }
+
+    fn tag_value_identity() -> TranslationUnitIdentity {
+        let group = RpgMakerLocation::note_tag(
+            RpgMakerSource::data(StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+            "Help",
+            0,
+        );
+        TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            group,
+            TextUnitRole::Scalar(ScalarFieldKey::new("note_tag").expect("字段键应合法")),
+            TextUnitContent::Value("炎の剣の説明".to_owned()),
+            "{}",
+        )
     }
 
     #[test]

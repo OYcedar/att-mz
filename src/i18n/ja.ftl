@@ -281,6 +281,7 @@ task-record-rejection-reason = { $code ->
     [unexpected_placeholder] 未知のプレースホルダー：{ $detail }
     [placeholder_normalization_ambiguous] プレースホルダーの正規化が曖昧です：{ $detail }
     [source_residual] 原文言語の残留を検出：{ $detail }
+    [tag_value_contains_closing_delimiter] 行 { $line } にタグ値を早期に閉じる '>' が含まれています
    *[other] { $detail }
 }
 task-record-protocol-detail = { $code ->

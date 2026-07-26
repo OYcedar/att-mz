@@ -354,7 +354,8 @@ fn rejection_code(
             | TranslationUnitRejectionReason::InvalidShape { .. }
             | TranslationUnitRejectionReason::LineCountMismatch { .. }
             | TranslationUnitRejectionReason::InvalidLineText { .. }
-            | TranslationUnitRejectionReason::BlankLineMismatch { .. } => {
+            | TranslationUnitRejectionReason::BlankLineMismatch { .. }
+            | TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { .. } => {
                 Err(TrustedLuaHostCallError::new(
                     "translation",
                     "internal_invariant",

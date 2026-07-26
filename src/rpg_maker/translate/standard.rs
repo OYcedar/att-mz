@@ -176,6 +176,17 @@ impl TranslationUnitIdentity {
         self.logical_location.group_location()
     }
 
+    /// 写回目标是否为 `<name:value>` 标签值。
+    ///
+    /// 标签值由提取协议保证不含 `>`；写回按字节区间拼接替换值，译文一旦引入
+    /// `>` 就会提前闭合标签并把余文泄漏为 note/comment 正文,因此验收必须拒绝。
+    pub(crate) fn targets_tag_value(&self) -> bool {
+        matches!(
+            self.group_location(),
+            RpgMakerLocation::NoteTag { .. } | RpgMakerLocation::CommentTag { .. }
+        )
+    }
+
     pub(crate) fn source_content(&self) -> &TextUnitContent {
         &self.source_content
     }
@@ -1234,6 +1245,11 @@ pub(crate) enum TranslationUnitRejectionReason {
     },
     SourceResidual {
         fragment: String,
+    },
+    /// 写回目标是 `<name:value>` 标签值：译文含 `>` 会提前闭合标签并破坏
+    /// note/comment 的标签协议，必须整单元拒绝。
+    TagValueContainsClosingDelimiter {
+        line_index: usize,
     },
 }
 
