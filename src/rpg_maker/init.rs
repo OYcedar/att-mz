@@ -615,29 +615,23 @@ where
             ("source", DirectoryEntryKind::Directory),
             ("write_back", DirectoryEntryKind::Directory),
         ],
-        true,
     )];
     if let Some(content_directory) = layout.rpg_maker_layout().content_directory() {
         for root in [layout.source_root(), layout.write_back_root()] {
             expectations.push((
                 root.to_path_buf(),
                 vec![(content_directory, DirectoryEntryKind::Directory)],
-                false,
             ));
-            expectations.push((root.join(content_directory), data_and_js.clone(), false));
+            expectations.push((root.join(content_directory), data_and_js.clone()));
         }
     } else {
         expectations.extend([
-            (
-                layout.source_root().to_path_buf(),
-                data_and_js.clone(),
-                false,
-            ),
-            (layout.write_back_root().to_path_buf(), data_and_js, false),
+            (layout.source_root().to_path_buf(), data_and_js.clone()),
+            (layout.write_back_root().to_path_buf(), data_and_js),
         ]);
     }
 
-    for (root, expected_children, is_workspace_root) in expectations {
+    for (root, required_children) in expectations {
         let children = match file_system.list_directory(root.clone()).await {
             Ok(children) => children,
             Err(ListDirectoryError::NotFound { .. } | ListDirectoryError::NotDirectory { .. }) => {
@@ -645,22 +639,7 @@ where
             }
             Err(error @ ListDirectoryError::Io { .. }) => return Err(error),
         };
-        let matches = if is_workspace_root {
-            has_required_and_optional_child_names(
-                &children,
-                &expected_children,
-                &[
-                    ("logs", DirectoryEntryKind::Directory),
-                    ("task-records", DirectoryEntryKind::Directory),
-                    ("project.db-journal", DirectoryEntryKind::RegularFile),
-                    ("project.db-wal", DirectoryEntryKind::RegularFile),
-                    ("project.db-shm", DirectoryEntryKind::RegularFile),
-                ],
-            )
-        } else {
-            has_exact_child_names(&children, &expected_children)
-        };
-        if !matches {
+        if !has_required_child_names(&children, &required_children) {
             return Ok(false);
         }
     }
@@ -719,33 +698,13 @@ where
     ) == 1)
 }
 
-fn has_exact_child_names(
-    children: &[DirectoryEntry],
-    expected: &[(&str, DirectoryEntryKind)],
-) -> bool {
-    has_required_and_optional_child_names(children, expected, &[])
-}
-
-fn has_required_and_optional_child_names(
+fn has_required_child_names(
     children: &[DirectoryEntry],
     required: &[(&str, DirectoryEntryKind)],
-    optional: &[(&str, DirectoryEntryKind)],
 ) -> bool {
-    children.iter().all(|child| {
-        child.resolved_path().file_name().is_some_and(|name| {
-            required
-                .iter()
-                .chain(optional)
-                .any(|(expected_name, expected_kind)| {
-                    name == *expected_name && child.kind() == *expected_kind
-                })
-        })
-    }) && required
+    required
         .iter()
         .all(|expected| count_child(children, *expected) == 1)
-        && optional
-            .iter()
-            .all(|expected| count_child(children, *expected) <= 1)
 }
 
 fn count_child(children: &[DirectoryEntry], expected: (&str, DirectoryEntryKind)) -> usize {
@@ -2729,6 +2688,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_replace_ignores_then_discards_unknown_entries_and_preserves_observability() {
+        let temporary = tempfile::tempdir().expect("应建立真实文件系统临时目录");
+        let workspace = temporary.path().join("workspace");
+        for directory in [
+            "source/data",
+            "source/js",
+            "write_back/data",
+            "write_back/js",
+            "source/unknown-directory",
+            "logs/nested/空目录",
+            "task-records/人工补译",
+        ] {
+            fs::create_dir_all(workspace.join(directory)).expect("应建立现有工作区目录");
+        }
+        fs::write(workspace.join("project.db"), b"old database").expect("应建立项目数据库");
+        fs::write(workspace.join("unknown-root.bin"), b"discard me").expect("应建立未知根文件");
+        fs::write(
+            workspace.join("source/unknown-directory/value.bin"),
+            b"discard nested",
+        )
+        .expect("应建立未知 source 条目");
+        fs::write(workspace.join("write_back/obsolete.bin"), b"discard output")
+            .expect("应建立未知 write_back 条目");
+        fs::write(workspace.join("logs/zero.jsonl"), []).expect("应建立零字节日志");
+        let log_bytes = [0, 0xff, 0x80, b'\n'];
+        fs::write(workspace.join("logs/nested/raw.bin"), log_bytes).expect("应建立二进制日志");
+        let task_bytes = "人工补译记录\n".as_bytes();
+        fs::write(
+            workspace.join("task-records/人工补译/任务一.md"),
+            task_bytes,
+        )
+        .expect("应建立 Unicode 任务记录");
+
+        let replacement_data = temporary.path().join("replacement-data");
+        let replacement_js = temporary.path().join("replacement-js");
+        fs::create_dir(&replacement_data).expect("应建立替换 data");
+        fs::create_dir(&replacement_js).expect("应建立替换 js");
+        fs::write(replacement_data.join("Actors.json"), b"[]").expect("应建立替换数据");
+        fs::write(replacement_js.join("rmmz_core.js"), b"new core").expect("应建立替换脚本");
+
+        let file_system =
+            SystemFileSystem::new(SystemFileSystemConfig::production()).expect("应建立文件系统根");
+        let layout =
+            ProjectWorkspaceLayout::from_workspace_root(workspace.clone(), RpgMakerLayout::MZ);
+        assert!(
+            observe_required_workspace_structure(&file_system, &layout)
+                .await
+                .expect("应列举真实工作区"),
+            "未知条目不得使必需结构失效"
+        );
+
+        let publisher = file_system.directory_publisher(
+            DirectoryPublisherConfig::production(temporary.path().join("locks"))
+                .expect("锁目录配置应合法"),
+        );
+        let request = DirectoryStageRequest::new(
+            workspace.clone(),
+            DirectoryPublishIntent::ReplaceExisting,
+            vec![
+                DirectorySourceMapping::new(replacement_data, PathBuf::from("source/data"))
+                    .expect("data 映射应合法"),
+                DirectorySourceMapping::new(replacement_js, PathBuf::from("source/js"))
+                    .expect("js 映射应合法"),
+            ],
+            Vec::new(),
+            ["write_back/data", "write_back/js", "logs", "task-records"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+        )
+        .expect("替换候选请求应合法");
+        let staged = publisher.prepare(request).await.expect("应准备替换候选");
+        let scope = ScopedDirectoryScope::new(
+            PRESERVED_OBSERVABILITY_DIRECTORIES
+                .iter()
+                .map(OsString::from),
+        )
+        .expect("保留范围应合法");
+        let bound = publisher
+            .bind_scoped_directory(&staged, scope)
+            .await
+            .expect("应绑定保留目录");
+        preserve_observability_directories(
+            &file_system,
+            &publisher,
+            &workspace,
+            &bound,
+            &PRESERVED_OBSERVABILITY_DIRECTORIES,
+        )
+        .await
+        .expect("可观测性目录应进入替换候选");
+        fs::write(staged.staging_root().join("project.db"), b"new database")
+            .expect("应建立候选项目数据库");
+
+        publisher.publish(staged).await.expect("真实替换应发布");
+
+        assert!(!workspace.join("unknown-root.bin").exists());
+        assert!(!workspace.join("source/unknown-directory").exists());
+        assert!(!workspace.join("write_back/obsolete.bin").exists());
+        assert_eq!(
+            fs::read(workspace.join("source/data/Actors.json")).expect("替换数据应可读"),
+            b"[]"
+        );
+        assert!(workspace.join("logs/nested/空目录").is_dir());
+        assert_eq!(
+            fs::read(workspace.join("logs/zero.jsonl")).expect("零字节日志应可读"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            fs::read(workspace.join("logs/nested/raw.bin")).expect("二进制日志应可读"),
+            log_bytes
+        );
+        assert_eq!(
+            fs::read(workspace.join("task-records/人工补译/任务一.md"))
+                .expect("Unicode 任务记录应可读"),
+            task_bytes
+        );
+        file_system.shutdown().await.expect("文件系统根应终结");
+    }
+
+    #[tokio::test]
     async fn observability_list_read_and_write_failures_discard_once_without_publish() {
         for failure in [
             PreservationFailure::List,
@@ -2856,16 +2936,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_exact_workspace_structure_is_repaired_even_when_requested_facts_match() {
+    async fn missing_or_wrong_required_workspace_structure_is_repaired() {
         for structure in [
-            WorkspaceStructureObservation::SqliteSidecarNotFile,
             WorkspaceStructureObservation::DatabaseNotFile,
             WorkspaceStructureObservation::SourceNotDirectory,
             WorkspaceStructureObservation::SourceDataNotDirectory,
             WorkspaceStructureObservation::WriteBackDataNotDirectory,
-            WorkspaceStructureObservation::ExtraWorkspaceEntry,
-            WorkspaceStructureObservation::ExtraSourceEntry,
-            WorkspaceStructureObservation::ExtraWriteBackEntry,
             WorkspaceStructureObservation::MissingSourceEntry,
             WorkspaceStructureObservation::WriteBackNotDirectory,
         ] {
@@ -2898,6 +2974,43 @@ mod tests {
                 !observations.events().contains(&"fingerprint_existing"),
                 "结构不完整时不应把其内容身份当作可复用事实：{structure:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_workspace_entries_do_not_trigger_rebuild() {
+        for structure in [
+            WorkspaceStructureObservation::SqliteSidecarNotFile,
+            WorkspaceStructureObservation::ExtraWorkspaceEntry,
+            WorkspaceStructureObservation::ExtraSourceEntry,
+            WorkspaceStructureObservation::ExtraWriteBackEntry,
+        ] {
+            let current = database_state(0x55, Vec::new());
+            let (service, observations) = service(
+                true,
+                structure,
+                ExistingSourceObservation::Fingerprint([0x55; 32]),
+                0x55,
+                Ok(current.clone()),
+                Ok(ProjectDatabaseReconciliation::for_test(current)),
+                Ok(()),
+            );
+
+            let outcome = service
+                .converge(request())
+                .await
+                .unwrap_or_else(|error| panic!("{structure:?} 应被忽略：{error}"));
+
+            assert_eq!(
+                outcome,
+                OperationCompletion::Completed(ProjectWorkspaceConvergence::Unchanged),
+                "{structure:?}"
+            );
+            let events = observations.events();
+            assert!(events.contains(&"fingerprint_existing"), "{structure:?}");
+            assert!(!events.contains(&"prepare"), "{structure:?}");
+            assert!(!events.contains(&"publish"), "{structure:?}");
+            assert!(!events.contains(&"discard"), "{structure:?}");
         }
     }
 
