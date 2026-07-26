@@ -1025,14 +1025,16 @@ mod tests {
 
     #[test]
     fn zero_total_never_renders_zero_over_zero() {
-        for (mode, terminal) in [(ProgressMode::Plain, false), (ProgressMode::Auto, true)] {
-            let writer = SharedWriter::default();
-            let output = writer.clone();
-            let progress = TerminalProgress::with_writer(mode, terminal, writer, phase_label);
-            progress.observe(ProgressSnapshot::determinate(Phase::Translating, 0, 0));
-            thread::sleep(Duration::from_millis(15));
-            progress.finish();
-            let text = output.text();
+        let mut state = RendererState::new();
+        assert!(
+            state
+                .accept_snapshot(ProgressSnapshot::determinate(Phase::Translating, 0, 0))
+                .accepted
+        );
+
+        for spinner_frame in [None, Some(0)] {
+            let text =
+                render_active_line(&phase_label, &state, spinner_frame).expect("零工作量仍有阶段");
             assert!(!text.contains("0/0"), "零工作量不得伪造比例：{text:?}");
             assert!(text.contains("翻译"), "零工作量仍可呈现阶段：{text:?}");
         }
