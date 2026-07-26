@@ -529,28 +529,104 @@ pub(crate) enum UiMessage<'a> {
     },
     DiagnosticStageValue {
         code: &'a str,
-        fallback: &'a str,
     },
     DiagnosticImpactValue {
         code: &'a str,
-        fallback: &'a str,
     },
     DiagnosticActionValue {
         code: &'a str,
-        fallback: &'a str,
     },
     DiagnosticFailureValue {
         code: &'a str,
-        fallback: &'a str,
     },
     DiagnosticIoKindValue {
         code: &'a str,
-        fallback: &'a str,
     },
     DiagnosticConfigurationRuleValue {
         code: &'a str,
-        fallback: &'a str,
-        facts: &'a str,
+        line: u64,
+        column: u64,
+        actual: u64,
+        maximum: u64,
+    },
+    DiagnosticIoReason {
+        operation: &'a str,
+        kind: &'a str,
+    },
+    DiagnosticIoReasonWithOsCode {
+        operation: &'a str,
+        kind: &'a str,
+        os_code: &'a str,
+    },
+    DiagnosticIoReasonWithSystemMessage {
+        operation: &'a str,
+        kind: &'a str,
+        system_message: &'a str,
+    },
+    DiagnosticIoReasonWithOsCodeAndSystemMessage {
+        operation: &'a str,
+        kind: &'a str,
+        os_code: &'a str,
+        system_message: &'a str,
+    },
+    DiagnosticFailureWithDetail {
+        failure: &'a str,
+        detail: &'a str,
+    },
+    DiagnosticInvalidUtf8 {
+        valid_up_to: u64,
+        error_len: u64,
+    },
+    DiagnosticIncompleteUtf8 {
+        valid_up_to: u64,
+    },
+    DiagnosticTomlFailureValue {
+        code: &'a str,
+        expected: &'a str,
+    },
+    DiagnosticTomlExpectedKindValue {
+        code: &'a str,
+    },
+    DiagnosticInvalidToml {
+        resource: &'a str,
+        failure: &'a str,
+    },
+    DiagnosticInvalidTomlAt {
+        line: u64,
+        column: u64,
+        resource: &'a str,
+        failure: &'a str,
+    },
+    DiagnosticHttpNoDetails,
+    DiagnosticHttpStatus {
+        status: u64,
+    },
+    DiagnosticHttpRetryAfter {
+        seconds: u64,
+    },
+    DiagnosticHttpProviderCode {
+        code: &'a str,
+    },
+    DiagnosticHttpProviderType {
+        kind: &'a str,
+    },
+    DiagnosticHttpFactSeparator,
+    DiagnosticSqlite {
+        primary_code: &'a str,
+        extended_code: &'a str,
+    },
+    DiagnosticWindowsStatus {
+        operation: &'a str,
+        status: &'a str,
+    },
+    DiagnosticResource {
+        resource: &'a str,
+        actual: u64,
+    },
+    DiagnosticResourceWithMaximum {
+        resource: &'a str,
+        actual: u64,
+        maximum: u64,
     },
     ErrorNoExecutableExtractOwner,
     ErrorPlanSaveFailedApplied,
@@ -946,6 +1022,31 @@ impl UiMessage<'_> {
             Self::DiagnosticFailureValue { .. } => "diagnostic-failure-value",
             Self::DiagnosticIoKindValue { .. } => "diagnostic-io-kind-value",
             Self::DiagnosticConfigurationRuleValue { .. } => "diagnostic-configuration-rule-value",
+            Self::DiagnosticIoReason { .. } => "diagnostic-io-reason",
+            Self::DiagnosticIoReasonWithOsCode { .. } => "diagnostic-io-reason-with-os-code",
+            Self::DiagnosticIoReasonWithSystemMessage { .. } => {
+                "diagnostic-io-reason-with-system-message"
+            }
+            Self::DiagnosticIoReasonWithOsCodeAndSystemMessage { .. } => {
+                "diagnostic-io-reason-with-os-code-and-system-message"
+            }
+            Self::DiagnosticFailureWithDetail { .. } => "diagnostic-failure-with-detail",
+            Self::DiagnosticInvalidUtf8 { .. } => "diagnostic-invalid-utf8",
+            Self::DiagnosticIncompleteUtf8 { .. } => "diagnostic-incomplete-utf8",
+            Self::DiagnosticTomlFailureValue { .. } => "diagnostic-toml-failure-value",
+            Self::DiagnosticTomlExpectedKindValue { .. } => "diagnostic-toml-expected-kind-value",
+            Self::DiagnosticInvalidToml { .. } => "diagnostic-invalid-toml",
+            Self::DiagnosticInvalidTomlAt { .. } => "diagnostic-invalid-toml-at",
+            Self::DiagnosticHttpNoDetails => "diagnostic-http-no-details",
+            Self::DiagnosticHttpStatus { .. } => "diagnostic-http-status",
+            Self::DiagnosticHttpRetryAfter { .. } => "diagnostic-http-retry-after",
+            Self::DiagnosticHttpProviderCode { .. } => "diagnostic-http-provider-code",
+            Self::DiagnosticHttpProviderType { .. } => "diagnostic-http-provider-type",
+            Self::DiagnosticHttpFactSeparator => "diagnostic-http-fact-separator",
+            Self::DiagnosticSqlite { .. } => "diagnostic-sqlite",
+            Self::DiagnosticWindowsStatus { .. } => "diagnostic-windows-status",
+            Self::DiagnosticResource { .. } => "diagnostic-resource",
+            Self::DiagnosticResourceWithMaximum { .. } => "diagnostic-resource-with-maximum",
             Self::ErrorNoExecutableExtractOwner => "error-no-executable-extract-owner",
             Self::ErrorPlanSaveFailedApplied => "error-plan-save-failed-applied",
             Self::ErrorPlanSaveOutcomeUnknown => "error-plan-save-outcome-unknown",
@@ -1399,22 +1500,128 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "value", value);
             }
             Self::DiagnosticRelated { index } => set_number(&mut arguments, "index", index),
-            Self::DiagnosticStageValue { code, fallback }
-            | Self::DiagnosticImpactValue { code, fallback }
-            | Self::DiagnosticActionValue { code, fallback }
-            | Self::DiagnosticFailureValue { code, fallback }
-            | Self::DiagnosticIoKindValue { code, fallback } => {
+            Self::DiagnosticStageValue { code }
+            | Self::DiagnosticImpactValue { code }
+            | Self::DiagnosticActionValue { code }
+            | Self::DiagnosticFailureValue { code }
+            | Self::DiagnosticIoKindValue { code }
+            | Self::DiagnosticTomlExpectedKindValue { code } => {
                 set_text(&mut arguments, "code", code);
-                set_text(&mut arguments, "fallback", fallback);
             }
             Self::DiagnosticConfigurationRuleValue {
                 code,
-                fallback,
-                facts,
+                line,
+                column,
+                actual,
+                maximum,
             } => {
                 set_text(&mut arguments, "code", code);
-                set_text(&mut arguments, "fallback", fallback);
-                set_text(&mut arguments, "facts", facts);
+                set_number(&mut arguments, "line", line);
+                set_number(&mut arguments, "column", column);
+                set_number(&mut arguments, "actual", actual);
+                set_number(&mut arguments, "maximum", maximum);
+            }
+            Self::DiagnosticIoReason { operation, kind } => {
+                set_text(&mut arguments, "operation", operation);
+                set_text(&mut arguments, "kind", kind);
+            }
+            Self::DiagnosticIoReasonWithOsCode {
+                operation,
+                kind,
+                os_code,
+            } => {
+                set_text(&mut arguments, "operation", operation);
+                set_text(&mut arguments, "kind", kind);
+                set_text(&mut arguments, "os_code", os_code);
+            }
+            Self::DiagnosticIoReasonWithSystemMessage {
+                operation,
+                kind,
+                system_message,
+            } => {
+                set_text(&mut arguments, "operation", operation);
+                set_text(&mut arguments, "kind", kind);
+                set_text(&mut arguments, "system_message", system_message);
+            }
+            Self::DiagnosticIoReasonWithOsCodeAndSystemMessage {
+                operation,
+                kind,
+                os_code,
+                system_message,
+            } => {
+                set_text(&mut arguments, "operation", operation);
+                set_text(&mut arguments, "kind", kind);
+                set_text(&mut arguments, "os_code", os_code);
+                set_text(&mut arguments, "system_message", system_message);
+            }
+            Self::DiagnosticFailureWithDetail { failure, detail } => {
+                set_text(&mut arguments, "failure", failure);
+                set_text(&mut arguments, "detail", detail);
+            }
+            Self::DiagnosticInvalidUtf8 {
+                valid_up_to,
+                error_len,
+            } => {
+                set_number(&mut arguments, "valid_up_to", valid_up_to);
+                set_number(&mut arguments, "error_len", error_len);
+            }
+            Self::DiagnosticIncompleteUtf8 { valid_up_to } => {
+                set_number(&mut arguments, "valid_up_to", valid_up_to);
+            }
+            Self::DiagnosticTomlFailureValue { code, expected } => {
+                set_text(&mut arguments, "code", code);
+                set_text(&mut arguments, "expected", expected);
+            }
+            Self::DiagnosticInvalidToml { resource, failure } => {
+                set_text(&mut arguments, "resource", resource);
+                set_text(&mut arguments, "failure", failure);
+            }
+            Self::DiagnosticInvalidTomlAt {
+                line,
+                column,
+                resource,
+                failure,
+            } => {
+                set_number(&mut arguments, "line", line);
+                set_number(&mut arguments, "column", column);
+                set_text(&mut arguments, "resource", resource);
+                set_text(&mut arguments, "failure", failure);
+            }
+            Self::DiagnosticHttpStatus { status } => {
+                set_number(&mut arguments, "status", status);
+            }
+            Self::DiagnosticHttpRetryAfter { seconds } => {
+                set_number(&mut arguments, "seconds", seconds);
+            }
+            Self::DiagnosticHttpProviderCode { code } => {
+                set_text(&mut arguments, "code", code);
+            }
+            Self::DiagnosticHttpProviderType { kind } => {
+                set_text(&mut arguments, "kind", kind);
+            }
+            Self::DiagnosticSqlite {
+                primary_code,
+                extended_code,
+            } => {
+                set_text(&mut arguments, "primary_code", primary_code);
+                set_text(&mut arguments, "extended_code", extended_code);
+            }
+            Self::DiagnosticWindowsStatus { operation, status } => {
+                set_text(&mut arguments, "operation", operation);
+                set_text(&mut arguments, "status", status);
+            }
+            Self::DiagnosticResource { resource, actual } => {
+                set_text(&mut arguments, "resource", resource);
+                set_number(&mut arguments, "actual", actual);
+            }
+            Self::DiagnosticResourceWithMaximum {
+                resource,
+                actual,
+                maximum,
+            } => {
+                set_text(&mut arguments, "resource", resource);
+                set_number(&mut arguments, "actual", actual);
+                set_number(&mut arguments, "maximum", maximum);
             }
             Self::AppAbout
             | Self::CliConfigHelp
@@ -1462,6 +1669,8 @@ impl UiMessage<'_> {
             | Self::CliInvalidUtf8
             | Self::CliParseFailure
             | Self::ErrorStateAppliedFinalization
+            | Self::DiagnosticHttpNoDetails
+            | Self::DiagnosticHttpFactSeparator
             | Self::ErrorNoExecutableExtractOwner
             | Self::ErrorPlanSaveFailedApplied
             | Self::ErrorPlanSaveOutcomeUnknown
@@ -1570,6 +1779,7 @@ fn set_number(arguments: &mut FluentArgs<'static>, name: &'static str, value: u6
 
 /// 使用嵌入式 Fluent catalog 格式化用户可见消息。
 pub(crate) struct UiLocalizer {
+    #[cfg(test)]
     locale: UiLocale,
     selected: FluentBundle<FluentResource>,
     english_fallback: FluentBundle<FluentResource>,
@@ -1578,12 +1788,14 @@ pub(crate) struct UiLocalizer {
 impl UiLocalizer {
     pub(crate) fn new(locale: UiLocale) -> Self {
         Self {
+            #[cfg(test)]
             locale,
             selected: build_bundle(locale),
             english_fallback: build_bundle(UiLocale::English),
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn locale(&self) -> UiLocale {
         self.locale
     }
@@ -1746,7 +1958,6 @@ mod tests {
             };
             let rendered = UiLocalizer::new(locale).format(UiMessage::DiagnosticStageValue {
                 code: "process_output",
-                fallback: "process output",
             });
             assert_eq!(
                 without_fluent_isolation(&rendered),
@@ -1985,30 +2196,84 @@ mod tests {
                 value: "rolled_back",
             },
             UiMessage::DiagnosticRelated { index: 1 },
-            UiMessage::DiagnosticStageValue {
-                code: "extract",
-                fallback: "extraction",
-            },
-            UiMessage::DiagnosticImpactValue {
-                code: "unchanged",
-                fallback: "unchanged",
-            },
-            UiMessage::DiagnosticActionValue {
-                code: "retry",
-                fallback: "retry",
-            },
-            UiMessage::DiagnosticFailureValue {
-                code: "not_found",
-                fallback: "not found",
-            },
-            UiMessage::DiagnosticIoKindValue {
-                code: "not_found",
-                fallback: "not found",
-            },
+            UiMessage::DiagnosticStageValue { code: "extract" },
+            UiMessage::DiagnosticImpactValue { code: "unchanged" },
+            UiMessage::DiagnosticActionValue { code: "retry" },
+            UiMessage::DiagnosticFailureValue { code: "not_found" },
+            UiMessage::DiagnosticIoKindValue { code: "not_found" },
             UiMessage::DiagnosticConfigurationRuleValue {
                 code: "value_blank",
-                fallback: "value must not be blank",
-                facts: "",
+                line: 0,
+                column: 0,
+                actual: 0,
+                maximum: 0,
+            },
+            UiMessage::DiagnosticIoReason {
+                operation: "read",
+                kind: "not found",
+            },
+            UiMessage::DiagnosticIoReasonWithOsCode {
+                operation: "read",
+                kind: "not found",
+                os_code: "2",
+            },
+            UiMessage::DiagnosticIoReasonWithSystemMessage {
+                operation: "read",
+                kind: "not found",
+                system_message: "file missing",
+            },
+            UiMessage::DiagnosticIoReasonWithOsCodeAndSystemMessage {
+                operation: "read",
+                kind: "not found",
+                os_code: "2",
+                system_message: "file missing",
+            },
+            UiMessage::DiagnosticFailureWithDetail {
+                failure: "not found",
+                detail: "fixture",
+            },
+            UiMessage::DiagnosticInvalidUtf8 {
+                valid_up_to: 4,
+                error_len: 1,
+            },
+            UiMessage::DiagnosticIncompleteUtf8 { valid_up_to: 4 },
+            UiMessage::DiagnosticTomlFailureValue {
+                code: "type_mismatch",
+                expected: "a string",
+            },
+            UiMessage::DiagnosticTomlExpectedKindValue { code: "string" },
+            UiMessage::DiagnosticInvalidToml {
+                resource: "configuration",
+                failure: "invalid syntax",
+            },
+            UiMessage::DiagnosticInvalidTomlAt {
+                line: 1,
+                column: 2,
+                resource: "configuration",
+                failure: "invalid syntax",
+            },
+            UiMessage::DiagnosticHttpNoDetails,
+            UiMessage::DiagnosticHttpStatus { status: 429 },
+            UiMessage::DiagnosticHttpRetryAfter { seconds: 7 },
+            UiMessage::DiagnosticHttpProviderCode { code: "rate_limit" },
+            UiMessage::DiagnosticHttpProviderType { kind: "quota" },
+            UiMessage::DiagnosticHttpFactSeparator,
+            UiMessage::DiagnosticSqlite {
+                primary_code: "5",
+                extended_code: "517",
+            },
+            UiMessage::DiagnosticWindowsStatus {
+                operation: "rename",
+                status: "0xc0000001",
+            },
+            UiMessage::DiagnosticResource {
+                resource: "request bytes",
+                actual: 10,
+            },
+            UiMessage::DiagnosticResourceWithMaximum {
+                resource: "request bytes",
+                actual: 10,
+                maximum: 8,
             },
             UiMessage::ErrorNoExecutableExtractOwner,
             UiMessage::ErrorPlanSaveFailedApplied,

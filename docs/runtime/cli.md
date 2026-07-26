@@ -65,7 +65,8 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 ```
 
 显式来源中的非法或不支持 locale 是输入错误；Windows 自动检测中的无效或不支持项会
-跳过，全部不能匹配时回退英语。匹配规则如下：
+跳过，全部不能匹配时回退英语。`--ui-language` 预扫描只为 Clap 选择呈现语言；预扫描
+本身无法建立值时仍先执行完整 Clap schema，前序参数的真实根错误优先。匹配规则如下：
 
 - `zh-Hant`、`zh-TW`、`zh-HK`、`zh-MO` 选择 `zh-Hant`；
 - `zh-Hans`、`zh-CN`、`zh-SG` 和普通 `zh` 选择 `zh-Hans`；
@@ -78,6 +79,12 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 用户控制的路径、ID 和其他动态文本在进入终端或日志前会移除 ESC、换行伪装及既有
 双向文本控制字符。阿拉伯语消息保持逻辑顺序；命令、路径、ID、数字和进度条作为独立
 方向片段渲染，不反转原字符串。
+
+安全诊断中的 stage、impact、action、failure、I/O 类别、配置规则和 TOML 值形态都是
+闭集事实，十个 locale 分别通过 Fluent 提供完整译文，不以英语说明或枚举 Debug 文本
+回退。HTTP、SQLite、Windows 与 OS 错误的可选事实只在实际存在时按字段组合；呈现结果
+不会出现 `Some(...)`、`None` 或 Debug 引号。由稳定 OS 错误码重新取得的系统消息保留
+操作系统提供的正文，周围的操作与错误类别仍使用当前 UI locale。
 
 ## 3. 运行方案解析与持久化
 
@@ -294,7 +301,8 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 项目日志建立后的命令 panic 由命令边界转换成 `internal.operation` 安全诊断：CLI 与
 JSONL 都显示实际命令阶段、项目工作区、日志路径和 `outcome_unknown` 影响，绝不显示
 panic payload；JSONL 以未知终态完成，CLI 退出 `1`。只有日志建立前或日志无法建立时的
-panic 才由最外层进程兜底直接写 stderr。
+panic 才由进程启动边界直接写 stderr。完整 Clap 解析已经确认 UI locale 时，启动边界
+使用该 locale；解析完成前固定使用英语，绝不从尚未通过参数 schema 的预扫描值选择语言。
 
 | 退出码 | 含义 |
 |---|---|
@@ -305,7 +313,8 @@ panic 才由最外层进程兜底直接写 stderr。
 
 错误统一说明错误码、阶段、对象或路径、具体原因、稳定底层代码、状态影响、处理办法和
 恢复位置。OS 系统消息、SQLite primary/extended code、HTTP 状态与允许公开的供应商
-code/type 在清理控制字符后明示；不得用责任域类别替代具体原因。输出不读取任意 `Debug`
+code/type 在清理控制字符后按实际存在的字段明示；缺失字段不打印占位文字。不得用责任域
+类别替代具体原因。输出不读取任意 `Debug`
 或内部来源链，也不泄露 API key 实际值。CLI 与普通 JSONL 不复制配置原文、Header、
 完整 Client parameters、Prompt、完整模型消息、模型正文、原文或译文，是为了维持职责、
 稳定 schema、可读体积和控制字符边界，不表示这些内容属于敏感信息。任务记录可以呈现

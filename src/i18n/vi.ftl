@@ -171,25 +171,245 @@ diagnostic-recovery-value = { $kind ->
 }
 diagnostic-related = Lỗi liên quan { $index }:
 diagnostic-stage-value = { $code ->
+    [process_startup] Khởi động tiến trình
     [process_output] Đầu ra tiến trình
+    [configuration] Nạp cấu hình
+    [command_preparation] Chuẩn bị lệnh
+    [project_opening] Mở dự án
+    [init] Khởi tạo
+    [extract] Trích xuất
+    [translate] Dịch
+    [write_back] Ghi ngược
     [lua] Thực thi Lua dự án
-   *[other] { $fallback }
+    [model_request] Yêu cầu mô hình
+    [run_plan_finalization] Hoàn tất kế hoạch chạy
+    [publication] Phát hành
+    [shutdown] Tắt
+    [logging] Nhật ký dự án
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-impact-value = { $code ->
-   *[other] { $fallback }
+    [unchanged] Trạng thái không thay đổi
+    [valid_progress_preserved] Tiến độ hợp lệ đã được giữ lại
+    [result_applied_but_run_plan_not_saved] Kết quả đã được áp dụng nhưng kế hoạch chạy chưa được lưu
+    [state_applied_but_finalization_failed] Trạng thái đã được áp dụng nhưng bước hoàn tất chưa xong
+    [recovery_required] Cần khôi phục trước khi có thể tin cậy trạng thái
+    [outcome_unknown] Không rõ trạng thái cuối cùng
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-action-value = { $code ->
-   *[other] { $fallback }
+    [fix_configuration] Sửa trường cấu hình được nêu rồi thử lại
+    [fix_input] Sửa dữ liệu đầu vào được nêu rồi thử lại
+    [check_path_and_permissions] Kiểm tra đường dẫn, trạng thái hệ thống tệp và quyền
+    [check_project_state] Kiểm tra và sửa trạng thái dự án rồi thử lại
+    [retry_after_resolving_contention] Chờ thao tác xung đột kết thúc rồi thử lại
+    [check_model_service] Kiểm tra phản hồi của dịch vụ mô hình và giới hạn tài khoản
+    [preserve_recovery_artifacts] Không xóa các tạo phẩm khôi phục được liệt kê; hãy khôi phục đầu ra trước khi thử lại
+    [retry] Thử lại thao tác
+    [report_bug] Báo cáo lỗi ATT này kèm mã lỗi và đường dẫn nhật ký
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
-   *[other] { $fallback }
+    [missing_required_value] Thiếu một giá trị bắt buộc
+    [extract_plan_required] Không có kế hoạch Extract có thể tái sử dụng; hãy cung cấp ít nhất một trong --builtin, --rules hoặc --lua
+    [conflicting_values] Các giá trị được cung cấp xung đột với nhau
+    [invalid_syntax] Cú pháp của giá trị không hợp lệ
+    [invalid_encoding] Mã hóa văn bản không hợp lệ
+    [invalid_value] Giá trị vi phạm hợp đồng bắt buộc
+    [not_found] Đối tượng bắt buộc không tồn tại
+    [busy] Tài nguyên đang được thao tác khác sử dụng
+    [state_mismatch] Trạng thái dự án đã lưu không đáp ứng thao tác này
+    [requirement_failed] Điều kiện tiên quyết bắt buộc chưa được đáp ứng
+    [transaction_rolled_back] Giao dịch thất bại và các thay đổi đã được hoàn tác
+    [transaction_outcome_unknown] Giao dịch kết thúc mà không xác nhận được commit hay hoàn tác
+    [finalization_failed] Kết quả thao tác đã tồn tại nhưng bước hoàn tất thất bại
+    [rollback_failed] Cả thao tác chính và hoàn tác đều thất bại
+    [external_service_rejected] Dịch vụ bên ngoài đã từ chối yêu cầu
+    [external_service_unavailable] Dịch vụ bên ngoài không khả dụng
+    [executor_closed] Dịch vụ thực thi đang đóng hoặc đã đóng
+    [concurrent_shutdown] Một bên gọi khác đang đóng bộ thực thi
+    [executor_state_poisoned] Trạng thái vòng đời của bộ thực thi đã bị hỏng
+    [worker_spawn_failed] Hệ điều hành không thể tạo luồng worker
+    [worker_channel_closed] Kênh lệnh worker đã đóng trước khi hoàn tất
+    [worker_panicked] Một worker kết thúc ngoài dự kiến
+    [reparse_point_forbidden] Đường dẫn chứa điểm phân tích lại không đáng tin cậy
+    [non_local_volume] Đường dẫn không nằm trên ổ đĩa cố định cục bộ
+    [non_ntfs_volume] Đường dẫn không nằm trên ổ đĩa NTFS
+    [case_sensitive_directory] Thư mục dùng ngữ nghĩa tên phân biệt chữ hoa chữ thường
+    [lock_cancelled] Việc chờ khóa bắt buộc đã bị hủy
+    [target_already_exists] Đích đã tồn tại
+    [file_identity_changed] Danh tính tệp đã thay đổi trong khi thao tác
+    [invalid_path] Đường dẫn không phải đích hợp lệ cho thao tác này
+    [wrong_publisher_instance] Token phát hành thuộc về một phiên bản bộ phát hành khác
+    [journal_corrupt] Nhật ký khôi phục phát hành không hợp lệ hoặc chưa hoàn chỉnh
+    [unexpected_artifact] Tạo phẩm hệ thống tệp ngoài dự kiến đang chặn thao tác
+    [interactive_session_already_open] Một phiên SQLite tương tác khác đang hoạt động
+    [backup_incomplete] Bản sao lưu SQLite chưa đạt trạng thái hoàn tất
+    [request_serialization_failed] Không thể tuần tự hóa yêu cầu mô hình
+    [response_parsing_failed] Phản hồi mô hình không phải JSON hợp lệ
+    [invalid_response_contract] Phản hồi mô hình không đáp ứng hợp đồng phản hồi bắt buộc
+    [transport_failed] Truyền tải HTTP thất bại trước khi nhận được phản hồi hợp lệ
+    [lua_database_open_failed] Máy chủ Lua không thể mở phiên cơ sở dữ liệu dự án
+    [lua_context_creation_failed] Môi trường Lua không thể tạo ngữ cảnh VM
+    [lua_compilation_failed] Không thể biên dịch chương trình Lua chính
+    [lua_execution_failed] Chương trình Lua chính thất bại trong khi chạy
+    [lua_host_call_failed] Lời gọi khả năng máy chủ Lua thất bại
+    [lua_finalization_failed] Máy chủ Lua không thể hoàn tất mọi tài nguyên đã liên kết
+    [lua_unclosed_transaction] Chương trình Lua kết thúc với giao dịch còn mở; giao dịch đã được hoàn tác
+    [lua_snapshot_store_failed] Không thể commit ảnh chụp trích xuất Lua đã xác minh
+    [rules_definition_invalid] Chương trình Rules không đáp ứng hợp đồng định nghĩa Rules
+    [rules_document_read_failed] Không thể đọc tài liệu nguồn mà chương trình Rules yêu cầu
+    [rules_no_non_blank_match] Mục Rules không tạo ra đơn vị ngữ nghĩa khác trống
+    [rules_invalid_target] Mục Rules đã chọn giá trị không thể dùng làm đích văn bản
+    [rules_pattern_match_failed] Không thể đánh giá mẫu PCRE2 của Rules
+    [rules_zero_width_match] Mẫu Rules tạo ra kết quả khớp có độ rộng bằng không
+    [rules_overlapping_capture] Mẫu Rules tạo ra các vùng bắt văn bản chồng lấp
+    [rules_missing_text_capture] Vùng bắt văn bản có tên bắt buộc không tham gia kết quả khớp
+    [rules_invalid_capture_range] Kết quả khớp hoặc vùng bắt Rules nằm ngoài ranh giới ký tự UTF-8 hợp lệ
+    [rules_duplicate_target] Hai mục Rules yêu cầu cùng một đích văn bản vật lý
+    [rules_invalid_materialization] Công thức chiếu Rules không thể dựng lại giá trị nguồn
+    [rules_snapshot_invalid] Các nhóm Rules đã trích xuất không tạo thành ảnh chụp tài sản hợp lệ
+    [rules_snapshot_store_failed] Không thể commit ảnh chụp trích xuất Rules đã xác minh
+    [write_back_extraction_out_of_date] Tài sản đã trích xuất không còn khớp với nguồn dự án hiện tại
+    [write_back_asset_snapshot_invalid] Tài sản Standard đã lưu không tạo thành ảnh chụp ghi ngược hợp lệ
+    [source_document_invalid] Tài liệu nguồn RPG Maker không đáp ứng định dạng bắt buộc
+    [write_back_mutation_invalid] Không thể áp dụng thay đổi bản dịch đã xác minh vào vị trí nguồn đã đóng băng
+    [write_back_output_path_invalid] Tệp được viết lại nằm ngoài cây đầu ra RPG Maker được phép
+    [write_back_output_path_duplicate] Nhiều tệp được viết lại nhắm đến cùng một đường dẫn đầu ra
+    [write_back_candidate_project_mismatch] Ứng viên ghi ngược đã chuẩn bị thuộc về dự án khác
+    [write_back_candidate_invalid] Ứng viên ghi ngược không đáp ứng cấu trúc cây data/js bắt buộc
+    [write_back_unexpected_lua_outcome] Chương trình Lua ghi ngược trả về kết quả cho một giai đoạn Lua khác
+    [write_back_not_published] Ứng viên ghi ngược không thay thế thư mục đầu ra hiện tại
+    [write_back_published_with_residuals] Đầu ra đã được phát hành nhưng không thể xóa một số tạo phẩm khôi phục
+    [write_back_recovery_required] Cần khôi phục thư mục đầu ra trước khi có thể tin cậy nội dung
+    [internal_invariant] Một bất biến nội bộ đã bị vi phạm; đây là lỗi của ATT
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-io-kind-value = { $code ->
-   *[other] { $fallback }
+    [not_found] Không tìm thấy
+    [permission_denied] Quyền bị từ chối
+    [connection_refused] Kết nối bị từ chối
+    [connection_reset] Kết nối bị đặt lại
+    [host_unreachable] Không thể truy cập máy chủ
+    [network_unreachable] Không thể truy cập mạng
+    [connection_aborted] Kết nối bị hủy
+    [not_connected] Chưa kết nối
+    [address_in_use] Địa chỉ đang được sử dụng
+    [address_not_available] Địa chỉ không khả dụng
+    [network_down] Mạng ngừng hoạt động
+    [broken_pipe] Đường ống bị hỏng
+    [already_exists] Đã tồn tại
+    [would_block] Thao tác sẽ bị chặn
+    [not_a_directory] Không phải thư mục
+    [is_a_directory] Là thư mục
+    [directory_not_empty] Thư mục không trống
+    [read_only_filesystem] Hệ thống tệp chỉ đọc
+    [stale_network_file_handle] Handle tệp mạng đã cũ
+    [invalid_input] Đầu vào thao tác không hợp lệ
+    [invalid_data] Dữ liệu không hợp lệ
+    [timed_out] Thao tác hết thời gian chờ
+    [write_zero] Việc ghi không tiến triển
+    [storage_full] Bộ nhớ lưu trữ đã đầy
+    [not_seekable] Không thể di chuyển vị trí trong đối tượng
+    [quota_exceeded] Vượt hạn ngạch lưu trữ
+    [file_too_large] Tệp quá lớn đối với hệ thống nền
+    [resource_busy] Tài nguyên đang bận
+    [executable_file_busy] Tệp thực thi đang bận
+    [deadlock] Thao tác sẽ gây bế tắc
+    [crosses_devices] Thao tác đi qua nhiều thiết bị hệ thống tệp
+    [too_many_links] Quá nhiều liên kết hệ thống tệp
+    [invalid_filename] Tên tệp không hợp lệ
+    [argument_list_too_long] Danh sách đối số hệ điều hành quá dài
+    [interrupted] Thao tác bị gián đoạn
+    [unsupported] Thao tác không được hỗ trợ
+    [unexpected_eof] Kết thúc tệp ngoài dự kiến
+    [out_of_memory] Hệ điều hành không thể cấp phát bộ nhớ
+    [other] Lỗi hệ điều hành khác
+   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-   *[other] { $fallback }{ $facts }
+    [runtime_configuration_invalid] Cấu hình thời gian chạy không hợp lệ
+    [unsupported_prompt_locale] Phải là auto viết thường hoàn toàn hoặc locale giao diện BCP 47 được hỗ trợ
+    [language_policy_term_blank] Thuật ngữ chính sách ngôn ngữ không được để trống
+    [language_policy_term_surrounding_whitespace] Thuật ngữ chính sách ngôn ngữ không được có khoảng trắng ở hai đầu
+    [language_policy_term_duplicate] Thuật ngữ chính sách ngôn ngữ không được trùng lặp
+    [quote_repair_candidates_empty] Danh sách ứng viên sửa dấu ngoặc kép không được để trống
+    [quote_repair_delimiter_invalid] Dấu phân cách sửa dấu ngoặc kép không được là chữ số, khoảng trắng hoặc ký tự điều khiển
+    [quote_repair_pair_duplicate] Cặp sửa dấu ngoặc kép không được trùng lặp
+    [quote_repair_delimiter_ambiguous] Dấu phân cách sửa dấu ngoặc kép phải thuộc đúng một cặp
+    [language_id_blank] ID ngôn ngữ không được để trống
+    [language_id_surrounding_whitespace] ID ngôn ngữ không được có khoảng trắng ở hai đầu
+    [language_id_uses_underscore] ID ngôn ngữ phải dùng dấu gạch ngang giữa các thẻ con
+    [language_id_invalid_syntax] ID ngôn ngữ phải đáp ứng cú pháp RFC 5646
+    [language_id_invalid_registry_tag] ID ngôn ngữ chứa thẻ con registry không hợp lệ
+    [language_id_canonicalization_failed] Không thể chuẩn hóa ID ngôn ngữ
+    [language_id_undefined_primary_language] ID ngôn ngữ phải xác định ngôn ngữ chính
+    [language_id_duplicate] ID ngôn ngữ phải là duy nhất
+    [language_catalog_empty] Cần ít nhất một mô-đun ngôn ngữ nguồn
+    [url_invalid] Giá trị phải là URL hợp lệ
+    [url_credentials_forbidden] URL không được chứa thông tin xác thực
+    [url_fragment_forbidden] URL không được chứa fragment
+    [url_scheme_unsupported] Scheme URL phải là http hoặc https
+    [api_key_blank] API key không được để trống
+    [api_key_surrounding_whitespace] API key không được có khoảng trắng ở hai đầu
+    [api_key_invalid_header] Không thể biểu diễn API key dưới dạng giá trị HTTP Header
+    [strict_json_invalid] Giá trị phải là JSON nghiêm ngặt (dòng={ $line }, cột={ $column })
+    [json_object_required] Giá trị phải là đối tượng JSON
+    [reserved_request_field] Trường này thuộc sở hữu giao thức yêu cầu và không thể bị ghi đè
+    [proxy_must_be_false_or_url] proxy phải là false hoặc URL http/https hoàn chỉnh
+    [pem_path_duplicate] Đường dẫn PEM phải là duy nhất
+    [runtime_maximum_exceeded] Giá trị vượt quá mức tối đa của thời gian chạy (thực tế={ $actual }, tối đa={ $maximum })
+    [value_surrounding_whitespace] Giá trị không được có khoảng trắng ở hai đầu
+    [value_blank] Giá trị không được để trống
+    [path_blank] Đường dẫn không được để trống
+    [positive_required] Giá trị phải lớn hơn không (thực tế={ $actual })
+    [usize_range_exceeded] Giá trị vượt quá phạm vi usize của nền tảng này (thực tế={ $actual })
+    [u32_range_exceeded] Giá trị vượt quá phạm vi u32 (thực tế={ $actual })
+    [duplicate_profile_id] ID hồ sơ dịch phải là duy nhất
+    [selected_profile_invalid] Cấu trúc hoặc kiểu trường của hồ sơ dịch đã chọn không hợp lệ
+    [referenced_client_not_found] Máy khách LLM được tham chiếu không tồn tại
+   *[other] __ATT_FALLBACK__
 }
+diagnostic-io-reason = Thao tác { $operation }: { $kind }
+diagnostic-io-reason-with-os-code = Thao tác { $operation }: { $kind } (HĐH { $os_code })
+diagnostic-io-reason-with-system-message = Thao tác { $operation }: { $kind }: { $system_message }
+diagnostic-io-reason-with-os-code-and-system-message = Thao tác { $operation }: { $kind } (HĐH { $os_code }): { $system_message }
+diagnostic-failure-with-detail = { $failure }: { $detail }
+diagnostic-invalid-utf8 = UTF-8 không hợp lệ tại byte { $valid_up_to }, độ dài không hợp lệ { $error_len } byte
+diagnostic-incomplete-utf8 = Chuỗi UTF-8 chưa hoàn chỉnh sau byte { $valid_up_to }
+diagnostic-toml-failure-value = { $code ->
+    [syntax] Cú pháp TOML không hợp lệ
+    [missing_field] Thiếu trường cấu hình bắt buộc
+    [unknown_field] Cấu hình chứa trường không xác định
+    [duplicate_field] Trường cấu hình được khai báo nhiều lần
+    [type_mismatch] Cần kiểu { $expected }
+    [invalid_value] Giá trị cấu hình vi phạm hợp đồng của trường
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-toml-expected-kind-value = { $code ->
+    [string] chuỗi
+    [integer] số nguyên
+    [boolean] giá trị Boolean
+    [string_or_boolean] chuỗi hoặc giá trị Boolean
+    [string_array] mảng chuỗi
+    [integer_array] mảng số nguyên
+    [string_pair_array] mảng các cặp chuỗi
+    [table] bảng
+    [table_array] mảng bảng
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-invalid-toml = TOML không hợp lệ ({ $resource }): { $failure }
+diagnostic-invalid-toml-at = TOML không hợp lệ tại dòng { $line }, cột { $column } ({ $resource }): { $failure }
+diagnostic-http-no-details = Yêu cầu dịch vụ mô hình thất bại mà không có chi tiết trạng thái HTTP công khai
+diagnostic-http-status = Trạng thái HTTP { $status }
+diagnostic-http-retry-after = Retry-After { $seconds } giây
+diagnostic-http-provider-code = Mã lỗi nhà cung cấp { $code }
+diagnostic-http-provider-type = Loại lỗi nhà cung cấp { $kind }
+diagnostic-http-fact-separator = ;{ " " }
+diagnostic-sqlite = Mã lỗi SQLite chính { $primary_code }, mã mở rộng { $extended_code }
+diagnostic-windows-status = Thao tác Windows { $operation } thất bại với NTSTATUS { $status }
+diagnostic-resource = { $resource }: thực tế { $actual }
+diagnostic-resource-with-maximum = { $resource }: thực tế { $actual }, tối đa { $maximum }
 task-record-title = Tác vụ dịch { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] Hoàn tất

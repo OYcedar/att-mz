@@ -180,25 +180,245 @@ diagnostic-recovery-value = { $kind ->
 }
 diagnostic-related = Erreur associée { $index } :
 diagnostic-stage-value = { $code ->
+    [process_startup] Démarrage du processus
     [process_output] Sortie du processus
+    [configuration] Chargement de la configuration
+    [command_preparation] Préparation de la commande
+    [project_opening] Ouverture du projet
+    [init] Initialisation
+    [extract] Extraction
+    [translate] Traduction
+    [write_back] Réécriture
     [lua] Exécution Lua du projet
-   *[other] { $fallback }
+    [model_request] Requête au modèle
+    [run_plan_finalization] Finalisation du plan d’exécution
+    [publication] Publication
+    [shutdown] Arrêt
+    [logging] Journal du projet
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-impact-value = { $code ->
-   *[other] { $fallback }
+    [unchanged] L’état n’a pas été modifié
+    [valid_progress_preserved] La progression valide a été conservée
+    [result_applied_but_run_plan_not_saved] Le résultat a été appliqué, mais le plan d’exécution n’a pas été enregistré
+    [state_applied_but_finalization_failed] L’état a été appliqué, mais la finalisation n’a pas abouti
+    [recovery_required] Une récupération est requise avant de pouvoir faire confiance à l’état
+    [outcome_unknown] L’état final est inconnu
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-action-value = { $code ->
-   *[other] { $fallback }
+    [fix_configuration] Corrigez le champ de configuration indiqué, puis réessayez
+    [fix_input] Corrigez l’entrée indiquée, puis réessayez
+    [check_path_and_permissions] Vérifiez le chemin, l’état du système de fichiers et les autorisations
+    [check_project_state] Examinez et corrigez l’état du projet, puis réessayez
+    [retry_after_resolving_contention] Attendez la fin de l’opération concurrente, puis réessayez
+    [check_model_service] Vérifiez la réponse du service de modèle et les limites du compte
+    [preserve_recovery_artifacts] Ne supprimez pas les artefacts de récupération indiqués ; récupérez la sortie avant de réessayer
+    [retry] Réessayez l’opération
+    [report_bug] Signalez ce défaut ATT avec le code d’erreur et le chemin du journal
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
-   *[other] { $fallback }
+    [missing_required_value] Une valeur obligatoire est manquante
+    [extract_plan_required] Aucun plan Extract réutilisable n’est enregistré ; fournissez au moins une option parmi --builtin, --rules et --lua
+    [conflicting_values] Les valeurs fournies sont incompatibles
+    [invalid_syntax] La syntaxe de la valeur est incorrecte
+    [invalid_encoding] L’encodage du texte est incorrect
+    [invalid_value] La valeur ne respecte pas le contrat requis
+    [not_found] L’objet requis n’existe pas
+    [busy] La ressource est utilisée par une autre opération
+    [state_mismatch] L’état enregistré du projet ne satisfait pas cette opération
+    [requirement_failed] Une condition préalable requise n’est pas satisfaite
+    [transaction_rolled_back] La transaction a échoué et ses modifications ont été annulées
+    [transaction_outcome_unknown] La transaction s’est terminée sans confirmation de validation ni d’annulation
+    [finalization_failed] Le résultat de l’opération existe, mais la finalisation a échoué
+    [rollback_failed] L’opération principale et son annulation ont toutes deux échoué
+    [external_service_rejected] Le service externe a refusé la requête
+    [external_service_unavailable] Le service externe est indisponible
+    [executor_closed] Le service d’exécution est en cours d’arrêt ou déjà arrêté
+    [concurrent_shutdown] Un autre appelant arrête déjà l’exécuteur
+    [executor_state_poisoned] L’état du cycle de vie de l’exécuteur est corrompu
+    [worker_spawn_failed] Le système d’exploitation n’a pas pu créer le thread de travail
+    [worker_channel_closed] Le canal de commandes du worker s’est fermé avant la fin de la finalisation
+    [worker_panicked] Un worker s’est arrêté de façon inattendue
+    [reparse_point_forbidden] Le chemin contient un point d’analyse secondaire non fiable
+    [non_local_volume] Le chemin ne se trouve pas sur un volume fixe local
+    [non_ntfs_volume] Le chemin ne se trouve pas sur un volume NTFS
+    [case_sensitive_directory] Le répertoire applique une sémantique de noms sensible à la casse
+    [lock_cancelled] L’attente du verrou requis a été annulée
+    [target_already_exists] La destination existe déjà
+    [file_identity_changed] L’identité du fichier a changé pendant l’opération
+    [invalid_path] Le chemin n’est pas une cible valide pour cette opération
+    [wrong_publisher_instance] Le jeton de publication appartient à une autre instance de publication
+    [journal_corrupt] Le journal de récupération de publication est incorrect ou incomplet
+    [unexpected_artifact] Un artefact inattendu du système de fichiers bloque l’opération
+    [interactive_session_already_open] Une autre session SQLite interactive est déjà active
+    [backup_incomplete] La sauvegarde SQLite n’a pas atteint l’état terminé
+    [request_serialization_failed] La requête du modèle n’a pas pu être sérialisée
+    [response_parsing_failed] La réponse du modèle n’est pas un JSON valide
+    [invalid_response_contract] La réponse du modèle ne respecte pas le contrat de réponse requis
+    [transport_failed] Le transport HTTP a échoué avant l’arrivée d’une réponse valide
+    [lua_database_open_failed] L’hôte Lua n’a pas pu ouvrir la session de base de données du projet
+    [lua_context_creation_failed] L’environnement Lua n’a pas pu créer le contexte VM
+    [lua_compilation_failed] Le programme Lua principal n’a pas pu être compilé
+    [lua_execution_failed] Le programme Lua principal a échoué pendant son exécution
+    [lua_host_call_failed] Un appel à une capacité de l’hôte Lua a échoué
+    [lua_finalization_failed] L’hôte Lua n’a pas pu finaliser toutes les ressources liées
+    [lua_unclosed_transaction] Le programme Lua s’est terminé avec une transaction ouverte ; celle-ci a été annulée
+    [lua_snapshot_store_failed] L’instantané d’extraction Lua validé n’a pas pu être enregistré
+    [rules_definition_invalid] Le programme Rules ne respecte pas le contrat de définition Rules
+    [rules_document_read_failed] Un document source requis par le programme Rules n’a pas pu être lu
+    [rules_no_non_blank_match] L’entrée Rules n’a produit aucune unité sémantique non vide
+    [rules_invalid_target] L’entrée Rules a sélectionné une valeur inutilisable comme cible de texte
+    [rules_pattern_match_failed] Le motif PCRE2 de Rules n’a pas pu être évalué
+    [rules_zero_width_match] Le motif Rules a produit une correspondance de largeur nulle
+    [rules_overlapping_capture] Le motif Rules a produit des captures de texte qui se chevauchent
+    [rules_missing_text_capture] La capture de texte nommée requise n’a pas participé à la correspondance
+    [rules_invalid_capture_range] La correspondance ou la capture Rules est hors des limites de caractères UTF-8 valides
+    [rules_duplicate_target] Deux entrées Rules revendiquent la même cible de texte physique
+    [rules_invalid_materialization] La recette de projection Rules ne peut pas reconstruire la valeur source
+    [rules_snapshot_invalid] Les groupes Rules extraits ne forment pas un instantané de ressources valide
+    [rules_snapshot_store_failed] L’instantané d’extraction Rules validé n’a pas pu être enregistré
+    [write_back_extraction_out_of_date] Les ressources extraites ne correspondent plus à la source actuelle du projet
+    [write_back_asset_snapshot_invalid] Les ressources Standard enregistrées ne forment pas un instantané de réécriture valide
+    [source_document_invalid] Un document source RPG Maker ne respecte pas le format requis
+    [write_back_mutation_invalid] Une modification de traduction validée ne peut pas être appliquée à son emplacement source figé
+    [write_back_output_path_invalid] Un fichier réécrit se trouve hors de l’arborescence de sortie RPG Maker autorisée
+    [write_back_output_path_duplicate] Plusieurs fichiers réécrits ciblent le même chemin de sortie
+    [write_back_candidate_project_mismatch] Le candidat de réécriture préparé appartient à un autre projet
+    [write_back_candidate_invalid] Le candidat de réécriture ne respecte pas l’arborescence data/js requise
+    [write_back_unexpected_lua_outcome] Le programme Lua de réécriture a renvoyé un résultat pour une autre phase Lua
+    [write_back_not_published] Le candidat de réécriture n’a pas remplacé le répertoire de sortie actuel
+    [write_back_published_with_residuals] La sortie a été publiée, mais certains artefacts de récupération n’ont pas pu être supprimés
+    [write_back_recovery_required] Le répertoire de sortie doit être récupéré avant que son contenu soit fiable
+    [internal_invariant] Un invariant interne a été violé ; il s’agit d’un défaut ATT
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-io-kind-value = { $code ->
-   *[other] { $fallback }
+    [not_found] Introuvable
+    [permission_denied] Autorisation refusée
+    [connection_refused] Connexion refusée
+    [connection_reset] Connexion réinitialisée
+    [host_unreachable] Hôte inaccessible
+    [network_unreachable] Réseau inaccessible
+    [connection_aborted] Connexion interrompue
+    [not_connected] Non connecté
+    [address_in_use] Adresse déjà utilisée
+    [address_not_available] Adresse indisponible
+    [network_down] Réseau hors service
+    [broken_pipe] Canal rompu
+    [already_exists] Existe déjà
+    [would_block] L’opération serait bloquante
+    [not_a_directory] N’est pas un répertoire
+    [is_a_directory] Est un répertoire
+    [directory_not_empty] Répertoire non vide
+    [read_only_filesystem] Système de fichiers en lecture seule
+    [stale_network_file_handle] Descripteur de fichier réseau obsolète
+    [invalid_input] Entrée d’opération incorrecte
+    [invalid_data] Données incorrectes
+    [timed_out] Délai de l’opération dépassé
+    [write_zero] L’écriture n’a pas progressé
+    [storage_full] Stockage plein
+    [not_seekable] L’objet ne permet pas le positionnement
+    [quota_exceeded] Quota de stockage dépassé
+    [file_too_large] Fichier trop volumineux pour le système sous-jacent
+    [resource_busy] Ressource occupée
+    [executable_file_busy] Fichier exécutable occupé
+    [deadlock] L’opération provoquerait un interblocage
+    [crosses_devices] L’opération traverse plusieurs périphériques de système de fichiers
+    [too_many_links] Trop de liens de système de fichiers
+    [invalid_filename] Nom de fichier incorrect
+    [argument_list_too_long] Liste d’arguments du système trop longue
+    [interrupted] Opération interrompue
+    [unsupported] Opération non prise en charge
+    [unexpected_eof] Fin de fichier inattendue
+    [out_of_memory] Le système n’a pas pu allouer de mémoire
+    [other] Autre erreur du système d’exploitation
+   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-   *[other] { $fallback }{ $facts }
+    [runtime_configuration_invalid] La configuration d’exécution est incorrecte
+    [unsupported_prompt_locale] La valeur doit être exactement auto en minuscules ou une langue d’interface BCP 47 prise en charge
+    [language_policy_term_blank] Le terme de politique linguistique ne doit pas être vide
+    [language_policy_term_surrounding_whitespace] Le terme de politique linguistique ne doit pas contenir d’espaces en début ou fin
+    [language_policy_term_duplicate] Le terme de politique linguistique ne doit pas être dupliqué
+    [quote_repair_candidates_empty] La liste des candidats de réparation des guillemets ne doit pas être vide
+    [quote_repair_delimiter_invalid] Le délimiteur de réparation des guillemets ne doit être ni alphanumérique, ni un espace, ni un caractère de contrôle
+    [quote_repair_pair_duplicate] La paire de réparation des guillemets ne doit pas être dupliquée
+    [quote_repair_delimiter_ambiguous] Le délimiteur de réparation des guillemets doit appartenir à une seule paire
+    [language_id_blank] L’identifiant de langue ne doit pas être vide
+    [language_id_surrounding_whitespace] L’identifiant de langue ne doit pas contenir d’espaces en début ou fin
+    [language_id_uses_underscore] L’identifiant de langue doit séparer les sous-étiquettes par des tirets
+    [language_id_invalid_syntax] L’identifiant de langue doit respecter la syntaxe RFC 5646
+    [language_id_invalid_registry_tag] L’identifiant de langue contient une sous-étiquette de registre incorrecte
+    [language_id_canonicalization_failed] L’identifiant de langue ne peut pas être normalisé
+    [language_id_undefined_primary_language] L’identifiant de langue doit définir une langue principale
+    [language_id_duplicate] L’identifiant de langue doit être unique
+    [language_catalog_empty] Au moins un module de langue source est requis
+    [url_invalid] La valeur doit être une URL valide
+    [url_credentials_forbidden] L’URL ne doit pas contenir d’identifiants
+    [url_fragment_forbidden] L’URL ne doit pas contenir de fragment
+    [url_scheme_unsupported] Le schéma de l’URL doit être http ou https
+    [api_key_blank] L’API key ne doit pas être vide
+    [api_key_surrounding_whitespace] L’API key ne doit pas contenir d’espaces en début ou fin
+    [api_key_invalid_header] L’API key ne peut pas être représentée comme valeur HTTP Header
+    [strict_json_invalid] La valeur doit être un JSON strict (ligne={ $line }, colonne={ $column })
+    [json_object_required] La valeur doit être un objet JSON
+    [reserved_request_field] Le champ appartient au protocole de requête et ne peut pas être remplacé
+    [proxy_must_be_false_or_url] proxy doit être false ou une URL http/https complète
+    [pem_path_duplicate] Le chemin PEM doit être unique
+    [runtime_maximum_exceeded] La valeur dépasse le maximum de l’environnement (valeur réelle={ $actual }, maximum={ $maximum })
+    [value_surrounding_whitespace] La valeur ne doit pas contenir d’espaces en début ou fin
+    [value_blank] La valeur ne doit pas être vide
+    [path_blank] Le chemin ne doit pas être vide
+    [positive_required] La valeur doit être supérieure à zéro (valeur réelle={ $actual })
+    [usize_range_exceeded] La valeur dépasse la plage usize de cette plateforme (valeur réelle={ $actual })
+    [u32_range_exceeded] La valeur dépasse la plage u32 (valeur réelle={ $actual })
+    [duplicate_profile_id] L’identifiant du profil de traduction doit être unique
+    [selected_profile_invalid] La structure ou les types de champs du profil de traduction sélectionné sont incorrects
+    [referenced_client_not_found] Le client LLM référencé n’existe pas
+   *[other] __ATT_FALLBACK__
 }
+diagnostic-io-reason = Opération { $operation } : { $kind }
+diagnostic-io-reason-with-os-code = Opération { $operation } : { $kind } (OS { $os_code })
+diagnostic-io-reason-with-system-message = Opération { $operation } : { $kind } : { $system_message }
+diagnostic-io-reason-with-os-code-and-system-message = Opération { $operation } : { $kind } (OS { $os_code }) : { $system_message }
+diagnostic-failure-with-detail = { $failure } : { $detail }
+diagnostic-invalid-utf8 = UTF-8 incorrect à l’octet { $valid_up_to }, longueur incorrecte de { $error_len } octets
+diagnostic-incomplete-utf8 = Séquence UTF-8 incomplète après l’octet { $valid_up_to }
+diagnostic-toml-failure-value = { $code ->
+    [syntax] La syntaxe TOML est incorrecte
+    [missing_field] Un champ de configuration obligatoire est manquant
+    [unknown_field] La configuration contient un champ inconnu
+    [duplicate_field] Le champ de configuration est déclaré plusieurs fois
+    [type_mismatch] Type attendu : { $expected }
+    [invalid_value] La valeur de configuration ne respecte pas le contrat du champ
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-toml-expected-kind-value = { $code ->
+    [string] une chaîne
+    [integer] un entier
+    [boolean] un booléen
+    [string_or_boolean] une chaîne ou un booléen
+    [string_array] un tableau de chaînes
+    [integer_array] un tableau d’entiers
+    [string_pair_array] un tableau de paires de chaînes
+    [table] une table
+    [table_array] un tableau de tables
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-invalid-toml = TOML incorrect ({ $resource }) : { $failure }
+diagnostic-invalid-toml-at = TOML incorrect à la ligne { $line }, colonne { $column } ({ $resource }) : { $failure }
+diagnostic-http-no-details = La requête au service de modèle a échoué sans détail public sur l’état HTTP
+diagnostic-http-status = État HTTP { $status }
+diagnostic-http-retry-after = Retry-After de { $seconds } secondes
+diagnostic-http-provider-code = Code d’erreur du fournisseur { $code }
+diagnostic-http-provider-type = Type d’erreur du fournisseur { $kind }
+diagnostic-http-fact-separator = ;{ " " }
+diagnostic-sqlite = Code d’erreur SQLite principal { $primary_code }, code étendu { $extended_code }
+diagnostic-windows-status = L’opération Windows { $operation } a échoué avec NTSTATUS { $status }
+diagnostic-resource = { $resource } : valeur réelle { $actual }
+diagnostic-resource-with-maximum = { $resource } : valeur réelle { $actual }, maximum { $maximum }
 task-record-title = Tâche de traduction { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] Terminée

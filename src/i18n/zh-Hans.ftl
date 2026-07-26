@@ -186,7 +186,7 @@ diagnostic-stage-value = { $code ->
     [publication] 发布
     [shutdown] 关闭
     [logging] 项目日志
-   *[other] { $fallback }
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-impact-value = { $code ->
     [unchanged] 状态未改变
@@ -195,7 +195,7 @@ diagnostic-impact-value = { $code ->
     [state_applied_but_finalization_failed] 状态已生效，但收尾未完成
     [recovery_required] 必须先恢复，才能信任当前状态
     [outcome_unknown] 最终状态未知
-   *[other] { $fallback }
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-action-value = { $code ->
     [fix_configuration] 修正指出的配置字段后重试
@@ -207,7 +207,7 @@ diagnostic-action-value = { $code ->
     [preserve_recovery_artifacts] 不要删除列出的恢复产物；先恢复输出，再重试
     [retry] 重试该操作
     [report_bug] 携带错误码和日志路径报告 ATT 缺陷
-   *[other] { $fallback }
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
     [missing_required_value] 缺少必填值
@@ -239,7 +239,6 @@ diagnostic-failure-value = { $code ->
     [lock_cancelled] 等待所需锁时操作被取消
     [target_already_exists] 目标已经存在
     [file_identity_changed] 操作期间文件物理身份发生变化
-    [allocation_failed] 无法分配所需内存
     [invalid_path] 路径不是该操作的有效目标
     [wrong_publisher_instance] 发布令牌属于另一个发布器实例
     [journal_corrupt] 发布恢复日志损坏或不完整
@@ -284,7 +283,7 @@ diagnostic-failure-value = { $code ->
     [write_back_published_with_residuals] 输出已发布，但部分恢复产物无法删除
     [write_back_recovery_required] 必须先恢复输出目录，才能信任其中内容
     [internal_invariant] 内部不变量被破坏；这是 ATT 缺陷
-   *[other] { $fallback }
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-io-kind-value = { $code ->
     [not_found] 对象不存在
@@ -326,51 +325,91 @@ diagnostic-io-kind-value = { $code ->
     [unexpected_eof] 文件意外结束
     [out_of_memory] 操作系统无法分配内存
     [other] 其他操作系统错误
-   *[unknown] { $fallback }
+   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-    [runtime_configuration_invalid] 运行时配置无效{ $facts }
-    [unsupported_prompt_locale] 必须是小写 auto 或受支持的 BCP 47 界面语言{ $facts }
-    [language_policy_term_blank] 语言策略术语不能为空{ $facts }
-    [language_policy_term_surrounding_whitespace] 语言策略术语不能带首尾空白{ $facts }
-    [language_policy_term_duplicate] 语言策略术语不能重复{ $facts }
-    [quote_repair_candidates_empty] 引号修复候选不能为空{ $facts }
-    [quote_repair_delimiter_invalid] 引号分隔符必须是单个非空白字符{ $facts }
-    [quote_repair_pair_duplicate] 引号修复对不能重复{ $facts }
-    [quote_repair_delimiter_ambiguous] 同一引号分隔符不能同时承担冲突角色{ $facts }
-    [language_id_blank] 语言 ID 不能为空{ $facts }
-    [language_id_surrounding_whitespace] 语言 ID 不能带首尾空白{ $facts }
-    [language_id_uses_underscore] 语言 ID 必须使用连字符，不能使用下划线{ $facts }
-    [language_id_invalid_syntax] 语言 ID 不是有效 BCP 47 标签{ $facts }
-    [language_id_invalid_registry_tag] 语言 ID 不是 IANA 注册标签{ $facts }
-    [language_id_canonicalization_failed] 语言 ID 无法规范化{ $facts }
-    [language_id_undefined_primary_language] 语言 ID 的主语言未定义{ $facts }
-    [language_id_duplicate] 语言 ID 不能重复{ $facts }
-    [language_catalog_empty] 语言目录必须至少包含一种语言{ $facts }
-    [url_invalid] URL 无效{ $facts }
-    [url_credentials_forbidden] URL 不能包含用户名或密码{ $facts }
-    [url_fragment_forbidden] URL 不能包含片段{ $facts }
-    [url_scheme_unsupported] URL 必须使用 http 或 https{ $facts }
-    [api_key_blank] API key 不能为空{ $facts }
-    [api_key_surrounding_whitespace] API key 不能带首尾空白{ $facts }
-    [api_key_invalid_header] API key 不是有效 HTTP Header 值{ $facts }
-    [strict_json_invalid] JSON 必须严格有效{ $facts }
-    [json_object_required] JSON 顶层必须是对象{ $facts }
-    [reserved_request_field] JSON 包含 ATT 保留的请求字段{ $facts }
-    [proxy_must_be_false_or_url] proxy 必须是 false 或有效代理 URL{ $facts }
-    [pem_path_duplicate] PEM 路径不能重复{ $facts }
-    [runtime_maximum_exceeded] 该值超过底层运行时可表示范围{ $facts }
-    [value_surrounding_whitespace] 值不能带首尾空白{ $facts }
-    [value_blank] 值不能为空{ $facts }
-    [path_blank] 路径不能为空{ $facts }
-    [positive_required] 值必须大于零{ $facts }
-    [usize_range_exceeded] 值超过当前平台的 usize 范围{ $facts }
-    [u32_range_exceeded] 值超过 u32 范围{ $facts }
-    [duplicate_profile_id] 翻译 Profile ID 必须唯一{ $facts }
-    [selected_profile_invalid] 所选翻译 Profile 的结构或字段类型无效{ $facts }
-    [referenced_client_not_found] 引用的 LLM Client 不存在{ $facts }
-   *[other] { $fallback }
+    [runtime_configuration_invalid] 运行时配置无效
+    [unsupported_prompt_locale] 必须是全小写的 auto 或受支持的 BCP 47 界面语言
+    [language_policy_term_blank] 语言策略术语不能为空
+    [language_policy_term_surrounding_whitespace] 语言策略术语不能带首尾空白
+    [language_policy_term_duplicate] 语言策略术语不能重复
+    [quote_repair_candidates_empty] 引号修复候选列表不能为空
+    [quote_repair_delimiter_invalid] 引号修复分隔符不能是字母数字、空白或控制字符
+    [quote_repair_pair_duplicate] 引号修复对不能重复
+    [quote_repair_delimiter_ambiguous] 引号修复分隔符必须只属于一个配对
+    [language_id_blank] 语言 ID 不能为空
+    [language_id_surrounding_whitespace] 语言 ID 不能带首尾空白
+    [language_id_uses_underscore] 语言 ID 的子标签之间必须使用连字符
+    [language_id_invalid_syntax] 语言 ID 必须符合 RFC 5646 语法
+    [language_id_invalid_registry_tag] 语言 ID 包含无效的注册表子标签
+    [language_id_canonicalization_failed] 语言 ID 无法规范化
+    [language_id_undefined_primary_language] 语言 ID 必须定义主语言
+    [language_id_duplicate] 语言 ID 必须唯一
+    [language_catalog_empty] 至少需要一个来源语言模块
+    [url_invalid] 值必须是有效 URL
+    [url_credentials_forbidden] URL 不能包含凭据
+    [url_fragment_forbidden] URL 不能包含片段
+    [url_scheme_unsupported] URL scheme 必须是 http 或 https
+    [api_key_blank] API key 不能为空
+    [api_key_surrounding_whitespace] API key 不能带首尾空白
+    [api_key_invalid_header] API key 不是有效 HTTP Header 值
+    [strict_json_invalid] 值必须是严格 JSON（行={ $line }，列={ $column }）
+    [json_object_required] 值必须是 JSON 对象
+    [reserved_request_field] 该字段由请求协议拥有，不能覆盖
+    [proxy_must_be_false_or_url] proxy 必须是 false 或完整的 http/https URL
+    [pem_path_duplicate] PEM 路径必须唯一
+    [runtime_maximum_exceeded] 值超过运行时上限（实际值={ $actual }，上限={ $maximum }）
+    [value_surrounding_whitespace] 值不能带首尾空白
+    [value_blank] 值不能为空
+    [path_blank] 路径不能为空
+    [positive_required] 值必须大于零（实际值={ $actual }）
+    [usize_range_exceeded] 值超过当前平台的 usize 范围（实际值={ $actual }）
+    [u32_range_exceeded] 值超过 u32 范围（实际值={ $actual }）
+    [duplicate_profile_id] 翻译 Profile ID 必须唯一
+    [selected_profile_invalid] 所选翻译 Profile 的结构或字段类型无效
+    [referenced_client_not_found] 引用的 LLM Client 不存在
+   *[other] __ATT_FALLBACK__
 }
+diagnostic-io-reason = 操作 { $operation }：{ $kind }
+diagnostic-io-reason-with-os-code = 操作 { $operation }：{ $kind }（OS { $os_code }）
+diagnostic-io-reason-with-system-message = 操作 { $operation }：{ $kind }：{ $system_message }
+diagnostic-io-reason-with-os-code-and-system-message = 操作 { $operation }：{ $kind }（OS { $os_code }）：{ $system_message }
+diagnostic-failure-with-detail = { $failure }：{ $detail }
+diagnostic-invalid-utf8 = 第 { $valid_up_to } 字节处的 UTF-8 无效，无效长度为 { $error_len } 字节
+diagnostic-incomplete-utf8 = 第 { $valid_up_to } 字节后是未完成的 UTF-8 序列
+diagnostic-toml-failure-value = { $code ->
+    [syntax] TOML 语法无效
+    [missing_field] 缺少必填配置字段
+    [unknown_field] 配置包含未知字段
+    [duplicate_field] 配置字段被重复声明
+    [type_mismatch] 应为{ $expected }
+    [invalid_value] 配置值不符合字段契约
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-toml-expected-kind-value = { $code ->
+    [string] 字符串
+    [integer] 整数
+    [boolean] 布尔值
+    [string_or_boolean] 字符串或布尔值
+    [string_array] 字符串数组
+    [integer_array] 整数数组
+    [string_pair_array] 字符串对数组
+    [table] 表
+    [table_array] 表数组
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-invalid-toml = TOML 无效（{ $resource }）：{ $failure }
+diagnostic-invalid-toml-at = TOML 第 { $line } 行、第 { $column } 列无效（{ $resource }）：{ $failure }
+diagnostic-http-no-details = 模型服务请求失败，但没有返回可公开的 HTTP 状态详情
+diagnostic-http-status = HTTP 状态码 { $status }
+diagnostic-http-retry-after = Retry-After { $seconds } 秒
+diagnostic-http-provider-code = 供应商错误码 { $code }
+diagnostic-http-provider-type = 供应商错误类型 { $kind }
+diagnostic-http-fact-separator = ；
+diagnostic-sqlite = SQLite 主错误码 { $primary_code }，扩展错误码 { $extended_code }
+diagnostic-windows-status = Windows 操作 { $operation } 失败，NTSTATUS { $status }
+diagnostic-resource = { $resource }：实际值 { $actual }
+diagnostic-resource-with-maximum = { $resource }：实际值 { $actual }，上限 { $maximum }
 task-record-title = 翻译任务 { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] 完成

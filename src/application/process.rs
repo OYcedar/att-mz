@@ -50,7 +50,13 @@ fn run_guarded() -> ExitCode {
 }
 
 fn render_uncaught_panic() -> ExitCode {
-    let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+    // UI locale 尚未由完整 Clap 解析确认时，现行 CLI 契约固定使用英语兜底。
+    let localizer = UiLocalizer::new(UiLocale::English);
+    let mut stderr = io::stderr();
+    render_uncaught_panic_with(&localizer, &mut stderr)
+}
+
+fn render_uncaught_panic_with(localizer: &UiLocalizer, stderr: &mut dyn Write) -> ExitCode {
     let diagnostic = SafeDiagnostic::new(
         DiagnosticCode::InternalOperation,
         DiagnosticStage::ProcessStartup,
@@ -59,8 +65,7 @@ fn render_uncaught_panic() -> ExitCode {
         DiagnosticImpact::OutcomeUnknown,
         DiagnosticAction::ReportBug,
     );
-    let mut stderr = io::stderr();
-    render_diagnostic_fatal(&localizer, &diagnostic, &mut stderr)
+    render_diagnostic_fatal(localizer, &diagnostic, stderr)
 }
 
 fn run_from<A, S>(args: A, stdout: &mut dyn Write, stderr: &mut dyn Write) -> ExitCode
@@ -81,6 +86,33 @@ where
     };
     let locale = resolved_locale.locale();
     let localizer = UiLocalizer::new(locale);
+    catch_after_cli_parsing(&localizer, stderr, |stderr| {
+        run_after_cli_parsing(arguments, locale, &localizer, stdout, stderr)
+    })
+}
+
+fn catch_after_cli_parsing(
+    localizer: &UiLocalizer,
+    stderr: &mut dyn Write,
+    operation: impl FnOnce(&mut dyn Write) -> ExitCode,
+) -> ExitCode {
+    match catch_unwind(AssertUnwindSafe(|| operation(stderr))) {
+        Ok(exit_code) => exit_code,
+        Err(payload) => {
+            // 与命令 panic 边界一致，payload 只触发控制流，绝不读取或格式化。
+            drop(payload);
+            render_uncaught_panic_with(localizer, stderr)
+        }
+    }
+}
+
+fn run_after_cli_parsing(
+    arguments: AttArguments,
+    locale: UiLocale,
+    localizer: &UiLocalizer,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
     let progress_mode = match arguments.progress {
         ProgressArgument::Auto => ProgressMode::Auto,
         ProgressArgument::Plain => ProgressMode::Plain,
@@ -98,17 +130,17 @@ where
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::CheckPathAndPermissions,
             );
-            return render_diagnostic_fatal(&localizer, &diagnostic, stderr);
+            return render_diagnostic_fatal(localizer, &diagnostic, stderr);
         }
     };
     let configuration_path = match resolve_configuration_path(&arguments.config, &current_directory)
     {
         Ok(path) => path,
-        Err(error) => return render_configuration_path_error(&localizer, &error, stderr),
+        Err(error) => return render_configuration_path_error(localizer, &error, stderr),
     };
     let configuration = match load_product_configuration(&configuration_path, arguments.product) {
         Ok(configuration) => configuration,
-        Err(error) => return render_configuration_load_error(&localizer, &error, stderr),
+        Err(error) => return render_configuration_load_error(localizer, &error, stderr),
     };
     let runtime_parallelism = match std::thread::available_parallelism() {
         Ok(parallelism) => parallelism,
@@ -122,7 +154,7 @@ where
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::Retry,
             );
-            return render_diagnostic_fatal(&localizer, &diagnostic, stderr);
+            return render_diagnostic_fatal(localizer, &diagnostic, stderr);
         }
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -141,7 +173,7 @@ where
                 DiagnosticImpact::Unchanged,
                 DiagnosticAction::Retry,
             );
-            return render_diagnostic_fatal(&localizer, &diagnostic, stderr);
+            return render_diagnostic_fatal(localizer, &diagnostic, stderr);
         }
     };
 
@@ -163,12 +195,12 @@ where
     let panic_boundary = pending_project_log
         .as_mut()
         .map(PendingProjectLog::arm_presentation_panic);
-    catch_logged_presentation(panic_boundary, &localizer, stderr, |stderr| {
+    catch_logged_presentation(panic_boundary, localizer, stderr, |stderr| {
         render_command_report(
             report.result,
             report.shutdown_error,
             pending_project_log,
-            &localizer,
+            localizer,
             stdout,
             stderr,
         )
@@ -667,7 +699,9 @@ mod tests {
                 path: "settings.toml".into(),
                 location: Some(super::super::config::SourceLocation::new(3, 7)),
                 resource: "llm.clients.primary".to_owned(),
-                reason: "不应呈现的内部分类",
+                failure: crate::diagnostic::ConfigurationTomlFailureKind::TypeMismatch {
+                    expected: crate::diagnostic::ConfigurationTomlValueKind::Table,
+                },
             },
             &mut stderr,
         );
@@ -678,7 +712,44 @@ mod tests {
         assert!(stderr.contains("settings.toml"));
         assert!(plain.contains("TOML 第 3 行、第 7 列无效"));
         assert!(stderr.contains("llm.clients.primary"));
-        assert!(stderr.contains("不应呈现的内部分类"));
+        let expected_kind =
+            localizer.format(UiMessage::DiagnosticTomlExpectedKindValue { code: "table" });
+        let expected_failure = localizer.format(UiMessage::DiagnosticTomlFailureValue {
+            code: "type_mismatch",
+            expected: &expected_kind,
+        });
+        let expected_failure = expected_failure.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(plain.contains(&expected_failure));
+    }
+
+    #[test]
+    fn panic_fallback_uses_selected_locale_after_cli_parsing_and_english_before_it() {
+        const PANIC_BODY: &str = "PROCESS_STARTUP_PANIC_BODY_SENTINEL";
+        let selected = UiLocalizer::new(UiLocale::Japanese);
+        let mut selected_stderr = Vec::new();
+        let selected_exit = catch_after_cli_parsing(&selected, &mut selected_stderr, |_stderr| {
+            panic!("{PANIC_BODY}")
+        });
+        assert_eq!(selected_exit, ExitCode::FAILURE);
+        let selected_stderr =
+            String::from_utf8(selected_stderr).expect("已选 locale 诊断应为 UTF-8");
+        assert!(
+            selected_stderr.contains(&selected.format(UiMessage::DiagnosticTitle {
+                code: DiagnosticCode::InternalOperation.as_str(),
+            }))
+        );
+        assert!(!selected_stderr.contains(PANIC_BODY));
+
+        let english = UiLocalizer::new(UiLocale::English);
+        let mut startup_stderr = Vec::new();
+        let startup_exit = render_uncaught_panic_with(&english, &mut startup_stderr);
+        assert_eq!(startup_exit, ExitCode::FAILURE);
+        let startup_stderr = String::from_utf8(startup_stderr).expect("解析前诊断应为 UTF-8");
+        assert!(
+            startup_stderr.contains(&english.format(UiMessage::DiagnosticTitle {
+                code: DiagnosticCode::InternalOperation.as_str(),
+            }))
+        );
     }
 
     #[test]

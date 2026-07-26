@@ -43,30 +43,11 @@ impl AttArguments {
         let explicit_language = match scan_ui_language(&arguments) {
             UiLanguageScan::Absent => None,
             UiLanguageScan::Value(value) => Some(value),
-            UiLanguageScan::MissingValue => {
+            failure @ (UiLanguageScan::MissingValue | UiLanguageScan::InvalidUnicode) => {
                 let resolved = resolve_lower_priority_ui_locale(UiLocaleInputSource::CommandLine);
                 let localizer = UiLocalizer::new(resolved.locale());
-                let mut command = localized_command(&localizer);
-                let usage = localized_usage(&command.render_usage().to_string(), &localizer);
-                return Err(LocalizedCliError::input(
-                    ErrorKind::MissingRequiredArgument,
-                    localizer.format(UiMessage::CliMissingValue {
-                        argument: "--ui-language",
-                    }),
-                    Some(usage),
-                    &localizer,
-                ));
-            }
-            UiLanguageScan::InvalidUnicode => {
-                let resolved = resolve_lower_priority_ui_locale(UiLocaleInputSource::CommandLine);
-                let localizer = UiLocalizer::new(resolved.locale());
-                let mut command = localized_command(&localizer);
-                let usage = localized_usage(&command.render_usage().to_string(), &localizer);
-                return Err(LocalizedCliError::input(
-                    ErrorKind::InvalidUtf8,
-                    localizer.format(UiMessage::CliInvalidUtf8),
-                    Some(usage),
-                    &localizer,
+                return Err(parse_before_ui_locale_failure(
+                    &arguments, failure, &localizer,
                 ));
             }
         };
@@ -316,6 +297,46 @@ pub(crate) enum MzCommand {
     /// 在项目上下文中执行一次可信 Lua 程序。
     #[command(name = "lua")]
     Lua(ProjectLuaArguments),
+}
+
+/// 预扫描只负责在 Clap 生成内容前选择语言，不能抢占真实参数 schema 的根错误。
+///
+/// 只有 Clap 确认整条命令行不存在更早的结构错误时，才呈现预扫描自身无法建立 locale
+/// 的失败。这也确保新增或重排参数时，预扫描不会成为第二套命令行解析器。
+fn parse_before_ui_locale_failure(
+    arguments: &[OsString],
+    failure: UiLanguageScan,
+    localizer: &UiLocalizer,
+) -> LocalizedCliError {
+    let command = localized_command(localizer);
+    let mut fallback_usage_command = command.clone();
+    let fallback_usage = localized_usage(
+        &fallback_usage_command.render_usage().to_string(),
+        localizer,
+    );
+    if let Err(error) = command.try_get_matches_from(arguments.iter().cloned()) {
+        return LocalizedCliError::from_clap(error, localizer, Some(fallback_usage));
+    }
+
+    match failure {
+        UiLanguageScan::MissingValue => LocalizedCliError::input(
+            ErrorKind::MissingRequiredArgument,
+            localizer.format(UiMessage::CliMissingValue {
+                argument: "--ui-language",
+            }),
+            Some(fallback_usage),
+            localizer,
+        ),
+        UiLanguageScan::InvalidUnicode => LocalizedCliError::input(
+            ErrorKind::InvalidUtf8,
+            localizer.format(UiMessage::CliInvalidUtf8),
+            Some(fallback_usage),
+            localizer,
+        ),
+        UiLanguageScan::Absent | UiLanguageScan::Value(_) => {
+            unreachable!("只有失败的 UI locale 预扫描才能进入本边界")
+        }
+    }
 }
 
 /// `att mv` 当前支持的用户意图。
@@ -1167,6 +1188,33 @@ mod tests {
                 .contains(&localizer.format(UiMessage::CliTryHelp))
         );
         assert!(!error.output().contains("Usage:"));
+    }
+
+    #[test]
+    fn ui_language_scan_failure_preserves_the_earlier_clap_root_error() {
+        let error = AttArguments::try_parse_localized_from([
+            "att",
+            "--definitely-unknown",
+            "--ui-language",
+        ])
+        .expect_err("未知参数必须优先于后续 UI locale 预扫描失败");
+
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        assert!(
+            error.output().contains("--definitely-unknown"),
+            "必须呈现 Clap 依据真实 schema 选择的根错误：{}",
+            error.output()
+        );
+        assert!(
+            !error
+                .output()
+                .contains(&UiLocalizer::new(UiLocale::English).format(
+                    UiMessage::CliMissingValue {
+                        argument: "--ui-language",
+                    }
+                )),
+            "预扫描不得覆盖更早的 Clap 根错误"
+        );
     }
 
     #[test]

@@ -192,25 +192,245 @@ diagnostic-recovery-value = { $kind ->
 }
 diagnostic-related = الخطأ المرتبط { $index }:
 diagnostic-stage-value = { $code ->
+    [process_startup] بدء العملية
     [process_output] إخراج العملية
+    [configuration] تحميل الإعدادات
+    [command_preparation] إعداد الأمر
+    [project_opening] فتح المشروع
+    [init] التهيئة
+    [extract] الاستخراج
+    [translate] الترجمة
+    [write_back] إعادة الكتابة
     [lua] تنفيذ Lua للمشروع
-   *[other] { $fallback }
+    [model_request] طلب النموذج
+    [run_plan_finalization] إنهاء خطة التشغيل
+    [publication] النشر
+    [shutdown] الإغلاق
+    [logging] سجل المشروع
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-impact-value = { $code ->
-   *[other] { $fallback }
+    [unchanged] لم تتغير الحالة
+    [valid_progress_preserved] حُفظ التقدم الصالح
+    [result_applied_but_run_plan_not_saved] طُبقت النتيجة، لكن لم تُحفظ خطة التشغيل
+    [state_applied_but_finalization_failed] طُبقت الحالة، لكن لم يكتمل الإنهاء
+    [recovery_required] يلزم الاسترداد قبل الوثوق بالحالة
+    [outcome_unknown] الحالة النهائية غير معروفة
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-action-value = { $code ->
-   *[other] { $fallback }
+    [fix_configuration] صحح حقل الإعدادات المحدد ثم أعد المحاولة
+    [fix_input] صحح الإدخال المحدد ثم أعد المحاولة
+    [check_path_and_permissions] تحقق من المسار وحالة نظام الملفات والأذونات
+    [check_project_state] افحص حالة المشروع وصححها ثم أعد المحاولة
+    [retry_after_resolving_contention] انتظر انتهاء العملية المتعارضة ثم أعد المحاولة
+    [check_model_service] تحقق من استجابة خدمة النموذج وحدود الحساب
+    [preserve_recovery_artifacts] لا تحذف عناصر الاسترداد المدرجة؛ استرد المخرجات قبل إعادة المحاولة
+    [retry] أعد محاولة العملية
+    [report_bug] أبلغ عن عيب ATT هذا مع رمز الخطأ ومسار السجل
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-failure-value = { $code ->
-   *[other] { $fallback }
+    [missing_required_value] قيمة مطلوبة مفقودة
+    [extract_plan_required] لا توجد خطة Extract محفوظة قابلة لإعادة الاستخدام؛ حدد واحدًا على الأقل من --builtin أو --rules أو --lua
+    [conflicting_values] القيم المقدمة متعارضة
+    [invalid_syntax] صياغة القيمة غير صالحة
+    [invalid_encoding] ترميز النص غير صالح
+    [invalid_value] القيمة تخالف العقد المطلوب
+    [not_found] الكائن المطلوب غير موجود
+    [busy] المورد مستخدم بواسطة عملية أخرى
+    [state_mismatch] حالة المشروع المحفوظة لا تستوفي متطلبات هذه العملية
+    [requirement_failed] شرط مسبق مطلوب غير مستوفى
+    [transaction_rolled_back] فشلت المعاملة وتراجعت تغييراتها
+    [transaction_outcome_unknown] انتهت المعاملة دون تأكيد التثبيت أو التراجع
+    [finalization_failed] نتيجة العملية موجودة لكن الإنهاء فشل
+    [rollback_failed] فشلت العملية الأساسية وفشل التراجع أيضًا
+    [external_service_rejected] رفضت الخدمة الخارجية الطلب
+    [external_service_unavailable] الخدمة الخارجية غير متاحة
+    [executor_closed] خدمة التنفيذ قيد الإغلاق أو مغلقة بالفعل
+    [concurrent_shutdown] مستدعٍ آخر يغلق المنفّذ بالفعل
+    [executor_state_poisoned] حالة دورة حياة المنفّذ تالفة
+    [worker_spawn_failed] تعذر على نظام التشغيل إنشاء خيط العامل
+    [worker_channel_closed] أُغلقت قناة أوامر العامل قبل اكتمال الإنهاء
+    [worker_panicked] انتهى عامل على نحو غير متوقع
+    [reparse_point_forbidden] يحتوي المسار على نقطة إعادة تحليل لا يمكن الوثوق بها
+    [non_local_volume] المسار ليس على وحدة تخزين محلية ثابتة
+    [non_ntfs_volume] المسار ليس على وحدة تخزين NTFS
+    [case_sensitive_directory] يستخدم الدليل دلالات أسماء حساسة لحالة الأحرف
+    [lock_cancelled] أُلغي انتظار القفل المطلوب
+    [target_already_exists] الوجهة موجودة بالفعل
+    [file_identity_changed] تغيرت هوية الملف أثناء العملية
+    [invalid_path] المسار ليس هدفًا صالحًا لهذه العملية
+    [wrong_publisher_instance] رمز النشر يخص مثيل ناشر آخر
+    [journal_corrupt] سجل استرداد النشر غير صالح أو غير مكتمل
+    [unexpected_artifact] عنصر غير متوقع في نظام الملفات يمنع العملية
+    [interactive_session_already_open] جلسة SQLite تفاعلية أخرى نشطة بالفعل
+    [backup_incomplete] لم تصل نسخة SQLite الاحتياطية إلى حالة الاكتمال
+    [request_serialization_failed] تعذر إجراء تسلسل لطلب النموذج
+    [response_parsing_failed] استجابة النموذج ليست JSON صالحًا
+    [invalid_response_contract] استجابة النموذج لا تستوفي عقد الاستجابة المطلوب
+    [transport_failed] فشل نقل HTTP قبل وصول استجابة صالحة
+    [lua_database_open_failed] تعذر على مضيف Lua فتح جلسة قاعدة بيانات المشروع
+    [lua_context_creation_failed] تعذر على وقت تشغيل Lua إنشاء سياق VM
+    [lua_compilation_failed] تعذر تجميع برنامج Lua الرئيسي
+    [lua_execution_failed] فشل برنامج Lua الرئيسي أثناء التشغيل
+    [lua_host_call_failed] فشل استدعاء إحدى إمكانات مضيف Lua
+    [lua_finalization_failed] تعذر على مضيف Lua إنهاء جميع الموارد المرتبطة
+    [lua_unclosed_transaction] انتهى برنامج Lua مع معاملة مفتوحة؛ تم التراجع عن المعاملة
+    [lua_snapshot_store_failed] تعذر تثبيت لقطة استخراج Lua التي تم التحقق منها
+    [rules_definition_invalid] برنامج Rules لا يستوفي عقد تعريف Rules
+    [rules_document_read_failed] تعذرت قراءة مستند مصدر يتطلبه برنامج Rules
+    [rules_no_non_blank_match] لم ينتج إدخال Rules وحدة دلالية غير فارغة
+    [rules_invalid_target] اختار إدخال Rules قيمة لا تصلح كهدف نصي
+    [rules_pattern_match_failed] تعذر تقييم نمط PCRE2 في Rules
+    [rules_zero_width_match] أنتج نمط Rules تطابقًا بعرض صفري
+    [rules_overlapping_capture] أنتج نمط Rules لقطات نصية متداخلة
+    [rules_missing_text_capture] لم تشارك لقطة النص المسماة المطلوبة في التطابق
+    [rules_invalid_capture_range] تطابق Rules أو نطاق اللقطة خارج حدود أحرف UTF-8 الصالحة
+    [rules_duplicate_target] يطالب إدخالان في Rules بنفس هدف النص الفعلي
+    [rules_invalid_materialization] لا تستطيع وصفة إسقاط Rules إعادة بناء قيمة المصدر
+    [rules_snapshot_invalid] مجموعات Rules المستخرجة لا تكوّن لقطة أصول صالحة
+    [rules_snapshot_store_failed] تعذر تثبيت لقطة استخراج Rules التي تم التحقق منها
+    [write_back_extraction_out_of_date] لم تعد الأصول المستخرجة تطابق مصدر المشروع الحالي
+    [write_back_asset_snapshot_invalid] أصول Standard المخزنة لا تكوّن لقطة إعادة كتابة صالحة
+    [source_document_invalid] مستند مصدر RPG Maker لا يستوفي تنسيق المستند المطلوب
+    [write_back_mutation_invalid] لا يمكن تطبيق تعديل ترجمة متحقق منه على موضع المصدر المجمّد
+    [write_back_output_path_invalid] الملف المعاد كتابته خارج شجرة إخراج RPG Maker المسموح بها
+    [write_back_output_path_duplicate] أكثر من ملف معاد كتابته يستهدف مسار الإخراج نفسه
+    [write_back_candidate_project_mismatch] مرشح إعادة الكتابة المحضر يخص مشروعًا آخر
+    [write_back_candidate_invalid] مرشح إعادة الكتابة لا يستوفي بنية شجرة data/js المطلوبة
+    [write_back_unexpected_lua_outcome] أعاد برنامج Lua لإعادة الكتابة نتيجة لمرحلة Lua أخرى
+    [write_back_not_published] لم يستبدل مرشح إعادة الكتابة دليل الإخراج الحالي
+    [write_back_published_with_residuals] نُشر الإخراج، لكن تعذرت إزالة عنصر استرداد واحد أو أكثر
+    [write_back_recovery_required] يلزم استرداد دليل الإخراج قبل الوثوق بمحتوياته
+    [internal_invariant] انتُهك ثابت داخلي؛ هذا عيب في ATT
+   *[other] __ATT_FALLBACK__
 }
 diagnostic-io-kind-value = { $code ->
-   *[other] { $fallback }
+    [not_found] غير موجود
+    [permission_denied] الإذن مرفوض
+    [connection_refused] الاتصال مرفوض
+    [connection_reset] أُعيد تعيين الاتصال
+    [host_unreachable] لا يمكن الوصول إلى المضيف
+    [network_unreachable] لا يمكن الوصول إلى الشبكة
+    [connection_aborted] أُحبط الاتصال
+    [not_connected] غير متصل
+    [address_in_use] العنوان مستخدم بالفعل
+    [address_not_available] العنوان غير متاح
+    [network_down] الشبكة متوقفة
+    [broken_pipe] الأنبوب مقطوع
+    [already_exists] موجود بالفعل
+    [would_block] ستؤدي العملية إلى الحظر
+    [not_a_directory] ليس دليلاً
+    [is_a_directory] هو دليل
+    [directory_not_empty] الدليل غير فارغ
+    [read_only_filesystem] نظام الملفات للقراءة فقط
+    [stale_network_file_handle] مقبض ملف الشبكة منتهي الصلاحية
+    [invalid_input] إدخال العملية غير صالح
+    [invalid_data] البيانات غير صالحة
+    [timed_out] انتهت مهلة العملية
+    [write_zero] لم تحقق الكتابة أي تقدم
+    [storage_full] مساحة التخزين ممتلئة
+    [not_seekable] لا يمكن الانتقال داخل الكائن
+    [quota_exceeded] تم تجاوز حصة التخزين
+    [file_too_large] الملف أكبر مما يدعمه النظام الأساسي
+    [resource_busy] المورد مشغول
+    [executable_file_busy] الملف التنفيذي مشغول
+    [deadlock] ستؤدي العملية إلى توقف متبادل
+    [crosses_devices] تعبر العملية أجهزة نظام الملفات
+    [too_many_links] روابط نظام الملفات كثيرة جدًا
+    [invalid_filename] اسم الملف غير صالح
+    [argument_list_too_long] قائمة وسائط نظام التشغيل طويلة جدًا
+    [interrupted] قوطعت العملية
+    [unsupported] العملية غير مدعومة
+    [unexpected_eof] نهاية ملف غير متوقعة
+    [out_of_memory] تعذر على نظام التشغيل تخصيص الذاكرة
+    [other] خطأ آخر في نظام التشغيل
+   *[unknown] __ATT_FALLBACK__
 }
 diagnostic-configuration-rule-value = { $code ->
-   *[other] { $fallback }{ $facts }
+    [runtime_configuration_invalid] إعدادات وقت التشغيل غير صالحة
+    [unsupported_prompt_locale] يجب أن تكون auto بأحرف صغيرة تمامًا أو لغة واجهة BCP 47 مدعومة
+    [language_policy_term_blank] يجب ألا يكون مصطلح سياسة اللغة فارغًا
+    [language_policy_term_surrounding_whitespace] يجب ألا يحتوي مصطلح سياسة اللغة على مسافات طرفية
+    [language_policy_term_duplicate] يجب ألا يتكرر مصطلح سياسة اللغة
+    [quote_repair_candidates_empty] يجب ألا تكون قائمة مرشحي إصلاح علامات الاقتباس فارغة
+    [quote_repair_delimiter_invalid] يجب ألا يكون فاصل إصلاح علامات الاقتباس حرفًا أبجديًا رقميًا أو مسافة أو حرف تحكم
+    [quote_repair_pair_duplicate] يجب ألا يتكرر زوج إصلاح علامات الاقتباس
+    [quote_repair_delimiter_ambiguous] يجب أن ينتمي فاصل إصلاح علامات الاقتباس إلى زوج واحد فقط
+    [language_id_blank] يجب ألا يكون معرّف اللغة فارغًا
+    [language_id_surrounding_whitespace] يجب ألا يحتوي معرّف اللغة على مسافات طرفية
+    [language_id_uses_underscore] يجب أن يستخدم معرّف اللغة الشرطات بين الوسوم الفرعية
+    [language_id_invalid_syntax] يجب أن يطابق معرّف اللغة صياغة RFC 5646
+    [language_id_invalid_registry_tag] يحتوي معرّف اللغة على وسم فرعي غير صالح في السجل
+    [language_id_canonicalization_failed] لا يمكن توحيد معرّف اللغة
+    [language_id_undefined_primary_language] يجب أن يحدد معرّف اللغة لغة أساسية
+    [language_id_duplicate] يجب أن يكون معرّف اللغة فريدًا
+    [language_catalog_empty] يلزم وجود وحدة لغة مصدر واحدة على الأقل
+    [url_invalid] يجب أن تكون القيمة عنوان URL صالحًا
+    [url_credentials_forbidden] يجب ألا يحتوي URL على بيانات اعتماد
+    [url_fragment_forbidden] يجب ألا يحتوي URL على جزء
+    [url_scheme_unsupported] يجب أن يكون مخطط URL هو http أو https
+    [api_key_blank] يجب ألا يكون API key فارغًا
+    [api_key_surrounding_whitespace] يجب ألا يحتوي API key على مسافات طرفية
+    [api_key_invalid_header] لا يمكن تمثيل API key كقيمة HTTP Header
+    [strict_json_invalid] يجب أن تكون القيمة JSON صارمًا (السطر={ $line }، العمود={ $column })
+    [json_object_required] يجب أن تكون القيمة كائن JSON
+    [reserved_request_field] هذا الحقل مملوك لبروتوكول الطلب ولا يمكن تجاوزه
+    [proxy_must_be_false_or_url] يجب أن يكون proxy هو false أو عنوان http/https كاملاً
+    [pem_path_duplicate] يجب أن يكون مسار PEM فريدًا
+    [runtime_maximum_exceeded] تتجاوز القيمة الحد الأقصى لوقت التشغيل (الفعلي={ $actual }، الأقصى={ $maximum })
+    [value_surrounding_whitespace] يجب ألا تحتوي القيمة على مسافات طرفية
+    [value_blank] يجب ألا تكون القيمة فارغة
+    [path_blank] يجب ألا يكون المسار فارغًا
+    [positive_required] يجب أن تكون القيمة أكبر من صفر (الفعلي={ $actual })
+    [usize_range_exceeded] تتجاوز القيمة نطاق usize لهذه المنصة (الفعلي={ $actual })
+    [u32_range_exceeded] تتجاوز القيمة نطاق u32 (الفعلي={ $actual })
+    [duplicate_profile_id] يجب أن يكون معرّف ملف الترجمة فريدًا
+    [selected_profile_invalid] بنية ملف الترجمة المحدد أو أنواع حقوله غير صالحة
+    [referenced_client_not_found] عميل LLM المشار إليه غير موجود
+   *[other] __ATT_FALLBACK__
 }
+diagnostic-io-reason = العملية { $operation }: { $kind }
+diagnostic-io-reason-with-os-code = العملية { $operation }: { $kind } (OS { $os_code })
+diagnostic-io-reason-with-system-message = العملية { $operation }: { $kind }: { $system_message }
+diagnostic-io-reason-with-os-code-and-system-message = العملية { $operation }: { $kind } (OS { $os_code }): { $system_message }
+diagnostic-failure-with-detail = { $failure }: { $detail }
+diagnostic-invalid-utf8 = UTF-8 غير صالح عند البايت { $valid_up_to }، وطول الخطأ { $error_len } بايت
+diagnostic-incomplete-utf8 = تسلسل UTF-8 غير مكتمل بعد البايت { $valid_up_to }
+diagnostic-toml-failure-value = { $code ->
+    [syntax] صياغة TOML غير صالحة
+    [missing_field] حقل إعدادات مطلوب مفقود
+    [unknown_field] تحتوي الإعدادات على حقل غير معروف
+    [duplicate_field] تم تعريف حقل الإعدادات أكثر من مرة
+    [type_mismatch] النوع المتوقع هو { $expected }
+    [invalid_value] قيمة الإعدادات تخالف عقد الحقل
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-toml-expected-kind-value = { $code ->
+    [string] سلسلة نصية
+    [integer] عدد صحيح
+    [boolean] قيمة منطقية
+    [string_or_boolean] سلسلة نصية أو قيمة منطقية
+    [string_array] مصفوفة سلاسل نصية
+    [integer_array] مصفوفة أعداد صحيحة
+    [string_pair_array] مصفوفة أزواج نصية
+    [table] جدول
+    [table_array] مصفوفة جداول
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-invalid-toml = TOML غير صالح ({ $resource }): { $failure }
+diagnostic-invalid-toml-at = TOML غير صالح عند السطر { $line } والعمود { $column } ({ $resource }): { $failure }
+diagnostic-http-no-details = فشل طلب خدمة النموذج دون تفاصيل عامة عن حالة HTTP
+diagnostic-http-status = حالة HTTP ‏{ $status }
+diagnostic-http-retry-after = Retry-After بعد { $seconds } ثانية
+diagnostic-http-provider-code = رمز خطأ المزوّد { $code }
+diagnostic-http-provider-type = نوع خطأ المزوّد { $kind }
+diagnostic-http-fact-separator = ؛
+diagnostic-sqlite = رمز خطأ SQLite الأساسي { $primary_code }، ورمز الخطأ الموسّع { $extended_code }
+diagnostic-windows-status = فشلت عملية Windows ‏{ $operation } بالحالة NTSTATUS ‏{ $status }
+diagnostic-resource = { $resource }: القيمة الفعلية { $actual }
+diagnostic-resource-with-maximum = { $resource }: القيمة الفعلية { $actual }، والحد الأقصى { $maximum }
 task-record-title = مهمة الترجمة { $ordinal } · { $state }
 task-record-state-label = { $state ->
     [complete] مكتملة
