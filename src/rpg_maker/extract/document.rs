@@ -838,11 +838,7 @@ where
             .with_recovery(RecoveryFact::path(source.actual())),
             Self::ReadDocument { source, .. } => read_document_diagnostic(source, code, stage),
             Self::ScheduleParse { path, source } => source
-                .safe_diagnostic_source(
-                    stage,
-                    DiagnosticImpact::Unchanged,
-                    DiagnosticAction::Retry,
-                )
+                .safe_diagnostic_source(stage, DiagnosticImpact::Unchanged, DiagnosticAction::Retry)
                 .with_recovery(RecoveryFact::path(path)),
             Self::InvalidUtf8 { path, source } => SafeDiagnostic::new(
                 code,

@@ -2072,8 +2072,7 @@ fn asset_snapshot_fingerprint(
     units: &[EncodedUnit],
     claims: &[EncodedClaim],
 ) -> AssetSnapshotFingerprint {
-    let mut builder =
-        StandardTextSnapshotFingerprintBuilder::new(owner, project_definition_json);
+    let mut builder = StandardTextSnapshotFingerprintBuilder::new(owner, project_definition_json);
     for group in groups {
         builder.group(
             &group.group_location,

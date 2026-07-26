@@ -663,7 +663,6 @@ impl StandardWriteBackSnapshot {
     }
 }
 
-
 /// Reader 交回受信快照前必须排除的数据损坏。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StandardWriteBackSnapshotError {

@@ -19,14 +19,14 @@ use crate::rpg_maker::project_database::{
 };
 use crate::rpg_maker::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
 use crate::storage::file_system::{
-    DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry, DirectoryEntryKind,
-    DirectoryLister, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
-    DirectorySourceMapping, DirectoryStageRequest, DirectoryStageRequestError,
-    DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
-    BoundScopedDirectory, DirectoryTreeRoot, ExistingDirectoryResolver, FileReader,
+    BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
+    DirectoryEntryKind, DirectoryLister, DirectoryPrepareError, DirectoryPublishError,
+    DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
+    DirectoryStageRequestError, DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest,
+    DirectoryTreeFingerprinter, DirectoryTreeRoot, ExistingDirectoryResolver, FileReader,
     ListDirectoryError, ReadFileError, RecoverableDirectoryPublisher, ResolveDirectoryError,
-    ScopedDirectoryBindError, ScopedDirectoryEditError, ScopedDirectoryEditor,
-    ScopedDirectoryPath, ScopedDirectoryScope, StagedDirectory,
+    ScopedDirectoryBindError, ScopedDirectoryEditError, ScopedDirectoryEditor, ScopedDirectoryPath,
+    ScopedDirectoryScope, StagedDirectory,
 };
 use crate::storage::scoped_path::ScopedDirectoryPathError;
 use crate::storage::sqlite::{SnapshotDatabaseError, SqliteDatabaseSnapshotter};
@@ -419,10 +419,8 @@ where
         if !preserved_directories.is_empty() {
             // bind 只借用 candidate 建立范围令牌;后续复制只携带 BoundScopedDirectory,
             // 不跨 await 持有 StagingState 借用。
-            let scope = ScopedDirectoryScope::new(
-                preserved_directories.iter().map(OsString::from),
-            )
-            .expect("保留目录名是固定的合法范围根");
+            let scope = ScopedDirectoryScope::new(preserved_directories.iter().map(OsString::from))
+                .expect("保留目录名是固定的合法范围根");
             let bound = match self.directories.bind_scoped_directory(&staged, scope).await {
                 Ok(bound) => bound,
                 Err(source) => {
@@ -854,12 +852,13 @@ where
                 });
             };
             let child_relative = format!("{relative}/{name}");
-            let scoped = ScopedDirectoryPath::new(PathBuf::from(&child_relative)).map_err(
-                |source| PreserveObservabilityFailure::InvalidCandidatePath {
-                    path: entry.resolved_path().to_path_buf(),
-                    source,
-                },
-            )?;
+            let scoped =
+                ScopedDirectoryPath::new(PathBuf::from(&child_relative)).map_err(|source| {
+                    PreserveObservabilityFailure::InvalidCandidatePath {
+                        path: entry.resolved_path().to_path_buf(),
+                        source,
+                    }
+                })?;
             match entry.kind() {
                 DirectoryEntryKind::Directory => {
                     directories
@@ -984,7 +983,11 @@ where
                 path.display()
             ),
             Self::Edit { path, source } => {
-                write!(formatter, "无法写入候选保留条目 {}：{source}", path.display())
+                write!(
+                    formatter,
+                    "无法写入候选保留条目 {}：{source}",
+                    path.display()
+                )
             }
         }
     }

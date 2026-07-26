@@ -1303,8 +1303,8 @@ struct SnapshotFingerprintAccumulator {
 
 impl SnapshotFingerprintAccumulator {
     fn new(owner: RpgMakerStandardAssetOwner, dialogue_definition_json: &str) -> Self {
-        let project_definition_json = (owner == RpgMakerStandardAssetOwner::Builtin)
-            .then_some(dialogue_definition_json);
+        let project_definition_json =
+            (owner == RpgMakerStandardAssetOwner::Builtin).then_some(dialogue_definition_json);
         Self {
             builder: StandardTextSnapshotFingerprintBuilder::new(owner, project_definition_json),
         }

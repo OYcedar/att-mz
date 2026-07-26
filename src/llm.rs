@@ -521,8 +521,7 @@ fn scan_delimited_url_region(
     let mut segment_start = start;
     let mut index = start;
     while index <= end {
-        let at_delimiter =
-            index < end && matches!(bytes[index], b'/' | b';' | b',' | b':' | b'@');
+        let at_delimiter = index < end && matches!(bytes[index], b'/' | b';' | b',' | b':' | b'@');
         if index == end || at_delimiter {
             if segment_start < index {
                 replacements.extend(
