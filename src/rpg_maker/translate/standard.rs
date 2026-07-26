@@ -1069,39 +1069,39 @@ impl ExpectedTranslationOutputContractTarget {
 pub(crate) enum ExpectedTranslationOutputContractError {
     PropagationContextCountMismatch {
         unit_id: usize,
-        target: ExpectedTranslationOutputContractTarget,
+        target: Box<ExpectedTranslationOutputContractTarget>,
         target_count: usize,
         context_count: usize,
     },
     PlaceholderIndexInvalid {
         unit_id: usize,
-        target: ExpectedTranslationOutputContractTarget,
+        target: Box<ExpectedTranslationOutputContractTarget>,
         source: LanguageTextProjectionError,
     },
     ProtectedPlaceholderMultisetMismatch {
         unit_id: usize,
-        target: ExpectedTranslationOutputContractTarget,
+        target: Box<ExpectedTranslationOutputContractTarget>,
         kind: PlaceholderMultisetErrorKind,
     },
     ProtectedPlaceholderCrossesLineBoundary {
         unit_id: usize,
-        target: ExpectedTranslationOutputContractTarget,
+        target: Box<ExpectedTranslationOutputContractTarget>,
         placeholder_index: usize,
     },
     ProtectedLineCountMismatch {
         unit_id: usize,
-        target: ExpectedTranslationOutputContractTarget,
+        target: Box<ExpectedTranslationOutputContractTarget>,
         expected: usize,
         actual: usize,
     },
     ScalarAlignedCountInvalid {
         unit_id: usize,
-        target: ExpectedTranslationOutputContractTarget,
+        target: Box<ExpectedTranslationOutputContractTarget>,
         actual: usize,
     },
     LinesAlignedCountMismatch {
         unit_id: usize,
-        target: ExpectedTranslationOutputContractTarget,
+        target: Box<ExpectedTranslationOutputContractTarget>,
         expected: usize,
         actual: usize,
     },
@@ -1115,7 +1115,9 @@ impl ExpectedTranslationOutputContractError {
     ) -> Self {
         Self::PlaceholderIndexInvalid {
             unit_id,
-            target: ExpectedTranslationOutputContractTarget::from_identity(identity),
+            target: Box::new(ExpectedTranslationOutputContractTarget::from_identity(
+                identity,
+            )),
             source,
         }
     }
@@ -1142,7 +1144,7 @@ impl ExpectedTranslationOutputContractError {
             }
             | Self::LinesAlignedCountMismatch {
                 unit_id, target, ..
-            } => (target, *unit_id),
+            } => (target.as_ref(), *unit_id),
         }
     }
 
@@ -1237,7 +1239,9 @@ impl ExpectedTranslationOutput {
             return Err(
                 ExpectedTranslationOutputContractError::PropagationContextCountMismatch {
                     unit_id: id,
-                    target: ExpectedTranslationOutputContractTarget::from_identity(&identity),
+                    target: Box::new(ExpectedTranslationOutputContractTarget::from_identity(
+                        &identity,
+                    )),
                     target_count: propagation_targets.len(),
                     context_count: propagation_state_contexts.len(),
                 },
@@ -1336,7 +1340,11 @@ fn validate_expected_translation_output(
     validation: &ExpectedTranslationValidation,
     placeholder_bindings: &PlaceholderBindingIndex,
 ) -> Result<(), ExpectedTranslationOutputContractError> {
-    let target = || ExpectedTranslationOutputContractTarget::from_identity(identity);
+    let target = || {
+        Box::new(ExpectedTranslationOutputContractTarget::from_identity(
+            identity,
+        ))
+    };
     let protected_scan = placeholder_bindings.scan(&validation.protected_text);
     if matches!(identity.source_content(), TextUnitContent::Lines(_))
         && let Some((placeholder_index, _)) = validation

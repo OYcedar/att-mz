@@ -1812,12 +1812,14 @@ fn accept_translation_lines_candidate_at(
     }
     match validate_and_restore_translation_lines_at(
         lines,
-        protected_text,
-        line_shape,
-        placeholders,
-        placeholder_bindings,
-        language_analysis,
-        language_module,
+        TranslationLinesValidationContract {
+            protected_text,
+            line_shape,
+            placeholders,
+            placeholder_bindings,
+            language_analysis,
+            language_module,
+        },
         invariant_location,
     ) {
         Ok(lines) => Ok(TranslationContentAcceptance::Accepted(translation_content(
@@ -2275,26 +2277,41 @@ fn validate_and_restore_translation_lines(
         .map_err(TranslationCandidateValidationError::LanguageProjection)?;
     validate_and_restore_translation_lines_at(
         lines,
-        protected_text,
-        line_shape,
-        placeholders,
-        &placeholder_bindings,
-        language_analysis,
-        language_module,
+        TranslationLinesValidationContract {
+            protected_text,
+            line_shape,
+            placeholders,
+            placeholder_bindings: &placeholder_bindings,
+            language_analysis,
+            language_module,
+        },
         TranslationCandidateInvariantLocation::PreparedCandidate,
     )
 }
 
+#[derive(Clone, Copy)]
+struct TranslationLinesValidationContract<'a> {
+    protected_text: &'a str,
+    line_shape: ExpectedLineShape,
+    placeholders: &'a [AppliedPlaceholder],
+    placeholder_bindings: &'a PlaceholderBindingIndex,
+    language_analysis: &'a crate::language::LanguageAnalysis,
+    language_module: &'a dyn LanguageModule,
+}
+
 fn validate_and_restore_translation_lines_at(
     mut lines: Vec<String>,
-    protected_text: &str,
-    line_shape: ExpectedLineShape,
-    placeholders: &[AppliedPlaceholder],
-    placeholder_bindings: &PlaceholderBindingIndex,
-    language_analysis: &crate::language::LanguageAnalysis,
-    language_module: &dyn LanguageModule,
+    contract: TranslationLinesValidationContract<'_>,
     invariant_location: TranslationCandidateInvariantLocation,
 ) -> Result<Vec<String>, TranslationCandidateValidationError> {
+    let TranslationLinesValidationContract {
+        protected_text,
+        line_shape,
+        placeholders,
+        placeholder_bindings,
+        language_analysis,
+        language_module,
+    } = contract;
     let initial_scans = lines
         .iter()
         .map(|line| placeholder_bindings.scan(line))
