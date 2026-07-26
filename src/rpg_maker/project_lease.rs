@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::path::PathBuf;
 
 use super::ProjectName;
@@ -42,10 +43,23 @@ impl ProjectCommandLease<()> {
 }
 
 /// 组合根已经持有真实项目租约时，向既有纵向服务提供的无二次加锁见证。
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct AlreadyHeldProjectCommandLeaseProvider;
+///
+/// 本类型只能从仍存活的真实租约借用构造；不提供 `Default` 或无参构造，因而下层服务
+/// 无法在组合根未持锁时伪造“已经持有”状态。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AlreadyHeldProjectCommandLeaseProvider<'lease> {
+    _lease: PhantomData<&'lease ()>,
+}
 
-impl ProjectCommandLeaseProvider for AlreadyHeldProjectCommandLeaseProvider {
+impl<'lease> AlreadyHeldProjectCommandLeaseProvider<'lease> {
+    pub(crate) const fn new<T>(_lease: &'lease ProjectCommandLease<T>) -> Self {
+        Self {
+            _lease: PhantomData,
+        }
+    }
+}
+
+impl ProjectCommandLeaseProvider for AlreadyHeldProjectCommandLeaseProvider<'_> {
     type Error = Infallible;
     type LeaseState = ();
 
@@ -57,7 +71,7 @@ impl ProjectCommandLeaseProvider for AlreadyHeldProjectCommandLeaseProvider {
     }
 }
 
-/// 为同一项目串行化四类 RPG Maker 命令的业务能力。
+/// 为同一项目串行化五类 RPG Maker 命令的业务能力。
 pub(crate) trait ProjectCommandLeaseProvider: Send + Sync {
     type Error: Error + Send + Sync + 'static;
     type LeaseState: Send + 'static;
@@ -207,5 +221,20 @@ mod tests {
         );
         assert_eq!(requests[0].identity(), std::ffi::OsStr::new("游戏 One"));
         drop(lease);
+    }
+
+    #[tokio::test]
+    async fn already_held_provider_is_borrowed_from_a_live_real_lease() {
+        let real_lease = ProjectCommandLease::for_test(());
+        let provider = AlreadyHeldProjectCommandLeaseProvider::new(&real_lease);
+        let project = "借用见证".parse().expect("测试项目名应该合法");
+
+        let nested_witness = provider
+            .acquire(&project)
+            .await
+            .expect("存活的真实租约应可建立下层见证");
+
+        drop(nested_witness);
+        drop(real_lease);
     }
 }

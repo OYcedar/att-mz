@@ -204,6 +204,8 @@ Extract、Translate、WriteBack 的非空 Lua 主程序按阶段分别保存在�
   ↓
 建立通用受信配置
   ↓
+建立本命令的非日志运行根
+  ↓
 取得对应版本的项目租约，读取项目事实和保存方案
   ↓ 工作区合法建立后
 启动本 RunId 独占的项目 JSONL（失败时明确警告并降级）
@@ -216,6 +218,20 @@ Extract、Translate、WriteBack 的非空 Lua 主程序按阶段分别保存在�
   ↓
 呈现最终结果；项目日志独立尝试排空，不参与业务终态
 ```
+
+非日志运行根只有一处生命周期所有者。Init 按 `FileSystem → SQLite` 建立；Extract、
+Translate、WriteBack 和独立 `lua` 按 `CPU → FileSystem → SQLite` 建立，并且只在最终
+选择确实需要 Lua 时继续建立 Lua Runtime。无论正常完成还是任一步启动失败，已经建立的
+根都严格按 `Lua → SQLite → FileSystem → CPU` 的可用子集逆序关闭；某一根关闭失败不会
+阻止其余根收尾，首要业务或启动失败与全部关闭诊断会同时保留。
+Extract、Translate 和 WriteBack 显式选择的零字节 Lua 只表达停用或清除，因此不会建立
+Lua Runtime；独立 `lua` 的零字节文件则是合法空 chunk，仍建立 Runtime 并执行。
+
+项目租约不是可以无锁构造的标记。组合根取得真实租约后，向 Init、Extract、Translate
+和 WriteBack 纵向服务传递一个借用该租约的见证；见证不能活得比租约更久。真实租约覆盖
+业务执行、非日志根关闭和阶段运行方案最终化，随后才释放。Translate 的 LLM 执行器与
+任务记录专用 FileSystem、最终化运行方案所用的短生命周期 SQLite，以及可降级项目日志
+各自属于独立责任边界，不伪装成上述命令根，也不改变命令根的启动和逆序关闭契约。
 
 Translate 在选定显式或保存的 Profile 后，精确选择当前配置中的 Profile 及其 Client；
 项目开启后取得 metadata 的规范 `LanguagePair`，再按 `[prompts].locale` 选择

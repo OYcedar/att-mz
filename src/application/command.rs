@@ -59,7 +59,9 @@ use crate::rpg_maker::init::{
     ProjectWorkspaceConvergenceError, ProjectWorkspaceConvergenceService,
 };
 use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingService;
-use crate::rpg_maker::lua::lua54::TrustedLua54Runtime;
+use crate::rpg_maker::lua::lua54::{
+    TrustedLua54Runtime, TrustedLua54RuntimeConfiguration, TrustedLua54RuntimeError,
+};
 use crate::rpg_maker::lua::runtime::OwnedLuaProgram;
 use crate::rpg_maker::lua::runtime::{
     TrustedLuaHostCallError, TrustedLuaStandardAcceptance, TrustedLuaStandardCandidate,
@@ -142,9 +144,11 @@ use crate::rpg_maker::write_back::{
     WriteBackLuaDiagnostic, WriteBackOutput, WriteBackProgressPhase, WriteBackPublishFailureState,
     WriteBackPublishingDiagnostic, WriteBackService, WriteBackServiceError,
 };
-use crate::runtime::cpu::{CpuExecutorStartError, RayonCpuExecutor};
+use crate::runtime::cpu::{
+    CpuExecutorConfig, CpuExecutorShutdownError, CpuExecutorStartError, RayonCpuExecutor,
+};
 use crate::runtime::filesystem::{
-    SystemFileSystem, SystemFileSystemBuildError, SystemFileSystemError,
+    SystemFileSystem, SystemFileSystemBuildError, SystemFileSystemConfig, SystemFileSystemError,
 };
 use crate::runtime::llm::{
     OpenAiChatCompletionClient, OpenAiChatCompletionError, OpenAiChatCompletionExecutor,
@@ -159,7 +163,8 @@ use crate::runtime::project_log::{
 };
 use crate::runtime::run_id::generate_run_id;
 use crate::runtime::sqlite::{
-    RusqliteFinalTransactionExecutor, RusqliteStorage, SqliteRuntimeError,
+    RusqliteFinalTransactionExecutor, RusqliteStorage, RusqliteStorageConfiguration,
+    SqliteRuntimeError,
 };
 use crate::runtime::windows::WindowsFsError;
 use crate::storage::file_system::{
@@ -535,6 +540,465 @@ impl fmt::Display for UnexpectedProjectLuaOutcome {
 
 impl Error for UnexpectedProjectLuaOutcome {}
 
+trait CommandRootShutdown: Send + Sync {
+    type Error: Error + SafeDiagnosticSource + Send + Sync + 'static;
+
+    const COMPONENT: &'static str;
+
+    fn shutdown_root(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+impl CommandRootShutdown for RayonCpuExecutor {
+    type Error = CpuExecutorShutdownError;
+
+    const COMPONENT: &'static str = "CPU";
+
+    async fn shutdown_root(&self) -> Result<(), Self::Error> {
+        self.shutdown()
+    }
+}
+
+impl CommandRootShutdown for SystemFileSystem {
+    type Error = SystemFileSystemError;
+
+    const COMPONENT: &'static str = "FileSystem";
+
+    async fn shutdown_root(&self) -> Result<(), Self::Error> {
+        self.shutdown().await
+    }
+}
+
+impl CommandRootShutdown for RusqliteStorage {
+    type Error = SqliteRuntimeError;
+
+    const COMPONENT: &'static str = "SQLite";
+
+    async fn shutdown_root(&self) -> Result<(), Self::Error> {
+        self.shutdown().await
+    }
+}
+
+impl CommandRootShutdown for TrustedLua54Runtime {
+    type Error = TrustedLua54RuntimeError;
+
+    const COMPONENT: &'static str = "Lua";
+
+    async fn shutdown_root(&self) -> Result<(), Self::Error> {
+        self.shutdown().await
+    }
+}
+
+/// 拥有一次命令的必要非日志运行根，并以唯一逆序边界完成收尾。
+///
+/// 主命令按 CPU → FileSystem → SQLite → 按需 Lua 建立；Init 只使用
+/// FileSystem → SQLite 子集。启动中途失败与正常收尾都复用同一逆序关闭路径。
+struct CommandRootGuard<C, F, S, L> {
+    cpu: Option<C>,
+    file_system: Option<F>,
+    sqlite: Option<S>,
+    lua: Option<L>,
+}
+
+impl<C, F, S, L> CommandRootGuard<C, F, S, L> {
+    const fn empty() -> Self {
+        Self {
+            cpu: None,
+            file_system: None,
+            sqlite: None,
+            lua: None,
+        }
+    }
+}
+
+impl<C, F, S, L> CommandRootGuard<C, F, S, L>
+where
+    C: CommandRootShutdown,
+    F: CommandRootShutdown,
+    S: CommandRootShutdown,
+    L: CommandRootShutdown,
+{
+    async fn shutdown(mut self) -> ShutdownFailures {
+        let mut failures = ShutdownFailures::default();
+        shutdown_command_root(self.lua.take(), &mut failures).await;
+        shutdown_command_root(self.sqlite.take(), &mut failures).await;
+        shutdown_command_root(self.file_system.take(), &mut failures).await;
+        shutdown_command_root(self.cpu.take(), &mut failures).await;
+        failures
+    }
+}
+
+async fn shutdown_command_root<R>(root: Option<R>, failures: &mut ShutdownFailures)
+where
+    R: CommandRootShutdown,
+{
+    if let Some(root) = root
+        && let Err(source) = root.shutdown_root().await
+    {
+        failures.push(R::COMPONENT, source);
+    }
+}
+
+type ProductionCommandRootGuard =
+    CommandRootGuard<RayonCpuExecutor, SystemFileSystem, RusqliteStorage, TrustedLua54Runtime>;
+
+impl ProductionCommandRootGuard {
+    async fn start_main(
+        cpu_configuration: CpuExecutorConfig,
+        file_system_configuration: SystemFileSystemConfig,
+        sqlite_configuration: RusqliteStorageConfiguration,
+        performance: Arc<RunPerformanceCounters>,
+    ) -> Result<Self, CommandRootStartupFailure> {
+        let mut roots = Self::empty();
+        roots.cpu = match RayonCpuExecutor::start(cpu_configuration) {
+            Ok(cpu) => Some(cpu),
+            Err(source) => {
+                return Err(CommandRootStartupFailure::new(
+                    ProductionCommandError::cpu_start(source),
+                    roots.shutdown().await,
+                ));
+            }
+        };
+        roots.file_system = match SystemFileSystem::new_with_performance(
+            file_system_configuration,
+            Arc::clone(&performance),
+        ) {
+            Ok(file_system) => Some(file_system),
+            Err(source) => {
+                return Err(CommandRootStartupFailure::new(
+                    ProductionCommandError::file_system_build(source),
+                    roots.shutdown().await,
+                ));
+            }
+        };
+        roots.sqlite =
+            match RusqliteStorage::start_with_performance(sqlite_configuration, performance) {
+                Ok(sqlite) => Some(sqlite),
+                Err(source) => {
+                    return Err(CommandRootStartupFailure::new(
+                        ProductionCommandError::sqlite_start(source),
+                        roots.shutdown().await,
+                    ));
+                }
+            };
+        Ok(roots)
+    }
+
+    async fn start_init(
+        file_system_configuration: SystemFileSystemConfig,
+        sqlite_configuration: RusqliteStorageConfiguration,
+        performance: Arc<RunPerformanceCounters>,
+    ) -> Result<Self, CommandRootStartupFailure> {
+        let mut roots = Self::empty();
+        roots.file_system = match SystemFileSystem::new_with_performance(
+            file_system_configuration,
+            Arc::clone(&performance),
+        ) {
+            Ok(file_system) => Some(file_system),
+            Err(source) => {
+                return Err(CommandRootStartupFailure::new(
+                    ProductionCommandError::file_system_build(source),
+                    roots.shutdown().await,
+                ));
+            }
+        };
+        roots.sqlite =
+            match RusqliteStorage::start_with_performance(sqlite_configuration, performance) {
+                Ok(sqlite) => Some(sqlite),
+                Err(source) => {
+                    return Err(CommandRootStartupFailure::new(
+                        ProductionCommandError::sqlite_start(source),
+                        roots.shutdown().await,
+                    ));
+                }
+            };
+        Ok(roots)
+    }
+
+    fn cpu(&self) -> &RayonCpuExecutor {
+        self.cpu.as_ref().expect("主命令必须已启动 CPU 根")
+    }
+
+    fn file_system(&self) -> &SystemFileSystem {
+        self.file_system
+            .as_ref()
+            .expect("命令必须已启动 FileSystem 根")
+    }
+
+    fn sqlite(&self) -> &RusqliteStorage {
+        self.sqlite.as_ref().expect("命令必须已启动 SQLite 根")
+    }
+
+    fn start_lua(
+        &mut self,
+        configuration: TrustedLua54RuntimeConfiguration,
+    ) -> TrustedLua54Runtime {
+        assert!(self.lua.is_none(), "一次命令只能启动一个 Lua 根");
+        let runtime = TrustedLua54Runtime::new(configuration, tokio::runtime::Handle::current());
+        self.lua = Some(runtime.clone());
+        runtime
+    }
+}
+
+struct CommandRootStartupFailure {
+    primary: ProductionCommandError,
+    shutdown: ShutdownFailures,
+}
+
+impl CommandRootStartupFailure {
+    const fn new(primary: ProductionCommandError, shutdown: ShutdownFailures) -> Self {
+        Self { primary, shutdown }
+    }
+
+    fn into_report(self) -> ProductionCommandRunReport {
+        if self.shutdown.is_empty() {
+            ProductionCommandRunReport::failed_before_logging(self.primary)
+        } else {
+            ProductionCommandRunReport::failed_before_logging_with_shutdown(
+                self.primary,
+                self.shutdown,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_root_guard_tests {
+    use super::*;
+
+    trait TestRootComponent: Send + Sync {
+        const NAME: &'static str;
+    }
+
+    struct TestCpu;
+    struct TestFileSystem;
+    struct TestSqlite;
+    struct TestLua;
+
+    impl TestRootComponent for TestCpu {
+        const NAME: &'static str = "CPU";
+    }
+
+    impl TestRootComponent for TestFileSystem {
+        const NAME: &'static str = "FileSystem";
+    }
+
+    impl TestRootComponent for TestSqlite {
+        const NAME: &'static str = "SQLite";
+    }
+
+    impl TestRootComponent for TestLua {
+        const NAME: &'static str = "Lua";
+    }
+
+    struct TestRoot<C> {
+        failure: bool,
+        observed: Arc<Mutex<Vec<&'static str>>>,
+        _component: std::marker::PhantomData<C>,
+    }
+
+    impl<C> TestRoot<C> {
+        fn new(failure: bool, observed: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                failure,
+                observed,
+                _component: std::marker::PhantomData,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestRootShutdownError;
+
+    impl fmt::Display for TestRootShutdownError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("测试命令根关闭失败")
+        }
+    }
+
+    impl Error for TestRootShutdownError {}
+
+    impl SafeDiagnosticSource for TestRootShutdownError {
+        fn safe_diagnostic_source(
+            &self,
+            stage: DiagnosticStage,
+            impact: DiagnosticImpact,
+            fallback_action: DiagnosticAction,
+        ) -> SafeDiagnostic {
+            SafeDiagnostic::new(
+                DiagnosticCode::ShutdownComponent,
+                stage,
+                DiagnosticSubject::component("test command root"),
+                DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
+                impact,
+                fallback_action,
+            )
+        }
+    }
+
+    impl<C> CommandRootShutdown for TestRoot<C>
+    where
+        C: TestRootComponent,
+    {
+        type Error = TestRootShutdownError;
+
+        const COMPONENT: &'static str = C::NAME;
+
+        async fn shutdown_root(&self) -> Result<(), Self::Error> {
+            self.observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(C::NAME);
+            if self.failure {
+                Err(TestRootShutdownError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    type TestCommandRootGuard = CommandRootGuard<
+        TestRoot<TestCpu>,
+        TestRoot<TestFileSystem>,
+        TestRoot<TestSqlite>,
+        TestRoot<TestLua>,
+    >;
+
+    fn root<C>(failure: bool, observed: &Arc<Mutex<Vec<&'static str>>>) -> TestRoot<C> {
+        TestRoot::new(failure, Arc::clone(observed))
+    }
+
+    #[tokio::test]
+    async fn every_started_prefix_and_init_subset_shutdown_in_reverse_order() {
+        for (started, expected) in [
+            ([false, false, false, false], Vec::<&'static str>::new()),
+            ([true, false, false, false], vec!["CPU"]),
+            ([true, true, false, false], vec!["FileSystem", "CPU"]),
+            (
+                [true, true, true, false],
+                vec!["SQLite", "FileSystem", "CPU"],
+            ),
+            (
+                [true, true, true, true],
+                vec!["Lua", "SQLite", "FileSystem", "CPU"],
+            ),
+            ([false, true, false, false], vec!["FileSystem"]),
+            ([false, true, true, false], vec!["SQLite", "FileSystem"]),
+        ] {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let roots = TestCommandRootGuard {
+                cpu: started[0].then(|| root(false, &observed)),
+                file_system: started[1].then(|| root(false, &observed)),
+                sqlite: started[2].then(|| root(false, &observed)),
+                lua: started[3].then(|| root(false, &observed)),
+            };
+
+            let failures = roots.shutdown().await;
+
+            assert!(failures.is_empty());
+            assert_eq!(
+                *observed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_continues_after_each_failure_and_preserves_failure_order() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let roots = TestCommandRootGuard {
+            cpu: Some(root(true, &observed)),
+            file_system: Some(root(true, &observed)),
+            sqlite: Some(root(true, &observed)),
+            lua: Some(root(true, &observed)),
+        };
+
+        let failures = roots.shutdown().await;
+
+        let expected = ["Lua", "SQLite", "FileSystem", "CPU"];
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            expected
+        );
+        assert_eq!(
+            failures
+                .failures
+                .iter()
+                .map(|failure| failure.component)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_primary_failure_is_not_replaced_by_partial_shutdown_failures() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let roots = TestCommandRootGuard {
+            cpu: Some(root(true, &observed)),
+            file_system: Some(root(true, &observed)),
+            sqlite: None,
+            lua: None,
+        };
+        let shutdown = roots.shutdown().await;
+        let report = CommandRootStartupFailure::new(
+            ProductionCommandError::cpu_start(CpuExecutorStartError::TooManyWorkerThreads {
+                requested: 2,
+                maximum: 1,
+            }),
+            shutdown,
+        )
+        .into_report();
+
+        assert!(matches!(
+            report.result,
+            CommandRunResult::Failed(ProductionCommandError::Internal(_))
+        ));
+        assert_eq!(
+            report
+                .shutdown_error
+                .expect("部分启动根的关闭失败必须保留")
+                .failures
+                .iter()
+                .map(|failure| failure.component)
+                .collect::<Vec<_>>(),
+            ["FileSystem", "CPU"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_lua_starts_runtime_only_for_nonempty_programs() {
+        let mut roots = ProductionCommandRootGuard::empty();
+        let empty = OwnedLuaProgram::new(PathBuf::from("disabled.lua"), Vec::new());
+
+        assert!(start_stage_lua_selection(empty, &mut roots).is_none());
+        assert!(roots.lua.is_none(), "零字节阶段程序不得建立 Lua Runtime");
+
+        let active = OwnedLuaProgram::new(PathBuf::from("active.lua"), b"return nil".to_vec());
+        assert!(start_stage_lua_selection(active, &mut roots).is_some());
+        assert!(roots.lua.is_some(), "非空阶段程序必须纳入命令根");
+
+        assert!(roots.shutdown().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_lua_starts_runtime_for_a_zero_byte_chunk() {
+        let mut roots = ProductionCommandRootGuard::empty();
+        let empty = OwnedLuaProgram::new(PathBuf::from("empty.lua"), Vec::new());
+
+        let selected = start_lua_selection(empty, &mut roots);
+
+        assert!(selected.program.source().is_empty());
+        assert!(
+            roots.lua.is_some(),
+            "独立 Lua 的合法空 chunk 仍须建立 Runtime"
+        );
+        assert!(roots.shutdown().await.is_empty());
+    }
+}
+
 /// 按本次命令只构造实际需要的 RPG Maker 生产纵向切片。
 pub(crate) struct ProductionRpgMakerCommandRunner {
     layout: RpgMakerLayout,
@@ -600,32 +1064,18 @@ impl ProductionRpgMakerCommandRunner {
         let cancellation = CooperativeCancellation::default();
         let projects_root = command.common().projects_root().to_path_buf();
         let sqlite_configuration = command.common().sqlite().clone();
-        let sqlite = match RusqliteStorage::start_with_performance(
+        let roots = match ProductionCommandRootGuard::start_init(
+            command.common().filesystem().clone(),
             sqlite_configuration.clone(),
             Arc::clone(&performance),
         )
-        .map_err(ProductionCommandError::sqlite_start)
+        .await
         {
-            Ok(sqlite) => sqlite,
-            Err(error) => return ProductionCommandRunReport::failed_before_logging(error),
+            Ok(roots) => roots,
+            Err(failure) => return failure.into_report(),
         };
-        let file_system = match SystemFileSystem::new_with_performance(
-            command.common().filesystem().clone(),
-            Arc::clone(&performance),
-        )
-        .map_err(ProductionCommandError::file_system_build)
-        {
-            Ok(file_system) => file_system,
-            Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    error, shutdown,
-                );
-            }
-        };
+        let file_system = roots.file_system().clone();
+        let sqlite = roots.sqlite().clone();
         let arguments = &command.arguments;
         let project_name = arguments.project.name.clone();
         let project_workspace =
@@ -649,26 +1099,14 @@ impl ProductionRpgMakerCommandRunner {
         let project_lease_guard = match project_lease {
             DrivenCommand::Finished(Ok(lease)) => lease,
             DrivenCommand::Finished(Err(error)) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     error, shutdown,
                 );
             }
             DrivenCommand::Interrupted(result) => {
                 drop(result);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::interrupted_before_logging(shutdown);
             }
@@ -680,13 +1118,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
@@ -705,13 +1137,7 @@ impl ProductionRpgMakerCommandRunner {
                             ProjectLogValueSource::ProjectState,
                         ),
                         None => {
-                            let mut shutdown = ShutdownFailures::default();
-                            if let Err(error) = sqlite.shutdown().await {
-                                shutdown.push("SQLite", error);
-                            }
-                            if let Err(error) = file_system.shutdown().await {
-                                shutdown.push("FileSystem", error);
-                            }
+                            let shutdown = roots.shutdown().await;
                             drop(project_lease_guard);
                             return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                                 ProductionCommandError::run_plan_resolution(
@@ -722,13 +1148,7 @@ impl ProductionRpgMakerCommandRunner {
                         }
                     },
                     Err(ProjectRunPlanReadError::DatabaseNotFound { .. }) => {
-                        let mut shutdown = ShutdownFailures::default();
-                        if let Err(error) = sqlite.shutdown().await {
-                            shutdown.push("SQLite", error);
-                        }
-                        if let Err(error) = file_system.shutdown().await {
-                            shutdown.push("FileSystem", error);
-                        }
+                        let shutdown = roots.shutdown().await;
                         drop(project_lease_guard);
                         return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                             ProductionCommandError::run_plan_resolution(
@@ -738,13 +1158,7 @@ impl ProductionRpgMakerCommandRunner {
                         );
                     }
                     Err(error) => {
-                        let mut shutdown = ShutdownFailures::default();
-                        if let Err(shutdown_error) = sqlite.shutdown().await {
-                            shutdown.push("SQLite", shutdown_error);
-                        }
-                        if let Err(shutdown_error) = file_system.shutdown().await {
-                            shutdown.push("FileSystem", shutdown_error);
-                        }
+                        let shutdown = roots.shutdown().await;
                         drop(project_lease_guard);
                         return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                             ProductionCommandError::project_run_plan_read(error),
@@ -757,13 +1171,7 @@ impl ProductionRpgMakerCommandRunner {
         let resolved_game_root = match file_system.resolve_existing_directory(game_root).await {
             Ok(path) => path,
             Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(shutdown_error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", shutdown_error);
-                }
-                if let Err(shutdown_error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", shutdown_error);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::input_directory(error),
@@ -788,7 +1196,7 @@ impl ProductionRpgMakerCommandRunner {
         .with_progress(progress_observer.clone());
         let service = InitService::new(
             workspace,
-            AlreadyHeldProjectCommandLeaseProvider,
+            AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
             cancellation.clone(),
         );
         let input = InitInput {
@@ -817,13 +1225,7 @@ impl ProductionRpgMakerCommandRunner {
         .await
         .map(|result| result.map_err(map_init_error));
         progress_observer.finish();
-        let mut shutdown = ShutdownFailures::default();
-        if let Err(error) = sqlite.shutdown().await {
-            shutdown.push("SQLite", error);
-        }
-        if let Err(error) = file_system.shutdown().await {
-            shutdown.push("FileSystem", error);
-        }
+        let shutdown = roots.shutdown().await;
         let reused_path = (plan_source == ProjectLogValueSource::ProjectState)
             .then(|| resolved_game_root.clone());
         let workspace_is_legal = matches!(
@@ -953,32 +1355,20 @@ impl ProductionRpgMakerCommandRunner {
         let cancellation = CooperativeCancellation::default();
         let projects_root = command.common().projects_root().to_path_buf();
         let sqlite_configuration = command.common().sqlite().clone();
-        let sqlite = match RusqliteStorage::start_with_performance(
+        let mut roots = match ProductionCommandRootGuard::start_main(
+            command.cpu(),
+            command.common().filesystem().clone(),
             sqlite_configuration.clone(),
             Arc::clone(&performance),
         )
-        .map_err(ProductionCommandError::sqlite_start)
+        .await
         {
-            Ok(value) => value,
-            Err(error) => return ProductionCommandRunReport::failed_before_logging(error),
+            Ok(roots) => roots,
+            Err(failure) => return failure.into_report(),
         };
-        let file_system = match SystemFileSystem::new_with_performance(
-            command.common().filesystem().clone(),
-            Arc::clone(&performance),
-        )
-        .map_err(ProductionCommandError::file_system_build)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    error, shutdown,
-                );
-            }
-        };
+        let cpu = roots.cpu().clone();
+        let file_system = roots.file_system().clone();
+        let sqlite = roots.sqlite().clone();
         let project_name = command.project_name().clone();
         let database_path =
             ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name)
@@ -1004,26 +1394,14 @@ impl ProductionRpgMakerCommandRunner {
         let project_lease_guard = match project_lease {
             DrivenCommand::Finished(Ok(lease)) => lease,
             DrivenCommand::Finished(Err(error)) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     error, shutdown,
                 );
             }
             DrivenCommand::Interrupted(result) => {
                 drop(result);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::interrupted_before_logging(shutdown);
             }
@@ -1035,13 +1413,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
@@ -1060,13 +1432,7 @@ impl ProductionRpgMakerCommandRunner {
                 Ok(plans) => match plans.extract().cloned() {
                     Some(plan) => (Some(plan), ProjectLogValueSource::ProjectState),
                     None => {
-                        let mut shutdown = ShutdownFailures::default();
-                        if let Err(error) = sqlite.shutdown().await {
-                            shutdown.push("SQLite", error);
-                        }
-                        if let Err(error) = file_system.shutdown().await {
-                            shutdown.push("FileSystem", error);
-                        }
+                        let shutdown = roots.shutdown().await;
                         drop(project_lease_guard);
                         return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                             ProductionCommandError::run_plan_resolution(
@@ -1077,13 +1443,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                 },
                 Err(ProjectRunPlanReadError::DatabaseNotFound { .. }) => {
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Err(error) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", error);
-                    }
-                    if let Err(error) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", error);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                         ProductionCommandError::run_plan_resolution(
@@ -1093,13 +1453,7 @@ impl ProductionRpgMakerCommandRunner {
                     );
                 }
                 Err(error) => {
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Err(shutdown_error) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", shutdown_error);
-                    }
-                    if let Err(shutdown_error) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", shutdown_error);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                         ProductionCommandError::project_run_plan_read(error),
@@ -1124,13 +1478,7 @@ impl ProductionRpgMakerCommandRunner {
         let opened_project = match project_opening {
             DrivenCommand::Finished(Ok(project)) => project,
             DrivenCommand::Finished(Err(error)) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -1139,13 +1487,7 @@ impl ProductionRpgMakerCommandRunner {
             }
             DrivenCommand::Interrupted(result) => {
                 drop(result);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::interrupted_before_logging(shutdown);
@@ -1158,13 +1500,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -1186,13 +1522,7 @@ impl ProductionRpgMakerCommandRunner {
         }) {
             Ok(log) => log,
             Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -1215,13 +1545,7 @@ impl ProductionRpgMakerCommandRunner {
                     }),
                     Err(source) => {
                         let diagnostic = source.safe_diagnostic();
-                        let mut shutdown = ShutdownFailures::default();
-                        if let Err(error) = sqlite.shutdown().await {
-                            shutdown.push("SQLite", error);
-                        }
-                        if let Err(error) = file_system.shutdown().await {
-                            shutdown.push("FileSystem", error);
-                        }
+                        let shutdown = roots.shutdown().await;
                         drop(project_lease_guard);
                         return observed_construction_failure(
                             project_log,
@@ -1244,13 +1568,7 @@ impl ProductionRpgMakerCommandRunner {
                     Ok(program) => Some(program),
                     Err(source) => {
                         let diagnostic = source.safe_diagnostic();
-                        let mut shutdown = ShutdownFailures::default();
-                        if let Err(error) = sqlite.shutdown().await {
-                            shutdown.push("SQLite", error);
-                        }
-                        if let Err(error) = file_system.shutdown().await {
-                            shutdown.push("FileSystem", error);
-                        }
+                        let shutdown = roots.shutdown().await;
                         drop(project_lease_guard);
                         return observed_construction_failure(
                             project_log,
@@ -1271,13 +1589,7 @@ impl ProductionRpgMakerCommandRunner {
                     Ok(program) => Some(program),
                     Err(error) => {
                         let diagnostic = error.safe_diagnostic(&database_path);
-                        let mut shutdown = ShutdownFailures::default();
-                        if let Err(shutdown_error) = sqlite.shutdown().await {
-                            shutdown.push("SQLite", shutdown_error);
-                        }
-                        if let Err(shutdown_error) = file_system.shutdown().await {
-                            shutdown.push("FileSystem", shutdown_error);
-                        }
+                        let shutdown = roots.shutdown().await;
                         drop(project_lease_guard);
                         return observed_construction_failure(
                             project_log,
@@ -1293,18 +1605,12 @@ impl ProductionRpgMakerCommandRunner {
             },
             (None, None) => None,
         };
-        let lua = match (command.lua(), saved_extract.as_ref()) {
-            (Some(selected), _) => match load_lua_selection(&file_system, selected).await {
+        let lua_program = match (command.lua(), saved_extract.as_ref()) {
+            (Some(selected), _) => match load_lua_program(&file_system, selected).await {
                 Ok(program) => Some(program),
                 Err(source) => {
                     let diagnostic = source.safe_diagnostic();
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Err(error) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", error);
-                    }
-                    if let Err(error) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", error);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return observed_construction_failure(
                         project_log,
@@ -1316,52 +1622,31 @@ impl ProductionRpgMakerCommandRunner {
                     .await;
                 }
             },
-            (None, Some(plan)) => match plan.lua_program() {
-                Some(snapshot) => match command.resolve_lua_runtime() {
-                    Ok(runtime) => Some(ProductionLuaSelection {
-                        program: OwnedLuaProgram::new(
-                            snapshot.resolved_path().to_path_buf(),
-                            snapshot.source().to_vec(),
-                        ),
-                        runtime: TrustedLua54Runtime::new(
-                            runtime,
-                            tokio::runtime::Handle::current(),
-                        ),
-                    }),
-                    Err(error) => {
-                        let mut shutdown = ShutdownFailures::default();
-                        if let Err(shutdown_error) = sqlite.shutdown().await {
-                            shutdown.push("SQLite", shutdown_error);
-                        }
-                        if let Err(shutdown_error) = file_system.shutdown().await {
-                            shutdown.push("FileSystem", shutdown_error);
-                        }
-                        drop(project_lease_guard);
-                        return observed_construction_failure(
-                            project_log,
-                            ProductionCommandError::configuration_load(error),
-                            shutdown,
-                        )
-                        .await;
-                    }
-                },
-                None => None,
-            },
+            (None, Some(plan)) => plan.lua_program().map(|snapshot| {
+                OwnedLuaProgram::new(
+                    snapshot.resolved_path().to_path_buf(),
+                    snapshot.source().to_vec(),
+                )
+            }),
             (None, None) => None,
         };
+        let lua = lua_program
+            .as_ref()
+            .cloned()
+            .and_then(|program| start_stage_lua_selection(program, &mut roots));
         let replacement = {
             let rules_definition = rules_program
                 .as_ref()
                 .filter(|program| !program.is_empty())
                 .map(|program| ExtractRulesCanonicalJson::new(program.canonical_json().to_owned()))
                 .transpose();
-            let lua_program = lua
+            let lua_program = lua_program
                 .as_ref()
-                .filter(|selection| !selection.program.source().is_empty())
-                .map(|selection| {
+                .filter(|program| !program.source().is_empty())
+                .map(|program| {
                     LuaProgramSnapshot::new(
-                        selection.program.main_script_path().to_path_buf(),
-                        selection.program.source().to_vec(),
+                        program.main_script_path().to_path_buf(),
+                        program.source().to_vec(),
                     )
                 })
                 .transpose();
@@ -1381,18 +1666,7 @@ impl ProductionRpgMakerCommandRunner {
         let replacement = match replacement {
             Ok(replacement) => replacement,
             Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Some(selected) = lua.as_ref()
-                    && let Err(source) = selected.runtime.shutdown().await
-                {
-                    shutdown.push("Lua", source);
-                }
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 return observed_construction_failure(
                     project_log,
@@ -1412,9 +1686,9 @@ impl ProductionRpgMakerCommandRunner {
         {
             selections.push(String::from("Rules"));
         }
-        if lua
+        if lua_program
             .as_ref()
-            .is_some_and(|selection| !selection.program.source().is_empty())
+            .is_some_and(|program| !program.source().is_empty())
         {
             selections.push(String::from("Lua"));
         }
@@ -1427,8 +1701,8 @@ impl ProductionRpgMakerCommandRunner {
                 .map(|_| "Rules"),
             command
                 .lua()
-                .zip(lua.as_ref())
-                .filter(|(_, selection)| selection.program.source().is_empty())
+                .zip(lua_program.as_ref())
+                .filter(|(_, program)| program.source().is_empty())
                 .map(|_| "Lua"),
         ]
         .into_iter()
@@ -1445,27 +1719,12 @@ impl ProductionRpgMakerCommandRunner {
                 lua_source: None,
                 selections,
                 lua_enabled: Some(
-                    lua.as_ref()
-                        .is_some_and(|selection| !selection.program.source().is_empty()),
+                    lua_program
+                        .as_ref()
+                        .is_some_and(|program| !program.source().is_empty()),
                 ),
             },
         ));
-        let cpu = match RayonCpuExecutor::start(command.cpu())
-            .map_err(ProductionCommandError::cpu_start)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
-                drop(project_lease_guard);
-                return observed_construction_failure(project_log, error, shutdown).await;
-            }
-        };
         let opener = PreopenedProject::new(opened_project);
         let document_config = command.rpg_maker().document();
         let document_reader =
@@ -1501,22 +1760,32 @@ impl ProductionRpgMakerCommandRunner {
                 )
             }
         });
-        let selected_lua = lua.as_ref().map(|selected| {
-                let host = TrustedLuaExecutionHostingService::<_, OpenAiChatCompletionExecutor, _, _>::without_llm(
-                    file_system.clone(), selected.runtime.clone(), sqlite.clone(),
-                );
-                let store = RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone());
-                SelectedLua::new(
-                    selected.program.clone(),
-                    LuaExtractionService::new(host, store),
-                )
+        let selected_lua = lua_program.as_ref().map(|program| {
+            let store = RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone());
+            let executor = match lua.as_ref() {
+                Some(selected) => {
+                    let host = TrustedLuaExecutionHostingService::<
+                        _,
+                        OpenAiChatCompletionExecutor,
+                        _,
+                        _,
+                    >::without_llm(
+                        file_system.clone(),
+                        selected.runtime.clone(),
+                        sqlite.clone(),
+                    );
+                    LuaExtractionService::new(host, store)
+                }
+                None => LuaExtractionService::deactivation_only(store),
+            };
+            SelectedLua::new(program.clone(), executor)
         });
         let service = ExtractService::new(
             opener,
             builtin,
             selected_rules,
             selected_lua,
-            AlreadyHeldProjectCommandLeaseProvider,
+            AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
             cancellation.clone(),
         )
         .with_progress(progress_observer.clone());
@@ -1550,21 +1819,7 @@ impl ProductionRpgMakerCommandRunner {
             project_log.emit_cancellation(ProjectLogCode::SafeStopFinished, confirmed, total);
         }
         progress_observer.finish();
-        let mut shutdown = ShutdownFailures::default();
-        if let Some(selected) = lua.as_ref()
-            && let Err(source) = selected.runtime.shutdown().await
-        {
-            shutdown.push("Lua", source);
-        }
-        if let Err(source) = sqlite.shutdown().await {
-            shutdown.push("SQLite", source);
-        }
-        if let Err(source) = file_system.shutdown().await {
-            shutdown.push("FileSystem", source);
-        }
-        if let Err(source) = cpu.shutdown() {
-            shutdown.push("CPU", source);
-        }
+        let shutdown = roots.shutdown().await;
         if !matches!(execution, DrivenCommand::Interrupted(_)) {
             progress.finalizing(progress_finalizing(self.locale));
         }
@@ -1627,32 +1882,20 @@ impl ProductionRpgMakerCommandRunner {
         let projects_root = command.common().projects_root().to_path_buf();
         let sqlite_configuration = command.common().sqlite().clone();
         let file_system_configuration = command.common().filesystem().clone();
-        let file_system = match SystemFileSystem::new_with_performance(
+        let mut roots = match ProductionCommandRootGuard::start_main(
+            command.cpu(),
             file_system_configuration.clone(),
-            Arc::clone(&performance),
-        )
-        .map_err(ProductionCommandError::file_system_build)
-        {
-            Ok(value) => value,
-            Err(error) => return ProductionCommandRunReport::failed_before_logging(error),
-        };
-        let sqlite = match RusqliteStorage::start_with_performance(
             sqlite_configuration.clone(),
             Arc::clone(&performance),
         )
-        .map_err(ProductionCommandError::sqlite_start)
+        .await
         {
-            Ok(value) => value,
-            Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    error, shutdown,
-                );
-            }
+            Ok(roots) => roots,
+            Err(failure) => return failure.into_report(),
         };
+        let cpu = roots.cpu().clone();
+        let file_system = roots.file_system().clone();
+        let sqlite = roots.sqlite().clone();
         let project_name = command.project_name().clone();
         let project_workspace =
             ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name);
@@ -1675,26 +1918,14 @@ impl ProductionRpgMakerCommandRunner {
         let project_lease_guard = match project_lease {
             DrivenCommand::Finished(Ok(lease)) => lease,
             DrivenCommand::Finished(Err(error)) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     error, shutdown,
                 );
             }
             DrivenCommand::Interrupted(result) => {
                 drop(result);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::interrupted_before_logging(shutdown);
             }
@@ -1706,13 +1937,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
@@ -1725,13 +1950,7 @@ impl ProductionRpgMakerCommandRunner {
             Ok(plans) => plans,
             Err(error) => {
                 let error = ProductionCommandError::project_run_plan_read(error);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(shutdown_error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", shutdown_error);
-                }
-                if let Err(shutdown_error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", shutdown_error);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     error, shutdown,
@@ -1747,13 +1966,7 @@ impl ProductionRpgMakerCommandRunner {
                     ProjectLogValueSource::ProjectState,
                 ),
                 None => {
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Err(error) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", error);
-                    }
-                    if let Err(error) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", error);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                         ProductionCommandError::run_plan_resolution(
@@ -1780,13 +1993,7 @@ impl ProductionRpgMakerCommandRunner {
         let opened_project = match project_opening {
             DrivenCommand::Finished(Ok(project)) => project,
             DrivenCommand::Finished(Err(error)) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -1795,13 +2002,7 @@ impl ProductionRpgMakerCommandRunner {
             }
             DrivenCommand::Interrupted(result) => {
                 drop(result);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::interrupted_before_logging(shutdown);
@@ -1814,13 +2015,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -1834,13 +2029,7 @@ impl ProductionRpgMakerCommandRunner {
             Err(ConfigurationLoadError::TranslationProfileNotFound { .. })
                 if profile_source == ProjectLogValueSource::ProjectState =>
             {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::run_plan_resolution(
@@ -1850,13 +2039,7 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
             Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(shutdown_error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", shutdown_error);
-                }
-                if let Err(shutdown_error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", shutdown_error);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::configuration_load(error),
@@ -1877,13 +2060,7 @@ impl ProductionRpgMakerCommandRunner {
         }) {
             Ok(log) => log,
             Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -1899,20 +2076,14 @@ impl ProductionRpgMakerCommandRunner {
         );
         let explicit_lua_requested = command.lua().is_some();
         let (lua, lua_source) = match command.lua() {
-            Some(selected) => match load_lua_selection(&file_system, selected).await {
+            Some(selected) => match load_lua_program(&file_system, selected).await {
                 Ok(program) => (
-                    (!program.program.source().is_empty()).then_some(program),
+                    start_stage_lua_selection(program, &mut roots),
                     ProjectLogValueSource::Explicit,
                 ),
                 Err(error) => {
                     let diagnostic = error.safe_diagnostic();
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Err(shutdown_error) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", shutdown_error);
-                    }
-                    if let Err(shutdown_error) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", shutdown_error);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return observed_construction_failure(
                         project_log,
@@ -1930,40 +2101,18 @@ impl ProductionRpgMakerCommandRunner {
                 } else {
                     ProjectLogValueSource::ProductDefault
                 };
-                let lua = match saved_translate
+                let lua = saved_translate
                     .as_ref()
                     .and_then(TranslateRunPlan::lua_program)
-                {
-                    Some(snapshot) => match command.resolve_lua_runtime() {
-                        Ok(runtime) => Some(ProductionLuaSelection {
-                            program: OwnedLuaProgram::new(
+                    .map(|snapshot| {
+                        start_lua_selection(
+                            OwnedLuaProgram::new(
                                 snapshot.resolved_path().to_path_buf(),
                                 snapshot.source().to_vec(),
                             ),
-                            runtime: TrustedLua54Runtime::new(
-                                runtime,
-                                tokio::runtime::Handle::current(),
-                            ),
-                        }),
-                        Err(error) => {
-                            let mut shutdown = ShutdownFailures::default();
-                            if let Err(shutdown_error) = sqlite.shutdown().await {
-                                shutdown.push("SQLite", shutdown_error);
-                            }
-                            if let Err(shutdown_error) = file_system.shutdown().await {
-                                shutdown.push("FileSystem", shutdown_error);
-                            }
-                            drop(project_lease_guard);
-                            return observed_construction_failure(
-                                project_log,
-                                ProductionCommandError::configuration_load(error),
-                                shutdown,
-                            )
-                            .await;
-                        }
-                    },
-                    None => None,
-                };
+                            &mut roots,
+                        )
+                    });
                 (lua, lua_source)
             }
         };
@@ -1981,18 +2130,7 @@ impl ProductionRpgMakerCommandRunner {
             match lua_snapshot.and_then(|lua| TranslateRunPlan::new(profile_id.clone(), lua)) {
                 Ok(plan) => ProjectRunPlanReplacement::Translate(plan),
                 Err(error) => {
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Some(selected) = lua.as_ref()
-                        && let Err(source) = selected.runtime.shutdown().await
-                    {
-                        shutdown.push("Lua", source);
-                    }
-                    if let Err(source) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", source);
-                    }
-                    if let Err(source) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", source);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return observed_construction_failure(
                         project_log,
@@ -2017,18 +2155,7 @@ impl ProductionRpgMakerCommandRunner {
             match load_additional_pem_roots(&file_system, command.llm()).await {
                 Ok(value) => value,
                 Err(error) => {
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Some(selected) = lua.as_ref()
-                        && let Err(source) = selected.runtime.shutdown().await
-                    {
-                        shutdown.push("Lua", source);
-                    }
-                    if let Err(source) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", source);
-                    }
-                    if let Err(source) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", source);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return observed_construction_failure(project_log, error, shutdown).await;
                 }
@@ -2040,40 +2167,7 @@ impl ProductionRpgMakerCommandRunner {
         {
             Ok(value) => value,
             Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Some(selected) = lua.as_ref()
-                    && let Err(source) = selected.runtime.shutdown().await
-                {
-                    shutdown.push("Lua", source);
-                }
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
-                drop(project_lease_guard);
-                return observed_construction_failure(project_log, error, shutdown).await;
-            }
-        };
-        let cpu = match RayonCpuExecutor::start(command.cpu())
-            .map_err(ProductionCommandError::cpu_start)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                llm.shutdown().await;
-                let mut shutdown = ShutdownFailures::default();
-                if let Some(selected) = lua.as_ref()
-                    && let Err(source) = selected.runtime.shutdown().await
-                {
-                    shutdown.push("Lua", source);
-                }
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 return observed_construction_failure(project_log, error, shutdown).await;
             }
@@ -2128,7 +2222,7 @@ impl ProductionRpgMakerCommandRunner {
         let service = TranslateService::new(
             opener,
             builder,
-            AlreadyHeldProjectCommandLeaseProvider,
+            AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
             cancellation.clone(),
         );
         let input = TranslateInput {
@@ -2195,22 +2289,8 @@ impl ProductionRpgMakerCommandRunner {
             ));
         }
         progress_observer.finish();
-        let mut shutdown = ShutdownFailures::default();
-        if let Some(selected) = lua.as_ref()
-            && let Err(source) = selected.runtime.shutdown().await
-        {
-            shutdown.push("Lua", source);
-        }
         llm.shutdown().await;
-        if let Err(source) = sqlite.shutdown().await {
-            shutdown.push("SQLite", source);
-        }
-        if let Err(source) = file_system.shutdown().await {
-            shutdown.push("FileSystem", source);
-        }
-        if let Err(source) = cpu.shutdown() {
-            shutdown.push("CPU", source);
-        }
+        let shutdown = roots.shutdown().await;
         if !matches!(execution, DrivenCommand::Interrupted(_)) {
             progress.finalizing(progress_finalizing(self.locale));
         }
@@ -2273,32 +2353,20 @@ impl ProductionRpgMakerCommandRunner {
         let cancellation = CooperativeCancellation::default();
         let projects_root = command.common().projects_root().to_path_buf();
         let sqlite_configuration = command.common().sqlite().clone();
-        let file_system = match SystemFileSystem::new_with_performance(
+        let mut roots = match ProductionCommandRootGuard::start_main(
+            command.cpu(),
             command.common().filesystem().clone(),
-            Arc::clone(&performance),
-        )
-        .map_err(ProductionCommandError::file_system_build)
-        {
-            Ok(value) => value,
-            Err(error) => return ProductionCommandRunReport::failed_before_logging(error),
-        };
-        let sqlite = match RusqliteStorage::start_with_performance(
             sqlite_configuration.clone(),
             Arc::clone(&performance),
         )
-        .map_err(ProductionCommandError::sqlite_start)
+        .await
         {
-            Ok(value) => value,
-            Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    error, shutdown,
-                );
-            }
+            Ok(roots) => roots,
+            Err(failure) => return failure.into_report(),
         };
+        let cpu = roots.cpu().clone();
+        let file_system = roots.file_system().clone();
+        let sqlite = roots.sqlite().clone();
         let project_name = command.project_name().clone();
         let database_path =
             ProjectWorkspaceLayout::for_project(&projects_root, self.layout, &project_name)
@@ -2322,26 +2390,14 @@ impl ProductionRpgMakerCommandRunner {
         let project_lease_guard = match project_lease {
             DrivenCommand::Finished(Ok(lease)) => lease,
             DrivenCommand::Finished(Err(error)) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     error, shutdown,
                 );
             }
             DrivenCommand::Interrupted(result) => {
                 drop(result);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::interrupted_before_logging(shutdown);
             }
@@ -2353,13 +2409,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
@@ -2376,13 +2426,7 @@ impl ProductionRpgMakerCommandRunner {
                 Ok(plans) => plans.write_back().cloned(),
                 Err(error) => {
                     let error = ProductionCommandError::project_run_plan_read(error);
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Err(shutdown_error) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", shutdown_error);
-                    }
-                    if let Err(shutdown_error) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", shutdown_error);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                         error, shutdown,
@@ -2413,13 +2457,7 @@ impl ProductionRpgMakerCommandRunner {
         let opened_project = match project_opening {
             DrivenCommand::Finished(Ok(project)) => project,
             DrivenCommand::Finished(Err(error)) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -2428,13 +2466,7 @@ impl ProductionRpgMakerCommandRunner {
             }
             DrivenCommand::Interrupted(result) => {
                 drop(result);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::interrupted_before_logging(shutdown);
@@ -2447,13 +2479,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -2475,13 +2501,7 @@ impl ProductionRpgMakerCommandRunner {
         }) {
             Ok(log) => log,
             Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -2495,17 +2515,11 @@ impl ProductionRpgMakerCommandRunner {
             write_back_phase_code,
         );
         let lua = match command.lua() {
-            Some(selected) => match load_lua_selection(&file_system, selected).await {
-                Ok(program) => (!program.program.source().is_empty()).then_some(program),
+            Some(selected) => match load_lua_program(&file_system, selected).await {
+                Ok(program) => start_stage_lua_selection(program, &mut roots),
                 Err(source) => {
                     let diagnostic = source.safe_diagnostic();
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Err(error) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", error);
-                    }
-                    if let Err(error) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", error);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return observed_construction_failure(
                         project_log,
@@ -2517,40 +2531,18 @@ impl ProductionRpgMakerCommandRunner {
                     .await;
                 }
             },
-            None => match saved_write_back
+            None => saved_write_back
                 .as_ref()
                 .and_then(WriteBackRunPlan::lua_program)
-            {
-                Some(snapshot) => match command.resolve_lua_runtime() {
-                    Ok(runtime) => Some(ProductionLuaSelection {
-                        program: OwnedLuaProgram::new(
+                .map(|snapshot| {
+                    start_lua_selection(
+                        OwnedLuaProgram::new(
                             snapshot.resolved_path().to_path_buf(),
                             snapshot.source().to_vec(),
                         ),
-                        runtime: TrustedLua54Runtime::new(
-                            runtime,
-                            tokio::runtime::Handle::current(),
-                        ),
-                    }),
-                    Err(error) => {
-                        let mut shutdown = ShutdownFailures::default();
-                        if let Err(shutdown_error) = sqlite.shutdown().await {
-                            shutdown.push("SQLite", shutdown_error);
-                        }
-                        if let Err(shutdown_error) = file_system.shutdown().await {
-                            shutdown.push("FileSystem", shutdown_error);
-                        }
-                        drop(project_lease_guard);
-                        return observed_construction_failure(
-                            project_log,
-                            ProductionCommandError::configuration_load(error),
-                            shutdown,
-                        )
-                        .await;
-                    }
-                },
-                None => None,
-            },
+                        &mut roots,
+                    )
+                }),
         };
         let lua_cleared = explicit_lua_requested && lua.is_none();
         let replacement = match lua.as_ref() {
@@ -2562,16 +2554,7 @@ impl ProductionRpgMakerCommandRunner {
                     ProjectRunPlanReplacement::WriteBack(WriteBackRunPlan::with_lua(snapshot))
                 }
                 Err(error) => {
-                    let mut shutdown = ShutdownFailures::default();
-                    if let Err(source) = selection.runtime.shutdown().await {
-                        shutdown.push("Lua", source);
-                    }
-                    if let Err(source) = sqlite.shutdown().await {
-                        shutdown.push("SQLite", source);
-                    }
-                    if let Err(source) = file_system.shutdown().await {
-                        shutdown.push("FileSystem", source);
-                    }
+                    let shutdown = roots.shutdown().await;
                     drop(project_lease_guard);
                     return observed_construction_failure(
                         project_log,
@@ -2594,27 +2577,6 @@ impl ProductionRpgMakerCommandRunner {
                 lua_enabled: Some(lua.is_some()),
             },
         ));
-        let cpu = match RayonCpuExecutor::start(command.cpu())
-            .map_err(ProductionCommandError::cpu_start)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Some(selected) = lua.as_ref()
-                    && let Err(source) = selected.runtime.shutdown().await
-                {
-                    shutdown.push("Lua", source);
-                }
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
-                drop(project_lease_guard);
-                return observed_construction_failure(project_log, error, shutdown).await;
-            }
-        };
         let directory_publisher = file_system.directory_publisher(command.publisher().clone());
         let opener = PreopenedProject::new(opened_project);
         let asset_reader =
@@ -2651,7 +2613,7 @@ impl ProductionRpgMakerCommandRunner {
             publisher,
             selected_lua,
             ProductionBusinessLog::from_active(&project_log),
-            AlreadyHeldProjectCommandLeaseProvider,
+            AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
             cancellation.clone(),
         )
         .with_progress(progress_observer.clone());
@@ -2685,21 +2647,7 @@ impl ProductionRpgMakerCommandRunner {
             project_log.emit_cancellation(ProjectLogCode::SafeStopFinished, confirmed, total);
         }
         progress_observer.finish();
-        let mut shutdown = ShutdownFailures::default();
-        if let Some(selected) = lua.as_ref()
-            && let Err(source) = selected.runtime.shutdown().await
-        {
-            shutdown.push("Lua", source);
-        }
-        if let Err(source) = sqlite.shutdown().await {
-            shutdown.push("SQLite", source);
-        }
-        if let Err(source) = file_system.shutdown().await {
-            shutdown.push("FileSystem", source);
-        }
-        if let Err(source) = cpu.shutdown() {
-            shutdown.push("CPU", source);
-        }
+        let shutdown = roots.shutdown().await;
         if !matches!(execution, DrivenCommand::Interrupted(_)) {
             progress.finalizing(progress_finalizing(self.locale));
         }
@@ -2757,32 +2705,20 @@ impl ProductionRpgMakerCommandRunner {
         let progress = project_lua_terminal_progress(self.progress_mode, self.locale);
         let cancellation = CooperativeCancellation::default();
         let projects_root = command.common().projects_root().to_path_buf();
-        let sqlite = match RusqliteStorage::start_with_performance(
+        let mut roots = match ProductionCommandRootGuard::start_main(
+            command.cpu(),
+            command.common().filesystem().clone(),
             command.common().sqlite().clone(),
             Arc::clone(&performance),
         )
-        .map_err(ProductionCommandError::sqlite_start)
+        .await
         {
-            Ok(value) => value,
-            Err(error) => return ProductionCommandRunReport::failed_before_logging(error),
+            Ok(roots) => roots,
+            Err(failure) => return failure.into_report(),
         };
-        let file_system = match SystemFileSystem::new_with_performance(
-            command.common().filesystem().clone(),
-            Arc::clone(&performance),
-        )
-        .map_err(ProductionCommandError::file_system_build)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    error, shutdown,
-                );
-            }
-        };
+        let cpu = roots.cpu().clone();
+        let file_system = roots.file_system().clone();
+        let sqlite = roots.sqlite().clone();
         let project_name = command.project_name().clone();
         let lease_provider = ProjectCommandLeaseService::new(
             projects_root.clone(),
@@ -2802,26 +2738,14 @@ impl ProductionRpgMakerCommandRunner {
         let project_lease_guard = match project_lease {
             DrivenCommand::Finished(Ok(lease)) => lease,
             DrivenCommand::Finished(Err(error)) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     error, shutdown,
                 );
             }
             DrivenCommand::Interrupted(result) => {
                 drop(result);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::interrupted_before_logging(shutdown);
             }
@@ -2833,13 +2757,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
                     ProductionCommandError::signal(source, outcome),
@@ -2863,13 +2781,7 @@ impl ProductionRpgMakerCommandRunner {
         let opened_project = match project_opening {
             DrivenCommand::Finished(Ok(project)) => project,
             DrivenCommand::Finished(Err(error)) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -2878,13 +2790,7 @@ impl ProductionRpgMakerCommandRunner {
             }
             DrivenCommand::Interrupted(result) => {
                 drop(result);
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::interrupted_before_logging(shutdown);
@@ -2897,13 +2803,7 @@ impl ProductionRpgMakerCommandRunner {
                     }
                     Err(error) => SignalOutcomeSource::CommandFailed(error),
                 };
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -2925,13 +2825,7 @@ impl ProductionRpgMakerCommandRunner {
         }) {
             Ok(log) => log,
             Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 progress.finish();
                 return ProductionCommandRunReport::failed_before_logging_with_shutdown(
@@ -2939,17 +2833,11 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
         };
-        let lua = match load_lua_selection(&file_system, command.lua()).await {
-            Ok(lua) => lua,
+        let lua = match load_lua_program(&file_system, command.lua()).await {
+            Ok(program) => start_lua_selection(program, &mut roots),
             Err(source) => {
                 let diagnostic = source.safe_diagnostic();
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(error) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", error);
-                }
-                if let Err(error) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", error);
-                }
+                let shutdown = roots.shutdown().await;
                 drop(project_lease_guard);
                 return observed_construction_failure(
                     project_log,
@@ -2959,25 +2847,6 @@ impl ProductionRpgMakerCommandRunner {
                     shutdown,
                 )
                 .await;
-            }
-        };
-        let cpu = match RayonCpuExecutor::start(command.cpu())
-            .map_err(ProductionCommandError::cpu_start)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                let mut shutdown = ShutdownFailures::default();
-                if let Err(source) = lua.runtime.shutdown().await {
-                    shutdown.push("Lua", source);
-                }
-                if let Err(source) = sqlite.shutdown().await {
-                    shutdown.push("SQLite", source);
-                }
-                if let Err(source) = file_system.shutdown().await {
-                    shutdown.push("FileSystem", source);
-                }
-                drop(project_lease_guard);
-                return observed_construction_failure(project_log, error, shutdown).await;
             }
         };
         let arguments = command.arguments().to_vec();
@@ -3065,19 +2934,7 @@ impl ProductionRpgMakerCommandRunner {
         if let Some(profile_id) = standard.opened_profile_id() {
             project_log.set_profile(profile_id);
         }
-        let mut shutdown = ShutdownFailures::default();
-        if let Err(source) = lua.runtime.shutdown().await {
-            shutdown.push("Lua", source);
-        }
-        if let Err(source) = sqlite.shutdown().await {
-            shutdown.push("SQLite", source);
-        }
-        if let Err(source) = file_system.shutdown().await {
-            shutdown.push("FileSystem", source);
-        }
-        if let Err(source) = cpu.shutdown() {
-            shutdown.push("CPU", source);
-        }
+        let shutdown = roots.shutdown().await;
         drop(project_lease_guard);
         progress.finish();
         let log_outcome = project_log_outcome(&execution, &shutdown);
@@ -3112,10 +2969,26 @@ async fn load_rules_program(
     })
 }
 
-async fn load_lua_selection(
+fn start_lua_selection(
+    program: OwnedLuaProgram,
+    roots: &mut ProductionCommandRootGuard,
+) -> ProductionLuaSelection {
+    let runtime = roots.start_lua(TrustedLua54RuntimeConfiguration::production());
+    ProductionLuaSelection { program, runtime }
+}
+
+/// 阶段命令的零字节 Lua 表示清除或停用，不需要建立 Runtime。
+fn start_stage_lua_selection(
+    program: OwnedLuaProgram,
+    roots: &mut ProductionCommandRootGuard,
+) -> Option<ProductionLuaSelection> {
+    (!program.source().is_empty()).then(|| start_lua_selection(program, roots))
+}
+
+async fn load_lua_program(
     file_system: &SystemFileSystem,
     selected: &SelectedLuaConfiguration,
-) -> Result<ProductionLuaSelection, LuaProgramInputError> {
+) -> Result<OwnedLuaProgram, LuaProgramInputError> {
     let requested_path = selected.script_path().to_path_buf();
     let file = file_system
         .read_file(requested_path.clone())
@@ -3126,10 +2999,7 @@ async fn load_lua_selection(
         })?;
     let resolved_path = file.resolved_path().to_path_buf();
     let bytes = file.into_bytes();
-    Ok(ProductionLuaSelection {
-        program: OwnedLuaProgram::new(resolved_path, bytes),
-        runtime: TrustedLua54Runtime::new(selected.runtime(), tokio::runtime::Handle::current()),
-    })
+    Ok(OwnedLuaProgram::new(resolved_path, bytes))
 }
 
 #[derive(Debug)]
@@ -5463,12 +5333,12 @@ mod large_external_input_tests {
             rules_path.canonicalize().expect("Rules 路径应规范化")
         );
 
-        let lua = load_lua_selection(&file_system, command.lua().expect("测试显式选择了 Lua"))
+        let lua = load_lua_program(&file_system, command.lua().expect("测试显式选择了 Lua"))
             .await
             .expect("17 MiB 以上 Lua 应通过生产读取和程序准备边界");
-        assert!(lua.program.source().len() > 17 * 1024 * 1024);
+        assert!(lua.source().len() > 17 * 1024 * 1024);
         assert_eq!(
-            lua.program.main_script_path(),
+            lua.main_script_path(),
             lua_path.canonicalize().expect("Lua 路径应规范化")
         );
 
