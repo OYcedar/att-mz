@@ -43,13 +43,13 @@ use super::semantics::{
     PreparedTranslationStatus, ResolvedTranslationSemanticError, ResolvedTranslationSemantics,
 };
 use super::standard::{
-    ExpectedLineShape, ExpectedTranslationOutput, ExpectedTranslationValidation,
-    StandardTranslationCorpus, StandardTranslationGroup, StandardTranslationInput,
-    StandardTranslationPlan, StandardTranslationTaskIndex, StandardTranslationTaskPlanner,
-    TerminologyDependency, TranslationInvalidation, TranslationPlanPreparation,
-    TranslationPlanPreparationCounts, TranslationPlanningFailure, TranslationPlanningFailureReason,
-    TranslationPropagationTarget, TranslationStateContext, TranslationTaskBlock,
-    TranslationUnitIdentity, TranslationVirtualReason,
+    ExpectedLineShape, ExpectedTranslationOutput, ExpectedTranslationOutputContractError,
+    ExpectedTranslationValidation, StandardTranslationCorpus, StandardTranslationGroup,
+    StandardTranslationInput, StandardTranslationPlan, StandardTranslationTaskIndex,
+    StandardTranslationTaskPlanner, TerminologyDependency, TranslationInvalidation,
+    TranslationPlanPreparation, TranslationPlanPreparationCounts, TranslationPlanningFailure,
+    TranslationPlanningFailureReason, TranslationPropagationTarget, TranslationStateContext,
+    TranslationTaskBlock, TranslationUnitIdentity, TranslationVirtualReason,
 };
 
 /// 使用三个职责模块与 CPU 根建立确定性 RPG Maker 翻译计划。
@@ -390,20 +390,26 @@ where
         let tasks = self
             .cpu
             .execute(move || {
-                planned_scopes
+                let planned_scopes = planned_scopes
                     .into_iter()
-                    .flatten()
-                    .enumerate()
-                    .map(|(index, task)| {
-                        task.with_index(
-                            StandardTranslationTaskIndex::new(index),
-                            task_language_pair.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>, ExpectedTranslationOutputContractError>>()?;
+                Ok::<_, ExpectedTranslationOutputContractError>(
+                    planned_scopes
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                        .map(|(index, task)| {
+                            task.with_index(
+                                StandardTranslationTaskIndex::new(index),
+                                task_language_pair.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
             })
             .await
-            .map_err(RpgMakerStandardTranslationTaskPlanningError::FinalizePlanCompute)?;
+            .map_err(RpgMakerStandardTranslationTaskPlanningError::FinalizePlanCompute)?
+            .map_err(RpgMakerStandardTranslationTaskPlanningError::InvalidOutputContract)?;
 
         Ok(StandardTranslationPlan::new(
             Arc::clone(&semantics),
@@ -967,7 +973,7 @@ fn build_scope_tasks(
     terminology: Arc<TerminologyPromptIndex>,
     system_markdown: &str,
     target_user_message_characters: usize,
-) -> Vec<UnindexedTask> {
+) -> Result<Vec<UnindexedTask>, ExpectedTranslationOutputContractError> {
     let mut prepared_groups = Vec::with_capacity(scope.groups.len());
     for group in scope.groups {
         let units = group
@@ -1404,7 +1410,7 @@ fn pack_scope(
     terminology: &TerminologyPromptIndex,
     system_markdown: &str,
     target_user_message_characters: usize,
-) -> Vec<UnindexedTask> {
+) -> Result<Vec<UnindexedTask>, ExpectedTranslationOutputContractError> {
     let mut tasks = Vec::new();
     let mut current_groups = Vec::<PackedGroup>::new();
     let mut current_active = 0usize;
@@ -1440,7 +1446,7 @@ fn pack_scope(
                 terminology,
                 &current_terms,
                 system_markdown,
-            ));
+            )?);
         } else {
             current_groups.clear();
         }
@@ -1468,7 +1474,7 @@ fn pack_scope(
                 terminology,
                 &current_terms,
                 system_markdown,
-            ));
+            )?);
             current_active = 0;
             current_terms.clear();
             current_user_message_characters = 0;
@@ -1481,9 +1487,9 @@ fn pack_scope(
             terminology,
             &current_terms,
             system_markdown,
-        ));
+        )?);
     }
-    tasks
+    Ok(tasks)
 }
 
 fn additional_terminology_size(
@@ -1584,7 +1590,7 @@ fn finalize_task(
     terminology: &TerminologyPromptIndex,
     selected_terms: &BTreeSet<usize>,
     system_markdown: &str,
-) -> UnindexedTask {
+) -> Result<UnindexedTask, ExpectedTranslationOutputContractError> {
     let mut next_active_id = 1usize;
     let groups = groups
         .into_iter()
@@ -1598,13 +1604,13 @@ fn finalize_task(
     let user_markdown = render_user_markdown(&groups, None, terminology, selected_terms);
     let mut expected_outputs = Vec::new();
     for group in groups {
-        expected_outputs.extend(group.expected.into_iter().map(|expected| {
+        for expected in group.expected {
             let (propagation_targets, propagation_state_contexts) = expected
                 .propagation_targets
                 .into_iter()
                 .map(|target| (target.identity().clone(), target.state_context()))
                 .unzip();
-            ExpectedTranslationOutput::new(
+            expected_outputs.push(ExpectedTranslationOutput::try_new(
                 expected.id,
                 expected.identity,
                 propagation_targets,
@@ -1616,16 +1622,16 @@ fn finalize_task(
                 ),
                 expected.state_context,
                 propagation_state_contexts,
-            )
-        }));
+            )?);
+        }
     }
-    UnindexedTask {
+    Ok(UnindexedTask {
         messages: vec![
             ChatMessage::new(ChatMessageRole::System, system_markdown),
             ChatMessage::new(ChatMessageRole::User, user_markdown),
         ],
         expected_outputs,
-    }
+    })
 }
 
 struct UnindexedTask {
@@ -1752,6 +1758,7 @@ pub(crate) enum RpgMakerStandardTranslationTaskPlanningError<R, C> {
     InvalidDeduplication(TranslationDeduplicationError),
     PlanScopesCompute(CpuTaskExecutionError<C>),
     FinalizePlanCompute(CpuTaskExecutionError<C>),
+    InvalidOutputContract(ExpectedTranslationOutputContractError),
 }
 
 impl<R: fmt::Display, C: fmt::Display> fmt::Display
@@ -1795,6 +1802,9 @@ impl<R: fmt::Display, C: fmt::Display> fmt::Display
             Self::FinalizePlanCompute(source) => {
                 write!(formatter, "无法调度翻译任务最终编号：{source}")
             }
+            Self::InvalidOutputContract(source) => {
+                write!(formatter, "Planner 建立的模型输出契约无效：{source}")
+            }
         }
     }
 }
@@ -1815,6 +1825,7 @@ impl<R: Error + 'static, C: Error + 'static> Error
             Self::InvalidDeduplication(source) => Some(source),
             Self::PlanScopesCompute(source) => Some(source),
             Self::FinalizePlanCompute(source) => Some(source),
+            Self::InvalidOutputContract(source) => Some(source),
             Self::ResolvedLanguagePairMismatch { .. } => None,
         }
     }
@@ -1928,6 +1939,17 @@ where
                 impact,
                 "finalize_translation_task_order",
                 None,
+            ),
+            Self::InvalidOutputContract(source) => SafeDiagnostic::new(
+                DiagnosticCode::InternalOperation,
+                stage,
+                source.diagnostic_subject(),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InternalInvariant,
+                    source.safe_detail(),
+                ),
+                impact,
+                DiagnosticAction::ReportBug,
             ),
         }
     }
@@ -2615,6 +2637,72 @@ mod tests {
                 failure: DiagnosticFailureKind::LockCancelled
             }
         ));
+    }
+
+    #[test]
+    fn invalid_output_contract_is_a_safe_planner_failure() {
+        let sentinel = "PLANNER_PLACEHOLDER_TOKEN_SENTINEL";
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            RpgMakerLocation::value(RpgMakerSource::map(9), vec![RpgMakerLocationStep::index(2)]),
+            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法")),
+            TextUnitContent::Value("原文".to_owned()),
+            "{}",
+        );
+        let error: ProductionPlanningError =
+            RpgMakerStandardTranslationTaskPlanningError::InvalidOutputContract(
+                ExpectedTranslationOutputContractError::placeholder_index_invalid(
+                    4,
+                    &identity,
+                    LanguageTextProjectionError::MissingToken {
+                        token: sentinel.to_owned(),
+                    },
+                ),
+            );
+
+        let diagnostic = error.safe_diagnostic_source(
+            DiagnosticStage::Translate,
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+
+        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+        assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+        assert!(matches!(
+            diagnostic.subject,
+            DiagnosticSubject::Operation { ref name }
+                if name.contains("translation_output_contract")
+                    && name.contains("unit=4")
+                    && name.contains("owner=builtin")
+                    && name.contains("group_kind=database_entry")
+                    && name.contains("Map009.json[2]")
+                    && name.contains("role=name")
+        ));
+        assert!(
+            diagnostic
+                .reason
+                .render()
+                .contains("placeholder_index_invalid")
+        );
+        assert!(diagnostic.reason.render().contains("unit=4"));
+        assert!(diagnostic.reason.render().contains("owner=builtin"));
+        assert!(
+            diagnostic
+                .reason
+                .render()
+                .contains("group_kind=database_entry")
+        );
+        assert!(diagnostic.reason.render().contains("Map009.json[2]"));
+        assert!(diagnostic.reason.render().contains("role=name"));
+        assert!(
+            diagnostic
+                .reason
+                .render()
+                .contains("missing_required_placeholder_token")
+        );
+        assert!(!diagnostic.reason.render().contains(sentinel));
+        assert!(!format!("{error:?}").contains(sentinel));
     }
 
     #[test]
