@@ -98,6 +98,7 @@ notice-manual-layout = { $count ->
    *[other] تحتاج { $count } وحدة إلى مراجعة يدوية لفواصل الأسطر.
 }
 notice-log-degraded = سجل المشروع غير متاح أو متدهور؛ سيستمر الأمر ولن تتغير حالة الخروج.
+notice-task-records-degraded = سجلات مهام الترجمة غير متاحة أو متدهورة؛ سيستمر الأمر ولن تتغير حالة الخروج.
 progress-init-check-project = جارٍ فحص حالة المشروع
 progress-init-scan-source = جارٍ فحص مصدر اللعبة
 progress-init-build-candidate = جارٍ بناء مرشح المشروع

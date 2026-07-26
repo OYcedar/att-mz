@@ -94,6 +94,7 @@ notice-manual-layout = { $count ->
    *[other] { $count } unidades necesitan revisión manual de saltos de línea.
 }
 notice-log-degraded = El registro del proyecto no está disponible o está degradado; el comando continúa y su estado de salida no cambia.
+notice-task-records-degraded = Los registros de tareas de traducción no están disponibles o están degradados; el comando continúa y su estado de salida no cambia.
 progress-init-check-project = Comprobando el estado del proyecto
 progress-init-scan-source = Explorando el origen del juego
 progress-init-build-candidate = Construyendo el candidato del proyecto

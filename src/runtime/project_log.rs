@@ -1,8 +1,9 @@
 //! 每次命令独占一个 JSONL 文件的项目日志运行时。
 //!
-//! 普通事件进入单 writer 的内部有界队列；队列饱和时生产者自然背压，不丢记录。最终
-//! `performance.counters`、`failure.reported` 与 `run.finished` 保存在独立终态槽，
-//! worker 排空普通事件后按固定顺序直接写入，因而不会被普通队列压力挤掉。
+//! 普通事件尽力进入单 writer 的内部有界队列；队列饱和时直接降级并累计丢弃数，不阻塞
+//! 业务生产者。最终 `performance.counters`、`failure.reported` 与 `run.finished` 保存在
+//! 独立可靠终态槽，worker 排空已接收普通事件后按固定顺序直接写入，因而不会被普通队列
+//! 压力挤掉。
 //! 已建立 writer 的 runtime 即使被意外丢弃，也会使用预登记的安全投影写出未知终态。
 //! 日志失败只进入健康状态，不改变业务结果。
 
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -437,19 +438,17 @@ impl ProjectLogger {
         self.inner.health.take_warning()
     }
 
-    /// 将同一运行中的其他可观测性产物故障并入既有非致命日志降级提示。
-    pub(crate) fn record_observability_failure(&self, diagnostic: SafeDiagnostic) {
-        self.inner.health.record_observability_failure(diagnostic);
+    /// 记录一次任务记录旁路失败；它与项目 JSONL 健康状态分别计数和呈现。
+    pub(crate) fn record_task_record_failure(&self, diagnostic: SafeDiagnostic) {
+        self.record_task_record_failures([diagnostic]);
     }
 
-    /// 同一可观测性操作的主错误与相关清理错误必须全部保留，不能互相覆盖。
-    pub(crate) fn record_observability_failures(
+    /// 同一次任务记录操作的主错误与相关清理错误必须全部保留，不能互相覆盖。
+    pub(crate) fn record_task_record_failures(
         &self,
         diagnostics: impl IntoIterator<Item = SafeDiagnostic>,
     ) {
-        for diagnostic in diagnostics {
-            self.record_observability_failure(diagnostic);
-        }
+        self.inner.health.record_task_record_failures(diagnostics);
     }
 }
 
@@ -463,9 +462,12 @@ impl ProjectLog for ProjectLogger {
             emitted_at: OffsetDateTime::now_utc(),
             event,
         };
-        match sender.send_blocking(queued) {
+        match sender.try_send(queued) {
             Ok(()) => self.inner.health.add_accepted(1),
-            Err(_) => {
+            Err(TrySendError::Full(_)) => {
+                self.inner.health.add_dropped(1);
+            }
+            Err(TrySendError::Closed(_)) => {
                 self.inner.health.record_queue_closed();
                 self.inner.health.add_dropped(1);
             }
@@ -485,10 +487,11 @@ pub(crate) struct ProjectLogHealthSnapshot {
     pub(crate) flush_failures: u64,
     pub(crate) sync_failures: u64,
     pub(crate) worker_panics: u64,
+    pub(crate) task_record_failures: u64,
 }
 
 impl ProjectLogHealthSnapshot {
-    pub(crate) const fn is_degraded(self) -> bool {
+    pub(crate) const fn is_project_log_degraded(self) -> bool {
         self.startup_failures > 0
             || self.queue_closed > 0
             || self.serialization_failures > 0
@@ -498,12 +501,26 @@ impl ProjectLogHealthSnapshot {
             || self.worker_panics > 0
             || self.dropped_records > 0
     }
+
+    pub(crate) const fn is_task_record_degraded(self) -> bool {
+        self.task_record_failures > 0
+    }
+
+    pub(crate) const fn is_degraded(self) -> bool {
+        self.is_project_log_degraded() || self.is_task_record_degraded()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObservabilityWarning {
+    pub(crate) diagnostic: Option<SafeDiagnostic>,
+    pub(crate) related_diagnostics: Vec<SafeDiagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectLogWarning {
-    pub(crate) diagnostic: Option<SafeDiagnostic>,
-    pub(crate) related_diagnostics: Vec<SafeDiagnostic>,
+    pub(crate) project_log: Option<ObservabilityWarning>,
+    pub(crate) task_records: Option<ObservabilityWarning>,
 }
 
 #[derive(Default)]
@@ -518,9 +535,10 @@ struct ProjectLogHealth {
     flush_failures: AtomicU64,
     sync_failures: AtomicU64,
     worker_panics: AtomicU64,
+    task_record_failures: AtomicU64,
     warning_claimed: AtomicBool,
     first_failure: Mutex<Option<SafeDiagnostic>>,
-    observation_failures: Mutex<Vec<SafeDiagnostic>>,
+    task_record_diagnostics: Mutex<Vec<SafeDiagnostic>>,
 }
 
 impl ProjectLogHealth {
@@ -557,12 +575,16 @@ impl ProjectLogHealth {
         }
     }
 
-    fn record_observability_failure(&self, diagnostic: SafeDiagnostic) {
-        self.record_failure(&self.write_failures, diagnostic.clone());
-        self.observation_failures
+    fn record_task_record_failures(&self, diagnostics: impl IntoIterator<Item = SafeDiagnostic>) {
+        let diagnostics = diagnostics.into_iter().collect::<Vec<_>>();
+        if diagnostics.is_empty() {
+            return;
+        }
+        Self::increment(&self.task_record_failures, 1);
+        self.task_record_diagnostics
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(diagnostic);
+            .extend(diagnostics);
     }
 
     fn snapshot(&self) -> ProjectLogHealthSnapshot {
@@ -577,6 +599,7 @@ impl ProjectLogHealth {
             flush_failures: self.flush_failures.load(Ordering::Relaxed),
             sync_failures: self.sync_failures.load(Ordering::Relaxed),
             worker_panics: self.worker_panics.load(Ordering::Relaxed),
+            task_record_failures: self.task_record_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -590,26 +613,31 @@ impl ProjectLogHealth {
         {
             return None;
         }
-        let diagnostic = self
-            .first_failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let mut related_diagnostics = self
-            .observation_failures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(primary) = &diagnostic
-            && let Some(position) = related_diagnostics
-                .iter()
-                .position(|candidate| candidate == primary)
-        {
-            related_diagnostics.remove(position);
-        }
+        let project_log = health
+            .is_project_log_degraded()
+            .then(|| ObservabilityWarning {
+                diagnostic: self
+                    .first_failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+                related_diagnostics: Vec::new(),
+            });
+        let task_records = health.is_task_record_degraded().then(|| {
+            let mut diagnostics = self
+                .task_record_diagnostics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .into_iter();
+            ObservabilityWarning {
+                diagnostic: diagnostics.next(),
+                related_diagnostics: diagnostics.collect(),
+            }
+        });
         Some(ProjectLogWarning {
-            diagnostic,
-            related_diagnostics,
+            project_log,
+            task_records,
         })
     }
 }
@@ -854,6 +882,15 @@ pub(crate) fn start_project_log(logs_root: PathBuf, run_id: String) -> ProjectLo
         worker: Some(worker),
         path: Some(path),
     }
+}
+
+/// 在本次运行无法建立 RunId 时创建带启动诊断的 no-op 日志运行时。
+///
+/// 调用方继续执行业务；终态呈现只消费这里登记的一次非致命项目日志降级。
+pub(crate) fn disabled_project_log(diagnostic: SafeDiagnostic) -> ProjectLogRuntime {
+    let health = Arc::new(ProjectLogHealth::default());
+    health.record_failure(&health.startup_failures, diagnostic);
+    no_op_runtime(health, Arc::new(Mutex::new(None)))
 }
 
 fn no_op_runtime(
@@ -1385,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn observability_failures_remain_visible_after_an_earlier_project_log_failure() {
+    fn project_log_and_task_record_failures_are_reported_separately_once() {
         let health = Arc::new(ProjectLogHealth::default());
         let logger = ProjectLogger::no_op(Arc::clone(&health));
         let diagnostic = |path: &str| {
@@ -1409,7 +1446,7 @@ mod tests {
                 DiagnosticAction::CheckPathAndPermissions,
             ),
         );
-        logger.record_observability_failures([
+        logger.record_task_record_failures([
             diagnostic("C:/project/task-records/run/task-000001.md"),
             diagnostic("C:/project/task-records/run/.task-000001.tmp"),
         ]);
@@ -1419,15 +1456,21 @@ mod tests {
             .expect("项目日志与任务记录故障必须形成非致命警告");
         assert_eq!(
             warning
-                .diagnostic
+                .project_log
                 .as_ref()
+                .and_then(|warning| warning.diagnostic.as_ref())
                 .map(|diagnostic| diagnostic.code),
             Some(DiagnosticCode::LogStart)
         );
+        let task_record_warning = warning
+            .task_records
+            .as_ref()
+            .expect("任务记录必须拥有独立降级类别");
         assert_eq!(
-            warning
-                .related_diagnostics
+            task_record_warning
+                .diagnostic
                 .iter()
+                .chain(task_record_warning.related_diagnostics.iter())
                 .map(|diagnostic| diagnostic.subject.clone())
                 .collect::<Vec<_>>(),
             [
@@ -1435,6 +1478,16 @@ mod tests {
                 DiagnosticSubject::path("C:/project/task-records/run/.task-000001.tmp"),
             ],
             "较早的 JSONL 故障不得覆盖任务记录主错误或清理错误"
+        );
+        let snapshot = logger.health();
+        assert_eq!(snapshot.startup_failures, 1);
+        assert_eq!(
+            snapshot.task_record_failures, 1,
+            "同一次保存操作的主错误与清理错误只计为一次任务记录失败"
+        );
+        assert!(
+            logger.take_warning().is_none(),
+            "两个类别的终态警告都只能领取一次"
         );
     }
 
@@ -1672,31 +1725,67 @@ mod tests {
     }
 
     #[test]
-    fn queue_pressure_backpressures_without_losing_events_or_terminal_records() {
-        let directory = tempdir().expect("临时目录应可建立");
-        let run_id = "550e8400-e29b-41d4-a716-446655440004";
-        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
-        let logger = runtime.logger();
-        let event_count = u64::try_from(QUEUE_CAPACITY)
-            .expect("队列容量应可转换")
-            .saturating_add(257);
-        for index in 1..=event_count {
-            logger.emit(event(index));
-        }
-        let health = runtime.finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new());
-        assert_eq!(health.accepted_records, event_count);
-        assert_eq!(health.dropped_records, 0);
-        assert!(!health.is_degraded());
+    fn full_ordinary_queue_drops_without_blocking_and_counts_degradation() {
+        let health = Arc::new(ProjectLogHealth::default());
+        let (sender, _receiver) = async_channel::bounded(1);
+        let logger = ProjectLogger {
+            inner: Arc::new(LoggerInner {
+                sender: Some(sender),
+                health: Arc::clone(&health),
+            }),
+        };
 
-        let path = directory.path().join(format!("{run_id}.jsonl"));
-        let raw = std::fs::read_to_string(path).expect("日志应可读取");
+        logger.emit(event(1));
+        logger.emit(event(2));
+
+        let snapshot = logger.health();
+        assert_eq!(snapshot.accepted_records, 1);
+        assert_eq!(snapshot.dropped_records, 1);
+        assert!(snapshot.is_project_log_degraded());
+        assert!(!snapshot.is_task_record_degraded());
+        let warning = logger.take_warning().expect("普通事件丢弃必须可见");
         assert_eq!(
-            u64::try_from(raw.lines().count()).expect("日志条数应可转换"),
-            event_count.saturating_add(2)
+            warning,
+            ProjectLogWarning {
+                project_log: Some(ObservabilityWarning {
+                    diagnostic: None,
+                    related_diagnostics: Vec::new(),
+                }),
+                task_records: None,
+            }
         );
-        let terminal: serde_json::Value =
-            serde_json::from_str(raw.lines().last().expect("应有终态")).expect("终态应为 JSON");
-        assert_eq!(terminal["code"], "run.finished");
+        assert!(logger.take_warning().is_none(), "降级横幅只能领取一次");
+    }
+
+    #[test]
+    fn disabled_runtime_preserves_run_id_failure_as_one_nonfatal_warning() {
+        let diagnostic = SafeDiagnostic::new(
+            DiagnosticCode::InternalOperation,
+            DiagnosticStage::ProcessStartup,
+            DiagnosticSubject::operation("generate_run_id"),
+            DiagnosticReason::failure(DiagnosticFailureKind::InternalInvariant),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::Retry,
+        );
+        let runtime = disabled_project_log(diagnostic.clone());
+        assert!(runtime.path().is_none(), "禁用日志时不得伪造日志路径");
+        let logger = runtime.logger();
+
+        let snapshot = runtime.finish(ProjectLogRunOutcome::Succeeded, context(), Vec::new());
+
+        assert_eq!(snapshot.startup_failures, 1);
+        assert_eq!(snapshot.task_record_failures, 0);
+        assert_eq!(
+            logger.take_warning(),
+            Some(ProjectLogWarning {
+                project_log: Some(ObservabilityWarning {
+                    diagnostic: Some(diagnostic),
+                    related_diagnostics: Vec::new(),
+                }),
+                task_records: None,
+            })
+        );
+        assert!(logger.take_warning().is_none());
     }
 
     #[test]

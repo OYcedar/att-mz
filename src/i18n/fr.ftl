@@ -94,6 +94,7 @@ notice-manual-layout = { $count ->
    *[other] { $count } unités nécessitent une vérification manuelle des sauts de ligne.
 }
 notice-log-degraded = La journalisation du projet est indisponible ou dégradée ; la commande continue et son code de sortie ne change pas.
+notice-task-records-degraded = Les enregistrements des tâches de traduction sont indisponibles ou dégradés ; la commande continue et son code de sortie ne change pas.
 progress-init-check-project = Vérification de l’état du projet
 progress-init-scan-source = Analyse de la source du jeu
 progress-init-build-candidate = Construction du projet candidat

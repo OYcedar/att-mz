@@ -676,6 +676,7 @@ pub(crate) enum UiMessage<'a> {
         count: u64,
     },
     NoticeLogDegraded,
+    NoticeTaskRecordsDegraded,
     ProgressInitCheckProject,
     ProgressInitScanSource,
     ProgressInitBuildCandidate,
@@ -1083,6 +1084,7 @@ impl UiMessage<'_> {
             Self::NoticeNoModelRequest => "notice-no-model-request",
             Self::NoticeManualLayout { .. } => "notice-manual-layout",
             Self::NoticeLogDegraded => "notice-log-degraded",
+            Self::NoticeTaskRecordsDegraded => "notice-task-records-degraded",
             Self::ProgressInitCheckProject => "progress-init-check-project",
             Self::ProgressInitScanSource => "progress-init-scan-source",
             Self::ProgressInitBuildCandidate => "progress-init-build-candidate",
@@ -1702,6 +1704,7 @@ impl UiMessage<'_> {
             | Self::NoticeWriteBackStandardOnly
             | Self::NoticeNoModelRequest
             | Self::NoticeLogDegraded
+            | Self::NoticeTaskRecordsDegraded
             | Self::ProgressInitCheckProject
             | Self::ProgressInitScanSource
             | Self::ProgressInitBuildCandidate
@@ -2311,6 +2314,7 @@ mod tests {
             UiMessage::NoticeNoModelRequest,
             UiMessage::NoticeManualLayout { count: 3 },
             UiMessage::NoticeLogDegraded,
+            UiMessage::NoticeTaskRecordsDegraded,
             UiMessage::ProgressInitCheckProject,
             UiMessage::ProgressInitScanSource,
             UiMessage::ProgressInitBuildCandidate,

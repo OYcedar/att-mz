@@ -91,6 +91,7 @@ notice-lua-cleared = Chương trình Lua { $phase } đã bị xóa và sẽ khô
 notice-no-model-request = Mọi đơn vị dịch chuẩn đều mới nhất; trong lần chạy này Standard không gửi yêu cầu nào đến mô hình.
 notice-manual-layout = Có { $count } đơn vị cần kiểm tra ngắt dòng thủ công.
 notice-log-degraded = Nhật ký dự án không khả dụng hoặc suy giảm; lệnh vẫn tiếp tục và trạng thái thoát không đổi.
+notice-task-records-degraded = Bản ghi tác vụ dịch không khả dụng hoặc suy giảm; lệnh vẫn tiếp tục và trạng thái thoát không đổi.
 progress-init-check-project = Đang kiểm tra trạng thái dự án
 progress-init-scan-source = Đang quét nguồn trò chơi
 progress-init-build-candidate = Đang dựng ứng viên dự án

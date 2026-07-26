@@ -94,6 +94,7 @@ notice-manual-layout = { $count ->
    *[other] { $count } units need a manual line-break review.
 }
 notice-log-degraded = Project logging is unavailable or degraded; the command will continue and its exit status is unchanged.
+notice-task-records-degraded = Translation task records are unavailable or degraded; the command will continue and its exit status is unchanged.
 progress-init-check-project = Checking project state
 progress-init-scan-source = Scanning the game source
 progress-init-build-candidate = Building the project candidate

@@ -72,6 +72,8 @@ const INVALID_PROMPT_BODY_SENTINEL: &str = "e2e-invalid-prompt-body-sentinel";
 const EMPTY_PARAMETERS: &str = "{}";
 const E2E_PARAMETERS: &str = r#"{"temperature":0.0,"provider_extension":{"mode":"e2e","diagnostic_marker":"e2e-parameter-marker"}}"#;
 const LOG_DEGRADED_WARNING: &str = "项目日志不可用或已降级；命令会继续，退出状态不受影响。";
+const TASK_RECORDS_DEGRADED_WARNING: &str =
+    "翻译任务记录不可用或已降级；命令会继续，退出状态不受影响。";
 const SAFE_STOPPING_PROGRESS: &str = "正在安全停止；保留最后确认进度";
 
 #[test]
@@ -1727,6 +1729,65 @@ fn enabled_task_recording_with_zero_standard_tasks_creates_no_directory() {
             .join("task-records")
             .exists(),
         "记录开启但没有 Standard TaskBlock 时不得创建空目录"
+    );
+}
+
+#[test]
+fn task_record_failure_is_reported_once_without_changing_translate_success() {
+    const DEGRADED_PROJECT: &str = "task-records-degraded";
+
+    let temporary = tempfile::tempdir().expect("应可建立任务记录降级端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
+    write_minimal_mz_game(&game_root);
+    initialize_and_extract_prompt_project(root, DEGRADED_PROJECT, &game_root, "ja", "zh-Hans");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), E2E_PARAMETERS);
+    enable_translation_task_records(root);
+    let workspace = root.join("projects/mz").join(DEGRADED_PROJECT);
+    let task_records_root = workspace.join("task-records");
+    fs::write(&task_records_root, b"not-a-directory")
+        .expect("普通文件应可稳定触发任务记录写入降级");
+    let requests = server.start_with_responses(vec![ChatResponseFixture::Standard]);
+
+    let translate = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", DEGRADED_PROJECT, PROFILE]),
+    );
+
+    let stdout = String::from_utf8(translate.stdout).expect("Translate stdout 必须是 UTF-8");
+    let stderr = String::from_utf8(translate.stderr).expect("Translate stderr 必须是 UTF-8");
+    let visible_stdout = without_fluent_isolation(&stdout);
+    let visible_stderr = without_fluent_isolation(&stderr);
+    assert_eq!(
+        translate.status.code(),
+        Some(0),
+        "任务记录故障不得改变翻译成功退出码\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        visible_stdout.contains("翻译执行完成：task-records-degraded"),
+        "成功输出必须保留完整 Translate 结果：{stdout}"
+    );
+    assert_eq!(requests.finish().len(), 1);
+    assert_translation_committed(&workspace.join("project.db"));
+    assert_eq!(
+        visible_stderr
+            .matches(TASK_RECORDS_DEGRADED_WARNING)
+            .count(),
+        1,
+        "任务记录降级横幅在终态只能显示一次：{visible_stderr}"
+    );
+    assert_eq!(
+        visible_stderr.matches(LOG_DEGRADED_WARNING).count(),
+        0,
+        "任务记录故障不得错误归入项目 JSONL 类别：{visible_stderr}"
+    );
+    assert!(
+        visible_stderr.contains("task-records"),
+        "任务记录诊断必须保留失败路径：{visible_stderr}"
     );
 }
 
