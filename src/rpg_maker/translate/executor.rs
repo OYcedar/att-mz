@@ -179,30 +179,6 @@ pub(crate) enum TranslationCandidateInvariantLocation {
     PreparedCandidate,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PlaceholderMultisetErrorKind {
-    Mismatch,
-    Unexpected,
-}
-
-impl PlaceholderMultisetErrorKind {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Mismatch => "mismatch",
-            Self::Unexpected => "unexpected",
-        }
-    }
-}
-
-impl From<&PlaceholderMultisetError> for PlaceholderMultisetErrorKind {
-    fn from(source: &PlaceholderMultisetError) -> Self {
-        match source {
-            PlaceholderMultisetError::Mismatch { .. } => Self::Mismatch,
-            PlaceholderMultisetError::Unexpected { .. } => Self::Unexpected,
-        }
-    }
-}
-
 #[derive(Eq, PartialEq)]
 pub(crate) enum TranslationInternalInvariant {
     ResponseAttemptZero {
@@ -217,44 +193,6 @@ pub(crate) enum TranslationInternalInvariant {
         task_target: LanguageId,
         resolved_source: LanguageId,
         resolved_target: LanguageId,
-    },
-    PropagationContextCountMismatch {
-        task_index: StandardTranslationTaskIndex,
-        unit_id: usize,
-        target_count: usize,
-        context_count: usize,
-    },
-    PlaceholderIndexInvalid {
-        task_index: StandardTranslationTaskIndex,
-        unit_id: usize,
-        source: LanguageTextProjectionError,
-    },
-    ProtectedPlaceholderMultisetMismatch {
-        task_index: StandardTranslationTaskIndex,
-        unit_id: usize,
-        kind: PlaceholderMultisetErrorKind,
-    },
-    ProtectedPlaceholderCrossesLineBoundary {
-        task_index: StandardTranslationTaskIndex,
-        unit_id: usize,
-        placeholder_index: usize,
-    },
-    ProtectedLineCountMismatch {
-        task_index: StandardTranslationTaskIndex,
-        unit_id: usize,
-        expected: usize,
-        actual: usize,
-    },
-    ScalarAlignedCountInvalid {
-        task_index: StandardTranslationTaskIndex,
-        unit_id: usize,
-        actual: usize,
-    },
-    LinesAlignedCountMismatch {
-        task_index: StandardTranslationTaskIndex,
-        unit_id: usize,
-        expected: usize,
-        actual: usize,
     },
     RepairSegmentRangeMissing {
         location: TranslationCandidateInvariantLocation,
@@ -326,67 +264,6 @@ impl TranslationInternalInvariant {
                 resolved_source.as_str(),
                 resolved_target.as_str()
             ),
-            Self::PropagationContextCountMismatch {
-                task_index,
-                unit_id,
-                target_count,
-                context_count,
-            } => format!(
-                "propagation_context_count_mismatch; task={}; unit={unit_id}; targets={target_count}; contexts={context_count}",
-                task_index.get()
-            ),
-            Self::PlaceholderIndexInvalid {
-                task_index,
-                unit_id,
-                source,
-            } => format!(
-                "placeholder_index_invalid; task={}; unit={unit_id}; {}",
-                task_index.get(),
-                language_projection_detail(source)
-            ),
-            Self::ProtectedPlaceholderMultisetMismatch {
-                task_index,
-                unit_id,
-                kind,
-            } => format!(
-                "protected_placeholder_multiset_mismatch; task={}; unit={unit_id}; kind={}",
-                task_index.get(),
-                kind.as_str()
-            ),
-            Self::ProtectedPlaceholderCrossesLineBoundary {
-                task_index,
-                unit_id,
-                placeholder_index,
-            } => format!(
-                "protected_placeholder_crosses_line_boundary; task={}; unit={unit_id}; placeholder_index={placeholder_index}",
-                task_index.get()
-            ),
-            Self::ProtectedLineCountMismatch {
-                task_index,
-                unit_id,
-                expected,
-                actual,
-            } => format!(
-                "protected_line_count_mismatch; task={}; unit={unit_id}; expected={expected}; actual={actual}",
-                task_index.get()
-            ),
-            Self::ScalarAlignedCountInvalid {
-                task_index,
-                unit_id,
-                actual,
-            } => format!(
-                "scalar_aligned_count_invalid; task={}; unit={unit_id}; expected=1; actual={actual}",
-                task_index.get()
-            ),
-            Self::LinesAlignedCountMismatch {
-                task_index,
-                unit_id,
-                expected,
-                actual,
-            } => format!(
-                "lines_aligned_count_mismatch; task={}; unit={unit_id}; expected={expected}; actual={actual}",
-                task_index.get()
-            ),
             Self::RepairSegmentRangeMissing {
                 location,
                 line_index,
@@ -428,41 +305,6 @@ impl TranslationInternalInvariant {
             | Self::LanguagePairMismatch { task_index, .. } => {
                 translation_task_subject(*task_index)
             }
-            Self::PropagationContextCountMismatch {
-                task_index,
-                unit_id,
-                ..
-            }
-            | Self::PlaceholderIndexInvalid {
-                task_index,
-                unit_id,
-                ..
-            }
-            | Self::ProtectedPlaceholderMultisetMismatch {
-                task_index,
-                unit_id,
-                ..
-            }
-            | Self::ProtectedPlaceholderCrossesLineBoundary {
-                task_index,
-                unit_id,
-                ..
-            }
-            | Self::ProtectedLineCountMismatch {
-                task_index,
-                unit_id,
-                ..
-            }
-            | Self::ScalarAlignedCountInvalid {
-                task_index,
-                unit_id,
-                ..
-            }
-            | Self::LinesAlignedCountMismatch {
-                task_index,
-                unit_id,
-                ..
-            } => translation_unit_subject(*task_index, *unit_id),
             Self::RepairSegmentRangeMissing { location, .. }
             | Self::RepairLineBoundaryMissing { location, .. }
             | Self::RepairUnassignedSegments { location, .. }
@@ -488,10 +330,7 @@ impl fmt::Display for TranslationInternalInvariant {
 
 impl Error for TranslationInternalInvariant {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::PlaceholderIndexInvalid { source, .. } => Some(source),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -1641,12 +1480,6 @@ fn process_response(
     let mut accepted = Vec::with_capacity(expected_by_id.len());
     let mut unresolved = Vec::new();
     for expected in &input.expected_outputs {
-        if let Err(source) = validate_expected_output_contract(input.task_index, expected) {
-            return Err(TranslationResponseTechnicalFailure::new(
-                source,
-                response_record,
-            ));
-        }
         let Some(candidates) = actual_by_id.get(&expected.id()) else {
             unresolved.push(unresolved_unit(
                 expected,
@@ -1682,6 +1515,7 @@ fn process_response(
             expected.protected_text(),
             expected.line_shape(),
             expected.applied_placeholders(),
+            expected.placeholder_bindings(),
             expected.language_analysis(),
             language_module.as_ref(),
             translation_lines,
@@ -1786,104 +1620,6 @@ fn non_empty_known<T>(items: Vec<T>, established_by: &'static str) -> NonEmptyTa
         unreachable!("{established_by}");
     };
     NonEmptyTaskItems::new(first, items.collect())
-}
-
-fn validate_expected_output_contract(
-    task_index: StandardTranslationTaskIndex,
-    expected: &ExpectedTranslationOutput,
-) -> Result<(), TranslationResponseTechnicalError> {
-    if expected.propagation_targets().len() != expected.propagation_state_contexts().len() {
-        return Err(TranslationResponseTechnicalError::InternalInvariant {
-            invariant: TranslationInternalInvariant::PropagationContextCountMismatch {
-                task_index,
-                unit_id: expected.id(),
-                target_count: expected.propagation_targets().len(),
-                context_count: expected.propagation_state_contexts().len(),
-            },
-        });
-    }
-    let placeholder_bindings = PlaceholderBindingIndex::new(expected.applied_placeholders())
-        .map_err(
-            |source| TranslationResponseTechnicalError::InternalInvariant {
-                invariant: TranslationInternalInvariant::PlaceholderIndexInvalid {
-                    task_index,
-                    unit_id: expected.id(),
-                    source,
-                },
-            },
-        )?;
-    let protected_scan = placeholder_bindings.scan(expected.protected_text());
-    if matches!(
-        expected.identity().source_content(),
-        TextUnitContent::Lines(_)
-    ) && let Some((placeholder_index, _)) = expected
-        .applied_placeholders()
-        .iter()
-        .enumerate()
-        .find(|(_, placeholder)| placeholder.original().contains('\n'))
-    {
-        return Err(TranslationResponseTechnicalError::InternalInvariant {
-            invariant: TranslationInternalInvariant::ProtectedPlaceholderCrossesLineBoundary {
-                task_index,
-                unit_id: expected.id(),
-                placeholder_index,
-            },
-        });
-    }
-    if let Err(reason) = placeholder_bindings.validate_multiset(
-        std::slice::from_ref(&protected_scan),
-        placeholder_bindings.all_binding_indices(),
-    ) {
-        return Err(TranslationResponseTechnicalError::InternalInvariant {
-            invariant: TranslationInternalInvariant::ProtectedPlaceholderMultisetMismatch {
-                task_index,
-                unit_id: expected.id(),
-                kind: (&reason).into(),
-            },
-        });
-    }
-    if let ExpectedLineShape::Aligned(line_count) = expected.line_shape()
-        && expected.protected_text().split('\n').count() != line_count.get()
-    {
-        return Err(TranslationResponseTechnicalError::InternalInvariant {
-            invariant: TranslationInternalInvariant::ProtectedLineCountMismatch {
-                task_index,
-                unit_id: expected.id(),
-                expected: line_count.get(),
-                actual: expected.protected_text().split('\n').count(),
-            },
-        });
-    }
-    match (expected.identity().source_content(), expected.line_shape()) {
-        (TextUnitContent::Value(_), ExpectedLineShape::Aligned(line_count))
-            if line_count.get() == 1 =>
-        {
-            Ok(())
-        }
-        (TextUnitContent::Value(_), ExpectedLineShape::Reflow) => Ok(()),
-        (TextUnitContent::Value(_), ExpectedLineShape::Aligned(line_count)) => {
-            Err(TranslationResponseTechnicalError::InternalInvariant {
-                invariant: TranslationInternalInvariant::ScalarAlignedCountInvalid {
-                    task_index,
-                    unit_id: expected.id(),
-                    actual: line_count.get(),
-                },
-            })
-        }
-        (TextUnitContent::Lines(source_lines), ExpectedLineShape::Aligned(line_count))
-            if source_lines.len() != line_count.get() =>
-        {
-            Err(TranslationResponseTechnicalError::InternalInvariant {
-                invariant: TranslationInternalInvariant::LinesAlignedCountMismatch {
-                    task_index,
-                    unit_id: expected.id(),
-                    expected: source_lines.len(),
-                    actual: line_count.get(),
-                },
-            })
-        }
-        (TextUnitContent::Lines(_), _) => Ok(()),
-    }
 }
 
 fn validate_translation_lines(
@@ -2040,12 +1776,15 @@ fn accept_translation_content_candidate_at(
             ));
         }
     };
+    let placeholder_bindings = PlaceholderBindingIndex::new(placeholders)
+        .map_err(TranslationCandidateTechnicalError::LanguageProjection)?;
     accept_translation_lines_candidate_at(
         identity,
         target_constraints,
         protected_text,
         line_shape,
         placeholders,
+        &placeholder_bindings,
         language_analysis,
         language_module,
         lines,
@@ -2060,6 +1799,7 @@ fn accept_translation_lines_candidate_at(
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
+    placeholder_bindings: &PlaceholderBindingIndex,
     language_analysis: &crate::language::LanguageAnalysis,
     language_module: &dyn LanguageModule,
     lines: Vec<String>,
@@ -2075,6 +1815,7 @@ fn accept_translation_lines_candidate_at(
         protected_text,
         line_shape,
         placeholders,
+        placeholder_bindings,
         language_analysis,
         language_module,
         invariant_location,
@@ -2530,11 +2271,14 @@ fn validate_and_restore_translation_lines(
     language_analysis: &crate::language::LanguageAnalysis,
     language_module: &dyn LanguageModule,
 ) -> Result<Vec<String>, TranslationCandidateValidationError> {
+    let placeholder_bindings = PlaceholderBindingIndex::new(placeholders)
+        .map_err(TranslationCandidateValidationError::LanguageProjection)?;
     validate_and_restore_translation_lines_at(
         lines,
         protected_text,
         line_shape,
         placeholders,
+        &placeholder_bindings,
         language_analysis,
         language_module,
         TranslationCandidateInvariantLocation::PreparedCandidate,
@@ -2546,12 +2290,11 @@ fn validate_and_restore_translation_lines_at(
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
+    placeholder_bindings: &PlaceholderBindingIndex,
     language_analysis: &crate::language::LanguageAnalysis,
     language_module: &dyn LanguageModule,
     invariant_location: TranslationCandidateInvariantLocation,
 ) -> Result<Vec<String>, TranslationCandidateValidationError> {
-    let placeholder_bindings = PlaceholderBindingIndex::new(placeholders)
-        .map_err(TranslationCandidateValidationError::LanguageProjection)?;
     let initial_scans = lines
         .iter()
         .map(|line| placeholder_bindings.scan(line))
@@ -2559,7 +2302,7 @@ fn validate_and_restore_translation_lines_at(
     let normalized_original = normalize_original_controls_in_lines(
         &mut lines,
         placeholders,
-        &placeholder_bindings,
+        placeholder_bindings,
         &initial_scans,
     )
     .map_err(TranslationCandidateValidationError::Rejected)?;
@@ -2930,7 +2673,7 @@ enum TranslationCandidateValidationError {
 fn normalize_original_controls_in_lines(
     lines: &mut [String],
     placeholders: &[AppliedPlaceholder],
-    placeholder_bindings: &PlaceholderBindingIndex<'_>,
+    placeholder_bindings: &PlaceholderBindingIndex,
     scans: &[PlaceholderTextScan],
 ) -> Result<bool, TranslationUnitRejectionReason> {
     let mut originals = BTreeMap::<&str, Vec<usize>>::new();
@@ -3027,9 +2770,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::diagnostic::render_safe_diagnostic;
     use crate::fingerprint::Sha256Fingerprint;
-    use crate::i18n::{UiLocale, UiLocalizer};
     use crate::language::{
         EnglishLanguageModule, EnglishResidualPolicy, EnglishTranslationDetectionPolicy,
         JapaneseLanguageModule, JapaneseQuoteRepairPolicy, JapaneseResidualPolicy, LanguageId,
@@ -3227,95 +2968,6 @@ mod tests {
         assert!(repair.reason.render().contains("segment_index=4"));
         assert!(!repair.reason.render().contains('密'));
         assert!(!repair.reason.render().contains('钥'));
-
-        let invariant: ProductionResponseError =
-            TranslationTaskResponseProcessingError::InternalInvariant {
-                invariant: TranslationInternalInvariant::PlaceholderIndexInvalid {
-                    task_index: StandardTranslationTaskIndex::new(7),
-                    unit_id: 11,
-                    source: LanguageTextProjectionError::MissingToken {
-                        token: sentinel.to_owned(),
-                    },
-                },
-            };
-        let invariant = invariant.safe_diagnostic_source(
-            DiagnosticStage::ModelRequest,
-            DiagnosticImpact::ProgressPreserved,
-            DiagnosticAction::CheckModelService,
-        );
-        assert_eq!(invariant.action, DiagnosticAction::ReportBug);
-        for expected in [
-            "placeholder_index_invalid",
-            "task=7",
-            "unit=11",
-            "missing_required_placeholder_token",
-        ] {
-            assert!(
-                invariant.reason.render().contains(expected),
-                "不变量诊断缺少安全事实 {expected}: {}",
-                invariant.reason.render()
-            );
-        }
-        let serialized = serde_json::to_string(&invariant).expect("公开诊断应可序列化");
-        let mut rendered = Vec::new();
-        render_safe_diagnostic(
-            &invariant,
-            &UiLocalizer::new(UiLocale::SimplifiedChinese),
-            &mut rendered,
-        )
-        .expect("不变量诊断应可呈现");
-        let rendered = String::from_utf8(rendered).expect("CLI 诊断应为 UTF-8");
-        assert!(serialized.contains("placeholder_index_invalid"));
-        assert!(rendered.contains("placeholder_index_invalid"));
-        assert!(!serialized.contains(sentinel));
-        assert!(!rendered.contains(sentinel));
-        assert!(!format!("{invariant:?}").contains(sentinel));
-    }
-
-    #[test]
-    fn protected_placeholder_invariant_discards_token_text_before_cli_and_jsonl_projection() {
-        let sentinel = "PROTECTED_SOURCE_TOKEN_BODY_SENTINEL";
-        let source = PlaceholderMultisetError::Unexpected {
-            token: sentinel.to_owned(),
-        };
-        let invariant = TranslationInternalInvariant::ProtectedPlaceholderMultisetMismatch {
-            task_index: StandardTranslationTaskIndex::new(3),
-            unit_id: 5,
-            kind: (&source).into(),
-        };
-        let diagnostic = invariant.safe_diagnostic(
-            DiagnosticStage::ModelRequest,
-            DiagnosticImpact::ProgressPreserved,
-        );
-        let serialized = serde_json::to_string(&diagnostic).expect("公开诊断应可序列化");
-        let mut rendered = Vec::new();
-        render_safe_diagnostic(
-            &diagnostic,
-            &UiLocalizer::new(UiLocale::SimplifiedChinese),
-            &mut rendered,
-        )
-        .expect("不变量诊断应可呈现");
-        let rendered = String::from_utf8(rendered).expect("CLI 诊断应为 UTF-8");
-        let debug = format!("{invariant:?}");
-
-        for public in [&serialized, &rendered, &debug] {
-            assert!(!public.contains(sentinel));
-        }
-        for expected in [
-            "protected_placeholder_multiset_mismatch",
-            "task=3",
-            "unit=5",
-            "kind=unexpected",
-        ] {
-            assert!(
-                serialized.contains(expected),
-                "JSONL 投影缺少安全事实 {expected}: {serialized}"
-            );
-            assert!(
-                rendered.contains(expected),
-                "CLI 投影缺少安全事实 {expected}: {rendered}"
-            );
-        }
     }
 
     fn japanese_module() -> Arc<dyn LanguageModule> {
@@ -3636,6 +3288,40 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[tokio::test]
+    async fn response_processing_reuses_the_planner_placeholder_index() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let task = task();
+        let bindings = task.expected_outputs()[0].placeholder_bindings();
+        let construction_scans = bindings.scan_passes();
+        assert_eq!(
+            construction_scans, 1,
+            "Planner 构造期只扫描一次受保护原文契约"
+        );
+
+        let outcome = processor
+            .process(
+                &task,
+                LlmResponse::new(
+                    r#"{"1":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    None,
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("合法响应应使用缓存索引完成验收");
+
+        assert!(matches!(outcome, TranslationTaskOutcome::Complete { .. }));
+        assert!(
+            bindings.scan_passes() > construction_scans,
+            "响应验收必须继续使用 ExpectedTranslationOutput 缓存的同一索引"
+        );
     }
 
     #[test]
@@ -4140,10 +3826,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn response_processor_rejects_a_planner_contract_with_a_line_crossing_placeholder() {
-        let processor =
-            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+    #[test]
+    fn expected_output_construction_rejects_a_line_crossing_placeholder() {
         let group =
             RpgMakerLocation::value(RpgMakerSource::map(1), vec![RpgMakerLocationStep::index(5)]);
         let identity = TranslationUnitIdentity::new(
@@ -4157,64 +3841,36 @@ mod tests {
             ]),
             "{}",
         );
-        let task_index = StandardTranslationTaskIndex::new(8);
-        let task = TranslationTaskBlock::new(
-            task_index,
-            LanguagePair::new(
-                LanguageId::parse("ja").expect("测试源语言合法"),
-                LanguageId::parse("zh-Hans").expect("测试目标语言合法"),
+        let error = ExpectedTranslationOutput::try_new(
+            1,
+            identity,
+            Vec::new(),
+            ExpectedTranslationValidation::new(
+                ExpectedLineShape::Reflow,
+                "翻訳⟦ATT_CUSTOM_WHOLE_0000⟧続き",
+                vec![AppliedPlaceholder::new(
+                    "⟦ATT_CUSTOM_WHOLE_0000⟧",
+                    "<opaque>前半\n後半</opaque>",
+                    PlaceholderRuleOrigin::Custom,
+                    "CUSTOM",
+                    "event_dialogue",
+                    PlaceholderSegment::Whole,
+                )],
+                line_content_analysis(&["翻訳前半", "後半続き"]),
             ),
-            vec![
-                ChatMessage::new(ChatMessageRole::System, "# Contract"),
-                ChatMessage::new(ChatMessageRole::User, "# Task"),
-            ],
-            vec![ExpectedTranslationOutput::new(
-                1,
-                identity,
-                Vec::new(),
-                ExpectedTranslationValidation::new(
-                    ExpectedLineShape::Reflow,
-                    "翻訳⟦ATT_CUSTOM_WHOLE_0000⟧続き",
-                    vec![AppliedPlaceholder::new(
-                        "⟦ATT_CUSTOM_WHOLE_0000⟧",
-                        "<opaque>前半\n後半</opaque>",
-                        PlaceholderRuleOrigin::Custom,
-                        "CUSTOM",
-                        "event_dialogue",
-                        PlaceholderSegment::Whole,
-                    )],
-                    line_content_analysis(&["翻訳前半", "後半続き"]),
-                ),
-                state_context(8),
-                Vec::new(),
-            )],
-        );
-
-        let error = processor
-            .process(
-                &task,
-                LlmResponse::new(
-                    r#"{"1":["译文","继续"]}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    None,
-                    None,
-                ),
-                1,
-            )
-            .await
-            .expect_err("Executor 必须防御已被污染的 Planner Lines 契约");
+            state_context(8),
+            Vec::new(),
+        )
+        .expect_err("Planner 输出构造期必须拒绝跨物理行的占位符");
 
         assert!(matches!(
             error,
-            TranslationTaskResponseProcessingError::InternalInvariant {
-                invariant:
-                    TranslationInternalInvariant::ProtectedPlaceholderCrossesLineBoundary {
-                        task_index: actual_task_index,
-                        unit_id: 1,
-                        placeholder_index: 0,
-                    },
-            } if actual_task_index == task_index
+            super::super::standard::ExpectedTranslationOutputContractError::
+                ProtectedPlaceholderCrossesLineBoundary {
+                    unit_id: 1,
+                    placeholder_index: 0,
+                    ..
+                }
         ));
     }
 

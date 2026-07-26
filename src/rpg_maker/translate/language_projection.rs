@@ -1,8 +1,9 @@
 //! 把 RPG Maker 翻译阶段的占位符文本投影为引擎无关的语言视图。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -64,32 +65,57 @@ pub(crate) fn restore_protected_text(
 ///
 /// 正常 ATT token 由保留信封扫描直接定位；只有测试或内部不变量破坏产生的
 /// 非信封 token 才需要额外的多模式匹配器。索引本身不限制 binding 总量。
-pub(super) struct PlaceholderBindingIndex<'a> {
-    placeholders: &'a [AppliedPlaceholder],
-    tokens: Vec<&'a str>,
-    token_to_index: HashMap<&'a str, usize>,
+#[derive(Clone)]
+pub(super) struct PlaceholderBindingIndex {
+    placeholders: Arc<[AppliedPlaceholder]>,
+    tokens: Vec<String>,
+    token_to_index: HashMap<String, usize>,
     binding_token_indices: Vec<usize>,
     all_binding_indices: Vec<usize>,
     non_envelope_matcher: Option<AhoCorasick>,
     non_envelope_pattern_tokens: Vec<usize>,
     has_empty_token: bool,
     #[cfg(test)]
-    scan_passes: AtomicUsize,
+    scan_passes: Arc<AtomicUsize>,
 }
 
-impl<'a> PlaceholderBindingIndex<'a> {
+impl fmt::Debug for PlaceholderBindingIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlaceholderBindingIndex")
+            .field("placeholders", &self.placeholders)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PlaceholderBindingIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.placeholders == other.placeholders
+    }
+}
+
+impl Eq for PlaceholderBindingIndex {}
+
+impl PlaceholderBindingIndex {
     pub(super) fn new(
-        placeholders: &'a [AppliedPlaceholder],
+        placeholders: &[AppliedPlaceholder],
     ) -> Result<Self, LanguageTextProjectionError> {
-        let mut ordered_tokens = BTreeMap::<&str, ()>::new();
-        for placeholder in placeholders {
-            ordered_tokens.insert(placeholder.token(), ());
-        }
-        let tokens = ordered_tokens.into_keys().collect::<Vec<_>>();
+        Self::from_shared(Arc::from(placeholders))
+    }
+
+    pub(super) fn from_shared(
+        placeholders: Arc<[AppliedPlaceholder]>,
+    ) -> Result<Self, LanguageTextProjectionError> {
+        let tokens = placeholders
+            .iter()
+            .map(|placeholder| placeholder.token().to_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let token_to_index = tokens
             .iter()
             .enumerate()
-            .map(|(index, &token)| (token, index))
+            .map(|(index, token)| (token.clone(), index))
             .collect::<HashMap<_, _>>();
         let binding_token_indices = placeholders
             .iter()
@@ -100,9 +126,9 @@ impl<'a> PlaceholderBindingIndex<'a> {
 
         let mut non_envelope_patterns = Vec::new();
         let mut non_envelope_pattern_tokens = Vec::new();
-        for (token_index, &token) in tokens.iter().enumerate() {
+        for (token_index, token) in tokens.iter().enumerate() {
             if !token.is_empty() && !is_complete_token_envelope(token) {
-                non_envelope_patterns.push(token);
+                non_envelope_patterns.push(token.as_str());
                 non_envelope_pattern_tokens.push(token_index);
             }
         }
@@ -127,7 +153,7 @@ impl<'a> PlaceholderBindingIndex<'a> {
             non_envelope_pattern_tokens,
             has_empty_token,
             #[cfg(test)]
-            scan_passes: AtomicUsize::new(0),
+            scan_passes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -254,7 +280,7 @@ impl<'a> PlaceholderBindingIndex<'a> {
             };
             if actual_count != expected_count {
                 return Err(PlaceholderMultisetError::Mismatch {
-                    token: self.tokens[token_index].to_owned(),
+                    token: self.tokens[token_index].clone(),
                 });
             }
         }
@@ -273,7 +299,7 @@ impl<'a> PlaceholderBindingIndex<'a> {
                     ScannedEnvelope::Known(token_index) if expected.contains_key(token_index) => {}
                     ScannedEnvelope::Known(token_index) => {
                         return Err(PlaceholderMultisetError::Unexpected {
-                            token: self.tokens[*token_index].to_owned(),
+                            token: self.tokens[*token_index].clone(),
                         });
                     }
                     ScannedEnvelope::Unknown(token) => {
@@ -406,7 +432,7 @@ impl<'a> PlaceholderBindingIndex<'a> {
     }
 
     #[cfg(test)]
-    fn scan_passes(&self) -> usize {
+    pub(super) fn scan_passes(&self) -> usize {
         self.scan_passes.load(Ordering::Relaxed)
     }
 }

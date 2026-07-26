@@ -32,6 +32,9 @@ use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
 use crate::rpg_maker::text::{RpgMakerLocation, TextGroupKind};
 
 use super::executor::FinalLlmResponseMetadata;
+use super::language_projection::{
+    LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
+};
 use super::profile::RpgMakerTranslationProfile;
 use super::task_record::{
     NoOpTranslationTaskRecordSink, TranslationTaskCommitFailure,
@@ -982,7 +985,7 @@ pub(crate) enum ExpectedLineShape {
 pub(crate) struct ExpectedTranslationValidation {
     line_shape: ExpectedLineShape,
     protected_text: String,
-    applied_placeholders: Vec<AppliedPlaceholder>,
+    applied_placeholders: Arc<[AppliedPlaceholder]>,
     language_analysis: LanguageAnalysis,
 }
 
@@ -996,8 +999,215 @@ impl ExpectedTranslationValidation {
         Self {
             line_shape,
             protected_text: protected_text.into(),
-            applied_placeholders,
+            applied_placeholders: applied_placeholders.into(),
             language_analysis,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlaceholderMultisetErrorKind {
+    Mismatch,
+    Unexpected,
+}
+
+impl PlaceholderMultisetErrorKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mismatch => "mismatch",
+            Self::Unexpected => "unexpected",
+        }
+    }
+}
+
+impl From<&PlaceholderMultisetError> for PlaceholderMultisetErrorKind {
+    fn from(source: &PlaceholderMultisetError) -> Self {
+        match source {
+            PlaceholderMultisetError::Mismatch { .. } => Self::Mismatch,
+            PlaceholderMultisetError::Unexpected { .. } => Self::Unexpected,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExpectedTranslationOutputContractTarget {
+    owner: RpgMakerStandardAssetOwner,
+    group_kind: TextGroupKind,
+    group_location: RpgMakerLocation,
+    role: String,
+}
+
+impl ExpectedTranslationOutputContractTarget {
+    fn from_identity(identity: &TranslationUnitIdentity) -> Self {
+        Self {
+            owner: identity.owner(),
+            group_kind: identity.kind(),
+            group_location: identity.group_location().clone(),
+            role: identity.role_label(),
+        }
+    }
+
+    fn safe_detail(&self) -> String {
+        format!(
+            "owner={}; group_kind={}; location={}; role={}",
+            self.owner.storage_name(),
+            self.group_kind.storage_name(),
+            self.group_location,
+            self.role
+        )
+    }
+
+    fn diagnostic_subject(&self, unit_id: usize) -> crate::diagnostic::DiagnosticSubject {
+        crate::diagnostic::DiagnosticSubject::operation(format!(
+            "translation_output_contract; unit={unit_id}; {}",
+            self.safe_detail()
+        ))
+    }
+}
+
+#[derive(Eq, PartialEq)]
+pub(crate) enum ExpectedTranslationOutputContractError {
+    PropagationContextCountMismatch {
+        unit_id: usize,
+        target: ExpectedTranslationOutputContractTarget,
+        target_count: usize,
+        context_count: usize,
+    },
+    PlaceholderIndexInvalid {
+        unit_id: usize,
+        target: ExpectedTranslationOutputContractTarget,
+        source: LanguageTextProjectionError,
+    },
+    ProtectedPlaceholderMultisetMismatch {
+        unit_id: usize,
+        target: ExpectedTranslationOutputContractTarget,
+        kind: PlaceholderMultisetErrorKind,
+    },
+    ProtectedPlaceholderCrossesLineBoundary {
+        unit_id: usize,
+        target: ExpectedTranslationOutputContractTarget,
+        placeholder_index: usize,
+    },
+    ProtectedLineCountMismatch {
+        unit_id: usize,
+        target: ExpectedTranslationOutputContractTarget,
+        expected: usize,
+        actual: usize,
+    },
+    ScalarAlignedCountInvalid {
+        unit_id: usize,
+        target: ExpectedTranslationOutputContractTarget,
+        actual: usize,
+    },
+    LinesAlignedCountMismatch {
+        unit_id: usize,
+        target: ExpectedTranslationOutputContractTarget,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl ExpectedTranslationOutputContractError {
+    pub(crate) fn placeholder_index_invalid(
+        unit_id: usize,
+        identity: &TranslationUnitIdentity,
+        source: LanguageTextProjectionError,
+    ) -> Self {
+        Self::PlaceholderIndexInvalid {
+            unit_id,
+            target: ExpectedTranslationOutputContractTarget::from_identity(identity),
+            source,
+        }
+    }
+
+    fn target_and_unit(&self) -> (&ExpectedTranslationOutputContractTarget, usize) {
+        match self {
+            Self::PropagationContextCountMismatch {
+                unit_id, target, ..
+            }
+            | Self::PlaceholderIndexInvalid {
+                unit_id, target, ..
+            }
+            | Self::ProtectedPlaceholderMultisetMismatch {
+                unit_id, target, ..
+            }
+            | Self::ProtectedPlaceholderCrossesLineBoundary {
+                unit_id, target, ..
+            }
+            | Self::ProtectedLineCountMismatch {
+                unit_id, target, ..
+            }
+            | Self::ScalarAlignedCountInvalid {
+                unit_id, target, ..
+            }
+            | Self::LinesAlignedCountMismatch {
+                unit_id, target, ..
+            } => (target, *unit_id),
+        }
+    }
+
+    pub(crate) fn diagnostic_subject(&self) -> crate::diagnostic::DiagnosticSubject {
+        let (target, unit_id) = self.target_and_unit();
+        target.diagnostic_subject(unit_id)
+    }
+
+    pub(crate) fn safe_detail(&self) -> String {
+        let failure = match self {
+            Self::PropagationContextCountMismatch {
+                target_count,
+                context_count,
+                ..
+            } => format!(
+                "propagation_context_count_mismatch; targets={target_count}; contexts={context_count}"
+            ),
+            Self::PlaceholderIndexInvalid { source, .. } => format!(
+                "placeholder_index_invalid; {}",
+                super::executor::language_projection_detail(source)
+            ),
+            Self::ProtectedPlaceholderMultisetMismatch { kind, .. } => format!(
+                "protected_placeholder_multiset_mismatch; kind={}",
+                kind.as_str()
+            ),
+            Self::ProtectedPlaceholderCrossesLineBoundary {
+                placeholder_index, ..
+            } => format!(
+                "protected_placeholder_crosses_line_boundary; placeholder_index={placeholder_index}"
+            ),
+            Self::ProtectedLineCountMismatch {
+                expected, actual, ..
+            } => format!("protected_line_count_mismatch; expected={expected}; actual={actual}"),
+            Self::ScalarAlignedCountInvalid { actual, .. } => {
+                format!("scalar_aligned_count_invalid; expected=1; actual={actual}")
+            }
+            Self::LinesAlignedCountMismatch {
+                expected, actual, ..
+            } => format!("lines_aligned_count_mismatch; expected={expected}; actual={actual}"),
+        };
+        let (target, unit_id) = self.target_and_unit();
+        format!("{failure}; unit={unit_id}; {}", target.safe_detail())
+    }
+}
+
+impl fmt::Debug for ExpectedTranslationOutputContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ExpectedTranslationOutputContractError")
+            .field(&self.safe_detail())
+            .finish()
+    }
+}
+
+impl fmt::Display for ExpectedTranslationOutputContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.safe_detail())
+    }
+}
+
+impl Error for ExpectedTranslationOutputContractError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PlaceholderIndexInvalid { source, .. } => Some(source),
+            _ => None,
         }
     }
 }
@@ -1008,11 +1218,57 @@ pub(crate) struct ExpectedTranslationOutput {
     identity: TranslationUnitIdentity,
     propagation_targets: Vec<TranslationUnitIdentity>,
     validation: ExpectedTranslationValidation,
+    placeholder_bindings: Arc<PlaceholderBindingIndex>,
     state_context: TranslationStateContext,
     propagation_state_contexts: Vec<TranslationStateContext>,
 }
 
 impl ExpectedTranslationOutput {
+    pub(crate) fn try_new(
+        id: usize,
+        identity: TranslationUnitIdentity,
+        propagation_targets: Vec<TranslationUnitIdentity>,
+        validation: ExpectedTranslationValidation,
+        state_context: TranslationStateContext,
+        propagation_state_contexts: Vec<TranslationStateContext>,
+    ) -> Result<Self, ExpectedTranslationOutputContractError> {
+        assert!(id > 0, "模型输出 ID 必须是正整数");
+        if propagation_targets.len() != propagation_state_contexts.len() {
+            return Err(
+                ExpectedTranslationOutputContractError::PropagationContextCountMismatch {
+                    unit_id: id,
+                    target: ExpectedTranslationOutputContractTarget::from_identity(&identity),
+                    target_count: propagation_targets.len(),
+                    context_count: propagation_state_contexts.len(),
+                },
+            );
+        }
+        let placeholder_bindings = Arc::new(
+            PlaceholderBindingIndex::from_shared(Arc::clone(&validation.applied_placeholders))
+                .map_err(|source| {
+                    ExpectedTranslationOutputContractError::placeholder_index_invalid(
+                        id, &identity, source,
+                    )
+                })?,
+        );
+        validate_expected_translation_output(
+            id,
+            &identity,
+            &validation,
+            placeholder_bindings.as_ref(),
+        )?;
+        Ok(Self {
+            id,
+            identity,
+            propagation_targets,
+            validation,
+            placeholder_bindings,
+            state_context,
+            propagation_state_contexts,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         id: usize,
         identity: TranslationUnitIdentity,
@@ -1021,20 +1277,15 @@ impl ExpectedTranslationOutput {
         state_context: TranslationStateContext,
         propagation_state_contexts: Vec<TranslationStateContext>,
     ) -> Self {
-        assert!(id > 0, "模型输出 ID 必须是正整数");
-        assert_eq!(
-            propagation_targets.len(),
-            propagation_state_contexts.len(),
-            "每个传播目标必须具有对应的独立状态上下文"
-        );
-        Self {
+        Self::try_new(
             id,
             identity,
             propagation_targets,
             validation,
             state_context,
             propagation_state_contexts,
-        }
+        )
+        .expect("测试 ExpectedTranslationOutput 必须满足静态 Planner 契约")
     }
 
     pub(crate) const fn id(&self) -> usize {
@@ -1061,6 +1312,10 @@ impl ExpectedTranslationOutput {
         &self.validation.applied_placeholders
     }
 
+    pub(super) fn placeholder_bindings(&self) -> &PlaceholderBindingIndex {
+        self.placeholder_bindings.as_ref()
+    }
+
     /// 返回 Planner 针对代表原文建立、供译后处理使用的唯一语言事实。
     pub(crate) fn language_analysis(&self) -> &LanguageAnalysis {
         &self.validation.language_analysis
@@ -1072,6 +1327,83 @@ impl ExpectedTranslationOutput {
 
     pub(crate) fn propagation_state_contexts(&self) -> &[TranslationStateContext] {
         &self.propagation_state_contexts
+    }
+}
+
+fn validate_expected_translation_output(
+    unit_id: usize,
+    identity: &TranslationUnitIdentity,
+    validation: &ExpectedTranslationValidation,
+    placeholder_bindings: &PlaceholderBindingIndex,
+) -> Result<(), ExpectedTranslationOutputContractError> {
+    let target = || ExpectedTranslationOutputContractTarget::from_identity(identity);
+    let protected_scan = placeholder_bindings.scan(&validation.protected_text);
+    if matches!(identity.source_content(), TextUnitContent::Lines(_))
+        && let Some((placeholder_index, _)) = validation
+            .applied_placeholders
+            .iter()
+            .enumerate()
+            .find(|(_, placeholder)| placeholder.original().contains('\n'))
+    {
+        return Err(
+            ExpectedTranslationOutputContractError::ProtectedPlaceholderCrossesLineBoundary {
+                unit_id,
+                target: target(),
+                placeholder_index,
+            },
+        );
+    }
+    if let Err(reason) = placeholder_bindings.validate_multiset(
+        std::slice::from_ref(&protected_scan),
+        placeholder_bindings.all_binding_indices(),
+    ) {
+        return Err(
+            ExpectedTranslationOutputContractError::ProtectedPlaceholderMultisetMismatch {
+                unit_id,
+                target: target(),
+                kind: (&reason).into(),
+            },
+        );
+    }
+    if let ExpectedLineShape::Aligned(line_count) = validation.line_shape
+        && validation.protected_text.split('\n').count() != line_count.get()
+    {
+        return Err(
+            ExpectedTranslationOutputContractError::ProtectedLineCountMismatch {
+                unit_id,
+                target: target(),
+                expected: line_count.get(),
+                actual: validation.protected_text.split('\n').count(),
+            },
+        );
+    }
+    match (identity.source_content(), validation.line_shape) {
+        (TextUnitContent::Value(_), ExpectedLineShape::Aligned(line_count))
+            if line_count.get() == 1 =>
+        {
+            Ok(())
+        }
+        (TextUnitContent::Value(_), ExpectedLineShape::Reflow) => Ok(()),
+        (TextUnitContent::Value(_), ExpectedLineShape::Aligned(line_count)) => Err(
+            ExpectedTranslationOutputContractError::ScalarAlignedCountInvalid {
+                unit_id,
+                target: target(),
+                actual: line_count.get(),
+            },
+        ),
+        (TextUnitContent::Lines(source_lines), ExpectedLineShape::Aligned(line_count))
+            if source_lines.len() != line_count.get() =>
+        {
+            Err(
+                ExpectedTranslationOutputContractError::LinesAlignedCountMismatch {
+                    unit_id,
+                    target: target(),
+                    expected: source_lines.len(),
+                    actual: line_count.get(),
+                },
+            )
+        }
+        (TextUnitContent::Lines(_), _) => Ok(()),
     }
 }
 
