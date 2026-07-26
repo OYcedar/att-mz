@@ -10,6 +10,7 @@ use std::ops::{Deref, DerefMut};
 
 use serde_json::{Map, Number, Value};
 
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::lua::json::{
     LosslessJsonError, LosslessJsonValue, decode as decode_lossless,
 };
@@ -40,6 +41,20 @@ impl StackSafeJsonError {
         }
     }
 
+    pub(crate) fn diagnostic_category(&self) -> JsonErrorCategory {
+        match self {
+            Self::Syntax {
+                source: LosslessJsonError::Syntax { .. },
+                ..
+            } => JsonErrorCategory::Syntax,
+            Self::Syntax {
+                source: LosslessJsonError::DuplicateObjectKey { .. },
+                ..
+            } => JsonErrorCategory::DuplicateObjectKey,
+            Self::Backend(source) => JsonErrorCategory::from(source),
+        }
+    }
+
     /// 只投影解析器闭集原因和坐标，不公开原始 JSON 或后端错误文本。
     pub(crate) fn safe_diagnostic_detail(&self) -> String {
         match self {
@@ -51,25 +66,26 @@ impl StackSafeJsonError {
                     },
                 line,
                 column,
-            } => format!(
-                "json_backend=lossless; json_kind=syntax; byte_offset={byte_offset}; json_line={line}; json_column={column}"
-            ),
+            } => {
+                let category = self.diagnostic_category();
+                format!(
+                    "json_backend=lossless; json_category={category}; byte_offset={byte_offset}; json_line={line}; json_column={column}"
+                )
+            }
             Self::Syntax {
                 source: LosslessJsonError::DuplicateObjectKey { byte_offset },
                 line,
                 column,
-            } => format!(
-                "json_backend=lossless; json_kind=duplicate_object_key; byte_offset={byte_offset}; json_line={line}; json_column={column}"
-            ),
-            Self::Backend(source) => {
-                let category = match source.classify() {
-                    serde_json::error::Category::Io => "io",
-                    serde_json::error::Category::Syntax => "syntax",
-                    serde_json::error::Category::Data => "data",
-                    serde_json::error::Category::Eof => "eof",
-                };
+            } => {
+                let category = self.diagnostic_category();
                 format!(
-                    "json_backend=serde_json; json_kind={category}; json_line={}; json_column={}",
+                    "json_backend=lossless; json_category={category}; byte_offset={byte_offset}; json_line={line}; json_column={column}"
+                )
+            }
+            Self::Backend(source) => {
+                let category = self.diagnostic_category();
+                format!(
+                    "json_backend=serde_json; json_category={category}; json_line={}; json_column={}",
                     source.line(),
                     source.column()
                 )

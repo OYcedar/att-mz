@@ -35,15 +35,22 @@ impl Sha256Fingerprint {
     pub(crate) const fn into_bytes(self) -> [u8; SHA256_FINGERPRINT_BYTES] {
         self.0
     }
+
+    /// 输出固定 64 位、小写 ASCII 十六进制表示。
+    pub(crate) fn hex(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(SHA256_FINGERPRINT_BYTES * 2);
+        for byte in self.0 {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
 }
 
 impl fmt::Debug for Sha256Fingerprint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Sha256Fingerprint(")?;
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        formatter.write_str(")")
+        write!(formatter, "Sha256Fingerprint({})", self.hex())
     }
 }
 
@@ -128,6 +135,21 @@ mod tests {
             reference,
             fingerprint(b"translation", &[(1, b"c"), (2, b"ab")])
         );
+    }
+
+    #[test]
+    fn hexadecimal_projection_is_fixed_width_and_lowercase() {
+        let mut bytes = [0; SHA256_FINGERPRINT_BYTES];
+        bytes[0] = 0x0a;
+        bytes[1] = 0xff;
+        bytes[SHA256_FINGERPRINT_BYTES - 1] = 0x5c;
+        let encoded = Sha256Fingerprint::from_bytes(bytes).hex();
+
+        assert_eq!(encoded.len(), SHA256_FINGERPRINT_BYTES * 2);
+        assert_eq!(&encoded[..4], "0aff");
+        assert_eq!(&encoded[encoded.len() - 2..], "5c");
+        assert!(encoded.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(encoded, encoded.to_ascii_lowercase());
     }
 
     #[test]

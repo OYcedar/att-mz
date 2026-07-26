@@ -13,6 +13,7 @@ use crate::diagnostic::{
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::language::{LanguageAnalysis, LanguagePair};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity};
 use crate::rpg_maker::RpgMakerEngine;
@@ -1656,16 +1657,7 @@ const fn human_group_kind(kind: TextGroupKind) -> &'static str {
 }
 
 const fn group_kind_name(kind: TextGroupKind) -> &'static [u8] {
-    match kind {
-        TextGroupKind::DatabaseEntry => b"database_entry",
-        TextGroupKind::System => b"system",
-        TextGroupKind::Map => b"map",
-        TextGroupKind::EventDialogue => b"event_dialogue",
-        TextGroupKind::EventChoices => b"event_choices",
-        TextGroupKind::EventScrollingText => b"event_scrolling_text",
-        TextGroupKind::EventCommand => b"event_command",
-        TextGroupKind::PluginParameter => b"plugin_parameter",
-    }
+    kind.storage_name().as_bytes()
 }
 
 enum GlobalPreparationFailure {
@@ -2393,14 +2385,9 @@ fn toml_error_detail(source: &toml::de::Error) -> String {
 }
 
 fn serde_json_error_detail(source: &serde_json::Error) -> String {
-    let category = match source.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    };
+    let category = JsonErrorCategory::from(source);
     format!(
-        "category={category}; line={}; column={}",
+        "json_category={category}; line={}; column={}",
         source.line(),
         source.column()
     )

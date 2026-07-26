@@ -21,6 +21,7 @@ use crate::diagnostic::{
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic,
 };
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::llm::{
     ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientRecordMetadata,
     LlmClientSemanticIdentity, LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmResponse,
@@ -786,12 +787,7 @@ fn json_model_failure(
     action: DiagnosticAction,
     source: &serde_json::Error,
 ) -> SafeDiagnostic {
-    let category = match source.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    };
+    let category = JsonErrorCategory::from(source);
     SafeDiagnostic::new(
         DiagnosticCode::ModelRequest,
         DiagnosticStage::ModelRequest,

@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use super::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
     DirectTextRecipe, MutationClaim, MutationResource, ProjectionModelError, ScalarFieldKey,
@@ -167,12 +168,7 @@ impl RpgMakerLocationCodecError {
 }
 
 fn codec_json_error_detail(source: &serde_json::Error) -> String {
-    let category = match source.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    };
+    let category = JsonErrorCategory::from(source);
     format!(
         "json_category={category}; json_line={}; json_column={}",
         source.line(),

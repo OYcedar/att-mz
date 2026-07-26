@@ -2842,7 +2842,7 @@ mod tests {
                 &[
                     "rewrite_error=decode_nested_json",
                     "json_backend=serde_json",
-                    "json_kind=eof",
+                    "json_category=eof",
                     "json_line=1",
                     "json_column=",
                 ][..],
@@ -2860,7 +2860,7 @@ mod tests {
                 &[
                     "rewrite_error=encode_nested_json",
                     "json_backend=lossless",
-                    "json_kind=duplicate_object_key",
+                    "json_category=duplicate_object_key",
                     "byte_offset=17",
                     "json_line=2",
                     "json_column=9",
@@ -2875,7 +2875,7 @@ mod tests {
                 &[
                     "rewrite_error=serialize_document",
                     "json_backend=serde_json",
-                    "json_kind=eof",
+                    "json_category=eof",
                 ][..],
             ),
         ];

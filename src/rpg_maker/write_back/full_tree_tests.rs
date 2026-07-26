@@ -1438,8 +1438,8 @@ fn write_back_snapshot_rows() -> WriteBackSnapshotRows {
         group_rows.push(SqliteRow::new(vec![
             SqliteValue::Text(group.owner.clone()),
             SqliteValue::Text(group.group_location.clone()),
-            SqliteValue::Integer(i64::try_from(group.group_order).expect("测试顺序应可编码")),
             SqliteValue::Text(group.kind.to_owned()),
+            SqliteValue::Integer(i64::try_from(group.group_order).expect("测试顺序应可编码")),
             SqliteValue::Text(group.recipes.clone()),
         ]));
         unit_rows.push(SqliteRow::new(vec![
@@ -1502,8 +1502,17 @@ fn rows_for_requested_owner(rows: Vec<SqliteRow>, query: &SqliteQuery) -> Vec<Sq
         SqliteValue::Text(owner) => Some(owner.as_str()),
         _ => None,
     });
+    let Some(requested_owner) = requested_owner else {
+        return rows;
+    };
     rows.into_iter()
-        .filter(|row| requested_owner.is_none_or(|owner| snapshot_row_text(row, 0) == owner))
+        .filter_map(|row| {
+            (snapshot_row_text(&row, 0) == requested_owner).then(|| {
+                let mut values = row.into_values();
+                values.remove(0);
+                SqliteRow::new(values)
+            })
+        })
         .collect()
 }
 
@@ -1613,16 +1622,7 @@ fn fixture_asset_fingerprint(owner: &str, groups: &[FixtureGroup]) -> [u8; 32] {
 }
 
 const fn fixture_group_kind(kind: TextGroupKind) -> &'static str {
-    match kind {
-        TextGroupKind::DatabaseEntry => "database_entry",
-        TextGroupKind::System => "system",
-        TextGroupKind::Map => "map",
-        TextGroupKind::EventDialogue => "event_dialogue",
-        TextGroupKind::EventChoices => "event_choices",
-        TextGroupKind::EventScrollingText => "event_scrolling_text",
-        TextGroupKind::EventCommand => "event_command",
-        TextGroupKind::PluginParameter => "plugin_parameter",
-    }
+    kind.storage_name()
 }
 
 fn source_files() -> BTreeMap<PathBuf, Vec<u8>> {

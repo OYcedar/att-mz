@@ -971,12 +971,14 @@ fn parse_lua_rpg_maker_location(
 fn parse_standard_group_kind(value: Value) -> Result<TextGroupKind, TrustedLuaHostCallError> {
     let kind = parse_rpg_maker_string(value, "extract group.kind")
         .map_err(|error| extract_argument_error(error.to_string()))?;
-    match kind.as_str() {
-        "database_entry" => Ok(TextGroupKind::DatabaseEntry),
-        "system" => Ok(TextGroupKind::System),
-        "map" => Ok(TextGroupKind::Map),
-        "event_command" => Ok(TextGroupKind::EventCommand),
-        "plugin_parameter" => Ok(TextGroupKind::PluginParameter),
+    match TextGroupKind::from_storage_name(&kind) {
+        Some(
+            kind @ (TextGroupKind::DatabaseEntry
+            | TextGroupKind::System
+            | TextGroupKind::Map
+            | TextGroupKind::EventCommand
+            | TextGroupKind::PluginParameter),
+        ) => Ok(kind),
         _ => Err(extract_argument_error(format!(
             "extract group.kind 无效：{kind}"
         ))),
@@ -1583,16 +1585,7 @@ fn standard_role_name(role: &TextUnitRole) -> &'static str {
 }
 
 fn standard_group_kind_name(kind: TextGroupKind) -> &'static str {
-    match kind {
-        TextGroupKind::DatabaseEntry => "database_entry",
-        TextGroupKind::System => "system",
-        TextGroupKind::Map => "map",
-        TextGroupKind::EventDialogue => "event_dialogue",
-        TextGroupKind::EventChoices => "event_choices",
-        TextGroupKind::EventScrollingText => "event_scrolling_text",
-        TextGroupKind::EventCommand => "event_command",
-        TextGroupKind::PluginParameter => "plugin_parameter",
-    }
+    kind.storage_name()
 }
 
 fn usize_to_lua_integer(value: usize) -> mlua::Result<i64> {
@@ -1643,19 +1636,23 @@ fn parse_translation_prepare(
     };
     let kind_name = lua_string_to_text(&kind, "translation.prepare kind").map_err(binding_error)?;
     let kind = match kind_name.as_str() {
-        "database_entry" => TextGroupKind::DatabaseEntry,
-        "system" => TextGroupKind::System,
-        "map" => TextGroupKind::Map,
         "dialogue" => TextGroupKind::EventDialogue,
         "choices" => TextGroupKind::EventChoices,
         "scrolling_text" => TextGroupKind::EventScrollingText,
-        "event_command" => TextGroupKind::EventCommand,
-        "plugin_parameter" => TextGroupKind::PluginParameter,
-        _ => {
-            return Err(binding_error(mlua::Error::runtime(format!(
-                "translation.prepare kind 无效：{kind_name}"
-            ))));
-        }
+        _ => TextGroupKind::from_storage_name(&kind_name)
+            .filter(|kind| {
+                !matches!(
+                    kind,
+                    TextGroupKind::EventDialogue
+                        | TextGroupKind::EventChoices
+                        | TextGroupKind::EventScrollingText
+                )
+            })
+            .ok_or_else(|| {
+                binding_error(mlua::Error::runtime(format!(
+                    "translation.prepare kind 无效：{kind_name}"
+                )))
+            })?,
     };
     let Value::String(original) = original else {
         return Err(binding_error(mlua::Error::runtime(format!(
@@ -1776,13 +1773,7 @@ fn invalid_translation_state(message: impl Into<String>) -> TrustedLuaHostCallEr
 }
 
 fn translation_state_text(state: Sha256Fingerprint) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(SHA256_FINGERPRINT_BYTES * 2);
-    for byte in state.as_bytes() {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
+    state.hex()
 }
 
 fn prepared_acceptance_to_lua(

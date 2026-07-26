@@ -8,6 +8,7 @@ mod diagnostic;
 mod execution;
 mod fingerprint;
 mod i18n;
+mod json_diagnostic;
 mod language;
 mod llm;
 mod observability;

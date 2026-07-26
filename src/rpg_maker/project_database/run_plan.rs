@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::diagnostic::RecoveryFact;
 use crate::fingerprint::Sha256Fingerprint;
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::extract::rules::{RulesProgramError, validate_rules_canonical_json};
 use crate::storage::sqlite::{
     ExecuteFinalTransactionError, QueryExistingDatabaseError, SqliteCommand,
@@ -168,35 +169,7 @@ impl RunPlanPathPurpose {
 }
 
 /// `serde_json` 的稳定错误类别；不保存可能含 Rules 正文的错误文本。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunPlanJsonErrorCategory {
-    Io,
-    Syntax,
-    Data,
-    Eof,
-}
-
-impl RunPlanJsonErrorCategory {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Io => "io",
-            Self::Syntax => "syntax",
-            Self::Data => "data",
-            Self::Eof => "eof",
-        }
-    }
-}
-
-impl From<serde_json::error::Category> for RunPlanJsonErrorCategory {
-    fn from(value: serde_json::error::Category) -> Self {
-        match value {
-            serde_json::error::Category::Io => Self::Io,
-            serde_json::error::Category::Syntax => Self::Syntax,
-            serde_json::error::Category::Data => Self::Data,
-            serde_json::error::Category::Eof => Self::Eof,
-        }
-    }
-}
+pub(crate) type RunPlanJsonErrorCategory = JsonErrorCategory;
 
 /// 一个非空、内容身份已经固定的可信 Lua 主程序。
 ///
@@ -348,7 +321,7 @@ impl ExtractRulesCanonicalJson {
             InvalidRunPlanValue::InvalidRulesCanonicalJson {
                 line: usize_to_u64(source.line()),
                 column: usize_to_u64(source.column()),
-                category: source.classify().into(),
+                category: JsonErrorCategory::from(&source),
             }
         })?;
         let serde_json::Value::Array(rules) = &value else {
@@ -361,7 +334,7 @@ impl ExtractRulesCanonicalJson {
             InvalidRunPlanValue::RulesCanonicalJsonEncodingFailed {
                 line: usize_to_u64(source.line()),
                 column: usize_to_u64(source.column()),
-                category: source.classify().into(),
+                category: JsonErrorCategory::from(&source),
             }
         })?;
         if encoded != canonical_json {
@@ -579,7 +552,7 @@ impl InvalidRunPlanValue {
                 category,
             } => format!(
                 "Extract Rules canonical JSON 无效：类别 {}，第 {line} 行第 {column} 列",
-                category.as_str()
+                category.storage_name()
             ),
             Self::RulesCanonicalJsonNotArray => {
                 "Extract Rules canonical JSON 根值必须是数组".to_owned()
@@ -590,7 +563,7 @@ impl InvalidRunPlanValue {
                 category,
             } => format!(
                 "无法编码 Extract Rules canonical JSON：类别 {}，第 {line} 行第 {column} 列",
-                category.as_str()
+                category.storage_name()
             ),
             Self::InvalidRulesSemantics { .. } => {
                 "Extract Rules canonical JSON 语义无效".to_owned()

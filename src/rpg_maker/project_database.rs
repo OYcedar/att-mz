@@ -9,11 +9,13 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use crate::fingerprint::{InvalidSha256FingerprintLength, Sha256Fingerprint};
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::language::{LanguageId, LanguageIdError, LanguagePair};
 use crate::rpg_maker::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::dialogue::{MvDialogueDefinition, MvDialogueDefinitionError};
 use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
+use crate::rpg_maker::standard_asset_storage::standard_asset_owner_order;
 use crate::storage::sqlite::{
     CreateDatabaseError, ExecuteTransactionError, QueryExistingDatabaseError, SqliteCommand,
     SqliteDatabaseCreator, SqliteQuery, SqliteQueryExecutor, SqliteRow, SqliteTransactionExecutor,
@@ -263,6 +265,10 @@ impl SourceSnapshotFingerprint {
 
     pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
+    }
+
+    pub(crate) fn hex(&self) -> String {
+        self.0.hex()
     }
 }
 
@@ -1185,21 +1191,13 @@ impl ProjectDatabaseState {
                     .then_some(state.owner)
             })
             .collect::<Vec<_>>();
-        owners.sort_by_key(|owner| owner_sort_key(*owner));
+        owners.sort_by_key(|owner| standard_asset_owner_order(*owner));
         owners
     }
 
     #[cfg(test)]
     pub(crate) fn mv_dialogue_rules_json(&self) -> &str {
         &self.mv_dialogue_rules_json
-    }
-}
-
-fn owner_sort_key(owner: RpgMakerStandardAssetOwner) -> u8 {
-    match owner {
-        RpgMakerStandardAssetOwner::Builtin => 0,
-        RpgMakerStandardAssetOwner::Rules => 1,
-        RpgMakerStandardAssetOwner::Lua => 2,
     }
 }
 
@@ -1403,35 +1401,7 @@ impl TranslationResourceKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SafeJsonErrorCategory {
-    Io,
-    Syntax,
-    Data,
-    Eof,
-}
-
-impl SafeJsonErrorCategory {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Io => "io",
-            Self::Syntax => "syntax",
-            Self::Data => "data",
-            Self::Eof => "eof",
-        }
-    }
-}
-
-impl From<&serde_json::Error> for SafeJsonErrorCategory {
-    fn from(source: &serde_json::Error) -> Self {
-        match source.classify() {
-            serde_json::error::Category::Io => Self::Io,
-            serde_json::error::Category::Syntax => Self::Syntax,
-            serde_json::error::Category::Data => Self::Data,
-            serde_json::error::Category::Eof => Self::Eof,
-        }
-    }
-}
+pub(crate) type SafeJsonErrorCategory = JsonErrorCategory;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InvalidTranslationResources {
@@ -1747,9 +1717,9 @@ impl InvalidTranslationResources {
                 line,
                 column,
             } => format!(
-                "violation=invalid_json; resource={}; category={}; line={line}; column={column}",
+                "violation=invalid_json; resource={}; json_category={}; line={line}; column={column}",
                 resource.storage_name(),
-                category.as_str()
+                category.storage_name()
             ),
             Self::JsonMustBeArray { resource } => format!(
                 "violation=json_shape; resource={}; expected=array",
@@ -1847,16 +1817,16 @@ fn project_definition_failure_safe_fact(failure: &ProjectDefinitionFailure) -> S
             line,
             column,
         } => format!(
-            "failure=invalid_json; category={}; line={line}; column={column}",
-            category.as_str()
+            "failure=invalid_json; json_category={}; line={line}; column={column}",
+            category.storage_name()
         ),
         ProjectDefinitionFailure::EncodeJson {
             category,
             line,
             column,
         } => format!(
-            "failure=encode_json; category={}; line={line}; column={column}",
-            category.as_str()
+            "failure=encode_json; json_category={}; line={line}; column={column}",
+            category.storage_name()
         ),
         ProjectDefinitionFailure::EmptyPattern { rule_number } => {
             format!("failure=empty_pattern; rule_number={rule_number}")
@@ -2268,7 +2238,7 @@ fn decode_owner_states(
             asset_snapshot_fingerprint,
         });
     }
-    owners.sort_by_key(|state| owner_sort_key(state.owner));
+    owners.sort_by_key(|state| standard_asset_owner_order(state.owner));
     Ok(owners)
 }
 
@@ -4779,7 +4749,7 @@ mod tests {
         assert!(fact.contains("definition=mv_dialogue_rules"));
         assert!(fact.contains("stage=decode"));
         assert!(fact.contains("failure=invalid_json"));
-        assert!(fact.contains("category=data"));
+        assert!(fact.contains("json_category=data"));
         assert!(fact.contains("line=2"));
         assert!(!fact.contains(DEFINITION_BODY_SENTINEL));
     }

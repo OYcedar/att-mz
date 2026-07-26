@@ -13,6 +13,7 @@ use crate::diagnostic::{
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
+use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
@@ -1127,12 +1128,7 @@ fn result_storage_projection_codec_detail(source: &RpgMakerProjectionCodecError)
 }
 
 fn result_storage_json_detail(operation: &'static str, source: &serde_json::Error) -> String {
-    let category = match source.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    };
+    let category = JsonErrorCategory::from(source);
     format!(
         "plan_error=json; operation={operation}; json_category={category}; json_line={}; json_column={}",
         source.line(),

@@ -388,59 +388,24 @@ fn custom_diagnostic_label(rule_number: usize) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum PlaceholderScope {
-    DatabaseEntry,
-    System,
-    Map,
-    EventDialogue,
-    EventChoices,
-    EventScrollingText,
-    EventCommand,
-    PluginParameter,
-}
+struct PlaceholderScope(TextGroupKind);
 
 impl PlaceholderScope {
     fn parse(value: &str, rule_number: usize) -> Result<Self, PlaceholderRuleCompilationError> {
-        match value {
-            "database_entry" => Ok(Self::DatabaseEntry),
-            "system" => Ok(Self::System),
-            "map" => Ok(Self::Map),
-            "event_dialogue" => Ok(Self::EventDialogue),
-            "event_choices" => Ok(Self::EventChoices),
-            "event_scrolling_text" => Ok(Self::EventScrollingText),
-            "event_command" => Ok(Self::EventCommand),
-            "plugin_parameter" => Ok(Self::PluginParameter),
-            _ => Err(PlaceholderRuleCompilationError::UnknownScope {
+        TextGroupKind::from_storage_name(value)
+            .map(Self)
+            .ok_or_else(|| PlaceholderRuleCompilationError::UnknownScope {
                 rule_number,
                 scope: value.to_owned(),
-            }),
-        }
+            })
     }
 
     const fn from_kind(kind: TextGroupKind) -> Self {
-        match kind {
-            TextGroupKind::DatabaseEntry => Self::DatabaseEntry,
-            TextGroupKind::System => Self::System,
-            TextGroupKind::Map => Self::Map,
-            TextGroupKind::EventDialogue => Self::EventDialogue,
-            TextGroupKind::EventChoices => Self::EventChoices,
-            TextGroupKind::EventScrollingText => Self::EventScrollingText,
-            TextGroupKind::EventCommand => Self::EventCommand,
-            TextGroupKind::PluginParameter => Self::PluginParameter,
-        }
+        Self(kind)
     }
 
     const fn name(self) -> &'static str {
-        match self {
-            Self::DatabaseEntry => "database_entry",
-            Self::System => "system",
-            Self::Map => "map",
-            Self::EventDialogue => "event_dialogue",
-            Self::EventChoices => "event_choices",
-            Self::EventScrollingText => "event_scrolling_text",
-            Self::EventCommand => "event_command",
-            Self::PluginParameter => "plugin_parameter",
-        }
+        self.0.storage_name()
     }
 }
 
