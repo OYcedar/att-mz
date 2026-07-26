@@ -1617,11 +1617,11 @@ mod tests {
             .expect("消息应为文本")
             .replace(['\u{2068}', '\u{2069}'], "");
         assert!(message.contains("Error [project.unavailable]"));
-        assert!(message.contains("Stage: project opening"));
+        assert!(message.contains("Stage: Project opening"));
         assert!(message.contains("Location: C:\\game [31m"));
-        assert!(message.contains("Reason: open: permission denied"));
-        assert!(message.contains("Impact: state was not changed"));
-        assert!(message.contains("Action: check the path, filesystem state, and permissions"));
+        assert!(message.contains("Reason: Operation open: Permission denied"));
+        assert!(message.contains("Impact: State was not changed"));
+        assert!(message.contains("Action: Check the path, filesystem state, and permissions"));
         assert!(message.contains("Recovery: C:\\game\\recovery"));
     }
 
