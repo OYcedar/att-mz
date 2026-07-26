@@ -4013,27 +4013,22 @@ fn merge_run_plan_finalization<T>(
     project_log: &ActiveProjectLog,
 ) -> DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>> {
     match finalization {
-        DrivenCommand::Finished(result) => {
-            replace_success_with_plan_error(execution, observe_run_plan_result(result, project_log))
-        }
+        DrivenCommand::Finished(result) => match observe_run_plan_result(result, project_log) {
+            Ok(()) => finish_successful_execution(execution),
+            Err(error) => replace_success_with_plan_error(execution, Err(error)),
+        },
         DrivenCommand::Interrupted(result) => match result {
             // 保存期间到达信号但保存已成功：业务结果与运行方案都已生效。
-            // Interrupted 只记录“信号到达过”这一事实；已完成的业务结果仍按成功呈现。
+            // 最终命令状态只表达已经完整完成的结果，不保留过时的中断形态。
             Ok(()) => {
                 emit_run_plan_saved(project_log);
-                mark_successful_execution_interrupted(execution)
+                finish_successful_execution(execution)
             }
             // 信号取消了方案保存本身：业务结果已完整生效并按成功呈现，
             // 方案未保存进入项目日志，由下次运行重新提供输入。
             Err(error) if run_plan_wait_was_cancelled(&error) => {
-                let (level, code) = run_plan_replace_log_fact(&error);
-                project_log.logger.emit(ProjectLogEvent::new(
-                    level,
-                    code,
-                    project_log.context.clone(),
-                    ProjectLogPayload::None,
-                ));
-                mark_successful_execution_interrupted(execution)
+                emit_run_plan_error_fact(&error, project_log);
+                finish_successful_execution(execution)
             }
             Err(error) => {
                 DrivenCommand::Interrupted(Err(observe_run_plan_error(error, project_log)))
@@ -4041,8 +4036,12 @@ fn merge_run_plan_finalization<T>(
         },
         DrivenCommand::SignalFailed { source, result } => {
             let result = match result {
-                Ok(()) => take_successful_execution_result(execution),
+                Ok(()) => {
+                    emit_run_plan_saved(project_log);
+                    take_successful_execution_result(execution)
+                }
                 Err(error) if run_plan_wait_was_cancelled(&error) => {
+                    emit_run_plan_error_fact(&error, project_log);
                     take_successful_execution_result(execution)
                 }
                 Err(error) => Err(observe_run_plan_error(error, project_log)),
@@ -4078,14 +4077,21 @@ fn observe_run_plan_error(
     error: ProjectRunPlanReplaceError<SqliteRuntimeError>,
     project_log: &ActiveProjectLog,
 ) -> ProductionCommandError {
-    let (level, code) = run_plan_replace_log_fact(&error);
+    emit_run_plan_error_fact(&error, project_log);
+    map_run_plan_replace_error(error)
+}
+
+fn emit_run_plan_error_fact<E>(
+    error: &ProjectRunPlanReplaceError<E>,
+    project_log: &ActiveProjectLog,
+) {
+    let (level, code) = run_plan_replace_log_fact(error);
     project_log.logger.emit(ProjectLogEvent::new(
         level,
         code,
         project_log.context.clone(),
         ProjectLogPayload::None,
     ));
-    map_run_plan_replace_error(error)
 }
 
 fn run_plan_wait_was_cancelled(error: &ProjectRunPlanReplaceError<SqliteRuntimeError>) -> bool {
@@ -4098,12 +4104,11 @@ fn run_plan_wait_was_cancelled(error: &ProjectRunPlanReplaceError<SqliteRuntimeE
     )
 }
 
-/// 保留成功结果，同时记录“信号到达过”这一形态事实。
-/// 呈现层把 `Interrupted(Ok(Completed))` 与 `Finished(Ok(Completed))` 同样按成功处理。
-fn mark_successful_execution_interrupted<T>(
+/// 运行方案最终化没有产生根失败时，业务 `Completed` 是命令唯一有效的最终状态。
+fn finish_successful_execution<T>(
     execution: DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
 ) -> DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>> {
-    DrivenCommand::Interrupted(take_successful_execution_result(execution))
+    DrivenCommand::Finished(take_successful_execution_result(execution))
 }
 
 fn take_successful_execution_result<T>(
@@ -8368,6 +8373,15 @@ impl ShutdownFailures {
             }));
     }
 
+    #[cfg(test)]
+    pub(super) fn push_for_test(
+        &mut self,
+        component: &'static str,
+        source: impl Error + SafeDiagnosticSource + Send + Sync + 'static,
+    ) {
+        self.push(component, source);
+    }
+
     fn is_empty(&self) -> bool {
         self.failures.is_empty()
     }
@@ -9110,7 +9124,7 @@ mod command_error_rendering_tests {
     }
 
     #[test]
-    fn cancelled_final_run_plan_wait_is_a_command_interruption_not_a_root_failure() {
+    fn cancelled_final_run_plan_wait_finishes_completed_business_without_a_root_failure() {
         let error = ProjectRunPlanReplaceError::RollbackConfirmed {
             path: PathBuf::from("project.db"),
             source: SqliteRuntimeError::Cancelled {
@@ -9120,10 +9134,10 @@ mod command_error_rendering_tests {
         assert!(run_plan_wait_was_cancelled(&error));
 
         let execution = DrivenCommand::Finished(Ok(OperationCompletion::Completed(23_u8)));
-        let interrupted = mark_successful_execution_interrupted(execution);
+        let finished = finish_successful_execution(execution);
         assert!(matches!(
-            interrupted,
-            DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(23)))
+            finished,
+            DrivenCommand::Finished(Ok(OperationCompletion::Completed(23)))
         ));
     }
 
@@ -9144,6 +9158,207 @@ mod command_error_rendering_tests {
             take_successful_execution_result(interrupted_success),
             Ok(OperationCompletion::Completed(23))
         ));
+    }
+
+    #[test]
+    fn completed_business_has_one_finished_state_after_non_failing_plan_finalization() {
+        type Execution = DrivenCommand<Result<OperationCompletion<u8>, ProductionCommandError>>;
+        type Finalization =
+            DrivenCommand<Result<(), ProjectRunPlanReplaceError<SqliteRuntimeError>>>;
+
+        let cases: Vec<(Execution, Finalization, u8, &str)> = vec![
+            (
+                DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(21))),
+                DrivenCommand::Finished(Ok(())),
+                21,
+                "run_plan.saved",
+            ),
+            (
+                DrivenCommand::Finished(Ok(OperationCompletion::Completed(22))),
+                DrivenCommand::Interrupted(Ok(())),
+                22,
+                "run_plan.saved",
+            ),
+            (
+                DrivenCommand::Finished(Ok(OperationCompletion::Completed(23))),
+                DrivenCommand::Interrupted(Err(ProjectRunPlanReplaceError::RollbackConfirmed {
+                    path: PathBuf::from("project.db"),
+                    source: SqliteRuntimeError::Cancelled {
+                        operation: "begin_immediate",
+                    },
+                })),
+                23,
+                "run_plan.save_failed",
+            ),
+        ];
+
+        let directory = tempfile::tempdir().expect("临时日志目录应可建立");
+        for (index, (execution, finalization, expected, expected_log_code)) in
+            cases.into_iter().enumerate()
+        {
+            let run_id = format!("550e8400-e29b-41d4-a716-4466554401{index:02}");
+            let runtime = start_project_log(directory.path().to_path_buf(), run_id.clone());
+            let logger = runtime.logger();
+            let active = ActiveProjectLog {
+                run_id: run_id.clone(),
+                runtime,
+                logger,
+                context: ProjectLogContext::new("zh-Hans").with_command("extract"),
+                performance: Arc::new(RunPerformanceCounters::default()),
+            };
+
+            let execution = merge_run_plan_finalization(execution, finalization, &active);
+            assert!(matches!(
+                &execution,
+                DrivenCommand::Finished(Ok(OperationCompletion::Completed(actual)))
+                    if *actual == expected
+            ));
+            let outcome = project_log_outcome(&execution, &ShutdownFailures::default());
+            assert_eq!(outcome, ProjectLogRunOutcome::Succeeded);
+            let failures =
+                project_log_failure_diagnostics(&execution, &ShutdownFailures::default());
+            assert!(failures.is_empty());
+            assert!(finish_project_log(active, outcome, failures).is_none());
+
+            let records = std::fs::read_to_string(directory.path().join(format!("{run_id}.jsonl")))
+                .expect("项目日志应可读取")
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).expect("项目日志行应是 JSON")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record["code"] == expected_log_code),
+                "运行方案终态事实必须进入项目日志"
+            );
+            let finished = records
+                .iter()
+                .find(|record| record["code"] == "run.finished")
+                .expect("项目日志必须具有命令终态");
+            assert_eq!(finished["payload"]["outcome"], "succeeded");
+        }
+    }
+
+    #[test]
+    fn run_plan_signal_failure_keeps_its_shape_and_logs_the_transaction_fact() {
+        type Finalization =
+            DrivenCommand<Result<(), ProjectRunPlanReplaceError<SqliteRuntimeError>>>;
+        let cases: Vec<(Finalization, &str)> = vec![
+            (
+                DrivenCommand::SignalFailed {
+                    source: io::Error::other("signal unavailable"),
+                    result: Ok(()),
+                },
+                "run_plan.saved",
+            ),
+            (
+                DrivenCommand::SignalFailed {
+                    source: io::Error::other("signal unavailable"),
+                    result: Err(ProjectRunPlanReplaceError::RollbackConfirmed {
+                        path: PathBuf::from("project.db"),
+                        source: SqliteRuntimeError::Cancelled {
+                            operation: "begin_immediate",
+                        },
+                    }),
+                },
+                "run_plan.save_failed",
+            ),
+        ];
+
+        let directory = tempfile::tempdir().expect("临时日志目录应可建立");
+        for (index, (finalization, expected_log_code)) in cases.into_iter().enumerate() {
+            let run_id = format!("550e8400-e29b-41d4-a716-4466554402{index:02}");
+            let runtime = start_project_log(directory.path().to_path_buf(), run_id.clone());
+            let logger = runtime.logger();
+            let active = ActiveProjectLog {
+                run_id: run_id.clone(),
+                runtime,
+                logger,
+                context: ProjectLogContext::new("zh-Hans").with_command("extract"),
+                performance: Arc::new(RunPerformanceCounters::default()),
+            };
+            let execution = DrivenCommand::Finished(Ok(OperationCompletion::Completed(31_u8)));
+
+            let execution = merge_run_plan_finalization(execution, finalization, &active);
+            assert!(matches!(
+                &execution,
+                DrivenCommand::SignalFailed {
+                    result: Ok(OperationCompletion::Completed(31)),
+                    ..
+                }
+            ));
+            let outcome = project_log_outcome(&execution, &ShutdownFailures::default());
+            assert_eq!(outcome, ProjectLogRunOutcome::Failed);
+            let failures =
+                project_log_failure_diagnostics(&execution, &ShutdownFailures::default());
+            assert_eq!(failures.len(), 1);
+            assert!(finish_project_log(active, outcome, failures).is_none());
+
+            let records = std::fs::read_to_string(directory.path().join(format!("{run_id}.jsonl")))
+                .expect("项目日志应可读取");
+            let records = records
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).expect("项目日志行应是 JSON")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record["code"] == expected_log_code)
+            );
+            let finished = records
+                .iter()
+                .find(|record| record["code"] == "run.finished")
+                .expect("项目日志必须具有命令终态");
+            assert_eq!(finished["payload"]["outcome"], "failed");
+        }
+    }
+
+    #[test]
+    fn real_interrupted_run_plan_failure_remains_an_interrupted_failure() {
+        let directory = tempfile::tempdir().expect("临时日志目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440299";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        let logger = runtime.logger();
+        let active = ActiveProjectLog {
+            run_id: run_id.to_owned(),
+            runtime,
+            logger,
+            context: ProjectLogContext::new("zh-Hans").with_command("extract"),
+            performance: Arc::new(RunPerformanceCounters::default()),
+        };
+        let execution = DrivenCommand::Finished(Ok(OperationCompletion::Completed(41_u8)));
+        let finalization =
+            DrivenCommand::Interrupted(Err(ProjectRunPlanReplaceError::RequirementFailed {
+                path: PathBuf::from("project.db"),
+            }));
+
+        let execution = merge_run_plan_finalization(execution, finalization, &active);
+        assert!(matches!(
+            &execution,
+            DrivenCommand::Interrupted(Err(
+                ProductionCommandError::ResultAppliedButRunPlanNotSaved(_)
+            ))
+        ));
+        let outcome = project_log_outcome(&execution, &ShutdownFailures::default());
+        assert_eq!(outcome, ProjectLogRunOutcome::Failed);
+        let failures = project_log_failure_diagnostics(&execution, &ShutdownFailures::default());
+        assert_eq!(failures.len(), 1);
+        assert!(finish_project_log(active, outcome, failures).is_none());
+
+        let records = std::fs::read_to_string(directory.path().join(format!("{run_id}.jsonl")))
+            .expect("项目日志应可读取");
+        assert!(
+            records
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).expect("项目日志行应是 JSON")
+                })
+                .any(|record| record["code"] == "run_plan.save_failed")
+        );
     }
 
     #[test]
