@@ -1630,7 +1630,7 @@ fn prompt_locale_routing_renders_language_pairs_and_fails_before_llm_without_fal
         "ko",
         false,
         "system.md",
-        &["第 0 字节后的 UTF-8 无效", "错误长度为 1 字节"],
+        &["第 0 字节处的 UTF-8 无效", "无效长度为 1 字节"],
     );
 
     fs::write(&ko_system, " \r\n\t").expect("空白 system Prompt 应可写入");
@@ -1691,7 +1691,7 @@ fn prompt_locale_routing_renders_language_pairs_and_fails_before_llm_without_fal
         "zh-Hans",
         true,
         "thinking.md",
-        &["第 0 字节后的 UTF-8 无效", "错误长度为 1 字节"],
+        &["第 0 字节处的 UTF-8 无效", "无效长度为 1 字节"],
     );
 }
 
