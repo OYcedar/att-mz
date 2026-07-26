@@ -159,7 +159,7 @@ use crate::runtime::project_log::{
     ProjectLog, ProjectLogAmount, ProjectLogCode, ProjectLogContext, ProjectLogEvent,
     ProjectLogLevel, ProjectLogNoWorkReason, ProjectLogPayload, ProjectLogPhase,
     ProjectLogRunOutcome, ProjectLogRuntime, ProjectLogValueSource, ProjectLogWarning,
-    ProjectLogger, start_project_log,
+    ProjectLogger, disabled_project_log, start_project_log,
 };
 use crate::runtime::run_id::generate_run_id;
 use crate::runtime::sqlite::{
@@ -479,17 +479,22 @@ impl CommandPanicBoundary {
             ));
         }
         if let Some(warning) = context.logger.and_then(|logger| logger.take_warning()) {
-            if let Some(diagnostic) = warning.diagnostic {
-                report = report.with_related(ReportedFailure::new(
-                    diagnostic,
-                    ProjectLogDegradedWhileReportingPanic,
-                ));
-            }
-            for diagnostic in warning.related_diagnostics {
-                report = report.with_related(ReportedFailure::new(
-                    diagnostic,
-                    ProjectLogDegradedWhileReportingPanic,
-                ));
+            for category in [warning.project_log, warning.task_records]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(diagnostic) = category.diagnostic {
+                    report = report.with_related(ReportedFailure::new(
+                        diagnostic,
+                        ObservabilityDegradedWhileReportingPanic,
+                    ));
+                }
+                for diagnostic in category.related_diagnostics {
+                    report = report.with_related(ReportedFailure::new(
+                        diagnostic,
+                        ObservabilityDegradedWhileReportingPanic,
+                    ));
+                }
             }
         }
         ProductionCommandError::Internal(Box::new(report))
@@ -519,15 +524,15 @@ impl fmt::Display for RelatedFailurePreservedDuringPanic {
 impl Error for RelatedFailurePreservedDuringPanic {}
 
 #[derive(Debug)]
-struct ProjectLogDegradedWhileReportingPanic;
+struct ObservabilityDegradedWhileReportingPanic;
 
-impl fmt::Display for ProjectLogDegradedWhileReportingPanic {
+impl fmt::Display for ObservabilityDegradedWhileReportingPanic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("project logging degraded while reporting a command panic")
+        formatter.write_str("observability degraded while reporting a command panic")
     }
 }
 
-impl Error for ProjectLogDegradedWhileReportingPanic {}
+impl Error for ObservabilityDegradedWhileReportingPanic {}
 
 #[derive(Debug)]
 struct UnexpectedProjectLuaOutcome;
@@ -1254,7 +1259,7 @@ impl ProductionRpgMakerCommandRunner {
                 None,
             );
         }
-        let project_log = match start_command_log(CommandLogStart {
+        let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
             layout: self.layout,
@@ -1264,20 +1269,7 @@ impl ProductionRpgMakerCommandRunner {
             profile: None,
             performance: Arc::clone(&performance),
             panic_boundary: &self.panic_boundary,
-        }) {
-            Ok(log) => log,
-            Err(error) => {
-                drop(project_lease_guard);
-                progress.finish();
-                let report = error
-                    .into_failure_report()
-                    .with_primary_impact(DiagnosticImpact::StateAppliedFinalizationFailed);
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report)),
-                    shutdown,
-                );
-            }
-        };
+        });
         project_log.logger.emit(ProjectLogEvent::new(
             ProjectLogLevel::Info,
             ProjectLogCode::RunPlanResolved,
@@ -1509,7 +1501,7 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
         };
-        let project_log = match start_command_log(CommandLogStart {
+        let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
             layout: self.layout,
@@ -1519,17 +1511,7 @@ impl ProductionRpgMakerCommandRunner {
             profile: None,
             performance: Arc::clone(&performance),
             panic_boundary: &self.panic_boundary,
-        }) {
-            Ok(log) => log,
-            Err(error) => {
-                let shutdown = roots.shutdown().await;
-                drop(project_lease_guard);
-                progress.finish();
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    error, shutdown,
-                );
-            }
-        };
+        });
         let progress_observer =
             ProductionProgressObserver::new(progress.observer(), &project_log, extract_phase_code);
         let builtin_enabled = saved_extract.as_ref().map_or_else(
@@ -2047,7 +2029,7 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
         };
-        let mut project_log = match start_command_log(CommandLogStart {
+        let mut project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
             layout: self.layout,
@@ -2057,17 +2039,7 @@ impl ProductionRpgMakerCommandRunner {
             profile: Some(&profile_id),
             performance: Arc::clone(&performance),
             panic_boundary: &self.panic_boundary,
-        }) {
-            Ok(log) => log,
-            Err(error) => {
-                let shutdown = roots.shutdown().await;
-                drop(project_lease_guard);
-                progress.finish();
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    error, shutdown,
-                );
-            }
-        };
+        });
         project_log.set_profile(&profile_id);
         let progress_observer = ProductionProgressObserver::new(
             progress.observer(),
@@ -2175,7 +2147,9 @@ impl ProductionRpgMakerCommandRunner {
         let opener = PreopenedProject::new(opened_project);
         let business_log =
             ProductionBusinessLog::for_translation(&project_log, progress_observer.clone());
-        let (task_records, record_translation_tasks) = if command.record_translation_tasks() {
+        let (task_records, record_translation_tasks) = if let (true, Some(run_id)) =
+            (command.record_translation_tasks(), project_log.run_id())
+        {
             match SystemFileSystem::new_with_performance(
                 file_system_configuration,
                 Arc::clone(&performance),
@@ -2186,8 +2160,8 @@ impl ProductionRpgMakerCommandRunner {
                             project_workspace
                                 .workspace_root()
                                 .join("task-records")
-                                .join(project_log.run_id()),
-                            project_log.run_id().to_owned(),
+                                .join(run_id),
+                            run_id.to_owned(),
                             command.rpg_maker().client().record_metadata(),
                             self.locale,
                             observation_file_system,
@@ -2199,7 +2173,7 @@ impl ProductionRpgMakerCommandRunner {
                 Err(error) => {
                     project_log
                         .logger
-                        .record_observability_failure(error.safe_diagnostic());
+                        .record_task_record_failure(error.safe_diagnostic());
                     (ConfiguredTranslationTaskRecordSink::disabled(), false)
                 }
             }
@@ -2488,7 +2462,7 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
         };
-        let project_log = match start_command_log(CommandLogStart {
+        let project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
             layout: self.layout,
@@ -2498,17 +2472,7 @@ impl ProductionRpgMakerCommandRunner {
             profile: None,
             performance: Arc::clone(&performance),
             panic_boundary: &self.panic_boundary,
-        }) {
-            Ok(log) => log,
-            Err(error) => {
-                let shutdown = roots.shutdown().await;
-                drop(project_lease_guard);
-                progress.finish();
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    error, shutdown,
-                );
-            }
-        };
+        });
         let progress_observer = ProductionProgressObserver::new(
             progress.observer(),
             &project_log,
@@ -2812,7 +2776,7 @@ impl ProductionRpgMakerCommandRunner {
                 );
             }
         };
-        let mut project_log = match start_command_log(CommandLogStart {
+        let mut project_log = start_command_log(CommandLogStart {
             common: command.common(),
             locale: self.locale,
             layout: self.layout,
@@ -2822,17 +2786,7 @@ impl ProductionRpgMakerCommandRunner {
             profile: None,
             performance: Arc::clone(&performance),
             panic_boundary: &self.panic_boundary,
-        }) {
-            Ok(log) => log,
-            Err(error) => {
-                let shutdown = roots.shutdown().await;
-                drop(project_lease_guard);
-                progress.finish();
-                return ProductionCommandRunReport::failed_before_logging_with_shutdown(
-                    error, shutdown,
-                );
-            }
-        };
+        });
         let lua = match load_lua_program(&file_system, command.lua()).await {
             Ok(program) => start_lua_selection(program, &mut roots),
             Err(source) => {
@@ -3295,7 +3249,7 @@ async fn catch_command_panic(
 }
 
 struct ActiveProjectLog {
-    run_id: String,
+    run_id: Option<String>,
     runtime: ProjectLogRuntime,
     logger: ProjectLogger,
     context: ProjectLogContext,
@@ -3587,8 +3541,8 @@ const fn write_back_phase_code(phase: WriteBackProgressPhase) -> ProjectLogPhase
 }
 
 impl ActiveProjectLog {
-    fn run_id(&self) -> &str {
-        &self.run_id
+    fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
     }
 
     fn set_profile(&mut self, profile: &str) {
@@ -3684,9 +3638,14 @@ struct CommandLogStart<'a> {
     panic_boundary: &'a CommandPanicBoundary,
 }
 
-fn start_command_log(
+fn start_command_log(input: CommandLogStart<'_>) -> ActiveProjectLog {
+    start_command_log_with_run_id(input, generate_run_id())
+}
+
+fn start_command_log_with_run_id(
     input: CommandLogStart<'_>,
-) -> Result<ActiveProjectLog, ProductionCommandError> {
+    generated_run_id: Result<crate::observability::RunId, WindowsFsError>,
+) -> ActiveProjectLog {
     let CommandLogStart {
         common,
         locale,
@@ -3698,9 +3657,6 @@ fn start_command_log(
         performance,
         panic_boundary,
     } = input;
-    let run_id = generate_run_id()
-        .map_err(ProductionCommandError::run_id)?
-        .to_string();
     let logs_root = common
         .projects_root()
         .join(layout.engine().storage_name())
@@ -3710,7 +3666,7 @@ fn start_command_log(
         .parent()
         .expect("logs 路径必须位于项目工作区内")
         .to_path_buf();
-    let mut runtime = start_project_log(logs_root, run_id.clone());
+    let (run_id, mut runtime) = start_project_log_with_run_id(logs_root, generated_run_id);
     let logger = runtime.logger();
     let mut context = ProjectLogContext::new(locale.as_str())
         .with_engine(layout.engine().storage_name())
@@ -3733,13 +3689,39 @@ fn start_command_log(
         context.clone(),
         ProjectLogPayload::Run { outcome: None },
     ));
-    Ok(ActiveProjectLog {
+    ActiveProjectLog {
         run_id,
         runtime,
         logger,
         context,
         performance,
-    })
+    }
+}
+
+fn start_project_log_with_run_id(
+    logs_root: PathBuf,
+    generated_run_id: Result<crate::observability::RunId, WindowsFsError>,
+) -> (Option<String>, ProjectLogRuntime) {
+    match generated_run_id {
+        Ok(run_id) => {
+            let run_id = run_id.to_string();
+            let runtime = start_project_log(logs_root, run_id.clone());
+            (Some(run_id), runtime)
+        }
+        Err(source) => (
+            None,
+            disabled_project_log(run_id_failure_diagnostic(&source)),
+        ),
+    }
+}
+
+fn run_id_failure_diagnostic(source: &WindowsFsError) -> SafeDiagnostic {
+    source.safe_diagnostic(
+        DiagnosticCode::InternalOperation,
+        DiagnosticStage::ProcessStartup,
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::Retry,
+    )
 }
 
 fn finish_project_log(
@@ -8083,16 +8065,6 @@ impl ProductionCommandError {
         Self::Internal(Box::new(Self::report_diagnostic(source, diagnostic)))
     }
 
-    fn run_id(source: WindowsFsError) -> Self {
-        let diagnostic = source.safe_diagnostic(
-            DiagnosticCode::InternalOperation,
-            DiagnosticStage::ProcessStartup,
-            DiagnosticImpact::Unchanged,
-            DiagnosticAction::Retry,
-        );
-        Self::Internal(Box::new(Self::report_diagnostic(source, diagnostic)))
-    }
-
     fn pem_read(source: ReadFileError<SystemFileSystemError>) -> Self {
         let diagnostic = match &source {
             ReadFileError::NotFound { path } => SafeDiagnostic::new(
@@ -8748,6 +8720,40 @@ mod command_error_rendering_tests {
         );
     }
 
+    #[test]
+    fn run_id_failure_disables_project_log_without_becoming_a_command_failure() {
+        let directory = tempfile::tempdir().expect("临时目录应可建立");
+        let source_path = directory.path().join("run-id");
+        let source = WindowsFsError::Io {
+            operation: "generate_run_id",
+            path: source_path.clone(),
+            source: io::Error::from_raw_os_error(5),
+        };
+
+        let (run_id, runtime) =
+            start_project_log_with_run_id(directory.path().join("logs"), Err(source));
+        let logger = runtime.logger();
+        let health = runtime.finish(
+            ProjectLogRunOutcome::Succeeded,
+            ProjectLogContext::new("en").with_command("translate"),
+            Vec::new(),
+        );
+
+        assert!(run_id.is_none(), "没有 RunId 时不得创建日志或任务记录身份");
+        assert_eq!(health.startup_failures, 1);
+        let warning = logger
+            .take_warning()
+            .expect("RunId 失败必须作为一次非致命项目日志警告呈现");
+        let project_log = warning.project_log.expect("RunId 失败属于项目日志降级");
+        assert!(warning.task_records.is_none());
+        let diagnostic = project_log.diagnostic.expect("必须保留安全根因诊断");
+        assert_eq!(diagnostic.code, DiagnosticCode::InternalOperation);
+        assert_eq!(diagnostic.stage, DiagnosticStage::ProcessStartup);
+        assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
+        assert_eq!(diagnostic.subject, DiagnosticSubject::path(source_path));
+        assert!(logger.take_warning().is_none(), "终态警告只能领取一次");
+    }
+
     #[tokio::test]
     async fn command_scope_panic_uses_the_same_safe_projection_for_cli_and_jsonl() {
         const PANIC_BODY: &str = "COMMAND_PANIC_BODY_SENTINEL";
@@ -8784,7 +8790,7 @@ mod command_error_rendering_tests {
             ProjectLogPayload::Run { outcome: None },
         ));
         let active = ActiveProjectLog {
-            run_id: run_id.to_owned(),
+            run_id: Some(run_id.to_owned()),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),
@@ -9070,7 +9076,7 @@ mod command_error_rendering_tests {
             let runtime = start_project_log(directory.path().to_path_buf(), run_id.clone());
             let logger = runtime.logger();
             let active = ActiveProjectLog {
-                run_id: run_id.clone(),
+                run_id: Some(run_id.clone()),
                 runtime,
                 logger,
                 context: ProjectLogContext::new("zh-Hans").with_command("extract"),
@@ -9143,7 +9149,7 @@ mod command_error_rendering_tests {
             let runtime = start_project_log(directory.path().to_path_buf(), run_id.clone());
             let logger = runtime.logger();
             let active = ActiveProjectLog {
-                run_id: run_id.clone(),
+                run_id: Some(run_id.clone()),
                 runtime,
                 logger,
                 context: ProjectLogContext::new("zh-Hans").with_command("extract"),
@@ -9194,7 +9200,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
-            run_id: run_id.to_owned(),
+            run_id: Some(run_id.to_owned()),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),
@@ -9811,7 +9817,7 @@ mod command_error_rendering_tests {
         let logger = runtime.logger();
         let context = ProjectLogContext::new("zh-Hans").with_command("write-back");
         let active = ActiveProjectLog {
-            run_id: run_id.to_owned(),
+            run_id: Some(run_id.to_owned()),
             runtime,
             logger,
             context,
@@ -9852,7 +9858,7 @@ mod command_error_rendering_tests {
         performance.candidate_validation_started();
         performance.candidate_validation_completed();
         let active = ActiveProjectLog {
-            run_id: run_id.to_owned(),
+            run_id: Some(run_id.to_owned()),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("write-back"),
@@ -9907,7 +9913,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
-            run_id: run_id.to_owned(),
+            run_id: Some(run_id.to_owned()),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("init"),
@@ -10254,7 +10260,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
-            run_id: run_id.to_owned(),
+            run_id: Some(run_id.to_owned()),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),
@@ -10332,7 +10338,7 @@ mod command_error_rendering_tests {
         let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
         let logger = runtime.logger();
         let active = ActiveProjectLog {
-            run_id: run_id.to_owned(),
+            run_id: Some(run_id.to_owned()),
             runtime,
             logger,
             context: ProjectLogContext::new("zh-Hans").with_command("extract"),

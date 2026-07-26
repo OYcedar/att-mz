@@ -91,6 +91,7 @@ notice-lua-cleared = { $phase } Lua 프로그램을 지웠으며 이번에는 �
 notice-no-model-request = 모든 표준 번역 단위가 최신 상태여서 이번 실행에서 Standard는 모델 요청을 보내지 않았습니다.
 notice-manual-layout = { $count }개 단위의 줄바꿈을 수동으로 확인해야 합니다.
 notice-log-degraded = 프로젝트 로그를 사용할 수 없거나 성능이 저하되었습니다. 명령은 계속되며 종료 상태는 바뀌지 않습니다.
+notice-task-records-degraded = 번역 작업 기록을 사용할 수 없거나 성능이 저하되었습니다. 명령은 계속되며 종료 상태는 바뀌지 않습니다.
 progress-init-check-project = 프로젝트 상태 확인 중
 progress-init-scan-source = 게임 원본 검색 중
 progress-init-build-candidate = 프로젝트 후보 구성 중

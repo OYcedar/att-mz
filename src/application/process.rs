@@ -22,7 +22,7 @@ use crate::diagnostic::{
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::progress::ProgressMode;
-use crate::runtime::project_log::ProjectLogWarning;
+use crate::runtime::project_log::{ObservabilityWarning, ProjectLogWarning};
 
 /// 运行真实进程入口。
 pub(crate) fn run() -> ExitCode {
@@ -310,7 +310,27 @@ fn render_project_log_warning(
     warning: &ProjectLogWarning,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
-    writeln!(stderr, "{}", localizer.format(UiMessage::NoticeLogDegraded))?;
+    if let Some(project_log) = &warning.project_log {
+        render_observability_warning(localizer, UiMessage::NoticeLogDegraded, project_log, stderr)?;
+    }
+    if let Some(task_records) = &warning.task_records {
+        render_observability_warning(
+            localizer,
+            UiMessage::NoticeTaskRecordsDegraded,
+            task_records,
+            stderr,
+        )?;
+    }
+    Ok(())
+}
+
+fn render_observability_warning(
+    localizer: &UiLocalizer,
+    banner: UiMessage<'_>,
+    warning: &ObservabilityWarning,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    writeln!(stderr, "{}", localizer.format(banner))?;
     if let Some(diagnostic) = &warning.diagnostic {
         render_safe_diagnostic(diagnostic, localizer, stderr)?;
     }
@@ -815,33 +835,53 @@ mod tests {
         let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
         let source = io::Error::from_raw_os_error(5);
         let warning = ProjectLogWarning {
-            diagnostic: Some(SafeDiagnostic::io(
-                DiagnosticCode::LogWrite,
-                DiagnosticStage::Logging,
-                DiagnosticSubject::path("C:\\project\\logs\\run.jsonl"),
-                "write_all",
-                &source,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            )),
-            related_diagnostics: vec![SafeDiagnostic::io(
-                DiagnosticCode::FileSystemOperation,
-                DiagnosticStage::Logging,
-                DiagnosticSubject::path("C:\\project\\task-records\\run\\task-000001.md"),
-                "cleanup_temporary_file",
-                &source,
-                DiagnosticImpact::Unchanged,
-                DiagnosticAction::CheckPathAndPermissions,
-            )],
+            project_log: Some(ObservabilityWarning {
+                diagnostic: Some(SafeDiagnostic::io(
+                    DiagnosticCode::LogWrite,
+                    DiagnosticStage::Logging,
+                    DiagnosticSubject::path("C:\\project\\logs\\run.jsonl"),
+                    "write_all",
+                    &source,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckPathAndPermissions,
+                )),
+                related_diagnostics: Vec::new(),
+            }),
+            task_records: Some(ObservabilityWarning {
+                diagnostic: Some(SafeDiagnostic::io(
+                    DiagnosticCode::FileSystemOperation,
+                    DiagnosticStage::Logging,
+                    DiagnosticSubject::path("C:\\project\\task-records\\run\\task-000001.md"),
+                    "persist_task_record",
+                    &source,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckPathAndPermissions,
+                )),
+                related_diagnostics: vec![SafeDiagnostic::io(
+                    DiagnosticCode::FileSystemOperation,
+                    DiagnosticStage::Logging,
+                    DiagnosticSubject::path("C:\\project\\task-records\\run\\.task-000001.tmp"),
+                    "cleanup_temporary_file",
+                    &source,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::CheckPathAndPermissions,
+                )],
+            }),
         };
         let mut stderr = Vec::new();
 
         render_project_log_warning(&localizer, &warning, &mut stderr).expect("诊断应可写入");
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
+        let project_log_banner = localizer.format(UiMessage::NoticeLogDegraded);
+        let task_record_banner = localizer.format(UiMessage::NoticeTaskRecordsDegraded);
+        assert_eq!(stderr.matches(project_log_banner.as_str()).count(), 1);
+        assert_eq!(stderr.matches(task_record_banner.as_str()).count(), 1);
         assert!(stderr.contains("log.write"));
         assert!(stderr.contains("C:\\project\\logs\\run.jsonl"));
         assert!(stderr.contains("write_all"));
         assert!(stderr.contains("C:\\project\\task-records\\run\\task-000001.md"));
+        assert!(stderr.contains("persist_task_record"));
+        assert!(stderr.contains("C:\\project\\task-records\\run\\.task-000001.tmp"));
         assert!(stderr.contains("cleanup_temporary_file"));
         assert!(stderr.contains("OS 5"));
     }

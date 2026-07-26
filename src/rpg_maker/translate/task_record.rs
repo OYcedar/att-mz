@@ -828,7 +828,7 @@ impl MarkdownTranslationTaskRecordSink {
                 .cloned()
                 .map(|diagnostic| diagnostic.map_dynamic_text(|value| redactor.redact(value)))
                 .collect::<Vec<_>>();
-            self.warnings.record_observability_failures(diagnostics);
+            self.warnings.record_task_record_failures(diagnostics);
         }
     }
 
@@ -846,7 +846,7 @@ impl MarkdownTranslationTaskRecordSink {
                     .api_key_redactor()
                     .redact(&path.to_string_lossy());
                 let category = JsonErrorCategory::from(&error);
-                self.warnings.record_observability_failure(
+                self.warnings.record_task_record_failure(
                     SafeDiagnostic::new(
                         DiagnosticCode::LogSerialize,
                         DiagnosticStage::Logging,
@@ -888,7 +888,7 @@ impl MarkdownTranslationTaskRecordSink {
                         .with_recovery(RecoveryFact::path(recovery_path))
                 })
                 .collect::<Vec<_>>();
-            self.warnings.record_observability_failures(diagnostics);
+            self.warnings.record_task_record_failures(diagnostics);
         }
     }
 }
@@ -2763,9 +2763,9 @@ mod tests {
             "无覆盖写入失败不得改写既有任务记录"
         );
         assert_eq!(
-            logger.health().write_failures,
+            logger.health().task_record_failures,
             1,
-            "任务记录故障必须进入可见但非致命的项目日志健康状态"
+            "任务记录故障必须进入独立、可见但非致命的任务记录健康状态"
         );
         drop(log_runtime);
     }

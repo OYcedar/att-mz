@@ -91,6 +91,7 @@ notice-lua-cleared = 已清除 { $phase } Lua 程式，本輪不會執行。
 notice-no-model-request = 所有標準翻譯單元都是最新狀態，Standard 本次未請求模型。
 notice-manual-layout = 有 { $count } 個單元需要人工檢查換行。
 notice-log-degraded = 專案日誌無法使用或已降級；命令會繼續，結束狀態不受影響。
+notice-task-records-degraded = 翻譯任務記錄無法使用或已降級；命令會繼續，結束狀態不受影響。
 progress-init-check-project = 正在檢查專案狀態
 progress-init-scan-source = 正在掃描遊戲來源
 progress-init-build-candidate = 正在建立專案候選

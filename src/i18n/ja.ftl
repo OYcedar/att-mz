@@ -91,6 +91,7 @@ notice-lua-cleared = { $phase } Lua プログラムを消去しました。今�
 notice-no-model-request = すべての標準翻訳単位が最新のため、今回 Standard はモデルへのリクエストを行いませんでした。
 notice-manual-layout = { $count } 単位で改行の手動確認が必要です。
 notice-log-degraded = プロジェクトログを利用できないか劣化しています。コマンドは継続し、終了状態には影響しません。
+notice-task-records-degraded = 翻訳タスク記録を利用できないか劣化しています。コマンドは継続し、終了状態には影響しません。
 progress-init-check-project = プロジェクト状態を確認しています
 progress-init-scan-source = ゲームソースを走査しています
 progress-init-build-candidate = プロジェクト候補を構築しています
