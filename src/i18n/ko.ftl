@@ -281,6 +281,7 @@ task-record-rejection-reason = { $code ->
     [unexpected_placeholder] 알 수 없는 자리표시자: { $detail }
     [placeholder_normalization_ambiguous] 자리표시자 정규화가 모호함: { $detail }
     [source_residual] 원문 언어 잔류 감지: { $detail }
+    [tag_value_contains_closing_delimiter] { $line }번째 줄에 태그 값을 조기에 닫는 '>'가 포함되어 있습니다
    *[other] { $detail }
 }
 task-record-protocol-detail = { $code ->

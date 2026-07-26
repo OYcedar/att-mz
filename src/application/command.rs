@@ -3960,9 +3960,12 @@ async fn observed_construction_failure(
 fn business_completed<T>(
     execution: &DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
 ) -> bool {
+    // 信号到达后业务仍自然冲线成功属于完整业务完成：结果已生效，
+    // 运行方案照常保存，最终按成功呈现，不降级为“已取消”。
     matches!(
         execution,
         DrivenCommand::Finished(Ok(OperationCompletion::Completed(_)))
+            | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(_)))
     )
 }
 
@@ -4013,8 +4016,22 @@ fn merge_run_plan_finalization<T>(
             replace_success_with_plan_error(execution, observe_run_plan_result(result, project_log))
         }
         DrivenCommand::Interrupted(result) => match result {
-            Ok(()) => mark_successful_execution_interrupted(execution),
+            // 保存期间到达信号但保存已成功：业务结果与运行方案都已生效。
+            // Interrupted 只记录“信号到达过”这一事实；已完成的业务结果仍按成功呈现。
+            Ok(()) => {
+                emit_run_plan_saved(project_log);
+                mark_successful_execution_interrupted(execution)
+            }
+            // 信号取消了方案保存本身：业务结果已完整生效并按成功呈现，
+            // 方案未保存进入项目日志，由下次运行重新提供输入。
             Err(error) if run_plan_wait_was_cancelled(&error) => {
+                let (level, code) = run_plan_replace_log_fact(&error);
+                project_log.logger.emit(ProjectLogEvent::new(
+                    level,
+                    code,
+                    project_log.context.clone(),
+                    ProjectLogPayload::None,
+                ));
                 mark_successful_execution_interrupted(execution)
             }
             Err(error) => {
@@ -4040,16 +4057,20 @@ fn observe_run_plan_result(
 ) -> Result<(), ProductionCommandError> {
     match result {
         Ok(()) => {
-            project_log.logger.emit(ProjectLogEvent::new(
-                ProjectLogLevel::Info,
-                ProjectLogCode::RunPlanSaved,
-                project_log.context.clone(),
-                ProjectLogPayload::None,
-            ));
+            emit_run_plan_saved(project_log);
             Ok(())
         }
         Err(error) => Err(observe_run_plan_error(error, project_log)),
     }
+}
+
+fn emit_run_plan_saved(project_log: &ActiveProjectLog) {
+    project_log.logger.emit(ProjectLogEvent::new(
+        ProjectLogLevel::Info,
+        ProjectLogCode::RunPlanSaved,
+        project_log.context.clone(),
+        ProjectLogPayload::None,
+    ));
 }
 
 fn observe_run_plan_error(
@@ -4076,6 +4097,8 @@ fn run_plan_wait_was_cancelled(error: &ProjectRunPlanReplaceError<SqliteRuntimeE
     )
 }
 
+/// 保留成功结果，同时记录“信号到达过”这一形态事实。
+/// 呈现层把 `Interrupted(Ok(Completed))` 与 `Finished(Ok(Completed))` 同样按成功处理。
 fn mark_successful_execution_interrupted<T>(
     execution: DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
 ) -> DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>> {
@@ -4086,7 +4109,8 @@ fn take_successful_execution_result<T>(
     execution: DrivenCommand<Result<OperationCompletion<T>, ProductionCommandError>>,
 ) -> Result<OperationCompletion<T>, ProductionCommandError> {
     match execution {
-        DrivenCommand::Finished(result @ Ok(OperationCompletion::Completed(_))) => result,
+        DrivenCommand::Finished(result @ Ok(OperationCompletion::Completed(_)))
+        | DrivenCommand::Interrupted(result @ Ok(OperationCompletion::Completed(_))) => result,
         _ => unreachable!("只有成功业务执行才会进入运行方案最终化"),
     }
 }
@@ -4898,6 +4922,15 @@ fn project_lua_standard_rejection(
             ),
             TranslationUnitRejectionReason::SourceResidual { fragment } => {
                 ("source_residual", vec![string("fragment", fragment)])
+            }
+            TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index } => {
+                let line = line_index
+                    .checked_add(1)
+                    .ok_or_else(|| project_lua_standard_projection_error("line", line_index))?;
+                (
+                    "tag_value_contains_closing_delimiter",
+                    vec![integer("line", line)?],
+                )
             }
         },
     })
@@ -6092,13 +6125,15 @@ impl ProductionCommandRunReport {
     ) -> Self {
         let shutdown_error = (!shutdown.is_empty()).then_some(shutdown);
         match execution {
-            DrivenCommand::Finished(Ok(OperationCompletion::Completed(output))) => Self {
+            // 信号到达但业务已完整完成：结果已生效，按成功呈现全部输出。
+            DrivenCommand::Finished(Ok(OperationCompletion::Completed(output)))
+            | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(output))) => Self {
                 result: CommandRunResult::Succeeded(output),
                 shutdown_error,
                 pending_project_log,
             },
             DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
-            | DrivenCommand::Interrupted(Ok(_)) => Self {
+            | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled)) => Self {
                 result: CommandRunResult::Interrupted,
                 shutdown_error,
                 pending_project_log,
@@ -7609,20 +7644,27 @@ fn project_log_outcome<T>(
     shutdown: &ShutdownFailures,
 ) -> ProjectLogRunOutcome {
     match execution {
-        DrivenCommand::Finished(Ok(OperationCompletion::Completed(_))) if shutdown.is_empty() => {
+        // 信号到达但业务完整完成与正常完成同为成功终态。
+        DrivenCommand::Finished(Ok(OperationCompletion::Completed(_)))
+        | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(_)))
+            if shutdown.is_empty() =>
+        {
             ProjectLogRunOutcome::Succeeded
         }
-        DrivenCommand::Finished(Ok(OperationCompletion::Completed(_))) => {
+        DrivenCommand::Finished(Ok(OperationCompletion::Completed(_)))
+        | DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(_))) => {
             ProjectLogRunOutcome::Failed
         }
         DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
-        | DrivenCommand::Interrupted(Ok(_))
+        | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled))
             if shutdown.is_empty() =>
         {
             ProjectLogRunOutcome::Cancelled
         }
         DrivenCommand::Finished(Ok(OperationCompletion::Cancelled))
-        | DrivenCommand::Interrupted(Ok(_)) => ProjectLogRunOutcome::Failed,
+        | DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled)) => {
+            ProjectLogRunOutcome::Failed
+        }
         DrivenCommand::Interrupted(Err(error))
             if error.was_cancelled_wait() && shutdown.is_empty() =>
         {
@@ -9061,6 +9103,42 @@ mod command_error_rendering_tests {
             interrupted,
             DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(23)))
         ));
+    }
+
+    #[test]
+    fn a_signal_after_completed_business_still_counts_as_completed_business() {
+        // 信号到达后业务自然冲线成功：run plan 照常保存、结果按成功呈现。
+        let interrupted_success: DrivenCommand<
+            Result<OperationCompletion<u8>, ProductionCommandError>,
+        > = DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(23)));
+        assert!(business_completed(&interrupted_success));
+
+        let interrupted_cancel: DrivenCommand<
+            Result<OperationCompletion<u8>, ProductionCommandError>,
+        > = DrivenCommand::Interrupted(Ok(OperationCompletion::Cancelled));
+        assert!(!business_completed(&interrupted_cancel));
+
+        assert!(matches!(
+            take_successful_execution_result(interrupted_success),
+            Ok(OperationCompletion::Completed(23))
+        ));
+    }
+
+    #[test]
+    fn interrupted_completed_business_is_presented_as_success_not_cancellation() {
+        let output = RpgMakerCommandOutput::Lua {
+            project: "project".parse().expect("测试项目名应合法"),
+        };
+        let execution = DrivenCommand::Interrupted(Ok(OperationCompletion::Completed(output)));
+        let shutdown = ShutdownFailures::default();
+
+        assert_eq!(
+            project_log_outcome(&execution, &shutdown),
+            ProjectLogRunOutcome::Succeeded
+        );
+        let report =
+            ProductionCommandRunReport::from_completion_with_project_log(execution, shutdown, None);
+        assert!(matches!(report.result, CommandRunResult::Succeeded(_)));
     }
 
     #[test]

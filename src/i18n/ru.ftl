@@ -296,6 +296,7 @@ task-record-rejection-reason = { $code ->
     [unexpected_placeholder] Неожиданный заполнитель: { $detail }
     [placeholder_normalization_ambiguous] Неоднозначная нормализация заполнителя: { $detail }
     [source_residual] Обнаружен остаток исходного языка: { $detail }
+    [tag_value_contains_closing_delimiter] Строка { $line } содержит '>', преждевременно закрывающий значение тега
    *[other] { $detail }
 }
 task-record-protocol-detail = { $code ->

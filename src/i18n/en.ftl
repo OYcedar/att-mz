@@ -290,6 +290,7 @@ task-record-rejection-reason = { $code ->
     [unexpected_placeholder] Unexpected placeholder: { $detail }
     [placeholder_normalization_ambiguous] Placeholder normalization is ambiguous: { $detail }
     [source_residual] Source-language residue detected: { $detail }
+    [tag_value_contains_closing_delimiter] Line { $line } contains '>', which would close the tag value early
    *[other] { $detail }
 }
 task-record-protocol-detail = { $code ->

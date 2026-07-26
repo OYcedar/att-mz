@@ -1557,6 +1557,14 @@ fn rejection_reason(
             markdown_inline_code(&api_key_redactor.redact(fragment)),
             "",
         ),
+        TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index } => (
+            "tag_value_contains_closing_delimiter",
+            line_index.saturating_add(1),
+            0,
+            0,
+            String::new(),
+            "",
+        ),
     };
     task_record_text(
         localizer,

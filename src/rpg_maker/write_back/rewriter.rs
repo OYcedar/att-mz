@@ -1574,6 +1574,15 @@ fn replace_tag_values(
                 "标签值与 expected_original 不一致",
             ));
         }
+        // 标签值按字节区间逐字拼接；替换值一旦含 '>' 就会提前闭合 `<name:value>`
+        // 并把余文泄漏为容器正文。Translate 验收已拒绝该形态，这里是写回快照的
+        // 最后一道闸，覆盖全部标签替换来源。
+        if mutation.replacement().contains('>') {
+            return Err(mutation_failure(
+                mutation.exact_location(),
+                "标签替换值含 '>'，会提前闭合标签并破坏标签协议",
+            ));
+        }
         replacements.push((
             span.value_range(),
             mutation.replacement(),
