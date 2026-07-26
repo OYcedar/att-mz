@@ -296,10 +296,9 @@ impl ApiKeyRedactor {
 
     /// 替换整个 endpoint 中出现的 API key 实际值，逐字保留其余内容。
     ///
-    /// URL 的原始分隔符(RFC 3986 gen/sub-delims)是结构而非内容:path 与
-    /// fragment 按分隔符切段后只在段内容(percent-decode 后)中匹配;query 的
-    /// key/value 按既有 `+`→空格 语义逐 pair 匹配。部分代理网关把 key 编入
-    /// path,闭集替换不允许该位置成为漏洞。
+    /// 全串字面匹配覆盖跨 URL 分隔符的实际值；同时按 URL component 解码后匹配
+    /// percent-encoded 表示，query 沿用 `+`→空格语义。两条路径只收集源 range，
+    /// 合并重叠后一次渲染，避免改写邻接字节或重复处理替换标记。
     pub(crate) fn redact_url(&self, value: &str) -> String {
         let api_key = self.api_key.expose_secret();
         if api_key.is_empty() {
@@ -310,7 +309,8 @@ impl ApiKeyRedactor {
         let query_delimiter = value[..query_end].find('?');
         let path_end = query_delimiter.unwrap_or(query_end);
 
-        let mut replacements = scan_delimited_url_region(value, 0, path_end, api_key);
+        let mut replacements = Self::literal_source_ranges(value, api_key);
+        replacements.extend(scan_delimited_url_region(value, 0, path_end, api_key));
         if let Some(fragment_delimiter) = fragment_delimiter {
             replacements.extend(scan_delimited_url_region(
                 value,
@@ -347,16 +347,7 @@ impl ApiKeyRedactor {
             }
         }
 
-        replacements.sort_by_key(|source| (source.start, source.end));
-        let mut output = String::with_capacity(value.len());
-        let mut copied_until = 0usize;
-        for source in replacements {
-            output.push_str(&value[copied_until..source.start]);
-            output.push_str(Self::REPLACEMENT);
-            copied_until = source.end;
-        }
-        output.push_str(&value[copied_until..]);
-        output
+        Self::replace_source_ranges(value, Self::merge_source_ranges(replacements))
     }
 
     fn redact_serialized_json(&self, value: &str) -> String {
@@ -413,18 +404,22 @@ impl ApiKeyRedactor {
         if needle.is_empty() {
             return value.to_owned();
         }
-        let mut output = String::with_capacity(value.len());
-        let mut copied_until = 0usize;
+        Self::replace_source_ranges(value, Self::literal_source_ranges(value, needle))
+    }
+
+    fn literal_source_ranges(value: &str, needle: &str) -> Vec<DecodedSourceRange> {
+        let mut replacements = Vec::new();
         let mut index = 0usize;
         while index < value.len() {
             let remaining = &value[index..];
             if remaining.starts_with(Self::REPLACEMENT) {
                 index += Self::REPLACEMENT.len();
             } else if remaining.starts_with(needle) {
-                output.push_str(&value[copied_until..index]);
-                output.push_str(Self::REPLACEMENT);
+                replacements.push(DecodedSourceRange {
+                    start: index,
+                    end: index + needle.len(),
+                });
                 index += needle.len();
-                copied_until = index;
             } else {
                 index += remaining
                     .chars()
@@ -432,6 +427,32 @@ impl ApiKeyRedactor {
                     .expect("非空 UTF-8 后缀必须包含字符")
                     .len_utf8();
             }
+        }
+        replacements
+    }
+
+    fn merge_source_ranges(mut replacements: Vec<DecodedSourceRange>) -> Vec<DecodedSourceRange> {
+        replacements.sort_by_key(|source| (source.start, source.end));
+        let mut merged: Vec<DecodedSourceRange> = Vec::with_capacity(replacements.len());
+        for source in replacements {
+            if let Some(previous) = merged.last_mut()
+                && source.start < previous.end
+            {
+                previous.end = previous.end.max(source.end);
+            } else {
+                merged.push(source);
+            }
+        }
+        merged
+    }
+
+    fn replace_source_ranges(value: &str, replacements: Vec<DecodedSourceRange>) -> String {
+        let mut output = String::with_capacity(value.len());
+        let mut copied_until = 0usize;
+        for source in replacements {
+            output.push_str(&value[copied_until..source.start]);
+            output.push_str(Self::REPLACEMENT);
+            copied_until = source.end;
         }
         output.push_str(&value[copied_until..]);
         output
@@ -508,8 +529,8 @@ impl DecodedQueryComponent {
 
 /// 在 path 或 fragment 区间内按原始分隔符切段并对段内容做解码感知匹配。
 ///
-/// 原始 `/`、`;`、`,`、`:`、`@` 是结构分隔符,只有 percent-encoded 形式才属于
-/// 段内容;因此含分隔符字符的 key 不会与结构本身误匹配。
+/// 这条 component 解码路径把原始 `/`、`;`、`,`、`:`、`@` 视为结构；
+/// 全串字面路径另行覆盖实际 key 跨越这些分隔符的情况。
 fn scan_delimited_url_region(
     value: &str,
     start: usize,
@@ -848,28 +869,55 @@ mod tests {
     }
 
     #[test]
-    fn url_redaction_preserves_source_and_never_matches_query_syntax() {
-        for (api_key, encoded_api_key) in [
-            ("+", "%2B"),
-            ("=", "%3d"),
-            ("%", "%25"),
-            ("&", "%26"),
-            ("?", "%3F"),
-            (":", "%3a"),
-            ("#", "%23"),
-        ] {
+    fn url_redaction_covers_raw_syntax_and_decoded_components() {
+        let replacement = ApiKeyRedactor::REPLACEMENT;
+        let cases = [
+            (
+                "+",
+                "https://example.test/v1?left+right=%2B",
+                format!("https://example.test/v1?left{replacement}right={replacement}"),
+            ),
+            (
+                "=",
+                "https://example.test/v1?left=right&encoded=%3D",
+                format!(
+                    "https://example.test/v1?left{replacement}right&encoded{replacement}{replacement}"
+                ),
+            ),
+            (
+                "%",
+                "https://example.test/v1?encoded=%25&neighbor=%2f",
+                format!("https://example.test/v1?encoded={replacement}&neighbor={replacement}2f"),
+            ),
+            (
+                "&",
+                "https://example.test/v1?left=right&encoded=%26",
+                format!("https://example.test/v1?left=right{replacement}encoded={replacement}"),
+            ),
+            (
+                "?",
+                "https://example.test/v1?encoded=%3F#tail",
+                format!("https://example.test/v1{replacement}encoded={replacement}#tail"),
+            ),
+            (
+                ":",
+                "https://example.test/v1?encoded=%3A",
+                format!("https{replacement}//example.test/v1?encoded={replacement}"),
+            ),
+            (
+                "#",
+                "https://example.test/v1?encoded=%23#tail",
+                format!("https://example.test/v1?encoded={replacement}{replacement}tail"),
+            ),
+        ];
+
+        for (api_key, endpoint, expected) in cases {
             let redactor = ApiKeyRedactor::new(SecretString::from(api_key));
-            let endpoint = format!(
-                "https://example.test/a%20b?ordinary=left+right&target={encoded_api_key}&neighbor=%2f#fragment%20x"
-            );
 
             assert_eq!(
-                redactor.redact_url(&endpoint),
-                format!(
-                    "https://example.test/a%20b?ordinary=left+right&target={}&neighbor=%2f#fragment%20x",
-                    ApiKeyRedactor::REPLACEMENT
-                ),
-                "query 语法字符 {api_key:?} 只能匹配 component 解码后的实际内容"
+                redactor.redact_url(endpoint),
+                expected,
+                "API key {api_key:?} 的原始 URL 语法位置与编码内容都必须替换"
             );
         }
     }
@@ -907,15 +955,43 @@ mod tests {
                 ApiKeyRedactor::REPLACEMENT
             ),
         );
-        // path 分隔符是结构而非内容:含 '/' 的 key 不与结构误匹配,
-        // percent-encoded 形式才是段内容。
+        // 全串字面兜底覆盖跨 path 分隔符的实际 key；component 解码路径
+        // 同时覆盖它的 percent-encoded 表示。
         let slash_redactor = ApiKeyRedactor::new(SecretString::from("a/b"));
         assert_eq!(
             slash_redactor.redact_url("https://gateway.test/a/b/v1?x=a%2Fb"),
             format!(
-                "https://gateway.test/a/b/v1?x={}",
+                "https://gateway.test/{0}/v1?x={0}",
+                ApiKeyRedactor::REPLACEMENT,
+            ),
+        );
+    }
+
+    #[test]
+    fn url_redaction_merges_overlapping_ranges_and_does_not_reprocess_markers() {
+        let percent_redactor = ApiKeyRedactor::new(SecretString::from("%"));
+        assert_eq!(
+            percent_redactor.redact_url("https://example.test/%25?neighbor=%2f"),
+            format!(
+                "https://example.test/{0}?neighbor={0}2f",
                 ApiKeyRedactor::REPLACEMENT
             ),
+            "字面 '%' 与解码后的 '%25' 重叠时必须只渲染一次替换"
+        );
+
+        let redactor = ApiKeyRedactor::new(SecretString::from("API"));
+        let once = redactor.redact_url("https://example.test/API?token=API");
+        assert_eq!(
+            once,
+            format!(
+                "https://example.test/{0}?token={0}",
+                ApiKeyRedactor::REPLACEMENT
+            )
+        );
+        assert_eq!(
+            redactor.redact_url(&once),
+            once,
+            "替换标记自身包含 API key 文本时不得被二次处理"
         );
     }
 
