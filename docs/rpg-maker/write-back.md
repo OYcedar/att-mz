@@ -54,6 +54,10 @@ owner 的资产快照指纹，并验证：
 - 译文与 translation state 成对存在；
 - 当前源文档仍能逐字满足 recipe 记录的命令形状、长度、值和嵌套 JSON 边界。
 
+`translation_state` 的非空长度和与译文成对存在等合法性由当前项目数据库 schema 的
+`CHECK` 约束负责；WriteBack Reader 消费已经满足该约束的行，不在读取阶段建立第二套
+同义合法性规则。
+
 任一事实不成立都在修改或发布前失败。WriteBack 不读取外部 TOML，也不重新执行 PCRE2；
 姓名、局部文本和嵌套 JSON 的选择均以 Extract 时物化的 recipe 为权威。
 `standard_mutation_claim` 是必须与 recipe 相符的跨 owner 冲突摘要，不是缓存，也不能
@@ -68,6 +72,12 @@ Armors description 即使源值只有一行也使用该形状。WriteBack 把这
 `\n` 连接成同一个 `Value` 后写回，其余单行 Scalar 保持 `single line`。
 所有候选修改先在
 内存中完成形状验证，再写入目标文档；同一文档只在全部关联修改成功后编码。
+
+`plugins.js` 的声明、合法空白/行注释前缀、assignment、终止符和数组根由 Extract 与 Lua
+共用的外壳契约解释。插件参数发生修改时，声明之前的合法前缀按 UTF-8 原始字节逐字保留，
+只把 `var $plugins = ...;` 主体按当前数组重新编码；外壳失败会明确区分声明、前缀、
+assignment、终止符与根类型。CommentTag 只覆盖起始 108 及随后与它 indent 相同的连续
+408；不同 indent 的 408 是下一结构边界，不进入当前标签的冻结原文或 Mutation Claim。
 
 修改摘要统计语义单元。物理 Mutation Claim、模型返回行和自动生成的物理续行都不是
 新的翻译单元。
@@ -114,9 +124,12 @@ ScrollingText 的块级 mutation 覆盖完整 `105 + 405*`。模型必须返回�
 宽度的字段只保留语义断行。
 
 模型提供的未超宽行逐字保持，不合并、不重排，也不因引号状态补缩进。只有 ATT 自动
-生成的续行可以增加全角缩进；`inserted_line_breaks` 只统计这类新增物理换行。没有安全
-断点时返回 `Manual` 诊断，不硬切单词或 grapheme；这仍是正常写回结果，ATT 会写入当前
-有效译文而不添加强制换行，并把该项计入人工处理数量，命令本身可以成功。
+生成的续行可以增加全角缩进；换行搜索预先为每条续行保留两个显示 cell，确保加上一个
+全角缩进后仍不超过所选区域宽度。半角 `(`、`)` 与全角括号使用相同的配对、行尾 opener
+和行首 closer 禁则。`inserted_line_breaks` 只统计这类新增物理换行。没有满足宽度、配对
+和行首/行尾禁则的安全断点时返回 `Manual` 诊断，不硬切单词或 grapheme；这仍是正常写回
+结果，ATT 会写入当前有效译文而不添加强制换行，并把该项计入人工处理数量，命令本身
+可以成功。
 
 ## 5. Lua 候选能力
 
@@ -146,11 +159,12 @@ Standard 与可选 Lua 完成后，领域边界无条件验证候选：
 - MV 顶层恰好是普通 `www/`，且 `www` 内恰好是普通 `data/` 与 `js/`。
 
 随后通用发布器只做一次完整候选复核，覆盖普通对象、Windows 等价名称、reparse、
-hardlink 和稳定 file ID，不对文件数、深度或字节数设置 ATT 人工上限。被改写文档以合法
-JSON 重新编码；未成为 mutation Claim 的字段和未知命令字段保持来源值。候选 manifest
-拥有稳定 ordinal，未改写文件复制、overlay 写入和不同物理文档改写作为独立文件任务
-并行执行；完成顺序不改变主错误。Standard 后的 Lua 继续编辑同一不可见候选，随后进行
-上述唯一完整校验和唯一目录交换。
+稳定 file ID，并按[共享文件能力的唯一契约](../runtime/directory-publishing.md#11-硬链接拒绝)
+拒绝硬链接；不对文件数、深度或字节数设置 ATT 人工上限。被改写文档以合法 JSON 重新
+编码；未成为 mutation Claim 的字段和未知命令字段保持来源值。候选 manifest 拥有稳定
+ordinal，未改写文件复制、overlay 写入和不同物理文档改写作为独立文件任务并行执行；
+完成顺序不改变主错误。Standard 后的 Lua 继续编辑同一不可见候选，随后进行上述唯一
+完整校验和唯一目录交换。
 
 目录交换未生效且 publisher 已确认 `NotPublished` 时，顶层报告项目暂时不可用；它不
 表示数据库损坏或提取过期。已经生效、需要恢复或结果未知的终态继续分别保留其更强的

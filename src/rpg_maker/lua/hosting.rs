@@ -17,13 +17,16 @@ use crate::llm::{
     ChatMessage, LlmRequestDiagnosticSource, LlmRequestError, LlmRequestExecutor, LlmResponse,
 };
 use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
-use crate::storage::scoped_path::{ExactPathCaseMismatch, resolve_exact_directory_entry};
+use crate::storage::scoped_path::{
+    ExactDirectoryEntryResolutionError, resolve_exact_directory_entry,
+};
 use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
 use crate::storage::sqlite_session::{
     OpenSqliteInteractiveSessionError, SqliteInteractiveSessionError,
     SqliteInteractiveSessionFactory, SqliteInteractiveSessionFinalizationFailure,
     SqliteInteractiveSessionFinalizer, SqliteInteractiveSessionOperations,
 };
+use crate::windows_path::WindowsOrdinalCaseKeyError;
 
 #[cfg(test)]
 use super::runtime::OwnedLuaProgram;
@@ -488,7 +491,7 @@ where
             component,
             entries.iter().map(|entry| entry.resolved_path()),
         )
-        .map_err(|error| source_case_mismatch("source.resolve", error))?;
+        .map_err(|error| source_resolution_error("source.resolve", error))?;
         match resolved {
             Some(resolved) => current = resolved,
             None => {
@@ -773,31 +776,67 @@ fn file_state_diagnostic(path: &Path, failure: DiagnosticFailureKind) -> SafeDia
     )
 }
 
-fn source_case_mismatch(
+fn source_resolution_error(
     operation: &'static str,
-    error: ExactPathCaseMismatch,
+    error: ExactDirectoryEntryResolutionError,
 ) -> TrustedLuaHostCallError {
-    let diagnostic = SafeDiagnostic::new(
-        DiagnosticCode::FileSystemOperation,
-        DiagnosticStage::ProjectOpening,
-        DiagnosticSubject::path(error.requested()),
-        DiagnosticReason::failure_with_detail(
-            DiagnosticFailureKind::InvalidPath,
-            "requested path casing does not match the actual directory entry",
+    let (kind, message, diagnostic) = match &error {
+        ExactDirectoryEntryResolutionError::CaseMismatch(error) => (
+            "case_mismatch",
+            "Lua Host 来源路径的大小写与磁盘上的真实名称不一致",
+            SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                DiagnosticStage::ProjectOpening,
+                DiagnosticSubject::path(error.requested()),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InvalidPath,
+                    "requested path casing does not match the actual directory entry",
+                ),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            )
+            .with_recovery(RecoveryFact::path(error.actual())),
         ),
-        DiagnosticImpact::Unchanged,
-        DiagnosticAction::FixInput,
-    )
-    .with_recovery(RecoveryFact::path(error.actual()));
-    TrustedLuaHostCallError::new(
-        "filesystem",
-        "case_mismatch",
-        "Lua Host 来源路径的大小写与磁盘上的真实名称不一致",
-        None,
-        Some(Arc::new(error)),
-    )
-    .with_operation(operation)
-    .with_safe_diagnostic(diagnostic)
+        ExactDirectoryEntryResolutionError::CaseKey { path, source } => {
+            let diagnostic = match source {
+                WindowsOrdinalCaseKeyError::InputTooLarge { maximum, observed } => {
+                    SafeDiagnostic::new(
+                        DiagnosticCode::FileSystemOperation,
+                        DiagnosticStage::ProjectOpening,
+                        DiagnosticSubject::path(path),
+                        DiagnosticReason::Resource {
+                            resource: "Windows 文件名 UTF-16 单元数".to_owned(),
+                            actual: *observed,
+                            maximum: Some(*maximum),
+                        },
+                        DiagnosticImpact::Unchanged,
+                        DiagnosticAction::FixInput,
+                    )
+                }
+                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => SafeDiagnostic::io(
+                    DiagnosticCode::FileSystemOperation,
+                    DiagnosticStage::ProjectOpening,
+                    DiagnosticSubject::path(path),
+                    "windows_ordinal_case_key",
+                    source,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                )
+                .with_recovery(RecoveryFact::component(format!(
+                    "windows_ordinal_case_key_phase={}",
+                    phase.as_str()
+                ))),
+            };
+            (
+                "io",
+                "Lua Host 无法建立来源路径的 Windows 非大小写身份",
+                diagnostic,
+            )
+        }
+    };
+    TrustedLuaHostCallError::new("filesystem", kind, message, None, Some(Arc::new(error)))
+        .with_operation(operation)
+        .with_safe_diagnostic(diagnostic)
 }
 
 fn llm_call_error<E>(error: LlmRequestError<E>) -> TrustedLuaHostCallError

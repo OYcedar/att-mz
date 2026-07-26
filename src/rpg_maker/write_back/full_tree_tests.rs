@@ -1279,7 +1279,7 @@ fn metadata_row() -> SqliteRow {
         SqliteValue::Blob(vec![7; 32]),
         SqliteValue::Integer(4),
         SqliteValue::Integer(8),
-        SqliteValue::Integer(3),
+        SqliteValue::Integer(4),
         SqliteValue::Text(DIALOGUE_DEFINITION_JSON.to_owned()),
     ])
 }

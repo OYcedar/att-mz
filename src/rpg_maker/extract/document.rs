@@ -21,13 +21,19 @@ use crate::diagnostic::{
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::rpg_maker::json::{StackSafeJsonError, StackSafeJsonValue, from_str as parse_json};
+use crate::rpg_maker::plugin_document::{
+    PluginsEnvelopeFailure, parse_plugins_envelope, validate_plugins_root_is_array,
+};
 use crate::rpg_maker::project::OpenedProject;
 pub(crate) use crate::rpg_maker::text::StandardDataFile;
 use crate::rpg_maker::text::{DataFileName, MapId, RpgMakerSource};
 use crate::storage::file_system::{
     DirectoryEntryKind, DirectoryLister, FileReader, ListDirectoryError, ReadFileError,
 };
-use crate::storage::scoped_path::{ExactPathCaseMismatch, resolve_exact_directory_entry};
+use crate::storage::scoped_path::{
+    ExactDirectoryEntryResolutionError, ExactPathCaseMismatch, resolve_exact_directory_entry,
+};
+use crate::windows_path::WindowsOrdinalCaseKeyError;
 
 /// 一个已加载文档的稳定身份。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -171,6 +177,7 @@ impl PluginConfiguration {
 pub(crate) struct RpgMakerProjectDocuments {
     documents: BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
     plugins: Vec<PluginConfiguration>,
+    plugins_prefix: String,
 }
 
 impl RpgMakerProjectDocuments {
@@ -185,12 +192,22 @@ impl RpgMakerProjectDocuments {
                 .map(|(id, value)| (id, Arc::new(StackSafeJsonValue::new(value))))
                 .collect(),
             plugins,
+            plugins_prefix: String::new(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_stack_safe_parts(
         documents: BTreeMap<RpgMakerDocumentId, StackSafeJsonValue>,
+        plugins: Vec<PluginConfiguration>,
+    ) -> Self {
+        Self::from_stack_safe_parts_with_plugins_prefix(documents, plugins, String::new())
+    }
+
+    fn from_stack_safe_parts_with_plugins_prefix(
+        documents: BTreeMap<RpgMakerDocumentId, StackSafeJsonValue>,
         mut plugins: Vec<PluginConfiguration>,
+        plugins_prefix: String,
     ) -> Self {
         plugins.sort_by_key(PluginConfiguration::index);
         Self {
@@ -199,15 +216,28 @@ impl RpgMakerProjectDocuments {
                 .map(|(id, value)| (id, Arc::new(value)))
                 .collect(),
             plugins,
+            plugins_prefix,
         }
     }
 
     pub(crate) fn from_shared_parts(
         documents: BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
+        plugins: Vec<PluginConfiguration>,
+    ) -> Self {
+        Self::from_shared_parts_with_plugins_prefix(documents, plugins, String::new())
+    }
+
+    fn from_shared_parts_with_plugins_prefix(
+        documents: BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
         mut plugins: Vec<PluginConfiguration>,
+        plugins_prefix: String,
     ) -> Self {
         plugins.sort_by_key(PluginConfiguration::index);
-        Self { documents, plugins }
+        Self {
+            documents,
+            plugins,
+            plugins_prefix,
+        }
     }
 
     pub(crate) fn empty() -> Self {
@@ -235,12 +265,18 @@ impl RpgMakerProjectDocuments {
         &self.plugins
     }
 
+    #[cfg(test)]
+    pub(crate) fn plugins_prefix(&self) -> &str {
+        &self.plugins_prefix
+    }
+
     /// 将完整文档集拆成可移动到独立 CPU 工作单元的拥有型部分。
     pub(crate) fn into_parts(
         self,
     ) -> (
         BTreeMap<RpgMakerDocumentId, StackSafeJsonValue>,
         Vec<PluginConfiguration>,
+        String,
     ) {
         let documents = self
             .documents
@@ -250,7 +286,7 @@ impl RpgMakerProjectDocuments {
                 (id, value)
             })
             .collect();
-        (documents, self.plugins)
+        (documents, self.plugins, self.plugins_prefix)
     }
 
     /// 将共享解析根拆成可移动到并行 CPU 工作单元的轻量引用。
@@ -259,8 +295,9 @@ impl RpgMakerProjectDocuments {
     ) -> (
         BTreeMap<RpgMakerDocumentId, Arc<StackSafeJsonValue>>,
         Vec<PluginConfiguration>,
+        String,
     ) {
-        (self.documents, self.plugins)
+        (self.documents, self.plugins, self.plugins_prefix)
     }
 }
 
@@ -387,13 +424,16 @@ where
         }
 
         let loaded_all_maps = missing.includes_all_maps();
-        let (documents, plugins) = fresh.into_shared_parts();
+        let (documents, plugins, plugins_prefix) = fresh.into_shared_parts();
         cache.documents.extend(documents);
         cache.all_maps_loaded |= loaded_all_maps;
-        Ok(RpgMakerProjectDocuments::from_shared_parts(
-            cache.select_documents(&selection, true),
-            plugins,
-        ))
+        Ok(
+            RpgMakerProjectDocuments::from_shared_parts_with_plugins_prefix(
+                cache.select_documents(&selection, true),
+                plugins,
+                plugins_prefix,
+            ),
+        )
     }
 }
 
@@ -585,6 +625,9 @@ where
                 BuildDocumentRequestsError::FileNameCaseMismatch(source) => {
                     RpgMakerProjectDocumentReadingError::FileNameCaseMismatch(source)
                 }
+                BuildDocumentRequestsError::FileNameCaseKey { path, source } => {
+                    RpgMakerProjectDocumentReadingError::FileNameCaseKey { path, source }
+                }
             })?;
         let request_count = requests.len();
         let total = u64::try_from(request_count).expect("RPG Maker 文档请求数必须能用 u64 表达");
@@ -649,18 +692,26 @@ where
         outcomes.sort_by_key(|(request_index, _)| *request_index);
         let mut documents = BTreeMap::new();
         let mut plugins = Vec::new();
+        let mut plugins_prefix = String::new();
         for (_, result) in outcomes {
             match result? {
                 ParsedDocument::Json { id, value } => {
                     documents.insert(id, value);
                 }
-                ParsedDocument::Plugins(records) => plugins = records,
+                ParsedDocument::Plugins { records, prefix } => {
+                    plugins = records;
+                    plugins_prefix = prefix;
+                }
             }
         }
 
-        Ok(RpgMakerProjectDocuments::from_stack_safe_parts(
-            documents, plugins,
-        ))
+        Ok(
+            RpgMakerProjectDocuments::from_stack_safe_parts_with_plugins_prefix(
+                documents,
+                plugins,
+                plugins_prefix,
+            ),
+        )
     }
 }
 
@@ -689,18 +740,18 @@ where
         let mut documents = BTreeMap::new();
         for file in selection.standard_files() {
             let path = exact_or_requested_path(data_root, file.file_name(), &data_entries)
-                .map_err(BuildDocumentRequestsError::FileNameCaseMismatch)?;
+                .map_err(BuildDocumentRequestsError::from_resolution_error)?;
             documents.insert(RpgMakerDocumentId::Data(*file), path);
         }
         for file in selection.data_files() {
             let path = exact_or_requested_path(data_root, file.as_str(), &data_entries)
-                .map_err(BuildDocumentRequestsError::FileNameCaseMismatch)?;
+                .map_err(BuildDocumentRequestsError::from_resolution_error)?;
             documents.insert(RpgMakerDocumentId::DataFile(file.clone()), path);
         }
         for map_id in selection.map_ids() {
             let file_name = map_id.file_name();
             let path = exact_or_requested_path(data_root, &file_name, &data_entries)
-                .map_err(BuildDocumentRequestsError::FileNameCaseMismatch)?;
+                .map_err(BuildDocumentRequestsError::from_resolution_error)?;
             documents.insert(RpgMakerDocumentId::Map(*map_id), path);
         }
 
@@ -734,7 +785,7 @@ where
                 .await
                 .map_err(BuildDocumentRequestsError::ListJs)?;
             let path = exact_or_requested_path(js_root, "plugins.js", &entries)
-                .map_err(BuildDocumentRequestsError::FileNameCaseMismatch)?;
+                .map_err(BuildDocumentRequestsError::from_resolution_error)?;
             requests.push(DocumentRequest {
                 kind: DocumentRequestKind::Plugins,
                 path,
@@ -748,7 +799,7 @@ fn exact_or_requested_path(
     parent: &Path,
     file_name: &str,
     entries: &[crate::storage::file_system::DirectoryEntry],
-) -> Result<PathBuf, ExactPathCaseMismatch> {
+) -> Result<PathBuf, ExactDirectoryEntryResolutionError> {
     resolve_exact_directory_entry(
         parent,
         file_name,
@@ -762,6 +813,23 @@ enum BuildDocumentRequestsError<L> {
     ListData(ListDirectoryError<L>),
     ListJs(ListDirectoryError<L>),
     FileNameCaseMismatch(ExactPathCaseMismatch),
+    FileNameCaseKey {
+        path: PathBuf,
+        source: WindowsOrdinalCaseKeyError,
+    },
+}
+
+impl<L> BuildDocumentRequestsError<L> {
+    fn from_resolution_error(source: ExactDirectoryEntryResolutionError) -> Self {
+        match source {
+            ExactDirectoryEntryResolutionError::CaseMismatch(source) => {
+                Self::FileNameCaseMismatch(source)
+            }
+            ExactDirectoryEntryResolutionError::CaseKey { path, source } => {
+                Self::FileNameCaseKey { path, source }
+            }
+        }
+    }
 }
 
 /// 无损读取 RPG Maker 文档时的阶段错误。
@@ -770,6 +838,10 @@ pub(crate) enum RpgMakerProjectDocumentReadingError<F, L, C> {
     ListData(ListDirectoryError<L>),
     ListJs(ListDirectoryError<L>),
     FileNameCaseMismatch(ExactPathCaseMismatch),
+    FileNameCaseKey {
+        path: PathBuf,
+        source: WindowsOrdinalCaseKeyError,
+    },
     ReadDocument {
         path: PathBuf,
         source: ReadFileError<F>,
@@ -788,6 +860,7 @@ pub(crate) enum RpgMakerProjectDocumentReadingError<F, L, C> {
     },
     InvalidPluginsEnvelope {
         path: PathBuf,
+        failure: PluginsEnvelopeFailure,
     },
     InvalidPluginRecord {
         path: PathBuf,
@@ -812,7 +885,9 @@ impl<F, L, C> RpgMakerProjectDocumentReadingError<F, L, C> {
         match error {
             ParseFailure::InvalidUtf8 { path, source } => Self::InvalidUtf8 { path, source },
             ParseFailure::InvalidJson { path, source } => Self::InvalidJson { path, source },
-            ParseFailure::InvalidPluginsEnvelope { path } => Self::InvalidPluginsEnvelope { path },
+            ParseFailure::InvalidPluginsEnvelope { path, failure } => {
+                Self::InvalidPluginsEnvelope { path, failure }
+            }
             ParseFailure::InvalidPluginRecord { path, index } => {
                 Self::InvalidPluginRecord { path, index }
             }
@@ -845,6 +920,35 @@ where
                 DiagnosticAction::FixInput,
             )
             .with_recovery(RecoveryFact::path(source.actual())),
+            Self::FileNameCaseKey { path, source } => match source {
+                WindowsOrdinalCaseKeyError::InputTooLarge { maximum, observed } => {
+                    SafeDiagnostic::new(
+                        code,
+                        stage,
+                        DiagnosticSubject::path(path),
+                        DiagnosticReason::Resource {
+                            resource: "Windows 文件名 UTF-16 单元数".to_owned(),
+                            actual: *observed,
+                            maximum: Some(*maximum),
+                        },
+                        DiagnosticImpact::Unchanged,
+                        DiagnosticAction::FixInput,
+                    )
+                }
+                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => SafeDiagnostic::io(
+                    code,
+                    stage,
+                    DiagnosticSubject::path(path),
+                    "windows_ordinal_case_key",
+                    source,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                )
+                .with_recovery(RecoveryFact::component(format!(
+                    "windows_ordinal_case_key_phase={}",
+                    phase.as_str()
+                ))),
+            },
             Self::ReadDocument { source, .. } => read_document_diagnostic(source, code, stage),
             Self::ScheduleParse { path, source } => {
                 let mut diagnostic = source.safe_diagnostic_source(
@@ -881,11 +985,11 @@ where
                 source.line(),
                 source.column()
             ))),
-            Self::InvalidPluginsEnvelope { path } => {
-                source_document_invalid(path, None, code, stage)
+            Self::InvalidPluginsEnvelope { path, failure } => {
+                source_document_invalid(path, None, Some(*failure), code, stage)
             }
             Self::InvalidPluginRecord { path, index } => {
-                source_document_invalid(path, Some(*index), code, stage)
+                source_document_invalid(path, Some(*index), None, code, stage)
             }
         }
     }
@@ -968,10 +1072,11 @@ where
 fn source_document_invalid(
     path: &Path,
     plugin_index: Option<usize>,
+    envelope_failure: Option<PluginsEnvelopeFailure>,
     code: DiagnosticCode,
     stage: DiagnosticStage,
 ) -> SafeDiagnostic {
-    let diagnostic = SafeDiagnostic::new(
+    let mut diagnostic = SafeDiagnostic::new(
         code,
         stage,
         DiagnosticSubject::path(path),
@@ -979,9 +1084,17 @@ fn source_document_invalid(
         DiagnosticImpact::Unchanged,
         DiagnosticAction::FixInput,
     );
-    plugin_index.map_or(diagnostic.clone(), |index| {
-        diagnostic.with_recovery(RecoveryFact::component(format!("plugin_index={index}")))
-    })
+    if let Some(index) = plugin_index {
+        diagnostic =
+            diagnostic.with_recovery(RecoveryFact::component(format!("plugin_index={index}")));
+    }
+    if let Some(failure) = envelope_failure {
+        diagnostic = diagnostic.with_recovery(RecoveryFact::component(format!(
+            "plugins_envelope_failure={}",
+            failure.storage_name()
+        )));
+    }
+    diagnostic
 }
 
 impl<F, L, C> fmt::Display for RpgMakerProjectDocumentReadingError<F, L, C>
@@ -995,6 +1108,11 @@ where
             Self::ListData(error) => write!(formatter, "无法列举 RPG Maker data 目录：{error}"),
             Self::ListJs(error) => write!(formatter, "无法列举 RPG Maker js 目录：{error}"),
             Self::FileNameCaseMismatch(error) => error.fmt(formatter),
+            Self::FileNameCaseKey { path, source } => write!(
+                formatter,
+                "无法建立 RPG Maker 文档名 {} 的 Windows 非大小写身份：{source}",
+                path.display()
+            ),
             Self::ReadDocument { path, source } => {
                 write!(
                     formatter,
@@ -1021,10 +1139,10 @@ where
                     path.display()
                 )
             }
-            Self::InvalidPluginsEnvelope { path } => write!(
+            Self::InvalidPluginsEnvelope { path, failure } => write!(
                 formatter,
-                "{} 不是 RPG Maker 生成的 plugins.js 格式",
-                path.display()
+                "{} 不是 RPG Maker 生成的 plugins.js 格式：{failure}",
+                path.display(),
             ),
             Self::InvalidPluginRecord { path, index } => write!(
                 formatter,
@@ -1045,6 +1163,7 @@ where
         match self {
             Self::ListData(error) | Self::ListJs(error) => Some(error),
             Self::FileNameCaseMismatch(error) => Some(error),
+            Self::FileNameCaseKey { source, .. } => Some(source),
             Self::ReadDocument { source, .. } => Some(source),
             Self::ScheduleParse { source, .. } => Some(source),
             Self::InvalidUtf8 { source, .. } => Some(source),
@@ -1070,7 +1189,10 @@ enum ParsedDocument {
         id: RpgMakerDocumentId,
         value: StackSafeJsonValue,
     },
-    Plugins(Vec<PluginConfiguration>),
+    Plugins {
+        records: Vec<PluginConfiguration>,
+        prefix: String,
+    },
 }
 
 #[derive(Debug)]
@@ -1085,6 +1207,7 @@ enum ParseFailure {
     },
     InvalidPluginsEnvelope {
         path: PathBuf,
+        failure: PluginsEnvelopeFailure,
     },
     InvalidPluginRecord {
         path: PathBuf,
@@ -1113,29 +1236,22 @@ fn parse_document(
 }
 
 fn parse_plugins(path: PathBuf, text: &str) -> Result<ParsedDocument, ParseFailure> {
-    let Some((prefix, assignment)) = text.split_once("var $plugins") else {
-        return Err(ParseFailure::InvalidPluginsEnvelope { path });
-    };
-    if !prefix
-        .lines()
-        .all(|line| line.trim().is_empty() || line.trim_start().starts_with("//"))
-    {
-        return Err(ParseFailure::InvalidPluginsEnvelope { path });
-    }
-    let Some(json_with_terminator) = assignment.trim_start().strip_prefix('=') else {
-        return Err(ParseFailure::InvalidPluginsEnvelope { path });
-    };
-    let Some(json) = json_with_terminator.trim().strip_suffix(';') else {
-        return Err(ParseFailure::InvalidPluginsEnvelope { path });
-    };
+    let envelope =
+        parse_plugins_envelope(text).map_err(|failure| ParseFailure::InvalidPluginsEnvelope {
+            path: path.clone(),
+            failure,
+        })?;
 
-    let values = parse_json(json.trim()).map_err(|source| ParseFailure::InvalidJson {
+    let values = parse_json(envelope.json()).map_err(|source| ParseFailure::InvalidJson {
         path: path.clone(),
         source,
     })?;
-    if !values.is_array() {
-        return Err(ParseFailure::InvalidPluginsEnvelope { path });
-    }
+    validate_plugins_root_is_array(values.is_array()).map_err(|failure| {
+        ParseFailure::InvalidPluginsEnvelope {
+            path: path.clone(),
+            failure,
+        }
+    })?;
     let Value::Array(values) = values.into_inner() else {
         unreachable!("已检查 plugins.js 赋值是 array")
     };
@@ -1153,7 +1269,10 @@ fn parse_plugins(path: PathBuf, text: &str) -> Result<ParsedDocument, ParseFailu
         };
         plugins.push(PluginConfiguration::new(index, fields));
     }
-    Ok(ParsedDocument::Plugins(plugins))
+    Ok(ParsedDocument::Plugins {
+        records: plugins,
+        prefix: envelope.prefix().to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -1174,7 +1293,7 @@ pub(crate) fn parse_json_document_for_test(
 
 #[cfg(test)]
 pub(crate) fn parse_plugins_document_for_test(text: &str) -> RpgMakerProjectDocuments {
-    let ParsedDocument::Plugins(plugins) = parse_document(
+    let ParsedDocument::Plugins { records, prefix } = parse_document(
         DocumentRequestKind::Plugins,
         PathBuf::from("js/plugins.js"),
         text.as_bytes().to_vec(),
@@ -1182,7 +1301,11 @@ pub(crate) fn parse_plugins_document_for_test(text: &str) -> RpgMakerProjectDocu
     .expect("测试 plugins.js 必须有效") else {
         unreachable!("plugins 测试请求必须返回插件记录")
     };
-    RpgMakerProjectDocuments::from_stack_safe_parts(BTreeMap::new(), plugins)
+    RpgMakerProjectDocuments::from_stack_safe_parts_with_plugins_prefix(
+        BTreeMap::new(),
+        records,
+        prefix,
+    )
 }
 
 #[cfg(test)]
@@ -1374,6 +1497,7 @@ var $plugins =
         assert_eq!(documents.plugins()[0].index(), 0);
         assert_eq!(documents.plugins()[0].fields()["status"], false);
         assert_eq!(documents.plugins()[0].fields()["future"]["kept"], true);
+        assert_eq!(documents.plugins_prefix(), "// Generated by RPG Maker.\n");
         assert_eq!(
             *progress.lock().expect("进度记录锁不应中毒"),
             [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]
@@ -1632,8 +1756,56 @@ var $plugins =
 
         assert!(matches!(
             error,
-            RpgMakerProjectDocumentReadingError::InvalidPluginsEnvelope { path } if path == plugins
+            RpgMakerProjectDocumentReadingError::InvalidPluginsEnvelope {
+                path,
+                failure: PluginsEnvelopeFailure::Declaration,
+            } if path == plugins
         ));
+    }
+
+    #[tokio::test]
+    async fn plugins_envelope_diagnostic_preserves_the_structured_failure_fact() {
+        let plugins = project().source_root().join("js").join("plugins.js");
+        let harness = Harness::new(
+            HashMap::from([(
+                plugins.clone(),
+                b"/* unsupported */\nvar $plugins = [];".to_vec(),
+            )]),
+            Vec::new(),
+            1,
+        );
+
+        let error = harness
+            .service()
+            .read(&project(), RpgMakerDocumentSelection::new([], false, true))
+            .await
+            .expect_err("非法前缀必须明确失败");
+        assert!(matches!(
+            error,
+            RpgMakerProjectDocumentReadingError::InvalidPluginsEnvelope {
+                ref path,
+                failure: PluginsEnvelopeFailure::Prefix,
+            } if path == &plugins
+        ));
+        let diagnostic_error: RpgMakerProjectDocumentReadingError<
+            crate::runtime::filesystem::SystemFileSystemError,
+            crate::runtime::filesystem::SystemFileSystemError,
+            crate::runtime::cpu::CpuExecutorUnavailable,
+        > = RpgMakerProjectDocumentReadingError::InvalidPluginsEnvelope {
+            path: plugins,
+            failure: PluginsEnvelopeFailure::Prefix,
+        };
+        let diagnostic = diagnostic_error.safe_document_reading_diagnostic(
+            DiagnosticCode::ExtractRules,
+            DiagnosticStage::Extract,
+        );
+        assert!(diagnostic.recovery.iter().any(|fact| {
+            matches!(
+                fact,
+                RecoveryFact::Component { name }
+                    if name == "plugins_envelope_failure=prefix"
+            )
+        }));
     }
 
     #[tokio::test]

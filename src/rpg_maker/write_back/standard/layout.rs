@@ -15,6 +15,7 @@ use crate::rpg_maker::placeholder_token;
 use crate::rpg_maker::project::{MaxFullwidthChars, RpgMakerWriteBackLayoutProfile};
 
 const FULLWIDTH_INDENT: &str = "　";
+const CONTINUATION_INDENT_CELLS: u64 = 2;
 const MAX_TAIL_CELLS: u64 = 8;
 
 /// 只在能够完整证明显示结果安全时修改文本的 RPG Maker 布局器。
@@ -542,8 +543,13 @@ fn find_wrapped_ranges(
     let mut decisions = vec![None; token_count + 1];
     for &start in starts.iter().rev() {
         observation.observe_state();
+        let line_max_cells = if start == 0 {
+            max_cells
+        } else {
+            max_cells.saturating_sub(CONTINUATION_INDENT_CELLS)
+        };
         let remaining_width = index.range_width(start, token_count, observation);
-        if remaining_width <= max_cells {
+        if remaining_width <= line_max_cells {
             if remaining_width >= min_tail_cells
                 && index.valid_output_range(start, token_count, observation)
             {
@@ -555,9 +561,9 @@ fn find_wrapped_ranges(
         let first_after_start = candidates.partition_point(|candidate| candidate.head_end <= start);
         let fits_end = first_after_start
             + candidates[first_after_start..].partition_point(|candidate| {
-                index.range_width(start, candidate.head_end, observation) <= max_cells
+                index.range_width(start, candidate.head_end, observation) <= line_max_cells
             });
-        let minimum_width_end = max_cells.saturating_mul(45);
+        let minimum_width_end = line_max_cells.saturating_mul(45);
         let viable_start = first_after_start
             + candidates[first_after_start..fits_end].partition_point(|candidate| {
                 index
@@ -687,7 +693,7 @@ fn is_pair_opener(text: &str) -> bool {
 fn is_pair_closer(text: &str) -> bool {
     matches!(
         text,
-        "」" | "』" | "”" | "）" | "】" | "》" | "〉" | "〕" | "］" | "｝"
+        ")" | "」" | "』" | "”" | "）" | "】" | "》" | "〉" | "〕" | "］" | "｝"
     )
 }
 
@@ -776,6 +782,7 @@ fn update_wrapping_stack(tokens: &[DisplayToken<'_>], wrapping_stack: &mut Vec<&
 
 fn pair_closer(opener: &str) -> Option<&'static str> {
     match opener {
+        "(" => Some(")"),
         "「" => Some("」"),
         "『" => Some("』"),
         "“" => Some("”"),
@@ -906,7 +913,12 @@ mod tests {
         }
 
         let remaining_width = line_width(&tokens[start..]);
-        if remaining_width <= max_cells {
+        let line_max_cells = if start == 0 {
+            max_cells
+        } else {
+            max_cells.saturating_sub(CONTINUATION_INDENT_CELLS)
+        };
+        if remaining_width <= line_max_cells {
             let result = (remaining_width >= min_tail_cells
                 && reference_valid_output_range(tokens, start, tokens.len()))
             .then_some(vec![(start, tokens.len())]);
@@ -920,8 +932,8 @@ mod tests {
             .filter(|candidate| candidate.head_end > start && candidate.tail_start > start)
             .filter_map(|candidate| {
                 let width = line_width(&tokens[start..candidate.head_end]);
-                (width <= max_cells
-                    && width.saturating_mul(100) >= max_cells.saturating_mul(45)
+                (width <= line_max_cells
+                    && width.saturating_mul(100) >= line_max_cells.saturating_mul(45)
                     && reference_valid_output_range(tokens, start, candidate.head_end))
                 .then_some((candidate, width))
             })
@@ -1036,7 +1048,7 @@ mod tests {
         let RpgMakerTextLayoutOutcome::Applied(applied) = layout(
             RpgMakerWriteBackLayoutRegion::HelpDescription,
             &pairs,
-            &profile(20, 20, 3),
+            &profile(20, 20, 4),
         ) else {
             panic!("单行帮助说明应按帮助宽度安全换行")
         };
@@ -1048,7 +1060,7 @@ mod tests {
 
     #[test]
     fn help_request_wraps_a_single_line_source_at_the_explicit_help_width() {
-        let request = request(3, vec![segment(1, "单行原文", Some("甲乙，丙丁。"))]);
+        let request = request(4, vec![segment(1, "单行原文", Some("甲乙，丙丁。"))]);
 
         let applied = applied(&request);
 
@@ -1116,9 +1128,10 @@ mod tests {
     }
 
     #[test]
-    fn indexed_wrap_search_matches_the_previous_selection_semantics() {
+    fn indexed_wrap_search_matches_the_reference_selection_semantics() {
         const FRAGMENTS: &[&str] = &[
-            "甲", "乙", "A", "，", "。", " ", "  ", "「", "」", "（", "）", "…", r"\C[1]", "\u{a0}",
+            "甲", "乙", "A", "，", "。", " ", "  ", "(", ")", "「", "」", "（", "）", "…",
+            r"\C[1]", "\u{a0}",
         ];
         let mut state = 0x7a31_49d2_u32;
         for case_index in 0..64usize {
@@ -1133,7 +1146,7 @@ mod tests {
                 assert_eq!(
                     wrap_line(&tokens, max_cells),
                     reference_wrap_line(&tokens, max_cells),
-                    "索引搜索必须保持旧选择，case={case_index}, max_cells={max_cells}, line={line:?}"
+                    "索引搜索必须匹配独立参考，case={case_index}, max_cells={max_cells}, line={line:?}"
                 );
             }
         }
@@ -1200,7 +1213,7 @@ mod tests {
     #[test]
     fn wraps_at_chinese_punctuation_without_moving_text_between_segments() {
         let request = request(
-            3,
+            4,
             vec![
                 segment(1, "原一", Some("甲乙，丙丁。")),
                 segment(2, "原二", Some("戊己，庚辛。")),
@@ -1216,7 +1229,7 @@ mod tests {
 
     #[test]
     fn replaces_a_horizontal_whitespace_boundary_with_a_line_break() {
-        let request = request(2, vec![segment(1, "原文", Some("abcd  efgh"))]);
+        let request = request(3, vec![segment(1, "原文", Some("abcd  efgh"))]);
 
         let applied = applied(&request);
 
@@ -1262,6 +1275,35 @@ mod tests {
     #[test]
     fn refuses_a_break_that_would_leave_an_opening_pair_at_line_end() {
         assert_manual(&request(3, vec![segment(1, "原文", Some("甲乙（ 丙丁丁"))]));
+    }
+
+    #[test]
+    fn reserves_two_cells_for_every_automatic_continuation() {
+        let tokens = scan_line("abcd efgh").expect("测试文本应可扫描");
+
+        assert_eq!(
+            wrap_line(&tokens, 5),
+            None,
+            "续行正文即使单独不超宽，也必须为可能插入的全角缩进预留两个 cell"
+        );
+        assert_eq!(
+            wrap_line(&tokens, 6),
+            Some(vec!["abcd".to_owned(), "efgh".to_owned()])
+        );
+    }
+
+    #[test]
+    fn ascii_parentheses_share_pairing_and_line_boundary_rules() {
+        let layout_request = request(4, vec![segment(1, "原文", Some("(甲乙，丙丁)"))]);
+        let applied = applied(&layout_request);
+
+        assert_eq!(
+            line_texts(&applied.segments()[0]),
+            ["(甲乙，", "　丙丁)"][..]
+        );
+        assert_eq!(applied.inserted_fullwidth_indents(), 1);
+        assert_manual(&request(3, vec![segment(1, "原文", Some("abcd( efgh"))]));
+        assert_manual(&request(4, vec![segment(1, "原文", Some("abcd )efgh"))]));
     }
 
     #[test]

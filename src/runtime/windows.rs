@@ -17,7 +17,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, HANDLE};
-use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
@@ -266,25 +265,6 @@ fn wide_nul(value: &OsStr) -> Vec<u16> {
 
 fn handle(file: &File) -> HANDLE {
     file.as_raw_handle() as HANDLE
-}
-
-/// 按 Windows 非大小写敏感文件名语义比较两段 UTF-16。
-pub(crate) fn windows_names_equal(first: &[u16], second: &[u16]) -> bool {
-    let (Ok(first_length), Ok(second_length)) =
-        (i32::try_from(first.len()), i32::try_from(second.len()))
-    else {
-        return false;
-    };
-    // SAFETY: 两个 slice 在调用期间都提供有效指针与精确长度；长度已确认可表示为 i32。
-    unsafe {
-        CompareStringOrdinal(
-            first.as_ptr(),
-            first_length,
-            second.as_ptr(),
-            second_length,
-            1,
-        ) == CSTR_EQUAL
-    }
 }
 
 /// 一条已经逐组件打开并固定身份的现存路径。

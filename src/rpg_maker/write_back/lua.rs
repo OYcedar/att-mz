@@ -27,7 +27,10 @@ use crate::storage::file_system::{
     BoundScopedDirectory, ScopedDirectoryBindError, ScopedDirectoryEditError,
     ScopedDirectoryEditor, ScopedDirectoryEntryKind, ScopedDirectoryPath, StagedDirectory,
 };
-use crate::storage::scoped_path::{ExactPathCaseMismatch, resolve_exact_directory_entry};
+use crate::storage::scoped_path::{
+    ExactDirectoryEntryResolutionError, resolve_exact_directory_entry,
+};
+use crate::windows_path::WindowsOrdinalCaseKeyError;
 
 use super::standard::{
     RpgMakerLayoutTextPair, RpgMakerTextLayoutOutcome, RpgMakerWriteBackLayoutRegion,
@@ -248,7 +251,7 @@ where
             expected_name,
             entries.iter().map(|entry| parent.join(entry.name())),
         )
-        .map_err(output_case_mismatch)?;
+        .map_err(output_resolution_error)?;
         let Some(resolved) = resolved else {
             return Ok(path);
         };
@@ -450,15 +453,59 @@ where
     TrustedLuaHostCallError::new("output", kind, message, None, Some(Arc::new(error)))
 }
 
-fn output_case_mismatch(error: ExactPathCaseMismatch) -> TrustedLuaHostCallError {
+fn output_resolution_error(error: ExactDirectoryEntryResolutionError) -> TrustedLuaHostCallError {
     let message = error.to_string();
-    TrustedLuaHostCallError::new(
-        "filesystem",
-        "case_mismatch",
-        message,
-        None,
-        Some(Arc::new(error)),
-    )
+    let (kind, diagnostic) = match &error {
+        ExactDirectoryEntryResolutionError::CaseMismatch(error) => (
+            "case_mismatch",
+            SafeDiagnostic::new(
+                DiagnosticCode::FileSystemOperation,
+                DiagnosticStage::WriteBack,
+                DiagnosticSubject::path(error.requested()),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::InvalidPath,
+                    "requested path casing does not match the actual directory entry",
+                ),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::FixInput,
+            )
+            .with_recovery(RecoveryFact::path(error.actual())),
+        ),
+        ExactDirectoryEntryResolutionError::CaseKey { path, source } => {
+            let diagnostic = match source {
+                WindowsOrdinalCaseKeyError::InputTooLarge { maximum, observed } => {
+                    SafeDiagnostic::new(
+                        DiagnosticCode::FileSystemOperation,
+                        DiagnosticStage::WriteBack,
+                        DiagnosticSubject::path(path),
+                        DiagnosticReason::Resource {
+                            resource: "Windows 文件名 UTF-16 单元数".to_owned(),
+                            actual: *observed,
+                            maximum: Some(*maximum),
+                        },
+                        DiagnosticImpact::Unchanged,
+                        DiagnosticAction::ReportBug,
+                    )
+                }
+                WindowsOrdinalCaseKeyError::WindowsApi { phase, source } => SafeDiagnostic::io(
+                    DiagnosticCode::FileSystemOperation,
+                    DiagnosticStage::WriteBack,
+                    DiagnosticSubject::path(path),
+                    "windows_ordinal_case_key",
+                    source,
+                    DiagnosticImpact::Unchanged,
+                    DiagnosticAction::Retry,
+                )
+                .with_recovery(RecoveryFact::component(format!(
+                    "windows_ordinal_case_key_phase={}",
+                    phase.as_str()
+                ))),
+            };
+            ("io", diagnostic)
+        }
+    };
+    TrustedLuaHostCallError::new("filesystem", kind, message, None, Some(Arc::new(error)))
+        .with_safe_diagnostic(diagnostic)
 }
 
 /// Lua WriteBack 在项目交接或 Host 执行边界遇到的失败。

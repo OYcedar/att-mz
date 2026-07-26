@@ -3810,7 +3810,7 @@ mod tests {
                             .to_vec(),
                     ),
                     "data/Map001.json" => Ok(
-                        r#"{"list":[{"code":108,"parameters":["<Quest:第一"]},{"code":408,"parameters":["行>"]},{"code":0,"parameters":[]}]}"#
+                        r#"{"list":[{"code":108,"indent":0,"parameters":["<Quest:第一"]},{"code":408,"indent":0,"parameters":["行>"]},{"code":0,"indent":0,"parameters":[]}]}"#
                             .as_bytes()
                             .to_vec(),
                     ),
