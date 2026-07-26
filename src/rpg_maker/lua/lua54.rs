@@ -1,9 +1,7 @@
 //! 使用专用 OS worker 运行 RPG Maker 可信 Lua 5.4 的生产根适配器。
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
-use std::ffi::CString;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -11,7 +9,6 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -23,14 +20,11 @@ use mlua::{
 };
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, oneshot};
-use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
-
 // 标准快照及其数据库存储分类仍由当前资产适配器提供；Lua VM 与宿主协议本身
 // 已位于共享 RPG Maker 边界，不依赖具体引擎的命令编排。
 use crate::fingerprint::{SHA256_FINGERPRINT_BYTES, Sha256Fingerprint};
@@ -199,10 +193,10 @@ struct RuntimeLifecycle {
     active_jobs: usize,
 }
 
-/// 进程内完整 Lua 5.4 Runtime。
+/// 进程内可信 Lua 5.4 Runtime。
 ///
-/// VM 与全部 Lua 标准库只在专用 OS worker 中存在。SQLite 与 LLM 调用通过
-/// 同步响应桥交回构造本根的 Tokio Runtime 驱动。
+/// VM 与允许的 Lua 标准库只在专用 OS worker 中存在。SQLite 与 LLM 调用通过同步
+/// 响应桥交回构造本根的 Tokio Runtime 驱动。
 pub(crate) struct TrustedLua54Runtime {
     inner: Arc<RuntimeInner>,
 }
@@ -239,8 +233,8 @@ impl TrustedLua54Runtime {
 
     /// 停止新启动，取消正在执行的脚本，并等待 worker 与唯一终结器退出。
     ///
-    /// 可信脚本进入 native C 模块、`os.execute` 或替换调试 hook 后可以长时间不
-    /// 交还控制；本方法不伪造超时成功。
+    /// 可信脚本进入 `os.execute` 或替换调试 hook 后可以长时间不交还控制；本方法
+    /// 不伪造超时成功。
     pub(crate) async fn shutdown(&self) -> Result<(), TrustedLua54RuntimeError> {
         self.inner.request_shutdown();
         loop {
@@ -493,14 +487,11 @@ fn execute_program(
     let script_path = safe_path_identity(program.main_script_path());
     let script_directory = script_directory(program.main_script_path());
 
-    let native_modules = Rc::new(NativeModuleRegistry::default());
-    // SAFETY: 脚本是用户明确选择的完全可信本机程序；契约明确允许 debug、io、os、
-    // require 与本地 C 模块。VM 只在当前专用 worker 线程中创建、使用和销毁。
-    // native_modules 在 lua 之前声明，因此所有动态库一定晚于 VM 和其中的 C Function 释放。
+    // SAFETY: 脚本是用户明确选择的完全可信本机程序；契约明确允许 debug、io、os
+    // 与纯 Lua require。VM 只在当前专用 worker 线程中创建、使用和销毁。
     let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
 
-    if let Err(error) = configure_module_paths(&lua, &script_directory, Rc::clone(&native_modules))
-    {
+    if let Err(error) = configure_module_paths(&lua, &script_directory) {
         return WorkerOutcome::Context(vm_error(
             "configure_module_paths",
             "无法配置 Lua package 路径",
@@ -642,31 +633,22 @@ fn script_directory(path: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-fn configure_module_paths(
-    lua: &Lua,
-    script_directory: &Path,
-    native_modules: Rc<NativeModuleRegistry>,
-) -> mlua::Result<()> {
+fn configure_module_paths(lua: &Lua, script_directory: &Path) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
-    install_unicode_module_searchers(
-        lua,
-        &package,
-        script_directory.to_path_buf(),
-        native_modules,
-    )
+    install_unicode_lua_module_searcher(lua, &package, script_directory.to_path_buf())?;
+    package.set("cpath", Value::Nil)?;
+    package.set("loadlib", Value::Nil)
 }
 
-fn install_unicode_module_searchers(
+fn install_unicode_lua_module_searcher(
     lua: &Lua,
     package: &Table,
     script_directory: PathBuf,
-    native_modules: Rc<NativeModuleRegistry>,
 ) -> mlua::Result<()> {
-    let lua_module_directory = script_directory.clone();
     let lua_searcher = lua.create_function(move |lua, module: mlua::LuaString| {
         let module = strict_module_name(&module)?;
-        let mut candidates = local_lua_module_candidates(&lua_module_directory, &module);
-        candidates.extend(package_candidates(lua, "path", &module)?);
+        let mut candidates = local_lua_module_candidates(&script_directory, &module);
+        candidates.extend(package_lua_candidates(lua, &module)?);
         let mut diagnostics = String::new();
         for candidate in candidates {
             match std::fs::read(&candidate) {
@@ -690,33 +672,11 @@ fn install_unicode_module_searchers(
         )]))
     })?;
 
-    let direct_modules = Rc::clone(&native_modules);
-    let direct_module_directory = script_directory.clone();
-    let direct_c_searcher = lua.create_function(move |lua, module: mlua::LuaString| {
-        let module = strict_module_name(&module)?;
-        let mut candidates = local_native_module_candidates(&direct_module_directory, &module);
-        candidates.extend(package_candidates(lua, "cpath", &module)?);
-        native_module_search(lua, &direct_modules, &module, candidates, false)
-    })?;
-
-    let root_module_directory = script_directory;
-    let root_c_searcher = lua.create_function(move |lua, module: mlua::LuaString| {
-        let module = strict_module_name(&module)?;
-        let Some((root, _)) = module.split_once('.') else {
-            return Ok(MultiValue::new());
-        };
-        let mut candidates = local_native_module_candidates(&root_module_directory, root);
-        candidates.extend(package_candidates(lua, "cpath", root)?);
-        native_module_search(lua, &native_modules, &module, candidates, true)
-    })?;
-
     let current_searchers: Table = package.get("searchers")?;
     let preload: Value = current_searchers.raw_get(1)?;
     let searchers = lua.create_table()?;
     searchers.raw_set(1, preload)?;
     searchers.raw_set(2, lua_searcher)?;
-    searchers.raw_set(3, direct_c_searcher)?;
-    searchers.raw_set(4, root_c_searcher)?;
     package.set("searchers", searchers)
 }
 
@@ -734,190 +694,18 @@ fn local_lua_module_candidates(script_directory: &Path, module: &str) -> Vec<Pat
     vec![direct, script_directory.join(module_path).join("init.lua")]
 }
 
-fn local_native_module_candidates(script_directory: &Path, module: &str) -> Vec<PathBuf> {
-    let mut candidate = script_directory.join(module.replace('.', "\\"));
-    candidate.set_extension("dll");
-    vec![candidate]
-}
-
-fn package_candidates(lua: &Lua, field: &str, module: &str) -> mlua::Result<Vec<PathBuf>> {
+fn package_lua_candidates(lua: &Lua, module: &str) -> mlua::Result<Vec<PathBuf>> {
     let package: Table = lua.globals().get("package")?;
-    let templates: mlua::LuaString = package.get(field)?;
+    let templates: mlua::LuaString = package.get("path")?;
     let templates = templates
         .to_str()
-        .map_err(|_| mlua::Error::runtime(format!("package.{field} 不是 UTF-8 字符串")))?;
+        .map_err(|_| mlua::Error::runtime("package.path 不是 UTF-8 字符串"))?;
     let module_path = module.replace('.', "\\");
     Ok(templates
         .split(';')
         .filter(|template| !template.is_empty())
         .map(|template| PathBuf::from(template.replace('?', &module_path)))
         .collect())
-}
-
-fn native_module_search(
-    lua: &Lua,
-    registry: &NativeModuleRegistry,
-    module: &str,
-    candidates: Vec<PathBuf>,
-    missing_symbol_is_diagnostic: bool,
-) -> mlua::Result<MultiValue> {
-    let mut diagnostics = String::new();
-    for candidate in candidates {
-        match std::fs::metadata(&candidate) {
-            Ok(metadata) if metadata.is_file() => {
-                match registry.load_function(&candidate, module) {
-                    Ok((function, loaded_path)) => {
-                        // SAFETY: load_function 只返回仍由 registry 持有的 HMODULE 中、
-                        // 按 Lua 5.4 luaopen_* 契约解析出的入口；本能力只运行用户明确
-                        // 信任的本机模块，且 registry 的寿命覆盖 VM。
-                        let loader = unsafe { lua.create_c_function(function) }?;
-                        let loaded_path = safe_path_identity(&loaded_path);
-                        return Ok(MultiValue::from_vec(vec![
-                            Value::Function(loader),
-                            Value::String(lua.create_string(&loaded_path)?),
-                        ]));
-                    }
-                    Err(NativeModuleLoadError::MissingSymbol { path, .. })
-                        if missing_symbol_is_diagnostic =>
-                    {
-                        use std::fmt::Write as _;
-                        let path = safe_path_identity(&path);
-                        let _ = write!(diagnostics, "\n\tno module '{module}' in file '{path}'");
-                        return Ok(MultiValue::from_vec(vec![Value::String(
-                            lua.create_string(diagnostics)?,
-                        )]));
-                    }
-                    Err(error) => return Err(mlua::Error::runtime(error.to_string())),
-                }
-            }
-            Ok(_) => {
-                use std::fmt::Write as _;
-                let path = safe_path_identity(&candidate);
-                let _ = write!(diagnostics, "\n\tno file '{path}' (not a regular file)");
-            }
-            Err(error) => {
-                use std::fmt::Write as _;
-                let path = safe_path_identity(&candidate);
-                let _ = write!(diagnostics, "\n\tno file '{path}' ({error})");
-            }
-        }
-    }
-    Ok(MultiValue::from_vec(vec![Value::String(
-        lua.create_string(diagnostics)?,
-    )]))
-}
-
-#[derive(Default)]
-struct NativeModuleRegistry {
-    handles: RefCell<HashMap<PathBuf, HMODULE>>,
-}
-
-impl NativeModuleRegistry {
-    fn load_function(
-        &self,
-        path: &Path,
-        module: &str,
-    ) -> Result<(mlua::lua_CFunction, PathBuf), NativeModuleLoadError> {
-        let path = std::fs::canonicalize(path).map_err(|source| NativeModuleLoadError::Load {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-        let handle = if let Some(handle) = self.handles.borrow().get(&path).copied() {
-            handle
-        } else {
-            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-            if wide.contains(&0) {
-                return Err(NativeModuleLoadError::InvalidPath);
-            }
-            wide.push(0);
-            // SAFETY: wide 是以 NUL 结尾且在调用期间有效的 UTF-16 路径；调用方只
-            // 允许完全可信的本机模块。成功返回的 HMODULE 被本 registry 唯一持有，
-            // 并在 VM 完全销毁后释放。
-            let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
-            if handle.is_null() {
-                return Err(NativeModuleLoadError::Load {
-                    path,
-                    source: io::Error::last_os_error(),
-                });
-            }
-            self.handles.borrow_mut().insert(path.clone(), handle);
-            handle
-        };
-
-        let symbols = native_module_symbols(module);
-        for symbol in &symbols {
-            let symbol_name = CString::new(symbol.as_str()).map_err(|_| {
-                NativeModuleLoadError::InvalidSymbol {
-                    module: module.to_owned(),
-                }
-            })?;
-            // SAFETY: handle 是本 registry 仍持有的可信模块 HMODULE；symbol_name
-            // 是 NUL 结尾且在调用期间有效的 ASCII/UTF-8 导出名。
-            let address = unsafe { GetProcAddress(handle, symbol_name.as_ptr().cast()) };
-            if let Some(address) = address {
-                // SAFETY: 仅支持 x86_64-pc-windows-msvc，该平台 system 与 C 调用约定
-                // 相同；用户信任的 luaopen_* 导出按 Lua C API 接受 lua_State 并返回
-                // 结果数量，且其 HMODULE 在整个 VM 生命周期内保持有效。
-                let function = unsafe {
-                    std::mem::transmute::<unsafe extern "system" fn() -> isize, mlua::lua_CFunction>(
-                        address,
-                    )
-                };
-                return Ok((function, path));
-            }
-        }
-        Err(NativeModuleLoadError::MissingSymbol { path, symbols })
-    }
-}
-
-impl Drop for NativeModuleRegistry {
-    fn drop(&mut self) {
-        for (_, handle) in self.handles.get_mut().drain() {
-            // SAFETY: 每个 handle 都来自一次成功的 LoadLibraryW，只在此处释放一次；
-            // registry 的 drop 晚于 Lua VM，因此已不存在引用这些导出的 Lua Function。
-            // FreeLibrary 触发的可信模块卸载代码也在其最后有效引用消失后运行。
-            let _ = unsafe { FreeLibrary(handle) };
-        }
-    }
-}
-
-fn native_module_symbols(module: &str) -> Vec<String> {
-    let normalized = module.replace('.', "_");
-    match normalized.split_once('-') {
-        Some((prefix, suffix)) => vec![format!("luaopen_{prefix}"), format!("luaopen_{suffix}")],
-        None => vec![format!("luaopen_{normalized}")],
-    }
-}
-
-enum NativeModuleLoadError {
-    InvalidPath,
-    InvalidSymbol { module: String },
-    Load { path: PathBuf, source: io::Error },
-    MissingSymbol { path: PathBuf, symbols: Vec<String> },
-}
-
-impl fmt::Display for NativeModuleLoadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidPath => formatter.write_str("Lua C 模块路径包含 NUL"),
-            Self::InvalidSymbol { module } => {
-                write!(formatter, "Lua C 模块名无法形成导出符号：{module}")
-            }
-            Self::Load { path, source } => {
-                let path = safe_path_identity(path);
-                write!(formatter, "无法加载 Lua C 模块 {path}：{source}")
-            }
-            Self::MissingSymbol { path, symbols } => {
-                let path = safe_path_identity(path);
-                write!(
-                    formatter,
-                    "Lua C 模块 {path} 缺少导出符号 {}",
-                    symbols.join(" 或 ")
-                )
-            }
-        }
-    }
 }
 
 fn build_context(
@@ -3964,10 +3752,10 @@ fn lua_value_description(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
-    use std::process::Command;
     use std::time::Duration;
 
     use crate::rpg_maker::ProjectName;
@@ -6292,7 +6080,7 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn in_memory_main_and_local_module_support_an_unpaired_surrogate_parent() {
+    async fn in_memory_main_and_pure_lua_module_support_an_unpaired_surrogate_parent() {
         let directory = tempfile::tempdir().unwrap();
         let script_directory = directory.path().join(OsString::from_wide(&[0xD800]));
         std::fs::create_dir(&script_directory).unwrap();
@@ -6307,6 +6095,9 @@ local source = debug.getinfo(1, "S").source
 assert(string.find(source, "@att-utf16-", 1, true) == 1)
 assert(string.find(source, "D800", 1, true) ~= nil)
 assert(string.find(source, "%c") == nil)
+assert(#package.searchers == 2)
+assert(package.cpath == nil)
+assert(package.loadlib == nil)
 local value, loader = require("local_helper")
 assert(value.value == "loaded")
 assert(string.find(loader, "D800", 1, true) ~= nil)
@@ -6327,98 +6118,6 @@ assert(string.find(loader, "D800", 1, true) ~= nil)
 
         report.into_parts().0.unwrap();
         runtime.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn native_module_symbols_follow_lua54_name_rules() {
-        assert_eq!(native_module_symbols("plain"), ["luaopen_plain"]);
-        assert_eq!(native_module_symbols("root.child"), ["luaopen_root_child"]);
-        assert_eq!(
-            native_module_symbols("versioned-v1.child"),
-            ["luaopen_versioned", "luaopen_v1_child"]
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn require_loads_native_modules_from_an_unpaired_surrogate_directory() {
-        let directory = tempfile::tempdir().unwrap();
-        let build_directory = directory.path().join("build");
-        std::fs::create_dir(&build_directory).unwrap();
-        let library = compile_test_native_module(&build_directory);
-        let module_directory = directory.path().join(OsString::from_wide(&[0xD800]));
-        std::fs::create_dir(&module_directory).unwrap();
-        for name in [
-            "unicode_native.dll",
-            "root.dll",
-            "versioned-v1.dll",
-            "wrong_symbol.dll",
-        ] {
-            std::fs::copy(&library, module_directory.join(name)).unwrap();
-        }
-
-        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
-        let script = r#"
-assert(#package.searchers == 4)
-local unicode_native, native_loader = require("unicode_native")
-assert(unicode_native == true)
-assert(string.find(native_loader, "D800", 1, true) ~= nil)
-assert(require("root.child") == true)
-assert(require("versioned-v1") == true)
-local ok, error = pcall(require, "wrong_symbol")
-assert(not ok)
-assert(string.find(tostring(error), "luaopen_wrong_symbol", 1, true))
-assert(string.find(tostring(error), "D800", 1, true))
-"#;
-        let report = runtime
-            .start(
-                OwnedLuaProgram::new(
-                    module_directory.join("main.lua"),
-                    script.as_bytes().to_vec(),
-                ),
-                test_bindings(
-                    None,
-                    Arc::new(Mutex::new(TestObservations::default())),
-                    Arc::new(Mutex::new(Vec::new())),
-                    None,
-                ),
-            )
-            .await;
-        report.into_parts().0.unwrap();
-        runtime.shutdown().await.unwrap();
-    }
-
-    fn compile_test_native_module(directory: &Path) -> PathBuf {
-        let source = directory.join("fixture.rs");
-        std::fs::write(
-            &source,
-            r#"
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn luaopen_unicode_native(_: *mut core::ffi::c_void) -> i32 { 0 }
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn luaopen_root_child(_: *mut core::ffi::c_void) -> i32 { 0 }
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn luaopen_versioned(_: *mut core::ffi::c_void) -> i32 { 0 }
-"#,
-        )
-        .unwrap();
-        let library = directory.join("unicode_native.dll");
-        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-        let output = Command::new(rustc)
-            .arg("--edition=2024")
-            .arg("--crate-type=cdylib")
-            .arg(&source)
-            .arg("-o")
-            .arg(&library)
-            .output()
-            .expect("测试环境必须能启动 rustc");
-        assert!(
-            output.status.success(),
-            "无法编译 Lua C 测试模块：{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        library
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
