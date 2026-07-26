@@ -4,8 +4,9 @@
 WriteBack 的阶段扩展，也可由独立的一次性项目命令执行；Init 没有 Lua。可复制的完整
 协议见 [Lua Cookbook](lua-cookbook.md)和 [`examples/`](examples/README.md)。
 
-“可信”不是沙箱：脚本拥有完整 Lua 标准库，并按 ATT 进程的操作系统权限运行。`ctx`
-提供的是与冻结来源、翻译语义、SQLite 和未发布候选相连的受管门面，不是唯一访问路径。
+“可信”不是沙箱：除本机动态模块装载入口外，脚本拥有 Lua 5.4 标准库，并按 ATT
+进程的操作系统权限运行。`ctx` 提供的是与冻结来源、翻译语义、SQLite 和未发布候选
+相连的受管门面，不是唯一访问路径。
 
 本文所有代码块前使用 `<!-- att-example: valid|invalid|illustrative -->`：valid 是当前 API
 可用代码，invalid 是必须失败的反例，illustrative 只展示形状或数据。
@@ -29,7 +30,7 @@ WriteBack；复杂跨文档/多目标插件由 Lua 自己拥有三阶段身份�
 路径。显式提供非空 `--lua` 时精确替换该阶段快照；省略 `--lua` 时，仅在上次成功运行
 方案启用了 Lua 的情况下复用；零字节文件显式清除该阶段主程序。自动复用执行数据库中的
 正文，不重新读取原文件；保存路径只用于 chunk 名、`require` 搜索目录和诊断。主程序通过
-`require`、`io`、`os` 或本机模块动态读取的模块、文件和进程仍是外部依赖，不纳入快照。
+`require`、`io` 或 `os` 动态读取的纯 Lua 模块、文件和进程仍是外部依赖，不纳入快照。
 
 清除语义按阶段区分：Extract 同时停用 Lua owner、删除其标准资产，并从后续自动方案中
 移除 Lua；Translate 与 WriteBack 只清除各自主程序，不猜测或删除 Lua 私有数据库状态。
@@ -56,9 +57,9 @@ att --config FILE mz lua --name NAME [--profile PROFILE_ID] SCRIPT_LUA [-- ARG..
 - 只有持久数据库表、冻结来源、标准资产或已发布文件能跨阶段交接；
 - Extract、Translate、WriteBack 即使保存了同一路径，也不能依赖前一 VM 的内存。
 
-主程序目录加入当前 VM 的 `package.path`/`package.cpath`；进程 cwd 不改变。`require`、
-`io`、`os`、`debug` 与 Lua 5.4 本机模块开放。直接 I/O/进程/本机模块不自动进入 ATT 的
-受管路径、取消、事务或候选发布协议。
+纯 Lua `require` 依次搜索主程序目录和当前 VM 的 `package.path`；进程 cwd 不改变。
+`package.cpath` 和 `package.loadlib` 不公开，ATT 不装载本机 C 模块。`io`、`os` 与
+`debug` 开放；直接 I/O 和进程不自动进入 ATT 的受管路径、取消、事务或候选发布协议。
 
 <!-- att-example: illustrative -->
 ```lua
@@ -655,7 +656,7 @@ kind。ATT 不按 Lua VM 内存、Host 值字节、节点、深度、错误文�
 提前拒绝；真实分配、地址空间、文件系统、SQLite 或格式失败按其实际 domain/kind 报告。
 
 取消是合作式。Host 调用到达现实副作用后等待明确终态；脚本可捕获取消，但 VM 返回边界
-再次观察。完整标准库、本机模块、`os.execute`/`os.exit` 不受同等抢占保证。
+再次观察。`os.execute`/`os.exit` 和被脚本替换的调试 hook 不受同等抢占保证。
 
 失败后的现实状态必须按副作用判断：活动 SQLite 事务由终结器尝试回滚；已提交 SQL 和
 已发送 LLM 请求保持；Extract 内存意图只在干净终结后提交；WriteBack 受管修改随候选

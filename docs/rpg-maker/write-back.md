@@ -128,9 +128,9 @@ ScrollingText 的块级 mutation 覆盖完整 `105 + 405*`。模型必须返回�
 Lua 使用严格逻辑 `data/...` 与 `js/...` 访问候选；只接受 `/`，拒绝反斜杠、空段、点段、
 重复/尾随分隔符、冒号和控制字符，并逐字核对目录项大小写。MV Host 在边界映射到候选的
 `www/`，MZ 直接映射到顶层；脚本从不使用逻辑 `www/...`。`ctx` 不提供受管的 validate、discard 或 publish 接口；通过 `ctx.output`
-进行的编辑只作用于本次未发布候选。可信 Lua 仍有完整标准库，直接执行文件系统或进程
-操作不属于 ATT 的候选发布契约。Lua 显式提交的数据库事务不随 candidate discard 回滚，
-因此脚本必须自己拥有这类副作用的协议。
+进行的编辑只作用于本次未发布候选。可信 Lua 仍有除本机动态模块装载入口外的 Lua 5.4
+标准库；直接执行文件系统或进程操作不属于 ATT 的候选发布契约。Lua 显式提交的数据库
+事务不随 candidate discard 回滚，因此脚本必须自己拥有这类副作用的协议。
 
 每次 WriteBack 使用新 Lua VM 和新 SQLite 连接；globals、TEMP 表和连接状态不从 Extract
 或 Translate 继承。没有发布后回调。脚本必须以冻结来源、当前候选和持久私有状态重建

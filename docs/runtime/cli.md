@@ -150,8 +150,8 @@ Translate 同时消费 `[rpg_maker]` 中可省略的 `record_translation_tasks`�
 全局 `arg[1..]`，`arg[0]` 是解析后的脚本路径；任一参数不能表示为 UTF-8 时在运行脚本前
 明确失败。
 
-独立程序拥有完整可信 Lua 5.4 和公共项目接口。它可通过 `ctx.standard.open()` 打开由
-Standard 核心拥有的人工候选会话，但不会发送 LLM 请求：
+独立程序拥有可信 Lua 5.4 标准库（不含本机动态模块装载入口）和公共项目接口。它可通过
+`ctx.standard.open()` 打开由 Standard 核心拥有的人工候选会话，但不会发送 LLM 请求：
 
 - 显式 `--profile` 在当前配置中精确选择，ID 不存在时失败；
 - 未显式选择时，`open()` 才读取上次成功 Translate 保存的 Profile；项目没有可复用 ID，
