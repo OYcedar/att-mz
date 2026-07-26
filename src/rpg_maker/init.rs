@@ -1351,6 +1351,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -1359,6 +1360,9 @@ mod tests {
     type SnapshotDatabaseResponses = VecDeque<Result<(), SnapshotDatabaseError<FakeError>>>;
     use crate::fingerprint::Sha256Fingerprint;
     use crate::rpg_maker::project_database::{ProjectDatabaseReconciliation, ProjectDatabaseState};
+    use crate::runtime::filesystem::{
+        DirectoryPublisherConfig, SystemFileSystem, SystemFileSystemConfig,
+    };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -1437,6 +1441,13 @@ mod tests {
         Io,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PreservationFailure {
+        List,
+        Read,
+        Edit,
+    }
+
     #[derive(Clone)]
     struct FakeWorkspaceFileSystem {
         observations: Observations,
@@ -1445,6 +1456,7 @@ mod tests {
         workspace_structure: WorkspaceStructureObservation,
         existing_source: ExistingSourceObservation,
         candidate_fingerprint: [u8; 32],
+        preservation_failure: Option<PreservationFailure>,
     }
 
     impl DirectChildDirectoryEnsurer for FakeWorkspaceFileSystem {
@@ -1645,9 +1657,24 @@ mod tests {
             if path == Path::new("C:/projects/mz/game/logs")
                 || path == Path::new("C:/projects/mz/game/task-records")
             {
-                // 保留复制走显式栈遍历;默认夹具的可观测性目录为空即可
-                // 证明"保留步骤被执行且不失败"。
                 self.observations.event("list_preserved");
+                if path.ends_with("logs") {
+                    if matches!(self.preservation_failure, Some(PreservationFailure::List)) {
+                        return Err(ListDirectoryError::Io {
+                            path,
+                            source: FakeError("preserve list"),
+                        });
+                    }
+                    if matches!(
+                        self.preservation_failure,
+                        Some(PreservationFailure::Read | PreservationFailure::Edit)
+                    ) {
+                        return Ok(vec![DirectoryEntry::new(
+                            path.join("run.bin"),
+                            DirectoryEntryKind::RegularFile,
+                        )]);
+                    }
+                }
                 return Ok(Vec::new());
             }
             if path == Path::new("C:/projects/mz/game/write_back") {
@@ -1822,6 +1849,7 @@ mod tests {
     struct FakePublisher {
         observations: Observations,
         discard_error: Arc<Mutex<Option<FakeError>>>,
+        preservation_failure: Option<PreservationFailure>,
     }
 
     impl FileReader for FakeWorkspaceFileSystem {
@@ -1831,7 +1859,18 @@ mod tests {
             &self,
             path: PathBuf,
         ) -> Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>> {
-            // 保留复制场景由专用夹具覆盖;默认夹具不含可保留文件。
+            if path == Path::new("C:/projects/mz/game/logs/run.bin") {
+                if matches!(self.preservation_failure, Some(PreservationFailure::Read)) {
+                    return Err(ReadFileError::Io {
+                        path,
+                        source: FakeError("preserve read"),
+                    });
+                }
+                return Ok(crate::storage::file_system::ReadFile::new(
+                    path,
+                    vec![0, 0xff, 0x7f],
+                ));
+            }
             Err(ReadFileError::NotFound { path })
         }
     }
@@ -1844,7 +1883,7 @@ mod tests {
         fn bind_scoped_directory(
             &self,
             candidate: &StagedDirectory<Self::CandidateState>,
-            _scope: ScopedDirectoryScope,
+            scope: ScopedDirectoryScope,
         ) -> impl std::future::Future<
             Output = Result<
                 crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
@@ -1857,7 +1896,7 @@ mod tests {
             async move {
                 Ok(crate::storage::file_system::BoundScopedDirectory::new(
                     root,
-                    ScopedDirectoryScope::new([OsString::from("logs")]).expect("测试范围应合法"),
+                    scope,
                     (),
                 ))
             }
@@ -1906,10 +1945,16 @@ mod tests {
         async fn write_scoped_file(
             &self,
             _scope: &crate::storage::file_system::BoundScopedDirectory<Self::ScopeState>,
-            _path: ScopedDirectoryPath,
+            path: ScopedDirectoryPath,
             _bytes: Vec<u8>,
         ) -> Result<(), ScopedDirectoryEditError<Self::Error>> {
             self.observations.event("preserve_file");
+            if matches!(self.preservation_failure, Some(PreservationFailure::Edit)) {
+                return Err(ScopedDirectoryEditError::Failed {
+                    path: path.as_path().to_path_buf(),
+                    source: FakeError("preserve write"),
+                });
+            }
             Ok(())
         }
 
@@ -2070,10 +2115,12 @@ mod tests {
                     workspace_structure,
                     existing_source,
                     candidate_fingerprint: [candidate_fingerprint; 32],
+                    preservation_failure: None,
                 },
                 FakePublisher {
                     observations: observations.clone(),
                     discard_error: Arc::new(Mutex::new(None)),
+                    preservation_failure: None,
                 },
                 CooperativeCancellation::default(),
             )
@@ -2585,6 +2632,227 @@ mod tests {
                 "候选必须为保留目录 {preserved} 建立空目录根"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn real_filesystem_preserves_nested_empty_zero_binary_and_unicode_observability_entries()
+    {
+        let temporary = tempfile::tempdir().expect("应建立真实文件系统临时目录");
+        let workspace = temporary.path().join("existing-workspace");
+        let logs = workspace.join("logs");
+        let task_records = workspace.join("task-records");
+        fs::create_dir_all(logs.join("nested/空目录")).expect("应建立嵌套空日志目录");
+        fs::create_dir_all(task_records.join("人工补译")).expect("应建立 Unicode 审计目录");
+        fs::write(logs.join("empty.jsonl"), []).expect("应建立零字节日志");
+        let binary = [0, 0xff, 0x7f, 0x80, b'\n'];
+        fs::write(logs.join("nested/raw.bin"), binary).expect("应建立二进制日志");
+        let unicode_bytes = "人工补译记录\n".as_bytes();
+        fs::write(task_records.join("人工补译/任务一.md"), unicode_bytes)
+            .expect("应建立 Unicode 审计文件");
+
+        let seed = temporary.path().join("seed");
+        fs::create_dir(&seed).expect("应建立候选种子目录");
+        let target = temporary.path().join("target");
+        let file_system =
+            SystemFileSystem::new(SystemFileSystemConfig::production()).expect("应建立文件系统根");
+        let publisher = file_system.directory_publisher(
+            DirectoryPublisherConfig::production(temporary.path().join("locks"))
+                .expect("锁目录配置应合法"),
+        );
+        let request = DirectoryStageRequest::new(
+            target.clone(),
+            DirectoryPublishIntent::CreateNew,
+            vec![
+                DirectorySourceMapping::new(seed, PathBuf::from("seed"))
+                    .expect("候选种子映射应合法"),
+            ],
+            Vec::new(),
+            PRESERVED_OBSERVABILITY_DIRECTORIES
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+        )
+        .expect("候选请求应合法");
+        let staged = publisher.prepare(request).await.expect("应准备真实候选");
+        let staging_root = staged.staging_root().to_path_buf();
+        let scope = ScopedDirectoryScope::new(
+            PRESERVED_OBSERVABILITY_DIRECTORIES
+                .iter()
+                .map(OsString::from),
+        )
+        .expect("保留范围应合法");
+        let bound = publisher
+            .bind_scoped_directory(&staged, scope)
+            .await
+            .expect("应绑定真实候选范围");
+
+        preserve_observability_directories(
+            &file_system,
+            &publisher,
+            &workspace,
+            &bound,
+            &PRESERVED_OBSERVABILITY_DIRECTORIES,
+        )
+        .await
+        .expect("真实可观测性目录应逐字节搬入候选");
+
+        assert!(staging_root.join("logs/nested/空目录").is_dir());
+        assert!(staging_root.join("task-records/人工补译").is_dir());
+        assert_eq!(
+            fs::read(staging_root.join("logs/empty.jsonl")).expect("候选零字节日志应可读"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            fs::read(staging_root.join("logs/nested/raw.bin")).expect("候选二进制日志应可读"),
+            binary
+        );
+        assert_eq!(
+            fs::read(staging_root.join("task-records/人工补译/任务一.md"))
+                .expect("候选 Unicode 审计文件应可读"),
+            unicode_bytes
+        );
+        assert_eq!(
+            fs::read(logs.join("nested/raw.bin")).expect("原工作区二进制日志应保持可读"),
+            binary,
+            "保留步骤只能复制，不能修改原工作区"
+        );
+
+        publisher.discard(staged).await.expect("应丢弃测试候选");
+        assert!(!staging_root.exists(), "discard 应移除候选");
+        assert!(!target.exists(), "未 publish 不得建立目标");
+        assert_eq!(
+            fs::read(task_records.join("人工补译/任务一.md"))
+                .expect("discard 后原审计文件仍应可读"),
+            unicode_bytes
+        );
+        file_system.shutdown().await.expect("文件系统根应终结");
+    }
+
+    #[tokio::test]
+    async fn observability_list_read_and_write_failures_discard_once_without_publish() {
+        for failure in [
+            PreservationFailure::List,
+            PreservationFailure::Read,
+            PreservationFailure::Edit,
+        ] {
+            let current = database_state(0x33, Vec::new());
+            let updated = database_state(0x44, Vec::new());
+            let (mut service, observations) = service(
+                true,
+                WorkspaceStructureObservation::ObservabilityDirectories,
+                ExistingSourceObservation::Fingerprint([0x33; 32]),
+                0x44,
+                Ok(current),
+                Ok(ProjectDatabaseReconciliation::for_test(updated)),
+                Ok(()),
+            );
+            service.file_system.preservation_failure = Some(failure);
+            service.directories.preservation_failure = Some(failure);
+
+            let error = match service.converge(request()).await {
+                Err(error) => error,
+                Ok(_) => panic!("{failure:?} 保留失败不得 publish"),
+            };
+
+            let ProjectWorkspaceConvergenceError::PreserveObservability {
+                failure: primary,
+                discard,
+            } = error
+            else {
+                panic!("{failure:?} 应保留为可观测性搬运失败")
+            };
+            assert!(discard.is_none(), "候选清理成功时不得伪造相关失败");
+            match failure {
+                PreservationFailure::List => assert!(matches!(
+                    primary,
+                    PreserveObservabilityFailure::List {
+                        source: ListDirectoryError::Io {
+                            source: FakeError("preserve list"),
+                            ..
+                        },
+                        ..
+                    }
+                )),
+                PreservationFailure::Read => assert!(matches!(
+                    primary,
+                    PreserveObservabilityFailure::Read {
+                        source: ReadFileError::Io {
+                            source: FakeError("preserve read"),
+                            ..
+                        },
+                        ..
+                    }
+                )),
+                PreservationFailure::Edit => assert!(matches!(
+                    primary,
+                    PreserveObservabilityFailure::Edit {
+                        source: ScopedDirectoryEditError::Failed {
+                            source: FakeError("preserve write"),
+                            ..
+                        },
+                        ..
+                    }
+                )),
+            }
+            let events = observations.events();
+            assert_eq!(
+                events.iter().filter(|event| **event == "discard").count(),
+                1,
+                "{failure:?} 后候选必须且只能 discard 一次"
+            );
+            assert!(!events.contains(&"publish"), "{failure:?} 后不得 publish");
+            assert!(
+                !events.contains(&"snapshot_database"),
+                "{failure:?} 后不得继续修改候选数据库"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn observability_primary_and_discard_failures_are_both_preserved() {
+        let current = database_state(0x33, Vec::new());
+        let updated = database_state(0x44, Vec::new());
+        let (mut service, observations) = service(
+            true,
+            WorkspaceStructureObservation::ObservabilityDirectories,
+            ExistingSourceObservation::Fingerprint([0x33; 32]),
+            0x44,
+            Ok(current),
+            Ok(ProjectDatabaseReconciliation::for_test(updated)),
+            Ok(()),
+        );
+        service.file_system.preservation_failure = Some(PreservationFailure::Read);
+        *service
+            .directories
+            .discard_error
+            .lock()
+            .expect("discard error mutex should not be poisoned") = Some(FakeError("discard"));
+
+        let error = service
+            .converge(request())
+            .await
+            .expect_err("保留与候选清理双重失败必须同时返回");
+
+        assert!(matches!(
+            error,
+            ProjectWorkspaceConvergenceError::PreserveObservability {
+                failure: PreserveObservabilityFailure::Read {
+                    source: ReadFileError::Io {
+                        source: FakeError("preserve read"),
+                        ..
+                    },
+                    ..
+                },
+                discard: Some(ref discard),
+            } if discard.source() == &FakeError("discard")
+                && discard.staging_root() == Path::new("C:/projects/.game-stage")
+        ));
+        let events = observations.events();
+        assert_eq!(
+            events.iter().filter(|event| **event == "discard").count(),
+            1
+        );
+        assert!(!events.contains(&"publish"));
     }
 
     #[tokio::test]
