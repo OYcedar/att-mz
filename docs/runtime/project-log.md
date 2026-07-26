@@ -104,12 +104,11 @@ CLI 与 JSONL 消费同一份 `SafeDiagnostic`。每个 primary 和 related fail
 
 ## 5. 内容与凭据边界
 
-现行敏感信息闭集只有本次实际选中 LLM Client 的 API key 实际值。普通 JSONL、CLI、
-Debug、安全诊断和任务记录都不得显示该值。任务记录按现行规格精确替换正文中与 API key
-相同的片段；普通 JSONL、CLI 与 Debug 则继续只消费其职责所需的稳定结构化摘要，不复制
-完整 Prompt/messages、模型正文、原文、译文、Lua VM 任意正文、SQL/参数或 panic
-payload。这些摘要边界用于维持稳定 schema、控制体积和控制字符，不把未复制的内容重新
-定义为敏感信息。
+项目日志严格采用
+[Chat Completions 运行根规格规定的敏感信息闭集与替换契约](chat-completions.md#6-敏感信息闭集唯一权威)，
+不得在日志域另行定义或扩大清单。普通 JSONL、CLI 与 Debug 只消费职责所需的稳定结构化
+摘要，不复制完整模型任务正文、Lua VM 任意正文、SQL/参数或 panic payload；这些摘要
+边界用于维持稳定 schema、控制体积和控制字符，不构成新的敏感性分类。
 
 必须保留并清理控制字符后输出安全的路径、字段、阶段、计数、配置值、HTTP 状态、
 `Retry-After`、供应商稳定 code/type、SQLite primary/extended code、OS 错误码、事务与

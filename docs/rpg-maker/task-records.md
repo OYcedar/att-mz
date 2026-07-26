@@ -155,27 +155,16 @@ Complete 或 Partial 只有在对应事务确认成功后才能成立。提交�
 0 处”或暗示项目未改变。一个任务已经确认提交后，不会因后续 Result Store 会话关闭、
 Translate Lua、运行方案保存或运行级收尾失败而改写任务终态；这些仍是运行级诊断。
 
-## 6. 唯一敏感信息与精确替换
+## 6. 敏感信息与精确替换
 
-现行敏感信息闭集只有：**本次实际选中 LLM Client 的 API key 实际值**。Prompt、原文、
-译文、自定义参数、Thinking、Assistant、Provider 正文和用户内容不因内容类别成为敏感
-信息。
-
-任务记录建立时使用同一个 API-key 替换器，递归处理 Endpoint query、自定义参数键和值、
-System、User、输入历史 Assistant、Thinking、输出 Assistant、Provider 标识和任务诊断。
-凡与 API key 实际值精确匹配的文本片段替换为：
-
-```text
-[REDACTED API KEY]
-```
-
-替换只作用于 key 本身，不删除所在字段、段落或正文。API key 配置字段本身完全不进入
-任务文档。`Authorization` 不是第二类敏感信息；任务记录不采集 HTTP Header。诊断确需
-说明认证时只保留字段名与认证方案，不显示承载的 key。
+任务记录严格采用
+[Chat Completions 运行根规格规定的敏感信息闭集与精确替换契约](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)，
+不得在任务记录域另行定义或扩大清单。所有可读字段都在渲染前应用该契约；任务记录不
+采集 HTTP Header，替换也不得删除命中值以外的字段、段落或相邻正文。
 
 普通 CLI、JSONL 与 Debug 继续消费职责边界提供的稳定结构化投影，不遍历任意错误链、
 复制大段正文或任意控制字符。这里的限制服务于职责、稳定 schema、可读体积和输出边界，
-不表示 API key 之外的正文被重新定义为敏感信息。
+不构成新的敏感性分类。
 
 ## 7. 非权威写入语义
 
