@@ -75,6 +75,7 @@ const LOG_DEGRADED_WARNING: &str = "项目日志不可用或已降级；命令�
 const TASK_RECORDS_DEGRADED_WARNING: &str =
     "翻译任务记录不可用或已降级；命令会继续，退出状态不受影响。";
 const SAFE_STOPPING_PROGRESS: &str = "正在安全停止；保留最后确认进度";
+const SAVE_RUN_PLAN_PROGRESS: &str = "正在保存成功运行方案";
 
 #[test]
 fn broken_stdout_changes_successful_command_terminal_log_to_failure() {
@@ -785,6 +786,183 @@ fn project_log_startup_failure_never_changes_success_or_cancellation_outcome() {
     assert!(!cancelled_stderr.contains('\r'));
     assert!(!cancelled_stderr.contains('\u{001b}'));
     assert_translation_absent(&database);
+}
+
+#[test]
+fn extract_and_write_back_ctrl_break_cancel_without_state_or_candidate_residue() {
+    let temporary = tempfile::tempdir().expect("应可建立真实取消矩阵测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir(root.join("projects")).expect("项目根应可建立");
+    fs::create_dir_all(root.join("prompts/rpg_maker")).expect("提示词根应可建立");
+    fs::create_dir(root.join("scripts")).expect("Lua 夹具目录应可建立");
+    write_minimal_mz_game(&game_root);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), EMPTY_PARAMETERS);
+    assert_success(
+        "真实取消矩阵 Init",
+        &run_att(root, mz_init_arguments(&game_root)),
+    );
+
+    let workspace = root.join("projects/mz").join(PROJECT);
+    let database = workspace.join("project.db");
+    let logs_root = workspace.join("logs");
+    let extract_marker = root.join("extract-cancel-ready");
+    write_cancellable_extract_lua(root);
+    let extract_state_before = read_saved_phase_plan_snapshot(&database);
+    assert_no_directory_publish_artifacts(root);
+
+    let extract_child = spawn_observable_att_in_new_process_group(
+        root,
+        arguments(&["mz", "extract", "--name", PROJECT, "--lua", EXTRACT_LUA]),
+    )
+    .wait_until_fixture_marker(&extract_marker);
+    send_ctrl_break(&extract_child, "Extract");
+    let cancelled_extract = extract_child.wait_until_safe_stopping().wait_for_output();
+    assert_cooperatively_cancelled("Extract", &cancelled_extract);
+    assert_eq!(
+        read_saved_phase_plan_snapshot(&database),
+        extract_state_before,
+        "取消的 Extract 不得保存运行方案或改变其他阶段方案"
+    );
+    assert_database_table_absent(&database, "extract_cancel_probe");
+    assert_no_directory_publish_artifacts(root);
+    assert_cancelled_project_log(&logs_root, "extract");
+
+    assert_success(
+        "取消后正常 Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+    let running_server = server.start_with_responses(vec![ChatResponseFixture::Standard]);
+    assert_success(
+        "WriteBack 取消前 Translate",
+        &run_att(
+            root,
+            arguments(&["mz", "translate", "--name", PROJECT, PROFILE]),
+        ),
+    );
+    assert_eq!(running_server.finish().len(), 1);
+
+    let output_before = snapshot_directory_tree(&workspace.join("write_back"));
+    let write_back_state_before = read_saved_phase_plan_snapshot(&database);
+    let write_back_marker = root.join("write-back-cancel-ready");
+    write_cancellable_write_back_lua(root);
+    let write_back_child = spawn_observable_att_in_new_process_group(
+        root,
+        arguments(&[
+            "mz",
+            "write-back",
+            "--name",
+            PROJECT,
+            "--lua",
+            WRITE_BACK_LUA,
+        ]),
+    )
+    .wait_until_fixture_marker(&write_back_marker);
+    assert!(
+        !directory_publish_artifacts(root).is_empty(),
+        "WriteBack Lua 开始后必须存在尚未发布的真实候选，测试才能证明取消清理"
+    );
+    send_ctrl_break(&write_back_child, "WriteBack");
+    let cancelled_write_back = write_back_child
+        .wait_until_safe_stopping()
+        .wait_for_output();
+    assert_cooperatively_cancelled("WriteBack", &cancelled_write_back);
+    assert_eq!(
+        snapshot_directory_tree(&workspace.join("write_back")),
+        output_before,
+        "取消的 WriteBack 不得改变已发布输出目录"
+    );
+    assert_eq!(
+        read_saved_phase_plan_snapshot(&database),
+        write_back_state_before,
+        "取消的 WriteBack 不得保存运行方案或改变其他阶段方案"
+    );
+    assert_database_table_absent(&database, "write_back_cancel_probe");
+    assert_no_directory_publish_artifacts(root);
+    assert_cancelled_project_log(&logs_root, "write-back");
+}
+
+#[test]
+fn signal_during_run_plan_save_preserves_completed_extract_outcome() {
+    let temporary = tempfile::tempdir().expect("应可建立完成后信号测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir(root.join("projects")).expect("项目根应可建立");
+    fs::create_dir_all(root.join("prompts/rpg_maker")).expect("提示词根应可建立");
+    fs::create_dir(root.join("scripts")).expect("Lua 夹具目录应可建立");
+    write_minimal_mz_game(&game_root);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), EMPTY_PARAMETERS);
+    assert_success(
+        "完成后信号 Init",
+        &run_att(root, mz_init_arguments(&game_root)),
+    );
+    assert_success(
+        "完成后信号基线 Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+
+    let workspace = root.join("projects/mz").join(PROJECT);
+    let database = workspace.join("project.db");
+    let saved_plan_before = read_saved_phase_plan_snapshot(&database);
+    write_completed_extract_wait_lua(root);
+    let ready = root.join("completed-extract-ready");
+    let release = root.join("completed-extract-release");
+    let child = spawn_observable_att_in_new_process_group(
+        root,
+        arguments(&["mz", "extract", "--name", PROJECT, "--lua", EXTRACT_LUA]),
+    )
+    .wait_until_fixture_marker(&ready);
+
+    let blocker = Connection::open(&database).expect("运行方案阻塞连接应可打开");
+    blocker
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("测试连接应可只阻塞最终运行方案写事务");
+    fs::write(&release, b"release").expect("应可放行已经完成业务工作的 Lua 夹具");
+    let child = child.wait_until_saving_run_plan();
+    send_ctrl_break(&child, "运行方案最终化");
+    let completed = child.wait_until_safe_stopping().wait_for_output();
+    blocker
+        .execute_batch("ROLLBACK")
+        .expect("运行方案阻塞锁应可释放");
+
+    let stdout = without_fluent_isolation(
+        std::str::from_utf8(&completed.stdout).expect("完成结果必须是 UTF-8"),
+    );
+    let stderr = without_fluent_isolation(
+        std::str::from_utf8(&completed.stderr).expect("完成后信号诊断必须是 UTF-8"),
+    );
+    assert_eq!(
+        completed.status.code(),
+        Some(0),
+        "业务已完成后收到信号必须退出 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.starts_with("提取完成：e2e\n"),
+        "完整业务结果必须照常呈现：{stdout}"
+    );
+    assert_eq!(stderr.matches(SAFE_STOPPING_PROGRESS).count(), 1);
+    assert!(
+        !stderr.contains("命令已在安全收尾后取消"),
+        "自然完成不得呈现取消终态：{stderr}"
+    );
+    assert_eq!(
+        read_saved_phase_plan_snapshot(&database),
+        saved_plan_before,
+        "最终方案写锁被信号取消时必须保留此前已保存方案"
+    );
+    assert_completed_signal_project_log(&workspace.join("logs"));
+    assert_no_directory_publish_artifacts(root);
 }
 
 #[test]
@@ -2204,6 +2382,7 @@ struct ObservableAttChild {
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
     safe_stopping_receiver: mpsc::Receiver<()>,
+    save_run_plan_receiver: mpsc::Receiver<()>,
 }
 
 impl ObservableAttChild {
@@ -2226,6 +2405,57 @@ impl ObservableAttChild {
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
+        }
+    }
+
+    fn wait_until_saving_run_plan(self) -> Self {
+        match self
+            .save_run_plan_receiver
+            .recv_timeout(Duration::from_secs(5))
+        {
+            Ok(()) => self,
+            Err(error) => {
+                let output = self.terminate_and_collect();
+                panic!(
+                    "att.exe 未在 5 秒内进入运行方案保存：{error}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    fn wait_until_fixture_marker(mut self, marker: &Path) -> Self {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if marker.is_file() {
+                return self;
+            }
+            if self
+                .child
+                .try_wait()
+                .expect("应可查询 att.exe 状态")
+                .is_some()
+            {
+                let (stdout, stderr) = self.join_readers();
+                panic!(
+                    "att.exe 在建立测试同步标记前退出：{}\nstdout:\n{}\nstderr:\n{}",
+                    marker.display(),
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            if Instant::now() >= deadline {
+                let output = self.terminate_and_collect();
+                panic!(
+                    "att.exe 未在 10 秒内建立测试同步标记：{}\nstdout:\n{}\nstderr:\n{}",
+                    marker.display(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -2297,27 +2527,38 @@ fn spawn_observable_att_in_new_process_group(
     let stderr = child.stderr.take().expect("att.exe stderr 应已管道化");
     let stdout_reader = spawn_output_reader("att-e2e-stdout", stdout);
     let (safe_stopping_sender, safe_stopping_receiver) = mpsc::channel();
+    let (save_run_plan_sender, save_run_plan_receiver) = mpsc::channel();
     let stderr_reader = thread::Builder::new()
         .name(String::from("att-e2e-stderr"))
         .spawn(move || {
             let mut stderr = stderr;
             let mut captured = Vec::new();
             let mut buffer = [0_u8; 4096];
-            let marker = SAFE_STOPPING_PROGRESS.as_bytes();
-            let mut marker_reported = false;
+            let safe_stopping_marker = SAFE_STOPPING_PROGRESS.as_bytes();
+            let save_run_plan_marker = SAVE_RUN_PLAN_PROGRESS.as_bytes();
+            let mut safe_stopping_reported = false;
+            let mut save_run_plan_reported = false;
             loop {
                 let read = stderr.read(&mut buffer)?;
                 if read == 0 {
                     break;
                 }
                 captured.extend_from_slice(&buffer[..read]);
-                if !marker_reported
+                if !safe_stopping_reported
                     && captured
-                        .windows(marker.len())
-                        .any(|window| window == marker)
+                        .windows(safe_stopping_marker.len())
+                        .any(|window| window == safe_stopping_marker)
                 {
-                    marker_reported = true;
+                    safe_stopping_reported = true;
                     let _ = safe_stopping_sender.send(());
+                }
+                if !save_run_plan_reported
+                    && captured
+                        .windows(save_run_plan_marker.len())
+                        .any(|window| window == save_run_plan_marker)
+                {
+                    save_run_plan_reported = true;
+                    let _ = save_run_plan_sender.send(());
                 }
             }
             Ok(captured)
@@ -2329,7 +2570,19 @@ fn spawn_observable_att_in_new_process_group(
         stdout_reader: Some(stdout_reader),
         stderr_reader: Some(stderr_reader),
         safe_stopping_receiver,
+        save_run_plan_receiver,
     }
+}
+
+fn send_ctrl_break(child: &ObservableAttChild, stage: &str) {
+    // SAFETY: `spawn_observable_att_in_new_process_group` 使用
+    // CREATE_NEW_PROCESS_GROUP 启动子进程且继承当前控制台；目标进程组 ID
+    // 就是子进程 ID，因此 CTRL_BREAK 不会投递给测试进程。
+    let generated = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+    assert_ne!(
+        generated, 0,
+        "应能向 {stage} att.exe 独立进程组发送 Ctrl-Break"
+    );
 }
 
 fn att_command(root: &Path, arguments: Vec<OsString>) -> Command {
@@ -2419,6 +2672,33 @@ fn assert_success(stage: &str, output: &Output) -> String {
         .chars()
         .filter(|character| !matches!(character, '\u{2068}' | '\u{2069}'))
         .collect()
+}
+
+fn assert_cooperatively_cancelled(stage: &str, output: &Output) {
+    let stdout = String::from_utf8(output.stdout.clone()).expect("取消 stdout 必须是 UTF-8");
+    let stderr = without_fluent_isolation(
+        std::str::from_utf8(&output.stderr).expect("取消 stderr 必须是 UTF-8"),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{stage} 真正取消必须退出 130\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "{stage} 真正取消不得打印业务成功文案：{stdout}"
+    );
+    assert_eq!(
+        stderr.matches(SAFE_STOPPING_PROGRESS).count(),
+        1,
+        "{stage} 必须且只能呈现一次安全停止进度：{stderr}"
+    );
+    assert!(
+        stderr.ends_with("命令已在安全收尾后取消。\n"),
+        "{stage} 必须呈现合作取消终态：{stderr}"
+    );
+    assert!(!stderr.contains('\r'));
+    assert!(!stderr.contains('\u{001b}'));
 }
 
 fn assert_log_degraded_diagnostic(stderr: &[u8], log_root: &Path) {
@@ -2814,6 +3094,63 @@ ctx.db.commit()
     .expect("WriteBack Lua 应可写入");
 }
 
+fn write_cancellable_extract_lua(root: &Path) {
+    fs::write(
+        root.join(EXTRACT_LUA),
+        r#"
+assert(ctx.phase == "extract")
+ctx.db.begin()
+ctx.db.execute("CREATE TABLE extract_cancel_probe (value TEXT NOT NULL)")
+ctx.db.execute("INSERT INTO extract_cancel_probe (value) VALUES ('must-roll-back')")
+local marker = assert(io.open("extract-cancel-ready", "wb"))
+assert(marker:write("ready"))
+assert(marker:close())
+while true do
+end
+"#,
+    )
+    .expect("可取消 Extract Lua 夹具应可写入");
+}
+
+fn write_cancellable_write_back_lua(root: &Path) {
+    fs::write(
+        root.join(WRITE_BACK_LUA),
+        r#"
+assert(ctx.phase == "write_back")
+ctx.output.write_text("js/cancelled-candidate.txt", "must-not-publish")
+ctx.db.begin()
+ctx.db.execute("CREATE TABLE write_back_cancel_probe (value TEXT NOT NULL)")
+ctx.db.execute("INSERT INTO write_back_cancel_probe (value) VALUES ('must-roll-back')")
+local marker = assert(io.open("write-back-cancel-ready", "wb"))
+assert(marker:write("ready"))
+assert(marker:close())
+while true do
+end
+"#,
+    )
+    .expect("可取消 WriteBack Lua 夹具应可写入");
+}
+
+fn write_completed_extract_wait_lua(root: &Path) {
+    fs::write(
+        root.join(EXTRACT_LUA),
+        r#"
+assert(ctx.phase == "extract")
+local marker = assert(io.open("completed-extract-ready", "wb"))
+assert(marker:write("ready"))
+assert(marker:close())
+while true do
+  local release = io.open("completed-extract-release", "rb")
+  if release ~= nil then
+    release:close()
+    break
+  end
+end
+"#,
+    )
+    .expect("完成后信号 Extract Lua 夹具应可写入");
+}
+
 fn write_updated_write_back_lua(root: &Path) {
     fs::write(
         root.join(WRITE_BACK_LUA),
@@ -3159,6 +3496,90 @@ fn read_saved_phase_plan_snapshot(database: &Path) -> SavedPhasePlanSnapshot {
         write_back_lua: write_back,
         lua_programs,
     }
+}
+
+fn assert_database_table_absent(database: &Path, table: &str) {
+    let connection = open_read_only(database);
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .expect("应可检查取消事务是否留下表");
+    assert!(!exists, "取消的 Lua 事务不得留下表 {table}");
+}
+
+fn snapshot_directory_tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut snapshot = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("应可读取目录快照 {}：{error}", directory.display()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("目录快照条目应可读取");
+        for entry in entries {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("目录快照条目必须位于根内")
+                .to_path_buf();
+            let file_type = entry.file_type().expect("目录快照条目类型应可读取");
+            if file_type.is_dir() {
+                snapshot.insert(relative, None);
+                pending.push(path);
+            } else {
+                assert!(
+                    file_type.is_file(),
+                    "目录快照不得包含链接：{}",
+                    path.display()
+                );
+                snapshot.insert(
+                    relative,
+                    Some(fs::read(&path).unwrap_or_else(|error| {
+                        panic!("应可读取快照文件 {}：{error}", path.display())
+                    })),
+                );
+            }
+        }
+    }
+    snapshot
+}
+
+fn directory_publish_artifacts(root: &Path) -> Vec<PathBuf> {
+    let mut artifacts = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("应可检查发布候选残留 {}：{error}", directory.display()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("发布候选残留条目应可读取");
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.starts_with(".directory-publish-") {
+                artifacts.push(path);
+                continue;
+            }
+            if entry
+                .file_type()
+                .expect("发布候选残留条目类型应可读取")
+                .is_dir()
+            {
+                pending.push(path);
+            }
+        }
+    }
+    artifacts.sort();
+    artifacts
+}
+
+fn assert_no_directory_publish_artifacts(root: &Path) {
+    let artifacts = directory_publish_artifacts(root);
+    assert!(
+        artifacts.is_empty(),
+        "命令终态不得遗留目录发布候选、备份或日志：{artifacts:?}"
+    );
 }
 
 fn assert_missing_extract_plan(root: &Path, stage: &str) {
@@ -4242,6 +4663,86 @@ fn read_project_logs(log_root: &Path) -> (String, Vec<Value>) {
         records.extend(file_records);
     }
     (raw, records)
+}
+
+fn explicit_lua_run_id<'a>(records: &'a [Value], command: &str) -> &'a str {
+    records
+        .iter()
+        .find(|record| {
+            record["command"] == command
+                && record["code"] == "run_plan.resolved"
+                && record["payload"]["source"] == "explicit"
+                && record["payload"]["lua_enabled"] == true
+        })
+        .and_then(|record| record["run_id"].as_str())
+        .unwrap_or_else(|| panic!("{command} 显式 Lua 运行必须记录 RunId"))
+}
+
+fn assert_cancelled_project_log(log_root: &Path, command: &str) {
+    let (_, records) = read_project_logs(log_root);
+    let run_id = explicit_lua_run_id(&records, command);
+    for code in ["run.cancel_requested", "run.safe_stop_finished"] {
+        assert!(
+            records
+                .iter()
+                .any(|record| record["run_id"] == run_id && record["code"] == code),
+            "{command} 真正取消必须记录 {code}"
+        );
+    }
+    assert!(records.iter().any(|record| {
+        record["run_id"] == run_id
+            && record["code"] == "run.finished"
+            && record["payload"]["outcome"] == "cancelled"
+    }));
+    assert!(
+        !records.iter().any(|record| {
+            record["run_id"] == run_id
+                && matches!(
+                    record["code"].as_str(),
+                    Some(
+                        "run_plan.saved"
+                            | "run_plan.save_failed"
+                            | "run_plan.save_outcome_unknown"
+                            | "run_plan.saved_finalization_failed"
+                    )
+                )
+        }),
+        "{command} 真正取消不得进入运行方案最终化"
+    );
+}
+
+fn assert_completed_signal_project_log(log_root: &Path) {
+    let (_, records) = read_project_logs(log_root);
+    let run_id = explicit_lua_run_id(&records, "extract");
+    assert!(
+        records.iter().any(|record| {
+            record["run_id"] == run_id && record["code"] == "run.cancel_requested"
+        })
+    );
+    assert!(
+        records.iter().any(|record| {
+            record["run_id"] == run_id && record["code"] == "run_plan.save_failed"
+        })
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| { record["run_id"] == run_id && record["code"] == "run_plan.saved" }),
+        "写锁等待被信号取消时不得谎报运行方案已保存"
+    );
+    assert!(records.iter().any(|record| {
+        record["run_id"] == run_id
+            && record["code"] == "run.finished"
+            && record["payload"]["outcome"] == "succeeded"
+    }));
+    assert!(
+        !records.iter().any(|record| {
+            record["run_id"] == run_id
+                && record["code"] == "run.finished"
+                && record["payload"]["outcome"] == "cancelled"
+        }),
+        "业务自然完成后不得保留过时的取消终态"
+    );
 }
 
 fn assert_project_logs_do_not_contain(log_root: &Path, needle: &str, label: &str) {

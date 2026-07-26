@@ -1616,6 +1616,7 @@ impl ProductionRpgMakerCommandRunner {
             .as_ref()
             .cloned()
             .and_then(|program| start_stage_lua_selection(program, &mut roots));
+        let lua_runtime_for_cancellation = lua.as_ref().map(|selection| selection.runtime.clone());
         let replacement = {
             let rules_definition = rules_program
                 .as_ref()
@@ -1780,6 +1781,9 @@ impl ProductionRpgMakerCommandRunner {
             termination_signals,
             || {
                 cancellation.request();
+                if let Some(runtime) = lua_runtime_for_cancellation {
+                    runtime.request_cancellation();
+                }
                 cpu.cancel_waits();
                 file_system.cancel_waits();
                 sqlite.cancel_waits();
@@ -2508,6 +2512,7 @@ impl ProductionRpgMakerCommandRunner {
                     )
                 }),
         };
+        let lua_runtime_for_cancellation = lua.as_ref().map(|selection| selection.runtime.clone());
         let lua_cleared = explicit_lua_requested && lua.is_none();
         let replacement = match lua.as_ref() {
             Some(selection) => match LuaProgramSnapshot::new(
@@ -2590,6 +2595,9 @@ impl ProductionRpgMakerCommandRunner {
             termination_signals,
             || {
                 cancellation.request();
+                if let Some(runtime) = lua_runtime_for_cancellation {
+                    runtime.request_cancellation();
+                }
                 cpu.cancel_waits();
                 file_system.cancel_waits();
                 sqlite.cancel_waits();
