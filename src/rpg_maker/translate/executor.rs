@@ -31,7 +31,10 @@ use crate::llm::{
     LlmClientConcurrency, LlmFinishReason, LlmRequestDiagnosticSource, LlmRequestError,
     LlmRequestExecutor, LlmResponse, LlmUsage,
 };
-use crate::rpg_maker::model::TextUnitContent;
+use crate::rpg_maker::model::{
+    TextUnitContent, TextUnitContentStructureError, TextUnitContentView,
+    validate_text_unit_content_structure, validate_text_unit_lines,
+};
 use crate::rpg_maker::placeholder_token;
 
 use super::language_projection::{
@@ -45,8 +48,9 @@ use super::standard::{
     AcceptedTranslationDecision, AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
     NonEmptyTaskItems, StandardTranslationProfile, StandardTranslationTaskExecutor,
     StandardTranslationTaskIndex, TranslationPatch, TranslationProtocolDiagnostic,
-    TranslationTaskBlock, TranslationTaskOutcome, TranslationTaskOutcomeContext,
-    TranslationTaskUnavailableReason, TranslationUnitRejectionReason, UnresolvedTranslationUnit,
+    TranslationTargetConstraints, TranslationTaskBlock, TranslationTaskOutcome,
+    TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
+    TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
 use super::task_record::{
     TranslationAssistantEntry, TranslationAssistantValueError, TranslationTaskAttemptRecord,
@@ -1668,8 +1672,12 @@ fn process_response(
                 continue;
             }
         };
+        let target_constraints = TranslationTargetConstraints::from_identities(
+            std::iter::once(expected.identity()).chain(expected.propagation_targets().iter()),
+        );
         let translation = match accept_translation_lines_candidate_at(
             expected.identity(),
+            target_constraints,
             expected.protected_text(),
             expected.line_shape(),
             expected.applied_placeholders(),
@@ -1879,6 +1887,7 @@ fn validate_expected_output_contract(
 
 fn validate_translation_lines(
     identity: &super::standard::TranslationUnitIdentity,
+    target_constraints: TranslationTargetConstraints,
     shape: ExpectedLineShape,
     lines: &[String],
 ) -> Result<(), TranslationUnitRejectionReason> {
@@ -1890,13 +1899,13 @@ fn validate_translation_lines(
             actual: lines.len(),
         });
     }
-    if let Some(line_index) = lines.iter().position(|line| {
-        line.chars()
-            .any(|character| matches!(character, '\r' | '\n' | '\0'))
-    }) {
+    if let Err(error) = validate_text_unit_lines(lines) {
+        let TextUnitContentStructureError::InvalidText { line_index } = error else {
+            unreachable!("物理行校验不执行内容形状判断");
+        };
         return Err(TranslationUnitRejectionReason::InvalidLineText { line_index });
     }
-    if identity.targets_tag_value()
+    if target_constraints.targets_tag_value()
         && let Some(line_index) = lines.iter().position(|line| line.contains('>'))
     {
         return Err(
@@ -1957,8 +1966,10 @@ pub(crate) enum TranslationContentAcceptance {
 ///
 /// `Value` 与 `Lines` 的物理边界由调用方提交的 `TextUnitContent` 明确表达；
 /// 本函数不会用 LF 猜测或转换两种形状。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn accept_translation_content_candidate(
     identity: &super::standard::TranslationUnitIdentity,
+    target_constraints: TranslationTargetConstraints,
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
@@ -1968,6 +1979,7 @@ pub(crate) fn accept_translation_content_candidate(
 ) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
     accept_translation_content_candidate_at(
         identity,
+        target_constraints,
         protected_text,
         line_shape,
         placeholders,
@@ -1981,6 +1993,7 @@ pub(crate) fn accept_translation_content_candidate(
 #[allow(clippy::too_many_arguments)]
 fn accept_translation_content_candidate_at(
     identity: &super::standard::TranslationUnitIdentity,
+    target_constraints: TranslationTargetConstraints,
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
@@ -1989,6 +2002,23 @@ fn accept_translation_content_candidate_at(
     candidate: TextUnitContent,
     invariant_location: TranslationCandidateInvariantLocation,
 ) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
+    if let Err(error) =
+        validate_text_unit_content_structure(identity.role(), TextUnitContentView::from(&candidate))
+    {
+        return Ok(TranslationContentAcceptance::Rejected(match error {
+            TextUnitContentStructureError::ShapeMismatch => {
+                TranslationUnitRejectionReason::InvalidShape {
+                    message: match candidate {
+                        TextUnitContent::Value(_) => "expected=lines; actual=value".to_owned(),
+                        TextUnitContent::Lines(_) => "expected=value; actual=lines".to_owned(),
+                    },
+                }
+            }
+            TextUnitContentStructureError::InvalidText { line_index } => {
+                TranslationUnitRejectionReason::InvalidLineText { line_index }
+            }
+        }));
+    }
     let lines = match (identity.source_content(), candidate) {
         (TextUnitContent::Value(_), TextUnitContent::Value(value)) => {
             value.split('\n').map(str::to_owned).collect::<Vec<_>>()
@@ -2011,6 +2041,7 @@ fn accept_translation_content_candidate_at(
     };
     accept_translation_lines_candidate_at(
         identity,
+        target_constraints,
         protected_text,
         line_shape,
         placeholders,
@@ -2024,6 +2055,7 @@ fn accept_translation_content_candidate_at(
 #[allow(clippy::too_many_arguments)]
 fn accept_translation_lines_candidate_at(
     identity: &super::standard::TranslationUnitIdentity,
+    target_constraints: TranslationTargetConstraints,
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
@@ -2032,7 +2064,9 @@ fn accept_translation_lines_candidate_at(
     lines: Vec<String>,
     invariant_location: TranslationCandidateInvariantLocation,
 ) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
-    if let Err(reason) = validate_translation_lines(identity, line_shape, &lines) {
+    if let Err(reason) =
+        validate_translation_lines(identity, target_constraints, line_shape, &lines)
+    {
         return Ok(TranslationContentAcceptance::Rejected(reason));
     }
     match validate_and_restore_translation_lines_at(
@@ -3495,10 +3529,22 @@ mod tests {
         line_shape: ExpectedLineShape,
         analysis: crate::language::LanguageAnalysis,
     ) -> TranslationTaskBlock {
+        line_task_with_propagation(identity, Vec::new(), line_shape, analysis)
+    }
+
+    fn line_task_with_propagation(
+        identity: TranslationUnitIdentity,
+        propagation_targets: Vec<TranslationUnitIdentity>,
+        line_shape: ExpectedLineShape,
+        analysis: crate::language::LanguageAnalysis,
+    ) -> TranslationTaskBlock {
         let protected_text = match identity.source_content() {
             TextUnitContent::Value(value) => value.clone(),
             TextUnitContent::Lines(lines) => lines.join("\n"),
         };
+        let propagation_state_contexts = (0..propagation_targets.len())
+            .map(|index| state_context(index as u8 + 5))
+            .collect();
         TranslationTaskBlock::new(
             StandardTranslationTaskIndex::new(4),
             LanguagePair::new(
@@ -3512,7 +3558,7 @@ mod tests {
             vec![ExpectedTranslationOutput::new(
                 1,
                 identity,
-                Vec::new(),
+                propagation_targets,
                 ExpectedTranslationValidation::new(
                     line_shape,
                     protected_text,
@@ -3520,7 +3566,7 @@ mod tests {
                     analysis,
                 ),
                 state_context(4),
-                Vec::new(),
+                propagation_state_contexts,
             )],
         )
     }
@@ -4354,6 +4400,30 @@ mod tests {
             TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index: 0 }
         ));
 
+        let propagated_tag = processor
+            .process(
+                &line_task_with_propagation(
+                    plain_tag_family_identity(),
+                    vec![tag_value_identity()],
+                    ExpectedLineShape::Aligned(NonZeroUsize::MIN),
+                    line_content_analysis(&["炎の剣の説明"]),
+                ),
+                LlmResponse::new(
+                    r#"{"1":["炎之剑>说明"]}"#,
+                    LlmFinishReason::Stop,
+                    None,
+                    Some("response-propagated-tag-value".to_owned()),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("传播族任一标签目标含 '>' 属于当前 ID 的正常拒绝");
+        assert!(matches!(
+            propagated_tag.unresolved()[0].reason(),
+            TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index: 0 }
+        ));
+
         // 普通 Value 单元不受标签值约束：同样含 '>' 的译文照常进入语言验收流程。
         let accepted = processor
             .process(
@@ -4390,6 +4460,20 @@ mod tests {
             RpgMakerStandardAssetOwner::Builtin,
             TextGroupKind::DatabaseEntry,
             group,
+            TextUnitRole::Scalar(ScalarFieldKey::new("note_tag").expect("字段键应合法")),
+            TextUnitContent::Value("炎の剣の説明".to_owned()),
+            "{}",
+        )
+    }
+
+    fn plain_tag_family_identity() -> TranslationUnitIdentity {
+        TranslationUnitIdentity::new(
+            RpgMakerStandardAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            RpgMakerLocation::value(
+                RpgMakerSource::data(StandardDataFile::Items),
+                vec![RpgMakerLocationStep::index(4)],
+            ),
             TextUnitRole::Scalar(ScalarFieldKey::new("note_tag").expect("字段键应合法")),
             TextUnitContent::Value("炎の剣の説明".to_owned()),
             "{}",

@@ -348,7 +348,10 @@ end
 | `placeholder_normalization_ambiguous` | 重复槽无法无歧义恢复 |
 | `source_residual` | 语言分析/修复后仍残留不可接受源语 |
 
-Standard 多 ID/Lines 响应的结构错误不属于 Lua 标量 accept 的 reason 集合。
+Standard 多 ID/Lines 响应的结构错误不属于 Lua 标量 accept 的 reason 集合。这个通用
+标量 API 没有物理 Standard identity，因此普通候选可以包含 `>`；候选经
+`standard:accept` 绑定到实际去重族时，才按代表与全部传播位置共同建立
+note/comment 标签值约束。
 
 成功 acceptance 的 translation/state 必须由脚本在同一 SQLite 事务中成对写入私有表。
 核心不替 Lua 选择身份或事务粒度。

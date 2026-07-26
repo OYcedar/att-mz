@@ -79,6 +79,76 @@ pub(crate) enum TextUnitContent {
     Lines(Vec<String>),
 }
 
+/// 在不复制正文的前提下交给领域不变量校验的文本内容视图。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TextUnitContentView<'a> {
+    Value(&'a str),
+    Lines(&'a [String]),
+}
+
+impl<'a> From<&'a TextUnitContent> for TextUnitContentView<'a> {
+    fn from(content: &'a TextUnitContent) -> Self {
+        match content {
+            TextUnitContent::Value(value) => Self::Value(value),
+            TextUnitContent::Lines(lines) => Self::Lines(lines),
+        }
+    }
+}
+
+/// 角色与内容物理结构不一致，或内容含有不能进入语义单元的控制字符。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TextUnitContentStructureError {
+    ShapeMismatch,
+    InvalidText { line_index: usize },
+}
+
+/// 验证一个完整语义单元内容的唯一结构规则。
+///
+/// `Scalar` 的单值可以包含 LF；Dialogue speaker 的单值不能包含 CR/LF；任何单值
+/// 都不能包含 NUL。行序列中的每个槽都不能包含 CR、LF 或 NUL。纯空白、空行序列、
+/// 对齐数量和空槽对应关系属于各业务边界的额外规则，不在这里判断。
+pub(crate) fn validate_text_unit_content_structure(
+    role: &TextUnitRole,
+    content: TextUnitContentView<'_>,
+) -> Result<(), TextUnitContentStructureError> {
+    match content {
+        TextUnitContentView::Value(_) if role.expects_lines() => {
+            Err(TextUnitContentStructureError::ShapeMismatch)
+        }
+        TextUnitContentView::Lines(_) if !role.expects_lines() => {
+            Err(TextUnitContentStructureError::ShapeMismatch)
+        }
+        TextUnitContentView::Value(value) => {
+            if value.contains('\0')
+                || (matches!(role, TextUnitRole::DialogueSpeaker)
+                    && (value.contains('\r') || value.contains('\n')))
+            {
+                Err(TextUnitContentStructureError::InvalidText { line_index: 0 })
+            } else {
+                Ok(())
+            }
+        }
+        TextUnitContentView::Lines(lines) => validate_text_unit_lines(lines),
+    }
+}
+
+/// 验证物理行槽的唯一控制字符规则。
+///
+/// 模型响应尚未重建为 `TextUnitContent` 时也需要消费同一规则，因此这一窄入口与
+/// 完整内容校验并列暴露，避免 Executor 复制字符扫描逻辑。
+pub(crate) fn validate_text_unit_lines(
+    lines: &[String],
+) -> Result<(), TextUnitContentStructureError> {
+    if let Some(line_index) = lines.iter().position(|line| {
+        line.chars()
+            .any(|character| matches!(character, '\r' | '\n' | '\0'))
+    }) {
+        Err(TextUnitContentStructureError::InvalidText { line_index })
+    } else {
+        Ok(())
+    }
+}
+
 impl TextUnitContent {
     pub(crate) fn as_value(&self) -> Option<&str> {
         match self {
@@ -1580,6 +1650,50 @@ mod tests {
             ]))
             .expect("行集合应可序列化"),
             r#"["第一行",""]"#
+        );
+    }
+
+    #[test]
+    fn content_structure_validation_is_role_aware_and_keeps_scalar_lf() {
+        let scalar = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应合法"));
+        let speaker = TextUnitRole::DialogueSpeaker;
+        let body = TextUnitRole::DialogueBody;
+
+        assert_eq!(
+            validate_text_unit_content_structure(
+                &scalar,
+                TextUnitContentView::Value("第一行\n第二行")
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_text_unit_content_structure(&scalar, TextUnitContentView::Value("值\0")),
+            Err(TextUnitContentStructureError::InvalidText { line_index: 0 })
+        );
+        assert_eq!(
+            validate_text_unit_content_structure(
+                &speaker,
+                TextUnitContentView::Value("姓名\n别名")
+            ),
+            Err(TextUnitContentStructureError::InvalidText { line_index: 0 })
+        );
+        assert_eq!(
+            validate_text_unit_content_structure(
+                &body,
+                TextUnitContentView::Lines(&["第一行".to_owned(), "第二\r行".to_owned()])
+            ),
+            Err(TextUnitContentStructureError::InvalidText { line_index: 1 })
+        );
+        assert_eq!(
+            validate_text_unit_content_structure(&body, TextUnitContentView::Value("错误形状")),
+            Err(TextUnitContentStructureError::ShapeMismatch)
+        );
+        assert_eq!(
+            validate_text_unit_content_structure(
+                &scalar,
+                TextUnitContentView::Lines(&["错误形状".to_owned()])
+            ),
+            Err(TextUnitContentStructureError::ShapeMismatch)
         );
     }
 }

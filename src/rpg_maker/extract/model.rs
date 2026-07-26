@@ -7,7 +7,8 @@ use std::fmt;
 use crate::rpg_maker::model::{
     DirectTextPart, DirectTextRecipe, LogicalTextLocation, MutationClaim, MutationClaimIndex,
     MutationClaimSet, MutationResource, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe,
-    TextUnitContent, TextUnitRole, mutation_claims_for_group,
+    TextUnitContent, TextUnitContentStructureError, TextUnitContentView, TextUnitRole,
+    mutation_claims_for_group, validate_text_unit_content_structure,
 };
 pub(crate) use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind,
@@ -78,22 +79,22 @@ impl ExtractedTextUnit {
                 ProjectionModelError::MutationClaimTargetMismatch,
             ));
         }
-        let actual_lines = matches!(source_content, TextUnitContent::Lines(_));
-        if role.expects_lines() != actual_lines {
-            return Err(SnapshotModelError::ContentShapeMismatch {
-                role,
-                exact_location: Box::new(projection_location),
-            });
-        }
-        if let TextUnitContent::Lines(lines) = &source_content
-            && let Some(source_line_index) = lines.iter().position(|line| {
-                line.chars()
-                    .any(|character| matches!(character, '\r' | '\n' | '\0'))
-            })
+        if let Err(error) =
+            validate_text_unit_content_structure(&role, TextUnitContentView::from(&source_content))
         {
-            return Err(SnapshotModelError::InvalidSourceLine {
-                source_line_index,
-                exact_location: Box::new(projection_location),
+            return Err(match error {
+                TextUnitContentStructureError::ShapeMismatch => {
+                    SnapshotModelError::ContentShapeMismatch {
+                        role,
+                        exact_location: Box::new(projection_location),
+                    }
+                }
+                TextUnitContentStructureError::InvalidText { line_index } => {
+                    SnapshotModelError::InvalidSourceLine {
+                        source_line_index: line_index,
+                        exact_location: Box::new(projection_location),
+                    }
+                }
             });
         }
         if source_content.is_blank() {
