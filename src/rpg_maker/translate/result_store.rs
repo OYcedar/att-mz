@@ -2007,18 +2007,6 @@ mod tests {
         assert!(projection_json.contains("kind=invalid_projection"));
         assert!(projection_json.contains("expected=2"));
         assert!(projection_json.contains("actual=4"));
-
-        let claim_kind_diagnostic = ResultStoragePlanError::Projection(
-            RpgMakerProjectionCodecError::MutationClaimKindMismatch {
-                expected: "value",
-                actual: "event_block",
-            },
-        )
-        .safe_diagnostic();
-        let claim_kind_json =
-            serde_json::to_string(&claim_kind_diagnostic).expect("公开诊断应可序列化");
-        assert!(claim_kind_json.contains("expected=value"));
-        assert!(claim_kind_json.contains("actual=event_block"));
     }
 
     #[derive(Clone, Copy)]

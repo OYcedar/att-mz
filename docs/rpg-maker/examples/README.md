@@ -17,9 +17,10 @@ JSON 夹具，以及需要模型的示例所用假 LLM。
 | [`lua-translate-state.lua`](lua-translate-state.lua) | Translate | 首跑请求、二跑 Current、语义变化失效、译文/state 同事务 |
 | [`lua-accept-standard.lua`](lua-accept-standard.lua) | 独立 Lua | Standard 人工候选验收、去重传播与原子提交 |
 | [`lua-idempotent-write-back.lua`](lua-idempotent-write-back.lua) | WriteBack | 从权威候选重建相同输出，不依赖 post-publish |
+| [`lua-private-tag.lua`](lua-private-tag.lua) | 三阶段 | Lua 私有解析、验收、持久化并完整重建 `<Help:...>` Value |
 | [`lua-complex-protocol.lua`](lua-complex-protocol.lua) | 三阶段 | 跨 Actors/Map/两个私有文档的多目标私有协议 |
 
-三阶段私有协议示例只创建 `lua_example_*` / `lua_complex_*` 私有表。人工候选示例不
+三阶段私有协议示例只创建 `lua_example_*` / `lua_private_tag_*` / `lua_complex_*` 私有表。人工候选示例不
 直接修改 ATT 受管表，而是只通过 `ctx.standard` 交给核心。文件名和夹具字段是可替换的
 示范协议；复制到真实游戏时，必须把来源、身份、上下文和物理断言改成该游戏的已验证
 事实。
@@ -36,6 +37,10 @@ JSON 夹具，以及需要模型的示例所用假 LLM。
 
 `lua-accept-standard.lua` 另假定 Builtin 已从 `data/Items.json[1]` 提取
 `description = "药水"`；真实项目必须把完整身份、原文断言和候选一起替换。
+
+`lua-private-tag.lua` 使用同一 `Items.json[1]` 的
+`note = "<Help:炎の剣の説明>"`。这个外壳完全由示例 Lua 解释；Host 只读取和写入完整
+Value。
 
 <!-- att-example: illustrative -->
 ```json

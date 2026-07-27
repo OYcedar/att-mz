@@ -20,8 +20,7 @@ use crate::rpg_maker::location_codec::{
 #[cfg(test)]
 use crate::rpg_maker::model::mutation_claims_for_group;
 use crate::rpg_maker::model::{
-    MutationClaim, MutationResource, MutationResourceAccess, TextProjectionRecipe, TextUnitContent,
-    TextUnitRole,
+    MutationClaim, MutationResourceAccess, TextProjectionRecipe, TextUnitContent, TextUnitRole,
 };
 use crate::rpg_maker::mutation_claim_summary::{
     EncodedMutationClaim, MutationClaimSummaryError, collision_summary, sort_logical_claims,
@@ -633,8 +632,8 @@ impl InvalidStandardWriteBackAssetSnapshot {
 pub(crate) struct ClaimSummaryMismatchDetails {
     expected_group: Option<RpgMakerLocation>,
     actual_group: Option<RpgMakerLocation>,
-    expected_resource: Option<MutationResource>,
-    actual_resource: Option<MutationResource>,
+    expected_resource: Option<RpgMakerLocation>,
+    actual_resource: Option<RpgMakerLocation>,
     expected_access: Option<MutationResourceAccess>,
     actual_access: Option<MutationResourceAccess>,
 }
@@ -872,12 +871,6 @@ fn write_back_group_kind(kind: TextGroupKind) -> &'static str {
 fn write_back_claim_detail(claim: &MutationClaim) -> String {
     match claim {
         MutationClaim::Value(location) => format!("claim_kind=value; claim_location={location}"),
-        MutationClaim::NoteTag(location) => {
-            format!("claim_kind=note_tag; claim_location={location}")
-        }
-        MutationClaim::CommentTag { location, .. } => {
-            format!("claim_kind=comment_tag; claim_location={location}")
-        }
         MutationClaim::EventBlock { header, .. } => {
             format!("claim_kind=event_block; claim_location={header}")
         }
@@ -1617,7 +1610,7 @@ fn claim_summary_mismatch(
     expected_rows: usize,
     actual_rows: &[EncodedMutationClaim],
     compared: ComparedClaimSummaryRows<'_>,
-    actual_resource: Option<MutationResource>,
+    actual_resource: Option<RpgMakerLocation>,
 ) -> InvalidStandardWriteBackAssetSnapshot {
     let decode_group = |claim: Option<&EncodedMutationClaim>| {
         claim.map(|claim| {
@@ -1644,7 +1637,7 @@ fn claim_summary_mismatch(
 
 fn decode_expected_summary_resource(
     claim: Option<&EncodedMutationClaim>,
-) -> Option<MutationResource> {
+) -> Option<RpgMakerLocation> {
     claim.map(|claim| {
         RpgMakerProjectionCodec::decode_mutation_resource(&claim.resource_key)
             .expect("重建的摘要 resource_key 必须是规范编码")
@@ -1654,7 +1647,7 @@ fn decode_expected_summary_resource(
 fn decode_actual_summary_resource(
     owner: RpgMakerStandardAssetOwner,
     claim: Option<&EncodedMutationClaim>,
-) -> Result<Option<MutationResource>, InvalidStandardWriteBackAssetSnapshot> {
+) -> Result<Option<RpgMakerLocation>, InvalidStandardWriteBackAssetSnapshot> {
     let Some(claim) = claim else {
         return Ok(None);
     };
@@ -1818,13 +1811,13 @@ mod tests {
         let recipe_location = RpgMakerLocation::value(RpgMakerSource::map(2), Vec::new());
         let scalar =
             TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("测试标量字段键应有效"));
-        let resource = MutationResource::Value {
-            source: source.clone(),
-            steps: vec![
+        let resource = RpgMakerLocation::value(
+            source.clone(),
+            vec![
                 RpgMakerLocationStep::index(1),
                 RpgMakerLocationStep::key("name"),
             ],
-        };
+        );
         let cases = vec![
             (
                 StandardWriteBackSnapshotError::BlankSourceContent {
@@ -2615,12 +2608,10 @@ mod tests {
             SqliteValue::Text(value) => value.clone(),
             _ => unreachable!("group_location 必须为 TEXT"),
         };
-        let root_resource =
-            RpgMakerProjectionCodec::encode_mutation_resource(&MutationResource::Value {
-                source: RpgMakerSource::data(StandardDataFile::Items),
-                steps: Vec::new(),
-            })
-            .expect("根资源应可编码");
+        let root_resource = RpgMakerProjectionCodec::encode_mutation_resource(
+            &RpgMakerLocation::value(RpgMakerSource::data(StandardDataFile::Items), Vec::new()),
+        )
+        .expect("根资源应可编码");
         let row_index = wrong_representative
             .claims
             .iter()

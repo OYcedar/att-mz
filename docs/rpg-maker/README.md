@@ -116,6 +116,12 @@ Speaker，以及可由姓名投影完整且可逆表达的 MV Speaker。先对�
 精确能力、字段和工件验证见[规则文件现行规格与编写指南](rules.md)。Rules 的命中数量
 不是覆盖证明；仍需检查真实消费者、误收、漏收、分组和写回边界。
 
+例如原值 `<Help:炎之剑的说明>` 有三种不同意图：Rules 省略 `pattern` 时整串是一个
+Unit；显式 `(?<text>...)` 时只有捕获正文是 Unit，外壳成为 recipe Literal；保持整串
+Unit 再用 Custom Placeholder 时，只保护 Unit 内的外壳，不改变提取身份。若 `<Help:...>`
+还涉及 occurrence、多值同步、条件 grammar 或私有事务，则由阶段 Lua 解析、验收并重建
+完整 Value，不能要求 Host 根据尖括号外观猜测协议。
+
 ### Lua 的责任边界
 
 可信 Lua 有两个不同入口。已有人工候选要补入**现存 Standard 单元**时，使用独立项目

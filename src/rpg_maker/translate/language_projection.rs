@@ -166,6 +166,7 @@ impl PlaceholderBindingIndex {
         self.scan_passes.fetch_add(1, Ordering::Relaxed);
 
         let mut matches = HashMap::<usize, TokenMatches>::new();
+        let mut token_ranges = Vec::new();
         if let Some(matcher) = &self.non_envelope_matcher {
             let mut last_ends = vec![0usize; self.non_envelope_pattern_tokens.len()];
             for found in matcher.find_overlapping_iter(text) {
@@ -180,6 +181,7 @@ impl PlaceholderBindingIndex {
                     found.start(),
                     found.end(),
                 );
+                token_ranges.push((found.start(), found.end()));
             }
         }
 
@@ -205,6 +207,7 @@ impl PlaceholderBindingIndex {
             } else {
                 envelopes.push(ScannedEnvelope::Unknown(token.to_owned()));
             }
+            token_ranges.push((start, end));
             cursor = end;
         };
 
@@ -217,6 +220,7 @@ impl PlaceholderBindingIndex {
             },
             matches,
             envelope_scan,
+            token_ranges,
         }
     }
 
@@ -473,6 +477,13 @@ pub(super) struct PlaceholderTextScan {
     empty_token_occurrences: usize,
     matches: HashMap<usize, TokenMatches>,
     envelope_scan: EnvelopeScan,
+    token_ranges: Vec<(usize, usize)>,
+}
+
+impl PlaceholderTextScan {
+    pub(super) fn token_ranges(&self) -> &[(usize, usize)] {
+        &self.token_ranges
+    }
 }
 
 enum EnvelopeScan {

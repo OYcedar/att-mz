@@ -82,8 +82,8 @@ Armors description 即使源值只有一行也使用该形状。WriteBack 把这
 `plugins.js` 的声明、合法空白/行注释前缀、assignment、终止符和数组根由 Extract 与 Lua
 共用的外壳契约解释。插件参数发生修改时，声明之前的合法前缀按 UTF-8 原始字节逐字保留，
 只把 `var $plugins = ...;` 主体按当前数组重新编码；外壳失败会明确区分声明、前缀、
-assignment、终止符与根类型。CommentTag 只覆盖起始 108 及随后与它 indent 相同的连续
-408；不同 indent 的 408 是下一结构边界，不进入当前标签的冻结原文或 Mutation Claim。
+assignment、终止符与根类型。普通 Value 始终按完整冻结原文验收和替换；其中的裸 `<`、
+`>` 或插件私有语法逐字保存，不触发局部扫描、拼接或额外候选限制。
 
 修改摘要统计语义单元。物理 Mutation Claim、模型返回行和自动生成的物理续行都不是
 新的翻译单元。
@@ -156,6 +156,11 @@ Lua 使用严格逻辑 `data/...` 与 `js/...` 访问候选；只接受 `/`，�
 幂等结果，不能在 Lua 返回前把私有表标记为“已经发布”。完整 output 操作矩阵与范例见
 [Lua 技术参考](lua.md#11-writeback-候选与布局)和
 [Lua Cookbook](lua-cookbook.md#4-幂等-writeback)。
+
+Lua 若拥有插件私有 grammar，必须在这里重新读取并复核完整原 Value，使用自己的已验收
+状态重建完整新 Value，再通过 `ctx.output` 写回。Host 随后只验证候选目录、JSON 与
+RPG Maker 公共结构，不猜测或代替脚本验收插件 grammar。完整 `<Help:...>` 示例见
+[Lua 私有标签协议](lua-cookbook.md#5-插件标签的三阶段私有协议)。
 
 ## 6. 顶层验证、发布与完成边界
 

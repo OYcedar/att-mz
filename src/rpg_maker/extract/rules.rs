@@ -653,13 +653,6 @@ fn snapshot_model_fact(source: &SnapshotModelError) -> String {
 fn projection_model_variant(source: &ProjectionModelError) -> &'static str {
     match source {
         ProjectionModelError::EmptyScalarFieldKey => "projection.empty_scalar_field_key",
-        ProjectionModelError::CommentTagBackingRequired => {
-            "projection.comment_tag_backing_required"
-        }
-        ProjectionModelError::InvalidCommentTagBacking => "projection.invalid_comment_tag_backing",
-        ProjectionModelError::EventBlockHeaderMustBeValue => {
-            "projection.event_block_header_must_be_value"
-        }
         ProjectionModelError::EventBlockCoverageRequired => {
             "projection.event_block_coverage_required"
         }
@@ -668,9 +661,6 @@ fn projection_model_variant(source: &ProjectionModelError) -> &'static str {
         }
         ProjectionModelError::MutationClaimTargetMismatch => {
             "projection.mutation_claim_target_mismatch"
-        }
-        ProjectionModelError::InvalidDialoguePhysicalLocation => {
-            "projection.invalid_dialogue_physical_location"
         }
         ProjectionModelError::RecipeHasNoTextSlot => "projection.recipe_has_no_text_slot",
         ProjectionModelError::DuplicateProjectionSlot { .. } => {

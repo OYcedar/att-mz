@@ -502,7 +502,6 @@ task-record-rejection-reason = { $code ->
     [unexpected_placeholder] 出現未知預留位置：{ $detail }
     [placeholder_normalization_ambiguous] 預留位置正規化有歧義：{ $detail }
     [source_residual] 偵測到來源語言殘留：{ $detail }
-    [tag_value_contains_closing_delimiter] 第 { $line } 行包含會提前閉合標籤值的 '>'
    *[other] { $detail }
 }
 task-record-protocol-detail = { $code ->

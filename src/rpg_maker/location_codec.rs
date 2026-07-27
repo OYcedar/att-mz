@@ -15,8 +15,8 @@ use super::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
-    DirectTextRecipe, MutationClaim, MutationResource, ProjectionModelError, ScalarFieldKey,
-    TextProjectionRecipe, TextUnitRole,
+    DirectTextRecipe, MutationClaim, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe,
+    TextUnitRole,
 };
 use crate::rpg_maker::text::{DataFileName, MapId};
 
@@ -65,7 +65,7 @@ impl RpgMakerProjectionCodec {
     }
 
     pub(crate) fn encode_mutation_resource(
-        resource: &MutationResource,
+        resource: &RpgMakerLocation,
     ) -> Result<String, RpgMakerProjectionCodecError> {
         serde_json::to_string(&LocationRef::from(resource))
             .map_err(RpgMakerProjectionCodecError::Encode)
@@ -73,10 +73,11 @@ impl RpgMakerProjectionCodec {
 
     pub(crate) fn decode_mutation_resource(
         value: &str,
-    ) -> Result<MutationResource, RpgMakerProjectionCodecError> {
+    ) -> Result<RpgMakerLocation, RpgMakerProjectionCodecError> {
         let resource = serde_json::from_str::<StoredLocation>(value)
             .map_err(RpgMakerProjectionCodecError::Decode)?
-            .try_into()?;
+            .try_into()
+            .map_err(RpgMakerProjectionCodecError::Location)?;
         let canonical = Self::encode_mutation_resource(&resource)?;
         if canonical != value {
             return Err(RpgMakerProjectionCodecError::NonCanonical);
@@ -176,23 +177,9 @@ fn codec_json_error_detail(source: &serde_json::Error) -> String {
     )
 }
 
-enum StoredLocation {
-    Value {
-        source: StoredSource,
-        steps: Vec<StoredStep>,
-    },
-    NoteTag {
-        source: StoredSource,
-        container_steps: Vec<StoredStep>,
-        tag_name: String,
-        occurrence: usize,
-    },
-    CommentTag {
-        source: StoredSource,
-        command_steps: Vec<StoredStep>,
-        tag_name: String,
-        occurrence: usize,
-    },
+struct StoredLocation {
+    source: StoredSource,
+    steps: Vec<StoredStep>,
 }
 
 impl StoredLocation {
@@ -203,36 +190,14 @@ impl StoredLocation {
             .and_then(Value::as_str)
             .ok_or_else(|| "位置缺少字符串种类标记".to_owned())?
             .to_owned();
-        match tag.as_str() {
-            "v" => {
-                let [_, source, steps] = exact_fields(fields, "值位置")?;
-                Ok(Self::Value {
-                    source: parse_source(source)?,
-                    steps: parse_steps(steps)?,
-                })
-            }
-            "n" => {
-                let [_, source, steps, tag_name, occurrence] =
-                    exact_fields(fields, "备注标签位置")?;
-                Ok(Self::NoteTag {
-                    source: parse_source(source)?,
-                    container_steps: parse_steps(steps)?,
-                    tag_name: expect_string(tag_name, "备注标签名")?,
-                    occurrence: expect_usize(occurrence, "备注标签序号")?,
-                })
-            }
-            "c" => {
-                let [_, source, steps, tag_name, occurrence] =
-                    exact_fields(fields, "注释标签位置")?;
-                Ok(Self::CommentTag {
-                    source: parse_source(source)?,
-                    command_steps: parse_steps(steps)?,
-                    tag_name: expect_string(tag_name, "注释标签名")?,
-                    occurrence: expect_usize(occurrence, "注释标签序号")?,
-                })
-            }
-            _ => Err(format!("位置包含未知种类标记：{tag}")),
+        if tag != "v" {
+            return Err(format!("位置包含未知种类标记：{tag}"));
         }
+        let [_, source, steps] = exact_fields(fields, "值位置")?;
+        Ok(Self {
+            source: parse_source(source)?,
+            steps: parse_steps(steps)?,
+        })
     }
 }
 
@@ -241,121 +206,24 @@ impl Serialize for StoredLocation {
     where
         S: Serializer,
     {
-        match self {
-            Self::Value { source, steps } => {
-                let mut sequence = serializer.serialize_seq(Some(3))?;
-                sequence.serialize_element("v")?;
-                sequence.serialize_element(source)?;
-                sequence.serialize_element(steps)?;
-                sequence.end()
-            }
-            Self::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => {
-                let mut sequence = serializer.serialize_seq(Some(5))?;
-                sequence.serialize_element("n")?;
-                sequence.serialize_element(source)?;
-                sequence.serialize_element(container_steps)?;
-                sequence.serialize_element(tag_name)?;
-                sequence.serialize_element(occurrence)?;
-                sequence.end()
-            }
-            Self::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => {
-                let mut sequence = serializer.serialize_seq(Some(5))?;
-                sequence.serialize_element("c")?;
-                sequence.serialize_element(source)?;
-                sequence.serialize_element(command_steps)?;
-                sequence.serialize_element(tag_name)?;
-                sequence.serialize_element(occurrence)?;
-                sequence.end()
-            }
-        }
+        let mut sequence = serializer.serialize_seq(Some(3))?;
+        sequence.serialize_element("v")?;
+        sequence.serialize_element(&self.source)?;
+        sequence.serialize_element(&self.steps)?;
+        sequence.end()
     }
 }
 
-enum LocationRef<'a> {
-    Value {
-        source: &'a RpgMakerSource,
-        steps: &'a [RpgMakerLocationStep],
-    },
-    NoteTag {
-        source: &'a RpgMakerSource,
-        container_steps: &'a [RpgMakerLocationStep],
-        tag_name: &'a str,
-        occurrence: usize,
-    },
-    CommentTag {
-        source: &'a RpgMakerSource,
-        command_steps: &'a [RpgMakerLocationStep],
-        tag_name: &'a str,
-        occurrence: usize,
-    },
+struct LocationRef<'a> {
+    source: &'a RpgMakerSource,
+    steps: &'a [RpgMakerLocationStep],
 }
 
 impl<'a> From<&'a RpgMakerLocation> for LocationRef<'a> {
     fn from(location: &'a RpgMakerLocation) -> Self {
-        match location {
-            RpgMakerLocation::Value { source, steps } => Self::Value { source, steps },
-            RpgMakerLocation::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => Self::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence: *occurrence,
-            },
-            RpgMakerLocation::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => Self::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence: *occurrence,
-            },
-        }
-    }
-}
-
-impl<'a> From<&'a MutationResource> for LocationRef<'a> {
-    fn from(resource: &'a MutationResource) -> Self {
-        match resource {
-            MutationResource::Value { source, steps } => Self::Value { source, steps },
-            MutationResource::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => Self::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence: *occurrence,
-            },
-            MutationResource::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => Self::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence: *occurrence,
-            },
+        Self {
+            source: location.source(),
+            steps: location.steps(),
         }
     }
 }
@@ -365,43 +233,11 @@ impl Serialize for LocationRef<'_> {
     where
         S: Serializer,
     {
-        match self {
-            Self::Value { source, steps } => {
-                let mut sequence = serializer.serialize_seq(Some(3))?;
-                sequence.serialize_element("v")?;
-                sequence.serialize_element(&SourceRef(source))?;
-                sequence.serialize_element(&StepsRef(steps))?;
-                sequence.end()
-            }
-            Self::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => {
-                let mut sequence = serializer.serialize_seq(Some(5))?;
-                sequence.serialize_element("n")?;
-                sequence.serialize_element(&SourceRef(source))?;
-                sequence.serialize_element(&StepsRef(container_steps))?;
-                sequence.serialize_element(tag_name)?;
-                sequence.serialize_element(occurrence)?;
-                sequence.end()
-            }
-            Self::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => {
-                let mut sequence = serializer.serialize_seq(Some(5))?;
-                sequence.serialize_element("c")?;
-                sequence.serialize_element(&SourceRef(source))?;
-                sequence.serialize_element(&StepsRef(command_steps))?;
-                sequence.serialize_element(tag_name)?;
-                sequence.serialize_element(occurrence)?;
-                sequence.end()
-            }
-        }
+        let mut sequence = serializer.serialize_seq(Some(3))?;
+        sequence.serialize_element("v")?;
+        sequence.serialize_element(&SourceRef(self.source))?;
+        sequence.serialize_element(&StepsRef(self.steps))?;
+        sequence.end()
     }
 }
 
@@ -572,33 +408,9 @@ fn parse_steps(value: Value) -> Result<Vec<StoredStep>, String> {
 
 impl From<&RpgMakerLocation> for StoredLocation {
     fn from(location: &RpgMakerLocation) -> Self {
-        match location {
-            RpgMakerLocation::Value { source, steps } => Self::Value {
-                source: source.into(),
-                steps: steps.iter().map(Into::into).collect(),
-            },
-            RpgMakerLocation::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => Self::NoteTag {
-                source: source.into(),
-                container_steps: container_steps.iter().map(Into::into).collect(),
-                tag_name: tag_name.clone(),
-                occurrence: *occurrence,
-            },
-            RpgMakerLocation::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => Self::CommentTag {
-                source: source.into(),
-                command_steps: command_steps.iter().map(Into::into).collect(),
-                tag_name: tag_name.clone(),
-                occurrence: *occurrence,
-            },
+        Self {
+            source: location.source().into(),
+            steps: location.steps().iter().map(Into::into).collect(),
         }
     }
 }
@@ -607,34 +419,10 @@ impl TryFrom<StoredLocation> for RpgMakerLocation {
     type Error = RpgMakerLocationCodecError;
 
     fn try_from(location: StoredLocation) -> Result<Self, Self::Error> {
-        match location {
-            StoredLocation::Value { source, steps } => Ok(Self::value(
-                source.try_into()?,
-                steps.into_iter().map(Into::into).collect(),
-            )),
-            StoredLocation::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => Ok(Self::note_tag(
-                source.try_into()?,
-                container_steps.into_iter().map(Into::into).collect(),
-                tag_name,
-                occurrence,
-            )),
-            StoredLocation::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => Ok(Self::comment_tag(
-                source.try_into()?,
-                command_steps.into_iter().map(Into::into).collect(),
-                tag_name,
-                occurrence,
-            )),
-        }
+        Ok(Self::value(
+            location.source.try_into()?,
+            location.steps.into_iter().map(Into::into).collect(),
+        ))
     }
 }
 
@@ -816,80 +604,6 @@ impl TryFrom<StoredRole> for TextUnitRole {
     }
 }
 
-impl From<&MutationResource> for StoredLocation {
-    fn from(resource: &MutationResource) -> Self {
-        match resource {
-            MutationResource::Value { source, steps } => Self::Value {
-                source: source.into(),
-                steps: steps.iter().map(Into::into).collect(),
-            },
-            MutationResource::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => Self::NoteTag {
-                source: source.into(),
-                container_steps: container_steps.iter().map(Into::into).collect(),
-                tag_name: tag_name.clone(),
-                occurrence: *occurrence,
-            },
-            MutationResource::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => Self::CommentTag {
-                source: source.into(),
-                command_steps: command_steps.iter().map(Into::into).collect(),
-                tag_name: tag_name.clone(),
-                occurrence: *occurrence,
-            },
-        }
-    }
-}
-
-impl TryFrom<StoredLocation> for MutationResource {
-    type Error = RpgMakerProjectionCodecError;
-
-    fn try_from(resource: StoredLocation) -> Result<Self, Self::Error> {
-        match resource {
-            StoredLocation::Value { source, steps } => Ok(Self::Value {
-                source: source
-                    .try_into()
-                    .map_err(RpgMakerProjectionCodecError::Location)?,
-                steps: steps.into_iter().map(Into::into).collect(),
-            }),
-            StoredLocation::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => Ok(Self::NoteTag {
-                source: source
-                    .try_into()
-                    .map_err(RpgMakerProjectionCodecError::Location)?,
-                container_steps: container_steps.into_iter().map(Into::into).collect(),
-                tag_name,
-                occurrence,
-            }),
-            StoredLocation::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => Ok(Self::CommentTag {
-                source: source
-                    .try_into()
-                    .map_err(RpgMakerProjectionCodecError::Location)?,
-                command_steps: command_steps.into_iter().map(Into::into).collect(),
-                tag_name,
-                occurrence,
-            }),
-        }
-    }
-}
-
 #[derive(Deserialize, Serialize)]
 enum StoredRecipe {
     #[serde(rename = "d")]
@@ -973,10 +687,6 @@ impl TryFrom<StoredRecipe> for TextProjectionRecipe {
 enum StoredMutationClaim {
     #[serde(rename = "v")]
     Value(StoredLocation),
-    #[serde(rename = "n")]
-    NoteTag(StoredLocation),
-    #[serde(rename = "c")]
-    CommentTag(StoredLocation, Vec<StoredLocation>),
     #[serde(rename = "e")]
     EventBlock(StoredLocation, Vec<StoredLocation>),
 }
@@ -985,14 +695,6 @@ impl From<&MutationClaim> for StoredMutationClaim {
     fn from(claim: &MutationClaim) -> Self {
         match claim {
             MutationClaim::Value(location) => Self::Value(location.into()),
-            MutationClaim::NoteTag(location) => Self::NoteTag(location.into()),
-            MutationClaim::CommentTag {
-                location,
-                backing_values,
-            } => Self::CommentTag(
-                location.into(),
-                backing_values.iter().map(Into::into).collect(),
-            ),
             MutationClaim::EventBlock {
                 header,
                 covered_values,
@@ -1014,36 +716,7 @@ impl TryFrom<StoredMutationClaim> for MutationClaim {
                 .map_err(RpgMakerProjectionCodecError::Location)
         };
         match claim {
-            StoredMutationClaim::Value(location) => {
-                let location = decode(location)?;
-                if !matches!(location, RpgMakerLocation::Value { .. }) {
-                    return Err(RpgMakerProjectionCodecError::MutationClaimKindMismatch {
-                        expected: "value",
-                        actual: location_kind(&location),
-                    });
-                }
-                Ok(MutationClaim::Value(location))
-            }
-            StoredMutationClaim::NoteTag(location) => {
-                let location = decode(location)?;
-                if !matches!(location, RpgMakerLocation::NoteTag { .. }) {
-                    return Err(RpgMakerProjectionCodecError::MutationClaimKindMismatch {
-                        expected: "note_tag",
-                        actual: location_kind(&location),
-                    });
-                }
-                Ok(MutationClaim::NoteTag(location))
-            }
-            StoredMutationClaim::CommentTag(location, backing_values) => {
-                MutationClaim::comment_tag(
-                    decode(location)?,
-                    backing_values
-                        .into_iter()
-                        .map(decode)
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
-                .map_err(RpgMakerProjectionCodecError::Projection)
-            }
+            StoredMutationClaim::Value(location) => Ok(MutationClaim::Value(decode(location)?)),
             StoredMutationClaim::EventBlock(header, covered_values) => MutationClaim::event_block(
                 decode(header)?,
                 covered_values
@@ -1194,18 +867,6 @@ pub(crate) enum RpgMakerProjectionCodecError {
     NonCanonical,
     Location(RpgMakerLocationCodecError),
     Projection(ProjectionModelError),
-    MutationClaimKindMismatch {
-        expected: &'static str,
-        actual: &'static str,
-    },
-}
-
-fn location_kind(location: &RpgMakerLocation) -> &'static str {
-    match location {
-        RpgMakerLocation::Value { .. } => "value",
-        RpgMakerLocation::NoteTag { .. } => "note_tag",
-        RpgMakerLocation::CommentTag { .. } => "comment_tag",
-    }
 }
 
 impl fmt::Display for RpgMakerProjectionCodecError {
@@ -1216,10 +877,6 @@ impl fmt::Display for RpgMakerProjectionCodecError {
             Self::NonCanonical => write!(formatter, "RPG Maker 文本投影不是规范紧凑 JSON"),
             Self::Location(source) => write!(formatter, "文本投影位置无效：{source}"),
             Self::Projection(source) => write!(formatter, "文本投影配方无效：{source}"),
-            Self::MutationClaimKindMismatch { expected, actual } => write!(
-                formatter,
-                "文本投影 Claim 种类与位置不一致：期待 {expected}，实际为 {actual}"
-            ),
         }
     }
 }
@@ -1231,7 +888,6 @@ impl Error for RpgMakerProjectionCodecError {
             Self::NonCanonical => None,
             Self::Location(source) => Some(source),
             Self::Projection(source) => Some(source),
-            Self::MutationClaimKindMismatch { .. } => None,
         }
     }
 }
@@ -1260,9 +916,6 @@ impl RpgMakerProjectionCodecError {
             Self::Projection(source) => format!(
                 "codec=projection; kind=invalid_projection; {}",
                 crate::rpg_maker::dialogue::projection_model_detail(source)
-            ),
-            Self::MutationClaimKindMismatch { expected, actual } => format!(
-                "codec=projection; kind=mutation_claim_kind_mismatch; expected={expected}; actual={actual}"
             ),
         }
     }
@@ -1293,77 +946,61 @@ mod tests {
     }
 
     #[test]
-    fn every_location_variant_and_decoding_boundary_round_trips() {
-        let locations = [
-            (
-                RpgMakerLocation::note_tag(
-                    RpgMakerSource::data(StandardDataFile::Items),
-                    vec![RpgMakerLocationStep::index(2)],
-                    "Category",
-                    1,
-                ),
-                r#"["n",["d","Items.json"],[2],"Category",1]"#,
-            ),
-            (
-                RpgMakerLocation::comment_tag(
-                    RpgMakerSource::map(3),
-                    vec![
-                        RpgMakerLocationStep::key("events"),
-                        RpgMakerLocationStep::index(1),
-                        RpgMakerLocationStep::DecodeJsonString,
-                    ],
-                    "Quest",
-                    0,
-                ),
-                r#"["c",["m",3],["events",1,null],"Quest",0]"#,
-            ),
-            (
-                RpgMakerLocation::value(
-                    RpgMakerSource::plugin_parameter(4, "QuestMenu", "Categories"),
-                    vec![
-                        RpgMakerLocationStep::DecodeJsonString,
-                        RpgMakerLocationStep::index(2),
-                        RpgMakerLocationStep::key("Name"),
-                    ],
-                ),
-                r#"["v",["p",4,"QuestMenu","Categories"],[null,2,"Name"]]"#,
-            ),
-        ];
+    fn unknown_location_marker_is_an_ordinary_decode_failure() {
+        let encoded = r#"["x",["d","Items.json"],[]]"#;
 
-        for (location, expected) in locations {
-            let encoded = RpgMakerLocationCodec::encode(&location).expect("位置应该可编码");
-            assert_eq!(encoded, expected);
-            assert_eq!(
-                serde_json::to_string(&StoredLocation::from(&location))
-                    .expect("嵌入配方的位置应该可编码"),
-                expected
-            );
-            assert_eq!(
-                RpgMakerLocationCodec::decode(&encoded).expect("位置应该可解码"),
-                location
-            );
-        }
+        assert!(matches!(
+            RpgMakerLocationCodec::decode(encoded),
+            Err(RpgMakerLocationCodecError::Decode(_))
+        ));
+        assert!(matches!(
+            RpgMakerProjectionCodec::decode_mutation_resource(encoded),
+            Err(RpgMakerProjectionCodecError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn decoded_plugin_parameter_location_round_trips() {
+        let location = RpgMakerLocation::value(
+            RpgMakerSource::plugin_parameter(4, "QuestMenu", "Categories"),
+            vec![
+                RpgMakerLocationStep::DecodeJsonString,
+                RpgMakerLocationStep::index(2),
+                RpgMakerLocationStep::key("Name"),
+            ],
+        );
+        let expected = r#"["v",["p",4,"QuestMenu","Categories"],[null,2,"Name"]]"#;
+
+        let encoded = RpgMakerLocationCodec::encode(&location).expect("位置应该可编码");
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            serde_json::to_string(&StoredLocation::from(&location))
+                .expect("嵌入配方的位置应该可编码"),
+            expected
+        );
+        assert_eq!(
+            RpgMakerLocationCodec::decode(&encoded).expect("位置应该可解码"),
+            location
+        );
     }
 
     #[test]
     fn mutation_resource_uses_the_same_exact_compact_location_bytes() {
-        let resource = MutationResource::CommentTag {
-            source: RpgMakerSource::plugin_parameter(7, "QuestMenu", "Help"),
-            command_steps: vec![
+        let resource = RpgMakerLocation::value(
+            RpgMakerSource::plugin_parameter(7, "QuestMenu", "Help"),
+            vec![
                 RpgMakerLocationStep::key("list"),
                 RpgMakerLocationStep::index(12),
                 RpgMakerLocationStep::DecodeJsonString,
             ],
-            tag_name: "Hint".to_owned(),
-            occurrence: 2,
-        };
+        );
 
         let encoded =
             RpgMakerProjectionCodec::encode_mutation_resource(&resource).expect("资源应该可编码");
 
         assert_eq!(
             encoded,
-            r#"["c",["p",7,"QuestMenu","Help"],["list",12,null],"Hint",2]"#
+            r#"["v",["p",7,"QuestMenu","Help"],["list",12,null]]"#
         );
         assert_eq!(
             RpgMakerProjectionCodec::decode_mutation_resource(&encoded).expect("资源应该可解码"),
@@ -1452,46 +1089,20 @@ mod tests {
         );
 
         let maximum_index = usize::MAX;
-        let maximum_usize = RpgMakerLocation::note_tag(
+        let maximum_usize = RpgMakerLocation::value(
             RpgMakerSource::plugin_parameter(maximum_index, "Plugin", "Parameter"),
             vec![RpgMakerLocationStep::index(maximum_index)],
-            "Tag",
-            maximum_index,
         );
         let encoded_usize =
             RpgMakerLocationCodec::encode(&maximum_usize).expect("平台 usize 上界应可编码");
         assert_eq!(
             encoded_usize,
-            format!(
-                r#"["n",["p",{maximum_index},"Plugin","Parameter"],[{maximum_index}],"Tag",{maximum_index}]"#
-            )
+            format!(r#"["v",["p",{maximum_index},"Plugin","Parameter"],[{maximum_index}]]"#)
         );
         assert_eq!(
             RpgMakerLocationCodec::decode(&encoded_usize).expect("平台 usize 上界应可解码"),
             maximum_usize
         );
-    }
-
-    #[test]
-    fn stored_mutation_claim_kind_must_match_its_location_variant() {
-        let note = RpgMakerLocation::note_tag(
-            RpgMakerSource::data(StandardDataFile::Items),
-            vec![RpgMakerLocationStep::index(1)],
-            "Help",
-            0,
-        );
-
-        let error =
-            MutationClaim::try_from(StoredMutationClaim::Value(StoredLocation::from(&note)))
-                .expect_err("Value Claim 不得夹带 NoteTag 位置");
-
-        assert!(matches!(
-            error,
-            RpgMakerProjectionCodecError::MutationClaimKindMismatch {
-                expected: "value",
-                actual: "note_tag"
-            }
-        ));
     }
 
     #[test]
@@ -1503,12 +1114,6 @@ mod tests {
         let covered = RpgMakerLocation::value(
             RpgMakerSource::data(StandardDataFile::CommonEvents),
             vec![RpgMakerLocationStep::index(2)],
-        );
-        let note = RpgMakerLocation::note_tag(
-            RpgMakerSource::data(StandardDataFile::CommonEvents),
-            vec![RpgMakerLocationStep::index(2)],
-            "Tag",
-            0,
         );
         let cross_source = RpgMakerLocation::value(
             RpgMakerSource::data(StandardDataFile::Items),
@@ -1528,14 +1133,12 @@ mod tests {
                 ProjectionModelError::EventBlockCoverageRequired
             ))
         ));
-        for invalid in [&note, &cross_source] {
-            assert!(matches!(
-                MutationClaim::try_from(stored(vec![invalid])),
-                Err(RpgMakerProjectionCodecError::Projection(
-                    ProjectionModelError::InvalidEventBlockCoverage
-                ))
-            ));
-        }
+        assert!(matches!(
+            MutationClaim::try_from(stored(vec![&cross_source])),
+            Err(RpgMakerProjectionCodecError::Projection(
+                ProjectionModelError::InvalidEventBlockCoverage
+            ))
+        ));
     }
 
     #[test]

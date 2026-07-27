@@ -22,7 +22,7 @@ use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
 };
-use crate::rpg_maker::model::{MutationResource, MutationResourceAccess, TextUnitRole};
+use crate::rpg_maker::model::{MutationResourceAccess, TextUnitRole};
 #[cfg(test)]
 use crate::rpg_maker::mutation_claim_summary::collision_summary;
 #[cfg(not(test))]
@@ -1149,7 +1149,7 @@ enum ClaimIndexMaintenance {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MutationClaimConflictDetails {
-    resource: MutationResource,
+    resource: RpgMakerLocation,
     incoming_owner: RpgMakerStandardAssetOwner,
     incoming_group_location: RpgMakerLocation,
     incoming_access: MutationResourceAccess,
@@ -1569,9 +1569,6 @@ fn projection_codec_failure_detail(source: &RpgMakerProjectionCodecError) -> Str
             )
         }
         RpgMakerProjectionCodecError::Projection(_) => "kind=projection_model_invalid".to_owned(),
-        RpgMakerProjectionCodecError::MutationClaimKindMismatch { expected, actual } => {
-            format!("kind=mutation_claim_kind_mismatch; expected={expected}; actual={actual}")
-        }
     }
 }
 
@@ -2908,12 +2905,10 @@ mod tests {
             None,
         )
         .expect("测试快照应可合并");
-        let shared_root =
-            RpgMakerProjectionCodec::encode_mutation_resource(&MutationResource::Value {
-                source: RpgMakerSource::data(StandardDataFile::Items),
-                steps: Vec::new(),
-            })
-            .expect("共享根资源应可编码");
+        let shared_root = RpgMakerProjectionCodec::encode_mutation_resource(
+            &RpgMakerLocation::value(RpgMakerSource::data(StandardDataFile::Items), Vec::new()),
+        )
+        .expect("共享根资源应可编码");
         let logical = snapshot
             .claims
             .iter()
@@ -4065,12 +4060,10 @@ mod tests {
             RpgMakerSource::data(StandardDataFile::Items),
             vec![RpgMakerLocationStep::index(7)],
         );
-        let resource_key =
-            RpgMakerProjectionCodec::encode_mutation_resource(&MutationResource::Value {
-                source: RpgMakerSource::data(StandardDataFile::Items),
-                steps: Vec::new(),
-            })
-            .expect("测试资源应可编码");
+        let resource_key = RpgMakerProjectionCodec::encode_mutation_resource(
+            &RpgMakerLocation::value(RpgMakerSource::data(StandardDataFile::Items), Vec::new()),
+        )
+        .expect("测试资源应可编码");
         let json_error = || {
             serde_json::from_str::<serde_json::Value>("{")
                 .expect_err("不完整 JSON 必须产生类型化错误")
@@ -4094,16 +4087,6 @@ mod tests {
                 EncodeAssetSnapshotError::Location(RpgMakerLocationCodecError::NonCanonical),
                 "group_location",
                 "kind=non_canonical",
-            ),
-            (
-                EncodeAssetSnapshotError::Projection(
-                    RpgMakerProjectionCodecError::MutationClaimKindMismatch {
-                        expected: "value",
-                        actual: "note_tag",
-                    },
-                ),
-                "projection_recipe_json",
-                "expected=value; actual=note_tag",
             ),
             (
                 EncodeAssetSnapshotError::SourceContent(json_error()),
@@ -4747,16 +4730,14 @@ mod tests {
     }
 
     fn assert_large_data_root_location(location: &RpgMakerLocation, ordinal: usize) {
-        match location {
-            RpgMakerLocation::Value {
-                source: RpgMakerSource::DataFile(file),
-                steps,
-            } => {
-                assert_eq!(file.as_str(), large_data_file_name(ordinal));
-                assert!(steps.is_empty(), "大项目 Group 应保持 data 文档根位置");
-            }
-            actual => panic!("大项目自然序 Group 位置无效：{actual}"),
-        }
+        let RpgMakerSource::DataFile(file) = location.source() else {
+            panic!("大项目自然序 Group 来源无效：{location}");
+        };
+        assert_eq!(file.as_str(), large_data_file_name(ordinal));
+        assert!(
+            location.steps().is_empty(),
+            "大项目 Group 应保持 data 文档根位置"
+        );
     }
 
     fn seed_large_group_and_unit_snapshot(
@@ -4932,13 +4913,13 @@ mod tests {
         let source = RpgMakerSource::data(StandardDataFile::Items);
         let group_location =
             RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(1)]);
-        let resource = MutationResource::Value {
+        let resource = RpgMakerLocation::value(
             source,
-            steps: vec![
+            vec![
                 RpgMakerLocationStep::index(1),
                 RpgMakerLocationStep::key("name"),
             ],
-        };
+        );
         SqliteRow::new(vec![
             text(
                 RpgMakerProjectionCodec::encode_mutation_resource(&resource)

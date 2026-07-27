@@ -1127,15 +1127,6 @@ fn is_safe_capture_name(value: &str) -> bool {
 pub(crate) fn projection_model_detail(source: &ProjectionModelError) -> String {
     match source {
         ProjectionModelError::EmptyScalarFieldKey => "structure=empty_scalar_field_key".to_owned(),
-        ProjectionModelError::CommentTagBackingRequired => {
-            "structure=comment_tag_backing_required".to_owned()
-        }
-        ProjectionModelError::InvalidCommentTagBacking => {
-            "structure=invalid_comment_tag_backing".to_owned()
-        }
-        ProjectionModelError::EventBlockHeaderMustBeValue => {
-            "structure=event_block_header_must_be_value".to_owned()
-        }
         ProjectionModelError::EventBlockCoverageRequired => {
             "structure=event_block_coverage_required".to_owned()
         }
@@ -1144,9 +1135,6 @@ pub(crate) fn projection_model_detail(source: &ProjectionModelError) -> String {
         }
         ProjectionModelError::MutationClaimTargetMismatch => {
             "structure=mutation_claim_target_mismatch".to_owned()
-        }
-        ProjectionModelError::InvalidDialoguePhysicalLocation => {
-            "structure=invalid_dialogue_physical_location".to_owned()
         }
         ProjectionModelError::RecipeHasNoTextSlot => "structure=recipe_has_no_text_slot".to_owned(),
         ProjectionModelError::DuplicateProjectionSlot {

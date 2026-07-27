@@ -2513,7 +2513,7 @@ mod tests {
         RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
         RpgMakerTranslationRequestConfiguration, TranslationResponseEnvelope,
     };
-    use crate::rpg_maker::translate::standard::StandardTranslationAsset;
+    use crate::rpg_maker::translate::standard::{AppliedPlaceholder, StandardTranslationAsset};
 
     #[derive(Clone, Copy)]
     struct ImmediateCpu;
@@ -3365,6 +3365,87 @@ mod tests {
             assert!(prompt.contains(expected), "多行标量应使用自由断行契约");
         }
         assert!(!prompt.contains("(single line)"));
+    }
+
+    #[tokio::test]
+    async fn custom_placeholder_scope_is_shared_by_builtin_and_rules_owners() {
+        let placeholder_path = PathBuf::from("C:/input/help-placeholders.toml");
+        let reader = TranslationPlanningResourceReadingService::new(
+            MemoryFileReader {
+                files: Arc::new(BTreeMap::from([(
+                    placeholder_path.clone(),
+                    br#"
+[[rule]]
+scopes = ["database_entry"]
+pattern = '\A<Help:(?<text>.*?)>\z'
+"#
+                    .to_vec(),
+                )])),
+            },
+            ImmediateCpu,
+        );
+        let planner = RpgMakerStandardTranslationTaskPlanningService::<_, _, ()>::new(
+            reader,
+            translation_resources(),
+            Pcre2PlaceholderService::new().expect("内建占位符应该可编译"),
+            ImmediateCpu,
+        );
+        let original = "<Help:炎の剣の説明>";
+        let source = RpgMakerSource::data(StandardDataFile::Items);
+        let group = |owner, index| {
+            let group_location =
+                RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(index)]);
+            let identity = TranslationUnitIdentity::new(
+                owner,
+                TextGroupKind::DatabaseEntry,
+                group_location.clone(),
+                TextUnitRole::Scalar(ScalarFieldKey::new("note").expect("字段键应合法")),
+                TextUnitContent::Value(original.to_owned()),
+                "{}",
+            );
+            StandardTranslationGroup::new(
+                TextGroupKind::DatabaseEntry,
+                group_location,
+                vec![StandardTranslationAsset::new(identity, None, None)],
+            )
+        };
+        let corpus = StandardTranslationCorpus::new(vec![
+            group(RpgMakerStandardAssetOwner::Builtin, 1),
+            group(RpgMakerStandardAssetOwner::Rules, 2),
+        ]);
+
+        let (_, _, tasks) = planner
+            .plan(
+                &project(),
+                &profile(10_000),
+                corpus,
+                StandardTranslationInput::new(None, Some(placeholder_path)),
+            )
+            .await
+            .expect("同 kind 的两个 owner 应共享 Placeholder 与去重族")
+            .into_parts();
+
+        assert_eq!(tasks.len(), 1);
+        let [output] = tasks[0].expected_outputs() else {
+            panic!("同原文同 kind 应只有一个活动代表")
+        };
+        assert_eq!(
+            output.identity().owner(),
+            RpgMakerStandardAssetOwner::Builtin
+        );
+        assert_eq!(output.propagation_targets().len(), 1);
+        assert_eq!(
+            output.propagation_targets()[0].owner(),
+            RpgMakerStandardAssetOwner::Rules
+        );
+        assert_eq!(
+            output
+                .applied_placeholders()
+                .iter()
+                .map(AppliedPlaceholder::original)
+                .collect::<Vec<_>>(),
+            ["<Help:", ">"]
+        );
     }
 
     #[tokio::test]

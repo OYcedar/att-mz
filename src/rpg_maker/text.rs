@@ -281,102 +281,30 @@ impl RpgMakerLocationStep {
     }
 }
 
-/// 一个物理值或局部文本容器的结构化权威地址。
+/// 一个物理 JSON 值的结构化权威地址。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum RpgMakerLocation {
-    Value {
-        source: RpgMakerSource,
-        steps: Vec<RpgMakerLocationStep>,
-    },
-    NoteTag {
-        source: RpgMakerSource,
-        container_steps: Vec<RpgMakerLocationStep>,
-        tag_name: String,
-        occurrence: usize,
-    },
-    CommentTag {
-        source: RpgMakerSource,
-        command_steps: Vec<RpgMakerLocationStep>,
-        tag_name: String,
-        occurrence: usize,
-    },
+pub(crate) struct RpgMakerLocation {
+    source: RpgMakerSource,
+    steps: Vec<RpgMakerLocationStep>,
 }
 
 impl RpgMakerLocation {
     pub(crate) fn value(source: RpgMakerSource, steps: Vec<RpgMakerLocationStep>) -> Self {
-        Self::Value { source, steps }
-    }
-
-    pub(crate) fn note_tag(
-        source: RpgMakerSource,
-        container_steps: Vec<RpgMakerLocationStep>,
-        tag_name: impl Into<String>,
-        occurrence: usize,
-    ) -> Self {
-        Self::NoteTag {
-            source,
-            container_steps,
-            tag_name: tag_name.into(),
-            occurrence,
-        }
-    }
-
-    pub(crate) fn comment_tag(
-        source: RpgMakerSource,
-        command_steps: Vec<RpgMakerLocationStep>,
-        tag_name: impl Into<String>,
-        occurrence: usize,
-    ) -> Self {
-        Self::CommentTag {
-            source,
-            command_steps,
-            tag_name: tag_name.into(),
-            occurrence,
-        }
+        Self { source, steps }
     }
 
     pub(crate) fn source(&self) -> &RpgMakerSource {
-        match self {
-            Self::Value { source, .. }
-            | Self::NoteTag { source, .. }
-            | Self::CommentTag { source, .. } => source,
-        }
+        &self.source
     }
 
     pub(crate) fn steps(&self) -> &[RpgMakerLocationStep] {
-        match self {
-            Self::Value { steps, .. } => steps,
-            Self::NoteTag {
-                container_steps, ..
-            } => container_steps,
-            Self::CommentTag { command_steps, .. } => command_steps,
-        }
+        &self.steps
     }
 }
 
 impl fmt::Display for RpgMakerLocation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Value { source, steps } => write_path(formatter, source, steps),
-            Self::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => {
-                write_path(formatter, source, container_steps)?;
-                write!(formatter, ".note#{tag_name}[{occurrence}]")
-            }
-            Self::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => {
-                write_path(formatter, source, command_steps)?;
-                write!(formatter, "#comment:{tag_name}[{occurrence}]")
-            }
-        }
+        write_path(formatter, &self.source, &self.steps)
     }
 }
 

@@ -511,7 +511,6 @@ task-record-rejection-reason = { $code ->
     [unexpected_placeholder] Placeholder inattendu : { $detail }
     [placeholder_normalization_ambiguous] Normalisation du placeholder ambiguë : { $detail }
     [source_residual] Résidu de la langue source détecté : { $detail }
-    [tag_value_contains_closing_delimiter] La ligne { $line } contient '>' qui fermerait la valeur de balise prématurément
    *[other] { $detail }
 }
 task-record-protocol-detail = { $code ->

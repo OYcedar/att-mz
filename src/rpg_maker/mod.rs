@@ -20,7 +20,6 @@ pub(crate) mod project_lease;
 mod project_name;
 pub(crate) mod standard_asset;
 pub(crate) mod standard_asset_storage;
-pub(crate) mod tag;
 pub(crate) mod text;
 pub(crate) mod translate;
 pub(crate) mod write_back;

@@ -876,11 +876,6 @@ fn parse_lua_standard_group(value: Value) -> Result<ExtractedTextGroup, TrustedL
             .map_err(|error| extract_argument_error(error.to_string()))?,
         "group.location",
     )?;
-    if !matches!(group_location, RpgMakerLocation::Value { .. }) {
-        return Err(extract_argument_error(
-            "extract group.location 必须是 document:location 建立的 Value 地址".to_owned(),
-        ));
-    }
     let fields: Value = group
         .get("fields")
         .map_err(|error| extract_argument_error(error.to_string()))?;
@@ -3514,62 +3509,6 @@ impl UserData for LuaRpgMakerDocument {
             })?;
             checked_host_function(lua, native)
         });
-        fields.add_field_method_get("note_tag", |lua, this| {
-            let document = this.document.clone();
-            let native = lua.create_function(
-                move |lua,
-                      (_document, path, tag_name, occurrence): (
-                    Value,
-                    Value,
-                    Value,
-                    Value,
-                )| {
-                    let result = parse_rpg_maker_path(path).and_then(|steps| {
-                        parse_rpg_maker_string(tag_name, "Note 标签名").and_then(|tag_name| {
-                            parse_rpg_maker_occurrence(occurrence).and_then(|occurrence| {
-                                document
-                                    .note_tag(&steps, &tag_name, occurrence)
-                                    .map_err(rpg_maker_host_error)
-                            })
-                        })
-                    })
-                    .map_err(|error| error.with_operation("rpg_maker.document.note_tag"));
-                    host_result_to_lua(lua, result, |lua, reference| {
-                        lua.create_userdata(LuaRpgMakerTextReference(reference))
-                            .map(Value::UserData)
-                    })
-                },
-            )?;
-            checked_host_function(lua, native)
-        });
-        fields.add_field_method_get("comment_tag", |lua, this| {
-            let document = this.document.clone();
-            let native = lua.create_function(
-                move |lua,
-                      (_document, path, tag_name, occurrence): (
-                    Value,
-                    Value,
-                    Value,
-                    Value,
-                )| {
-                    let result = parse_rpg_maker_path(path).and_then(|steps| {
-                        parse_rpg_maker_string(tag_name, "Comment 标签名").and_then(|tag_name| {
-                            parse_rpg_maker_occurrence(occurrence).and_then(|occurrence| {
-                                document
-                                    .comment_tag(&steps, &tag_name, occurrence)
-                                    .map_err(rpg_maker_host_error)
-                            })
-                        })
-                    })
-                    .map_err(|error| error.with_operation("rpg_maker.document.comment_tag"));
-                    host_result_to_lua(lua, result, |lua, reference| {
-                        lua.create_userdata(LuaRpgMakerTextReference(reference))
-                            .map(Value::UserData)
-                    })
-                },
-            )?;
-            checked_host_function(lua, native)
-        });
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -3645,13 +3584,6 @@ fn parse_rpg_maker_path(path: Value) -> Result<Vec<RpgMakerLocationStep>, Truste
             ))),
         })
         .collect()
-}
-
-fn parse_rpg_maker_occurrence(value: Value) -> Result<usize, TrustedLuaHostCallError> {
-    let value = parse_rpg_maker_integer(value, "RPG Maker 标签 occurrence")?;
-    usize::try_from(value).map_err(|_| {
-        rpg_maker_argument_error("RPG Maker 标签 occurrence 必须是非负 Lua integer".to_owned())
-    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5336,14 +5268,6 @@ assert(type(text) == "userdata")
 assert(text.original == "药水")
 assert(type(text.location) == "userdata")
 assert(tostring(text.location) == "data/Items.json[1].name")
-local note = items:note_tag({1}, "Help", 0)
-assert(note.original == "恢复 HP")
-assert(tostring(note.location) == "data/Items.json[1].note#Help[0]")
-
-local map = ctx.rpg_maker.open(ctx.rpg_maker.map(1))
-local comment = map:comment_tag({"list", 0}, "Quest", 0)
-assert(comment.original == "第一\n行")
-assert(tostring(comment.location) == "data/Map001.json.list[0]#comment:Quest[0]")
 
 local plugin = ctx.rpg_maker.open(ctx.rpg_maker.plugin_parameter(0, "Quest", "Entries"))
 local plugin_text = plugin:text({ctx.rpg_maker.DECODE_JSON, 0, "Title"})
@@ -6614,6 +6538,12 @@ assert(string.find(loader, "D800", 1, true) ~= nil)
     fn documented_example_sources() -> Arc<HashMap<String, Vec<u8>>> {
         Arc::new(HashMap::from([
             (
+                "data/Items.json".to_owned(),
+                r#"[null,{"name":"炎之剑","description":"药水","note":"<Help:炎の剣の説明>"}]"#
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
                 "data/QuestEntries.json".to_owned(),
                 r#"[{"id":"arrival","title":"星港へ","description":"港へ向かう。"}]"#
                     .as_bytes()
@@ -6650,6 +6580,9 @@ assert(string.find(loader, "D800", 1, true) ~= nil)
             }
             "lua-idempotent-write-back.lua" => {
                 include_str!("../../../docs/rpg-maker/examples/lua-idempotent-write-back.lua")
+            }
+            "lua-private-tag.lua" => {
+                include_str!("../../../docs/rpg-maker/examples/lua-private-tag.lua")
             }
             "lua-complex-protocol.lua" => {
                 include_str!("../../../docs/rpg-maker/examples/lua-complex-protocol.lua")
@@ -6978,6 +6911,104 @@ assert(string.find(loader, "D800", 1, true) ~= nil)
         let materialized: serde_json::Value =
             serde_json::from_slice(&generated[0]).expect("写回结果应为 JSON");
         assert_eq!(materialized[0]["title"], "星港");
+
+        runtime.shutdown().await.expect("Lua Runtime 应关闭");
+        storage.shutdown().await.expect("SQLite 根应关闭");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn documented_private_tag_protocol_owns_all_three_phases() {
+        let directory = tempfile::tempdir().expect("应建立文档示例临时目录");
+        let database_path = directory.path().join("project.db");
+        drop(rusqlite::Connection::open(&database_path).expect("应建立文档示例数据库"));
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let storage = documented_example_sqlite_storage();
+        let observations = Arc::new(Mutex::new(DocumentedExampleObservations::default()));
+        let sources = documented_example_sources();
+        let initial_items = sources
+            .get("data/Items.json")
+            .expect("应有 Items 来源")
+            .clone();
+        let outputs = Arc::new(Mutex::new(HashMap::from([(
+            "data/Items.json".to_owned(),
+            initial_items.clone(),
+        )])));
+
+        for phase in [LuaPhase::Extract, LuaPhase::Translate, LuaPhase::WriteBack] {
+            run_documented_example(
+                &runtime,
+                &storage,
+                DocumentedExampleRun {
+                    workspace: directory.path(),
+                    database_path: &database_path,
+                    script_name: "lua-private-tag.lua",
+                    phase,
+                    sources: Arc::clone(&sources),
+                    outputs: Arc::clone(&outputs),
+                    observations: Arc::clone(&observations),
+                    semantic_revision: "semantics-a",
+                },
+            )
+            .await;
+        }
+
+        assert_eq!(
+            observations
+                .lock()
+                .expect("文档示例观察锁不应中毒")
+                .llm_requests,
+            1,
+            "私有标签 Translate 首跑应请求一次模型"
+        );
+        let connection =
+            rusqlite::Connection::open(&database_path).expect("应重开私有标签示例数据库");
+        let (original, expected_value, translation, state): (String, String, String, String) =
+            connection
+                .query_row(
+                    "SELECT original, expected_value, translation, state \
+                     FROM lua_private_tag_unit WHERE identity = 'item:1:help:0'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("私有标签协议应保存身份、完整原值和翻译状态");
+        assert_eq!(original, "炎の剣の説明");
+        assert_eq!(expected_value, "<Help:炎の剣の説明>");
+        assert_eq!(translation, "星港");
+        assert_eq!(state.len(), 64);
+        drop(connection);
+
+        let first = outputs
+            .lock()
+            .expect("文档示例候选锁不应中毒")
+            .get("data/Items.json")
+            .expect("私有标签协议应写回 Items")
+            .clone();
+        let materialized: serde_json::Value =
+            serde_json::from_slice(&first).expect("Items 写回应为 JSON");
+        assert_eq!(materialized[1]["note"], "<Help:星港>");
+
+        *outputs.lock().expect("文档示例候选锁不应中毒") =
+            HashMap::from([("data/Items.json".to_owned(), initial_items)]);
+        run_documented_example(
+            &runtime,
+            &storage,
+            DocumentedExampleRun {
+                workspace: directory.path(),
+                database_path: &database_path,
+                script_name: "lua-private-tag.lua",
+                phase: LuaPhase::WriteBack,
+                sources,
+                outputs: Arc::clone(&outputs),
+                observations,
+                semantic_revision: "semantics-a",
+            },
+        )
+        .await;
+        assert_eq!(
+            outputs.lock().expect("文档示例候选锁不应中毒")["data/Items.json"],
+            first,
+            "相同完整原值与私有状态必须幂等重建"
+        );
 
         runtime.shutdown().await.expect("Lua Runtime 应关闭");
         storage.shutdown().await.expect("SQLite 根应关闭");

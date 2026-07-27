@@ -1,6 +1,6 @@
 # RPG Maker Lua Cookbook
 
-本页从“外部作者一次写对”出发，给出五种完整模式。所有可执行主程序位于
+本页从“外部作者一次写对”出发，给出六种完整模式。所有可执行主程序位于
 [`examples/`](examples/README.md)，测试会原样交给真实 Lua VM、临时 SQLite、冻结夹具
 和假 LLM；本页的短代码只解释关键不变量。
 
@@ -15,9 +15,9 @@
 
 ## 1. 自定义 DataFile 标量接入 Standard
 
-适用条件：每个语义字段只写回一个 Value/NoteTag/CommentTag，且 source×kind×location
+适用条件：每个语义字段就是一个完整 Value，且 source×kind×location
 满足 [replace_standard 矩阵](lua.md#6-extractreplace_standard)。跨文档、多目标不要硬塞进
-这个接口，直接跳到第 5 节。
+这个接口，直接跳到第 6 节；需要自行解释插件标签 grammar 时参见第 5 节。
 
 完整脚本：[lua-standard-data-file.lua](examples/lua-standard-data-file.lua)。它：
 
@@ -210,7 +210,43 @@ ctx.output.write_json(path, entries)
 需要布局时，在写 JSON 前调用 `ctx.write_back.layout`，并同时处理 `applied` 与正常的
 `manual` 结果；不要自行猜测 Standard 的窗口宽度。
 
-## 5. 跨文档、多目标三阶段私有协议
+## 5. 插件标签的三阶段私有协议
+
+完整脚本：[lua-private-tag.lua](examples/lua-private-tag.lua)。示例把
+`Items.json[1].note` 中的 `<Help:炎の剣の説明>` 当作插件自己的 grammar，而不是 Host
+位置类型：
+
+<!-- att-example: illustrative -->
+```text
+Extract
+  读取完整 note Value
+  -> Lua 解析唯一 <Help:...>
+  -> 私有 identity/original/expected_value
+
+Translate
+  私有 original
+  -> prepare("database_entry", original, 私有 grammar context)
+  -> is_current / LLM / accept
+  -> 私有事务成对提交 translation/state
+
+WriteBack
+  读取候选的完整 note Value
+  -> Lua 按同一 grammar 解析并复核 expected_value/original
+  -> 用已验收译文重建完整 <Help:...>
+  -> 写回完整 note Value
+```
+
+脚本自己决定 `>` 是否能够出现在私有标签值中，并在 Extract、Translate、WriteBack 使用
+同一 grammar。`translation.prepare/accept` 只负责公共 Placeholder、术语、语言和 state
+语义，不替脚本验证 `<Help:...>`。Host 只提供完整 Value 读取、公共翻译能力、SQLite 和
+候选写入；不存在标签扫描器、occurrence 或局部写回助手。
+
+如果希望把整个 `<Help:炎の剣の説明>` 作为一个 Standard Unit，也可以用
+`document:text({1, "note"})` 交给 `replace_standard`；此时候选会替换完整 Value，裸
+尖括号仍是普通内容。若只翻译正文而保留壳，应该由 Extract Rule 显式 `text` 捕获建立
+recipe，或像本节一样由 Lua 私有协议拥有。
+
+## 6. 跨文档、多目标三阶段私有协议
 
 完整脚本：[lua-complex-protocol.lua](examples/lua-complex-protocol.lua)。示例把
 `QuestGraph.json[i].title` 与 `QuestIndex.json[id].label` 视为同一个语义事实，并读取
@@ -253,7 +289,7 @@ Prompt、Client、语言模块、engine、original 或脚本 context 发生变�
 5. WriteBack 重复执行是否确定，部分目标失败时是否在写文件前停止；
 6. 发布后没有回调时，协议是否仍能从权威输入恢复。
 
-## 6. SQLite 与阶段交接检查
+## 7. SQLite 与阶段交接检查
 
 需要私有状态的阶段示例只使用 `lua_example_*` 或 `lua_complex_*` 表；人工 Standard
 示例只调用 `ctx.standard`。可信脚本虽然能执行任意单条 SQLite statement，但直接修改
@@ -271,7 +307,7 @@ ctx.db.execute("CREATE TEMP TABLE handoff(value TEXT)")
 跨阶段只使用持久私有表或 ATT 已明确拥有的标准资产。每个阶段正常返回前必须 commit 或
 rollback；活动事务不会被隐式提交。
 
-## 7. 交付前盲测
+## 8. 交付前盲测
 
 让未参与脚本编写的人只阅读 [Lua 技术参考](lua.md)、本页和目标游戏协议材料，然后用
 隔离夹具验证：

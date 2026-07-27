@@ -179,48 +179,12 @@ impl TranslationUnitIdentity {
         self.logical_location.group_location()
     }
 
-    /// 写回目标是否为 `<name:value>` 标签值。
-    ///
-    /// 标签值由提取协议保证不含 `>`；写回按字节区间拼接替换值，译文一旦引入
-    /// `>` 就会提前闭合标签并把余文泄漏为 note/comment 正文,因此验收必须拒绝。
-    pub(crate) fn targets_tag_value(&self) -> bool {
-        matches!(
-            self.group_location(),
-            RpgMakerLocation::NoteTag { .. } | RpgMakerLocation::CommentTag { .. }
-        )
-    }
-
     pub(crate) fn source_content(&self) -> &TextUnitContent {
         &self.source_content
     }
 
     pub(crate) fn source_context_json(&self) -> &str {
         &self.source_context_json
-    }
-}
-
-/// 一个候选译文最终会写入的完整目标集合所建立的约束。
-///
-/// 去重代表的物理位置不一定拥有最严格的写回协议，因此约束必须由主目标与全部
-/// 传播/家族成员共同建立，不能只观察代表 identity。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationTargetConstraints {
-    targets_tag_value: bool,
-}
-
-impl TranslationTargetConstraints {
-    pub(crate) fn from_identities<'a>(
-        identities: impl IntoIterator<Item = &'a TranslationUnitIdentity>,
-    ) -> Self {
-        Self {
-            targets_tag_value: identities
-                .into_iter()
-                .any(TranslationUnitIdentity::targets_tag_value),
-        }
-    }
-
-    pub(crate) const fn targets_tag_value(self) -> bool {
-        self.targets_tag_value
     }
 }
 
@@ -1610,11 +1574,6 @@ pub(crate) enum TranslationUnitRejectionReason {
     },
     SourceResidual {
         fragment: String,
-    },
-    /// 写回目标是 `<name:value>` 标签值：译文含 `>` 会提前闭合标签并破坏
-    /// note/comment 的标签协议，必须整单元拒绝。
-    TagValueContainsClosingDelimiter {
-        line_index: usize,
     },
 }
 

@@ -173,7 +173,7 @@ ctx.source.list(path) -> string[]
 `read` 返回字节；`read_text` 要求 UTF-8；`read_json` 使用无损 JSON；`list` 只列直接子项，
 返回稳定排序的完整逻辑子路径。门面只读 Init 冻结副本，不访问原游戏。
 
-## 5. `ctx.rpg_maker` 来源、路径与标签
+## 5. `ctx.rpg_maker` 来源、路径与完整 Value
 
 <!-- att-example: illustrative -->
 ```text
@@ -187,8 +187,6 @@ ctx.rpg_maker.open(source) -> RpgMakerDocument
 document:value(path) -> JsonValue
 document:location(path) -> RpgMakerLocation
 document:text(path) -> RpgMakerTextRef
-document:note_tag(container_path, tag_name, occurrence) -> RpgMakerTextRef
-document:comment_tag(command_path, tag_name, occurrence) -> RpgMakerTextRef
 
 text_ref.original -> string
 text_ref.location -> RpgMakerLocation
@@ -229,28 +227,25 @@ local text = document:text(path)
 ```
 
 `document:value` 每次返回与冻结文档脱离的深拷贝；修改返回 table 不会修改文档、已有引用
-或随后读取。`location`/`text` 由 Host 建立不可伪造身份，显示字符串只用于诊断。
+或随后读取。`location`/`text` 由 Host 建立不可伪造的完整 JSON Value 身份，显示字符串只
+用于诊断。`document:text` 要求路径终点本身是 string；引用的 `original` 是这个 string 的
+全部字节。裸 `<`、`>`、`:` 以及形如 `<Help:炎之剑的说明>` 的内容都没有 Host 级语法。
 
-NoteTag 与 CommentTag 只识别简单 `<name:value>`：第一个冒号分隔名和值，第一个后续 `>`
-结束；没有冒号、空名或缺少 `>` 不是标签。occurrence 按同名标签分别从 0 计数。tag name
-参数不能为空，不能含 `<`、`>`、`:`。
+路径可以包含一个或多个 `DECODE_JSON`。Standard WriteBack 会沿相同路径逐层解码，验收
+完整 Value 的冻结原文后替换整个 string，再从内向外编码为紧凑 JSON string；任一层失败
+都不会提交该文档候选。被解码层原有的 JSON 排版空白不会保留，未修改的 JSON 值与
+UTF-8 文本保留。
 
-`note_tag` 的 container 指向含 string `note` 的 object。`comment_tag` 的 command path
-必须指向一条带整数 indent 的 code 108；Host 只把紧随、code 408 且 indent 与起始 108
-相同的命令纳入当前注释块，并将其 `parameters[0]` 用 LF 拼接后定位标签。不同 indent
-立即结束当前块；WriteBack 使用同一 108+408 边界、recipe 和 occurrence。
-
-两种路径都可以包含一个或多个 `DECODE_JSON`。WriteBack 会沿相同路径逐层解码，完成全部
-类型、occurrence 和冻结原文验收后，再从内向外编码为紧凑 JSON string；任一层失败都不会
-提交该文档候选。被解码层原有的 JSON 排版空白不会保留，未修改的 JSON 值与 UTF-8 文本保留。
+插件私有标签、注释块或其他 grammar 由脚本完整拥有：Extract 读取原始 Value 后自行解析
+并建立私有身份；Translate 可按明确 kind 主动调用 `prepare/accept`；WriteBack 复核当前
+完整原值，按私有 grammar 重建，再写回完整 Value。Host 不提供标签扫描、occurrence、
+局部拼接或私有 grammar 验收。
 
 <!-- att-example: valid -->
 ```lua
 local entry = ctx.json.array({ 1 })
-local help = document:note_tag(entry, "Help", 0)
-
-local command = ctx.json.array({ "events", 1, "pages", 0, "list", 12 })
-local quest = document:comment_tag(command, "Quest", 0)
+local note = document:text(ctx.json.array({ 1, "note" }))
+assert(note.original == "<Help:炎之剑的说明>")
 ```
 
 ## 6. Extract：`replace_standard`
@@ -274,15 +269,15 @@ groups = {
 
 | kind | 合法 source | field `text` 位置 |
 |---|---|---|
-| `database_entry` | 除 System 外的标准 Data、自定义 DataFile、Map | Value 或 NoteTag |
-| `system` | 仅标准 `System.json` | Value 或 NoteTag |
-| `map` | 仅规范 Map | Value 或 NoteTag |
-| `event_command` | 标准 Data、自定义 DataFile、Map | Value 或 CommentTag |
+| `database_entry` | 除 System 外的标准 Data、自定义 DataFile、Map | Value |
+| `system` | 仅标准 `System.json` | Value |
+| `map` | 仅规范 Map | Value |
+| `event_command` | 标准 Data、自定义 DataFile、Map | Value |
 | `plugin_parameter` | 显式 PluginParameter source | Value |
 
-`location` 必须是同一 source 的普通 Value；NoteTag container 或 CommentTag command path
-必须等于组 location。Lua 不通过此接口构造 Dialogue、Choices、ScrollingText 或一对多
-投影。
+`location` 与每个 field 必须来自同一 source 的 Value。组位置负责语义上下文和顺序，
+field 的完整 Value 才是最小翻译单元与写回目标。Lua 不通过此接口构造 Dialogue、
+Choices、ScrollingText、局部标签投影或一对多投影。
 
 `groups` 和 `fields` 都是从 1 开始无洞数组；声明顺序分别成为 `group_order` 和
 `unit_order`，不得按字母重排。同一次调用中 `group.location` 本身必须唯一；同位置同 kind
@@ -322,7 +317,10 @@ kind 精确值为 `database_entry`、`system`、`map`、`dialogue`、`choices`�
 外部模型版本或其他 Host 不掌握、但会改变正确译文的事实，必须由脚本稳定编码进去。
 
 `model_text` 是 Placeholder 后输入；`terms` 是仅对 NaturalText 的有序命中，和 Standard
-state/Prompt 共用结果。`prepare` 不读写脚本私有译文。
+state/Prompt 共用结果。Custom Placeholder 的 `scopes` 只比较本次传入的 kind；同 kind
+时与文本来自 Builtin、Rules 还是 Lua 私有协议无关，异 kind 不消费该规则。Lua 只有主动
+调用 `prepare(kind, ...)` 才消费这些规则。`prepare` 不读写脚本私有译文，也不验收脚本
+自己的标签 grammar。
 
 state 是不透明的 64 字符小写十六进制 SHA-256 文本，自动绑定 engine、语言对、语言
 模块、公共 Prompt/Client 语义、kind、original、实际 Placeholder、实际有序术语、脚本
@@ -358,10 +356,10 @@ end
 | `placeholder_normalization_ambiguous` | 重复槽无法无歧义恢复 |
 | `source_residual` | 语言分析/修复后仍残留不可接受源语 |
 
-Standard 多 ID/Lines 响应的结构错误不属于 Lua 标量 accept 的 reason 集合。这个通用
-标量 API 没有物理 Standard identity，因此普通候选可以包含 `>`；候选经
-`standard:accept` 绑定到实际去重族时，才按代表与全部传播位置共同建立
-note/comment 标签值约束。
+Standard 多 ID/Lines 响应的结构错误不属于 Lua 标量 accept 的 reason 集合。裸 `<` 与
+`>` 是普通候选内容；Lua 标量 accept、Standard 模型响应和 `standard:accept` 都不会按
+相似插件语法追加启发式禁令。只有 MV/MZ Builtin 控制符和当前 Custom Placeholder 明确
+匹配的跨度会被当作 opaque 内容保护。
 
 成功 acceptance 的 translation/state 必须由脚本在同一 SQLite 事务中成对写入私有表。
 核心不替 Lua 选择身份或事务粒度。
@@ -650,7 +648,7 @@ error.retry_after_ms = integer | nil
 |---|---|
 | `json` | `invalid_value` |
 | `binding` | `invalid_source_path`、`invalid_output_path`、`invalid_value` |
-| `rpg_maker` | `invalid_argument`、`invalid_source`、`invalid_plugin_parameter_source`、`invalid_plugins_envelope`、`invalid_location`、`invalid_tag`、`tag_not_found`、`invalid_utf8`、`invalid_json` |
+| `rpg_maker` | `invalid_argument`、`invalid_source`、`invalid_plugin_parameter_source`、`invalid_plugins_envelope`、`invalid_location`、`invalid_utf8`、`invalid_json` |
 | `extract` | `invalid_standard_snapshot`、`intent_already_declared` |
 | `filesystem` | `case_mismatch`、`not_found`、`not_file`、`not_directory`、`invalid_path`、`invalid_utf8`、`io` |
 | `output` | `outside_content_roots`、`invalid_path`、`outside_scope`、`scope_root_mutation`、`not_found`、`not_file`、`not_directory`、`directory_not_empty`、`candidate_identity_changed`、`wrong_editor_instance`、`invalid_utf8_name`、`io` |

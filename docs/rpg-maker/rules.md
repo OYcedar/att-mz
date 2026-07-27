@@ -435,6 +435,17 @@ pattern = '<t>(?<text>.*?)</t>'
 recipe：Literal("A<t>") + Slot(0) + Literal("</t>B<t>") + Slot(1) + Literal("</t>C")
 ```
 
+尖括号没有隐含提取语义。假设终点完整原值为 `<Help:炎之剑的说明>`：
+
+- 省略 `pattern` 时，完整字符串形成一个 Scalar Unit，recipe 以一个 Slot 写回整个 Value；
+- 显式写 `pattern = '\A<Help:(?<text>.*?)>\z'` 时，只有 `炎之剑的说明` 形成 Unit，
+  `<Help:` 与 `>` 逐字物化为 recipe Literal；
+- 若 Extract 仍省略 `pattern`，但 Translate 的 Custom Placeholder 使用同一个 wrapper
+  模式，则 Unit 仍是完整 `<Help:炎之剑的说明>`；Placeholder 只在该 Unit 内保护前后壳，
+  不改变 Unit 身份或 recipe。
+
+选择哪一种只由规则作者表达的翻译边界决定，ATT 不根据 `<name:value>` 外观猜测标签。
+
 ### 4.11 来源执行与原子失败范围
 
 插件来源只读取 `js/plugins.js` 中名称精确匹配且 `status = true` 的参数。插件文件存在、
@@ -472,8 +483,8 @@ Rules 的跨来源顺序是稳定契约，不读取也不继承 OS 目录枚举�
 顺序进入资产快照指纹，但不进入逻辑身份，也不单独阻止原文/上下文相同的译文继承。
 并发可以改变完成时间，不能改变这些顺序。
 
-提取方不直接书写 `MutationClaim`。ATT 从 Value、NoteTag、CommentTag 和事件块 recipe
-派生资源锁：`Intent` 表示将穿过或局部使用资源，`Exclusive` 表示拥有该精确可变资源。
+提取方不直接书写 `MutationClaim`。ATT 从完整 Value 和事件块 recipe 派生资源锁：
+`Intent` 表示将穿过资源，`Exclusive` 表示拥有该精确可变 Value。
 同一资源只有 `Intent + Intent` 可以共存；存在任一 `Exclusive` 就冲突。验证在组内、
 owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 
@@ -488,16 +499,11 @@ owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 | 同一 raw JSON Value | 冲突 |
 | raw JSON string 与它解码后的任意 descendant | 冲突 |
 | 同一已解码对象中的不同 sibling | 允许 |
-| raw `note` 与其中任一 NoteTag | 冲突 |
-| 同一 NoteTag occurrence | 冲突 |
-| 同一 `note` 的不同 tag occurrence | 允许 |
-| raw `108/408` comment string 与其 CommentTag | 冲突 |
-| 同一 CommentTag occurrence | 冲突 |
-| 同一 comment 块的不同 tag occurrence | 允许 |
 | Dialogue/Choices/ScrollingText 事件块与其覆盖字段或 decoded descendant | 冲突 |
 | 两个互不覆盖的事件块或普通值 | 允许 |
 
-因此“最终字符串文字刚好相等”不是冲突判断；关键是两个 recipe 是否竞争同一物理资源。
+因此“最终字符串文字刚好相等”以及 Value 是否包含 `<`、`>` 都不是冲突判断；关键是两个
+recipe 是否竞争同一物理资源。
 
 ## 6. Placeholder Rules
 
@@ -540,8 +546,10 @@ pattern = '<name>(?<text>.*?)</name>'
 
 ### 6.4 针对来源执行失败
 
-定义成功后，规则只对 scope 相符的标准单元执行。单条自定义规则零命中是正常结果；一旦
-命中，完整匹配必须非零宽并位于 UTF-8 边界，`text` 必须参与、位于完整匹配内并对齐。
+定义成功后，规则只对 kind 与 scope 相符的 Unit 执行。这个 kind 可以来自 Builtin、
+Rules，或由 Lua `translation.prepare(kind, ...)` 明确提交；owner、文件路径、Rule 序号和
+脚本身份都不参与 scope 选择。单条自定义规则零命中是正常结果；一旦命中，完整匹配必须
+非零宽并位于 UTF-8 边界，`text` 必须参与、位于完整匹配内并对齐。
 实际保护跨度冲突、跨越 `Lines` 元素的语义槽边界、原文占用保留前缀 `⟦ATT_`，或最终
 token 无法安全投影时，只使当前翻译单元规划失败，不把未命中的其他单元判为失败。
 
@@ -581,6 +589,8 @@ Builtin 匹配严格使用 ASCII 字母和 `[0-9]`；命令名接受 ASCII 大�
 
 `n` 必须由一个或多个 ASCII 数字组成。插件扩展，包括 MV 插件自行实现的 PX/PY/FS，
 用自定义 Placeholder Rule 明确保护。
+表中的 `\<`、`\>` 都包含实际反斜杠；裸 `<`、`>` 不是 Builtin Placeholder，也不会因
+外形类似插件协议而被推断成占位符。
 
 MV 行为依据 RPG Maker MV 的
 [官方 `Window_Base` 核心脚本](https://raw.githubusercontent.com/rpgtkoolmv/corescript/master/js/rpg_windows/Window_Base.js)
@@ -608,6 +618,12 @@ pattern = '<msg>(?<text>.*?)</msg>'
 对于 `<msg>勇者\C[2]</msg>`，`<msg>`/`</msg>` 是自定义 opaque wrapper，`勇者` 是
 NaturalText，`\C[2]` 是 NaturalText 内的 Builtin 保护段。三者可以自然组合。
 
+同理，Extract 省略 `pattern` 得到的完整 Unit `<Help:炎之剑的说明>`，可以在
+`database_entry` scope 使用 `\A<Help:(?<text>.*?)>\z`：前后壳成为 opaque，正文保持
+NaturalText，但 Unit 原文、Group、recipe、持久身份和去重输入都不改变。Placeholder
+只保护明确跨度，不承担 `<Help:...>` grammar 的候选验收；需要这种责任时由 Lua 私有
+协议处理。
+
 例如源 `Lines` 为 `["<msg>第一行", "第二行</msg>"]` 时，若模式启用 DOTALL，元素边界
 位于 `text` 捕获中，因此合法；无 `text` 捕获并把两行整体保护的模式则使该单元规划失败。
 
@@ -622,9 +638,11 @@ label 或 state。插入、删除、重排一条对该单元不命中的规则�
 
 若去掉全部 opaque 段后没有任何非空白 NaturalText，prepared 状态为
 `fully_protected`，不请求 LLM；只剩空格、制表符或换行也属于这种情况。
-模型响应必须精确保留 token 的数量和对齐位置。原文中两个字节完全相同的占位符仍是两个
-独立槽；新响应若无法无歧义判断它们的对应关系，拒绝为
-`placeholder_normalization_ambiguous`。
+模型响应必须精确保留 token 的数量和对齐位置。候选缺少 token 时，只有对应原片段属于
+唯一槽且在候选中恰好回显一次，才可归一化回该 token；多个同字节槽或多次回显无法唯一
+对应时拒绝为 `placeholder_normalization_ambiguous`。token 已经在场时，额外出现的
+Builtin 原控制符仍按内建控制语义拒绝；Custom 原片段不会反向扫描候选正文，正文中的
+同字节内容保持 NaturalText。
 
 已存译文的 state 与当前事实精确匹配时直接判定 Current，不把恢复后的旧译文再次反向
 正规化。因此重复相同占位符的已验收译文在第二次运行不会再次请求 LLM；严格歧义检查

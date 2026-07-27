@@ -502,7 +502,6 @@ task-record-rejection-reason = { $code ->
     [unexpected_placeholder] Placeholder không mong đợi: { $detail }
     [placeholder_normalization_ambiguous] Chuẩn hóa placeholder không rõ ràng: { $detail }
     [source_residual] Phát hiện phần còn lại của ngôn ngữ nguồn: { $detail }
-    [tag_value_contains_closing_delimiter] Dòng { $line } chứa '>' sẽ đóng giá trị thẻ sớm
    *[other] { $detail }
 }
 task-record-protocol-detail = { $code ->

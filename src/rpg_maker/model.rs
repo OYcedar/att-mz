@@ -230,85 +230,23 @@ impl MutationResourceAccess {
     }
 }
 
-/// Claim 展开后的规范物理资源。
-///
-/// Value 资源同时覆盖普通 JSON 值与逐层解码后的虚拟值；路径中的
-/// `DecodeJsonString` 保留解码边界，因此同一原始字符串内的 decoded sibling
-/// 只共享 Intent 前缀，而原始字符串与任一 descendant 会形成冲突。
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum MutationResource {
-    Value {
-        source: RpgMakerSource,
-        steps: Vec<RpgMakerLocationStep>,
-    },
-    NoteTag {
-        source: RpgMakerSource,
-        container_steps: Vec<RpgMakerLocationStep>,
-        tag_name: String,
-        occurrence: usize,
-    },
-    CommentTag {
-        source: RpgMakerSource,
-        command_steps: Vec<RpgMakerLocationStep>,
-        tag_name: String,
-        occurrence: usize,
-    },
-}
-
-impl MutationResource {
-    pub(crate) fn source(&self) -> &RpgMakerSource {
-        match self {
-            Self::Value { source, .. }
-            | Self::NoteTag { source, .. }
-            | Self::CommentTag { source, .. } => source,
-        }
-    }
-}
-
-impl fmt::Display for MutationResource {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let location = match self {
-            Self::Value { source, steps } => RpgMakerLocation::value(source.clone(), steps.clone()),
-            Self::NoteTag {
-                source,
-                container_steps,
-                tag_name,
-                occurrence,
-            } => RpgMakerLocation::note_tag(
-                source.clone(),
-                container_steps.clone(),
-                tag_name.clone(),
-                *occurrence,
-            ),
-            Self::CommentTag {
-                source,
-                command_steps,
-                tag_name,
-                occurrence,
-            } => RpgMakerLocation::comment_tag(
-                source.clone(),
-                command_steps.clone(),
-                tag_name.clone(),
-                *occurrence,
-            ),
-        };
-        location.fmt(formatter)
-    }
-}
-
 /// 一个可持久化并用于跨组比较的资源锁。
+///
+/// 每个资源都是一个物理 JSON 值。路径中的 `DecodeJsonString` 保留解码边界，
+/// 因此同一原始字符串内的 decoded sibling 只共享 Intent 前缀，而原始字符串与任一
+/// descendant 会形成冲突。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct MutationResourceLock {
-    resource: MutationResource,
+    resource: RpgMakerLocation,
     access: MutationResourceAccess,
 }
 
 impl MutationResourceLock {
-    pub(crate) fn new(resource: MutationResource, access: MutationResourceAccess) -> Self {
+    pub(crate) fn new(resource: RpgMakerLocation, access: MutationResourceAccess) -> Self {
         Self { resource, access }
     }
 
-    pub(crate) fn resource(&self) -> &MutationResource {
+    pub(crate) fn resource(&self) -> &RpgMakerLocation {
         &self.resource
     }
 
@@ -321,11 +259,6 @@ impl MutationResourceLock {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MutationClaim {
     Value(RpgMakerLocation),
-    NoteTag(RpgMakerLocation),
-    CommentTag {
-        location: RpgMakerLocation,
-        backing_values: Vec<RpgMakerLocation>,
-    },
     EventBlock {
         header: RpgMakerLocation,
         covered_values: Vec<RpgMakerLocation>,
@@ -333,53 +266,22 @@ pub(crate) enum MutationClaim {
 }
 
 impl MutationClaim {
-    pub(crate) fn for_location(location: RpgMakerLocation) -> Result<Self, ProjectionModelError> {
-        match location {
-            location @ RpgMakerLocation::Value { .. } => Ok(Self::Value(location)),
-            location @ RpgMakerLocation::NoteTag { .. } => Ok(Self::NoteTag(location)),
-            RpgMakerLocation::CommentTag { .. } => {
-                Err(ProjectionModelError::CommentTagBackingRequired)
-            }
-        }
-    }
-
-    pub(crate) fn comment_tag(
-        location: RpgMakerLocation,
-        backing_values: Vec<RpgMakerLocation>,
-    ) -> Result<Self, ProjectionModelError> {
-        if !matches!(location, RpgMakerLocation::CommentTag { .. }) || backing_values.is_empty() {
-            return Err(ProjectionModelError::InvalidCommentTagBacking);
-        }
-        let source = location.source();
-        if backing_values.iter().any(|backing| {
-            !matches!(backing, RpgMakerLocation::Value { .. }) || backing.source() != source
-        }) {
-            return Err(ProjectionModelError::InvalidCommentTagBacking);
-        }
-        Ok(Self::CommentTag {
-            location,
-            backing_values,
-        })
+    pub(crate) fn for_location(location: RpgMakerLocation) -> Self {
+        Self::Value(location)
     }
 
     pub(crate) fn event_block(
         header: RpgMakerLocation,
         covered_values: Vec<RpgMakerLocation>,
     ) -> Result<Self, ProjectionModelError> {
-        let RpgMakerLocation::Value {
-            source: header_source,
-            ..
-        } = &header
-        else {
-            return Err(ProjectionModelError::EventBlockHeaderMustBeValue);
-        };
+        let header_source = header.source();
         if covered_values.is_empty() {
             return Err(ProjectionModelError::EventBlockCoverageRequired);
         }
-        if covered_values.iter().any(|location| {
-            !matches!(location, RpgMakerLocation::Value { .. })
-                || location.source() != header_source
-        }) {
+        if covered_values
+            .iter()
+            .any(|location| location.source() != header_source)
+        {
             return Err(ProjectionModelError::InvalidEventBlockCoverage);
         }
         Ok(Self::EventBlock {
@@ -390,8 +292,7 @@ impl MutationClaim {
 
     pub(crate) fn representative_location(&self) -> &RpgMakerLocation {
         match self {
-            Self::Value(location) | Self::NoteTag(location) => location,
-            Self::CommentTag { location, .. } => location,
+            Self::Value(location) => location,
             Self::EventBlock { header, .. } => header,
         }
     }
@@ -400,11 +301,6 @@ impl MutationClaim {
         let mut locks = Vec::new();
         match self {
             Self::Value(location) => append_location_locks(location, &mut locks),
-            Self::NoteTag(location) => append_note_tag_locks(location, &mut locks),
-            Self::CommentTag {
-                location,
-                backing_values,
-            } => append_comment_tag_locks(location, backing_values, &mut locks),
             Self::EventBlock { covered_values, .. } => {
                 for location in covered_values {
                     append_location_locks(location, &mut locks);
@@ -424,9 +320,9 @@ pub(crate) struct MutationClaimSet {
 
 impl MutationClaimSet {
     pub(crate) fn new(claims: Vec<MutationClaim>) -> Result<Self, MutationConflict> {
-        let mut locks = BTreeMap::<MutationResource, MutationResourceAccess>::new();
+        let mut locks = BTreeMap::<RpgMakerLocation, MutationResourceAccess>::new();
         for claim in &claims {
-            let mut claim_locks = BTreeMap::<MutationResource, MutationResourceAccess>::new();
+            let mut claim_locks = BTreeMap::<RpgMakerLocation, MutationResourceAccess>::new();
             for lock in claim.locks() {
                 claim_locks
                     .entry(lock.resource)
@@ -518,7 +414,7 @@ pub(crate) struct MutationClaimIndex<'a> {
     // Claim 集合在 owner 级校验结束前始终存活；索引只借用规范资源，避免为大型
     // 游戏的每个唯一 Value/事件块深拷贝 source、steps 和路径字符串。只有真的
     // 发现冲突时才克隆最终要进入错误值的那一个资源。
-    resources: HashMap<&'a MutationResource, IndexedMutationResource>,
+    resources: HashMap<&'a RpgMakerLocation, IndexedMutationResource>,
     next_group_index: usize,
     #[cfg(test)]
     resource_lookups: usize,
@@ -547,7 +443,7 @@ impl<'a> MutationClaimIndex<'a> {
             .checked_add(1)
             .expect("内存中的文本组数量必须可用 usize 表达");
         let mut inserted_resources = Vec::new();
-        let mut selected = None::<(usize, &'a MutationResource)>;
+        let mut selected = None::<(usize, &'a RpgMakerLocation)>;
         for lock in claims.locks() {
             #[cfg(test)]
             {
@@ -599,130 +495,27 @@ impl<'a> MutationClaimIndex<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MutationConflict {
-    resource: MutationResource,
+    resource: RpgMakerLocation,
 }
 
 impl MutationConflict {
-    pub(crate) fn resource(&self) -> &MutationResource {
+    pub(crate) fn resource(&self) -> &RpgMakerLocation {
         &self.resource
     }
 }
 
 fn append_location_locks(location: &RpgMakerLocation, locks: &mut Vec<MutationResourceLock>) {
-    match location {
-        RpgMakerLocation::Value { source, steps } => {
-            for prefix_length in 0..steps.len() {
-                locks.push(MutationResourceLock::new(
-                    MutationResource::Value {
-                        source: source.clone(),
-                        steps: steps[..prefix_length].to_vec(),
-                    },
-                    MutationResourceAccess::Intent,
-                ));
-            }
-            locks.push(MutationResourceLock::new(
-                MutationResource::Value {
-                    source: source.clone(),
-                    steps: steps.clone(),
-                },
-                MutationResourceAccess::Exclusive,
-            ));
-        }
-        RpgMakerLocation::NoteTag { .. } => append_note_tag_locks(location, locks),
-        RpgMakerLocation::CommentTag { .. } => {
-            debug_assert!(false, "CommentTag 必须由携带完整 backing 的 Claim 展开")
-        }
-    }
-}
-
-fn append_note_tag_locks(location: &RpgMakerLocation, locks: &mut Vec<MutationResourceLock>) {
-    let RpgMakerLocation::NoteTag {
-        source,
-        container_steps,
-        tag_name,
-        occurrence,
-    } = location
-    else {
-        debug_assert!(false, "NoteTag Claim 必须携带 NoteTag 位置");
-        return;
-    };
-    let mut note_steps = container_steps.clone();
-    note_steps.push(RpgMakerLocationStep::key("note"));
-    for prefix_length in 0..note_steps.len() {
+    for prefix_length in 0..location.steps().len() {
         locks.push(MutationResourceLock::new(
-            MutationResource::Value {
-                source: source.clone(),
-                steps: note_steps[..prefix_length].to_vec(),
-            },
+            RpgMakerLocation::value(
+                location.source().clone(),
+                location.steps()[..prefix_length].to_vec(),
+            ),
             MutationResourceAccess::Intent,
         ));
     }
     locks.push(MutationResourceLock::new(
-        MutationResource::Value {
-            source: source.clone(),
-            steps: note_steps,
-        },
-        MutationResourceAccess::Intent,
-    ));
-    locks.push(MutationResourceLock::new(
-        MutationResource::NoteTag {
-            source: source.clone(),
-            container_steps: container_steps.clone(),
-            tag_name: tag_name.clone(),
-            occurrence: *occurrence,
-        },
-        MutationResourceAccess::Exclusive,
-    ));
-}
-
-fn append_comment_tag_locks(
-    location: &RpgMakerLocation,
-    backing_values: &[RpgMakerLocation],
-    locks: &mut Vec<MutationResourceLock>,
-) {
-    let RpgMakerLocation::CommentTag {
-        source,
-        command_steps,
-        tag_name,
-        occurrence,
-    } = location
-    else {
-        debug_assert!(false, "CommentTag Claim 必须携带 CommentTag 位置");
-        return;
-    };
-    for backing in backing_values {
-        let RpgMakerLocation::Value {
-            source: backing_source,
-            steps,
-        } = backing
-        else {
-            debug_assert!(false, "CommentTag backing 必须是 Value");
-            continue;
-        };
-        for prefix_length in 0..steps.len() {
-            locks.push(MutationResourceLock::new(
-                MutationResource::Value {
-                    source: backing_source.clone(),
-                    steps: steps[..prefix_length].to_vec(),
-                },
-                MutationResourceAccess::Intent,
-            ));
-        }
-        locks.push(MutationResourceLock::new(
-            MutationResource::Value {
-                source: backing_source.clone(),
-                steps: steps.clone(),
-            },
-            MutationResourceAccess::Intent,
-        ));
-    }
-    locks.push(MutationResourceLock::new(
-        MutationResource::CommentTag {
-            source: source.clone(),
-            command_steps: command_steps.clone(),
-            tag_name: tag_name.clone(),
-            occurrence: *occurrence,
-        },
+        location.clone(),
         MutationResourceAccess::Exclusive,
     ));
 }
@@ -730,9 +523,8 @@ fn append_comment_tag_locks(
 fn event_command_steps(
     location: &RpgMakerLocation,
 ) -> Option<(&RpgMakerSource, Vec<RpgMakerLocationStep>)> {
-    let RpgMakerLocation::Value { source, steps } = location else {
-        return None;
-    };
+    let source = location.source();
+    let steps = location.steps();
     let parameter_key = steps.iter().position(
         |step| matches!(step, RpgMakerLocationStep::ObjectKey(key) if key == "parameters"),
     );
@@ -759,15 +551,16 @@ impl TextProjectionRecipe {
             Self::Dialogue(recipe) => {
                 let mut claims = Vec::new();
                 if let Some(speaker) = recipe.direct_speaker() {
-                    claims.push(
-                        MutationClaim::for_location(speaker.physical_location().clone())
-                            .expect("对话直接 Speaker 已验证为 Value 位置"),
-                    );
+                    claims.push(MutationClaim::for_location(
+                        speaker.physical_location().clone(),
+                    ));
                 }
-                claims.extend(recipe.lines().iter().map(|line| {
-                    MutationClaim::for_location(line.physical_location().clone())
-                        .expect("对话正文行已验证为 Value 位置")
-                }));
+                claims.extend(
+                    recipe
+                        .lines()
+                        .iter()
+                        .map(|line| MutationClaim::for_location(line.physical_location().clone())),
+                );
                 claims
             }
             Self::Claim(claim) => vec![claim.clone()],
@@ -886,7 +679,7 @@ pub(crate) fn mutation_claims_for_group(
             return Ok(event_claims);
         }
     }
-    // 先以每个配方目标为原子项验证，排除同一组内的 raw/decoded、重复标签等冲突。
+    // 先以每个配方目标为原子项验证，排除同一组内的 raw/decoded 与重复 Value 冲突。
     let direct_claims = MutationClaimSet::new(direct_claims)?;
 
     if matches!(
@@ -926,7 +719,7 @@ impl DirectTextRecipe {
         expected_raw: impl Into<String>,
         parts: Vec<DirectTextPart>,
     ) -> Result<Self, ProjectionModelError> {
-        let mutation_claim = MutationClaim::for_location(target.clone())?;
+        let mutation_claim = MutationClaim::for_location(target.clone());
         Self::new_with_claim(target, mutation_claim, expected_raw, parts)
     }
 
@@ -1020,16 +813,6 @@ impl DialogueWriteRecipe {
         direct_speaker: Option<DirectSpeakerTarget>,
         lines: Vec<DialogueLineRecipe>,
     ) -> Result<Self, ProjectionModelError> {
-        if !matches!(group_location, RpgMakerLocation::Value { .. })
-            || direct_speaker.as_ref().is_some_and(|target| {
-                !matches!(target.physical_location(), RpgMakerLocation::Value { .. })
-            })
-            || lines
-                .iter()
-                .any(|line| !matches!(line.physical_location(), RpgMakerLocation::Value { .. }))
-        {
-            return Err(ProjectionModelError::InvalidDialoguePhysicalLocation);
-        }
         let mut body_line_indexes = BTreeSet::new();
         let mut has_speaker_slot = false;
         for line in &lines {
@@ -1154,13 +937,9 @@ pub(crate) enum DialogueLinePart {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectionModelError {
     EmptyScalarFieldKey,
-    CommentTagBackingRequired,
-    InvalidCommentTagBacking,
-    EventBlockHeaderMustBeValue,
     EventBlockCoverageRequired,
     InvalidEventBlockCoverage,
     MutationClaimTargetMismatch,
-    InvalidDialoguePhysicalLocation,
     RecipeHasNoTextSlot,
     DuplicateProjectionSlot {
         role: TextUnitRole,
@@ -1181,26 +960,14 @@ impl fmt::Display for ProjectionModelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyScalarFieldKey => formatter.write_str("标量字段键不能为空"),
-            Self::CommentTagBackingRequired => {
-                formatter.write_str("CommentTag 投影必须声明完整 108/408 backing 值")
-            }
-            Self::InvalidCommentTagBacking => {
-                formatter.write_str("CommentTag backing 必须是同一来源中的非空 Value 地址集合")
-            }
-            Self::EventBlockHeaderMustBeValue => {
-                formatter.write_str("事件块 header 必须是 Value 地址")
-            }
             Self::EventBlockCoverageRequired => {
                 formatter.write_str("事件块必须声明至少一个真实修改 Value")
             }
             Self::InvalidEventBlockCoverage => {
-                formatter.write_str("事件块 coverage 必须全部是与 header 同来源的 Value 地址")
+                formatter.write_str("事件块 coverage 必须全部与 header 来自同一来源")
             }
             Self::MutationClaimTargetMismatch => {
                 formatter.write_str("直接文本配方的 Claim 与写回目标不一致")
-            }
-            Self::InvalidDialoguePhysicalLocation => {
-                formatter.write_str("对话头、Speaker 与正文行必须都是 Value 地址")
             }
             Self::RecipeHasNoTextSlot => {
                 formatter.write_str("直接文本配方既没有文本槽，也不是完整冻结字面量")
@@ -1273,13 +1040,13 @@ mod tests {
             MutationClaim::Value(location("z")),
         ]);
 
-        let expected = MutationResource::Value {
+        let expected = RpgMakerLocation::value(
             source,
-            steps: vec![
+            vec![
                 RpgMakerLocationStep::index(1),
                 RpgMakerLocationStep::key("z"),
             ],
-        };
+        );
         for mut index in [
             MutationClaimIndex::default(),
             MutationClaimIndex::with_capacity(
@@ -1327,9 +1094,8 @@ mod tests {
     #[test]
     fn failed_claim_index_insert_rolls_back_all_new_resources_and_preserves_sequence() {
         let source = RpgMakerSource::data(StandardDataFile::Items);
-        let resource = |key: &str| MutationResource::Value {
-            source: source.clone(),
-            steps: vec![RpgMakerLocationStep::key(key)],
+        let resource = |key: &str| {
+            RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::key(key)])
         };
         let existing = MutationClaimSet::from_locks(vec![MutationResourceLock::new(
             resource("b"),
@@ -1388,104 +1154,25 @@ mod tests {
 
         assert!(
             MutationClaimSet::new(vec![
-                MutationClaim::for_location(raw.clone()).expect("raw Value 应合法"),
-                MutationClaim::for_location(decoded_left.clone()).expect("decoded Value 应合法"),
+                MutationClaim::for_location(raw.clone()),
+                MutationClaim::for_location(decoded_left.clone()),
             ])
             .is_err()
         );
         assert!(
-            claim_set(vec![
-                MutationClaim::for_location(raw).expect("raw Value 应合法")
-            ])
-            .conflict_with(&claim_set(vec![
-                MutationClaim::for_location(decoded_left.clone()).expect("decoded Value 应合法")
-            ]))
-            .is_some()
+            claim_set(vec![MutationClaim::for_location(raw)])
+                .conflict_with(&claim_set(vec![MutationClaim::for_location(
+                    decoded_left.clone(),
+                )]))
+                .is_some()
         );
         assert!(
             MutationClaimSet::new(vec![
-                MutationClaim::for_location(decoded_left).expect("decoded left 应合法"),
-                MutationClaim::for_location(decoded_right).expect("decoded right 应合法"),
+                MutationClaim::for_location(decoded_left),
+                MutationClaim::for_location(decoded_right),
             ])
             .is_ok()
         );
-    }
-
-    #[test]
-    fn note_tag_claims_conflict_with_raw_note_but_distinct_occurrences_coexist() {
-        let source = RpgMakerSource::data(StandardDataFile::Items);
-        let container = vec![RpgMakerLocationStep::index(1)];
-        let raw_note = RpgMakerLocation::value(
-            source.clone(),
-            vec![
-                RpgMakerLocationStep::index(1),
-                RpgMakerLocationStep::key("note"),
-            ],
-        );
-        let first = RpgMakerLocation::note_tag(source.clone(), container.clone(), "Tag", 0);
-        let second = RpgMakerLocation::note_tag(source, container, "Tag", 1);
-
-        assert!(
-            MutationClaimSet::new(vec![
-                MutationClaim::for_location(raw_note).expect("raw note 应合法"),
-                MutationClaim::for_location(first.clone()).expect("NoteTag 应合法"),
-            ])
-            .is_err()
-        );
-        assert!(
-            MutationClaimSet::new(vec![
-                MutationClaim::for_location(first).expect("首个 NoteTag 应合法"),
-                MutationClaim::for_location(second).expect("第二个 NoteTag 应合法"),
-            ])
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn comment_tag_claims_cover_every_108_408_backing_and_allow_distinct_occurrences() {
-        let source = RpgMakerSource::data(StandardDataFile::CommonEvents);
-        let command_steps = vec![
-            RpgMakerLocationStep::index(1),
-            RpgMakerLocationStep::key("list"),
-            RpgMakerLocationStep::index(4),
-        ];
-        let backing = [4, 5]
-            .into_iter()
-            .map(|command_index| {
-                RpgMakerLocation::value(
-                    source.clone(),
-                    vec![
-                        RpgMakerLocationStep::index(1),
-                        RpgMakerLocationStep::key("list"),
-                        RpgMakerLocationStep::index(command_index),
-                        RpgMakerLocationStep::key("parameters"),
-                        RpgMakerLocationStep::index(0),
-                    ],
-                )
-            })
-            .collect::<Vec<_>>();
-        let first = MutationClaim::comment_tag(
-            RpgMakerLocation::comment_tag(source.clone(), command_steps.clone(), "Tag", 0),
-            backing.clone(),
-        )
-        .expect("首个 CommentTag 应合法");
-        let second = MutationClaim::comment_tag(
-            RpgMakerLocation::comment_tag(source, command_steps, "Tag", 1),
-            backing.clone(),
-        )
-        .expect("第二个 CommentTag 应合法");
-
-        for (index, raw_comment) in backing.iter().enumerate() {
-            assert!(
-                MutationClaimSet::new(vec![
-                    MutationClaim::for_location(raw_comment.clone()).expect("108/408 raw 值应合法"),
-                    first.clone(),
-                ])
-                .is_err(),
-                "CommentTag 必须与第 {index} 个真实 108/408 backing 冲突"
-            );
-        }
-        assert!(MutationClaimSet::new(vec![first, second]).is_ok());
     }
 
     #[test]
@@ -1517,15 +1204,9 @@ mod tests {
             MutationClaim::event_block(command(1), vec![command(2)])
                 .expect("同来源非空事件块 Claim 应合法"),
         ]);
-        let header_descendant = claim_set(vec![
-            MutationClaim::for_location(descendant(1)).expect("header descendant 应合法"),
-        ]);
-        let covered_descendant = claim_set(vec![
-            MutationClaim::for_location(descendant(2)).expect("正文 descendant 应合法"),
-        ]);
-        let other_command = claim_set(vec![
-            MutationClaim::for_location(descendant(3)).expect("其他命令 descendant 应合法"),
-        ]);
+        let header_descendant = claim_set(vec![MutationClaim::for_location(descendant(1))]);
+        let covered_descendant = claim_set(vec![MutationClaim::for_location(descendant(2))]);
+        let other_command = claim_set(vec![MutationClaim::for_location(descendant(3))]);
 
         assert!(dialogue.conflict_with(&header_descendant).is_none());
         assert!(dialogue.conflict_with(&covered_descendant).is_some());
@@ -1533,16 +1214,10 @@ mod tests {
     }
 
     #[test]
-    fn event_block_claim_rejects_invalid_header_empty_non_value_and_cross_source_coverage() {
+    fn event_block_claim_rejects_empty_and_cross_source_coverage() {
         let source = RpgMakerSource::data(StandardDataFile::CommonEvents);
         let header = RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(1)]);
         let covered = RpgMakerLocation::value(source.clone(), vec![RpgMakerLocationStep::index(2)]);
-        let non_value = RpgMakerLocation::note_tag(
-            source.clone(),
-            vec![RpgMakerLocationStep::index(2)],
-            "Tag",
-            0,
-        );
         let cross_source = RpgMakerLocation::value(
             RpgMakerSource::data(StandardDataFile::Items),
             vec![RpgMakerLocationStep::index(1)],
@@ -1550,16 +1225,8 @@ mod tests {
 
         assert!(MutationClaim::event_block(header.clone(), vec![covered]).is_ok());
         assert!(matches!(
-            MutationClaim::event_block(non_value.clone(), vec![header.clone()]),
-            Err(ProjectionModelError::EventBlockHeaderMustBeValue)
-        ));
-        assert!(matches!(
             MutationClaim::event_block(header.clone(), Vec::new()),
             Err(ProjectionModelError::EventBlockCoverageRequired)
-        ));
-        assert!(matches!(
-            MutationClaim::event_block(header.clone(), vec![non_value]),
-            Err(ProjectionModelError::InvalidEventBlockCoverage)
         ));
         assert!(matches!(
             MutationClaim::event_block(header, vec![cross_source]),

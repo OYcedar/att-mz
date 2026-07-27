@@ -6,9 +6,9 @@ use std::fmt;
 
 use crate::rpg_maker::model::{
     DirectTextPart, DirectTextRecipe, LogicalTextLocation, MutationClaim, MutationClaimIndex,
-    MutationClaimSet, MutationResource, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe,
-    TextUnitContent, TextUnitContentStructureError, TextUnitContentView, TextUnitRole,
-    mutation_claims_for_group, validate_text_unit_content_structure,
+    MutationClaimSet, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe, TextUnitContent,
+    TextUnitContentStructureError, TextUnitContentView, TextUnitRole, mutation_claims_for_group,
+    validate_text_unit_content_structure,
 };
 pub(crate) use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind,
@@ -63,8 +63,7 @@ impl ExtractedTextUnit {
         projection_location: RpgMakerLocation,
         source_content: TextUnitContent,
     ) -> Result<Self, SnapshotModelError> {
-        let mutation_claim = MutationClaim::for_location(projection_location.clone())
-            .map_err(SnapshotModelError::Projection)?;
+        let mutation_claim = MutationClaim::for_location(projection_location.clone());
         Self::projected_with_claim(role, projection_location, mutation_claim, source_content)
     }
 
@@ -520,7 +519,7 @@ pub(crate) enum SnapshotModelError {
         second: TextGroupKind,
     },
     MutationClaimConflict {
-        resource: Box<MutationResource>,
+        resource: Box<RpgMakerLocation>,
     },
     RecipeRoleMismatch {
         group_location: Box<RpgMakerLocation>,

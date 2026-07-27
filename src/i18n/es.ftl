@@ -511,7 +511,6 @@ task-record-rejection-reason = { $code ->
     [unexpected_placeholder] Marcador de posición inesperado: { $detail }
     [placeholder_normalization_ambiguous] Normalización ambigua del marcador: { $detail }
     [source_residual] Se detectó texto residual del idioma de origen: { $detail }
-    [tag_value_contains_closing_delimiter] La línea { $line } contiene '>' que cerraría el valor de la etiqueta prematuramente
    *[other] { $detail }
 }
 task-record-protocol-detail = { $code ->
