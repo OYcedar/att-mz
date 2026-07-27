@@ -102,6 +102,11 @@ CLI 与 JSONL 消费同一份 `SafeDiagnostic`。每个 primary 和 related fail
 `source` 链或解析 `Display` 补猜事实；安全投影必须在具体错误仍持有类型、阶段、路径和
 底层代码时建立。
 
+业务已经成功但 stdout 呈现失败时，本次运行仍以失败终态记录，不回滚业务结果。若同时
+存在非日志 shutdown 失败，可靠终态区固定依次写入 `performance.counters`、stdout
+primary `failure.reported`、按原顺序排列的 shutdown related `failure.reported`，最后
+只写一条 `run.finished` 且 `outcome = failed`。stdout 不得为了补日志而再次写入。
+
 ## 5. 内容与凭据边界
 
 项目日志严格采用
