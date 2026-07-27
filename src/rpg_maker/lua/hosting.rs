@@ -16,7 +16,9 @@ use crate::execution::OperationCompletion;
 use crate::llm::{
     ChatMessage, LlmRequestDiagnosticSource, LlmRequestError, LlmRequestExecutor, LlmResponse,
 };
-use crate::storage::file_system::{DirectoryLister, FileReader, ListDirectoryError, ReadFileError};
+use crate::storage::file_system::{
+    DirectoryEntry, DirectoryLister, FileReader, ListDirectoryError, ReadFileError,
+};
 use crate::storage::scoped_path::{
     ExactDirectoryEntryResolutionError, resolve_exact_directory_entry,
 };
@@ -28,6 +30,7 @@ use crate::storage::sqlite_session::{
 };
 use crate::windows_path::WindowsOrdinalCaseKeyError;
 
+use super::directory_cache::SuccessfulDirectoryListCache;
 #[cfg(test)]
 use super::runtime::OwnedLuaProgram;
 use super::runtime::{
@@ -156,6 +159,7 @@ where
             project,
             operations,
             file_system: Arc::clone(&self.file_system),
+            source_directories: Arc::default(),
         });
         let transaction_state = Arc::clone(&common);
         let finalizer: Box<dyn TrustedLuaBindingFinalizer> =
@@ -243,6 +247,7 @@ where
     project: LuaProjectContext,
     operations: Arc<S>,
     file_system: Arc<F>,
+    source_directories: Arc<SuccessfulDirectoryListCache<DirectoryEntry>>,
 }
 
 impl<F, S> TrustedLuaCommonHostCalls for LuaCommonHostCalls<F, S>
@@ -262,10 +267,16 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TrustedLuaHostCallError>> + Send + 'static>>
     {
         let file_system = Arc::clone(&self.file_system);
+        let source_directories = Arc::clone(&self.source_directories);
         let source_root = self.project.source_root().to_path_buf();
         Box::pin(async move {
-            let requested =
-                resolve_exact_source_path(file_system.as_ref(), &source_root, &path).await?;
+            let requested = resolve_exact_source_path(
+                file_system.as_ref(),
+                source_directories.as_ref(),
+                &source_root,
+                &path,
+            )
+            .await?;
             file_system
                 .read_file(requested)
                 .await
@@ -280,16 +291,25 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, TrustedLuaHostCallError>> + Send + 'static>>
     {
         let file_system = Arc::clone(&self.file_system);
+        let source_directories = Arc::clone(&self.source_directories);
         let source_root = self.project.source_root().to_path_buf();
         Box::pin(async move {
-            let requested =
-                resolve_exact_source_path(file_system.as_ref(), &source_root, &path).await?;
-            let entries = file_system
-                .list_directory(requested)
-                .await
-                .map_err(|error| source_list_error("source.list", error))?;
+            let requested = resolve_exact_source_path(
+                file_system.as_ref(),
+                source_directories.as_ref(),
+                &source_root,
+                &path,
+            )
+            .await?;
+            let entries = list_source_directory(
+                file_system.as_ref(),
+                source_directories.as_ref(),
+                requested,
+                "source.list",
+            )
+            .await?;
             let mut result = Vec::with_capacity(entries.len());
-            for entry in entries {
+            for entry in entries.iter() {
                 let name = entry
                     .resolved_path()
                     .file_name()
@@ -473,6 +493,7 @@ impl TrustedLuaStandardSession for TransactionAwareLuaStandardSession {
 
 async fn resolve_exact_source_path<F>(
     file_system: &F,
+    source_directories: &SuccessfulDirectoryListCache<DirectoryEntry>,
     source_root: &Path,
     logical_path: &LuaSourcePath,
 ) -> Result<PathBuf, TrustedLuaHostCallError>
@@ -482,10 +503,13 @@ where
 {
     let mut current = source_root.to_path_buf();
     for component in logical_path.components() {
-        let entries = file_system
-            .list_directory(current.clone())
-            .await
-            .map_err(|error| source_list_error("source.resolve", error))?;
+        let entries = list_source_directory(
+            file_system,
+            source_directories,
+            current.clone(),
+            "source.resolve",
+        )
+        .await?;
         let resolved = resolve_exact_directory_entry(
             &current,
             component,
@@ -502,6 +526,27 @@ where
         };
     }
     Ok(current)
+}
+
+async fn list_source_directory<F>(
+    file_system: &F,
+    source_directories: &SuccessfulDirectoryListCache<DirectoryEntry>,
+    path: PathBuf,
+    operation: &'static str,
+) -> Result<Arc<[DirectoryEntry]>, TrustedLuaHostCallError>
+where
+    F: DirectoryLister,
+    F::Error: SafeDiagnosticSource,
+{
+    let (cached, observed_epoch) = source_directories.lookup(&path);
+    if let Some(entries) = cached {
+        return Ok(entries);
+    }
+    let entries = file_system
+        .list_directory(path.clone())
+        .await
+        .map_err(|error| source_list_error(operation, error))?;
+    Ok(source_directories.insert_if_unchanged(path, observed_epoch, entries))
 }
 
 #[derive(Default)]
@@ -2184,6 +2229,7 @@ mod tests {
             ),
             operations: Arc::new(FakeOperations),
             file_system,
+            source_directories: Arc::default(),
         }
     }
 
@@ -2218,10 +2264,37 @@ mod tests {
             [
                 PathBuf::from("C:/projects/demo/source"),
                 PathBuf::from("C:/projects/demo/source/data"),
-                PathBuf::from("C:/projects/demo/source"),
-                PathBuf::from("C:/projects/demo/source/data"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn source_directory_cache_is_limited_to_one_lua_execution() {
+        let file_system = Arc::new(SourceFileSystem::default());
+        let path = LuaSourcePath::parse("data/Items.json").unwrap();
+        let first_execution = source_calls(Arc::clone(&file_system));
+
+        for _ in 0..8 {
+            first_execution
+                .read_source(path.clone())
+                .await
+                .expect("同一次执行应能重复读取冻结来源");
+        }
+        assert_eq!(
+            *file_system.lists.lock().unwrap(),
+            [
+                PathBuf::from("C:/projects/demo/source"),
+                PathBuf::from("C:/projects/demo/source/data"),
+            ],
+            "重复文件数不应再乘以每个父目录的列举次数"
+        );
+
+        let next_execution = source_calls(Arc::clone(&file_system));
+        next_execution
+            .read_source(path)
+            .await
+            .expect("下一次执行仍应重新观测冻结来源");
+        assert_eq!(file_system.lists.lock().unwrap().len(), 4);
     }
 
     #[tokio::test]
@@ -2285,8 +2358,21 @@ mod tests {
             .expect_err("缺失目录应由列举能力报告");
         assert_eq!(list_error.kind(), "not_found");
         assert!(list_error.to_string().contains("目录不存在"));
+        let repeated_list_error = calls
+            .list_source(LuaSourcePath::parse("data/Missing").unwrap())
+            .await
+            .expect_err("失败的目录列举不得进入缓存");
+        assert_eq!(repeated_list_error.kind(), "not_found");
         assert_eq!(file_system.reads.lock().unwrap().len(), 1);
-        assert_eq!(file_system.lists.lock().unwrap().len(), 5);
+        assert_eq!(
+            *file_system.lists.lock().unwrap(),
+            [
+                PathBuf::from("C:/projects/demo/source"),
+                PathBuf::from("C:/projects/demo/source/data"),
+                PathBuf::from("C:/projects/demo/source/data/Missing"),
+                PathBuf::from("C:/projects/demo/source/data/Missing"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2314,6 +2400,7 @@ mod tests {
             ),
             operations: Arc::new(FakeOperations),
             file_system: Arc::clone(&file_system),
+            source_directories: Arc::default(),
         };
 
         let error = calls

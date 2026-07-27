@@ -15,6 +15,7 @@ use crate::execution::OperationCompletion;
 use crate::language::{LanguageId, LanguagePair};
 use crate::rpg_maker::RpgMakerEngine;
 
+pub(crate) mod directory_cache;
 pub(crate) mod document;
 pub(crate) mod hosting;
 pub(crate) mod json;
