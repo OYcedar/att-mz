@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::windows_path::{WindowsOrdinalCaseKey, WindowsOrdinalCaseKeyError};
@@ -11,7 +12,7 @@ use crate::windows_path::{WindowsOrdinalCaseKey, WindowsOrdinalCaseKeyError};
 ///
 /// `new` 面向外部逻辑协议，因而只接受 `/`，并逐字拒绝平台可能替调用方
 /// 归一化的反斜杠、空段、点段和重复分隔符。`from_internal_path` 只供已经受信的
-/// 宿主布局把 MV 的 `www` 前缀映射为本机路径。
+/// 宿主布局或文件系统枚举结果组合本机路径，并保留原始 Windows UTF-16 名称。
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ScopedDirectoryPath(PathBuf);
 
@@ -68,14 +69,17 @@ impl ScopedDirectoryPath {
 }
 
 fn invalid_internal_component(component: &OsStr) -> bool {
-    let Some(component) = component.to_str() else {
-        return true;
-    };
-    component.is_empty()
-        || component.contains(':')
-        || component.chars().any(char::is_control)
-        || component.ends_with(['.', ' '])
-        || matches!(component, "." | "..")
+    let units = component.encode_wide().collect::<Vec<_>>();
+    units.is_empty()
+        || units.contains(&u16::from(b':'))
+        || char::decode_utf16(units.iter().copied()).any(|unit| unit.is_ok_and(char::is_control))
+        || matches!(units.last(), Some(unit) if *unit == u16::from(b'.') || *unit == u16::from(b' '))
+        || matches!(units.as_slice(), [unit] if *unit == u16::from(b'.'))
+        || matches!(
+            units.as_slice(),
+            [first, second]
+                if *first == u16::from(b'.') && *second == u16::from(b'.')
+        )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,6 +210,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
 
     #[test]
     fn logical_scoped_paths_do_not_depend_on_platform_normalization() {
@@ -244,6 +250,45 @@ mod tests {
         ] {
             assert!(ScopedDirectoryPath::new(path.into()).is_err(), "{path:?}");
         }
+    }
+
+    #[test]
+    fn internal_scoped_paths_preserve_unpaired_windows_surrogates() {
+        let high = OsString::from_wide(&[
+            u16::from(b'h'),
+            u16::from(b'i'),
+            u16::from(b'g'),
+            u16::from(b'h'),
+            0xd800,
+        ]);
+        let low = OsString::from_wide(&[
+            u16::from(b'l'),
+            u16::from(b'o'),
+            u16::from(b'w'),
+            0xdc00,
+            u16::from(b'.'),
+            u16::from(b'b'),
+            u16::from(b'i'),
+            u16::from(b'n'),
+        ]);
+        let path = PathBuf::from("logs").join(&high).join(&low);
+
+        let scoped =
+            ScopedDirectoryPath::from_internal_path(path).expect("内部路径必须保留原始 UTF-16");
+        let components = scoped
+            .as_path()
+            .components()
+            .map(Component::as_os_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            components[1].encode_wide().collect::<Vec<_>>(),
+            high.encode_wide().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            components[2].encode_wide().collect::<Vec<_>>(),
+            low.encode_wide().collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -6671,8 +6671,7 @@ fn init_preserve_observability_diagnostic(
                 .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
         }
         .with_recovery(crate::diagnostic::RecoveryFact::path(path)),
-        PreserveObservabilityFailure::InvalidEntryName { path }
-        | PreserveObservabilityFailure::InvalidCandidatePath { path, .. } => {
+        PreserveObservabilityFailure::InvalidCandidatePath { path, .. } => {
             invalid_path(path, DiagnosticFailureKind::InvalidPath)
         }
         PreserveObservabilityFailure::Edit { path, source } => match source {
