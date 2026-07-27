@@ -71,3 +71,40 @@ description: 使用 ATT 调查、初始化、提取、翻译、审核、写回�
 
 只有当前状态的权威事实、失败语义、剩余缺口和准确续作入口都明确时，才把该状态标记为
 完成。候选内容树只是隔离试玩输入，不要把它误称为完整游戏包。
+
+### 翻译补跑与人工收尾闭环
+
+对已授权的 Translate 或质量审核任务按以下闭环推进：
+
+1. 每轮开始前记录本轮实际 Profile、翻译 state 所绑定的有效输入、Current 数量，以及
+   `remaining_decisions`、`remaining_locations` 和稳定原因；任务记录只补充单任务证据，
+   不替代项目权威状态。
+2. 执行 Standard Translate 后，以 `Complete`、`Partial`、`Unavailable`、提交终态、
+   `remaining_decisions` 和 `remaining_locations` 判断结果；不要把退出成功、请求完成或
+   任务进度 `N/N` 当成质量完成。
+3. `Complete` 时结束补跑；技术失败、取消、提交终态未知或状态矛盾时进入恢复流程，
+   不把它们当作质量问题自动重试。
+4. 对 `Partial` 或 `Unavailable` 的每项剩余工作定位最早责任状态：规划失败返回
+   Placeholder、资源或 Extract；模型候选拒绝核对任务输入、响应与验收原因；原文、分组、
+   recipe 或 Claim 错误返回 Extract。只修改有观察证据支持的最早责任工件。
+5. 满足下列任一条件时才开始下一轮：上一轮确认提交了新的 Current；已完成有证据的工件
+   修正并需要验证；或模型候选因非确定性质量问题被拒绝，且同一有效输入尚未做过一次
+   无改动确认补跑。下一轮复用项目权威状态，只处理仍非 Current 的单元，不清库、不重建
+   项目，也不重做已提交译文。
+6. 每轮后比较新增 Current、剩余位置和稳定原因。同一有效输入的一次无改动确认补跑仍未
+   增加 Current 时，停止重复模型调用；没有新的证据化修正、剩余项不再适合 Standard，
+   或下一步需要扩大模型成本、文件范围或使用者选择时，也停止自动推进并明确报告缺口。
+
+只有剩余位置、原文、上下文和拒绝原因都明确，自动路径已经按上述条件停止，且问题只是
+候选译文质量而不是提取、分组、Placeholder、资源、事务或发布错误时，才进入人工补翻：
+
+1. 读取独立项目 Lua 的 Standard 人工提交契约，通过 `ctx.standard.open()` 与
+   `standard:accept(batch)` 提交候选；不得直接写受管翻译表或自行构造 state。
+2. 让人工候选继续经过普通 Standard 共用的 Placeholder、line shape、目标语言、源语
+   残留、语言修复和去重验收。按逐项拒绝原因修正后再提交，不绕过失败项。
+3. 只对明确授权替换的 Current 设置 `replace_current = true`；普通拒绝项保持零写入。
+   任一 `standard/stale_snapshot` 使本批合法族回滚，必须重新打开会话再判断候选。
+4. 全部人工候选确认提交后，用同一 Profile 再运行普通 Translate：人工结果仍为 Current
+   时不得产生对应 LLM 任务。只有结果为 `Complete`，且 `remaining_decisions` 与
+   `remaining_locations` 均已清零时，人工收尾才完成；否则返回最早责任状态，不把无法
+   验收的人工文本强行写入。
