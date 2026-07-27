@@ -8,7 +8,6 @@ use crate::rpg_maker::model::MutationClaim;
 use crate::rpg_maker::plugin_document::{
     PluginsEnvelopeFailure, parse_plugins_envelope, validate_plugins_root_is_array,
 };
-use crate::rpg_maker::tag::simple_tag_spans;
 use crate::rpg_maker::text::{
     DataFileName, DataFileNameError, MapId, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
     StandardDataFile,
@@ -77,113 +76,6 @@ impl OpenedRpgMakerDocument {
             RpgMakerLocation::value(self.source.clone(), steps.to_vec()),
         ))
     }
-
-    pub(crate) fn note_tag(
-        &self,
-        container_steps: &[RpgMakerLocationStep],
-        tag_name: &str,
-        occurrence: usize,
-    ) -> Result<RpgMakerTextReference, RpgMakerDocumentError> {
-        validate_tag_name(tag_name)?;
-        let container = self.value(container_steps)?;
-        let LosslessJsonValue::Object(fields) = &container else {
-            return Err(RpgMakerDocumentError::ExpectedObject);
-        };
-        let Some(LosslessJsonValue::String(note)) = object_get(fields, "note") else {
-            return Err(RpgMakerDocumentError::ExpectedNoteString);
-        };
-        let value = find_tag(note, tag_name, occurrence)?;
-        Ok(RpgMakerTextReference::new(
-            value.to_owned(),
-            RpgMakerLocation::note_tag(
-                self.source.clone(),
-                container_steps.to_vec(),
-                tag_name,
-                occurrence,
-            ),
-        ))
-    }
-
-    pub(crate) fn comment_tag(
-        &self,
-        command_steps: &[RpgMakerLocationStep],
-        tag_name: &str,
-        occurrence: usize,
-    ) -> Result<RpgMakerTextReference, RpgMakerDocumentError> {
-        validate_tag_name(tag_name)?;
-        let Some((last, list_steps)) = command_steps.split_last() else {
-            return Err(RpgMakerDocumentError::ExpectedCommandPath);
-        };
-        let RpgMakerLocationStep::ArrayIndex(start_index) = last else {
-            return Err(RpgMakerDocumentError::ExpectedCommandPath);
-        };
-        let list = self.value(list_steps)?;
-        let LosslessJsonValue::Array(commands) = &list else {
-            return Err(RpgMakerDocumentError::ExpectedCommandList);
-        };
-        let mut lines = Vec::new();
-        let mut backing_values = Vec::new();
-        let mut start_indent = None;
-        for (relative, command) in commands.iter().skip(*start_index).enumerate() {
-            let LosslessJsonValue::Object(fields) = command else {
-                if relative == 0 {
-                    return Err(RpgMakerDocumentError::ExpectedCommandObject);
-                }
-                break;
-            };
-            let Some(code) = object_get(fields, "code").and_then(json_integer) else {
-                if relative == 0 {
-                    return Err(RpgMakerDocumentError::ExpectedCommandCode);
-                }
-                break;
-            };
-            let expected = if relative == 0 { 108 } else { 408 };
-            if code != expected {
-                if relative == 0 {
-                    return Err(RpgMakerDocumentError::ExpectedCommentStart);
-                }
-                break;
-            }
-            let Some(indent) = object_get(fields, "indent").and_then(json_integer) else {
-                return Err(RpgMakerDocumentError::ExpectedCommandIndent);
-            };
-            if let Some(start_indent) = start_indent {
-                if indent != start_indent {
-                    break;
-                }
-            } else {
-                start_indent = Some(indent);
-            }
-            let Some(LosslessJsonValue::Array(parameters)) = object_get(fields, "parameters")
-            else {
-                return Err(RpgMakerDocumentError::ExpectedCommandParameters);
-            };
-            let Some(LosslessJsonValue::String(line)) = parameters.first() else {
-                return Err(RpgMakerDocumentError::ExpectedCommentLine);
-            };
-            lines.push(line.as_str());
-            let mut backing_steps = list_steps.to_vec();
-            backing_steps.push(RpgMakerLocationStep::ArrayIndex(start_index + relative));
-            backing_steps.push(RpgMakerLocationStep::ObjectKey("parameters".to_owned()));
-            backing_steps.push(RpgMakerLocationStep::ArrayIndex(0));
-            backing_values.push(RpgMakerLocation::value(self.source.clone(), backing_steps));
-        }
-        let text = lines.join("\n");
-        let value = find_tag(&text, tag_name, occurrence)?;
-        let location = RpgMakerLocation::comment_tag(
-            self.source.clone(),
-            command_steps.to_vec(),
-            tag_name,
-            occurrence,
-        );
-        let mutation_claim = MutationClaim::comment_tag(location.clone(), backing_values)
-            .expect("Host 已验证 CommentTag 及其完整 108/408 backing");
-        Ok(RpgMakerTextReference::new_with_claim(
-            value.to_owned(),
-            location,
-            mutation_claim,
-        ))
-    }
 }
 
 /// 由 Rust 建立且同时携带冻结原文和结构化身份的文本引用。
@@ -196,17 +88,7 @@ pub(crate) struct RpgMakerTextReference {
 
 impl RpgMakerTextReference {
     fn new(original: String, location: RpgMakerLocation) -> Self {
-        let mutation_claim = MutationClaim::for_location(location.clone())
-            .expect("Host 只会建立可直接写回的 Value 或 NoteTag 文本引用");
-        Self::new_with_claim(original, location, mutation_claim)
-    }
-
-    fn new_with_claim(
-        original: String,
-        location: RpgMakerLocation,
-        mutation_claim: MutationClaim,
-    ) -> Self {
-        debug_assert_eq!(mutation_claim.representative_location(), &location);
+        let mutation_claim = MutationClaim::for_location(location.clone());
         Self {
             original,
             location,
@@ -415,37 +297,6 @@ fn object_get<'a>(
         .find_map(|(candidate, value)| (candidate == key).then_some(value))
 }
 
-fn json_integer(value: &LosslessJsonValue) -> Option<i64> {
-    let LosslessJsonValue::Number(value) = value else {
-        return None;
-    };
-    value.parse().ok()
-}
-
-fn validate_tag_name(tag_name: &str) -> Result<(), RpgMakerDocumentError> {
-    if tag_name.is_empty()
-        || tag_name
-            .chars()
-            .any(|character| matches!(character, '<' | '>' | ':'))
-    {
-        Err(RpgMakerDocumentError::InvalidTagName)
-    } else {
-        Ok(())
-    }
-}
-
-fn find_tag<'a>(
-    text: &'a str,
-    tag_name: &str,
-    occurrence: usize,
-) -> Result<&'a str, RpgMakerDocumentError> {
-    simple_tag_spans(text)
-        .into_iter()
-        .find(|tag| tag.name() == tag_name && tag.occurrence() == occurrence)
-        .map(|tag| tag.value())
-        .ok_or(RpgMakerDocumentError::TagNotFound)
-}
-
 /// RPG Maker 文档来源、结构路径或目标值无效。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpgMakerDocumentError {
@@ -468,17 +319,6 @@ pub(crate) enum RpgMakerDocumentError {
     MissingArrayIndex,
     ExpectedEncodedJsonString,
     ExpectedString,
-    ExpectedNoteString,
-    ExpectedCommandPath,
-    ExpectedCommandList,
-    ExpectedCommandObject,
-    ExpectedCommandCode,
-    ExpectedCommandIndent,
-    ExpectedCommentStart,
-    ExpectedCommandParameters,
-    ExpectedCommentLine,
-    InvalidTagName,
-    TagNotFound,
 }
 
 impl RpgMakerDocumentError {
@@ -501,18 +341,7 @@ impl RpgMakerDocumentError {
             | Self::MissingObjectKey
             | Self::MissingArrayIndex
             | Self::ExpectedEncodedJsonString
-            | Self::ExpectedString
-            | Self::ExpectedNoteString
-            | Self::ExpectedCommandPath
-            | Self::ExpectedCommandList
-            | Self::ExpectedCommandObject
-            | Self::ExpectedCommandCode
-            | Self::ExpectedCommandIndent
-            | Self::ExpectedCommentStart
-            | Self::ExpectedCommandParameters
-            | Self::ExpectedCommentLine => "invalid_location",
-            Self::InvalidTagName => "invalid_tag",
-            Self::TagNotFound => "tag_not_found",
+            | Self::ExpectedString => "invalid_location",
         }
     }
 }
@@ -552,29 +381,6 @@ impl fmt::Display for RpgMakerDocumentError {
                 formatter.write_str("DecodeJsonString 当前值不是 JSON string")
             }
             Self::ExpectedString => formatter.write_str("RPG Maker 文本位置不是 JSON string"),
-            Self::ExpectedNoteString => formatter.write_str("RPG Maker Note 容器缺少字符串 note"),
-            Self::ExpectedCommandPath => {
-                formatter.write_str("RPG Maker 注释路径必须终止于事件指令数组下标")
-            }
-            Self::ExpectedCommandList => {
-                formatter.write_str("RPG Maker 指令父位置不是事件指令数组")
-            }
-            Self::ExpectedCommandObject => formatter.write_str("RPG Maker 事件指令不是对象"),
-            Self::ExpectedCommandCode => formatter.write_str("RPG Maker 事件指令 code 不是整数"),
-            Self::ExpectedCommandIndent => {
-                formatter.write_str("RPG Maker 注释指令 indent 不是整数")
-            }
-            Self::ExpectedCommentStart => {
-                formatter.write_str("RPG Maker 注释起始指令 code 不是 108")
-            }
-            Self::ExpectedCommandParameters => {
-                formatter.write_str("RPG Maker 注释指令 parameters 不是数组")
-            }
-            Self::ExpectedCommentLine => {
-                formatter.write_str("RPG Maker 108/408 注释正文不是字符串")
-            }
-            Self::InvalidTagName => formatter.write_str("RPG Maker 标签名无效"),
-            Self::TagNotFound => formatter.write_str("RPG Maker 文本中不存在指定标签 occurrence"),
         }
     }
 }
@@ -612,70 +418,6 @@ mod tests {
         assert_eq!(
             text.location(),
             &RpgMakerLocation::value(document.source().clone(), steps)
-        );
-        assert_eq!(
-            document
-                .note_tag(&[RpgMakerLocationStep::index(1)], "Help", 0)
-                .unwrap()
-                .original(),
-            "说明"
-        );
-    }
-
-    #[test]
-    fn resolves_contiguous_108_408_comment_tags() {
-        let document = OpenedRpgMakerDocument::open(
-            RpgMakerSource::map(1),
-            r#"{"list":[{"code":108,"indent":2,"parameters":["<Quest:第一"]},{"code":408,"indent":2,"parameters":["行>"]},{"code":0,"indent":2,"parameters":[]}] }"#.as_bytes(),
-        )
-        .unwrap();
-        let reference = document
-            .comment_tag(
-                &[
-                    RpgMakerLocationStep::key("list"),
-                    RpgMakerLocationStep::index(0),
-                ],
-                "Quest",
-                0,
-            )
-            .unwrap();
-        assert_eq!(reference.original(), "第一\n行");
-    }
-
-    #[test]
-    fn comment_tag_stops_before_a_408_with_a_different_indent() {
-        let document = OpenedRpgMakerDocument::open(
-            RpgMakerSource::map(1),
-            r#"{"list":[{"code":108,"indent":1,"parameters":["<Quest:第一>"]},{"code":408,"indent":2,"parameters":["<Quest:错误续行>"]},{"code":0,"indent":1,"parameters":[]}] }"#.as_bytes(),
-        )
-        .unwrap();
-
-        let first = document
-            .comment_tag(
-                &[
-                    RpgMakerLocationStep::key("list"),
-                    RpgMakerLocationStep::index(0),
-                ],
-                "Quest",
-                0,
-            )
-            .expect("108 自身的标签应可读取");
-        assert_eq!(first.original(), "第一");
-        let MutationClaim::CommentTag { backing_values, .. } = first.mutation_claim() else {
-            panic!("CommentTag 引用必须携带完整 backing");
-        };
-        assert_eq!(backing_values.len(), 1);
-        assert_eq!(
-            document.comment_tag(
-                &[
-                    RpgMakerLocationStep::key("list"),
-                    RpgMakerLocationStep::index(0),
-                ],
-                "Quest",
-                1,
-            ),
-            Err(RpgMakerDocumentError::TagNotFound),
-            "不同 indent 的 408 不属于当前 108 注释块"
         );
     }
 

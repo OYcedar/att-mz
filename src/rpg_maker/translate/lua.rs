@@ -350,8 +350,7 @@ fn rejection_code(
             | TranslationUnitRejectionReason::InvalidShape { .. }
             | TranslationUnitRejectionReason::LineCountMismatch { .. }
             | TranslationUnitRejectionReason::InvalidLineText { .. }
-            | TranslationUnitRejectionReason::BlankLineMismatch { .. }
-            | TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { .. } => {
+            | TranslationUnitRejectionReason::BlankLineMismatch { .. } => {
                 Err(TrustedLuaHostCallError::new(
                     "translation",
                     "internal_invariant",
@@ -403,7 +402,9 @@ mod tests {
     use crate::rpg_maker::lua::LuaPhase;
     use crate::rpg_maker::translate::executor::TranslationCandidateTechnicalError;
     use crate::rpg_maker::translate::language_projection::LanguageTextProjectionError;
-    use crate::rpg_maker::translate::placeholder::PlaceholderProtectionError;
+    use crate::rpg_maker::translate::placeholder::{
+        PlaceholderProtectionError, PlaceholderRuleDefinition,
+    };
 
     #[derive(Debug)]
     struct FakeClient {
@@ -773,6 +774,50 @@ mod tests {
                 .expect("非 active 状态应返回普通拒绝"),
             TrustedLuaPreparedTranslationAcceptance::rejected("fully_protected")
         );
+    }
+
+    #[test]
+    fn lua_prepare_uses_kind_scoped_placeholder_without_owning_private_grammar() {
+        let semantics = ResolvedTranslationSemantics::for_test_with_placeholders(vec![
+            PlaceholderRuleDefinition::new(
+                Some(vec!["database_entry".to_owned()]),
+                r"\A<Help:(?<text>.*?)>\z",
+            ),
+        ]);
+        let original = "<Help:炎の剣の説明>";
+        let prepared = TrustedLuaTranslationSemantics::prepare_translation(
+            &semantics,
+            TextGroupKind::DatabaseEntry,
+            original.to_owned(),
+            "private-protocol=help".to_owned(),
+        )
+        .expect("Lua 主动 prepare 应消费同 kind Custom Placeholder");
+
+        assert!(prepared.model_text().contains("炎の剣の説明"));
+        assert!(!prepared.model_text().contains("<Help:"));
+        let candidate = prepared.model_text().replace("炎の剣の説明", "炎之剑>说明");
+        let accepted = prepared
+            .accept(candidate)
+            .expect("公共验收不应猜测 Lua 私有 grammar");
+        assert!(
+            matches!(
+                &accepted,
+                TrustedLuaPreparedTranslationAcceptance::Accepted {
+                    translation,
+                    ..
+                } if translation == "<Help:炎之剑>说明>"
+            ),
+            "实际验收结果：{accepted:?}"
+        );
+
+        let other_kind = TrustedLuaTranslationSemantics::prepare_translation(
+            &semantics,
+            TextGroupKind::Map,
+            original.to_owned(),
+            String::new(),
+        )
+        .expect("异 kind 不应消费 database_entry Placeholder");
+        assert_eq!(other_kind.model_text(), original);
     }
 
     #[test]

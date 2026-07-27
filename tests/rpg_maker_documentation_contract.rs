@@ -113,7 +113,7 @@ const TOML_EXAMPLES: [&str; 4] = [
     "terminology.toml",
 ];
 
-const LUA_EXAMPLES: [(&str, &[&str]); 5] = [
+const LUA_EXAMPLES: [(&str, &[&str]); 6] = [
     (
         "lua-standard-data-file.lua",
         &["ctx.rpg_maker.data_file", "ctx.extract.replace_standard"],
@@ -142,6 +142,15 @@ const LUA_EXAMPLES: [(&str, &[&str]); 5] = [
         &["ctx.write_back", "ctx.output"],
     ),
     (
+        "lua-private-tag.lua",
+        &[
+            "ctx.rpg_maker.open",
+            "ctx.translation.prepare",
+            "ctx.output",
+            "lua_private_tag_unit",
+        ],
+    ),
+    (
         "lua-complex-protocol.lua",
         &[
             "ctx.phase",
@@ -152,7 +161,7 @@ const LUA_EXAMPLES: [(&str, &[&str]); 5] = [
     ),
 ];
 
-const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 10] = [
+const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 11] = [
     (
         "config.example.toml",
         "src/application/config.rs",
@@ -206,6 +215,12 @@ const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 10] = [
         "src/rpg_maker/lua/lua54.rs",
         "include_str!(\"../../../docs/rpg-maker/examples/lua-idempotent-write-back.lua\")",
         "async fn documented_translate_state_and_idempotent_write_back_examples_execute()",
+    ),
+    (
+        "lua-private-tag.lua",
+        "src/rpg_maker/lua/lua54.rs",
+        "include_str!(\"../../../docs/rpg-maker/examples/lua-private-tag.lua\")",
+        "async fn documented_private_tag_protocol_owns_all_three_phases()",
     ),
     (
         "lua-complex-protocol.lua",

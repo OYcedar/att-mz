@@ -2472,15 +2472,9 @@ impl RulesMaterializationReason {
 fn projection_error_code(source: &ProjectionModelError) -> &'static str {
     match source {
         ProjectionModelError::EmptyScalarFieldKey => "empty_scalar_field_key",
-        ProjectionModelError::CommentTagBackingRequired => "comment_tag_backing_required",
-        ProjectionModelError::InvalidCommentTagBacking => "invalid_comment_tag_backing",
-        ProjectionModelError::EventBlockHeaderMustBeValue => "event_block_header_must_be_value",
         ProjectionModelError::EventBlockCoverageRequired => "event_block_coverage_required",
         ProjectionModelError::InvalidEventBlockCoverage => "invalid_event_block_coverage",
         ProjectionModelError::MutationClaimTargetMismatch => "mutation_claim_target_mismatch",
-        ProjectionModelError::InvalidDialoguePhysicalLocation => {
-            "invalid_dialogue_physical_location"
-        }
         ProjectionModelError::RecipeHasNoTextSlot => "recipe_has_no_text_slot",
         ProjectionModelError::DuplicateProjectionSlot { .. } => "duplicate_projection_slot",
         ProjectionModelError::MultipleBodyLinesInPhysicalLine => {
@@ -3059,6 +3053,69 @@ path = 'z'
                 .collect::<Vec<_>>(),
             ["物理第一", "物理第二"],
             "规则编号与键名词法序都不得覆盖来源结构顺序"
+        );
+    }
+
+    #[test]
+    fn rule_without_pattern_keeps_angle_bracket_text_as_one_complete_unit() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+file = "Items.json"
+path = '[].note'
+"#,
+        )
+        .expect("完整 Value 规则应合法");
+        let input = input([("Items.json", json!([null, {"note":"<Help:炎之剑的说明>"}]))]);
+
+        let targets = match_rules(&definition, &input).expect("完整 Value 应形成一个目标");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].units.len(), 1);
+        assert_eq!(targets[0].units[0].source_text, "<Help:炎之剑的说明>");
+        assert_eq!(
+            targets[0].parts,
+            [MatchedRulePart::TextSlot { unit_index: 0 }]
+        );
+        assert_eq!(
+            targets[0]
+                .materialize(&["<Help:烈焰之剑的说明>>".to_owned()])
+                .expect("完整 Value 配方应可写回"),
+            "<Help:烈焰之剑的说明>>"
+        );
+    }
+
+    #[test]
+    fn explicit_help_capture_makes_only_the_body_a_unit_and_keeps_the_shell_literal() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+file = "Items.json"
+path = '[].note'
+pattern = '\A<Help:(?<text>.*?)>\z'
+"#,
+        )
+        .expect("显式正文捕获规则应合法");
+        let input = input([("Items.json", json!([null, {"note":"<Help:炎之剑的说明>"}]))]);
+
+        let targets = match_rules(&definition, &input).expect("显式捕获应形成一个目标");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].units.len(), 1);
+        assert_eq!(targets[0].units[0].source_text, "炎之剑的说明");
+        assert_eq!(
+            targets[0].parts,
+            [
+                MatchedRulePart::Literal("<Help:".to_owned()),
+                MatchedRulePart::TextSlot { unit_index: 0 },
+                MatchedRulePart::Literal(">".to_owned()),
+            ]
+        );
+        assert_eq!(
+            targets[0]
+                .materialize(&["烈焰之剑的说明>追加".to_owned()])
+                .expect("外壳与正文配方应可写回"),
+            "<Help:烈焰之剑的说明>追加>"
         );
     }
 

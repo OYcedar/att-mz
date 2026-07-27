@@ -20,8 +20,8 @@ use super::placeholder::{
 };
 use super::planning_resource::CompiledTerminology;
 use super::standard::{
-    AppliedPlaceholder, ExpectedLineShape, TerminologyDependency, TranslationTargetConstraints,
-    TranslationUnitIdentity, TranslationUnitRejectionReason,
+    AppliedPlaceholder, ExpectedLineShape, TerminologyDependency, TranslationUnitIdentity,
+    TranslationUnitRejectionReason,
 };
 
 /// 一轮 Standard 与 Lua 共享且不可变的当前翻译语义。
@@ -82,6 +82,13 @@ impl ResolvedTranslationSemantics {
 
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
+        Self::for_test_with_placeholders(Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_placeholders(
+        definitions: Vec<super::placeholder::PlaceholderRuleDefinition>,
+    ) -> Self {
         use std::num::NonZeroUsize;
 
         use crate::language::{
@@ -90,8 +97,8 @@ impl ResolvedTranslationSemantics {
 
         let placeholder_service = Pcre2PlaceholderService::new().expect("测试内建占位符应可编译");
         let custom_placeholders = placeholder_service
-            .compile_custom(Vec::new())
-            .expect("测试空占位符集应可编译");
+            .compile_custom(definitions)
+            .expect("测试占位符集应可编译");
         let source_language = Arc::new(JapaneseLanguageModule::new(
             JapaneseResidualPolicy::new(NonZeroUsize::new(1).expect("常量非零"), Vec::new())
                 .expect("测试日文残留策略应有效"),
@@ -390,7 +397,6 @@ impl PreparedTranslationText {
     pub(crate) fn accept_content(
         &self,
         identity: &TranslationUnitIdentity,
-        target_constraints: TranslationTargetConstraints,
         line_shape: ExpectedLineShape,
         candidate: TextUnitContent,
     ) -> Result<TranslationContentAcceptance, ResolvedTranslationSemanticError> {
@@ -406,7 +412,6 @@ impl PreparedTranslationText {
         }
         accept_translation_content_candidate(
             identity,
-            target_constraints,
             &self.model_text,
             line_shape,
             &self.placeholders,
@@ -712,6 +717,114 @@ mod tests {
     }
 
     #[test]
+    fn help_wrapper_protects_shell_without_splitting_the_complete_value_unit() {
+        let semantics = semantics_with(
+            RpgMakerEngine::Mz,
+            Vec::new(),
+            vec![PlaceholderRuleDefinition::new(
+                Some(vec!["database_entry".to_owned()]),
+                r"\A<Help:(?<text>.*?)>\z",
+            )],
+        );
+        let original = "<Help:炎の剣の説明>";
+
+        let prepared = semantics
+            .prepare(TextGroupKind::DatabaseEntry, original)
+            .expect("完整 Value 应在形成 Unit 后投影 Placeholder");
+
+        assert!(prepared.model_text().contains("炎の剣の説明"));
+        assert_eq!(
+            prepared
+                .placeholders()
+                .iter()
+                .map(AppliedPlaceholder::original)
+                .collect::<Vec<_>>(),
+            ["<Help:", ">"]
+        );
+        let candidate = prepared
+            .model_text()
+            .replace("炎の剣の説明", "炎之剑<说明>追加");
+        assert_eq!(
+            prepared
+                .accept(&candidate)
+                .expect("正文中的裸尖括号不应被猜成 opaque 外壳"),
+            PreparedTranslationAcceptance::Accepted("<Help:炎之剑<说明>追加>".to_owned())
+        );
+        assert_eq!(
+            prepared
+                .accept("<Help:炎之剑的说明>")
+                .expect("人工候选应能用唯一原片段恢复 Custom 外壳"),
+            PreparedTranslationAcceptance::Accepted("<Help:炎之剑的说明>".to_owned())
+        );
+
+        let other_kind = semantics
+            .prepare(TextGroupKind::Map, original)
+            .expect("异 kind 不应消费 database_entry Placeholder");
+        assert_eq!(other_kind.model_text(), original);
+        assert!(other_kind.placeholders().is_empty());
+    }
+
+    #[test]
+    fn manual_custom_shell_rejects_repeated_missing_bindings_as_ambiguous() {
+        let semantics = semantics_with(
+            RpgMakerEngine::Mz,
+            Vec::new(),
+            vec![PlaceholderRuleDefinition::new(
+                Some(vec!["database_entry".to_owned()]),
+                r"<x>(?<text>.*?)</x>",
+            )],
+        );
+        let prepared = semantics
+            .prepare(TextGroupKind::DatabaseEntry, "<x>一つ目</x><x>二つ目</x>")
+            .expect("两个结构化壳应建立四个独立 Custom 绑定");
+
+        assert!(matches!(
+            prepared
+                .accept("<x>第一项</x><x>第二项</x>")
+                .expect("无法唯一归位应是普通候选拒绝"),
+            PreparedTranslationAcceptance::Rejected(PreparedTranslationRejection::Candidate(
+                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn custom_literal_normalization_uses_the_frozen_candidate_not_inserted_tokens() {
+        let scope = Some(vec!["database_entry".to_owned()]);
+        let semantics = semantics_with(
+            RpgMakerEngine::Mz,
+            Vec::new(),
+            vec![
+                PlaceholderRuleDefinition::new(scope.clone(), r"<x>"),
+                PlaceholderRuleDefinition::new(scope, r"ATT"),
+            ],
+        );
+        let prepared = semantics
+            .prepare(TextGroupKind::DatabaseEntry, "<x>翻訳ATT")
+            .expect("两个互不重叠的 Custom 原片段应可保护");
+
+        for candidate in [
+            "<x>译文ATT".to_owned(),
+            prepared.model_text().replace("翻訳", "译文").replace(
+                prepared
+                    .placeholders()
+                    .iter()
+                    .find(|placeholder| placeholder.original() == "ATT")
+                    .expect("ATT 绑定应存在")
+                    .token(),
+                "ATT",
+            ),
+        ] {
+            assert_eq!(
+                prepared
+                    .accept(candidate)
+                    .expect("原片段扫描不得进入既有或刚插入的 ATT token"),
+                PreparedTranslationAcceptance::Accepted("<x>译文ATT".to_owned())
+            );
+        }
+    }
+
+    #[test]
     fn scalar_accept_allows_lf_but_rejects_cr_nul_and_all_whitespace() {
         let prepared = ResolvedTranslationSemantics::for_test()
             .prepare(TextGroupKind::DatabaseEntry, "翻訳")
@@ -760,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn new_candidate_rejects_extra_original_copies_even_when_all_tokens_are_present() {
+    fn new_candidate_rejects_extra_builtin_control_when_all_tokens_are_present() {
         // 重复 original 的 token 全部在场时，多抄的一份原始控制片段同样无法
         // 唯一归位；混排必须与单绑定分支一致拒绝，不得作为字面文本混入译文。
         let prepared = ResolvedTranslationSemantics::for_test()

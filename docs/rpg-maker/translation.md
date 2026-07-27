@@ -72,12 +72,19 @@ MV 与 MZ 共享翻译流程，但 engine 是语义事实：两者 Builtin 控�
 
 ## 3. NaturalText、术语和 Placeholder
 
-每个原文先执行 engine 对应的 Builtin Placeholder 和当前 Custom Placeholder，得到有序
-opaque 段及 NaturalText 段。术语只逐段扫描 NaturalText，不扫描 opaque 外壳，不跨
+Extract 先建立 Group 与 Unit；Unit 是翻译验收、Current 和全局去重的最小单位。每个
+Unit 原文随后执行 engine 对应的 Builtin Placeholder 和当前 Custom Placeholder，得到
+有序 opaque 段及 NaturalText 段。Placeholder 不拆 Unit、不分配持久 ID，也不改变
+Extract recipe。术语只逐段扫描 NaturalText，不扫描 opaque 外壳，不跨
 OpaqueBoundary 或 Lines 元素拼接。`Value` 中的 LF 是该值本身的内容，Placeholder 可以
 按规则跨 LF 匹配；`Lines` 元素之间的拼接 LF 是语义槽边界，任何实际 opaque 保护跨度
 都不得包含该边界。带 `text` 捕获的完整 wrapper 匹配可以横跨多个元素，但前后实际
 opaque wrapper 必须各自留在单个元素内，元素边界只能位于仍可翻译的 `text` 中。
+
+Custom Placeholder 的 `scopes` 只匹配八种 TextGroup kind。同 kind 的 Builtin、Rules
+Unit 与主动调用 `translation.prepare(kind, ...)` 的 Lua 私有文本使用同一规则；异 kind
+不使用。规则不选择 owner、文件路径、Extract Rule 或 Lua 脚本，也不负责 Lua 私有
+grammar 的解析和验收。
 
 自定义 Placeholder 文件的解析或编译错误在任何单元规划前拒绝整份资源；规则已经成功
 编译后，某个单元发生保护跨度冲突、占用 `⟦ATT_` 保留前缀或无法安全投影，只形成该单元
@@ -111,7 +118,10 @@ Reader 只接受 Extract 已验证的顺序：owner 固定 Builtin、Rules、Lua
 
 不 trim、不折叠大小写、不做 Unicode 或换行模糊匹配。重复集合使用自然顺序最早代表；
 已有一个 Current 译文时复用，多个有效译文冲突时失败。recipe 的 Literal 外壳不是翻译
-语义；仅外壳变化、而语义内容和上下文相同时可继承译文。
+语义；仅外壳变化、而语义内容和上下文相同时可继承译文。去重键同时包含完整 Unit
+原文、角色/语义域、必要上下文、保护后的文本和实际 Placeholder 有序绑定；不同完整原文
+或不同实际保护契约不会误合族。只为本轮没有 Current 种子的活动代表分配临时模型 ID，
+持久化层不为去重族另造业务 ID。
 
 ## 5. 任务规划与模型消息
 
@@ -201,25 +211,25 @@ kind/role 若不一致属于内部不变量，候选自身的形状或字符不�
 - DialogueSpeaker Value 拒绝 CR/LF，所有 Value 拒绝 NUL；每个 Lines 元素拒绝
   CR、LF、NUL；
 - 纯空白、严格对齐数量和空槽一致性仍由响应验收规则负责，不进入共享结构校验；
-- 写回目标为 note/comment `<name:value>` 标签值的单元额外拒绝含 `>` 的译文
-  （`tag_value_contains_closing_delimiter`）：标签值按字节区间逐字写回，`>` 会提前
-  闭合标签并把余文泄漏为容器正文。原文由提取协议保证不含 `>`，该规则不拒绝任何
-  可往返的合法译文。约束按完整去重传播族建立：主目标不是标签值但任一传播目标是
-  标签值时，同一候选仍必须拒绝。
+- 裸 `<` 与 `>` 是普通文本字节，新模型候选、Current 复用、去重传播和人工候选都按
+  完整 Unit 契约逐字验收；只有明确命中的 Builtin/Custom Placeholder 跨度受到保护。
 
 Planner 在构造每个 `ExpectedTranslationOutput` 时一次性校验传播上下文数量、Value/Lines
 形状、行数、受保护文本与占位符 multiset，并建立该输出唯一的 Placeholder binding
 索引。Executor 只消费这份已验证契约和缓存索引，不在每次响应验收时重建索引或重新
 校验相同的静态 Planner 事实。
 
-候选随后执行：BOM/全空白检查、ATT token 数量与对齐检查、占位符无歧义恢复、目标自然
-语言检查、源语残留分析及当前语言模块允许的修复。失败仅拒绝相应候选并形成结构化
+候选随后执行：BOM/全空白检查、ATT token 数量与对齐检查、唯一原片段回显归一化、目标
+自然语言检查、源语残留分析及当前语言模块允许的修复。失败仅拒绝相应候选并形成结构化
 unresolved；不会伪造译文。全部 ID 通过时任务为 `Complete`；部分通过时为 `Partial`；
 JSON 根有效但全部输出被拒绝时原因为 `AllOutputsRejected`。
 
-原文中相同占位符出现多次时，每个源位置仍是独立槽。**新**模型响应若无法无歧义恢复，
-以 `placeholder_normalization_ambiguous` 拒绝。已经验收并持久化的译文按下一节 Current
-规则处理，不重新执行这项反向正规化。
+候选缺少某个 token 时，只有对应原片段属于唯一槽且在候选中恰好回显一次，才可恢复为
+该 token；多个同字节槽或多次回显无法唯一对应时，以
+`placeholder_normalization_ambiguous` 拒绝。token 已经在场时，额外出现的 Builtin
+原控制符仍由内建控制语义拒绝；Custom 原片段不会反向扫描候选正文，正文中的同字节内容
+保持 NaturalText。已经验收并持久化的译文按下一节 Current 规则处理，不重新执行这项
+反向正规化。
 
 ## 7. translation state 与 Current
 

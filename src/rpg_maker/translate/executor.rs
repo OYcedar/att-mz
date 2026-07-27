@@ -48,9 +48,9 @@ use super::profile::{
 };
 use super::standard::{
     AcceptedTranslationDecision, AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
-    NonEmptyTaskItems, StandardTranslationProfile, StandardTranslationTaskExecutor,
-    StandardTranslationTaskIndex, TranslationPatch, TranslationProtocolDiagnostic,
-    TranslationTargetConstraints, TranslationTaskBlock, TranslationTaskOutcome,
+    NonEmptyTaskItems, PlaceholderRuleOrigin, StandardTranslationProfile,
+    StandardTranslationTaskExecutor, StandardTranslationTaskIndex, TranslationPatch,
+    TranslationProtocolDiagnostic, TranslationTaskBlock, TranslationTaskOutcome,
     TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
     TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
@@ -1533,12 +1533,8 @@ fn process_response(
                 continue;
             }
         };
-        let target_constraints = TranslationTargetConstraints::from_identities(
-            std::iter::once(expected.identity()).chain(expected.propagation_targets().iter()),
-        );
         let translation = match accept_translation_lines_candidate_at(
             expected.identity(),
-            target_constraints,
             expected.protected_text(),
             expected.line_shape(),
             expected.applied_placeholders(),
@@ -1651,7 +1647,6 @@ fn non_empty_known<T>(items: Vec<T>, established_by: &'static str) -> NonEmptyTa
 
 fn validate_translation_lines(
     identity: &super::standard::TranslationUnitIdentity,
-    target_constraints: TranslationTargetConstraints,
     shape: ExpectedLineShape,
     lines: &[String],
 ) -> Result<(), TranslationUnitRejectionReason> {
@@ -1668,13 +1663,6 @@ fn validate_translation_lines(
             unreachable!("物理行校验不执行内容形状判断");
         };
         return Err(TranslationUnitRejectionReason::InvalidLineText { line_index });
-    }
-    if target_constraints.targets_tag_value()
-        && let Some(line_index) = lines.iter().position(|line| line.contains('>'))
-    {
-        return Err(
-            TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index },
-        );
     }
     match shape {
         ExpectedLineShape::Reflow => {
@@ -1733,7 +1721,6 @@ pub(crate) enum TranslationContentAcceptance {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn accept_translation_content_candidate(
     identity: &super::standard::TranslationUnitIdentity,
-    target_constraints: TranslationTargetConstraints,
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
@@ -1743,7 +1730,6 @@ pub(crate) fn accept_translation_content_candidate(
 ) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
     accept_translation_content_candidate_at(
         identity,
-        target_constraints,
         protected_text,
         line_shape,
         placeholders,
@@ -1757,7 +1743,6 @@ pub(crate) fn accept_translation_content_candidate(
 #[allow(clippy::too_many_arguments)]
 fn accept_translation_content_candidate_at(
     identity: &super::standard::TranslationUnitIdentity,
-    target_constraints: TranslationTargetConstraints,
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
@@ -1819,7 +1804,6 @@ fn accept_translation_content_candidate_at(
         .map_err(TranslationCandidateTechnicalError::LanguageProjection)?;
     accept_translation_lines_candidate_at(
         identity,
-        target_constraints,
         protected_text,
         line_shape,
         placeholders,
@@ -1834,7 +1818,6 @@ fn accept_translation_content_candidate_at(
 #[allow(clippy::too_many_arguments)]
 fn accept_translation_lines_candidate_at(
     identity: &super::standard::TranslationUnitIdentity,
-    target_constraints: TranslationTargetConstraints,
     protected_text: &str,
     line_shape: ExpectedLineShape,
     placeholders: &[AppliedPlaceholder],
@@ -1844,9 +1827,7 @@ fn accept_translation_lines_candidate_at(
     lines: Vec<String>,
     invariant_location: TranslationCandidateInvariantLocation,
 ) -> Result<TranslationContentAcceptance, TranslationCandidateTechnicalError> {
-    if let Err(reason) =
-        validate_translation_lines(identity, target_constraints, line_shape, &lines)
-    {
+    if let Err(reason) = validate_translation_lines(identity, line_shape, &lines) {
         return Ok(TranslationContentAcceptance::Rejected(reason));
     }
     match validate_and_restore_translation_lines_at(
@@ -2355,7 +2336,7 @@ fn validate_and_restore_translation_lines_at(
         .iter()
         .map(|line| placeholder_bindings.scan(line))
         .collect::<Vec<_>>();
-    let normalized_original = normalize_original_controls_in_lines(
+    let normalized_original = normalize_original_placeholder_literals_in_lines(
         &mut lines,
         placeholders,
         placeholder_bindings,
@@ -2525,7 +2506,7 @@ fn validate_and_restore_translation_at(
     let placeholder_bindings = PlaceholderBindingIndex::new(placeholders)
         .map_err(TranslationCandidateValidationError::LanguageProjection)?;
     let initial_scan = placeholder_bindings.scan(&translation);
-    let normalized_original = normalize_original_controls_in_lines(
+    let normalized_original = normalize_original_placeholder_literals_in_lines(
         std::slice::from_mut(&mut translation),
         placeholders,
         &placeholder_bindings,
@@ -2726,12 +2707,13 @@ enum TranslationCandidateValidationError {
     },
 }
 
-fn normalize_original_controls_in_lines(
+fn normalize_original_placeholder_literals_in_lines(
     lines: &mut [String],
     placeholders: &[AppliedPlaceholder],
     placeholder_bindings: &PlaceholderBindingIndex,
     scans: &[PlaceholderTextScan],
 ) -> Result<bool, TranslationUnitRejectionReason> {
+    debug_assert_eq!(lines.len(), scans.len());
     let mut originals = BTreeMap::<&str, Vec<usize>>::new();
     let mut token_counts = BTreeMap::<&str, usize>::new();
     for (binding_index, placeholder) in placeholders.iter().enumerate() {
@@ -2743,13 +2725,22 @@ fn normalize_original_controls_in_lines(
             .entry(placeholder.token())
             .or_insert_with(|| placeholder_bindings.token_occurrences(scans, binding_index));
     }
-    let mut changed = false;
+    let mut replacements = Vec::<OriginalPlaceholderLiteralReplacement<'_>>::new();
     for (original, bindings) in originals {
-        if bindings.len() != 1 {
-            // 同一 original 对应多个 token 时任何字面出现都无法唯一归位：
-            // 无论对应 token 是缺失还是全部在场(多抄了一份原始片段)，都属于
-            // 无法无歧义恢复的混排，与单绑定分支的拒绝语义一致。
-            if lines.iter().any(|line| line.contains(original)) {
+        let occurrences = original_literal_occurrences(lines, scans, original);
+        if occurrences.is_empty() {
+            continue;
+        }
+        let all_tokens_present = bindings
+            .iter()
+            .all(|binding_index| token_counts[placeholders[*binding_index].token()] != 0);
+        if all_tokens_present {
+            if bindings.iter().any(|binding_index| {
+                placeholders[*binding_index].origin() == PlaceholderRuleOrigin::BuiltIn
+            }) {
+                // Builtin 原片段本身就是 RPG Maker 控制符；token 已在场时再出现
+                // 同一控制符不是自然文本，必须拒绝。Custom 只声明源跨度 opaque，
+                // 不拥有候选 grammar，因此其 token 之外的同字节内容仍是自然文本。
                 return Err(
                     TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
                         original: original.to_owned(),
@@ -2758,31 +2749,26 @@ fn normalize_original_controls_in_lines(
             }
             continue;
         }
+        if bindings.len() != 1 {
+            // 同一原片段对应多个缺失 token 时，字面回显无法确定要替代哪个槽。
+            return Err(
+                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
+                    original: original.to_owned(),
+                },
+            );
+        }
         let binding = &placeholders[bindings[0]];
         let token_count = token_counts[binding.token()];
-        let original_count = lines
-            .iter()
-            .map(|line| line.matches(original).count())
-            .sum::<usize>();
-        if token_count == 0 && original_count > 0 {
-            if original_count == 1 {
-                let line = lines
-                    .iter_mut()
-                    .find(|line| line.contains(original))
-                    .expect("已确认唯一原片段存在于某个译文行");
-                *line = line.replacen(original, binding.token(), 1);
-                *token_counts
-                    .get_mut(binding.token())
-                    .expect("binding token 已建立计数") += 1;
-                changed = true;
-            } else {
-                return Err(
-                    TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
-                        original: original.to_owned(),
-                    },
-                );
-            }
-        } else if original_count > 0 && token_count != 0 {
+        if token_count == 0 && occurrences.len() == 1 {
+            let (line_index, start, end) = occurrences[0];
+            replacements.push(OriginalPlaceholderLiteralReplacement {
+                line_index,
+                start,
+                end,
+                token: binding.token(),
+                original,
+            });
+        } else {
             return Err(
                 TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
                     original: original.to_owned(),
@@ -2790,7 +2776,58 @@ fn normalize_original_controls_in_lines(
             );
         }
     }
-    Ok(changed)
+
+    replacements.sort_unstable_by_key(|replacement| {
+        (replacement.line_index, replacement.start, replacement.end)
+    });
+    for pair in replacements.windows(2) {
+        let [previous, current] = pair else {
+            unreachable!("windows(2) 始终返回两个元素");
+        };
+        if previous.line_index == current.line_index && current.start < previous.end {
+            return Err(
+                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
+                    original: current.original.to_owned(),
+                },
+            );
+        }
+    }
+    for replacement in replacements.iter().rev() {
+        lines[replacement.line_index]
+            .replace_range(replacement.start..replacement.end, replacement.token);
+    }
+    Ok(!replacements.is_empty())
+}
+
+#[derive(Clone, Copy)]
+struct OriginalPlaceholderLiteralReplacement<'a> {
+    line_index: usize,
+    start: usize,
+    end: usize,
+    token: &'a str,
+    original: &'a str,
+}
+
+fn original_literal_occurrences(
+    lines: &[String],
+    scans: &[PlaceholderTextScan],
+    original: &str,
+) -> Vec<(usize, usize, usize)> {
+    let mut occurrences = Vec::new();
+    for (line_index, (line, scan)) in lines.iter().zip(scans).enumerate() {
+        for (start, matched) in line.match_indices(original) {
+            let end = start + matched.len();
+            if scan
+                .token_ranges()
+                .iter()
+                .any(|&(token_start, token_end)| start < token_end && token_start < end)
+            {
+                continue;
+            }
+            occurrences.push((line_index, start, end));
+        }
+    }
+    occurrences
 }
 
 fn multiset_rejection(error: PlaceholderMultisetError) -> TranslationUnitRejectionReason {
@@ -4091,12 +4128,10 @@ mod tests {
             TextUnitContent::Value("炎の剣".to_owned()),
             "{}",
         );
-        let constraints = TranslationTargetConstraints::from_identities([&identity]);
         let module = japanese_module();
 
         let error = accept_translation_content_candidate(
             &identity,
-            constraints,
             "炎の剣",
             ExpectedLineShape::Aligned(NonZeroUsize::MIN),
             &[],
@@ -4119,58 +4154,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_processor_rejects_closing_delimiter_in_tag_value_translations() {
+    async fn response_processor_preserves_plain_angle_brackets() {
         let processor =
             TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
 
-        let rejected = processor
-            .process(
-                &line_task(
-                    tag_value_identity(),
-                    ExpectedLineShape::Aligned(NonZeroUsize::MIN),
-                    line_content_analysis(&["炎の剣の説明"]),
-                ),
-                LlmResponse::new(
-                    r#"{"1":["炎之剑<强化>说明"]}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-tag-value".to_owned()),
-                    None,
-                ),
-                1,
-            )
-            .await
-            .expect("标签值译文含 '>' 属于当前 ID 的正常拒绝");
-        assert!(matches!(
-            rejected.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index: 0 }
-        ));
-
-        let propagated_tag = processor
-            .process(
-                &line_task_with_propagation(
-                    plain_tag_family_identity(),
-                    vec![tag_value_identity()],
-                    ExpectedLineShape::Aligned(NonZeroUsize::MIN),
-                    line_content_analysis(&["炎の剣の説明"]),
-                ),
-                LlmResponse::new(
-                    r#"{"1":["炎之剑>说明"]}"#,
-                    LlmFinishReason::Stop,
-                    None,
-                    Some("response-propagated-tag-value".to_owned()),
-                    None,
-                ),
-                1,
-            )
-            .await
-            .expect("传播族任一标签目标含 '>' 属于当前 ID 的正常拒绝");
-        assert!(matches!(
-            propagated_tag.unresolved()[0].reason(),
-            TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index: 0 }
-        ));
-
-        // 普通 Value 单元不受标签值约束：同样含 '>' 的译文照常进入语言验收流程。
         let accepted = processor
             .process(
                 &line_task(
@@ -4179,7 +4166,7 @@ mod tests {
                     line_content_analysis(&["炎の剣。", "装備すると攻撃力が上がる。"]),
                 ),
                 LlmResponse::new(
-                    r#"{"1":["炎之剑>装备后攻击力上升。"]}"#,
+                    r#"{"1":["<Help:炎之剑>装备后攻击力上升。"]}"#,
                     LlmFinishReason::Stop,
                     None,
                     Some("response-plain-value".to_owned()),
@@ -4188,42 +4175,11 @@ mod tests {
                 1,
             )
             .await
-            .expect("普通 Value 译文应正常处理");
-        assert!(!matches!(
-            &accepted,
-            TranslationTaskOutcome::Unavailable { .. }
-        ));
-    }
-
-    fn tag_value_identity() -> TranslationUnitIdentity {
-        let group = RpgMakerLocation::note_tag(
-            RpgMakerSource::data(StandardDataFile::Items),
-            vec![RpgMakerLocationStep::index(1)],
-            "Help",
-            0,
+            .expect("裸尖括号属于普通文本内容");
+        assert_eq!(
+            accepted.accepted()[0].translation(),
+            &TextUnitContent::Value("<Help:炎之剑>装备后攻击力上升。".to_owned())
         );
-        TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
-            TextGroupKind::DatabaseEntry,
-            group,
-            TextUnitRole::Scalar(ScalarFieldKey::new("note_tag").expect("字段键应合法")),
-            TextUnitContent::Value("炎の剣の説明".to_owned()),
-            "{}",
-        )
-    }
-
-    fn plain_tag_family_identity() -> TranslationUnitIdentity {
-        TranslationUnitIdentity::new(
-            RpgMakerStandardAssetOwner::Builtin,
-            TextGroupKind::DatabaseEntry,
-            RpgMakerLocation::value(
-                RpgMakerSource::data(StandardDataFile::Items),
-                vec![RpgMakerLocationStep::index(4)],
-            ),
-            TextUnitRole::Scalar(ScalarFieldKey::new("note_tag").expect("字段键应合法")),
-            TextUnitContent::Value("炎の剣の説明".to_owned()),
-            "{}",
-        )
     }
 
     #[test]

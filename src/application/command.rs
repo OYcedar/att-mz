@@ -4789,15 +4789,6 @@ fn project_lua_standard_rejection(
             TranslationUnitRejectionReason::SourceResidual { fragment } => {
                 ("source_residual", vec![string("fragment", fragment)])
             }
-            TranslationUnitRejectionReason::TagValueContainsClosingDelimiter { line_index } => {
-                let line = line_index
-                    .checked_add(1)
-                    .ok_or_else(|| project_lua_standard_projection_error("line", line_index))?;
-                (
-                    "tag_value_contains_closing_delimiter",
-                    vec![integer("line", line)?],
-                )
-            }
         },
     })
 }

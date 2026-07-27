@@ -571,15 +571,16 @@ mod tests {
 
     #[test]
     fn family_without_current_seed_uses_first_unit_and_propagates_in_natural_order() {
-        let first = scalar_identity(StandardDataFile::Items, 1, "name", "保存しますか？");
-        let second = scalar_identity(StandardDataFile::Items, 2, "name", "保存しますか？");
-        let third = scalar_identity(StandardDataFile::Items, 3, "name", "保存しますか？");
+        let original = "<Help:保存しますか？>";
+        let first = scalar_identity(StandardDataFile::Items, 1, "name", original);
+        let second = scalar_identity(StandardDataFile::Items, 2, "name", original);
+        let third = scalar_identity(StandardDataFile::Items, 3, "name", original);
         let second_context = state_context(2);
         let third_context = state_context(3);
         let result = deduplicate_translation_candidates(vec![
             candidate(
                 first.clone(),
-                "保存しますか？",
+                original,
                 Vec::new(),
                 None,
                 state_context(1),
@@ -587,7 +588,7 @@ mod tests {
             ),
             candidate(
                 second.clone(),
-                "保存しますか？",
+                original,
                 Vec::new(),
                 None,
                 second_context,
@@ -595,7 +596,7 @@ mod tests {
             ),
             candidate(
                 third.clone(),
-                "保存しますか？",
+                original,
                 Vec::new(),
                 None,
                 third_context,
@@ -635,10 +636,46 @@ mod tests {
     }
 
     #[test]
+    fn different_complete_angle_bracket_values_never_share_a_family() {
+        let first = scalar_identity(StandardDataFile::Items, 1, "note", "<Help:甲>");
+        let second = scalar_identity(StandardDataFile::Items, 2, "note", "<Help:乙>");
+
+        let result = deduplicate_translation_candidates(vec![
+            candidate(
+                first,
+                "<Help:甲>",
+                Vec::new(),
+                None,
+                state_context(1),
+                false,
+            ),
+            candidate(
+                second,
+                "<Help:乙>",
+                Vec::new(),
+                None,
+                state_context(2),
+                false,
+            ),
+        ])
+        .expect("不同完整原文应各自建立模型责任");
+        let (outcomes, invalidations, reuses) = result.into_parts();
+
+        assert!(invalidations.is_empty());
+        assert!(reuses.is_empty());
+        assert!(outcomes.iter().all(|outcome| matches!(
+            outcome,
+            TranslationDeduplicationOutcome::Active {
+                propagation_targets
+            } if propagation_targets.is_empty()
+        )));
+    }
+
+    #[test]
     fn current_state_translation_becomes_a_reuse_seed() {
         let seed_context = state_context(1);
         let target_context = state_context(2);
-        let translation = value("Save");
+        let translation = value("<Help:Save>");
         let seed_state = seed_context.finish(&translation);
         let seed = scalar_identity(StandardDataFile::Items, 1, "name", "保存");
         let target = scalar_identity(StandardDataFile::Items, 2, "name", "保存");

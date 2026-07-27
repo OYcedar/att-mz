@@ -114,7 +114,9 @@ recipe 重建完整逻辑 Claim、重算原 owner 指纹，并把重建出的摘
 摘要因此是受检验的持久状态，不是可省略的缓存或跳过 recipe 验证的捷径。
 
 位置、Mutation resource、unit role 和 recipe 的持久表示只接受当前 compact canonical
-JSON 字节。语义等价但含额外空白、替代转义或其他非规范表示的值按普通无效项目状态处理。
+JSON 字节。`group_location` 与 Mutation resource 的当前位置形态只表示完整 Value 地址；
+事件块 Claim 由多个这样的 Value 地址组成。语义等价但含额外空白、替代转义、未知位置
+标记或其他非规范表示的值统一按普通无效项目状态处理，不识别其历史来源。
 
 语义译文身份是 `owner + group_location + unit_role`，不等于物理 JSON 地址；顺序字段也
 不进入身份。删除 owner 状态会级联删除该 owner 的组、单元和 Claim 摘要。owner 状态同时

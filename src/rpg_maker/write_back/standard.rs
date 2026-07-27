@@ -21,7 +21,7 @@ use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueWriteRecipe, DirectTextPart, DirectTextRecipe, LogicalTextLocation,
-    MutationClaim, MutationClaimIndex, MutationClaimSet, MutationResource, MutationResourceLock,
+    MutationClaim, MutationClaimIndex, MutationClaimSet, MutationResourceLock,
     TextProjectionRecipe, TextUnitContent, TextUnitContentStructureError, TextUnitContentView,
     TextUnitRole, mutation_claims_for_group, validate_text_unit_content_structure,
 };
@@ -721,7 +721,7 @@ pub(crate) enum StandardWriteBackSnapshotError {
         target: Box<RpgMakerLocation>,
     },
     MutationClaimConflict {
-        resource: Box<MutationResource>,
+        resource: Box<RpgMakerLocation>,
     },
     MismatchedClaimSource {
         group_location: Box<RpgMakerLocation>,
@@ -729,7 +729,7 @@ pub(crate) enum StandardWriteBackSnapshotError {
     },
     MismatchedClaimResourceSource {
         group_location: Box<RpgMakerLocation>,
-        resource: Box<MutationResource>,
+        resource: Box<RpgMakerLocation>,
     },
     InvalidDialogueProjection {
         group_location: Box<RpgMakerLocation>,
@@ -1328,8 +1328,7 @@ impl SetTextMutation {
         expected_original: impl Into<String>,
         replacement: impl Into<String>,
     ) -> Self {
-        let mutation_claim = MutationClaim::for_location(exact_location.clone())
-            .expect("测试 SetText 的普通位置必须能建立 Claim");
+        let mutation_claim = MutationClaim::for_location(exact_location.clone());
         Self::for_test_with_claim(
             exact_location,
             mutation_claim,
@@ -1820,7 +1819,7 @@ pub(crate) enum StandardWriteBackMutationPlanError {
         exact_location: Box<RpgMakerLocation>,
     },
     MutationClaimConflict {
-        resource: Box<MutationResource>,
+        resource: Box<RpgMakerLocation>,
     },
 }
 
@@ -2670,10 +2669,7 @@ fn is_canonical_help_description(
     ) {
         return false;
     }
-    let RpgMakerLocation::Value { source, steps } = recipe.target() else {
-        return false;
-    };
-    let RpgMakerSource::Data(file) = source else {
+    let RpgMakerSource::Data(file) = recipe.target().source() else {
         return false;
     };
     if !matches!(
@@ -2686,7 +2682,7 @@ fn is_canonical_help_description(
         return false;
     }
     matches!(
-        steps.as_slice(),
+        recipe.target().steps(),
         [RpgMakerLocationStep::ArrayIndex(_), RpgMakerLocationStep::ObjectKey(field_name)]
             if field_name == "description"
     )
@@ -3702,12 +3698,11 @@ mod tests {
         )
         .expect("配方应合法");
         let projection = TextProjectionRecipe::Direct(recipe);
-        let wrong_locks = MutationClaimSet::new(vec![
-            MutationClaim::for_location(location(9, Some(0))).expect("测试 Value Claim 应合法"),
-        ])
-        .expect("测试 Claim 应无内部冲突")
-        .locks()
-        .to_vec();
+        let wrong_locks =
+            MutationClaimSet::new(vec![MutationClaim::for_location(location(9, Some(0)))])
+                .expect("测试 Claim 应无内部冲突")
+                .locks()
+                .to_vec();
         assert!(matches!(
             StandardWriteBackGroup::new(
                 TextGroupKind::EventCommand,

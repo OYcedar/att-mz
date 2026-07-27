@@ -619,13 +619,10 @@ fn snapshot_model_safe_diagnostic(source: &SnapshotModelError) -> SafeDiagnostic
                 builtin_group_kind_name(*second)
             ),
         ),
-        SnapshotModelError::MutationClaimConflict { resource } => (
+        SnapshotModelError::MutationClaimConflict { .. } => (
             DiagnosticSubject::operation("build_builtin_snapshot_claim_index"),
             DiagnosticFailureKind::ConflictingValues,
-            format!(
-                "structure=mutation_claim; resource_kind={}; access=conflicting",
-                mutation_resource_kind(resource)
-            ),
+            "structure=mutation_claim; resource_kind=value; access=conflicting".to_owned(),
         ),
         SnapshotModelError::RecipeRoleMismatch {
             group_location,
@@ -685,14 +682,6 @@ fn builtin_role_name(role: &TextUnitRole) -> &'static str {
 
 fn builtin_group_kind_name(kind: TextGroupKind) -> &'static str {
     kind.storage_name()
-}
-
-fn mutation_resource_kind(resource: &crate::rpg_maker::model::MutationResource) -> &'static str {
-    match resource {
-        crate::rpg_maker::model::MutationResource::Value { .. } => "value",
-        crate::rpg_maker::model::MutationResource::NoteTag { .. } => "note_tag",
-        crate::rpg_maker::model::MutationResource::CommentTag { .. } => "comment_tag",
-    }
 }
 
 fn optional_usize(value: Option<usize>) -> String {

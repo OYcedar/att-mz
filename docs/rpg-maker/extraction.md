@@ -81,7 +81,8 @@ DialogueSpeaker/DialogueBody，`event_choices` 只接受 Choices，
 - `extract_rules_definition`：可自动复用的非空 Rules canonical 语义；
 - `lua_program` 中的 `extract` 行：可自动复用的非空 Lua 主程序快照。
 
-其中位置、Mutation resource、unit role 和 recipe 只使用当前 compact canonical JSON
+其中 group location 与 Mutation resource 只使用当前完整 Value 地址的 compact canonical
+JSON；事件块 Claim 由多个 Value 地址组成。unit role 和 recipe 也只使用当前 canonical
 字节；含额外空白、替代转义或其他语义等价但非规范的表示时，按普通无效项目状态处理。
 
 数据库只按当前 schema、约束和领域不变量读取；不符合时按具体 schema、状态或完整性
@@ -159,6 +160,11 @@ Builtin 数据库对象以对象条目为组，System 各逻辑数组/对象、�
 `group.location` 本身必须唯一，同位置同 kind 或不同 kind 都直接失败，不会交给共享归一化
 自动合并。
 
+Group 是保持上下文、自然顺序、投影 recipe 和共同修改范围的最小单元组；Unit 才是候选
+验收、Current 判断和全局去重的最小翻译单元。Placeholder 在 Unit 已经形成后运行，只把
+Unit 内部划分为 NaturalText 与 opaque 段；它不拆 Unit、不建立持久身份，也不改变
+Extract 物化的 recipe。
+
 自然顺序为：
 
 1. owner：Builtin、Rules、Lua；
@@ -177,9 +183,9 @@ Builtin 数据库对象以对象条目为组，System 各逻辑数组/对象、�
 
 ## 6. Mutation Claim 与冲突
 
-每个 recipe 派生 Value、NoteTag、CommentTag 或事件块的物理 Claim，并展开成 Intent 与
-Exclusive 资源锁。同一资源只允许 Intent+Intent；任一 Exclusive 即冲突。组内、同 owner、
-跨 owner Store 与 WriteBack 发布前共用这一验证。
+每个 recipe 派生完整 Value 或事件块的物理 Claim，并展开成 Intent 与 Exclusive 资源锁。
+同一资源只允许 Intent+Intent；任一 Exclusive 即冲突。组内、同 owner、跨 owner Store
+与 WriteBack 发布前共用这一验证。
 
 这里的 Claim 是完整逻辑集合，由 group kind、location 和 recipe 唯一确定，并全部进入
 owner 资产指纹。SQLite 不逐条复制这个集合：`standard_mutation_claim` 对每个
@@ -188,9 +194,9 @@ owner 资产指纹。SQLite 不逐条复制这个集合：`standard_mutation_cla
 作为代表。摘要不减少组内或 owner 内验证，也不改变完整逻辑 Claim 的指纹顺序。
 
 完整冲突矩阵见[规则文件第 5 节](rules.md#5-自然顺序与-mutation-claim)。关键结果是：
-raw JSON string 与 decoded descendant 冲突，不同 decoded sibling 允许；raw note 与
-NoteTag 冲突而不同 occurrence 允许；raw 108/408 与 CommentTag 冲突；Dialogue、Choices、
-ScrollingText 与其覆盖字段或 descendant 冲突。
+raw JSON string 与 decoded descendant 冲突，不同 decoded sibling 允许；Dialogue、
+Choices、ScrollingText 与其覆盖字段或 descendant 冲突。Value 中出现 `<`、`>` 或任何
+插件私有语法都不改变 Claim 身份和冲突关系。
 
 ## 7. Lua 与三阶段停止线
 
