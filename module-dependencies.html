@@ -242,7 +242,7 @@
       <div class="arrow" aria-hidden="true">→</div>
       <div class="box shared">
         <strong>ProductionRpgMakerCommandRunner</strong>
-        <span>持有项目租约，解析并最终保存运行方案，把 Init / Extract / Translate / WriteBack 路由到唯一共享能力网络</span>
+        <span>持有项目租约，以 CommandRootGuard 管理必要运行根，解析并最终保存运行方案，把 Init / Extract / Translate / WriteBack 路由到唯一共享能力网络</span>
       </div>
     </div>
     <div class="layout-grid">
@@ -305,7 +305,7 @@
         <ol>
           <li><strong>共享 Profile 与 Prompt</strong><p>[prompts] 显式提供 root、locale 与 thinking_output；Prompt 从 prompts.root/rpg_maker/locale/system.md 渲染，开启时再追加同目录 thinking.md。Planner 与 Executor 共享响应信封模式。</p><span class="path">src/application/config.rs · src/rpg_maker/translate/profile.rs</span></li>
           <li><strong>TOML 资源边界</strong><p>Terminology 与 Placeholder 从严格 TOML 建立受信类型，再以 canonical JSON 持久化。</p><span class="path">src/rpg_maker/translate/planning_resource.rs · src/rpg_maker/translate/placeholder.rs</span></li>
-          <li><strong>语义资产读取与 Planner</strong><p>Speaker、完整 Body、Choices、ScrollingText 与 Scalar 可以进入同一任务；相关组不拆分。Body 按完整行序列和源 Speaker 去重，Choices 保持组内独立。</p><span class="path">src/rpg_maker/translate/asset_reader.rs · src/rpg_maker/translate/planner.rs</span></li>
+          <li><strong>共享存储 Codec 与 Planner</strong><p>Translate reader 复用标准资产共享列投影、原始行解码、owner 顺序与分区归并，再自行承担本阶段的查询条件、metadata 与失败语义。Speaker、完整 Body、Choices、ScrollingText 与 Scalar 可以进入同一任务；相关组不拆分。Body 按完整行序列和源 Speaker 去重，Choices 保持组内独立。</p><span class="path">src/rpg_maker/standard_asset_storage.rs · src/rpg_maker/translate/asset_reader.rs · src/rpg_maker/translate/planner.rs</span></li>
           <li><strong>最小模型协议</strong><p>user message 只用 Markdown 表达命中术语、无编号直接语境和活动 ID，例如 <code>Body [2] (free line breaking):<br>&gt; 第一行<br>&gt; 第二行</code>；JsonOnly 直接返回 ID 到字符串数组的 JSON 对象，ThinkingThenJson 先返回唯一非空 <code>&lt;why&gt;...&lt;/why&gt;</code> 再返回同一 JSON。Reflow 允许重断行，Aligned(N) 必须逐槽对应。</p><span class="path">src/rpg_maker/translate/planner.rs · src/rpg_maker/translate/executor.rs</span></li>
           <li><strong>按语义单元提交</strong><p>写入前再次核对 metadata、owner 双指纹、资源快照、unit role、完整源内容与上下文，随后原子更新 standard_text_unit 并传播完整译文。</p><span class="path">src/rpg_maker/translate/result_store.rs</span></li>
         </ol>
@@ -321,7 +321,7 @@
       </summary>
       <div class="tree">
         <ol>
-          <li><strong>读取完整物化快照</strong><p>重新计算 owner asset fingerprint，验证自然顺序、recipe、语义单元、Mutation Claim、来源块与资源锁冲突。</p><span class="path">src/rpg_maker/write_back/asset_reader.rs</span></li>
+          <li><strong>读取完整物化快照</strong><p>WriteBack reader 复用与 Translate 相同的标准资产存储投影、行解码、owner 顺序与分区归并，再自行承担本阶段的 SQL、recipe、快照与错误语义；读取后重新计算 owner asset fingerprint，验证自然顺序、语义单元、Mutation Claim、来源块与资源锁冲突。</p><span class="path">src/rpg_maker/standard_asset_storage.rs · src/rpg_maker/write_back/asset_reader.rs</span></li>
           <li><strong>统一对话修改</strong><p>一个 ReplaceDialogueMutation 同时处理 Speaker 与完整 Body；模型正文可以从三行变为一、二或四行，验证后一次替换完整 101+401*。</p><span class="path">src/rpg_maker/write_back/standard.rs · src/rpg_maker/write_back/rewriter.rs</span></li>
           <li><strong>语义断行与兜底布局</strong><p>模型行保持原样，只拆分过宽行；每条语义行使用对应源模板，新增语义行与自动续行沿用确定模板。Choices 同步更新 102/402，ScrollingText 原子更新完整 105+405*。</p><span class="path">src/rpg_maker/write_back/standard/layout.rs</span></li>
           <li><strong>Lua 编辑同一候选</strong><p>Lua 使用逻辑 data/js 路径；MV Host 映射到 www 内。脚本没有 publish 能力。</p><span class="path">src/rpg_maker/write_back/lua.rs · src/rpg_maker/lua</span></li>
@@ -333,18 +333,24 @@
   </section>
 
   <section class="roots" aria-labelledby="roots-title">
-    <p class="kicker">生产根与边界适配器</p>
-    <h2 id="roots-title">业务能力直接依赖所需机制</h2>
+    <p class="kicker">共享能力、生产根与边界适配器</p>
+    <h2 id="roots-title">业务能力直接依赖语义所有者与所需机制</h2>
     <div class="root-grid">
       <article class="root-card"><h3>文件、指纹与可恢复发布</h3><p>完整文件读取、有界并发执行、稳定对象身份、项目锁、候选编辑与 Windows 目录发布；不对项目规模设置人工上限。</p><span class="path">src/runtime/filesystem.rs</span></article>
       <article class="root-card"><h3>SQLite</h3><p>通用存储契约承载任意查询组的一致内存快照、短事务、交互会话与长寿命事务会话；rusqlite 根负责连接、线程、背压与 shutdown，不拥有 RPG Maker 语义。</p><span class="path">src/storage/sqlite.rs · src/storage/sqlite_session.rs · src/storage/sqlite_transaction_session.rs · src/runtime/sqlite.rs</span></article>
       <article class="root-card"><h3>CPU 与 Tokio</h3><p>PCRE2、JSON、规划与写回进入有界 CPU/文件资源；并发不改变自然顺序。</p><span class="path">src/runtime/cpu.rs · src/runtime/mod.rs</span></article>
       <article class="root-card"><h3>LLM 与 Delay</h3><p>公共非流式 Chat Completion 根负责连接池、限流与 shutdown；生产组合根直接提供 RPG Maker 重试等待。</p><span class="path">src/runtime/llm.rs · src/application/command.rs</span></article>
       <article class="root-card"><h3>RPG Maker Lua 5.4 适配器</h3><p>直接实现当前可信 Host 协议，负责每脚本专用线程、无深度上限的 Host 值转换、合作取消和唯一 finalizer。</p><span class="path">src/rpg_maker/lua/lua54.rs · src/rpg_maker/lua/json.rs · src/rpg_maker/json.rs</span></article>
-      <article class="root-card"><h3>运行方案与项目租约</h3><p>租约覆盖方案读取、业务执行和最终替换；只有业务成功且必要的非日志根完成收尾，才用最终短事务整体替换本命令方案。Lua 主程序以正文、SHA-256 和无损 Windows 路径分阶段保存。</p><span class="path">src/rpg_maker/project_lease.rs · src/rpg_maker/project_database/run_plan.rs · src/application/command.rs</span></article>
+      <article class="root-card"><h3>Lua 单次执行目录缓存</h3><p><code>SuccessfulDirectoryListCache</code> 由 Source Host 与 WriteBack Output Host 共同消费，只在一次 Lua 执行内保存成功目录列举，不缓存错误。Output write 尝试后失效父目录与目标，create 失效根至新目录的全部前缀，remove 失效父目录、目标及全部后代；操作失败也执行失效。</p><span class="path">src/rpg_maker/lua/directory_cache.rs · src/rpg_maker/lua/hosting.rs · src/rpg_maker/write_back/lua.rs</span></article>
+      <article class="root-card"><h3>标准资产存储 Codec</h3><p><code>standard_asset_storage</code> 唯一拥有共享列投影、原始 SQLite 行解码、owner 自然顺序与分区归并。Translate 与 WriteBack reader 共同消费它，但阶段特有 SQL、状态、校验和错误仍归各 reader；项目数据库只复用 owner 顺序。</p><span class="path">src/rpg_maker/standard_asset_storage.rs · src/rpg_maker/translate/asset_reader.rs · src/rpg_maker/write_back/asset_reader.rs · src/rpg_maker/project_database.rs</span></article>
+      <article class="root-card"><h3>Windows invariant 路径身份</h3><p>共享能力按 Win32 invariant UTF-16 uppercase 建立 ignore-case 身份，不做 Unicode case folding、规范化或兼容折叠。Scoped path、文件系统、Extract 文档解析、Lua Host 与 WriteBack 输出文档/重写器依赖同一规则识别大小写等价和重复路径。</p><span class="path">src/windows_path.rs · src/storage/scoped_path.rs · src/runtime/filesystem.rs · src/rpg_maker/extract/document.rs · src/rpg_maker/lua/hosting.rs · src/rpg_maker/write_back/lua.rs · src/rpg_maker/write_back/rewriter.rs</span></article>
+      <article class="root-card"><h3>命令根生命周期</h3><p><code>CommandRootGuard</code> 统一四条纵向切片与项目 Lua 命令的部分启动失败和正常收尾。主命令严格按 CPU → FileSystem → SQLite → 按需 Lua 启动，并按 Lua → SQLite → FileSystem → CPU 逆序关闭；Init 使用 FileSystem → SQLite 子集。</p><span class="path">src/application/command.rs</span></article>
+      <article class="root-card"><h3>运行方案与项目租约</h3><p>租约覆盖方案读取、业务执行和最终替换；<code>AlreadyHeldProjectCommandLeaseProvider</code> 必须借用仍存活的真实租约，类型上不能伪造无锁装配。只有业务成功且必要的非日志根完成收尾，才用最终短事务整体替换本命令方案。Lua 主程序以正文、SHA-256 和无损 Windows 路径分阶段保存。</p><span class="path">src/rpg_maker/project_lease.rs · src/rpg_maker/project_database/run_plan.rs · src/application/command.rs</span></article>
+      <article class="root-card"><h3>JSON 诊断分类</h3><p><code>JsonErrorCategory</code> 为 serde_json 错误提供唯一的 typed category；项目数据库、Extract/Rules、Translate、WriteBack 与 Lua/LLM 只建立稳定的 <code>json_category</code>，CLI 和项目日志消费形成后的安全诊断。各责任域仍拥有自己的错误码、阶段、路径和恢复语义。</p><span class="path">src/json_diagnostic.rs · src/rpg_maker/json.rs · src/rpg_maker/project_database.rs · src/runtime/llm.rs</span></article>
       <article class="root-card"><h3>安全诊断与终端 i18n</h3><p>具体错误在持有阶段、路径和底层代码时建立 SafeDiagnostic；CLI 与 JSONL 消费同一 FailureReport。类型化 UiMessage 和十个 Fluent catalog 负责最终呈现，用户文本在边界统一净化。</p><span class="path">src/diagnostic.rs · src/i18n.rs · src/i18n/*.ftl · src/user_text.rs · src/application/arguments.rs · src/application/process.rs</span></article>
       <article class="root-card"><h3>实时进度</h3><p>各纵向切片拥有自己的 phase enum，共享层只传递不可失败的绝对快照。生产观察器把同一快照分别交给终端和项目日志；终端按 auto/plain/off 独立渲染，翻译计数只在任务必要提交成功后推进。</p><span class="path">src/progress.rs · src/application/command.rs · src/rpg_maker/init.rs · src/rpg_maker/extract/service.rs · src/rpg_maker/write_back.rs</span></article>
-      <article class="root-card"><h3>普通项目日志</h3><p>每个 RunId 独占一个不轮转的 JSONL；闭集事件通过单 writer 的有界缓冲自然背压，最终失败与 run.finished 使用独立终态槽。启动、写入、flush、sync 和关闭故障明确降级，不改变业务结果、发布或退出码。</p><span class="path">src/runtime/project_log.rs · src/diagnostic.rs · src/user_text.rs · src/application/command.rs</span></article>
+      <article class="root-card"><h3>普通项目日志</h3><p>每个 RunId 独占一个不轮转的 JSONL；普通事件对单 writer 有界队列使用 <code>try_send</code>，队列已满或断开时只累计丢弃数。<code>performance.counters</code>、<code>failure.reported</code> 与 <code>run.finished</code>（含清理诊断）使用可靠终态槽；RunId、启动、写入、flush、sync 和关闭故障明确降级，不改变业务结果、发布或退出码。</p><span class="path">src/runtime/project_log.rs · src/diagnostic.rs · src/user_text.rs · src/application/command.rs</span></article>
+      <article class="root-card"><h3>翻译任务记录旁路</h3><p><code>StandardTranslationService</code> 只依赖既有 <code>TranslationTaskRecordSink</code> 提交不可变终态文档；组合根直接用独立 <code>SystemFileSystem</code> 与同一个 <code>ProjectLogger</code> 构造具体 <code>MarkdownTranslationTaskRecordSink</code>。RunId 不可用时本轮记录禁用；任务记录与 JSONL 故障分别计数、分别呈现，均不改变业务结果。</p><span class="path">src/rpg_maker/translate/standard.rs · src/rpg_maker/translate/task_record.rs · src/application/command.rs · src/runtime/filesystem.rs · src/runtime/project_log.rs</span></article>
     </div>
     <div class="stopline">
       <strong>当前停止线：</strong>跨命令 Speaker 状态、ChoiceHelp 等块协议和 JS 字符串语义由 <code>ctx.rpg_maker</code> Lua 处理。共享层不包含 TOML 状态机、JSONPath、规则优先级、版本字段或面向其他引擎的框架。
