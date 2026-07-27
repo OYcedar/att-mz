@@ -120,6 +120,14 @@ segment      = one or more UTF-8 characters other than "/", "\\", ":" or control
 `data/items.json` 而实际为 `data/Items.json` 时抛出 `filesystem/case_mismatch`，不借助
 Windows 大小写别名。真实不存在仍按具体操作返回既有 `filesystem/not_found`。
 
+在来源已经冻结、候选只经本 Host 编辑的单次 Lua 执行边界内，Host 按受检目录路径缓存
+`ctx.source` 与 `ctx.output` 的成功列举；失败列举不缓存，下一次 Lua 执行也重新观测。
+`ctx.output.write` 每次真正尝试后使父目录与目标路径失效；`create_directory` 可能逐段
+建立缺失目录，因此使根与目标路径上的每一级前缀失效；`remove` 使父目录、目标及全部
+后代失效。即使候选编辑操作返回错误也执行相同失效；失效代还会阻止较早开始的列举在
+完成后把旧结果重新放回缓存。缓存只减少重复目录列举，不改变逐字大小写检查、越界检查
+或具体操作的错误文本。
+
 <!-- att-example: valid -->
 ```lua
 local actors = ctx.source.read_json("data/Actors.json")

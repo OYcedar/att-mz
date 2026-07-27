@@ -12,6 +12,7 @@ use crate::diagnostic::{
     SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::OperationCompletion;
+use crate::rpg_maker::lua::directory_cache::SuccessfulDirectoryListCache;
 use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingError;
 use crate::rpg_maker::lua::runtime::{
     OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaOutputEntry, TrustedLuaOutputEntryKind,
@@ -25,7 +26,8 @@ use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::project::RpgMakerWriteBackLayoutProfile;
 use crate::storage::file_system::{
     BoundScopedDirectory, ScopedDirectoryBindError, ScopedDirectoryEditError,
-    ScopedDirectoryEditor, ScopedDirectoryEntryKind, ScopedDirectoryPath, StagedDirectory,
+    ScopedDirectoryEditor, ScopedDirectoryEntry, ScopedDirectoryEntryKind, ScopedDirectoryPath,
+    StagedDirectory,
 };
 use crate::storage::scoped_path::{
     ExactDirectoryEntryResolutionError, resolve_exact_directory_entry,
@@ -133,6 +135,7 @@ where
                     scope: Arc::clone(&scope),
                     layout_profile,
                     rpg_maker_layout,
+                    output_directories: Arc::default(),
                 });
             let invocation = LuaInvocation::write_back(program, project, calls);
             match self.host.execute(invocation).await {
@@ -210,6 +213,7 @@ where
     scope: Arc<BoundScopedDirectory<E::ScopeState>>,
     layout_profile: RpgMakerWriteBackLayoutProfile,
     rpg_maker_layout: crate::rpg_maker::RpgMakerLayout,
+    output_directories: Arc<SuccessfulDirectoryListCache<ScopedDirectoryEntry>>,
 }
 
 /// 把候选中的每个现存路径段解析为目录实际列出的逐字身份。
@@ -220,6 +224,7 @@ where
 async fn resolve_exact_output_path<E>(
     editor: &E,
     scope: &BoundScopedDirectory<E::ScopeState>,
+    output_directories: &SuccessfulDirectoryListCache<ScopedDirectoryEntry>,
     path: ScopedDirectoryPath,
 ) -> Result<ScopedDirectoryPath, TrustedLuaHostCallError>
 where
@@ -233,16 +238,8 @@ where
         let expected_name = expected_name
             .to_str()
             .expect("ScopedDirectoryPath 已建立 UTF-8 路径段不变量");
-        let entries = match &exact_parent {
-            Some(parent) => editor
-                .list_scoped_directory(scope, parent.clone())
-                .await
-                .map_err(output_edit_error)?,
-            None => editor
-                .list_scoped_root(scope)
-                .await
-                .map_err(output_edit_error)?,
-        };
+        let entries =
+            list_output_directory(editor, scope, output_directories, exact_parent.as_ref()).await?;
         let parent = exact_parent
             .as_ref()
             .map_or_else(|| Path::new(""), ScopedDirectoryPath::as_path);
@@ -263,6 +260,68 @@ where
     Ok(path)
 }
 
+async fn list_output_directory<E>(
+    editor: &E,
+    scope: &BoundScopedDirectory<E::ScopeState>,
+    output_directories: &SuccessfulDirectoryListCache<ScopedDirectoryEntry>,
+    path: Option<&ScopedDirectoryPath>,
+) -> Result<Arc<[ScopedDirectoryEntry]>, TrustedLuaHostCallError>
+where
+    E: ScopedDirectoryEditor,
+{
+    let cache_key = path.map_or_else(PathBuf::new, |path| path.as_path().to_path_buf());
+    let (cached, observed_epoch) = output_directories.lookup(&cache_key);
+    if let Some(entries) = cached {
+        return Ok(entries);
+    }
+    let entries = match path {
+        Some(path) => editor
+            .list_scoped_directory(scope, path.clone())
+            .await
+            .map_err(output_edit_error)?,
+        None => editor
+            .list_scoped_root(scope)
+            .await
+            .map_err(output_edit_error)?,
+    };
+    Ok(output_directories.insert_if_unchanged(cache_key, observed_epoch, entries))
+}
+
+fn invalidate_output_parent_and_target(
+    output_directories: &SuccessfulDirectoryListCache<ScopedDirectoryEntry>,
+    path: &ScopedDirectoryPath,
+) {
+    if let Some(parent) = path.as_path().parent() {
+        output_directories.invalidate(parent);
+    }
+    output_directories.invalidate(path.as_path());
+}
+
+fn invalidate_created_output_path(
+    output_directories: &SuccessfulDirectoryListCache<ScopedDirectoryEntry>,
+    path: &ScopedDirectoryPath,
+) {
+    output_directories.invalidate(Path::new(""));
+    let mut prefix = PathBuf::new();
+    for component in path.as_path().components() {
+        let Component::Normal(name) = component else {
+            unreachable!("ScopedDirectoryPath 已建立普通相对路径段不变量")
+        };
+        prefix.push(name);
+        output_directories.invalidate(&prefix);
+    }
+}
+
+fn invalidate_removed_output_subtree(
+    output_directories: &SuccessfulDirectoryListCache<ScopedDirectoryEntry>,
+    path: &ScopedDirectoryPath,
+) {
+    if let Some(parent) = path.as_path().parent() {
+        output_directories.invalidate(parent);
+    }
+    output_directories.invalidate_subtree(path.as_path());
+}
+
 impl<E> TrustedLuaWriteBackHostCalls for ScopedLuaWriteBackHostCalls<E>
 where
     E: ScopedDirectoryEditor + 'static,
@@ -280,9 +339,16 @@ where
         let path = map_output_path(self.rpg_maker_layout, path);
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
+        let output_directories = Arc::clone(&self.output_directories);
         Box::pin(async move {
             let path = path?;
-            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
+            let path = resolve_exact_output_path(
+                editor.as_ref(),
+                scope.as_ref(),
+                output_directories.as_ref(),
+                path,
+            )
+            .await?;
             editor
                 .read_scoped_file(&scope, path)
                 .await
@@ -304,31 +370,41 @@ where
         let path = map_output_path(self.rpg_maker_layout, path);
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
+        let output_directories = Arc::clone(&self.output_directories);
         Box::pin(async move {
             let path = path?;
-            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
-            editor
-                .list_scoped_directory(&scope, path)
-                .await
-                .map_err(output_edit_error)?
-                .into_iter()
-                .map(|entry| {
-                    let name = entry.name().to_str().ok_or_else(|| {
-                        TrustedLuaHostCallError::new(
-                            "output",
-                            "invalid_utf8_name",
-                            "候选目录项名称无法无损转换为 UTF-8",
-                            None,
-                            None,
-                        )
-                    })?;
-                    let kind = match entry.kind() {
-                        ScopedDirectoryEntryKind::File => TrustedLuaOutputEntryKind::File,
-                        ScopedDirectoryEntryKind::Directory => TrustedLuaOutputEntryKind::Directory,
-                    };
-                    Ok(TrustedLuaOutputEntry::new(name.to_owned(), kind))
-                })
-                .collect()
+            let path = resolve_exact_output_path(
+                editor.as_ref(),
+                scope.as_ref(),
+                output_directories.as_ref(),
+                path,
+            )
+            .await?;
+            list_output_directory(
+                editor.as_ref(),
+                scope.as_ref(),
+                output_directories.as_ref(),
+                Some(&path),
+            )
+            .await?
+            .iter()
+            .map(|entry| {
+                let name = entry.name().to_str().ok_or_else(|| {
+                    TrustedLuaHostCallError::new(
+                        "output",
+                        "invalid_utf8_name",
+                        "候选目录项名称无法无损转换为 UTF-8",
+                        None,
+                        None,
+                    )
+                })?;
+                let kind = match entry.kind() {
+                    ScopedDirectoryEntryKind::File => TrustedLuaOutputEntryKind::File,
+                    ScopedDirectoryEntryKind::Directory => TrustedLuaOutputEntryKind::Directory,
+                };
+                Ok(TrustedLuaOutputEntry::new(name.to_owned(), kind))
+            })
+            .collect()
         })
     }
 
@@ -341,13 +417,20 @@ where
         let path = map_output_mutation_path(self.rpg_maker_layout, path);
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
+        let output_directories = Arc::clone(&self.output_directories);
         Box::pin(async move {
             let path = path?;
-            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
-            editor
-                .create_scoped_directory(&scope, path)
-                .await
-                .map_err(output_edit_error)
+            let path = resolve_exact_output_path(
+                editor.as_ref(),
+                scope.as_ref(),
+                output_directories.as_ref(),
+                path,
+            )
+            .await?;
+            let invalidation_path = path.clone();
+            let result = editor.create_scoped_directory(&scope, path).await;
+            invalidate_created_output_path(output_directories.as_ref(), &invalidation_path);
+            result.map_err(output_edit_error)
         })
     }
 
@@ -361,13 +444,20 @@ where
         let path = map_output_mutation_path(self.rpg_maker_layout, path);
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
+        let output_directories = Arc::clone(&self.output_directories);
         Box::pin(async move {
             let path = path?;
-            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
-            editor
-                .write_scoped_file(&scope, path, bytes)
-                .await
-                .map_err(output_edit_error)
+            let path = resolve_exact_output_path(
+                editor.as_ref(),
+                scope.as_ref(),
+                output_directories.as_ref(),
+                path,
+            )
+            .await?;
+            let invalidation_path = path.clone();
+            let result = editor.write_scoped_file(&scope, path, bytes).await;
+            invalidate_output_parent_and_target(output_directories.as_ref(), &invalidation_path);
+            result.map_err(output_edit_error)
         })
     }
 
@@ -380,13 +470,20 @@ where
         let path = map_output_mutation_path(self.rpg_maker_layout, path);
         let editor = Arc::clone(&self.editor);
         let scope = Arc::clone(&self.scope);
+        let output_directories = Arc::clone(&self.output_directories);
         Box::pin(async move {
             let path = path?;
-            let path = resolve_exact_output_path(editor.as_ref(), scope.as_ref(), path).await?;
-            editor
-                .remove_scoped_path(&scope, path)
-                .await
-                .map_err(output_edit_error)
+            let path = resolve_exact_output_path(
+                editor.as_ref(),
+                scope.as_ref(),
+                output_directories.as_ref(),
+                path,
+            )
+            .await?;
+            let invalidation_path = path.clone();
+            let result = editor.remove_scoped_path(&scope, path).await;
+            invalidate_removed_output_subtree(output_directories.as_ref(), &invalidation_path);
+            result.map_err(output_edit_error)
         })
     }
 
@@ -911,6 +1008,268 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn output_directory_cache_is_limited_to_one_lua_execution() {
+        let editor = Arc::new(FakeEditor::with_entries([
+            (
+                PathBuf::new(),
+                vec![entry("data", ScopedDirectoryEntryKind::Directory)],
+            ),
+            (
+                PathBuf::from("data"),
+                vec![entry("Generated", ScopedDirectoryEntryKind::Directory)],
+            ),
+            (
+                PathBuf::from("data/Generated"),
+                vec![entry("Item.json", ScopedDirectoryEntryKind::File)],
+            ),
+        ]));
+        let path = scoped_path("data/Generated/Item.json");
+        let first_execution =
+            output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+
+        for _ in 0..8 {
+            first_execution
+                .read_output(path.clone())
+                .await
+                .expect("同一次执行应能重复读取候选");
+        }
+        first_execution
+            .list_output(scoped_path("data/Generated"))
+            .await
+            .expect("已经观测的候选目录应能列举");
+        assert_eq!(
+            *editor
+                .directory_lists
+                .lock()
+                .expect("候选目录列举记录锁不应中毒"),
+            [
+                PathBuf::new(),
+                PathBuf::from("data"),
+                PathBuf::from("data/Generated"),
+            ],
+            "重复文件数不应再乘以每个父目录的列举次数"
+        );
+
+        let next_execution =
+            output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+        next_execution
+            .read_output(path)
+            .await
+            .expect("下一次执行仍应重新观测候选");
+        assert_eq!(
+            editor
+                .directory_lists
+                .lock()
+                .expect("候选目录列举记录锁不应中毒")
+                .len(),
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_output_directory_lists_are_not_cached() {
+        let editor = Arc::new(FakeEditor::with_entries([
+            (
+                PathBuf::new(),
+                vec![entry("data", ScopedDirectoryEntryKind::Directory)],
+            ),
+            (PathBuf::from("data"), Vec::new()),
+        ]));
+        let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+
+        for _ in 0..2 {
+            let error = calls
+                .list_output(scoped_path("data/Missing"))
+                .await
+                .expect_err("失败的候选目录列举不得进入缓存");
+            assert_eq!(error.domain(), "output");
+            assert_eq!(error.kind(), "not_found");
+        }
+        assert_eq!(
+            *editor
+                .directory_lists
+                .lock()
+                .expect("候选目录列举记录锁不应中毒"),
+            [
+                PathBuf::new(),
+                PathBuf::from("data"),
+                PathBuf::from("data/Missing"),
+                PathBuf::from("data/Missing"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_directory_creation_invalidates_all_cached_ancestors() {
+        for fail_mutations in [false, true] {
+            let editor = Arc::new(FakeEditor {
+                fail_mutations,
+                ..FakeEditor::with_entries([
+                    (
+                        PathBuf::new(),
+                        vec![entry("data", ScopedDirectoryEntryKind::Directory)],
+                    ),
+                    (PathBuf::from("data"), Vec::new()),
+                ])
+            });
+            let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+
+            calls
+                .list_output(scoped_path("data"))
+                .await
+                .expect("应先缓存候选根和现存 data 目录");
+            let create = calls
+                .create_output_directory(scoped_path("data/New/Nested"))
+                .await;
+            if fail_mutations {
+                let error = create.expect_err("逐段建目录失败仍可能留下已经创建的前缀");
+                assert_eq!(error.domain(), "output");
+                assert_eq!(error.kind(), "io");
+            } else {
+                create.expect("应允许具体编辑器逐段建立缺失目录");
+            }
+            let data_entries = calls
+                .list_output(scoped_path("data"))
+                .await
+                .expect("建目录尝试后必须重新观测所有祖先目录");
+            assert_eq!(
+                data_entries
+                    .iter()
+                    .map(TrustedLuaOutputEntry::name)
+                    .collect::<Vec<_>>(),
+                ["New"]
+            );
+            let new_entries = calls
+                .list_output(scoped_path("data/New"))
+                .await
+                .expect("已经创建的前缀必须能够按逐字身份重新列举");
+            let expected_new_entries: &[&str] = if fail_mutations { &[] } else { &["Nested"] };
+            assert_eq!(
+                new_entries
+                    .iter()
+                    .map(TrustedLuaOutputEntry::name)
+                    .collect::<Vec<_>>(),
+                expected_new_entries
+            );
+
+            let terminal_count = editor
+                .terminal_operations
+                .lock()
+                .expect("候选操作记录锁不应中毒")
+                .len();
+            let alias_error = calls
+                .create_output_directory(scoped_path("data/new/Other"))
+                .await
+                .expect_err("创建后的大小写别名必须由最新祖先列举拒绝");
+            assert_eq!(alias_error.domain(), "filesystem");
+            assert_eq!(alias_error.kind(), "case_mismatch");
+            assert_eq!(
+                editor
+                    .terminal_operations
+                    .lock()
+                    .expect("候选操作记录锁不应中毒")
+                    .len(),
+                terminal_count,
+                "大小写别名不得到达具体编辑操作"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn output_mutations_invalidate_affected_lists_after_success_or_failure() {
+        for fail_mutations in [false, true] {
+            let editor = Arc::new(FakeEditor {
+                fail_mutations,
+                ..FakeEditor::with_entries([
+                    (
+                        PathBuf::new(),
+                        vec![entry("data", ScopedDirectoryEntryKind::Directory)],
+                    ),
+                    (
+                        PathBuf::from("data"),
+                        vec![
+                            entry("Generated", ScopedDirectoryEntryKind::Directory),
+                            entry("Items.json", ScopedDirectoryEntryKind::File),
+                        ],
+                    ),
+                    (
+                        PathBuf::from("data/Generated"),
+                        vec![entry("Nested", ScopedDirectoryEntryKind::Directory)],
+                    ),
+                    (
+                        PathBuf::from("data/Generated/Nested"),
+                        vec![entry("Leaf.json", ScopedDirectoryEntryKind::File)],
+                    ),
+                ])
+            });
+            let calls = output_calls(crate::rpg_maker::RpgMakerLayout::MZ, Arc::clone(&editor));
+            let leaf = scoped_path("data/Generated/Nested/Leaf.json");
+
+            calls
+                .read_output(leaf.clone())
+                .await
+                .expect("应先缓存完整祖先链");
+
+            let create = calls
+                .create_output_directory(scoped_path("data/Generated/New"))
+                .await;
+            if fail_mutations {
+                create.expect_err("建目录失败仍须使相关缓存失效");
+            } else {
+                create.expect("建目录成功应使相关缓存失效");
+            }
+            calls
+                .list_output(scoped_path("data/Generated"))
+                .await
+                .expect("建目录尝试后应重新列举父目录");
+
+            let write = calls
+                .write_output(scoped_path("data/Items.json"), b"changed".to_vec())
+                .await;
+            if fail_mutations {
+                write.expect_err("写文件失败仍须使相关缓存失效");
+            } else {
+                write.expect("写文件成功应使相关缓存失效");
+            }
+            calls
+                .read_output(leaf.clone())
+                .await
+                .expect("写文件尝试后应重新列举父目录");
+
+            let remove = calls.remove_output(scoped_path("data/Generated")).await;
+            if fail_mutations {
+                remove.expect_err("删除失败仍须使相关缓存失效");
+            } else {
+                remove.expect("删除成功应使相关缓存失效");
+            }
+            calls
+                .read_output(leaf.clone())
+                .await
+                .expect("删除尝试后应重新列举目标及全部后代");
+
+            assert_eq!(
+                *editor
+                    .directory_lists
+                    .lock()
+                    .expect("候选目录列举记录锁不应中毒"),
+                [
+                    PathBuf::new(),
+                    PathBuf::from("data"),
+                    PathBuf::from("data/Generated"),
+                    PathBuf::from("data/Generated/Nested"),
+                    PathBuf::new(),
+                    PathBuf::from("data"),
+                    PathBuf::from("data/Generated"),
+                    PathBuf::from("data"),
+                    PathBuf::from("data"),
+                    PathBuf::from("data/Generated"),
+                    PathBuf::from("data/Generated/Nested"),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn mv_output_case_resolution_keeps_www_internal() {
         let editor = Arc::new(FakeEditor::with_entries([
             (
@@ -997,6 +1356,7 @@ mod tests {
             scope: Arc::clone(&scope),
             layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
             rpg_maker_layout: crate::rpg_maker::RpgMakerLayout::MZ,
+            output_directories: Arc::default(),
         };
 
         let error = calls
@@ -1080,6 +1440,7 @@ mod tests {
             scope: Arc::clone(&scope),
             layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
             rpg_maker_layout: layout,
+            output_directories: Arc::default(),
         };
 
         for root in ["data", "js"] {
@@ -1239,7 +1600,10 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeEditor {
         bind_fail: bool,
-        entries: Arc<BTreeMap<PathBuf, Vec<crate::storage::file_system::ScopedDirectoryEntry>>>,
+        fail_mutations: bool,
+        entries:
+            Arc<Mutex<BTreeMap<PathBuf, Vec<crate::storage::file_system::ScopedDirectoryEntry>>>>,
+        directory_lists: Arc<Mutex<Vec<PathBuf>>>,
         terminal_operations: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1253,7 +1617,7 @@ mod tests {
             >,
         ) -> Self {
             Self {
-                entries: Arc::new(entries.into_iter().collect()),
+                entries: Arc::new(Mutex::new(entries.into_iter().collect())),
                 ..Self::default()
             }
         }
@@ -1266,6 +1630,8 @@ mod tests {
             ScopedDirectoryEditError<FakeEditorError>,
         > {
             self.entries
+                .lock()
+                .expect("候选目录项测试状态锁不应中毒")
                 .get(path)
                 .cloned()
                 .ok_or_else(|| ScopedDirectoryEditError::NotFound {
@@ -1273,11 +1639,73 @@ mod tests {
                 })
         }
 
+        fn entries_are_empty(&self) -> bool {
+            self.entries
+                .lock()
+                .expect("候选目录项测试状态锁不应中毒")
+                .is_empty()
+        }
+
         fn record(&self, operation: &str, path: &ScopedDirectoryPath) {
             self.terminal_operations
                 .lock()
                 .expect("候选操作记录锁不应中毒")
                 .push(format!("{operation}:{}", path.as_path().display()));
+        }
+
+        fn record_list(&self, path: &Path) {
+            self.directory_lists
+                .lock()
+                .expect("候选目录列举记录锁不应中毒")
+                .push(path.to_path_buf());
+        }
+
+        fn mutation_result(
+            &self,
+            path: &ScopedDirectoryPath,
+        ) -> Result<(), ScopedDirectoryEditError<FakeEditorError>> {
+            if self.fail_mutations {
+                Err(ScopedDirectoryEditError::Failed {
+                    path: path.as_path().to_path_buf(),
+                    source: FakeEditorError,
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        fn create_directory_result(
+            &self,
+            path: &ScopedDirectoryPath,
+        ) -> Result<(), ScopedDirectoryEditError<FakeEditorError>> {
+            let mut entries = self.entries.lock().expect("候选目录项测试状态锁不应中毒");
+            let mut current = PathBuf::new();
+            for component in path.as_path().components() {
+                let Component::Normal(name) = component else {
+                    unreachable!("ScopedDirectoryPath 已建立普通相对路径段不变量")
+                };
+                let parent_entries = entries.entry(current.clone()).or_default();
+                let created = if parent_entries.iter().any(|entry| entry.name() == name) {
+                    false
+                } else {
+                    parent_entries.push(crate::storage::file_system::ScopedDirectoryEntry::new(
+                        name.to_os_string(),
+                        ScopedDirectoryEntryKind::Directory,
+                    ));
+                    parent_entries.sort_by(|left, right| left.name().cmp(right.name()));
+                    true
+                };
+                current.push(name);
+                entries.entry(current.clone()).or_default();
+                if self.fail_mutations && created {
+                    return Err(ScopedDirectoryEditError::Failed {
+                        path: path.as_path().to_path_buf(),
+                        source: FakeEditorError,
+                    });
+                }
+            }
+            drop(entries);
+            self.mutation_result(path)
         }
     }
 
@@ -1326,7 +1754,8 @@ mod tests {
                 ScopedDirectoryEditError<Self::Error>,
             >,
         > + Send {
-            std::future::ready(if self.entries.is_empty() {
+            self.record_list(path.as_path());
+            std::future::ready(if self.entries_are_empty() {
                 Ok(Vec::new())
             } else {
                 self.entries_at(path.as_path())
@@ -1342,7 +1771,8 @@ mod tests {
                 ScopedDirectoryEditError<Self::Error>,
             >,
         > + Send {
-            std::future::ready(if self.entries.is_empty() {
+            self.record_list(Path::new(""));
+            std::future::ready(if self.entries_are_empty() {
                 Ok(Vec::new())
             } else {
                 self.entries_at(Path::new(""))
@@ -1356,7 +1786,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
         {
             self.record("create", &path);
-            std::future::ready(Ok(()))
+            std::future::ready(self.create_directory_result(&path))
         }
 
         fn write_scoped_file(
@@ -1367,7 +1797,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
         {
             self.record("write", &path);
-            std::future::ready(Ok(()))
+            std::future::ready(self.mutation_result(&path))
         }
 
         fn remove_scoped_path(
@@ -1377,7 +1807,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<(), ScopedDirectoryEditError<Self::Error>>> + Send
         {
             self.record("remove", &path);
-            std::future::ready(Ok(()))
+            std::future::ready(self.mutation_result(&path))
         }
     }
 
@@ -1405,6 +1835,7 @@ mod tests {
             )),
             layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
             rpg_maker_layout: layout,
+            output_directories: Arc::default(),
         }
     }
 
@@ -1665,6 +2096,7 @@ mod tests {
             )),
             layout_profile: RpgMakerWriteBackLayoutProfile::new(width(3), width(2), width(2)),
             rpg_maker_layout: crate::rpg_maker::RpgMakerLayout::MZ,
+            output_directories: Arc::default(),
         };
         let pairs = vec![
             TrustedLuaWriteBackLayoutPair::new("原文".to_owned(), Some("甲乙丙".to_owned())),
