@@ -278,6 +278,12 @@ shutdown 停止新准入并排空已接管作业。
 实时状态、进度和非阻断提示写 stderr；错误也写 stderr。最终摘要包含关键方案来源、实际
 结果和必要的下一步建议。日志只写日志文件，不混入 stdout。
 
+业务已经成功时，最终摘要只尝试呈现一次。stdout 写入失败后不重试，也不回滚已经生效的
+数据库、候选发布或其他业务副作用；调用方必须假定 stdout 可能已经写出一部分。若此时
+还存在非日志 shutdown 失败，stdout 写入错误是 stderr 与项目日志中的 primary，
+shutdown 诊断按原顺序作为 related failure 保留，进程退出 `1`。stdout 完整写出而
+shutdown 失败时，成功摘要保持有效，随后在 stderr 报告收尾失败并退出 `1`。
+
 ## 6. 项目布局、租约与取消
 
 MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏根；MV 只接受包含

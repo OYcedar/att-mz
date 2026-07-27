@@ -3295,11 +3295,12 @@ impl PendingProjectLog {
         self,
         error: &ProductionCommandError,
     ) -> Option<ProjectLogWarning> {
-        let failures = error
+        let mut failures = error
             .failure_report()
             .public_diagnostics()
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
+        failures.extend(self.failures);
         finish_project_log(self.active, ProjectLogRunOutcome::Failed, failures)
     }
 
@@ -9900,6 +9901,89 @@ mod command_error_rendering_tests {
         );
         assert_eq!(snapshot["candidate_validations"]["started"], 1);
         assert_eq!(snapshot["candidate_validations"]["completed"], 1);
+    }
+
+    #[test]
+    fn presentation_failure_precedes_preserved_shutdown_failures_in_project_log() {
+        let directory = tempfile::tempdir().expect("临时日志目录应可建立");
+        let run_id = "550e8400-e29b-41d4-a716-446655440022";
+        let runtime = start_project_log(directory.path().to_path_buf(), run_id.to_owned());
+        let logger = runtime.logger();
+        let active = ActiveProjectLog {
+            run_id: Some(run_id.to_owned()),
+            runtime,
+            logger,
+            context: ProjectLogContext::new("zh-Hans").with_command("write-back"),
+            performance: Arc::new(RunPerformanceCounters::default()),
+        };
+        let shutdown_failures = ["first shutdown root", "second shutdown root"]
+            .map(|component| {
+                SafeDiagnostic::new(
+                    DiagnosticCode::ShutdownComponent,
+                    DiagnosticStage::Shutdown,
+                    DiagnosticSubject::component(component),
+                    DiagnosticReason::failure(DiagnosticFailureKind::FinalizationFailed),
+                    DiagnosticImpact::StateAppliedFinalizationFailed,
+                    DiagnosticAction::Retry,
+                )
+            })
+            .to_vec();
+        let pending = PendingProjectLog::new(
+            active,
+            ProjectLogRunOutcome::Failed,
+            shutdown_failures.clone(),
+        );
+        let stdout_error = ProductionCommandError::stdout_write(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "测试 stdout 已关闭",
+        ));
+        let stdout_diagnostic = stdout_error.failure_report().primary.public().clone();
+
+        assert!(pending.finish_with_failure(&stdout_error).is_none());
+
+        let records = std::fs::read_to_string(directory.path().join(format!("{run_id}.jsonl")))
+            .expect("项目日志应可读取")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("日志行应为 JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["code"].as_str().expect("日志 code 应为文本"))
+                .collect::<Vec<_>>(),
+            [
+                "performance.counters",
+                "failure.reported",
+                "failure.reported",
+                "failure.reported",
+                "run.finished",
+            ]
+        );
+        let failures = records
+            .iter()
+            .filter(|record| record["code"] == "failure.reported")
+            .collect::<Vec<_>>();
+        assert_eq!(failures[0]["payload"]["relation"], "primary");
+        assert_eq!(failures[1]["payload"]["relation"], "related");
+        assert_eq!(failures[2]["payload"]["relation"], "related");
+        assert_eq!(
+            failures[0]["payload"]["diagnostic"],
+            serde_json::to_value(stdout_diagnostic).expect("stdout 诊断应可序列化")
+        );
+        assert_eq!(
+            failures[1]["payload"]["diagnostic"],
+            serde_json::to_value(&shutdown_failures[0]).expect("首个 shutdown 诊断应可序列化")
+        );
+        assert_eq!(
+            failures[2]["payload"]["diagnostic"],
+            serde_json::to_value(&shutdown_failures[1]).expect("第二个 shutdown 诊断应可序列化")
+        );
+        let terminals = records
+            .iter()
+            .filter(|record| record["code"] == "run.finished")
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1, "项目日志只能写入一个运行终态");
+        assert_eq!(terminals[0]["payload"]["outcome"], "failed");
     }
 
     fn render_and_persist_command_failure(

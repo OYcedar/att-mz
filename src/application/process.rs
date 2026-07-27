@@ -216,7 +216,7 @@ fn render_command_report(
     stderr: &mut dyn Write,
 ) -> ExitCode {
     match (result, shutdown_error) {
-        (CommandRunResult::Succeeded(output), None) => {
+        (CommandRunResult::Succeeded(output), shutdown) => {
             if let Err(error) = CommandResultRenderer::render_success(output, localizer, stdout) {
                 let command_error = ProductionCommandError::stdout_write(error);
                 let warning = pending_project_log
@@ -224,7 +224,7 @@ fn render_command_report(
                 render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
                 let _ = CommandResultRenderer::render_failure(
                     Some(&command_error),
-                    None,
+                    shutdown.as_ref(),
                     localizer,
                     stderr,
                 );
@@ -232,7 +232,16 @@ fn render_command_report(
             } else {
                 let warning = pending_project_log.and_then(PendingProjectLog::finish);
                 render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-                ExitCode::SUCCESS
+                if let Some(shutdown) = shutdown {
+                    // 业务结果已生效：成功输出完整写入后再报告收尾失败，
+                    // 清理错误不得覆盖业务成功事实。
+                    let _ = CommandResultRenderer::render_applied_finalization_failure(
+                        &shutdown, localizer, stderr,
+                    );
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
             }
         }
         (CommandRunResult::Failed(command_error), shutdown) => {
@@ -258,17 +267,6 @@ fn render_command_report(
             // 取消事实与清理失败并列呈现，清理错误不吞掉“已取消”这一终态。
             let _ = writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled));
             let _ = CommandResultRenderer::render_failure(None, Some(&shutdown), localizer, stderr);
-            ExitCode::FAILURE
-        }
-        (CommandRunResult::Succeeded(output), Some(shutdown)) => {
-            let warning = pending_project_log.and_then(PendingProjectLog::finish);
-            render_project_log_warning_if_present(localizer, warning.as_ref(), stderr);
-            // 业务结果已生效：先完整呈现成功输出，再报告收尾失败，
-            // 清理错误不得覆盖业务成功事实。
-            let _ = CommandResultRenderer::render_success(output, localizer, stdout);
-            let _ = CommandResultRenderer::render_applied_finalization_failure(
-                &shutdown, localizer, stderr,
-            );
             ExitCode::FAILURE
         }
     }
@@ -492,6 +490,25 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailingOutput {
+        write_attempts: usize,
+    }
+
+    impl Write for FailingOutput {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            self.write_attempts += 1;
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "测试 stdout 已关闭",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn completed_output_is_fully_rendered_before_shutdown_failure() {
         let mut shutdown = ShutdownFailures::default();
@@ -542,6 +559,46 @@ mod tests {
                 .all(|stream| *stream == ObservedStream::Stderr),
             "成功输出必须完整写完后才开始呈现清理失败"
         );
+    }
+
+    #[test]
+    fn stdout_failure_is_primary_when_shutdown_also_failed() {
+        let mut shutdown = ShutdownFailures::default();
+        shutdown.push_for_test("test shutdown root", TestShutdownError);
+        let localizer = UiLocalizer::new(UiLocale::SimplifiedChinese);
+        let output = RpgMakerCommandOutput::Lua {
+            project: "project".parse().expect("测试项目名应合法"),
+        };
+        let mut stdout = FailingOutput::default();
+        let mut stderr = Vec::new();
+
+        let exit = render_command_report(
+            CommandRunResult::Succeeded(output),
+            Some(shutdown),
+            None,
+            &localizer,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(
+            stdout.write_attempts, 1,
+            "stdout 写入失败后不得重试成功摘要"
+        );
+        let stderr = String::from_utf8(stderr).expect("stderr 应为 UTF-8");
+        let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
+        let stdout_position = stderr
+            .find("state.finalization_failed")
+            .expect("stdout 写入失败必须成为主错误");
+        let shutdown_position = stderr
+            .find("shutdown.component")
+            .expect("shutdown 失败必须继续呈现");
+        assert!(
+            stdout_position < shutdown_position,
+            "stdout 主错误必须先于 shutdown 相关错误"
+        );
+        assert!(plain.contains("相关错误 1"));
     }
 
     #[test]
