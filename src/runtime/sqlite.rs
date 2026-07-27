@@ -64,7 +64,8 @@ const SQLITE_BACKUP_PAGES_PER_STEP: i32 = 256;
 // 这些值是 SSPV 最大真实样本的 SQLite 单因素消融结果，不是项目容量限制：
 // 64 KiB 页显著减少长路径 Claim 索引的 B-tree 页与写放大；3 GiB 连接缓存和
 // 内存 TEMP 避免 SQLite 的 2 MiB 默认缓存把同一批索引页反复赶回磁盘。cache_size
-// 只规定缓存目标，不会预分配内存，也不拒绝任何规模的项目。
+// 只规定缓存目标；每个连接的页缓存随实际触达的页增长，不会按目标值预分配内存，
+// 也不拒绝任何规模的项目。
 const NEW_DATABASE_PAGE_SIZE_BYTES: i64 = 64 * 1024;
 const CONNECTION_CACHE_SIZE_KIB: i64 = -(3 * 1024 * 1024);
 
@@ -3424,12 +3425,17 @@ impl Drop for RusqliteStorageInner {
 }
 
 /// 共享短操作 worker 与唯一交互会话的 `rusqlite` 生产根。
+///
+/// 主根同时打开的连接最多为 `2 * short_worker_width + 1`：每个短操作 worker 在
+/// online backup 中至多同时持有源、目标两个连接，唯一交互会话再持有一个连接。
 #[derive(Clone)]
 pub(crate) struct RusqliteStorage {
     inner: Arc<RusqliteStorageInner>,
 }
 
 /// 主 SQLite 根完成关闭后，用一个独立连接提交最终运行方案的短生命周期根。
+///
+/// 该连接只在主根关闭完成后打开，不与主根的连接生命周期叠加。
 #[derive(Clone)]
 pub(crate) struct RusqliteFinalTransactionExecutor {
     config: Arc<RusqliteStorageConfiguration>,
