@@ -468,6 +468,42 @@ fn rpg_maker_skill_has_the_minimal_portable_package_contract() {
         );
     }
 
+    let translation_closure = markdown_level_three_section(body, "### 翻译补跑与人工收尾闭环")
+        .expect("SKILL.md 必须包含翻译补跑与人工收尾闭环");
+    let closure_steps = translation_closure
+        .lines()
+        .filter_map(|line| {
+            let (number, instruction) = line.split_once(". ")?;
+            let number = number.parse::<usize>().ok()?;
+            assert!(
+                !instruction.trim().is_empty(),
+                "翻译补跑与人工收尾闭环的第 {number} 步不得为空"
+            );
+            Some(number)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        closure_steps,
+        [1, 2, 3, 4, 5, 6, 1, 2, 3, 4],
+        "翻译补跑必须包含六步，人工收尾必须包含四步"
+    );
+    for required_contract in [
+        "`Complete`",
+        "`Partial`",
+        "`Unavailable`",
+        "`remaining_decisions`",
+        "`remaining_locations`",
+        "`ctx.standard.open()`",
+        "`standard:accept(batch)`",
+        "`replace_current = true`",
+        "`standard/stale_snapshot`",
+    ] {
+        assert!(
+            translation_closure.contains(required_contract),
+            "翻译补跑与人工收尾闭环必须保留契约 {required_contract}"
+        );
+    }
+
     let interface_path = skill_root.join("agents/openai.yaml");
     let interface = parse_openai_interface(&interface_path, &read_utf8(&interface_path));
     assert_eq!(
@@ -1246,6 +1282,13 @@ fn markdown_level_two_section<'a>(source: &'a str, heading: &str) -> Option<&'a 
     let start = source.find(heading)?;
     let remainder = &source[start + heading.len()..];
     let end = remainder.find("\n## ").unwrap_or(remainder.len());
+    Some(&remainder[..end])
+}
+
+fn markdown_level_three_section<'a>(source: &'a str, heading: &str) -> Option<&'a str> {
+    let start = source.find(heading)?;
+    let remainder = &source[start + heading.len()..];
+    let end = remainder.find("\n### ").unwrap_or(remainder.len());
     Some(&remainder[..end])
 }
 
