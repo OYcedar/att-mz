@@ -8,11 +8,11 @@ use std::error::Error;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::lua::json::{
-    LosslessJsonError, LosslessJsonValue, decode as decode_lossless,
+    JsonValueDecodeError, LosslessJsonError, decode_value, drop_serde_value,
 };
 
 /// 栈安全 JSON 边界保留的具体解析或编码错误。
@@ -198,8 +198,11 @@ impl Drop for StackSafeJsonValue {
 
 /// 严格解析一个完整 JSON 值；重复 object key 与 Lua Host 使用相同语义。
 pub(crate) fn from_str(source: &str) -> Result<StackSafeJsonValue, StackSafeJsonError> {
-    let lossless = decode_lossless(source).map_err(|error| lossless_error(source, error))?;
-    convert_lossless(lossless).map(StackSafeJsonValue::new)
+    match decode_value(source) {
+        Ok(value) => Ok(StackSafeJsonValue::new(value)),
+        Err(JsonValueDecodeError::Syntax(error)) => Err(lossless_error(source, error)),
+        Err(JsonValueDecodeError::Backend(error)) => Err(StackSafeJsonError::Backend(error)),
+    }
 }
 
 fn lossless_error(source: &str, error: LosslessJsonError) -> StackSafeJsonError {
@@ -220,72 +223,6 @@ fn lossless_error(source: &str, error: LosslessJsonError) -> StackSafeJsonError 
         line,
         column,
     }
-}
-
-fn convert_lossless(root: LosslessJsonValue) -> Result<Value, StackSafeJsonError> {
-    enum Work {
-        Value(LosslessJsonValue),
-        Array(usize),
-        Object(Vec<String>),
-    }
-
-    let mut work = vec![Work::Value(root)];
-    let mut completed = Vec::<Value>::new();
-    while let Some(item) = work.pop() {
-        match item {
-            Work::Value(mut value) => match &mut value {
-                LosslessJsonValue::Null => completed.push(Value::Null),
-                LosslessJsonValue::Boolean(value) => completed.push(Value::Bool(*value)),
-                LosslessJsonValue::String(value) => {
-                    completed.push(Value::String(std::mem::take(value)));
-                }
-                LosslessJsonValue::Number(value) => {
-                    let number = match serde_json::from_str::<Number>(&std::mem::take(value)) {
-                        Ok(number) => number,
-                        Err(source) => {
-                            for value in completed.drain(..) {
-                                drop_value(value);
-                            }
-                            return Err(StackSafeJsonError::Backend(source));
-                        }
-                    };
-                    completed.push(Value::Number(number));
-                }
-                LosslessJsonValue::Array(values) => {
-                    let children = std::mem::take(values);
-                    let length = children.len();
-                    work.push(Work::Array(length));
-                    work.extend(children.into_iter().rev().map(Work::Value));
-                }
-                LosslessJsonValue::Object(entries) => {
-                    let entries = std::mem::take(entries);
-                    let mut keys = Vec::with_capacity(entries.len());
-                    let mut children = Vec::with_capacity(entries.len());
-                    for (key, value) in entries {
-                        keys.push(key);
-                        children.push(value);
-                    }
-                    work.push(Work::Object(keys));
-                    work.extend(children.into_iter().rev().map(Work::Value));
-                }
-            },
-            Work::Array(length) => {
-                let first = completed.len() - length;
-                let values = completed.split_off(first);
-                completed.push(Value::Array(values));
-            }
-            Work::Object(keys) => {
-                let first = completed.len() - keys.len();
-                let values = completed.split_off(first);
-                let mut object = Map::with_capacity(keys.len());
-                for (key, value) in keys.into_iter().zip(values) {
-                    object.insert(key, value);
-                }
-                completed.push(Value::Object(object));
-            }
-        }
-    }
-    Ok(completed.pop().expect("完整 JSON 必须产生一个根值"))
 }
 
 /// 克隆一个任意深的 `serde_json::Value`，不递归进入子树。
@@ -467,20 +404,8 @@ fn serialize(root: &Value, pretty: bool) -> Result<Vec<u8>, StackSafeJsonError> 
 }
 
 /// 迭代释放一个任意深的 `serde_json::Value`。
-pub(crate) fn drop_value(mut root: Value) {
-    let mut pending = Vec::new();
-    take_children(&mut root, &mut pending);
-    while let Some(mut value) = pending.pop() {
-        take_children(&mut value, &mut pending);
-    }
-}
-
-fn take_children(value: &mut Value, pending: &mut Vec<Value>) {
-    match value {
-        Value::Array(values) => pending.append(values),
-        Value::Object(values) => pending.extend(std::mem::take(values).into_values()),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
+pub(crate) fn drop_value(root: Value) {
+    drop_serde_value(root);
 }
 
 #[cfg(test)]
@@ -509,6 +434,19 @@ mod tests {
             "]".repeat(DEPTH)
         );
         assert_eq!(to_string(&value).unwrap(), expected);
+
+        let mut object_source = String::with_capacity(DEPTH * 6 + 4);
+        for _ in 0..DEPTH {
+            object_source.push_str(r#"{"v":"#);
+        }
+        object_source.push_str("null");
+        object_source.push_str(&"}".repeat(DEPTH));
+        let object = from_str(&object_source).unwrap();
+        let mut current = object.as_ref();
+        for _ in 0..DEPTH {
+            current = current.get("v").expect("每层 object 都应保留唯一的 v 属性");
+        }
+        assert!(current.is_null());
     }
 
     #[test]
@@ -527,5 +465,13 @@ mod tests {
 
         let error = from_str("{\n \"a\": 1,\n \"a\": 2\n}").unwrap_err();
         assert_eq!((error.line(), error.column()), (3, 2));
+        assert!(matches!(
+            error,
+            StackSafeJsonError::Syntax {
+                source: LosslessJsonError::DuplicateObjectKey { byte_offset: 12 },
+                line: 3,
+                column: 2,
+            }
+        ));
     }
 }

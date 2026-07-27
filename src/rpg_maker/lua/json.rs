@@ -1,8 +1,11 @@
-//! 可信 Lua Host 使用的无损 JSON 值与严格解析边界。
+//! RPG Maker Standard 与可信 Lua Host 共用的严格 JSON 解析边界。
 
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+
+use serde_json::{Map, Number, Value};
 
 /// 保留 JSON number 原文的中间值。
 #[derive(Debug)]
@@ -158,19 +161,250 @@ impl fmt::Display for LosslessJsonError {
 
 impl Error for LosslessJsonError {}
 
+/// 直接构造 `serde_json::Value` 时保留的解析或 number 后端错误。
+#[derive(Debug)]
+pub(crate) enum JsonValueDecodeError {
+    Syntax(LosslessJsonError),
+    Backend(serde_json::Error),
+}
+
+enum ParseValueError<E> {
+    Syntax(LosslessJsonError),
+    Build(E),
+}
+
+impl<E> From<LosslessJsonError> for ParseValueError<E> {
+    fn from(source: LosslessJsonError) -> Self {
+        Self::Syntax(source)
+    }
+}
+
+trait JsonValueBuilder {
+    type Value;
+    type Array;
+    type Object;
+    type Error;
+
+    fn null() -> Self::Value;
+    fn boolean(value: bool) -> Self::Value;
+    fn string(value: String) -> Self::Value;
+    fn number(source: &str) -> Result<Self::Value, Self::Error>;
+    fn new_array() -> Self::Array;
+    fn push_array(array: &mut Self::Array, value: Self::Value);
+    fn finish_array(array: Self::Array) -> Self::Value;
+    fn new_object() -> Self::Object;
+    fn push_object(object: &mut Self::Object, key: String, value: Self::Value);
+    fn finish_object(object: Self::Object) -> Self::Value;
+    fn drop_value(value: Self::Value);
+
+    fn drop_array(array: Self::Array) {
+        Self::drop_value(Self::finish_array(array));
+    }
+
+    fn drop_object(object: Self::Object) {
+        Self::drop_value(Self::finish_object(object));
+    }
+}
+
+struct LosslessValueBuilder;
+
+impl JsonValueBuilder for LosslessValueBuilder {
+    type Value = LosslessJsonValue;
+    type Array = Vec<LosslessJsonValue>;
+    type Object = Vec<(String, LosslessJsonValue)>;
+    type Error = Infallible;
+
+    fn null() -> Self::Value {
+        LosslessJsonValue::Null
+    }
+
+    fn boolean(value: bool) -> Self::Value {
+        LosslessJsonValue::Boolean(value)
+    }
+
+    fn string(value: String) -> Self::Value {
+        LosslessJsonValue::String(value)
+    }
+
+    fn number(source: &str) -> Result<Self::Value, Self::Error> {
+        Ok(LosslessJsonValue::Number(source.to_owned()))
+    }
+
+    fn new_array() -> Self::Array {
+        Vec::new()
+    }
+
+    fn push_array(array: &mut Self::Array, value: Self::Value) {
+        array.push(value);
+    }
+
+    fn finish_array(array: Self::Array) -> Self::Value {
+        LosslessJsonValue::Array(array)
+    }
+
+    fn new_object() -> Self::Object {
+        Vec::new()
+    }
+
+    fn push_object(object: &mut Self::Object, key: String, value: Self::Value) {
+        object.push((key, value));
+    }
+
+    fn finish_object(object: Self::Object) -> Self::Value {
+        LosslessJsonValue::Object(object)
+    }
+
+    fn drop_value(value: Self::Value) {
+        drop(value);
+    }
+}
+
+struct SerdeValueBuilder;
+
+impl JsonValueBuilder for SerdeValueBuilder {
+    type Value = Value;
+    type Array = Vec<Value>;
+    type Object = Map<String, Value>;
+    type Error = serde_json::Error;
+
+    fn null() -> Self::Value {
+        Value::Null
+    }
+
+    fn boolean(value: bool) -> Self::Value {
+        Value::Bool(value)
+    }
+
+    fn string(value: String) -> Self::Value {
+        Value::String(value)
+    }
+
+    fn number(source: &str) -> Result<Self::Value, Self::Error> {
+        serde_json::from_str::<Number>(source).map(Value::Number)
+    }
+
+    fn new_array() -> Self::Array {
+        Vec::new()
+    }
+
+    fn push_array(array: &mut Self::Array, value: Self::Value) {
+        array.push(value);
+    }
+
+    fn finish_array(array: Self::Array) -> Self::Value {
+        Value::Array(array)
+    }
+
+    fn new_object() -> Self::Object {
+        Map::new()
+    }
+
+    fn push_object(object: &mut Self::Object, key: String, value: Self::Value) {
+        if let Some(previous) = object.insert(key, value) {
+            drop_serde_value(previous);
+            panic!("parser 已拒绝重复 object key");
+        }
+    }
+
+    fn finish_object(object: Self::Object) -> Self::Value {
+        Value::Object(object)
+    }
+
+    fn drop_value(value: Self::Value) {
+        drop_serde_value(value);
+    }
+}
+
+enum ParseFrame<B: JsonValueBuilder> {
+    Array(B::Array),
+    Object {
+        entries: B::Object,
+        keys: HashSet<String>,
+        pending_key: String,
+    },
+}
+
+struct ParseState<B: JsonValueBuilder> {
+    frames: Vec<ParseFrame<B>>,
+    completed: Option<B::Value>,
+}
+
+impl<B: JsonValueBuilder> ParseState<B> {
+    fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            completed: None,
+        }
+    }
+}
+
+impl<B: JsonValueBuilder> Drop for ParseState<B> {
+    fn drop(&mut self) {
+        if let Some(value) = self.completed.take() {
+            B::drop_value(value);
+        }
+        while let Some(frame) = self.frames.pop() {
+            match frame {
+                ParseFrame::Array(array) => B::drop_array(array),
+                ParseFrame::Object { entries, .. } => B::drop_object(entries),
+            }
+        }
+    }
+}
+
 /// 解析一个完整且严格的 JSON 值。
 pub(crate) fn decode(source: &str) -> Result<LosslessJsonValue, LosslessJsonError> {
+    match decode_with_builder::<LosslessValueBuilder>(source) {
+        Ok(value) => Ok(value),
+        Err(ParseValueError::Syntax(source)) => Err(source),
+        Err(ParseValueError::Build(source)) => match source {},
+    }
+}
+
+/// 使用同一解析器直接构造一个完整且严格的 `serde_json::Value`。
+///
+/// 成功结果可能任意深；调用方必须立即转交栈安全拥有型边界，或使用
+/// [`drop_serde_value`] 迭代释放，不能让裸值沿 Rust 调用栈递归析构。
+pub(crate) fn decode_value(source: &str) -> Result<Value, JsonValueDecodeError> {
+    match decode_with_builder::<SerdeValueBuilder>(source) {
+        Ok(value) => Ok(value),
+        Err(ParseValueError::Syntax(source)) => Err(JsonValueDecodeError::Syntax(source)),
+        Err(ParseValueError::Build(source)) => Err(JsonValueDecodeError::Backend(source)),
+    }
+}
+
+fn decode_with_builder<B: JsonValueBuilder>(
+    source: &str,
+) -> Result<B::Value, ParseValueError<B::Error>> {
     let mut parser = Parser {
         source,
         position: 0,
     };
     parser.skip_whitespace();
-    let value = parser.parse_value()?;
+    let value = parser.parse_value::<B>()?;
     parser.skip_whitespace();
     if parser.position != source.len() {
-        return Err(parser.syntax("顶层值之后存在额外内容"));
+        let error = parser.syntax("顶层值之后存在额外内容");
+        B::drop_value(value);
+        return Err(error.into());
     }
     Ok(value)
+}
+
+pub(crate) fn drop_serde_value(mut root: Value) {
+    let mut pending = Vec::new();
+    take_serde_children(&mut root, &mut pending);
+    while let Some(mut value) = pending.pop() {
+        take_serde_children(&mut value, &mut pending);
+    }
+}
+
+fn take_serde_children(value: &mut Value, pending: &mut Vec<Value>) {
+    match value {
+        Value::Array(values) => pending.append(values),
+        Value::Object(values) => pending.extend(std::mem::take(values).into_values()),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 /// 验证文本是否恰好为一个标准 JSON number。
@@ -191,90 +425,81 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
-    fn parse_value(&mut self) -> Result<LosslessJsonValue, LosslessJsonError> {
-        enum Frame {
-            Array(Vec<LosslessJsonValue>),
-            Object {
-                entries: Vec<(String, LosslessJsonValue)>,
-                keys: HashSet<String>,
-                pending_key: String,
-            },
-        }
-
-        let mut frames = Vec::new();
-        let mut completed = None;
+    fn parse_value<B: JsonValueBuilder>(&mut self) -> Result<B::Value, ParseValueError<B::Error>> {
+        let mut state = ParseState::<B>::new();
         loop {
-            if let Some(value) = completed.take() {
-                let Some(frame) = frames.last_mut() else {
+            if let Some(value) = state.completed.take() {
+                let Some(frame) = state.frames.last_mut() else {
                     return Ok(value);
                 };
                 match frame {
-                    Frame::Array(values) => values.push(value),
-                    Frame::Object {
+                    ParseFrame::Array(values) => B::push_array(values, value),
+                    ParseFrame::Object {
                         entries,
                         pending_key,
                         ..
-                    } => entries.push((std::mem::take(pending_key), value)),
+                    } => B::push_object(entries, std::mem::take(pending_key), value),
                 }
                 self.skip_whitespace();
 
                 let closing = match frame {
-                    Frame::Array(_) if self.consume_if(b']') => true,
-                    Frame::Object { .. } if self.consume_if(b'}') => true,
-                    Frame::Array(_) => {
+                    ParseFrame::Array(_) if self.consume_if(b']') => true,
+                    ParseFrame::Object { .. } if self.consume_if(b'}') => true,
+                    ParseFrame::Array(_) => {
                         if !self.consume_if(b',') {
-                            return Err(self.syntax("JSON array 项之间缺少逗号或结束括号"));
+                            return Err(self.syntax("JSON array 项之间缺少逗号或结束括号").into());
                         }
                         self.skip_whitespace();
                         if self.peek_byte() == Some(b']') {
-                            return Err(self.syntax("JSON array 不允许尾逗号"));
+                            return Err(self.syntax("JSON array 不允许尾逗号").into());
                         }
                         false
                     }
-                    Frame::Object {
+                    ParseFrame::Object {
                         keys, pending_key, ..
                     } => {
                         if !self.consume_if(b',') {
-                            return Err(self.syntax("JSON object 项之间缺少逗号或结束括号"));
+                            return Err(self.syntax("JSON object 项之间缺少逗号或结束括号").into());
                         }
                         self.skip_whitespace();
                         if self.peek_byte() == Some(b'}') {
-                            return Err(self.syntax("JSON object 不允许尾逗号"));
+                            return Err(self.syntax("JSON object 不允许尾逗号").into());
                         }
                         *pending_key = self.parse_object_key(keys)?;
                         false
                     }
                 };
                 if closing {
-                    completed = Some(match frames.pop().expect("已检查 frame 存在") {
-                        Frame::Array(values) => LosslessJsonValue::Array(values),
-                        Frame::Object { entries, .. } => LosslessJsonValue::Object(entries),
+                    state.completed = Some(match state.frames.pop().expect("已检查 frame 存在")
+                    {
+                        ParseFrame::Array(values) => B::finish_array(values),
+                        ParseFrame::Object { entries, .. } => B::finish_object(entries),
                     });
                 }
                 continue;
             }
 
-            completed = match self.peek_byte() {
+            state.completed = match self.peek_byte() {
                 Some(b'n') => {
                     self.consume_literal(b"null")?;
-                    Some(LosslessJsonValue::Null)
+                    Some(B::null())
                 }
                 Some(b't') => {
                     self.consume_literal(b"true")?;
-                    Some(LosslessJsonValue::Boolean(true))
+                    Some(B::boolean(true))
                 }
                 Some(b'f') => {
                     self.consume_literal(b"false")?;
-                    Some(LosslessJsonValue::Boolean(false))
+                    Some(B::boolean(false))
                 }
-                Some(b'"') => Some(LosslessJsonValue::String(self.parse_string()?)),
+                Some(b'"') => Some(B::string(self.parse_string()?)),
                 Some(b'[') => {
                     self.position += 1;
                     self.skip_whitespace();
                     if self.consume_if(b']') {
-                        Some(LosslessJsonValue::Array(Vec::new()))
+                        Some(B::finish_array(B::new_array()))
                     } else {
-                        frames.push(Frame::Array(Vec::new()));
+                        state.frames.push(ParseFrame::Array(B::new_array()));
                         None
                     }
                 }
@@ -282,12 +507,12 @@ impl Parser<'_> {
                     self.position += 1;
                     self.skip_whitespace();
                     if self.consume_if(b'}') {
-                        Some(LosslessJsonValue::Object(Vec::new()))
+                        Some(B::finish_object(B::new_object()))
                     } else {
                         let mut keys = HashSet::new();
                         let pending_key = self.parse_object_key(&mut keys)?;
-                        frames.push(Frame::Object {
-                            entries: Vec::new(),
+                        state.frames.push(ParseFrame::Object {
+                            entries: B::new_object(),
                             keys,
                             pending_key,
                         });
@@ -297,12 +522,13 @@ impl Parser<'_> {
                 Some(b'-' | b'0'..=b'9') => {
                     let start = self.position;
                     self.position = scan_number(self.source.as_bytes(), start)?;
-                    Some(LosslessJsonValue::Number(
-                        self.source[start..self.position].to_owned(),
-                    ))
+                    Some(
+                        B::number(&self.source[start..self.position])
+                            .map_err(ParseValueError::Build)?,
+                    )
                 }
-                Some(_) => return Err(self.syntax("期望 JSON value")),
-                None => return Err(self.syntax("缺少 JSON value")),
+                Some(_) => return Err(self.syntax("期望 JSON value").into()),
+                None => return Err(self.syntax("缺少 JSON value").into()),
             };
         }
     }
@@ -545,6 +771,26 @@ mod tests {
     }
 
     #[test]
+    fn direct_value_builder_preserves_number_and_object_semantics() {
+        let source = r#"{"z":-0,"a":1e999,"integer":9223372036854775808,"text":"\uD83D\uDE00"}"#;
+        let value = decode_value(source).unwrap();
+        let serde_value = serde_json::from_str::<Value>(source).unwrap();
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            serde_json::to_string(&serde_value).unwrap()
+        );
+        drop_serde_value(value);
+        drop_serde_value(serde_value);
+
+        assert!(matches!(
+            decode_value(r#"{"a":1,"\u0061":2}"#),
+            Err(JsonValueDecodeError::Syntax(
+                LosslessJsonError::DuplicateObjectKey { .. }
+            ))
+        ));
+    }
+
+    #[test]
     fn rejects_duplicate_keys_after_escape_decoding() {
         assert!(matches!(
             decode(r#"{"a":1,"\u0061":2}"#),
@@ -578,6 +824,40 @@ mod tests {
         ] {
             assert!(decode(invalid).is_err(), "{invalid:?} 应被拒绝");
         }
+    }
+
+    #[test]
+    fn direct_value_builder_cleans_deep_partial_trees_iteratively_on_every_failure_shape() {
+        const DEPTH: usize = 20_000;
+        let mut deep = "[".repeat(DEPTH);
+        deep.push_str("null");
+        deep.push_str(&"]".repeat(DEPTH));
+
+        let trailing = format!("{deep}x");
+        assert!(matches!(
+            decode_value(&trailing),
+            Err(JsonValueDecodeError::Syntax(_))
+        ));
+
+        let missing_closing = &deep[..deep.len() - 1];
+        assert!(matches!(
+            decode_value(missing_closing),
+            Err(JsonValueDecodeError::Syntax(_))
+        ));
+
+        let nested_failure = format!("[{deep},]");
+        assert!(matches!(
+            decode_value(&nested_failure),
+            Err(JsonValueDecodeError::Syntax(_))
+        ));
+
+        let duplicate_after_deep = format!(r#"{{"\u0064eep":{deep},"deep":null}}"#);
+        assert!(matches!(
+            decode_value(&duplicate_after_deep),
+            Err(JsonValueDecodeError::Syntax(
+                LosslessJsonError::DuplicateObjectKey { .. }
+            ))
+        ));
     }
 
     #[test]
