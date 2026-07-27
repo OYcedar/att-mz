@@ -4292,27 +4292,39 @@ fn validate_windows_name(name: &OsStr, full_path: &Path) -> Result<(), SystemFil
             reason: "Windows 名称包含控制字符、ADS 或保留符号",
         });
     }
-    let ascii = String::from_utf16(&wide)
-        .ok()
-        .filter(|value| value.is_ascii())
-        .map(|value| value.to_ascii_uppercase());
-    if let Some(ascii) = ascii {
-        let base = ascii.split('.').next().unwrap_or_default();
-        let reserved = matches!(base, "CON" | "PRN" | "AUX" | "NUL")
-            || base.strip_prefix("COM").is_some_and(|suffix| {
-                suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
-            })
-            || base.strip_prefix("LPT").is_some_and(|suffix| {
-                suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
-            });
-        if reserved || ascii.to_ascii_lowercase().starts_with(RESERVED_PREFIX) {
-            return Err(SystemFileSystemError::InvalidPath {
-                path: full_path.to_path_buf(),
-                reason: "Windows 名称属于设备名或发布根保留命名空间",
-            });
-        }
+    let base_end = wide
+        .iter()
+        .position(|unit| *unit == u16::from(b'.'))
+        .unwrap_or(wide.len());
+    let base = &wide[..base_end];
+    let reserved_device = ["CON", "PRN", "AUX", "NUL"]
+        .into_iter()
+        .any(|name| wide_eq_ascii_ignore_case(base, name))
+        || (base.len() == 4
+            && (wide_eq_ascii_ignore_case(&base[..3], "COM")
+                || wide_eq_ascii_ignore_case(&base[..3], "LPT"))
+            && matches!(base[3], unit if unit >= u16::from(b'1') && unit <= u16::from(b'9')));
+    if reserved_device || wide_starts_with_ascii_ignore_case(&wide, RESERVED_PREFIX) {
+        return Err(SystemFileSystemError::InvalidPath {
+            path: full_path.to_path_buf(),
+            reason: "Windows 名称属于设备名或发布根保留命名空间",
+        });
     }
     Ok(())
+}
+
+fn wide_eq_ascii_ignore_case(wide: &[u16], ascii: &str) -> bool {
+    wide.len() == ascii.len() && wide_starts_with_ascii_ignore_case(wide, ascii)
+}
+
+fn wide_starts_with_ascii_ignore_case(wide: &[u16], ascii: &str) -> bool {
+    wide.iter()
+        .zip(ascii.bytes())
+        .take(ascii.len())
+        .all(|(unit, byte)| {
+            *unit <= u16::from(u8::MAX) && (*unit as u8).eq_ignore_ascii_case(&byte)
+        })
+        && wide.len() >= ascii.len()
 }
 
 fn target_lock_path(
@@ -5845,6 +5857,47 @@ mod tests {
         }
         validate_windows_name(OsStr::new("剧情 数据.json"), Path::new("剧情 数据.json"))
             .expect("Unicode 普通名称应该合法");
+
+        for units in [
+            [
+                u16::from(b'N'),
+                u16::from(b'U'),
+                u16::from(b'L'),
+                u16::from(b'.'),
+                0xd800,
+            ]
+            .as_slice(),
+            [
+                u16::from(b'.'),
+                u16::from(b'd'),
+                u16::from(b'i'),
+                u16::from(b'r'),
+                u16::from(b'e'),
+                u16::from(b'c'),
+                u16::from(b't'),
+                u16::from(b'o'),
+                u16::from(b'r'),
+                u16::from(b'y'),
+                u16::from(b'-'),
+                u16::from(b'p'),
+                u16::from(b'u'),
+                u16::from(b'b'),
+                u16::from(b'l'),
+                u16::from(b'i'),
+                u16::from(b's'),
+                u16::from(b'h'),
+                u16::from(b'-'),
+                u16::from(b'x'),
+                0xdc00,
+            ]
+            .as_slice(),
+        ] {
+            let name = OsString::from_wide(units);
+            assert!(
+                validate_windows_name(&name, Path::new(&name)).is_err(),
+                "孤立 surrogate 不得绕过设备名或发布保留命名空间"
+            );
+        }
     }
 
     #[test]

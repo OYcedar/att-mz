@@ -790,7 +790,7 @@ where
 {
     let mut pending = preserved
         .iter()
-        .map(|name| (workspace_root.join(name), (*name).to_owned()))
+        .map(|name| (workspace_root.join(name), PathBuf::from(name)))
         .collect::<Vec<_>>();
     while let Some((absolute, relative)) = pending.pop() {
         let entries = file_system
@@ -801,30 +801,24 @@ where
                 source,
             })?;
         for entry in entries {
-            let Some(name) = entry
+            let name = entry
                 .resolved_path()
                 .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-            else {
-                return Err(PreserveObservabilityFailure::InvalidEntryName {
+                .expect("DirectoryLister 返回的直接子项必须包含名称");
+            let child_relative = relative.join(name);
+            let scoped = ScopedDirectoryPath::from_internal_path(child_relative.clone()).map_err(
+                |source| PreserveObservabilityFailure::InvalidCandidatePath {
                     path: entry.resolved_path().to_path_buf(),
-                });
-            };
-            let child_relative = format!("{relative}/{name}");
-            let scoped =
-                ScopedDirectoryPath::new(PathBuf::from(&child_relative)).map_err(|source| {
-                    PreserveObservabilityFailure::InvalidCandidatePath {
-                        path: entry.resolved_path().to_path_buf(),
-                        source,
-                    }
-                })?;
+                    source,
+                },
+            )?;
             match entry.kind() {
                 DirectoryEntryKind::Directory => {
                     directories
                         .create_scoped_directory(bound, scoped)
                         .await
                         .map_err(|source| PreserveObservabilityFailure::Edit {
-                            path: PathBuf::from(&child_relative),
+                            path: child_relative.clone(),
                             source,
                         })?;
                     pending.push((entry.resolved_path().to_path_buf(), child_relative));
@@ -841,7 +835,7 @@ where
                         .write_scoped_file(bound, scoped, file.into_bytes())
                         .await
                         .map_err(|source| PreserveObservabilityFailure::Edit {
-                            path: PathBuf::from(&child_relative),
+                            path: child_relative,
                             source,
                         })?;
                 }
@@ -904,9 +898,6 @@ pub(crate) enum PreserveObservabilityFailure<E, A> {
         path: PathBuf,
         source: ReadFileError<E>,
     },
-    InvalidEntryName {
-        path: PathBuf,
-    },
     InvalidCandidatePath {
         path: PathBuf,
         source: ScopedDirectoryPathError,
@@ -931,11 +922,6 @@ where
             Self::Read { path, source } => {
                 write!(formatter, "无法读取保留文件 {}：{source}", path.display())
             }
-            Self::InvalidEntryName { path } => write!(
-                formatter,
-                "保留目录条目 {} 的名称无法作为候选相对路径",
-                path.display()
-            ),
             Self::InvalidCandidatePath { path, source } => write!(
                 formatter,
                 "保留条目 {} 无法映射为候选路径：{source}",
@@ -962,7 +948,6 @@ where
             Self::Bind(source) => Some(source),
             Self::List { source, .. } => Some(source),
             Self::Read { source, .. } => Some(source),
-            Self::InvalidEntryName { .. } => None,
             Self::InvalidCandidatePath { source, .. } => Some(source),
             Self::Edit { source, .. } => Some(source),
         }
@@ -1311,6 +1296,7 @@ where
 mod tests {
     use std::collections::VecDeque;
     use std::fs;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -1322,6 +1308,27 @@ mod tests {
     use crate::runtime::filesystem::{
         DirectoryPublisherConfig, SystemFileSystem, SystemFileSystemConfig,
     };
+
+    fn find_entry_by_windows_name(parent: &Path, expected: &[u16]) -> PathBuf {
+        fs::read_dir(parent)
+            .unwrap_or_else(|error| panic!("应列举目录 {}：{error}", parent.display()))
+            .map(|entry| entry.expect("目录项应可读取"))
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .as_os_str()
+                    .encode_wide()
+                    .eq(expected.iter().copied())
+            })
+            .map(|entry| entry.path())
+            .unwrap_or_else(|| {
+                panic!(
+                    "目录 {} 应包含 UTF-16 名称 {:?}",
+                    parent.display(),
+                    expected
+                )
+            })
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError(&'static str);
@@ -2720,6 +2727,33 @@ mod tests {
             task_bytes,
         )
         .expect("应建立 Unicode 任务记录");
+        let raw_directory_units = [
+            u16::from(b'h'),
+            u16::from(b'i'),
+            u16::from(b'g'),
+            u16::from(b'h'),
+            0xd800,
+        ];
+        let raw_file_units = [
+            u16::from(b'l'),
+            u16::from(b'o'),
+            u16::from(b'w'),
+            0xdc00,
+            u16::from(b'.'),
+            u16::from(b'b'),
+            u16::from(b'i'),
+            u16::from(b'n'),
+        ];
+        let raw_directory = workspace
+            .join("logs")
+            .join(OsString::from_wide(&raw_directory_units));
+        fs::create_dir(&raw_directory).expect("应建立含孤立高 surrogate 的日志目录");
+        let raw_windows_bytes = [0, 0xff, 0x81, b'\r', b'\n'];
+        fs::write(
+            raw_directory.join(OsString::from_wide(&raw_file_units)),
+            raw_windows_bytes,
+        )
+        .expect("应建立含孤立低 surrogate 的二进制日志");
 
         let replacement_data = temporary.path().join("replacement-data");
         let replacement_js = temporary.path().join("replacement-js");
@@ -2804,6 +2838,30 @@ mod tests {
             fs::read(workspace.join("task-records/人工补译/任务一.md"))
                 .expect("Unicode 任务记录应可读"),
             task_bytes
+        );
+        let preserved_raw_directory =
+            find_entry_by_windows_name(&workspace.join("logs"), &raw_directory_units);
+        assert_eq!(
+            preserved_raw_directory
+                .file_name()
+                .expect("保留目录必须包含名称")
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            raw_directory_units
+        );
+        let preserved_raw_file =
+            find_entry_by_windows_name(&preserved_raw_directory, &raw_file_units);
+        assert_eq!(
+            preserved_raw_file
+                .file_name()
+                .expect("保留文件必须包含名称")
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            raw_file_units
+        );
+        assert_eq!(
+            fs::read(preserved_raw_file).expect("原始 UTF-16 二进制日志应可读"),
+            raw_windows_bytes
         );
         file_system.shutdown().await.expect("文件系统根应终结");
     }
