@@ -789,7 +789,7 @@ fn project_log_startup_failure_never_changes_success_or_cancellation_outcome() {
 }
 
 #[test]
-fn extract_and_write_back_ctrl_break_cancel_without_state_or_candidate_residue() {
+fn stage_lua_ctrl_break_cancels_without_state_or_candidate_residue() {
     let temporary = tempfile::tempdir().expect("应可建立真实取消矩阵测试目录");
     let root = temporary.path();
     let game_root = root.join("game");
@@ -838,15 +838,43 @@ fn extract_and_write_back_ctrl_break_cancel_without_state_or_candidate_residue()
         ),
     );
     write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+    write_cancellable_translate_lua(root);
+    let translate_state_before = read_saved_phase_plan_snapshot(&database);
+    let translate_marker = root.join("translate-cancel-ready");
     let running_server = server.start_with_responses(vec![ChatResponseFixture::Standard]);
+    let translate_child = spawn_observable_att_in_new_process_group(
+        root,
+        arguments(&[
+            "mz",
+            "translate",
+            "--name",
+            PROJECT,
+            PROFILE,
+            "--lua",
+            TRANSLATE_LUA,
+        ]),
+    )
+    .wait_until_fixture_marker(&translate_marker);
+    send_ctrl_break(&translate_child, "Translate");
+    let cancelled_translate = translate_child.wait_until_safe_stopping().wait_for_output();
+    assert_cooperatively_cancelled("Translate", &cancelled_translate);
+    assert_eq!(running_server.finish().len(), 1);
+    assert_eq!(
+        read_saved_phase_plan_snapshot(&database),
+        translate_state_before,
+        "取消的 Translate 不得保存运行方案或改变其他阶段方案"
+    );
+    assert_translation_committed(&database);
+    assert_database_table_absent(&database, "translate_cancel_probe");
+    assert_cancelled_project_log(&logs_root, "translate");
+
     assert_success(
-        "WriteBack 取消前 Translate",
+        "取消后正常 Translate",
         &run_att(
             root,
             arguments(&["mz", "translate", "--name", PROJECT, PROFILE]),
         ),
     );
-    assert_eq!(running_server.finish().len(), 1);
 
     let output_before = snapshot_directory_tree(&workspace.join("write_back"));
     let write_back_state_before = read_saved_phase_plan_snapshot(&database);
@@ -3110,6 +3138,24 @@ end
 "#,
     )
     .expect("可取消 Extract Lua 夹具应可写入");
+}
+
+fn write_cancellable_translate_lua(root: &Path) {
+    fs::write(
+        root.join(TRANSLATE_LUA),
+        r#"
+assert(ctx.phase == "translate")
+ctx.db.begin()
+ctx.db.execute("CREATE TABLE translate_cancel_probe (value TEXT NOT NULL)")
+ctx.db.execute("INSERT INTO translate_cancel_probe (value) VALUES ('must-roll-back')")
+local marker = assert(io.open("translate-cancel-ready", "wb"))
+assert(marker:write("ready"))
+assert(marker:close())
+while true do
+end
+"#,
+    )
+    .expect("可取消 Translate Lua 夹具应可写入");
 }
 
 fn write_cancellable_write_back_lua(root: &Path) {

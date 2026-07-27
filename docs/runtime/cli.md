@@ -296,7 +296,7 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 
 第一次 Ctrl-C 后停止派生新阶段；SQLite、发布、CPU 和 HTTP 已接管的工作继续到明确终态。
 候选尚未发布时 discard；publish 已开始时等待终态。业务最终取消时不保存运行方案；
-Extract 或 WriteBack 正在执行 Lua 时同时请求该阶段 Lua Runtime 合作取消，Host 先回滚未闭合
+Extract、Translate 或 WriteBack 正在执行 Lua 时同时请求该阶段 Lua Runtime 合作取消，Host 先回滚未闭合
 的交互事务，WriteBack 再 discard 尚未发布的完整候选。
 若信号到达后业务仍自然完整完成，则归入成功路径，必要收尾后照常保存方案并完整呈现
 结果。普通项目日志故障不会改变取消与收尾次序。Translate 停止启动新的 Standard 任务；

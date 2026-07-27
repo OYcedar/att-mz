@@ -2093,6 +2093,7 @@ impl ProductionRpgMakerCommandRunner {
             }
         };
         let lua_cleared = explicit_lua_requested && lua.is_none();
+        let lua_runtime_for_cancellation = lua.as_ref().map(|selection| selection.runtime.clone());
         let lua_snapshot = lua
             .as_ref()
             .map(|selection| {
@@ -2217,6 +2218,9 @@ impl ProductionRpgMakerCommandRunner {
             termination_signals,
             || {
                 cancellation.request();
+                if let Some(runtime) = lua_runtime_for_cancellation {
+                    runtime.request_cancellation();
+                }
                 cpu.cancel_waits();
                 file_system.cancel_waits();
                 sqlite.cancel_waits();
