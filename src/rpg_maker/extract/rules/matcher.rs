@@ -2950,6 +2950,39 @@ path = 'dText'
     }
 
     #[test]
+    fn command_source_skips_non_objects_and_non_integer_codes() {
+        let definition = RulesDefinition::parse(
+            r#"
+[[rule]]
+code = 401
+parameter = 0
+"#,
+        )
+        .expect("命令规则应合法");
+        let input = input([(
+            "CommonEvents.json",
+            json!([
+                null,
+                {
+                    "list": [
+                        "不是 command 对象",
+                        {"code": "401", "parameters": ["不得误匹配字符串 code"]},
+                        {"code": 401.5, "parameters": ["不得误匹配小数 code"]},
+                        {"code": 401, "parameters": ["有效正文"]}
+                    ]
+                }
+            ]),
+        )]);
+
+        let targets = match_rules(&definition, &input)
+            .expect("非对象或非整数 code 的 command 来源应跳过而不是导致匹配失败");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].units().len(), 1);
+        assert_eq!(targets[0].units()[0].source_text(), "有效正文");
+    }
+
+    #[test]
     fn exact_nonstandard_file_and_all_maps_are_real_sources() {
         let definition = RulesDefinition::parse(
             r#"

@@ -3284,6 +3284,37 @@ mod tests {
     }
 
     #[test]
+    fn mz_null_native_speaker_is_an_invalid_string_value() {
+        let mut documents = complete_documents();
+        documents.insert_document(
+            RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+            json!([null, {"list": [
+                {"code": 101, "parameters": ["", 0, 0, 2, null]},
+                {"code": 401, "parameters": ["正文"]},
+                {"code": 0, "parameters": []}
+            ]}]),
+        );
+
+        let error = build_builtin_snapshot(&documents)
+            .expect_err("MZ 101.parameters[4] 的 null 不得被视为缺失 Speaker");
+        let BuildBuiltinSnapshotError::Malformed(error) = error else {
+            panic!("MZ 原生 Speaker 类型错误必须保持文档结构错误语义");
+        };
+        assert_eq!(
+            error.location,
+            "data/CommonEvents.json[1].list[0].parameters[4]"
+        );
+        assert_eq!(error.reason, BuiltinDocumentFailure::ExpectedString);
+        assert_eq!(
+            error.reason_detail(),
+            (
+                DiagnosticFailureKind::InvalidValue,
+                "structure=expected_string".to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn keeps_blank_405_as_a_semantic_aligned_slot() {
         let mut documents = complete_documents();
         documents.insert_document(
