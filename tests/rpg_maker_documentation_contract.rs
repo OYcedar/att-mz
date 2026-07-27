@@ -13,9 +13,16 @@ const RPG_MAKER_SKILL_NAME: &str = "translate-rpg-maker-with-att";
 
 const RPG_MAKER_SKILL_DESCRIPTION: &str = "使用 ATT 调查、初始化、提取、翻译、审核、写回、续作和诊断 RPG Maker MV/MZ 汉化项目。用于创建、继续、修复、检查或验证 ATT 项目，编写 Extract Rules、术语、Placeholder、Prompt 或可信 Lua，以及把试玩反馈追溯到责任阶段；不用于开发 ATT Rust 源码或不经过 ATT 的普通翻译。";
 
-const RPG_MAKER_SKILL_FLOWS: [(&str, &[&str]); 8] = [
+const RPG_MAKER_SKILL_SECTIONS: [&str; 4] = [
+    "工作边界",
+    "每次触发",
+    "状态路由与必读资料",
+    "判断、停止与恢复",
+];
+
+const RPG_MAKER_SKILL_ROUTES: [(&str, &[&str]); 8] = [
     (
-        "## 流程 0：入口与续作路由",
+        "阶段不明、已有项目续作",
         &[
             "docs/README.md",
             "docs/runtime/README.md",
@@ -23,7 +30,7 @@ const RPG_MAKER_SKILL_FLOWS: [(&str, &[&str]); 8] = [
         ],
     ),
     (
-        "## 流程 1：调查与初始化",
+        "游戏调查、初始化或冻结来源受质疑",
         &[
             "docs/rpg-maker/README.md",
             "docs/rpg-maker/init.md",
@@ -31,16 +38,15 @@ const RPG_MAKER_SKILL_FLOWS: [(&str, &[&str]); 8] = [
         ],
     ),
     (
-        "## 流程 2：提取与覆盖证明",
+        "漏收、误收、错组、recipe 或 Claim 问题",
         &[
-            "docs/rpg-maker/README.md",
             "docs/rpg-maker/extraction.md",
             "docs/rpg-maker/rules.md",
             "docs/runtime/sqlite.md",
         ],
     ),
     (
-        "## 流程 3：翻译资源准备",
+        "术语、Placeholder、Prompt、Profile、Client 或语言资源问题",
         &[
             "docs/rpg-maker/terminology.md",
             "docs/rpg-maker/prompts.md",
@@ -50,34 +56,27 @@ const RPG_MAKER_SKILL_FLOWS: [(&str, &[&str]); 8] = [
         ],
     ),
     (
-        "## 流程 4：翻译与质量审核",
+        "翻译执行、续作或质量审核",
         &[
             "docs/rpg-maker/translation.md",
-            "docs/rpg-maker/terminology.md",
-            "docs/rpg-maker/prompts.md",
-            "docs/rpg-maker/rules.md",
+            "docs/rpg-maker/task-records.md",
+            "docs/runtime/project-log.md",
             "docs/runtime/chat-completions.md",
         ],
     ),
     (
-        "## 流程 5：写回与隔离试玩",
+        "写回、候选差异或隔离试玩",
         &[
             "docs/rpg-maker/write-back.md",
             "docs/runtime/directory-publishing.md",
         ],
     ),
     (
-        "## 流程 6：诊断、恢复与安全续作",
-        &[
-            "docs/runtime/cli.md",
-            "docs/runtime/project-log.md",
-            "docs/runtime/sqlite.md",
-            "docs/runtime/directory-publishing.md",
-            "docs/runtime/chat-completions.md",
-        ],
+        "失败、取消、部分结果、状态矛盾或恢复",
+        &["docs/runtime/cli.md", "docs/runtime/project-log.md"],
     ),
     (
-        "## 条件子流程：可信 Lua",
+        "已证明需要可信 Lua",
         &["docs/rpg-maker/lua.md", "docs/rpg-maker/lua-cookbook.md"],
     ),
 ];
@@ -389,30 +388,69 @@ fn rpg_maker_skill_has_the_minimal_portable_package_contract() {
         !body.lines().any(is_markdown_fence),
         "SKILL.md 正文不得包含 fenced code block"
     );
-    for (flow_heading, required_documents) in RPG_MAKER_SKILL_FLOWS {
-        let flow = markdown_level_two_section(body, flow_heading).unwrap_or_else(|| {
-            panic!("SKILL.md 缺少流程章节 {flow_heading}");
-        });
-        for required_heading in [
-            "### 进入条件",
-            "### 必读文档",
-            "### 任务清单",
-            "### 完成证据",
-            "### 返回位置",
-        ] {
+    let level_two_headings = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        level_two_headings,
+        RPG_MAKER_SKILL_SECTIONS.to_vec(),
+        "SKILL.md 必须按已确认顺序且仅保留四个二级章节"
+    );
+
+    let trigger_section =
+        markdown_level_two_section(body, "## 每次触发").expect("SKILL.md 必须包含每次触发章节");
+    let trigger_steps = trigger_section
+        .lines()
+        .filter_map(|line| {
+            let (number, instruction) = line.split_once(". ")?;
+            let number = number.parse::<usize>().ok()?;
             assert!(
-                flow.contains(required_heading),
-                "{flow_heading} 缺少统一章节 {required_heading}"
+                !instruction.trim().is_empty(),
+                "每次触发的第 {number} 步不得为空"
             );
-        }
-        let linked_documents = directly_linked_local_files(&skill_path, flow);
-        for relative_path in required_documents {
-            let expected_path = canonicalize_for_contract(&workspace_root().join(relative_path));
-            assert!(
-                linked_documents.contains(&expected_path),
-                "{flow_heading} 必须直接链接权威文档 {relative_path}"
-            );
-        }
+            Some(number)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        trigger_steps,
+        (1..=6).collect::<Vec<_>>(),
+        "每次触发必须恰好包含连续有序的 1–6 六步"
+    );
+
+    let route_section = markdown_level_two_section(body, "## 状态路由与必读资料")
+        .expect("SKILL.md 必须包含状态路由与必读资料章节");
+    let route_rows = route_section
+        .lines()
+        .filter(|line| line.starts_with("| ") && !line.starts_with("| 当前状态 "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        route_rows.len(),
+        RPG_MAKER_SKILL_ROUTES.len(),
+        "状态路由表必须恰好包含八行状态"
+    );
+    for (row, (expected_state, required_documents)) in
+        route_rows.into_iter().zip(RPG_MAKER_SKILL_ROUTES)
+    {
+        let (state, _) = row
+            .trim_matches('|')
+            .split_once('|')
+            .expect("状态路由表每行必须包含状态与必读资料两列");
+        assert_eq!(
+            state.trim(),
+            expected_state,
+            "状态路由表的八行状态必须保持已确认顺序"
+        );
+
+        let linked_documents = directly_linked_local_files(&skill_path, row);
+        let expected_documents = required_documents
+            .iter()
+            .map(|relative_path| canonicalize_for_contract(&workspace_root().join(relative_path)))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            linked_documents, expected_documents,
+            "状态 {expected_state} 必须直接且仅链接对应的权威文档"
+        );
     }
 
     let interface_path = skill_root.join("agents/openai.yaml");
@@ -460,6 +498,63 @@ fn rpg_maker_skill_is_directly_reachable_and_links_every_authoritative_document(
         assert!(
             linked_documents.contains(&expected_path),
             "SKILL.md 必须直接链接权威文档 {relative_path}"
+        );
+    }
+}
+
+#[test]
+fn sensitive_information_members_have_one_authority_and_are_only_linked_elsewhere() {
+    let authority_path = workspace_root().join("docs/runtime/chat-completions.md");
+    let canonical_authority_path = canonicalize_for_contract(&authority_path);
+    let authority_anchor = "6-敏感信息闭集唯一权威";
+    let authority_source = read_utf8(&authority_path).replace("\r\n", "\n");
+    let authority_section =
+        markdown_level_two_section(&authority_source, "## 6. 敏感信息闭集唯一权威")
+            .expect("Chat Completions 规格必须保留敏感信息闭集唯一权威章节");
+    let normalized_authority = authority_section
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sensitive_member = normalized_authority
+        .split_once("闭集只有")
+        .and_then(|(_, remainder)| remainder.split_once('。'))
+        .map(|(member, _)| member.trim())
+        .filter(|member| !member.is_empty())
+        .expect("敏感信息权威章节必须明确闭集成员");
+
+    for relative_path in [
+        "AGENTS.md",
+        "docs/runtime/project-log.md",
+        "docs/rpg-maker/task-records.md",
+        "skills/translate-rpg-maker-with-att/SKILL.md",
+    ] {
+        let path = workspace_root().join(relative_path);
+        let source = read_utf8(&path).replace("\r\n", "\n");
+        let authority_links = local_markdown_links(&source)
+            .into_iter()
+            .filter(|(_, target)| {
+                let Some((file_target, anchor)) = target.split_once('#') else {
+                    return false;
+                };
+                if anchor != authority_anchor {
+                    return false;
+                }
+                let linked_path = path
+                    .parent()
+                    .expect("Markdown 文件始终有父目录")
+                    .join(file_target);
+                canonicalize_for_contract(&linked_path) == canonical_authority_path
+            })
+            .count();
+        assert_eq!(
+            authority_links, 1,
+            "{relative_path} 必须恰好一次直链敏感信息闭集唯一权威及其锚点"
+        );
+
+        let normalized_source = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !normalized_source.contains(sensitive_member),
+            "{relative_path} 只能引用敏感信息权威，不得复述闭集成员"
         );
     }
 }
