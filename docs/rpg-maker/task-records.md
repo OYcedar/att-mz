@@ -2,7 +2,7 @@
 
 ## 1. 目的、范围与开关
 
-任务记录是供人工和 Agent 排查问题的 Markdown 文件。一个文件包含一个 TaskBlock 的最终
+任务记录是用于排查翻译问题的 Markdown 文件。一个文件包含一个 TaskBlock 的最终
 输入、全部请求尝试、模型输出、每个 ID 的译文检查结果和数据库写入结果。只有模型协议和
 数据库写入都由 ATT 完整管理时，ATT 才能生成这样的记录。它覆盖 RPG Maker Standard 与
 Lua Managed，不是逐次 HTTP 抓包，也不用于恢复、重放或判断项目数据库状态。
