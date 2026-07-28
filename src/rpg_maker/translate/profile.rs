@@ -74,29 +74,47 @@ impl Error for RpgMakerSystemPromptError {}
 
 /// 项目打开后为其精确语言对一次性解析出的 RPG Maker 翻译资源。
 ///
-/// Planner 与 Executor 必须共享同一个实例；两者不得重新查询语言目录或选择 Prompt。
+/// Standard 与 Managed 必须显式选择自己的最终 Prompt；两者不得重新查询语言目录、装配
+/// Prompt 或借用另一条执行路径的 Prompt。
 pub(crate) struct ResolvedRpgMakerTranslationResources {
-    system_prompt: RpgMakerSystemPrompt,
+    standard_system_prompt: RpgMakerSystemPrompt,
+    managed_system_prompt: RpgMakerSystemPrompt,
     source_language: Arc<dyn LanguageModule>,
 }
 
 impl ResolvedRpgMakerTranslationResources {
     pub(crate) fn new(
-        system_prompt: RpgMakerSystemPrompt,
+        standard_system_prompt: RpgMakerSystemPrompt,
+        managed_system_prompt: RpgMakerSystemPrompt,
         source_language: Arc<dyn LanguageModule>,
     ) -> Self {
+        assert_eq!(
+            standard_system_prompt.language_pair(),
+            managed_system_prompt.language_pair(),
+            "Standard 与 Managed Prompt 必须绑定同一个项目语言对"
+        );
+        assert_eq!(
+            standard_system_prompt.response_envelope(),
+            managed_system_prompt.response_envelope(),
+            "Standard 与 Managed Prompt 必须绑定同一个响应信封"
+        );
         Self {
-            system_prompt,
+            standard_system_prompt,
+            managed_system_prompt,
             source_language,
         }
     }
 
     pub(crate) fn language_pair(&self) -> &LanguagePair {
-        self.system_prompt.language_pair()
+        self.standard_system_prompt.language_pair()
     }
 
-    pub(crate) fn system_prompt(&self) -> &RpgMakerSystemPrompt {
-        &self.system_prompt
+    pub(crate) fn standard_system_prompt(&self) -> &RpgMakerSystemPrompt {
+        &self.standard_system_prompt
+    }
+
+    pub(crate) fn managed_system_prompt(&self) -> &RpgMakerSystemPrompt {
+        &self.managed_system_prompt
     }
 
     pub(crate) fn source_language(&self) -> Arc<dyn LanguageModule> {
@@ -109,7 +127,8 @@ impl fmt::Debug for ResolvedRpgMakerTranslationResources {
         formatter
             .debug_struct("ResolvedRpgMakerTranslationResources")
             .field("language_pair", self.language_pair())
-            .field("system_prompt", &self.system_prompt)
+            .field("standard_system_prompt", &self.standard_system_prompt)
+            .field("managed_system_prompt", &self.managed_system_prompt)
             .field("source_language", &"dyn LanguageModule")
             .finish()
     }
@@ -323,12 +342,14 @@ mod tests {
             TranslationResponseEnvelope::JsonOnly,
         )
         .unwrap();
-        let resources = ResolvedRpgMakerTranslationResources::new(prompt, Arc::clone(&module));
+        let resources =
+            ResolvedRpgMakerTranslationResources::new(prompt.clone(), prompt, Arc::clone(&module));
 
         assert_eq!(resources.language_pair(), &language_pair());
-        assert_eq!(resources.system_prompt().markdown(), "system");
+        assert_eq!(resources.standard_system_prompt().markdown(), "system");
+        assert_eq!(resources.managed_system_prompt().markdown(), "system");
         assert_eq!(
-            resources.system_prompt().response_envelope(),
+            resources.standard_system_prompt().response_envelope(),
             TranslationResponseEnvelope::JsonOnly
         );
         assert!(Arc::ptr_eq(&resources.source_language(), &module));

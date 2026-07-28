@@ -6,6 +6,34 @@
 mod kernel;
 mod lua;
 
+/// Managed `reflow` 在 user message 中使用的固定输入标记。
+pub(crate) const MANAGED_REFLOW_WIRE_MARKER: &str = "single string, LF allowed";
+
+/// 追加到具体引擎 Prompt 后的 Managed 机器协议。
+///
+/// 该片段由 Managed 模块维护，避免把只适用于 Managed shape 的模型协议复制到各 locale
+/// 资源。具体引擎仍负责提供翻译方向、质量要求、共同使用的 JSON 信封与其他 shape 规则。
+pub(crate) fn managed_translation_system_prompt_fragment() -> String {
+    [
+        "# ATT Managed translation extension\n\n",
+        "This section applies only to ATT Managed translation TaskBlocks. ",
+        "For the exact input marker `",
+        MANAGED_REFLOW_WIRE_MARKER,
+        "`, these rules override any shared ",
+        "rule that forbids LF inside a JSON string:\n\n",
+        "- Return the ID exactly once in the top-level JSON object. Its value must be an array ",
+        "containing exactly one non-blank JSON string; never split the result into multiple array ",
+        "elements.\n",
+        "- An LF in the decoded string is allowed and must be encoded as `\\n` in the JSON text. ",
+        "CR and NUL are forbidden.\n",
+        "- ATT tokens may move only between LF-delimited segments within that same ID. They must ",
+        "never move to another ID.\n",
+        "- When a thinking requirement follows this section, the `<why>` analysis must cover this ",
+        "marker's one-element shape, LF placement, and ATT-token placement.",
+    ]
+    .concat()
+}
+
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;

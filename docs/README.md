@@ -1,20 +1,20 @@
 # ATT 文档
 
-本目录保存 ATT 当前产品知识：现行规格定义已经确认的外部契约，指南解释如何调查事实、
-选择机制和验证单件工件。文档能够独立阅读和审查，不依赖某个执行入口才能成立。
+本目录说明 ATT 当前已经确定的产品行为和外部接口。现行规格定义产品承诺，指南说明如何
+调查项目、选择功能和验证文件或配置。每份文档都应能够独立阅读和审查。
 
-## 事实源分工与权重
+## 各类资料分别负责什么
 
-- [AGENTS.md](../AGENTS.md)保存长期产品方向、架构判断方法、知识治理与同步门禁。
-- 标题标明“现行规格”的文档拥有当前产品与外部接口契约。指南、代码或测试与现行规格
-  冲突时，应修复冲突材料，不要求使用者从实现中猜测另一套契约。
-- 指南拥有调查方法、机制选择依据和验证方法，不重复定义现行规格中的命令、字段、
+- [AGENTS.md](../AGENTS.md)说明长期产品方向、架构判断原则以及文档和代码的更新要求。
+- 标题标明“现行规格”的文档完整定义当前产品行为与外部接口。指南、代码或测试与现行
+  规格冲突时，应修复不一致的内容，不能要求使用者从实现中猜测另一套规则。
+- 指南说明调查方法、功能选择依据和验证方法，不重复定义现行规格中的命令、字段、
   schema 或错误语义。
-- 代码和测试保存已经实现的行为与验证证据，不能反向覆盖已确认的现行契约。
-- 代表性真实材料、权威说明和验证记录用于证明领域事实与能力是否成立。
+- 代码和测试记录已经实现的行为与验证结果，不能自行改变现行规格。
+- 真实项目材料、产品说明和验证记录用于确认事实与功能是否成立。
 
-同一事实只由一个位置拥有。其他材料通过链接消费它；发现知识缺口时，先补充其语义
-所有者，再更新相关导航、执行入口和验证。
+同一项产品规则只在一个位置完整说明，其他文档通过链接引用。发现缺少说明时，先补充
+负责这项规则的文档，再更新相关导航、调用位置和测试。
 
 ## 当前产品范围
 
@@ -24,22 +24,22 @@ ATT 当前实现的游戏领域只有 **RPG Maker**，该领域目前只包含 *
 
 ## 文档导航
 
-### RPG Maker 调查与工件知识
+### RPG Maker 项目调查与配置制作
 
-- [调查与机制选择指南](rpg-maker/README.md)：从实际消费者确认游戏事实、文本载体、
-  Builtin/Rules/Lua 能力边界、覆盖证据和高级数据库边界。
-- [规则文件现行规格与编写指南](rpg-maker/rules.md)：MV 姓名投影、Extract Rules 与
-  Placeholder Rules 的契约、示例和单件验证。
+- [调查与机制选择指南](rpg-maker/README.md)：从游戏运行时实际读取的位置确认项目事实、
+  文本位置、Builtin/Rules/Lua 能力边界、覆盖证据和高级数据库接口边界。
+- [规则文件现行规格与编写指南](rpg-maker/rules.md)：MV 姓名映射、Extract Rules 与
+  Placeholder Rules 的契约、示例和单项验证。
 - [术语文件现行规格与制作指南](rpg-maker/terminology.md)：从真实语料提炼稳定术语，
   并验证当前 Terminology TOML。
-- [系统提示词编写指南](rpg-maker/prompts.md)：Prompt locale、模板、模型信封、ATT
-  token 与协议失败边界。
+- [Prompt 资源与模型协议现行规格及编写指南](rpg-maker/prompts.md)：Prompt locale、
+  模板、模型消息、响应信封、JSON wire、ID、ATT token 与协议失败时的处理方式。
 - [初始化现行规格](rpg-maker/init.md)
 - [文本提取现行规格](rpg-maker/extraction.md)
 - [翻译现行规格](rpg-maker/translation.md)
 - [翻译任务记录现行规格](rpg-maker/task-records.md)
 - [写回现行规格](rpg-maker/write-back.md)
-- [可信 Lua 现行规格](rpg-maker/lua.md)
+- [Lua 现行规格](rpg-maker/lua.md)
 - [Lua Cookbook](rpg-maker/lua-cookbook.md)
 - [当前示例索引](rpg-maker/examples/README.md)
 
@@ -49,6 +49,6 @@ ATT 当前实现的游戏领域只有 **RPG Maker**，该领域目前只包含 *
 - [生产配置现行规格](runtime/configuration.md)
 - [运行时与 CLI 现行规格](runtime/cli.md)
 - [普通项目日志现行规格](runtime/project-log.md)
-- [Chat Completions 运行根现行规格](runtime/chat-completions.md)
+- [Chat Completions 现行规格](runtime/chat-completions.md)
 - [SQLite 运行时现行规格](runtime/sqlite.md)
 - [Windows 文件能力与可恢复目录发布现行规格](runtime/directory-publishing.md)

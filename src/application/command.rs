@@ -29,6 +29,7 @@ use crate::diagnostic::{
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_label};
 use crate::language::LanguageModuleCatalogError;
+use crate::managed_translation::managed_translation_system_prompt_fragment;
 use crate::progress::{
     ProgressAmount, ProgressMode, ProgressObserver, ProgressSnapshot, TerminalProgress,
     TerminalProgressObserver,
@@ -5177,6 +5178,27 @@ fn ensure_no_prompt_template_variables(text: &str) -> Result<(), PromptTemplateE
     Ok(())
 }
 
+fn assemble_rpg_maker_system_prompt_markdown(
+    rendered_system: String,
+    thinking: Option<&str>,
+) -> (String, String, TranslationResponseEnvelope) {
+    let mut standard = rendered_system.clone();
+    let mut managed = rendered_system;
+    managed.push_str("\n\n");
+    managed.push_str(&managed_translation_system_prompt_fragment());
+
+    let response_envelope = if let Some(thinking) = thinking {
+        standard.push_str("\n\n");
+        standard.push_str(thinking);
+        managed.push_str("\n\n");
+        managed.push_str(thinking);
+        TranslationResponseEnvelope::ThinkingThenJson
+    } else {
+        TranslationResponseEnvelope::JsonOnly
+    };
+    (standard, managed, response_envelope)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PromptTemplateError {
     InvalidSyntax,
@@ -5276,6 +5298,40 @@ mod prompt_template_tests {
                 Err(PromptTemplateError::VariablesNotAllowed)
             );
         }
+    }
+
+    #[test]
+    fn standard_and_managed_prompts_have_exact_json_only_assembly() {
+        let (standard, managed, envelope) =
+            assemble_rpg_maker_system_prompt_markdown("rendered system".to_owned(), None);
+
+        assert_eq!(standard, "rendered system");
+        assert_eq!(
+            managed,
+            format!(
+                "rendered system\n\n{}",
+                managed_translation_system_prompt_fragment()
+            )
+        );
+        assert_eq!(envelope, TranslationResponseEnvelope::JsonOnly);
+    }
+
+    #[test]
+    fn standard_and_managed_prompts_have_exact_thinking_assembly() {
+        let (standard, managed, envelope) = assemble_rpg_maker_system_prompt_markdown(
+            "rendered system".to_owned(),
+            Some("thinking requirement"),
+        );
+
+        assert_eq!(standard, "rendered system\n\nthinking requirement");
+        assert_eq!(
+            managed,
+            format!(
+                "rendered system\n\n{}\n\nthinking requirement",
+                managed_translation_system_prompt_fragment()
+            )
+        );
+        assert_eq!(envelope, TranslationResponseEnvelope::ThinkingThenJson);
     }
 }
 
@@ -5416,7 +5472,7 @@ async fn build_production_translation_profile(
                 source,
             )
         })?;
-    let mut markdown =
+    let rendered_system =
         render_system_prompt_template(&system_template, &language_pair).map_err(|source| {
             ProductionTranslationExecutionBuildError::prompt_template(
                 prompt_locale,
@@ -5425,7 +5481,7 @@ async fn build_production_translation_profile(
                 source,
             )
         })?;
-    let response_envelope = if configuration.thinking_output() {
+    let thinking = if configuration.thinking_output() {
         let thinking_path = prompt_directory.join(THINKING_PROMPT_FILE_NAME);
         let thinking = read_prompt_resource(file_system, &thinking_path)
             .await
@@ -5445,23 +5501,32 @@ async fn build_production_translation_profile(
                 source,
             )
         })?;
-        markdown.push_str("\n\n");
-        markdown.push_str(&thinking);
-        TranslationResponseEnvelope::ThinkingThenJson
+        Some(thinking)
     } else {
-        TranslationResponseEnvelope::JsonOnly
+        None
     };
-    let system_prompt =
-        RpgMakerSystemPrompt::new(language_pair.clone(), markdown, response_envelope).map_err(
-            |source| {
+    let (standard_markdown, managed_markdown, response_envelope) =
+        assemble_rpg_maker_system_prompt_markdown(rendered_system, thinking.as_deref());
+    let standard_system_prompt =
+        RpgMakerSystemPrompt::new(language_pair.clone(), standard_markdown, response_envelope)
+            .map_err(|source| {
                 ProductionTranslationExecutionBuildError::system_prompt(
                     prompt_locale,
                     PromptResourceComponent::System,
                     &system_path,
                     source,
                 )
-            },
-        )?;
+            })?;
+    let managed_system_prompt =
+        RpgMakerSystemPrompt::new(language_pair.clone(), managed_markdown, response_envelope)
+            .map_err(|source| {
+                ProductionTranslationExecutionBuildError::system_prompt(
+                    prompt_locale,
+                    PromptResourceComponent::System,
+                    &system_path,
+                    source,
+                )
+            })?;
     let source_language = configuration
         .language_modules()
         .resolve(language_pair.source())
@@ -5469,7 +5534,8 @@ async fn build_production_translation_profile(
             ProductionTranslationExecutionBuildError::language_module(&language_pair, source)
         })?;
     let translation_resources = Arc::new(ResolvedRpgMakerTranslationResources::new(
-        system_prompt,
+        standard_system_prompt,
+        managed_system_prompt,
         source_language,
     ));
     let planning = RpgMakerTranslationPlanningConfiguration::new(
@@ -5522,7 +5588,7 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             placeholders,
             self.cpu.clone(),
         );
-        let response_envelope = translation_resources.system_prompt().response_envelope();
+        let managed_system_prompt = translation_resources.managed_system_prompt().clone();
         let processor =
             TranslationTaskResponseProcessingService::new(self.cpu.clone(), translation_resources);
         let executor = RpgMakerStandardTranslationTaskExecutionService::<
@@ -5564,7 +5630,7 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
                 ManagedTranslationSqliteRepository::new(self.sqlite.clone()),
                 profile.planning().clone(),
                 profile.request().clone(),
-                response_envelope,
+                managed_system_prompt.clone(),
                 self.task_records.clone(),
                 self.cancellation.clone(),
             )

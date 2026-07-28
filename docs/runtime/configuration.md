@@ -29,7 +29,7 @@ Profile 引用的 Client。
 后的重复 ID。
 
 配置错误展示配置路径、一基行列、字段和具体原因，并采用
-[Chat Completions 运行根规格规定的敏感信息边界](chat-completions.md#6-敏感信息闭集唯一权威)。
+[Chat Completions 规格规定的敏感信息边界](chat-completions.md#6-敏感信息闭集唯一权威)。
 稳定配置诊断不复制完整 `parameters` 或配置正文，以维持结构化 schema 与可读体积；
 该输出边界不构成敏感性分类。语法、缺失字段、未知字段、重复字段、类型不符和值不符是
 互斥的结构化失败；类型不符同时展示当前字段契约要求的字符串、整数、布尔、数组或表形态。
@@ -89,8 +89,8 @@ burst = 8
 ```
 
 `rate_limit` 整表可省略，表示供应商没有已知的本地限速要求。存在时两个值都必须为正。
-等待活动许可或 RPM 只形成背压并响应取消，不产生本地队列满或准入超时错误，也不计为
-模型失败或重试。
+等待活动许可或 RPM 时，请求会留在本地等待并响应取消，不产生本地队列已满或等待超时
+错误，也不计为模型失败或重试。
 
 `proxy` 只能是 `false` 或不含凭据的代理 URL。附加 PEM 文件在配置加载后读取并交给
 HTTP Client。`parameters` 必须是完整 JSON 对象，递归拒绝重复键，并且顶层不得包含
@@ -126,69 +126,50 @@ llm_client = "primary"
 target_task_user_message_characters = 24000
 ```
 
-`record_translation_tasks` 是可省略的布尔值，默认 `false`，只有 Translate 消费。开启后
-为本轮已启动的 Standard TaskBlock 和 `ctx.translations.translate()` 建立的 Managed
-TaskBlock 写入可读 Markdown；低级 `ctx.llm` 不生成记录。它不属于某个 Client，不进入
-翻译 state、保存的运行方案或项目数据库。固定路径、run-wide 编号、内容模板、精确替换
-和非阻断写入语义见[翻译任务记录现行规格](../rpg-maker/task-records.md)。
+`[prompts]` 是 Translate 必需的配置表，只允许三个必填字段：`root` 是路径字符串，
+`locale` 是 locale 字符串，`thinking_output` 是布尔值。缺失字段、未知字段或错误类型
+都是配置输入错误；相对 `root` 按本文第 2 节规定，从配置文件所在目录解析。配置通过校验后，
+locale 如何选择资源、文件需要满足什么条件、system message 如何装配以及模型协议是什么，
+由 [Prompt 资源与模型协议现行规格](../rpg-maker/prompts.md)规定。
 
-Profile 只拥有 ATT 托管 TaskBlock 最终 user message 的 Unicode 字符装箱目标和 Client
-引用。Standard Planner 按完整组、Managed Planner 按完整 unit 对实际渲染结果计数；
-加入下一个原子会超过目标时，只在对应边界开始下一任务。单个不可拆分组或 unit 本身
-超过目标时独立成为一个任务，实际字符数允许超过目标，翻译继续；这不会拆原子、拒绝
-规范内容或抬高后续任务的装箱目标。
+`record_translation_tasks` 是可省略的布尔值，默认 `false`，只有 Translate 读取。
+开启后的记录范围、文件内容、编号、写入失败处理和其他行为，由
+[翻译任务记录现行规格](../rpg-maker/task-records.md)规定。
 
-该目标不包含 system message、请求外壳或模型输出，也不是 Provider 上下文或请求容量
-上限。Profile 不拥有 worker、任务在途数、planning/execution 包装或重试副本。Standard
-与 Managed 都使用所选 Client 的 `max_concurrent_requests`、超时、速率限制、
-`retry_delays_ms` 和 `max_retry_after_ms`；活动 HTTP 宽度为 N，内部有界在途/重排宽度
-为 3N。这些执行策略由程序拥有，不进入配置。
+每个 `[[rpg_maker.translation_profiles]]` 必须提供非空 `id`、引用现有 Client 的
+`llm_client`，以及正整数 `target_task_user_message_characters`。该字符数如何用于
+Standard Group 和 Managed unit 的 TaskBlock 分组，由
+[翻译现行规格](../rpg-maker/translation.md#5-任务规划与模型消息)规定。
 
-Lua 托管翻译高级接口不增加配置字段。它复用项目 engine/语言对、当前 Prompt、
-`thinking_output`、Profile 装箱目标、术语、Placeholder、Client 并发/重试和
-`record_translation_tasks`。collection instruction、unit context、kind、shape 与
-metadata 属于 Extract 声明；内部 worker、重排窗口、提交批次和 checkpoint 事务也不
-转嫁为用户配置。高级契约不能表达的私有协议由 Lua 显式使用低级接口，不以配置开关
-触发自动降级。
+Lua Managed API 不增加配置字段。它使用哪些现有翻译设置，以及何时需要改用低级 API，
+由 [Lua 现行规格](../rpg-maker/lua.md#72-ctxtranslationstranslateopen)规定。内部 worker、
+同时处理的任务数量、重排窗口和 checkpoint 事务不是用户配置。
 
-`prompts.locale = "auto"` 复用本进程已经解析的 UI locale；显式值按现有 UI i18n 规则
-规范化。资源路径固定为：
+Prompt locale、资源路径、文件读取条件与消息装配只由
+[Prompt 资源与模型协议现行规格](../rpg-maker/prompts.md)规定。Translate 验证全部
+`[[languages]]`，然后按项目 metadata 的规范 LanguagePair 精确选择源语言模块。
 
-```text
-<prompts.root>/rpg_maker/<locale>/system.md
-<prompts.root>/rpg_maker/<locale>/thinking.md
-```
+## 5. 不属于配置的运行时行为
 
-`system.md` 始终读取；只有 `thinking_output = true` 才读取 `thinking.md`。资源只按上述
-精确路径选择。Translate 验证全部 `[[languages]]`，然后按项目 metadata 的规范
-LanguagePair 精确选择源语言模块。
+线程、worker、内部任务窗口、队列、批次、缓存、SQLite 工作方式、锁等待、日志路径、
+任务记录路径和任务完成顺序都不是 `config.toml` 字段。各项当前行为分别由以下文档规定：
 
-## 5. 程序拥有的运行时策略
+- 线程、worker、内部容量和项目总量：[运行时导航](README.md#哪些值不能配置)；
+- Translate 的并发和提交顺序：[翻译现行规格](../rpg-maker/translation.md#9-并发提交与任务结果)；
+- SQLite 设置和等待方式：[SQLite 现行规格](sqlite.md)；
+- 项目日志：[普通项目日志现行规格](project-log.md)；
+- 翻译任务记录：[翻译任务记录现行规格](../rpg-maker/task-records.md)；
+- 项目锁和目录发布：[目录发布现行规格](directory-publishing.md)。
 
-下列事实固定由当前实现和真实性能测试拥有：
-
-- Tokio 使用操作系统可用并行度；探测失败明确启动失败；
-- CPU 密集型工作使用命令私有 Rayon 池；
-- 文件与 SQLite 短操作使用程序选择的有限 worker，饱和时自然等待；
-- SQLite 固定使用 WAL + FULL；
-- 项目锁、发布锁和 SQLite busy 不设置任意截止时间；
-- 日志固定写入项目工作区的 `logs/<run-id>.jsonl`；
-- 启用翻译任务记录时固定写入同一 RunId 的
-  `task-records/<run-id>/task-000001.md`，稳定 ordinal 与完整格式由任务记录规格规定；
-- 文档、规则、Group、任务和不同物理文件在不破坏确定性的前提下并行；
-- 自然顺序、代表选择、提交顺序和最终主错误不受完成顺序影响。
-
-这些策略不形成项目总量上限。ATT 不比较文件字节数、目录项、目录深度、目录总字节、
-Lua 值大小或复杂度、SQLite 查询组/行/结果字节以及 Claim、Unit、Group、Task 总数。
-规范输入只会因真实文件系统、操作系统、地址空间、内存、SQLite、外部协议或格式错误
-失败，并报告实际底层原因。
+配置中也没有用于限制文件、目录、Lua、SQLite 结果、Claim、Unit、Group 或 Task 总量的
+字段。超出真实文件系统、操作系统、内存、SQLite、外部协议或数据格式能力时，程序报告
+实际失败原因。
 
 ## 6. 运行方案
 
-运行方案不写入生产配置：Init 来源、Extract owner 集合、Translate Profile 和 WriteBack
-Lua 选择属于项目数据库。Rules 保存 canonical 语义；Lua 保存阶段正文快照、指纹和无损
-路径。保存的 Profile 在当前配置中不存在时明确失败，不选择其他 Profile。独立项目
-`lua` 命令每次读取显式脚本，Profile 只服务本次 Standard 会话，因此两者都不增加配置
-分区或运行方案。
+Init 来源、Extract owner 集合、Translate Profile 和 WriteBack Lua 选择属于项目中保存的
+运行方案，不是生产配置字段。各命令何时保存、复用或清除这些值，以及保存的 Profile
+不存在时如何失败，由 [CLI 与运行方案现行规格](cli.md)规定。独立项目 `lua` 命令同样
+不会因此增加配置分区。
 
 解析器只实现本规格列出的当前字段和语义；其他内容按普通无效输入处理。

@@ -55,11 +55,13 @@ use crate::rpg_maker::managed_translation::{
 };
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::text::TextGroupKind;
+#[cfg(test)]
 use crate::translation_protocol::TranslationResponseEnvelope;
 
 use super::lua::ManagedLuaTranslationFactory;
 use super::profile::{
-    RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationRequestConfiguration,
+    RpgMakerSystemPrompt, RpgMakerTranslationPlanningConfiguration,
+    RpgMakerTranslationRequestConfiguration,
 };
 use super::standard::{
     StandardTranslationLog, StandardTranslationLogEvent, StandardTranslationLogTaskOutcome,
@@ -83,7 +85,7 @@ pub(crate) struct ManagedTranslationService<L, D, C, S, K> {
     repository: S,
     planning: RpgMakerTranslationPlanningConfiguration,
     request: RpgMakerTranslationRequestConfiguration,
-    response_envelope: TranslationResponseEnvelope,
+    managed_system_prompt: RpgMakerSystemPrompt,
     task_records: K,
     task_log: Option<Arc<dyn StandardTranslationLog>>,
     cancellation: CooperativeCancellation,
@@ -98,7 +100,7 @@ impl<L, D, C, S, K> ManagedTranslationService<L, D, C, S, K> {
         repository: S,
         planning: RpgMakerTranslationPlanningConfiguration,
         request: RpgMakerTranslationRequestConfiguration,
-        response_envelope: TranslationResponseEnvelope,
+        managed_system_prompt: RpgMakerSystemPrompt,
         task_records: K,
         cancellation: CooperativeCancellation,
     ) -> Self {
@@ -109,7 +111,7 @@ impl<L, D, C, S, K> ManagedTranslationService<L, D, C, S, K> {
             repository,
             planning,
             request,
-            response_envelope,
+            managed_system_prompt,
             task_records,
             task_log: None,
             cancellation,
@@ -149,7 +151,7 @@ where
             repository: self.repository.clone(),
             planning: self.planning.clone(),
             request: self.request.clone(),
-            response_envelope: self.response_envelope,
+            managed_system_prompt: self.managed_system_prompt.clone(),
             task_records: self.task_records.clone(),
             task_log: self.task_log.clone(),
             cancellation: self.cancellation.clone(),
@@ -173,7 +175,7 @@ where
     repository: S,
     planning: RpgMakerTranslationPlanningConfiguration,
     request: RpgMakerTranslationRequestConfiguration,
-    response_envelope: TranslationResponseEnvelope,
+    managed_system_prompt: RpgMakerSystemPrompt,
     task_records: K,
     task_log: Option<Arc<dyn StandardTranslationLog>>,
     cancellation: CooperativeCancellation,
@@ -214,7 +216,7 @@ where
             repository: self.repository.clone(),
             planning: self.planning.clone(),
             request: self.request.clone(),
-            response_envelope: self.response_envelope,
+            managed_system_prompt: self.managed_system_prompt.clone(),
             task_records: self.task_records.clone(),
             task_log: self.task_log.clone(),
             cancellation: self.cancellation.clone(),
@@ -271,7 +273,7 @@ where
     repository: S,
     planning: RpgMakerTranslationPlanningConfiguration,
     request: RpgMakerTranslationRequestConfiguration,
-    response_envelope: TranslationResponseEnvelope,
+    managed_system_prompt: RpgMakerSystemPrompt,
     task_records: K,
     task_log: Option<Arc<dyn StandardTranslationLog>>,
     cancellation: CooperativeCancellation,
@@ -284,6 +286,7 @@ where
 #[derive(Clone)]
 struct RpgManagedSemanticsAdapter {
     semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+    managed_system_prompt: RpgMakerSystemPrompt,
 }
 
 impl RootManagedSemantics for RpgManagedSemanticsAdapter {
@@ -292,7 +295,7 @@ impl RootManagedSemantics for RpgManagedSemanticsAdapter {
     }
 
     fn system_prompt(&self) -> &str {
-        self.semantics.system_prompt()
+        self.managed_system_prompt.markdown()
     }
 
     fn source_language(&self) -> &str {
@@ -670,7 +673,7 @@ where
             self.planning.target_user_message_characters().get(),
             self.request.network_retry_delays().to_vec(),
             self.request.max_network_retry_after(),
-            self.response_envelope,
+            self.managed_system_prompt.response_envelope(),
             self.standard_task_count,
         );
         let store = RpgManagedStoreAdapter {
@@ -683,6 +686,7 @@ where
         };
         let semantics: Arc<dyn RootManagedSemantics> = Arc::new(RpgManagedSemanticsAdapter {
             semantics: self.semantics,
+            managed_system_prompt: self.managed_system_prompt,
         });
         let kernel = RootManagedKernel::new(
             self.llm,
@@ -1507,6 +1511,15 @@ mod tests {
         )
     }
 
+    fn test_managed_system_prompt(project: &OpenedProject) -> RpgMakerSystemPrompt {
+        RpgMakerSystemPrompt::new(
+            project.language_pair().clone(),
+            "managed system".to_owned(),
+            TranslationResponseEnvelope::JsonOnly,
+        )
+        .expect("测试 Managed Prompt 应合法")
+    }
+
     fn assert_failure(
         diagnostic: &SafeDiagnostic,
         expected_code: DiagnosticCode,
@@ -1727,6 +1740,7 @@ mod tests {
     #[tokio::test]
     async fn translate_stale_snapshot_fails_before_any_llm_request() {
         let llm_calls = Arc::new(AtomicUsize::new(0));
+        let project = project();
         let execution = BoundManagedTranslationExecution {
             llm: CountingLlm {
                 calls: Arc::clone(&llm_calls),
@@ -1736,11 +1750,11 @@ mod tests {
             repository: StaleRepository,
             planning: RpgMakerTranslationPlanningConfiguration::new(NonZeroUsize::MIN),
             request: RpgMakerTranslationRequestConfiguration::new(Vec::new(), Duration::ZERO),
-            response_envelope: TranslationResponseEnvelope::JsonOnly,
+            managed_system_prompt: test_managed_system_prompt(&project),
             task_records: NoOpTranslationTaskRecordSink,
             task_log: None,
             cancellation: CooperativeCancellation::default(),
-            project: project(),
+            project,
             llm_client: Arc::new(SnapshotGateClient),
             semantics: Arc::new(FakeSemantics),
             standard_task_count: 0,
@@ -1830,7 +1844,7 @@ mod tests {
             },
             planning: RpgMakerTranslationPlanningConfiguration::new(NonZeroUsize::MIN),
             request: RpgMakerTranslationRequestConfiguration::new(Vec::new(), Duration::ZERO),
-            response_envelope: TranslationResponseEnvelope::JsonOnly,
+            managed_system_prompt: test_managed_system_prompt(&project),
             task_records: NoOpTranslationTaskRecordSink,
             task_log: None,
             cancellation: CooperativeCancellation::default(),

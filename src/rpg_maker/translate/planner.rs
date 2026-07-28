@@ -120,7 +120,7 @@ where
         }
         let system_markdown = self
             .translation_resources
-            .system_prompt()
+            .standard_system_prompt()
             .markdown()
             .to_owned();
         let source_language = self.translation_resources.source_language();
@@ -2833,7 +2833,11 @@ mod tests {
         let prompt =
             RpgMakerSystemPrompt::new(pair, system_markdown, TranslationResponseEnvelope::JsonOnly)
                 .expect("测试 Prompt 应合法");
-        Arc::new(ResolvedRpgMakerTranslationResources::new(prompt, module))
+        Arc::new(ResolvedRpgMakerTranslationResources::new(
+            prompt.clone(),
+            prompt,
+            module,
+        ))
     }
 
     fn translation_resources() -> Arc<ResolvedRpgMakerTranslationResources> {
