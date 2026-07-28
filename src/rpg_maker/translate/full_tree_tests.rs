@@ -870,7 +870,11 @@ fn translation_resources() -> Arc<ResolvedRpgMakerTranslationResources> {
         TranslationResponseEnvelope::JsonOnly,
     )
     .expect("测试 Prompt 应合法");
-    Arc::new(ResolvedRpgMakerTranslationResources::new(prompt, japanese))
+    Arc::new(ResolvedRpgMakerTranslationResources::new(
+        prompt.clone(),
+        prompt,
+        japanese,
+    ))
 }
 
 fn event_position(events: &[Event], predicate: impl Fn(&Event) -> bool) -> usize {

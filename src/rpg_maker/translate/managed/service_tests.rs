@@ -415,6 +415,7 @@ struct ScriptedLlmState {
     scripts: Vec<UnitRequestScript>,
     attempts: Mutex<Vec<usize>>,
     started_units: Mutex<Vec<usize>>,
+    system_prompts: Mutex<Vec<String>>,
     started_count: AtomicUsize,
     completed_count: AtomicUsize,
     active: AtomicUsize,
@@ -436,6 +437,7 @@ impl ScriptedLlm {
                 scripts,
                 attempts: Mutex::new(vec![0; unit_count]),
                 started_units: Mutex::new(Vec::new()),
+                system_prompts: Mutex::new(Vec::new()),
                 started_count: AtomicUsize::new(0),
                 completed_count: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
@@ -460,6 +462,14 @@ impl ScriptedLlm {
 
     fn maximum_active(&self) -> usize {
         self.state.maximum_active.load(Ordering::Acquire)
+    }
+
+    fn system_prompts(&self) -> Vec<String> {
+        self.state
+            .system_prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn started_units(&self) -> Vec<usize> {
@@ -520,6 +530,17 @@ impl LlmRequestExecutor for ScriptedLlm {
         _client: &'a Self::Client,
         messages: &'a [ChatMessage],
     ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+        let system_prompt = messages
+            .iter()
+            .find(|message| message.role() == ChatMessageRole::System)
+            .expect("Managed 请求必须包含 System message")
+            .content()
+            .to_owned();
+        self.state
+            .system_prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(system_prompt);
         let unit = request_unit_index(messages);
         let script = self
             .state
@@ -695,6 +716,12 @@ fn service_harness(
     let repository = ServiceRepository::new(snapshot, task_checkpoints);
     let records = DisabledTaskRecords::default();
     let task_log = task_log.map(|task_log| task_log as Arc<dyn StandardTranslationLog>);
+    let managed_system_prompt = RpgMakerSystemPrompt::new(
+        project.language_pair().clone(),
+        "managed system".to_owned(),
+        TranslationResponseEnvelope::JsonOnly,
+    )
+    .expect("测试 Managed Prompt 应合法");
     let execution = BoundManagedTranslationExecution {
         llm: llm.clone(),
         delay: delay.clone(),
@@ -702,7 +729,7 @@ fn service_harness(
         repository: repository.clone(),
         planning: RpgMakerTranslationPlanningConfiguration::new(NonZeroUsize::MIN),
         request: RpgMakerTranslationRequestConfiguration::new(retry_delays, maximum_retry_after),
-        response_envelope: TranslationResponseEnvelope::JsonOnly,
+        managed_system_prompt,
         task_records: records.clone(),
         task_log,
         cancellation,
@@ -836,6 +863,14 @@ async fn slow_first_task_refills_window_but_checkpoints_in_natural_order() {
     let (report, _) = result.expect("Managed 服务应成功");
 
     assert_eq!(harness.llm.started_count(), 8);
+    assert!(
+        harness
+            .llm
+            .system_prompts()
+            .iter()
+            .all(|prompt| prompt == "managed system"),
+        "Managed 请求必须使用显式注入的 Managed Prompt，而不是低级 Lua 的 Standard Prompt"
+    );
     assert_eq!(harness.llm.active(), 0, "所有已开始请求都必须 drain");
     assert_eq!(harness.llm.maximum_active(), 2);
     assert_eq!(harness.repository.task_checkpoint_calls(), 8);

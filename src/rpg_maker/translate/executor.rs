@@ -1266,7 +1266,7 @@ fn process_response(
     let raw_assistant = record_response.then(|| response.content().to_owned());
     let parsed = parse_model_response(
         response.content(),
-        resources.system_prompt().response_envelope(),
+        resources.standard_system_prompt().response_envelope(),
     );
     let response_record = raw_assistant.map(|raw_assistant| match &parsed {
         Ok(parsed) => TranslationTaskResponseRecord::parsed(
@@ -2651,7 +2651,11 @@ mod tests {
         );
         let prompt = RpgMakerSystemPrompt::new(pair, "# Contract".to_owned(), response_envelope)
             .expect("测试 Prompt 合法");
-        Arc::new(ResolvedRpgMakerTranslationResources::new(prompt, module))
+        Arc::new(ResolvedRpgMakerTranslationResources::new(
+            prompt.clone(),
+            prompt,
+            module,
+        ))
     }
 
     fn translation_resources() -> Arc<ResolvedRpgMakerTranslationResources> {

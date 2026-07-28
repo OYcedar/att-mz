@@ -36,10 +36,12 @@ use crate::translation_protocol::{
     TranslationTaskResponseParseError, parse_translation_response,
 };
 
+#[cfg(test)]
+use super::managed_translation_system_prompt_fragment;
 use super::{
-    ManagedTranslationCollection, ManagedTranslationContent, ManagedTranslationPair,
-    ManagedTranslationSemantics, ManagedTranslationShape, ManagedTranslationUnit,
-    TrustedLuaPreparedTranslation, TrustedLuaPreparedTranslationAcceptance,
+    MANAGED_REFLOW_WIRE_MARKER, ManagedTranslationCollection, ManagedTranslationContent,
+    ManagedTranslationPair, ManagedTranslationSemantics, ManagedTranslationShape,
+    ManagedTranslationUnit, TrustedLuaPreparedTranslation, TrustedLuaPreparedTranslationAcceptance,
     TrustedLuaPreparedTranslationStatus, TrustedLuaTranslationTerm,
 };
 
@@ -563,6 +565,7 @@ where
 fn prepare_managed_input(
     input: ManagedUnitPreparationInput,
     semantics: &dyn ManagedTranslationSemantics,
+    system_prompt_fingerprint: Sha256Fingerprint,
 ) -> Result<PreparedManagedUnit, TrustedLuaHostCallError> {
     let ManagedUnitPreparationInput {
         collection_name,
@@ -597,7 +600,13 @@ fn prepare_managed_input(
         }
         _ => unreachable!("托管模型已经建立 shape/content 不变量"),
     };
-    let state_context = managed_state_context(semantics, &unit, &instruction, &prepared);
+    let state_context = managed_state_context(
+        semantics,
+        &unit,
+        &instruction,
+        &prepared,
+        system_prompt_fingerprint,
+    );
     Ok(PreparedManagedUnit {
         identity: ManagedUnitIdentity::new(collection_name, unit.key()),
         kind: unit.kind().to_owned(),
@@ -627,6 +636,7 @@ fn managed_state_context(
     unit: &ManagedTranslationUnit,
     instruction: &str,
     prepared: &PreparedManagedSemantics,
+    system_prompt_fingerprint: Sha256Fingerprint,
 ) -> ManagedUnitStateContext {
     let mut hasher = Sha256FramedHasher::new(b"att.managed_translation.context");
     hasher
@@ -651,7 +661,14 @@ fn managed_state_context(
             }
         }
     }
+    hasher.frame(11, system_prompt_fingerprint.as_bytes());
     ManagedUnitStateContext(hasher.finish())
+}
+
+fn managed_system_prompt_fingerprint(system_prompt: &str) -> Sha256Fingerprint {
+    let mut hasher = Sha256FramedHasher::new(b"att.managed_translation.system_prompt");
+    hasher.frame(1, system_prompt.as_bytes());
+    hasher.finish()
 }
 
 fn unit_store_pair(
@@ -984,7 +1001,7 @@ fn render_managed_family(output: &mut String, id: usize, family: &ManagedFamily)
 fn shape_label(shape: ManagedTranslationShape, original: &ManagedTranslationContent) -> String {
     match shape {
         ManagedTranslationShape::Single => "single line".to_owned(),
-        ManagedTranslationShape::Reflow => "free line breaking".to_owned(),
+        ManagedTranslationShape::Reflow => MANAGED_REFLOW_WIRE_MARKER.to_owned(),
         ManagedTranslationShape::Lines => format!(
             "{} lines, corresponding line by line",
             original.as_array().map_or(0, <[String]>::len)
@@ -1452,11 +1469,13 @@ where
         };
 
         let preparation_inputs = managed_preparation_inputs(&snapshot);
+        let system_prompt = self.semantics.system_prompt().to_owned();
+        let system_prompt_fingerprint = managed_system_prompt_fingerprint(&system_prompt);
         let semantics = Arc::clone(&self.semantics);
         let prepared_units = self
             .cpu
             .execute_ordered_map(preparation_inputs, move |input| {
-                prepare_managed_input(input, semantics.as_ref())
+                prepare_managed_input(input, semantics.as_ref(), system_prompt_fingerprint)
             })
             .await
             .map_err(|source| managed_cpu_error("planning_failed", source, "managed_planning"))?
@@ -1465,7 +1484,6 @@ where
             .map_err(|source| {
                 normalize_managed_host_error(source, "managed_translation_preparation")
             })?;
-        let system_prompt = self.semantics.system_prompt().to_owned();
         let target_characters = self.configuration.target_user_message_characters;
         let plan = self
             .cpu
@@ -2341,6 +2359,7 @@ mod tests {
     struct FakeSemantics {
         source_language: &'static str,
         target_language: &'static str,
+        system_prompt: &'static str,
     }
 
     impl Default for FakeSemantics {
@@ -2348,6 +2367,7 @@ mod tests {
             Self {
                 source_language: "ja",
                 target_language: "zh-Hans",
+                system_prompt: "system",
             }
         }
     }
@@ -2358,7 +2378,7 @@ mod tests {
         }
 
         fn system_prompt(&self) -> &str {
-            "system"
+            self.system_prompt
         }
 
         fn source_language(&self) -> &str {
@@ -2477,9 +2497,14 @@ mod tests {
         snapshot: &TestSnapshot,
         semantics: &dyn ManagedTranslationSemantics,
     ) -> Vec<PreparedManagedUnit> {
+        let system_prompt_fingerprint =
+            managed_system_prompt_fingerprint(semantics.system_prompt());
         managed_preparation_inputs(snapshot)
             .into_iter()
-            .map(|input| prepare_managed_input(input, semantics).expect("测试 unit 应可准备"))
+            .map(|input| {
+                prepare_managed_input(input, semantics, system_prompt_fingerprint)
+                    .expect("测试 unit 应可准备")
+            })
             .collect()
     }
 
@@ -2606,8 +2631,16 @@ mod tests {
                 ..FakeSemantics::default()
             },
         );
+        let other_prompt = prepare_units(
+            &snapshot,
+            &FakeSemantics {
+                system_prompt: "managed system v2",
+                ..FakeSemantics::default()
+            },
+        );
         assert_ne!(base[0].state_context.0, other_source[0].state_context.0);
         assert_ne!(base[0].state_context.0, other_target[0].state_context.0);
+        assert_ne!(base[0].state_context.0, other_prompt[0].state_context.0);
     }
 
     #[test]
@@ -2633,6 +2666,44 @@ mod tests {
         );
         assert!(!task.messages[1].content().contains("secret_collection"));
         assert!(!task.messages[1].content().contains("persistent:key"));
+    }
+
+    #[test]
+    fn managed_reflow_uses_its_owned_wire_marker_and_protocol_fragment() {
+        let snapshot = snapshot(vec![collection(
+            "reflow",
+            "",
+            vec![unit(
+                "body",
+                ManagedTranslationShape::Reflow,
+                ManagedTranslationContent::scalar("第一行\n第二行"),
+                "",
+            )],
+        )]);
+
+        let plan = plan(&snapshot, &FakeSemantics::default(), usize::MAX);
+        assert!(
+            plan.tasks[0].messages[1]
+                .content()
+                .contains("Text [1] (single string, LF allowed):\n\n> 第一行\n> 第二行")
+        );
+        assert!(
+            managed_translation_system_prompt_fragment()
+                .contains("array containing exactly one non-blank JSON string")
+        );
+        assert!(
+            managed_translation_system_prompt_fragment()
+                .contains("must be encoded as `\\n` in the JSON text")
+        );
+        assert!(managed_translation_system_prompt_fragment().contains("CR and NUL are forbidden"));
+        assert!(
+            managed_translation_system_prompt_fragment()
+                .contains("only between LF-delimited segments within that same ID")
+        );
+        assert!(
+            managed_translation_system_prompt_fragment()
+                .contains("`<why>` analysis must cover this marker's one-element shape")
+        );
     }
 
     #[test]
@@ -2750,6 +2821,63 @@ mod tests {
                 accept_managed_candidate(&expected, &values).expect("形状拒绝是普通结果");
             assert_eq!(decision.accepted, None);
             assert_eq!(decision.reason.as_deref(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn reflow_json_wire_accepts_one_lf_string_and_rejects_other_shapes() {
+        let snapshot = snapshot(vec![collection(
+            "reflow",
+            "",
+            vec![unit(
+                "body",
+                ManagedTranslationShape::Reflow,
+                ManagedTranslationContent::scalar("第一行\n第二行"),
+                "",
+            )],
+        )]);
+        let task = plan(&snapshot, &FakeSemantics::default(), usize::MAX)
+            .tasks
+            .into_iter()
+            .next()
+            .expect("reflow 应形成一个任务");
+
+        let accepted = process_managed_response(
+            &task,
+            response(r#"{"1":["译文一\n译文二"]}"#),
+            TranslationResponseEnvelope::JsonOnly,
+            false,
+        )
+        .expect("单元素 JSON 字符串中的 LF 应可解码并验收");
+        assert_eq!(
+            accepted.decisions[0].accepted,
+            Some(ManagedTranslationContent::scalar("译文一\n译文二"))
+        );
+
+        let multiple = process_managed_response(
+            &task,
+            response(r#"{"1":["译文一","译文二"]}"#),
+            TranslationResponseEnvelope::JsonOnly,
+            false,
+        )
+        .expect("多元素是逐 ID 普通拒绝");
+        assert_eq!(
+            multiple.decisions[0].reason.as_deref(),
+            Some("item_count_mismatch")
+        );
+
+        for response_body in [r#"{"1":["译文一\r译文二"]}"#, r#"{"1":["译文\u0000"]}"#] {
+            let invalid = process_managed_response(
+                &task,
+                response(response_body),
+                TranslationResponseEnvelope::JsonOnly,
+                false,
+            )
+            .expect("CR/NUL 是逐 ID 普通拒绝");
+            assert_eq!(
+                invalid.decisions[0].reason.as_deref(),
+                Some("invalid_line_text")
+            );
         }
     }
 

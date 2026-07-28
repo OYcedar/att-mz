@@ -1,11 +1,16 @@
-# RPG Maker 系统提示词编写指南
+# RPG Maker Prompt 资源与模型协议现行规格及编写指南
 
 本文面向编写或微调 RPG Maker Standard/Managed Translate system Prompt 的作者。它说明 ATT 如何
 选择、校验和装配外置 Prompt，以及模型响应必须满足的机器协议。本文首先关心的不是译文
 是否优美，而是响应能否被 ATT 解析、关联到正确单元并通过结构验收。
 
-本文描述当前唯一实现。资源路径、模板变量、任务消息或响应信封发生变化时，必须同步
-修改解析器、资源、测试与本文，不能在外置文案中另行发明协议。
+本文规定 Prompt 资源的选择与文件格式、模板装配、模型消息内容、响应信封、JSON wire
+（发送和接收时使用的精确 JSON 格式）、临时 ID、输出形状和 ATT token 模型协议，同时
+给出 Prompt 文件的编写与验证方法。`[prompts]` 的字段、类型和路径解析规则由
+[配置现行规格](../runtime/configuration.md#4-prompt语言与-profile)规定。资源路径、
+模板变量、任务消息或响应协议发生变化时，必须同步修改解析器、资源、测试与本文，不能
+在翻译规格、Skill 或外置文案中另行定义一份协议。任务如何规划，模型响应的解析结果
+如何用于译文检查、state、checkpoint 与最终结果，由[翻译现行规格](translation.md)规定。
 
 ## 1. 先区分四种问题
 
@@ -20,23 +25,16 @@
 不是改善翻译质量的建议，而是协议要求。思考模式要求模型实际分析指定事项，但 ATT 只
 机械验证思考信封和非空内容，不判断分析质量是否正确。
 
-这些结果属于结构化翻译结果，不一定表现为进程崩溃或非零退出码。一个任务可为
-`Complete`、`Partial`，或因 `AllOutputsRejected`、`ModelResponseUnusable` 等原因不可用；
-命令仍需按全部任务和 planning-unresolved 汇总为 `Complete`、`Partial` 或 `Unavailable`。
+这些协议结果不一定表现为进程崩溃或非零退出码。信封或 JSON 根非法时当前 TaskBlock
+形成 `ModelResponseUnusable`；JSON 根合法后，协议允许合法 ID 与被拒绝 ID 并存。它们
+如何与后续译文检查、planning-unresolved 和 checkpoint 汇总为任务及命令结果，由
+[翻译现行规格](translation.md#6-模型协议之后的译文检查)规定。
 
 ## 2. 配置、locale 与资源选择
 
-Translate 必须完整提供：
-
-```toml
-[prompts]
-root = "prompts"
-locale = "auto"
-thinking_output = false
-```
-
-该表只允许这三个字段；Translate 遇到缺失字段、未知字段或错误类型都会按配置输入错误
-失败。Help、Version、Init、Extract 与 WriteBack 不消费或校验这些内部字段。
+本节从配置模块已经校验的 `root`、`locale` 和 `thinking_output` 开始，说明这些值如何
+选择 Prompt 文件。字段是否必填、允许的类型、相对路径从哪里解析以及哪些命令读取它们，
+见[配置现行规格](../runtime/configuration.md#4-prompt语言与-profile)。
 
 `locale` 只选择提示词说明所使用的语言，不是游戏源语言或目标语言。它接受精确小写
 `auto`，或能按现有 UI i18n 规则映射到受支持语言的有效 BCP-47 locale；例如 `fr-CA`
@@ -65,7 +63,7 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 
 资源错误在首次 LLM 请求前失败。用户诊断报告规范 locale、组件名、路径和统一检查方向，
 不复制资源正文；这是配置诊断的职责与可读体积边界，不构成敏感性分类。敏感信息边界由
-[Chat Completions 运行根规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)
+[Chat Completions 规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)
 唯一规定。
 
 ## 3. `system.md` 模板与装配
@@ -86,18 +84,28 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 - 替换后仍残留任何 `{{...}}`。
 
 `thinking.md` 不是模板，不能包含模板变量。两个文件都先执行 Unicode 首尾空白去除。
-关闭思考输出时，最终 system message 只有渲染后的 `system.md`；开启时精确装配为：
+外置资源先建立 Standard 与 Managed 共同的翻译方向、质量要求和响应格式，但最终
+system message 分成两份。Standard（以及显式读取该 Prompt 的低级 Lua）在关闭思考输出
+时精确等于渲染后的 `system.md`，开启时精确装配为：
 
 ```text
 rendered system.md + "\n\n" + thinking.md
 ```
 
-即只追加一份同 locale 的思考要求，并固定使用两个 LF。装配后的完整 system message 参与
-translation state，并随每个 TaskBlock 完整发送；Profile 的字符装箱目标只参与最终 user
-message 中完整文本组的 TaskBlock 分组。切换 locale、切换 `thinking_output`，或修改本轮
-实际读取的任一资源，都会使依赖旧 Prompt 的受影响译文不再 Current，但 system message
-的字符数不参与该目标计算。关闭时没有读取 `thinking.md`，因此它的变化不会影响该模式的
-system message 或 state。
+Managed 在渲染后的 `system.md` 后固定追加由 Managed 模块提供的英文协议片段；该
+片段不是 locale 资源，也不是用户配置。关闭和开启思考输出时分别精确装配为：
+
+```text
+rendered system.md + "\n\n" + managed protocol fragment
+rendered system.md + "\n\n" + managed protocol fragment + "\n\n" + thinking.md
+```
+
+因此只有 Managed 请求获得该片段，Standard 消息字节与低级 Lua 的 `system_prompt` 不因
+Managed shape 扩展而变化。思考要求始终位于最终 system message 末尾。装配后的对应
+system message 随每个 TaskBlock 完整发送；Profile 的字符装箱目标只计算最终 user
+message，不计算 system message。实际发送的完整 Prompt 如何进入 state，以及资源变化
+何时使译文不再 Current，由[翻译现行规格](translation.md#7-translation-state-与-current)
+规定。关闭模式没有读取 `thinking.md`，因此其内容不属于该模式装配出的 system message。
 
 所有 `system.md` 都必须把裸 JSON 规定为默认响应；只有 system message 末尾实际存在
 `thinking.md` 的“思考输出要求”时，才允许先输出该片段规定的内容。无论使用哪种模式，
@@ -109,17 +117,18 @@ system message 或 state。
 每个 Standard 或 Managed TaskBlock 都只发送两条消息：
 
 1. `system`：按上一节渲染并按模式装配的完整 system Prompt；
-2. `user`：ATT Planner 自动生成的 Markdown 任务载荷。
+2. `user`：ATT Planner 自动生成的 Markdown 任务内容。
 
-user message 不是 JSON，也不是 ATT 的内部领域对象。它只携带模型完成本次翻译所需的
+user message 不是 JSON，也不是 ATT 的内部数据对象。它只包含模型完成本次翻译所需的
 术语、语境、待翻译内容、临时 ID 和输出形状。语言对、文件路径、owner、传播目标和
 去重原因不会重复写入 user message；Managed 的 collection name、unit key、metadata
 与 state 同样不发送。翻译方向由模板渲染后的 system message 建立。
 
-Planner 生成的标题、字段标签和形状说明统一使用英文。所有本地化 Prompt 都必须保留并
-解释协议字面量 `single line`、`free line breaking`、
-`N lines, corresponding line by line`、`N items, corresponding item by item`。这些固定文本
-不随 Prompt locale 本地化；翻译内容本身的语言只由项目语言对建立，不能根据英文标签推断。
+Planner 生成的标题、字段标签和形状说明统一使用英文。模型输入共有五种固定标记：
+`single line`、`free line breaking`、`N lines, corresponding line by line`、
+`N items, corresponding item by item` 与 Managed 专用的 `single string, LF allowed`。
+前四种由外置本地化 Prompt 解释；第五种由宿主追加的 Managed 协议片段解释。固定文本
+本身不随 Prompt locale 本地化；翻译内容的语言只由项目语言对建立，不能根据英文标签推断。
 
 一个任务通常形如：
 
@@ -152,15 +161,16 @@ Choices [2] (3 items, corresponding item by item):
 
 ID 只在当前 TaskBlock 中有效，从 `1` 连续编号；下一个 TaskBlock 会重新从 `1` 开始。
 字段标签不是封闭枚举，模型应以“是否带 `[ID]`”和括号中的形状标记判断输出责任。
-字段名也不决定输出形状：Planner 会把源 `Value` 含 LF 的 Scalar 标成
+字段名也不决定输出形状：Standard Planner 会把源 `Value` 含 LF 的 Scalar 标成
 `free line breaking`，部分可自然扩展的 profile/description 即使当前只有一行也使用该
-形状；模型始终只服从条目上实际给出的形状标记。
+形状；Managed `reflow` 始终标成 `single string, LF allowed`。模型只服从条目上实际给出
+的标记，不能根据字段名或业务 shape 名猜测。
 
 多行、逐项严格对齐及允许重排换行的内容使用 `> ` 作为 Markdown blockquote 前缀；前缀
 不属于原文，只有 `> ` 的行表示空槽。`single line` 内容直接出现在冒号后。输出不得复制标题、标签、
 `[ID]`、形状说明或 `> ` 前缀，只返回 ID 到译文字符串数组的映射。
 
-## 5. 翻译要求与四种输出形状
+## 5. 翻译要求与五种输入标记
 
 模型应结合整个 TaskBlock 的术语和语境，判断主谓、省略主语、可能人称、人物关系、
 语气、情绪及敬语，在忠实保留含义、风格和语域的同时使用自然目标语言。这些要求主要
@@ -174,9 +184,11 @@ ID 只在当前 TaskBlock 中有效，从 `1` 连续编号；下一个 TaskBlock
 | `N lines, corresponding line by line` | 恰好 `N` 个字符串 | 与源行逐槽对应，并保持空槽位置 |
 | `N items, corresponding item by item` | 恰好 `N` 个字符串 | 与源项逐槽对应，并保持空槽位置 |
 | `free line breaking` | 可以按目标语言自然表达重新断行 | 整个数组至少有一个非空白字符串 |
+| `single string, LF allowed` | 恰好一个非空白字符串 | 解码后允许 LF；JSON 文本中用 `\n` 表示；禁止 CR 与 NUL |
 
-所有数组元素都必须是 JSON 字符串，解码后不能包含 CR、LF 或 NUL。需要多行时必须拆成
-多个数组元素；把换行写进一个字符串，即使 JSON 语法有效，也会使该 ID 被拒绝。
+所有数组元素都必须是 JSON 字符串。除 `single string, LF allowed` 的 LF 例外外，解码后
+不能包含 CR、LF 或 NUL；`free line breaking` 的多行内容必须拆成多个数组元素。Managed
+专用标记反而必须保持单元素，并把 LF 编码在该 JSON 字符串内部；拆成多个元素会拒绝该 ID。
 
 严格对齐的源空槽必须对应精确空字符串 `""`，不能是 `" "`；源槽非空时，对应输出
 不能是空字符串或纯空白。`free line breaking` 不要求保持原行数。去除 ATT token 等受保护片段后，
@@ -184,7 +196,7 @@ ID 只在当前 TaskBlock 中有效，从 `1` 连续编号；下一个 TaskBlock
 
 ## 6. 响应信封模式
 
-ATT 把配置解析成受信的 `TranslationResponseEnvelope`，并让 Planner 与 Executor 共享
+ATT 校验配置后得到 `TranslationResponseEnvelope`，并让 Planner 与 Executor 共享
 同一个值，避免 system Prompt 开关和解析器失配：
 
 ```text
@@ -250,7 +262,7 @@ ATT 解析的是 Chat Completions assistant `message.content` 中剥离信封后
 之前，不能出现在 `</why>` 与 JSON 之间。剥离可选思考信封后必须直接得到 JSON；
 Markdown 围栏不是合法 wire。
 
-JSON 根成功后，以下问题只拒绝对应 ID：
+JSON 根成功后，以下协议或结构问题只拒绝对应 ID：
 
 | 输出问题 | 对应 ID 的结果 |
 |---|---|
@@ -258,17 +270,15 @@ JSON 根成功后，以下问题只拒绝对应 ID：
 | 同一 ID 出现多次 | `Duplicate` |
 | value 不是数组，或数组中含非字符串 | 形状无效 |
 | `single line` 或严格对齐数组长度错误 | 行数不匹配 |
-| 字符串含 CR、LF 或 NUL | 结构行无效 |
+| 字符串含 CR、NUL，或非 `single string, LF allowed` 标记的字符串含 LF | 结构行无效 |
 | 空槽位置错误，或非空槽只返回空白 | 空白形状不匹配 |
 | ATT token 丢失、重复、损坏、未知或跨严格槽移动 | Placeholder/ATT token 验收失败 |
-| 只含 ATT token、控制片段或空白，没有自然语言文本 | 自然语言文本缺失 |
 | 译文字符串内部含 BOM | BOM 验收失败 |
-| 同时混用 ATT token 与原始控制片段，无法唯一恢复 | Placeholder 正规化歧义 |
-| 译文仍有源语言残留 | 源语残留验收失败 |
 
-非法或未知 ID 形成协议诊断并被忽略，不能代替缺失的正确 ID。其他 ID 仍可接受，因此
-任务可以得到 `Partial`；没有任何预期 ID 通过时原因为 `AllOutputsRejected`；全部通过才
-是 `Complete`。这套逐 ID 规则在两种响应信封模式下完全相同。
+非法或未知 ID 形成协议诊断并被忽略，不能代替缺失的正确 ID。某个 ID 通过上述格式检查
+后，ATT 还会检查自然语言内容、源语残留和 Placeholder 恢复；这些检查的精确行为和最终
+任务结果由[翻译现行规格](translation.md#6-模型协议之后的译文检查)规定。这套逐 ID
+协议规则在两种响应信封模式下完全相同。
 
 ## 8. ATT token 是机器保护标记
 
@@ -286,12 +296,13 @@ user message 中可能出现：
 - 不删除、复制、改写、拆开、创造或翻译 token；
 - 不输出输入中不存在的未知或残缺 `⟦ATT_...` 内容。
 
-严格对齐条目按对应槽分别校验 token，因此 token 不能跨行或跨项移动。允许重排换行的条目按
-整个 ID 校验 token 多重集，只允许 token 在同一 ID 的输出行之间随自然表达移动，不能
-跨 ID 移动。
+严格对齐条目按对应槽分别校验 token，因此 token 不能跨行或跨项移动。`free line breaking`
+允许 token 在同一 ID 的数组元素之间移动；`single string, LF allowed` 允许 token 在同一
+ID 字符串的 LF 分段之间移动。两者都按整个 ID 校验 token 多重集，绝不能跨 ID 移动。
 
-解析器能在少数无歧义场景中把模型输出的原始控制片段正规化回 token，但这只是接收端
-恢复能力，不是 Prompt 契约。Prompt 作者必须要求模型保留所见 token，不能依赖恢复逻辑。
+Prompt 作者必须要求模型保留所见 token，不能依赖接收端恢复。ATT 对候选执行的
+Placeholder 正规化与歧义拒绝属于译文检查，见
+[翻译现行规格](translation.md#6-模型协议之后的译文检查)。
 
 ## 9. `thinking.md` 的思考要求
 
@@ -301,7 +312,8 @@ user message 中可能出现：
 1. 说话人、听话人、省略主语和可能人称；
 2. 人物关系、语气、情绪和敬语；
 3. 术语含义及目标语言自然表达；
-4. 占位符、控制符、ATT token 和行结构；
+4. 占位符、控制符、ATT token 和实际 wire 标记规定的行结构；Managed 专用标记还要核对
+   单元素形状、LF 位置与 token 所在 LF 分段；
 5. ID、行数、源语残留和最终格式。
 
 不能只写“已检查”或直接给结论。协议不强制固定栏目标题，ATT 也不判断分析内容是否
@@ -315,14 +327,14 @@ user message 中可能出现：
 
 - `{{source_language}}` 与 `{{target_language}}`；
 - JSON、`[ID]`、`<why>`、`</why>`、ATT token 等协议字面量；
-- Planner 的英文输入标记 `single line`、`free line breaking`、
+- locale 资源负责的英文输入标记 `single line`、`free line breaking`、
   `N lines, corresponding line by line`、`N items, corresponding item by item`；
 - 两种信封的选择条件、ID/数组/空槽/token 规则以及 JSON 终止边界。
 
 可以微调的是翻译风格、表达提示和本地语言说明；不能增加模板变量、改变资源布局、要求
 额外输出字段、另包 JSON、改变标签、放宽或收紧行形状，或让 JSON parser承担提示词中
 没有建立的协议。`thinking_output` 只控制人工可读的 `<why>` 输出，不控制供应商原生
-reasoning/thinking 参数；这些参数仍完全属于所选 Client 的受信 `parameters`。
+reasoning/thinking 参数；这些参数仍完全属于所选 Client 已经校验的 `parameters`。
 
 ## 11. 最低检查清单
 
@@ -333,21 +345,23 @@ reasoning/thinking 参数；这些参数仍完全属于所选 Client 的受信 `
 - 两类文件保留相同协议字面量和 `<why>` 边界；
 - system Prompt 只把带 `[ID]` 的源语言内容翻译为目标语言；
 - JSON 中每个实际 ID 恰好一次，value 只能是字符串数组；
-- `single line`、严格逐行、严格逐项和 `free line breaking` 分别遵守自己的形状与空槽规则；
-- JSON 字符串不含 CR、LF 或 NUL，ATT token 按形状逐字保留；
+- 五种 wire 标记分别遵守自己的数组、字符与空槽规则；
+- JSON 字符串不含 CR 或 NUL；只有 `single string, LF allowed` 解码后可以含 LF，ATT token
+  按对应标记逐字保留；
 - JsonOnly 直接输出 JSON，ThinkingThenJson 恰好输出一组非空 `<why>` 后接 JSON；
 - 最终 JSON 后没有任何内容。
 
-验证样本至少覆盖无术语、存在术语、无 ID 语境、`single line`、`free line breaking`、带空槽的
-严格对齐、多个 ATT token，以及合法/非法思考信封。只测试一个单字符串 JSON 不能证明完整契约。
+验证样本至少覆盖无术语、存在术语、无 ID 语境、五种 wire 标记、带空槽的严格对齐、
+Managed 单元素含 LF 与错误多元素、多个 ATT token，以及合法/非法思考信封。只测试一个
+单字符串 JSON 不能证明完整契约。
 
 任务输入的规划事实和结果状态见[翻译现行规格](translation.md#5-任务规划与模型消息)，
 ATT token 的来源与恢复规则见[规则编写指南](rules.md#6-placeholder-rules)，术语资源见
 [术语表制作指南](terminology.md)，HTTP 外层响应与 assistant content 的关系见
-[Chat Completions 运行根](../runtime/chat-completions.md)。普通项目日志、终端和通用
-诊断保持运行级结构化摘要，不复制完整 Prompt、messages、思考正文、原文、译文或模型
-正文；这是各自职责、稳定 schema 和体积边界，不构成敏感性分类。敏感信息边界与替换
-契约由
-[Chat Completions 运行根规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)
-唯一规定；高级记录的呈现方式见
+[Chat Completions 规格](../runtime/chat-completions.md)。普通项目日志、终端和通用诊断
+只保存本轮运行的结构化摘要，不复制完整 Prompt、messages、思考正文、原文、译文或模型
+正文。这样可以保持各类输出职责清楚、schema 稳定且大小可控，但不会增加新的敏感信息
+类别。敏感信息边界与替换规则由
+[Chat Completions 规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)规定；
+任务记录的呈现方式见
 [翻译任务记录现行规格](task-records.md)。

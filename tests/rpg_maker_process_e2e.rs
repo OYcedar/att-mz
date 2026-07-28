@@ -2106,7 +2106,18 @@ assert(#unit.metadata == 2 and unit.metadata[1] == 12 and unit.metadata[2] == "m
         .expect("Managed 请求必须包含 messages");
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[0]["content"], SYSTEM_PROMPT);
+    let managed_system = messages[0]["content"]
+        .as_str()
+        .expect("Managed system message 必须是字符串");
+    assert!(
+        managed_system.starts_with(&format!(
+            "{SYSTEM_PROMPT}\n\n# ATT Managed translation extension"
+        )),
+        "Managed 必须在未修改的项目 System Prompt 后追加自己的协议片段：{managed_system}"
+    );
+    assert!(managed_system.contains("`single string, LF allowed`"));
+    assert!(managed_system.contains("array containing exactly one non-blank JSON string"));
+    assert!(managed_system.contains("CR and NUL are forbidden"));
     assert_eq!(messages[1]["role"], "user");
     let user = messages[1]["content"]
         .as_str()

@@ -1,8 +1,11 @@
 # RPG Maker 翻译现行规格
 
-本文定义 MV/MZ Standard 与 Lua Managed Translate 的资源生命周期、规划、模型协议、
-验收、state 与提交，以及独立项目 Lua 复用 Standard 语义验收人工候选的边界。Standard
-与 Managed 是两个独立业务域，共用 ATT 拥有的协议执行与记录设施，不共享身份或译文。
+本文定义 MV/MZ Standard 与 Lua Managed Translate 的资源生命周期、任务规划、译文检查、
+state、提交与恢复，以及独立项目 Lua 如何复用 Standard 的规则来检查人工译文。Standard
+与 Managed 是两套独立流程；它们共用 ATT 的模型协议执行器和任务记录功能，但不共享身份
+或译文。Prompt 配置与资源、模型消息内容、响应信封、JSON wire、临时 ID、输出形状和
+ATT token 协议由[Prompt 资源与模型协议现行规格](prompts.md)统一规定；本文直接使用响应
+解析器返回的结构化结果，不重新定义协议。
 术语字段由[术语现行规格](terminology.md)唯一规定，Placeholder 字段由
 [规则文件](rules.md#6-placeholder-rules)唯一规定，Lua Translate API 见
 [Lua 技术参考](lua.md#7-translatepreparecurrent-与-accept)，Managed API 见
@@ -43,35 +46,22 @@ Profile 与 Lua 各自保留类型化来源。显式 Profile 配合省略 `--lua
 manifest 指纹。Standard 以标准语义单元身份读写，Managed 以 collection name + unit key
 寻址；两者都不要求模型理解物理 JSON 地址。
 
-## 2. 公共翻译语义
+## 2. Standard、Managed 与低级 Lua 共用的翻译能力
 
 Profile 由显式或项目状态解析出的 ID 在 `[[rpg_maker.translation_profiles]]` 中精确
-选择，再解析它引用的公共 LLM Client。语言对来自项目 metadata；Prompt 的说明语言由
-`[prompts].locale` 独立选择。Translate 要求配置完整提供：
-
-```toml
-[prompts]
-root = "prompts"
-locale = "auto"
-thinking_output = false
-```
-
-`locale = "auto"` 复用本进程已经解析的有效 UI locale；显式 locale 覆盖它。规范 locale
-精确选择 `<prompts.root>/rpg_maker/<locale>/system.md`。该模板只允许并且必须包含
-`{{source_language}}` 与 `{{target_language}}`，ATT 用项目规范 `LanguageId` 替换。只有
-`thinking_output = true` 时才读取同目录 `thinking.md`，并以两个 LF 追加到渲染后的
-system Prompt。
-
-被读取的资源必须是普通 UTF-8 非空白文件，模板必须完整有效；任何错误都在首次 LLM
-请求前失败。资源只按所选 locale 的精确路径读取。每次 Translate 都重新读取所选资源；
-关闭模式不读取 `thinking.md`。完整契约见
-[系统提示词编写指南](prompts.md)。
+选择，再解析它引用的公共 LLM Client。语言对来自项目 metadata；Prompt 的说明语言、
+资源选择、模板校验和 system message 装配由
+[Prompt 资源与模型协议现行规格](prompts.md#2-配置locale-与资源选择)完整定义。Translate
+在首次 LLM 请求前取得本轮已经校验的完整 Prompt 与响应协议；资源或模板无效时，不进入
+任务执行。
 
 Standard、Managed 与低级 Translate Lua 复用本轮解析出的 engine、语言对、语言模块、
-已装配 Prompt、Client、实际 Placeholder 和实际有序术语命中。Managed 进一步复用 ATT
-拥有的 planning、request、响应信封、并发、重试、验收、state、checkpoint 与任务记录；
-低级 `ctx.translation/ctx.llm/ctx.db` 仍由脚本拥有自己的消息协议和提交真相，不继承
-这些托管行为。
+同一份已经渲染的 Prompt 资源、Client、实际 Placeholder 和实际有序术语命中。最终
+system Prompt 按执行路径分离：Standard 与低级 Lua 保持资源既有装配字节；Managed 在
+相同资源内容后追加 Managed 模块固定提供的机器协议片段。Managed 进一步复用 ATT 的
+planning、request、响应信封、并发、重试、验收、state、checkpoint 与任务记录；低级
+`ctx.translation/ctx.llm/ctx.db` 仍由脚本自行定义消息格式并确认写入结果，不继承这些
+Managed 行为。
 
 MV 与 MZ 共享翻译流程，但 engine 是语义事实：两者 Builtin 控制符矩阵不同，state 也
 绑定 engine。精确矩阵见[规则文件](rules.md#68-mvmz-builtin-控制符矩阵)。
@@ -99,7 +89,8 @@ Mutation Claim；`single`、`reflow`、`lines`、`items` 自己定义模型输�
 `lines/items` 的完整数组整体占一个模型 ID 并原子验收、提交，元素不是独立持久单元。
 
 自定义 Placeholder 文件的解析或编译错误在任何单元规划前拒绝整份资源；规则已经成功
-编译后，某个单元发生保护跨度冲突、占用 `⟦ATT_` 保留前缀或无法安全投影，只形成该单元
+编译后，某个单元发生保护跨度冲突、占用 `⟦ATT_` 保留前缀或无法安全替换为 ATT token，
+只形成该单元
 自己的 `planning-unresolved`。它不取得模型 ID、不产生 LLM attempt，也不发给模型；同轮
 其他单元继续规划。该单元的旧译文不再 Current，并与本轮合法术语/Placeholder 资源一起
 在请求模型前由 Preparation 原子失效和提交。
@@ -145,7 +136,7 @@ collection 共同形成一个 Managed 去重域，但它与 Standard 去重域�
 原文和语义相同，也不互相选择代表、传播译文或共享 Current。
 
 Managed 去重键包含完整 prepared 语义：engine、kind、shape、精确 original（包括数组
-边界）、collection instruction、unit context、语言对、语言模块、最终公共 Prompt/Client
+边界）、collection instruction、unit context、语言对、语言模块、实际 Managed Prompt/Client
 语义、实际有序术语和 Placeholder 绑定。collection `name`、unit `key`、metadata 以及
 声明顺序不进入键。不 trim、不折叠大小写、不做 Unicode 或换行模糊匹配；完整语义相同
 时选择全局自然顺序最早 unit 为代表。
@@ -174,37 +165,11 @@ CommonEvent、`Troops.json` 按单个 Troop 建立范围。每个范围独立装
 TaskBlock 分区、每个任务的术语并集和完整模型请求语义，并保持组内必要上下文、源
 上下文、组顺序及单元顺序。Reader 顺序被其他范围打断后，相同范围键不会跨段重新合并。
 
-user message 是最小 Markdown 载荷，只包含实际命中术语、活动 ID、自然语言角色、必要
-形状约束和直接有用的无编号上下文。owner、路径、内部 kind、传播目标、去重原因和空区
-不发送。已有/复用译文作上下文时优先目标文，没有时用源文。
-
-输出形状由语义角色和源内容共同决定，不由字段标签猜测。任何源 Scalar `Value` 只要
-包含 LF，就使用 `free line breaking`，避免把多行值误声明成单行；Actor `profile` 以及
-Skills、Items、Weapons、Armors 的 `description` 即使源值当前只有一行，也继续允许自由
-断行。其余单行 Scalar 使用 `single line`。
-
-<!-- att-example: illustrative -->
-```markdown
-Terminology:
-
-- 星港 → 星港
-
-## Dialogue
-
-Speaker [1] (single line):ミレア
-
-Body [2] (free line breaking):
-
-> 潮風が強くなってきました。
-> 灯台へ戻りましょう。
-
-## Choices
-
-Choices [3] (2 items, corresponding item by item):
-
-> 戻る
-> 進む
-```
+Planner 把组内需要翻译的内容转换为
+[Prompt 资源与模型协议现行规格](prompts.md#4-模型实际收到什么)定义的最小 Markdown
+user message。消息包含哪些内容、临时 ID 如何表示以及形状标记如何选择，都由该协议
+规定；Planner 只负责按本节的处理范围和自然顺序提供正确输入。已有或复用译文作为上下文时
+优先提供目标文，没有时使用源文。
 
 ### 5.2 Managed TaskBlock
 
@@ -213,69 +178,43 @@ TaskBlock。TaskBlock 不跨 collection；加入下一个完整 unit 会超过�
 user message Unicode 字符装箱目标时，在 unit 边界开始下一任务。单个完整 unit 超过
 目标时独占任务，不拆数组、不拒绝规范内容，也不改变后续任务目标。
 
-每个 TaskBlock 独立从 `1` 连续分配临时 ID，下个任务重新开始。user message 只包含当前
-collection 的 `instruction`、实际命中术语、必要 `context`、shape、临时 ID 和经过
-Placeholder 保护的正文；不包含 collection `name`、unit `key`、metadata、来源路径、
-translation state 或去重信息。一个 `lines/items` 数组仍只占一个 ID。身份只在 ATT
-受信计划和最终任务记录映射中保存，不泄漏为模型必须理解的内部协议。
+Managed Planner 按同一
+[模型消息协议](prompts.md#4-模型实际收到什么)。collection 与 unit 的持久身份只保留在
+ATT 已经校验的任务计划和最终任务记录映射中；模型消息允许包含哪些内容、数组 unit 如何
+使用 ID，以及哪些内部信息不得发送，都由该协议统一规定。
 
-Prompt 作者必须遵守[系统提示词编写指南](prompts.md)定义的输入解释、模板变量、JSON
-wire、ID、行形状、空槽、ATT token 和响应信封约束。Planner 与 Executor 共享已解析的
-`TranslationResponseEnvelope`：关闭思考输出为 `JsonOnly`，开启为 `ThinkingThenJson`，
-避免 Prompt 与解析器使用不同模式。违反这些约束会使整个 TaskBlock 或对应 ID 不可用，
-不是单纯降低翻译质量。
+公共 LLM 请求格式由 [Chat Completions 现行规格](../runtime/chat-completions.md)规定。
+网络重试仅按所选 Client 的明确策略；模型协议失败不伪装成网络错误。
 
-公共 LLM 根提交 `model`、`messages`、`stream=false` 并透传 Client 的受信 parameters。
-网络重试仅按所选 Client 的明确策略；协议失败不伪装成网络错误。
+## 6. 模型协议之后的译文检查
 
-## 6. 响应结构与候选验收
+Executor 按[Prompt 资源与模型协议现行规格](prompts.md#6-响应信封模式)只解析一次响应
+信封与 JSON wire，返回 Thinking、Assistant JSON、按顺序排列的合法条目和每个 ID 的协议
+诊断；译文检查与任务记录共用这份结果，不重新解析标签、JSON 或 ID。信封或 JSON 根失败
+时，整个 TaskBlock 以 `ModelResponseUnusable` 不可用，且不作为网络错误重试；JSON 根
+合法后，只有通过 JSON 和输出形状检查的 ID 才进入下述译文检查，其他 ID 保留各自的协议
+诊断。
 
-`JsonOnly` 要求 assistant content 直接提供 JSON，任何 `<why>` 都非法。
-`ThinkingThenJson` 要求整个 TaskBlock 精确输出一组
-`<why>非空任意内容</why>`，随后只允许空白再接 JSON。标签必须精确小写且无属性；缺失、
-空、未闭合、嵌套、重复、大小写变体、属性或前置说明都会拒绝。ATT 不赋予思考正文业务
-权威性，不将其放入 `TranslationTaskOutcome`、数据库、state、普通项目日志、终端或
-诊断，也不判断分析质量。启用翻译任务记录时，合法正文进入该任务的非权威可读
-投影。
+Thinking 只是解析结果中的可读说明，不进入 `TranslationTaskOutcome`、数据库、state、
+普通项目日志、终端或诊断，也不参与译文判断。启用翻译任务记录时，记录功能直接使用
+解析结果，不重新猜测响应正文。
 
-响应整体允许首尾空白和最开头的单个 BOM；BOM 必须位于裸 JSON 或 `<why>` 之前，不能
-放在 `</why>` 与 JSON 之间。剥离信封后的部分直接进入唯一 JSON parser；Markdown
-围栏、前置说明和后记都不属于协议。信封或 JSON 根失败使整个任务
-因 `ModelResponseUnusable` 不可用，不作为网络错误重试；逐 ID 规则没有任何变化。
+Managed 对每个已经通过 JSON 和输出形状检查的 ID，继续检查自然语言内容、源语残留、
+语言修复和 Placeholder。四种 shape 的输入要求、每个位置如何检查 Placeholder，以及
+一个 unit 必须整体接受和提交的规则，由
+[Lua 技术参考](lua.md#62-ctxtranslationsreplace)规定；模型实际使用的五种输入标记
+由 [Prompt 规范](prompts.md#5-翻译要求与五种输入标记)规定。当前不能把多个 unit 组成
+一个共同接受或拒绝的组。
 
-响应信封在责任边界只解析一次，形成 Thinking、Assistant JSON 和有序条目投影；业务
-验收与任务记录共享该结果。记录 renderer 不重新猜测 `<why>`，也不重新解释逐 ID 规则。
-
-Standard 与 Managed 响应的 JSON 根都必须是从十进制临时 ID 映射到字符串数组的 object。
-每个 TaskBlock 的预期 ID 应恰好出现一次。信封或 JSON 根非法会使整个任务不可用；根
-合法后的缺失、重复、未知 ID 以及单个值类型或候选验收错误只拒绝受影响 ID，其他合法
-ID 仍可进入本任务 checkpoint。未知 ID 没有提交目标，但保留协议诊断。
-
-Managed 的每个 ID 按声明 shape 验收：
-
-- `single` 必须是恰好一个不含 LF 的字符串；
-- `reflow` 必须是恰好一个字符串，允许其中含 LF；
-- `lines` 必须与源数组等长并保持空槽位置，Placeholder 可以在同一 ID 的不同非空行间
-  移动，但不能丢失、增加或逃出这个原子；
-- `items` 必须与源数组等长、每项非空白，各位置独立执行 Placeholder 和语言验收，
-  Placeholder 不得移动到另一个位置。
-
-四种 shape 都拒绝相应位置的 CR/NUL，并继续执行公共 BOM、自然语言、源语残留、语言
-修复和 Placeholder 契约。数组整体只有全部位置合法时才接受并原子提交；当前没有跨 unit
-组合原子组。
-
-Standard Reader 在建立受信身份时，以 Extract 相同的唯一结构契约同时验证 group kind、
+Standard Reader 在建立已经校验的身份时，使用与 Extract 相同的结构规则同时验证 group kind、
 role 和 Value/Lines：对话组只接受 Speaker/Body，选项组只接受 Choices，滚动文本组只接受
-ScrollingText，其余组只接受 Scalar。Executor 验收候选时继续消费同一契约；受信身份的
+ScrollingText，其余组只接受 Scalar。Executor 检查译文时继续使用同一规则；已经校验的身份中
 kind/role 若不一致属于内部不变量，候选自身的形状或字符不合规则只拒绝对应 ID。
 
-- Speaker 和形状为 `single line` 的严格字段是一条非空候选；
-- `free line breaking` Scalar `Value` 可由多模型行组成，最终以 LF 连接；源值含 LF 时
-  必须采用该形状；
-- Choices 和严格 ScrollingText 必须与源 Lines 按槽对齐并保持空槽；
-- DialogueSpeaker Value 拒绝 CR/LF，所有 Value 拒绝 NUL；每个 Lines 元素拒绝
-  CR、LF、NUL；
-- 纯空白、严格对齐数量和空槽一致性仍由响应验收规则负责，不进入共享结构校验；
+- Speaker 和严格单行字段把一条协议候选映射为 Value；
+- 允许自由断行的 Scalar `Value` 把多条协议候选按 LF 连接；
+- Choices 和严格 ScrollingText 把协议数组按槽映射为 Lines；
+- 数量、字符、非空与空槽一致性由 Prompt 协议按 ID 检查，不属于 Unit 身份检查；
 - 裸 `<` 与 `>` 是普通文本字节，新模型候选、Current 复用、去重传播和人工候选都按
   完整 Unit 契约逐字验收；只有明确命中的 Builtin/Custom Placeholder 跨度受到保护。
 
@@ -301,7 +240,7 @@ JSON 根有效但全部输出被拒绝时原因为 `AllOutputsRejected`。
 state 是当前译文成立所依赖语义的 SHA-256 摘要。它绑定：
 
 - engine、语言对、语言模块；
-- 完整装配后的公共 Prompt（由此确定响应信封）和影响模型语义的 Client 事实；
+- 当前执行路径实际发送的完整 Prompt（由此确定响应信封）和影响模型语义的 Client 事实；
 - kind、完整 original、Lines 边界与源上下文；
 - 实际选中的 Placeholder 有序绑定；
 - 实际有序术语命中；
@@ -354,27 +293,27 @@ WriteBack 按普通 Standard 规则消费它们。独立命令不生成 Standard
 
 ## 9. 并发、提交与任务结果
 
-所选 Client 的 `max_concurrent_requests`（记为 N）决定活动 HTTP 数。完整 Corpus、Plan、
-Task 和传播目标可以保存在内存。Standard 与 Managed 共享同一个有序执行内核：乱序执行
-网络请求和无副作用准备，响应完成后立即释放 HTTP 许可，再由顺序 finalizer 只按自然
-task index checkpoint。包括活动请求、已完成等待重排及正在最终化的任务在内，本地最多
-保持 3N 个已入场任务；该内部窗口固化在代码中，不进入 Profile 或 Lua 配置。
+所选 Client 的 `max_concurrent_requests`（记为 N）决定同时进行的 HTTP 请求数。完整
+Corpus、Plan、Task 和传播目标可以保存在内存。Standard 与 Managed 使用同一个有序执行器：
+网络请求和不修改项目的准备工作可以乱序完成；一个响应完成后立即释放 HTTP 名额；数据库
+写入仍严格按任务的自然顺序进行。活动请求、已经完成但等待前序任务的结果，以及正在写入
+数据库的任务合计最多 3N 个。这个窗口固定在程序中，不属于 Profile 或 Lua 配置。
 
-执行器统一实现 Client 重试预算、`Retry-After`、合作取消、停止新任务准入、在途 drain、
-最早自然序任务错误与明确提交终态。技术失败停止新工作；已经提交的自然序前缀保持。
-取消停止启动新任务；每个已经发出 `TaskStarted` 的任务仍回到顺序 finalizer 并取得明确
-的已提交、未提交或取消终态，尚未启动的任务不产生任务记录。取消事实建立后，已经从
-模型响应验收但尚未开始提交的任务不再进入 SQLite；它不能因为响应先返回而越过取消
-边界。ATT 不猜测外部请求是否未发生。
+执行器统一处理 Client 重试次数、`Retry-After`、合作取消和已经开始的请求。发生技术错误
+后不再启动新任务；已经确认写入的自然顺序前缀保持不变。取消后同样不再启动新任务，但
+每个已经发出 `TaskStarted` 的任务仍会得到明确的“已写入、未写入或已取消”结果；尚未启动
+的任务不产生任务记录。确认取消后，已经通过模型响应检查但尚未开始写入的任务不再进入
+SQLite。ATT 不猜测外部请求是否发生。
 
-Standard 与 Managed 各自维护业务计划和存储适配器。Standard 每个有写入的任务使用独立
-SQLite 事务，在同事务传播验收通过的重复集合。Managed 在发出请求前用一致快照完成
-Current 检查、non-applicable 清理、全局去重和 Current 冲突检查；随后每个 TaskBlock 把
-全部已接受 ID 的 translation/state 对作为一个短 CAS checkpoint 提交。CAS 同时核对
-owner 来源、manifest、unit 身份及读取时 translation/state pair。`NotApplied` 表示项目
-没有应用本 checkpoint；`OutcomeUnknown` 立即停止后续准入和提交，不能显示为普通未写入。
+Standard 与 Managed 各自维护任务计划和数据库适配器。Standard 为每个需要写入的任务
+使用独立 SQLite 事务，并在同一事务中传播已经通过检查的重复内容。Managed 在发出请求前，
+从同一数据库快照完成 Current 检查、non-applicable 清理、全局去重和 Current 冲突检查；
+随后每个 TaskBlock 用一次短 CAS checkpoint 写入全部已经接受的 translation/state 对。
+CAS 同时核对 owner 来源、manifest、unit 身份以及读取时的 translation/state pair。
+`NotApplied` 表示这次 checkpoint 没有修改项目；`OutcomeUnknown` 表示无法确认是否写入，
+此时立即停止启动和提交后续任务，不能把它显示成普通的“未写入”。
 
-普通不可用结果保持 translation/state 为空并允许下次重试。协议根合法时，合法 ID 可以
+普通不可用结果保持 translation/state 为空并允许下次重试。JSON 根合法时，合法 ID 可以
 与同任务的拒绝 ID 一起形成部分 checkpoint；数组 unit 自身仍全部接受或全部不写。技术
 失败或取消只保留已经确认提交的自然序前缀。
 
@@ -384,32 +323,23 @@ Standard 最终结果仍是：全部需要翻译的单元 Current 为 `Complete`
 或 Lua 调用正常返回不等于每个单元都有译文；技术错误、状态不一致或提交结果未知使用
 更强失败语义。
 
-模型响应拒绝作为 task unresolved 记录；每个译前 Placeholder 投影失败单元保留独立的
-结构化诊断事实，包含逻辑位置和专用原因，不伪造 task ID、模型 attempt 或响应拒绝原因。
+模型响应拒绝作为 task unresolved 记录；每个译前 Placeholder 处理失败的单元保留独立的
+结构化诊断信息，包含逻辑位置和专用原因，不伪造 task ID、模型 attempt 或响应拒绝原因。
 两者都计入最终 `remaining_decisions` 与 `remaining_locations`；因此即使所有已发送任务
 都完成，只要仍有 planning-unresolved，本轮也不能解释为全部 Current。普通项目日志可
-按稳定 code 和类型化 payload 记录摘要，但日志缺失不改变这些业务事实或提交结果。
+按稳定 code 和结构化字段记录摘要，但日志缺失不改变这些结果或数据库写入状态。
 
-各域规划建立真实任务总数后，进度只在对应任务必要的数据库终态确认后推进；业务
+Standard 或 Managed 建立真实任务总数后，进度只在对应任务的数据库写入结果确认后推进；业务
 Complete、Partial 与 Unavailable 都算已确认。零任务显示“无需调用模型”，不显示
 `0/0`。到达计划总数后仍进入必要收尾与保存运行方案。
 
-全部业务阶段成功且必要非日志根完成收尾后，最后一个短事务精确替换
-`translate_run_plan` 及 Translate Lua 程序。确认提交失败时旧方案保持；终态无法确认时
+全部翻译工作和必要的资源清理成功后，最后一个短事务精确替换
+`translate_run_plan` 及 Translate Lua 程序。确认提交失败时旧方案保持；写入结果无法确认时
 命令说明翻译结果已生效但方案状态无法确认，并建议下次显式传入 Profile 与 Lua 选择。
 项目日志的启动、写入或关闭故障不停止模型任务、不丢弃合法候选，也不改变退出码。
 
 ## 10. Standard 与 Managed 任务记录
 
-`[rpg_maker].record_translation_tasks = true` 时，顺序 finalizer 在真实验收和提交判断后，
-为每个已启动且由 ATT 拥有完整协议与提交真相的 TaskBlock 构造一份完整不可变 Markdown。
-同一 Translate 运行使用一个 run-wide ordinal：Standard 任务全部在前，Managed 任务随后
-继续编号；并发发送和完成顺序不改变文件名。同一任务的全部重试归入同一文件；
-System/User 按原生 Markdown 呈现，合法 Thinking 去除信封标签，合法 Assistant JSON 按
-原始 ID 顺序展开，最终结果明确区分验收与提交终态。
-
-任务记录是非权威旁路。它的渲染、建立、写入或清理失败只产生可见诊断，不改变任务
-Outcome、数据库、退出码、后续任务或保存方案。Managed 记录额外标明 collection，并在
-最终结果中把临时 ID 映射回 unit key；这些身份不进入模型 user message。低级
-`ctx.llm` 没有核心拥有的逐 ID 验收与提交终态，因此不生成记录。路径、完整模板、
-精确替换、互斥终态和原子落盘规则见[翻译任务记录现行规格](task-records.md)。
+Translate 可以按配置生成 Standard 与 Managed 任务记录。哪些任务会被记录、文件如何
+编号、保存哪些请求和结果、写入失败是否影响翻译，以及低级 `ctx.llm` 是否生成记录，
+统一由[翻译任务记录现行规格](task-records.md)规定；本文不重复这些规则。
