@@ -1,4 +1,4 @@
 interface:
   display_name: "用 ATT 交付 RPG Maker 翻译"
-  short_description: "用一个任务清单规划并检查完整的 RPG Maker 翻译"
-  default_prompt: "使用 $translate-rpg-maker-with-att，通过一个 Markdown 任务清单规划、执行并检查这项 RPG Maker 翻译。"
+  short_description: "用简洁任务清单完成 RPG Maker 的提取、翻译和写回"
+  default_prompt: "使用 $translate-rpg-maker-with-att，通过一个简洁的 Markdown 任务清单完成这项 RPG Maker 翻译。"
