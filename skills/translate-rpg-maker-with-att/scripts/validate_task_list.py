@@ -561,11 +561,11 @@ class TaskListValidator:
                 task_id.value,
             )
         writer = fields.get("当前唯一写入者")
-        if writer is not None and writer.value != "主 Agent":
+        if writer is not None and writer.value != "任务负责人":
             self.error(
                 "E_TASK_LIST_WRITER",
                 writer.line,
-                "当前唯一写入者必须为“主 Agent”",
+                "当前唯一写入者必须为“任务负责人”",
             )
         overall = fields.get("总体状态")
         if overall is not None and overall.value not in RESPONSIBILITY_STATES:
@@ -720,6 +720,15 @@ class TaskListValidator:
                     "E_TODO_TYPE",
                     task_type.line,
                     f"未知任务类型“{task_type.value}”",
+                    todo.identifier,
+                )
+
+            owner = todo.fields.get("负责人")
+            if owner is not None and owner.value != "任务负责人":
+                self.error(
+                    "E_TODO_OWNER",
+                    owner.line,
+                    "TODO 负责人必须为“任务负责人”",
                     todo.identifier,
                 )
 

@@ -112,7 +112,7 @@ def todo(
         lines.append(f"  - 参考文档：{reference_for(identifier)}")
     lines.extend(
         (
-            "  - 负责人：主 Agent",
+            "  - 负责人：任务负责人",
             f"  - 最近执行结果：{result}",
             f"  - 结果和证据：{evidence}",
             f"  - 下一步：{next_todo or identifier}",
@@ -183,7 +183,7 @@ def task_list_text(root: Path, path: Path, *, final: bool = False) -> str:
 - 总体状态：{overall}
 - 创建时间：2026-07-28T23:00:00+08:00
 - 最后更新时间：2026-07-28T23:01:00+08:00
-- 当前唯一写入者：主 Agent
+- 当前唯一写入者：任务负责人
 - 任务目录：{root}
 - 任务清单：{path}
 - 游戏来源：D:\\game
@@ -689,6 +689,26 @@ class TaskListValidatorTests(unittest.TestCase):
             set(),
             self.validate(target, target.read_text(encoding="utf-8"), final=True),
         )
+
+    def test_only_task_owner_can_write_task_list(self) -> None:
+        temporary, target = self.make_task_list()
+        self.addCleanup(temporary.cleanup)
+        text = target.read_text(encoding="utf-8").replace(
+            "- 当前唯一写入者：任务负责人",
+            "- 当前唯一写入者：协作者",
+            1,
+        )
+        self.assertIn("E_TASK_LIST_WRITER", self.validate(target, text))
+
+    def test_task_owner_remains_responsible_for_delegated_todo(self) -> None:
+        temporary, target = self.make_task_list()
+        self.addCleanup(temporary.cleanup)
+        text = target.read_text(encoding="utf-8").replace(
+            "  - 负责人：任务负责人",
+            "  - 负责人：协作者",
+            1,
+        )
+        self.assertIn("E_TODO_OWNER", self.validate(target, text))
 
     def test_done_requires_succeeded(self) -> None:
         temporary, target = self.make_task_list(final=True)
