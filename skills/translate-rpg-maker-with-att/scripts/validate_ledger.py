@@ -43,6 +43,9 @@ PHASE_NAMES: Final[dict[str, str]] = {
     "写回": "WBK",
     "封包": "RPK",
 }
+ADDITIONAL_FIXED_TODOS: Final[dict[str, str]] = {
+    "TRN-004": "3. 翻译（TRN）",
+}
 RESPONSIBILITY_STATES: Final[frozenset[str]] = frozenset(
     {"TODO", "DOING", "BLOCKED", "DONE", "N/A", "SUPERSEDED", "CANCELLED"}
 )
@@ -531,6 +534,14 @@ class LedgerValidator:
                         f"阶段缺少固定责任 {identifier}",
                         identifier,
                     )
+        for identifier, section in ADDITIONAL_FIXED_TODOS.items():
+            if identifier not in self.todos:
+                self.error(
+                    "E_FIXED_TODO_MISSING",
+                    self._section_line(section),
+                    f"阶段缺少固定责任 {identifier}",
+                    identifier,
+                )
 
         for todo in self.todos.values():
             expected_prefix = PHASE_PREFIXES.get(todo.section)
@@ -632,7 +643,8 @@ class LedgerValidator:
                     todo, "取消依据", require_evidence=True
                 )
 
-            if todo.number in (2, 3) and todo.state in {
+            non_skippable = todo.number in (2, 3) or todo.identifier in ADDITIONAL_FIXED_TODOS
+            if non_skippable and todo.state in {
                 "N/A",
                 "SUPERSEDED",
                 "CANCELLED",
@@ -640,7 +652,7 @@ class LedgerValidator:
                 self.error(
                     "E_GATE_TERMINAL_STATE",
                     todo.line,
-                    "固定进入门和验收门只能保持开放、阻塞或以 DONE 收束",
+                    "固定进入门、验收门和术语责任只能保持开放、阻塞或以 DONE 收束",
                     todo.identifier,
                 )
 

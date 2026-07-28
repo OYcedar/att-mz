@@ -69,6 +69,7 @@ def ledger_text(root: Path, path: Path, final: bool = False) -> str:
             + todo(prefix, 2, todo_state)
             + "\n"
             + todo(prefix, 3, todo_state)
+            + ("\n" + todo(prefix, 4, todo_state) if prefix == "TRN" else "")
         )
 
     completion = "完成" if final else "未完成"
@@ -195,6 +196,22 @@ class LedgerValidatorTests(unittest.TestCase):
         diagnostics = MODULE.LedgerValidator(target, text, final=False).validate()
         self.assertIn("E_SECTION_ORDER", {item.code for item in diagnostics})
 
+    def test_missing_fixed_terminology_responsibility_is_rejected(self) -> None:
+        temporary, target = self.make_ledger()
+        self.addCleanup(temporary.cleanup)
+        text = target.read_text(encoding="utf-8").replace(todo("TRN", 4), "")
+        diagnostics = MODULE.LedgerValidator(target, text, final=False).validate()
+        self.assertIn("E_FIXED_TODO_MISSING", {item.code for item in diagnostics})
+
+    def test_fixed_terminology_responsibility_cannot_be_skipped(self) -> None:
+        temporary, target = self.make_ledger()
+        self.addCleanup(temporary.cleanup)
+        text = target.read_text(encoding="utf-8").replace(
+            todo("TRN", 4), todo("TRN", 4, "N/A")
+        )
+        diagnostics = MODULE.LedgerValidator(target, text, final=False).validate()
+        self.assertIn("E_GATE_TERMINAL_STATE", {item.code for item in diagnostics})
+
     def test_code_block_example_is_ignored(self) -> None:
         temporary, target = self.make_ledger()
         self.addCleanup(temporary.cleanup)
@@ -259,7 +276,7 @@ class LedgerValidatorTests(unittest.TestCase):
         temporary, target = self.make_ledger()
         self.addCleanup(temporary.cleanup)
         text = target.read_text(encoding="utf-8")
-        extra_todos = "\n".join(todo("TRN", number) for number in (4, 5, 6))
+        extra_todos = "\n".join(todo("TRN", number) for number in (5, 6))
         text = text.replace("## 4. 写回（WBK）", f"{extra_todos}\n## 4. 写回（WBK）")
         text = text.replace(
             "- 支持或否定：UNP-001、最终完成声明",

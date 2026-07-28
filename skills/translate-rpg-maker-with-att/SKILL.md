@@ -93,6 +93,12 @@ Lua Standard、Managed 以及低级 `translation.prepare` 的实际输入，核�
 新增与丢失命中、Custom/Custom 和 Custom/Builtin 重叠。具体语法和 scope 只从
 [Rules 现行规格](../../docs/rpg-maker/rules.md)读取。
 
+正式批量 Translate 前必须完成固定责任 `TRN-004`：以现行 MV/MZ 特殊字段和 Builtin
+覆盖矩阵建立高价值候选，再对任务范围内全部玩家可见文本及其运行时消费者完成全局取证、
+消歧和正反例命中验证。特殊字段只是候选入口，出现频次也不是收录依据；不得把结构化字段、
+原始字符串或已提取单位机械复制成术语。没有可用术语时仍须用证据证明并提交权威
+`term = []`。完整步骤见 [五阶段门禁](references/stage-gates.md#4-翻译)。
+
 ## Lua 路由
 
 先判断 Builtin、Rules 或 Standard 是否已准确表达责任。Lua 负责私有发现与映射、翻译单位
