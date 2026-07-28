@@ -4,19 +4,29 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use crate::diagnostic::{
-    DiagnosticAction, DiagnosticImpact, DiagnosticStage, FailureReport, RecoveryFact,
+    DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
+    DiagnosticStage, DiagnosticSubject, FailureReport, RecoveryFact, ReportedFailure,
     SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::OperationCompletion;
 use crate::rpg_maker::lua::LuaProjectContext;
 use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingError;
-use crate::rpg_maker::lua::runtime::{OwnedLuaProgram, TrustedLuaExtractIntent};
+use crate::rpg_maker::lua::runtime::{
+    OwnedLuaProgram, TrustedLuaManagedTranslationContent, TrustedLuaManagedTranslationShape,
+    TrustedLuaManagedTranslationSnapshot, TrustedLuaStandardExtractIntent,
+};
 pub(crate) use crate::rpg_maker::lua::{
     LuaInvocation, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
 };
+use crate::rpg_maker::managed_translation::{
+    ManagedTranslationCollection, ManagedTranslationContent, ManagedTranslationMetadata,
+    ManagedTranslationModelError, ManagedTranslationShape, ManagedTranslationSnapshot,
+    ManagedTranslationUnit,
+};
 use crate::rpg_maker::project::OpenedProject;
+use crate::rpg_maker::text::TextGroupKind;
 
-use super::store::LuaSnapshotStore;
+use super::store::{LuaSnapshotStore, LuaStandardSnapshotMutation};
 use super::{ExtractProgress, ExtractProgressPhase};
 
 /// 执行一次可信 Lua 提取，并在 Host 干净结束后收敛其可选标准快照意图。
@@ -29,6 +39,12 @@ pub(crate) trait LuaExtraction: Send + Sync {
         program: OwnedLuaProgram,
         progress: ExtractProgress,
     ) -> impl Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send;
+
+    fn deactivate(
+        &self,
+        project: &OpenedProject,
+        progress: ExtractProgress,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// 把 Extract 阶段已经建立的项目事实交给可信 Lua Host。
@@ -67,13 +83,8 @@ where
         progress: ExtractProgress,
     ) -> Result<OperationCompletion<()>, Self::Error> {
         if program.source().is_empty() {
-            progress.indeterminate(ExtractProgressPhase::LuaCommit);
-            return self
-                .store
-                .deactivate_lua(project)
-                .await
-                .map(|_| OperationCompletion::Completed(()))
-                .map_err(LuaExtractionError::StoreSnapshot);
+            self.deactivate(project, progress).await?;
+            return Ok(OperationCompletion::Completed(()));
         }
         let host = self
             .host
@@ -105,24 +116,149 @@ where
 
         match outcome {
             TrustedLuaExecutionOutcome::Empty => Ok(OperationCompletion::Completed(())),
-            TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Replace(
-                snapshot,
-            )) => {
+            TrustedLuaExecutionOutcome::ExtractIntent(intent) => {
+                let (standard, managed) = intent.into_parts();
+                let standard = standard.map(|intent| match intent {
+                    TrustedLuaStandardExtractIntent::Replace(snapshot) => {
+                        LuaStandardSnapshotMutation::Replace(snapshot)
+                    }
+                    TrustedLuaStandardExtractIntent::Deactivate => {
+                        LuaStandardSnapshotMutation::Deactivate
+                    }
+                });
+                let managed = managed
+                    .map(|snapshot| build_managed_snapshot(project, snapshot))
+                    .transpose()
+                    .map_err(LuaExtractionError::InvalidManagedSnapshot)?;
+                if standard.is_none() && managed.is_none() {
+                    return Ok(OperationCompletion::Completed(()));
+                }
                 progress.indeterminate(ExtractProgressPhase::LuaCommit);
                 self.store
-                    .replace_lua(project, snapshot)
+                    .apply_lua(project, standard, managed)
                     .await
                     .map(|_| OperationCompletion::Completed(()))
                     .map_err(LuaExtractionError::StoreSnapshot)
             }
-            TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::Deactivate) => {
-                progress.indeterminate(ExtractProgressPhase::LuaCommit);
-                self.store
-                    .deactivate_lua(project)
-                    .await
-                    .map(|_| OperationCompletion::Completed(()))
-                    .map_err(LuaExtractionError::StoreSnapshot)
+        }
+    }
+
+    async fn deactivate(
+        &self,
+        project: &OpenedProject,
+        progress: ExtractProgress,
+    ) -> Result<(), Self::Error> {
+        progress.indeterminate(ExtractProgressPhase::LuaCommit);
+        self.store
+            .deactivate_lua(project)
+            .await
+            .map_err(LuaExtractionError::StoreSnapshot)
+    }
+}
+
+fn build_managed_snapshot(
+    project: &OpenedProject,
+    snapshot: TrustedLuaManagedTranslationSnapshot,
+) -> Result<ManagedTranslationSnapshot, ManagedSnapshotBuildError> {
+    let collections = snapshot
+        .collections()
+        .iter()
+        .map(|collection| {
+            let units = collection
+                .units()
+                .iter()
+                .map(
+                    |unit| -> Result<ManagedTranslationUnit, ManagedSnapshotBuildError> {
+                        let kind = match unit.kind() {
+                            "dialogue" => Some(TextGroupKind::EventDialogue),
+                            "choices" => Some(TextGroupKind::EventChoices),
+                            "scrolling_text" => Some(TextGroupKind::EventScrollingText),
+                            value => TextGroupKind::from_storage_name(value).filter(|kind| {
+                                !matches!(
+                                    kind,
+                                    TextGroupKind::EventDialogue
+                                        | TextGroupKind::EventChoices
+                                        | TextGroupKind::EventScrollingText
+                                )
+                            }),
+                        }
+                        .ok_or_else(|| {
+                            ManagedSnapshotBuildError::UnknownKind(unit.kind().to_owned())
+                        })?;
+                        let shape = match unit.shape() {
+                            TrustedLuaManagedTranslationShape::Single => {
+                                ManagedTranslationShape::Single
+                            }
+                            TrustedLuaManagedTranslationShape::Reflow => {
+                                ManagedTranslationShape::Reflow
+                            }
+                            TrustedLuaManagedTranslationShape::Lines => {
+                                ManagedTranslationShape::Lines
+                            }
+                            TrustedLuaManagedTranslationShape::Items => {
+                                ManagedTranslationShape::Items
+                            }
+                        };
+                        let original = match unit.original() {
+                            TrustedLuaManagedTranslationContent::Scalar(value) => {
+                                ManagedTranslationContent::scalar(value.clone())
+                            }
+                            TrustedLuaManagedTranslationContent::Array(values) => {
+                                ManagedTranslationContent::array(values.clone())
+                            }
+                        };
+                        let metadata = unit
+                            .metadata_json()
+                            .map(ManagedTranslationMetadata::from_canonical_json)
+                            .transpose()?;
+                        ManagedTranslationUnit::new(
+                            unit.key(),
+                            kind.storage_name(),
+                            shape,
+                            original,
+                            unit.context(),
+                            metadata,
+                        )
+                        .map_err(ManagedSnapshotBuildError::Model)
+                    },
+                )
+                .collect::<Result<Vec<_>, ManagedSnapshotBuildError>>()?;
+            ManagedTranslationCollection::new(collection.name(), collection.instruction(), units)
+                .map_err(ManagedSnapshotBuildError::Model)
+        })
+        .collect::<Result<Vec<_>, ManagedSnapshotBuildError>>()?;
+    ManagedTranslationSnapshot::new(project.source_snapshot_fingerprint(), collections)
+        .map_err(ManagedSnapshotBuildError::Model)
+}
+
+#[derive(Debug)]
+pub(crate) enum ManagedSnapshotBuildError {
+    UnknownKind(String),
+    Model(ManagedTranslationModelError),
+}
+
+impl From<ManagedTranslationModelError> for ManagedSnapshotBuildError {
+    fn from(source: ManagedTranslationModelError) -> Self {
+        Self::Model(source)
+    }
+}
+
+impl fmt::Display for ManagedSnapshotBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownKind(kind) => {
+                write!(formatter, "未知 RPG Maker 托管翻译 kind：{kind}")
             }
+            Self::Model(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ManagedSnapshotBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::UnknownKind(_) => None,
+            Self::Model(source) => Some(source),
         }
     }
 }
@@ -131,6 +267,7 @@ where
 #[derive(Debug)]
 pub(crate) enum LuaExtractionError<E, S> {
     ExecuteHost { script_path: PathBuf, source: E },
+    InvalidManagedSnapshot(ManagedSnapshotBuildError),
     StoreSnapshot(S),
 }
 
@@ -151,6 +288,7 @@ where
                 script_path,
                 DiagnosticImpact::Unchanged,
             ),
+            Self::InvalidManagedSnapshot(_) => invalid_managed_snapshot_diagnostic(),
             Self::StoreSnapshot(source) => source
                 .safe_diagnostic_source(
                     DiagnosticStage::Extract,
@@ -177,6 +315,10 @@ where
                 &script_path,
                 DiagnosticImpact::Unchanged,
             ),
+            Self::InvalidManagedSnapshot(source) => FailureReport::new(ReportedFailure::new(
+                invalid_managed_snapshot_diagnostic(),
+                source,
+            )),
             Self::StoreSnapshot(source) => source
                 .into_failure_report(
                     DiagnosticStage::Extract,
@@ -203,6 +345,9 @@ where
                 "执行可信 Lua 提取 Host 失败 {}：{source}",
                 script_path.display()
             ),
+            Self::InvalidManagedSnapshot(source) => {
+                write!(formatter, "Lua 托管翻译快照无效：{source}")
+            }
             Self::StoreSnapshot(source) => write!(formatter, "保存 Lua 标准资产快照失败：{source}"),
         }
     }
@@ -216,9 +361,21 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ExecuteHost { source, .. } => Some(source),
+            Self::InvalidManagedSnapshot(source) => Some(source),
             Self::StoreSnapshot(source) => Some(source),
         }
     }
+}
+
+fn invalid_managed_snapshot_diagnostic() -> SafeDiagnostic {
+    SafeDiagnostic::new(
+        DiagnosticCode::LuaExecution,
+        DiagnosticStage::Extract,
+        DiagnosticSubject::component("Lua managed translation snapshot"),
+        DiagnosticReason::failure(DiagnosticFailureKind::InvalidValue),
+        DiagnosticImpact::Unchanged,
+        DiagnosticAction::FixInput,
+    )
 }
 
 #[cfg(test)]
@@ -234,7 +391,9 @@ mod tests {
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::extract::store::LuaSnapshot;
     use crate::rpg_maker::lua::runtime::{
-        TrustedLuaExtractIntent, TrustedLuaRuntimeExecutionError,
+        TrustedLuaExtractIntent, TrustedLuaManagedTranslationCollectionDeclaration,
+        TrustedLuaManagedTranslationSnapshot, TrustedLuaManagedTranslationUnitDeclaration,
+        TrustedLuaRuntimeExecutionError, TrustedLuaStandardExtractIntent,
     };
     use crate::rpg_maker::lua::{LuaPhase, LuaProjectContext};
 
@@ -266,6 +425,27 @@ mod tests {
         fail: bool,
         cancelled: bool,
         outcome: TrustedLuaExecutionOutcome,
+    }
+
+    fn standard_outcome(intent: TrustedLuaStandardExtractIntent) -> TrustedLuaExecutionOutcome {
+        TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::new(Some(intent), None))
+    }
+
+    fn managed_snapshot() -> TrustedLuaManagedTranslationSnapshot {
+        TrustedLuaManagedTranslationSnapshot::new(vec![
+            TrustedLuaManagedTranslationCollectionDeclaration::new(
+                "quests".to_owned(),
+                "翻译标题".to_owned(),
+                vec![TrustedLuaManagedTranslationUnitDeclaration::new(
+                    "quest:1".to_owned(),
+                    "plugin_parameter".to_owned(),
+                    TrustedLuaManagedTranslationShape::Single,
+                    TrustedLuaManagedTranslationContent::scalar("星港へ"),
+                    "".to_owned(),
+                    Some(r#"{"quest_id":12}"#.to_owned()),
+                )],
+            ),
+        ])
     }
 
     impl TrustedLuaExecutionHost for FakeHost {
@@ -306,8 +486,11 @@ mod tests {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum StoreCall {
-        Replace(usize),
-        Deactivate,
+        Apply {
+            standard: Option<&'static str>,
+            managed_collections: Option<usize>,
+        },
+        DeactivateAll,
     }
 
     #[derive(Clone, Default)]
@@ -319,18 +502,31 @@ mod tests {
     impl LuaSnapshotStore for FakeStore {
         type Error = FakeError;
 
-        async fn replace_lua(
+        async fn apply_lua(
             &self,
             _project: &OpenedProject,
-            snapshot: LuaSnapshot,
+            standard: Option<LuaStandardSnapshotMutation>,
+            managed: Option<ManagedTranslationSnapshot>,
         ) -> Result<(), Self::Error> {
             if self.fail {
                 return Err(FakeError);
             }
+            let standard = standard.as_ref().map(|mutation| match mutation {
+                LuaStandardSnapshotMutation::Replace(snapshot) if snapshot.groups().is_empty() => {
+                    "replace_empty"
+                }
+                LuaStandardSnapshotMutation::Replace(_) => "replace",
+                LuaStandardSnapshotMutation::Deactivate => "deactivate",
+            });
             self.calls
                 .lock()
                 .expect("Store 调用锁不应中毒")
-                .push(StoreCall::Replace(snapshot.groups().len()));
+                .push(StoreCall::Apply {
+                    standard,
+                    managed_collections: managed
+                        .as_ref()
+                        .map(|snapshot| snapshot.collections().len()),
+                });
             Ok(())
         }
 
@@ -341,7 +537,7 @@ mod tests {
             self.calls
                 .lock()
                 .expect("Store 调用锁不应中毒")
-                .push(StoreCall::Deactivate);
+                .push(StoreCall::DeactivateAll);
             Ok(())
         }
     }
@@ -488,7 +684,7 @@ mod tests {
         assert_eq!(completion, OperationCompletion::Completed(()));
         assert_eq!(
             calls.lock().expect("Store 调用锁不应中毒").as_slice(),
-            &[StoreCall::Deactivate]
+            &[StoreCall::DeactivateAll]
         );
         assert_eq!(
             progress.snapshots(),
@@ -545,16 +741,19 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_script_path_and_host_source() {
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
         let service = LuaExtractionService::new(
             FakeHost {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: true,
                 cancelled: false,
-                outcome: TrustedLuaExecutionOutcome::ExtractIntent(
-                    TrustedLuaExtractIntent::Deactivate,
-                ),
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::new(
+                    Some(TrustedLuaStandardExtractIntent::Deactivate),
+                    Some(managed_snapshot()),
+                )),
             },
-            FakeStore::default(),
+            store,
         );
 
         let error = service
@@ -574,6 +773,10 @@ mod tests {
             } if script_path == &PathBuf::from("broken extract.lua")
         ));
         assert!(error.to_string().contains("broken extract.lua"));
+        assert!(
+            calls.lock().expect("Store 调用锁不应中毒").is_empty(),
+            "Host 失败时不得提交此前记录的任何 Extract 意图"
+        );
     }
 
     #[test]
@@ -648,9 +851,9 @@ mod tests {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: false,
                 cancelled: false,
-                outcome: TrustedLuaExecutionOutcome::ExtractIntent(
-                    TrustedLuaExtractIntent::Replace(LuaSnapshot::empty()),
-                ),
+                outcome: standard_outcome(TrustedLuaStandardExtractIntent::Replace(
+                    LuaSnapshot::empty(),
+                )),
             },
             store,
         );
@@ -666,7 +869,10 @@ mod tests {
 
         assert_eq!(
             calls.lock().expect("Store 调用锁不应中毒").as_slice(),
-            &[StoreCall::Replace(0)]
+            &[StoreCall::Apply {
+                standard: Some("replace_empty"),
+                managed_collections: None,
+            }]
         );
         assert_eq!(
             progress.snapshots(),
@@ -678,6 +884,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_only_intent_preserves_standard_and_builds_an_active_snapshot() {
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                cancelled: false,
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::new(
+                    None,
+                    Some(managed_snapshot()),
+                )),
+            },
+            store,
+        );
+
+        service
+            .run(
+                &opened_project(),
+                program("extract.lua"),
+                ExtractProgress::default(),
+            )
+            .await
+            .expect("仅托管意图应成功提交");
+
+        assert_eq!(
+            calls.lock().expect("Store 调用锁不应中毒").as_slice(),
+            &[StoreCall::Apply {
+                standard: None,
+                managed_collections: Some(1),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_managed_replace_remains_an_explicit_active_snapshot() {
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                cancelled: false,
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::new(
+                    None,
+                    Some(TrustedLuaManagedTranslationSnapshot::new(Vec::new())),
+                )),
+            },
+            store,
+        );
+
+        service
+            .run(
+                &opened_project(),
+                program("extract.lua"),
+                ExtractProgress::default(),
+            )
+            .await
+            .expect("空 Managed replace 仍应提交 active 快照");
+
+        assert_eq!(
+            calls.lock().expect("Store 调用锁不应中毒").as_slice(),
+            &[StoreCall::Apply {
+                standard: None,
+                managed_collections: Some(0),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_and_managed_intents_reach_one_atomic_store_call() {
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                cancelled: false,
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::new(
+                    Some(TrustedLuaStandardExtractIntent::Replace(
+                        LuaSnapshot::empty(),
+                    )),
+                    Some(managed_snapshot()),
+                )),
+            },
+            store,
+        );
+
+        service
+            .run(
+                &opened_project(),
+                program("extract.lua"),
+                ExtractProgress::default(),
+            )
+            .await
+            .expect("两个域的意图应原子提交");
+
+        assert_eq!(
+            calls.lock().expect("Store 调用锁不应中毒").as_slice(),
+            &[StoreCall::Apply {
+                standard: Some("replace_empty"),
+                managed_collections: Some(1),
+            }],
+            "服务只能把两个域交给同一个 Store 调用"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_managed_dto_is_revalidated_before_any_store_write() {
+        let invalid = TrustedLuaManagedTranslationSnapshot::new(vec![
+            TrustedLuaManagedTranslationCollectionDeclaration::new(
+                "quests".to_owned(),
+                "".to_owned(),
+                vec![TrustedLuaManagedTranslationUnitDeclaration::new(
+                    "quest:1".to_owned(),
+                    "plugin_parameter".to_owned(),
+                    TrustedLuaManagedTranslationShape::Single,
+                    TrustedLuaManagedTranslationContent::scalar("含\n换行"),
+                    "".to_owned(),
+                    None,
+                )],
+            ),
+        ]);
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                cancelled: false,
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::new(
+                    None,
+                    Some(invalid),
+                )),
+            },
+            store,
+        );
+
+        let error = service
+            .run(
+                &opened_project(),
+                program("extract.lua"),
+                ExtractProgress::default(),
+            )
+            .await
+            .expect_err("违反受信模型不变量的 DTO 必须在事务前失败");
+
+        assert!(matches!(
+            error,
+            LuaExtractionError::InvalidManagedSnapshot(ManagedSnapshotBuildError::Model(
+                ManagedTranslationModelError::InvalidContentText { .. }
+            ))
+        ));
+        assert!(calls.lock().expect("Store 调用锁不应中毒").is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_rpg_maker_kind_fails_before_any_store_write() {
+        let invalid = TrustedLuaManagedTranslationSnapshot::new(vec![
+            TrustedLuaManagedTranslationCollectionDeclaration::new(
+                "quests".to_owned(),
+                "".to_owned(),
+                vec![TrustedLuaManagedTranslationUnitDeclaration::new(
+                    "quest:1".to_owned(),
+                    "private_engine_kind".to_owned(),
+                    TrustedLuaManagedTranslationShape::Single,
+                    TrustedLuaManagedTranslationContent::scalar("原文"),
+                    "".to_owned(),
+                    None,
+                )],
+            ),
+        ]);
+        let store = FakeStore::default();
+        let calls = Arc::clone(&store.calls);
+        let service = LuaExtractionService::new(
+            FakeHost {
+                invocation: Arc::new(Mutex::new(None)),
+                fail: false,
+                cancelled: false,
+                outcome: TrustedLuaExecutionOutcome::ExtractIntent(TrustedLuaExtractIntent::new(
+                    None,
+                    Some(invalid),
+                )),
+            },
+            store,
+        );
+
+        let error = service
+            .run(
+                &opened_project(),
+                program("extract.lua"),
+                ExtractProgress::default(),
+            )
+            .await
+            .expect_err("未知 RPG Maker kind 必须在提交前失败");
+
+        assert!(matches!(
+            error,
+            LuaExtractionError::InvalidManagedSnapshot(
+                ManagedSnapshotBuildError::UnknownKind(kind)
+            ) if kind == "private_engine_kind"
+        ));
+        assert!(calls.lock().expect("Store 调用锁不应中毒").is_empty());
+    }
+
+    #[tokio::test]
     async fn cancellation_is_a_normal_result_and_never_commits_the_extract_intent() {
         let store = FakeStore::default();
         let calls = Arc::clone(&store.calls);
@@ -686,9 +1098,7 @@ mod tests {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: false,
                 cancelled: true,
-                outcome: TrustedLuaExecutionOutcome::ExtractIntent(
-                    TrustedLuaExtractIntent::Deactivate,
-                ),
+                outcome: standard_outcome(TrustedLuaStandardExtractIntent::Deactivate),
             },
             store,
         );
@@ -713,9 +1123,7 @@ mod tests {
                 invocation: Arc::new(Mutex::new(None)),
                 fail: false,
                 cancelled: false,
-                outcome: TrustedLuaExecutionOutcome::ExtractIntent(
-                    TrustedLuaExtractIntent::Deactivate,
-                ),
+                outcome: standard_outcome(TrustedLuaStandardExtractIntent::Deactivate),
             },
             FakeStore {
                 calls: Arc::new(Mutex::new(Vec::new())),

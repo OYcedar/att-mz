@@ -72,6 +72,7 @@ use crate::rpg_maker::lua::runtime::{
 use crate::rpg_maker::lua::{
     LuaInvocation, LuaProjectContext, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
 };
+use crate::rpg_maker::managed_translation::ManagedTranslationSqliteRepository;
 use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::project::{
     ExistingProjectOpener, ExistingProjectOpeningError, ExistingProjectOpeningService,
@@ -106,6 +107,9 @@ use crate::rpg_maker::translate::executor::{
     RpgMakerStandardTranslationTaskExecutionService, TranslationTaskResponseProcessingService,
 };
 use crate::rpg_maker::translate::lua::{LuaTranslationError, LuaTranslationService};
+use crate::rpg_maker::translate::managed::{
+    ManagedTranslationReadService, ManagedTranslationService,
+};
 use crate::rpg_maker::translate::placeholder::{
     Pcre2PlaceholderConstructionError, Pcre2PlaceholderService,
 };
@@ -1763,6 +1767,10 @@ impl ProductionRpgMakerCommandRunner {
             };
             SelectedLua::new(program.clone(), executor)
         });
+        let removed_lua = (explicit_selection && command.lua().is_none()).then(|| {
+            let store = RpgMakerExtractionAssetStore::new(sqlite.clone(), cpu.clone());
+            LuaExtractionService::<ProductionLuaHost, _>::deactivation_only(store)
+        });
         let service = ExtractService::new(
             opener,
             builtin,
@@ -1770,7 +1778,11 @@ impl ProductionRpgMakerCommandRunner {
             selected_lua,
             AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
             cancellation.clone(),
-        )
+        );
+        let service = match removed_lua {
+            Some(removed_lua) => service.with_removed_lua(removed_lua),
+            None => service,
+        }
         .with_progress(progress_observer.clone());
         let input = ExtractInput {
             name: command.project_name().clone(),
@@ -2255,7 +2267,7 @@ impl ProductionRpgMakerCommandRunner {
         let no_model_work = matches!(
             &execution,
             DrivenCommand::Finished(Ok(OperationCompletion::Completed(output)))
-                if output.standard.total_tasks == 0
+                if output.standard.total_tasks == 0 && !output.lua_executed
         );
         if no_model_work {
             progress_observer.observe(ProgressSnapshot::indeterminate(
@@ -2572,13 +2584,19 @@ impl ProductionRpgMakerCommandRunner {
         .with_progress(progress_observer.clone());
         let publisher = StandardWriteBackPublishingService::new(directory_publisher.clone());
         let selected_lua = lua.as_ref().map(|selected| {
-                let host = TrustedLuaExecutionHostingService::<_, OpenAiChatCompletionExecutor, _, _>::without_llm(
-                    file_system.clone(), selected.runtime.clone(), sqlite.clone(),
+            let host =
+                TrustedLuaExecutionHostingService::<_, OpenAiChatCompletionExecutor, _, _>::without_llm(
+                    file_system.clone(),
+                    selected.runtime.clone(),
+                    sqlite.clone(),
                 );
-                SelectedLua::new(
-                    selected.program.clone(),
-                    LuaWriteBackService::new(host, directory_publisher),
-                )
+            let managed = ManagedTranslationReadService::new(
+                ManagedTranslationSqliteRepository::new(sqlite.clone()),
+            );
+            SelectedLua::new(
+                selected.program.clone(),
+                LuaWriteBackService::with_managed(host, directory_publisher, managed),
+            )
         });
         let service = WriteBackService::new(
             opener,
@@ -4379,7 +4397,15 @@ type ProductionLuaHost = TrustedLuaExecutionHostingService<
     TrustedLua54Runtime,
     RusqliteStorage,
 >;
-type ProductionLuaTranslation = LuaTranslationService<ProductionLuaHost>;
+type ProductionManagedTranslation = ManagedTranslationService<
+    OpenAiChatCompletionExecutor,
+    TokioAsyncDelay,
+    RayonCpuExecutor,
+    ManagedTranslationSqliteRepository<RusqliteStorage>,
+    ConfiguredTranslationTaskRecordSink,
+>;
+type ProductionLuaTranslation =
+    LuaTranslationService<ProductionLuaHost, ProductionManagedTranslation>;
 
 /// 独立项目 Lua 到 Standard 人工候选核心之间的生产组合根。
 ///
@@ -5496,6 +5522,7 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             placeholders,
             self.cpu.clone(),
         );
+        let response_envelope = translation_resources.system_prompt().response_envelope();
         let processor =
             TranslationTaskResponseProcessingService::new(self.cpu.clone(), translation_resources);
         let executor = RpgMakerStandardTranslationTaskExecutionService::<
@@ -5530,7 +5557,22 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
                 selected.runtime.clone(),
                 self.sqlite.clone(),
             );
-            SelectedLua::new(selected.program.clone(), LuaTranslationService::new(host))
+            let managed = ManagedTranslationService::new(
+                self.llm.clone(),
+                TokioAsyncDelay,
+                self.cpu.clone(),
+                ManagedTranslationSqliteRepository::new(self.sqlite.clone()),
+                profile.planning().clone(),
+                profile.request().clone(),
+                response_envelope,
+                self.task_records.clone(),
+                self.cancellation.clone(),
+            )
+            .with_task_log(Arc::new(self.log.clone()));
+            SelectedLua::new(
+                selected.program.clone(),
+                LuaTranslationService::with_managed(host, managed),
+            )
         });
         Ok(SelectedTranslationExecution::new(profile, standard, lua))
     }
@@ -7010,6 +7052,9 @@ where
             script_path: _,
             source,
         } => map_project_failure_report(source.into_extract_failure_report()),
+        ExtractServiceError::LuaDeactivation(source) => {
+            map_project_failure_report(source.into_extract_failure_report())
+        }
     }
 }
 

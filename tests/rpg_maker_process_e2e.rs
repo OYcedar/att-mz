@@ -49,6 +49,12 @@ const MANUAL_STANDARD_ITEM_SOURCE: &str = "回復薬です";
 const MANUAL_STANDARD_ITEM_TRANSLATION: &str = "恢复药剂";
 const MANUAL_STANDARD_DIALOGUE_SOURCE: [&str; 2] = ["今日は晴れです。", "散歩しましょう。"];
 const MANUAL_STANDARD_DIALOGUE_TRANSLATION: &str = "今天天气晴朗，一起散步吧。";
+const MANAGED_PROJECT: &str = "managed-translation";
+const MANAGED_ORIGINAL: &str = "星港へ";
+const MANAGED_TRANSLATION: &str = "前往星港";
+const MANAGED_EXTRACT_LUA: &str = "scripts/managed_extract.lua";
+const MANAGED_TRANSLATE_LUA: &str = "scripts/managed_translate.lua";
+const MANAGED_WRITE_BACK_LUA: &str = "scripts/managed_write_back.lua";
 const SYSTEM_PROMPT_TEMPLATE: &str = "E2E SYSTEM CONTRACT: {{source_language}} -> {{target_language}}; repeat {{source_language}} -> {{target_language}}";
 const SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT: ja -> zh-Hans; repeat ja -> zh-Hans";
 const UPDATED_SYSTEM_PROMPT_TEMPLATE: &str =
@@ -1900,6 +1906,260 @@ fn prompt_locale_routing_renders_language_pairs_and_fails_before_llm_without_fal
         true,
         "thinking.md",
         &["第 0 字节处的 UTF-8 无效", "无效长度为 1 字节"],
+    );
+}
+
+#[test]
+fn managed_lua_translation_crosses_extract_translate_and_write_back_processes() {
+    let temporary = tempfile::tempdir().expect("应可建立 Managed 纵向端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
+    fs::create_dir_all(root.join("scripts")).expect("Lua 脚本目录应可建立");
+    write_minimal_mz_game(&game_root);
+
+    initialize_prompt_project(root, MANAGED_PROJECT, &game_root, "ja", "zh-Hans");
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+
+    fs::write(
+        root.join(MANAGED_EXTRACT_LUA),
+        format!(
+            r#"
+ctx.translations.replace({{
+  {{
+    name = "quest_titles",
+    instruction = "翻译任务标题；保持简洁。",
+    units = {{
+      {{
+        key = "quest:arrival",
+        kind = "plugin_parameter",
+        shape = "single",
+        original = "{MANAGED_ORIGINAL}",
+        context = "任务标题",
+        metadata = ctx.json.array({{12, "main"}}),
+      }},
+    }},
+  }},
+}})
+"#
+        ),
+    )
+    .expect("Managed Extract Lua 应可写入");
+    let extract = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "extract",
+            "--name",
+            MANAGED_PROJECT,
+            "--lua",
+            MANAGED_EXTRACT_LUA,
+        ]),
+    );
+    assert_success("Managed extract", &extract);
+
+    let workspace = root.join("projects/mz").join(MANAGED_PROJECT);
+    let database = workspace.join("project.db");
+    let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("Managed 项目数据库应可只读打开");
+    let declared = connection
+        .query_row(
+            r#"SELECT c.collection_name, c.instruction, u.unit_key, u.kind, u.shape,
+                      u.original_content_json, u.context, u.metadata_json,
+                      u.translation_content_json, u.translation_state
+               FROM managed_translation_collection AS c
+               JOIN managed_translation_unit AS u
+                 ON u.owner = c.owner
+                AND u.collection_name = c.collection_name
+              WHERE c.owner = 'lua'"#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
+                ))
+            },
+        )
+        .expect("Managed 声明应在 Extract 后原子落库");
+    assert_eq!(
+        declared,
+        (
+            "quest_titles".to_owned(),
+            "翻译任务标题；保持简洁。".to_owned(),
+            "quest:arrival".to_owned(),
+            "plugin_parameter".to_owned(),
+            "single".to_owned(),
+            serde_json::to_string(MANAGED_ORIGINAL).expect("测试原文应可编码"),
+            "任务标题".to_owned(),
+            r#"[12,"main"]"#.to_owned(),
+            None,
+            None,
+        )
+    );
+    drop(connection);
+
+    fs::write(
+        root.join(MANAGED_TRANSLATE_LUA),
+        format!(
+            r#"
+local report = ctx.translations.translate()
+local results = {{}}
+for result in report:units() do results[#results + 1] = result end
+assert(#results == 1)
+assert(results[1].collection == "quest_titles")
+assert(results[1].key == "quest:arrival")
+assert(results[1].status == "translated" or results[1].status == "current")
+assert(results[1].translation == "{MANAGED_TRANSLATION}")
+
+local collection = ctx.translations.open("quest_titles")
+assert(collection.name == "quest_titles")
+local unit = collection:get("quest:arrival")
+assert(unit.original == "{MANAGED_ORIGINAL}")
+assert(unit.translation == "{MANAGED_TRANSLATION}")
+assert(ctx.json.kind(unit.metadata) == "array")
+assert(#unit.metadata == 2 and unit.metadata[1] == 12 and unit.metadata[2] == "main")
+"#
+        ),
+    )
+    .expect("Managed Translate Lua 应可写入");
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), E2E_PARAMETERS);
+    enable_translation_task_records(root);
+    let requests = server.start_with_responses_and_observe(
+        vec![ChatResponseFixture::Managed],
+        ChatResponseFixture::Managed,
+    );
+    let translate = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "translate",
+            "--name",
+            MANAGED_PROJECT,
+            PROFILE,
+            "--lua",
+            MANAGED_TRANSLATE_LUA,
+        ]),
+    );
+    let translate_stdout = assert_success("Managed translate", &translate);
+    assert!(
+        translate_stdout
+            .contains("标准翻译：任务 0，完整 0，部分 0，不可用 0；写入 0 处，剩余 0 处")
+            && translate_stdout.contains("Lua：已执行"),
+        "Managed-only Translate 应保持 Standard 与 Lua 可观察结果独立：{translate_stdout}"
+    );
+    let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("Managed 项目数据库应可再次只读打开");
+    let committed = connection
+        .query_row(
+            "SELECT translation_content_json, translation_state FROM managed_translation_unit",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .expect("Managed 译文与 state 应成对提交");
+    assert_eq!(
+        committed.0,
+        serde_json::to_string(MANAGED_TRANSLATION).expect("测试译文应可编码")
+    );
+    assert_eq!(committed.1.len(), 32);
+    drop(connection);
+
+    let record = read_single_task_record(&workspace.join("task-records"));
+    assert!(record.contains("## Managed"));
+    assert!(record.contains("- Collection: `quest_titles`"));
+    assert!(record.contains("`1` → `quest_titles`/`quest:arrival`"));
+    assert!(record.contains("confirmed committed unit targets `1`"));
+    assert!(record.contains(MANAGED_TRANSLATION));
+
+    let converged = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "translate",
+            "--name",
+            MANAGED_PROJECT,
+            PROFILE,
+            "--lua",
+            MANAGED_TRANSLATE_LUA,
+        ]),
+    );
+    assert_success("converged Managed translate", &converged);
+    let requests = requests.finish();
+    assert_eq!(
+        requests.len(),
+        1,
+        "完全相同的 Profile 语义下，唯一 Managed unit 为 Current 时不得请求模型"
+    );
+    let request_body: Value =
+        serde_json::from_slice(&requests[0].body).expect("Managed 请求体必须是 JSON");
+    let messages = request_body["messages"]
+        .as_array()
+        .expect("Managed 请求必须包含 messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], SYSTEM_PROMPT);
+    assert_eq!(messages[1]["role"], "user");
+    let user = messages[1]["content"]
+        .as_str()
+        .expect("Managed user message 必须是字符串");
+    assert!(user.contains("翻译任务标题；保持简洁。"));
+    assert!(user.contains("任务标题"));
+    assert!(user.contains("Text [1] (single line)"));
+    assert!(user.contains(MANAGED_ORIGINAL));
+    for private in ["quest_titles", "quest:arrival", "metadata", "main"] {
+        assert!(
+            !user.contains(private),
+            "Managed user message 不得泄漏内部身份或 metadata：{private}\n{user}"
+        );
+    }
+    assert_eq!(
+        fs::read_dir(workspace.join("task-records"))
+            .expect("任务记录根应存在")
+            .count(),
+        1,
+        "零 Managed TaskBlock 不得建立空 run 目录"
+    );
+
+    fs::write(
+        root.join(MANAGED_WRITE_BACK_LUA),
+        format!(
+            r#"
+local collection = ctx.translations.open("quest_titles")
+assert(collection ~= nil)
+local unit = collection:get("quest:arrival")
+assert(unit.status == "current")
+assert(unit.translation == "{MANAGED_TRANSLATION}")
+assert(ctx.json.kind(unit.metadata) == "array")
+ctx.output.write_text("js/managed-translation.txt", unit.translation)
+"#
+        ),
+    )
+    .expect("Managed WriteBack Lua 应可写入");
+    let write_back = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "write-back",
+            "--name",
+            MANAGED_PROJECT,
+            "--lua",
+            MANAGED_WRITE_BACK_LUA,
+        ]),
+    );
+    assert_success("Managed write-back", &write_back);
+    assert_eq!(
+        fs::read_to_string(workspace.join("write_back/js/managed-translation.txt"))
+            .expect("Managed WriteBack 应可消费最后提交快照"),
+        MANAGED_TRANSLATION
     );
 }
 
@@ -5138,12 +5398,75 @@ impl BoundChatServer {
             worker: Some(worker),
         }
     }
+
+    fn start_with_responses_and_observe(
+        self,
+        responses: Vec<ChatResponseFixture>,
+        additional_response: ChatResponseFixture,
+    ) -> RunningChatServer {
+        self.listener
+            .set_nonblocking(true)
+            .expect("本地监听器应可设为非阻塞");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (result_sender, result_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = (|| {
+                let mut requests = Vec::new();
+                for response in responses {
+                    let request = loop {
+                        match self.listener.accept() {
+                            Ok((stream, _)) => {
+                                break serve_chat_completion(stream, requests.len(), response)?;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                if worker_stop.load(Ordering::Acquire) {
+                                    return Err(format!(
+                                        "翻译进程只发出了 {} 个 Chat Completions 请求",
+                                        requests.len()
+                                    ));
+                                }
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) => {
+                                return Err(format!("本地 LLM accept 失败：{error}"));
+                            }
+                        }
+                    };
+                    requests.push(request);
+                }
+                while !worker_stop.load(Ordering::Acquire) {
+                    match self.listener.accept() {
+                        Ok((stream, _)) => requests.push(serve_chat_completion(
+                            stream,
+                            requests.len(),
+                            additional_response,
+                        )?),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => {
+                            return Err(format!("本地 LLM 观察 accept 失败：{error}"));
+                        }
+                    }
+                }
+                Ok(requests)
+            })();
+            let _ = result_sender.send(result);
+        });
+        RunningChatServer {
+            stop,
+            result_receiver,
+            worker: Some(worker),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 enum ChatResponseFixture {
     Standard,
     ThinkingStandard,
+    Managed,
     Lua,
     MvDialogue,
     MixedSemanticUnits,
@@ -5239,6 +5562,15 @@ fn serve_chat_completion(
                 19,
                 11,
                 30,
+            ),
+            ChatResponseFixture::Managed => (
+                "request-managed-e2e".to_owned(),
+                "response-managed-e2e".to_owned(),
+                serde_json::to_string(&json!({ "1": [MANAGED_TRANSLATION] }))
+                    .map_err(|error| error.to_string())?,
+                13,
+                4,
+                17,
             ),
             ChatResponseFixture::Lua => (
                 "request-lua".to_owned(),

@@ -20,16 +20,16 @@ use crate::diagnostic::{
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::json::{
+    StackSafeJsonError, StackSafeJsonValue, clone_value, drop_value, from_str as parse_json,
+    to_string as encode_json, to_string_pretty as encode_json_pretty,
+    to_vec_pretty as encode_json_pretty_bytes,
+};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::ProjectName;
 use crate::rpg_maker::extract::document::{
     RpgMakerDocumentId, RpgMakerDocumentSelection, RpgMakerProjectDocumentReader,
     RpgMakerProjectDocumentReadingDiagnostic, RpgMakerProjectDocuments,
-};
-use crate::rpg_maker::json::{
-    StackSafeJsonError, StackSafeJsonValue, clone_value, drop_value, from_str as parse_json,
-    to_string as encode_json, to_string_pretty as encode_json_pretty,
-    to_vec_pretty as encode_json_pretty_bytes,
 };
 use crate::rpg_maker::model::DialogueLinePart;
 use crate::rpg_maker::project::OpenedProject;
@@ -2508,11 +2508,11 @@ mod tests {
     use super::*;
     use crate::diagnostic::render_safe_diagnostic;
     use crate::i18n::{UiLocale, UiLocalizer};
+    use crate::lossless_json::LosslessJsonError;
     use crate::rpg_maker::extract::document::{
         PluginConfiguration, parse_json_document_for_test, parse_plugins_document_for_test,
     };
     use crate::rpg_maker::lua::document::{OpenedRpgMakerDocument, RpgMakerTextReference};
-    use crate::rpg_maker::lua::json::LosslessJsonError;
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
         DirectTextPart, DirectTextRecipe, TextUnitRole,

@@ -21,9 +21,12 @@ WriteBack 的阶段扩展，也可由独立的一次性项目命令执行；Init
 | WriteBack | Standard 候选 → Lua → 验证 → 发布 | Lua 失败丢弃候选；没有发布后回调 |
 | Lua | 独立项目程序 | 每次 `standard:accept` 独立提交；后续脚本失败不回滚已成功调用 |
 
-三个阶段入口彼此独立。简单标量可在 Extract 用 `replace_standard` 接入 Standard Translate 和
-WriteBack；复杂跨文档/多目标插件由 Lua 自己拥有三阶段身份、私有表、state、事务和幂等
-写回。已有可靠人工译文则可从独立 `lua` 命令交给 Standard 核心验收与提交，不必伪造
+三个阶段入口彼此独立。与一个受信 RPG Maker 位置直接对应的 Standard 单元可在 Extract
+用 `replace_standard` 接入 Standard Translate 和 WriteBack；只需由 Lua 声明集合、原子
+单元和最终写回关系的文本可以使用可选的 `ctx.translations`，由 ATT 承担翻译协议、调度、
+state、增量提交和任务记录。私有 grammar、跨单元原子关系、特殊模型协议或其他高级契约
+表达不了的行为继续由 Lua 通过 `ctx.translation`、`ctx.llm`、`ctx.db` 和候选能力完整
+拥有。已有可靠人工译文则可从独立 `lua` 命令交给 Standard 核心验收与提交，不必伪造
 受管数据库 state。核心不增加通用多目标投影 DSL、自动发布状态或 post-publish hook。
 
 每个阶段独立保存自己的 Lua 主程序快照：非空主程序正文、SHA-256 和无损 Windows 解析
@@ -32,8 +35,10 @@ WriteBack；复杂跨文档/多目标插件由 Lua 自己拥有三阶段身份�
 正文，不重新读取原文件；保存路径只用于 chunk 名、`require` 搜索目录和诊断。主程序通过
 `require`、`io` 或 `os` 动态读取的纯 Lua 模块、文件和进程仍是外部依赖，不纳入快照。
 
-清除语义按阶段区分：Extract 同时停用 Lua owner、删除其标准资产，并从后续自动方案中
-移除 Lua；Translate 与 WriteBack 只清除各自主程序，不猜测或删除 Lua 私有数据库状态。
+清除语义按阶段区分：显式 Extract 方案未列出 Lua 或提供零字节 Lua 时，同时停用 Lua
+Standard owner、删除其标准资产，停用 Lua Managed owner、删除其托管快照，并从后续
+自动方案中移除 Lua；Translate 与 WriteBack
+只清除各自主程序，不猜测或删除 Lua 私有数据库状态。
 三个阶段即使最初来自同一个文件，也仍是彼此独立的快照和运行方案。
 
 独立命令形状为：
@@ -80,6 +85,7 @@ ctx = {
   db = DatabaseApi,
   extract = ExtractApi | nil,
   translation = TranslationApi | nil,
+  translations = ManagedTranslationsApi | nil,
   llm = function | nil,
   output = OutputApi | nil,
   write_back = WriteBackApi | nil,
@@ -89,18 +95,18 @@ ctx = {
 
 | 阶段 | 非 nil 的阶段接口 |
 |---|---|
-| Extract | `ctx.extract` |
-| Translate | `ctx.translation`、`ctx.llm` |
-| WriteBack | `ctx.output`、`ctx.write_back` |
+| Extract | `ctx.extract`、`ctx.translations.replace` |
+| Translate | `ctx.translation`、`ctx.llm`、`ctx.translations.translate/open` |
+| WriteBack | `ctx.output`、`ctx.write_back`、`ctx.translations.open` |
 | Lua | `ctx.standard` |
 
 `json/source/rpg_maker/db` 四种调用都有。`source_root` 是冻结内容物理根：MZ 对应 `source/`，
 MV 对应 `source/www/`。`output_root` 仅 WriteBack 存在且是未发布候选物理路径。这些物理
 路径只供可信脚本诊断或显式直接 I/O；受管 API 一律使用下一节逻辑路径。
 
-独立命令中 `ctx.extract/translation/llm/output/write_back` 都是 nil。全局 `arg[0]` 是
-解析后的主脚本路径，`arg[1..]` 是 `--` 后按顺序传入的 UTF-8 参数；不能表示为 UTF-8 的
-参数在脚本运行前显式失败。阶段 Lua 不建立这份独立命令参数契约。
+独立命令中 `ctx.extract/translations/translation/llm/output/write_back` 都是 nil。全局
+`arg[0]` 是解析后的主脚本路径，`arg[1..]` 是 `--` 后按顺序传入的 UTF-8 参数；不能表示
+为 UTF-8 的参数在脚本运行前显式失败。阶段 Lua 不建立这份独立命令参数契约。
 
 ## 3. 跨平台逻辑路径
 
@@ -250,6 +256,8 @@ assert(note.original == "<Help:炎之剑的说明>")
 
 ## 6. Extract：`replace_standard`
 
+### 6.1 `replace_standard`
+
 <!-- att-example: illustrative -->
 ```lua
 ctx.extract.replace_standard(groups)
@@ -284,14 +292,74 @@ Choices、ScrollingText、局部标签投影或一对多投影。
 或不同 kind 都是 `extract / invalid_standard_snapshot`，Host 不会把它们自动合并。每组至少
 一个 field；name 非空且组内唯一；原文不能全空白；逻辑身份和 Mutation Claim 不得冲突。
 
-一次脚本最多声明一个意图：一次 `replace_standard` 或 `clear_standard`。第二次失败。
+一次脚本最多声明一个 Standard 意图：一次 `replace_standard` 或 `clear_standard`。第二次失败。
 `replace_standard({})` 是 active 的空 Lua owner；`clear_standard()` 停用 owner；不调用
-表示保持旧 owner。
+表示保持旧 Standard owner。它与下一节的 Managed 意图彼此独立，同一脚本可以各声明一次。
 
 意图先完整校验并留在内存。只有脚本正常返回、未取消、SQLite 连接干净终结且无活动事务
-时，Host 才用独立 Store 事务应用。脚本通过 `ctx.db` 的提交不和 Store 事务合并。
+时，Host 才进入 Store 提交。脚本通过 `ctx.db` 的提交不和 Store 事务合并。
+
+### 6.2 `ctx.translations.replace`
+
+<!-- att-example: valid -->
+```lua
+ctx.translations.replace({
+  {
+    name = "quest_titles",
+    instruction = "翻译任务标题；保持简洁。",
+    units = {
+      {
+        key = "quest:arrival",
+        kind = "plugin_parameter",
+        shape = "single",
+        original = "星港へ",
+        context = "",
+        metadata = ctx.json.object({ quest_id = 12 }),
+      },
+    },
+  },
+})
+```
+
+`replace(collections)` 一次性声明 Lua Managed owner 的完整当前快照。一次 Extract 主程序
+最多调用一次；`replace({})` 保持 owner active 并清空全部 collection；不调用表示保持旧
+Managed 快照。零字节 Extract Lua 或 Extract 运行方案停用 Lua 时，Managed owner 和
+Standard Lua owner 一起停用，不留下可供 Translate 或 WriteBack 打开的托管快照。
+
+外层、`units` 和所有数组正文都必须是从 1 开始、无洞且没有其他 key 的稠密数组。
+collection 只接受 `name`、`instruction`、`units`；unit 只接受 `key`、`kind`、`shape`、
+`original`、`context` 和可选 `metadata`。缺失字段、未知字段、错误类型、非 UTF-8
+字符串、空白 `name/key/kind`、重复 collection `name` 或同一 collection 内重复 `key`
+立即使声明失败；不同 collection 可以使用相同 `key`。`instruction` 与 `context` 是必填
+字符串并允许 `""`。
+
+`kind` 精确使用 `database_entry`、`system`、`map`、`dialogue`、`choices`、
+`scrolling_text`、`event_command`、`plugin_parameter` 之一，选择对应的 RPG Maker
+Placeholder 与语言验收语义。四种原子 `shape` 为：
+
+| shape | `original` | 模型与验收结果 |
+|---|---|---|
+| `single` | 标量字符串，不得含 CR、LF 或 NUL | 一个模型 ID；JSON 值是单元素字符串数组，译文不得含 LF |
+| `reflow` | 标量字符串，不得含 CR 或 NUL | 一个模型 ID；JSON 值是单元素字符串数组，元素可含 LF |
+| `lines` | 非空稠密字符串数组；元素不得含 CR、LF 或 NUL | 一个模型 ID；项数及空槽位置不变，Placeholder 可按 Lines 规则在同一 ID 内移动 |
+| `items` | 非空稠密字符串数组；每项非空白且不得含 CR、LF 或 NUL | 一个模型 ID；项数不变且每项独立验收，Placeholder 不得跨位置移动 |
+
+数组整体是一个不可拆分的翻译、验收和提交原子；当前契约不提供跨 unit 原子组。
+`metadata` 若存在，必须是 `ctx.json` 能无损表达的显式 JSON 值；object/array table
+仍须分别由 `ctx.json.object(...)` / `ctx.json.array(...)` 建立，JSON null 使用
+`ctx.json.NULL`。Host 将它作为不透明 JSON 原样随 unit 持久化并在后续 Lua 中还原；
+它不发送给模型，不参与 state、去重或译文保留判断。Lua `nil` 表示未声明 metadata，
+与显式 JSON null 不同。
+
+脚本正常返回前，Standard 与 Managed 声明都只存在内存。Host 先完整验证二者，确认未
+取消且交互数据库干净终结后，再在同一个 Store 事务中原子应用两个意图；任一意图失败都
+不会提交另一意图。仅 `metadata` 或自然顺序变化时保留同身份 unit 的 translation/state；
+`instruction`、`kind`、`shape`、`original` 或 `context` 改变时对应译文失效，删除 collection
+或 unit 会删除对应托管状态。
 
 ## 7. Translate：prepare、Current 与 accept
+
+### 7.1 低级标量接口
 
 <!-- att-example: illustrative -->
 ```lua
@@ -370,6 +438,63 @@ LLM。Lua 私有 Current 也只在 Translate 脚本实际调用 `is_current` 时
 变化后，都必须先重新运行同一 Translate 脚本，再进入 WriteBack；核心不会替私有协议
 读取或刷新其表。
 
+### 7.2 `ctx.translations.translate/open`
+
+<!-- att-example: valid -->
+```lua
+local report = ctx.translations.translate()
+for result in report:units() do
+  print(result.collection, result.key, result.status)
+  -- result.translation、result.reason、result.details
+end
+
+local collection = ctx.translations.open("quest_titles")
+if collection ~= nil then
+  local arrival = collection:get("quest:arrival")
+  for unit in collection:units() do
+    -- key、kind、shape、original、context、metadata、translation、status
+  end
+end
+```
+
+`translate()` 无参数，一次 Translate 主程序最多调用一次。它读取一致的完整 Managed
+快照，一次处理全部 collection，并为它们建立共同的 Managed 全局去重域；空快照返回
+零项报告且不请求模型。调用前若 `ctx.db` 有活动事务，则以
+`translations/transaction_conflict` 在零模型请求、零托管修改的边界失败。Lua 应先结束
+自己的事务，再让 Host 进入会持续跨并发请求和多个短提交事务的托管执行。
+
+报告的 `units()` 按 collection、unit 自然顺序迭代一次。每项提供：
+
+- `collection`、`key`：只用于把结果映射回 Lua 声明身份；
+- `status`：`current`、`translated`、`not_applicable` 或 `unavailable`；
+- `translation`：`single/reflow` 返回标量 string，`lines/items` 返回带 JSON array 标记的
+  稠密 string 数组；没有可用译文时为 nil；
+- `reason`：存在正常未产出或拒绝时的稳定原因，否则为 nil；
+- `details`：存在时为 `ctx.json.object`，否则为 nil。
+
+报告是本次执行结果，不是权威存储。`translate()` 正常返回后，Translate 阶段才允许
+`open(name)`；调用前使用 `open` 明确失败。WriteBack 阶段不需要先调用 `translate()`，
+可以直接打开最后已确认提交的快照。不存在的 collection 返回 nil；`name` 必须是非空
+UTF-8 字符串。
+
+`open` 返回只读 collection userdata：`name`、`instruction` 是字段，
+`get(key)` 精确查找并在不存在时返回 nil，`units()` 按声明顺序单次迭代。只读 unit
+提供 `key`、`kind`、`shape`、`original`、`context`、`metadata`、`translation` 和
+`status`；`status` 为 `current`、`missing`、`not_applicable` 或 `unavailable`。来源快照
+已经改变时，`open` 会明确失败，不把 stale 伪装成可读单元状态。
+标量/数组投影与报告相同，`metadata` 仍为原来的不透明 JSON 值。
+
+打开 collection 不会修改游戏资产，也不会替 Lua推导写回位置。WriteBack 必须使用
+`ctx.rpg_maker` 重新核对完整来源关系，再用 `ctx.output` 把当前译文写入未发布候选。
+项目冻结来源与 Managed owner 记录的来源不一致时，Translate 和 WriteBack 都明确报告
+stale，不提供陈旧译文继续运行。
+
+Managed 路径由 ATT 拥有全局去重、临时 ID、装箱、JSON/可选 `<why>`、并发、网络重试、
+逐 ID 验收、state、增量提交和 task-records。它不会自动调用低级接口，也不会在某个
+unit 无法表达时自动降级。需要私有 grammar、跨 unit 原子关系、特殊模型协议或自有状态
+机时，脚本显式使用本节 7.1、`ctx.llm` 与 `ctx.db`；两套接口可以在同一 Translate
+主程序中共存。Host 不提供通用 `llm.batch`。
+
 ## 8. 独立项目 Lua：Standard 人工译文验收与提交
 
 `ctx.standard` 只在独立 `lua` 命令中存在。它把已经由人或其他受信来源准备好的候选交给
@@ -378,7 +503,7 @@ Standard 核心，不发送 LLM 请求，也不暴露内部 state：
 <!-- att-example: valid -->
 ```lua
 assert(ctx.phase == "lua")
-assert(ctx.extract == nil and ctx.translation == nil and ctx.llm == nil)
+assert(ctx.extract == nil and ctx.translation == nil and ctx.translations == nil and ctx.llm == nil)
 assert(ctx.output == nil and ctx.write_back == nil)
 
 local standard = ctx.standard.open()
@@ -430,7 +555,7 @@ nil；不接受数据库位置 JSON、展示字符串或自造 userdata。
 | `content_kind` | `value` 或 `lines` |
 | `line_policy` | `single`、`aligned` 或 `reflow` |
 | `expected_line_count` | `single` 为 1，`aligned` 为严格槽数，`reflow` 为 nil |
-| `status` | `current`、`missing`、`stale`、`not_applicable` 或 `unavailable` |
+| `status` | `current`、`missing`、`not_applicable` 或 `unavailable` |
 | `family_size` | 本次验收可能传播的物理位置数 |
 
 `unavailable` 表示该物理单元无法建立完整 Standard 准备语义；它仍可用于调查，但候选只会
@@ -532,9 +657,9 @@ Profile 的 Client，但不会自动插入 system prompt；脚本应显式发送
 返回供应商响应即成功；`finish_reason ~= "stop"` 不自动报错。LLM 根不自动重试；
 `llm/retryable` 可带 `retry_after_ms`，`llm/fatal` 不可恢复。请求失败也可能已被服务接收。
 
-`ctx.llm` 不生成 Standard 任务记录。Lua 拥有任意私有消息协议、验收、身份和数据库
+`ctx.llm` 不生成翻译任务记录。Lua 拥有任意私有消息协议、验收、身份和数据库
 事务，核心无法从一次 Provider 响应推导脚本的逐 ID 结果或最终提交终态，因此不会把
-Lua 调用伪装成 Standard TaskBlock。Lua 排障使用运行级 JSONL 摘要、脚本自己的稳定诊断
+低级调用伪装成 ATT 托管 TaskBlock。Lua 排障使用运行级 JSONL 摘要、脚本自己的稳定诊断
 和私有状态证据。
 
 ## 10. SQLite：私有协议与事务
@@ -625,6 +750,15 @@ WriteBack 没有 validate/discard/publish 或 post-publish 回调。脚本应只
 发布；Lua 无法在成功发布后再把私有表标记成“已发布”。需要跨运行恢复时，以权威输入和
 候选可重建性设计协议，而不是猜测发布结果。
 
+### 11.3 托管译文写回
+
+WriteBack 的 `ctx.translations` 只提供 `open(name)`，不提供 `replace` 或 `translate`。
+脚本读取最后已确认提交的 collection/unit 及其 `status/translation`，用声明时保存的
+`key`、`metadata` 和自身确定关系找到候选目标，并通过 `ctx.output` 完成写回。Host 不把
+Managed unit 自动变成 Standard recipe 或 Mutation Claim，也不替脚本决定缺失、不可用
+单元应如何影响私有资产。来源 stale 在打开 collection 时明确失败，不把旧译文交给
+脚本继续发布。
+
 ## 12. 错误、取消与副作用
 
 Host 错误以 userdata 抛出，可由 `pcall` 读取：
@@ -640,7 +774,7 @@ error.retry_after_ms = integer | nil
 只按 domain/kind 分支；message 仅诊断。JSON、普通 Host 值、RPG Maker 整文档、Extract
 快照、来源和输出转换各自保留不同错误域。常见域包括 `json`、`binding`、
 `rpg_maker`、`extract`、`filesystem`、`output`、`sqlite`、`translation`、`standard`、
-`llm`、`runtime`。
+`translations`、`llm`、`runtime`。
 
 当前稳定的常用 kind：
 
@@ -655,6 +789,7 @@ error.retry_after_ms = integer | nil
 | `sqlite` | `closed`、`indeterminate`、`transaction_already_active`、`no_active_transaction`、`operation_failed`、`outcome_unknown` |
 | `translation` | `prepare`、`accept`、`invalid_state` |
 | `standard` | `invalid_argument`、`invalid_role`、`foreign_unit`、`transaction_conflict`、`stale_snapshot`、`invalid_result`、`profile_required`、`saved_profile_unavailable`、`profile_invalid`、`profile_state_unavailable`、`profile_resources_invalid`、`snapshot_unavailable`、`open_failed`、`acceptance_failed`、`internal_invariant` |
+| `translations` | `invalid_snapshot`、`intent_already_declared`、`invalid_argument`、`already_translated`、`translate_required`、`transaction_conflict`、`stale_snapshot`、`unavailable` |
 | `llm` | `retryable`、`fatal` |
 | `runtime` | `cancelled`、`host_bridge_closed` |
 

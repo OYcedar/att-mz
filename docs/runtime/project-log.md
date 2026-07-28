@@ -33,24 +33,24 @@ RunId 建立失败时，本次运行不创建 JSONL，也不创建依赖 RunId �
 也不递归记录自身；存在具体失败事实时，stderr 必须明确显示日志路径、失败操作和安全的
 底层原因。队列丢弃没有可伪造的文件系统根因，只显示项目日志降级横幅。
 
-## 2. Standard 翻译任务记录
+## 2. 翻译任务记录
 
 Translate 可以通过 `[rpg_maker].record_translation_tasks` 开启高级可读任务记录。它按
-Standard 计划中的 TaskBlock 生成文件，把一个任务的全部重试、最终 System/User、
-Thinking、Assistant、逐 ID 验收和数据库提交终态放在同一份 Markdown 中：
+Standard 与 Lua Managed 计划中的 TaskBlock 生成文件，把一个任务的全部重试、最终
+System/User、Thinking、Assistant、逐 ID 验收和数据库提交终态放在同一份 Markdown 中：
 
 ```text
 <project-workspace>/task-records/<run-id>/task-000001.md
 ```
 
-该能力默认关闭；零 Standard 任务或没有启动任务时不建立空目录。Translate Lua 和独立
-`lua` 命令都不生成任务记录；后者没有 LLM TaskBlock，人工候选的权威验收与提交结果由
-每次 `ctx.standard.accept` 返回值和项目数据库承担。完整模板、稳定编号、互斥终态、取消、
-API-key 精确替换与原子落盘规则由
-[Standard 翻译任务记录现行规格](../rpg-maker/task-records.md)唯一规定。
+该能力默认关闭；Standard 与 Managed 都没有启动任务时不建立空目录。Translate Lua 的
+低级 `ctx.llm` 和独立 `lua` 命令都不生成任务记录；后者没有 LLM TaskBlock，人工候选的
+权威验收与提交结果由每次 `ctx.standard.accept` 返回值和项目数据库承担。完整模板、
+run-wide 稳定编号、互斥终态、取消、精确替换与原子落盘规则由
+[翻译任务记录现行规格](../rpg-maker/task-records.md)唯一规定。
 
 任务记录与本节项目 JSONL 都是非权威可观测性旁路，但承担不同阅读任务：JSONL 保持
-运行级结构化摘要，任务记录供人或 Agent 阅读单个 Standard 任务的完整上下文。两类故障
+运行级结构化摘要，任务记录供人或 Agent 阅读单个 ATT 托管任务的完整上下文。两类故障
 分别计数，并在终态各自至多显示一次降级横幅；同一次任务记录保存的主错误和清理错误
 全部保留在任务记录类别内，不与 JSONL 故障互相覆盖。记录失败只在 stderr 明示路径、
 操作及清理后的底层原因，不改变翻译结果、数据库、退出码、重试或后续任务。文件缺失

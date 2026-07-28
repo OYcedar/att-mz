@@ -20,7 +20,7 @@ use crate::diagnostic::{
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
-use crate::rpg_maker::json::{StackSafeJsonError, StackSafeJsonValue, from_str as parse_json};
+use crate::json::{StackSafeJsonError, StackSafeJsonValue, from_str as parse_json};
 use crate::rpg_maker::plugin_document::{
     PluginsEnvelopeFailure, parse_plugins_envelope, validate_plugins_root_is_array,
 };

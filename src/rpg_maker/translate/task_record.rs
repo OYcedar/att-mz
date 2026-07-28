@@ -1,10 +1,11 @@
-//! Standard 翻译任务的可读、非权威旁路记录。
+//! ATT 托管翻译任务的可读、非权威旁路记录。
 //!
-//! 一个已经开始的 [`TranslationTaskBlock`] 最多形成一个不可变 Markdown 文档。模型请求、
-//! 响应解析、逐 ID 验收和数据库提交仍分别由原有语义所有者负责；本模块只接收它们建立
-//! 的确定事实并呈现，不参与恢复、重放、验收、提交或退出码判断。
+//! Standard 与 Managed 各自的一个已开始 TaskBlock 最多形成一个不可变 Markdown 文档。
+//! 模型请求、响应解析、逐 ID 验收和数据库提交仍分别由原有语义所有者负责；本模块只接收
+//! 它们建立的确定事实并呈现，不参与恢复、重放、验收、提交或退出码判断。
 
 use std::fmt::Write as _;
+#[cfg(test)]
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -18,128 +19,29 @@ use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
+use crate::execution::llm_request::LlmRequestAttemptOutcome as TranslationTaskAttemptOutcome;
+pub(crate) use crate::execution::llm_request::{
+    LlmRequestAttemptRecord as TranslationTaskAttemptRecord,
+    LlmRequestRetryWaitRecord as TranslationTaskRetryWaitRecord,
+};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::json_diagnostic::JsonErrorCategory;
-use crate::llm::{
-    ApiKeyRedactor, ChatMessageRole, LlmClientRecordMetadata, LlmFinishReason, LlmResponse,
-    LlmUsage,
-};
+use crate::llm::{ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientRecordMetadata};
+#[cfg(test)]
+use crate::llm::{LlmFinishReason, LlmResponse, LlmUsage};
 use crate::runtime::filesystem::SystemFileSystem;
 use crate::runtime::project_log::ProjectLogger;
+#[cfg(test)]
+pub(crate) use crate::translation_protocol::TranslationTaskResponseJsonErrorCategory;
+pub(crate) use crate::translation_protocol::{
+    TranslationAssistantValueError, TranslationTaskResponseParseError,
+    TranslationTaskResponseParseErrorKind,
+};
 
 use super::standard::{
     StandardTranslationTaskIndex, TranslationProtocolDiagnostic, TranslationTaskBlock,
     TranslationTaskOutcome, TranslationTaskUnavailableReason, TranslationUnitRejectionReason,
 };
-
-/// 一次逻辑请求尝试在任务记录中需要的结构化证据。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationTaskAttemptRecord {
-    attempt: NonZeroUsize,
-    duration: Duration,
-    outcome: TranslationTaskAttemptOutcome,
-}
-
-impl TranslationTaskAttemptRecord {
-    pub(crate) fn succeeded(
-        attempt: NonZeroUsize,
-        duration: Duration,
-        response: &LlmResponse,
-    ) -> Self {
-        Self {
-            attempt,
-            duration,
-            outcome: TranslationTaskAttemptOutcome::Succeeded {
-                finish_reason: response.finish_reason().clone(),
-                provider_request_id: response.provider_request_id().map(str::to_owned),
-                provider_response_id: response.provider_response_id().map(str::to_owned),
-                usage: response.usage(),
-            },
-        }
-    }
-
-    pub(crate) fn retryable(
-        attempt: NonZeroUsize,
-        duration: Duration,
-        diagnostic: SafeDiagnostic,
-        retry_after: Option<Duration>,
-        retry_wait: Option<TranslationTaskRetryWaitRecord>,
-    ) -> Self {
-        Self {
-            attempt,
-            duration,
-            outcome: TranslationTaskAttemptOutcome::Retryable {
-                diagnostic,
-                retry_after,
-                retry_wait,
-            },
-        }
-    }
-
-    pub(crate) fn mark_retry_started(&mut self) {
-        let outcome =
-            std::mem::replace(&mut self.outcome, TranslationTaskAttemptOutcome::Cancelled);
-        self.outcome = match outcome {
-            TranslationTaskAttemptOutcome::Retryable {
-                diagnostic,
-                retry_after,
-                retry_wait:
-                    Some(TranslationTaskRetryWaitRecord::CompletedBeforeNextAttempt { duration }),
-            } => TranslationTaskAttemptOutcome::Retryable {
-                diagnostic,
-                retry_after,
-                retry_wait: Some(TranslationTaskRetryWaitRecord::Retried { duration }),
-            },
-            outcome => outcome,
-        };
-    }
-
-    pub(crate) fn failed(
-        attempt: NonZeroUsize,
-        duration: Duration,
-        diagnostic: SafeDiagnostic,
-    ) -> Self {
-        Self {
-            attempt,
-            duration,
-            outcome: TranslationTaskAttemptOutcome::Failed { diagnostic },
-        }
-    }
-
-    pub(crate) fn cancelled(attempt: NonZeroUsize, duration: Duration) -> Self {
-        Self {
-            attempt,
-            duration,
-            outcome: TranslationTaskAttemptOutcome::Cancelled,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum TranslationTaskAttemptOutcome {
-    Succeeded {
-        finish_reason: LlmFinishReason,
-        provider_request_id: Option<String>,
-        provider_response_id: Option<String>,
-        usage: Option<LlmUsage>,
-    },
-    Retryable {
-        diagnostic: SafeDiagnostic,
-        retry_after: Option<Duration>,
-        retry_wait: Option<TranslationTaskRetryWaitRecord>,
-    },
-    Failed {
-        diagnostic: SafeDiagnostic,
-    },
-    Cancelled,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationTaskRetryWaitRecord {
-    Retried { duration: Duration },
-    CompletedBeforeNextAttempt { duration: Duration },
-    CancelledWhileWaiting { planned_duration: Duration },
-}
 
 /// Assistant JSON 中保持原始顺序的一个条目。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,128 +75,6 @@ impl TranslationAssistantEntry {
             canonical_id,
             value_error,
         }
-    }
-}
-
-/// 合法 Assistant JSON 中单个译文值不满足字符串数组契约的结构化原因。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationAssistantValueError {
-    NotStringArray,
-    NonStringItem { item: NonZeroUsize },
-}
-
-impl TranslationAssistantValueError {
-    pub(crate) fn business_message(self) -> String {
-        match self {
-            Self::NotStringArray => "译文必须是字符串数组".to_owned(),
-            Self::NonStringItem { item } => format!("译文数组第 {item} 项必须是字符串"),
-        }
-    }
-}
-
-/// Assistant 响应无法按当前受信协议解析时的结构化类别。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationTaskResponseParseErrorKind {
-    Json(TranslationTaskResponseJsonErrorCategory),
-    ThinkingNotAllowed,
-    ThinkingEnvelopeMissing,
-    ThinkingEnvelopeUnclosed,
-    ThinkingEmpty,
-    ThinkingNested,
-    ThinkingRepeated,
-    MarkdownFenceNoBody,
-    MarkdownFenceUnsupported,
-    MarkdownFenceUnclosed,
-    MarkdownFenceInvalidClosing,
-}
-
-impl TranslationTaskResponseParseErrorKind {
-    fn code(self) -> &'static str {
-        match self {
-            Self::Json(_) => "json",
-            Self::ThinkingNotAllowed => "thinking_not_allowed",
-            Self::ThinkingEnvelopeMissing => "thinking_envelope_missing",
-            Self::ThinkingEnvelopeUnclosed => "thinking_envelope_unclosed",
-            Self::ThinkingEmpty => "thinking_empty",
-            Self::ThinkingNested => "thinking_nested",
-            Self::ThinkingRepeated => "thinking_repeated",
-            Self::MarkdownFenceNoBody => "markdown_fence_no_body",
-            Self::MarkdownFenceUnsupported => "markdown_fence_unsupported",
-            Self::MarkdownFenceUnclosed => "markdown_fence_unclosed",
-            Self::MarkdownFenceInvalidClosing => "markdown_fence_invalid_closing",
-        }
-    }
-}
-
-/// `serde_json` 在协议边界建立的稳定错误类别。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationTaskResponseJsonErrorCategory {
-    Io,
-    Syntax,
-    Shape,
-    UnexpectedEof,
-}
-
-impl TranslationTaskResponseJsonErrorCategory {
-    fn code(self) -> &'static str {
-        match self {
-            Self::Io => "io",
-            Self::Syntax => "syntax",
-            Self::Shape => "shape",
-            Self::UnexpectedEof => "unexpected_eof",
-        }
-    }
-}
-
-/// 相对于完整原始 Assistant 的一基解析位置及其稳定类别。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationTaskResponseParseError {
-    kind: TranslationTaskResponseParseErrorKind,
-    line: NonZeroUsize,
-    column: NonZeroUsize,
-}
-
-impl TranslationTaskResponseParseError {
-    pub(crate) fn new(
-        kind: TranslationTaskResponseParseErrorKind,
-        line: NonZeroUsize,
-        column: NonZeroUsize,
-    ) -> Self {
-        Self { kind, line, column }
-    }
-
-    pub(crate) fn business_message(self) -> String {
-        let message = match self.kind {
-            TranslationTaskResponseParseErrorKind::Json(category) => {
-                return format!(
-                    "模型响应 JSON 无效：类别 {}，第 {} 行、第 {} 列",
-                    category.code(),
-                    self.line,
-                    self.column
-                );
-            }
-            TranslationTaskResponseParseErrorKind::ThinkingNotAllowed => {
-                "当前响应模式不接受思考输出"
-            }
-            TranslationTaskResponseParseErrorKind::ThinkingEnvelopeMissing => {
-                "模型响应缺少规定的思考信封"
-            }
-            TranslationTaskResponseParseErrorKind::ThinkingEnvelopeUnclosed => {
-                "模型响应的思考信封没有闭合"
-            }
-            TranslationTaskResponseParseErrorKind::ThinkingEmpty => "模型响应的思考内容为空",
-            TranslationTaskResponseParseErrorKind::ThinkingNested => "模型响应包含嵌套的思考信封",
-            TranslationTaskResponseParseErrorKind::ThinkingRepeated => "模型响应包含重复的思考信封",
-            TranslationTaskResponseParseErrorKind::MarkdownFenceNoBody => "Markdown 围栏没有正文",
-            TranslationTaskResponseParseErrorKind::MarkdownFenceUnsupported => {
-                "只接受无语言标记或 json 标记的单层 Markdown 围栏"
-            }
-            TranslationTaskResponseParseErrorKind::MarkdownFenceUnclosed => "Markdown 围栏没有闭合",
-            TranslationTaskResponseParseErrorKind::MarkdownFenceInvalidClosing => {
-                "Markdown 围栏必须以最终独立行闭合"
-            }
-        };
-        format!("{message}，第 {} 行、第 {} 列", self.line, self.column)
     }
 }
 
@@ -714,14 +494,279 @@ impl TranslationTaskRecordDocument {
     }
 }
 
-/// Standard 最终化线使用的非权威记录入口。
+/// 一轮 Translate 内跨 Standard 与 Managed 共用的零基自然序。
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RunWideTranslationTaskIndex(usize);
+
+impl RunWideTranslationTaskIndex {
+    pub(crate) const fn new(zero_based: usize) -> Self {
+        Self(zero_based)
+    }
+
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Managed TaskBlock 内一个临时 ID 对应的 Lua unit 身份。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedTranslationTaskUnitIdentity {
+    id: usize,
+    targets: Vec<ManagedTranslationTaskUnitTarget>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedTranslationTaskUnitTarget {
+    collection: String,
+    key: String,
+}
+
+impl ManagedTranslationTaskUnitIdentity {
+    pub(crate) fn new(id: usize, targets: Vec<ManagedTranslationTaskUnitTarget>) -> Self {
+        assert!(id != 0, "Managed 任务记录 ID 必须从 1 开始");
+        assert!(
+            !targets.is_empty(),
+            "Managed 任务记录 ID 必须至少映射一个 unit"
+        );
+        Self { id, targets }
+    }
+}
+
+impl ManagedTranslationTaskUnitTarget {
+    pub(crate) fn new(collection: impl Into<String>, key: impl Into<String>) -> Self {
+        let collection = collection.into();
+        let key = key.into();
+        assert!(
+            !collection.is_empty(),
+            "Managed 任务记录 collection 不得为空"
+        );
+        assert!(!key.is_empty(), "Managed 任务记录 key 不得为空");
+        Self { collection, key }
+    }
+}
+
+/// Managed 逐 ID 验收边界已经确认的结构化结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedTranslationTaskUnitResult {
+    id: usize,
+    status: ManagedTranslationTaskUnitStatus,
+}
+
+impl ManagedTranslationTaskUnitResult {
+    pub(crate) fn accepted(id: usize) -> Self {
+        assert!(id != 0, "Managed 任务记录 ID 必须从 1 开始");
+        Self {
+            id,
+            status: ManagedTranslationTaskUnitStatus::Accepted,
+        }
+    }
+
+    pub(crate) fn rejected(id: usize, reason: impl Into<String>, details: Option<Value>) -> Self {
+        assert!(id != 0, "Managed 任务记录 ID 必须从 1 开始");
+        let reason = reason.into();
+        assert!(!reason.is_empty(), "Managed 任务记录拒绝原因不得为空");
+        Self {
+            id,
+            status: ManagedTranslationTaskUnitStatus::Rejected { reason, details },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ManagedTranslationTaskUnitStatus {
+    Accepted,
+    Rejected {
+        reason: String,
+        details: Option<Value>,
+    },
+}
+
+/// Managed 顺序 checkpoint 建立的终态；状态码与 Standard 记录共用同一呈现契约。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedTranslationTaskCheckpointState {
+    Complete,
+    Partial,
+    Unavailable,
+    ExecutionFailed,
+    CommitPreparationFailed,
+    CommitNotApplied,
+    OutcomeUnknown,
+    EarlierFailure,
+    Cancelled,
+}
+
+impl ManagedTranslationTaskCheckpointState {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Unavailable => "unavailable",
+            Self::ExecutionFailed => "execution_failed",
+            Self::CommitPreparationFailed => "commit_preparation_failed",
+            Self::CommitNotApplied => "commit_not_applied",
+            Self::OutcomeUnknown => "commit_outcome_unknown",
+            Self::EarlierFailure => "not_committed_after_earlier_failure",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    const fn permits_confirmed_commits(self) -> bool {
+        matches!(self, Self::Complete | Self::Partial)
+    }
+
+    const fn outcome_unknown(self) -> bool {
+        matches!(self, Self::OutcomeUnknown)
+    }
+}
+
+/// Managed TaskBlock 的逐 ID 验收与顺序 checkpoint 投影。
+pub(crate) struct ManagedTranslationTaskRecordFinalState {
+    checkpoint: ManagedTranslationTaskCheckpointState,
+    units: Vec<ManagedTranslationTaskUnitResult>,
+    protocol_diagnostics: Vec<TranslationProtocolDiagnostic>,
+    confirmed_committed_units: Option<usize>,
+    diagnostic: Option<SafeDiagnostic>,
+}
+
+impl ManagedTranslationTaskRecordFinalState {
+    pub(crate) fn new(
+        checkpoint: ManagedTranslationTaskCheckpointState,
+        units: Vec<ManagedTranslationTaskUnitResult>,
+        confirmed_committed_units: Option<usize>,
+        diagnostic: Option<SafeDiagnostic>,
+    ) -> Self {
+        assert_eq!(
+            checkpoint.outcome_unknown(),
+            confirmed_committed_units.is_none(),
+            "Managed 提交终态未知必须且只能用未知的已确认提交数表示"
+        );
+        assert!(
+            checkpoint.permits_confirmed_commits()
+                || confirmed_committed_units.is_none_or(|count| count == 0),
+            "只有 complete 或 partial 终态才能确认 Managed 提交进度"
+        );
+        Self {
+            checkpoint,
+            units,
+            protocol_diagnostics: Vec::new(),
+            confirmed_committed_units,
+            diagnostic,
+        }
+    }
+
+    pub(crate) fn with_protocol_diagnostics(
+        mut self,
+        diagnostics: Vec<TranslationProtocolDiagnostic>,
+    ) -> Self {
+        self.protocol_diagnostics = diagnostics;
+        self
+    }
+
+    fn accepted_count(&self) -> usize {
+        self.units
+            .iter()
+            .filter(|unit| matches!(unit.status, ManagedTranslationTaskUnitStatus::Accepted))
+            .count()
+    }
+}
+
+/// Managed 最终化线交给 sink 的完整不可变文档，不依赖 Standard 的 TaskBlock。
+pub(crate) struct ManagedTranslationTaskRecordDocument {
+    total_tasks: usize,
+    task_index: RunWideTranslationTaskIndex,
+    collection: String,
+    messages: Vec<ChatMessage>,
+    units: Vec<ManagedTranslationTaskUnitIdentity>,
+    evidence: TranslationTaskExecutionEvidence,
+    total_duration: Duration,
+    state: ManagedTranslationTaskRecordFinalState,
+}
+
+impl ManagedTranslationTaskRecordDocument {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        total_tasks: usize,
+        task_index: RunWideTranslationTaskIndex,
+        collection: impl Into<String>,
+        messages: Vec<ChatMessage>,
+        units: Vec<ManagedTranslationTaskUnitIdentity>,
+        evidence: TranslationTaskExecutionEvidence,
+        state: ManagedTranslationTaskRecordFinalState,
+    ) -> Self {
+        assert!(total_tasks != 0, "Managed 任务记录总数不得为零");
+        assert!(
+            task_index.get() < total_tasks,
+            "Managed 任务记录自然序必须落在本轮任务总数内"
+        );
+        let collection = collection.into();
+        assert!(!collection.is_empty(), "Managed collection 名不得为空");
+        assert!(!units.is_empty(), "Managed TaskBlock 必须至少包含一个 unit");
+        assert!(
+            units
+                .iter()
+                .enumerate()
+                .all(|(index, unit)| unit.id == index + 1),
+            "Managed 任务记录 ID 必须从 1 连续编号"
+        );
+        assert!(
+            state
+                .units
+                .iter()
+                .all(|result| units.iter().any(|unit| unit.id == result.id)),
+            "Managed 逐 ID 结果不得引用任务外 ID"
+        );
+        assert!(
+            state.units.iter().enumerate().all(|(index, result)| {
+                !state.units[..index]
+                    .iter()
+                    .any(|previous| previous.id == result.id)
+            }),
+            "Managed 逐 ID 结果不得重复"
+        );
+        let accepted_targets = units
+            .iter()
+            .filter(|identity| {
+                state.units.iter().any(|result| {
+                    result.id == identity.id
+                        && matches!(result.status, ManagedTranslationTaskUnitStatus::Accepted)
+                })
+            })
+            .map(|identity| identity.targets.len())
+            .sum::<usize>();
+        assert!(
+            state
+                .confirmed_committed_units
+                .is_none_or(|count| count <= accepted_targets),
+            "Managed 已确认提交数不能超过已验收 ID 映射的 unit target 数"
+        );
+        let total_duration = evidence.elapsed_until_finalization();
+        Self {
+            total_tasks,
+            task_index,
+            collection,
+            messages,
+            units,
+            evidence,
+            total_duration,
+            state,
+        }
+    }
+}
+
+/// Standard 与 Managed 最终化线共用的非权威记录入口。
 pub(crate) trait TranslationTaskRecordSink: Send + Sync {
     fn enabled(&self) -> bool {
         true
     }
 
+    /// 在 Managed 计划形成后声明两类任务合计总数；sink 只将它用于最终记录呈现。
+    fn declare_total_tasks(&self, _total_tasks: usize) {}
+
     /// 只接收已经固定的不可变终态文档，不在 Standard 业务编排中执行渲染或文件 I/O。
     fn submit(&self, document: TranslationTaskRecordDocument);
+
+    /// 只接收已经固定的 Managed 不可变终态文档。
+    fn submit_managed(&self, _document: ManagedTranslationTaskRecordDocument) {}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -769,6 +814,49 @@ impl TranslationTaskRecordSink for ConfiguredTranslationTaskRecordSink {
             Self::Markdown(sink) => sink.submit(document),
         }
     }
+
+    fn declare_total_tasks(&self, total_tasks: usize) {
+        match self {
+            Self::Disabled(sink) => sink.declare_total_tasks(total_tasks),
+            Self::Markdown(sink) => sink.declare_total_tasks(total_tasks),
+        }
+    }
+
+    fn submit_managed(&self, document: ManagedTranslationTaskRecordDocument) {
+        match self {
+            Self::Disabled(sink) => sink.submit_managed(document),
+            Self::Markdown(sink) => sink.submit_managed(document),
+        }
+    }
+}
+
+enum BufferedTranslationTaskRecordDocument {
+    Standard(TranslationTaskRecordDocument),
+    Managed(ManagedTranslationTaskRecordDocument),
+}
+
+impl BufferedTranslationTaskRecordDocument {
+    const fn task_index(&self) -> RunWideTranslationTaskIndex {
+        match self {
+            Self::Standard(document) => {
+                RunWideTranslationTaskIndex::new(document.task_index().get())
+            }
+            Self::Managed(document) => document.task_index,
+        }
+    }
+
+    const fn declared_total_tasks(&self) -> usize {
+        match self {
+            Self::Standard(document) => document.total_tasks,
+            Self::Managed(document) => document.total_tasks,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingTranslationTaskRecords {
+    total_tasks: usize,
+    documents: Vec<BufferedTranslationTaskRecordDocument>,
 }
 
 /// 生产 Markdown sink；文件故障只并入项目日志健康状态。
@@ -780,7 +868,7 @@ pub(crate) struct MarkdownTranslationTaskRecordSink {
     locale: UiLocale,
     file_system: SystemFileSystem,
     warnings: ProjectLogger,
-    pending: Arc<Mutex<Vec<TranslationTaskRecordDocument>>>,
+    pending: Arc<Mutex<PendingTranslationTaskRecords>>,
 }
 
 impl MarkdownTranslationTaskRecordSink {
@@ -799,21 +887,30 @@ impl MarkdownTranslationTaskRecordSink {
             locale,
             file_system,
             warnings,
-            pending: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(PendingTranslationTaskRecords::default())),
         }
     }
 
     async fn finish(&self) {
-        let documents = {
+        let pending = {
             let mut pending = self
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *pending)
         };
+        let total_tasks =
+            pending
+                .documents
+                .iter()
+                .fold(pending.total_tasks, |total_tasks, document| {
+                    total_tasks
+                        .max(document.declared_total_tasks())
+                        .max(document.task_index().get().saturating_add(1))
+                });
         let mut writes = FuturesUnordered::new();
-        for document in documents {
-            writes.push(self.write(document));
+        for document in pending.documents {
+            writes.push(self.write(document, total_tasks));
         }
         while writes.next().await.is_some() {}
         if let Err(error) = self.file_system.shutdown().await {
@@ -832,13 +929,30 @@ impl MarkdownTranslationTaskRecordSink {
         }
     }
 
-    async fn write(&self, document: TranslationTaskRecordDocument) {
+    async fn write(&self, document: BufferedTranslationTaskRecordDocument, total_tasks: usize) {
         let path = self.directory.join(format!(
             "task-{:06}.md",
             document.task_index().get().saturating_add(1)
         ));
-        let markdown = match render_task_record(&self.run_id, &self.client, self.locale, &document)
-        {
+        let markdown = match &document {
+            BufferedTranslationTaskRecordDocument::Standard(document) => {
+                render_standard_task_record(
+                    &self.run_id,
+                    &self.client,
+                    self.locale,
+                    document,
+                    total_tasks,
+                )
+            }
+            BufferedTranslationTaskRecordDocument::Managed(document) => render_managed_task_record(
+                &self.run_id,
+                &self.client,
+                self.locale,
+                document,
+                total_tasks,
+            ),
+        };
+        let markdown = match markdown {
             Ok(markdown) => markdown,
             Err(error) => {
                 let path = self
@@ -895,18 +1009,52 @@ impl MarkdownTranslationTaskRecordSink {
 
 impl TranslationTaskRecordSink for MarkdownTranslationTaskRecordSink {
     fn submit(&self, document: TranslationTaskRecordDocument) {
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(document);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.total_tasks = pending.total_tasks.max(document.total_tasks);
+        pending
+            .documents
+            .push(BufferedTranslationTaskRecordDocument::Standard(document));
+    }
+
+    fn declare_total_tasks(&self, total_tasks: usize) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.total_tasks = pending.total_tasks.max(total_tasks);
+    }
+
+    fn submit_managed(&self, document: ManagedTranslationTaskRecordDocument) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.total_tasks = pending.total_tasks.max(document.total_tasks);
+        pending
+            .documents
+            .push(BufferedTranslationTaskRecordDocument::Managed(document));
     }
 }
 
+#[cfg(test)]
 fn render_task_record(
     run_id: &str,
     client: &LlmClientRecordMetadata,
     locale: UiLocale,
     document: &TranslationTaskRecordDocument,
+) -> Result<String, serde_json::Error> {
+    render_standard_task_record(run_id, client, locale, document, document.total_tasks)
+}
+
+fn render_standard_task_record(
+    run_id: &str,
+    client: &LlmClientRecordMetadata,
+    locale: UiLocale,
+    document: &TranslationTaskRecordDocument,
+    total_tasks: usize,
 ) -> Result<String, serde_json::Error> {
     let localizer = UiLocalizer::new(locale);
     let api_key_redactor = client.api_key_redactor();
@@ -940,7 +1088,7 @@ fn render_task_record(
             &localizer,
             UiMessage::TaskRecordSummaryWithWritten {
                 ordinal: ordinal as u64,
-                total: document.total_tasks as u64,
+                total: total_tasks as u64,
                 attempts: attempts as u64,
                 accepted: accepted as u64,
                 expected: expected as u64,
@@ -951,7 +1099,7 @@ fn render_task_record(
             &localizer,
             UiMessage::TaskRecordSummaryWithoutWritten {
                 ordinal: ordinal as u64,
-                total: document.total_tasks as u64,
+                total: total_tasks as u64,
                 attempts: attempts as u64,
                 accepted: accepted as u64,
                 expected: expected as u64,
@@ -1108,6 +1256,334 @@ fn render_task_record(
     render_final_result(&mut output, &localizer, client.api_key_redactor(), document)?;
 
     Ok(output)
+}
+
+fn render_managed_task_record(
+    run_id: &str,
+    client: &LlmClientRecordMetadata,
+    locale: UiLocale,
+    document: &ManagedTranslationTaskRecordDocument,
+    total_tasks: usize,
+) -> Result<String, serde_json::Error> {
+    let localizer = UiLocalizer::new(locale);
+    let api_key_redactor = client.api_key_redactor();
+    let ordinal = document.task_index.get().saturating_add(1);
+    let accepted = document.state.accepted_count();
+    let expected = document.units.len();
+    let attempts = document.evidence.attempt_count();
+
+    let mut output = String::new();
+    let state_label = task_record_text(
+        &localizer,
+        UiMessage::TaskRecordStateLabel {
+            state: document.state.checkpoint.code(),
+        },
+    );
+    let padded_ordinal = format!("{ordinal:06}");
+    let title = task_record_text(
+        &localizer,
+        UiMessage::TaskRecordTitle {
+            ordinal: &padded_ordinal,
+            state: &state_label,
+        },
+    );
+    let _ = writeln!(output, "# {title}\n");
+    let summary = task_record_text(
+        &localizer,
+        UiMessage::TaskRecordSummaryWithoutWritten {
+            ordinal: ordinal as u64,
+            total: total_tasks as u64,
+            attempts: attempts as u64,
+            accepted: accepted as u64,
+            expected: expected as u64,
+        },
+    );
+    let _ = writeln!(output, "{summary}\n");
+    let run_id = markdown_inline_code(&api_key_redactor.redact(run_id));
+    let _ = writeln!(
+        output,
+        "- {}{run_id}",
+        task_record_text(&localizer, UiMessage::TaskRecordRunIdLabel),
+    );
+    let started_at = markdown_inline_code(&recorded_at_utc(document.evidence.started_at()));
+    let _ = writeln!(
+        output,
+        "- {}{started_at}",
+        task_record_text(&localizer, UiMessage::TaskRecordStartedAtLabel),
+    );
+    let duration = markdown_inline_code(&render_duration(&localizer, document.total_duration));
+    let _ = writeln!(
+        output,
+        "- {}{duration}",
+        task_record_text(&localizer, UiMessage::TaskRecordDurationLabel),
+    );
+    let endpoint = markdown_inline_code(client.endpoint());
+    let _ = writeln!(
+        output,
+        "- {}{endpoint}",
+        task_record_text(&localizer, UiMessage::TaskRecordEndpointLabel),
+    );
+    let model = markdown_inline_code(client.model());
+    let _ = writeln!(
+        output,
+        "- {}{model}",
+        task_record_text(&localizer, UiMessage::TaskRecordModelLabel),
+    );
+
+    output.push_str("\n## Managed\n\n");
+    let collection = markdown_inline_code(&api_key_redactor.redact(&document.collection));
+    let _ = writeln!(output, "- Collection: {collection}");
+    output.push_str("- ID → collection/key:\n");
+    for unit in &document.units {
+        let id = markdown_inline_code(&unit.id.to_string());
+        for target in &unit.targets {
+            let collection = markdown_inline_code(&api_key_redactor.redact(&target.collection));
+            let key = markdown_inline_code(&api_key_redactor.redact(&target.key));
+            let _ = writeln!(output, "  - {id} → {collection}/{key}");
+        }
+    }
+
+    let _ = write!(
+        output,
+        "\n## {}\n\n",
+        task_record_text(&localizer, UiMessage::TaskRecordCustomParametersHeading)
+    );
+    let parameters =
+        api_key_redactor.redact_json_pretty(&Value::Object(client.parameters().clone()))?;
+    output.push_str(&markdown_fence(&parameters, "json"));
+
+    render_managed_messages_and_execution(
+        &mut output,
+        &localizer,
+        api_key_redactor,
+        &document.messages,
+        &document.evidence,
+    )?;
+
+    let _ = write!(
+        output,
+        "\n## {}\n\n",
+        task_record_text(&localizer, UiMessage::TaskRecordFinalResultHeading)
+    );
+    render_managed_final_result(&mut output, &localizer, api_key_redactor, document)?;
+
+    Ok(output)
+}
+
+fn render_managed_messages_and_execution(
+    output: &mut String,
+    localizer: &UiLocalizer,
+    api_key_redactor: &ApiKeyRedactor,
+    messages: &[ChatMessage],
+    evidence: &TranslationTaskExecutionEvidence,
+) -> Result<(), serde_json::Error> {
+    for message in messages {
+        let title = match message.role() {
+            ChatMessageRole::System => "System",
+            ChatMessageRole::User => "User",
+            ChatMessageRole::Assistant => "Assistant",
+        };
+        let _ = write!(output, "\n## {title}\n\n");
+        let content = api_key_redactor.redact(message.content());
+        output.push_str(&content);
+        if !content.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+
+    let _ = write!(
+        output,
+        "\n## {}\n\n",
+        task_record_text(localizer, UiMessage::TaskRecordAttemptsHeading)
+    );
+    if evidence.attempts.is_empty() {
+        let _ = writeln!(
+            output,
+            "- {}",
+            task_record_text(localizer, UiMessage::TaskRecordNoRequest)
+        );
+    } else {
+        for attempt in &evidence.attempts {
+            render_attempt(output, localizer, api_key_redactor, attempt)?;
+        }
+    }
+
+    let Some(response) = &evidence.response else {
+        return Ok(());
+    };
+    if let Some(thinking) = &response.thinking {
+        output.push_str("\n## Thinking\n\n");
+        let thinking = api_key_redactor.redact(thinking);
+        output.push_str(&thinking);
+        if !thinking.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output.push_str("\n## Assistant\n\n");
+    if let Some(entries) = &response.ordered_entries {
+        if entries.is_empty() {
+            let _ = writeln!(
+                output,
+                "_{}_",
+                task_record_text(localizer, UiMessage::TaskRecordEmptyAssistant)
+            );
+        }
+        for entry in entries {
+            let id = api_key_redactor.redact(&entry.id);
+            let _ = writeln!(output, "### ID {}\n", markdown_heading_id(&id));
+            match &entry.value {
+                Value::Array(values)
+                    if values.iter().all(|value| matches!(value, Value::String(_))) =>
+                {
+                    for (line_index, value) in values.iter().enumerate() {
+                        if line_index != 0 {
+                            output.push_str("\n\n");
+                        }
+                        output.push_str(
+                            &api_key_redactor.redact(value.as_str().expect("已验证为字符串")),
+                        );
+                    }
+                    output.push('\n');
+                }
+                value => {
+                    let value = api_key_redactor.redact_json_pretty(value)?;
+                    output.push_str(&markdown_fence(&value, "json"));
+                }
+            }
+            output.push('\n');
+        }
+    } else {
+        if let Some(error) = &response.parse_error {
+            let category = match error.kind {
+                TranslationTaskResponseParseErrorKind::Json(category) => category.code(),
+                _ => "",
+            };
+            let _ = writeln!(
+                output,
+                "> {}\n",
+                task_record_text(
+                    localizer,
+                    UiMessage::TaskRecordParseError {
+                        kind: error.kind.code(),
+                        category,
+                        line: error.line.get() as u64,
+                        column: error.column.get() as u64,
+                    }
+                )
+            );
+        }
+        output.push_str(&markdown_fence(
+            &api_key_redactor.redact_text_with_json_strings(&response.raw_assistant),
+            "text",
+        ));
+    }
+    Ok(())
+}
+
+fn render_managed_final_result(
+    output: &mut String,
+    localizer: &UiLocalizer,
+    api_key_redactor: &ApiKeyRedactor,
+    document: &ManagedTranslationTaskRecordDocument,
+) -> Result<(), serde_json::Error> {
+    let checkpoint = document.state.checkpoint.code();
+    let _ = writeln!(
+        output,
+        "- {}",
+        task_record_text(
+            localizer,
+            UiMessage::TaskRecordFinalStatus { state: checkpoint }
+        )
+    );
+    let checkpoint = markdown_inline_code(checkpoint);
+    let _ = writeln!(output, "- Managed checkpoint: {checkpoint}");
+    let accepted = document.state.accepted_count();
+    match document.state.confirmed_committed_units {
+        Some(committed) => {
+            let _ = writeln!(
+                output,
+                "- IDs: accepted `{accepted}/{}`; confirmed committed unit targets `{committed}`",
+                document.units.len()
+            );
+        }
+        None => {
+            let _ = writeln!(
+                output,
+                "- IDs: accepted `{accepted}/{}`; unit-target commit outcome `unknown`",
+                document.units.len()
+            );
+        }
+    }
+    output.push_str("- Unit acceptance:\n");
+    for identity in &document.units {
+        let id = markdown_inline_code(&identity.id.to_string());
+        let result = document
+            .state
+            .units
+            .iter()
+            .find(|result| result.id == identity.id);
+        for target in &identity.targets {
+            let collection = markdown_inline_code(&api_key_redactor.redact(&target.collection));
+            let key = markdown_inline_code(&api_key_redactor.redact(&target.key));
+            match result.map(|result| &result.status) {
+                Some(ManagedTranslationTaskUnitStatus::Accepted) => {
+                    let _ = writeln!(
+                        output,
+                        "  - ID {id} → collection {collection}, key {key}: `accepted`"
+                    );
+                }
+                Some(ManagedTranslationTaskUnitStatus::Rejected { reason, details }) => {
+                    let reason = markdown_inline_code(&api_key_redactor.redact(reason));
+                    let _ = write!(
+                        output,
+                        "  - ID {id} → collection {collection}, key {key}: `rejected`; reason {reason}"
+                    );
+                    if let Some(details) = details {
+                        let details = api_key_redactor.redact_json(details)?;
+                        let details = markdown_inline_code(&details);
+                        let _ = write!(output, "; details {details}");
+                    }
+                    output.push('\n');
+                }
+                None => {
+                    let _ = writeln!(
+                        output,
+                        "  - ID {id} → collection {collection}, key {key}: `not_evaluated`"
+                    );
+                }
+            }
+        }
+    }
+    for diagnostic in &document.state.protocol_diagnostics {
+        let diagnostic = protocol_diagnostic(localizer, api_key_redactor, diagnostic);
+        let _ = writeln!(
+            output,
+            "- {}",
+            task_record_text(
+                localizer,
+                UiMessage::TaskRecordProtocolDiagnostic {
+                    diagnostic: &diagnostic,
+                }
+            )
+        );
+    }
+    if let Some(diagnostic) = &document.state.diagnostic {
+        let reason = markdown_inline_code(
+            &api_key_redactor.redact(&diagnostic.reason.render_localized(localizer)),
+        );
+        let _ = writeln!(
+            output,
+            "- {}",
+            task_record_text(
+                localizer,
+                UiMessage::TaskRecordTaskDiagnostic {
+                    code: diagnostic.code.as_str(),
+                    reason: &reason,
+                }
+            )
+        );
+    }
+    Ok(())
 }
 
 fn render_attempt(
@@ -1904,6 +2380,256 @@ mod tests {
             ),
             state,
         )
+    }
+
+    fn managed_document(
+        task_index: usize,
+        total_tasks: usize,
+        state: ManagedTranslationTaskRecordFinalState,
+        response: Option<TranslationTaskResponseRecord>,
+    ) -> ManagedTranslationTaskRecordDocument {
+        ManagedTranslationTaskRecordDocument::new(
+            total_tasks,
+            RunWideTranslationTaskIndex::new(task_index),
+            "quest_titles",
+            vec![
+                ChatMessage::new(ChatMessageRole::System, "Managed system"),
+                ChatMessage::new(ChatMessageRole::User, "Managed user"),
+            ],
+            vec![
+                ManagedTranslationTaskUnitIdentity::new(
+                    1,
+                    vec![
+                        ManagedTranslationTaskUnitTarget::new("quests", "quest:arrival"),
+                        ManagedTranslationTaskUnitTarget::new(
+                            "archive_quests",
+                            "quest:arrival-copy",
+                        ),
+                    ],
+                ),
+                ManagedTranslationTaskUnitIdentity::new(
+                    2,
+                    vec![ManagedTranslationTaskUnitTarget::new(
+                        "quests",
+                        "quest:departure",
+                    )],
+                ),
+            ],
+            TranslationTaskExecutionEvidence::new(
+                OffsetDateTime::UNIX_EPOCH,
+                Duration::from_millis(12),
+                Vec::new(),
+                response,
+            ),
+            state,
+        )
+    }
+
+    #[test]
+    fn managed_record_renders_structured_identity_protocol_and_checkpoint_facts() {
+        const KEY: &str = "managed-secret";
+        let document = managed_document(
+            2,
+            4,
+            ManagedTranslationTaskRecordFinalState::new(
+                ManagedTranslationTaskCheckpointState::Partial,
+                vec![
+                    ManagedTranslationTaskUnitResult::accepted(1),
+                    ManagedTranslationTaskUnitResult::rejected(
+                        2,
+                        "placeholder_mismatch",
+                        Some(json!({
+                            "token": format!("ordinary:{KEY}"),
+                            "expected": 1,
+                            "actual": 0,
+                        })),
+                    ),
+                ],
+                Some(2),
+                None,
+            )
+            .with_protocol_diagnostics(vec![
+                TranslationProtocolDiagnostic::UnknownId {
+                    item_index: 2,
+                    id: 99,
+                },
+            ]),
+            Some(TranslationTaskResponseRecord::parsed(
+                format!(r#"{{"1":["抵达"],"2":["ordinary:{KEY}"],"99":["未知"]}}"#),
+                Some(format!("why ordinary:{KEY}")),
+                vec![
+                    TranslationAssistantEntry::projected(
+                        "1".to_owned(),
+                        json!(["抵达"]),
+                        Some(1),
+                        None,
+                    ),
+                    TranslationAssistantEntry::projected(
+                        "2".to_owned(),
+                        json!([format!("ordinary:{KEY}")]),
+                        Some(2),
+                        None,
+                    ),
+                    TranslationAssistantEntry::new("99".to_owned(), json!(["未知"])),
+                ],
+            )),
+        );
+
+        let markdown = render_managed_task_record(
+            "run-managed",
+            &client("https://example.test", "model", Map::new(), KEY),
+            UiLocale::SimplifiedChinese,
+            &document,
+            4,
+        )
+        .expect("Managed 任务记录应可渲染");
+
+        assert!(markdown.starts_with("# 翻译任务 000003 · 部分完成\n"));
+        assert!(markdown.contains("`任务 3/4`"));
+        assert!(markdown.contains("- Collection: `quest_titles`"));
+        assert!(markdown.contains("`1` → `quests`/`quest:arrival`"));
+        assert!(
+            markdown.contains("`1` → `archive_quests`/`quest:arrival-copy`"),
+            "同一模型 ID 的全部去重扇出目标都必须出现在身份映射中"
+        );
+        assert!(markdown.contains("`2` → `quests`/`quest:departure`"));
+        assert!(markdown.contains("## System\n\nManaged system"));
+        assert!(markdown.contains("## User\n\nManaged user"));
+        assert!(markdown.contains("## Thinking\n\nwhy ordinary:[REDACTED API KEY]"));
+        assert!(markdown.contains("### ID 1\n\n抵达"));
+        assert!(markdown.contains("### ID 99\n\n未知"));
+        assert!(markdown.contains("- Managed checkpoint: `partial`"));
+        assert!(
+            markdown.contains("IDs: accepted `1/2`; confirmed committed unit targets `2`"),
+            "一个已接受 ID 扇出的两个 unit target 必须按真实提交行数计数"
+        );
+        assert!(markdown.contains("ID `1` → collection `quests`, key `quest:arrival`: `accepted`"));
+        assert!(
+            markdown.contains(
+                "ID `1` → collection `archive_quests`, key `quest:arrival-copy`: `accepted`"
+            ),
+            "最终验收结果必须展开同一 ID 的每个 collection/key target"
+        );
+        assert!(
+            markdown.contains(
+                "ID `2` → collection `quests`, key `quest:departure`: `rejected`; reason `placeholder_mismatch`"
+            )
+        );
+        assert!(
+            markdown.contains("协议诊断：模型第 3 个条目返回了未知 ID `99`"),
+            "Managed 记录必须保留响应边界产生的未知 ID 协议诊断"
+        );
+        assert!(markdown.contains("[REDACTED API KEY]"));
+        assert!(!markdown.contains(KEY));
+    }
+
+    #[test]
+    fn managed_checkpoint_codes_cover_every_ordered_finalization_state() {
+        let states = [
+            (ManagedTranslationTaskCheckpointState::Complete, "complete"),
+            (ManagedTranslationTaskCheckpointState::Partial, "partial"),
+            (
+                ManagedTranslationTaskCheckpointState::Unavailable,
+                "unavailable",
+            ),
+            (
+                ManagedTranslationTaskCheckpointState::ExecutionFailed,
+                "execution_failed",
+            ),
+            (
+                ManagedTranslationTaskCheckpointState::CommitPreparationFailed,
+                "commit_preparation_failed",
+            ),
+            (
+                ManagedTranslationTaskCheckpointState::CommitNotApplied,
+                "commit_not_applied",
+            ),
+            (
+                ManagedTranslationTaskCheckpointState::OutcomeUnknown,
+                "commit_outcome_unknown",
+            ),
+            (
+                ManagedTranslationTaskCheckpointState::EarlierFailure,
+                "not_committed_after_earlier_failure",
+            ),
+            (
+                ManagedTranslationTaskCheckpointState::Cancelled,
+                "cancelled",
+            ),
+        ];
+
+        assert_eq!(
+            states.map(|(state, _)| state.code()),
+            states.map(|(_, expected)| expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_uses_one_run_wide_ordinal_and_final_total_for_standard_and_managed() {
+        let directory = tempdir().expect("临时目录应可建立");
+        let record_directory = directory.path().join("task-records").join("run-combined");
+        std::fs::create_dir_all(&record_directory).expect("任务记录目录应可建立");
+        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
+            .expect("文件系统执行根应可建立");
+        let log_runtime =
+            start_project_log(directory.path().join("logs"), "run-combined".to_owned());
+        let sink = MarkdownTranslationTaskRecordSink::new(
+            record_directory.clone(),
+            "run-combined".to_owned(),
+            client("https://example.test", "model", Map::new(), "unused-key"),
+            UiLocale::SimplifiedChinese,
+            file_system,
+            log_runtime.logger(),
+        );
+        let mut standard = document(
+            Vec::new(),
+            Vec::new(),
+            None,
+            TranslationTaskRecordFinalState::CompleteCommitted {
+                outcome: test_complete_outcome(),
+            },
+        );
+        standard.total_tasks = 1;
+        sink.submit(standard);
+        sink.declare_total_tasks(3);
+        for task_index in 1..=2 {
+            sink.submit_managed(managed_document(
+                task_index,
+                3,
+                ManagedTranslationTaskRecordFinalState::new(
+                    ManagedTranslationTaskCheckpointState::Complete,
+                    vec![
+                        ManagedTranslationTaskUnitResult::accepted(1),
+                        ManagedTranslationTaskUnitResult::accepted(2),
+                    ],
+                    Some(3),
+                    None,
+                ),
+                None,
+            ));
+        }
+
+        sink.finish().await;
+
+        for ordinal in 1..=3 {
+            let path = record_directory.join(format!("task-{ordinal:06}.md"));
+            let markdown = std::fs::read_to_string(path).expect("连续编号任务记录应存在");
+            assert!(
+                markdown.contains(&format!("`任务 {ordinal}/3`")),
+                "Standard 和 Managed 文档都必须在落盘时得到最终总数"
+            );
+        }
+        assert!(
+            std::fs::read_to_string(record_directory.join("task-000001.md"))
+                .expect("Standard 记录应存在")
+                .contains("## 最终结果"),
+        );
+        assert!(
+            std::fs::read_to_string(record_directory.join("task-000002.md"))
+                .expect("首个 Managed 记录应存在")
+                .contains("- Collection: `quest_titles`"),
+        );
+        drop(log_runtime);
     }
 
     #[test]

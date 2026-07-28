@@ -19,7 +19,7 @@ use crate::diagnostic::{
     DiagnosticAction, DiagnosticCode, DiagnosticFailureKind, DiagnosticImpact, DiagnosticReason,
     DiagnosticStage, DiagnosticSubject, SafeDiagnostic,
 };
-use crate::rpg_maker::json::{StackSafeJsonError, StackSafeJsonValue, from_str as parse_json};
+use crate::json::{StackSafeJsonError, StackSafeJsonValue, from_str as parse_json};
 use crate::rpg_maker::model::{
     DirectTextPart, DirectTextRecipe, ProjectionModelError, ScalarFieldKey, TextProjectionRecipe,
     TextUnitRole,

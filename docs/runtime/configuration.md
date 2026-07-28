@@ -2,7 +2,7 @@
 
 仓库根目录的 [`config.example.toml`](../../config.example.toml) 是当前版本唯一示例。
 配置只表达操作者真正能够选择的路径、Prompt、语言、模型服务、业务 Profile 和可读
-Standard 任务记录开关；线程、队列、批次、SQLite 持久策略、日志缓冲以及文件、Lua、SQLite、
+翻译任务记录开关；线程、队列、批次、SQLite 持久策略、日志缓冲以及文件、Lua、SQLite、
 Claim、Unit、Group、Task 总量都不是配置项。
 
 ## 1. 读取与严格边界
@@ -127,21 +127,29 @@ target_task_user_message_characters = 24000
 ```
 
 `record_translation_tasks` 是可省略的布尔值，默认 `false`，只有 Translate 消费。开启后
-只为本轮已启动的 Standard TaskBlock 写入可读 Markdown；Translate Lua 不生成任务记录。
-它不属于某个 Client，不进入翻译 state、保存的运行方案或项目数据库。固定路径、内容
-模板、API-key 精确替换和非阻断写入语义见
-[Standard 翻译任务记录现行规格](../rpg-maker/task-records.md)。
+为本轮已启动的 Standard TaskBlock 和 `ctx.translations.translate()` 建立的 Managed
+TaskBlock 写入可读 Markdown；低级 `ctx.llm` 不生成记录。它不属于某个 Client，不进入
+翻译 state、保存的运行方案或项目数据库。固定路径、run-wide 编号、内容模板、精确替换
+和非阻断写入语义见[翻译任务记录现行规格](../rpg-maker/task-records.md)。
 
-Profile 只拥有普通 TaskBlock 最终 user message 的 Unicode 字符装箱目标和 Client 引用。
-Planner 按实际渲染结果计数；加入下一个完整文本组会超过目标时，只在组边界开始下一
-任务。单个不可拆分文本组本身超过目标时，该组独立成为一个任务，实际字符数允许超过
-目标，翻译继续；这不会拆组、拒绝规范内容或抬高后续任务的装箱目标。
+Profile 只拥有 ATT 托管 TaskBlock 最终 user message 的 Unicode 字符装箱目标和 Client
+引用。Standard Planner 按完整组、Managed Planner 按完整 unit 对实际渲染结果计数；
+加入下一个原子会超过目标时，只在对应边界开始下一任务。单个不可拆分组或 unit 本身
+超过目标时独立成为一个任务，实际字符数允许超过目标，翻译继续；这不会拆原子、拒绝
+规范内容或抬高后续任务的装箱目标。
 
 该目标不包含 system message、请求外壳或模型输出，也不是 Provider 上下文或请求容量
-上限。Profile 不拥有 worker、任务在途数、planning/execution 包装或重试副本。活动 HTTP
-宽度来自所选 Client 的 `max_concurrent_requests`（N）；内部完成重排窗口由最大真实样本
-消融与慢首任务压力测试确定为 2N，因此总在途宽度为 3N。这些内部执行策略由程序拥有，
-不进入配置。
+上限。Profile 不拥有 worker、任务在途数、planning/execution 包装或重试副本。Standard
+与 Managed 都使用所选 Client 的 `max_concurrent_requests`、超时、速率限制、
+`retry_delays_ms` 和 `max_retry_after_ms`；活动 HTTP 宽度为 N，内部有界在途/重排宽度
+为 3N。这些执行策略由程序拥有，不进入配置。
+
+Lua 托管翻译高级接口不增加配置字段。它复用项目 engine/语言对、当前 Prompt、
+`thinking_output`、Profile 装箱目标、术语、Placeholder、Client 并发/重试和
+`record_translation_tasks`。collection instruction、unit context、kind、shape 与
+metadata 属于 Extract 声明；内部 worker、重排窗口、提交批次和 checkpoint 事务也不
+转嫁为用户配置。高级契约不能表达的私有协议由 Lua 显式使用低级接口，不以配置开关
+触发自动降级。
 
 `prompts.locale = "auto"` 复用本进程已经解析的 UI locale；显式值按现有 UI i18n 规则
 规范化。资源路径固定为：
@@ -165,7 +173,7 @@ LanguagePair 精确选择源语言模块。
 - SQLite 固定使用 WAL + FULL；
 - 项目锁、发布锁和 SQLite busy 不设置任意截止时间；
 - 日志固定写入项目工作区的 `logs/<run-id>.jsonl`；
-- 启用 Standard 任务记录时固定写入同一 RunId 的
+- 启用翻译任务记录时固定写入同一 RunId 的
   `task-records/<run-id>/task-000001.md`，稳定 ordinal 与完整格式由任务记录规格规定；
 - 文档、规则、Group、任务和不同物理文件在不破坏确定性的前提下并行；
 - 自然顺序、代表选择、提交顺序和最终主错误不受完成顺序影响。

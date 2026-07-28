@@ -5,16 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::language::{LanguageModule, LanguagePair};
-
-/// RPG Maker 翻译响应必须遵循的受信外层协议。
-///
-/// 该模式与已装配的 system prompt 共同建立，Planner 与 Executor 必须通过同一份
-/// 已解析资源消费它，避免提示词要求与响应解析发生偏离。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationResponseEnvelope {
-    JsonOnly,
-    ThinkingThenJson,
-}
+pub(crate) use crate::translation_protocol::TranslationResponseEnvelope;
 
 /// 一个 RPG Maker system prompt 及其唯一适用的规范语言对。
 #[derive(Clone, Eq, PartialEq)]

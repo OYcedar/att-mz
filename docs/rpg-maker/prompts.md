@@ -1,6 +1,6 @@
 # RPG Maker 系统提示词编写指南
 
-本文面向编写或微调 RPG Maker Standard Translate system Prompt 的作者。它说明 ATT 如何
+本文面向编写或微调 RPG Maker Standard/Managed Translate system Prompt 的作者。它说明 ATT 如何
 选择、校验和装配外置 Prompt，以及模型响应必须满足的机器协议。本文首先关心的不是译文
 是否优美，而是响应能否被 ATT 解析、关联到正确单元并通过结构验收。
 
@@ -106,15 +106,15 @@ system message 或 state。
 
 ## 4. 模型实际收到什么
 
-每个 Standard TaskBlock 仍然只发送两条消息：
+每个 Standard 或 Managed TaskBlock 都只发送两条消息：
 
 1. `system`：按上一节渲染并按模式装配的完整 system Prompt；
 2. `user`：ATT Planner 自动生成的 Markdown 任务载荷。
 
 user message 不是 JSON，也不是 ATT 的内部领域对象。它只携带模型完成本次翻译所需的
-术语、语境、待翻译内容、临时 ID 和输出形状。语言对、文件路径、owner、内部 kind、
-传播目标和去重原因不会重复写入 user message；翻译方向由模板渲染后的 system message
-建立。
+术语、语境、待翻译内容、临时 ID 和输出形状。语言对、文件路径、owner、传播目标和
+去重原因不会重复写入 user message；Managed 的 collection name、unit key、metadata
+与 state 同样不发送。翻译方向由模板渲染后的 system message 建立。
 
 Planner 生成的标题、字段标签和形状说明统一使用英文。所有本地化 Prompt 都必须保留并
 解释协议字面量 `single line`、`free line breaking`、
@@ -196,8 +196,7 @@ TranslationResponseEnvelope
 ### 6.1 `JsonOnly`
 
 `thinking_output = false` 选择 `JsonOnly`。模型必须直接输出裸 JSON object；任何
-`<why>` 思考信封都会被拒绝。响应仍可使用第 7 节说明的有限 JSON 围栏容错，但 Prompt
-始终要求裸 JSON。
+`<why>` 思考信封、Markdown 围栏、前置说明或后记都会被拒绝。
 
 ### 6.2 `ThinkingThenJson`
 
@@ -219,7 +218,7 @@ JSON
 
 ATT 验证信封后把剥离的 JSON 交给唯一的现有 JSON parser 和逐 ID 验收。它不判断分析
 是否正确，也不会把思考正文放入权威结果、数据库、state、普通项目日志、终端或诊断；
-启用 Standard 任务记录时，合法 Thinking 作为非权威正文按原生 Markdown 呈现。裸 JSON
+启用翻译任务记录时，合法 Thinking 作为非权威正文按原生 Markdown 呈现。裸 JSON
 在该模式下同样非法。
 
 信封错误与 JSON 根错误都形成 `ModelResponseUnusable`，不会伪装成网络错误，也不会触发
@@ -248,9 +247,8 @@ ATT 解析的是 Chat Completions assistant `message.content` 中剥离信封后
 7. 最终 JSON 后不能再输出任何内容。
 
 响应整体会容忍首尾空白和最开头的单个 BOM；这个 BOM 必须位于裸 JSON 或 `<why>`
-之前，不能出现在 `</why>` 与 JSON 之间。剥离可选思考信封后，JSON parser 还容忍唯一
-一层独占首尾行的无标记、`json` 或 `JSON` Markdown 围栏。这是接收端的有限容错，不是
-Prompt 可以依赖的输出格式；外置 Prompt 必须始终要求裸 JSON。
+之前，不能出现在 `</why>` 与 JSON 之间。剥离可选思考信封后必须直接得到 JSON；
+Markdown 围栏不是合法 wire。
 
 JSON 根成功后，以下问题只拒绝对应 ID：
 
@@ -352,4 +350,4 @@ ATT token 的来源与恢复规则见[规则编写指南](rules.md#6-placeholder
 契约由
 [Chat Completions 运行根规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)
 唯一规定；高级记录的呈现方式见
-[Standard 翻译任务记录现行规格](task-records.md)。
+[翻译任务记录现行规格](task-records.md)。

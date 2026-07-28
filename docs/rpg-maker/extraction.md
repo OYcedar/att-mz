@@ -1,7 +1,7 @@
 # RPG Maker 文本提取现行规格
 
-本文定义 MV/MZ Extract 的生命周期、标准资产、Builtin 覆盖、顺序与事务。三类声明式
-文件的字段和错误由[规则文件现行规格](rules.md)唯一规定；Lua 形状由
+本文定义 MV/MZ Extract 的生命周期、标准资产、Lua Managed 快照、Builtin 覆盖、顺序与
+事务。三类声明式文件的字段和错误由[规则文件现行规格](rules.md)唯一规定；Lua 形状由
 [Lua 技术参考](lua.md)规定。
 
 ## 1. 命令与 owner 生命周期
@@ -18,8 +18,9 @@ att --config FILE mv extract --name NAME \
 
 未提供 `--builtin/--rules/--lua` 时，命令复用项目上次成功 Extract 保存的完整 owner 方案；
 项目尚无方案时明确要求至少提供一个提取选项。只要显式提供任一 owner，本轮显式集合就
-精确替换自动方案：未列出的 owner 不执行，但其既有资产不会仅因未列出而删除。执行和
-owner 总顺序始终是 `Builtin → Rules → Lua`。三个实际执行的 owner 分别原子替换自己的
+精确替换自动方案：未列出的 Builtin/Rules 不执行且保留既有资产；Lua 未列出则表示从
+新方案移除 Extract Lua，并停用 Lua Standard 与 Managed owner。执行和 owner 总顺序始终
+是 `Builtin → Rules → Lua`。三个实际执行或停用的 owner 分别原子更新自己的
 快照；首个技术失败阻止后续 owner，此前已成功提交的 owner 不做组合回滚，但本次保存
 方案不会替换旧方案。
 
@@ -30,8 +31,8 @@ owner 总顺序始终是 `Builtin → Rules → Lua`。三个实际执行的 own
   直接执行该语义，不重新读取原 TOML 路径；
 - `rule = []` 停用 Rules owner、删除其标准资产，并把 Rules 移出后续自动方案；
 - 非空 `--lua FILE` 保存主程序正文、SHA-256 和无损解析路径；自动复用执行保存的正文；
-- 零字节 Extract Lua 文件不执行程序，而是停用 Lua owner、删除其标准资产并清除该阶段
-  程序；
+- 显式方案未列出 Lua，或提供零字节 Extract Lua 文件时，都不执行程序，而是停用 Lua
+  Standard 与 Managed owner、删除两类快照并清除该阶段程序；
 - 清除后若没有任何可执行 owner，则删除保存的 Extract 方案；下次无参数运行会得到
   “尚无可复用方案”的输入错误。
 
@@ -76,7 +77,11 @@ DialogueSpeaker/DialogueBody，`event_choices` 只接受 Choices，
 - `standard_text_unit`：含 `unit_order` 的语义单元、译文和 state；
 - `standard_mutation_claim`：每个 `(owner, resource)` 至多一行的确定性跨 owner 冲突摘要；
 - `standard_translation_resource`：术语与自定义占位符 canonical 资源；
-- `standard_project_definition`：MV 姓名投影定义。
+- `standard_project_definition`：MV 姓名投影定义；
+- `managed_translation_owner_state`：Lua Managed owner 的来源和 manifest 指纹；
+- `managed_translation_collection`：collection 自然顺序、名称和 instruction；
+- `managed_translation_unit`：unit 自然顺序、身份、kind/shape、原文、context、metadata
+  以及成对 translation/state；
 - `extract_run_plan`：上次成功 Extract 的非空完整 owner 集合；
 - `extract_rules_definition`：可自动复用的非空 Rules canonical 语义；
 - `lua_program` 中的 `extract` 行：可自动复用的非空 Lua 主程序快照。
@@ -202,13 +207,18 @@ Choices、ScrollingText 与其覆盖字段或 descendant 冲突。Value 中出�
 
 Extract Lua 获得公共 `ctx.project/json/source/rpg_maker/db` 和 `ctx.extract`。简单的
 “一个标量语义字段 → 一个受信物理文本位置”可用 `replace_standard` 接入 Standard。
-跨文档、多目标复杂插件由 Lua 自己拥有 Extract/Translate/WriteBack 三阶段身份、私有表、
-事务和幂等协议；核心不提供通用多目标 DSL 或发布后回调。完整示例见
-[Lua Cookbook](lua-cookbook.md)。
+Lua 也可以通过 `ctx.translations.replace` 一次声明完整 Managed collection/unit 快照，
+由 ATT 在 Translate 承担去重、协议、并发、验收、state 和 checkpoint；WriteBack 仍由
+Lua 使用 key/metadata 映射到候选目标。Managed 不建立 Standard recipe 或 Mutation Claim。
+
+私有 grammar、跨 unit 原子关系、特殊模型协议和其他高级契约无法表达的关系继续由 Lua
+自己拥有三阶段身份、私有表、事务和幂等协议；Host 不自动降级，也不提供通用多目标 DSL
+或发布后回调。完整低级模式见[Lua Cookbook](lua-cookbook.md)，Managed 精确声明见
+[Lua 技术参考](lua.md#62-ctxtranslationsreplace)。
 
 ## 8. 提交、继承与完成语义
 
-每个 owner 的来源指纹、group、unit、由 recipe 确定的完整逻辑 Claim、冲突摘要和资产
+每个 Standard owner 的来源指纹、group、unit、由 recipe 确定的完整逻辑 Claim、冲突摘要和资产
 快照指纹在一个事务中验证并替换。事务直接批量写正式 Group、Unit 与 Claim 摘要表；
 未提交行对其他连接不可见，不复制 TEMP B-tree。非空 incoming 摘要不少于其他两个
 owner 的摘要总量时，按最大真实游戏消融结果在同一替换事务内暂时删除两个 Claim
@@ -225,6 +235,13 @@ owner 的摘要总量时，按最大真实游戏消融结果在同一替换事�
 替换时，只有逻辑身份、unit role、完整源内容与源上下文逐字相同才继承译文/state；
 `group_order`/`unit_order` 的单独变化不破坏继承，但会改变资产快照指纹。跨 owner 的 Claim
 冲突在提交前失败。成功摘要统计逻辑组和语义单元，不把物理位置或资源锁计为单元。
+
+同一次 Lua 主程序可以分别声明一个 Standard 意图和一个 Managed 意图。两者先完整校验并
+停留在内存；脚本、取消和交互数据库都正常终结后，Host 在同一个 Store 事务中原子应用。
+Managed 以 `collection name + unit key` 匹配旧单元：只改变 metadata 或声明顺序时保留
+translation/state；instruction、kind、shape、original 或 context 改变时不保留。删除
+collection/unit 会删除其状态；`replace({})` 是 active 空快照；未调用则保留原 Managed
+owner。
 
 提取成功证明候选满足 ATT 契约，不单独证明所有文本都玩家可见。作者仍应做正反样本、
 未翻译 round-trip、翻译 round-trip 和游戏内抽查。

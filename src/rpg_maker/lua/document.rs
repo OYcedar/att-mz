@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::rpg_maker::lua::json::{LosslessJsonError, LosslessJsonValue, decode as decode_json};
+use crate::lossless_json::{LosslessJsonError, LosslessJsonValue, decode as decode_json};
 use crate::rpg_maker::model::MutationClaim;
 use crate::rpg_maker::plugin_document::{
     PluginsEnvelopeFailure, parse_plugins_envelope, validate_plugins_root_is_array,

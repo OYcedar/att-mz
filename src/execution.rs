@@ -1,6 +1,8 @@
 //! 进程内业务执行的共享契约，包括取消状态、正常终态与受控 CPU 计算。
 
 pub(crate) mod cpu;
+pub(crate) mod llm_request;
+pub(crate) mod ordered;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

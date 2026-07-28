@@ -31,16 +31,16 @@ Help 与 Version 之外的命令必须显式传入 `--config FILE`。配置中�
 
 ## 哪些值由用户配置
 
-用户可配置的 LLM 相关值包括显式 Standard 任务记录选择和模型供应商真实约束：
+用户可配置的 LLM 相关值包括显式翻译任务记录选择和模型供应商真实约束：
 
-- 可选的 Standard TaskBlock 可读记录开关；
+- 可选的 Standard/Managed TaskBlock 可读记录开关；
 - Client 最大并发请求数；
 - 可选 RPM 与 burst；
 - 连接、连续读取和完整请求超时；
 - 重试延迟与可接受的最大 `Retry-After`；
 - 代理和额外 PEM 根证书。
 
-Profile 只配置所用 Client 和普通任务最终 user message 的字符装箱目标。该目标调节任务
+Profile 只配置所用 Client 和 ATT 托管任务最终 user message 的字符装箱目标。该目标调节任务
 粒度，不构成内容合法性、Provider 上下文或请求容量上限。Prompt、语言策略、项目根与
 业务规则继续按各自规格配置。
 
@@ -69,5 +69,5 @@ Release/MSVC 配对基准。每轮使用全新来源、项目数据库和输出�
 - [SQLite](sqlite.md)
 - [目录发布](directory-publishing.md)
 - [项目日志](project-log.md)
-- [Standard 翻译任务记录](../rpg-maker/task-records.md)
+- [翻译任务记录](../rpg-maker/task-records.md)
 - [RPG Maker 文档](../rpg-maker/README.md)

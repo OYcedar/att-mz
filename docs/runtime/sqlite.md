@@ -70,9 +70,14 @@ Group、Task 等业务总量设置容量。输入只会因 bundled SQLite 的真
 在领域指纹和无变化判断完成后，批量参数会按当前主键/唯一索引的物理顺序排列以减少随机
 B-tree 写入；自然顺序仍由显式顺序列决定，不能从 INSERT 顺序推导业务语义。
 
-Translate preparation 使用一个事务完成 baseline CAS、失效、复用和资源更新；每个任务
-仍按自然顺序独立事务提交，以保留有效前缀进度。一次 Translate 运行应复用连接与 cached
-statements，避免每任务重新打开连接和重复执行相同 PRAGMA。
+Standard Translate preparation 使用一个事务完成 baseline CAS、失效、复用和资源更新；
+每个任务仍按自然顺序独立事务提交，以保留有效前缀进度。Lua Managed Translate 在发出
+任何请求前用同一类一致快照完成来源/manifest 校验、Current 检查、non-applicable 清理、
+全局去重和冲突检查；每个 TaskBlock 的已接受 unit 在一个短事务中以 CAS 成对更新
+translation/state。CAS 同时核对来源、manifest、unit 身份和读取时 translation/state
+pair；NotApplied、确认未提交和 OutcomeUnknown 保持不同语义，OutcomeUnknown 立即停止
+后续提交。一次 Translate 运行应复用连接与 cached statements，避免每任务重新打开连接
+和重复执行相同 PRAGMA。
 
 ## 4. Lua 交互会话
 
@@ -84,6 +89,11 @@ statements，避免每任务重新打开连接和重复执行相同 PRAGMA。
 
 Lua/SQL 正文和参数永不进入 CLI 或 JSONL；诊断仍必须公开 query ID、阶段、数据库路径、
 SQLite primary/extended code 和确认的事务终态。
+
+`ctx.translations.translate()` 需要在多次并发模型请求之间自行建立短 Store 事务，因此
+调用时交互会话必须处于 autocommit。存在活动 `ctx.db` 事务时，它以
+`translations/transaction_conflict` 在零模型请求、零托管修改的边界失败；Host 不替
+Lua 提交或回滚脚本事务。
 
 交互会话中的单条 `query` 或 `execute` 失败时，以操作前后的 `total_changes()` 与
 autocommit 状态判定终态。操作前后均处于 autocommit 且 `total_changes()` 没有变化，
@@ -101,3 +111,25 @@ autocommit 状态判定终态。操作前后均处于 autocommit 且 `total_chan
 运行方案、Lua 程序、`quick_check` 和 `foreign_key_check` 作为有稳定 ID 的窄查询，一次性
 提交给第 2 节的同连接只读快照。对账使用该快照中的精确 schema version 和领域事实执行
 CAS；不得通过多次独立只读事务拼接项目状态，也不通过新增 revision/version 字段补偿。
+
+Lua Managed 翻译由三类当前权威表共同表达：
+
+- `managed_translation_owner_state`：固定 owner `lua` 的来源快照指纹和完整 manifest
+  指纹；
+- `managed_translation_collection`：唯一 collection name、连续自然顺序和 instruction；
+- `managed_translation_unit`：collection 内唯一 key、连续自然顺序、kind、shape、原文、
+  context、可选不透明 metadata JSON 值，以及成对存在或成对为空的 translation/state。
+
+Extract Lua 正常返回、未取消且交互会话干净终结后，Standard Lua 意图与 Managed 意图在
+同一个 Store 事务中原子应用。完整 Managed 快照替换按 `collection name + unit key`
+匹配现有单元：仅 metadata 或顺序改变时保留 translation/state；instruction、kind、shape、
+original 或 context 改变时不保留；被删除单元随快照删除。`replace({})` 保持 active 空
+owner，停用 Extract Lua 则删除 owner 及其级联快照。
+
+owner 保存的 source snapshot 必须与项目 metadata 当前来源一致。来源改变而未重新
+Extract 时，Translate 和 WriteBack 都以 stale 失败，不读取陈旧译文。manifest 覆盖全部
+声明语义和自然顺序但不包含 translation/state；请求准入前的完整预检 CAS 还核对全部
+collection/unit 定义及 pair。每个 TaskBlock checkpoint 再核对 owner/manifest 和本任务
+目标 unit 的完整读取基线，因此影响目标的并发 Extract、翻译提交或直接 SQL 修改表现为
+明确 NotApplied，而不是覆盖后来状态；只改变其他 unit 的并发写入由最终完整快照检查
+报告 `snapshot_changed`。

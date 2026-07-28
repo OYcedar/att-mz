@@ -7,6 +7,7 @@ use std::error::Error;
 use std::future::Future;
 
 use crate::rpg_maker::dialogue::MvDialogueDefinition;
+use crate::rpg_maker::managed_translation::ManagedTranslationSnapshot;
 use crate::rpg_maker::project::OpenedProject;
 
 use super::model::{BuiltinSnapshot, RulesSnapshot};
@@ -87,19 +88,35 @@ pub(crate) trait RulesSnapshotStore: Send + Sync {
 
 /// 原子收敛 Lua 拥有的标准文本快照。
 ///
-/// `replace_lua` 包括 active 空快照；`deactivate_lua` 则移除 owner state 并级联清理
-/// Lua 标准资产。两者复用与 Builtin/Rules 相同的逐单元继承、冲突和事务不变量。
+/// Standard 与托管翻译是两个独立语义域，但同一次干净脚本产生的意图必须共享事务；
+/// active 空快照、逐单元继承、冲突检查和明确事务终态均由生产 Store 收敛。
 pub(crate) trait LuaSnapshotStore: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
-    fn replace_lua(
+    /// 在唯一事务中收敛一次干净 Lua Extract 同时产生的 Standard 与 Managed 意图。
+    ///
+    /// `None` 表示脚本未声明该域，存储必须完整保留其现状；两个域均为 `None`
+    /// 时不得发起写事务。
+    fn apply_lua(
         &self,
         project: &OpenedProject,
-        snapshot: LuaSnapshot,
+        standard: Option<LuaStandardSnapshotMutation>,
+        managed: Option<ManagedTranslationSnapshot>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Extract Lua 被移除或以零字节程序停用时，在唯一事务中清除两个 Lua owner。
     fn deactivate_lua(
         &self,
         project: &OpenedProject,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Lua Extract 对 Standard owner 的可选快照变更。
+///
+/// 外层 `Option` 表示未调用相关接口并保留现状；`Replace(empty)` 仍建立 active
+/// 空快照，而 `Deactivate` 明确移除 Standard Lua owner。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LuaStandardSnapshotMutation {
+    Replace(LuaSnapshot),
+    Deactivate,
 }

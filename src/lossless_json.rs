@@ -1,4 +1,4 @@
-//! RPG Maker Standard 与可信 Lua Host 共用的严格 JSON 解析边界。
+//! ATT 内部共用的严格、无深度上限 JSON 解析边界。
 
 use std::collections::HashSet;
 use std::convert::Infallible;

@@ -36,10 +36,12 @@ use super::runtime::OwnedLuaProgram;
 use super::runtime::{
     TrustedLuaBindingFinalization, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
     TrustedLuaCommonBindings, TrustedLuaCommonHostCalls, TrustedLuaExtractHostCalls,
-    TrustedLuaExtractIntent, TrustedLuaHostCallError, TrustedLuaRuntimeBindings,
-    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor, TrustedLuaStandardAcceptance,
-    TrustedLuaStandardCandidate, TrustedLuaStandardHostCalls, TrustedLuaStandardSession,
-    TrustedLuaTranslateHostCalls, TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
+    TrustedLuaExtractIntent, TrustedLuaHostCallError, TrustedLuaManagedTranslateHostCalls,
+    TrustedLuaManagedTranslationReader, TrustedLuaManagedTranslationSnapshot,
+    TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor,
+    TrustedLuaStandardAcceptance, TrustedLuaStandardCandidate, TrustedLuaStandardExtractIntent,
+    TrustedLuaStandardHostCalls, TrustedLuaStandardSession, TrustedLuaTranslateHostCalls,
+    TrustedLuaTranslationSemantics, TrustedLuaWriteBackHostCalls,
 };
 use super::{
     LuaInvocation, LuaProjectContext, LuaSourcePath, TrustedLuaExecutionHost,
@@ -116,10 +118,12 @@ where
                 project,
                 llm_client,
                 semantics,
+                managed,
             } => (
                 HostingPhase::Translate {
                     llm_client,
                     semantics,
+                    managed,
                 },
                 program,
                 project,
@@ -128,7 +132,8 @@ where
                 program,
                 project,
                 calls,
-            } => (HostingPhase::WriteBack(calls), program, project),
+                managed,
+            } => (HostingPhase::WriteBack { calls, managed }, program, project),
             LuaInvocation::Project {
                 program,
                 project,
@@ -175,18 +180,23 @@ where
             HostingPhase::Translate {
                 llm_client,
                 semantics,
+                managed,
             } => TrustedLuaRuntimeBindings::translate(
                 common,
                 Arc::new(LuaTranslationHostCalls {
                     llm_client,
                     semantics,
                     llm: self.llm.clone(),
+                    managed,
+                    transaction_state,
                 }),
                 finalizer,
             ),
-            HostingPhase::WriteBack(calls) => {
-                TrustedLuaRuntimeBindings::write_back(common, calls, finalizer)
-            }
+            HostingPhase::WriteBack { calls, managed } => TrustedLuaRuntimeBindings::write_back(
+                common,
+                Arc::new(ManagedAwareWriteBackHostCalls { calls, managed }),
+                finalizer,
+            ),
             HostingPhase::Project {
                 arguments,
                 standard,
@@ -231,12 +241,95 @@ enum HostingPhase<P> {
     Translate {
         llm_client: Arc<P>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+        managed: Arc<dyn TrustedLuaManagedTranslateHostCalls>,
     },
-    WriteBack(Arc<dyn TrustedLuaWriteBackHostCalls>),
+    WriteBack {
+        calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
+        managed: Arc<dyn TrustedLuaManagedTranslationReader>,
+    },
     Project {
         arguments: Vec<String>,
         standard: Arc<dyn TrustedLuaStandardHostCalls>,
     },
+}
+
+struct ManagedAwareWriteBackHostCalls {
+    calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
+    managed: Arc<dyn TrustedLuaManagedTranslationReader>,
+}
+
+impl TrustedLuaWriteBackHostCalls for ManagedAwareWriteBackHostCalls {
+    fn open_managed(
+        &self,
+        name: String,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<super::runtime::TrustedLuaManagedTranslationCollection>,
+                        TrustedLuaHostCallError,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        self.managed.open(name)
+    }
+
+    fn read_output(
+        &self,
+        path: crate::storage::scoped_path::ScopedDirectoryPath,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TrustedLuaHostCallError>> + Send + 'static>>
+    {
+        self.calls.read_output(path)
+    }
+
+    fn list_output(
+        &self,
+        path: crate::storage::scoped_path::ScopedDirectoryPath,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<super::runtime::TrustedLuaOutputEntry>,
+                        TrustedLuaHostCallError,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        self.calls.list_output(path)
+    }
+
+    fn create_output_directory(
+        &self,
+        path: crate::storage::scoped_path::ScopedDirectoryPath,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
+        self.calls.create_output_directory(path)
+    }
+
+    fn write_output(
+        &self,
+        path: crate::storage::scoped_path::ScopedDirectoryPath,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
+        self.calls.write_output(path, bytes)
+    }
+
+    fn remove_output(
+        &self,
+        path: crate::storage::scoped_path::ScopedDirectoryPath,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
+        self.calls.remove_output(path)
+    }
+
+    fn layout(
+        &self,
+        region: super::runtime::TrustedLuaWriteBackLayoutRegion,
+        pairs: Vec<super::runtime::TrustedLuaWriteBackLayoutPair>,
+    ) -> Result<super::runtime::TrustedLuaWriteBackLayoutResult, TrustedLuaHostCallError> {
+        self.calls.layout(region, pairs)
+    }
 }
 
 struct LuaCommonHostCalls<F, S>
@@ -551,15 +644,19 @@ where
 
 #[derive(Default)]
 struct LuaExtractHostCalls {
-    intent: Mutex<Option<TrustedLuaExtractIntent>>,
+    standard_intent: Mutex<Option<TrustedLuaStandardExtractIntent>>,
+    managed_intent: Mutex<Option<TrustedLuaManagedTranslationSnapshot>>,
 }
 
 impl LuaExtractHostCalls {
-    fn record_intent(
+    fn record_standard_intent(
         &self,
-        intent: TrustedLuaExtractIntent,
+        intent: TrustedLuaStandardExtractIntent,
     ) -> Result<(), TrustedLuaHostCallError> {
-        let mut current = self.intent.lock().expect("Lua Extract intent 锁不应中毒");
+        let mut current = self
+            .standard_intent
+            .lock()
+            .expect("Lua Extract Standard intent 锁不应中毒");
         if current.is_some() {
             return Err(TrustedLuaHostCallError::new(
                 "extract",
@@ -573,11 +670,40 @@ impl LuaExtractHostCalls {
         Ok(())
     }
 
-    fn take_intent(&self) -> Option<TrustedLuaExtractIntent> {
-        self.intent
+    fn record_managed_intent(
+        &self,
+        intent: TrustedLuaManagedTranslationSnapshot,
+    ) -> Result<(), TrustedLuaHostCallError> {
+        let mut current = self
+            .managed_intent
             .lock()
-            .expect("Lua Extract intent 锁不应中毒")
-            .take()
+            .expect("Lua Extract managed intent 锁不应中毒");
+        if current.is_some() {
+            return Err(TrustedLuaHostCallError::new(
+                "translations",
+                "intent_already_declared",
+                "一次 Lua Extract 主程序只能声明一个托管翻译快照意图",
+                None,
+                None,
+            ));
+        }
+        *current = Some(intent);
+        Ok(())
+    }
+
+    fn take_intent(&self) -> Option<TrustedLuaExtractIntent> {
+        let standard = self
+            .standard_intent
+            .lock()
+            .expect("Lua Extract Standard intent 锁不应中毒")
+            .take();
+        let managed = self
+            .managed_intent
+            .lock()
+            .expect("Lua Extract managed intent 锁不应中毒")
+            .take();
+        let intent = TrustedLuaExtractIntent::new(standard, managed);
+        (!intent.is_empty()).then_some(intent)
     }
 }
 
@@ -586,11 +712,18 @@ impl TrustedLuaExtractHostCalls for LuaExtractHostCalls {
         &self,
         snapshot: crate::rpg_maker::extract::store::LuaSnapshot,
     ) -> Result<(), TrustedLuaHostCallError> {
-        self.record_intent(TrustedLuaExtractIntent::Replace(snapshot))
+        self.record_standard_intent(TrustedLuaStandardExtractIntent::Replace(snapshot))
     }
 
     fn clear_standard(&self) -> Result<(), TrustedLuaHostCallError> {
-        self.record_intent(TrustedLuaExtractIntent::Deactivate)
+        self.record_standard_intent(TrustedLuaStandardExtractIntent::Deactivate)
+    }
+
+    fn replace_managed(
+        &self,
+        snapshot: TrustedLuaManagedTranslationSnapshot,
+    ) -> Result<(), TrustedLuaHostCallError> {
+        self.record_managed_intent(snapshot)
     }
 }
 
@@ -602,6 +735,8 @@ where
     llm_client: Arc<L::Client>,
     semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     llm: LuaLlmCapability<L>,
+    managed: Arc<dyn TrustedLuaManagedTranslateHostCalls>,
+    transaction_state: Arc<dyn TrustedLuaCommonHostCalls>,
 }
 
 impl<L> TrustedLuaTranslateHostCalls for LuaTranslationHostCalls<L>
@@ -656,6 +791,53 @@ where
                 .map_err(llm_call_error)
                 .map_err(|error| error.with_operation("llm.request"))
         })
+    }
+
+    fn translate_managed(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        super::runtime::TrustedLuaManagedTranslationReport,
+                        TrustedLuaHostCallError,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let managed = Arc::clone(&self.managed);
+        let transaction_state = Arc::clone(&self.transaction_state);
+        Box::pin(async move {
+            if transaction_state.transaction_active().await? {
+                return Err(TrustedLuaHostCallError::new(
+                    "translations",
+                    "transaction_conflict",
+                    "活动 ctx.db 事务中不能启动托管翻译",
+                    None,
+                    None,
+                )
+                .with_operation("translations.translate"));
+            }
+            managed.translate().await
+        })
+    }
+
+    fn open_managed(
+        &self,
+        name: String,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<super::runtime::TrustedLuaManagedTranslationCollection>,
+                        TrustedLuaHostCallError,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        self.managed.open(name)
     }
 }
 
@@ -1971,7 +2153,10 @@ mod tests {
         assert_eq!(
             outcome,
             OperationCompletion::Completed(TrustedLuaExecutionOutcome::ExtractIntent(
-                TrustedLuaExtractIntent::Deactivate
+                TrustedLuaExtractIntent::new(
+                    Some(TrustedLuaStandardExtractIntent::Deactivate),
+                    None,
+                )
             ))
         );
     }
@@ -2491,6 +2676,156 @@ mod tests {
             let result = self.result.clone();
             Box::pin(async move { result })
         }
+    }
+
+    struct UnusedTranslationSemantics;
+
+    impl TrustedLuaTranslationSemantics for UnusedTranslationSemantics {
+        fn system_prompt(&self) -> &str {
+            "system"
+        }
+
+        fn source_language(&self) -> &str {
+            "ja"
+        }
+
+        fn target_language(&self) -> &str {
+            "zh-Hans"
+        }
+
+        fn prepare_translation(
+            &self,
+            _kind: crate::rpg_maker::text::TextGroupKind,
+            _original: String,
+            _semantic_context: String,
+        ) -> Result<
+            Arc<dyn crate::rpg_maker::lua::runtime::TrustedLuaPreparedTranslation>,
+            TrustedLuaHostCallError,
+        > {
+            panic!("事务门禁测试不准备翻译")
+        }
+
+        fn prepare_translation_lines(
+            &self,
+            _kind: crate::rpg_maker::text::TextGroupKind,
+            _original: Vec<String>,
+            _semantic_context: String,
+        ) -> Result<
+            Arc<dyn crate::rpg_maker::lua::runtime::TrustedLuaPreparedTranslation>,
+            TrustedLuaHostCallError,
+        > {
+            panic!("事务门禁测试不准备多行翻译")
+        }
+    }
+
+    struct RecordingManagedCalls {
+        called: Arc<AtomicBool>,
+    }
+
+    impl TrustedLuaManagedTranslateHostCalls for RecordingManagedCalls {
+        fn translate(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::rpg_maker::lua::runtime::TrustedLuaManagedTranslationReport,
+                            TrustedLuaHostCallError,
+                        >,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            self.called
+                .store(true, std::sync::atomic::Ordering::Release);
+            Box::pin(async {
+                Ok(
+                    crate::rpg_maker::lua::runtime::TrustedLuaManagedTranslationReport::new(
+                        Vec::new(),
+                    ),
+                )
+            })
+        }
+
+        fn open(
+            &self,
+            _name: String,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<
+                                crate::rpg_maker::lua::runtime::TrustedLuaManagedTranslationCollection,
+                            >,
+                            TrustedLuaHostCallError,
+                        >,
+                    > + Send
+                    + 'static,
+            >,
+        >{
+            Box::pin(async { panic!("事务门禁测试不打开 collection") })
+        }
+    }
+
+    fn translation_host_calls(
+        managed: Arc<dyn TrustedLuaManagedTranslateHostCalls>,
+        transaction_state: Arc<dyn TrustedLuaCommonHostCalls>,
+    ) -> LuaTranslationHostCalls<FakeLlm> {
+        LuaTranslationHostCalls {
+            llm_client: Arc::new(()),
+            semantics: Arc::new(UnusedTranslationSemantics),
+            llm: LuaLlmCapability::Enabled(Arc::new(FakeLlm)),
+            managed,
+            transaction_state,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_translate_uses_authoritative_transaction_state_before_any_request() {
+        let called = Arc::new(AtomicBool::new(false));
+        let managed: Arc<dyn TrustedLuaManagedTranslateHostCalls> =
+            Arc::new(RecordingManagedCalls {
+                called: Arc::clone(&called),
+            });
+        let active: Arc<dyn TrustedLuaCommonHostCalls> =
+            Arc::new(TransactionObservationCalls { result: Ok(true) });
+        let calls = translation_host_calls(Arc::clone(&managed), active);
+        let error = calls
+            .translate_managed()
+            .await
+            .expect_err("活动事务必须在托管执行前失败");
+        assert_eq!(error.domain(), "translations");
+        assert_eq!(error.kind(), "transaction_conflict");
+        assert_eq!(error.operation(), Some("translations.translate"));
+        assert!(
+            !called.load(std::sync::atomic::Ordering::Acquire),
+            "事务冲突不得进入可能发起 LLM 请求的托管能力"
+        );
+
+        let indeterminate: Arc<dyn TrustedLuaCommonHostCalls> =
+            Arc::new(TransactionObservationCalls {
+                result: Err(TrustedLuaHostCallError::new(
+                    "sqlite",
+                    "indeterminate",
+                    "事务终态未知",
+                    None,
+                    None,
+                )),
+            });
+        let calls = translation_host_calls(Arc::clone(&managed), indeterminate);
+        let error = calls
+            .translate_managed()
+            .await
+            .expect_err("事务状态读取失败必须原样阻止托管执行");
+        assert_eq!(error.domain(), "sqlite");
+        assert_eq!(error.kind(), "indeterminate");
+        assert!(!called.load(std::sync::atomic::Ordering::Acquire));
+
+        let idle: Arc<dyn TrustedLuaCommonHostCalls> =
+            Arc::new(TransactionObservationCalls { result: Ok(false) });
+        let calls = translation_host_calls(managed, idle);
+        assert!(calls.translate_managed().await.is_ok());
+        assert!(called.load(std::sync::atomic::Ordering::Acquire));
     }
 
     struct RecordingStandardSession {

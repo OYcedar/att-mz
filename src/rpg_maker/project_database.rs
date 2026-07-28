@@ -157,6 +157,82 @@ const CREATE_STANDARD_PROJECT_DEFINITION_TABLE: &str = r#"CREATE TABLE standard_
     canonical_json  TEXT NOT NULL CHECK (length(canonical_json) > 0)
 )"#;
 
+pub(crate) const CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE: &str = r#"CREATE TABLE managed_translation_owner_state (
+    owner                       TEXT NOT NULL PRIMARY KEY CHECK (owner = 'lua'),
+    source_snapshot_fingerprint BLOB NOT NULL CHECK (
+        typeof(source_snapshot_fingerprint) = 'blob'
+        AND length(source_snapshot_fingerprint) = 32
+    ),
+    manifest_fingerprint        BLOB NOT NULL CHECK (
+        typeof(manifest_fingerprint) = 'blob'
+        AND length(manifest_fingerprint) = 32
+    )
+)"#;
+
+pub(crate) const CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE: &str = r#"CREATE TABLE managed_translation_collection (
+    owner            TEXT NOT NULL CHECK (owner = 'lua'),
+    collection_name  TEXT NOT NULL CHECK (
+        typeof(collection_name) = 'text'
+        AND length(trim(collection_name)) > 0
+    ),
+    collection_order INTEGER NOT NULL CHECK (collection_order >= 0),
+    instruction      TEXT NOT NULL CHECK (typeof(instruction) = 'text'),
+    PRIMARY KEY (owner, collection_name),
+    UNIQUE (owner, collection_order),
+    FOREIGN KEY (owner)
+        REFERENCES managed_translation_owner_state(owner) ON DELETE CASCADE
+)"#;
+
+pub(crate) const CREATE_MANAGED_TRANSLATION_UNIT_TABLE: &str = r#"CREATE TABLE managed_translation_unit (
+    owner                    TEXT NOT NULL CHECK (owner = 'lua'),
+    collection_name          TEXT NOT NULL CHECK (
+        typeof(collection_name) = 'text'
+        AND length(trim(collection_name)) > 0
+    ),
+    unit_key                 TEXT NOT NULL CHECK (
+        typeof(unit_key) = 'text'
+        AND length(trim(unit_key)) > 0
+    ),
+    unit_order               INTEGER NOT NULL CHECK (unit_order >= 0),
+    kind                     TEXT NOT NULL CHECK (
+        typeof(kind) = 'text'
+        AND length(trim(kind)) > 0
+    ),
+    shape                    TEXT NOT NULL CHECK (shape IN ('single', 'reflow', 'lines', 'items')),
+    original_content_json    TEXT NOT NULL CHECK (
+        typeof(original_content_json) = 'text'
+        AND json_valid(original_content_json)
+        AND (
+            (shape IN ('single', 'reflow') AND json_type(original_content_json) = 'text')
+            OR (shape IN ('lines', 'items') AND json_type(original_content_json) = 'array')
+        )
+    ),
+    context                  TEXT NOT NULL CHECK (typeof(context) = 'text'),
+    metadata_json            TEXT CHECK (
+        metadata_json IS NULL
+        OR (
+            typeof(metadata_json) = 'text'
+            AND json_valid(metadata_json)
+        )
+    ),
+    translation_content_json TEXT,
+    translation_state        BLOB,
+    PRIMARY KEY (owner, collection_name, unit_key),
+    UNIQUE (owner, collection_name, unit_order),
+    FOREIGN KEY (owner, collection_name)
+        REFERENCES managed_translation_collection(owner, collection_name) ON DELETE CASCADE,
+    CHECK (
+        (translation_content_json IS NULL AND translation_state IS NULL)
+        OR (
+            typeof(translation_content_json) = 'text'
+            AND json_valid(translation_content_json)
+            AND json_type(translation_content_json) = json_type(original_content_json)
+            AND typeof(translation_state) = 'blob'
+            AND length(translation_state) = 32
+        )
+    )
+)"#;
+
 const INSERT_METADATA: &str = r#"INSERT INTO metadata (
     name,
     source_language,
@@ -214,7 +290,10 @@ WHERE sql IS NOT NULL
       'standard_text_unit',
       'standard_mutation_claim',
       'standard_translation_resource',
-      'standard_project_definition'
+      'standard_project_definition',
+      'managed_translation_owner_state',
+      'managed_translation_collection',
+      'managed_translation_unit'
     )
     OR name IN (
       'standard_mutation_claim_resource_idx',
@@ -246,6 +325,7 @@ SET source_language = ?1,
     help_description_max_fullwidth_chars = ?6
 WHERE name = ?7"#;
 const CLEAR_STANDARD_TEXT_TRANSLATIONS: &str = "UPDATE standard_text_unit SET translation_content_json = NULL, translation_state = NULL WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL";
+const CLEAR_MANAGED_TRANSLATIONS: &str = "UPDATE managed_translation_unit SET translation_content_json = NULL, translation_state = NULL WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL";
 const RESET_TERMINOLOGY_RESOURCE: &str = r#"UPDATE standard_translation_resource
 SET canonical_json = '[]'
 WHERE resource_kind = 'terminology'"#;
@@ -1294,6 +1374,9 @@ pub(crate) enum ManagedSchemaObject {
     StandardMutationClaim,
     StandardTranslationResource,
     StandardProjectDefinition,
+    ManagedTranslationOwnerState,
+    ManagedTranslationCollection,
+    ManagedTranslationUnit,
     StandardMutationClaimOwnerResourceIndex,
     StandardMutationClaimResourceIndex,
 }
@@ -1314,6 +1397,9 @@ impl ManagedSchemaObject {
             Self::StandardMutationClaim => "table:standard_mutation_claim",
             Self::StandardTranslationResource => "table:standard_translation_resource",
             Self::StandardProjectDefinition => "table:standard_project_definition",
+            Self::ManagedTranslationOwnerState => "table:managed_translation_owner_state",
+            Self::ManagedTranslationCollection => "table:managed_translation_collection",
+            Self::ManagedTranslationUnit => "table:managed_translation_unit",
             Self::StandardMutationClaimOwnerResourceIndex => {
                 "index:standard_mutation_claim_owner_resource_idx"
             }
@@ -1972,6 +2058,24 @@ fn expected_managed_schema() -> Vec<(&'static str, &'static str, &'static str, &
             CREATE_STANDARD_PROJECT_DEFINITION_TABLE,
         ),
         (
+            "table",
+            "managed_translation_owner_state",
+            "managed_translation_owner_state",
+            CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE,
+        ),
+        (
+            "table",
+            "managed_translation_collection",
+            "managed_translation_collection",
+            CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE,
+        ),
+        (
+            "table",
+            "managed_translation_unit",
+            "managed_translation_unit",
+            CREATE_MANAGED_TRANSLATION_UNIT_TABLE,
+        ),
+        (
             "index",
             "standard_mutation_claim_owner_resource_idx",
             STANDARD_MUTATION_CLAIM_TABLE_NAME,
@@ -2108,6 +2212,13 @@ fn managed_schema_object(kind: &str, name: &str) -> Option<ManagedSchemaObject> 
         ("table", STANDARD_PROJECT_DEFINITION_TABLE_NAME) => {
             Some(ManagedSchemaObject::StandardProjectDefinition)
         }
+        ("table", "managed_translation_owner_state") => {
+            Some(ManagedSchemaObject::ManagedTranslationOwnerState)
+        }
+        ("table", "managed_translation_collection") => {
+            Some(ManagedSchemaObject::ManagedTranslationCollection)
+        }
+        ("table", "managed_translation_unit") => Some(ManagedSchemaObject::ManagedTranslationUnit),
         ("index", "standard_mutation_claim_owner_resource_idx") => {
             Some(ManagedSchemaObject::StandardMutationClaimOwnerResourceIndex)
         }
@@ -3058,7 +3169,11 @@ where
         project_definitions_cas(&current),
     ];
     if language_changed {
-        for statement in [CLEAR_STANDARD_TEXT_TRANSLATIONS, RESET_TERMINOLOGY_RESOURCE] {
+        for statement in [
+            CLEAR_STANDARD_TEXT_TRANSLATIONS,
+            CLEAR_MANAGED_TRANSLATIONS,
+            RESET_TERMINOLOGY_RESOURCE,
+        ] {
             steps.push(SqliteTransactionStep::Execute(SqliteCommand::new(
                 statement,
                 Vec::new(),
@@ -3204,6 +3319,9 @@ fn project_database_commands(project: &NewProject) -> Vec<SqliteCommand> {
         CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
         CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE,
         CREATE_STANDARD_PROJECT_DEFINITION_TABLE,
+        CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE,
+        CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE,
+        CREATE_MANAGED_TRANSLATION_UNIT_TABLE,
     ]
     .into_iter()
     .map(|statement| SqliteCommand::new(statement, Vec::new()))
@@ -3497,7 +3615,7 @@ mod tests {
             invocation.path,
             PathBuf::from("C:/projects/测试 游戏/project.db")
         );
-        assert_eq!(invocation.commands.len(), 19);
+        assert_eq!(invocation.commands.len(), 22);
         assert_eq!(invocation.commands[0].statement(), CREATE_METADATA_TABLE);
         assert!(invocation.commands[0].parameters().is_empty());
         assert_eq!(
@@ -3537,9 +3655,21 @@ mod tests {
             invocation.commands[10].statement(),
             CREATE_STANDARD_MUTATION_CLAIM_TABLE
         );
-        assert_eq!(invocation.commands[15].statement(), INSERT_METADATA);
         assert_eq!(
-            invocation.commands[15].parameters(),
+            invocation.commands[15].statement(),
+            CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE
+        );
+        assert_eq!(
+            invocation.commands[16].statement(),
+            CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE
+        );
+        assert_eq!(
+            invocation.commands[17].statement(),
+            CREATE_MANAGED_TRANSLATION_UNIT_TABLE
+        );
+        assert_eq!(invocation.commands[18].statement(), INSERT_METADATA);
+        assert_eq!(
+            invocation.commands[18].parameters(),
             &[
                 SqliteValue::Text("测试 游戏".to_owned()),
                 SqliteValue::Text("ja".to_owned()),
@@ -3551,21 +3681,21 @@ mod tests {
             ]
         );
         assert_eq!(
-            invocation.commands[16].parameters(),
+            invocation.commands[19].parameters(),
             &[
                 SqliteValue::Text(TERMINOLOGY_RESOURCE_KIND.to_owned()),
                 SqliteValue::Text("[]".to_owned()),
             ]
         );
         assert_eq!(
-            invocation.commands[17].parameters(),
+            invocation.commands[20].parameters(),
             &[
                 SqliteValue::Text(PLACEHOLDER_RULES_RESOURCE_KIND.to_owned()),
                 SqliteValue::Text("[]".to_owned()),
             ]
         );
         assert_eq!(
-            invocation.commands[18].parameters(),
+            invocation.commands[21].parameters(),
             &[
                 SqliteValue::Text(MV_DIALOGUE_RULES_DEFINITION_KIND.to_owned()),
                 SqliteValue::Text(r#"{"rules":[]}"#.to_owned()),
@@ -3620,6 +3750,9 @@ mod tests {
             CREATE_STANDARD_MUTATION_CLAIM_RESOURCE_INDEX,
             CREATE_STANDARD_TRANSLATION_RESOURCE_TABLE,
             CREATE_STANDARD_PROJECT_DEFINITION_TABLE,
+            CREATE_MANAGED_TRANSLATION_OWNER_STATE_TABLE,
+            CREATE_MANAGED_TRANSLATION_COLLECTION_TABLE,
+            CREATE_MANAGED_TRANSLATION_UNIT_TABLE,
         ] {
             connection
                 .execute_batch(statement)
@@ -3795,6 +3928,92 @@ mod tests {
                 [],
             )
             .expect("两个 owner 的 Intent 锁可以共存，跨 owner 冲突由 Store 事务判定");
+
+        connection
+            .execute(
+                "INSERT INTO managed_translation_owner_state VALUES ('other', ?1, ?2)",
+                rusqlite::params![vec![1_u8; 32], vec![2_u8; 32]],
+            )
+            .expect_err("托管翻译 owner 必须固定为 lua");
+        connection
+            .execute(
+                "INSERT INTO managed_translation_owner_state VALUES ('lua', ?1, ?2)",
+                rusqlite::params![vec![1_u8; 32], vec![2_u8; 32]],
+            )
+            .expect("合法托管 owner 应可保存");
+        connection
+            .execute(
+                "INSERT INTO managed_translation_collection VALUES ('lua', 'quests', 0, ?1)",
+                rusqlite::params![b"instruction".to_vec()],
+            )
+            .expect_err("collection instruction 的 BLOB 伪装必须拒绝");
+        connection
+            .execute(
+                "INSERT INTO managed_translation_collection VALUES ('lua', 'quests', 0, '')",
+                [],
+            )
+            .expect("空 instruction 是合法的明确语义");
+        let insert_managed_unit = r#"INSERT INTO managed_translation_unit (
+            owner, collection_name, unit_key, unit_order, kind, shape,
+            original_content_json, context, metadata_json,
+            translation_content_json, translation_state
+        ) VALUES ('lua', 'quests', ?1, ?2, 'plugin_parameter', ?3, ?4, '', ?5, ?6, ?7)"#;
+        connection
+            .execute(
+                insert_managed_unit,
+                rusqlite::params![
+                    "metadata-array",
+                    0,
+                    "single",
+                    r#""原文""#,
+                    "[]",
+                    Option::<String>::None,
+                    Option::<Vec<u8>>::None,
+                ],
+            )
+            .expect("metadata 可以是任意显式 JSON 值");
+        connection
+            .execute(
+                insert_managed_unit,
+                rusqlite::params![
+                    "q:1",
+                    1,
+                    "single",
+                    r#""原文""#,
+                    Option::<String>::None,
+                    r#""译文""#,
+                    Option::<Vec<u8>>::None,
+                ],
+            )
+            .expect_err("托管译文与 state 必须成对保存");
+        connection
+            .execute(
+                insert_managed_unit,
+                rusqlite::params![
+                    "q:1",
+                    0,
+                    "lines",
+                    r#""错误标量""#,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<Vec<u8>>::None,
+                ],
+            )
+            .expect_err("托管原文 JSON 类型必须符合 shape");
+        connection
+            .execute(
+                insert_managed_unit,
+                rusqlite::params![
+                    "q:1",
+                    1,
+                    "single",
+                    r#""原文""#,
+                    r#"{"quest_id":1}"#,
+                    r#""译文""#,
+                    vec![3_u8; 32],
+                ],
+            )
+            .expect("合法托管单位与成对译文应可保存");
     }
 
     #[test]
@@ -4576,6 +4795,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(executed.contains(&CLEAR_STANDARD_TEXT_TRANSLATIONS));
+        assert!(executed.contains(&CLEAR_MANAGED_TRANSLATIONS));
         assert!(executed.contains(&RESET_TERMINOLOGY_RESOURCE));
         assert_eq!(executed.last().copied(), Some(UPDATE_METADATA));
     }

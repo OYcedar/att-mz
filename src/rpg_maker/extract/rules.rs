@@ -18,7 +18,7 @@ use crate::diagnostic::{
     SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
-use crate::rpg_maker::json::StackSafeJsonValue;
+use crate::json::StackSafeJsonValue;
 use crate::rpg_maker::model::{ProjectionModelError, TextUnitContent};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::text::{DataFileName, StandardDataFile};

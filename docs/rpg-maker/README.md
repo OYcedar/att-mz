@@ -130,18 +130,21 @@ Placeholder、语言、去重和 Current 语义验收并原子提交，脚本不
 直接 SQL 修改受管翻译表。
 
 只有现实关系超出 Builtin、Rules 或 Placeholder 的表达能力时，才考虑 Extract、
-Translate、WriteBack 的阶段 Lua，例如：
+Translate、WriteBack 的阶段 Lua。若 Lua 只需声明 collection、原子 unit 和写回关系，
+优先使用 `ctx.translations`：ATT 负责全局去重、模型协议、并发、state、checkpoint 和
+任务记录，Lua 在 WriteBack 仍明确拥有目标映射。典型场景包括：
 
 - 需要递归、过滤、动态对象键或跨文档关系；
 - 一个语义事实依赖多个物理节点，或译文必须同步投影到多个位置；
 - 是否翻译取决于跨节点状态或游戏私有协议；
-- 需要 Rules 契约之外的身份、事务、私有状态或恢复语义；
+- 需要 Rules 契约之外的身份，但每个 unit 可以独立、原子地翻译和提交；
 - 静态路径能够命中字符串，却无法表达完整分组和可逆写回。
 
-复杂不自动意味着需要阶段 Lua。每个启用 Lua 的阶段都必须拥有独立、现实的理由，并
-明确协议所有者、事务和幂等边界。独立项目脚本也必须按完整身份定位候选、审查去重传播
-范围并保持可重复执行。完整能力见[Lua 技术参考](lua.md)，可验证模式见
-[Lua Cookbook](lua-cookbook.md)。
+私有 grammar、跨 unit 原子关系、特殊模型协议或自有恢复状态超出 Managed 契约时，再由
+Lua 显式组合 `ctx.translation`、`ctx.llm` 与 `ctx.db`；Host 不自动降级。复杂不自动意味着
+需要低级协议。每个启用 Lua 的阶段都必须拥有独立、现实的理由，并明确协议所有者、事务
+和幂等边界。独立项目脚本也必须按完整身份定位候选、审查去重传播范围并保持可重复执行。
+完整能力见[Lua 技术参考](lua.md)，低级可验证模式见[Lua Cookbook](lua-cookbook.md)。
 
 ## 证明覆盖与可逆写回
 
@@ -162,9 +165,10 @@ Translate、WriteBack 的阶段 Lua，例如：
 
 ## 高级数据库边界
 
-`project.db` 可用于只读核对 metadata、owner 快照、逻辑组、语义单元、recipe、Claim
-冲突摘要、译文和 state。完整逻辑 Claim 由 group kind、location 和 recipe 重建；
-持久化摘要不是完整 Claim 清单，不能用其行数代替覆盖判断。
+`project.db` 可用于只读核对 metadata、Standard owner 快照、逻辑组、语义单元、recipe、
+Claim 冲突摘要、译文和 state，也可以核对 Managed owner、collection、unit 与成对
+translation/state。完整逻辑 Claim 由 Standard group kind、location 和 recipe 重建；
+Managed 不建立 Claim。持久化摘要不是完整 Claim 清单，不能用其行数代替覆盖判断。
 
 外部 SQLite 工具不会自动取得 ATT 项目租约。直接修改受管表属于明确授权下的高级修复，
 不是普通调查步骤，也不是人工补译入口；人工译文必须通过 `ctx.standard` 交给语义所有者。
@@ -172,10 +176,11 @@ Translate、WriteBack 的阶段 Lua，例如：
 中修改，并在提交前后重新证明当前 schema 与业务不变量。受管 schema 不是稳定扩展 API；
 自有扩展应使用可信 Lua 保证的私有命名空间。
 
-直接 SQL 成功不等于业务结果成立。译文与 translation state、owner 指纹、group、unit、
-recipe、完整逻辑 Claim 和持久化摘要必须继续描述同一快照；来源可见性和译文质量仍由
-对应消费者与验收语义证明。发现不一致时，先确定冻结来源、提取资产、译文或数据库中
-哪一方拥有事实，不通过盲目重算校验值掩盖漂移。
+直接 SQL 成功不等于业务结果成立。Standard 译文与 translation state、owner 指纹、
+group、unit、recipe、完整逻辑 Claim 和持久化摘要必须继续描述同一快照；Managed 的
+来源/manifest、collection/unit 与 translation/state 也必须一致。来源可见性和译文质量
+仍由对应消费者与验收语义证明。发现不一致时，先确定冻结来源、提取资产、译文或数据库
+中哪一方拥有事实，不通过盲目重算校验值掩盖漂移。
 
 项目表关系见[初始化现行规格](init.md#3-当前项目数据库)，SQLite 连接、事务和失败边界见
 [SQLite 运行时现行规格](../runtime/sqlite.md)。

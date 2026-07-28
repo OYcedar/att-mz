@@ -1,10 +1,11 @@
-# RPG Maker Standard 翻译任务记录现行规格
+# RPG Maker 翻译任务记录现行规格
 
 ## 1. 目的、范围与开关
 
-任务记录是面向人工与 Agent 排障的高级可读投影。它把一个 Standard TaskBlock 的最终
-输入、全部逻辑尝试、模型业务输出、逐 ID 验收和数据库提交终态收敛到同一个 Markdown
-文件。它不是逐次 HTTP 抓包，也不承担恢复、重放、验收或数据库状态判断。
+任务记录是面向人工与 Agent 排障的高级可读投影。它把一个由 ATT 完整拥有协议和提交
+真相的 TaskBlock 的最终输入、全部逻辑尝试、模型业务输出、逐 ID 验收和数据库提交终态
+收敛到同一个 Markdown 文件。它覆盖 RPG Maker Standard 与 Lua Managed，不是逐次 HTTP
+抓包，也不承担恢复、重放、验收或数据库状态判断。
 
 该能力默认关闭，只由 Translate 消费：
 
@@ -14,8 +15,9 @@ record_translation_tasks = false
 ```
 
 `record_translation_tasks` 可省略，默认 `false`。它不属于某个 Client，不进入翻译
-state、保存的运行方案或项目数据库。开启后只记录 RPG Maker Standard TaskBlock；
-Translate Lua 不生成任务记录，因为核心不拥有 Lua 私有协议的逐 ID 验收与提交终态。
+state、保存的运行方案或项目数据库。开启后记录本轮 Standard TaskBlock，以及 Translate
+Lua 通过 `ctx.translations.translate()` 建立的 Managed TaskBlock。低级 `ctx.llm` 不生成
+记录，因为核心不拥有脚本私有协议的逐 ID 验收与提交终态。
 
 ## 2. 路径、身份与生命周期
 
@@ -25,10 +27,10 @@ Translate Lua 不生成任务记录，因为核心不拥有 Lua 私有协议的�
 <project-workspace>/task-records/<run-id>/task-000001.md
 ```
 
-文件序号来自本轮 Standard 计划中的稳定 ordinal，不来自 HTTP 发送或响应完成顺序。
-同一个 TaskBlock 的全部重试归入同一个文件。关闭记录、Standard 计划为零或没有启动任何
-Standard 任务时，不建立空的 `task-records/<run-id>` 目录。既有外部文件不参与当前格式
-识别、迁移或自动清理。
+文件序号来自本轮 Translate 的稳定 run-wide ordinal，不来自 HTTP 发送或响应完成顺序。
+Standard 任务占据前段，Managed 任务在后段继续编号；两边各自的自然计划顺序保持不变。
+同一个 TaskBlock 的全部重试归入同一个文件。关闭记录，或者 Standard 与 Managed 都没有
+启动任何任务时，不建立空的 `task-records/<run-id>` 目录。
 
 任务记录身份依赖本次运行已经成功建立的 RunId。RunId 建立失败时，即使配置已开启记录，
 本次任务记录也整体禁用，不创建目录或文件；stderr 只呈现该 RunId 根因所属的项目日志
@@ -45,13 +47,21 @@ Standard 任务时，不建立空的 `task-records/<run-id>` 目录。既有外�
 ~~~markdown
 # 翻译任务 000030 · 部分完成
 
-`任务 30/128` · `尝试 2 次` · `验收 14/17` · `写入 21 处`
+`任务 30/128` · `尝试 2 次` · `验收 14/17`
 
 - Run ID：`...`
 - 开始时间：`...`
 - 总耗时：`...`
 - Endpoint：`...`
 - Model：`...`
+
+## Managed
+
+- Collection: `quest_titles`
+- ID → collection/key:
+  - `1` → `quest_titles`/`quest:arrival`
+  - `1` → `shared_quest_titles`/`quest:arrival-copy`
+  - `2` → `quest_titles`/`quest:return`
 
 ## 自定义参数
 
@@ -91,13 +101,25 @@ Standard 任务时，不建立空的 `task-records/<run-id>` 目录。既有外�
 ## 最终结果
 
 - 状态：部分完成，已确认提交
-- 已接受：14 项，写入 21 个实际位置
-- 未接受：
-  - `15`：占位符不匹配
-  - `16`：缺少模型输出
-  - `17`：检测到源语言残留
-- 协议诊断：模型额外返回了未知 ID `99`
+- Managed checkpoint: `partial`
+- IDs: accepted `14/17`; confirmed committed unit targets `15`
+- Unit acceptance:
+  - ID `1` → collection `quest_titles`, key `quest:arrival`: `accepted`
+  - ID `1` → collection `shared_quest_titles`, key `quest:arrival-copy`: `accepted`
+  - ID `15` → collection `quest_titles`, key `quest:other`: `rejected`; reason `placeholder_mismatch`
+- 任务诊断 `unknown_id`：模型额外返回了未知 ID `99`
 ~~~
+
+`## Managed` 及其 Collection、ID→collection/key 映射只在 Managed 记录中存在；
+Standard 继续显示其标准逻辑身份与传播位置。Managed 的 collection name、unit key、
+metadata、来源路径、state 与去重信息都不进入 User，仅由响应边界已经持有的受信计划在
+记录元数据和最终结果中投影。最终结果逐 ID 显示 acceptance，并把 Applied、
+NotApplied、OutcomeUnknown、取消或前序失败等 checkpoint 终态与验收结果分开。
+
+Managed 的验收分母和 accepted 数量按模型临时 ID 计数；`confirmed committed unit
+targets` 按数据库中已经确认提交的真实 unit 目标计数。跨 collection 全局去重后，一个
+模型 ID 可以扇出到多个 collection/key，因此已提交 target 数可以大于 accepted ID 数。
+身份映射和最终验收会逐个展开这些目标，不把扇出隐藏成一个代表 unit。
 
 `System`、`User` 与输入历史中的 `Assistant` 按原始消息顺序直接作为 Markdown 渲染；
 不得把 messages 再包装成 JSON。固定角色标题使用 `System`、`User`、`Thinking`、

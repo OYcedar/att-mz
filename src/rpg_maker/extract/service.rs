@@ -21,6 +21,7 @@ pub(crate) struct ExtractService<O, B, R, L, P> {
     built_in_extraction: Option<B>,
     selected_rules: Option<SelectedRules<R>>,
     selected_lua: Option<SelectedLua<L>>,
+    removed_lua: Option<L>,
     project_lease: P,
     cancellation: CooperativeCancellation,
     progress: ExtractProgress,
@@ -40,10 +41,21 @@ impl<O, B, R, L, P> ExtractService<O, B, R, L, P> {
             built_in_extraction,
             selected_rules,
             selected_lua,
+            removed_lua: None,
             project_lease,
             cancellation,
             progress: ExtractProgress::default(),
         }
+    }
+
+    /// 显式 Extract 运行方案移除 Lua 时，绑定负责清除旧 Lua owner 的执行器。
+    pub(crate) fn with_removed_lua(mut self, lua: L) -> Self {
+        assert!(
+            self.selected_lua.is_none(),
+            "选择 Lua 程序与移除 Lua owner 互斥"
+        );
+        self.removed_lua = Some(lua);
+        self
     }
 
     /// 为本次 Extract 绑定同步、不可失败的业务进度观察者。
@@ -98,7 +110,7 @@ where
 
         let total_owners = u64::from(self.built_in_extraction.is_some() as u8)
             + u64::from(self.selected_rules.is_some() as u8)
-            + u64::from(self.selected_lua.is_some() as u8);
+            + u64::from((self.selected_lua.is_some() || self.removed_lua.is_some()) as u8);
         let mut completed_owners = 0_u64;
 
         if let Some(built_in_extraction) = &self.built_in_extraction {
@@ -167,6 +179,17 @@ where
             };
             completed_owners += 1;
             self.observe_owner(ExtractProgressPhase::Lua, completed_owners, total_owners);
+        } else if let Some(removed_lua) = &self.removed_lua {
+            if self.cancellation.is_requested() {
+                return Ok(OperationCompletion::Cancelled);
+            }
+            self.observe_owner(ExtractProgressPhase::Lua, completed_owners, total_owners);
+            removed_lua
+                .deactivate(&project, self.progress.clone())
+                .await
+                .map_err(ExtractServiceError::LuaDeactivation)?;
+            completed_owners += 1;
+            self.observe_owner(ExtractProgressPhase::Lua, completed_owners, total_owners);
         }
 
         if self.cancellation.is_requested() {
@@ -185,6 +208,7 @@ pub(crate) enum ExtractServiceError<OE, BE, RE, LE, PE> {
     BuiltIn(BE),
     Rules { rules_path: PathBuf, source: RE },
     Lua { script_path: PathBuf, source: LE },
+    LuaDeactivation(LE),
 }
 
 impl<OE, BE, RE, LE, PE> fmt::Display for ExtractServiceError<OE, BE, RE, LE, PE>
@@ -211,6 +235,9 @@ where
                 "Lua 提取失败 {}：{source}",
                 script_path.display()
             ),
+            Self::LuaDeactivation(source) => {
+                write!(formatter, "停用 Lua 提取 owner 失败：{source}")
+            }
         }
     }
 }
@@ -230,6 +257,7 @@ where
             Self::BuiltIn(source) => Some(source),
             Self::Rules { source, .. } => Some(source),
             Self::Lua { source, .. } => Some(source),
+            Self::LuaDeactivation(source) => Some(source),
         }
     }
 }
@@ -410,6 +438,22 @@ mod tests {
                 Ok(OperationCompletion::Cancelled)
             } else {
                 Ok(OperationCompletion::Completed(()))
+            }
+        }
+
+        async fn deactivate(
+            &self,
+            _: &OpenedProject,
+            _: ExtractProgress,
+        ) -> Result<(), Self::Error> {
+            self.events
+                .lock()
+                .expect("事件锁不应中毒")
+                .push(Event::Lua(PathBuf::from("<removed>")));
+            if self.fail {
+                Err(FakeError("lua"))
+            } else {
+                Ok(())
             }
         }
     }
@@ -676,6 +720,32 @@ mod tests {
                 .expect("单阶段提取应该成功");
             assert_eq!(events(&recorded), vec![Event::Lease, Event::Open, expected]);
         }
+    }
+
+    #[tokio::test]
+    async fn removing_lua_from_an_explicit_plan_deactivates_its_owner() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let service =
+            service(Arc::clone(&recorded), None, true, None, None).with_removed_lua(FakeLua {
+                events: Arc::clone(&recorded),
+                fail: false,
+                cancelled: false,
+            });
+
+        service
+            .execute(input())
+            .await
+            .expect("移除 Lua 应清除旧 owner");
+
+        assert_eq!(
+            events(&recorded),
+            vec![
+                Event::Lease,
+                Event::Open,
+                Event::BuiltIn,
+                Event::Lua(PathBuf::from("<removed>")),
+            ]
+        );
     }
 
     #[tokio::test]

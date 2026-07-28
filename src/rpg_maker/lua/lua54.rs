@@ -29,6 +29,7 @@ use crate::diagnostic::{
 // 已位于共享 RPG Maker 边界，不依赖具体引擎的命令编排。
 use crate::fingerprint::{SHA256_FINGERPRINT_BYTES, Sha256Fingerprint};
 use crate::llm::{ChatMessage, ChatMessageRole, LlmResponse, LlmUsage};
+use crate::lossless_json::{LosslessJsonValue, decode as decode_json, validate_number};
 use crate::rpg_maker::extract::store::{
     ExtractedTextGroup, ExtractedTextUnit, LuaSnapshot, SnapshotModelError,
 };
@@ -36,18 +37,21 @@ use crate::rpg_maker::lua::document::{
     OpenedRpgMakerDocument, RpgMakerDocumentError, RpgMakerTextReference, data_file_source,
     data_source, map_source, plugin_parameter_source, source_path,
 };
-use crate::rpg_maker::lua::json::{LosslessJsonValue, decode as decode_json, validate_number};
 use crate::rpg_maker::lua::runtime::{
     OwnedLuaProgram, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
     TrustedLuaCommonBindings, TrustedLuaCommonHostCalls, TrustedLuaExecutionHandle,
-    TrustedLuaExtractHostCalls, TrustedLuaHostCallError, TrustedLuaPhaseBindings,
-    TrustedLuaPreparedTranslation, TrustedLuaPreparedTranslationAcceptance,
-    TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport,
-    TrustedLuaRuntimeExecutor, TrustedLuaStandardAcceptance, TrustedLuaStandardCandidate,
-    TrustedLuaStandardHostCalls, TrustedLuaStandardRejectionValue, TrustedLuaStandardSession,
-    TrustedLuaStandardUnit, TrustedLuaTranslateHostCalls, TrustedLuaWriteBackHostCalls,
-    TrustedLuaWriteBackLayoutPair, TrustedLuaWriteBackLayoutRegion,
-    TrustedLuaWriteBackLayoutResult,
+    TrustedLuaExtractHostCalls, TrustedLuaHostCallError, TrustedLuaManagedTranslationCollection,
+    TrustedLuaManagedTranslationCollectionDeclaration, TrustedLuaManagedTranslationContent,
+    TrustedLuaManagedTranslationReport, TrustedLuaManagedTranslationResult,
+    TrustedLuaManagedTranslationShape, TrustedLuaManagedTranslationSnapshot,
+    TrustedLuaManagedTranslationUnit, TrustedLuaManagedTranslationUnitDeclaration,
+    TrustedLuaPhaseBindings, TrustedLuaPreparedTranslation,
+    TrustedLuaPreparedTranslationAcceptance, TrustedLuaRuntimeBindings,
+    TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutionReport, TrustedLuaRuntimeExecutor,
+    TrustedLuaStandardAcceptance, TrustedLuaStandardCandidate, TrustedLuaStandardHostCalls,
+    TrustedLuaStandardRejectionValue, TrustedLuaStandardSession, TrustedLuaStandardUnit,
+    TrustedLuaTranslateHostCalls, TrustedLuaWriteBackHostCalls, TrustedLuaWriteBackLayoutPair,
+    TrustedLuaWriteBackLayoutRegion, TrustedLuaWriteBackLayoutResult,
 };
 use crate::rpg_maker::lua::{LuaPhase, LuaProjectContext, LuaSourcePath};
 use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
@@ -754,10 +758,17 @@ fn build_context(
     )?;
     match phase {
         TrustedLuaPhaseBindings::Extract(extract) => {
-            install_extract_context(lua, &context, extract)?;
+            install_extract_context(lua, &context, extract, &json_markers)?;
         }
         TrustedLuaPhaseBindings::Translate(translate) => {
-            install_translate_context(lua, &context, translate, tokio, cancellation)?;
+            install_translate_context(
+                lua,
+                &context,
+                translate,
+                tokio,
+                cancellation,
+                &json_markers,
+            )?;
         }
         TrustedLuaPhaseBindings::WriteBack(write_back) => {
             install_write_back_context(
@@ -784,6 +795,7 @@ fn install_extract_context(
     lua: &Lua,
     context: &Table,
     calls: Arc<dyn TrustedLuaExtractHostCalls>,
+    json_markers: &Table,
 ) -> mlua::Result<()> {
     let extract = lua.create_table()?;
     let declared = Arc::new(AtomicBool::new(false));
@@ -800,14 +812,16 @@ fn install_extract_context(
     })?;
     extract.set("replace_standard", checked_host_function(lua, replace)?)?;
 
+    let clear_calls = Arc::clone(&calls);
     let clear = lua.create_function(move |lua, ()| {
         let result = claim_extract_intent(&declared)
-            .and_then(|()| calls.clear_standard())
+            .and_then(|()| clear_calls.clear_standard())
             .map_err(|error| error.with_operation("extract.clear_standard"));
         host_result_to_lua(lua, result, |_, ()| Ok(Value::Nil))
     })?;
     extract.set("clear_standard", checked_host_function(lua, clear)?)?;
     context.set("extract", extract)?;
+    install_extract_translations_context(lua, context, calls, json_markers)?;
     Ok(())
 }
 
@@ -995,18 +1009,721 @@ fn extract_argument_error(message: String) -> TrustedLuaHostCallError {
     TrustedLuaHostCallError::new("extract", "invalid_standard_snapshot", message, None, None)
 }
 
+fn install_extract_translations_context(
+    lua: &Lua,
+    context: &Table,
+    calls: Arc<dyn TrustedLuaExtractHostCalls>,
+    json_markers: &Table,
+) -> mlua::Result<()> {
+    let translations = lua.create_table()?;
+    let declared = Arc::new(AtomicBool::new(false));
+    let markers = json_markers.clone();
+    let native = lua.create_function(move |lua, arguments: MultiValue| {
+        let result = claim_managed_once(
+            &declared,
+            "intent_already_declared",
+            "一次 Lua Extract 主程序只能调用一次 translations.replace",
+        )
+        .and_then(|()| exact_managed_arguments(arguments, 1, "translations.replace"))
+        .and_then(|mut arguments| parse_managed_translation_snapshot(arguments.remove(0), &markers))
+        .and_then(|snapshot| calls.replace_managed(snapshot))
+        .map_err(|error| error.with_operation("translations.replace"));
+        host_result_to_lua(lua, result, |_, ()| Ok(Value::Nil))
+    })?;
+    translations.set("replace", checked_host_function(lua, native)?)?;
+    context.set("translations", translations)
+}
+
+fn parse_managed_translation_snapshot(
+    value: Value,
+    json_markers: &Table,
+) -> Result<TrustedLuaManagedTranslationSnapshot, TrustedLuaHostCallError> {
+    let Value::Table(collections) = value else {
+        return Err(managed_argument_error(format!(
+            "translations.replace collections 必须是无洞数组，实际为 {}",
+            value.type_name()
+        )));
+    };
+    let values = dense_values(collections, |error| {
+        managed_argument_error(format!(
+            "translations.replace collections 必须是无洞数组：{error}"
+        ))
+    })?;
+    let mut names = HashSet::with_capacity(values.len());
+    let mut parsed = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        let collection = parse_managed_translation_collection(value, index + 1, json_markers)?;
+        if !names.insert(collection.name().to_owned()) {
+            return Err(managed_argument_error(format!(
+                "translations.replace collections 不允许重复 name：{}",
+                collection.name()
+            )));
+        }
+        parsed.push(collection);
+    }
+    Ok(TrustedLuaManagedTranslationSnapshot::new(parsed))
+}
+
+fn parse_managed_translation_collection(
+    value: Value,
+    index: usize,
+    json_markers: &Table,
+) -> Result<TrustedLuaManagedTranslationCollectionDeclaration, TrustedLuaHostCallError> {
+    let Value::Table(collection) = value else {
+        return Err(managed_argument_error(format!(
+            "translations.replace collections[{index}] 必须是 table，实际为 {}",
+            value.type_name()
+        )));
+    };
+    ensure_exact_string_keys(&collection, &["name", "instruction", "units"])
+        .map_err(|error| managed_argument_error(error.to_string()))?;
+    let name = managed_required_string(&collection, "name", &format!("collections[{index}].name"))?;
+    if name.is_empty() {
+        return Err(managed_argument_error(format!(
+            "translations.replace collections[{index}].name 不能为空"
+        )));
+    }
+    let instruction = managed_required_string(
+        &collection,
+        "instruction",
+        &format!("collections[{index}].instruction"),
+    )?;
+    let units = collection
+        .raw_get::<Value>("units")
+        .map_err(|error| managed_argument_error(error.to_string()))?;
+    let Value::Table(units) = units else {
+        return Err(managed_argument_error(format!(
+            "translations.replace collections[{index}].units 必须是无洞数组，实际为 {}",
+            units.type_name()
+        )));
+    };
+    let unit_values = dense_values(units, |error| {
+        managed_argument_error(format!(
+            "translations.replace collections[{index}].units 必须是无洞数组：{error}"
+        ))
+    })?;
+    let mut keys = HashSet::with_capacity(unit_values.len());
+    let mut parsed_units = Vec::with_capacity(unit_values.len());
+    for (unit_offset, value) in unit_values.into_iter().enumerate() {
+        let unit = parse_managed_translation_unit(value, index, unit_offset + 1, json_markers)?;
+        if !keys.insert(unit.key().to_owned()) {
+            return Err(managed_argument_error(format!(
+                "translations.replace collection {name} 不允许重复 unit.key：{}",
+                unit.key()
+            )));
+        }
+        parsed_units.push(unit);
+    }
+    Ok(TrustedLuaManagedTranslationCollectionDeclaration::new(
+        name,
+        instruction,
+        parsed_units,
+    ))
+}
+
+fn parse_managed_translation_unit(
+    value: Value,
+    collection_index: usize,
+    unit_index: usize,
+    json_markers: &Table,
+) -> Result<TrustedLuaManagedTranslationUnitDeclaration, TrustedLuaHostCallError> {
+    let Value::Table(unit) = value else {
+        return Err(managed_argument_error(format!(
+            "translations.replace collections[{collection_index}].units[{unit_index}] 必须是 table，实际为 {}",
+            value.type_name()
+        )));
+    };
+    ensure_managed_unit_keys(&unit, collection_index, unit_index)?;
+    let role = |field: &str| format!("collections[{collection_index}].units[{unit_index}].{field}");
+    let key = managed_required_string(&unit, "key", &role("key"))?;
+    if key.is_empty() {
+        return Err(managed_argument_error(format!(
+            "translations.replace {} 不能为空",
+            role("key")
+        )));
+    }
+    let kind = managed_required_string(&unit, "kind", &role("kind"))?;
+    if kind.is_empty() {
+        return Err(managed_argument_error(format!(
+            "translations.replace {} 不能为空",
+            role("kind")
+        )));
+    }
+    let shape = parse_managed_shape(
+        unit.raw_get::<Value>("shape")
+            .map_err(|error| managed_argument_error(error.to_string()))?,
+        &role("shape"),
+    )?;
+    let original = parse_managed_original(
+        unit.raw_get::<Value>("original")
+            .map_err(|error| managed_argument_error(error.to_string()))?,
+        shape,
+        &role("original"),
+    )?;
+    let context = managed_required_string(&unit, "context", &role("context"))?;
+    let metadata = unit
+        .raw_get::<Value>("metadata")
+        .map_err(|error| managed_argument_error(error.to_string()))?;
+    let metadata_json = match metadata {
+        Value::Nil => None,
+        value => Some(
+            JsonEncoder::new(json_markers)
+                .encode(value)
+                .map_err(|error| {
+                    managed_argument_error(format!(
+                        "translations.replace {} 必须是可由 ctx.json 表达的 JSON 值：{error}",
+                        role("metadata")
+                    ))
+                })?,
+        ),
+    };
+    Ok(TrustedLuaManagedTranslationUnitDeclaration::new(
+        key,
+        kind,
+        shape,
+        original,
+        context,
+        metadata_json,
+    ))
+}
+
+fn ensure_managed_unit_keys(
+    unit: &Table,
+    collection_index: usize,
+    unit_index: usize,
+) -> Result<(), TrustedLuaHostCallError> {
+    let required = ["key", "kind", "shape", "original", "context"];
+    let allowed = ["key", "kind", "shape", "original", "context", "metadata"];
+    let mut found = HashSet::new();
+    for pair in unit.clone().pairs::<Value, Value>() {
+        let (key, _) = pair.map_err(|error| managed_argument_error(error.to_string()))?;
+        let Value::String(key) = key else {
+            return Err(managed_argument_error(format!(
+                "translations.replace collections[{collection_index}].units[{unit_index}] 字段名必须是字符串"
+            )));
+        };
+        let key = lua_string_to_text(&key, "managed unit 字段名")
+            .map_err(|error| managed_argument_error(error.to_string()))?;
+        if !allowed.contains(&key.as_str()) {
+            return Err(managed_argument_error(format!(
+                "translations.replace collections[{collection_index}].units[{unit_index}] 包含未知字段 {key}"
+            )));
+        }
+        found.insert(key);
+    }
+    for field in required {
+        if !found.contains(field) {
+            return Err(managed_argument_error(format!(
+                "translations.replace collections[{collection_index}].units[{unit_index}] 缺少字段 {field}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn managed_required_string(
+    table: &Table,
+    field: &str,
+    role: &str,
+) -> Result<String, TrustedLuaHostCallError> {
+    match table
+        .raw_get::<Value>(field)
+        .map_err(|error| managed_argument_error(error.to_string()))?
+    {
+        Value::String(value) => lua_string_to_text(&value, role)
+            .map_err(|error| managed_argument_error(error.to_string())),
+        value => Err(managed_argument_error(format!(
+            "translations.replace {role} 必须是 UTF-8 字符串，实际为 {}",
+            value.type_name()
+        ))),
+    }
+}
+
+fn parse_managed_shape(
+    value: Value,
+    role: &str,
+) -> Result<TrustedLuaManagedTranslationShape, TrustedLuaHostCallError> {
+    let Value::String(value) = value else {
+        return Err(managed_argument_error(format!(
+            "translations.replace {role} 必须是字符串，实际为 {}",
+            value.type_name()
+        )));
+    };
+    let value = lua_string_to_text(&value, role)
+        .map_err(|error| managed_argument_error(error.to_string()))?;
+    match value.as_str() {
+        "single" => Ok(TrustedLuaManagedTranslationShape::Single),
+        "reflow" => Ok(TrustedLuaManagedTranslationShape::Reflow),
+        "lines" => Ok(TrustedLuaManagedTranslationShape::Lines),
+        "items" => Ok(TrustedLuaManagedTranslationShape::Items),
+        _ => Err(managed_argument_error(format!(
+            "translations.replace {role} 无效：{value}"
+        ))),
+    }
+}
+
+fn parse_managed_original(
+    value: Value,
+    shape: TrustedLuaManagedTranslationShape,
+    role: &str,
+) -> Result<TrustedLuaManagedTranslationContent, TrustedLuaHostCallError> {
+    match shape {
+        TrustedLuaManagedTranslationShape::Single | TrustedLuaManagedTranslationShape::Reflow => {
+            let Value::String(value) = value else {
+                return Err(managed_argument_error(format!(
+                    "translations.replace {role} 在 {} shape 下必须是 UTF-8 字符串，实际为 {}",
+                    shape.as_str(),
+                    value.type_name()
+                )));
+            };
+            lua_string_to_text(&value, role)
+                .map(TrustedLuaManagedTranslationContent::scalar)
+                .map_err(|error| managed_argument_error(error.to_string()))
+        }
+        TrustedLuaManagedTranslationShape::Lines | TrustedLuaManagedTranslationShape::Items => {
+            let Value::Table(values) = value else {
+                return Err(managed_argument_error(format!(
+                    "translations.replace {role} 在 {} shape 下必须是非空无洞字符串数组，实际为 {}",
+                    shape.as_str(),
+                    value.type_name()
+                )));
+            };
+            let values = dense_values(values, |error| {
+                managed_argument_error(format!(
+                    "translations.replace {role} 必须是无洞字符串数组：{error}"
+                ))
+            })?;
+            if values.is_empty() {
+                return Err(managed_argument_error(format!(
+                    "translations.replace {role} 在 {} shape 下不能为空数组",
+                    shape.as_str()
+                )));
+            }
+            let mut parsed = Vec::with_capacity(values.len());
+            for (index, value) in values.into_iter().enumerate() {
+                let Value::String(value) = value else {
+                    return Err(managed_argument_error(format!(
+                        "translations.replace {role}[{}] 必须是 UTF-8 字符串，实际为 {}",
+                        index + 1,
+                        value.type_name()
+                    )));
+                };
+                let value = lua_string_to_text(&value, role)
+                    .map_err(|error| managed_argument_error(error.to_string()))?;
+                if shape == TrustedLuaManagedTranslationShape::Items && value.trim().is_empty() {
+                    return Err(managed_argument_error(format!(
+                        "translations.replace {role}[{}] 在 items shape 下不得为空白",
+                        index + 1
+                    )));
+                }
+                parsed.push(value);
+            }
+            Ok(TrustedLuaManagedTranslationContent::array(parsed))
+        }
+    }
+}
+
+fn exact_managed_arguments(
+    arguments: MultiValue,
+    expected: usize,
+    operation: &str,
+) -> Result<Vec<Value>, TrustedLuaHostCallError> {
+    let arguments = arguments.into_vec();
+    if arguments.len() != expected {
+        return Err(managed_argument_error(format!(
+            "{operation} 需要 {expected} 个参数，实际为 {} 个",
+            arguments.len()
+        )));
+    }
+    Ok(arguments)
+}
+
+fn claim_managed_once(
+    claimed: &AtomicBool,
+    kind: &'static str,
+    message: &'static str,
+) -> Result<(), TrustedLuaHostCallError> {
+    claimed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|_| TrustedLuaHostCallError::new("translations", kind, message, None, None))
+}
+
+fn managed_argument_error(message: String) -> TrustedLuaHostCallError {
+    TrustedLuaHostCallError::new("translations", "invalid_snapshot", message, None, None)
+}
+
 fn install_translate_context(
     lua: &Lua,
     context: &Table,
     calls: Arc<dyn TrustedLuaTranslateHostCalls>,
     tokio: Handle,
     cancellation: RuntimeCancellation,
+    json_markers: &Table,
 ) -> mlua::Result<()> {
     context.set(
         "translation",
         build_translation_table(lua, Arc::clone(&calls))?,
     )?;
-    context.set("llm", build_llm_function(lua, calls, tokio, cancellation)?)
+    context.set(
+        "llm",
+        build_llm_function(lua, Arc::clone(&calls), tokio.clone(), cancellation.clone())?,
+    )?;
+    install_translate_translations_context(lua, context, calls, tokio, cancellation, json_markers)
+}
+
+fn install_translate_translations_context(
+    lua: &Lua,
+    context: &Table,
+    calls: Arc<dyn TrustedLuaTranslateHostCalls>,
+    tokio: Handle,
+    cancellation: RuntimeCancellation,
+    json_markers: &Table,
+) -> mlua::Result<()> {
+    let translations = lua.create_table()?;
+    let translate_claimed = Arc::new(AtomicBool::new(false));
+    let translate_succeeded = Arc::new(AtomicBool::new(false));
+
+    let translate_calls = Arc::clone(&calls);
+    let translate_tokio = tokio.clone();
+    let translate_cancellation = cancellation.clone();
+    let translate_markers = json_markers.clone();
+    let claimed = Arc::clone(&translate_claimed);
+    let succeeded = Arc::clone(&translate_succeeded);
+    let native_translate = lua.create_function(move |lua, arguments: MultiValue| {
+        let result = claim_managed_once(
+            &claimed,
+            "already_translated",
+            "一次 Lua Translate 主程序只能调用一次 translations.translate",
+        )
+        .and_then(|()| exact_managed_arguments(arguments, 0, "translations.translate"))
+        .and_then(|_| {
+            wait_for_output_terminal(
+                &translate_tokio,
+                &translate_cancellation,
+                translate_calls.translate_managed(),
+            )
+        })
+        .inspect(|_| {
+            succeeded.store(true, Ordering::Release);
+        })
+        .map_err(|error| error.with_operation("translations.translate"));
+        host_result_to_lua(lua, result, |lua, report| {
+            lua.create_userdata(LuaManagedTranslationReport {
+                report,
+                markers: translate_markers.clone(),
+            })
+            .map(Value::UserData)
+        })
+    })?;
+    translations.set("translate", checked_host_function(lua, native_translate)?)?;
+
+    let open_markers = json_markers.clone();
+    let native_open = lua.create_function(move |lua, arguments: MultiValue| {
+        let result = exact_managed_arguments(arguments, 1, "translations.open")
+            .and_then(|mut arguments| parse_managed_open_name(arguments.remove(0)))
+            .and_then(|name| {
+                if !translate_succeeded.load(Ordering::Acquire) {
+                    return Err(TrustedLuaHostCallError::new(
+                        "translations",
+                        "translate_required",
+                        "Translate 阶段只能在本轮 translations.translate 成功后调用 translations.open",
+                        None,
+                        None,
+                    ));
+                }
+                wait_for_host(&tokio, &cancellation, calls.open_managed(name))
+            })
+            .map_err(|error| error.with_operation("translations.open"));
+        host_result_to_lua(lua, result, |lua, collection| match collection {
+            Some(collection) => lua
+                .create_userdata(LuaManagedTranslationCollection {
+                    collection,
+                    markers: open_markers.clone(),
+                })
+                .map(Value::UserData),
+            None => Ok(Value::Nil),
+        })
+    })?;
+    translations.set("open", checked_host_function(lua, native_open)?)?;
+    context.set("translations", translations)
+}
+
+fn install_write_back_translations_context(
+    lua: &Lua,
+    context: &Table,
+    calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
+    tokio: Handle,
+    cancellation: RuntimeCancellation,
+    json_markers: &Table,
+) -> mlua::Result<()> {
+    let translations = lua.create_table()?;
+    let markers = json_markers.clone();
+    let native = lua.create_function(move |lua, arguments: MultiValue| {
+        let result = exact_managed_arguments(arguments, 1, "translations.open")
+            .and_then(|mut arguments| parse_managed_open_name(arguments.remove(0)))
+            .and_then(|name| wait_for_host(&tokio, &cancellation, calls.open_managed(name)))
+            .map_err(|error| error.with_operation("translations.open"));
+        host_result_to_lua(lua, result, |lua, collection| match collection {
+            Some(collection) => lua
+                .create_userdata(LuaManagedTranslationCollection {
+                    collection,
+                    markers: markers.clone(),
+                })
+                .map(Value::UserData),
+            None => Ok(Value::Nil),
+        })
+    })?;
+    translations.set("open", checked_host_function(lua, native)?)?;
+    context.set("translations", translations)
+}
+
+fn parse_managed_open_name(value: Value) -> Result<String, TrustedLuaHostCallError> {
+    let Value::String(value) = value else {
+        return Err(TrustedLuaHostCallError::new(
+            "translations",
+            "invalid_argument",
+            format!(
+                "translations.open name 必须是非空 UTF-8 字符串，实际为 {}",
+                value.type_name()
+            ),
+            None,
+            None,
+        ));
+    };
+    let value = lua_string_to_text(&value, "translations.open name")
+        .map_err(|error| managed_open_argument_error(error.to_string()))?;
+    if value.is_empty() {
+        return Err(managed_open_argument_error(
+            "translations.open name 不能为空".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+fn managed_open_argument_error(message: String) -> TrustedLuaHostCallError {
+    TrustedLuaHostCallError::new("translations", "invalid_argument", message, None, None)
+}
+
+#[derive(Clone)]
+struct LuaManagedTranslationReport {
+    report: TrustedLuaManagedTranslationReport,
+    markers: Table,
+}
+
+impl UserData for LuaManagedTranslationReport {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("units", |lua, this, ()| {
+            let markers = this.markers.clone();
+            let mut units = this.report.units().to_vec().into_iter();
+            lua.create_function_mut(move |lua, _arguments: MultiValue| {
+                let Some(result) = units.next() else {
+                    return Ok(Value::Nil);
+                };
+                lua.create_userdata(LuaManagedTranslationResult {
+                    result,
+                    markers: markers.clone(),
+                })
+                .map(Value::UserData)
+            })
+        });
+        methods.add_meta_method(MetaMethod::ToString, |_lua, _this, ()| {
+            Ok("ManagedTranslationReport")
+        });
+    }
+}
+
+#[derive(Clone)]
+struct LuaManagedTranslationResult {
+    result: TrustedLuaManagedTranslationResult,
+    markers: Table,
+}
+
+impl UserData for LuaManagedTranslationResult {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("collection", |_lua, this| {
+            Ok(this.result.collection().to_owned())
+        });
+        fields.add_field_method_get("key", |_lua, this| Ok(this.result.key().to_owned()));
+        fields.add_field_method_get("status", |_lua, this| Ok(this.result.status().as_str()));
+        fields.add_field_method_get("translation", |lua, this| {
+            managed_optional_content_to_lua(lua, this.result.translation(), &this.markers)
+        });
+        fields.add_field_method_get("reason", |_lua, this| {
+            Ok(this.result.reason().map(str::to_owned))
+        });
+        fields.add_field_method_get("details", |lua, this| {
+            managed_optional_json_object_to_lua(
+                lua,
+                this.result.details_json(),
+                &this.markers,
+                "translation result details",
+            )
+        });
+    }
+
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method(MetaMethod::ToString, |_lua, this, ()| {
+            Ok(format!(
+                "ManagedTranslationResult({}/{})",
+                this.result.collection(),
+                this.result.key()
+            ))
+        });
+    }
+}
+
+#[derive(Clone)]
+struct LuaManagedTranslationCollection {
+    collection: TrustedLuaManagedTranslationCollection,
+    markers: Table,
+}
+
+impl UserData for LuaManagedTranslationCollection {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("name", |_lua, this| Ok(this.collection.name().to_owned()));
+        fields.add_field_method_get("instruction", |_lua, this| {
+            Ok(this.collection.instruction().to_owned())
+        });
+    }
+
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("get", |lua, this, key: Value| {
+            let key = parse_managed_open_name(key)
+                .map_err(|error| mlua::Error::external(error.message().to_owned()))?;
+            match this.collection.get(&key) {
+                Some(unit) => lua
+                    .create_userdata(LuaManagedTranslationUnit {
+                        unit: unit.clone(),
+                        markers: this.markers.clone(),
+                    })
+                    .map(Value::UserData),
+                None => Ok(Value::Nil),
+            }
+        });
+        methods.add_method("units", |lua, this, ()| {
+            let markers = this.markers.clone();
+            let mut units = this.collection.units().to_vec().into_iter();
+            lua.create_function_mut(move |lua, _arguments: MultiValue| {
+                let Some(unit) = units.next() else {
+                    return Ok(Value::Nil);
+                };
+                lua.create_userdata(LuaManagedTranslationUnit {
+                    unit,
+                    markers: markers.clone(),
+                })
+                .map(Value::UserData)
+            })
+        });
+        methods.add_meta_method(MetaMethod::ToString, |_lua, this, ()| {
+            Ok(format!(
+                "ManagedTranslationCollection({})",
+                this.collection.name()
+            ))
+        });
+    }
+}
+
+#[derive(Clone)]
+struct LuaManagedTranslationUnit {
+    unit: TrustedLuaManagedTranslationUnit,
+    markers: Table,
+}
+
+impl UserData for LuaManagedTranslationUnit {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("key", |_lua, this| Ok(this.unit.key().to_owned()));
+        fields.add_field_method_get("kind", |_lua, this| Ok(this.unit.kind().to_owned()));
+        fields.add_field_method_get("shape", |_lua, this| Ok(this.unit.shape().as_str()));
+        fields.add_field_method_get("original", |lua, this| {
+            managed_content_to_lua(lua, this.unit.original(), &this.markers)
+        });
+        fields.add_field_method_get("context", |_lua, this| Ok(this.unit.context().to_owned()));
+        fields.add_field_method_get("metadata", |lua, this| {
+            managed_optional_json_to_lua(
+                lua,
+                this.unit.metadata_json(),
+                &this.markers,
+                "unit metadata",
+            )
+        });
+        fields.add_field_method_get("translation", |lua, this| {
+            managed_optional_content_to_lua(lua, this.unit.translation(), &this.markers)
+        });
+        fields.add_field_method_get("status", |_lua, this| Ok(this.unit.status().as_str()));
+    }
+
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method(MetaMethod::ToString, |_lua, this, ()| {
+            Ok(format!("ManagedTranslationUnit({})", this.unit.key()))
+        });
+    }
+}
+
+fn managed_optional_content_to_lua(
+    lua: &Lua,
+    content: Option<&TrustedLuaManagedTranslationContent>,
+    markers: &Table,
+) -> mlua::Result<Value> {
+    match content {
+        Some(content) => managed_content_to_lua(lua, content, markers),
+        None => Ok(Value::Nil),
+    }
+}
+
+fn managed_content_to_lua(
+    lua: &Lua,
+    content: &TrustedLuaManagedTranslationContent,
+    markers: &Table,
+) -> mlua::Result<Value> {
+    match content {
+        TrustedLuaManagedTranslationContent::Scalar(value) => {
+            lua.create_string(value).map(Value::String)
+        }
+        TrustedLuaManagedTranslationContent::Array(values) => {
+            let output = lua.create_table_with_capacity(values.len(), 0)?;
+            for (index, value) in values.iter().enumerate() {
+                output.raw_set(index + 1, value.as_str())?;
+            }
+            mark_json_table(markers, &output, JsonContainerKind::Array)?;
+            Ok(Value::Table(output))
+        }
+    }
+}
+
+fn managed_optional_json_object_to_lua(
+    lua: &Lua,
+    source: Option<&str>,
+    markers: &Table,
+    role: &str,
+) -> mlua::Result<Value> {
+    let Some(source) = source else {
+        return Ok(Value::Nil);
+    };
+    let value = decode_json(source).map_err(|error| {
+        mlua::Error::runtime(format!("托管核心返回了无效 {role} JSON：{error}"))
+    })?;
+    if !matches!(value, LosslessJsonValue::Object(_)) {
+        return Err(mlua::Error::runtime(format!(
+            "托管核心返回的 {role} 必须是 JSON object"
+        )));
+    }
+    lossless_json_to_lua(lua, value, markers)
+}
+
+fn managed_optional_json_to_lua(
+    lua: &Lua,
+    source: Option<&str>,
+    markers: &Table,
+    role: &str,
+) -> mlua::Result<Value> {
+    let Some(source) = source else {
+        return Ok(Value::Nil);
+    };
+    let value = decode_json(source).map_err(|error| {
+        mlua::Error::runtime(format!("托管核心返回了无效 {role} JSON：{error}"))
+    })?;
+    lossless_json_to_lua(lua, value, markers)
 }
 
 fn install_project_context(
@@ -1800,19 +2517,26 @@ fn install_write_back_context(
 ) -> mlua::Result<()> {
     context.set(
         "output",
-        build_output_table(lua, Arc::clone(&calls), tokio, cancellation, markers)?,
+        build_output_table(
+            lua,
+            Arc::clone(&calls),
+            tokio.clone(),
+            cancellation.clone(),
+            markers,
+        )?,
     )?;
 
     let write_back = lua.create_table()?;
+    let layout_calls = Arc::clone(&calls);
     let layout = lua.create_function(move |lua, (region, pairs): (Value, Value)| {
         let result = parse_write_back_layout(region, pairs)
-            .and_then(|(region, pairs)| calls.layout(region, pairs))
+            .and_then(|(region, pairs)| layout_calls.layout(region, pairs))
             .map_err(|error| error.with_operation("write_back.layout"));
         host_result_to_lua(lua, result, write_back_layout_result_to_lua)
     })?;
     write_back.set("layout", checked_host_function(lua, layout)?)?;
     context.set("write_back", write_back)?;
-    Ok(())
+    install_write_back_translations_context(lua, context, calls, tokio, cancellation, markers)
 }
 
 fn build_output_table(
@@ -3683,10 +4407,12 @@ mod tests {
 
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::lua::runtime::{
-        TrustedLuaBindingFinalization, TrustedLuaBindingFinalizer, TrustedLuaExtractIntent,
+        TrustedLuaBindingFinalization, TrustedLuaBindingFinalizer,
+        TrustedLuaManagedTranslationResultStatus, TrustedLuaManagedTranslationUnitStatus,
         TrustedLuaOutputEntry, TrustedLuaPreparedTranslationStatus, TrustedLuaRuntimeBindings,
-        TrustedLuaStandardLinePolicy, TrustedLuaStandardRejectionDetail,
-        TrustedLuaStandardUnitStatus, TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
+        TrustedLuaStandardExtractIntent, TrustedLuaStandardLinePolicy,
+        TrustedLuaStandardRejectionDetail, TrustedLuaStandardUnitStatus,
+        TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
     };
     use crate::rpg_maker::project::OpenedProject;
     use crate::runtime::sqlite::{
@@ -3703,7 +4429,10 @@ mod tests {
         executed_parameters: Vec<SqliteValue>,
         messages: Vec<ChatMessage>,
         prepared: Vec<(TextGroupKind, String, String)>,
-        extract_intents: Vec<TrustedLuaExtractIntent>,
+        extract_intents: Vec<TrustedLuaStandardExtractIntent>,
+        managed_snapshots: Vec<TrustedLuaManagedTranslationSnapshot>,
+        managed_translate_calls: usize,
+        managed_open_names: Vec<String>,
         output_operations: Vec<String>,
         output_writes: Vec<(String, Vec<u8>)>,
         standard_candidates: Vec<TrustedLuaStandardCandidate>,
@@ -3720,6 +4449,85 @@ mod tests {
         begin_error: Option<TrustedLuaHostCallError>,
         begin_started: Option<Arc<Notify>>,
         begin_gate: Option<Arc<Notify>>,
+    }
+
+    fn test_managed_collection(name: String) -> TrustedLuaManagedTranslationCollection {
+        TrustedLuaManagedTranslationCollection::new(
+            name,
+            "翻译任务标题；保持简洁。".to_owned(),
+            vec![
+                TrustedLuaManagedTranslationUnit::new(
+                    "single".to_owned(),
+                    "plugin_parameter".to_owned(),
+                    TrustedLuaManagedTranslationShape::Single,
+                    TrustedLuaManagedTranslationContent::scalar("星港へ"),
+                    "任务标题".to_owned(),
+                    Some(r#"{"quest_id":12,"tag":"main"}"#.to_owned()),
+                    Some(TrustedLuaManagedTranslationContent::scalar("前往星港")),
+                    TrustedLuaManagedTranslationUnitStatus::Current,
+                ),
+                TrustedLuaManagedTranslationUnit::new(
+                    "reflow".to_owned(),
+                    "plugin_parameter".to_owned(),
+                    TrustedLuaManagedTranslationShape::Reflow,
+                    TrustedLuaManagedTranslationContent::scalar("長い説明"),
+                    String::new(),
+                    Some(r#"[1,"tag"]"#.to_owned()),
+                    Some(TrustedLuaManagedTranslationContent::scalar("很长的\n说明")),
+                    TrustedLuaManagedTranslationUnitStatus::Current,
+                ),
+                TrustedLuaManagedTranslationUnit::new(
+                    "lines".to_owned(),
+                    "map".to_owned(),
+                    TrustedLuaManagedTranslationShape::Lines,
+                    TrustedLuaManagedTranslationContent::array(vec![
+                        "第一行".to_owned(),
+                        String::new(),
+                    ]),
+                    String::new(),
+                    Some(r#""tag""#.to_owned()),
+                    Some(TrustedLuaManagedTranslationContent::array(vec![
+                        "第 1 行".to_owned(),
+                        String::new(),
+                    ])),
+                    TrustedLuaManagedTranslationUnitStatus::Current,
+                ),
+                TrustedLuaManagedTranslationUnit::new(
+                    "items".to_owned(),
+                    "choices".to_owned(),
+                    TrustedLuaManagedTranslationShape::Items,
+                    TrustedLuaManagedTranslationContent::array(vec![
+                        "はい".to_owned(),
+                        "いいえ".to_owned(),
+                    ]),
+                    String::new(),
+                    Some("null".to_owned()),
+                    None,
+                    TrustedLuaManagedTranslationUnitStatus::Unavailable,
+                ),
+            ],
+        )
+    }
+
+    fn test_managed_report() -> TrustedLuaManagedTranslationReport {
+        TrustedLuaManagedTranslationReport::new(vec![
+            TrustedLuaManagedTranslationResult::new(
+                "quest_titles".to_owned(),
+                "single".to_owned(),
+                TrustedLuaManagedTranslationResultStatus::Translated,
+                Some(TrustedLuaManagedTranslationContent::scalar("前往星港")),
+                None,
+                Some(r#"{"changed_locations":2}"#.to_owned()),
+            ),
+            TrustedLuaManagedTranslationResult::new(
+                "quest_titles".to_owned(),
+                "items".to_owned(),
+                TrustedLuaManagedTranslationResultStatus::Unavailable,
+                None,
+                Some("placeholder_mismatch".to_owned()),
+                Some(r#"{"index":2}"#.to_owned()),
+            ),
+        ])
     }
 
     impl TrustedLuaCommonHostCalls for TestCalls {
@@ -3958,6 +4766,54 @@ mod tests {
                 ))
             })
         }
+
+        fn translate_managed(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            TrustedLuaManagedTranslationReport,
+                            TrustedLuaHostCallError,
+                        >,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            self.observations
+                .lock()
+                .expect("测试记录锁不应中毒")
+                .managed_translate_calls += 1;
+            Box::pin(async { Ok(test_managed_report()) })
+        }
+
+        fn open_managed(
+            &self,
+            name: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<TrustedLuaManagedTranslationCollection>,
+                            TrustedLuaHostCallError,
+                        >,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            self.observations
+                .lock()
+                .expect("测试记录锁不应中毒")
+                .managed_open_names
+                .push(name.clone());
+            Box::pin(async move {
+                if name == "missing" {
+                    Ok(None)
+                } else {
+                    Ok(Some(test_managed_collection(name)))
+                }
+            })
+        }
     }
 
     struct TestPreparedTranslation {
@@ -3977,6 +4833,10 @@ mod tests {
 
         fn terms(&self) -> &[TrustedLuaTranslationTerm] {
             &self.terms
+        }
+
+        fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+            Sha256Fingerprint::from_bytes([0x5c; SHA256_FINGERPRINT_BYTES])
         }
 
         fn is_current(
@@ -4017,7 +4877,7 @@ mod tests {
                 .lock()
                 .expect("测试观察锁不应中毒")
                 .extract_intents
-                .push(TrustedLuaExtractIntent::Replace(snapshot));
+                .push(TrustedLuaStandardExtractIntent::Replace(snapshot));
             Ok(())
         }
 
@@ -4026,12 +4886,52 @@ mod tests {
                 .lock()
                 .expect("测试观察锁不应中毒")
                 .extract_intents
-                .push(TrustedLuaExtractIntent::Deactivate);
+                .push(TrustedLuaStandardExtractIntent::Deactivate);
+            Ok(())
+        }
+
+        fn replace_managed(
+            &self,
+            snapshot: TrustedLuaManagedTranslationSnapshot,
+        ) -> Result<(), TrustedLuaHostCallError> {
+            self.observations
+                .lock()
+                .expect("测试观察锁不应中毒")
+                .managed_snapshots
+                .push(snapshot);
             Ok(())
         }
     }
 
     impl TrustedLuaWriteBackHostCalls for TestCalls {
+        fn open_managed(
+            &self,
+            name: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<TrustedLuaManagedTranslationCollection>,
+                            TrustedLuaHostCallError,
+                        >,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            self.observations
+                .lock()
+                .expect("测试记录锁不应中毒")
+                .managed_open_names
+                .push(name.clone());
+            Box::pin(async move {
+                if name == "missing" {
+                    Ok(None)
+                } else {
+                    Ok(Some(test_managed_collection(name)))
+                }
+            })
+        }
+
         fn read_output(
             &self,
             path: ScopedDirectoryPath,
@@ -4629,7 +5529,7 @@ ctx.extract.replace_standard({
 
         {
             let observations = observations.lock().expect("测试观察锁不应中毒");
-            let [TrustedLuaExtractIntent::Replace(snapshot)] =
+            let [TrustedLuaStandardExtractIntent::Replace(snapshot)] =
                 observations.extract_intents.as_slice()
             else {
                 panic!("Runtime 应只记录一次 Replace 意图")
@@ -4656,6 +5556,266 @@ ctx.extract.replace_standard({
                 &crate::rpg_maker::model::TextUnitContent::Value("<Help:恢复 HP>".to_owned())
             );
         }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extract_managed_translations_parse_all_shapes_and_lossless_metadata() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let observations = Arc::new(Mutex::new(TestObservations::default()));
+        run_extract_program(
+            &runtime,
+            Arc::clone(&observations),
+            r#"
+ctx.extract.replace_standard({})
+ctx.translations.replace({
+  {
+    name = "quest_titles",
+    instruction = "翻译任务标题；保持简洁。",
+    units = {
+      {
+        key = "single",
+        kind = "plugin_parameter",
+        shape = "single",
+        original = "星港へ",
+        context = "任务标题",
+        metadata = ctx.json.object({
+          z = ctx.json.number("1e999"),
+          quest_id = 12,
+          nested = ctx.json.object({tag = "main"}),
+        }),
+      },
+      {
+        key = "reflow",
+        kind = "plugin_parameter",
+        shape = "reflow",
+        original = "長い説明",
+        context = "",
+        metadata = ctx.json.array({true, "tag"}),
+      },
+      {
+        key = "lines",
+        kind = "map",
+        shape = "lines",
+        original = {"第一行", ""},
+        context = "",
+        metadata = "scalar",
+      },
+      {
+        key = "items",
+        kind = "choices",
+        shape = "items",
+        original = {"はい", "いいえ"},
+        context = "",
+        metadata = ctx.json.NULL,
+      },
+    },
+  },
+})
+"#,
+        )
+        .await
+        .expect("四种托管 shape 和显式 JSON metadata 应被完整解析");
+
+        {
+            let observations = observations.lock().expect("测试观察锁不应中毒");
+            assert!(matches!(
+                observations.extract_intents.as_slice(),
+                [TrustedLuaStandardExtractIntent::Replace(snapshot)] if snapshot.groups().is_empty()
+            ));
+            let [snapshot] = observations.managed_snapshots.as_slice() else {
+                panic!("Runtime 应只记录一次 managed Replace 意图")
+            };
+            let [collection] = snapshot.collections() else {
+                panic!("测试快照应包含一个 collection")
+            };
+            assert_eq!(collection.name(), "quest_titles");
+            assert_eq!(collection.instruction(), "翻译任务标题；保持简洁。");
+            assert_eq!(collection.units().len(), 4);
+            assert_eq!(
+                collection.units()[0].metadata_json(),
+                Some(r#"{"nested":{"tag":"main"},"quest_id":12,"z":1e999}"#)
+            );
+            assert_eq!(
+                collection.units()[0].original(),
+                &TrustedLuaManagedTranslationContent::scalar("星港へ")
+            );
+            assert_eq!(
+                collection.units()[1].shape(),
+                TrustedLuaManagedTranslationShape::Reflow
+            );
+            assert_eq!(
+                collection.units()[1].metadata_json(),
+                Some(r#"[true,"tag"]"#)
+            );
+            assert_eq!(
+                collection.units()[2].original(),
+                &TrustedLuaManagedTranslationContent::array(vec![
+                    "第一行".to_owned(),
+                    String::new(),
+                ])
+            );
+            assert_eq!(collection.units()[2].metadata_json(), Some(r#""scalar""#));
+            assert_eq!(
+                collection.units()[3].shape(),
+                TrustedLuaManagedTranslationShape::Items
+            );
+            assert_eq!(collection.units()[3].metadata_json(), Some("null"));
+        }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extract_managed_translations_reject_invalid_snapshots_before_host_calls() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let invalid_programs = [
+            r#"ctx.translations.replace({{name="a", instruction="", units={}, extra=true}})"#,
+            r#"ctx.translations.replace({[1]={name="a",instruction="",units={}},[3]={name="b",instruction="",units={}}})"#,
+            r#"ctx.translations.replace({{name="",instruction="",units={}}})"#,
+            r#"ctx.translations.replace({
+                 {name="a",instruction="",units={
+                   {key="x",kind="map",shape="unknown",original="a",context=""}
+                 }}
+               })"#,
+            r#"ctx.translations.replace({
+                 {name="a",instruction="",units={
+                   {key="x",kind="map",shape="lines",original={},context=""}
+                 }}
+               })"#,
+            r#"ctx.translations.replace({
+                 {name="a",instruction="",units={
+                   {key="x",kind="map",shape="items",original={"ok","  "},context=""}
+                 }}
+               })"#,
+            r#"ctx.translations.replace({
+                 {name="a",instruction="",units={
+                   {key="x",kind="map",shape="single",original="a",context="",metadata={value=1}}
+                 }}
+               })"#,
+            r#"ctx.translations.replace({
+                 {name="a",instruction="",units={
+                   {key="x",kind="map",shape="single",original="a",context=""},
+                   {key="x",kind="map",shape="single",original="b",context=""}
+                 }}
+               })"#,
+            r#"ctx.translations.replace({
+                 {name="a",instruction="",units={}},
+                 {name="a",instruction="",units={}}
+               })"#,
+        ];
+
+        for (index, source) in invalid_programs.into_iter().enumerate() {
+            let observations = Arc::new(Mutex::new(TestObservations::default()));
+            let error = run_extract_program(&runtime, Arc::clone(&observations), source)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    TrustedLuaRuntimeExecutionError::Binding(ref error)
+                        if error.domain() == "translations"
+                            && error.kind() == "invalid_snapshot"
+                            && error.operation() == Some("translations.replace")
+                ),
+                "无效 managed fixture {index} 的实际错误：{error}"
+            );
+            assert!(
+                observations
+                    .lock()
+                    .expect("测试观察锁不应中毒")
+                    .managed_snapshots
+                    .is_empty(),
+                "无效 managed fixture {index} 不得到达 Host"
+            );
+        }
+
+        let observations = Arc::new(Mutex::new(TestObservations::default()));
+        run_extract_program(
+            &runtime,
+            Arc::clone(&observations),
+            r#"
+ctx.translations.replace({})
+local ok, error = pcall(ctx.translations.replace, {})
+assert(not ok)
+assert(error.domain == "translations")
+assert(error.kind == "intent_already_declared")
+assert(error.operation == "translations.replace")
+"#,
+        )
+        .await
+        .expect("第二次 replace 应作为可捕获 Host 错误，而非再次调用 Host");
+        assert_eq!(
+            observations
+                .lock()
+                .expect("测试观察锁不应中毒")
+                .managed_snapshots
+                .len(),
+            1
+        );
+
+        let observations = Arc::new(Mutex::new(TestObservations::default()));
+        run_extract_program(
+            &runtime,
+            Arc::clone(&observations),
+            r#"
+local first_ok, first_error = pcall(ctx.translations.replace, 42)
+assert(not first_ok)
+assert(first_error.operation == "translations.replace")
+local second_ok, second_error = pcall(ctx.translations.replace, {})
+assert(not second_ok)
+assert(second_error.kind == "intent_already_declared")
+"#,
+        )
+        .await
+        .expect("一次非法 replace 也必须消耗本脚本唯一调用权");
+        assert!(
+            observations
+                .lock()
+                .expect("测试观察锁不应中毒")
+                .managed_snapshots
+                .is_empty()
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn translate_invalid_first_call_still_consumes_the_only_managed_call() {
+        let runtime = TrustedLua54Runtime::new(test_configuration(), Handle::current());
+        let observations = Arc::new(Mutex::new(TestObservations::default()));
+        let finalizations = Arc::new(Mutex::new(Vec::new()));
+        let report = runtime
+            .start(
+                OwnedLuaProgram::new(
+                    PathBuf::from("C:/scripts/translate-managed-once.lua"),
+                    br#"
+local first_ok, first_error = pcall(ctx.translations.translate, "unexpected")
+assert(not first_ok)
+assert(first_error.operation == "translations.translate")
+local second_ok, second_error = pcall(ctx.translations.translate)
+assert(not second_ok)
+assert(second_error.kind == "already_translated")
+"#
+                    .to_vec(),
+                ),
+                test_bindings(
+                    None,
+                    Arc::clone(&observations),
+                    Arc::clone(&finalizations),
+                    None,
+                ),
+            )
+            .await;
+        let (execution, finalization) = report.into_parts();
+        execution.expect("非法首调后的第二次调用应以可捕获错误结束");
+        finalization.expect("测试 finalizer 应成功");
+        assert_eq!(
+            observations
+                .lock()
+                .expect("测试观察锁不应中毒")
+                .managed_translate_calls,
+            0,
+            "两次调用都不得到达 Managed Host"
+        );
         runtime.shutdown().await.unwrap();
     }
 
@@ -4758,7 +5918,7 @@ ctx.extract.replace_standard({{
                 .expect("测试观察锁不应中毒")
                 .extract_intents
                 .as_slice(),
-            [TrustedLuaExtractIntent::Replace(snapshot)] if snapshot.groups().is_empty()
+            [TrustedLuaStandardExtractIntent::Replace(snapshot)] if snapshot.groups().is_empty()
         ));
 
         let clear_observations = Arc::new(Mutex::new(TestObservations::default()));
@@ -4775,7 +5935,7 @@ ctx.extract.replace_standard({{
                 .expect("测试观察锁不应中毒")
                 .extract_intents
                 .as_slice(),
-            [TrustedLuaExtractIntent::Deactivate]
+            [TrustedLuaStandardExtractIntent::Deactivate]
         );
         runtime.shutdown().await.unwrap();
     }
@@ -4802,7 +5962,7 @@ ctx.extract.replace_standard({{
                 .expect("测试观察锁不应中毒")
                 .extract_intents
                 .as_slice(),
-            [TrustedLuaExtractIntent::Deactivate]
+            [TrustedLuaStandardExtractIntent::Deactivate]
         );
 
         let forged_observations = Arc::new(Mutex::new(TestObservations::default()));
@@ -4851,6 +6011,56 @@ assert(ctx.project.target_language == "zh-Hans")
 assert(ctx.project.output_root == nil)
 assert(ctx.output == nil and ctx.write_back == nil and ctx.extract == nil)
 assert(ctx.standard == nil)
+assert(type(ctx.translations) == "table")
+local open_ok, open_error = pcall(ctx.translations.open, "quest_titles")
+assert(not open_ok)
+assert(open_error.domain == "translations")
+assert(open_error.kind == "translate_required")
+local managed_report = ctx.translations.translate()
+local managed_results = {}
+for result in managed_report:units() do
+  managed_results[#managed_results + 1] = result
+end
+assert(#managed_results == 2)
+assert(managed_results[1].collection == "quest_titles")
+assert(managed_results[1].key == "single")
+assert(managed_results[1].status == "translated")
+assert(managed_results[1].translation == "前往星港")
+assert(managed_results[1].reason == nil)
+assert(ctx.json.kind(managed_results[1].details) == "object")
+assert(managed_results[1].details.changed_locations == 2)
+assert(managed_results[2].status == "unavailable")
+assert(managed_results[2].translation == nil)
+assert(managed_results[2].reason == "placeholder_mismatch")
+local managed = ctx.translations.open("quest_titles")
+assert(managed.name == "quest_titles")
+assert(managed.instruction == "翻译任务标题；保持简洁。")
+local single = managed:get("single")
+assert(single.key == "single" and single.kind == "plugin_parameter")
+assert(single.shape == "single" and single.original == "星港へ")
+assert(single.context == "任务标题")
+assert(single.translation == "前往星港" and single.status == "current")
+assert(ctx.json.kind(single.metadata) == "object")
+assert(single.metadata.quest_id == 12 and single.metadata.tag == "main")
+local managed_units = {}
+for unit in managed:units() do managed_units[#managed_units + 1] = unit end
+assert(#managed_units == 4)
+assert(managed_units[2].shape == "reflow")
+assert(managed_units[2].translation == "很长的\n说明")
+assert(ctx.json.kind(managed_units[2].metadata) == "array")
+assert(#managed_units[2].metadata == 2 and managed_units[2].metadata[2] == "tag")
+assert(ctx.json.kind(managed_units[3].original) == "array")
+assert(#managed_units[3].original == 2 and managed_units[3].original[2] == "")
+assert(managed_units[3].metadata == "tag")
+assert(ctx.json.kind(managed_units[4].original) == "array")
+assert(managed_units[4].translation == nil and managed_units[4].status == "unavailable")
+assert(ctx.json.kind(managed_units[4].metadata) == "null")
+assert(ctx.translations.open("missing") == nil)
+local mutate_ok = pcall(function() single.translation = "伪造" end)
+assert(not mutate_ok)
+local twice_ok, twice_error = pcall(ctx.translations.translate)
+assert(not twice_ok)
+assert(twice_error.domain == "translations" and twice_error.kind == "already_translated")
 assert(ctx.translation.system_prompt == "只输出译文")
 assert(ctx.translation.language_pair.source == "ja")
 assert(ctx.translation.language_pair.target == "zh-Hans")
@@ -5035,6 +6245,11 @@ ctx.db.commit()
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].role(), ChatMessageRole::User);
             assert_eq!(messages[0].content(), "hello");
+            assert_eq!(observation_guard.managed_translate_calls, 1);
+            assert_eq!(
+                observation_guard.managed_open_names,
+                ["quest_titles".to_owned(), "missing".to_owned()]
+            );
         }
         assert_eq!(*finalizations.lock().unwrap(), vec![()]);
         runtime.shutdown().await.unwrap();
@@ -5315,6 +6530,7 @@ assert(not ok and error.domain == "rpg_maker" and error.kind == "invalid_locatio
 assert(ctx.phase == "lua")
 assert(ctx.extract == nil and ctx.translation == nil and ctx.llm == nil)
 assert(ctx.output == nil and ctx.write_back == nil)
+assert(ctx.translations == nil)
 assert(type(ctx.project) == "table")
 assert(type(ctx.json) == "table")
 assert(type(ctx.source) == "table")
@@ -5748,7 +6964,7 @@ assert(error.kind == "invalid_value")
         let extract = runtime.start(
                 OwnedLuaProgram::new(
                     PathBuf::from("C:/scripts/extract.lua"),
-                    b"assert(ctx.phase == 'extract'); assert(ctx.llm == nil); assert(ctx.translation == nil); assert(ctx.output == nil); assert(ctx.write_back == nil); assert(ctx.standard == nil); assert(ctx.project.output_root == nil); assert(type(ctx.source) == 'table'); assert(type(ctx.rpg_maker) == 'table')".to_vec(),
+                    b"assert(ctx.phase == 'extract'); assert(ctx.llm == nil); assert(ctx.translation == nil); assert(ctx.output == nil); assert(ctx.write_back == nil); assert(ctx.standard == nil); assert(ctx.project.output_root == nil); assert(type(ctx.translations) == 'table'); assert(ctx.translations.translate == nil and ctx.translations.open == nil); assert(type(ctx.source) == 'table'); assert(type(ctx.rpg_maker) == 'table')".to_vec(),
                 ),
                 extract_bindings(
                     extract_calls,
@@ -5796,6 +7012,15 @@ assert(ctx.standard == nil)
 assert(ctx.project.output_root == 'C:/projects/demo/write_back')
 assert(type(ctx.source) == 'table' and type(ctx.rpg_maker) == 'table')
 assert(type(ctx.output) == 'table' and type(ctx.write_back) == 'table')
+assert(type(ctx.translations) == 'table')
+assert(ctx.translations.translate == nil and ctx.translations.replace == nil)
+local managed = ctx.translations.open('quest_titles')
+assert(managed.name == 'quest_titles')
+assert(managed:get('single').translation == '前往星港')
+assert(ctx.json.kind(managed:get('reflow').metadata) == 'array')
+assert(managed:get('lines').metadata == 'tag')
+assert(ctx.json.kind(managed:get('items').metadata) == 'null')
+assert(ctx.translations.open('missing') == nil)
 
 assert(ctx.output.read('data/raw.bin') == string.char(0, 255, 1))
 assert(ctx.output.read_text('data/text.txt') == '文本')
@@ -5875,6 +7100,10 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
                     TrustedLuaWriteBackLayoutPair::new("原文".to_owned(), Some("译文".to_owned()),),
                     TrustedLuaWriteBackLayoutPair::new("冻结原文".to_owned(), None),
                 ]
+            );
+            assert_eq!(
+                write_back_observations.managed_open_names,
+                ["quest_titles".to_owned(), "missing".to_owned()]
             );
         }
         assert_eq!(*finalizations.lock().unwrap(), vec![(), ()]);
@@ -6116,7 +7345,7 @@ assert(string.find(loader, "D800", 1, true) ~= nil)
 
     #[derive(Default)]
     struct DocumentedExampleObservations {
-        extract_intents: Vec<TrustedLuaExtractIntent>,
+        extract_intents: Vec<TrustedLuaStandardExtractIntent>,
         llm_requests: usize,
     }
 
@@ -6292,7 +7521,7 @@ assert(string.find(loader, "D800", 1, true) ~= nil)
                 .lock()
                 .expect("文档示例观察锁不应中毒")
                 .extract_intents
-                .push(TrustedLuaExtractIntent::Replace(snapshot));
+                .push(TrustedLuaStandardExtractIntent::Replace(snapshot));
             Ok(())
         }
 
@@ -6301,7 +7530,7 @@ assert(string.find(loader, "D800", 1, true) ~= nil)
                 .lock()
                 .expect("文档示例观察锁不应中毒")
                 .extract_intents
-                .push(TrustedLuaExtractIntent::Deactivate);
+                .push(TrustedLuaStandardExtractIntent::Deactivate);
             Ok(())
         }
     }
@@ -6767,7 +7996,7 @@ assert(string.find(loader, "D800", 1, true) ~= nil)
 
         {
             let observations = observations.lock().expect("文档示例观察锁不应中毒");
-            let [TrustedLuaExtractIntent::Replace(snapshot)] =
+            let [TrustedLuaStandardExtractIntent::Replace(snapshot)] =
                 observations.extract_intents.as_slice()
             else {
                 panic!("自定义 DataFile 示例应声明一次标准快照")

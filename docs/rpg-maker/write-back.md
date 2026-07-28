@@ -1,7 +1,7 @@
 # RPG Maker 写回现行规格
 
-WriteBack 从冻结来源重建一次完整候选，把所有活动 owner 的已确认译文应用到候选，
-可选执行可信 Lua，验证后只发布一次。RPG Maker 领域当前只支持 MZ 与 MV；两者共用
+WriteBack 从冻结来源重建一次完整候选，把所有活动 Standard owner 的已确认译文应用到
+候选，可选执行可信 Lua 并由它读取 Managed 译文，验证后只发布一次。RPG Maker 领域当前只支持 MZ 与 MV；两者共用
 读取、修改、排版、复核和发布流程，差异只有工作区相对布局。
 
 ## 1. 命令与候选布局
@@ -62,6 +62,11 @@ owner 的资产快照指纹，并验证：
 姓名、局部文本和嵌套 JSON 的选择均以 Extract 时物化的 recipe 为权威。
 `standard_mutation_claim` 是必须与 recipe 相符的跨 owner 冲突摘要，不是缓存，也不能
 代替完整逻辑 Claim 重建、旧指纹复算或发布前冲突验证。
+
+Managed 快照不属于 Standard Reader，也没有自动 recipe 或 Mutation Claim。WriteBack
+Lua 调用 `ctx.translations.open` 时，Host 另行核对 `managed_translation_owner_state`
+保存的来源快照、manifest、collection/unit 结构和 translation/state 成对不变量；来源
+stale 或快照不一致时在交给脚本任何陈旧译文前失败。
 
 WriteBack Reader 与 Extract、Translate 共用同一个 group kind / role / content 结构校验：
 对话、选项、滚动文本专属组只接受各自角色，其余组只接受 Scalar；Scalar Value 保留
@@ -141,7 +146,8 @@ ScrollingText 的块级 mutation 覆盖完整 `105 + 405*`。模型必须返回�
 
 本次运行方案启用的 Lua 在 Standard 成功后运行，获得公共
 `ctx.project/json/source/rpg_maker/db`、
-候选专属 `ctx.output` 和 `ctx.write_back`；`extract`、`translation`、`llm` 为 nil。
+候选专属 `ctx.output`、`ctx.write_back` 和只读 `ctx.translations.open`；`extract`、
+`translation`、`llm` 为 nil。
 `ctx.write_back.layout` 复用 Rust 布局器。
 
 Lua 使用严格逻辑 `data/...` 与 `js/...` 访问候选；只接受 `/`，拒绝反斜杠、空段、点段、
@@ -161,6 +167,13 @@ Lua 若拥有插件私有 grammar，必须在这里重新读取并复核完整�
 状态重建完整新 Value，再通过 `ctx.output` 写回。Host 随后只验证候选目录、JSON 与
 RPG Maker 公共结构，不猜测或代替脚本验收插件 grammar。完整 `<Help:...>` 示例见
 [Lua 私有标签协议](lua-cookbook.md#5-插件标签的三阶段私有协议)。
+
+Managed collection/unit 同样不会自动修改候选。Lua 以 unit `key` 和不透明 `metadata`
+恢复自身写回关系，只消费 `status = "current"` 且 translation 非 nil 的结果，并再次
+核对它拥有的完整游戏 grammar 或多位置关系，再通过 `ctx.output` 幂等写入。缺失、
+non-applicable 或 unavailable 的处理属于脚本明确策略；Host 不自动回退到低级协议，也
+不把 Managed unit 转换成 Standard 资产。完整读取契约见
+[Lua 托管 translate/open](lua.md#72-ctxtranslationstranslateopen)。
 
 ## 6. 顶层验证、发布与完成边界
 

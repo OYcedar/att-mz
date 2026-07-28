@@ -4,11 +4,11 @@
 
 `OpenAiChatCompletionExecutor` 按所选 Client 执行非流式请求，拥有共享 HTTP 连接池、
 Client 活动请求许可、可选 RPM limiter、连接/读取/完整请求超时和实际 HTTP 协议。
-Standard 与 Translate Lua 共享同一 Client 约束。
+Standard、Managed 与低级 Translate Lua 共享同一 Client 约束。
 
-运行根只执行请求并返回结构化传输事实；Standard TaskBlock、Lua 私有业务、逐 ID 验收、
-数据库提交状态和高级任务记录均由各自语义所有者负责。Standard 的高级任务记录由
-RPG Maker 顺序最终化边界拥有；Translate Lua 不生成该记录。
+运行根只执行请求并返回结构化传输事实；Standard/Managed TaskBlock、Lua 私有业务、
+逐 ID 验收、数据库提交状态和高级任务记录均由各自语义所有者负责。Standard 与 Managed
+的高级任务记录由 RPG Maker 顺序最终化边界拥有；低级 `ctx.llm` 不生成该记录。
 
 只有 Client 的 `max_concurrent_requests` 和可选 `rate_limit` 控制请求。没有第二层用户队列、
 总容量或本地准入截止时间；等待活动许可或 RPM 时只响应取消/shutdown，不算模型失败或
@@ -49,9 +49,9 @@ HTTP 200 后要求：
 
 Retryable 包含 DNS/连接/发送/读取/完整请求超时或中断，以及 HTTP 408、429、500、502、
 503、504。`Retry-After` 支持秒数和 HTTP-date，并受 Client `max_retry_after_ms` 约束。
-Standard 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。
+Standard 与 Managed 按 Client `retry_delays_ms` 执行有限重试；本地等待不消耗重试次数。
 运行根向调用方提供 HTTP 状态、供应商稳定 code/type、`Retry-After` 和结构化原因，
-使 Standard 能把多次逻辑 attempt 汇总到同一任务记录；它不提供原始 Header 或任意
+使调用方能把多次逻辑 attempt 汇总到同一任务记录；它不提供原始 Header 或任意
 非 200 wire body。
 
 Fatal 包含请求构造、TLS/证书、其他 HTTP 状态，以及 200 响应不满足成功信封。安全诊断
@@ -73,7 +73,7 @@ Provider 正文和普通用户内容不因内容类别成为敏感信息。任�
 对象、HTTP 状态、超时种类和状态影响等稳定摘要，不复制完整请求、响应或 Header。这是
 运行根职责、稳定 schema、控制字符和输出体积边界，不构成新的敏感性分类。
 
-Standard 任务记录使用实际选中的 Endpoint、Model、parameters 和最终消息，并在所有
+翻译任务记录使用实际选中的 Endpoint、Model、parameters 和最终消息，并在所有
 可读字段中递归应用同一个闭集替换器。Endpoint query、自定义参数键和值、System、User、
 输入历史 Assistant、Thinking、输出 Assistant、Provider 标识和任务诊断中的每个精确
 匹配片段都替换为：
@@ -86,4 +86,4 @@ Standard 任务记录使用实际选中的 Endpoint、Model、parameters 和最�
 二次处理。配置中的 API key 字段本身完全不进入任务记录；任务记录不采集 Header、
 Provider 外层信封或非 200 原始 body。`Authorization` 是字段与认证方案，不是另一类
 敏感信息；诊断需要说明认证事实时只保留字段名和方案。任务记录的其余格式契约见
-[Standard 翻译任务记录现行规格](../rpg-maker/task-records.md)。
+[翻译任务记录现行规格](../rpg-maker/task-records.md)。
