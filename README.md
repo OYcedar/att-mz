@@ -9,9 +9,6 @@ ATT 以原游戏之外的项目工作区保存冻结来源、项目事实、提�
 
 ## 知识入口
 
-- **执行 RPG Maker 汉化**：使用
-  [translate-rpg-maker-with-att Skill](skills/translate-rpg-maker-with-att/SKILL.md)，
-  根据游戏与项目的真实状态调查、执行、续作、诊断和验证。
 - **查询当前产品事实**：从[ATT 文档总入口](docs/README.md)进入现行规格、调查指南与
   工件验证方法。
 - **开发 ATT**：先读[项目长期方向与知识治理契约](AGENTS.md)，再以现行规格、代码和
