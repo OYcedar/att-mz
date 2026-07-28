@@ -1,9 +1,9 @@
 # ATT 生产配置现行规格
 
-仓库根目录的 [`config.example.toml`](../../config.example.toml) 是当前版本唯一示例。
-配置只表达操作者真正能够选择的路径、Prompt、语言、模型服务、业务 Profile 和可读
-翻译任务记录开关；线程、队列、批次、SQLite 持久策略、日志缓冲以及文件、Lua、SQLite、
-Claim、Unit、Group、Task 总量都不是配置项。
+ATT 发布目录中的 `config.toml` 是当前版本可直接编辑的完整起始配置。配置只表达操作者
+真正能够选择的路径、Prompt、语言、模型服务、业务 Profile 和可读翻译任务记录开关；
+线程、队列、批次、SQLite 持久策略、日志缓冲以及文件、Lua、SQLite、Claim、Unit、
+Group、Task 总量都不是配置项。
 
 ## 1. 读取与严格边界
 
