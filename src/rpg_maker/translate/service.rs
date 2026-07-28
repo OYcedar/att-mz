@@ -166,6 +166,7 @@ where
                     &project,
                     execution.profile.shared_llm_client(),
                     semantics,
+                    standard_report.total_tasks(),
                     selected_lua.program().clone(),
                 )
                 .await
@@ -433,6 +434,7 @@ mod tests {
             project: &OpenedProject,
             llm_client: Arc<Self::Client>,
             semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+            _standard_task_count: usize,
             program: crate::rpg_maker::lua::runtime::OwnedLuaProgram,
         ) -> Result<OperationCompletion<()>, Self::Error> {
             assert!(Arc::ptr_eq(&llm_client, &self.expected_client));

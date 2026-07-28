@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use self::runtime::OwnedLuaProgram;
 use self::runtime::TrustedLuaExtractIntent;
+use self::runtime::TrustedLuaManagedTranslateHostCalls;
+use self::runtime::TrustedLuaManagedTranslationReader;
 use self::runtime::TrustedLuaStandardHostCalls;
 use self::runtime::TrustedLuaTranslationSemantics;
 use self::runtime::TrustedLuaWriteBackHostCalls;
@@ -18,7 +20,6 @@ use crate::rpg_maker::RpgMakerEngine;
 pub(crate) mod directory_cache;
 pub(crate) mod document;
 pub(crate) mod hosting;
-pub(crate) mod json;
 pub(crate) mod lua54;
 pub(crate) mod runtime;
 
@@ -265,11 +266,13 @@ pub(crate) enum LuaInvocation<C> {
         project: LuaProjectContext,
         llm_client: Arc<C>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+        managed: Arc<dyn TrustedLuaManagedTranslateHostCalls>,
     },
     WriteBack {
         program: OwnedLuaProgram,
         project: LuaProjectContext,
         calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
+        managed: Arc<dyn TrustedLuaManagedTranslationReader>,
     },
     Project {
         program: OwnedLuaProgram,
@@ -289,12 +292,14 @@ impl<C> LuaInvocation<C> {
         project: LuaProjectContext,
         llm_client: Arc<C>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+        managed: Arc<dyn TrustedLuaManagedTranslateHostCalls>,
     ) -> Self {
         Self::Translate {
             program,
             project,
             llm_client,
             semantics,
+            managed,
         }
     }
 
@@ -302,11 +307,13 @@ impl<C> LuaInvocation<C> {
         program: OwnedLuaProgram,
         project: LuaProjectContext,
         calls: Arc<dyn TrustedLuaWriteBackHostCalls>,
+        managed: Arc<dyn TrustedLuaManagedTranslationReader>,
     ) -> Self {
         Self::WriteBack {
             program,
             project,
             calls,
+            managed,
         }
     }
 

@@ -5,6 +5,9 @@
 和假 LLM；本页的短代码只解释关键不变量。
 
 代码块分类沿用 [Lua 技术参考](lua.md)的 `att-example` 标记。
+本页现有模式重点展示 Standard 接入和低级私有协议；能够表达为独立 collection/unit 的
+新脚本应先使用 [`ctx.translations`](lua.md#62-ctxtranslationsreplace)，只有高级契约无法
+表达私有 grammar、跨 unit 原子关系或特殊模型协议时再采用这里的低级三阶段模式。
 
 声明式文件也提供生产解析器直接读取的完整样本：
 [MV 姓名](examples/mv-dialogue.toml)、
@@ -17,7 +20,8 @@
 
 适用条件：每个语义字段就是一个完整 Value，且 source×kind×location
 满足 [replace_standard 矩阵](lua.md#6-extractreplace_standard)。跨文档、多目标不要硬塞进
-这个接口，直接跳到第 6 节；需要自行解释插件标签 grammar 时参见第 5 节。
+这个接口；能拆成独立原子 unit 时使用 `ctx.translations`，必须共同原子提交时再跳到第
+6 节；需要自行解释插件标签 grammar 时参见第 5 节。
 
 完整脚本：[lua-standard-data-file.lua](examples/lua-standard-data-file.lua)。它：
 

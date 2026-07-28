@@ -106,13 +106,14 @@ ar  zh-Hans  zh-Hant  en  fr  ru  es  ja  ko  vi
 完整 owner 集合，并提示例如“未提供提取范围，已沿用上次成功方案：Builtin、Rules”。
 项目尚无保存方案时省略全部 owner 是输入错误。
 
-只要显式提供任一 owner，本次显式集合就精确替换旧集合：未列出的 owner 本次不执行，
-也不会仅因未列出而删除其既有资产。以下输入承担明确的清除语义：
+只要显式提供任一 owner，本次显式集合就精确替换旧集合：未列出的 Builtin/Rules 本次
+不执行且保留既有资产；未列出的 Lua 从新方案移除，并停用 Lua Standard 与 Managed
+owner。以下输入承担明确的清除语义：
 
 - Rules 文件的 canonical 内容为 `rule = []` 时，停用 Rules owner，并从以后自动复用的
   Extract 方案中移除 Rules；
-- 零字节 Extract Lua 文件不执行程序，停用 Lua owner、删除该 owner 的标准资产，并清除
-  Extract 阶段 Lua 程序；
+- 显式方案未列出 Lua，或零字节 Extract Lua 文件不执行程序，停用 Lua owner、删除该
+  owner 的 Standard 与 Managed 快照，并清除 Extract 阶段 Lua 程序；
 - 清除后没有任何可执行 owner 时删除保存的 Extract 方案；本次清除可以成功，但下一次
   无参数 Extract 会报告“尚无可复用方案”。
 
@@ -138,8 +139,9 @@ Translate 还会严格消费 `[prompts]` 的 `root`、`locale` 和 `thinking_out
 `ModelResponseUnusable`，不会作为网络错误重试。
 
 Translate 同时消费 `[rpg_maker]` 中可省略的 `record_translation_tasks`，默认 `false`。
-启用时，每个已启动的 Standard TaskBlock 在同一 RunId 下生成一份人类可读任务记录，
-同一任务的全部重试、输入输出、验收和提交终态归入该文件。Translate Lua 不生成任务
+启用时，每个已启动的 Standard 或 `ctx.translations.translate()` Managed TaskBlock 在同一
+RunId 下生成一份人类可读任务记录，同一任务的全部重试、输入输出、验收和提交终态归入
+该文件；Standard 编号在前，Managed 随后继续 run-wide ordinal。低级 `ctx.llm` 不生成
 记录；该开关不进入翻译 state、保存方案或项目数据库。本次 RunId 无法建立时，JSONL 与
 任务记录同时禁用，只呈现一次项目日志降级诊断，命令继续执行。
 
@@ -305,7 +307,7 @@ MZ 只接受顶层同时包含 `data/`、`js/` 和 `js/rmmz_core.js` 的游戏�
 Extract、Translate 或 WriteBack 正在执行 Lua 时同时请求该阶段 Lua Runtime 合作取消，Host 先回滚未闭合
 的交互事务，WriteBack 再 discard 尚未发布的完整候选。
 若信号到达后业务仍自然完整完成，则归入成功路径，必要收尾后照常保存方案并完整呈现
-结果。普通项目日志故障不会改变取消与收尾次序。Translate 停止启动新的 Standard 任务；
+结果。普通项目日志故障不会改变取消与收尾次序。Translate 停止启动新的 Standard/Managed 任务；
 每个已发出 `TaskStarted` 的任务仍返回顺序最终化边界，并在文件系统 shutdown 前形成
 已提交、未提交或已取消的明确任务记录终态。没有启动的任务不生成记录。
 
@@ -319,12 +321,12 @@ Extract、Translate 或 WriteBack 正在执行 Lua 时同时请求该阶段 Lua 
 存在具体根因时继续显示路径、具体操作和清理后的底层原因，但不改变原本的成功、失败或
 取消退出码。详细契约见[普通项目日志](project-log.md)。
 
-启用 `rpg_maker.record_translation_tasks` 时，Standard 任务记录写入
+启用 `rpg_maker.record_translation_tasks` 时，Standard 与 Managed 任务记录写入
 `task-records/<run-id>/task-000001.md`。它与普通 JSONL 一样是可降级、非权威的
 可观测性旁路，但提供单任务的完整可读上下文；缺失记录不证明没有调用，记录故障也不
 改变原业务结果、项目状态、后续任务或退出码。任务记录与 JSONL 分别计数、分别在终态
 至多显示一次降级横幅；一类故障不能覆盖另一类诊断。完整契约见
-[Standard 翻译任务记录现行规格](../rpg-maker/task-records.md)。
+[翻译任务记录现行规格](../rpg-maker/task-records.md)。
 
 项目日志建立后的命令 panic 由命令边界转换成 `internal.operation` 安全诊断：CLI 与
 JSONL 都显示实际命令阶段、项目工作区、日志路径和 `outcome_unknown` 影响，绝不显示

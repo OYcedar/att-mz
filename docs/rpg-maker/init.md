@@ -99,7 +99,11 @@ reparse point、名称碰撞、读取中对象身份变化和资源超限；硬�
   保留自然顺序最早的 group 代表；
 - `standard_translation_resource`：术语与自定义占位符的 canonical JSON；
 - `standard_project_definition`：活动 MV 对话定义的 canonical JSON。MZ 使用同一结构，
-  但不消费 MV 姓名投影。
+  但不消费 MV 姓名投影；
+- `managed_translation_owner_state`：Lua Managed owner 的来源快照与 manifest 指纹；
+- `managed_translation_collection`：collection 名称、连续自然顺序与 instruction；
+- `managed_translation_unit`：collection 内 unit key、连续自然顺序、kind、shape、原文、
+  context、可选 metadata JSON 值以及成对译文/state；
 - `init_run_plan`：上次成功 Init 的无损 Windows 来源路径；
 - `extract_run_plan` 与 `extract_rules_definition`：上次成功 Extract 的完整 owner 集合和
   已验证 Rules canonical 语义；
@@ -132,9 +136,10 @@ READ_ONLY 连接和同一个显式只读事务中按上述自然顺序读取。�
 WAL 提交，检查也不会拼接不同时点的项目事实；后续对账仍以快照中的精确 schema version
 和领域事实执行 CAS。
 
-来源变化保留既有 owner 快照与译文，直到下一次对应 Extract 用当前来源原子替换；语言
-对变化清除所有标准译文与 state，并把术语表重置为空，保留占位符定义。布局宽度变化
-只更新 metadata。
+来源变化保留既有 Standard/Managed owner 快照与译文，直到下一次对应 Extract 用当前
+来源原子替换；其间 Translate 与 WriteBack 依据 owner 来源指纹明确报告 stale。语言对
+变化清除所有 Standard/Managed 译文与 state，并把术语表重置为空，保留占位符定义。
+布局宽度变化只更新 metadata。
 
 ## 4. 发布与完成边界
 

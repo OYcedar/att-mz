@@ -1,4 +1,4 @@
-//! RPG Maker Standard 与可信 Lua 共用的无深度上限 JSON 基础能力。
+//! ATT 内部共用的无深度上限 JSON 基础能力。
 //!
 //! `serde_json::Value` 仍是 Standard 业务代码的访问模型；本模块只接管会随输入嵌套
 //! 深度增长的解析、克隆、比较、序列化和析构调用栈。全部遍历使用显式堆栈，避免在
@@ -11,7 +11,7 @@ use std::ops::{Deref, DerefMut};
 use serde_json::{Map, Value};
 
 use crate::json_diagnostic::JsonErrorCategory;
-use crate::rpg_maker::lua::json::{
+use crate::lossless_json::{
     JsonValueDecodeError, LosslessJsonError, decode_value, drop_serde_value,
 };
 

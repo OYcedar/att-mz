@@ -22,6 +22,9 @@ use crate::rpg_maker::location_codec::{
     RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
     RpgMakerProjectionCodecError,
 };
+use crate::rpg_maker::managed_translation::{
+    ManagedTranslationSnapshot, ManagedTranslationSnapshotMutation,
+};
 use crate::rpg_maker::model::{MutationResourceAccess, TextUnitRole};
 #[cfg(test)]
 use crate::rpg_maker::mutation_claim_summary::collision_summary;
@@ -47,9 +50,12 @@ use crate::storage::sqlite::{
     SqliteTransactionStep, SqliteValue,
 };
 
-use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, LuaSnapshot, RulesSnapshot};
+#[cfg(test)]
+use super::super::model::LuaSnapshot;
+use super::super::model::{BuiltinSnapshot, ExtractedTextGroup, RulesSnapshot};
 use super::{
-    BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore, LuaSnapshotStore, RulesSnapshotStore,
+    BuiltinProjectDefinitionUpdate, BuiltinSnapshotStore, LuaSnapshotStore,
+    LuaStandardSnapshotMutation, RulesSnapshotStore,
 };
 
 const INSERT_CLAIM_PREFIX: &str = r#"INSERT INTO standard_mutation_claim (
@@ -280,14 +286,16 @@ where
     S: SqliteQueryExecutor + SqliteTransactionExecutor<Error = <S as SqliteQueryExecutor>::Error>,
     C: CpuTaskExecutor,
 {
-    async fn replace(
+    async fn prepare_replace(
         &self,
         project: &OpenedProject,
         owner: RpgMakerStandardAssetOwner,
         groups: Vec<ExtractedTextGroup>,
         project_definition_update: Option<BuiltinProjectDefinitionUpdate>,
-    ) -> Result<(), RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>>
-    {
+    ) -> Result<
+        Option<Vec<SqliteTransactionStep>>,
+        RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>,
+    > {
         let ordered_groups = groups.into_iter().enumerate().collect::<Vec<_>>();
         let batches = self
             .cpu
@@ -364,7 +372,7 @@ where
                 .await
                 .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
             if snapshot_is_current {
-                return Ok(());
+                return Ok(None);
             }
             (encoded_snapshot, current.units)
         } else {
@@ -384,10 +392,10 @@ where
             )
             .await?;
         let replacement = project_definition.and_then(|definition| definition.replacement);
-        let plan = self
+        let steps = self
             .cpu
             .execute(move || {
-                build_transaction_plan(
+                build_transaction_steps(
                     owner,
                     source_snapshot_fingerprint,
                     encoded,
@@ -398,8 +406,26 @@ where
             })
             .await
             .map_err(RpgMakerExtractionAssetStoreError::ScheduleEncoding)?;
+        Ok(Some(steps))
+    }
+
+    async fn replace(
+        &self,
+        project: &OpenedProject,
+        owner: RpgMakerStandardAssetOwner,
+        groups: Vec<ExtractedTextGroup>,
+        project_definition_update: Option<BuiltinProjectDefinitionUpdate>,
+    ) -> Result<(), RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>>
+    {
+        let Some(steps) = self
+            .prepare_replace(project, owner, groups, project_definition_update)
+            .await?
+        else {
+            return Ok(());
+        };
+        let database_path = project.database_path().to_path_buf();
         self.sqlite
-            .execute_transaction(database_path.clone(), plan)
+            .execute_transaction(database_path.clone(), SqliteTransactionPlan::new(steps))
             .await
             .map_err(|error| map_persist_error(database_path, error))?;
         Ok(())
@@ -636,23 +662,67 @@ where
 {
     type Error = RpgMakerExtractionAssetStoreError<C::Error, <S as SqliteQueryExecutor>::Error>;
 
-    async fn replace_lua(
+    async fn apply_lua(
         &self,
         project: &OpenedProject,
-        snapshot: LuaSnapshot,
+        standard: Option<LuaStandardSnapshotMutation>,
+        managed: Option<ManagedTranslationSnapshot>,
     ) -> Result<(), Self::Error> {
-        self.replace(
-            project,
-            RpgMakerStandardAssetOwner::Lua,
-            snapshot.into_groups(),
-            None,
-        )
-        .await
+        let mut steps = match standard {
+            None => Vec::new(),
+            Some(LuaStandardSnapshotMutation::Replace(snapshot)) => self
+                .prepare_replace(
+                    project,
+                    RpgMakerStandardAssetOwner::Lua,
+                    snapshot.into_groups(),
+                    None,
+                )
+                .await?
+                .unwrap_or_default(),
+            Some(LuaStandardSnapshotMutation::Deactivate) => {
+                let database_path = project.database_path().to_path_buf();
+                if self
+                    .read_owner_state(database_path, RpgMakerStandardAssetOwner::Lua)
+                    .await?
+                    .is_empty()
+                {
+                    Vec::new()
+                } else {
+                    vec![execute(
+                        DEACTIVATE_OWNER,
+                        vec![text(RpgMakerStandardAssetOwner::Lua.storage_name())],
+                    )]
+                }
+            }
+        };
+        if let Some(snapshot) = managed {
+            steps.extend(ManagedTranslationSnapshotMutation::replace(&snapshot).into_steps());
+        }
+        if steps.is_empty() {
+            return Ok(());
+        }
+
+        let database_path = project.database_path().to_path_buf();
+        self.sqlite
+            .execute_transaction(database_path.clone(), SqliteTransactionPlan::new(steps))
+            .await
+            .map_err(|error| map_persist_error(database_path, error))
     }
 
     async fn deactivate_lua(&self, project: &OpenedProject) -> Result<(), Self::Error> {
-        self.deactivate(project, RpgMakerStandardAssetOwner::Lua)
+        let mut steps = vec![execute(
+            DEACTIVATE_OWNER,
+            vec![text(RpgMakerStandardAssetOwner::Lua.storage_name())],
+        )];
+        steps.extend(
+            ManagedTranslationSnapshotMutation::deactivate(project.source_snapshot_fingerprint())
+                .into_steps(),
+        );
+        let database_path = project.database_path().to_path_buf();
+        self.sqlite
+            .execute_transaction(database_path.clone(), SqliteTransactionPlan::new(steps))
             .await
+            .map_err(|error| map_persist_error(database_path, error))
     }
 }
 
@@ -688,6 +758,9 @@ pub(crate) enum RpgMakerExtractionAssetStoreError<C, S> {
     MutationClaimConflict {
         database_path: PathBuf,
         conflict: MutationClaimConflictDetails,
+    },
+    ConcurrentModification {
+        database_path: PathBuf,
     },
     MutationClaimConflictOutcomeUnknown {
         database_path: PathBuf,
@@ -779,6 +852,11 @@ where
                 conflict.current_group_location,
                 conflict.current_access.storage_name(),
             ),
+            Self::ConcurrentModification { database_path } => write!(
+                formatter,
+                "Lua 提取提交前项目来源已经改变，事务未应用：{}",
+                database_path.display()
+            ),
             Self::InvalidMutationClaimConflictRow {
                 database_path,
                 source,
@@ -854,7 +932,8 @@ where
             | Self::OutcomeUnknown { source, .. } => Some(source),
             Self::DatabaseNotFound { .. }
             | Self::UnexpectedSnapshotQueryResultCount { .. }
-            | Self::MutationClaimConflict { .. } => None,
+            | Self::MutationClaimConflict { .. }
+            | Self::ConcurrentModification { .. } => None,
         }
     }
 }
@@ -971,6 +1050,18 @@ where
                 "current_access={}",
                 conflict.current_access.storage_name()
             )))
+            .with_recovery(RecoveryFact::transaction("rolled_back")),
+            Self::ConcurrentModification { database_path } => SafeDiagnostic::new(
+                DiagnosticCode::ProjectState,
+                stage,
+                DiagnosticSubject::path(database_path),
+                DiagnosticReason::failure(DiagnosticFailureKind::StateMismatch),
+                DiagnosticImpact::Unchanged,
+                DiagnosticAction::Retry,
+            )
+            .with_recovery(RecoveryFact::component(
+                "operation=commit_lua_extract_snapshot",
+            ))
             .with_recovery(RecoveryFact::transaction("rolled_back")),
             Self::InvalidMutationClaimConflictRow {
                 database_path,
@@ -1225,7 +1316,6 @@ impl Error for MutationClaimConflictEvidence {}
 
 #[derive(Debug)]
 pub(crate) enum MutationClaimConflictRowError {
-    MissingDiagnosticRow,
     UnexpectedQueryId,
     ColumnCount {
         actual: usize,
@@ -1254,7 +1344,6 @@ pub(crate) enum MutationClaimConflictRowError {
 impl MutationClaimConflictRowError {
     fn safe_detail(&self) -> String {
         match self {
-            Self::MissingDiagnosticRow => "missing_conflict_diagnostic_row".to_owned(),
             Self::UnexpectedQueryId => "unexpected_conflict_query_id".to_owned(),
             Self::ColumnCount { actual } => {
                 format!("conflict_row_expected_columns=7, actual_columns={actual}")
@@ -2084,14 +2173,33 @@ fn asset_snapshot_fingerprint(
     AssetSnapshotFingerprint::from_bytes(builder.finish().into_bytes())
 }
 
+#[cfg(test)]
 fn build_transaction_plan(
+    owner: RpgMakerStandardAssetOwner,
+    source_snapshot_fingerprint: [u8; 32],
+    snapshot: EncodedSnapshot,
+    previous_unit_rows: Vec<SqliteRow>,
+    project_definition_replacement: Option<String>,
+    claim_index_maintenance: ClaimIndexMaintenance,
+) -> SqliteTransactionPlan {
+    SqliteTransactionPlan::new(build_transaction_steps(
+        owner,
+        source_snapshot_fingerprint,
+        snapshot,
+        previous_unit_rows,
+        project_definition_replacement,
+        claim_index_maintenance,
+    ))
+}
+
+fn build_transaction_steps(
     owner: RpgMakerStandardAssetOwner,
     source_snapshot_fingerprint: [u8; 32],
     mut snapshot: EncodedSnapshot,
     previous_unit_rows: Vec<SqliteRow>,
     project_definition_replacement: Option<String>,
     claim_index_maintenance: ClaimIndexMaintenance,
-) -> SqliteTransactionPlan {
+) -> Vec<SqliteTransactionStep> {
     snapshot.inherit_translations(previous_unit_rows);
     snapshot.prepare_physical_write_order(claim_index_maintenance);
     let EncodedSnapshot {
@@ -2236,7 +2344,7 @@ fn build_transaction_plan(
             ),
         ));
     }
-    SqliteTransactionPlan::new(steps)
+    steps
 }
 
 fn decode_claim_index_maintenance(
@@ -2327,10 +2435,7 @@ fn map_persist_error<C, S>(
             RpgMakerExtractionAssetStoreError::DatabaseNotFound { database_path }
         }
         ExecuteTransactionError::RequirementFailed => {
-            RpgMakerExtractionAssetStoreError::InvalidMutationClaimConflictRow {
-                database_path,
-                source: MutationClaimConflictRowError::MissingDiagnosticRow,
-            }
+            RpgMakerExtractionAssetStoreError::ConcurrentModification { database_path }
         }
         ExecuteTransactionError::RequirementFailedWithRow { query_id, row } => {
             if query_id != "extract.mutation_claim_conflict" {
@@ -2532,6 +2637,10 @@ mod tests {
     use crate::rpg_maker::ProjectName;
     use crate::rpg_maker::extract::model::{
         ExtractedTextUnit, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
+    };
+    use crate::rpg_maker::managed_translation::{
+        ManagedTranslationCollection, ManagedTranslationContent, ManagedTranslationShape,
+        ManagedTranslationUnit,
     };
     use crate::rpg_maker::model::{
         DirectTextPart, DirectTextRecipe, MutationClaim, ScalarFieldKey, TextProjectionRecipe,
@@ -4501,9 +4610,13 @@ mod tests {
             let harness = Harness::new(Some(response));
             let error = harness
                 .service()
-                .replace_lua(
+                .apply_lua(
                     &project(),
-                    LuaSnapshot::new(vec![scalar_group(1, "name", "原文")]).expect("快照应合法"),
+                    Some(LuaStandardSnapshotMutation::Replace(
+                        LuaSnapshot::new(vec![scalar_group(1, "name", "原文")])
+                            .expect("快照应合法"),
+                    )),
+                    None,
                 )
                 .await
                 .expect_err("预设的事务终态必须返回");
@@ -4521,6 +4634,207 @@ mod tests {
                 )
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn lua_standard_and_managed_snapshots_share_exactly_one_transaction_plan() {
+        let harness = Harness::new(None);
+        let project = project();
+        let managed = managed_snapshot(&project);
+
+        harness
+            .service()
+            .apply_lua(
+                &project,
+                Some(LuaStandardSnapshotMutation::Replace(
+                    LuaSnapshot::new(vec![scalar_group(1, "name", "原文")])
+                        .expect("标准快照应合法"),
+                )),
+                Some(managed),
+            )
+            .await
+            .expect("两个 Lua 域应原子提交");
+
+        let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
+        assert_eq!(plans.len(), 1, "两个域不得串行提交两个事务");
+        let statements = plan_statements(&plans[0].1);
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.contains("standard_asset_owner_state"))
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.contains("managed_translation_owner_state"))
+        );
+        let standard_step = statements
+            .iter()
+            .position(|statement| statement.contains("standard_asset_owner_state"))
+            .expect("计划应包含 Standard owner 写入");
+        let managed_step = statements
+            .iter()
+            .position(|statement| statement.contains("managed_translation_owner_state"))
+            .expect("计划应包含 Managed owner 写入");
+        assert!(
+            standard_step < managed_step,
+            "Standard 与 Managed 步骤应保持确定的域顺序"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_only_replace_preserves_standard_domain() {
+        let harness = Harness::new(None);
+        let project = project();
+
+        harness
+            .service()
+            .apply_lua(&project, None, Some(managed_snapshot(&project)))
+            .await
+            .expect("仅 Managed replace 应成功");
+
+        assert!(
+            harness
+                .sqlite
+                .queries
+                .lock()
+                .expect("查询记录锁不应中毒")
+                .is_empty(),
+            "未声明 Standard 意图时不应读取或改写该域"
+        );
+        let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
+        assert_eq!(plans.len(), 1);
+        let statements = plan_statements(&plans[0].1);
+        assert!(
+            statements
+                .iter()
+                .all(|statement| !statement.contains("standard_asset_owner_state"))
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.contains("managed_translation_owner_state"))
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_only_replace_preserves_managed_domain() {
+        let harness = Harness::new(None);
+
+        harness
+            .service()
+            .apply_lua(
+                &project(),
+                Some(LuaStandardSnapshotMutation::Replace(
+                    LuaSnapshot::new(vec![scalar_group(1, "name", "原文")])
+                        .expect("标准快照应合法"),
+                )),
+                None,
+            )
+            .await
+            .expect("仅 Standard replace 应成功");
+
+        let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
+        assert_eq!(plans.len(), 1);
+        let statements = plan_statements(&plans[0].1);
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.contains("standard_asset_owner_state"))
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|statement| !statement.contains("managed_translation_")),
+            "未声明 Managed 意图时不得改写该域"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_lua_intents_leave_both_domains_untouched_without_a_transaction() {
+        let harness = Harness::new(None);
+
+        harness
+            .service()
+            .apply_lua(&project(), None, None)
+            .await
+            .expect("未声明任何 Lua 意图应是无副作用成功");
+
+        assert!(
+            harness
+                .sqlite
+                .queries
+                .lock()
+                .expect("查询记录锁不应中毒")
+                .is_empty()
+        );
+        assert!(
+            harness
+                .sqlite
+                .plans
+                .lock()
+                .expect("事务记录锁不应中毒")
+                .is_empty(),
+            "未声明任何 Lua 意图时不得创建事务"
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivating_an_absent_standard_lua_owner_does_not_create_a_write_transaction() {
+        let harness = Harness::new(None);
+
+        harness
+            .service()
+            .apply_lua(
+                &project(),
+                Some(LuaStandardSnapshotMutation::Deactivate),
+                None,
+            )
+            .await
+            .expect("停用不存在的 Standard Lua owner 应是无副作用成功");
+
+        assert_eq!(
+            *harness.sqlite.queries.lock().expect("查询记录锁不应中毒"),
+            [READ_OWNER_STATE.to_owned()]
+        );
+        assert!(
+            harness
+                .sqlite
+                .plans
+                .lock()
+                .expect("事务记录锁不应中毒")
+                .is_empty(),
+            "不存在的 Standard owner 不应产生空效果 DELETE 事务"
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_deactivation_clears_both_domains_in_one_transaction() {
+        let harness = Harness::new(None);
+
+        harness
+            .service()
+            .deactivate_lua(&project())
+            .await
+            .expect("停用 Lua 应原子清除两个 owner");
+
+        let plans = harness.sqlite.plans.lock().expect("事务记录锁不应中毒");
+        assert_eq!(plans.len(), 1);
+        let statements = plan_statements(&plans[0].1);
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.contains("standard_asset_owner_state"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.contains("managed_translation_owner_state"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -5145,6 +5459,22 @@ mod tests {
             "zh-Hans".to_owned(),
             test_layout_profile(),
         )
+    }
+
+    fn managed_snapshot(project: &OpenedProject) -> ManagedTranslationSnapshot {
+        let unit = ManagedTranslationUnit::new(
+            "quest:1",
+            "plugin_parameter",
+            ManagedTranslationShape::Single,
+            ManagedTranslationContent::scalar("星港へ"),
+            "",
+            None,
+        )
+        .expect("托管单元应合法");
+        let collection = ManagedTranslationCollection::new("quests", "翻译标题", vec![unit])
+            .expect("托管 collection 应合法");
+        ManagedTranslationSnapshot::new(project.source_snapshot_fingerprint(), vec![collection])
+            .expect("托管快照应合法")
     }
 
     fn encode_test_batch(

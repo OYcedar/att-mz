@@ -15,7 +15,8 @@ use crate::execution::OperationCompletion;
 use crate::rpg_maker::lua::directory_cache::SuccessfulDirectoryListCache;
 use crate::rpg_maker::lua::hosting::TrustedLuaExecutionHostingError;
 use crate::rpg_maker::lua::runtime::{
-    OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaOutputEntry, TrustedLuaOutputEntryKind,
+    OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaManagedTranslationCollection,
+    TrustedLuaManagedTranslationReader, TrustedLuaOutputEntry, TrustedLuaOutputEntryKind,
     TrustedLuaWriteBackHostCalls, TrustedLuaWriteBackLayoutPair, TrustedLuaWriteBackLayoutRegion,
     TrustedLuaWriteBackLayoutResult, TrustedLuaWriteBackLayoutStatus,
 };
@@ -48,24 +49,81 @@ where
 }
 
 /// 在完整候选上运行可信 Lua 写回程序。
-pub(crate) struct LuaWriteBackService<H, E> {
-    host: H,
-    editor: Arc<E>,
+pub(crate) trait ManagedWriteBackTranslationReaderFactory: Send + Sync {
+    fn bind(&self, project: &OpenedProject) -> Arc<dyn TrustedLuaManagedTranslationReader>;
 }
 
-impl<H, E> LuaWriteBackService<H, E> {
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NoManagedWriteBackTranslationReaderFactory;
+
+struct UnavailableManagedWriteBackTranslationReader;
+
+impl TrustedLuaManagedTranslationReader for UnavailableManagedWriteBackTranslationReader {
+    fn open(
+        &self,
+        _name: String,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<TrustedLuaManagedTranslationCollection>,
+                        TrustedLuaHostCallError,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async {
+            Err(TrustedLuaHostCallError::new(
+                "translations",
+                "unavailable",
+                "当前 WriteBack 执行未构造托管翻译读取能力",
+                None,
+                None,
+            )
+            .with_operation("translations.open"))
+        })
+    }
+}
+
+impl ManagedWriteBackTranslationReaderFactory for NoManagedWriteBackTranslationReaderFactory {
+    fn bind(&self, _project: &OpenedProject) -> Arc<dyn TrustedLuaManagedTranslationReader> {
+        Arc::new(UnavailableManagedWriteBackTranslationReader)
+    }
+}
+
+pub(crate) struct LuaWriteBackService<H, E, M = NoManagedWriteBackTranslationReaderFactory> {
+    host: H,
+    editor: Arc<E>,
+    managed: M,
+}
+
+#[cfg(test)]
+impl<H, E> LuaWriteBackService<H, E, NoManagedWriteBackTranslationReaderFactory> {
     pub(crate) fn new(host: H, editor: E) -> Self {
         Self {
             host,
             editor: Arc::new(editor),
+            managed: NoManagedWriteBackTranslationReaderFactory,
         }
     }
 }
 
-impl<H, E, C> LuaWriteBack<C> for LuaWriteBackService<H, E>
+impl<H, E, M> LuaWriteBackService<H, E, M> {
+    pub(crate) fn with_managed(host: H, editor: E, managed: M) -> Self {
+        Self {
+            host,
+            editor: Arc::new(editor),
+            managed,
+        }
+    }
+}
+
+impl<H, E, M, C> LuaWriteBack<C> for LuaWriteBackService<H, E, M>
 where
     H: TrustedLuaExecutionHost,
     E: ScopedDirectoryEditor + 'static,
+    M: ManagedWriteBackTranslationReaderFactory,
     C: ScopedPreparedWriteBackCandidate<E::CandidateState>,
 {
     type Error = LuaWriteBackServiceError<H::Error, E::Error>;
@@ -77,6 +135,7 @@ where
         program: OwnedLuaProgram,
     ) -> impl std::future::Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send
     {
+        let managed = self.managed.bind(project);
         let prepared = if !candidate.belongs_to(project) {
             Err(LuaWriteBackServiceError::CandidateProjectMismatch {
                 project_root: project.workspace_root().to_path_buf(),
@@ -137,7 +196,7 @@ where
                     rpg_maker_layout,
                     output_directories: Arc::default(),
                 });
-            let invocation = LuaInvocation::write_back(program, project, calls);
+            let invocation = LuaInvocation::write_back(program, project, calls, managed);
             match self.host.execute(invocation).await {
                 Ok(OperationCompletion::Completed(TrustedLuaExecutionOutcome::Empty)) => {
                     Ok(OperationCompletion::Completed(()))
@@ -1512,6 +1571,7 @@ mod tests {
                 program,
                 project,
                 calls: _,
+                managed: _,
             } = invocation
             else {
                 panic!("Lua 写回服务只应提交 WriteBack 调用")
@@ -1528,7 +1588,12 @@ mod tests {
             } else if self.unexpected_outcome {
                 Ok(OperationCompletion::Completed(
                     TrustedLuaExecutionOutcome::ExtractIntent(
-                        crate::rpg_maker::lua::runtime::TrustedLuaExtractIntent::Deactivate,
+                        crate::rpg_maker::lua::runtime::TrustedLuaExtractIntent::new(
+                            Some(
+                                crate::rpg_maker::lua::runtime::TrustedLuaStandardExtractIntent::Deactivate,
+                            ),
+                            None,
+                        ),
                     ),
                 ))
             } else {

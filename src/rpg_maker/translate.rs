@@ -8,6 +8,7 @@ mod deduplication;
 pub(crate) mod executor;
 mod language_projection;
 pub(crate) mod lua;
+pub(crate) mod managed;
 pub(crate) mod placeholder;
 pub(crate) mod planner;
 pub(crate) mod planning_resource;

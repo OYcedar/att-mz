@@ -12,8 +12,21 @@ use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 
 use crate::diagnostic::SafeDiagnostic;
-use crate::fingerprint::Sha256Fingerprint;
 use crate::llm::{ChatMessage, LlmResponse};
+pub(crate) use crate::lua_host::TrustedLuaHostCallError;
+use crate::lua_host::TrustedLuaHostFuture;
+use crate::managed_translation::managed_translations_unavailable;
+pub(crate) use crate::managed_translation::{
+    TrustedLuaManagedTranslateHostCalls, TrustedLuaManagedTranslationCollection,
+    TrustedLuaManagedTranslationCollectionDeclaration, TrustedLuaManagedTranslationContent,
+    TrustedLuaManagedTranslationReader, TrustedLuaManagedTranslationReport,
+    TrustedLuaManagedTranslationResult, TrustedLuaManagedTranslationResultStatus,
+    TrustedLuaManagedTranslationShape, TrustedLuaManagedTranslationSnapshot,
+    TrustedLuaManagedTranslationUnit, TrustedLuaManagedTranslationUnitDeclaration,
+    TrustedLuaManagedTranslationUnitStatus, TrustedLuaPreparedTranslation,
+    TrustedLuaPreparedTranslationAcceptance, TrustedLuaPreparedTranslationStatus,
+    TrustedLuaTranslationTerm,
+};
 use crate::rpg_maker::extract::store::LuaSnapshot;
 use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
 use crate::rpg_maker::standard_asset::RpgMakerStandardAssetOwner;
@@ -23,7 +36,7 @@ use crate::storage::sqlite::{SqliteCommand, SqliteQuery, SqliteRow};
 
 use super::{LuaPhase, LuaProjectContext, LuaSourcePath};
 
-type HostFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+type HostFuture<T> = TrustedLuaHostFuture<T>;
 
 /// 已完整读取并可交给专用 Lua worker 的主程序。
 #[derive(Clone, Eq, PartialEq)]
@@ -74,90 +87,6 @@ impl TrustedLuaBindingFinalization {
 
     pub(crate) const fn had_unclosed_transaction(self) -> bool {
         self.had_unclosed_transaction
-    }
-}
-
-/// Lua 能通过 `pcall` 检查的 Host 错误事实。
-///
-/// `domain` 与 `kind` 是稳定的机器字段；`message` 只用于人类诊断。
-#[derive(Clone, Debug)]
-pub(crate) struct TrustedLuaHostCallError {
-    domain: &'static str,
-    kind: &'static str,
-    operation: Option<&'static str>,
-    message: String,
-    retry_after_ms: Option<u64>,
-    safe_diagnostic: Option<Box<SafeDiagnostic>>,
-    source: Option<Arc<dyn Error + Send + Sync>>,
-}
-
-impl TrustedLuaHostCallError {
-    pub(crate) fn new(
-        domain: &'static str,
-        kind: &'static str,
-        message: impl Into<String>,
-        retry_after_ms: Option<u64>,
-        source: Option<Arc<dyn Error + Send + Sync>>,
-    ) -> Self {
-        Self {
-            domain,
-            kind,
-            operation: None,
-            message: message.into(),
-            retry_after_ms,
-            safe_diagnostic: None,
-            source,
-        }
-    }
-
-    /// 补充 Lua Host 公开 API 的稳定操作名；不得放入 SQL、参数或用户正文。
-    pub(crate) fn with_operation(mut self, operation: &'static str) -> Self {
-        self.operation = Some(operation);
-        self
-    }
-
-    /// 保存错误根在仍持有类型化事实时生成的安全公开投影。
-    pub(crate) fn with_safe_diagnostic(mut self, diagnostic: SafeDiagnostic) -> Self {
-        self.safe_diagnostic = Some(Box::new(diagnostic));
-        self
-    }
-
-    pub(crate) const fn domain(&self) -> &'static str {
-        self.domain
-    }
-
-    pub(crate) const fn kind(&self) -> &'static str {
-        self.kind
-    }
-
-    pub(crate) const fn operation(&self) -> Option<&'static str> {
-        self.operation
-    }
-
-    pub(crate) fn message(&self) -> &str {
-        &self.message
-    }
-
-    pub(crate) const fn retry_after_ms(&self) -> Option<u64> {
-        self.retry_after_ms
-    }
-
-    pub(crate) fn safe_diagnostic(&self) -> Option<&SafeDiagnostic> {
-        self.safe_diagnostic.as_deref()
-    }
-}
-
-impl fmt::Display for TrustedLuaHostCallError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl Error for TrustedLuaHostCallError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn Error + 'static))
     }
 }
 
@@ -240,22 +169,58 @@ pub(crate) trait TrustedLuaCommonHostCalls: Send + Sync + 'static {
     fn transaction_active(&self) -> HostFuture<Result<bool, TrustedLuaHostCallError>>;
 }
 
-/// Lua Extract 主程序在内存中声明的唯一标准快照意图。
+/// Lua Extract 主程序在内存中声明的 Standard 快照意图。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TrustedLuaExtractIntent {
+pub(crate) enum TrustedLuaStandardExtractIntent {
     /// 以完整快照收敛 Lua owner；空快照仍表示 active。
     Replace(LuaSnapshot),
     /// 停用 Lua owner 并清除其标准资产。
     Deactivate,
 }
 
+/// 一次干净结束的 Extract 同时交付的两个独立意图。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TrustedLuaExtractIntent {
+    standard: Option<TrustedLuaStandardExtractIntent>,
+    managed: Option<TrustedLuaManagedTranslationSnapshot>,
+}
+
+impl TrustedLuaExtractIntent {
+    pub(crate) fn new(
+        standard: Option<TrustedLuaStandardExtractIntent>,
+        managed: Option<TrustedLuaManagedTranslationSnapshot>,
+    ) -> Self {
+        Self { standard, managed }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Option<TrustedLuaStandardExtractIntent>,
+        Option<TrustedLuaManagedTranslationSnapshot>,
+    ) {
+        (self.standard, self.managed)
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.standard.is_none() && self.managed.is_none()
+    }
+}
+
 /// Extract 阶段专属 Host 能力。
 ///
-/// Runtime 只把已校验的完整意图记录到内存，不在 VM 生命周期内写标准资产表。
+/// Runtime 只把已校验的完整意图记录到内存，不在 VM 生命周期内写托管资产表。
 pub(crate) trait TrustedLuaExtractHostCalls: Send + Sync + 'static {
     fn replace_standard(&self, snapshot: LuaSnapshot) -> Result<(), TrustedLuaHostCallError>;
 
     fn clear_standard(&self) -> Result<(), TrustedLuaHostCallError>;
+
+    fn replace_managed(
+        &self,
+        _snapshot: TrustedLuaManagedTranslationSnapshot,
+    ) -> Result<(), TrustedLuaHostCallError> {
+        Err(managed_translations_unavailable("translations.replace"))
+    }
 }
 
 /// Translate 阶段专属 Host 能力。
@@ -275,6 +240,20 @@ pub(crate) trait TrustedLuaTranslateHostCalls: Send + Sync + 'static {
         &self,
         messages: Vec<ChatMessage>,
     ) -> HostFuture<Result<LlmResponse, TrustedLuaHostCallError>>;
+
+    fn translate_managed(
+        &self,
+    ) -> HostFuture<Result<TrustedLuaManagedTranslationReport, TrustedLuaHostCallError>> {
+        Box::pin(async { Err(managed_translations_unavailable("translations.translate")) })
+    }
+
+    fn open_managed(
+        &self,
+        _name: String,
+    ) -> HostFuture<Result<Option<TrustedLuaManagedTranslationCollection>, TrustedLuaHostCallError>>
+    {
+        Box::pin(async { Err(managed_translations_unavailable("translations.open")) })
+    }
 }
 
 /// Standard 已解析并冻结、Lua 只借用其结果的一轮翻译语义。
@@ -291,100 +270,14 @@ pub(crate) trait TrustedLuaTranslationSemantics: Send + Sync + 'static {
         original: String,
         semantic_context: String,
     ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError>;
-}
 
-/// Translate 共享语义对一段文本完成预处理后的稳定状态。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TrustedLuaPreparedTranslationStatus {
-    Active,
-    NonSourceLanguage,
-    FullyProtected,
-}
-
-impl TrustedLuaPreparedTranslationStatus {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::NonSourceLanguage => "non_source_language",
-            Self::FullyProtected => "fully_protected",
-        }
-    }
-}
-
-/// 当前单段文本实际命中的一个有序术语对。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TrustedLuaTranslationTerm {
-    term: String,
-    translation: String,
-}
-
-impl TrustedLuaTranslationTerm {
-    pub(crate) fn new(term: impl Into<String>, translation: impl Into<String>) -> Self {
-        Self {
-            term: term.into(),
-            translation: translation.into(),
-        }
-    }
-
-    pub(crate) fn term(&self) -> &str {
-        &self.term
-    }
-
-    pub(crate) fn translation(&self) -> &str {
-        &self.translation
-    }
-}
-
-/// `PreparedText:accept` 的正常内容验收结果。
-///
-/// 内容不合格是 Lua 能继续处理的普通结果；只有共享语义本身无法执行时才返回
-/// `TrustedLuaHostCallError`。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TrustedLuaPreparedTranslationAcceptance {
-    Accepted {
-        translation: String,
-        state: Sha256Fingerprint,
-    },
-    Rejected {
-        reason: String,
-    },
-}
-
-impl TrustedLuaPreparedTranslationAcceptance {
-    pub(crate) fn accepted(translation: impl Into<String>, state: Sha256Fingerprint) -> Self {
-        Self::Accepted {
-            translation: translation.into(),
-            state,
-        }
-    }
-
-    pub(crate) fn rejected(reason: impl Into<String>) -> Self {
-        Self::Rejected {
-            reason: reason.into(),
-        }
-    }
-}
-
-/// 一个由 Translate 共享语义建立、不可由 Lua 伪造的预处理句柄。
-pub(crate) trait TrustedLuaPreparedTranslation: Send + Sync + 'static {
-    fn status(&self) -> TrustedLuaPreparedTranslationStatus;
-    fn model_text(&self) -> &str;
-    fn terms(&self) -> &[TrustedLuaTranslationTerm];
-
-    /// 只比较脚本持久化的译文与 opaque state 是否仍等于当前语义。
-    ///
-    /// `state` 已由 Lua 边界验证为当前协议的 SHA-256 文本；这里不得重新执行
-    /// `accept`，避免旧译文因新的正规化实现被反向改写或误判。
-    fn is_current(
+    /// 为 `lines` 保留物理槽边界完成同一 ID 的整体准备。
+    fn prepare_translation_lines(
         &self,
-        translation: String,
-        state: Sha256Fingerprint,
-    ) -> Result<bool, TrustedLuaHostCallError>;
-
-    fn accept(
-        &self,
-        candidate: String,
-    ) -> Result<TrustedLuaPreparedTranslationAcceptance, TrustedLuaHostCallError>;
+        kind: TextGroupKind,
+        original: Vec<String>,
+        semantic_context: String,
+    ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError>;
 }
 
 /// 独立项目 Lua 打开 Standard 人工验收会话的 Host 能力。
@@ -828,6 +721,14 @@ impl TrustedLuaWriteBackLayoutStatus {
 /// 调用面只持有已经绑定到尚未发布候选物理身份的 scope，不持有、复制或终结 Publisher
 /// token。每个异步调用返回时，该次文件操作已经到达明确终态。
 pub(crate) trait TrustedLuaWriteBackHostCalls: Send + Sync + 'static {
+    fn open_managed(
+        &self,
+        _name: String,
+    ) -> HostFuture<Result<Option<TrustedLuaManagedTranslationCollection>, TrustedLuaHostCallError>>
+    {
+        Box::pin(async { Err(managed_translations_unavailable("translations.open")) })
+    }
+
     fn read_output(
         &self,
         path: ScopedDirectoryPath,

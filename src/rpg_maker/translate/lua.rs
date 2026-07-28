@@ -12,13 +12,15 @@ use crate::execution::OperationCompletion;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::lua::runtime::{
-    OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaPreparedTranslation,
-    TrustedLuaPreparedTranslationAcceptance, TrustedLuaPreparedTranslationStatus,
-    TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
+    OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaManagedTranslateHostCalls,
+    TrustedLuaManagedTranslationCollection, TrustedLuaManagedTranslationReport,
+    TrustedLuaPreparedTranslation, TrustedLuaPreparedTranslationAcceptance,
+    TrustedLuaPreparedTranslationStatus, TrustedLuaTranslationSemantics, TrustedLuaTranslationTerm,
 };
 use crate::rpg_maker::lua::{
     LuaInvocation, LuaProjectContext, TrustedLuaExecutionHost, TrustedLuaExecutionOutcome,
 };
+use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::text::TextGroupKind;
 
@@ -30,8 +32,9 @@ use super::standard::TranslationUnitRejectionReason;
 
 /// 使用可信 Lua 程序翻译其自有数据的职责契约。
 ///
-/// Lua 翻译完整拥有自己的数据协议、事务划分、重试和幂等语义。标准翻译和顶层
-/// 翻译用例不解释 Lua 产物，也不回滚 Lua 或前序标准翻译已经提交的副作用。
+/// Lua 的低级能力继续由脚本拥有数据协议和事务语义；脚本显式采用托管翻译时，
+/// 并发、重试、协议、验收与增量提交改由绑定的 Host 能力负责。标准翻译和顶层
+/// 翻译用例不解释 Lua 私有产物，也不回滚 Lua 或前序标准翻译已经提交的副作用。
 pub(crate) trait LuaTranslation: Send + Sync {
     /// 配置边界已经选择且只供 Lua LLM 调用使用的 Client。
     type Client: Send + Sync + 'static;
@@ -44,24 +47,113 @@ pub(crate) trait LuaTranslation: Send + Sync {
         project: &OpenedProject,
         llm_client: Arc<Self::Client>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+        standard_task_count: usize,
         program: OwnedLuaProgram,
     ) -> impl Future<Output = Result<OperationCompletion<()>, Self::Error>> + Send;
 }
 
 /// 把 Translate 阶段已经建立的项目事实、公共 Client 和解析语义交给可信 Lua Host。
-pub(crate) struct LuaTranslationService<H> {
-    host: H,
+pub(crate) trait ManagedLuaTranslationFactory<C>: Send + Sync {
+    fn bind(
+        &self,
+        project: &OpenedProject,
+        llm_client: Arc<C>,
+        semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+        standard_task_count: usize,
+    ) -> Arc<dyn TrustedLuaManagedTranslateHostCalls>;
 }
 
-impl<H> LuaTranslationService<H> {
-    pub(crate) fn new(host: H) -> Self {
-        Self { host }
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NoManagedLuaTranslationFactory;
+
+struct UnavailableManagedLuaTranslationHostCalls;
+
+impl TrustedLuaManagedTranslateHostCalls for UnavailableManagedLuaTranslationHostCalls {
+    fn translate(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<TrustedLuaManagedTranslationReport, TrustedLuaHostCallError>>
+                + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async {
+            Err(TrustedLuaHostCallError::new(
+                "translations",
+                "unavailable",
+                "当前 Translate 执行未构造托管翻译能力",
+                None,
+                None,
+            )
+            .with_operation("translations.translate"))
+        })
+    }
+
+    fn open(
+        &self,
+        _name: String,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<TrustedLuaManagedTranslationCollection>,
+                        TrustedLuaHostCallError,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async {
+            Err(TrustedLuaHostCallError::new(
+                "translations",
+                "unavailable",
+                "当前 Translate 执行未构造托管翻译能力",
+                None,
+                None,
+            )
+            .with_operation("translations.open"))
+        })
     }
 }
 
-impl<H> LuaTranslation for LuaTranslationService<H>
+impl<C> ManagedLuaTranslationFactory<C> for NoManagedLuaTranslationFactory {
+    fn bind(
+        &self,
+        _project: &OpenedProject,
+        _llm_client: Arc<C>,
+        _semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+        _standard_task_count: usize,
+    ) -> Arc<dyn TrustedLuaManagedTranslateHostCalls> {
+        Arc::new(UnavailableManagedLuaTranslationHostCalls)
+    }
+}
+
+pub(crate) struct LuaTranslationService<H, M = NoManagedLuaTranslationFactory> {
+    host: H,
+    managed: M,
+}
+
+#[cfg(test)]
+impl<H> LuaTranslationService<H, NoManagedLuaTranslationFactory> {
+    pub(crate) fn new(host: H) -> Self {
+        Self {
+            host,
+            managed: NoManagedLuaTranslationFactory,
+        }
+    }
+}
+
+impl<H, M> LuaTranslationService<H, M> {
+    pub(crate) fn with_managed(host: H, managed: M) -> Self {
+        Self { host, managed }
+    }
+}
+
+impl<H, M> LuaTranslation for LuaTranslationService<H, M>
 where
     H: TrustedLuaExecutionHost,
+    M: ManagedLuaTranslationFactory<H::TranslationClient>,
 {
     type Client = H::TranslationClient;
     type Error = LuaTranslationError<H::Error>;
@@ -71,9 +163,16 @@ where
         project: &OpenedProject,
         llm_client: Arc<Self::Client>,
         semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+        standard_task_count: usize,
         program: OwnedLuaProgram,
     ) -> Result<OperationCompletion<()>, Self::Error> {
         let error_path = program.main_script_path().to_path_buf();
+        let managed = self.managed.bind(
+            project,
+            Arc::clone(&llm_client),
+            Arc::clone(&semantics),
+            standard_task_count,
+        );
         let invocation = LuaInvocation::translate(
             program,
             LuaProjectContext::for_frozen_source(
@@ -85,6 +184,7 @@ where
             ),
             llm_client,
             semantics,
+            managed,
         );
 
         let completion = self.host.execute(invocation).await.map_err(|source| {
@@ -186,6 +286,36 @@ impl TrustedLuaTranslationSemantics for ResolvedTranslationSemantics {
             state_context,
         }))
     }
+
+    fn prepare_translation_lines(
+        &self,
+        kind: TextGroupKind,
+        original: Vec<String>,
+        semantic_context: String,
+    ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
+        let joined = original.join("\n");
+        let prepared = self
+            .prepare_content(kind, &TextUnitContent::Lines(original))
+            .map_err(|source| translation_semantic_error("prepare", source))?;
+        let state_context = lua_translation_state_context(
+            self.global_fingerprint(),
+            self.engine(),
+            kind,
+            &joined,
+            &semantic_context,
+            &prepared,
+        );
+        let terms = prepared
+            .terms()
+            .iter()
+            .map(|term| TrustedLuaTranslationTerm::new(term.term(), term.translation()))
+            .collect();
+        Ok(Arc::new(ResolvedPreparedTranslation {
+            prepared,
+            terms,
+            state_context,
+        }))
+    }
 }
 
 struct ResolvedPreparedTranslation {
@@ -213,6 +343,10 @@ impl TrustedLuaPreparedTranslation for ResolvedPreparedTranslation {
 
     fn terms(&self) -> &[TrustedLuaTranslationTerm] {
         &self.terms
+    }
+
+    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
+        self.state_context.fingerprint()
     }
 
     fn is_current(
@@ -265,6 +399,10 @@ impl TrustedLuaPreparedTranslation for ResolvedPreparedTranslation {
 struct LuaTranslationStateContext(Sha256Fingerprint);
 
 impl LuaTranslationStateContext {
+    const fn fingerprint(self) -> Sha256Fingerprint {
+        self.0
+    }
+
     fn finish(self, translation: &str) -> Sha256Fingerprint {
         let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.lua-translation-state");
         hasher
@@ -443,6 +581,7 @@ mod tests {
                     project,
                     llm_client,
                     semantics,
+                    managed: _,
                 } => RecordedInvocation {
                     phase: LuaPhase::Translate,
                     script_path: program.main_script_path().to_path_buf(),
@@ -468,7 +607,12 @@ mod tests {
             } else if self.unexpected_outcome {
                 Ok(OperationCompletion::Completed(
                     TrustedLuaExecutionOutcome::ExtractIntent(
-                        crate::rpg_maker::lua::runtime::TrustedLuaExtractIntent::Deactivate,
+                        crate::rpg_maker::lua::runtime::TrustedLuaExtractIntent::new(
+                            Some(
+                                crate::rpg_maker::lua::runtime::TrustedLuaStandardExtractIntent::Deactivate,
+                            ),
+                            None,
+                        ),
                     ),
                 ))
             } else {
@@ -498,6 +642,21 @@ mod tests {
             &self,
             _kind: TextGroupKind,
             _original: String,
+            _semantic_context: String,
+        ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
+            Err(TrustedLuaHostCallError::new(
+                "test",
+                "unused",
+                "测试不应预处理文本",
+                None,
+                None,
+            ))
+        }
+
+        fn prepare_translation_lines(
+            &self,
+            _kind: TextGroupKind,
+            _original: Vec<String>,
             _semantic_context: String,
         ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
             Err(TrustedLuaHostCallError::new(
@@ -910,6 +1069,7 @@ mod tests {
                 &project(),
                 Arc::clone(&client),
                 semantics,
+                0,
                 program("scripts/translate.lua"),
             )
             .await
@@ -955,6 +1115,7 @@ mod tests {
                 &project(),
                 Arc::new(FakeClient { name: "quality" }),
                 semantics(),
+                0,
                 program("broken translation.lua"),
             )
             .await
@@ -988,6 +1149,7 @@ mod tests {
                 &project(),
                 Arc::new(FakeClient { name: "quality" }),
                 semantics(),
+                0,
                 program("translation.lua"),
             )
             .await
@@ -1013,6 +1175,7 @@ mod tests {
                 &project(),
                 Arc::new(FakeClient { name: "quality" }),
                 semantics(),
+                0,
                 program("translation.lua"),
             )
             .await
@@ -1033,6 +1196,6 @@ mod tests {
         });
         let project = project();
         let client = Arc::new(FakeClient { name: "quality" });
-        assert_send(service.run(&project, client, semantics(), program("translate.lua")));
+        assert_send(service.run(&project, client, semantics(), 0, program("translate.lua")));
     }
 }

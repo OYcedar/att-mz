@@ -13,11 +13,11 @@ use crate::diagnostic::{
     DiagnosticStage, DiagnosticSubject, RecoveryFact, SafeDiagnostic, SafeDiagnosticSource,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::json::StackSafeJsonValue;
 use crate::rpg_maker::dialogue::{
     DialoguePhysicalLine, MvDialogueDefinition, MvDialogueDefinitionError,
     MvDialogueProjectionError, MvDialogueProjector, projection_model_detail,
 };
-use crate::rpg_maker::json::StackSafeJsonValue;
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
     DirectTextRecipe, MutationClaim, TextProjectionRecipe, TextUnitContent, TextUnitRole,
