@@ -336,4 +336,4 @@ ATT 将项目知识组织为能够从目标、状态、权威事实、行动和�
 
 ## 13. 完整发行物
 
-`dist/` 必须包含目标平台的 ATT Release 本体、程序直接读取的 `config.toml`、面向使用者的 `README.md`、完整的 `skills/translate-rpg-maker-with-att/`、该 Skill 引用的现行 `docs/`、全部受支持语言的 `prompts/`，以及本体实际需要的非系统运行依赖和许可声明。发行包不包含配置示例、源码、测试、构建缓存或历史版本文件；使用者只需填写 `config.toml`，再向能够发现随包 Skill 的 Agent 提供游戏链接。
+`dist/` 必须包含目标平台的 ATT Release 本体、程序直接读取的 `config.toml`、面向使用者的 `README.md`、现行 `docs/`、全部受支持语言的 `prompts/`，以及本体实际需要的非系统运行依赖和许可声明。发行包不包含配置示例、源码、测试、构建缓存或历史版本文件。
