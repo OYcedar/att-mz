@@ -4,7 +4,7 @@ root = "projects"
 [prompts]
 root = "prompts"
 locale = "auto"
-thinking_output = false
+thinking_output = true
 
 [llm.clients.primary]
 url = "https://api.example.com/v1/chat/completions"
@@ -19,7 +19,7 @@ additional_pem_files = []
 retry_delays_ms = [500, 1500, 5000]
 max_retry_after_ms = 30000
 parameters = '''
-{}
+{"thinking": {"type": "disabled"}}
 '''
 
 [[languages]]
@@ -40,9 +40,9 @@ minimum_copied_letter_count = 4
 allowed_terms = []
 
 [rpg_maker]
-record_translation_tasks = false
+record_translation_tasks = true
 
 [[rpg_maker.translation_profiles]]
 id = "primary"
 llm_client = "primary"
-target_task_user_message_characters = 24000
+target_task_user_message_characters = 5090
