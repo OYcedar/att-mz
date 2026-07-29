@@ -72,7 +72,9 @@ const MANUAL_STANDARD_DIALOGUE_TRANSLATION: &str = "今天天气晴朗，一起�
 const MANAGED_PROJECT: &str = "managed-translation";
 const MANAGED_ORIGINAL: &str = "星港へ";
 const MANAGED_TRANSLATION: &str = "前往星港";
+const MANAGED_REVISED_TRANSLATION: &str = "抵达星港";
 const MANAGED_LUA: &str = "scripts/lua-managed-translation.lua";
+const MANAGED_EDIT_LUA: &str = "scripts/lua-edit-managed.lua";
 const UNICODE_LUA_PROJECT: &str = "Unicode 项目 🚀";
 const UNICODE_EXECUTABLE_DIRECTORY_MARKER: &str = r"中文主程序 🚀\带 空格";
 const UNICODE_ENVIRONMENT_NAME: &str = "ATT_E2E_环境变量_🚀";
@@ -1203,6 +1205,10 @@ assert(type(ctx.standard) == "table")
 local ok, error = pcall(ctx.standard.open)
 assert(not ok)
 assert(error.domain == "standard" and error.kind == "profile_required")
+local managed_ok, managed_error = pcall(ctx.translations.edit)
+assert(not managed_ok)
+assert(managed_error.domain == "translations")
+assert(managed_error.kind == "profile_required")
 "#,
     )
     .expect("普通项目 Lua 应可写入");
@@ -1427,6 +1433,10 @@ assert(ctx.phase == "lua")
 local ok, error = pcall(ctx.standard.open)
 assert(not ok)
 assert(error.domain == "standard" and error.kind == "saved_profile_unavailable")
+local managed_ok, managed_error = pcall(ctx.translations.edit)
+assert(not managed_ok)
+assert(managed_error.domain == "translations")
+assert(managed_error.kind == "saved_profile_unavailable")
 "#,
     )
     .expect("失效 Profile 的延迟失败 Lua 应可写入");
@@ -2443,6 +2453,61 @@ fn managed_lua_translation_crosses_extract_translate_and_write_back_processes() 
     assert!(record.contains("confirmed committed unit targets `1`"));
     assert!(record.contains(MANAGED_TRANSLATION));
 
+    fs::write(
+        root.join(MANAGED_EDIT_LUA),
+        format!(
+            "{}\nerror(\"提交后的测试失败\")\n",
+            include_str!("../docs/rpg-maker/examples/lua-edit-managed.lua")
+        ),
+    )
+    .expect("Managed 人工修订示例应可写入");
+    let mut edit_arguments =
+        arguments(&["mz", "lua", "--name", MANAGED_PROJECT, "--profile", PROFILE]);
+    edit_arguments.push(Path::new(MANAGED_EDIT_LUA).as_os_str().to_owned());
+    let edit = run_att(root, edit_arguments);
+    assert!(
+        !edit.status.success(),
+        "Managed 修订后的脚本错误必须让 Lua 命令失败"
+    );
+
+    let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("Managed 人工修订后数据库应可只读打开");
+    let revised = connection
+        .query_row(
+            "SELECT translation_content_json, translation_state FROM managed_translation_unit",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .expect("Managed 人工修订应提交译文与 state");
+    assert_eq!(
+        revised.0,
+        serde_json::to_string(MANAGED_REVISED_TRANSLATION).expect("人工译文应可编码")
+    );
+    assert_eq!(revised.1.len(), 32);
+    drop(connection);
+
+    fs::write(
+        root.join(MANAGED_EDIT_LUA),
+        format!(
+            r#"
+assert(ctx.phase == "lua")
+local session = ctx.translations.edit()
+local unit = session:get("quest_titles", "quest:arrival")
+assert(unit ~= nil)
+assert(unit.status == "current")
+assert(unit.translation == {expected:?})
+"#,
+            expected = MANAGED_REVISED_TRANSLATION,
+        ),
+    )
+    .expect("Managed 新会话复核脚本应可写入");
+    let mut verify_arguments = arguments(&["mz", "lua", "--name", MANAGED_PROJECT]);
+    verify_arguments.push(Path::new(MANAGED_EDIT_LUA).as_os_str().to_owned());
+    assert_success(
+        "Managed 新会话重读 Current",
+        &run_att(root, verify_arguments),
+    );
+
     let converged = run_att(
         root,
         arguments(&[
@@ -2455,7 +2520,11 @@ fn managed_lua_translation_crosses_extract_translate_and_write_back_processes() 
             MANAGED_LUA,
         ]),
     );
-    assert_success("converged Managed translate", &converged);
+    let converged_stdout = assert_success("converged Managed translate", &converged);
+    assert!(
+        converged_stdout.contains("Lua：已执行"),
+        "收敛 Translate 必须实际执行 Managed Lua：{converged_stdout}"
+    );
     let requests = requests.finish();
     assert_eq!(
         requests.len(),
@@ -2521,7 +2590,133 @@ fn managed_lua_translation_crosses_extract_translate_and_write_back_processes() 
                 .expect("Managed WriteBack 应写入 QuestEntries.json"),
         )
         .expect("Managed WriteBack 结果应是 JSON")[0]["title"],
-        MANAGED_TRANSLATION,
+        MANAGED_REVISED_TRANSLATION,
+    );
+}
+
+#[test]
+fn managed_revision_and_safe_write_back_cover_mv_layout() {
+    const PROJECT: &str = "managed-translation-mv";
+
+    let temporary = tempfile::tempdir().expect("应可建立 MV Managed 端到端测试目录");
+    let root = temporary.path();
+    let game_root = root.join("game");
+    fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
+    fs::create_dir_all(root.join("scripts")).expect("Lua 脚本目录应可建立");
+    write_minimal_mv_game(&game_root);
+    fs::write(
+        game_root.join("www/data/QuestEntries.json"),
+        serde_json::to_vec(&json!([{
+            "id": "arrival",
+            "title": MANAGED_ORIGINAL,
+            "description": "港へ向かう。"
+        }]))
+        .expect("MV Managed 来源应可序列化"),
+    )
+    .expect("MV Managed 来源应可写入");
+    fs::write(
+        root.join(MANAGED_LUA),
+        include_str!("../docs/rpg-maker/examples/lua-managed-translation.lua"),
+    )
+    .expect("MV Managed 主脚本应可写入");
+    fs::write(
+        root.join(MANAGED_EDIT_LUA),
+        include_str!("../docs/rpg-maker/examples/lua-edit-managed.lua"),
+    )
+    .expect("MV Managed 人工修订脚本应可写入");
+
+    let bootstrap_server = BoundChatServer::bind();
+    write_configuration(root, bootstrap_server.endpoint(), EMPTY_PARAMETERS);
+    let init = run_att(root, rpg_maker_init_arguments("mv", PROJECT, &game_root));
+    assert_success("MV Managed init", &init);
+    drop(bootstrap_server);
+    write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
+
+    let extract = run_att(
+        root,
+        arguments(&["mv", "extract", "--name", PROJECT, "--lua", MANAGED_LUA]),
+    );
+    assert_success("MV Managed extract", &extract);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), E2E_PARAMETERS);
+    let requests = server.start_with_responses_and_observe(
+        vec![ChatResponseFixture::Managed],
+        ChatResponseFixture::Managed,
+    );
+    let translate = run_att(
+        root,
+        arguments(&[
+            "mv",
+            "translate",
+            "--name",
+            PROJECT,
+            PROFILE,
+            "--lua",
+            MANAGED_LUA,
+        ]),
+    );
+    assert_success("MV Managed translate", &translate);
+
+    let mut edit_arguments = arguments(&["mv", "lua", "--name", PROJECT, "--profile", PROFILE]);
+    edit_arguments.push(Path::new(MANAGED_EDIT_LUA).as_os_str().to_owned());
+    assert_success(
+        "MV Managed Current 人工修订",
+        &run_att(root, edit_arguments),
+    );
+
+    let converged = run_att(
+        root,
+        arguments(&[
+            "mv",
+            "translate",
+            "--name",
+            PROJECT,
+            PROFILE,
+            "--lua",
+            MANAGED_LUA,
+        ]),
+    );
+    let converged_stdout = assert_success("MV Managed 收敛 Translate", &converged);
+    assert!(
+        converged_stdout.contains("Lua：已执行"),
+        "MV 收敛 Translate 必须实际执行 Managed Lua：{converged_stdout}"
+    );
+    assert_eq!(
+        requests.finish().len(),
+        1,
+        "MV 人工修订必须使用与自动 Managed 相同的 Current 语义"
+    );
+
+    let write_back = run_att(
+        root,
+        arguments(&["mv", "write-back", "--name", PROJECT, "--lua", MANAGED_LUA]),
+    );
+    assert_success("MV Managed write-back", &write_back);
+
+    let workspace = root.join("projects/mv").join(PROJECT);
+    let database = workspace.join("project.db");
+    let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("MV Managed 数据库应可只读打开");
+    let current = connection
+        .query_row(
+            "SELECT translation_content_json FROM managed_translation_unit",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("MV Managed Current 应存在");
+    assert_eq!(
+        current,
+        serde_json::to_string(MANAGED_REVISED_TRANSLATION).expect("人工译文应可编码")
+    );
+    let published: Value = serde_json::from_slice(
+        &fs::read(workspace.join("write_back/www/data/QuestEntries.json"))
+            .expect("MV Managed 发布文件应存在"),
+    )
+    .expect("MV Managed 发布文件应可重新解析");
+    assert_eq!(
+        published[0]["title"], MANAGED_REVISED_TRANSLATION,
+        "重新解析的发布内容必须与数据库 Current 精确一致"
     );
 }
 

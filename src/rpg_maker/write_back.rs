@@ -16,6 +16,7 @@ use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::lua::runtime::OwnedLuaProgram;
+use crate::rpg_maker::model::MutationClaim;
 use crate::storage::file_system::ScopedDirectoryScope;
 
 pub(crate) mod asset_reader;
@@ -196,6 +197,14 @@ pub(crate) trait StandardWriteBack: Send + Sync {
 pub(crate) trait PreparedWriteBackCandidate: Send + 'static {
     fn belongs_to(&self, project: &OpenedProject) -> bool;
     fn candidate_root(&self) -> &Path;
+
+    /// Standard 在建立此候选前已经占用的物理修改声明。
+    ///
+    /// 普通测试替身和不产生结构化修改的候选可沿用空集合；低级文件编辑不自动
+    /// 进入该集合，只有采用 Claim 契约的高级能力会继续检查它。
+    fn mutation_claims(&self) -> &[MutationClaim] {
+        &[]
+    }
 }
 
 /// 准备、借用式校验、发布或丢弃唯一写回候选的能力。

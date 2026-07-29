@@ -10,6 +10,10 @@ use crate::diagnostic::{
 };
 use crate::execution::OperationCompletion;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::managed_translation::{
+    ManagedPreparedContent, ManagedPreparedContentError, ManagedTranslationContent,
+    ManagedTranslationSemantics, ManagedTranslationShape,
+};
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::lua::runtime::{
     OwnedLuaProgram, TrustedLuaHostCallError, TrustedLuaManagedTranslateHostCalls,
@@ -315,6 +319,101 @@ impl TrustedLuaTranslationSemantics for ResolvedTranslationSemantics {
             terms,
             state_context,
         }))
+    }
+}
+
+/// 把 Translate 阶段已经冻结的 RPG Maker 翻译语义接到四种 Managed content 组合器。
+///
+/// 该入口只准备和验收结构化正文，不拥有 Managed identity、LLM 协议、持久化或事务。
+pub(crate) fn prepare_lua_managed_content(
+    semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+    kind: TextGroupKind,
+    shape: ManagedTranslationShape,
+    original: ManagedTranslationContent,
+    semantic_context: String,
+) -> Result<Arc<ManagedPreparedContent>, TrustedLuaHostCallError> {
+    let adapter = LuaManagedContentSemantics { semantics };
+    ManagedPreparedContent::prepare(
+        &adapter,
+        kind.storage_name(),
+        shape,
+        &original,
+        &semantic_context,
+    )
+    .map(Arc::new)
+    .map_err(|source| match source {
+        ManagedPreparedContentError::InvalidOriginal(source) => TrustedLuaHostCallError::new(
+            "translation",
+            "invalid_content",
+            source.to_string(),
+            None,
+            Some(Arc::new(source)),
+        )
+        .with_operation("translation.prepare_content"),
+        ManagedPreparedContentError::Semantics(source) => {
+            source.with_operation("translation.prepare_content")
+        }
+    })
+}
+
+struct LuaManagedContentSemantics {
+    semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+}
+
+impl ManagedTranslationSemantics for LuaManagedContentSemantics {
+    fn engine_semantic_identity(&self) -> &str {
+        "rpg_maker"
+    }
+
+    fn system_prompt(&self) -> &str {
+        self.semantics.system_prompt()
+    }
+
+    fn source_language(&self) -> &str {
+        self.semantics.source_language()
+    }
+
+    fn target_language(&self) -> &str {
+        self.semantics.target_language()
+    }
+
+    fn prepare_translation(
+        &self,
+        kind: &str,
+        shape: ManagedTranslationShape,
+        original: &ManagedTranslationContent,
+        semantic_context: &str,
+    ) -> Result<Arc<dyn TrustedLuaPreparedTranslation>, TrustedLuaHostCallError> {
+        let kind = TextGroupKind::from_storage_name(kind).ok_or_else(|| {
+            TrustedLuaHostCallError::new(
+                "translation",
+                "invalid_kind",
+                format!("结构化准备使用未知 RPG Maker kind：{kind}"),
+                None,
+                None,
+            )
+        })?;
+        match (shape, original) {
+            (ManagedTranslationShape::Lines, ManagedTranslationContent::Array(values)) => self
+                .semantics
+                .prepare_translation_lines(kind, values.clone(), semantic_context.to_owned()),
+            (
+                ManagedTranslationShape::Single
+                | ManagedTranslationShape::Reflow
+                | ManagedTranslationShape::Items,
+                ManagedTranslationContent::Scalar(value),
+            ) => {
+                self.semantics
+                    .prepare_translation(kind, value.clone(), semantic_context.to_owned())
+            }
+            _ => Err(TrustedLuaHostCallError::new(
+                "translation",
+                "invalid_content",
+                "结构化准备的正文与 shape 不一致",
+                None,
+                None,
+            )),
+        }
     }
 }
 

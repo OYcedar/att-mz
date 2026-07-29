@@ -183,6 +183,7 @@ where
     }
 
     /// 使用项目当前 canonical 资源打开无副作用的人工候选语义会话。
+    #[cfg(test)]
     pub(crate) async fn open_candidate_session(
         &self,
         project: &OpenedProject,
@@ -190,6 +191,25 @@ where
         corpus: StandardTranslationCorpus,
     ) -> Result<
         super::candidate::StandardCandidateSession,
+        OpenStandardCandidateSessionError<R::Error, C::Error>,
+    > {
+        self.open_candidate_session_with_semantics(project, profile, corpus)
+            .await
+            .map(|(session, _)| session)
+    }
+
+    /// 打开人工候选会话，并把本轮从相同 Profile、术语和 Placeholder 资源解析出的
+    /// 翻译语义一并交给需要复用这些语义的其他受管调用方。
+    pub(crate) async fn open_candidate_session_with_semantics(
+        &self,
+        project: &OpenedProject,
+        profile: &Arc<RpgMakerTranslationProfile<L>>,
+        corpus: StandardTranslationCorpus,
+    ) -> Result<
+        (
+            super::candidate::StandardCandidateSession,
+            Arc<ResolvedTranslationSemantics>,
+        ),
         OpenStandardCandidateSessionError<R::Error, C::Error>,
     > {
         let resolved = self
@@ -225,7 +245,7 @@ where
                     super::candidate::StandardCandidateSessionBuildError::Corpus(source),
                 )
             })?;
-        let scope_semantics = semantics;
+        let scope_semantics = Arc::clone(&semantics);
         let prepared_scopes = self
             .cpu
             .execute_ordered_map(prepared.into_scopes(), move |scope| {
@@ -246,7 +266,7 @@ where
             })
             .await
             .map_err(OpenStandardCandidateSessionError::ScheduleBuild)?;
-        Ok(session)
+        Ok((session, semantics))
     }
 }
 

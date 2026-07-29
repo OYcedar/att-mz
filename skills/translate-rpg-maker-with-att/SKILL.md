@@ -1,6 +1,6 @@
 ---
 name: translate-rpg-maker-with-att
-description: 使用 ATT 规划、执行、继续、只读诊断、人工审校、修复和验收 RPG Maker MV/MZ 游戏翻译。用于完整汉化或本地化，Init、Extract、Translate、WriteBack 任一操作，Rules、Placeholder、Terminology、Prompt、Lua 的项目处理，Standard Current 或已保存译文修订，以及遗漏、拒绝、Partial、Unavailable、写回或发布异常调查。用户明确使用 ATT、提供 ATT 项目或要求继续已有 ATT 翻译任务时使用。不用于开发或评审 ATT 源码与架构、RPG Maker XP/VX/VX Ace、其他翻译工具或普通文本翻译。
+description: 使用 ATT 规划、执行、继续、只读诊断、人工审校、修复和验收 RPG Maker MV/MZ 游戏翻译。用于完整汉化或本地化，Init、Extract、Translate、WriteBack 任一操作，Rules、Placeholder、Terminology、Prompt、Lua 的项目处理，Standard 或 Managed Current 与已保存译文修订，以及遗漏、拒绝、Partial、Unavailable、写回或发布异常调查。用户明确使用 ATT、提供 ATT 项目或要求继续已有 ATT 翻译任务时使用。不用于开发或评审 ATT 源码与架构、RPG Maker XP/VX/VX Ace、其他翻译工具或普通文本翻译。
 ---
 
 # 用 ATT 完成 RPG Maker 翻译
@@ -144,6 +144,14 @@ Rules、Placeholder、Terminology、Prompt、项目 Lua 和相关项目设置。
 普通调查和人工补译不得直接 SQL 修改 ATT 受管表。只有用户明确授权“高级数据库修复”，
 并且实际发布文档确认该路径和要求时，才按现行文档执行；它不是普通译文提交方式。
 
+涉及 Lua 游戏文本时，先按
+[Lua 表示层与受管能力选择](references/workflow.md#lua-表示层与受管能力选择)检查当前
+发布是否已有能够完整表达该结构、Current 和写回关系的高级接口。能够表达时，把脚本私有
+表示转换成接口接收的结构，由语义所有者验收和提交；不能表达特殊 grammar、跨目标关系或
+私有协议时，保留低级 Lua，并由脚本承担完整解析、渲染、状态、事务、恢复和往返验证。
+不要为使用高级接口而丢失真实语义，也不要在已有正式状态接口时复制其 Current 或提交
+规则。
+
 Lua 是可信程序，不是 sandbox。本次运行方案或项目状态会使用 Lua，或请求明确涉及 Lua
 时，按
 [Lua 外部依赖与副作用](references/workflow.md#lua-外部依赖与副作用)读取实际产品契约，
@@ -187,6 +195,8 @@ Partial、Unavailable、Manual、取消、已生效但运行方案未保存、Ou
 - 完整游戏翻译有提取、翻译和写回的当前证据；
 - 范围内没有未解释的玩家可见文本遗漏、未翻译内容、拒绝、质量问题或写回差异；
 - 项目配置修改已完成全部影响检查和修改后验证；
+- 手写 Lua parser/renderer 的内容已经完成解析、验收或保存、渲染、重新解析和领域值比较，
+  失败路径不得留下半修改或伪造 Current；
 - 任务使用 Lua 时，实际解析环境、动态依赖和非受管副作用已经核对，并与本轮授权和证据
   一致；
 - 权威项目状态、实际输出和用户要求的加载位置已经核对；

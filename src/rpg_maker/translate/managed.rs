@@ -284,9 +284,21 @@ where
 }
 
 #[derive(Clone)]
-struct RpgManagedSemanticsAdapter {
+pub(crate) struct RpgManagedSemanticsAdapter {
     semantics: Arc<dyn TrustedLuaTranslationSemantics>,
     managed_system_prompt: RpgMakerSystemPrompt,
+}
+
+impl RpgManagedSemanticsAdapter {
+    pub(crate) fn new(
+        semantics: Arc<dyn TrustedLuaTranslationSemantics>,
+        managed_system_prompt: RpgMakerSystemPrompt,
+    ) -> Self {
+        Self {
+            semantics,
+            managed_system_prompt,
+        }
+    }
 }
 
 impl RootManagedSemantics for RpgManagedSemanticsAdapter {
@@ -344,9 +356,18 @@ impl RootManagedSemantics for RpgManagedSemanticsAdapter {
 }
 
 #[derive(Clone)]
-struct RpgManagedStoreAdapter<S> {
+pub(crate) struct RpgManagedStoreAdapter<S> {
     repository: S,
     project: OpenedProject,
+}
+
+impl<S> RpgManagedStoreAdapter<S> {
+    pub(crate) fn new(repository: S, project: OpenedProject) -> Self {
+        Self {
+            repository,
+            project,
+        }
+    }
 }
 
 impl<S> RootManagedStore for RpgManagedStoreAdapter<S>

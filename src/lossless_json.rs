@@ -18,27 +18,6 @@ pub(crate) enum LosslessJsonValue {
     Object(Vec<(String, Self)>),
 }
 
-impl LosslessJsonValue {
-    pub(crate) fn take_object_value(&mut self, key: &str) -> Option<Self> {
-        let Self::Object(entries) = self else {
-            return None;
-        };
-        entries
-            .iter_mut()
-            .find(|(candidate, _)| candidate == key)
-            .map(|(_, value)| std::mem::replace(value, Self::Null))
-    }
-
-    pub(crate) fn take_array_value(&mut self, index: usize) -> Option<Self> {
-        let Self::Array(values) = self else {
-            return None;
-        };
-        values
-            .get_mut(index)
-            .map(|value| std::mem::replace(value, Self::Null))
-    }
-}
-
 impl Clone for LosslessJsonValue {
     fn clone(&self) -> Self {
         enum Work<'a> {

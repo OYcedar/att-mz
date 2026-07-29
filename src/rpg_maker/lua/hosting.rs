@@ -36,7 +36,8 @@ use super::runtime::OwnedLuaProgram;
 use super::runtime::{
     TrustedLuaBindingFinalization, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
     TrustedLuaCommonBindings, TrustedLuaCommonHostCalls, TrustedLuaExtractHostCalls,
-    TrustedLuaExtractIntent, TrustedLuaHostCallError, TrustedLuaManagedTranslateHostCalls,
+    TrustedLuaExtractIntent, TrustedLuaHostCallError, TrustedLuaManagedEditHostCalls,
+    TrustedLuaManagedEditSession, TrustedLuaManagedTranslateHostCalls,
     TrustedLuaManagedTranslationReader, TrustedLuaManagedTranslationSnapshot,
     TrustedLuaRuntimeBindings, TrustedLuaRuntimeExecutionError, TrustedLuaRuntimeExecutor,
     TrustedLuaStandardAcceptance, TrustedLuaStandardCandidate, TrustedLuaStandardExtractIntent,
@@ -139,10 +140,12 @@ where
                 project,
                 arguments,
                 standard,
+                managed,
             } => (
                 HostingPhase::Project {
                     arguments,
                     standard,
+                    managed,
                 },
                 program,
                 project,
@@ -200,11 +203,16 @@ where
             HostingPhase::Project {
                 arguments,
                 standard,
-            } => TrustedLuaRuntimeBindings::project(
+                managed,
+            } => TrustedLuaRuntimeBindings::project_with_managed(
                 common,
                 arguments,
                 Arc::new(TransactionAwareLuaStandardHostCalls {
                     inner: standard,
+                    transaction_state: Arc::clone(&transaction_state),
+                }),
+                Arc::new(TransactionAwareLuaManagedEditHostCalls {
+                    inner: managed,
                     transaction_state,
                 }),
                 finalizer,
@@ -250,6 +258,7 @@ enum HostingPhase<P> {
     Project {
         arguments: Vec<String>,
         standard: Arc<dyn TrustedLuaStandardHostCalls>,
+        managed: Arc<dyn TrustedLuaManagedEditHostCalls>,
     },
 }
 
@@ -274,6 +283,13 @@ impl TrustedLuaWriteBackHostCalls for ManagedAwareWriteBackHostCalls {
         >,
     > {
         self.managed.open(name)
+    }
+
+    fn replace_text(
+        &self,
+        replacements: Vec<crate::rpg_maker::lua::document::RpgMakerTextReplacement>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TrustedLuaHostCallError>> + Send + 'static>> {
+        self.calls.replace_text(replacements)
     }
 
     fn read_output(
@@ -584,6 +600,92 @@ impl TrustedLuaStandardSession for TransactionAwareLuaStandardSession {
     }
 }
 
+struct TransactionAwareLuaManagedEditHostCalls {
+    inner: Arc<dyn TrustedLuaManagedEditHostCalls>,
+    transaction_state: Arc<dyn TrustedLuaCommonHostCalls>,
+}
+
+impl TrustedLuaManagedEditHostCalls for TransactionAwareLuaManagedEditHostCalls {
+    fn edit(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Arc<dyn TrustedLuaManagedEditSession>, TrustedLuaHostCallError>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let inner = Arc::clone(&self.inner);
+        let transaction_state = Arc::clone(&self.transaction_state);
+        Box::pin(async move {
+            let session = inner.edit().await?;
+            Ok(Arc::new(TransactionAwareLuaManagedEditSession {
+                inner: session,
+                transaction_state,
+            }) as Arc<dyn TrustedLuaManagedEditSession>)
+        })
+    }
+}
+
+struct TransactionAwareLuaManagedEditSession {
+    inner: Arc<dyn TrustedLuaManagedEditSession>,
+    transaction_state: Arc<dyn TrustedLuaCommonHostCalls>,
+}
+
+impl TrustedLuaManagedEditSession for TransactionAwareLuaManagedEditSession {
+    fn units(
+        &self,
+    ) -> Result<
+        Vec<crate::managed_translation::ManagedTranslationCandidateUnit>,
+        TrustedLuaHostCallError,
+    > {
+        self.inner.units()
+    }
+
+    fn get(
+        &self,
+        collection: String,
+        key: String,
+    ) -> Result<
+        Option<crate::managed_translation::ManagedTranslationCandidateUnit>,
+        TrustedLuaHostCallError,
+    > {
+        self.inner.get(collection, key)
+    }
+
+    fn accept(
+        &self,
+        candidates: Vec<crate::managed_translation::ManagedTranslationCandidateRequest>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<crate::managed_translation::ManagedTranslationCandidateAcceptance>,
+                        TrustedLuaHostCallError,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let transaction_state = Arc::clone(&self.transaction_state);
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            if transaction_state.transaction_active().await? {
+                return Err(TrustedLuaHostCallError::new(
+                    "translations",
+                    "transaction_conflict",
+                    "活动 ctx.db 事务中不能提交 Managed 人工译文",
+                    None,
+                    None,
+                )
+                .with_operation("translations.accept"));
+            }
+            inner.accept(candidates).await
+        })
+    }
+}
+
 async fn resolve_exact_source_path<F>(
     file_system: &F,
     source_directories: &SuccessfulDirectoryListCache<DirectoryEntry>,
@@ -765,6 +867,23 @@ where
     {
         self.semantics
             .prepare_translation(kind, original, semantic_context)
+    }
+
+    fn prepare_content(
+        &self,
+        kind: crate::rpg_maker::text::TextGroupKind,
+        shape: crate::managed_translation::ManagedTranslationShape,
+        original: crate::managed_translation::ManagedTranslationContent,
+        semantic_context: String,
+    ) -> Result<Arc<crate::managed_translation::ManagedPreparedContent>, TrustedLuaHostCallError>
+    {
+        crate::rpg_maker::translate::lua::prepare_lua_managed_content(
+            Arc::clone(&self.semantics),
+            kind,
+            shape,
+            original,
+            semantic_context,
+        )
     }
 
     fn request_llm(
@@ -2908,6 +3027,104 @@ mod tests {
         let idle: Arc<dyn TrustedLuaCommonHostCalls> =
             Arc::new(TransactionObservationCalls { result: Ok(false) });
         let session = TransactionAwareLuaStandardSession {
+            inner,
+            transaction_state: idle,
+        };
+        assert!(session.accept(Vec::new()).await.is_ok());
+        assert!(called.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    struct RecordingManagedEditSession {
+        called: Arc<AtomicBool>,
+    }
+
+    impl TrustedLuaManagedEditSession for RecordingManagedEditSession {
+        fn units(
+            &self,
+        ) -> Result<
+            Vec<crate::managed_translation::ManagedTranslationCandidateUnit>,
+            TrustedLuaHostCallError,
+        > {
+            Ok(Vec::new())
+        }
+
+        fn get(
+            &self,
+            _collection: String,
+            _key: String,
+        ) -> Result<
+            Option<crate::managed_translation::ManagedTranslationCandidateUnit>,
+            TrustedLuaHostCallError,
+        > {
+            Ok(None)
+        }
+
+        fn accept(
+            &self,
+            _candidates: Vec<crate::managed_translation::ManagedTranslationCandidateRequest>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Vec<crate::managed_translation::ManagedTranslationCandidateAcceptance>,
+                            TrustedLuaHostCallError,
+                        >,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            self.called
+                .store(true, std::sync::atomic::Ordering::Release);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_edit_accept_uses_authoritative_transaction_state() {
+        let called = Arc::new(AtomicBool::new(false));
+        let inner: Arc<dyn TrustedLuaManagedEditSession> = Arc::new(RecordingManagedEditSession {
+            called: Arc::clone(&called),
+        });
+        let active: Arc<dyn TrustedLuaCommonHostCalls> =
+            Arc::new(TransactionObservationCalls { result: Ok(true) });
+        let session = TransactionAwareLuaManagedEditSession {
+            inner: Arc::clone(&inner),
+            transaction_state: active,
+        };
+        let error = session
+            .accept(Vec::new())
+            .await
+            .expect_err("活动事务必须阻止 Managed 人工提交");
+        assert_eq!(error.domain(), "translations");
+        assert_eq!(error.kind(), "transaction_conflict");
+        assert_eq!(error.operation(), Some("translations.accept"));
+        assert!(!called.load(std::sync::atomic::Ordering::Acquire));
+
+        let indeterminate: Arc<dyn TrustedLuaCommonHostCalls> =
+            Arc::new(TransactionObservationCalls {
+                result: Err(TrustedLuaHostCallError::new(
+                    "sqlite",
+                    "indeterminate",
+                    "事务终态未知",
+                    None,
+                    None,
+                )),
+            });
+        let session = TransactionAwareLuaManagedEditSession {
+            inner: Arc::clone(&inner),
+            transaction_state: indeterminate,
+        };
+        let error = session
+            .accept(Vec::new())
+            .await
+            .expect_err("终态未知必须保留 SQLite 失败");
+        assert_eq!(error.domain(), "sqlite");
+        assert_eq!(error.kind(), "indeterminate");
+        assert!(!called.load(std::sync::atomic::Ordering::Acquire));
+
+        let idle: Arc<dyn TrustedLuaCommonHostCalls> =
+            Arc::new(TransactionObservationCalls { result: Ok(false) });
+        let session = TransactionAwareLuaManagedEditSession {
             inner,
             transaction_state: idle,
         };

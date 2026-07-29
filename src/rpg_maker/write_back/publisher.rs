@@ -11,6 +11,7 @@ use crate::diagnostic::{
 };
 use crate::rpg_maker::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
+use crate::rpg_maker::model::MutationClaim;
 use crate::rpg_maker::project::OpenedProject;
 use crate::storage::file_system::{
     DirectoryDiscardError, DirectoryFileOverlay, DirectoryPrepareError, DirectoryPublishError,
@@ -33,6 +34,7 @@ pub(crate) struct PreparedWriteBack<S> {
     workspace_root: PathBuf,
     output_root: PathBuf,
     layout: RpgMakerLayout,
+    mutation_claims: Vec<MutationClaim>,
     staged: crate::storage::file_system::StagedDirectory<S>,
 }
 
@@ -60,6 +62,10 @@ where
 
     fn candidate_root(&self) -> &Path {
         self.staged.staging_root()
+    }
+
+    fn mutation_claims(&self) -> &[MutationClaim] {
+        &self.mutation_claims
     }
 }
 
@@ -125,8 +131,8 @@ where
             )
             .map_err(StandardWriteBackPublishingError::InvalidRequest)?,
         ];
-        let overlays = documents
-            .into_files()
+        let (files, mutation_claims) = documents.into_files_and_claims();
+        let overlays = files
             .into_iter()
             .map(|file| {
                 let (relative_path, bytes) = file.into_parts();
@@ -157,6 +163,7 @@ where
             workspace_root: project.workspace_root().to_path_buf(),
             output_root: project.write_back_root().to_path_buf(),
             layout: project.layout().rpg_maker_layout(),
+            mutation_claims,
             staged,
         })
     }
