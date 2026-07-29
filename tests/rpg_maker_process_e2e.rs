@@ -3,10 +3,11 @@
 //! Windows x64 生产进程边界的 RPG Maker 纵向黑盒测试。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::{OsStr, OsString, c_void};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -21,7 +22,26 @@ use uuid::Uuid;
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x0000_0002;
+const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u32 = 0x0000_0020;
+const RT_MANIFEST: u16 = 24;
 const WSA_WOULD_BLOCK: i32 = 10035;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "LoadLibraryExW"]
+    fn load_library_ex_w(file_name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+    #[link_name = "FindResourceW"]
+    fn find_resource_w(module: *mut c_void, name: *const u16, kind: *const u16) -> *mut c_void;
+    #[link_name = "LoadResource"]
+    fn load_resource(module: *mut c_void, resource: *mut c_void) -> *mut c_void;
+    #[link_name = "SizeofResource"]
+    fn size_of_resource(module: *mut c_void, resource: *mut c_void) -> u32;
+    #[link_name = "LockResource"]
+    fn lock_resource(resource: *mut c_void) -> *mut c_void;
+    #[link_name = "FreeLibrary"]
+    fn free_library(module: *mut c_void) -> i32;
+}
 
 const PROJECT: &str = "e2e";
 const SHARED_PROJECT: &str = "shared";
@@ -53,6 +73,10 @@ const MANAGED_PROJECT: &str = "managed-translation";
 const MANAGED_ORIGINAL: &str = "星港へ";
 const MANAGED_TRANSLATION: &str = "前往星港";
 const MANAGED_LUA: &str = "scripts/lua-managed-translation.lua";
+const UNICODE_LUA_PROJECT: &str = "Unicode 项目 🚀";
+const UNICODE_EXECUTABLE_DIRECTORY_MARKER: &str = r"中文主程序 🚀\带 空格";
+const UNICODE_ENVIRONMENT_NAME: &str = "ATT_E2E_环境变量_🚀";
+const UNICODE_ENVIRONMENT_VALUE: &str = "环境值 中文 🚀";
 const SYSTEM_PROMPT_TEMPLATE: &str = "E2E SYSTEM CONTRACT: {{source_language}} -> {{target_language}}; repeat {{source_language}} -> {{target_language}}";
 const SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT: ja -> zh-Hans; repeat ja -> zh-Hans";
 const UPDATED_SYSTEM_PROMPT_TEMPLATE: &str =
@@ -1421,6 +1445,359 @@ assert(error.domain == "standard" and error.kind == "saved_profile_unavailable")
 }
 
 #[test]
+fn production_executable_embeds_utf8_and_long_path_manifest_as_resource_one() {
+    let temporary = tempfile::tempdir().expect("应可建立 manifest 端到端测试目录");
+    let executable =
+        copy_att_executable(&temporary.path().join("manifest 中文 🚀").join("带 空格"));
+    let manifest = read_embedded_manifest_resource_one(&executable);
+
+    assert!(
+        manifest.contains("<activeCodePage") && manifest.contains(">UTF-8</activeCodePage>"),
+        "RT_MANIFEST ID 1 必须启用 UTF-8 activeCodePage：\n{manifest}"
+    );
+    assert!(
+        manifest.contains("<longPathAware") && manifest.contains(">true</longPathAware>"),
+        "RT_MANIFEST ID 1 必须声明 longPathAware：\n{manifest}"
+    );
+}
+
+#[test]
+fn copied_executable_in_unicode_directory_has_utf8_package_path_and_require_order() {
+    let temporary = tempfile::tempdir().expect("应可建立 Unicode require 端到端测试目录");
+    let root = temporary.path().join("工作区 中文 🚀 with spaces");
+    let executable_directory = root.join("中文主程序 🚀").join("带 空格");
+    let executable = copy_att_executable(&executable_directory);
+    initialize_unicode_lua_project(&root, &executable);
+
+    let script_directory = root.join("Lua 脚本与模块 🧩");
+    let fallback_directory = root.join("package.path 后备模块 🚀");
+    let versioned_environment_directory = root.join("LUA_PATH_5_4 中文 🚀");
+    let legacy_environment_directory = root.join("LUA_PATH 冲突 中文 🚀");
+    fs::create_dir_all(&script_directory).expect("Unicode Lua 脚本目录应可建立");
+    fs::create_dir_all(&fallback_directory).expect("Unicode package.path 目录应可建立");
+    fs::create_dir_all(&versioned_environment_directory)
+        .expect("Unicode LUA_PATH_5_4 目录应可建立");
+    fs::create_dir_all(&legacy_environment_directory).expect("Unicode LUA_PATH 目录应可建立");
+
+    fs::write(
+        script_directory.join("相邻模块_🚀.lua"),
+        "return '主程序目录模块 中文 🚀'\n",
+    )
+    .expect("Unicode 相邻模块应可写入");
+    fs::write(
+        script_directory.join("预加载优先_🚀.lua"),
+        "return '不应读取的相邻文件'\n",
+    )
+    .expect("预加载同名相邻模块应可写入");
+    fs::write(
+        script_directory.join("主目录优先_🚀.lua"),
+        "return '主程序目录优先'\n",
+    )
+    .expect("主目录优先模块应可写入");
+    fs::write(
+        fallback_directory.join("主目录优先_🚀.lua"),
+        "return 'package.path 不应优先'\n",
+    )
+    .expect("package.path 同名模块应可写入");
+    fs::write(
+        versioned_environment_directory.join("版本化环境模块_🚀.lua"),
+        "return 'LUA_PATH_5_4 优先'\n",
+    )
+    .expect("LUA_PATH_5_4 模块应可写入");
+    fs::write(
+        legacy_environment_directory.join("版本化环境模块_🚀.lua"),
+        "return 'LUA_PATH 不应生效'\n",
+    )
+    .expect("冲突 LUA_PATH 模块应可写入");
+
+    let main_script = script_directory.join("主程序 require 🚀.lua");
+    fs::write(
+        &main_script,
+        r#"
+assert(ctx.phase == "lua")
+assert(utf8.len(package.path) ~= nil, "package.path 必须是 UTF-8")
+assert(string.find(package.path, arg[2], 1, true) ~= nil,
+       "默认 package.path 必须包含实际 att.exe 目录")
+assert(string.find(package.path, arg[5], 1, true) ~= nil,
+       "LUA_PATH_5_4 必须进入 package.path")
+assert(string.find(package.path, arg[6], 1, true) == nil,
+       "LUA_PATH_5_4 存在时不得读取 LUA_PATH")
+assert(require("版本化环境模块_🚀") == "LUA_PATH_5_4 优先")
+
+assert(require("相邻模块_🚀") == "主程序目录模块 中文 🚀")
+
+package.preload["预加载优先_🚀"] = function()
+  return "package.preload 优先"
+end
+assert(require("预加载优先_🚀") == "package.preload 优先")
+
+package.path = arg[1] .. ";" .. package.path
+assert(require("主目录优先_🚀") == "主程序目录优先")
+
+local found = assert(package.searchpath("主目录优先_🚀", arg[1]))
+assert(found == arg[3])
+local missing, search_diagnostic = package.searchpath("缺失模块_🚀", arg[1])
+assert(missing == nil)
+assert(string.find(search_diagnostic, arg[4], 1, true) ~= nil)
+assert(string.find(search_diagnostic, "os error 2", 1, true) ~= nil)
+"#,
+    )
+    .expect("Unicode require 主程序应可写入");
+
+    let package_template = fallback_directory.join("?.lua");
+    let mut lua_arguments = arguments(&["mz", "lua", "--name", UNICODE_LUA_PROJECT]);
+    lua_arguments.push(main_script.into_os_string());
+    lua_arguments.push("--".into());
+    lua_arguments.push(package_template.into_os_string());
+    lua_arguments.push(UNICODE_EXECUTABLE_DIRECTORY_MARKER.into());
+    lua_arguments.push(
+        fallback_directory
+            .join("主目录优先_🚀.lua")
+            .into_os_string(),
+    );
+    lua_arguments.push(fallback_directory.join("缺失模块_🚀.lua").into_os_string());
+    lua_arguments.push(versioned_environment_directory.clone().into_os_string());
+    lua_arguments.push(legacy_environment_directory.clone().into_os_string());
+
+    let versioned_package_path = format!(
+        "{};;",
+        versioned_environment_directory.join("?.lua").display()
+    );
+    let legacy_package_path = legacy_environment_directory.join("?.lua");
+    let mut command = att_command_for_executable(&executable, &root, lua_arguments);
+    command.env("LUA_PATH_5_4", versioned_package_path);
+    command.env("LUA_PATH", legacy_package_path);
+    let child = command
+        .spawn()
+        .expect("带 Unicode LUA_PATH 的复制 att.exe 应可启动");
+    let lua = wait_for_att(child);
+    assert_success("Unicode 可执行路径 require", &lua);
+}
+
+#[test]
+fn copied_executable_exposes_unicode_safe_lua_standard_library_boundaries() {
+    let temporary = tempfile::tempdir().expect("应可建立 Unicode 标准库端到端测试目录");
+    let root = temporary.path().join("标准库工作区 中文 🚀 with spaces");
+    let executable = copy_att_executable(&root.join("程序目录 中文 🚀").join("带 空格"));
+    initialize_unicode_lua_project(&root, &executable);
+
+    let data_directory = root.join("Lua 直接 I／O 中文 🚀");
+    fs::create_dir_all(&data_directory).expect("Unicode Lua 直接 I/O 目录应可建立");
+    let read_path = data_directory.join("读取 输入 🚀.txt");
+    let write_path = data_directory.join("写入 输出 🚀.txt");
+    let default_output_path = data_directory.join("默认输出 中文 🚀.txt");
+    let loadfile_path = data_directory.join("loadfile 模块 中文 🚀.lua");
+    let dofile_path = data_directory.join("dofile 模块 中文 🚀.lua");
+    let rename_source = data_directory.join("改名前 中文 🚀.txt");
+    let rename_target = data_directory.join("改名后 中文 🚀.txt");
+    let missing_path = data_directory.join("不存在 文件 中文 🚀.txt");
+    let execute_output_path = data_directory.join("os.execute 输出 中文 🚀.txt");
+    let popen_source_path = data_directory.join("io.popen 输入 中文 🚀.txt");
+    let failed_rename_target = data_directory.join("不会建立的 rename 目标 中文 🚀.txt");
+    fs::write(&read_path, "第一行 中文 🚀\n第二行 空格 path\n")
+        .expect("Unicode Lua 输入文件应可写入");
+    fs::write(&loadfile_path, "return 'loadfile 已读取 中文 🚀'\n")
+        .expect("Unicode loadfile 文件应可写入");
+    fs::write(&dofile_path, "return 'dofile 已读取 中文 🚀'\n")
+        .expect("Unicode dofile 文件应可写入");
+    fs::write(&rename_source, "等待改名").expect("Unicode 待改名文件应可写入");
+    fs::write(&popen_source_path, "popen-unicode-path-ok")
+        .expect("Unicode io.popen 输入文件应可写入");
+
+    let script_directory = root.join("标准库脚本 中文 🚀");
+    fs::create_dir_all(&script_directory).expect("Unicode 标准库脚本目录应可建立");
+    let main_script = script_directory.join("标准库边界 中文 🚀.lua");
+    fs::write(
+        &main_script,
+        r#"
+assert(ctx.phase == "lua")
+
+local reader = assert(io.open(arg[1], "rb"))
+assert(reader:read("*a") == "第一行 中文 🚀\n第二行 空格 path\n")
+assert(reader:close())
+
+local writer = assert(io.open(arg[2], "wb"))
+assert(writer:write("io.open 写入 中文 🚀"))
+assert(writer:close())
+
+local lines = {}
+for line in io.lines(arg[1]) do
+  lines[#lines + 1] = line
+end
+assert(#lines == 2)
+assert(lines[1] == "第一行 中文 🚀")
+assert(lines[2] == "第二行 空格 path")
+
+io.input(arg[1])
+assert(io.read("*l") == "第一行 中文 🚀")
+assert(io.close(io.input()))
+
+io.output(arg[3])
+assert(io.write("io.output 写入 中文 🚀"))
+assert(io.close(io.output()))
+
+local loaded = assert(loadfile(arg[4]))
+assert(loaded() == "loadfile 已读取 中文 🚀")
+assert(dofile(arg[5]) == "dofile 已读取 中文 🚀")
+
+assert(os.rename(arg[6], arg[7]))
+assert(os.remove(arg[7]))
+
+local environment = os.getenv(arg[8])
+assert(environment == arg[9])
+assert(environment == "环境值 中文 🚀")
+assert(utf8.len(environment) ~= nil,
+       "Unicode 环境变量必须以 UTF-8 Lua string 返回")
+
+local missing_reader, open_message, open_code = io.open(arg[10], "rb")
+assert(missing_reader == nil)
+assert(string.find(open_message, arg[10], 1, true) ~= nil)
+assert(string.find(open_message, "Windows error 2", 1, true) ~= nil)
+assert(open_code == 2)
+
+local missing_chunk, loadfile_message = loadfile(arg[10])
+assert(missing_chunk == nil)
+assert(string.find(loadfile_message, arg[10], 1, true) ~= nil)
+assert(string.find(loadfile_message, "Windows error 2", 1, true) ~= nil)
+local dofile_ok, dofile_message = pcall(dofile, arg[10])
+assert(not dofile_ok)
+assert(string.find(dofile_message, arg[10], 1, true) ~= nil)
+assert(string.find(dofile_message, "Windows error 2", 1, true) ~= nil)
+
+local removed, remove_message, remove_code = os.remove(arg[10])
+assert(removed == nil)
+assert(string.find(remove_message, arg[10], 1, true) ~= nil)
+assert(string.find(remove_message, "Windows error 2", 1, true) ~= nil)
+assert(remove_code == 2)
+
+local denied, denied_message, denied_code = io.open(arg[13], "rb")
+assert(denied == nil)
+assert(string.find(denied_message, arg[13], 1, true) ~= nil)
+assert(string.find(denied_message, "Windows error 5", 1, true) ~= nil)
+assert(denied_code == 13)
+
+local renamed, rename_message, rename_code = os.rename(arg[10], arg[14])
+assert(renamed == nil)
+assert(string.find(rename_message, arg[10], 1, true) ~= nil)
+assert(string.find(rename_message, arg[14], 1, true) ~= nil)
+assert(string.find(rename_message, "Windows error 2", 1, true) ~= nil)
+assert(rename_code == 2)
+
+local execute_ok, execute_kind, execute_code =
+  os.execute('type nul > "' .. arg[11] .. '"')
+assert(execute_ok == true and execute_kind == "exit" and execute_code == 0)
+
+local process = assert(io.popen('type "' .. arg[12] .. '"', "r"))
+assert(process:read("*a") == "popen-unicode-path-ok")
+local popen_ok, popen_kind, popen_code = process:close()
+assert(popen_ok == true and popen_kind == "exit" and popen_code == 0)
+"#,
+    )
+    .expect("Unicode 标准库主程序应可写入");
+
+    let mut lua_arguments = arguments(&["mz", "lua", "--name", UNICODE_LUA_PROJECT]);
+    lua_arguments.push(main_script.into_os_string());
+    lua_arguments.push("--".into());
+    lua_arguments.push(
+        read_path
+            .strip_prefix(&root)
+            .expect("Unicode 输入路径应可按进程 cwd 表达")
+            .as_os_str()
+            .to_owned(),
+    );
+    for argument in [
+        &write_path,
+        &default_output_path,
+        &loadfile_path,
+        &dofile_path,
+        &rename_source,
+        &rename_target,
+    ] {
+        lua_arguments.push(argument.as_os_str().to_owned());
+    }
+    lua_arguments.push(UNICODE_ENVIRONMENT_NAME.into());
+    lua_arguments.push(UNICODE_ENVIRONMENT_VALUE.into());
+    lua_arguments.push(missing_path.into_os_string());
+    lua_arguments.push(execute_output_path.clone().into_os_string());
+    lua_arguments.push(popen_source_path.into_os_string());
+    lua_arguments.push(data_directory.into_os_string());
+    lua_arguments.push(failed_rename_target.into_os_string());
+
+    let mut command = att_command_for_executable(&executable, &root, lua_arguments);
+    command.env(UNICODE_ENVIRONMENT_NAME, UNICODE_ENVIRONMENT_VALUE);
+    let child = command
+        .spawn()
+        .expect("Unicode 标准库测试中的 att.exe 应可启动");
+    let lua = wait_for_att(child);
+    assert_success("Unicode Lua 标准库边界", &lua);
+
+    assert_eq!(
+        fs::read_to_string(&write_path).expect("io.open Unicode 输出应可读取"),
+        "io.open 写入 中文 🚀"
+    );
+    assert_eq!(
+        fs::read_to_string(&default_output_path).expect("io.output Unicode 输出应可读取"),
+        "io.output 写入 中文 🚀"
+    );
+    assert!(
+        !rename_source.exists(),
+        "os.rename 后旧 Unicode 路径必须消失"
+    );
+    assert!(
+        !rename_target.exists(),
+        "os.remove 后新 Unicode 路径必须消失"
+    );
+    assert!(
+        execute_output_path.is_file(),
+        "os.execute 必须能把 Unicode 输出路径交给命令解释器"
+    );
+}
+
+#[test]
+fn copied_executable_supports_long_unicode_paths() {
+    let temporary = tempfile::tempdir().expect("应可建立长路径端到端测试目录");
+    let mut root = temporary.path().join("长路径工作区 中文 🚀");
+    while root
+        .join("中文主程序 🚀")
+        .join("带 空格")
+        .join("att.exe")
+        .to_string_lossy()
+        .encode_utf16()
+        .count()
+        < 320
+    {
+        root = root.join("重复长路径段 中文 🚀 0123456789");
+    }
+    assert_unicode_require_contract(&root, "长路径");
+}
+
+#[test]
+fn copied_executable_supports_unc_unicode_paths_when_root_is_explicitly_provided() {
+    let release_acceptance =
+        std::env::var_os("ATT_RELEASE_ACCEPTANCE").as_deref() == Some(OsStr::new("1"));
+    let Some(unc_root) = std::env::var_os("ATT_TEST_UNC_ROOT") else {
+        assert!(
+            !release_acceptance,
+            "ATT_RELEASE_ACCEPTANCE=1 时必须提供可写 UNC 根 ATT_TEST_UNC_ROOT"
+        );
+        eprintln!("跳过 UNC 执行：把 ATT_TEST_UNC_ROOT 设为可写 UNC 目录后运行此测试");
+        return;
+    };
+    let unc_root = PathBuf::from(unc_root);
+    assert!(
+        unc_root.to_string_lossy().starts_with(r"\\"),
+        "ATT_TEST_UNC_ROOT 必须是 UNC 路径，实际为 {}",
+        unc_root.display()
+    );
+    let temporary = tempfile::Builder::new()
+        .prefix("att-unicode-unc-")
+        .tempdir_in(&unc_root)
+        .expect("应可在显式 UNC 根内建立唯一测试目录");
+    let root = temporary.path().join("UNC 工作区 中文 🚀 with spaces");
+    assert_unicode_require_contract(&root, "UNC");
+}
+
+#[test]
 fn oversized_system_group_exceeds_task_target_and_still_reaches_the_model() {
     const OVERSIZED_PROJECT: &str = "oversized-system";
     const TASK_TARGET: usize = 2_048;
@@ -2596,6 +2973,201 @@ fn run_att_with_ui_locale(root: &Path, arguments: Vec<OsString>, ui_locale: &str
     wait_for_att(child)
 }
 
+fn copy_att_executable(directory: &Path) -> PathBuf {
+    fs::create_dir_all(directory).expect("复制 att.exe 的目标目录应可建立");
+    let executable = directory.join("att.exe");
+    let source = std::env::var_os("ATT_TEST_EXECUTABLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_att")));
+    assert!(
+        source.is_absolute() && source.is_file(),
+        "ATT_TEST_EXECUTABLE 必须指向现有的绝对 att.exe 路径：{}",
+        source.display()
+    );
+    fs::copy(&source, &executable).expect("实际 att.exe 应可复制");
+    executable
+}
+
+struct LoadedLibraryResource(*mut c_void);
+
+impl Drop for LoadedLibraryResource {
+    fn drop(&mut self) {
+        // SAFETY: 该句柄由本测试中的 LoadLibraryExW 成功返回，并且只在这里释放一次。
+        let _ = unsafe { free_library(self.0) };
+    }
+}
+
+fn read_embedded_manifest_resource_one(executable: &Path) -> String {
+    let wide_path = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: 路径是 NUL 结尾 UTF-16；保留参数为 null；只把 PE 作为资源映像载入。
+    let module = unsafe {
+        load_library_ex_w(
+            wide_path.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+        )
+    };
+    assert!(
+        !module.is_null(),
+        "应可把复制后的 att.exe 作为资源映像加载：{}",
+        io::Error::last_os_error()
+    );
+    let module = LoadedLibraryResource(module);
+
+    // MAKEINTRESOURCEW 用指针低 16 位表达整数资源；这里精确读取 RT_MANIFEST ID 1。
+    let resource_name = make_integer_resource(1);
+    let resource_kind = make_integer_resource(RT_MANIFEST);
+    // SAFETY: module 在 guard 生命周期内有效，两个资源标识都是 Win32 整数资源形式。
+    let resource = unsafe { find_resource_w(module.0, resource_name, resource_kind) };
+    assert!(
+        !resource.is_null(),
+        "att.exe 必须内嵌 RT_MANIFEST ID 1：{}",
+        io::Error::last_os_error()
+    );
+    // SAFETY: module 与 resource 来自同一次 FindResourceW。
+    let size = unsafe { size_of_resource(module.0, resource) };
+    assert_ne!(size, 0, "RT_MANIFEST ID 1 不能为空");
+    // SAFETY: module 与 resource 来自同一次 FindResourceW。
+    let loaded = unsafe { load_resource(module.0, resource) };
+    assert!(!loaded.is_null(), "RT_MANIFEST ID 1 应可加载");
+    // SAFETY: loaded 是 LoadResource 返回的只读资源句柄。
+    let bytes = unsafe { lock_resource(loaded) }.cast::<u8>();
+    assert!(!bytes.is_null(), "RT_MANIFEST ID 1 应可锁定");
+    // SAFETY: SizeofResource 给出该只读资源的精确字节数，module guard 在复制完成前有效。
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, size as usize) };
+    std::str::from_utf8(bytes)
+        .expect("内嵌 manifest 必须是 UTF-8")
+        .to_owned()
+}
+
+fn make_integer_resource(identifier: u16) -> *const u16 {
+    usize::from(identifier) as *const u16
+}
+
+fn initialize_unicode_lua_project(root: &Path, executable: &Path) {
+    initialize_unicode_lua_project_from(root, executable, root);
+}
+
+fn initialize_unicode_lua_project_from(
+    root: &Path,
+    executable: &Path,
+    process_current_directory: &Path,
+) {
+    let game_root = root.join("原游戏 中文 🚀 with spaces");
+    fs::create_dir_all(root.join("projects")).expect("Unicode 项目根应可建立");
+    fs::create_dir_all(root.join("prompts/rpg_maker")).expect("Unicode Prompt 根应可建立");
+    write_minimal_mz_game(&game_root);
+
+    let server = BoundChatServer::bind();
+    write_configuration(root, server.endpoint(), EMPTY_PARAMETERS);
+    let mut command = att_command_for_executable(
+        executable,
+        root,
+        mz_init_arguments_for(&game_root, UNICODE_LUA_PROJECT, "ja", "zh-Hans", 24, 30, 40),
+    );
+    command.current_dir(process_current_directory);
+    let child = command
+        .spawn()
+        .expect("指定 cwd 下复制后的 att.exe 应可启动");
+    let init = wait_for_att(child);
+    assert_success("Unicode 路径 init", &init);
+    assert!(
+        root.join("projects/mz")
+            .join(UNICODE_LUA_PROJECT)
+            .join("project.db")
+            .is_file(),
+        "Unicode 配置、游戏根和项目名称必须产生真实项目数据库"
+    );
+}
+
+fn assert_unicode_require_contract(root: &Path, case_name: &str) {
+    let process_current_directory = std::env::current_dir().expect("测试进程 cwd 应可读取");
+    let executable_directory = root.join("中文主程序 🚀").join("带 空格");
+    let executable = std::fs::canonicalize(copy_att_executable(&executable_directory))
+        .expect("长路径或 UNC att.exe 应可解析成 Win32 扩展路径");
+    initialize_unicode_lua_project_from(root, &executable, &process_current_directory);
+
+    let script_directory = root.join("Lua require 中文 🚀 with spaces");
+    let direct_directory = root.join("Lua C 路径桥 中文 🚀 with spaces");
+    fs::create_dir_all(&script_directory).expect("Unicode require 脚本目录应可建立");
+    fs::create_dir_all(&direct_directory).expect("Unicode Lua C 路径桥目录应可建立");
+    fs::write(
+        script_directory.join("相邻模块_🚀.lua"),
+        "return 'Unicode require 已执行'\n",
+    )
+    .expect("Unicode require 相邻模块应可写入");
+    let read_path = direct_directory.join("io.open 读取 中文 🚀.txt");
+    let write_path = direct_directory.join("io.open 写入 中文 🚀.txt");
+    let loadfile_path = direct_directory.join("loadfile 中文 🚀.lua");
+    let dofile_path = direct_directory.join("dofile 中文 🚀.lua");
+    let rename_source = direct_directory.join("os.rename 源 中文 🚀.txt");
+    let rename_target = direct_directory.join("os.rename 目标 中文 🚀.txt");
+    fs::write(&read_path, "长路径与 UNC 读取 中文 🚀").expect("Unicode Lua C 路径桥输入应可写入");
+    fs::write(&loadfile_path, "return '长路径 loadfile 中文 🚀'\n")
+        .expect("Unicode Lua C 路径桥 loadfile 应可写入");
+    fs::write(&dofile_path, "return '路径桥 dofile 中文 🚀'\n")
+        .expect("Unicode Lua C 路径桥 dofile 应可写入");
+    fs::write(&rename_source, "等待 rename/remove")
+        .expect("Unicode Lua C 路径桥 rename 源应可写入");
+    let main_script = script_directory.join("主程序 中文 🚀.lua");
+    fs::write(
+        &main_script,
+        r#"
+assert(utf8.len(package.path) ~= nil, "package.path 必须是 UTF-8")
+assert(string.find(package.path, arg[1], 1, true) ~= nil,
+       "默认 package.path 必须包含实际 att.exe 目录")
+assert(require("相邻模块_🚀") == "Unicode require 已执行")
+
+local reader = assert(io.open(arg[2], "rb"))
+assert(reader:read("*a") == "长路径与 UNC 读取 中文 🚀")
+assert(reader:close())
+local writer = assert(io.open(arg[3], "wb"))
+assert(writer:write("Lua C 路径桥已写入 中文 🚀"))
+assert(writer:close())
+local loaded = assert(loadfile(arg[4]))
+assert(loaded() == "长路径 loadfile 中文 🚀")
+assert(dofile(arg[5]) == "路径桥 dofile 中文 🚀")
+assert(os.rename(arg[6], arg[7]))
+assert(os.remove(arg[7]))
+"#,
+    )
+    .expect("Unicode require 主程序应可写入");
+
+    let mut lua_arguments = arguments(&["mz", "lua", "--name", UNICODE_LUA_PROJECT]);
+    lua_arguments.push(main_script.into_os_string());
+    lua_arguments.push("--".into());
+    lua_arguments.push(UNICODE_EXECUTABLE_DIRECTORY_MARKER.into());
+    for argument in [
+        &read_path,
+        &write_path,
+        &loadfile_path,
+        &dofile_path,
+        &rename_source,
+        &rename_target,
+    ] {
+        lua_arguments.push(argument.as_os_str().to_owned());
+    }
+    let mut command = att_command_for_executable(&executable, root, lua_arguments);
+    command.current_dir(process_current_directory);
+    let child = command
+        .spawn()
+        .expect("长路径或 UNC 中复制后的 att.exe 应可启动");
+    let output = wait_for_att(child);
+    assert_success(&format!("{case_name} Unicode require"), &output);
+    assert_eq!(
+        fs::read_to_string(&write_path).expect("Lua C 路径桥输出应可读取"),
+        "Lua C 路径桥已写入 中文 🚀"
+    );
+    assert!(
+        !rename_source.exists() && !rename_target.exists(),
+        "Lua C 路径桥的 rename/remove 必须完成"
+    );
+}
+
 fn assert_process_summary_omits_client_payloads(phase: &str, output: &Output) {
     for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
         let text = String::from_utf8_lossy(bytes);
@@ -2878,6 +3450,22 @@ fn att_command_with_ui_locale_and_progress(
         .arg("--config")
         .arg(root.join("config.toml"))
         .args(["--ui-language", ui_locale, "--progress", progress])
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn att_command_for_executable(executable: &Path, root: &Path, arguments: Vec<OsString>) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .current_dir(root)
+        .env_remove("LUA_PATH")
+        .env_remove("LUA_PATH_5_4")
+        .arg("--config")
+        .arg(root.join("config.toml"))
+        .args(["--ui-language", "zh-Hans", "--progress", "off"])
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

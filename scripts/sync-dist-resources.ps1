@@ -3,8 +3,8 @@
 把仓库中的使用者资源同步到 dist，或只检查两边是否一致。
 
 .DESCRIPTION
-管理 README.md、config.example.toml -> config.toml、docs、prompts 和 skills。
-不修改 att.exe、运行库或许可文件。
+管理 README.md、config.example.toml -> config.toml、Lua 许可、docs、prompts 和 skills。
+不修改 att.exe、运行库或其他许可文件。
 
 .PARAMETER Check
 只比较文件集合和 SHA-256，不修改 dist。
@@ -32,6 +32,10 @@ $fileMappings = @(
     [pscustomobject]@{
         Source = Join-Path $repositoryRoot 'config.example.toml'
         Destination = Join-Path $distributionRoot 'config.toml'
+    },
+    [pscustomobject]@{
+        Source = Join-Path $repositoryRoot 'vendor/lua-src/LICENSE'
+        Destination = Join-Path $distributionRoot 'licenses/Lua-LICENSE.md'
     }
 )
 
@@ -203,6 +207,16 @@ try {
 
     foreach ($mapping in $fileMappings) {
         Assert-DistributionChild -Path $mapping.Destination
+        $destinationDirectory = [System.IO.Path]::GetDirectoryName($mapping.Destination)
+        if (-not $destinationDirectory.Equals(
+                $distributionRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            Assert-DistributionChild -Path $destinationDirectory
+        }
+        if (-not (Test-Path -LiteralPath $destinationDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Path $destinationDirectory | Out-Null
+        }
         $staged = Join-Path $stagingRoot ([System.IO.Path]::GetFileName($mapping.Destination))
         Copy-Item -LiteralPath $staged -Destination $mapping.Destination -Force
     }

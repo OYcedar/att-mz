@@ -1,0 +1,16 @@
+[package]
+name = "lua-src"
+version = "550.1.1"
+authors = ["Aleksandr Orlenko <zxteam@protonmail.com>"]
+edition = "2024"
+repository = "https://github.com/mlua-rs/lua-src-rs"
+keywords = ["lua", "lua54"]
+readme = "README.md"
+license = "MIT"
+description = "ATT 受控的 Lua 5.4.8 源码与 Windows MSVC 构建逻辑。"
+
+[features]
+ucid = []
+
+[dependencies]
+cc = "1.2"

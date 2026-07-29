@@ -282,6 +282,79 @@ fn current_markdown_local_links_resolve_to_existing_files_and_anchors() {
 }
 
 #[test]
+fn windows_unicode_runtime_and_lua_direct_path_contract_are_documented() {
+    let readme_path = workspace_root().join("README.md");
+    let readme = read_utf8(&readme_path);
+    for required in [
+        "Windows 10 1903",
+        "UTF-8 active code page manifest",
+        "code page 是 65001",
+        "中文、Emoji 和内部空格",
+        "不需要启用 `LongPathsEnabled`",
+        "ATT_TEST_UNC_ROOT",
+        "ATT_RELEASE_ACCEPTANCE=1",
+        "ATT_TEST_EXECUTABLE",
+        "它不是 ATT 产品配置",
+    ] {
+        assert!(
+            readme.contains(required),
+            "{} 必须说明 Windows Unicode 运行契约 {required:?}",
+            display_relative(&readme_path)
+        );
+    }
+
+    let lua_path = documentation_root().join("lua.md");
+    let lua = read_utf8(&lua_path);
+    let vm_section = markdown_level_two_section(&lua, "## 2. VM、连接与 `ctx`")
+        .expect("Lua 规格必须保留 VM、连接与 ctx 章节");
+    let preload = vm_section
+        .find("1. `package.preload[name]`")
+        .expect("Lua 规格必须先写 package.preload");
+    let main_directory = vm_section
+        .find("2. 主程序解析路径所在目录")
+        .expect("Lua 规格必须写主程序目录 searcher");
+    let package_path = vm_section
+        .find("3. 当前 VM 的 `package.path`")
+        .expect("Lua 规格必须最后写 package.path");
+    assert!(
+        preload < main_directory && main_directory < package_path,
+        "Lua 规格必须固定 preload、主程序目录、package.path 的查找顺序"
+    );
+
+    for required in [
+        "`package.searchpath`",
+        "`LUA_PATH_5_4`",
+        "仅在它不存在时读取 `LUA_PATH`",
+        "环境值中的 `;;`",
+        "`io.open`",
+        "`io.input`",
+        "`io.output`",
+        "`io.lines`",
+        "`loadfile`",
+        "`dofile`",
+        "`os.remove`",
+        "`os.rename`",
+        "`os.getenv`",
+        "`os.execute`",
+        "`io.popen`",
+        "相对路径按进程 cwd 解析",
+        "`errno` 第三返回值",
+        "原始 Windows error code",
+        "直接外部访问",
+        "本地盘",
+        "映射盘和 UNC",
+        "不受项目根白名单限制",
+        "必须使用受管接口",
+    ] {
+        assert!(
+            vm_section.contains(required),
+            "{} 的 VM 章节必须说明直接 Lua 边界 {required:?}",
+            display_relative(&lua_path)
+        );
+    }
+}
+
+#[test]
 fn sensitive_information_members_have_one_authority_and_are_only_linked_elsewhere() {
     let authority_path = workspace_root().join("docs/runtime/chat-completions.md");
     let canonical_authority_path = canonicalize_for_contract(&authority_path);

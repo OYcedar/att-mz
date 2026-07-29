@@ -62,9 +62,45 @@ att --config FILE mz lua --name NAME [--profile PROFILE_ID] SCRIPT_LUA [-- ARG..
 - 只有持久数据库表、冻结来源、标准资产或已发布文件能跨阶段交接；
 - Extract、Translate、WriteBack 即使保存了同一路径，也不能依赖前一 VM 的内存。
 
-纯 Lua `require` 依次搜索主程序目录和当前 VM 的 `package.path`；进程 cwd 不改变。
+`require(name)` 先复用 `package.loaded[name]`。尚未加载时，固定按以下顺序查找：
+
+1. `package.preload[name]`；
+2. 主程序解析路径所在目录的 `name.lua`、`name/init.lua`；
+3. 当前 VM 的 `package.path`，按分号分隔的模板顺序替换 `?`。
+
+主程序目录由独立 searcher 负责；只有其中没有可读模块时才读取 `package.path`，所以
+`package.path` 中的同名文件不能覆盖主程序相邻模块。`package.searchpath` 与第三步使用
+相同的 UTF-8 Windows 路径语义；失败结果逐项保留实际候选路径和 Windows OS code。
+Lua 初始化 `package.path` 时优先读取 `LUA_PATH_5_4`，仅在它不存在时读取 `LUA_PATH`；
+环境值中的 `;;` 会在该位置插入正式默认路径。变量值和脚本后来写入的模板必须是 UTF-8。
+正式 `att.exe` 的默认 `package.path` 包含程序所在目录，并且在中文、Emoji 或空格目录
+中仍是有效 UTF-8。进程 cwd 不参与上述模块优先级；相对 `package.path` 模板仍按 cwd
+解析。
+
 `package.cpath` 和 `package.loadlib` 不公开，ATT 不装载本机 C 模块。`io`、`os` 与
-`debug` 开放；直接 I/O 和进程不自动进入 ATT 的受管路径、取消、事务或候选发布协议。
+`debug` 开放。正式制品在[受支持的 Windows 环境](../../README.md#运行环境与路径)中，
+把以下 Lua string 一律解释为 UTF-8，并无损访问对应 Unicode 路径或环境值：
+
+- `io.open`、`io.input`、`io.output`、`io.lines` 的文件路径；
+- `loadfile`、`dofile` 的程序路径；
+- `os.remove`、`os.rename` 的文件路径；
+- `os.getenv` 的环境变量名和非 nil 返回值。
+
+`io.open`、`os.remove` 等标准库失败三元组保留原 UTF-8 路径和 Lua 5.4 规定的
+`errno` 第三返回值；错误消息同时包含系统原因和原始 Windows error code。
+`os.rename` 的失败消息同时包含源、目标路径，`loadfile`、`dofile` 的失败消息也保留
+传入路径。脚本可以据此诊断直接访问，但 ATT 不会把这些返回值转换成受管 Host 错误。
+
+这些函数的相对路径按进程 cwd 解析，不会改按主程序目录解析。`os.execute` 与 `io.popen`
+接收 UTF-8 命令字符串，但命令拆分、引用规则、子进程字符编码和退出行为继续由 Windows、
+命令解释器与被调用程序决定。脚本调用 `os.setlocale` 主动改变 C locale 后产生的行为不在
+初始 UTF-8 运行环境保证内。
+
+上述标准库调用、`loadfile`/`dofile` 动态执行的程序和 `require` 动态读取的模块都属于
+直接外部访问。它们可以访问当前进程权限允许的任意 UTF-8 Windows 路径，包括本地盘、
+映射盘和 UNC，不受项目根白名单限制。ATT 不冻结其内容，不把写入转成 WriteBack 候选，
+不提供 `ctx.source`/`ctx.output` 的逐字大小写与越界检查，也不为它们增加取消、事务、
+恢复或候选发布语义。需要这些保证时必须使用受管接口。
 
 <!-- att-example: illustrative -->
 ```lua
@@ -102,7 +138,8 @@ ctx = {
 
 `json/source/rpg_maker/db` 四种调用都有。`source_root` 是冻结内容物理根：MZ 对应 `source/`，
 MV 对应 `source/www/`。`output_root` 仅 WriteBack 存在且是未发布候选物理路径。这些物理
-路径只供可信脚本诊断或显式直接 I/O；受管 API 一律使用下一节逻辑路径。
+路径是 UTF-8 Lua string，可供可信脚本诊断或显式传给上述标准库；受管 API 一律使用
+下一节逻辑路径。
 
 独立命令中 `ctx.extract/translations/translation/llm/output/write_back` 都是 nil。全局
 `arg[0]` 是解析后的主脚本路径，`arg[1..]` 是 `--` 后按顺序传入的 UTF-8 参数；不能表示

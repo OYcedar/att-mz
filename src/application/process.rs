@@ -6,6 +6,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::ExitCode;
 use std::sync::Once;
 
+use windows_sys::Win32::Globalization::{CP_UTF8, GetACP};
+
 use super::arguments::AttArguments;
 use super::arguments::ProgressArgument;
 use super::command::{
@@ -46,7 +48,39 @@ fn run_guarded() -> ExitCode {
     // 实时进度由独立线程短暂取得 stderr 锁；进程主线程不能在整个命令期间持有锁。
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
+    if let Some(diagnostic) = windows_utf8_process_diagnostic() {
+        // 进程运行时不满足最低要求时，完整 CLI 尚未解析，固定使用英语呈现；
+        // run_from 不执行此检查，避免未嵌入 manifest 的 Rust 测试宿主受进程 ACP 影响。
+        let localizer = UiLocalizer::new(UiLocale::English);
+        return render_diagnostic_fatal(&localizer, &diagnostic, &mut stderr);
+    }
     run_from(std::env::args_os(), &mut stdout, &mut stderr)
+}
+
+fn windows_utf8_process_diagnostic() -> Option<SafeDiagnostic> {
+    // SAFETY: GetACP 没有参数，只读取当前进程的 Windows ANSI code page。
+    let actual_code_page = unsafe { GetACP() };
+    windows_utf8_process_diagnostic_for(actual_code_page)
+}
+
+fn windows_utf8_process_diagnostic_for(actual_code_page: u32) -> Option<SafeDiagnostic> {
+    (actual_code_page != CP_UTF8).then(|| {
+        SafeDiagnostic::new(
+            DiagnosticCode::ProcessRuntimeStart,
+            DiagnosticStage::ProcessStartup,
+            DiagnosticSubject::component("Windows UTF-8 runtime"),
+            DiagnosticReason::failure_with_detail(
+                DiagnosticFailureKind::RequirementFailed,
+                format!(
+                    "ATT requires Windows 10 version 1903 or later and an official executable \
+                     with an embedded UTF-8 manifest; expected process code page {CP_UTF8}, \
+                     actual {actual_code_page}"
+                ),
+            ),
+            DiagnosticImpact::Unchanged,
+            DiagnosticAction::ReportBug,
+        )
+    })
 }
 
 fn render_uncaught_panic() -> ExitCode {
@@ -558,6 +592,24 @@ mod tests {
                 .iter()
                 .all(|stream| *stream == ObservedStream::Stderr),
             "成功输出必须完整写完后才开始呈现清理失败"
+        );
+    }
+
+    #[test]
+    fn utf8_process_runtime_accepts_only_utf8_code_page() {
+        assert!(windows_utf8_process_diagnostic_for(CP_UTF8).is_none());
+
+        let diagnostic =
+            windows_utf8_process_diagnostic_for(936).expect("非 UTF-8 代码页必须被拒绝");
+        assert_eq!(diagnostic.code, DiagnosticCode::ProcessRuntimeStart);
+        assert_eq!(diagnostic.stage, DiagnosticStage::ProcessStartup);
+        assert_eq!(diagnostic.impact, DiagnosticImpact::Unchanged);
+        assert_eq!(diagnostic.action, DiagnosticAction::ReportBug);
+        assert!(
+            diagnostic
+                .reason
+                .render_localized(&UiLocalizer::new(UiLocale::English))
+                .contains("actual 936")
         );
     }
 

@@ -45,3 +45,6 @@ tokio = { version = "1.52.3", features = ["macros", "rt"] }
 # ATT 的 Release 制品以大型游戏端到端吞吐优先，接受更长的本机构建时间。
 codegen-units = 1
 lto = "thin"
+
+[patch.crates-io]
+lua-src = { path = "vendor/lua-src" }

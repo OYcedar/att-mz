@@ -6,7 +6,6 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::os::windows::ffi::OsStrExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -36,6 +35,9 @@ use crate::rpg_maker::extract::store::{
 use crate::rpg_maker::lua::document::{
     OpenedRpgMakerDocument, RpgMakerDocumentError, RpgMakerTextReference, data_file_source,
     data_source, map_source, plugin_parameter_source, source_path,
+};
+use crate::rpg_maker::lua::module_loading::{
+    configure_module_paths, safe_path_identity, script_directory,
 };
 use crate::rpg_maker::lua::runtime::{
     OwnedLuaProgram, TrustedLuaBindingFinalizationError, TrustedLuaBindingFinalizer,
@@ -167,11 +169,14 @@ impl SafeDiagnosticSource for TrustedLua54RuntimeError {
                 impact,
                 DiagnosticAction::ReportBug,
             ),
-            Self::Vm { operation, .. } => SafeDiagnostic::new(
+            Self::Vm { operation, message } => SafeDiagnostic::new(
                 DiagnosticCode::LuaExecution,
                 stage,
                 DiagnosticSubject::component("Lua VM"),
-                DiagnosticReason::failure(DiagnosticFailureKind::LuaExecutionFailed),
+                DiagnosticReason::failure_with_detail(
+                    DiagnosticFailureKind::LuaExecutionFailed,
+                    message,
+                ),
                 impact,
                 DiagnosticAction::CheckProjectState,
             )
@@ -615,101 +620,6 @@ fn execute_program(
         operation: "execute_main_program",
         message: format!("Lua 主程序运行失败：{}", lua_value_description(&error)),
     })
-}
-
-/// 把 Windows 原始路径逐 UTF-16 code unit 编码成 Lua 可安全展示的无控制字符身份。
-///
-/// 该身份只用于 chunk 名、loader data 与诊断；真实模块查找始终使用原始 `PathBuf`。
-fn safe_path_identity(path: &Path) -> String {
-    use std::fmt::Write as _;
-
-    let mut identity = String::from("@att-utf16");
-    for unit in path.as_os_str().encode_wide() {
-        write!(&mut identity, "-{unit:04X}").expect("写入 String 不会失败");
-    }
-    identity
-}
-
-fn script_directory(path: &Path) -> PathBuf {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf()
-}
-
-fn configure_module_paths(lua: &Lua, script_directory: &Path) -> mlua::Result<()> {
-    let package: Table = lua.globals().get("package")?;
-    install_unicode_lua_module_searcher(lua, &package, script_directory.to_path_buf())?;
-    package.set("cpath", Value::Nil)?;
-    package.set("loadlib", Value::Nil)
-}
-
-fn install_unicode_lua_module_searcher(
-    lua: &Lua,
-    package: &Table,
-    script_directory: PathBuf,
-) -> mlua::Result<()> {
-    let lua_searcher = lua.create_function(move |lua, module: mlua::LuaString| {
-        let module = strict_module_name(&module)?;
-        let mut candidates = local_lua_module_candidates(&script_directory, &module);
-        candidates.extend(package_lua_candidates(lua, &module)?);
-        let mut diagnostics = String::new();
-        for candidate in candidates {
-            match std::fs::read(&candidate) {
-                Ok(source) => {
-                    let name = safe_path_identity(&candidate);
-                    let loader = lua.load(source).set_name(&name).into_function()?;
-                    return Ok(MultiValue::from_vec(vec![
-                        Value::Function(loader),
-                        Value::String(lua.create_string(&name)?),
-                    ]));
-                }
-                Err(error) => {
-                    use std::fmt::Write as _;
-                    let name = safe_path_identity(&candidate);
-                    let _ = write!(diagnostics, "\n\tno file '{name}' ({error})");
-                }
-            }
-        }
-        Ok(MultiValue::from_vec(vec![Value::String(
-            lua.create_string(diagnostics)?,
-        )]))
-    })?;
-
-    let current_searchers: Table = package.get("searchers")?;
-    let preload: Value = current_searchers.raw_get(1)?;
-    let searchers = lua.create_table()?;
-    searchers.raw_set(1, preload)?;
-    searchers.raw_set(2, lua_searcher)?;
-    package.set("searchers", searchers)
-}
-
-fn strict_module_name(module: &mlua::LuaString) -> mlua::Result<String> {
-    module
-        .to_str()
-        .map(|module| module.to_owned())
-        .map_err(|_| mlua::Error::runtime("Lua 模块名不是 UTF-8"))
-}
-
-fn local_lua_module_candidates(script_directory: &Path, module: &str) -> Vec<PathBuf> {
-    let module_path = PathBuf::from(module.replace('.', "\\"));
-    let mut direct = script_directory.join(&module_path);
-    direct.set_extension("lua");
-    vec![direct, script_directory.join(module_path).join("init.lua")]
-}
-
-fn package_lua_candidates(lua: &Lua, module: &str) -> mlua::Result<Vec<PathBuf>> {
-    let package: Table = lua.globals().get("package")?;
-    let templates: mlua::LuaString = package.get("path")?;
-    let templates = templates
-        .to_str()
-        .map_err(|_| mlua::Error::runtime("package.path 不是 UTF-8 字符串"))?;
-    let module_path = module.replace('.', "\\");
-    Ok(templates
-        .split(';')
-        .filter(|template| !template.is_empty())
-        .map(|template| PathBuf::from(template.replace('?', &module_path)))
-        .collect())
 }
 
 fn build_context(
@@ -4391,9 +4301,20 @@ fn lua_value_description(value: &Value) -> String {
         Value::String(value) => value
             .to_str()
             .map(|value| value.to_owned())
-            .unwrap_or_else(|_| "<non-UTF-8 Lua error>".to_owned()),
+            .unwrap_or_else(|_| escaped_lua_bytes(&value.as_bytes())),
+        Value::Error(error) => error.to_string(),
         other => format!("Lua {} 错误值", other.type_name()),
     }
+}
+
+fn escaped_lua_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut escaped = String::from("非 UTF-8 Lua 错误字符串（原始字节）：");
+    for byte in bytes {
+        write!(&mut escaped, "\\x{byte:02X}").expect("写入 String 不会失败");
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -5480,17 +5401,17 @@ mod tests {
     }
 
     #[test]
-    fn vm_errors_keep_source_text_but_only_publish_the_stable_operation() {
-        let sentinel = "底层原因".repeat(10_000);
+    fn vm_errors_publish_the_sanitized_reason_and_stable_operation() {
+        let sentinel = "底层原因";
         let error = vm_error(
             "execute_main_program",
             "Lua 失败",
-            mlua::Error::runtime(sentinel.clone()),
+            mlua::Error::runtime(format!("{sentinel}\n下一行")),
         );
         let TrustedLua54RuntimeError::Vm { message, .. } = &error else {
             panic!("VM 错误必须保留文本")
         };
-        assert!(message.ends_with(&sentinel));
+        assert!(message.contains(sentinel));
 
         let public = error.safe_diagnostic_source(
             DiagnosticStage::Translate,
@@ -5500,7 +5421,19 @@ mod tests {
         let serialized = serde_json::to_string(&public).expect("VM 安全诊断应可序列化");
         assert!(serialized.contains("lua_vm_operation=execute_main_program"));
         assert!(serialized.contains("translate"));
-        assert!(!serialized.contains(&sentinel));
+        assert!(serialized.contains(sentinel));
+        assert!(!serialized.contains("\\n下一行"));
+    }
+
+    #[test]
+    fn non_utf8_lua_error_string_uses_deterministic_byte_escapes() {
+        let lua = Lua::new();
+        let value = Value::String(lua.create_string([0x00, 0xff, b'A', b'\\']).unwrap());
+
+        assert_eq!(
+            lua_value_description(&value),
+            r"非 UTF-8 Lua 错误字符串（原始字节）：\x00\xFF\x41\x5C"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7184,7 +7117,7 @@ assert(not ok and error.domain == 'binding' and error.kind == 'invalid_value')
         let main_script = directory.path().join("main.lua");
         std::fs::write(
             &main_script,
-            "local value, loader = require('local_helper'); assert(value.value == 'loaded'); assert(string.find(loader, '@att-utf16-', 1, true) == 1)",
+            "local value, loader = require('local_helper'); assert(value.value == 'loaded'); assert(string.find(loader, 'local_helper.lua', 1, true) ~= nil)",
         )
         .unwrap();
         let snapshot = std::fs::read(&main_script).unwrap();
@@ -7239,7 +7172,7 @@ local source = debug.getinfo(1, "S").source
 assert(string.find(source, "@att-utf16-", 1, true) == 1)
 assert(string.find(source, "D800", 1, true) ~= nil)
 assert(string.find(source, "%c") == nil)
-assert(#package.searchers == 2)
+assert(#package.searchers == 3)
 assert(package.cpath == nil)
 assert(package.loadlib == nil)
 local value, loader = require("local_helper")
