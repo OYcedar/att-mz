@@ -21,6 +21,7 @@ pub(crate) mod directory_cache;
 pub(crate) mod document;
 pub(crate) mod hosting;
 pub(crate) mod lua54;
+mod module_loading;
 pub(crate) mod runtime;
 
 /// Lua 只读来源门面能够访问的项目内相对路径。
