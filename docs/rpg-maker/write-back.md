@@ -161,18 +161,19 @@ Lua 使用严格逻辑 `data/...` 与 `js/...` 访问候选；只接受 `/`，�
 或 Translate 继承。没有发布后回调。脚本必须以冻结来源、当前候选和持久私有状态重建
 幂等结果，不能在 Lua 返回前把私有表标记为“已经发布”。完整 output 操作矩阵与范例见
 [Lua 技术参考](lua.md#11-writeback-候选与布局)和
-[Lua Cookbook](lua-cookbook.md#4-幂等-writeback)。
+[Lua Cookbook](lua-cookbook.md#5-幂等-writeback)。
 
 Lua 若拥有插件私有 grammar，必须在这里重新读取并复核完整原 Value，使用自己的已验收
 状态重建完整新 Value，再通过 `ctx.output` 写回。Host 随后只验证候选目录、JSON 与
 RPG Maker 公共结构，不猜测或代替脚本验收插件 grammar。完整 `<Help:...>` 示例见
-[Lua 私有标签协议](lua-cookbook.md#5-插件标签的三阶段私有协议)。
+[Lua 私有标签协议](lua-cookbook.md#6-插件标签的三阶段私有协议)。
 
 Managed collection/unit 同样不会自动修改候选。Lua 以 unit `key` 和不透明 `metadata`
 恢复自身写回关系，只消费 `status = "current"` 且 translation 非 nil 的结果，并再次
-核对它拥有的完整游戏 grammar 或多位置关系，再通过 `ctx.output` 幂等写入。缺失、
-non-applicable 或 unavailable 的处理属于脚本明确策略；Host 不自动回退到低级协议，也
-不把 Managed unit 转换成 Standard 资产。完整读取契约见
+核对它拥有的完整游戏 grammar 或多位置关系，再通过 `ctx.output` 幂等写入。WriteBack
+从持久快照只投影 `current` 或 `missing`；某轮 Translate 的 non-applicable 或 unavailable
+结果不会持久化为 WriteBack 状态。`missing` 的处理属于脚本明确策略；Host 不自动回退到
+低级协议，也不把 Managed unit 转换成 Standard 资产。完整读取契约见
 [Lua 托管 translate/open](lua.md#72-ctxtranslationstranslateopen)。
 
 ## 6. 顶层验证、发布与完成边界

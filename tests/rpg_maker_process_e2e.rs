@@ -52,9 +52,7 @@ const MANUAL_STANDARD_DIALOGUE_TRANSLATION: &str = "今天天气晴朗，一起�
 const MANAGED_PROJECT: &str = "managed-translation";
 const MANAGED_ORIGINAL: &str = "星港へ";
 const MANAGED_TRANSLATION: &str = "前往星港";
-const MANAGED_EXTRACT_LUA: &str = "scripts/managed_extract.lua";
-const MANAGED_TRANSLATE_LUA: &str = "scripts/managed_translate.lua";
-const MANAGED_WRITE_BACK_LUA: &str = "scripts/managed_write_back.lua";
+const MANAGED_LUA: &str = "scripts/lua-managed-translation.lua";
 const SYSTEM_PROMPT_TEMPLATE: &str = "E2E SYSTEM CONTRACT: {{source_language}} -> {{target_language}}; repeat {{source_language}} -> {{target_language}}";
 const SYSTEM_PROMPT: &str = "E2E SYSTEM CONTRACT: ja -> zh-Hans; repeat ja -> zh-Hans";
 const UPDATED_SYSTEM_PROMPT_TEMPLATE: &str =
@@ -1917,34 +1915,25 @@ fn managed_lua_translation_crosses_extract_translate_and_write_back_processes() 
     fs::create_dir_all(root.join("projects")).expect("项目根应可建立");
     fs::create_dir_all(root.join("scripts")).expect("Lua 脚本目录应可建立");
     write_minimal_mz_game(&game_root);
+    fs::write(
+        game_root.join("data/QuestEntries.json"),
+        serde_json::to_vec(&json!([{
+            "id": "arrival",
+            "title": MANAGED_ORIGINAL,
+            "description": "港へ向かう。"
+        }]))
+        .expect("Managed 来源应可序列化"),
+    )
+    .expect("Managed 来源应可写入");
+    fs::write(
+        root.join(MANAGED_LUA),
+        include_str!("../docs/rpg-maker/examples/lua-managed-translation.lua"),
+    )
+    .expect("Managed 文档示例应可写入");
 
     initialize_prompt_project(root, MANAGED_PROJECT, &game_root, "ja", "zh-Hans");
     write_system_prompt(root, "zh-Hans", SYSTEM_PROMPT_TEMPLATE);
 
-    fs::write(
-        root.join(MANAGED_EXTRACT_LUA),
-        format!(
-            r#"
-ctx.translations.replace({{
-  {{
-    name = "quest_titles",
-    instruction = "翻译任务标题；保持简洁。",
-    units = {{
-      {{
-        key = "quest:arrival",
-        kind = "plugin_parameter",
-        shape = "single",
-        original = "{MANAGED_ORIGINAL}",
-        context = "任务标题",
-        metadata = ctx.json.array({{12, "main"}}),
-      }},
-    }},
-  }},
-}})
-"#
-        ),
-    )
-    .expect("Managed Extract Lua 应可写入");
     let extract = run_att(
         root,
         arguments(&[
@@ -1953,7 +1942,7 @@ ctx.translations.replace({{
             "--name",
             MANAGED_PROJECT,
             "--lua",
-            MANAGED_EXTRACT_LUA,
+            MANAGED_LUA,
         ]),
     );
     assert_success("Managed extract", &extract);
@@ -1993,43 +1982,40 @@ ctx.translations.replace({{
         declared,
         (
             "quest_titles".to_owned(),
-            "翻译任务标题；保持简洁。".to_owned(),
+            "翻译任务标题；保持简洁，并结合任务说明判断含义。".to_owned(),
             "quest:arrival".to_owned(),
-            "plugin_parameter".to_owned(),
+            "database_entry".to_owned(),
             "single".to_owned(),
             serde_json::to_string(MANAGED_ORIGINAL).expect("测试原文应可编码"),
-            "任务标题".to_owned(),
-            r#"[12,"main"]"#.to_owned(),
+            "任务标题；相关说明：港へ向かう。".to_owned(),
+            r#"{"json_index":0,"quest_id":"arrival"}"#.to_owned(),
             None,
             None,
         )
     );
     drop(connection);
 
-    fs::write(
-        root.join(MANAGED_TRANSLATE_LUA),
-        format!(
-            r#"
-local report = ctx.translations.translate()
-local results = {{}}
-for result in report:units() do results[#results + 1] = result end
-assert(#results == 1)
-assert(results[1].collection == "quest_titles")
-assert(results[1].key == "quest:arrival")
-assert(results[1].status == "translated" or results[1].status == "current")
-assert(results[1].translation == "{MANAGED_TRANSLATION}")
-
-local collection = ctx.translations.open("quest_titles")
-assert(collection.name == "quest_titles")
-local unit = collection:get("quest:arrival")
-assert(unit.original == "{MANAGED_ORIGINAL}")
-assert(unit.translation == "{MANAGED_TRANSLATION}")
-assert(ctx.json.kind(unit.metadata) == "array")
-assert(#unit.metadata == 2 and unit.metadata[1] == 12 and unit.metadata[2] == "main")
-"#
-        ),
-    )
-    .expect("Managed Translate Lua 应可写入");
+    let missing_write_back = run_att(
+        root,
+        arguments(&[
+            "mz",
+            "write-back",
+            "--name",
+            MANAGED_PROJECT,
+            "--lua",
+            MANAGED_LUA,
+        ]),
+    );
+    assert_success("missing Managed write-back", &missing_write_back);
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &fs::read(workspace.join("write_back/data/QuestEntries.json"))
+                .expect("无 Managed 译文时仍应写入 QuestEntries.json"),
+        )
+        .expect("无 Managed 译文时的 WriteBack 结果应是 JSON")[0]["title"],
+        MANAGED_ORIGINAL,
+        "WriteBack 的 missing 投影必须保持冻结原文"
+    );
 
     let server = BoundChatServer::bind();
     write_configuration(root, server.endpoint(), E2E_PARAMETERS);
@@ -2047,7 +2033,7 @@ assert(#unit.metadata == 2 and unit.metadata[1] == 12 and unit.metadata[2] == "m
             MANAGED_PROJECT,
             PROFILE,
             "--lua",
-            MANAGED_TRANSLATE_LUA,
+            MANAGED_LUA,
         ]),
     );
     let translate_stdout = assert_success("Managed translate", &translate);
@@ -2089,7 +2075,7 @@ assert(#unit.metadata == 2 and unit.metadata[1] == 12 and unit.metadata[2] == "m
             MANAGED_PROJECT,
             PROFILE,
             "--lua",
-            MANAGED_TRANSLATE_LUA,
+            MANAGED_LUA,
         ]),
     );
     assert_success("converged Managed translate", &converged);
@@ -2122,11 +2108,11 @@ assert(#unit.metadata == 2 and unit.metadata[1] == 12 and unit.metadata[2] == "m
     let user = messages[1]["content"]
         .as_str()
         .expect("Managed user message 必须是字符串");
-    assert!(user.contains("翻译任务标题；保持简洁。"));
+    assert!(user.contains("翻译任务标题；保持简洁，并结合任务说明判断含义。"));
     assert!(user.contains("任务标题"));
     assert!(user.contains("Text [1] (single line)"));
     assert!(user.contains(MANAGED_ORIGINAL));
-    for private in ["quest_titles", "quest:arrival", "metadata", "main"] {
+    for private in ["quest_titles", "quest:arrival", "json_index", "quest_id"] {
         assert!(
             !user.contains(private),
             "Managed user message 不得泄漏内部身份或 metadata：{private}\n{user}"
@@ -2140,21 +2126,6 @@ assert(#unit.metadata == 2 and unit.metadata[1] == 12 and unit.metadata[2] == "m
         "零 Managed TaskBlock 不得建立空 run 目录"
     );
 
-    fs::write(
-        root.join(MANAGED_WRITE_BACK_LUA),
-        format!(
-            r#"
-local collection = ctx.translations.open("quest_titles")
-assert(collection ~= nil)
-local unit = collection:get("quest:arrival")
-assert(unit.status == "current")
-assert(unit.translation == "{MANAGED_TRANSLATION}")
-assert(ctx.json.kind(unit.metadata) == "array")
-ctx.output.write_text("js/managed-translation.txt", unit.translation)
-"#
-        ),
-    )
-    .expect("Managed WriteBack Lua 应可写入");
     let write_back = run_att(
         root,
         arguments(&[
@@ -2163,14 +2134,17 @@ ctx.output.write_text("js/managed-translation.txt", unit.translation)
             "--name",
             MANAGED_PROJECT,
             "--lua",
-            MANAGED_WRITE_BACK_LUA,
+            MANAGED_LUA,
         ]),
     );
     assert_success("Managed write-back", &write_back);
     assert_eq!(
-        fs::read_to_string(workspace.join("write_back/js/managed-translation.txt"))
-            .expect("Managed WriteBack 应可消费最后提交快照"),
-        MANAGED_TRANSLATION
+        serde_json::from_slice::<Value>(
+            &fs::read(workspace.join("write_back/data/QuestEntries.json"))
+                .expect("Managed WriteBack 应写入 QuestEntries.json"),
+        )
+        .expect("Managed WriteBack 结果应是 JSON")[0]["title"],
+        MANAGED_TRANSLATION,
     );
 }
 

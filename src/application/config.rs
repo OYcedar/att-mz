@@ -4102,6 +4102,11 @@ mod tests {
     use crate::application::arguments::{AttArguments, ProductCommand};
     use crate::llm::LlmClientSemanticIdentity;
 
+    const EXAMPLE_TASK_RECORDING: &str = "record_translation_tasks = true";
+    const EXAMPLE_TARGET_CHARACTERS: &str = "target_task_user_message_characters = 5090";
+    const EXAMPLE_CLIENT_PARAMETERS: &str =
+        "parameters = '''\n{\"thinking\": {\"type\": \"disabled\"}}\n'''";
+
     #[test]
     fn repository_example_is_valid_for_every_command() {
         let directory = TestDirectory::new();
@@ -4271,7 +4276,7 @@ mod tests {
     fn explicit_translate_profile_is_still_validated_during_load() {
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml").replace(
-            "target_task_user_message_characters = 24000",
+            EXAMPLE_TARGET_CHARACTERS,
             "target_task_user_message_characters = 0",
         );
         let path = directory.write("invalid-explicit-profile.toml", &source);
@@ -4535,18 +4540,15 @@ id = "unused"
         let cases = [
             (
                 "omitted",
-                example.replace("record_translation_tasks = false", ""),
+                example.replace(EXAMPLE_TASK_RECORDING, ""),
                 false,
             ),
-            ("false", example.to_owned(), false),
             (
-                "true",
-                example.replace(
-                    "record_translation_tasks = false",
-                    "record_translation_tasks = true",
-                ),
-                true,
+                "false",
+                example.replace(EXAMPLE_TASK_RECORDING, "record_translation_tasks = false"),
+                false,
             ),
+            ("true", example.to_owned(), true),
         ];
 
         let mut semantic_fingerprints = Vec::new();
@@ -4577,7 +4579,7 @@ id = "unused"
         const SENTINEL: &str = "RECORD_TRANSLATION_TASKS_TYPE_SENTINEL";
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml").replace(
-            "record_translation_tasks = false",
+            EXAMPLE_TASK_RECORDING,
             format!("record_translation_tasks = [\"{SENTINEL}\"]").as_str(),
         );
         let path = directory.write("record-translation-tasks-type.toml", &source);
@@ -4604,8 +4606,8 @@ id = "unused"
     fn selected_profile_rejects_unknown_fields() {
         let directory = TestDirectory::new();
         let source = include_str!("../../config.example.toml").replace(
-            "target_task_user_message_characters = 24000",
-            "target_task_user_message_characters = 24000\nunexpected_field = []",
+            EXAMPLE_TARGET_CHARACTERS,
+            format!("{EXAMPLE_TARGET_CHARACTERS}\nunexpected_field = []").as_str(),
         );
         let path = directory.write("unknown-profile-field.toml", &source);
         assert!(
@@ -4646,7 +4648,7 @@ id = "unused"
             ),
             (
                 "profile-target-task-user-message-characters",
-                source.replacen("target_task_user_message_characters = 24000\n", "", 1),
+                source.replacen(format!("{EXAMPLE_TARGET_CHARACTERS}\n").as_str(), "", 1),
             ),
             (
                 "client-retry-delays",
@@ -4886,15 +4888,15 @@ id = "unused"
             (
                 "profile",
                 example.replace(
-                    "target_task_user_message_characters = 24000",
-                    "target_task_user_message_characters = 24000\nunexpected = 1",
+                    EXAMPLE_TARGET_CHARACTERS,
+                    format!("{EXAMPLE_TARGET_CHARACTERS}\nunexpected = 1").as_str(),
                 ),
             ),
             (
                 "rpg-maker",
                 example.replace(
-                    "record_translation_tasks = false",
-                    "record_translation_tasks = false\nunexpected = 1",
+                    EXAMPLE_TASK_RECORDING,
+                    format!("{EXAMPLE_TASK_RECORDING}\nunexpected = 1").as_str(),
                 ),
             ),
         ];
@@ -4934,10 +4936,9 @@ id = "unused"
     #[test]
     fn selected_scalar_shape_conflicts_are_typed_without_value_echo() {
         const SENTINEL: &str = "SCALAR_SHAPE_VALUE_SENTINEL";
-        const PARAMETERS: &str = "parameters = '''\n{}\n'''";
         let directory = TestDirectory::new();
         let example = include_str!("../../config.example.toml").replace("\r\n", "\n");
-        assert!(example.contains(PARAMETERS));
+        assert!(example.contains(EXAMPLE_CLIENT_PARAMETERS));
 
         for (name, replacement) in [
             (
@@ -4950,7 +4951,7 @@ id = "unused"
                 format!("parameters = {{ vendor = \"{SENTINEL}\" }}"),
             ),
         ] {
-            let source = example.replacen(PARAMETERS, &replacement, 1);
+            let source = example.replacen(EXAMPLE_CLIENT_PARAMETERS, &replacement, 1);
             let path = directory.write(format!("scalar-shape-{name}.toml").as_str(), &source);
             let error = match load_configuration(&path, translate_command(false, "primary")) {
                 Ok(_) => panic!("所选字符串字段的表形态必须拒绝：{name}"),
@@ -5115,16 +5116,15 @@ api_key = "{API_KEY}" "invalid"
     fn selected_llm_client_debug_hides_only_api_key() {
         let directory = TestDirectory::new();
         let example = include_str!("../../config.example.toml").replace("\r\n", "\n");
-        const EMPTY_PARAMETERS: &str = "parameters = '''\n{}\n'''";
         const CUSTOM_PARAMETERS: &str =
             "parameters = '''\n{\"vendor_value\":\"PARAMETER_SENTINEL\"}\n'''";
         assert!(
-            example.contains(EMPTY_PARAMETERS),
-            "示例配置必须默认使用空 parameters，测试再显式注入普通参数"
+            example.contains(EXAMPLE_CLIENT_PARAMETERS),
+            "示例配置必须保留本测试声明的当前 parameters"
         );
         let source = example
             .replace("replace-with-api-key", "API_KEY_SENTINEL")
-            .replace(EMPTY_PARAMETERS, CUSTOM_PARAMETERS);
+            .replace(EXAMPLE_CLIENT_PARAMETERS, CUSTOM_PARAMETERS);
         assert!(source.contains("PARAMETER_SENTINEL"));
         let path = directory.write("api-key.toml", &source);
         let ConfiguredRpgMakerCommand::Translate(configured) =

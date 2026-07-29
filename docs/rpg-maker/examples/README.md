@@ -14,22 +14,24 @@ JSON 夹具，以及需要模型的示例所用假 LLM。
 | 文件 | 阶段 | 演示 |
 |---|---|---|
 | [`lua-standard-data-file.lua`](lua-standard-data-file.lua) | Extract | 自定义 DataFile 标量接入 Standard |
+| [`lua-managed-translation.lua`](lua-managed-translation.lua) | 三阶段 | Managed 完整快照、托管翻译和按 metadata 写回 |
 | [`lua-translate-state.lua`](lua-translate-state.lua) | Translate | 首跑请求、二跑 Current、语义变化失效、译文/state 同事务 |
 | [`lua-accept-standard.lua`](lua-accept-standard.lua) | 独立 Lua | Standard 人工候选验收、去重传播与原子提交 |
 | [`lua-idempotent-write-back.lua`](lua-idempotent-write-back.lua) | WriteBack | 从权威候选重建相同输出，不依赖 post-publish |
 | [`lua-private-tag.lua`](lua-private-tag.lua) | 三阶段 | Lua 私有解析、验收、持久化并完整重建 `<Help:...>` Value |
 | [`lua-complex-protocol.lua`](lua-complex-protocol.lua) | 三阶段 | 跨 Actors/Map/两个私有文档的多目标私有协议 |
 
-三阶段私有协议示例只创建 `lua_example_*` / `lua_private_tag_*` / `lua_complex_*` 私有表。人工候选示例不
-直接修改 ATT 受管表，而是只通过 `ctx.standard` 交给核心。文件名和夹具字段是可替换的
-示范协议；复制到真实游戏时，必须把来源、身份、上下文和物理断言改成该游戏的已验证
-事实。
+Managed 示例不建立私有翻译表：ATT 负责 collection/unit 的普通翻译状态，Lua 只声明
+来源关系并根据 `metadata` 写回。三阶段私有协议示例只创建 `lua_example_*` /
+`lua_private_tag_*` / `lua_complex_*` 私有表。人工候选示例不直接修改 ATT 受管表，而是
+只通过 `ctx.standard` 交给核心。文件名和夹具字段是可替换的示范协议；复制到真实游戏时，
+必须把来源、身份、上下文和物理断言改成该游戏的已验证事实。
 
 所需最小夹具形状：
 
 <!-- att-example: illustrative -->
 ```json
-// data/QuestEntries.json（用于三个阶段私有表的简单示例；实际 JSON 不含本注释）
+// data/QuestEntries.json（用于 Standard、Managed 和私有表示例；实际 JSON 不含本注释）
 [
   {"id":"arrival","title":"星港へ","description":"港へ向かう。"}
 ]

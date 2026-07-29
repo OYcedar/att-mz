@@ -321,6 +321,9 @@ ctx.translations.replace({
 })
 ```
 
+从真实 JSON 字段声明 unit、执行托管翻译并按 metadata 写回同一字段的完整主程序，见
+[Managed 三阶段示例](lua-cookbook.md#2-managed-三阶段翻译)。
+
 `replace(collections)` 一次性声明 Lua Managed owner 的完整当前快照。一次 Extract 主程序
 最多调用一次；`replace({})` 保持 owner active 并清空全部 collection；不调用表示保持旧
 Managed 快照。零字节 Extract Lua 或 Extract 运行方案停用 Lua 时，Managed owner 和
@@ -457,6 +460,9 @@ if collection ~= nil then
 end
 ```
 
+同一脚本怎样在 Translate 读取报告、在 WriteBack 直接打开最后已确认状态，见
+[Managed 三阶段示例](lua-cookbook.md#2-managed-三阶段翻译)。
+
 `translate()` 无参数，一次 Translate 主程序最多调用一次。它读取一致的完整 Managed
 快照，一次处理全部 collection，并为它们建立共同的 Managed 全局去重域；空快照返回
 零项报告且不请求模型。调用前若 `ctx.db` 有活动事务，则以
@@ -480,8 +486,10 @@ UTF-8 字符串。
 `open` 返回只读 collection userdata：`name`、`instruction` 是字段，
 `get(key)` 精确查找并在不存在时返回 nil，`units()` 按声明顺序单次迭代。只读 unit
 提供 `key`、`kind`、`shape`、`original`、`context`、`metadata`、`translation` 和
-`status`；`status` 为 `current`、`missing`、`not_applicable` 或 `unavailable`。来源快照
-已经改变时，`open` 会明确失败，不把 stale 伪装成可读单元状态。
+`status`。Translate 在本轮 `translate()` 后打开时，状态为 `current`、`not_applicable`
+或 `unavailable`，其中刚验收的 `translated` 报告结果投影为 `current`；WriteBack 从
+持久快照打开时只投影 `current` 或 `missing`，不会保存某轮正常未产出的具体结果。来源
+快照已经改变时，`open` 会明确失败，不把 stale 伪装成可读单元状态。
 标量/数组投影与报告相同，`metadata` 仍为原来的不透明 JSON 值。
 
 打开 collection 不会修改游戏资产，也不会替 Lua推导写回位置。WriteBack 必须使用
@@ -753,11 +761,15 @@ WriteBack 没有 validate/discard/publish 或 post-publish 回调。脚本应只
 ### 11.3 托管译文写回
 
 WriteBack 的 `ctx.translations` 只提供 `open(name)`，不提供 `replace` 或 `translate`。
-脚本读取最后已确认提交的 collection/unit 及其 `status/translation`，用声明时保存的
-`key`、`metadata` 和自身确定关系找到候选目标，并通过 `ctx.output` 完成写回。Host 不把
-Managed unit 自动变成 Standard recipe 或 Mutation Claim，也不替脚本决定缺失、不可用
-单元应如何影响私有资产。来源 stale 在打开 collection 时明确失败，不把旧译文交给
-脚本继续发布。
+脚本读取最后已确认提交的 collection/unit；有译文时投影为 `current`，否则为
+`missing`。脚本用声明时保存的 `key`、`metadata` 和自身确定关系找到候选目标，并通过
+`ctx.output` 完成写回。某轮 Translate 的 `not_applicable` 或 `unavailable` 只在该轮报告
+和同进程投影中存在，不进入 WriteBack 快照。Host 不把 Managed unit 自动变成 Standard
+recipe 或 Mutation Claim，也不替脚本决定 `missing` 应如何影响私有资产。来源 stale 在
+打开 collection 时明确失败，不把旧译文交给脚本继续发布。
+
+可直接执行的完整目标映射与来源漂移检查，见
+[Managed 三阶段示例](lua-cookbook.md#2-managed-三阶段翻译)。
 
 ## 12. 错误、取消与副作用
 

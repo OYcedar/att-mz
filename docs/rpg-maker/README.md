@@ -144,7 +144,9 @@ Translate、WriteBack 的阶段 Lua。若 Lua 只需声明 collection、原子 u
 Lua 显式组合 `ctx.translation`、`ctx.llm` 与 `ctx.db`；Host 不自动降级。复杂不自动意味着
 需要低级协议。每个启用 Lua 的阶段都必须拥有独立、现实的理由，并明确协议所有者、事务
 和幂等边界。独立项目脚本也必须按完整身份定位候选、审查去重传播范围并保持可重复执行。
-完整能力见[Lua 技术参考](lua.md)，低级可验证模式见[Lua Cookbook](lua-cookbook.md)。
+完整能力见[Lua 技术参考](lua.md)；先查看
+[Managed 三阶段示例](lua-cookbook.md#2-managed-三阶段翻译)，再按需参考 Cookbook 中的
+低级协议。
 
 ## 证明覆盖与可逆写回
 
