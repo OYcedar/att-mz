@@ -1,13 +1,13 @@
 # RPG Maker Lua Cookbook
 
-本页从“外部作者一次写对”出发，给出六种完整模式。所有可执行主程序位于
+本页从“外部作者一次写对”出发，给出七种完整模式。所有可执行主程序位于
 [`examples/`](examples/README.md)，测试会原样交给真实 Lua VM、临时 SQLite、冻结夹具
 和假 LLM；本页的短代码只解释关键不变量。
 
 代码块分类沿用 [Lua 技术参考](lua.md)的 `att-example` 标记。
-本页现有模式重点展示 Standard 接入和低级私有协议；能够表达为独立 collection/unit 的
-新脚本应先使用 [`ctx.translations`](lua.md#62-ctxtranslationsreplace)，只有高级契约无法
-表达私有 grammar、跨 unit 原子关系或特殊模型协议时再采用这里的低级三阶段模式。
+能够表达为独立 collection/unit 的新脚本应先使用
+[`ctx.translations`](lua.md#62-ctxtranslationsreplace)；只有这个契约无法表达私有
+grammar、跨 unit 原子关系或特殊模型协议时，才采用低级三阶段模式。
 
 声明式文件也提供生产解析器直接读取的完整样本：
 [MV 姓名](examples/mv-dialogue.toml)、
@@ -21,7 +21,7 @@
 适用条件：每个语义字段就是一个完整 Value，且 source×kind×location
 满足 [replace_standard 矩阵](lua.md#6-extractreplace_standard)。跨文档、多目标不要硬塞进
 这个接口；能拆成独立原子 unit 时使用 `ctx.translations`，必须共同原子提交时再跳到第
-6 节；需要自行解释插件标签 grammar 时参见第 5 节。
+7 节；需要自行解释插件标签 grammar 时参见第 6 节。
 
 完整脚本：[lua-standard-data-file.lua](examples/lua-standard-data-file.lua)。它：
 
@@ -54,7 +54,76 @@ ctx.extract.replace_standard({
 显式失败。`Map000.json` 可由 `data_file` 打开，但它是自定义
 DataFile，不是 Map 0。
 
-## 2. Translate state：首跑、复用和失效
+## 2. Managed 三阶段翻译
+
+适用条件：文本能够拆成独立 collection/unit，ATT 可以负责普通模型协议、全局去重、
+验收、state、增量提交和任务记录；Lua 仍然掌握游戏私有身份、上下文和最终写回关系。
+
+完整脚本：[lua-managed-translation.lua](examples/lua-managed-translation.lua)。同一主程序
+根据 `ctx.phase` 完成三个阶段：
+
+<!-- att-example: illustrative -->
+```text
+Extract
+  QuestEntries.json
+  -> key / kind / shape / original / context / metadata
+  -> ctx.translations.replace
+
+Translate
+  -> ctx.translations.translate
+  -> 逐 unit 读取 current / translated / not_applicable / unavailable
+
+WriteBack
+  -> ctx.translations.open
+  -> 用 metadata 找回候选目标
+  -> 复核 quest id 与原文
+  -> 只把 Current 译文写入 ctx.output
+```
+
+Extract 使用稳定的任务 `id` 形成 key，把数组位置和任务 id 放入不发送给模型的
+`metadata`，并把说明文本放入会影响翻译语义的 `context`。数组位置不能单独充当长期身份；
+它只用于本次冻结来源中的写回定位，WriteBack 仍要同时复核 id 和原文。
+
+<!-- att-example: valid -->
+```lua
+ctx.translations.replace({
+  {
+    name = "quest_titles",
+    instruction = "翻译任务标题；保持简洁。",
+    units = {
+      {
+        key = "quest:arrival",
+        kind = "database_entry",
+        shape = "single",
+        original = "星港へ",
+        context = "任务标题；相关说明：港へ向かう。",
+        metadata = ctx.json.object({
+          json_index = 0,
+          quest_id = "arrival",
+        }),
+      },
+    },
+  },
+})
+```
+
+`translate()` 一次处理本轮完整 Managed 快照。正常未产出不会由示例伪装成错误；脚本打印
+报告供诊断，任务是否完成仍由调用方根据完整范围判断。
+
+WriteBack 的 `open` 只从持久快照投影 `current` 或 `missing`，不会自动修改候选，也不会
+保留某轮 Translate 报告中的 `not_applicable` 或 `unavailable`。示例分别读取冻结来源和
+候选 `data/QuestEntries.json`，验证 metadata 指向的对象仍有相同 id 和原文，再写入
+Current 译文；`missing` 保持冻结原文。相同来源和托管状态重复执行会得到相同 JSON。
+
+复制到真实插件时至少重新确认：
+
+1. key 是否来自稳定业务身份，而不是显示顺序或译文；
+2. shape 是否覆盖不可拆分的真实翻译单位；
+3. context 是否包含所有会改变正确译文的项目私有事实；
+4. metadata 能否无损定位写回目标，且 WriteBack 有足够断言发现来源漂移；
+5. 普通未产出应保持原文、阻止交付，还是由项目另行处理。
+
+## 3. Translate state：首跑、复用和失效
 
 完整脚本：[lua-translate-state.lua](examples/lua-translate-state.lua)。其私有表只保存已经
 accept 的 translation/state，因此二者天然成对。
@@ -125,7 +194,7 @@ translation/state，并保持二者为 NULL：这两种状态不需要也不能�
 后续每次 Translate 仍会重新 `prepare`，但不会请求 LLM。若脚本希望记录“已观察过”，应
 在另一张私有表保存独立诊断事实，不能制造虚假的 translation/state pair。
 
-## 3. 已有人工作品交给 Standard 验收
+## 4. 已有人工作品交给 Standard 验收
 
 适用条件：目标已经是 Extract 建立的 Standard 物理单元，候选由人完成，需要沿用普通
 Standard 的 Placeholder、line shape、语言验收、去重传播和 Current state。不要为这种
@@ -184,7 +253,7 @@ assert(results[1].accepted, results[1].reason)
 的人工族，WriteBack 直接消费它；改变 Prompt、Client、语言、术语、Placeholder、原文或
 源上下文后仍会按普通规则失效。
 
-## 4. 幂等 WriteBack
+## 5. 幂等 WriteBack
 
 完整脚本：[lua-idempotent-write-back.lua](examples/lua-idempotent-write-back.lua)。WriteBack
 每次从冻结 source 建新候选，脚本从候选原文和私有表重建结果，不读取旧 `write_back`，
@@ -214,7 +283,7 @@ ctx.output.write_json(path, entries)
 需要布局时，在写 JSON 前调用 `ctx.write_back.layout`，并同时处理 `applied` 与正常的
 `manual` 结果；不要自行猜测 Standard 的窗口宽度。
 
-## 5. 插件标签的三阶段私有协议
+## 6. 插件标签的三阶段私有协议
 
 完整脚本：[lua-private-tag.lua](examples/lua-private-tag.lua)。示例把
 `Items.json[1].note` 中的 `<Help:炎の剣の説明>` 当作插件自己的 grammar，而不是 Host
@@ -250,7 +319,7 @@ WriteBack
 尖括号仍是普通内容。若只翻译正文而保留壳，应该由 Extract Rule 显式 `text` 捕获建立
 recipe，或像本节一样由 Lua 私有协议拥有。
 
-## 6. 跨文档、多目标三阶段私有协议
+## 7. 跨文档、多目标三阶段私有协议
 
 完整脚本：[lua-complex-protocol.lua](examples/lua-complex-protocol.lua)。示例把
 `QuestGraph.json[i].title` 与 `QuestIndex.json[id].label` 视为同一个语义事实，并读取
@@ -293,7 +362,7 @@ Prompt、Client、语言模块、engine、original 或脚本 context 发生变�
 5. WriteBack 重复执行是否确定，部分目标失败时是否在写文件前停止；
 6. 发布后没有回调时，协议是否仍能从权威输入恢复。
 
-## 7. SQLite 与阶段交接检查
+## 8. SQLite 与阶段交接检查
 
 需要私有状态的阶段示例只使用 `lua_example_*` 或 `lua_complex_*` 表；人工 Standard
 示例只调用 `ctx.standard`。可信脚本虽然能执行任意单条 SQLite statement，但直接修改
@@ -311,7 +380,7 @@ ctx.db.execute("CREATE TEMP TABLE handoff(value TEXT)")
 跨阶段只使用持久私有表或 ATT 已明确拥有的标准资产。每个阶段正常返回前必须 commit 或
 rollback；活动事务不会被隐式提交。
 
-## 8. 交付前盲测
+## 9. 交付前盲测
 
 让未参与脚本编写的人只阅读 [Lua 技术参考](lua.md)、本页和目标游戏协议材料，然后用
 隔离夹具验证：

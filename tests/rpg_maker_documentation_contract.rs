@@ -20,10 +20,22 @@ const TOML_EXAMPLES: [&str; 4] = [
     "terminology.toml",
 ];
 
-const LUA_EXAMPLES: [(&str, &[&str]); 6] = [
+const LUA_EXAMPLES: [(&str, &[&str]); 7] = [
     (
         "lua-standard-data-file.lua",
         &["ctx.rpg_maker.data_file", "ctx.extract.replace_standard"],
+    ),
+    (
+        "lua-managed-translation.lua",
+        &[
+            "ctx.rpg_maker.data_file",
+            "ctx.translations.replace",
+            "ctx.translations.translate",
+            "ctx.translations.open",
+            "ctx.output.read_json",
+            "ctx.output.write_json",
+            "unit.status == \"missing\"",
+        ],
     ),
     (
         "lua-translate-state.lua",
@@ -68,7 +80,7 @@ const LUA_EXAMPLES: [(&str, &[&str]); 6] = [
     ),
 ];
 
-const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 11] = [
+const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 12] = [
     (
         "config.example.toml",
         "src/application/config.rs",
@@ -104,6 +116,12 @@ const PRODUCTION_EXAMPLE_BINDINGS: [(&str, &str, &str, &str); 11] = [
         "src/rpg_maker/lua/lua54.rs",
         "include_str!(\"../../../docs/rpg-maker/examples/lua-standard-data-file.lua\")",
         "async fn documented_custom_data_file_example_executes_in_the_real_vm()",
+    ),
+    (
+        "lua-managed-translation.lua",
+        "tests/rpg_maker_process_e2e.rs",
+        "include_str!(\"../docs/rpg-maker/examples/lua-managed-translation.lua\")",
+        "fn managed_lua_translation_crosses_extract_translate_and_write_back_processes()",
     ),
     (
         "lua-translate-state.lua",
