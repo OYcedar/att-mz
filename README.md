@@ -11,9 +11,9 @@ ATT 以原游戏之外的项目工作区保存冻结来源、项目事实、提�
 
 ATT 0.1.0 的正式制品是 Windows x64 程序，最低支持 Windows 10 1903。正式 `att.exe`
 内嵌 [UTF-8 active code page manifest](https://learn.microsoft.com/windows/apps/design/globalizing/use-utf8-code-page)，
-并在启动时确认当前进程 code page 是 65001；
-系统版本不支持该 manifest，或者制品没有正确嵌入它时，ATT 会在读取配置和项目之前
-明确失败。复制正式 `att.exe` 到其他目录不会丢失内嵌 manifest。
+并在启动时确认当前进程 code page 是 65001；实际值不是 65001 时，ATT 会在读取配置和
+项目前报告该值并失败。发行测试另行确认正式制品的 RT_MANIFEST ID 1 包含 UTF-8 与长路径
+声明。复制正式 `att.exe` 到其他目录不会丢失内嵌 manifest。
 
 ATT 的文件系统路径支持 Windows 能表示的 Unicode，包括中文、Emoji 和内部空格。
 这一保证覆盖 `att.exe` 所在目录、进程 cwd、配置、游戏来源、项目与 Prompt 根、SQLite

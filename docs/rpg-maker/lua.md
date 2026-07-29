@@ -62,7 +62,8 @@ att --config FILE mz lua --name NAME [--profile PROFILE_ID] SCRIPT_LUA [-- ARG..
 - 只有持久数据库表、冻结来源、标准资产或已发布文件能跨阶段交接；
 - Extract、Translate、WriteBack 即使保存了同一路径，也不能依赖前一 VM 的内存。
 
-`require(name)` 先复用 `package.loaded[name]`。尚未加载时，固定按以下顺序查找：
+VM 建立后的 `require(name)` 先复用 `package.loaded[name]`。尚未加载时，初始 searcher
+按以下顺序查找：
 
 1. `package.preload[name]`；
 2. 主程序解析路径所在目录的 `name.lua`、`name/init.lua`；
@@ -70,12 +71,22 @@ att --config FILE mz lua --name NAME [--profile PROFILE_ID] SCRIPT_LUA [-- ARG..
 
 主程序目录由独立 searcher 负责；只有其中没有可读模块时才读取 `package.path`，所以
 `package.path` 中的同名文件不能覆盖主程序相邻模块。`package.searchpath` 与第三步使用
-相同的 UTF-8 Windows 路径语义；失败结果逐项保留实际候选路径和 Windows OS code。
+相同的参数、成功或失败返回形状及 UTF-8 Windows 路径语义；失败结果逐项保留实际候选
+路径和 Windows OS code。无效 UTF-8 `package.path` 只在真正进入第三步时失败，不影响
+前两个位置已经命中的模块。
 Lua 初始化 `package.path` 时优先读取 `LUA_PATH_5_4`，仅在它不存在时读取 `LUA_PATH`；
 环境值中的 `;;` 会在该位置插入正式默认路径。变量值和脚本后来写入的模板必须是 UTF-8。
 正式 `att.exe` 的默认 `package.path` 包含程序所在目录，并且在中文、Emoji 或空格目录
 中仍是有效 UTF-8。进程 cwd 不参与上述模块优先级；相对 `package.path` 模板仍按 cwd
-解析。
+解析。模板也可直接使用本地盘、映射盘、UNC 和长绝对路径；ATT 不做项目根检查，作者
+不需要手写 `\\?\` 前缀。
+
+`require` 和 ATT 的文件 searcher 使用 VM 创建时捕获的原始 `package` table。重绑定全局
+`package` 不会替换这张表；可信脚本仍可修改 `package.loaded[name]`、
+`package.preload[name]` 条目，以及原表的 `package.path` 和 `package.searchers` 字段。
+修改 `package.path` 会在下一次真正进入路径 searcher 时生效；已经位于
+`package.loaded` 的模块继续复用，清除相应条目后才重新搜索。脚本追加的后续 searcher
+会在 ATT 文件 searcher 都未命中后继续执行。
 
 `package.cpath` 和 `package.loadlib` 不公开，ATT 不装载本机 C 模块。`io`、`os` 与
 `debug` 开放。正式制品在[受支持的 Windows 环境](../../README.md#运行环境与路径)中，
@@ -85,6 +96,9 @@ Lua 初始化 `package.path` 时优先读取 `LUA_PATH_5_4`，仅在它不存在
 - `loadfile`、`dofile` 的程序路径；
 - `os.remove`、`os.rename` 的文件路径；
 - `os.getenv` 的环境变量名和非 nil 返回值。
+
+含未配对 UTF-16 surrogate 的 Windows 名称不能表示为 UTF-8 Lua string，因此不能通过
+上述标准库或模块模板直接访问；ATT 只在内部路径与诊断中保留这类名称的 UTF-16 安全身份。
 
 `io.open`、`os.remove` 等标准库失败三元组保留原 UTF-8 路径和 Lua 5.4 规定的
 `errno` 第三返回值；错误消息同时包含系统原因和原始 Windows error code。
@@ -841,6 +855,11 @@ error.retry_after_ms = integer | nil
 | `translations` | `invalid_snapshot`、`intent_already_declared`、`invalid_argument`、`already_translated`、`translate_required`、`transaction_conflict`、`stale_snapshot`、`unavailable` |
 | `llm` | `retryable`、`fatal` |
 | `runtime` | `cancelled`、`host_bridge_closed` |
+
+主程序或模块读取、编译失败，以及未被脚本捕获的 VM 错误，会进入 ATT 的安全诊断并保留
+命令与阶段、主程序或模块路径、Lua 原因，以及实际存在的 Windows 或文件系统错误码。有效
+Unicode 路径直接显示；Lua string 无法表示的内部 Windows 路径使用 UTF-16 安全身份。
+顶层不会把这些事实压缩成没有原因和路径的“Lua 主程序运行失败”。
 
 接口参数/值错误和脚本编程错误仍可能由 `binding` 报告；不要通过解析 message 猜测新的
 kind。ATT 不按 Lua VM 内存、Host 值字节、节点、深度、错误文本长度或完整文档字节数
